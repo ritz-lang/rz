@@ -145,6 +145,35 @@ const TYPE_ARRAY: i32 = 101   # Array type [N]T - stores size and element type
 const TYPE_REF: i32 = 102     # Immutable reference @T (emits as pointer)
 const TYPE_MUT_REF: i32 = 103 # Mutable reference @@T (emits as pointer)
 
+# AGAST #1924: a `**T` records its innermost pointee T in one i32 slot
+# (Stmt.var_inner_pointee_type, Param.param_inner_pointee_type,
+# GlobalVarDef / StructField / LocalVar.inner_pointee_type).  A deeper
+# pointer packs its extra levels into the same slot: `***T` is
+# T + PTR_DEPTH_UNIT, `****T` is T + 2 * PTR_DEPTH_UNIT.  Every reader that
+# asks "is this a **S?" (`== TYPE_STRUCT`) therefore still answers no for
+# `***S`, and every copy of the slot carries the depth with it.  Decode
+# with ptr_ptr_slot_levels / ptr_ptr_slot_inner below.
+const PTR_DEPTH_UNIT: i32 = 1024
+
+# AGAST #1924: decode an inner-pointee slot (see PTR_DEPTH_UNIT).  Levels
+# of the whole pointer type: 2 for `**T`, 3 for `***T`; 0 when the slot
+# records nothing.
+pub fn ptr_ptr_slot_levels(slot: i32) -> i32
+    if slot == TYPE_VOID or slot < 0
+        return 0
+    return 2 + slot / PTR_DEPTH_UNIT
+
+# The innermost pointee T of an inner-pointee slot.
+pub fn ptr_ptr_slot_inner(slot: i32) -> i32
+    if slot < 0
+        return TYPE_VOID
+    return slot % PTR_DEPTH_UNIT
+
+# The slot with its innermost pointee replaced by `inner` (depth kept), for
+# monomorph's `**T` -> `**i32`.
+pub fn ptr_ptr_slot_subst(slot: i32, inner: i32) -> i32
+    return slot - ptr_ptr_slot_inner(slot) + inner
+
 # Source location span for DWARF debug info.  Named SrcSpan, not Span, so it
 # does not collide with ritzlib.span's Span<T>, which main.ritz reaches
 # through ritzlib.os.env (AGAST #1750).
@@ -336,6 +365,9 @@ struct StructField
   array_elem_type_name: *u8    # Struct name when array_elem_type == TYPE_STRUCT
   array_elem_type_name_len: i32
   next: *StructField
+  # AGAST #1924: for a `**T` field, T (packed with any deeper levels, see
+  # PTR_DEPTH_UNIT); TYPE_VOID otherwise.  `*(*(s.rows + i) + k)` reads it.
+  inner_pointee_type: i32
 
 # Struct definition
 struct StructDef
@@ -525,6 +557,10 @@ struct Parser
   # TYPE_PTR_PTR field (e.g. **ZSetNode → TYPE_STRUCT, **u8 → TYPE_U8).
   # Set by type_ptr only when the immediate inner is NOT a pointer.
   last_inner_pointee_type: i32
+  # AGAST #1924: pointer levels of the type type_ptr just built (1 = *T,
+  # 2 = **T, 3 = ***T ...).  last_pointee_type alone cannot tell ***T
+  # from ****T.
+  last_ptr_depth: i32
   # For array types - stores the last parsed array info
   last_array_size: i32       # Size of array (e.g., 16 for [16]i32)
   last_array_elem_type: i32  # Element type (e.g., TYPE_I32)

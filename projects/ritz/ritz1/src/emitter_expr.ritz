@@ -152,7 +152,7 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
         if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
             levels = 1
         else if loc.var_type == TYPE_PTR_PTR
-            levels = 2
+            levels = ptr_ptr_ident_levels(loc.inner_pointee_type)
         if levels == 0
             return 0
         let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
@@ -173,7 +173,7 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
         if f.field_type == TYPE_PTR
             flevels = 1
         else if f.field_type == TYPE_PTR_PTR
-            flevels = 2
+            flevels = ptr_ptr_ident_levels(f.inner_pointee_type)
         if flevels == 0
             return 0
         let fst: *StructDef = find_struct(s, f.field_type_name, f.field_type_name_len)
@@ -191,7 +191,39 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
         *out_st = sub_st
         *out_levels = sub_levels - 1
         return emit_load_ptr(s, sub_reg)
+    # AGAST #1924: `y + k` / `y - k` where y is a `*S` (`*(pp + i) + k`):
+    # emit_expr strides it by sizeof(S) (deref_pointee_struct_name names S
+    # for the left operand), so `(*(*(pp + i) + k)).f` GEPs into the right
+    # element.  Only the one-level case: `(**(ppp + 1)).f` keeps its error.
+    if x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB)
+        var b_name: *u8 = null
+        var b_len: i32 = 0
+        deref_pointee_struct_name(s, x, @b_name, @b_len)
+        if b_len <= 0
+            return 0
+        let b_st: *StructDef = find_struct(s, b_name, b_len)
+        if b_st == null
+            return 0
+        let b_val: i32 = emit_expr(s, x)
+        let b_ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, b_ptr)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, b_val)
+        emit_str(s, c" to ptr\n")
+        *out_st = b_st
+        *out_levels = 1
+        return b_ptr
     return 0
+
+# AGAST #1924: pointer levels of a `**S` local/param/field from its inner
+# pointee slot: 3 for `***S`.  2 when the slot records nothing (the
+# pre-#1924 assumption, kept for names whose depth was never recorded).
+fn ptr_ptr_ident_levels(slot: i32) -> i32
+    let lv: i32 = ptr_ptr_slot_levels(slot)
+    if lv < 2
+        return 2
+    return lv
 
 fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     result.reg = 0

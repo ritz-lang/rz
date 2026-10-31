@@ -1166,6 +1166,15 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
             cloned.param_type_name = new_name
             cloned.param_type_name_len = new_len
 
+    # AGAST #1924: a `**T` param (any depth) records its innermost pointee as
+    # TYPE_STRUCT named "T"; concretize it as the `*T` case above does, so
+    # `*(*(pp + i) + k)` in pp_get<i32> loads an i32 and strides by 4.
+    if cloned.param_type == TYPE_PTR_PTR and ptr_ptr_slot_inner(cloned.param_inner_pointee_type) == TYPE_STRUCT
+        if cloned.param_type_name != null and cloned.param_type_name_len == type_param_len and memcmp(cloned.param_type_name, type_param, type_param_len as i64) == 0
+            cloned.param_inner_pointee_type = ptr_ptr_slot_subst(cloned.param_inner_pointee_type, subst_type)
+            cloned.param_type_name = subst_name
+            cloned.param_type_name_len = subst_len
+
     cloned.next = clone_params_with_suffix(params.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     return cloned
 
@@ -1350,6 +1359,12 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         cloned.var_array_elem_type = s.var_array_elem_type
         cloned.var_pointee_type = s.var_pointee_type
         cloned.var_inner_pointee_type = s.var_inner_pointee_type  # AGAST #1815
+        # AGAST #1924: `let pp: **T` concretizes T like a `**T` param.
+        var pp_local_subst: i32 = 0
+        if s.var_type == TYPE_PTR_PTR and ptr_ptr_slot_inner(s.var_inner_pointee_type) == TYPE_STRUCT
+            if s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+                cloned.var_inner_pointee_type = ptr_ptr_slot_subst(s.var_inner_pointee_type, subst_type)
+                pp_local_subst = 1
         cloned.var_fn_sig = clone_fn_sig(s.var_fn_sig, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)  # AGAST #1671
         # Substitute type param in variable type name (e.g., Vec<T> -> Vec$u8)
         if s.var_type == TYPE_STRUCT and s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
@@ -1367,6 +1382,9 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
             substitute_type_param_in_name(s.var_type_name, s.var_type_name_len, type_param, type_param_len, suffix, suffix_len, @new_name_ptr, @new_name_len)
             cloned.var_type_name = new_name_ptr
             cloned.var_type_name_len = new_name_len
+        else if pp_local_subst == 1
+            cloned.var_type_name = subst_name
+            cloned.var_type_name_len = subst_len
         else
             cloned.var_type_name = s.var_type_name
             cloned.var_type_name_len = s.var_type_name_len
@@ -1760,6 +1778,7 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
     let cloned: *StructField = malloc(sizeof(StructField)) as *StructField
     cloned.name = fields.name
     cloned.name_len = fields.name_len
+    cloned.inner_pointee_type = fields.inner_pointee_type  # AGAST #1924
 
     # Check if field type is the type parameter
     if fields.field_type == TYPE_STRUCT
@@ -1847,6 +1866,7 @@ fn clone_struct_fields_multi(fields: *StructField, tp: *TypeParam, suffix: *u8, 
     let cloned: *StructField = malloc(sizeof(StructField)) as *StructField
     cloned.name = fields.name
     cloned.name_len = fields.name_len
+    cloned.inner_pointee_type = fields.inner_pointee_type  # AGAST #1924
     cloned.field_type = fields.field_type
     cloned.field_type_name = fields.field_type_name
     cloned.field_type_name_len = fields.field_type_name_len

@@ -714,6 +714,11 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
     if var_type == TYPE_PTR and g.pointee_type == TYPE_STRUCT
         g.pointee_type_name = p.last_type_name
         g.pointee_type_name_len = p.last_type_name_len
+    else if var_type == TYPE_PTR_PTR and ptr_ptr_slot_inner(g.inner_pointee_type) == TYPE_STRUCT
+        # AGAST #1944: and the S of `var g: **S` (any depth), so `*g + 1`
+        # strides sizeof(S) as it does for a `**S` param or local.
+        g.pointee_type_name = p.last_type_name
+        g.pointee_type_name_len = p.last_type_name_len
     else
         g.pointee_type_name = null
         g.pointee_type_name_len = 0
@@ -957,8 +962,10 @@ pub fn struct_def_new(p: *Parser, name: *u8, len: i32, fields: *StructField, lin
     return s
 
 pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *StructField
-    let f: *StructField = parser_alloc(p, 72) as *StructField  # Updated size for new fields
+    let f: *StructField = parser_alloc(p, sizeof(StructField)) as *StructField
     f.name = name as *u8
+    # AGAST #1924: `rows: **i32` -> `*(*(s.rows + i) + k)` loads an i32.
+    f.inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     f.name_len = len
     f.field_type = ty
     # Copy struct type name if this is a struct-typed field OR a pointer-to-struct field
@@ -1424,9 +1431,10 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
         # struct name (as params do) so `q.a` resolves.
         p.var_type_name = p.last_type_name
         p.var_type_name_len = p.last_type_name_len
-    else if ty == TYPE_PTR_PTR and ptr_ptr_inner_pointee(p, ty) == TYPE_STRUCT
+    else if ty == TYPE_PTR_PTR and ptr_ptr_slot_inner(ptr_ptr_inner_pointee(p, ty)) == TYPE_STRUCT
         # AGAST #1933: `let pp: **S = ...` keeps S (as a `**S` param does)
-        # so `(**pp).f` resolves.  `***S` is not covered (see #1924).
+        # so `(**pp).f` resolves.  AGAST #1924: `***S` too; its depth rides
+        # in var_inner_pointee_type.
         p.var_type_name = p.last_type_name
         p.var_type_name_len = p.last_type_name_len
     else
@@ -1509,13 +1517,17 @@ pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i
     return TYPE_ARRAY
 
 # AGAST #1815: the innermost pointee of a just-parsed `**T`, for
-# Param / Stmt / GlobalVarDef.  Exactly two levels only (last_pointee_type
-# is TYPE_PTR): for `***T` the element of `*(ppp + i)` is itself a `**T`,
-# which this one-slot record cannot describe, so it answers TYPE_VOID.
+# Param / Stmt / GlobalVarDef / StructField.  AGAST #1924: a `***T` (or
+# deeper) packs its extra levels in as multiples of PTR_DEPTH_UNIT, so
+# `*(*(*(ppp + i) + j) + k)` knows both the 8-byte strides and T.
 pub fn ptr_ptr_inner_pointee(p: *Parser, ty: i32) -> i32
-    if ty == TYPE_PTR_PTR and p.last_pointee_type == TYPE_PTR
+    if ty != TYPE_PTR_PTR
+        return TYPE_VOID
+    if p.last_pointee_type == TYPE_PTR
         return p.last_inner_pointee_type
-    return TYPE_VOID
+    if p.last_ptr_depth < 3 or p.last_inner_pointee_type == TYPE_VOID
+        return TYPE_VOID
+    return p.last_inner_pointee_type + (p.last_ptr_depth - 2) * PTR_DEPTH_UNIT
 
 # Handle pointer type *T
 # Stores the pointee type and preserves type name if pointing to struct/generic
@@ -1529,6 +1541,10 @@ pub fn type_ptr(p: *Parser, inner_type: i32) -> i32
     # last_pointee_type=TYPE_PTR.
     if inner_type != TYPE_PTR and inner_type != TYPE_PTR_PTR
         p.last_inner_pointee_type = inner_type
+        p.last_ptr_depth = 1
+    else
+        # AGAST #1924: one more level on the pointer just built.
+        p.last_ptr_depth = p.last_ptr_depth + 1
     # Note: last_type_name/len was already set by parsing inner_type if it's a struct/generic
     # No need to modify it - stmt_var_decl will read both
     # Return TYPE_PTR_PTR for pointer-to-pointer types
@@ -1572,6 +1588,7 @@ struct AliasEntry
     array_elem_type_name: *u8
     array_elem_type_name_len: i32
     ref_inner_type: i32
+    ptr_depth: i32         # AGAST #1924
 
 const MAX_TYPE_ALIASES: i32 = 1024
 const ALIAS_ENTRY_BYTES: i64 = 128   # >= sizeof(AliasEntry), with headroom
@@ -1630,6 +1647,7 @@ pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
     e.type_name_len = p.last_type_name_len
     e.pointee_type = p.last_pointee_type
     e.inner_pointee_type = p.last_inner_pointee_type
+    e.ptr_depth = p.last_ptr_depth
     e.array_size = p.last_array_size
     e.array_elem_type = p.last_array_elem_type
     e.array_elem_type_name = p.last_array_elem_type_name
@@ -1649,6 +1667,7 @@ pub fn type_alias_resolve(p: *Parser, name: *u8, len: i32) -> i32
         p.last_type_name_len = e.type_name_len
         p.last_pointee_type = e.pointee_type
         p.last_inner_pointee_type = e.inner_pointee_type
+        p.last_ptr_depth = e.ptr_depth
         p.last_array_size = e.array_size
         p.last_array_elem_type = e.array_elem_type
         p.last_array_elem_type_name = e.array_elem_type_name

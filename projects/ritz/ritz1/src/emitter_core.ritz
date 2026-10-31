@@ -2679,11 +2679,83 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
     emit_ir_error(s, c"pointer arithmetic: element size of pointee unknown for a non-name operand")
     return 1
 
-# AGAST #1815: the element a `*(pp + i)` (or `*pp`) points at, when `pp` is a
-# `**T` local, param or global with a primitive T: `*(*(pp + i) + k)` loads a
-# T and `*(pp + i) + k` strides by sizeof(T).  TYPE_VOID when unknown (not a
-# deref, not a `**T` name, a struct T, or a deeper pointer) — callers keep
-# their previous behaviour then.
+# AGAST #1924: the static pointer type of `x`, as a level count plus the
+# innermost pointee.  Returns the levels (1 = `*T`, 2 = `**T`, 3 = `***T`)
+# and writes T to *out_inner and, for a struct T, its name to *out_name /
+# *out_len.  0 when unknown.
+#
+# Only shapes rooted in a recorded `**T` (or deeper) answer: an identifier
+# (local, param, global) or a struct field at any member-chain depth, then
+# `y + k` / `y - k` (same type as y) and `*y` (one level fewer).  So
+# `*(*(h.rows + i) + k)`, `*(*(*(ppp + i) + j) + k)` and `*(g + i) + k`
+# all resolve.  A plain `*T` base answers 0: the callers already handle it.
+#
+# #1815 / #1941 resolved identifier bases only, exactly two levels deep, so
+# a `**T` field, a `***T`, a global `**S` and a monomorphised `**T` param
+# still loaded i64 and stepped one byte.
+fn ptr_levels_of(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8, out_len: *i32) -> i32
+    *out_inner = TYPE_VOID
+    *out_name = null
+    *out_len = 0
+    if x == null
+        return 0
+    if x.kind == EXPR_BINARY
+        if x.op == OP_ADD or x.op == OP_SUB
+            return ptr_levels_of(s, x.left, out_inner, out_name, out_len)
+        return 0
+    if x.kind == EXPR_UNARY
+        if x.op != OP_DEREF or x.operand == null
+            return 0
+        let sub: i32 = ptr_levels_of(s, x.operand, out_inner, out_name, out_len)
+        if sub < 2
+            *out_inner = TYPE_VOID
+            *out_name = null
+            *out_len = 0
+            return 0
+        return sub - 1
+    var slot: i32 = TYPE_VOID
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if x.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+        if loc != null
+            if loc.var_type != TYPE_PTR_PTR
+                return 0
+            slot = loc.inner_pointee_type
+            name = loc.type_name
+            name_len = loc.type_name_len
+        else
+            let glob: *GlobalVarDef = find_global(s, x.ident_ptr, x.ident_len)
+            if glob == null or glob.var_type != TYPE_PTR_PTR
+                return 0
+            slot = glob.inner_pointee_type
+            name = glob.pointee_type_name
+            name_len = glob.pointee_type_name_len
+    else if x.kind == EXPR_MEMBER
+        let fld: *StructField = member_field_def(s, x)
+        if fld == null or fld.field_type != TYPE_PTR_PTR
+            return 0
+        slot = fld.inner_pointee_type
+        name = fld.field_type_name
+        name_len = fld.field_type_name_len
+    else
+        return 0
+    let levels: i32 = ptr_ptr_slot_levels(slot)
+    if levels < 2
+        return 0
+    let inner: i32 = ptr_ptr_slot_inner(slot)
+    *out_inner = inner
+    # A primitive `**u8` param still carries a stale parser type name.
+    if inner == TYPE_STRUCT
+        *out_name = name
+        *out_len = name_len
+    return levels
+
+# AGAST #1815: the element a `*(pp + i)` (or `*pp`) points at, when that is
+# a primitive T: `*(*(pp + i) + k)` loads a T and `*(pp + i) + k` strides by
+# sizeof(T).  TYPE_VOID when unknown (not a deref, a struct T, or itself a
+# pointer, which loads and stores as i64 anyway) — callers keep their
+# previous behaviour then.  AGAST #1924: any base ptr_levels_of resolves.
 #
 # ritz1's own enum tracker read its `**u8` name table this way under
 # self-hosting and got `load i64` for each byte, so it carried a "load each
@@ -2691,41 +2763,49 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
 fn deref_ptr_ptr_elem_type(s: *EmitterState, d: *Expr) -> i32
     if d == null or d.kind != EXPR_UNARY or d.op != OP_DEREF or d.operand == null
         return TYPE_VOID
-    let base: *Expr = find_base_expr(d.operand)
-    if base.kind != EXPR_IDENT
-        return TYPE_VOID
     var inner: i32 = TYPE_VOID
-    let loc: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
-    if loc != null
-        if loc.var_type == TYPE_PTR_PTR
-            inner = loc.inner_pointee_type
-    else
-        let glob: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
-        if glob != null and glob.var_type == TYPE_PTR_PTR
-            inner = glob.inner_pointee_type
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if ptr_levels_of(s, d, @inner, @name, @name_len) != 1
+        return TYPE_VOID
     if inner == TYPE_STRUCT or ptr_pointee_size(s, inner, null, 0) == 0
         return TYPE_VOID
     return inner
 
-# AGAST #1941: sizeof(S) for `*pp` / `*(pp + i)` when `pp` is a `**S` local
-# or param, so `*pp + 1` strides one S.  deref_ptr_ptr_elem_type answers
-# TYPE_VOID for a struct inner pointee (its callers want a primitive load or
-# store width), which left ptr_arith_elem_size classifying `*pp` as "not a
-# pointer" and emitting a raw BYTE add: `next.v` read across the S boundary.
-# 0 when not that shape.  Requires inner_pointee_type == TYPE_STRUCT, not
-# just a type name: a `***S` keeps S's name too, but `*ppp` is a `**S` and
-# strides 8 (ptr_ptr_inner_pointee answers TYPE_VOID for it).  `**S` globals
-# keep no struct name (GlobalVarDef.type_name is for TYPE_STRUCT only).
-fn deref_ptr_ptr_struct_size(s: *EmitterState, d: *Expr) -> i64
+# AGAST #1941 / #1924: the element stride of a pointer-valued `*y`, for
+# `*pp + 1` / `*(pp + i) + k`: sizeof(T) when `*y` is a `*T` (struct T
+# included: sizeof(S)), 8 when it is itself a pointer to pointer
+# (`*ppp + 1` with `ppp: ***S`, #1944).  0 when not that shape, which
+# ptr_arith_elem_size reads as "not a pointer" (a raw byte add).
+fn deref_ptr_ptr_stride(s: *EmitterState, d: *Expr) -> i64
     if d == null or d.kind != EXPR_UNARY or d.op != OP_DEREF or d.operand == null
         return 0
-    let base: *Expr = find_base_expr(d.operand)
-    if base.kind != EXPR_IDENT
-        return 0
-    let loc: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
-    if loc == null or loc.var_type != TYPE_PTR_PTR or loc.inner_pointee_type != TYPE_STRUCT
-        return 0
-    return ptr_pointee_size(s, TYPE_STRUCT, loc.type_name, loc.type_name_len)
+    var inner: i32 = TYPE_VOID
+    var name: *u8 = null
+    var name_len: i32 = 0
+    let levels: i32 = ptr_levels_of(s, d, @inner, @name, @name_len)
+    if levels >= 2
+        return 8
+    if levels == 1
+        return ptr_pointee_size(s, inner, name, name_len)
+    return 0
+
+# AGAST #1924: the struct S that a pointer-valued `*y` points at (`*(pp + i)`
+# with `pp: **S`, `*(t.cells + i)` with a `**S` field, `*g`), so
+# `*(*(pp + i) + k)` loads `%S` and `(*(*(pp + i) + k)).f` resolves.
+# Writes null/0 when not that shape.
+fn deref_ptr_ptr_struct_name(s: *EmitterState, d: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if d == null or d.kind != EXPR_UNARY or d.op != OP_DEREF or d.operand == null
+        return
+    var inner: i32 = TYPE_VOID
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if ptr_levels_of(s, d, @inner, @name, @name_len) != 1 or inner != TYPE_STRUCT
+        return
+    *out_name = name
+    *out_len = name_len
 
 # Classify an operand of `+`/`-` as pointer arithmetic, and if so give its
 # element stride.  Returns 0 for "not a pointer", otherwise the element size
@@ -2805,12 +2885,10 @@ fn ptr_arith_elem_size(s: *EmitterState, e: *Expr) -> i64
         # q is an identifier with a recorded pointee.)
         if (e.op == OP_ADDR or e.op == OP_ADDR_MUT) and e.operand != null and e.operand.kind == EXPR_INDEX
             return index_elem_size(s, e.operand)
-        # AGAST #1815: `*(pp + i) + k` for `pp: **T` strides by sizeof(T).
-        let dpt: i32 = deref_ptr_ptr_elem_type(s, e)
-        if dpt != TYPE_VOID
-            return ptr_pointee_size(s, dpt, null, 0)
-        # AGAST #1941: ... and `*pp + 1` for `pp: **S` by sizeof(S).
-        return deref_ptr_ptr_struct_size(s, e)
+        # AGAST #1815 / #1941 / #1924: `*(pp + i) + k` for `pp: **T`
+        # strides by sizeof(T) (sizeof(S) for `**S`, 8 for `***T`), whatever
+        # the base: local, param, global or struct field.
+        return deref_ptr_ptr_stride(s, e)
     return 0
 
 # Byte size of the element an index expression `base[i]` names, for
@@ -3003,6 +3081,15 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         else if e.op == OP_BIT_NOT
             return TYPE_I64
         else if e.op == OP_DEREF
+            # AGAST #1924: `*(ppp + i)` with `ppp: ***T` is itself a `**T`.
+            # The arm below calls every deref of a `**` a `*T`, so the next
+            # deref out lost the pointee and `*(*(*(ppp + i) + j) + k)`
+            # loaded i64.
+            var dl_inner: i32 = TYPE_VOID
+            var dl_name: *u8 = null
+            var dl_len: i32 = 0
+            if ptr_levels_of(s, e, @dl_inner, @dl_name, @dl_len) >= 2
+                return TYPE_PTR_PTR
             let inner_type: i32 = get_expr_type(s, e.operand)
             if inner_type == TYPE_PTR_PTR
                 return TYPE_PTR  # Deref **T gives *T
