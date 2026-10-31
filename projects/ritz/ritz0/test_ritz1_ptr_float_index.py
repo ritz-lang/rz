@@ -128,18 +128,18 @@ def test_ptr_float_index_through_addr_of_element(ritz1_bin, tmp_path):
 
 # A range `p[a..b]` over a `*f32` / `*f64` is an element pointer, not a
 # float: get_expr_type must not call it F32 / F64, or the `as *u32` cast
-# lowers as a float->int conversion of a pointer.  `lo` is 0 because a bare
-# pointer's range GEP strides by i8 whatever the pointee (AGAST #1974).
+# lowers as a float->int conversion of a pointer.  `lo` is non-zero: the
+# range GEP strides by float / double (AGAST #1974), so p[1..3] is a[1].
 RANGE = """\
 pub fn main() -> i32
     var a: [4]f32 = [1.0, 2.0, 3.0, 4.0]
-    var d: [2]f64 = [1.0, -0.5]
+    var d: [3]f64 = [7.0, 1.0, -0.5]
     let p: *f32 = @a as *f32
-    let q: *u32 = p[0..2] as *u32
-    if q[1] != 0x40000000
+    let q: *u32 = p[1..3] as *u32
+    if q[0] != 0x40000000
         return 1
     let pd: *f64 = @d as *f64
-    let r: *u64 = pd[0..2] as *u64
+    let r: *u64 = pd[1..3] as *u64
     if r[1] != 0xBFE0000000000000
         return 2
     return 42
