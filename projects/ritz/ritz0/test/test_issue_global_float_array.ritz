@@ -1,0 +1,119 @@
+# AGAST #1970: ritz1 declares a global `var g: [N]f32` / `[N]f64` as
+# `[N x float]` / `[N x double]` and indexes it at that width.
+#
+# THE DEFECT
+#
+# global_array_elem_llvm had no float case, so `var gd: [3]f64` was declared
+# `[3 x i64]`, `gd[1] = 2.5` stored `store i64 %double` and `gd[1]` loaded an
+# i64 into a double -- clang rejects the IR.
+#
+# THE FIX (ritz1/src/emitter_core.ritz global_array_elem_llvm, get_expr_type;
+# emitter_stmt.ritz global index store)
+#
+# The declaration, every GEP / load / store use local_array_elem_llvm's
+# float / double; an f64 value stored into an f32 slot is fptrunc'd; `g[i]`
+# has type F32 / F64, so a binop or compare over it uses the float width.
+#
+# ritz0 rejects float global initialisers (#1539), so values are set at run
+# time.  They are checked as values and as IEEE-754 bits through a `*u32` /
+# `*u64` view of the global, which pins the declared width and stride.
+#
+# Oracle: ritz0 runs every case to the same result.
+
+var gfa_d: [3]f64
+var gfa_f: [4]f32
+
+fn gfa_bits32(p: *u32, i: i64) -> u32
+    p[i]
+
+fn gfa_bits64(p: *u64, i: i64) -> u64
+    p[i]
+
+# The ticket's repro.
+fn gfa_repro() -> i32
+    gfa_d[1] = 2.5
+    let x: f64 = gfa_d[1]
+    let y: f32 = 1.5
+    gfa_f[0] = y
+    let z: f32 = gfa_f[0]
+    if x != 2.5
+        return 1
+    if z != y
+        return 2
+    return 42
+
+[[test]]
+fn test_global_float_array_repro() -> i32
+    assert gfa_repro() == 42
+    0
+
+# --- [N]f64 -----------------------------------------------------------------
+
+fn gfa_f64_main() -> i32
+    gfa_d[0] = 1.0
+    gfa_d[1] = -0.5
+    gfa_d[2] = gfa_d[0] + gfa_d[1]
+    if gfa_bits64(@gfa_d as *u64, 0) != 0x3FF0000000000000      # 1.0
+        return 1
+    if gfa_bits64(@gfa_d as *u64, 1) != 0xBFE0000000000000      # -0.5
+        return 2
+    if gfa_bits64(@gfa_d as *u64, 2) != 0x3FE0000000000000      # 0.5
+        return 3
+    # `gfa_d[i]` is an f64: a compare / binop with a literal stays double.
+    if gfa_d[2] * 4.0 != 2.0
+        return 4
+    let w: f64 = -0.5
+    if gfa_d[1] != w
+        return 5
+    var i: i64 = 0
+    var sum: f64 = 0.0
+    while i < 3
+        sum = sum + gfa_d[i]
+        i = i + 1
+    if sum != 1.0
+        return 6
+    return 42
+
+[[test]]
+fn test_global_float_array_f64() -> i32
+    assert gfa_f64_main() == 42
+    0
+
+# --- [N]f32 -----------------------------------------------------------------
+
+fn gfa_f32_main() -> i32
+    let one: f32 = 1.0
+    let two: f32 = 2.0
+    gfa_f[0] = one
+    gfa_f[1] = two
+    # A literal (an f64 value) stored into an f32 slot narrows (fptrunc).
+    gfa_f[2] = 6.5
+    gfa_f[3] = gfa_f[0] + gfa_f[1]
+    if gfa_bits32(@gfa_f as *u32, 0) != 0x3F800000      # 1.0
+        return 1
+    if gfa_bits32(@gfa_f as *u32, 1) != 0x40000000      # 2.0
+        return 2
+    if gfa_bits32(@gfa_f as *u32, 2) != 0x40D00000      # 6.5
+        return 3
+    if gfa_bits32(@gfa_f as *u32, 3) != 0x40400000      # 3.0
+        return 4
+    # `gfa_f[i]` is an f32: the literal side of a binop / compare narrows.
+    if gfa_f[2] * 2.0 != 13.0
+        return 5
+    let w: f32 = 3.0
+    if gfa_f[3] != w
+        return 6
+    var i: i64 = 0
+    var sum: f32 = 0.0
+    while i < 4
+        sum = sum + gfa_f[i]
+        i = i + 1
+    let want: f32 = 12.5
+    if sum != want
+        return 7
+    return 42
+
+[[test]]
+fn test_global_float_array_f32() -> i32
+    assert gfa_f32_main() == 42
+    0

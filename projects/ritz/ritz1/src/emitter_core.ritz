@@ -1059,9 +1059,11 @@ pub fn build_symbol_maps(s: *EmitterState)
 # lowering GEPs `[N x <this>], ptr @g, i64 0, i64 idx` and loads/stores at this
 # width, so the declaration and every access must agree. It differs from
 # emit_llvm_type, which lowers pointers to i64 and bool to i1. Struct elements
-# are not covered here; the declaration names `%T` for those.
+# are not covered here; the declaration names `%T` for those.  AGAST #1970:
+# f32 / f64 elements are `float` / `double`, as for a local array (#1966);
+# they were `i64`, so `g[i] = 2.5` stored `store i64 %double`.
 fn global_array_elem_llvm(g: *GlobalVarDef) -> *u8
-    return array_elem_llvm(g.array_elem_type)
+    return local_array_elem_llvm(g.array_elem_type)
 
 # The LLVM element type of a non-struct `[N]T` array, global or local. It is
 # the spelling both emit_globals and emit_var_decl's `alloca [N x T]` use, so
@@ -1098,8 +1100,8 @@ fn field_array_elem_llvm(t: i32) -> *u8
 # therefore of every GEP / load / store over it: f32 / f64 elements are real
 # `float` / `double`, as for a struct field (ritz0's layout).  AGAST #1966:
 # they were `i64` slots, so `let a: [3]f32 = [1.0, 2.0, 3.5]` stored
-# `store i64 %double`.  bool keeps its i64 slot.  Globals still use
-# array_elem_llvm (#1970).
+# `store i64 %double`.  bool keeps its i64 slot.  A global `[N]T`
+# uses it too (global_array_elem_llvm, #1970).
 fn local_array_elem_llvm(t: i32) -> *u8
     if t == TYPE_F32
         return c"float"
@@ -3199,12 +3201,21 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 # a `float` / `double` (local_array_elem_llvm); say so, or a
                 # binop / compare over it picks the other operand's width.
                 # A range `loc[a..b]` is an element pointer (i64), not one.
+                # AGAST #1970: likewise a global `[N]f32` / `[N]f64`
+                # (global_array_elem_llvm).
                 let arr_loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+                var arr_elem: i32 = TYPE_UNKNOWN
+                if arr_loc != null
+                    arr_elem = arr_loc.array_elem_type
+                else
+                    let arr_glob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+                    if arr_glob != null
+                        arr_elem = arr_glob.array_elem_type
                 var is_range: i32 = 0
                 if e.right != null and e.right.kind == EXPR_RANGE
                     is_range = 1
-                if is_range == 0 and arr_loc != null and (arr_loc.array_elem_type == TYPE_F32 or arr_loc.array_elem_type == TYPE_F64)
-                    return arr_loc.array_elem_type
+                if is_range == 0 and (arr_elem == TYPE_F32 or arr_elem == TYPE_F64)
+                    return arr_elem
         return TYPE_I64  # Default
     else if e.kind == EXPR_UNARY
         if e.op == OP_ADDR
