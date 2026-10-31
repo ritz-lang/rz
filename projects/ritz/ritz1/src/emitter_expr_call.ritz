@@ -347,6 +347,8 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     if ap != null
         ap = ap.next
     while arg != null
+        # Receiver is argument 1, as ritz0 numbers it (AGAST #1948).
+        check_struct_ptr_arg(s, e, e.ident_ptr, e.ident_len, arg_count + 2, arg, ap)
         arg_regs[arg_count] = emit_call_arg(s, arg, ap)
         arg_count = arg_count + 1
         if ap != null
@@ -730,6 +732,116 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if param_uses_byval(s, p) == 1
         return spill_byval_arg(s, arg, reg, p)
     return reg
+
+# AGAST #1948: the struct a pointer-to-struct param points at, or null.
+# `p: *T`, `p: @T` and `p: @&T` qualify (not the auto-deref `p:& T` borrow,
+# whose argument is a value), and only when T names a struct the module
+# defines: a primitive pointee, or a name that resolves to nothing, says
+# nothing checkable.
+fn param_pointee_struct(s: *EmitterState, p: *Param, out_len: *i32) -> *u8
+    *out_len = 0
+    if p == null or p.is_borrow == 1 or p.param_type_name_len <= 0
+        return null
+    if p.param_type != TYPE_PTR and p.param_type != TYPE_REF and p.param_type != TYPE_MUT_REF
+        return null
+    if p.param_pointee_type != TYPE_STRUCT
+        return null
+    if find_struct(s, p.param_type_name, p.param_type_name_len) == null
+        return null
+    *out_len = p.param_type_name_len
+    return p.param_type_name
+
+# AGAST #1948: the struct an argument expression statically points at, or
+# null when it is not one of the shapes whose pointee ritz1 knows for sure:
+#   `@x` / `@&x`     x a struct-typed local, or a struct-typed field chain;
+#   `x`              x a local declared `*T` / `@T` / `@&T` with T a struct.
+# Anything else (casts, calls, arithmetic, globals) answers null: the check
+# fails OPEN on shapes it cannot type, never by guessing.
+fn arg_pointee_struct(s: *EmitterState, arg: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if arg == null
+        return null
+    var name: *u8 = null
+    var len: i32 = 0
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+        let x: *Expr = arg.operand
+        if x == null
+            return null
+        if x.kind == EXPR_IDENT
+            let loc: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+            if loc == null or loc.var_type != TYPE_STRUCT
+                return null
+            name = loc.type_name
+            len = loc.type_name_len
+        else if x.kind == EXPR_MEMBER
+            let f: *StructField = member_field_def(s, x)
+            if f == null or f.field_type != TYPE_STRUCT
+                return null
+            name = f.field_type_name
+            len = f.field_type_name_len
+        else
+            return null
+    else if arg.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, arg.ident_ptr, arg.ident_len)
+        if loc == null
+            return null
+        if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+            return null
+        if loc.pointee_type != TYPE_STRUCT
+            return null
+        name = loc.type_name
+        len = loc.type_name_len
+    else
+        return null
+    if name == null or len <= 0
+        return null
+    if find_struct(s, name, len) == null
+        return null
+    *out_len = len
+    return name
+
+# AGAST #1948: passing a pointer to struct A where a pointer to struct B is
+# expected is a located error, as in ritz0 (#1366).  ritz1's value model
+# makes every pointer an i64, so nothing downstream (clang included) can see
+# the pointee: a GrowBuf passed as `@&Vec<u8>` ran only because the two share
+# a layout, and with different layouts the callee silently reads and writes
+# the wrong fields.  `call` is the call expression (for its location),
+# `fname` the callee as written in the diagnostic, `argno` 1-based.
+fn check_struct_ptr_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
+    var want_len: i32 = 0
+    let want: *u8 = param_pointee_struct(s, p, @want_len)
+    if want == null
+        return
+    var got_len: i32 = 0
+    let got: *u8 = arg_pointee_struct(s, arg, @got_len)
+    if got == null
+        return
+    if name_eq(want, want_len, got, got_len) == 1
+        return
+    emit_str(s, c"  ; ERROR: struct pointer argument mismatch (AGAST #1948)\n")
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_int(call.span.line as i64)
+    eprint_char(':')
+    eprint_int(call.span.col as i64)
+    eprints_cstr(c": argument ")
+    eprint_int(argno as i64)
+    eprints_cstr(c" of `")
+    for i in 0..flen
+        eprint_char(*(fname + i))
+    eprints_cstr(c"` has the wrong type: ")
+    for i in 0..want_len
+        eprint_char(*(want + i))
+    eprints_cstr(c"* != ")
+    for i in 0..got_len
+        eprint_char(*(got + i))
+    eprints_cstr(c"*\n")
+    s.error_count = s.error_count + 1
 
 # AGAST #1739 — a large by-value struct param is passed `ptr byval(%T)`.
 # Spill the argument into a fresh slot right after evaluating it, before the
@@ -1783,6 +1895,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     if fn_def != null
         ap = fn_def.params
     while arg2 != null
+        check_struct_ptr_arg(s, e, e.func_name, e.func_name_len, arg_count + 1, arg2, ap)
         arg_regs[arg_count] = emit_call_arg(s, arg2, ap)
         arg_count += 1
         if ap != null
@@ -2996,6 +3109,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 # No receiver: params line up from the head (AGAST #1498).
                 var sm_ap: *Param = sm_method.params
                 while sm_arg != null
+                    check_struct_ptr_arg(s, e, e.ident_ptr, e.ident_len, sm_arg_count + 1, sm_arg, sm_ap)
                     sm_arg_regs[sm_arg_count] = emit_call_arg(s, sm_arg, sm_ap)
                     sm_arg_count = sm_arg_count + 1
                     if sm_ap != null
@@ -3258,6 +3372,8 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         if ap != null
             ap = ap.next
     while arg != null
+        # Receiver is argument 1, as ritz0 numbers it (AGAST #1948).
+        check_struct_ptr_arg(s, e, e.ident_ptr, e.ident_len, arg_count + 2, arg, ap)
         arg_regs[arg_count] = emit_call_arg(s, arg, ap)
         conv_regs[arg_count] = arg_regs[arg_count]
         arg_count = arg_count + 1
