@@ -113,6 +113,56 @@ fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: *u8) -> i32
   lex.pending_dedents = 0
   1
 
+# The byte an escape `\<esc>` cooks to, or -1 if the language defines no such
+# escape (AGAST #1978).  The one table for every literal kind: the "..." and
+# c"..." scanners below, the TOK_CHAR check, and ast_helpers' expr_char.
+# `braces` is 1 for "..." and '.' literals, which (as in ritz0) also accept
+# `\{` and `\}`; c"..." has no interpolation, so there they are unknown.
+# Every arm used to end in "unknown escape -> the literal char", which
+# silently turned c"a\xC3b" into "axC3b".  `\xNN` is deliberately absent:
+# LANGUAGE_SPEC lists the escapes, and widening it is a LARB decision.
+pub fn lexer_cook_escape(esc: i32, braces: i32) -> i32
+  if esc == 110       # \n
+    return 10
+  if esc == 116       # \t
+    return 9
+  if esc == 114       # \r
+    return 13
+  if esc == 92        # \\
+    return 92
+  if esc == 34        # \"
+    return 34
+  if esc == 39        # \'
+    return 39
+  if esc == 48        # \0
+    return 0
+  if braces == 1 and (esc == 123 or esc == 125)  # \{ \}
+    return esc
+  -1
+
+# Fatal, located TOK_ERROR for an unknown escape `\<esc>` whose escape char
+# (the byte after the backslash) is at source offset `pos` -- the column
+# ritz0 reports -- naming the escape as ritz0 does:
+#   Unknown escape sequence '\x'
+fn lexer_fail_escape(lex: *Lexer, pos: i64, line: i32, col: i32, esc: i32) -> Token
+  let prefix: *u8 = c"Unknown escape sequence '\\"
+  var n: i64 = 0
+  while *(prefix + n) != 0
+    n = n + 1
+  # prefix + escape byte + closing quote + NUL.  Fatal path: never freed.
+  let msg: *u8 = malloc(n + 3)
+  for i in 0..n
+    *(msg + i) = *(prefix + i)
+  *(msg + n) = esc as u8
+  *(msg + n + 1) = 39
+  *(msg + n + 2) = 0
+  lex.error_msg = msg
+  lex.pos = lex.len
+  lex.pending_dedents = 0
+  var tok: Token = token_new(TOK_ERROR, pos, 1, line, col)
+  tok.start = lex.src + pos
+  tok
+
 # Initialize a lexer with source and pre-allocated NFA/patterns storage
 fn lexer_init(lex: *Lexer, src: *u8, len: i32, nfa: *NFA, patterns: *TokenPattern) -> i32
   lex.src = src
@@ -483,24 +533,11 @@ fn lexer_next(lex: *Lexer) -> Token
           lex.col = lex.col + 1
           if lex.pos < lex.len
             let esc_ch: i32 = lexer_peek_at(lex, 0)
-            var cooked: i8 = 0
-            if esc_ch == 110       # \n -> newline
-              cooked = 10
-            else if esc_ch == 116  # \t -> tab
-              cooked = 9
-            else if esc_ch == 114  # \r -> carriage return
-              cooked = 13
-            else if esc_ch == 92   # \\ -> backslash
-              cooked = 92
-            else if esc_ch == 34   # \" -> quote
-              cooked = 34
-            else if esc_ch == 48   # \0 -> null
-              cooked = 0
-            else
-              # Unknown escape - just emit the literal char
-              cooked = esc_ch as i8
+            let cooked: i32 = lexer_cook_escape(esc_ch, 1)
+            if cooked < 0
+              return lexer_fail_escape(lex, lex.pos, lex.line, lex.col, esc_ch)
             # Store cooked char in buffer
-            lexer_str_push(lex, cooked)
+            lexer_str_push(lex, cooked as i8)
             lex.pos = lex.pos + 1
             lex.col = lex.col + 1
         else
@@ -634,20 +671,10 @@ fn lexer_next(lex: *Lexer) -> Token
                     lex.col = lex.col + 1
                     if lex.pos < lex.len
                         let esc_ch: i32 = lexer_peek_at(lex, 0)
-                        var cooked: i8 = esc_ch as i8
-                        if esc_ch == 110
-                            cooked = 10
-                        else if esc_ch == 116
-                            cooked = 9
-                        else if esc_ch == 114
-                            cooked = 13
-                        else if esc_ch == 92
-                            cooked = 92
-                        else if esc_ch == 34
-                            cooked = 34
-                        else if esc_ch == 48
-                            cooked = 0
-                        lexer_str_push(lex, cooked)
+                        let cooked: i32 = lexer_cook_escape(esc_ch, 0)
+                        if cooked < 0
+                            return lexer_fail_escape(lex, lex.pos, lex.line, lex.col, esc_ch)
+                        lexer_str_push(lex, cooked as i8)
                         lex.pos = lex.pos + 1
                         lex.col = lex.col + 1
                 else
@@ -694,30 +721,28 @@ fn lexer_next(lex: *Lexer) -> Token
     # IDENT-prefix path above is the legacy workaround for when the NFA
     # negation bug masked CSTRING matches; with the negation fixed,
     # CSTRING wins the longest match and we cook here.
+    # A char literal `'\X'` is cooked later, by expr_char; reject an unknown
+    # escape here so it is a located lexer error like the string kinds.
+    if best_type == TOK_CHAR and best_len == 4 and ((*(lex.src + start + 1)) & 255) == 92
+      let esc: i32 = (*(lex.src + start + 2)) & 255
+      if lexer_cook_escape(esc, 1) < 0
+        return lexer_fail_escape(lex, start + 2, line, col + 2, esc)
     if best_type == TOK_CSTRING or best_type == TOK_STRING
       var prefix: i32 = 1  # default: `"`
+      var braces: i32 = 1
       if best_type == TOK_CSTRING
         prefix = 2  # `c"`
+        braces = 0
       var i: i32 = prefix
       lexer_str_begin(lex)
       while i < best_len - 1  # stop before closing quote
         let raw: i32 = (*(lex.src + start + i)) & 255
         if raw == 92 and i + 1 < best_len - 1  # backslash escape
           let esc: i32 = (*(lex.src + start + i + 1)) & 255
-          var cooked: i8 = esc as i8
-          if esc == 110       # \n
-            cooked = 10
-          else if esc == 116  # \t
-            cooked = 9
-          else if esc == 114  # \r
-            cooked = 13
-          else if esc == 92   # \\
-            cooked = 92
-          else if esc == 34   # \"
-            cooked = 34
-          else if esc == 48   # \0
-            cooked = 0
-          lexer_str_push(lex, cooked)
+          let cooked: i32 = lexer_cook_escape(esc, braces)
+          if cooked < 0
+            return lexer_fail_escape(lex, start + i + 1, line, col + i + 1, esc)
+          lexer_str_push(lex, cooked as i8)
           i = i + 2
         else
           lexer_str_push(lex, raw as i8)
