@@ -1,0 +1,144 @@
+# AGAST #1959 / #1955 / #1541: ritz1 negates a float operand with `fneg`.
+#
+# THE DEFECT
+#
+# ritz1's emit_expr_unary lowered every OP_NEG as `sub i64 0, %v`.  For a
+# float operand %v is a `float`/`double`, so `f(-1.5)` with `fn f(v: f64)`
+# (#1959) and `s.vals = [1.5, -2.25, 3.0]` for a `[3]f32` field (#1955)
+# emitted `sub i64 0, %double`, which clang rejects.  #1541 is the same
+# defect on a negated f64 global and on `x * -4.0`.
+#
+# THE FIX (ritz1/src/emitter_expr_arith.ritz)
+#
+# emit_expr_unary emits `fneg double` / `fneg float` when the operand is
+# float-typed, as ritz0 does.  A negated literal stays `double` like the
+# literal itself, so the let / argument / field-store / payload sites that
+# fptrunc a double to f32 narrow `-lit` as they narrow `lit`.
+#
+# The Some / Ok payload cases live in test_diff_float_neg_payload_f32.ritz
+# and _f64.ritz (one float width per module, for ritz0's sake).
+#
+# An f32 result is compared against an f32 local, never a bare literal:
+# ritz1 does not narrow the literal side of an f32 binop (#1965).  Binding
+# `let want: f32 = -2.5` is itself a narrowing site for `-lit`.
+#
+# Oracle: ritz0 runs every case to the same result.
+
+import ritzlib.option
+import ritzlib.result
+
+struct FnVals
+    vals: [3]f32
+    wide: [2]f64
+
+# Set at run time: ritz0 rejects a float global initializer (#1539).
+var fn_g: f64
+
+fn fn_id64(v: f64) -> f64
+    v
+
+fn fn_id32(v: f32) -> f32
+    v
+
+fn fn_sum32(a: f32, b: f32) -> f32
+    a + b
+
+# --- negative literals as call arguments (#1959) ---------------------------
+
+fn neg_lit_args_main() -> i32
+    if fn_id64(-1.5) != -1.5
+        return 1
+    let want2: f32 = -2.5
+    if fn_id32(-2.5) != want2
+        return 2
+    let want3: f32 = -0.75
+    if fn_sum32(-0.25, -0.5) != want3
+        return 3
+    if fn_id64(-(-4.0)) != 4.0
+        return 4
+    return 42
+
+[[test]]
+fn test_neg_lit_args() -> i32
+    assert neg_lit_args_main() == 42
+    0
+
+# --- negated float variables and globals (#1541) ---------------------------
+
+fn neg_var_main() -> i32
+    let x: f64 = 2.0
+    let y: f32 = 3.0
+    let ny: f32 = -3.0
+    let two32: f32 = 2.0
+    let ny2: f32 = -6.0
+    fn_g = 1.5
+    if fn_id64(-x) != -2.0
+        return 1
+    if fn_id32(-y) != ny
+        return 2
+    let z: f32 = -y
+    if z != ny
+        return 3
+    let w: f64 = -x * 2.0
+    if w != -4.0
+        return 4
+    if x * -4.0 != -8.0
+        return 5
+    if (fn_g * -4.0) as i32 != -6
+        return 6
+    if (-fn_g) as i32 + 5 != 4
+        return 7
+    if -y * two32 != ny2
+        return 8
+    return 42
+
+[[test]]
+fn test_neg_var() -> i32
+    assert neg_var_main() == 42
+    0
+
+# --- negative literals in array literals (#1955) ---------------------------
+#
+# The [N]f32 field elements are checked through their IEEE-754 bits (ritz1
+# cannot yet read a `[N]f32` field element as a value, see
+# test_issue_array_field_whole_assign).  0xC0100000 is -2.25: the high-bit
+# u32 compare #1955 reported failing under ritz0.  That is ritz0
+# sign-extending a u32 CALL result (#1963), so each result is bound to a u32
+# local first, which ritz0 zero-extends.  Local [N]f32 / [N]f64 arrays are
+# not covered: ritz1 lowers them as [N x i64] whatever the literal (#1966).
+
+fn fn_f32_bits(s: *FnVals, i: i64) -> u32
+    let p: *u32 = @s.vals as *u32
+    p[i]
+
+fn fn_f64_bits(s: *FnVals, i: i64) -> u64
+    let p: *u64 = @s.wide as *u64
+    p[i]
+
+fn neg_array_main() -> i32
+    var s: FnVals = FnVals { vals: [0.0, 0.0, 0.0], wide: [0.0, 0.0] }
+    s.vals = [1.5, -2.25, 3.0]
+    let b0: u32 = fn_f32_bits(@s, 0)
+    let b1: u32 = fn_f32_bits(@s, 1)
+    let b2: u32 = fn_f32_bits(@s, 2)
+    if b0 != 0x3FC00000
+        return 1
+    if b1 != 0xC0100000
+        return 2
+    if b2 != 0x40400000
+        return 3
+    s.wide = [-1.0, -0.125]
+    if fn_f64_bits(@s, 0) != 0xBFF0000000000000
+        return 4
+    if fn_f64_bits(@s, 1) != 0xBFC0000000000000
+        return 5
+    s.vals = [-0.5; 3]
+    let b3: u32 = fn_f32_bits(@s, 2)
+    if b3 != 0xBF000000
+        return 6
+    return 42
+
+[[test]]
+fn test_neg_array() -> i32
+    assert neg_array_main() == 42
+    0
