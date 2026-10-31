@@ -861,7 +861,13 @@ struct GrowBuf
     cap: i64
 ```
 
-**Has automatic `Drop` implementation.**
+A standalone struct, not an alias of `Vec<u8>`: the fields match `Vec<u8>`'s
+in name and layout, but the types are distinct: ritz0 rejects a `GrowBuf`
+passed to a `Vec<u8>` function (ritz1 does not check this yet, #1948). It has
+an `impl Drop` (`Vec<T>` does not); whether that drop is inserted
+automatically depends on the compiler (#1854), so `growbuf_free` remains for
+explicit release. To read a whole file descriptor, use `vec_read_all_fd`
+(gvec) and point a `Buffer` at the bytes.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -880,7 +886,6 @@ struct GrowBuf
 | `growbuf_is_empty` | `fn(b: @GrowBuf) -> bool` | Empty? |
 | `growbuf_view` | `fn(b: @GrowBuf) -> StrView` | Contents as a slice (invalidated by the next append) |
 | `growbuf_data` | `fn(b: @GrowBuf) -> *u8` | Data pointer (C interop) |
-| `read_all_fd` | `fn(fd: i32, b: @&GrowBuf) -> i64` | Read file descriptor |
 
 ---
 

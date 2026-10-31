@@ -149,7 +149,7 @@ GOLDEN
 out=$(./buf_demo </dev/null); rc=$?
 check "empty stdin (builtin config)" "$want" "$out" "$rc"
 
-# 2. Config on stdin via read_all_fd: CRLF line endings, an escaped quote,
+# 2. Config on stdin via vec_read_all_fd: CRLF line endings, an escaped quote,
 #    a space+tab indent, a trailing comment, a key cut short by '-', a stray
 #    quote, and a string left unterminated at EOF.
 want=$(cat <<'GOLDEN'
@@ -174,7 +174,7 @@ GOLDEN
 out=$(printf '[db]\r\nuser = "ad\\"min"\r\n \tport=5432 # trailing\nbad-key = 1\n\x27open\nx = "never closed\n' | ./buf_demo); rc=$?
 check "stdin config" "$want" "$(echo "$out" | tokens_section)" "$rc"
 
-# 3. Input larger than read_all_fd's 4096-byte chunk: 600 lines of
+# 3. Input larger than vec_read_all_fd's 4096-byte chunk: 600 lines of
 #    `kNNN = NNN\n` (600 x 11 = 6600 bytes) must arrive whole and in order,
 #    so the last line is still parsed, at 600:1.
 want=$(cat <<'GOLDEN'
