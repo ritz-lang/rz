@@ -2707,6 +2707,26 @@ fn deref_ptr_ptr_elem_type(s: *EmitterState, d: *Expr) -> i32
         return TYPE_VOID
     return inner
 
+# AGAST #1941: sizeof(S) for `*pp` / `*(pp + i)` when `pp` is a `**S` local
+# or param, so `*pp + 1` strides one S.  deref_ptr_ptr_elem_type answers
+# TYPE_VOID for a struct inner pointee (its callers want a primitive load or
+# store width), which left ptr_arith_elem_size classifying `*pp` as "not a
+# pointer" and emitting a raw BYTE add: `next.v` read across the S boundary.
+# 0 when not that shape.  Requires inner_pointee_type == TYPE_STRUCT, not
+# just a type name: a `***S` keeps S's name too, but `*ppp` is a `**S` and
+# strides 8 (ptr_ptr_inner_pointee answers TYPE_VOID for it).  `**S` globals
+# keep no struct name (GlobalVarDef.type_name is for TYPE_STRUCT only).
+fn deref_ptr_ptr_struct_size(s: *EmitterState, d: *Expr) -> i64
+    if d == null or d.kind != EXPR_UNARY or d.op != OP_DEREF or d.operand == null
+        return 0
+    let base: *Expr = find_base_expr(d.operand)
+    if base.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+    if loc == null or loc.var_type != TYPE_PTR_PTR or loc.inner_pointee_type != TYPE_STRUCT
+        return 0
+    return ptr_pointee_size(s, TYPE_STRUCT, loc.type_name, loc.type_name_len)
+
 # Classify an operand of `+`/`-` as pointer arithmetic, and if so give its
 # element stride.  Returns 0 for "not a pointer", otherwise the element size
 # in bytes (never 0, so 0 is an unambiguous sentinel).
@@ -2789,7 +2809,8 @@ fn ptr_arith_elem_size(s: *EmitterState, e: *Expr) -> i64
         let dpt: i32 = deref_ptr_ptr_elem_type(s, e)
         if dpt != TYPE_VOID
             return ptr_pointee_size(s, dpt, null, 0)
-        return 0
+        # AGAST #1941: ... and `*pp + 1` for `pp: **S` by sizeof(S).
+        return deref_ptr_ptr_struct_size(s, e)
     return 0
 
 # Byte size of the element an index expression `base[i]` names, for
