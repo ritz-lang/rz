@@ -1,0 +1,109 @@
+# AGAST #1963: a call returning u32/u16/u8 must be widened with zext and
+# compared unsigned. ritz0's _infer_unsigned_expr had no Call/MethodCall case,
+# so `bits(..) != 0xC0100000` sign-extended the i32 result and compared it
+# against a positive i64 constant: always unequal when bit 31 was set.
+#
+# Every compare below calls the function directly in the condition; binding
+# the result to an annotated local first hides the bug (the local's type is
+# known unsigned).
+
+struct F
+    vals: [3]f32
+
+fn bits(f: *F, i: i64) -> u32
+    let p: *u32 = @f.vals as *u32
+    p[i]
+
+fn ret_u32(v: u32) -> u32
+    v
+
+fn ret_u16(v: u16) -> u16
+    v
+
+fn ret_u8(v: u8) -> u8
+    v
+
+struct Box
+    w: u32
+    h: u16
+    b: u8
+
+impl Box
+    fn word(self: *Box) -> u32
+        self.w
+    fn half(self: *Box) -> u16
+        self.h
+    fn byte(self: *Box) -> u8
+        self.b
+
+# The ticket's repro: -2.25f is 0xC0100000.
+fn repro_main() -> i32
+    var f: F = F { vals: [1.5, -2.25, 3.0] }
+    if bits(@f, 1) != 0xC0100000
+        return 1
+    if bits(@f, 0) != 0x3FC00000
+        return 2
+    return 42
+
+[[test]]
+fn test_u32_call_high_bit_eq() -> i32
+    assert repro_main() == 42
+    0
+
+fn narrow_main() -> i32
+    if ret_u16(0xFFFE) != 0xFFFE
+        return 1
+    if ret_u16(0x8000) != 32768
+        return 2
+    if ret_u8(200) != 200
+        return 3
+    if ret_u8(0xFF) != 255
+        return 4
+    return 42
+
+[[test]]
+fn test_u16_u8_call_high_bit_eq() -> i32
+    assert narrow_main() == 42
+    0
+
+# Ordering: a u32 above 2^31 is greater than 2^31 - 1 and than 0, and a
+# signed compare (or a sext) would place it below both.
+fn order_main() -> i32
+    if ret_u32(0x80000001) < 0x7FFFFFFF
+        return 1
+    if not (ret_u32(0x80000001) > 0x7FFFFFFF)
+        return 2
+    if ret_u32(0xFFFFFFFF) < 1
+        return 3
+    if not (ret_u32(0xFFFFFFFF) > 0x80000000)
+        return 4
+    if ret_u32(0x80000000) <= 0
+        return 5
+    if ret_u16(0x8000) < 1
+        return 6
+    if ret_u8(0x80) < 1
+        return 7
+    return 42
+
+[[test]]
+fn test_u32_call_high_bit_order() -> i32
+    assert order_main() == 42
+    0
+
+# Method-call results go through the same path.
+fn method_main() -> i32
+    var bx: Box = Box { w: 0xC0100000, h: 0xFFFE, b: 200 }
+    if bx.word() != 0xC0100000
+        return 1
+    if bx.word() < 0x7FFFFFFF
+        return 2
+    if bx.half() != 0xFFFE
+        return 3
+    if bx.byte() != 200
+        return 4
+    return 42
+
+[[test]]
+fn test_unsigned_method_call_cmp() -> i32
+    assert method_main() == 42
+    0

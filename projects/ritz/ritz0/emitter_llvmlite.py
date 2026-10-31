@@ -11025,6 +11025,14 @@ class LLVMEmitter:
                                 return self._is_unsigned_type(field_type)
             return False
 
+        # Call / method call - the callee's declared return type (AGAST
+        # #1963). Without this a `-> u32` result with bit 31 set was widened
+        # with sext and compared signed, so `bits(..) != 0xC0100000` was
+        # always true. _infer_ritz_type already resolves free functions,
+        # static `Type.method(..)` and `recv.method(..)` to the declaration.
+        if isinstance(expr, (rast.Call, rast.MethodCall)):
+            return self._is_unsigned_type(self._infer_ritz_type(expr))
+
         return False
 
     def _is_float_type(self, llvm_ty: ir.Type) -> bool:
