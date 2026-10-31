@@ -1,0 +1,151 @@
+# AGAST #1922: ritz1 spells every primitive generic argument as ritz0 does.
+#
+# THE DEFECT
+#
+# ritz1's primitive_arg_spelling (ast_helpers.ritz) knew only u8, i8, i32,
+# i64 and u64; any other primitive argument spelled as "", so `Option<u32>`
+# mangled as `Option$`.  tagged_enum_layout (#1898) cannot measure an empty
+# argument and kept the conservative `{ i8, [7 x i8], [144 x i8] }` layout,
+# while ritz0's `Option<u32>` is `{ i8, [3 x i8], [4 x i8] }`: a ritz1 caller
+# of a ritz0-built fn returning or taking one read and wrote the wrong
+# aggregate.
+#
+# THE FIX (ritz1/src)
+#
+# * ast_helpers primitive_arg_spelling spells u16, u32, i16, bool, f32, f64.
+# * monomorph parse_type_from_suffix maps every primitive suffix back
+#   (via primitive_type_from_name); tested in test_diff_generic_prim_args.
+#
+# The tp_* fns live in test_tagged_prim_lib.ritz, which the matrix builds
+# with ritz0, so in the ritz1 cells every value below crosses compilers.
+# Oracle: ritz0 runs every case to the same result.
+
+import ritzlib.result
+import ritzlib.option
+import test_tagged_prim_lib
+
+# --- returned from ritz0 ---------------------------------------------------
+
+fn b2i(v: bool) -> i64
+    if v
+        return 1
+    return 2
+
+fn opt_u32_main() -> i32
+    let a: i64 = match tp_some_u32(4000000000)
+        Some(v) => v as i64
+        None => -1
+    if a != 4000000000
+        return 1
+    return 42
+
+[[test]]
+fn test_opt_u32_returned() -> i32
+    assert opt_u32_main() == 42
+    0
+
+fn opt_narrow_main() -> i32
+    let a: i64 = match tp_some_u16(65000)
+        Some(v) => v as i64
+        None => -1
+    if a != 65000
+        return 1
+    let b: i64 = match tp_some_i16(-300)
+        Some(v) => v as i64
+        None => 0
+    if b != -300
+        return 2
+    return 42
+
+[[test]]
+fn test_opt_u16_i16_returned() -> i32
+    assert opt_narrow_main() == 42
+    0
+
+fn opt_bool_main() -> i32
+    let a: i64 = match tp_some_bool(true)
+        Some(v) => b2i(v)
+        None => 3
+    if a != 1
+        return 1
+    let b: i64 = match tp_some_bool(false)
+        Some(v) => b2i(v)
+        None => 3
+    if b != 2
+        return 2
+    return 42
+
+[[test]]
+fn test_opt_bool_returned() -> i32
+    assert opt_bool_main() == 42
+    0
+
+# The payload is compared inside the arm: a `match` yielding f64 is a
+# separate ritz1 defect (AGAST #1946; the payload itself is #1945).
+fn opt_f64_main() -> i32
+    let a: i64 = match tp_some_f64(2.5)
+        Some(v) => f64_is(v, 2.5)
+        None => -1
+    if a != 1
+        return 1
+    return 42
+
+fn f64_is(v: f64, want: f64) -> i64
+    if v == want
+        return 1
+    return 0
+
+[[test]]
+fn test_opt_f64_returned() -> i32
+    assert opt_f64_main() == 42
+    0
+
+fn res_bool_main() -> i32
+    let a: i64 = match tp_ok_bool(true)
+        Ok(v) => b2i(v)
+        Err(e) => -1
+    if a != 1
+        return 1
+    let b: i64 = match tp_err_bool(9)
+        Ok(v) => -1
+        Err(e) => e as i64
+    if b != 9
+        return 2
+    return 42
+
+[[test]]
+fn test_result_bool_returned() -> i32
+    assert res_bool_main() == 42
+    0
+
+# --- passed to ritz0 -------------------------------------------------------
+
+# Built through fns whose return type fixes the instantiation: ritz0 types
+# `let s: Option<u32> = Some(..)` as the last Option it declared (AGAST #1947).
+fn mk_some_u32(v: u32) -> Option<u32>
+    return Some(v)
+
+fn mk_none_u32() -> Option<u32>
+    return None
+
+fn mk_ok_u32(v: u32) -> Result<u32, i32>
+    return Ok(v)
+
+fn mk_err_u32(e: i32) -> Result<u32, i32>
+    return Err(e)
+
+fn pass_main() -> i32
+    if tp_unwrap_u32(mk_some_u32(4000000000)) != 4000000001
+        return 1
+    if tp_unwrap_u32(mk_none_u32()) != 0
+        return 2
+    if tp_unwrap_res_u32(mk_ok_u32(77)) != 77
+        return 3
+    if tp_unwrap_res_u32(mk_err_u32(5)) != -5
+        return 4
+    return 42
+
+[[test]]
+fn test_passed_to_ritz0() -> i32
+    assert pass_main() == 42
+    0

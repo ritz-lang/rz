@@ -110,6 +110,9 @@ _RITZ1_TWINS = {
         "AGAST #1624 — `alias::item` calls, removed from the spec; ritz0 is the outlier",
     "test_asm":
         "AGAST #1619 — inline `asm x86_64:` blocks unsupported in ritz1",
+    # --- codegen, runtime failures ---
+    "test_diff_tagged_prim_args::test_opt_f64_returned":
+        "AGAST #1945 — f32/f64 Option/Result payloads stored and loaded as i64",
 }
 
 # Files no compiler can build: they target draft features (LARB-0013) that
@@ -223,6 +226,9 @@ def matrix_exit_code(outcomes):
 # is nothing to execute. Enforced by test_not_tests_entries_really_have_
 # nothing_to_run — a file here that grows a test or a main must leave.
 NOT_TESTS = {
+    "test_tagged_prim_lib":
+        "library imported by test_diff_tagged_prim_args.ritz; the matrix builds "
+        "it with ritz0, so the ritz1 cells call across compilers (AGAST #1922)",
     "test_import_lib":
         "library imported by test_import_main.ritz; it is compiled and linked "
         "as part of that file's import closure",
