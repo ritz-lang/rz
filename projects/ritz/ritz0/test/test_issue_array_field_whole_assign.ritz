@@ -189,3 +189,199 @@ fn test_whole_assign_reads_old_value() -> i32
     assert w.vals[0] == 2
     assert w.vals[1] == 1
     0
+
+# ---------------------------------------------------------------------------
+# AGAST #1935: a non-literal right-hand side (`x.f = arr`) is copied, and
+# [N]bool / [N]f32 / [N]f64 fields accept literals and fills.  ritz1 used to
+# refuse both (fail closed since #1934).  `p.f = *src` with `src: *[N]T`
+# still fails closed in ritz1: it records no length for `*[N]T`.
+
+struct Flags
+    lead: u8
+    bits: [3]bool
+    after: u8
+
+struct Floats
+    lead: i32
+    vals: [3]f32
+    tail: i32
+
+struct Doubles
+    vals: [2]f64
+    tail: i64
+
+struct Pair
+    a: [3]u8
+    b: [3]u8
+
+fn copy_field_ptr(dst: *Wide, src: *Wide)
+    dst.vals = src.vals
+
+fn set_flags(p: *Flags, v: bool)
+    p.bits = [v, false, v]
+
+fn set_doubles(p: *Doubles, x: f64)
+    p.vals = [x, x * 2.0]
+
+[[test]]
+fn test_whole_assign_from_local_i64() -> i32
+    var w: Wide = Wide { vals: [0, 0], tail: 9 }
+    var a: [2]i64 = [1, -2]
+    w.vals = a
+    assert w.vals[0] == 1
+    assert w.vals[1] == -2
+    assert w.tail == 9
+    # A copy, not an alias: writing the field leaves the next field alone.
+    w.vals[1] = 77
+    assert w.vals[0] == 1
+    assert w.tail == 9
+    0
+
+[[test]]
+fn test_whole_assign_from_local_u8() -> i32
+    var n: Narrow = Narrow { tag: 7, bytes: [0, 0, 0, 0], after: 5 }
+    var b: [4]u8 = [4, 3, 2, 255]
+    n.bytes = b
+    assert n.bytes[0] == 4
+    assert n.bytes[3] == 255
+    assert n.tag == 7
+    assert n.after == 5
+    0
+
+[[test]]
+fn test_whole_assign_from_local_i32() -> i32
+    var w: Words = Words { head: 1, words: [0, 0, 0], tail: 2 }
+    var v: [3]i32 = [-1, 2, -70000]
+    w.words = v
+    assert w.words[0] == -1
+    assert w.words[1] == 2
+    assert w.words[2] == -70000
+    assert w.head == 1
+    assert w.tail == 2
+    0
+
+[[test]]
+fn test_whole_assign_from_other_field() -> i32
+    var p: Pair = Pair { a: [1, 2, 3], b: [0, 0, 0] }
+    p.b = p.a
+    assert p.b[0] == 1
+    assert p.b[1] == 2
+    assert p.b[2] == 3
+    p.a[0] = 9
+    assert p.b[0] == 1
+    var x: Wide = Wide { vals: [5, 6], tail: 1 }
+    var y: Wide = Wide { vals: [0, 0], tail: 2 }
+    y.vals = x.vals
+    assert y.vals[0] == 5
+    assert y.vals[1] == 6
+    assert y.tail == 2
+    0
+
+[[test]]
+fn test_whole_assign_from_ptr_field() -> i32
+    var x: Wide = Wide { vals: [5, 6], tail: 1 }
+    var y: Wide = Wide { vals: [0, 0], tail: 2 }
+    copy_field_ptr(@y, @x)
+    assert y.vals[0] == 5
+    assert y.vals[1] == 6
+    assert y.tail == 2
+    0
+
+[[test]]
+fn test_whole_assign_struct_from_local() -> i32
+    var g: Bag = Bag { items: [Item { a: 0, b: 0 }, Item { a: 0, b: 0 }], tail: 3 }
+    var src: [2]Item = [Item { a: 1, b: 2 }, Item { a: 3, b: 4 }]
+    g.items = src
+    assert g.items[0].a == 1
+    assert g.items[0].b == 2
+    assert g.items[1].a == 3
+    assert g.items[1].b == 4
+    assert g.tail == 3
+    0
+
+[[test]]
+fn test_whole_assign_bool_field() -> i32
+    var f: Flags = Flags { lead: 7, bits: [false, false, false], after: 5 }
+    f.bits = [true, false, true]
+    assert f.bits[0] == true
+    assert f.bits[1] == false
+    assert f.bits[2] == true
+    assert f.lead == 7
+    assert f.after == 5
+    f.bits = [true; 3]
+    assert f.bits[1] == true
+    assert f.after == 5
+    f.bits = [false; 3]
+    assert f.bits[0] == false
+    assert f.bits[2] == false
+    set_flags(@f, true)
+    assert f.bits[0] == true
+    assert f.bits[1] == false
+    assert f.bits[2] == true
+    assert f.after == 5
+    0
+
+# The f32 elements are checked through their IEEE-754 bits: ritz1 cannot
+# yet read a `[N]f32` field element as a value.
+fn f32_field_bits(f: *Floats, i: i64) -> u32
+    let p: *u32 = @f.vals as *u32
+    p[i]
+
+[[test]]
+fn test_whole_assign_f32_field() -> i32
+    var f: Floats = Floats { lead: 1, vals: [0.0, 0.0, 0.0], tail: 2 }
+    f.vals = [1.5, 2.25, 3.0]
+    assert f32_field_bits(@f, 0) == 0x3FC00000
+    assert f32_field_bits(@f, 1) == 0x40100000
+    assert f32_field_bits(@f, 2) == 0x40400000
+    assert f.lead == 1
+    assert f.tail == 2
+    f.vals = [0.5; 3]
+    assert f32_field_bits(@f, 0) == 0x3F000000
+    assert f32_field_bits(@f, 2) == 0x3F000000
+    assert f.tail == 2
+    var g: Floats = Floats { lead: 3, vals: [0.0, 0.0, 0.0], tail: 4 }
+    g.vals = f.vals
+    assert f32_field_bits(@g, 1) == 0x3F000000
+    assert g.lead == 3
+    assert g.tail == 4
+    0
+
+# Likewise f64 elements through their bits: ritz1 reads a `[N]f64` field
+# element as an i64 bit pattern, which a float comparison rejects.
+fn f64_field_bits(d: *Doubles, i: i64) -> i64
+    let p: *i64 = @d.vals as *i64
+    p[i]
+
+[[test]]
+fn test_whole_assign_f64_field() -> i32
+    var d: Doubles = Doubles { vals: [0.0, 0.0], tail: 4 }
+    d.vals = [1.0, 2.0]
+    assert f64_field_bits(@d, 0) == 0x3FF0000000000000
+    assert f64_field_bits(@d, 1) == 0x4000000000000000
+    assert d.tail == 4
+    d.vals = [6.5; 2]
+    assert f64_field_bits(@d, 0) == 0x401A000000000000
+    assert f64_field_bits(@d, 1) == 0x401A000000000000
+    set_doubles(@d, 1.25)
+    assert f64_field_bits(@d, 0) == 0x3FF4000000000000
+    assert f64_field_bits(@d, 1) == 0x4004000000000000
+    assert d.tail == 4
+    0
+
+[[test]]
+fn test_whole_assign_float_field_from_field() -> i32
+    var a: Doubles = Doubles { vals: [3.5, 4.5], tail: 1 }
+    var b: Doubles = Doubles { vals: [0.0, 0.0], tail: 2 }
+    b.vals = a.vals
+    assert f64_field_bits(@b, 0) == 0x400C000000000000
+    assert f64_field_bits(@b, 1) == 0x4012000000000000
+    assert b.tail == 2
+    var f: Flags = Flags { lead: 1, bits: [true, false, true], after: 2 }
+    var g: Flags = Flags { lead: 3, bits: [false, false, false], after: 4 }
+    g.bits = f.bits
+    assert g.bits[0] == true
+    assert g.bits[1] == false
+    assert g.bits[2] == true
+    assert g.after == 4
+    0

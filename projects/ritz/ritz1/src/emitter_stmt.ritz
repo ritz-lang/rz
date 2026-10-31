@@ -556,7 +556,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # squeeze/cryptosec/valet rely on this for inflate/sbox tables.
         # Lowering strategy lives in emit_array_fill_into (emitter_expr).
         if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_FILL
-            emit_array_fill_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_init.left)
+            emit_array_fill_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_init.left, 0)
             return
 
         # Array-literal init for typed [N]T slots (ritz0 parity —
@@ -569,7 +569,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # direct-element-store behaviour.
         if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_LIT
             # `stmt.var_type_name` names the element struct of `[N]T`.
-            emit_array_lit_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init)
+            emit_array_lit_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init, 0)
             return
 
         # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
@@ -1807,28 +1807,108 @@ fn emit_array_field_llvm_type(s: *EmitterState, field: *StructField)
         emit_str(s, field_array_elem_llvm(field.array_elem_type))
     emit_str(s, c"]")
 
+# Copy `[N x T]` (spelled for `field`) from `src_ptr` over `dst_ptr` as one
+# aggregate load + store: every element is read before any is written.
+fn emit_array_field_copy(s: *EmitterState, field: *StructField, src_ptr: i32, dst_ptr: i32)
+    let agg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, agg)
+    emit_str(s, c" = load ")
+    emit_array_field_llvm_type(s, field)
+    emit_str(s, c", ptr ")
+    emit_reg(s, src_ptr)
+    emit_str(s, c"\n  store ")
+    emit_array_field_llvm_type(s, field)
+    emit_str(s, c" ")
+    emit_reg(s, agg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, dst_ptr)
+    emit_str(s, c"\n")
+
+# 1 when two array element types name the same type (struct elements by name).
+fn array_elem_types_match(a: i32, a_name: *u8, a_len: i32, b: i32, b_name: *u8, b_len: i32) -> i32
+    if a != b
+        return 0
+    if a == TYPE_STRUCT
+        if a_len != b_len or a_len <= 0
+            return 0
+        if memcmp(a_name, b_name, a_len as i64) != 0
+            return 0
+    1
+
+# AGAST #1935: `x.f = <array value>` where the right-hand side is not a
+# literal.  Resolve the source array's storage and copy it over the field
+# at `field_ptr`, after checking it has the field's length and element type
+# (ritz0 rejects a mismatch).  Supported sources:
+#   * a local `[N]T` array (`w.vals = a`); its alloca is `[N x T]` with the
+#     field's element spelling for every T except bool / f32 / f64, which a
+#     local keeps in i64 slots (field_elem_layout_differs) — refused;
+#   * another inline array field (`y.vals = x.vals`, `p.b = p.a`), whose
+#     layout is the field's own.
+# Returns 1 once handled (copied or diagnosed).  Anything else — notably
+# `*p` for `p: *[N]T`, whose length and element type ritz1 does not record —
+# fails closed: emit_expr has no whole-array value, and the pre-#1934
+# generic path stored an ADDRESS into the field.
+fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructField, value: *Expr)
+    var src_ptr: i32 = -1
+    var src_size: i32 = -1
+    var src_et: i32 = TYPE_VOID
+    var src_name: *u8 = null
+    var src_name_len: i32 = 0
+    var src_is_local: i32 = 0
+    if value.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, value.ident_ptr, value.ident_len)
+        if loc != null and loc.var_type == TYPE_ARRAY
+            src_ptr = loc.reg
+            src_size = loc.array_size
+            src_et = loc.array_elem_type
+            src_name = loc.type_name
+            src_name_len = loc.type_name_len
+            src_is_local = 1
+    else if value.kind == EXPR_MEMBER
+        var mr: MemberPtrResult
+        emit_member_ptr(s, value, @mr)
+        if mr.success == 1 and mr.field != null and mr.field.field_type == TYPE_ARRAY
+            src_ptr = mr.reg
+            src_size = mr.field.array_size
+            src_et = mr.field.array_elem_type
+            src_name = mr.field.array_elem_type_name
+            src_name_len = mr.field.array_elem_type_name_len
+    if src_ptr < 0
+        emit_ir_error(s, c"whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays and array fields)")
+        return
+    if src_size != field.array_size
+        emit_ir_error(s, c"array length does not match the struct field's array length")
+        return
+    if array_elem_types_match(src_et, src_name, src_name_len, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len) == 0
+        emit_ir_error(s, c"array element type does not match the struct field's element type")
+        return
+    if src_is_local == 1 and field_elem_layout_differs(src_et) == 1
+        emit_ir_error(s, c"copying a local [N]bool / [N]f32 / [N]f64 array into a struct field is not supported by ritz1")
+        return
+    emit_array_field_copy(s, field, src_ptr, field_ptr)
+
 # AGAST #1934: `x.f = [a, b, ..]` / `x.f = [v; N]` where `f` is an inline
 # `[N]T` array field at `field_ptr`.  The elements are written at the field's
-# declared element type, as a struct literal's array field is (#1605/#1608).
+# declared element type, as a struct literal's array field is (#1605/#1608);
+# bool / f32 / f64 elements as `i1` / `float` / `double` (#1935).
 #
 #   * `[v; N]` is written straight into the field: emit_array_fill_into
 #     evaluates `v` once, before any store.
 #   * `[a, b, ..]` is built in a temporary `[N x T]` and then copied over the
 #     field, so every element is read before any is written
 #     (`x.f = [x.f[1], x.f[0]]` swaps, as in ritz0).
+#   * any other right-hand side is copied by emit_array_field_copy_from.
 #
-# Anything ritz1 cannot lower faithfully fails closed: a length that differs
-# from the field's (ritz0 rejects it too), bool/f32/f64 elements (the
-# writers have no `i1`/float element store; see #1814), and any right-hand
-# side that is not a literal — emit_expr has no whole-array value, so the
-# old generic path stored an address into the field.
+# A literal whose length differs from the field's fails closed (ritz0
+# rejects it too).
 fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *StructField, value: *Expr)
     let et: i32 = field.array_elem_type
-    if et == TYPE_BOOL or et == TYPE_F32 or et == TYPE_F64
-        emit_ir_error(s, c"assigning an array literal to a [N]bool / [N]f32 / [N]f64 struct field is not supported by ritz1")
+    if value == null
+        emit_ir_error(s, c"whole-array assignment to a struct field has no value")
         return
-    if value == null or (value.kind != EXPR_ARRAY_LIT and value.kind != EXPR_ARRAY_FILL)
-        emit_ir_error(s, c"whole-array assignment to a struct field from a non-literal value is not supported by ritz1")
+    if value.kind != EXPR_ARRAY_LIT and value.kind != EXPR_ARRAY_FILL
+        emit_array_field_copy_from(s, field_ptr, field, value)
         return
     var n: i32 = 0
     if value.kind == EXPR_ARRAY_FILL
@@ -1842,7 +1922,7 @@ fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *Struc
         emit_ir_error(s, c"array literal length does not match the struct field's array length")
         return
     if value.kind == EXPR_ARRAY_FILL
-        emit_array_fill_into(s, field_ptr, field.array_size, et, value.left)
+        emit_array_fill_into(s, field_ptr, field.array_size, et, value.left, 1)
         return
     # Build in a temporary (a fixed-size alloca, hoisted to the entry block),
     # then copy the whole aggregate over the field.
@@ -1852,21 +1932,8 @@ fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *Struc
     emit_str(s, c" = alloca ")
     emit_array_field_llvm_type(s, field)
     emit_str(s, c"\n")
-    emit_array_lit_into(s, tmp, field.array_size, et, field.array_elem_type_name, field.array_elem_type_name_len, value)
-    let agg: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, agg)
-    emit_str(s, c" = load ")
-    emit_array_field_llvm_type(s, field)
-    emit_str(s, c", ptr ")
-    emit_reg(s, tmp)
-    emit_str(s, c"\n  store ")
-    emit_array_field_llvm_type(s, field)
-    emit_str(s, c" ")
-    emit_reg(s, agg)
-    emit_str(s, c", ptr ")
-    emit_reg(s, field_ptr)
-    emit_str(s, c"\n")
+    emit_array_lit_into(s, tmp, field.array_size, et, field.array_elem_type_name, field.array_elem_type_name_len, value, 1)
+    emit_array_field_copy(s, field, tmp, field_ptr)
 
 # AGAST #1814: `x.f[i] = v` where `f` is an inline `[N]T` array field at
 # `field_ptr`. GEP the element at the field's DECLARED element type

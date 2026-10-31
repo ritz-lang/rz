@@ -1429,7 +1429,45 @@ fn emit_array_fill_struct_loop(s: *EmitterState, base_reg: i32, arr_size: i32, s
     emit_str(s, c"\n")
     begin_block(s, l_end)
 
-fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, fill_val: *Expr)
+# The register to store for one bool / f32 / f64 element of a STRUCT FIELD
+# array (`[N x i1]` / `[N x float]` / `[N x double]`, see
+# field_array_elem_llvm): narrowed exactly as emit_struct_lit_field_store
+# narrows a scalar field of that type.  `val_reg` is emit_expr(value).
+# AGAST #1935.
+fn emit_field_elem_narrow(s: *EmitterState, val_reg: i32, elem_ty: i32, value: *Expr) -> i32
+    if elem_ty == TYPE_BOOL
+        if bool_reg_is_i1(s, value) == 1
+            return val_reg
+        let t1: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, t1)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, val_reg)
+        emit_str(s, c" to i1\n")
+        return t1
+    if elem_ty == TYPE_F32 and get_expr_type(s, value) == TYPE_F64
+        let tf: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, tf)
+        emit_str(s, c" = fptrunc double ")
+        emit_reg(s, val_reg)
+        emit_str(s, c" to float\n")
+        return tf
+    val_reg
+
+# 1 when `[N]elem_ty` is laid out differently as a struct field than as a
+# local: fields use i1 / float / double elements (ritz0's struct ABI, #1814),
+# locals keep every bool / float element in an i64 slot.
+fn field_elem_layout_differs(elem_ty: i32) -> i32
+    if elem_ty == TYPE_BOOL or elem_ty == TYPE_F32 or elem_ty == TYPE_F64
+        return 1
+    0
+
+# Write `[v; arr_size]` into the array at `base_reg`.  `field_layout` is 1
+# when `base_reg` is an inline STRUCT FIELD array (bool / f32 / f64 elements
+# are then `i1` / `float` / `double`, see field_elem_layout_differs) and 0
+# for a local array.
+fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, fill_val: *Expr, field_layout: i32)
     let fill_elem_ty: i32 = elem_ty
     let fill_arr_size: i32 = arr_size
     var fill_elem_llvm: *u8 = c"i64"
@@ -1446,6 +1484,14 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
     else if fill_elem_ty == TYPE_PTR or fill_elem_ty == TYPE_PTR_PTR
         fill_elem_llvm = c"ptr"
         fill_elem_bytes = 8
+    var field_scalar: i32 = 0
+    if field_layout == 1 and field_elem_layout_differs(fill_elem_ty) == 1
+        field_scalar = 1
+        fill_elem_llvm = field_array_elem_llvm(fill_elem_ty)
+        if fill_elem_ty == TYPE_BOOL
+            fill_elem_bytes = 1
+        else if fill_elem_ty == TYPE_F32
+            fill_elem_bytes = 4
     # `[T { .. }; N]`: the element is the literal's own struct type, stored
     # as a `%T` aggregate built once by the rvalue lowering. (AGAST #1362)
     if fill_val != null and fill_val.kind == EXPR_STRUCT_LIT
@@ -1476,7 +1522,9 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
     # re-emit the trunc inside the loop body (and so a pointer
     # element type gets one inttoptr we can reuse).
     var fill_narrow: i32 = fill_val_reg
-    if fill_elem_ty == TYPE_U8 or fill_elem_ty == TYPE_I8
+    if field_scalar == 1
+        fill_narrow = emit_field_elem_narrow(s, fill_val_reg, fill_elem_ty, fill_val)
+    else if fill_elem_ty == TYPE_U8 or fill_elem_ty == TYPE_I8
         let t8: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, t8)
@@ -1626,7 +1674,10 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
 #     `%T` aggregate and is stored as one.
 # The generic EXPR_ARRAY_LIT arm of emit_expr builds an `[N x i64]` shadow and
 # stored each struct element as an i64 (invalid IR). (AGAST #1608)
-fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, elem_name: *u8, elem_name_len: i32, lit: *Expr)
+#
+# `field_layout` is as for emit_array_fill_into: 1 writes bool / f32 / f64
+# elements as `i1` / `float` / `double` (a struct field), 0 as i64 slots.
+fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, elem_name: *u8, elem_name_len: i32, lit: *Expr, field_layout: i32)
     var is_struct: i32 = 0
     if elem_ty == TYPE_STRUCT and elem_name_len > 0
         is_struct = 1
@@ -1643,6 +1694,10 @@ fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: 
         needs_trunc = 1
     else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
         elem_llvm = c"ptr"
+    var field_scalar: i32 = 0
+    if field_layout == 1 and field_elem_layout_differs(elem_ty) == 1
+        field_scalar = 1
+        elem_llvm = field_array_elem_llvm(elem_ty)
     var idx: i32 = 0
     var it: *Expr = lit.args
     while it != null and idx < arr_size
@@ -1682,7 +1737,9 @@ fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: 
         else
             # Narrow the i64 expression value to the element type.
             var stored: i32 = val_reg
-            if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
+            if field_scalar == 1
+                stored = emit_field_elem_narrow(s, val_reg, elem_ty, it)
+            else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
                 stored = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, stored)
@@ -1720,12 +1777,6 @@ fn emit_struct_lit_array_fill_field(s: *EmitterState, st: *StructDef, field_idx:
     let field: *StructField = get_field_type(st, field_idx)
     if field.field_type != TYPE_ARRAY
         return 0
-    if field.array_elem_type == TYPE_BOOL or field.array_elem_type == TYPE_F32
-        # AGAST #1814: these fields are `[N x i1]` / `[N x float]` (ritz0's
-        # layout), but the fill/literal writers lay elements out as the
-        # i64 slots LOCAL arrays use — they would write past the field.
-        emit_ir_error(s, c"array literal for a [N]bool / [N]f32 struct field is not supported by ritz1")
-        return 1
     let field_ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, field_ptr)
@@ -1737,9 +1788,9 @@ fn emit_struct_lit_array_fill_field(s: *EmitterState, st: *StructDef, field_idx:
     emit_int(s, field_idx as i64)
     emit_str(s, c"\n")
     if value.kind == EXPR_ARRAY_LIT
-        emit_array_lit_into(s, field_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, value)
+        emit_array_lit_into(s, field_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, value, 1)
     else
-        emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, value.left)
+        emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, value.left, 1)
     1
 
 # Evaluate struct-literal field `field_idx` of `st` and store it into the
