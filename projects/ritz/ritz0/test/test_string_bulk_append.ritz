@@ -1,0 +1,288 @@
+# AGAST #1931: ritzlib.string appends in bulk (reserve once, then memcpy).
+#
+# string_push_cstr / _string / _bytes, string_push_i64, string_from_hex, the
+# string_from* constructors and string_clone used to vec_push one byte at a
+# time. They all now go through string_push_bytes, which reserves the whole
+# length up front. Consequences these tests pin down:
+#
+#   * a failed reserve is atomic: -1, and the String is left untouched
+#     (the byte loop wrote a partial prefix, or read past the source)
+#   * appending a String's own bytes (push_string(s, s), push_bytes of its
+#     own buffer, push_cstr of string_as_ptr(s)) stays correct when the
+#     append forces the buffer to move
+#   * empty appends and appends that cross capacity boundaries are exact
+#
+# The matrix runs every [[test]] here under ritz0, ritz1 and
+# ritz1_selfhosted.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.string
+
+# 2^60: far beyond any address space, so the reserve's realloc must fail.
+fn huge_len() -> i64
+    1152921504606846976
+
+# A String whose header claims `len` bytes at `buf`. Never dropped: it does
+# not own `buf`. Used to hand a "too big to reserve" source to the String
+# APIs without allocating it.
+fn fake_string(buf: *u8, len: i64) -> String
+    var f: String
+    f.data.data = buf
+    f.data.len = len
+    f.data.cap = len
+    f
+
+# ============================================================================
+# Empty appends
+# ============================================================================
+
+[[test]]
+fn test_empty_appends_leave_string_unchanged() -> i32
+    var s: String = string_from("abc")
+    var empty: String = string_new()
+    assert string_push_bytes(@&s, null, 0) == 0
+    assert string_push_bytes(@&s, c"zzz", -5) == 0
+    assert string_push_cstr(@&s, c"") == 0
+    assert string_push_str(@&s, "") == 0
+    assert string_push_string(@&s, @empty) == 0
+    assert string_len(@s) == 3
+    assert string_eq_strview(@s, "abc")
+    string_drop(@&s)
+    0
+
+# Appending nothing to a never-allocated String must not need a buffer.
+[[test]]
+fn test_empty_append_to_empty_string() -> i32
+    var s: String = string_new()
+    var e: String = string_new()
+    assert string_push_string(@&s, @e) == 0
+    assert string_push_cstr(@&s, c"") == 0
+    assert string_len(@s) == 0
+    var c: String = string_clone(@s)
+    assert string_len(@c) == 0
+    var b: String = string_from_bytes(null, 0)
+    assert string_len(@b) == 0
+    0
+
+# ============================================================================
+# Aliasing: appending a String's own bytes
+# ============================================================================
+
+# 12 bytes lands in a 16-byte buffer; doubling it to 24 forces a move.
+[[test]]
+fn test_push_string_self_across_growth() -> i32
+    var s: String = string_from("abcdefghijkl")
+    let cap0: i64 = string_cap(@s)
+    assert string_push_string(@&s, @s) == 0
+    assert string_cap(@s) > cap0
+    assert string_eq_strview(@s, "abcdefghijklabcdefghijkl")
+    assert string_push_string(@&s, @s) == 0
+    assert string_eq_strview(@s, "abcdefghijklabcdefghijklabcdefghijklabcdefghijkl")
+    string_drop(@&s)
+    0
+
+# The source pointer is the String's own buffer; the append moves it.
+[[test]]
+fn test_push_bytes_own_buffer_across_growth() -> i32
+    var s: String = string_from("0123456789ABCDEF")   # cap 32, len 16
+    var i: i32 = 0
+    while i < 3
+        let v: StrView = string_as_view(@s)
+        assert string_push_bytes(@&s, v.ptr + 4, v.len - 4) == 0
+        i += 1
+    assert string_len(@s) == 100
+    assert string_eq_strview(@s, "0123456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF")
+    string_drop(@&s)
+    0
+
+# Same, past ritzlib.memory's largest bin (2048), where blocks come from mmap.
+# (ritzlib.memory never makes a moved block unreadable today, so a stale
+# source pointer would still read the right bytes: AGAST #1983. The
+# re-derivation in string_push_bytes is for correctness under any allocator.)
+[[test]]
+fn test_push_own_large_buffer_across_growth() -> i32
+    var s: String = string_with_cap(8192)
+    var i: i64 = 0
+    while i < 8192
+        assert string_push(@&s, (97 + i % 26) as u8) == 0
+        i += 1
+    assert string_cap(@s) == 8192
+    let v: StrView = string_as_view(@s)
+    assert string_push_bytes(@&s, v.ptr + 1, 8191) == 0
+    assert string_len(@s) == 16383
+    i = 0
+    while i < 8191
+        assert string_get(@s, 8192 + i) == (97 + (i + 1) % 26) as u8
+        i += 1
+    assert string_push_string(@&s, @s) == 0
+    assert string_len(@s) == 32766
+    assert string_get(@s, 32765) == string_get(@s, 16382)
+    string_drop(@&s)
+    0
+
+# push_cstr of the String's own C string: the length must be measured before
+# anything is appended, or the scan chases its own tail.
+[[test]]
+fn test_push_cstr_own_buffer() -> i32
+    var s: String = string_from("hello, world!!!")   # 15 bytes, cap 16
+    let p: *u8 = string_as_ptr(@&s)
+    assert string_push_cstr(@&s, p) == 0
+    assert string_eq_strview(@s, "hello, world!!!hello, world!!!")
+    string_drop(@&s)
+    0
+
+# ============================================================================
+# Growth across capacity boundaries
+# ============================================================================
+
+# Appends of every size 0..40 onto every starting length 0..40, each checked
+# byte for byte against the pattern it should spell.
+[[test]]
+fn test_push_bytes_every_boundary() -> i32
+    var src: [64]u8
+    var k: i64 = 0
+    while k < 64
+        src[k] = (65 + k % 26) as u8
+        k += 1
+    var start: i64 = 0
+    while start <= 40
+        var n: i64 = 0
+        while n <= 40
+            var s: String = string_from_bytes(@src[0], start)
+            assert string_push_bytes(@&s, @src[0], n) == 0
+            assert string_len(@s) == start + n
+            assert string_cap(@s) >= start + n
+            var j: i64 = 0
+            while j < start + n
+                var want: u8 = src[j]
+                if j >= start
+                    want = src[j - start]
+                assert string_get(@s, j) == want
+                j += 1
+            string_drop(@&s)
+            n += 1
+        start += 1
+    0
+
+# Many small appends: the result must match, and capacity must stay a
+# doubling of 8 (bulk reserve keeps vec_ensure_cap's growth policy).
+[[test]]
+fn test_many_small_appends() -> i32
+    var s: String = string_new()
+    var i: i32 = 0
+    while i < 100
+        assert string_push_str(@&s, "xyz") == 0
+        i += 1
+    assert string_len(@s) == 300
+    assert string_cap(@s) == 512
+    assert string_starts_with(@s, "xyzxyz") == 1
+    assert string_ends_with(@s, "xyzxyz") == 1
+    string_drop(@&s)
+    0
+
+# ============================================================================
+# Allocation failure: -1, and the String is untouched
+# ============================================================================
+
+[[test]]
+fn test_push_bytes_failed_reserve_is_atomic() -> i32
+    var s: String = string_from("keep")
+    var buf: [8]u8
+    assert string_push_bytes(@&s, @buf[0], huge_len()) == -1
+    assert string_len(@s) == 4
+    assert string_eq_strview(@s, "keep")
+    # Still usable afterwards.
+    assert string_push_str(@&s, "!") == 0
+    assert string_eq_strview(@s, "keep!")
+    string_drop(@&s)
+    0
+
+# A length so large that len + needed overflows must also fail cleanly.
+[[test]]
+fn test_push_bytes_overflowing_len_fails() -> i32
+    var s: String = string_from("keep")
+    var buf: [8]u8
+    assert string_push_bytes(@&s, @buf[0], 9223372036854775807) == -1
+    assert string_eq_strview(@s, "keep")
+    string_drop(@&s)
+    0
+
+[[test]]
+fn test_push_string_failed_reserve_is_atomic() -> i32
+    var s: String = string_from("keep")
+    var buf: [8]u8
+    var big: String = fake_string(@buf[0], huge_len())
+    assert string_push_string(@&s, @big) == -1
+    assert string_eq_strview(@s, "keep")
+    string_drop(@&s)
+    0
+
+[[test]]
+fn test_push_str_failed_reserve_is_atomic() -> i32
+    var s: String = string_from("keep")
+    var buf: [8]u8
+    let sv: StrView = StrView { ptr: @buf[0], len: huge_len() }
+    assert string_push_str(@&s, sv) == -1
+    assert string_eq_strview(@s, "keep")
+    string_drop(@&s)
+    0
+
+# Constructors and clone cannot return an error code; on a failed reserve they
+# return an empty String rather than reading past their source.
+[[test]]
+fn test_constructors_failed_reserve_return_empty() -> i32
+    var buf: [8]u8
+    var a: String = string_from_bytes(@buf[0], huge_len())
+    assert string_len(@a) == 0
+    var b: String = string_from(StrView { ptr: @buf[0], len: huge_len() })
+    assert string_len(@b) == 0
+    var big: String = fake_string(@buf[0], huge_len())
+    var c: String = string_clone(@big)
+    assert string_len(@c) == 0
+    0
+
+# ============================================================================
+# Constructors and clone copy exactly
+# ============================================================================
+
+[[test]]
+fn test_constructors_and_clone_copy_exactly() -> i32
+    var a: String = string_from("constructed")
+    var b: String = string_from_cstr(c"constructed")
+    var c: String = string_from_bytes(c"constructed!!", 11)
+    var d: String = string_clone(@a)
+    assert string_eq_string(@a, @b)
+    assert string_eq_string(@a, @c)
+    assert string_eq_string(@a, @d)
+    assert string_len(@d) == 11
+    # The clone owns its own bytes.
+    assert string_set_char(@&d, 0, 'C') == 0
+    assert string_eq_strview(@a, "constructed")
+    assert string_eq_strview(@d, "Constructed")
+    0
+
+# ============================================================================
+# Formatted digits: i64 extremes and u64 max
+# ============================================================================
+
+# Seven bytes in an 8-byte buffer: i64::MIN's 20 digits cross two boundaries.
+[[test]]
+fn test_push_i64_extremes_across_boundary() -> i32
+    var s: String = string_with_cap(8)
+    assert string_push_str(@&s, "1234567") == 0
+    assert string_push_i64(@&s, -9223372036854775807 - 1) == 0
+    assert string_eq_strview(@s, "1234567-9223372036854775808")
+    assert string_push_i64(@&s, 9223372036854775807) == 0
+    assert string_eq_strview(@s, "1234567-92233720368547758089223372036854775807")
+    string_drop(@&s)
+    0
+
+[[test]]
+fn test_from_hex_u64_max() -> i32
+    var s: String = string_from_hex(18446744073709551615 as u64)
+    assert string_eq_strview(@s, "0xffffffffffffffff")
+    var z: String = string_from_hex(0 as u64)
+    assert string_eq_strview(@z, "0x0")
+    0

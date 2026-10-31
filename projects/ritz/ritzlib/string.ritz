@@ -13,6 +13,7 @@
 #   # Automatic cleanup when s goes out of scope (Drop trait)
 
 import ritzlib.memory
+import ritzlib.str     # memcpy, strlen
 import ritzlib.gvec
 import ritzlib.drop
 import ritzlib.hash
@@ -151,12 +152,9 @@ pub fn string_from(sv: StrView) -> String
     var s: String
     s.data = vec_new<u8>()
 
-    # Reserve space
-    vec_ensure_cap<u8>(@s.data, sv.len + 1)
-
-    # Copy bytes
-    for i in 0..sv.len
-        vec_push<u8>(@s.data, *(sv.ptr + i))
+    # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
+    if vec_ensure_cap<u8>(@s.data, sv.len + 1) == 0
+        string_push_bytes(@&s, sv.ptr, sv.len)
 
     return s
 
@@ -167,17 +165,10 @@ pub fn string_from_cstr(cstr: *u8) -> String
     var s: String
     s.data = vec_new<u8>()
 
-    # Calculate length
-    var len: i64 = 0
-    while *(cstr + len) != 0
-        len += 1
-
-    # Reserve space (including null terminator)
-    vec_ensure_cap<u8>(@s.data, len + 1)
-
-    # Copy bytes
-    for i in 0..len
-        vec_push<u8>(@s.data, *(cstr + i))
+    # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
+    let len: i64 = strlen(cstr)
+    if vec_ensure_cap<u8>(@s.data, len + 1) == 0
+        string_push_bytes(@&s, cstr, len)
 
     return s
 
@@ -186,12 +177,9 @@ pub fn string_from_bytes(bytes: *u8, len: i64) -> String
     var s: String
     s.data = vec_new<u8>()
 
-    # Reserve space
-    vec_ensure_cap<u8>(@s.data, len + 1)
-
-    # Copy bytes
-    for i in 0..len
-        vec_push<u8>(@s.data, *(bytes + i))
+    # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
+    if vec_ensure_cap<u8>(@s.data, len + 1) == 0
+        string_push_bytes(@&s, bytes, len)
 
     return s
 
@@ -258,27 +246,44 @@ pub fn string_push_str(s: @&String, sv: StrView) -> i32
     return string_push_bytes(s, sv.ptr, sv.len)
 
 # Push a NUL-terminated C string onto the string (FFI / *u8 interop).
+# The length is measured first, so cstr may be string_as_ptr(s) itself.
 pub fn string_push_cstr(s: @&String, cstr: *u8) -> i32
-    var i: i64 = 0
-    while *(cstr + i) != 0
-        if vec_push<u8>(@s.data, *(cstr + i)) != 0
-            return -1
-        i += 1
-    return 0
+    return string_push_bytes(s, cstr, strlen(cstr))
 
-# Push another String onto this string.
+# Push another String onto this string. `other` may be `s` itself.
 pub fn string_push_string(s: @&String, other: @String) -> i32
-    let len: i64 = other.data.len
-    for i in 0..len
-        if vec_push<u8>(@s.data, vec_get<u8>(@other.data, i)) != 0
-            return -1
-    return 0
+    return string_push_bytes(s, other.data.data, other.data.len)
 
 # Push a slice of bytes (explicit length, no null-termination required).
+#
+# The one bulk append every other push_*, constructor and clone goes through
+# (AGAST #1931): reserve the whole length once, then memcpy. Returns 0, or -1
+# if the reserve fails, in which case the String is left untouched. len <= 0
+# appends nothing. `bytes` may point into s's own buffer: it is re-derived
+# after the reserve, which can move that buffer.
 pub fn string_push_bytes(s: @&String, bytes: *u8, len: i64) -> i32
-    for i in 0..len
-        if vec_push<u8>(@s.data, *(bytes + i)) != 0
-            return -1
+    if len <= 0
+        return 0
+    let old_len: i64 = s.data.len
+    # Keep old_len + len (and vec_ensure_cap's doubling of it) from overflowing.
+    if len > 4611686018427387904 - old_len
+        return -1
+
+    # Is the source inside our own buffer? Remember its offset if so.
+    let base: i64 = s.data.data as i64
+    let src: i64 = bytes as i64
+    var own: bool = false
+    if base != 0 and src >= base and src < base + s.data.cap
+        own = true
+
+    if vec_ensure_cap<u8>(@s.data, old_len + len) != 0
+        return -1
+
+    var from: *u8 = bytes
+    if own
+        from = s.data.data + (src - base)
+    memcpy(s.data.data + old_len, from, len)
+    s.data.len = old_len + len
     return 0
 
 # Clear the string (keeps capacity).
@@ -334,12 +339,9 @@ pub fn string_eq_cstr(s: @String, cstr: *u8) -> i32
 
 # Clone a string (deep copy).
 pub fn string_clone(s: @String) -> String
-    let len: i64 = s.data.len
-    var clone: String = string_with_cap(len)
-
-    for i in 0..len
-        vec_push<u8>(@clone.data, vec_get<u8>(@s.data, i))
-
+    # One bulk copy; on a failed reserve the clone is empty.
+    var clone: String = string_new()
+    string_push_bytes(@&clone, s.data.data, s.data.len)
     return clone
 
 # ============================================================================
@@ -535,12 +537,7 @@ pub fn string_from_i64(n: i64) -> String
 pub fn string_push_i64(s: @&String, n: i64) -> i32
     var buf: [20]u8
     let len: i64 = fmt_i64_into(@buf[0], n)
-    var i: i64 = 0
-    while i < len
-        if string_push(s, buf[i]) != 0
-            return -1
-        i += 1
-    return 0
+    return string_push_bytes(s, @buf[0], len)
 
 # Convert a u64 to a hex string (with 0x prefix).
 pub fn string_from_hex(n: u64) -> String
@@ -548,10 +545,7 @@ pub fn string_from_hex(n: u64) -> String
     string_push_str(@s, "0x")
     var buf: [16]u8
     let len: i64 = fmt_u64_hex_into(@buf[0], n)
-    var i: i64 = 0
-    while i < len
-        string_push(@s, buf[i])
-        i += 1
+    string_push_bytes(@&s, @buf[0], len)
     return s
 
 # ============================================================================
