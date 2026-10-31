@@ -3077,6 +3077,46 @@ fn get_deref_store_type(s: *EmitterState, ptr_expr: *Expr) -> i32
         return deref_ptr_ptr_elem_type(s, ptr_expr)
     return TYPE_VOID
 
+# AGAST #1965: the float width (TYPE_F32 / TYPE_F64) of binop operand `x`,
+# or 0 when it is not a float.  An `f32` local can surface as TYPE_STRUCT
+# with declared type name "f32", which is_float_type also accepts.
+fn binop_operand_float_ty(s: *EmitterState, x: *Expr) -> i32
+    let t: i32 = get_expr_type(s, x)
+    if t == TYPE_F32 or t == TYPE_F64
+        return t
+    if x.kind == EXPR_IDENT
+        let lv: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+        if lv != null and is_float_type(t, lv.type_name, lv.type_name_len) == 1
+            if *(lv.type_name + 1) == 51  # "f32"
+                return TYPE_F32
+            return TYPE_F64
+    return 0
+
+# AGAST #1965: 1 when `e` is a float literal or a negated one (`-2.5`, which
+# #1959 lowers as `fneg double`).  Both are `double`, narrowable to f32.
+fn is_float_lit_operand(e: *Expr) -> i32
+    if e.kind == EXPR_FLOAT_LIT
+        return 1
+    if e.kind == EXPR_UNARY and e.op == OP_NEG
+        return is_float_lit_operand(e.operand)
+    return 0
+
+# AGAST #1965: the float width a binop `e` is computed at, or 0 when neither
+# operand is a float.  f32 when both sides are f32, or one is f32 and the
+# other a literal / `-literal` (a `double` that narrows); f64 otherwise --
+# f64 wins over f32.  emit_expr_binary coerces both operands to it, and
+# get_expr_type reports it for float arithmetic so an enclosing op agrees.
+pub fn binop_float_width(s: *EmitterState, e: *Expr) -> i32
+    let lft: i32 = binop_operand_float_ty(s, e.left)
+    let rft: i32 = binop_operand_float_ty(s, e.right)
+    if lft == 0 and rft == 0
+        return 0
+    if lft == TYPE_F32 and (rft == TYPE_F32 or is_float_lit_operand(e.right) == 1)
+        return TYPE_F32
+    if rft == TYPE_F32 and is_float_lit_operand(e.left) == 1
+        return TYPE_F32
+    TYPE_F64
+
 fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     # Returns the Ritz type of an expression
     if e.kind == EXPR_INT_LIT
@@ -3222,6 +3262,12 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 return TYPE_I64  # Deref *T gives value
         return get_expr_type(s, e.operand)
     else if e.kind == EXPR_BINARY
+        # AGAST #1965: float arithmetic is computed at binop_float_width
+        # (`y * 2.0` is f32, `y * x` with `x: f64` is f64), not the left type.
+        if e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV
+            let bw: i32 = binop_float_width(s, e)
+            if bw != 0
+                return bw
         return get_expr_type(s, e.left)  # Binary ops preserve left type (simplified)
     else if e.kind == EXPR_MEMBER
         # Look up the field type through the whole receiver chain.  Without
