@@ -480,7 +480,8 @@ struct String
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `string_eq` | `fn(s: @String, other: StrView) -> bool` | Compare to a StrView (a `"..."` literal) |
-| `string_eq_string` | `fn(a: @String, b: @String) -> i32` | Compare two Strings |
+| `string_eq_string` | `fn(a: @String, b: @String) -> bool` | Compare two Strings |
+| `string_eq_strview` | `fn(s: @String, sv: StrView) -> bool` | Same as `string_eq` |
 | `string_eq_cstr` | `fn(s: @String, cstr: *u8) -> i32` | Compare to C string |
 | `string_hash` | `fn(s: @String) -> u64` | Hash the string |
 
@@ -585,8 +586,12 @@ struct Span<T>
 
 **String Operations** (for `Span<u8>`):
 
+`Span<u8>` has StrView's layout; these delegate to the `strview_*` function of
+the same name, and `span_as_strview` / `span_from_strview` convert between the two.
+
 | Function | Signature | Description |
 |----------|-----------|-------------|
+| `span_as_strview` | `fn(s: *Span<u8>) -> StrView` | View the same bytes as a StrView |
 | `span_eq` | `fn(a: *Span<u8>, b: *Span<u8>) -> i32` | Compare equality |
 | `span_eq_cstr` | `fn(s: *Span<u8>, cstr: *u8) -> i32` | Compare to C string |
 | `span_contains` | `fn(haystack: *Span<u8>, needle: *Span<u8>) -> i32` | Contains check |

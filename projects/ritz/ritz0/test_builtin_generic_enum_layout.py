@@ -112,6 +112,35 @@ def test_result_string_payload_synthesized(tmp_path):
     )
 
 
+# String's layout ({ *u8, i64, i64 }: size 24, align 8) without importing
+# ritzlib.string. Since AGAST #1930 string.ritz imports ritzlib.strview, which
+# imports ritzlib.option, so `Option<String>` now resolves to the declared enum
+# and never reaches the synthesizer. A local payload keeps `Option` unimported,
+# and declaring it after its first use keeps it unregistered at synthesis time,
+# like the discovery.ritz case.
+MATCH_OPTION_STRING_LAYOUT_IN_IF = """\
+fn get() -> Option<StrLike>
+    return Some(StrLike { p: null, len: 6, cap: 7 })
+
+fn expand(flag: i32) -> i64
+    if flag == 1
+        match get()
+            Some(s) => s.len
+            None => 0
+    else
+        5
+
+fn main() -> i32
+    let n = expand(1)
+    return 0
+
+struct StrLike
+    p: *u8
+    len: i64
+    cap: i64
+"""
+
+
 def test_synthesized_option_string_body_uses_shared_layout(tmp_path):
     """The synthesized struct body must match the shared layout helper.
 
@@ -128,12 +157,12 @@ def test_synthesized_option_string_body_uses_shared_layout(tmp_path):
     unregistered-payload case the same drift shrank the body to
     `{i8, [1 x i8]}` and crashed `discovery.ritz` with an IndexError GEP.
     """
-    result = _compile(tmp_path, MATCH_OPTION_STRING_IN_IF)
+    result = _compile(tmp_path, MATCH_OPTION_STRING_LAYOUT_IN_IF)
     assert result.returncode == 0, result.stderr
     ll = (tmp_path / "unit.ll").read_text()
     body = next((line for line in ll.splitlines()
-                 if '"Option$String" = type' in line), None)
-    assert body is not None, "Option$String type not found in module"
+                 if '"Option$StrLike" = type' in line), None)
+    assert body is not None, "synthesized Option$StrLike type not found in module"
     assert "{i8, [7 x i8], [24 x i8]}" in body, (
         f"synthesized Option$String body drifted from shared layout: {body}"
     )

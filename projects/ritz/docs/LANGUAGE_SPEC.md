@@ -1431,7 +1431,7 @@ equivalent spelling.
 import ritzlib.string
 
 fn append(s: @&String) -> i32
-    string_push_strview(s, " world")
+    string_push_str(s, " world")
 
 fn main() -> i32
     var s = string_from("hello")

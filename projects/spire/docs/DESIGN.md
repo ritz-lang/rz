@@ -1022,14 +1022,14 @@ pub fn el_render(elem: *Element) -> Html
 
     # Opening tag
     string_push_str(&html.content, "<")
-    string_push_strview(&html.content, &string_as_strview(&elem.tag))
+    string_push_str(&html.content, &string_as_strview(&elem.tag))
 
     # Attributes
     var i: i64 = 0
     while i < vec_len<Attr>(&elem.attrs)
         let attr = vec_get_ptr<Attr>(&elem.attrs, i)
         string_push_str(&html.content, " ")
-        string_push_strview(&html.content, &string_as_strview(&attr.name))
+        string_push_str(&html.content, &string_as_strview(&attr.name))
         string_push_str(&html.content, "=\"")
         html_escape_into(&html.content, &string_as_strview(&attr.value))
         string_push_str(&html.content, "\"")
@@ -1047,12 +1047,12 @@ pub fn el_render(elem: *Element) -> Html
     i = 0
     while i < vec_len<Html>(&elem.children)
         let child = vec_get_ptr<Html>(&elem.children, i)
-        string_push_strview(&html.content, &string_as_strview(&child.content))
+        string_push_str(&html.content, &string_as_strview(&child.content))
         i += 1
 
     # Closing tag
     string_push_str(&html.content, "</")
-    string_push_strview(&html.content, &string_as_strview(&elem.tag))
+    string_push_str(&html.content, &string_as_strview(&elem.tag))
     string_push_str(&html.content, ">")
 
     html
