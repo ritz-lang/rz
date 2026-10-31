@@ -1,0 +1,128 @@
+# AGAST #1984: unannotated `let p = f()` where non-generic `f() -> *Prim`.
+#
+# THE DEFECT (ritz1)
+#
+# capture_fn_return_type recorded a `-> *X` pointee only as a NAME taken
+# from last_type_name, which is null for a primitive pointee (or stale from
+# an earlier struct-typed param). The FnDef never named `*i32`'s pointee, so
+# emit_var_decl could not narrow the let: ritz1 emitted `call i64 @pi()`,
+# kept p as an i64 local, and `p[1]` became a byte-stride `load i8`.
+# #1980 fixed only the generic `-> *T` case.
+#
+# Values are chosen so a byte stride, a narrow load or a struct-typed load
+# changes the answer. The struct and generic cases guard the two existing
+# narrowing paths.
+#
+# Oracle: same exit code under ritz0, ritz1 and ritz1_selfhosted.
+
+import ritzlib.gvec
+import ritzlib.sys
+
+var g_i32: [3]i32
+var g_u64: [3]u64
+
+struct Pt
+    x: i32
+    y: i64
+
+var g_pt: Pt
+
+fn pi() -> *i32
+    return @g_i32[0]
+
+fn pu() -> *u64
+    return @g_u64[1]
+
+fn pu_base() -> *u64
+    return @g_u64[0]
+
+fn ppt() -> *Pt
+    return @g_pt
+
+# A struct-typed param before a primitive pointer return: last_type_name is
+# "Pt" when `-> *i32` is parsed. The let must not take Pt as the pointee.
+fn pi_after_struct_param(q: *Pt) -> *i32
+    return @g_i32[0]
+
+[[test]]
+fn test_i32_ptr_index() -> i32
+    g_i32[0] = 7
+    g_i32[1] = 42
+    g_i32[2] = -70000
+    let p = pi()
+    assert p[1] == 42
+    assert p[2] == -70000
+    0
+
+[[test]]
+fn test_i32_ptr_deref() -> i32
+    g_i32[0] = -123456
+    let p = pi()
+    assert *p == -123456
+    0
+
+[[test]]
+fn test_u64_ptr_deref() -> i32
+    g_u64[1] = 0x600000005 as u64
+    let p = pu()
+    assert *p == 0x600000005 as u64
+    0
+
+[[test]]
+fn test_u64_ptr_index() -> i32
+    g_u64[0] = 1 as u64
+    g_u64[1] = 0x700000009 as u64
+    g_u64[2] = 0x800000003 as u64
+    let p = pu_base()
+    assert p[1] == 0x700000009 as u64
+    assert p[2] == 0x800000003 as u64
+    0
+
+[[test]]
+fn test_i32_ptr_after_struct_param() -> i32
+    g_i32[1] = 99
+    g_pt.x = 5
+    let p = pi_after_struct_param(@g_pt)
+    assert p[1] == 99
+    0
+
+# --- `@g[i]` on a primitive global array -----------------------------------
+#
+# ritz1 GEP'd `@g_u64[1]` by one BYTE (`getelementptr i8, ptr @g_u64, 1`),
+# so pu() above pointed into g_u64[0]. These use an annotated pointer, so they
+# isolate the address-of fix from the unannotated-let fix.
+
+[[test]]
+fn test_addr_of_global_u64_elem() -> i32
+    g_u64[2] = 0x900000007 as u64
+    let q: *u64 = @g_u64[2]
+    assert *q == 0x900000007 as u64
+    0
+
+[[test]]
+fn test_addr_of_global_i32_elem() -> i32
+    g_i32[1] = -5
+    g_i32[2] = 77777
+    let q: *i32 = @g_i32[2]
+    assert *q == 77777
+    0
+
+[[test]]
+fn test_struct_ptr_member() -> i32
+    g_pt.x = 11
+    g_pt.y = 0x500000001
+    let p = ppt()
+    assert p.x == 11
+    assert p.y == 0x500000001
+    0
+
+[[test]]
+fn test_generic_ptr_i32() -> i32
+    var v = vec_new<i32>()
+    v.push(1)
+    v.push(42)
+    v.push(-70000)
+    let p = vec_as_ptr<i32>(@v)
+    assert p[1] == 42
+    assert p[2] == -70000
+    0
