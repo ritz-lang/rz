@@ -1644,9 +1644,69 @@ pub fn tagged_enum_scalar_bits(s: *EmitterState, name: *u8, len: i32, variant: i
     *signed = 1
     64
 
+# AGAST #1945: TYPE_F32 / TYPE_F64 when the payload of `variant` (as for
+# tagged_enum_scalar_bits) is a float, else 0.  Float payloads are stored and
+# loaded as float / double, as ritz0 does, never through the i64 path.
+pub fn tagged_enum_float_type(s: *EmitterState, name: *u8, len: i32, variant: i32) -> i32
+    if is_tagged_enum_type(name, len) == 0
+        let uf: *StructField = user_enum_tuple_field(name, len, variant)
+        if uf == null
+            return 0
+        if uf.field_type == TYPE_F32 or uf.field_type == TYPE_F64
+            return uf.field_type
+        return 0
+    var c_len: i32 = 0
+    let c: *u8 = tagged_enum_arg(s, name, len, variant, @c_len)
+    if c == null
+        return 0
+    if name_eq(c, c_len, c"f32", 3) == 1
+        return TYPE_F32
+    if name_eq(c, c_len, c"f64", 3) == 1
+        return TYPE_F64
+    0
+
+# The LLVM spelling of float type code `t` (TYPE_F32 or TYPE_F64).
+pub fn float_llvm_name(t: i32) -> *u8
+    if t == TYPE_F32
+        return c"float"
+    c"double"
+
+# Convert register `val`, of expression type `src_ty`, to float type `dst_ty`
+# (TYPE_F32 / TYPE_F64): passthrough, fptrunc, fpext, or sitofp from the i64
+# every integer is carried in.  Returns the converted register.
+pub fn emit_float_coerce(s: *EmitterState, val: i32, src_ty: i32, dst_ty: i32) -> i32
+    if src_ty == dst_ty
+        return val
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    if src_ty == TYPE_F64 and dst_ty == TYPE_F32
+        emit_str(s, c" = fptrunc double ")
+    else if src_ty == TYPE_F32 and dst_ty == TYPE_F64
+        emit_str(s, c" = fpext float ")
+    else
+        emit_str(s, c" = sitofp i64 ")
+    emit_reg(s, val)
+    emit_str(s, c" to ")
+    emit_str(s, float_llvm_name(dst_ty))
+    emit_str(s, c"\n")
+    r
+
 # `<dst> = load i<bits>, ptr <pay_ptr>` widened to i64 for a scalar payload
 # of `variant`; returns the i64 register.  See tagged_enum_scalar_bits.
 pub fn emit_tagged_payload_load(s: *EmitterState, pay_ptr: i32, name: *u8, len: i32, variant: i32) -> i32
+    # AGAST #1945: a float payload loads as float / double, unwidened.
+    let ft: i32 = tagged_enum_float_type(s, name, len, variant)
+    if ft != 0
+        let fr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, fr)
+        emit_str(s, c" = load ")
+        emit_str(s, float_llvm_name(ft))
+        emit_str(s, c", ptr ")
+        emit_reg(s, pay_ptr)
+        emit_str(s, c"\n")
+        return fr
     var signed: i32 = 1
     let bits: i32 = tagged_enum_scalar_bits(s, name, len, variant, @signed)
     let r: i32 = next_reg(s)
@@ -1675,6 +1735,18 @@ pub fn emit_tagged_payload_load(s: *EmitterState, pay_ptr: i32, name: *u8, len: 
 # `store i<bits>` of the i64 register `val` into a scalar payload of
 # `variant`, truncating first when the payload is narrower.
 pub fn emit_tagged_payload_store(s: *EmitterState, val: i32, pay_ptr: i32, name: *u8, len: i32, variant: i32)
+    # AGAST #1945: a float payload stores as float / double; `val` must
+    # already be of that type (see emit_float_coerce).
+    let ft: i32 = tagged_enum_float_type(s, name, len, variant)
+    if ft != 0
+        emit_str(s, c"  store ")
+        emit_str(s, float_llvm_name(ft))
+        emit_str(s, c" ")
+        emit_reg(s, val)
+        emit_str(s, c", ptr ")
+        emit_reg(s, pay_ptr)
+        emit_str(s, c"\n")
+        return
     var signed: i32 = 1
     let bits: i32 = tagged_enum_scalar_bits(s, name, len, variant, @signed)
     var v: i32 = val

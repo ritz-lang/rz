@@ -111,8 +111,6 @@ _RITZ1_TWINS = {
     "test_asm":
         "AGAST #1619 — inline `asm x86_64:` blocks unsupported in ritz1",
     # --- codegen, runtime failures ---
-    "test_diff_tagged_prim_args::test_opt_f64_returned":
-        "AGAST #1945 — f32/f64 Option/Result payloads stored and loaded as i64",
 }
 
 # Files no compiler can build: they target draft features (LARB-0013) that
