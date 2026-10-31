@@ -1,0 +1,148 @@
+# AGAST #1973: ritz1 indexes through a `*f32` / `*f64` pointer at the
+# element's real width.
+#
+# THE DEFECT
+#
+# ritz1's pointer-index paths only knew integer pointees.  `p[i]` on a
+# `*f32` / `*f64` fell to the byte path (`getelementptr i8` + `load i8`, a
+# silently wrong value), and `p[i] = v` fell to the i64 path
+# (`getelementptr i64` + `store i64 %float`, which clang rejects).
+#
+# THE FIX (ritz1/src/emitter_expr_access.ritz emit_expr_index,
+# emitter_stmt.ritz emit_index_assign_ptr_store, emitter_core.ritz
+# get_expr_type)
+#
+# A float pointee GEPs, loads and stores `float` / `double`; an f64 value
+# stored into an f32 slot is fptrunc'd; `p[i]` has type F32 / F64, so a
+# binop or compare over it uses the float width.
+#
+# Values are checked as values and as IEEE-754 bits through a `*u32` /
+# `*u64` view of the same memory, which pins the stride and the width.
+#
+# Oracle: ritz0 runs every case to the same result.
+
+fn pfi_bits32(p: *u32, i: i64) -> u32
+    p[i]
+
+fn pfi_bits64(p: *u64, i: i64) -> u64
+    p[i]
+
+# The four functions from the ticket.
+fn pfi_st32(p: *f32, v: f32) -> void
+    p[1] = v
+
+fn pfi_ld32(p: *f32) -> f32
+    p[1]
+
+fn pfi_st64(p: *f64, v: f64) -> void
+    p[1] = v
+
+fn pfi_ld64(p: *f64) -> f64
+    p[1]
+
+# --- params: load and store through *f32 / *f64 ----------------------------
+
+fn pfi_param32_main() -> i32
+    var loc: [3]u32 = [0x3F800000, 0x40100000, 0x40600000]   # 1.0, 2.25, 3.5
+    let p: *f32 = @loc as *f32
+    let want: f32 = 2.25
+    if pfi_ld32(p) != want
+        return 1
+    let v: f32 = -0.75
+    pfi_st32(p, v)
+    if loc[1] != 0xBF400000
+        return 2
+    if loc[0] != 0x3F800000
+        return 3
+    if loc[2] != 0x40600000
+        return 4
+    if pfi_ld32(p) != v
+        return 5
+    return 42
+
+[[test]]
+fn test_ptr_float_index_param32() -> i32
+    assert pfi_param32_main() == 42
+    0
+
+fn pfi_param64_main() -> i32
+    var loc: [3]u64 = [0x3FF0000000000000, 0x4002000000000000, 0xC00C000000000000]   # 1.0, 2.25, -3.5
+    let p: *f64 = @loc as *f64
+    if pfi_ld64(p) != 2.25
+        return 1
+    pfi_st64(p, 0.125)
+    if loc[1] != 0x3FC0000000000000
+        return 2
+    if loc[0] != 0x3FF0000000000000
+        return 3
+    if loc[2] != 0xC00C000000000000
+        return 4
+    if pfi_ld64(p) != 0.125
+        return 5
+    return 42
+
+[[test]]
+fn test_ptr_float_index_param64() -> i32
+    assert pfi_param64_main() == 42
+    0
+
+# --- a `*f32` / `*f64` local over a local float array ----------------------
+
+fn pfi_local32_main() -> i32
+    var loc: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+    let p: *f32 = @loc as *f32
+    # A literal stored into an f32 slot narrows (fptrunc).
+    p[2] = 6.5
+    p[3] = p[0] + p[1]
+    if pfi_bits32(@loc as *u32, 2) != 0x40D00000      # 6.5
+        return 1
+    if pfi_bits32(@loc as *u32, 3) != 0x40400000      # 3.0
+        return 2
+    if pfi_bits32(@loc as *u32, 1) != 0x40000000      # untouched 2.0
+        return 3
+    # `p[i]` is an f32, so the literal side of a binop / compare narrows.
+    if p[2] * 2.0 != 13.0
+        return 4
+    if p[0] != 1.0
+        return 5
+    let x: f32 = p[3]
+    let three: f32 = 3.0
+    if x != three
+        return 6
+    var i: i64 = 0
+    var sum: f32 = 0.0
+    while i < 4
+        sum = sum + p[i]
+        i = i + 1
+    let want: f32 = 12.5
+    if sum != want
+        return 7
+    return 42
+
+[[test]]
+fn test_ptr_float_index_local32() -> i32
+    assert pfi_local32_main() == 42
+    0
+
+fn pfi_local64_main() -> i32
+    var loc: [3]f64 = [1.0, 2.0, 3.0]
+    let p: *f64 = @loc as *f64
+    p[1] = -0.5
+    p[2] = p[0] + p[1]
+    if pfi_bits64(@loc as *u64, 1) != 0xBFE0000000000000      # -0.5
+        return 1
+    if pfi_bits64(@loc as *u64, 2) != 0x3FE0000000000000      # 0.5
+        return 2
+    if pfi_bits64(@loc as *u64, 0) != 0x3FF0000000000000      # untouched 1.0
+        return 3
+    if p[2] * 4.0 != 2.0
+        return 4
+    let x: f64 = p[1]
+    if x != -0.5
+        return 5
+    return 42
+
+[[test]]
+fn test_ptr_float_index_local64() -> i32
+    assert pfi_local64_main() == 42
+    0

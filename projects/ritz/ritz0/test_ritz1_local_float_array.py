@@ -19,8 +19,8 @@ file pins what that matrix test cannot see:
     [3 x float]", #1972), so ritz1 is checked against a fixed exit code;
   * `loc[a..b]`, likewise ritz1-only.
 
-Callees read and write through `*u32` / `*u64`: indexing a `*f32` / `*f64`
-pointer is broken in ritz1 (#1973).
+Callees read and write through `*u32` / `*u64`, which also pins the IEEE
+bits; `*f32` / `*f64` indexing is test_ritz1_ptr_float_index.py (#1973).
 """
 
 import subprocess
@@ -29,8 +29,8 @@ import pytest
 
 from test_ritz1_builtin_struct_shadow import _run
 
-# The callee only receives the pointer: indexing through a `*f32` / `*f64`
-# is #1973.
+# The callee only receives the pointer; indexing through a `*f32` / `*f64`
+# is test_ritz1_ptr_float_index.py (#1973).
 SHAPE = """\
 fn take(p: *{elem}) -> void
     return
@@ -81,7 +81,8 @@ def test_local_float_array_ir_uses_float_elements(ritz1_bin, tmp_path, elem, llv
 
 # `@loc[i]` is the address of element i: a callee writing IEEE bits at
 # offset 1 from `@a[1]` lands on a[2] and leaves a[1] alone.  The callees
-# write through `*u32` / `*u64` because indexing a `*f32` / `*f64` is #1973.
+# write IEEE bits through `*u32` / `*u64`; the `*f32` / `*f64` form is in
+# test_ritz1_ptr_float_index.py (#1973).
 ADDR_OF = """\
 fn put32(p: *u32, i: i64, v: u32) -> void
     p[i] = v
