@@ -1,0 +1,169 @@
+# test/test_int_format.ritz - valet's integer formatters at their extremes
+#
+# AGAST #1950: valet's digit loops all ran `while v > 0`, so a negative
+# printed no digits at all, and log_error_i's `v = 0 - v` printed just "-"
+# for i64's minimum. They now go through ritzlib.fmt.
+
+import ritzlib.str
+import ritzlib.strview
+
+import lib.log
+import lib.response
+import lib.static
+
+fn i64_min() -> i64
+    -9223372036854775807 - 1
+
+# 0 when the `len` bytes at `got` are exactly `want`.
+fn bytes_differ(got: *u8, len: i64, want: StrView) -> i32
+    if len != want.len
+        return 1
+    var i: i64 = 0
+    while i < want.len
+        if *(got + i) != *(want.ptr + i)
+            return 1
+        i += 1
+    0
+
+# ----------------------------------------------------------------------------
+# response_append_int
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_response_append_int_extremes() -> i32
+    var buf: [128]u8
+    var res: Response
+    response_init(@res, @buf[0], 128)
+    response_append_int(@res, i64_min())
+    response_append_byte(@res, ' ')
+    response_append_int(@res, 9223372036854775807)
+    response_append_byte(@res, ' ')
+    response_append_int(@res, 0)
+    response_append_byte(@res, ' ')
+    response_append_int(@res, -1)
+    bytes_differ(res.buf, res.len as i64, "-9223372036854775808 9223372036854775807 0 -1")
+
+# Out of room: nothing is written and -1 comes back.
+[[test]]
+fn test_response_append_int_full() -> i32
+    var buf: [8]u8
+    var res: Response
+    response_init(@res, @buf[0], 8)
+    if response_append_int(@res, 123456789) != -1
+        return 1
+    if res.len != 0
+        return 2
+    0
+
+# ----------------------------------------------------------------------------
+# format_int64 (static.ritz)
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_format_int64_extremes() -> i32
+    var buf: [32]u8
+    var n: i32 = format_int64(@buf[0], 32, i64_min())
+    if bytes_differ(@buf[0], n as i64, "-9223372036854775808") != 0
+        return 1
+    n = format_int64(@buf[0], 32, 9223372036854775807)
+    if bytes_differ(@buf[0], n as i64, "9223372036854775807") != 0
+        return 2
+    n = format_int64(@buf[0], 32, 0)
+    if bytes_differ(@buf[0], n as i64, "0") != 0
+        return 3
+    # Too small for the digits: nothing written.
+    if format_int64(@buf[0], 4, 12345) != 0
+        return 4
+    0
+
+# ----------------------------------------------------------------------------
+# format_int (log.ritz): zero-padded to a minimum width
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_format_int_padding() -> i32
+    var buf: [32]u8
+    var n: i32 = format_int(@buf[0], 7, 2)
+    if bytes_differ(@buf[0], n as i64, "07") != 0
+        return 1
+    n = format_int(@buf[0], 0, 4)
+    if bytes_differ(@buf[0], n as i64, "0000") != 0
+        return 2
+    # Wider than the width: every digit is kept.
+    n = format_int(@buf[0], 12345, 4)
+    if bytes_differ(@buf[0], n as i64, "12345") != 0
+        return 3
+    0
+
+[[test]]
+fn test_format_int_extremes() -> i32
+    var buf: [32]u8
+    var n: i32 = format_int(@buf[0], i64_min(), 2)
+    if bytes_differ(@buf[0], n as i64, "-9223372036854775808") != 0
+        return 1
+    n = format_int(@buf[0], 9223372036854775807, 2)
+    if bytes_differ(@buf[0], n as i64, "9223372036854775807") != 0
+        return 2
+    # The sign comes before the zeros, as printf's %04d does.
+    n = format_int(@buf[0], -5, 4)
+    if bytes_differ(@buf[0], n as i64, "-005") != 0
+        return 3
+    0
+
+# ----------------------------------------------------------------------------
+# log_format_i: the "msg<int>" line behind log_error_i / log_info_i
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_log_format_i_extremes() -> i32
+    var buf: [64]u8
+    var n: i32 = log_format_i(@buf[0], 64, c"x=", i64_min())
+    if bytes_differ(@buf[0], n as i64, "x=-9223372036854775808") != 0
+        return 1
+    if buf[n] != 0
+        return 2
+    n = log_format_i(@buf[0], 64, c"x=", 9223372036854775807)
+    if bytes_differ(@buf[0], n as i64, "x=9223372036854775807") != 0
+        return 3
+    n = log_format_i(@buf[0], 64, c"x=", 0)
+    if bytes_differ(@buf[0], n as i64, "x=0") != 0
+        return 4
+    0
+
+# A message too long for the buffer is cut short; the number and the NUL
+# still fit exactly (12 + 3 + NUL = 16). The old code copied the whole
+# message into a [256]u8.
+[[test]]
+fn test_log_format_i_long_message() -> i32
+    var buf: [16]u8
+    let n: i32 = log_format_i(@buf[0], 16, c"abcdefghijklmnopqrstuvwxyz", -42)
+    if bytes_differ(@buf[0], n as i64, "abcdefghijkl-42") != 0
+        return 1
+    if buf[n] != 0
+        return 2
+    0
+
+# ----------------------------------------------------------------------------
+# format_hex64 (static.ritz, ETag parts): two's-complement bits for negatives
+# ----------------------------------------------------------------------------
+
+# The old loop ran `while v > 0`, so a negative wrote no digits at all.
+[[test]]
+fn test_format_hex64_extremes() -> i32
+    var buf: [32]u8
+    var n: i32 = format_hex64(@buf[0], 32, 0)
+    if bytes_differ(@buf[0], n as i64, "0") != 0
+        return 1
+    n = format_hex64(@buf[0], 32, 9223372036854775807)
+    if bytes_differ(@buf[0], n as i64, "7fffffffffffffff") != 0
+        return 2
+    n = format_hex64(@buf[0], 32, -1)
+    if bytes_differ(@buf[0], n as i64, "ffffffffffffffff") != 0
+        return 3
+    n = format_hex64(@buf[0], 32, i64_min())
+    if bytes_differ(@buf[0], n as i64, "8000000000000000") != 0
+        return 4
+    # Too small for the digits: nothing written.
+    if format_hex64(@buf[0], 2, 4096) != 0
+        return 5
+    0
