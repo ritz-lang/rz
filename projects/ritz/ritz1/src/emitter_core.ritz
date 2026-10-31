@@ -1094,6 +1094,19 @@ fn field_array_elem_llvm(t: i32) -> *u8
         return c"i1"
     return array_elem_llvm(t)
 
+# The LLVM element type of a LOCAL `[N]T` array (`alloca [N x <this>]`) and
+# therefore of every GEP / load / store over it: f32 / f64 elements are real
+# `float` / `double`, as for a struct field (ritz0's layout).  AGAST #1966:
+# they were `i64` slots, so `let a: [3]f32 = [1.0, 2.0, 3.5]` stored
+# `store i64 %double`.  bool keeps its i64 slot.  Globals still use
+# array_elem_llvm (#1970).
+fn local_array_elem_llvm(t: i32) -> *u8
+    if t == TYPE_F32
+        return c"float"
+    if t == TYPE_F64
+        return c"double"
+    return array_elem_llvm(t)
+
 # Widen an array element just loaded as `ty` (array_elem_llvm(t)) to the i64
 # every expression value is carried in: zext unsigned, sext signed, ptrtoint
 # pointers. i64 elements are returned as-is.
@@ -3177,6 +3190,17 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 if pointee == TYPE_I32 or pointee == TYPE_U32 or pointee == TYPE_I16 or pointee == TYPE_U16 or pointee == TYPE_I64 or pointee == TYPE_U64 or pointee == TYPE_I8
                     return pointee
                 return TYPE_U8   # *u8 (or unrecorded pointee) indexed gives u8
+            else if base_type == TYPE_ARRAY
+                # AGAST #1966: `loc[i]` over a local `[N]f32` / `[N]f64` loads
+                # a `float` / `double` (local_array_elem_llvm); say so, or a
+                # binop / compare over it picks the other operand's width.
+                # A range `loc[a..b]` is an element pointer (i64), not one.
+                let arr_loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+                var is_range: i32 = 0
+                if e.right != null and e.right.kind == EXPR_RANGE
+                    is_range = 1
+                if is_range == 0 and arr_loc != null and (arr_loc.array_elem_type == TYPE_F32 or arr_loc.array_elem_type == TYPE_F64)
+                    return arr_loc.array_elem_type
         return TYPE_I64  # Default
     else if e.kind == EXPR_UNARY
         if e.op == OP_ADDR

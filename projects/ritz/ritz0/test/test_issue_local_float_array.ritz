@@ -1,0 +1,186 @@
+# AGAST #1966: ritz1 lays out a local `[N]f32` / `[N]f64` array with real
+# `float` / `double` elements.
+#
+# THE DEFECT
+#
+# ritz1 allocated `let loc: [3]f32 = [1.0, 2.0, 3.5]` as `alloca [3 x i64]`
+# and stored each element as `store i64 %double`, which clang rejects.  The
+# struct-field path already used `[N x float]` / `[N x double]` (#1935);
+# local arrays kept every float element in an i64 slot.
+#
+# THE FIX (ritz1/src/emitter_core.ritz array_elem_llvm, emitter_stmt.ritz)
+#
+# array_elem_llvm spells f32 / f64 elements `float` / `double`, so the
+# alloca, the literal / fill stores and the `loc[i]` loads and stores agree.
+# An f64 literal stored into an f32 element is fptrunc'd, as for a field.
+#
+# Values are checked twice: as values (mostly against an f32 / f64 local,
+# plus literal-side compares #1965 made possible), and as IEEE-754 bits
+# through a `*u32` / `*u64` view, which pins the in-memory layout.
+#
+# Oracle: ritz0 runs every case to the same result.
+
+fn lfa_bits32(p: *u32, i: i64) -> u32
+    p[i]
+
+fn lfa_bits64(p: *u64, i: i64) -> u64
+    p[i]
+
+# --- literals and element loads -------------------------------------------
+
+fn lfa_lit_main() -> i32
+    let loc: [3]f32 = [1.0, 2.0, 3.5]
+    let l2: [2]f64 = [1.0, 0.5]
+    let w2: f32 = 2.0
+    let w3: f32 = 3.5
+    if loc[1] != w2
+        return 1
+    if loc[2] != w3
+        return 2
+    if l2[0] != 1.0
+        return 3
+    if l2[1] != 0.5
+        return 4
+    let b0: u32 = lfa_bits32(@loc as *u32, 0)
+    let b2: u32 = lfa_bits32(@loc as *u32, 2)
+    if b0 != 0x3F800000
+        return 5
+    if b2 != 0x40600000
+        return 6
+    if lfa_bits64(@l2 as *u64, 1) != 0x3FE0000000000000
+        return 7
+    # The literal side of an f32 binop narrows (#1965) once `loc[i]` is
+    # known to be an f32.
+    if loc[2] * 2.0 != 7.0
+        return 8
+    if loc[0] != 1.0
+        return 9
+    if l2[1] + loc[1] != 2.5
+        return 10
+    return 42
+
+[[test]]
+fn test_local_float_array_lit() -> i32
+    assert lfa_lit_main() == 42
+    0
+
+# --- negative literals, variable index, arithmetic on elements ------------
+
+fn lfa_neg_main() -> i32
+    let loc: [3]f32 = [1.5, -2.25, -3.5]
+    let l2: [3]f64 = [-1.0, -0.125, 4.0]
+    let w: f32 = -3.5
+    if loc[2] != w
+        return 1
+    let b1: u32 = lfa_bits32(@loc as *u32, 1)
+    if b1 != 0xC0100000
+        return 2
+    var i: i64 = 0
+    var sum: f64 = 0.0
+    while i < 3
+        sum = sum + l2[i]
+        i = i + 1
+    if sum != 2.875
+        return 3
+    let w4: f32 = -2.0
+    if loc[0] + loc[2] != w4
+        return 4
+    if lfa_bits64(@l2 as *u64, 0) != 0xBFF0000000000000
+        return 5
+    return 42
+
+[[test]]
+fn test_local_float_array_neg() -> i32
+    assert lfa_neg_main() == 42
+    0
+
+# --- fill `[v; N]`, unrolled (N <= 16) and looped (N > 16) -----------------
+
+fn lfa_fill_main() -> i32
+    let f: [3]f32 = [0.5; 3]
+    let g: [3]f64 = [-0.5; 3]
+    let big: [20]f32 = [1.25; 20]
+    let bigd: [20]f64 = [2.5; 20]
+    let h: f32 = 0.5
+    let hb: f32 = 1.25
+    if f[2] != h
+        return 1
+    if g[1] != -0.5
+        return 2
+    if big[19] != hb
+        return 3
+    if bigd[19] != 2.5
+        return 4
+    let b: u32 = lfa_bits32(@f as *u32, 0)
+    if b != 0x3F000000
+        return 5
+    let bb: u32 = lfa_bits32(@big as *u32, 19)
+    if bb != 0x3FA00000
+        return 6
+    if lfa_bits64(@g as *u64, 2) != 0xBFE0000000000000
+        return 7
+    let z: [4]f32 = [0.0; 4]
+    let zz: f32 = 0.0
+    if z[3] != zz
+        return 8
+    return 42
+
+[[test]]
+fn test_local_float_array_fill() -> i32
+    assert lfa_fill_main() == 42
+    0
+
+# --- element stores `loc[i] = v` -------------------------------------------
+
+fn lfa_store_main() -> i32
+    var loc: [3]f32 = [0.0, 0.0, 0.0]
+    var l2: [2]f64 = [0.0, 0.0]
+    let v: f32 = -1.5
+    loc[1] = v
+    loc[2] = 2.75
+    l2[0] = -0.25
+    var j: i64 = 1
+    l2[j] = l2[0] * 2.0
+    if loc[1] != v
+        return 1
+    let w: f32 = 2.75
+    if loc[2] != w
+        return 2
+    if l2[1] != -0.5
+        return 3
+    let b2: u32 = lfa_bits32(@loc as *u32, 2)
+    if b2 != 0x40300000
+        return 4
+    let b0: u32 = lfa_bits32(@loc as *u32, 0)
+    if b0 != 0
+        return 5
+    return 42
+
+[[test]]
+fn test_local_float_array_store() -> i32
+    assert lfa_store_main() == 42
+    0
+
+# --- `for x in loc`: the loop already loaded `float` / `double` elements, ---
+# --- which only matched the alloca once the array was typed (#1966) --------
+
+fn lfa_for_main() -> i32
+    let loc: [4]f32 = [0.5, 1.5, -2.0, 4.0]
+    let l2: [3]f64 = [0.25, -0.5, 8.0]
+    var s32: f32 = 0.0
+    for x in loc
+        s32 = s32 + x
+    let want: f32 = 4.0
+    if s32 != want
+        return 1
+    var s64: f64 = 0.0
+    for y in l2
+        s64 = s64 + y
+    if s64 != 7.75
+        return 2
+    return 42
+
+[[test]]
+fn test_local_float_array_for() -> i32
+    assert lfa_for_main() == 42
+    0

@@ -452,21 +452,12 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         emit_str(s, c"[")
         emit_int(s, stmt.var_array_size as i64)
         emit_str(s, c" x ")
-        if stmt.var_array_elem_type == TYPE_I32 or stmt.var_array_elem_type == TYPE_U32
-            emit_str(s, c"i32")
-        else if stmt.var_array_elem_type == TYPE_I64 or stmt.var_array_elem_type == TYPE_U64
-            emit_str(s, c"i64")
-        else if stmt.var_array_elem_type == TYPE_U8 or stmt.var_array_elem_type == TYPE_I8
-            emit_str(s, c"i8")
-        else if stmt.var_array_elem_type == TYPE_U16 or stmt.var_array_elem_type == TYPE_I16
-            emit_str(s, c"i16")
-        else if stmt.var_array_elem_type == TYPE_PTR or stmt.var_array_elem_type == TYPE_PTR_PTR
-            emit_str(s, c"ptr")
-        else if stmt.var_array_elem_type == TYPE_STRUCT and stmt.var_type_name_len > 0
+        if stmt.var_array_elem_type == TYPE_STRUCT and stmt.var_type_name_len > 0
             emit_str(s, c"%")
             emit_name(s, stmt.var_type_name, stmt.var_type_name_len)
         else
-            emit_str(s, c"i64")
+            # The spelling every access over the local uses (#1564, #1966).
+            emit_str(s, local_array_elem_llvm(stmt.var_array_elem_type))
         emit_str(s, c"]")
     else
         emit_llvm_type_struct(s, var_type, stmt.var_type_name, stmt.var_type_name_len)
@@ -2821,7 +2812,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_str(s, c" x ")
                 # AGAST #1564: every non-struct element uses the alloca's own
                 # spelling (array_elem_llvm); u32/u16/i16 used to fall to i64.
-                let elem_ty: *u8 = array_elem_llvm(local.array_elem_type)
+                let elem_ty: *u8 = local_array_elem_llvm(local.array_elem_type)
                 if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
                     # AGAST #190: struct-array LHS — emit `[N x %T]` so the
                     # GEP and the store agree with the actual element layout.
@@ -2848,8 +2839,13 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     emit_reg(s, val_reg)
                 else
                     # Store at the element width: narrow ints truncate, pointers
-                    # convert back to ptr, i64 stores as-is.
-                    let store_val: i32 = emit_array_elem_narrow(s, val_reg, local.array_elem_type, elem_ty)
+                    # convert back to ptr, i64 stores as-is; an f64 value into
+                    # an f32 element is fptrunc'd (#1966).
+                    var store_val: i32 = val_reg
+                    if local.array_elem_type == TYPE_F32 or local.array_elem_type == TYPE_F64
+                        store_val = emit_field_elem_narrow(s, val_reg, local.array_elem_type, stmt.assign_value)
+                    else
+                        store_val = emit_array_elem_narrow(s, val_reg, local.array_elem_type, elem_ty)
                     emit_str(s, c"  store ")
                     emit_str(s, elem_ty)
                     emit_str(s, c" ")

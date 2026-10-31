@@ -1431,9 +1431,9 @@ fn emit_array_fill_struct_loop(s: *EmitterState, base_reg: i32, arr_size: i32, s
 
 # The register to store for one bool / f32 / f64 element of a STRUCT FIELD
 # array (`[N x i1]` / `[N x float]` / `[N x double]`, see
-# field_array_elem_llvm): narrowed exactly as emit_struct_lit_field_store
-# narrows a scalar field of that type.  `val_reg` is emit_expr(value).
-# AGAST #1935.
+# field_array_elem_llvm), or one f32 / f64 element of a LOCAL array (#1966):
+# narrowed exactly as emit_struct_lit_field_store narrows a scalar field of
+# that type.  `val_reg` is emit_expr(value).  AGAST #1935.
 fn emit_field_elem_narrow(s: *EmitterState, val_reg: i32, elem_ty: i32, value: *Expr) -> i32
     if elem_ty == TYPE_BOOL
         if bool_reg_is_i1(s, value) == 1
@@ -1455,18 +1455,30 @@ fn emit_field_elem_narrow(s: *EmitterState, val_reg: i32, elem_ty: i32, value: *
         return tf
     val_reg
 
-# 1 when `[N]elem_ty` is laid out differently as a struct field than as a
-# local: fields use i1 / float / double elements (ritz0's struct ABI, #1814),
-# locals keep every bool / float element in an i64 slot.
+# 1 when emit_array_field_copy_from must refuse to copy a LOCAL `[N]elem_ty`
+# into a struct field.  bool differs: fields use i1 elements (ritz0's struct
+# ABI, #1814), a local keeps an i64 slot.  f32 / f64 locals share the field's
+# float / double layout since #1966, but that copy is not yet exercised
+# against ritz0, so it stays refused (#1971).
 fn field_elem_layout_differs(elem_ty: i32) -> i32
     if elem_ty == TYPE_BOOL or elem_ty == TYPE_F32 or elem_ty == TYPE_F64
         return 1
     0
 
+# 1 when an element of `[N]elem_ty` is stored with emit_field_elem_narrow at
+# `float` / `double` / `i1` width: every f32 / f64 array (field or local,
+# #1966), and a bool array only when it is a struct field (`field_layout`).
+fn array_elem_typed_scalar(elem_ty: i32, field_layout: i32) -> i32
+    if elem_ty == TYPE_F32 or elem_ty == TYPE_F64
+        return 1
+    if field_layout == 1 and elem_ty == TYPE_BOOL
+        return 1
+    0
+
 # Write `[v; arr_size]` into the array at `base_reg`.  `field_layout` is 1
-# when `base_reg` is an inline STRUCT FIELD array (bool / f32 / f64 elements
-# are then `i1` / `float` / `double`, see field_elem_layout_differs) and 0
-# for a local array.
+# when `base_reg` is an inline STRUCT FIELD array (bool elements are then
+# `i1`) and 0 for a local array (bool in an i64 slot).  f32 / f64 elements
+# are `float` / `double` either way (array_elem_typed_scalar, #1966).
 fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, fill_val: *Expr, field_layout: i32)
     let fill_elem_ty: i32 = elem_ty
     let fill_arr_size: i32 = arr_size
@@ -1485,7 +1497,7 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
         fill_elem_llvm = c"ptr"
         fill_elem_bytes = 8
     var field_scalar: i32 = 0
-    if field_layout == 1 and field_elem_layout_differs(fill_elem_ty) == 1
+    if array_elem_typed_scalar(fill_elem_ty, field_layout) == 1
         field_scalar = 1
         fill_elem_llvm = field_array_elem_llvm(fill_elem_ty)
         if fill_elem_ty == TYPE_BOOL
@@ -1675,8 +1687,9 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
 # The generic EXPR_ARRAY_LIT arm of emit_expr builds an `[N x i64]` shadow and
 # stored each struct element as an i64 (invalid IR). (AGAST #1608)
 #
-# `field_layout` is as for emit_array_fill_into: 1 writes bool / f32 / f64
-# elements as `i1` / `float` / `double` (a struct field), 0 as i64 slots.
+# `field_layout` is as for emit_array_fill_into: 1 writes bool elements as
+# `i1` (a struct field), 0 as i64 slots; f32 / f64 are always `float` /
+# `double` (#1966).
 fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, elem_name: *u8, elem_name_len: i32, lit: *Expr, field_layout: i32)
     var is_struct: i32 = 0
     if elem_ty == TYPE_STRUCT and elem_name_len > 0
@@ -1695,7 +1708,7 @@ fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: 
     else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
         elem_llvm = c"ptr"
     var field_scalar: i32 = 0
-    if field_layout == 1 and field_elem_layout_differs(elem_ty) == 1
+    if array_elem_typed_scalar(elem_ty, field_layout) == 1
         field_scalar = 1
         elem_llvm = field_array_elem_llvm(elem_ty)
     var idx: i32 = 0
