@@ -1220,6 +1220,19 @@ class LLVMEmitter:
         elif isinstance(expr, rast.Index):
             base_type = self._infer_ritz_type(expr.expr)
             if base_type:
+                # A reference to a Vec auto-derefs on index (AGAST #1968), so
+                # `d[i]` on `d: @Vec<T>` is a T, mirroring _emit_index. A raw
+                # `*Vec<T>` stays pointer arithmetic (falls through below).
+                if (isinstance(base_type, rast.RefType)
+                        and self._vec_elem_type(base_type.inner) is not None):
+                    base_type = base_type.inner
+                # `v[i]` on a Vec<T> lowers to vec_get$T, whose LLVM return
+                # type (i8/i16/...) carries no signedness. Without the element
+                # type here, `v[i] as i64` on a Vec<u8> used sext (200 -> -56)
+                # and comparisons/div/shr were signed (AGAST #1979).
+                elem = self._vec_elem_type(base_type)
+                if elem is not None:
+                    return elem
                 if isinstance(base_type, rast.ArrayType):
                     return base_type.inner
                 elif isinstance(base_type, rast.PtrType):
@@ -10931,6 +10944,24 @@ class LLVMEmitter:
         name = getattr(ty, "name", None)
         return name if isinstance(name, str) else str(ty)
 
+    def _vec_elem_type(self, ty: Optional[rast.Type]) -> Optional[rast.Type]:
+        """Element type of a `Vec<T>` / mangled `Vec$T` type, else None.
+
+        For the mangled form only a plain scalar suffix (`Vec$u8`) is mapped
+        back to a type; a composite suffix (`Vec$ptr_u8`) is not reversible
+        from the name alone, so it answers None (no signedness claim).
+        """
+        if not isinstance(ty, rast.NamedType):
+            return None
+        if ty.name == 'Vec' and ty.args:
+            return ty.args[0]
+        if ty.name.startswith('Vec$'):
+            suffix = ty.name[4:]
+            if suffix in ('u8', 'u16', 'u32', 'u64', 'i8', 'i16', 'i32',
+                          'i64', 'f32', 'f64', 'bool'):
+                return rast.NamedType(ty.span, suffix, [])
+        return None
+
     def _is_unsigned_type(self, ty: rast.Type) -> bool:
         """Check if a Ritz type is unsigned."""
         if isinstance(ty, rast.NamedType):
@@ -11031,7 +11062,10 @@ class LLVMEmitter:
                         return self._is_unsigned_type(field_type.inner)
                     if isinstance(field_type, rast.PtrType):
                         return self._is_unsigned_type(field_type.inner)
-            return False
+            # Anything else, notably the Vec index sugar `v[i]` / `d[i]` on a
+            # `@Vec<T>` (AGAST #1979): vec_get$T returns a bare i8/i16, so
+            # ask _infer_ritz_type for the element type.
+            return self._is_unsigned_type(self._infer_ritz_type(expr))
 
         # Field access - check struct field type
         if isinstance(expr, rast.Field):

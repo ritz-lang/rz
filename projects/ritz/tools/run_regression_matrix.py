@@ -116,6 +116,9 @@ _RITZ1_TWINS = {
     "test_diff_ref_vec_index":
         "AGAST #1981 — `d[i]` on a `@Vec<T>` param indexes the reference as "
         "bytes; `@&Vec<T>` also emits inttoptr on a ptr",
+    "test_diff_ref_vec_index_unsigned":
+        "AGAST #1981 — `d[i]` on a `@Vec<T>` param; `@&Vec<T>` emits "
+        "inttoptr on a ptr (the unsigned-element twin of test_diff_ref_vec_index)",
     # --- codegen, runtime failures ---
 }
 
