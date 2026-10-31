@@ -121,6 +121,54 @@ def test_warm_run_compiles_no_harness(tmp_path, monkeypatch, test_runner):
     assert calls["harness"] == [], "the harness was recompiled although the store had it"
 
 
+def _spy_obj_compiles(monkeypatch, test_runner):
+    """Record the .ll files build.compile_ll_to_obj (clang -c -O2) is run on."""
+    build = test_runner._build_module()
+    real = build.compile_ll_to_obj
+    seen = []
+
+    def spy(ll_path, obj_path, src):
+        seen.append(Path(ll_path).name)
+        return real(ll_path, obj_path, src)
+    monkeypatch.setattr(build, "compile_ll_to_obj", spy)
+    return seen
+
+
+@pytest.mark.integration
+@needs_clang
+def test_the_harness_is_linked_as_an_O2_object(tmp_path, monkeypatch, test_runner):
+    """AGAST #1917: the harness went to the link as .ll, i.e. at clang's -O0,
+    while every other object (and every shipped program) is -O2. Tests that
+    passed only unoptimised hid real bugs."""
+    _pkg_dir, t = _pkg(tmp_path)
+    seen = _spy_obj_compiles(monkeypatch, test_runner)
+    linked = []
+    real_link = test_runner._link
+
+    def spy_link(objects, exe_path):
+        linked.extend(objects)
+        return real_link(objects, exe_path)
+    monkeypatch.setattr(test_runner, "_link", spy_link)
+
+    assert test_runner.run_test_file(str(t))[:2] == (1, 0)
+    assert "test_main.ll" in seen, seen
+    assert linked and not [o for o in linked if not o.endswith(".o")], linked
+
+
+@pytest.mark.integration
+@needs_clang
+def test_warm_run_compiles_no_harness_object(tmp_path, monkeypatch, test_runner):
+    """The -O2 harness object is stored, so a warm run runs no clang -c on it."""
+    _pkg_dir, t = _pkg(tmp_path)
+    seen = _spy_obj_compiles(monkeypatch, test_runner)
+    assert test_runner.run_test_file(str(t))[:2] == (1, 0)
+    assert seen.count("test_main.ll") == 1, seen
+
+    seen.clear()
+    assert test_runner.run_test_file(str(t))[:2] == (1, 0)
+    assert "test_main.ll" not in seen, "the harness object was rebuilt although the store had it"
+
+
 @pytest.mark.integration
 @needs_clang
 def test_editing_the_test_file_recompiles_its_harness(tmp_path, monkeypatch, test_runner):

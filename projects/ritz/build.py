@@ -511,11 +511,13 @@ def cas_harness_key(src: Path, closure, compiler: str) -> Optional[str]:
     copy for ritz0, the test file itself for ritz1) and `closure` its
     transitive imports, as test_runner resolved them. Keyed like a module,
     with `emit: test-table` so it never shares an entry with the file's
-    `--no-runtime` object. The IR is stored, not an object: the link compiles
-    it as it always has (at -O0; #1914 found -O2 changes three verdicts).
+    `--no-runtime` object. The -O2 object (compile_ll_to_obj) is stored, as
+    for every other module (AGAST #1917; it used to be IR linked at -O0, and
+    tests that passed only unoptimised hid real bugs). `artifact: o` keeps
+    entries from before that change, which hold IR, from being served.
     None when an import does not parse: compile uncached.
     """
-    flags = {"compiler": compiler, "emit": "test-table", "artifact": "ll"}
+    flags = {"compiler": compiler, "emit": "test-table", "artifact": "o"}
     return _cas_key(src, closure, get_build_cache(compiler), compiler, flags)
 
 

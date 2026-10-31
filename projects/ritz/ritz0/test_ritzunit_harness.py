@@ -180,8 +180,11 @@ def test_crash_assert_and_timeout_are_attributed(package, tmp_path, monkeypatch)
     test_file = package("""\
         [[test]]
         fn crashes() -> i32
-            let p: *i32 = 0 as *i32
-            *p
+            # A load from address 0 the optimiser cannot see. `*(0 as *i32)`
+            # is UB: the -O2 harness folded it to `unreachable` (AGAST #1917).
+            asm x86_64:
+                movl 0, %eax
+            0
 
         [[test]]
         fn asserts() -> i32

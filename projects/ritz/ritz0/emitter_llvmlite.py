@@ -2123,6 +2123,17 @@ class LLVMEmitter:
         replacement = r'\1 alignstack(16) "no-builtins"\2\3'
         ir_str = re.sub(pattern, replacement, ir_str, flags=re.MULTILINE)
 
+        # "no-builtins" on declarations too (AGAST #1917). The attribute on
+        # definitions only covers what a function's body may become; LLVM's
+        # InferFunctionAttrs pass recognises a *declaration* by name, through
+        # TLI built from the declaration's own attributes. An imported
+        # ritzlib `realloc` got libc's allocptr/allockind/noalias, and -O2
+        # then elided `realloc(malloc(64), 0)` and folded `== null` to false.
+        # Intrinsics (llvm.*) are not library functions and are left alone.
+        decl_pattern = (r'^(declare [^\n]+@"(?!llvm\.)[^"]+"' + _IR_PARAMS
+                        + r')(?! "no-builtins")')
+        ir_str = re.sub(decl_pattern, r'\1 "no-builtins"', ir_str, flags=re.MULTILINE)
+
         return ir_str
 
     def _add_simd_alignstack(self, ir_str: str) -> str:
@@ -3709,8 +3720,14 @@ class LLVMEmitter:
             self.di_subprograms[fn_def.name] = di_sp
             fn.set_metadata('dbg', di_sp)
 
-        # Add inline attributes if specified
-        if fn_def.has_attr('inline'):
+        # Add inline attributes if specified.
+        # [[naked]] implies noinline (as clang does): the body is asm that does
+        # its own `ret`, followed by `unreachable`. Inlined (-O2), that `ret`
+        # returns from the caller and the code after the call is deleted as
+        # unreachable (AGAST #1917). Inline hints are ignored on a naked fn.
+        if fn_def.has_attr('naked'):
+            fn.attributes.add('noinline')
+        elif fn_def.has_attr('inline'):
             fn.attributes.add('inlinehint')
         elif fn_def.has_attr('always_inline'):
             fn.attributes.add('alwaysinline')

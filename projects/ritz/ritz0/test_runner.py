@@ -623,43 +623,55 @@ def _cas_enabled() -> bool:
     return os.environ.get(NO_CAS_ENV, "") in ("", "0")
 
 
-def _harness_ll(source_path: str, harness_path: str, harness_ll: str,
-                project_root: Optional[Path],
-                dependencies: Optional[Dict[str, DependencyMapping]],
-                closure: List[Path], compiler: str = "ritz0") -> Optional[str]:
-    """Write the test file's `--test-table` IR to `harness_ll`; an error or None.
+def _harness_obj(source_path: str, harness_path: str, harness_ll: str,
+                 project_root: Optional[Path],
+                 dependencies: Optional[Dict[str, DependencyMapping]],
+                 closure: List[Path],
+                 compiler: str = "ritz0") -> Tuple[Optional[str], Optional[str]]:
+    """The test file's `--test-table` harness as an -O2 object: (obj, error).
+
+    AGAST #1917: compiled by build.compile_ll_to_obj (-O2) like every other
+    object and every shipped program; linked as .ll it was -O0, and tests
+    that pass only unoptimised hid real bugs.
 
     AGAST #1915: from the artifact store when it has it, keyed on the harness
     source and its closure's interfaces (build.cas_harness_key). Before this
     every file of every warm `rz test --all` recompiled IR it had produced
-    before: ~0.75 s x 180 files.
+    before: ~0.75 s x 180 files. The object is stored, not the IR, so a warm
+    run pays for no clang -O2 either.
     """
+    harness_obj = os.path.join(os.path.dirname(harness_ll), Path(harness_ll).stem + ".rzu.o")
+
     def compile_it() -> Optional[str]:
-        return _compile_harness(harness_path, harness_ll, project_root, dependencies, compiler)
+        return (_compile_harness(harness_path, harness_ll, project_root, dependencies, compiler)
+                or _build_module().compile_ll_to_obj(
+                    Path(harness_ll), Path(harness_obj), Path(source_path)))
 
     if not _cas_enabled():
-        return compile_it()
+        error = compile_it()
+        return (None, error) if error else (harness_obj, None)
     build = _build_module()
     key = build.cas_harness_key(Path(harness_path), closure, compiler)
     if key is None:
-        return compile_it()
+        error = compile_it()
+        return (None, error) if error else (harness_obj, None)
 
     def build_fn():
         error = compile_it()
         if error:
             raise build.cas.BuildFailed(error)
-        return {"ll": Path(harness_ll)}
+        return {"ll": Path(harness_ll), "o": Path(harness_obj)}
 
     ident = build.cas.module_identity(Path(source_path)) + "#test-table"
     try:
         stored, built = build.cas.ArtifactStore().get_or_build(
-            key, "ll", build_fn, identity=ident,
+            key, "o", build_fn, identity=ident,
             meta={"module": ident, "compiler": compiler})
     except build.cas.BuildFailed as e:
-        return str(e)
+        return None, str(e)
     if not built:
-        shutil.copyfile(stored, harness_ll)
-    return None
+        shutil.copyfile(stored, harness_obj)
+    return harness_obj, None
 
 
 def _link(objects: List[str], exe_path: str) -> Tuple[Optional[str], Optional[str]]:
@@ -823,14 +835,15 @@ def build_test_binary(source_path: str, tmpdir: str,
         Path(harness_path).write_text(strip_main_from_source(Path(source_path).read_text()))
     else:
         harness_path = str(Path(source_path).resolve())
-    error = _harness_ll(source_path, harness_path, harness_ll, project_root, dependencies,
-                        [Path(f) for f in dep_files or []], compiler)
+    harness_obj, error = _harness_obj(source_path, harness_path, harness_ll, project_root,
+                                      dependencies, [Path(f) for f in dep_files or []],
+                                      compiler)
     if error:
         return None, error
 
     # A module both the test and ritzunit import is in both lists once.
     objects = list(dict.fromkeys(dep_objects + runner_objects))
-    return _link(objects + [harness_ll], os.path.join(tmpdir, "test"))
+    return _link(objects + [harness_obj], os.path.join(tmpdir, "test"))
 
 
 def _indent(text: str) -> str:

@@ -55,11 +55,12 @@ def _ir(compiler: str, tmp_path: Path, src: str) -> str:
     return ll.read_text()
 
 
-def _run(compiler: str, tmp_path: Path, src: str) -> int:
+def _run(compiler: str, tmp_path: Path, src: str, opt: str = "-O0") -> int:
     _ir(compiler, tmp_path, src)
     ll = tmp_path / "t.ll"
     exe = tmp_path / f"t_{compiler}"
-    link_cmd = ["clang", "-Wno-override-module", str(ll), "-o", str(exe), "-nostdlib", "-no-pie"]
+    link_cmd = ["clang", "-Wno-override-module", opt, str(ll), "-o", str(exe),
+                "-nostdlib", "-no-pie"]
     if compiler == "ritz1":
         link_cmd.insert(1, str(RITZ_START))
     link = subprocess.run(link_cmd, capture_output=True, text=True)
@@ -348,6 +349,20 @@ def test_ritz0_naked_has_no_prologue(tmp_path):
 
 def test_ritz0_naked_runs(tmp_path):
     assert _run("ritz0", tmp_path, NAKED) == 42
+
+
+def test_ritz0_naked_runs_at_O2(tmp_path):
+    # AGAST #1917: a naked fn's IR body is asm + `unreachable` (the asm does
+    # its own `ret`). Inlined at -O2, that `ret` returned from the *caller*
+    # and everything after the call was deleted as unreachable: SIGSEGV.
+    # Shipped programs are -O2, so a naked fn must never be inlined.
+    assert _run("ritz0", tmp_path, NAKED, "-O2") == 42
+
+
+def test_ritz0_naked_is_noinline(tmp_path):
+    ir = _ir("ritz0", tmp_path, NAKED)
+    header = re.search(r'^define [^\n]*@"?naked_add"?\(.*$', ir, re.M).group(0)
+    assert re.search(r"\bnoinline\b", header), header
 
 
 NAKED_NON_ASM = """\
