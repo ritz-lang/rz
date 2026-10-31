@@ -611,6 +611,23 @@ class DepObjects:
         return objs, None
 
 
+def cell_link_cmd(exe, obj, objs, baseline_archive):
+    """The ld command for one matrix cell.
+
+    No libc. ritzlib is linked as an archive, and an archive member is pulled
+    in only for a symbol that is still undefined. A `-lc` ahead of it (there
+    from the first matrix, bb167ee, until AGAST #1983) resolved malloc,
+    realloc, free, memcpy and friends from glibc first, so every cell
+    silently tested glibc's allocator instead of ritzlib.memory. That hid a
+    real ritzlib bug (mmap failure checked as == -1) and made probes of the
+    ritzlib block header read glibc's chunk header instead. build.py links
+    without libc too.
+    """
+    return (["ld", "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+             "-o", str(exe), str(RUNTIME_O), str(obj)] + list(objs)
+            + [str(baseline_archive)])
+
+
 def run_file(test_name, compiler_name, compiler_bin, deps, env, tmpdir):
     """{unit: (status, code, info)} for every unit of one file under one compiler.
 
@@ -671,10 +688,7 @@ def run_file(test_name, compiler_name, compiler_bin, deps, env, tmpdir):
         return all_units("asm-fail", r.returncode, r.stderr[-400:])
 
     exe = work / f"{test_name}.exe"
-    link_cmd = (["ld", "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2", "-lc",
-                 "-o", str(exe), str(RUNTIME_O), str(obj)] + objs
-                + [deps.baseline_archive()])
-    r = subprocess.run(link_cmd, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(cell_link_cmd(exe, obj, objs, deps.baseline_archive()), capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         return all_units("link-fail", r.returncode, r.stderr[-400:])
 

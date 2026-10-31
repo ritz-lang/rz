@@ -23,6 +23,14 @@ import ritzlib.str  # For memcpy, memset, memcmp
 
 const ARENA_DEFAULT_SIZE: i64 = 1048576  # 1 MB default
 
+# Did sys_mmap fail? Linux returns -errno in [-4095, -1] (e.g. -12 for
+# ENOMEM), not just -1 (MAP_FAILED is libc's translation). Comparing against
+# -1 alone missed every real failure: arena_new kept base = -12 and malloc
+# returned -12 + HEADER_SIZE = 4 (AGAST #1983).
+fn mmap_failed(p: *u8) -> bool
+    let v: i64 = p as i64
+    return v < 0 and v >= -4095
+
 struct Arena
     base: *u8       # Base pointer from mmap
     size: i64       # Total size of arena
@@ -32,7 +40,7 @@ struct Arena
 pub fn arena_new(size: i64) -> Arena
     var a: Arena
     a.base = sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
-    if a.base == (-1) as *u8
+    if mmap_failed(a.base)
         # mmap failed
         a.base = null
         a.size = 0
@@ -117,7 +125,10 @@ pub fn arena_valid(a: *Arena) -> i32
 pub fn heap_alloc(size: i64) -> *u8
     if size <= 0
         return null
-    return sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+    let p: *u8 = sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+    if mmap_failed(p)
+        return null
+    return p
 
 # Free `size` bytes of heap memory at `ptr`
 pub fn heap_free(ptr: *u8, size: i64) -> i32
@@ -272,7 +283,7 @@ fn bin_new_slab(bin: *SizeBin) -> i32
     # Allocate 64KB slabs for efficiency
     let slab_size: i64 = 65536
     let slab: *u8 = sys_mmap(0, slab_size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
-    if slab == (-1) as *u8
+    if mmap_failed(slab)
         return -1
     bin.slab = slab
     bin.slab_offset = 0
@@ -336,14 +347,18 @@ pub fn malloc(size: i64) -> *u8
     let class: i32 = get_size_class(size)
 
     if class < 0
-        # Large allocation - use mmap directly
+        # Large allocation - use mmap directly.
+        # The header holds 0 - mmap_size, where mmap_size is size + HEADER_SIZE
+        # rounded up to whole pages: malloc(8192) -> 8208 -> 3 pages -> -12288.
+        # A size near i64 max wraps mmap_size to <= 0 (ritz arithmetic wraps),
+        # which mmap rejects, so it fails as null below.
         let total_size: i64 = size + HEADER_SIZE
         # Round up to page size
         let pages: i64 = (total_size + PAGE_SIZE - 1) / PAGE_SIZE
         let mmap_size: i64 = pages * PAGE_SIZE
 
         let block: *u8 = sys_mmap(0, mmap_size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
-        if block == (-1) as *u8
+        if mmap_failed(block)
             return null
 
         # Store negative size to indicate large block
@@ -397,7 +412,10 @@ pub fn realloc(ptr: *u8, new_size: i64) -> *u8
         # Get usable size from block size
         old_usable = get_block_size(old_class as i32) - HEADER_SIZE
 
-    # Check if new size fits in current block
+    # Only a small block staying in its own bin is returned as-is. A large
+    # (mmap) block always moves, whether it grows or shrinks: there is no
+    # in-place mremap growth, so realloc(malloc(8192), 16384) is a new block
+    # and the old mapping is unmapped (AGAST #1983).
     let new_class: i32 = get_size_class(new_size)
     if new_class >= 0 and new_class == old_class as i32
         return ptr  # Fits in same class, no change needed

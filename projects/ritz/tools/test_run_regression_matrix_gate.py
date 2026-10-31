@@ -446,3 +446,12 @@ def test_harness_lowers_and_runs_under_ritz0(tmp_path):
     assert [c[0] for c in codes] == ["pass", "bad-exit", "bad-exit", "bad-exit", "pass"], codes
     assert codes[1][1] == 7
     assert codes[2][1] == 255 and codes[3][1] == 255
+
+
+def test_cell_link_cmd_links_no_libc_ahead_of_ritzlib(tmp_path):
+    """AGAST #1983: a `-lc` before the ritzlib archive made glibc's malloc,
+    realloc and free win, so no cell ever ran ritzlib.memory."""
+    cmd = matrix.cell_link_cmd(tmp_path / "e", tmp_path / "t.o", ["dep.o"], tmp_path / "b.a")
+    assert not [a for a in cmd if a.startswith("-l")], cmd
+    assert cmd[-1] == str(tmp_path / "b.a")
+    assert cmd.index(str(tmp_path / "t.o")) < cmd.index("dep.o") < cmd.index(str(tmp_path / "b.a"))

@@ -488,6 +488,87 @@ fn test_malloc_large() -> i32
     0
 
 [[test]]
+fn test_malloc_large_header() -> i32
+    # AGAST #1983: a large block's header holds 0 - mmap_size, where
+    # mmap_size = (size + HEADER_SIZE) rounded up to whole pages.
+    # malloc(8192) needs 8192 + 16 = 8208 bytes -> 3 pages -> -12288.
+    let p: *u8 = malloc(8192)
+    assert p != null
+    let h: i64 = *((p as i64 - 16) as *i64)
+    assert h == -12288
+    free(p)
+    0
+
+[[test]]
+fn test_realloc_large_grow_moves() -> i32
+    # AGAST #1983: growing a large (mmap) block past its mapping must return a
+    # new block, preserve the contents, and give a fully writable new size.
+    let p: *u8 = malloc(8192)
+    assert p != null
+    for i in 0..8192
+        *(p + i) = (i % 251) as u8
+
+    let q: *u8 = realloc(p, 16384)
+    assert q != null
+    assert (p as i64) != (q as i64)
+    # 16384 + 16 -> 5 pages
+    let h: i64 = *((q as i64 - 16) as *i64)
+    assert h == -20480
+
+    for i in 0..8192
+        assert *(q + i) == (i % 251) as u8
+    *(q + 16383) = 7
+    assert *(q + 16383) == 7
+
+    free(q)
+    0
+
+# Linux mmap reports failure as -errno (e.g. -ENOMEM = -12), not just -1.
+# 2^60 bytes cannot be mapped, so each allocator must report failure as null
+# instead of handing back a small bogus address. AGAST #1983 found that the
+# `== -1` checks missed every real failure.
+fn unmappable_size() -> i64
+    1152921504606846976
+
+[[test]]
+fn test_malloc_mmap_failure_returns_null() -> i32
+    let p: *u8 = malloc(unmappable_size())
+    assert p == null
+    0
+
+[[test]]
+fn test_malloc_size_overflow_returns_null() -> i32
+    # size + header + page rounding must not wrap to a small mapping
+    let p: *u8 = malloc(9223372036854775807)
+    assert p == null
+    0
+
+[[test]]
+fn test_realloc_mmap_failure_keeps_block() -> i32
+    let p: *u8 = malloc(8192)
+    assert p != null
+    *p = 5
+    let q: *u8 = realloc(p, unmappable_size())
+    assert q == null
+    # The old block is untouched and still owned by the caller.
+    assert *p == 5
+    free(p)
+    0
+
+[[test]]
+fn test_arena_mmap_failure_has_null_base() -> i32
+    var a: Arena = arena_new(unmappable_size())
+    assert a.base == null
+    assert a.size == 0
+    0
+
+[[test]]
+fn test_heap_alloc_mmap_failure_returns_null() -> i32
+    let p: *u8 = heap_alloc(unmappable_size())
+    assert p == null
+    0
+
+[[test]]
 fn test_malloc_write_read() -> i32
     # Allocate and write data
     let p: *u8 = malloc(100)
