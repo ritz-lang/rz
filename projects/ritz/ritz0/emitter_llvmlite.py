@@ -6452,6 +6452,20 @@ class LLVMEmitter:
             name = expr.expr.name
             if name in self.ritz_types:
                 base_ritz_type = self.ritz_types[name]
+                # A reference to a Vec (`d: @Vec<T>` / `@&Vec<T>`) auto-derefs:
+                # `d[i]` indexes the Vec, not the reference (AGAST #1968). The
+                # reference's value already IS the Vec pointer, so it replaces
+                # `&d`. A raw `*Vec<T>` is deliberately NOT peeled: `p[i]` on a
+                # pointer is pointer arithmetic.
+                via_ref = (
+                    isinstance(base_ritz_type, rast.RefType)
+                    and isinstance(base_ritz_type.inner, rast.NamedType)
+                    and (base_ritz_type.inner.name == 'Vec'
+                         or base_ritz_type.inner.name.startswith('Vec$'))
+                )
+                if via_ref:
+                    base_ritz_type = base_ritz_type.inner
+
                 if isinstance(base_ritz_type, rast.NamedType):
                     type_name = base_ritz_type.name
 
@@ -6475,7 +6489,10 @@ class LLVMEmitter:
 
                         fn, _ = self.functions[fn_name]
                         # Get pointer to vec
-                        vec_ptr = self._emit_lvalue_addr(expr.expr)
+                        if via_ref:
+                            vec_ptr = self._emit_expr(expr.expr)
+                        else:
+                            vec_ptr = self._emit_lvalue_addr(expr.expr)
                         # Ensure index is i64
                         if index.type != self.i64:
                             index = self.builder.sext(index, self.i64)
@@ -8874,6 +8891,13 @@ class LLVMEmitter:
 
             return self.builder.call(fn, args)
 
+        # A generic fn called without type args: ritz does not infer them from
+        # the arguments (LANGUAGE_SPEC section 4.4), so name the fix (#1968).
+        if fname in getattr(self, 'generic_fn_names', ()):
+            raise ValueError(
+                f"generic function `{fname}` needs explicit type arguments: "
+                f"write `{fname}<T>(...)`; type arguments are not inferred "
+                f"from the call's arguments")
         raise ValueError(f"Unknown function: {fname}")
 
     def _try_emit_simd_builtin(self, fname: str, args: list) -> Optional[ir.Value]:
@@ -12542,8 +12566,12 @@ def emit(module: rast.Module, no_runtime: bool = False,
             where emitted_fn_ir is {fn_name: ir_block} for cache storage
         Otherwise: ir_str only (backward compatible)
     """
-    # Monomorphize generics before emission
+    # Monomorphize generics before emission. Note the generic fn names first:
+    # monomorph drops their definitions, and a call that names one without
+    # type args deserves a better error than "Unknown function" (#1968).
     from monomorph import monomorphize
+    generic_fn_names = {item.name for item in module.items
+                        if isinstance(item, rast.FnDef) and item.is_generic()}
     module = monomorphize(module)
 
     # Test mode (§17.1): the runner supplies `main`, so the file's own goes.
@@ -12557,6 +12585,7 @@ def emit(module: rast.Module, no_runtime: bool = False,
                           target_os=target_os)
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
+    emitter.generic_fn_names = generic_fn_names
 
     # Configure per-fn cache: tells emitter which functions to skip
     cached_fn_ir = {}

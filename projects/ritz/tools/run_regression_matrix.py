@@ -110,6 +110,12 @@ _RITZ1_TWINS = {
         "AGAST #1624 — `alias::item` calls, removed from the spec; ritz0 is the outlier",
     "test_asm":
         "AGAST #1619 — inline `asm x86_64:` blocks unsupported in ritz1",
+    "test_diff_ref_vec_explicit_generic":
+        "AGAST #1980 — unannotated `let p = vec_get_ptr<u64>(..)` keeps `*T` "
+        "unsubstituted (`load %T`; byte stride for vec_as_ptr<i32>)",
+    "test_diff_ref_vec_index":
+        "AGAST #1981 — `d[i]` on a `@Vec<T>` param indexes the reference as "
+        "bytes; `@&Vec<T>` also emits inttoptr on a ptr",
     # --- codegen, runtime failures ---
 }
 
