@@ -25,7 +25,6 @@ THE ORACLE
 """
 
 import re
-import subprocess
 
 import pytest
 
@@ -341,31 +340,24 @@ def test_nested_struct_sizeof_uses_natural_alignment(ritz1_bin, tmp_path, compil
     assert _run(compiler, tmp_path, "nested", NESTED) == 42
 
 
-# ritz1 has no f32 element value model; indexing a `[N x float]` field must be
-# a counted compile error, never an 8-byte stride over 4-byte slots.
+# AGAST #1954: a `[N x float]` field element reads and writes as a real
+# `float` (it was a counted compile error, #1814 / #1890).  ritz0 is the oracle.
 F32_INDEX = {
-    "read": "    return s.a[1] as i32\n",
-    "write": "    s.a[1] = 1.5\n    return 0\n",
+    "read": "    s.a[1] = 1.5\n    return (s.a[1] * 2.0) as i32 + 39\n",
+    "write": "    s.a[1] = 1.5\n    s.a[0] = -2.0\n    s.a[2] = s.a[1] + s.a[0]\n"
+    "    if s.a[2] != -0.5\n        return 1\n    return 42\n",
 }
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 @pytest.mark.parametrize("op", sorted(F32_INDEX))
-def test_ritz1_f32_member_array_index_fails_closed(ritz1_bin, tmp_path, op):
-    src = tmp_path / f"f32_{op}.ritz"
-    src.write_text(
+def test_f32_member_array_index_runs(ritz1_bin, tmp_path, compiler, op):
+    prog = (
         "struct S\n    a: [3]f32\n    c: i64\n\npub fn main() -> i32\n"
         "    var s: S\n" + F32_INDEX[op]
     )
-    proc = subprocess.run(
-        [str(ritz1_bin), str(src), "-o", str(tmp_path / f"f32_{op}.ll")],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert proc.returncode != 0
-    assert "[N]f32 struct field" in proc.stderr
+    assert _run(compiler, tmp_path, f"f32_{op}", prog) == 42
 
 
 @pytest.mark.integration

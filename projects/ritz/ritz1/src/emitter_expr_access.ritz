@@ -758,12 +758,6 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             let field: *StructField = member_result.field
             if field.field_type == TYPE_ARRAY
                 let et: i32 = field.array_elem_type
-                if et == TYPE_F32
-                    # AGAST #1814: the field is now `[N x float]` (ritz0's
-                    # layout); ritz1 has no f32 element value model, and an
-                    # i64 read would stride 8 over 4-byte slots. Fail closed.
-                    emit_ir_error(s, c"indexing a [N]f32 struct field is not supported by ritz1")
-                    return 0
                 # Array field in struct - GEP directly into it
                 let idx: i32 = emit_expr(s, e.right)
                 let elem_ptr: i32 = next_reg(s)
@@ -789,12 +783,15 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 emit_reg(s, idx)
                 emit_str(s, c"\n")
                 # Load element. Integer/pointer elements load at their own
-                # width (array_elem_llvm) and widen to i64. f64 elements keep
-                # their historical i64 bit-load (same 8-byte slot). Bool loads
-                # its i1 and zero-extends.
+                # width (array_elem_llvm) and widen to i64. Bool loads its i1
+                # and zero-extends. AGAST #1954: f32 / f64 elements load the
+                # field's own `float` / `double` (field_array_elem_llvm) and
+                # are returned as-is, as #1966's `loc[i]` and #1973's `p[i]`
+                # are; get_expr_type reports F32 / F64 for them. They used to
+                # fail closed (f32) or bit-load an i64 (f64).
                 var load_ty: *u8 = array_elem_llvm(et)
-                if et == TYPE_BOOL
-                    load_ty = c"i1"
+                if et == TYPE_BOOL or et == TYPE_F32 or et == TYPE_F64
+                    load_ty = field_array_elem_llvm(et)
                 let result: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, result)
@@ -808,6 +805,8 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 emit_reg(s, elem_ptr)
                 emit_str(s, c"\n")
                 if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
+                    return result
+                if et == TYPE_F32 or et == TYPE_F64
                     return result
                 if et == TYPE_BOOL
                     let bext: i32 = next_reg(s)

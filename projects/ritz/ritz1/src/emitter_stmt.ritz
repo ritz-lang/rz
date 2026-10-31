@@ -1960,11 +1960,6 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
     var is_struct: i32 = 0
     if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
         is_struct = 1
-    if et == TYPE_F32
-        # `[N x float]`: ritz1 has no f32 element store. Fail closed rather
-        # than stride 8 over 4-byte slots.
-        emit_ir_error(s, c"assigning to a [N]f32 struct field element is not supported by ritz1")
-        return
     let elem_ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, elem_ptr)
@@ -1994,7 +1989,14 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
         emit_reg(s, elem_ptr)
         emit_str(s, c"\n")
         return
-    if et == TYPE_BOOL
+    if et == TYPE_F32 or et == TYPE_F64
+        # AGAST #1954: `float` / `double` (field_array_elem_llvm), an f64
+        # value into an f32 slot fptrunc'd, as #1973's `p[i] = v` does.
+        # f32 failed closed; f64 stored `i64`, which only type-checked while
+        # the `x.f[i]` read also bit-loaded an i64.
+        sty = field_array_elem_llvm(et)
+        sval = emit_field_elem_narrow(s, val, et, val_expr)
+    else if et == TYPE_BOOL
         # An i1 register stores as-is; an i64 bool truncates.
         sty = c"i1"
         if bool_reg_is_i1(s, val_expr) == 0
@@ -2005,8 +2007,8 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
             emit_reg(s, val)
             emit_str(s, c" to i1\n")
     else
-        # Integers / pointers at their own width (trunc / inttoptr); i64 and
-        # f64 elements store all 8 bytes, as before.
+        # Integers / pointers at their own width (trunc / inttoptr); i64
+        # elements store all 8 bytes.
         sty = array_elem_llvm(et)
         sval = emit_array_elem_narrow(s, val, et, sty)
     emit_str(s, c"  store ")
