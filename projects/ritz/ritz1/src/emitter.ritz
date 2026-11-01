@@ -471,6 +471,68 @@ fn hoist_entry_allocas(s: *EmitterState, body_start: i64)
     memcpy(base, tmp, n)
     free(tmp)
 
+# AGAST #1737 — the CPU features an x86 ISA-extension intrinsic needs.
+#
+# Without them, instruction selection aborts with "Cannot select: intrinsic
+# %llvm.x86.sha256rnds2" (clang exit 70), unless clang is run with -msha /
+# -maes / -mpclmul / -march=native, and build.py's per-source `clang -c -O2`
+# passes none of those (#1731). So, as ritz0 has done since #1736, a function
+# whose body calls one gets `"target-features"="+..."` for exactly the
+# features it uses: what clang gives a C function marked
+# `__attribute__((target("sha")))`. The rest of the module stays baseline
+# x86-64, so the runtime check guarding the call (cryptosec's cpu_has_sha_ni
+# and friends) still decides whether the instructions ever run.
+#
+# "target-cpu"="x86-64" is pinned too (#1921): a function's target-features
+# REPLACES the command line's feature string, so with `-march=native` on a VM
+# that masks AVX, a bare "+sha" function got the host CPU's full nominal ISA
+# and SIGILLed. ritz0's _with_target_features emits the identical attributes.
+#
+# llvm.x86.sse2.* (psad.bw) is baseline x86-64 and needs nothing.
+
+# 1 if `pat` (plen bytes) occurs anywhere in s.out from `from` on.
+fn out_contains(s: *EmitterState, from: i64, pat: *u8, plen: i64) -> i32
+    let base: *u8 = s.out.data
+    var i: i64 = from
+    while i + plen <= s.out.len
+        if memcmp(base + i, pat, plen) == 0
+            return 1
+        i += 1
+    0
+
+# Called once the body is complete (before the closing `}`), with attr_pos
+# the offset in s.out just after the define line's other attributes. Splices
+# the target attributes in there when the body calls an intrinsic needing
+# one; the body text after attr_pos moves along unchanged.
+fn tag_intrinsic_target_features(s: *EmitterState, attr_pos: i64)
+    let sha: i32 = out_contains(s, attr_pos, c"@llvm.x86.sha", 13)
+    let aes: i32 = out_contains(s, attr_pos, c"@llvm.x86.aesni.", 16)
+    let clmul: i32 = out_contains(s, attr_pos, c"@llvm.x86.pclmulqdq", 19)
+    if sha == 0 and aes == 0 and clmul == 0
+        return
+    let n: i64 = s.out.len - attr_pos
+    let tail: *u8 = malloc(n)
+    memcpy(tail, s.out.data + attr_pos, n)
+    s.out.len = attr_pos
+    emit_str(s, c" \"target-cpu\"=\"x86-64\" \"target-features\"=\"")
+    # Sorted, as ritz0 emits them, so the two compilers' IR agrees.
+    var sep: i32 = 0
+    if aes == 1
+        emit_str(s, c"+aes")
+        sep = 1
+    if clmul == 1
+        if sep == 1
+            emit_str(s, c",")
+        emit_str(s, c"+pclmul")
+        sep = 1
+    if sha == 1
+        if sep == 1
+            emit_str(s, c",")
+        emit_str(s, c"+sha")
+    emit_str(s, c"\"")
+    vec_push_bytes<u8>(s.out, tail, n)
+    free(tail)
+
 fn emit_fn(s: *EmitterState, f: *FnDef)
     # AGAST #194 modular emit: skip imports entirely. The owning .ll
     # emits the body; this .ll just needs a `declare`, which the
@@ -576,6 +638,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     # never runs. The property has to travel with the IR.
     emit_str(s, c") alignstack(16) \"no-builtins\"")
     emit_str(s, fn_inline_attr(f))   # [[inline]] / [[always_inline]] / [[noinline]] (#1847)
+    let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
     # AGAST #1685: allocas emitted below this point are hoisted back here.
@@ -768,6 +831,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     align_packed_accesses(s, body_start)         # AGAST #1918
     hoist_entry_allocas(s, body_start)
+    tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
 
 # =============================================================================
@@ -893,7 +957,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # build.py's -ffreestanding/-fno-builtin cannot prevent this: they are
     # frontend flags and we hand clang already-emitted .ll, so the frontend
     # never runs. The property has to travel with the IR.
-    emit_str(s, c") alignstack(16) \"no-builtins\" {\n")
+    emit_str(s, c") alignstack(16) \"no-builtins\"")
+    let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
+    emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
     # AGAST #1685: allocas emitted below this point are hoisted back here.
     let body_start: i64 = s.out.len
@@ -1102,6 +1168,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     align_packed_accesses(s, body_start)         # AGAST #1918
     hoist_entry_allocas(s, body_start)
+    tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
 
 # =============================================================================
