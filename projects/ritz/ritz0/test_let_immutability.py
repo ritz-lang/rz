@@ -189,3 +189,120 @@ WHOLE_ACCEPTED = [
 def test_assigning_a_var_is_accepted(tmp_path, body):
     r, out = _compile(tmp_path, _indent(body))
     assert r.returncode == 0, f"rejected:\n{body}\n{out[-2000:]}"
+
+
+# AGAST #2029: an *implicit* mutable borrow -- a `self:&` / `self: @&T`
+# method receiver, or call-site autoborrow into a `name:& T` / `name: @&T`
+# parameter -- is the same `@&` as #2026's explicit one, and was accepted.
+# A small `let` was spilled to a temp so the mutation vanished; a #2025
+# large `let` slot was passed in place, so it stuck.
+IMPLICIT_PRELUDE = """\
+impl Pt
+    fn bump(self:& Pt)
+        self.x = self.x + 1
+    fn bump_ref(self: @&Pt)
+        self.x = self.x + 1
+    fn peek(self: @Pt) -> i64
+        return self.x
+    fn get(self: Pt) -> i64
+        return self.x
+    fn absorb(self:& Pt, other:& Pt)
+        self.x = self.x + other.x
+
+impl Big
+    fn bump(self:& Big)
+        self.n = self.n + 1
+
+fn set(p:& Pt)
+    p.x = 9
+
+fn set_ref(p: @&Pt)
+    p.x = 9
+
+fn pt_read(p: @Pt) -> i64
+    return p.x
+
+fn set_big(b:& Big)
+    b.n = 9
+
+fn set_i64(k:& i64)
+    k = 9
+
+struct Wrap
+    pt: Pt
+    pp: *Pt
+
+"""
+
+
+def _compile_implicit(tmp_path: Path, body: str):
+    src = tmp_path / "prog.ritz"
+    src.write_text(PRELUDE + IMPLICIT_PRELUDE + "fn main() -> i32\n" + body + "    0\n")
+    ll = tmp_path / "prog.ll"
+    r = run_ritz0([str(src), "-o", str(ll), "--no-runtime"], cwd=tmp_path,
+                  env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)), timeout=300)
+    return r, r.stdout + r.stderr
+
+
+IMPLICIT_REJECTED = [
+    # Method receivers.
+    ("recv-small", "let p = Pt { x: 1, y: 2 }\np.bump()", "p"),
+    ("recv-small-ref", "let p = Pt { x: 1, y: 2 }\np.bump_ref()", "p"),
+    ("recv-large", "let b: Big = big_new()\nb.bump()", "b"),
+    ("recv-large-nested-field", "let b: Big = big_new()\nb.pt.bump()", "b"),
+    ("recv-small-field", "let w = Wrap { pt: Pt { x: 1, y: 2 }, pp: null }\nw.pt.bump()", "w"),
+    # A method's explicit `:&` argument.
+    ("method-arg", "var p = Pt { x: 1, y: 2 }\nlet q = Pt { x: 3, y: 4 }\np.absorb(q)", "q"),
+    # Free-function autoborrow.
+    ("arg-small", "let q = Pt { x: 1, y: 2 }\nset(q)", "q"),
+    ("arg-small-ref", "let q = Pt { x: 1, y: 2 }\nset_ref(q)", "q"),
+    ("arg-large", "let b: Big = big_new()\nset_big(b)", "b"),
+    ("arg-large-field", "let b: Big = big_new()\nset(b.pt)", "b"),
+    ("arg-scalar", "let k: i64 = 4\nset_i64(k)", "k"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("body,name", [r[1:] for r in IMPLICIT_REJECTED],
+                         ids=[r[0] for r in IMPLICIT_REJECTED])
+def test_implicit_mut_borrow_of_let_is_rejected(tmp_path, body, name):
+    r, out = _compile_implicit(tmp_path, _indent(body))
+    assert r.returncode != 0, f"implicit mutable borrow of `let {name}` compiled:\n{body}"
+    assert f"cannot borrow `let` binding `{name}` as mutable; declare it `var`" in out, out[-2000:]
+    assert "Traceback" not in out, out[-3000:]
+    assert "prog.ritz:" in out, out[-2000:]
+
+
+# Each autoborrow call is the body's last use of its argument: the move
+# checker still counts a `name:&` autoborrow as a move (separate defect).
+IMPLICIT_ACCEPTED = [
+    # Shared and by-value receivers/params of a `let`.
+    ("recv-shared", "let p = Pt { x: 1, y: 2 }\nlet n = p.peek()"),
+    ("recv-by-value", "let p = Pt { x: 1, y: 2 }\nlet n = p.get()"),
+    ("arg-shared", "let p = Pt { x: 1, y: 2 }\nlet n = pt_read(p)"),
+    # `var` receivers and arguments.
+    ("recv-var", "var p = Pt { x: 1, y: 2 }\np.bump()\np.bump_ref()"),
+    ("recv-var-large", "var b: Big = big_new()\nb.bump()\nb.pt.bump()"),
+    ("arg-var", "var p = Pt { x: 1, y: 2 }\nset(p)"),
+    ("arg-var-ref", "var p = Pt { x: 1, y: 2 }\nset_ref(p)"),
+    ("arg-var-large", "var b: Big = big_new()\nset_big(b)"),
+    ("arg-var-large-field", "var b: Big = big_new()\nset(b.pt)"),
+    ("var-shadows-let", "let p = Pt { x: 1, y: 2 }\nvar p = Pt { x: 3, y: 4 }\np.bump()\nset(p)"),
+    # A `let` holding a pointer: the pointee is borrowed, not the binding.
+    ("let-ptr-recv", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\np.bump()\np.bump_ref()"),
+    ("let-ptr-arg", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\nset(p)"),
+    ("let-ptr-arg-ref", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\nset_ref(p)"),
+    ("let-ref-arg", "var v = Pt { x: 1, y: 2 }\nlet p: @&Pt = @&v\np.bump()\nset(p)"),
+    ("let-ptr-field-recv",
+     "var v = Pt { x: 1, y: 2 }\nlet w = Wrap { pt: Pt { x: 0, y: 0 }, pp: @&v }\nw.pp.bump()\nset(w.pp)"),
+    # Rvalues are spilled to a fresh temp.
+    ("rvalue-recv", "Pt { x: 1, y: 2 }.bump()"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("body", [a[1] for a in IMPLICIT_ACCEPTED],
+                         ids=[a[0] for a in IMPLICIT_ACCEPTED])
+def test_implicit_non_let_mut_borrow_is_accepted(tmp_path, body):
+    r, out = _compile_implicit(tmp_path, _indent(body))
+    assert r.returncode == 0, f"rejected:\n{body}\n{out[-2000:]}"

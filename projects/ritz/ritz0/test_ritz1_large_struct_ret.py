@@ -325,7 +325,7 @@ pub fn main() -> i32
     var x: Big = big_pick(10)
     if x.total() != 30
         return 1
-    let y = big_with(3)
+    var y = big_with(3)
     if y.total() != 16
         return 2
     x = big_with(x.count + y.count)

@@ -3409,6 +3409,32 @@ class LLVMEmitter:
                 f"cannot borrow `let` binding `{place[0]}` as mutable; declare it `var`",
                 operand.span)
 
+    @staticmethod
+    def _is_mut_borrow_param(param: rast.Param) -> bool:
+        """AGAST #2029: does `param` borrow its argument mutably?
+
+        `name:& T` (Borrow.MUTABLE) or `name: @&T` (a mutable RefType).
+        Raw `*T` params and shared `@T` / by-value params do not.
+        """
+        if getattr(param, 'borrow', None) == rast.Borrow.MUTABLE:
+            return True
+        return isinstance(param.type, rast.RefType) and param.type.mutable
+
+    def _check_let_implicit_mut_borrow(self, arg: rast.Expr, param: rast.Param) -> None:
+        """AGAST #2029: reject an implicit `@&` of a `let` at a call site.
+
+        A `self:&` receiver or a `name:& T` / `name: @&T` argument is
+        autoborrowed, which is #2026's explicit `@&` in disguise: a small
+        `let` was spilled to a temp (the mutation vanished), a #2025 large
+        slot passed in place (it stuck). A `let` that *holds* a pointer is
+        passed as that pointer, borrowing the pointee, so stays legal.
+        """
+        if not self._is_mut_borrow_param(param):
+            return
+        place = self._let_place(arg)
+        if place is not None and not isinstance(place[1], ir.PointerType):
+            self._check_let_mut_borrow(arg)
+
     def _let_place(self, expr: rast.Expr) -> Optional[Tuple[str, ir.Type]]:
         """AGAST #2026: (let name, LLVM type) if `expr` is a `let`'s storage.
 
@@ -9034,6 +9060,7 @@ class LLVMEmitter:
                         # Argument is already a pointer type - just emit it
                         val = self._emit_expr(arg)
                     else:
+                        self._check_let_implicit_mut_borrow(arg, param_def)
                         # Reference parameter: emit address of the argument.
                         # If the argument is an rvalue (e.g. a method call result),
                         # spill it to a stack slot so we can take its address.
@@ -10422,6 +10449,7 @@ class LLVMEmitter:
         # If method expects pointer and receiver is lvalue, get address
         receiver_val = None
         if receiver_is_lvalue and isinstance(first_param_type, ir.PointerType):
+            self._check_let_implicit_mut_borrow(expr.expr, fn_def.params[0])
             # Try to get address of the receiver
             # For `var` bindings, this is the alloca
             # For `let` bindings with struct values, we need special handling
@@ -10489,6 +10517,8 @@ class LLVMEmitter:
             arg_is_addr_of = isinstance(arg, rast.UnaryOp) and arg.op in ('&', '@', '@&', '&mut')
             if (expected_type is not None and isinstance(expected_type, ir.PointerType)
                     and not (arg_is_ref or arg_is_ptr or arg_is_addr_of)):
+                if j < len(fn_def.params):
+                    self._check_let_implicit_mut_borrow(arg, fn_def.params[j])
                 # Decide from actual emitted types, not inference: an Ident
                 # holding a `*T` infers as `T`, and its lvalue address is
                 # `T**` — passing that where `T*` is expected broke
