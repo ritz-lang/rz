@@ -477,6 +477,8 @@ class LLVMEmitter:
         # Symbol tables
         self.locals: Dict[str, Tuple[ir.AllocaInstr, ir.Type]] = {}  # name -> (alloca, type)
         self.params: Dict[str, Tuple[ir.Value, ir.Type]] = {}  # name -> (value, type)
+        # AGAST #2025: name -> the slot a large-struct `let` lives in.
+        self._let_slots: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
         self.constants: Dict[str, Tuple[int, ir.Type]] = {}  # name -> (value, type)
         self.const_arrays: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
@@ -3315,9 +3317,64 @@ class LLVMEmitter:
     # ritz1's rule (find_local_idx: innermost/latest wins), so ritz0 and
     # ritz1 agree.
     def _bind_let(self, name: str, val: ir.Value, ty: ir.Type) -> None:
-        """Bind an immutable `let` name, replacing any `var` of that name."""
+        """Bind an immutable `let` name, replacing any `var` of that name.
+
+        AGAST #2025: a large struct (the sret test) gets one entry-block
+        slot instead of an SSA value, as a byval param does (#1739).  As an
+        SSA value, every `@name` re-materialised it with a fresh alloca and a
+        first-class `store %T %v`. The #1732 peephole caught that only when
+        the producing load sat earlier in the same block, so a borrow in an
+        `assert` pass block or a loop body stored the whole struct. At
+        100 KB that hung clang -O2.  The slot is filled by retargeting the
+        sret call into it, else by a store, which #1732 turns into a copy.
+        The name stays immutable: _is_let_slot makes assignment an error.
+        """
+        if val.type == ty and self._sret_struct_type(ty) is not None:
+            slot = self._alloca_in_entry_block(ty, f"{name}.addr")
+            if not self._retarget_sret_result(val, slot):
+                self.builder.store(val, slot)
+            self._bind_let_slot(name, slot, ty)
+            return
         self.locals.pop(name, None)
         self.params[name] = (val, ty)
+
+    def _bind_let_slot(self, name: str, slot: ir.Value, ty: ir.Type) -> None:
+        """Bind an immutable `let` name to its #2025 slot (see _bind_let)."""
+        self.params.pop(name, None)
+        self.locals[name] = (slot, ty)
+        self._let_slots[name] = slot
+
+    def _emit_large_let_lit(self, stmt: rast.LetStmt) -> bool:
+        """AGAST #2025/#1741: `let b = Big { ... }` builds the literal in the
+        let's slot, as a `var` does. Otherwise the literal would go to a
+        temporary and then be copied into the slot. False, emitting nothing,
+        unless the value is a large struct literal of the annotated type.
+        """
+        if not isinstance(stmt.value, rast.StructLit):
+            return False
+        ty = self.struct_types.get(stmt.value.name)
+        if ty is None or self._sret_struct_type(ty) is None:
+            return False
+        if stmt.type is not None and self._ritz_type_to_llvm(stmt.type) != ty:
+            return False
+        slot = self._alloca_in_entry_block(ty, f"{stmt.name}.addr")
+        if not self._emit_large_lit_into(stmt.value, slot):
+            slot.parent.instructions.remove(slot)
+            return False
+        self._bind_let_slot(stmt.name, slot, ty)
+        ritz_type = stmt.type or self._infer_ritz_type(stmt.value)
+        if ritz_type is not None:
+            self.ritz_types[stmt.name] = ritz_type
+        return True
+
+    def _is_let_slot(self, name: str) -> bool:
+        """Is `name`'s current self.locals binding a #2025 `let` slot?
+
+        Compared by slot identity, not name: a later `var`, param or loop
+        variable that rebinds `name` in self.locals directly is mutable.
+        """
+        slot = self._let_slots.get(name)
+        return slot is not None and self.locals.get(name, (None, None))[0] is slot
 
     def _bind_var(self, name: str, alloca: ir.Value, ty: ir.Type) -> None:
         """Bind a mutable `var` name, replacing any `let` of that name."""
@@ -3875,6 +3932,7 @@ class LLVMEmitter:
         self._sret_results.clear()
         self.locals.clear()
         self.params.clear()
+        self._let_slots.clear()
         self.has_returned = False
         self.current_fn_def = fn_def
         self.in_test_fn = fn_def.has_attr('test')
@@ -4635,6 +4693,8 @@ class LLVMEmitter:
             return None
 
         elif isinstance(stmt, rast.LetStmt):
+            if self._emit_large_let_lit(stmt):
+                return None
             # Handle String literal inference: "hello" -> string_from("hello")
             if (stmt.type and isinstance(stmt.type, rast.NamedType)
                 and stmt.type.name == 'String'
@@ -4727,6 +4787,10 @@ class LLVMEmitter:
                 val = self._emit_expr(stmt.value)
             if isinstance(stmt.target, rast.Ident):
                 name = stmt.target.name
+                if self._is_let_slot(name):
+                    # AGAST #2025: a large `let` has a slot, but is no `var`.
+                    raise ValueError(
+                        f"cannot assign to `let` binding `{name}`; declare it `var`")
                 if name in self.locals:
                     alloca, ty = self.locals[name]
                     val = self._convert_type(val, ty)
