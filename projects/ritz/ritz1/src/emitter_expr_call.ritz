@@ -1123,9 +1123,24 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
 # encoded in the args; for binary ops fall back to walking the arg locals.
 # =============================================================================
 
+# The AES-NI builtins lowered by emit_x86_intrinsic_v2i64.
+fn is_aesni_builtin(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"aesenc", 6) == 1
+        return 1
+    if name_eq(name, len, c"aesenclast", 10) == 1
+        return 1
+    if name_eq(name, len, c"aesdec", 6) == 1
+        return 1
+    if name_eq(name, len, c"aesdeclast", 10) == 1
+        return 1
+    if name_eq(name, len, c"aesimc", 6) == 1
+        return 1
+    0
+
 # Resolve SIMD vector type-name for an arg expression — looks at ident
 # locals first (they carry `type_name = "v4i32"` etc.), then falls back to
-# the binding context.  Returns 1 if resolved, 0 otherwise.
+# the binding context.  Returns 1 if resolved, 0 otherwise.  An AES-NI call
+# resolves to its state operand's type.
 fn resolve_simd_arg_type(s: *EmitterState, arg: *Expr, out_name: **u8, out_len: *i32) -> i32
     if arg != null
         if arg.kind == EXPR_IDENT
@@ -1138,6 +1153,10 @@ fn resolve_simd_arg_type(s: *EmitterState, arg: *Expr, out_name: **u8, out_len: 
         else if arg.kind == EXPR_UNARY
             # `*p` — check the operand (deref of *v4i32 → v4i32 value).
             return resolve_simd_arg_type(s, arg.operand, out_name, out_len)
+        else if arg.kind == EXPR_CALL and is_aesni_builtin(arg.func_name, arg.func_name_len) == 1
+            # An AES-NI call has its state operand's type (AGAST #1609).
+            if resolve_simd_arg_type(s, arg.args, out_name, out_len) == 1
+                return 1
     if s.ctx_simd_name != null
         if s.ctx_simd_name_len > 0
             *out_name = s.ctx_simd_name
@@ -1603,12 +1622,77 @@ fn emit_x86_simd_intrinsic(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name
     emit_str(s, c")\n")
     return result
 
-# Convenience wrappers: v4i32-typed (SHA-NI family) and v2i64-typed (AES-NI).
+# SHA-NI wrapper: those intrinsics take and return <4 x i32>, the only type
+# the builtins accept (ritz0 rejects others), so no cast is needed.
 fn emit_x86_intrinsic_v4i32(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name_len: i32, arity: i32) -> i32
     return emit_x86_simd_intrinsic(s, e, llvm_name, llvm_name_len, arity, c"v4i32", 5)
 
+# AES-NI (AGAST #1609): `llvm.x86.aesni.*` take and return only <2 x i64>,
+# but the ritz builtins accept any 128-bit integer vector, as ritz0 does.  An
+# operand whose type resolves to anything but v2i64 (in practice v4i32) is
+# bitcast to <2 x i64> on the way in, and the result is bitcast back to the
+# state operand's (first arg's) type.  An operand whose type cannot be
+# resolved is taken as v2i64, which is what this path emitted before.
 fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name_len: i32, arity: i32) -> i32
-    return emit_x86_simd_intrinsic(s, e, llvm_name, llvm_name_len, arity, c"v2i64", 5)
+    var arg_regs: [4]i32
+    var arg_count: i32 = 0
+    var res_name: *u8 = c"v2i64"
+    var res_name_len: i32 = 5
+    var arg_it: *Expr = e.args
+    while arg_it != null and arg_count < 4
+        var reg: i32 = emit_expr(s, arg_it)
+        var a_name: *u8 = null
+        var a_len: i32 = 0
+        if resolve_simd_arg_type(s, arg_it, @a_name, @a_len) == 1
+            if arg_count == 0
+                res_name = a_name
+                res_name_len = a_len
+            if name_eq(a_name, a_len, c"v2i64", 5) == 0
+                let cast_in: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, cast_in)
+                emit_str(s, c" = bitcast ")
+                emit_simd_vector_type(s, a_name, a_len)
+                emit_str(s, c" ")
+                emit_reg(s, reg)
+                emit_str(s, c" to <2 x i64>\n")
+                reg = cast_in
+        arg_regs[arg_count] = reg
+        arg_count = arg_count + 1
+        arg_it = arg_it.next
+    if arg_count != arity
+        emit_ir_error(s, c"x86 intrinsic arity mismatch")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = add i64 0, 0\n")
+        return z
+    add_extern(s, llvm_name, llvm_name_len)
+    let result: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, result)
+    emit_str(s, c" = call <2 x i64> @")
+    emit_name(s, llvm_name, llvm_name_len)
+    emit_str(s, c"(")
+    var k: i32 = 0
+    while k < arg_count
+        if k > 0
+            emit_str(s, c", ")
+        emit_str(s, c"<2 x i64> ")
+        emit_reg(s, arg_regs[k])
+        k = k + 1
+    emit_str(s, c")\n")
+    if name_eq(res_name, res_name_len, c"v2i64", 5) == 1
+        return result
+    let cast_out: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cast_out)
+    emit_str(s, c" = bitcast <2 x i64> ")
+    emit_reg(s, result)
+    emit_str(s, c" to ")
+    emit_simd_vector_type(s, res_name, res_name_len)
+    emit_str(s, c"\n")
+    return cast_out
 
 fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # Variant constructor: Some(x) / Ok(x) / None / Err(x) -> %Result$.../

@@ -78,8 +78,6 @@ EXPECTED_FAILURES = {
 # the passing one turns xpass and the gate goes red.
 _RITZ1_TWINS = {
     # --- codegen, build failures ---
-    "test_aesni":
-        "AGAST #1609 — AES-NI intrinsics do not bitcast v4i32 operands",
     "test_native_string":
         "AGAST #1627 — unspecified ritz0-only String coercions (\"...\"→String, String→*u8)",
     "test_string_coercion":
