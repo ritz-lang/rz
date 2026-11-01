@@ -454,7 +454,7 @@ struct String
 |----------|-----------|-------------|
 | `string_len` | `fn(s: @String) -> i64` | Get length |
 | `string_cap` | `fn(s: @String) -> i64` | Get capacity |
-| `string_is_empty` | `fn(s: @String) -> i32` | Check if empty |
+| `string_is_empty` | `fn(s: @String) -> bool` | Check if empty |
 | `string_as_ptr` | `fn(s: @&String) -> *u8` | Get null-terminated C string |
 | `string_as_view` | `fn(s: @String) -> StrView` | Borrow the bytes as a StrView (no copy), valid until `s` is modified or dropped; how a String prints in `print`/`eprint` interpolation or reaches a StrView API |
 | `string_get` | `fn(s: @String, idx: i64) -> u8` | Get byte at index |
@@ -482,16 +482,16 @@ struct String
 | `string_eq` | `fn(s: @String, other: StrView) -> bool` | Compare to a StrView (a `"..."` literal) |
 | `string_eq_string` | `fn(a: @String, b: @String) -> bool` | Compare two Strings |
 | `string_eq_strview` | `fn(s: @String, sv: StrView) -> bool` | Same as `string_eq` |
-| `string_eq_cstr` | `fn(s: @String, cstr: *u8) -> i32` | Compare to C string |
+| `string_eq_cstr` | `fn(s: @String, cstr: *u8) -> bool` | Compare to C string |
 | `string_hash` | `fn(s: @String) -> u64` | Hash the string |
 
 **Search/Slice**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `string_starts_with` | `fn(s: @String, prefix: StrView) -> i32` | Check prefix |
-| `string_ends_with` | `fn(s: @String, suffix: StrView) -> i32` | Check suffix |
-| `string_contains` | `fn(s: @String, needle: StrView) -> i32` | Check contains |
+| `string_starts_with` | `fn(s: @String, prefix: StrView) -> bool` | Check prefix |
+| `string_ends_with` | `fn(s: @String, suffix: StrView) -> bool` | Check suffix |
+| `string_contains` | `fn(s: @String, needle: StrView) -> bool` | Check contains |
 | `string_find` | `fn(s: @String, needle: @String) -> i64` | Find substring (-1 if not found) |
 | `string_slice` | `fn(s: @String, start: i64, end: i64) -> String` | Extract substring |
 | `string_clone` | `fn(s: @String) -> String` | Deep copy |
@@ -570,7 +570,7 @@ struct Span<T>
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `span_len` | `fn<T>(s: *Span<T>) -> i64` | Get length |
-| `span_is_empty` | `fn<T>(s: *Span<T>) -> i32` | Check if empty |
+| `span_is_empty` | `fn<T>(s: *Span<T>) -> bool` | Check if empty |
 | `span_get` | `fn<T>(s: *Span<T>, idx: i64) -> T` | Get element |
 | `span_as_ptr` | `fn<T>(s: *Span<T>) -> *T` | Get raw pointer |
 
@@ -592,11 +592,11 @@ the same name, and `span_as_strview` / `span_from_strview` convert between the t
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `span_as_strview` | `fn(s: *Span<u8>) -> StrView` | View the same bytes as a StrView |
-| `span_eq` | `fn(a: *Span<u8>, b: *Span<u8>) -> i32` | Compare equality |
-| `span_eq_cstr` | `fn(s: *Span<u8>, cstr: *u8) -> i32` | Compare to C string |
-| `span_contains` | `fn(haystack: *Span<u8>, needle: *Span<u8>) -> i32` | Contains check |
-| `span_starts_with` | `fn(s: *Span<u8>, prefix: *Span<u8>) -> i32` | Prefix check |
-| `span_ends_with` | `fn(s: *Span<u8>, suffix: *Span<u8>) -> i32` | Suffix check |
+| `span_eq` | `fn(a: *Span<u8>, b: *Span<u8>) -> bool` | Compare equality |
+| `span_eq_cstr` | `fn(s: *Span<u8>, cstr: *u8) -> bool` | Compare to C string |
+| `span_contains` | `fn(haystack: *Span<u8>, needle: *Span<u8>) -> bool` | Contains check |
+| `span_starts_with` | `fn(s: *Span<u8>, prefix: *Span<u8>) -> bool` | Prefix check |
+| `span_ends_with` | `fn(s: *Span<u8>, suffix: *Span<u8>) -> bool` | Suffix check |
 | `span_find` | `fn(haystack: *Span<u8>, needle: *Span<u8>) -> i64` | Find substring |
 | `span_find_byte` | `fn(s: *Span<u8>, c: u8) -> i64` | Find byte |
 

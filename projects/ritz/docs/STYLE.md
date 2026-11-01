@@ -765,7 +765,7 @@ enum ParseError
 
 
 fn parse_int(s: StrView) -> Result<i64, ParseError>
-    if strview_is_empty(@s) == 1
+    if strview_is_empty(@s)
         return Err(ParseError.EmptyInput)
 
     var value: i64 = 0
@@ -841,7 +841,7 @@ struct Error
 
 
 fn read_file(path: StrView) -> Result<StrView, Error>
-    if strview_is_empty(@path) == 1
+    if strview_is_empty(@path)
         return Err(Error { code: 2 })
     Ok(path)
 

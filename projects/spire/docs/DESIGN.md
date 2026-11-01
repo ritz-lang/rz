@@ -933,7 +933,7 @@ pub fn form_get(form: *Form, name: *StrView) -> Option<StrView>
     while i < vec_len<FormField>(&form.fields)
         let field = vec_get_ptr<FormField>(&form.fields, i)
         let field_name = string_as_strview(&field.name)
-        if strview_eq(&field_name, name) == 1
+        if strview_eq(&field_name, name)
             return Some(string_as_strview(&field.value))
         i += 1
     None

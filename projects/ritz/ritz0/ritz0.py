@@ -33,7 +33,7 @@ from type_checker import TypeChecker, TypeError as RitzTypeError
 from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
     source_file_hash, build_hash_map, build_sig_hash_map,
-    read_sig_file, write_sig_file, check_cache, check_source_hash,
+    read_sig_file, write_sig_file, check_source_hash,
     check_import_hashes, build_import_hashes,
     build_sig_data, detect_sig_changes, invalidate_dependents,
 )
@@ -212,11 +212,23 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                         break
                 invalidate_dependents(source_abs_path, changed_sigs, project_root)
 
-            # Check which functions have cached IR
-            hits, misses = check_cache(fn_hashes, old_sig_data)
+            # Per-fn IR reuse is OFF: every fn is emitted fresh (AGAST #2019).
+            #
+            # The only "hits" the emitter ever honoured were fns the async
+            # transform synthesizes: an `async fn f` yields a constructor
+            # also named `f`, with no `source_file`, so `_should_emit_body`
+            # consulted the cache for it (source fns carry `source_file` and
+            # are always emitted).  Its body was skipped, `_splice_cached_ir`
+            # failed to match the `... "no-builtins"` declare, and a warm
+            # recompile shipped `f_poll` with `f` only declared — a link
+            # failure that build.py's shared CAS then kept for every worktree.
+            # Splicing can't be byte-identical to a cold compile in any case:
+            # a cached block's `!dbg !N` ids belong to the compile that wrote
+            # it.  The sig is still written (source-hash fast path, sig-change
+            # invalidation); its stored IR is just never spliced back in.
             fn_cache_data = {
-                'cache_hits': hits,
-                'cache_misses': misses,
+                'cache_hits': {},
+                'cache_misses': dict(fn_hashes),
                 'sig_data': old_sig_data,
             }
         except Exception:
