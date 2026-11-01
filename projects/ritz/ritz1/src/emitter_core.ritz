@@ -3191,12 +3191,19 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             if base_type == TYPE_PTR_PTR
                 return TYPE_PTR  # **u8 indexed gives *u8
             else if base_type == TYPE_PTR
+                # AGAST #1975: a range `p[a..b]` is an element pointer
+                # (emit_expr_index's #110 lowering), whatever the pointee.
+                # It was typed as the element for the integer widths (and u8
+                # for f32/f64 after #1973), so `p[2..4] != p + 2` compared a
+                # pointer at the element's width.
+                if e.right != null and e.right.kind == EXPR_RANGE
+                    return TYPE_PTR
                 # Element type of *T indexing is the pointee when recorded.
                 if pointee == TYPE_I32 or pointee == TYPE_U32 or pointee == TYPE_I16 or pointee == TYPE_U16 or pointee == TYPE_I64 or pointee == TYPE_U64 or pointee == TYPE_I8
                     return pointee
                 # AGAST #1973: `p[i]` through a *f32 / *f64 loads a `float` /
-                # `double`.  A range `p[a..b]` is an element pointer, not one.
-                if (pointee == TYPE_F32 or pointee == TYPE_F64) and (e.right == null or e.right.kind != EXPR_RANGE)
+                # `double`.
+                if pointee == TYPE_F32 or pointee == TYPE_F64
                     return pointee
                 return TYPE_U8   # *u8 (or unrecorded pointee) indexed gives u8
             else if base_type == TYPE_ARRAY
@@ -3298,6 +3305,22 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 # already used for the member+offset path.
                 else if e.operand.kind == EXPR_MEMBER
                     return get_member_pointee_type(s, e.operand)
+                # AGAST #1975: `*(p[a..b])` -- the range is a pointer into
+                # `p` (TYPE_PTR above), so it loads `p`'s integer pointee.
+                else if e.operand.kind == EXPR_INDEX and e.operand.right != null and e.operand.right.kind == EXPR_RANGE and e.operand.left.kind == EXPR_IDENT
+                    let rb: *Expr = e.operand.left
+                    var rb_type: i32 = find_local_type(s, rb.ident_ptr, rb.ident_len)
+                    var rb_pt: i32 = TYPE_UNKNOWN
+                    if rb_type == TYPE_UNKNOWN
+                        let rglob: *GlobalVarDef = find_global(s, rb.ident_ptr, rb.ident_len)
+                        if rglob != null
+                            rb_type = rglob.var_type
+                            rb_pt = rglob.pointee_type
+                    else
+                        rb_pt = find_local_pointee_type(s, rb.ident_ptr, rb.ident_len)
+                    # Not f32 / f64: a float deref isn't lowered yet (#2022).
+                    if rb_type == TYPE_PTR and primitive_name_len(rb_pt) > 0 and rb_pt != TYPE_F32 and rb_pt != TYPE_F64
+                        return rb_pt
                 return TYPE_I64  # Default for unknown pointer dereference
             else if inner_type == TYPE_MUT_REF and e.operand.kind == EXPR_IDENT
                 # AGAST #1644: `*x` with `x: @&i32` loads the pointee's
