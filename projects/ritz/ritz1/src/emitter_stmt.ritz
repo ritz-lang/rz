@@ -556,6 +556,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     else
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
     set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, stmt.var_fn_sig)  # AGAST #1671
+    if var_type == TYPE_PTR
+        set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953
     # `let ok = is_big(x)`: inference above leaves a bool-returning call's
     # local at TYPE_I64. (Indistinguishable here from `let ok: i64 = ...`;
     # assigning a bool call to an explicit i64 is the rare case.)
@@ -1939,11 +1941,14 @@ fn array_elem_types_match(a: i32, a_name: *u8, a_len: i32, b: i32, b_name: *u8, 
 #     field's element spelling for every T except bool / f32 / f64, which a
 #     local keeps in i64 slots (field_elem_layout_differs) — refused;
 #   * another inline array field (`y.vals = x.vals`, `p.b = p.a`), whose
-#     layout is the field's own.
-# Returns 1 once handled (copied or diagnosed).  Anything else — notably
-# `*p` for `p: *[N]T`, whose length and element type ritz1 does not record —
-# fails closed: emit_expr has no whole-array value, and the pre-#1934
-# generic path stored an ADDRESS into the field.
+#     layout is the field's own;
+#   * `*src` for a param or annotated local `src: *[N]T` (AGAST #1953), whose
+#     N and T are recorded on the LocalVar (pointee_array_*).  The pointee
+#     may be a local array or a field, so for bool / f32 / f64 its element
+#     layout is unknown — refused, as for a local.
+# Returns 1 once handled (copied or diagnosed).  Anything else fails
+# closed: emit_expr has no whole-array value, and the pre-#1934 generic
+# path stored an ADDRESS into the field.
 fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructField, value: *Expr)
     var src_ptr: i32 = -1
     var src_size: i32 = -1
@@ -1969,8 +1974,19 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
             src_et = mr.field.array_elem_type
             src_name = mr.field.array_elem_type_name
             src_name_len = mr.field.array_elem_type_name_len
+    else if value.kind == EXPR_UNARY and value.op == OP_DEREF and value.operand != null and value.operand.kind == EXPR_IDENT
+        # AGAST #1953: `*src` for `src: *[N]T` — copy from the address held
+        # in src's slot.
+        let ploc: *LocalVar = find_local_struct_name(s, value.operand.ident_ptr, value.operand.ident_len)
+        if ploc != null and ploc.var_type == TYPE_PTR and ploc.pointee_type == TYPE_ARRAY and ploc.pointee_array_size > 0
+            src_ptr = emit_load_ptr(s, ploc.reg)
+            src_size = ploc.pointee_array_size
+            src_et = ploc.pointee_array_elem_type
+            src_name = ploc.type_name
+            src_name_len = ploc.type_name_len
+            src_is_local = 1
     if src_ptr < 0
-        emit_ir_error(s, c"whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays and array fields)")
+        emit_ir_error(s, c"whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
         return
     if src_size != field.array_size
         emit_ir_error(s, c"array length does not match the struct field's array length")
@@ -1979,7 +1995,7 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
         emit_ir_error(s, c"array element type does not match the struct field's element type")
         return
     if src_is_local == 1 and field_elem_layout_differs(src_et) == 1
-        emit_ir_error(s, c"copying a local [N]bool / [N]f32 / [N]f64 array into a struct field is not supported by ritz1")
+        emit_ir_error(s, c"copying a local or `*[N]T` pointee [N]bool / [N]f32 / [N]f64 array into a struct field is not supported by ritz1")
         return
     emit_array_field_copy(s, field, src_ptr, field_ptr)
 

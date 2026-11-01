@@ -193,8 +193,8 @@ fn test_whole_assign_reads_old_value() -> i32
 # ---------------------------------------------------------------------------
 # AGAST #1935: a non-literal right-hand side (`x.f = arr`) is copied, and
 # [N]bool / [N]f32 / [N]f64 fields accept literals and fills.  ritz1 used to
-# refuse both (fail closed since #1934).  `p.f = *src` with `src: *[N]T`
-# still fails closed in ritz1: it records no length for `*[N]T`.
+# refuse both (fail closed since #1934).  AGAST #1953: `p.f = *src` with
+# `src: *[N]T` (a param or an annotated local) copies the pointee array.
 
 struct Flags
     lead: u8
@@ -372,4 +372,110 @@ fn test_whole_assign_float_field_from_field() -> i32
     assert g.bits[1] == false
     assert g.bits[2] == true
     assert g.after == 4
+    0
+
+# ---------------------------------------------------------------------------
+# AGAST #1953: `p.f = *src` for `src: *[N]T`.  ritz1 recorded no length or
+# element type for a `*[N]T` pointee and refused the copy; ritz0 copies.
+
+fn set_wide_from_ptr(p: *Wide, src: *[2]i64)
+    p.vals = *src
+
+fn set_narrow_from_ptr(p: *Narrow, src: *[4]u8)
+    p.bytes = *src
+
+fn set_words_from_ptr(p: *Words, src: *[3]i32)
+    p.words = *src
+
+fn set_bag_from_ptr(p: *Bag, src: *[2]Item)
+    p.items = *src
+
+[[test]]
+fn test_whole_assign_from_array_ptr_param_i64() -> i32
+    var w: Wide = Wide { vals: [0, 0], tail: 9 }
+    var a: [2]i64 = [123456789012, -5]
+    set_wide_from_ptr(@w, @a)
+    assert w.vals[0] == 123456789012
+    assert w.vals[1] == -5
+    assert w.tail == 9
+    # A copy, not an alias.
+    a[0] = 1
+    assert w.vals[0] == 123456789012
+    0
+
+[[test]]
+fn test_whole_assign_from_array_ptr_param_narrow() -> i32
+    var n: Narrow = Narrow { tag: 7, bytes: [0, 0, 0, 0], after: 5 }
+    var b: [4]u8 = [1, 2, 3, 254]
+    set_narrow_from_ptr(@n, @b)
+    assert n.bytes[0] == 1
+    assert n.bytes[3] == 254
+    assert n.tag == 7
+    assert n.after == 5
+    var w: Words = Words { head: 1, words: [0, 0, 0], tail: 2 }
+    var v: [3]i32 = [-7, 8, 90000]
+    set_words_from_ptr(@w, @v)
+    assert w.words[0] == -7
+    assert w.words[1] == 8
+    assert w.words[2] == 90000
+    assert w.head == 1
+    assert w.tail == 2
+    0
+
+[[test]]
+fn test_whole_assign_from_array_ptr_param_struct() -> i32
+    var g: Bag = Bag { items: [Item { a: 0, b: 0 }, Item { a: 0, b: 0 }], tail: 3 }
+    var src: [2]Item = [Item { a: 11, b: 12 }, Item { a: 13, b: 14 }]
+    set_bag_from_ptr(@g, @src)
+    assert g.items[0].a == 11
+    assert g.items[0].b == 12
+    assert g.items[1].a == 13
+    assert g.items[1].b == 14
+    assert g.tail == 3
+    0
+
+[[test]]
+fn test_whole_assign_from_array_ptr_local() -> i32
+    var w: Wide = Wide { vals: [0, 0], tail: 9 }
+    var a: [2]i64 = [31, -32]
+    let q: *[2]i64 = @a
+    w.vals = *q
+    assert w.vals[0] == 31
+    assert w.vals[1] == -32
+    assert w.tail == 9
+    0
+
+# A generic fn's `*[N]i64` param survives monomorph's param clone.
+fn set_wide_from_ptr_gen<T>(p: *W2, src: *[2]i64, extra: T) -> T
+    p.vals = *src
+    extra
+
+struct W2
+    vals: [2]i64
+    tail: i64
+
+[[test]]
+fn test_whole_assign_from_array_ptr_param_generic() -> i32
+    var w: W2 = W2 { vals: [0, 0], tail: 9 }
+    var a: [2]i64 = [41, 42]
+    let r: i32 = set_wide_from_ptr_gen<i32>(@w, @a, 7)
+    assert r == 7
+    assert w.vals[0] == 41
+    assert w.vals[1] == 42
+    assert w.tail == 9
+    0
+
+# ...and so does a method's (impl methods register params separately).
+impl W2
+    fn load_from(self: *W2, src: *[2]i64)
+        self.vals = *src
+
+[[test]]
+fn test_whole_assign_from_array_ptr_method_param() -> i32
+    var w: W2 = W2 { vals: [0, 0], tail: 9 }
+    var a: [2]i64 = [-51, 52]
+    w.load_from(@a)
+    assert w.vals[0] == -51
+    assert w.vals[1] == 52
+    assert w.tail == 9
     0
