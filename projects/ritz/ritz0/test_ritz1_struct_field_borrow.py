@@ -19,6 +19,10 @@ so they accept the form too.
 field (and through `@C` / `@&C` fields): they are laid out as `ptr` and member
 access through them auto-derefs like a `*C` field.
 
+#2050 did the same for ref fields to an integer (`p: @i32` / `@&u8` /
+`p:& i64`): they lower to a `*T` field. Float refs stay fail-closed until
+`*f64` fields work (#2053).
+
 Every program returns 3 on success. ritz0 is the oracle.
 """
 
@@ -178,6 +182,67 @@ ACCESS = {
     for spelling, ty in _FIELD_SPELLINGS.items()
 }
 
+# Ref fields to a primitive (#2050). #2041 lowered ref-to-struct fields only;
+# a ref-to-primitive field failed closed with "struct literal field of this
+# type is not lowered". Each program is instantiated for i32/u8/i64 and each
+# field spelling. `T` is the pointee, `FIELD` the field's type.
+
+# The ticket's repro: read through the field.
+PRIM_READ = """\
+struct R
+    p FIELD
+
+pub fn main() -> i32
+    var x: T = 3
+    var r: R = R { p: @x }
+    return *r.p as i32
+"""
+
+# Write through the field, directly and via a pointer to the outer struct:
+# x goes 1 -> 2 (in bump) -> 3 (in main).
+PRIM_WRITE = """\
+struct R
+    p FIELD
+
+fn bump(r: *R)
+    *r.p = *r.p + 1
+
+pub fn main() -> i32
+    var x: T = 1
+    var r: R = R { p: @&x }
+    bump(@r)
+    *r.p = *r.p + 1
+    return x as i32
+"""
+
+# The ref field sits between plain fields of other widths: it must be
+# pointer-sized and the literal must fill each slot, or head/tail read junk.
+# Also passes the field on to a callee expecting `*T`.
+PRIM_MIXED = """\
+struct R
+    head: u8
+    p FIELD
+    tail: i64
+
+fn peek(q: *T) -> T
+    return *q
+
+pub fn main() -> i32
+    var x: T = 1
+    var r: R = R { head: 1, p: @&x, tail: 1 }
+    *r.p = *r.p + r.head as T
+    return (peek(r.p) as i64 + r.tail) as i32
+"""
+
+_PRIM_BASE = {"read": PRIM_READ, "write": PRIM_WRITE, "mixed": PRIM_MIXED}
+_PRIM_SPELLINGS = {"colon_amp": ":& T", "at": ": @T", "at_amp": ": @&T"}
+PRIM_ACCESS = {
+    f"{name}_{spelling}_{ty}": prog.replace("FIELD", field).replace("T", ty)
+    for name, prog in _PRIM_BASE.items()
+    for spelling, field in _PRIM_SPELLINGS.items()
+    for ty in ("i32", "u8", "i64")
+}
+
 # The borrow field must lower to a reference (pointer-sized), not to the
 # pointee: `ch:& C` parsed as plain `C` would embed {i32, i64} inline.
 LAYOUT = """\
@@ -319,6 +384,54 @@ def test_ritz1_borrow_field_access(ritz1_bin, tmp_path, name):
     """AGAST #2041. Before the fix: "struct literal field of this type is not
     lowered" / "unhandled EXPR_MEMBER"."""
     assert _run("ritz1", ritz1_bin, tmp_path, name, ACCESS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(PRIM_ACCESS))
+def test_ritz0_prim_ref_field_access(tmp_path, name):
+    assert _run("ritz0", None, tmp_path, name, PRIM_ACCESS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(PRIM_ACCESS))
+def test_ritz1_prim_ref_field_access(ritz1_bin, tmp_path, name):
+    """AGAST #2050. Before the fix: "struct literal field of this type is not
+    lowered"."""
+    assert _run("ritz1", ritz1_bin, tmp_path, name, PRIM_ACCESS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("ty", ["i32", "u8", "i64"])
+def test_ritz1_prim_ref_field_is_a_reference(ritz1_bin, tmp_path, ty):
+    """A `p: @T` field is laid out as `ptr`, as in ritz0, not as `T`."""
+    prog = PRIM_READ.replace("FIELD", ": @T").replace("T", ty)
+    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, f"layout_{ty}", prog)
+    assert comp.returncode == 0 and ll.exists(), comp.stderr[-2000:]
+    m = re.search(r"^%R = type (.*)$", ll.read_text(), re.MULTILINE)
+    assert m, "no %R type in ritz1 IR"
+    assert m.group(1).replace(" ", "") == "{ptr}", m.group(1)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("ty", ["f64", "f32"])
+def test_ritz1_float_ref_field_fails_closed(ritz1_bin, tmp_path, ty):
+    """#2050 lowers integer ref fields only. A `*f64` field still loads and
+    stores at the wrong width, so lowering `p: @f64` to it would turn a
+    compile error into a wrong answer. ritz1 must refuse or get it right
+    (ritz0 returns 3), never compile and return something else."""
+    prog = PRIM_WRITE.replace("FIELD", ": @T").replace("T", ty)
+    comp, ll, work = _compile("ritz1", ritz1_bin, tmp_path, f"float_{ty}", prog)
+    if comp.returncode != 0:
+        assert not ll.exists()
+        return
+    exe = work / "main"
+    link = subprocess.run(
+        ["clang", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
+        capture_output=True,
+        text=True,
+    )
+    assert link.returncode == 0, link.stderr[-2000:]
+    assert subprocess.run([str(exe)], timeout=60).returncode == 3
 
 
 @pytest.mark.integration
