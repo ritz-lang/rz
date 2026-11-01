@@ -2739,6 +2739,23 @@ class LLVMEmitter:
             return ty.name
         return None
 
+    def _let_annotation_enum(self, ty: Optional['rast.Type']) -> Optional[str]:
+        """The enum specialization a `let` annotation names, else None.
+
+        `Option<f64>` resolves to `Option$f64`, materializing a builtin
+        generic specialization that nothing has registered yet (as the `var`
+        path does). A non-enum annotation (`i64`, `Foo`) answers None, which
+        leaves the initialiser's emission untouched.
+        """
+        if not isinstance(ty, rast.NamedType):
+            return None
+        enum_name = self._resolve_enum_type_name(ty)
+        if enum_name is None and ty.args:
+            enum_name = self._ensure_builtin_generic_specialization(ty)
+        if enum_name not in self.enum_types:
+            return None
+        return enum_name
+
     def _emit_expr_with_expected_enum(self, expr: rast.Expr, expected_enum_name: Optional[str]) -> ir.Value:
         """Emit expression, forcing enum variant constructors to a specific enum type.
 
@@ -4635,7 +4652,14 @@ class LLVMEmitter:
                         self.simd_expected_type = stmt.type
                 self.expected_ritz_type = stmt.type
                 self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
-                val = self._emit_expr(stmt.value)
+                # AGAST #1964: variant names are global (`Some` -> whichever
+                # Option specialization registered last), so with Option<f32>
+                # and Option<f64> both in the module `let o: Option<f64> =
+                # Some(2.5)` was built as Option$f32. Resolve the annotation
+                # to its specialization and emit through the expected-enum
+                # path, which also threads it into if / match / block tails.
+                let_enum = self._let_annotation_enum(stmt.type)
+                val = self._emit_expr_with_expected_enum(stmt.value, let_enum)
                 self.closure_expected_type = None  # Clear context
                 self.simd_expected_type = None  # Clear SIMD context
                 self.expected_ritz_type = None

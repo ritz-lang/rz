@@ -66,3 +66,88 @@ def test_var_with_plain_enum_annotation(tmp_path):
     assert result.returncode == 0, (
         f"plain enum annotation guard case failed:\n{result.stderr}"
     )
+
+
+# AGAST #1964: the `let` path ignored its annotation entirely, so a variant
+# constructor took whichever specialization registered last. With both
+# Option<f32> and Option<f64> in the module, `let o: Option<f64> = Some(2.5)`
+# was built as Option$f32 and the `match` died storing it into an
+# Option$f64 slot. Each case pairs the let under test with a later fn that
+# registers the competing width.
+
+LET_TWO_WIDTHS = {
+    "direct_variant": """\
+fn a() -> i64
+    let o: Option<f64> = Some(2.5)
+    match o
+        Some(v) => 1
+        None => 0
+
+fn b() -> i64
+    let p: Option<f32> = Some(0.5)
+    0
+""",
+    "direct_variant_mirror": """\
+fn a() -> i64
+    let o: Option<f32> = Some(2.5)
+    match o
+        Some(v) => 1
+        None => 0
+
+fn b() -> Option<f64>
+    return Some(0.5)
+""",
+    "result_ok": """\
+fn a() -> i64
+    let r: Result<f64, i32> = Ok(2.5)
+    match r
+        Ok(v) => 1
+        Err(e) => 0
+
+fn b() -> i64
+    let s: Result<f32, i32> = Ok(0.5)
+    0
+""",
+    "unit_variant": """\
+fn a() -> i64
+    let o: Option<f64> = None
+    match o
+        Some(v) => 0
+        None => 1
+
+fn b() -> i64
+    let p: Option<f32> = Some(0.5)
+    0
+""",
+    # The competing widths are registered *before* `a` so `Some` in the tail
+    # does not happen to resolve to Option$f64 by being registered last.
+    "if_tail": """\
+fn z() -> Option<f64>
+    return Some(1.5)
+
+fn y() -> Option<f32>
+    return Some(0.5)
+
+fn a(flag: bool) -> i64
+    let o: Option<f64> = if flag
+        Some(2.5)
+    else
+        None
+    match o
+        Some(v) => 1
+        None => 0
+
+fn b() -> i64
+    let p: Option<f32> = Some(0.5)
+    0
+""",
+}
+
+
+@pytest.mark.parametrize("case", sorted(LET_TWO_WIDTHS))
+def test_let_builds_declared_enum_width(tmp_path, case):
+    """`let x: E<T> = <variant>` must build E$T, not the last-registered E."""
+    result = _compile(tmp_path, LET_TWO_WIDTHS[case])
+    assert result.returncode == 0, (
+        f"[{case}] let ignored its declared enum width:\n{result.stderr}"
+    )
