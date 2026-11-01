@@ -1808,18 +1808,22 @@ fn primitive_arg_spelling(ty: i32, out: **u8) -> i32
 # the innermost pointee, so depth is exact up to two levels; a deeper
 # pointer spells as "" (clang then rejects the IR loudly).
 fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
+    return spell_ptr_parts(p, ty, p.last_pointee_type, p.last_inner_pointee_type, p.last_type_name, p.last_type_name_len, out_len)
+
+# spell_ptr_generic_arg over explicit parts, so an alias table entry (which
+# saved the same fields) spells without replaying itself into p.
+fn spell_ptr_parts(p: *Parser, ty: i32, pointee: i32, inner: i32, type_name: *u8, type_name_len: i32, out_len: *i32) -> *u8
     var depth: i32 = 1
     if ty == TYPE_PTR_PTR
-        if p.last_pointee_type != TYPE_PTR
+        if pointee != TYPE_PTR
             *out_len = 0
             return null
         depth = 2
-    let inner: i32 = p.last_inner_pointee_type
     var base: *u8 = null
     var base_len: i32 = 0
     if inner == TYPE_STRUCT
-        base = p.last_type_name
-        base_len = p.last_type_name_len
+        base = type_name
+        base_len = type_name_len
     else
         base_len = primitive_arg_spelling(inner, @base)
     if base_len <= 0
@@ -1840,6 +1844,46 @@ fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
     *(name + pos) = 0
     *out_len = pos
     return name
+
+# AGAST #2037: build a single-token generic call's suffix — "$" + prefix +
+# the type argument's mangled spelling.  The token rules (`f<T>`, `f<*T>`,
+# `f<@T>`) never pass the token through type_named, so an alias (`type Id =
+# u32`) used to mangle by its own name ("$Id"), instantiating `Vec$Id` where
+# a `Vec<Id>` field had resolved to `Vec$u32`.  An alias spells as its
+# target, exactly as generic_arg_spelling would after type_named replayed it
+# (the table entry holds the final target, so alias-of-alias is settled).
+# Anything else spells as the token text.  Reads the table without touching
+# parser state.
+fn generic_tok_suffix(p: *Parser, prefix: *u8, prefix_len: i32, tok: Token, out_len: *i32) -> *u8
+    var spell: *u8 = tok.start
+    var spell_len: i32 = tok.len
+    if g_alias_count > 0
+        let e: *AliasEntry = type_alias_find(tok.start, tok.len)
+        if e != null
+            var n: i32 = 0
+            if e.kind == TYPE_STRUCT
+                spell = e.type_name
+                n = e.type_name_len
+            else if e.kind == TYPE_PTR or e.kind == TYPE_PTR_PTR
+                spell = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, e.type_name, e.type_name_len, @n)
+            else
+                n = primitive_arg_spelling(e.kind, @spell)
+            # A target with no spelling (array, fn type, ...) keeps the alias
+            # name: no worse than before, and the mismatch stays visible.
+            if n > 0
+                spell_len = n
+            else
+                spell = tok.start
+    let total: i32 = 1 + prefix_len + spell_len
+    let buf: *u8 = parser_alloc(p, (total + 1) as i64)
+    *buf = 36  # '$'
+    for i in 0..prefix_len
+        *(buf + 1 + i) = *(prefix + i)
+    for i in 0..spell_len
+        *(buf + 1 + prefix_len + i) = *(spell + i)
+    *(buf + total) = 0
+    *out_len = total
+    return buf
 
 # Prepend one captured argument to the (possibly null) list of those after it.
 pub fn link_generic_arg(first: *GenericArg, rest: *GenericArg) -> *GenericArg
@@ -2833,13 +2877,10 @@ pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *Postfi
     let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
-    # Build type suffix: "$" + type_name
-    let suffix_buf: *u8 = parser_alloc(p, type_tok.len + 2) as *u8
-    *suffix_buf = 36  # '$'
-    for i in 0..type_tok.len
-        *(suffix_buf + 1 + i) = *(type_tok.start + i)
-    op.call_type_suffix = suffix_buf
-    op.call_type_suffix_len = type_tok.len + 1
+    # Type suffix: "$" + type_name (an alias spelled as its target, #2037).
+    var len: i32 = 0
+    op.call_type_suffix = generic_tok_suffix(p, null, 0, type_tok, @len)
+    op.call_type_suffix_len = len
     op.next = null
     return op
 
@@ -2854,18 +2895,10 @@ pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
-    # Build type suffix: "$ptr_" + type_name (5-char prefix after the `$`).
-    let suffix_len: i32 = type_tok.len + 5
-    let suffix_buf: *u8 = parser_alloc(p, suffix_len + 1) as *u8
-    *(suffix_buf + 0) = 36   # '$'
-    *(suffix_buf + 1) = 112  # 'p'
-    *(suffix_buf + 2) = 116  # 't'
-    *(suffix_buf + 3) = 114  # 'r'
-    *(suffix_buf + 4) = 95   # '_'
-    for i in 0..type_tok.len
-        *(suffix_buf + 5 + i) = *(type_tok.start + i)
-    op.call_type_suffix = suffix_buf
-    op.call_type_suffix_len = suffix_len
+    # Type suffix: "$ptr_" + type_name (an alias spelled as its target, #2037).
+    var len: i32 = 0
+    op.call_type_suffix = generic_tok_suffix(p, c"ptr_", 4, type_tok, @len)
+    op.call_type_suffix_len = len
     op.next = null
     return op
 
@@ -3715,19 +3748,10 @@ pub fn postfix_generic_call_ref(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     let op: *PostfixOp = parser_alloc(p, 80) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
-    # "$ref_" + type_name.
-    let suffix_len: i32 = type_tok.len + 5
-    let suffix_buf: *u8 = parser_alloc(p, suffix_len + 1) as *u8
-    *(suffix_buf + 0) = 36   # '$'
-    *(suffix_buf + 1) = 114  # 'r'
-    *(suffix_buf + 2) = 101  # 'e'
-    *(suffix_buf + 3) = 102  # 'f'
-    *(suffix_buf + 4) = 95   # '_'
-    for i in 0..type_tok.len
-        *(suffix_buf + 5 + i) = *(type_tok.start + i)
-    *(suffix_buf + suffix_len) = 0
-    op.call_type_suffix = suffix_buf
-    op.call_type_suffix_len = suffix_len
+    # "$ref_" + type_name (an alias spelled as its target, #2037).
+    var len: i32 = 0
+    op.call_type_suffix = generic_tok_suffix(p, c"ref_", 4, type_tok, @len)
+    op.call_type_suffix_len = len
     op.next = null
     return op
 
