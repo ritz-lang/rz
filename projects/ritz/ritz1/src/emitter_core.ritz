@@ -2296,9 +2296,39 @@ fn coerce_struct_ret_value(s: *EmitterState, expr: *Expr, val: i32, dst_name: *u
         return rebuild_layout_equiv(s, val, src_name, src_len, dst_name, dst_len)
     val
 
+# AGAST #1600: the user enum a bare identifier `B` denotes as a VALUE — a
+# unit variant of exactly one non-generic enum, the name not shadowed by a
+# const, local, global or fn (those resolve first in emit_expr_ident).
+# Returns the enum index with *out_vi = the tag; -1 if `e` is not one; -2 if
+# two enums declare the name (*out_vi / *out_other = the two enum indices,
+# for the caller's error).  A payload variant used bare is -1: it is not a
+# value without its payload.
+fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_other: *i32) -> i32
+    *out_vi = 0 - 1
+    *out_other = 0 - 1
+    if e == null or e.kind != EXPR_IDENT
+        return 0 - 1
+    if is_const(s, e.ident_ptr, e.ident_len) == 1
+        return 0 - 1
+    if find_local(s, e.ident_ptr, e.ident_len) >= 0
+        return 0 - 1
+    if find_global(s, e.ident_ptr, e.ident_len) != null
+        return 0 - 1
+    if find_fn(s, e.ident_ptr, e.ident_len) != null
+        return 0 - 1
+    let ei: i32 = enum_of_variant_unique(e.ident_ptr, e.ident_len, out_vi, out_other)
+    if ei < 0
+        return ei
+    if enum_variant_kind(ei, *out_vi) != ENUM_VARIANT_UNIT
+        *out_vi = 0 - 1
+        return 0 - 1
+    return ei
+
 # AGAST #1797: the user enum a call `Holds(x)` constructs — a one-payload
 # tuple variant of a non-generic enum, resolved as try_emit_user_variant_ctor
 # does (it wins over a same-named fn, as in ritz0).  null/0 otherwise.
+# AGAST #1610: also a unit variant called with no arguments, `Red()` (built
+# with no payload; it used to fall through to a fn call returning i64).
 pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
@@ -2308,9 +2338,14 @@ pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
     let ei: i32 = enum_of_variant(e.func_name, e.func_name_len, @vi)
     if ei < 0
         return
-    if enum_variant_kind(ei, vi) != ENUM_VARIANT_TUPLE
-        return
-    if e.args == null or e.args.next != null
+    let kind: i32 = enum_variant_kind(ei, vi)
+    if kind == ENUM_VARIANT_UNIT
+        if e.args != null
+            return
+    else if kind == ENUM_VARIANT_TUPLE
+        if e.args == null or e.args.next != null
+            return
+    else
         return
     *out_name = enum_name_at(ei, out_len)
 
@@ -2380,6 +2415,13 @@ fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len:
         if ce != null and ce.const_type == TYPE_STRUCT and ce.type_name_len > 0
             *out_name = ce.type_name
             *out_len = ce.type_name_len
+            return
+        # AGAST #1600: a bare unit variant `B` is a value of its enum.
+        var vi: i32 = 0
+        var other: i32 = 0
+        let ei: i32 = bare_unit_variant_enum(s, e, @vi, @other)
+        if ei >= 0
+            *out_name = enum_name_at(ei, out_len)
         return
     # Function-call return-type lookup.
     if e.kind == EXPR_CALL

@@ -80,8 +80,6 @@ _RITZ1_TWINS = {
     # --- codegen, build failures ---
     "test_aesni":
         "AGAST #1609 — AES-NI intrinsics do not bitcast v4i32 operands",
-    "test_level34":
-        "AGAST #1610 — bare user-enum unit variant as a value is an unknown identifier",
     "test_native_string":
         "AGAST #1627 — unspecified ritz0-only String coercions (\"...\"→String, String→*u8)",
     "test_string_coercion":
