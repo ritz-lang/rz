@@ -58,6 +58,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             # Clear first so a stale type from an earlier match can't leak in.
             s.last_match_agg_name = null
             s.last_match_agg_name_len = 0
+            s.last_match_float_ty = 0
             pre_init_reg = emit_expr(s, stmt.var_init)
             pre_emitted = 1
             if s.last_match_agg_name != null and s.last_match_agg_name_len > 0
@@ -65,6 +66,11 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type = TYPE_STRUCT
                 stmt.var_type_name = s.last_match_agg_name
                 stmt.var_type_name_len = s.last_match_agg_name_len
+            else if s.last_match_float_ty != 0
+                # AGAST #1946: float-valued arms, `let v = match o` with
+                # `Some(x) => x` over Option<f64>: a `double` slot.
+                var_type = s.last_match_float_ty
+                stmt.var_type = var_type
 
     # Infer struct type for `var IDENT = expr` (no annotation).
     # The parser defaults missing annotations to TYPE_I64, which is
@@ -625,6 +631,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     s.ctx_simd_name_len = stmt.var_type_name_len
         var init_reg: i32 = pre_init_reg
         if pre_emitted == 0
+            set_match_float_hint(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
             init_reg = emit_expr(s, stmt.var_init)
         s.ctx_enum_name = _saved_ctx
         s.ctx_enum_name_len = _saved_ctx_len
@@ -1272,6 +1279,24 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_ir_error_begin(s, c"unknown variable '")
             emit_ir_error_end(s, stmt.assign_target, stmt.assign_target_len)
 
+# AGAST #1946: when `e` is a match / if expression bound or returned at float
+# type (`ty`, or a TYPE_STRUCT named "f32" / "f64"), tell it to merge at that
+# type so its phi, every arm and the slot / `ret` agree.  emit_match and
+# emit_if_expr consume the hint on entry.
+fn set_match_float_hint(s: *EmitterState, e: *Expr, ty: i32, ty_name: *u8, ty_name_len: i32)
+    s.match_float_hint = 0
+    if e == null
+        return
+    if e.kind != EXPR_MATCH and e.kind != EXPR_IF
+        return
+    if ty == TYPE_F32 or ty == TYPE_F64
+        s.match_float_hint = ty
+    else if ty_name != null and ty_name_len == 3 and is_float_type(ty, ty_name, ty_name_len) == 1
+        if *(ty_name + 1) == 51   # "f32"
+            s.match_float_hint = TYPE_F32
+        else
+            s.match_float_hint = TYPE_F64
+
 fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
         # Special handling for struct returns - need to load entire struct
@@ -1368,6 +1393,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c"\n")
             return
 
+        set_match_float_hint(s, stmt.return_value, ret_type, s.ret_type_name, s.ret_type_name_len)
         let val: i32 = emit_expr(s, stmt.return_value)
         if ret_type == TYPE_I32 or ret_type == TYPE_U32
             let trunc: i32 = next_reg(s)

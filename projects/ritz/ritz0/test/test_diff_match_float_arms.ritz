@@ -1,0 +1,220 @@
+# AGAST #1946: a `match` whose arms yield a float merges at that float type.
+#
+# ritz1 typed every scalar match phi as i64, so `let a: f64 = match o` with
+# `Some(v) => v` / `None => 0.0` emitted `phi i64 [ double ... ]`, and clang
+# rejected the module ("'%.15' defined with type 'double' but expected
+# 'i64'").  The phi now takes the arms' float type (f64 wins over f32, as
+# binop_float_width), and the fallthrough value is a float zero.
+#
+# Only f64 arms are exercised: in ritz0 an `f32` arm next to a `0.0` arm has
+# mismatched types (#1357).
+#
+# Oracle: ritz0 runs every case to the same result.
+
+import ritzlib.option
+import ritzlib.result
+
+fn mk_some(x: f64) -> Option<f64>
+    return Some(x)
+
+fn mk_none() -> Option<f64>
+    return None
+
+fn mk_ok(x: f64) -> Result<f64, i32>
+    return Ok(x)
+
+fn mk_err() -> Result<f64, i32>
+    return Err(7)
+
+fn half(x: f64) -> f64
+    return x / 2.0
+
+# Arms: a float payload binding, and a float literal.
+fn option_main() -> i32
+    let o: Option<f64> = Some(2.5)
+    let a: f64 = match o
+        Some(v) => v
+        None => 0.0
+    if a != 2.5
+        return 1
+    let b: f64 = match mk_none()
+        Some(v) => v
+        None => 0.75
+    if b != 0.75
+        return 2
+    # Literal arm first, payload arm second.
+    let c: f64 = match mk_some(-4.0)
+        None => 1.0
+        Some(v) => v
+    if c != -4.0
+        return 3
+    return 42
+
+# Arms: a float-returning call and arithmetic on the payload.
+fn result_main() -> i32
+    let a: f64 = match mk_ok(9.0)
+        Ok(v) => half(v)
+        Err(e) => 0.0
+    if a != 4.5
+        return 1
+    let b: f64 = match mk_err()
+        Ok(v) => v * 3.0
+        Err(e) => 1.5
+    if b != 1.5
+        return 2
+    return 42
+
+# An integer scrutinee whose arms are float literals.
+fn int_scrut_main() -> i32
+    var k: i64 = 2
+    let a: f64 = match k
+        1 => 1.5
+        2 => 2.5
+        _ => 0.0
+    if a != 2.5
+        return 1
+    return 42
+
+# The match's float value used directly, not via a let.
+fn pick(o: Option<f64>) -> f64
+    return match o
+        Some(v) => v + 1.0
+        None => 0.0
+
+fn direct_main() -> i32
+    if pick(Some(1.5)) != 2.5
+        return 1
+    if pick(None) != 0.0
+        return 2
+    return 42
+
+# The match is the fn's trailing expression, not a `return`.
+fn pick_tail(o: Option<f64>) -> f64
+    match o
+        Some(v) => v * 2.0
+        None => 0.5
+
+# Untyped `let`: the slot takes the arms' float type, as #1666 does for
+# struct-valued arms.
+fn untyped_main() -> i32
+    let o: Option<f64> = Some(3.25)
+    let a = match o
+        Some(v) => v
+        None => 0.0
+    if a != 3.25
+        return 1
+    if pick_tail(Some(1.25)) != 2.5
+        return 2
+    if pick_tail(None) != 0.5
+        return 3
+    return 42
+
+# f32 arms, and a nested match as an arm.
+fn f32_main() -> i32
+    let o: Option<f32> = Some(1.5)
+    let z: f32 = 0.25
+    let a: f32 = match o
+        Some(v) => v
+        None => z
+    if a != 1.5
+        return 1
+    let n: Option<f32> = None
+    let b: f32 = match n
+        Some(v) => v
+        None => z
+    if b != 0.25
+        return 2
+    let p: Option<f32> = Some(4.0)
+    let q: Option<f64> = Some(8.0)
+    let c: f64 = match p
+        Some(v) => match q
+            Some(w) => w
+            None => 0.0
+        None => 0.0
+    if c != 8.0
+        return 3
+    return 42
+
+# `return match` in a `-> f32` fn: the return type decides the merge type.
+fn pick32(k: i64) -> f32
+    return match k
+        1 => 0.75
+        _ => 0.0
+
+# Literal arms are `double`; the f32 annotation decides the merge type, so
+# each arm narrows to it rather than the phi being a double in a float slot.
+fn f32_literal_main() -> i32
+    var k: i64 = 1
+    let a: f32 = match k
+        1 => 1.5
+        _ => 0.0
+    if a != 1.5
+        return 1
+    let b: f32 = if k > 0
+        -0.5
+    else
+        2.0
+    if b != -0.5
+        return 2
+    if pick32(1) != 0.75
+        return 3
+    if pick32(5) != 0.0
+        return 4
+    return 42
+
+# An if-expression yielding f64 goes through the same merge.
+fn if_expr_main() -> i32
+    var k: i64 = 3
+    let a: f64 = if k > 1
+        6.5
+    else
+        0.0
+    if a != 6.5
+        return 1
+    let b = if k > 5
+        1.0
+    else
+        -2.0
+    if b != -2.0
+        return 2
+    return 42
+
+[[test]]
+fn test_match_f64_untyped_and_tail() -> i32
+    assert untyped_main() == 42
+    0
+
+[[test]]
+fn test_match_f32_arms() -> i32
+    assert f32_main() == 42
+    0
+
+[[test]]
+fn test_match_f32_literal_arms() -> i32
+    assert f32_literal_main() == 42
+    0
+
+[[test]]
+fn test_if_expr_f64_arms() -> i32
+    assert if_expr_main() == 42
+    0
+
+[[test]]
+fn test_match_f64_option_arms() -> i32
+    assert option_main() == 42
+    0
+
+[[test]]
+fn test_match_f64_result_arms() -> i32
+    assert result_main() == 42
+    0
+
+[[test]]
+fn test_match_f64_int_scrutinee() -> i32
+    assert int_scrut_main() == 42
+    0
+
+[[test]]
+fn test_match_f64_direct_return() -> i32
+    assert direct_main() == 42
+    0

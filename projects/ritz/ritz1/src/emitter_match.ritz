@@ -59,6 +59,19 @@ struct MatchResult
     # non-exhaustive fallthrough value are emitted at this type.
     agg_name: *u8
     agg_name_len: i32
+    # AGAST #1946: TYPE_F32 / TYPE_F64 when the arms yield a float, else 0.
+    # Fixed by the enclosing let / return's hint (match_float_hint) or by
+    # the first float-valued arm; later arms are coerced to it.
+    float_ty: i32
+    # Arms recorded as i64 values before float_ty was fixed: they cannot be
+    # coerced after the fact (their `br` is already emitted).
+    int_arms: i32
+
+# AGAST #1946: a `values[]` entry for an arm with no value (`pass`, or a body
+# with no trailing expression): the phi gets the zero constant of its type
+# instead of an `add i64 0, 0` register, which mismatched a float or struct
+# phi.
+const MATCH_ZERO_VALUE: i32 = -1
 
 # Check if a variant name denotes the "Some/Ok" (tagged) side of its enum.
 # Returns 1 if tag should be 1, 0 otherwise.
@@ -295,6 +308,80 @@ fn match_result_init(r: *MatchResult, n_arms: i32)
     r.count = 0
     r.agg_name = null
     r.agg_name_len = 0
+    r.float_ty = 0
+    r.int_arms = 0
+
+# AGAST #1946: the float type (TYPE_F32 / TYPE_F64) arm value `e` was just
+# emitted at, or 0.  A nested match / if publishes its phi type as it
+# completes, which is immediately before this is asked.
+fn match_arm_float_ty(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+        return s.last_match_float_ty
+    binop_operand_float_ty(s, e)
+
+# AGAST #1946: take the float type an enclosing let / return expects of this
+# match (0 if none) and clear it so no nested match sees it.
+fn take_match_float_hint(s: *EmitterState) -> i32
+    let h: i32 = s.match_float_hint
+    s.match_float_hint = 0
+    h
+
+# AGAST #1946: settle a scalar arm's value against the phi's float type.  The
+# first float arm fixes it (an earlier i64 arm cannot be converted any more:
+# an error, not a mistyped phi); once fixed, a float of the other width or an
+# integer is converted in the arm's own block before its `br`.  Called while
+# the arm's pattern binding is in scope.  Returns the register to record.
+fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, result: *MatchResult) -> i32
+    let aft: i32 = match_arm_float_ty(s, arm_body)
+    if result.float_ty == 0
+        if aft == 0
+            result.int_arms = result.int_arms + 1
+            return body_reg
+        if result.int_arms > 0
+            emit_ir_error(s, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        result.float_ty = aft
+        return body_reg
+    if aft == result.float_ty
+        return body_reg
+    if aft != 0
+        return emit_float_coerce(s, body_reg, aft, result.float_ty)
+    if is_int_const_type(get_expr_type(s, arm_body)) == 1
+        return emit_float_coerce(s, body_reg, TYPE_I64, result.float_ty)
+    emit_ir_error(s, c"match arm yields a non-numeric value where the other arms yield a float")
+    body_reg
+
+# AGAST #1946: the merge phi's type: the arms' struct, their float, or i64.
+fn emit_match_phi_type(s: *EmitterState, result: *MatchResult)
+    if result.agg_name != null and result.agg_name_len > 0
+        emit_llvm_type_struct(s, TYPE_STRUCT, result.agg_name, result.agg_name_len)
+    else if result.float_ty != 0
+        emit_str(s, float_llvm_name(result.float_ty))
+    else
+        emit_str(s, c"i64")
+
+# AGAST #1946: one phi incoming value: the arm's register, or for
+# MATCH_ZERO_VALUE the zero constant of the phi's type.
+fn emit_match_phi_value(s: *EmitterState, result: *MatchResult, reg: i32)
+    if reg != MATCH_ZERO_VALUE
+        emit_reg(s, reg)
+    else if result.agg_name != null and result.agg_name_len > 0
+        emit_str(s, c"zeroinitializer")
+    else if result.float_ty != 0
+        emit_str(s, c"0.0")
+    else
+        emit_str(s, c"0")
+
+# AGAST #1946: publish the phi's type for an untyped `let v = match` / `if`
+# (#1666).  Called after every arm, so the outermost construct's type wins.
+fn publish_match_type(s: *EmitterState, result: *MatchResult)
+    if result.agg_name != null and result.agg_name_len > 0
+        s.last_match_agg_name = result.agg_name
+        s.last_match_agg_name_len = result.agg_name_len
+        s.last_match_float_ty = 0
+    else
+        s.last_match_agg_name = null
+        s.last_match_agg_name_len = 0
+        s.last_match_float_ty = result.float_ty
 
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
@@ -360,12 +447,11 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     # trailing expression match_arm_set_block left in arm.body.
     emit_match_arm_stmts(s, arm.body_stmts)
 
-    var body_reg: i32 = 0
+    # A valueless arm (`pass`, or no trailing expression) feeds the phi the
+    # zero of its type (AGAST #1946).
+    var body_reg: i32 = MATCH_ZERO_VALUE
     if arm.is_pass == 1
-        body_reg = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, body_reg)
-        emit_str(s, c" = add i64 0, 0  ; match arm: pass\n")
+        body_reg = MATCH_ZERO_VALUE
     else if arm.body != null
         body_reg = emit_expr(s, arm.body)
         # AGAST #1645: resolve the arm's struct type while its pattern
@@ -391,11 +477,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # its `br`, so every phi incoming value has the phi's type.
         if is_layout_equiv_pair(arm_ty, arm_ty_len, result.agg_name, result.agg_name_len) == 1
             body_reg = rebuild_layout_equiv(s, body_reg, arm_ty, arm_ty_len, result.agg_name, result.agg_name_len)
-    else
-        body_reg = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, body_reg)
-        emit_str(s, c" = add i64 0, 0  ; match arm: null body\n")
+        # AGAST #1946: a float-valued scalar arm types the phi as float.
+        if result.agg_name == null
+            body_reg = match_arm_float_settle(s, arm.body, body_reg, result)
 
     s.local_count = saved_local_count
     # ritz-task-193 — drop the inner-arm binding from local_map so the next
@@ -576,6 +660,7 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
         counted = counted.next
     var result: MatchResult
     match_result_init(@result, n_arms)
+    result.float_ty = take_match_float_hint(s)   # AGAST #1946
 
     var arm: *MatchArm = arms
     var idx: i32 = 0
@@ -586,21 +671,16 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
 
     # Current block is the last "next" block — it has no matching arm, so
     # fall through to match end with a default value. This is the
-    # non-exhaustive safety net.  For struct-valued arms (AGAST #1645) the
-    # default is the aggregate `zeroinitializer` constant, written straight
-    # into the phi below, so no instruction is emitted for it here.
-    let is_agg: i32 = result.agg_name != null and result.agg_name_len > 0
+    # non-exhaustive safety net.  The default is the zero constant of the
+    # phi's type (`0`, `0.0`, or `zeroinitializer` for struct-valued arms,
+    # AGAST #1645 / #1946), written straight into the phi below.
     # AGAST #1666: publish the phi type for an untyped `let v = match ...`.
     # Set after every arm (nested matches inside arms included) so the
     # outermost match's type is what the enclosing let sees.
-    if is_agg == 1
-        s.last_match_agg_name = result.agg_name
-        s.last_match_agg_name_len = result.agg_name_len
-    else
-        s.last_match_agg_name = null
-        s.last_match_agg_name_len = 0
+    publish_match_type(s, @result)
     var fallthrough_reg: i32 = 0
-    if is_agg == 0
+    if result.count == 0
+        # No arm phi: the match's value is this register itself.
         fallthrough_reg = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, fallthrough_reg)
@@ -623,27 +703,21 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
     emit_str(s, c"  ")
     emit_reg(s, phi_reg)
     emit_str(s, c" = phi ")
-    if is_agg == 1
-        emit_llvm_type_struct(s, TYPE_STRUCT, result.agg_name, result.agg_name_len)
-    else
-        emit_str(s, c"i64")
+    emit_match_phi_type(s, @result)
     emit_str(s, c" ")
     var i: i32 = 0
     while i < result.count
         if i > 0
             emit_str(s, c", ")
         emit_str(s, c"[ ")
-        emit_reg(s, result.values[i])
+        emit_match_phi_value(s, @result, result.values[i])
         emit_str(s, c", %")
         emit_label(s, result.labels[i])
         emit_str(s, c" ]")
         i = i + 1
     # Add fallthrough entry
     emit_str(s, c", [ ")
-    if is_agg == 1
-        emit_str(s, c"zeroinitializer")
-    else
-        emit_reg(s, fallthrough_reg)
+    emit_match_phi_value(s, @result, MATCH_ZERO_VALUE)
     emit_str(s, c", %")
     emit_label(s, fallthrough_label)
     emit_str(s, c" ]\n")
@@ -713,6 +787,7 @@ fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
 
     var result: MatchResult
     match_result_init(@result, 2)
+    result.float_ty = take_match_float_hint(s)   # AGAST #1946
     begin_block(s, then_label)
     emit_match_arm_body(s, then_arm, 0, 0, null, 0, @result, 0, end_label)
     begin_block(s, else_label)
@@ -721,28 +796,19 @@ fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
 
     # Publish the phi type for an untyped `let v = if ...` (#1666's path);
     # set after both arms so a nested if/match inside an arm can't clobber it.
-    let is_agg: i32 = result.agg_name != null and result.agg_name_len > 0
-    if is_agg == 1
-        s.last_match_agg_name = result.agg_name
-        s.last_match_agg_name_len = result.agg_name_len
-    else
-        s.last_match_agg_name = null
-        s.last_match_agg_name_len = 0
+    publish_match_type(s, @result)
 
     let phi_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, phi_reg)
     emit_str(s, c" = phi ")
-    if is_agg == 1
-        emit_llvm_type_struct(s, TYPE_STRUCT, result.agg_name, result.agg_name_len)
-    else
-        emit_str(s, c"i64")
+    emit_match_phi_type(s, @result)
     var i: i32 = 0
     while i < 2
         if i > 0
             emit_str(s, c",")
         emit_str(s, c" [ ")
-        emit_reg(s, result.values[i])
+        emit_match_phi_value(s, @result, result.values[i])
         emit_str(s, c", %")
         emit_label(s, result.labels[i])
         emit_str(s, c" ]")
