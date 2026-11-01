@@ -16,8 +16,9 @@
 # so a `var`, param, loop variable or match binding that shadows a `let` is
 # mutable, as in ritz0.
 #
-# Not covered here: implicit mutable autoborrows (a `self:&` receiver, a
-# `name:&` param) -- ritz0 #2029 decides that rule first.
+# Implicit mutable autoborrows (AGAST #2032, ritz0 #2029) count too: a
+# `self:&` / `self: @&T` receiver or a `name:& T` / `name: @&T` argument
+# that is a `let`'s own storage (let_check_implicit).
 
 import ritzlib.sys
 import ritzlib.io
@@ -25,6 +26,7 @@ import ritzlib.io
 import ast
 import ast_helpers
 import emitter_core
+import emitter_expr_call   # method_callee_def (AGAST #2032)
 
 # The type of the place reached so far along a `let`'s own storage.
 struct LetPlace
@@ -140,6 +142,51 @@ fn let_error_assign_whole(s: *EmitterState, line: i32, col: i32, name: *u8, len:
 fn let_error_borrow(s: *EmitterState, line: i32, col: i32, pl: *LetPlace)
     let_error(s, line, col, c"cannot borrow `let` binding `", pl.name, pl.name_len, c"` as mutable; declare it `var`\n")
 
+# AGAST #2032 (ritz0 #2029): an implicit mutable borrow.  `p` is the callee
+# param that `arg` (or a method receiver) binds to.  A `name:& T`,
+# `name: @&T` or `self:&` param (all TYPE_MUT_REF) autoborrows its argument,
+# which is #2026's explicit `@&` in disguise.  A `let` that *holds* a
+# pointer is passed as that pointer, borrowing the pointee, so stays legal;
+# `@&x` itself is the explicit form, reported by let_check_expr.
+fn let_check_implicit(s: *EmitterState, arg: *Expr, p: *Param)
+    if p.param_type != TYPE_MUT_REF
+        return
+    var pl: LetPlace
+    if let_place(s, arg, @pl) == 0
+        return
+    if pl.kind == TYPE_PTR or pl.kind == TYPE_PTR_PTR or pl.kind == TYPE_REF or pl.kind == TYPE_MUT_REF
+        return
+    let_error_borrow(s, arg.span.line, arg.span.col, @pl)
+
+# The struct a method receiver names (by value or through a pointer), or
+# null when ritz1 cannot type it without emitting it.
+fn let_recv_type(s: *EmitterState, recv: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if recv == null
+        return null
+    if recv.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, recv.ident_ptr, recv.ident_len)
+        if loc == null
+            return null
+        *out_len = loc.type_name_len
+        return loc.type_name
+    if recv.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, recv)
+        if f == null
+            return null
+        *out_len = f.field_type_name_len
+        return f.field_type_name
+    return null
+
+# The function a method call dispatches to (UFCS helper, impl method or
+# specialized generic impl method), or null.
+fn let_method_def(s: *EmitterState, e: *Expr) -> *FnDef
+    var tlen: i32 = 0
+    let tname: *u8 = let_recv_type(s, e.left, @tlen)
+    if tname == null or tlen <= 0
+        return null
+    return method_callee_def(s, tname, tlen, e.ident_ptr, e.ident_len)
+
 # Reject every `@&<let place>` in `e`.  Walks only the expression kinds
 # whose children are plain sub-expressions; a match / if / struct-literal
 # expression reuses those slots for other nodes, and their statements and
@@ -160,11 +207,26 @@ pub fn let_check_expr(s: *EmitterState, e: *Expr)
     else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY
         let_check_expr(s, e.left)
     else if k == EXPR_CALL or k == EXPR_METHOD
+        # AGAST #2032: the callee's signature, for implicit `@&` autoborrows.
+        var p: *Param = null
         if k == EXPR_METHOD
             let_check_expr(s, e.left)
+            let m: *FnDef = let_method_def(s, e)
+            if m != null
+                p = m.params
+                if p != null
+                    let_check_implicit(s, e.left, p)
+                    p = p.next
+        else
+            let f: *FnDef = find_call_fn(s, e)
+            if f != null
+                p = f.params
         var a: *Expr = e.args
         while a != null
             let_check_expr(s, a)
+            if p != null
+                let_check_implicit(s, a, p)
+                p = p.next
             a = a.next
 
 # The write target of an assignment-kind statement, if it is a `let` place.

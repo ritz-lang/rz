@@ -258,6 +258,15 @@ fn ufcs_non_generic_prefix(type_name: *u8, type_name_len: i32, out_len: *i32) ->
 # Returns -1 if the mangled function isn't defined (caller should fall back
 # to the current Type_method mangling); otherwise the register holding the call result.
 fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_len: i32, receiver_reg: i32, recv_is_ptr_of_ptr: i32) -> i32
+    let fn_def: *FnDef = ufcs_fn_def(s, type_name, type_name_len, e.ident_ptr, e.ident_len)
+    if fn_def == null
+        return -1
+    return emit_ufcs_call(s, e, fn_def, receiver_reg, recv_is_ptr_of_ptr)
+
+# The monomorphized UFCS helper `type_name.method` dispatches to
+# (`vec_method$T`, `span_method$T`, `strview_method`, or a non-generic
+# ritzlib prefix), or null when there is none.
+fn ufcs_fn_def(s: *EmitterState, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
     # Pick the UFCS prefix and suffix source
     var prefix_buf: [16]u8
     var prefix_len: i32 = 0
@@ -298,9 +307,9 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
         var ng_len: i32 = 0
         let ng: *u8 = ufcs_non_generic_prefix(type_name, type_name_len, @ng_len)
         if ng == null
-            return -1
-        if find_impl_method(s, type_name, type_name_len, e.ident_ptr, e.ident_len) != null
-            return -1
+            return null
+        if find_impl_method(s, type_name, type_name_len, method, method_len) != null
+            return null
         for i in 0..ng_len
             prefix_buf[i] = *(ng + i)
         prefix_len = ng_len
@@ -308,13 +317,13 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
 
     # Build: <prefix><method>[<$T>].  Heap, sized exactly: a fixed [128]u8
     # was overrun by a long method or type name (AGAST #1813).
-    let mangled: *u8 = malloc((prefix_len + e.ident_len + type_name_len + 1) as i64)
+    let mangled: *u8 = malloc((prefix_len + method_len + type_name_len + 1) as i64)
     var mangled_len: i32 = 0
     for i in 0..prefix_len
         mangled[mangled_len] = prefix_buf[i]
         mangled_len += 1
-    for i in 0..e.ident_len
-        mangled[mangled_len] = *(e.ident_ptr + i)
+    for i in 0..method_len
+        mangled[mangled_len] = *(method + i)
         mangled_len += 1
     if append_suffix == 1
         for i in suffix_start..type_name_len
@@ -323,9 +332,35 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
 
     # Must resolve to a known function for us to dispatch here
     let fn_def: *FnDef = find_fn(s, mangled, mangled_len)
-    if fn_def == null
-        return -1
+    free(mangled)
+    return fn_def
 
+# The function a method call `type_name.method(..)` dispatches to, in
+# emit_expr_method's order: a UFCS helper, a method of a non-generic impl,
+# else a specialized generic impl method `Type$T_method` (monomorph adds
+# those to the module's functions, not to its impls).  Null when unknown.
+# let_check.ritz reads its params (AGAST #2032).
+fn method_callee_def(s: *EmitterState, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
+    let u: *FnDef = ufcs_fn_def(s, type_name, type_name_len, method, method_len)
+    if u != null
+        return u
+    let m: *FnDef = find_impl_method(s, type_name, type_name_len, method, method_len)
+    if m != null
+        return m
+    let n: i32 = type_name_len + 1 + method_len
+    let buf: *u8 = malloc(n as i64 + 1)
+    for i in 0..type_name_len
+        *(buf + i) = *(type_name + i)
+    *(buf + type_name_len) = '_'
+    for i in 0..method_len
+        *(buf + type_name_len + 1 + i) = *(method + i)
+    *(buf + n) = 0
+    let fd: *FnDef = find_fn(s, buf, n)
+    free(buf)
+    return fd
+
+# Emit the UFCS call to `fn_def` with the receiver passed as a pointer.
+fn emit_ufcs_call(s: *EmitterState, e: *Expr, fn_def: *FnDef, receiver_reg: i32, recv_is_ptr_of_ptr: i32) -> i32
     # If the receiver is a pointer type, its stack slot holds an i64 pointer —
     # load it first so the callee receives the real struct pointer.
     var recv_ptr: i32 = receiver_reg
@@ -547,7 +582,7 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
             emit_str(s, c" = call ptr @")
         else
             emit_str(s, c" = call i64 @")
-    emit_name(s, mangled, mangled_len)
+    emit_name(s, fn_def.name, fn_def.name_len)
     emit_str(s, c"(")
     if ufcs_sret > 0
         emit_sret_attr(s, fn_def.return_type_name, fn_def.return_type_name_len)
@@ -575,7 +610,7 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
 
     # Register as an external so link-time lookups succeed even if monomorphization
     # instantiated this helper in a sibling module.
-    add_extern(s, mangled, mangled_len)
+    add_extern(s, fn_def.name, fn_def.name_len)
 
     # Sign/zero-extend smaller return values to i64 for uniform representation
     if ret_type == TYPE_I32
