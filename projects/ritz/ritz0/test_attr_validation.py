@@ -293,6 +293,148 @@ def test_packed_struct_type_is_llvm_packed(request, tmp_path, compiler):
     assert types["Outer"].startswith("{"), types
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_packed_layout_runs_at_O2(request, tmp_path, compiler):
+    _need(compiler, request)
+    assert _run(compiler, tmp_path, PACKED, opt="-O2") == 42
+
+
+# --- AGAST #1918: packed-field accesses carry `align 1` ----------------------
+#
+# A field of a `[[packed]]` struct can sit at any offset, so `load i64` from
+# `p.b` (offset 1) with no `align` operand claims ABI alignment 8 — UB that
+# -O2 is entitled to exploit.  Every shape below reaches a field of a packed
+# struct: directly, through a pointer, through an array element, nested
+# inside a normal struct, and a normal struct nested inside a packed one.
+
+PACKED_ACCESS = """\
+struct Inner
+    x: u32
+    y: u64
+
+[[packed]]
+struct P
+    a: u8
+    b: u64
+    c: u16
+    inner: Inner
+
+struct Outer
+    x: u8
+    p: P
+
+var g: P
+
+fn via_ptr(q: *P) -> u64
+    q.b = q.b + 1
+    q.b
+
+fn main() -> i32
+    var p: P
+    var o: Outer
+    var arr: [2]P
+    p.b = 5
+    p.c = 6
+    p.b += 1
+    o.p.b = 7
+    o.p.inner.y = 8
+    p.inner.x = 9
+    arr[1].b = 10
+    g.b = 11
+    let r: u64 = p.b + p.c as u64 + o.p.b + o.p.inner.y + p.inner.x as u64 + arr[1].b + g.b + via_ptr(@p)
+    if r != 6 + 6 + 7 + 8 + 9 + 10 + 11 + 7
+        return 1
+    42
+"""
+
+_REG = r'(?:%"[^"]+"|%[\w.$-]+)'
+
+
+def _struct_name(tok: str) -> str:
+    # ritz0: `%"struct.<module>.P"`, ritz1: `%P`.
+    return tok.strip('%"').rsplit(".", 1)[-1]
+
+
+def _packed_accesses(ir: str, names=frozenset({"P"})):
+    """(line, has_align1) for each load/store through a field of `names`.
+
+    A pointer is derived when a GEP's source type is one of `names`,
+    or its base is itself packed-derived (nesting).  The GEP's result is the
+    register defined; the base is the first register operand after the
+    source type (skipping ritz0's typed-pointer `%T*` spelling).
+    """
+    packed = set()
+    out = []
+    for line in ir.splitlines():
+        code = line.split(", !dbg")[0]
+        m = re.match(rf"\s*({_REG}) = getelementptr (?:inbounds )?(.*)$", code)
+        if m:
+            dst, rest = m.group(1), m.group(2)
+            src_ty = re.match(rf"({_REG}|\[[^\]]*\]|\w+)", rest).group(1)
+            after = rest[len(src_ty):]
+            base = None
+            for bm in re.finditer(_REG, after):
+                if after[bm.end():bm.end() + 1] == "*":
+                    continue   # ritz0's `%"struct.P"*` pointer type
+                base = bm.group(0)
+                break
+            if (src_ty.startswith("%") and _struct_name(src_ty) in names) or base in packed:
+                packed.add(dst)
+            continue
+        m = re.match(rf"\s*(?:{_REG} = load .*|store .*), (?:ptr|\S+\*) ({_REG})(.*)$", code)
+        if m and m.group(1) in packed:
+            out.append((line.strip(), re.search(r",\s*align 1\b", m.group(2)) is not None))
+    return out
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_packed_field_accesses_are_align_1(request, tmp_path, compiler):
+    _need(compiler, request)
+    ir = _ir(compiler, tmp_path, PACKED_ACCESS)
+    accesses = _packed_accesses(ir)
+    # One store and one load per shape at least — the check must not be vacuous.
+    assert len(accesses) >= 16, "\n".join(a for a, _ in accesses) or ir
+    bad = [a for a, ok in accesses if not ok]
+    assert not bad, "packed-field access without `align 1`:\n" + "\n".join(bad)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_packed_field_accesses_run_at_O2(request, tmp_path, compiler):
+    _need(compiler, request)
+    assert _run(compiler, tmp_path, PACKED_ACCESS, opt="-O2") == 42
+
+
+# A packed struct in the module too, so ritz1's pass actually runs.
+NORMAL_ONLY = """\
+struct N
+    a: u8
+    b: u64
+
+[[packed]]
+struct Q
+    a: u8
+    b: u64
+
+fn main() -> i32
+    var n: N
+    var q: Q
+    n.b = 40
+    q.b = 2
+    (n.b + q.b) as i32
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_normal_struct_accesses_keep_natural_alignment(request, tmp_path, compiler):
+    # The fix must not degrade every field access to `align 1`.
+    _need(compiler, request)
+    ir = _ir(compiler, tmp_path, NORMAL_ONLY)
+    normal = _packed_accesses(ir, frozenset({"N"}))
+    assert len(normal) >= 2, ir
+    assert not any(ok for _, ok in normal), "\n".join(a for a, _ in normal)
+    assert all(ok for _, ok in _packed_accesses(ir, frozenset({"Q"}))), ir
+
+
 GENERIC_PACKED = """\
 [[packed]]
 struct Pair<T>

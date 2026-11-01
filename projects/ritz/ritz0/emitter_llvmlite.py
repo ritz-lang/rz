@@ -113,6 +113,40 @@ def _cannot_write_memory(inst) -> bool:
     return inst.opname in _NO_WRITE_OPNAMES
 
 
+def _in_packed_struct(ptr) -> bool:
+    """AGAST #1918: does `ptr` address memory inside a `[[packed]]` struct?
+
+    A packed struct (`<{ ... }>`) puts its fields at any byte offset, so a
+    `load`/`store` through a field pointer must say `align 1`: with no
+    `align` operand LLVM assumes the type's ABI alignment, which is false
+    for `p.b: u64` at offset 1, and -O2 may exploit it.
+
+    True when a GEP on the way to `ptr` steps into a packed struct's field,
+    directly or via a base pointer that is itself inside one (`o.p.b`,
+    `p.inner.x` for a normal Inner inside packed P).  A pointer LOADED from
+    memory starts afresh: what it points at has its own alignment.
+    """
+    while True:
+        if isinstance(ptr, ir.CastInstr) and ptr.opname == 'bitcast':
+            ptr = ptr.operands[0]
+            continue
+        if not isinstance(ptr, ir.GEPInstr):
+            return False
+        ty = ptr.source_etype
+        for idx in ptr.operands[2:]:   # operands[1] steps over the base pointer
+            if isinstance(ty, ir.BaseStructType):
+                if ty.packed:
+                    return True
+                if not isinstance(idx, ir.Constant):
+                    break
+                ty = ty.elements[idx.constant]
+            elif isinstance(ty, ir.ArrayType):
+                ty = ty.element
+            else:
+                break
+        ptr = ptr.operands[0]
+
+
 class _SretAwareBuilder(ir.IRBuilder):
     """IRBuilder that lowers calls to and returns from sret functions."""
 
@@ -199,6 +233,11 @@ class _SretAwareBuilder(ir.IRBuilder):
         with self.goto_entry_block():
             return self.alloca(ty, name=name)
 
+    def load(self, ptr, name='', align=None, typ=None):
+        if align is None and _in_packed_struct(ptr):
+            align = 1   # AGAST #1918
+        return super().load(ptr, name=name, align=align, typ=typ)
+
     def store(self, value, ptr, align=None):
         """AGAST #1732: copy a large struct pointer-to-pointer.
 
@@ -210,6 +249,8 @@ class _SretAwareBuilder(ir.IRBuilder):
         """
         src = self._emitter._large_copy_source(value, ptr, self.block)
         if src is None:
+            if align is None and _in_packed_struct(ptr):
+                align = 1   # AGAST #1918
             return super().store(value, ptr, align=align)
         return self._emitter._emit_large_copy(self, ptr, src, value.type)
 
