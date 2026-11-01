@@ -15,8 +15,9 @@ the AMP form to `struct_field` and lowers it to type_mut_ref (`@&C`), the same
 type ritz0 gives it. Struct-style enum variants reuse `struct_fields` (#1543),
 so they accept the form too.
 
-Reading and writing through such a field parses now but does not yet emit in
-ritz1 (#2041). Those cases run under ritz0 and are a strict xfail under ritz1.
+#2041 taught the ritz1 emitter to initialise, read and write through such a
+field (and through `@C` / `@&C` fields): they are laid out as `ptr` and member
+access through them auto-derefs like a `*C` field.
 
 Every program returns 3 on success. ritz0 is the oracle.
 """
@@ -114,13 +115,67 @@ PROGRAMS = {
     "mixed_fields": MIXED_FIELDS,
 }
 
-# Field access through the borrow. ritz0 runs these. ritz1 now parses them but
-# its emitter cannot yet lower reference-typed fields (`@C`, `@&C`, `:& C`
-# alike): "struct literal field of this type is not lowered" / "unhandled
-# EXPR_MEMBER". Tracked by #2041; strict xfail until then.
-ACCESS = {
+# A ref field between plain fields: the struct literal must put each value in
+# its own slot and the ref field must be pointer-sized, or `tail` reads junk.
+# Also writes through a ref field of a by-value local and passes the inner
+# pointer on to a callee expecting `*C`.
+MIXED_ACCESS = """\
+struct C
+    x: i32
+    y: i64
+
+struct R
+    head: i32
+    ch:& C
+    tail: i64
+
+fn set_y(c: *C, v: i64)
+    c.y = v
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    var r: R = R { head: 1, ch: @&c, tail: 1 }
+    r.ch.x = r.ch.x + r.head
+    set_y(r.ch, r.tail)
+    return (r.ch.x as i64 + c.y) as i32
+"""
+
+# A plain `*C` field initialised from `@&c`. `@&c` is a `ptr` in ritz1, not
+# the i64 its pointer model uses, so the struct literal must not inttoptr it
+# (#2041 found this; a ref field's literal takes the same path).
+PTR_FIELD_FROM_BORROW = """\
+struct C
+    x: i32
+
+struct P
+    ch: *C
+
+pub fn main() -> i32
+    var c: C = C { x: 2 }
+    var p: P = P { ch: @&c }
+    p.ch.x = p.ch.x + 1
+    return c.x
+"""
+
+# Field access through the borrow (#2041). ritz0 is the oracle. Each program
+# also runs with the field spelled `@C` and `@&C`; ritz0 and ritz1 lower all
+# three spellings to a pointer.
+_ACCESS_BASE = {
     "read_write": READ_WRITE,
     "read_only": READ_ONLY,
+    "mixed": MIXED_ACCESS,
+}
+_FIELD_SPELLINGS = {
+    "colon_amp": ":& C",
+    "at": ": @C",
+    "at_amp": ": @&C",
+}
+ACCESS = {
+    "ptr_field_from_borrow": PTR_FIELD_FROM_BORROW,
+} | {
+    f"{name}_{spelling}": re.sub(r":& C$", ty, prog, flags=re.MULTILINE)
+    for name, prog in _ACCESS_BASE.items()
+    for spelling, ty in _FIELD_SPELLINGS.items()
 }
 
 # The borrow field must lower to a reference (pointer-sized), not to the
@@ -259,12 +314,10 @@ def test_ritz0_borrow_field_access(tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(
-    strict=True,
-    reason="#2041: ritz1 emitter cannot lower reference-typed struct fields",
-)
 @pytest.mark.parametrize("name", sorted(ACCESS))
 def test_ritz1_borrow_field_access(ritz1_bin, tmp_path, name):
+    """AGAST #2041. Before the fix: "struct literal field of this type is not
+    lowered" / "unhandled EXPR_MEMBER"."""
     assert _run("ritz1", ritz1_bin, tmp_path, name, ACCESS[name]) == 3
 
 
@@ -274,7 +327,8 @@ def test_ritz1_borrow_field_is_a_reference(ritz1_bin, tmp_path):
     assert comp.returncode == 0 and ll.exists(), comp.stderr[-2000:]
     m = re.search(r"^%R = type (.*)$", ll.read_text(), re.MULTILINE)
     assert m, "no %R type in ritz1 IR"
-    assert m.group(1).replace(" ", "") in ("{ptr}", "{i64}"), (
+    # #2041: ref fields lower like `*C` fields, i.e. to `ptr` as in ritz0.
+    assert m.group(1).replace(" ", "") == "{ptr}", (
         f"`ch:& C` should lower to a reference, got %R = type {m.group(1)}"
     )
 

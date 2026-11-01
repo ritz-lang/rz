@@ -2852,6 +2852,27 @@ fn emit_test_table(s: *EmitterState)
     emit_str(s, c"  call void asm sideeffect \"movq (%rsp), %rdi\\0Aleaq 8(%rsp), %rsi\\0Aandq $$-16, %rsp\\0Acall main\\0Amovq %rax, %rdi\\0Amovq $$60, %rax\\0Asyscall\", \"~{rax},~{rdi},~{rsi},~{rsp},~{rcx},~{r11},~{memory}\"()\n")
     emit_str(s, c"  unreachable\n}\n")
 
+# AGAST #2041: a struct field of reference type to a struct (`ch: @C`,
+# `ch: @&C`, `ch:& C`) is a `*C` field as far as the emitter is concerned.
+# ritz0 lays it out as `ptr` and auto-derefs member access through it, which
+# is exactly what every TYPE_PTR field path (struct literal, member read,
+# member assignment, sizeof, field + i, ...) already does.  Rather than teach
+# each of those sites the two ref codes, rewrite the field once, after
+# monomorphize_module (clone_struct_fields substitutes a `@T` pointee the
+# same way as a `*T` one) and before any struct is laid out or looked up.
+# Refs to a primitive (`p: @i32`) keep their ref type: a TYPE_PTR field with
+# a primitive pointee needs array_elem_type, which field_new does not record
+# for refs, so they stay on their existing (fail-closed) path.
+fn lower_ref_fields(m: *Module)
+    var st: *StructDef = m.structs
+    while st != null
+        var f: *StructField = st.fields
+        while f != null
+            if (f.field_type == TYPE_REF or f.field_type == TYPE_MUT_REF) and f.field_type_name_len > 0
+                f.field_type = TYPE_PTR
+            f = f.next
+        st = st.next
+
 fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     var s: EmitterState
     s.out = out
@@ -2887,6 +2908,7 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.packed_types_emitted = 0   # AGAST #1918 — see align_packed_accesses
     # Before build_symbol_maps, so find_struct sees the fallback if added.
     ensure_string_literal_struct(@s, m)
+    lower_ref_fields(m)   # AGAST #2041
     # ritz-task-193 — allocate the five symbol-table HashMaps before any
     # add_local / find_* call.  build_symbol_maps then snapshots the
     # post-monomorph module-level lists so find_global / find_fn /
