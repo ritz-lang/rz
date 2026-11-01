@@ -3,32 +3,46 @@
 # Tests for URL routing with path parameters
 
 import ritzlib.strview { StrView }
-import ritzlib.option
+import ritzlib.span { Span, span_from_strview, span_from_cstr, span_eq_cstr }
+import ritzlib.gvec { vec_len }
 
-import spire.http.method { Method, GET, POST, PUT, DELETE, HEAD }
-import spire.http.request { Request, request_new, request_with, request_param }
-import spire.http.response { Response, response_ok, response_status_code }
-import spire.router { Router, Route, router_new }
-import spire.router { router_route, router_get, router_post, router_put, router_delete }
-import spire.router { router_handle, router_set_not_found }
-import spire.utils { strview_eq }
+import spire.http.mod { METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE, METHOD_HEAD }
+import spire.http.mod { STATUS_OK, STATUS_CREATED, STATUS_NOT_FOUND }
+import spire.http.request { Request, request_with, request_param }
+import spire.http.response { Response, response_ok, response_with_status, response_status }
+import spire.router.mod { Router, Route, router_new }
+import spire.router.mod { router_route, router_get, router_post, router_put, router_delete }
+import spire.router.mod { router_handle, router_set_not_found }
+
+# ============================================================================
+# Test helpers
+# ============================================================================
+
+# Build a request for `method` on `path` (StrView literal -> Span<u8>)
+# The route param `name` was injected into `req` with value `expected`.
+fn param_is(req: *Request, name: *u8, expected: *u8) -> bool
+    let n: Span<u8> = span_from_cstr(name)
+    var v: Span<u8>
+    if request_param(req, @n, @v) != 1
+        return false
+    return span_eq_cstr(@v, expected)
+
+fn make_request(method: i32, path: *StrView) -> Request
+    let sp: Span<u8> = span_from_strview(path)
+    return request_with(method, @sp)
 
 # ============================================================================
 # Test handlers
 # ============================================================================
 
 fn handler_ok(req: *Request) -> Response
-    response_ok()
+    return response_ok()
 
 fn handler_created(req: *Request) -> Response
-    var resp: Response = response_ok()
-    resp.status.code = 201
-    resp
+    return response_with_status(STATUS_CREATED)
 
 fn handler_custom_404(req: *Request) -> Response
-    var resp: Response = response_ok()
-    resp.status.code = 418  # I'm a teapot - to identify custom handler
-    resp
+    return response_with_status(418)  # I'm a teapot - to identify custom handler
 
 # ============================================================================
 # router_new tests
@@ -36,8 +50,8 @@ fn handler_custom_404(req: *Request) -> Response
 
 [[test]]
 fn test_router_new_has_no_routes() -> i32
-    let r: Router = router_new()
-    # New router should have empty routes
+    var r: Router = router_new()
+    assert vec_len<Route>(@r.routes) == 0
     0
 
 # ============================================================================
@@ -51,9 +65,9 @@ fn test_router_get_matches_get_request() -> i32
     router_get(@r, @path, handler_ok)
 
     let req_path: StrView = "/"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
     0
 
 [[test]]
@@ -63,9 +77,9 @@ fn test_router_post_matches_post_request() -> i32
     router_post(@r, @path, handler_created)
 
     let req_path: StrView = "/tasks"
-    var req: Request = request_with(POST, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 201
+    var req: Request = make_request(METHOD_POST, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_CREATED
     0
 
 [[test]]
@@ -75,9 +89,9 @@ fn test_router_put_matches_put_request() -> i32
     router_put(@r, @path, handler_ok)
 
     let req_path: StrView = "/tasks/1"
-    var req: Request = request_with(PUT, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
+    var req: Request = make_request(METHOD_PUT, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
     0
 
 [[test]]
@@ -87,9 +101,21 @@ fn test_router_delete_matches_delete_request() -> i32
     router_delete(@r, @path, handler_ok)
 
     let req_path: StrView = "/tasks/1"
-    var req: Request = request_with(DELETE, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
+    var req: Request = make_request(METHOD_DELETE, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
+    0
+
+[[test]]
+fn test_router_route_with_explicit_method() -> i32
+    var r: Router = router_new()
+    let path: StrView = "/tasks"
+    router_route(@r, METHOD_POST, @path, handler_created)
+
+    let req_path: StrView = "/tasks"
+    var req: Request = make_request(METHOD_POST, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_CREATED
     0
 
 # ============================================================================
@@ -103,9 +129,9 @@ fn test_router_returns_404_for_unmatched_path() -> i32
     router_get(@r, @path, handler_ok)
 
     let req_path: StrView = "/does-not-exist"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 404
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_NOT_FOUND
     0
 
 [[test]]
@@ -115,9 +141,9 @@ fn test_router_returns_404_for_wrong_method() -> i32
     router_get(@r, @path, handler_ok)  # Only GET
 
     let req_path: StrView = "/tasks"
-    var req: Request = request_with(POST, @req_path)  # But request is POST
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 404
+    var req: Request = make_request(METHOD_POST, @req_path)  # But request is POST
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_NOT_FOUND
     0
 
 [[test]]
@@ -126,13 +152,17 @@ fn test_router_custom_not_found_handler() -> i32
     router_set_not_found(@r, handler_custom_404)
 
     let req_path: StrView = "/does-not-exist"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 418  # Our custom handler
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == 418  # Our custom handler
     0
 
 # ============================================================================
 # Path parameter tests
+#
+# router_handle does not inject matched params into the Request yet (see the
+# TODO in handle_matched_route), so request_param cannot be checked here.
+# These tests verify that parameterised patterns match.
 # ============================================================================
 
 [[test]]
@@ -142,18 +172,11 @@ fn test_router_extracts_single_param() -> i32
     router_get(@r, @pattern, handler_ok)
 
     let req_path: StrView = "/tasks/123"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
-
-    # Check that param was extracted
-    let param_name: StrView = "id"
-    match request_param(@req, @param_name)
-        Some(v) =>
-            let expected: StrView = "123"
-            assert strview_eq(@v, @expected)
-            0
-        None => 1
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
+    assert param_is(@req, c"id", c"123")
+    0
 
 [[test]]
 fn test_router_extracts_multiple_params() -> i32
@@ -162,24 +185,12 @@ fn test_router_extracts_multiple_params() -> i32
     router_get(@r, @pattern, handler_ok)
 
     let req_path: StrView = "/users/42/tasks/99"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
-
-    let user_name: StrView = "user_id"
-    match request_param(@req, @user_name)
-        Some(v) =>
-            let expected: StrView = "42"
-            assert strview_eq(@v, @expected)
-        None => return 1
-
-    let task_name: StrView = "task_id"
-    match request_param(@req, @task_name)
-        Some(v) =>
-            let expected: StrView = "99"
-            assert strview_eq(@v, @expected)
-            0
-        None => 1
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
+    assert param_is(@req, c"user_id", c"42")
+    assert param_is(@req, c"task_id", c"99")
+    0
 
 [[test]]
 fn test_router_param_with_uuid_format() -> i32
@@ -188,17 +199,11 @@ fn test_router_param_with_uuid_format() -> i32
     router_get(@r, @pattern, handler_ok)
 
     let req_path: StrView = "/tasks/550e8400-e29b-41d4-a716-446655440000"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
-
-    let param_name: StrView = "id"
-    match request_param(@req, @param_name)
-        Some(v) =>
-            let expected: StrView = "550e8400-e29b-41d4-a716-446655440000"
-            assert strview_eq(@v, @expected)
-            0
-        None => 1
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
+    assert param_is(@req, c"id", c"550e8400-e29b-41d4-a716-446655440000")
+    0
 
 # ============================================================================
 # Static vs param precedence tests
@@ -216,11 +221,12 @@ fn test_router_static_matches_before_param() -> i32
 
     # Request to /tasks/new should match static route
     let req_path: StrView = "/tasks/new"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
     # Depending on implementation, this might be 200 or 201
     # Just verify it matches something
-    assert response_status_code(@resp) == 200 or response_status_code(@resp) == 201
+    let status: i32 = response_status(@resp)
+    assert status == STATUS_OK or status == STATUS_CREATED
     0
 
 # ============================================================================
@@ -234,10 +240,10 @@ fn test_router_head_matches_get_route() -> i32
     router_get(@r, @path, handler_ok)
 
     let req_path: StrView = "/tasks"
-    var req: Request = request_with(HEAD, @req_path)
-    let resp: Response = router_handle(@r, @req)
+    var req: Request = make_request(METHOD_HEAD, @req_path)
+    var resp: Response = router_handle(@r, @req)
     # HEAD should match GET routes
-    assert response_status_code(@resp) == 200
+    assert response_status(@resp) == STATUS_OK
     0
 
 # ============================================================================
@@ -255,9 +261,9 @@ fn test_router_multiple_different_paths() -> i32
     router_get(@r, @path3, handler_ok)
 
     let req_path: StrView = "/tasks"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
     0
 
 [[test]]
@@ -268,14 +274,14 @@ fn test_router_same_path_different_methods() -> i32
     router_post(@r, @path, handler_created)
 
     let get_path: StrView = "/tasks"
-    var get_req: Request = request_with(GET, @get_path)
-    let get_resp: Response = router_handle(@r, @get_req)
-    assert response_status_code(@get_resp) == 200
+    var get_req: Request = make_request(METHOD_GET, @get_path)
+    var get_resp: Response = router_handle(@r, @get_req)
+    assert response_status(@get_resp) == STATUS_OK
 
     let post_path: StrView = "/tasks"
-    var post_req: Request = request_with(POST, @post_path)
-    let post_resp: Response = router_handle(@r, @post_req)
-    assert response_status_code(@post_resp) == 201
+    var post_req: Request = make_request(METHOD_POST, @post_path)
+    var post_resp: Response = router_handle(@r, @post_req)
+    assert response_status(@post_resp) == STATUS_CREATED
     0
 
 # ============================================================================
@@ -289,9 +295,9 @@ fn test_router_root_path() -> i32
     router_get(@r, @path, handler_ok)
 
     let req_path: StrView = "/"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    assert response_status_code(@resp) == 200
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_OK
     0
 
 [[test]]
@@ -300,11 +306,13 @@ fn test_router_trailing_slash_different() -> i32
     let path: StrView = "/tasks"
     router_get(@r, @path, handler_ok)
 
-    # Request with trailing slash should NOT match (strict matching)
+    # Strict matching would 404 a trailing slash; lenient matching would 200.
+    # Either is acceptable, but it must resolve to one of them.
     let req_path: StrView = "/tasks/"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    # This tests strict matching - may return 404 or 200 depending on impl
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    let status: i32 = response_status(@resp)
+    assert status == STATUS_OK or status == STATUS_NOT_FOUND
     0
 
 [[test]]
@@ -313,9 +321,9 @@ fn test_router_empty_param_value() -> i32
     let pattern: StrView = "/tasks/:id/comments"
     router_get(@r, @pattern, handler_ok)
 
-    # Path with missing segment should not match
+    # Path with missing segment should not match: empty segment is not a :param
     let req_path: StrView = "/tasks//comments"
-    var req: Request = request_with(GET, @req_path)
-    let resp: Response = router_handle(@r, @req)
-    # Empty segment typically doesn't match :param
+    var req: Request = make_request(METHOD_GET, @req_path)
+    var resp: Response = router_handle(@r, @req)
+    assert response_status(@resp) == STATUS_NOT_FOUND
     0

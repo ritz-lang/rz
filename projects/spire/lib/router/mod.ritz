@@ -18,13 +18,15 @@
 
 import ritzlib.option
 import ritzlib.strview { StrView, strview_from_ptr, strview_len }
-import ritzlib.string { String, string_new, string_from_strview, string_push, string_push_str, string_len }
+import ritzlib.string { String, string_new, string_from_strview, string_push, string_push_str, string_len, string_clone }
 import ritzlib.gvec { Vec, vec_new, vec_push, vec_get, vec_get_ptr, vec_len }
 
 import http.types { METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_PATCH, METHOD_DELETE, METHOD_HEAD, METHOD_OPTIONS, METHOD_TRACE, METHOD_CONNECT }
-import spire.http.request { Request }
+import ritzlib.span { Span, span_from_strview }
+import spire.http.request { Request, request_set_param }
 import spire.http.response { Response, response_not_found }
-import spire.utils { string_as_strview, strview_eq }
+import spire.utils { string_as_strview }
+import ritzlib.strview { strview_eq }
 
 # ============================================================================
 # Handler Type
@@ -43,7 +45,7 @@ pub struct Route
     method: i32
     pattern: String
     segments: Vec<Segment>
-    handler: Handler
+    handler: fn(*Request) -> Response
 
 # Segment kind enum
 pub enum SegmentKind
@@ -124,7 +126,7 @@ fn parse_segment(s: *StrView) -> Segment
 
 pub struct Router
     routes: Vec<Route>
-    not_found_handler: Option<Handler>
+    not_found_handler: Option<fn(*Request) -> Response>
 
 # Create a new router
 pub fn router_new() -> Router
@@ -134,7 +136,7 @@ pub fn router_new() -> Router
     return r
 
 # Add a route
-pub fn router_route(self:& Router, method: i32, pattern: *StrView, handler: Handler)
+pub fn router_route(self:& Router, method: i32, pattern: *StrView, handler: fn(*Request) -> Response)
     let segments: Vec<Segment> = parse_pattern(pattern)
     var route: Route
     route.method = method
@@ -144,23 +146,23 @@ pub fn router_route(self:& Router, method: i32, pattern: *StrView, handler: Hand
     vec_push<Route>(@self.routes, route)
 
 # Convenience methods for common HTTP methods
-pub fn router_get(self:& Router, pattern: *StrView, handler: Handler)
+pub fn router_get(self:& Router, pattern: *StrView, handler: fn(*Request) -> Response)
     router_route(self, METHOD_GET, pattern, handler)
 
-pub fn router_post(self:& Router, pattern: *StrView, handler: Handler)
+pub fn router_post(self:& Router, pattern: *StrView, handler: fn(*Request) -> Response)
     router_route(self, METHOD_POST, pattern, handler)
 
-pub fn router_put(self:& Router, pattern: *StrView, handler: Handler)
+pub fn router_put(self:& Router, pattern: *StrView, handler: fn(*Request) -> Response)
     router_route(self, METHOD_PUT, pattern, handler)
 
-pub fn router_patch(self:& Router, pattern: *StrView, handler: Handler)
+pub fn router_patch(self:& Router, pattern: *StrView, handler: fn(*Request) -> Response)
     router_route(self, METHOD_PATCH, pattern, handler)
 
-pub fn router_delete(self:& Router, pattern: *StrView, handler: Handler)
+pub fn router_delete(self:& Router, pattern: *StrView, handler: fn(*Request) -> Response)
     router_route(self, METHOD_DELETE, pattern, handler)
 
 # Set custom 404 handler
-pub fn router_set_not_found(self:& Router, handler: Handler)
+pub fn router_set_not_found(self:& Router, handler: fn(*Request) -> Response)
     self.not_found_handler = Some(handler)
 
 # ============================================================================
@@ -306,11 +308,6 @@ fn split_path(path: *StrView) -> Vec<StrView>
 
     return result
 
-# Helper to clone a String
-fn string_clone(s: *String) -> String
-    let sv: StrView = string_as_strview(s)
-    return string_from_strview(@sv)
-
 # Helper to create string from strview
 fn string_from_sv(sv: *StrView) -> String
     return string_from_strview(sv)
@@ -324,26 +321,57 @@ pub fn router_handle(self: *Router, request: *Request) -> Response
     let path: StrView = request_path_strview(request)
     let method: i32 = request.method
 
+    # Branch on the match and return outside it: a `match` *expression*
+    # yielding a Response (~85KB) is emitted as a by-value phi that clang -O2
+    # does not finish compiling.
+    var found: bool = false
+    var route_match: RouteMatch
     match match_route(self, method, @path)
-        Some(route_match) => handle_matched_route(self, request, @route_match)
-        None => handle_not_found(self, request)
+        Some(m) =>
+            route_match = m
+            found = true
+        None =>
+            found = false
+    if found
+        return handle_matched_route(self, request, @route_match)
+    return handle_not_found(self, request)
 
 fn handle_matched_route(router: *Router, request: *Request, route_match: *RouteMatch) -> Response
-    # TODO: Inject params into request (needs type compatibility fix)
-    # Currently params are stored in RouteMatch but not injected
+    # Inject the captured `:name` segments so handlers can read them with
+    # request_param.
+    var i: i64 = 0
+    while i < vec_len<RouteParam>(@route_match.params)
+        let rp: *RouteParam = vec_get_ptr<RouteParam>(@route_match.params, i)
+        let name_sv: StrView = string_as_strview(@rp.name)
+        let value_sv: StrView = string_as_strview(@rp.value)
+        let name: Span<u8> = span_from_strview(@name_sv)
+        let value: Span<u8> = span_from_strview(@value_sv)
+        request_set_param(request, @name, @value)
+        i += 1
 
-    # Call handler
     let route: *Route = vec_get_ptr<Route>(@router.routes, route_match.route_index)
     return (route.handler)(request)
 
 fn handle_not_found(router: *Router, request: *Request) -> Response
+    # See router_handle for why this isn't a match expression.
+    var found: bool = false
+    var handler: fn(*Request) -> Response = default_not_found
     match router.not_found_handler
-        Some(handler) => handler(request)
-        None => response_not_found()
+        Some(h) =>
+            handler = h
+            found = true
+        None =>
+            found = false
+    if found
+        return handler(request)
+    return response_not_found()
+
+fn default_not_found(request: *Request) -> Response
+    return response_not_found()
 
 # Helper to get path as strview from request
 fn request_path_strview(request: *Request) -> StrView
     var sv: StrView
-    sv.ptr = request.path.data.data
-    sv.len = request.path.data.len
+    sv.ptr = @request.path[0]
+    sv.len = request.path_len
     return sv
