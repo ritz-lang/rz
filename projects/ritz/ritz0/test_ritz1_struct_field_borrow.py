@@ -1,0 +1,312 @@
+"""Regression tests for AGAST #1598: ritz1 must parse a struct field whose type
+is a mutable borrow:
+
+    struct R
+        ch:& C
+
+ritz1 lexes `:&` as COLON AMP. `param` gained an `IDENT COLON AMP type_spec`
+alternative in #1301/#1522, but `struct_field` stayed `IDENT COLON type_spec`
+only, so the struct failed to parse and the item anchor-skip reported
+
+    cannot parse item starting at 'struct R'
+
+which is how tempest's lib/tab_renderer.ritz:22 died under ritz1. The fix adds
+the AMP form to `struct_field` and lowers it to type_mut_ref (`@&C`), the same
+type ritz0 gives it. Struct-style enum variants reuse `struct_fields` (#1543),
+so they accept the form too.
+
+Reading and writing through such a field parses now but does not yet emit in
+ritz1 (#2041). Those cases run under ritz0 and are a strict xfail under ritz1.
+
+Every program returns 3 on success. ritz0 is the oracle.
+"""
+
+import os
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from ritz0_inproc import run_ritz0
+
+RITZ_ROOT = Path(__file__).resolve().parent.parent
+# Build product, not a tracked file; see test_ritz1_ptr_arith_chain.py.
+RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
+
+
+# --- programs -----------------------------------------------------------------
+
+# The ticket's repro, verbatim.
+REPRO = """\
+struct C
+    x: i32
+struct R
+    ch:& C
+pub fn main() -> i32
+    return 3
+"""
+
+# Borrow fields mixed with plain fields before, between and after, plus a
+# generic struct and an item after them. A borrow field that swallowed the
+# following field or item would fail to compile or change the answer.
+MIXED_FIELDS = """\
+struct C
+    x: i32
+
+struct TabRenderer
+    id: i32
+    channel:& C
+    count: i32
+    other:& C
+
+struct Holder<T>
+    item:& T
+    n: i32
+
+struct After
+    v: i32
+
+pub fn main() -> i32
+    let a: After = After { v: 3 }
+    return a.v
+"""
+
+# Read and write a field through the borrow, both directly and via a pointer
+# to the outer struct: c.x goes 1 -> 2 (in bump) -> 3 (in main).
+READ_WRITE = """\
+struct C
+    x: i32
+
+struct R
+    ch:& C
+
+fn bump(r: *R)
+    r.ch.x = r.ch.x + 1
+
+pub fn main() -> i32
+    var c: C = C { x: 1 }
+    var r: R = R { ch: @&c }
+    bump(@r)
+    r.ch.x = r.ch.x + 1
+    return c.x
+"""
+
+# Read-only use: the value read through the borrow reaches the exit code.
+READ_ONLY = """\
+struct C
+    x: i32
+
+struct R
+    ch:& C
+
+fn get(r: *R) -> i32
+    return r.ch.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3 }
+    var r: R = R { ch: @&c }
+    return get(@r)
+"""
+
+PROGRAMS = {
+    "repro": REPRO,
+    "mixed_fields": MIXED_FIELDS,
+}
+
+# Field access through the borrow. ritz0 runs these. ritz1 now parses them but
+# its emitter cannot yet lower reference-typed fields (`@C`, `@&C`, `:& C`
+# alike): "struct literal field of this type is not lowered" / "unhandled
+# EXPR_MEMBER". Tracked by #2041; strict xfail until then.
+ACCESS = {
+    "read_write": READ_WRITE,
+    "read_only": READ_ONLY,
+}
+
+# The borrow field must lower to a reference (pointer-sized), not to the
+# pointee: `ch:& C` parsed as plain `C` would embed {i32, i64} inline.
+LAYOUT = """\
+struct C
+    x: i32
+    y: i64
+struct R
+    ch:& C
+fn f(r: *R) -> i32
+    return 3
+pub fn main() -> i32
+    return 3
+"""
+
+# Struct-style enum variants share `struct_fields` in ritz1 (#1543), so they
+# accept a borrow field too. Tag indices must still count the variant: Stop is
+# 1 and GoBack is 3, so the answer is 1 + 2 = 3.
+#
+# ritz0 cannot be the oracle here. Its struct-field parser takes COLON_AMP but
+# its variant-field loop takes only COLON, so it rejects this program (#2040).
+# The ritz0 side is pinned as a strict xfail that turns red once #2040 lands.
+ENUM_VARIANT = """\
+struct C
+    x: i32
+
+enum Msg
+    Attach
+        channel:& C
+    Stop
+    Bind
+        id: i32
+        ch:& C
+    GoBack
+
+fn code(m: Msg) -> i32
+    match m
+        Stop => 1
+        GoBack => 2
+        _ => 100
+
+pub fn main() -> i32
+    return code(Msg.Stop) + code(Msg.GoBack)
+"""
+
+# `ch: &C` (spaced) is NOT the borrow form. ritz0 lexes `:&` as one COLON_AMP
+# token, so `: &C` is the removed legacy `&T` reference type and gets a
+# migration diagnostic. ritz1 lexes `:&` as COLON AMP and cannot tell the two
+# apart, the same known looseness as `param` (#1301, #1522). Pinned on the
+# ritz0 side only.
+SPACED_LEGACY = """\
+struct C
+    x: i32
+struct R
+    ch: &C
+pub fn main() -> i32
+    return 3
+"""
+
+# Malformed borrow fields must still be rejected.
+MALFORMED = {
+    "borrow_missing_type": """\
+struct R
+    ch:&
+pub fn main() -> i32
+    return 3
+""",
+    "borrow_missing_colon": """\
+struct C
+    x: i32
+struct R
+    ch & C
+pub fn main() -> i32
+    return 3
+""",
+}
+
+
+def _compile(compiler: str, ritz1_bin, tmp_path: Path, name: str, program: str):
+    work = tmp_path / f"{name}_{compiler}"
+    work.mkdir()
+    src = work / "main.ritz"
+    src.write_text(program)
+    ll = work / "main.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    if compiler == "ritz0":
+        comp = run_ritz0([str(src), "-o", str(ll)], cwd=work, env=env, timeout=300)
+    else:
+        cmd = [str(ritz1_bin), str(src), "-o", str(ll)]
+        comp = subprocess.run(
+            cmd, cwd=work, env=env, capture_output=True, text=True, timeout=300
+        )
+    return comp, ll, work
+
+
+def _run(compiler: str, ritz1_bin, tmp_path: Path, name: str, program=None) -> int:
+    """Compile PROGRAMS[name] (or `program`) with `compiler`, link, run, return
+    the exit code."""
+    if program is None:
+        program = PROGRAMS[name]
+    comp, ll, work = _compile(compiler, ritz1_bin, tmp_path, name, program)
+    assert comp.returncode == 0 and ll.exists(), (
+        f"{compiler} failed to compile {name}:\n"
+        f"{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
+    )
+    exe = work / "main"
+    link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
+    if compiler == "ritz1":
+        link_cmd.insert(2, str(RITZ_START))
+    link = subprocess.run(link_cmd, cwd=work, capture_output=True, text=True)
+    assert link.returncode == 0, (
+        f"{compiler} emitted IR that would not link for {name}:\n{link.stderr[-2000:]}"
+    )
+    return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(PROGRAMS))
+def test_ritz0_is_the_oracle(tmp_path, name):
+    """The reference answer. If this changes, the oracle moved, not ritz1."""
+    assert _run("ritz0", None, tmp_path, name) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(PROGRAMS))
+def test_ritz1_struct_field_borrow(ritz1_bin, tmp_path, name):
+    """AGAST #1598. Before the fix these died with `cannot parse item`."""
+    assert _run("ritz1", ritz1_bin, tmp_path, name) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(ACCESS))
+def test_ritz0_borrow_field_access(tmp_path, name):
+    assert _run("ritz0", None, tmp_path, name, ACCESS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(
+    strict=True,
+    reason="#2041: ritz1 emitter cannot lower reference-typed struct fields",
+)
+@pytest.mark.parametrize("name", sorted(ACCESS))
+def test_ritz1_borrow_field_access(ritz1_bin, tmp_path, name):
+    assert _run("ritz1", ritz1_bin, tmp_path, name, ACCESS[name]) == 3
+
+
+@pytest.mark.integration
+def test_ritz1_borrow_field_is_a_reference(ritz1_bin, tmp_path):
+    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, "layout", LAYOUT)
+    assert comp.returncode == 0 and ll.exists(), comp.stderr[-2000:]
+    m = re.search(r"^%R = type (.*)$", ll.read_text(), re.MULTILINE)
+    assert m, "no %R type in ritz1 IR"
+    assert m.group(1).replace(" ", "") in ("{ptr}", "{i64}"), (
+        f"`ch:& C` should lower to a reference, got %R = type {m.group(1)}"
+    )
+
+
+@pytest.mark.integration
+def test_ritz1_enum_variant_borrow_field(ritz1_bin, tmp_path):
+    """Struct-style variants reuse struct_fields, so `name:& T` parses there
+    too and the variant still counts toward later tags."""
+    assert _run("ritz1", ritz1_bin, tmp_path, "enum_variant", ENUM_VARIANT) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(
+    strict=True,
+    reason="#2040: ritz0's enum variant field loop rejects `name:& T`",
+)
+def test_ritz0_enum_variant_borrow_field(tmp_path):
+    assert _run("ritz0", None, tmp_path, "enum_variant", ENUM_VARIANT) == 3
+
+
+@pytest.mark.integration
+def test_ritz0_rejects_spaced_legacy_field(tmp_path):
+    comp, _, _ = _compile("ritz0", None, tmp_path, "spaced", SPACED_LEGACY)
+    assert comp.returncode != 0
+    assert "Legacy `&T` reference syntax" in comp.stdout + comp.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(MALFORMED))
+def test_ritz1_rejects_malformed_borrow_field(ritz1_bin, tmp_path, name):
+    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MALFORMED[name])
+    assert comp.returncode != 0, (
+        f"ritz1 accepted malformed borrow field {name!r}:\n{comp.stdout[-1000:]}"
+    )
+    assert not ll.exists(), f"ritz1 wrote an artifact for malformed {name!r}"
