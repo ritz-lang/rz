@@ -32,6 +32,7 @@ SOURCES = \
 	emitter_core \
 	ll_copy_scan \
 	narrowing \
+	let_check \
 	emitter_expr_arith \
 	emitter_expr_access \
 	emitter_expr_call \

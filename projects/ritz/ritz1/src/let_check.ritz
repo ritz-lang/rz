@@ -1,0 +1,254 @@
+# let_check.ritz - `let` immutability (AGAST #2028, ritz0 #2026)
+#
+# A write (`=`, `op=`) or a mutable borrow (`@&`) whose place is a `let`'s
+# own storage is a compile error: the binding itself, a by-value field of
+# it, or an element of a by-value array in it, to any depth.  A path that
+# leaves the binding through a pointer (`let p: *T` then `p.x`, a `*T`
+# field, a slice) writes the pointee, not the binding, and stays legal.
+#
+# Mirrors ritz0's `_let_place` / `_check_let_write` / `_check_let_mut_borrow`
+# in emitter_llvmlite.py, with ritz0's exact messages; the shared case table
+# is ritz0/test_let_immutability.py (ritz0/test_ritz1_let_immutability.py
+# runs it through ritz1).
+#
+# A binding is a `let` when its LocalVar has is_let = 1 (emit_stmt copies it
+# from Stmt.var_is_let).  The lookup is by the CURRENT binding of the name,
+# so a `var`, param, loop variable or match binding that shadows a `let` is
+# mutable, as in ritz0.
+#
+# Not covered here: implicit mutable autoborrows (a `self:&` receiver, a
+# `name:&` param) -- ritz0 #2029 decides that rule first.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+
+# The type of the place reached so far along a `let`'s own storage.
+struct LetPlace
+    name: *u8            # the `let` binding's name
+    name_len: i32
+    kind: i32            # TYPE_* of the place
+    type_name: *u8       # struct name when kind == TYPE_STRUCT
+    type_name_len: i32
+    elem: i32            # element TYPE_* when kind == TYPE_ARRAY
+    elem_name: *u8       # element struct name when elem == TYPE_STRUCT
+    elem_name_len: i32
+
+# 1 and fill `out` when `name` is currently bound by a `let`.
+fn let_place_root(s: *EmitterState, name: *u8, len: i32, out: *LetPlace) -> i32
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx < 0
+        return 0
+    let loc: *LocalVar = local_at(s, idx)
+    if loc.is_let != 1
+        return 0
+    out.name = loc.name
+    out.name_len = loc.name_len
+    out.kind = loc.var_type
+    out.type_name = loc.type_name
+    out.type_name_len = loc.type_name_len
+    out.elem = loc.array_elem_type
+    # LocalVar does not record an array's element struct name.  Without it a
+    # `.f` past `a[i]` stays permissive (let_place_member answers 0).
+    out.elem_name = null
+    out.elem_name_len = 0
+    return 1
+
+# Step `out` into field `field` of a by-value struct.  0 when the place is
+# not a struct value (a pointer, say), so the field lives outside the `let`.
+fn let_place_member(s: *EmitterState, out: *LetPlace, field: *u8, field_len: i32) -> i32
+    if out.kind != TYPE_STRUCT or out.type_name_len <= 0
+        return 0
+    let st: *StructDef = find_struct(s, out.type_name, out.type_name_len)
+    if st == null
+        return 0
+    let fidx: i32 = find_field_index(st, field, field_len)
+    if fidx < 0
+        return 0
+    let fld: *StructField = get_field_type(st, fidx)
+    if fld == null
+        return 0
+    out.kind = fld.field_type
+    out.type_name = fld.field_type_name
+    out.type_name_len = fld.field_type_name_len
+    out.elem = fld.array_elem_type
+    out.elem_name = fld.array_elem_type_name
+    out.elem_name_len = fld.array_elem_type_name_len
+    return 1
+
+# Step `out` into an element of a by-value array.  0 for a pointer or slice:
+# its elements are the pointee's.
+fn let_place_index(out: *LetPlace) -> i32
+    if out.kind != TYPE_ARRAY
+        return 0
+    out.kind = out.elem
+    out.type_name = out.elem_name
+    out.type_name_len = out.elem_name_len
+    out.elem = TYPE_VOID
+    out.elem_name = null
+    out.elem_name_len = 0
+    return 1
+
+# 1 when `e` (an ident / `.f` / `[i]` chain) is a `let`'s own storage.
+fn let_place(s: *EmitterState, e: *Expr, out: *LetPlace) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_IDENT
+        return let_place_root(s, e.ident_ptr, e.ident_len, out)
+    if e.kind == EXPR_MEMBER
+        if let_place(s, e.left, out) == 0
+            return 0
+        return let_place_member(s, out, e.ident_ptr, e.ident_len)
+    if e.kind == EXPR_INDEX
+        if let_place(s, e.left, out) == 0
+            return 0
+        return let_place_index(out)
+    return 0
+
+fn let_eprint_name(name: *u8, len: i32)
+    var i: i32 = 0
+    while i < len
+        eprint_char(*(name + i))
+        i += 1
+
+# `<file>:<line>:<col>: error: <head>`<name>`<tail>`, counted.
+fn let_error(s: *EmitterState, line: i32, col: i32, head: *u8, name: *u8, len: i32, tail: *u8)
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": error: ")
+    eprints_cstr(head)
+    let_eprint_name(name, len)
+    eprints_cstr(tail)
+    s.error_count = s.error_count + 1
+
+fn let_error_assign_through(s: *EmitterState, line: i32, col: i32, pl: *LetPlace)
+    let_error(s, line, col, c"cannot assign through `let` binding `", pl.name, pl.name_len, c"`; declare it `var`\n")
+
+fn let_error_assign_whole(s: *EmitterState, line: i32, col: i32, name: *u8, len: i32)
+    let_error(s, line, col, c"cannot assign to `let` binding `", name, len, c"`; declare it `var`\n")
+
+fn let_error_borrow(s: *EmitterState, line: i32, col: i32, pl: *LetPlace)
+    let_error(s, line, col, c"cannot borrow `let` binding `", pl.name, pl.name_len, c"` as mutable; declare it `var`\n")
+
+# Reject every `@&<let place>` in `e`.  Walks only the expression kinds
+# whose children are plain sub-expressions; a match / if / struct-literal
+# expression reuses those slots for other nodes, and their statements and
+# arm bodies are checked when they are emitted (emit_stmt, emit_match_arm_body).
+pub fn let_check_expr(s: *EmitterState, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_UNARY
+        if e.op == OP_ADDR_MUT
+            var pl: LetPlace
+            if let_place(s, e.operand, @pl) == 1
+                let_error_borrow(s, e.span.line, e.span.col, @pl)
+        let_check_expr(s, e.operand)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        let_check_expr(s, e.left)
+        let_check_expr(s, e.right)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY
+        let_check_expr(s, e.left)
+    else if k == EXPR_CALL or k == EXPR_METHOD
+        if k == EXPR_METHOD
+            let_check_expr(s, e.left)
+        var a: *Expr = e.args
+        while a != null
+            let_check_expr(s, a)
+            a = a.next
+
+# The write target of an assignment-kind statement, if it is a `let` place.
+fn let_check_write(s: *EmitterState, stmt: *Stmt)
+    let line: i32 = stmt.span.line
+    let col: i32 = stmt.span.col
+    var pl: LetPlace
+    let k: i32 = stmt.kind
+    if k == STMT_ASSIGN
+        if stmt.assign_target_len > 0
+            # `x = v` / `x op= v`: the whole binding.
+            if let_place_root(s, stmt.assign_target, stmt.assign_target_len, @pl) == 1
+                let_error_assign_whole(s, line, col, pl.name, pl.name_len)
+            return
+        # `expr = v`; the target expr is in if_cond.  `*p = v` (EXPR_UNARY)
+        # writes the pointee and never matches.
+        let target: *Expr = stmt.if_cond as *Expr
+        if target == null
+            return
+        if target.kind == EXPR_IDENT
+            if let_place_root(s, target.ident_ptr, target.ident_len, @pl) == 1
+                let_error_assign_whole(s, line, col, pl.name, pl.name_len)
+            return
+        if target.kind == EXPR_MEMBER or target.kind == EXPR_INDEX
+            if let_place(s, target, @pl) == 1
+                let_error_assign_through(s, line, col, @pl)
+        return
+    if k == STMT_INDEX_ASSIGN
+        # `name[i] = v`
+        if let_place_root(s, stmt.assign_target, stmt.assign_target_len, @pl) == 1
+            if let_place_index(@pl) == 1
+                let_error_assign_through(s, line, col, @pl)
+        return
+    if k == STMT_LOCAL_FIELD_ASSIGN
+        # `name.f = v`
+        if let_place_root(s, stmt.var_name, stmt.var_name_len, @pl) == 1
+            if let_place_member(s, @pl, stmt.assign_target, stmt.assign_target_len) == 1
+                let_error_assign_through(s, line, col, @pl)
+        return
+    if k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        # `name.f[i] = v`
+        if let_place_root(s, stmt.var_name, stmt.var_name_len, @pl) == 1
+            if let_place_member(s, @pl, stmt.assign_target, stmt.assign_target_len) == 1
+                if let_place_index(@pl) == 1
+                    let_error_assign_through(s, line, col, @pl)
+        return
+    # STMT_MEMBER_ASSIGN / STMT_MEMBER_INDEX_ASSIGN are `(*p).f = v`: through
+    # a pointer, always legal.
+
+# Check one statement before it is emitted: its own write target, and every
+# `@&` in the expressions it evaluates.  Nested statement lists (if / while /
+# for bodies, match arms) are checked as emit_stmt reaches them, when the
+# bindings in scope are the ones that statement sees.
+pub fn let_check_stmt(s: *EmitterState, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        let_check_expr(s, stmt.var_init)
+        return
+    if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        let_check_write(s, stmt)
+        let_check_expr(s, stmt.assign_value)
+        if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+            let_check_expr(s, stmt.while_cond)
+        return
+    if k == STMT_RETURN
+        let_check_expr(s, stmt.return_value)
+    else if k == STMT_EXPR
+        let_check_expr(s, stmt.expr)
+    else if k == STMT_IF or k == STMT_ASSERT
+        let_check_expr(s, stmt.if_cond)
+    else if k == STMT_WHILE
+        let_check_expr(s, stmt.while_cond)
+    else if k == STMT_FOR
+        let_check_expr(s, stmt.for_start)
+        let_check_expr(s, stmt.for_end)
+
+# After emit_var_decl: mark the binding it registered as a `let`.  `before`
+# is s.local_count before the decl, so a decl that registered nothing never
+# marks an outer binding of the same name.
+pub fn let_mark_decl(s: *EmitterState, stmt: *Stmt, before: i32)
+    if stmt.var_is_let != 1
+        return
+    let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
+    if idx < before
+        return
+    let loc: *LocalVar = local_at(s, idx)
+    loc.is_let = 1
