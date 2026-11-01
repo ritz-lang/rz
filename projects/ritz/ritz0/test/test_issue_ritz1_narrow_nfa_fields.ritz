@@ -1,0 +1,361 @@
+# Regression tests for AGAST #1949: six structs in ritz1's own NFA lexer
+# (nfa.ritz NFAState / Transition / NFA / NFAFragment, regex.ritz
+# RegexParser, lexer_nfa.ritz TokenPattern) widened every non-pointer field to
+# i64 "to ensure 8-byte alignment for ritz1 self-hosting".  #1814 made ritz1's
+# struct layout and sizeof follow natural alignment, as ritz0's does, so the
+# workaround should be stale.
+#
+# Each struct below is the NARROWED shape now in ritz1/src, under the same
+# name, used the way ritz1/src uses it: arrays strided by sizeof, pointer +
+# i32 index, i32 <-> i64 widening at the field, by-value struct return and
+# parameters, and a struct nested in a struct.  The matrix runs every fn on
+# ritz0, ritz1 and ritz1_selfhosted, so all three must agree on the layout,
+# not just on the values.  A last group repeats the exercise with u8 and bool
+# fields, whose padding is where a layout bug would show first.
+#
+# Offsets are checked as `@s.field - @s` byte distances.  Everything is
+# checked at runtime; a wrong layout compiles and gives a wrong answer.
+
+# --- the shapes ritz1/src now uses -------------------------------------------
+
+struct NFAState
+    id: i32
+    is_accept: i32
+    token_type: i32
+
+struct Transition
+    kind: i32
+    char_lo: i32
+    char_hi: i32
+    from_state: i32
+    to_state: i32
+
+struct NFA
+    states: *NFAState
+    state_count: i32
+    transitions: *Transition
+    trans_count: i32
+    start_state: i32
+    state_trans_offset: *i32
+    state_trans_count: *i32
+    trans_indices: *i32
+    max_states: i32
+    max_trans: i32
+
+struct NFAFragment
+    start: i32
+    end: i32
+
+struct RegexParser
+    src: *u8
+    pos: i32
+    len: i32
+    nfa: *NFA
+
+struct TokenPattern
+    token_type: i32
+    priority: i32
+    frag: NFAFragment
+
+fn off(base: *u8, field: *u8) -> i64
+    (field as i64) - (base as i64)
+
+# --- sizeof and field offsets ------------------------------------------------
+
+[[test]]
+fn test_narrow_nfa_sizeof() -> i32
+    assert sizeof(NFAState) == 12
+    assert sizeof(Transition) == 20
+    # ptr@0 i32@8 pad ptr@16 i32@24 i32@28 ptr@32 ptr@40 ptr@48 i32@56 i32@60
+    assert sizeof(NFA) == 64
+    assert sizeof(NFAFragment) == 8
+    # ptr@0 i32@8 i32@12 ptr@16
+    assert sizeof(RegexParser) == 24
+    # i32@0 i32@4 {i32, i32}@8
+    assert sizeof(TokenPattern) == 16
+    0
+
+[[test]]
+fn test_narrow_nfa_field_offsets() -> i32
+    var s: NFAState
+    let sb: *u8 = @s as *u8
+    assert off(sb, @s.id as *u8) == 0
+    assert off(sb, @s.is_accept as *u8) == 4
+    assert off(sb, @s.token_type as *u8) == 8
+
+    var t: Transition
+    let tb: *u8 = @t as *u8
+    assert off(tb, @t.kind as *u8) == 0
+    assert off(tb, @t.char_hi as *u8) == 8
+    assert off(tb, @t.to_state as *u8) == 16
+
+    var n: NFA
+    let nb: *u8 = @n as *u8
+    assert off(nb, @n.state_count as *u8) == 8
+    assert off(nb, @n.transitions as *u8) == 16
+    assert off(nb, @n.trans_count as *u8) == 24
+    assert off(nb, @n.start_state as *u8) == 28
+    assert off(nb, @n.state_trans_offset as *u8) == 32
+    assert off(nb, @n.trans_indices as *u8) == 48
+    assert off(nb, @n.max_states as *u8) == 56
+    assert off(nb, @n.max_trans as *u8) == 60
+
+    var p: RegexParser
+    let pb: *u8 = @p as *u8
+    assert off(pb, @p.pos as *u8) == 8
+    assert off(pb, @p.len as *u8) == 12
+    assert off(pb, @p.nfa as *u8) == 16
+
+    var tp: TokenPattern
+    let tpb: *u8 = @tp as *u8
+    assert off(tpb, @tp.priority as *u8) == 4
+    assert off(tpb, @tp.frag as *u8) == 8
+    assert off(tpb, @tp.frag.end as *u8) == 12
+    0
+
+# --- the code shapes of nfa.ritz ---------------------------------------------
+
+# nfa_add_state: an i32 count read back as an index, pointer + i32 stride
+fn add_state(nfa: *NFA, is_accept: i32, token_type: i32) -> i32
+    if nfa.state_count >= nfa.max_states
+        return -1
+    let id: i32 = nfa.state_count
+    let state_ptr: *NFAState = nfa.states + id
+    state_ptr.id = id
+    state_ptr.is_accept = is_accept
+    state_ptr.token_type = token_type
+    nfa.state_count = id + 1
+    id
+
+# nfa_add_*_trans
+fn add_trans(nfa: *NFA, kind: i32, from: i32, to: i32, lo: i32, hi: i32) -> i32
+    if nfa.trans_count >= nfa.max_trans
+        return -1
+    let idx: i32 = nfa.trans_count
+    let trans_ptr: *Transition = nfa.transitions + idx
+    trans_ptr.kind = kind
+    trans_ptr.char_lo = lo
+    trans_ptr.char_hi = hi
+    trans_ptr.from_state = from
+    trans_ptr.to_state = to
+    nfa.trans_count = idx + 1
+    idx
+
+# thompson_char: a by-value {i32, i32} return from a struct literal
+fn frag_char(nfa: *NFA, ch: i32) -> NFAFragment
+    let s0: i32 = add_state(nfa, 0, 0)
+    let s1: i32 = add_state(nfa, 0, 0)
+    add_trans(nfa, 0, s0, s1, ch, ch)
+    NFAFragment { start: s0, end: s1 }
+
+# thompson_concat: by-value {i32, i32} params and return
+fn frag_concat(nfa: *NFA, a: NFAFragment, b: NFAFragment) -> NFAFragment
+    add_trans(nfa, 2, a.end, b.start, 0, 0)
+    NFAFragment { start: a.start, end: b.end }
+
+# thompson_accept: pointer + a field of a by-value param
+fn frag_accept(nfa: *NFA, frag: NFAFragment, token_type: i32) -> i32
+    let end_state: *NFAState = nfa.states + frag.end
+    end_state.is_accept = 1
+    end_state.token_type = token_type
+    nfa.start_state = frag.start
+    0
+
+fn nfa_setup(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i32, stc: *i32, ti: *i32, max_states: i32, max_trans: i32) -> i32
+    nfa.states = states
+    nfa.state_count = 0
+    nfa.transitions = trans
+    nfa.trans_count = 0
+    nfa.start_state = 0
+    nfa.state_trans_offset = sto
+    nfa.state_trans_count = stc
+    nfa.trans_indices = ti
+    nfa.max_states = max_states
+    nfa.max_trans = max_trans
+    0
+
+[[test]]
+fn test_narrow_nfa_build() -> i32
+    var nfa: NFA
+    var states: [8]NFAState
+    var trans: [8]Transition
+    var sto: [8]i32
+    var stc: [8]i32
+    var ti: [8]i32
+    # max_states 6 / max_trans 6: slots 6 and 7 are canaries
+    nfa_setup(@nfa, @states[0], @trans[0], @sto[0], @stc[0], @ti[0], 6, 6)
+    states[6].id = 777
+    states[6].is_accept = 778
+    trans[6].kind = 779
+    trans[6].from_state = 780
+
+    let a: NFAFragment = frag_char(@nfa, 97)
+    let b: NFAFragment = frag_char(@nfa, 98)
+    let ab: NFAFragment = frag_concat(@nfa, a, b)
+    frag_accept(@nfa, ab, 42)
+
+    assert nfa.state_count == 4
+    assert nfa.trans_count == 3
+    assert nfa.start_state == 0
+    assert ab.start == 0
+    assert ab.end == 3
+    assert states[3].is_accept == 1
+    assert states[3].token_type == 42
+    assert states[2].is_accept == 0
+    assert states[1].id == 1
+    assert trans[0].char_lo == 97
+    assert trans[1].char_hi == 98
+    assert trans[1].from_state == 2
+    assert trans[2].kind == 2
+    assert trans[2].from_state == 1
+    assert trans[2].to_state == 2
+
+    # the array stride is sizeof, not 24 / 40 bytes
+    assert off(@states[0] as *u8, @states[1] as *u8) == 12
+    assert off(@trans[0] as *u8, @trans[1] as *u8) == 20
+    let s2: *NFAState = nfa.states + 2
+    assert s2.id == 2
+    let t1: *Transition = nfa.transitions + 1
+    assert t1.char_lo == 98
+
+    # fill to capacity: the canaries past it are untouched
+    assert add_state(@nfa, 0, 0) == 4
+    assert add_state(@nfa, 1, 9) == 5
+    assert add_state(@nfa, 0, 0) == -1
+    assert states[5].token_type == 9
+    assert states[6].id == 777
+    assert states[6].is_accept == 778
+    0
+
+[[test]]
+fn test_narrow_nfa_count_widening() -> i32
+    var nfa: NFA
+    nfa.state_count = 2147483647
+    nfa.trans_count = -1
+    nfa.max_states = 5
+    nfa.max_trans = 6
+    # nfa_finalize: `let nstates: i64 = nfa.state_count`
+    let nstates: i64 = nfa.state_count as i64
+    let ntrans: i64 = nfa.trans_count as i64
+    assert nstates == 2147483647
+    assert ntrans == -1
+    # neighbours of the narrowed fields are not clobbered
+    assert nfa.max_states == 5
+    assert nfa.max_trans == 6
+    nfa.start_state = 3
+    assert nfa.trans_count == -1
+    assert nfa.max_states == 5
+    0
+
+# --- the code shapes of regex.ritz -------------------------------------------
+
+fn rx_peek(p: *RegexParser) -> i32
+    if p.pos >= p.len
+        -1
+    else
+        (*(p.src + p.pos)) & 255
+
+fn rx_advance(p: *RegexParser) -> i32
+    let ch: i32 = rx_peek(p)
+    if ch >= 0
+        p.pos = p.pos + 1
+    ch
+
+[[test]]
+fn test_narrow_regex_parser() -> i32
+    var nfa: NFA
+    nfa.state_count = 11
+    var buf: [4]u8 = [120, 200, 122, 0]
+    var p: RegexParser = RegexParser { src: @buf[0], pos: 0, len: 3, nfa: @nfa }
+    assert rx_advance(@p) == 120
+    assert rx_advance(@p) == 200
+    assert p.pos == 2
+    assert rx_advance(@p) == 122
+    assert rx_advance(@p) == -1
+    assert p.pos == 3
+    assert p.len == 3
+    # the pointer after the two i32s is intact
+    assert p.nfa.state_count == 11
+    0
+
+# --- the code shapes of lexer_nfa.ritz ---------------------------------------
+
+[[test]]
+fn test_narrow_token_pattern() -> i32
+    var patterns: [4]TokenPattern
+    let base: *TokenPattern = @patterns[0]
+    var i: i32 = 0
+    while i < 4
+        let pat: *TokenPattern = base + i
+        pat.token_type = 100 + i
+        pat.priority = i
+        pat.frag = NFAFragment { start: 10 * i, end: 10 * i + 1 }
+        i = i + 1
+    assert off(@patterns[0] as *u8, @patterns[1] as *u8) == 16
+    assert patterns[2].token_type == 102
+    assert patterns[2].priority == 2
+    assert patterns[2].frag.start == 20
+    assert patterns[2].frag.end == 21
+    assert patterns[3].frag.end == 31
+    let f: NFAFragment = patterns[1].frag
+    assert f.start == 10
+    assert f.end == 11
+    0
+
+# --- u8 / bool fields: padding between narrow and wide -----------------------
+
+struct NarrowState
+    is_accept: bool
+    id: i32
+    kind: u8
+    token_type: i32
+
+struct NarrowFrag
+    flag: bool
+    end: i32
+
+fn narrow_make(e: i32) -> NarrowFrag
+    NarrowFrag { flag: true, end: e }
+
+[[test]]
+fn test_narrow_u8_bool_fields() -> i32
+    assert sizeof(NarrowState) == 16
+    assert sizeof(NarrowFrag) == 8
+    var arr: [3]NarrowState
+    var i: i32 = 0
+    while i < 3
+        let s: *NarrowState = @arr[0] + i
+        s.is_accept = i == 1
+        s.id = 1000 + i
+        s.kind = (200 + i) as u8
+        s.token_type = -i
+        i = i + 1
+    let sb: *u8 = @arr[0] as *u8
+    assert off(sb, @arr[0].id as *u8) == 4
+    assert off(sb, @arr[0].kind as *u8) == 8
+    assert off(sb, @arr[0].token_type as *u8) == 12
+    assert off(sb, @arr[1] as *u8) == 16
+    assert arr[0].is_accept == false
+    assert arr[1].is_accept == true
+    assert arr[2].is_accept == false
+    assert arr[1].id == 1001
+    assert arr[2].token_type == -2
+    # through a pointer: `arr[2].kind` directly is the next test
+    let s2: *NarrowState = @arr[0] + 2
+    assert s2.kind == 202
+    assert arr[0].token_type == 0
+    let f: NarrowFrag = narrow_make(7)
+    assert f.flag == true
+    assert f.end == 7
+    0
+
+# `arr[i].f` on an unsigned field.  ritz1 and ritz1_selfhosted are right;
+# ritz0 sign-extends the extracted field (202 reads back as -54), for u8, u16
+# and u32 alike (AGAST #2036, listed in run_regression_matrix.py).  No
+# ritz1/src struct uses an unsigned field, so this does not gate #1949.
+[[test]]
+fn test_narrow_array_unsigned_field() -> i32
+    var arr: [3]NarrowState
+    arr[2].kind = 202
+    assert arr[2].kind == 202
+    0

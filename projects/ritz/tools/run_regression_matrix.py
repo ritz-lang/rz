@@ -56,6 +56,9 @@ EXPECTED_FAILURES = {
     ("ritz1_selfhosted", "test_issue_float_coercion"):
         "AGAST #1370 — same gap, listed separately on purpose: an excuse for "
         "ritz1 must not cover its self-compiled twin.",
+    ("ritz0", "test_issue_ritz1_narrow_nfa_fields::test_narrow_array_unsigned_field"):
+        "AGAST #2036 — ritz0 sign-extends an unsigned field read as `a[i].f` "
+        "(extractvalue + sext); ritz1 and ritz1_selfhosted are correct.",
 }
 
 # AGAST #1371 — what the matrix found once it ran every [[test]] fn of every

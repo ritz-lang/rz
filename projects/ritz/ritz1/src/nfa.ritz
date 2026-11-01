@@ -22,22 +22,21 @@ const TR_ANY: i32 = 3       # Match any character (.)
 # MAX_STATES = 256 and MAX_TRANS = 512, used to sit here, referenced nowhere
 # and disagreeing with the real 4096/8192 storage (#1433).
 
-# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
+# Fields are i32: ritz1 lays structs out at natural alignment, as ritz0 does
+# (#1814), so the six i64-widened structs of this lexer are narrowed (#1949;
+# test_issue_ritz1_narrow_nfa_fields.ritz pins every layout below).
 struct NFAState
-  id: i64
-  is_accept: i64
-  token_type: i64    # Token type if accepting state
+  id: i32
+  is_accept: i32
+  token_type: i32    # Token type if accepting state
 
-# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
 struct Transition
-  kind: i64
-  char_lo: i64       # Character or range start
-  char_hi: i64       # Range end (inclusive)
-  from_state: i64
-  to_state: i64
+  kind: i32
+  char_lo: i32       # Character or range start
+  char_hi: i32       # Range end (inclusive)
+  from_state: i32
+  to_state: i32
 
-# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
-#
 # Tier 1 NFA optimization (state-indexed transition table):
 # nfa_finalize() builds a per-state lookup so lexer_match_from no longer
 # scans all transitions for each step (was 98.79% of compile time).
@@ -47,21 +46,21 @@ struct Transition
 #   trans_indices    [k] = original transitions[] index, grouped by from_state
 struct NFA
   states: *NFAState
-  state_count: i64
+  state_count: i32
   transitions: *Transition
-  trans_count: i64
-  start_state: i64
+  trans_count: i32
+  start_state: i32
   state_trans_offset: *i32
   state_trans_count: *i32
   trans_indices: *i32
-  max_states: i64
-  max_trans: i64
+  max_states: i32
+  max_trans: i32
 
 # Initialize an NFA with pre-allocated storage.
 #
 # max_states sizes `states`, `sto` and `stc`; max_trans sizes `trans` and `ti`.
-# They are i32 on purpose: every nfa_add_* keeps its count below its capacity,
-# so count <= 2^31-1 and narrowing a count to an i32 ID is lossless (#1436).
+# They are i32, as are the counts: every nfa_add_* keeps its count below its
+# capacity, so a count is always a valid i32 ID (#1436).
 fn nfa_init(nfa: *NFA, states: *NFAState, trans: *Transition, sto: *i32, stc: *i32, ti: *i32, max_states: i32, max_trans: i32) -> i32
   nfa.states = states
   nfa.state_count = 0
@@ -96,15 +95,13 @@ fn nfa_capacity_exceeded(what: *u8) -> i32
 fn nfa_next_trans(nfa: *NFA) -> i32
   if nfa.trans_count >= nfa.max_trans
     nfa_capacity_exceeded(c"transition")
-  # Lossless: trans_count < max_trans, which is an i32.
-  nfa.trans_count as i32
+  nfa.trans_count
 
 # Add a new state, returns state ID
 fn nfa_add_state(nfa: *NFA, is_accept: i32, token_type: i32) -> i32
   if nfa.state_count >= nfa.max_states
     nfa_capacity_exceeded(c"state")
-  # Lossless: state_count < max_states, which is an i32.
-  let id: i32 = nfa.state_count as i32
+  let id: i32 = nfa.state_count
   let state_ptr: *NFAState = nfa.states + id
   state_ptr.id = id
   state_ptr.is_accept = is_accept
@@ -193,8 +190,8 @@ fn nfa_finalize(nfa: *NFA) -> i32
   let count_arr: *i32 = nfa.state_trans_count
   let offset_arr: *i32 = nfa.state_trans_offset
   let indices_arr: *i32 = nfa.trans_indices
-  let nstates: i64 = nfa.state_count
-  let ntrans: i64 = nfa.trans_count
+  let nstates: i64 = nfa.state_count as i64
+  let ntrans: i64 = nfa.trans_count as i64
 
   # Phase 1: zero the count array
   var i: i64 = 0
@@ -206,7 +203,7 @@ fn nfa_finalize(nfa: *NFA) -> i32
   var t: i64 = 0
   while t < ntrans
     let trans_ptr: *Transition = nfa.transitions + t
-    let from: i64 = trans_ptr.from_state
+    let from: i64 = trans_ptr.from_state as i64
     let cur: i32 = *(count_arr + from)
     *(count_arr + from) = cur + 1
     t = t + 1
@@ -229,7 +226,7 @@ fn nfa_finalize(nfa: *NFA) -> i32
   var t2: i64 = 0
   while t2 < ntrans
     let tp2: *Transition = nfa.transitions + t2
-    let from2: i64 = tp2.from_state
+    let from2: i64 = tp2.from_state as i64
     let base_off: i64 = *(offset_arr + from2) as i64
     let cur_count: i32 = *(count_arr + from2)
     # Lossless: t2 < trans_count <= max_trans, an i32 (#1436).
@@ -261,7 +258,7 @@ fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
       let i: i64 = *(nfa.trans_indices + off + k) as i64
       let trans_ptr: *Transition = nfa.transitions + i
       if trans_ptr.kind == TR_EPSILON
-        if nfa_accepts_from(nfa, trans_ptr.to_state as i32, src, pos, len) == 1
+        if nfa_accepts_from(nfa, trans_ptr.to_state, src, pos, len) == 1
           return 1
       k = k + 1
     return 0
@@ -275,7 +272,7 @@ fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
     let i1: i64 = *(nfa.trans_indices + off + k1) as i64
     let trans_ptr1: *Transition = nfa.transitions + i1
     if trans_ptr1.kind == TR_EPSILON
-      if nfa_accepts_from(nfa, trans_ptr1.to_state as i32, src, pos, len) == 1
+      if nfa_accepts_from(nfa, trans_ptr1.to_state, src, pos, len) == 1
         return 1
     k1 = k1 + 1
 
@@ -285,7 +282,7 @@ fn nfa_accepts_from(nfa: *NFA, state: i32, src: *u8, pos: i32, len: i32) -> i32
     let i2: i64 = *(nfa.trans_indices + off + k2) as i64
     let trans_ptr2: *Transition = nfa.transitions + i2
     if trans_matches(trans_ptr2, ch) == 1
-      if nfa_accepts_from(nfa, trans_ptr2.to_state as i32, src, pos + 1, len) == 1
+      if nfa_accepts_from(nfa, trans_ptr2.to_state, src, pos + 1, len) == 1
         return 1
     k2 = k2 + 1
 
@@ -301,10 +298,9 @@ fn nfa_accepts(nfa: *NFA, src: *u8, len: i32) -> i32
 # Build NFA fragments from regex patterns programmatically.
 # Each fragment has a start state and end state.
 
-# NOTE: Using i64 for all non-pointer fields to ensure 8-byte alignment for ritz1 self-hosting
 struct NFAFragment
-  start: i64
-  end: i64
+  start: i32
+  end: i32
 
 # Build NFA for a single character
 fn thompson_char(nfa: *NFA, ch: i32) -> NFAFragment

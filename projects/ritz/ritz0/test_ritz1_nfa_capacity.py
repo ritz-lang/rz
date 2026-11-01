@@ -17,6 +17,7 @@ not range, so widening the IDs would buy nothing. The narrowing is lossless
 exactly when the count is bounded — which is what this test enforces. With
 `nfa_init` taking i32 capacities, count < capacity <= 2^31-1, so the explicit
 `as i32` at those sites is lossless by construction rather than by hope.
+(#1949 later narrowed the counts themselves to i32, so the casts are gone.)
 
 HOW
 
