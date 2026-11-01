@@ -22,8 +22,7 @@ from test_ritz1_builtin_struct_shadow import _run
 # stride or load reads something else.
 CASES = [
     ("u8", "[1, 2, 3, 4, 5]", "3", "4"),
-    # Positive: a negative i8 local reloads zext'd (AGAST #2021, separate).
-    ("i8", "[1, 2, 3, 100, 5]", "3", "100"),
+    ("i8", "[1, 2, -3, 100, 5]", "-3", "100"),
     ("u16", "[1, 2, 300, 400, 5]", "300", "400"),
     ("i16", "[1, 2, -300, 400, 5]", "-300", "400"),
     ("u32", "[1, 2, 70000, 80000, 5]", "70000", "80000"),
