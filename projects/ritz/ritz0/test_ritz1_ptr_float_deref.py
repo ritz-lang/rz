@@ -15,6 +15,10 @@ THE TESTS
     ritz1_selfhosted (ritz0 already lowers float derefs).
   * IR shape: ritz1 loads `float` / `double` for the deref, never i64.
 
+AGAST #2034: `*(g + i)` on a module-level `*T` global strided by one
+byte for a float pointee (ptr_arith_elem_size's global arm knew only the
+integer widths).  GLOBAL_PROG pins the stride for every pointee width.
+
 The ritz0/test/test_issue_ptr_float_deref.ritz repro runs the same cases
 through the regression matrix.
 """
@@ -70,7 +74,9 @@ pub fn main() -> i32
     g = p
     if *g != x0
         return 8
-    # `*(g + 1)` omitted: a global *T strides by i8 (AGAST #2034).
+    # AGAST #2034: a global *T strides by sizeof(T), not one byte.
+    if *(g + 1) != x1
+        return 9
     *p = 0.5
     let half: {t} = 0.5
     if *p != half
@@ -79,6 +85,34 @@ pub fn main() -> i32
         return 11
     return 42
 """
+
+# AGAST #2034: `g + i` on a global `*T` strides by sizeof(T), for a plain
+# add and a left-associated chain.
+GLOBAL_PROG = """\
+var g: *{t} = null
+
+pub fn main() -> i32
+    var a: [3]{t} = [{v0}, {v1}, {v2}]
+    g = @a as *{t}
+    let w1: {t} = {v1}
+    let w2: {t} = {v2}
+    if *(g + 1) != w1
+        return 1
+    if *(g + 2) != w2
+        return 2
+    if *(g + 2 - 1) != w1
+        return 3
+    return 42
+"""
+
+GLOBAL_VALUES = {
+    "i8": ("7", "-3", "9"),
+    "u16": ("7", "300", "9"),
+    "i32": ("7", "70000", "9"),
+    "u64": ("7", "70000", "9"),
+    "f32": ("3.5", "-1.25", "6.0"),
+    "f64": ("3.5", "-1.25", "6.0"),
+}
 
 # The ticket's repro, verbatim.
 REPRO = """\
@@ -144,6 +178,15 @@ def binaries(ritz1_bin):
 def test_ptr_float_deref_runs(binaries, tmp_path, compiler, t):
     prog = PROG.format(t=t)
     assert _run(compiler, binaries[compiler], tmp_path, f"pfd_{t}", prog) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("t", sorted(GLOBAL_VALUES))
+def test_global_ptr_add_strides_by_pointee(binaries, tmp_path, compiler, t):
+    v0, v1, v2 = GLOBAL_VALUES[t]
+    prog = GLOBAL_PROG.format(t=t, v0=v0, v1=v1, v2=v2)
+    assert _run(compiler, binaries[compiler], tmp_path, f"gstride_{t}", prog) == 42
 
 
 @pytest.mark.integration
