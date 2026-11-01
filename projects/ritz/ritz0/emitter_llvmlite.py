@@ -3380,11 +3380,21 @@ class LLVMEmitter:
         return slot is not None and self.locals.get(name, (None, None))[0] is slot
 
     def _check_let_write(self, target: rast.Expr) -> None:
-        """AGAST #2026: reject a field/element write into a `let`'s storage.
+        """AGAST #2026/#2031: reject a write into a `let`'s storage.
 
-        A whole-binding `x = v` is handled where it is emitted (#2025/#1317).
+        Called by both AssignStmt (incl. `op=`) and AssignExpr (match arms).
+        A whole-binding `x = v` is checked here for every `let`, by identity
+        via _let_place: a small `let` is an SSA value in self.params (before
+        #2031 it fell through to an uncaught "Unknown variable" ValueError),
+        a large one a #2025 slot in self.locals (which AssignExpr silently
+        stored into).
         """
-        if isinstance(target, (rast.Field, rast.Index)):
+        if isinstance(target, rast.Ident):
+            if self._let_place(target) is not None:
+                raise EmitError(
+                    f"cannot assign to `let` binding `{target.name}`; declare it `var`",
+                    target.span)
+        elif isinstance(target, (rast.Field, rast.Index)):
             place = self._let_place(target)
             if place is not None:
                 raise EmitError(
@@ -4853,10 +4863,8 @@ class LLVMEmitter:
                 val = self._emit_expr(stmt.value)
             if isinstance(stmt.target, rast.Ident):
                 name = stmt.target.name
-                if self._is_let_slot(name):
-                    # AGAST #2025: a large `let` has a slot, but is no `var`.
-                    raise ValueError(
-                        f"cannot assign to `let` binding `{name}`; declare it `var`")
+                # A `let` (#2025 slot or SSA value) was rejected by
+                # _check_let_write above (AGAST #2031).
                 if name in self.locals:
                     alloca, ty = self.locals[name]
                     val = self._convert_type(val, ty)

@@ -467,10 +467,10 @@ let x: i32 = 42       # Explicit type
 let y = 100           # Type inferred (i64)
 ```
 
-Immutable bindings cannot be reassigned. The current diagnostic is terse — a
-`let` binding is simply not registered as an assignable variable:
+Immutable bindings cannot be reassigned, whole or with a compound operator
+(`x += 1`):
 
-```ritz body expect-error="Unknown variable: x"
+```ritz body expect-error="cannot assign to `let` binding `x`; declare it `var`"
 let x = 42
 x = 43
 ```

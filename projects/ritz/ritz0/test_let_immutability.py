@@ -135,3 +135,57 @@ ACCEPTED = [
 def test_non_let_mutation_is_accepted(tmp_path, body):
     r, out = _compile(tmp_path, _indent(body))
     assert r.returncode == 0, f"rejected:\n{body}\n{out[-2000:]}"
+
+
+# AGAST #2031: whole-binding `x = v` / `x op= v` on any `let`. A small `let`
+# is an SSA value in self.params, so before #2031 it fell through to an
+# uncaught `ValueError: Unknown variable: x` traceback; only a #2025
+# large-struct slot got the `let` diagnostic, and that one had no span.
+WHOLE_REJECTED = [
+    ("whole-scalar", "let k: i64 = 4\nk = 5", "k"),
+    ("whole-scalar-inferred", "let k = 4\nk = 5", "k"),
+    ("whole-scalar-compound", "let k: i64 = 4\nk += 1", "k"),
+    ("whole-scalar-in-loop", "let k: i64 = 4\nvar i = 0\nwhile i < 3\n    k = i\n    i += 1", "k"),
+    ("whole-small-struct", "let p = Pt { x: 1, y: 2 }\np = Pt { x: 3, y: 4 }", "p"),
+    ("whole-large-struct", "let b: Big = big_new()\nb = big_new()", "b"),
+    # A `let` that shadows a `var` is immutable from there on.
+    ("whole-let-shadows-var", "var k: i64 = 1\nlet k: i64 = 2\nk = 3", "k"),
+    # A match-arm assignment is an AssignExpr, not an AssignStmt.
+    ("whole-scalar-match-arm",
+     "let k: i64 = 4\nlet o: Option<i64> = Some(3)\n"
+     "match o\n    Some(v) => k = v\n    None => k = 0", "k"),
+    ("whole-large-match-arm",
+     "let b: Big = big_new()\nlet o: Option<i64> = Some(3)\n"
+     "match o\n    Some(v) => b = big_new()\n    None => b = big_new()", "b"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("body,name", [r[1:] for r in WHOLE_REJECTED],
+                         ids=[r[0] for r in WHOLE_REJECTED])
+def test_assigning_a_let_is_rejected(tmp_path, body, name):
+    r, out = _compile(tmp_path, _indent(body))
+    assert r.returncode != 0, f"assigning `let {name}` compiled:\n{body}"
+    assert f"cannot assign to `let` binding `{name}`; declare it `var`" in out, out[-2000:]
+    assert "Traceback" not in out, out[-3000:]
+    assert "Unknown variable" not in out, out[-2000:]
+    # Located at the assignment, not just named (prelude + `fn main` line).
+    assert "prog.ritz:" in out, out[-2000:]
+
+
+WHOLE_ACCEPTED = [
+    ("whole-var-scalar", "var k: i64 = 4\nk = 5\nk += 1"),
+    ("whole-var-shadows-let", "let k: i64 = 4\nvar k: i64 = 5\nk = 6\nk += 1"),
+    ("whole-var-shadows-large-let", "let b: Big = big_new()\nvar b: Big = big_new()\nb = big_new()"),
+    ("whole-var-match-arm",
+     "var k: i64 = 4\nlet o: Option<i64> = Some(3)\n"
+     "match o\n    Some(v) => k = v\n    None => k = 0"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("body", [a[1] for a in WHOLE_ACCEPTED],
+                         ids=[a[0] for a in WHOLE_ACCEPTED])
+def test_assigning_a_var_is_accepted(tmp_path, body):
+    r, out = _compile(tmp_path, _indent(body))
+    assert r.returncode == 0, f"rejected:\n{body}\n{out[-2000:]}"
