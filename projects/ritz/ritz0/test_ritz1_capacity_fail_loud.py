@@ -9,7 +9,8 @@ in indentation made the lexer loop forever.
 Each table is now either growable, so the program compiles correctly with
 ritz0 as the oracle (MUST_WORK), or a located fatal error that names the
 limit (MUST_FAIL_LOUD). The ticket's acceptance cases (17 args, 33 enums) are
-in MUST_WORK.
+in MUST_WORK. AGAST #1905 made the last two EmitterState tables (256 locals,
+4096 string literals) growable, so they moved to MUST_WORK as well.
 """
 
 import os
@@ -133,6 +134,18 @@ def _many_locals(n: int) -> str:
     )
 
 
+def _many_strings(n: int) -> str:
+    """n distinct string literals in one module; the sum of their first bytes
+    checks that literal i still names its own bytes past the old 4096."""
+    calls = "".join(f'    t = t + first(c"{i % 10}s{i}")\n' for i in range(n))
+    want = sum(48 + i % 10 for i in range(n))
+    return (
+        "fn first(p: *u8) -> i64\n    return *p as i64\n\n"
+        f"pub fn main() -> i32\n    var t: i64 = 0\n{calls}"
+        f"    return (t - {want} + 42) as i32\n"
+    )
+
+
 def _many_arms(n: int) -> str:
     """Block-bodied arms that return."""
     arms = "".join(f"        {i} =>\n            return {i % 100}\n" for i in range(n))
@@ -155,7 +168,7 @@ def _many_value_arms(n: int) -> str:
 
 def _many_instantiations(n: int) -> str:
     structs = "".join(f"struct T{i}\n    v: i64\n\n" for i in range(n))
-    # One helper per type, so main stays under the 256-locals limit.
+    # One helper per type, keeping main small.
     helpers = "".join(
         f"fn get{i}() -> i64\n    let r: T{i} = ident<T{i}>(T{i} {{ v: 1 }})\n    return r.v\n\n"
         for i in range(n)
@@ -207,12 +220,15 @@ MUST_WORK = {
     "match_arms_70": (_many_arms(70), 69),
     "instantiations_270": (_many_instantiations(270), 42),
     "long_name_300": (_long_name_call(300), 42),
+    # AGAST #1905: EmitterState.locals / strings were [256] / [4096] inline.
+    "locals_300": (_many_locals(300), 42),
+    "locals_1100": (_many_locals(1100), 42),
+    "strings_4200": (_many_strings(4200), 42),
 }
 
 # --- fixed limits that remain: one located error -----------------------------
 
 MUST_FAIL_LOUD = {
-    "locals_300": (_many_locals(300), 42, "too many locals and params in one function"),
     "nesting_70": (_deep_nesting(70), 42, "blocks nested more than 64 levels deep"),
 }
 
