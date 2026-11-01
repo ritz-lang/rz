@@ -101,12 +101,10 @@ def test_compiler_hash_independent_of_stat_size(ritz1_bin, valgrind, tmp_path):
     Under valgrind `stat("/proc/self/exe")` reports memcheck's size, not
     ritz1's.  The fingerprint must describe the bytes actually read.
     """
-    native_dir = tmp_path / "native"
-    vg_dir = tmp_path / "vg"
-    native_dir.mkdir()
-    vg_dir.mkdir()
-    p1, native = _compile([], ritz1_bin, native_dir)
-    p2, under_vg = _compile([valgrind, "-q"], ritz1_bin, vg_dir)
+    # One directory for both: compiler_hash also covers the source's
+    # directory (AGAST #2023), and only the binary's part is under test.
+    p1, native = _compile([], ritz1_bin, tmp_path)
+    p2, under_vg = _compile([valgrind, "-q"], ritz1_bin, tmp_path)
     assert native is not None, p1.stderr[-2000:]
     assert under_vg is not None, p2.stderr[-2000:]
     assert native["compiler_hash"] == under_vg["compiler_hash"]

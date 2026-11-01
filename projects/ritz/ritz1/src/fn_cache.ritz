@@ -8,10 +8,15 @@
 # these still hold for the sig written by the last compile:
 #
 #   * `source_hash`   — FNV1a-64 of this source file;
-#   * `compiler_hash` — this binary, the target OS and the import search path
-#                       (`cache_fingerprint()`; AGAST #1279, #1550, #1807);
+#   * `compiler_hash` — this binary, the target OS and the import roots
+#                       (`cache_fingerprint()`; AGAST #1279, #1550, #1807,
+#                       #2023);
 #   * `import_hashes` — FNV1a-64 of every file the source transitively
-#                       imports, keyed by canonical path (AGAST #1807).
+#                       imports, keyed by canonical path (AGAST #1807);
+#   * `module_ir`     — the output is reused only if it is byte-identical to
+#                       it, and otherwise rewritten from it.  The sig is per
+#                       source, so this is what ties it to *this* output
+#                       (AGAST #2023).
 #
 # The last one matters because a module's IR bakes in every imported struct
 # layout (field offsets, GEP indices), constant and signature: before #1807 a
@@ -132,25 +137,86 @@ pub fn compiler_fingerprint() -> u64
 #   * the target OS (#1550), since `--target-os` decides which
 #     `[[target_os]]` variants reach the IR — without it a harland compile
 #     reuses IR a linux compile left behind;
-#   * the import search path (`-I` merged with RITZ_PATH; #1807), since it
-#     decides which file an import resolves to.  The import hashes only vouch
-#     for the files the last compile read; if the same import now resolves
-#     to a different file, those files can be unchanged and the IR still
-#     stale.
+#   * the import roots (#1807, #2023), since they decide which file an import
+#     resolves to.  The import hashes only vouch for the files the last
+#     compile read; if the same import now resolves to a different file,
+#     those files can be unchanged and the IR still stale.  The roots are:
+#       - each `-I` / RITZ_PATH entry, by the directory it NAMES, not its
+#         spelling: a relative entry means something else from another cwd,
+#         and `rootA` and `/abs/rootA/` are the same root (#2023);
+#       - the directory of `input_path`, which imports are tried against
+#         first.  The resolver climbs it textually, so its spelling counts
+#         too, and a symlinked source resolves from the symlink's directory
+#         while sharing the target's sig (#2023).
 # 0 (unknown) whenever the compiler fingerprint is.
-pub fn cache_fingerprint(target_os: *u8, target_os_len: i64, ritz_path: *u8, ritz_path_len: i64) -> u64
+pub fn cache_fingerprint(target_os: *u8, target_os_len: i64, ritz_path: *u8, ritz_path_len: i64, input_path: *u8) -> u64
     let fp: u64 = compiler_fingerprint()
     if fp == 0
         return 0
-    var h: u64 = fnv1a_mix_u64(fp, target_os_len as u64)
-    if target_os_len > 0
-        h = fnv1a_mix_u64(h, fnv1a_bytes(target_os, target_os_len))
-    h = fnv1a_mix_u64(h, ritz_path_len as u64)
-    if ritz_path_len > 0
-        h = fnv1a_mix_u64(h, fnv1a_bytes(ritz_path, ritz_path_len))
+    var h: u64 = fnv1a_mix_bytes(fp, target_os, target_os_len)
+
+    # Import search path: `:`-separated, empty entries skipped (as the
+    # resolver does).
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= ritz_path_len
+        if i == ritz_path_len or *(ritz_path + i) == ':'
+            if i > start
+                h = fnv1a_mix_dir(h, ritz_path + start, i - start)
+                if h == 0
+                    return 0
+            start = i + 1
+        i = i + 1
+
+    # The source's directory, as main.ritz's path_dir() computes it: up to
+    # and including the last '/', empty (never probed) when there is none.
+    var dir_len: i64 = 0
+    var k: i64 = 0
+    while *(input_path + k) != 0
+        if *(input_path + k) == '/'
+            dir_len = k + 1
+        k = k + 1
+    h = fnv1a_mix_bytes(fnv1a_mix_u64(h, 3), input_path, dir_len)
+    if dir_len > 0
+        if *input_path != '/'
+            h = fnv1a_mix_cwd(h)
+        h = fnv1a_mix_dir(h, input_path, dir_len)
     if h == 0
         h = 1
     return h
+
+# Fold `p[0..n)` into `h`, length first, so adjacent fields cannot alias.
+fn fnv1a_mix_bytes(h: u64, p: *u8, n: i64) -> u64
+    var acc: u64 = fnv1a_mix_u64(h, n as u64)
+    if n > 0
+        acc = fnv1a_mix_u64(acc, fnv1a_bytes(p, n))
+    return acc
+
+# Fold the canonical current directory into `h`.
+fn fnv1a_mix_cwd(h: u64) -> u64
+    var cwd: String = string_new()
+    push_canonical_path(@cwd, c".")
+    let acc: u64 = fnv1a_mix_bytes(fnv1a_mix_u64(h, 4), string_as_ptr(@cwd), string_len(@cwd))
+    string_drop(@cwd)
+    return acc
+
+# Fold the canonical path of the directory `dir[0..len)` into `h`.  A
+# directory that does not exist resolves no import, so it is left out exactly
+# like an absent entry; once created it contributes its path, so the
+# fingerprint changes.  Returns 0 (unknown) if out of memory.
+fn fnv1a_mix_dir(h: u64, dir: *u8, len: i64) -> u64
+    let cstr: *u8 = malloc(len + 1)
+    if cstr == null
+        return 0
+    memcpy(cstr, dir, len)
+    *(cstr + len) = 0
+    var canon: String = string_new()
+    var acc: u64 = h
+    if push_canonical_path(@canon, cstr) == 1
+        acc = fnv1a_mix_bytes(fnv1a_mix_u64(acc, 1), string_as_ptr(@canon), string_len(@canon))
+    string_drop(@canon)
+    free(cstr)
+    return acc
 
 # Fold the 8 little-endian bytes of `v` into an in-progress FNV1a-64 state.
 fn fnv1a_mix_u64(h: u64, v: u64) -> u64
@@ -729,8 +795,9 @@ fn sig_deps_unchanged(sd: *SigData) -> i32
     return 1
 
 # Returns 1 when the requested compilation can be skipped — either:
-#   (a) <ll_path> exists with mtime >= the source's, or
-#   (b) the sig has a cached `module_ir`, which we WRITE to <ll_path> here.
+#   (a) <ll_path> holds exactly the sig's `module_ir` and its mtime is >= the
+#       source's, or
+#   (b) we WRITE the sig's `module_ir` to <ll_path> here.
 # Returns 0 if the caller must do a full compile.
 #
 # BOTH branches are gated on the sig's source hash, its compiler identity
@@ -768,13 +835,28 @@ pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u
         sig_data_free(sd)
         return 0
 
-    # Path (a): the requested .ll already exists and is up-to-date.
-    var ll_st: Stat
-    let lr: i32 = sys_stat2(ll_path, @ll_st)
-    if lr == 0
+    # Everything above vouches for `module_ir`, not for whatever is at
+    # `ll_path`; with no IR there is nothing to vouch for (AGAST #2023).
+    if sd.module_ir == null or sd.module_ir_len <= 0
+        sig_data_free(sd)
+        return 0
+
+    # Path (a): the requested .ll already holds exactly that IR, and is
+    # newer than the source, so make sees it as current — leave it alone.
+    #
+    # The content check is what makes this per-output (AGAST #2023).  The sig
+    # is per source, so before it a `.ll` merely NEWER than the source passed:
+    # a --test-table compile's output (test mode writes no sig, so the older
+    # default-mode sig still matched), another target OS's IR when that OS's
+    # compile into a different path had re-stamped the sig, or a file
+    # rewritten behind the sig's back.  ritz0 records a per-output
+    # {mode, ir_hash} for this (#2020); ritz1's sig already holds the IR
+    # itself, under this mode's fingerprint, so a byte comparison is the same
+    # check with nothing extra to keep in step.
+    if file_equals(ll_path, sd.module_ir, sd.module_ir_len) == 1
+        var ll_st: Stat
         var src_st: Stat
-        let sr: i32 = sys_stat2(src_path, @src_st)
-        if sr == 0
+        if sys_stat2(ll_path, @ll_st) == 0 and sys_stat2(src_path, @src_st) == 0
             if ll_st.st_mtime > src_st.st_mtime
                 sig_data_free(sd)
                 return 1
@@ -782,16 +864,27 @@ pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u
                 sig_data_free(sd)
                 return 1
 
-    # Path (b): the on-disk .ll is missing or stale, but we have cached IR
-    # from a previous run.  Splice it to the requested output path.
-    if sd.module_ir != null and sd.module_ir_len > 0
-        let fd: i32 = sys_open3(ll_path, O_WRONLY + O_CREAT + O_TRUNC, 420)
-        if fd >= 0
-            let n: i64 = sys_write(fd, sd.module_ir, sd.module_ir_len)
-            sys_close(fd)
-            if n == sd.module_ir_len
-                sig_data_free(sd)
-                return 1
+    # Path (b): the on-disk .ll is missing, different, or older than the
+    # source.  Splice the cached IR to the requested output path.
+    let fd: i32 = sys_open3(ll_path, O_WRONLY + O_CREAT + O_TRUNC, 420)
+    if fd >= 0
+        let n: i64 = sys_write(fd, sd.module_ir, sd.module_ir_len)
+        sys_close(fd)
+        if n == sd.module_ir_len
+            sig_data_free(sd)
+            return 1
 
     sig_data_free(sd)
     return 0
+
+# 1 when the file at `path` holds exactly `data[0..len)`, else 0.
+fn file_equals(path: *u8, data: *u8, len: i64) -> i32
+    var sz: i64 = 0
+    let buf: *u8 = read_file_to_buf(path, @sz)
+    if buf == null
+        return 0
+    var same: i32 = 0
+    if sz == len and memcmp(buf, data, len) == 0
+        same = 1
+    free(buf)
+    return same
