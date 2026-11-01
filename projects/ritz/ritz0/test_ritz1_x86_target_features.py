@@ -77,9 +77,8 @@ impl Ctx
     fn clmul(self: *Ctx, a: *i64, b: *i64) -> i32
         let x: v2i64 = simd_loadu(a)
         let y: v2i64 = simd_loadu(b)
-        # Bound first: a nested simd_clmul is stored as <4 x i32> (#2051).
-        let r: v2i64 = simd_clmul(x, y, 0)
-        simd_storeu(a, r)
+        # Nested on purpose: stored as <4 x i32> before #2051.
+        simd_storeu(a, simd_clmul(x, y, 0))
         0
 
     fn plain(self: *Ctx) -> i32
