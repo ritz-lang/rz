@@ -319,6 +319,37 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                         emit_member_gep_from_ptr(s, result, loaded, st, field_idx, field)
                         return
 
+    # AGAST #1647: a field of a struct returned BY VALUE, `mk(true).b`,
+    # `p.pair().a`, `Q.make(1).x`, `mko(1).inner.x` (the nested arm above
+    # recurses into here).  Emit the call once, spill the aggregate into an
+    # alloca of the callee's return struct, then GEP the field out of it.
+    # Before this the base fell through to "unhandled EXPR_MEMBER".
+    else if e.left.kind == EXPR_CALL or e.left.kind == EXPR_METHOD
+        var cr_name: *u8 = null
+        var cr_len: i32 = 0
+        call_result_struct_name(s, e.left, @cr_name, @cr_len)
+        if cr_len > 0
+            let cr_st: *StructDef = find_struct(s, cr_name, cr_len)
+            if cr_st != null
+                let cr_idx: i32 = find_field_index(cr_st, e.ident_ptr, e.ident_len)
+                if cr_idx >= 0
+                    let cr_field: *StructField = get_field_type(cr_st, cr_idx)
+                    let cr_val: i32 = emit_expr(s, e.left)
+                    let cr_slot: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, cr_slot)
+                    emit_str(s, c" = alloca %")
+                    emit_name(s, cr_st.name, cr_st.name_len)
+                    emit_str(s, c"  ; call-result member\n  store %")
+                    emit_name(s, cr_st.name, cr_st.name_len)
+                    emit_str(s, c" ")
+                    emit_reg(s, cr_val)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, cr_slot)
+                    emit_str(s, c"\n")
+                    emit_member_gep_from_ptr(s, result, cr_slot, cr_st, cr_idx, cr_field)
+                    return
+
     # Dereference case: ptr.field - e.left is EXPR_UNARY with OP_DEREF
     # Also: address-of-then-member case: (@expr).field — when the inner
     # expression already resolves through a struct pointer, the outer
