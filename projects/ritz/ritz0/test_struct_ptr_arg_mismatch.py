@@ -244,12 +244,12 @@ fn main() -> i32
 """, None),
     "static": (TWO_STRUCTS + """
 impl C
-    fn get(c: @&C) -> i64
-        return take_c(c) as i64
+    fn get(c: @&C) -> i32
+        return take_c(c)
 
 fn main() -> i32
     var c: C = C { z: 5 }
-    return C.get(@&c) as i32
+    return C.get(@&c)
 """, 6),
     # An explicit cast is the programmer's own call to make.
     "cast": (TWO_STRUCTS + """

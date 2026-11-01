@@ -299,9 +299,9 @@ impl Big
     fn plus(self: @&Big, other: Big) -> i32
         return self.count + total(@other)
 
-    # i64, not i32: ritz1 uses a static method's i32 result as i64 (#1733).
-    fn of(other: Big) -> i64
-        return total(@other) as i64
+    # i32 result: widened to i64 at the static call site (#1962).
+    fn of(other: Big) -> i32
+        return total(@other)
 
 pub fn main() -> i32
     var x: Big = big_make(5)
