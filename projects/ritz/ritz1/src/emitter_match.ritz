@@ -22,6 +22,10 @@
 #   that struct type (AGAST #1645).  Arms yielding the layout-equivalent
 #   Span$u8/StrView pair are rebuilt to the phi's type in their own block, and
 #   a `"..."` arm counts as StrView (AGAST #1662).
+# - A match with an arm that calls a void fn (`Some(e) => say(e)`) has no
+#   value: no phi, and emit_match returns 0 like a void call (AGAST #1654).
+#   `return` / `break` / `continue` arms leave through their own terminator
+#   and feed the phi a zero from the unreachable block opened after it.
 #
 # Variant patterns (Some(v) / None / Ok(v) / Err(_)) use a tag convention:
 #   Some(x) / Ok(x) -> high 16 bits = 1, low 48 bits = x
@@ -67,6 +71,10 @@ struct MatchResult
     # Arms recorded as i64 values before float_ty was fixed: they cannot be
     # coerced after the fact (their `br` is already emitted).
     int_arms: i32
+    # AGAST #1654: arms whose body expression produced no value (a call to a
+    # void fn: emit_expr returns register 0, which is never defined).  Any
+    # such arm makes the match valueless: emit_match emits no phi.
+    void_arms: i32
 
 # AGAST #1946: a `values[]` entry for an arm with no value (`pass`, or a body
 # with no trailing expression): the phi gets the zero constant of its type
@@ -311,6 +319,7 @@ fn match_result_init(r: *MatchResult, n_arms: i32)
     r.agg_name_len = 0
     r.float_ty = 0
     r.int_arms = 0
+    r.void_arms = 0
 
 # AGAST #1946: the float type (TYPE_F32 / TYPE_F64) arm value `e` was just
 # emitted at, or 0.  A nested match / if publishes its phi type as it
@@ -458,6 +467,13 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # pattern binding in scope.
         let_check_expr(s, arm.body)
         body_reg = emit_expr(s, arm.body)
+    if arm.is_pass == 0 and arm.body != null and body_reg == 0
+        # AGAST #1654: a void call (`Some(e) => say(e)`), or a nested
+        # valueless match.  Register 0 is never defined; record a zero so
+        # nothing ever names %.0, and mark the whole match valueless.
+        result.void_arms = result.void_arms + 1
+        body_reg = MATCH_ZERO_VALUE
+    else if arm.is_pass == 0 and arm.body != null
         # AGAST #1645: resolve the arm's struct type while its pattern
         # binding (`Some(v) => v`) is still in scope; it is popped below.
         var arm_ty: *u8 = null
@@ -682,6 +698,19 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
     # Set after every arm (nested matches inside arms included) so the
     # outermost match's type is what the enclosing let sees.
     publish_match_type(s, @result)
+    if result.void_arms > 0
+        # AGAST #1654: an arm yields no value (a void call), so the match is
+        # a statement: join at match.end with no phi and no value (register
+        # 0, as for a void call).  A struct/float type an earlier arm fixed
+        # must not leak to an untyped `let` either.
+        s.last_match_agg_name = null
+        s.last_match_agg_name_len = 0
+        s.last_match_float_ty = 0
+        emit_str(s, c"  br label %")
+        emit_label(s, end_label)
+        emit_str(s, c"\n")
+        begin_block(s, end_label)
+        return 0
     var fallthrough_reg: i32 = 0
     if result.count == 0
         # No arm phi: the match's value is this register itself.

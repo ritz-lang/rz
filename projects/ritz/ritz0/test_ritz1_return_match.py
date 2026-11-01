@@ -15,8 +15,8 @@ enclosing fn failed with
 let/var and match arms had already hit this and gained `match_expr_rhs`
 alternatives (#1479). The fix gives return_stmt the same alternative.
 
-Not covered: an inline `return` as a match-arm body (`Ok(v) => return v + 1`),
-which is #1689 and needs emitter work as well as grammar.
+An inline `return` as a match-arm body (`Ok(v) => return v + 1`, #1689) is
+covered by ritz0/test/test_diff_match_ctrl_arms.ritz.
 
 ritz0 is the oracle. Every program exits 42 on success.
 

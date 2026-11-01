@@ -167,17 +167,14 @@ fn main() -> i32
 """
 
 PROGRAMS = {
+    # Void arms: ritz1 emitted `phi i64` over the undefined %.0 until #1654.
+    "repro": REPRO,
     "mixed_arms": MIXED_ARMS,
     "let_last_arm": LET_LAST_ARM,
     "first_arm": FIRST_ARM,
     "tail_expr": TAIL_EXPR,
     "doubly_nested": DOUBLY_NESTED,
 }
-
-# Parse-and-compile only. A statement match with void arms still emits a
-# `phi i64` over an undefined register (#1468), which clang rejects with or
-# without nesting. When #1468 lands, move these into PROGRAMS.
-COMPILE_ONLY = {"repro": REPRO}
 
 # A nested `match` with no indented arms is still a syntax error.
 MALFORMED = {
@@ -247,23 +244,6 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 def test_ritz1_nested_match_arm(ritz1_bin, tmp_path, name):
     """AGAST #1479. Before the fix these died with `cannot parse item`."""
     _check(_run("ritz1", tmp_path, name), name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(COMPILE_ONLY))
-def test_ritz1_parses_void_nested_match(ritz1_bin, tmp_path, name):
-    """The ticket repro. ritz1 used to refuse `fn f` with `cannot parse item`."""
-    comp, ll, _ = _compile("ritz1", tmp_path, name, COMPILE_ONLY[name])
-    assert comp.returncode == 0 and ll.exists(), (
-        f"ritz1 failed to compile {name}:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
-    )
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(COMPILE_ONLY))
-def test_ritz0_accepts_void_nested_match(tmp_path, name):
-    comp, ll, _ = _compile("ritz0", tmp_path, name, COMPILE_ONLY[name])
-    assert comp.returncode == 0 and ll.exists(), comp.stderr[-2000:]
 
 
 @pytest.mark.integration

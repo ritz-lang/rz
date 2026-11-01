@@ -1,0 +1,172 @@
+# AGAST #1654 (also #1468): `match` arms that call void functions.
+#
+# ritz1 built a `phi i64` at match.end from every arm's emit_expr result.  A
+# call to a void fn returns register 0, so `Some(e) => say(e)` produced
+# `phi i64 [ %.0, %L1 ], ...` over an undefined value and clang rejected the
+# module.  A match with a void-call arm now emits no phi (asserted at the IR
+# level by ritz0/test_ritz1_match_void_arms.py).  Control-flow and assignment
+# arms are in test_diff_match_ctrl_arms.ritz.
+#
+# Oracle: ritz0 runs every case to the same result.
+
+import ritzlib.option
+import ritzlib.result
+
+fn mk_some(x: i32) -> Option<i32>
+    return Some(x)
+
+fn mk_none() -> Option<i32>
+    return None
+
+fn mk_ok(x: i64) -> Result<i64, i32>
+    return Ok(x)
+
+fn mk_err(e: i32) -> Result<i64, i32>
+    return Err(e)
+
+# Void sinks: add `x` to the counter `p` points at.
+fn add_to(p: *i32, x: i32)
+    *p = *p + x
+
+fn add_to64(p: *i32, x: i64)
+    *p = *p + x as i32
+
+fn noop()
+    pass
+
+# ---------------------------------------------------------------------------
+# Void-call arms
+
+# The ticket's repro: every arm calls a void fn, statement position.
+fn void_option_main() -> i32
+    var acc: i32 = 0
+    var next: Option<i32> = mk_some(40)
+    match next
+        Some(e) => add_to(@acc, e)
+        None => add_to(@acc, 100)
+    match mk_none()
+        Some(e) => add_to(@acc, e)
+        None => add_to(@acc, 2)
+    acc
+
+# Result scrutinee, with a void-call arm on each side.
+fn void_result_main() -> i32
+    var acc: i32 = 0
+    match mk_ok(30)
+        Ok(v) => add_to64(@acc, v)
+        Err(e) => add_to(@acc, e)
+    match mk_err(12)
+        Ok(v) => add_to64(@acc, v)
+        Err(e) => add_to(@acc, e)
+    acc
+
+# Scalar (integer) scrutinee, including a wildcard void arm.
+fn void_int_scrutinee_main() -> i32
+    var acc: i32 = 0
+    var i: i32 = 0
+    while i < 4
+        match i
+            0 => add_to(@acc, 10)
+            1 => add_to(@acc, 20)
+            _ => add_to(@acc, 6)
+        i = i + 1
+    acc
+
+# A void-call arm next to `pass` and a no-arg void call.
+fn void_mixed_pass_main() -> i32
+    var acc: i32 = 42
+    match mk_none()
+        Some(e) => add_to(@acc, e)
+        None => pass
+    match mk_some(1)
+        Some(e) => noop()
+        None => add_to(@acc, 1000)
+    acc
+
+# A void-call arm next to an arm that yields a value: the value is discarded.
+fn void_mixed_value_main() -> i32
+    var acc: i32 = 0
+    match mk_some(42)
+        Some(e) => add_to(@acc, e)
+        None => 7
+    match mk_none()
+        Some(e) => e
+        None => add_to(@acc, 0)
+    acc
+
+# Block-bodied arms whose last statement is a void call.
+fn void_block_arm_main() -> i32
+    var acc: i32 = 0
+    match mk_some(20)
+        Some(e) =>
+            let twice: i32 = e * 2
+            add_to(@acc, twice)
+        None =>
+            add_to(@acc, 1000)
+    add_to(@acc, 2)
+    acc
+
+# A nested match whose arms are void calls, inside an arm.
+fn void_nested_main() -> i32
+    var acc: i32 = 0
+    match mk_some(1)
+        Some(a) => match mk_some(41)
+            Some(b) => add_to(@acc, a + b)
+            None => add_to(@acc, 500)
+        None => add_to(@acc, 900)
+    acc
+
+# A void-arm match as the last statement of a void procedure (block tail).
+fn tail_proc(p: *i32, o: Option<i32>)
+    match o
+        Some(e) => add_to(p, e)
+        None => add_to(p, 1)
+
+fn void_tail_main() -> i32
+    var acc: i32 = 0
+    tail_proc(@acc, mk_some(41))
+    tail_proc(@acc, mk_none())
+    acc
+
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_match_void_option_arms() -> i32
+    assert void_option_main() == 42
+    0
+
+[[test]]
+fn test_match_void_result_arms() -> i32
+    assert void_result_main() == 42
+    0
+
+[[test]]
+fn test_match_void_int_scrutinee() -> i32
+    assert void_int_scrutinee_main() == 42
+    0
+
+[[test]]
+fn test_match_void_mixed_pass() -> i32
+    assert void_mixed_pass_main() == 42
+    0
+
+[[test]]
+fn test_match_void_mixed_value() -> i32
+    assert void_mixed_value_main() == 42
+    0
+
+[[test]]
+fn test_match_void_block_arm() -> i32
+    assert void_block_arm_main() == 42
+    0
+
+[[test]]
+fn test_match_void_nested() -> i32
+    assert void_nested_main() == 42
+    0
+
+[[test]]
+fn test_match_void_proc_tail() -> i32
+    assert void_tail_main() == 42
+    0
+
