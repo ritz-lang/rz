@@ -15,6 +15,7 @@ Compilation Model:
     - Linking is a separate step (use llc + ld)
 """
 
+import os
 import sys
 import argparse
 from pathlib import Path
@@ -36,8 +37,50 @@ from emitter.fn_cache import (
     read_sig_file, write_sig_file, check_source_hash,
     check_import_hashes, build_import_hashes,
     build_sig_data, detect_sig_changes, invalidate_dependents,
+    compile_mode_key, check_output_entry, build_outputs,
 )
 import ritz_ast as rast
+
+
+def _compile_mode(no_runtime, check_names, check_ownership, check_types,
+                  dependencies, source_roots, project_root, target, target_os,
+                  test_mode) -> dict:
+    """Every compile_file input, besides the sources themselves, that shapes
+    the output or whether the compile succeeds (AGAST #2020).
+
+    The source-level fast path may only reuse an output built under the same
+    mode.  Covered: the emit flags (no_runtime, test_mode, target, target_os);
+    the import roots, which decide WHICH file an import resolves to (the
+    import hashes only vouch for the files the last compile resolved), as
+    ImportResolver resolves them; and the checks, since a skip would stand in
+    for a check the earlier compile never ran.  Paths are resolved so the same
+    roots spelled differently are one mode.
+    """
+    root = Path(project_root).resolve() if project_root else None
+    roots = []
+    for sr in source_roots or []:
+        p = Path(sr)
+        if not p.is_absolute() and root is not None:
+            p = root / p
+        roots.append(str(p.resolve()))
+    ritz_path = [str(Path(p).resolve())
+                 for p in os.environ.get('RITZ_PATH', '').split(':') if p]
+    deps = {name: [str(Path(d.path).resolve()), list(d.sources)]
+            for name, d in (dependencies or {}).items()}
+    return {
+        'no_runtime': bool(no_runtime),
+        'test_mode': bool(test_mode),
+        'target': target,
+        'target_os': target_os,
+        'check_names': bool(check_names),
+        'check_ownership': bool(check_ownership),
+        'check_types': bool(check_types),
+        'project_root': str(root) if root else None,
+        'source_roots': roots,
+        'ritz_path': ritz_path,
+        'dependencies': deps,
+        'interfaces': module_interface.enabled(),
+    }
 
 
 def _filter_by_target_os(module: rast.Module, target_os: str) -> rast.Module:
@@ -108,14 +151,22 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # still hashes as recorded, skip everything. The import check matters:
         # the .ll bakes in imported struct layouts (field offsets), constants
         # and signatures, so an unchanged module over a changed import is
-        # still stale (AGAST #1674).
+        # still stale (AGAST #1674). The sig must also vouch for THIS output
+        # in THIS mode: it is keyed by source alone, so another flag set or
+        # another output path must not count as "unchanged" (AGAST #2020).
+        mode_key = compile_mode_key(_compile_mode(
+            no_runtime, check_names, check_ownership, check_types,
+            dependencies, source_roots, project_root, target, target_os,
+            test_mode))
         output_file = Path(output_path)
         if output_file.exists():
             source_mtime = Path(source_path).stat().st_mtime
             output_mtime = output_file.stat().st_mtime
+            prior_sig = read_sig_file(source_abs_path)
             if (output_mtime >= source_mtime
                     and check_source_hash(source, source_abs_path)
-                    and check_import_hashes(read_sig_file(source_abs_path))):
+                    and check_import_hashes(prior_sig)
+                    and check_output_entry(prior_sig, output_path, mode_key)):
                 print(f"Skipped {source_path} (unchanged)")
                 return True
 
@@ -273,6 +324,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                 imports=original_import_paths,
                 old_sig_data=old_sig_data,
                 import_hashes=import_hashes,
+                outputs=build_outputs(old_sig_data, source, import_hashes,
+                                      output_path, mode_key, ir),
             )
             write_sig_file(source_abs_path, sig_data)
         except Exception as e:

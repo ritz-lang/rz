@@ -24,12 +24,21 @@ Key components:
     }
   },
   "imports": ["ritzlib.sys", "ritzlib.io"],
-  "import_hashes": {"/abs/path/ritzlib/sys.ritz": "<sha256 of that file>"}
+  "import_hashes": {"/abs/path/ritzlib/sys.ritz": "<sha256 of that file>"},
+  "outputs": {"/abs/path/out.ll": {"mode": "<compile mode key>",
+                                   "ir_hash": "<hash of the IR written>"}}
 }
 
 `import_hashes` covers every TRANSITIVE import (AGAST #1674): the emitted .ll
 bakes in imported struct layouts, constants and signatures, so the
 "unchanged" fast path is only sound if none of those sources changed either.
+
+`outputs` (AGAST #2020) records which output files this sig vouches for, in
+which compile mode, with which content.  The sig is keyed by source alone, so
+without it a recompile in another mode (--no-runtime, test mode, --target,
+--target-os, another import root, other checks) or into an output the sig
+never wrote "Skipped" and kept the wrong IR.  Entries survive only while the
+source and import hashes they were written under still hold.
 """
 
 import hashlib
@@ -477,6 +486,72 @@ def build_import_hashes(paths) -> Dict[str, str]:
     return {str(p): source_file_hash(Path(p).read_text()) for p in sorted(paths)}
 
 
+def compile_mode_key(mode: Dict[str, Any]) -> str:
+    """Canonical key for a compile mode: every input besides the sources that
+    shapes the output (flags, import roots, enabled checks).
+
+    Args:
+        mode: JSON-serialisable description of the mode
+
+    Returns:
+        Hex digest; equal iff the (canonicalised) modes are equal
+    """
+    blob = json.dumps(mode, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _output_key(output_path) -> str:
+    return os.path.realpath(str(output_path))
+
+
+def check_output_entry(sig_data: Optional[Dict[str, Any]], output_path,
+                       mode_key: str) -> bool:
+    """Does the sig vouch for `output_path` as built in mode `mode_key`?
+
+    True only if the sig recorded writing this output in this mode, and the
+    file still holds exactly the IR it wrote.  An output written in another
+    mode, written by another compile, or rewritten since, is not vouched for.
+    """
+    if not sig_data:
+        return False
+    outputs = sig_data.get('outputs')
+    if not isinstance(outputs, dict):
+        return False
+    entry = outputs.get(_output_key(output_path))
+    if not isinstance(entry, dict) or entry.get('mode') != mode_key:
+        return False
+    try:
+        current = Path(output_path).read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return source_file_hash(current) == entry.get('ir_hash')
+
+
+def build_outputs(old_sig_data: Optional[Dict[str, Any]], source: str,
+                  import_hashes: Dict[str, str], output_path, mode_key: str,
+                  ir: str) -> Dict[str, Dict[str, str]]:
+    """The sig's `outputs` after writing `ir` to `output_path` in `mode_key`.
+
+    Other outputs' entries are kept only if the old sig was written for the
+    same source and import hashes; otherwise they describe IR built from
+    other inputs and can no longer be vouched for.  Entries whose file is
+    gone are dropped.
+    """
+    outputs: Dict[str, Dict[str, str]] = {}
+    if (old_sig_data
+            and old_sig_data.get('source_hash') == source_file_hash(source)
+            and old_sig_data.get('import_hashes') == import_hashes
+            and isinstance(old_sig_data.get('outputs'), dict)):
+        for path, entry in old_sig_data['outputs'].items():
+            if isinstance(entry, dict) and os.path.exists(path):
+                outputs[path] = entry
+    outputs[_output_key(output_path)] = {
+        'mode': mode_key,
+        'ir_hash': source_file_hash(ir),
+    }
+    return outputs
+
+
 def build_sig_data(
     source: str,
     fn_hashes: Dict[str, str],
@@ -485,6 +560,7 @@ def build_sig_data(
     imports: Optional[List[str]] = None,
     old_sig_data: Optional[Dict[str, Any]] = None,
     import_hashes: Optional[Dict[str, str]] = None,
+    outputs: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Build a .ritz.sig data dict.
 
@@ -497,6 +573,8 @@ def build_sig_data(
         old_sig_data: Previous sig data (to preserve cached IR for unchanged fns)
         import_hashes: {abs_path: source hash} for every transitive import;
             consulted by check_import_hashes() on the next build
+        outputs: {abs_output: {mode, ir_hash}} from build_outputs();
+            consulted by check_output_entry() on the next build
 
     Returns:
         Dict suitable for write_sig_file()
@@ -533,6 +611,7 @@ def build_sig_data(
         'functions': functions,
         'imports': imports,
         'import_hashes': dict(import_hashes or {}),
+        'outputs': dict(outputs or {}),
     }
 
 
