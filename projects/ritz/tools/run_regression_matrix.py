@@ -47,15 +47,6 @@ RITZLIB_MODULES = ["sys", "io", "str", "fmt", "strview", "string", "hash", "memo
 # is an allowlist nobody edits — #1365 found two entries blaming the async
 # framework for what was really a syntax migration.
 EXPECTED_FAILURES = {
-    ("ritz1", "test_issue_float_coercion"):
-        "AGAST #1370 — ritz1 has no float method dispatch; x.ceil() fails even "
-        "with an identifier receiver. It previously 'passed' because the "
-        "emitter substituted a zero and said nothing (#1369), and because the "
-        "matrix only runs the file's FIRST [[test]] fn (#1371) — the assertion "
-        "that would have caught it is the third.",
-    ("ritz1_selfhosted", "test_issue_float_coercion"):
-        "AGAST #1370 — same gap, listed separately on purpose: an excuse for "
-        "ritz1 must not cover its self-compiled twin.",
     ("ritz0", "test_issue_ritz1_narrow_nfa_fields::test_narrow_array_unsigned_field"):
         "AGAST #2036 — ritz0 sign-extends an unsigned field read as `a[i].f` "
         "(extractvalue + sext); ritz1 and ritz1_selfhosted are correct.",
