@@ -479,3 +479,77 @@ fn test_whole_assign_from_array_ptr_method_param() -> i32
     assert w.vals[1] == 52
     assert w.tail == 9
     0
+
+# ---------------------------------------------------------------------------
+# AGAST #1971: since #1966 a local `[N]f32` / `[N]f64` is `[N x float]` /
+# `[N x double]`, the field's own layout, so `w.vals = loc` and
+# `p.vals = *src` copy float arrays.  ritz1 refused them (only bool, whose
+# local keeps i64 slots while a field uses i1, still differs).  Bits are
+# checked through a `*u32` / `*u64` view of the field, which pins the layout.
+
+fn wa_bits32(p: *u32, i: i64) -> u32
+    p[i]
+
+fn wa_bits64(p: *u64, i: i64) -> u64
+    p[i]
+
+fn set_floats_from_ptr(p: *Floats, src: *[3]f32)
+    p.vals = *src
+
+fn set_doubles_from_ptr(p: *Doubles, src: *[2]f64)
+    p.vals = *src
+
+[[test]]
+fn test_whole_assign_f32_from_local() -> i32
+    var f: Floats = Floats { lead: 1, vals: [0.0, 0.0, 0.0], tail: 2 }
+    var loc: [3]f32 = [1.0, -2.25, 3.5]
+    f.vals = loc
+    assert wa_bits32(@f.vals as *u32, 0) == 0x3F800000
+    assert wa_bits32(@f.vals as *u32, 1) == 0xC0100000
+    assert wa_bits32(@f.vals as *u32, 2) == 0x40600000
+    let w: f32 = 3.5
+    assert f.vals[2] == w
+    assert f.lead == 1
+    assert f.tail == 2
+    # Writing the field leaves the next field alone.
+    f.vals[2] = 9.0
+    assert wa_bits32(@f.vals as *u32, 2) == 0x41100000
+    assert f.tail == 2
+    0
+
+[[test]]
+fn test_whole_assign_f64_from_local() -> i32
+    var d: Doubles = Doubles { vals: [0.0, 0.0], tail: 4 }
+    var loc: [2]f64 = [-1.0, 0.5]
+    d.vals = loc
+    assert wa_bits64(@d.vals as *u64, 0) == 0xBFF0000000000000
+    assert wa_bits64(@d.vals as *u64, 1) == 0x3FE0000000000000
+    assert d.vals[1] == 0.5
+    assert d.tail == 4
+    0
+
+[[test]]
+fn test_whole_assign_float_from_array_ptr() -> i32
+    var f: Floats = Floats { lead: 5, vals: [0.0, 0.0, 0.0], tail: 6 }
+    var a: [3]f32 = [0.5, 1.25, -3.5]
+    set_floats_from_ptr(@f, @a)
+    assert wa_bits32(@f.vals as *u32, 0) == 0x3F000000
+    assert wa_bits32(@f.vals as *u32, 1) == 0x3FA00000
+    assert wa_bits32(@f.vals as *u32, 2) == 0xC0600000
+    assert f.lead == 5
+    assert f.tail == 6
+    # The pointee may be another float field: same layout.
+    var g: Floats = Floats { lead: 7, vals: [0.0, 0.0, 0.0], tail: 8 }
+    set_floats_from_ptr(@g, @f.vals)
+    assert wa_bits32(@g.vals as *u32, 2) == 0xC0600000
+    assert g.tail == 8
+    var d: Doubles = Doubles { vals: [0.0, 0.0], tail: 9 }
+    var b: [2]f64 = [2.5, -0.125]
+    let q: *[2]f64 = @b
+    d.vals = *q
+    assert wa_bits64(@d.vals as *u64, 0) == 0x4004000000000000
+    assert wa_bits64(@d.vals as *u64, 1) == 0xBFC0000000000000
+    set_doubles_from_ptr(@d, @b)
+    assert d.vals[0] == 2.5
+    assert d.tail == 9
+    0
