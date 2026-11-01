@@ -428,7 +428,7 @@ import ritzlib.string
 import ritzlib.strview
 
 fn main() -> i32
-    let s: String = string_from("hello")
+    var s: String = string_from("hello")
     let n = string_len(@s)
     string_drop(@&s)
     n as i32
@@ -473,6 +473,27 @@ Immutable bindings cannot be reassigned. The current diagnostic is terse — a
 ```ritz body expect-error="Unknown variable: x"
 let x = 42
 x = 43
+```
+
+Nor can a `let` be changed through a field or array element, or lent out
+mutably with `@&`: anything that writes the binding's own storage needs a
+`var`. Writing *through* a pointer held in a `let` is fine, since that
+changes the pointee, not the binding.
+
+```ritz body expect-error="cannot assign through `let` binding `a`; declare it `var`"
+let a: [2]i64 = [1, 2]
+a[0] = 3
+```
+
+```ritz body expect-error="cannot borrow `let` binding `k` as mutable; declare it `var`"
+let k: i64 = 1
+let p: *i64 = @&k
+```
+
+```ritz body
+var a: [2]i64 = [1, 2]
+let p: *i64 = @&a[0]
+p[1] = 3              # OK: writes a[1] through the pointer
 ```
 
 ### 4.2 Mutable Bindings (var)
@@ -1387,7 +1408,7 @@ today: owners are released by calling the type's `_drop` function explicitly.
 import ritzlib.string
 
 fn main() -> i32
-    let s = string_from("hello")    # s owns the buffer
+    var s = string_from("hello")    # s owns the buffer
     string_drop(@&s)                # released explicitly
     0
 ```
@@ -1403,7 +1424,7 @@ import ritzlib.string
 
 fn main() -> i32
     let s1 = string_from("hello")
-    let s2 = s1                     # shares s1's buffer
+    var s2 = s1                     # shares s1's buffer
     string_drop(@&s2)               # drop exactly once
     0
 ```
@@ -1416,7 +1437,7 @@ fn main() -> i32
 import ritzlib.string
 
 fn main() -> i32
-    let s = string_from("hello")
+    var s = string_from("hello")
     let n = string_len(@s)          # borrow for the call
     string_drop(@&s)
     n as i32

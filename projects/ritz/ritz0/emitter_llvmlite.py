@@ -479,6 +479,8 @@ class LLVMEmitter:
         self.params: Dict[str, Tuple[ir.Value, ir.Type]] = {}  # name -> (value, type)
         # AGAST #2025: name -> the slot a large-struct `let` lives in.
         self._let_slots: Dict[str, ir.Value] = {}
+        # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
+        self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
         self.constants: Dict[str, Tuple[int, ir.Type]] = {}  # name -> (value, type)
         self.const_arrays: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
@@ -3337,6 +3339,7 @@ class LLVMEmitter:
             return
         self.locals.pop(name, None)
         self.params[name] = (val, ty)
+        self._let_values[name] = val
 
     def _bind_let_slot(self, name: str, slot: ir.Value, ty: ir.Type) -> None:
         """Bind an immutable `let` name to its #2025 slot (see _bind_let)."""
@@ -3375,6 +3378,67 @@ class LLVMEmitter:
         """
         slot = self._let_slots.get(name)
         return slot is not None and self.locals.get(name, (None, None))[0] is slot
+
+    def _check_let_write(self, target: rast.Expr) -> None:
+        """AGAST #2026: reject a field/element write into a `let`'s storage.
+
+        A whole-binding `x = v` is handled where it is emitted (#2025/#1317).
+        """
+        if isinstance(target, (rast.Field, rast.Index)):
+            place = self._let_place(target)
+            if place is not None:
+                raise EmitError(
+                    f"cannot assign through `let` binding `{place[0]}`; declare it `var`",
+                    target.span)
+
+    def _check_let_mut_borrow(self, operand: rast.Expr) -> None:
+        """AGAST #2026: reject `@&` of a `let` or of a place inside it."""
+        place = self._let_place(operand)
+        if place is not None:
+            raise EmitError(
+                f"cannot borrow `let` binding `{place[0]}` as mutable; declare it `var`",
+                operand.span)
+
+    def _let_place(self, expr: rast.Expr) -> Optional[Tuple[str, ir.Type]]:
+        """AGAST #2026: (let name, LLVM type) if `expr` is a `let`'s storage.
+
+        The binding itself, a by-value field of it or an element of a
+        by-value array in it, to any depth. None as soon as the path leaves
+        the binding's own storage through a pointer (`let p: *T` then
+        `p.x`), since that writes the pointee, not the `let`.
+        """
+        if isinstance(expr, rast.Ident):
+            # By identity, as _is_let_slot: a fn param, `var` or match
+            # binding that replaced the `let` of this name is not one.
+            name = expr.name
+            if self._is_let_slot(name):
+                return name, self.locals[name][1]
+            val = self._let_values.get(name)
+            bound = self.params.get(name)
+            if val is not None and bound is not None and bound[0] is val:
+                return name, bound[1]
+            return None
+        if isinstance(expr, rast.Field):
+            base = self._let_place(expr.expr)
+            if base is None or not isinstance(base[1], ir.BaseStructType):
+                return None
+            name, ty = base
+            if expr.field.isdigit():
+                idx = int(expr.field)
+            else:
+                struct_name = self._get_struct_name_from_type(ty)
+                if not struct_name or not self._struct_has_field(struct_name, expr.field):
+                    return None
+                idx = self._get_struct_field_index(struct_name, expr.field)
+            if idx >= len(ty.elements):
+                return None
+            return name, ty.elements[idx]
+        if isinstance(expr, rast.Index):
+            base = self._let_place(expr.expr)
+            if base is None or not isinstance(base[1], ir.ArrayType):
+                return None
+            return base[0], base[1].element
+        return None
 
     def _bind_var(self, name: str, alloca: ir.Value, ty: ir.Type) -> None:
         """Bind a mutable `var` name, replacing any `let` of that name."""
@@ -3933,6 +3997,7 @@ class LLVMEmitter:
         self.locals.clear()
         self.params.clear()
         self._let_slots.clear()
+        self._let_values.clear()
         self.has_returned = False
         self.current_fn_def = fn_def
         self.in_test_fn = fn_def.has_attr('test')
@@ -4766,6 +4831,7 @@ class LLVMEmitter:
             return None
 
         elif isinstance(stmt, rast.AssignStmt):
+            self._check_let_write(stmt.target)
             # `x = Some(v)` must build the variant for the *target's* enum.
             # Variant names are global (`Some` -> whichever Option was
             # specialized last), so without the target type an assignment to
@@ -7846,6 +7912,7 @@ class LLVMEmitter:
 
         Returns the assigned value.
         """
+        self._check_let_write(expr.target)
         # `self.field = Some(v)` must build the variant for the *target's*
         # enum, exactly as the AssignStmt path does — variant names are
         # global, so `Some` otherwise resolves to whichever Option was
@@ -8183,6 +8250,8 @@ class LLVMEmitter:
         # Legacy & and &mut are still accepted here for backward compat with existing AST
         # All map to the same LLVM IR: taking a pointer to the operand
         if expr.op in ('&', '@', '&mut', '@&'):
+            if expr.op in ('&mut', '@&'):
+                self._check_let_mut_borrow(expr.operand)
             if isinstance(expr.operand, rast.Ident):
                 name = expr.operand.name
                 if name in self.locals:
