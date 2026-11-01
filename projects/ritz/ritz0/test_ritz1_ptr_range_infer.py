@@ -33,7 +33,6 @@ CASES = [
     ("f32", "[1.0, 2.0, 3.5, -4.25, 5.0]", "3.5", "-4.25"),
     ("f64", "[1.0, 2.0, 3.5, -4.25, 5.0]", "3.5", "-4.25"),
 ]
-INT_CASES = [c for c in CASES if not c[0].startswith("f")]
 
 # The inferred `let s` is read (s[0], s[1]), written through (s[1] = ..),
 # re-sliced (`let u = s[1..2]`), and passed where a `*T` is expected.  A
@@ -131,8 +130,7 @@ def test_ptr_range_types_as_pointer(ritz1_bin, tmp_path, elem):
 # The range's own type: a pointer carrying the base's pointee.  `*(p[2..4])`
 # derefs it at the element's width.  Typed as the element (or u8 for
 # f32/f64), the deref fell to the i64 default and read 8 bytes.  Local,
-# param and global bases.  Integer widths only: `*p` on a *f32 / *f64 does
-# not lower yet (AGAST #2022).
+# param and global bases, every width (f32 / f64 since AGAST #2022).
 DEREF = """\
 var g: *{elem} = null
 
@@ -155,7 +153,7 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("elem,lit,v0,v1", INT_CASES, ids=[c[0] for c in INT_CASES])
+@pytest.mark.parametrize("elem,lit,v0,v1", CASES, ids=[c[0] for c in CASES])
 def test_deref_ptr_range_loads_element(ritz1_bin, tmp_path, elem, lit, v0, v1):
     src = DEREF.format(elem=elem, lit=lit, v0=v0)
     assert _run("ritz1", tmp_path, f"pri_deref_{elem}", src) == 42
