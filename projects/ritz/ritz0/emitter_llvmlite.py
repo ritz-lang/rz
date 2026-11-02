@@ -148,6 +148,18 @@ def _in_packed_struct(ptr) -> bool:
         ptr = ptr.operands[0]
 
 
+def _is_float_lit_operand(expr) -> bool:
+    """AGAST #1969: is `expr` a float literal or a negated one (`-0.1`,
+    `-(-0.1)`)?  Both emit a `double` whose value is exact in the source, so
+    a binop against an f32 narrows them to f32 rather than widening the f32
+    side.  Mirrors ritz1's `is_float_lit_operand` (emitter_core.ritz): the
+    two compilers must agree on exactly these shapes.
+    """
+    while isinstance(expr, rast.UnaryOp) and expr.op == '-':
+        expr = expr.operand
+    return isinstance(expr, rast.FloatLit)
+
+
 class _SretAwareBuilder(ir.IRBuilder):
     """IRBuilder that lowers calls to and returns from sret functions."""
 
@@ -6542,12 +6554,13 @@ class LLVMEmitter:
 
             # Unify float widths: `f32_value + 1.0` has an f32 operand and a
             # double literal. Narrow the literal side (its value is exact in
-            # the source), otherwise widen so both sides agree.
+            # the source; `-lit` counts too, #1969), otherwise widen so both
+            # sides agree.
             if (self._is_float_type(left.type) and self._is_float_type(right.type)
                     and left.type != right.type):
-                if isinstance(expr.right, rast.FloatLit):
+                if _is_float_lit_operand(expr.right):
                     right = self._convert_type(right, left.type)
-                elif isinstance(expr.left, rast.FloatLit):
+                elif _is_float_lit_operand(expr.left):
                     left = self._convert_type(left, right.type)
                 elif left.type == self.f32:
                     left = self.builder.fpext(left, right.type)
