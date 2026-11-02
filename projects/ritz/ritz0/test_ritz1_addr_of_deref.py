@@ -16,13 +16,11 @@ OP_ADDR(OP_DEREF e). That way the call-argument coercions that already apply to
 `@x` (by-value struct param, `@T` param) apply to `@*e` too. The emitter's
 lvalue-address helper gains a deref case, and the address of `*e` is `e` itself.
 
-ritz0 is NOT a reliable oracle for this construct. Its address-of falls
-through to "emit the operand" for anything but an ident/index/field, so `@*p`
-evaluates to the *loaded value* `*p`, not to `p`. That only happens to give
-the right answer where a by-value struct is wanted. Writes through `@&*p` hit a
-copy, `let q: *i32 = @*p` segfaults, and on a `h:& T` borrow `*h` crashes
-the emitter. Those cases are pinned as strict xfails on the ritz0 side (#2045).
-Where ritz0 is right, it is still run as the oracle.
+Until #2045 ritz0 was not a reliable oracle for this construct: its
+address-of fell through to "emit the operand", so `@*p` evaluated to the
+*loaded value* `*p`, not to `p`. Writes through `@&*p` hit a copy,
+`let q: *i32 = @*p` segfaulted, and on a `h:& T` borrow `*h` crashed the
+emitter. The SPEC programs now pin both compilers to the right answer.
 
 Every program returns 3 on success.
 """
@@ -159,7 +157,32 @@ pub fn main() -> i32
     return *q
 """
 
+# A `:&` borrow of a pointer reads as that pointer: `@*p` is p's value.
+BORROWED_PTR = """\
+fn g(p:& *i32) -> *i32
+    return @*p
+pub fn main() -> i32
+    var x: i32 = 3
+    var p: *i32 = @x
+    let q: *i32 = g(@&p)
+    return *q
+"""
+
+# `*h` on a `:&` borrow is the referent; reading it is a plain value.
+BORROW_DEREF_VALUE = """\
+struct H
+    i: i32
+fn g(h:& H) -> i32
+    let v: H = *h
+    return v.i
+pub fn main() -> i32
+    var x: H = H { i: 3 }
+    return g(@&x)
+"""
+
 SPEC = {
+    "borrowed_ptr": BORROWED_PTR,
+    "borrow_deref_value": BORROW_DEREF_VALUE,
     "repro": REPRO,
     "tempest": TEMPEST,
     "reborrow_mut": REBORROW_MUT,
@@ -234,20 +257,27 @@ def test_ritz1_addr_of_deref_matches_ritz0(ritz1_bin, tmp_path, name):
     assert _run("ritz1", ritz1_bin, tmp_path, name, ORACLE[name]) == 3
 
 
+# ritz1 cases still wrong; strict so the fix has to remove them.
+RITZ1_XFAIL = {
+    "borrowed_ptr": "#2075: ritz1 `@*p` on `p:& *T` yields the `**T` borrow slot",
+}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(SPEC))
+@pytest.mark.parametrize("name", [
+    pytest.param(n, marks=pytest.mark.xfail(strict=True, reason=RITZ1_XFAIL[n]))
+    if n in RITZ1_XFAIL else n
+    for n in sorted(SPEC)
+])
 def test_ritz1_addr_of_deref(ritz1_bin, tmp_path, name):
     """AGAST #1599: `@*e` / `@&*e` is the pointer `e` itself."""
     assert _run("ritz1", ritz1_bin, tmp_path, name, SPEC[name]) == 3
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(
-    strict=True,
-    reason="#2045: ritz0 lowers `@*e` to the loaded value `*e`, not to `e`",
-)
 @pytest.mark.parametrize("name", sorted(SPEC))
 def test_ritz0_addr_of_deref(tmp_path, name):
+    """AGAST #2045: ritz0 lowers `@*e` / `@&*e` to `e`, not to a copy of `*e`."""
     assert _run("ritz0", None, tmp_path, name, SPEC[name]) == 3
 
 

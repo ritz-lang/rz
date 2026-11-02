@@ -479,6 +479,10 @@ class LLVMEmitter:
         self.params: Dict[str, Tuple[ir.Value, ir.Type]] = {}  # name -> (value, type)
         # AGAST #2025: name -> the slot a large-struct `let` lives in.
         self._let_slots: Dict[str, ir.Value] = {}
+        # AGAST #2045: name -> incoming `*T` of a `name:& T` borrow param.
+        # A name is a borrow only while `locals[name]` still holds this
+        # pointer (a shadowing `let`/`var` rebinds it to an alloca).
+        self._mut_borrow_args: Dict[str, ir.Value] = {}
         # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
@@ -4032,6 +4036,7 @@ class LLVMEmitter:
         self._sret_results.clear()
         self.locals.clear()
         self.params.clear()
+        self._mut_borrow_args.clear()
         self._let_slots.clear()
         self._let_values.clear()
         self.has_returned = False
@@ -4091,6 +4096,7 @@ class LLVMEmitter:
                 # Store in locals so `x = val` assignments work (load/store through pointer)
                 # The arg IS the alloca-like storage (a pointer passed from caller)
                 self.locals[param.name] = (arg, arg.type.pointee)
+                self._mut_borrow_args[param.name] = arg
                 self.ritz_types[param.name] = param.type
                 # Don't register for Drop - borrowed values are not owned
                 self._emit_dbg_declare(arg, param.name, param.type, fn_line)
@@ -8277,6 +8283,24 @@ class LLVMEmitter:
 
         return self._emit_closure(closure)
 
+    def _borrow_referent_slot(self, expr: rast.Expr) -> Optional[ir.Value]:
+        """AGAST #2045: the incoming `*T` if `expr` names a `h:& T` borrow.
+
+        Only for a non-pointer `T`: there `h` already reads as the referent,
+        so `*h` is `h` and `@*h` is the borrow's pointer. For `h:& *U`, `h`
+        reads as a `*U` and `*h` / `@*h` take the ordinary pointer path.
+        None once a later binding has shadowed the param.
+        """
+        if not isinstance(expr, rast.Ident):
+            return None
+        arg = self._mut_borrow_args.get(expr.name)
+        if arg is None or expr.name not in self.locals:
+            return None
+        slot, ty = self.locals[expr.name]
+        if slot is not arg or isinstance(ty, ir.PointerType):
+            return None
+        return arg
+
     def _emit_unary(self, expr: rast.UnaryOp) -> ir.Value:
         """Emit a unary operation: -x, !x, *x, @x, @&x."""
         # Handle address-of operators: @, @&
@@ -8310,6 +8334,18 @@ class LLVMEmitter:
             elif isinstance(expr.operand, rast.Field):
                 # For &struct.field, use _emit_lvalue_addr to get the field's address
                 return self._emit_lvalue_addr(expr.operand)
+            elif isinstance(expr.operand, rast.UnaryOp) and expr.operand.op == '*':
+                # AGAST #2045: `@*e` / `@&*e` is the pointer `e` itself, not
+                # the value loaded through it. For a `h:& T` borrow, `*h` is
+                # the referent and its address is the incoming pointer.
+                inner = expr.operand.operand
+                slot = self._borrow_referent_slot(inner)
+                if slot is not None:
+                    return slot
+                ptr = self._emit_expr(inner)
+                if not isinstance(ptr.type, ir.PointerType):
+                    raise ValueError(f"Cannot dereference non-pointer: {ptr.type}")
+                return ptr
             else:
                 # For more complex expressions, emit the value (might be a pointer already)
                 operand = self._emit_expr(expr.operand)
@@ -8331,6 +8367,10 @@ class LLVMEmitter:
 
         elif expr.op == '*':
             # Dereference
+            if self._borrow_referent_slot(expr.operand) is not None:
+                # AGAST #2045: `h:& T` already reads as the referent `T`;
+                # the borrow is the pointer, so `*h` is `h`.
+                return operand
             if isinstance(operand.type, ir.PointerType):
                 return self.builder.load(operand)
             else:
