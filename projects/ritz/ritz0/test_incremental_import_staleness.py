@@ -20,6 +20,7 @@ The fix records a hash of every transitive import in the sig
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,7 @@ sys.path.insert(0, str(RITZ0_DIR))
 from emitter.fn_cache import (  # noqa: E402
     build_sig_data,
     check_import_hashes,
+    check_import_misses,
     sig_path_for,
     source_file_hash,
 )
@@ -168,3 +170,141 @@ class TestCheckImportHashes:
             import_hashes={"/x/lib.ritz": "abc"},
         )
         assert data["import_hashes"] == {"/x/lib.ritz": "abc"}
+
+
+# ---------------------------------------------------------------------------
+# A new file that shadows a resolved import (AGAST #2030)
+# ---------------------------------------------------------------------------
+#
+# `import_hashes` vouches only for the files the last compile READ.  Import
+# resolution is first match (importer's dir as foo/bar.ritz then foo.bar.ritz,
+# source roots, project root, RITZ_PATH), so a NEW file at a candidate probed
+# before the hit changes what the import resolves to while every recorded
+# hash still matches.  The sig records those probed-and-missed candidates
+# (`import_misses`) and the fast path requires them to still be missing.
+
+TAG_SRC = "pub const LIB_TAG: i32 = {}\n"
+TAG_MAIN = "import shared.tag\n\nfn main() -> i32\n    LIB_TAG\n"
+
+
+def _tag_tree(tmp_path: Path):
+    """app/main.ritz imports shared.tag, which only rootB provides (202)."""
+    app = tmp_path / "app"
+    app.mkdir()
+    main = app / "main.ritz"
+    main.write_text(TAG_MAIN)
+    root_b = tmp_path / "rootB"
+    (root_b / "shared").mkdir(parents=True)
+    (root_b / "shared" / "tag.ritz").write_text(TAG_SRC.format(202))
+    return main, root_b
+
+
+def _place(path: Path, value: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(TAG_SRC.format(value))
+
+
+def _compile_env(main: Path, out: Path, ritz_path: str, cache: Path):
+    env = dict(os.environ, RITZ_PATH=ritz_path, RITZ_CACHE_DIR=str(cache))
+    result = run_ritz0([str(main), "-o", str(out)], cwd=str(main.parent), env=env)
+    assert result.returncode == 0, f"compile failed:\n{result.stdout}\n{result.stderr}"
+    return result
+
+
+def _assert_shadow_recompiles(tmp_path, main, out, ritz_path, shadow):
+    cache = tmp_path / "cache"
+    _compile_env(main, out, ritz_path, cache)
+    assert "202" in out.read_text()
+    _place(shadow, 101)
+    second = _compile_env(main, out, ritz_path, cache)
+    assert "Skipped" not in second.stdout, (
+        "fast path kept IR for the import's OLD resolution: " + second.stdout)
+    cold = tmp_path / "cold.ll"
+    _compile_env(main, cold, ritz_path, tmp_path / "cold-cache")
+    assert "101" in cold.read_text(), "test is vacuous: cold IR lacks the new tag"
+    assert out.read_text() == cold.read_text()
+
+
+@pytest.mark.integration
+class TestFastPathSeesShadowingImports:
+    def test_ticket_repro_new_file_in_source_dir(self, tmp_path):
+        main, root_b = _tag_tree(tmp_path)
+        _assert_shadow_recompiles(tmp_path, main, main.parent / "a.ll", str(root_b),
+                                  main.parent / "shared" / "tag.ritz")
+
+    def test_new_flat_named_file_in_source_dir(self, tmp_path):
+        """The importer's dir is also probed for `shared.tag.ritz`."""
+        main, root_b = _tag_tree(tmp_path)
+        _assert_shadow_recompiles(tmp_path, main, main.parent / "a.ll", str(root_b),
+                                  main.parent / "shared.tag.ritz")
+
+    def test_new_file_in_earlier_ritz_path_entry(self, tmp_path):
+        main, root_b = _tag_tree(tmp_path)
+        root_a = tmp_path / "rootA"
+        root_a.mkdir()
+        _assert_shadow_recompiles(tmp_path, main, main.parent / "a.ll",
+                                  f"{root_a}:{root_b}", root_a / "shared" / "tag.ritz")
+
+    def test_earlier_ritz_path_entry_created_later(self, tmp_path):
+        """An entry that did not exist at the first compile is still a candidate."""
+        main, root_b = _tag_tree(tmp_path)
+        root_a = tmp_path / "rootA"
+        _assert_shadow_recompiles(tmp_path, main, main.parent / "a.ll",
+                                  f"{root_a}:{root_b}", root_a / "shared" / "tag.ritz")
+
+    def test_new_file_after_the_hit_keeps_the_fast_path(self, tmp_path):
+        """Guard: only candidates probed BEFORE the hit can shadow it."""
+        main, root_b = _tag_tree(tmp_path)
+        root_c = tmp_path / "rootC"
+        root_c.mkdir()
+        out = main.parent / "a.ll"
+        cache = tmp_path / "cache"
+        _compile_env(main, out, f"{root_b}:{root_c}", cache)
+        _place(root_c / "shared" / "tag.ritz", 101)
+        _place(root_b / "shared.tag.ritz", 101)
+        second = _compile_env(main, out, f"{root_b}:{root_c}", cache)
+        assert "Skipped" in second.stdout, second.stdout
+
+    def test_sig_without_import_misses_recompiles(self, tmp_path):
+        """A sig written before #2030 cannot vouch for its missed candidates."""
+        main, root_b = _tag_tree(tmp_path)
+        out = main.parent / "a.ll"
+        cache = tmp_path / "cache"
+        _compile_env(main, out, str(root_b), cache)
+        sig = cache / "ritz0" / (os.path.realpath(main).lstrip("/") + ".sig")
+        data = json.loads(sig.read_text())
+        assert str(main.parent / "shared" / "tag.ritz") in data["import_misses"]
+        data.pop("import_misses")
+        sig.write_text(json.dumps(data))
+        out.touch()
+        second = _compile_env(main, out, str(root_b), cache)
+        assert "Skipped" not in second.stdout, second.stdout
+
+
+@pytest.mark.unit
+class TestCheckImportMisses:
+    def test_missing_key_is_stale(self):
+        assert check_import_misses({"import_hashes": {}}) is False
+
+    def test_none_sig_is_stale(self):
+        assert check_import_misses(None) is False
+
+    def test_no_misses_is_fresh(self):
+        assert check_import_misses({"import_misses": []}) is True
+
+    def test_still_missing_is_fresh(self, tmp_path):
+        assert check_import_misses({"import_misses": [str(tmp_path / "no.ritz")]}) is True
+
+    def test_now_existing_is_stale(self, tmp_path):
+        f = tmp_path / "now.ritz"
+        f.write_text("")
+        assert check_import_misses({"import_misses": [str(f)]}) is False
+
+    def test_malformed_record_is_stale(self):
+        assert check_import_misses({"import_misses": {"a": 1}}) is False
+        assert check_import_misses({"import_misses": [3]}) is False
+
+    def test_build_sig_data_records_import_misses(self):
+        data = build_sig_data(source="fn main() -> i32\n    0\n", fn_hashes={},
+                              import_misses=["/x/b.ritz", "/x/a.ritz"])
+        assert data["import_misses"] == ["/x/a.ritz", "/x/b.ritz"]

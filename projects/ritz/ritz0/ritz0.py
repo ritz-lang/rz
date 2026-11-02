@@ -35,7 +35,7 @@ from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
     source_file_hash, build_hash_map, build_sig_hash_map,
     read_sig_file, write_sig_file, check_source_hash,
-    check_import_hashes, build_import_hashes,
+    check_import_hashes, check_import_misses, build_import_hashes,
     build_sig_data, detect_sig_changes, invalidate_dependents,
     compile_mode_key, check_output_entry, build_outputs,
 )
@@ -154,6 +154,9 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # still stale (AGAST #1674). The sig must also vouch for THIS output
         # in THIS mode: it is keyed by source alone, so another flag set or
         # another output path must not count as "unchanged" (AGAST #2020).
+        # And every candidate import resolution probed and missed must still
+        # be missing: a new file there would change what an import resolves
+        # to, behind import hashes that all still match (AGAST #2030).
         mode_key = compile_mode_key(_compile_mode(
             no_runtime, check_names, check_ownership, check_types,
             dependencies, source_roots, project_root, target, target_os,
@@ -166,6 +169,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
             if (output_mtime >= source_mtime
                     and check_source_hash(source, source_abs_path)
                     and check_import_hashes(prior_sig)
+                    and check_import_misses(prior_sig)
                     and check_output_entry(prior_sig, output_path, mode_key)):
                 print(f"Skipped {source_path} (unchanged)")
                 return True
@@ -205,6 +209,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # for the sources this .ll was actually built from (AGAST #1674).
         import_hashes = build_import_hashes(
             f for f in resolver.processed_files if f != source_abs_path)
+        # ...and the candidates it probed and missed on the way (AGAST #2030).
+        import_misses = sorted(resolver.missed_candidates)
 
         # Filter out items that don't match target_os
         # This must happen after import resolution but before name resolution
@@ -324,8 +330,10 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                 imports=original_import_paths,
                 old_sig_data=old_sig_data,
                 import_hashes=import_hashes,
+                import_misses=import_misses,
                 outputs=build_outputs(old_sig_data, source, import_hashes,
-                                      output_path, mode_key, ir),
+                                      output_path, mode_key, ir,
+                                      import_misses=import_misses),
             )
             write_sig_file(source_abs_path, sig_data)
         except Exception as e:

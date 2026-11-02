@@ -253,3 +253,135 @@ def test_ritz0_compile_between_ritz1_compiles_keeps_ritz1_warm(two_modules):
     a, _b, out = two_modules
     _ritz0(a, out.with_name("a.ritz0.ll"))
     assert SKIPPED in _ritz1(a, out).stdout
+
+
+# ---------------------------------------------------------------------------
+# 3. A new file that shadows a resolved import (AGAST #2030)
+# ---------------------------------------------------------------------------
+#
+# `import_hashes` vouches only for the files the last compile READ.  Import
+# resolution is first match (source dir, its ancestors, then each RITZ_PATH
+# entry: direct, lib/, src/), so a NEW file at a candidate probed before the
+# hit changes what the import resolves to while every recorded hash still
+# matches.  The sig records those probed-and-missed candidates
+# (`import_misses`) and the fast path requires them to still be missing.
+
+TAG_SRC = "pub const LIB_TAG: i32 = {}\n"
+TAG_MAIN = "import shared.tag\n\nfn main() -> i32\n    LIB_TAG\n"
+
+
+def _tag_tree(tmp_path: Path, main_dir: str = "app"):
+    """`<main_dir>/main.ritz` imports shared.tag, which only rootB provides (202)."""
+    app = tmp_path / main_dir
+    app.mkdir(parents=True)
+    main = app / "main.ritz"
+    main.write_text(TAG_MAIN)
+    root_b = tmp_path / "rootB"
+    (root_b / "shared").mkdir(parents=True)
+    (root_b / "shared" / "tag.ritz").write_text(TAG_SRC.format(202))
+    return main, root_b
+
+
+def _place(path: Path, value: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(TAG_SRC.format(value))
+
+
+def _cold(src: Path, tmp: Path, *extra, env: dict) -> str:
+    out = tmp / "cold.ll"
+    cold_env = dict(env, RITZ_CACHE_DIR=str(tmp / "cold-cache"))
+    _ritz1(src, out, *extra, env=cold_env)
+    return out.read_text()
+
+
+def _assert_recompiled(second, out: Path, cold: str) -> None:
+    assert SKIPPED not in second.stdout, (
+        "fast path kept IR for the import's OLD resolution: " + second.stdout)
+    assert "101" in cold and "202" not in cold, "test is vacuous: cold IR lacks the new tag"
+    assert out.read_text() == cold
+
+
+@pytest.mark.integration
+class TestRitz1FastPathSeesShadowingImports:
+
+    def test_ticket_repro_new_file_in_source_dir(self, tmp_path, cache_dir):
+        """The #2030 repro: `-I rootB` resolved shared.tag; app/shared/tag.ritz appears."""
+        main, root_b = _tag_tree(tmp_path)
+        out = main.parent / "a.ll"
+        _ritz1(main, out, "-I", str(root_b))
+        assert "202" in out.read_text()
+        _place(main.parent / "shared" / "tag.ritz", 101)
+        second = _ritz1(main, out, "-I", str(root_b))
+        _assert_recompiled(second, out, _cold(main, tmp_path, "-I", str(root_b), env=_env()))
+
+    def test_new_file_in_ancestor_dir(self, tmp_path, cache_dir):
+        """The resolver climbs the source dir's ancestors before RITZ_PATH."""
+        main, root_b = _tag_tree(tmp_path, "app/sub")
+        env = _env(RITZ_PATH=str(root_b))
+        out = main.parent / "a.ll"
+        _ritz1(main, out, env=env)
+        _place(tmp_path / "app" / "shared" / "tag.ritz", 101)
+        _assert_recompiled(_ritz1(main, out, env=env), out, _cold(main, tmp_path, env=env))
+
+    def test_new_file_in_earlier_ritz_path_entry(self, tmp_path, cache_dir):
+        """rootA precedes rootB in RITZ_PATH and gains shared/tag.ritz."""
+        main, root_b = _tag_tree(tmp_path)
+        root_a = tmp_path / "rootA"
+        root_a.mkdir()
+        env = _env(RITZ_PATH=f"{root_a}:{root_b}")
+        out = main.parent / "a.ll"
+        _ritz1(main, out, env=env)
+        _place(root_a / "shared" / "tag.ritz", 101)
+        _assert_recompiled(_ritz1(main, out, env=env), out, _cold(main, tmp_path, env=env))
+
+    def test_new_file_in_earlier_entrys_lib_subdir(self, tmp_path, cache_dir):
+        """The workspace probes (<entry>/<pkg>/lib/...) are candidates too."""
+        main, root_b = _tag_tree(tmp_path)
+        root_a = tmp_path / "rootA"
+        root_a.mkdir()
+        env = _env(RITZ_PATH=f"{root_a}:{root_b}")
+        out = main.parent / "a.ll"
+        _ritz1(main, out, env=env)
+        _place(root_a / "shared" / "lib" / "tag.ritz", 101)
+        _assert_recompiled(_ritz1(main, out, env=env), out, _cold(main, tmp_path, env=env))
+
+    def test_spliced_output_also_rechecks_misses(self, tmp_path, cache_dir):
+        """Path (b): make deleted a.ll; the splice must not resurrect the old tag."""
+        main, root_b = _tag_tree(tmp_path)
+        out = main.parent / "a.ll"
+        _ritz1(main, out, "-I", str(root_b))
+        _place(main.parent / "shared" / "tag.ritz", 101)
+        out.unlink()
+        second = _ritz1(main, out, "-I", str(root_b))
+        _assert_recompiled(second, out, _cold(main, tmp_path, "-I", str(root_b), env=_env()))
+
+    def test_new_file_after_the_hit_keeps_the_fast_path(self, tmp_path, cache_dir):
+        """Guard: only candidates probed BEFORE the hit can shadow it."""
+        main, root_b = _tag_tree(tmp_path)
+        root_c = tmp_path / "rootC"
+        root_c.mkdir()
+        env = _env(RITZ_PATH=f"{root_b}:{root_c}")
+        out = main.parent / "a.ll"
+        _ritz1(main, out, env=env)
+        _place(root_c / "shared" / "tag.ritz", 101)
+        _place(root_b / "shared" / "lib" / "tag.ritz", 101)
+        assert SKIPPED in _ritz1(main, out, env=env).stdout
+
+    def test_sig_records_import_misses(self, tmp_path, cache_dir):
+        main, root_b = _tag_tree(tmp_path)
+        _ritz1(main, main.parent / "a.ll", "-I", str(root_b))
+        data = json.loads(sig_path_for(main, "ritz1").read_text())
+        misses = data.get("import_misses")
+        assert isinstance(misses, list), data.keys()
+        assert str(main.parent / "shared" / "tag.ritz") in misses, misses
+
+    def test_sig_without_import_misses_is_not_trusted(self, tmp_path, cache_dir):
+        """A sig that cannot vouch for its missed candidates must fail closed."""
+        main, root_b = _tag_tree(tmp_path)
+        out = main.parent / "a.ll"
+        _ritz1(main, out, "-I", str(root_b))
+        sig = sig_path_for(main, "ritz1")
+        data = json.loads(sig.read_text())
+        data.pop("import_misses", None)
+        sig.write_text(json.dumps(data))
+        assert SKIPPED not in _ritz1(main, out, "-I", str(root_b)).stdout

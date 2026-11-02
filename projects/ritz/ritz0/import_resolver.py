@@ -205,12 +205,15 @@ class DependencyMapping:
         self.path = path          # Path to dependency root
         self.sources = sources    # Source directories within dependency
 
-    def resolve_import(self, module_parts: List[str]) -> Optional[str]:
+    def resolve_import(self, module_parts: List[str],
+                       misses: Optional[Set[str]] = None) -> Optional[str]:
         """Resolve an import path within this dependency.
 
         Args:
             module_parts: Path parts after the dependency name
                          e.g., for "squeeze.gzip", this would be ["gzip"]
+            misses: If given, every candidate probed and found missing is
+                    added to it (AGAST #2030: the fast path's negative deps)
 
         Returns:
             Path to the .ritz file if found, None otherwise
@@ -223,12 +226,11 @@ class DependencyMapping:
 
         # Search in dependency's source directories
         for src_dir in self.sources:
-            src_path = self.path / src_dir
-            if not src_path.is_dir():
-                continue
-            candidate = src_path / file_rel
+            candidate = self.path / src_dir / file_rel
             if candidate.exists():
                 return str(candidate.resolve())
+            if misses is not None:
+                misses.add(os.path.abspath(str(candidate)))
 
         return None
 
@@ -273,11 +275,23 @@ class ImportResolver:
         self.project_root: Optional[Path] = Path(project_root).resolve() if project_root else None
         # Additional import paths from RITZ_PATH environment variable
         self.import_paths: List[Path] = []
+        # Every RITZ_PATH entry, existing or not, in order: an entry created
+        # after a compile is a place an import can newly resolve to, so its
+        # candidates are probed (and recorded as misses) too (AGAST #2030).
+        self._ritz_path_roots: List[Path] = []
         ritz_path = os.environ.get('RITZ_PATH', '')
         if ritz_path:
             for p in ritz_path.split(':'):
+                if p:
+                    self._ritz_path_roots.append(Path(p).resolve())
                 if p and Path(p).exists():
                     self.import_paths.append(Path(p).resolve())
+        # Every candidate path _resolve_import_path probed and found missing
+        # before a hit.  The source-level fast path records these in the sig
+        # (`import_misses`) and requires them to still be missing: resolution
+        # is first match, so a new file at one changes what an import
+        # resolves to while every import hash still matches (AGAST #2030).
+        self.missed_candidates: Set[str] = set()
         # Metadata cache for incremental compilation
         self.use_cache = use_cache
         self.metadata_cache = MetadataCache() if use_cache else None
@@ -294,11 +308,14 @@ class ImportResolver:
         # Source roots: directories to search for imports (e.g., ["src", "kernel/src"])
         # These are searched after relative imports but before project root
         self.source_roots: List[Path] = []
+        # As _ritz_path_roots: every source root, existing or not (#2030).
+        self._source_root_candidates: List[Path] = []
         if source_roots:
             for sr in source_roots:
                 sr_path = Path(sr)
                 if not sr_path.is_absolute() and self.project_root:
                     sr_path = self.project_root / sr_path
+                self._source_root_candidates.append(sr_path.resolve())
                 if sr_path.exists():
                     self.source_roots.append(sr_path.resolve())
 
@@ -937,51 +954,33 @@ class ImportResolver:
         # e.g., "squeeze.gzip" → check if "squeeze" is a dependency
         if len(path_parts) >= 1 and path_parts[0] in self.dependencies:
             dep = self.dependencies[path_parts[0]]
-            result = dep.resolve_import(path_parts[1:])
-            if result:
-                return result
             # If not found in dependency, don't fall through to other resolution
             # This prevents accidental shadowing of dependency names
-            return None
+            return dep.resolve_import(path_parts[1:], self.missed_candidates)
 
-        # Try 1: Relative to importing file - foo/bar.ritz
         relative_path = Path(*path_parts[:-1]) / f"{path_parts[-1]}.ritz" if len(path_parts) > 1 else Path(f"{path_parts[0]}.ritz")
-        candidate = base_dir / relative_path
-        if candidate.exists():
-            return str(candidate.resolve())
-
-        # Try 1b: Relative to importing file - foo.bar.ritz
         flat_name = '.'.join(path_parts) + '.ritz'
-        candidate = base_dir / flat_name
-        if candidate.exists():
-            return str(candidate.resolve())
 
-        # Try 2: From source roots (e.g., ["src", "kernel/src"])
-        for source_root in self.source_roots:
-            candidate = source_root / relative_path
-            if candidate.exists():
-                return str(candidate.resolve())
-            candidate = source_root / flat_name
-            if candidate.exists():
-                return str(candidate.resolve())
-
-        # Try 4: From project root
+        # Each root is tried as foo/bar.ritz, then foo.bar.ritz:
+        #   1. the importing file's directory
+        #   2. source roots (e.g., ["src", "kernel/src"])
+        #   3. the project root
+        #   4. RITZ_PATH entries
+        # Roots that do not exist are still tried: their candidates miss, and
+        # are recorded as such, so creating the root later invalidates.
+        roots: List[Path] = [base_dir]
+        roots.extend(self._source_root_candidates)
         if self.project_root:
-            candidate = self.project_root / relative_path
-            if candidate.exists():
-                return str(candidate.resolve())
-            candidate = self.project_root / flat_name
-            if candidate.exists():
-                return str(candidate.resolve())
+            roots.append(self.project_root)
+        roots.extend(self._ritz_path_roots)
 
-        # Try 5: From RITZ_PATH directories
-        for import_path in self.import_paths:
-            candidate = import_path / relative_path
-            if candidate.exists():
-                return str(candidate.resolve())
-            candidate = import_path / flat_name
-            if candidate.exists():
-                return str(candidate.resolve())
+        for root in roots:
+            for candidate in (root / relative_path, root / flat_name):
+                if candidate.exists():
+                    return str(candidate.resolve())
+                # A miss BEFORE the hit: a file appearing here later would
+                # win, so the fast path must see it (AGAST #2030).
+                self.missed_candidates.add(os.path.abspath(str(candidate)))
 
         return None
 

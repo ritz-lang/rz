@@ -13,6 +13,11 @@
 #                       #2023);
 #   * `import_hashes` — FNV1a-64 of every file the source transitively
 #                       imports, keyed by canonical path (AGAST #1807);
+#   * `import_misses` — every candidate path import resolution probed and
+#                       found missing before a hit; each must still be
+#                       missing (AGAST #2030).  Resolution is first match, so
+#                       a NEW file at one of them changes what an import
+#                       resolves to, while every import hash still matches;
 #   * `module_ir`     — the output is reused only if it is byte-identical to
 #                       it, and otherwise rewritten from it.  The sig is per
 #                       source, so this is what ties it to *this* output
@@ -41,7 +46,8 @@
 #     "source_hash":   "<16 hex>",
 #     "compiler_hash": "<16 hex>",
 #     "module_ir":     "<the whole emitted .ll>" | null,
-#     "import_hashes": {"<canonical path>": "<16 hex>", ...}
+#     "import_hashes": {"<canonical path>": "<16 hex>", ...},
+#     "import_misses": ["<absolute path>", ...]
 #   }
 #
 # There used to be a per-function cache here too (`lookup_fn_ir` /
@@ -394,11 +400,21 @@ struct SigData
     # 1 when the sig carried an `import_hashes` record.  A sig without one
     # cannot vouch for its imports and is never reused.
     has_deps:      i32
+    # Candidates import resolution probed and missed (AGAST #2030): absolute
+    # path (heap cstring) and its FNV1a-64, which only speeds up de-duping.
+    miss_paths:    **u8
+    miss_hashes:   *u64
+    miss_count:    i32
+    miss_cap:      i32
+    # 1 when the record is complete: read from a well-formed `import_misses`,
+    # or taken from a compile that recorded every miss.  A sig without one
+    # cannot vouch for its misses and is never reused.
+    has_misses:    i32
 
 # Allocate a fresh empty SigData on the heap.
 pub fn sig_data_new() -> *SigData
-    # 96 bytes covers all fields with room for alignment padding.
-    let sd: *SigData = malloc(96) as *SigData
+    # 128 bytes covers all fields with room for alignment padding.
+    let sd: *SigData = malloc(128) as *SigData
     if sd == null
         return null
     sd.source_hash = 0
@@ -410,6 +426,11 @@ pub fn sig_data_new() -> *SigData
     sd.dep_count = 0
     sd.dep_cap = 0
     sd.has_deps = 0
+    sd.miss_paths = null
+    sd.miss_hashes = null
+    sd.miss_count = 0
+    sd.miss_cap = 0
+    sd.has_misses = 0
     return sd
 
 fn sig_data_free_deps(sd: *SigData)
@@ -428,11 +449,28 @@ fn sig_data_free_deps(sd: *SigData)
     sd.dep_count = 0
     sd.dep_cap = 0
 
+fn sig_data_free_misses(sd: *SigData)
+    var i: i32 = 0
+    while i < sd.miss_count
+        let p: *u8 = *(sd.miss_paths + i)
+        if p != null
+            free(p)
+        i = i + 1
+    if sd.miss_paths != null
+        free(sd.miss_paths as *u8)
+    if sd.miss_hashes != null
+        free(sd.miss_hashes as *u8)
+    sd.miss_paths = null
+    sd.miss_hashes = null
+    sd.miss_count = 0
+    sd.miss_cap = 0
+
 # Free SigData and all owned heap allocations.
 pub fn sig_data_free(sd: *SigData)
     if sd == null
         return
     sig_data_free_deps(sd)
+    sig_data_free_misses(sd)
     if sd.module_ir != null
         free(sd.module_ir)
     free(sd as *u8)
@@ -466,6 +504,46 @@ fn sig_data_add_dep(sd: *SigData, path: *u8, path_len: i64, h: u64)
     *(sd.dep_hashes + sd.dep_count) = h
     sd.dep_count = sd.dep_count + 1
 
+# Append a missed candidate, copying `path[0..path_len)`, unless it is
+# already listed (one import probes the same candidates from every importer).
+# Returns 1 when the path is listed afterwards, 0 if out of memory.
+fn sig_data_add_miss(sd: *SigData, path: *u8, path_len: i64) -> i32
+    let h: u64 = fnv1a_bytes(path, path_len)
+    var i: i32 = 0
+    while i < sd.miss_count
+        if *(sd.miss_hashes + i) == h
+            let p: *u8 = *(sd.miss_paths + i)
+            if strlen(p) == path_len and memcmp(p, path, path_len) == 0
+                return 1
+        i = i + 1
+    if sd.miss_count >= sd.miss_cap
+        var new_cap: i32 = sd.miss_cap * 2
+        if new_cap < 16
+            new_cap = 16
+        let np: **u8 = malloc((new_cap as i64) * 8) as **u8
+        let nh: *u64 = malloc((new_cap as i64) * 8) as *u64
+        if np == null or nh == null
+            return 0
+        if sd.miss_count > 0
+            memcpy(np as *u8, sd.miss_paths as *u8, (sd.miss_count as i64) * 8)
+            memcpy(nh as *u8, sd.miss_hashes as *u8, (sd.miss_count as i64) * 8)
+        if sd.miss_paths != null
+            free(sd.miss_paths as *u8)
+        if sd.miss_hashes != null
+            free(sd.miss_hashes as *u8)
+        sd.miss_paths = np
+        sd.miss_hashes = nh
+        sd.miss_cap = new_cap
+    let copy: *u8 = malloc(path_len + 1)
+    if copy == null
+        return 0
+    memcpy(copy, path, path_len)
+    *(copy + path_len) = 0
+    *(sd.miss_paths + sd.miss_count) = copy
+    *(sd.miss_hashes + sd.miss_count) = h
+    sd.miss_count = sd.miss_count + 1
+    return 1
+
 
 # ============================================================================
 # Dependency record for the compile in progress
@@ -475,13 +553,41 @@ fn sig_data_add_dep(sd: *SigData, path: *u8, path_len: i64, h: u64)
 # loads, with the exact bytes it is about to parse — so the hash describes
 # what this compile actually saw, not what is on disk by the time the sig is
 # written.  The record is moved into the outgoing sig by `sig_take_deps()`.
+#
+# It also calls `dep_record_miss()` for every candidate it probes and misses
+# before a hit (AGAST #2030).
 
 var g_dep_record: *SigData
+# 1 once a miss could not be recorded: the record is then incomplete, and
+# the outgoing sig carries no `import_misses`, so it is never reused.
+var g_miss_lost: i32
 
 pub fn dep_record_reset()
     if g_dep_record != null
         sig_data_free(g_dep_record)
     g_dep_record = null
+    g_miss_lost = 0
+
+# Record that import resolution probed `path` and found nothing there.  A
+# relative path is made absolute against the current directory, which is
+# where the resolver's probe looked.
+pub fn dep_record_miss(path: *u8)
+    if g_dep_record == null
+        g_dep_record = sig_data_new()
+        if g_dep_record == null
+            g_miss_lost = 1
+            return
+    var abs: String = string_new()
+    if *path != '/'
+        if push_canonical_path(@abs, c".") == 0
+            g_miss_lost = 1
+            string_drop(@abs)
+            return
+        string_push(@abs, '/')
+    string_push_cstr(@abs, path)
+    if sig_data_add_miss(g_dep_record, string_as_ptr(@abs), string_len(@abs)) == 0
+        g_miss_lost = 1
+    string_drop(@abs)
 
 pub fn dep_record_note(path: *u8, data: *u8, len: i64)
     if g_dep_record == null
@@ -501,9 +607,21 @@ pub fn dep_record_note(path: *u8, data: *u8, len: i64)
 # (a compile with no imports legitimately records none).
 pub fn sig_take_deps(sd: *SigData)
     sig_data_free_deps(sd)
+    sig_data_free_misses(sd)
     sd.has_deps = 1
+    sd.has_misses = 1
+    if g_miss_lost == 1
+        sd.has_misses = 0
     if g_dep_record == null
         return
+    sd.miss_paths = g_dep_record.miss_paths
+    sd.miss_hashes = g_dep_record.miss_hashes
+    sd.miss_count = g_dep_record.miss_count
+    sd.miss_cap = g_dep_record.miss_cap
+    g_dep_record.miss_paths = null
+    g_dep_record.miss_hashes = null
+    g_dep_record.miss_count = 0
+    g_dep_record.miss_cap = 0
     sd.dep_paths = g_dep_record.dep_paths
     sd.dep_hashes = g_dep_record.dep_hashes
     sd.dep_count = g_dep_record.dep_count
@@ -615,8 +733,26 @@ pub fn read_sig_file(sig_path: *u8) -> *SigData
     if ih_node != null and ih_node.kind == JSON_OBJECT
         sig_parse_deps(sd, ih_node)
 
+    let im_node: *JsonValue = json_get_field(root, c"import_misses")
+    if im_node != null and im_node.kind == JSON_ARRAY
+        sig_parse_misses(sd, im_node)
+
     json_free(root)
     return sd
+
+# Fill `sd`'s missed candidates from the `import_misses` array.  Any entry
+# that is not a non-empty string, or that cannot be stored, leaves the record
+# incomplete (`has_misses == 0`), so the sig is not reused.
+fn sig_parse_misses(sd: *SigData, arr: *JsonValue)
+    var i: i64 = 0
+    while i < arr.count
+        let val: *JsonValue = *(arr.items + i)
+        if val == null or val.kind != JSON_STRING or val.str_val == null or val.str_len <= 0
+            return
+        if sig_data_add_miss(sd, val.str_val, val.str_len) == 0
+            return
+        i = i + 1
+    sd.has_misses = 1
 
 # Fill `sd`'s dependencies from the `import_hashes` object.  An entry that is
 # not a string hash is recorded with hash 0, which no real file matches.
@@ -711,7 +847,7 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
 
     vec_push_str(buf, c"  \"import_hashes\": {")
     if sd.dep_count == 0
-        vec_push_str(buf, c"}\n")
+        vec_push_str(buf, c"}")
     else
         vec_push<u8>(buf, 10)       # '\n'
         var i: i32 = 0
@@ -731,9 +867,23 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
                 vec_push<u8>(buf, 44)   # ','
             vec_push<u8>(buf, 10)
             i = i + 1
-        vec_push_str(buf, c"  }\n")
+        vec_push_str(buf, c"  }")
 
-    vec_push_str(buf, c"}\n")
+    # Omitted when the record is incomplete, so the sig is never reused.
+    if sd.has_misses == 1
+        vec_push_str(buf, c",\n  \"import_misses\": [")
+        var j: i32 = 0
+        while j < sd.miss_count
+            vec_push_str(buf, c"\n    ")
+            let mp: *u8 = *(sd.miss_paths + j)
+            emit_json_string_bytes(buf, mp, strlen(mp))
+            if j + 1 < sd.miss_count
+                vec_push<u8>(buf, 44)   # ','
+            j = j + 1
+        if sd.miss_count > 0
+            vec_push_str(buf, c"\n  ")
+        vec_push<u8>(buf, 93)           # ']'
+    vec_push_str(buf, c"\n}\n")
 
 # Atomic write: serialize, write "<sig>.tmp.<pid>", rename over "<sig>".
 # Creates the sig's directory first.  Returns 0 on success, -1 on failure.
@@ -794,6 +944,21 @@ fn sig_deps_unchanged(sd: *SigData) -> i32
         i = i + 1
     return 1
 
+# 1 when every candidate import resolution missed last time is still missing
+# (AGAST #2030).  A sig with no complete record answers 0.  "Missing" is the
+# resolver's own test: `try_open_import` takes the first candidate that opens.
+fn sig_misses_absent(sd: *SigData) -> i32
+    if sd.has_misses == 0
+        return 0
+    var i: i32 = 0
+    while i < sd.miss_count
+        let fd: i32 = sys_open(*(sd.miss_paths + i), O_RDONLY)
+        if fd >= 0
+            sys_close(fd)
+            return 0
+        i = i + 1
+    return 1
+
 # Returns 1 when the requested compilation can be skipped — either:
 #   (a) <ll_path> holds exactly the sig's `module_ir` and its mtime is >= the
 #       source's, or
@@ -802,7 +967,7 @@ fn sig_deps_unchanged(sd: *SigData) -> i32
 #
 # BOTH branches are gated on the sig's source hash, its compiler identity
 # (`self_fp` is `cache_fingerprint()`; AGAST #1279) and its import hashes
-# (AGAST #1807).  Gating only (a) would be worse than useless — (b) is the
+# (AGAST #1807) and missed candidates (AGAST #2030).  Gating only (a) would be worse than useless — (b) is the
 # branch that *materialises* stale IR, re-creating a `.ll` that make had
 # just deleted and filling it with output that no longer matches the inputs.
 pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u8, self_fp: u64) -> i32
@@ -832,6 +997,12 @@ pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u
 
     # Every transitive import must be byte-identical to what was compiled.
     if sig_deps_unchanged(sd) == 0
+        sig_data_free(sd)
+        return 0
+
+    # ...and must still resolve to those files: no new file may have appeared
+    # at a candidate probed before one of them (AGAST #2030).
+    if sig_misses_absent(sd) == 0
         sig_data_free(sd)
         return 0
 

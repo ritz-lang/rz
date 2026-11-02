@@ -25,6 +25,7 @@ Key components:
   },
   "imports": ["ritzlib.sys", "ritzlib.io"],
   "import_hashes": {"/abs/path/ritzlib/sys.ritz": "<sha256 of that file>"},
+  "import_misses": ["/abs/path/app/ritzlib/sys.ritz"],
   "outputs": {"/abs/path/out.ll": {"mode": "<compile mode key>",
                                    "ir_hash": "<hash of the IR written>"}}
 }
@@ -32,6 +33,12 @@ Key components:
 `import_hashes` covers every TRANSITIVE import (AGAST #1674): the emitted .ll
 bakes in imported struct layouts, constants and signatures, so the
 "unchanged" fast path is only sound if none of those sources changed either.
+
+`import_misses` (AGAST #2030) lists every candidate path import resolution
+probed and found missing before a hit.  Resolution is first match, so a NEW
+file at one of them would change what an import resolves to while every
+`import_hashes` entry still matched; the fast path requires each to still be
+missing.
 
 `outputs` (AGAST #2020) records which output files this sig vouches for, in
 which compile mode, with which content.  The sig is keyed by source alone, so
@@ -474,6 +481,34 @@ def check_import_hashes(sig_data: Optional[Dict[str, Any]]) -> bool:
     return True
 
 
+def check_import_misses(sig_data: Optional[Dict[str, Any]]) -> bool:
+    """Check that every candidate the last compile probed and missed is still
+    missing (AGAST #2030).
+
+    Import resolution takes the first candidate that exists, so a new file at
+    a candidate probed BEFORE the hit changes what the import resolves to --
+    and nothing in `import_hashes` (which covers only the files read) sees it.
+
+    Args:
+        sig_data: Parsed .ritz.sig data (or None)
+
+    Returns:
+        True only if the sig records `import_misses` as a list of paths and
+        none of them exists now.  A sig without the record (written before
+        #2030), or with a malformed one, is treated as stale.
+    """
+    if not sig_data:
+        return False
+    misses = sig_data.get('import_misses')
+    if not isinstance(misses, list):
+        return False
+    for path in misses:
+        # Same predicate as ImportResolver._resolve_import_path's probes.
+        if not isinstance(path, str) or os.path.exists(path):
+            return False
+    return True
+
+
 def build_import_hashes(paths) -> Dict[str, str]:
     """Hash each source file in `paths` -> {path: source_file_hash}.
 
@@ -529,11 +564,12 @@ def check_output_entry(sig_data: Optional[Dict[str, Any]], output_path,
 
 def build_outputs(old_sig_data: Optional[Dict[str, Any]], source: str,
                   import_hashes: Dict[str, str], output_path, mode_key: str,
-                  ir: str) -> Dict[str, Dict[str, str]]:
+                  ir: str, import_misses: Optional[List[str]] = None
+                  ) -> Dict[str, Dict[str, str]]:
     """The sig's `outputs` after writing `ir` to `output_path` in `mode_key`.
 
     Other outputs' entries are kept only if the old sig was written for the
-    same source and import hashes; otherwise they describe IR built from
+    same source and import hashes (and, when given, import misses); otherwise they describe IR built from
     other inputs and can no longer be vouched for.  Entries whose file is
     gone are dropped.
     """
@@ -541,6 +577,8 @@ def build_outputs(old_sig_data: Optional[Dict[str, Any]], source: str,
     if (old_sig_data
             and old_sig_data.get('source_hash') == source_file_hash(source)
             and old_sig_data.get('import_hashes') == import_hashes
+            and (import_misses is None
+                 or old_sig_data.get('import_misses') == sorted(import_misses))
             and isinstance(old_sig_data.get('outputs'), dict)):
         for path, entry in old_sig_data['outputs'].items():
             if isinstance(entry, dict) and os.path.exists(path):
@@ -561,6 +599,7 @@ def build_sig_data(
     old_sig_data: Optional[Dict[str, Any]] = None,
     import_hashes: Optional[Dict[str, str]] = None,
     outputs: Optional[Dict[str, Dict[str, str]]] = None,
+    import_misses: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build a .ritz.sig data dict.
 
@@ -575,6 +614,8 @@ def build_sig_data(
             consulted by check_import_hashes() on the next build
         outputs: {abs_output: {mode, ir_hash}} from build_outputs();
             consulted by check_output_entry() on the next build
+        import_misses: candidate paths import resolution probed and missed
+            before each hit; consulted by check_import_misses()
 
     Returns:
         Dict suitable for write_sig_file()
@@ -611,6 +652,7 @@ def build_sig_data(
         'functions': functions,
         'imports': imports,
         'import_hashes': dict(import_hashes or {}),
+        'import_misses': sorted(import_misses or []),
         'outputs': dict(outputs or {}),
     }
 
