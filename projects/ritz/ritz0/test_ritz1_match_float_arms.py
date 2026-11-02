@@ -3,8 +3,9 @@
 The working cases (float arms of either width, untyped / annotated lets,
 `return match`, nested matches, if-expressions) are the matrix case
 ritz0/test/test_diff_match_float_arms.ritz, with ritz0 as the oracle.  This
-module covers what that file cannot: the paths ritz0 does not support either
-(it crashes on them, AGAST #2027).
+module covers what that file cannot: paths ritz0 rejects or crashes on (#2094).
+ritz0 now converts the annotated integer arm too; both compilers are checked
+against each other in test_let_float_match_int_arm.py (#2027).
 
 * An unannotated match whose integer arm comes BEFORE its first float arm.
   The phi's float type is fixed by the first float arm.  The integer arm's

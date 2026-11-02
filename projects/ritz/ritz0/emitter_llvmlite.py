@@ -4905,12 +4905,16 @@ class LLVMEmitter:
                     if stmt.type:
                         self.expected_ritz_type = stmt.type
                         self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
+                    saved_float = self._enter_float_tails(stmt.type, stmt.value)
                     try:
                         val = self._emit_expr(stmt.value)
                     finally:
                         self.expected_ritz_type = saved_expected
                         self._literal_ctx_nodes = saved_ctx
+                        self._leave_float_tails(saved_float)
                     self.simd_expected_type = None  # Clear SIMD context
+                    if stmt.type:
+                        self._check_initialiser_has_value(stmt, val)
                     self._check_int_literal_fits_declaration(stmt)
                     if stmt.type:
                         self._check_implicit_narrowing(stmt, val.type, ty)
@@ -4958,11 +4962,16 @@ class LLVMEmitter:
                 # to its specialization and emit through the expected-enum
                 # path, which also threads it into if / match / block tails.
                 let_enum = self._let_annotation_enum(stmt.type)
-                val = self._emit_expr_with_expected_enum(stmt.value, let_enum)
+                saved_float = self._enter_float_tails(stmt.type, stmt.value)
+                try:
+                    val = self._emit_expr_with_expected_enum(stmt.value, let_enum)
+                finally:
+                    self._leave_float_tails(saved_float)
                 self.closure_expected_type = None  # Clear context
                 self.simd_expected_type = None  # Clear SIMD context
                 self.expected_ritz_type = None
             if stmt.type:
+                self._check_initialiser_has_value(stmt, val)
                 # Use declared type and convert value if needed
                 declared_ty = self._ritz_type_to_llvm(stmt.type)
                 src_ty = val.type  # before _convert_type hides any narrowing
@@ -5858,8 +5867,19 @@ class LLVMEmitter:
         target_type = None
         if then_value is not None and else_value is not None:
             if then_value.type != else_value.type:
+                # A float-annotated initialiser fixes the merge type (#2027):
+                # by size alone, i64 vs f64 kept the THEN type and `if c then
+                # 0 else 1.5` truncated 1.5 to 1.
+                float_ty = self._float_merge_type(if_expr)
+                arm_types = (then_value.type, else_value.type)
+                if (float_ty is not None
+                        and any(isinstance(t, (ir.FloatType, ir.DoubleType))
+                                for t in arm_types)
+                        and all(self._is_float_arm_convertible(t)
+                                for t in arm_types)):
+                    target_type = float_ty
                 # Pick the larger type
-                if self._type_size(else_value.type) > self._type_size(then_value.type):
+                elif self._type_size(else_value.type) > self._type_size(then_value.type):
                     target_type = else_value.type
                 else:
                     target_type = then_value.type
@@ -11332,6 +11352,24 @@ class LLVMEmitter:
             getattr(stmt, "span", None),
         )
 
+    def _check_initialiser_has_value(self, stmt, val) -> None:
+        """Reject a typed `let`/`var` whose initialiser yielded no value.
+
+        A match whose live arms have irreconcilable types returns
+        ir.Undefined (#1321). Read as a value it died with a raw
+        `'_Undefined' object has no attribute 'type'` (#1357, #2027).
+        A pointer or bool arm next to a float arm under a float annotation
+        still lands here (#2027, #2093), now as a located error.
+        """
+        if val is not ir.Undefined:
+            return
+        raise EmitError(
+            f"`{stmt.name}` is declared `{self._format_ritz_type(stmt.type)}` "
+            f"but its initialiser has no single value type: its match / if "
+            f"arms yield values that cannot be merged at that type",
+            getattr(stmt, "span", None),
+        )
+
     def _check_let_annotation(self, stmt, val: ir.Value, declared_ty: ir.Type) -> None:
         """Reject `let x: T = expr` where expr cannot possibly be a T.
 
@@ -11677,6 +11715,112 @@ class LLVMEmitter:
         """
         value = const.constant
         return -(1 << (width - 1)) <= value < (1 << width)
+
+    # --- AGAST #2027: arms of a float-annotated initialiser ------------------
+    #
+    # `let a: f64 = 0` and `let a: f64 = <int expr>` convert the initialiser
+    # to the annotation (sitofp, via _convert_type); so does `let a: f32 =
+    # <f64>` (fptrunc). A match or if that IS the initialiser gets the same
+    # conversion per arm, so its arms merge at the annotation's float type
+    # instead of being called irreconcilable (match: ir.Undefined, then a raw
+    # AttributeError in LetStmt) or merged at the "larger" int type (if:
+    # `if c then 0 else 1.5` truncated 1.5 to 1). Same rule as ritz1 #1946.
+
+    def _float_tail_ids(self, root: Optional[rast.Expr]) -> set:
+        """Ids of the Match / If nodes that are value tails of `root`.
+
+        A tail is the initialiser itself, or (recursively) a match arm body,
+        an if branch's trailing expression, or a block's trailing expression.
+        Anything else (a call argument, an operand, a cast) consumes the
+        value at a type we have not established, so the descent stops there.
+        """
+        ids = set()
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, rast.Match):
+                ids.add(id(node))
+                stack.extend(arm.body for arm in node.arms)
+            elif isinstance(node, rast.If):
+                ids.add(id(node))
+                stack.append(node.then_block)
+                stack.append(node.else_block)
+            elif isinstance(node, rast.Block):
+                stack.append(node.expr)
+        return ids
+
+    def _float_annotation_llvm(self, ty: Optional[rast.Type]) -> Optional[ir.Type]:
+        """The LLVM float type for an `f32` / `f64` annotation, else None."""
+        if isinstance(ty, rast.NamedType) and not ty.args:
+            if ty.name == 'f32':
+                return self.f32
+            if ty.name == 'f64':
+                return self.f64
+        return None
+
+    def _enter_float_tails(self, ty: Optional[rast.Type], value) -> tuple:
+        """Install the float-merge context for a typed initialiser.
+
+        Returns the previous context for _leave_float_tails: a typed `let`
+        nested in an arm block must not leave its own context behind.
+        """
+        saved = (getattr(self, '_float_tail_set', frozenset()),
+                 getattr(self, '_float_tail_ty', None))
+        float_ty = self._float_annotation_llvm(ty)
+        if float_ty is None:
+            self._float_tail_set, self._float_tail_ty = frozenset(), None
+        else:
+            self._float_tail_set = self._float_tail_ids(value)
+            self._float_tail_ty = float_ty
+        return saved
+
+    def _leave_float_tails(self, saved: tuple) -> None:
+        self._float_tail_set, self._float_tail_ty = saved
+
+    def _float_merge_type(self, node) -> Optional[ir.Type]:
+        """The float type `node`'s arms must merge at, or None."""
+        if id(node) in getattr(self, '_float_tail_set', frozenset()):
+            return self._float_tail_ty
+        return None
+
+    @staticmethod
+    def _is_float_arm_convertible(ty: ir.Type) -> bool:
+        """Arm types _convert_type turns into a float the way a plain let does.
+
+        bool (i1) is excluded: the plain form `let a: f64 = <bool>` gives
+        -1.0 in ritz0 and 1.0 in ritz1 (#2093), so it is not copied here.
+        """
+        if isinstance(ty, (ir.FloatType, ir.DoubleType)):
+            return True
+        return isinstance(ty, ir.IntType) and ty.width > 1
+
+    def _merge_arms_at_float(self, incoming: list, float_ty: ir.Type) -> Optional[ir.Value]:
+        """Merge (value, exit_block) arms at `float_ty`, or None.
+
+        Only applies when some arm is already a float and every arm converts
+        the way the plain-form let does (_is_float_arm_convertible). All-int
+        arms keep the integer merge (LetStmt converts the result once), and
+        a non-numeric arm returns None so the caller's irreconcilable path
+        runs. Each conversion goes in the arm's own exit block, before its
+        branch, so it dominates the phi.
+        """
+        types = [v.type for v, _ in incoming]
+        if not any(isinstance(t, (ir.FloatType, ir.DoubleType)) for t in types):
+            return None
+        if not all(self._is_float_arm_convertible(t) for t in types):
+            return None
+        merge_block = self.builder.block
+        converted = []
+        for val, block in incoming:
+            if val.type != float_ty:
+                self.builder.position_before(block.terminator)
+                val = self._convert_type(val, float_ty)
+            converted.append((val, block))
+        self.builder.position_at_end(merge_block)
+        phi = self.builder.phi(float_ty)
+        for val, block in converted:
+            phi.add_incoming(val, block)
+        return phi
 
     def _merge_match_arms(self, incoming: list) -> ir.Value:
         """Build the merge phi for a value-producing match.
@@ -12037,6 +12181,12 @@ class LLVMEmitter:
             # match simply has no value, so fall through to the dummy below.
             if not all(hasattr(val, 'type') for val, _ in incoming):
                 incoming = []
+            # A float-annotated initialiser fixes the merge type (#2027).
+            float_ty = self._float_merge_type(expr)
+            if incoming and float_ty is not None:
+                merged = self._merge_arms_at_float(incoming, float_ty)
+                if merged is not None:
+                    return merged
             # Irreconcilable arm types (assignment arm yielding its enum
             # value next to a `pass` arm's dummy i32 0) also make this a
             # statement match — a phi would mix an integer constant into an
@@ -12200,6 +12350,12 @@ class LLVMEmitter:
             # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
             if any(val is ir.Undefined for val, _ in incoming):
                 return ir.Undefined
+            # A float-annotated initialiser fixes the merge type (#2027).
+            float_ty = self._float_merge_type(expr)
+            if incoming and float_ty is not None:
+                merged = self._merge_arms_at_float(incoming, float_ty)
+                if merged is not None:
+                    return merged
             # Irreconcilable arm types (e.g. an assignment arm yielding its
             # enum value next to a `pass` arm's dummy i32 0) mean nobody can
             # consume this match as a value: it is a statement. Building a
