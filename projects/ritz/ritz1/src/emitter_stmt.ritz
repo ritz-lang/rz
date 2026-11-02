@@ -18,6 +18,7 @@ import emitter_expr_arith    # deref_pointee_struct_name (AGAST #1505)
 import emitter_match
 import narrowing           # check_implicit_narrowing (AGAST #1364)
 import let_check           # let_check_stmt / let_mark_decl (AGAST #2028)
+import emitter_expr_call   # method_callee_def (AGAST #1798)
 
 # resolve_member_chain_field moved to emitter_core (AGAST #1660) so the
 # binary-op emitter can type enum-valued member operands too.
@@ -179,68 +180,31 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type_name = c"Span$u8"
                 stmt.var_type_name_len = 7
             else
-                # task-112: non-intrinsic impl-method calls. Resolve the
-                # receiver's struct type, then walk the impl table for a
-                # matching Type.method whose return is TYPE_STRUCT and
-                # narrow var_type. Without this, `let x = a.clone_self()`
-                # allocates i64 and loses the %Struct layout the call
-                # actually produces — downstream field access and arg
-                # coercion then bind to the wrong slot type.
-                var recv_tn: *u8 = null
+                # task-112 / AGAST #1798: a method returning a struct or a
+                # float narrows the local to that type.  Resolve the callee
+                # exactly as emit_expr_method dispatches it: a UFCS helper
+                # (`a.slice(0, n)` and `a[:]` -> `vec_slice$i32` -> Vec$i32),
+                # a user impl method (`a.clone_self()`, static `Vec2.new()`),
+                # or a specialised generic impl method (`W$i32_dup`).  Only
+                # the impl table was walked before #1798, so a UFCS call left
+                # the local i64 and `s.push(5)` then failed "cannot determine
+                # receiver type for method call".
                 var recv_tn_len: i32 = 0
-                let rcv: *Expr = stmt.var_init.left
-                if rcv != null
-                    if rcv.kind == EXPR_IDENT
-                        let loc: *LocalVar = find_local_struct_name(s, rcv.ident_ptr, rcv.ident_len)
-                        if loc != null
-                            recv_tn = loc.type_name
-                            recv_tn_len = loc.type_name_len
-                        else
-                            # Static-method call: `Vec2.new(...)` — the LHS
-                            # ident IS the type name, not a local binding.
-                            # Use the ident itself as the receiver type so
-                            # the impl-table walk below resolves the static
-                            # method's return type.  Without this, `let v =
-                            # Vec2.new(...)` allocated i64 and stored a
-                            # %Vec2 into it (type mismatch).
-                            let static_st: *StructDef = find_struct(s, rcv.ident_ptr, rcv.ident_len)
-                            if static_st != null
-                                recv_tn = rcv.ident_ptr as *u8
-                                recv_tn_len = rcv.ident_len
-                    else if rcv.kind == EXPR_CALL
-                        let fdr: *FnDef = find_call_fn(s, rcv)
-                        if fdr != null and fdr.return_type == TYPE_STRUCT
-                            recv_tn = fdr.return_type_name
-                            recv_tn_len = fdr.return_type_name_len
-                    else if rcv.kind == EXPR_STRUCT_LIT
-                        # Rvalue receiver: `Point { ... }.scale(...)` — the
-                        # struct-lit ident IS the receiver type, used for
-                        # impl-table walk to narrow the call's return type.
-                        if rcv.ident_ptr != null and rcv.ident_len > 0
-                            recv_tn = rcv.ident_ptr as *u8
-                            recv_tn_len = rcv.ident_len
+                let recv_tn: *u8 = method_recv_type_name(s, stmt.var_init, @recv_tn_len)
+                var m: *FnDef = null
                 if recv_tn != null and recv_tn_len > 0
-                    var ib: *ImplBlock = s.module.impls
-                    while ib != null
-                        if name_eq(ib.type_name, ib.type_name_len, recv_tn, recv_tn_len) == 1
-                            var m: *FnDef = ib.methods
-                            while m != null
-                                if name_eq(m.name, m.name_len, stmt.var_init.ident_ptr, stmt.var_init.ident_len) == 1
-                                    if m.return_type == TYPE_STRUCT and m.return_type_name_len > 0
-                                        var_type = TYPE_STRUCT
-                                        stmt.var_type = TYPE_STRUCT
-                                        stmt.var_type_name = m.return_type_name
-                                        stmt.var_type_name_len = m.return_type_name_len
-                                    else if m.return_type == TYPE_F32 or m.return_type == TYPE_F64
-                                        # Float-returning method: narrow so
-                                        # alloca/store width match (was
-                                        # `alloca i64; store float` mismatch).
-                                        var_type = m.return_type
-                                        stmt.var_type = m.return_type
-                                    break
-                                m = m.next
-                            break
-                        ib = ib.next
+                    m = method_callee_def(s, recv_tn, recv_tn_len, stmt.var_init.ident_ptr, stmt.var_init.ident_len)
+                if m != null
+                    if m.return_type == TYPE_STRUCT and m.return_type_name_len > 0
+                        var_type = TYPE_STRUCT
+                        stmt.var_type = TYPE_STRUCT
+                        stmt.var_type_name = m.return_type_name
+                        stmt.var_type_name_len = m.return_type_name_len
+                    else if m.return_type == TYPE_F32 or m.return_type == TYPE_F64
+                        # Float-returning method: narrow so alloca/store
+                        # width match (was `alloca i64; store float`).
+                        var_type = m.return_type
+                        stmt.var_type = m.return_type
         # AGAST #1681: `var parsed = p` where `p` is a struct-typed local —
         # a by-value struct param or a struct `let`.  Copy its struct type
         # so the slot is `alloca %S` (was `alloca i64` → `store i64 %<%S>`

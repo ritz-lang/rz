@@ -174,7 +174,7 @@ fn main() -> i32
     var a: Vec<i32> = vec_new<i32>()
     a.push(3)
     a.push(4)
-    var s: Vec<i32> = a[:]
+    var s = a[:]
     s.push(5)
     return (s.len() * 10 + a.len()) as i32
 """,

@@ -300,9 +300,9 @@ fn resolve_member_field(m: *Module, e: *Expr) -> *StructField
         f = f.next
     return null
 
-# Register `<prefix><method>$T` (vec_/span_) for a UFCS call on a Vec/Span
-# receiver of the given kind and "$T" suffix, if that generic template exists.
-fn register_ufcs_instantiation(m: *Module, kind: i32, suf: *u8, suf_len: i32, method: *u8, method_len: i32)
+# The generic UFCS template `<prefix><method>` (vec_/span_) a method call on
+# a Vec/Span receiver of the given kind dispatches to, or null.
+fn find_ufcs_template(m: *Module, kind: i32, method: *u8, method_len: i32) -> *FnDef
     var prefix: *u8 = null
     var prefix_len: i32 = 0
     if kind == 1
@@ -311,8 +311,8 @@ fn register_ufcs_instantiation(m: *Module, kind: i32, suf: *u8, suf_len: i32, me
     else if kind == 2
         prefix = c"span_"
         prefix_len = 5
-    if prefix_len == 0 or suf == null or suf_len <= 0
-        return
+    if prefix_len == 0
+        return null
     let mangled_len: i32 = prefix_len + method_len
     let mangled: *u8 = malloc(mangled_len as i64 + 1) as *u8
     for i in 0..prefix_len
@@ -320,8 +320,61 @@ fn register_ufcs_instantiation(m: *Module, kind: i32, suf: *u8, suf_len: i32, me
     for i in 0..method_len
         *(mangled + prefix_len + i) = *(method + i)
     *(mangled + mangled_len) = 0
-    if find_generic_function(m, mangled, mangled_len) != null
-        add_instantiation(mangled, mangled_len, suf, suf_len)
+    let tmpl: *FnDef = find_generic_function(m, mangled, mangled_len)
+    free(mangled)
+    return tmpl
+
+# Register `<prefix><method>$T` (vec_/span_) for a UFCS call on a Vec/Span
+# receiver of the given kind and "$T" suffix, if that generic template exists.
+fn register_ufcs_instantiation(m: *Module, kind: i32, suf: *u8, suf_len: i32, method: *u8, method_len: i32)
+    if suf == null or suf_len <= 0
+        return
+    let tmpl: *FnDef = find_ufcs_template(m, kind, method, method_len)
+    if tmpl != null
+        add_instantiation(tmpl.name, tmpl.name_len, suf, suf_len)
+
+# AGAST #1798: record an un-annotated local initialised by a method call on a
+# tracked ident receiver -- `var s = a.slice(0, n)`, `var s = a[:]` (which
+# lowers to that call), `var v = b.items()` -- so a later `s.push(..)`
+# instantiates `vec_push$T` even when no other receiver calls push.
+fn track_method_init_local(m: *Module, name: *u8, name_len: i32, init: *Expr)
+    if init.left == null or init.left.kind != EXPR_IDENT
+        return
+    let idx: i32 = find_local_var_idx(init.left.ident_ptr, init.left.ident_len)
+    if idx < 0
+        return
+    let kind: i32 = *(g_lv_prefix_kind + idx)
+    if kind > 0
+        # Vec/Span receiver: a UFCS template returning its own collection
+        # over its type parameter (`vec_slice<T> -> Vec<T>`, "Vec$T") gives
+        # that collection at the receiver's suffix.
+        let tmpl: *FnDef = find_ufcs_template(m, kind, init.ident_ptr, init.ident_len)
+        if tmpl == null or tmpl.return_type != TYPE_STRUCT or tmpl.type_params == null
+            return
+        var rsuf: *u8 = null
+        var rsuf_len: i32 = 0
+        let rkind: i32 = classify_collection_type(tmpl.return_type_name, tmpl.return_type_name_len, @rsuf, @rsuf_len)
+        let tp: *TypeParam = tmpl.type_params
+        if rkind > 0 and rsuf_len == tp.name_len + 1
+            if memcmp(rsuf + 1, tp.name, tp.name_len as i64) == 0
+                add_local_var(name, name_len, rkind, *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx))
+        return
+    # Struct receiver (by value or pointer): its non-generic impl method's
+    # return type, recorded like an annotation of that type.
+    let tn: *u8 = *(g_lv_type_names + idx)
+    let tn_len: i32 = *(g_lv_type_name_lens + idx)
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params == null and ib.type_name_len == tn_len
+            if memcmp(ib.type_name, tn, tn_len as i64) == 0
+                var meth: *FnDef = ib.methods
+                while meth != null
+                    if meth.name_len == init.ident_len
+                        if memcmp(meth.name, init.ident_ptr, init.ident_len as i64) == 0
+                            track_typed_local(name, name_len, meth.return_type, meth.return_type_name, meth.return_type_name_len)
+                            return
+                    meth = meth.next
+        ib = ib.next
 
 fn find_local_var_idx(name: *u8, name_len: i32) -> i32
     for i in 0..g_lv_count
@@ -722,6 +775,8 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
         else if s.var_init != null and s.var_init.kind == EXPR_STRUCT_LIT
             # Un-annotated `var r = R { ... }`: the literal names the type.
             add_local_struct_var(s.var_name, s.var_name_len, s.var_init.ident_ptr, s.var_init.ident_len)
+        else if s.var_init != null and s.var_init.kind == EXPR_METHOD
+            track_method_init_local(m, s.var_name, s.var_name_len, s.var_init)
         if s.var_init != null
             collect_from_expr(m, s.var_init)
     else if k == STMT_ASSIGN
