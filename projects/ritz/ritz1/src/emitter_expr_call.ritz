@@ -3532,6 +3532,34 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             # the slot therefore points at a pointer, not at the struct.
             if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
                 recv_is_ptr_of_ptr = 1
+        else
+            # AGAST #2044: a global receiver (`g_p.get()`).  A struct
+            # global's address `@g` is the receiver itself (auto-borrowed,
+            # so a mutating method writes the global); a `*S` global holds
+            # a pointer in `@g`, so it is dispatched ptr-of-ptr, like a
+            # pointer-typed local (cf. emit_member_ptr's #1892 arm).
+            let rglob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+            if rglob != null
+                var rg_ptr_of_ptr: i32 = -1
+                if rglob.var_type == TYPE_STRUCT and rglob.type_name_len > 0
+                    type_name = rglob.type_name
+                    type_name_len = rglob.type_name_len
+                    rg_ptr_of_ptr = 0
+                else if rglob.var_type == TYPE_PTR and rglob.pointee_type == TYPE_STRUCT and rglob.pointee_type_name_len > 0
+                    type_name = rglob.pointee_type_name
+                    type_name_len = rglob.pointee_type_name_len
+                    rg_ptr_of_ptr = 1
+                if rg_ptr_of_ptr >= 0
+                    # Name `@g` as a register so every dispatcher below can
+                    # take it like a local's slot.
+                    let rg_reg: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, rg_reg)
+                    emit_str(s, c" = getelementptr i8, ptr @")
+                    emit_name(s, rglob.name, rglob.name_len)
+                    emit_str(s, c", i64 0  ; global receiver\n")
+                    receiver_reg = rg_reg
+                    recv_is_ptr_of_ptr = rg_ptr_of_ptr
     else if e.left.kind == EXPR_INDEX and e.left.left != null and e.left.left.kind == EXPR_IDENT and (e.left.right == null or e.left.right.kind != EXPR_RANGE)
         # AGAST #1981: `arr[i].m()` on a local `[N]St` -- the element's
         # address is the receiver, dispatched in place (a mutating method

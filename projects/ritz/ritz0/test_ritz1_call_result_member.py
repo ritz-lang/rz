@@ -268,6 +268,37 @@ pub fn main() -> i32
         return 3
     return (p.outer().inner.x + 39) as i32
 """,
+    # Field off a method result on a global receiver (AGAST #2044):
+    # call_result_struct_name must resolve a struct global's and a `*P`
+    # global's type, not mistake the global for a static-dispatch type name.
+    "method_global_receiver": STRUCTS
+    + """\
+struct P
+    v: i64
+
+impl P
+    fn pair(self: *P) -> F
+        F { a: self.v, b: self.v > 0 }
+    fn outer(self: *P) -> Outer
+        mko(self.v)
+
+var g_p: P
+var g_q: *P
+
+pub fn main() -> i32
+    g_p.v = 3
+    if g_p.pair().a != 3
+        return 1
+    if not g_p.pair().b
+        return 2
+    if g_p.outer().inner.y != 5
+        return 3
+    var p: P = P { v: 37 }
+    g_q = @p
+    if g_q.pair().a != 37
+        return 4
+    return (g_q.outer().inner.x + g_p.outer().inner.y as i64) as i32
+""",
     # Field off a static method result.
     "static_method": """\
 struct Q
