@@ -75,6 +75,10 @@ struct MatchResult
     # void fn: emit_expr returns register 0, which is never defined).  Any
     # such arm makes the match valueless: emit_match emits no phi.
     void_arms: i32
+    # AGAST #2046: where the first valueless arm is (its innermost void
+    # call), for the error when the match's value is wanted.
+    void_line: i32
+    void_col: i32
 
 # AGAST #1946: a `values[]` entry for an arm with no value (`pass`, or a body
 # with no trailing expression): the phi gets the zero constant of its type
@@ -320,6 +324,37 @@ fn match_result_init(r: *MatchResult, n_arms: i32)
     r.float_ty = 0
     r.int_arms = 0
     r.void_arms = 0
+    r.void_line = 0
+    r.void_col = 0
+
+# AGAST #2046: take the caller's "value discarded" flag (match_no_value) and
+# clear it so no nested match / if sees it.  Returns 1 if the value is wanted.
+fn take_match_wants_value(s: *EmitterState) -> i32
+    let discard: i32 = s.match_no_value
+    s.match_no_value = 0
+    1 - discard
+
+# AGAST #2046: the arms of a match / if were emitted and at least one had no
+# value.  If the value is wanted that is a located error at the innermost
+# void call; either way publish that location for an enclosing match, whose
+# arm this match / if may be.
+fn match_void_arms_settle(s: *EmitterState, result: *MatchResult, wants_value: i32)
+    s.void_arm_line = result.void_line
+    s.void_arm_col = result.void_col
+    if wants_value == 0
+        return
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(result.void_line as i64)
+    eprint_char(':')
+    eprint_i64(result.void_col as i64)
+    eprints_cstr(c": error: this arm calls a fn that returns nothing, so it has no value; the `match`/`if` it belongs to is used as a value here\n")
+    emit_str(s, c"  ; ERROR: valueless match / if arm used as a value\n")
+    s.error_count = s.error_count + 1
 
 # AGAST #1946: the float type (TYPE_F32 / TYPE_F64) arm value `e` was just
 # emitted at, or 0.  A nested match / if publishes its phi type as it
@@ -466,6 +501,11 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # AGAST #2028: `@&` of a `let` in an expression arm, with the arm's
         # pattern binding in scope.
         let_check_expr(s, arm.body)
+        # AGAST #2046: a match / if nested as the arm never reports its own
+        # valueless arm; it returns no value and this match decides.
+        let nested: i32 = arm.body.kind == EXPR_MATCH or arm.body.kind == EXPR_IF
+        if nested
+            s.match_no_value = 1
         body_reg = emit_expr(s, arm.body)
     if arm.is_pass == 0 and arm.body != null and body_reg == 0
         # AGAST #1654: a void call (`Some(e) => say(e)`), or a nested
@@ -473,6 +513,15 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # nothing ever names %.0, and mark the whole match valueless.
         result.void_arms = result.void_arms + 1
         body_reg = MATCH_ZERO_VALUE
+        if result.void_line == 0
+            # AGAST #2046: locate the void call; a nested valueless match /
+            # if published its own innermost one.
+            if arm.body.kind == EXPR_MATCH or arm.body.kind == EXPR_IF
+                result.void_line = s.void_arm_line
+                result.void_col = s.void_arm_col
+            else
+                result.void_line = arm.body.span.line
+                result.void_col = arm.body.span.col
     else if arm.is_pass == 0 and arm.body != null
         # AGAST #1645: resolve the arm's struct type while its pattern
         # binding (`Some(v) => v`) is still in scope; it is popped below.
@@ -648,6 +697,7 @@ fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len:
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
 fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
+    let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
     # Detect whether the scrutinee is a tagged-enum struct; if so, spill
     # it into an alloca once so every arm can GEP the same pointer.
     var enum_name: *u8 = null
@@ -706,6 +756,7 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
         s.last_match_agg_name = null
         s.last_match_agg_name_len = 0
         s.last_match_float_ty = 0
+        match_void_arms_settle(s, @result, wants_value)   # AGAST #2046
         emit_str(s, c"  br label %")
         emit_label(s, end_label)
         emit_str(s, c"\n")
@@ -791,6 +842,7 @@ fn if_arm_check_value(s: *EmitterState, arm: *MatchArm)
 # `br` to the merge, and types a struct-valued arm (#1645) so the phi is
 # `%StrView` / `%Point` rather than i64.  Returns the phi register.
 fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
+    let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
     let then_arm: *MatchArm = e.args as *MatchArm
     let else_arm: *MatchArm = then_arm.next
     if_arm_check_value(s, then_arm)
@@ -826,6 +878,15 @@ fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
     begin_block(s, else_label)
     emit_match_arm_body(s, else_arm, 0, 0, null, 0, @result, 1, end_label)
     begin_block(s, end_label)
+
+    if result.void_arms > 0
+        # AGAST #2046: an arm is a void call, so the if has no value: no phi
+        # (as emit_match, #1654), and an error if the value is wanted.
+        s.last_match_agg_name = null
+        s.last_match_agg_name_len = 0
+        s.last_match_float_ty = 0
+        match_void_arms_settle(s, @result, wants_value)
+        return 0
 
     # Publish the phi type for an untyped `let v = if ...` (#1666's path);
     # set after both arms so a nested if/match inside an arm can't clobber it.

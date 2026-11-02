@@ -4154,6 +4154,9 @@ class LLVMEmitter:
                 offender = self._find_valueless_if(fn_def.body.expr, consumed=False)
                 if offender is not None:
                     self._raise_valueless_if(offender, fn_def.body.expr)
+                void_arm = self._find_void_arm(fn_def.body.expr, consumed=False)
+                if void_arm is not None:
+                    self._raise_void_arm(void_arm, fn_def.body.expr)
                 # Check if we're returning a local variable - it should be moved, not dropped
                 exclude_var = None
                 if isinstance(fn_def.body.expr, rast.Ident):
@@ -4621,6 +4624,62 @@ class LLVMEmitter:
             getattr(offender, 'span', None) or getattr(fallback, 'span', None),
         )
 
+    def _is_void_call(self, expr: rast.Expr) -> bool:
+        """A call to a fn declared with no return type (it yields no value)."""
+        if not isinstance(expr, rast.Call) or not isinstance(expr.func, rast.Ident):
+            return False
+        entry = self.functions.get(expr.func.name)
+        if entry is None:
+            return False
+        fn_def = entry[1]
+        return fn_def is not None and fn_def.ret_type is None
+
+    def _find_void_arm(self, expr: Optional[rast.Expr], consumed: bool = True,
+                       in_arm: bool = False) -> Optional[rast.Expr]:
+        """AGAST #2046: the first void call that is a used `match`/`if` arm.
+
+        The same walk as `_find_valueless_if`: operands are always consumed,
+        and the result paths (`if` arms, block tails, `match` arm bodies)
+        inherit `consumed`. `in_arm` is True on a result path, so a void call
+        there is an arm with no value. A nested match/if arm is walked with
+        the same flags, so its own void arm is the offender (the innermost
+        call). A diverging arm (`return`) is a statement, never a call, and a
+        bare `let x = say(1)` (no arm) is left to the call checks.
+        """
+        find = self._find_void_arm
+        if expr is None:
+            return None
+        if consumed and in_arm and self._is_void_call(expr):
+            return expr
+        if isinstance(expr, rast.Grouped):
+            return find(expr.expr, consumed, in_arm)
+        if isinstance(expr, rast.AssignExpr):
+            return find(expr.target, False) or find(expr.value, True)
+        for operand in LLVMEmitter._operands(expr):
+            found = find(operand, True)
+            if found is not None:
+                return found
+        if isinstance(expr, rast.If):
+            return (find(expr.then_block, consumed, True)
+                    or find(expr.else_block, consumed, True))
+        if isinstance(expr, rast.Block):
+            return find(expr.expr, consumed, in_arm)
+        if isinstance(expr, rast.Match):
+            for arm in expr.arms:
+                found = find(arm.body, consumed, True)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _raise_void_arm(offender: rast.Expr, fallback: object) -> None:
+        name = offender.func.name
+        raise EmitError(
+            f"this arm calls `{name}`, which returns nothing, so it has no "
+            f"value; the `match`/`if` it belongs to is used as a value here",
+            getattr(offender, 'span', None) or getattr(fallback, 'span', None),
+        )
+
     def _reject_valueless_if(self, stmt: rast.Stmt) -> None:
         """AGAST #1406/#1435: an else-less `if` has no value to use.
 
@@ -4631,11 +4690,17 @@ class LLVMEmitter:
         tier examples, and angelo's statement-position `match` whose arm ends
         in a guard. None of those shapes consumes the `if`'s value, so none
         is reached from here.
+
+        AGAST #2046: the same roots reject a used `match`/`if` with a
+        void-call arm (`_find_void_arm`).
         """
         for expr, consumed in self._stmt_value_roots(stmt):
             offender = self._find_valueless_if(expr, consumed)
             if offender is not None:
                 self._raise_valueless_if(offender, stmt)
+            void_arm = self._find_void_arm(expr, consumed)
+            if void_arm is not None:
+                self._raise_void_arm(void_arm, stmt)
 
     def _emit_stmt_inner(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated."""
