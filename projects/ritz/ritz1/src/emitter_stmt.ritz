@@ -644,6 +644,11 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             emit_array_lit_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init)
             return
 
+        # AGAST #2035: `let a: [N]T = x.f` copies the inline array field.
+        if var_type == TYPE_ARRAY
+            if emit_array_local_copy_from_field(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init) == 1
+                return
+
         # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
         # a non-Result-returning fn still builds the right struct.  Save /
         # restore around the init expression so nested decls don't leak.
@@ -1215,6 +1220,12 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_reg(s, loc)
                 emit_str(s, c"\n")
             return
+        # AGAST #2035: `a = x.f` copies the inline array field into local `a`.
+        if var_type == TYPE_ARRAY
+            let aloc: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+            if aloc != null
+                if emit_array_local_copy_from_field(s, loc, aloc.array_size, aloc.array_elem_type, aloc.type_name, aloc.type_name_len, stmt.assign_value) == 1
+                    return
         # AGAST #1652: `p = s` (`s: @&S`) into a `*S` local.  `let` only;
         # see the #1755 note in emit_fn.
         let assign_raw: i32 = emit_expr(s, stmt.assign_value)
@@ -2054,6 +2065,36 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
         emit_ir_error(s, c"array element type does not match the struct field's element type")
         return
     emit_array_field_copy(s, field, src_ptr, field_ptr)
+
+# AGAST #2035: the reverse of emit_array_field_copy_from.  A local `[N]T`
+# array at `dst_ptr` (length `dst_size`, element `dst_et`, element struct name
+# `dst_name`) is initialised or assigned from `value`, `let a: [N]T = x.f` /
+# `a = p.f`.  When `value` is a member expression, copy the inline array field
+# it names into the local, after checking that the length and element type
+# match.  A local array uses the field's element spelling for every T
+# (local_array_elem_llvm, f32 / f64 since #1966, bool since #2063), so the
+# field's `[N x T]` copies as one aggregate.  The generic path loaded
+# the field as `[N x T]` and emitted `store i64 <[N x T]>`, which clang rejects.
+# Returns 1 once handled (copied or diagnosed) and 0 for a non-member value,
+# which is left to the caller.  A member that is not a matching array field
+# fails closed.
+fn emit_array_local_copy_from_field(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, value: *Expr) -> i32
+    if value == null or value.kind != EXPR_MEMBER
+        return 0
+    var mr: MemberPtrResult
+    emit_member_ptr(s, value, @mr)
+    if mr.success != 1 or mr.field == null or mr.field.field_type != TYPE_ARRAY
+        emit_ir_error(s, c"whole-array read into a local array from this member is not supported by ritz1 (only an inline array field)")
+        return 1
+    let field: *StructField = mr.field
+    if field.array_size != dst_size
+        emit_ir_error(s, c"struct field's array length does not match the local array's length")
+        return 1
+    if array_elem_types_match(field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, dst_et, dst_name, dst_name_len) == 0
+        emit_ir_error(s, c"struct field's array element type does not match the local array's element type")
+        return 1
+    emit_array_field_copy(s, field, mr.reg, dst_ptr)
+    1
 
 # AGAST #2048: `x.f = v` / `pp.f = v` / `o.p.f = v` where `f` is an f32 /
 # f64 field at `field_ptr` and `val_reg` is emit_expr(value).  Stores
