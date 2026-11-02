@@ -229,8 +229,16 @@ BROKEN_FORMS = {
 
 # --- forms that already worked, pinned against regression --------------------
 
-# A local named like a variant still reads the local.  ritz1-only: ritz0
-# itself crashes on it ("Unknown enum type: i32"), AGAST #2038.
+# --- a local or param named like a unit variant shadows it --------------------
+#
+# AGAST #2038: ritz0 crashed on these with "Unknown enum type: i32".  Every
+# site that builds a variant against an expected type (a fn's return type, a
+# let's declared type, an assignment target, a call's param, a struct field)
+# took the bare `B` as S.B by name alone, then used the i32 as its enum.  The
+# binding wins, as in ritz1 (#1600).  S.B is tag 1, so reading the variant
+# instead of the 9 would not exit 9.
+
+# The ticket's repro: the `return` site (fn return type i32).
 LOCAL_SHADOWS_VARIANT = (
     ENUM_S
     + """\
@@ -239,6 +247,118 @@ pub fn main() -> i32
     return B
 """
 )
+
+# In the forms below the binding is itself of another enum, T.  With an i32
+# binding these sites happen to skip the variant path (i32 resolves to no
+# enum); with an enum binding they built S's variant name against T and
+# raised "Unknown variant B in enum T" instead of reading the binding.
+ENUM_ST = (
+    ENUM_S
+    + """\
+enum T
+    X
+    Y
+"""
+)
+
+# A `var` binding (self.locals, not self.params in ritz0) read by a typed
+# `let` initialiser.
+VAR_SHADOWS_IN_LET = (
+    ENUM_ST
+    + """\
+pub fn main() -> i32
+    var B: T = X
+    B = Y
+    let y: T = B
+    match y
+        X => 1
+        Y => 9
+"""
+)
+
+# Assignment: the target's type is the expected type.
+SHADOW_IN_ASSIGN = (
+    ENUM_ST
+    + """\
+pub fn main() -> i32
+    let B: T = Y
+    var t: T = X
+    t = B
+    match t
+        X => 1
+        Y => 9
+"""
+)
+
+# A parameter, returned bare (the fn's return type is the expected type).
+PARAM_SHADOWS_VARIANT = (
+    ENUM_S
+    + """\
+fn f(B: i32) -> i32
+    return B
+pub fn main() -> i32
+    return f(9)
+"""
+)
+
+# A call argument: the param's type is the expected type.
+SHADOW_AS_CALL_ARG = (
+    ENUM_ST
+    + """\
+fn score(t: T) -> i32
+    match t
+        X => 1
+        Y => 9
+pub fn main() -> i32
+    let B: T = Y
+    return score(B)
+"""
+)
+
+# A struct literal field: the field's type is the expected type.
+SHADOW_IN_STRUCT_FIELD = (
+    ENUM_ST
+    + """\
+struct P
+    t: T
+pub fn main() -> i32
+    let B: T = Y
+    let p: P = P { t: B }
+    match p.t
+        X => 1
+        Y => 9
+"""
+)
+
+# The shadow is per function: outside it, bare `B` is still S.B.
+# 9 from the local + 2 from the match on the variant = 11.
+SHADOW_IS_LOCAL_TO_FN = (
+    ENUM_S
+    + """\
+fn variant() -> S
+    return B
+fn local() -> i32
+    let B: i32 = 9
+    return B
+pub fn main() -> i32
+    let s: S = variant()
+    let k: i32 = match s
+        A => 1
+        B => 2
+        C => 3
+    return local() + k
+"""
+)
+
+SHADOW_FORMS = {
+    "local_shadows_variant": (LOCAL_SHADOWS_VARIANT, 9),
+    "var_shadows_in_let": (VAR_SHADOWS_IN_LET, 9),
+    "shadow_in_assign": (SHADOW_IN_ASSIGN, 9),
+    "param_shadows_variant": (PARAM_SHADOWS_VARIANT, 9),
+    "shadow_as_call_arg": (SHADOW_AS_CALL_ARG, 9),
+    "shadow_in_struct_field": (SHADOW_IN_STRUCT_FIELD, 9),
+    "shadow_is_local_to_fn": (SHADOW_IS_LOCAL_TO_FN, 11),
+}
 
 QUALIFIED = (
     ENUM_S
@@ -351,9 +471,18 @@ def test_ritz1_matches_ritz0(tmp_path, name):
 
 
 @pytest.mark.integration
-def test_ritz1_local_shadows_variant(tmp_path):
-    """`let B: i32 = 9` reads the local, not S.B (which is tag 1)."""
-    assert _run("ritz1", tmp_path, "shadow", LOCAL_SHADOWS_VARIANT) == 9
+@pytest.mark.parametrize("name", sorted(SHADOW_FORMS))
+def test_ritz0_binding_shadows_variant(tmp_path, name):
+    """ritz0 is the oracle here too (AGAST #2038): the binding, not S.B."""
+    program, expected = SHADOW_FORMS[name]
+    assert _run("ritz0", tmp_path, name, program) == expected
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(SHADOW_FORMS))
+def test_ritz1_binding_shadows_variant(tmp_path, name):
+    program, expected = SHADOW_FORMS[name]
+    assert _run("ritz1", tmp_path, name, program) == expected
 
 
 @pytest.mark.integration

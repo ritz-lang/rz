@@ -2704,7 +2704,13 @@ class LLVMEmitter:
             if isinstance(expr.func, rast.Ident):
                 return expr.func.name in self.variant_to_enum
         elif isinstance(expr, rast.Ident):
-            # Unit variant without parens
+            # Unit variant without parens.  A local or param of the same name
+            # shadows the variant (AGAST #2038, as ritz1 since #1600): the
+            # Ident emitter reads locals/params before variant_to_enum, so
+            # every expected-type site (return, let, assign, call arg, struct
+            # field) must not build `B` as a variant of the expected type.
+            if expr.name in self.locals or expr.name in self.params:
+                return False
             return expr.name in self.variant_to_enum
         return False
 
