@@ -168,6 +168,48 @@ pub fn main() -> i32
     return *q
 """
 
+# #2075: the rest of a pointer borrow reads as the pointer too: `p` is the
+# `*i32`, `*p` is the i32, and `p = q` re-points the caller's variable.
+BORROWED_PTR_READS = """\
+fn val(p:& *i32) -> *i32
+    return p
+fn get(p:& *i32) -> i32
+    return *p
+pub fn main() -> i32
+    var x: i32 = 3
+    var p: *i32 = @x
+    if val(@&p) != @x
+        return 100
+    return get(@&p)
+"""
+
+BORROWED_PTR_WRITE = """\
+fn repoint(p:& *i32, q: *i32)
+    p = q
+pub fn main() -> i32
+    var x: i32 = 7
+    var y: i32 = 3
+    var p: *i32 = @x
+    repoint(@&p, @y)
+    return *p
+"""
+
+# A borrowed struct pointer: field access and `@*p` go through the pointer.
+BORROWED_STRUCT_PTR = """\
+struct H
+    i: i32
+fn f(h: *H) -> i32
+    return h.i
+fn g(p:& *H) -> i32
+    if f(@*p) != p.i
+        return 100
+    return p.i
+pub fn main() -> i32
+    var x: H = H { i: 3 }
+    var p: *H = @x
+    return g(@&p)
+"""
+
 # `*h` on a `:&` borrow is the referent; reading it is a plain value.
 BORROW_DEREF_VALUE = """\
 struct H
@@ -182,6 +224,9 @@ pub fn main() -> i32
 
 SPEC = {
     "borrowed_ptr": BORROWED_PTR,
+    "borrowed_ptr_reads": BORROWED_PTR_READS,
+    "borrowed_ptr_write": BORROWED_PTR_WRITE,
+    "borrowed_struct_ptr": BORROWED_STRUCT_PTR,
     "borrow_deref_value": BORROW_DEREF_VALUE,
     "repro": REPRO,
     "tempest": TEMPEST,
@@ -258,9 +303,7 @@ def test_ritz1_addr_of_deref_matches_ritz0(ritz1_bin, tmp_path, name):
 
 
 # ritz1 cases still wrong; strict so the fix has to remove them.
-RITZ1_XFAIL = {
-    "borrowed_ptr": "#2075: ritz1 `@*p` on `p:& *T` yields the `**T` borrow slot",
-}
+RITZ1_XFAIL: dict[str, str] = {}
 
 
 @pytest.mark.integration

@@ -142,16 +142,45 @@ fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) ->
     if param.is_borrow != 1 or param.param_type != TYPE_MUT_REF
         return 0
     let pt: i32 = param.param_pointee_type
-    if pt != TYPE_I8 and pt != TYPE_U8 and pt != TYPE_I16 and pt != TYPE_U16 and pt != TYPE_I32 and pt != TYPE_U32 and pt != TYPE_I64 and pt != TYPE_U64
+    # AGAST #2075: `p:& *T` (T an integer or a struct) is a borrow of a
+    # pointer variable, and like the integer case `p` reads as the
+    # referent: the `*T` value.  Bind it as a `*T` local whose slot is the
+    # caller's pointer variable, so `p`, `*p`, `p.f`, `@*p` (which is p's
+    # value) and `p = q` lower as for the caller's own `var p: *T`.  Before
+    # this, `p` was left a TYPE_MUT_REF whose value is the borrow itself,
+    # so `@*p` returned the `**T` slot.
+    if pt == TYPE_PTR
+        let ipt: i32 = param.param_inner_pointee_type
+        if is_borrow_scalar_kind(ipt) == 0 and ipt != TYPE_STRUCT
+            return 0
+        if ipt == TYPE_STRUCT and param.param_type_name_len <= 0
+            return 0
+        let pslot: i32 = emit_borrow_slot_load(s, alloca_reg)
+        add_local_full(s, param.name, param.name_len, pslot, TYPE_PTR, param.param_type_name, param.param_type_name_len, ipt, 0, 0)
+        return 1
+    if is_borrow_scalar_kind(pt) == 0
         return 0
+    let slot: i32 = emit_borrow_slot_load(s, alloca_reg)
+    add_local(s, param.name, param.name_len, slot, pt)
+    return 1
+
+# The integer kinds a `:&` borrow binds as a plain local (AGAST #1644).
+fn is_borrow_scalar_kind(t: i32) -> i32
+    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16
+        return 1
+    if t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64
+        return 1
+    return 0
+
+# Load a borrow param's pointer, spilled to `alloca_reg`, once at entry.
+fn emit_borrow_slot_load(s: *EmitterState, alloca_reg: i32) -> i32
     let slot: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, slot)
     emit_str(s, c" = load ptr, ptr ")
     emit_reg(s, alloca_reg)
     emit_str(s, c"  ; #1644 scalar borrow\n")
-    add_local(s, param.name, param.name_len, slot, pt)
-    return 1
+    return slot
 
 # AGAST #1739: bind a large by-value struct param (`ptr byval(%T) %x.arg`,
 # see param_uses_byval).  The byval memory is the callee's own copy, so it
