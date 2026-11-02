@@ -183,6 +183,43 @@ def _many_instantiations(n: int) -> str:
     )
 
 
+# No u64: a u64 struct-literal field is not lowered by ritz1 yet (separate,
+# AGAST #2064), independent of generics.
+_ARG_TYPES = ["i64", "i32", "u8", "i16", "u32", "i8", "u16"]
+
+
+def _wide_generic_struct(n: int) -> str:
+    """A generic struct with n type params (AGAST #1906: split_mangled_args
+    capped at 8, so the instantiation was dropped and the program failed at
+    link). One argument is itself generic (`Box<i64>`) to exercise nesting."""
+    params = ", ".join(f"T{i}" for i in range(n))
+    fields = "".join(f"    f{i}: T{i}\n" for i in range(n))
+    args = ["Box<i64>"] + [_ARG_TYPES[i % len(_ARG_TYPES)] for i in range(1, n)]
+    inits = ["f0: Box<i64> { v: 5 }"] + [f"f{i}: {i}" for i in range(1, n)]
+    total = " + ".join(f"w.f{i} as i64" for i in range(1, n))
+    return (
+        "struct Box<T>\n    v: T\n\n"
+        f"struct Wide<{params}>\n{fields}\n"
+        f"pub fn main() -> i32\n"
+        f"    let w: Wide<{', '.join(args)}> = Wide<{', '.join(args)}> {{ {', '.join(inits)} }}\n"
+        f"    return (w.f0.v + {total}) as i32\n"
+    )
+
+
+def _wide_generic_fn(n: int) -> str:
+    """A generic fn with n type params, called with n distinct arguments."""
+    params = ", ".join(f"T{i}" for i in range(n))
+    formals = ", ".join(f"a{i}: T{i}" for i in range(n))
+    body = " + ".join(f"a{i} as i64" for i in range(n))
+    types = [_ARG_TYPES[i % len(_ARG_TYPES)] for i in range(n)]
+    actuals = ", ".join(f"{i + 1} as {t}" for i, t in enumerate(types))
+    return (
+        f"fn wide<{params}>({formals}) -> i64\n    return {body}\n\n"
+        f"pub fn main() -> i32\n"
+        f"    return wide<{', '.join(types)}>({actuals}) as i32\n"
+    )
+
+
 def _long_name_call(n: int) -> str:
     """A call to a struct-returning fn with an n-byte name, bound by an
     unannotated `var`: emit_var_decl's [256]u8 name buffer."""
@@ -224,6 +261,12 @@ MUST_WORK = {
     "locals_300": (_many_locals(300), 42),
     "locals_1100": (_many_locals(1100), 42),
     "strings_4200": (_many_strings(4200), 42),
+    # AGAST #1906: more than 8 type args (split_mangled_args' old cap).
+    # struct: 5 + (1 + ... + n-1); fn: 1 + ... + n.
+    "generic_struct_9_args": (_wide_generic_struct(9), 5 + 36),
+    "generic_struct_12_args": (_wide_generic_struct(12), 5 + 66),
+    "generic_fn_9_args": (_wide_generic_fn(9), 45),
+    "generic_fn_12_args": (_wide_generic_fn(12), 78),
 }
 
 # --- fixed limits that remain: one located error -----------------------------

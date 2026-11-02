@@ -397,8 +397,9 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
     # parameter.  (Unlike `Vec$T` below, no placeholder check: nothing
     # registers a `Pair$T$i64` today — see AGAST #1582.)
     if count_type_params(template.type_params) >= 2
-        let starts: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
-        let lens: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+        let cap: i64 = 4 * mangled_arg_capacity(suffix, suffix_len) as i64
+        let starts: *i32 = malloc(cap) as *i32
+        let lens: *i32 = malloc(cap) as *i32
         if split_mangled_args(m, suffix, suffix_len, starts, lens) == count_type_params(template.type_params)
             add_struct_instantiation(base_name, base_len, suffix, suffix_len)
         return
@@ -425,7 +426,18 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
 # it.  Single-parameter templates never split — their whole suffix is the
 # one argument, exactly as before #1574.
 
-const MAX_GENERIC_ARGS: i32 = 8
+# AGAST #1906: no fixed cap on type arguments (it was 8, and a 9th dropped the
+# instantiation, so the program failed at link).  Every argument starts with
+# its own `$`, so the suffix's `$` count bounds the argument count; callers
+# size split_mangled_args' starts/lens buffers with it.
+fn mangled_arg_capacity(suffix: *u8, suffix_len: i32) -> i32
+    var n: i32 = 0
+    for i in 0..suffix_len
+        if *(suffix + i) == 36   # '$'
+            n = n + 1
+    if n == 0
+        return 1
+    n
 
 fn count_type_params(tp: *TypeParam) -> i32
     var n: i32 = 0
@@ -466,14 +478,13 @@ fn mangled_arg_end(m: *Module, s: *u8, len: i32, pos: i32) -> i32
 # Split a suffix "$a1$a2..." into its top-level arguments.  Each
 # (suffix + starts[i], lens[i]) is itself a one-argument suffix "$ai", the
 # form parse_type_from_suffix / get_type_name_from_suffix take.  Returns the
-# argument count, or -1 for a malformed suffix or more than MAX_GENERIC_ARGS.
+# argument count, or -1 for a malformed suffix.  starts/lens must hold
+# mangled_arg_capacity(suffix, suffix_len) entries.
 fn split_mangled_args(m: *Module, suffix: *u8, suffix_len: i32, starts: *i32, lens: *i32) -> i32
     var n: i32 = 0
     var pos: i32 = 0
     while pos < suffix_len
         if *(suffix + pos) != 36   # '$'
-            return -1
-        if n >= MAX_GENERIC_ARGS
             return -1
         let end: i32 = mangled_arg_end(m, suffix, suffix_len, pos + 1)
         *(starts + n) = pos
@@ -989,8 +1000,9 @@ fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suff
             tp_len = template.type_params.name_len
         return specialize_fn_one_param(m, template, tp_name, tp_len, suffix, suffix_len)
 
-    let starts: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
-    let lens: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+    let cap: i64 = 4 * mangled_arg_capacity(suffix, suffix_len) as i64
+    let starts: *i32 = malloc(cap) as *i32
+    let lens: *i32 = malloc(cap) as *i32
     if split_mangled_args(m, suffix, suffix_len, starts, lens) != n
         # Wrong arity for this template (e.g. `pair<i64>`): nothing sound to
         # emit.  The call stays unresolved and fails at link, loudly.
@@ -1712,8 +1724,9 @@ fn clone_and_specialize_struct(m: *Module, template: *StructDef, suffix: *u8, su
 
     # AGAST #1574: substitute EVERY parameter of a multi-parameter template.
     if count_type_params(template.type_params) >= 2
-        let starts: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
-        let lens: *i32 = malloc(4 * MAX_GENERIC_ARGS as i64) as *i32
+        let cap: i64 = 4 * mangled_arg_capacity(suffix, suffix_len) as i64
+        let starts: *i32 = malloc(cap) as *i32
+        let lens: *i32 = malloc(cap) as *i32
         if split_mangled_args(m, suffix, suffix_len, starts, lens) != count_type_params(template.type_params)
             return null
         let multi: *StructDef = malloc(sizeof(StructDef)) as *StructDef
