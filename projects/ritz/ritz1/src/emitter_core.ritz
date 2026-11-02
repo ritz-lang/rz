@@ -3297,6 +3297,74 @@ pub fn float_method_result_ty(s: *EmitterState, e: *Expr) -> i32
         return 0
     binop_operand_float_ty(s, e.left)
 
+# AGAST #2068: the struct name a method call `e` dispatches on, as
+# emit_expr_method resolves it, or null.  `*out_len` gets its length.
+# Receivers: a local (value or pointer -- loc.type_name names the struct
+# either way), a struct / `*S` global, a static `Type.m()`, a struct
+# literal, a struct-returning call, and a struct / pointer field.
+fn method_recv_type_name(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    let rcv: *Expr = e.left
+    if rcv == null
+        return null
+    if rcv.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, rcv.ident_ptr, rcv.ident_len)
+        if loc != null
+            *out_len = loc.type_name_len
+            return loc.type_name
+        let glob: *GlobalVarDef = find_global(s, rcv.ident_ptr, rcv.ident_len)
+        if glob != null
+            if glob.var_type == TYPE_STRUCT
+                *out_len = glob.type_name_len
+                return glob.type_name
+            if glob.var_type == TYPE_PTR and glob.pointee_type == TYPE_STRUCT
+                *out_len = glob.pointee_type_name_len
+                return glob.pointee_type_name
+            return null
+        # Neither local nor global: a static call names its impl type.
+        *out_len = rcv.ident_len
+        return rcv.ident_ptr as *u8
+    if rcv.kind == EXPR_STRUCT_LIT
+        *out_len = rcv.ident_len
+        return rcv.ident_ptr as *u8
+    if rcv.kind == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, rcv)
+        if fd != null and fd.return_type == TYPE_STRUCT
+            *out_len = fd.return_type_name_len
+            return fd.return_type_name
+        return null
+    if rcv.kind == EXPR_MEMBER
+        let fld: *StructField = member_field_def(s, rcv)
+        if fld != null and (fld.field_type == TYPE_STRUCT or fld.field_type == TYPE_PTR or fld.field_type == TYPE_REF or fld.field_type == TYPE_MUT_REF)
+            *out_len = fld.field_type_name_len
+            return fld.field_type_name
+    null
+
+# AGAST #2068: TYPE_F32 / TYPE_F64 when `e` calls a user impl method that
+# returns one, 0 otherwise.  emit_expr_method leaves that result in a
+# `float` / `double` register, so `p.scale(f) + 0.5` must be float math at
+# the method's width -- get_expr_type used to call it i64, and the add ran
+# at the literal's `double` (`fadd double %<float>`, rejected by clang).
+pub fn user_method_float_ret(s: *EmitterState, e: *Expr) -> i32
+    if e.kind != EXPR_METHOD
+        return 0
+    var tn_len: i32 = 0
+    let tn: *u8 = method_recv_type_name(s, e, @tn_len)
+    if tn == null or tn_len == 0
+        return 0
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if name_eq(ib.type_name, ib.type_name_len, tn, tn_len) == 1
+            var m: *FnDef = ib.methods
+            while m != null
+                if name_eq(m.name, m.name_len, e.ident_ptr, e.ident_len) == 1
+                    if m.return_type == TYPE_F32 or m.return_type == TYPE_F64
+                        return m.return_type
+                    return 0
+                m = m.next
+        ib = ib.next
+    0
+
 # AGAST #1965: 1 when `e` is a float literal or a negated one (`-2.5`, which
 # #1959 lowers as `fneg double`).  Both are `double`, narrowable to f32.
 fn is_float_lit_operand(e: *Expr) -> i32
@@ -3564,6 +3632,10 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         let fmt: i32 = float_method_result_ty(s, e)
         if fmt != 0
             return fmt
+        # AGAST #2068: a user method's f32 / f64 return.
+        let umt: i32 = user_method_float_ret(s, e)
+        if umt != 0
+            return umt
     TYPE_I64  # Default fallback
 
 # Does emit_expr leave this bool expression in an i1 register?
