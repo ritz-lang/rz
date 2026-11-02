@@ -172,7 +172,7 @@ PROGRAMS = {
 # ritz0 mangles the alias name itself, so mixing spellings of one type is a
 # type error there (AGAST #2049).  Strict: when ritz0 resolves aliases before
 # mangling these XPASS and must be removed from this set.
-RITZ0_MANGLES_ALIAS_NAME = {"chain", "pointer", "nested"}
+RITZ0_MANGLES_ALIAS_NAME = set()
 
 
 @pytest.mark.integration

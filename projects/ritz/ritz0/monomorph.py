@@ -128,8 +128,37 @@ class TypeSubstitution:
             return ty
 
 
+# Type aliases of the module being monomorphized: name -> target type.  Set by
+# monomorphize() for the duration of one pass.  Aliases are transparent, so
+# mangle_type_name spells an alias as its target (`Vec<Id>` with `type Id = u32`
+# is Vec$u32, the same instantiation as `Vec<u32>`), matching ritz1 (AGAST #2049).
+_TYPE_ALIASES: Dict[str, rast.Type] = {}
+
+
+def resolve_alias(ty: rast.Type) -> rast.Type:
+    """Follow a bare alias name (and alias-of-alias chains) to its target."""
+    return resolve_alias_in(ty, _TYPE_ALIASES)
+
+
+def resolve_alias_in(ty: rast.Type, aliases: Dict[str, rast.Type]) -> rast.Type:
+    """Follow a bare alias name through `aliases` (chains included).
+
+    A union alias (`type X = A | B`) is a nominal type in ritz0 -- it gets its
+    own named LLVM struct -- so it keeps its name.
+    """
+    seen = set()
+    while (isinstance(ty, rast.NamedType) and not ty.args
+           and ty.name in aliases and ty.name not in seen
+           and not isinstance(aliases[ty.name], rast.UnionType)):
+        seen.add(ty.name)
+        ty = aliases[ty.name]
+    return ty
+
+
 def mangle_type_name(ty: rast.Type) -> str:
     """Generate a mangled name component for a type.
+
+    A type alias mangles as its target (AGAST #2049).
 
     Examples:
         i32 -> "i32"
@@ -137,6 +166,7 @@ def mangle_type_name(ty: rast.Type) -> str:
         *mut i32 -> "ptrmut_i32"
         Vec<i32> -> "Vec_i32"
     """
+    ty = resolve_alias(ty)
     if isinstance(ty, rast.NamedType):
         if ty.args:
             arg_names = "_".join(mangle_type_name(arg) for arg in ty.args)
@@ -1552,5 +1582,12 @@ class Monomorphizer:
 
 def monomorphize(module: rast.Module) -> rast.Module:
     """Monomorphize a module, returning a new module with generics specialized."""
-    monomorphizer = Monomorphizer()
-    return monomorphizer.monomorphize(module)
+    global _TYPE_ALIASES
+    saved = _TYPE_ALIASES
+    _TYPE_ALIASES = {item.name: item.target for item in module.items
+                     if isinstance(item, rast.TypeAlias)}
+    try:
+        monomorphizer = Monomorphizer()
+        return monomorphizer.monomorphize(module)
+    finally:
+        _TYPE_ALIASES = saved

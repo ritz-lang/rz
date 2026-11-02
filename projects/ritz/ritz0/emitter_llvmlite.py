@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
+from monomorph import resolve_alias_in
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
 
@@ -2012,6 +2013,15 @@ class LLVMEmitter:
                 self._declare_struct(item)
             elif isinstance(item, rast.EnumDef):
                 self._declare_enum(item)
+
+        # Alias targets are needed by the struct bodies below: a field typed
+        # `*Pair<Id>` (a specialization substituting T = Pair<Id>) must lower
+        # to Pair$u32, so the generic-name suffix must already see `Id`
+        # (AGAST #2049).  Union aliases get their LLVM type further down.
+        for item in module.items:
+            if (isinstance(item, rast.TypeAlias)
+                    and not isinstance(item.target, rast.UnionType)):
+                self.type_aliases[item.name] = item.target
 
         # Second pass: define struct bodies, then enum bodies.
         #
@@ -12307,7 +12317,12 @@ class LLVMEmitter:
         return f"{base}${'_'.join(arg_parts)}"
 
     def _type_to_name_suffix(self, ty: rast.Type) -> str:
-        """Convert a type to a name suffix for monomorphization."""
+        """Convert a type to a name suffix for monomorphization.
+
+        A type alias spells as its target, as in the monomorphizer: `Pair<Id>`
+        with `type Id = u32` is Pair$u32, not Pair$Id (AGAST #2049).
+        """
+        ty = resolve_alias_in(ty, self.type_aliases)
         if isinstance(ty, rast.NamedType):
             if ty.args:
                 return self._get_specialized_type_name(ty)
