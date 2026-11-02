@@ -11334,7 +11334,13 @@ class LLVMEmitter:
                         for field_name, field_type in self.struct_fields[struct_name]:
                             if field_name == expr.field:
                                 return self._is_unsigned_type(field_type)
-            return False
+            # Any other base: an indexed element `a[i].f` (AGAST #2036), a
+            # call result `mk().f` (#2042), a nested `a[i].inner.f`. These
+            # lower to extractvalue on a loaded/returned aggregate, which
+            # carries no signedness, so without this a u8/u16/u32 field with
+            # its top bit set was widened with sext (202 -> -54).
+            # _infer_ritz_type resolves the base recursively.
+            return self._is_unsigned_type(self._infer_ritz_type(expr))
 
         # Call / method call - the callee's declared return type (AGAST
         # #1963). Without this a `-> u32` result with bit 31 set was widened

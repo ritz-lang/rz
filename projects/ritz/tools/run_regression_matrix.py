@@ -46,11 +46,7 @@ RITZLIB_MODULES = ["sys", "io", "str", "fmt", "strview", "string", "hash", "memo
 # AGAST #1365, from scripts/regression.sh too. An allowlist that cannot go red
 # is an allowlist nobody edits — #1365 found two entries blaming the async
 # framework for what was really a syntax migration.
-EXPECTED_FAILURES = {
-    ("ritz0", "test_issue_ritz1_narrow_nfa_fields::test_narrow_array_unsigned_field"):
-        "AGAST #2036 — ritz0 sign-extends an unsigned field read as `a[i].f` "
-        "(extractvalue + sext); ritz1 and ritz1_selfhosted are correct.",
-}
+EXPECTED_FAILURES = {}
 
 # AGAST #1371 — what the matrix found once it ran every [[test]] fn of every
 # file instead of fns[0] of 53. Each failure was triaged to a root cause and

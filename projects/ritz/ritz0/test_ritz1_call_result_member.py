@@ -87,8 +87,7 @@ pub fn main() -> i32
     return 3
 """,
     # Narrow fields (i32, u8, negative i64) keep their width and signedness
-    # when read off a call.  d stays below 128: ritz0 sign-extends a u8 read
-    # off a call result (AGAST #2042).
+    # when read off a call.
     "call_narrow": STRUCTS
     + """\
 pub fn main() -> i32
@@ -102,6 +101,23 @@ pub fn main() -> i32
     if c != 8
         return 4
     return mkn().c * 6
+""",
+    # AGAST #2042: a u8 field with its top bit set, read off a call result.
+    # ritz0 sign-extended it (200 -> -56) because _infer_unsigned_expr only
+    # resolved `ident.field`.
+    "call_unsigned_high_bit": STRUCTS
+    + """\
+fn mkn200() -> N
+    N { c: 7, d: 200, e: 0 }
+
+pub fn main() -> i32
+    if mkn200().d != 200
+        return 1
+    if mkn200().d as i64 != 200
+        return 2
+    if not (mkn200().d > 127)
+        return 3
+    return 42
 """,
     # Nested struct fields: one and two levels below the call.
     "call_nested": STRUCTS
