@@ -1202,10 +1202,14 @@ fn emit_array_elem_narrow(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i32
 # AGAST #1596: the element kind for indexing THROUGH a pointer-typed struct
 # field (`s.data[i]` with `data: *T` or `**T`). `**T` elements are pointers;
 # a `*Struct` element is TYPE_STRUCT (spelled `%T` from field_type_name);
-# primitive integer pointees come from array_elem_type (#1304). Anything
-# else (bool, floats, an unrecorded pointee, a non-pointer field) is
+# primitive pointees (integers, and since #2053 f32 / f64) come from
+# array_elem_type (#1304); their in-memory spelling is ptr_field_elem_llvm.
+# Anything else (bool, an unrecorded pointee, a non-pointer field) is
 # TYPE_UNKNOWN: ritz1 cannot address it at the right width, so callers must
-# fail closed rather than guess a stride.
+# fail closed rather than guess a stride.  bool has no single stride in
+# ritz1: a bool struct field is an `i1` (ritz0's layout) but a local
+# `[N]bool` keeps i64 slots, so `b.data[2]` into a local `[4]bool` would hit
+# byte 2 of element 0 (AGAST #2063).
 fn ptr_field_elem_kind(field: *StructField) -> i32
     if field.field_type == TYPE_PTR_PTR
         return TYPE_PTR
@@ -1218,7 +1222,17 @@ fn ptr_field_elem_kind(field: *StructField) -> i32
         return t
     if t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64
         return t
+    if t == TYPE_F32 or t == TYPE_F64
+        return t
     return TYPE_UNKNOWN
+
+# AGAST #2053: the LLVM type of ONE pointee of a pointer field, for a `kind`
+# from ptr_field_elem_kind: `float` / `double` for f32 / f64 (a local `[N]f64`
+# is `double` too since #1966), integers / pointers at their own width.
+# array_elem_llvm spells f32 / f64 as i64, which is not what the pointer
+# points at.
+fn ptr_field_elem_llvm(kind: i32) -> *u8
+    return local_array_elem_llvm(kind)
 
 # AGAST #1596: address of element `idx` (an i64 register) through the
 # pointer held in a struct field. `field_slot` points AT the field; the
@@ -1239,7 +1253,7 @@ fn emit_ptr_field_elem_addr(s: *EmitterState, field_slot: i32, field: *StructFie
     if kind == TYPE_STRUCT
         emit_llvm_type_struct(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
     else
-        emit_str(s, array_elem_llvm(kind))
+        emit_str(s, ptr_field_elem_llvm(kind))
     emit_str(s, c", ptr ")
     emit_reg(s, base)
     emit_str(s, c", i64 ")
@@ -3192,6 +3206,11 @@ fn get_member_pointee_type_exact(s: *EmitterState, e: *Expr) -> i32
             return pe
         if pe == TYPE_U32 or pe == TYPE_I32 or pe == TYPE_U64 or pe == TYPE_I64
             return pe
+        # AGAST #2053: a `*f32` / `*f64` / `*bool` field.  These fell to
+        # the unknown case, so `*r.p` loaded `i8` (the u8 guess) and
+        # `*r.p = v` stored `i64 %double`.
+        if pe == TYPE_F32 or pe == TYPE_F64 or pe == TYPE_BOOL
+            return pe
         # Pointee not recorded — e.g. `data: *T` in a
         # monomorphised generic, where the substituted field
         # carries no array_elem_type.  Report "unknown" and let
@@ -3401,6 +3420,12 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             let af: *StructField = member_field_def(s, e.left)
             if af != null and af.field_type == TYPE_ARRAY and (af.array_elem_type == TYPE_F32 or af.array_elem_type == TYPE_F64)
                 return af.array_elem_type
+            # AGAST #2053: `x.p[i]` through a `*f32` / `*f64` field loads a
+            # `float` / `double` (ptr_field_elem_llvm) and is not widened.
+            if af != null and af.field_type == TYPE_PTR
+                let pk: i32 = ptr_field_elem_kind(af)
+                if pk == TYPE_F32 or pk == TYPE_F64
+                    return pk
         return TYPE_I64  # Default
     else if e.kind == EXPR_UNARY
         if e.op == OP_ADDR

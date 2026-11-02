@@ -20,8 +20,8 @@ field (and through `@C` / `@&C` fields): they are laid out as `ptr` and member
 access through them auto-derefs like a `*C` field.
 
 #2050 did the same for ref fields to an integer (`p: @i32` / `@&u8` /
-`p:& i64`): they lower to a `*T` field. Float refs stay fail-closed until
-`*f64` fields work (#2053).
+`p:& i64`): they lower to a `*T` field. #2053 made `*f64` / `*f32` / `*bool`
+fields load and store at their own width, so float and bool refs lower too.
 
 Every program returns 3 on success. ritz0 is the oracle.
 """
@@ -243,6 +243,78 @@ PRIM_ACCESS = {
     for ty in ("i32", "u8", "i64")
 }
 
+# Ref fields to f32 / f64 / bool (#2053). Until `*f64` fields loaded and stored
+# at their own width these stayed fail-closed; now they lower to `*T` like the
+# integer refs above. Float programs use float literals (`*r.p + 1` is a type
+# error in ritz0). x goes 0.5 -> 1.75 (in bump) -> 3.0 (in main).
+FLOAT_REF_WRITE = """\
+struct R
+    p FIELD
+
+fn bump(r: *R)
+    *r.p = *r.p + 1.25
+
+pub fn main() -> i32
+    var x: T = 0.5
+    var r: R = R { p: @&x }
+    bump(@r)
+    *r.p = *r.p + 1.25
+    return x as i32
+"""
+
+# Between fields of other widths, read back through the field and a `*T`
+# callee, and the struct literal initialised with `@x`.
+FLOAT_REF_MIXED = """\
+struct R
+    head: u8
+    p FIELD
+    tail: i64
+
+fn peek(q: *T) -> T
+    return *q
+
+pub fn main() -> i32
+    var x: T = 1.5
+    var r: R = R { head: 1, p: @x, tail: 1 }
+    *r.p = *r.p - 0.5
+    return (peek(r.p) as i64 + r.head as i64 + r.tail) as i32
+"""
+
+# A bool ref into an `i1` struct field with neighbours: a wide store through
+# the field would clobber `after`.
+BOOL_REF = """\
+struct S
+    b: bool
+    after: u8
+
+struct R
+    p FIELD
+
+fn flip(r: *R)
+    *r.p = not *r.p
+
+pub fn main() -> i32
+    var s: S = S { b: false, after: 3 }
+    var r: R = R { p: @&s.b }
+    flip(@r)
+    if *r.p and s.b
+        return s.after as i32
+    return 100
+"""
+
+_NONINT_SPELLINGS = {"colon_amp": ":& {t}", "at": ": @{t}", "at_amp": ": @&{t}"}
+NONINT_REF_ACCESS = {
+    f"{name}_{spelling}_{ty}": prog.replace("FIELD", field.format(t=ty)).replace(
+        "T", ty
+    )
+    for name, prog in {"write": FLOAT_REF_WRITE, "mixed": FLOAT_REF_MIXED}.items()
+    for spelling, field in _NONINT_SPELLINGS.items()
+    for ty in ("f64", "f32")
+} | {
+    f"bool_{spelling}": BOOL_REF.replace("FIELD", field.format(t="bool"))
+    for spelling, field in _NONINT_SPELLINGS.items()
+}
+
 # The borrow field must lower to a reference (pointer-sized), not to the
 # pointee: `ch:& C` parsed as plain `C` would embed {i32, i64} inline.
 LAYOUT = """\
@@ -401,10 +473,10 @@ def test_ritz1_prim_ref_field_access(ritz1_bin, tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("ty", ["i32", "u8", "i64"])
+@pytest.mark.parametrize("ty", ["i32", "u8", "i64", "f64", "f32", "bool"])
 def test_ritz1_prim_ref_field_is_a_reference(ritz1_bin, tmp_path, ty):
     """A `p: @T` field is laid out as `ptr`, as in ritz0, not as `T`."""
-    prog = PRIM_READ.replace("FIELD", ": @T").replace("T", ty)
+    prog = f"struct R\n    p: @{ty}\n\npub fn main() -> i32\n    return 3\n"
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, f"layout_{ty}", prog)
     assert comp.returncode == 0 and ll.exists(), comp.stderr[-2000:]
     m = re.search(r"^%R = type (.*)$", ll.read_text(), re.MULTILINE)
@@ -413,25 +485,18 @@ def test_ritz1_prim_ref_field_is_a_reference(ritz1_bin, tmp_path, ty):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("ty", ["f64", "f32"])
-def test_ritz1_float_ref_field_fails_closed(ritz1_bin, tmp_path, ty):
-    """#2050 lowers integer ref fields only. A `*f64` field still loads and
-    stores at the wrong width, so lowering `p: @f64` to it would turn a
-    compile error into a wrong answer. ritz1 must refuse or get it right
-    (ritz0 returns 3), never compile and return something else."""
-    prog = PRIM_WRITE.replace("FIELD", ": @T").replace("T", ty)
-    comp, ll, work = _compile("ritz1", ritz1_bin, tmp_path, f"float_{ty}", prog)
-    if comp.returncode != 0:
-        assert not ll.exists()
-        return
-    exe = work / "main"
-    link = subprocess.run(
-        ["clang", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
-        capture_output=True,
-        text=True,
-    )
-    assert link.returncode == 0, link.stderr[-2000:]
-    assert subprocess.run([str(exe)], timeout=60).returncode == 3
+@pytest.mark.parametrize("name", sorted(NONINT_REF_ACCESS))
+def test_ritz0_nonint_ref_field_access(tmp_path, name):
+    assert _run("ritz0", None, tmp_path, name, NONINT_REF_ACCESS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(NONINT_REF_ACCESS))
+def test_ritz1_nonint_ref_field_access(ritz1_bin, tmp_path, name):
+    """AGAST #2053. #2050 kept float / bool refs fail-closed ("struct literal
+    field of this type is not lowered") because a `*f64` field loaded `i8`
+    and stored `i64 %double`."""
+    assert _run("ritz1", ritz1_bin, tmp_path, name, NONINT_REF_ACCESS[name]) == 3
 
 
 @pytest.mark.integration

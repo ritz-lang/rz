@@ -361,24 +361,35 @@ def test_ritz1_local_ptr_field_store_loads_the_pointer(ritz1_bin, tmp_path):
     assert "store i32 " in main, main
 
 
-# A pointee ritz1 cannot index at the right width must refuse, not miscompile.
-UNSUPPORTED_POINTEE = """\
+# A `*f64` / `*f32` pointee (AGAST #2053): this was the fail-closed pin
+# ("unhandled indexed EXPR_MEMBER in assignment") until ritz1 could index
+# through the field at `double` / `float` width. Bool pointees still fail
+# closed (#2063; see test_ritz1_member_store_fail_closed.py).
+FLOAT_POINTEE = """\
 struct F
-    data: *f64
+    data: *T
 
 pub fn main() -> i32
-    var buf: [4]f64
+    var buf: [4]T = [0.0, 0.0, 0.0, 0.0]
     var f: F
     f.data = @buf[0]
     f.data[2] = 1.5
-    return 0
+    f.data[3] = f.data[2] * 2.0
+    if buf[2] != 1.5 or buf[1] != 0.0
+        return 1
+    return (f.data[3] * 14.0) as i32
 """
 
 
 @pytest.mark.integration
-def test_ritz1_unsupported_pointee_store_fails_closed(ritz1_bin, tmp_path):
-    comp, ll = _compile("ritz1", tmp_path, "unsupported", UNSUPPORTED_POINTEE)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"ritz1 accepted a *f64 field store:\n{out[-2000:]}"
-    assert "unhandled indexed EXPR_MEMBER in assignment" in out, out[-2000:]
-    assert not ll.exists(), "ritz1 must refuse to write output on an emit error"
+@pytest.mark.parametrize("ty", ["f64", "f32"])
+def test_ritz0_float_pointee_store(tmp_path, ty):
+    prog = FLOAT_POINTEE.replace("T", ty)
+    assert _run("ritz0", tmp_path, f"float_{ty}", prog) == EXPECTED
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("ty", ["f64", "f32"])
+def test_ritz1_float_pointee_store(ritz1_bin, tmp_path, ty):
+    prog = FLOAT_POINTEE.replace("T", ty)
+    assert _run("ritz1", tmp_path, f"float_{ty}", prog) == EXPECTED
