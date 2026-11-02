@@ -3692,22 +3692,25 @@ pub fn enum_variant_kind(ei: i32, vi: i32) -> i32
 pub fn enum_variant_fields(ei: i32, vi: i32) -> *StructField
     return *(g_enum_variant_fields + *(g_enum_variant_starts + ei) + vi)
 
-# The non-generic enum an unqualified variant name `Holds` constructs, as
-# ritz0's variant_to_enum resolves it: the LAST enum declaring the name
-# wins.  Fills *out_vi with the variant's tag; returns the enum index, or -1.
-pub fn enum_of_variant(name: *u8, len: i32, out_vi: *i32) -> i32
-    *out_vi = 0 - 1
-    if g_enum_initialized == 0
-        return 0 - 1
-    var ei: i32 = g_enum_count - 1
-    while ei >= 0
-        if *(g_enum_generic + ei) == 0
-            let vi: i32 = enum_variant_slot(ei, name, len)
-            if vi >= 0
-                *out_vi = vi
-                return ei
-        ei = ei - 1
-    return 0 - 1
+# 1 when enum `ea`'s name sorts before enum `eb`'s (bytewise; a proper prefix
+# sorts first), else 0.
+fn enum_name_lt(ea: i32, eb: i32) -> i32
+    let a: *u8 = *(g_enum_names + ea)
+    let b: *u8 = *(g_enum_names + eb)
+    let a_len: i32 = *(g_enum_name_lens + ea)
+    let b_len: i32 = *(g_enum_name_lens + eb)
+    var k: i32 = 0
+    while k < a_len and k < b_len
+        let ab: u8 = *(a + k)
+        let bb: u8 = *(b + k)
+        if ab < bb
+            return 1
+        if ab > bb
+            return 0
+        k = k + 1
+    if a_len < b_len
+        return 1
+    return 0
 
 # The tag of variant `name` within enum `ei`, or -1.
 fn enum_variant_slot(ei: i32, name: *u8, len: i32) -> i32
@@ -3727,35 +3730,53 @@ fn enum_variant_slot(ei: i32, name: *u8, len: i32) -> i32
                 return vi
     return 0 - 1
 
-# AGAST #1600: the enum a bare variant name used as a VALUE (`let s: S = B`)
-# denotes.  Unlike enum_of_variant, a name two non-generic enums declare is
-# not resolved by declaration order: it returns -2, with *out_vi set to the
-# FIRST declaring enum's index and *out_other to the second's, so the caller
-# can name both.  -1 when no enum declares the name.  Otherwise the enum
-# index, with *out_vi the variant's tag.
+# AGAST #1600 / #2039: the enum a bare variant name denotes, as a VALUE
+# (`let s: S = B`) or a ctor call (`B()`, `Holds(x)`).  A name two or more
+# non-generic enums declare is ambiguous whatever the expected type: it
+# returns -2, with *out_vi set to the alphabetically-first declaring enum's
+# index and *out_other to the second's, so the caller can name both (ritz0
+# names the same two; declaration order differs between the compilers across
+# imports).  -1 when no enum declares the name.  Otherwise the enum index,
+# with *out_vi the variant's tag.
 pub fn enum_of_variant_unique(name: *u8, len: i32, out_vi: *i32, out_other: *i32) -> i32
     *out_vi = 0 - 1
     *out_other = 0 - 1
     if g_enum_initialized == 0
         return 0 - 1
-    var found: i32 = 0 - 1
+    # lo / hi: the two alphabetically-smallest distinct declarers so far.
+    var lo: i32 = 0 - 1
+    var lo_vi: i32 = 0 - 1
+    var hi: i32 = 0 - 1
     var ei: i32 = 0
     while ei < g_enum_count
         if *(g_enum_generic + ei) == 0
             let vi: i32 = enum_variant_slot(ei, name, len)
             if vi >= 0
-                if found < 0
-                    found = ei
-                    *out_vi = vi
                 # The same enum recorded twice (a module reached again
                 # through an import cycle, as tempest's tab.ritz is) is not
                 # ambiguous; the tracker keys enums by name (enum_find).
-                else if enum_name_eq(ei, *(g_enum_names + found), *(g_enum_name_lens + found)) == 0
-                    *out_vi = found
-                    *out_other = ei
-                    return 0 - 2
+                var dup: i32 = 0
+                if lo >= 0 and enum_name_eq(ei, *(g_enum_names + lo), *(g_enum_name_lens + lo)) == 1
+                    dup = 1
+                if hi >= 0 and enum_name_eq(ei, *(g_enum_names + hi), *(g_enum_name_lens + hi)) == 1
+                    dup = 1
+                if dup == 0
+                    if lo < 0
+                        lo = ei
+                        lo_vi = vi
+                    else if enum_name_lt(ei, lo) == 1
+                        hi = lo
+                        lo = ei
+                        lo_vi = vi
+                    else if hi < 0 or enum_name_lt(ei, hi) == 1
+                        hi = ei
         ei = ei + 1
-    return found
+    if hi >= 0
+        *out_vi = lo
+        *out_other = hi
+        return 0 - 2
+    *out_vi = lo_vi
+    return lo
 
 # =============================================================================
 # AGAST #1794: `id<@E>(e)` and `a[:]`

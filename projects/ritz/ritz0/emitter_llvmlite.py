@@ -543,6 +543,12 @@ class LLVMEmitter:
         # Variant to enum mapping: variant_name -> enum_name
         # Used to resolve variant constructors like Some(x) -> Option_i32
         self.variant_to_enum: Dict[str, str] = {}
+        # AGAST #2039: variant_name -> the non-generic user enums declaring
+        # it, each name once (the same enum reached twice through an import
+        # cycle is one enum, as in ritz1; ritz0's resolver loads a module once,
+        # so the dedupe is defensive).  Two or more make a bare use of the
+        # name ambiguous (_check_variant_unambiguous).
+        self.variant_declarers: Dict[str, List[str]] = {}
 
         # Traits: name -> list of method signatures (TraitMethodSig)
         self.traits: Dict[str, List[rast.TraitMethodSig]] = {}
@@ -2429,6 +2435,33 @@ class LLVMEmitter:
         # Register variant names for constructor resolution
         for variant in enum_def.variants:
             self.variant_to_enum[variant.name] = enum_def.name
+            # A specialization of a generic enum (`Option$i64`, from
+            # monomorph) is no user enum: `Some` / `None` resolve by the
+            # expected type, as in ritz1, which skips generic enums too.
+            if not enum_def.is_generic() and '$' not in enum_def.name:
+                declarers = self.variant_declarers.setdefault(variant.name, [])
+                if enum_def.name not in declarers:
+                    declarers.append(enum_def.name)
+
+    def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span]):
+        """Reject a bare variant name two or more user enums declare (AGAST #2039).
+
+        `B` used as a value or a ctor call (`B`, `B()`, `Holds(x)`) when enums
+        S and T both declare it is an error wherever it appears, whatever the
+        expected type: qualify it (`S.B`).  The diagnostic is ritz1's (#1600),
+        naming the two alphabetically-first declaring enums.  Bare match-arm
+        patterns are not checked here: they resolve against the scrutinee's
+        enum in both compilers.
+        """
+        declarers = self.variant_declarers.get(name, ())
+        if len(declarers) >= 2:
+            # Alphabetical, not declaration order: ritz0 registers imported
+            # enums before the module's own, ritz1 the other way round, and
+            # both must print the same text.
+            a, b = sorted(declarers)[:2]
+            raise EmitError(
+                f"ambiguous enum variant '{name}': declared by enum '{a}' and "
+                f"enum '{b}'; qualify it, e.g. '{a}.{name}'", span)
 
     def _define_enum(self, enum_def: rast.EnumDef):
         """Define an enum type body (after all types are declared).
@@ -2712,7 +2745,10 @@ class LLVMEmitter:
         """Check if expression is an enum variant constructor call."""
         if isinstance(expr, rast.Call):
             if isinstance(expr.func, rast.Ident):
-                return expr.func.name in self.variant_to_enum
+                if expr.func.name in self.variant_to_enum:
+                    self._check_variant_unambiguous(expr.func.name, expr.func.span)
+                    return True
+                return False
         elif isinstance(expr, rast.Ident):
             # Unit variant without parens.  A local or param of the same name
             # shadows the variant (AGAST #2038, as ritz1 since #1600): the
@@ -2721,7 +2757,10 @@ class LLVMEmitter:
             # field) must not build `B` as a variant of the expected type.
             if expr.name in self.locals or expr.name in self.params:
                 return False
-            return expr.name in self.variant_to_enum
+            if expr.name in self.variant_to_enum:
+                self._check_variant_unambiguous(expr.name, expr.span)
+                return True
+            return False
         return False
 
     def _emit_enum_variant_with_type(self, expr: rast.Expr, enum_type_name: str) -> ir.Value:
@@ -6406,6 +6445,7 @@ class LLVMEmitter:
 
             # Check if this is a unit variant (enum variant without parentheses)
             if name in self.variant_to_enum:
+                self._check_variant_unambiguous(name, expr.span)
                 # Get the variant and check if it's a unit variant (no fields)
                 enum_name = self.variant_to_enum[name]
                 variant = self._get_enum_variant(enum_name, name)
@@ -8973,6 +9013,7 @@ class LLVMEmitter:
 
         # Handle enum variant constructors: Some(x), None, Ok(v), Err(e)
         if fname in self.variant_to_enum:
+            self._check_variant_unambiguous(fname, call.func.span)
             return self._emit_enum_variant_constructor(fname, call.args)
 
         # Handle __builtin_alloca

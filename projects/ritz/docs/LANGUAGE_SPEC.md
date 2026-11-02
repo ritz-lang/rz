@@ -1199,6 +1199,50 @@ let c = Color::Red
 Use free functions instead: `string_from(sv)`, `strview_from_cstr(p)`,
 `vec_new<T>()`.
 
+**Bare variants.** A variant may be written without its enum (`Red`, `Red()`,
+`Circle(1.0)`) only when **exactly one** enum in scope (declared or imported,
+`Option`/`Result` aside) declares a variant of that name. If two or more do,
+the bare name is an error in every value position (a `let` / `var`
+initialiser, an assignment, a call argument, a `return`, an operand of `==`,
+a constructor call), **whatever the expected type**: `let s: S = B` is
+rejected even though only `S.B` would fit. Qualify it instead (AGAST #2039):
+
+```ritz
+enum S
+    A
+    B
+
+enum T
+    B
+    C
+
+fn main() -> i32
+    let s: S = S.B   # qualified: fine
+    let t = C        # only T declares C: fine bare
+    match s
+        A => 1
+        B => 2       # a bare arm resolves against the scrutinee's enum
+```
+
+```ritz expect-error="ambiguous enum variant 'B': declared by enum 'S' and enum 'T'; qualify it, e.g. 'S.B'"
+enum S
+    A
+    B
+
+enum T
+    B
+    C
+
+fn main() -> i32
+    let s: S = B
+    0
+```
+
+The error names the two alphabetically-first declaring enums. Bare **match
+arm patterns** are the exception: the scrutinee's enum is known, so `B =>`
+against an `S` is `S.B`. A local or parameter named like a variant shadows it,
+and an enum reached twice through an import cycle is still one enum.
+
 ### 10.3 Pattern Matching
 
 ```ritz

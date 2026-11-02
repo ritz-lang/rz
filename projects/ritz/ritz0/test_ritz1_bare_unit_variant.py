@@ -14,9 +14,9 @@ that builds *a* value with the wrong tag is caught, not just a compile
 failure.  ritz0 is run as the oracle.
 
 A name declared as a variant by two enums is ambiguous: ritz1 reports a
-located error rather than guessing.  (ritz0 picks by expected type, else the
-last-declared enum; ritz1 has no user-enum expected-type threading.  The rule
-is open in AGAST #2039.)
+located error rather than guessing.  Since AGAST #2039 that is the rule in
+both compilers, in every value position and for ctor calls, whatever the
+expected type; test_ambiguous_enum_variant.py covers it for ritz0 and ritz1.
 """
 
 import os

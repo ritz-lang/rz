@@ -2352,13 +2352,16 @@ fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_other: *
 # does (it wins over a same-named fn, as in ritz0).  null/0 otherwise.
 # AGAST #1610: also a unit variant called with no arguments, `Red()` (built
 # with no payload; it used to fall through to a fn call returning i64).
+# AGAST #2039: a name two enums declare is no ctor here (null): the caller,
+# try_emit_user_variant_ctor, reports it via user_variant_ctor_ambiguous.
 pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
     if e == null or e.kind != EXPR_CALL
         return
     var vi: i32 = 0
-    let ei: i32 = enum_of_variant(e.func_name, e.func_name_len, @vi)
+    var other: i32 = 0
+    let ei: i32 = enum_of_variant_unique(e.func_name, e.func_name_len, @vi, @other)
     if ei < 0
         return
     let kind: i32 = enum_variant_kind(ei, vi)
@@ -2371,6 +2374,61 @@ pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
     else
         return
     *out_name = enum_name_at(ei, out_len)
+
+# AGAST #2039: a call `B()` / `Holds(x)` whose callee name two or more
+# non-generic enums declare as a variant.  Returns 1 and fills *out_a /
+# *out_b with the two enums to name (enum_of_variant_unique's -2), else 0.
+pub fn user_variant_ctor_ambiguous(e: *Expr, out_a: *i32, out_b: *i32) -> i32
+    if e == null or e.kind != EXPR_CALL
+        return 0
+    if enum_of_variant_unique(e.func_name, e.func_name_len, out_a, out_b) == 0 - 2
+        return 1
+    return 0
+
+# AGAST #1600 / #2039: `name` (a bare variant used as a value, or the callee
+# of a ctor call) is a variant of two enums (`ea`, `eb`).  Whatever the
+# expected type, this is a located error asking for the qualified form; ritz0
+# prints the same text.  Counted like emit_ir_error, so no output is written;
+# returns a placeholder register to keep the IR well-formed.
+pub fn emit_ambiguous_variant_error(s: *EmitterState, name: *u8, len: i32, span: SrcSpan, ea: i32, eb: i32) -> i32
+    var a_len: i32 = 0
+    let a: *u8 = enum_name_at(ea, @a_len)
+    var b_len: i32 = 0
+    let b: *u8 = enum_name_at(eb, @b_len)
+    emit_str(s, c"  ; ERROR: ambiguous enum variant '")
+    emit_name(s, name, len)
+    emit_str(s, c"'\n")
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(span.col as i64)
+    eprints_cstr(c": ambiguous enum variant '")
+    eprint_bytes(name, len)
+    eprints_cstr(c"': declared by enum '")
+    eprint_bytes(a, a_len)
+    eprints_cstr(c"' and enum '")
+    eprint_bytes(b, b_len)
+    eprints_cstr(c"'; qualify it, e.g. '")
+    eprint_bytes(a, a_len)
+    eprints_cstr(c".")
+    eprint_bytes(name, len)
+    eprints_cstr(c"'\n")
+    s.error_count = s.error_count + 1
+    let zero: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, zero)
+    emit_str(s, c" = add i64 0, 0\n")
+    return zero
+
+fn eprint_bytes(p: *u8, len: i32)
+    for i in 0..len
+        eprint_char(*(p + i))
 
 # Best-effort resolve the LLVM struct type-name produced by an expression.
 # Writes the name pointer and length into the out-pointers, or null/0 if
