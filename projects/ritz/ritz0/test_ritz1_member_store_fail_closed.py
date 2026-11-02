@@ -116,20 +116,23 @@ pub fn main() -> i32
     ),
     # A pointer field whose pointee ritz1 cannot address at a known width.
     # (Integer, pointer and struct pointees are lowered since #1596 — see
-    # test_ritz1_ptr_field_index.py.)
-    "nested_bool_ptr_field_index": (
+    # test_ritz1_ptr_field_index.py; bool since #2063, whose
+    # `nested_bool_ptr_field_index` pin moved to the ritz0-oracle
+    # test_ritz1_bool_ptr_layout.py.)  An array pointee records no element
+    # kind (ptr_field_elem_kind -> TYPE_UNKNOWN).
+    "nested_array_ptr_field_index": (
         """\
 struct B
-    data: *bool
+    data: *[4]u8
 
 struct A
     b: B
 
 pub fn main() -> i32
-    var buf: [4]bool
+    var buf: [4]u8
     var a: A
-    a.b.data = @buf[0]
-    a.b.data[2] = true
+    a.b.data = @buf
+    a.b.data[2] = 1
     return 0
 """,
         INDEXED,

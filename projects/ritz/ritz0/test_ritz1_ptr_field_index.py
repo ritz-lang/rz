@@ -363,8 +363,8 @@ def test_ritz1_local_ptr_field_store_loads_the_pointer(ritz1_bin, tmp_path):
 
 # A `*f64` / `*f32` pointee (AGAST #2053): this was the fail-closed pin
 # ("unhandled indexed EXPR_MEMBER in assignment") until ritz1 could index
-# through the field at `double` / `float` width. Bool pointees still fail
-# closed (#2063; see test_ritz1_member_store_fail_closed.py).
+# through the field at `double` / `float` width. Bool pointees are covered
+# by test_ritz1_bool_ptr_layout.py (#2063).
 FLOAT_POINTEE = """\
 struct F
     data: *T

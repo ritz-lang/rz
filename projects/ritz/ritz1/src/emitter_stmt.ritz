@@ -628,7 +628,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # squeeze/cryptosec/valet rely on this for inflate/sbox tables.
         # Lowering strategy lives in emit_array_fill_into (emitter_expr).
         if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_FILL
-            emit_array_fill_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_init.left, 0)
+            emit_array_fill_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_init.left)
             return
 
         # Array-literal init for typed [N]T slots (ritz0 parity —
@@ -641,7 +641,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # direct-element-store behaviour.
         if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_LIT
             # `stmt.var_type_name` names the element struct of `[N]T`.
-            emit_array_lit_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init, 0)
+            emit_array_lit_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init)
             return
 
         # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
@@ -1884,11 +1884,13 @@ fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, bas
         emit_reg(s, elem_ptr)
         emit_str(s, c"\n")
         return
-    if base_type != TYPE_PTR_PTR and (pointee == TYPE_F32 or pointee == TYPE_F64)
+    if base_type != TYPE_PTR_PTR and array_elem_typed_scalar(pointee) == 1
         # AGAST #1973: `p[i] = v` through a *f32 / *f64 GEPs and stores a
         # `float` / `double` (an f64 value into an f32 slot is fptrunc'd),
         # as a local float array element does (#1966).  It fell to the
-        # i64 arm below: `getelementptr i64` + `store i64 %float`.
+        # i64 arm below: `getelementptr i64` + `store i64 %float`.  A
+        # *bool strides and stores one `i1`, as every bool array element
+        # is laid out (#2063); it stored an i64 8 bytes apart.
         let fty: *u8 = local_array_elem_llvm(pointee)
         let fval: i32 = emit_field_elem_narrow(s, val_reg, pointee, stmt.assign_value)
         emit_str(s, c"  ")
@@ -1998,16 +2000,14 @@ fn array_elem_types_match(a: i32, a_name: *u8, a_len: i32, b: i32, b_name: *u8, 
 # at `field_ptr`, after checking it has the field's length and element type
 # (ritz0 rejects a mismatch).  Supported sources:
 #   * a local `[N]T` array (`w.vals = a`); its alloca is `[N x T]` with the
-#     field's element spelling for every T except bool, which a local keeps
-#     in i64 slots (field_elem_layout_differs) — refused.  f32 / f64 locals
-#     are `[N x float]` / `[N x double]` since #1966 and copy (#1971);
+#     field's element spelling for every T (f32 / f64 since #1966 / #1971,
+#     bool `i1` since #2063);
 #   * another inline array field (`y.vals = x.vals`, `p.b = p.a`), whose
 #     layout is the field's own;
 #   * `*src` for a param or annotated local `src: *[N]T` (AGAST #1953), whose
-#     N and T are recorded on the LocalVar (pointee_array_*).  The pointee
-#     may be a local array or a field, so for bool its element layout is
-#     unknown — refused, as for a local.  f32 / f64 pointees (local, field
-#     or global) all use float / double elements and copy (#1971).
+#     N and T are recorded on the LocalVar (pointee_array_*).  A local,
+#     field or global pointee shares the field's element layout (#1971,
+#     #2063), so every element type copies.
 # Returns 1 once handled (copied or diagnosed).  Anything else fails
 # closed: emit_expr has no whole-array value, and the pre-#1934 generic
 # path stored an ADDRESS into the field.
@@ -2017,7 +2017,6 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
     var src_et: i32 = TYPE_VOID
     var src_name: *u8 = null
     var src_name_len: i32 = 0
-    var src_is_local: i32 = 0
     if value.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, value.ident_ptr, value.ident_len)
         if loc != null and loc.var_type == TYPE_ARRAY
@@ -2026,7 +2025,6 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
             src_et = loc.array_elem_type
             src_name = loc.type_name
             src_name_len = loc.type_name_len
-            src_is_local = 1
     else if value.kind == EXPR_MEMBER
         var mr: MemberPtrResult
         emit_member_ptr(s, value, @mr)
@@ -2046,7 +2044,6 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
             src_et = ploc.pointee_array_elem_type
             src_name = ploc.type_name
             src_name_len = ploc.type_name_len
-            src_is_local = 1
     if src_ptr < 0
         emit_ir_error(s, c"whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
         return
@@ -2055,9 +2052,6 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
         return
     if array_elem_types_match(src_et, src_name, src_name_len, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len) == 0
         emit_ir_error(s, c"array element type does not match the struct field's element type")
-        return
-    if src_is_local == 1 and field_elem_layout_differs(src_et) == 1
-        emit_ir_error(s, c"copying a local or `*[N]T` pointee [N]bool array into a struct field is not supported by ritz1 (a local bool array keeps i64 slots, a bool field i1)")
         return
     emit_array_field_copy(s, field, src_ptr, field_ptr)
 
@@ -2115,7 +2109,7 @@ fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *Struc
         emit_ir_error(s, c"array literal length does not match the struct field's array length")
         return
     if value.kind == EXPR_ARRAY_FILL
-        emit_array_fill_into(s, field_ptr, field.array_size, et, value.left, 1)
+        emit_array_fill_into(s, field_ptr, field.array_size, et, value.left)
         return
     # Build in a temporary (a fixed-size alloca, hoisted to the entry block),
     # then copy the whole aggregate over the field.
@@ -2125,7 +2119,7 @@ fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *Struc
     emit_str(s, c" = alloca ")
     emit_array_field_llvm_type(s, field)
     emit_str(s, c"\n")
-    emit_array_lit_into(s, tmp, field.array_size, et, field.array_elem_type_name, field.array_elem_type_name_len, value, 1)
+    emit_array_lit_into(s, tmp, field.array_size, et, field.array_elem_type_name, field.array_elem_type_name_len, value)
     emit_array_field_copy(s, field, tmp, field_ptr)
 
 # AGAST #1814: `x.f[i] = v` where `f` is an inline `[N]T` array field at
@@ -2200,7 +2194,7 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
 # AGAST #1596: `x.f[i] = v` where `f` is a pointer field (`*T` / `**T`):
 # load the pointer from the field slot `field_slot`, GEP by the pointee, and
 # store `v` at the pointee's width. Returns 0 WITHOUT emitting anything when
-# the pointee cannot be addressed at a known width (bool, unrecorded)
+# the pointee cannot be addressed at a known width (unrecorded)
 # so the caller can fail closed.
 fn emit_ptr_field_index_store(s: *EmitterState, field_slot: i32, field: *StructField, idx_expr: *Expr, val_expr: *Expr) -> i32
     let kind: i32 = ptr_field_elem_kind(field)
@@ -2215,9 +2209,9 @@ fn emit_ptr_field_index_store(s: *EmitterState, field_slot: i32, field: *StructF
         emit_llvm_type_struct(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
         emit_str(s, c" ")
         emit_reg(s, val)
-    else if kind == TYPE_F32 or kind == TYPE_F64
+    else if array_elem_typed_scalar(kind) == 1
         # AGAST #2053: `float` / `double` (ptr_field_elem_llvm); an f64
-        # value into an f32 slot is fptrunc'd.
+        # value into an f32 slot is fptrunc'd.  bool: `i1` (#2063).
         let typed: i32 = emit_field_elem_narrow(s, val, kind, val_expr)
         emit_str(s, c"  store ")
         emit_str(s, ptr_field_elem_llvm(kind))
@@ -3062,7 +3056,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # convert back to ptr, i64 stores as-is; an f64 value into
                     # an f32 element is fptrunc'd (#1966).
                     var store_val: i32 = val_reg
-                    if local.array_elem_type == TYPE_F32 or local.array_elem_type == TYPE_F64
+                    if array_elem_typed_scalar(local.array_elem_type) == 1
                         store_val = emit_field_elem_narrow(s, val_reg, local.array_elem_type, stmt.assign_value)
                     else
                         store_val = emit_array_elem_narrow(s, val_reg, local.array_elem_type, elem_ty)
@@ -3168,9 +3162,10 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     emit_str(s, c" to ")
                     emit_str(s, gty)
                     emit_str(s, c"\n")
-                else if get == TYPE_F32 or get == TYPE_F64
+                else if array_elem_typed_scalar(get) == 1
                     # AGAST #1970: a float / double slot; an f64 value into
-                    # an f32 element is fptrunc'd, as for a local array.
+                    # an f32 element is fptrunc'd, as for a local array.  A
+                    # bool element is an `i1` (#2063).
                     gstore = emit_field_elem_narrow(s, gval, get, stmt.assign_value)
                 emit_str(s, c"  store ")
                 emit_str(s, gty)

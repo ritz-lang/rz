@@ -85,7 +85,7 @@ FLOAT_PROGRAMS = {
 # between neighbours, and at a bool local (an i64 slot in ritz1): stored
 # through, flipped via `*R`, read back. An i64 store through the field
 # clobbers `c` / `after` (exit 0 before the fix). Indexing through a `*bool`
-# field stays fail-closed (#2063; test_ritz1_member_store_fail_closed.py).
+# field is covered by test_ritz1_bool_ptr_layout.py (#2063).
 BOOL_PROGRAM = """\
 struct S
     before: bool
