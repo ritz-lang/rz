@@ -2106,14 +2106,23 @@ class Parser:
                     self._advance()
                     while not self._at(TokenType.DEDENT, TokenType.EOF):
                         field_name = self._expect(TokenType.IDENT)
-                        if not self._at(TokenType.COLON):
+                        # `name:& T` is a borrow field, wrapped in a RefType
+                        # exactly as in a struct body (#2040). ritz1 has no
+                        # `:=` field form, so unlike struct bodies it is not
+                        # accepted here.
+                        wrap_ref = self._at(TokenType.COLON_AMP)
+                        if not (wrap_ref or self._at(TokenType.COLON)):
                             raise ParseError(
                                 f"Expected ':' after field name "
                                 f"'{field_name.value}' in enum variant "
                                 f"'{var_name.value}'",
                                 field_name.span)
                         self._advance()
-                        var_fields.append(self.parse_type())
+                        field_type = self.parse_type()
+                        if wrap_ref:
+                            field_type = rast.RefType(
+                                field_type.span, field_type, mutable=True)
+                        var_fields.append(field_type)
                         var_field_names.append(field_name.value)
                         self._skip_newlines()
                     if self._at(TokenType.DEDENT):

@@ -333,9 +333,8 @@ pub fn main() -> i32
 # accept a borrow field too. Tag indices must still count the variant: Stop is
 # 1 and GoBack is 3, so the answer is 1 + 2 = 3.
 #
-# ritz0 cannot be the oracle here. Its struct-field parser takes COLON_AMP but
-# its variant-field loop takes only COLON, so it rejects this program (#2040).
-# The ritz0 side is pinned as a strict xfail that turns red once #2040 lands.
+# ritz0's variant-field loop took only COLON until #2040, so it rejected this
+# program; it now accepts COLON_AMP exactly as its struct-field parser does.
 ENUM_VARIANT = """\
 struct C
     x: i32
@@ -357,6 +356,24 @@ fn code(m: Msg) -> i32
 
 pub fn main() -> i32
     return code(Msg.Stop) + code(Msg.GoBack)
+"""
+
+# A 32-byte C: a by-value field would make the payload [32 x i8]; a reference
+# makes it [8 x i8]. Distinguishes "parsed `:&` as `:`" from "wrapped in a ref".
+VARIANT_LAYOUT = """\
+struct C
+    a: i64
+    b: i64
+    c: i64
+    d: i64
+
+enum Msg
+    Attach
+        channel:& C
+    Stop
+
+pub fn main() -> i32
+    return 3
 """
 
 # `ch: &C` (spaced) is NOT the borrow form. ritz0 lexes `:&` as one COLON_AMP
@@ -519,12 +536,23 @@ def test_ritz1_enum_variant_borrow_field(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(
-    strict=True,
-    reason="#2040: ritz0's enum variant field loop rejects `name:& T`",
-)
 def test_ritz0_enum_variant_borrow_field(tmp_path):
+    """AGAST #2040. Before the fix: "Expected ':' after field name 'channel'
+    in enum variant 'Attach'"."""
     assert _run("ritz0", None, tmp_path, "enum_variant", ENUM_VARIANT) == 3
+
+
+@pytest.mark.integration
+def test_ritz0_enum_variant_borrow_field_is_a_reference(tmp_path):
+    """`channel:& C` in a variant is a reference, as in a struct body: the
+    payload holds a pointer, not the 32-byte C."""
+    comp, ll, _ = _compile("ritz0", None, tmp_path, "variant_layout", VARIANT_LAYOUT)
+    assert comp.returncode == 0 and ll.exists(), comp.stdout[-2000:] + comp.stderr[-2000:]
+    m = re.search(r'^%"enum\.[^"]*\.Msg" = type (.*)$', ll.read_text(), re.MULTILINE)
+    assert m, "no Msg enum type in ritz0 IR"
+    assert m.group(1).replace(" ", "") == "{i8,[7xi8],[8xi8]}", (
+        f"`channel:& C` should lower to a reference, got Msg = type {m.group(1)}"
+    )
 
 
 @pytest.mark.integration
