@@ -7,9 +7,8 @@ arm only knew float intrinsics (`x.ceil()`) and fell back to TYPE_I64 for a
 user method, so binop_float_width computed the add at the literal's `double`.
 
 Receivers covered: struct literal (the ticket), local, pointer local,
-global, field, `self`, and a static method.  A call-result receiver
-(`mk(v).scale(f)`) is AGAST #2073: emit_expr_method spills it as `i64`
-before any arithmetic, so it is not exercised here.  Each program is
+global, field, call result (`mk(v).scale(f)`, which also needed AGAST
+#2073's struct-typed spill), `self`, and a static method.  Each program is
 instantiated for f64 and f32 and returns 3 on success.  ritz0 is the oracle.
 """
 
@@ -78,6 +77,16 @@ pub fn main() -> i32
     return b as i32
 """
 
+# A call-result receiver (AGAST #2073): 0.75 * 2 + 1.5 = 3.
+CALL_RECV = """\
+fn mk(v: T) -> Pt
+    Pt { x: v }
+
+pub fn main() -> i32
+    let b: T = mk(0.75 as T).scale(2.0 as T) + 1.5
+    return b as i32
+"""
+
 # `self.scale(...) + 0.5` inside a method: 1.25 * 2 + 0.5 = 3.
 SELF_RECV = """\
 struct Q
@@ -108,6 +117,7 @@ PROGRAMS = {
     "local_recv": LOCAL_RECV,
     "global_recv": GLOBAL_RECV,
     "field_recv": FIELD_RECV,
+    "call_recv": CALL_RECV,
     "self_recv": SELF_RECV,
     "static": STATIC,
 }
