@@ -1,0 +1,68 @@
+# ritzunit/wait_status.ritz - what a reaped test child's wait status reports
+#
+# Split from runner.ritz so ritzunit's own tests can import it: the runner
+# declares the compiler-emitted test table, which a test file defines.
+
+import ritzlib.sys
+
+# ============================================================================
+# Wait Status Macros (POSIX)
+# ============================================================================
+
+pub fn WIFEXITED(status: i32) -> i32
+    return ((status & 127) == 0) as i32
+
+pub fn WEXITSTATUS(status: i32) -> i32
+    return (status >> 8) & 255
+
+pub fn WIFSIGNALED(status: i32) -> i32
+    let sig: i32 = status & 127
+    return (sig != 0 && sig != 127) as i32
+
+pub fn WTERMSIG(status: i32) -> i32
+    return status & 127
+
+# ============================================================================
+# Test results
+# ============================================================================
+
+const TEST_RESULT_PASS: i32 = 0      # Test passed (exit 0)
+const TEST_RESULT_FAIL: i32 = 1      # Test failed (non-zero exit)
+const TEST_RESULT_SIGNAL: i32 = 2    # Test killed by signal
+const TEST_RESULT_TIMEOUT: i32 = 3   # Test timed out
+
+struct TestRunResult
+    status: i32          # TEST_RESULT_* constant
+    exit_code: i32       # Exit code (if PASS/FAIL)
+    signal: i32          # Signal number (if SIGNAL)
+
+# What a reaped child's wait status means.
+pub fn result_from_status(status: i32, result: *TestRunResult)
+    result.exit_code = 0
+    result.signal = 0
+    if WIFEXITED(status) != 0
+        result.exit_code = WEXITSTATUS(status)
+        if result.exit_code == 0
+            result.status = TEST_RESULT_PASS
+        else
+            result.status = TEST_RESULT_FAIL
+    else if WIFSIGNALED(status) != 0
+        result.status = TEST_RESULT_SIGNAL
+        result.signal = WTERMSIG(status)
+    else
+        result.status = TEST_RESULT_FAIL
+        result.exit_code = -1
+
+# What a reaped pool child reports; `killed` is 1 if the runner SIGKILLed it
+# for passing its deadline.
+#
+# The status decides, not `killed` (AGAST #2070). The runner kills at the
+# deadline right after a WNOHANG reap found nothing, so a child that crashed
+# or exited in that window is already a zombie: the kill does nothing and the
+# status says what the test did. Only a SIGKILL death after our kill is a
+# timeout.
+pub fn result_from_reap(status: i32, killed: i32, result: *TestRunResult)
+    result_from_status(status, result)
+    if killed != 0 && result.status == TEST_RESULT_SIGNAL && result.signal == SIGKILL
+        result.status = TEST_RESULT_TIMEOUT
+        result.signal = 0

@@ -175,9 +175,27 @@ def test_result_256_fails(package, tmp_path):
     assert (passed, failed) == (0, 2), failures
 
 
+def _run_filtered(exe: str, monkeypatch, pattern: str, timeout_ms: int):
+    """test_runner.run_test_binary on the tests `-f pattern` selects."""
+    monkeypatch.setattr(test_runner, "TEST_TIMEOUT_MS", timeout_ms)
+    base = test_runner.runner_args
+    monkeypatch.setattr(test_runner, "runner_args", lambda: base() + ["-f", pattern])
+    try:
+        return test_runner.run_test_binary(exe)
+    finally:
+        monkeypatch.setattr(test_runner, "runner_args", base)
+
+
 def test_crash_assert_and_timeout_are_attributed(package, tmp_path, monkeypatch):
-    monkeypatch.setattr(test_runner, "TEST_TIMEOUT_MS", 300)
-    test_file = package("""\
+    """AGAST #2070: only `hangs` races a short deadline.
+
+    With one 300 ms timeout for the whole binary, `crashes` read "timeout" on
+    a loaded CI runner: a SIGSEGV whose core dump (a piped core handler) or
+    scheduling outlasts the deadline is SIGKILLed mid-crash. The crash,
+    the assert and the pass run under test_runner's default timeout; `hangs`
+    runs alone, so its short deadline cannot catch anything else.
+    """
+    exe = _binary(package("""\
         [[test]]
         fn crashes() -> i32
             # A load from address 0 the optimiser cannot see. `*(0 as *i32)`
@@ -200,13 +218,17 @@ def test_crash_assert_and_timeout_are_attributed(package, tmp_path, monkeypatch)
         [[test]]
         fn passes() -> i32
             0
-        """)
-    passed, failed, failures = test_runner.run_test_file(str(test_file))
-    assert (passed, failed) == (1, 3), failures
+        """), tmp_path)
+    passed, failed, failures = _run_filtered(exe, monkeypatch, "not hangs",
+                                             test_runner.TEST_TIMEOUT_MS)
+    assert (passed, failed) == (1, 2), failures
     by_name = {f.split(":", 1)[0]: f for f in failures}
     assert "crashed with signal 11" in by_name["crashes"]
     assert "assertion failed" in by_name["asserts"]
-    assert "timeout" in by_name["hangs"]
+
+    passed, failed, failures = _run_filtered(exe, monkeypatch, "hangs", 300)
+    assert (passed, failed) == (0, 1), failures
+    assert failures[0].startswith("hangs:") and "timeout" in failures[0]
 
 
 def test_runner_symbols_cannot_clash_with_the_program(package, tmp_path):

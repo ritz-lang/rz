@@ -31,6 +31,7 @@ import ritzlib.memory
 import ritzlib.args
 import ritzlib.str
 import ritzlib.strview
+import ritzunit.wait_status
 
 # ============================================================================
 # The compiler-emitted test table (LANGUAGE_SPEC §17.1)
@@ -59,23 +60,6 @@ const MFD_CLOEXEC: i64 = 1
 # Output kept per failing test: the last CAPTURE_KEEP bytes. A diagnostic is
 # at the end of a test's output, and a runaway test must not exhaust memory.
 const CAPTURE_KEEP: i64 = 65536
-
-# ============================================================================
-# Wait Status Macros (POSIX)
-# ============================================================================
-
-fn WIFEXITED(status: i32) -> i32
-    return ((status & 127) == 0) as i32
-
-fn WEXITSTATUS(status: i32) -> i32
-    return (status >> 8) & 255
-
-fn WIFSIGNALED(status: i32) -> i32
-    let sig: i32 = status & 127
-    return (sig != 0 && sig != 127) as i32
-
-fn WTERMSIG(status: i32) -> i32
-    return status & 127
 
 # ============================================================================
 # CLI Options (Global State)
@@ -139,16 +123,6 @@ fn shuffle_order(order: *i64, count: i64)
 # Test Execution
 # ============================================================================
 
-const TEST_RESULT_PASS: i32 = 0      # Test passed (exit 0)
-const TEST_RESULT_FAIL: i32 = 1      # Test failed (non-zero exit)
-const TEST_RESULT_SIGNAL: i32 = 2    # Test killed by signal
-const TEST_RESULT_TIMEOUT: i32 = 3   # Test timed out
-
-struct TestRunResult
-    status: i32          # TEST_RESULT_* constant
-    exit_code: i32       # Exit code (if PASS/FAIL)
-    signal: i32          # Signal number (if SIGNAL)
-
 # The exit status a test's result becomes in its child. Only the low 8 bits
 # of an exit status survive, so a non-zero result whose low byte is zero (256)
 # would read as a pass: report it as 1 instead.
@@ -203,23 +177,6 @@ fn capture_take(fd: i32) -> StrView
 fn run_test_direct(test: *RitzTest) -> i32
     let run: fn() -> i32 = test.run
     return run()
-
-# What a reaped child's wait status means.
-fn result_from_status(status: i32, result: *TestRunResult)
-    result.exit_code = 0
-    result.signal = 0
-    if WIFEXITED(status) != 0
-        result.exit_code = WEXITSTATUS(status)
-        if result.exit_code == 0
-            result.status = TEST_RESULT_PASS
-        else
-            result.status = TEST_RESULT_FAIL
-    else if WIFSIGNALED(status) != 0
-        result.status = TEST_RESULT_SIGNAL
-        result.signal = WTERMSIG(status)
-    else
-        result.status = TEST_RESULT_FAIL
-        result.exit_code = -1
 
 # ============================================================================
 # The pool: up to g_jobs forked children at once (-j N, AGAST #1909)
@@ -291,12 +248,7 @@ fn pool_launch(slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_ma
 fn pool_record(slot: *PoolSlot, status: i32, outcomes: *Outcome)
     let out: *Outcome = @outcomes[slot.pos]
     out.elapsed = get_time_ms() - slot.start_ms
-    if slot.killed != 0
-        out.result.status = TEST_RESULT_TIMEOUT
-        out.result.exit_code = 0
-        out.result.signal = 0
-    else
-        result_from_status(status, @out.result)
+    result_from_reap(status, slot.killed, @out.result)
     out.output = strview_empty()
     if out.result.status != TEST_RESULT_PASS
         out.output = capture_take(slot.capture_fd)
