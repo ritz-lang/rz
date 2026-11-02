@@ -516,7 +516,137 @@ fn emit_ptr_elem_gep_type(s: *EmitterState, pointee_type: i32, name: *u8, name_l
         # Default to i8 (covers *u8 / *i8 — most common).
         emit_str(s, c"i8")
 
+# =============================================================================
+# Multi-dimensional arrays (AGAST #1509)
+# =============================================================================
+#
+# `var g: [N][M]..T` (local or global) carries an ArrayShape.  An index
+# chain `g[i0][i1]..[ik-1]` (k <= rank) over it is ONE GEP over the full
+# nested type, `getelementptr [N x [M x T]], ptr <g>, i64 0, i64 i0, i64 i1`,
+# giving the element (k == rank) or a sub-array (k < rank).  Loads, stores,
+# `@` and `.field` on a struct leaf all start from it.  Before #1509 the
+# inner array was flattened to one i64 and every one of these miscompiled
+# (or, for `@`, failed "cannot take address").
+
+struct NdIndexPtr
+    reg: i32              # ptr register of the element / sub-array
+    depth: i32            # indices applied, 1..shape.rank
+    shape: *ArrayShape
+
+# The shape of the N-D array an index chain `e` indexes, with the number of
+# indices in *out_depth, or null when `e` is not such a chain (base is not a
+# local / global N-D array, or the chain is deeper than its rank).  Emits
+# nothing, so callers can test before committing to the N-D path.
+fn nd_index_shape(s: *EmitterState, e: *Expr, out_depth: *i32) -> *ArrayShape
+    if e == null or e.kind != EXPR_INDEX
+        return null
+    var depth: i32 = 0
+    var base: *Expr = e
+    while base.kind == EXPR_INDEX
+        depth = depth + 1
+        base = base.left
+    let sh: *ArrayShape = nd_array_ident_shape(s, base)
+    if sh == null or depth > sh.rank
+        return null
+    *out_depth = depth
+    return sh
+
+# The ArrayShape of the local / global N-D array named `name`, or null.
+fn nd_array_name_shape(s: *EmitterState, name: *u8, len: i32) -> *ArrayShape
+    if name == null or len <= 0
+        return null
+    let lv: *LocalVar = find_local_struct_name(s, name, len)
+    if lv != null
+        if lv.var_type == TYPE_ARRAY
+            return lv.array_shape
+        return null
+    let glob: *GlobalVarDef = find_global(s, name, len)
+    if glob != null and glob.var_type == TYPE_ARRAY
+        return glob.array_shape
+    return null
+
+# The same for an EXPR_IDENT `e` (null for any other expression).
+fn nd_array_ident_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    return nd_array_name_shape(s, e.ident_ptr, e.ident_len)
+
+# Emit the GEP for an N-D index chain `e` into *out.  Returns 0 (emitting
+# nothing) when nd_index_shape does not recognise `e`.  The indices are
+# evaluated in source order, outermost dimension first.
+fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, e, @depth)
+    if sh == null
+        return 0
+    var base: *Expr = e
+    while base.kind == EXPR_INDEX
+        base = base.left
+    var regs: [8]i32
+    var j: i32 = 0
+    while j < depth
+        # The j-th index (source order) sits depth-1-j levels below `e`.
+        var node: *Expr = e
+        var k: i32 = 0
+        while k < depth - 1 - j
+            node = node.left
+            k = k + 1
+        regs[j] = emit_expr(s, node.right)
+        j = j + 1
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = getelementptr ")
+    emit_array_shape_llvm(s, sh, 0)
+    emit_str(s, c", ptr ")
+    let lv: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+    if lv != null
+        emit_reg(s, lv.reg)
+    else
+        emit_str(s, c"@")
+        emit_name(s, base.ident_ptr, base.ident_len)
+    emit_str(s, c", i64 0")
+    j = 0
+    while j < depth
+        emit_str(s, c", i64 ")
+        emit_reg(s, regs[j])
+        j = j + 1
+    emit_str(s, c"\n")
+    out.reg = r
+    out.depth = depth
+    out.shape = sh
+    return 1
+
+# The value of `e` = `g[i]..[k]` over an N-D array, in *out_reg.  Returns 0
+# when `e` is not an N-D index chain.  Only a full-depth chain to a scalar
+# leaf is a value; a row (`g[i]` of `[N][M]T`) or a struct leaf by value is
+# a located error rather than a guess at an aggregate load.
+fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
+    var ndp: NdIndexPtr
+    if emit_nd_index_ptr(s, e, @ndp) == 0
+        return 0
+    let sh: *ArrayShape = ndp.shape
+    if ndp.depth < sh.rank or sh.leaf_type == TYPE_STRUCT
+        emit_nd_error(s, e.span.line, e.span.col, c"a row or a struct element of a multi-dimensional array is not a value in ritz1 (index every dimension, use .field, or take its address with @)")
+        *out_reg = 0
+        return 1
+    let ty: *u8 = local_array_elem_llvm(sh.leaf_type)
+    let v: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, v)
+    emit_str(s, c" = load ")
+    emit_str(s, ty)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ndp.reg)
+    emit_str(s, c"\n")
+    *out_reg = emit_array_elem_widen(s, v, sh.leaf_type, ty)
+    return 1
+
 fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
+    # AGAST #1509: `@g[i][j]` / `@g[i]` over a multi-dimensional array.
+    var nd_addr: NdIndexPtr
+    if emit_nd_index_ptr(s, op, @nd_addr) == 1
+        return nd_addr.reg
     if op.kind == EXPR_IDENT
         let loc: i32 = find_local(s, op.ident_ptr, op.ident_len)
         if loc >= 0

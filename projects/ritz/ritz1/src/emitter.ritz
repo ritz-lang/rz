@@ -2281,6 +2281,9 @@ fn emit_global_vars(s: *EmitterState)
         mark_global_emitted(s, g.name, g.name_len)
         # Fold (and diagnose) the initializer before the declaration line so
         # any IR error marker lands on its own line.
+        if g.array_shape != null and g.init_expr != null
+            # AGAST #1509: see emit_var_decl -- no N-D initializer is lowered.
+            emit_nd_error(s, g.line, g.col, c"an initializer on a multi-dimensional array is not supported in ritz1")
         var gi: GlobalInit
         global_init_check(s, g, @gi)
         emit_str(s, c"@")
@@ -2297,6 +2300,9 @@ fn emit_global_vars(s: *EmitterState)
             emit_str(s, c"i64")
         else if g.var_type == TYPE_PTR
             emit_str(s, c"ptr")
+        else if g.var_type == TYPE_ARRAY and g.array_shape != null
+            # AGAST #1509: `var g: [N][M]T` -> `[N x [M x T]]` (was `[N x i64]`).
+            emit_array_shape_llvm(s, g.array_shape, 0)
         else if g.var_type == TYPE_ARRAY
             # AGAST #190: `var g: [N]T` — emit `[N x T]` so indexing GEPs
             # use the right stride.  Without this branch the global fell
@@ -3170,4 +3176,10 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     # AGAST #1369 — number of expressions the emitter could not lower.  This
     # used to be a hardcoded 0, and the call site in main.ritz ignored it, so
     # there was no path by which an emit failure could reach the exit code.
+    # AGAST #1509: a multi-dimensional array reached a 1-D element path
+    # (field_array_elem_llvm).  That is an unlowered N-D use: fail.
+    let nd_leaks: i32 = nd_elem_leaks()
+    if nd_leaks > 0
+        eprints_cstr(c"error: ritz1 cannot emit: a multi-dimensional array is used in a way ritz1 does not lower (only element access g[i][j], element stores and @g[i][j] are supported)\n")
+        s.error_count = s.error_count + nd_leaks
     s.error_count

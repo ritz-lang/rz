@@ -490,7 +490,11 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     emit_str(s, c"  ")
     emit_reg(s, alloca_reg)
     emit_str(s, c" = alloca ")
-    if var_type == TYPE_ARRAY
+    if var_type == TYPE_ARRAY and stmt.var_array_shape != null
+        # AGAST #1509: `var g: [N][M]T` -> `alloca [N x [M x T]]` (it was
+        # `[N x i64]`: the inner array lost, every access miscompiled).
+        emit_array_shape_llvm(s, stmt.var_array_shape, 0)
+    else if var_type == TYPE_ARRAY
         # Emit array type: [N x elem_type]
         emit_str(s, c"[")
         emit_int(s, stmt.var_array_size as i64)
@@ -548,6 +552,9 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, TYPE_ARRAY, stmt.var_type_name, stmt.var_type_name_len, TYPE_I64, stmt.var_array_size, stmt.var_array_elem_type)
         else
             add_local_array(s, stmt.var_name, stmt.var_name_len, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type)
+        if stmt.var_array_shape != null and s.local_count > 0
+            let nd_loc: *LocalVar = local_at(s, s.local_count - 1)
+            nd_loc.array_shape = stmt.var_array_shape  # AGAST #1509
     else
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
     set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, stmt.var_fn_sig)  # AGAST #1671
@@ -565,6 +572,13 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         let bool_loc: *LocalVar = local_at(s, s.local_count - 1)
         bool_loc.is_bool = 1
 
+    if stmt.var_init != null and stmt.var_array_shape != null
+        # AGAST #1509: no initializer form of a multi-dimensional array is
+        # lowered (the 1-D literal / fill / copy paths would write it as a
+        # flat [N x i64]).  Fail closed: the error count stops the driver
+        # writing any output.
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"an initializer on a multi-dimensional array is not supported in ritz1")
+        return
     if stmt.var_init != null
         # Check for struct literal initializer
         if stmt.var_init.kind == EXPR_STRUCT_LIT
@@ -756,11 +770,43 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
 
+# AGAST #1509: store stmt.assign_value into the N-D element `dst` points
+# at, at the leaf's width (as a 1-D local array element store does).  A row
+# or a whole struct element is a located error.
+fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
+    let sh: *ArrayShape = dst.shape
+    if dst.depth < sh.rank or sh.leaf_type == TYPE_STRUCT
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
+        return
+    let ty: *u8 = local_array_elem_llvm(sh.leaf_type)
+    let val: i32 = emit_expr(s, stmt.assign_value)
+    var store_val: i32 = val
+    if array_elem_typed_scalar(sh.leaf_type) == 1
+        store_val = emit_field_elem_narrow(s, val, sh.leaf_type, stmt.assign_value)
+    else
+        store_val = emit_array_elem_narrow(s, val, sh.leaf_type, ty)
+    emit_str(s, c"  store ")
+    emit_str(s, ty)
+    emit_str(s, c" ")
+    emit_reg(s, store_val)
+    emit_str(s, c", ptr ")
+    emit_reg(s, dst.reg)
+    emit_str(s, c"\n")
+
 fn emit_assign(s: *EmitterState, stmt: *Stmt)
     # Check for expression assignment: expr = value
     # When assign_target_len == 0, the target is in if_cond as an expression
     if stmt.assign_target_len == 0
         let target_expr: *Expr = stmt.if_cond as *Expr
+
+        # AGAST #1509: `g[i][j] = v` over a multi-dimensional array.  It fell
+        # to the generic path below, which evaluated `g[i][j]` as a VALUE
+        # (over a flattened [N x i64]) and stored through it.
+        if target_expr.kind == EXPR_INDEX
+            var nd_dst: NdIndexPtr
+            if emit_nd_index_ptr(s, target_expr, @nd_dst) == 1
+                emit_nd_elem_store(s, stmt, @nd_dst)
+                return
 
         # Check if target is a member expression (struct field assignment)
         if target_expr.kind == EXPR_MEMBER
@@ -1134,6 +1180,11 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c"\n")
         return
 
+    # AGAST #1509: `g = v` onto a whole multi-dimensional array stored one
+    # i64 into its first 8 bytes.  Not lowered: fail closed.
+    if nd_array_name_shape(s, stmt.assign_target, stmt.assign_target_len) != null
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a whole multi-dimensional array is not supported in ritz1 (assign each element)")
+        return
     let loc: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
     if loc >= 0
         let var_type: i32 = find_local_type(s, stmt.assign_target, stmt.assign_target_len)
@@ -1573,6 +1624,12 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         if iter.kind == EXPR_IDENT
             let loc: *LocalVar = find_local_struct_name(s, iter.ident_ptr, iter.ident_len)
             if loc != null
+                if loc.var_type == TYPE_ARRAY and loc.array_shape != null
+                    # AGAST #1509: iterating a multi-dimensional array yields
+                    # rows, which ritz1 cannot hold; it used to GEP the
+                    # alloca as `[N x i64]` and load garbage.
+                    emit_nd_error(s, iter.span.line, iter.span.col, c"iterating a multi-dimensional array is not supported in ritz1 (index it with nested ranges)")
+                    return
                 if loc.var_type == TYPE_ARRAY
                     iter_kind = 1
                     elem_type = loc.array_elem_type
@@ -3014,6 +3071,10 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # AGAST #1439: unresolved here -> shared member-store path.
         if lfia_done == 0
             emit_local_field_store_fallback(s, stmt, 1)
+    else if stmt.kind == STMT_INDEX_ASSIGN and nd_array_name_shape(s, stmt.assign_target, stmt.assign_target_len) != null
+        # AGAST #1509: `g[i] = v` with g multi-dimensional assigns a whole
+        # row (`g[i][j] = v` is an expression assignment, see emit_assign).
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
     else if stmt.kind == STMT_INDEX_ASSIGN
         # name[index] = value (array or pointer index assignment)
         # stmt.assign_target = base variable name (as *u8)

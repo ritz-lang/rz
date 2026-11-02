@@ -66,6 +66,9 @@ struct LocalVar
     # Read by emit_array_field_copy_from for `x.f = *src`.
     pointee_array_size: i32
     pointee_array_elem_type: i32
+    # AGAST #1509: every dimension of a `var g: [N][M]..T` local (array_size
+    # and array_elem_type then hold N and TYPE_ARRAY); null otherwise.
+    array_shape: *ArrayShape
 
 # A let/var seen so far in the current function, with the integer type its
 # annotation WROTE (NARROW_UNKNOWN when unannotated or not an integer).
@@ -280,6 +283,27 @@ fn emit_ir_error_kind(s: *EmitterState, msg: *u8, kind: i32)
     eprints_cstr(c"error: ritz1 cannot emit: ")
     eprints_cstr(msg)
     eprint_int(kind as i64)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+# AGAST #1509: a multi-dimensional array use ritz1 does not lower, as
+# `error: <file>:<line>:<col>: <msg>`.  Counts like emit_ir_error, so the
+# driver refuses to write the output.
+fn emit_nd_error(s: *EmitterState, line: i32, col: i32, msg: *u8)
+    emit_str(s, c"  ; ERROR: ")
+    emit_str(s, msg)
+    emit_str(s, c"\n")
+    eprints_cstr(c"error: ")
+    if g_emit_file != null
+        eprints_cstr(g_emit_file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(line as i64)
+    eprints_cstr(c":")
+    eprint_int(col as i64)
+    eprints_cstr(c": ")
+    eprints_cstr(msg)
     eprints_cstr(c"\n")
     s.error_count = s.error_count + 1
 
@@ -677,6 +701,7 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
     loc.is_let = 0
     loc.pointee_array_size = 0
     loc.pointee_array_elem_type = TYPE_VOID
+    loc.array_shape = null
     s.local_count = idx + 1
     # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
     # Store `idx + 1` so the value is non-zero (0 = miss in
@@ -1119,6 +1144,34 @@ pub fn build_symbol_maps(s: *EmitterState)
 # are not covered here; the declaration names `%T` for those.  AGAST #1970:
 # f32 / f64 elements are `float` / `double`, as for a local array (#1966);
 # they were `i64`, so `g[i] = 2.5` stored `store i64 %double`.
+# AGAST #1509: times a multi-dimensional array's TYPE_ARRAY element reached
+# a 1-D element-type helper (field_array_elem_llvm), i.e. an N-D array use
+# ritz1 does not lower.  Reported (and failed) by emit_module.
+var g_nd_elem_leaks: i32 = 0
+
+pub fn nd_elem_leaks() -> i32
+    g_nd_elem_leaks
+
+# AGAST #1509: the LLVM type of `sh` from dimension `from` inward:
+# `[4 x [8 x i8]]` for `[4][8]u8` from 0, `[8 x i8]` from 1, and the bare
+# leaf at from == rank.  The same spelling the alloca / global declares, so
+# every GEP over the array agrees with its layout (ritz0's layout).
+fn emit_array_shape_llvm(s: *EmitterState, sh: *ArrayShape, from: i32)
+    var d: i32 = from
+    while d < sh.rank
+        emit_str(s, c"[")
+        emit_int(s, sh.dims[d] as i64)
+        emit_str(s, c" x ")
+        d = d + 1
+    if sh.leaf_type == TYPE_STRUCT and sh.leaf_name_len > 0
+        emit_llvm_type_struct(s, TYPE_STRUCT, sh.leaf_name, sh.leaf_name_len)
+    else
+        emit_str(s, local_array_elem_llvm(sh.leaf_type))
+    d = from
+    while d < sh.rank
+        emit_str(s, c"]")
+        d = d + 1
+
 fn global_array_elem_llvm(g: *GlobalVarDef) -> *u8
     return local_array_elem_llvm(g.array_elem_type)
 
@@ -1145,6 +1198,14 @@ fn array_elem_llvm(t: i32) -> *u8
 # use it. AGAST #1814: the field ladder lacked u16/i16/u32/f32/f64/bool, so
 # `a: [4]u16` was declared `[4 x i64]` (32 bytes) while sizeof counted 8.
 fn field_array_elem_llvm(t: i32) -> *u8
+    if t == TYPE_ARRAY
+        # AGAST #1509: a multi-dimensional array reached a 1-D element path.
+        # Every lowered N-D access goes through emit_nd_index_ptr and
+        # emit_array_shape_llvm; anything else used to treat the inner
+        # array as one i64 and miscompile silently.  emit_module turns the
+        # count into a hard error.
+        g_nd_elem_leaks = g_nd_elem_leaks + 1
+        return c"i64"
     if t == TYPE_F32
         return c"float"
     if t == TYPE_F64

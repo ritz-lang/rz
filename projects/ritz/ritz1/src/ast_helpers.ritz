@@ -706,7 +706,9 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
         g.array_elem_type = p.last_array_elem_type
         g.array_elem_type_name = p.last_array_elem_type_name
         g.array_elem_type_name_len = p.last_array_elem_type_name_len
+        g.array_shape = p.last_array_shape  # AGAST #1509
     else
+        g.array_shape = null
         g.array_size = 0
         g.array_elem_type = 0
         g.array_elem_type_name = null
@@ -897,6 +899,7 @@ pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i
 # =============================================================================
 
 pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
+    nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
     let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
     param.name = name as *u8
     param.name_len = len
@@ -929,6 +932,7 @@ pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
 
 # `name:& T` (AGAST #1644): a TYPE_MUT_REF param that ritz0 auto-derefs.
 pub fn param_borrow(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
+    nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
     let param: *Param = param_new(p, name, len, ty, line, col)
     param.is_borrow = 1
     # AGAST #2075: for `name:& *T` keep T (the borrowed pointer's own
@@ -973,6 +977,7 @@ pub fn struct_def_new(p: *Parser, name: *u8, len: i32, fields: *StructField, lin
     return s
 
 pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *StructField
+    nd_array_reject(p, ty, line, col, c"a struct field")  # AGAST #1509
     let f: *StructField = parser_alloc(p, sizeof(StructField)) as *StructField
     f.name = name as *u8
     # AGAST #1924: `rows: **i32` -> `*(*(s.rows + i) + k)` loads an i32.
@@ -1143,6 +1148,7 @@ pub fn field_link(first: *StructField, rest: *StructField) -> *StructField
 # =============================================================================
 
 pub fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32, col: i32) -> *ConstEntry
+    nd_array_reject(p, ty, line, col, c"a const")  # AGAST #1509
     # Bumped from 40 → 128 to fit the extra metadata fields appended to
     # ConstEntry for non-integer constants (value_expr, array_size, etc.).
     let c: *ConstEntry = parser_alloc(p, 128) as *ConstEntry
@@ -1421,6 +1427,7 @@ pub fn type_named(p: *Parser, name: *u8, len: i32) -> i32
 # member access fell through to "; ERROR: unhandled EXPR_MEMBER" with a
 # stale `%.0` reference.
 pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
+    nd_array_reject(p, ret, parse_pos_line(p), parse_pos_col(p), c"a return type")  # AGAST #1509
     if ret == TYPE_STRUCT
         p.fn_return_type_name = p.last_type_name
         p.fn_return_type_name_len = p.last_type_name_len
@@ -1522,6 +1529,91 @@ pub fn fresh_fn_sig(p: *Parser) -> *FnDef
         return p.last_fn_sig
     return null
 
+# AGAST #1509: the shape of `[size]<inner>`, where <inner> is the array type
+# whose info p.last_array_* / p.last_array_shape still hold.  A 1-D inner
+# `[M]T` becomes rank 2 `[size][M]T`; a deeper inner gains one leading dim.
+# Returns null (and reports) past MAX_ARRAY_RANK.
+fn array_shape_prepend(p: *Parser, size: i32) -> *ArrayShape
+    let sh: *ArrayShape = parser_alloc(p, sizeof(ArrayShape)) as *ArrayShape
+    let inner: *ArrayShape = p.last_array_shape
+    sh.dims[0] = size
+    if inner == null
+        sh.rank = 2
+        sh.dims[1] = p.last_array_size
+        sh.leaf_type = p.last_array_elem_type
+        sh.leaf_name = p.last_array_elem_type_name
+        sh.leaf_name_len = p.last_array_elem_type_name_len
+        return sh
+    if inner.rank >= MAX_ARRAY_RANK
+        eprints_cstr(c"error: ")
+        eprint_parse_location(p)
+        eprintln_cstr(c"array type has more than 8 dimensions")
+        g_attr_errors = g_attr_errors + 1
+        return null
+    sh.rank = inner.rank + 1
+    var d: i32 = 0
+    while d < inner.rank
+        sh.dims[d + 1] = inner.dims[d]
+        d = d + 1
+    sh.leaf_type = inner.leaf_type
+    sh.leaf_name = inner.leaf_name
+    sh.leaf_name_len = inner.leaf_name_len
+    return sh
+
+# AGAST #1509: 1 when the type just parsed (`ty`, with p's array state) is
+# a multi-dimensional array `[N][M]..T`.
+pub fn is_nd_array_type(p: *Parser, ty: i32) -> i32
+    if ty == TYPE_ARRAY and p.last_array_elem_type == TYPE_ARRAY
+        return 1
+    0
+
+var g_nd_reject_line: i32 = -1
+var g_nd_reject_col: i32 = -1
+
+# AGAST #1509: fail closed where ritz1 cannot lower a multi-dimensional
+# array type.  Only local and global `var` declarations carry an ArrayShape;
+# a struct field, parameter, return type, const or pointee of type
+# `[N][M]T` used to be laid out as `[N x i64]` and miscompiled silently.
+# `what` names the site ("a struct field", ...).  Reported once per source
+# position (the grammar can re-run an action while backtracking); the
+# parse-time error count (g_attr_errors) fails the compile.
+# Returns 1 when it rejected `ty`.
+pub fn nd_array_reject(p: *Parser, ty: i32, line: i32, col: i32, what: *u8) -> i32
+    if is_nd_array_type(p, ty) == 0
+        return 0
+    if line == g_nd_reject_line and col == g_nd_reject_col
+        return 1
+    g_nd_reject_line = line
+    g_nd_reject_col = col
+    g_attr_errors = g_attr_errors + 1
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": a multi-dimensional array type is not supported as ")
+    eprints_cstr(what)
+    eprintln_cstr(c" in ritz1 (only a local or global `var` can be one)")
+    return 1
+
+# The line / col of the token at p.pos (0 / 0 past the end), for sites whose
+# action has no position of its own.
+fn parse_pos_line(p: *Parser) -> i32
+    if p.pos < p.token_count
+        let tok: *Token = p.tokens + p.pos
+        return tok.line
+    0
+
+fn parse_pos_col(p: *Parser) -> i32
+    if p.pos < p.token_count
+        let tok: *Token = p.tokens + p.pos
+        return tok.col
+    0
+
 # Parse array size from digit string and store array info in parser state
 pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i32
     # Parse the size string to an integer
@@ -1529,6 +1621,14 @@ pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i
     for i in 0..size_len
         let digit: i32 = (*(size_str + i)) as i32 - 48  # '0' = 48
         size = size * 10 + digit
+    # AGAST #1509: `[size]<array>` is multi-dimensional.  The inner array's
+    # info is still in p.last_array_* (type_spec is right-recursive, so the
+    # inner `[M]T` action ran just before this one): prepend `size` to its
+    # shape before the 1-D fields below are overwritten with the outer dim.
+    if elem_type == TYPE_ARRAY
+        p.last_array_shape = array_shape_prepend(p, size)
+    else
+        p.last_array_shape = null
     # Store in parser state for field_new to retrieve
     p.last_array_size = size
     p.last_array_elem_type = elem_type
@@ -1579,6 +1679,7 @@ pub fn ptr_array_pointee_elem(p: *Parser, ty: i32) -> i32
 # Handle pointer type *T
 # Stores the pointee type and preserves type name if pointing to struct/generic
 pub fn type_ptr(p: *Parser, inner_type: i32) -> i32
+    nd_array_reject(p, inner_type, parse_pos_line(p), parse_pos_col(p), c"a pointee")  # AGAST #1509
     # Store pointee type for emitter
     p.last_pointee_type = inner_type
     # AGAST #184: track the deepest non-pointer pointee.  For **Foo the
@@ -1636,6 +1737,7 @@ struct AliasEntry
     array_elem_type_name_len: i32
     ref_inner_type: i32
     ptr_depth: i32         # AGAST #1924
+    array_shape: *ArrayShape  # AGAST #1509
 
 const MAX_TYPE_ALIASES: i32 = 1024
 const ALIAS_ENTRY_BYTES: i64 = 128   # >= sizeof(AliasEntry), with headroom
@@ -1699,6 +1801,7 @@ pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
     e.array_elem_type = p.last_array_elem_type
     e.array_elem_type_name = p.last_array_elem_type_name
     e.array_elem_type_name_len = p.last_array_elem_type_name_len
+    e.array_shape = p.last_array_shape
     e.ref_inner_type = p.last_ref_inner_type
     return kind
 
@@ -1719,6 +1822,7 @@ pub fn type_alias_resolve(p: *Parser, name: *u8, len: i32) -> i32
         p.last_array_elem_type = e.array_elem_type
         p.last_array_elem_type_name = e.array_elem_type_name
         p.last_array_elem_type_name_len = e.array_elem_type_name_len
+        p.last_array_shape = e.array_shape
         p.last_ref_inner_type = e.ref_inner_type
     return e.kind
 
@@ -1765,6 +1869,7 @@ struct GenericArg
 # Called from grammar rules first_generic_type_arg / first_generic_type_arg_shr
 # right after the argument's type_spec parses, while last_type_name is fresh.
 pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
+    nd_array_reject(p, ty, parse_pos_line(p), parse_pos_col(p), c"a generic type argument")  # AGAST #1509
     let ga: *GenericArg = parser_alloc(p, 32) as *GenericArg
     ga.ty = ty
     if ty == TYPE_STRUCT
@@ -2031,9 +2136,11 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         s.var_type_name = null
         s.var_type_name_len = 0
     # Copy array info from parser state if this is an array type
+    s.var_array_shape = null
     if ty == TYPE_ARRAY
         s.var_array_size = p.last_array_size
         s.var_array_elem_type = p.last_array_elem_type
+        s.var_array_shape = p.last_array_shape  # AGAST #1509
         # For arrays of structs, store the struct name in var_type_name
         # so the emitter can allocate with correct element size
         if p.last_array_elem_type == TYPE_STRUCT
