@@ -25,9 +25,9 @@ impl Pt
     fn scale(self: @Pt, f: T) -> T
         self.x * f
 
-    # `as T`: a bare `1.0` tail in an f32 fn is AGAST #2074.
+    # A bare `1.0` tail in an f32 fn: fptrunc'd since AGAST #2074.
     fn unit() -> T
-        1.0 as T
+        1.0
 
 """
 
