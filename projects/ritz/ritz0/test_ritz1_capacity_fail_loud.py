@@ -183,9 +183,9 @@ def _many_instantiations(n: int) -> str:
     )
 
 
-# No u64: a u64 struct-literal field is not lowered by ritz1 yet (separate,
-# AGAST #2064), independent of generics.
-_ARG_TYPES = ["i64", "i32", "u8", "i16", "u32", "i8", "u16"]
+# Every integer width, so wide instantiations mix field/arg kinds. u64 joined
+# once ritz1 lowered u64 struct-literal fields (AGAST #2064).
+_ARG_TYPES = ["i64", "i32", "u8", "i16", "u32", "i8", "u16", "u64"]
 
 
 def _wide_generic_struct(n: int) -> str:
