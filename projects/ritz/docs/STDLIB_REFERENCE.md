@@ -38,7 +38,6 @@ Ritzlib is built on three core principles:
    - [option](#option) - Optional values
    - [result](#result) - Error handling
    - [drop](#drop) - Automatic cleanup trait
-   - [eq](#eq) - Equality comparison
    - [hash](#hash) - Hashing utilities
 2. [Memory Management](#memory-management)
    - [memory](#memory) - Allocators (Arena, Heap, malloc/free)
@@ -183,20 +182,6 @@ The compiler automatically inserts drop calls at:
 - Before break/continue in loops
 
 Drop is called in reverse declaration order (LIFO).
-
----
-
-### eq
-
-**Module**: `ritzlib.eq`
-
-Equality comparison functions for primitive types.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `eq_i32` | `fn(a: i32, b: i32) -> i32` | Returns 1 if equal, 0 otherwise |
-| `eq_i64` | `fn(a: i64, b: i64) -> i32` | Returns 1 if equal, 0 otherwise |
-| `eq_u64` | `fn(a: u64, b: u64) -> i32` | Returns 1 if equal, 0 otherwise |
 
 ---
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Golden stdout for hashmap_demo (examples/tier5_async/77_hashmap):
-# ritzlib.hashmap + ritzlib.hash + ritzlib.eq (AGAST #1458).
+# ritzlib.hashmap + ritzlib.hash (AGAST #1458).
 #
 # The hash values are the FNV-1a 64-bit reference values (fnv1a_str("a") =
 # af63dc4c8601ec8c and fnv1a_str("foobar") = 85944171f73967e8 are the
@@ -47,14 +47,6 @@ hash_i64(-42): eeb07d2ce8108904
 hash_u64(1): 89cd31291d2aefa4
 hash_u64(hash_i64(42)): 0ab075faa6eaf897
 fnv1a_i32/i64/u64 chain: 34493c839c113e9b
-== eq ==
-eq_i32(3, 3): 1
-eq_i32(3, -3): 0
-eq_i64(1 << 40, 1 << 40): 1
-eq_i64(-1, 1): 0
-eq_i64(1, -1): 0
-eq_u64(hash a, hash a): 1
-eq_u64(hash a, hash b): 0
 == map ==
 with_cap(100).cap: 128
 new.len: 0

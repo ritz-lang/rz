@@ -44,7 +44,6 @@ Currently (as of January 2026), ritzlib is a flat collection of 35 modules:
 
 **Utilities:**
 - `hashmap.ritz`, `hash.ritz` - Hash tables
-- `eq.ritz` - Equality traits
 - `buf.ritz` - Buffer utilities
 - `elf.ritz` - ELF binary format
 - `drop.ritz` - Drop trait

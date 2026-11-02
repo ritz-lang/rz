@@ -51,7 +51,7 @@ SOURCES = \
 #   explicit ritzlib_os_env rules below, since the ritzlib_% pattern only
 #   reaches top-level ritzlib/*.ritz.
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str fmt string strview hash hashmap eq memory gvec drop option result json span os_env
+RITZLIB_MODULES = sys io str fmt string strview hash hashmap memory gvec drop option result json span os_env
 
 # Build artifacts
 BUILD_DIR = build

@@ -84,7 +84,6 @@ fn main(argc: i32, argv: **u8) -> i32
 | `result.ritz` | Result type |
 | `box.ritz` | Heap-allocated single values |
 | `drop.ritz` | Drop trait for cleanup |
-| `eq.ritz` | Equality trait |
 | `testing.ritz` | Test support utilities |
 | `timer.ritz` | Timer operations |
 | `iovec.ritz` | Scatter-gather I/O vectors |
