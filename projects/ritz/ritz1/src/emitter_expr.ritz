@@ -1484,6 +1484,56 @@ fn emit_array_fill_struct_loop(s: *EmitterState, base_reg: i32, arr_size: i32, s
     emit_str(s, c"\n")
     begin_block(s, l_end)
 
+# AGAST #2062 (moved from emitter_stmt by #2065): `val_reg` = emit_expr(value), stored into an f32 / f64 slot of
+# type `dst_ty`.  An integer-typed value (`var x: f64 = 3`, `*p = n`) is the
+# i64 every integer is carried in: `sitofp` it to the slot's float width, as
+# ritz0 does (ritz0 uses sitofp for u64 too).  Returns val_reg otherwise —
+# float values keep their existing narrowing at the call site.  clang
+# rejected the `store double %<i64>` this used to emit.
+fn int_to_float_slot(s: *EmitterState, val_reg: i32, dst_ty: i32, value: *Expr) -> i32
+    if expr_is_definitely_int(s, value) == 1
+        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
+    val_reg
+
+fn is_int_ty(t: i32) -> i32
+    if t == TYPE_I64 or t == TYPE_I32 or t == TYPE_I16 or t == TYPE_I8 or t == TYPE_U64 or t == TYPE_U32 or t == TYPE_U16 or t == TYPE_U8
+        return 1
+    0
+
+# Is `e` KNOWN to produce an integer register?  get_expr_type cannot answer
+# that: TYPE_I64 is also its fallback for anything it can't type, e.g. a
+# float method on an rvalue receiver (`Pt { .. }.scale(2.0)`, gate failure
+# test_issue_method_autoborrow_rvalue).  So only forms whose type is
+# resolved, not defaulted, count; anything else is left unconverted.  A
+# `match` / `if` is never "definitely int": under a float hint
+# (set_match_float_hint) its integer arms were already converted.
+fn expr_is_definitely_int(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
+        return 1
+    if e.kind == EXPR_IDENT
+        if find_local_idx(s, e.ident_ptr, e.ident_len) >= 0 or find_global(s, e.ident_ptr, e.ident_len) != null
+            return is_int_ty(get_expr_type(s, e))
+        return 0
+    if e.kind == EXPR_CAST
+        return is_int_ty(e.op)
+    if e.kind == EXPR_CALL
+        if call_is_named_syscall_builtin(s, e) == 1 or find_call_fn(s, e) != null
+            return is_int_ty(get_expr_type(s, e))
+        return 0
+    if e.kind == EXPR_MEMBER
+        if member_field_def(s, e) != null
+            return is_int_ty(get_expr_type(s, e))
+        return 0
+    if e.kind == EXPR_UNARY and e.op == OP_NEG
+        return expr_is_definitely_int(s, e.operand)
+    if e.kind == EXPR_BINARY
+        if e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV or e.op == OP_MOD or e.op == OP_BIT_AND or e.op == OP_BIT_OR or e.op == OP_BIT_XOR or e.op == OP_SHL or e.op == OP_SHR
+            if expr_is_definitely_int(s, e.left) == 1 and expr_is_definitely_int(s, e.right) == 1
+                return 1
+    0
+
 # The register to store for one bool / f32 / f64 element of a STRUCT FIELD
 # array (`[N x i1]` / `[N x float]` / `[N x double]`, see
 # field_array_elem_llvm), or one f32 / f64 element of a LOCAL array (#1966):
@@ -1500,6 +1550,11 @@ fn emit_field_elem_narrow(s: *EmitterState, val_reg: i32, elem_ty: i32, value: *
         emit_reg(s, val_reg)
         emit_str(s, c" to i1\n")
         return t1
+    # AGAST #2065: an integer value into a float slot (`R { a: 3 }`,
+    # `r.a = 3`, `p[i] = 3`, `x = 3`) is sitofp'd; it stored the i64.
+    if elem_ty == TYPE_F32 or elem_ty == TYPE_F64
+        if expr_is_definitely_int(s, value) == 1
+            return emit_float_coerce(s, val_reg, TYPE_I64, elem_ty)
     if elem_ty == TYPE_F32 and get_expr_type(s, value) == TYPE_F64
         let tf: i32 = next_reg(s)
         emit_str(s, c"  ")
@@ -1929,18 +1984,12 @@ fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: i32,
         stored = i64_value_to_ptr(s, value, val_reg)
         store_ty = c"ptr"
     else if ft == TYPE_F32
-        # Float lit emits as `double`; narrow to f32 before store.
-        # Cast-from-explicit-as-f32 already emitted float, so we
-        # only fptrunc when the source is f64.
-        if get_expr_type(s, value) == TYPE_F64
-            stored = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, stored)
-            emit_str(s, c" = fptrunc double ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to float\n")
+        # Float lit emits as `double`; an f64 value is fptrunc'd, an
+        # integer one sitofp'd (#2065), by emit_field_elem_narrow.
+        stored = emit_field_elem_narrow(s, val_reg, TYPE_F32, value)
         store_ty = c"float"
     else if ft == TYPE_F64
+        stored = emit_field_elem_narrow(s, val_reg, TYPE_F64, value)
         store_ty = c"double"
     else if ft == TYPE_STRUCT and field.field_type_name_len > 0
         # task-103: struct-by-value field (e.g. `Vec$T` in `Wrap`).

@@ -8,9 +8,10 @@ but expected 'double'`). emit_var_decl's F32 / F64 store arms assumed the
 init was already a float.
 
 `*p = 3` through a `*f64` (emit_assign's deref arm) had the same gap and is
-covered here. Struct-literal float fields (`R { a: 3 }`), `x.f = 3`,
-`p[i] = 3` and a plain `x = 3` lower through emit_field_elem_narrow /
-emit_assign's local arm and are tracked separately in AGAST #2065.
+covered here. AGAST #2065 extends it to the sibling store paths that lower
+through emit_field_elem_narrow / emit_assign's local arm: struct-literal float
+fields (`R { a: 3 }`), `r.a = 3`, `p[i] = 3`, a plain `x = 3`, and a u64
+source (sitofp, as ritz0 does).
 
 Each program is instantiated for f64 and f32 and returns 3 on success.
 ritz0 is the oracle.
@@ -108,7 +109,81 @@ pub fn main() -> i32
     return (a + b + c) as i32
 """
 
+# AGAST #2065: struct-literal float field (`R { a: 3 }`).
+STRUCT_LIT = """\
+struct R
+    a: T
+    b: T
+
+pub fn main() -> i32
+    let n: i32 = 2
+    let r: R = R { a: 1, b: n }
+    return (r.a + r.b) as i32
+"""
+
+# AGAST #2065: field assign (`r.a = 3`), and through a pointer (`q.a = 3`).
+FIELD_ASSIGN = """\
+struct R
+    a: T
+    b: T
+
+pub fn main() -> i32
+    var r: R = R { a: 0.5, b: 0.5 }
+    r.a = 1
+    let q: *R = @r
+    q.b = 2
+    return (r.a + r.b) as i32
+"""
+
+# AGAST #2065: indexed store through a `*T` (`p[1] = 3`) and into a local
+# `[N]T` array.
+INDEX_STORE = """\
+pub fn main() -> i32
+    var arr: [2]T = [0.5, 0.5]
+    let p: *T = @arr[0]
+    p[1] = 2
+    arr[0] = 1
+    return (arr[0] + arr[1]) as i32
+"""
+
+# AGAST #2065: plain local reassign (`x = 3`).
+LOCAL_ASSIGN = """\
+pub fn main() -> i32
+    var x: T = 0.5
+    x = 3
+    return x as i32
+"""
+
+# AGAST #2065: a global float reassigned from an integer.
+GLOBAL_ASSIGN = """\
+var g: T
+
+pub fn main() -> i32
+    g = 3
+    return g as i32
+"""
+
+# AGAST #2065: a u64 source is sitofp'd too (ritz0 does; values here fit).
+U64_SOURCE = """\
+struct R
+    a: T
+
+pub fn main() -> i32
+    let u: u64 = 1
+    var r: R = R { a: u }
+    var x: T = 0.5
+    x = u
+    r.a = r.a + x + (u as T)
+    return r.a as i32
+"""
+
 PROGRAMS = {
+    "struct_lit": STRUCT_LIT,
+    "field_assign": FIELD_ASSIGN,
+    "index_store": INDEX_STORE,
+    "local_assign": LOCAL_ASSIGN,
+    "global_assign": GLOBAL_ASSIGN,
+    "u64_source": U64_SOURCE,
     "rvalue_method": RVALUE_METHOD,
     "literal": LITERAL,
     "expr": EXPR,

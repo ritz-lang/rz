@@ -22,55 +22,8 @@ import let_check           # let_check_stmt / let_mark_decl (AGAST #2028)
 # resolve_member_chain_field moved to emitter_core (AGAST #1660) so the
 # binary-op emitter can type enum-valued member operands too.
 
-# AGAST #2062: `val_reg` = emit_expr(value), stored into an f32 / f64 slot of
-# type `dst_ty`.  An integer-typed value (`var x: f64 = 3`, `*p = n`) is the
-# i64 every integer is carried in: `sitofp` it to the slot's float width, as
-# ritz0 does (ritz0 uses sitofp for u64 too).  Returns val_reg otherwise —
-# float values keep their existing narrowing at the call site.  clang
-# rejected the `store double %<i64>` this used to emit.
-fn int_to_float_slot(s: *EmitterState, val_reg: i32, dst_ty: i32, value: *Expr) -> i32
-    if expr_is_definitely_int(s, value) == 1
-        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
-    val_reg
-
-fn is_int_ty(t: i32) -> i32
-    if t == TYPE_I64 or t == TYPE_I32 or t == TYPE_I16 or t == TYPE_I8 or t == TYPE_U64 or t == TYPE_U32 or t == TYPE_U16 or t == TYPE_U8
-        return 1
-    0
-
-# Is `e` KNOWN to produce an integer register?  get_expr_type cannot answer
-# that: TYPE_I64 is also its fallback for anything it can't type, e.g. a
-# float method on an rvalue receiver (`Pt { .. }.scale(2.0)`, gate failure
-# test_issue_method_autoborrow_rvalue).  So only forms whose type is
-# resolved, not defaulted, count; anything else is left unconverted.  A
-# `match` / `if` is never "definitely int": under a float hint
-# (set_match_float_hint) its integer arms were already converted.
-fn expr_is_definitely_int(s: *EmitterState, e: *Expr) -> i32
-    if e == null
-        return 0
-    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
-        return 1
-    if e.kind == EXPR_IDENT
-        if find_local_idx(s, e.ident_ptr, e.ident_len) >= 0 or find_global(s, e.ident_ptr, e.ident_len) != null
-            return is_int_ty(get_expr_type(s, e))
-        return 0
-    if e.kind == EXPR_CAST
-        return is_int_ty(e.op)
-    if e.kind == EXPR_CALL
-        if call_is_named_syscall_builtin(s, e) == 1 or find_call_fn(s, e) != null
-            return is_int_ty(get_expr_type(s, e))
-        return 0
-    if e.kind == EXPR_MEMBER
-        if member_field_def(s, e) != null
-            return is_int_ty(get_expr_type(s, e))
-        return 0
-    if e.kind == EXPR_UNARY and e.op == OP_NEG
-        return expr_is_definitely_int(s, e.operand)
-    if e.kind == EXPR_BINARY
-        if e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV or e.op == OP_MOD or e.op == OP_BIT_AND or e.op == OP_BIT_OR or e.op == OP_BIT_XOR or e.op == OP_SHL or e.op == OP_SHR
-            if expr_is_definitely_int(s, e.left) == 1 and expr_is_definitely_int(s, e.right) == 1
-                return 1
-    0
+# int_to_float_slot / expr_is_definitely_int moved to emitter_expr (AGAST
+# #2065) so emit_field_elem_narrow can convert integer values too.
 
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # Use the user's explicit type annotation. The parser defaults
@@ -1131,9 +1084,9 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             # AGAST #2022: `*p = v` through a *f32 / *f64 stores `float` /
             # `double` (an f64 value into an f32 slot is fptrunc'd), as
             # `p[i] = v` does (#1973).  It fell to `store i64 %float`.
-            # AGAST #2062: an integer value (`*p = 3`) is converted first.
-            let ival: i32 = int_to_float_slot(s, val, value_type, stmt.assign_value)
-            let fval: i32 = emit_field_elem_narrow(s, ival, value_type, stmt.assign_value)
+            # AGAST #2062: an integer value (`*p = 3`) is sitofp'd by
+            # emit_field_elem_narrow (#2065).
+            let fval: i32 = emit_field_elem_narrow(s, val, value_type, stmt.assign_value)
             emit_str(s, c"  store ")
             emit_str(s, local_array_elem_llvm(value_type))
             emit_str(s, c" ")
@@ -1312,10 +1265,16 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_reg(s, loc)
             emit_str(s, c"\n")
         else
+            # AGAST #2065: an f32 / f64 local narrows / converts its value
+            # (`x = 3` sitofp's, an f64 into an f32 fptrunc's) as every
+            # other float slot does; it stored the raw i64 register.
+            var lval: i32 = val
+            if var_type == TYPE_F32 or var_type == TYPE_F64
+                lval = emit_field_elem_narrow(s, val, var_type, stmt.assign_value)
             emit_str(s, c"  store ")
             emit_llvm_type(s, var_type)
             emit_str(s, c" ")
-            emit_reg(s, val)
+            emit_reg(s, lval)
             emit_str(s, c", ptr ")
             emit_reg(s, loc)
             emit_str(s, c"\n")
@@ -1378,10 +1337,14 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_name(s, glob.name, glob.name_len)
                 emit_str(s, c"\n")
             else
+                # AGAST #2065: f32 / f64 global, as the local arm above.
+                var gval: i32 = val
+                if glob.var_type == TYPE_F32 or glob.var_type == TYPE_F64
+                    gval = emit_field_elem_narrow(s, val, glob.var_type, stmt.assign_value)
                 emit_str(s, c"  store ")
                 emit_llvm_type(s, glob.var_type)
                 emit_str(s, c" ")
-                emit_reg(s, val)
+                emit_reg(s, gval)
                 emit_str(s, c", ptr @")
                 emit_name(s, glob.name, glob.name_len)
                 emit_str(s, c"\n")
