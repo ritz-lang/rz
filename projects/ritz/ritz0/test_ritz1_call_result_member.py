@@ -247,10 +247,9 @@ pub fn main() -> i32
         return 2
     return (big(39).d) as i32
 """,
-    # AGAST #1470's repro shape: a StrView field off a call.
+    # AGAST #1470's repro shape: a StrView field off a call.  No
+    # `import ritzlib.strview`: StrView is builtin (AGAST #2043).
     "call_strview_field": """\
-import ritzlib.strview
-
 struct Box
     value: StrView
 

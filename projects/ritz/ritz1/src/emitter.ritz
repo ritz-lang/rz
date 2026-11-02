@@ -2660,11 +2660,14 @@ fn emit_const_arrays(s: *EmitterState)
 # named a struct `Transition` got ritz1's layout instead of its own.  The
 # copies are gone (AGAST #1440).
 #
-# The one exception is `Span$u8`: a bare `"..."` literal lowers to a
-# `%Span$u8` aggregate (AGAST #98), so the type is needed even by a program
-# that imports nothing.  It is supplied only when the source does not define
-# it, and through the same StructDef path as every other struct.  When the
-# source DOES define it (an imported `Span<T>` instantiated at u8), the
+# The exceptions are `Span$u8` and `StrView`: a bare `"..."` literal lowers
+# to a `%Span$u8` aggregate and has type StrView (AGAST #98), so both are
+# needed even by a program that imports nothing — `struct Box { value:
+# StrView }` then `b.value.len` must resolve `.len` without
+# `import ritzlib.strview` (AGAST #2043; ritz0's `_builtin_strview`).  Each is
+# supplied only when the source does not define it, and through the same
+# StructDef path as every other struct.  When the source DOES define it (an
+# imported `Span<T>` instantiated at u8, or ritzlib.strview's StrView), the
 # source wins — and because the literal lowering hard-codes `{ ptr, i64 }`,
 # a source layout that differs is an error, not a silent shadow.
 
@@ -2709,20 +2712,22 @@ fn is_string_literal_layout(st: *StructDef) -> i32
         return 0
     1
 
-fn ensure_string_literal_struct(s: *EmitterState, m: *Module)
-    let existing: *StructDef = find_module_struct(m, c"Span$u8", 7)
+# Supplies the `{ ptr: *u8, len: i64 }` struct `name` unless the module
+# already defines it; a source definition with another layout is an error.
+fn ensure_view_struct(s: *EmitterState, m: *Module, name: *u8, len: i32, err: *u8)
+    let existing: *StructDef = find_module_struct(m, name, len)
     if existing != null
         if is_string_literal_layout(existing) == 0
-            emit_ir_error(s, c"struct Span$u8 must be { ptr: *u8, len: i64 }: string literals are lowered to that layout")
+            emit_ir_error(s, err)
         return
-    # Span$u8 = { ptr: *u8, len: i64 } — the monomorph of ritzlib's
-    # `struct Span<T> { ptr: *T, len: i64 }` at T = u8.
+    # The monomorph of ritzlib's `struct Span<T> { ptr: *T, len: i64 }` at
+    # T = u8, which is also ritzlib.strview's `struct StrView`.
     let f1: *StructField = string_literal_field(c"ptr", 3, TYPE_PTR)
     f1.array_elem_type = TYPE_U8   # pointee, for `span.ptr + i` stride
     f1.next = string_literal_field(c"len", 3, TYPE_I64)
-    let st: *StructDef = malloc(40) as *StructDef   # sizeof(StructDef)
-    st.name = c"Span$u8"
-    st.name_len = 7
+    let st: *StructDef = malloc(sizeof(StructDef)) as *StructDef
+    st.name = name
+    st.name_len = len
     st.fields = f1
     st.type_params = null
     # Appended, not prepended: nothing it could shadow exists (checked above).
@@ -2734,6 +2739,10 @@ fn ensure_string_literal_struct(s: *EmitterState, m: *Module)
     while last.next != null
         last = last.next
     last.next = st
+
+fn ensure_string_literal_struct(s: *EmitterState, m: *Module)
+    ensure_view_struct(s, m, c"Span$u8", 7, c"struct Span$u8 must be { ptr: *u8, len: i64 }: string literals are lowered to that layout")
+    ensure_view_struct(s, m, c"StrView", 7, c"struct StrView must be { ptr: *u8, len: i64 }: string literals are lowered to that layout")
 
 # =============================================================================
 # Test mode: the `[[test]]` table (LANGUAGE_SPEC §17.1, AGAST #1908)
