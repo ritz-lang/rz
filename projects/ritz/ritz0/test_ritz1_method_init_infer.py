@@ -13,9 +13,9 @@ call".  monomorph never recorded `s` either, so a method reached only through
 instantiated.  Each `*_only_local_*` program uses such a method.
 
 ritz0 is the oracle: each program's expected exit code is checked against
-both compilers.  ritz0 has the same monomorph gap (AGAST #2095), so for the
-programs in RITZ0_ANNOTATE it compiles the program with the local annotated
--- the same program, typed the way ritz1 must now infer it.
+both compilers, un-annotated.  ritz0 had the same monomorph gap (AGAST #2095):
+its `_infer_value_type` knew nothing of method calls or `a[:]`, so it too
+never instantiated a method reached only through such a local.
 
 A generic impl method returning its struct (`let d = w.dup()`, W<i32>) is
 inferred too, but its call is mis-emitted even when annotated (AGAST #2096);
@@ -115,25 +115,52 @@ fn main() -> i32
 """,
         28,
     ),
-}
+    # A chain: `t` is inferred from a method on `s`, itself inferred from
+    # `a[:]`.  `pop` and `last` are reached only through `t`.
+    "slice_chain_only_local_methods": (
+        """\
+import ritzlib.memory
+import ritzlib.gvec
 
+fn main() -> i32
+    var a: Vec<i32> = vec_new<i32>()
+    a.push(3)
+    a.push(4)
+    a.push(9)
+    var s = a[:]
+    var t = s.slice(0, 2)
+    let x: i32 = t.pop()
+    return x * 10 + t.last() + (t.len() as i32)
+""",
+        44,
+    ),
+    # A user impl method returning another generic type; `is_ok` / `is_err`
+    # are reached only through `r`.
+    "impl_method_result_only_local_methods": (
+        """\
+import ritzlib.result
 
-# AGAST #2095: ritz0 never instantiates a method reached only through an
-# un-annotated method-call local.  Until it does, its oracle run spells the
-# local's type out.  Drop an entry once ritz0 compiles the bare program.
-RITZ0_ANNOTATE = {
-    "slice_only_local_methods": ("var s = ", "var s: Vec<i32> = "),
-    "full_slice_only_local_methods": ("var s = ", "var s: Vec<i32> = "),
-    "impl_method_vec_only_local_methods": ("var v = ", "var v: Vec<i32> = "),
+struct Gate
+    n: i32
+
+impl Gate
+    fn check(self: *Gate) -> Result<i32, i32>
+        if self.n > 0
+            return Ok(self.n)
+        return Err(0)
+
+fn main() -> i32
+    var g: Gate = Gate { n: 5 }
+    var r = g.check()
+    return r.is_ok() * 10 + r.is_err()
+""",
+        10,
+    ),
 }
 
 
 def _check(compiler: str, tmp_path, name: str) -> None:
     program, want = PROGRAMS[name]
-    if compiler == "ritz0" and name in RITZ0_ANNOTATE:
-        bare, typed = RITZ0_ANNOTATE[name]
-        assert program.count(bare) == 1, name
-        program = program.replace(bare, typed)
     code = _run_pkg(compiler, tmp_path, name, program)
     assert code == want, f"{compiler} {name}: exit {code}, want {want}"
 

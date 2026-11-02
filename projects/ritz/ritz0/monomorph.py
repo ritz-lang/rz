@@ -255,6 +255,10 @@ class Monomorphizer:
         # All struct definitions by name (for field-type inference).
         self.struct_defs: Dict[str, rast.StructDef] = {}
 
+        # Non-generic impl methods: type name -> method name -> definition
+        # (for return-type inference of `var v = b.items()`, AGAST #2095).
+        self.impl_methods: Dict[str, Dict[str, rast.FnDef]] = {}
+
         # Expected type of the value currently being visited (return type or
         # `let` annotation). Resolves associated calls like `Span.empty()`
         # whose type argument is only implied by context.
@@ -371,6 +375,10 @@ class Monomorphizer:
                 if item.type_name not in self.generic_impls:
                     self.generic_impls[item.type_name] = []
                 self.generic_impls[item.type_name].append(item)
+            elif isinstance(item, rast.ImplBlock):
+                methods = self.impl_methods.setdefault(item.type_name, {})
+                for method in item.methods:
+                    methods.setdefault(method.name, method)
 
     def _find_instantiations(self, module: rast.Module) -> None:
         """Walk the AST to find all generic instantiations."""
@@ -671,6 +679,25 @@ class Monomorphizer:
             if plain is not None and plain.ret_type is not None:
                 return plain.ret_type
 
+        # `a[:]` / `a[i:j]` on a Vec<T> lowers to vec_slice<T>: a Vec<T>.
+        if isinstance(expr, rast.SliceExpr):
+            base_type = self._infer_value_type(expr.expr)
+            while isinstance(base_type, (rast.PtrType, rast.RefType)):
+                base_type = base_type.inner
+            if (isinstance(base_type, rast.NamedType)
+                    and base_type.name == 'Vec' and base_type.args):
+                return base_type
+            return None
+
+        # Any other method call: the return type of the function it resolves
+        # to (AGAST #2095).  Without this `var s = a.slice(0, n)` stays
+        # untyped and a generic method reached only through `s` (`s.pop()`)
+        # is never instantiated.
+        if isinstance(expr, rast.MethodCall):
+            inferred = self._infer_method_call_type(expr)
+            if inferred is not None:
+                return inferred
+
         # `expr.unwrap()` / `expr.expect(..)` / `expr.unwrap_or(..)` on a
         # Result<T, E> or Option<T> yields T. Without this the binding type is
         # unknown and later generic sugar on it (e.g. `v[i]` -> vec_get<T>)
@@ -684,6 +711,47 @@ class Monomorphizer:
                     and recv_type.name in ('Result', 'Option')
                     and recv_type.args):
                 return recv_type.args[0]
+        return None
+
+    def _infer_method_call_type(self, expr: rast.MethodCall) -> Optional[rast.Type]:
+        """Return type of `recv.method(..)`, or None if it can't be resolved.
+
+        Covers UFCS on a built-in generic receiver (`Vec<T>.slice` ->
+        vec_slice<T>, substituted at the receiver's type args) and methods of
+        a user impl block on the receiver's struct (generic or not).
+        """
+        recv_type = self._infer_value_type(expr.expr)
+        while isinstance(recv_type, (rast.PtrType, rast.RefType)):
+            recv_type = recv_type.inner
+        if not isinstance(recv_type, rast.NamedType):
+            return None
+
+        def resolve(ret: Optional[rast.Type], params: List[str]) -> Optional[rast.Type]:
+            if ret is None:
+                return None
+            if isinstance(ret, rast.NamedType) and ret.name == 'Self' and not ret.args:
+                return recv_type
+            if not params:
+                return ret
+            if len(params) != len(recv_type.args):
+                return None
+            return TypeSubstitution(dict(zip(params, recv_type.args))).apply(ret)
+
+        # User impl block on the receiver's type.
+        method = self.impl_methods.get(recv_type.name, {}).get(expr.method)
+        if method is not None:
+            return resolve(method.ret_type, [])
+        for impl in self.generic_impls.get(recv_type.name, []):
+            for m in impl.methods:
+                if m.name == expr.method and not m.type_params:
+                    return resolve(m.ret_type, impl.type_params)
+
+        # UFCS on a built-in generic type: Vec<T>.m() -> vec_m<T>.
+        prefix = self.TYPE_TO_UFCS_PREFIX.get(recv_type.name)
+        if prefix is not None and recv_type.args:
+            fn_def = self.generic_functions.get(f"{prefix}{expr.method}")
+            if fn_def is not None:
+                return resolve(fn_def.ret_type, fn_def.type_params)
         return None
 
     def _register_method_instantiation(self, expr: rast.MethodCall) -> None:
