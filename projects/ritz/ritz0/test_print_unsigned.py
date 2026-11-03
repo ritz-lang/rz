@@ -25,9 +25,13 @@ exit 0, and stdout and stderr are each pinned to literal bytes, so a bug the
 two compilers share cannot pass.
 """
 
+import os
+import subprocess
+
 import pytest
 
 from test_eprint_interpolation import _assert_parity
+from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("ritz1_bin")]
 
@@ -55,8 +59,7 @@ pub fn main() -> i32
     let u32h: u32 = 3000000000
     let u32m: u32 = 4294967295
     let u64z: u64 = 0
-    # 2^63 + 1: ritz1 hangs on the literal 2^63 itself (AGAST #2129).
-    let u64h: u64 = 9223372036854775809
+    let u64h: u64 = 9223372036854775808
     let u64m: u64 = 18446744073709551615
     PRINT("u8 {u8z} {u8h} {u8m}\\n")
     PRINT("u16 {u16z} {u16h} {u16m}\\n")
@@ -92,7 +95,7 @@ EXPECTED = (
     b"u8 0 200 255\n"
     b"u16 0 40000 65535\n"
     b"u32 0 3000000000 4294967295\n"
-    b"u64 0 9223372036854775809 18446744073709551615\n"
+    b"u64 0 9223372036854775808 18446744073709551615\n"
     b"i8 -128 127\n"
     b"i16 -32768 32767\n"
     b"i32 -2147483648 2147483647\n"
@@ -131,3 +134,41 @@ def test_ticket_reproduction(tmp_path):
         b"200 65000 4000000000 18446744073709551615\n",
         b"",
     )
+
+
+# ---------------------------------------------------------------------------
+# AGAST #2129: the i64::MIN bit pattern as a literal.
+#
+# ritz1's `emit_int` wrote a negative as '-' then recursed on `0 - n`, which
+# for i64::MIN is i64::MIN again: `let a: u64 = 9223372036854775808` (or the
+# hex 0x8000000000000000, or `-9223372036854775808`) never finished
+# compiling. Each form is compiled by ritz1 under a short timeout first, so a
+# regression fails in seconds instead of the parity helper's 300 s.
+# ---------------------------------------------------------------------------
+
+MIN_BITS = {
+    "u64_decimal": ("let v: u64 = 9223372036854775808", b"9223372036854775808\n"),
+    "u64_hex": ("let v: u64 = 0x8000000000000000", b"9223372036854775808\n"),
+    "i64_negated": ("let v: i64 = -9223372036854775808", b"-9223372036854775808\n"),
+}
+
+
+@pytest.mark.parametrize("form", sorted(MIN_BITS))
+def test_i64_min_bit_pattern_literal(tmp_path, form):
+    decl, expected = MIN_BITS[form]
+    program = f'pub fn main() -> i32\n    {decl}\n    print("{{v}}\\n")\n    return 0\n'
+    src = tmp_path / "hang_probe.ritz"
+    src.write_text(program)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    try:
+        proc = subprocess.run(
+            [str(RITZ1_BIN), str(src), "-o", str(tmp_path / "hang_probe.ll")],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"ritz1 hung compiling `{decl}` (AGAST #2129)")
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    _assert_parity(tmp_path, f"min_bits_{form}", program, expected, b"")
