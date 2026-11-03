@@ -53,10 +53,7 @@ fn val(o: Opt) -> i32
         Vacant => 100
 """
 
-# `Result<i64, ArgError>`, read back through raw bytes: binding a user-enum
-# payload out of `Err(e)` / `Some(x)` is a separate ritz1 bug
-# (#2100), so the Err payload is checked in memory.  ritz0 and
-# ritz1 share the layout: Result tag @0, ArgError @8 (tag @8, i64 @16).
+# `Result<i64, ArgError>`; the Err payload is bound and matched (#2100).
 RESULT_ARGERROR = """\
 import ritzlib.result
 
@@ -64,15 +61,15 @@ enum ArgError
     Missing(i64)
     Bad
 
-fn err_tag(r: *Result<i64, ArgError>) -> i32
-    let base: *u8 = r as *u8
-    if *base != 1
-        return 0 - 1
-    return *(base + 8) as i32
+fn code(e: ArgError) -> i64
+    match e
+        Missing(n) => n
+        Bad => 1000
 
-fn err_payload(r: *Result<i64, ArgError>) -> i64
-    let p: *i64 = ((r as *u8) + 16) as *i64
-    return *p
+fn err_code(r: Result<i64, ArgError>) -> i64
+    match r
+        Ok(n) => 0 - 1
+        Err(e) => code(e)
 """
 
 RUNNABLE = {
@@ -134,13 +131,11 @@ fn f(x: i64) -> Result<i64, ArgError>
     return Ok(x)
 
 pub fn main() -> i32
-    let m: Result<i64, ArgError> = f(0)
-    let b: Result<i64, ArgError> = f(0 - 1)
-    if err_tag(@m) != 0 or err_tag(@b) != 1
+    if err_code(f(0 - 1)) != 1000
         return 1
     var r: i64 = 3
     match f(2)
-        Ok(n) => r = err_payload(@m) + n
+        Ok(n) => r = err_code(f(0)) + n
         Err(e) => r = 3
     return r as i32
 """,
@@ -153,10 +148,7 @@ fn f(x: i64) -> Result<i64, ArgError>
     return Ok(x)
 
 pub fn main() -> i32
-    let m: Result<i64, ArgError> = f(0)
-    if err_tag(@m) != 0
-        return 1
-    return err_payload(@m) as i32
+    return err_code(f(0)) as i32
 """,
     # A payload wider than i32, with its high bits significant.
     "i64_payload": """\
@@ -204,13 +196,14 @@ pub fn main() -> i32
     + """
 import ritzlib.option
 
+fn inner(o: Option<Opt>) -> i32
+    match o
+        Some(x) => val(x)
+        None => 0
+
 pub fn main() -> i32
     let o: Option<Opt> = Some(Opt.Holds(40))
-    # Option<Opt> is { i8, [8 x i8] } in both: Opt's tag @1, its i32 @5.
-    let base: *u8 = @o as *u8
-    if *base != 0 or *(base + 1) != 1
-        return 1
-    return (*(base + 5) as i32) + 2
+    return inner(o) + 2
 """,
     # ritz0: a variant wins over an impl method of the same name.
     "variant_beats_impl_method": OPT

@@ -1416,6 +1416,22 @@ fn is_tagged_enum_type(name: *u8, name_len: i32) -> i32
 # `$`-bounded prefix of the suffix naming a concrete struct.  (Not the first
 # component alone: `Vec` there is the generic template.)
 fn tagged_enum_payload_struct(s: *EmitterState, name: *u8, name_len: i32, out_len: *i32) -> *u8
+    return tagged_enum_payload_named(s, name, name_len, out_len, 0)
+
+# AGAST #2100: 1 if `name` is a concrete (non-generic) struct or, when
+# allow_enum is 1, a non-generic user enum: a type a tagged-enum payload is
+# stored as by value (#1466 builds a user-enum payload as its aggregate).
+fn is_concrete_payload_type(s: *EmitterState, name: *u8, len: i32, allow_enum: i32) -> i32
+    let st: *StructDef = find_struct(s, name, len)
+    if st != null
+        return st.type_params == null
+    if allow_enum == 1 and user_enum_index(name, len) >= 0
+        return 1
+    0
+
+# tagged_enum_payload_struct; with allow_enum 1 the carried type may also be
+# a non-generic user enum (AGAST #2100: `Some(x)` over `Option<Opt>`).
+fn tagged_enum_payload_named(s: *EmitterState, name: *u8, name_len: i32, out_len: *i32, allow_enum: i32) -> *u8
     *out_len = 0
     if name == null
         return null
@@ -1427,7 +1443,9 @@ fn tagged_enum_payload_struct(s: *EmitterState, name: *u8, name_len: i32, out_le
     if sfx_len <= 0
         return null
     if dollar == 6 and *name == 79   # "Option": the whole suffix
-        if find_struct(s, sfx, sfx_len) == null
+        if allow_enum == 0 and find_struct(s, sfx, sfx_len) == null
+            return null
+        if allow_enum == 1 and is_concrete_payload_type(s, sfx, sfx_len, 1) == 0
             return null
         *out_len = sfx_len
         return sfx
@@ -1436,8 +1454,7 @@ fn tagged_enum_payload_struct(s: *EmitterState, name: *u8, name_len: i32, out_le
         end = end + 1
         while end < sfx_len and *(sfx + end) != 36
             end = end + 1
-        let st: *StructDef = find_struct(s, sfx, end)
-        if st != null and st.type_params == null
+        if is_concrete_payload_type(s, sfx, end, allow_enum) == 1
             *out_len = end
             return sfx
     return null
@@ -1450,6 +1467,11 @@ fn tagged_enum_payload_struct(s: *EmitterState, name: *u8, name_len: i32, out_le
 # `Result$i32$Box$i64` -> `Box$i64`.  Returns null (out_len 0) when E is
 # not a struct, or for non-Result names; callers then keep the i64 binding.
 fn tagged_enum_err_payload_struct(s: *EmitterState, name: *u8, name_len: i32, out_len: *i32) -> *u8
+    return tagged_enum_err_payload_named(s, name, name_len, out_len, 0)
+
+# tagged_enum_err_payload_struct; with allow_enum 1, T and E may also be
+# non-generic user enums (AGAST #2100: `Err(e)` over `Result<i64, ArgError>`).
+fn tagged_enum_err_payload_named(s: *EmitterState, name: *u8, name_len: i32, out_len: *i32, allow_enum: i32) -> *u8
     *out_len = 0
     if name == null or name_len <= 7
         return null
@@ -1459,14 +1481,13 @@ fn tagged_enum_err_payload_struct(s: *EmitterState, name: *u8, name_len: i32, ou
     let sfx: *u8 = name + 7
     let sfx_len: i32 = name_len - 7
     var ok_len: i32 = 0
-    let ok_st: *u8 = tagged_enum_payload_struct(s, name, name_len, @ok_len)
+    let ok_st: *u8 = tagged_enum_payload_named(s, name, name_len, @ok_len, allow_enum)
     if ok_st != null and ok_len > 0
         let rest_len: i32 = sfx_len - ok_len - 1
         if rest_len <= 0
             return null
         let rest: *u8 = sfx + ok_len + 1
-        let rst: *StructDef = find_struct(s, rest, rest_len)
-        if rst == null or rst.type_params != null
+        if is_concrete_payload_type(s, rest, rest_len, allow_enum) == 0
             return null
         *out_len = rest_len
         return rest
@@ -1476,8 +1497,7 @@ fn tagged_enum_err_payload_struct(s: *EmitterState, name: *u8, name_len: i32, ou
         if *(sfx + start - 1) == 36   # '$'
             let cand: *u8 = sfx + start
             let cand_len: i32 = sfx_len - start
-            let st: *StructDef = find_struct(s, cand, cand_len)
-            if st != null and st.type_params == null
+            if is_concrete_payload_type(s, cand, cand_len, allow_enum) == 1
                 *out_len = cand_len
                 return cand
         start = start - 1
