@@ -115,59 +115,69 @@ pub struct Elf64Phdr
 pub struct ElfLoadResult
     entry_point: u64      # Entry point address
     load_base: u64        # Base address where ELF was loaded
-    error: i32            # 0 = success, <0 = error code
+    error: ElfStatus      # ElfStatus.Ok, or why the load failed
 
 # ============================================================================
-# ELF Error Codes
+# ELF Load Status
 # ============================================================================
+#
+# Why a load failed (or Ok). Not an errno, and not an integer: a spawn that
+# fails maps it to the errno user space sees (main.ritz: elf_status_errno),
+# so a loader code can't reach rax as -EPERM..-ENOEXEC by accident (AGAST
+# #2123: ELF_ERR_* were the i32s -1..-8).
 
-pub const ELF_OK: i32 = 0
-pub const ELF_ERR_INVALID_MAGIC: i32 = -1
-pub const ELF_ERR_NOT_64BIT: i32 = -2
-pub const ELF_ERR_NOT_LITTLE_ENDIAN: i32 = -3
-pub const ELF_ERR_NOT_EXECUTABLE: i32 = -4
-pub const ELF_ERR_WRONG_MACHINE: i32 = -5
-pub const ELF_ERR_NO_SEGMENTS: i32 = -6
-pub const ELF_ERR_ALLOC_FAILED: i32 = -7
-pub const ELF_ERR_MAP_FAILED: i32 = -8
+pub enum ElfStatus
+    Ok
+    InvalidMagic        # e_ident does not start 0x7F 'E' 'L' 'F'
+    NotElf64            # not ELFCLASS64
+    NotLittleEndian     # not ELFDATA2LSB
+    NotExecutable       # neither ET_EXEC nor ET_DYN
+    WrongMachine        # not EM_X86_64
+    NoSegments          # no program headers
+    AllocFailed         # out of physical pages
+    MapFailed           # vmm_map_page failed
+
+# Numeric code for serial logs (Ok = 0).
+pub fn elf_status_code(s: ElfStatus) -> u64
+    s as u64
 
 # ============================================================================
 # ELF Functions
 # ============================================================================
 
 # Validate ELF header
-pub fn elf_validate_header(ehdr: *Elf64Ehdr) -> i32
+pub fn elf_validate_header(ehdr: *Elf64Ehdr) -> ElfStatus
     # Check magic number
     if (*ehdr).e_ident[EI_MAG0] != ELF_MAGIC_0
-        return ELF_ERR_INVALID_MAGIC
+        return ElfStatus.InvalidMagic
     if (*ehdr).e_ident[EI_MAG1] != ELF_MAGIC_1
-        return ELF_ERR_INVALID_MAGIC
+        return ElfStatus.InvalidMagic
     if (*ehdr).e_ident[EI_MAG2] != ELF_MAGIC_2
-        return ELF_ERR_INVALID_MAGIC
+        return ElfStatus.InvalidMagic
     if (*ehdr).e_ident[EI_MAG3] != ELF_MAGIC_3
-        return ELF_ERR_INVALID_MAGIC
+        return ElfStatus.InvalidMagic
 
     # Check 64-bit class
     if (*ehdr).e_ident[EI_CLASS] != ELFCLASS64
-        return ELF_ERR_NOT_64BIT
+        return ElfStatus.NotElf64
 
     # Check little-endian encoding
     if (*ehdr).e_ident[EI_DATA] != ELFDATA2LSB
-        return ELF_ERR_NOT_LITTLE_ENDIAN
+        return ElfStatus.NotLittleEndian
 
     # Check executable type (accept both ET_EXEC and ET_DYN for PIE)
     if (*ehdr).e_type != ET_EXEC and (*ehdr).e_type != ET_DYN
-        return ELF_ERR_NOT_EXECUTABLE
+        return ElfStatus.NotExecutable
 
     # Check x86-64 architecture
     if (*ehdr).e_machine != EM_X86_64
-        return ELF_ERR_WRONG_MACHINE
+        return ElfStatus.WrongMachine
 
     # Check program headers exist
     if (*ehdr).e_phnum == 0
-        return ELF_ERR_NO_SEGMENTS
+        return ElfStatus.NoSegments
 
-    return ELF_OK
+    return ElfStatus.Ok
 
 # Convert ELF flags to page table flags
 fn elf_flags_to_pte(p_flags: u32) -> u64
@@ -195,14 +205,14 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
     var result: ElfLoadResult
     result.entry_point = 0
     result.load_base = load_base
-    result.error = ELF_OK
+    result.error = ElfStatus.Ok
 
     # Parse ELF header
     let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
 
     # Validate header
-    let validate_result: i32 = elf_validate_header(ehdr)
-    if validate_result != ELF_OK
+    let validate_result: ElfStatus = elf_validate_header(ehdr)
+    if validate_result != ElfStatus.Ok
         result.error = validate_result
         return result
 
@@ -279,7 +289,7 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
                     page_phys = pmm_alloc_page()
                     if page_phys == 0
                         prints("[elf] Failed to allocate page!\n")
-                        result.error = ELF_ERR_ALLOC_FAILED
+                        result.error = ElfStatus.AllocFailed
                         return result
 
                     # Zero the new page (through physical/identity-mapped address)
@@ -325,7 +335,7 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
                         serial_print_hex(page_vaddr)
                         prints("!\n")
                         pmm_free_page(page_phys)
-                        result.error = ELF_ERR_MAP_FAILED
+                        result.error = ElfStatus.MapFailed
                         return result
                 else if need_upgrade
                     # Page was already mapped but we need to upgrade permissions
@@ -335,7 +345,7 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
                         prints("[elf] Failed to upgrade page permissions at 0x")
                         serial_print_hex(page_vaddr)
                         prints("!\n")
-                        result.error = ELF_ERR_MAP_FAILED
+                        result.error = ElfStatus.MapFailed
                         return result
 
                 page_offset = page_offset + PAGE_SIZE
@@ -350,16 +360,16 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
     return result
 
 # Load an ELF and execute it in userspace
-pub fn elf_exec(elf_data: *u8, elf_size: u64) -> i32
+pub fn elf_exec(elf_data: *u8, elf_size: u64) -> ElfStatus
     # Default load base for PIE executables
     # Using a user-space address that's easy to debug
     let default_load_base: u64 = 0x400000
 
     # Load the ELF
     let load_result: ElfLoadResult = elf_load(elf_data, elf_size, default_load_base)
-    if load_result.error != ELF_OK
+    if load_result.error != ElfStatus.Ok
         prints("[elf] Load failed with error ")
-        serial_print_dec((0 - load_result.error) as u64)
+        serial_print_dec(elf_status_code(load_result.error))
         prints("\n")
         return load_result.error
 
@@ -367,7 +377,7 @@ pub fn elf_exec(elf_data: *u8, elf_size: u64) -> i32
     let stack_top: u64 = alloc_user_stack()
     if stack_top == 0
         prints("[elf] Failed to allocate user stack!\n")
-        return ELF_ERR_ALLOC_FAILED
+        return ElfStatus.AllocFailed
 
     # Flush TLB
     vmm_flush_tlb_all()
@@ -376,7 +386,7 @@ pub fn elf_exec(elf_data: *u8, elf_size: u64) -> i32
     jump_to_userspace(load_result.entry_point, stack_top)
 
     # Should not return
-    return 0
+    return ElfStatus.Ok
 
 # Test ELF loader with validation
 pub fn test_elf_loader() -> i32
@@ -398,20 +408,20 @@ pub fn test_elf_loader() -> i32
     test_ehdr.e_machine = EM_X86_64
     test_ehdr.e_phnum = 1
 
-    let validate_result: i32 = elf_validate_header(@test_ehdr)
+    let validate_result: ElfStatus = elf_validate_header(@test_ehdr)
     prints("  Validation test: ")
-    if validate_result == ELF_OK
+    if validate_result == ElfStatus.Ok
         prints("PASSED\n")
     else
         prints("FAILED (error=")
-        serial_print_dec((0 - validate_result) as u64)
+        serial_print_dec(elf_status_code(validate_result))
         prints(")\n")
 
     # Test invalid magic
     test_ehdr.e_ident[0] = 0x00
-    let invalid_result: i32 = elf_validate_header(@test_ehdr)
+    let invalid_result: ElfStatus = elf_validate_header(@test_ehdr)
     prints("  Invalid magic test: ")
-    if invalid_result == ELF_ERR_INVALID_MAGIC
+    if invalid_result == ElfStatus.InvalidMagic
         prints("PASSED (correctly rejected)\n")
     else
         prints("FAILED\n")

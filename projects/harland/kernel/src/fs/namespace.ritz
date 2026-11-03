@@ -13,20 +13,14 @@ import serial { StrView, prints, println, serial_print_hex }
 import fs.backend { BACKEND_NONE, BACKEND_GOLIATH, BACKEND_MEMORY, BACKEND_DEVICE, VIS_PUBLIC, VIS_VISIBLE, VIS_HIDDEN, VIS_KERNEL_ONLY, NODE_FILE, NODE_DIRECTORY, NODE_DEVICE, NODE_PIPE, NODE_SOCKET, NODE_SYMLINK, NODE_MOUNT, CAP_READ, CAP_WRITE, CAP_EXECUTE, CAP_DELETE, CAP_CREATE, CAP_ADMIN, BackendHandle, MemoryFile, caps_check, backend_name, visibility_name, node_type_name }
 import fs.kblob { KBlobStore, KBlobId, kblob_store_get, kblob_store_get_size, kblob_store_put, kblob_id_zero, kblob_id_eq, kblob_id_is_zero, kblob_id_copy }
 import fs.kpath { path_is_absolute, path_is_root, path_parent, path_basename, path_validate, PathIter, path_iter_new, path_iter_next, strview_empty, NAME_MAX, strview_from_ptr }
+import syscall.errno { Errno }
 
 # Maximum name length
 const MAX_NAME: i32 = 255
 
 # Error codes
 pub const NS_OK: i32 = 0
-pub const NS_NOT_FOUND: i32 = -2
-pub const NS_PERMISSION_DENIED: i32 = -13
-pub const NS_ALREADY_EXISTS: i32 = -17
-pub const NS_NOT_A_DIRECTORY: i32 = -20
-pub const NS_NOT_A_FILE: i32 = -21
-pub const NS_INVALID_PATH: i32 = -22
-pub const NS_OUT_OF_MEMORY: i32 = -12
-pub const NS_NOT_EMPTY: i32 = -39
+# Failures are `Errno` values (syscall/errno.ritz), returned `as i32`.
 
 # Namespace node - an entry in the in-memory tree
 pub struct NsNode
@@ -251,15 +245,15 @@ pub fn ns_can_access(node: *NsNode, caller_caps: u64, needed_caps: u64) -> bool
 # Create a directory
 pub fn namespace_mkdir(ns: *Namespace, path: @StrView, visibility: u8, required_caps: u64) -> i32
     if not path_validate(path)
-        return NS_INVALID_PATH
+        return Errno.Inval as i32
 
     if path_is_root(path)
-        return NS_ALREADY_EXISTS
+        return Errno.Exist as i32
 
     # Check if already exists
     let existing: *NsNode = namespace_resolve_internal(ns, path)
     if existing != 0 as *NsNode
-        return NS_ALREADY_EXISTS
+        return Errno.Exist as i32
 
     # Get parent
     let parent_path: StrView = path_parent(path)
@@ -271,15 +265,15 @@ pub fn namespace_mkdir(ns: *Namespace, path: @StrView, visibility: u8, required_
     else
         parent = namespace_resolve_internal(ns, @parent_path)
         if parent == 0 as *NsNode
-            return NS_NOT_FOUND
+            return Errno.NoEnt as i32
 
     if (*parent).node_type != NODE_DIRECTORY
-        return NS_NOT_A_DIRECTORY
+        return Errno.NotDir as i32
 
     # Create new directory node
     let node: *NsNode = ns_node_alloc()
     if node == 0 as *NsNode
-        return NS_OUT_OF_MEMORY
+        return Errno.NoMem as i32
 
     ns_node_set_name(node, base_name)
     (*node).node_type = NODE_DIRECTORY
@@ -303,10 +297,10 @@ pub fn namespace_mkdir(ns: *Namespace, path: @StrView, visibility: u8, required_
 # Create/write a file (auto-selects backend based on persistence flag)
 pub fn namespace_write_file(ns: *Namespace, path: @StrView, data: *u8, size: u64, persistent: bool) -> i32
     if not path_validate(path)
-        return NS_INVALID_PATH
+        return Errno.Inval as i32
 
     if path_is_root(path)
-        return NS_NOT_A_FILE
+        return Errno.IsDir as i32
 
     # Get parent
     let parent_path: StrView = path_parent(path)
@@ -318,10 +312,10 @@ pub fn namespace_write_file(ns: *Namespace, path: @StrView, data: *u8, size: u64
     else
         parent = namespace_resolve_internal(ns, @parent_path)
         if parent == 0 as *NsNode
-            return NS_NOT_FOUND
+            return Errno.NoEnt as i32
 
     if (*parent).node_type != NODE_DIRECTORY
-        return NS_NOT_A_DIRECTORY
+        return Errno.NotDir as i32
 
     # Check if file already exists
     var node: *NsNode = ns_find_child(parent, @base_name)
@@ -330,7 +324,7 @@ pub fn namespace_write_file(ns: *Namespace, path: @StrView, data: *u8, size: u64
         # Create new node
         node = ns_node_alloc()
         if node == 0 as *NsNode
-            return NS_OUT_OF_MEMORY
+            return Errno.NoMem as i32
 
         ns_node_set_name(node, base_name)
         (*node).node_type = NODE_FILE
@@ -347,7 +341,7 @@ pub fn namespace_write_file(ns: *Namespace, path: @StrView, data: *u8, size: u64
         # Use Goliath backend
         let blob_id: KBlobId = kblob_store_put((*ns).goliath_store, data, size)
         if kblob_id_is_zero(@blob_id)
-            return NS_OUT_OF_MEMORY
+            return Errno.NoMem as i32
 
         (*node).backend = BACKEND_GOLIATH
         # Store first 8 bytes of hash in handle, next 8 in handle_high
@@ -364,11 +358,11 @@ pub fn namespace_write_file(ns: *Namespace, path: @StrView, data: *u8, size: u64
         # Use memory backend
         let mf: *MemoryFile = kalloc(64) as *MemoryFile  # sizeof(MemoryFile)
         if mf == 0 as *MemoryFile
-            return NS_OUT_OF_MEMORY
+            return Errno.NoMem as i32
 
         let buf: *u8 = kalloc(size)
         if buf == 0 as *u8
-            return NS_OUT_OF_MEMORY
+            return Errno.NoMem as i32
 
         # Copy data
         var i: u64 = 0
@@ -443,7 +437,7 @@ pub fn namespace_file_size(ns: *Namespace, path: @StrView) -> u64
 # Create a pipe
 pub fn namespace_create_pipe(ns: *Namespace, path: @StrView, buffer_size: u64, owner_pid: u32) -> i32
     if not path_validate(path)
-        return NS_INVALID_PATH
+        return Errno.Inval as i32
 
     # Get parent
     let parent_path: StrView = path_parent(path)
@@ -455,12 +449,12 @@ pub fn namespace_create_pipe(ns: *Namespace, path: @StrView, buffer_size: u64, o
     else
         parent = namespace_resolve_internal(ns, @parent_path)
         if parent == 0 as *NsNode
-            return NS_NOT_FOUND
+            return Errno.NoEnt as i32
 
     # Create pipe node
     let node: *NsNode = ns_node_alloc()
     if node == 0 as *NsNode
-        return NS_OUT_OF_MEMORY
+        return Errno.NoMem as i32
 
     ns_node_set_name(node, base_name)
     (*node).node_type = NODE_PIPE
@@ -472,11 +466,11 @@ pub fn namespace_create_pipe(ns: *Namespace, path: @StrView, buffer_size: u64, o
     # Allocate memory file for pipe buffer
     let mf: *MemoryFile = kalloc(64) as *MemoryFile
     if mf == 0 as *MemoryFile
-        return NS_OUT_OF_MEMORY
+        return Errno.NoMem as i32
 
     let buf: *u8 = kalloc(buffer_size)
     if buf == 0 as *u8
-        return NS_OUT_OF_MEMORY
+        return Errno.NoMem as i32
 
     (*mf).data = buf
     (*mf).capacity = buffer_size
@@ -504,7 +498,7 @@ pub fn namespace_create_pipe(ns: *Namespace, path: @StrView, buffer_size: u64, o
 # Register a device node
 pub fn namespace_register_device(ns: *Namespace, path: @StrView, device_id: u64, visibility: u8, required_caps: u64) -> i32
     if not path_validate(path)
-        return NS_INVALID_PATH
+        return Errno.Inval as i32
 
     # Get parent
     let parent_path: StrView = path_parent(path)
@@ -516,12 +510,12 @@ pub fn namespace_register_device(ns: *Namespace, path: @StrView, device_id: u64,
     else
         parent = namespace_resolve_internal(ns, @parent_path)
         if parent == 0 as *NsNode
-            return NS_NOT_FOUND
+            return Errno.NoEnt as i32
 
     # Create device node
     let node: *NsNode = ns_node_alloc()
     if node == 0 as *NsNode
-        return NS_OUT_OF_MEMORY
+        return Errno.NoMem as i32
 
     ns_node_set_name(node, base_name)
     (*node).node_type = NODE_DEVICE

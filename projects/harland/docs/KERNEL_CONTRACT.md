@@ -359,30 +359,41 @@ pub const MSG_CAPS_FOLLOW: u32 = 1 << 2  # Capabilities attached
 
 ## Error Codes
 
-Standard POSIX-compatible error codes:
+A failing syscall returns a negative errno in rax, numbered as on Linux. The
+kernel's one source for them is `pub enum Errno: i64` in
+`kernel/src/syscall/errno.ritz` (each discriminant is the negated number);
+this table lists exactly its variants (checked by
+`projects/ritz/ritz0/test_harland_errno.py`).
 
-| Code | Name | Description |
-|------|------|-------------|
-| -1 | EPERM | Permission denied |
-| -2 | ENOENT | No such file or directory |
-| -3 | ESRCH | No such process |
-| -4 | EINTR | Interrupted syscall |
-| -9 | EBADF | Bad file descriptor |
-| -11 | EAGAIN | Try again |
-| -12 | ENOMEM | Out of memory |
-| -13 | EACCES | Access denied |
-| -14 | EFAULT | Bad address |
-| -17 | EEXIST | Already exists |
-| -19 | ENODEV | No such device |
-| -20 | ENOTDIR | Not a directory |
-| -21 | EISDIR | Is a directory |
-| -22 | EINVAL | Invalid argument |
-| -28 | ENOSPC | No space left |
-| -36 | ENAMETOOLONG | Name too long |
-| -38 | ENOSYS | Syscall not implemented |
-| -40 | ELOOP | Too many symlinks |
-| -90 | EMSGSIZE | Message too long |
-| -110 | ETIMEDOUT | Timed out |
+| Code | Name | `Errno` | Description |
+|------|------|---------|-------------|
+| -1 | EPERM | Perm | Operation not permitted |
+| -2 | ENOENT | NoEnt | No such file or directory |
+| -3 | ESRCH | Srch | No such process |
+| -5 | EIO | Io | I/O error |
+| -7 | E2BIG | TooBig | Argument list too long |
+| -8 | ENOEXEC | NoExec | Not a loadable executable |
+| -9 | EBADF | BadF | Bad file descriptor or handle |
+| -10 | ECHILD | Child | No child to wait for |
+| -11 | EAGAIN | Again | Try again (nothing pending) |
+| -12 | ENOMEM | NoMem | Out of memory |
+| -13 | EACCES | Acces | Access denied |
+| -14 | EFAULT | Fault | Bad address |
+| -17 | EEXIST | Exist | Already exists |
+| -19 | ENODEV | NoDev | No such device |
+| -20 | ENOTDIR | NotDir | Not a directory |
+| -21 | EISDIR | IsDir | Is a directory |
+| -22 | EINVAL | Inval | Invalid argument |
+| -23 | ENFILE | NFile | Too many open files |
+| -28 | ENOSPC | NoSpc | No space left |
+| -32 | EPIPE | Pipe | Broken pipe (peer closed) |
+| -34 | ERANGE | Range | Buffer too small |
+| -36 | ENAMETOOLONG | NameTooLong | Name too long |
+| -38 | ENOSYS | NoSys | Syscall not implemented |
+| -39 | ENOTEMPTY | NotEmpty | Directory not empty |
+
+The ELF loader's failures are not errnos: `loader/elf.ritz` returns an
+`ElfStatus`, which a failed spawn reports as ENOMEM or ENOEXEC.
 
 ---
 

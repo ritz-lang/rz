@@ -4,7 +4,8 @@
 # Integrates with knamespace and VFS file descriptors.
 
 import serial { StrView, prints, println, serial_print_dec }
-import fs.vfs { FileDesc, fd_table_init, fd_alloc, fd_free, fd_get, MAX_FDS, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND, E_OK, E_NOENT, E_BADF, E_INVAL }
+import fs.vfs { FileDesc, fd_table_init, fd_alloc, fd_free, fd_get, MAX_FDS, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND }
+import syscall.errno { Errno }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_resolve, knamespace_read, knamespace_write, knamespace_exists, knamespace_mkdir }
 import fs.kblob { KBlobStore, KBlobId, kblob_id_is_zero, kblob_id_copy, kblob_store_get, kblob_store_get_size, kblob_get_store }
 import fs.kpath { strview_from_ptr }
@@ -62,7 +63,7 @@ pub fn fs_syscall_init() -> i32
 pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        return E_INVAL as i64
+        return Errno.Inval as i64
 
     let path: StrView = strview_from_ptr(path_ptr, path_len as i64)
 
@@ -81,9 +82,9 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
             # Re-resolve to get the new blob ID
             blob_id = knamespace_resolve(ns, @path)
             if kblob_id_is_zero(@blob_id)
-                return E_NOENT as i64
+                return Errno.NoEnt as i64
         else
-            return E_NOENT as i64
+            return Errno.NoEnt as i64
 
     # Allocate a file descriptor
     let fd: i32 = fd_alloc()
@@ -124,10 +125,10 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
 
 pub fn sys_close(fd: i32) -> i64
     if fd < 0 or fd >= MAX_FDS
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     if fs_file_state[fd].used == 0
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     # Flush write buffer if any data was written
     let flush_result: i32 = fs_flush_write_buffer(fd)
@@ -158,15 +159,15 @@ pub fn sys_close(fd: i32) -> i64
 
 pub fn sys_fs_read(fd: i32, buf: *u8, count: u64) -> i64
     if fd < 0 or fd >= MAX_FDS
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     if fs_file_state[fd].used == 0
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     # Check read permission
     let flags: i32 = fs_file_state[fd].flags
     if (flags & O_WRONLY) != 0 and (flags & O_RDWR) == 0
-        return E_BADF as i64  # Write-only, can't read
+        return Errno.BadF as i64  # Write-only, can't read
 
     let pos: u64 = fs_file_state[fd].position
     let size: u64 = fs_file_state[fd].size
@@ -240,21 +241,21 @@ pub fn fs_store_path(fd: i32, path: *u8, len: u64)
 
 pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
     if fd < 0 or fd >= MAX_FDS
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     if fs_file_state[fd].used == 0
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     # Check write permission
     let flags: i32 = fs_file_state[fd].flags
     if (flags & O_WRONLY) == 0 and (flags & O_RDWR) == 0
-        return E_BADF as i64  # Read-only
+        return Errno.BadF as i64  # Read-only
 
     # Allocate write buffer if needed
     if fs_write_buffers[fd] == 0 as *u8
         fs_write_buffers[fd] = kalloc(WRITE_BUFFER_INITIAL) as *u8
         if fs_write_buffers[fd] == 0 as *u8
-            return -12 as i64  # ENOMEM
+            return Errno.NoMem as i64
         fs_write_buffer_caps[fd] = WRITE_BUFFER_INITIAL
         fs_write_buffer_sizes[fd] = 0
 
@@ -267,7 +268,7 @@ pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
         let old_cap: u64 = fs_write_buffer_caps[fd]
         let new_buf: *u8 = krealloc(fs_write_buffers[fd], new_cap, old_cap)
         if new_buf == 0 as *u8
-            return -12 as i64  # ENOMEM
+            return Errno.NoMem as i64
         fs_write_buffers[fd] = new_buf
         fs_write_buffer_caps[fd] = new_cap
 
@@ -284,7 +285,8 @@ pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
 
     count as i64
 
-# Flush write buffer to namespace (called on close)
+# Flush write buffer to namespace (called on close): 0, or an Errno that
+# sys_close returns
 fn fs_flush_write_buffer(fd: i32) -> i32
     if fs_write_buffers[fd] == 0 as *u8
         return 0  # Nothing to flush
@@ -300,13 +302,13 @@ fn fs_flush_write_buffer(fd: i32) -> i32
     if path_len == 0
         kfree(fs_write_buffers[fd])
         fs_write_buffers[fd] = 0 as *u8
-        return -1  # No path stored
+        return Errno.Io as i32  # no path to write back to
 
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
         kfree(fs_write_buffers[fd])
         fs_write_buffers[fd] = 0 as *u8
-        return -1
+        return Errno.Io as i32
 
     let path: StrView = strview_from_ptr(@fs_file_paths[fd][0], path_len as i64)
     let result: i32 = knamespace_write(ns, @path, fs_write_buffers[fd], fs_write_buffer_sizes[fd])
@@ -329,10 +331,10 @@ pub const SEEK_END: i32 = 2
 
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
     if fd < 0 or fd >= MAX_FDS
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     if fs_file_state[fd].used == 0
-        return E_BADF as i64
+        return Errno.BadF as i64
 
     let size: u64 = fs_file_state[fd].size
     var new_pos: i64
@@ -344,10 +346,10 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
     else if whence == SEEK_END
         new_pos = size as i64 + offset
     else
-        return E_INVAL as i64
+        return Errno.Inval as i64
 
     if new_pos < 0
-        return E_INVAL as i64
+        return Errno.Inval as i64
 
     fs_file_state[fd].position = new_pos as u64
     new_pos
@@ -359,7 +361,7 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
 pub fn sys_mkdir(path_ptr: *u8, path_len: u64) -> i64
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        return E_INVAL as i64
+        return Errno.Inval as i64
 
     let path: StrView = strview_from_ptr(path_ptr, path_len as i64)
     let result: i32 = knamespace_mkdir(ns, @path)

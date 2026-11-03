@@ -11,7 +11,7 @@ claim is checked as behaviour on every compiler:
 
 * the enum's discriminants are exactly the syscall ABI user programs rely on;
 * the table calls the registered handler with the caller's arguments, and an
-  unregistered, undeclared or out-of-range number gets -ENOSYS;
+  unregistered, undeclared or out-of-range number gets Errno.NoSys (-ENOSYS);
 
 plus the ticket's acceptance at source level: ritz-metrics reports
 syscall_handler CC <= 15, and the kernel registers the same syscalls the
@@ -147,6 +147,7 @@ def test_syscall_enum_declares_exactly_the_abi():
 
 DISPATCH = """\
 import ritzlib.option
+import syscall.errno
 import syscall.numbers
 import syscall.dispatch
 
@@ -170,16 +171,16 @@ fn main() -> i32
     if not syscall_has_handler(1)
         return 4
     # Declared (Open) but not registered by this program.
-    if syscall_has_handler(2) or syscall_dispatch(2, 0, 0, 0, 0) != ENOSYS
+    if syscall_has_handler(2) or syscall_dispatch(2, 0, 0, 0, 0) != Errno.NoSys as i64
         return 5
     # Not a syscall number at all, inside and beyond the table.
-    if syscall_has_handler(5) or syscall_dispatch(5, 0, 0, 0, 0) != ENOSYS
+    if syscall_has_handler(5) or syscall_dispatch(5, 0, 0, 0, 0) != Errno.NoSys as i64
         return 6
-    if syscall_has_handler(256) or syscall_dispatch(256, 0, 0, 0, 0) != ENOSYS
+    if syscall_has_handler(256) or syscall_dispatch(256, 0, 0, 0, 0) != Errno.NoSys as i64
         return 7
-    if syscall_dispatch(0xFFFFFFFFFFFFFFFF, 0, 0, 0, 0) != ENOSYS
+    if syscall_dispatch(0xFFFFFFFFFFFFFFFF, 0, 0, 0, 0) != Errno.NoSys as i64
         return 8
-    if ENOSYS != -38
+    if Errno.NoSys as i64 != -38
         return 9
     # Re-registering replaces the handler.
     syscall_register(Syscall.Read, h_sum)
@@ -191,7 +192,7 @@ fn main() -> i32
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_dispatch_table(compiler, tmp_path):
-    assert _run(compiler, tmp_path, DISPATCH, ["syscall.numbers", "syscall.dispatch"]) == 0
+    assert _run(compiler, tmp_path, DISPATCH, ["syscall.errno", "syscall.numbers", "syscall.dispatch"]) == 0
 
 
 # --- the kernel's use of it ------------------------------------------------------

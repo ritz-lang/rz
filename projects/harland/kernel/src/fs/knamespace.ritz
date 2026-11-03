@@ -8,17 +8,14 @@ import serial { StrView, prints, println }
 import fs.kblob { KBlobStore, KBlobId, kblob_store_get, kblob_store_get_size, kblob_store_put, kblob_id_zero, kblob_id_eq, kblob_id_is_zero, kblob_id_copy }
 import fs.kdir_entry { KDirEntry, KDIR_ENTRY_SIZE, kdir_entry_file, kdir_entry_dir, kdir_entry_is_dir, kdir_entry_name_eq, kdir_entry_serialize, kdir_entry_deserialize, kdir_serialized_size }
 import fs.kpath { path_is_absolute, path_is_root, path_parent, path_basename, path_validate, PathIter, path_iter_new, path_iter_next, strview_empty }
+import syscall.errno { Errno }
 
 # Maximum entries per directory
 const MAX_DIR_ENTRIES: i32 = 256
 
 # Error codes
 pub const KNS_OK: i32 = 0
-pub const KNS_NOT_FOUND: i32 = -2
-pub const KNS_ALREADY_EXISTS: i32 = -17
-pub const KNS_INVALID_PATH: i32 = -22
-pub const KNS_OUT_OF_SPACE: i32 = -28
-pub const KNS_NOT_A_FILE: i32 = -21
+# Failures are `Errno` values (syscall/errno.ritz), returned `as i32`.
 
 # Kernel Namespace - maps paths to content
 pub struct KNamespace
@@ -139,22 +136,22 @@ pub fn knamespace_file_size(ns: *KNamespace, path: @StrView) -> u64
 # Note: For content-addressed FS, we need to propagate changes up to root
 pub fn knamespace_write(ns: *KNamespace, path: @StrView, data: *u8, size: u64) -> i32
     if not path_validate(path)
-        return KNS_INVALID_PATH
+        return Errno.Inval as i32
 
     if path_is_root(path)
-        return KNS_NOT_A_FILE
+        return Errno.IsDir as i32
 
     # Get parent and basename
     let parent_path: StrView = path_parent(path)
     let base_name: StrView = path_basename(path)
 
     if base_name.len == 0
-        return KNS_INVALID_PATH
+        return Errno.Inval as i32
 
     # Store the file content first
     var file_id: KBlobId = kblob_store_put((*ns).store, data, size)
     if kblob_id_is_zero(@file_id)
-        return KNS_OUT_OF_SPACE
+        return Errno.NoSpc as i32
 
     # Now propagate the change up the tree
     # We need to update each directory from the file's parent up to root
@@ -166,7 +163,7 @@ fn update_path_recursive(ns: *KNamespace, path: @StrView, new_blob_id: *KBlobId,
     let base_name: StrView = path_basename(path)
 
     if base_name.len == 0
-        return KNS_INVALID_PATH
+        return Errno.Inval as i32
 
     # Check if parent is root (path_parent returns "/" for top-level entries)
     let parent_is_root: bool = path_is_root(@parent_path) or parent_path.len == 0
@@ -179,12 +176,12 @@ fn update_path_recursive(ns: *KNamespace, path: @StrView, new_blob_id: *KBlobId,
     else
         parent_id = knamespace_resolve(ns, @parent_path)
         if kblob_id_is_zero(@parent_id)
-            return KNS_NOT_FOUND
+            return Errno.NoEnt as i32
 
     # Create updated parent directory with new entry
     var new_parent_id: KBlobId = create_updated_dir(ns, @parent_id, @base_name, new_blob_id, size, is_dir)
     if kblob_id_is_zero(@new_parent_id)
-        return KNS_OUT_OF_SPACE
+        return Errno.NoSpc as i32
 
     # If parent was root, update root and we're done
     if parent_is_root
@@ -254,13 +251,13 @@ fn create_updated_dir(ns: *KNamespace, dir_id: *KBlobId, name: @StrView, blob_id
 # Create a directory
 pub fn knamespace_mkdir(ns: *KNamespace, path: @StrView) -> i32
     if not path_validate(path)
-        return KNS_INVALID_PATH
+        return Errno.Inval as i32
 
     if path_is_root(path)
-        return KNS_ALREADY_EXISTS
+        return Errno.Exist as i32
 
     if knamespace_exists(ns, path)
-        return KNS_ALREADY_EXISTS
+        return Errno.Exist as i32
 
     # Create empty directory blob
     var empty_dir: [4]u8
@@ -271,7 +268,7 @@ pub fn knamespace_mkdir(ns: *KNamespace, path: @StrView) -> i32
 
     var dir_id: KBlobId = kblob_store_put((*ns).store, @empty_dir[0], 4)
     if kblob_id_is_zero(@dir_id)
-        return KNS_OUT_OF_SPACE
+        return Errno.NoSpc as i32
 
     # Use the recursive update to propagate changes to root
     return update_path_recursive(ns, path, @dir_id, 0, 1)
@@ -285,11 +282,11 @@ pub fn knamespace_list(ns: *KNamespace, path: @StrView, entries: *KDirEntry, max
     else
         dir_id = knamespace_resolve(ns, path)
         if kblob_id_is_zero(@dir_id)
-            return -1
+            return Errno.NoEnt as i32
 
     let count: i32 = read_dir_count(ns, @dir_id)
     if count < 0
-        return -1
+        return Errno.NotDir as i32
 
     var copy_count: i32 = count
     if copy_count > max_entries

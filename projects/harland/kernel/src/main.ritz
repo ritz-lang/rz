@@ -18,7 +18,7 @@ import drivers.pci { PciDevice, PCI_CLASS_NETWORK, PCI_CLASS_STORAGE, PCI_CLASS_
 import mm.pmm { PAGE_SIZE, PAGE_SHIFT, MAX_MEMORY, MAX_PAGES, MB2_TAG_END, MB2_TAG_CMDLINE, MB2_TAG_BOOTLOADER_NAME, MB2_TAG_MODULE, MB2_TAG_BASIC_MEMINFO, MB2_TAG_BOOTDEV, MB2_TAG_MMAP, MB2_TAG_VBE, MB2_TAG_FRAMEBUFFER, MB2_TAG_ELF_SECTIONS, MB2_TAG_APM, MB2_TAG_EFI32, MB2_TAG_EFI64, MB2_TAG_SMBIOS, MB2_TAG_ACPI_OLD, MB2_TAG_ACPI_NEW, MB2_TAG_NETWORK, MB2_TAG_EFI_MMAP, MB2_TAG_EFI_BS, MB2_TAG_EFI32_IH, MB2_TAG_EFI64_IH, MB2_TAG_LOAD_BASE_ADDR, MB2_MEMORY_AVAILABLE, MB2_MEMORY_RESERVED, MB2_MEMORY_ACPI_RECLAIMABLE, MB2_MEMORY_NVS, MB2_MEMORY_BADRAM, Mb2BootInfo, Mb2Tag, Mb2BasicMemInfo, Mb2MmapTag, Mb2MmapEntry, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, HARLAND_MEM_ACPI_RECLAIMABLE, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_init, pmm_mark_region_free, pmm_mark_region_used, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_ACCESSED, PTE_DIRTY, PTE_HUGE, PTE_GLOBAL, PTE_NO_EXECUTE, PTE_ADDR_MASK, vmm_init, vmm_flush_tlb, vmm_flush_tlb_all, vmm_debug_page_tables, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_is_accessible, vmm_ensure_mapped, vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_map_page_in, vmm_free_pml4, vmm_read_pml4_entry, vmm_reserve_page_tables }
 import mm.heap { KERNEL_VIRT_BASE, HEAP_START, HEAP_MAX_SIZE, heap_init, kalloc, kfree, heap_get_used, heap_get_free, heap_check }
-import mm.uptr { EFAULT, USER_SPACE_END, uptr_validate_read, uptr_validate_write, uptr_validate_string, uptr_check_read, uptr_check_write, UPTR_OK }
+import mm.uptr { USER_SPACE_END, uptr_validate_read, uptr_validate_write, uptr_validate_string, uptr_check_read, uptr_check_write, UPTR_OK }
 # mm.shm and mm.dma are WIP - commented out until imports are fixed
 # import mm.shm { ShmRegion, ShmMapping, shm_create, ... }
 # import mm.dma { DmaRegion, dma_alloc, dma_free, ... }
@@ -30,7 +30,7 @@ import cap.table { CapTable, CAP_TABLE_SIZE, cap_table_init, cap_table_alloc, ca
 import cap.syscall { sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_init_nth, virtio_blk_read, virtio_blk_write, virtio_blk_get_capacity, virtio_blk_get_device, virtio_blk_get_device_nth, virtio_blk_get_device_count, virtio_blk_test }
 import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq, kblob_id_is_zero }
-import fs.vfs { vfs_init, fd_table_init, E_BADF, E_INVAL }
+import fs.vfs { vfs_init, fd_table_init }
 import fs.knamespace { KNamespace, knamespace_init, knamespace_get, knamespace_mkdir, knamespace_write, knamespace_read, knamespace_exists, knamespace_list, KNS_OK }
 import fs.kdir_entry { KDirEntry }
 import fs.kpath { strview_from_ptr }
@@ -63,7 +63,7 @@ import drivers.acpi.tables {
 import arch.x86_64.exceptions { InterruptFrame, exception_handler, irq_handler, exception_name, print_stack_trace }
 
 # ELF loader
-import loader.elf { Elf64Ehdr, Elf64Phdr, ElfLoadResult, ELF_OK, ELF_ERR_ALLOC_FAILED, ET_EXEC, ET_DYN, elf_load, elf_exec, elf_validate_header, test_elf_loader }
+import loader.elf { Elf64Ehdr, Elf64Phdr, ElfLoadResult, ElfStatus, elf_status_code, ET_EXEC, ET_DYN, elf_load, elf_exec, elf_validate_header, test_elf_loader }
 
 # GDT and IDT
 import arch.x86_64.gdt { gdt_init, gdt_set_kernel_stack }
@@ -761,15 +761,16 @@ const EFER_SCE: u64 = 1
 
 # Harland syscall numbers (single source of truth) and the dispatch table
 import syscall.numbers { Syscall }
-import syscall.dispatch { ENOSYS, syscall_register, syscall_has_handler, syscall_dispatch }
+import syscall.errno { Errno }
+import syscall.dispatch { syscall_register, syscall_has_handler, syscall_dispatch }
 
 # ============================================================================
 # Memory Mapping (mmap/munmap)
 # ============================================================================
 #
 # Harland uses a simplified mmap interface:
-#   sys_mmap(addr_hint, length, prot, flags) -> mapped_addr or -1
-#   sys_munmap(addr, length) -> 0 or -1
+#   sys_mmap(addr_hint, length, prot, flags) -> mapped_addr or -errno
+#   sys_munmap(addr, length) -> 0 or -errno
 #
 # We only support anonymous mappings (no file-backed mmap yet).
 # The kernel allocates physical pages and maps them into the process.
@@ -858,7 +859,7 @@ fn syscall_strlen(s: *u8) -> i64
 fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        return -1
+        return Errno.NoDev as i64
 
     # Create StrView from path
     let path_len: i64 = syscall_strlen(dir_path)
@@ -869,7 +870,7 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     let count: i32 = knamespace_list(ns, @path_view, @entries[0], 64)
 
     if count < 0
-        return -1
+        return count as i64  # an Errno: NoEnt or NotDir
 
     # Copy names to buffer as null-terminated strings
     var bytes_written: i64 = 0
@@ -965,6 +966,14 @@ fn free_user_stack()
             pmm_free_page(paddr)
         i = i + 1
 
+# The errno a failed spawn returns for a failed ELF load: out of memory, or
+# a file that isn't a loadable x86-64 executable.
+fn elf_status_errno(s: ElfStatus) -> i64
+    match s
+        AllocFailed => Errno.NoMem as i64
+        MapFailed => Errno.NoMem as i64
+        _ => Errno.NoExec as i64
+
 # sys_spawn: Load and execute a binary from the filesystem
 # This is a BLOCKING spawn - we save parent state, run child, and when
 # child exits, we restore parent state and return with child's exit code.
@@ -976,7 +985,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     # Look up the file in the namespace
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        return -1
+        return Errno.NoDev as i64
 
     # Read file from namespace (using kernel's page table)
     let path_len: i64 = syscall_strlen(path)
@@ -985,7 +994,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     let elf_data: *u8 = knamespace_read(ns, @path_view, @file_size)
 
     if elf_data == 0 as *u8
-        return -1
+        return Errno.NoEnt as i64
 
     # Save parent's execution context
     # When the child calls sys_exit(), we'll restore this and return here
@@ -1001,7 +1010,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     let child_pml4: u64 = vmm_create_user_pml4()
     if child_pml4 == 0
         g_has_parent = 0
-        return -1
+        return Errno.NoMem as i64
 
     g_child_pml4 = child_pml4  # Save for cleanup on exit
 
@@ -1023,13 +1032,13 @@ fn sys_spawn_impl(path: *u8) -> i64
     let child_load_base: u64 = 0x100000000  # 4GB - same as init, no conflict due to isolation
     let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
 
-    if load_result.error != ELF_OK
+    if load_result.error != ElfStatus.Ok
         # Switch back to parent before cleanup
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
-        return -1
+        return elf_status_errno(load_result.error)
 
     # Allocate 64KB user stack (16 pages)
     let child_stack_top: u64 = alloc_user_stack()
@@ -1038,7 +1047,7 @@ fn sys_spawn_impl(path: *u8) -> i64
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
-        return -1
+        return Errno.NoMem as i64
 
     # Jump to child! This does NOT return.
     # We're already in the child's address space (CR3 was switched above).
@@ -1047,7 +1056,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     jump_to_userspace(load_result.entry_point, child_stack_top)
 
     # Never reached - child will call sys_exit which handles return to parent
-    return -1
+    return Errno.NoExec as i64
 
 # sys_spawn_args: Load and execute a binary with command-line arguments
 # Similar to sys_spawn_impl but passes argc/argv to the child process.
@@ -1069,7 +1078,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
         prints("[spawn_args] No namespace\n")
-        return -1
+        return Errno.NoDev as i64
 
     # Read file from namespace (using kernel's page table)
     let path_len: i64 = syscall_strlen(path)
@@ -1081,7 +1090,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         prints("[spawn_args] File not found: ")
         prints_str(path)
         prints("\n")
-        return -1
+        return Errno.NoEnt as i64
 
     prints("[spawn_args] Loading ELF (")
     serial_print_dec(file_size)
@@ -1100,7 +1109,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     if child_pml4 == 0
         prints("[spawn_args] Failed to create child page table\n")
         g_has_parent = 0
-        return -1
+        return Errno.NoMem as i64
 
     g_child_pml4 = child_pml4
 
@@ -1123,14 +1132,14 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
-        return -1
+        return Errno.TooBig as i64
 
     if argc > 64
         prints("[spawn_args] too many arguments\n")
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
-        return -1
+        return Errno.TooBig as i64
 
     # Copy all strings into argv_copy
     var copy_pos: i64 = 0
@@ -1153,13 +1162,13 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     let child_load_base: u64 = 0x100000000
     let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
 
-    if load_result.error != ELF_OK
+    if load_result.error != ElfStatus.Ok
         prints("[spawn_args] Failed to load ELF\n")
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
-        return -1
+        return elf_status_errno(load_result.error)
 
     # Allocate 64KB user stack (16 pages)
     let alloc_stack_top: u64 = alloc_user_stack()
@@ -1169,7 +1178,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
-        return -1
+        return Errno.NoMem as i64
 
     # Set up the stack with argv data
     # Layout from top of stack going down:
@@ -1239,7 +1248,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
 
     # Never reached
     prints("[spawn_args] ERROR: jump returned!\n")
-    return -1
+    return Errno.NoExec as i64
 
 # sys_exit: Exit the current process
 # If we're a child (spawned by blocking spawn), restore parent and return
@@ -1291,7 +1300,7 @@ fn sys_wait_impl(pid: i32) -> i64
         return code
 
     # No child to wait for
-    return -1
+    return Errno.Child as i64
 
 # ============================================================================
 # sys_mmap: Map anonymous memory pages
@@ -1304,18 +1313,18 @@ fn sys_wait_impl(pid: i32) -> i64
 #   flags: Mapping flags (MAP_ANONYMOUS | MAP_PRIVATE)
 #
 # Returns:
-#   Address of mapped region, or -1 on error
+#   Address of mapped region, or Errno.Inval / Errno.NoMem
 #
 # Note: We only support anonymous private mappings for now.
 fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     # Validate flags - we only support anonymous private mappings
     if (flags & MAP_ANONYMOUS) == 0
         prints("[mmap] ERROR: only anonymous mappings supported\n")
-        return -1
+        return Errno.Inval as i64
 
     if length == 0
         prints("[mmap] ERROR: length cannot be zero\n")
-        return -1
+        return Errno.Inval as i64
 
     # Round length up to page size
     let num_pages: u64 = (length + PAGE_SIZE - 1) / PAGE_SIZE
@@ -1326,7 +1335,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         # Must map at the exact address
         if addr_hint == 0 or (addr_hint & 0xFFF) != 0
             prints("[mmap] ERROR: MAP_FIXED requires page-aligned address\n")
-            return -1
+            return Errno.Inval as i64
         map_addr = addr_hint
     else if addr_hint != 0 and (addr_hint & 0xFFF) == 0
         # Try the hint address if it's page-aligned
@@ -1339,11 +1348,11 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     # Validate address is in user mmap region
     if map_addr < USER_MMAP_START or map_addr >= USER_MMAP_END
         prints("[mmap] ERROR: address outside user mmap region\n")
-        return -1
+        return Errno.NoMem as i64
 
     if (map_addr + num_pages * PAGE_SIZE) > USER_MMAP_END
         prints("[mmap] ERROR: mapping would exceed mmap region\n")
-        return -1
+        return Errno.NoMem as i64
 
     # Compute page table flags from protection
     var pte_flags: u64 = PTE_PRESENT | PTE_USER
@@ -1359,7 +1368,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         if page_phys == 0
             prints("[mmap] ERROR: out of physical memory\n")
             # TODO: Unmap already-mapped pages
-            return -1
+            return Errno.NoMem as i64
 
         let page_virt: u64 = map_addr + (i * PAGE_SIZE)
         let result: i32 = vmm_map_page(page_virt, page_phys, pte_flags)
@@ -1369,7 +1378,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
             prints("\n")
             pmm_free_page(page_phys)
             # TODO: Unmap already-mapped pages
-            return -1
+            return Errno.NoMem as i64
 
         # Zero the page for security
         var p: u64 = 0
@@ -1397,12 +1406,12 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
 #   length: Number of bytes to unmap (will be rounded up to page size)
 #
 # Returns:
-#   0 on success, -1 on error
+#   0 on success, Errno.Inval for a bad address
 fn sys_munmap_impl(addr: u64, length: u64) -> i64
     # Validate address alignment
     if (addr & 0xFFF) != 0
         prints("[munmap] ERROR: address not page-aligned\n")
-        return -1
+        return Errno.Inval as i64
 
     if length == 0
         return 0  # Nothing to do
@@ -1410,7 +1419,7 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
     # Validate address is in user mmap region
     if addr < USER_MMAP_START or addr >= USER_MMAP_END
         prints("[munmap] ERROR: address outside user mmap region\n")
-        return -1
+        return Errno.Inval as i64
 
     # Round length up to page size
     let num_pages: u64 = (length + PAGE_SIZE - 1) / PAGE_SIZE
@@ -1463,11 +1472,11 @@ fn init_cwd()
 
 # sys_getcwd_impl: Get current working directory
 # Args: buf = buffer to write path to, size = buffer size
-# Returns: length of path on success, -1 if buffer too small
+# Returns: length of path on success, Errno.Range if buffer too small
 fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
     # Check buffer size (need room for null terminator)
     if size < (g_cwd_len as u64 + 1)
-        return -1
+        return Errno.Range as i64
 
     # Copy CWD to user buffer
     var i: u16 = 0
@@ -1480,20 +1489,22 @@ fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
 
 # sys_chdir_impl: Change current working directory
 # Args: path = path to new directory (null-terminated)
-# Returns: 0 on success, -1 on error
+# Returns: 0 on success, Errno.NoEnt / NameTooLong / NoDev on error
 fn sys_chdir_impl(path: *u8) -> i64
     # Get path length
     var path_len: i64 = 0
     while *(path + path_len) != 0 and path_len < 255
         path_len = path_len + 1
 
-    if path_len == 0 or path_len >= 255
-        return -1
+    if path_len == 0
+        return Errno.NoEnt as i64
+    if path_len >= 255
+        return Errno.NameTooLong as i64
 
     # Verify the path exists in the namespace
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        return -1
+        return Errno.NoDev as i64
 
     let path_view: StrView = strview_from_ptr(path, path_len)
 
@@ -1501,9 +1512,9 @@ fn sys_chdir_impl(path: *u8) -> i64
     var entries: [1]KDirEntry
     let count: i32 = knamespace_list(ns, @path_view, @entries[0], 1)
 
-    # knamespace_list returns -1 if path not found, >= 0 otherwise
+    # knamespace_list returns an Errno (NoEnt, NotDir) if the path is no directory
     if count < 0
-        return -1
+        return count as i64
 
     # Path exists, update CWD
     var i: i64 = 0
@@ -1541,13 +1552,14 @@ fn sys_input_poll_impl() -> i64
 
 # sys_input_read: Read next input event
 # Args: event_ptr = pointer to 8-byte VirtioInputEvent structure
-# Returns: 0 if event read successfully, -1 if no events pending
+# Returns: 0 if event read successfully, Errno.Again if no events pending
+# (Errno.NoDev without an input device)
 fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
     if not virtio_input_available()
-        return -1
+        return Errno.NoDev as i64
 
     if event_ptr == 0 as *VirtioInputEvent
-        return -1
+        return Errno.Fault as i64
 
     # Poll for new events first
     virtio_input_poll()
@@ -1561,7 +1573,7 @@ fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
         (*event_ptr).value = event.value
         return 0
 
-    return -1
+    return Errno.Again as i64
 
 # ============================================================================
 # Framebuffer Syscalls (for Prism compositor)
@@ -1590,14 +1602,14 @@ var g_user_fb_addr: u64 = 0
 
 # sys_fb_info: Get framebuffer information
 # Args: info_buf pointer to 24-byte FbInfo structure
-# Returns: 0 on success, -1 if no display
+# Returns: 0 on success, Errno.NoDev if no display
 fn sys_fb_info_impl(info_buf: *u8) -> i64
     if not display_available()
-        return -1
+        return Errno.NoDev as i64
 
     let fb: *SimpleFramebuffer = display_get_framebuffer()
     if fb == 0 as *SimpleFramebuffer
-        return -1
+        return Errno.NoDev as i64
 
     # Write FbInfo structure
     let buf64: *u64 = info_buf as *u64
@@ -1625,14 +1637,14 @@ fn sys_fb_info_impl(info_buf: *u8) -> i64
     return 0
 
 # sys_fb_map: Map framebuffer into userspace
-# Returns: Mapped address on success, -1 on error
+# Returns: Mapped address on success, Errno.NoDev / Errno.NoMem on error
 fn sys_fb_map_impl() -> i64
     if not display_available()
-        return -1
+        return Errno.NoDev as i64
 
     let fb: *SimpleFramebuffer = display_get_framebuffer()
     if fb == 0 as *SimpleFramebuffer
-        return -1
+        return Errno.NoDev as i64
 
     # If already mapped, return the existing address
     if g_user_fb_mapped != 0
@@ -1658,7 +1670,7 @@ fn sys_fb_map_impl() -> i64
             prints("[fb_map] Failed to map page ")
             serial_print_dec(i as i64)
             prints("\n")
-            return -1
+            return Errno.NoMem as i64
 
         i = i + 1
 
@@ -1791,7 +1803,7 @@ fn sys_open_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if rsi > 0
         let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
         if path_result != 0
-            return EFAULT
+            return Errno.Fault as i64
     let saved_child_pid: u64 = g_child_pid
     let saved_has_parent: u8 = g_has_parent
     let result: i64 = sys_open(rdi as *u8, rsi, rdx as i32)
@@ -1812,17 +1824,17 @@ fn sys_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 fn sys_lseek_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let fd: i32 = rdi as i32
     if not is_fs_fd(fd)
-        return E_BADF as i64
+        return Errno.BadF as i64
     return sys_lseek(fd, rsi as i64, rdx as i32)
 
 # mkdir(path, len): create a directory in the kernel namespace.
 fn sys_mkdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate path buffer (same contract as open)
     if rsi == 0
-        return E_INVAL as i64
+        return Errno.Inval as i64
     let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
     if path_result != 0
-        return EFAULT
+        return Errno.Fault as i64
     return sys_mkdir(rdi as *u8, rsi)
 
 # write(fd, buf, count), also debug_print: Linux/POSIX write convention.
@@ -1835,7 +1847,7 @@ fn sys_write_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if len > 0
         let uptr_result: i64 = uptr_check_read(buf, len as u64)
         if uptr_result != 0
-            return EFAULT
+            return Errno.Fault as i64
 
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
@@ -1865,7 +1877,7 @@ fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if count > 0
         let uptr_result: i64 = uptr_check_write(buf, count as u64)
         if uptr_result != 0
-            return EFAULT
+            return Errno.Fault as i64
 
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
@@ -1873,7 +1885,7 @@ fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
     # Only support stdin (fd 0) for serial input
     if fd != 0
-        return -1  # EBADF
+        return Errno.BadF as i64
 
     # First, poll for any new data
     serial_poll()
@@ -1896,11 +1908,11 @@ fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate path string and output buffer
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
-        return EFAULT
+        return Errno.Fault as i64
     if rdx > 0
         let buf_result: i64 = uptr_check_write(rsi as *u8, rdx as u64)
         if buf_result != 0
-            return EFAULT
+            return Errno.Fault as i64
     return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
 
 # spawn(path)
@@ -1908,7 +1920,7 @@ fn sys_spawn_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate path string
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
-        return EFAULT
+        return Errno.Fault as i64
     return sys_spawn_impl(rdi as *u8)
 
 # spawn_args(path, argv, argc)
@@ -1916,7 +1928,7 @@ fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate path string
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
-        return EFAULT
+        return Errno.Fault as i64
     # SECURITY: Validate argv array (each pointer + the strings they point to)
     let argc: i32 = rdx as i32
     if argc > 0
@@ -1924,7 +1936,7 @@ fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let argv_size: u64 = (argc as u64) * 8  # sizeof(*u8) = 8 on x86-64
         let argv_result: i64 = uptr_check_read(rsi as *u8, argv_size)
         if argv_result != 0
-            return EFAULT
+            return Errno.Fault as i64
         # Validate each string in argv
         var i: i32 = 0
         let argv: **u8 = rsi as **u8
@@ -1932,7 +1944,7 @@ fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
             let arg: *u8 = *(argv + i)
             let arg_result: i64 = uptr_validate_string(arg, 4096)
             if arg_result < 0
-                return EFAULT
+                return Errno.Fault as i64
             i = i + 1
     return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
 
@@ -1948,19 +1960,19 @@ fn sys_ipc_send_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate Message struct (4096 bytes) is readable
     let msg_result: i64 = uptr_check_read(rsi as *u8, 4096)
     if msg_result != 0
-        return EFAULT
+        return Errno.Fault as i64
     return sys_ipc_send(current_pid(), rdi as i32, rsi as *Message)
 
 fn sys_ipc_recv_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate Message struct (4096 bytes) is writable
     let msg_result: i64 = uptr_check_write(rsi as *u8, 4096)
     if msg_result != 0
-        return EFAULT
+        return Errno.Fault as i64
     # Validate sender_pid output pointer (4 bytes for u32)
     if rdx != 0
         let sender_result: i64 = uptr_check_write(rdx as *u8, 4)
         if sender_result != 0
-            return EFAULT
+            return Errno.Fault as i64
     return sys_ipc_recv(current_pid(), rdi as i32, rsi as *Message, rdx as *u32)
 
 fn sys_ipc_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -1980,7 +1992,7 @@ fn sys_cap_info_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate CapInfo output struct (16 bytes) is writable
     let info_result: i64 = uptr_check_write(rsi as *u8, 16)
     if info_result != 0
-        return EFAULT
+        return Errno.Fault as i64
     return sys_cap_info(current_pid(), rdi, rsi as *CapInfo)
 
 fn sys_cap_check_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -1994,33 +2006,33 @@ fn sys_mmap_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 fn sys_munmap_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return sys_munmap_impl(rdi, rsi)
 
-# getcwd(buf, size) -> length or -1
+# getcwd(buf, size) -> length or -errno
 fn sys_getcwd_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate output buffer is writable
     if rsi > 0
         let buf_result: i64 = uptr_check_write(rdi as *u8, rsi as u64)
         if buf_result != 0
-            return EFAULT
+            return Errno.Fault as i64
     return sys_getcwd_impl(rdi as *u8, rsi)
 
-# chdir(path) -> 0 or -1
+# chdir(path) -> 0 or -errno
 fn sys_chdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate path string
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
-        return EFAULT
+        return Errno.Fault as i64
     return sys_chdir_impl(rdi as *u8)
 
 # input_poll() -> number of events pending
 fn sys_input_poll_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return sys_input_poll_impl()
 
-# input_read(event_ptr) -> 0 if event read, -1 if no events
+# input_read(event_ptr) -> 0 if event read, -EAGAIN if no events
 fn sys_input_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate VirtioInputEvent output struct (8 bytes) is writable
     let event_result: i64 = uptr_check_write(rdi as *u8, 8)
     if event_result != 0
-        return EFAULT
+        return Errno.Fault as i64
     return sys_input_read_impl(rdi as *VirtioInputEvent)
 
 # acpi_poweroff()
@@ -2031,20 +2043,20 @@ fn sys_acpi_poweroff_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return result as i64
 
 # Framebuffer syscalls for Prism compositor
-# fb_info(info_buf: *FbInfo) -> 0 on success, -1 on no display
+# fb_info(info_buf: *FbInfo) -> 0 on success, -ENODEV on no display
 fn sys_fb_info_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate FbInfo output struct (24 bytes) is writable
     let info_result: i64 = uptr_check_write(rdi as *u8, 24)
     if info_result != 0
-        return EFAULT
+        return Errno.Fault as i64
     return sys_fb_info_impl(rdi as *u8)
 
-# fb_map() -> mapped_addr or -1
+# fb_map() -> mapped_addr or -errno
 fn sys_fb_map_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return sys_fb_map_impl()
 
 # Fill the dispatch table: one line per dispatched syscall. A Syscall
-# variant without a line here answers ENOSYS (see syscall/dispatch.ritz).
+# variant without a line here answers Errno.NoSys (see syscall/dispatch.ritz).
 fn syscall_table_init()
     syscall_register(Syscall.Read, sys_read_handler)
     syscall_register(Syscall.Write, sys_write_handler)
@@ -2086,7 +2098,7 @@ pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         prints("[syscall] unknown: ")
         serial_print_dec(rax)
         prints("\n")
-        return ENOSYS
+        return Errno.NoSys as i64
     return syscall_dispatch(rax, rdi, rsi, rdx, r10)
 
 # Run /bin/init from the filesystem as PID 1
@@ -2117,9 +2129,9 @@ fn run_init() -> i32
     let load_base: u64 = 0x100000000  # 4GB
     let load_result: ElfLoadResult = elf_load(elf_data, file_size, load_base)
 
-    if load_result.error != ELF_OK
+    if load_result.error != ElfStatus.Ok
         prints("[init] ELF load failed, error=")
-        serial_print_dec(load_result.error as u64)
+        serial_print_dec(elf_status_code(load_result.error))
         prints("\n")
         return -1
 

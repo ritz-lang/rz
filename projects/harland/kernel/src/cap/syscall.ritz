@@ -3,6 +3,7 @@
 # Implements the syscall interface for capability operations.
 
 import serial { prints, println, serial_print_dec }
+import syscall.errno { Errno }
 import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_RIGHT_GRANT, CAP_RIGHT_DERIVE, cap_handle_invalid, cap_handle_is_valid, cap_type_name }
 import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_table_insert, cap_table_remove, cap_table_derive, cap_grant, cap_table_info, cap_has_rights }
 
@@ -34,18 +35,18 @@ pub fn sys_cap_grant(caller_pid: u32, handle_packed: u64, target_pid: u32, right
 
     let from_table: *CapTable = cap_table_get(caller_pid)
     if from_table == 0 as *CapTable
-        return -1  # EPERM - no capability table
+        return Errno.Perm as i64
 
     let to_table: *CapTable = cap_table_get(target_pid)
     if to_table == 0 as *CapTable
-        return -3  # ESRCH - target process not found
+        return Errno.Srch as i64
 
     let new_handle: CapHandle = cap_grant(from_table, handle, to_table, rights)
     # Extract values before validation (which consumes the struct)
     let idx: u32 = new_handle.index
     let gen: u32 = new_handle.generation
     if idx == 0xFFFFFFFF
-        return -1  # EPERM - grant failed (invalid handle)
+        return Errno.BadF as i64  # no such capability
 
     # Pack result handle
     let result: i64 = (idx as i64) | ((gen as i64) << 32)
@@ -68,10 +69,11 @@ pub fn sys_cap_revoke(caller_pid: u32, handle_packed: u64) -> i64
 
     let table: *CapTable = cap_table_get(caller_pid)
     if table == 0 as *CapTable
-        return -1  # EPERM
+        return Errno.Perm as i64  # no capability table
 
-    let result: i32 = cap_table_remove(table, handle)
-    return result as i64
+    if cap_table_remove(table, handle) != 0
+        return Errno.BadF as i64  # no such capability
+    return 0
 
 # ============================================================================
 # SYS_CAP_DERIVE
@@ -91,14 +93,14 @@ pub fn sys_cap_derive(caller_pid: u32, handle_packed: u64, new_rights: u32) -> i
 
     let table: *CapTable = cap_table_get(caller_pid)
     if table == 0 as *CapTable
-        return -1  # EPERM
+        return Errno.Perm as i64  # no capability table
 
     let new_handle: CapHandle = cap_table_derive(table, handle, new_rights)
     # Extract values before validation (which consumes the struct)
     let idx: u32 = new_handle.index
     let gen: u32 = new_handle.generation
     if idx == 0xFFFFFFFF
-        return -1  # EPERM - derive failed (invalid handle)
+        return Errno.BadF as i64  # no such capability
 
     let result: i64 = (idx as i64) | ((gen as i64) << 32)
     return result
@@ -116,7 +118,7 @@ pub fn sys_cap_derive(caller_pid: u32, handle_packed: u64, new_rights: u32) -> i
 
 pub fn sys_cap_info(caller_pid: u32, handle_packed: u64, info_ptr: *CapInfo) -> i64
     if info_ptr == 0 as *CapInfo
-        return -22  # EINVAL
+        return Errno.Inval as i64
 
     var handle: CapHandle
     handle.index = (handle_packed & 0xFFFFFFFF) as u32
@@ -124,10 +126,11 @@ pub fn sys_cap_info(caller_pid: u32, handle_packed: u64, info_ptr: *CapInfo) -> 
 
     let table: *CapTable = cap_table_get(caller_pid)
     if table == 0 as *CapTable
-        return -1  # EPERM
+        return Errno.Perm as i64  # no capability table
 
-    let result: i32 = cap_table_info(table, handle, info_ptr)
-    return result as i64
+    if cap_table_info(table, handle, info_ptr) != 0
+        return Errno.BadF as i64  # no such capability
+    return 0
 
 # ============================================================================
 # SYS_CAP_CHECK
@@ -147,7 +150,7 @@ pub fn sys_cap_check(caller_pid: u32, handle_packed: u64, required_rights: u32) 
 
     let table: *CapTable = cap_table_get(caller_pid)
     if table == 0 as *CapTable
-        return -1  # EPERM
+        return Errno.Perm as i64  # no capability table
 
     if cap_has_rights(table, handle, required_rights)
         return 1

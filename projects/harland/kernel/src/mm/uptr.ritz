@@ -16,6 +16,7 @@
 #   3. Range must not wrap around (overflow check)
 #   4. If writable access required, pages must be writable
 
+import syscall.errno { Errno }
 import mm.vmm { vmm_pml4_phys, PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_HUGE, PTE_ADDR_MASK }
 
 # ============================================================================
@@ -26,17 +27,9 @@ import mm.vmm { vmm_pml4_phys, PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_HUGE, PT
 # 0x0000_7FFF_FFFF_FFFF = 140737488355327
 pub const USER_SPACE_END: u64 = 140737488355327
 
-# Error codes for pointer validation
+# Pointer validation: UPTR_OK, or Errno.Fault for every way a pointer can be
+# bad (NULL, kernel half, wrapping range, unmapped, not user, not writable).
 pub const UPTR_OK: i32 = 0
-pub const UPTR_ERR_NULL: i32 = -14         # EFAULT - NULL pointer
-pub const UPTR_ERR_KERNEL: i32 = -14       # EFAULT - Pointer in kernel space
-pub const UPTR_ERR_OVERFLOW: i32 = -14     # EFAULT - Range overflows
-pub const UPTR_ERR_NOT_MAPPED: i32 = -14   # EFAULT - Page not mapped
-pub const UPTR_ERR_NOT_USER: i32 = -14     # EFAULT - Page not user-accessible
-pub const UPTR_ERR_NOT_WRITABLE: i32 = -14 # EFAULT - Page not writable
-
-# EFAULT error code (standard POSIX)
-pub const EFAULT: i64 = -14
 
 # Page size
 const PAGE_SIZE: u64 = 4096
@@ -115,9 +108,9 @@ fn uptr_check_page_access(pml4: u64, vaddr: u64, need_write: bool) -> i32
     let pml4_entry: u64 = *pml4_ptr
 
     if (pml4_entry & PTE_PRESENT) == 0
-        return UPTR_ERR_NOT_MAPPED
+        return Errno.Fault as i32
     if (pml4_entry & PTE_USER) == 0
-        return UPTR_ERR_NOT_USER
+        return Errno.Fault as i32
 
     # Check PDPT entry
     let pdpt_phys: u64 = pml4_entry & PTE_ADDR_MASK
@@ -125,14 +118,14 @@ fn uptr_check_page_access(pml4: u64, vaddr: u64, need_write: bool) -> i32
     let pdpt_entry: u64 = *pdpt_ptr
 
     if (pdpt_entry & PTE_PRESENT) == 0
-        return UPTR_ERR_NOT_MAPPED
+        return Errno.Fault as i32
     if (pdpt_entry & PTE_USER) == 0
-        return UPTR_ERR_NOT_USER
+        return Errno.Fault as i32
 
     # 1GB huge page?
     if (pdpt_entry & PTE_HUGE) != 0
         if need_write and (pdpt_entry & PTE_WRITABLE) == 0
-            return UPTR_ERR_NOT_WRITABLE
+            return Errno.Fault as i32
         return UPTR_OK
 
     # Check PD entry
@@ -141,14 +134,14 @@ fn uptr_check_page_access(pml4: u64, vaddr: u64, need_write: bool) -> i32
     let pd_entry: u64 = *pd_ptr
 
     if (pd_entry & PTE_PRESENT) == 0
-        return UPTR_ERR_NOT_MAPPED
+        return Errno.Fault as i32
     if (pd_entry & PTE_USER) == 0
-        return UPTR_ERR_NOT_USER
+        return Errno.Fault as i32
 
     # 2MB huge page?
     if (pd_entry & PTE_HUGE) != 0
         if need_write and (pd_entry & PTE_WRITABLE) == 0
-            return UPTR_ERR_NOT_WRITABLE
+            return Errno.Fault as i32
         return UPTR_OK
 
     # Check PT entry
@@ -157,11 +150,11 @@ fn uptr_check_page_access(pml4: u64, vaddr: u64, need_write: bool) -> i32
     let pt_entry: u64 = *pt_ptr
 
     if (pt_entry & PTE_PRESENT) == 0
-        return UPTR_ERR_NOT_MAPPED
+        return Errno.Fault as i32
     if (pt_entry & PTE_USER) == 0
-        return UPTR_ERR_NOT_USER
+        return Errno.Fault as i32
     if need_write and (pt_entry & PTE_WRITABLE) == 0
-        return UPTR_ERR_NOT_WRITABLE
+        return Errno.Fault as i32
 
     return UPTR_OK
 
@@ -192,11 +185,11 @@ pub fn uptr_validate_read(ptr: *u8, len: u64) -> i32
 
     # NULL pointer with non-zero length is invalid
     if addr == 0
-        return UPTR_ERR_NULL
+        return Errno.Fault as i32
 
     # Check range is in user space
     if not uptr_range_in_user_space(addr, len)
-        return UPTR_ERR_KERNEL
+        return Errno.Fault as i32
 
     # Check each page in the range is mapped with user access
     let page_size: u64 = 4096
@@ -222,11 +215,11 @@ pub fn uptr_validate_write(ptr: *u8, len: u64) -> i32
 
     # NULL pointer with non-zero length is invalid
     if addr == 0
-        return UPTR_ERR_NULL
+        return Errno.Fault as i32
 
     # Check range is in user space
     if not uptr_range_in_user_space(addr, len)
-        return UPTR_ERR_KERNEL
+        return Errno.Fault as i32
 
     # Check each page in the range is mapped with user+write access
     let page_size: u64 = 4096
@@ -251,11 +244,11 @@ pub fn uptr_validate_string(ptr: *u8, max_len: u64) -> i64
 
     # NULL pointer is invalid
     if addr == 0
-        return UPTR_ERR_NULL as i64
+        return Errno.Fault as i64
 
     # Check string doesn't start outside user space
     if not uptr_in_user_space(addr)
-        return UPTR_ERR_KERNEL as i64
+        return Errno.Fault as i64
 
     # Scan for null terminator, validating pages as we go
     var current_page: u64 = addr & 0xFFFFFFFFFFFFF000
@@ -267,7 +260,7 @@ pub fn uptr_validate_string(ptr: *u8, max_len: u64) -> i64
 
         # Check we're still in user space
         if not uptr_in_user_space(current_addr)
-            return UPTR_ERR_KERNEL as i64
+            return Errno.Fault as i64
 
         # Validate page if we crossed to a new one
         let page: u64 = current_addr & 0xFFFFFFFFFFFFF000
@@ -284,7 +277,7 @@ pub fn uptr_validate_string(ptr: *u8, max_len: u64) -> i64
         len = len + 1
 
     # String too long - no null terminator found within max_len
-    return UPTR_ERR_OVERFLOW as i64
+    return Errno.Fault as i64
 
 # ============================================================================
 # Convenience Macros / Helper Functions
@@ -296,17 +289,16 @@ pub fn uptr_is_valid(ptr: *u8) -> bool
     let addr: u64 = ptr as u64
     return addr != 0 and uptr_in_user_space(addr)
 
-# Validate pointer and return EFAULT if invalid (for use in syscalls)
-# Returns 0 if valid, EFAULT (-14) if invalid
+# Validate pointer for use in syscalls: 0 if valid, Errno.Fault (-14) if not
 pub fn uptr_check_read(ptr: *u8, len: u64) -> i64
     let result: i32 = uptr_validate_read(ptr, len)
     if result != UPTR_OK
-        return EFAULT
+        return Errno.Fault as i64
     return 0
 
-# Validate writable pointer and return EFAULT if invalid
+# Validate writable pointer: 0 if valid, Errno.Fault (-14) if not
 pub fn uptr_check_write(ptr: *u8, len: u64) -> i64
     let result: i32 = uptr_validate_write(ptr, len)
     if result != UPTR_OK
-        return EFAULT
+        return Errno.Fault as i64
     return 0
