@@ -1,0 +1,113 @@
+# test/test_slug.ritz - slug extraction and validation (AGAST #1870)
+#
+# extract_slug used to accept any byte except '/', and GET /wiki/:slug and
+# /wiki/:slug/edit never validated it, so a slug of `"><script>` reached an
+# href unescaped.  Every route now rejects slugs outside [a-z0-9-]{1,128}.
+
+import ritzlib.str { strlen }
+
+import slug { extract_slug, validate_slug, slug_from_path }
+
+
+fn valid(s: *u8) -> i32
+    return validate_slug(s, strlen(s) as i32)
+
+
+[[test]]
+fn test_validate_slug_accepts_lower_digits_hyphen() -> i32
+    if valid(c"hello-world-42") != 1
+        return 1
+    if valid(c"a") != 1
+        return 2
+    0
+
+
+[[test]]
+fn test_validate_slug_rejects_html_specials() -> i32
+    if valid(c"a\"b") != 0
+        return 1
+    if valid(c"<script>") != 0
+        return 2
+    if valid(c"x>y") != 0
+        return 3
+    if valid(c"a&b") != 0
+        return 4
+    if valid(c"it's") != 0
+        return 5
+    0
+
+
+[[test]]
+fn test_validate_slug_rejects_other_bytes() -> i32
+    if valid(c"Upper") != 0
+        return 1
+    if valid(c"..") != 0
+        return 2
+    if valid(c"a b") != 0
+        return 3
+    if valid(c"a%22b") != 0
+        return 4
+    if validate_slug(c"x", 0) != 0
+        return 5
+    0
+
+
+[[test]]
+fn test_validate_slug_length_cap() -> i32
+    var buf: [129]u8
+    for i in 0..129
+        buf[i] = 'a'
+    if validate_slug(@buf[0], 128) != 1
+        return 1
+    if validate_slug(@buf[0], 129) != 0
+        return 2
+    0
+
+
+[[test]]
+fn test_extract_slug_stops_at_slash() -> i32
+    var out: [128]u8
+    let p = c"/wiki/foo/edit"
+    let n = extract_slug(p, strlen(p) as i32, @out[0], 128)
+    if n != 3
+        return 1
+    if out[0] != 'f' or out[2] != 'o'
+        return 2
+    0
+
+
+# The route-level helper: extract, then validate.  A hostile slug in the
+# path is refused (returns -1) rather than handed to a renderer.
+[[test]]
+fn test_slug_from_path_rejects_hostile_slug() -> i32
+    var out: [128]u8
+    let bad = c"/wiki/\"><script>"
+    if slug_from_path(bad, strlen(bad) as i32, @out[0]) != -1
+        return 1
+    let good = c"/wiki/home/edit"
+    if slug_from_path(good, strlen(good) as i32, @out[0]) != 4
+        return 2
+    let empty = c"/wiki/"
+    if slug_from_path(empty, strlen(empty) as i32, @out[0]) != -1
+        return 3
+    0
+
+
+# An over-long slug is rejected, not silently truncated to a different page.
+[[test]]
+fn test_slug_from_path_rejects_overlong() -> i32
+    var path: [140]u8
+    path[0] = '/'
+    path[1] = 'w'
+    path[2] = 'i'
+    path[3] = 'k'
+    path[4] = 'i'
+    path[5] = '/'
+    for i in 6..140
+        path[i] = 'a'
+    var out: [128]u8
+    if slug_from_path(@path[0], 140, @out[0]) != -1
+        return 1
+    if slug_from_path(@path[0], 134, @out[0]) != 128
+        return 2
+    0

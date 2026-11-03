@@ -1,42 +1,47 @@
-# src/html_writer.ritz - Append-at-position writers for the HTML response buffer
+# src/html_writer.ritz - HTML appenders onto a growable ritzlib String
 #
-# Each writer copies into `buf` starting at `pos` and returns the position
-# just past what it wrote, so calls chain: `p = write_cstr(buf, p, c"...")`.
-# The byte copying and length scanning are ritzlib.str's (memcpy / strlen);
-# this module only adds the position bookkeeping (AGAST #1951).
+# Every nexus response is built in a String, which grows as needed, so
+# escaping can never write past a buffer (AGAST #1870).  Before that, these
+# appended into caller-sized fixed buffers with no bounds checks, and a page
+# of 8192 `"` (6 bytes each when escaped) wrote ~49 KB into 16 KB of stack.
 #
-# The caller owns `buf` and must size it for everything it appends.
+# The byte copying is ritzlib.string's (string_push_bytes); this module only
+# adds HTML escaping.  A failed grow (out of memory) leaves the String short,
+# never overruns it.
 
-import ritzlib.str { strlen, memcpy }
-
-
-# Append `len` bytes of `src`.
-pub fn write_bytes(buf: *u8, pos: i32, src: *u8, len: i32) -> i32
-    memcpy(buf + pos, src, len as i64)
-    return pos + len
+import ritzlib.string { String, string_push_bytes, string_push_cstr }
 
 
-# Append the NUL-terminated `src` (without its terminator).
-pub fn write_cstr(buf: *u8, pos: i32, src: *u8) -> i32
-    return write_bytes(buf, pos, src, strlen(src) as i32)
+# Append `len` bytes of `src`, verbatim.
+pub fn html_bytes(out: @&String, src: *u8, len: i32)
+    string_push_bytes(out, src, len as i64)
 
 
-# Append `len` bytes of `src`, escaping the HTML-special characters.
-pub fn write_escaped(buf: *u8, pos: i32, src: *u8, len: i32) -> i32
-    var p: i32 = pos
+# Append the NUL-terminated `src` (without its terminator), verbatim.
+pub fn html_cstr(out: @&String, src: *u8)
+    string_push_cstr(out, src)
+
+
+# Append `len` bytes of `src`, escaping the HTML-special characters.  Safe in
+# element text and in double- or single-quoted attribute values.
+pub fn html_escaped(out: @&String, src: *u8, len: i32)
+    # Copy runs of plain bytes in one push; escape the specials between them.
+    var run: i32 = 0
     for i in 0..len
         let c: u8 = *(src + i)
+        var esc: *u8 = null
         if c == '<'
-            p = write_cstr(buf, p, c"&lt;")
+            esc = c"&lt;"
         else if c == '>'
-            p = write_cstr(buf, p, c"&gt;")
+            esc = c"&gt;"
         else if c == '&'
-            p = write_cstr(buf, p, c"&amp;")
+            esc = c"&amp;"
         else if c == '"'
-            p = write_cstr(buf, p, c"&quot;")
+            esc = c"&quot;"
         else if c == '\''
-            p = write_cstr(buf, p, c"&#39;")
-        else
-            *(buf + p) = c
-            p += 1
-    return p
+            esc = c"&#39;"
+        if esc != null
+            string_push_bytes(out, src + run, (i - run) as i64)
+            string_push_cstr(out, esc)
+            run = i + 1
+    string_push_bytes(out, src + run, (len - run) as i64)

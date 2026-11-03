@@ -1,0 +1,196 @@
+# src/pages.ritz - Nexus HTML pages and HTTP headers, rendered into a String
+#
+# Each renderer appends a complete page to `out`, a growable ritzlib String,
+# so no input size can overrun a buffer (AGAST #1870: these were fixed
+# [16384]u8 / [8192]u8 / [4096]u8 stack buffers with no bounds checks).
+#
+# Every byte that did not come from this file is escaped: page content and
+# slugs (in text, hrefs and form actions alike).  Routes also validate slugs
+# to [a-z0-9-] (src/slug.ritz), so escaping a slug is defence in depth; the
+# index's slugs come from the store, which the router never saw.
+
+import ritzlib.string { String, string_push_i64 }
+
+import src.html_writer { html_cstr, html_bytes, html_escaped }
+
+
+# ============================================================================
+# Page chrome
+# ============================================================================
+
+# `title` is always a literal from this program, never request data.
+fn write_html_head(out: @&String, title: *u8)
+    html_cstr(out, c"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>")
+    html_cstr(out, title)
+    html_cstr(out, c"</title><style>")
+    html_cstr(out, c"body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.6}")
+    html_cstr(out, c"h1{color:#333}a{color:#0066cc}")
+    html_cstr(out, c".pages{list-style:none;padding:0}")
+    html_cstr(out, c".pages li{margin:.5rem 0;padding:.5rem;background:#f5f5f5;border-radius:4px}")
+    html_cstr(out, c".content{background:#f9f9f9;padding:1rem;border-radius:4px;margin:1rem 0;white-space:pre-wrap}")
+    html_cstr(out, c"textarea{width:100%;height:300px;font-family:monospace;padding:.5rem}")
+    html_cstr(out, c"input[type=text]{width:100%;padding:.5rem;margin:.5rem 0}")
+    html_cstr(out, c"button{background:#0066cc;color:white;border:none;padding:.5rem 1rem;cursor:pointer;border-radius:4px}")
+    html_cstr(out, c"button:hover{background:#0055aa}")
+    html_cstr(out, c".nav{margin-bottom:1rem}")
+    html_cstr(out, c".actions{margin-top:1rem}")
+    html_cstr(out, c".success{background:#d4edda;padding:1rem;border-radius:4px;margin:1rem 0}")
+    html_cstr(out, c"</style></head><body>")
+
+
+fn write_html_footer(out: @&String)
+    html_cstr(out, c"<hr><small>Powered by <a href=\"https://ritz-lang.org\">Ritz</a> | ")
+    html_cstr(out, c"<a href=\"/\">Home</a></small></body></html>")
+
+
+# ============================================================================
+# Pages
+# ============================================================================
+
+# GET / - `slugs` is wiki_store_list's output: slugs each ending in '\n',
+# `slugs_len` bytes long (a NUL also ends it).
+pub fn render_index_page(out: @&String, slugs: *u8, slugs_len: i32)
+    write_html_head(out, c"Nexus Wiki")
+    html_cstr(out, c"<h1>Nexus Wiki</h1>")
+    html_cstr(out, c"<p>The Ritz Knowledge Base</p>")
+    html_cstr(out, c"<nav class=\"nav\"><a href=\"/wiki/new\">+ New Page</a></nav>")
+    html_cstr(out, c"<h2>Pages</h2>")
+    html_cstr(out, c"<ul class=\"pages\">")
+
+    var listed: i32 = 0
+    var pos: i32 = 0
+    var start: i32 = 0
+    while pos < slugs_len and *(slugs + pos) != 0
+        if *(slugs + pos) == '\n'
+            if pos > start
+                html_cstr(out, c"<li><a href=\"/wiki/")
+                html_escaped(out, slugs + start, pos - start)
+                html_cstr(out, c"\">")
+                html_escaped(out, slugs + start, pos - start)
+                html_cstr(out, c"</a></li>")
+                listed += 1
+            start = pos + 1
+        pos += 1
+
+    if listed == 0
+        html_cstr(out, c"<li><em>No pages yet. <a href=\"/wiki/new\">Create one!</a></em></li>")
+
+    html_cstr(out, c"</ul>")
+    write_html_footer(out)
+
+
+# 404 for a well-formed slug with no page, offering to create one.
+pub fn render_not_found_page(out: @&String, slug: *u8, slug_len: i32)
+    write_html_head(out, c"Not Found - Nexus Wiki")
+    html_cstr(out, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+    html_cstr(out, c"<h1>Page Not Found</h1>")
+    html_cstr(out, c"<p>No page exists with the slug <code>")
+    html_escaped(out, slug, slug_len)
+    html_cstr(out, c"</code>.</p>")
+    html_cstr(out, c"<p><a href=\"/wiki/new\">Create a new page &rarr;</a></p>")
+    write_html_footer(out)
+
+
+# GET /wiki/:slug - content is rendered as escaped pre-formatted text
+# (`white-space: pre-wrap` in the head); Markdown rendering is a follow-up.
+pub fn render_view_page(out: @&String, slug: *u8, slug_len: i32, content: *u8, content_len: i32)
+    write_html_head(out, c"Nexus Wiki")
+    html_cstr(out, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+    html_cstr(out, c"<h1>")
+    html_escaped(out, slug, slug_len)
+    html_cstr(out, c"</h1>")
+    html_cstr(out, c"<div class=\"content\">")
+    html_escaped(out, content, content_len)
+    html_cstr(out, c"</div>")
+    html_cstr(out, c"<div class=\"actions\">")
+    html_cstr(out, c"<a href=\"/wiki/")
+    html_escaped(out, slug, slug_len)
+    html_cstr(out, c"/edit\">Edit this page</a>")
+    html_cstr(out, c"</div>")
+    write_html_footer(out)
+
+
+# GET /wiki/new
+pub fn render_new_page(out: @&String)
+    write_html_head(out, c"New Page - Nexus Wiki")
+    html_cstr(out, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+    html_cstr(out, c"<h1>New Page</h1>")
+    html_cstr(out, c"<form method=\"POST\" action=\"/wiki\">")
+    html_cstr(out, c"<p><label>Slug (URL-friendly name):</label></p>")
+    html_cstr(out, c"<input type=\"text\" name=\"slug\" placeholder=\"my-page-name\" required pattern=\"[a-z0-9-]+\">")
+    html_cstr(out, c"<p><label>Content:</label></p>")
+    html_cstr(out, c"<textarea name=\"content\" placeholder=\"Enter your page content here...\"></textarea>")
+    html_cstr(out, c"<p><button type=\"submit\">Create Page</button></p>")
+    html_cstr(out, c"</form>")
+    write_html_footer(out)
+
+
+# GET /wiki/:slug/edit - the form pre-populated with the current content.
+pub fn render_edit_page(out: @&String, slug: *u8, slug_len: i32, content: *u8, content_len: i32)
+    write_html_head(out, c"Edit - Nexus Wiki")
+    html_cstr(out, c"<nav class=\"nav\"><a href=\"/wiki/")
+    html_escaped(out, slug, slug_len)
+    html_cstr(out, c"\">&larr; ")
+    html_escaped(out, slug, slug_len)
+    html_cstr(out, c"</a></nav>")
+    html_cstr(out, c"<h1>Edit: ")
+    html_escaped(out, slug, slug_len)
+    html_cstr(out, c"</h1>")
+    html_cstr(out, c"<form method=\"POST\" action=\"/wiki/")
+    html_escaped(out, slug, slug_len)
+    html_cstr(out, c"\">")
+    html_cstr(out, c"<p><label>Content:</label></p>")
+    html_cstr(out, c"<textarea name=\"content\">")
+    html_escaped(out, content, content_len)
+    html_cstr(out, c"</textarea>")
+    html_cstr(out, c"<p><button type=\"submit\">Save</button></p>")
+    html_cstr(out, c"</form>")
+    write_html_footer(out)
+
+
+# A styled error page.  `title` and `message` are literals from this program.
+pub fn render_error_page(out: @&String, title: *u8, message: *u8)
+    write_html_head(out, title)
+    html_cstr(out, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
+    html_cstr(out, c"<h1>")
+    html_cstr(out, title)
+    html_cstr(out, c"</h1>")
+    html_cstr(out, c"<p>")
+    html_cstr(out, message)
+    html_cstr(out, c"</p>")
+    write_html_footer(out)
+
+
+# ============================================================================
+# HTTP headers
+# ============================================================================
+
+pub fn push_headers(out: @&String, status: i32, content_type: *u8, content_len: i64)
+    html_cstr(out, c"HTTP/1.1 ")
+    if status == 200
+        html_cstr(out, c"200 OK")
+    else if status == 400
+        html_cstr(out, c"400 Bad Request")
+    else if status == 404
+        html_cstr(out, c"404 Not Found")
+    else if status == 409
+        html_cstr(out, c"409 Conflict")
+    else if status == 500
+        html_cstr(out, c"500 Internal Server Error")
+    else
+        html_cstr(out, c"200 OK")
+    html_cstr(out, c"\r\nContent-Type: ")
+    html_cstr(out, content_type)
+    html_cstr(out, c"\r\nContent-Length: ")
+    string_push_i64(out, content_len)
+    html_cstr(out, c"\r\nConnection: keep-alive\r\n\r\n")
+
+
+# 303 See Other (POST -> GET, RFC 7231 §6.4.4) to /wiki/<slug>.  303 forces
+# the user agent onto GET, which every wiki create/update flow wants; 302
+# leaves method preservation implementation-defined.  The slug has been
+# validated to [a-z0-9-], so it needs no URL- or header-escaping.
+pub fn push_redirect_to_page(out: @&String, slug: *u8, slug_len: i32)
+    html_cstr(out, c"HTTP/1.1 303 See Other\r\nLocation: /wiki/")
+    html_bytes(out, slug, slug_len)
+    html_cstr(out, c"\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")

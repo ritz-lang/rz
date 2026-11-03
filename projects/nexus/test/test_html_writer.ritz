@@ -1,94 +1,101 @@
-# test/test_html_writer.ritz - HTML buffer writer tests
+# test/test_html_writer.ritz - HTML String appender tests
 #
-# write_cstr / write_bytes / write_escaped append into a byte buffer at a
-# position and return the new position (AGAST #1951: built on ritzlib.str,
-# not hand-rolled byte loops).
+# html_cstr / html_bytes / html_escaped append onto a growable ritzlib
+# String (AGAST #1870: the old fixed-buffer writers never bound-checked, so
+# escaping 8192 bytes of `"` wrote ~49 KB into a 16 KB stack buffer).
 
-import ritzlib.str { strneq }
+import ritzlib.str { strneq, strlen }
+import ritzlib.string { String, string_new, string_drop, string_len, string_as_ptr, string_push_cstr }
 
-import html_writer { write_cstr, write_bytes, write_escaped }
+import html_writer { html_cstr, html_bytes, html_escaped }
 
 
-# 1 if buf[0..len] equals the NUL-terminated `want` exactly, else 0.
-fn buf_is(buf: *u8, len: i32, want: *u8) -> i32
-    var n: i32 = 0
-    while *(want + n) != 0
-        n += 1
-    if n != len
+# 1 if `s` equals the NUL-terminated `want` exactly, else 0.
+fn str_is(s: @&String, want: *u8) -> i32
+    let n: i64 = strlen(want)
+    if string_len(s) != n
         return 0
-    if strneq(buf, want, len as i64) == 0
+    if strneq(string_as_ptr(s), want, n) == 0
         return 0
     1
 
 
 [[test]]
-fn test_write_cstr_appends_and_returns_end() -> i32
-    var buf: [32]u8
-    var p: i32 = write_cstr(@buf[0], 0, c"ab")
-    p = write_cstr(@buf[0], p, c"cde")
-    if p != 5
-        return 1
-    if buf_is(@buf[0], p, c"abcde") == 0
-        return 2
-    0
+fn test_html_cstr_appends() -> i32
+    var s: String = string_new()
+    html_cstr(@s, c"ab")
+    html_cstr(@s, c"cde")
+    var rc: i32 = 0
+    if str_is(@s, c"abcde") == 0
+        rc = 1
+    string_drop(@s)
+    rc
 
 
 [[test]]
-fn test_write_cstr_empty_is_noop() -> i32
-    var buf: [8]u8
-    buf[0] = 'x'
-    let p = write_cstr(@buf[0], 0, c"")
-    if p != 0
-        return 1
-    if buf[0] != 'x'
-        return 2
-    0
+fn test_html_cstr_empty_is_noop() -> i32
+    var s: String = string_new()
+    html_cstr(@s, c"")
+    var rc: i32 = 0
+    if string_len(@s) != 0
+        rc = 1
+    string_drop(@s)
+    rc
 
 
 [[test]]
-fn test_write_bytes_copies_exactly_len() -> i32
-    var buf: [16]u8
-    buf[3] = 'z'
-    # Copy 3 bytes of a longer string; the 4th byte must be untouched.
-    let p = write_bytes(@buf[0], 0, c"hello", 3)
-    if p != 3
-        return 1
-    if buf_is(@buf[0], p, c"hel") == 0
-        return 2
-    if buf[3] != 'z'
-        return 3
-    0
+fn test_html_bytes_copies_exactly_len() -> i32
+    var s: String = string_new()
+    html_bytes(@s, c"hello", 3)
+    var rc: i32 = 0
+    if str_is(@s, c"hel") == 0
+        rc = 1
+    string_drop(@s)
+    rc
 
 
 [[test]]
-fn test_write_bytes_at_offset() -> i32
-    var buf: [16]u8
-    var p: i32 = write_cstr(@buf[0], 0, c"<")
-    p = write_bytes(@buf[0], p, c"abc", 2)
-    if p != 3
-        return 1
-    if buf_is(@buf[0], p, c"<ab") == 0
-        return 2
-    0
-
-
-[[test]]
-fn test_write_escaped_escapes_html_specials() -> i32
-    var buf: [64]u8
+fn test_html_escaped_escapes_html_specials() -> i32
+    var s: String = string_new()
     let src = c"<a href='x'>&\"</a>"
-    var n: i32 = 0
-    while *(src + n) != 0
-        n += 1
-    let p = write_escaped(@buf[0], 0, src, n)
-    if buf_is(@buf[0], p, c"&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;") == 0
-        return 1
-    0
+    html_escaped(@s, src, strlen(src) as i32)
+    var rc: i32 = 0
+    if str_is(@s, c"&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;") == 0
+        rc = 1
+    string_drop(@s)
+    rc
 
 
 [[test]]
-fn test_write_escaped_passes_plain_bytes() -> i32
-    var buf: [16]u8
-    let p = write_escaped(@buf[0], 0, c"plain-text", 10)
-    if buf_is(@buf[0], p, c"plain-text") == 0
-        return 1
-    0
+fn test_html_escaped_passes_plain_bytes() -> i32
+    var s: String = string_new()
+    string_push_cstr(@s, c"<")
+    html_escaped(@s, c"plain-text", 10)
+    var rc: i32 = 0
+    if str_is(@s, c"<plain-text") == 0
+        rc = 1
+    string_drop(@s)
+    rc
+
+
+# The #1870 overflow input: a maximal (8192-byte) page of `"`, every byte
+# of which expands to the 6-byte `&quot;`.  The String must grow to hold
+# all 49152 bytes; the old [16384]u8 buffer took 16 KB of it.
+[[test]]
+fn test_html_escaped_grows_past_old_fixed_buffer() -> i32
+    var src: [8192]u8
+    for i in 0..8192
+        src[i] = '"'
+    var s: String = string_new()
+    html_escaped(@s, @src[0], 8192)
+    var rc: i32 = 0
+    if string_len(@s) != 49152
+        rc = 1
+    else
+        let p: *u8 = string_as_ptr(@s)
+        for i in 0..8192
+            if strneq(p + (i * 6) as i64, c"&quot;", 6) == 0
+                rc = 2
+                break
+    string_drop(@s)
+    rc

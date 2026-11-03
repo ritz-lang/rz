@@ -25,6 +25,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.string { String, string_new, string_drop, string_len, string_as_ptr, string_push_cstr }
 
 import zeus.worker { WorkerContext }
 import zeus.worker { worker_init, worker_destroy }
@@ -40,7 +41,10 @@ import zeus.ring { response_slot_set_body, response_slot_set_headers }
 import zeus.ring { RESP_FLAG_COMPLETE }
 
 import src.store
-import src.html_writer { write_cstr, write_bytes, write_escaped }
+import src.slug { MAX_SLUG, path_starts_with, validate_slug, slug_from_path }
+import src.pages { render_index_page, render_not_found_page, render_view_page }
+import src.pages { render_new_page, render_edit_page, render_error_page }
+import src.pages { push_headers, push_redirect_to_page }
 
 
 # ============================================================================
@@ -55,38 +59,6 @@ const SHM_FD: i32 = 3  # Zeus always passes shm fd as fd 3
 # ============================================================================
 
 # Using ritzlib.io: prints, print_int are already imported
-
-
-# ============================================================================
-# HTML Templates
-# ============================================================================
-
-fn write_html_head(buf: *u8, pos: i32, title: *u8) -> i32
-    var p: i32 = pos
-    p = write_cstr(buf, p, c"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>")
-    p = write_cstr(buf, p, title)
-    p = write_cstr(buf, p, c"</title><style>")
-    p = write_cstr(buf, p, c"body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.6}")
-    p = write_cstr(buf, p, c"h1{color:#333}a{color:#0066cc}")
-    p = write_cstr(buf, p, c".pages{list-style:none;padding:0}")
-    p = write_cstr(buf, p, c".pages li{margin:.5rem 0;padding:.5rem;background:#f5f5f5;border-radius:4px}")
-    p = write_cstr(buf, p, c".content{background:#f9f9f9;padding:1rem;border-radius:4px;margin:1rem 0;white-space:pre-wrap}")
-    p = write_cstr(buf, p, c"textarea{width:100%;height:300px;font-family:monospace;padding:.5rem}")
-    p = write_cstr(buf, p, c"input[type=text]{width:100%;padding:.5rem;margin:.5rem 0}")
-    p = write_cstr(buf, p, c"button{background:#0066cc;color:white;border:none;padding:.5rem 1rem;cursor:pointer;border-radius:4px}")
-    p = write_cstr(buf, p, c"button:hover{background:#0055aa}")
-    p = write_cstr(buf, p, c".nav{margin-bottom:1rem}")
-    p = write_cstr(buf, p, c".actions{margin-top:1rem}")
-    p = write_cstr(buf, p, c".success{background:#d4edda;padding:1rem;border-radius:4px;margin:1rem 0}")
-    p = write_cstr(buf, p, c"</style></head><body>")
-    return p
-
-
-fn write_html_footer(buf: *u8, pos: i32) -> i32
-    var p: i32 = pos
-    p = write_cstr(buf, p, c"<hr><small>Powered by <a href=\"https://ritz-lang.org\">Ritz</a> | ")
-    p = write_cstr(buf, p, c"<a href=\"/\">Home</a></small></body></html>")
-    return p
 
 
 # ============================================================================
@@ -173,137 +145,90 @@ fn parse_form_field(body: *u8, body_len: i32, field: *u8, value_out: *u8, max_le
 
 
 # ============================================================================
-# Routing Helpers
+# Response plumbing
+#
+# Pages and headers are rendered into growable Strings (src/pages.ritz), then
+# copied once into the worker's response arena.  No response is ever built in
+# a fixed-size buffer (AGAST #1870).
 # ============================================================================
 
-# Check if path starts with prefix
-fn path_starts_with(path: *u8, path_len: i32, prefix: *u8) -> i32
-    let prefix_len: i32 = strlen(prefix) as i32
-    if path_len < prefix_len
-        return 0
-    for i in 0..prefix_len
-        if *(path + i) != *(prefix + i)
-            return 0
-    return 1
+# Copy `len` bytes into a fresh arena block; null if the arena is full.
+fn arena_copy(ctx: *WorkerContext, src: *u8, len: i64) -> *u8
+    let dst: *u8 = worker_alloc_response_data(ctx, len)
+    if dst != null
+        memcpy(dst, src, len)
+    return dst
 
 
-# Extract parameter from path: /wiki/:slug -> slug
-fn extract_slug(path: *u8, path_len: i32, slug_out: *u8, max_len: i32) -> i32
-    # Skip "/wiki/"
-    if path_len < 7
+# Commit `headers` + `body` (either may be empty) as the response.  If the
+# arena cannot hold them, or the headers overflow the slot's u16 length, the
+# response degrades to a bare 500 with no body rather than a truncated page.
+fn send_raw(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, headers: @&String, body: @&String) -> i32
+    let headers_len: i64 = string_len(headers)
+    let body_len: i64 = string_len(body)
+    var h: *u8 = null
+    var b: *u8 = null
+    var ok: i32 = 1
+    if headers_len > 65535 or body_len > 4294967295
+        ok = 0
+    if ok == 1
+        h = arena_copy(ctx, string_as_ptr(headers), headers_len)
+        if h == null
+            ok = 0
+    if ok == 1 and body_len > 0
+        b = arena_copy(ctx, string_as_ptr(body), body_len)
+        if b == null
+            ok = 0
+
+    if ok == 0
+        response_slot_set_status(resp, 500)
+        response_slot_set_headers(resp, 0, 0)
+        response_slot_set_body(resp, 0, 0)
+        response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
         return -1
-    if path_starts_with(path, path_len, c"/wiki/") == 0
-        return -1
 
-    var start: i32 = 6
-    var end: i32 = start
-
-    # Find end of slug (next '/' or end of path)
-    while end < path_len and *(path + end) != 47
-        end += 1
-
-    var len: i32 = end - start
-    if len > max_len
-        len = max_len
-    if len == 0
-        return -1
-
-    for i in 0..len
-        *(slug_out + i) = *(path + start + i)
-
-    return len
-
-
-# Validate slug bytes: lowercase ASCII letters, digits, and hyphen only.
-# Returns 1 if valid, 0 otherwise.  Empty slugs and slugs longer than 128
-# bytes are rejected.  This guards against directory traversal, URL
-# escaping ambiguities, and DB key abuse on user-supplied input.
-fn validate_slug(slug: *u8, slug_len: i32) -> i32
-    if slug_len <= 0
-        return 0
-    if slug_len > 128
-        return 0
-    for i in 0..slug_len
-        let c: u8 = *(slug + i)
-        var is_lower: i32 = 0
-        if c >= 'a' and c <= 'z'
-            is_lower = 1
-        else if c >= '0' and c <= '9'
-            is_lower = 1
-        else if c == '-'
-            is_lower = 1
-        if is_lower == 0
-            return 0
-    return 1
-
-
-# ============================================================================
-# Response Building
-# ============================================================================
-
-# Build HTTP response headers
-fn build_headers(buf: *u8, status: i32, content_type: *u8, content_len: i32) -> i32
-    var p: i32 = 0
-
-    # Status line
-    p = write_cstr(buf, p, c"HTTP/1.1 ")
-    if status == 200
-        p = write_cstr(buf, p, c"200 OK")
-    else if status == 301
-        p = write_cstr(buf, p, c"301 Moved Permanently")
-    else if status == 302
-        p = write_cstr(buf, p, c"302 Found")
-    else if status == 400
-        p = write_cstr(buf, p, c"400 Bad Request")
-    else if status == 404
-        p = write_cstr(buf, p, c"404 Not Found")
-    else if status == 500
-        p = write_cstr(buf, p, c"500 Internal Server Error")
+    response_slot_set_status(resp, status as u16)
+    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, h) as u32, headers_len as u16)
+    if b == null
+        response_slot_set_body(resp, 0, 0)
     else
-        p = write_cstr(buf, p, c"200 OK")
-
-    p = write_cstr(buf, p, c"\r\nContent-Type: ")
-    p = write_cstr(buf, p, content_type)
-    p = write_cstr(buf, p, c"\r\nContent-Length: ")
-
-    # Write content length as string
-    var len_buf: [12]u8
-    var len_i: i32 = 0
-    var len_v: i32 = content_len
-    if len_v == 0
-        len_buf[0] = 48
-        len_i = 1
-    else
-        var tmp: [12]u8
-        var tmp_i: i32 = 0
-        while len_v > 0
-            tmp[tmp_i] = (0x30 + (len_v % 10)) as u8
-            len_v = len_v / 10
-            tmp_i += 1
-        while tmp_i > 0
-            tmp_i -= 1
-            len_buf[len_i] = tmp[tmp_i]
-            len_i += 1
-
-    p = write_bytes(buf, p, @len_buf[0], len_i)
-    p = write_cstr(buf, p, c"\r\nConnection: keep-alive\r\n\r\n")
-
-    return p
+        response_slot_set_body(resp, worker_ptr_to_offset(ctx, b) as u32, body_len as u32)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+    return 0
 
 
-fn build_redirect_headers(buf: *u8, location: *u8) -> i32
-    # 303 See Other (POST → GET): RFC 7231 §6.4.4.  Use this for the
-    # post-form redirect so the user agent unambiguously switches to
-    # GET on the redirect target.  302 Found leaves method preservation
-    # implementation-defined — curl re-POSTs by default, browsers
-    # historically downgrade to GET, but the spec lets either happen.
-    # 303 forces GET, which is what every wiki create/update flow
-    # actually wants ("save my form, then show me the resulting page").
-    var p: i32 = 0
-    p = write_cstr(buf, p, c"HTTP/1.1 303 See Other\r\nLocation: ")
-    p = write_cstr(buf, p, location)
-    p = write_cstr(buf, p, c"\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
-    return p
+# Send `body` with status and content type, then free it.
+fn send_body(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, content_type: *u8, body: @&String) -> i32
+    var headers: String = string_new()
+    push_headers(@headers, status, content_type, string_len(body))
+    let rc: i32 = send_raw(ctx, resp, status, @headers, body)
+    string_drop(@headers)
+    string_drop(body)
+    return rc
+
+
+fn send_text(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, text: *u8) -> i32
+    var body: String = string_new()
+    string_push_cstr(@body, text)
+    return send_body(ctx, resp, status, c"text/plain", @body)
+
+
+# 303 to /wiki/<slug>; the slug must already be validated.
+fn send_redirect(ctx: *WorkerContext, resp: *ResponseSlot, slug: *u8, slug_len: i32) -> i32
+    var headers: String = string_new()
+    var body: String = string_new()
+    push_redirect_to_page(@headers, slug, slug_len)
+    let rc: i32 = send_raw(ctx, resp, 303, @headers, @body)
+    string_drop(@headers)
+    string_drop(@body)
+    return rc
+
+
+# A styled HTML error page.  `title` and `message` are literals.
+fn send_error_page(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, title: *u8, message: *u8) -> i32
+    var body: String = string_new()
+    render_error_page(@body, title, message)
+    return send_body(ctx, resp, status, c"text/html; charset=utf-8", @body)
 
 
 # ============================================================================
@@ -311,297 +236,65 @@ fn build_redirect_headers(buf: *u8, location: *u8) -> i32
 # ============================================================================
 
 fn handle_index(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    var body: [8192]u8
-    var p: i32 = 0
-
-    p = write_html_head(@body[0], p, c"Nexus Wiki")
-    p = write_cstr(@body[0], p, c"<h1>Nexus Wiki</h1>")
-    p = write_cstr(@body[0], p, c"<p>The Ritz Knowledge Base</p>")
-    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/wiki/new\">+ New Page</a></nav>")
-    p = write_cstr(@body[0], p, c"<h2>Pages</h2>")
-    p = write_cstr(@body[0], p, c"<ul class=\"pages\">")
-
+    # wiki_store_list writes '\n'-terminated slugs but no end marker, so
+    # zero the buffer: the renderer stops at the first NUL.
     var slugs: [2048]u8
-    let count: i32 = wiki_store_list(@slugs[0], 2048)
-
-    if count == 0
-        p = write_cstr(@body[0], p, c"<li><em>No pages yet. <a href=\"/wiki/new\">Create one!</a></em></li>")
-    else
-        var pos: i32 = 0
-        var start: i32 = 0
-        while pos < 2048 and slugs[pos] != 0
-            if slugs[pos] == '\n'
-                if pos > start
-                    p = write_cstr(@body[0], p, c"<li><a href=\"/wiki/")
-                    p = write_bytes(@body[0], p, @slugs[start], pos - start)
-                    p = write_cstr(@body[0], p, c"\">")
-                    p = write_bytes(@body[0], p, @slugs[start], pos - start)
-                    p = write_cstr(@body[0], p, c"</a></li>")
-                start = pos + 1
-            pos += 1
-
-    p = write_cstr(@body[0], p, c"</ul>")
-    p = write_html_footer(@body[0], p)
-
-    var headers: [256]u8
-    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
-
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-    for i in 0..p
-        *(arena_body + i) = body[i]
-
-    response_slot_set_status(resp, 200)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-
-    return 0
+    memset(@slugs[0], 0, 2048)
+    wiki_store_list(@slugs[0], 2048)
+    var body: String = string_new()
+    render_index_page(@body, @slugs[0], 2048)
+    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @body)
 
 
 fn handle_health(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    let body_text: *u8 = c"OK"
-    let body_len: i32 = 2
-
-    var headers: [256]u8
-    let headers_len: i32 = build_headers(@headers[0], 200, c"text/plain", body_len)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    let arena_body: *u8 = worker_alloc_response_data(ctx, body_len as i64)
-
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-    for i in 0..body_len
-        *(arena_body + i) = *(body_text + i)
-
-    response_slot_set_status(resp, 200)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, body_len as u32)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-
-    return 0
+    return send_text(ctx, resp, 200, c"OK")
 
 
 fn handle_not_found(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    let body_text: *u8 = c"404 Not Found"
-    let body_len: i32 = 13
-
-    var headers: [256]u8
-    let headers_len: i32 = build_headers(@headers[0], 404, c"text/plain", body_len)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    let arena_body: *u8 = worker_alloc_response_data(ctx, body_len as i64)
-
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-    for i in 0..body_len
-        *(arena_body + i) = *(body_text + i)
-
-    response_slot_set_status(resp, 404)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, body_len as u32)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-
-    return 0
+    return send_text(ctx, resp, 404, c"404 Not Found")
 
 
 # GET /wiki/:slug - View a wiki page
 #
-# Looks up the page in the store (mausoleum or fallback), renders the markdown
-# content inside the standard Nexus chrome.  404s with a styled page if the
-# slug is missing.  This is the handler that finally closes the
-# valet → zeus → nexus → mausoleum loop end-to-end (mausoleum integration via
-# store.ritz; falls back to seeded in-memory pages if mausoleum isn't reachable).
+# Looks up the page in the store (mausoleum or fallback) and renders its
+# content inside the standard Nexus chrome.  A slug outside [a-z0-9-]{1,128}
+# is a plain 404; a valid slug with no page gets a styled 404 offering to
+# create it.
 fn handle_wiki_view(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let path: *u8 = worker_get_request_path(ctx, req)
     let path_len: i32 = req.path_len as i32
 
     var slug: [128]u8
-    let slug_len: i32 = extract_slug(path, path_len, @slug[0], 128)
-
+    let slug_len: i32 = slug_from_path(path, path_len, @slug[0])
     if slug_len <= 0
         return handle_not_found(ctx, req, resp)
 
-    # Look up content in the store
     var content: [8192]u8
     var content_len: i32 = 0
-    let found: i32 = wiki_store_get(@slug[0], slug_len, @content[0], @content_len)
+    var body: String = string_new()
+    if wiki_store_get(@slug[0], slug_len, @content[0], @content_len) == 0
+        render_not_found_page(@body, @slug[0], slug_len)
+        return send_body(ctx, resp, 404, c"text/html; charset=utf-8", @body)
 
-    if found == 0
-        # Render styled 404 with offer to create
-        var nf_body: [4096]u8
-        var np: i32 = 0
-
-        np = write_html_head(@nf_body[0], np, c"Not Found - Nexus Wiki")
-        np = write_cstr(@nf_body[0], np, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
-        np = write_cstr(@nf_body[0], np, c"<h1>Page Not Found</h1>")
-        np = write_cstr(@nf_body[0], np, c"<p>No page exists with the slug <code>")
-        np = write_escaped(@nf_body[0], np, @slug[0], slug_len)
-        np = write_cstr(@nf_body[0], np, c"</code>.</p>")
-        np = write_cstr(@nf_body[0], np, c"<p><a href=\"/wiki/new\">Create a new page &rarr;</a></p>")
-        np = write_html_footer(@nf_body[0], np)
-
-        var nf_headers: [256]u8
-        let nf_headers_len: i32 = build_headers(@nf_headers[0], 404, c"text/html; charset=utf-8", np)
-
-        let nf_arena_h: *u8 = worker_alloc_response_data(ctx, nf_headers_len as i64)
-        let nf_arena_b: *u8 = worker_alloc_response_data(ctx, np as i64)
-
-        for i in 0..nf_headers_len
-            *(nf_arena_h + i) = nf_headers[i]
-        for i in 0..np
-            *(nf_arena_b + i) = nf_body[i]
-
-        response_slot_set_status(resp, 404)
-        response_slot_set_headers(resp, worker_ptr_to_offset(ctx, nf_arena_h) as u32, nf_headers_len as u16)
-        response_slot_set_body(resp, worker_ptr_to_offset(ctx, nf_arena_b) as u32, np as u32)
-        response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-        return 0
-
-    # Render the page
-    var body: [16384]u8
-    var p: i32 = 0
-
-    p = write_html_head(@body[0], p, c"Nexus Wiki")
-    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
-    p = write_cstr(@body[0], p, c"<h1>")
-    p = write_escaped(@body[0], p, @slug[0], slug_len)
-    p = write_cstr(@body[0], p, c"</h1>")
-    p = write_cstr(@body[0], p, c"<div class=\"content\">")
-    # Render content as escaped pre-formatted text.  Markdown rendering is a
-    # follow-up — for now `white-space: pre-wrap` (set in head) preserves
-    # line breaks, and write_escaped neutralises any HTML in the source.
-    p = write_escaped(@body[0], p, @content[0], content_len)
-    p = write_cstr(@body[0], p, c"</div>")
-    p = write_cstr(@body[0], p, c"<div class=\"actions\">")
-    p = write_cstr(@body[0], p, c"<a href=\"/wiki/")
-    p = write_bytes(@body[0], p, @slug[0], slug_len)
-    p = write_cstr(@body[0], p, c"/edit\">Edit this page</a>")
-    p = write_cstr(@body[0], p, c"</div>")
-    p = write_html_footer(@body[0], p)
-
-    var headers: [256]u8
-    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
-
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-    for i in 0..p
-        *(arena_body + i) = body[i]
-
-    response_slot_set_status(resp, 200)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-
-    return 0
+    render_view_page(@body, @slug[0], slug_len, @content[0], content_len)
+    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @body)
 
 
 fn handle_wiki_new(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    var body: [4096]u8
-    var p: i32 = 0
-
-    p = write_html_head(@body[0], p, c"New Page - Nexus Wiki")
-    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
-    p = write_cstr(@body[0], p, c"<h1>New Page</h1>")
-    p = write_cstr(@body[0], p, c"<form method=\"POST\" action=\"/wiki\">")
-    p = write_cstr(@body[0], p, c"<p><label>Slug (URL-friendly name):</label></p>")
-    p = write_cstr(@body[0], p, c"<input type=\"text\" name=\"slug\" placeholder=\"my-page-name\" required pattern=\"[a-z0-9-]+\">")
-    p = write_cstr(@body[0], p, c"<p><label>Content:</label></p>")
-    p = write_cstr(@body[0], p, c"<textarea name=\"content\" placeholder=\"Enter your page content here...\"></textarea>")
-    p = write_cstr(@body[0], p, c"<p><button type=\"submit\">Create Page</button></p>")
-    p = write_cstr(@body[0], p, c"</form>")
-    p = write_html_footer(@body[0], p)
-
-    var headers: [256]u8
-    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
-
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-    for i in 0..p
-        *(arena_body + i) = body[i]
-
-    response_slot_set_status(resp, 200)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-
-    return 0
-
-
-# ============================================================================
-# Response helpers — used by the POST handlers below for short replies
-# and redirects.  Each takes ownership of the response slot and copies
-# the precomputed bytes into the worker's data arena.
-# ============================================================================
-
-fn send_redirect(ctx: *WorkerContext, resp: *ResponseSlot, location: *u8) -> i32
-    var headers: [256]u8
-    let headers_len: i32 = build_redirect_headers(@headers[0], location)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-
-    response_slot_set_status(resp, 303)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, 0, 0)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-    return 0
-
-
-# Render a styled HTML error page with the given status, title and body
-# message.  Used by POST handlers when validation fails (400) or when a
-# duplicate slug is rejected (409).
-fn send_error_page(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, title: *u8, message: *u8) -> i32
-    var body: [4096]u8
-    var p: i32 = 0
-
-    p = write_html_head(@body[0], p, title)
-    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/\">&larr; Home</a></nav>")
-    p = write_cstr(@body[0], p, c"<h1>")
-    p = write_cstr(@body[0], p, title)
-    p = write_cstr(@body[0], p, c"</h1>")
-    p = write_cstr(@body[0], p, c"<p>")
-    p = write_cstr(@body[0], p, message)
-    p = write_cstr(@body[0], p, c"</p>")
-    p = write_html_footer(@body[0], p)
-
-    var headers: [256]u8
-    let headers_len: i32 = build_headers(@headers[0], status, c"text/html; charset=utf-8", p)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
-
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-    for i in 0..p
-        *(arena_body + i) = body[i]
-
-    response_slot_set_status(resp, status)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-    return 0
+    var body: String = string_new()
+    render_new_page(@body)
+    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @body)
 
 
 # POST /wiki - Create a new wiki page from form data.
 #
 # Body shape: application/x-www-form-urlencoded with fields `slug` and
 # `content`.  Both are URL-decoded by parse_form_field.  Slug is then
-# validated against [a-z0-9-]+; content has no character restrictions
-# beyond a length cap.  If a page with the slug already exists we
-# refuse with 409 rather than silently overwriting — use POST
-# /wiki/:slug for explicit updates.  On success we 302-redirect to the
-# new page so the browser ends up on a GET.
+# validated against [a-z0-9-]{1,128}; content has no character restrictions
+# beyond a length cap.  If a page with the slug already exists we refuse
+# with 409 rather than silently overwriting — use POST /wiki/:slug for
+# explicit updates.  On success we 303-redirect to the new page so the
+# browser ends up on a GET.
 fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let body_ptr: *u8 = worker_get_request_body(ctx, req)
     let body_len: i32 = req.body_len as i32
@@ -609,8 +302,10 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if body_len <= 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Empty request body.")
 
-    var slug: [128]u8
-    let slug_len: i32 = parse_form_field(body_ptr, body_len, c"slug", @slug[0], 128)
+    # One byte past MAX_SLUG, so an over-long slug fails validation instead
+    # of being truncated to a valid, different one.
+    var slug: [129]u8
+    let slug_len: i32 = parse_form_field(body_ptr, body_len, c"slug", @slug[0], MAX_SLUG + 1)
     if slug_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'slug' field.")
     if validate_slug(@slug[0], slug_len) == 0
@@ -627,17 +322,10 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if wiki_store_get(@slug[0], slug_len, @probe[0], @probe_len) == 1
         return send_error_page(ctx, resp, 409, c"Slug Already Exists", c"A page with that slug already exists. Edit it from its page, or pick a different slug.")
 
-    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
-    if saved == 0
+    if wiki_store_save(@slug[0], slug_len, @content[0], content_len) == 0
         return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the new page.")
 
-    # Build redirect URL: /wiki/<slug>
-    var location: [200]u8
-    var lp: i32 = 0
-    lp = write_cstr(@location[0], lp, c"/wiki/")
-    lp = write_bytes(@location[0], lp, @slug[0], slug_len)
-    location[lp] = 0  # null terminate for build_redirect_headers
-    return send_redirect(ctx, resp, @location[0])
+    return send_redirect(ctx, resp, @slug[0], slug_len)
 
 
 # POST /wiki/:slug - Update an existing page (also creates if missing).
@@ -650,10 +338,8 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     let path_len: i32 = req.path_len as i32
 
     var slug: [128]u8
-    let slug_len: i32 = extract_slug(path, path_len, @slug[0], 128)
+    let slug_len: i32 = slug_from_path(path, path_len, @slug[0])
     if slug_len <= 0
-        return handle_not_found(ctx, req, resp)
-    if validate_slug(@slug[0], slug_len) == 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9], or '-'.")
 
     let body_ptr: *u8 = worker_get_request_body(ctx, req)
@@ -666,76 +352,31 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if content_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
 
-    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
-    if saved == 0
+    if wiki_store_save(@slug[0], slug_len, @content[0], content_len) == 0
         return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the page.")
 
-    var location: [200]u8
-    var lp: i32 = 0
-    lp = write_cstr(@location[0], lp, c"/wiki/")
-    lp = write_bytes(@location[0], lp, @slug[0], slug_len)
-    location[lp] = 0
-    return send_redirect(ctx, resp, @location[0])
+    return send_redirect(ctx, resp, @slug[0], slug_len)
 
 
 # GET /wiki/:slug/edit - Render the edit form pre-populated with the
-# current page content.  404s with a styled page if the slug is not
-# found, mirroring handle_wiki_view's behavior.
+# current page content.  404s if the slug is invalid or has no page.
 fn handle_wiki_edit_form(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let path: *u8 = worker_get_request_path(ctx, req)
     let path_len: i32 = req.path_len as i32
 
     var slug: [128]u8
-    let slug_len: i32 = extract_slug(path, path_len, @slug[0], 128)
+    let slug_len: i32 = slug_from_path(path, path_len, @slug[0])
     if slug_len <= 0
         return handle_not_found(ctx, req, resp)
 
     var content: [8192]u8
     var content_len: i32 = 0
-    let found: i32 = wiki_store_get(@slug[0], slug_len, @content[0], @content_len)
-    if found == 0
+    if wiki_store_get(@slug[0], slug_len, @content[0], @content_len) == 0
         return handle_not_found(ctx, req, resp)
 
-    var body: [16384]u8
-    var p: i32 = 0
-
-    p = write_html_head(@body[0], p, c"Edit - Nexus Wiki")
-    p = write_cstr(@body[0], p, c"<nav class=\"nav\"><a href=\"/wiki/")
-    p = write_bytes(@body[0], p, @slug[0], slug_len)
-    p = write_cstr(@body[0], p, c"\">&larr; ")
-    p = write_escaped(@body[0], p, @slug[0], slug_len)
-    p = write_cstr(@body[0], p, c"</a></nav>")
-    p = write_cstr(@body[0], p, c"<h1>Edit: ")
-    p = write_escaped(@body[0], p, @slug[0], slug_len)
-    p = write_cstr(@body[0], p, c"</h1>")
-    p = write_cstr(@body[0], p, c"<form method=\"POST\" action=\"/wiki/")
-    p = write_bytes(@body[0], p, @slug[0], slug_len)
-    p = write_cstr(@body[0], p, c"\">")
-    p = write_cstr(@body[0], p, c"<p><label>Content:</label></p>")
-    p = write_cstr(@body[0], p, c"<textarea name=\"content\">")
-    p = write_escaped(@body[0], p, @content[0], content_len)
-    p = write_cstr(@body[0], p, c"</textarea>")
-    p = write_cstr(@body[0], p, c"<p><button type=\"submit\">Save</button></p>")
-    p = write_cstr(@body[0], p, c"</form>")
-    p = write_html_footer(@body[0], p)
-
-    var headers: [256]u8
-    let headers_len: i32 = build_headers(@headers[0], 200, c"text/html; charset=utf-8", p)
-
-    let arena_headers: *u8 = worker_alloc_response_data(ctx, headers_len as i64)
-    let arena_body: *u8 = worker_alloc_response_data(ctx, p as i64)
-
-    for i in 0..headers_len
-        *(arena_headers + i) = headers[i]
-    for i in 0..p
-        *(arena_body + i) = body[i]
-
-    response_slot_set_status(resp, 200)
-    response_slot_set_headers(resp, worker_ptr_to_offset(ctx, arena_headers) as u32, headers_len as u16)
-    response_slot_set_body(resp, worker_ptr_to_offset(ctx, arena_body) as u32, p as u32)
-    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
-
-    return 0
+    var body: String = string_new()
+    render_edit_page(@body, @slug[0], slug_len, @content[0], content_len)
+    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @body)
 
 
 # Detect the trailing "/edit" suffix for a /wiki/:slug/edit GET.  We

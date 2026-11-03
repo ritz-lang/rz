@@ -45,6 +45,18 @@ This will:
 4. Install and start systemd services
 5. Output the wiki URL
 
+## Dev TLS certificate
+
+`docker/docker-compose.yml` mounts `deploy/certs/{cert,key}.pem`. They are not in
+git: generate a self-signed `CN=localhost` pair per checkout with
+
+```bash
+deploy/scripts/gen-dev-cert.sh          # keeps an existing pair
+deploy/scripts/gen-dev-cert.sh --force  # regenerate
+```
+
+`deploy/certs/.gitignore` ignores `*.pem`; never commit key material (AGAST #1870).
+
 ## Commands
 
 ```bash
