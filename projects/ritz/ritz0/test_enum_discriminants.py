@@ -578,6 +578,70 @@ def test_enum_positions_ok(compiler, tmp_path):
     assert _run(compiler, tmp_path, ENUM_POSITIONS_OK) == 41
 
 
+# AGAST #2135: `d as *Hdr` of a pointer param, in a fn with a local of a
+# struct that has an enum field.  ritz1 resolved `d` as an enum and lowered
+# the cast as enum → int: `extractvalue %St` on the i64 pointer, which clang
+# rejects.
+PTR_CAST_BESIDE_ENUM_FIELD = """\
+struct Hdr
+    a: u64
+
+enum St: u8
+    Ok
+    Bad = 5
+
+struct Res
+    s: St
+    v: u64
+
+fn first(d: *u8) -> u64
+    var r: Res
+    r.s = St.Bad
+    let h: *Hdr = d as *Hdr
+    (*h).a + r.s as u64
+
+fn main() -> i32
+    var x: Hdr
+    x.a = 37
+    first(@x as *u8) as i32      # 42
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_ptr_cast_beside_enum_field(compiler, tmp_path):
+    assert _run(compiler, tmp_path, PTR_CAST_BESIDE_ENUM_FIELD) == 42
+
+
+# The control for #2135's fix: a `*St` local is no enum, but `*p` is one --
+# matched, and converted with `as`.
+DEREF_ENUM_PTR = """\
+enum St: u8
+    Ok
+    Bad = 5
+
+fn pick(p: *St) -> i32
+    match *p
+        Ok => 1
+        Bad => 2
+
+fn disc(p: *St) -> u64
+    (*p) as u64
+
+fn main() -> i32
+    var s: St = St.Bad
+    var q: *St = @s
+    let a: i32 = pick(@s)
+    let b: u64 = disc(@s)
+    let c: u64 = (*q) as u64
+    a + (b as i32) * 10 + (c as i32) - 15   # 2 + 50 + 5 - 15
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_deref_enum_ptr(compiler, tmp_path):
+    assert _run(compiler, tmp_path, DEREF_ENUM_PTR) == 42
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(REJECTS))
 def test_rejected(compiler, case, tmp_path):
