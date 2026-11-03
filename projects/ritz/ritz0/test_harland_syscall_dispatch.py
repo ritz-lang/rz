@@ -308,3 +308,50 @@ def test_no_second_kernel_syscall_table():
     assert not (KERNEL_SRC / "arch" / "x86_64" / "syscall.ritz").exists()
     for p in [HARLAND / "kernel" / "user_program.s", HARLAND / "build.py"]:
         assert "arch/x86_64/syscall.ritz" not in p.read_text(), p
+
+
+# --- indium user programs speak the same ABI (AGAST #2133) ----------------------
+
+INDIUM_USER = RITZ_ROOT.parent / "indium" / "user"
+
+
+def _indium_drift():
+    """{file: {SYS_NAME: (value, kernel value)}} for every `const SYS_*` an indium
+    user program declares for harland (harland-targeted or untargeted) whose
+    number is not the kernel's. Linux branches ([[target_os = "linux"]]) are
+    another ABI and are skipped."""
+    kernel = _kernel_enum()
+    drift = {}
+    for path in sorted(INDIUM_USER.glob("*.ritz")):
+        nums = _ritzlib_harland_numbers(path.read_text())
+        wrong = {n: (v, kernel.get(_variant(n))) for n, v in nums.items()
+                 if kernel.get(_variant(n)) != v}
+        if wrong:
+            drift[path.name] = wrong
+    return drift
+
+
+def test_indium_user_sys_numbers_match_kernel():
+    """Every SYS_* number an indium user program declares for harland is the
+    kernel's `enum Syscall` number: a private table can't send Yield as Spawn."""
+    scanned = {p.name: _ritzlib_harland_numbers(p.read_text()) for p in INDIUM_USER.glob("*.ritz")}
+    # Not vacuous: the scan reaches the programs that still declare numbers.
+    assert {"SYS_OPEN", "SYS_CLOSE"} <= set(scanned["libharland.ritz"]), scanned
+    assert scanned["minimal_syscall.ritz"] == {"SYS_EXIT": 20}, scanned
+    assert scanned["portable_hello.ritz"] == {"SYS_WRITE": 1, "SYS_EXIT": 20}, scanned
+    drift = _indium_drift()
+    assert not drift, "indium SYS_* (value, kernel Syscall value) disagree: " + repr(drift)
+
+
+def test_portable_getpid_takes_its_syscalls_from_ritzlib():
+    """portable_getpid is harland-only: it uses ritzlib.sys's wrappers, which the
+    #2122 diff pins to the kernel, rather than its own table, and its bin is
+    built for target_os harland so ritzlib selects the harland numbers."""
+    src = (INDIUM_USER / "portable_getpid.ritz").read_text()
+    assert not re.search(r"^\s*(?:pub\s+)?const\s+SYS_", src, re.M), "private SYS_* table is back"
+    m = re.search(r"^import ritzlib\.sys \{([^}]*)\}", src, re.M)
+    assert m and {"sys_write", "sys_exit", "sys_yield", "sys_getpid"} <= \
+        set(re.findall(r"\w+", m.group(1))), "portable_getpid doesn't import ritzlib.sys's wrappers"
+    toml = (RITZ_ROOT.parent / "indium" / "ritz.toml").read_text()
+    b = re.search(r'^name = "portable_getpid"\n((?:(?!\[).*\n)*)', toml, re.M)
+    assert b and re.search(r'^target_os = "harland"$', b.group(1), re.M), b and b.group(1)
