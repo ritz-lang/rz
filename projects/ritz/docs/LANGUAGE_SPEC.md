@@ -221,7 +221,8 @@ let bad = s"hello"
 
 `make check-no-s-strings` fails the build if one reappears in the tree.
 
-**Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`
+**Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`, and `\{` /
+`\}` for a literal brace anywhere
 
 **String interpolation:** `{expr}` inside a **plain** string literal passed to
 the `print` or `eprint` builtin substitutes the value of `expr`. `print` writes
@@ -242,7 +243,11 @@ fn main() -> i32
     return 0
 ```
 
-Use `{{` for a literal brace.
+Inside a `print` or `eprint` literal, `{{` prints one `{` and `}}` one `}`.
+That escape belongs to print interpolation, not to the string literal: a plain
+`"..."` used anywhere else keeps both braces, so `"x{{y"` is four bytes and
+`prints("{{")` writes two braces (AGAST #1913). Write `\{` / `\}` for a
+literal brace that means the same thing in every context.
 
 **Interpolation does NOT apply to `c"..."` literals** (AGAST #1374). A
 c-string is opaque bytes, so `print(c"x = {x}\n")` would print the placeholder

@@ -956,7 +956,7 @@ class Parser:
         # String literal
         if self._at(TokenType.STRING):
             self._advance()
-            return rast.StringLit(span, tok.value)
+            return rast.StringLit(span, tok.value, tok.print_value)
 
         # C-string literal: c"..."
         if self._at(TokenType.CSTRING):

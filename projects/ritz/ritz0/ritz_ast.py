@@ -235,8 +235,15 @@ class FloatLit(Expr):
 
 @dataclass
 class StringLit(Expr):
-    """String literal."""
+    """String literal.
+
+    `value` is the literal's bytes everywhere: `{{` / `}}` stay two braces.
+    `print_value` is what `print` / `eprint` write, with each pair collapsed
+    to one brace; that escape belongs to print interpolation, not to the
+    literal (AGAST #1913, LANGUAGE_SPEC section 2). None means "same as value".
+    """
     value: str
+    print_value: Optional[str] = None
 
 
 @dataclass

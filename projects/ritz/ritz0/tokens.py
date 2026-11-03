@@ -203,6 +203,10 @@ class Token:
     span: Span
     # Numeric literal type suffix, e.g. the `u32` in `0u32`. None otherwise.
     suffix: Optional[str] = None
+    # A plain "..." literal's text as the print / eprint builtins write it:
+    # `value` with `{{` / `}}` collapsed to one brace (AGAST #1913). None
+    # for every other token.
+    print_value: Optional[str] = None
 
     def __repr__(self) -> str:
         if self.value is not None:

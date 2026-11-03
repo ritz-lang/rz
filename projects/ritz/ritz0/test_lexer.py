@@ -624,13 +624,38 @@ class TestStringBraceLiterals:
             (TokenType.EOF, None),
         ]
 
-    def test_double_brace_still_works(self):
-        """{{ should still produce literal brace."""
+    def test_double_brace_kept_in_plain_value(self):
+        """AGAST #1913: `{{`/`}}` are print's escape, not the literal's.
+
+        The value a "..." has everywhere else keeps both braces, as in ritz1.
+        """
         result = token_values('"{{hello}}"')
         assert result == [
-            (TokenType.STRING, "{hello}"),
+            (TokenType.STRING, "{{hello}}"),
             (TokenType.EOF, None),
         ]
+
+    def test_double_brace_collapsed_in_print_value(self):
+        """AGAST #1913: print/eprint still read `{{` as one brace."""
+        tok = tokenize('"{{hello}}"')[0]
+        assert tok.print_value == "{hello}"
+
+    def test_backslash_brace_then_brace_print_value(self):
+        r"""`\{{` is an escaped brace then a lone `{`: two braces in print too.
+
+        Collapsing the cooked text after the fact would give one.
+        """
+        tok = tokenize(r'"\{{"')[0]
+        assert (tok.value, tok.print_value) == ("{{", "{{")
+
+    def test_plain_string_print_value_matches_value(self):
+        tok = tokenize(r'"a } b { c\n"')[0]
+        assert (tok.value, tok.print_value) == ("a } b { c\n", "a } b { c\n")
+
+    def test_interp_parts_still_collapse(self):
+        """Interpolated strings exist only for print, so parts collapse."""
+        result = token_values('"{{{x}}}"')
+        assert result[0] == (TokenType.INTERP_STRING, (["{", "}"], ["x"]))
 
 
 if __name__ == "__main__":

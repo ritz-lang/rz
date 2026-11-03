@@ -9140,6 +9140,11 @@ class LLVMEmitter:
                     )
                 if isinstance(arg, (rast.StringLit, rast.CStringLit)):
                     s = arg.value
+                    # AGAST #1913: `{{` / `}}` print as one brace, but only
+                    # here -- the literal itself keeps both. c"..." never
+                    # collapses them.
+                    if isinstance(arg, rast.StringLit) and arg.print_value is not None:
+                        s = arg.print_value
                     # Get or create the string constant
                     str_const = self._get_string_constant(s)
                     # GEP to get i8* pointer to string data

@@ -164,10 +164,19 @@ class Lexer:
         Single quotes with exactly one character produce a CHAR token (u8 value).
         Double quotes produce STRING or INTERP_STRING token.
         Interpolation uses {expr} syntax. Use {{ for literal brace.
+
+        AGAST #1913: `{{` / `}}` are the brace escape of print interpolation,
+        not of the literal (LANGUAGE_SPEC section 2, and ritz1's rule). A plain
+        STRING token's `value` keeps them as two bytes; its `print_value` is
+        the text the print / eprint builtins write, with each pair collapsed
+        to one brace. They are tracked side by side rather than collapsing the
+        cooked value later, which could not tell `\\{{` (two braces) from `{{`.
+        INTERP_STRING parts are only ever printed, so they collapse.
         """
         start_span = self._span()
         quote = self._advance()  # consume opening quote
         chars = []
+        pchars = []     # print_value: chars with `{{` / `}}` collapsed
         has_interpolation = False
         parts = []      # String fragments
         expr_strs = []  # Expression strings (raw text inside {})
@@ -202,11 +211,13 @@ class Lexer:
                     chars.append('}')  # \} for literal brace
                 else:
                     raise LexerError(f"Unknown escape sequence '\\{escape}'", self._span())
+                pchars.append(chars[-1])
                 self._advance()
             elif ch == '{' and quote == '"':
                 # Check for {{ (escaped brace)
                 if self._peek(1) == '{':
-                    chars.append('{')
+                    chars.append('{{')
+                    pchars.append('{')
                     self._advance()
                     self._advance()
                 else:
@@ -232,12 +243,14 @@ class Lexer:
                     if not has_matching_brace:
                         # No matching } — treat { as literal character
                         chars.append('{')
+                        pchars.append('{')
                         self._advance()
                     else:
                         # Start of interpolation
                         has_interpolation = True
-                        parts.append(''.join(chars))
+                        parts.append(''.join(pchars))
                         chars = []
+                        pchars = []
                         self._advance()  # consume '{'
 
                         # Read expression until matching '}'
@@ -260,16 +273,19 @@ class Lexer:
             elif ch == '}' and quote == '"':
                 # Check for }} (escaped brace)
                 if self._peek(1) == '}':
-                    chars.append('}')
+                    chars.append('}}')
+                    pchars.append('}')
                     self._advance()
                     self._advance()
                 else:
                     # Standalone } is just a literal character (common in JSON strings)
                     # Only { starts interpolation, } by itself is not special
                     chars.append(ch)
+                    pchars.append(ch)
                     self._advance()
             else:
                 chars.append(ch)
+                pchars.append(ch)
                 self._advance()
 
         # Single-quoted single character = char literal (u8)
@@ -284,10 +300,11 @@ class Lexer:
 
         # Interpolated string
         if has_interpolation:
-            parts.append(''.join(chars))  # Final part after last expr
+            parts.append(''.join(pchars))  # Final part after last expr
             return Token(TokenType.INTERP_STRING, (parts, expr_strs), start_span)
 
-        return Token(TokenType.STRING, ''.join(chars), start_span)
+        return Token(TokenType.STRING, ''.join(chars), start_span,
+                     print_value=''.join(pchars))
 
     def _lex_cstring(self) -> Token:
         """Lex a C-string literal: c"...".
