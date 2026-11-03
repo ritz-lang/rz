@@ -569,7 +569,15 @@ class LLVMEmitter:
         self._closure_thunk_arrays: Dict[str, ir.GlobalVariable] = {}  # thunk fn ptr arrays
         self.has_returned = False
         self.main_fn_def: Optional[rast.FnDef] = None
-        self.in_test_fn = False  # True when emitting a @test function
+        self.in_test_fn = False  # True when emitting a [[test]] function
+        # AGAST #1869: True when emitting a [[test_helper]] function.
+        self.in_test_helper = False
+        # AGAST #1869: id(operand expr) -> its already-emitted value, while
+        # _emit_assert lowers `a OP b` (see _emit_expr's first lines).
+        self._assert_operands: Dict[int, ir.Value] = {}
+        self._assert_val_fn: Optional[ir.Function] = None
+        self._assert_site_gvars = None
+        self._assert_file_consts: Dict[str, ir.Value] = {}
         self.current_fn_def: Optional[rast.FnDef] = None  # Current function being emitted
         self.in_unsafe = False  # True when inside an unsafe block
 
@@ -4182,6 +4190,7 @@ class LLVMEmitter:
         self.has_returned = False
         self.current_fn_def = fn_def
         self.in_test_fn = fn_def.has_attr('test')
+        self.in_test_helper = fn_def.has_attr('test_helper')
         self.drop_scope_stack.clear()  # Clear drop scopes from previous function
         self.drop_flags.clear()  # Clear drop flags from previous function
         self.simd_expected_type = None  # Clear SIMD type context from previous function
@@ -6383,82 +6392,293 @@ class LLVMEmitter:
         # This is a simplification - proper tracking would require carrying type info
         return True  # Default to signed comparisons for now
 
+    # AGAST #1869: comparison operators a failing assert reports both sides of.
+    _ASSERT_CMP_OPS = ('==', '!=', '<', '<=', '>', '>=')
+
+    # __ritz_assert_val's `kind` argument. ritz1 passes the same numbers.
+    _ASSERT_SIGNED, _ASSERT_UNSIGNED, _ASSERT_PTR, _ASSERT_BOOL = 0, 1, 2, 3
+
     def _emit_assert(self, stmt: rast.AssertStmt) -> None:
-        """Emit an assert statement (only valid in test functions).
+        """Emit `assert cond[, "message"]` (LANGUAGE_SPEC §17.1, §19.2).
 
-        On failure, writes a diagnostic line to stderr then exits with code 1:
+        Legal only in a [[test]] or [[test_helper]] fn. On failure it writes
+        to stderr and exits with status 1:
 
-            assertion failed at <file>:<line>: <message>\n
+            <file>:<line>: assertion failed[: <message> | : left OP right]
+              left:  <value>         } when cond is `a OP b` over integers,
+              right: <value>         } bools or pointers (AGAST #1869)
+              in helper <fn> at <file>:<line>   } in a [[test_helper]] fn
 
-        If no message was supplied, just '<file>:<line>: assertion failed\n'.
-        Both the file:line prefix and message body are baked into a single
-        global cstr at compile time so failure-emit code is just one write
-        syscall + one exit syscall.
+        In a helper, <file>:<line> is the call site the running [[test]] fn
+        recorded (_record_assert_site) — the line that identifies the failing
+        test — or the assert's own location if no test has recorded one.
         """
-        # Enforce assert only in @test functions
-        if not self.in_test_fn:
-            fn_name = self.current_fn_def.name if self.current_fn_def else "unknown"
-            raise ValueError(f"assert is only allowed in @test functions, not in '{fn_name}'")
+        fn_name = self.current_fn_def.name if self.current_fn_def else "unknown"
+        # A generic helper's instance is `name$T...`; report the source name.
+        fn_name = fn_name.split("$", 1)[0]
+        if not (self.in_test_fn or self.in_test_helper):
+            raise EmitError(
+                "assert is only allowed in [[test]] and [[test_helper]] "
+                f"functions, not in '{fn_name}'",
+                stmt.span,
+            )
 
-        # Build the diagnostic string at compile time.  Source location lets
-        # a hard-exit assert tell you which test failed (the test runner only
-        # sees the exit code; without this prefix you'd be guessing).
-        loc = ""
+        own_loc = ""
         if stmt.span is not None:
-            # Strip directory noise — the basename is enough context.
-            file_part = stmt.span.file or "?"
-            if "/" in file_part:
-                file_part = file_part.rsplit("/", 1)[-1]
-            loc = f"{file_part}:{stmt.span.line}: "
-        if stmt.message:
-            diag = f"{loc}assertion failed: {stmt.message}\n"
+            own_loc = f"{self._assert_basename(stmt.span.file)}:{stmt.span.line}"
+
+        # `a OP b`: evaluate each operand once, then lower the comparison
+        # through the ordinary BinOp path (signedness, literal re-typing,
+        # null and enum handling) with those values substituted.
+        operands = None
+        cond_expr = stmt.condition
+        if isinstance(cond_expr, rast.BinOp) and cond_expr.op in self._ASSERT_CMP_OPS:
+            lv = self._emit_expr(cond_expr.left)
+            rv = self._emit_expr(cond_expr.right)
+            lk = self._assert_value_kind(lv, cond_expr.left)
+            rk = self._assert_value_kind(rv, cond_expr.right)
+            # One bool side makes both bool: ritz1 cannot tell `true` from
+            # `1`, so it decides the same way (emit_assert_stmt).
+            if self._ASSERT_BOOL in (lk, rk) and None not in (lk, rk):
+                lk = rk = self._ASSERT_BOOL
+            self._assert_operands = {id(cond_expr.left): lv, id(cond_expr.right): rv}
+            try:
+                cond = self._emit_expr(cond_expr)
+            finally:
+                self._assert_operands = {}
+            if lk is not None and rk is not None:
+                operands = ((lv, lk), (rv, rk))
         else:
-            diag = f"{loc}assertion failed\n"
-        diag_bytes = diag.encode("utf-8")
+            cond = self._emit_expr(cond_expr)
 
-        # Emit the condition
-        cond = self._emit_expr(stmt.condition)
-
-        # Ensure condition is i1
         if cond.type != self.i1:
             cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0))
 
-        # Create blocks
         pass_block = self.current_fn.append_basic_block("assert.pass")
         fail_block = self.current_fn.append_basic_block("assert.fail")
-
-        # Branch based on condition
         self.builder.cbranch(cond, pass_block, fail_block)
-
-        # Fail block: write(2, diag, len) then exit(1)
         self.builder.position_at_end(fail_block)
 
-        # Stage the diagnostic string as a global cstr (sans the trailing NUL,
-        # since write takes an explicit length).
-        diag_gvar = self._get_string_constant(diag)
-        zero = ir.Constant(self.i64, 0)
-        diag_ptr = self.builder.gep(diag_gvar, [zero, zero])
-        self._emit_write_syscall(
-            ir.Constant(self.i64, 2),                  # fd 2 = stderr
-            diag_ptr,
-            ir.Constant(self.i64, len(diag_bytes)),
-        )
+        head = "assertion failed"
+        if stmt.message:
+            head += f": {stmt.message}"
+        elif operands is not None:
+            head += f": left {cond_expr.op} right"
+        head += "\n"
+
+        if self.in_test_helper:
+            # The test's call site if one was recorded, else our own.
+            file_g, len_g, line_g = self._assert_site_globals()
+            site_line = self.builder.load(line_g)
+            has_site = self.builder.icmp_signed('!=', site_line, ir.Constant(self.i64, 0))
+            site_bb = self.current_fn.append_basic_block("assert.site")
+            own_bb = self.current_fn.append_basic_block("assert.own")
+            head_bb = self.current_fn.append_basic_block("assert.head")
+            self.builder.cbranch(has_site, site_bb, own_bb)
+            self.builder.position_at_end(site_bb)
+            self._emit_write_syscall(ir.Constant(self.i64, 2), self.builder.load(file_g),
+                                     self.builder.load(len_g))
+            self._assert_write_text(":")
+            self._assert_write_value(site_line, self._ASSERT_SIGNED)
+            self._assert_write_text(": ")
+            self.builder.branch(head_bb)
+            self.builder.position_at_end(own_bb)
+            self._assert_write_text(f"{own_loc}: " if own_loc else "")
+            self.builder.branch(head_bb)
+            self.builder.position_at_end(head_bb)
+            self._assert_write_text(head)
+        else:
+            self._assert_write_text((f"{own_loc}: " if own_loc else "") + head)
+
+        if operands is not None:
+            (lv, lk), (rv, rk) = operands
+            self._assert_write_text("  left:  ")
+            self._assert_write_value(lv, lk)
+            self._assert_write_text("\n  right: ")
+            self._assert_write_value(rv, rk)
+            self._assert_write_text("\n")
+
+        if self.in_test_helper:
+            self._assert_write_text(f"  in helper {fn_name} at {own_loc or '?'}\n")
 
         # syscall 60 = exit on x86_64
-        exit_code = ir.Constant(self.i64, 1)
-        asm_str = "syscall"
-        constraints = "={rax},{rax},{rdi},~{rcx},~{r11},~{memory}"
-        asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64])
-        asm_ir = ir.InlineAsm(asm_func_ty, asm_str, constraints, side_effect=True)
-        self.builder.call(asm_ir, [ir.Constant(self.i64, 60), exit_code])
+        asm_ty = ir.FunctionType(self.i64, [self.i64, self.i64])
+        asm_ir = ir.InlineAsm(asm_ty, "syscall", "={rax},{rax},{rdi},~{rcx},~{r11},~{memory}",
+                              side_effect=True)
+        self.builder.call(asm_ir, [ir.Constant(self.i64, 60), ir.Constant(self.i64, 1)])
         self.builder.unreachable()
 
-        # Pass block: continue
         self.builder.position_at_end(pass_block)
         return None
 
+    @staticmethod
+    def _assert_basename(path: Optional[str]) -> str:
+        """The file part of an assert location: the basename is enough."""
+        path = path or "?"
+        return path.rsplit("/", 1)[-1]
+
+    def _assert_value_kind(self, value: ir.Value, expr: rast.Expr) -> Optional[int]:
+        """How a failing assert prints `value`, or None if it cannot."""
+        if isinstance(value.type, ir.IntType):
+            if value.type.width == 1:
+                return self._ASSERT_BOOL
+            if self._infer_unsigned_expr(expr):
+                return self._ASSERT_UNSIGNED
+            return self._ASSERT_SIGNED
+        if isinstance(value.type, ir.PointerType):
+            return self._ASSERT_PTR
+        return None
+
+    def _assert_write_text(self, text: str) -> None:
+        """write(2, text) for a compile-time string."""
+        if not text:
+            return
+        g = self._get_string_constant(text)
+        zero = ir.Constant(self.i64, 0)
+        self._emit_write_syscall(ir.Constant(self.i64, 2), self.builder.gep(g, [zero, zero]),
+                                 ir.Constant(self.i64, len(text.encode("utf-8"))))
+
+    def _assert_write_value(self, value: ir.Value, kind: int) -> None:
+        """Print `value` to stderr via __ritz_assert_val."""
+        if isinstance(value.type, ir.PointerType):
+            value = self.builder.ptrtoint(value, self.i64)
+        elif value.type != self.i64:
+            if kind == self._ASSERT_SIGNED:
+                value = self.builder.sext(value, self.i64)
+            else:
+                value = self.builder.zext(value, self.i64)
+        self.builder.call(self._get_assert_val_fn(), [value, ir.Constant(self.i64, kind)])
+
+    def _assert_site_globals(self):
+        """The call site a [[test]] fn records for its helpers' asserts.
+
+        `weak` so every module that names them shares one copy at link time
+        — a helper is usually in another module than the test calling it.
+        ritz1 defines the same three symbols.
+        """
+        if self._assert_site_gvars is None:
+            def weak(name, ty, init):
+                g = self.module.globals.get(name)
+                if g is None:
+                    g = ir.GlobalVariable(self.module, ty, name=name)
+                    g.linkage = "weak"
+                    g.initializer = init
+                return g
+            i8p = self.i8.as_pointer()
+            self._assert_site_gvars = (
+                weak("__ritz_assert_site_file", i8p, ir.Constant(i8p, None)),
+                weak("__ritz_assert_site_file_len", self.i64, ir.Constant(self.i64, 0)),
+                weak("__ritz_assert_site_line", self.i64, ir.Constant(self.i64, 0)),
+            )
+        return self._assert_site_gvars
+
+    def _record_assert_site(self, call: rast.Expr) -> None:
+        """In a [[test]] fn, note the location of a call about to be made.
+
+        A [[test_helper]] reached through it reports this location when an
+        assert fails. Helpers do not record, so through any depth of helpers
+        the reported line stays the test's.
+        """
+        if not self.in_test_fn or call.span is None or self.builder is None:
+            return
+        if self.builder.block is None or self.builder.block.is_terminated:
+            return
+        name = self._assert_basename(call.span.file)
+        ptr = self._assert_file_consts.get(name)
+        if ptr is None:
+            g = self._get_string_constant(name)
+            zero = ir.Constant(self.i32, 0)
+            ptr = g.gep([zero, zero])
+            self._assert_file_consts[name] = ptr
+        file_g, len_g, line_g = self._assert_site_globals()
+        self.builder.store(ptr, file_g)
+        self.builder.store(ir.Constant(self.i64, len(name.encode("utf-8"))), len_g)
+        self.builder.store(ir.Constant(self.i64, call.span.line), line_g)
+
+    def _get_assert_val_fn(self) -> ir.Function:
+        """`internal void @__ritz_assert_val(i64 v, i64 kind)`: print v to fd 2.
+
+        kind 0 signed decimal, 1 unsigned decimal, 2 pointer as 0x-hex,
+        3 bool as true/false. Digits are taken from the unsigned magnitude,
+        so i64::MIN prints exactly. ritz1 emits the same function as text
+        (emitter_print.ritz emit_assert_helpers).
+        """
+        if self._assert_val_fn is not None:
+            return self._assert_val_fn
+        i64, i8 = self.i64, self.i8
+        fn = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [i64, i64]),
+                         name="__ritz_assert_val")
+        fn.linkage = "internal"
+        v, kind = fn.args
+        c = lambda n: ir.Constant(i64, n)  # noqa: E731
+        entry = fn.append_basic_block("entry")
+        boolbb = fn.append_basic_block("bool")
+        numbb = fn.append_basic_block("num")
+        loop = fn.append_basic_block("digit")
+        done = fn.append_basic_block("done")
+        b = ir.IRBuilder(entry)
+        write_ty = ir.FunctionType(i64, [i64, i64, i64, i64])
+        write = ir.InlineAsm(write_ty, "syscall",
+                             "=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}",
+                             side_effect=True)
+        buf = b.alloca(ir.ArrayType(i8, 24))
+        end = b.gep(buf, [c(0), c(24)])
+        b.cbranch(b.icmp_unsigned('==', kind, c(3)), boolbb, numbb)
+
+        b.position_at_end(boolbb)
+        t = b.icmp_unsigned('!=', v, c(0))
+        tg, fg = self._get_string_constant("true"), self._get_string_constant("false")
+        tp = b.ptrtoint(b.gep(tg, [c(0), c(0)]), i64)
+        fp = b.ptrtoint(b.gep(fg, [c(0), c(0)]), i64)
+        b.call(write, [c(1), c(2), b.select(t, tp, fp), b.select(t, c(4), c(5))])
+        b.ret_void()
+
+        b.position_at_end(numbb)
+        neg = b.and_(b.icmp_unsigned('==', kind, c(0)), b.icmp_signed('<', v, c(0)))
+        mag = b.select(neg, b.sub(c(0), v), v)
+        is_hex = b.icmp_unsigned('==', kind, c(2))
+        base = b.select(is_hex, c(16), c(10))
+        b.branch(loop)
+
+        b.position_at_end(loop)
+        p = b.phi(i8.as_pointer())
+        val = b.phi(i64)
+        d = b.urem(val, base)
+        ch = b.select(b.icmp_unsigned('<', d, c(10)), b.add(d, c(48)), b.add(d, c(87)))
+        np_ = b.gep(p, [c(-1)])
+        b.store(b.trunc(ch, i8), np_)
+        q = b.udiv(val, base)
+        p.add_incoming(end, numbb)
+        p.add_incoming(np_, loop)
+        val.add_incoming(mag, numbb)
+        val.add_incoming(q, loop)
+        b.cbranch(b.icmp_unsigned('!=', q, c(0)), loop, done)
+
+        # At most 20 digits + "0x" + "-" = 23 bytes: the unconditional
+        # stores below stay inside the 24-byte buffer.
+        b.position_at_end(done)
+        x_at = b.gep(np_, [c(-1)])
+        b.store(ir.Constant(i8, ord('x')), x_at)
+        zero_at = b.gep(np_, [c(-2)])
+        b.store(ir.Constant(i8, ord('0')), zero_at)
+        p3 = b.select(is_hex, zero_at, np_)
+        minus_at = b.gep(p3, [c(-1)])
+        b.store(ir.Constant(i8, ord('-')), minus_at)
+        p4 = b.select(neg, minus_at, p3)
+        p4i = b.ptrtoint(p4, i64)
+        b.call(write, [c(1), c(2), p4i, b.sub(b.ptrtoint(end, i64), p4i)])
+        b.ret_void()
+        self._assert_val_fn = fn
+        return fn
+
     def _emit_expr(self, expr: rast.Expr) -> ir.Value:
         """Emit an expression."""
+        # AGAST #1869: an operand _emit_assert already evaluated, so the
+        # comparison and the failure report share one evaluation.
+        if self._assert_operands:
+            pre = self._assert_operands.get(id(expr))
+            if pre is not None:
+                return pre
         if isinstance(expr, rast.IntLit):
             return ir.Constant(self.i64, expr.value)
 
@@ -9024,6 +9244,7 @@ class LLVMEmitter:
         genuine bug in the emitter still surfaces as a Python traceback
         instead of being disguised as a user error.
         """
+        self._record_assert_site(call)
         try:
             return self._emit_call_inner(call)
         except TypeError as exc:
@@ -10524,6 +10745,7 @@ class LLVMEmitter:
         # `Vec.new()`, ... The receiver is a *type*, not a value, so there is
         # no receiver argument and the type parameter comes from the context
         # the call sits in (return type, let annotation).
+        self._record_assert_site(expr)
         assoc = self._try_emit_associated_builtin_call(expr)
         if assoc is not None:
             return assoc

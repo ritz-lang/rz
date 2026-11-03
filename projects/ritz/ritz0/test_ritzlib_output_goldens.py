@@ -5,9 +5,9 @@ print/eprint interpolations.  Output must stay byte-identical, on the same fd,
 with the same exit status.  ritzlib/tests/test_{argspec,args,env}_output.ritz
 pin most of it under ritz0; this file covers the two things they can't:
 
-* ritzlib/testing.ritz's assertion helpers exit the process on failure, so
-  each case is its own process, selected by $TGOLD_CASE.  (The module's test
-  runner and its `main` were deleted by AGAST #1868: ritzunit is the runner.)
+* (ritzlib/testing.ritz's assertion helpers were pinned here until AGAST
+  #1869 deleted the module: `assert` itself now prints both operands; see
+  ritz0/test/test_assert_operands.ritz.)
 * ritzlib/args.ritz is compiled by ritz1 for every example that imports it, so
   its converted printers are also built with `--compiler ritz1` and both
   binaries must print the same pinned bytes.  The cases are the ones in
@@ -79,67 +79,6 @@ def _check(exe: Path, args, env_extra, want_rc, want_out, want_err, label):
     assert run.stdout == want_out, f"{label} stdout: {run.stdout!r}"
     assert run.stderr == want_err, f"{label} stderr: {run.stderr!r}"
     assert run.returncode == want_rc, f"{label} exit {run.returncode}"
-
-
-# ---------------------------------------------------------------------------
-# ritzlib/testing.ritz (ritz0)
-# ---------------------------------------------------------------------------
-
-TESTING_PROGRAM = """\
-import ritzlib.sys
-import ritzlib.strview
-import ritzlib.os.env
-import ritzlib.testing
-
-fn main() -> i32
-    let case = env_get_or("TGOLD_CASE", "0")
-    let which: u8 = strview_get(@case, 0)
-    if which == '1'
-        assert_msg(0, "boom")
-    else if which == '2'
-        assert_eq_i64(5, -7, "i64 differ")
-    else if which == '3'
-        assert_eq_i64(4294967297, 4294967298, "truncated")
-    else if which == '4'
-        assert_eq_i32(-3, 4, "i32 differ")
-    else if which == '5'
-        assert_not_null(null, "want ptr")
-    else if which == '6'
-        assert_null(c"x", "want null")
-    0
-"""
-
-# case -> (exit status, stdout, stderr)
-TESTING_CASES = {
-    "0": (0, b"", b""),
-    "1": (1, b"", b"Assertion failed: boom\n"),
-    "2": (1, b"", b"Assertion failed: i64 differ\n  expected: -7\n  actual:   5\n"),
-    # assert_eq_i64 reports both sides truncated to i32: 2^32 + 1 shows as 1,
-    # 2^32 + 2 as 2.
-    "3": (1, b"", b"Assertion failed: truncated\n  expected: 2\n  actual:   1\n"),
-    "4": (1, b"", b"Assertion failed: i32 differ\n  expected: 4\n  actual:   -3\n"),
-    "5": (1, b"", b"Assertion failed (null pointer): want ptr\n"),
-    "6": (1, b"", b"Assertion failed (expected null): want null\n"),
-}
-
-
-@pytest.fixture(scope="module")
-def tgold(tmp_path_factory) -> Path:
-    return _build(tmp_path_factory.mktemp("tgold"), "tgold", TESTING_PROGRAM, "ritz0")
-
-
-@pytest.mark.parametrize("case", sorted(TESTING_CASES))
-def test_testing_output_is_byte_exact(tgold, case):
-    want_rc, want_out, want_err = TESTING_CASES[case]
-    _check(
-        tgold,
-        [],
-        {"TGOLD_CASE": case},
-        want_rc,
-        want_out,
-        want_err,
-        f"testing case {case}",
-    )
 
 
 # ---------------------------------------------------------------------------

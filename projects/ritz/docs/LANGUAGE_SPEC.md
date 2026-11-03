@@ -1907,6 +1907,7 @@ The attributes are a closed set:
 | Attribute | Applies to | Meaning |
 |---|---|---|
 | `[[test]]` | `fn` | a test ([§17.1](#171-test-attribute)) |
+| `[[test_helper]]` | `fn` | may `assert`; a failure reports the calling test's line ([§17.1](#171-test-attribute)) |
 | `[[target_os = "<os>"]]` | `fn`, `struct`, `const` | the item exists only when compiling for `<os>` ([§17.2](#172-target-attribute)) |
 | `[[packed]]` | `struct` | no padding; alignment 1 ([§17.4](#174-packed-structs)) |
 | `[[naked]]` | `fn` | no prologue or epilogue; the body is `asm` only ([§17.5](#175-naked-functions)) |
@@ -1958,6 +1959,40 @@ its diagnostic to stderr). It *crashes* if its process is killed by a signal,
 and *times out* if it runs past the runner's per-test limit. A non-zero result
 is never read as a pass: a result whose low 8 bits are zero (256) fails with
 status 1, and a result of a type other than `i32` fails as 1.
+
+**Test helpers.** A function marked `[[test_helper]]` may use `assert` too
+([§19.2](#192-built-in-functions)). It is an ordinary function in every other
+respect: any parameters, any return type, generic or not, callable from
+anywhere. When an
+assert in a helper fails, the first line of the diagnostic names the line of
+the **test** that called it, so the failing test is identified rather than the
+shared helper; a further line names the helper and the assert's own location.
+This holds through any depth of helpers calling helpers, and across modules:
+
+```ritz expect-runtime-error=".ritz:13: assertion failed: left == right\n  left:  4\n  right: 5\n  in helper expect_sum at "
+[[test_helper]]
+fn expect_sum(a: i64, b: i64, want: i64)
+    assert a + b == want
+
+[[test_helper]]
+fn expect_sums()
+    expect_sum(1, 1, 2)
+    expect_sum(2, 2, 5)
+
+[[test]]
+fn test_sums() -> i32
+    expect_sum(0, 0, 0)
+    expect_sums()
+    0
+
+fn main() -> i32
+    test_sums()
+```
+
+The location is recorded by the test: before each call it makes, a `[[test]]`
+function stores the call's file and line, and a helper's failing assert reads
+them back. A helper reached without passing through a test (from `main`, say)
+reports its own location.
 
 **Test mode and the test table.** A test file is not compiled to a program of
 its own. In test mode (ritz0 `--test-table`) the compiler omits the file's
@@ -2300,25 +2335,52 @@ See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 | `print(literal)` | Print a string literal to stdout, with `{expr}` interpolation |
 | `eprint(literal)` | As `print`, to stderr |
 | `sizeof(T)` / `sizeof(expr)` | Size in bytes |
-| `assert cond` | Runtime check; exits non-zero on failure. **`[[test]]` functions only** |
+| `assert cond` | Runtime check; exits 1 on failure. **`[[test]]` and `[[test_helper]]` functions only** |
 | `assert cond, "message"` | As above, naming what the check was for |
 | `volatile_load(p)` / `volatile_store(p, v)` | Volatile access ([§18.4](#184-volatile-access)) |
 | `atomic_*(p, ..)` / `fence()` | Atomic access and fences ([§18.5](#185-atomics-and-fences)) |
 
-`assert` is legal **only inside a `[[test]]` function**, and the compiler
-enforces it rather than leaving it to convention — an `assert` in ordinary code
-is a compile error naming the offending function:
+`assert` is legal **only inside a `[[test]]` or `[[test_helper]]` function**
+([§17.1](#171-test-attribute)), and the compiler enforces it rather than leaving
+it to convention — an `assert` in ordinary code is a compile error, located at
+the assert, naming the offending function:
 
-```ritz expect-error="assert is only allowed in"
+```ritz expect-error="assert is only allowed in [[test]] and [[test_helper]] functions, not in 'main'"
 fn main() -> i32
     assert 1 == 1
     return 0
 ```
 
-Note that the diagnostic itself still reads *"assert is only allowed in @test
-functions"*. `@test` is removed syntax ([§17.3](#173-the--attribute-syntax-was-removed));
-the attribute to write is `[[test]]`. The message is a compiler bug, not a hint
-to use `@test`.
+**What a failing assert prints.** It writes one diagnostic to stderr and exits
+with status 1:
+
+```text
+<file>:<line>: assertion failed[: <message>]
+  left:  <value>
+  right: <value>
+```
+
+When the condition is a comparison `a OP b` (`==`, `!=`, `<`, `<=`, `>`, `>=`)
+whose operands are integers, bools or pointers, the `left:` and `right:` lines
+show both values, and without a message the first line names the operator
+(`left == right`). Signed integers print in decimal, unsigned ones (`u8` …
+`u64`) as unsigned decimal, bools as `true` / `false` and pointers in hex
+(`0x0` for null). Each operand is evaluated once: the comparison and the report
+share the value. Any other condition (`assert ok`, `assert a and b`, a float
+comparison) prints only the first line. In a `[[test_helper]]`, `<file>:<line>`
+is the calling test's and a final line, `  in helper <fn> at <file>:<line>`,
+names the assert itself.
+
+```ritz expect-runtime-error=".ritz:4: assertion failed: left == right\n  left:  3\n  right: 4\n"
+[[test]]
+fn test_sum() -> i32
+    let got: i32 = 1 + 2
+    assert got == 4
+    0
+
+fn main() -> i32
+    test_sum()
+```
 
 Both the one- and two-argument forms work inside a test:
 

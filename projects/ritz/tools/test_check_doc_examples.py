@@ -266,6 +266,95 @@ def test_no_compile_block_is_skipped_but_counted(tmp_path):
     assert report.skips[0].detail.startswith("illustrative")
 
 
+# ---------------------------------------------------------------------------
+# expect-runtime-error (AGAST #1869): the block compiles, RUNS, exits
+# non-zero, and its stderr contains the declared text.
+# ---------------------------------------------------------------------------
+
+FAILING_ASSERT = (
+    "[[test]]\n"
+    "fn test_sum() -> i32\n"
+    "    let got: i32 = 1 + 2\n"
+    "    assert got == 4\n"
+    "    0\n"
+    "\n"
+    "fn main() -> i32\n"
+    "    test_sum()\n"
+)
+
+
+@pytest.mark.unit
+def test_bare_expect_runtime_error_is_rejected(tmp_path):
+    doc = write(tmp_path, "```ritz expect-runtime-error\nfn main() -> i32\n    0\n```\n")
+    with pytest.raises(C.FenceError, match="must name"):
+        C.extract_blocks(doc)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("other", ['expect-error="x"', 'no-compile="a long enough reason"', "body"])
+def test_expect_runtime_error_excludes_other_modes(tmp_path, other):
+    doc = write(tmp_path, f'```ritz expect-runtime-error="x" {other}\nfn main() -> i32\n    0\n```\n')
+    with pytest.raises(C.FenceError):
+        C.extract_blocks(doc)
+
+
+@pytest.mark.unit
+def test_expect_runtime_error_decodes_newline_escapes(tmp_path):
+    doc = write(tmp_path, '```ritz expect-runtime-error="a\\nb \\\\n"\nfn main() -> i32\n    0\n```\n')
+    (block,) = C.extract_blocks(doc)
+    assert block.expect_runtime_error == "a\nb \\n"
+
+
+@pytest.mark.integration
+def test_expect_runtime_error_passes_when_stderr_matches(tmp_path):
+    doc = write(
+        tmp_path,
+        '```ritz expect-runtime-error="left:  3\\n  right: 4"\n' + FAILING_ASSERT + "```\n",
+    )
+    report = C.run([doc], jobs=2, verbose=False)
+    assert report.failures == [], [r.detail for r in report.failures]
+    assert len(report.compiled) == 1
+
+
+@pytest.mark.integration
+def test_expect_runtime_error_fails_when_stderr_differs(tmp_path):
+    doc = write(
+        tmp_path,
+        '```ritz expect-runtime-error="left:  5"\n' + FAILING_ASSERT + "```\n",
+    )
+    report = C.run([doc], jobs=2, verbose=False)
+    assert len(report.failures) == 1
+    assert "not with the declared stderr" in report.failures[0].detail
+
+
+@pytest.mark.integration
+def test_expect_runtime_error_fails_when_the_program_succeeds(tmp_path):
+    doc = write(
+        tmp_path,
+        '```ritz expect-runtime-error="anything"\n'
+        "fn main() -> i32\n"
+        "    0\n"
+        "```\n",
+    )
+    report = C.run([doc], jobs=2, verbose=False)
+    assert len(report.failures) == 1
+    assert "exited 0" in report.failures[0].detail
+
+
+@pytest.mark.integration
+def test_expect_runtime_error_fails_when_it_does_not_compile(tmp_path):
+    doc = write(
+        tmp_path,
+        '```ritz expect-runtime-error="anything"\n'
+        "fn main() -> i32\n"
+        "    let mut s = 1\n"
+        "```\n",
+    )
+    report = C.run([doc], jobs=2, verbose=False)
+    assert len(report.failures) == 1
+    assert "did not compile" in report.failures[0].detail
+
+
 @pytest.mark.integration
 def test_missing_document_is_an_error():
     assert C.main(["does/not/exist.md"]) == 1

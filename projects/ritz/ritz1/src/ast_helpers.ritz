@@ -150,6 +150,13 @@ pub fn is_test_fn(f: *FnDef) -> i32
         i = i + 1
     0
 
+# 1 if `f` was declared `[[test_helper]]` (AGAST #1869), or is a monomorph
+# instance of such a fn (fn_copy_instance_attrs marks those).
+pub fn is_test_helper_fn(f: *FnDef) -> i32
+    if (item_attr_bits(f as *u8) & ATTR_TEST_HELPER) != 0
+        return 1
+    0
+
 pub fn test_fn_count() -> i64
     g_test_fn_count
 
@@ -188,7 +195,7 @@ pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
             if fn_is_decl(fn_def) == 1
                 decl_refused(fn_def.line, c"[[test]] fn", fn_def.name, fn_def.name_len, null, 0, c"a test needs its body")
             test_fn_record(fn_def)
-        let fn_bits: i32 = g_attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_WIN64)
+        let fn_bits: i32 = g_attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_WIN64 | ATTR_TEST_HELPER)
         if fn_bits != 0
             item_attr_record(fn_def as *u8, fn_bits)
     p.skip_item = 0
@@ -337,6 +344,7 @@ const ATTR_INLINE: i32 = 4
 const ATTR_ALWAYS_INLINE: i32 = 8
 const ATTR_NOINLINE: i32 = 16
 const ATTR_WIN64: i32 = 32       # [[callconv = "win64"]] (AGAST #1879)
+const ATTR_TEST_HELPER: i32 = 64 # [[test_helper]]: may `assert` (AGAST #1869)
 
 const ATTR_ITEM_OTHER: i32 = 0
 const ATTR_ITEM_FN: i32 = 1
@@ -425,6 +433,8 @@ fn attr_unknown(name: *u8, len: i32, line: i32, col: i32)
 fn attr_is_bare_name(name: *u8, len: i32) -> i32
     if buf_eq(name, len, c"test", 4) == 1 or buf_eq(name, len, c"packed", 6) == 1
         return 1
+    if buf_eq(name, len, c"test_helper", 11) == 1
+        return 1
     if buf_eq(name, len, c"naked", 5) == 1 or buf_eq(name, len, c"inline", 6) == 1
         return 1
     if buf_eq(name, len, c"always_inline", 13) == 1 or buf_eq(name, len, c"noinline", 8) == 1
@@ -437,6 +447,8 @@ pub fn attr_flag(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> i32
     var applies_to: i32 = ATTR_ITEM_FN
     if buf_eq(name, len, c"test", 4) == 1
         bit = ATTR_TEST
+    else if buf_eq(name, len, c"test_helper", 11) == 1
+        bit = ATTR_TEST_HELPER
     else if buf_eq(name, len, c"packed", 6) == 1
         bit = ATTR_PACKED
         applies_to = ATTR_ITEM_STRUCT
@@ -565,10 +577,16 @@ pub fn fn_callconv_kw(f: *FnDef) -> *u8
         return c"win64cc "
     c""
 
-# A monomorph specialisation calls and is called as its template is.
-pub fn fn_copy_callconv(dst: *FnDef, src: *FnDef)
-    if src != null and (item_attr_bits(src as *u8) & ATTR_WIN64) != 0
-        item_attr_record(dst as *u8, ATTR_WIN64)
+# A monomorph specialisation `dst` carries its template `src`'s
+# [[callconv]] (#1879) and [[test_helper]] (#1869): it calls, is called and
+# may assert as the template does.  One record: an item's bits are read from
+# its first record only (item_attr_bits).
+pub fn fn_copy_instance_attrs(dst: *FnDef, src: *FnDef)
+    if src == null
+        return
+    let bits: i32 = item_attr_bits(src as *u8) & (ATTR_WIN64 | ATTR_TEST_HELPER)
+    if bits != 0
+        item_attr_record(dst as *u8, bits)
 
 # Called by the generated anchor-skip recovery in parse_item BEFORE it
 # skips the construct it could not parse.  p.pos is still at the first
@@ -2367,18 +2385,18 @@ pub fn stmt_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line
     s.next = null
     return s
 
-# `assert <cond>` — emit a runtime check that aborts on falsy cond.
-# Condition lives in if_cond (slot reused from STMT_IF); the emitter
-# lowers to `br i1 cond, %ok, %fail` where %fail does inline `syscall(60, 1)`
-# (Linux exit syscall) and unreachable.  Message text is parsed-and-dropped
-# for now — if/when we want assertion messages we extend Stmt with a
-# string slot and wire it through emit_assert.
-pub fn stmt_assert(p: *Parser, cond: *Expr, line: i32, col: i32) -> *Stmt
+# `assert <cond>[, "message"]` — a runtime check that exits 1 on a falsy
+# cond.  Condition lives in if_cond (slot reused from STMT_IF); the message
+# (null / 0 if none) in assert_msg.  emit_assert_stmt (emitter_print.ritz)
+# lowers it (AGAST #1869).
+pub fn stmt_assert(p: *Parser, cond: *Expr, msg: *u8, msg_len: i32, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = STMT_ASSERT
     s.span.line = line
     s.span.col = col
     s.if_cond = cond
+    s.assert_msg = msg
+    s.assert_msg_len = msg_len
     s.next = null
     return s
 

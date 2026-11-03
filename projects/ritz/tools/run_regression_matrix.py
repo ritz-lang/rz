@@ -216,6 +216,10 @@ NOT_TESTS = {
     "test_import_lib":
         "library imported by test_import_main.ritz; it is compiled and linked "
         "as part of that file's import closure",
+    "test_assert_helper_lib":
+        "[[test_helper]] fns imported by test_assert_operands.ritz; built with "
+        "ritz0 for every cell, so ritz1 cells read call-site globals ritz0 "
+        "declared (AGAST #1869)",
 }
 
 # A failing file's units are run one process each, selected by a one-byte

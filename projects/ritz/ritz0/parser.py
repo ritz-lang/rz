@@ -32,6 +32,9 @@ class ParseError(Exception):
 # keeps the same table in ritz1/src/ast_helpers.ritz.
 ATTRS = {
     "test": (False, ("fn",)),
+    # LANGUAGE_SPEC §17.1 (AGAST #1869): a fn that may `assert`, reporting
+    # the calling [[test]] fn's location.
+    "test_helper": (False, ("fn",)),
     "target_os": (True, ("fn", "struct", "const")),
     "packed": (False, ("struct",)),
     "naked": (False, ("fn",)),

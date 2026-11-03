@@ -784,18 +784,18 @@ fn parse_int(s: StrView) -> Result<i64, ParseError>
 - Unrecoverable states
 - Debug-only checks
 
-`assert` is a **compiler-enforced** restriction, not a style preference: ritz0
-permits `assert` only inside `[[test]]` functions. Using it anywhere else is an
-error, not merely bad style:
+`assert` is a **compiler-enforced** restriction, not a style preference: both
+compilers permit `assert` only inside `[[test]]` and `[[test_helper]]` functions
+(LANGUAGE_SPEC §19.2). Using it anywhere else is an error, not merely bad style:
 
-```ritz expect-error="assert is only allowed in @test functions"
+```ritz expect-error="assert is only allowed in [[test]] and [[test_helper]] functions, not in 'vec_get'"
 struct Vec32
     data: *i32
     len: i64
 
 
 fn vec_get(v: @Vec32, idx: i64) -> i32
-    assert idx >= 0 && idx < v.len   # Rejected: not a [[test]] function
+    assert idx >= 0 && idx < v.len   # Rejected: not a test or test helper
     *(v.data + idx)
 ```
 

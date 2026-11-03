@@ -80,7 +80,7 @@ Ritzlib is built on three core principles:
     - [json](#json) - JSON parsing
     - [elf](#elf) - ELF binary parsing
     - [meta](#meta) - Module metadata
-    - [testing](#testing) - Test framework
+    - [testing](#testing) - Removed; use `assert`
 
 ---
 
@@ -2234,50 +2234,22 @@ Module metadata parser for .ritz-meta JSON files (incremental compilation).
 
 ### testing
 
-**Module**: `ritzlib.testing`
-
-Native test framework.
-
-**Architecture**:
-1. Test files are compiled with `--no-runtime`
-2. Build system reads .o symbol tables to find `test_*` functions
-3. Build system generates registration stub
-4. This module provides `_start` and test runner
+`ritzlib.testing` was removed by AGAST #1869. Its helpers (`assert_msg`,
+`assert_eq_i64`, `assert_eq_i32`, `assert_not_null`, `assert_null`) are all the
+`assert` statement now: a failing `assert a == b` prints both operands, and
+`assert` works in any `[[test_helper]]` fn, reporting the calling test's line
+(LANGUAGE_SPEC §17.1, §19.2). Tests are run by ritzunit.
 
 ```ritz
-struct TestEntry
-    name: StrView
-    func: *u8
-```
+[[test_helper]]
+fn expect_not_null(p: *u8)
+    assert p != null, "want ptr"
 
-**Global State**:
-- `g_tests: [1024]TestEntry`
-- `g_test_count: i32`
-
-**Functions**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `register_test` | `fn(name: StrView, func: *u8)` | Register a test |
-| `run_all_tests` | `fn() -> i32` | Run all tests |
-
-**Assertions**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `assert_msg` | `fn(condition: i32, msg: StrView)` | Assert with message |
-| `assert_eq_i64` | `fn(actual: i64, expected: i64, msg: StrView)` | Assert i64 equality |
-| `assert_eq_i32` | `fn(actual: i32, expected: i32, msg: StrView)` | Assert i32 equality |
-| `assert_not_null` | `fn(ptr: *u8, msg: StrView)` | Assert not null |
-| `assert_null` | `fn(ptr: *u8, msg: StrView)` | Assert null |
-
-**Example** (the attribute is `[[test]]`; the old `@test` spelling no longer
-parses):
-
-```ritz
 [[test]]
 fn test_addition() -> i32
-    assert 1 + 1 == 2
+    let got: i64 = 1 + 1
+    assert got == 2, "sum"
+    expect_not_null(c"x")
     0
 ```
 

@@ -28,6 +28,7 @@ import ast
 import emitter_core
 import emitter_expr
 import interp
+import ast_helpers   # is_test_fn / is_test_helper_fn (AGAST #1869)
 
 # Report an error at a print literal: an IR comment, a stderr line naming
 # the literal's line, and one more on s.error_count (AGAST #1369), so ritz1
@@ -433,5 +434,373 @@ pub fn emit_print_helpers(s: *EmitterState)
     emit_str(s, c"  %len = select i1 %t, i64 4, i64 5\n")
     emit_str(s, c"  %pi = ptrtoint ptr %ptr to i64\n")
     emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 %fd, i64 %pi, i64 %len)\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n")
+
+# =============================================================================
+# assert (AGAST #1869; LANGUAGE_SPEC §17.1, §19.2)
+# =============================================================================
+#
+# A failing assert writes to stderr and exits 1:
+#
+#     <file>:<line>: assertion failed[: <message> | : left OP right]
+#       left:  <value>                      } cond is `a OP b` with integer,
+#       right: <value>                      } bool or pointer operands
+#       in helper <fn> at <file>:<line>     } in a [[test_helper]] fn
+#
+# byte for byte what ritz0's _emit_assert writes.  In a helper the first
+# <file>:<line> is the call site the running [[test]] fn recorded in the
+# @__ritz_assert_site_* globals (record_assert_site), or the assert's own
+# location when none was recorded.
+
+# __ritz_assert_val's `kind`; ritz0's _ASSERT_* use the same numbers.
+const ASSERT_V_SIGNED: i32 = 0
+const ASSERT_V_UNSIGNED: i32 = 1
+const ASSERT_V_PTR: i32 = 2
+const ASSERT_V_BOOL: i32 = 3
+
+pub fn assert_fn_kind(f: *FnDef) -> i32
+    if is_test_fn(f) == 1
+        return ASSERT_FN_TEST
+    if is_test_helper_fn(f) == 1
+        return ASSERT_FN_HELPER
+    ASSERT_FN_PLAIN
+
+fn assert_cstr_len(t: *u8) -> i32
+    var n: i32 = 0
+    while *(t + n) != 0
+        n += 1
+    n
+
+# The basename of the file being compiled: the location an assert reports.
+fn assert_file_base(out_len: *i32) -> *u8
+    let f: *u8 = emitter_source_file()
+    if f == null
+        *out_len = 1
+        return c"?"
+    var n: i32 = 0
+    var start: i32 = 0
+    while *(f + n) != 0
+        if *(f + n) == 47
+            start = n + 1
+        n += 1
+    *out_len = n - start
+    f + start
+
+fn assert_file_str(s: *EmitterState) -> i32
+    if s.assert_file_str < 0
+        var blen: i32 = 0
+        let base: *u8 = assert_file_base(@blen)
+        s.assert_file_str = add_string(s, base, blen)
+    s.assert_file_str
+
+# write(2, data, len) for bytes known at compile time.
+fn assert_write(s: *EmitterState, data: *u8, len: i32)
+    if len <= 0
+        return
+    let idx: i32 = add_string(s, data, len)
+    s.print_helpers_used = 1
+    emit_str(s, c"  call void @__ritz_print_bytes(i64 2, i64 ptrtoint (ptr @.str.")
+    emit_int(s, idx as i64)
+    emit_str(s, c" to i64), i64 ")
+    emit_int(s, len as i64)
+    emit_str(s, c")\n")
+
+fn assert_write_c(s: *EmitterState, text: *u8)
+    assert_write(s, text, assert_cstr_len(text))
+
+# The value in i64 register `reg` (or the constant `imm` when reg == 0).
+fn assert_write_val(s: *EmitterState, reg: i32, imm: i64, kind: i32)
+    s.assert_helpers_used = 1
+    emit_str(s, c"  call void @__ritz_assert_val(i64 ")
+    if reg != 0
+        emit_reg(s, reg)
+    else
+        emit_int(s, imm)
+    emit_str(s, c", i64 ")
+    emit_int(s, kind as i64)
+    emit_str(s, c")\n")
+
+fn assert_write_own_loc(s: *EmitterState, line: i32)
+    var blen: i32 = 0
+    let base: *u8 = assert_file_base(@blen)
+    assert_write(s, base, blen)
+    assert_write_c(s, c":")
+    assert_write_val(s, 0, line as i64, ASSERT_V_SIGNED)
+    assert_write_c(s, c": ")
+
+# How a failing assert prints an operand of type get_expr_type(e); -1: not.
+fn assert_operand_kind(s: *EmitterState, e: *Expr) -> i32
+    let t: i32 = get_expr_type(s, e)
+    if t == TYPE_BOOL
+        return ASSERT_V_BOOL
+    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
+        return ASSERT_V_PTR
+    if t == TYPE_U8 or t == TYPE_U16 or t == TYPE_U32 or t == TYPE_U64
+        return ASSERT_V_UNSIGNED
+    if t == TYPE_I8 or t == TYPE_I16 or t == TYPE_I32 or t == TYPE_I64
+        return ASSERT_V_SIGNED
+    -1
+
+# `f`'s source name: a generic instance `name$T...` without its suffix.
+fn assert_fn_name_len(f: *FnDef) -> i32
+    var n: i32 = 0
+    while n < f.name_len and *(f.name + n) != 36
+        n += 1
+    n
+
+fn assert_op_text(op: i32) -> *u8
+    if op == OP_EQ
+        return c"=="
+    if op == OP_NE
+        return c"!="
+    if op == OP_LT
+        return c"<"
+    if op == OP_GT
+        return c">"
+    if op == OP_LE
+        return c"<="
+    c">="
+
+# In a [[test]] fn, note the location of the call `e` before it is made.  A
+# [[test_helper]] reached through it reports that location; helpers do not
+# record, so through any depth of helpers the line stays the test's.
+pub fn record_assert_site(s: *EmitterState, e: *Expr)
+    if s.fn_assert_kind != ASSERT_FN_TEST
+        return
+    let idx: i32 = assert_file_str(s)
+    var blen: i32 = 0
+    assert_file_base(@blen)
+    s.assert_site_used = 1
+    emit_str(s, c"  store ptr @.str.")
+    emit_int(s, idx as i64)
+    emit_str(s, c", ptr @__ritz_assert_site_file\n")
+    emit_str(s, c"  store i64 ")
+    emit_int(s, blen as i64)
+    emit_str(s, c", ptr @__ritz_assert_site_file_len\n")
+    emit_str(s, c"  store i64 ")
+    emit_int(s, e.span.line as i64)
+    emit_str(s, c", ptr @__ritz_assert_site_line\n")
+
+fn assert_placement_error(s: *EmitterState, stmt: *Stmt)
+    emit_str(s, c"  ; ERROR: assert outside [[test]] / [[test_helper]]\n")
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(stmt.span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(stmt.span.col as i64)
+    eprints_cstr(c": assert is only allowed in [[test]] and [[test_helper]] functions, not in '")
+    let f: *FnDef = emitter_current_fn()
+    if f != null
+        eprint_bytes(f.name, assert_fn_name_len(f))
+    eprints_cstr(c"'\n")
+    s.error_count = s.error_count + 1
+
+pub fn emit_assert_stmt(s: *EmitterState, stmt: *Stmt)
+    if s.fn_assert_kind == ASSERT_FN_PLAIN
+        assert_placement_error(s, stmt)
+        return
+    let c: *Expr = stmt.if_cond
+    # `a OP b`: emit_expr_binary records the two i64 operand registers its
+    # compare reads, so the report shows exactly the compared values without
+    # evaluating anything twice.
+    var is_cmp: i32 = 0
+    var lk: i32 = -1
+    var rk: i32 = -1
+    if c.kind == EXPR_BINARY and c.op >= OP_EQ and c.op <= OP_GE
+        is_cmp = 1
+        lk = assert_operand_kind(s, c.left)
+        rk = assert_operand_kind(s, c.right)
+        # A bool local is an i64 slot and `true` an int literal here, so
+        # one side known to be bool makes both bool (the type rules say the
+        # other is too) — interp_is_bool, as print interpolation decides.
+        if interp_is_bool(s, c.left) == 1 or interp_is_bool(s, c.right) == 1
+            lk = ASSERT_V_BOOL
+            rk = ASSERT_V_BOOL
+        s.assert_cap_expr = c
+        s.assert_cap_ok = 0
+    let a_cond: i32 = emit_expr(s, c)
+    s.assert_cap_expr = null
+    var show: i32 = 0
+    if is_cmp == 1 and s.assert_cap_ok == 1 and lk >= 0 and rk >= 0
+        show = 1
+    let cap_l: i32 = s.assert_cap_l
+    let cap_r: i32 = s.assert_cap_r
+    var a_cond_i1: i32 = a_cond
+    # Same i1 / i64 decision as STMT_IF (bool_reg_is_i1, AGAST #1646).
+    if bool_reg_is_i1(s, c) == 0
+        a_cond_i1 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, a_cond_i1)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, a_cond)
+        emit_str(s, c", 0\n")
+    let a_ok: i32 = next_label(s)
+    let a_fail: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, a_cond_i1)
+    emit_str(s, c", label %")
+    emit_label(s, a_ok)
+    emit_str(s, c", label %")
+    emit_label(s, a_fail)
+    emit_str(s, c"\n")
+    begin_block(s, a_fail)
+
+    if s.fn_assert_kind == ASSERT_FN_HELPER
+        s.assert_site_used = 1
+        let l_site: i32 = next_label(s)
+        let l_own: i32 = next_label(s)
+        let l_head: i32 = next_label(s)
+        let line_r: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, line_r)
+        emit_str(s, c" = load i64, ptr @__ritz_assert_site_line\n")
+        let has_r: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, has_r)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, line_r)
+        emit_str(s, c", 0\n  br i1 ")
+        emit_reg(s, has_r)
+        emit_str(s, c", label %")
+        emit_label(s, l_site)
+        emit_str(s, c", label %")
+        emit_label(s, l_own)
+        emit_str(s, c"\n")
+        begin_block(s, l_site)
+        let fp_r: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, fp_r)
+        emit_str(s, c" = load i64, ptr @__ritz_assert_site_file\n")
+        let fl_r: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, fl_r)
+        emit_str(s, c" = load i64, ptr @__ritz_assert_site_file_len\n")
+        s.print_helpers_used = 1
+        emit_str(s, c"  call void @__ritz_print_bytes(i64 2, i64 ")
+        emit_reg(s, fp_r)
+        emit_str(s, c", i64 ")
+        emit_reg(s, fl_r)
+        emit_str(s, c")\n")
+        assert_write_c(s, c":")
+        assert_write_val(s, line_r, 0, ASSERT_V_SIGNED)
+        assert_write_c(s, c": ")
+        emit_str(s, c"  br label %")
+        emit_label(s, l_head)
+        emit_str(s, c"\n")
+        begin_block(s, l_own)
+        assert_write_own_loc(s, stmt.span.line)
+        emit_str(s, c"  br label %")
+        emit_label(s, l_head)
+        emit_str(s, c"\n")
+        begin_block(s, l_head)
+    else
+        assert_write_own_loc(s, stmt.span.line)
+
+    assert_write_c(s, c"assertion failed")
+    if stmt.assert_msg != null and stmt.assert_msg_len > 0
+        assert_write_c(s, c": ")
+        assert_write(s, stmt.assert_msg, stmt.assert_msg_len)
+    else if show == 1
+        assert_write_c(s, c": left ")
+        assert_write_c(s, assert_op_text(c.op))
+        assert_write_c(s, c" right")
+    assert_write_c(s, c"\n")
+    if show == 1
+        assert_write_c(s, c"  left:  ")
+        assert_write_val(s, cap_l, 0, lk)
+        assert_write_c(s, c"\n  right: ")
+        assert_write_val(s, cap_r, 0, rk)
+        assert_write_c(s, c"\n")
+    if s.fn_assert_kind == ASSERT_FN_HELPER
+        assert_write_c(s, c"  in helper ")
+        let hf: *FnDef = emitter_current_fn()
+        if hf != null
+            assert_write(s, hf.name, assert_fn_name_len(hf))
+        assert_write_c(s, c" at ")
+        var blen: i32 = 0
+        let base: *u8 = assert_file_base(@blen)
+        assert_write(s, base, blen)
+        assert_write_c(s, c":")
+        assert_write_val(s, 0, stmt.span.line as i64, ASSERT_V_SIGNED)
+        assert_write_c(s, c"\n")
+    # syscall(60, 1): Linux _exit.  `unreachable` tells LLVM the fail block
+    # has no successor.
+    emit_str(s, c"  call i64 asm sideeffect \"syscall\", ")
+    emit_str(s, c"\"=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"")
+    emit_str(s, c"(i64 60, i64 1)\n")
+    emit_str(s, c"  unreachable\n")
+    begin_block(s, a_ok)
+
+# The call-site globals (weak: one copy across every module of a test
+# binary; ritz0 defines the same symbols) and @__ritz_assert_val, the value
+# printer: ritz0's _get_assert_val_fn instruction for instruction.
+pub fn emit_assert_helpers(s: *EmitterState)
+    if s.assert_site_used == 1
+        emit_str(s, c"\n; assert call-site globals (AGAST #1869)\n")
+        emit_str(s, c"@__ritz_assert_site_file = weak global ptr null\n")
+        emit_str(s, c"@__ritz_assert_site_file_len = weak global i64 0\n")
+        emit_str(s, c"@__ritz_assert_site_line = weak global i64 0\n")
+    if s.assert_helpers_used == 0
+        return
+    emit_str(s, c"\n; assert value printer (AGAST #1869): kind 0 signed, 1 unsigned, 2 0x-hex, 3 bool\n")
+    emit_str(s, c"@.ritz_assert_true = private unnamed_addr constant [4 x i8] c\"true\"\n")
+    emit_str(s, c"@.ritz_assert_false = private unnamed_addr constant [5 x i8] c\"false\"\n")
+    emit_str(s, c"define internal void @__ritz_assert_val(i64 %v, i64 %kind) {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %buf = alloca [24 x i8]\n")
+    emit_str(s, c"  %end = getelementptr [24 x i8], ptr %buf, i64 0, i64 24\n")
+    emit_str(s, c"  %isb = icmp eq i64 %kind, 3\n")
+    emit_str(s, c"  br i1 %isb, label %bool, label %num\n")
+    emit_str(s, c"bool:\n")
+    emit_str(s, c"  %t = icmp ne i64 %v, 0\n")
+    emit_str(s, c"  %bp = select i1 %t, ptr @.ritz_assert_true, ptr @.ritz_assert_false\n")
+    emit_str(s, c"  %bl = select i1 %t, i64 4, i64 5\n")
+    emit_str(s, c"  %bpi = ptrtoint ptr %bp to i64\n")
+    emit_str(s, c"  %r0 = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %bpi, i64 %bl)\n")
+    emit_str(s, c"  ret void\n")
+    emit_str(s, c"num:\n")
+    emit_str(s, c"  %iss = icmp eq i64 %kind, 0\n")
+    emit_str(s, c"  %isn = icmp slt i64 %v, 0\n")
+    emit_str(s, c"  %neg = and i1 %iss, %isn\n")
+    emit_str(s, c"  %negv = sub i64 0, %v\n")
+    emit_str(s, c"  %mag = select i1 %neg, i64 %negv, i64 %v\n")
+    emit_str(s, c"  %ish = icmp eq i64 %kind, 2\n")
+    emit_str(s, c"  %base = select i1 %ish, i64 16, i64 10\n")
+    emit_str(s, c"  br label %digit\n")
+    emit_str(s, c"digit:\n")
+    emit_str(s, c"  %p = phi ptr [ %end, %num ], [ %np, %digit ]\n")
+    emit_str(s, c"  %val = phi i64 [ %mag, %num ], [ %q, %digit ]\n")
+    emit_str(s, c"  %d = urem i64 %val, %base\n")
+    emit_str(s, c"  %lo = icmp ult i64 %d, 10\n")
+    emit_str(s, c"  %dc = add i64 %d, 48\n")
+    emit_str(s, c"  %hc = add i64 %d, 87\n")
+    emit_str(s, c"  %ch64 = select i1 %lo, i64 %dc, i64 %hc\n")
+    emit_str(s, c"  %ch = trunc i64 %ch64 to i8\n")
+    emit_str(s, c"  %np = getelementptr i8, ptr %p, i64 -1\n")
+    emit_str(s, c"  store i8 %ch, ptr %np\n")
+    emit_str(s, c"  %q = udiv i64 %val, %base\n")
+    emit_str(s, c"  %more = icmp ne i64 %q, 0\n")
+    emit_str(s, c"  br i1 %more, label %digit, label %done\n")
+    # At most 20 digits + "0x" + "-" = 23 bytes: the unconditional stores
+    # stay inside the 24-byte buffer.
+    emit_str(s, c"done:\n")
+    emit_str(s, c"  %xp = getelementptr i8, ptr %np, i64 -1\n")
+    emit_str(s, c"  store i8 120, ptr %xp\n")
+    emit_str(s, c"  %zp = getelementptr i8, ptr %np, i64 -2\n")
+    emit_str(s, c"  store i8 48, ptr %zp\n")
+    emit_str(s, c"  %p3 = select i1 %ish, ptr %zp, ptr %np\n")
+    emit_str(s, c"  %mp = getelementptr i8, ptr %p3, i64 -1\n")
+    emit_str(s, c"  store i8 45, ptr %mp\n")
+    emit_str(s, c"  %p4 = select i1 %neg, ptr %mp, ptr %p3\n")
+    emit_str(s, c"  %p4i = ptrtoint ptr %p4 to i64\n")
+    emit_str(s, c"  %ei = ptrtoint ptr %end to i64\n")
+    emit_str(s, c"  %len = sub i64 %ei, %p4i\n")
+    emit_str(s, c"  %r1 = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %p4i, i64 %len)\n")
     emit_str(s, c"  ret void\n")
     emit_str(s, c"}\n")

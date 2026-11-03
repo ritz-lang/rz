@@ -6,8 +6,9 @@ ritz1-built kernel would lay out GDT/IDT/ACPI structures wrong in silence.
 
 The rule (LANGUAGE_SPEC §17):
 
-* the attributes are `test`, `target_os = "..."`, `packed`, `naked`,
-  `inline`, `always_inline` and `noinline`;
+* the attributes are `test`, `test_helper` (AGAST #1869),
+  `target_os = "..."`, `packed`, `naked`, `inline`, `always_inline`,
+  `noinline` and `callconv = "..."`;
 * anything else, or a known attribute on an item kind it does not apply to,
   is a compile error located at the attribute (file:line:col);
 * `[[packed]]` structs have no padding: LLVM `<{ ... }>`, alignment 1, and
@@ -134,6 +135,24 @@ fn main() -> i32
     0
 """
 
+TEST_HELPER_ON_STRUCT = """\
+[[test_helper]]
+struct S
+    a: u8
+
+fn main() -> i32
+    0
+"""
+
+TEST_HELPER_WITH_VALUE = """\
+[[test_helper = "yes"]]
+fn h()
+    assert 1 == 1
+
+fn main() -> i32
+    0
+"""
+
 PACKED_WITH_VALUE = """\
 [[packed = "yes"]]
 struct S
@@ -152,6 +171,8 @@ ERRORS = {
     "test_on_struct": (TEST_ON_STRUCT, 1, 3, ["test", "fn"]),
     "target_os_bare": (TARGET_OS_BARE, 1, 3, ["target_os", "value"]),
     "packed_with_value": (PACKED_WITH_VALUE, 1, 3, ["packed", "value"]),
+    "test_helper_on_struct": (TEST_HELPER_ON_STRUCT, 1, 3, ["test_helper", "fn"]),
+    "test_helper_with_value": (TEST_HELPER_WITH_VALUE, 1, 3, ["test_helper", "value"]),
 }
 
 
@@ -176,6 +197,10 @@ fn which() -> i32
 [[test]]
 fn test_it() -> i32
     0
+
+[[test_helper]]
+fn helper_it(x: i64)
+    assert x == x
 
 [[inline]]
 fn a() -> i32

@@ -35,6 +35,9 @@ commas::
     ```ritz expect-error="Expected IDENT" must FAIL, with that text in the
                                           diagnostic
     ```ritz no-compile="<reason>"         not compiled; reason mandatory
+    ```ritz expect-runtime-error="left:  3"
+                                          must COMPILE, then RUN and exit
+                                          non-zero with that text on stderr
 
 ``body`` exists because much of the prose illustrates a statement or two
 rather than a whole program.  Those blocks are wrapped in a ``fn`` and a
@@ -45,6 +48,13 @@ the fragment-ness is handled by a preamble, not by an exemption.
 are not skipped: they must fail, and they must fail with the diagnostic
 the prose claims they produce.  A block that starts compiling because the
 compiler grew a feature is a documentation bug, and this reports it.
+
+``expect-runtime-error`` (AGAST #1869) is ``expect-error`` for behaviour
+the compiler cannot see: what a failing ``assert`` prints, say.  The block is
+top-level items with a ``main``; it is compiled, linked freestanding and
+run, and it must exit non-zero with the declared text in its stderr.  In
+the value, ``\\n`` is a newline and ``\\\\`` a backslash, so a multi-line
+diagnostic can be pinned.
 
 ``no-compile`` is the escape hatch, and it is deliberately awkward:
 
@@ -108,6 +118,7 @@ class Block:
     code: str
     mode: str = "items"  # "items" | "body"
     expect_error: str | None = None
+    expect_runtime_error: str | None = None
     no_compile_reason: str | None = None
 
     @property
@@ -182,7 +193,7 @@ def block_from_fence(doc: Path, line: int, info: str, code: str) -> Block:
     attrs = parse_info_string(info, where)
     block = Block(doc=doc, line=line, code=code)
 
-    known = {"body", "items", "expect-error", "no-compile"}
+    known = {"body", "items", "expect-error", "expect-runtime-error", "no-compile"}
     unknown = sorted(set(attrs) - known)
     if unknown:
         raise FenceError(
@@ -205,6 +216,21 @@ def block_from_fence(doc: Path, line: int, info: str, code: str) -> Block:
             )
         block.expect_error = expected
 
+    if "expect-runtime-error" in attrs:
+        expected = (attrs["expect-runtime-error"] or "").strip()
+        if not expected:
+            raise FenceError(
+                f"{where}: `expect-runtime-error` must name the stderr text, e.g. "
+                f'```ritz expect-runtime-error="left:  3\\n  right: 4".'
+            )
+        if "expect-error" in attrs or "no-compile" in attrs or "body" in attrs:
+            raise FenceError(
+                f"{where}: `expect-runtime-error` is a whole program that compiles "
+                f"and runs; it cannot be combined with `expect-error`, "
+                f"`no-compile` or `body`."
+            )
+        block.expect_runtime_error = _decode_escapes(expected)
+
     if "no-compile" in attrs:
         reason = (attrs["no-compile"] or "").strip()
         if len(reason) < MIN_REASON_LEN:
@@ -223,6 +249,20 @@ def block_from_fence(doc: Path, line: int, info: str, code: str) -> Block:
         )
 
     return block
+
+
+def _decode_escapes(text: str) -> str:
+    """``\\n`` -> newline and ``\\\\`` -> backslash; nothing else is special."""
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in "n\\":
+            out.append("\n" if text[i + 1] == "n" else "\\")
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
 
 
 def extract_blocks(doc: Path) -> list[Block]:
@@ -375,9 +415,47 @@ def compile_block(block: Block, workdir: Path) -> Result:
             )
         return Result(block, ok=True, detail=f"failed as declared: {block.expect_error}")
 
+    if block.expect_runtime_error:
+        if proc.returncode != 0:
+            return Result(block, ok=False, detail=(
+                "block is marked expect-runtime-error but did not compile:"
+                + _indent_output(output)))
+        return run_block(block, workdir, stem)
+
     if proc.returncode != 0:
         return Result(block, ok=False, detail=_indent_output(output))
     return Result(block, ok=True)
+
+
+def run_block(block: Block, workdir: Path, stem: str) -> Result:
+    """Link an expect-runtime-error block freestanding, run it, check stderr.
+
+    ritz0 emits its own `_start` for a file with a `main`, so the link needs
+    no runtime object and no ritzlib: the same `-nostdlib` link
+    ritz0/test_attr_validation.py uses.
+    """
+    exe = workdir / f"{stem}.exe"
+    link = subprocess.run(
+        ["clang", "-Wno-override-module", "-O0", str(workdir / f"{stem}.ll"),
+         "-o", str(exe), "-nostdlib", "-no-pie"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if link.returncode != 0:
+        return Result(block, ok=False, detail=(
+            "block compiled but did not link:" + _indent_output(link.stderr.strip())))
+    proc = subprocess.run([str(exe)], capture_output=True, timeout=30)
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    if proc.returncode == 0:
+        return Result(block, ok=False, detail=(
+            "block is marked expect-runtime-error but the program exited 0. "
+            "Either the behaviour changed and the prose is now wrong, or the "
+            "fence is."))
+    if block.expect_runtime_error not in stderr:
+        return Result(block, ok=False, detail=(
+            f"program failed (exit {proc.returncode}), but not with the declared stderr.\n"
+            f"    expected substring: {block.expect_runtime_error!r}\n"
+            f"    actual: {_indent_output(stderr.strip())}"))
+    return Result(block, ok=True, detail=f"failed at run time as declared (exit {proc.returncode})")
 
 
 def _indent_output(output: str) -> str:
@@ -414,7 +492,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Compile every fenced ```ritz example in the given documents.",
         epilog=(
-            "Fence attributes: body, expect-error=\"...\", no-compile=\"reason\". "
+            "Fence attributes: body, expect-error=\"...\", "
+            "expect-runtime-error=\"...\", no-compile=\"reason\". "
             "See the module docstring for what each one promises."
         ),
     )
@@ -437,7 +516,9 @@ def main(argv: list[str] | None = None) -> int:
                     kind = (
                         "no-compile"
                         if b.no_compile_reason
-                        else ("expect-error" if b.expect_error else b.mode)
+                        else ("expect-error" if b.expect_error
+                              else ("expect-runtime-error" if b.expect_runtime_error
+                                    else b.mode))
                     )
                     print(f"{b.where}\t{kind}")
             return 0
