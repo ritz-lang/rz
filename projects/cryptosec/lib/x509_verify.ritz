@@ -163,13 +163,42 @@ fn x509_verify_rsa_sha512(cert: *X509Certificate, issuer_key: *X509PublicKey) ->
 # Maximum chain depth
 const X509_MAX_CHAIN_DEPTH: i32 = 10
 
-# Does `anchor` (a trust-store certificate) vouch for `cert`? It must be a CA,
-# be named as cert's issuer, and its key must verify cert's signature. The
-# name alone proves nothing: anyone can mint a CA with a trusted CA's name.
-fn x509_anchor_issued(cert: *X509Certificate, anchor: *X509Certificate, check_time: i32, now: i64) -> i32
+# May `ca` vouch for chain[0 .. below), the certificates beneath it (it
+# issued chain[below - 1])? RFC 5280 6.1.4:
+#   - it is a CA (basicConstraints cA), and its keyUsage, if present,
+#     includes keyCertSign;
+#   - pathLenConstraint: at most path_len CA certificates below it, i.e.
+#     everything below except the leaf. Self-issued certificates are counted
+#     too (stricter than 6.1.4 (l), which exempts them);
+#   - nameConstraints hold for every certificate below it.
+# Trust anchors are held to the same rules.
+fn x509_ca_may_issue(ca: *X509Certificate, chain: **X509Certificate, below: i32) -> i32
+    if ca.is_ca != 1
+        return 0
+    if ca.has_key_usage == 1 && (ca.key_usage & KU_KEY_CERT_SIGN) == 0
+        return 0
+    if ca.has_path_len == 1 && below - 1 > ca.path_len
+        return 0
+    if ca.has_name_constraints == 1
+        var k: i32 = 0
+        while k < below
+            var is_leaf: i32 = 0
+            if k == 0
+                is_leaf = 1
+            if x509_nc_permits(ca, chain[k], is_leaf) != 1
+                return 0
+            k += 1
+    return 1
+
+# Does `anchor` (a trust-store certificate) vouch for chain[0 .. below)? It
+# must be a CA that may issue them, be named as the issuer of chain[below-1],
+# and its key must verify that certificate's signature. The name alone
+# proves nothing: anyone can mint a CA with a trusted CA's name.
+fn x509_anchor_issued(chain: **X509Certificate, below: i32, anchor: *X509Certificate, check_time: i32, now: i64) -> i32
     if anchor == null
         return 0
-    if anchor.is_ca != 1
+    let cert: *X509Certificate = chain[below - 1]
+    if x509_ca_may_issue(anchor, chain, below) != 1
         return 0
     if x509_is_issued_by(cert, anchor) != 1
         return 0
@@ -183,8 +212,10 @@ fn x509_anchor_issued(cert: *X509Certificate, anchor: *X509Certificate, check_ti
 # a CA that issued it. Running out of chain without reaching an anchor fails.
 # There is no trust-on-first-use: without anchors nothing is trusted.
 #
-# Not checked yet (AGAST #2114): keyUsage, pathLenConstraint, nameConstraints,
-# unknown critical extensions.
+# Every issuer (anchor included) must pass x509_ca_may_issue. Every chain
+# certificate with a critical extension we do not process is refused (RFC
+# 5280 4.2); an anchor is trusted configuration and is not checked for that.
+# Leaf usage for TLS (keyUsage, extendedKeyUsage) is x509_verify_server_cert's.
 fn x509_chain_walk(chain: **X509Certificate, chain_len: i32, anchors: **X509Certificate, anchors_len: i32, check_time: i32, now: i64) -> i32
     if chain == null || chain_len <= 0 || chain_len > X509_MAX_CHAIN_DEPTH
         return 0
@@ -196,13 +227,15 @@ fn x509_chain_walk(chain: **X509Certificate, chain_len: i32, anchors: **X509Cert
         let cert: *X509Certificate = chain[i]
         if cert == null
             return 0
+        if cert.unknown_critical != 0
+            return 0
         if check_time == 1
             if x509_is_valid_time(cert, now) != 1
                 return 0
 
         var j: i32 = 0
         while j < anchors_len
-            if x509_anchor_issued(cert, anchors[j], check_time, now) == 1
+            if x509_anchor_issued(chain, i + 1, anchors[j], check_time, now) == 1
                 return 1
             j += 1
 
@@ -211,7 +244,7 @@ fn x509_chain_walk(chain: **X509Certificate, chain_len: i32, anchors: **X509Cert
         let issuer: *X509Certificate = chain[i + 1]
         if issuer == null
             return 0
-        if issuer.is_ca != 1
+        if x509_ca_may_issue(issuer, chain, i + 1) != 1
             return 0
         if x509_is_issued_by(cert, issuer) != 1
             return 0
@@ -292,30 +325,169 @@ pub fn x509_hostname_match(pattern: *u8, pattern_len: i32, hostname: *u8, hostna
     # Exact match (case-insensitive)
     return bytes_equal_ci(pattern, pattern_len, hostname, hostname_len)
 
-# Match hostname against the dNSName ([2] IA5String) entries of the SAN's
-# GeneralNames. Returns 1 on a match; 0 for no match or malformed DER.
-fn x509_san_match_dns(cert: *X509Certificate, hostname: *u8, hostname_len: i32) -> i32
+# Open the SAN's GeneralNames for x509_san_next_dns. Returns 0 or -1.
+fn x509_san_open(cert: *X509Certificate, names: *DerParser) -> i32
     if cert.san_data == null || cert.san_len == 0
-        return 0
+        return -1
     var outer: DerParser
     der_parser_init(@outer, cert.san_data, cert.san_len)
     var seq: DerElement
     if der_parse_element(@outer, @seq) != 0
-        return 0
-    if der_is_sequence(@seq) != 1
-        return 0
-    var names: DerParser
-    if der_enter_sequence(@seq, @names) != 0
-        return 0
-    while der_parser_eof(@names) != 1
-        var gn: DerElement
-        if der_parse_element(@names, @gn) != 0
-            return 0
-        if der_is_context_tag(@gn, 2) == 1 && gn.constructed == 0
-            if gn.content_len > 0 && gn.content_len <= 255
-                if x509_hostname_match(gn.content, gn.content_len as i32, hostname, hostname_len) == 1
-                    return 1
+        return -1
+    return der_enter_sequence(@seq, names)
+
+# Next dNSName ([2] IA5String) in a GeneralNames walk: 1 with *out set, 0 at
+# the end, -1 on malformed DER.
+fn x509_san_next_dns(names: *DerParser, out: *DerElement) -> i32
+    while der_parser_eof(names) != 1
+        if der_parse_element(names, out) != 0
+            return -1
+        if der_is_context_tag(out, 2) == 1 && out.constructed == 0
+            return 1
     return 0
+
+# Match hostname against the dNSName entries of the SAN's GeneralNames.
+# Returns 1 on a match; 0 for no match or malformed DER.
+fn x509_san_match_dns(cert: *X509Certificate, hostname: *u8, hostname_len: i32) -> i32
+    var names: DerParser
+    if x509_san_open(cert, @names) != 0
+        return 0
+    var gn: DerElement
+    while x509_san_next_dns(@names, @gn) == 1
+        if gn.content_len > 0 && gn.content_len <= 255
+            if x509_hostname_match(gn.content, gn.content_len as i32, hostname, hostname_len) == 1
+                return 1
+    return 0
+
+# ============================================================================
+# Name Constraints (RFC 5280 4.2.1.10), dNSName only
+# ============================================================================
+
+# Is dNSName `name` within the subtree `base`? "example.com" covers itself
+# and every subdomain; ".example.com" covers subdomains only; an empty base
+# covers everything. Case-insensitive. Returns 1 or 0.
+pub fn x509_dns_in_subtree(name: *u8, name_len: i32, base: *u8, base_len: i32) -> i32
+    if base_len == 0
+        return 1
+    if base_len > name_len
+        return 0
+    let tail: *u8 = @name[name_len - base_len]
+    if base[0] == 0x2e
+        return bytes_equal_ci(tail, base_len, base, base_len)
+    if name_len == base_len
+        return bytes_equal_ci(name, name_len, base, base_len)
+    if name[name_len - base_len - 1] != 0x2e
+        return 0
+    return bytes_equal_ci(tail, base_len, base, base_len)
+
+# Does the excluded subtree `base` reach `name`? A wildcard "*.S" stands for
+# any name one label under S, so it is excluded as soon as the excluded
+# subtree reaches under S at all (over-approximated: deeper names too).
+fn x509_dns_excluded(name: *u8, name_len: i32, base: *u8, base_len: i32) -> i32
+    if x509_dns_in_subtree(name, name_len, base, base_len) == 1
+        return 1
+    if name_len >= 2 && name[0] == 0x2a && name[1] == 0x2e
+        var b: *u8 = base
+        var bl: i32 = base_len
+        if bl > 0 && b[0] == 0x2e
+            b = @base[1]
+            bl = bl - 1
+        if x509_dns_in_subtree(b, bl, @name[2], name_len - 2) == 1
+            return 1
+    return 0
+
+# Scan GeneralSubtrees (permitted [0] or excluded [1]) for dNSName `name`
+# (null: only validate). GeneralSubtree ::= SEQUENCE { base GeneralName,
+# minimum [0] DEFAULT 0, maximum [1] OPTIONAL }; minimum/maximum MUST be
+# absent (4.2.1.10). Returns -1 for malformed DER or a subtree we do not
+# implement (any base but dNSName: refused, not ignored), else bit 0 = the
+# list has a subtree, bit 1 = `name` is within one.
+fn x509_nc_scan(trees: *DerElement, name: *u8, name_len: i32, excluded: i32) -> i32
+    var p: DerParser
+    if der_enter_constructed(trees, @p) != 0
+        return -1
+    var result: i32 = 0
+    while der_parser_eof(@p) != 1
+        var st: DerElement
+        if der_parse_element(@p, @st) != 0
+            return -1
+        var sp: DerParser
+        if der_enter_sequence(@st, @sp) != 0
+            return -1
+        var base: DerElement
+        if der_parse_element(@sp, @base) != 0
+            return -1
+        if der_parser_eof(@sp) != 1
+            return -1
+        if der_is_context_tag(@base, 2) != 1 || base.constructed != 0 || base.content_len > 255
+            return -1
+        result = result | 1
+        if name != null
+            var hit: i32 = 0
+            if excluded == 1
+                hit = x509_dns_excluded(name, name_len, base.content, base.content_len as i32)
+            else
+                hit = x509_dns_in_subtree(name, name_len, base.content, base.content_len as i32)
+            if hit == 1
+                result = result | 2
+    return result
+
+# Does ca's NameConstraints allow dNSName `name`? With name == null, only
+# checks that every subtree is one we implement. Returns 1 or 0.
+fn x509_nc_allows(ca: *X509Certificate, name: *u8, name_len: i32) -> i32
+    var outer: DerParser
+    der_parser_init(@outer, ca.nc_data, ca.nc_len)
+    var seq: DerElement
+    if der_parse_element(@outer, @seq) != 0
+        return 0
+    var p: DerParser
+    if der_enter_sequence(@seq, @p) != 0
+        return 0
+    while der_parser_eof(@p) != 1
+        var trees: DerElement
+        if der_parse_element(@p, @trees) != 0
+            return 0
+        var excluded: i32 = 0
+        if der_is_context_tag(@trees, 1) == 1
+            excluded = 1
+        else
+            if der_is_context_tag(@trees, 0) != 1
+                return 0
+        let r: i32 = x509_nc_scan(@trees, name, name_len, excluded)
+        if r < 0
+            return 0
+        if name != null
+            if excluded == 1 && (r & 2) != 0
+                return 0
+            if excluded == 0 && (r & 1) != 0 && (r & 2) == 0
+                return 0
+    return 1
+
+# Do ca's name constraints allow `cert`? Every SAN dNSName must; a leaf
+# without a SAN is named by its CN (x509_verify_hostname), so that must.
+# Returns 1 or 0.
+fn x509_nc_permits(ca: *X509Certificate, cert: *X509Certificate, is_leaf: i32) -> i32
+    if x509_nc_allows(ca, null, 0) != 1
+        return 0
+    if cert.has_san == 1
+        var names: DerParser
+        if x509_san_open(cert, @names) != 0
+            return 0
+        var gn: DerElement
+        var r: i32 = x509_san_next_dns(@names, @gn)
+        while r == 1
+            if gn.content_len > 255
+                return 0
+            if x509_nc_allows(ca, gn.content, gn.content_len as i32) != 1
+                return 0
+            r = x509_san_next_dns(@names, @gn)
+        if r < 0
+            return 0
+        return 1
+    if is_leaf == 1
+        if cert.subject.common_name_len > 0
+            return x509_nc_allows(ca, @cert.subject.common_name[0], cert.subject.common_name_len as i32)
+    return 1
 
 # Verify hostname against certificate
 # Checks SubjectAltName (dNSName) first, then falls back to CN
@@ -338,6 +510,17 @@ pub fn x509_verify_hostname(cert: *X509Certificate, hostname: *u8, hostname_len:
 # Simplified Verification for TLS
 # ============================================================================
 
+# Can `leaf` authenticate a TLS 1.3 server? It signs CertificateVerify, so
+# a keyUsage must include digitalSignature; an extendedKeyUsage must include
+# serverAuth or anyExtendedKeyUsage (RFC 5280 4.2.1.3, 4.2.1.12; RFC 8446
+# 4.4.2.2). Absent extensions restrict nothing.
+pub fn x509_leaf_ok_for_tls_server(leaf: *X509Certificate) -> i32
+    if leaf.has_key_usage == 1 && (leaf.key_usage & KU_DIGITAL_SIGNATURE) == 0
+        return 0
+    if leaf.has_ext_key_usage == 1 && (leaf.ext_key_usage & (EKU_SERVER_AUTH | EKU_ANY)) == 0
+        return 0
+    return 1
+
 # One-shot certificate chain verification for TLS
 # chain: certificate chain (leaf first)
 # chain_len: number of certs
@@ -358,6 +541,9 @@ pub fn x509_verify_server_cert(chain: **X509Certificate, chain_len: i32, hostnam
     # Verify hostname matches the leaf certificate
     let leaf: *X509Certificate = chain[0]
     if leaf == null
+        return 0
+
+    if x509_leaf_ok_for_tls_server(leaf) != 1
         return 0
 
     if x509_verify_hostname(leaf, hostname, hostname_len) != 1

@@ -37,7 +37,9 @@ import mem
 # Maximum lengths for certificate fields
 const X509_MAX_NAME_LEN: i32 = 256
 const X509_MAX_SERIAL_LEN: i32 = 20
-const X509_MAX_PUBKEY_LEN: i32 = 512
+# Holds an RSA-4096 SubjectPublicKey (a 526-byte RSAPublicKey); larger keys
+# are refused, never truncated. Keep in step with X509PublicKey.key_data.
+const X509_MAX_PUBKEY_LEN: i32 = 600
 const X509_MAX_SIG_LEN: i32 = 512
 
 # Public key types
@@ -60,6 +62,29 @@ const SIG_ALG_ECDSA_SHA256: u8  = 4
 const SIG_ALG_ECDSA_SHA384: u8  = 5
 const SIG_ALG_ED25519: u8       = 6
 
+# keyUsage bits (RFC 5280 4.2.1.3): KeyUsage bit n is stored as 1 << n.
+const KU_DIGITAL_SIGNATURE: u16 = 0x0001
+const KU_NON_REPUDIATION: u16   = 0x0002
+const KU_KEY_ENCIPHERMENT: u16  = 0x0004
+const KU_DATA_ENCIPHERMENT: u16 = 0x0008
+const KU_KEY_AGREEMENT: u16     = 0x0010
+const KU_KEY_CERT_SIGN: u16     = 0x0020
+const KU_CRL_SIGN: u16          = 0x0040
+const KU_ENCIPHER_ONLY: u16     = 0x0080
+const KU_DECIPHER_ONLY: u16     = 0x0100
+
+# extendedKeyUsage purposes we act on (RFC 5280 4.2.1.12)
+const EKU_SERVER_AUTH: u8 = 0x01   # id-kp-serverAuth
+const EKU_ANY: u8         = 0x02   # anyExtendedKeyUsage
+
+# Extensions the parser understands (one bit each, to refuse duplicates).
+# A critical extension outside this set sets unknown_critical.
+const EXT_SAN: u8       = 0x01
+const EXT_BASIC: u8     = 0x02
+const EXT_KU: u8        = 0x04
+const EXT_EKU: u8       = 0x08
+const EXT_NAME_CONS: u8 = 0x10
+
 # Validity period (times as Unix timestamps)
 struct X509Validity
     not_before: i64
@@ -67,6 +92,9 @@ struct X509Validity
 
 # Distinguished Name (simplified - just stores common fields)
 struct X509Name
+    # ub-common-name is 64 (RFC 5280 A.1). A longer CN is not stored at all
+    # (length 0, so it never matches a hostname): truncated, it could name
+    # another host.
     common_name: [64]u8
     common_name_len: u8
     organization: [64]u8
@@ -81,7 +109,7 @@ struct X509Name
 struct X509PublicKey
     algorithm: u8           # PUBKEY_TYPE_*
     curve: u8               # EC_CURVE_* (for EC keys)
-    key_data: [512]u8       # Raw public key bytes
+    key_data: [600]u8       # Raw public key bytes (X509_MAX_PUBKEY_LEN)
     key_len: u64
 
 # Parsed X.509 Certificate
@@ -95,9 +123,22 @@ struct X509Certificate
     subject: X509Name
     public_key: X509PublicKey
 
-    # Extensions (basic subset)
-    is_ca: u8               # From basicConstraints
-    key_usage: u16          # From keyUsage
+    # Extensions. An absent keyUsage / extendedKeyUsage restricts nothing.
+    is_ca: u8               # basicConstraints cA
+    has_path_len: u8
+    path_len: i32           # basicConstraints pathLenConstraint
+    has_key_usage: u8
+    key_usage: u16          # KU_* bits
+    has_ext_key_usage: u8
+    ext_key_usage: u8       # EKU_* bits
+    # nameConstraints: the NameConstraints SEQUENCE (DER, tag and length
+    # included), pointing into the certificate's DER like tbs_data.
+    has_name_constraints: u8
+    nc_data: *u8
+    nc_len: u64
+    # 1 if a critical extension not listed in EXT_* is present: the
+    # certificate must not be used in path validation (RFC 5280 4.2).
+    unknown_critical: u8
 
     # subjectAltName: the GeneralNames SEQUENCE (DER, tag and length
     # included), pointing into the certificate's DER like tbs_data.
@@ -191,11 +232,11 @@ fn x509_parse_rdn_attribute(parser: *DerParser, name: *X509Name) -> i32
 
     # Copy value to appropriate field based on OID
     if oid_is_common_name(@oid) == 1
-        var copy_len: u64 = value_elem.content_len
-        if copy_len > 63
-            copy_len = 63
-        mem_copy(@name.common_name[0], value_elem.content, copy_len)
-        name.common_name_len = copy_len as u8
+        if value_elem.content_len > 64
+            name.common_name_len = 0
+        else
+            mem_copy(@name.common_name[0], value_elem.content, value_elem.content_len)
+            name.common_name_len = value_elem.content_len as u8
 
     if oid_is_org_name(@oid) == 1
         var copy_len: u64 = value_elem.content_len
@@ -214,7 +255,7 @@ fn x509_parse_rdn_attribute(parser: *DerParser, name: *X509Name) -> i32
     return 0
 
 # Parse Name (sequence of RDNs)
-fn x509_parse_name(parser: *DerParser, name: *X509Name) -> i32
+pub fn x509_parse_name(parser: *DerParser, name: *X509Name) -> i32
     # Initialize
     name.common_name_len = 0
     name.organization_len = 0
@@ -504,8 +545,8 @@ pub fn x509_parse_public_key(parser: *DerParser, pubkey: *X509PublicKey) -> i32
     if der_bit_string_content(@pk_bits, @pk_data, @pk_len, @unused) != 0
         return -1
 
-    if pk_len > 512
-        pk_len = 512
+    if pk_len > X509_MAX_PUBKEY_LEN as u64
+        return -1
 
     mem_copy(@pubkey.key_data[0], pk_data, pk_len)
     pubkey.key_len = pk_len
@@ -516,104 +557,233 @@ pub fn x509_parse_public_key(parser: *DerParser, pubkey: *X509PublicKey) -> i32
 # Extensions Parsing
 # ============================================================================
 
-fn x509_parse_extensions(parser: *DerParser, cert: *X509Certificate) -> i32
-    # Extensions are wrapped in [3] context tag
-    var wrapper: DerElement
-    if der_parse_element(parser, @wrapper) != 0
+# Every parser below fails closed: -1 on any DER it does not expect. The
+# caller then rejects the whole certificate, so a malformed extension can
+# never hide the subjectAltName (and with it the CN fallback) or a constraint.
+
+# Parse `data` as exactly one DER element (nothing after it).
+fn x509_ext_single(data: *u8, len: u64, out: *DerElement) -> i32
+    var p: DerParser
+    der_parser_init(@p, data, len)
+    if der_parse_element(@p, out) != 0
+        return -1
+    if der_parser_eof(@p) != 1
+        return -1
+    return 0
+
+# subjectAltName: GeneralNames ::= SEQUENCE OF GeneralName. The entries are
+# read when matching (x509_verify); malformed entries match nothing there.
+fn x509_parse_ext_san(data: *u8, len: u64, cert: *X509Certificate) -> i32
+    var seq: DerElement
+    if x509_ext_single(data, len, @seq) != 0
+        return -1
+    if der_is_sequence(@seq) != 1
+        return -1
+    cert.has_san = 1
+    cert.san_data = seq.content - seq.header_len
+    cert.san_len = seq.header_len + seq.content_len
+    return 0
+
+# basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+#                                 pathLenConstraint INTEGER (0..MAX) OPTIONAL }
+fn x509_parse_ext_basic(data: *u8, len: u64, cert: *X509Certificate) -> i32
+    var seq: DerElement
+    if x509_ext_single(data, len, @seq) != 0
+        return -1
+    var bc: DerParser
+    if der_enter_sequence(@seq, @bc) != 0
+        return -1
+    if der_parser_eof(@bc) == 1
+        return 0
+    var e: DerElement
+    if der_parse_element(@bc, @e) != 0
+        return -1
+    if e.tag_class == TAG_CLASS_UNIVERSAL && e.tag_number == (TAG_BOOLEAN as u32)
+        if e.content_len != 1
+            return -1
+        if e.content[0] != 0
+            cert.is_ca = 1
+        if der_parser_eof(@bc) == 1
+            return 0
+        if der_parse_element(@bc, @e) != 0
+            return -1
+    var n: i64 = 0
+    if der_integer_to_i64(@e, @n) != 0
+        return -1
+    if n < 0
+        return -1
+    if n > 1000
+        n = 1000  # far beyond any chain we accept (X509_MAX_CHAIN_DEPTH)
+    cert.has_path_len = 1
+    cert.path_len = n as i32
+    if der_parser_eof(@bc) != 1
+        return -1
+    return 0
+
+# keyUsage ::= BIT STRING; bit n (MSB of the first byte is bit 0) -> 1 << n.
+fn x509_parse_ext_key_usage(data: *u8, len: u64, cert: *X509Certificate) -> i32
+    var bits: DerElement
+    if x509_ext_single(data, len, @bits) != 0
+        return -1
+    var p: *u8 = null
+    var n: u64 = 0
+    var unused: u8 = 0
+    if der_bit_string_content(@bits, @p, @n, @unused) != 0
+        return -1
+    var ku: u16 = 0
+    var i: u64 = 0
+    while i < 9
+        let byte: u64 = i / 8
+        if byte < n
+            let mask: u8 = (0x80 >> (i % 8)) as u8
+            if (p[byte] & mask) != 0
+                ku = ku | ((1 << i) as u16)
+        i += 1
+    cert.has_key_usage = 1
+    cert.key_usage = ku
+    return 0
+
+# extKeyUsage ::= SEQUENCE OF KeyPurposeId (OBJECT IDENTIFIER)
+fn x509_parse_ext_eku(data: *u8, len: u64, cert: *X509Certificate) -> i32
+    var seq: DerElement
+    if x509_ext_single(data, len, @seq) != 0
+        return -1
+    var p: DerParser
+    if der_enter_sequence(@seq, @p) != 0
+        return -1
+    var eku: u8 = 0
+    while der_parser_eof(@p) != 1
+        var e: DerElement
+        if der_parse_element(@p, @e) != 0
+            return -1
+        var oid: Oid
+        if der_decode_oid(@e, @oid) != 0
+            return -1
+        if oid_is_kp_server_auth(@oid) == 1
+            eku = eku | EKU_SERVER_AUTH
+        if oid_is_any_ext_key_usage(@oid) == 1
+            eku = eku | EKU_ANY
+    cert.has_ext_key_usage = 1
+    cert.ext_key_usage = eku
+    return 0
+
+# nameConstraints ::= SEQUENCE { permitted [0], excluded [1] }. Kept as DER;
+# x509_verify checks its subtrees against the certificates below this CA.
+fn x509_parse_ext_name_constraints(data: *u8, len: u64, cert: *X509Certificate) -> i32
+    var seq: DerElement
+    if x509_ext_single(data, len, @seq) != 0
+        return -1
+    if der_is_sequence(@seq) != 1
+        return -1
+    cert.has_name_constraints = 1
+    cert.nc_data = seq.content - seq.header_len
+    cert.nc_len = seq.header_len + seq.content_len
+    return 0
+
+# EXT_* bit for an extension OID we understand, 0 for any other.
+fn x509_ext_kind(oid: *Oid) -> u8
+    if oid_is_subject_alt_name(oid) == 1
+        return EXT_SAN
+    if oid_is_basic_constraints(oid) == 1
+        return EXT_BASIC
+    if oid_is_key_usage(oid) == 1
+        return EXT_KU
+    if oid_is_ext_key_usage(oid) == 1
+        return EXT_EKU
+    if oid_is_name_constraints(oid) == 1
+        return EXT_NAME_CONS
+    return 0
+
+# Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE,
+#                          extnValue OCTET STRING }
+# `seen` collects EXT_* bits: an extension may appear only once (4.2).
+fn x509_parse_extension(parser: *DerParser, cert: *X509Certificate, seen: *u8) -> i32
+    var ext: DerElement
+    if der_parse_element(parser, @ext) != 0
+        return -1
+    var inner: DerParser
+    if der_enter_sequence(@ext, @inner) != 0
         return -1
 
-    if der_is_context_tag(@wrapper, 3) != 1
+    var oid_elem: DerElement
+    if der_parse_element(@inner, @oid_elem) != 0
+        return -1
+    var oid: Oid
+    if der_decode_oid(@oid_elem, @oid) != 0
         return -1
 
+    var critical: u8 = 0
+    var value: DerElement
+    if der_parse_element(@inner, @value) != 0
+        return -1
+    if value.tag_class == TAG_CLASS_UNIVERSAL && value.tag_number == (TAG_BOOLEAN as u32)
+        if value.content_len != 1
+            return -1
+        if value.content[0] != 0
+            critical = 1
+        if der_parse_element(@inner, @value) != 0
+            return -1
+    if der_is_octet_string(@value) != 1 || value.constructed != 0
+        return -1
+    if der_parser_eof(@inner) != 1
+        return -1
+
+    let kind: u8 = x509_ext_kind(@oid)
+    if kind == 0
+        if critical == 1
+            cert.unknown_critical = 1
+        return 0
+    if (*seen & kind) != 0
+        return -1
+    *seen = *seen | kind
+
+    if kind == EXT_SAN
+        return x509_parse_ext_san(value.content, value.content_len, cert)
+    if kind == EXT_BASIC
+        return x509_parse_ext_basic(value.content, value.content_len, cert)
+    if kind == EXT_KU
+        return x509_parse_ext_key_usage(value.content, value.content_len, cert)
+    if kind == EXT_EKU
+        return x509_parse_ext_eku(value.content, value.content_len, cert)
+    return x509_parse_ext_name_constraints(value.content, value.content_len, cert)
+
+# extensions [3] EXPLICIT Extensions; Extensions ::= SEQUENCE OF Extension
+fn x509_parse_extensions(wrapper: *DerElement, cert: *X509Certificate) -> i32
     var wrapper_parser: DerParser
-    if der_enter_constructed(@wrapper, @wrapper_parser) != 0
+    if der_enter_constructed(wrapper, @wrapper_parser) != 0
         return -1
-
-    # Extensions is a SEQUENCE
     var ext_seq: DerElement
     if der_parse_element(@wrapper_parser, @ext_seq) != 0
         return -1
-
-    if der_is_sequence(@ext_seq) != 1
+    if der_parser_eof(@wrapper_parser) != 1
         return -1
-
     var ext_parser: DerParser
     if der_enter_sequence(@ext_seq, @ext_parser) != 0
         return -1
-
-    # Parse each extension
+    var seen: u8 = 0
     while der_parser_eof(@ext_parser) != 1
-        var ext: DerElement
-        if der_parse_element(@ext_parser, @ext) != 0
-            break
+        if x509_parse_extension(@ext_parser, cert, @seen) != 0
+            return -1
+    return 0
 
-        if der_is_sequence(@ext) != 1
+# What follows subjectPublicKeyInfo in the TBS: issuerUniqueID [1] and
+# subjectUniqueID [2] (v2+, skipped), then extensions [3] (v3, once).
+# Anything else is an error.
+fn x509_parse_tbs_tail(parser: *DerParser, cert: *X509Certificate) -> i32
+    var have_ext: i32 = 0
+    while der_parser_eof(parser) != 1
+        var e: DerElement
+        if der_parse_element(parser, @e) != 0
+            return -1
+        if have_ext == 1
+            return -1
+        if cert.version >= 2 && (der_is_context_tag(@e, 1) == 1 || der_is_context_tag(@e, 2) == 1)
             continue
-
-        var ext_inner: DerParser
-        if der_enter_sequence(@ext, @ext_inner) != 0
-            continue
-
-        # Extension OID
-        var ext_oid_elem: DerElement
-        if der_parse_element(@ext_inner, @ext_oid_elem) != 0
-            continue
-
-        var ext_oid: Oid
-        if der_decode_oid(@ext_oid_elem, @ext_oid) != 0
-            continue
-
-        # Critical flag (optional BOOLEAN)
-        var next_elem: DerElement
-        if der_parse_element(@ext_inner, @next_elem) != 0
-            continue
-
-        var ext_value: *DerElement = @next_elem
-
-        # Check if it's a BOOLEAN (critical flag)
-        if next_elem.tag_class == TAG_CLASS_UNIVERSAL
-            if next_elem.tag_number == (TAG_BOOLEAN as u32)
-                # Skip critical flag, parse actual value
-                var actual_value: DerElement
-                if der_parse_element(@ext_inner, @actual_value) != 0
-                    continue
-                ext_value = @actual_value
-
-        # Process known extensions
-        if oid_is_subject_alt_name(@ext_oid) == 1
-            # extnValue OCTET STRING wraps GeneralNames ::= SEQUENCE OF
-            # GeneralName. Record that a SAN exists even if it is malformed:
-            # x509_verify_hostname then matches nothing (fail closed) rather
-            # than falling back to the CN.
-            cert.has_san = 1
-            if der_is_octet_string(ext_value) == 1
-                var san_parser: DerParser
-                der_parser_init(@san_parser, ext_value.content, ext_value.content_len)
-                var san_seq: DerElement
-                if der_parse_element(@san_parser, @san_seq) == 0
-                    if der_is_sequence(@san_seq) == 1
-                        cert.san_data = san_seq.content - san_seq.header_len
-                        cert.san_len = san_seq.header_len + san_seq.content_len
-
-        if oid_is_basic_constraints(@ext_oid) == 1
-            # Parse basicConstraints
-            if der_is_octet_string(ext_value) == 1
-                var bc_parser: DerParser
-                der_parser_init(@bc_parser, ext_value.content, ext_value.content_len)
-
-                var bc_seq: DerElement
-                if der_parse_element(@bc_parser, @bc_seq) == 0
-                    if der_is_sequence(@bc_seq) == 1
-                        var bc_inner: DerParser
-                        if der_enter_sequence(@bc_seq, @bc_inner) == 0
-                            if der_parser_eof(@bc_inner) != 1
-                                var ca_elem: DerElement
-                                if der_parse_element(@bc_inner, @ca_elem) == 0
-                                    if ca_elem.tag_number == (TAG_BOOLEAN as u32)
-                                        if ca_elem.content_len > 0
-                                            if ca_elem.content[0] != 0
-                                                cert.is_ca = 1
-
+        if cert.version != 3 || der_is_context_tag(@e, 3) != 1
+            return -1
+        if x509_parse_extensions(@e, cert) != 0
+            return -1
+        have_ext = 1
     return 0
 
 # ============================================================================
@@ -714,11 +884,10 @@ pub fn x509_parse_certificate(der_data: *u8, der_len: u64, cert: *X509Certificat
     if x509_parse_public_key(@tbs_parser, @cert.public_key) != 0
         return -16
 
-    # Extensions (v3 only)
-    if cert.version == 3
-        if der_parser_eof(@tbs_parser) != 1
-            # Try to parse extensions, but don't fail if we can't
-            x509_parse_extensions(@tbs_parser, cert)
+    # Unique IDs and extensions. Fail closed: an extension we cannot parse
+    # could be the subjectAltName or a constraint.
+    if x509_parse_tbs_tail(@tbs_parser, cert) != 0
+        return -20
 
     # Signature Algorithm (outer)
     var outer_alg: u8 = x509_parse_sig_algorithm(@cert_parser)
