@@ -28,7 +28,7 @@ import tempfile
 import textwrap
 import threading
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 try:
@@ -1859,6 +1859,22 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
+# AGAST #2141: exit code for "every failure was a missing toolchain binary".
+# The room gate runs `rz build --all`; on a machine without lld-link, harland's
+# UEFI loader cannot link. Exit 1 there would read as a regression, and
+# excusing it would read as a pass -- it is neither, so it gets its own code.
+EXIT_SETUP = 3
+
+# Targets in this process that failed only because a tool is absent:
+# target name -> tool. build_package() moves each into its result.
+_SETUP_MISSES: dict[str, str] = {}
+
+
+def record_setup_miss(target: str, tool: str) -> None:
+    """Mark `target`'s failure as the environment's fault (missing `tool`)."""
+    _SETUP_MISSES[target] = tool
+
+
 def find_llvm_tool(name: str) -> str:
     """Find LLVM tool, trying versioned names."""
     import shutil as shutil_mod
@@ -2259,6 +2275,7 @@ def compile_freestanding_binary(
                     f"    Install it with:  sudo apt install lld",
                     file=sys.stderr,
                 )
+                record_setup_miss(name, "lld-link")
                 return None
 
         else:
@@ -2308,11 +2325,20 @@ class PackageBuildResult:
     built: list[Path]
     failed: list[str]
     skipped: list[SkippedBinary]
+    # The subset of `failed` that failed only because a toolchain binary is
+    # missing from this machine (AGAST #2141). Still failures -- `ok` is
+    # False -- but the environment's fault, not the code's.
+    setup_failed: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         """True only when no declared target failed."""
         return not self.failed
+
+    @property
+    def setup_only(self) -> bool:
+        """Failed, and every failure was a missing tool (exit EXIT_SETUP)."""
+        return bool(self.failed) and set(self.failed) <= set(self.setup_failed)
 
     def __bool__(self) -> bool:
         # Deliberate: truth-testing the result means "did the package build?",
@@ -2381,6 +2407,8 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     built = []
     # A target that could not even be resolved is a failure, not an absence.
     failed = [u.name for u in plan.unresolved]
+    setup_failed = []       # subset of `failed`: missing tool only (#2141)
+    _SETUP_MISSES.clear()   # a miss belongs to the package that recorded it
 
     for skipped in plan.skipped:
         print(f"  ⏭ {skipped.name} skipped: {skipped.reason}")
@@ -2490,8 +2518,14 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
         else:
             print(f"\n  ✗ Failed to build {bin_config.name}")
             failed.append(bin_config.name)
+            tool = _SETUP_MISSES.pop(bin_config.name, None)
+            if tool:
+                print(f"  ⚠ SETUP ERROR: {bin_config.name} needs {tool}, which this "
+                      f"machine lacks -- not verified here, not a regression")
+                setup_failed.append(bin_config.name)
 
-    return PackageBuildResult(built=built, failed=failed, skipped=plan.skipped)
+    return PackageBuildResult(built=built, failed=failed, skipped=plan.skipped,
+                              setup_failed=setup_failed)
 
 
 def ritz_path_for_tests(caller_path: str) -> str:
@@ -2920,6 +2954,7 @@ def cmd_build(args):
             return 1
 
     success = True
+    setup_only = True   # every failure so far was a missing tool (#2141)
     for pkg_dir, config in targets:
         # A test-only package (`[build] test_only = true`) deliberately declares
         # no [[bin]], so get_binaries() returns [] and build_package() returns an
@@ -2940,11 +2975,16 @@ def cmd_build(args):
             print(f"  ✗ Failed to build {config['package']['name']}: {result.summary()}",
                   file=sys.stderr)
             success = False
+            setup_only = setup_only and result.setup_only
 
     if keep_artifacts:
         print(f"\n📁 Debug artifacts kept in build/")
 
-    return 0 if success else 1
+    if success:
+        return 0
+    # A missing tool is neither a pass nor the code's fault: its own code, so
+    # `rz build --all` (and the room gate) can say which (AGAST #2141).
+    return EXIT_SETUP if setup_only else 1
 
 
 # --- `rz test --all -j N` units (AGAST #1809) ------------------------------

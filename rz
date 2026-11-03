@@ -256,7 +256,14 @@ def gate_outcome(failed, known_failing, ran):
     return hard, known, xpass
 
 
-def summarize_gate(kind, failed, known_failing, ran, list_kind=None):
+# AGAST #2141: build.py's exit code for "every failure was a missing tool"
+# (build.EXIT_SETUP). A sweep whose only unexcused failures are setup errors
+# exits with it too: neither a pass nor a regression.
+EXIT_SETUP = 3
+
+
+def summarize_gate(kind, failed, known_failing, ran, list_kind=None,
+                   setup=None):
     """Print the end-of-sweep gate summary; return the process exit code.
 
     The known-failing list is deliberately NOT continue-on-error: excused
@@ -270,9 +277,17 @@ def summarize_gate(kind, failed, known_failing, ran, list_kind=None):
     `list_kind` names which rz.toml table the excuses came from, when that
     differs from the sweep kind (the test sweep consults the BUILD list —
     see cmd_test for why there is no [ci.known_failing.test]).
+
+    `setup` names failed projects whose build exited EXIT_SETUP: a missing
+    toolchain binary, the machine's fault (AGAST #2141). Unexcused, they are
+    listed as SETUP ERROR rather than as failures, and alone make the exit
+    EXIT_SETUP; any real failure or xpass still exits 1.
     """
     list_kind = list_kind or kind
     hard, known, xpass = gate_outcome(failed, known_failing, ran)
+    setup_set = set(setup or ())
+    setup_err = [p for p in hard if p in setup_set]
+    hard = [p for p in hard if p not in setup_set]
 
     print(flush=True)
     if known:
@@ -287,11 +302,17 @@ def summarize_gate(kind, failed, known_failing, ran, list_kind=None):
         print(f"    Remove them from [ci.known_failing.{list_kind}] in rz.toml "
               f"(and close the task) — this gate fails until the list is "
               f"accurate.", flush=True)
+    if setup_err:
+        print(f"⚠ SETUP ERROR — not verified on this machine (a missing tool, "
+              f"not a regression; see the project's log above): "
+              f"{', '.join(setup_err)}", flush=True)
     if hard:
         print(f"✗ Failed {kind}: {', '.join(hard)}", flush=True)
         return 1
     if xpass:
         return 1
+    if setup_err:
+        return EXIT_SETUP
     gating = len(ran) - len(known)
     print(f"✓ All {gating} gating project(s) passed {kind} "
           f"({len(known)} known-failing excluded, listed above)."
@@ -528,7 +549,8 @@ def _banner(verb, project, compiler):
 
 
 def build_projects_parallel(projects, jobs, extra_args):
-    """`rz build --all` on the pool. Returns failed projects, in order."""
+    """`rz build --all` on the pool. Returns (failed, setup): failed
+    projects in order, and the subset whose build exited EXIT_SETUP."""
     compiler = extra_args[extra_args.index("--compiler") + 1] \
         if "--compiler" in extra_args else "ritz0"
     units = [Unit(project=p, order=(i,), sched=(i,), kind="build",
@@ -536,7 +558,7 @@ def build_projects_parallel(projects, jobs, extra_args):
                        str(PROJECTS_DIR / p), *extra_args],
                   env=child_env(p))
              for i, p in enumerate(projects)]
-    failed = []
+    failed, setup = [], []
 
     def render(i):
         u = units[i]
@@ -544,6 +566,8 @@ def build_projects_parallel(projects, jobs, extra_args):
         _emit(u.output)
         if u.rc != 0:
             failed.append(u.project)
+            if u.rc == EXIT_SETUP:
+                setup.append(u.project)
             _emit(f"✗ {u.project}: build failed (exit {u.rc})")
 
     printer = _InOrderPrinter(len(projects), render)
@@ -551,7 +575,7 @@ def build_projects_parallel(projects, jobs, extra_args):
     run_pool(jobs, units, lambda u: printer.finish(u.order[0]))
     _emit(f"rz: built {len(projects)} project(s) on {jobs} worker(s) "
           f"in {time.monotonic() - t0:.1f}s")
-    return failed
+    return failed, setup
 
 
 @dataclass
@@ -678,10 +702,11 @@ def cmd_build(args):
         projects = discover_projects()
         jobs = resolve_jobs(getattr(args, "jobs", None))
         if jobs > 1:
-            failed = build_projects_parallel(projects, jobs, extra_args)
+            failed, setup = build_projects_parallel(projects, jobs, extra_args)
             return summarize_gate(
-                "build", failed, known_failing_from_config("build"), projects)
-        failed = []
+                "build", failed, known_failing_from_config("build"), projects,
+                setup=setup)
+        failed, setup = [], []
         for project in projects:
             # flush=True on the banner (and the verdict below) is load-bearing:
             # with stdout piped (CI), unflushed banners detach from the child
@@ -692,10 +717,13 @@ def cmd_build(args):
             rc = run_build(project, extra_args)
             if rc != 0:
                 failed.append(project)
+                if rc == EXIT_SETUP:
+                    setup.append(project)
                 print(f"✗ {project}: build failed (exit {rc})", flush=True)
 
         return summarize_gate(
-            "build", failed, known_failing_from_config("build"), projects)
+            "build", failed, known_failing_from_config("build"), projects,
+            setup=setup)
 
     if not args.project:
         print("Error: Specify a project or use --all", file=sys.stderr)

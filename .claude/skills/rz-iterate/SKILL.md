@@ -154,9 +154,11 @@ vouches for that exact commit.
    LOG=$(~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh ~/dev/ritz-lang/rz-task-<id> <id>)
    ~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh --wait "$LOG"
    ```
-   It runs a clean `make -C projects/ritz ci-local`, one gate machine-wide,
-   and exits with the gate's code (98 = no verdict, 99 = HEAD moved; neither
-   passes). The gate runs at full CPU weight; your room runs at CPUWeight=20
+   It runs a clean `make -C projects/ritz ci-local` over CI's `build-all`
+   and `bootstrap` jobs (#2141), one gate machine-wide, and exits with the
+   gate's code (98 = no verdict, 99 = HEAD moved; neither passes). A
+   `SETUP ERROR` line means a missing tool on this machine (e.g. lld-link
+   for harland), not a regression: fix the machine and re-gate. The gate runs at full CPU weight; your room runs at CPUWeight=20
    under a 5G memory cap, so room builds can't starve it (#1811). Don't
    escape the cap with your own `systemd-run`. If you touched packages
    outside `projects/ritz`, also `./rz build <pkg>` and run their tests;

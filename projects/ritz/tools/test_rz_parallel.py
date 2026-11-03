@@ -369,12 +369,12 @@ class TestGateWiring:
         monkeypatch.setattr(rz, "build_projects_parallel",
                             lambda projects, jobs, extra:
                             calls.setdefault("bpar", (projects, jobs)) and
-                            list(failed))
+                            (list(failed), []))
         monkeypatch.setattr(rz, "known_failing_from_config",
                             lambda kind: calls.setdefault("kf", kind) and
                             {"q": "AGAST #1 — x"})
 
-        def gate(kind, f, kf, ran, list_kind=None):
+        def gate(kind, f, kf, ran, list_kind=None, setup=None):
             calls["gate"] = (kind, f, kf, ran, list_kind)
             return 0
         monkeypatch.setattr(rz, "summarize_gate", gate)
@@ -418,9 +418,9 @@ class TestBuildSweep:
             return unit
 
         monkeypatch.setattr(rz, "run_unit", fake)
-        failed = rz.build_projects_parallel(["a", "b", "c"], 3,
-                                            ["--compiler", "ritz0"])
-        assert failed == ["b"]
+        failed, setup = rz.build_projects_parallel(["a", "b", "c"], 3,
+                                                   ["--compiler", "ritz0"])
+        assert failed == ["b"] and setup == []
         out = capsys.readouterr().out
         assert out.index("[built a]") < out.index("[built b]") < out.index(
             "[built c]")

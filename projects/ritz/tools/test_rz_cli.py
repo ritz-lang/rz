@@ -207,6 +207,45 @@ class TestKnownFailingConfig:
         assert rz.summarize_gate("test", ["a"], {"a": "AGAST #0"}, ["a"]) == 0
         assert rz.summarize_gate("test", [], {"a": "AGAST #0"}, ["a"]) == 1
 
+    def test_setup_error_is_its_own_verdict(self, rz, capsys):
+        # AGAST #2141: a project whose build exited EXIT_SETUP (a missing
+        # tool, e.g. harland without lld-link) is neither a pass nor a
+        # regression. Alone it exits 3; named under SETUP ERROR, not under
+        # "Failed build".
+        rc = rz.summarize_gate("build", ["harland"], {}, ["harland", "a"],
+                               setup=["harland"])
+        out = capsys.readouterr().out
+        assert rc == rz.EXIT_SETUP == 3
+        assert "SETUP ERROR" in out and "harland" in out
+        assert "Failed build" not in out
+
+    def test_setup_error_never_masks_a_regression(self, rz, capsys):
+        rc = rz.summarize_gate("build", ["harland", "angelo"], {},
+                               ["harland", "angelo"], setup=["harland"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "✗ Failed build: angelo" in out
+        assert "SETUP ERROR" in out
+
+    def test_setup_error_on_a_known_failing_project_stays_advisory(self, rz):
+        # Already excused: the setup miss does not make it gate.
+        assert rz.summarize_gate("build", ["lexis"], {"lexis": "AGAST #0"},
+                                 ["lexis"], setup=["lexis"]) == 0
+
+    def test_build_sweep_collects_setup_exit_codes(self, rz, monkeypatch):
+        # The parallel sweep (the gate's path: rz.toml max_jobs = 8) hands
+        # summarize_gate the projects whose build exited EXIT_SETUP.
+        def fake_pool(jobs, units, on_done):
+            for u in units:
+                u.rc = {"harland": 3, "angelo": 1}.get(u.project, 0)
+                u.output = ""
+                on_done(u)
+        monkeypatch.setattr(rz, "run_pool", fake_pool)
+        failed, setup = rz.build_projects_parallel(
+            ["angelo", "harland", "ok"], 2, ["--compiler", "ritz0"])
+        assert failed == ["angelo", "harland"]
+        assert setup == ["harland"]
+
     def test_gate_summary_names_the_source_list(self, rz, capsys):
         # The test sweep borrows the BUILD list; the summary must point
         # readers at the table the excuse actually lives in.

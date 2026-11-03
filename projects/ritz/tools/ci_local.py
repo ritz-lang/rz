@@ -28,6 +28,7 @@ Usage
     python3 tools/ci_local.py --list              # what CI declares
     python3 tools/ci_local.py                     # run the `bootstrap` job
     python3 tools/ci_local.py --job build-all
+    python3 tools/ci_local.py --job build-all --job bootstrap   # the room gate
     python3 tools/ci_local.py --jobs              # every job (slow: test-all
                                                   # sweeps 26 projects, ~50m)
 
@@ -64,7 +65,16 @@ A name that matches no step in the selected job(s) exits 2 before anything
 runs, so a renamed step cannot quietly turn the skip into a no-op. Skipped
 steps are listed in the summary.
 
-Exit code: 0 only if every step it ran exited 0.
+`--job` is repeatable; the selected jobs run in workflow order. The gate runner
+runs `--job build-all --job bootstrap` (AGAST #2141): bootstrap alone is the
+compiler gate, but a compiler change can break an ecosystem package -- #2124
+broke angelo, gated green, and turned main's build-all red for nine runs.
+
+Exit code: 0 only if every step it ran exited 0. A step that exits 3
+(EXIT_SETUP: `rz build --all` saying a toolchain binary is missing, e.g.
+lld-link) is a SETUP ERROR: it does not trip --fail-fast, and if every failure
+was one the run exits 3 -- not 0 (nothing was verified) and not 1 (nothing
+regressed). Any other failure exits 1.
 """
 
 from __future__ import annotations
@@ -90,6 +100,10 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "main.yml"
 SETUP_STEP_MARKERS = ("install toolchain", "install ritz0 dependencies")
 
 DEFAULT_JOB = "bootstrap"
+
+# A step's exit code for "a toolchain binary is missing" -- rz's and
+# build.py's EXIT_SETUP (AGAST #2141).
+EXIT_SETUP = 3
 
 # The composite action that pins clang (AGAST #1308). It is a `uses:` step, so
 # it has no command to run -- but its effect matters: it prepends the
@@ -274,7 +288,8 @@ def run_step(step: Step, dry_run: bool = False) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--job", help=f"run one job (default: {DEFAULT_JOB})")
+    p.add_argument("--job", action="append", default=[],
+                   help=f"run this job (repeatable; default: {DEFAULT_JOB})")
     p.add_argument("--jobs", action="store_true", help="run every job")
     p.add_argument("--list", action="store_true",
                    help="print the steps CI declares and exit")
@@ -307,12 +322,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.jobs:
         selected = available
     else:
-        job = args.job or DEFAULT_JOB
-        if job not in available:
-            print(f"unknown job {job!r}; available: {', '.join(available)}",
-                  file=sys.stderr)
+        wanted = args.job or [DEFAULT_JOB]
+        bad = [j for j in wanted if j not in available]
+        if bad:
+            print(f"unknown job {', '.join(repr(j) for j in bad)}; "
+                  f"available: {', '.join(available)}", file=sys.stderr)
             return 2
-        selected = [job]
+        # Workflow order, not argv order: the same run whichever way it's typed.
+        selected = [j for j in available if j in wanted]
 
     # A --skip that matches nothing would be a silent no-op the day the step
     # is renamed, and the gate would quietly pay for it again (AGAST #1897).
@@ -332,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["RITZ_CAS_STATS_LOG"] = name  # inherited by every step
 
     failures: list[str] = []
+    setup_errors: list[str] = []
     skipped: list[str] = []
     not_run: list[str] = []
     skipped_by_request: list[str] = []
@@ -350,7 +368,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         rc, secs = timed_step(s, dry_run=args.dry_run)
         timings.append((s.name, secs, rc))
-        if rc != 0:
+        if rc == EXIT_SETUP:
+            # The machine's fault: no verdict on the code, so no fail-fast.
+            setup_errors.append(f"[{s.job}] {s.name} (exit {rc})")
+        elif rc != 0:
             failures.append(f"[{s.job}] {s.name} (exit {rc})")
 
     print(f"\n{'=' * 70}")
@@ -374,11 +395,18 @@ def main(argv: list[str] | None = None) -> int:
         print("skipped (environment setup; --with-setup to include):")
         for s in skipped:
             print(f"  - {s}")
+    if setup_errors:
+        print(f"⚠ SETUP ERROR in {len(setup_errors)} step(s) -- a missing tool, "
+              f"not a regression; not verified on this machine:")
+        for f in setup_errors:
+            print(f"  - {f}")
     if failures:
         print(f"✗ {len(failures)} step(s) failed:")
         for f in failures:
             print(f"  - {f}")
         return 1
+    if setup_errors:
+        return EXIT_SETUP
     print(f"✓ all steps passed for: {', '.join(selected)}")
     return 0
 

@@ -178,7 +178,7 @@ jobs:
       - name: First ok
         run: echo first
       - name: Second fails
-        run: exit 3
+        run: exit 4
       - name: Third leaves a marker
         run: touch {marker}
 """
@@ -214,7 +214,7 @@ def test_each_step_prints_start_and_end_with_duration(three_steps, capsys):
     ci_local.main([])
     out = capsys.readouterr().out
     iso = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d"
-    for name, rc in (("First ok", 0), ("Second fails", 3),
+    for name, rc in (("First ok", 0), ("Second fails", 4),
                      ("Third leaves a marker", 0)):
         assert re.search(rf"\[{re.escape(name)}\] START {iso}", out), out
         assert re.search(
@@ -226,7 +226,7 @@ def test_final_timing_table_lists_every_step_run(three_steps, capsys):
     out = capsys.readouterr().out
     table = out[out.index("step timings"):]
     assert re.search(r"First ok\s+\d+(\.\d+)?s\s+rc=0", table), table
-    assert re.search(r"Second fails\s+\d+(\.\d+)?s\s+rc=3", table), table
+    assert re.search(r"Second fails\s+\d+(\.\d+)?s\s+rc=4", table), table
     assert re.search(r"total\s+\d+(\.\d+)?s", table), table
 
 
@@ -302,6 +302,26 @@ def test_gate_runner_defaults_to_fail_fast():
     cmd_line = next(line for line in gate.read_text().splitlines()
                     if line.startswith("CMD="))
     assert re.search(r"ci-local ARGS=\S*--fail-fast", cmd_line), cmd_line
+
+
+def test_gate_runner_runs_build_all_and_bootstrap():
+    """AGAST #2141: #2124 broke angelo, passed a bootstrap-only gate, and
+    turned main's build-all red. The gate runs both jobs."""
+    gate = ci_local.REPO_ROOT / ".claude/skills/rz-iterate/run-gate.sh"
+    if not gate.is_file():
+        pytest.skip("run-gate.sh is not part of this checkout")
+    text = gate.read_text()
+    cmd_line = next(line for line in text.splitlines() if line.startswith("CMD="))
+    args = re.search(r'ci-local ARGS=\\"([^"\\]*)\\"', cmd_line)
+    assert args, cmd_line
+    jobs = re.findall(r"--job (\S+)", args.group(1))
+    assert set(jobs) == {"build-all", "bootstrap"}, cmd_line
+    # --wait's summary must surface the verdicts: which project broke, and a
+    # setup error as itself.
+    wait_grep = next(line for line in text.splitlines()
+                     if "grep -E" in line and "EXIT" in line)
+    for needle in ("Failed build", "SETUP ERROR"):
+        assert needle in wait_grep, wait_grep
 
 
 # --------------------------------------------------------------------------
@@ -391,3 +411,74 @@ def test_real_verify_ir_steps_carry_their_env():
     verified = [s.name for s in ci_local.load_steps()
                 if s.job == "bootstrap" and s.env.get("RITZ_VERIFY_IR") == "1"]
     assert len(verified) >= 2, verified
+
+
+# --------------------------------------------------------------------------
+# AGAST #2141: the gate runs build-all AND bootstrap; a setup error is its
+# own verdict, never folded into "failed" (1) or "passed" (0).
+# --------------------------------------------------------------------------
+
+TWO_JOBS = """\
+jobs:
+  alpha:
+    steps:
+      - name: A
+        run: {a}
+  beta:
+    steps:
+      - name: B
+        run: {b}
+"""
+
+
+def _two_jobs(tmp_path, monkeypatch, a="'true'", b="'true'"):
+    wf = tmp_path / "main.yml"
+    wf.write_text(TWO_JOBS.format(a=a, b=b))
+    monkeypatch.setattr(ci_local, "WORKFLOW", wf)
+    monkeypatch.setattr(ci_local, "REPO_ROOT", tmp_path)
+
+
+def test_job_is_repeatable(tmp_path, monkeypatch, capsys):
+    _two_jobs(tmp_path, monkeypatch)
+    assert ci_local.main(["--job", "alpha", "--job", "beta"]) == 0
+    out = capsys.readouterr().out
+    assert "[A] START" in out and "[B] START" in out
+    assert "all steps passed for: alpha, beta" in out
+
+
+def test_repeated_job_runs_in_workflow_order(tmp_path, monkeypatch, capsys):
+    _two_jobs(tmp_path, monkeypatch)
+    ci_local.main(["--job", "beta", "--job", "alpha"])
+    out = capsys.readouterr().out
+    assert out.index("[A] START") < out.index("[B] START")
+
+
+def test_unknown_job_among_several_is_an_error(tmp_path, monkeypatch):
+    _two_jobs(tmp_path, monkeypatch)
+    assert ci_local.main(["--job", "alpha", "--job", "nope"]) == 2
+
+
+def test_setup_only_failure_exits_with_the_setup_code(tmp_path, monkeypatch, capsys):
+    _two_jobs(tmp_path, monkeypatch, a="exit 3")
+    assert ci_local.main(["--job", "alpha", "--job", "beta"]) == ci_local.EXIT_SETUP == 3
+    out = capsys.readouterr().out
+    assert "SETUP ERROR" in out
+
+
+def test_real_failure_beats_a_setup_error(tmp_path, monkeypatch):
+    _two_jobs(tmp_path, monkeypatch, a="exit 3", b="exit 1")
+    assert ci_local.main(["--job", "alpha", "--job", "beta"]) == 1
+
+
+def test_setup_error_does_not_stop_fail_fast(tmp_path, monkeypatch, capsys):
+    # A missing tool says nothing about the compiler: the bootstrap job
+    # still runs, so the gate's verdict on the code is complete.
+    _two_jobs(tmp_path, monkeypatch, a="exit 3", b="exit 1")
+    assert ci_local.main(["--fail-fast", "--job", "alpha", "--job", "beta"]) == 1
+    assert "[B] START" in capsys.readouterr().out
+
+
+def test_real_build_all_job_is_one_rz_build_all_step():
+    """run-gate.sh relies on build-all's exit code being `rz build --all`'s."""
+    steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
+    assert [s.run.strip() for s in steps] == ["./rz build --all"]

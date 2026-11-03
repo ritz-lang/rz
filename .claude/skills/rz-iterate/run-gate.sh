@@ -28,6 +28,12 @@
 #     specific commit passed.  A gate that ran while HEAD moved proves nothing.
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
+#   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
+#     passed a bootstrap-only gate, and main's build-all was red for 9 runs.
+#     `rz build --all` honours rz.toml [ci.known_failing.build].  A missing
+#     toolchain binary (harland's bootx64 without lld-link) is reported as
+#     SETUP ERROR (ci_local exit 3; make turns it into 2): not a pass, not a
+#     regression.  --wait prints the line; install the tool and re-gate.
 set -euo pipefail
 
 GATES="${RZ_GATE_DIR:-$HOME/dev/ritz-lang/gate-logs}"
@@ -45,7 +51,7 @@ if [[ "${1:-}" == "--wait" ]]; then
         sleep 15
     done
     rc="$(sed -n 's/^EXIT=//p' "$LOG" | tail -1)"
-    grep -E '^(SHA|SLOT|EXIT)=|Stage [0-9]:|passed|FATAL' "$LOG" | tail -20
+    grep -E '^(SHA|SLOT|EXIT)=|Stage [0-9]:|passed|FATAL|Failed build|SETUP ERROR|step\(s\) failed' "$LOG" | tail -20
     exit "$rc"
 fi
 
@@ -64,7 +70,9 @@ SLOTS="${RZ_GATE_SLOTS:-1}"
 # `make smoke` first (AGAST #1803): a fully broken commit fails in ~2 min, not
 # ~26.  main.yml's bootstrap job also starts with "Smoke"; ci-local skips it
 # (`--skip Smoke`, AGAST #1897) rather than pay ~30 s to run it again.
-CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke\"}"
+# build-all runs first (main.yml order): ~30 s on a warm CAS, so a broken
+# ecosystem package fails before the long bootstrap job (AGAST #2141).
+CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke --job build-all --job bootstrap\"}"
 UNIT="ritz-gate-$NAME"
 
 # Uncommitted tracked changes would be tested but not merged.
