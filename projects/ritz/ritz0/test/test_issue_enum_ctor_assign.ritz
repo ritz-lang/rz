@@ -1,0 +1,178 @@
+# AGAST #2142: an enum variant constructor as an assignment RHS or a
+# struct-literal field takes its enum from the target's declared type.
+#
+# ritz1 resolved a ctor's enum only from a typed let/var or a call
+# parameter (#1498). `x = Some(..)`, `s.f = None`, `p.f = Rect(..)` and
+# `Font { cmap: Some(..) }` got no context and emitted
+#   %.N = add i64 0, 0  ; variant w/ no enum ctx
+# which clang rejects. Covered for Option<Struct>, a scalar Option and a
+# user payload enum, in fns that return no enum (no return-type fallback).
+
+struct Cmap
+    base: u32
+    span: u32
+
+struct Dims
+    w: i32
+    h: i32
+
+enum Shape
+    Circle(i32)
+    Rect(Dims)
+    Empty
+
+struct Font
+    cmap: Option<Cmap>
+    shape: Shape
+    tag: Option<i32>
+
+fn opt_cmap(o: Option<Cmap>) -> i32
+    match o
+        Some(c) => (c.base + c.span) as i32
+        None => -1
+
+fn opt_i32(o: Option<i32>) -> i32
+    match o
+        Some(v) => v
+        None => -1
+
+fn area(sh: Shape) -> i32
+    match sh
+        Circle(r) => 3 * r * r
+        Rect(d) => d.w * d.h
+        Empty => 0
+
+# --- `x = Ctor(..)` onto a local --------------------------------------------
+
+fn local_assign_option(p: i32) -> i32
+    var held: Option<Cmap> = None
+    if p != 0
+        held = Some(Cmap { base: 10, span: 5 })
+    opt_cmap(held)
+
+fn local_assign_option_none() -> i32
+    var held: Option<Cmap> = Some(Cmap { base: 1, span: 1 })
+    held = None
+    opt_cmap(held)
+
+fn local_assign_option_int(p: i32) -> i32
+    var held: Option<i32> = None
+    if p != 0
+        held = Some(41)
+    opt_i32(held)
+
+fn local_assign_shape(k: i32) -> i32
+    var sh: Shape = Empty
+    if k == 1
+        sh = Circle(2)
+    if k == 2
+        sh = Rect(Dims { w: 5, h: 6 })
+    if k == 3
+        sh = Circle(1)
+        sh = Empty
+    area(sh)
+
+# --- `s.f = Ctor(..)` onto a struct field -----------------------------------
+
+fn blank_font() -> Font
+    let none: Option<Cmap> = None
+    let empty: Shape = Empty
+    let notag: Option<i32> = None
+    Font { cmap: none, shape: empty, tag: notag }
+
+fn field_assign_local(k: i32) -> i32
+    var f: Font = blank_font()
+    if k == 1
+        f.cmap = Some(Cmap { base: 65, span: 26 })
+        f.shape = Rect(Dims { w: 3, h: 4 })
+        f.tag = Some(7)
+    opt_cmap(f.cmap) * 1000 + area(f.shape) * 10 + opt_i32(f.tag)
+
+fn field_assign_ptr(f: *Font)
+    f.cmap = None
+    f.shape = Circle(3)
+    f.tag = Some(9)
+
+# A member-chain target (`h.font.cmap = ..`, `(*p).tag = ..`).
+struct Holder
+    font: Font
+
+fn chain_assign(k: i32) -> i32
+    var h: Holder = Holder { font: blank_font() }
+    if k == 1
+        h.font.cmap = Some(Cmap { base: 30, span: 3 })
+        h.font.shape = Circle(1)
+    let p: *Font = @h.font
+    (*p).tag = Some(5)
+    opt_cmap(h.font.cmap) * 1000 + area(h.font.shape) * 10 + opt_i32(h.font.tag)
+
+# `*p = Ctor(..)` through a pointer to an enum.
+fn deref_assign(o: *Option<Cmap>, sh: *Shape)
+    *o = Some(Cmap { base: 4, span: 4 })
+    *sh = Rect(Dims { w: 7, h: 2 })
+
+# --- `S { f: Ctor(..) }` ----------------------------------------------------
+
+fn lit_fields_some() -> i32
+    let f: Font = Font { cmap: Some(Cmap { base: 65, span: 26 }), shape: Rect(Dims { w: 2, h: 3 }), tag: Some(4) }
+    opt_cmap(f.cmap) * 1000 + area(f.shape) * 10 + opt_i32(f.tag)
+
+fn lit_fields_none() -> i32
+    let f: Font = Font { cmap: None, shape: Empty, tag: None }
+    opt_cmap(f.cmap) * 1000 + area(f.shape) * 10 + opt_i32(f.tag)
+
+fn lit_fields_assigned() -> i32
+    var f: Font = blank_font()
+    f = Font { cmap: Some(Cmap { base: 1, span: 2 }), shape: Circle(1), tag: None }
+    opt_cmap(f.cmap) * 1000 + area(f.shape) * 10 + opt_i32(f.tag)
+
+[[test]]
+fn test_enum_ctor_assign_local_option() -> i32
+    assert local_assign_option(1) == 15
+    assert local_assign_option(0) == -1
+    assert local_assign_option_none() == -1
+    assert local_assign_option_int(1) == 41
+    assert local_assign_option_int(0) == -1
+    0
+
+[[test]]
+fn test_enum_ctor_assign_local_user_enum() -> i32
+    assert local_assign_shape(0) == 0
+    assert local_assign_shape(1) == 12
+    assert local_assign_shape(2) == 30
+    assert local_assign_shape(3) == 0
+    0
+
+[[test]]
+fn test_enum_ctor_assign_field() -> i32
+    # 91*1000 + 12*10 + 7
+    assert field_assign_local(1) == 91127
+    assert field_assign_local(0) == -1000 + 0 - 1
+    var f: Font = blank_font()
+    f.cmap = Some(Cmap { base: 2, span: 2 })
+    field_assign_ptr(@f)
+    assert opt_cmap(f.cmap) == -1
+    assert area(f.shape) == 27
+    assert opt_i32(f.tag) == 9
+    # 33*1000 + 3*10 + 5
+    assert chain_assign(1) == 33035
+    assert chain_assign(0) == -1000 + 0 + 5
+    0
+
+[[test]]
+fn test_enum_ctor_struct_lit_field() -> i32
+    # 91*1000 + 6*10 + 4
+    assert lit_fields_some() == 91064
+    assert lit_fields_none() == -1000 + 0 - 1
+    # 3*1000 + 3*10 - 1
+    assert lit_fields_assigned() == 3029
+    0
+
+[[test]]
+fn test_enum_ctor_deref_assign() -> i32
+    var o: Option<Cmap> = None
+    var sh: Shape = Empty
+    deref_assign(@o, @sh)
+    assert opt_cmap(o) == 8
+    assert area(sh) == 14
+    0

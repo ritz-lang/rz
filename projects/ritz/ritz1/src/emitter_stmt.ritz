@@ -830,8 +830,9 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_array_field_whole_assign(s, member_result.reg, member_result.field, stmt.assign_value)
                 return
             if member_result.success == 1
-                let val: i32 = emit_expr(s, stmt.assign_value)
                 let field: *StructField = member_result.field
+                # AGAST #2142: `p.shape = Rect(..)` builds the field's enum.
+                let val: i32 = emit_expr_into_slot(s, stmt.assign_value, field.field_type, field.field_type_name, field.field_type_name_len)
                 # AGAST #2048: f32 / f64 fields store float / double.
                 if emit_float_field_store(s, member_result.reg, field.field_type, val, stmt.assign_value) == 1
                     return
@@ -1054,7 +1055,14 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 struct_name = stmt.assign_value.ident_ptr
                 struct_name_len = stmt.assign_value.ident_len
 
-        let val: i32 = emit_expr(s, stmt.assign_value)
+        # AGAST #2142: `*p = Some(..)` builds the pointee's enum.  Only when
+        # the destination struct is known; an unresolved one keeps the
+        # plain lowering (and its return-type fallback).
+        var val: i32 = 0
+        if value_type == TYPE_STRUCT and struct_name_len > 0
+            val = emit_expr_into_slot(s, stmt.assign_value, value_type, struct_name, struct_name_len)
+        else
+            val = emit_expr(s, stmt.assign_value)
         # For `*ptr = value`, the store address IS the pointer — NOT the
         # dereferenced value. `target_expr` here IS the pointer expression
         # (parser strips the leading `*`), so emit_expr produces the pointer
@@ -1213,8 +1221,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             if local != null and is_simd_vector_type_name(local.type_name, local.type_name_len) == 1
                 s.ctx_simd_name = local.type_name
                 s.ctx_simd_name_len = local.type_name_len
-            # For function call or other expression returning struct
-            let val: i32 = emit_expr(s, stmt.assign_value)
+            # For function call or other expression returning struct.
+            # AGAST #2142: `held = Some(..)` builds the local's enum.
+            var val: i32 = 0
+            if local != null
+                val = emit_expr_into_slot(s, stmt.assign_value, var_type, local.type_name, local.type_name_len)
+            else
+                val = emit_expr(s, stmt.assign_value)
             s.ctx_simd_name = _saved_simd_a
             s.ctx_simd_name_len = _saved_simd_a_len
             if local != null
@@ -1254,7 +1267,8 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     return
         # AGAST #1652: `p = s` (`s: @&S`) into a `*S` local.  `let` only;
         # see the #1755 note in emit_fn.
-        let assign_raw: i32 = emit_expr(s, stmt.assign_value)
+        # AGAST #2142: a non-enum local is no enum context for a ctor RHS.
+        let assign_raw: i32 = emit_expr_into_slot(s, stmt.assign_value, var_type, null, 0)
         let val: i32 = ptr_slot_value(s, var_type, stmt.assign_value, assign_raw)
         if var_type == TYPE_I32 or var_type == TYPE_U32
             let trunc: i32 = next_reg(s)
@@ -2894,8 +2908,9 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     if field.field_type == TYPE_ARRAY
                         emit_array_field_whole_assign(s, field_ptr, field, stmt.assign_value)
                         return
-                    # Emit the value
-                    let val_reg: i32 = emit_expr(s, stmt.assign_value)
+                    # Emit the value.  AGAST #2142: `f.cmap = None` builds
+                    # the field's enum.
+                    let val_reg: i32 = emit_expr_into_slot(s, stmt.assign_value, field.field_type, field.field_type_name, field.field_type_name_len)
                     # Store the value based on field type.
                     #
                     # AGAST #1303: narrow fields (u8/i8/u16/i16) used to fall
