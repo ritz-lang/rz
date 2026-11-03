@@ -40,6 +40,10 @@ ATTRS = {
     "noinline": (False, ("fn",)),
 }
 
+# The tail of every "can't be `= extern`" diagnostic (AGAST #1900). ritz1
+# prints the same words (ritz1/src/ast_helpers.ritz decl_refused).
+DECL_REFUSED = "cannot be declaration-only (= extern)"
+
 
 class Parser:
     """
@@ -1954,6 +1958,28 @@ class Parser:
             self._advance()
             ret_type = self.parse_type()
 
+        if self._at(TokenType.EQ) and self._peek_at(1, TokenType.EXTERN):
+            # Declaration only (LANGUAGE_SPEC §5.3, AGAST #1900).
+            self._advance()
+            self._advance()
+            if not self._at(TokenType.NEWLINE, TokenType.EOF, TokenType.DEDENT):
+                raise ParseError(f"Expected end of line after '= extern', got "
+                                 f"{self._current().type.name}", self._current().span)
+            # Bodies the using module needs itself can't live elsewhere.
+            name = name_tok.value
+            if type_params:
+                raise ParseError(f"generic fn '{name}' {DECL_REFUSED}: importers "
+                                 f"instantiate its body", span)
+            if is_async:
+                raise ParseError(f"async fn '{name}' {DECL_REFUSED}: importers "
+                                 f"transform its body", span)
+            if any(a.name == "test" for a in attrs):
+                raise ParseError(f"[[test]] fn '{name}' {DECL_REFUSED}: a test "
+                                 f"needs its body", span)
+            return rast.FnDef(span, name_tok.value, params, ret_type,
+                              rast.Block(span, [], None), attrs,
+                              is_async=is_async, is_pub=is_pub, is_decl=True)
+
         body = self.parse_block()
         if any(a.name == "naked" for a in attrs):
             # No prologue means no frame: the body is asm that returns by
@@ -2321,6 +2347,11 @@ class Parser:
             self._advance()
             ret_type = self.parse_type()
 
+        if self._at(TokenType.EQ) and self._peek_at(1, TokenType.EXTERN):
+            raise ParseError(
+                f"trait method '{name_tok.value}' {DECL_REFUSED}: a trait method "
+                f"is a signature already; drop '= extern'", span)
+
         return rast.TraitMethodSig(span, name_tok.value, params, ret_type)
 
     def parse_trait(self, is_pub: bool = False) -> rast.TraitDef:
@@ -2429,6 +2460,11 @@ class Parser:
                     f"method '{method.name}' of '{type_name}' has its own type "
                     f"parameters <{', '.join(method.type_params)}>; generic methods "
                     f"are not supported -- use a free generic fn",
+                    method.span)
+            if method.is_decl and type_params:
+                raise ParseError(
+                    f"method '{method.name}' of generic impl '{type_name}' "
+                    f"{DECL_REFUSED}: importers instantiate its body",
                     method.span)
             methods.append(method)
             self._skip_newlines()

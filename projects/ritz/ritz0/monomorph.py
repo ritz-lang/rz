@@ -1465,7 +1465,8 @@ class Monomorphizer:
         new_body = self._rewrite_block(fn.body)
 
         new_fn = rast.FnDef(fn.span, fn.name, new_params, new_ret, new_body, fn.attrs,
-                            type_params=fn.type_params, is_async=fn.is_async, is_pub=fn.is_pub)
+                            type_params=fn.type_params, is_async=fn.is_async, is_pub=fn.is_pub,
+                            is_decl=fn.is_decl)
         # Preserve source_file for separate compilation
         if hasattr(fn, 'source_file'):
             new_fn.source_file = fn.source_file

@@ -597,6 +597,48 @@ fn mul(a: i32, b: i32) -> i32
 extern fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
 ```
 
+`extern fn` is a C-style symbol: top level only, no `pub`, no attributes.
+
+**Declaration-only fns.** A fn or method header ending in `= extern`
+instead of a body declares the fn without defining it. The body lives in
+another object, under the same symbol and ABI as in the module that defines
+it, so a call emits exactly the `declare` that importing that module would.
+The form is valid at top level and in a plain `impl` block, and takes `pub`
+and attributes as a definition does. It is how a module's interface is
+written as Ritz source (AGAST #1900, #1901).
+
+```ritz
+pub struct Pt
+    x: i64
+    y: i64
+
+pub fn add(a: i64, b: i64) -> i64 = extern
+
+impl Pt
+    fn sum(self: *Pt) -> i64 = extern
+    pub fn bump(self: *Pt, by: i64) = extern
+```
+
+A body the using module needs itself can't be declaration-only, so each of
+these is a compile error naming the item: a generic fn, a method of a
+generic impl (importers instantiate both), an `async fn` (its body is
+transformed where it is used), a `[[test]]` fn, and a trait method (already
+a signature).
+
+```ritz expect-error="cannot be declaration-only"
+pub fn ident<T>(x: T) -> T = extern
+```
+
+*Why `= extern`:* it is a tail on an unchanged header, so a definition
+becomes its declaration by replacing the body and nothing else, and both
+parsers see it as one extra alternative after the return type: `=` can't
+start a type or a block. Two alternatives were rejected. A `[[decl]]`
+attribute on a header with no INDENT needs attributes on impl methods,
+which ritz1 does not parse, and it makes a forgotten body look like a
+declaration. Widening `extern fn` to methods, `pub` and attributes would
+blur the C-style symbol it declares today. The keyword `extern` keeps one
+meaning: "defined in another object".
+
 ### 5.4 Methods
 
 Methods live in `impl` blocks. The receiver is named `self`, either bare or
@@ -2026,7 +2068,7 @@ item         := attrs (fn_def | extern_fn | struct_def | enum_def
 attrs        := ('[[' attr (',' attr)* ']]' NEWLINE)*     # §17
 attr         := IDENT | IDENT '=' STRING
 fn_def       := 'pub'? 'fn' IDENT generic_params? '(' params? ')'
-                ('->' type)? block
+                ('->' type)? (block | '=' 'extern' NEWLINE)   # §5.3
 struct_def   := 'pub'? 'struct' IDENT generic_params? NEWLINE INDENT field+ DEDENT
 enum_def     := 'pub'? 'enum' IDENT generic_params? NEWLINE INDENT variant+ DEDENT
 impl_block   := 'impl' generic_params? (IDENT 'for')? IDENT NEWLINE

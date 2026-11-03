@@ -860,6 +860,10 @@ class FnDef(Item):
     is_pub: bool = False    # pub fn - exported from module
     type_params: List[str] = None  # Generic type parameters like <T, U>
     type_param_bounds: dict = None  # Trait bounds: {"T": ["Drop", "Clone"]}
+    # Declaration only, `fn ... = extern` (LANGUAGE_SPEC §5.3, AGAST #1900):
+    # the body lives in another object; `body` is an empty Block and is
+    # never emitted, so a call declares the fn as an import of it would.
+    is_decl: bool = False
 
     def __post_init__(self):
         if self.attrs is None:

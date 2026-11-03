@@ -185,6 +185,8 @@ pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
     if p.skip_item == 0
         module_add_fn(p.module, fn_def)
         if (g_attr_bits & ATTR_TEST) != 0
+            if fn_is_decl(fn_def) == 1
+                decl_refused(fn_def.line, c"[[test]] fn", fn_def.name, fn_def.name_len, null, 0, c"a test needs its body")
             test_fn_record(fn_def)
         let fn_bits: i32 = g_attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE)
         if fn_bits != 0
@@ -637,6 +639,8 @@ pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u
     while mt != null
         if mt.type_params != null
             generic_method_error(mt, type_name, type_len)
+        if type_params != null and fn_is_decl(mt) == 1
+            decl_refused(mt.line, c"method", mt.name, mt.name_len, type_name, type_len, c"importers instantiate its body")
         mt = mt.next
     return ib
 
@@ -666,6 +670,67 @@ fn generic_method_error(mt: *FnDef, type_name: *u8, type_len: i32)
     eprints_cstr(c"' of '")
     eprint_lexeme(type_name, type_len)
     eprintln_cstr(c"' has its own type parameters; generic methods are not supported -- use a free generic fn")
+
+# =============================================================================
+# Declaration-only fns: `fn ... = extern` (LANGUAGE_SPEC §5.3, AGAST #1900)
+# =============================================================================
+#
+# A declared fn or method has the one body every stripped import shares
+# (main.ritz strip_to_interface, #1899), so it is emitted exactly as an
+# imported definition is: main() never marks it is_local, the call site
+# `declare`s it, and emitting it is a hard error.  It can't be null:
+# `body == null` means `extern fn`.
+
+var g_stripped_body: Stmt
+
+pub fn stripped_body() -> *Stmt
+    g_stripped_body.kind = STMT_STRIPPED
+    g_stripped_body.next = null
+    @g_stripped_body
+
+pub fn fn_is_decl(f: *FnDef) -> i32
+    if f.body == @g_stripped_body
+        return 1
+    0
+
+# One error per item name (the grammar may re-run an action on
+# backtracking); counted in g_attr_errors, which fails the parse.  ritz0
+# prints the same words (parser.py DECL_REFUSED).
+var g_decl_last_err: *u8 = null
+
+# `owner` (a generic impl's type name) may be null.
+fn decl_refused(line: i32, what: *u8, name: *u8, name_len: i32, owner: *u8, owner_len: i32, why: *u8)
+    if name == g_decl_last_err
+        return
+    g_decl_last_err = name
+    g_attr_errors = g_attr_errors + 1
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprints_cstr(c": ")
+    eprints_cstr(what)
+    eprints_cstr(c" '")
+    eprint_lexeme(name, name_len)
+    if owner != null
+        eprints_cstr(c"' of generic impl '")
+        eprint_lexeme(owner, owner_len)
+    eprints_cstr(c"' cannot be declaration-only (= extern): ")
+    eprintln_cstr(why)
+
+# Grammar action: `[pub] fn name[<T>](params) [-> R] = extern`.
+pub fn decl_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, params: *Param, ret: i32, line: i32, col: i32) -> *FnDef
+    if type_params != null
+        decl_refused(line, c"generic fn", name, len, null, 0, c"importers instantiate its body")
+    generic_fn_def_new(p, name, len, type_params, params, ret, stripped_body(), line, col)
+
+# Grammar action: `fn name(params) [-> R] = extern` in a trait.
+pub fn trait_decl_refused(name: *u8, len: i32, line: i32) -> i32
+    decl_refused(line, c"trait method", name, len, null, 0, c"a trait method is a signature already; drop '= extern'")
+    0
 
 # =============================================================================
 # Global variable helpers

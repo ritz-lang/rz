@@ -3061,7 +3061,8 @@ class LLVMEmitter:
                 ret_type=method.ret_type,
                 body=method.body,
                 attrs=method.attrs,
-                type_params=method.type_params
+                type_params=method.type_params,
+                is_decl=method.is_decl,
             )
             # Preserve source_file for separate compilation
             if hasattr(method, 'source_file'):
@@ -3923,6 +3924,11 @@ class LLVMEmitter:
         Returns:
             True if the function body should be emitted
         """
+        # `fn ... = extern` (AGAST #1900): defined in another object, so
+        # declared exactly as an imported definition is.
+        if getattr(item, 'is_decl', False):
+            return False
+
         # If no source file tracking, emit all bodies (legacy behavior)
         if self._current_source_file is None:
             return True
