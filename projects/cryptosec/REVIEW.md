@@ -46,7 +46,7 @@ The cryptographic primitives (ChaCha20, Poly1305, X25519, Ed25519, AES, SHA-256/
 
 ### H-2: Server authentication completely bypassed
 
-> **Status (2026-11, AGAST #1862):** Fixed. `certificate_verify_verify` verifies ecdsa_secp256r1_sha256 and ed25519 and rejects everything else (rsa_pkcs1 is forbidden in TLS 1.3 CertificateVerify; rsa_pss is unimplemented). The client now requires, fail closed: a pinned leaf certificate (`tls_config_pin_cert`), a hostname match, a verifying CertificateVerify, and EE → Certificate → CertificateVerify → Finished order; there is no skip-verify mode. CA-chain validation is not wired into the client yet, so an unpinned client refuses every server — tracked in #2109 (CA chain, SAN, validity) and #2110 (RSA-PSS). Covered by `test/test_tls13_handshake.ritz` and valet's `test/test_tls_e2e.ritz`.
+> **Status (2026-11, AGAST #1862):** Fixed. `certificate_verify_verify` verifies ecdsa_secp256r1_sha256 and ed25519 and rejects everything else (rsa_pkcs1 is forbidden in TLS 1.3 CertificateVerify; rsa_pss is unimplemented). The client now requires, fail closed: a pinned leaf certificate (`tls_config_pin_cert`), a hostname match, a verifying CertificateVerify, and EE → Certificate → CertificateVerify → Finished order; there is no skip-verify mode. Since #2109 the client can instead trust a CA store (`tls_config_set_ca_store`): chain to an anchor, signatures, CA flags, validity and SAN hostname; with neither a pin nor a store it refuses every server. RSA-PSS is #2110. Covered by `test/test_tls13_handshake.ritz` and valet's `test/test_tls_e2e.ritz`.
 
 **File:** `tls13_handshake.ritz:754-756`, `tls13_client.ritz:493`
 **Severity:** HIGH — Full MITM
@@ -71,6 +71,8 @@ The TLS 1.3 client accepts any server certificate and any CertificateVerify mess
 ### H-3: Second buffer overflow in TLS client decrypt
 
 > **Status (2026-11, AGAST #1862):** Not an overflow today: `tls13_record_decrypt` refuses plaintext larger than `out_cap` (-9), so the 4096-byte buffer limits the size of the server's flight rather than overflowing.
+>
+> **Status (2026-11, AGAST #2109):** Fixed. The client buffers one whole record (2^14 + 256 ciphertext + header), decrypts into 16640 bytes, refuses larger records and plaintexts as `TLS_ERR_RECORD_OVERFLOW`, and reassembles handshake messages across records (up to 64 KiB).
 
 **File:** `tls13_client.ritz:400, 404`
 **Severity:** HIGH — Remote exploitable
@@ -259,6 +261,8 @@ Both comparison loops use early-exit branching, leaking hash byte position via t
 
 ### M-9: `x509_verify_hostname` ignores SubjectAltName
 
+> **Status (2026-11, AGAST #2109):** Fixed. The SAN extension is parsed; when present only its dNSName entries are matched (the CN is used only for certificates without a SAN).
+
 **File:** `x509_verify.ritz:280-286`
 
 Only checks Common Name. RFC 6125/9525 requires SAN checking. All modern CA-issued certs carry SANs and may have empty CN.
@@ -384,7 +388,7 @@ Both branches of the if/else execute identical code (SHA-256 init). SHA-384 is n
 | L-1 | Arena partial-allocation waste on cert parse failure | `ca_store.ritz:138-156` |
 | L-2 | `ca_store_load_pem_file` passes `size=0` to `sys_mmap` for empty files | `ca_store.ritz:237` |
 | L-3 | BigInt intermediates not zeroed in `bigint_mod_exp` | `bigint.ritz` |
-| L-4 | ECDSA/Ed25519 X.509 verification returns 0 (fail-safe but undocumented) | `x509_verify.ritz:42-46` |
+| L-4 | ECDSA/Ed25519 X.509 verification returns 0 (fail-safe but undocumented). **Fixed #2109:** ECDSA-SHA256/384 (P-256 issuers; P-384 is #2115) and Ed25519 verified | `x509_verify.ritz:42-46` |
 | L-5 | `GRND_NONBLOCK`/`GRND_RANDOM` constants defined but unused | `random.ritz:25-26` |
 | L-6 | `fe_reduce` in x25519 uses non-constant-time nested branches | `x25519.ritz:248-253` |
 | L-7 | `cpu_has_avx512` doesn't check AVX2 prerequisite | `cpuid.ritz:165` |

@@ -7,7 +7,8 @@
 # tls13_record_encrypt's already-framed record in a second header.
 #
 # The client trusts the server only through an explicit pinned leaf
-# certificate; there is no "skip verification" mode to fall back on.
+# certificate or (since #2109) a CA store; there is no "skip verification"
+# mode to fall back on.
 #
 # Fixtures: self-signed P-256 certificates generated for this test
 # (openssl req -x509 -sha256 -days 36500). They are test-only trust anchors
@@ -23,6 +24,7 @@ import cryptosec.mem
 import cryptosec.tls13_client
 import cryptosec.tls13_handshake
 import cryptosec.tls13_record
+import cryptosec.ca_store
 
 fn key_valet() -> *u8
     return c"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNT9qgcppZH3mMfCD\nItz3rs0NZXlB9L0Ov5BudymuXlKhRANCAASzc1xpUOiT4bf/6U0rfJm8oWRsyeKg\nCPOV9iHemcqrVinp+stzc0kkTBROPewRlBOA8VKO6sWetFYJ7HOZfwvT\n-----END PRIVATE KEY-----\n"
@@ -320,4 +322,322 @@ fn test_e2e_client_rejects_same_length_different_pin() -> i32
     leaf[20] = leaf[20] ^ 0x01  # inside the serialNumber INTEGER
     if client_verdict(@scfg, c"valet.test", @pin) != TLS_ERR_CERTIFICATE_INVALID
         return 3
+    return 0
+
+# ============================================================================
+# CA-chain trust (AGAST #2109)
+# ============================================================================
+# Fixtures generated with openssl 3.5 for these tests only (keys protect
+# nothing); all valid 2026-01-01 .. 2126-01-01:
+#   ca_root          P-256 CA "CN=Ritz Test Root EC,O=Ritz"
+#   ca_impostor      P-256 CA with the same name and a different key
+#   ca_root_ed25519  Ed25519 CA
+#   chain_leaf_inter leaf (key key_ca_leaf, CN=Ritz Leaf, SAN DNS:valet.test,
+#                    DNS:*.wild.test) + intermediate CA issued by ca_root
+#   chain_leaf_only  the same leaf without its intermediate
+#   chain_leaf_ed25519  a leaf with the same key, issued by ca_root_ed25519
+#   chain_big        chain_leaf_inter + four unrelated RSA-4096 certificates
+#                    (a flight larger than the client's old 4096-byte buffer)
+
+fn ca_root() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBvDCCAWOgAwIBAgIUCRKPbD31oQV4XrDehNSML4O3E2YwCgYIKoZIzj0EAwIw\nKzEaMBgGA1UEAwwRUml0eiBUZXN0IFJvb3QgRUMxDTALBgNVBAoMBFJpdHowIBcN\nMjYwMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMCsxGjAYBgNVBAMMEVJpdHog\nVGVzdCBSb290IEVDMQ0wCwYDVQQKDARSaXR6MFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAE0CcYIMiaXD/MukS1gvlJq6NclmL64sovgcAFaQO30M0OSR78waeVqmhK\nHwOFccdgfgRvfxumos9SKH3is47sL6NjMGEwHQYDVR0OBBYEFDMJUWU348CJmT6E\ni6ZhLeyue8SyMB8GA1UdIwQYMBaAFDMJUWU348CJmT6Ei6ZhLeyue8SyMA8GA1Ud\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0cAMEQCICk9\nT097RX+/4i1sfQwm/x5tzaJfWLptz6fD5rBfquqfAiAIa7t3a3w/QT5dNpwZ/uC5\nRAp9kZFUJpqdn0/w2kvWDQ==\n-----END CERTIFICATE-----\n"
+
+fn ca_impostor() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBvDCCAWOgAwIBAgIUe2cX6rXwiqKt64tojHaJ4Wwyke0wCgYIKoZIzj0EAwIw\nKzEaMBgGA1UEAwwRUml0eiBUZXN0IFJvb3QgRUMxDTALBgNVBAoMBFJpdHowIBcN\nMjYwMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMCsxGjAYBgNVBAMMEVJpdHog\nVGVzdCBSb290IEVDMQ0wCwYDVQQKDARSaXR6MFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAESLU1F6l9h/k0kUMsf4f0YE1QRmoHOFpsR+CXry8BH0uphVpcfLaaYeMa\nowhyGCgP4cv6Y+UGij3SUtIeryEUaaNjMGEwHQYDVR0OBBYEFC+AMH9LUpuzvdsW\nQpF1BoX4KSSEMB8GA1UdIwQYMBaAFC+AMH9LUpuzvdsWQpF1BoX4KSSEMA8GA1Ud\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0cAMEQCIF09\nSFg3EsEeWsFDedtmMws+Szv/6SKkHM5SZ0k6BkloAiBx2liiRKayrXVdcPdunizX\n0J+NzOyVrx3Zc4emCCx+4A==\n-----END CERTIFICATE-----\n"
+
+fn ca_root_ed25519() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBhzCCATmgAwIBAgIUHIJlmoU4sbJZE3BKrGu4S/ozX1UwBQYDK2VwMDAxHzAd\nBgNVBAMMFlJpdHogVGVzdCBSb290IEVkMjU1MTkxDTALBgNVBAoMBFJpdHowIBcN\nMjYwMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMDAxHzAdBgNVBAMMFlJpdHog\nVGVzdCBSb290IEVkMjU1MTkxDTALBgNVBAoMBFJpdHowKjAFBgMrZXADIQAvd8PS\nww6QzIJz1yJuNfAqV7IY6iWB8YUACavMrlsN/qNjMGEwHQYDVR0OBBYEFHONQQ/o\n//8QengTCObbCWnge8muMB8GA1UdIwQYMBaAFHONQQ/o//8QengTCObbCWnge8mu\nMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAUGAytlcANBAJJv99AU\n2wyY0IXRzG+BwyCScShtJjyVyzi7Yt7uDjxBNhY5+qPUSa6FGE7bJkMFe9MugUBH\nSYlRb3axRe7DjAs=\n-----END CERTIFICATE-----\n"
+
+fn key_ca_leaf() -> *u8
+    return c"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgI35ghUagiVTAgZ1A\nxwFXsDm/wsPsDK72FUFvfdvKsoOhRANCAATU2Hhe3c21Yf65Pj/qRJiQGiqg20Rd\no1+mSVGxz0iDIWIbU1i1uQADvRqFKKQNZv+7bQWBBY4YGpC0eAaaKxAR\n-----END PRIVATE KEY-----\n"
+
+fn chain_leaf_inter() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBwzCCAWmgAwIBAgIJAL2Ryin5xP8NMAoGCCqGSM49BAMCMDMxIjAgBgNVBAMM\nGVJpdHogVGVzdCBJbnRlcm1lZGlhdGUgRUMxDTALBgNVBAoMBFJpdHowIBcNMjYw\nMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMCMxEjAQBgNVBAMMCVJpdHogTGVh\nZjENMAsGA1UECgwEUml0ejBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABNTYeF7d\nzbVh/rk+P+pEmJAaKqDbRF2jX6ZJUbHPSIMhYhtTWLW5AAO9GoUopA1m/7ttBYEF\njhgakLR4BporEBGjdDByMAwGA1UdEwEB/wQCMAAwIgYDVR0RBBswGYIKdmFsZXQu\ndGVzdIILKi53aWxkLnRlc3QwHQYDVR0OBBYEFG3CUIonYqCbXLm9dGGdi1ie7QqI\nMB8GA1UdIwQYMBaAFJ9V3r/rrSib5zdoUCa4kFW6CjtLMAoGCCqGSM49BAMCA0gA\nMEUCIQChn13dbntufhYCWDz3pBNNJyoSY4c24q7eobXYXoyiIQIgcS9n2hwbW0ue\nHV7svru41vqekzC8Pf605fvtqH002WU=\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBuTCCAV+gAwIBAgIIE+ptjApbHbQwCgYIKoZIzj0EAwIwKzEaMBgGA1UEAwwR\nUml0eiBUZXN0IFJvb3QgRUMxDTALBgNVBAoMBFJpdHowIBcNMjYwMTAxMDAwMDAw\nWhgPMjEyNjAxMDEwMDAwMDBaMDMxIjAgBgNVBAMMGVJpdHogVGVzdCBJbnRlcm1l\nZGlhdGUgRUMxDTALBgNVBAoMBFJpdHowWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\nAASxf+M81yVgx/DUTs6Mtd1cQKUL4UxEXwKhmyznac2LwnK0PsD9tstJsFNlqbKY\n0bt2PZdZ4tMiqaNqVaLUIpPbo2MwYTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB\n/wQEAwIBBjAdBgNVHQ4EFgQUn1Xev+utKJvnN2hQJriQVboKO0swHwYDVR0jBBgw\nFoAUMwlRZTfjwImZPoSLpmEt7K57xLIwCgYIKoZIzj0EAwIDSAAwRQIhAITTDo1S\nZFtpD7gtp3mbubZxKrsrbtt9dMDpEZULBGVPAiBL/ltlbR4uzJUXH1VkPgM/zugn\nwi1/HYBk4XSPGb5TUQ==\n-----END CERTIFICATE-----\n"
+
+fn chain_leaf_only() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBwzCCAWmgAwIBAgIJAL2Ryin5xP8NMAoGCCqGSM49BAMCMDMxIjAgBgNVBAMM\nGVJpdHogVGVzdCBJbnRlcm1lZGlhdGUgRUMxDTALBgNVBAoMBFJpdHowIBcNMjYw\nMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMCMxEjAQBgNVBAMMCVJpdHogTGVh\nZjENMAsGA1UECgwEUml0ejBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABNTYeF7d\nzbVh/rk+P+pEmJAaKqDbRF2jX6ZJUbHPSIMhYhtTWLW5AAO9GoUopA1m/7ttBYEF\njhgakLR4BporEBGjdDByMAwGA1UdEwEB/wQCMAAwIgYDVR0RBBswGYIKdmFsZXQu\ndGVzdIILKi53aWxkLnRlc3QwHQYDVR0OBBYEFG3CUIonYqCbXLm9dGGdi1ie7QqI\nMB8GA1UdIwQYMBaAFJ9V3r/rrSib5zdoUCa4kFW6CjtLMAoGCCqGSM49BAMCA0gA\nMEUCIQChn13dbntufhYCWDz3pBNNJyoSY4c24q7eobXYXoyiIQIgcS9n2hwbW0ue\nHV7svru41vqekzC8Pf605fvtqH002WU=\n-----END CERTIFICATE-----\n"
+
+fn chain_leaf_ed25519() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBsjCCAWSgAwIBAgIJANIUd77KQuOHMAUGAytlcDAwMR8wHQYDVQQDDBZSaXR6\nIFRlc3QgUm9vdCBFZDI1NTE5MQ0wCwYDVQQKDARSaXR6MCAXDTI2MDEwMTAwMDAw\nMFoYDzIxMjYwMTAxMDAwMDAwWjAmMRUwEwYDVQQDDAxSaXR6IExlYWYgRWQxDTAL\nBgNVBAoMBFJpdHowWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATU2Hhe3c21Yf65\nPj/qRJiQGiqg20Rdo1+mSVGxz0iDIWIbU1i1uQADvRqFKKQNZv+7bQWBBY4YGpC0\neAaaKxARo3QwcjAMBgNVHRMBAf8EAjAAMCIGA1UdEQQbMBmCCnZhbGV0LnRlc3SC\nCyoud2lsZC50ZXN0MB0GA1UdDgQWBBRtwlCKJ2Kgm1y5vXRhnYtYnu0KiDAfBgNV\nHSMEGDAWgBRzjUEP6P//EHp4Ewjm2wlp4HvJrjAFBgMrZXADQQCbHaz2k47v4hjr\n2dTqqMnLCZ4f7X2GPUbSfQBSA9sB/t6/KuS54SL79OofbFGO1kkrsBcSpulxaY9z\n85Qb2TIP\n-----END CERTIFICATE-----\n"
+
+fn chain_big() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBwzCCAWmgAwIBAgIJAL2Ryin5xP8NMAoGCCqGSM49BAMCMDMxIjAgBgNVBAMM\nGVJpdHogVGVzdCBJbnRlcm1lZGlhdGUgRUMxDTALBgNVBAoMBFJpdHowIBcNMjYw\nMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMCMxEjAQBgNVBAMMCVJpdHogTGVh\nZjENMAsGA1UECgwEUml0ejBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABNTYeF7d\nzbVh/rk+P+pEmJAaKqDbRF2jX6ZJUbHPSIMhYhtTWLW5AAO9GoUopA1m/7ttBYEF\njhgakLR4BporEBGjdDByMAwGA1UdEwEB/wQCMAAwIgYDVR0RBBswGYIKdmFsZXQu\ndGVzdIILKi53aWxkLnRlc3QwHQYDVR0OBBYEFG3CUIonYqCbXLm9dGGdi1ie7QqI\nMB8GA1UdIwQYMBaAFJ9V3r/rrSib5zdoUCa4kFW6CjtLMAoGCCqGSM49BAMCA0gA\nMEUCIQChn13dbntufhYCWDz3pBNNJyoSY4c24q7eobXYXoyiIQIgcS9n2hwbW0ue\nHV7svru41vqekzC8Pf605fvtqH002WU=\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBuTCCAV+gAwIBAgIIE+ptjApbHbQwCgYIKoZIzj0EAwIwKzEaMBgGA1UEAwwR\nUml0eiBUZXN0IFJvb3QgRUMxDTALBgNVBAoMBFJpdHowIBcNMjYwMTAxMDAwMDAw\nWhgPMjEyNjAxMDEwMDAwMDBaMDMxIjAgBgNVBAMMGVJpdHogVGVzdCBJbnRlcm1l\nZGlhdGUgRUMxDTALBgNVBAoMBFJpdHowWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\nAASxf+M81yVgx/DUTs6Mtd1cQKUL4UxEXwKhmyznac2LwnK0PsD9tstJsFNlqbKY\n0bt2PZdZ4tMiqaNqVaLUIpPbo2MwYTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB\n/wQEAwIBBjAdBgNVHQ4EFgQUn1Xev+utKJvnN2hQJriQVboKO0swHwYDVR0jBBgw\nFoAUMwlRZTfjwImZPoSLpmEt7K57xLIwCgYIKoZIzj0EAwIDSAAwRQIhAITTDo1S\nZFtpD7gtp3mbubZxKrsrbtt9dMDpEZULBGVPAiBL/ltlbR4uzJUXH1VkPgM/zugn\nwi1/HYBk4XSPGb5TUQ==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIFFTCCAv2gAwIBAgIUX2UZDK22MztIXINE/JbSHlfZ+DQwDQYJKoZIhvcNAQEL\nBQAwGTEXMBUGA1UEAwwOUml0eiBQYWRkaW5nIDEwIBcNMjYxMTAzMDQwMTAxWhgP\nMjEyNjEwMTAwNDAxMDFaMBkxFzAVBgNVBAMMDlJpdHogUGFkZGluZyAxMIICIjAN\nBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtJjEujaJSyjulWSiHSG7ZAPSAF9s\ntXFiya8pO5OuKpWetZAcvoPXjdbQx06LSS34ebzujJRU5mghdT4cId4bIUiTPwbS\nlttXAUEFWWSinignV0Gau1FOKtmThljwwRYy4JiqYo5k/X5faVeODt4ul/SATyed\nzHiZrtp/RTssK6hKb0EFXkLq16AWCVB8f2WjwJPpNNoYbi0LdtrdwJOSezpFUp+8\nhAUa/2IWL3UceyL8x2rlkJaFRUelLkQIznyT4LEvAFKaLolV2Kzc0U9/pnxuiZHt\nlEyVdv+7AIz+IKNMZ/dqbKgSNevdvDGvvSUys+eHOyqMosCAL8blhoJBPD7d3aJE\nMULbMdx/x3CcqmV9/N2Ulr8uvTWhlpUGSCi6pOcyTY3qwL51Z/hi1IDwwQocze7R\nCvYSG2tkh6KOC9GLW/GnUGxMcU57/1sVj5G2BZweIfOiHKgJwSmCZqC/LAR+MG6L\n3yOYOeBwTPptkiBmlcSC6MdAAdeTz34XKEKR976g8SYjNN+2GZ0mc8YAyi4yIE/A\n9pSbXSyA2LCaDOXbfjNkCDOCs5pcg01wPWiCJhGHvMUJ3cFGzLcCrXRlC5tXJ7SW\nyquKYluNijerHH12YZam0gYDCapv9euHwF3opEZpsrAzyWVtJJJVn6VulLP6t6MP\nPelVdqDXvJgde7sCAwEAAaNTMFEwHQYDVR0OBBYEFC1XV9K3Tkf1EquIVjZNUsV2\nU5CEMB8GA1UdIwQYMBaAFC1XV9K3Tkf1EquIVjZNUsV2U5CEMA8GA1UdEwEB/wQF\nMAMBAf8wDQYJKoZIhvcNAQELBQADggIBAHXB0JDJ1kfSpOPzi8IDTx8HiM/mWi8t\njoEvEwPH/3YhsZxr3VAxIF1+V7U43jxf5NTemyPek5tslHXaYQKYo36q8tHok9BS\nyhLlcOGQnHq/zH7LhDmG9hxuiYIMU3cEon3zyd6vvXy+NuIW70ST7i5cHrSBCBdI\nvaQkKwPL093HCqX+253Z07lDA5AQ3R4SR1D7o8jfS3peEmEpGGVtYgY4vYbBGgK2\nyJWk3CREpAh1e5l4/eJQ6ysC7MbDMsV8Z+casD7cR0nYv2oF8Ock1g6HA26QbCOR\nEhw2mvXI6vu+KmxqHLdiKcmAnpPza+OHTUi6EP/RwtXkpwonZXsv8XzBbbrMPvb0\n5zBYxDMGe363DR7CGwUwLyVdGb48AQgGAgVpgKw5reE51rbggI0NjXZqUR8bccOh\nseP7UMnd2gSgUfN5WRERXAATRs220PiMLbjwEEWFcKV+d41tF0O4BazbC9n1QRXE\n8EyqpREzIAwjI1HqMSAC8ei0c0A82mB7bo4XFFqhecDnsI1sGmZj6fFvN3pkWJnJ\nXYMNj2rPLI9hoRUECJQGKt3h9LInTuRECA3PrbRYjAYCp6bnn8DXOgugZ9YShn9u\nYH+HwdhZRgqOIO4wFzEm1mVr5hqWyCZX79gyhMiDpoV6Wye+r8P3ezczx2CVi5UZ\neaQ8uk7hljwu\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIFFTCCAv2gAwIBAgIUHL/tCwQ8or5AHwc6HFIqdea803YwDQYJKoZIhvcNAQEL\nBQAwGTEXMBUGA1UEAwwOUml0eiBQYWRkaW5nIDIwIBcNMjYxMTAzMDQwMTAyWhgP\nMjEyNjEwMTAwNDAxMDJaMBkxFzAVBgNVBAMMDlJpdHogUGFkZGluZyAyMIICIjAN\nBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA6+KoT7wLDTXX+dADW80kSUlI4TIi\nGqtvcku/mPMnKZ7XGhLDlhXMVAwKzfSWOiHz1kH1jh59z+iJDZP1Kno8UuP20yn4\nqTy0+x/yXH9jYLOMR5IAJw/xWtPgwfSUBlqWF2+9zCKVlHrMg+iMIA+rsY+Vd3oY\nSyqrfYHEoi2r8HbYx+oHYWVsn9jnM5W8/y9RSKxijlZLRVZj8GUxO48Kl/stq4aj\naVH012LgDN26GPy6GeCJJjo+Q6xi0/qWGGgusfxZzzCA6xjcmdXi608j5v62v/CP\n3P/3Pgj0g0xC9QH77vRA5Ku37K4wkHIDnzJz2GTH2UM8/KpKODlLrtrgbC1qhuND\nwPcYN4TMcZGwNBlgOxWunow/QNrVZtg9n1CIVTF9Vb0qDHaZCawrKz9J5c17i6Jl\njtgwwvVzr+es1jI6ze5gQD/oGtwy62pqdpZ2vhaVt+3SzeCvZ9OTHrY6S4Y3LxT/\n5/Ce++S/CXFZo2oXnC07vc3e4u7yp6cAyIcraxeaJdvCbD/x093k23OYxWrv2tbZ\nHikGlum5DBaZ+UPF5lSiC3IOyd73t9/fLchHx42Xc+wD3da4N77Gyi+QsAx/PVMe\nUwZ0FwYUUNQnMpU8GyxjRDK8pmUaDQHE1Vw4iQedAM5S2H7hUo5WTTlvSdPCmkgM\nHw/HslPAex/NjE0CAwEAAaNTMFEwHQYDVR0OBBYEFKDa3s9iKU1SH/HVqRRbgTme\nhH6FMB8GA1UdIwQYMBaAFKDa3s9iKU1SH/HVqRRbgTmehH6FMA8GA1UdEwEB/wQF\nMAMBAf8wDQYJKoZIhvcNAQELBQADggIBAC11v/xc4NEK1irwiodaNtBb26rbUZdW\nKYFvVq0WBvy7vEImmV/mTpDE20ulxBuojGu26jvNkgQi2M8ZmnPX+bJtPRmziOfT\napoLRQ8iXOfn9CgE57hxCQl2Y3WKymmhlSL+E9mt/AhrFcRjH5KSARU1T9C9dfF3\n5aIVMYCuqpa7MswceIl7tVSKzB0duXb8vLm6fb28ZNkTmVLGm/9ARqNcEzEWC9EK\naeHmDsDr8/cRcbyLLRGXFCHhxcfdfwL3XSNE9FXDZXo64LeqchKfw9B7KdN8G8cE\n2SMW6qwhXe3Lfy8R+Rmpj5WgiEwz43fMJyESHT7j7/XupJr5SUTsob2XB8QnzfUS\nSWvN5a49+HncnFQJtHSKp5BA6w6yM5vPak6ONfdWpyfg8WBexA4s19y2O9zGHd8P\nIgh4nJYynDKo3J07pmqI9KeAAYtOJSGOh/Ud0kHPUfoXpAQlO+YeUohqCXgzZ7zO\n1/3TCMFBDo95sg2cjD0p3iJHgnkOCqvYtZ6XFqaS10Ai0QwXtxgNzhwGp+lKkIiW\nlZQadN6jM3/x4Z30y8v5nCjnW/ZUwwhoRe3VuuOHHlZhjzEOT016r96kxGqjAltR\nBIz4ENPqta5BnwMZqQ4r3ycpF3W1QwhLEPum/RBLFCdc4/EqcOd0Eol+5RnO/TPm\nyn6Cet0DvwqO\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIFFTCCAv2gAwIBAgIUMlhgflxoFsbhyU25mT1f7JqzpaowDQYJKoZIhvcNAQEL\nBQAwGTEXMBUGA1UEAwwOUml0eiBQYWRkaW5nIDMwIBcNMjYxMTAzMDQwMTAyWhgP\nMjEyNjEwMTAwNDAxMDJaMBkxFzAVBgNVBAMMDlJpdHogUGFkZGluZyAzMIICIjAN\nBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAl8AbcgCxVaIFOdEwNFL9oytjB08U\nDoSytEGlkJY872G06/HskRuH7NzivaRp+k6X6oPssNPEKuaPMEAjNTvBcWe8SFLk\nVJ0fVjGK0+203I5/hk537HPzWlYO8HQdQG+acwFr+XEHcX9uKb34H0o3jEF0Aln+\nahEhtO9ySNFpWw6gSivdIYK31ATtWmz08Y/SANIvhSPXJQESFV3odJyqa7yAreB0\n5GXcFZ17gI2yBpDwOmkFEOIwMVroGCR7VxENlY2jxCv1lIpzbqUF/JwKzG6JKror\nJzWJLDdceFrN7jjTJjOEtjni7soG19QetVdWrQohjVB0oe1jBrIb4HXRPizMS3Pn\nZDQEcuMRhiwxsxlEoWxU8AJr9oobo05ZU+4mi6LYjcfdooBz3XArv8oGGHzMNnSK\nf4BmjlZA/hsMGpOJzehzOqUOKXtRz83A4R454m7lGxCbEGxx7CyALfKLIBxw2WUc\n7CA+ZWq2kRvlXEipvt44ZoJsyLuE09DyAeQwr2jugyKX1Jvmt7lGpQ+MHSbNpt5P\n++3IB1ONraL9ogfOwkJ9zCKErOyIde24MQvZAAvjQc95LdOlIpdmY8nSjFlXKmZT\n2QUYB82vTTsgNe46ftkKPUWWCFhrfzLUotZ8pOeQo7Bn7qa1RMiODkkwJ45pDXq/\nGt9R638yC7OPnD0CAwEAAaNTMFEwHQYDVR0OBBYEFOdorla9lNOdcvIEkTXhBE8u\n8d/hMB8GA1UdIwQYMBaAFOdorla9lNOdcvIEkTXhBE8u8d/hMA8GA1UdEwEB/wQF\nMAMBAf8wDQYJKoZIhvcNAQELBQADggIBAFT9TBq91oYTLueLBnhpjUSHt+3nhHY+\nGZ7GSFGqSOh8BwY4kZFzrS/+ejRlw517aZ0soM9tTqQd4g21zbr8CdJ1TP2j4Lgt\nGG9k2FMmRfXrvXIirJdxnea0a4bEgf5l3nehHNvdhj3TVZ5p0ML6KUP6iY/yJTrm\nMrs9tp0M44KJe4n+MM2XiLuWSYRnbonGfuBx+DIDuFRk9DgWZX614PY7X7xeOfs+\nJcrXA5DkKKqUmIK/eSa/0gOQg1mwltE1ETgSOCld68xdYujXyJbMKi1v0P64uBsQ\ne8lZ9tJnynHVwzbs3SNFNvmWeCs5gub2tV+trb8kfaJOrDyebivFVIc3QJp6KhsP\nxCDCjwC2n2EgOPSuwsvO4CSdMLKawSzuoNYm+WPEn9ssIxIjomZ6NHm/3DKDHEat\nz2gMNuqzWaAUryfs53ORn/C7lSw/rTCOZpaXIXRsYzFnbi5eIBqLpatEMswMkRDT\nxeudgfhGS4kaSDkxNgF7bnvUPDZp4coiORjzzXPLIakc4kM7clA9GOjmpca8KGza\nLyRYn3pq4v7vvr1bWmnf+z1t0pnVw14BxhJQCQraSnmxjFbbWqOr3KpE32mC3Y4N\nndq/54s/G8vVvDfk8BWznqk+vDMMm0jQkUSyWUmnrzt9DqeiNxiqvC5fjBNKMCOG\nVkTI0Ex6K2KN\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIFFDCCAvygAwIBAgITV5Mv+QdW48qRYNTyXzZf35a5mjANBgkqhkiG9w0BAQsF\nADAZMRcwFQYDVQQDDA5SaXR6IFBhZGRpbmcgNDAgFw0yNjExMDMwNDAxMDNaGA8y\nMTI2MTAxMDA0MDEwM1owGTEXMBUGA1UEAwwOUml0eiBQYWRkaW5nIDQwggIiMA0G\nCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDKM2notnLamNRii54AxGBccjurhAS6\nqbtyx8AwxNx9aGg3Do6ZGIJDe3kUR7kCmn8zh3dzfALuFITBejY3yDf+v+hIlLsj\n+TudGAmhsChkgj9+TPMnGBgITZ+ilR6D+rxBhvFGTDhfnxtLKf9pzNM78wYMUF4b\nrCuaU+V5dEHaMlQibXQ4odrZvqt7wVdG9DXgCarRSRbW6JVP0OWgz3yU0swF513b\ngwkGKCdljg0QwJhQhGS6EF8Zqz/kHwTqdYk0FPF41zkC6QLX3d2FIFclX2FQIvhH\nJ2UO1IEpRQoHelC7etee28DGMyEzJdW4ELsjreHLW+dR+1opD89ivm8H3z+ezRMs\nIt8kErKjmzsPgWU4BlorzAbwJLhb0X1+GxsXZCiHKvvDSIK+9dIX+SGkF1rxNfVV\nvIM3Ed94EQX31uhqctE+gTz3yvvIUFY1bRZDM6VIrfypo1U2cw0Qgf+YnccxMc5Y\npChNDPNsof5O+QUk94VSf31URJ70Z6BlMk9THLl+J4PkDXz+eR2lw1m/OsGtaW6O\nJ9cCQdYkn2rEo1kS7FYkivY/8s2NsCw4ftxhiJ5TqlrSVYJM5csb+598bIylpDkz\nQvGgE8fpe4xpSiuaDb3rRFNe+JwleDTqlJ3GoAUSGf0Kjdd9jA/qH0QIWK3GKBLn\nRGKEuLV3COG6+QIDAQABo1MwUTAdBgNVHQ4EFgQUE4b3RRaWkiuSHaK52Q50Xr+G\n+d4wHwYDVR0jBBgwFoAUE4b3RRaWkiuSHaK52Q50Xr+G+d4wDwYDVR0TAQH/BAUw\nAwEB/zANBgkqhkiG9w0BAQsFAAOCAgEAtV+tzGI5f+gPUTQ5Ietji9e34Mep76I7\n03dtc+ugNi+G73WdDo620DguWomlROGabgcCddkwzQVIIzJRW7hvRX952FxJnlZW\nXNokpKZHklMbvf28AzPWreSh1dIe1MAHNgQt6JN/zuZqt8d/Fncc2NuFCdXnwmIo\nN2xnux/A9WqQMUK4WqSE5tYWBPCfMFxS0ddleGKO5aNQ1mGIl7T3ZNTxSUjYe+ru\nPavM3LLxjnCAt3lrleX21UhVPK5fsWtpVmSx+Iwc5FQZ8lpFKglors3xexEeG8ON\nmibDnAtsv0u/5ATFRAMxzGjTY+4hP+nFWf/krAqjVFf6h5LxbOtvluRAJ9s+cujg\nph81FQ8UfluRw+so4fDID2L3LZiDp4VcxkbJADPuq1K6hZsjY3Gv/blCHyF54YL3\nOop6U2Bywrb2QdMsuRFeSaDgpagpPbOL0KroCS+OsCZ4j1eRk/T6lq4zJlXFau/T\nEvGIH71HR3GQm/b1tYlbtHzzoMsCeFZgouYXhqJmCn0sMnakFOnsPU8+wkqMbVrP\nciHmTvCBybO4hioD5R9yzEzIEX8qak5pZI+nljRI8foS968IfjFh01WiWscCx48G\naxdiupis4NM5Oonx+BympWyTuNjpW+yugbu6LOOsJftG+YqKEYF2PtAXA8mGrxJc\nMyWcZxBrWno=\n-----END CERTIFICATE-----\n"
+
+const CA_NOT_BEFORE: i64 = 1767225600   # 2026-01-01T00:00:00Z
+const CA_NOT_AFTER: i64 = 4922899200    # 2126-01-01T00:00:00Z
+
+# A store holding the one CA certificate `pem`. 0 on success.
+fn store_with(store: *CaStore, pem: *u8) -> i32
+    ca_store_init(store)
+    if ca_store_add_cert_pem(store, pem, cstr_len_e2e(pem)) != 1
+        return 1
+    return 0
+
+fn ca_client_setup(cfg: *TlsConfig, host: *u8, store: *CaStore, now: i64) -> i32
+    tls_config_init(cfg)
+    tls_config_set_hostname(cfg, host, cstr_len_e2e(host) as i32)
+    tls_config_set_verify_time(cfg, now)
+    return tls_config_set_ca_store(cfg, store)
+
+# As client_verdict, trusting the CAs in `store` at time `now` (0 = clock).
+fn ca_verdict(chain: *u8, host: *u8, ca_pem: *u8, now: i64) -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], chain, key_ca_leaf()) != 0
+        return 100
+    var store: CaStore
+    if store_with(@store, ca_pem) != 0
+        ca_store_destroy(@store)
+        return 101
+    var ccfg: TlsConfig
+    if ca_client_setup(@ccfg, host, @store, now) != 0
+        ca_store_destroy(@store)
+        return 102
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    let hs: i32 = handshake(@client, @server)
+    var err: i32 = tls_client_error(@client)
+    if hs == 0
+        err = 0
+    else if hs != 3
+        err = 200 + hs
+    else if tls_client_state(@client) != TLS_STATE_ERROR
+        err = 300
+    tls_client_free(@client)
+    tls_server_free(@server)
+    ca_store_destroy(@store)
+    return err
+
+[[test]]
+fn test_e2e_ca_chain_handshake_and_data() -> i32
+    # The acceptance case: no pin, the server's chain leads to a CA in the
+    # store, so the client handshakes and exchanges data.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], chain_leaf_inter(), key_ca_leaf()) != 0
+        return 1
+    var store: CaStore
+    if store_with(@store, ca_root()) != 0
+        return 2
+    var ccfg: TlsConfig
+    if ca_client_setup(@ccfg, c"valet.test", @store, 0) != 0
+        return 3
+    if ccfg.pinned_cert_len != 0
+        return 4
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    let hs: i32 = handshake(@client, @server)
+    if hs != 0
+        return 10 + hs
+    if send_to_server(@client, @server, c"GET / HTTP/1.1\r\nHost: valet.test\r\n\r\n") != 0
+        return 20
+    if send_to_client(@server, @client, c"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") != 0
+        return 21
+    tls_client_free(@client)
+    tls_server_free(@server)
+    ca_store_destroy(@store)
+    return 0
+
+[[test]]
+fn test_e2e_ca_refuses_chain_to_other_ca() -> i32
+    if ca_verdict(chain_leaf_inter(), c"valet.test", ca_root(), 0) != 0
+        return 1  # control
+    # Same CA name, different key: the old name-only lookup trusted this.
+    if ca_verdict(chain_leaf_inter(), c"valet.test", ca_impostor(), 0) != TLS_ERR_CERTIFICATE_INVALID
+        return 2
+    if ca_verdict(chain_leaf_inter(), c"valet.test", ca_root_ed25519(), 0) != TLS_ERR_CERTIFICATE_INVALID
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_ca_refuses_missing_intermediate() -> i32
+    if ca_verdict(chain_leaf_only(), c"valet.test", ca_root(), 0) != TLS_ERR_CERTIFICATE_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_e2e_ca_checks_san_hostname() -> i32
+    # The leaf's CN is "Ritz Leaf": these match only through its SAN.
+    if ca_verdict(chain_leaf_inter(), c"api.wild.test", ca_root(), 0) != 0
+        return 1
+    if ca_verdict(chain_leaf_inter(), c"evil.test", ca_root(), 0) != TLS_ERR_CERTIFICATE_INVALID
+        return 2
+    if ca_verdict(chain_leaf_inter(), c"Ritz Leaf", ca_root(), 0) != TLS_ERR_CERTIFICATE_INVALID
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_ca_checks_validity_dates() -> i32
+    if ca_verdict(chain_leaf_inter(), c"valet.test", ca_root(), CA_NOT_BEFORE) != 0
+        return 1
+    if ca_verdict(chain_leaf_inter(), c"valet.test", ca_root(), CA_NOT_BEFORE - 1) != TLS_ERR_CERTIFICATE_INVALID
+        return 2
+    if ca_verdict(chain_leaf_inter(), c"valet.test", ca_root(), CA_NOT_AFTER + 1) != TLS_ERR_CERTIFICATE_INVALID
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_ca_ed25519_signed_chain() -> i32
+    if ca_verdict(chain_leaf_ed25519(), c"valet.test", ca_root_ed25519(), 0) != 0
+        return 1
+    if ca_verdict(chain_leaf_ed25519(), c"valet.test", ca_root(), 0) != TLS_ERR_CERTIFICATE_INVALID
+        return 2
+    return 0
+
+[[test]]
+fn test_e2e_ca_large_certificate_flight() -> i32
+    # Six certificates: one ~6.5 KB record, over the client's old 4096-byte
+    # receive and decrypt buffers.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], chain_big(), key_ca_leaf()) != 0
+        return 1
+    if scfg.num_certs != 6 || scfg.cert_chain_len <= 4096
+        return 2
+    if ca_verdict(chain_big(), c"valet.test", ca_root(), 0) != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_ca_multi_record_flight() -> i32
+    # Re-send valet's encrypted flight as many small records, so messages
+    # (the Certificate above all) are split across records, and feed it to
+    # the client in uneven pieces.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], chain_leaf_inter(), key_ca_leaf()) != 0
+        return 1
+    var store: CaStore
+    if store_with(@store, ca_root()) != 0
+        return 2
+    var ccfg: TlsConfig
+    if ca_client_setup(@ccfg, c"valet.test", @store, 0) != 0
+        return 3
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+
+    var ch: [4096]u8
+    let ch_len: i64 = tls_client_start(@client, @ch[0], 4096)
+    var real: [16384]u8
+    var real_len: i64 = 0
+    if tls_server_process(@server, @ch[0], ch_len, @real[0], 16384, @real_len) != TLS_RESULT_HAVE_OUTPUT
+        return 4
+    let sh_rec: i64 = 5 + (((real[3] as i64) << 8) | (real[4] as i64))
+
+    # Decrypt the server's one flight record with the server's keys ...
+    var rs: TlsRecordState
+    tls_record_state_init(@rs)
+    tls_record_state_set_keys(@rs, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    var flight: [16384]u8
+    var inner: u8 = 0
+    let flight_len: i32 = tls_record_state_server_decrypt(@rs, @real[sh_rec], (real_len - sh_rec) as i32, @flight[0], 16384, @inner)
+    if flight_len <= 1000 || inner != 22
+        return 5
+
+    # ... and re-encrypt it 97 bytes per record.
+    var ws: TlsRecordState
+    tls_record_state_init(@ws)
+    tls_record_state_set_keys(@ws, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    var wire: [32768]u8
+    mem_copy(@wire[0], @real[0], sh_rec)
+    var wire_len: i64 = sh_rec
+    var p: i64 = 0
+    var records: i32 = 0
+    while p < flight_len as i64
+        var n: i64 = flight_len as i64 - p
+        if n > 97
+            n = 97
+        let enc: i32 = tls_record_state_server_encrypt(@ws, @flight[p], n as i32, 22, @wire[wire_len], 1024)
+        if enc <= 0
+            return 6
+        wire_len = wire_len + enc as i64
+        p = p + n
+        records += 1
+    if records < 10
+        return 7
+
+    var c_out: [4096]u8
+    var c_len: i64 = 0
+    var off: i64 = 0
+    var r: i32 = TLS_RESULT_NEED_INPUT
+    while off < wire_len
+        var piece: i64 = wire_len - off
+        if piece > 333
+            piece = 333
+        r = tls_client_process(@client, @wire[off], piece, @c_out[0], 4096, @c_len)
+        off = off + piece
+        if r != TLS_RESULT_NEED_INPUT
+            break
+    if r != TLS_RESULT_HAVE_OUTPUT || off != wire_len
+        return 100 + tls_client_error(@client)
+    var s_out: [1024]u8
+    var s_len: i64 = 0
+    if tls_server_process(@server, @c_out[0], c_len, @s_out[0], 1024, @s_len) != TLS_RESULT_COMPLETE
+        return 8
+    if send_to_client(@server, @client, c"after a fragmented flight") != 0
+        return 9
+    tls_client_free(@client)
+    tls_server_free(@server)
+    ca_store_destroy(@store)
+    return 0
+
+[[test]]
+fn test_e2e_client_rejects_data_after_server_finished() -> i32
+    # The keys change after the server's Finished, so no handshake bytes may
+    # follow it in the same record (RFC 8446 5.1).
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], chain_leaf_inter(), key_ca_leaf()) != 0
+        return 1
+    var store: CaStore
+    if store_with(@store, ca_root()) != 0
+        return 2
+    var ccfg: TlsConfig
+    if ca_client_setup(@ccfg, c"valet.test", @store, 0) != 0
+        return 3
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+
+    var ch: [4096]u8
+    let ch_len: i64 = tls_client_start(@client, @ch[0], 4096)
+    var real: [16384]u8
+    var real_len: i64 = 0
+    if tls_server_process(@server, @ch[0], ch_len, @real[0], 16384, @real_len) != TLS_RESULT_HAVE_OUTPUT
+        return 4
+    let sh_rec: i64 = 5 + (((real[3] as i64) << 8) | (real[4] as i64))
+    var rs: TlsRecordState
+    tls_record_state_init(@rs)
+    tls_record_state_set_keys(@rs, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    var flight: [16384]u8
+    var inner: u8 = 0
+    let flight_len: i32 = tls_record_state_server_decrypt(@rs, @real[sh_rec], (real_len - sh_rec) as i32, @flight[0], 16384, @inner)
+    if flight_len <= 0
+        return 5
+    # A trailing (empty) KeyUpdate header after Finished.
+    flight[flight_len] = 24
+    flight[flight_len + 1] = 0
+    flight[flight_len + 2] = 0
+    flight[flight_len + 3] = 0
+
+    var ws: TlsRecordState
+    tls_record_state_init(@ws)
+    tls_record_state_set_keys(@ws, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    let enc: i32 = tls_record_state_server_encrypt(@ws, @flight[0], flight_len + 4, 22, @real[sh_rec], 16384 - sh_rec as i32)
+    if enc <= 0
+        return 6
+    var c_out: [4096]u8
+    var c_len: i64 = 0
+    if tls_client_process(@client, @real[0], sh_rec + enc as i64, @c_out[0], 4096, @c_len) != TLS_RESULT_ERROR
+        return 7
+    if tls_client_error(@client) != TLS_ERR_UNEXPECTED_MESSAGE || tls_client_is_connected(@client) != 0
+        return 8
+    ca_store_destroy(@store)
     return 0

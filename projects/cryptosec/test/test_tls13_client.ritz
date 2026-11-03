@@ -5,6 +5,9 @@ import ritzlib.sys
 import cryptosec.mem
 import cryptosec.tls13_client
 import cryptosec.tls13_handshake
+import cryptosec.tls13_record
+import cryptosec.ca_store
+import cryptosec.pem
 
 # ============================================================================
 # Config Tests
@@ -468,4 +471,98 @@ fn test_client_rejects_unimplemented_cipher_suite() -> i32
     # to accept it and then run AES-128-GCM keys anyway.
     if run_server_hello_1862(TLS_CHACHA20_POLY1305_SHA256) != TLS_RESULT_ERROR
         return 1
+    return 0
+
+# ============================================================================
+# CA trust store, verification time, record sizing (AGAST #2109)
+# ============================================================================
+
+# P-256 self-signed CA (CN=Ritz Test CA), as in test_ca_store.
+fn ca_pem_2109() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBvTCCAWOgAwIBAgIUfP1+DMBV/A+m0p3rGzRcxVRqy94wCgYIKoZIzj0EAwIw\nMzEVMBMGA1UEAwwMUml0eiBUZXN0IENBMQ0wCwYDVQQKDARSaXR6MQswCQYDVQQG\nEwJVUzAgFw0yNjEwMzExNDA4MzBaGA8yMTI2MTAwNzE0MDgzMFowMzEVMBMGA1UE\nAwwMUml0eiBUZXN0IENBMQ0wCwYDVQQKDARSaXR6MQswCQYDVQQGEwJVUzBZMBMG\nByqGSM49AgEGCCqGSM49AwEHA0IABIeaJBwDHlO0+pap2TvIQ1t0m92+baQCLyPz\njDLvjGOiIjjo6laU3/2dotedfLT96f4Fu5eyRWqr2mOGH0HHVLWjUzBRMB0GA1Ud\nDgQWBBSbC2AYUWFTrHkv5xRJ9/u/3GtlKzAfBgNVHSMEGDAWgBSbC2AYUWFTrHkv\n5xRJ9/u/3GtlKzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIB74\njfMjZcbtSDY6FQ5XOQSVpI12hTLVERL/ZCkd0s6cAiEA6kPDTJYWKuVTmuIkPlvA\n/LjxLkNMIaDItTm6AN3c15o=\n-----END CERTIFICATE-----\n"
+
+fn cstr_len_2109(s: *u8) -> i64
+    var n: i64 = 0
+    while s[n] != 0
+        n = n + 1
+    return n
+
+[[test]]
+fn test_config_ca_store() -> i32
+    var cfg: TlsConfig
+    tls_config_init(@cfg)
+    if cfg.ca_store != null || cfg.verify_time != 0
+        return 1
+    if tls_config_set_ca_store(@cfg, null) != -1
+        return 2
+    var store: CaStore
+    ca_store_init(@store)
+    # An empty store trusts nothing; refuse it rather than accept and fail later.
+    if tls_config_set_ca_store(@cfg, @store) != -1
+        ca_store_destroy(@store)
+        return 3
+    let pem: *u8 = ca_pem_2109()
+    if ca_store_add_cert_pem(@store, pem, cstr_len_2109(pem)) != 1
+        ca_store_destroy(@store)
+        return 4
+    if tls_config_set_ca_store(@cfg, @store) != 0 || cfg.ca_store != @store
+        ca_store_destroy(@store)
+        return 5
+    tls_config_set_verify_time(@cfg, 1790000000)
+    if cfg.verify_time != 1790000000
+        ca_store_destroy(@store)
+        return 6
+    ca_store_destroy(@store)
+    return 0
+
+# ServerHello, then the header of an encrypted record of `rec_len` bytes and
+# `body` bytes of its (garbage) body. Returns the client's result.
+fn run_after_server_hello_2109(client: *TlsClient, rec_len: i64, body: i64) -> i32
+    var cfg: TlsConfig
+    tls_config_init(@cfg)
+    tls_config_set_hostname(@cfg, "test.local", 10)
+    tls_client_init(client, @cfg)
+    var out: [1024]u8
+    if tls_client_start(client, @out[0], 1024) <= 0
+        return -100
+    var buf: [17000]u8
+    mem_zero(@buf[0], 17000)
+    let sh_len: i64 = build_server_hello_1862(@buf[0], TLS_AES_128_GCM_SHA256)
+    buf[sh_len] = 23
+    buf[sh_len + 1] = 0x03
+    buf[sh_len + 2] = 0x03
+    buf[sh_len + 3] = ((rec_len >> 8) & 0xff) as u8
+    buf[sh_len + 4] = (rec_len & 0xff) as u8
+    var out_len: i64 = 0
+    return tls_client_process(client, @buf[0], sh_len + 5 + body, @out[0], 1024, @out_len)
+
+[[test]]
+fn test_client_takes_max_size_record() -> i32
+    # A 2^14 + 256 byte ciphertext is a legal record. The 4096-byte receive
+    # buffer refused it as BUFFER_TOO_SMALL; now it is buffered and fails
+    # only because this garbage does not decrypt.
+    var client: TlsClient
+    let r: i32 = run_after_server_hello_2109(@client, 16640, 16640)
+    if r != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(@client) != TLS_ERR_DECRYPT_FAILED
+        return 2
+    return 0
+
+[[test]]
+fn test_client_waits_for_rest_of_large_record() -> i32
+    var client: TlsClient
+    if run_after_server_hello_2109(@client, 16640, 9000) != TLS_RESULT_NEED_INPUT
+        return 1
+    return 0
+
+[[test]]
+fn test_client_rejects_oversize_record() -> i32
+    # One byte over the TLS 1.3 limit is record_overflow, as soon as the
+    # header is seen.
+    var client: TlsClient
+    if run_after_server_hello_2109(@client, 16641, 0) != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(@client) != TLS_ERR_RECORD_OVERFLOW
+        return 2
     return 0

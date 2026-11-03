@@ -8,11 +8,15 @@
 # - X25519 key exchange
 # - AES-128-GCM and ChaCha20-Poly1305 cipher suites
 # - AES-128-GCM only (the record layer implements nothing else)
-# - Server authentication, fail closed:
-#     * trust anchor: the leaf certificate must byte-equal a pinned DER cert
-#       (tls_config_pin_cert). CA-chain validation is not wired up yet, so a
-#       client without a pin refuses every server.
-#     * hostname: the leaf must match the configured hostname
+# - Server authentication, fail closed. One trust anchor must be configured:
+#     * pin (tls_config_pin_cert): the leaf must byte-equal a pinned DER cert;
+#     * or a CA store (tls_config_set_ca_store): the chain must lead from the
+#       leaf, through CA certificates the server sent, to a CA in the store,
+#       with every signature (RSA-PKCS1, ECDSA P-256 SHA-256/384, Ed25519)
+#       verified and every certificate valid at the current time.
+#     A client with neither refuses every server. A pin takes precedence.
+#     * hostname: the leaf must match the configured hostname (SAN dNSName,
+#       or the CN when the certificate has no SAN)
 #     * CertificateVerify: the signature over the transcript must verify
 #       under the leaf's key (ecdsa_secp256r1_sha256 or ed25519)
 #   There is no "skip verification" mode.
@@ -33,6 +37,7 @@ import chacha20_poly1305
 import x25519
 import x509
 import x509_verify
+import ca_store
 import rsa
 import tls13_kdf
 import tls13_record
@@ -59,8 +64,13 @@ pub const TLS_STATE_ERROR: i32 = -1
 # tls13_record, shared with valet's server so the two can be linked together.
 
 # Maximum sizes
-const MAX_RECORD_SIZE: i64 = 16384
-const MAX_HANDSHAKE_SIZE: i64 = 65536
+const MAX_RECORD_SIZE: i64 = 16384          # TLSPlaintext.fragment, 2^14
+const MAX_CIPHERTEXT_SIZE: i64 = 16640      # TLSCiphertext.fragment, 2^14 + 256
+const RECV_BUF_SIZE: i64 = 16645            # one whole record, header included
+const MAX_HANDSHAKE_SIZE: i64 = 65536       # reassembled handshake bytes
+
+const CLIENT_SYS_CLOCK_GETTIME: i64 = 228
+const CLIENT_CLOCK_REALTIME: i64 = 0
 
 # ============================================================================
 # TLS Client Configuration
@@ -74,6 +84,12 @@ pub struct TlsConfig
     # Trust anchor: DER of the one leaf certificate this client accepts.
     pinned_cert: [4096]u8
     pinned_cert_len: i64
+
+    # Trust anchor: CA certificates (borrowed; must outlive the client).
+    ca_store: *CaStore
+
+    # Unix time to validate certificates at; 0 means the system clock.
+    verify_time: i64
 
     # Preferred cipher suites (in order of preference)
     cipher_suites: [4]u16
@@ -105,6 +121,21 @@ pub fn tls_config_pin_cert(cfg: *TlsConfig, der: *u8, len: i64) -> i32
     cfg.pinned_cert_len = len
     return 0
 
+# Trust the CAs in `store` (used only when no certificate is pinned). The
+# store is borrowed, not copied. Returns 0, or -1 if it is null or empty.
+pub fn tls_config_set_ca_store(cfg: *TlsConfig, store: *CaStore) -> i32
+    if store == null
+        return -1
+    if ca_store_count(store) <= 0
+        return -1
+    cfg.ca_store = store
+    return 0
+
+# Validate certificate dates at `unix_time` instead of the system clock
+# (0 restores the clock). For tests and for clients with a trusted time.
+pub fn tls_config_set_verify_time(cfg: *TlsConfig, unix_time: i64)
+    cfg.verify_time = unix_time
+
 # ============================================================================
 # TLS Client State
 # ============================================================================
@@ -133,11 +164,15 @@ pub struct TlsClient
     read_state: TlsRecordState
     write_state: TlsRecordState
 
-    # Handshake message buffers
-    # (For accumulating fragmented messages)
-    recv_buf: [4096]u8
+    # Received bytes not yet consumed: at most one whole record.
+    recv_buf: [16645]u8
     recv_len: i64
-    recv_expected: i64  # Expected message length (from header)
+    recv_expected: i64  # unused
+
+    # Decrypted handshake bytes not yet consumed: a message may span records
+    # and a record may hold several messages.
+    hs_buf: [65536]u8
+    hs_len: i64
 
     # Output buffer for handshake messages to send
     send_buf: [4096]u8
@@ -249,37 +284,66 @@ pub fn tls_client_process(client: *TlsClient, data: *u8, data_len: i64, out: *u8
     if client.state == TLS_STATE_CONNECTED
         return TLS_RESULT_COMPLETE
 
-    # Accumulate data
-    if data_len > 0
-        if client.recv_len + data_len > 4096
+    # Feed the input through recv_buf, which holds one record at a time.
+    var off: i64 = 0
+    while 1
+        if off < data_len
+            var take: i64 = data_len - off
+            let room: i64 = RECV_BUF_SIZE - client.recv_len
+            if take > room
+                take = room
+            if take > 0
+                mem_copy(@client.recv_buf[client.recv_len], data + off, take as u64)
+                client.recv_len = client.recv_len + take
+                off = off + take
+        let r: i32 = client_step(client, out, out_cap, out_len)
+        if r != TLS_RESULT_NEED_INPUT
+            return r
+        if off >= data_len
+            return TLS_RESULT_NEED_INPUT
+        if client.recv_len >= RECV_BUF_SIZE
+            # Cannot happen: a full buffer always holds a whole record.
             client.last_error = TLS_ERR_BUFFER_TOO_SMALL
             client.state = TLS_STATE_ERROR
             return TLS_RESULT_ERROR
-        mem_copy(@client.recv_buf[client.recv_len], data, data_len as u64)
-        client.recv_len = client.recv_len + data_len
+    return TLS_RESULT_NEED_INPUT
 
-    # Process based on current state
-    if client.state == TLS_STATE_CLIENT_HELLO_SENT
-        return process_server_hello(client, out, out_cap, out_len)
+# 1 if recv_buf starts with a whole record, 0 if more input is needed, -1 if
+# the record header announces more than TLS 1.3 allows (client is failed).
+fn client_record_ready(client: *TlsClient) -> i32
+    if client.recv_len < 5
+        return 0
+    let record_len: i64 = ((client.recv_buf[3] as i64) << 8) | (client.recv_buf[4] as i64)
+    if record_len > MAX_CIPHERTEXT_SIZE
+        client.last_error = TLS_ERR_RECORD_OVERFLOW
+        client.state = TLS_STATE_ERROR
+        return -1
+    if client.recv_len < 5 + record_len
+        return 0
+    return 1
 
-    if client.state == TLS_STATE_SERVER_HELLO_RECEIVED
-        return process_encrypted_handshake(client, out, out_cap, out_len)
-
-    if client.state == TLS_STATE_ENCRYPTED_EXTENSIONS_RECEIVED
-        return process_encrypted_handshake(client, out, out_cap, out_len)
-
-    if client.state == TLS_STATE_CERTIFICATE_RECEIVED
-        return process_encrypted_handshake(client, out, out_cap, out_len)
-
-    if client.state == TLS_STATE_CERTIFICATE_VERIFY_RECEIVED
-        return process_encrypted_handshake(client, out, out_cap, out_len)
-
-    if client.state == TLS_STATE_FINISHED_RECEIVED
-        return finish_handshake(client, out, out_cap, out_len)
-
-    client.last_error = TLS_ERR_INVALID_STATE
-    client.state = TLS_STATE_ERROR
-    return TLS_RESULT_ERROR
+# Process every whole record in recv_buf, one at a time.
+fn client_step(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i64) -> i32
+    while 1
+        if client.state == TLS_STATE_FINISHED_RECEIVED
+            return finish_handshake(client, out, out_cap, out_len)
+        let ready: i32 = client_record_ready(client)
+        if ready < 0
+            return TLS_RESULT_ERROR
+        if ready == 0
+            return TLS_RESULT_NEED_INPUT
+        var r: i32 = TLS_RESULT_ERROR
+        if client.state == TLS_STATE_CLIENT_HELLO_SENT
+            r = process_server_hello(client, out, out_cap, out_len)
+        else if client.state >= TLS_STATE_SERVER_HELLO_RECEIVED && client.state <= TLS_STATE_CERTIFICATE_VERIFY_RECEIVED
+            r = process_encrypted_handshake(client, out, out_cap, out_len)
+        else
+            client.last_error = TLS_ERR_INVALID_STATE
+            client.state = TLS_STATE_ERROR
+            return TLS_RESULT_ERROR
+        if r != TLS_RESULT_NEED_INPUT
+            return r
+    return TLS_RESULT_NEED_INPUT
 
 # ============================================================================
 # Process ServerHello
@@ -372,10 +436,7 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
     client.encrypted_handshake = 1
     client.state = TLS_STATE_SERVER_HELLO_RECEIVED
 
-    # Continue processing if more data available
-    if client.recv_len > 0
-        return process_encrypted_handshake(client, out, out_cap, out_len)
-
+    # client_step goes on to any further records.
     return TLS_RESULT_NEED_INPUT
 
 # ============================================================================
@@ -401,67 +462,68 @@ fn process_encrypted_handshake(client: *TlsClient, out: *u8, out_cap: i64, out_l
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
 
-    # Decrypt record
-    var plaintext: [4096]u8
-    var plaintext_len: i64 = 0
+    # Decrypt record. Its 5-byte header is the AEAD's additional data.
+    var plaintext: [16640]u8
     var inner_type: u8 = 0
-
-    # The whole record: its 5-byte header is the AEAD's additional data.
-    let decrypt_result: i32 = tls_record_state_server_decrypt(@client.read_state, @client.recv_buf[0], (5 + record_len) as i32, @plaintext[0], 4096, @inner_type)
-    plaintext_len = decrypt_result as i64
-
+    let decrypt_result: i32 = tls_record_state_server_decrypt(@client.read_state, @client.recv_buf[0], (5 + record_len) as i32, @plaintext[0], 16640, @inner_type)
     if decrypt_result < 0
         client.last_error = TLS_ERR_DECRYPT_FAILED
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
+    let plaintext_len: i64 = decrypt_result as i64
+    client_shift_recv_buf(client, 5 + record_len)
 
-    # Expect handshake content
-    if inner_type != 22
+    if plaintext_len > MAX_RECORD_SIZE
+        client.last_error = TLS_ERR_RECORD_OVERFLOW
+        client.state = TLS_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # Expect (non-empty) handshake content
+    if inner_type != 22 || plaintext_len == 0
         client.last_error = TLS_ERR_UNEXPECTED_MESSAGE
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
 
-    # Process handshake message(s) in plaintext
+    if client.hs_len + plaintext_len > MAX_HANDSHAKE_SIZE
+        client.last_error = TLS_ERR_RECORD_OVERFLOW
+        client.state = TLS_STATE_ERROR
+        return TLS_RESULT_ERROR
+    mem_copy(@client.hs_buf[client.hs_len], @plaintext[0], plaintext_len as u64)
+    client.hs_len = client.hs_len + plaintext_len
+
+    # Process every complete handshake message reassembled so far.
     var pos: i64 = 0
-    while pos + 4 <= plaintext_len
-        var hdr: HandshakeHeader
-        if handshake_header_parse(@plaintext[pos], plaintext_len - pos, @hdr) != 0
-            client.last_error = TLS_ERR_PARSE_ERROR
+    while client.hs_len - pos >= 4
+        let msg_type: u8 = client.hs_buf[pos]
+        let body_len: i64 = ((client.hs_buf[pos + 1] as i64) << 16) | ((client.hs_buf[pos + 2] as i64) << 8) | (client.hs_buf[pos + 3] as i64)
+        if 4 + body_len > MAX_HANDSHAKE_SIZE
+            client.last_error = TLS_ERR_RECORD_OVERFLOW
             client.state = TLS_STATE_ERROR
             return TLS_RESULT_ERROR
+        if pos + 4 + body_len > client.hs_len
+            break  # the rest arrives in later records
 
-        let msg_start: i64 = pos
-        let msg_len: i64 = 4 + hdr.length
-
-        if pos + msg_len > plaintext_len
-            # Incomplete message - shouldn't happen in a single record
-            client.last_error = TLS_ERR_PARSE_ERROR
-            client.state = TLS_STATE_ERROR
-            return TLS_RESULT_ERROR
-
-        # Process based on message type
-        let result: i32 = process_handshake_message(client, hdr.msg_type, @plaintext[pos + 4], hdr.length)
-        if result != 0
+        if process_handshake_message(client, msg_type, @client.hs_buf[pos + 4], body_len) != 0
             client.state = TLS_STATE_ERROR
             return TLS_RESULT_ERROR
 
         # Update transcript with handshake message
-        transcript_update(@client.transcript, @plaintext[pos], msg_len)
+        transcript_update(@client.transcript, @client.hs_buf[pos], 4 + body_len)
+        pos = pos + 4 + body_len
 
-        pos = pos + msg_len
+        if client.state == TLS_STATE_FINISHED_RECEIVED
+            break
 
-    # Consume processed record
-    let consumed: i64 = 5 + record_len
-    client_shift_recv_buf(client, consumed)
+    client_shift_hs_buf(client, pos)
 
-    # Check if handshake complete
-    if client.state == TLS_STATE_FINISHED_RECEIVED
-        return finish_handshake(client, out, out_cap, out_len)
+    # The keys change after the server's Finished: nothing may follow it in
+    # the same record (RFC 8446 5.1).
+    if client.state == TLS_STATE_FINISHED_RECEIVED && client.hs_len != 0
+        client.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        client.state = TLS_STATE_ERROR
+        return TLS_RESULT_ERROR
 
-    # Continue processing if more data available
-    if client.recv_len > 5
-        return process_encrypted_handshake(client, out, out_cap, out_len)
-
+    # client_step sends our Finished, or goes on to the next record.
     return TLS_RESULT_NEED_INPUT
 
 # Fail with `err`; the caller moves the client to TLS_STATE_ERROR.
@@ -469,21 +531,57 @@ fn hs_fail(client: *TlsClient, err: i32) -> i32
     client.last_error = err
     return -1
 
-# Authenticate the server's leaf certificate: pinned trust anchor + hostname.
+# Current Unix time for certificate validity: the configured verify_time,
+# else the system clock. <= 0 if unavailable (the caller then refuses).
+fn client_verify_time(cfg: *TlsConfig) -> i64
+    if cfg.verify_time != 0
+        return cfg.verify_time
+    var ts: [2]i64
+    ts[0] = 0
+    ts[1] = 0
+    if syscall2(CLIENT_SYS_CLOCK_GETTIME, CLIENT_CLOCK_REALTIME, @ts[0] as i64) != 0
+        return 0
+    return ts[0]
+
+# Authenticate the server's certificate (leaf = server_certs entry 0, parsed)
+# against the configured trust anchor, and the leaf against the hostname.
 # Returns 0 if trusted, -1 otherwise.
 fn verify_server_certificate(client: *TlsClient, leaf: *X509Certificate) -> i32
     let cfg: *TlsConfig = @client.config
-    # Trust anchor. Without a pin there is nothing to trust (no CA store yet).
-    if cfg.pinned_cert_len <= 0
-        return -1
-    if client.server_certs.cert_lens[0] != cfg.pinned_cert_len
-        return -1
-    if mem_eq(client.server_certs.cert_data[0], @cfg.pinned_cert[0], cfg.pinned_cert_len as u64) != 1
-        return -1
-    # Hostname
     if cfg.hostname_len <= 0
         return -1
-    if x509_verify_hostname(leaf, @cfg.hostname[0], cfg.hostname_len) != 1
+
+    # Pinned leaf: exact bytes, then hostname.
+    if cfg.pinned_cert_len > 0
+        if client.server_certs.cert_lens[0] != cfg.pinned_cert_len
+            return -1
+        if mem_eq(client.server_certs.cert_data[0], @cfg.pinned_cert[0], cfg.pinned_cert_len as u64) != 1
+            return -1
+        if x509_verify_hostname(leaf, @cfg.hostname[0], cfg.hostname_len) != 1
+            return -1
+        return 0
+
+    # CA store: the chain the server sent, leaf first, up to an anchor.
+    if cfg.ca_store == null
+        return -1  # no trust anchor at all
+    let now: i64 = client_verify_time(cfg)
+    if now <= 0
+        return -1
+
+    var certs: [10]X509Certificate
+    var chain: [10]*X509Certificate
+    chain[0] = leaf
+    var n: i32 = 1
+    while n < client.server_certs.num_certs && n < 10
+        # A certificate we cannot parse ends the usable chain; the walk then
+        # needs an anchor for what came before it.
+        if x509_parse_certificate(client.server_certs.cert_data[n], client.server_certs.cert_lens[n] as u64, @certs[n]) != 0
+            break
+        chain[n] = @certs[n]
+        n += 1
+
+    let store: *CaStore = cfg.ca_store
+    if x509_verify_server_cert(@chain[0], n, @cfg.hostname[0], cfg.hostname_len, now, ca_store_as_array(store), ca_store_count(store)) != 1
         return -1
     return 0
 
@@ -689,6 +787,18 @@ fn client_record_cap(cap: i64) -> i32
     if cap < 0
         return 0
     return cap as i32
+
+fn client_shift_hs_buf(client: *TlsClient, amount: i64)
+    if amount <= 0
+        return
+    if amount >= client.hs_len
+        client.hs_len = 0
+        return
+    var i: i64 = 0
+    while i < client.hs_len - amount
+        client.hs_buf[i] = client.hs_buf[i + amount]
+        i += 1
+    client.hs_len = client.hs_len - amount
 
 fn client_shift_recv_buf(client: *TlsClient, amount: i64)
     if amount >= client.recv_len

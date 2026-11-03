@@ -99,6 +99,14 @@ struct X509Certificate
     is_ca: u8               # From basicConstraints
     key_usage: u16          # From keyUsage
 
+    # subjectAltName: the GeneralNames SEQUENCE (DER, tag and length
+    # included), pointing into the certificate's DER like tbs_data.
+    # has_san is 1 when the extension is present, even if it holds no
+    # dNSName: a SAN-bearing certificate's CN is never a hostname.
+    has_san: u8
+    san_data: *u8
+    san_len: u64
+
     # Signature
     signature: [512]u8
     signature_len: u64
@@ -572,6 +580,21 @@ fn x509_parse_extensions(parser: *DerParser, cert: *X509Certificate) -> i32
                 ext_value = @actual_value
 
         # Process known extensions
+        if oid_is_subject_alt_name(@ext_oid) == 1
+            # extnValue OCTET STRING wraps GeneralNames ::= SEQUENCE OF
+            # GeneralName. Record that a SAN exists even if it is malformed:
+            # x509_verify_hostname then matches nothing (fail closed) rather
+            # than falling back to the CN.
+            cert.has_san = 1
+            if der_is_octet_string(ext_value) == 1
+                var san_parser: DerParser
+                der_parser_init(@san_parser, ext_value.content, ext_value.content_len)
+                var san_seq: DerElement
+                if der_parse_element(@san_parser, @san_seq) == 0
+                    if der_is_sequence(@san_seq) == 1
+                        cert.san_data = san_seq.content - san_seq.header_len
+                        cert.san_len = san_seq.header_len + san_seq.content_len
+
         if oid_is_basic_constraints(@ext_oid) == 1
             # Parse basicConstraints
             if der_is_octet_string(ext_value) == 1
