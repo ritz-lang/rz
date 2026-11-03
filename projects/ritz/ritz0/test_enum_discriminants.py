@@ -463,6 +463,120 @@ fn main() -> i32
 """, "enum 'E' has no 'from'", "t.ritz:5"),
 }
 
+# AGAST #2136: §10.4 "Convert explicitly to pass one as an integer." An enum
+# value where an integer is expected is a located error at each place a value
+# meets a declared type: return (statement and tail), argument, annotated
+# let / var, and assignment.  ritz0 used to emit `ret %enum.St` from an i64
+# fn (invalid IR) and ritz1 accepted all of them.
+_ST = """\
+enum St
+    A
+    B
+
+enum Errno: i64
+    Fault = -14
+
+struct Box
+    n: i64
+
+fn take(x: u64) -> i64
+    x as i64
+
+"""
+_AS_INT = "found enum '{}'; convert with `as`"
+REJECTS.update({
+    "enum_as_int_return": (_ST + """\
+fn f() -> i64
+    return St.B
+
+fn main() -> i32
+    f() as i32
+""", "expected i64, " + _AS_INT.format("St"), "t.ritz:15"),
+    "enum_as_int_tail": (_ST + """\
+fn f() -> i64
+    Errno.Fault
+
+fn main() -> i32
+    f() as i32
+""", "expected i64, " + _AS_INT.format("Errno"), "t.ritz:15"),
+    "enum_as_int_argument": (_ST + """\
+fn main() -> i32
+    take(St.A) as i32
+""", "expected u64, " + _AS_INT.format("St"), "t.ritz:15"),
+    "enum_as_int_let": (_ST + """\
+fn main() -> i32
+    let n: i32 = St.B
+    n
+""", "expected i32, " + _AS_INT.format("St"), "t.ritz:15"),
+    "enum_as_int_var": (_ST + """\
+fn main() -> i32
+    var n: i64 = Errno.Fault
+    n as i32
+""", "expected i64, " + _AS_INT.format("Errno"), "t.ritz:15"),
+    "enum_as_int_assign": (_ST + """\
+fn main() -> i32
+    var n: i64 = 0
+    n = St.B
+    n as i32
+""", "expected i64, " + _AS_INT.format("St"), "t.ritz:16"),
+    "enum_as_int_assign_field": (_ST + """\
+fn main() -> i32
+    var b = Box { n: 0 }
+    b.n = St.B
+    b.n as i32
+""", "expected i64, " + _AS_INT.format("St"), "t.ritz:16"),
+    # The expression forms: `return` and assignment as a match arm.
+    "enum_as_int_return_arm": (_ST + """\
+fn f(k: i64) -> i64
+    match k
+        0 => return St.B
+        _ => 1
+
+fn main() -> i32
+    f(0) as i32
+""", "expected i64, " + _AS_INT.format("St"), "t.ritz:16"),
+    "enum_as_int_assign_arm": (_ST + """\
+fn main() -> i32
+    var n: i64 = 0
+    match n
+        0 => n = Errno.Fault
+        _ => pass
+    n as i32
+""", "expected i64, " + _AS_INT.format("Errno"), "t.ritz:17"),
+})
+
+# The controls: an enum where an enum is expected, an explicit `as`, and an
+# enum-valued tail in a procedure (whose tail is evaluated for effect) all
+# still compile and run.
+ENUM_POSITIONS_OK = _ST + """\
+fn pick(s: St) -> St
+    s
+
+fn st() -> St
+    return St.B
+
+fn proc()
+    St.A
+
+fn main() -> i32
+    proc()
+    var s: St = St.A
+    s = pick(st())
+    let n: i64 = s as i64
+    var b = Box { n: 0 }
+    b.n = Errno.Fault as i64
+    if n != 1
+        return 1
+    if b.n != -14
+        return 2
+    take(St.B as u64) as i32 + 40
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_enum_positions_ok(compiler, tmp_path):
+    assert _run(compiler, tmp_path, ENUM_POSITIONS_OK) == 41
+
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(REJECTS))

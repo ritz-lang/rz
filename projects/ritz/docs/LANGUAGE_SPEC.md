@@ -1601,7 +1601,21 @@ The rules:
 - `= N` needs a representation type, and an enum with one must be fieldless.
 - The representation type fixes the discriminants' type, not the enum's
   layout: an enum value is still its tag (§10.1), whatever its
-  discriminants. Convert explicitly to pass one as an integer.
+  discriminants. Convert explicitly to pass one as an integer: an enum
+  value where an integer is expected (a return, an argument, an annotated
+  `let` / `var`, an assignment) is an error.
+
+```ritz expect-error="expected i64, found enum 'St'; convert with `as`"
+enum St
+    A
+    B
+
+fn f() -> i64
+    return St.B                      # write `St.B as i64`
+
+fn main() -> i32
+    f() as i32
+```
 
 **`e as U`** converts a fieldless enum value to any integer type `U`: its
 discriminant, extended or truncated exactly as an integer cast from the

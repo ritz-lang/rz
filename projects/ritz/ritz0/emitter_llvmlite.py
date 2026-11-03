@@ -4441,6 +4441,10 @@ class LLVMEmitter:
                     self._emit_drop_for_all_scopes(exclude_var)
                     self.builder.ret(ir.Constant(ret_type, 0))
                     return fn
+                if fn_def.ret_type is not None:
+                    self._reject_enum_as_int(
+                        last_val, ret_type, fn_def.ret_type,
+                        getattr(fn_def.body.expr, 'span', None))
                 last_val = self._convert_type(last_val, ret_type)
                 # A fn with no declared return type is a procedure: its tail
                 # expression is evaluated for effect only. _convert_type
@@ -5000,6 +5004,10 @@ class LLVMEmitter:
                     val = self._emit_expr(stmt.value)
                 self.closure_expected_type = None  # Clear context
                 self.expected_ritz_type = None
+                self._reject_enum_as_int(
+                    val, ret_type,
+                    self.current_fn_def.ret_type if self.current_fn_def else None,
+                    getattr(stmt.value, 'span', None) or getattr(stmt, 'span', None))
                 val = self._convert_type(val, ret_type)
                 # Emit drops for all scopes before return (excluding moved variable)
                 self._emit_drop_for_all_scopes(exclude_var)
@@ -5107,6 +5115,8 @@ class LLVMEmitter:
                     self.simd_expected_type = None  # Clear SIMD context
                     if stmt.type:
                         self._check_initialiser_has_value(stmt, val)
+                        self._reject_enum_as_int(val, ty, stmt.type,
+                                                 getattr(stmt, 'span', None))
                     self._check_int_literal_fits_declaration(stmt)
                     if stmt.type:
                         self._check_implicit_narrowing(stmt, val.type, ty)
@@ -5167,6 +5177,8 @@ class LLVMEmitter:
                 # Use declared type and convert value if needed
                 declared_ty = self._ritz_type_to_llvm(stmt.type)
                 src_ty = val.type  # before _convert_type hides any narrowing
+                self._reject_enum_as_int(val, declared_ty, stmt.type,
+                                         getattr(stmt, 'span', None))
                 val = self._convert_type(val, declared_ty)
                 self._check_int_literal_fits_declaration(stmt)
                 self._check_implicit_narrowing(stmt, src_ty, declared_ty)
@@ -5226,6 +5238,7 @@ class LLVMEmitter:
                 val = self._emit_enum_variant_with_type(stmt.value, target_enum)
             else:
                 val = self._emit_expr(stmt.value)
+            self._reject_enum_assign(stmt.target, val, getattr(stmt, 'span', None))
             if isinstance(stmt.target, rast.Ident):
                 name = stmt.target.name
                 # A `let` (#2025 slot or SSA value) was rejected by
@@ -8581,6 +8594,10 @@ class LLVMEmitter:
         ret_type = self._fn_ret_type(self.current_fn)
         if expr.value is not None:
             ret_val = self._emit_expr(expr.value)
+            self._reject_enum_as_int(
+                ret_val, ret_type,
+                self.current_fn_def.ret_type if self.current_fn_def else None,
+                getattr(expr.value, 'span', None) or getattr(expr, 'span', None))
             ret_val = self._convert_type(ret_val, ret_type)
             self.builder.ret(ret_val)
         else:
@@ -8639,6 +8656,7 @@ class LLVMEmitter:
             val = self._emit_enum_variant_with_type(expr.value, target_enum)
         else:
             val = self._emit_expr(expr.value)
+        self._reject_enum_assign(expr.target, val, getattr(expr, 'span', None))
 
         # Handle different target types (similar to AssignStmt handling)
         if isinstance(expr.target, rast.Ident):
@@ -9500,10 +9518,40 @@ class LLVMEmitter:
         m = re.search(r"#(\d+) arg mismatch", llvm_msg)
         if m:
             n = int(m.group(1))
+            as_int = self._enum_arg_message(call, fname, n, llvm_msg)
+            if as_int is not None:
+                return as_int
             return (
                 f"argument {n} of `{fname}` has the wrong type: {llvm_msg}"
             )
         return f"call to `{fname}`: {llvm_msg}"
+
+    def _enum_arg_message(self, call: rast.Call, fname: str, n: int,
+                          llvm_msg: str) -> Optional[str]:
+        """AGAST #2136: argument `n` is an enum value where the callee takes
+        an integer.  llvmlite's message is the only record of the two types
+        here (`Type of #1 arg mismatch: i64 != %"enum.m.St"`), so it is read
+        back against the enum and integer LLVM types; the parameter's Ritz
+        spelling (`u64`, not LLVM's `i64`) comes from the callee's def."""
+        m = re.search(r"arg mismatch: (\S+) != (.+)$", llvm_msg.strip())
+        if not m or not re.fullmatch(r"i\d+", m.group(1)):
+            return None
+        found = m.group(2).strip()
+        enum_name = None
+        for name, (enum_type, _) in self.enum_types.items():
+            if str(enum_type) == found:
+                enum_name = name
+                break
+        if enum_name is None:
+            return None
+        expected = m.group(1)
+        fn_entry = self.functions.get(fname)
+        if fn_entry is not None:
+            params = fn_entry[1].params
+            if len(params) == len(call.args) and 0 < n <= len(params):
+                expected = self._format_ritz_type(params[n - 1].type)
+        return (f"argument {n} of `{fname}`: "
+                + self._enum_as_int_message(expected, enum_name))
 
     def _emit_call_inner(self, call: rast.Call) -> ir.Value:
         """Emit a function call.
@@ -13303,6 +13351,54 @@ class LLVMEmitter:
         # Use _convert_type for other conversions
         return self._convert_type(val, target_type)
 
+    def _enum_entry_of_type(self, ty: ir.Type) -> Optional[Tuple[str, List[rast.Variant]]]:
+        """`(enum name, variants)` when `ty` is an enum's LLVM type, else None."""
+        ty_name = getattr(ty, 'name', None)
+        for enum_name, (enum_type, variants) in self.enum_types.items():
+            if enum_type is ty or (
+                    ty_name is not None
+                    and getattr(enum_type, 'name', None) == ty_name):
+                return enum_name, variants
+        return None
+
+    @staticmethod
+    def _enum_as_int_message(expected: str, enum_name: str) -> str:
+        return f"expected {expected}, found enum '{enum_name}'; convert with `as`"
+
+    def _reject_enum_as_int(self, val: ir.Value, target_ty: ir.Type,
+                            ritz_type: Optional[rast.Type], span) -> None:
+        """An enum value where an integer is expected (AGAST #2136).
+
+        LANGUAGE_SPEC §10.4: an enum value is its tag, not an integer;
+        "Convert explicitly to pass one as an integer."  _convert_type no-ops
+        on an aggregate, so without this a `return St.B` from an i64 fn was
+        emitted as `ret %enum.St` -- invalid IR -- and the let / argument /
+        assignment forms failed with LLVM's type spelling.  Called wherever a
+        value meets a declared type: return, tail, annotated let / var, and
+        assignment (arguments go through _call_mismatch_message).
+        """
+        if val is ir.Undefined or not isinstance(target_ty, ir.IntType):
+            return
+        entry = self._enum_entry_of_type(val.type)
+        if entry is None:
+            return
+        expected = (self._format_ritz_type(ritz_type) if ritz_type is not None
+                    else f"i{target_ty.width}")
+        raise EmitError(self._enum_as_int_message(expected, entry[0]), span)
+
+    def _reject_enum_assign(self, target: rast.Expr, val: ir.Value, span) -> None:
+        """`x = St.B` where `x` is an integer: _reject_enum_as_int for the
+        assignment target, whatever its form (local, global, field, index,
+        deref).  The target's type is only inferred once `val` is known to be
+        an enum, so ordinary assignments pay nothing."""
+        if val is ir.Undefined or self._enum_entry_of_type(val.type) is None:
+            return
+        target_ritz = self._infer_ritz_type(target)
+        if target_ritz is None:
+            return
+        self._reject_enum_as_int(val, self._ritz_type_to_llvm(target_ritz),
+                                 target_ritz, span)
+
     def _try_emit_enum_to_int(self, val: ir.Value, target_type: ir.IntType,
                               expr: rast.Cast) -> Optional[ir.Value]:
         """`e as U` for a fieldless enum value: its discriminant (§10.4).
@@ -13313,13 +13409,7 @@ class LLVMEmitter:
         value yields exactly that residue, widening or narrowing).  An enum
         whose discriminants are its indices is a plain zext/trunc of the tag.
         """
-        entry = None
-        for enum_name, (enum_type, variants) in self.enum_types.items():
-            if enum_type is val.type or (
-                    getattr(enum_type, 'name', None) is not None
-                    and getattr(enum_type, 'name', None) == getattr(val.type, 'name', None)):
-                entry = (enum_name, variants)
-                break
+        entry = self._enum_entry_of_type(val.type)
         if entry is None:
             return None
         enum_name, variants = entry

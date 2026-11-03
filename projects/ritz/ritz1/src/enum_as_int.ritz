@@ -1,0 +1,205 @@
+# ritz1/src/enum_as_int.ritz - an enum value where an integer is expected
+#
+# AGAST #2136.  LANGUAGE_SPEC §10.4: an enum value is its tag, not an
+# integer -- "Convert explicitly to pass one as an integer."
+#
+#     enum St
+#         A
+#         B
+#     fn f() -> i64
+#         return St.B     # error: expected i64, found enum 'St'; convert with `as`
+#
+# ritz1 accepted this at every place a value meets a declared type, so an
+# `ElfStatus` or an `Errno` without `as i64` could leak out as an integer.
+# This is a pre-pass, run beside let_check_stmt: emit_stmt calls
+# enum_as_int_stmt for each statement, the fn / method emitters call
+# enum_as_int_tail for a trailing expression, and emit_match_arm_body calls
+# enum_as_int_expr for an expression arm.  It checks
+#
+#   * `return e` and a tail `e` against the fn's integer return type
+#   * `let x: T = e` / `var x: T = e` against a written integer T
+#   * `x = e`, `x.f = e`, `p.f = e` against an integer target
+#   * each call argument against an integer parameter
+#
+# Like narrowing.ritz it is one-sided: an expression is an enum only when
+# resolve_scrutinee_enum names a non-generic user enum, and a target is an
+# integer only when its type was written (an unannotated local is the
+# parser's TYPE_I64 default whatever it holds, so it is never trusted).  A
+# missed rejection is a parity gap with ritz0; a false one would refuse a
+# valid program.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import narrowing
+import emitter_match
+import emitter_expr_call
+import let_check
+
+# The user enum `e` evaluates to, if any: 1 and its name in out_name/out_len.
+fn eai_enum_of(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if e == null
+        return 0
+    if resolve_scrutinee_enum(s, e, out_name, out_len) == 0
+        return 0
+    let ei: i32 = enum_find(*out_name, *out_len)
+    if ei < 0 or enum_is_generic(ei) == 1
+        return 0
+    1
+
+# `e` where an integer of type kind `want` is expected: report it at
+# line:col if `e` is an enum.  `want` that is no integer kind is no check.
+fn eai_check(s: *EmitterState, e: *Expr, want: i32, line: i32, col: i32)
+    if narrow_int_width(want) == 0
+        return
+    var en: *u8 = null
+    var en_len: i32 = 0
+    if eai_enum_of(s, e, @en, @en_len) == 0
+        return
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(line as i64)
+    eprints_cstr(c":")
+    eprint_int(col as i64)
+    eprints_cstr(c": expected ")
+    eprints_cstr(narrow_type_name(want))
+    eprints_cstr(c", found enum '")
+    narrow_eprint_name(en, en_len)
+    eprints_cstr(c"'; convert with `as`\n")
+    emit_str(s, c"  ; ERROR: enum value where an integer is expected\n")
+    s.error_count = s.error_count + 1
+
+fn eai_check_at(s: *EmitterState, e: *Expr, want: i32)
+    if e != null
+        eai_check(s, e, want, e.span.line, e.span.col)
+
+# Type kind of field `f` of struct `sname`, or NARROW_UNKNOWN.
+fn eai_field_type(s: *EmitterState, sname: *u8, slen: i32, f: *u8, flen: i32) -> i32
+    if sname == null or slen <= 0
+        return NARROW_UNKNOWN
+    let st: *StructDef = find_struct(s, sname, slen)
+    if st == null
+        return NARROW_UNKNOWN
+    let idx: i32 = find_field_index(st, f, flen)
+    if idx < 0
+        return NARROW_UNKNOWN
+    let field: *StructField = get_field_type(st, idx)
+    narrow_known(field.field_type)
+
+# Type kind of field `f` of the struct local / pointer-to-struct local `name`.
+fn eai_local_field_type(s: *EmitterState, name: *u8, len: i32, f: *u8, flen: i32) -> i32
+    let loc: *LocalVar = find_local_struct_name(s, name, len)
+    if loc == null
+        return NARROW_UNKNOWN
+    eai_field_type(s, loc.type_name, loc.type_name_len, f, flen)
+
+# Type kind of an assignment target expression, or NARROW_UNKNOWN.
+fn eai_target_type(s: *EmitterState, t: *Expr) -> i32
+    if t == null
+        return NARROW_UNKNOWN
+    if t.kind == EXPR_IDENT
+        return narrow_ident_type(s, t)
+    if t.kind == EXPR_MEMBER
+        let fld: *StructField = resolve_member_chain_field(s, t)
+        if fld != null
+            return narrow_known(fld.field_type)
+        return narrow_member_type(s, t)
+    NARROW_UNKNOWN
+
+# Each argument of a call / method call against its parameter, then every
+# sub-expression (the same walk as let_check_expr).
+pub fn enum_as_int_expr(s: *EmitterState, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_UNARY
+        enum_as_int_expr(s, e.operand)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        enum_as_int_expr(s, e.left)
+        enum_as_int_expr(s, e.right)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY
+        enum_as_int_expr(s, e.left)
+    else if k == EXPR_CALL or k == EXPR_METHOD
+        var p: *Param = null
+        if k == EXPR_METHOD
+            enum_as_int_expr(s, e.left)
+            let m: *FnDef = let_method_def(s, e)
+            if m != null
+                p = m.params
+                if p != null
+                    p = p.next   # the receiver
+        else
+            let f: *FnDef = find_call_fn(s, e)
+            if f != null
+                p = f.params
+        var a: *Expr = e.args
+        while a != null
+            enum_as_int_expr(s, a)
+            if p != null
+                eai_check_at(s, a, p.param_type)
+                p = p.next
+            a = a.next
+
+# A fn / method's trailing expression, returned as `ret_type`.
+pub fn enum_as_int_tail(s: *EmitterState, e: *Expr, ret_type: i32)
+    enum_as_int_expr(s, e)
+    eai_check_at(s, e, ret_type)
+
+# One statement, before it is emitted.  Called before emit_var_decl, so a
+# `let x: i32 = x` still types the outer x.
+pub fn enum_as_int_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
+    let k: i32 = stmt.kind
+    let line: i32 = stmt.span.line
+    let col: i32 = stmt.span.col
+    if k == STMT_VAR_DECL
+        enum_as_int_expr(s, stmt.var_init)
+        eai_check(s, stmt.var_init, stmt.var_declared_type, line, col)
+        return
+    if k == STMT_TUPLE_DECL
+        enum_as_int_expr(s, stmt.var_init)
+        return
+    if k == STMT_RETURN
+        enum_as_int_expr(s, stmt.return_value)
+        eai_check_at(s, stmt.return_value, ret_type)
+        return
+    if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        enum_as_int_expr(s, stmt.assign_value)
+        var want: i32 = NARROW_UNKNOWN
+        if k == STMT_ASSIGN
+            if stmt.assign_target_len > 0
+                # `x = v` / `x op= v`: the target is a bare name.
+                var id: Expr
+                id.kind = EXPR_IDENT
+                id.ident_ptr = stmt.assign_target
+                id.ident_len = stmt.assign_target_len
+                want = narrow_ident_type(s, @id)
+            else
+                want = eai_target_type(s, stmt.if_cond as *Expr)
+        else if k == STMT_LOCAL_FIELD_ASSIGN
+            # `name.f = v`
+            want = eai_local_field_type(s, stmt.var_name, stmt.var_name_len, stmt.assign_target, stmt.assign_target_len)
+        else if k == STMT_MEMBER_ASSIGN
+            # `p.f = v`, the pointer expression in if_cond.
+            let pe: *Expr = stmt.if_cond as *Expr
+            if pe != null and pe.kind == EXPR_IDENT
+                want = eai_local_field_type(s, pe.ident_ptr, pe.ident_len, stmt.assign_target, stmt.assign_target_len)
+        if want != NARROW_UNKNOWN
+            eai_check(s, stmt.assign_value, want, line, col)
+        return
+    if k == STMT_EXPR
+        enum_as_int_expr(s, stmt.expr)
+    else if k == STMT_IF or k == STMT_ASSERT
+        enum_as_int_expr(s, stmt.if_cond)
+    else if k == STMT_WHILE
+        enum_as_int_expr(s, stmt.while_cond)
+    else if k == STMT_FOR
+        enum_as_int_expr(s, stmt.for_start)
+        enum_as_int_expr(s, stmt.for_end)
