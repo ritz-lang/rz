@@ -12097,7 +12097,13 @@ class LLVMEmitter:
                         ritz_type = self.ritz_types[inner.left.name]
                         if isinstance(ritz_type, rast.PtrType):
                             return self._is_unsigned_type(ritz_type.inner)
-            return False
+            # Any other pointer operand: an inline cast `*(@b[0] as *u16)` /
+            # `*((base + 2) as *u16)` or an address-of `*@b[0]` / `*@g`
+            # (AGAST #2146). The load already has the pointee's width, but
+            # without this a u16/u32 pointee widened with sext (65535 -> -1).
+            # _infer_ritz_type resolves `as *T` to *T and `@x` to *typeof(x),
+            # and its '*' arm strips the pointer.
+            return self._is_unsigned_type(self._infer_ritz_type(expr))
 
         # Index into unsigned array or pointer
         if isinstance(expr, rast.Index):
