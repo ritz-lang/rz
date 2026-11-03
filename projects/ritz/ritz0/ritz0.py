@@ -25,6 +25,7 @@ from lexer import Lexer, LexerError
 # Use generated parser with adapter (comment out to use hand-written parser)
 # from parser_adapter import Parser, ParseError  # Generated parser
 from parser import Parser, ParseError  # Hand-written parser
+from enum_from import rewrite_enum_from
 from emitter_llvmlite import emit as emit_llvmlite, EmitError
 from import_resolver import ImportResolver, ImportError as RitzImportError
 import module_interface
@@ -216,6 +217,13 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # This must happen after import resolution but before name resolution
         # so that name resolution doesn't see excluded items
         module = _filter_by_target_os(module, target_os)
+
+        # `E.from(v)` -> the generated `E__from(v)` (LANGUAGE_SPEC §10.4)
+        from_errors = rewrite_enum_from(module)
+        if from_errors:
+            for err in from_errors:
+                print(f"Error: {err}", file=sys.stderr)
+            return False
 
         # Evaluate constant expressions in array sizes
         # This must happen before name resolution since it transforms the AST

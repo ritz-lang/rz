@@ -2113,6 +2113,12 @@ class Parser:
         # Parse optional type parameters: <T> or <T, U> or <T: Drop>
         type_params, type_param_bounds = self._parse_type_params()
 
+        # `enum E: u64` -- a representation type (LANGUAGE_SPEC §10.4).
+        repr_type = None
+        if self._at(TokenType.COLON) and not type_params:
+            self._advance()
+            repr_type = self.parse_type()
+
         self._skip_newlines()
         self._expect(TokenType.INDENT)
 
@@ -2122,7 +2128,18 @@ class Parser:
             var_name = self._expect(TokenType.IDENT)
             var_fields = []
             var_field_names = []
-            if self._at(TokenType.LPAREN):
+            discriminant = None
+            if self._at(TokenType.EQ):
+                # `Read = 0`, `Fault = -14`: an explicit discriminant.
+                self._advance()
+                negative = self._at(TokenType.MINUS)
+                if negative:
+                    self._advance()
+                discriminant = self._expect(TokenType.INT).value
+                if negative:
+                    discriminant = -discriminant
+                self._skip_newlines()
+            elif self._at(TokenType.LPAREN):
                 # Tuple variant: Reload(i32), SetViewport(u32, u32)
                 self._advance()
                 if not self._at(TokenType.RPAREN):
@@ -2188,14 +2205,18 @@ class Parser:
                             var_span)
 
             variants.append(rast.Variant(var_span, var_name.value, var_fields,
-                                         field_names=var_field_names))
+                                         field_names=var_field_names,
+                                         discriminant=discriminant))
             self._skip_newlines()  # Skip newlines after enum variant
 
         if self._at(TokenType.DEDENT):
             self._advance()
 
-        return rast.EnumDef(span, name_tok.value, variants,
-                            type_params=type_params, type_param_bounds=type_param_bounds, is_pub=is_pub)
+        enum_def = rast.EnumDef(span, name_tok.value, variants,
+                                type_params=type_params, type_param_bounds=type_param_bounds,
+                                is_pub=is_pub, repr=repr_type)
+        _check_discriminants(enum_def)
+        return enum_def
 
     def _expect_ident_or_keyword(self, msg: str = None) -> Token:
         """Consume an identifier or keyword token (for paths where keywords are valid)."""
@@ -2589,7 +2610,107 @@ class Parser:
             items.append(self.parse_item())
             self._skip_newlines()  # Skip newlines between items
 
+        items.extend(_enum_from_fns(items, span.file))
         return rast.Module(span, items)
+
+
+# ============================================================================
+# Enum discriminants (LANGUAGE_SPEC §10.4, AGAST #1880)
+# ============================================================================
+#
+# ritz1 enforces the same rules with the same messages (ast_helpers.ritz,
+# enum_check_*), and generates the same `from` source (enum_from_source).
+
+# Representation types and their value ranges.
+INT_RANGES = {
+    "i8": (-(1 << 7), (1 << 7) - 1), "i16": (-(1 << 15), (1 << 15) - 1),
+    "i32": (-(1 << 31), (1 << 31) - 1), "i64": (-(1 << 63), (1 << 63) - 1),
+    "u8": (0, (1 << 8) - 1), "u16": (0, (1 << 16) - 1),
+    "u32": (0, (1 << 32) - 1), "u64": (0, (1 << 64) - 1),
+}
+
+
+def _repr_name(enum_def: rast.EnumDef) -> Optional[str]:
+    """The representation type's name (`u64`), or None without one."""
+    ty = enum_def.repr
+    if ty is None:
+        return None
+    if isinstance(ty, rast.NamedType) and not ty.args:
+        return ty.name
+    return "?"
+
+
+def _check_discriminants(enum_def: rast.EnumDef) -> None:
+    """Reject what §10.4 forbids, located at the offending variant."""
+    name = enum_def.name
+    repr_name = _repr_name(enum_def)
+    if repr_name is not None and repr_name not in INT_RANGES:
+        raise ParseError(
+            f"representation type of enum '{name}' must be an integer type",
+            enum_def.span)
+    for v in enum_def.variants:
+        if repr_name is not None and v.fields:
+            raise ParseError(
+                f"variant '{v.name}' of enum '{name}' carries data, so the "
+                f"enum cannot have a representation type", v.span)
+        if repr_name is None and v.discriminant is not None:
+            raise ParseError(
+                f"discriminant of variant '{v.name}' needs a representation "
+                f"type: write 'enum {name}: <integer type>'", v.span)
+    if repr_name is None:
+        return
+    lo, hi = INT_RANGES[repr_name]
+    seen = {}
+    for v, d in zip(enum_def.variants, enum_def.discriminants()):
+        if not lo <= d <= hi:
+            raise ParseError(
+                f"discriminant {d} of variant '{v.name}' does not fit enum "
+                f"'{name}''s representation type {repr_name}", v.span)
+        if d in seen:
+            raise ParseError(
+                f"variants '{seen[d]}' and '{v.name}' of enum '{name}' have "
+                f"the same discriminant {d}", v.span)
+        seen[d] = v.name
+
+
+def enum_from_name(enum_name: str) -> str:
+    """The fn `E.from(v)` calls (§10.4): generated, so not user-spellable
+    in practice, and the same symbol in both compilers."""
+    return f"{enum_name}__from"
+
+
+def enum_from_source(enum_def: rast.EnumDef) -> str:
+    """Ritz source of `E.from`: `Some(E.V)` for V's discriminant, else None."""
+    name = enum_def.name
+    pub = "pub " if enum_def.is_pub else ""
+    lines = [f"{pub}fn {enum_from_name(name)}(v: {_repr_name(enum_def)}) -> Option<{name}>"]
+    for v, d in zip(enum_def.variants, enum_def.discriminants()):
+        lines.append(f"    if v == {d}")
+        lines.append(f"        return Some({name}.{v.name})")
+    lines.append("    return None")
+    return "\n".join(lines) + "\n"
+
+
+def _enum_from_fns(items: list, filename: str) -> List[rast.FnDef]:
+    """`E.from` for each enum with a representation type, if this module
+    imports ritzlib.option (its result type).  Parsed from generated source,
+    which starts on the enum's line so any position in it points there.
+
+    The fns are marked `generated`: they are not in the module's text, so
+    its interface text omits them, and parsing that text regenerates them
+    from the enum (ritz1 does the same).
+    """
+    if not any(isinstance(it, rast.Import) and it.path == ["ritzlib", "option"]
+               and it.alias is None for it in items):
+        return []
+    out = []
+    for it in items:
+        if isinstance(it, rast.EnumDef) and it.repr is not None:
+            src = "\n" * (it.span.line - 1) + enum_from_source(it)
+            fn = Parser(Lexer(src, filename).tokenize()).parse_module().items[0]
+            fn.generated = True
+            out.append(fn)
+    return out
 
 
 def _callconv_of(attrs: List[rast.Attr]) -> Optional[str]:

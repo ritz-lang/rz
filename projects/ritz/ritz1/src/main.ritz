@@ -189,6 +189,46 @@ fn parse_tokens(tokens: *Vec<Token>) -> *Module
     m
 
 # =============================================================================
+# E.from (LANGUAGE_SPEC §10.4, AGAST #1880)
+# =============================================================================
+
+# Does `m` import ritzlib.option (the result type of a generated `from`)?
+fn imports_option(m: *Module) -> i32
+    var imp: *ImportDecl = m.imports
+    while imp != null
+        let a: *ImportPath = imp.path
+        if a != null and a.next != null and a.next.next == null
+            if a.segment_len == 7 and memcmp(a.segment, c"ritzlib", 7) == 0
+                if a.next.segment_len == 6 and memcmp(a.next.segment, c"option", 6) == 0
+                    return 1
+        imp = imp.next
+    0
+
+# Parse the generated `E__from` fns of the enums with a representation type
+# that `m` declared (tracker indices >= first_ei) into `m`, as if written in
+# its source: ritz0 does the same (parser.py, _enum_from_fns).  Only for a
+# module that imports ritzlib.option; elsewhere `E.from` is a located error
+# (emit_expr_method).  Returns -1 on a lex/parse failure of the generated text.
+fn add_enum_from_fns(m: *Module, first_ei: i32, path: *u8) -> i32
+    if imports_option(m) == 0
+        return 0
+    var gen_len: i64 = 0
+    let gen: *u8 = enum_from_source(first_ei, @gen_len)
+    if gen == null or gen_len == 0
+        return 0
+    var tokens: Vec<Token> = vec_with_cap<Token>(1024)
+    if tokenize(path, gen, gen_len, @tokens) > 0
+        err2("Lexer errors in the generated from() of: ", path)
+        return -1
+    let gm: *Module = parse_tokens(@tokens)
+    if gm == null
+        err2("Parse error in the generated from() of: ", path)
+        return -1
+    keep_source_alive(gen)
+    merge_module_into(m, gm)
+    0
+
+# =============================================================================
 # Import Resolution - Inline imported code into the module
 # =============================================================================
 
@@ -605,9 +645,12 @@ fn load_and_parse(path: @String) -> *Module
 
     # Name the file in parse diagnostics (AGAST #1301).
     parser_set_source_file(path_ptr)
+    let first_ei: i32 = enum_count()
     let mod: *Module = parse_tokens(@tokens)
     if mod == null
         err2("Parse error in: ", path_ptr)
+        return null
+    if add_enum_from_fns(mod, first_ei, path_ptr) < 0
         return null
 
     # The cached IR depends on these exact bytes (AGAST #1807).
@@ -871,8 +914,11 @@ fn print_usage()
 fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz_path: StrView) -> *Module
     # Parse
     parser_set_source_file(input_path)
+    let first_ei: i32 = enum_count()
     let m: *Module = parse_tokens(tokens)
     if m == null
+        return null
+    if add_enum_from_fns(m, first_ei, input_path) < 0
         return null
 
     # AGAST #194: mark every FnDef parsed from THIS file as is_local=1

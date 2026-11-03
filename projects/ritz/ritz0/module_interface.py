@@ -239,7 +239,10 @@ def _indent(line: str) -> int:
 
 def _fns_to_declare(module: rast.Module) -> List[rast.FnDef]:
     def wanted(fn, impl=None):
+        # A generated fn (`E.from`, LANGUAGE_SPEC §10.4) has no text to
+        # strip: parsing the interface text regenerates it from the enum.
         return (not body_needed(fn, impl) and not getattr(fn, "is_decl", False)
+                and not getattr(fn, "generated", False)
                 and not any(a.name == "test" for a in fn.attrs))
     out = []
     for item in module.items:

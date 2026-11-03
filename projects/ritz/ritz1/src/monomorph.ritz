@@ -843,10 +843,32 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
                 collect_from_expr(m, sarm.body)
             sarm = sarm.next
 
+# Rewrite `E.from(args)` in place into the plain call `E__from(args)` of the
+# generated fn (main.ritz, add_enum_from_fns), as ritz0's enum_from.py does,
+# so type inference and emission see an ordinary call.  Done here because
+# this walk visits every body before emission.  Left alone when no such fn
+# exists: emit_expr_method then reports the located error.
+fn rewrite_enum_from_call(m: *Module, e: *Expr)
+    if is_enum_from_call(e) == 0
+        return
+    if find_local_var_idx(e.left.ident_ptr, e.left.ident_len) >= 0
+        return
+    var len: i32 = 0
+    let name: *u8 = enum_from_fn_name(e.left.ident_ptr, e.left.ident_len, @len)
+    if find_fn_in_module(m, name, len) == null
+        return
+    e.kind = EXPR_CALL
+    e.func_name = name
+    e.func_name_len = len
+    e.call_type_suffix = null
+    e.call_type_suffix_len = 0
+    e.left = null
+
 fn collect_from_expr(m: *Module, e: *Expr)
     if e == null
         return
 
+    rewrite_enum_from_call(m, e)
     let k: i32 = e.kind
 
     if k == EXPR_CALL
@@ -1642,6 +1664,10 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
         cloned.ident_ptr = e.ident_ptr  # Method name
         cloned.ident_len = e.ident_len
         cloned.args = clone_expr_list(e.args, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
+        # A generic body is never walked by collect_from_expr, so its
+        # specialisation is where `E.from(...)` becomes `E__from(...)`.
+        if g_mono_module != null
+            rewrite_enum_from_call(g_mono_module, cloned)
     else if k == EXPR_CAST
         # Parser stores operand in e.left, not e.operand
         cloned.left = clone_expr(e.left, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)

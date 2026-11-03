@@ -1099,7 +1099,8 @@ class ImportResolver:
                 # Absent for bare/tuple variants and for metadata written
                 # before struct variants existed.
                 variants.append(rast.Variant(dummy_span, v['name'], variant_fields,
-                                             field_names=list(v.get('field_names', []))))
+                                             field_names=list(v.get('field_names', [])),
+                                             discriminant=v.get('discriminant')))
             enum_def = rast.EnumDef(
                 span=dummy_span,
                 name=enum_meta.name,

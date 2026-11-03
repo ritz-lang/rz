@@ -1073,7 +1073,8 @@ class Monomorphizer:
             # Field names are independent of the type substitution, so
             # they carry through specialization unchanged.
             new_variants.append(rast.Variant(variant.span, variant.name, new_fields,
-                                             field_names=list(variant.field_names)))
+                                             field_names=list(variant.field_names),
+                                             discriminant=variant.discriminant))
 
         return rast.EnumDef(
             generic_def.span,
@@ -1417,10 +1418,12 @@ class Monomorphizer:
             # Field names are independent of the type substitution, so
             # they carry through specialization unchanged.
             new_variants.append(rast.Variant(variant.span, variant.name, new_fields,
-                                             field_names=list(variant.field_names)))
+                                             field_names=list(variant.field_names),
+                                             discriminant=variant.discriminant))
 
         new_enum = rast.EnumDef(enum.span, enum.name, new_variants,
-                                type_params=enum.type_params)
+                                type_params=enum.type_params,
+                                repr=enum.repr)
         # Preserve source_file for separate compilation
         if hasattr(enum, 'source_file'):
             new_enum.source_file = enum.source_file

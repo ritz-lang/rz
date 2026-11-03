@@ -12859,6 +12859,11 @@ class LLVMEmitter:
 
         target_type = self._ritz_type_to_llvm(expr.target)
 
+        if isinstance(target_type, ir.IntType):
+            enum_int = self._try_emit_enum_to_int(val, target_type, expr)
+            if enum_int is not None:
+                return enum_int
+
         # Handle StrView -> *u8 cast (common RERITZ pattern: "str" as *u8)
         # StrView is {ptr, len}, we extract the ptr field
         src_ritz_type = self._infer_ritz_type(expr.expr)
@@ -12890,6 +12895,50 @@ class LLVMEmitter:
 
         # Use _convert_type for other conversions
         return self._convert_type(val, target_type)
+
+    def _try_emit_enum_to_int(self, val: ir.Value, target_type: ir.IntType,
+                              expr: rast.Cast) -> Optional[ir.Value]:
+        """`e as U` for a fieldless enum value: its discriminant (§10.4).
+
+        None when `val` is no enum.  The tag is the declaration index; it
+        maps to the discriminant through a select chain over constants
+        already reduced to U's width (an integer cast of the representation
+        value yields exactly that residue, widening or narrowing).  An enum
+        whose discriminants are its indices is a plain zext/trunc of the tag.
+        """
+        entry = None
+        for enum_name, (enum_type, variants) in self.enum_types.items():
+            if enum_type is val.type or (
+                    getattr(enum_type, 'name', None) is not None
+                    and getattr(enum_type, 'name', None) == getattr(val.type, 'name', None)):
+                entry = (enum_name, variants)
+                break
+        if entry is None:
+            return None
+        enum_name, variants = entry
+        for v in variants:
+            if v.fields:
+                raise EmitError(
+                    f"cannot convert enum '{enum_name}' to an integer: variant "
+                    f"'{v.name}' carries data", expr.span)
+        discs = []
+        for v in variants:
+            discs.append(v.discriminant if v.discriminant is not None
+                         else (discs[-1] + 1 if discs else 0))
+        tag = self.builder.extract_value(val, 0, name="enum.tag")
+        if discs == list(range(len(discs))):
+            if tag.type.width < target_type.width:
+                return self.builder.zext(tag, target_type)
+            if tag.type.width > target_type.width:
+                return self.builder.trunc(tag, target_type)
+            return tag
+        mask = (1 << target_type.width) - 1
+        result = ir.Constant(target_type, discs[0] & mask)
+        for i in range(1, len(discs)):
+            is_i = self.builder.icmp_unsigned('==', tag, ir.Constant(tag.type, i))
+            result = self.builder.select(is_i, ir.Constant(target_type, discs[i] & mask),
+                                         result)
+        return result
 
     def _get_union_name_from_expr(self, expr: rast.Expr) -> Optional[str]:
         """Get the union type name if the expression has a union type."""

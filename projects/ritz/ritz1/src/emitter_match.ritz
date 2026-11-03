@@ -489,6 +489,22 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                     emit_str(s, c"\n")
                     add_local(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, bind_type)
 
+    # A catch-all name over a scalar (`other => other + 1`) binds the
+    # scrutinee, as in ritz0 (LANGUAGE_SPEC §8.2).  Not a const (that arm
+    # compares) and not `None` (the tagged-enum null test above).
+    if arm.pattern_kind == PAT_IDENT and (enum_name == null or enum_name_len == 0)
+        if find_const_entry(s, arm.pattern_name, arm.pattern_name_len) == null and is_ident_none_name(arm.pattern_name, arm.pattern_name_len) == 0
+            let bind_reg: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, bind_reg)
+            emit_str(s, c" = alloca i64  ; match binding\n")
+            emit_str(s, c"  store i64 ")
+            emit_reg(s, scrut_reg)
+            emit_str(s, c", ptr ")
+            emit_reg(s, bind_reg)
+            emit_str(s, c"\n")
+            add_local(s, arm.pattern_name, arm.pattern_name_len, bind_reg, TYPE_I64)
+
     # Block-bodied / statement arm (AGAST #1454, #1617): run the leading
     # statements in the arm's own scope (they are popped with the payload
     # binding below), then fall into the value path, which reads the
@@ -607,6 +623,19 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
                         cond_reg = emit_variant_tag_check(s, scrut_slot, enum_name, enum_name_len, 0)
                     else
                         cond_reg = emit_variant_tag_check_i64(s, scrut_reg, 0)
+        # A constant pattern (LANGUAGE_SPEC §8.2, AGAST #1880): a name that
+        # is an integer const compares, as ritz0 does; any other binds.
+        if cond_reg == 0 and is_enum_match == 0
+            let ce: *ConstEntry = find_const_entry(s, arm.pattern_name, arm.pattern_name_len)
+            if ce != null and is_int_const_type(ce.const_type) == 1
+                cond_reg = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, cond_reg)
+                emit_str(s, c" = icmp eq i64 ")
+                emit_reg(s, scrut_reg)
+                emit_str(s, c", ")
+                emit_int(s, ce.value)
+                emit_str(s, c"\n")
         if cond_reg == 0
             always_true = 1
     else if arm.pattern_kind == PAT_VARIANT
@@ -645,6 +674,100 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
     emit_match_arm_body(s, arm, scrut_reg, scrut_slot, enum_name, enum_name_len, result, arm_index, end_label)
 
     begin_block(s, next_label_id)
+
+fn is_ident_none_name(name: *u8, len: i32) -> i32
+    if len == 4 and memcmp(name, c"None", 4) == 0
+        return 1
+    return 0
+
+# `x as U` for a fieldless user enum value `x` (LANGUAGE_SPEC §10.4): the
+# discriminant of `x`'s variant, as an i64 register held per the enum's
+# representation type (*out_src_ty; TYPE_I64 without one), for the int → int
+# cast that follows to wrap it to U.  The tag (field 0) is the declaration
+# index; it maps to the discriminant through a select chain, or is the
+# discriminant itself when no `= N` moved one.  An enum with a payload
+# variant is the located error ritz0 gives.  -1 when `x` is no user enum.
+pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty: *i32) -> i32
+    var en: *u8 = null
+    var en_len: i32 = 0
+    if resolve_scrutinee_enum(s, cast.left, @en, @en_len) == 0
+        return 0 - 1
+    let ei: i32 = enum_find(en, en_len)
+    if ei < 0 or enum_is_generic(ei) == 1
+        return 0 - 1
+    let n: i32 = enum_variant_count(ei)
+    for vi in 0..n
+        if enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
+            var vf: *StructField = enum_variant_fields(ei, vi)
+            eprints_cstr(c"error: ")
+            let file: *u8 = emitter_source_file()
+            if file != null
+                eprints_cstr(file)
+            else
+                eprints_cstr(c"<input>")
+            eprints_cstr(c":")
+            eprint_int(cast.span.line as i64)
+            eprints_cstr(c":")
+            eprint_int(cast.span.col as i64)
+            eprints_cstr(c": cannot convert enum '")
+            eprint_bytes(en, en_len)
+            eprints_cstr(c"' to an integer: variant '")
+            eprint_bytes(vf.name, vf.name_len)
+            eprints_cstr(c"' carries data\n")
+            s.error_count = s.error_count + 1
+            *out_src_ty = TYPE_I64
+            let z: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, z)
+            emit_str(s, c" = add i64 0, 0\n")
+            return z
+    *out_src_ty = enum_repr(ei)
+    if *out_src_ty == 0
+        *out_src_ty = TYPE_I64
+    let tag: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tag)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, en, en_len)
+    emit_str(s, c" ")
+    emit_reg(s, raw_reg)
+    emit_str(s, c", 0\n")
+    var r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = zext i8 ")
+    emit_reg(s, tag)
+    emit_str(s, c" to i64\n")
+    if enum_discr_is_index(ei) == 1
+        return r
+    let first: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, first)
+    emit_str(s, c" = add i64 0, ")
+    emit_int(s, enum_variant_discr(ei, 0))
+    emit_str(s, c"\n")
+    r = first
+    for vi in 1..n
+        let is_vi: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, is_vi)
+        emit_str(s, c" = icmp eq i8 ")
+        emit_reg(s, tag)
+        emit_str(s, c", ")
+        emit_int(s, vi as i64)
+        emit_str(s, c"\n")
+        let sel: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sel)
+        emit_str(s, c" = select i1 ")
+        emit_reg(s, is_vi)
+        emit_str(s, c", i64 ")
+        emit_int(s, enum_variant_discr(ei, vi))
+        emit_str(s, c", i64 ")
+        emit_reg(s, r)
+        emit_str(s, c"\n")
+        r = sel
+    return r
 
 # Resolve the scrutinee's enum struct type name by peeking at the AST:
 #   * EXPR_IDENT   -> local's recorded struct type

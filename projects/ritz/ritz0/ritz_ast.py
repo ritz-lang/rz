@@ -954,9 +954,28 @@ class EnumDef(Item):
     is_pub: bool = False  # pub enum - exported from module
     type_params: List[str] = field(default_factory=list)
     type_param_bounds: dict = field(default_factory=dict)  # Trait bounds
+    # `enum E: u64` (LANGUAGE_SPEC §10.4, AGAST #1880): the representation
+    # type of a fieldless enum -- the type of its discriminants and of
+    # `E.from`'s parameter.  None when the enum declares none.
+    repr: Optional['Type'] = None
 
     def is_generic(self) -> bool:
         return len(self.type_params) > 0
+
+    def discriminants(self) -> List[int]:
+        """Each variant's discriminant, in declaration order (§10.4).
+
+        An explicit `= N` wins; any other variant takes the previous one + 1,
+        the first 0.  Without explicit ones that is the declaration index,
+        which is also the variant's tag.
+        """
+        out = []
+        for v in self.variants:
+            if v.discriminant is not None:
+                out.append(v.discriminant)
+            else:
+                out.append(out[-1] + 1 if out else 0)
+        return out
 
     def get_bounds(self, param: str) -> List[str]:
         """Get trait bounds for a type parameter."""
@@ -985,6 +1004,8 @@ class Variant(Node):
     # Parallel to `fields` for struct-style variants; empty for bare and
     # tuple variants. When non-empty, len(field_names) == len(fields).
     field_names: List[str] = field(default_factory=list)
+    # Explicit `= N` (LANGUAGE_SPEC §10.4), else None.
+    discriminant: Optional[int] = None
 
     def is_struct_variant(self) -> bool:
         """True if this variant was declared with named fields."""

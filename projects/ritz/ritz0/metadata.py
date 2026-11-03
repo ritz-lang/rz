@@ -249,7 +249,10 @@ def extract_metadata(module: rast.Module, source_path: str) -> ModuleMetadata:
                 # round-trips to an equivalent tuple variant.
                 {"name": v.name,
                  "fields": [type_to_string(f) for f in v.fields],
-                 **({"field_names": list(v.field_names)} if v.field_names else {})}
+                 **({"field_names": list(v.field_names)} if v.field_names else {}),
+                 # LANGUAGE_SPEC §10.4: only an explicit `= N` is stored.
+                 **({"discriminant": v.discriminant}
+                    if v.discriminant is not None else {})}
                 for v in item.variants
             ]
             enums.append(EnumMeta(

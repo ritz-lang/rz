@@ -1107,6 +1107,31 @@ fn main() -> i32
         None => 0
 ```
 
+#### Constant Patterns
+
+A bare identifier pattern that names an integer `const` (declared in the
+module or imported) compares the scrutinee with the constant. Any other
+identifier binds the scrutinee to a new name, which also makes it a
+catch-all (AGAST #1880):
+
+```ritz
+const SYS_READ: u64 = 0
+const SYS_WRITE: u64 = 1
+
+fn dispatch(n: u64) -> i64
+    match n
+        SYS_READ => 10
+        SYS_WRITE => 20
+        other => other as i64     # not a const: binds
+
+fn main() -> i32
+    dispatch(SYS_WRITE) as i32
+```
+
+A const resolves wherever it is declared in the module, before or after the
+`match`. Constant patterns compare integers only: against an enum
+scrutinee, a bare name is a variant (§10.2).
+
 #### Wildcard Pattern
 
 `_` matches anything and binds nothing. `pass` is a valid arm body for arms
@@ -1388,6 +1413,101 @@ fn width_ish(s: Shape) -> f64
 fn main() -> i32
     let x = width_ish(Shape.Rect(3.0, 4.0))
     return 0
+```
+
+### 10.4 Discriminants and Integer Conversion
+
+Every variant of a **fieldless** enum (no variant carries data) has a
+*discriminant*, an integer. By default it is the variant's declaration index:
+0, 1, 2, ... An enum can name a *representation type* after a colon, and
+then give any variant an explicit discriminant with `= N` (AGAST #1880):
+
+```ritz
+enum Syscall: u64
+    Read = 0
+    Write         # 1: the previous discriminant + 1
+    Mmap = 9
+    Exit = 60
+
+enum Errno: i64
+    Fault = -14
+    Inval = -22
+    Range = -34
+
+fn main() -> i32
+    let s = Syscall.Exit
+    let n: u64 = s as u64            # 60
+    let e: i64 = Errno.Fault as i64  # -14
+    (n as i64 + e) as i32            # 46
+```
+
+The rules:
+
+- The representation type is one of `i8`, `i16`, `i32`, `i64`, `u8`,
+  `u16`, `u32`, `u64`. A variant without `= N` takes the previous
+  variant's discriminant plus one; the first takes 0. `N` is an integer
+  literal (decimal, hex or binary), optionally negated.
+- Every discriminant must fit the representation type, and no two variants
+  may share one.
+- `= N` needs a representation type, and an enum with one must be fieldless.
+- The representation type fixes the discriminants' type, not the enum's
+  layout: an enum value is still its tag (§10.1), whatever its
+  discriminants. Convert explicitly to pass one as an integer.
+
+**`e as U`** converts a fieldless enum value to any integer type `U`: its
+discriminant, extended or truncated exactly as an integer cast from the
+representation type would (for an enum without one, its declaration index).
+Converting an enum that carries data is an error:
+
+```ritz expect-error="cannot convert enum 'Shape' to an integer: variant 'Circle' carries data"
+enum Shape
+    Circle(f64)
+    Empty
+
+fn main() -> i32
+    Shape.Empty as i32
+```
+
+**`E.from(v)`** converts back: given a value of the representation type, it
+returns `Some(variant)` for the variant with that discriminant, otherwise
+`None`. It is generated for each enum with a representation type in a
+module that imports `ritzlib.option`, and is visible wherever the enum is
+(`pub` if the enum is). Its symbol is `E__from`, so a module may not declare
+a fn of that name beside such an enum.
+
+```ritz
+import ritzlib.option
+
+enum Syscall: u64
+    Read = 0
+    Write
+    Exit = 60
+
+fn handle(rax: u64) -> i64
+    match Syscall.from(rax)
+        Some(s) => match s
+            Read => 1
+            Write => 2
+            Exit => 3
+        None => -38                  # ENOSYS
+
+fn main() -> i32
+    handle(60) as i32
+```
+
+For an enum without a representation type, or one whose module does not
+import `ritzlib.option`, `E.from` is an error located at the call:
+
+```ritz expect-error="enum 'Color' has no 'from'"
+import ritzlib.option
+
+enum Color
+    Red
+    Green
+
+fn main() -> i32
+    let c = Color.from(1)
+    0
 ```
 
 ---

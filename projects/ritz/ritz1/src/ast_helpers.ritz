@@ -3736,6 +3736,13 @@ pub fn stmt_for_iter(p: *Parser, name: *u8, name_len: i32, iter: *Expr, body: *S
 pub fn enum_def_skip(p: *Parser) -> i32
     return 0
 
+# enum_def's action: as enum_def_skip, latching `pub` for the enum just
+# parsed (its generated `from` is `pub` iff it is, LANGUAGE_SPEC §10.4).
+pub fn enum_def_end(p: *Parser, is_pub: i32) -> i32
+    if g_enum_count > 0
+        *(g_enum_pub + g_enum_count - 1) = is_pub
+    return 0
+
 # ============================================================================
 # Enum variant tracker (for qualified enum-variant lookup at codegen)
 # ============================================================================
@@ -3784,6 +3791,21 @@ var g_enum_generic: *i32 = null
 var g_enum_variant_fields: **StructField = null
 var g_enum_variant_kinds: *i32 = null
 
+# AGAST #1880, LANGUAGE_SPEC §10.4:
+#   g_enum_repr[e]            the representation type (TYPE_U64, ...), 0 for
+#                             none
+#   g_enum_pub[e] / _line[e]  `pub enum`; the line of its name (where the
+#                             generated `from` source starts)
+#   g_enum_variant_discr[v]   the discriminant's bits: an explicit `= N`, else
+#                             the previous one + 1, the first 0
+#   g_enum_variant_neg[v]     1 when the discriminant's value is negative
+#                             (else the bits read as a u64)
+var g_enum_repr: *i32 = null
+var g_enum_pub: *i32 = null
+var g_enum_line: *i32 = null
+var g_enum_variant_discr: *i64 = null
+var g_enum_variant_neg: *i32 = null
+
 var g_enum_initialized: i32 = 0
 var g_enum_cap: i32 = 0
 var g_enum_variant_cap: i32 = 0
@@ -3802,6 +3824,11 @@ fn init_enum_tracker()
     g_enum_generic = malloc((g_enum_cap as i64) * 4) as *i32
     g_enum_variant_fields = malloc((g_enum_variant_cap as i64) * 8) as **StructField
     g_enum_variant_kinds = malloc((g_enum_variant_cap as i64) * 4) as *i32
+    g_enum_repr = malloc((g_enum_cap as i64) * 4) as *i32
+    g_enum_pub = malloc((g_enum_cap as i64) * 4) as *i32
+    g_enum_line = malloc((g_enum_cap as i64) * 4) as *i32
+    g_enum_variant_discr = malloc((g_enum_variant_cap as i64) * 8) as *i64
+    g_enum_variant_neg = malloc((g_enum_variant_cap as i64) * 4) as *i32
     g_enum_initialized = 1
     g_enum_count = 0
     g_enum_variant_total = 0
@@ -3814,6 +3841,9 @@ pub fn enum_tracker_reset()
     g_enum_variant_total = 0
 
 fn enum_def_start_impl(name: *u8, len: i32, generic: i32) -> i32
+    return enum_def_start_full(name, len, generic, 0, 0)
+
+fn enum_def_start_full(name: *u8, len: i32, generic: i32, repr: i32, line: i32) -> i32
     init_enum_tracker()
     if g_enum_count >= g_enum_cap
         let cap: i64 = (g_enum_cap as i64) * 2
@@ -3822,12 +3852,18 @@ fn enum_def_start_impl(name: *u8, len: i32, generic: i32) -> i32
         g_enum_variant_starts = realloc(g_enum_variant_starts as *u8, cap * 4) as *i32
         g_enum_variant_counts = realloc(g_enum_variant_counts as *u8, cap * 4) as *i32
         g_enum_generic = realloc(g_enum_generic as *u8, cap * 4) as *i32
+        g_enum_repr = realloc(g_enum_repr as *u8, cap * 4) as *i32
+        g_enum_pub = realloc(g_enum_pub as *u8, cap * 4) as *i32
+        g_enum_line = realloc(g_enum_line as *u8, cap * 4) as *i32
         g_enum_cap = cap as i32
     *(g_enum_names + g_enum_count) = name
     *(g_enum_name_lens + g_enum_count) = len
     *(g_enum_variant_starts + g_enum_count) = g_enum_variant_total
     *(g_enum_variant_counts + g_enum_count) = 0
     *(g_enum_generic + g_enum_count) = generic
+    *(g_enum_repr + g_enum_count) = repr
+    *(g_enum_pub + g_enum_count) = 0
+    *(g_enum_line + g_enum_count) = line
     g_enum_count = g_enum_count + 1
     return 0
 
@@ -3839,40 +3875,206 @@ pub fn enum_def_start(p: *Parser, name: *u8, len: i32) -> i32
 pub fn enum_def_start_generic(p: *Parser, name: *u8, len: i32) -> i32
     return enum_def_start_impl(name, len, 1)
 
+# `enum E: T` (LANGUAGE_SPEC §10.4): as enum_def_start, with representation
+# type T, which must be an integer type (a located error otherwise).
+pub fn enum_def_start_repr(p: *Parser, name: *u8, len: i32, repr: i32, line: i32, col: i32) -> i32
+    var r: i32 = repr
+    if is_int_const_type(repr) == 0 or repr == TYPE_BOOL
+        if p.skip_item == 0
+            enum_error_at(line, col)
+            eprints_cstr(c"representation type of enum '")
+            eprint_lexeme(name, len)
+            eprintln_cstr(c"' must be an integer type")
+            g_attr_errors = g_attr_errors + 1
+        r = TYPE_I64
+    return enum_def_start_full(name, len, 0, r, line)
+
 # Called from grammar rule enum_variant: appends a unit variant to the most
 # recent enum's variant list.
-pub fn enum_variant_record(p: *Parser, name: *u8, len: i32) -> i32
-    return enum_variant_record_impl(name, len, ENUM_VARIANT_UNIT, null)
+pub fn enum_variant_record(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> i32
+    return enum_variant_record_impl(p, name, len, ENUM_VARIANT_UNIT, null, 0, 0, 0, line, col)
 
 # `Name(T)` (AGAST #1797): the payload type is the type_spec just parsed;
 # field_new captures its struct / pointer / array detail from the parser
 # state exactly as for a struct field.
-pub fn enum_variant_record_tuple(p: *Parser, name: *u8, len: i32, ty: i32) -> i32
+pub fn enum_variant_record_tuple(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> i32
     let f: *StructField = field_new(p, name, len, ty, 0, 0)
     f.next = null
-    return enum_variant_record_impl(name, len, ENUM_VARIANT_TUPLE, f)
+    return enum_variant_record_impl(p, name, len, ENUM_VARIANT_TUPLE, f, 0, 0, 0, line, col)
 
 # `Name` + an indented field block (AGAST #1797): the fields are the payload.
-pub fn enum_variant_record_struct(p: *Parser, name: *u8, len: i32, fields: *StructField) -> i32
-    return enum_variant_record_impl(name, len, ENUM_VARIANT_STRUCT, fields)
+pub fn enum_variant_record_struct(p: *Parser, name: *u8, len: i32, fields: *StructField, line: i32, col: i32) -> i32
+    return enum_variant_record_impl(p, name, len, ENUM_VARIANT_STRUCT, fields, 0, 0, 0, line, col)
 
-fn enum_variant_record_impl(name: *u8, len: i32, kind: i32, fields: *StructField) -> i32
+# `Name = N` / `Name = -N` (LANGUAGE_SPEC §10.4): a unit variant with an
+# explicit discriminant.
+pub fn enum_variant_record_discr(p: *Parser, name: *u8, len: i32, num: *u8, num_len: i32, neg: i32, line: i32, col: i32) -> i32
+    var bits: i64 = parse_int(num, num_len)
+    var is_neg: i32 = 0
+    if neg == 1 and bits != 0
+        bits = 0 - bits
+        is_neg = 1
+    return enum_variant_record_impl(p, name, len, ENUM_VARIANT_UNIT, null, 1, bits, is_neg, line, col)
+
+# `error: <file>:<line>:<col>: ` -- a parse-time enum diagnostic's prefix.
+fn enum_error_at(line: i32, col: i32)
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": ")
+
+# A discriminant's value: negative bits when `neg`, else the bits as a u64.
+fn eprint_discr(bits: i64, neg: i32)
+    if neg == 1 or bits >= 0
+        eprint_i64(bits)
+        return
+    # >= 2^63: print the u64 (bits / 10 as an unsigned shift-divide).
+    let hi: i64 = ((bits >> 1) & 0x7FFFFFFFFFFFFFFF) / 5
+    let lo: i64 = bits - hi * 10
+    eprint_i64(hi)
+    eprint_i64(lo)
+
+# Does (bits, neg) fit representation type `ty`?
+fn discr_fits(ty: i32, bits: i64, neg: i32) -> i32
+    if ty == TYPE_U64
+        return 1 - neg
+    if neg == 0 and bits < 0
+        return 0   # >= 2^63: only a u64 holds it
+    var lo: i64 = 0
+    var hi: i64 = 0
+    if ty == TYPE_U8
+        hi = 255
+    else if ty == TYPE_U16
+        hi = 65535
+    else if ty == TYPE_U32
+        hi = 4294967295
+    else if ty == TYPE_I8
+        lo = -128
+        hi = 127
+    else if ty == TYPE_I16
+        lo = -32768
+        hi = 32767
+    else if ty == TYPE_I32
+        lo = -2147483648
+        hi = 2147483647
+    else
+        return 1   # i64: every value of a 64-bit literal
+    if bits < lo or bits > hi
+        return 0
+    return 1
+
+# The checks of LANGUAGE_SPEC §10.4 on the variant just recorded (index `v`
+# of the current enum `ei`), each a located error at the variant's name.
+# ritz0 enforces the same rules with the same text (parser.py,
+# _check_discriminants).
+fn enum_variant_check(p: *Parser, ei: i32, v: i32, kind: i32, explicit: i32, line: i32, col: i32)
+    if p.skip_item != 0
+        return
+    let repr: i32 = *(g_enum_repr + ei)
+    let ename: *u8 = *(g_enum_names + ei)
+    let elen: i32 = *(g_enum_name_lens + ei)
+    let vname: *u8 = *(g_enum_variant_names + v)
+    let vlen: i32 = *(g_enum_variant_name_lens + v)
+    if repr != 0 and kind != ENUM_VARIANT_UNIT
+        enum_error_at(line, col)
+        eprints_cstr(c"variant '")
+        eprint_lexeme(vname, vlen)
+        eprints_cstr(c"' of enum '")
+        eprint_lexeme(ename, elen)
+        eprintln_cstr(c"' carries data, so the enum cannot have a representation type")
+        g_attr_errors = g_attr_errors + 1
+        return
+    if repr == 0
+        if explicit == 1
+            enum_error_at(line, col)
+            eprints_cstr(c"discriminant of variant '")
+            eprint_lexeme(vname, vlen)
+            eprints_cstr(c"' needs a representation type: write 'enum ")
+            eprint_lexeme(ename, elen)
+            eprintln_cstr(c": <integer type>'")
+            g_attr_errors = g_attr_errors + 1
+        return
+    let bits: i64 = *(g_enum_variant_discr + v)
+    let neg: i32 = *(g_enum_variant_neg + v)
+    if discr_fits(repr, bits, neg) == 0
+        enum_error_at(line, col)
+        eprints_cstr(c"discriminant ")
+        eprint_discr(bits, neg)
+        eprints_cstr(c" of variant '")
+        eprint_lexeme(vname, vlen)
+        eprints_cstr(c"' does not fit enum '")
+        eprint_lexeme(ename, elen)
+        eprints_cstr(c"''s representation type ")
+        eprintln_cstr(primitive_name_from_type(repr))
+        g_attr_errors = g_attr_errors + 1
+        return
+    var w: i32 = *(g_enum_variant_starts + ei)
+    while w < v
+        if *(g_enum_variant_discr + w) == bits
+            enum_error_at(line, col)
+            eprints_cstr(c"variants '")
+            eprint_lexeme(*(g_enum_variant_names + w), *(g_enum_variant_name_lens + w))
+            eprints_cstr(c"' and '")
+            eprint_lexeme(vname, vlen)
+            eprints_cstr(c"' of enum '")
+            eprint_lexeme(ename, elen)
+            eprints_cstr(c"' have the same discriminant ")
+            eprint_discr(bits, neg)
+            eprintln_cstr(c"")
+            g_attr_errors = g_attr_errors + 1
+            return
+        w = w + 1
+
+fn enum_variant_record_impl(p: *Parser, name: *u8, len: i32, kind: i32, fields: *StructField, explicit: i32, discr: i64, discr_neg: i32, line: i32, col: i32) -> i32
     init_enum_tracker()
     if g_enum_count == 0
         return 0
+    # The same token again: `enum_variants : enum_variant enum_variants`
+    # fails after the last variant and backtracks into `enum_variant`, which
+    # runs this action a second time for it.  That used to record a phantom
+    # copy of every enum's last variant (AGAST #1880 found it: the copy
+    # shares its discriminant).
+    if *(g_enum_variant_counts + g_enum_count - 1) > 0
+        if *(g_enum_variant_names + g_enum_variant_total - 1) == name
+            return 0
     if g_enum_variant_total >= g_enum_variant_cap
         let vcap: i64 = (g_enum_variant_cap as i64) * 2
         g_enum_variant_names = realloc(g_enum_variant_names as *u8, vcap * 8) as **u8
         g_enum_variant_name_lens = realloc(g_enum_variant_name_lens as *u8, vcap * 4) as *i32
         g_enum_variant_fields = realloc(g_enum_variant_fields as *u8, vcap * 8) as **StructField
         g_enum_variant_kinds = realloc(g_enum_variant_kinds as *u8, vcap * 4) as *i32
+        g_enum_variant_discr = realloc(g_enum_variant_discr as *u8, vcap * 8) as *i64
+        g_enum_variant_neg = realloc(g_enum_variant_neg as *u8, vcap * 4) as *i32
         g_enum_variant_cap = vcap as i32
     *(g_enum_variant_names + g_enum_variant_total) = name
     *(g_enum_variant_name_lens + g_enum_variant_total) = len
     *(g_enum_variant_fields + g_enum_variant_total) = fields
     *(g_enum_variant_kinds + g_enum_variant_total) = kind
+    # The discriminant: explicit, else the previous variant's + 1, else 0.
+    let ei: i32 = g_enum_count - 1
+    var bits: i64 = discr
+    var neg: i32 = discr_neg
+    if explicit == 0
+        bits = 0
+        neg = 0
+        if *(g_enum_variant_counts + ei) > 0
+            let prev: i32 = g_enum_variant_total - 1
+            bits = *(g_enum_variant_discr + prev) + 1
+            neg = *(g_enum_variant_neg + prev)
+            if neg == 1 and bits == 0
+                neg = 0
+    *(g_enum_variant_discr + g_enum_variant_total) = bits
+    *(g_enum_variant_neg + g_enum_variant_total) = neg
+    let v: i32 = g_enum_variant_total
     g_enum_variant_total = g_enum_variant_total + 1
-    *(g_enum_variant_counts + g_enum_count - 1) = *(g_enum_variant_counts + g_enum_count - 1) + 1
+    *(g_enum_variant_counts + ei) = *(g_enum_variant_counts + ei) + 1
+    enum_variant_check(p, ei, v, kind, explicit, line, col)
     return 0
 
 # Lookup: returns the variant's tag index (0-based) within an enum, or -1
@@ -3961,6 +4163,154 @@ pub fn enum_variant_kind(ei: i32, vi: i32) -> i32
 
 pub fn enum_variant_fields(ei: i32, vi: i32) -> *StructField
     return *(g_enum_variant_fields + *(g_enum_variant_starts + ei) + vi)
+
+# LANGUAGE_SPEC §10.4: enum `ei`'s representation type (0: none) and the
+# discriminant bits of its variant `vi`.
+pub fn enum_repr(ei: i32) -> i32
+    return *(g_enum_repr + ei)
+
+pub fn enum_variant_discr(ei: i32, vi: i32) -> i64
+    return *(g_enum_variant_discr + *(g_enum_variant_starts + ei) + vi)
+
+# 1 when every variant's discriminant is its index (no `= N` moved one).
+pub fn enum_discr_is_index(ei: i32) -> i32
+    for vi in 0..*(g_enum_variant_counts + ei)
+        if enum_variant_discr(ei, vi) != vi as i64
+            return 0
+    return 1
+
+# `E__from`, the fn `E.from(v)` calls (LANGUAGE_SPEC §10.4): the receiver's
+# name + "__from", malloc'd.  *out_len gets its length.
+pub fn enum_from_fn_name(name: *u8, len: i32, out_len: *i32) -> *u8
+    let buf: *u8 = malloc((len + 7) as i64)
+    for i in 0..len
+        *(buf + i) = *(name + i)
+    let suffix: *u8 = c"__from"
+    for j in 0..6
+        *(buf + len + j) = *(suffix + j)
+    *(buf + len + 6) = 0
+    *out_len = len + 6
+    return buf
+
+# Is `e` the method call `E.from(...)` on the bare name of an enum?
+pub fn is_enum_from_call(e: *Expr) -> i32
+    if e.kind != EXPR_METHOD or e.left == null or e.left.kind != EXPR_IDENT
+        return 0
+    if e.ident_len != 4 or memcmp(e.ident_ptr, c"from", 4) != 0
+        return 0
+    if enum_find(e.left.ident_ptr, e.left.ident_len) < 0
+        return 0
+    return 1
+
+# --- E.from source (LANGUAGE_SPEC §10.4) -----------------------------------
+# ritz0 generates the same text (parser.py, enum_from_source): for each enum
+# with a representation type,
+#
+#     [pub ]fn E__from(v: T) -> Option<E>
+#         if v == <discriminant>
+#             return Some(E.V)
+#         ...
+#         return None
+#
+# preceded by enough newlines that it starts on the enum's line.  The driver
+# parses it into the enum's module (main.ritz, add_enum_from_fns).
+
+var g_gen_buf: *u8 = null
+var g_gen_len: i64 = 0
+var g_gen_cap: i64 = 0
+
+fn gen_push(b: *u8, n: i64)
+    if g_gen_len + n + 1 > g_gen_cap
+        var cap: i64 = g_gen_cap * 2 + n + 256
+        g_gen_buf = realloc(g_gen_buf, cap)
+        g_gen_cap = cap
+    for i in 0..n
+        *(g_gen_buf + g_gen_len + i) = *(b + i)
+    g_gen_len = g_gen_len + n
+    *(g_gen_buf + g_gen_len) = 0
+
+fn gen_cstr(c: *u8)
+    var n: i64 = 0
+    while *(c + n) != 0
+        n = n + 1
+    gen_push(c, n)
+
+# The discriminant as a literal: decimal, or hex for a u64 >= 2^63.
+fn gen_discr(bits: i64, neg: i32)
+    let digits: *u8 = malloc(24)
+    var n: i32 = 0
+    if neg == 0 and bits < 0
+        gen_cstr(c"0x")
+        while n < 16
+            let nib: i64 = (bits >> ((15 - n) * 4) as i64) & 15
+            if nib < 10
+                *(digits + n) = (48 + nib) as u8
+            else
+                *(digits + n) = (87 + nib) as u8
+            n = n + 1
+        gen_push(digits, 16)
+        free(digits)
+        return
+    var m: i64 = bits
+    if neg == 1
+        gen_cstr(c"-")
+        m = 0 - bits
+        if m < 0
+            gen_cstr(c"9223372036854775808")
+            free(digits)
+            return
+    while m > 0 or n == 0
+        *(digits + n) = (48 + m % 10) as u8
+        m = m / 10
+        n = n + 1
+    var i: i32 = n - 1
+    while i >= 0
+        gen_push(digits + i, 1)
+        i = i - 1
+    free(digits)
+
+# Source of `from` for every enum with a representation type recorded at
+# tracker index >= first_ei (the module just parsed), or null if there is
+# none.  *out_len gets its length.  The buffer is the caller's to keep.
+pub fn enum_from_source(first_ei: i32, out_len: *i64) -> *u8
+    g_gen_buf = null
+    g_gen_len = 0
+    g_gen_cap = 0
+    var line: i32 = 1
+    var ei: i32 = first_ei
+    while ei < g_enum_count
+        let repr: i32 = *(g_enum_repr + ei)
+        if repr != 0 and *(g_enum_generic + ei) == 0
+            let ename: *u8 = *(g_enum_names + ei)
+            let elen: i64 = *(g_enum_name_lens + ei) as i64
+            while line < *(g_enum_line + ei)
+                gen_cstr(c"\n")
+                line = line + 1
+            if *(g_enum_pub + ei) == 1
+                gen_cstr(c"pub ")
+            gen_cstr(c"fn ")
+            gen_push(ename, elen)
+            gen_cstr(c"__from(v: ")
+            gen_cstr(primitive_name_from_type(repr))
+            gen_cstr(c") -> Option<")
+            gen_push(ename, elen)
+            gen_cstr(c">\n")
+            line = line + 1
+            let start: i32 = *(g_enum_variant_starts + ei)
+            for vi in 0..*(g_enum_variant_counts + ei)
+                gen_cstr(c"    if v == ")
+                gen_discr(*(g_enum_variant_discr + start + vi), *(g_enum_variant_neg + start + vi))
+                gen_cstr(c"\n        return Some(")
+                gen_push(ename, elen)
+                gen_cstr(c".")
+                gen_push(*(g_enum_variant_names + start + vi), *(g_enum_variant_name_lens + start + vi) as i64)
+                gen_cstr(c")\n")
+                line = line + 2
+            gen_cstr(c"    return None\n")
+            line = line + 1
+        ei = ei + 1
+    *out_len = g_gen_len
+    return g_gen_buf
 
 # 1 when enum `ea`'s name sorts before enum `eb`'s (bytewise; a proper prefix
 # sorts first), else 0.
