@@ -941,7 +941,8 @@ pub fn fn_link(first: *FnDef, rest: *FnDef) -> *FnDef
     return first
 
 pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
-    let f: *FnDef = parser_alloc(p, 96) as *FnDef  # Increased for type_params field
+    let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1008,7 +1009,8 @@ pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, bod
 
 # Extern function declaration (no body) - forward declaration
 pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, line: i32, col: i32) -> *FnDef
-    let f: *FnDef = parser_alloc(p, 96) as *FnDef  # Increased for type_params field
+    let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1146,6 +1148,11 @@ pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
     f.inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     f.name_len = len
     f.field_type = ty
+    # AGAST #2120: `f: EfiFn` keeps the signature, so `(t.f)(..)` calls typed.
+    # The action runs after the field's NEWLINE, one token past the type.
+    f.fn_sig = null
+    if ty == TYPE_PTR and p.last_fn_sig != null and p.last_fn_sig_pos == p.pos - 1
+        f.fn_sig = p.last_fn_sig
     # Copy struct type name if this is a struct-typed field OR a pointer-to-struct field
     # For *StructName, last_type_name is preserved from inner type parsing.
     # For *u8/*i32/etc. we must NOT inherit a stale last_type_name from a
@@ -1243,7 +1250,8 @@ pub fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
 
 # Generic function definition (with type parameters)
 pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
-    let f: *FnDef = parser_alloc(p, 96) as *FnDef
+    let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1588,8 +1596,21 @@ pub fn type_named(p: *Parser, name: *u8, len: i32) -> i32
 # resolve the pointee struct → var-decl narrowing missed → `cqe.field`
 # member access fell through to "; ERROR: unhandled EXPR_MEMBER" with a
 # stale `%.0` reference.
+# AGAST #2120: the signature of the fn type the last `-> T` named (null for
+# any other T), latched by capture_fn_return_type for the FnDef the
+# enclosing fn_def action builds after the body.  Every `-> T` rewrites it,
+# and fn_ret_fn_sig hands it out only for a TYPE_PTR return, so a fn with no
+# `->` (TYPE_VOID) never sees a stale one.
+var g_ret_fn_sig: *FnDef = null
+
+fn fn_ret_fn_sig(ret: i32) -> *FnDef
+    if ret == TYPE_PTR
+        return g_ret_fn_sig
+    return null
+
 pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     nd_array_reject(p, ret, parse_pos_line(p), parse_pos_col(p), c"a return type")  # AGAST #1509
+    g_ret_fn_sig = fresh_fn_sig(p)   # the type_spec just ended here
     if ret == TYPE_STRUCT
         p.fn_return_type_name = p.last_type_name
         p.fn_return_type_name_len = p.last_type_name_len
@@ -1681,6 +1702,7 @@ pub fn type_fn(p: *Parser, params: *Param, ret: i32) -> i32
     f.next = null
     f.type_params = null
     f.is_local = 0
+    f.ret_fn_sig = null
     p.last_fn_sig = f
     p.last_fn_sig_pos = p.pos
     return TYPE_PTR
@@ -2993,6 +3015,7 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
     e.span = left.span
     e.left = left
     e.op = target_type
+    e.fn_sig = null
     e.int_val = TYPE_VOID
     e.ident_ptr = null
     e.ident_len = 0
@@ -3133,9 +3156,15 @@ pub fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
 # =============================================================================
 
 pub fn cast_tail_new(p: *Parser, ty: i32, next: *CastTail) -> *CastTail
-    let ct: *CastTail = parser_alloc(p, 32) as *CastTail
+    let ct: *CastTail = parser_alloc(p, sizeof(CastTail)) as *CastTail
     ct.cast_type = ty
     ct.next = next
+    # AGAST #2120: `as EfiFn` keeps the signature (with the alias's
+    # [[callconv]]).  Same outermost-only rule as the pointee below: only
+    # then is the fn type the last thing parsed.
+    ct.fn_sig = null
+    if next == null and ty == TYPE_PTR
+        ct.fn_sig = fresh_fn_sig(p)
     ct.pointee_type = TYPE_VOID
     ct.pointee_name = null
     ct.pointee_name_len = 0
@@ -3164,6 +3193,7 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
         result.int_val = ct.pointee_type as i64
         result.ident_ptr = ct.pointee_name
         result.ident_len = ct.pointee_name_len
+        result.fn_sig = ct.fn_sig
         ct = ct.next
     return result
 
@@ -3337,21 +3367,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                 # `f(1)(2)`) is an indirect call: EXPR_CALL with no name,
                 # the callee expression in `left`.  This arm used to drop
                 # the call, so `fs[1](3)` evaluated to the fn pointer.
-                let call_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
-                call_expr.kind = EXPR_CALL
-                call_expr.span = result.span
-                call_expr.func_name = null
-                call_expr.func_name_len = 0
-                call_expr.call_type_suffix = null
-                call_expr.call_type_suffix_len = 0
-                call_expr.args = op.args
-                call_expr.left = result
-                call_expr.right = null
-                call_expr.operand = null
-                call_expr.ident_ptr = null
-                call_expr.ident_len = 0
-                call_expr.next = null
-                result = call_expr
+                result = expr_nameless_call(p, result, op.args)
         else if op.kind == POSTFIX_INDEX
             # Create new index expression
             let index_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
@@ -3375,6 +3391,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
             # Create new cast expression
             let cast_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
             cast_expr.kind = EXPR_CAST
+            cast_expr.fn_sig = null
             cast_expr.span = result.span
             cast_expr.left = result
             cast_expr.op = op.cast_type
@@ -3391,6 +3408,34 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
             result = try_expr
         op = op.next
     return result
+
+# A call through a callee expression (AGAST #1747): EXPR_CALL with no name
+# and the callee in `left`; emit_call evaluates it to the fn's address.
+fn expr_nameless_call(p: *Parser, callee: *Expr, args: *Expr) -> *Expr
+    let call_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    call_expr.kind = EXPR_CALL
+    call_expr.span = callee.span
+    call_expr.func_name = null
+    call_expr.func_name_len = 0
+    call_expr.call_type_suffix = null
+    call_expr.call_type_suffix_len = 0
+    call_expr.args = args
+    call_expr.left = callee
+    call_expr.right = null
+    call_expr.operand = null
+    call_expr.ident_ptr = null
+    call_expr.ident_len = 0
+    call_expr.next = null
+    return call_expr
+
+# apply_postfix_p for a parenthesised primary `(e)`.  AGAST #2120: `(t.f)(..)`
+# calls the fn pointer stored in field f, as in ritz0; only the unparenthesised
+# `t.f(..)` is a method call.  Without the parens to tell them apart, the
+# call became `Tbl_f(t, ..)`, an undefined symbol.
+pub fn apply_postfix_paren_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
+    if ops != null and ops.kind == POSTFIX_CALL and base.kind == EXPR_MEMBER and ops.call_type_suffix_len == 0
+        return apply_postfix_p(p, expr_nameless_call(p, base, ops.args), ops.next)
+    return apply_postfix_p(p, base, ops)
 
 # =============================================================================
 # Struct literal helpers

@@ -323,6 +323,89 @@ def test_win64_runs(compiler, tmp_path):
     assert _run(compiler, tmp_path, WIN64, WIN64_DEFS) == 0
 
 
+# AGAST #2120: every callee expression whose type is the alias carries its
+# convention, not only a typed local. `(p as EfiFn)(..)` is the form harland's
+# boot wants; the others are the remaining ways a value of the alias reaches
+# a call.
+WIN64_CALLEE_PRELUDE = """\
+[[callconv = "win64"]]
+type WinFn5 = fn(i64, i64, i64, i64, i64) -> i64
+
+struct Tbl
+    f: WinFn5
+
+extern var w_table: u64
+
+fn get_fn() -> WinFn5
+    w_table as WinFn5
+"""
+
+WIN64_CALLEES = {
+    "cast": """\
+fn go(p: u64) -> i64
+    (p as WinFn5)(1, 2, 3, 4, 5)
+""",
+    "field_via_ptr": """\
+fn go(p: u64) -> i64
+    var t: Tbl
+    t.f = p as WinFn5
+    let tp: *Tbl = @t
+    (tp.f)(1, 2, 3, 4, 5)
+""",
+    "field": """\
+fn go(p: u64) -> i64
+    var t: Tbl
+    t.f = p as WinFn5
+    (t.f)(1, 2, 3, 4, 5)
+""",
+    "array_element": """\
+fn go(p: u64) -> i64
+    var a: [2]WinFn5
+    a[1] = p as WinFn5
+    a[1](1, 2, 3, 4, 5)
+""",
+    "returned": """\
+fn go(p: u64) -> i64
+    get_fn()(1, 2, 3, 4, 5)
+""",
+    "paren_local": """\
+fn go(p: u64) -> i64
+    let f: WinFn5 = p as WinFn5
+    (f)(1, 2, 3, 4, 5)
+""",
+}
+
+# WIN64_DEFS without drive_cb, whose r_cb these programs do not define.
+WIN64_CALLEE_DEFS = WIN64_DEFS[:WIN64_DEFS.index("declare win64cc i64 @r_cb")]
+
+WIN64_CALLEE_MAIN = """
+fn main() -> i32
+    if go(w_table) != 12345
+        return 1
+    0
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(WIN64_CALLEES))
+def test_win64_callee_forms_ir(compiler, form, tmp_path):
+    src = WIN64_CALLEE_PRELUDE + WIN64_CALLEES[form] + WIN64_CALLEE_MAIN
+    ir = _ir(compiler, tmp_path, src).read_text()
+    # The one call through a pointer is the WinFn5 call: it must be win64cc.
+    indirect = re.findall(r"call (?:\w+ )*?[^\s@%]+ %[^\s(]+\(", ir)
+    assert indirect, f"{compiler}/{form}: no indirect call:\n{ir}"
+    assert all("win64cc" in c for c in indirect), \
+        f"{compiler}/{form}: indirect call without win64cc: {indirect}"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(WIN64_CALLEES))
+def test_win64_callee_forms_run(compiler, form, tmp_path):
+    # SysV registers into the MS x64 w_mix give a value other than 12345.
+    src = WIN64_CALLEE_PRELUDE + WIN64_CALLEES[form] + WIN64_CALLEE_MAIN
+    assert _run(compiler, tmp_path, src, WIN64_CALLEE_DEFS) == 0
+
+
 # --- [[packed]] IR (the #1847 feature, pinned here for the ticket) ----------
 
 PACKED = """\

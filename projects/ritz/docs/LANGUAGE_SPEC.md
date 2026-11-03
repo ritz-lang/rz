@@ -2258,9 +2258,11 @@ direct call uses, so foreign code can call it. Every instance of a generic
 foreign function, used by every call.
 
 On a `type` alias of a fn type it is part of the type: a call through a
-value of the alias uses it. A function pointer read from a firmware table
-has no declaration of its own, so the alias is where its convention is
-written:
+value of the alias uses it, whatever the callee expression is: a typed
+local, a cast `(entry as EfiAllocatePages)(..)`, a struct field
+`(table.alloc)(..)`, an array element or a fn's result. A function pointer
+read from a firmware table has no declaration of its own, so the alias is
+where its convention is written:
 
 ```ritz
 [[callconv = "win64"]]
@@ -2277,6 +2279,9 @@ fn allocate(entry: u64, pages: u64, addr: *u64) -> u64
     efi_stall(10)
     let alloc: EfiAllocatePages = entry as EfiAllocatePages
     alloc(0, 2, pages, addr)
+
+fn allocate_direct(entry: u64, pages: u64, addr: *u64) -> u64
+    (entry as EfiAllocatePages)(0, 2, pages, addr)
 ```
 
 A fn type written out, or an alias without the attribute, has the C

@@ -9440,7 +9440,12 @@ class LLVMEmitter:
             # Non-identifier function expression (e.g., field access returning fn ptr)
             fn_ptr = self._emit_expr(call.func)
             args = [self._emit_expr(arg) for arg in call.args]
+            # AGAST #2120: the callee's type is often the alias itself
+            # (`(p as EfiFn)(..)`, a field, an element, a returned fn), and
+            # the alias is what carries the [[callconv]]: resolve it.
             ritz_type = self._infer_ritz_type(call.func, fn_ptr)
+            if ritz_type is not None:
+                ritz_type = resolve_alias_in(ritz_type, self.type_aliases)
             if isinstance(ritz_type, rast.FnType):
                 args = [self._convert_type(a, self._ritz_type_to_llvm(p))
                         for a, p in zip(args, ritz_type.params)]
