@@ -160,6 +160,49 @@ def _is_float_lit_operand(expr) -> bool:
     return isinstance(expr, rast.FloatLit)
 
 
+# --- volatile and atomic memory builtins (LANGUAGE_SPEC §18.4-§18.5) --------
+#
+# AGAST #1879. llvmlite has atomic load/store/rmw/cmpxchg/fence but no
+# volatile flag, so volatile accesses are these two subclasses: the same
+# instructions, printed with `volatile`.
+
+class _VolatileLoad(ir.LoadInstr):
+    def descr(self, buf):
+        [val] = self.operands
+        a = getattr(self, 'align', None)
+        align = f', align {a}' if a is not None else ''
+        buf.append(f"load volatile {self.type}, {val.type} {val.get_reference()}"
+                   f"{align}{self._stringify_metadata(leading_comma=True)}\n")
+
+
+class _VolatileStore(ir.StoreInstr):
+    def descr(self, buf):
+        val, ptr = self.operands
+        a = getattr(self, 'align', None)
+        align = f', align {a}' if a is not None else ''
+        buf.append(f"store volatile {val.type} {val.get_reference()}, {ptr.type} "
+                   f"{ptr.get_reference()}{align}"
+                   f"{self._stringify_metadata(leading_comma=True)}\n")
+
+
+# name -> (argument count, atomicrmw op or None). Every one takes a pointer
+# to an integer type first; all atomics are sequentially consistent.
+MEM_BUILTINS = {
+    'volatile_load': (1, None),
+    'volatile_store': (2, None),
+    'atomic_load': (1, None),
+    'atomic_store': (2, None),
+    'atomic_xchg': (2, 'xchg'),
+    'atomic_cmpxchg': (3, None),
+    'atomic_fetch_add': (2, 'add'),
+    'atomic_fetch_sub': (2, 'sub'),
+    'atomic_fetch_and': (2, 'and'),
+    'atomic_fetch_or': (2, 'or'),
+    'atomic_fetch_xor': (2, 'xor'),
+    'fence': (0, None),
+}
+
+
 class _SretAwareBuilder(ir.IRBuilder):
     """IRBuilder that lowers calls to and returns from sret functions."""
 
@@ -817,6 +860,13 @@ class LLVMEmitter:
             # enum payload at 1 byte instead of 16 and corrupt the ABI.
             if ty.name == 'StrView':
                 return self._ensure_strview_type()
+            # A non-union alias is its target: `type Handler = fn(..)` lowers
+            # to the fn pointer, not to the i8 placeholder (AGAST #1879 -- a
+            # `let f: Handler` slot was one byte wide).
+            if ty.name in self.type_aliases and not ty.args:
+                target = resolve_alias_in(ty, self.type_aliases)
+                if target is not ty:
+                    return self._ritz_type_to_llvm(target)
             # Treat unknown types as opaque struct types (i8 placeholder)
             # This allows forward references and unknown struct types
             return self.i8
@@ -1218,6 +1268,14 @@ class LLVMEmitter:
             # Look up function return type from self.functions
             if isinstance(expr.func, rast.Ident):
                 fn_name = expr.func.name
+                # AGAST #1879: a value-returning memory builtin returns the
+                # pointee type of its pointer argument.
+                if (fn_name in MEM_BUILTINS and fn_name not in
+                        ('volatile_store', 'atomic_store', 'fence') and expr.args):
+                    ptr_ty = self._infer_ritz_type(expr.args[0])
+                    if isinstance(ptr_ty, (rast.PtrType, rast.RefType)):
+                        return ptr_ty.inner
+                    return None
                 if fn_name in self.functions:
                     _, fn_def = self.functions[fn_name]
                     return fn_def.ret_type
@@ -1475,8 +1533,9 @@ class LLVMEmitter:
         # Create the global variable
         gvar = ir.GlobalVariable(self.module, ty, name=var_def.name)
 
-        # Check if this variable is from the current source file or imported
-        is_from_current_file = self._should_emit_body(var_def)
+        # Check if this variable is from the current source file or imported.
+        # `extern var` (AGAST #1879) is defined in another object even here.
+        is_from_current_file = self._should_emit_body(var_def) and not var_def.is_extern
 
         if is_from_current_file:
             # This is a definition - set linkage based on visibility
@@ -3636,9 +3695,13 @@ class LLVMEmitter:
         return self._sret_fns.get(fn.name)
 
     def _new_function(self, name: str, ret_type: ir.Type,
-                      param_types: List[ir.Type]) -> ir.Function:
+                      param_types: List[ir.Type],
+                      callconv: Optional[str] = None) -> ir.Function:
         """Create a user function from its *logical* signature, adding the
-        sret parameter when the return type calls for one."""
+        sret parameter when the return type calls for one.
+
+        `callconv` is a `[[callconv]]` value (AGAST #1879); llvmlite gives
+        every direct call of the function the same convention."""
         # AGAST #1739: large by-value struct params become `%T* byval(%T)`.
         byval = {i: t for i, t in enumerate(param_types)
                  if self._sret_struct_type(t) is not None}
@@ -3660,6 +3723,9 @@ class LLVMEmitter:
             fn.args[i + lead].attributes.align = BYVAL_ALIGN
         if byval:
             self._byval_fns[name] = byval
+        cc = _llvm_callconv(callconv)
+        if cc:
+            fn.calling_convention = cc
         return fn
 
     def _fn_type_byval(self, fn_type: rast.FnType) -> Dict[int, ir.Type]:
@@ -3898,7 +3964,7 @@ class LLVMEmitter:
         # This allows linking with external assembly/object files.
         # extern_fns keeps the logical fn_type; the declaration is sret for a
         # large struct return (AGAST #1736), matching its definition.
-        fn = self._new_function(extern.name, ret_type, param_types)
+        fn = self._new_function(extern.name, ret_type, param_types, extern.callconv)
         fn.linkage = 'external'
 
         # Store for later reference - use tuple format (fn, fn_def) like regular functions
@@ -3983,7 +4049,8 @@ class LLVMEmitter:
         ret_type = self._ritz_type_to_llvm(fn_def.ret_type) if fn_def.ret_type else self.i32
 
         # AGAST #1736: large struct returns become an sret parameter.
-        fn = self._new_function(fn_def.name, ret_type, param_types)
+        fn = self._new_function(fn_def.name, ret_type, param_types,
+                                fn_def.get_attr_value('callconv'))
 
         # Set linkage: non-pub functions get internal linkage (not visible to linker)
         # This prevents symbol collisions when linking multiple modules
@@ -9011,7 +9078,9 @@ class LLVMEmitter:
             # Check if this is a function pointer (local, parameter, or let binding)
             # The Ritz type is stored in ritz_types, which tells us if it's a FnType
             if fname in self.ritz_types:
-                ritz_type = self.ritz_types[fname]
+                # A local typed with a fn-type alias (`let f: Handler`) is a
+                # fn pointer too; the alias may carry a [[callconv]] (#1879).
+                ritz_type = resolve_alias_in(self.ritz_types[fname], self.type_aliases)
                 if isinstance(ritz_type, rast.FnType):
                     # This is a function pointer - indirect call
                     # Get the function pointer value
@@ -9031,7 +9100,9 @@ class LLVMEmitter:
                         converted_args.append(self._convert_type(arg_val, expected_llvm))
                     # AGAST #1739 / #1745: large struct args go byval and a
                     # large struct result via sret, as for a direct call.
+                    # AGAST #1879: a `[[callconv]]` fn-type alias's convention.
                     return self.builder.call(fn_ptr, converted_args,
+                                             cconv=_llvm_callconv(ritz_type.callconv),
                                              byval=self._fn_type_byval(ritz_type),
                                              sret=self._fn_type_sret(ritz_type))
         else:
@@ -9043,6 +9114,7 @@ class LLVMEmitter:
                 args = [self._convert_type(a, self._ritz_type_to_llvm(p))
                         for a, p in zip(args, ritz_type.params)]
                 return self.builder.call(fn_ptr, args,
+                                         cconv=_llvm_callconv(ritz_type.callconv),
                                          byval=self._fn_type_byval(ritz_type),
                                          sret=self._fn_type_sret(ritz_type))
             return self.builder.call(fn_ptr, args)
@@ -9115,6 +9187,11 @@ class LLVMEmitter:
                 return ir.Constant(self.i64, size)
 
             raise ValueError(f"sizeof() argument must be a type name, got: {type(arg)}")
+
+        # Volatile / atomic memory builtins (AGAST #1879). Reserved names, like
+        # sizeof: checked before user functions.
+        if fname in MEM_BUILTINS:
+            return self._emit_mem_builtin(fname, call)
 
         # Handle print / eprint builtins - print(string_literal) -> write(1, ptr, len).
         # eprint is the same lowering to fd 2 (AGAST #1641).
@@ -9329,7 +9406,8 @@ class LLVMEmitter:
 
             # Declare the extern function in LLVM if not already done
             if fname not in self.module.globals:
-                fn = self._new_function(fname, fn_type.return_type, list(fn_type.args))
+                fn = self._new_function(fname, fn_type.return_type, list(fn_type.args),
+                                        extern_def.callconv)
             else:
                 fn = self.module.globals[fname]
 
@@ -10956,6 +11034,53 @@ class LLVMEmitter:
         else:
             # Structs, arrays, etc. - use zeroinitializer
             return ir.Constant(llvm_type, None)
+
+    def _mem_builtin_ptr(self, fname: str, call: rast.Call) -> ir.Value:
+        """The pointer operand of a memory builtin, checked to point at an
+        integer type (LANGUAGE_SPEC §18.4: no bool, float, pointer or struct
+        pointees)."""
+        ptr = self._emit_expr(call.args[0])
+        ty = ptr.type
+        if (not isinstance(ty, ir.PointerType) or ty.is_opaque
+                or not isinstance(ty.pointee, ir.IntType)
+                or ty.pointee.width not in (8, 16, 32, 64)):
+            shown = ty.pointee if isinstance(ty, ir.PointerType) and not ty.is_opaque else ty
+            raise EmitError(f"{fname} needs a pointer to an integer type "
+                            f"(i8..u64), got a {shown}", call.span)
+        return ptr
+
+    def _emit_mem_builtin(self, fname: str, call: rast.Call) -> ir.Value:
+        """volatile_* / atomic_* / fence (LANGUAGE_SPEC §18.4-§18.5, AGAST #1879)."""
+        arity, rmw_op = MEM_BUILTINS[fname]
+        if len(call.args) != arity:
+            plural = '' if arity == 1 else 's'
+            raise EmitError(f"{fname} takes {arity} argument{plural}, "
+                            f"got {len(call.args)}", call.span)
+        if fname == 'fence':
+            return self.builder.fence('seq_cst')
+        ptr = self._mem_builtin_ptr(fname, call)
+        ity = ptr.type.pointee
+        nbytes = ity.width // 8
+        vals = [self._convert_type(self._emit_expr(a), ity) for a in call.args[1:]]
+        bb = self.builder.block
+        if fname == 'volatile_load':
+            instr = _VolatileLoad(bb, ptr, typ=ity)
+            self.builder._insert(instr)
+            return instr
+        if fname == 'volatile_store':
+            instr = _VolatileStore(bb, vals[0], ptr)
+            self.builder._insert(instr)
+            return ir.Constant(self.i32, 0)
+        if fname == 'atomic_load':
+            # LLVM requires an alignment on atomic accesses: the natural one.
+            return self.builder.load_atomic(ptr, 'seq_cst', nbytes)
+        if fname == 'atomic_store':
+            self.builder.store_atomic(vals[0], ptr, 'seq_cst', nbytes)
+            return ir.Constant(self.i32, 0)
+        if fname == 'atomic_cmpxchg':
+            pair = self.builder.cmpxchg(ptr, vals[0], vals[1], 'seq_cst', 'seq_cst')
+            return self.builder.extract_value(pair, 0)
+        return self.builder.atomic_rmw(rmw_op, ptr, vals[0], 'seq_cst')
 
     def _convert_type(self, val: ir.Value, target_type: ir.Type) -> ir.Value:
         """Convert a value to the target type if needed."""
@@ -13087,6 +13212,15 @@ _X86_INTRINSIC_FEATURES = (
 )
 
 _INTRINSIC_CALL_RE = re.compile(r'@"?(llvm\.x86\.[A-Za-z0-9_.]+)"?\(')
+
+
+def _llvm_callconv(callconv: Optional[str]) -> Optional[str]:
+    """LLVM's name for a `[[callconv]]` value (LANGUAGE_SPEC §17.7), None for C."""
+    if callconv is None or callconv == 'c':
+        return None
+    if callconv == 'win64':
+        return 'win64cc'
+    raise ValueError(f"unknown calling convention '{callconv}'")
 
 
 def _add_intrinsic_target_features(ir_str: str) -> str:

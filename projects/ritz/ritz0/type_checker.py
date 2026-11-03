@@ -590,6 +590,20 @@ class TypeChecker:
                     self._infer_type(arg)
                 return rast.NamedType(expr.span, 'i64', [])
 
+            # Volatile / atomic memory builtins (LANGUAGE_SPEC §18.4-§18.5,
+            # AGAST #1879): the value-returning ones return the pointee type.
+            if fn_name in ('volatile_load', 'volatile_store', 'atomic_load',
+                           'atomic_store', 'atomic_xchg', 'atomic_cmpxchg',
+                           'atomic_fetch_add', 'atomic_fetch_sub', 'atomic_fetch_and',
+                           'atomic_fetch_or', 'atomic_fetch_xor', 'fence'):
+                arg_types = [self._infer_type(arg) for arg in expr.args]
+                if fn_name in ('volatile_store', 'atomic_store', 'fence') or not arg_types:
+                    return rast.NamedType(expr.span, 'void', [])
+                ptr_ty = arg_types[0]
+                if isinstance(ptr_ty, (rast.PtrType, rast.RefType)):
+                    return ptr_ty.inner
+                return rast.NamedType(expr.span, 'unknown', [])
+
             # print(str) / eprint(str) -> void (eprint: AGAST #1641)
             if fn_name in ('print', 'eprint'):
                 for arg in expr.args:

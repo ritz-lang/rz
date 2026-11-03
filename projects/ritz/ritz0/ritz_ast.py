@@ -160,6 +160,10 @@ class FnType(Type):
     """A function type: fn(A, B) -> C."""
     params: List[Type]
     ret: Optional[Type]
+    # Calling convention of a call through a value of this type (LANGUAGE_SPEC
+    # §17.7, AGAST #1879): None is the C convention; "win64" is set by a
+    # `[[callconv = "win64"]]` fn-type alias.
+    callconv: Optional[str] = None
 
 
 @dataclass
@@ -899,6 +903,8 @@ class ExternFn(Item):
     ret_type: Optional[Type]
     varargs: bool = False
     is_pub: bool = False  # pub extern fn - exported from module
+    # `[[callconv = "win64"]]` (LANGUAGE_SPEC §17.7, AGAST #1879); None = C.
+    callconv: Optional[str] = None
 
 
 @dataclass
@@ -1023,6 +1029,10 @@ class VarDef(Item):
     type: Optional[Type]
     value: Optional[Expr]
     is_pub: bool = False  # pub var - exported from module
+    # `extern var NAME: T` (LANGUAGE_SPEC §5.3, AGAST #1879): a data symbol
+    # defined in another object (a linker symbol, say); `value` is None and
+    # the module emits only `@NAME = external global T`.
+    is_extern: bool = False
 
 
 @dataclass

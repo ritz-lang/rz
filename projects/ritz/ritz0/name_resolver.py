@@ -52,6 +52,10 @@ class NameResolver:
         'simd_shuffle', 'simd_extract', 'simd_insert',
         'simd_sad',  # Sum of absolute differences (psadbw)
         'simd_clmul',  # Carryless multiply (pclmulqdq) for CRC32
+        # Volatile and atomic memory access (LANGUAGE_SPEC §18.4-§18.5)
+        'volatile_load', 'volatile_store', 'atomic_load', 'atomic_store',
+        'atomic_xchg', 'atomic_cmpxchg', 'atomic_fetch_add', 'atomic_fetch_sub',
+        'atomic_fetch_and', 'atomic_fetch_or', 'atomic_fetch_xor', 'fence',
     }
 
     # Built-in types

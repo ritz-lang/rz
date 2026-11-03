@@ -639,6 +639,38 @@ declaration. Widening `extern fn` to methods, `pub` and attributes would
 blur the C-style symbol it declares today. The keyword `extern` keeps one
 meaning: "defined in another object".
 
+**External data.** `extern var NAME: T` declares a data symbol that another
+object defines, as `extern fn` does for code. The usual case is a linker
+symbol, whose address is the information:
+
+```ritz
+extern var __bss_start: u8
+extern var __bss_end: u8
+extern var boot_ticks: u64
+
+fn bss_size() -> i64
+    @__bss_end as i64 - @__bss_start as i64
+
+fn tick()
+    boot_ticks = boot_ticks + 1
+```
+
+The declaration has a type and no initializer. It is read, written and
+addressed like a module `var`, and emits `@NAME = external global T` with
+T's exact size and alignment: `extern var __bss_start: u8` claims one byte
+at alignment 1, nothing more. It is valid at top level, takes `pub`, and
+takes no attributes. An initializer is a compile error naming the symbol:
+
+```ritz expect-error="extern var cannot have an initializer"
+extern var boot_ticks: u64 = 0
+```
+
+*Why `extern var`:* the same keyword, with the same meaning, in front of the
+item that would otherwise define the storage. Declaring a linker symbol as
+`extern fn __bss_start()` and casting its address (what harland did,
+AGAST #1879) puts data behind a fn type, and a call through it would jump
+into it.
+
 ### 5.4 Methods
 
 Methods live in `impl` blocks. The receiver is named `self`, either bare or
@@ -1761,6 +1793,7 @@ The attributes are a closed set:
 | `[[inline]]` | `fn` | inlining hint ([§17.6](#176-inlining-attributes)) |
 | `[[always_inline]]` | `fn` | always inline |
 | `[[noinline]]` | `fn` | never inline |
+| `[[callconv = "<cc>"]]` | `fn`, `extern fn`, fn-type `type` | calling convention ([§17.7](#177-calling-conventions)) |
 
 Any other attribute, a known attribute on an item kind it does not apply to,
 a value given to an attribute that takes none, or a missing value is a
@@ -1818,8 +1851,8 @@ its own. In test mode (ritz0 `--test-table`) the compiler omits the file's
 
 `name` is the function's name, NUL-terminated (`len` excludes the NUL). `run`
 calls the test and returns its result as an `i32`. A runner uses the
-accessor, since Ritz has no extern data declarations. Only tests defined in the
-file being compiled are listed, not tests in modules it imports.
+accessor. Only tests defined in the file being compiled are listed, not tests
+in modules it imports.
 
 **The test binary.** A test file's binary is the file in test mode, linked
 with the ritzunit runner as its `main`, plus the dependencies of both.
@@ -1920,6 +1953,64 @@ fn slow_path() -> i32
     1
 ```
 
+### 17.7 Calling Conventions
+
+`[[callconv = "win64"]]` gives a function the Microsoft x64 calling
+convention, LLVM's `win64cc`: the first four integer arguments in RCX, RDX,
+R8 and R9, the rest on the stack above 32 bytes of shadow space, the result
+in RAX. It is the convention of UEFI firmware. `[[callconv = "c"]]` names
+the default, the platform C convention (System V on x86-64 Linux), and
+changes nothing. Any other value is a compile error.
+
+On a `fn` it is the convention the function is defined with and that every
+direct call uses, so foreign code can call it. Every instance of a generic
+`[[callconv]]` fn has it. On an `extern fn` it is the convention of the
+foreign function, used by every call.
+
+On a `type` alias of a fn type it is part of the type: a call through a
+value of the alias uses it. A function pointer read from a firmware table
+has no declaration of its own, so the alias is where its convention is
+written:
+
+```ritz
+[[callconv = "win64"]]
+type EfiAllocatePages = fn(u64, u64, u64, *u64) -> u64
+
+[[callconv = "win64"]]
+extern fn efi_stall(microseconds: u64) -> u64
+
+[[callconv = "win64"]]
+pub fn efi_main(image: u64, system_table: u64) -> u64
+    0
+
+fn allocate(entry: u64, pages: u64, addr: *u64) -> u64
+    efi_stall(10)
+    let alloc: EfiAllocatePages = entry as EfiAllocatePages
+    alloc(0, 2, pages, addr)
+```
+
+A fn type written out, or an alias without the attribute, has the C
+convention. The compiler cannot see where a pointer came from, so calling
+through a type whose convention differs from the callee's is undefined
+behaviour, as in C.
+
+```ritz expect-error="unknown calling convention 'fastcall'"
+[[callconv = "fastcall"]]
+fn f() -> i64
+    0
+```
+
+```ritz expect-error="attribute 'callconv' applies to"
+[[callconv = "win64"]]
+type Count = u64
+```
+
+*Why an attribute:* the convention is a property of the ABI, not of any
+value, and attributes are the closed set that holds such properties, each
+honoured or rejected by every compiler. Rust's `extern "win64" fn(..)` type
+syntax was rejected: `extern` means "defined in another object" in Ritz
+(§5.3).
+
 ---
 
 ## 18. Memory Model
@@ -1965,6 +2056,98 @@ Ritz has no garbage collector. Memory is managed through:
 - Explicit `*_drop` calls on owning types
 - Explicit heap management (`heap_alloc` / `heap_free`, arenas)
 
+### 18.4 Volatile Access
+
+`volatile_load(p)` reads `*p` and `volatile_store(p, v)` writes `v` to `*p`
+as volatile accesses: each is performed exactly once, at the pointee's
+width, in program order with respect to the other volatile accesses. The
+optimiser never removes, merges, splits or invents one. They are LLVM
+`load volatile` and `store volatile`, and are how memory-mapped device
+registers are read and written. A plain `*p` may be folded away or repeated.
+
+```ritz
+fn wait_tx_empty(uart_base: u64)
+    let lsr: *u8 = (uart_base + 5) as *u8
+    while (volatile_load(lsr) & 0x20) == 0
+        pass
+
+fn ring_doorbell(db: *u32, slot: u32)
+    volatile_store(db, slot)
+```
+
+`p` must point to an integer type (`i8` to `u64`). `volatile_load` returns
+the pointee type, and `v` converts to it as a call argument does (§7.5).
+Any other pointee, or a wrong argument count, is a compile error:
+
+```ritz expect-error="volatile_load needs a pointer to an integer type"
+struct Regs
+    status: u32
+
+fn read(r: *Regs) -> u32
+    let all: Regs = volatile_load(r)
+    all.status
+```
+
+Volatile is not atomic. It orders nothing with respect to other CPUs; use
+§18.5 for that.
+
+### 18.5 Atomics and Fences
+
+| Builtin | Effect | Returns |
+|---|---|---|
+| `atomic_load(p)` | reads `*p` | the value |
+| `atomic_store(p, v)` | writes `v` to `*p` | nothing |
+| `atomic_xchg(p, v)` | writes `v` to `*p` | the old value |
+| `atomic_cmpxchg(p, expected, new)` | writes `new` to `*p` if `*p == expected` | the old value |
+| `atomic_fetch_add(p, v)` | `*p = *p + v` (wrapping) | the old value |
+| `atomic_fetch_sub(p, v)` | `*p = *p - v` (wrapping) | the old value |
+| `atomic_fetch_and(p, v)` | `*p = *p & v` | the old value |
+| `atomic_fetch_or(p, v)` | `*p = *p \| v` | the old value |
+| `atomic_fetch_xor(p, v)` | `*p = *p ^ v` | the old value |
+| `fence()` | orders all memory accesses before it against all after it | nothing |
+
+Each `atomic_*` is one indivisible read-modify-write (or read, or write)
+that is sequentially consistent: LLVM `atomicrmw`, `cmpxchg`,
+`load atomic` and `store atomic` with `seq_cst` ordering, and `fence` is
+`fence seq_cst`. `atomic_cmpxchg` stored exactly when the value it returns
+equals `expected`. The pointer rules are those of §18.4, and `*p` must be
+naturally aligned (its address a multiple of its size); a misaligned
+atomic is undefined.
+
+```ritz
+var g_lock: u32 = 0
+var g_owner: u64 = 0
+
+fn lock()
+    while atomic_xchg(@g_lock as *u32, 1) != 0
+        pass
+
+fn unlock()
+    atomic_store(@g_lock as *u32, 0)
+
+fn try_claim(me: u64) -> bool
+    atomic_cmpxchg(@g_owner as *u64, 0, me) == 0
+
+fn publish(ring_idx: *u16, idx: u16)
+    fence()                      # descriptors are visible before the index
+    volatile_store(ring_idx, idx)
+```
+
+```ritz expect-error="atomic_fetch_add takes 2 arguments"
+fn bump(counter: *u64)
+    atomic_fetch_add(counter)
+```
+
+The names in §18.4 and §18.5 are reserved, as `sizeof` is: a call always
+means the builtin.
+
+*Why builtins and seq_cst only:* in the hardware cases the access is
+volatile or atomic, not the object. A register block is reached through a
+pointer computed from a base address, and the same lock word is read plainly
+during setup. Builtins express that and need no change to the type
+system. Sequential consistency is the one ordering that is always correct.
+Weaker orderings can be added when a measured need appears.
+
 ---
 
 ## 19. Standard Library
@@ -1999,6 +2182,8 @@ See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 | `sizeof(T)` / `sizeof(expr)` | Size in bytes |
 | `assert cond` | Runtime check; exits non-zero on failure. **`[[test]]` functions only** |
 | `assert cond, "message"` | As above, naming what the check was for |
+| `volatile_load(p)` / `volatile_store(p, v)` | Volatile access ([§18.4](#184-volatile-access)) |
+| `atomic_*(p, ..)` / `fence()` | Atomic access and fences ([§18.5](#185-atomics-and-fences)) |
 
 `assert` is legal **only inside a `[[test]]` function**, and the compiler
 enforces it rather than leaving it to convention — an `assert` in ordinary code
@@ -2062,13 +2247,17 @@ self-hosted parser is generated. A sketch:
 ```
 program      := item*
 item         := attrs (fn_def | extern_fn | struct_def | enum_def
-                        | const_def | global_var | import | impl_block)
+                        | const_def | global_var | extern_var | type_alias
+                        | import | impl_block)
               | trait_def
 
 attrs        := ('[[' attr (',' attr)* ']]' NEWLINE)*     # §17
 attr         := IDENT | IDENT '=' STRING
 fn_def       := 'pub'? 'fn' IDENT generic_params? '(' params? ')'
                 ('->' type)? (block | '=' 'extern' NEWLINE)   # §5.3
+extern_fn    := 'extern' 'fn' IDENT '(' params? ')' ('->' type)? NEWLINE
+extern_var   := 'pub'? 'extern' 'var' IDENT ':' type NEWLINE   # §5.3
+type_alias   := 'pub'? 'type' IDENT '=' type NEWLINE
 struct_def   := 'pub'? 'struct' IDENT generic_params? NEWLINE INDENT field+ DEDENT
 enum_def     := 'pub'? 'enum' IDENT generic_params? NEWLINE INDENT variant+ DEDENT
 impl_block   := 'impl' generic_params? (IDENT 'for')? IDENT NEWLINE

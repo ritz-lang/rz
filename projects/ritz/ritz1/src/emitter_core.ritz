@@ -3612,6 +3612,116 @@ pub fn binop_float_width(s: *EmitterState, e: *Expr) -> i32
         return TYPE_F32
     TYPE_F64
 
+# =============================================================================
+# Volatile and atomic memory builtins (LANGUAGE_SPEC §18.4-§18.5, AGAST #1879)
+# =============================================================================
+#
+# volatile_load / volatile_store and atomic_* / fence lower to LLVM volatile
+# and seq_cst atomic instructions at the width of the pointer's pointee,
+# which must be an integer type.  ritz1 carries integers as i64, so results
+# come back extended (sext / zext by the pointee's signedness) and value
+# operands are truncated, as a call argument would be.
+
+const MEM_VOLATILE_LOAD: i32 = 1
+const MEM_VOLATILE_STORE: i32 = 2
+const MEM_ATOMIC_LOAD: i32 = 3
+const MEM_ATOMIC_STORE: i32 = 4
+const MEM_ATOMIC_XCHG: i32 = 5
+const MEM_ATOMIC_CMPXCHG: i32 = 6
+const MEM_ATOMIC_ADD: i32 = 7
+const MEM_ATOMIC_SUB: i32 = 8
+const MEM_ATOMIC_AND: i32 = 9
+const MEM_ATOMIC_OR: i32 = 10
+const MEM_ATOMIC_XOR: i32 = 11
+const MEM_FENCE: i32 = 12
+
+# The MEM_* id of a builtin name, 0 for any other name.
+fn mem_builtin_id(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"volatile_load", 13) == 1
+        return MEM_VOLATILE_LOAD
+    if name_eq(name, len, c"volatile_store", 14) == 1
+        return MEM_VOLATILE_STORE
+    if name_eq(name, len, c"atomic_load", 11) == 1
+        return MEM_ATOMIC_LOAD
+    if name_eq(name, len, c"atomic_store", 12) == 1
+        return MEM_ATOMIC_STORE
+    if name_eq(name, len, c"atomic_xchg", 11) == 1
+        return MEM_ATOMIC_XCHG
+    if name_eq(name, len, c"atomic_cmpxchg", 14) == 1
+        return MEM_ATOMIC_CMPXCHG
+    if name_eq(name, len, c"atomic_fetch_add", 16) == 1
+        return MEM_ATOMIC_ADD
+    if name_eq(name, len, c"atomic_fetch_sub", 16) == 1
+        return MEM_ATOMIC_SUB
+    if name_eq(name, len, c"atomic_fetch_and", 16) == 1
+        return MEM_ATOMIC_AND
+    if name_eq(name, len, c"atomic_fetch_or", 15) == 1
+        return MEM_ATOMIC_OR
+    if name_eq(name, len, c"atomic_fetch_xor", 16) == 1
+        return MEM_ATOMIC_XOR
+    if name_eq(name, len, c"fence", 5) == 1
+        return MEM_FENCE
+    0
+
+# The pointee type of a memory builtin's pointer operand.  ritz1's `*p`
+# inference only knows a typed binding's pointee (a `*(@x as *u32)` deref
+# loads i64), and an atomic must not silently widen, so the two shapes a
+# kernel writes inline are resolved here first: `<e> as *T` (the cast
+# records T) and `@x` (x's own type).
+fn mem_builtin_pointee(s: *EmitterState, arg: *Expr) -> i32
+    if arg == null
+        return TYPE_VOID
+    if arg.kind == EXPR_CAST and arg.op == TYPE_PTR and arg.int_val != (TYPE_VOID as i64)
+        return arg.int_val as i32
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT) and arg.operand != null
+        return get_expr_type(s, arg.operand)
+    let d: *Expr = calloc(1, sizeof(Expr)) as *Expr
+    d.kind = EXPR_UNARY
+    d.op = OP_DEREF
+    d.operand = arg
+    d.span = arg.span
+    get_expr_type(s, d)
+
+# `error: <file>:<line>:<col>: <builtin name> <msg>` (AGAST #1879).
+fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: *u8)
+    emit_str(s, c"  ; ERROR: memory builtin\n")
+    eprints_cstr(c"error: ")
+    if g_emit_file != null
+        eprints_cstr(g_emit_file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(e.span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(e.span.col as i64)
+    eprints_cstr(c": ")
+    var i: i32 = 0
+    while i < e.func_name_len
+        eprint_char(*(e.func_name + i))
+        i += 1
+    eprints_cstr(c" ")
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+fn mem_int_type_bits(t: i32) -> i32
+    if t == TYPE_I8 or t == TYPE_U8
+        return 8
+    if t == TYPE_I16 or t == TYPE_U16
+        return 16
+    if t == TYPE_I32 or t == TYPE_U32
+        return 32
+    if t == TYPE_I64 or t == TYPE_U64
+        return 64
+    0
+
+# The type a memory builtin call evaluates to: the pointee for the
+# value-returning ones, TYPE_VOID for the stores and fence.
+fn mem_builtin_result_type(s: *EmitterState, e: *Expr, id: i32) -> i32
+    if id == MEM_VOLATILE_STORE or id == MEM_ATOMIC_STORE or id == MEM_FENCE
+        return TYPE_VOID
+    mem_builtin_pointee(s, e.args)
+
 fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     # Returns the Ritz type of an expression
     if e.kind == EXPR_INT_LIT
@@ -3838,6 +3948,10 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         # AGAST #1791: the builtin shadows any user fn of the same name.
         if call_is_named_syscall_builtin(s, e) == 1
             return named_syscall_builtin_type(e.func_name, e.func_name_len)
+        # AGAST #1879: volatile / atomic builtins return their pointee type.
+        let mem_id: i32 = mem_builtin_id(e.func_name, e.func_name_len)
+        if mem_id != 0
+            return mem_builtin_result_type(s, e, mem_id)
         # Look up function return type
         # Build full function name with type suffix if generic
         let fn_def: *FnDef = find_call_fn(s, e)

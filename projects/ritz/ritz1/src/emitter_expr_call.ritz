@@ -1799,6 +1799,171 @@ fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_nam
     emit_str(s, c"\n")
     return cast_out
 
+fn emit_mem_int_ty(s: *EmitterState, bits: i32)
+    emit_str(s, c"i")
+    emit_int(s, bits as i64)
+
+# Truncate an i64 value register to `bits` (no-op at 64).
+fn mem_narrow(s: *EmitterState, v: i32, bits: i32) -> i32
+    if bits == 64
+        return v
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = trunc i64 ")
+    emit_reg(s, v)
+    emit_str(s, c" to ")
+    emit_mem_int_ty(s, bits)
+    emit_str(s, c"\n")
+    r
+
+# Extend an iN result to the i64 value model by the pointee's signedness.
+fn mem_widen(s: *EmitterState, v: i32, bits: i32, ty: i32) -> i32
+    if bits == 64
+        return v
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    if ty == TYPE_I8 or ty == TYPE_I16 or ty == TYPE_I32
+        emit_str(s, c" = sext ")
+    else
+        emit_str(s, c" = zext ")
+    emit_mem_int_ty(s, bits)
+    emit_str(s, c" ")
+    emit_reg(s, v)
+    emit_str(s, c" to i64\n")
+    r
+
+# volatile_* / atomic_* / fence (LANGUAGE_SPEC §18.4-§18.5, AGAST #1879).
+fn emit_mem_builtin(s: *EmitterState, e: *Expr, id: i32) -> i32
+    var want: i32 = 2
+    if id == MEM_FENCE
+        want = 0
+    else if id == MEM_VOLATILE_LOAD or id == MEM_ATOMIC_LOAD
+        want = 1
+    else if id == MEM_ATOMIC_CMPXCHG
+        want = 3
+    var argc: i32 = 0
+    var a: *Expr = e.args
+    while a != null
+        argc += 1
+        a = a.next
+    if argc != want
+        if want == 0
+            mem_builtin_error(s, e, c"takes 0 arguments")
+        else if want == 1
+            mem_builtin_error(s, e, c"takes 1 argument")
+        else if want == 2
+            mem_builtin_error(s, e, c"takes 2 arguments")
+        else
+            mem_builtin_error(s, e, c"takes 3 arguments")
+        return 0
+    if id == MEM_FENCE
+        emit_str(s, c"  fence seq_cst\n")
+        return 0
+    let pty: i32 = mem_builtin_pointee(s, e.args)
+    let bits: i32 = mem_int_type_bits(pty)
+    if bits == 0
+        mem_builtin_error(s, e, c"needs a pointer to an integer type (i8..u64)")
+        return 0
+    # The pointer: an i64 address (or already a ptr, as for OP_DEREF).
+    let addr: i32 = emit_expr(s, e.args)
+    var ptr: i32 = addr
+    if deref_operand_is_ptr(s, e.args) == 0
+        ptr = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, ptr)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, addr)
+        emit_str(s, c" to ptr\n")
+    # Value operands, left to right, at the pointee width.
+    var v1: i32 = -1
+    var v2: i32 = -1
+    if want >= 2
+        v1 = mem_narrow(s, emit_expr(s, e.args.next), bits)
+    if want == 3
+        v2 = mem_narrow(s, emit_expr(s, e.args.next.next), bits)
+    if id == MEM_VOLATILE_STORE or id == MEM_ATOMIC_STORE
+        emit_str(s, c"  store ")
+        if id == MEM_VOLATILE_STORE
+            emit_str(s, c"volatile ")
+        else
+            emit_str(s, c"atomic ")
+        emit_mem_int_ty(s, bits)
+        emit_str(s, c" ")
+        emit_reg(s, v1)
+        emit_str(s, c", ptr ")
+        emit_reg(s, ptr)
+        if id == MEM_ATOMIC_STORE
+            # LLVM requires an explicit alignment on atomics: the natural one.
+            emit_str(s, c" seq_cst, align ")
+            emit_int(s, (bits / 8) as i64)
+        emit_str(s, c"\n")
+        return 0
+    let raw: i32 = next_reg(s)
+    if id == MEM_VOLATILE_LOAD or id == MEM_ATOMIC_LOAD
+        emit_str(s, c"  ")
+        emit_reg(s, raw)
+        if id == MEM_VOLATILE_LOAD
+            emit_str(s, c" = load volatile ")
+        else
+            emit_str(s, c" = load atomic ")
+        emit_mem_int_ty(s, bits)
+        emit_str(s, c", ptr ")
+        emit_reg(s, ptr)
+        if id == MEM_ATOMIC_LOAD
+            emit_str(s, c" seq_cst, align ")
+            emit_int(s, (bits / 8) as i64)
+        emit_str(s, c"\n")
+        return mem_widen(s, raw, bits, pty)
+    if id == MEM_ATOMIC_CMPXCHG
+        # { iN, i1 }: the old value, and whether it equalled `expected`.
+        emit_str(s, c"  ")
+        emit_reg(s, raw)
+        emit_str(s, c" = cmpxchg ptr ")
+        emit_reg(s, ptr)
+        emit_str(s, c", ")
+        emit_mem_int_ty(s, bits)
+        emit_str(s, c" ")
+        emit_reg(s, v1)
+        emit_str(s, c", ")
+        emit_mem_int_ty(s, bits)
+        emit_str(s, c" ")
+        emit_reg(s, v2)
+        emit_str(s, c" seq_cst seq_cst\n")
+        let old: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, old)
+        emit_str(s, c" = extractvalue { ")
+        emit_mem_int_ty(s, bits)
+        emit_str(s, c", i1 } ")
+        emit_reg(s, raw)
+        emit_str(s, c", 0\n")
+        return mem_widen(s, old, bits, pty)
+    emit_str(s, c"  ")
+    emit_reg(s, raw)
+    emit_str(s, c" = atomicrmw ")
+    if id == MEM_ATOMIC_XCHG
+        emit_str(s, c"xchg")
+    else if id == MEM_ATOMIC_ADD
+        emit_str(s, c"add")
+    else if id == MEM_ATOMIC_SUB
+        emit_str(s, c"sub")
+    else if id == MEM_ATOMIC_AND
+        emit_str(s, c"and")
+    else if id == MEM_ATOMIC_OR
+        emit_str(s, c"or")
+    else
+        emit_str(s, c"xor")
+    emit_str(s, c" ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", ")
+    emit_mem_int_ty(s, bits)
+    emit_str(s, c" ")
+    emit_reg(s, v1)
+    emit_str(s, c" seq_cst\n")
+    mem_widen(s, raw, bits, pty)
+
 fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # Variant constructor: Some(x) / Ok(x) / None / Err(x) -> %Result$.../
     # Option$... struct.  Handled before the generic call path so
@@ -1978,6 +2143,11 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesdeclast", 25, 2)
     if name_eq(e.func_name, e.func_name_len, c"aesimc", 6) == 1
         return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesimc", 21, 1)
+    # AGAST #1879: volatile / atomic memory builtins.  Reserved names, as in
+    # ritz0: checked before user fns, so they never become an extern.
+    let mem_id: i32 = mem_builtin_id(e.func_name, e.func_name_len)
+    if mem_id != 0
+        return emit_mem_builtin(s, e, mem_id)
 
     # Indirect call via local fn-ptr.  When `e.func_name` matches a
     # local variable (e.g. `let h: fn(*Task) -> i32 = task.handler`),
@@ -2687,14 +2857,21 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1730 — a large struct comes back through a caller-owned slot
     # (also for typed indirect calls: the pointee was defined the same way).
     var call_sret: i32 = 0
+    # [[callconv = "win64"]] on the callee, or on the fn type of a typed
+    # indirect call (fn_def is then its signature) -- AGAST #1879.
+    let call_cc: *u8 = fn_callconv_kw(fn_def)
     if struct_ret_uses_sret(s, ret_type, ret_struct_name, ret_struct_name_len) == 1
         call_sret = emit_sret_call_slot(s, ret_struct_name, ret_struct_name_len)
     if call_sret > 0
         call_result = next_reg(s)
-        emit_str(s, c"  call void ")
+        emit_str(s, c"  call ")
+        emit_str(s, call_cc)
+        emit_str(s, c"void ")
     else if ret_type == TYPE_VOID
         # void call - no result register assignment
-        emit_str(s, c"  call void ")
+        emit_str(s, c"  call ")
+        emit_str(s, call_cc)
+        emit_str(s, c"void ")
     else
         call_result = next_reg(s)
         emit_str(s, c"  ")
@@ -2703,6 +2880,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             # emit_llvm_type_struct routes tagged-enum Result$/Option$ to i64
             # (task-99 cluster #3).
             emit_str(s, c" = call ")
+            emit_str(s, call_cc)
             emit_llvm_type_struct(s, TYPE_STRUCT, ret_struct_name, ret_struct_name_len)
             emit_str(s, c" ")
         else if ret_type == TYPE_BOOL
@@ -2710,24 +2888,42 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             # match: `call i1 @f(...)`.  Without this branch the call site
             # emits `call i64` and clang rejects the type mismatch.  The
             # zext-to-i64 happens below in the return-narrow block.
-            emit_str(s, c" = call i1 ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"i1 ")
         else if ret_type == TYPE_F32
-            emit_str(s, c" = call float ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"float ")
         else if ret_type == TYPE_F64
-            emit_str(s, c" = call double ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"double ")
         else if ret_type == TYPE_I32 or ret_type == TYPE_U32
-            emit_str(s, c" = call i32 ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"i32 ")
         else if ret_type == TYPE_I16 or ret_type == TYPE_U16
-            emit_str(s, c" = call i16 ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"i16 ")
         else if ret_type == TYPE_I8 or ret_type == TYPE_U8
-            emit_str(s, c" = call i8 ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"i8 ")
         else if ret_type == TYPE_MUT_REF
-            emit_str(s, c" = call ptr ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"ptr ")
         else if ret_type == TYPE_PTR or ret_type == TYPE_REF
             # Match definition's return type (emit_llvm_type emits i64 for TYPE_PTR/TYPE_REF)
-            emit_str(s, c" = call i64 ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"i64 ")
         else
-            emit_str(s, c" = call i64 ")
+            emit_str(s, c" = call ")
+            emit_str(s, call_cc)
+            emit_str(s, c"i64 ")
     if icall_fp_reg >= 0
         emit_reg(s, icall_fp_reg)
     else

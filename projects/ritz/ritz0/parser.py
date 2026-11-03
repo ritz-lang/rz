@@ -38,7 +38,13 @@ ATTRS = {
     "inline": (False, ("fn",)),
     "always_inline": (False, ("fn",)),
     "noinline": (False, ("fn",)),
+    # LANGUAGE_SPEC §17.7 (AGAST #1879). On a `type` item only when the
+    # alias names a fn type (parse_type_alias checks).
+    "callconv": (True, ("fn", "extern fn", "type")),
 }
+
+# `[[callconv = "<name>"]]` values. "c" is the default, written out.
+CALLCONVS = ("c", "win64")
 
 # The tail of every "can't be `= extern`" diagnostic (AGAST #1900). ritz1
 # prints the same words (ritz1/src/ast_helpers.ritz decl_refused).
@@ -1878,6 +1884,10 @@ class Parser:
         if not takes_value and attr.value is not None:
             raise ParseError(f"attribute '{attr.name}' takes no value: [[{attr.name}]]",
                              attr.span)
+        if attr.name == "callconv" and attr.value not in CALLCONVS:
+            raise ParseError(
+                f"unknown calling convention '{attr.value}' (known: {', '.join(CALLCONVS)})",
+                attr.span)
         return attr
 
     def _check_attrs_apply(self, attrs: List[rast.Attr], kind: str) -> None:
@@ -2292,6 +2302,23 @@ class Parser:
 
         return rast.VarDef(span, name, var_type, value, is_pub=is_pub)
 
+    def parse_extern_var(self, is_pub: bool = False) -> rast.VarDef:
+        """`extern var NAME: T` (LANGUAGE_SPEC §5.3, AGAST #1879).
+
+        A data symbol defined in another object, typically by the linker
+        (`__bss_start`). It has a type and no initializer.
+        """
+        span = self._current().span
+        self._expect(TokenType.EXTERN)
+        self._expect(TokenType.VAR)
+        name = self._expect(TokenType.IDENT).value
+        self._expect(TokenType.COLON, "extern var needs a type: extern var NAME: T")
+        var_type = self.parse_type()
+        if self._at(TokenType.EQ):
+            raise ParseError(f"extern var cannot have an initializer: '{name}' is "
+                             "defined in another object", span)
+        return rast.VarDef(span, name, var_type, None, is_pub=is_pub, is_extern=True)
+
     def parse_static_assert(self) -> rast.StaticAssert:
         """Parse static_assert(condition) or static_assert(condition, "message")."""
         span = self._current().span
@@ -2495,10 +2522,15 @@ class Parser:
 
         if self._at(TokenType.FN):
             return self.parse_fn(attrs, is_pub=is_pub)
-        if self._at(TokenType.EXTERN):
+        if self._at(TokenType.EXTERN) and self._peek_at(1, TokenType.VAR):
             if attrs:
-                raise ParseError("Attributes not allowed on extern functions", self._current().span)
-            return self.parse_extern_fn(is_pub=is_pub)
+                raise ParseError("Attributes not allowed on extern var", attrs[0].span)
+            return self.parse_extern_var(is_pub=is_pub)
+        if self._at(TokenType.EXTERN):
+            self._check_attrs_apply(attrs, "extern fn")
+            ext = self.parse_extern_fn(is_pub=is_pub)
+            ext.callconv = _callconv_of(attrs)
+            return ext
         if self._at(TokenType.STRUCT):
             return self.parse_struct(attrs, is_pub=is_pub)
         if self._at(TokenType.ENUM):
@@ -2516,9 +2548,18 @@ class Parser:
                 raise ParseError("Attributes not allowed on module-level variables (yet)", self._current().span)
             return self.parse_var_def(is_pub=is_pub)
         if self._at(TokenType.TYPE):
+            self._check_attrs_apply(attrs, "type")
+            alias = self.parse_type_alias(is_pub=is_pub)
+            callconv = _callconv_of(attrs)
             if attrs:
-                raise ParseError("Attributes not allowed on type aliases (yet)", self._current().span)
-            return self.parse_type_alias(is_pub=is_pub)
+                # callconv is the only attribute a `type` takes: it is part of
+                # the fn type, so a call through the alias uses it.
+                if not isinstance(alias.target, rast.FnType):
+                    raise ParseError(
+                        f"attribute 'callconv' applies to fn-type aliases only; "
+                        f"'{alias.name}' is not a fn type", attrs[0].span)
+                alias.target.callconv = callconv
+            return alias
         if self._at(TokenType.TRAIT):
             if attrs:
                 raise ParseError("Attributes not allowed on traits (yet)", self._current().span)
@@ -2549,6 +2590,14 @@ class Parser:
             self._skip_newlines()  # Skip newlines between items
 
         return rast.Module(span, items)
+
+
+def _callconv_of(attrs: List[rast.Attr]) -> Optional[str]:
+    """The `[[callconv]]` value, or None for the C convention (also "c")."""
+    for a in attrs:
+        if a.name == "callconv" and a.value != "c":
+            return a.value
+    return None
 
 
 def parse(source: str, filename: str = "<stdin>") -> rast.Module:

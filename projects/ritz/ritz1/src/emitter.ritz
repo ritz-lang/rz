@@ -631,6 +631,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         emit_str(s, c"define linkonce_odr ")
     else
         emit_str(s, c"define weak_odr ")
+    emit_str(s, fn_callconv_kw(f))   # [[callconv = "win64"]] (AGAST #1879)
     if s.ret_sret == 1
         emit_str(s, c"void")
     else
@@ -1590,6 +1591,7 @@ fn fn_has_byval_param(s: *EmitterState, f: *FnDef) -> i32
 fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len: i32, is_method: i32)
     let sret: i32 = struct_ret_uses_sret(s, f.return_type, f.return_type_name, f.return_type_name_len)
     emit_str(s, c"declare ")
+    emit_str(s, fn_callconv_kw(f))
     if sret == 1
         emit_str(s, c"void")
     else
@@ -1686,25 +1688,35 @@ fn emit_extern_declarations(s: *EmitterState)
                     emit_concrete_extern_declare(s, fn_def, ex_name, ex_len, is_method)   # AGAST #1739
                 else if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
                     # AGAST #1730 — the call sites pass `ptr sret(%T)`.
-                    emit_str(s, c"declare void @")
+                    emit_str(s, c"declare ")
+                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, c"void @")
                     emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else if fn_def != null and fn_def.return_type == TYPE_STRUCT
-                    emit_str(s, c"declare %")
+                    emit_str(s, c"declare ")
+                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, c"%")
                     emit_name(s, fn_def.return_type_name, fn_def.return_type_name_len)
                     emit_str(s, c" @")
                     emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else if fn_def != null and fn_def.return_type == TYPE_I32
-                    emit_str(s, c"declare i32 @")
+                    emit_str(s, c"declare ")
+                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, c"i32 @")
                     emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else if fn_def != null and fn_def.return_type == TYPE_VOID
-                    emit_str(s, c"declare void @")
+                    emit_str(s, c"declare ")
+                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, c"void @")
                     emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
                 else
-                    emit_str(s, c"declare i64 @")
+                    emit_str(s, c"declare ")
+                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, c"i64 @")
                     emit_name(s, ex_name, ex_len)
                     emit_str(s, c"(...)\n")
     if namelist_count(@s.externs) > 0
@@ -2271,6 +2283,61 @@ fn resolve_const_values(s: *EmitterState)
         c = c.next
 
 # Emit global variable declarations
+# The LLVM type a defined global is emitted with.  Narrow scalars live in an
+# i64 slot (accesses use their own width).
+fn emit_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
+    # Emit the type
+    if g.var_type == TYPE_STRUCT
+        emit_str(s, c"%")
+        emit_name(s, g.type_name, g.type_name_len)
+    else if g.var_type == TYPE_I32 or g.var_type == TYPE_U32
+        emit_str(s, c"i32")
+    else if g.var_type == TYPE_I64 or g.var_type == TYPE_U64
+        emit_str(s, c"i64")
+    else if g.var_type == TYPE_PTR
+        emit_str(s, c"ptr")
+    else if g.var_type == TYPE_ARRAY and g.array_shape != null
+        # AGAST #1509: `var g: [N][M]T` -> `[N x [M x T]]` (was `[N x i64]`).
+        emit_array_shape_llvm(s, g.array_shape, 0)
+    else if g.var_type == TYPE_ARRAY
+        # AGAST #190: `var g: [N]T` — emit `[N x T]` so indexing GEPs
+        # use the right stride.  Without this branch the global fell
+        # through to `i64 zeroinitializer` and `g_fallback[i].used`
+        # in nexus tripped "; ERROR: unhandled EXPR_MEMBER" because
+        # the emitter had no array-stride context to GEP through.
+        emit_str(s, c"[")
+        emit_int(s, g.array_size as i64)
+        emit_str(s, c" x ")
+        if g.array_elem_type == TYPE_STRUCT and g.array_elem_type_name_len > 0
+            emit_llvm_type_struct(s, TYPE_STRUCT, g.array_elem_type_name, g.array_elem_type_name_len)
+        else
+            # Shared with index lowering (AGAST #1504) so `g[i]` GEPs
+            # the layout declared here.
+            emit_str(s, global_array_elem_llvm(g))
+        emit_str(s, c"]")
+    else
+        emit_str(s, c"i64")
+
+# AGAST #1879: an `extern var` is declared with its exact type -- the symbol
+# is another object's, so an i64 slot would claim a size and alignment it
+# does not have (`extern var __bss_start: u8` is one byte, alignment 1).
+fn emit_extern_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
+    let t: i32 = g.var_type
+    if t == TYPE_U8 or t == TYPE_I8
+        emit_str(s, c"i8")
+    else if t == TYPE_U16 or t == TYPE_I16
+        emit_str(s, c"i16")
+    else if t == TYPE_BOOL
+        emit_str(s, c"i1")
+    else if t == TYPE_F32
+        emit_str(s, c"float")
+    else if t == TYPE_F64
+        emit_str(s, c"double")
+    else if t == TYPE_REF or t == TYPE_MUT_REF or t == TYPE_PTR_PTR
+        emit_str(s, c"ptr")
+    else
+        emit_global_llvm_type(s, g)
+
 fn emit_global_vars(s: *EmitterState)
     var g: *GlobalVarDef = s.module.globals
     while g != null
@@ -2279,6 +2346,15 @@ fn emit_global_vars(s: *EmitterState)
             g = g.next
             continue
         mark_global_emitted(s, g.name, g.name_len)
+        if g.is_extern == 1
+            # AGAST #1879: `extern var` -- declared, defined elsewhere.
+            emit_str(s, c"@")
+            emit_name(s, g.name, g.name_len)
+            emit_str(s, c" = external global ")
+            emit_extern_global_llvm_type(s, g)
+            emit_str(s, c"\n")
+            g = g.next
+            continue
         # Fold (and diagnose) the initializer before the declaration line so
         # any IR error marker lands on its own line.
         if g.array_shape != null and g.init_expr != null
@@ -2290,37 +2366,7 @@ fn emit_global_vars(s: *EmitterState)
         emit_name(s, g.name, g.name_len)
         # weak_odr: merge duplicates across modules (same as functions)
         emit_str(s, c" = weak_odr global ")
-        # Emit the type
-        if g.var_type == TYPE_STRUCT
-            emit_str(s, c"%")
-            emit_name(s, g.type_name, g.type_name_len)
-        else if g.var_type == TYPE_I32 or g.var_type == TYPE_U32
-            emit_str(s, c"i32")
-        else if g.var_type == TYPE_I64 or g.var_type == TYPE_U64
-            emit_str(s, c"i64")
-        else if g.var_type == TYPE_PTR
-            emit_str(s, c"ptr")
-        else if g.var_type == TYPE_ARRAY and g.array_shape != null
-            # AGAST #1509: `var g: [N][M]T` -> `[N x [M x T]]` (was `[N x i64]`).
-            emit_array_shape_llvm(s, g.array_shape, 0)
-        else if g.var_type == TYPE_ARRAY
-            # AGAST #190: `var g: [N]T` — emit `[N x T]` so indexing GEPs
-            # use the right stride.  Without this branch the global fell
-            # through to `i64 zeroinitializer` and `g_fallback[i].used`
-            # in nexus tripped "; ERROR: unhandled EXPR_MEMBER" because
-            # the emitter had no array-stride context to GEP through.
-            emit_str(s, c"[")
-            emit_int(s, g.array_size as i64)
-            emit_str(s, c" x ")
-            if g.array_elem_type == TYPE_STRUCT and g.array_elem_type_name_len > 0
-                emit_llvm_type_struct(s, TYPE_STRUCT, g.array_elem_type_name, g.array_elem_type_name_len)
-            else
-                # Shared with index lowering (AGAST #1504) so `g[i]` GEPs
-                # the layout declared here.
-                emit_str(s, global_array_elem_llvm(g))
-            emit_str(s, c"]")
-        else
-            emit_str(s, c"i64")
+        emit_global_llvm_type(s, g)
         emit_global_init(s, g, @gi)
         emit_str(s, c"\n")
         g = g.next

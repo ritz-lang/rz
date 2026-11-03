@@ -200,11 +200,6 @@ PROGRAMS = {
     ),
 }
 
-# ritz0 lowers an alias of a struct (or of a pointer to one) to i8* and fails
-# to compile these (AGAST #1537), so it is no oracle for them yet. Strict
-# xfail: when #1537 lands they XPASS and must be deleted from this set.
-RITZ0_STRUCT_ALIAS_BROKEN = {"struct_alias", "pointer_alias", "imported_struct_alias"}
-
 # Must still be rejected, and must not leave an artifact behind.
 MALFORMED = {
     "missing_name": "type = i32\n\npub fn main() -> i32\n    return 3\n",
@@ -271,14 +266,8 @@ def _run(compiler: str, tmp_path: Path, name: str) -> int:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz0_is_the_oracle(request, tmp_path, name):
+def test_ritz0_is_the_oracle(tmp_path, name):
     """The reference answer. If this changes, the oracle moved, not ritz1."""
-    if name in RITZ0_STRUCT_ALIAS_BROKEN:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True, reason="AGAST #1537: ritz0 struct alias -> i8*"
-            )
-        )
     assert _run("ritz0", tmp_path, name) == 3
 
 
