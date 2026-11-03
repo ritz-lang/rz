@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-boot test-uefi-boot test-uefi-gui run-gui kernel iso help
+.PHONY: all build clean test test-boot test-tier1 test-uefi-boot test-uefi-gui run-gui kernel iso help
 
 all: kernel
 
@@ -65,6 +65,11 @@ test-boot: iso
 	@echo "=== Testing Kernel Boot (GRUB) ==="
 	./tools/test_boot.sh
 
+# Boot the kernel and the indium userspace (native loader and GRUB multiboot2)
+# and check init's Tier-1 suite: the spawn -> exit -> parent resume path (#2132)
+test-tier1:
+	./tools/test_tier1_boot.sh
+
 # UEFI bootloader test (headless)
 test-uefi-boot: kernel
 	@echo "=== Testing UEFI Bootloader ==="
@@ -103,6 +108,7 @@ help:
 	@echo "  iso          - Create test ISO with GRUB"
 	@echo "  test         - Run kernel boot test"
 	@echo "  test-boot    - Run kernel boot test (GRUB/BIOS)"
+	@echo "  test-tier1   - Boot with indium, check init Tier-1 suite (OVMF)"
 	@echo "  test-uefi-boot - Test UEFI bootloader (headless)"
 	@echo "  test-uefi-gui  - Test UEFI bootloader with display"
 	@echo "  run-gui        - Interactive run (no timeout, kill QEMU manually)"

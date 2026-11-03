@@ -298,56 +298,69 @@ syscall_set_return_context:
 .size syscall_set_return_context, . - syscall_set_return_context
 
 # ============================================================================
-# Jump to Userspace with Return Value
+# Save / Resume a Whole User Syscall Frame (blocking spawn -> exit, #2132)
 # ============================================================================
-# void jump_to_userspace_with_retval(u64 entry_point, u64 user_stack, i64 retval)
+# syscall_entry always builds its frame at the top of the single syscall_stack,
+# so the current syscall's frame is always the 16 quadwords below
+# syscall_stack_top:
 #
-# Similar to jump_to_userspace, but sets RAX to retval before jumping.
-# Used by sys_exit to return to parent with the child's exit code.
+#   word:  0   1   2   3   4   5   6   7   8   9   10  11  12  13  14     15
+#   reg:   r15 r14 r13 r12 rbp rbx rax rdi rsi rdx r10 r8  r9  rip rflags rsp
 #
-.global jump_to_userspace_with_retval
-.type jump_to_userspace_with_retval, @function
-jump_to_userspace_with_retval:
-    # Arguments:
-    #   RDI = entry point (user RIP)
-    #   RSI = user stack pointer
-    #   RDX = return value (to put in RAX)
+# The child's own syscalls overwrite that frame, so a blocking spawn has to
+# copy the parent's frame out and resume from the copy when the child exits.
+# Resuming from user RIP/RSP alone, with the GPRs zeroed, breaks the parent:
+# its syscall stub does `mov %rbp, %rsp` after `syscall`, and RBP=0 left it
+# running with RSP=0.
+.set SYSCALL_FRAME_WORDS, 16
+.set SYSCALL_FRAME_BYTES, SYSCALL_FRAME_WORDS * 8
 
-    # Disable interrupts during transition
+# void syscall_save_user_frame(u64* dst)
+# Copy the current syscall's user frame (16 quadwords) to dst.
+# Call it only from inside a syscall handler.
+.global syscall_save_user_frame
+.type syscall_save_user_frame, @function
+syscall_save_user_frame:
+    leaq syscall_stack_top(%rip), %rsi
+    subq $SYSCALL_FRAME_BYTES, %rsi
+    movq $SYSCALL_FRAME_WORDS, %rcx
+    cld
+    rep movsq
+    ret
+.size syscall_save_user_frame, . - syscall_save_user_frame
+
+# noreturn void resume_user_frame(u64* frame, i64 retval)
+# Return to ring 3 as though the syscall that saved frame had just returned
+# retval. Every register the syscall ABI preserves comes from frame. RCX and
+# R11 get the return RIP and RFLAGS, as SYSCALL/SYSRET leave them.
+.global resume_user_frame
+.type resume_user_frame, @function
+resume_user_frame:
     cli
-
-    # Build IRET frame for Ring 3
-    # Stack layout for IRETQ: RIP, CS, RFLAGS, RSP, SS
-
+    # IRET frame: SS, RSP, RFLAGS, CS, RIP
     pushq $0x23                  # SS (user data, ring 3)
-    pushq %rsi                   # RSP (user stack)
-    pushq $0x202                 # RFLAGS (IF=1, reserved bit 1 = 1)
+    pushq 120(%rdi)              # user RSP
+    pushq 112(%rdi)              # user RFLAGS
     pushq $0x1B                  # CS (user code, ring 3)
-    pushq %rdi                   # RIP (entry point)
+    pushq 104(%rdi)              # user RIP
 
-    # Set return value in RAX (this is the key difference!)
-    movq %rdx, %rax
-
-    # Clear other registers (security)
-    xorq %rbx, %rbx
-    xorq %rcx, %rcx
-    xorq %rdx, %rdx
-    xorq %rdi, %rdi
-    xorq %rsi, %rsi
-    xorq %rbp, %rbp
-    xorq %r8, %r8
-    xorq %r9, %r9
-    xorq %r10, %r10
-    xorq %r11, %r11
-    xorq %r12, %r12
-    xorq %r13, %r13
-    xorq %r14, %r14
-    xorq %r15, %r15
-
-    # Jump to userspace!
+    movq %rsi, %rax              # syscall return value
+    movq 0(%rdi), %r15
+    movq 8(%rdi), %r14
+    movq 16(%rdi), %r13
+    movq 24(%rdi), %r12
+    movq 32(%rdi), %rbp
+    movq 40(%rdi), %rbx
+    movq 64(%rdi), %rsi
+    movq 72(%rdi), %rdx
+    movq 80(%rdi), %r10
+    movq 88(%rdi), %r8
+    movq 96(%rdi), %r9
+    movq 104(%rdi), %rcx         # RCX = return RIP (SYSCALL semantics)
+    movq 112(%rdi), %r11         # R11 = RFLAGS (SYSCALL semantics)
+    movq 56(%rdi), %rdi          # RDI last: it held the frame pointer
     iretq
-
-.size jump_to_userspace_with_retval, . - jump_to_userspace_with_retval
+.size resume_user_frame, . - resume_user_frame
 
 # ============================================================================
 # Jump to Userspace with Arguments (argc/argv)

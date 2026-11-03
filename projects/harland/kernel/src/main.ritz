@@ -742,7 +742,8 @@ extern fn context_switch(old_ctx: *CpuContext, new_ctx: *CpuContext)
 # External assembly functions for syscalls and userspace
 extern fn syscall_entry()
 extern fn jump_to_userspace(entry: u64, stack: u64)
-extern fn jump_to_userspace_with_retval(entry: u64, stack: u64, retval: i64)
+extern fn syscall_save_user_frame(dst: *u64)
+extern fn resume_user_frame(frame: *u64, retval: i64)
 extern fn jump_to_userspace_with_args(entry: u64, stack: u64, argc: i64, argv: u64)
 
 # Note: Embedded ELF binaries removed. User binaries are now loaded
@@ -822,10 +823,14 @@ struct ParentContext
     user_rsp: u64           # Parent's user stack pointer
     user_rflags: u64        # Parent's RFLAGS
     user_pml4: u64          # Parent's page table (CR3)
-    # We don't need to save GPRs - they're on the syscall stack
 
 # Global parent context (single process system for now)
 var g_parent_ctx: ParentContext
+# The parent's whole syscall frame (GPRs, RIP, RFLAGS, RSP; layout in
+# syscall_entry.s). It can't stay on the syscall stack: that stack is one
+# global and the child's own syscalls overwrite it. sys_exit resumes the
+# parent from this copy (#2132).
+var g_parent_frame: [16]u64
 var g_has_parent: u8 = 0           # 1 if we're in a child process
 var g_child_pid: u64 = 1           # Current PID (1 = init)
 var g_child_pml4: u64 = 0          # Child's page table (for cleanup)
@@ -1001,6 +1006,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     g_parent_ctx.user_rip = get_syscall_user_rip()
     g_parent_ctx.user_rsp = get_syscall_user_rsp()
     g_parent_ctx.user_rflags = get_syscall_user_rflags()
+    syscall_save_user_frame(@g_parent_frame[0])
     g_parent_ctx.user_pml4 = vmm_get_current_pml4()  # Save parent's page table
     g_has_parent = 1
     g_child_pid = 2  # Simple: parent=1, child=2
@@ -1100,6 +1106,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     g_parent_ctx.user_rip = get_syscall_user_rip()
     g_parent_ctx.user_rsp = get_syscall_user_rsp()
     g_parent_ctx.user_rflags = get_syscall_user_rflags()
+    syscall_save_user_frame(@g_parent_frame[0])
     g_parent_ctx.user_pml4 = vmm_get_current_pml4()
     g_has_parent = 1
     g_child_pid = 2
@@ -1278,7 +1285,9 @@ fn sys_exit_impl(code: i32) -> i64
         if code < 0
             retval = -1  # Error if child exited with negative code
 
-        jump_to_userspace_with_retval(g_parent_ctx.user_rip, g_parent_ctx.user_rsp, retval)
+        # Resume the parent with every register it had at sys_spawn, not only
+        # RIP/RSP: its syscall stub restores RSP from RBP.
+        resume_user_frame(@g_parent_frame[0], retval)
 
         # Never reached
 
