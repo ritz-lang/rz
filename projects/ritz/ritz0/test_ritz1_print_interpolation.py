@@ -288,10 +288,10 @@ pub fn main() -> i32
     _assert_parity(tmp_path, "boolslots", program, b"field=true elem=false,true\n")
 
 
-def test_unsigned_narrow_ints_print_as_ritz0_does(tmp_path):
-    """ritz0 sign-extends every integer it prints, so a u8 holding 200 prints
-    -56. That is ritz0's behaviour today, and ritz1 must print the same bytes.
-    If unsigned printing is fixed, fix both compilers and this test together."""
+def test_unsigned_narrow_ints_print_unsigned(tmp_path):
+    """An unsigned value prints unsigned: a u8 holding 200 prints 200, not
+    the -56 both compilers printed before AGAST #2128. The full matrix lives
+    in test_print_unsigned.py."""
     program = """\
 pub fn main() -> i32
     let a: u8 = 200
@@ -300,7 +300,7 @@ pub fn main() -> i32
     print("{a} {b} {c}\\n")
     return 0
 """
-    _assert_parity(tmp_path, "unsigned", program, b"-56 -1 -1\n")
+    _assert_parity(tmp_path, "unsigned", program, b"200 65535 4294967295\n")
 
 
 def test_interpolation_inside_a_generic_function(tmp_path):

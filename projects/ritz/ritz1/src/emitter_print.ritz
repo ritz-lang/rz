@@ -5,8 +5,9 @@
 # `_emit_interp_string_print` / `_emit_print_value`, and the output must be
 # byte-identical to ritz0's. Values print by type:
 #
-#   integers   decimal. ritz0 sign-extends every LLVM integer, so a u8/u16/u32
-#              is truncated to its width and sign-extended the same way.
+#   integers   decimal, signed or unsigned by the Ritz type (AGAST #2128):
+#              u8 200 prints `200`, u64::MAX `18446744073709551615`. The
+#              digits come from format_into's @__ritz_fmt_int.
 #   bool       `true` / `false`
 #   StrView    its `len` bytes from `ptr` (also the %Span$u8 a bare "..."
 #              lowers to, and a @StrView / *StrView), as ritz0 (#1641)
@@ -15,9 +16,9 @@
 #
 # Every entry point takes the output fd: print passes 1, eprint 2 (#1641).
 #
-# Integer, bool and string printing are small helper functions
-# (`@__ritz_print_*`), defined once per module that uses them by
-# emit_print_helpers, rather than ritz0's inline loops.
+# Bool and string printing are small helper functions (`@__ritz_print_*`),
+# defined once per module that uses them by emit_print_helpers, rather than
+# ritz0's inline loops.
 #
 # interp.ritz holds the placeholder rules and the expression parser.
 
@@ -215,22 +216,31 @@ fn emit_print_value(s: *EmitterState, fd: i64, lit: *Expr, e: *Expr) -> i32
         emit_print_strview(s, fd, e, sv_kind, sv_name, sv_len)
         return 1
     let ty: i32 = get_expr_type(s, e)
-    var helper: *u8 = null
-    var narrow: *u8 = null
     let is_bool: i32 = interp_is_bool(s, e)
+    if is_bool == 0
+        # Integers: decimal by Ritz signedness, digits from @__ritz_fmt_int
+        # as format_into's (AGAST #2128), then one write.
+        var n: i32 = 0
+        let p: i32 = emit_fmt_int(s, e, ty, @n)
+        if p >= 0
+            let pi: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, pi)
+            emit_str(s, c" = ptrtoint ptr ")
+            emit_reg(s, p)
+            emit_str(s, c" to i64\n")
+            emit_str(s, c"  call void @__ritz_print_bytes(i64 ")
+            emit_int(s, fd)
+            emit_str(s, c", i64 ")
+            emit_reg(s, pi)
+            emit_str(s, c", i64 ")
+            emit_reg(s, n)
+            emit_str(s, c")\n")
+            s.print_helpers_used = 1
+            return 1
+    var helper: *u8 = null
     if is_bool == 1
         helper = c"__ritz_print_bool"
-    else if ty == TYPE_I64 or ty == TYPE_U64
-        helper = c"__ritz_print_i64"
-    else if ty == TYPE_I32 or ty == TYPE_U32
-        helper = c"__ritz_print_i64"
-        narrow = c"i32"
-    else if ty == TYPE_I16 or ty == TYPE_U16
-        helper = c"__ritz_print_i64"
-        narrow = c"i16"
-    else if ty == TYPE_I8 or ty == TYPE_U8
-        helper = c"__ritz_print_i64"
-        narrow = c"i8"
     else if ty == TYPE_PTR or ty == TYPE_PTR_PTR or ty == TYPE_REF or ty == TYPE_MUT_REF
         helper = c"__ritz_print_cstr"
     if helper == null
@@ -246,27 +256,6 @@ fn emit_print_value(s: *EmitterState, fd: i64, lit: *Expr, e: *Expr) -> i32
         emit_reg(s, v)
         emit_str(s, c" to i64\n")
         v = z
-    if narrow != null
-        # ritz0 holds a narrow int in its own LLVM width and sign-extends it
-        # to print. ritz1 keeps it in i64 (zero-extended when unsigned), so
-        # rebuild ritz0's value: truncate, then sign-extend.
-        let t: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, t)
-        emit_str(s, c" = trunc i64 ")
-        emit_reg(s, v)
-        emit_str(s, c" to ")
-        emit_str(s, narrow)
-        emit_str(s, c"\n")
-        let x: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, x)
-        emit_str(s, c" = sext ")
-        emit_str(s, narrow)
-        emit_str(s, c" ")
-        emit_reg(s, t)
-        emit_str(s, c" to i64\n")
-        v = x
     emit_str(s, c"  call void @")
     emit_str(s, helper)
     emit_str(s, c"(i64 ")
@@ -383,48 +372,6 @@ pub fn emit_print_helpers(s: *EmitterState)
     if s.print_helpers_used == 0
         return
     emit_str(s, c"\n; print interpolation helpers (AGAST #1521), as ritz0's _emit_print_value\n")
-    # Decimal, written back to front into a 21-byte buffer: ritz0's
-    # _emit_print_int_inline step for step, so even i64::MIN (whose
-    # negation overflows) prints the same bytes.
-    emit_str(s, c"define internal void @__ritz_print_i64(i64 %fd, i64 %v) {\n")
-    emit_str(s, c"entry:\n")
-    emit_str(s, c"  %buf = alloca [21 x i8]\n")
-    emit_str(s, c"  %end = getelementptr [21 x i8], ptr %buf, i64 0, i64 20\n")
-    emit_str(s, c"  %neg = icmp slt i64 %v, 0\n")
-    emit_str(s, c"  %negv = sub i64 0, %v\n")
-    emit_str(s, c"  %mag = select i1 %neg, i64 %negv, i64 %v\n")
-    emit_str(s, c"  %isz = icmp eq i64 %mag, 0\n")
-    emit_str(s, c"  br i1 %isz, label %zero, label %digit\n")
-    emit_str(s, c"zero:\n")
-    emit_str(s, c"  %zp = getelementptr i8, ptr %end, i64 -1\n")
-    emit_str(s, c"  store i8 48, ptr %zp\n")
-    emit_str(s, c"  br label %sign\n")
-    emit_str(s, c"digit:\n")
-    emit_str(s, c"  %p = phi ptr [ %end, %entry ], [ %np, %digit ]\n")
-    emit_str(s, c"  %val = phi i64 [ %mag, %entry ], [ %q, %digit ]\n")
-    emit_str(s, c"  %d = srem i64 %val, 10\n")
-    emit_str(s, c"  %ch64 = add i64 %d, 48\n")
-    emit_str(s, c"  %ch = trunc i64 %ch64 to i8\n")
-    emit_str(s, c"  %np = getelementptr i8, ptr %p, i64 -1\n")
-    emit_str(s, c"  store i8 %ch, ptr %np\n")
-    emit_str(s, c"  %q = sdiv i64 %val, 10\n")
-    emit_str(s, c"  %more = icmp ne i64 %q, 0\n")
-    emit_str(s, c"  br i1 %more, label %digit, label %sign\n")
-    emit_str(s, c"sign:\n")
-    emit_str(s, c"  %p2 = phi ptr [ %zp, %zero ], [ %np, %digit ]\n")
-    emit_str(s, c"  br i1 %neg, label %minus, label %write\n")
-    emit_str(s, c"minus:\n")
-    emit_str(s, c"  %mp = getelementptr i8, ptr %p2, i64 -1\n")
-    emit_str(s, c"  store i8 45, ptr %mp\n")
-    emit_str(s, c"  br label %write\n")
-    emit_str(s, c"write:\n")
-    emit_str(s, c"  %from = phi ptr [ %p2, %sign ], [ %mp, %minus ]\n")
-    emit_str(s, c"  %fi = ptrtoint ptr %from to i64\n")
-    emit_str(s, c"  %ei = ptrtoint ptr %end to i64\n")
-    emit_str(s, c"  %len = sub i64 %ei, %fi\n")
-    emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 %fd, i64 %fi, i64 %len)\n")
-    emit_str(s, c"  ret void\n")
-    emit_str(s, c"}\n\n")
     # A StrView's bytes: one write of exactly len bytes (#1641).
     emit_str(s, c"define internal void @__ritz_print_bytes(i64 %fd, i64 %p, i64 %n) {\n")
     emit_str(s, c"entry:\n")
@@ -842,8 +789,8 @@ pub fn emit_assert_helpers(s: *EmitterState)
 # oracle.
 #
 # A value is formatted into a stack buffer by @__ritz_fmt_int /
-# @__ritz_fmt_strlen (emit_format_helpers), not print's write helpers. Unlike
-# print (AGAST #2128), an unsigned integer formats unsigned.
+# @__ritz_fmt_strlen (emit_format_helpers), not print's write helpers. print
+# shares the integer path (emit_fmt_int, AGAST #2128).
 
 # Where format_into appends: the sink pointer and the push_bytes it names.
 struct FmtSink
@@ -977,6 +924,89 @@ fn fmt_push_const(s: *EmitterState, k: *FmtSink, data: *u8, len: i32)
 # Append the formatted value of placeholder `e`: as print's table, except
 # that unsigned integers format unsigned. Returns 0 after reporting an
 # error when `e` has no formatted form.
+# Format the integer placeholder `e` (get_expr_type `ty`) into a stack
+# buffer with @__ritz_fmt_int. Returns the ptr register of its decimal
+# digits and stores their i64 length register in *out_len; -1 when `ty` is
+# not an integer type. Signedness comes from the Ritz type: an unsigned
+# value is zero-extended and divided unsigned (AGAST #2128). print, eprint
+# and format_into all format integers here.
+fn emit_fmt_int(s: *EmitterState, e: *Expr, ty: i32, out_len: *i32) -> i32
+    var narrow: *u8 = null
+    var is_int: i32 = 1
+    var signed: i32 = 1
+    if ty == TYPE_I64
+        narrow = null
+    else if ty == TYPE_U64
+        signed = 0
+    else if ty == TYPE_I32 or ty == TYPE_U32
+        narrow = c"i32"
+        signed = (ty == TYPE_I32) as i32
+    else if ty == TYPE_I16 or ty == TYPE_U16
+        narrow = c"i16"
+        signed = (ty == TYPE_I16) as i32
+    else if ty == TYPE_I8 or ty == TYPE_U8
+        narrow = c"i8"
+        signed = (ty == TYPE_I8) as i32
+    else
+        is_int = 0
+    if is_int == 0
+        return -1
+    var v: i32 = emit_expr(s, e)
+    if narrow != null
+        # ritz1 holds a narrow int in an i64; rebuild it from its width.
+        let t: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, t)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, v)
+        emit_str(s, c" to ")
+        emit_str(s, narrow)
+        emit_str(s, c"\n")
+        let x: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, x)
+        if signed == 1
+            emit_str(s, c" = sext ")
+        else
+            emit_str(s, c" = zext ")
+        emit_str(s, narrow)
+        emit_str(s, c" ")
+        emit_reg(s, t)
+        emit_str(s, c" to i64\n")
+        v = x
+    let buf: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, buf)
+    emit_str(s, c" = alloca [24 x i8]\n")
+    let start: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, start)
+    emit_str(s, c" = call i64 @__ritz_fmt_int(ptr ")
+    emit_reg(s, buf)
+    emit_str(s, c", i64 ")
+    emit_reg(s, v)
+    if signed == 1
+        emit_str(s, c", i1 1)\n")
+    else
+        emit_str(s, c", i1 0)\n")
+    let p: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, p)
+    emit_str(s, c" = getelementptr i8, ptr ")
+    emit_reg(s, buf)
+    emit_str(s, c", i64 ")
+    emit_reg(s, start)
+    emit_str(s, c"\n")
+    let n: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, n)
+    emit_str(s, c" = sub i64 20, ")
+    emit_reg(s, start)
+    emit_str(s, c"\n")
+    s.fmt_helpers_used = 1
+    *out_len = n
+    p
+
 fn fmt_push_value(s: *EmitterState, k: *FmtSink, lit: *Expr, e: *Expr) -> i32
     var sv_name: *u8 = null
     var sv_len: i32 = 0
@@ -1040,78 +1070,9 @@ fn fmt_push_value(s: *EmitterState, k: *FmtSink, lit: *Expr, e: *Expr) -> i32
         fmt_push(s, k, p, n, 0)
         return 1
 
-    var narrow: *u8 = null
-    var is_int: i32 = 1
-    var signed: i32 = 1
-    if ty == TYPE_I64
-        narrow = null
-    else if ty == TYPE_U64
-        signed = 0
-    else if ty == TYPE_I32 or ty == TYPE_U32
-        narrow = c"i32"
-        signed = (ty == TYPE_I32) as i32
-    else if ty == TYPE_I16 or ty == TYPE_U16
-        narrow = c"i16"
-        signed = (ty == TYPE_I16) as i32
-    else if ty == TYPE_I8 or ty == TYPE_U8
-        narrow = c"i8"
-        signed = (ty == TYPE_I8) as i32
-    else
-        is_int = 0
-    if is_int == 1
-        var v: i32 = emit_expr(s, e)
-        if narrow != null
-            # ritz1 holds a narrow int in an i64; rebuild it from its width.
-            let t: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, t)
-            emit_str(s, c" = trunc i64 ")
-            emit_reg(s, v)
-            emit_str(s, c" to ")
-            emit_str(s, narrow)
-            emit_str(s, c"\n")
-            let x: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, x)
-            if signed == 1
-                emit_str(s, c" = sext ")
-            else
-                emit_str(s, c" = zext ")
-            emit_str(s, narrow)
-            emit_str(s, c" ")
-            emit_reg(s, t)
-            emit_str(s, c" to i64\n")
-            v = x
-        let buf: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, buf)
-        emit_str(s, c" = alloca [24 x i8]\n")
-        let start: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, start)
-        emit_str(s, c" = call i64 @__ritz_fmt_int(ptr ")
-        emit_reg(s, buf)
-        emit_str(s, c", i64 ")
-        emit_reg(s, v)
-        if signed == 1
-            emit_str(s, c", i1 1)\n")
-        else
-            emit_str(s, c", i1 0)\n")
-        let p: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, p)
-        emit_str(s, c" = getelementptr i8, ptr ")
-        emit_reg(s, buf)
-        emit_str(s, c", i64 ")
-        emit_reg(s, start)
-        emit_str(s, c"\n")
-        let n: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, n)
-        emit_str(s, c" = sub i64 20, ")
-        emit_reg(s, start)
-        emit_str(s, c"\n")
-        s.fmt_helpers_used = 1
+    var n: i32 = 0
+    let p: i32 = emit_fmt_int(s, e, ty, @n)
+    if p >= 0
         fmt_push(s, k, p, n, 0)
         return 1
 

@@ -5342,11 +5342,11 @@ class LLVMEmitter:
     # is appended with one call to `sink.push_bytes(data: *u8, len: i64)`,
     # resolved the way a method call on the sink's type would be.
     #
-    # This is deliberately not print's _emit_print_value: print sign-extends
-    # every integer (AGAST #2128), and formats a value with write syscalls.
-    # Here a value is formatted into a stack buffer by two module-internal
+    # A value is formatted into a stack buffer by two module-internal
     # helpers, @__ritz_fmt_int and @__ritz_fmt_strlen, which ritz1 defines
-    # identically (emitter_format.ritz).
+    # identically (emitter_print.ritz). print / eprint format integers with
+    # the same @__ritz_fmt_int (_format_int_digits, AGAST #2128) and write
+    # the digits with a syscall.
 
     def _emit_format_into(self, call: rast.Call):
         span = getattr(call, "span", None)
@@ -5437,15 +5437,7 @@ class LLVMEmitter:
                                       self.builder.gep(f, [zero, zero]))
             push(ptr, self.builder.select(value, ir.Constant(self.i64, 4), ir.Constant(self.i64, 5)))
         elif isinstance(ty, ir.IntType):
-            rt = self._infer_ritz_type(expr, value)
-            unsigned = isinstance(rt, rast.NamedType) and rt.name in ('u8', 'u16', 'u32', 'u64', 'usize')
-            if ty.width < 64:
-                value = self.builder.zext(value, self.i64) if unsigned else self.builder.sext(value, self.i64)
-            buf = self.builder._entry_alloca(ir.ArrayType(self.i8, 24), "fmt.buf")
-            base = self.builder.gep(buf, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
-            start = self.builder.call(self._format_int_helper(),
-                                      [base, value, ir.Constant(self.i1, 0 if unsigned else 1)])
-            push(self.builder.gep(base, [start]), self.builder.sub(ir.Constant(self.i64, 20), start))
+            push(*self._format_int_digits(value, expr))
         elif self._is_strview_llvm_type(ty):
             push(self.builder.extract_value(value, 0), self.builder.extract_value(value, 1))
         elif isinstance(ty, ir.PointerType):
@@ -5456,6 +5448,27 @@ class LLVMEmitter:
                 f"format_into cannot format a value of type {ty}: only integers, "
                 f"bool, StrView and pointers have a formatted form",
                 getattr(expr, "span", None) or span)
+
+    def _format_int_digits(self, value: ir.Value, expr: rast.Expr):
+        """Format integer `value` (placeholder `expr`) into a stack buffer.
+
+        Returns (ptr, len) of its decimal digits. Signedness comes from the
+        Ritz type, not the LLVM type (which has none): an unsigned value is
+        zero-extended and divided unsigned, so u8 200 is `200` and u64::MAX
+        is `18446744073709551615` (AGAST #2128). print, eprint and
+        format_into all format integers here.
+        """
+        rt = self._infer_ritz_type(expr, value)
+        unsigned = isinstance(rt, rast.NamedType) and rt.name in ('u8', 'u16', 'u32', 'u64', 'usize')
+        if value.type.width < 64:
+            value = self.builder.zext(value, self.i64) if unsigned else self.builder.sext(value, self.i64)
+        elif value.type.width > 64:
+            value = self.builder.trunc(value, self.i64)
+        buf = self.builder._entry_alloca(ir.ArrayType(self.i8, 24), "fmt.buf")
+        base = self.builder.gep(buf, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
+        start = self.builder.call(self._format_int_helper(),
+                                  [base, value, ir.Constant(self.i1, 0 if unsigned else 1)])
+        return self.builder.gep(base, [start]), self.builder.sub(ir.Constant(self.i64, 20), start)
 
     def _format_int_helper(self) -> ir.Function:
         """@__ritz_fmt_int(buf, v, signed) -> start.
@@ -5574,12 +5587,10 @@ class LLVMEmitter:
             value = self.builder.load(value)
             ty = value.type
 
-        # Integer types - print using inline itoa + write
+        # Integers: decimal by Ritz signedness, via @__ritz_fmt_int (#2128).
         if ty in (self.i8, self.i16, self.i32, self.i64):
-            # Extend to i64 if needed
-            if ty != self.i64:
-                value = self.builder.sext(value, self.i64)
-            self._emit_print_int_inline(value, fd)
+            ptr, length = self._format_int_digits(value, expr)
+            self._emit_write_syscall(fd_val, ptr, length)
 
         # StrView: write exactly `len` bytes from `ptr` (no strlen, so a view
         # into a longer buffer prints only its own bytes).
@@ -5604,110 +5615,11 @@ class LLVMEmitter:
 
         else:
             # For other types, try to print as integer
-            if hasattr(ty, 'width'):
-                value = self.builder.zext(value, self.i64) if ty.width < 64 else value
-                self._emit_print_int_inline(value, fd)
+            if isinstance(ty, ir.IntType):
+                ptr, length = self._format_int_digits(value, expr)
+                self._emit_write_syscall(fd_val, ptr, length)
             else:
                 raise ValueError(f"Cannot print value of type {ty}")
-
-    def _emit_print_int_inline(self, value: ir.Value, fd: int = 1):
-        """Inline integer printing using itoa and write syscall.
-
-        Algorithm: Extract digits in reverse order, store in buffer from end,
-        then write the filled portion of the buffer.
-        """
-        # Allocate buffer at end of 21-byte array and work backwards
-        buf = self.builder.alloca(ir.ArrayType(self.i8, 21))
-        buf_start = self.builder.gep(buf, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
-        buf_end = self.builder.gep(buf, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 20)])
-
-        # Working pointer (starts at end, moves backwards)
-        ptr_ptr = self.builder.alloca(self.i8.as_pointer())
-        self.builder.store(buf_end, ptr_ptr)
-
-        val_ptr = self.builder.alloca(self.i64)
-        self.builder.store(value, val_ptr)
-
-        # Check if negative
-        is_neg = self.builder.icmp_signed('<', value, ir.Constant(self.i64, 0))
-        neg_block = self.current_fn.append_basic_block("print_int.neg")
-        check_zero = self.current_fn.append_basic_block("print_int.check_zero")
-        self.builder.cbranch(is_neg, neg_block, check_zero)
-
-        # Negative: negate value (we'll add '-' at the end)
-        self.builder.position_at_end(neg_block)
-        neg_val = self.builder.sub(ir.Constant(self.i64, 0), self.builder.load(val_ptr))
-        self.builder.store(neg_val, val_ptr)
-        self.builder.branch(check_zero)
-
-        # Check for zero special case
-        self.builder.position_at_end(check_zero)
-        curr_val = self.builder.load(val_ptr)
-        is_zero_val = self.builder.icmp_signed('==', curr_val, ir.Constant(self.i64, 0))
-        zero_block = self.current_fn.append_basic_block("print_int.zero")
-        digit_loop = self.current_fn.append_basic_block("print_int.digits")
-        self.builder.cbranch(is_zero_val, zero_block, digit_loop)
-
-        # Zero: just store '0'
-        self.builder.position_at_end(zero_block)
-        curr_ptr = self.builder.load(ptr_ptr)
-        new_ptr = self.builder.gep(curr_ptr, [ir.Constant(self.i64, -1)])
-        self.builder.store(ir.Constant(self.i8, ord('0')), new_ptr)
-        self.builder.store(new_ptr, ptr_ptr)
-        write_block = self.current_fn.append_basic_block("print_int.write")
-        self.builder.branch(write_block)
-
-        # Extract digits in reverse
-        self.builder.position_at_end(digit_loop)
-        val = self.builder.load(val_ptr)
-        val_done = self.builder.icmp_signed('==', val, ir.Constant(self.i64, 0))
-        digit_done = self.current_fn.append_basic_block("print_int.digit_done")
-        digit_body = self.current_fn.append_basic_block("print_int.digit_body")
-        self.builder.cbranch(val_done, digit_done, digit_body)
-
-        # Store one digit
-        self.builder.position_at_end(digit_body)
-        digit = self.builder.srem(self.builder.load(val_ptr), ir.Constant(self.i64, 10))
-        char_val = self.builder.add(digit, ir.Constant(self.i64, ord('0')))
-        char_byte = self.builder.trunc(char_val, self.i8)
-
-        curr_ptr2 = self.builder.load(ptr_ptr)
-        new_ptr2 = self.builder.gep(curr_ptr2, [ir.Constant(self.i64, -1)])
-        self.builder.store(char_byte, new_ptr2)
-        self.builder.store(new_ptr2, ptr_ptr)
-
-        new_val = self.builder.sdiv(self.builder.load(val_ptr), ir.Constant(self.i64, 10))
-        self.builder.store(new_val, val_ptr)
-        self.builder.branch(digit_loop)
-
-        # Add minus sign if negative
-        self.builder.position_at_end(digit_done)
-        add_minus = self.current_fn.append_basic_block("print_int.minus")
-        skip_minus = self.current_fn.append_basic_block("print_int.skip_minus")
-        self.builder.cbranch(is_neg, add_minus, skip_minus)
-
-        self.builder.position_at_end(add_minus)
-        curr_ptr3 = self.builder.load(ptr_ptr)
-        new_ptr3 = self.builder.gep(curr_ptr3, [ir.Constant(self.i64, -1)])
-        self.builder.store(ir.Constant(self.i8, ord('-')), new_ptr3)
-        self.builder.store(new_ptr3, ptr_ptr)
-        self.builder.branch(skip_minus)
-
-        self.builder.position_at_end(skip_minus)
-        self.builder.branch(write_block)
-
-        # Write the result
-        self.builder.position_at_end(write_block)
-        final_ptr = self.builder.load(ptr_ptr)
-        # Length = buf_end - final_ptr
-        ptr_int = self.builder.ptrtoint(final_ptr, self.i64)
-        end_int = self.builder.ptrtoint(buf_end, self.i64)
-        length = self.builder.sub(end_int, ptr_int)
-        self._emit_write_syscall(ir.Constant(self.i64, fd), final_ptr, length)
-
-        done_block = self.current_fn.append_basic_block("print_int.done")
-        self.builder.branch(done_block)
-        self.builder.position_at_end(done_block)
 
     def _emit_write_str(self, ptr: ir.Value, fd: int = 1):
         """Write a null-terminated string to `fd` using strlen + write."""

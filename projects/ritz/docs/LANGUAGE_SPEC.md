@@ -277,7 +277,8 @@ What a placeholder prints depends on the value's type:
 
 | Type | Prints |
 |------|--------|
-| integers | decimal |
+| signed integers (`i8` … `i64`) | decimal, with a `-` when negative |
+| unsigned integers (`u8` … `u64`) | unsigned decimal: never a `-` |
 | `bool` | `true` or `false` |
 | `StrView`, `@StrView`, `*StrView` | exactly `len` bytes from `ptr` (no NUL needed, none past `len`) |
 | other pointers (`*u8`, ...) | the NUL-terminated bytes they point at |
@@ -286,6 +287,20 @@ A `String` prints through its view: `print("s = {string_as_view(@s)}\n")`
 (`ritzlib.string`). Every other type, including floats and other structs, is a
 compile error. ritz0 and ritz1 follow the same rules and print the same bytes
 (AGAST #1521, #1641).
+
+Signedness comes from the value's Ritz type, wherever the value comes from: a
+local, a field, a call result or an `as` cast (AGAST #2128).
+
+```ritz
+fn top() -> u64
+    return 18446744073709551615
+
+fn main() -> i32
+    let a: u8 = 200
+    let n: i32 = -1
+    print("{a} {n} {n as u32} {top()}\n")  # 200 -1 4294967295 18446744073709551615
+    return 0
+```
 
 #### Formatting into a buffer: `format_into`
 
@@ -353,10 +368,9 @@ evaluated left to right, each once. `format_into` only appends and never
 clears the buffer, and it produces no value. `push_bytes`'s result is
 discarded, as `print` discards `write`'s.
 
-A placeholder formats exactly as `print` prints it (the table above), with
-one difference: an unsigned integer formats as unsigned, so a `u64` holding
-2^64 - 1 appends `18446744073709551615`. (`print` still sign-extends,
-AGAST #2128.)
+A placeholder formats exactly as `print` prints it (the table above), so a
+`u64` holding 2^64 - 1 appends `18446744073709551615`. Both use the same
+integer formatter.
 
 These are compile errors:
 
