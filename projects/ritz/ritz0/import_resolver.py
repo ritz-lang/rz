@@ -1402,6 +1402,19 @@ class ImportResolver:
             return all(self._exprs_equal(ae, be) for ae, be in zip(a.elements, b.elements))
         if isinstance(a, rast.ArrayFill):
             return self._exprs_equal(a.value, b.value) and self._exprs_equal(a.count, b.count)
+        # Compound constant expressions (#2112): `-1`, `!0xF0`, `A | B`,
+        # `-1 as i64`. Two definitions are the same iff they are structurally
+        # identical; an Ident compares by name because both definitions
+        # resolve in the same merged constant namespace.
+        if isinstance(a, rast.UnaryOp):
+            return a.op == b.op and self._exprs_equal(a.operand, b.operand)
+        if isinstance(a, rast.BinOp):
+            return (a.op == b.op and self._exprs_equal(a.left, b.left)
+                    and self._exprs_equal(a.right, b.right))
+        if isinstance(a, rast.Ident):
+            return a.name == b.name
+        if isinstance(a, rast.Cast):
+            return self._exprs_equal(a.expr, b.expr) and self._types_equal(a.target, b.target)
         # For other expression types, conservatively return False
         return False
 
