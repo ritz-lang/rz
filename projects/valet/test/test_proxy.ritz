@@ -1,0 +1,112 @@
+# test/test_proxy.ritz - zeus-proxy sizing helpers (AGAST #2104)
+#
+# A proxied response is copied out of the worker's per-slot arena.  The
+# response slot's offsets come from another process, so valet must check
+# them against the slot's bounds before touching the bytes, and must size
+# its send buffer from them instead of assuming 8 KB.
+#
+# A request whose body did not arrive in the first recv must be read until
+# headers_end + Content-Length bytes are in hand; request_total_len says how
+# many bytes that is.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+import lib.request
+import lib.proxy
+
+
+# ----------------------------------------------------------------------------
+# proxy_response_bytes(slot_start, slot_end, h_off, h_len, b_off, b_len)
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_proxy_bytes_small_response() -> i32
+    if proxy_response_bytes(4096, 8192, 4096, 100, 4200, 50) != 150
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_bytes_response_bigger_than_write_buf() -> i32
+    # A max-size nexus page: 49 KB body in a 128 KiB slot.
+    let total: i64 = proxy_response_bytes(0, 131072, 0, 200, 256, 49900)
+    if total != 50100
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_bytes_empty_body_and_headers() -> i32
+    # Bare 500 from nexus: no headers, no body; offsets are 0 and ignored.
+    if proxy_response_bytes(65536, 131072, 0, 0, 0, 0) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_bytes_body_past_slot_end() -> i32
+    if proxy_response_bytes(0, 4096, 0, 100, 128, 4000) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_bytes_body_before_slot_start() -> i32
+    if proxy_response_bytes(8192, 16384, 8192, 10, 4096, 10) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_bytes_headers_past_slot_end() -> i32
+    if proxy_response_bytes(0, 4096, 4000, 200, 0, 0) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_bytes_negative_length() -> i32
+    if proxy_response_bytes(0, 4096, 0, -1, 0, 0) != -1
+        return 1
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# request_total_len(buf, len)
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_total_len_get_without_body() -> i32
+    let r = c"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    let n: i32 = strlen(r) as i32
+    if request_total_len(r, n) != n as i64
+        return 1
+    return 0
+
+[[test]]
+fn test_total_len_post_body_not_yet_received() -> i32
+    # Headers are 46 bytes; Content-Length says 20000 more follow.
+    let r = c"POST /wiki HTTP/1.1\r\nContent-Length: 20000\r\n\r\nslug="
+    let n: i32 = strlen(r) as i32
+    if request_total_len(r, n) != 46 + 20000
+        return 1
+    return 0
+
+[[test]]
+fn test_total_len_headers_incomplete() -> i32
+    let r = c"POST /wiki HTTP/1.1\r\nContent-Len"
+    if request_total_len(r, strlen(r) as i32) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_total_len_negative_content_length() -> i32
+    # 3000000000 overflows the parser's i32; never treat it as a size.
+    let r = c"POST / HTTP/1.1\r\nContent-Length: 3000000000\r\n\r\n"
+    if request_total_len(r, strlen(r) as i32) >= 0
+        return 1
+    return 0
+
+[[test]]
+fn test_total_len_wrapping_content_length() -> i32
+    # 5000000000 wraps an i32 to a positive 705032704; still not a size.
+    let r = c"POST / HTTP/1.1\r\nContent-Length: 5000000000\r\n\r\n"
+    if request_total_len(r, strlen(r) as i32) >= 0
+        return 1
+    return 0

@@ -830,17 +830,21 @@ fn get_proxy_continuation() -> fn(*Task) -> i32
     return g_proxy_continuation_ptr as fn(*Task) -> i32
 
 
-# Find the slot index of a task within its pool.  O(MAX_TASKS) — sub-µs.
+# Find the slot index of a task within its pool.  O(1): tasks live in a
+# fixed array, so the index is the byte offset over the element stride.
 pub fn valet_task_slot_idx(task: *Task) -> i32
     let pool: *TaskPool = task.user_data as *TaskPool
     if pool == null
         return -1
-    var i: i32 = 0
-    while i < 256
-        if @pool.tasks[i] == task
-            return i
-        i = i + 1
-    return -1
+    let base: i64 = @pool.tasks[0] as i64
+    let stride: i64 = (@pool.tasks[1] as i64) - base
+    let off: i64 = (task as i64) - base
+    if stride <= 0 or off < 0 or off % stride != 0
+        return -1
+    let idx: i64 = off / stride
+    if idx >= 256
+        return -1
+    return idx as i32
 
 
 # Get the proxy state for a task.  Returns null if the slot can't be
@@ -882,6 +886,128 @@ pub fn valet_proxy_state_clear(task: *Task)
 pub fn valet_proxy_arm_yield(task: *Task, _micros: i64) -> i32
     let pool: *TaskPool = task.user_data as *TaskPool
     return task_submit_nop(pool, task)
+
+
+# ============================================================================
+# Large request / response buffers (AGAST #2104)
+# ============================================================================
+#
+# ritzlib's Task carries fixed 8 KB read_buf / write_buf.  A request whose
+# body does not arrive in one 8 KB recv, or a response bigger than 8 KB
+# (a proxied nexus page reaches ~50 KB), goes through a per-task heap
+# buffer instead.  The buffer is mmap'd for the one request or response
+# and unmapped as soon as it is done, so idle connections hold nothing.
+#
+# g_bigbuf_active counts slots with mode != BIGBUF_NONE, so the common
+# small-request path skips the side-table lookup entirely.
+
+const BIGBUF_NONE: i32 = 0
+const BIGBUF_RECV: i32 = 1     # accumulating a request of `len` / `need` bytes
+const BIGBUF_PARSED: i32 = 2   # request complete; handler is reading it
+const BIGBUF_SEND: i32 = 3     # sending `len` bytes, `pos` already sent
+
+# Hard ceiling on one buffered request or response, applied even when
+# max_request_size is 0 (unlimited).
+pub const VALET_MAX_BUFFERED: i64 = 16777216
+
+pub struct BigBuf
+    ptr: *u8
+    cap: i64
+    len: i64
+    pos: i64
+    need: i64
+    mode: i32
+    _pad: i32
+
+var g_bigbufs: [256]BigBuf
+var g_bigbuf_active: i32 = 0
+
+
+fn bigbuf_for(task: *Task) -> *BigBuf
+    let idx: i32 = valet_task_slot_idx(task)
+    if idx < 0
+        return null
+    return @g_bigbufs[idx]
+
+
+# Release a task's buffer (if any) and unmap it.
+fn bigbuf_release(b: *BigBuf)
+    if b.mode != BIGBUF_NONE
+        g_bigbuf_active = g_bigbuf_active - 1
+    if b.ptr != null and b.cap > 0
+        sys_munmap(b.ptr, b.cap)
+    b.ptr = null
+    b.cap = 0
+    b.len = 0
+    b.pos = 0
+    b.need = 0
+    b.mode = BIGBUF_NONE
+
+
+fn bigbuf_release_task(task: *Task)
+    if g_bigbuf_active == 0
+        return
+    let b: *BigBuf = bigbuf_for(task)
+    if b != null
+        bigbuf_release(b)
+
+
+# Map a fresh `size`-byte buffer for `task` in `mode`.  Any previous buffer
+# is released first.  Returns null on failure or if size is out of range.
+fn bigbuf_acquire(task: *Task, size: i64, mode: i32) -> *BigBuf
+    if size <= 0 or size > VALET_MAX_BUFFERED
+        return null
+    let b: *BigBuf = bigbuf_for(task)
+    if b == null
+        return null
+    bigbuf_release(b)
+    let cap: i64 = ((size + 4095) / 4096) * 4096
+    let mem: *u8 = sys_mmap(0, cap, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+    if mem == (-1) as *u8
+        return null
+    b.ptr = mem
+    b.cap = cap
+    b.len = 0
+    b.pos = 0
+    b.need = size
+    b.mode = mode
+    g_bigbuf_active = g_bigbuf_active + 1
+    return b
+
+
+# Get a buffer to build a `len`-byte response in: task.write_buf when it
+# fits, a heap buffer otherwise.  Returns null if `len` can't be buffered.
+# Pass the result to valet_task_send_response.
+pub fn valet_response_buffer(task: *Task, len: i64) -> *u8
+    if len <= 8192
+        return @task.write_buf[0]
+    let b: *BigBuf = bigbuf_acquire(task, len, BIGBUF_SEND)
+    if b == null
+        return null
+    return b.ptr
+
+
+# Send `len` bytes built in a buffer from valet_response_buffer and move the
+# connection to CONN_STATE_SEND.  Large sends are resumed across short
+# writes in the SEND state.  Returns the handler convention (-1 pending,
+# 1 close).
+pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
+    task.handler_state = CONN_STATE_SEND
+    if buf == @task.write_buf[0]
+        task.write_len = len as i32
+        task.write_pos = 0
+        if valet_task_send(task, len as i32) < 0
+            return 1
+        return -1
+    let b: *BigBuf = bigbuf_for(task)
+    if b == null or b.mode != BIGBUF_SEND or b.ptr != buf
+        return 1
+    b.len = len
+    b.pos = 0
+    if task_send_buf(task, b.ptr, len as i32) < 0
+        bigbuf_release(b)
+        return 1
+    return -1
 
 
 # Check if path matches static prefix and serve file if so
@@ -986,10 +1112,17 @@ pub fn valet_send_413(task: *Task) -> i32
 
 
 pub fn valet_handle_connection(task: *Task) -> i32
+    # The request being handled: task.read_buf, or a heap buffer when the
+    # request outgrew it (AGAST #2104).
+    var req_buf: *u8 = @task.read_buf[0]
+    var req_len: i32 = 0
+
     # State: RECV - read request data
     if task.handler_state == CONN_STATE_RECV
         if task.io_result == TASK_IO_FRESH
-            # Fresh task — never submitted recv. Submit the initial recv now.
+            # Fresh task — never submitted recv.  A previous connection in
+            # this pool slot may have died mid-request; drop its buffer.
+            bigbuf_release_task(task)
             let ret = task_recv(task)
             if ret < 0
                 return 1
@@ -997,25 +1130,71 @@ pub fn valet_handle_connection(task: *Task) -> i32
 
         if task.io_result <= 0
             # EOF (0) or error (<0) — connection done.
+            bigbuf_release_task(task)
             return 0
 
-        task.read_len = task.io_result
-
-        # Check request size limit
         let app: *Valet = get_g_app()
-        if app.max_request_size > 0 && task.read_len > app.max_request_size
-            log_warn(c"Request too large, closing connection")
-            return valet_send_413(task)
+        var big: *BigBuf = null
+        if g_bigbuf_active > 0
+            big = bigbuf_for(task)
+            if big != null and big.mode != BIGBUF_RECV
+                # A finished request's buffer (e.g. after a static
+                # response) — done with it.
+                if big.mode == BIGBUF_PARSED
+                    bigbuf_release(big)
+                big = null
+
+        if big != null
+            # Continuing a request that outgrew read_buf.
+            big.len = big.len + task.io_result as i64
+            if big.len < big.need
+                if task_recv_buf(task, big.ptr + big.len, (big.need - big.len) as i32) < 0
+                    bigbuf_release(big)
+                    return 1
+                return -1
+            big.mode = BIGBUF_PARSED
+            req_buf = big.ptr
+            req_len = big.len as i32
+        else
+            task.read_len = task.io_result
+            req_len = task.read_len
+
+            # Check request size limit
+            if app.max_request_size > 0 && task.read_len > app.max_request_size
+                log_warn(c"Request too large, closing connection")
+                return valet_send_413(task)
+
+            # Body still on the wire?  Keep reading into a heap buffer
+            # until headers_end + Content-Length bytes are in hand.
+            let total: i64 = request_total_len(@task.read_buf[0], task.read_len)
+            if total == -2
+                return valet_send_413(task)
+            if total > task.read_len as i64
+                if app.max_request_size > 0 && total > app.max_request_size as i64
+                    log_warn(c"Request too large, closing connection")
+                    return valet_send_413(task)
+                let nb: *BigBuf = bigbuf_acquire(task, total, BIGBUF_RECV)
+                if nb == null
+                    return valet_send_413(task)
+                memcpy(nb.ptr, @task.read_buf[0], task.read_len as i64)
+                nb.len = task.read_len as i64
+                if task_recv_buf(task, nb.ptr + nb.len, (nb.need - nb.len) as i32) < 0
+                    bigbuf_release(nb)
+                    return 1
+                return -1
 
         task.handler_state = CONN_STATE_PARSE
 
     # State: PARSE - parse request, route, build response
     if task.handler_state == CONN_STATE_PARSE
+        if req_len == 0
+            req_len = task.read_len
         var req: Request
         request_init(@req)
 
-        let parsed = request_parse(@req, @task.read_buf[0], task.read_len)
+        let parsed = request_parse(@req, req_buf, req_len)
         if parsed < 0
+            bigbuf_release_task(task)
             return 0
 
         task.request_count += 1
@@ -1046,8 +1225,8 @@ pub fn valet_handle_connection(task: *Task) -> i32
         handler_ctx.route_result = null
         handler_ctx.path = req.path_ptr
         handler_ctx.path_len = req.path_len
-        handler_ctx.raw_buf = @task.read_buf[0]
-        handler_ctx.raw_len = task.read_len
+        handler_ctx.raw_buf = req_buf
+        handler_ctx.raw_len = req_len
         handler_ctx.task = task
         set_g_ctx(@handler_ctx)
 
@@ -1175,7 +1354,26 @@ pub fn valet_handle_connection(task: *Task) -> i32
     # State: SEND - wait for send completion
     if task.handler_state == CONN_STATE_SEND
         if task.io_result < 0
+            bigbuf_release_task(task)
             return 1
+
+        # Large response (or a finished large request's buffer)?
+        if g_bigbuf_active > 0
+            let b: *BigBuf = bigbuf_for(task)
+            if b != null and b.mode == BIGBUF_SEND
+                if task.io_result == 0
+                    bigbuf_release(b)
+                    return 1
+                b.pos = b.pos + task.io_result as i64
+                if b.pos < b.len
+                    # Short send: resume from where the kernel stopped.
+                    if task_send_buf(task, b.ptr + b.pos, (b.len - b.pos) as i32) < 0
+                        bigbuf_release(b)
+                        return 1
+                    return -1
+                bigbuf_release(b)
+            else if b != null and b.mode == BIGBUF_PARSED
+                bigbuf_release(b)
 
         # Check keep-alive limit from app config
         let app: *Valet = get_g_app()

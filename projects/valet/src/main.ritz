@@ -24,6 +24,7 @@ import lib.config
 import lib.log
 import lib.router
 import lib.json_builder
+import lib.proxy { proxy_response_bytes }
 import lib.response {
     response_init,
     response_status,
@@ -320,20 +321,23 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
         *(path_dst + i) = *(path + i)
     let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_dst)
 
-    # Allocate + copy body bytes for write methods.  ctx_body returns 0 if
-    # there's nothing to forward.
+    # Copy the body (if any) straight from the request buffer into the
+    # slot arena.  The framework has already read the whole body, however
+    # large (AGAST #2104); a short body here means the client lied about
+    # Content-Length.
     var body_offset: i64 = 0
     var body_len: i32 = 0
-    var body_buf: [16384]u8
-    let copied: i32 = ctx_body(@body_buf[0], 16384)
-    if copied > 0
-        let body_dst: *u8 = data_arena_alloc(@arena, copied as i64)
+    let want: i32 = c.req.content_length
+    if want > 0
+        if c.req.headers_end < 0 or c.req.headers_end + want > c.raw_len
+            return ctx_text(400, c"incomplete request body\n")
+        let body_dst: *u8 = data_arena_alloc(@arena, want as i64)
         if body_dst == null
-            return ctx_text(503, c"zeus arena: out of space for body\n")
-        for i in 0..copied
-            *(body_dst + i) = body_buf[i]
+            g_proxy_arena_oversize = g_proxy_arena_oversize + 1
+            return ctx_text(413, c"request body too large for zeus slot\n")
+        memcpy(body_dst, c.raw_buf + c.req.headers_end, want as i64)
         body_offset = data_arena_ptr_to_offset(@arena, body_dst)
-        body_len = copied
+        body_len = want
 
     # Build + submit RequestSlot
     var req: RequestSlot
@@ -384,6 +388,21 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     return STATUS_PROXY_PENDING
 
 
+# Send a short plain-text error from the proxy continuation (status 5xx,
+# Connection: close) and move to CONN_STATE_SEND.
+fn proxy_send_error(task: *Task, status: i32, msg: *u8) -> i32
+    let msg_len: i32 = strlen(msg) as i32
+    var res: Response
+    response_init(@res, @task.write_buf[0], 8192)
+    response_status(@res, status)
+    response_header(@res, c"Content-Type", c"text/plain")
+    response_header(@res, c"Connection", c"close")
+    response_content_length(@res, msg_len as i64)
+    response_end_headers(@res)
+    response_body(@res, msg, msg_len)
+    return valet_task_send_response(task, @task.write_buf[0], res.len as i64)
+
+
 # Cooperative-yield deadline: how long to keep re-arming yields before
 # giving up with 504.  Matches the legacy sync timeout.
 const PROXY_DEADLINE_SEC: i64 = 5
@@ -399,6 +418,7 @@ var g_proxy_state_lost: i64 = 0       # st == null or in_use == 0 in continuatio
 var g_proxy_handle_null: i64 = 0
 var g_proxy_deadline_504: i64 = 0
 var g_proxy_arena_oversize: i64 = 0
+var g_proxy_bad_response: i64 = 0     # response out of slot bounds / unbufferable
 var g_proxy_total_entries: i64 = 0     # handle_zeus_proxy entries
 var g_proxy_total_submits: i64 = 0
 var g_proxy_total_completions: i64 = 0
@@ -432,6 +452,8 @@ pub fn proxy_dump_counters()
     print_int(g_proxy_deadline_504)
     prints_cstr(c" arena_oversize=")
     print_int(g_proxy_arena_oversize)
+    prints_cstr(c" bad_response=")
+    print_int(g_proxy_bad_response)
     prints_cstr(c"\n")
 
 
@@ -487,45 +509,53 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
         # Per-slot arena view to resolve the response header + body offsets.
         var arena: DataArena
         worker_handle_get_slot_arena(handle, st.claimed_slot, @arena)
-        let body_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.body_offset as i64)
-        let headers_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.headers_offset as i64)
-        let headers_len: i32 = resp.headers_len as i32
+        valet_proxy_state_clear(task)
 
         # Pass the worker's pre-baked HTTP response prefix through verbatim.
         # The worker writes the full status line + header block (terminated
-        # by \r\n\r\n) into its arena slice — see build_headers /
-        # build_redirect_headers in nexus/src/main.ritz for shape.  Valet
-        # used to ignore those bytes and reconstruct the response from
-        # `resp.status`, `resp.body_len`, plus a hardcoded Content-Type +
-        # Connection.  That dropped any worker-supplied header — most
-        # visibly Location, which silently turned 302 redirects into
-        # blank-body 302s with no follow target (browser sees no Location,
-        # stays on the POST URL, refresh recovers).  Letting the worker
-        # own the response prefix means it can also set custom headers
-        # (Cache-Control, Set-Cookie, ETag, etc.) without further
-        # extending the SHM-ring slot schema.
-        var res: Response
-        response_init(@res, @task.write_buf[0], 8192)
-        if headers_len > 0
-            response_append_bytes(@res, headers_ptr, headers_len)
-        else
-            # Defensive fallback: worker didn't populate headers (null
-            # response).  Construct a minimal response so we don't ship
-            # garbage on the wire.  Should never fire from a well-formed
-            # worker but keeps the proxy honest if something regresses.
-            response_status(@res, resp.status as i32)
-            response_header(@res, c"Content-Type", c"text/html; charset=utf-8")
-            response_content_length(@res, resp.body_len as i64)
-            response_header(@res, c"Connection", c"keep-alive")
-            response_end_headers(@res)
-        response_body(@res, body_ptr, resp.body_len as i32)
+        # by \r\n\r\n) into its arena slice — see send_raw in
+        # nexus/src/main.ritz.  Letting the worker own the prefix keeps
+        # Location (302/303), Cache-Control, Set-Cookie etc. intact.
+        #
+        # The offsets/lengths come from another process: they are checked
+        # against the slot's bounds before a byte is read, and the send
+        # buffer is sized from them — task.write_buf when it fits, a heap
+        # buffer otherwise (AGAST #2104; a fixed 8 KB buffer used to ship a
+        # truncated 200 and hang the connection).
+        let headers_len: i64 = resp.headers_len as i64
+        let body_len: i64 = resp.body_len as i64
+        let total: i64 = proxy_response_bytes(arena.offset, arena.size, resp.headers_offset as i64, headers_len, resp.body_offset as i64, body_len)
+        if total < 0
+            g_proxy_bad_response = g_proxy_bad_response + 1
+            return proxy_send_error(task, 502, c"zeus worker response out of bounds\n")
 
-        valet_proxy_state_clear(task)
-        task.write_len = res.len
-        task.write_pos = 0
-        task.handler_state = CONN_STATE_SEND
-        let ret: i32 = valet_task_send(task, res.len)
-        if ret < 0
+        # Defensive fallback: worker didn't populate headers (e.g. nexus's
+        # bare 500 when its arena is full).  Build a minimal header block.
+        var fallback: [256]u8
+        var hdr_ptr: *u8 = data_arena_offset_to_ptr(@arena, resp.headers_offset as i64)
+        var hdr_len: i64 = headers_len
+        if headers_len == 0
+            var hres: Response
+            response_init(@hres, @fallback[0], 256)
+            response_status(@hres, resp.status as i32)
+            response_header(@hres, c"Content-Type", c"text/html; charset=utf-8")
+            response_content_length(@hres, body_len)
+            response_header(@hres, c"Connection", c"keep-alive")
+            response_end_headers(@hres)
+            hdr_ptr = @fallback[0]
+            hdr_len = hres.len as i64
+
+        let out_len: i64 = hdr_len + body_len
+        let out: *u8 = valet_response_buffer(task, out_len)
+        if out == null
+            g_proxy_bad_response = g_proxy_bad_response + 1
+            return proxy_send_error(task, 502, c"zeus worker response too large\n")
+        memcpy(out, hdr_ptr, hdr_len)
+        if body_len > 0
+            memcpy(out + hdr_len, data_arena_offset_to_ptr(@arena, resp.body_offset as i64), body_len)
+
+        let ret: i32 = valet_task_send_response(task, out, out_len)
+        if ret > 0
             g_proxy_send_fail_continuation = g_proxy_send_fail_continuation + 1
             return 1
         g_proxy_total_completions = g_proxy_total_completions + 1
@@ -536,22 +566,7 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
     if now_sec >= st.deadline_sec
         g_proxy_deadline_504 = g_proxy_deadline_504 + 1
         valet_proxy_state_clear(task)
-        var res: Response
-        response_init(@res, @task.write_buf[0], 8192)
-        response_status(@res, 504)
-        response_header(@res, c"Content-Type", c"text/plain")
-        response_header(@res, c"Connection", c"close")
-        let body = c"zeus worker timeout\n"
-        response_content_length(@res, 20)
-        response_end_headers(@res)
-        response_body(@res, body, 20)
-        task.write_len = res.len
-        task.write_pos = 0
-        task.handler_state = CONN_STATE_SEND
-        let ret: i32 = valet_task_send(task, res.len)
-        if ret < 0
-            return 1
-        return -1
+        return proxy_send_error(task, 504, c"zeus worker timeout\n")
 
     # Re-arm the yield.
     st.spin_count = st.spin_count + 1
