@@ -1,0 +1,323 @@
+# test/test_tls_e2e.ritz - cryptosec TLS 1.3 client <-> valet TLS server (#1862)
+#
+# Both ends run in-process; records are handed across in memory, so this is a
+# loopback of the exact bytes each side would write to a socket. Until #1862
+# no session could complete: every record-decrypt caller passed `buf + 5`
+# (the header is the AEAD's additional data) and every encrypt caller wrapped
+# tls13_record_encrypt's already-framed record in a second header.
+#
+# The client trusts the server only through an explicit pinned leaf
+# certificate; there is no "skip verification" mode to fall back on.
+#
+# Fixtures: self-signed P-256 certificates generated for this test
+# (openssl req -x509 -sha256 -days 36500). They are test-only trust anchors
+# and their private keys protect nothing.
+#   CERT_VALET:  CN=valet.test, key KEY_VALET
+#   CERT_OTHER:  CN=other.test, same key KEY_VALET
+#   KEY_WRONG:   an unrelated P-256 key
+
+import ritzlib.sys
+
+import lib.tls
+import cryptosec.mem
+import cryptosec.tls13_client
+import cryptosec.tls13_handshake
+import cryptosec.tls13_record
+
+fn key_valet() -> *u8
+    return c"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNT9qgcppZH3mMfCD\nItz3rs0NZXlB9L0Ov5BudymuXlKhRANCAASzc1xpUOiT4bf/6U0rfJm8oWRsyeKg\nCPOV9iHemcqrVinp+stzc0kkTBROPewRlBOA8VKO6sWetFYJ7HOZfwvT\n-----END PRIVATE KEY-----\n"
+
+fn cert_valet() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBgDCCASegAwIBAgIUYBeO4yVcgjolzrTUz2UyR0Bnfo0wCgYIKoZIzj0EAwIw\nFTETMBEGA1UEAwwKdmFsZXQudGVzdDAgFw0yNjExMDMwMjUzMTdaGA8yMTI2MTAx\nMDAyNTMxN1owFTETMBEGA1UEAwwKdmFsZXQudGVzdDBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABLNzXGlQ6JPht//pTSt8mbyhZGzJ4qAI85X2Id6ZyqtWKen6y3Nz\nSSRMFE497BGUE4DxUo7qxZ60Vgnsc5l/C9OjUzBRMB0GA1UdDgQWBBQ7XjL/wCDb\ncJvK9bLdWlANxl/RBTAfBgNVHSMEGDAWgBQ7XjL/wCDbcJvK9bLdWlANxl/RBTAP\nBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIAVKgSxo/pN0WRA3ohjS\nNzCrlh935KNJdvAP0AcXtNCXAiAiusA4Y6DcfcrC/mkmTWT0bqcbLZPI4a3Jcr7L\nBWDqsw==\n-----END CERTIFICATE-----\n"
+
+fn key_wrong() -> *u8
+    return c"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgeKHmXU9kLuO7j0sN\nVyigxjrWp/aZH1VrSNAQzvHm4MyhRANCAARqBp311KuVw/iR1Oz9ehn2CHy74E4u\nfr9CBThIvo6TJnzPm2SX7k2ttYFGoZx/4waFc9h5vuvUlE/5m8G83bMC\n-----END PRIVATE KEY-----\n"
+
+fn cert_other() -> *u8
+    return c"-----BEGIN CERTIFICATE-----\nMIIBgTCCASegAwIBAgIUJ1tZRBA9YAZIfpUS/ceuYaKG1eUwCgYIKoZIzj0EAwIw\nFTETMBEGA1UEAwwKb3RoZXIudGVzdDAgFw0yNjExMDMwMjUzMTdaGA8yMTI2MTAx\nMDAyNTMxN1owFTETMBEGA1UEAwwKb3RoZXIudGVzdDBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABLNzXGlQ6JPht//pTSt8mbyhZGzJ4qAI85X2Id6ZyqtWKen6y3Nz\nSSRMFE497BGUE4DxUo7qxZ60Vgnsc5l/C9OjUzBRMB0GA1UdDgQWBBQ7XjL/wCDb\ncJvK9bLdWlANxl/RBTAfBgNVHSMEGDAWgBQ7XjL/wCDbcJvK9bLdWlANxl/RBTAP\nBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIEsjF0hqkxhAywesKhxE\nr5e3tTWZs3wZ5fjH6lLCQ6KrAiEAtUcQU9OIHeAd52c61wIAcDSmg7ClJg5RTKk1\n39pDnU4=\n-----END CERTIFICATE-----\n"
+
+fn cstr_len_e2e(s: *u8) -> i64
+    var n: i64 = 0
+    while s[n] != 0
+        n = n + 1
+    return n
+
+# Server config from PEM cert + PKCS#8 P-256 key. 0 on success.
+fn server_setup(cfg: *TlsServerConfig, der: *u8, cert: *u8, key: *u8) -> i32
+    tls_server_config_init(cfg)
+    if tls_server_config_load_cert(cfg, cert, cstr_len_e2e(cert), der, 8192) != 0
+        return 1
+    if tls_server_config_load_ecdsa_p256_key(cfg, key, cstr_len_e2e(key)) != 0
+        return 2
+    return 0
+
+# Client config for `host`, pinning the first certificate of `pin`'s chain.
+fn client_setup(cfg: *TlsConfig, host: *u8, pin: *TlsServerConfig) -> i32
+    tls_config_init(cfg)
+    tls_config_set_hostname(cfg, host, cstr_len_e2e(host) as i32)
+    return tls_config_pin_cert(cfg, pin.cert_chain + pin.cert_offsets[0], pin.cert_lens[0])
+
+# Run the full handshake. Returns 0 when both sides report a completed
+# handshake; otherwise a step code (the client's error is in tls_client_error).
+fn handshake(client: *TlsClient, server: *TlsServer) -> i32
+    var c_out: [4096]u8
+    var s_out: [16384]u8
+    var s_len: i64 = 0
+    var c_len: i64 = 0
+
+    let ch_len: i64 = tls_client_start(client, @c_out[0], 4096)
+    if ch_len <= 0
+        return 1
+    if tls_server_process(server, @c_out[0], ch_len, @s_out[0], 16384, @s_len) != TLS_RESULT_HAVE_OUTPUT
+        return 2
+    if tls_client_process(client, @s_out[0], s_len, @c_out[0], 4096, @c_len) != TLS_RESULT_HAVE_OUTPUT
+        return 3
+    if tls_client_is_connected(client) != 1
+        return 4
+    if tls_server_process(server, @c_out[0], c_len, @s_out[0], 16384, @s_len) != TLS_RESULT_COMPLETE
+        return 5
+    if tls_server_is_connected(server) != 1
+        return 6
+    return 0
+
+# Client -> server: one application-data record, checked byte for byte.
+fn send_to_server(client: *TlsClient, server: *TlsServer, msg: *u8) -> i32
+    let n: i64 = cstr_len_e2e(msg)
+    var rec: [1024]u8
+    let rec_len: i64 = tls_client_write(client, msg, n, @rec[0], 1024)
+    if rec_len != 5 + n + 1 + 16
+        return 1  # one header, inner type byte, GCM tag
+    var got: [1024]u8
+    if tls_server_read(server, @rec[0], rec_len, @got[0], 1024) != n
+        return 2
+    if mem_eq(@got[0], msg, n as u64) != 1
+        return 3
+    return 0
+
+fn send_to_client(server: *TlsServer, client: *TlsClient, msg: *u8) -> i32
+    let n: i64 = cstr_len_e2e(msg)
+    var rec: [1024]u8
+    let rec_len: i64 = tls_server_write(server, msg, n, @rec[0], 1024)
+    if rec_len != 5 + n + 1 + 16
+        return 1
+    var got: [1024]u8
+    if tls_client_read(client, @rec[0], rec_len, @got[0], 1024) != n
+        return 2
+    if mem_eq(@got[0], msg, n as u64) != 1
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_handshake_and_data_both_ways() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+
+    let hs: i32 = handshake(@client, @server)
+    if hs != 0
+        return 10 + hs
+
+    # Two records each way: sequence numbers must advance in step.
+    if send_to_server(@client, @server, c"GET / HTTP/1.1\r\nHost: valet.test\r\n\r\n") != 0
+        return 20
+    if send_to_client(@server, @client, c"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi") != 0
+        return 21
+    if send_to_server(@client, @server, c"second request") != 0
+        return 22
+    if send_to_client(@server, @client, c"second response") != 0
+        return 23
+
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+[[test]]
+fn test_e2e_tampered_record_rejected() -> i32
+    # The header is authenticated: flipping its length-independent version
+    # byte, or a ciphertext byte, must fail decryption.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    if handshake(@client, @server) != 0
+        return 3
+
+    var rec: [256]u8
+    let rec_len: i64 = tls_client_write(@client, c"payload", 7, @rec[0], 256)
+    if rec_len <= 0
+        return 4
+    rec[8] = rec[8] ^ 0x01
+    var got: [256]u8
+    if tls_server_read(@server, @rec[0], rec_len, @got[0], 256) >= 0
+        return 5
+    return 0
+
+# Client error after handshaking against `scfg` with hostname `host`,
+# trusting `pin`. 0 means the client accepted the server.
+fn client_verdict(scfg: *TlsServerConfig, host: *u8, pin: *TlsServerConfig) -> i32
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, host, pin) != 0
+        return 100
+    var server: TlsServer
+    tls_server_init(@server, scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    let hs: i32 = handshake(@client, @server)
+    var err: i32 = tls_client_error(@client)
+    if hs == 0
+        err = 0
+    else if hs != 3
+        err = 200 + hs  # failed somewhere other than the client's verdict
+    else if tls_client_state(@client) != TLS_STATE_ERROR
+        err = 300
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return err
+
+[[test]]
+fn test_e2e_client_rejects_wrong_hostname() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    if client_verdict(@scfg, c"valet.test", @scfg) != 0
+        return 2  # control
+    if client_verdict(@scfg, c"evil.test", @scfg) != TLS_ERR_CERTIFICATE_INVALID
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_client_rejects_unpinned_certificate() -> i32
+    # The server presents CERT_VALET; the client trusts only CERT_OTHER (same
+    # key, so the CertificateVerify alone would still verify).
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var der2: [8192]u8
+    var other: TlsServerConfig
+    if server_setup(@other, @der2[0], cert_other(), key_valet()) != 0
+        return 2
+    if client_verdict(@scfg, c"valet.test", @other) != TLS_ERR_CERTIFICATE_INVALID
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_client_without_trust_anchor_refuses() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    tls_config_init(@ccfg)
+    tls_config_set_hostname(@ccfg, c"valet.test", 10)
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    if handshake(@client, @server) != 3
+        return 2
+    if tls_client_error(@client) != TLS_ERR_CERTIFICATE_INVALID
+        return 3
+    return 0
+
+[[test]]
+fn test_e2e_client_rejects_bad_certificate_verify() -> i32
+    # The server presents the pinned, correctly named certificate but signs
+    # with a key it does not hold the certificate for: an impersonator.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_wrong()) != 0
+        return 1
+    if client_verdict(@scfg, c"valet.test", @scfg) != TLS_ERR_VERIFY_FAILED
+        return 2
+    return 0
+
+[[test]]
+fn test_e2e_client_rejects_flight_without_certificate() -> i32
+    # A server that knows the handshake keys sends ServerHello,
+    # EncryptedExtensions and a correct Finished, skipping Certificate and
+    # CertificateVerify. The client used to accept any message order.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+
+    var ch: [4096]u8
+    let ch_len: i64 = tls_client_start(@client, @ch[0], 4096)
+    var real: [16384]u8
+    var real_len: i64 = 0
+    if tls_server_process(@server, @ch[0], ch_len, @real[0], 16384, @real_len) != TLS_RESULT_HAVE_OUTPUT
+        return 3
+
+    # Keep the real ServerHello record; replace the encrypted flight.
+    let sh_rec: i64 = 5 + (((real[3] as i64) << 8) | (real[4] as i64))
+    var t: Transcript
+    transcript_init(@t)
+    transcript_update(@t, @ch[5], ch_len - 5)
+    transcript_update(@t, @real[5], sh_rec - 5)
+    var flight: [64]u8
+    let ee_len: i64 = serialize_encrypted_extensions(@flight[0], 64)
+    transcript_update(@t, @flight[0], ee_len)
+    var th: [32]u8
+    transcript_hash(@t, @th[0])
+    var vd: [32]u8
+    finished_compute(@server.key_schedule.server_handshake_traffic_secret[0], @th[0], @vd[0])
+    let fin_len: i64 = finished_serialize(@vd[0], @flight[ee_len])
+
+    var ws: TlsRecordState
+    tls_record_state_init(@ws)
+    tls_record_state_set_keys(@ws, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+    let enc: i32 = tls_record_state_server_encrypt(@ws, @flight[0], (ee_len + fin_len) as i32, 22, @real[sh_rec], 1024)
+    if enc <= 0
+        return 4
+
+    var c_out: [4096]u8
+    var c_len: i64 = 0
+    if tls_client_process(@client, @real[0], sh_rec + enc as i64, @c_out[0], 4096, @c_len) != TLS_RESULT_ERROR
+        return 5
+    if tls_client_error(@client) != TLS_ERR_UNEXPECTED_MESSAGE
+        return 6
+    if tls_client_is_connected(@client) != 0
+        return 7
+    return 0
+
+[[test]]
+fn test_e2e_client_rejects_same_length_different_pin() -> i32
+    # The pin is compared byte for byte, not just by length: trust a copy of
+    # the server's certificate with one serial-number byte changed.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var der2: [8192]u8
+    var pin: TlsServerConfig
+    if server_setup(@pin, @der2[0], cert_valet(), key_valet()) != 0
+        return 2
+    let leaf: *u8 = pin.cert_chain + pin.cert_offsets[0]
+    leaf[20] = leaf[20] ^ 0x01  # inside the serialNumber INTEGER
+    if client_verdict(@scfg, c"valet.test", @pin) != TLS_ERR_CERTIFICATE_INVALID
+        return 3
+    return 0

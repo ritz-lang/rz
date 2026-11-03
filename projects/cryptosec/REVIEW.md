@@ -33,6 +33,8 @@ The cryptographic primitives (ChaCha20, Poly1305, X25519, Ed25519, AES, SHA-256/
 
 ### H-1: Remote stack buffer overflow in `tls13_record_decrypt`
 
+> **Status (2026-11, AGAST #1862):** Fixed by #1861. `inner` is `[16624]u8` and `tls13_record_decrypt` rejects `ciphertext_len > TLS_MAX_CIPHERTEXT_LEN` (record_overflow) before decrypting.
+
 **File:** `tls13_record.ritz:148, 168, 172`
 **Severity:** HIGH — Remote exploitable
 
@@ -43,6 +45,8 @@ The cryptographic primitives (ChaCha20, Poly1305, X25519, Ed25519, AES, SHA-256/
 ---
 
 ### H-2: Server authentication completely bypassed
+
+> **Status (2026-11, AGAST #1862):** Fixed. `certificate_verify_verify` verifies ecdsa_secp256r1_sha256 and ed25519 and rejects everything else (rsa_pkcs1 is forbidden in TLS 1.3 CertificateVerify; rsa_pss is unimplemented). The client now requires, fail closed: a pinned leaf certificate (`tls_config_pin_cert`), a hostname match, a verifying CertificateVerify, and EE → Certificate → CertificateVerify → Finished order; there is no skip-verify mode. CA-chain validation is not wired into the client yet, so an unpinned client refuses every server — tracked in #2109 (CA chain, SAN, validity) and #2110 (RSA-PSS). Covered by `test/test_tls13_handshake.ritz` and valet's `test/test_tls_e2e.ritz`.
 
 **File:** `tls13_handshake.ritz:754-756`, `tls13_client.ritz:493`
 **Severity:** HIGH — Full MITM
@@ -66,6 +70,8 @@ The TLS 1.3 client accepts any server certificate and any CertificateVerify mess
 
 ### H-3: Second buffer overflow in TLS client decrypt
 
+> **Status (2026-11, AGAST #1862):** Not an overflow today: `tls13_record_decrypt` refuses plaintext larger than `out_cap` (-9), so the 4096-byte buffer limits the size of the server's flight rather than overflowing.
+
 **File:** `tls13_client.ritz:400, 404`
 **Severity:** HIGH — Remote exploitable
 
@@ -76,6 +82,8 @@ The TLS 1.3 client accepts any server certificate and any CertificateVerify mess
 ---
 
 ### H-4: Undersized `mem_zero` leaves traffic keys in memory
+
+> **Status (2026-11, AGAST #1862):** Fixed (#1917): `mem_zero(ks as *u8, sizeof(TLS13KeySchedule))`, and the client/config zeroing uses `sizeof` too.
 
 **File:** `tls13_kdf.ritz:221`
 **Severity:** HIGH — Secret key material exposure
@@ -121,6 +129,8 @@ Same as H-5 but for SHA-512 with 80 branches.
 
 ### H-7: `u128_mul` silently produces wrong results
 
+> **Status (2026-11, AGAST #1862):** Fixed. `u128_mul` takes the low product from `u128_mul_u64` (which carries out of the middle term) and adds the cross terms mod 2^64; `test_u128_mul_middle_carry` fails on the old code.
+
 **File:** `u128.ritz:109-120`
 **Severity:** HIGH — Correctness bug
 
@@ -153,6 +163,8 @@ Same as H-5 but for SHA-512 with 80 branches.
 ---
 
 ### H-10: `ed25519_verify` missing scalar range check
+
+> **Status (2026-11, AGAST #1862):** Fixed. `ed25519_verify` rejects `s >= l` (`sc_is_canonical`); `test_ed25519_rejects_non_canonical_s` shows `(R, s + l)` used to verify.
 
 **File:** `ed25519.ritz:720`
 **Severity:** HIGH — RFC compliance

@@ -53,24 +53,8 @@ pub const TLS_SERVER_STATE_CLOSING: i32 = 9
 pub const TLS_SERVER_STATE_CLOSED: i32 = 10
 pub const TLS_SERVER_STATE_ERROR: i32 = -1
 
-# Handshake processing results
-pub const TLS_RESULT_NEED_INPUT: i32 = 0
-pub const TLS_RESULT_HAVE_OUTPUT: i32 = 1
-pub const TLS_RESULT_COMPLETE: i32 = 2
-pub const TLS_RESULT_ERROR: i32 = -1
-
-# Error codes
-pub const TLS_ERR_NONE: i32 = 0
-pub const TLS_ERR_INVALID_STATE: i32 = -1
-pub const TLS_ERR_PARSE_ERROR: i32 = -2
-pub const TLS_ERR_UNEXPECTED_MESSAGE: i32 = -3
-pub const TLS_ERR_VERSION_MISMATCH: i32 = -4
-pub const TLS_ERR_NO_KEY_SHARE: i32 = -5
-pub const TLS_ERR_DECRYPT_FAILED: i32 = -6
-pub const TLS_ERR_VERIFY_FAILED: i32 = -7
-pub const TLS_ERR_CERTIFICATE_INVALID: i32 = -8
-pub const TLS_ERR_FINISHED_MISMATCH: i32 = -9
-pub const TLS_ERR_BUFFER_TOO_SMALL: i32 = -10
+# TLS_RESULT_* and TLS_ERR_NONE .. TLS_ERR_BUFFER_TOO_SMALL come from
+# cryptosec.tls13_record (shared with the cryptosec client). Server-only codes:
 pub const TLS_ERR_NO_COMMON_CIPHER: i32 = -11
 pub const TLS_ERR_NO_CERTIFICATE: i32 = -12
 pub const TLS_ERR_NO_PRIVATE_KEY: i32 = -13
@@ -111,10 +95,10 @@ pub struct TlsServerConfig
 pub fn tls_server_config_init(cfg: *TlsServerConfig)
     mem_zero(cfg as *u8, 200 )
 
-    # Default cipher suites (server preference order)
+    # Only AES-128-GCM: cryptosec's record layer implements no other suite,
+    # so offering ChaCha20-Poly1305 would select it and then run AES keys.
     cfg.cipher_suites[0] = TLS_AES_128_GCM_SHA256
-    cfg.cipher_suites[1] = TLS_CHACHA20_POLY1305_SHA256
-    cfg.num_cipher_suites = 2
+    cfg.num_cipher_suites = 1
 
 # Load certificate from PEM file content
 # Returns 0 on success, -1 on error
@@ -342,7 +326,6 @@ pub struct TlsServer
     # These are large buffers that would otherwise be on the stack
     cert_buf: [8192]u8        # Certificate serialization buffer
     encrypted_hs: [8448]u8    # MAX_CERT_SIZE + 256 for encrypted handshake
-    encrypted: [8704]u8       # MAX_CERT_SIZE + 512 for final encryption
 
     # SHA-256 context for hashing operations during handshake
     # This avoids stack overflow from allocating Sha256 (~370 bytes) on the stack
@@ -1125,33 +1108,18 @@ pub fn build_server_flight(server: *TlsServer, out: *u8, out_cap: i64, out_len: 
     print_int(hs_len)
     prints("\n")
 
-    # Encrypt the concatenated handshake messages - use server work buffer
-    let encrypt_result: i32 = tls_record_state_server_encrypt(@server.write_state, @server.encrypted_hs[0], hs_len as i32, 22, @server.encrypted[0], 8704)
+    # Encrypt the concatenated handshake messages straight into `out`:
+    # tls13_record_encrypt emits the complete record, header included.
+    let encrypt_result: i32 = tls_record_state_server_encrypt(@server.write_state, @server.encrypted_hs[0], hs_len as i32, 22, out + pos, server_record_cap(out_cap - pos))
     prints("[BUILD_SF] encrypt_result=")
     print_int(encrypt_result as i64)
     prints("\n")
     if encrypt_result < 0
         prints("[BUILD_SF] encrypt failed\n")
-        server.last_error = TLS_ERR_PARSE_ERROR
-        server.state = TLS_SERVER_STATE_ERROR
-        return TLS_RESULT_ERROR
-
-    let encrypted_len: i64 = encrypt_result as i64
-    prints("[BUILD_SF] wrapping\n")
-
-    # Wrap in TLS record
-    if pos + 5 + encrypted_len > out_cap
         server.last_error = TLS_ERR_BUFFER_TOO_SMALL
         server.state = TLS_SERVER_STATE_ERROR
         return TLS_RESULT_ERROR
-
-    out[pos] = 23  # Application Data (encrypted)
-    out[pos + 1] = 0x03
-    out[pos + 2] = 0x03
-    out[pos + 3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[pos + 4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + pos + 5, @server.encrypted[0], encrypted_len )
-    pos = pos + 5 + encrypted_len
+    pos = pos + encrypt_result as i64
 
     # Update transcript with Finished
     transcript_update(@server.transcript, @fin_buf[0], fin_len)
@@ -1211,7 +1179,8 @@ pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_l
     # Decrypt record
     var plaintext: [256]u8
     var inner_type: u8 = 0
-    let decrypt_result: i32 = tls_record_state_client_decrypt(@server.read_state, @server.recv_buf[5], record_len as i32, @plaintext[0], 256, @inner_type)
+    # The whole record: its 5-byte header is the AEAD's additional data.
+    let decrypt_result: i32 = tls_record_state_client_decrypt(@server.read_state, @server.recv_buf[0], (5 + record_len) as i32, @plaintext[0], 256, @inner_type)
 
     prints("[PROC_CF] decrypt_result=")
     print_int(decrypt_result as i64)
@@ -1306,25 +1275,14 @@ pub fn tls_server_write(server: *TlsServer, data: *u8, data_len: i64, out: *u8, 
     if server.state != TLS_SERVER_STATE_CONNECTED
         return -1
 
-    var encrypted: [16500]u8
-    let result: i32 = tls_record_state_server_encrypt(@server.write_state, data, data_len as i32, 23, @encrypted[0], 16500)
+    if data_len < 0 || data_len > 16384
+        return -1
 
+    # Encrypt straight into `out`: the result is the complete record.
+    let result: i32 = tls_record_state_server_encrypt(@server.write_state, data, data_len as i32, 23, out, server_record_cap(out_cap))
     if result < 0
         return -1
-
-    let encrypted_len: i64 = result as i64
-
-    if out_cap < 5 + encrypted_len
-        return -1
-
-    out[0] = 23  # Application Data
-    out[1] = 0x03
-    out[2] = 0x03
-    out[3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + 5, @encrypted[0], encrypted_len )
-
-    return 5 + encrypted_len
+    return result as i64
 
 # Decrypt received application data
 # Returns bytes written to out, or negative on error
@@ -1347,7 +1305,8 @@ pub fn tls_server_read(server: *TlsServer, data: *u8, data_len: i64, out: *u8, o
     var plaintext: [16500]u8
     var inner_type: u8 = 0
 
-    let result: i32 = tls_record_state_client_decrypt(@server.read_state, data + 5, record_len as i32, @plaintext[0], 16500, @inner_type)
+    # The whole record: its 5-byte header is the AEAD's additional data.
+    let result: i32 = tls_record_state_client_decrypt(@server.read_state, data, (5 + record_len) as i32, @plaintext[0], 16500, @inner_type)
 
     if result < 0
         return -1
@@ -1376,30 +1335,24 @@ pub fn tls_server_close(server: *TlsServer, out: *u8, out_cap: i64) -> i64
     alert[0] = 1  # Warning
     alert[1] = 0  # close_notify
 
-    var encrypted: [64]u8
-    let result: i32 = tls_record_state_server_encrypt(@server.write_state, @alert[0], 2, 21, @encrypted[0], 64)
-
+    let result: i32 = tls_record_state_server_encrypt(@server.write_state, @alert[0], 2, 21, out, server_record_cap(out_cap))
     if result < 0
         return 0
 
-    let encrypted_len: i64 = result as i64
-
-    if out_cap < 5 + encrypted_len
-        return 0
-
-    out[0] = 23
-    out[1] = 0x03
-    out[2] = 0x03
-    out[3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + 5, @encrypted[0], encrypted_len )
-
     server.state = TLS_SERVER_STATE_CLOSING
-    return 5 + encrypted_len
+    return result as i64
 
 # ============================================================================
 # Helpers
 # ============================================================================
+
+# Record-layer capacities are i32; never let an i64 cap wrap negative.
+fn server_record_cap(cap: i64) -> i32
+    if cap > 0x7fffffff
+        return 0x7fffffff
+    if cap < 0
+        return 0
+    return cap as i32
 
 pub fn shift_recv_buf(server: *TlsServer, amount: i64)
     if amount >= server.recv_len

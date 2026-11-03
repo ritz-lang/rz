@@ -6,6 +6,9 @@ import cryptosec.mem
 import cryptosec.sha256
 import cryptosec.tls13_handshake
 import cryptosec.tls13_kdf
+import cryptosec.x509
+import cryptosec.p256
+import cryptosec.ed25519
 
 # ============================================================================
 # Transcript Hash Tests
@@ -748,4 +751,231 @@ fn test_client_hello_transcript() -> i32
     if all_zero == 1
         return 1
 
+    return 0
+
+# ============================================================================
+# CertificateVerify signature verification (#1862 / REVIEW.md H-2)
+# ============================================================================
+
+# Fill a 32-byte transcript hash with a fixed pattern.
+fn cv_test_transcript(th: *u8)
+    var i: i32 = 0
+    while i < 32
+        th[i] = (i * 7 + 3) as u8
+        i += 1
+
+# P-256 key from a fixed scalar; pubkey gets the X.509 uncompressed point.
+fn cv_test_p256_key(priv: *Scalar256, pubkey: *X509PublicKey)
+    var d: [32]u8
+    var i: i32 = 0
+    while i < 32
+        d[i] = (i + 1) as u8
+        i += 1
+    scalar256_from_bytes(priv, @d[0])
+    var q: P256Point
+    ecdsa_p256_pubkey_from_privkey(@q, priv)
+    var qx: FeP256
+    var qy: FeP256
+    p256_point_to_affine(@q, @qx, @qy)
+    mem_zero(pubkey as *u8, sizeof(X509PublicKey))
+    pubkey.algorithm = PUBKEY_TYPE_EC
+    pubkey.curve = EC_CURVE_P256
+    pubkey.key_data[0] = 0x04
+    fep256_to_bytes(@qx, @pubkey.key_data[1])
+    fep256_to_bytes(@qy, @pubkey.key_data[33])
+    pubkey.key_len = 65
+
+# Sign the CV content for `th` with ECDSA P-256 into a DER CertificateVerify.
+fn cv_test_ecdsa_sign(priv: *Scalar256, th: *u8, cv: *CertificateVerify) -> i32
+    var content: [130]u8
+    certificate_verify_content(th, @content[0])
+    var hash: [32]u8
+    sha256(@content[0], 130, @hash[0])
+    var sig: EcdsaSignature
+    if ecdsa_p256_sign(@sig, @hash[0], priv) == 0
+        return -1
+    mem_zero(cv as *u8, sizeof(CertificateVerify))
+    cv.algorithm = SIG_ECDSA_SECP256R1_SHA256
+    cv.signature_len = ecdsa_signature_to_der(@sig, @cv.signature[0])
+    return 0
+
+[[test]]
+fn test_cv_verify_ecdsa_valid_signature() -> i32
+    var priv: Scalar256
+    var pk: X509PublicKey
+    cv_test_p256_key(@priv, @pk)
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    if cv_test_ecdsa_sign(@priv, @th[0], @cv) != 0
+        return 1
+    if certificate_verify_verify(@cv, @th[0], @pk) != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_cv_verify_ecdsa_rejects_other_transcript() -> i32
+    var priv: Scalar256
+    var pk: X509PublicKey
+    cv_test_p256_key(@priv, @pk)
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    if cv_test_ecdsa_sign(@priv, @th[0], @cv) != 0
+        return 1
+    th[5] = th[5] ^ 0x01
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_cv_verify_ecdsa_rejects_corrupt_signature() -> i32
+    var priv: Scalar256
+    var pk: X509PublicKey
+    cv_test_p256_key(@priv, @pk)
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    if cv_test_ecdsa_sign(@priv, @th[0], @cv) != 0
+        return 1
+    # Last byte of s
+    let last: i64 = cv.signature_len - 1
+    cv.signature[last] = cv.signature[last] ^ 0x40
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_cv_verify_ecdsa_rejects_other_key() -> i32
+    var priv: Scalar256
+    var pk: X509PublicKey
+    cv_test_p256_key(@priv, @pk)
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    if cv_test_ecdsa_sign(@priv, @th[0], @cv) != 0
+        return 1
+    # Re-sign with a different scalar: same pubkey must reject it.
+    var other: [32]u8
+    var i: i32 = 0
+    while i < 32
+        other[i] = (90 - i) as u8
+        i += 1
+    var priv2: Scalar256
+    scalar256_from_bytes(@priv2, @other[0])
+    if cv_test_ecdsa_sign(@priv2, @th[0], @cv) != 0
+        return 2
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_cv_verify_rejects_rsa_pkcs1() -> i32
+    # Used to hash and return success without verifying anything.
+    var pk: X509PublicKey
+    mem_zero(@pk as *u8, sizeof(X509PublicKey))
+    pk.algorithm = PUBKEY_TYPE_RSA
+    pk.key_len = 270
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    mem_zero(@cv as *u8, sizeof(CertificateVerify))
+    cv.algorithm = SIG_RSA_PKCS1_SHA256
+    cv.signature_len = 256
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    return 0
+
+[[test]]
+fn test_cv_verify_rejects_rsa_pss_unimplemented() -> i32
+    var pk: X509PublicKey
+    mem_zero(@pk as *u8, sizeof(X509PublicKey))
+    pk.algorithm = PUBKEY_TYPE_RSA
+    pk.key_len = 270
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    mem_zero(@cv as *u8, sizeof(CertificateVerify))
+    cv.algorithm = SIG_RSA_PSS_RSAE_SHA256
+    cv.signature_len = 256
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    return 0
+
+fn cv_test_ed25519(pk: *X509PublicKey, th: *u8, cv: *CertificateVerify)
+    var seed: [32]u8
+    var i: i32 = 0
+    while i < 32
+        seed[i] = (200 - i) as u8
+        i += 1
+    var priv: [64]u8
+    mem_zero(pk as *u8, sizeof(X509PublicKey))
+    ed25519_keygen(@pk.key_data[0], @priv[0], @seed[0])
+    pk.algorithm = PUBKEY_TYPE_ED25519
+    pk.key_len = 32
+    var content: [130]u8
+    certificate_verify_content(th, @content[0])
+    mem_zero(cv as *u8, sizeof(CertificateVerify))
+    cv.algorithm = SIG_ED25519
+    ed25519_sign(@cv.signature[0], @content[0], 130, @priv[0])
+    cv.signature_len = 64
+
+[[test]]
+fn test_cv_verify_ed25519_valid_signature() -> i32
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv_test_ed25519(@pk, @th[0], @cv)
+    if certificate_verify_verify(@cv, @th[0], @pk) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_cv_verify_ed25519_rejects_corrupt_signature() -> i32
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv_test_ed25519(@pk, @th[0], @cv)
+    cv.signature[10] = cv.signature[10] ^ 0x01
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    return 0
+
+[[test]]
+fn test_ecdsa_sig_from_der_rejects_trailing_bytes() -> i32
+    # SEQUENCE { INTEGER 1, INTEGER 2 }; then the same with a stray byte
+    # inside the SEQUENCE length.
+    var der: [9]u8
+    der[0] = 0x30
+    der[1] = 0x06
+    der[2] = 0x02
+    der[3] = 0x01
+    der[4] = 0x01
+    der[5] = 0x02
+    der[6] = 0x01
+    der[7] = 0x02
+    der[8] = 0x00
+    var sig: EcdsaSignature
+    if ecdsa_sig_from_der(@der[0], 8, @sig) != 0
+        return 1  # well-formed 8-byte encoding must parse
+    der[1] = 0x07
+    if ecdsa_sig_from_der(@der[0], 9, @sig) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_cv_verify_rejects_key_type_mismatch() -> i32
+    # A genuinely valid Ed25519 signature, but the certificate says the key is
+    # P-256: the algorithm must match the certificate's key type.
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv_test_ed25519(@pk, @th[0], @cv)
+    pk.algorithm = PUBKEY_TYPE_EC
+    pk.curve = EC_CURVE_P256
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
     return 0

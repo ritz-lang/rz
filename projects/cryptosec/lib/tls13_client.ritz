@@ -7,8 +7,15 @@
 # - Full TLS 1.3 handshake (1-RTT)
 # - X25519 key exchange
 # - AES-128-GCM and ChaCha20-Poly1305 cipher suites
-# - Certificate chain validation
-# - Hostname verification
+# - AES-128-GCM only (the record layer implements nothing else)
+# - Server authentication, fail closed:
+#     * trust anchor: the leaf certificate must byte-equal a pinned DER cert
+#       (tls_config_pin_cert). CA-chain validation is not wired up yet, so a
+#       client without a pin refuses every server.
+#     * hostname: the leaf must match the configured hostname
+#     * CertificateVerify: the signature over the transcript must verify
+#       under the leaf's key (ecdsa_secp256r1_sha256 or ed25519)
+#   There is no "skip verification" mode.
 #
 # Non-blocking API for io_uring integration:
 # - tls_client_handshake_step() processes data incrementally
@@ -48,24 +55,8 @@ pub const TLS_STATE_CLOSING: i32 = 8
 pub const TLS_STATE_CLOSED: i32 = 9
 pub const TLS_STATE_ERROR: i32 = -1
 
-# Handshake step results
-pub const TLS_RESULT_NEED_INPUT: i32 = 0
-pub const TLS_RESULT_HAVE_OUTPUT: i32 = 1
-pub const TLS_RESULT_COMPLETE: i32 = 2
-pub const TLS_RESULT_ERROR: i32 = -1
-
-# Error codes
-pub const TLS_ERR_NONE: i32 = 0
-pub const TLS_ERR_INVALID_STATE: i32 = -1
-pub const TLS_ERR_PARSE_ERROR: i32 = -2
-pub const TLS_ERR_UNEXPECTED_MESSAGE: i32 = -3
-pub const TLS_ERR_VERSION_MISMATCH: i32 = -4
-pub const TLS_ERR_NO_KEY_SHARE: i32 = -5
-pub const TLS_ERR_DECRYPT_FAILED: i32 = -6
-pub const TLS_ERR_VERIFY_FAILED: i32 = -7
-pub const TLS_ERR_CERTIFICATE_INVALID: i32 = -8
-pub const TLS_ERR_FINISHED_MISMATCH: i32 = -9
-pub const TLS_ERR_BUFFER_TOO_SMALL: i32 = -10
+# Handshake step results (TLS_RESULT_*) and error codes (TLS_ERR_*) live in
+# tls13_record, shared with valet's server so the two can be linked together.
 
 # Maximum sizes
 const MAX_RECORD_SIZE: i64 = 16384
@@ -80,8 +71,9 @@ pub struct TlsConfig
     hostname: [256]u8
     hostname_len: i32
 
-    # Whether to verify certificate (1 = yes, 0 = no/TOFU)
-    verify_cert: i32
+    # Trust anchor: DER of the one leaf certificate this client accepts.
+    pinned_cert: [4096]u8
+    pinned_cert_len: i64
 
     # Preferred cipher suites (in order of preference)
     cipher_suites: [4]u16
@@ -90,12 +82,9 @@ pub struct TlsConfig
 pub fn tls_config_init(cfg: *TlsConfig)
     mem_zero(cfg as *u8, sizeof(TlsConfig))
 
-    # Default cipher suites
+    # Only offer what tls13_record can actually encrypt.
     cfg.cipher_suites[0] = TLS_AES_128_GCM_SHA256
-    cfg.cipher_suites[1] = TLS_CHACHA20_POLY1305_SHA256
-    cfg.num_cipher_suites = 2
-
-    cfg.verify_cert = 1
+    cfg.num_cipher_suites = 1
 
 pub fn tls_config_set_hostname(cfg: *TlsConfig, hostname: *u8, len: i32)
     if len > 255
@@ -105,6 +94,16 @@ pub fn tls_config_set_hostname(cfg: *TlsConfig, hostname: *u8, len: i32)
         cfg.hostname[i] = hostname[i]
         i += 1
     cfg.hostname_len = len
+
+# Pin the server's leaf certificate (DER). The handshake fails unless the
+# server presents exactly this certificate. Returns 0, or -1 if it is empty
+# or larger than the pin buffer.
+pub fn tls_config_pin_cert(cfg: *TlsConfig, der: *u8, len: i64) -> i32
+    if len <= 0 || len > 4096
+        return -1
+    mem_copy(@cfg.pinned_cert[0], der, len as u64)
+    cfg.pinned_cert_len = len
+    return 0
 
 # ============================================================================
 # TLS Client State
@@ -336,6 +335,12 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
 
+    # The record layer only does AES-128-GCM; keys below are derived for it.
+    if client.server_hello.cipher_suite != TLS_AES_128_GCM_SHA256
+        client.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        client.state = TLS_STATE_ERROR
+        return TLS_RESULT_ERROR
+
     # Store cipher suite
     client.cipher_suite = client.server_hello.cipher_suite
 
@@ -362,7 +367,7 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
 
     # Consume processed record
     let consumed: i64 = 5 + record_len
-    shift_recv_buf(client, consumed)
+    client_shift_recv_buf(client, consumed)
 
     client.encrypted_handshake = 1
     client.state = TLS_STATE_SERVER_HELLO_RECEIVED
@@ -401,7 +406,8 @@ fn process_encrypted_handshake(client: *TlsClient, out: *u8, out_cap: i64, out_l
     var plaintext_len: i64 = 0
     var inner_type: u8 = 0
 
-    let decrypt_result: i32 = tls_record_state_server_decrypt(@client.read_state, @client.recv_buf[5], record_len as i32, @plaintext[0], 4096, @inner_type)
+    # The whole record: its 5-byte header is the AEAD's additional data.
+    let decrypt_result: i32 = tls_record_state_server_decrypt(@client.read_state, @client.recv_buf[0], (5 + record_len) as i32, @plaintext[0], 4096, @inner_type)
     plaintext_len = decrypt_result as i64
 
     if decrypt_result < 0
@@ -436,6 +442,7 @@ fn process_encrypted_handshake(client: *TlsClient, out: *u8, out_cap: i64, out_l
         # Process based on message type
         let result: i32 = process_handshake_message(client, hdr.msg_type, @plaintext[pos + 4], hdr.length)
         if result != 0
+            client.state = TLS_STATE_ERROR
             return TLS_RESULT_ERROR
 
         # Update transcript with handshake message
@@ -445,7 +452,7 @@ fn process_encrypted_handshake(client: *TlsClient, out: *u8, out_cap: i64, out_l
 
     # Consume processed record
     let consumed: i64 = 5 + record_len
-    shift_recv_buf(client, consumed)
+    client_shift_recv_buf(client, consumed)
 
     # Check if handshake complete
     if client.state == TLS_STATE_FINISHED_RECEIVED
@@ -457,65 +464,89 @@ fn process_encrypted_handshake(client: *TlsClient, out: *u8, out_cap: i64, out_l
 
     return TLS_RESULT_NEED_INPUT
 
+# Fail with `err`; the caller moves the client to TLS_STATE_ERROR.
+fn hs_fail(client: *TlsClient, err: i32) -> i32
+    client.last_error = err
+    return -1
+
+# Authenticate the server's leaf certificate: pinned trust anchor + hostname.
+# Returns 0 if trusted, -1 otherwise.
+fn verify_server_certificate(client: *TlsClient, leaf: *X509Certificate) -> i32
+    let cfg: *TlsConfig = @client.config
+    # Trust anchor. Without a pin there is nothing to trust (no CA store yet).
+    if cfg.pinned_cert_len <= 0
+        return -1
+    if client.server_certs.cert_lens[0] != cfg.pinned_cert_len
+        return -1
+    if mem_eq(client.server_certs.cert_data[0], @cfg.pinned_cert[0], cfg.pinned_cert_len as u64) != 1
+        return -1
+    # Hostname
+    if cfg.hostname_len <= 0
+        return -1
+    if x509_verify_hostname(leaf, @cfg.hostname[0], cfg.hostname_len) != 1
+        return -1
+    return 0
+
+# Messages must arrive EncryptedExtensions -> Certificate -> CertificateVerify
+# -> Finished; anything else (including skipping Certificate) is an error.
 fn process_handshake_message(client: *TlsClient, msg_type: u8, data: *u8, len: i64) -> i32
     if msg_type == HS_ENCRYPTED_EXTENSIONS
+        if client.state != TLS_STATE_SERVER_HELLO_RECEIVED
+            return hs_fail(client, TLS_ERR_UNEXPECTED_MESSAGE)
         var ee: EncryptedExtensions
         if encrypted_extensions_parse(data, len, @ee) != 0
-            client.last_error = TLS_ERR_PARSE_ERROR
-            client.state = TLS_STATE_ERROR
-            return -1
+            return hs_fail(client, TLS_ERR_PARSE_ERROR)
         client.state = TLS_STATE_ENCRYPTED_EXTENSIONS_RECEIVED
         return 0
 
     if msg_type == HS_CERTIFICATE
+        if client.state != TLS_STATE_ENCRYPTED_EXTENSIONS_RECEIVED
+            return hs_fail(client, TLS_ERR_UNEXPECTED_MESSAGE)
         if certificate_parse(data, len, @client.server_certs) != 0
-            client.last_error = TLS_ERR_PARSE_ERROR
-            client.state = TLS_STATE_ERROR
-            return -1
+            return hs_fail(client, TLS_ERR_PARSE_ERROR)
 
-        # Parse first certificate to get public key
-        if client.server_certs.num_certs > 0
-            var cert: X509Certificate
-            if x509_parse_certificate(client.server_certs.cert_data[0], client.server_certs.cert_lens[0], @cert) == 0
-                # Copy public key
-                mem_copy(@client.server_pubkey as *u8, @cert.public_key as *u8, sizeof(X509PublicKey))
+        var cert: X509Certificate
+        if x509_parse_certificate(client.server_certs.cert_data[0], client.server_certs.cert_lens[0] as u64, @cert) != 0
+            return hs_fail(client, TLS_ERR_CERTIFICATE_INVALID)
+        if verify_server_certificate(client, @cert) != 0
+            return hs_fail(client, TLS_ERR_CERTIFICATE_INVALID)
 
+        mem_copy(@client.server_pubkey as *u8, @cert.public_key as *u8, sizeof(X509PublicKey))
         client.state = TLS_STATE_CERTIFICATE_RECEIVED
         return 0
 
     if msg_type == HS_CERTIFICATE_VERIFY
+        if client.state != TLS_STATE_CERTIFICATE_RECEIVED
+            return hs_fail(client, TLS_ERR_UNEXPECTED_MESSAGE)
         var cv: CertificateVerify
         if certificate_verify_parse(data, len, @cv) != 0
-            client.last_error = TLS_ERR_PARSE_ERROR
-            client.state = TLS_STATE_ERROR
-            return -1
+            return hs_fail(client, TLS_ERR_PARSE_ERROR)
 
-        # TODO: Verify signature over transcript
-        # For now, we trust it (TOFU mode)
+        # The transcript does not include this CertificateVerify yet: the
+        # caller appends each message after it is processed.
+        var th: [32]u8
+        transcript_hash(@client.transcript, @th[0])
+        if certificate_verify_verify(@cv, @th[0], @client.server_pubkey) != 0
+            return hs_fail(client, TLS_ERR_VERIFY_FAILED)
 
         client.state = TLS_STATE_CERTIFICATE_VERIFY_RECEIVED
         return 0
 
     if msg_type == HS_FINISHED
-        # Verify server's Finished message
+        if client.state != TLS_STATE_CERTIFICATE_VERIFY_RECEIVED
+            return hs_fail(client, TLS_ERR_UNEXPECTED_MESSAGE)
+        if len != 32
+            return hs_fail(client, TLS_ERR_PARSE_ERROR)
+        # Transcript up to (not including) Finished.
         var expected_transcript: [32]u8
         transcript_hash(@client.transcript, @expected_transcript[0])
-
-        # Note: We need transcript BEFORE the Finished message for verification
-        # The transcript_update for Finished happens after this function returns
-
-        let verify_result: i32 = finished_verify(@client.key_schedule.server_handshake_traffic_secret[0], @expected_transcript[0], data)
-
-        if verify_result != 1
-            client.last_error = TLS_ERR_FINISHED_MISMATCH
-            client.state = TLS_STATE_ERROR
-            return -1
-
+        if finished_verify(@client.key_schedule.server_handshake_traffic_secret[0], @expected_transcript[0], data) != 1
+            return hs_fail(client, TLS_ERR_FINISHED_MISMATCH)
         client.state = TLS_STATE_FINISHED_RECEIVED
         return 0
 
-    # Unknown message type - ignore for forward compatibility
-    return 0
+    # CertificateRequest (client auth) and anything else are unsupported.
+    return hs_fail(client, TLS_ERR_UNEXPECTED_MESSAGE)
 
 # ============================================================================
 # Finish Handshake - Send Client Finished
@@ -533,30 +564,14 @@ fn finish_handshake(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i64) -
     var finished_msg: [64]u8
     let finished_len: i64 = finished_serialize(@verify_data[0], @finished_msg[0])
 
-    # Encrypt with handshake keys
-    var encrypted: [128]u8
-
-    let encrypt_result: i32 = tls_record_state_client_encrypt(@client.write_state, @finished_msg[0], finished_len as i32, 22, @encrypted[0], 128)
-    var encrypted_len: i64 = encrypt_result as i64
-
-    if encrypt_result < 0
-        client.last_error = TLS_ERR_PARSE_ERROR
-        client.state = TLS_STATE_ERROR
-        return TLS_RESULT_ERROR
-
-    # Build TLS record
-    if out_cap < 5 + encrypted_len
+    # Encrypt with handshake keys. tls13_record_encrypt emits the complete
+    # record, header included.
+    let record_len: i32 = tls_record_state_client_encrypt(@client.write_state, @finished_msg[0], finished_len as i32, 22, out, client_record_cap(out_cap))
+    if record_len < 0
         client.last_error = TLS_ERR_BUFFER_TOO_SMALL
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
-
-    out[0] = 23  # Application Data (encrypted)
-    out[1] = 0x03
-    out[2] = 0x03  # TLS 1.2
-    out[3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + 5, @encrypted[0], encrypted_len as u64)
-    *out_len = 5 + encrypted_len
+    *out_len = record_len as i64
 
     # Update transcript with client Finished
     transcript_update(@client.transcript, @finished_msg[0], finished_len)
@@ -591,27 +606,14 @@ pub fn tls_client_write(client: *TlsClient, data: *u8, data_len: i64, out: *u8, 
     if client.state != TLS_STATE_CONNECTED
         return -1
 
-    # Encrypt data
-    var encrypted: [16500]u8  # Max record + overhead
+    if data_len < 0 || data_len > MAX_RECORD_SIZE
+        return -1
 
-    let result: i32 = tls_record_state_client_encrypt(@client.write_state, data, data_len as i32, 23, @encrypted[0], 16500)
-    var encrypted_len: i64 = result as i64
-
+    # Encrypt straight into `out`: the result is the complete record.
+    let result: i32 = tls_record_state_client_encrypt(@client.write_state, data, data_len as i32, 23, out, client_record_cap(out_cap))
     if result < 0
         return -1
-
-    # Build TLS record
-    if out_cap < 5 + encrypted_len
-        return -1
-
-    out[0] = 23  # Application Data
-    out[1] = 0x03
-    out[2] = 0x03
-    out[3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + 5, @encrypted[0], encrypted_len as u64)
-
-    return 5 + encrypted_len
+    return result as i64
 
 # Decrypt received application data
 # Returns bytes written to out, or negative on error
@@ -638,7 +640,8 @@ pub fn tls_client_read(client: *TlsClient, data: *u8, data_len: i64, out: *u8, o
     var plaintext_len: i64 = 0
     var inner_type: u8 = 0
 
-    let result: i32 = tls_record_state_server_decrypt(@client.read_state, data + 5, record_len as i32, @plaintext[0], 16500, @inner_type)
+    # The whole record: its 5-byte header is the AEAD's additional data.
+    let result: i32 = tls_record_state_server_decrypt(@client.read_state, data, (5 + record_len) as i32, @plaintext[0], 16500, @inner_type)
     plaintext_len = result as i64
 
     if result < 0
@@ -668,31 +671,26 @@ pub fn tls_client_close(client: *TlsClient, out: *u8, out_cap: i64) -> i64
     alert[0] = 1  # Warning level
     alert[1] = 0  # close_notify
 
-    var encrypted: [64]u8
-    let result: i32 = tls_record_state_client_encrypt(@client.write_state, @alert[0], 2, 21, @encrypted[0], 64)
-    var encrypted_len: i64 = result as i64
-
+    let result: i32 = tls_record_state_client_encrypt(@client.write_state, @alert[0], 2, 21, out, client_record_cap(out_cap))
     if result < 0
         return 0
 
-    if out_cap < 5 + encrypted_len
-        return 0
-
-    out[0] = 23  # Application Data (encrypted)
-    out[1] = 0x03
-    out[2] = 0x03
-    out[3] = ((encrypted_len >> 8) & 0xff) as u8
-    out[4] = (encrypted_len & 0xff) as u8
-    mem_copy(out + 5, @encrypted[0], encrypted_len as u64)
-
     client.state = TLS_STATE_CLOSING
-    return 5 + encrypted_len
+    return result as i64
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
-fn shift_recv_buf(client: *TlsClient, amount: i64)
+# Record-layer capacities are i32; never let an i64 cap wrap negative.
+fn client_record_cap(cap: i64) -> i32
+    if cap > 0x7fffffff
+        return 0x7fffffff
+    if cap < 0
+        return 0
+    return cap as i32
+
+fn client_shift_recv_buf(client: *TlsClient, amount: i64)
     if amount >= client.recv_len
         client.recv_len = 0
         return
