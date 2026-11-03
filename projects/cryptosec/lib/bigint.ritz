@@ -7,7 +7,11 @@
 # - Basic arithmetic (add, sub, mul)
 #
 # Design: Fixed-width arrays of 64-bit limbs, little-endian order.
-# Max size: 4096 bits = 64 limbs of 64 bits each.
+# Width: 8192 bits = 128 limbs, twice the largest supported modulus (4096
+# bits), so the product of two values reduced mod n always fits. Nothing is
+# ever silently truncated: an operation whose result would not fit returns an
+# error (AGAST #2134; bigint_mul used to drop product limbs >= 64, which made
+# s^e mod n wrong for every modulus over 2048 bits).
 
 import mem
 
@@ -15,17 +19,21 @@ import mem
 # Constants
 # ============================================================================
 
-# Maximum limbs for 4096-bit numbers
-const BIGINT_MAX_LIMBS: i32 = 64
+# Limbs in a BigInt (8192 bits)
+const BIGINT_MAX_LIMBS: i32 = 128
+
+# Largest modulus bigint_mod_exp accepts, in limbs (4096 bits): its squares
+# need 2 * 64 = BIGINT_MAX_LIMBS limbs.
+const BIGINT_MAX_MODULUS_LIMBS: i32 = 64
 
 # ============================================================================
 # BigInt Structure
 # ============================================================================
 
-# BigInt - fixed-width big integer (up to 4096 bits)
+# BigInt - fixed-width big integer (up to 8192 bits)
 # Limbs are in little-endian order: limbs[0] is least significant
 pub struct BigInt
-    limbs: [64]u64      # Up to 4096 bits (64 * 64 = 4096)
+    limbs: [128]u64     # Up to 8192 bits (128 * 64), see BIGINT_MAX_LIMBS
     len: i32            # Number of significant limbs
 
 # ============================================================================
@@ -62,11 +70,13 @@ pub fn bigint_copy(dst: *BigInt, src: *BigInt)
 # ============================================================================
 
 # Load from big-endian bytes (most common format for crypto)
-pub fn bigint_from_bytes(a: *BigInt, data: *u8, len: i32)
+# Returns 0, or -1 (and a = 0) if the value has more than 8192 significant
+# bits. Leading zero bytes don't count.
+pub fn bigint_from_bytes(a: *BigInt, data: *u8, len: i32) -> i32
     bigint_zero(a)
 
     if len <= 0
-        return
+        return 0
 
     # Skip leading zeros
     var start: i32 = 0
@@ -77,15 +87,14 @@ pub fn bigint_from_bytes(a: *BigInt, data: *u8, len: i32)
 
     if start == len
         # All zeros
-        return
+        return 0
 
     let effective_len: i32 = len - start
 
     # Calculate number of limbs needed
     let num_limbs: i32 = (effective_len + 7) / 8
     if num_limbs > BIGINT_MAX_LIMBS
-        # Too large - truncate (shouldn't happen in practice)
-        return
+        return -1
 
     # Load bytes in little-endian limb order
     # data is big-endian, so we read from the end
@@ -105,6 +114,7 @@ pub fn bigint_from_bytes(a: *BigInt, data: *u8, len: i32)
     a.len = limb_idx
     if a.len == 0
         a.len = 1
+    return 0
 
 # Store to big-endian bytes
 # Returns number of bytes written
@@ -322,7 +332,11 @@ fn mul64_full(a: u64, b: u64, hi: *u64, lo: *u64)
 
 # result = a * b (schoolbook multiplication)
 # result must not alias a or b
-pub fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt)
+# Returns 0, or -1 (and result = 0) if the product needs more than
+# BIGINT_MAX_LIMBS limbs. Partial products and carries only ever add, so
+# the product overflows exactly when some nonzero amount lands at limb
+# BIGINT_MAX_LIMBS or above.
+pub fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt) -> i32
     bigint_zero(result)
 
     var i: i32 = 0
@@ -331,7 +345,11 @@ pub fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt)
         var j: i32 = 0
         while j < b.len
             let k: i32 = i + j
-            if k < BIGINT_MAX_LIMBS
+            if k >= BIGINT_MAX_LIMBS
+                if a.limbs[i] != 0 && b.limbs[j] != 0
+                    bigint_zero(result)
+                    return -1
+            else
                 var hi: u64 = 0
                 var lo: u64 = 0
                 mul64_full(a.limbs[i], b.limbs[j], @hi, @lo)
@@ -353,7 +371,10 @@ pub fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt)
 
         # Propagate carry
         var k: i32 = i + b.len
-        while carry != 0 && k < BIGINT_MAX_LIMBS
+        while carry != 0
+            if k >= BIGINT_MAX_LIMBS
+                bigint_zero(result)
+                return -1
             let sum: u64 = result.limbs[k] + carry
             if sum < result.limbs[k]
                 carry = 1
@@ -364,6 +385,7 @@ pub fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt)
         i += 1
 
     bigint_normalize(result)
+    return 0
 
 # ============================================================================
 # Modular Arithmetic
@@ -384,14 +406,18 @@ pub fn bigint_mod_fast(result: *BigInt, a: *BigInt, n: *BigInt)
         return
 
     let n_bits: i32 = bigint_bit_length(n)
+    if n_bits == 0
+        return  # n = 0: no residue; callers check (bigint_mod_exp refuses it)
     var shift: i32 = bigint_bit_length(result) - n_bits
 
-    # Shift n left
+    # Align n's top bit with result's, then walk it down one bit at a time.
+    # n << shift has the same bit length as result, so it always fits.
     var shifted_n: BigInt
+    bigint_shl_to(@shifted_n, n, shift)
     while shift >= 0
-        bigint_shl_to(@shifted_n, n, shift)
         if bigint_ge(result, @shifted_n) == 1
             bigint_sub(result, @shifted_n)
+        bigint_shr(@shifted_n, 1)
         shift -= 1
 
 # Left shift by bits positions
@@ -483,35 +509,48 @@ pub fn bigint_get_bit(a: *BigInt, pos: i32) -> i32
 
 # result = base^exp mod n
 # This is the core RSA operation: m = s^e mod n (signature verification)
-pub fn bigint_mod_exp(result: *BigInt, base: *BigInt, exp: *BigInt, n: *BigInt)
+# Returns 0, or -1 (and result = 0) if n is zero or wider than 4096 bits
+# (BIGINT_MAX_MODULUS_LIMBS): a square of a residue must fit in a BigInt.
+pub fn bigint_mod_exp(result: *BigInt, base: *BigInt, exp: *BigInt, n: *BigInt) -> i32
+    if bigint_is_zero(n) == 1 || bigint_bit_length(n) > BIGINT_MAX_MODULUS_LIMBS * 64
+        bigint_zero(result)
+        return -1
+
     var r: BigInt
     bigint_one(@r)
+    bigint_mod_fast(@r, @r, n)  # n = 1: 1 mod 1 = 0
 
     var b: BigInt
-    bigint_copy(@b, base)
-    bigint_mod_fast(@b, @b, n)
+    bigint_mod_fast(@b, base, n)
 
     let exp_bits: i32 = bigint_bit_length(exp)
 
     var i: i32 = 0
     while i < exp_bits
+        var tmp: BigInt
         if bigint_get_bit(exp, i) == 1
-            var tmp: BigInt
-            bigint_mul(@tmp, @r, @b)
+            # r, b < n <= 2^4096, so r * b < 2^8192 fits; checked anyway.
+            if bigint_mul(@tmp, @r, @b) != 0
+                bigint_zero(result)
+                return -1
             bigint_mod_fast(@r, @tmp, n)
 
-        # Square base
-        var tmp2: BigInt
-        bigint_mul(@tmp2, @b, @b)
-        bigint_mod_fast(@b, @tmp2, n)
+        # Square base (not needed after the top bit)
+        if i + 1 < exp_bits
+            if bigint_mul(@tmp, @b, @b) != 0
+                bigint_zero(result)
+                return -1
+            bigint_mod_fast(@b, @tmp, n)
 
         i += 1
 
     bigint_copy(result, @r)
+    return 0
 
 # result = base^exp mod n, where exp is a small u32
 # Optimized for RSA public exponent (usually 65537)
-pub fn bigint_mod_exp_u32(result: *BigInt, base: *BigInt, exp: u32, n: *BigInt)
+# Returns 0, or -1 as bigint_mod_exp.
+pub fn bigint_mod_exp_u32(result: *BigInt, base: *BigInt, exp: u32, n: *BigInt) -> i32
     var e: BigInt
     bigint_from_u64(@e, exp as u64)
-    bigint_mod_exp(result, base, @e, n)
+    return bigint_mod_exp(result, base, @e, n)
