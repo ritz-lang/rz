@@ -109,8 +109,7 @@ pub fn main() -> i32
     + """
 fn mk(k: i32) -> Result<Opt, i64>
     if k == 0
-        # Qualified: a bare `Ok(Vacant)` is a separate ctor bug (#2144).
-        return Ok(Opt.Vacant)
+        return Ok(Vacant)
     if k == 1
         return Ok(Holds(30))
     return Err(10)
