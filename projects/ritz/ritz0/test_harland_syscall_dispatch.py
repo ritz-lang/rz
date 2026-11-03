@@ -43,15 +43,17 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 # The syscall ABI, as user programs (ritzlib/sys.ritz, indium) encode it.
 # Changing a number here is an ABI break, not a refactor.
+# Stat (4), SpawnEx (28), Pipe (29), IpcCall (32), NetInfo (60) and NetPing (61)
+# were declared but never dispatched, so every call got an error (AGAST #2122):
+# they are gone, and their numbers are free.
 ABI = {
-    "Read": 0, "Write": 1, "Open": 2, "Close": 3, "Stat": 4, "Lseek": 8,
+    "Read": 0, "Write": 1, "Open": 2, "Close": 3, "Lseek": 8,
     "Mmap": 9, "Munmap": 11, "Readdir": 17,
     "Exit": 20, "Spawn": 21, "Wait": 22, "Getpid": 23, "Yield": 24,
-    "SpawnArgs": 25, "Getcwd": 26, "Chdir": 27, "SpawnEx": 28, "Pipe": 29,
-    "IpcSend": 30, "IpcRecv": 31, "IpcCall": 32, "IpcClose": 33,
+    "SpawnArgs": 25, "Getcwd": 26, "Chdir": 27,
+    "IpcSend": 30, "IpcRecv": 31, "IpcClose": 33,
     "CapGrant": 40, "CapRevoke": 41, "CapDerive": 42, "CapInfo": 43, "CapCheck": 44,
     "InputPoll": 50, "InputRead": 51,
-    "NetInfo": 60, "NetPing": 61,
     "Mkdir": 83,
     "ChannelCreate": 100,
     "AcpiPoweroff": 200,
@@ -59,13 +61,16 @@ ABI = {
     "DebugPrint": 255,
 }
 
-# What the old `if rax ==` ladder dispatched (Write and DebugPrint shared an arm).
+# What the old `if rax ==` ladder dispatched (Write and DebugPrint shared an arm),
+# plus Lseek and Mkdir, whose fs/syscall.ritz implementations were never wired
+# up (AGAST #2122). Every declared syscall is dispatched: see
+# test_every_declared_syscall_is_dispatched.
 DISPATCHED = {
     "Exit", "Open", "Close", "Write", "DebugPrint", "Read", "Yield", "Getpid",
     "Readdir", "Spawn", "SpawnArgs", "Wait", "ChannelCreate", "IpcSend",
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
-    "AcpiPoweroff", "FbInfo", "FbMap",
+    "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir",
 }
 
 
@@ -164,8 +169,8 @@ fn main() -> i32
         return 3
     if not syscall_has_handler(1)
         return 4
-    # Declared but never registered.
-    if syscall_has_handler(4) or syscall_dispatch(4, 0, 0, 0, 0) != ENOSYS
+    # Declared (Open) but not registered by this program.
+    if syscall_has_handler(2) or syscall_dispatch(2, 0, 0, 0, 0) != ENOSYS
         return 5
     # Not a syscall number at all, inside and beyond the table.
     if syscall_has_handler(5) or syscall_dispatch(5, 0, 0, 0, 0) != ENOSYS
@@ -225,3 +230,80 @@ def test_syscall_init_fills_the_table(tmp_path):
     m = re.search(r'^define [^\n]*@"syscall_init"\(.*?^}', ir, re.M | re.S)
     assert m, "no definition of syscall_init"
     assert '@"syscall_table_init"(' in m.group(0), m.group(0)
+
+
+# --- one ABI: ritzlib's harland numbers are the kernel's (AGAST #2122) -----------
+
+RITZLIB_SYS = RITZ_ROOT / "ritzlib" / "sys.ritz"
+
+
+def _kernel_enum():
+    """{variant: number} as syscall/numbers.ritz declares `enum Syscall: u64`."""
+    src = (KERNEL_SRC / "syscall" / "numbers.ritz").read_text()
+    m = re.search(r"^pub enum Syscall: u64\n((?:[ \t]+.*\n|[ \t]*\n|#.*\n)+)", src, re.M)
+    assert m, "syscall/numbers.ritz has no `pub enum Syscall: u64`"
+    return {k: int(v) for k, v in re.findall(r"^\s+(\w+)\s*=\s*(\d+)", m.group(1), re.M)}
+
+
+def _ritzlib_harland_numbers(src):
+    """{SYS_NAME: number} for every `const SYS_*` a harland build of ritzlib sees:
+    those under `[[target_os = "harland"]]` and those with no target attribute."""
+    nums = {}
+    attr = None
+    for line in src.splitlines():
+        a = re.match(r'^\[\[target_os\s*=\s*"(\w+)"\]\]', line)
+        if a:
+            attr = a.group(1)
+            continue
+        c = re.match(r"^(?:pub\s+)?const\s+(SYS_\w+)\s*:\s*\w+\s*=\s*(\d+)", line)
+        if c and attr in (None, "harland"):
+            assert c.group(1) not in nums, f"ritzlib declares {c.group(1)} twice for harland"
+            nums[c.group(1)] = int(c.group(2))
+        if line.strip() and not line.startswith("#"):
+            attr = None
+    return nums
+
+
+def _variant(sys_name):
+    """SYS_SPAWN_ARGS -> SpawnArgs: the Syscall variant a ritzlib constant names."""
+    return "".join(w.capitalize() for w in sys_name[len("SYS_"):].split("_"))
+
+
+def test_ritzlib_harland_numbers_match_kernel():
+    """ritzlib/sys.ritz can't import a kernel module, so its harland block keeps
+    its own SYS_* constants; this diff is what keeps them from drifting. Each one
+    names a Syscall variant with the same number, and so is dispatched."""
+    kernel = _kernel_enum()
+    lib = _ritzlib_harland_numbers(RITZLIB_SYS.read_text())
+    # Not vacuous: the parser sees the shared, the platform-split and the
+    # harland-only constants.
+    assert {"SYS_READ", "SYS_WRITE", "SYS_EXIT", "SYS_MMAP", "SYS_INPUT_READ"} <= set(lib), lib
+    wrong = {n: (v, kernel.get(_variant(n))) for n, v in lib.items() if kernel.get(_variant(n)) != v}
+    assert not wrong, "ritzlib SYS_* (value, kernel Syscall value) disagree: " + repr(wrong)
+
+
+def test_ritzlib_diff_sees_a_drifted_number():
+    """The diff's parser on a ritzlib that disagrees with the kernel: a harland
+    constant is picked up (and a Linux one is not), so a wrong number shows."""
+    src = ('[[target_os = "linux"]]\nconst SYS_MMAP: i64 = 9\n'
+           '[[target_os = "harland"]]\nconst SYS_MMAP: i64 = 10\n'
+           'const SYS_READ: i64 = 0\n')
+    assert _ritzlib_harland_numbers(src) == {"SYS_MMAP": 10, "SYS_READ": 0}
+    assert _kernel_enum()[_variant("SYS_MMAP")] != 10
+
+
+def test_every_declared_syscall_is_dispatched():
+    """No declared-but-undispatched syscalls: a user program can only name a
+    number the kernel has a handler for (anything else answers ENOSYS)."""
+    src = (KERNEL_SRC / "main.ritz").read_text()
+    registered = set(re.findall(r"^\s+syscall_register\(Syscall\.(\w+),", src, re.M))
+    assert set(_kernel_enum()) == registered, \
+        f"declared, not dispatched: {sorted(set(_kernel_enum()) - registered)}"
+
+
+def test_no_second_kernel_syscall_table():
+    """The dead arch/x86_64/syscall.ritz (SYS_MMAP = 10 against numbers.ritz's 9)
+    is gone, and nothing points readers at it."""
+    assert not (KERNEL_SRC / "arch" / "x86_64" / "syscall.ritz").exists()
+    for p in [HARLAND / "kernel" / "user_program.s", HARLAND / "build.py"]:
+        assert "arch/x86_64/syscall.ritz" not in p.read_text(), p

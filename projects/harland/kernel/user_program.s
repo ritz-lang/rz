@@ -8,7 +8,7 @@
 
 .section .text
 
-# Syscall numbers (must match kernel/src/arch/x86_64/syscall.ritz)
+# Syscall numbers (must match kernel/src/syscall/numbers.ritz, enum Syscall)
 .equ SYS_WRITE,       1
 .equ SYS_EXIT,        20
 .equ SYS_DEBUG_PRINT, 255

@@ -457,7 +457,7 @@ But the secure default remains explicit grants.
 
 - `projects/harland/docs/ARCHITECTURE.md` - Kernel architecture
 - `projects/harland/docs/KERNEL_CONTRACT.md` - API contract
-- `projects/harland/kernel/src/arch/x86_64/syscall.ritz` - Syscall implementation
+- `projects/harland/kernel/src/syscall/dispatch.ritz` - Syscall dispatch table
 - `projects/rzsh/` - Ritz shell project
 
 ---

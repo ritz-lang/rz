@@ -136,7 +136,6 @@ def find_ritz_sources(src_dir: Path) -> list[Path]:
     """
     # Modules to exclude (old/broken/WIP)
     exclude = {
-        "arch/x86_64/syscall.ritz",   # WIP - needs syntax updates
         "arch/x86_64/interrupts.ritz", # WIP - needs syntax updates
         "arch/x86_64/idt.ritz",       # WIP - needs syntax updates
         "arch/x86_64/apic.ritz",      # WIP - needs syntax updates
