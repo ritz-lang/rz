@@ -47,7 +47,7 @@ import net.icmp { icmp_ping }
 import net.arp { arp_print_cache }
 
 # Display driver imports
-import drivers.display.mod { SimpleFramebuffer, display_init, display_get_framebuffer, display_available, PIXEL_FORMAT_RGBX, PIXEL_FORMAT_BGRX }
+import drivers.display.mod { SimpleFramebuffer, display_init, display_get_framebuffer, display_available, PIXEL_FORMAT_RGBX, PIXEL_FORMAT_BGRX, PIXEL_FORMAT_UNSUPPORTED, Mb2FramebufferTag, mb2_fb_format, mb2_find_fb_tag, MB2_FB_TAG_RGB_MIN_SIZE }
 import drivers.display.framebuffer { fb_clear, fb_fill_rect, fb_fill_rect_rgb, fb_clear_rgb }
 
 # Input driver imports
@@ -234,6 +234,42 @@ pub fn klog_hex(prefix: *u8, value: u64, suffix: *u8) -> i32
 
 var boot_protocol: u32 = 0  # BOOT_PROTOCOL_UNKNOWN
 var harland_boot_info: *HarlandBootInfo = 0 as *HarlandBootInfo
+
+# Framebuffer from either boot protocol, captured at boot-protocol detection
+# (the multiboot2 info isn't reserved in the PMM, so the heap may reuse it).
+# boot_fb_addr == 0 means headless.
+var boot_fb_addr: u64 = 0
+var boot_fb_width: u32 = 0
+var boot_fb_height: u32 = 0
+var boot_fb_pitch: u32 = 0
+var boot_fb_bpp: u8 = 0
+var boot_fb_format: u8 = 0
+
+# Copy the multiboot2 framebuffer tag (type 8) into boot_fb_*, #2143.
+fn capture_mb2_framebuffer(mb_info_addr: u64)
+    let tag_addr: u64 = mb2_find_fb_tag(mb_info_addr)
+    if tag_addr == 0
+        prints("      Multiboot2: no framebuffer tag\n")
+        return
+    let tag: *Mb2FramebufferTag = tag_addr as *Mb2FramebufferTag
+    if (*tag).size < MB2_FB_TAG_RGB_MIN_SIZE
+        prints("      Multiboot2: framebuffer tag too short\n")
+        return
+    let format: u8 = mb2_fb_format((*tag).fb_type, (*tag).bpp, (*tag).red_pos, (*tag).green_pos, (*tag).blue_pos)
+    if format == PIXEL_FORMAT_UNSUPPORTED
+        prints("      Multiboot2: unsupported framebuffer type ")
+        serial_print_dec((*tag).fb_type as u64)
+        prints(" bpp ")
+        serial_print_dec((*tag).bpp as u64)
+        prints("\n")
+        return
+    boot_fb_addr = (*tag).addr
+    boot_fb_width = (*tag).width
+    boot_fb_height = (*tag).height
+    boot_fb_pitch = (*tag).pitch
+    boot_fb_bpp = (*tag).bpp
+    boot_fb_format = format
+
 # ============================================================================
 # Exception and IRQ Handlers
 # ============================================================================
@@ -2212,10 +2248,17 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
             harland_boot_info = boot_info_addr as *HarlandBootInfo
             prints("Boot protocol: Harland (UEFI)\n")
             has_boot_info = true
+            boot_fb_addr = (*harland_boot_info).framebuffer_addr
+            boot_fb_width = (*harland_boot_info).framebuffer_width
+            boot_fb_height = (*harland_boot_info).framebuffer_height
+            boot_fb_pitch = (*harland_boot_info).framebuffer_pitch
+            boot_fb_bpp = (*harland_boot_info).framebuffer_bpp
+            boot_fb_format = (*harland_boot_info).framebuffer_format
         else
             boot_protocol = BOOT_PROTOCOL_MULTIBOOT2
             prints("Boot protocol: Multiboot2 (BIOS/GRUB)\n")
             has_boot_info = true
+            capture_mb2_framebuffer(boot_info_addr)
     else
         boot_protocol = BOOT_PROTOCOL_UNKNOWN
         prints("Boot protocol: Unknown (no boot info)\n")
@@ -2288,14 +2331,14 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     vmm_reserve_page_tables()
 
     # Initialize Display subsystem (if framebuffer available)
-    if boot_protocol == BOOT_PROTOCOL_HARLAND and harland_boot_info != 0 as *HarlandBootInfo
+    if boot_fb_addr != 0
         klog(c"  [..] Display driver")
-        let fb_addr: u64 = (*harland_boot_info).framebuffer_addr
-        let fb_width: u32 = (*harland_boot_info).framebuffer_width
-        let fb_height: u32 = (*harland_boot_info).framebuffer_height
-        let fb_pitch: u32 = (*harland_boot_info).framebuffer_pitch
-        let fb_bpp: u8 = (*harland_boot_info).framebuffer_bpp
-        let fb_format: u8 = (*harland_boot_info).framebuffer_format
+        let fb_addr: u64 = boot_fb_addr
+        let fb_width: u32 = boot_fb_width
+        let fb_height: u32 = boot_fb_height
+        let fb_pitch: u32 = boot_fb_pitch
+        let fb_bpp: u8 = boot_fb_bpp
+        let fb_format: u8 = boot_fb_format
         let fb_result: i32 = display_init(fb_addr, fb_width, fb_height, fb_pitch, fb_bpp, fb_format)
         if fb_result == 0
             klog(c"\r  [OK] Display driver\n")

@@ -6,11 +6,10 @@
 # Two boots, both with the initramfs on a virtio-blk disk:
 #   native  OVMF -> Harland's own BOOTX64.EFI -> kernel.elf. The suite must
 #           report ALL TESTS PASSED.
-#   grub    OVMF -> standalone GRUB-EFI -> multiboot2 harland.elf. Under
-#           multiboot2 the kernel sets up no framebuffer, so hello_gfx fails
-#           there (#2143). This boot must
-#           finish the suite with no kernel exception and no failure other
-#           than hello_gfx.
+#   grub    OVMF -> standalone GRUB-EFI -> multiboot2 harland.elf. The
+#           kernel takes its framebuffer from the multiboot2 framebuffer tag
+#           (#2143). The display driver must come up and the suite must also
+#           report ALL TESTS PASSED.
 #
 # Each ESP is a QEMU vvfat directory, so the only tools needed are
 # qemu-system-x86_64, OVMF, grub-mkstandalone (x86_64-efi) and python3.
@@ -19,6 +18,7 @@
 # Usage: tools/test_tier1_boot.sh [native|grub|all]   (default: all)
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds per boot (default 60)
+#        KEEP_WORK=DIR  copy each boot's serial log (NAME.log) into DIR
 #
 # Exit: 0 = pass; 1 = a boot failed; 2 = a required tool is missing (setup
 #       error, not a regression).
@@ -67,7 +67,7 @@ for f in "$KERNEL_ELF" "$LOADER_EFI" "$PROJECTS_DIR/indium/build/debug/init.elf"
 done
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
 for pkg in $USER_PKGS; do
     cp "$PROJECTS_DIR/$pkg"/build/debug/*.elf "$WORK/bin/" 2>/dev/null || true
@@ -116,6 +116,17 @@ no_exception() {
     fi
 }
 
+# all_passed NAME: pass only if the kernel took no exception and the suite
+# reported ALL TESTS PASSED.
+all_passed() {
+    if no_exception "$1" && grep -aq "ALL TESTS PASSED" "$WORK/$1.log"; then
+        echo "PASS ($1): init Tier-1 suite: ALL TESTS PASSED"
+    else
+        grep -aq "ALL TESTS PASSED" "$WORK/$1.log" || echo "FAIL ($1): suite did not report ALL TESTS PASSED"
+        return 1
+    fi
+}
+
 rc=0
 
 if [ "$MODE" != grub ]; then
@@ -123,39 +134,31 @@ if [ "$MODE" != grub ]; then
     cp "$LOADER_EFI" "$WORK/esp-native/EFI/BOOT/BOOTX64.EFI"
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
     boot native "$WORK/esp-native"
-    if no_exception native && grep -aq "ALL TESTS PASSED" "$WORK/native.log"; then
-        echo "PASS (native): init Tier-1 suite: ALL TESTS PASSED"
-    else
-        grep -aq "ALL TESTS PASSED" "$WORK/native.log" || echo "FAIL (native): suite did not report ALL TESTS PASSED"
-        rc=1
-    fi
+    all_passed native || rc=1
 fi
 
 if [ "$MODE" != native ]; then
     mkdir -p "$WORK/esp-grub/EFI/BOOT"
+    # A standalone GRUB image loads no video driver by itself; without one
+    # it can't honour the kernel's multiboot2 framebuffer request.
     cat > "$WORK/grub.cfg" <<'EOF'
 set timeout=0
+insmod all_video
 menuentry "Harland" { multiboot2 /boot/harland.elf; boot; }
 EOF
     grub-mkstandalone -O x86_64-efi -o "$WORK/esp-grub/EFI/BOOT/BOOTX64.EFI" \
         "boot/grub/grub.cfg=$WORK/grub.cfg" "boot/harland.elf=$KERNEL_ELF" \
         || setup_error "grub-mkstandalone failed"
     boot grub "$WORK/esp-grub"
-    # Tier-1 test lines look like "[test] NAME ... <child output> FAIL ...".
-    # The verdict can land lines later, so pair each FAIL with the last
-    # "[test]" line before it.
-    unexpected=$(awk '/^\[test\] /{t=$2} /FAIL \(/ && t!="" && t!="hello_gfx"{print t}' "$WORK/grub.log")
-    if ! no_exception grub; then
-        rc=1
-    elif ! grep -aq "Results:" "$WORK/grub.log"; then
-        echo "FAIL (grub): suite did not finish"
-        rc=1
-    elif [ -n "$unexpected" ]; then
-        echo "FAIL (grub): tests failed other than hello_gfx:" $unexpected
-        rc=1
+    # The framebuffer must come from the multiboot2 tag, not just be absent
+    # and tolerated (#2143).
+    if grep -aq "\[OK\] Display driver" "$WORK/grub.log"; then
+        grep -aA1 "\[OK\] Display driver" "$WORK/grub.log" | grep -a "Resolution" | sed 's/^ */      grub framebuffer: /'
     else
-        echo "PASS (grub): suite finished, no exception, no failure but hello_gfx (no multiboot2 framebuffer)"
+        echo "FAIL (grub): display driver did not come up from the multiboot2 framebuffer tag"
+        rc=1
     fi
+    all_passed grub || rc=1
 fi
 
 exit $rc

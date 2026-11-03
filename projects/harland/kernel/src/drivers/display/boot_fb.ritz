@@ -1,0 +1,72 @@
+# Boot framebuffer description
+#
+# Pixel-format constants shared by every boot path, and the multiboot2
+# framebuffer info tag (type 8) GRUB hands the kernel (#2143). No imports,
+# so hosted tests (test/test_boot_fb.ritz) can exercise it directly.
+
+# Pixel format constants (from UEFI GOP; match FB_FORMAT_* in framebuffer.ritz)
+pub const PIXEL_FORMAT_RGBX: u8 = 0     # Red-Green-Blue-Reserved
+pub const PIXEL_FORMAT_BGRX: u8 = 1     # Blue-Green-Red-Reserved (most common)
+pub const PIXEL_FORMAT_BITMASK: u8 = 2  # Custom bitmask
+# Returned by mb2_fb_format for framebuffers the driver can't draw to
+pub const PIXEL_FORMAT_UNSUPPORTED: u8 = 0xFF
+
+# Multiboot2 framebuffer info tag (type 8), multiboot2 spec 3.6.12. The color
+# info after `reserved` is only laid out like this for fb_type ==
+# MB2_FB_TYPE_RGB; the tag is then at least 38 bytes.
+pub struct Mb2FramebufferTag
+    tag_type: u32
+    size: u32
+    addr: u64
+    pitch: u32
+    width: u32
+    height: u32
+    bpp: u8
+    fb_type: u8
+    reserved: u16
+    red_pos: u8
+    red_size: u8
+    green_pos: u8
+    green_size: u8
+    blue_pos: u8
+    blue_size: u8
+
+pub const MB2_FB_TAG_RGB_MIN_SIZE: u32 = 38
+
+const MB2_TAG_END_TYPE: u32 = 0
+const MB2_TAG_FRAMEBUFFER_INFO: u32 = 8
+
+pub const MB2_FB_TYPE_INDEXED: u8 = 0
+pub const MB2_FB_TYPE_RGB: u8 = 1
+pub const MB2_FB_TYPE_EGA_TEXT: u8 = 2
+
+# Map a multiboot2 framebuffer's type, depth and channel positions to a
+# PIXEL_FORMAT_*. The driver draws 32-bit pixels with 8-bit channels, so only
+# direct-RGB 32bpp with green at bit 8 and red/blue at bits 0/16 is usable.
+pub fn mb2_fb_format(fb_type: u8, bpp: u8, red_pos: u8, green_pos: u8, blue_pos: u8) -> u8
+    if fb_type != MB2_FB_TYPE_RGB or bpp != 32 or green_pos != 8
+        return PIXEL_FORMAT_UNSUPPORTED
+    if red_pos == 16 and blue_pos == 0
+        return PIXEL_FORMAT_BGRX
+    if red_pos == 0 and blue_pos == 16
+        return PIXEL_FORMAT_RGBX
+    return PIXEL_FORMAT_UNSUPPORTED
+
+# Find the framebuffer info tag in a multiboot2 info block. Returns its
+# address, or 0 when the bootloader gave no framebuffer.
+pub fn mb2_find_fb_tag(mb_info_addr: u64) -> u64
+    let total_size: *u32 = mb_info_addr as *u32
+    let info_end: u64 = mb_info_addr + *total_size as u64
+    var tag_ptr: u64 = mb_info_addr + 8
+
+    while tag_ptr + 8 <= info_end
+        let tag_type: *u32 = tag_ptr as *u32
+        let tag_size: *u32 = (tag_ptr + 4) as *u32
+        if *tag_type == MB2_TAG_END_TYPE or *tag_size < 8
+            break
+        if *tag_type == MB2_TAG_FRAMEBUFFER_INFO
+            return tag_ptr
+        # Tags are 8-byte aligned
+        tag_ptr = (tag_ptr + *tag_size as u64 + 7) & ~7
+
+    return 0

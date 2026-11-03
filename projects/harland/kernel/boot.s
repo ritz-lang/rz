@@ -27,14 +27,16 @@ multiboot_header:
     .long multiboot_header_end - multiboot_header  # Header length
     .long -(0xE85250D6 + 0 + (multiboot_header_end - multiboot_header))  # Checksum
 
-    # Framebuffer tag (optional, request linear framebuffer)
-    # .align 8
-    # .word 5                           # Type: framebuffer
-    # .word 0                           # Flags
-    # .long 20                          # Size
-    # .long 1024                        # Width
-    # .long 768                         # Height
-    # .long 32                          # Depth
+    # Framebuffer request tag: ask for a linear 32bpp framebuffer, reported
+    # back in the type-8 info tag (#2143). Flag bit 0 = optional, so a
+    # loader with no graphics still boots the kernel headless.
+    .align 8
+    .word 5                             # Type: framebuffer
+    .word 1                             # Flags: optional
+    .long 20                            # Size
+    .long 1024                          # Width
+    .long 768                           # Height
+    .long 32                            # Depth
 
     # End tag (required)
     .align 8

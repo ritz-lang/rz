@@ -1,0 +1,116 @@
+# Harland - boot framebuffer tests (#2143)
+#
+# Multiboot2 framebuffer tag (type 8) lookup and its pixel-format mapping.
+# GRUB only reaches the display driver through these, so a wrong answer
+# here means a headless GRUB boot or swapped red/blue.
+
+import drivers.display.boot_fb { PIXEL_FORMAT_RGBX, PIXEL_FORMAT_BGRX, PIXEL_FORMAT_UNSUPPORTED, MB2_FB_TYPE_INDEXED, MB2_FB_TYPE_RGB, MB2_FB_TYPE_EGA_TEXT, Mb2FramebufferTag, mb2_fb_format, mb2_find_fb_tag }
+
+# A multiboot2 info block: 8-byte header, then tags, each 8-byte aligned
+var g_mbi: [16]u64
+
+fn put_u32(base: u64, off: u64, v: u32)
+    let p: *u32 = (base + off) as *u32
+    *p = v
+
+fn put_u8(base: u64, off: u64, v: u8)
+    let p: *u8 = (base + off) as *u8
+    *p = v
+
+fn mbi_base() -> u64
+    return @g_mbi as u64
+
+# Lay out: [header][cmdline tag, size 13 -> padded to 16][fb tag?][end tag]
+fn build_mbi(with_fb: bool) -> u64
+    let b: u64 = mbi_base()
+    var i: u64 = 0
+    while i < 16
+        g_mbi[i] = 0
+        i = i + 1
+    # cmdline tag (type 1), size 13: forces the 8-byte alignment step
+    put_u32(b, 8, 1)
+    put_u32(b, 12, 13)
+    var off: u64 = 24
+    if with_fb
+        # Framebuffer info tag at the offsets the multiboot2 spec gives
+        put_u32(b, off, 8)
+        put_u32(b, off + 4, 38)
+        put_u32(b, off + 8, 0x80000000)    # addr low
+        put_u32(b, off + 12, 0x1)          # addr high
+        put_u32(b, off + 16, 4096)         # pitch
+        put_u32(b, off + 20, 1024)         # width
+        put_u32(b, off + 24, 768)          # height
+        put_u8(b, off + 28, 32)            # bpp
+        put_u8(b, off + 29, 1)             # type: direct RGB
+        put_u8(b, off + 32, 16)            # red position
+        put_u8(b, off + 33, 8)             # red mask size
+        put_u8(b, off + 34, 8)             # green position
+        put_u8(b, off + 35, 8)             # green mask size
+        put_u8(b, off + 36, 0)             # blue position
+        put_u8(b, off + 37, 8)             # blue mask size
+        off = off + 40
+    # end tag
+    put_u32(b, off, 0)
+    put_u32(b, off + 4, 8)
+    put_u32(b, 0, (off + 8) as u32)
+    return b
+
+[[test]]
+fn test_mb2_format_bgrx() -> i32
+    # GOP's usual layout: red at bit 16, blue at bit 0
+    assert mb2_fb_format(MB2_FB_TYPE_RGB, 32, 16, 8, 0) == PIXEL_FORMAT_BGRX
+    0
+
+[[test]]
+fn test_mb2_format_rgbx() -> i32
+    assert mb2_fb_format(MB2_FB_TYPE_RGB, 32, 0, 8, 16) == PIXEL_FORMAT_RGBX
+    0
+
+[[test]]
+fn test_mb2_format_rejects_non_rgb_types() -> i32
+    assert mb2_fb_format(MB2_FB_TYPE_INDEXED, 32, 16, 8, 0) == PIXEL_FORMAT_UNSUPPORTED
+    assert mb2_fb_format(MB2_FB_TYPE_EGA_TEXT, 16, 0, 0, 0) == PIXEL_FORMAT_UNSUPPORTED
+    0
+
+[[test]]
+fn test_mb2_format_rejects_non_32bpp() -> i32
+    # 24bpp packs 3 bytes per pixel; the driver writes u32 pixels
+    assert mb2_fb_format(MB2_FB_TYPE_RGB, 24, 16, 8, 0) == PIXEL_FORMAT_UNSUPPORTED
+    assert mb2_fb_format(MB2_FB_TYPE_RGB, 16, 11, 5, 0) == PIXEL_FORMAT_UNSUPPORTED
+    0
+
+[[test]]
+fn test_mb2_format_rejects_odd_channel_layout() -> i32
+    assert mb2_fb_format(MB2_FB_TYPE_RGB, 32, 24, 16, 8) == PIXEL_FORMAT_UNSUPPORTED
+    assert mb2_fb_format(MB2_FB_TYPE_RGB, 32, 16, 0, 8) == PIXEL_FORMAT_UNSUPPORTED
+    0
+
+[[test]]
+fn test_mb2_tag_layout() -> i32
+    # The struct must read each field from its spec offset
+    let b: u64 = build_mbi(true)
+    let t: *Mb2FramebufferTag = (b + 24) as *Mb2FramebufferTag
+    assert (*t).tag_type == 8
+    assert (*t).size == 38
+    assert (*t).addr == 0x180000000
+    assert (*t).pitch == 4096
+    assert (*t).width == 1024
+    assert (*t).height == 768
+    assert (*t).bpp == 32
+    assert (*t).fb_type == MB2_FB_TYPE_RGB
+    assert (*t).red_pos == 16
+    assert (*t).green_pos == 8
+    assert (*t).blue_pos == 0
+    0
+
+[[test]]
+fn test_mb2_find_fb_tag_after_unaligned_tag() -> i32
+    let b: u64 = build_mbi(true)
+    assert mb2_find_fb_tag(b) == b + 24
+    0
+
+[[test]]
+fn test_mb2_find_fb_tag_absent() -> i32
+    let b: u64 = build_mbi(false)
+    assert mb2_find_fb_tag(b) == 0
+    0

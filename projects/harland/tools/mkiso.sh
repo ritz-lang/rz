@@ -55,6 +55,9 @@ cat > "$ISO_DIR/boot/grub/grub.cfg" << 'EOF'
 
 set timeout=0
 set default=0
+# Load GOP/VBE drivers so GRUB can honour the kernel's multiboot2
+# framebuffer request (#2143)
+insmod all_video
 
 menuentry "Harland" {
     multiboot2 /boot/harland.elf

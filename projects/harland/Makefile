@@ -51,6 +51,7 @@ iso: kernel
 	@cp $(KERNEL) $(BUILD_DIR)/isodir/boot/harland.elf
 	@echo 'set timeout=0' > $(BUILD_DIR)/isodir/boot/grub/grub.cfg
 	@echo 'set default=0' >> $(BUILD_DIR)/isodir/boot/grub/grub.cfg
+	@echo 'insmod all_video' >> $(BUILD_DIR)/isodir/boot/grub/grub.cfg
 	@echo 'menuentry "Harland" { multiboot2 /boot/harland.elf; boot; }' >> $(BUILD_DIR)/isodir/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(BUILD_DIR)/isodir -- -volid "HARLAND"
 
