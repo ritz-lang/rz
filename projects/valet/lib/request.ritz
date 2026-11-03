@@ -115,15 +115,34 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
         return -2  # Malformed
     pos += 2
 
-    # Parse headers - look for end of headers and Content-Length
-    req.keep_alive = 1  # HTTP/1.1 default
+    # Parse headers - look for end of headers, Content-Length and Connection.
+    #
+    # Persistence (RFC 9112 9.3): HTTP/1.1 persists unless the client sends
+    # "Connection: close"; HTTP/1.0 persists only with "Connection:
+    # keep-alive".  This used to be a flat `keep_alive = 1`, so HTTP/1.0
+    # clients such as ApacheBench waited forever for a close (AGAST #2106).
+    req.keep_alive = request_version_is_11(req)
+    var conn_close: i32 = 0
+    var conn_keep: i32 = 0
 
     while pos < len
         # Check for end of headers (empty line)
         if *(buf + pos) == '\r'
             if pos + 1 < len && *(buf + pos + 1) == '\n'
                 req.headers_end = pos + 2
+                if conn_close == 1
+                    req.keep_alive = 0
+                else if conn_keep == 1
+                    req.keep_alive = 1
                 return req.headers_end
+
+        # Connection header: scan its comma-separated tokens.
+        if header_name_is(buf, pos, len, c"connection", 10) == 1
+            let tok: i32 = connection_tokens(buf, pos + 11, len)
+            if (tok & CONN_TOKEN_CLOSE) != 0
+                conn_close = 1
+            if (tok & CONN_TOKEN_KEEP_ALIVE) != 0
+                conn_keep = 1
 
         # Check for Content-Length header (case-insensitive check for first char)
         let line_start: i32 = pos
@@ -173,6 +192,70 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
             pos += 1
 
     return -1  # Incomplete - didn't find end of headers
+
+
+# 1 when the request line's version is exactly "HTTP/1.1".
+fn request_version_is_11(req: *Request) -> i32
+    if req.version_len != 8
+        return 0
+    let v: *u8 = c"HTTP/1.1"
+    for i in 0..8
+        if *(req.version_ptr + i) != *(v + i)
+            return 0
+    return 1
+
+
+fn ascii_lower(ch: u8) -> u8
+    if ch >= 'A' and ch <= 'Z'
+        return ch + 32
+    return ch
+
+
+# 1 when the header line at `pos` is `name` (lowercase, `name_len` bytes)
+# followed directly by ':' — case-insensitive, so "Connection-Foo:" and
+# "X-Connection:" do not match "connection".
+fn header_name_is(buf: *u8, pos: i32, len: i32, name: *u8, name_len: i32) -> i32
+    if pos + name_len >= len
+        return 0
+    for i in 0..name_len
+        if ascii_lower(*(buf + pos + i)) != *(name + i)
+            return 0
+    if *(buf + pos + name_len) != ':'
+        return 0
+    return 1
+
+
+const CONN_TOKEN_CLOSE: i32 = 1
+const CONN_TOKEN_KEEP_ALIVE: i32 = 2
+
+
+# 1 when bytes [start, end) equal `word` (lowercase) case-insensitively.
+fn token_eq(buf: *u8, start: i32, end: i32, word: *u8, word_len: i32) -> i32
+    if end - start != word_len
+        return 0
+    for i in 0..word_len
+        if ascii_lower(*(buf + start + i)) != *(word + i)
+            return 0
+    return 1
+
+
+# Scan a Connection header value starting at `pos` up to CRLF; return a
+# bitmask of CONN_TOKEN_* for the "close" / "keep-alive" tokens present.
+fn connection_tokens(buf: *u8, pos: i32, len: i32) -> i32
+    var mask: i32 = 0
+    var p: i32 = pos
+    while p < len and *(buf + p) != '\r'
+        # Skip separators / optional whitespace
+        while p < len and (*(buf + p) == ' ' or *(buf + p) == '\t' or *(buf + p) == ',')
+            p += 1
+        let start: i32 = p
+        while p < len and *(buf + p) != ',' and *(buf + p) != '\r' and *(buf + p) != ' ' and *(buf + p) != '\t'
+            p += 1
+        if token_eq(buf, start, p, c"close", 5) == 1
+            mask = mask | CONN_TOKEN_CLOSE
+        if token_eq(buf, start, p, c"keep-alive", 10) == 1
+            mask = mask | CONN_TOKEN_KEEP_ALIVE
+    return mask
 
 
 # Bytes a complete request occupies: headers_end + Content-Length.

@@ -28,7 +28,9 @@ $V -z /run/zeus/zeus.sock   # Reverse-proxy to a zeus daemon
 $V --help               # Authoritative option list
 
 # Test
-./rz test valet         # 5 .ritz test files, 99 [[test]] fns — exit 0, several minutes
+./rz test valet         # .ritz files under test/ (10 files, 151 tests on 2026-11-03) — exit 0, several minutes
+# Shell suites are not wired into `rz test` (#1403); run them by hand, e.g.
+#   cd projects/valet && VALET=./build/debug/valet bash test/test_workers.sh
 
 # Benchmark
 $V -p 8080 &

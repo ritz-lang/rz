@@ -373,6 +373,30 @@ pub fn ctx_body(buf: *u8, buf_len: i32) -> i32
     return copy_len
 
 
+# 1 when the connection should stay open after answering `req`, the
+# `request_count`-th request on it: the client asked to persist (see
+# request_parse) and the per-connection cap isn't reached (AGAST #2106).
+pub fn valet_keep_alive(req: *Request, request_count: i32, max_requests: i32) -> i32
+    if req.keep_alive == 0
+        return 0
+    if request_count >= max_requests
+        return 0
+    return 1
+
+
+# Connection header value for the response being built in `c`: "close"
+# when valet will close after it, so the header never promises reuse the
+# server won't honour.
+fn ctx_connection_value(c: *HandlerContext) -> *u8
+    if c.req != null and c.req.keep_alive == 0
+        return c"close"
+    let app: *Valet = get_g_app()
+    if c.task != null and app != null
+        if c.task.request_count >= app.keepalive_requests
+            return c"close"
+    return c"keep-alive"
+
+
 # Send a plain text response
 pub fn ctx_text(status: i32, body: *u8) -> i32
     let c: *HandlerContext = get_g_ctx()
@@ -382,7 +406,7 @@ pub fn ctx_text(status: i32, body: *u8) -> i32
     response_status(c.res, status)
     response_header(c.res, c"Content-Type", c"text/plain")
     response_content_length(c.res, body_len as i64)
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     response_body(c.res, body, body_len)
     return 0
@@ -396,7 +420,7 @@ pub fn ctx_json(status: i32, json: *u8, json_len: i32) -> i32
     response_status(c.res, status)
     response_header(c.res, c"Content-Type", c"application/json")
     response_content_length(c.res, json_len as i64)
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     response_body(c.res, json, json_len)
     return 0
@@ -421,7 +445,7 @@ pub fn ctx_html(status: i32, body: *u8) -> i32
     response_status(c.res, status)
     response_header(c.res, c"Content-Type", c"text/html; charset=utf-8")
     response_content_length(c.res, body_len as i64)
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     response_body(c.res, body, body_len)
     return 0
@@ -435,7 +459,7 @@ pub fn ctx_redirect(location: *u8) -> i32
     response_status(c.res, 302)
     response_header(c.res, c"Location", location)
     response_content_length(c.res, 0)
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     return 0
 
@@ -497,7 +521,7 @@ pub fn ctx_text_compressed(status: i32, body: *u8) -> i32
             if enc_header != null
                 response_header(c.res, c"Content-Encoding", enc_header)
             response_content_length(c.res, compressed_len)
-            response_header(c.res, c"Connection", c"keep-alive")
+            response_header(c.res, c"Connection", ctx_connection_value(c))
             response_header(c.res, c"Vary", c"Accept-Encoding")
             response_end_headers(c.res)
             response_body(c.res, @compress_buf[0], compressed_len as i32)
@@ -507,7 +531,7 @@ pub fn ctx_text_compressed(status: i32, body: *u8) -> i32
     response_status(c.res, status)
     response_header(c.res, c"Content-Type", c"text/plain")
     response_content_length(c.res, body_len)
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     response_body(c.res, body, body_len as i32)
     return 0
@@ -541,7 +565,7 @@ pub fn ctx_json_compressed(status: i32, json: *u8, json_len: i32) -> i32
             if enc_header != null
                 response_header(c.res, c"Content-Encoding", enc_header)
             response_content_length(c.res, compressed_len)
-            response_header(c.res, c"Connection", c"keep-alive")
+            response_header(c.res, c"Connection", ctx_connection_value(c))
             response_header(c.res, c"Vary", c"Accept-Encoding")
             response_end_headers(c.res)
             response_body(c.res, @compress_buf[0], compressed_len as i32)
@@ -551,7 +575,7 @@ pub fn ctx_json_compressed(status: i32, json: *u8, json_len: i32) -> i32
     response_status(c.res, status)
     response_header(c.res, c"Content-Type", c"application/json")
     response_content_length(c.res, body_len)
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     response_body(c.res, json, json_len)
     return 0
@@ -578,7 +602,7 @@ pub fn ctx_body_large_compressed(status: i32, body: *u8, body_len: i64, content_
         if enc_header != null
             response_header(c.res, c"Content-Encoding", enc_header)
         response_content_length(c.res, result.len)
-        response_header(c.res, c"Connection", c"keep-alive")
+        response_header(c.res, c"Connection", ctx_connection_value(c))
         response_header(c.res, c"Vary", c"Accept-Encoding")
         response_end_headers(c.res)
         response_body(c.res, result.data, result.len as i32)
@@ -589,7 +613,7 @@ pub fn ctx_body_large_compressed(status: i32, body: *u8, body_len: i64, content_
     response_status(c.res, status)
     response_header(c.res, c"Content-Type", content_type)
     response_content_length(c.res, body_len)
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     response_body(c.res, body, body_len as i32)
     return 0
@@ -624,7 +648,7 @@ pub fn ctx_body_streaming_compressed(status: i32, body: *u8, body_len: i64, cont
         if enc_header != null
             response_header(c.res, c"Content-Encoding", enc_header)
 
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_header(c.res, c"Vary", c"Accept-Encoding")
     response_end_headers(c.res)
 
@@ -685,7 +709,7 @@ pub fn ctx_body_chunked_uncompressed(status: i32, body: *u8, body_len: i64, cont
     response_status(c.res, status)
     response_header(c.res, c"Content-Type", content_type)
     response_header(c.res, c"Transfer-Encoding", c"chunked")
-    response_header(c.res, c"Connection", c"keep-alive")
+    response_header(c.res, c"Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     response_body(c.res, null, 0)
 
@@ -1202,6 +1226,13 @@ pub fn valet_handle_connection(task: *Task) -> i32
         # Get global app pointer
         let app: *Valet = get_g_app()
 
+        # Client won't reuse the connection (HTTP/1.0 without keep-alive,
+        # or "Connection: close"): saturate the counter so every
+        # `request_count < keepalive_requests` check below closes after
+        # this response (AGAST #2106).
+        if valet_keep_alive(@req, task.request_count, app.keepalive_requests) == 0
+            task.request_count = app.keepalive_requests
+
         # Check for static file request first (only for GET requests)
         if request_is_get(@req) != 0
             if valet_try_static(app, task, req.path_ptr, req.path_len) != 0
@@ -1581,6 +1612,10 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
             return 0
 
         task.request_count += 1
+        # See valet_handle_connection: close after this response unless
+        # the client asked to persist (AGAST #2106).
+        if valet_keep_alive(@req, task.request_count, app.keepalive_requests) == 0
+            task.request_count = app.keepalive_requests
 
         # Build response
         var http_res: [4096]u8

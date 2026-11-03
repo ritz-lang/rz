@@ -30,8 +30,11 @@ SERVER_PID=""
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
-        # Kill the parent and all children (workers)
-        kill -9 -$(ps -o pgid= -p $SERVER_PID | tr -d ' ') 2>/dev/null || true
+        # Kill the parent and all children (workers): valet leads its own
+        # process group (setsid below).  Without setsid a non-interactive
+        # shell puts valet in the script's own group, and this kill took
+        # the script down with it -> exit 137 after "All passed" (#2106).
+        kill -9 -- -"$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
 }
@@ -40,7 +43,9 @@ trap cleanup EXIT
 
 # Start server with multiple workers
 echo "Starting Valet with $WORKERS workers on port $PORT..."
-$VALET -w $WORKERS -p $PORT &
+# setsid execs in place (a background job is never a group leader), so
+# $! is valet itself and its PID is the new process group ID.
+setsid $VALET -w $WORKERS -p $PORT &
 SERVER_PID=$!
 sleep 1
 
