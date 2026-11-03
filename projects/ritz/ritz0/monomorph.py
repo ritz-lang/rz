@@ -527,6 +527,14 @@ class Monomorphizer:
                     if key not in self.function_instantiations:
                         mangled = mangle_generic_name(fn_name, expr.type_args)
                         self.function_instantiations[key] = mangled
+            # AGAST #1824: format_into(sink, "...") appends through
+            # `sink.push_bytes(..)`, so a generic sink (`*Vec<u8>` ->
+            # vec_push_bytes<u8>) needs that method instantiated even when
+            # nothing else calls it.
+            if (isinstance(expr.func, rast.Ident) and expr.func.name == 'format_into'
+                    and expr.args):
+                self._register_method_instantiation(
+                    rast.MethodCall(expr.span, expr.args[0], 'push_bytes', []))
         elif isinstance(expr, rast.StructLit):
             for _, field_expr in expr.fields:
                 self._visit_expr(field_expr)

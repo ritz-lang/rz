@@ -454,7 +454,7 @@ struct String
 | `string_push_str` | `fn(s: @&String, sv: StrView) -> i32` | Push StrView (a `"..."` literal) |
 | `string_push_cstr` | `fn(s: @&String, cstr: *u8) -> i32` | Push NUL-terminated C string |
 | `string_push_string` | `fn(s: @&String, other: @String) -> i32` | Push String |
-| `string_push_bytes` | `fn(s: @&String, bytes: *u8, len: i64) -> i32` | Push bytes |
+| `string_push_bytes` | `fn(s: @&String, bytes: *u8, len: i64) -> i32` | Push bytes; what `format_into(@&s, "...")` appends through (AGAST #1824) |
 | `string_push_i64` | `fn(s: @&String, n: i64) -> i32` | Push an integer in decimal (all of i64); replaces `itoa` |
 | `string_clear` | `fn(s: @&String)` | Clear string |
 | `string_pop` | `fn(s: @&String) -> u8` | Pop last byte |
@@ -889,6 +889,7 @@ explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 | `growbuf_append` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> i32` | Append bytes |
 | `growbuf_append_view` | `fn(b: @&GrowBuf, s: StrView) -> i32` | Append a StrView |
 | `growbuf_append_byte` | `fn(b: @&GrowBuf, byte: u8) -> i32` | Append single byte |
+| `growbuf_push_bytes` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> i32` | `growbuf_append` under the `push_bytes` name `format_into(@&b, "...")` appends through (AGAST #1824) |
 | `growbuf_clear` | `fn(b: @&GrowBuf) -> i32` | Clear (keep capacity) |
 | `growbuf_len` | `fn(b: @GrowBuf) -> i64` | Get length |
 | `growbuf_cap` | `fn(b: @GrowBuf) -> i64` | Get capacity |

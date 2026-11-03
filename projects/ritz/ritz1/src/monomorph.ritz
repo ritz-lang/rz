@@ -864,6 +864,30 @@ fn rewrite_enum_from_call(m: *Module, e: *Expr)
     e.call_type_suffix_len = 0
     e.left = null
 
+# Register the UFCS instantiation a call of `method` on receiver `recv`
+# dispatches to: `vec_<method>$T` / `span_<method>$T` when `recv` is a
+# tracked Vec / Span local, a field of one (`r.raw.push(9)`, AGAST #1512), or
+# `@` / `@&` of either (format_into's sink, AGAST #1824).
+fn register_receiver_method(m: *Module, recv: *Expr, method: *u8, method_len: i32)
+    var r: *Expr = recv
+    if r != null and r.kind == EXPR_UNARY and (r.op == OP_ADDR or r.op == OP_ADDR_MUT)
+        r = r.operand
+    if r == null
+        return
+    if r.kind == EXPR_IDENT
+        let lv_idx: i32 = find_local_var_idx(r.ident_ptr, r.ident_len)
+        if lv_idx >= 0
+            register_ufcs_instantiation(m, *(g_lv_prefix_kind + lv_idx), *(g_lv_suffixes + lv_idx), *(g_lv_suffix_lens + lv_idx), method, method_len)
+    else if r.kind == EXPR_MEMBER
+        # A `*Vec<T>` field dispatches to the same `vec_<method>$T` as a
+        # by-value one (the emitter passes the pointer it holds).
+        let rf: *StructField = resolve_member_field(m, r)
+        if rf != null and (rf.field_type == TYPE_STRUCT or rf.field_type == TYPE_PTR)
+            var fsuf: *u8 = null
+            var fsuf_len: i32 = 0
+            let fkind: i32 = classify_collection_type(rf.field_type_name, rf.field_type_name_len, @fsuf, @fsuf_len)
+            register_ufcs_instantiation(m, fkind, fsuf, fsuf_len, method, method_len)
+
 fn collect_from_expr(m: *Module, e: *Expr)
     if e == null
         return
@@ -875,6 +899,11 @@ fn collect_from_expr(m: *Module, e: *Expr)
         # Check if this is a generic call (has type suffix)
         if e.call_type_suffix_len > 0
             add_instantiation(e.func_name, e.func_name_len, e.call_type_suffix, e.call_type_suffix_len)
+        # AGAST #1824: format_into(sink, "...") appends through
+        # `sink.push_bytes(..)`, so a generic sink (`*Vec<u8>` ->
+        # vec_push_bytes$u8) needs that method even when nothing else calls it.
+        if e.args != null and buf_eq(e.func_name, e.func_name_len, c"format_into", 11) == 1
+            register_receiver_method(m, e.args, c"push_bytes", 10)
         # Recurse into arguments
         var arg: *Expr = e.args
         while arg != null
@@ -916,22 +945,7 @@ fn collect_from_expr(m: *Module, e: *Expr)
         # function body.  Without this, the linker fails on the missing
         # `vec_<method>$T` symbol (the emitter's UFCS dispatch falls
         # back to the broken `Vec$T_<method>` mangling).
-        if e.left != null and e.left.kind == EXPR_IDENT
-            let lv_idx: i32 = find_local_var_idx(e.left.ident_ptr, e.left.ident_len)
-            if lv_idx >= 0
-                register_ufcs_instantiation(m, *(g_lv_prefix_kind + lv_idx), *(g_lv_suffixes + lv_idx), *(g_lv_suffix_lens + lv_idx), e.ident_ptr, e.ident_len)
-        else if e.left != null and e.left.kind == EXPR_MEMBER
-            # Field receiver `r.raw.push(9)`: resolve the field's type through
-            # the tracked root local, then register as for an ident receiver.
-            # A `*Vec<T>` field dispatches to the same `vec_<method>$T` as a
-            # by-value one (the emitter passes the pointer it holds).
-            # (AGAST #1512)
-            let rf: *StructField = resolve_member_field(m, e.left)
-            if rf != null and (rf.field_type == TYPE_STRUCT or rf.field_type == TYPE_PTR)
-                var fsuf: *u8 = null
-                var fsuf_len: i32 = 0
-                let fkind: i32 = classify_collection_type(rf.field_type_name, rf.field_type_name_len, @fsuf, @fsuf_len)
-                register_ufcs_instantiation(m, fkind, fsuf, fsuf_len, e.ident_ptr, e.ident_len)
+        register_receiver_method(m, e.left, e.ident_ptr, e.ident_len)
         collect_from_expr(m, e.left)  # receiver
         var arg: *Expr = e.args
         while arg != null

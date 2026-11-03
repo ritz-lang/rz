@@ -5333,6 +5333,204 @@ class LLVMEmitter:
         else:
             raise NotImplementedError(f"Statement: {type(stmt)}")
 
+    # ------------------------------------------------------------------
+    # format_into(sink, "...") -- AGAST #1824
+    # ------------------------------------------------------------------
+    #
+    # The literal is split exactly as print's (the parser builds the same
+    # InterpString), and every piece -- literal text or a formatted value --
+    # is appended with one call to `sink.push_bytes(data: *u8, len: i64)`,
+    # resolved the way a method call on the sink's type would be.
+    #
+    # This is deliberately not print's _emit_print_value: print sign-extends
+    # every integer (AGAST #2128), and formats a value with write syscalls.
+    # Here a value is formatted into a stack buffer by two module-internal
+    # helpers, @__ritz_fmt_int and @__ritz_fmt_strlen, which ritz1 defines
+    # identically (emitter_format.ritz).
+
+    def _emit_format_into(self, call: rast.Call):
+        span = getattr(call, "span", None)
+        if len(call.args) != 2:
+            raise EmitError(
+                "format_into(sink, \"...\") takes two arguments: a pointer to "
+                "the buffer and a string literal", span)
+        sink_expr, lit = call.args
+        if isinstance(lit, rast.CStringLit) and self._has_interp_placeholder(lit.value):
+            # #1374, as print: a c"..." placeholder would be appended verbatim.
+            raise EmitError(
+                "`c\"...\"` literals do not interpolate: the placeholder would "
+                "be appended verbatim. Use a plain string literal `\"...\"` "
+                "here, or `{{` for a literal brace",
+                getattr(lit, "span", None) or span)
+        if not isinstance(lit, (rast.StringLit, rast.CStringLit, rast.InterpString)):
+            raise EmitError(
+                "format_into's second argument must be a string literal: "
+                "its placeholders are resolved at compile time",
+                getattr(lit, "span", None) or span)
+
+        # The sink is evaluated once, before any placeholder.
+        push = self._format_sink(sink_expr, span)
+
+        if isinstance(lit, rast.InterpString):
+            parts, exprs = lit.parts, lit.exprs
+        else:
+            text = lit.value
+            if isinstance(lit, rast.StringLit) and lit.print_value is not None:
+                text = lit.print_value   # `{{` -> `{` (AGAST #1913)
+            parts, exprs = [text], []
+
+        for i, part in enumerate(parts):
+            if part:
+                const = self._get_string_constant(part)
+                ptr = self.builder.gep(const, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
+                push(ptr, ir.Constant(self.i64, len(part.encode('utf-8'))))
+            if i < len(exprs):
+                self._emit_format_value(push, exprs[i], span)
+        return ir.Constant(self.i64, 0)
+
+    def _format_sink(self, sink_expr: rast.Expr, span):
+        """Evaluate the sink; return push(ptr, len) appending through push_bytes."""
+        sink = self._emit_expr(sink_expr)
+        if not isinstance(sink.type, ir.PointerType):
+            raise EmitError(
+                "format_into's sink must be a pointer to the buffer (`@&buf`), "
+                "not a value: appending to a copy would be lost", span)
+        type_name = self._get_struct_name_from_type(sink.type.pointee)
+        mangled = None
+        if type_name is not None:
+            mangled = self.method_lookup.get((type_name, 'push_bytes'))
+            if mangled is None:
+                mangled = self._find_method_fallback(type_name, 'push_bytes')
+        if mangled is None or mangled not in self.functions:
+            shown = type_name or str(sink.type.pointee)
+            raise EmitError(
+                f"format_into: type '{shown}' has no push_bytes(data: *u8, len: i64) "
+                f"method to append through", span)
+        fn, _ = self.functions[mangled]
+        ptys = self._fn_param_types(fn)
+        if len(ptys) != 3:
+            raise EmitError(
+                f"format_into: '{mangled}' must take (self, data: *u8, len: i64) "
+                f"to be a push_bytes sink", span)
+        recv = sink if sink.type == ptys[0] else self.builder.bitcast(sink, ptys[0])
+
+        def push(ptr, length):
+            if ptr.type != ptys[1]:
+                ptr = self.builder.bitcast(ptr, ptys[1])
+            self.builder.call(fn, [recv, ptr, self._convert_type(length, ptys[2])])
+        return push
+
+    def _emit_format_value(self, push, expr: rast.Expr, span):
+        """Append the formatted value of placeholder `expr`."""
+        value = self._emit_expr(expr)
+        ty = value.type
+        # @StrView / *StrView: format the view it points at.
+        if isinstance(ty, ir.PointerType) and self._is_strview_llvm_type(ty.pointee):
+            value = self.builder.load(value)
+            ty = value.type
+
+        if ty == self.i1:
+            t = self._get_string_constant("true")
+            f = self._get_string_constant("false")
+            zero = ir.Constant(self.i64, 0)
+            ptr = self.builder.select(value, self.builder.gep(t, [zero, zero]),
+                                      self.builder.gep(f, [zero, zero]))
+            push(ptr, self.builder.select(value, ir.Constant(self.i64, 4), ir.Constant(self.i64, 5)))
+        elif isinstance(ty, ir.IntType):
+            rt = self._infer_ritz_type(expr, value)
+            unsigned = isinstance(rt, rast.NamedType) and rt.name in ('u8', 'u16', 'u32', 'u64', 'usize')
+            if ty.width < 64:
+                value = self.builder.zext(value, self.i64) if unsigned else self.builder.sext(value, self.i64)
+            buf = self.builder._entry_alloca(ir.ArrayType(self.i8, 24), "fmt.buf")
+            base = self.builder.gep(buf, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
+            start = self.builder.call(self._format_int_helper(),
+                                      [base, value, ir.Constant(self.i1, 0 if unsigned else 1)])
+            push(self.builder.gep(base, [start]), self.builder.sub(ir.Constant(self.i64, 20), start))
+        elif self._is_strview_llvm_type(ty):
+            push(self.builder.extract_value(value, 0), self.builder.extract_value(value, 1))
+        elif isinstance(ty, ir.PointerType):
+            ptr = value if ty == self.i8.as_pointer() else self.builder.bitcast(value, self.i8.as_pointer())
+            push(ptr, self.builder.call(self._format_strlen_helper(), [ptr]))
+        else:
+            raise EmitError(
+                f"format_into cannot format a value of type {ty}: only integers, "
+                f"bool, StrView and pointers have a formatted form",
+                getattr(expr, "span", None) or span)
+
+    def _format_int_helper(self) -> ir.Function:
+        """@__ritz_fmt_int(buf, v, signed) -> start.
+
+        Writes v's decimal digits back to front, ending at buf[20], and returns
+        the index of the first byte. With `signed` set a negative v gets a
+        '-'; its magnitude is 0 - v, which read unsigned is right even for
+        i64::MIN. Unsigned values divide unsigned, so u64::MAX is correct.
+        """
+        name = "__ritz_fmt_int"
+        if name in self.module.globals:
+            return self.module.globals[name]
+        i8p = self.i8.as_pointer()
+        fn = ir.Function(self.module, ir.FunctionType(self.i64, [i8p, self.i64, self.i1]), name=name)
+        fn.linkage = "internal"
+        buf, v, signed = fn.args
+        entry = fn.append_basic_block("entry")
+        loop = fn.append_basic_block("digit")
+        sign = fn.append_basic_block("sign")
+        minus = fn.append_basic_block("minus")
+        done = fn.append_basic_block("done")
+        b = ir.IRBuilder(entry)
+        isneg = b.and_(signed, b.icmp_signed('<', v, ir.Constant(self.i64, 0)))
+        mag = b.select(isneg, b.sub(ir.Constant(self.i64, 0), v), v)
+        b.branch(loop)
+        b.position_at_end(loop)
+        pos = b.phi(self.i64)
+        val = b.phi(self.i64)
+        pos.add_incoming(ir.Constant(self.i64, 20), entry)
+        val.add_incoming(mag, entry)
+        npos = b.sub(pos, ir.Constant(self.i64, 1))
+        digit = b.trunc(b.add(b.urem(val, ir.Constant(self.i64, 10)), ir.Constant(self.i64, 48)), self.i8)
+        b.store(digit, b.gep(buf, [npos]))
+        q = b.udiv(val, ir.Constant(self.i64, 10))
+        pos.add_incoming(npos, loop)
+        val.add_incoming(q, loop)
+        b.cbranch(b.icmp_unsigned('!=', q, ir.Constant(self.i64, 0)), loop, sign)
+        b.position_at_end(sign)
+        b.cbranch(isneg, minus, done)
+        b.position_at_end(minus)
+        mpos = b.sub(npos, ir.Constant(self.i64, 1))
+        b.store(ir.Constant(self.i8, ord('-')), b.gep(buf, [mpos]))
+        b.branch(done)
+        b.position_at_end(done)
+        start = b.phi(self.i64)
+        start.add_incoming(npos, sign)
+        start.add_incoming(mpos, minus)
+        b.ret(start)
+        return fn
+
+    def _format_strlen_helper(self) -> ir.Function:
+        """@__ritz_fmt_strlen(p) -> the length of the NUL-terminated bytes at p."""
+        name = "__ritz_fmt_strlen"
+        if name in self.module.globals:
+            return self.module.globals[name]
+        i8p = self.i8.as_pointer()
+        fn = ir.Function(self.module, ir.FunctionType(self.i64, [i8p]), name=name)
+        fn.linkage = "internal"
+        (p,) = fn.args
+        entry = fn.append_basic_block("entry")
+        scan = fn.append_basic_block("scan")
+        done = fn.append_basic_block("done")
+        b = ir.IRBuilder(entry)
+        b.branch(scan)
+        b.position_at_end(scan)
+        n = b.phi(self.i64)
+        n.add_incoming(ir.Constant(self.i64, 0), entry)
+        c = b.load(b.gep(p, [n]))
+        n1 = b.add(n, ir.Constant(self.i64, 1))
+        n.add_incoming(n1, scan)
+        b.cbranch(b.icmp_unsigned('==', c, ir.Constant(self.i8, 0)), done, scan)
+        b.position_at_end(done)
+        b.ret(n)
+        return fn
+
     def _emit_interp_string_print(self, expr: rast.InterpString, fd: int = 1):
         """Emit print calls for an interpolated string, writing to `fd`.
 
@@ -9459,6 +9657,11 @@ class LLVMEmitter:
                     # Handle interpolated string - desugar to print calls
                     return self._emit_interp_string_print(arg, out_fd)
             raise ValueError(f"{fname}() requires a single string literal argument")
+
+        # format_into(sink, "...") -- print's literal, appended to a buffer
+        # (AGAST #1824). Reserved like print: checked before user functions.
+        if fname == 'format_into':
+            return self._emit_format_into(call)
 
         # Handle named syscalls
         if fname in ('write', 'read', 'open', 'close', 'nanosleep'):

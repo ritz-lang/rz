@@ -27,6 +27,7 @@ import ritzlib.memory
 import ast
 import emitter_core
 import emitter_expr
+import emitter_expr_call
 import interp
 import ast_helpers   # is_test_fn / is_test_helper_fn (AGAST #1869)
 
@@ -292,11 +293,30 @@ fn interp_cook_escape(c: i32) -> u8
 # Lower print(<literal>) to fd. Returns the result register: the write's
 # byte count when the literal has no placeholder, else 0, as in ritz0.
 pub fn emit_print_literal(s: *EmitterState, fd: i64, lit: *Expr) -> i32
+    return emit_interp_literal(s, fd, null, lit)
+
+# Bytes known at compile time: written to fd, or appended to the sink `k`
+# when there is one (format_into, AGAST #1824).
+fn emit_interp_bytes(s: *EmitterState, fd: i64, k: *FmtSink, data: *u8, len: i32) -> i32
+    if k != null
+        fmt_push_const(s, k, data, len)
+        return 0
+    return emit_print_bytes(s, fd, data, len)
+
+# print's literal splitting, for print / eprint (k == null: write to fd) and
+# format_into (append each piece to the sink k).
+fn emit_interp_literal(s: *EmitterState, fd: i64, k: *FmtSink, lit: *Expr) -> i32
     if lit.kind == EXPR_CSTRING_LIT
         if interp_cstr_has_placeholder(lit.string_ptr, lit.string_len) == 1
             # #1374/#1394: c"..." does not interpolate, so this would print
             # the placeholder verbatim. Reject it, as ritz0 does.
-            emit_print_error(s, lit, c"`c\"...\"` literals do not interpolate: the placeholder would be printed verbatim. Use a plain string literal `\"...\"` here, or `{{` to print a literal brace")
+            if k != null
+                emit_print_error(s, lit, c"`c\"...\"` literals do not interpolate: the placeholder would be appended verbatim. Use a plain string literal `\"...\"` here, or `{{` for a literal brace")
+            else
+                emit_print_error(s, lit, c"`c\"...\"` literals do not interpolate: the placeholder would be printed verbatim. Use a plain string literal `\"...\"` here, or `{{` to print a literal brace")
+            return emit_print_zero(s)
+        if k != null
+            fmt_push_const(s, k, lit.string_ptr, lit.string_len)
             return emit_print_zero(s)
         return emit_print_bytes(s, fd, lit.string_ptr, lit.string_len)
 
@@ -305,6 +325,9 @@ pub fn emit_print_literal(s: *EmitterState, fd: i64, lit: *Expr) -> i32
     # token, quotes included, in ident_ptr / ident_len.
     let raw: *u8 = lit.ident_ptr
     if raw == null or lit.ident_len < 2
+        if k != null
+            fmt_push_const(s, k, lit.string_ptr, lit.string_len)
+            return emit_print_zero(s)
         return emit_print_bytes(s, fd, lit.string_ptr, lit.string_len)
     let body: *u8 = raw + 1
     let n: i32 = lit.ident_len - 2
@@ -332,12 +355,14 @@ pub fn emit_print_literal(s: *EmitterState, fd: i64, lit: *Expr) -> i32
         else if c == 123 and interp_match_brace(body, n, i) >= 0
             let close: i32 = interp_match_brace(body, n, i)
             if w > start
-                emit_print_bytes(s, fd, buf + start, w - start)
+                emit_interp_bytes(s, fd, k, buf + start, w - start)
             start = w
             placeholders = placeholders + 1
             let e: *Expr = interp_parse_expr(body + i + 1, close - i - 1, lit.span.line, lit.span.col)
             if e == null
                 emit_print_error(s, lit, c"invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
+            else if k != null
+                fmt_push_value(s, k, lit, e)
             else
                 emit_print_value(s, fd, lit, e)
             i = close + 1
@@ -346,10 +371,10 @@ pub fn emit_print_literal(s: *EmitterState, fd: i64, lit: *Expr) -> i32
             w = w + 1
             i = i + 1
 
-    if placeholders == 0
+    if placeholders == 0 and k == null
         return emit_print_bytes(s, fd, buf, w)
     if w > start
-        emit_print_bytes(s, fd, buf + start, w - start)
+        emit_interp_bytes(s, fd, k, buf + start, w - start)
     emit_print_zero(s)
 
 # The helpers emit_print_value calls. Emitted once, after the functions, by
@@ -804,3 +829,424 @@ pub fn emit_assert_helpers(s: *EmitterState)
     emit_str(s, c"  %r1 = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %p4i, i64 %len)\n")
     emit_str(s, c"  ret void\n")
     emit_str(s, c"}\n")
+
+# =============================================================================
+# format_into(sink, "...") -- AGAST #1824
+# =============================================================================
+#
+# The literal is split exactly as print's (emit_interp_literal), and every
+# piece -- literal text or a formatted value -- is appended with one call to
+# `sink.push_bytes(data: *u8, len: i64)`, resolved like a method call on the
+# sink's struct: a UFCS helper (string_push_bytes, growbuf_push_bytes,
+# vec_push_bytes$u8) or an impl method. ritz0's _emit_format_into is the
+# oracle.
+#
+# A value is formatted into a stack buffer by @__ritz_fmt_int /
+# @__ritz_fmt_strlen (emit_format_helpers), not print's write helpers. Unlike
+# print (AGAST #2128), an unsigned integer formats unsigned.
+
+# Where format_into appends: the sink pointer and the push_bytes it names.
+struct FmtSink
+    recv: i32          # register holding the sink as a `ptr`
+    callee: *u8        # IR name of push_bytes (no `@`)
+    callee_len: i32
+    fn_def: *FnDef     # its params (self, data, len) and return type
+
+# Report a format_into error at `at`, naming `name` (may be null) before
+# `msg`. Counts like emit_print_error.
+fn fmt_error(s: *EmitterState, at: *Expr, name: *u8, name_len: i32, msg: *u8)
+    emit_str(s, c"  ; ERROR: format_into\n")
+    eprints_cstr(c"error: ritz1 cannot emit: line ")
+    eprint_int(at.span.line as i64)
+    eprints_cstr(c": format_into: ")
+    if name != null
+        eprints_cstr(c"type '")
+        for i in 0..name_len
+            eprint_char(*(name + i))
+        eprints_cstr(c"' ")
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+fn fmt_is_ptr_type(t: i32) -> i32
+    if t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF
+        return 1
+    0
+
+# The struct the sink expression points at, or null. The shapes
+# arg_pointee_struct knows (`@x`, `@&x`, `@&a.b`, a `*T` local or param), a
+# pointer-typed field (`st.out: *Vec<u8>`), and a call returning `*T`.
+fn fmt_sink_struct(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    let named: *u8 = arg_pointee_struct(s, e, out_len)
+    if named != null
+        return named
+    *out_len = 0
+    if e.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, e)
+        if f != null and fmt_is_ptr_type(f.field_type) == 1 and f.field_type_name_len > 0
+            *out_len = f.field_type_name_len
+            return f.field_type_name
+    else if e.kind == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, e)
+        if fd != null and fmt_is_ptr_type(fd.return_type) == 1 and fd.return_type_name_len > 0
+            *out_len = fd.return_type_name_len
+            return fd.return_type_name
+    null
+
+# Is the sink expression a struct value (not a pointer to one)?
+fn fmt_sink_is_value(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc != null and loc.var_type == TYPE_STRUCT
+            return 1
+    var n: *u8 = null
+    var l: i32 = 0
+    resolve_expr_struct_name(s, e, @n, @l)
+    if n != null
+        return 1
+    0
+
+# The `ret` type push_bytes is called with.
+fn fmt_emit_ret_type(s: *EmitterState, fd: *FnDef)
+    let rt: i32 = fd.return_type
+    if rt == TYPE_BOOL
+        emit_str(s, c"i1")
+    else if rt == TYPE_I32 or rt == TYPE_U32
+        emit_str(s, c"i32")
+    else if rt == TYPE_I16 or rt == TYPE_U16
+        emit_str(s, c"i16")
+    else if rt == TYPE_I8 or rt == TYPE_U8
+        emit_str(s, c"i8")
+    else if rt == TYPE_STRUCT and fd.return_type_name_len > 0
+        emit_llvm_type_struct(s, TYPE_STRUCT, fd.return_type_name, fd.return_type_name_len)
+    else
+        emit_str(s, c"i64")
+
+# push_bytes(sink, data, len). `data` is a `ptr` register; the length is the
+# register len_reg when it is > 0, else the constant len_imm.
+fn fmt_push(s: *EmitterState, k: *FmtSink, data: i32, len_reg: i32, len_imm: i64)
+    let p2: *Param = k.fn_def.params.next
+    let p3: *Param = p2.next
+    var d: i32 = data
+    if p2.param_type != TYPE_MUT_REF
+        # A `*u8` param is an i64 in ritz1's signatures.
+        d = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, d)
+        emit_str(s, c" = ptrtoint ptr ")
+        emit_reg(s, data)
+        emit_str(s, c" to i64\n")
+    if k.fn_def.return_type == TYPE_VOID
+        emit_str(s, c"  call void @")
+    else
+        let r: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, r)
+        emit_str(s, c" = call ")
+        fmt_emit_ret_type(s, k.fn_def)
+        emit_str(s, c" @")
+    emit_name(s, k.callee, k.callee_len)
+    emit_str(s, c"(ptr ")
+    emit_reg(s, k.recv)
+    emit_str(s, c", ")
+    emit_param_llvm_type(s, p2)
+    emit_str(s, c" ")
+    emit_reg(s, d)
+    emit_str(s, c", ")
+    emit_param_llvm_type(s, p3)
+    emit_str(s, c" ")
+    if len_reg > 0
+        emit_reg(s, len_reg)
+    else
+        emit_int(s, len_imm)
+    emit_str(s, c")\n")
+
+# Append bytes known at compile time.
+fn fmt_push_const(s: *EmitterState, k: *FmtSink, data: *u8, len: i32)
+    let str_idx: i32 = add_string(s, data, len)
+    let g: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, g)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, (len + 1) as i64)
+    emit_str(s, c" x i8], ptr @.str.")
+    emit_int(s, str_idx as i64)
+    emit_str(s, c", i64 0, i64 0\n")
+    fmt_push(s, k, g, 0, len as i64)
+
+# Append the formatted value of placeholder `e`: as print's table, except
+# that unsigned integers format unsigned. Returns 0 after reporting an
+# error when `e` has no formatted form.
+fn fmt_push_value(s: *EmitterState, k: *FmtSink, lit: *Expr, e: *Expr) -> i32
+    var sv_name: *u8 = null
+    var sv_len: i32 = 0
+    let sv_kind: i32 = interp_strview_kind(s, e, @sv_name, @sv_len)
+    if sv_kind != 0
+        var v: i32 = emit_expr(s, e)
+        if sv_kind == 2
+            let p: i32 = i64_value_to_ptr(s, e, v)
+            let agg: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, agg)
+            emit_str(s, c" = load %")
+            emit_name(s, sv_name, sv_len)
+            emit_str(s, c", ptr ")
+            emit_reg(s, p)
+            emit_str(s, c"\n")
+            v = agg
+        let ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, ptr)
+        emit_str(s, c" = extractvalue %")
+        emit_name(s, sv_name, sv_len)
+        emit_str(s, c" ")
+        emit_reg(s, v)
+        emit_str(s, c", 0\n")
+        let len: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, len)
+        emit_str(s, c" = extractvalue %")
+        emit_name(s, sv_name, sv_len)
+        emit_str(s, c" ")
+        emit_reg(s, v)
+        emit_str(s, c", 1\n")
+        fmt_push(s, k, ptr, len, 0)
+        return 1
+
+    let ty: i32 = get_expr_type(s, e)
+    if interp_is_bool(s, e) == 1
+        let v: i32 = emit_expr(s, e)
+        var b: i32 = v
+        if bool_reg_is_i1(s, e) == 0
+            b = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, b)
+            emit_str(s, c" = icmp ne i64 ")
+            emit_reg(s, v)
+            emit_str(s, c", 0\n")
+        let p: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, p)
+        emit_str(s, c" = select i1 ")
+        emit_reg(s, b)
+        emit_str(s, c", ptr @.ritz_fmt_true, ptr @.ritz_fmt_false\n")
+        let n: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, n)
+        emit_str(s, c" = select i1 ")
+        emit_reg(s, b)
+        emit_str(s, c", i64 4, i64 5\n")
+        s.fmt_helpers_used = 1
+        fmt_push(s, k, p, n, 0)
+        return 1
+
+    var narrow: *u8 = null
+    var is_int: i32 = 1
+    var signed: i32 = 1
+    if ty == TYPE_I64
+        narrow = null
+    else if ty == TYPE_U64
+        signed = 0
+    else if ty == TYPE_I32 or ty == TYPE_U32
+        narrow = c"i32"
+        signed = (ty == TYPE_I32) as i32
+    else if ty == TYPE_I16 or ty == TYPE_U16
+        narrow = c"i16"
+        signed = (ty == TYPE_I16) as i32
+    else if ty == TYPE_I8 or ty == TYPE_U8
+        narrow = c"i8"
+        signed = (ty == TYPE_I8) as i32
+    else
+        is_int = 0
+    if is_int == 1
+        var v: i32 = emit_expr(s, e)
+        if narrow != null
+            # ritz1 holds a narrow int in an i64; rebuild it from its width.
+            let t: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, t)
+            emit_str(s, c" = trunc i64 ")
+            emit_reg(s, v)
+            emit_str(s, c" to ")
+            emit_str(s, narrow)
+            emit_str(s, c"\n")
+            let x: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, x)
+            if signed == 1
+                emit_str(s, c" = sext ")
+            else
+                emit_str(s, c" = zext ")
+            emit_str(s, narrow)
+            emit_str(s, c" ")
+            emit_reg(s, t)
+            emit_str(s, c" to i64\n")
+            v = x
+        let buf: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, buf)
+        emit_str(s, c" = alloca [24 x i8]\n")
+        let start: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, start)
+        emit_str(s, c" = call i64 @__ritz_fmt_int(ptr ")
+        emit_reg(s, buf)
+        emit_str(s, c", i64 ")
+        emit_reg(s, v)
+        if signed == 1
+            emit_str(s, c", i1 1)\n")
+        else
+            emit_str(s, c", i1 0)\n")
+        let p: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, p)
+        emit_str(s, c" = getelementptr i8, ptr ")
+        emit_reg(s, buf)
+        emit_str(s, c", i64 ")
+        emit_reg(s, start)
+        emit_str(s, c"\n")
+        let n: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, n)
+        emit_str(s, c" = sub i64 20, ")
+        emit_reg(s, start)
+        emit_str(s, c"\n")
+        s.fmt_helpers_used = 1
+        fmt_push(s, k, p, n, 0)
+        return 1
+
+    if ty == TYPE_PTR or ty == TYPE_PTR_PTR or ty == TYPE_REF or ty == TYPE_MUT_REF
+        let v: i32 = emit_expr(s, e)
+        let p: i32 = i64_value_to_ptr(s, e, v)
+        let n: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, n)
+        emit_str(s, c" = call i64 @__ritz_fmt_strlen(ptr ")
+        emit_reg(s, p)
+        emit_str(s, c")\n")
+        s.fmt_helpers_used = 1
+        fmt_push(s, k, p, n, 0)
+        return 1
+
+    fmt_error(s, lit, null, 0, c"cannot format this value: only integers, bool, StrView and pointers have a formatted form")
+    0
+
+# Lower format_into(sink, <literal>). The sink is evaluated once, first.
+pub fn emit_format_into(s: *EmitterState, e: *Expr) -> i32
+    let sink: *Expr = e.args
+    var lit: *Expr = null
+    if sink != null
+        lit = sink.next
+    if lit == null or lit.next != null
+        fmt_error(s, e, null, 0, c"format_into(sink, \"...\") takes two arguments: a pointer to the buffer and a string literal")
+        return emit_print_zero(s)
+    if lit.kind != EXPR_STRING_LIT and lit.kind != EXPR_CSTRING_LIT
+        fmt_error(s, e, null, 0, c"format_into's second argument must be a string literal: its placeholders are resolved at compile time")
+        return emit_print_zero(s)
+    if fmt_sink_is_value(s, sink) == 1
+        fmt_error(s, e, null, 0, c"format_into's sink must be a pointer to the buffer (`@&buf`), not a value: appending to a copy would be lost")
+        return emit_print_zero(s)
+    var tn_len: i32 = 0
+    let tn: *u8 = fmt_sink_struct(s, sink, @tn_len)
+    if tn == null
+        fmt_error(s, e, null, 0, c"the sink is not a pointer to a struct with a push_bytes(data: *u8, len: i64) method to append through")
+        return emit_print_zero(s)
+
+    # push_bytes, in emit_expr_method's order: a UFCS helper, else an impl
+    # method (whose IR name is `Type_push_bytes`).
+    var callee: *u8 = null
+    var callee_len: i32 = 0
+    var fd: *FnDef = ufcs_fn_def(s, tn, tn_len, c"push_bytes", 10)
+    if fd != null
+        callee = fd.name
+        callee_len = fd.name_len
+        add_extern(s, fd.name, fd.name_len)
+    else
+        fd = find_impl_method(s, tn, tn_len, c"push_bytes", 10)
+        if fd != null
+            callee_len = tn_len + 11
+            callee = malloc((callee_len + 1) as i64)
+            for i in 0..tn_len
+                *(callee + i) = *(tn + i)
+            *(callee + tn_len) = '_'
+            for i in 0..10
+                *(callee + tn_len + 1 + i) = *(c"push_bytes" + i)
+            *(callee + callee_len) = 0
+            if fd.is_local == 0
+                add_method_extern(s, tn, tn_len, c"push_bytes", 10)
+    if fd == null
+        fmt_error(s, e, tn, tn_len, c"has no push_bytes(data: *u8, len: i64) method to append through")
+        return emit_print_zero(s)
+    var np: i32 = 0
+    var pp: *Param = fd.params
+    while pp != null
+        np = np + 1
+        pp = pp.next
+    if np != 3 or fd.params.next.next.param_type != TYPE_I64
+        fmt_error(s, e, tn, tn_len, c"push_bytes must take (self, data: *u8, len: i64) to be a format_into sink")
+        return emit_print_zero(s)
+
+    let v: i32 = emit_expr(s, sink)
+    var k: FmtSink
+    k.recv = i64_value_to_ptr(s, sink, v)
+    k.callee = callee
+    k.callee_len = callee_len
+    k.fn_def = fd
+    emit_interp_literal(s, 0, @k, lit)
+
+# The helpers fmt_push_value calls. Emitted once, after the functions, by a
+# module that used any of them; ritz0's _format_int_helper /
+# _format_strlen_helper define the same functions. "no-builtins" keeps
+# clang from turning the strlen loop into a libc call.
+pub fn emit_format_helpers(s: *EmitterState)
+    if s.fmt_helpers_used == 0
+        return
+    emit_str(s, c"\n; format_into helpers (AGAST #1824), as ritz0's _format_int_helper\n")
+    # Decimal digits back to front, ending at buf[20]; returns the first
+    # byte's index. A negative signed value's magnitude 0 - v is right read
+    # unsigned even for i64::MIN; unsigned values divide unsigned.
+    emit_str(s, c"define internal i64 @__ritz_fmt_int(ptr %buf, i64 %v, i1 %signed) \"no-builtins\" {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %lt = icmp slt i64 %v, 0\n")
+    emit_str(s, c"  %neg = and i1 %signed, %lt\n")
+    emit_str(s, c"  %negv = sub i64 0, %v\n")
+    emit_str(s, c"  %mag = select i1 %neg, i64 %negv, i64 %v\n")
+    emit_str(s, c"  br label %digit\n")
+    emit_str(s, c"digit:\n")
+    emit_str(s, c"  %pos = phi i64 [ 20, %entry ], [ %np, %digit ]\n")
+    emit_str(s, c"  %val = phi i64 [ %mag, %entry ], [ %q, %digit ]\n")
+    emit_str(s, c"  %np = sub i64 %pos, 1\n")
+    emit_str(s, c"  %d = urem i64 %val, 10\n")
+    emit_str(s, c"  %ch64 = add i64 %d, 48\n")
+    emit_str(s, c"  %ch = trunc i64 %ch64 to i8\n")
+    emit_str(s, c"  %cp = getelementptr i8, ptr %buf, i64 %np\n")
+    emit_str(s, c"  store i8 %ch, ptr %cp\n")
+    emit_str(s, c"  %q = udiv i64 %val, 10\n")
+    emit_str(s, c"  %more = icmp ne i64 %q, 0\n")
+    emit_str(s, c"  br i1 %more, label %digit, label %sign\n")
+    emit_str(s, c"sign:\n")
+    emit_str(s, c"  br i1 %neg, label %minus, label %done\n")
+    emit_str(s, c"minus:\n")
+    emit_str(s, c"  %mp = sub i64 %np, 1\n")
+    emit_str(s, c"  %mcp = getelementptr i8, ptr %buf, i64 %mp\n")
+    emit_str(s, c"  store i8 45, ptr %mcp\n")
+    emit_str(s, c"  br label %done\n")
+    emit_str(s, c"done:\n")
+    emit_str(s, c"  %start = phi i64 [ %np, %sign ], [ %mp, %minus ]\n")
+    emit_str(s, c"  ret i64 %start\n")
+    emit_str(s, c"}\n\n")
+    emit_str(s, c"define internal i64 @__ritz_fmt_strlen(ptr %p) \"no-builtins\" {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  br label %scan\n")
+    emit_str(s, c"scan:\n")
+    emit_str(s, c"  %n = phi i64 [ 0, %entry ], [ %n1, %scan ]\n")
+    emit_str(s, c"  %cp = getelementptr i8, ptr %p, i64 %n\n")
+    emit_str(s, c"  %c = load i8, ptr %cp\n")
+    emit_str(s, c"  %n1 = add i64 %n, 1\n")
+    emit_str(s, c"  %nul = icmp eq i8 %c, 0\n")
+    emit_str(s, c"  br i1 %nul, label %done, label %scan\n")
+    emit_str(s, c"done:\n")
+    emit_str(s, c"  ret i64 %n\n")
+    emit_str(s, c"}\n\n")
+    emit_str(s, c"@.ritz_fmt_true = private unnamed_addr constant [4 x i8] c\"true\"\n")
+    emit_str(s, c"@.ritz_fmt_false = private unnamed_addr constant [5 x i8] c\"false\"\n")

@@ -604,8 +604,9 @@ class TypeChecker:
                     return ptr_ty.inner
                 return rast.NamedType(expr.span, 'unknown', [])
 
-            # print(str) / eprint(str) -> void (eprint: AGAST #1641)
-            if fn_name in ('print', 'eprint'):
+            # print(str) / eprint(str) -> void (eprint: AGAST #1641);
+            # format_into(sink, str) -> void (AGAST #1824)
+            if fn_name in ('print', 'eprint', 'format_into'):
                 for arg in expr.args:
                     self._infer_type(arg)
                 return rast.NamedType(expr.span, 'void', [])

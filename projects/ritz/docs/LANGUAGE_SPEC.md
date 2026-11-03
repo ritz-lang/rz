@@ -243,7 +243,8 @@ fn main() -> i32
     return 0
 ```
 
-Interpolation is a rule of the two builtins, not of the string literal. The
+Interpolation is a rule of the two builtins (and of `format_into`, below),
+not of the string literal. The
 same `"{x}"` anywhere else, such as a `let`, an argument to any other function,
 a `return` or a struct field, is the three bytes `{`, `x`, `}`. A bare
 `"{x}"` statement prints nothing (AGAST #2102).
@@ -285,6 +286,126 @@ A `String` prints through its view: `print("s = {string_as_view(@s)}\n")`
 (`ritzlib.string`). Every other type, including floats and other structs, is a
 compile error. ritz0 and ritz1 follow the same rules and print the same bytes
 (AGAST #1521, #1641).
+
+#### Formatting into a buffer: `format_into`
+
+`format_into(sink, "...")` appends instead of printing (AGAST #1824). The
+literal is `print`'s: the same placeholders, the same `{{` / `}}` and `\{` /
+`\}` escapes, and the same refusal of a `c"..."` literal that holds a
+placeholder. Each piece of the literal, whether text or a formatted value, is
+appended to `*sink`:
+
+```ritz
+import ritzlib.string
+
+fn emit_trunc(out: *String, r: i32, v: i32, ty: StrView)
+    format_into(out, "  %{r} = trunc i64 %{v} to {ty}\n")
+
+fn main() -> i32
+    var ir: String = string_new()
+    emit_trunc(@&ir, 4, 2, "i32")
+    format_into(@&ir, "  ret i32 %{4}\n")
+    print("{string_as_view(@ir)}")
+    string_drop(@&ir)
+    return 0
+```
+
+`{{` is how a literal brace goes into the buffer. That matters for text that
+is full of braces, such as an LLVM inline-asm constraint, where `{rax}` names
+a register rather than a placeholder:
+
+```ritz
+import ritzlib.string
+
+fn main() -> i32
+    var c: String = string_new()
+    let n: i64 = 3
+    format_into(@&c, "\"={{rax}},{{rax}},{{rdi}},~{{rcx}}\" ; {n} operands\n")
+    print("{string_as_view(@c)}")
+    string_drop(@&c)
+    return 0
+```
+
+**The sink** is a pointer to a struct (`@&buf`, or a `*T` / `@&T` value)
+whose method `push_bytes(data: *u8, len: i64)` resolves statically, exactly
+as `sink.push_bytes(data, len)` would (§12.2). `String`, `GrowBuf` and
+`Vec<u8>` provide it (`string_push_bytes`, `growbuf_push_bytes`,
+`vec_push_bytes`), and any type can by implementing it:
+
+```ritz
+struct Count
+    bytes: i64
+
+impl Count
+    fn push_bytes(self: @&Count, data: *u8, len: i64) -> i32
+        self.bytes = self.bytes + len
+        return 0
+
+fn main() -> i32
+    var c: Count = Count { bytes: 0 }
+    let id: u32 = 4000000000
+    format_into(@&c, "id={id}\n")
+    return c.bytes as i32           # 14
+```
+
+The sink is evaluated once, before any placeholder. Placeholders are then
+evaluated left to right, each once. `format_into` only appends and never
+clears the buffer, and it produces no value. `push_bytes`'s result is
+discarded, as `print` discards `write`'s.
+
+A placeholder formats exactly as `print` prints it (the table above), with
+one difference: an unsigned integer formats as unsigned, so a `u64` holding
+2^64 - 1 appends `18446744073709551615`. (`print` still sign-extends,
+AGAST #2128.)
+
+These are compile errors:
+
+```ritz expect-error="not a value"
+import ritzlib.string
+
+fn main() -> i32
+    var s: String = string_new()
+    format_into(s, "x")             # a copy would get the bytes
+    return 0
+```
+
+```ritz expect-error="must be a string literal"
+import ritzlib.string
+
+fn main() -> i32
+    var s: String = string_new()
+    let f: StrView = "{x}"
+    format_into(@&s, f)             # placeholders are resolved at compile time
+    return 0
+```
+
+```ritz expect-error="do not interpolate"
+import ritzlib.string
+
+fn main() -> i32
+    var s: String = string_new()
+    let x: i64 = 1
+    format_into(@&s, c"x={x}")      # would append `{x}` verbatim
+    return 0
+```
+
+A sink type without `push_bytes` is an error naming the type, and so is a
+placeholder of a type with no formatted form.
+
+**Why `format_into`.** AGAST #1824 weighed three spellings:
+
+- `write(buf, "...")` reads well, but `write` is already taken. ritz0 lowers
+  `write(fd, ptr, len)` as a syscall builtin, and the workspace defines
+  `write` as an `extern fn` and as methods. A builtin of that name would
+  change the meaning of existing calls.
+- `String.fmt(...)` would tie formatting to one type and need an
+  associated-builtin form neither compiler has. ritz1's own emitter, the
+  motivating user, writes into a `Vec<u8>`, not a `String`.
+- `format_into(sink, "...")` is a new name with no existing uses. It says
+  what it does, and it takes any sink with `push_bytes`.
+
+It is reserved like `print`: a call named `format_into` is always this
+builtin.
 
 ### 2.7 Operators
 
@@ -2334,6 +2455,7 @@ See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 |----------|-------------|
 | `print(literal)` | Print a string literal to stdout, with `{expr}` interpolation |
 | `eprint(literal)` | As `print`, to stderr |
+| `format_into(sink, literal)` | Append the literal, with `print`'s interpolation, to a buffer ([§2.6](#formatting-into-a-buffer-format_into)) |
 | `sizeof(T)` / `sizeof(expr)` | Size in bytes |
 | `assert cond` | Runtime check; exits 1 on failure. **`[[test]]` and `[[test_helper]]` functions only** |
 | `assert cond, "message"` | As above, naming what the check was for |

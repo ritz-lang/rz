@@ -353,6 +353,15 @@ class Parser:
             parts, expr_strs = lit.interp
             exprs = [self._parse_interp_expr(e, lit.span) for e in expr_strs]
             return [rast.InterpString(lit.span, parts, exprs)]
+        # AGAST #1824: format_into(sink, "...") -- the same literal rules,
+        # on its second argument.
+        if (isinstance(callee, rast.Ident) and callee.name == 'format_into'
+                and len(args) == 2 and isinstance(args[1], rast.StringLit)
+                and args[1].interp is not None):
+            lit = args[1]
+            parts, expr_strs = lit.interp
+            exprs = [self._parse_interp_expr(e, lit.span) for e in expr_strs]
+            return [args[0], rast.InterpString(lit.span, parts, exprs)]
         return args
 
     def _parse_interp_expr(self, expr_str: str, parent_span: Span) -> rast.Expr:
