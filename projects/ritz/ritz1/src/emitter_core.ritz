@@ -2446,6 +2446,76 @@ pub fn user_variant_ctor_ambiguous(e: *Expr, out_a: *i32, out_b: *i32) -> i32
         return 1
     return 0
 
+# AGAST #1466: the enum a qualified variant `E.V(args)` (EXPR_METHOD) or
+# `E.V` (EXPR_MEMBER) names.  Returns the enum index with *out_vi = the tag,
+# or -1 when `e` is not one.  As in ritz0, a local or global named `E`
+# shadows the enum (the expression is then a method call / field access on
+# it), and a variant beats an impl method of the same name on the enum.
+# Generic enums are returned too (callers check enum_is_generic: ritz1 has
+# no generic-enum specialisation, so those are located errors).
+pub fn qualified_variant(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
+    *out_vi = 0 - 1
+    if e == null or (e.kind != EXPR_METHOD and e.kind != EXPR_MEMBER)
+        return 0 - 1
+    let q: *Expr = e.left
+    if q == null or q.kind != EXPR_IDENT
+        return 0 - 1
+    if find_local(s, q.ident_ptr, q.ident_len) >= 0
+        return 0 - 1
+    if find_global(s, q.ident_ptr, q.ident_len) != null
+        return 0 - 1
+    let ei: i32 = enum_find(q.ident_ptr, q.ident_len)
+    if ei < 0
+        return 0 - 1
+    let vi: i32 = enum_variant_index(q.ident_ptr, q.ident_len, e.ident_ptr, e.ident_len)
+    if vi < 0
+        return 0 - 1
+    *out_vi = vi
+    return ei
+
+# AGAST #1466: the (non-generic) enum a qualified variant `E.V(args)` or
+# `E.V` builds, for type inference (untyped let, match scrutinee, an
+# aggregate payload).  null/0 otherwise.
+pub fn qualified_variant_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    var vi: i32 = 0
+    let ei: i32 = qualified_variant(s, e, @vi)
+    if ei < 0 or enum_is_generic(ei) == 1
+        return
+    *out_name = enum_name_at(ei, out_len)
+
+# AGAST #1466: a qualified variant ritz1 cannot build, as
+# `error: <file>:<line>:<col>: 'E.V' <msg>`.  Counted like emit_ir_error, so
+# no output is written; returns a placeholder register.
+pub fn emit_qualified_variant_error(s: *EmitterState, e: *Expr, msg: *u8) -> i32
+    emit_str(s, c"  ; ERROR: qualified variant ")
+    emit_str(s, msg)
+    emit_str(s, c"\n")
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(e.span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(e.span.col as i64)
+    eprints_cstr(c": '")
+    eprint_bytes(e.left.ident_ptr, e.left.ident_len)
+    eprints_cstr(c".")
+    eprint_bytes(e.ident_ptr, e.ident_len)
+    eprints_cstr(c"' ")
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+    let z: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, z)
+    emit_str(s, c" = add i64 0, 0\n")
+    z
+
 # AGAST #1600 / #2039: `name` (a bare variant used as a value, or the callee
 # of a ctor call) is a variant of two enums (`ea`, `eb`).  Whatever the
 # expected type, this is a located error asking for the qualified form; ritz0
@@ -2510,6 +2580,10 @@ fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len:
         if name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 1
             *out_name = c"Span$u8"
             *out_len = 7
+            return
+        # AGAST #1466: a qualified variant ctor `Opt.Holds(x)` is the enum.
+        qualified_variant_enum(s, e, out_name, out_len)
+        if *out_name != null
             return
         # Impl-method call: walk receiver's struct type then impl table.
         var recv_tn: *u8 = null
