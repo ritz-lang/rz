@@ -359,6 +359,12 @@ fn method_callee_def(s: *EmitterState, type_name: *u8, type_name_len: i32, metho
     let m: *FnDef = find_impl_method(s, type_name, type_name_len, method, method_len)
     if m != null
         return m
+    return find_spec_impl_method(s, type_name, type_name_len, method, method_len)
+
+# The specialized generic impl method `Type$T_method` (`W$i32_dup`), or null.
+# monomorph's specialize_impl_method adds these to the module's functions as
+# free fns, not to an impl block, so an impl-table walk never finds them.
+fn find_spec_impl_method(s: *EmitterState, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
     let n: i32 = type_name_len + 1 + method_len
     let buf: *u8 = malloc(n as i64 + 1)
     for i in 0..type_name_len
@@ -4455,6 +4461,17 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                             mfn = mm
                     mm = mm.next
         ib_it = ib_it.next
+    # AGAST #2096: a generic impl's method specialized at the receiver's type
+    # (`w.dup()` on W<i32> -> `W$i32_dup`) lives in the module's functions,
+    # not in an impl block.  Without its FnDef the call fell back to
+    # `call i64`, against `define %W$i32` (or `define i32` for `-> T`).
+    # It is defined as a free fn, so its `*W<T>` self is the i64 value-model
+    # pointer, not the impl define's forced `ptr` (see recv_ty below).
+    var mfn_is_spec: i32 = 0
+    if mfn == null
+        mfn = find_spec_impl_method(s, type_name, type_name_len, e.ident_ptr, e.ident_len)
+        if mfn != null
+            mfn_is_spec = 1
 
     # First, evaluate all arguments and collect their registers
     let arg_regs: *i32 = call_reg_slots(e.args, 0)
@@ -4574,6 +4591,17 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c"\n")
         receiver_reg = recv_ptr
 
+    # A specialized `Type$T_method` declares a pointer self (`*W<T>`, `@W<T>`)
+    # as i64 (emit_llvm_type), so pass the receiver as one (AGAST #2096).
+    var recv_ty: *u8 = c"ptr "
+    if mfn_is_spec == 1 and mfn.params != null
+        let sp: i32 = mfn.params.param_type
+        if sp == TYPE_PTR or sp == TYPE_REF
+            let recv_int: i32 = next_reg(s)
+            format_into(s.out, "  %.{recv_int} = ptrtoint ptr %.{receiver_reg} to i64\n")
+            receiver_reg = recv_int
+            recv_ty = c"i64 "
+
     # Emit the call with the correct return type keyword.  A void method is
     # `call void` with no result register; binding one to `call i64` would
     # mismatch the `define void` (AGAST #1581).
@@ -4625,7 +4653,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         emit_sret_attr(s, mfn.return_type_name, mfn.return_type_name_len)
         emit_reg(s, m_sret)
         emit_str(s, c", ")
-    emit_str(s, c"ptr ")
+    emit_str(s, recv_ty)
     emit_reg(s, receiver_reg)
 
     # Emit args with formal types (or i64 fallback when fn_def missing).

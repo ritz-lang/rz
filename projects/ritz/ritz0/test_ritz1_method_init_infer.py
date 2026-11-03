@@ -17,10 +17,12 @@ both compilers, un-annotated.  ritz0 had the same monomorph gap (AGAST #2095):
 its `_infer_value_type` knew nothing of method calls or `a[:]`, so it too
 never instantiated a method reached only through such a local.
 
-A generic impl method returning its struct (`let d = w.dup()`, W<i32>) is
-inferred too, but its call is mis-emitted even when annotated (AGAST #2096);
-that ticket adds the case here.
+A generic impl method returning its own generic struct (`w.dup()` on W<i32>)
+is covered annotated and un-annotated (AGAST #2096).
 """
+
+import re
+import subprocess
 
 import pytest
 
@@ -156,6 +158,63 @@ fn main() -> i32
 """,
         10,
     ),
+    # AGAST #2096: a generic impl method returning its own generic struct.
+    # ritz1 called `W$i32_dup` as `i64 (ptr)` against its `%W$i32 (i64)`
+    # definition, annotated or not.
+    "generic_impl_method_self_struct_annotated": (
+        """\
+struct W<T>
+    v: T
+
+impl<T> W<T>
+    fn dup(self: *W<T>) -> W<T>
+        return W<T> { v: self.v + self.v }
+
+fn main() -> i32
+    var w: W<i32> = W<i32> { v: 5 }
+    let d: W<i32> = w.dup()
+    return d.v
+""",
+        10,
+    ),
+    "generic_impl_method_self_struct_inferred": (
+        """\
+struct W<T>
+    v: T
+
+impl<T> W<T>
+    fn dup(self: *W<T>) -> W<T>
+        return W<T> { v: self.v + self.v }
+
+fn main() -> i32
+    var w: W<i32> = W<i32> { v: 5 }
+    let d = w.dup()
+    return d.v
+""",
+        10,
+    ),
+    # Same path: `-> T` was `call i64` against `define i32`, so a negative
+    # i32 came back unsign-extended; an extra `T` arg must narrow to i32.
+    "generic_impl_method_scalar_ret_and_arg": (
+        """\
+struct B<T>
+    v: T
+
+impl<T> B<T>
+    fn get(self: *B<T>) -> T
+        return self.v
+    fn plus(self: *B<T>, d: T) -> B<T>
+        return B<T> { v: self.v + d }
+
+fn main() -> i32
+    var b: B<i32> = B<i32> { v: 0 - 3 }
+    let c = b.plus(10)
+    if b.get() < 0
+        return c.get()
+    return 1
+""",
+        7,
+    ),
 }
 
 
@@ -177,3 +236,52 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 def test_ritz1_infers_method_call_local(ritz1_bin, tmp_path, name):
     """`var s = recv.method(..)` takes the method's return type."""
     _check("ritz1", tmp_path, name)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "name",
+    [
+        "generic_impl_method_self_struct_annotated",
+        "generic_impl_method_scalar_ret_and_arg",
+    ],
+)
+def test_ritz1_spec_method_call_matches_define(ritz1_bin, tmp_path, name):
+    """Each call to a specialized `Type$T_method` uses its define's signature.
+
+    The define is a free fn, so its `*W<T>` self is i64 and its `-> T`
+    return the concrete type.  LLVM accepts a direct call whose signature
+    differs from the define's, so a mismatch need not fail the build (AGAST
+    #2096): compare the text.
+    """
+    src = tmp_path / "main.ritz"
+    src.write_text(PROGRAMS[name][0])
+    ll = tmp_path / "main.ll"
+    comp = subprocess.run(
+        [str(ritz1_bin), str(src), "-o", str(ll)], capture_output=True, text=True
+    )
+    assert comp.returncode == 0, comp.stderr[-2000:]
+    ir = ll.read_text()
+
+    def types(arglist: str) -> list[str]:
+        # "i64 %self.arg, i32 %d.arg" -> ["i64", "i32"]
+        return [a.strip().rsplit(" ", 1)[0] for a in arglist.split(",") if a.strip()]
+
+    defines = {
+        m["name"]: (m["ret"], types(m["args"]))
+        for m in re.finditer(
+            r"^define \S+ (?P<ret>\S+) @(?P<name>\w+\$\w+_\w+)\((?P<args>[^)]*)\)",
+            ir,
+            re.M,
+        )
+    }
+    assert defines, ir
+    calls = list(
+        re.finditer(r"= call (?P<ret>\S+) @(?P<name>[\w$]+)\((?P<args>[^)]*)\)", ir)
+    )
+    checked = 0
+    for c in calls:
+        if c["name"] in defines:
+            assert (c["ret"], types(c["args"])) == defines[c["name"]], c.group(0)
+            checked += 1
+    assert checked, ir
