@@ -21,6 +21,7 @@ Interfaces live in the G7 artifact store (`cas.py`, $RITZ_CACHE_DIR):
 
     objects/<k[:2]>/<k>.rzi    pickled (interface_hash, stripped Module)
     objects/<k[:2]>/<k>.rzih   interface hash, hex text
+    objects/<t[:2]>/<t>.rzi.ritz  interface text (ritz1 reads it), t = text_key
 
 `k = sha256(schema, parser fingerprint, absolute path, source sha256)`. The
 absolute path is in the key because spans carry it (diagnostics, assert
@@ -29,12 +30,14 @@ produce the AST (tokens, lexer, parser, ritz_ast, this file), so a parser
 change can never return an interface from the old one.
 
 Pickle is ritz0-private: the store is the user's own cache directory, and the
-fingerprint pins the exact class definitions. ritz1 cannot read it: it parses
-import sources and strips them in memory by the rule of `body_needed`
-(ritz1/src/main.ritz strip_to_interface, AGAST #1899), which is why
-`build.cas_module_key` may key ritz1 objects on these interface hashes too. A
-language-neutral stored encoding is #1901. Keep `body_needed` and
-strip_to_interface in step: ritz1 must strip at least what this keeps out.
+fingerprint pins the exact class definitions. Next to it goes the interface
+as Ritz source, `<t>.rzi.ritz`, under a key of the source bytes alone (see
+"Interface text" below, AGAST #1901): ritz1 parses that instead of the import
+when it is stored. Either way ritz1 strips each import in memory by the rule
+of `body_needed` (ritz1/src/main.ritz strip_to_interface, AGAST #1899), which
+is why `build.cas_module_key` may key ritz1 objects on these interface hashes
+too. Keep `body_needed` and strip_to_interface in step: ritz1 must strip at
+least what this keeps out.
 
 Interface hash
 --------------
@@ -113,8 +116,7 @@ def parser_fingerprint() -> str:
 # Parsing (instrumented)
 # ============================================================================
 
-def parse_source(source: str, path: str) -> rast.Module:
-    """Lex and parse one module. Every compiler-path parse goes through here."""
+def _parse_with_tokens(source: str, path: str) -> Tuple[list, rast.Module]:
     PARSED.append(path)
     log = os.environ.get(PARSE_LOG_ENV)
     if log:
@@ -125,10 +127,15 @@ def parse_source(source: str, path: str) -> rast.Module:
             pass
     tokens = Lexer(source, path).tokenize()
     try:
-        parser = Parser(tokens, source=source)
+        parser = Parser(list(tokens), source=source)
     except TypeError:
-        parser = Parser(tokens)
-    return parser.parse_module()
+        parser = Parser(list(tokens))
+    return tokens, parser.parse_module()
+
+
+def parse_source(source: str, path: str) -> rast.Module:
+    """Lex and parse one module. Every compiler-path parse goes through here."""
+    return _parse_with_tokens(source, path)[1]
 
 
 # ============================================================================
@@ -162,6 +169,127 @@ def strip_module(module: rast.Module) -> rast.Module:
             item = impl
         items.append(item)
     return rast.Module(module.span, items)
+
+
+# ============================================================================
+# Interface text (G9c, AGAST #1901)
+# ============================================================================
+#
+# The interface as Ritz source, which ritz1 reads (ritz1/src/main.ritz
+# load_and_parse) instead of parsing the import itself. It is the source with
+# every fn `strip_module` strips turned into a declaration-only fn
+# (LANGUAGE_SPEC §5.3, AGAST #1900):
+#
+#   - the header is kept verbatim up to its last token (a trailing comment
+#     goes), and ` = extern` is appended;
+#   - every line of the body is emptied: the lines after the header up to the
+#     last line, before the next code line indented no deeper than the fn's
+#     own line, that is indented deeper. Blank and comment-only lines don't
+#     end a body (the lexer emits no INDENT/DEDENT for them either);
+#   - everything else is byte-for-byte the source.
+#
+# Line numbers and columns of everything kept are therefore the source's, so
+# the interface parses to the stripped module with the source's spans, and
+# the reader names the import's real path in diagnostics: the text holds no
+# path. Kept as written, besides what body_needed keeps: [[test]] fns, which
+# can't be declaration-only (ritz1 strips them after parsing anyway, and
+# ritz0's importers never read them).
+#
+# The text is a function of the source bytes alone, so it is stored under a
+# key both compilers compute without knowing anything of the writer:
+#
+#   objects/<k[:2]>/<k>.rzi.ritz
+#   k = sha256_hex(TEXT_SCHEMA + "\n" + sha256_hex(source bytes))
+#
+# TEXT_SCHEMA changes whenever the stripping rule does. ritz1 must use
+# the same constant (ritz1/src/main.ritz IFACE_TEXT_SCHEMA).
+
+TEXT_SCHEMA = "ritz-iface-text-v1"
+TEXT_EXT = "rzi.ritz"
+
+
+def text_key(source_bytes: bytes) -> str:
+    """Store key of the interface text of a module with these bytes."""
+    inner = hashlib.sha256(source_bytes).hexdigest()
+    return hashlib.sha256(f"{TEXT_SCHEMA}\n{inner}".encode()).hexdigest()
+
+
+def _code_end(line: str) -> int:
+    """Index where `line`'s trailing comment (if any) starts, right-trimmed."""
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "#":
+            break
+        i += 1
+    return len(line[:i].rstrip())
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _fns_to_declare(module: rast.Module) -> List[rast.FnDef]:
+    def wanted(fn, impl=None):
+        return (not body_needed(fn, impl) and not getattr(fn, "is_decl", False)
+                and not any(a.name == "test" for a in fn.attrs))
+    out = []
+    for item in module.items:
+        if isinstance(item, rast.FnDef) and wanted(item):
+            out.append(item)
+        elif isinstance(item, rast.ImplBlock):
+            out.extend(m for m in item.methods if wanted(m, item))
+    return out
+
+
+def interface_text(source: str, tokens: list, module: rast.Module) -> str:
+    """The interface text of `source`, given its tokens and parsed module."""
+    from tokens import TokenType
+    opens = (TokenType.LPAREN, TokenType.LBRACKET)
+    closes = (TokenType.RPAREN, TokenType.RBRACKET)
+    layout = (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT, TokenType.EOF)
+    at = {(t.span.line, t.span.column): i for i, t in enumerate(tokens)
+          if t.type == TokenType.FN}
+    lines = source.split("\n")
+    for fn in _fns_to_declare(module):
+        i = at[(fn.span.line, fn.span.column)]
+        # The header: from `fn` to the first NEWLINE outside brackets.
+        depth, last = 0, tokens[i]
+        for t in tokens[i:]:
+            if t.type in opens:
+                depth += 1
+            elif t.type in closes:
+                depth -= 1
+            elif t.type == TokenType.NEWLINE and depth == 0:
+                break
+            if t.type not in layout:
+                last = t
+        head = last.span.line  # 1-based
+        base = _indent(lines[fn.span.line - 1])
+        end = head
+        for n in range(head + 1, len(lines) + 1):
+            s = lines[n - 1]
+            code = s.lstrip(" ")
+            if code == "" or code.startswith("#"):
+                continue
+            if _indent(s) <= base:
+                break
+            end = n
+        if end == head:
+            raise ValueError(f"{fn.span}: fn '{fn.name}' has no body lines")
+        h = lines[head - 1]
+        lines[head - 1] = h[:_code_end(h)] + " = extern"
+        for n in range(head + 1, end + 1):
+            lines[n - 1] = ""
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -243,16 +371,28 @@ def _get(store: cas.ArtifactStore, key: str, ext: str) -> Optional[Path]:
 
 def _build(abs_path: str, source_bytes: bytes, key: str,
            store: cas.ArtifactStore) -> Tuple[str, rast.Module]:
-    iface = strip_module(parse_source(source_bytes.decode(), abs_path))
+    source = source_bytes.decode()
+    tokens, module = _parse_with_tokens(source, abs_path)
+    iface = strip_module(module)
     digest = hash_interface(iface)
     try:
+        # The text first: a pickle hit means the text is there too (_text_ok).
+        text = interface_text(source, tokens, module)
+        cas._atomic_write(store.path(text_key(source_bytes), TEXT_EXT),
+                          text.encode())
         cas._atomic_write(store.path(key, IFACE_EXT),
                           pickle.dumps((digest, iface), pickle.HIGHEST_PROTOCOL))
         cas._atomic_write(store.path(key, HASH_EXT), digest.encode())
-    except (OSError, pickle.PicklingError, RecursionError) as e:
+    except (OSError, pickle.PicklingError, RecursionError, KeyError, ValueError) as e:
         print(f"Warning: module interface not stored for {abs_path}: {e}",
               file=sys.stderr)
     return digest, iface
+
+
+def _text_ok(store: cas.ArtifactStore, source_bytes: bytes) -> bool:
+    """Is the interface text stored? Stores from before #1901 have only the
+    pickle and hash: those entries are rebuilt once, to add it."""
+    return store.path(text_key(source_bytes), TEXT_EXT).is_file()
 
 
 def _load(path: str) -> Tuple[str, rast.Module]:
@@ -261,7 +401,7 @@ def _load(path: str) -> Tuple[str, rast.Module]:
     key = _store_key(abs_path, source_bytes)
     store = cas.ArtifactStore()
     hit = _get(store, key, IFACE_EXT)
-    if hit is not None:
+    if hit is not None and _text_ok(store, source_bytes):
         try:
             with open(hit, "rb") as f:
                 digest, iface = pickle.load(f)
@@ -290,7 +430,7 @@ def interface_hash(path: str) -> str:
         key = _store_key(str(p), source_bytes)
         store = cas.ArtifactStore()
         hit = _get(store, key, HASH_EXT)
-        if hit is not None:
+        if hit is not None and _text_ok(store, source_bytes):
             digest = hit.read_text().strip()
         if not digest:
             digest = _build(str(p), source_bytes, key, store)[0]

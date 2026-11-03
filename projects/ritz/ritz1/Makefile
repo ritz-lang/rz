@@ -42,6 +42,7 @@ SOURCES = \
 	emitter_stmt \
 	emitter \
 	fn_cache \
+	sha256 \
 	main
 
 # ritzlib modules needed by ritz1

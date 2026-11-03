@@ -37,6 +37,7 @@ import parser_gen
 import monomorph
 import emitter
 import fn_cache
+import sha256
 
 # =============================================================================
 # Error Reporting Helpers
@@ -487,17 +488,117 @@ fn merge_module_into(m: *Module, other: *Module)
         last.next = m.impls
         m.impls = other.impls
 
-# Read / tokenize / parse a single file. Returns a parsed Module, or null
-# on any failure (already reported to stderr). Steals src.data to keep
-# AST-pointed-into buffer alive via keep_source_alive().
+# =============================================================================
+# Interface texts (G9c, AGAST #1901)
+# =============================================================================
+#
+# ritz0 stores each module's interface as Ritz source next to its own
+# (pickled) interface: the module with every body strip_to_interface drops
+# turned into a declaration-only `fn ... = extern` (#1900), and its lines
+# emptied, so every kept line and column is the source's.  The format and
+# the key are defined in ritz0/module_interface.py ("Interface text"):
+#
+#   <store>/objects/<k[:2]>/<k>.rzi.ritz
+#   k = sha256_hex("ritz-iface-text-v1\n" + sha256_hex(source bytes))
+#   <store> = $RITZ_CACHE_DIR, else ~/.cache/ritz/cas (cas.py default_root)
+#
+# The key holds the source's bytes only, never a path or a compiler, so an
+# import is lexed and parsed from its interface whenever one is stored,
+# under the import's real path for diagnostics.  On a miss the source is
+# parsed, as before; ritz1 writing the text itself is #2113.
+#
+# RITZ1_PARSE_LOG=<file> appends the path of every *source* this process
+# lexes and parses (the main file included, interface texts not), like
+# ritz0's RITZ0_PARSE_LOG.
+
+# The store path of the interface text of a module with these bytes, or an
+# empty String if there is no store root.  Caller owns it.
+fn iface_text_path(src: *u8, len: i64) -> String
+    var out: String = string_new()
+    let explicit: StrView = env_get_or("RITZ_CACHE_DIR", strview_empty())
+    let home: StrView = env_get_or("HOME", strview_empty())
+    if explicit.len > 0
+        # cas.py expands a leading `~` (Path.expanduser).
+        if *(explicit.ptr) == '~' and (explicit.len == 1 or *(explicit.ptr + 1) == '/')
+            if home.len == 0
+                return out
+            string_push_bytes(@out, home.ptr, home.len)
+            string_push_bytes(@out, explicit.ptr + 1, explicit.len - 1)
+        else
+            string_push_bytes(@out, explicit.ptr, explicit.len)
+    else
+        if home.len == 0
+            return out
+        string_push_bytes(@out, home.ptr, home.len)
+        string_push_str(@out, "/.cache/ritz/cas")
+    var inner: [64]u8
+    sha256_hex(src, len, @inner[0])
+    var pre: String = string_from("ritz-iface-text-v1\n")
+    string_push_bytes(@pre, @inner[0], 64)
+    var k: [64]u8
+    sha256_hex(string_as_ptr(@pre), string_len(@pre) as i64, @k[0])
+    string_drop(@pre)
+    string_push_str(@out, "/objects/")
+    string_push_bytes(@out, @k[0], 2)
+    string_push(@out, '/')
+    string_push_bytes(@out, @k[0], 64)
+    string_push_str(@out, ".rzi.ritz")
+    out
+
+# The stored interface text of a module with these bytes (NUL-terminated,
+# like read_file), or an empty Vec when none is stored.
+fn read_iface_text(src: *u8, len: i64) -> Vec<u8>
+    var path: String = iface_text_path(src, len)
+    if string_len(@path) == 0
+        string_drop(@path)
+        return vec_new<u8>()
+    let fd: i32 = sys_open(string_as_ptr(@path), O_RDONLY)
+    if fd < 0
+        string_drop(@path)
+        return vec_new<u8>()
+    sys_close(fd)
+    let text: Vec<u8> = read_file(string_as_ptr(@path))
+    string_drop(@path)
+    text
+
+# RITZ1_PARSE_LOG: note that `path`'s source is being lexed and parsed.
+fn parse_log_note(path: *u8)
+    let log: StrView = env_get_or("RITZ1_PARSE_LOG", strview_empty())
+    if log.len == 0
+        return
+    var log_path: String = string_from_strview(@log)
+    let fd: i32 = sys_open3(string_as_ptr(@log_path), O_WRONLY + O_CREAT + O_APPEND, 420)
+    string_drop(@log_path)
+    if fd < 0
+        return
+    var line: String = string_new()
+    string_push_cstr(@line, path)
+    string_push(@line, '\n')
+    sys_write(fd, string_as_ptr(@line), string_len(@line) as i64)
+    string_drop(@line)
+    sys_close(fd)
+
+# Read / tokenize / parse a single import: its stored interface text if
+# there is one, else its source.  Returns a parsed Module, or null on any
+# failure (already reported to stderr).  Steals the buffers' data to keep
+# the AST-pointed-into bytes alive via keep_source_alive().
 fn load_and_parse(path: @String) -> *Module
     let path_ptr: *u8 = string_as_ptr(path)
     var src: Vec<u8> = read_file(path_ptr)
     if src.len == 0
         return null
 
+    var text: Vec<u8> = read_iface_text(src.data, src.len - 1)
+    var lex_buf: *u8 = src.data
+    var lex_len: i64 = src.len - 1
+    if text.len > 0
+        lex_buf = text.data
+        lex_len = text.len - 1
+    else
+        parse_log_note(path_ptr)
+
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
-    let lex_err: i32 = tokenize(path_ptr, src.data, src.len - 1, @tokens)
+    let lex_err: i32 = tokenize(path_ptr, lex_buf, lex_len, @tokens)
     if lex_err > 0
         err2("Lexer errors in: ", path_ptr)
         return null
@@ -512,9 +613,10 @@ fn load_and_parse(path: @String) -> *Module
     # The cached IR depends on these exact bytes (AGAST #1807).
     dep_record_note(path_ptr, src.data, src.len - 1)
 
-    # Keep source buffer alive: AST nodes point into it.
-    keep_source_alive(src.data)
+    # Keep the lexed buffer alive: AST nodes point into it.
+    keep_source_alive(lex_buf)
     src.data = null  # Prevent Vec Drop from freeing.
+    text.data = null
 
     mod
 
@@ -537,9 +639,9 @@ fn load_and_parse(path: @String) -> *Module
 # on what ritz0's interface hash covers, which is what build.py keys ritz1
 # objects on (cas_module_key).
 #
-# The source is still lexed and parsed: storing the interface itself, in a
-# format both compilers read, is #1901 (it needs a body-less fn declaration
-# form in the language, #1900).
+# An import read from its interface text (#1901, load_and_parse) holds
+# `= extern` declarations where the bodies were; they share the same
+# stripped_body() sentinel, so stripping it again changes nothing.
 
 # Every stripped fn shares ast_helpers' stripped_body(), the body of a
 # declaration-only `fn ... = extern` too (#1900).  Non-null on purpose:
@@ -836,6 +938,7 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # Tokenize. Typical compiler input files produce under 20K tokens;
     # bigger files realloc organically.
+    parse_log_note(args.input_path)
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
     let lex_errors: i32 = tokenize(args.input_path, src.data, src.len - 1, @tokens)
     if lex_errors > 0

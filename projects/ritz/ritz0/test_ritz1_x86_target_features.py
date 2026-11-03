@@ -275,7 +275,12 @@ _NEEDS_RITZ1_ASM = pytest.mark.xfail(
         pytest.param("aes_gcm", marks=_NEEDS_RITZ1_ASM),
     ],
 )
-def test_cryptosec_source_compiles_at_O2_without_march_flags(ritz1_bin, tmp_path, name):
+def test_cryptosec_source_compiles_at_O2_without_march_flags(ritz1_bin, tmp_path, name,
+                                                           monkeypatch):
+    # A private, empty store (AGAST #1901): with mem.ritz's interface text
+    # stored, ritz1 parses that -- mem_zero's asm body emptied -- and never
+    # meets the asm, so the xfail would depend on what the cache holds.
+    monkeypatch.setenv("RITZ_CACHE_DIR", str(tmp_path / "cas"))
     ll = tmp_path / f"{name}.ll"
     _ritz1(CRYPTOSEC / "lib" / f"{name}.ritz", ll)
     r = _clang_obj(ll)
