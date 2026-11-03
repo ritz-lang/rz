@@ -23,6 +23,7 @@ regression to the workaround fails the test that names it. The last test is
 the ticket's source-level acceptance scan.
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -49,7 +50,9 @@ def _compile(tmp_path_factory, rel, boot=False):
     proc = subprocess.run(
         [sys.executable, str(RITZ0), str(src), "-o", str(out), *extra,
          "--project-root", str(HARLAND), "--sources", sources, "--target", target],
-        capture_output=True, text=True, cwd=RITZ0_DIR, timeout=300)
+        capture_output=True, text=True, cwd=RITZ0_DIR, timeout=300,
+        # syscall/numbers.ritz imports ritzlib.option (#2121); `rz build` sets this too.
+        env=dict(os.environ, RITZ_PATH=str(RITZ0_DIR.parent)))
     assert proc.returncode == 0 and out.exists(), \
         f"ritz0 rejected harland {rel}:\n{proc.stdout}{proc.stderr}"
     return out.read_text()

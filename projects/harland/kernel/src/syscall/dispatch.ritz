@@ -1,0 +1,54 @@
+# Harland Syscall Dispatch Table
+#
+# One handler per syscall, indexed by its number (AGAST #2121). The kernel
+# registers each handler once at init (main.ritz: syscall_table_init) and
+# syscall_handler looks the number up here, so adding a syscall is one
+# variant in syscall/numbers.ritz, one handler fn and one registration.
+#
+# A number that is not a Syscall variant, or a variant with no handler
+# registered, is answered with ENOSYS.
+
+import ritzlib.option
+import syscall.numbers { Syscall }
+
+# -ENOSYS: "function not implemented" (Linux errno 38). Negative, like
+# mm/uptr's EFAULT, because syscalls return -errno.
+pub const ENOSYS: i64 = -38
+
+# Every handler is a `fn(u64, u64, u64, u64) -> i64`: it takes the four syscall
+# argument registers (rdi, rsi, rdx, r10) and returns the value for rax; a
+# syscall ignores the arguments it doesn't use. (Spelled out rather than a
+# `type` alias: aliases are not resolved at use sites, LANGUAGE_SPEC §3.8.)
+
+# Syscall numbers are 0..255 (numbers.ritz), so a 256-entry table covers them.
+const SYSCALL_TABLE_SIZE: u64 = 256
+
+var g_syscall_handlers: [256]fn(u64, u64, u64, u64) -> i64
+# 1 where g_syscall_handlers holds a registered handler (the table starts zeroed).
+var g_syscall_registered: [256]u8
+
+# Install `handler` for `nr`, replacing any earlier one.
+pub fn syscall_register(nr: Syscall, handler: fn(u64, u64, u64, u64) -> i64)
+    let i: u64 = nr as u64
+    g_syscall_handlers[i] = handler
+    g_syscall_registered[i] = 1
+
+# Table slot for `rax`, or SYSCALL_TABLE_SIZE if it is no syscall.
+fn syscall_slot(rax: u64) -> u64
+    match Syscall.from(rax)
+        Some(s) => s as u64
+        None => SYSCALL_TABLE_SIZE
+
+# True if a handler is registered for syscall number `rax`.
+pub fn syscall_has_handler(rax: u64) -> bool
+    let i: u64 = syscall_slot(rax)
+    if i >= SYSCALL_TABLE_SIZE
+        return false
+    return g_syscall_registered[i] != 0
+
+# Run the handler for `rax` with the four argument registers; ENOSYS if none.
+pub fn syscall_dispatch(rax: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
+    if not syscall_has_handler(rax)
+        return ENOSYS
+    let handler: fn(u64, u64, u64, u64) -> i64 = g_syscall_handlers[rax]
+    return handler(a1, a2, a3, a4)

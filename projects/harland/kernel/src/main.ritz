@@ -24,10 +24,10 @@ import mm.uptr { EFAULT, USER_SPACE_END, uptr_validate_read, uptr_validate_write
 # import mm.dma { DmaRegion, dma_alloc, dma_free, ... }
 import ipc.message { Message, MsgHeader, MSG_MAX_PAYLOAD, MSG_FLAG_NONE, msg_init, msg_set_payload, msg_get_payload, msg_get_payload_len }
 import ipc.channel { ChannelEndpoint, ChannelPair, channel_init, channel_create, channel_send, channel_recv, channel_close, channel_has_messages, channel_debug_print }
-import ipc.syscall { SYS_CHANNEL_CREATE, SYS_IPC_SEND, SYS_IPC_RECV, SYS_IPC_CLOSE, ipc_syscall_init, sys_channel_create, sys_ipc_send, sys_ipc_recv, sys_ipc_close, sys_ipc_poll }
+import ipc.syscall { ipc_syscall_init, sys_channel_create, sys_ipc_send, sys_ipc_recv, sys_ipc_close, sys_ipc_poll }
 import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_MEMORY, CAP_TYPE_CHANNEL, CAP_TYPE_IRQ, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_GRANT, CAP_RIGHT_DERIVE, cap_handle_init, cap_handle_invalid, cap_handle_is_valid }
 import cap.table { CapTable, CAP_TABLE_SIZE, cap_table_init, cap_table_alloc, cap_table_free, cap_table_get, cap_table_insert, cap_table_lookup, cap_table_remove, cap_table_derive, cap_grant, cap_table_info, cap_has_rights, cap_system_debug_print }
-import cap.syscall { SYS_CAP_GRANT, SYS_CAP_REVOKE, SYS_CAP_DERIVE, SYS_CAP_INFO, SYS_CAP_CHECK, sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
+import cap.syscall { sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_init_nth, virtio_blk_read, virtio_blk_write, virtio_blk_get_capacity, virtio_blk_get_device, virtio_blk_get_device_nth, virtio_blk_get_device_count, virtio_blk_test }
 import fs.kblob { KBlobId, kblob_init, kblob_get_store, kblob_store_put, kblob_store_get, kblob_store_exists, kblob_id_eq, kblob_id_is_zero }
 import fs.vfs { vfs_init, fd_table_init }
@@ -759,20 +759,9 @@ const MSR_LSTAR: u32 = 0xC0000082
 const MSR_SFMASK: u32 = 0xC0000084
 const EFER_SCE: u64 = 1
 
-# Harland syscall numbers - imported from single source of truth
-# See syscall/numbers.ritz for the canonical definitions
-import syscall.numbers {
-    SYS_READ, SYS_WRITE, SYS_OPEN, SYS_CLOSE, SYS_STAT, SYS_LSEEK,
-    SYS_MMAP, SYS_MUNMAP, SYS_READDIR, SYS_MKDIR,
-    SYS_EXIT, SYS_SPAWN, SYS_WAIT, SYS_GETPID, SYS_YIELD,
-    SYS_SPAWN_ARGS, SYS_GETCWD, SYS_CHDIR, SYS_SPAWN_EX, SYS_PIPE,
-    SYS_IPC_SEND, SYS_IPC_RECV, SYS_IPC_CALL, SYS_IPC_CLOSE,
-    SYS_CAP_GRANT, SYS_CAP_REVOKE, SYS_CAP_DERIVE, SYS_CAP_INFO, SYS_CAP_CHECK,
-    SYS_INPUT_POLL, SYS_INPUT_READ,
-    SYS_NET_INFO, SYS_NET_PING,
-    SYS_CHANNEL_CREATE,
-    SYS_ACPI_POWEROFF, SYS_FB_INFO, SYS_FB_MAP, SYS_DEBUG_PRINT
-}
+# Harland syscall numbers (single source of truth) and the dispatch table
+import syscall.numbers { Syscall }
+import syscall.dispatch { ENOSYS, syscall_register, syscall_has_handler, syscall_dispatch }
 
 # ============================================================================
 # Memory Mapping (mmap/munmap)
@@ -1774,279 +1763,312 @@ pub fn syscall_init() -> i32
     serial_print_hex(sfmask_check)
     prints("\n")
 
+    # Handlers go in before the first user program can issue a syscall.
+    syscall_table_init()
+
     return 0
+
+# ============================================================================
+# Syscall handlers (AGAST #2121)
+# ============================================================================
+#
+# One fn per syscall, each `fn(rdi, rsi, rdx, r10) -> i64`, registered by
+# number in syscall_table_init and run by syscall_handler through the table
+# in syscall/dispatch.ritz. A handler ignores the argument registers it
+# doesn't use.
+
+# exit(code): sys_exit_impl handles both child exit (return to parent) and
+# init exit (halt system). It may not return!
+fn sys_exit_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_exit_impl(rdi as i32)
+
+# open(path, path_len, flags)
+# WORKAROUND: knamespace_resolve returns a 32-byte struct which triggers
+# a compiler bug that corrupts kernel globals. Save/restore the affected
+# globals around the call. TODO: Fix the Ritz compiler's large struct return.
+fn sys_open_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate path buffer
+    if rsi > 0
+        let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
+        if path_result != 0
+            return EFAULT
+    let saved_child_pid: u64 = g_child_pid
+    let saved_has_parent: u8 = g_has_parent
+    let result: i64 = sys_open(rdi as *u8, rsi, rdx as i32)
+    g_child_pid = saved_child_pid
+    g_has_parent = saved_has_parent
+    return result
+
+# close(fd)
+fn sys_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    let fd: i32 = rdi as i32
+    # Check if it's a filesystem fd
+    if is_fs_fd(fd)
+        return sys_close(fd)
+    # Otherwise, return success (stdin/stdout/stderr don't close)
+    return 0
+
+# write(fd, buf, count), also debug_print: Linux/POSIX write convention.
+fn sys_write_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    let fd: i32 = rdi as i32
+    let buf: *u8 = rsi as *u8
+    let len: i64 = rdx as i64
+
+    # SECURITY: Validate user buffer is readable
+    if len > 0
+        let uptr_result: i64 = uptr_check_read(buf, len as u64)
+        if uptr_result != 0
+            return EFAULT
+
+    # Check if it's a filesystem fd
+    if is_fs_fd(fd)
+        return sys_fs_write(fd, buf, len as u64)
+
+    # Otherwise, write to serial (fd 1 = stdout, fd 2 = stderr)
+    # Use interrupt-driven buffered output
+    var total_written: i64 = 0
+    while total_written < len
+        let written: i64 = serial_buffer_write(buf + total_written, len - total_written)
+        total_written = total_written + written
+
+        if total_written < len
+            # Buffer was full - drain some to hardware
+            # This ensures we don't block indefinitely
+            serial_drain_output()
+
+    return total_written
+
+# read(fd, buf, count): Linux/POSIX read convention.
+fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    let fd: i32 = rdi as i32
+    let buf: *u8 = rsi as *u8
+    let count: i64 = rdx as i64
+
+    # SECURITY: Validate user buffer is writable
+    if count > 0
+        let uptr_result: i64 = uptr_check_write(buf, count as u64)
+        if uptr_result != 0
+            return EFAULT
+
+    # Check if it's a filesystem fd
+    if is_fs_fd(fd)
+        return sys_fs_read(fd, buf, count as u64)
+
+    # Only support stdin (fd 0) for serial input
+    if fd != 0
+        return -1  # EBADF
+
+    # First, poll for any new data
+    serial_poll()
+
+    # Read from the serial input buffer
+    let bytes_read: i64 = serial_buf_read_many(buf, count)
+    return bytes_read
+
+# yield(): currently a no-op (TODO: implement proper user-level yield).
+# The kernel task scheduler is for kernel threads, not user processes.
+fn sys_yield_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return 0
+
+# getpid(): g_child_pid tracks the current running process (1=init, 2+=children)
+fn sys_getpid_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return g_child_pid as i64
+
+# readdir(path, buf, size)
+fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate path string and output buffer
+    let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+    if path_result < 0
+        return EFAULT
+    if rdx > 0
+        let buf_result: i64 = uptr_check_write(rsi as *u8, rdx as u64)
+        if buf_result != 0
+            return EFAULT
+    return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
+
+# spawn(path)
+fn sys_spawn_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate path string
+    let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+    if path_result < 0
+        return EFAULT
+    return sys_spawn_impl(rdi as *u8)
+
+# spawn_args(path, argv, argc)
+fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate path string
+    let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+    if path_result < 0
+        return EFAULT
+    # SECURITY: Validate argv array (each pointer + the strings they point to)
+    let argc: i32 = rdx as i32
+    if argc > 0
+        # Validate the argv array itself
+        let argv_size: u64 = (argc as u64) * 8  # sizeof(*u8) = 8 on x86-64
+        let argv_result: i64 = uptr_check_read(rsi as *u8, argv_size)
+        if argv_result != 0
+            return EFAULT
+        # Validate each string in argv
+        var i: i32 = 0
+        let argv: **u8 = rsi as **u8
+        while i < argc
+            let arg: *u8 = *(argv + i)
+            let arg_result: i64 = uptr_validate_string(arg, 4096)
+            if arg_result < 0
+                return EFAULT
+            i = i + 1
+    return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
+
+# wait(pid)
+fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_wait_impl(rdi as i32)
+
+# IPC syscalls - use current_pid() instead of hardcoded 1
+fn sys_channel_create_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_channel_create(current_pid())
+
+fn sys_ipc_send_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate Message struct (4096 bytes) is readable
+    let msg_result: i64 = uptr_check_read(rsi as *u8, 4096)
+    if msg_result != 0
+        return EFAULT
+    return sys_ipc_send(current_pid(), rdi as i32, rsi as *Message)
+
+fn sys_ipc_recv_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate Message struct (4096 bytes) is writable
+    let msg_result: i64 = uptr_check_write(rsi as *u8, 4096)
+    if msg_result != 0
+        return EFAULT
+    # Validate sender_pid output pointer (4 bytes for u32)
+    if rdx != 0
+        let sender_result: i64 = uptr_check_write(rdx as *u8, 4)
+        if sender_result != 0
+            return EFAULT
+    return sys_ipc_recv(current_pid(), rdi as i32, rsi as *Message, rdx as *u32)
+
+fn sys_ipc_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_ipc_close(current_pid(), rdi as i32)
+
+# Capability syscalls - use current_pid() instead of hardcoded 1
+fn sys_cap_grant_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_cap_grant(current_pid(), rdi, rsi as u32, rdx as u32)
+
+fn sys_cap_revoke_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_cap_revoke(current_pid(), rdi)
+
+fn sys_cap_derive_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_cap_derive(current_pid(), rdi, rsi as u32)
+
+fn sys_cap_info_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate CapInfo output struct (16 bytes) is writable
+    let info_result: i64 = uptr_check_write(rsi as *u8, 16)
+    if info_result != 0
+        return EFAULT
+    return sys_cap_info(current_pid(), rdi, rsi as *CapInfo)
+
+fn sys_cap_check_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_cap_check(current_pid(), rdi, rsi as u32)
+
+# mmap(addr, length, prot, flags)
+fn sys_mmap_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_mmap_impl(rdi, rsi, rdx, r10)
+
+# munmap(addr, length)
+fn sys_munmap_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_munmap_impl(rdi, rsi)
+
+# getcwd(buf, size) -> length or -1
+fn sys_getcwd_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate output buffer is writable
+    if rsi > 0
+        let buf_result: i64 = uptr_check_write(rdi as *u8, rsi as u64)
+        if buf_result != 0
+            return EFAULT
+    return sys_getcwd_impl(rdi as *u8, rsi)
+
+# chdir(path) -> 0 or -1
+fn sys_chdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate path string
+    let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+    if path_result < 0
+        return EFAULT
+    return sys_chdir_impl(rdi as *u8)
+
+# input_poll() -> number of events pending
+fn sys_input_poll_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_input_poll_impl()
+
+# input_read(event_ptr) -> 0 if event read, -1 if no events
+fn sys_input_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate VirtioInputEvent output struct (8 bytes) is writable
+    let event_result: i64 = uptr_check_write(rdi as *u8, 8)
+    if event_result != 0
+        return EFAULT
+    return sys_input_read_impl(rdi as *VirtioInputEvent)
+
+# acpi_poweroff()
+fn sys_acpi_poweroff_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    prints("[syscall] ACPI poweroff requested\n")
+    let result: i32 = acpi_poweroff()
+    # If we get here, poweroff failed
+    return result as i64
+
+# Framebuffer syscalls for Prism compositor
+# fb_info(info_buf: *FbInfo) -> 0 on success, -1 on no display
+fn sys_fb_info_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate FbInfo output struct (24 bytes) is writable
+    let info_result: i64 = uptr_check_write(rdi as *u8, 24)
+    if info_result != 0
+        return EFAULT
+    return sys_fb_info_impl(rdi as *u8)
+
+# fb_map() -> mapped_addr or -1
+fn sys_fb_map_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_fb_map_impl()
+
+# Fill the dispatch table: one line per dispatched syscall. A Syscall
+# variant without a line here answers ENOSYS (see syscall/dispatch.ritz).
+fn syscall_table_init()
+    syscall_register(Syscall.Read, sys_read_handler)
+    syscall_register(Syscall.Write, sys_write_handler)
+    syscall_register(Syscall.DebugPrint, sys_write_handler)
+    syscall_register(Syscall.Open, sys_open_handler)
+    syscall_register(Syscall.Close, sys_close_handler)
+    syscall_register(Syscall.Readdir, sys_readdir_handler)
+    syscall_register(Syscall.Mmap, sys_mmap_handler)
+    syscall_register(Syscall.Munmap, sys_munmap_handler)
+    syscall_register(Syscall.Exit, sys_exit_handler)
+    syscall_register(Syscall.Spawn, sys_spawn_handler)
+    syscall_register(Syscall.SpawnArgs, sys_spawn_args_handler)
+    syscall_register(Syscall.Wait, sys_wait_handler)
+    syscall_register(Syscall.Getpid, sys_getpid_handler)
+    syscall_register(Syscall.Yield, sys_yield_handler)
+    syscall_register(Syscall.Getcwd, sys_getcwd_handler)
+    syscall_register(Syscall.Chdir, sys_chdir_handler)
+    syscall_register(Syscall.ChannelCreate, sys_channel_create_handler)
+    syscall_register(Syscall.IpcSend, sys_ipc_send_handler)
+    syscall_register(Syscall.IpcRecv, sys_ipc_recv_handler)
+    syscall_register(Syscall.IpcClose, sys_ipc_close_handler)
+    syscall_register(Syscall.CapGrant, sys_cap_grant_handler)
+    syscall_register(Syscall.CapRevoke, sys_cap_revoke_handler)
+    syscall_register(Syscall.CapDerive, sys_cap_derive_handler)
+    syscall_register(Syscall.CapInfo, sys_cap_info_handler)
+    syscall_register(Syscall.CapCheck, sys_cap_check_handler)
+    syscall_register(Syscall.InputPoll, sys_input_poll_handler)
+    syscall_register(Syscall.InputRead, sys_input_read_handler)
+    syscall_register(Syscall.AcpiPoweroff, sys_acpi_poweroff_handler)
+    syscall_register(Syscall.FbInfo, sys_fb_info_handler)
+    syscall_register(Syscall.FbMap, sys_fb_map_handler)
 
 # Syscall handler (called from assembly)
 # Arguments: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4
 pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    # Handle exit specially - it may not return!
-    if rax == SYS_EXIT
-        # sys_exit_impl handles both child exit (return to parent) and
-        # init exit (halt system). It may not return!
-        return sys_exit_impl(rdi as i32)
-
-    # SYS_OPEN - Open a file
-    # WORKAROUND: knamespace_resolve returns a 32-byte struct which triggers
-    # a compiler bug that corrupts kernel globals. Save/restore the affected
-    # globals around the call. TODO: Fix the Ritz compiler's large struct return.
-    if rax == SYS_OPEN
-        # rdi = path pointer
-        # rsi = path length
-        # rdx = flags
-        # SECURITY: Validate path buffer
-        if rsi > 0
-            let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
-            if path_result != 0
-                return EFAULT
-        let saved_child_pid: u64 = g_child_pid
-        let saved_has_parent: u8 = g_has_parent
-        let result: i64 = sys_open(rdi as *u8, rsi, rdx as i32)
-        g_child_pid = saved_child_pid
-        g_has_parent = saved_has_parent
-        return result
-
-    # SYS_CLOSE - Close a file descriptor
-    if rax == SYS_CLOSE
-        let fd: i32 = rdi as i32
-        # Check if it's a filesystem fd
-        if is_fs_fd(fd)
-            return sys_close(fd)
-        # Otherwise, return success (stdin/stdout/stderr don't close)
-        return 0
-
-    if rax == SYS_WRITE or rax == SYS_DEBUG_PRINT
-        # Linux/POSIX write convention:
-        #   rdi = fd
-        #   rsi = buf
-        #   rdx = count
-        let fd: i32 = rdi as i32
-        let buf: *u8 = rsi as *u8
-        let len: i64 = rdx as i64
-
-        # SECURITY: Validate user buffer is readable
-        if len > 0
-            let uptr_result: i64 = uptr_check_read(buf, len as u64)
-            if uptr_result != 0
-                return EFAULT
-
-        # Check if it's a filesystem fd
-        if is_fs_fd(fd)
-            return sys_fs_write(fd, buf, len as u64)
-
-        # Otherwise, write to serial (fd 1 = stdout, fd 2 = stderr)
-        # Use interrupt-driven buffered output
-        var total_written: i64 = 0
-        while total_written < len
-            let written: i64 = serial_buffer_write(buf + total_written, len - total_written)
-            total_written = total_written + written
-
-            if total_written < len
-                # Buffer was full - drain some to hardware
-                # This ensures we don't block indefinitely
-                serial_drain_output()
-
-        return total_written
-
-    if rax == SYS_READ
-        # Linux/POSIX read convention:
-        #   rdi = fd
-        #   rsi = buf
-        #   rdx = count
-        let fd: i32 = rdi as i32
-        let buf: *u8 = rsi as *u8
-        let count: i64 = rdx as i64
-
-        # SECURITY: Validate user buffer is writable
-        if count > 0
-            let uptr_result: i64 = uptr_check_write(buf, count as u64)
-            if uptr_result != 0
-                return EFAULT
-
-        # Check if it's a filesystem fd
-        if is_fs_fd(fd)
-            return sys_fs_read(fd, buf, count as u64)
-
-        # Only support stdin (fd 0) for serial input
-        if fd != 0
-            return -1  # EBADF
-
-        # First, poll for any new data
-        serial_poll()
-
-        # Read from the serial input buffer
-        let bytes_read: i64 = serial_buf_read_many(buf, count)
-        return bytes_read
-
-    if rax == SYS_YIELD
-        # Yield CPU - currently a no-op (TODO: implement proper user-level yield)
-        # The kernel task scheduler is for kernel threads, not user processes
-        return 0
-
-    if rax == SYS_GETPID
-        # Return current process ID
-        # g_child_pid tracks the current running process (1=init, 2+=children)
-        return g_child_pid as i64
-
-    if rax == SYS_READDIR
-        # rdi = path pointer, rsi = buffer, rdx = buffer size
-        # SECURITY: Validate path string and output buffer
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        if rdx > 0
-            let buf_result: i64 = uptr_check_write(rsi as *u8, rdx as u64)
-            if buf_result != 0
-                return EFAULT
-        return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
-
-    if rax == SYS_SPAWN
-        # rdi = path pointer
-        # SECURITY: Validate path string
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        return sys_spawn_impl(rdi as *u8)
-
-    if rax == SYS_SPAWN_ARGS
-        # rdi = path pointer, rsi = argv, rdx = argc
-        # SECURITY: Validate path string
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        # SECURITY: Validate argv array (each pointer + the strings they point to)
-        let argc: i32 = rdx as i32
-        if argc > 0
-            # Validate the argv array itself
-            let argv_size: u64 = (argc as u64) * 8  # sizeof(*u8) = 8 on x86-64
-            let argv_result: i64 = uptr_check_read(rsi as *u8, argv_size)
-            if argv_result != 0
-                return EFAULT
-            # Validate each string in argv
-            var i: i32 = 0
-            let argv: **u8 = rsi as **u8
-            while i < argc
-                let arg: *u8 = *(argv + i)
-                let arg_result: i64 = uptr_validate_string(arg, 4096)
-                if arg_result < 0
-                    return EFAULT
-                i = i + 1
-        return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
-
-    if rax == SYS_WAIT
-        # rdi = pid
-        return sys_wait_impl(rdi as i32)
-
-    # IPC syscalls - use current_pid() instead of hardcoded 1
-    if rax == SYS_CHANNEL_CREATE
-        return sys_channel_create(current_pid())
-
-    if rax == SYS_IPC_SEND
-        # SECURITY: Validate Message struct (4096 bytes) is readable
-        let msg_result: i64 = uptr_check_read(rsi as *u8, 4096)
-        if msg_result != 0
-            return EFAULT
-        return sys_ipc_send(current_pid(), rdi as i32, rsi as *Message)
-
-    if rax == SYS_IPC_RECV
-        # SECURITY: Validate Message struct (4096 bytes) is writable
-        let msg_result: i64 = uptr_check_write(rsi as *u8, 4096)
-        if msg_result != 0
-            return EFAULT
-        # Validate sender_pid output pointer (4 bytes for u32)
-        if rdx != 0
-            let sender_result: i64 = uptr_check_write(rdx as *u8, 4)
-            if sender_result != 0
-                return EFAULT
-        return sys_ipc_recv(current_pid(), rdi as i32, rsi as *Message, rdx as *u32)
-
-    if rax == SYS_IPC_CLOSE
-        return sys_ipc_close(current_pid(), rdi as i32)
-
-    # Capability syscalls - use current_pid() instead of hardcoded 1
-    if rax == SYS_CAP_GRANT
-        return sys_cap_grant(current_pid(), rdi, rsi as u32, rdx as u32)
-
-    if rax == SYS_CAP_REVOKE
-        return sys_cap_revoke(current_pid(), rdi)
-
-    if rax == SYS_CAP_DERIVE
-        return sys_cap_derive(current_pid(), rdi, rsi as u32)
-
-    if rax == SYS_CAP_INFO
-        # SECURITY: Validate CapInfo output struct (16 bytes) is writable
-        let info_result: i64 = uptr_check_write(rsi as *u8, 16)
-        if info_result != 0
-            return EFAULT
-        return sys_cap_info(current_pid(), rdi, rsi as *CapInfo)
-
-    if rax == SYS_CAP_CHECK
-        return sys_cap_check(current_pid(), rdi, rsi as u32)
-
-    # Memory management syscalls
-    if rax == SYS_MMAP
-        # mmap(addr, length, prot, flags)
-        return sys_mmap_impl(rdi, rsi, rdx, r10)
-
-    if rax == SYS_MUNMAP
-        # munmap(addr, length)
-        return sys_munmap_impl(rdi, rsi)
-
-    # Working directory syscalls
-    if rax == SYS_GETCWD
-        # getcwd(buf, size) -> length or -1
-        # SECURITY: Validate output buffer is writable
-        if rsi > 0
-            let buf_result: i64 = uptr_check_write(rdi as *u8, rsi as u64)
-            if buf_result != 0
-                return EFAULT
-        return sys_getcwd_impl(rdi as *u8, rsi)
-
-    if rax == SYS_CHDIR
-        # chdir(path) -> 0 or -1
-        # SECURITY: Validate path string
-        let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
-        if path_result < 0
-            return EFAULT
-        return sys_chdir_impl(rdi as *u8)
-
-    # Input device syscalls
-    if rax == SYS_INPUT_POLL
-        # input_poll() -> number of events pending
-        return sys_input_poll_impl()
-
-    if rax == SYS_INPUT_READ
-        # input_read(event_ptr) -> 0 if event read, -1 if no events
-        # SECURITY: Validate VirtioInputEvent output struct (8 bytes) is writable
-        let event_result: i64 = uptr_check_write(rdi as *u8, 8)
-        if event_result != 0
-            return EFAULT
-        return sys_input_read_impl(rdi as *VirtioInputEvent)
-
-    # ACPI power management syscalls
-    if rax == SYS_ACPI_POWEROFF
-        prints("[syscall] ACPI poweroff requested\n")
-        let result: i32 = acpi_poweroff()
-        # If we get here, poweroff failed
-        return result as i64
-
-    # Framebuffer syscalls for Prism compositor
-    if rax == SYS_FB_INFO
-        # sys_fb_info(info_buf: *FbInfo) -> 0 on success, -1 on no display
-        # SECURITY: Validate FbInfo output struct (24 bytes) is writable
-        let info_result: i64 = uptr_check_write(rdi as *u8, 24)
-        if info_result != 0
-            return EFAULT
-        return sys_fb_info_impl(rdi as *u8)
-
-    if rax == SYS_FB_MAP
-        # sys_fb_map() -> mapped_addr or -1
-        return sys_fb_map_impl()
-
-    # Unknown syscall
-    prints("[syscall] unknown: ")
-    serial_print_dec(rax)
-    prints("\n")
-    return -1
+    if not syscall_has_handler(rax)
+        prints("[syscall] unknown: ")
+        serial_print_dec(rax)
+        prints("\n")
+        return ENOSYS
+    return syscall_dispatch(rax, rdi, rsi, rdx, r10)
 
 # Run /bin/init from the filesystem as PID 1
 # This is the actual init process that runs tests and triggers shutdown.
