@@ -859,6 +859,12 @@ fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len:
     *out_len = 0
     return 0
 
+# AGAST #2140: 1 when the scrutinee is a borrow, `@place` / `@&place`.
+fn match_scrutinee_is_addr(scr: *Expr) -> i32
+    if scr.kind == EXPR_UNARY and (scr.op == OP_ADDR or scr.op == OP_ADDR_MUT) and scr.operand != null
+        return 1
+    0
+
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
 fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
@@ -867,12 +873,39 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
     # it into an alloca once so every arm can GEP the same pointer.
     var enum_name: *u8 = null
     var enum_name_len: i32 = 0
-    let is_enum: i32 = resolve_scrutinee_enum(s, scrutinee, @enum_name, @enum_name_len)
+    # AGAST #2140: `match @place` (angelo's `match @self.cmap`) matches the
+    # enum the pointer addresses.  resolve_scrutinee_enum stays strict about
+    # `@` (emit_enum_to_int shares it, and `(@e) as T` is a pointer cast), so
+    # the borrow is unwrapped here: the pointer is the spill slot, and the
+    # value is loaded from it for arms that use the scrutinee register.
+    # Without this `@o` was a scalar: `Some(x)` compared the ADDRESS to 0.
+    let is_addr: i32 = match_scrutinee_is_addr(scrutinee)
+    var is_enum: i32 = 0
+    if is_addr == 1
+        is_enum = resolve_scrutinee_enum(s, scrutinee.operand, @enum_name, @enum_name_len)
+    else
+        is_enum = resolve_scrutinee_enum(s, scrutinee, @enum_name, @enum_name_len)
 
-    # Evaluate scrutinee
-    let scrut_reg: i32 = emit_expr(s, scrutinee)
+    # Evaluate scrutinee.  For `@place` the place's own address (a `ptr`;
+    # `@expr` as a value is a ptrtoint'd i64) is the slot.
+    var scrut_reg: i32 = 0
     var scrut_slot: i32 = 0
-    if is_enum == 1
+    if is_enum == 1 and is_addr == 1
+        scrut_slot = emit_lvalue_ptr(s, scrutinee.operand)
+        if scrut_slot < 0
+            emit_ir_error(s, c"cannot take address of match scrutinee")
+            return 0
+        scrut_reg = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, scrut_reg)
+        emit_str(s, c" = load %")
+        emit_name(s, enum_name, enum_name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, scrut_slot)
+        emit_str(s, c"  ; match @place\n")
+    else
+        scrut_reg = emit_expr(s, scrutinee)
+    if is_enum == 1 and is_addr == 0
         scrut_slot = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, scrut_slot)

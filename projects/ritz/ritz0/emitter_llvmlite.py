@@ -12275,8 +12275,17 @@ class LLVMEmitter:
         if union_name and union_name in self.union_types:
             return self._emit_union_match(expr, match_val, union_name)
 
-        # Check if matching on an enum type
-        enum_name = self._get_enum_name_from_expr(expr.expr)
+        # Check if matching on an enum type. `match @place` (angelo's
+        # `match @self.cmap`) matches the enum the borrow addresses:
+        # _emit_enum_match loads through a pointer-to-enum. Since #2124 `@x`
+        # infers as a pointer, so the enum is named by the operand (AGAST
+        # #2140). Kept here, not in _get_enum_name_from_expr: `(@e)?` and
+        # `(@e) as T` are pointer operations, not enum ones.
+        enum_src = expr.expr
+        if (isinstance(enum_src, rast.UnaryOp)
+                and enum_src.op in ('@', '&', '@&', '&mut')):
+            enum_src = enum_src.operand
+        enum_name = self._get_enum_name_from_expr(enum_src)
         if enum_name and enum_name in self.enum_types:
             return self._emit_enum_match(expr, match_val, enum_name)
 
