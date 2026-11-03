@@ -3485,6 +3485,10 @@ fn get_member_pointee_type_exact(s: *EmitterState, e: *Expr) -> i32
 # truncating it.  TYPE_I64 doubles as "unknown" in the local/global pointee
 # tables, and an i64 store is the default anyway, so it is reported as-is.
 fn get_deref_store_type(s: *EmitterState, ptr_expr: *Expr) -> i32
+    # AGAST #2119: `*(@s as *i8) = v` / `*@g = v` store the stated pointee.
+    let inl_pt: i32 = inline_deref_scalar_pointee(s, ptr_expr)
+    if inl_pt != TYPE_VOID
+        return inl_pt
     if ptr_expr.kind == EXPR_IDENT
         let lpt: i32 = find_local_pointee_type(s, ptr_expr.ident_ptr, ptr_expr.ident_len)
         if lpt != TYPE_I64
@@ -3700,6 +3704,56 @@ fn mem_builtin_id(name: *u8, len: i32) -> i32
         return MEM_FENCE
     0
 
+# The pointee type a pointer expression states inline, or TYPE_VOID: `<e> as
+# *T` (the cast records T; AGAST #1453) and `@x` (x's own type).  Shared by
+# the memory builtins (#1879) and the `*p` load / `*p = v` store widths
+# (#2119), which otherwise only know a typed binding's pointee.
+fn inline_ptr_pointee(s: *EmitterState, p: *Expr) -> i32
+    if p == null
+        return TYPE_VOID
+    if p.kind == EXPR_CAST and p.op == TYPE_PTR and p.int_val != (TYPE_VOID as i64)
+        return p.int_val as i32
+    if p.kind == EXPR_UNARY and (p.op == OP_ADDR or p.op == OP_ADDR_MUT) and p.operand != null
+        let ae: i32 = addr_of_array_elem_type(s, p.operand)
+        if ae != TYPE_VOID
+            return ae
+        return get_expr_type(s, p.operand)
+    TYPE_VOID
+
+# The element type of `arr[i]` over an inline array (local, global or
+# field), or TYPE_VOID.  get_expr_type calls an integer element i64 (its
+# value-model width), but `@arr[i]` points at the element's own slot.
+fn addr_of_array_elem_type(s: *EmitterState, x: *Expr) -> i32
+    if x.kind != EXPR_INDEX or x.left == null
+        return TYPE_VOID
+    if x.right != null and x.right.kind == EXPR_RANGE
+        return TYPE_VOID
+    if x.left.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, x.left.ident_ptr, x.left.ident_len)
+        if loc != null
+            if loc.var_type == TYPE_ARRAY
+                return loc.array_elem_type
+            return TYPE_VOID
+        let glob: *GlobalVarDef = find_global(s, x.left.ident_ptr, x.left.ident_len)
+        if glob != null and glob.var_type == TYPE_ARRAY
+            return glob.array_elem_type
+        return TYPE_VOID
+    if x.left.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, x.left)
+        if f != null and f.field_type == TYPE_ARRAY
+            return f.array_elem_type
+    TYPE_VOID
+
+# AGAST #2119: the scalar (integer / float / bool) pointee of `*p` when `p`
+# states it inline, else TYPE_VOID.  `*(@s as *i8)` and `*@g` (g: u32)
+# loaded and stored i64, reading / clobbering the slot's neighbours.
+# Aggregates are left to deref_pointee_struct_name, which names them.
+fn inline_deref_scalar_pointee(s: *EmitterState, p: *Expr) -> i32
+    let t: i32 = inline_ptr_pointee(s, p)
+    if t != TYPE_VOID and primitive_name_len(t) > 0
+        return t
+    TYPE_VOID
+
 # The pointee type of a memory builtin's pointer operand.  ritz1's `*p`
 # inference only knows a typed binding's pointee (a `*(@x as *u32)` deref
 # loads i64), and an atomic must not silently widen, so the two shapes a
@@ -3708,10 +3762,9 @@ fn mem_builtin_id(name: *u8, len: i32) -> i32
 fn mem_builtin_pointee(s: *EmitterState, arg: *Expr) -> i32
     if arg == null
         return TYPE_VOID
-    if arg.kind == EXPR_CAST and arg.op == TYPE_PTR and arg.int_val != (TYPE_VOID as i64)
-        return arg.int_val as i32
-    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT) and arg.operand != null
-        return get_expr_type(s, arg.operand)
+    let inl: i32 = inline_ptr_pointee(s, arg)
+    if inl != TYPE_VOID
+        return inl
     let d: *Expr = calloc(1, sizeof(Expr)) as *Expr
     d.kind = EXPR_UNARY
     d.op = OP_DEREF
@@ -3879,6 +3932,10 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         else if e.op == OP_BIT_NOT
             return TYPE_I64
         else if e.op == OP_DEREF
+            # AGAST #2119: `*(@s as *i8)` / `*@g` load the stated pointee.
+            let inl_pt: i32 = inline_deref_scalar_pointee(s, e.operand)
+            if inl_pt != TYPE_VOID
+                return inl_pt
             # AGAST #1924: `*(ppp + i)` with `ppp: ***T` is itself a `**T`.
             # The arm below calls every deref of a `**` a `*T`, so the next
             # deref out lost the pointee and `*(*(*(ppp + i) + j) + k)`
