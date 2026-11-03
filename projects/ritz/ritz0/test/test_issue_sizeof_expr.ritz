@@ -1,0 +1,247 @@
+# AGAST #2124 (LANGUAGE_SPEC §7.9): `sizeof(expr)` is the size of the
+# expression's type. The expression is neither evaluated nor moved.
+#
+# Before the fix both compilers answered 8 for every non-type argument
+# (a local array, a field, a global), so `mem_zero(@key[0], sizeof(key))`
+# compiled and wiped 8 bytes of a 64-byte key. ritz0's ownership checker
+# also treated `sizeof(local)` as a move, and `sizeof([8]u8)` didn't parse.
+import ritzlib.str
+
+struct Pair
+    a: i64
+    b: i32
+
+struct Inner
+    x: [10]u32
+    y: u8
+
+struct Holder
+    tag: i32
+    arr: [48]u8
+    ks: Inner
+    small: u16
+
+var g_buf: [24]u8
+var g_calls: i32 = 0
+
+fn bump() -> i32
+    g_calls = g_calls + 1
+    return g_calls
+
+fn param_size(v: u16) -> i64
+    return sizeof(v)
+
+fn ptr_field_size(p: *Holder) -> i64
+    return sizeof(p.arr)
+
+fn ptr_struct_field_size(p: *Holder) -> i64
+    return sizeof(p.ks)
+
+[[test]]
+fn test_sizeof_local_array() -> i32
+    var k: [64]u8
+    if sizeof(k) != 64
+        return 1
+    var w: [5]i32
+    if sizeof(w) != 20
+        return 2
+    return 0
+
+[[test]]
+fn test_sizeof_scalar_locals_and_params() -> i32
+    let n: i32 = 0
+    if sizeof(n) != 4
+        return 1
+    let b: u8 = 0
+    if sizeof(b) != 1
+        return 2
+    let q: *u8 = null
+    if sizeof(q) != 8
+        return 3
+    if param_size(7) != 2
+        return 4
+    return 0
+
+[[test]]
+fn test_sizeof_value_fields() -> i32
+    var h: Holder
+    if sizeof(h.arr) != 48
+        return 1
+    if sizeof(h.ks) != sizeof(Inner)
+        return 2
+    if sizeof(Inner) != 44
+        return 3
+    if sizeof(h.small) != 2
+        return 4
+    if sizeof(h.ks.x) != 40
+        return 5
+    if sizeof(h) != sizeof(Holder)
+        return 6
+    return 0
+
+[[test]]
+fn test_sizeof_pointer_fields() -> i32
+    var h: Holder
+    if ptr_field_size(@h) != 48
+        return 1
+    if ptr_struct_field_size(@h) != 44
+        return 2
+    return 0
+
+[[test]]
+fn test_sizeof_index_and_deref() -> i32
+    var w: [5]i32
+    if sizeof(w[0]) != 4
+        return 1
+    var pr: Pair
+    let pp: *Pair = @pr
+    if sizeof(*pp) != sizeof(Pair)
+        return 2
+    if sizeof(Pair) != 16
+        return 3
+    return 0
+
+[[test]]
+fn test_sizeof_global() -> i32
+    if sizeof(g_buf) != 24
+        return 1
+    return 0
+
+[[test]]
+fn test_sizeof_array_types() -> i32
+    if sizeof([8]u8) != 8
+        return 1
+    if sizeof([4]i32) != 16
+        return 2
+    if sizeof([3]Pair) != 48
+        return 3
+    if sizeof([2][3]u16) != 12
+        return 4
+    if sizeof(*u8) != 8
+        return 5
+    return 0
+
+[[test]]
+fn test_sizeof_does_not_evaluate() -> i32
+    g_calls = 0
+    if sizeof(bump()) != 4
+        return 1
+    if g_calls != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_sizeof_does_not_move() -> i32
+    var k: [64]u8
+    k[0] = 9
+    let sz: i64 = sizeof(k)
+    # k is still usable: sizeof did not move it.
+    if k[0] != 9
+        return 1
+    var h: Holder
+    h.tag = 5
+    let hs: i64 = sizeof(h)
+    if h.tag != 5
+        return 2
+    if sz != 64 or hs != sizeof(Holder)
+        return 3
+    return 0
+
+[[test]]
+fn test_sizeof_wipe_whole_key() -> i32
+    # The motivating bug: a wipe sized by sizeof(key) must cover the whole
+    # buffer (cryptosec's mem_zero has memset's shape).
+    var key: [64]u8
+    var i: i64 = 0
+    while i < 64
+        key[i] = 0xAB
+        i = i + 1
+    memset(@key[0], 0, sizeof(key))
+    i = 0
+    while i < 64
+        if key[i] != 0
+            return (i + 1) as i32
+        i = i + 1
+    return 0
+
+type Key = [32]u8
+type Word = u16
+
+const N_SLOTS: i32 = 3
+
+fn gen_size<T>(x: T) -> i64
+    return sizeof(T) * 100 + sizeof(x)
+
+fn gen_array_size<T>(x: T) -> i64
+    return sizeof([4]T)
+
+[[test]]
+fn test_sizeof_struct_array_local() -> i32
+    var ps: [3]Pair
+    if sizeof(ps) != 48
+        return 1
+    if sizeof(ps[1]) != 16
+        return 2
+    if sizeof(ps[1].b) != 4
+        return 3
+    return 0
+
+[[test]]
+fn test_sizeof_alias() -> i32
+    if sizeof(Key) != 32
+        return 1
+    if sizeof(Word) != 2
+        return 2
+    var k: Key
+    if sizeof(k) != 32
+        return 3
+    return 0
+
+[[test]]
+fn test_sizeof_unannotated_locals() -> i32
+    g_calls = 0
+    let c = bump()
+    if sizeof(c) != 4
+        return 1
+    let lit = 7
+    if sizeof(lit) != 8
+        return 2
+    var pr: Pair
+    let pp = @pr
+    if sizeof(pp) != 8
+        return 3
+    if g_calls != 1
+        return 4
+    return 0
+
+[[test]]
+fn test_sizeof_operators_and_casts() -> i32
+    let n: i32 = 3
+    if sizeof(n + 1) != 4
+        return 1
+    if sizeof(n < 2) != 1
+        return 2
+    if sizeof(n as u16) != 2
+        return 3
+    if sizeof(-n) != 4
+        return 4
+    if sizeof('a') != 1
+        return 5
+    if sizeof(N_SLOTS) != 4
+        return 6
+    return 0
+
+[[test]]
+fn test_sizeof_generic() -> i32
+    let n: i32 = 0
+    if gen_size<i32>(n) != 404
+        return 1
+    var pr: Pair
+    if gen_size<Pair>(pr) != 1616
+        return 2
+    let p: *u8 = null
+    if gen_size<*u8>(p) != 808
+        return 3
+    if gen_array_size<u16>(0 as u16) != 8
+        return 4
+    return 0

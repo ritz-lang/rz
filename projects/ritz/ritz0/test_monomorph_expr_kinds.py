@@ -143,7 +143,11 @@ def rewrite_with(stmt):
 
 
 def sizeof_args(fn):
-    return [n.args[0].name for n in walk(fn.body)
+    # A specialized `sizeof(T)` carries the concrete type as a TypeExpr
+    # (AGAST #2124); an unspecialized one is still the Ident `T`.
+    def name(arg):
+        return arg.ty.name if isinstance(arg, rast.TypeExpr) else arg.name
+    return [name(n.args[0]) for n in walk(fn.body)
             if isinstance(n, rast.Call) and isinstance(n.func, rast.Ident)
             and n.func.name == "sizeof"]
 

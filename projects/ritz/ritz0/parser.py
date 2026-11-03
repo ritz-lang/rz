@@ -856,7 +856,13 @@ class Parser:
                 while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
                     self._advance()
                 args = []
-                if not self._at(TokenType.RPAREN):
+                if (isinstance(expr, rast.Ident) and expr.name == 'sizeof'
+                        and self._at(TokenType.LBRACKET)):
+                    # `sizeof([8]u8)`: an array type can't parse as an
+                    # expression (AGAST #2124), so read it as a type.
+                    ty_start = self._peek().span
+                    args.append(rast.TypeExpr(ty_start, self.parse_type()))
+                elif not self._at(TokenType.RPAREN):
                     args.append(self.parse_expr())
                     # Skip any newlines after argument
                     while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):

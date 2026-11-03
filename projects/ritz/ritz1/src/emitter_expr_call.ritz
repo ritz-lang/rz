@@ -1,9 +1,11 @@
 # Auto-extracted from emitter_expr.ritz — CALL + METHOD codegen.
 
 import ast
+import ast_helpers
 import emitter_core
 import emitter_expr
 import emitter_print
+import narrowing
 import ritzlib.memory
 
 # AGAST #1813: per-call register arrays, sized from the argument list.  They
@@ -1964,6 +1966,347 @@ fn emit_mem_builtin(s: *EmitterState, e: *Expr, id: i32) -> i32
     emit_str(s, c" seq_cst\n")
     mem_widen(s, raw, bits, pty)
 
+# =============================================================================
+# sizeof (LANGUAGE_SPEC §7.9, AGAST #2124)
+#
+# `sizeof(T)` is the size of type T; `sizeof(expr)` the size of expr's TYPE.
+# The operand is never evaluated: these helpers only read declarations, and
+# emit_expr_call emits one constant.  Every non-type operand used to come out
+# as 8 (so `mem_zero(@key[0], sizeof(key))` wiped 8 bytes of a 64-byte key),
+# and so did an unknown type name.  Each helper answers -1 when it cannot
+# tell, and the caller makes that a located error: no guess survives.
+# =============================================================================
+
+# Size of one value of kind `t` (struct / enum `name` when t == TYPE_STRUCT;
+# a primitive spelled as a name is accepted too), or -1 for a type that does
+# not exist.  Unlike elem_size_align, never falls back to 8.
+fn sizeof_kind_size(s: *EmitterState, t: i32, name: *u8, name_len: i32) -> i64
+    if t == TYPE_STRUCT
+        if name == null or name_len <= 0
+            return -1
+        let prim: i64 = prim_name_size(name, name_len)
+        if prim > 0
+            return prim
+        if find_struct(s, name, name_len) != null or is_tagged_enum_type(name, name_len) == 1 or user_enum_index(name, name_len) >= 0
+            return get_struct_size_by_name(s, name, name_len)
+        return -1
+    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
+        return 8
+    let sz: i64 = ptr_pointee_size(s, t, null, 0)
+    if sz > 0
+        return sz
+    return -1
+
+fn sizeof_shape_size(s: *EmitterState, sh: *ArrayShape, skip_outer: i32) -> i64
+    var n: i64 = 1
+    var d: i32 = skip_outer
+    while d < sh.rank
+        n = n * (sh.dims[d] as i64)
+        d = d + 1
+    let leaf: i64 = sizeof_kind_size(s, sh.leaf_type, sh.leaf_name, sh.leaf_name_len)
+    if leaf < 0
+        return -1
+    return n * leaf
+
+fn sizeof_times(count: i64, elem: i64) -> i64
+    if elem < 0
+        return -1
+    return count * elem
+
+# A type alias `name`, sized; -1 when `name` is no alias (or sizes to nothing).
+fn sizeof_alias_size(s: *EmitterState, name: *u8, len: i32) -> i64
+    var count: i64 = 0
+    var leaf: i32 = TYPE_VOID
+    var leaf_name: *u8 = null
+    var leaf_len: i32 = 0
+    if type_alias_sizeof_shape(name, len, @count, @leaf, @leaf_name, @leaf_len) == 0
+        return -1
+    return sizeof_times(count, sizeof_kind_size(s, leaf, leaf_name, leaf_len))
+
+# 1 when `name` is a value in scope: a local or param, a global or a const.
+fn sizeof_is_value(s: *EmitterState, name: *u8, len: i32) -> i32
+    if find_local_idx(s, name, len) >= 0
+        return 1
+    if find_global(s, name, len) != null
+        return 1
+    if find_const_entry(s, name, len) != null
+        return 1
+    return 0
+
+# A type spelled as an identifier: a primitive, struct, enum or alias.
+fn sizeof_type_name_size(s: *EmitterState, name: *u8, len: i32) -> i64
+    let alias_sz: i64 = sizeof_alias_size(s, name, len)
+    if alias_sz >= 0
+        return alias_sz
+    return sizeof_kind_size(s, TYPE_STRUCT, name, len)
+
+# 1 when `e` spells a type rather than a value (`u8`, `Pair`, `*Pair`): the
+# operand of `sizeof(*u8)` parses as a deref of the name `u8`.
+fn sizeof_names_type(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_TYPE_OPERAND
+        return 1
+    if e.kind == EXPR_IDENT
+        if sizeof_is_value(s, e.ident_ptr, e.ident_len) == 1
+            return 0
+        if sizeof_type_name_size(s, e.ident_ptr, e.ident_len) >= 0
+            return 1
+        return 0
+    if e.kind == EXPR_UNARY and (e.op == OP_DEREF or e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        return sizeof_names_type(s, e.operand)
+    return 0
+
+# The newest declaration of `name` in this function (null if none, or if
+# the table overflowed and can no longer be trusted).
+fn sizeof_find_decl(s: *EmitterState, name: *u8, len: i32) -> *NarrowDecl
+    if s.narrow_decl_overflow != 0
+        return null
+    var i: i32 = s.narrow_decl_count - 1
+    while i >= 0
+        let d: *NarrowDecl = @s.narrow_decls[i]
+        if name_eq(d.name, d.name_len, name, len) == 1
+            return d
+        i = i - 1
+    return null
+
+fn sizeof_local_size(s: *EmitterState, lv: *LocalVar, depth: i32) -> i64
+    let t: i32 = lv.var_type
+    if t == TYPE_ARRAY
+        if lv.array_shape != null
+            return sizeof_shape_size(s, lv.array_shape, 0)
+        return sizeof_times(lv.array_size as i64, sizeof_kind_size(s, lv.array_elem_type, lv.type_name, lv.type_name_len))
+    if t == TYPE_STRUCT
+        return sizeof_kind_size(s, TYPE_STRUCT, lv.type_name, lv.type_name_len)
+    if lv.is_bool == 1
+        return 1
+    if narrow_int_width(t) == 0
+        return sizeof_kind_size(s, t, lv.type_name, lv.type_name_len)
+    # An integer slot: ritz1 keeps every integer in i64, and the parser
+    # defaults a missing annotation to TYPE_I64, so the slot can't say.
+    # An unannotated `let x = init` has init's type, as in ritz0.
+    let d: *NarrowDecl = sizeof_find_decl(s, lv.name, lv.name_len)
+    if d != null and d.declared == TYPE_VOID
+        if d.init == null
+            return -1
+        return sizeof_expr_size(s, d.init, depth + 1)
+    return sizeof_kind_size(s, t, null, 0)
+
+fn sizeof_global_size(s: *EmitterState, g: *GlobalVarDef) -> i64
+    if g.var_type == TYPE_ARRAY
+        if g.array_shape != null
+            return sizeof_shape_size(s, g.array_shape, 0)
+        return sizeof_times(g.array_size as i64, sizeof_kind_size(s, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len))
+    return sizeof_kind_size(s, g.var_type, g.type_name, g.type_name_len)
+
+fn sizeof_ident_size(s: *EmitterState, e: *Expr, depth: i32) -> i64
+    # A value in scope wins over a type of the same name, as in ritz0.
+    # The written integer type first (narrow_ident_type: consts, annotated
+    # locals, params, narrow globals).
+    let nt: i32 = narrow_ident_type(s, e)
+    if nt != NARROW_UNKNOWN
+        return sizeof_kind_size(s, nt, null, 0)
+    let lidx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+    if lidx >= 0
+        return sizeof_local_size(s, local_at(s, lidx), depth)
+    let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+    if g != null
+        return sizeof_global_size(s, g)
+    let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+    if ce != null
+        if ce.const_type == TYPE_ARRAY
+            return sizeof_times(ce.array_size as i64, sizeof_kind_size(s, ce.array_elem_type, ce.array_elem_type_name, ce.array_elem_type_name_len))
+        return sizeof_kind_size(s, ce.const_type, ce.type_name, ce.type_name_len)
+    return sizeof_type_name_size(s, e.ident_ptr, e.ident_len)
+
+# The struct an element of array `b` (a local or global ident) is, or 0.
+fn sizeof_array_elem_struct(s: *EmitterState, b: *Expr, name: **u8, len: *i32) -> i32
+    if b.kind != EXPR_IDENT
+        return 0
+    let lidx: i32 = find_local_idx(s, b.ident_ptr, b.ident_len)
+    if lidx >= 0
+        let lv: *LocalVar = local_at(s, lidx)
+        if lv.var_type == TYPE_ARRAY and lv.array_shape == null and lv.array_elem_type == TYPE_STRUCT
+            *name = lv.type_name
+            *len = lv.type_name_len
+            return 1
+        return 0
+    let g: *GlobalVarDef = find_global(s, b.ident_ptr, b.ident_len)
+    if g != null and g.var_type == TYPE_ARRAY and g.array_shape == null and g.array_elem_type == TYPE_STRUCT
+        *name = g.array_elem_type_name
+        *len = g.array_elem_type_name_len
+        return 1
+    return 0
+
+# The field `e` (an EXPR_MEMBER) names: member_field_def's receivers, plus
+# an element of a struct array (`ps[i].f`).
+fn sizeof_member_field(s: *EmitterState, e: *Expr) -> *StructField
+    let f: *StructField = member_field_def(s, e)
+    if f != null
+        return f
+    if e.left == null or e.left.kind != EXPR_INDEX
+        return null
+    var sname: *u8 = null
+    var slen: i32 = 0
+    if sizeof_array_elem_struct(s, e.left.left, @sname, @slen) == 0
+        return null
+    let st: *StructDef = find_struct(s, sname, slen)
+    if st == null
+        return null
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return null
+    return get_field_type(st, idx)
+
+# `base[i]`: one element of an array (local, global or field) or pointer.
+fn sizeof_index_size(s: *EmitterState, e: *Expr) -> i64
+    if e.right != null and e.right.kind == EXPR_RANGE
+        return -1
+    let b: *Expr = e.left
+    if b.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, b)
+        if f == null
+            return -1
+        if f.field_type == TYPE_ARRAY
+            return sizeof_kind_size(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
+        if f.field_type == TYPE_PTR
+            return sizeof_kind_size(s, ptr_field_elem_kind(f), f.field_type_name, f.field_type_name_len)
+        return -1
+    if b.kind != EXPR_IDENT
+        return -1
+    let lidx: i32 = find_local_idx(s, b.ident_ptr, b.ident_len)
+    if lidx >= 0
+        let lv: *LocalVar = local_at(s, lidx)
+        if lv.var_type == TYPE_ARRAY
+            if lv.array_shape != null
+                return sizeof_shape_size(s, lv.array_shape, 1)
+            return sizeof_kind_size(s, lv.array_elem_type, lv.type_name, lv.type_name_len)
+        if lv.var_type == TYPE_PTR_PTR
+            return 8
+        if lv.var_type == TYPE_PTR
+            return sizeof_kind_size(s, lv.pointee_type, lv.type_name, lv.type_name_len)
+        return -1
+    let g: *GlobalVarDef = find_global(s, b.ident_ptr, b.ident_len)
+    if g != null
+        if g.var_type == TYPE_ARRAY
+            if g.array_shape != null
+                return sizeof_shape_size(s, g.array_shape, 1)
+            return sizeof_kind_size(s, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
+        if g.var_type == TYPE_PTR_PTR
+            return 8
+        if g.var_type == TYPE_PTR
+            return sizeof_kind_size(s, g.pointee_type, g.type_name, g.type_name_len)
+    return -1
+
+# `*p`: the pointee of a pointer local / param / global.
+fn sizeof_deref_size(s: *EmitterState, e: *Expr) -> i64
+    let o: *Expr = e.operand
+    if o == null or o.kind != EXPR_IDENT
+        return -1
+    let lidx: i32 = find_local_idx(s, o.ident_ptr, o.ident_len)
+    if lidx >= 0
+        let lv: *LocalVar = local_at(s, lidx)
+        if lv.var_type == TYPE_PTR_PTR
+            return 8
+        if lv.var_type == TYPE_PTR or lv.var_type == TYPE_REF or lv.var_type == TYPE_MUT_REF
+            return sizeof_kind_size(s, lv.pointee_type, lv.type_name, lv.type_name_len)
+        return -1
+    let g: *GlobalVarDef = find_global(s, o.ident_ptr, o.ident_len)
+    if g != null
+        if g.var_type == TYPE_PTR_PTR
+            return 8
+        if g.var_type == TYPE_PTR
+            return sizeof_kind_size(s, g.pointee_type, g.type_name, g.type_name_len)
+    return -1
+
+# Size of `e`'s type, or -1 when it can't be determined.  `depth` bounds the
+# walk through unannotated locals' initialisers.
+fn sizeof_expr_size(s: *EmitterState, e: *Expr, depth: i32) -> i64
+    if e == null or depth > 16
+        return -1
+    let k: i32 = e.kind
+    if k == EXPR_TYPE_OPERAND
+        return sizeof_times(e.int_val, sizeof_kind_size(s, e.op, e.ident_ptr, e.ident_len))
+    if k == EXPR_IDENT
+        return sizeof_ident_size(s, e, depth)
+    if k == EXPR_INT_LIT or k == EXPR_FLOAT_LIT or k == EXPR_CSTRING_LIT
+        return 8
+    if k == EXPR_CHAR_LIT
+        return 1
+    if k == EXPR_STRING_LIT
+        return sizeof_kind_size(s, TYPE_STRUCT, c"StrView", 7)
+    if k == EXPR_MEMBER
+        let f: *StructField = sizeof_member_field(s, e)
+        if f == null
+            return -1
+        if f.field_type == TYPE_ARRAY
+            return sizeof_times(f.array_size as i64, sizeof_kind_size(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len))
+        return sizeof_kind_size(s, f.field_type, f.field_type_name, f.field_type_name_len)
+    if k == EXPR_INDEX
+        return sizeof_index_size(s, e)
+    if k == EXPR_UNARY
+        if sizeof_names_type(s, e) == 1
+            return 8   # `*u8`, `@Pair`: a pointer type
+        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
+            return 8
+        if e.op == OP_DEREF
+            return sizeof_deref_size(s, e)
+        return sizeof_expr_size(s, e.operand, depth + 1)
+    if k == EXPR_BINARY
+        # As ritz0: a comparison or `and`/`or` is a bool, anything else
+        # has its left operand's type.
+        if e.op >= OP_EQ and e.op <= OP_OR
+            return 1
+        return sizeof_expr_size(s, e.left, depth + 1)
+    if k == EXPR_CAST
+        return sizeof_kind_size(s, e.op, null, 0)
+    if k == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, e)
+        if fd == null
+            return -1
+        return sizeof_kind_size(s, fd.return_type, fd.return_type_name, fd.return_type_name_len)
+    return -1
+
+# "error: <file>:<line>:<col>: sizeof: ..." — counted, so main refuses to
+# write the output.
+fn sizeof_error(s: *EmitterState, e: *Expr, name: *u8, len: i32)
+    emit_str(s, c"  ; ERROR: sizeof operand\n")
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(e.span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(e.span.col as i64)
+    if name != null
+        eprints_cstr(c": sizeof: unknown type or value `")
+        var i: i32 = 0
+        while i < len
+            eprint_char(*(name + i))
+            i += 1
+        eprints_cstr(c"`\n")
+    else
+        eprints_cstr(c": sizeof: cannot determine the type of this expression\n")
+    s.error_count = s.error_count + 1
+
+# The constant `sizeof(...)` folds to; reports and returns 0 when unknown.
+fn sizeof_call_value(s: *EmitterState, e: *Expr) -> i64
+    let arg: *Expr = e.args
+    if arg == null or arg.next != null
+        emit_nd_error(s, e.span.line, e.span.col, c"sizeof takes exactly one argument (a type or an expression)")
+        return 0
+    let sz: i64 = sizeof_expr_size(s, arg, 0)
+    if sz >= 0
+        return sz
+    if arg.kind == EXPR_IDENT and sizeof_is_value(s, arg.ident_ptr, arg.ident_len) == 0
+        sizeof_error(s, arg, arg.ident_ptr, arg.ident_len)
+    else
+        sizeof_error(s, arg, null, 0)
+    return 0
+
 fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     record_assert_site(s, e)   # AGAST #1869: in a [[test]] fn only
     # Variant constructor: Some(x) / Ok(x) / None / Err(x) -> %Result$.../
@@ -2046,16 +2389,9 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             is_sizeof = 1
 
     if is_sizeof == 1
-        # sizeof(Type) -> compile-time constant
-        var type_size: i64 = 8  # Default to 8 (pointer size)
-        if e.args != null and e.args.kind == EXPR_IDENT
-            # AGAST #1814: primitives by name; anything else is a struct.
-            # The old ladder matched only u8..i64 by length, so bool/f32 were
-            # 8 and a 2- or 3-letter STRUCT name (`In`, `Vec`) was never
-            # measured at all.
-            type_size = prim_name_size(e.args.ident_ptr, e.args.ident_len)
-            if type_size == 0
-                type_size = get_struct_size_by_name(s, e.args.ident_ptr, e.args.ident_len)
+        # sizeof(T) / sizeof(expr) -> compile-time constant; the operand is
+        # not evaluated (AGAST #2124, see sizeof_call_value).
+        let type_size: i64 = sizeof_call_value(s, e)
         let result: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, result)

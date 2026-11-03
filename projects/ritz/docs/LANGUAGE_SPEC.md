@@ -1185,7 +1185,21 @@ let v = arr[0]          # Index access
 let a = sizeof(i32)         # Size of type in bytes
 let n = 0
 let b = sizeof(n)           # Size of expression's type
+let c = sizeof([8]u8)       # An array type: 8
+var key: [64]u8
+let d = sizeof(key)         # 64: the whole array, not a pointer
 ```
+
+`sizeof` is a compile-time constant of type `i64`. Its operand is either a type
+or an expression. For an expression, `sizeof` measures the expression's *type*
+and never evaluates it: `sizeof(f())` does not call `f`, and `sizeof(key)` does
+not move or use `key`. An identifier is taken as a value when one is in scope,
+and as a type name otherwise. A comparison or `and`/`or` has size 1; any other
+binary operation has the size of its left operand.
+
+A name that is neither a value nor a type, such as `sizeof(Nope)`, is a compile
+error. So is an expression whose type the compiler can't determine. Neither
+falls back to a guessed size.
 
 ---
 

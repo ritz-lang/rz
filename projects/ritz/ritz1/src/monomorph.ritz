@@ -1587,6 +1587,27 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
 
     return cloned
 
+# `sizeof(T)` with T := subst (AGAST #2124): one value of the concrete kind,
+# keeping `at`'s span and element count (1 for a bare `T`).
+fn sizeof_subst_operand(at: *Expr, subst_type: i32, subst_name: *u8, subst_len: i32) -> *Expr
+    let op: *Expr = malloc(sizeof(Expr)) as *Expr
+    memcpy(op as *u8, at as *u8, sizeof(Expr))
+    if at.kind != EXPR_TYPE_OPERAND
+        op.int_val = 1
+    op.kind = EXPR_TYPE_OPERAND
+    op.op = subst_type
+    op.ident_ptr = null
+    op.ident_len = 0
+    # An unparsed suffix (TYPE_VOID) keeps its spelling: the emitter sizes a
+    # TYPE_STRUCT leaf named `i32` as the primitive, and rejects a non-type.
+    if subst_type == TYPE_VOID
+        op.op = TYPE_STRUCT
+    if op.op == TYPE_STRUCT
+        op.ident_ptr = subst_name
+        op.ident_len = subst_len
+    op.next = null
+    return op
+
 fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Expr
     if e == null
         return null
@@ -1610,6 +1631,13 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
     else if k == EXPR_IDENT
         cloned.ident_ptr = e.ident_ptr
         cloned.ident_len = e.ident_len
+    else if k == EXPR_TYPE_OPERAND
+        # `sizeof([4]T)` (AGAST #2124): the leaf may be the type parameter.
+        if e.op == TYPE_STRUCT and e.ident_len == type_param_len and memcmp(e.ident_ptr, type_param, type_param_len as i64) == 0
+            let leaf: *Expr = sizeof_subst_operand(e, subst_type, subst_name, subst_len)
+            cloned.op = leaf.op
+            cloned.ident_ptr = leaf.ident_ptr
+            cloned.ident_len = leaf.ident_len
     else if k == EXPR_BINARY
         cloned.op = e.op
         cloned.left = clone_expr(e.left, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
@@ -1654,14 +1682,11 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
             # Check if the argument matches our type parameter
             if e.args.ident_len == type_param_len
                 if memcmp(e.args.ident_ptr, type_param, type_param_len as i64) == 0
-                    # Substitute with concrete type name
-                    let new_arg: *Expr = malloc(sizeof(Expr)) as *Expr
-                    new_arg.kind = EXPR_IDENT
-                    new_arg.span = e.args.span
-                    new_arg.ident_ptr = subst_name
-                    new_arg.ident_len = subst_len
-                    new_arg.next = null
-                    cloned.args = new_arg
+                    # Substitute the concrete type itself (AGAST #2124): a
+                    # TYPE_OPERAND, not an IDENT of subst_name, which for
+                    # a pointer or primitive T is no name the emitter knows
+                    # (and an unknown sizeof name is now an error).
+                    cloned.args = sizeof_subst_operand(e.args, subst_type, subst_name, subst_len)
                 else
                     cloned.args = clone_expr_list(e.args, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
             else

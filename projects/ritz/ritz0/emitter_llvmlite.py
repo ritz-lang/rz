@@ -781,6 +781,111 @@ class LLVMEmitter:
             # Default fallback
             return (8, 8)
 
+    # Primitive names `sizeof` accepts; their sizes come from
+    # _ritz_type_size_and_align (isize/usize hit its 8-byte fallback).
+    _SIZEOF_PRIMITIVES = frozenset((
+        'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'isize', 'usize',
+        'f32', 'f64', 'bool',
+        'v2i64', 'v4i32', 'v8i16', 'v16i8', 'v4i64', 'v8i32', 'v16i16', 'v32i8',
+    ))
+
+    def _sizeof_operand_size(self, call: rast.Call) -> int:
+        """Size in bytes of `sizeof`'s operand (LANGUAGE_SPEC §7.9).
+
+        The operand is a type (`sizeof(i32)`, `sizeof([8]u8)`) or an
+        expression, whose *type* is measured: it is never evaluated, so no
+        code is emitted for it. AGAST #2124: every non-type operand used to
+        come out as 8, and so did an unknown type name, so
+        `mem_zero(@key[0], sizeof(key))` wiped 8 bytes of a 64-byte key.
+        Anything we can't size is now a compile error.
+        """
+        if len(call.args) != 1:
+            raise EmitError("sizeof takes exactly one argument (a type or an expression)", call.span)
+        arg = call.args[0]
+        ty = self._sizeof_operand_type(arg)
+        if ty is not None:
+            size = self._sizeof_ritz_type(ty)
+            if size is not None:
+                return size
+        if isinstance(arg, rast.Ident) and not self._sizeof_is_value(arg.name):
+            raise EmitError(f"sizeof: unknown type or value `{arg.name}`", arg.span)
+        # A value whose Ritz type isn't tracked: its storage type is exact,
+        # unless it holds a struct (_type_size_bytes ignores padding).
+        if isinstance(arg, rast.Ident):
+            llvm_ty = self._sizeof_value_llvm_type(arg.name)
+            elem = llvm_ty
+            while isinstance(elem, ir.ArrayType):
+                elem = elem.element
+            if llvm_ty is not None and not isinstance(elem, ir.BaseStructType):
+                return self._type_size_bytes(llvm_ty)
+        raise EmitError("sizeof: cannot determine the type of this expression", arg.span)
+
+    def _sizeof_is_value(self, name: str) -> bool:
+        return (name in self.locals or name in self.params or name in self.globals
+                or name in self.const_arrays or name in self.constants)
+
+    def _sizeof_value_llvm_type(self, name: str) -> Optional[ir.Type]:
+        for table in (self.locals, self.params, self.globals, self.const_arrays):
+            if name in table:
+                return table[name][1]
+        if name in self.constants:
+            return self.constants[name][1]
+        return None
+
+    def _sizeof_operand_type(self, arg: rast.Expr) -> Optional[rast.Type]:
+        """The Ritz type `sizeof` measures, or None if it can't be found."""
+        if isinstance(arg, rast.TypeExpr):
+            return arg.ty
+        if isinstance(arg, rast.Grouped):
+            return self._sizeof_operand_type(arg.expr)
+        if isinstance(arg, rast.Ident):
+            # A value in scope wins over a type of the same name.
+            if self._sizeof_is_value(arg.name):
+                return self.ritz_types.get(arg.name)
+            return rast.NamedType(arg.span, arg.name, [])
+        # `sizeof(*u8)` / `sizeof(@Pair)` parse as a deref / borrow of a
+        # type name: when the operand is not a value, it's a pointer type.
+        if (isinstance(arg, rast.UnaryOp) and arg.op in ('*', '&', '@', '&mut', '@&')
+                and self._sizeof_names_type(arg.operand)):
+            return rast.PtrType(arg.span, rast.NamedType(arg.span, 'u8', []), mutable=False)
+        # A comparison or `and`/`or` is a bool; _infer_ritz_type gives every
+        # BinOp its left operand's type (ritz1's sizeof agrees).
+        if isinstance(arg, rast.BinOp) and arg.op in (
+                '==', '!=', '<', '<=', '>', '>=', 'and', 'or', '&&', '||'):
+            return rast.NamedType(arg.span, 'bool', [])
+        return self._infer_ritz_type(arg)
+
+    def _sizeof_names_type(self, expr: rast.Expr) -> bool:
+        """True if `expr` spells a type rather than a value (`u8`, `*Pair`)."""
+        if isinstance(expr, rast.TypeExpr):
+            return True
+        if isinstance(expr, rast.Ident):
+            return (not self._sizeof_is_value(expr.name)
+                    and self._sizeof_ritz_type(rast.NamedType(expr.span, expr.name, [])) is not None)
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('*', '&', '@', '&mut', '@&'):
+            return self._sizeof_names_type(expr.operand)
+        return False
+
+    def _sizeof_ritz_type(self, ty: rast.Type) -> Optional[int]:
+        """Size of `ty`, or None if it names a type that doesn't exist."""
+        ty = resolve_alias_in(ty, self.type_aliases)
+        if isinstance(ty, rast.NamedType):
+            if ty.name in self.union_types and not ty.args:
+                return self._type_size_bytes(self.union_types[ty.name][0])
+            known = (ty.name in self._SIZEOF_PRIMITIVES
+                     or ty.args
+                     or self._struct_layout_on_demand(ty.name) is not None
+                     or self._enum_size_and_align(ty.name) is not None)
+            if not known:
+                return None
+        elif isinstance(ty, rast.ArrayType):
+            if self._sizeof_ritz_type(ty.inner) is None:
+                return None
+        elif isinstance(ty, rast.TupleType):
+            if any(self._sizeof_ritz_type(e) is None for e in ty.elements):
+                return None
+        return self._ritz_type_size_and_align(ty)[0]
+
     def _ritz_type_to_llvm(self, ty: rast.Type) -> ir.Type:
         """Convert a Ritz type to an LLVM type."""
         if isinstance(ty, rast.NamedType):
@@ -1266,8 +1371,13 @@ class LLVMEmitter:
             return self._infer_ritz_type(expr.left)
         elif isinstance(expr, rast.UnaryOp):
             inner_type = self._infer_ritz_type(expr.operand)
-            if expr.op == '&' and inner_type:
+            # `@x` is the RERITZ spelling of `&x` (and `@&x` of `&mut x`):
+            # without them `let p = @pair` recorded p as a Pair, so
+            # `sizeof(p)` was sizeof(Pair) (AGAST #2124).
+            if expr.op in ('&', '@') and inner_type:
                 return rast.PtrType(expr.span, inner_type, mutable=False)
+            elif expr.op in ('&mut', '@&') and inner_type:
+                return rast.PtrType(expr.span, inner_type, mutable=True)
             elif expr.op == '*' and inner_type:
                 if isinstance(inner_type, rast.PtrType):
                     return inner_type.inner
@@ -9475,54 +9585,9 @@ class LLVMEmitter:
         if simd_result is not None:
             return simd_result
 
-        # Handle sizeof builtin - sizeof(Type) -> compile-time size in bytes
-        # Usage: sizeof(MyStruct), sizeof(i64), sizeof(*u8)
+        # sizeof(T) / sizeof(expr) -> compile-time size in bytes (spec §7.9).
         if fname == 'sizeof':
-            if len(call.args) != 1:
-                raise ValueError("sizeof() requires exactly 1 type argument")
-
-            # The argument should be a type expression, parsed as an identifier
-            # For sizeof(i32), call.args[0] is Ident("i32")
-            # For sizeof(MyStruct), call.args[0] is Ident("MyStruct")
-            arg = call.args[0]
-
-            # Try to interpret the argument as a type
-            if isinstance(arg, rast.Ident):
-                type_name = arg.name
-                # Check primitives
-                primitives = {
-                    'i8': 1, 'u8': 1,
-                    'i16': 2, 'u16': 2,
-                    'i32': 4, 'u32': 4,
-                    'i64': 8, 'u64': 8,
-                    'f32': 4, 'f64': 8,
-                    'bool': 1,
-                }
-                if type_name in primitives:
-                    return ir.Constant(self.i64, primitives[type_name])
-
-                # Check struct types via registry
-                layout = self.struct_registry.get_layout(type_name)
-                if layout:
-                    return ir.Constant(self.i64, layout.size)
-
-                # Enum types: the size of the body they are emitted with
-                # (AGAST #1923).
-                enum_sa = self._enum_size_and_align(type_name)
-                if enum_sa:
-                    return ir.Constant(self.i64, enum_sa[0])
-
-                # Fallback: unknown type, return 8 (pointer size)
-                return ir.Constant(self.i64, 8)
-
-            # For more complex type expressions, use the type resolver
-            elif hasattr(arg, 'span'):
-                # Try to create a NamedType from the identifier
-                ritz_ty = rast.NamedType(span=arg.span, name=str(arg))
-                size, _ = self._ritz_type_size_and_align(ritz_ty)
-                return ir.Constant(self.i64, size)
-
-            raise ValueError(f"sizeof() argument must be a type name, got: {type(arg)}")
+            return ir.Constant(self.i64, self._sizeof_operand_size(call))
 
         # Volatile / atomic memory builtins (AGAST #1879). Reserved names, like
         # sizeof: checked before user functions.

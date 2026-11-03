@@ -500,6 +500,18 @@ class Cast(Expr):
 
 
 @dataclass
+class TypeExpr(Expr):
+    """A type in expression position: the operand of `sizeof([8]u8)`.
+
+    Only `sizeof` produces one (AGAST #2124). A type that also reads as an
+    expression (`i32`, `Pair`, `*u8`) stays an Ident / UnaryOp and is resolved
+    as a type by the emitter; this node carries the forms that don't
+    (`[N]T`), and monomorph's substitution of `sizeof(T)`.
+    """
+    ty: Type
+
+
+@dataclass
 class Await(Expr):
     """Await expression: await expr."""
     expr: Expr

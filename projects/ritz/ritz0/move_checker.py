@@ -467,6 +467,12 @@ class MoveChecker:
             else:
                 self._check_expr(expr.operand, is_move_context=False)
 
+        elif (isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident)
+                and expr.func.name == 'sizeof'):
+            # sizeof's operand is never evaluated: it neither moves nor
+            # uses its operand (AGAST #2124; `sizeof(key)` used to move key).
+            pass
+
         elif isinstance(expr, rast.Call):
             # Function arguments are moved (unless Copy)
             # Borrows created for arguments are released after the call completes

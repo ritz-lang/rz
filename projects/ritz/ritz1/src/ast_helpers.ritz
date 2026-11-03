@@ -2004,6 +2004,36 @@ pub fn alias_type_latch(p: *Parser, kind: i32) -> i32
     g_alias_fn_sig = fresh_fn_sig(p)
     kind
 
+# `sizeof(Alias)` (AGAST #2124): the alias's target as `count` values of leaf
+# kind `*leaf` (struct `*leaf_name` for TYPE_STRUCT).  0 when `name` is no
+# alias.  The emitter sizes the leaf; an alias of a pointer is one pointer.
+pub fn type_alias_sizeof_shape(name: *u8, len: i32, count: *i64, leaf: *i32, leaf_name: **u8, leaf_len: *i32) -> i32
+    let e: *AliasEntry = type_alias_find(name, len)
+    if e == null
+        return 0
+    *count = 1
+    *leaf = e.kind
+    *leaf_name = e.type_name
+    *leaf_len = e.type_name_len
+    if e.kind == TYPE_ARRAY
+        let sh: *ArrayShape = e.array_shape
+        if sh != null
+            var n: i64 = 1
+            var d: i32 = 0
+            while d < sh.rank
+                n = n * (sh.dims[d] as i64)
+                d = d + 1
+            *count = n
+            *leaf = sh.leaf_type
+            *leaf_name = sh.leaf_name
+            *leaf_len = sh.leaf_name_len
+        else
+            *count = e.array_size as i64
+            *leaf = e.array_elem_type
+            *leaf_name = e.array_elem_type_name
+            *leaf_len = e.array_elem_type_name_len
+    return 1
+
 # Called from type_named.  Returns the alias's kind with its parse state
 # replayed into p, or TYPE_VOID when `name` is not an alias (no alias can
 # have kind TYPE_VOID: type_spec never yields it).
@@ -3021,6 +3051,50 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
     e.ident_len = 0
     e.next = null
     return e
+
+# EXPR_TYPE_OPERAND (AGAST #2124): `count` values of leaf kind `t` (struct
+# `name` when t == TYPE_STRUCT).
+pub fn expr_type_operand(p: *Parser, count: i64, t: i32, name: *u8, name_len: i32, line: i32, col: i32) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = EXPR_TYPE_OPERAND
+    e.span.line = line
+    e.span.col = col
+    e.int_val = count
+    e.op = t
+    e.ident_ptr = null
+    e.ident_len = 0
+    if t == TYPE_STRUCT
+        e.ident_ptr = name
+        e.ident_len = name_len
+    e.next = null
+    return e
+
+# `sizeof([N]..T)` (AGAST #2124): an array type is no expression, so the
+# grammar reads `IDENT ( [N] type_spec )` here.  Any callee but `sizeof`
+# rejects (p.error) — `f([8]u8)` is not a program.  type_array runs for the
+# outer dimension, so p.last_array_* / last_array_shape describe the whole
+# type, exactly as for a declaration.
+pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, num_tok: Token, elem_type: i32) -> *Expr
+    if name_tok.len != 6 or memcmp(name_tok.start, c"sizeof", 6) != 0
+        p.error = 1
+        return null
+    type_array(p, num_tok.start, num_tok.len, elem_type)
+    var count: i64 = p.last_array_size as i64
+    var leaf: i32 = p.last_array_elem_type
+    var leaf_name: *u8 = p.last_array_elem_type_name
+    var leaf_len: i32 = p.last_array_elem_type_name_len
+    let sh: *ArrayShape = p.last_array_shape
+    if sh != null
+        count = 1
+        var d: i32 = 0
+        while d < sh.rank
+            count = count * (sh.dims[d] as i64)
+            d = d + 1
+        leaf = sh.leaf_type
+        leaf_name = sh.leaf_name
+        leaf_len = sh.leaf_name_len
+    let arg: *Expr = expr_type_operand(p, count, leaf, leaf_name, leaf_len, num_tok.line, num_tok.col)
+    return expr_call(p, name_tok.start, name_tok.len, arg, name_tok.line, name_tok.col)
 
 pub fn expr_call(p: *Parser, name: *u8, len: i32, args: *Expr, line: i32, col: i32) -> *Expr
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr

@@ -1252,10 +1252,12 @@ class Monomorphizer:
                     type_param_name = expr.args[0].name
                     if type_param_name in subst.mapping:
                         # Substitute the type parameter with the concrete type name
-                        concrete_type = subst.mapping[type_param_name]
-                        # Convert the concrete type to its mangled name for sizeof
-                        concrete_name = mangle_type_name(concrete_type)
-                        new_args = [rast.Ident(expr.args[0].span, concrete_name)]
+                        # The concrete type itself, not its mangled name: a
+                        # name like `ptr_u8` is no type the emitter knows,
+                        # and an unknown sizeof name is an error (#2124).
+                        concrete_type = subst.apply(
+                            rast.NamedType(expr.args[0].span, type_param_name, []))
+                        new_args = [rast.TypeExpr(expr.args[0].span, concrete_type)]
 
             # If this is a generic call, rewrite to use mangled name
             if expr.type_args and isinstance(expr.func, rast.Ident):
