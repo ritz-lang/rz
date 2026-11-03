@@ -6,8 +6,8 @@
 # Operations:
 # - getrandom(buf, len, flags) - Raw syscall wrapper
 # - random_bytes(buf, len) - Fill buffer with random bytes (blocking)
-# - random_u64() - Get random 64-bit value
-# - random_u32() - Get random 32-bit value
+# - random_u64() / random_u32() - Random value; abort on RNG failure
+# - random_u64_checked / random_u32_checked - Random value; -1 on RNG failure
 
 import ritzlib.sys
 
@@ -31,10 +31,34 @@ pub fn getrandom(buf: *u8, len: u64, flags: i32) -> i64
 # High-level random functions
 # ============================================================================
 
+# Test hooks (AGAST #1863): make random_bytes fail as getrandom would on a
+# broken system, so callers' failure paths can be tested. They can only make
+# the RNG fail, never weaken its output.
+var g_random_force_failure: i32
+# 0 = off; k > 0 = k - 1 more calls succeed, the next one fails (one-shot).
+var g_random_fail_countdown: i32
+
+# on != 0: every random_bytes call fails. on == 0: both hooks off.
+pub fn random_test_force_failure(on: i32)
+    g_random_force_failure = on
+    g_random_fail_countdown = 0
+
+# Let the next n random_bytes calls succeed and fail only the one after, so
+# a caller's check on each individual call can be exercised.
+pub fn random_test_fail_after(n: i32)
+    g_random_fail_countdown = n + 1
+
 # Fill buffer with cryptographically secure random bytes
 # This function blocks until the CSPRNG is seeded (only on first boot)
-# Returns 0 on success, -1 on error
+# Returns 0 on success, -1 on error. Callers MUST check the result: a buffer
+# the RNG failed to fill is not random (AGAST #1863).
 pub fn random_bytes(buf: *u8, len: u64) -> i32
+    if g_random_force_failure != 0
+        return -1
+    if g_random_fail_countdown > 0
+        g_random_fail_countdown -= 1
+        if g_random_fail_countdown == 0
+            return -1
     if len == 0
         return 0
 
@@ -45,21 +69,30 @@ pub fn random_bytes(buf: *u8, len: u64) -> i32
     # so we loop until we get all requested bytes
     while remaining > 0
         let result: i64 = getrandom(ptr, remaining, 0)
-        if result < 0
-            return -1  # Error
+        if result == -4
+            continue  # EINTR: interrupted by a signal before any bytes; retry
+        if result <= 0
+            return -1  # Error (0 would loop forever)
         let got: u64 = result as u64
         remaining = remaining - got
         ptr = (ptr as u64 + got) as *u8
 
     return 0
 
-# Get a single random u64
-pub fn random_u64() -> u64
+# The RNG failed and the caller has no way to report it: stop rather than
+# hand back a predictable value. (Use the *_checked variants to handle it.)
+fn random_fail_closed()
+    let msg: *u8 = c"cryptosec: getrandom failed; aborting\n"
+    sys_write(2, msg, 38)
+    sys_exit(134)
+
+# Get a random u64 into *out. Returns 0 on success, -1 on RNG failure
+# (*out is then 0).
+pub fn random_u64_checked(out: *u64) -> i32
+    *out = 0
     var buf: [8]u8
-    let result: i32 = random_bytes(@buf[0], 8)
-    if result < 0
-        # Fallback: return 0 on error (should never happen on healthy system)
-        return 0
+    if random_bytes(@buf[0], 8) != 0
+        return -1
 
     # Assemble from bytes (little-endian)
     let b0: u64 = buf[0] as u64
@@ -73,14 +106,16 @@ pub fn random_u64() -> u64
 
     let lo: u64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
     let hi: u64 = (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
-    return lo | hi
+    *out = lo | hi
+    return 0
 
-# Get a single random u32
-pub fn random_u32() -> u32
+# Get a random u32 into *out. Returns 0 on success, -1 on RNG failure
+# (*out is then 0).
+pub fn random_u32_checked(out: *u32) -> i32
+    *out = 0
     var buf: [4]u8
-    let result: i32 = random_bytes(@buf[0], 4)
-    if result < 0
-        return 0
+    if random_bytes(@buf[0], 4) != 0
+        return -1
 
     # Assemble from bytes (little-endian)
     let b0: u32 = buf[0] as u32
@@ -88,7 +123,23 @@ pub fn random_u32() -> u32
     let b2: u32 = buf[2] as u32
     let b3: u32 = buf[3] as u32
 
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    *out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    return 0
+
+# Get a single random u64. Aborts the process if the RNG fails: it used to
+# return 0, a value callers could not tell from a random one (AGAST #1863).
+pub fn random_u64() -> u64
+    var v: u64 = 0
+    if random_u64_checked(@v) != 0
+        random_fail_closed()
+    return v
+
+# Get a single random u32. Aborts the process if the RNG fails.
+pub fn random_u32() -> u32
+    var v: u32 = 0
+    if random_u32_checked(@v) != 0
+        random_fail_closed()
+    return v
 
 # Get a random value in range [0, max) - not constant-time!
 # For cryptographic use, use rejection sampling with ct_select

@@ -5,6 +5,8 @@ import ritzlib.io
 import ritzunit.assertions
 import ritzunit.types
 
+import cryptosec.mem
+import cryptosec.random
 import lib.tls
 
 # ============================================================================
@@ -330,4 +332,99 @@ fn test_tls_server_accepts_exact_handshake_length() -> i32
         return 1
     if err != TLS_ERR_NO_CERTIFICATE
         return 2
+    return 0
+
+# ============================================================================
+# Secrets and randomness (AGAST #1863)
+# ============================================================================
+
+fn fill_aa(p: *u8, n: i64)
+    for i in 0..n
+        *(p + i) = 0xAA
+
+[[test]]
+fn test_tls_server_init_fails_on_rng_failure() -> i32
+    # No ephemeral key share may be derived from an unset private key.
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+    var server: TlsServer
+    fill_aa(@server.x25519_private[0], 32)
+    random_test_force_failure(1)
+    let result: i32 = tls_server_init(@server, @cfg)
+    random_test_force_failure(0)
+    if result != -1
+        return 1
+    if mem_is_zero(@server.x25519_private[0], 32) != 1
+        return 2
+    if tls_server_init(@server, @cfg) != 0
+        return 3
+    tls_server_free(@server)
+    return 0
+
+[[test]]
+fn test_serialize_server_hello_fails_on_rng_failure() -> i32
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+    var server: TlsServer
+    if tls_server_init(@server, @cfg) != 0
+        return 1
+    var out: [256]u8
+    random_test_force_failure(1)
+    let n: i64 = serialize_server_hello(@server, @out[0], 256)
+    random_test_force_failure(0)
+    tls_server_free(@server)
+    if n != -1
+        return 2
+    return 0
+
+[[test]]
+fn test_tls_server_free_zeroes_whole_key_schedule() -> i32
+    # Was a hand-counted 296 bytes of the key schedule. sizeof(T) falls back
+    # to 8 for a name it cannot resolve, so pin it above the old count.
+    if sizeof(TLS13KeySchedule) <= 296
+        return 9
+    var cfg: TlsServerConfig
+    tls_server_config_init(@cfg)
+    var server: TlsServer
+    if tls_server_init(@server, @cfg) != 0
+        return 1
+    fill_aa(@server.key_schedule as *u8, sizeof(TLS13KeySchedule))
+    fill_aa(@server.shared_secret[0], 32)
+    fill_aa(@server.x25519_private[0], 32)
+    tls_server_free(@server)
+    if mem_is_zero(@server.key_schedule as *u8, sizeof(TLS13KeySchedule)) != 1
+        return 2
+    if mem_is_zero(@server.shared_secret[0], 32) != 1
+        return 3
+    if mem_is_zero(@server.x25519_private[0], 32) != 1
+        return 4
+    return 0
+
+[[test]]
+fn test_parse_client_hello_zeroes_whole_struct() -> i32
+    # Was a hand-counted 400 bytes of the parsed ClientHello.
+    if sizeof(ParsedClientHello) <= 400
+        return 9
+    var ch: ParsedClientHello
+    fill_aa(@ch as *u8, sizeof(ParsedClientHello))
+    var data: [4]u8
+    if parse_client_hello(@data[0], 0, @ch) != -1
+        return 1
+    if mem_is_zero(@ch as *u8, sizeof(ParsedClientHello)) != 1
+        return 2
+    return 0
+
+[[test]]
+fn test_tls_server_config_init_zeroes_whole_struct() -> i32
+    # Was a hand-counted 200 bytes; key material lives in the config.
+    if sizeof(TlsServerConfig) <= 200
+        return 9
+    var cfg: TlsServerConfig
+    fill_aa(@cfg as *u8, sizeof(TlsServerConfig))
+    tls_server_config_init(@cfg)
+    # Everything but the cipher-suite fields the init sets must be zero.
+    cfg.cipher_suites[0] = 0
+    cfg.num_cipher_suites = 0
+    if mem_is_zero(@cfg as *u8, sizeof(TlsServerConfig)) != 1
+        return 1
     return 0

@@ -58,6 +58,7 @@ pub const TLS_SERVER_STATE_ERROR: i32 = -1
 pub const TLS_ERR_NO_COMMON_CIPHER: i32 = -11
 pub const TLS_ERR_NO_CERTIFICATE: i32 = -12
 pub const TLS_ERR_NO_PRIVATE_KEY: i32 = -13
+pub const TLS_ERR_RNG_FAILED: i32 = -14
 
 # Key types
 pub const TLS_KEY_TYPE_ED25519: i32 = 0
@@ -93,7 +94,7 @@ pub struct TlsServerConfig
 
 # Initialize config with defaults
 pub fn tls_server_config_init(cfg: *TlsServerConfig)
-    mem_zero(cfg as *u8, 200 )
+    mem_zero(cfg as *u8, sizeof(TlsServerConfig))
 
     # Only AES-128-GCM: cryptosec's record layer implements no other suite,
     # so offering ChaCha20-Poly1305 would select it and then run AES keys.
@@ -337,7 +338,9 @@ pub struct TlsServer
 
 # Initialize TLS server connection
 # Note: TlsServer is approximately 36KB (9.5KB + 25KB work buffers + 370 bytes SHA ctx)
-pub fn tls_server_init(server: *TlsServer, config: *TlsServerConfig)
+# Returns 0 on success, -1 if the RNG failed: the connection must be dropped,
+# and no partial key is left in *server (AGAST #1863).
+pub fn tls_server_init(server: *TlsServer, config: *TlsServerConfig) -> i32
     # Initialize individual fields instead of mem_zero on full struct
     # This avoids potential issues with struct size calculation
     server.state = TLS_SERVER_STATE_INIT
@@ -349,7 +352,10 @@ pub fn tls_server_init(server: *TlsServer, config: *TlsServerConfig)
     server.handshake_complete = 0
 
     # Generate server's ephemeral X25519 key pair
-    random_bytes(@server.x25519_private[0], 32)
+    if random_bytes(@server.x25519_private[0], 32) != 0
+        mem_zero(@server.x25519_private[0], 32)
+        server.last_error = TLS_ERR_RNG_FAILED
+        return -1
     x25519_clamp(@server.x25519_private[0])
     x25519_pubkey(@server.x25519_public[0], @server.x25519_private[0])
 
@@ -358,12 +364,13 @@ pub fn tls_server_init(server: *TlsServer, config: *TlsServerConfig)
 
     # Initialize key schedule
     tls13_key_schedule_init(@server.key_schedule)
+    return 0
 
 # Free server resources (zero sensitive data)
 pub fn tls_server_free(server: *TlsServer)
     mem_zero(@server.x25519_private[0], 32)
     mem_zero(@server.shared_secret[0], 32)
-    mem_zero(@server.key_schedule as *u8, 296 )
+    mem_zero(@server.key_schedule as *u8, sizeof(TLS13KeySchedule))
 
 # ============================================================================
 # ClientHello Parsing
@@ -372,7 +379,7 @@ pub fn tls_server_free(server: *TlsServer)
 # Parse ClientHello message
 # data points to handshake message body (after 4-byte header)
 pub fn parse_client_hello(data: *u8, len: i64, ch: *ParsedClientHello) -> i32
-    mem_zero(ch as *u8, 400 )
+    mem_zero(ch as *u8, sizeof(ParsedClientHello))
 
     if len < 38  # Minimum: version(2) + random(32) + session_id_len(1) + ...
         return -1
@@ -551,7 +558,8 @@ pub fn serialize_server_hello(server: *TlsServer, out: *u8, cap: i64) -> i64
 
     # Random (32 bytes)
     var server_random: [32]u8
-    random_bytes(@server_random[0], 32)
+    if random_bytes(@server_random[0], 32) != 0
+        return -1
     mem_copy(out + pos, @server_random[0], 32)
     pos = pos + 32
 

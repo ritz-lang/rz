@@ -162,3 +162,88 @@ fn test_auth_sets_flag() -> i32
 
     return 0
 
+
+
+# ============================================================================
+# AUTH compares the whole argument (AGAST #1863)
+# ============================================================================
+# AUTH used to copy the argument into a 256-byte NUL-terminated buffer and
+# strcmp it: an embedded NUL or a suffix past byte 255 was ignored. It now
+# compares (data, len) against the password in constant time.
+
+fn auth_with(password: *u8, request: *u8, request_len: i64) -> i32
+    var store: Store = store_new()
+    var buf: [8192]u8
+    var ctx: CommandContext
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, password, 0)
+    var parser: RespParser
+    resp_parser_init(@parser, request, request_len)
+    if resp_parse(@parser) != RESP_OK
+        return -1
+    cmd_dispatch(@ctx, @parser.command)
+    return ctx.is_authenticated
+
+[[test]]
+fn test_auth_rejects_embedded_nul_suffix() -> i32
+    # "secret123\0x" must not authenticate as "secret123".
+    if auth_with(c"secret123", c"*2\r\n$4\r\nAUTH\r\n$11\r\nsecret123\0x\r\n", 32) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_auth_rejects_wrong_password() -> i32
+    if auth_with(c"secret123", c"*2\r\n$4\r\nAUTH\r\n$9\r\nsecret124\r\n", 29) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_auth_rejects_prefix() -> i32
+    if auth_with(c"secret123", c"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n", 26) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_auth_rejects_suffix_past_copy_buffer() -> i32
+    # A 255-byte password followed by extra bytes: the old 256-byte copy
+    # truncated the argument back to the password and accepted it.
+    var pw: [256]u8
+    for i in 0..255
+        pw[i] = 0x61  # 'a'
+    pw[255] = 0
+    var req: [300]u8
+    var p: i64 = 0
+    let head: *u8 = c"*2\r\n$4\r\nAUTH\r\n$258\r\n"
+    for i in 0..20
+        req[p] = *(head + i)
+        p += 1
+    for i in 0..258
+        req[p] = 0x61
+        p += 1
+    req[p] = 13
+    req[p + 1] = 10
+    p += 2
+    if auth_with(@pw[0], @req[0], p) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_auth_accepts_long_exact_password() -> i32
+    var pw: [256]u8
+    for i in 0..255
+        pw[i] = 0x61
+    pw[255] = 0
+    var req: [300]u8
+    var p: i64 = 0
+    let head: *u8 = c"*2\r\n$4\r\nAUTH\r\n$255\r\n"
+    for i in 0..20
+        req[p] = *(head + i)
+        p += 1
+    for i in 0..255
+        req[p] = 0x61
+        p += 1
+    req[p] = 13
+    req[p + 1] = 10
+    p += 2
+    if auth_with(@pw[0], @req[0], p) != 1
+        return 1
+    return 0

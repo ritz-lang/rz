@@ -51,6 +51,7 @@ Ritzlib is built on three core principles:
 4. [String Utilities](#string-utilities)
    - [str](#str) - C-style string operations
    - [fmt](#fmt) - Integer-to-text digit routines
+   - [ct](#ct) - Constant-time comparison of secrets
    - [buf](#buf) - Buffer and parsing utilities
 5. [System Interface](#system-interface)
    - [sys](#sys) - Raw syscall wrappers
@@ -704,6 +705,30 @@ import ritzlib.fmt
 fn fmt_example() -> i64
     var buf: [20]u8
     fmt_i64_into(@buf[0], -9223372036854775807 - 1)  # "-9223372036854775808", returns 20
+```
+
+---
+
+### ct
+
+**Module**: `ritzlib.ct`
+
+Constant-time comparison for secrets such as passwords and tokens (AGAST #1863).
+`strcmp`/`memcmp` stop at the first differing byte, so their timing reveals
+how much of a guess was right. `ct_bytes_eq` examines every byte of `a`, never
+branches on the contents, and reports a length mismatch without an early exit.
+Pass the untrusted input as `a` and the secret as `b`: the running time depends
+only on `a_len`. tome's `AUTH` uses it.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ct_bytes_eq` | `fn(a: *u8, a_len: i64, b: *u8, b_len: i64) -> bool` | Equal length and contents, in constant time |
+
+```ritz
+import ritzlib.ct
+
+fn password_ok(given: *u8, given_len: i64) -> bool
+    ct_bytes_eq(given, given_len, c"hunter2", 7)
 ```
 
 ---
