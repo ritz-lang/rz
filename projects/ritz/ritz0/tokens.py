@@ -6,7 +6,7 @@ Token types for the ritz0 lexer.
 
 from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 
 class TokenType(Enum):
@@ -14,7 +14,6 @@ class TokenType(Enum):
     INT = auto()
     FLOAT = auto()
     STRING = auto()
-    INTERP_STRING = auto()  # Interpolated string: "Hello, {name}!"
     CSTRING = auto()        # C-string literal: c"hello" -> *u8 (null-terminated)
     # Note: SPAN_STRING (s"...") was removed in AGAST #98 — bare "..." now
     # produces StrView which is layout-compatible.
@@ -207,6 +206,11 @@ class Token:
     # `value` with `{{` / `}}` collapsed to one brace (AGAST #1913). None
     # for every other token.
     print_value: Optional[str] = None
+    # A "..." literal holding matched `{expr}` placeholders: its print-time
+    # split, (parts, expression source strings), with len(parts) ==
+    # len(exprs) + 1 and `{{` / `}}` collapsed in the parts. Only print /
+    # eprint use it (AGAST #2102); `value` is the plain literal. None otherwise.
+    interp: Optional[Tuple[List[str], List[str]]] = None
 
     def __repr__(self) -> str:
         if self.value is not None:

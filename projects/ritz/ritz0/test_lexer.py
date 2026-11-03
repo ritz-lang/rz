@@ -612,9 +612,14 @@ class TestStringBraceLiterals:
         ]
 
     def test_valid_interpolation_still_works(self):
-        """Strings with matched {expr} should still produce INTERP_STRING."""
-        result = token_values('"hello {name}!"')
-        assert result[0] == (TokenType.INTERP_STRING, (["hello ", "!"], ["name"]))
+        """A matched {expr} is a plain STRING carrying its print-time split.
+
+        AGAST #2102: the literal keeps its braces; only print / eprint use
+        `interp`.
+        """
+        tok = tokenize('"hello {name}!"')[0]
+        assert (tok.type, tok.value) == (TokenType.STRING, "hello {name}!")
+        assert tok.interp == (["hello ", "!"], ["name"])
 
     def test_escaped_brace_still_works(self):
         r"""Escaped \{ should still produce literal brace."""
@@ -653,9 +658,20 @@ class TestStringBraceLiterals:
         assert (tok.value, tok.print_value) == ("a } b { c\n", "a } b { c\n")
 
     def test_interp_parts_still_collapse(self):
-        """Interpolated strings exist only for print, so parts collapse."""
-        result = token_values('"{{{x}}}"')
-        assert result[0] == (TokenType.INTERP_STRING, (["{", "}"], ["x"]))
+        """`interp` parts are only printed, so they collapse; `value` keeps all."""
+        tok = tokenize('"{{{x}}}"')[0]
+        assert (tok.type, tok.value) == (TokenType.STRING, "{{{x}}}")
+        assert tok.interp == (["{", "}"], ["x"])
+
+    def test_interp_value_cooks_escapes_inside_placeholder(self):
+        """AGAST #2102: the plain value cooks escapes, placeholder text included."""
+        tok = tokenize(r'"\{a}\t{b\n}"')[0]
+        assert tok.value == "{a}\t{b\n}"
+        assert tok.interp == (["{a}\t", ""], ["b\\n"])
+
+    def test_plain_string_has_no_interp(self):
+        tok = tokenize('"a } b { c"')[0]
+        assert tok.interp is None
 
 
 if __name__ == "__main__":

@@ -323,6 +323,25 @@ class Parser:
             self._reset(mark)
             return []
 
+    def _interpolate_print_arg(self, callee: rast.Expr,
+                               args: List[rast.Expr]) -> List[rast.Expr]:
+        """Split `{expr}` placeholders in print / eprint's literal argument.
+
+        AGAST #2102: interpolation belongs to the print / eprint builtins, as
+        in ritz1 (interp.ritz). A "..." anywhere else -- a `let`, a call to
+        any other function, a return, a field init, a bare statement -- keeps
+        its braces as plain bytes, so only here does a StringLit carrying an
+        `interp` split become an InterpString with parsed expressions.
+        """
+        if (isinstance(callee, rast.Ident) and callee.name in ('print', 'eprint')
+                and len(args) == 1 and isinstance(args[0], rast.StringLit)
+                and args[0].interp is not None):
+            lit = args[0]
+            parts, expr_strs = lit.interp
+            exprs = [self._parse_interp_expr(e, lit.span) for e in expr_strs]
+            return [rast.InterpString(lit.span, parts, exprs)]
+        return args
+
     def _parse_interp_expr(self, expr_str: str, parent_span: Span) -> rast.Expr:
         """Parse an expression string from inside an interpolated string.
 
@@ -832,6 +851,7 @@ class Parser:
                         while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
                             self._advance()
                 self._expect(TokenType.RPAREN)
+                args = self._interpolate_print_arg(expr, args)
                 expr = rast.Call(expr.span, expr, args, type_args=type_args)
 
             elif self._at(TokenType.LBRACKET):
@@ -956,7 +976,7 @@ class Parser:
         # String literal
         if self._at(TokenType.STRING):
             self._advance()
-            return rast.StringLit(span, tok.value, tok.print_value)
+            return rast.StringLit(span, tok.value, tok.print_value, tok.interp)
 
         # C-string literal: c"..."
         if self._at(TokenType.CSTRING):
@@ -965,17 +985,6 @@ class Parser:
 
         # Note: s"..." (SPAN_STRING) was removed in AGAST #98 — bare "..."
         # now produces StrView which is layout-compatible.
-
-        # Interpolated string literal
-        if self._at(TokenType.INTERP_STRING):
-            self._advance()
-            parts, expr_strs = tok.value
-            # Parse each expression string
-            exprs = []
-            for expr_str in expr_strs:
-                expr = self._parse_interp_expr(expr_str, span)
-                exprs.append(expr)
-            return rast.InterpString(span, parts, exprs)
 
         # Character literal (u8)
         if self._at(TokenType.CHAR):

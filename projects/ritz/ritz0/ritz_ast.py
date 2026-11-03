@@ -14,7 +14,7 @@ RERITZ Extensions:
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional, Any, Union
+from typing import List, Optional, Any, Tuple, Union
 from tokens import Span
 
 
@@ -241,9 +241,15 @@ class StringLit(Expr):
     `print_value` is what `print` / `eprint` write, with each pair collapsed
     to one brace; that escape belongs to print interpolation, not to the
     literal (AGAST #1913, LANGUAGE_SPEC section 2). None means "same as value".
+
+    `interp` is set when the literal holds matched `{expr}` placeholders: the
+    raw (parts, expression strings) split. The literal itself is still plain
+    bytes; the parser turns it into an InterpString only as the argument of
+    print / eprint (AGAST #2102, ritz1's rule).
     """
     value: str
     print_value: Optional[str] = None
+    interp: Optional[Tuple[List[str], List[str]]] = None
 
 
 @dataclass
@@ -263,6 +269,10 @@ class CStringLit(Expr):
 @dataclass
 class InterpString(Expr):
     """Interpolated string: "Hello, {name}!"
+
+    Only ever the single argument of a print / eprint call: interpolation is
+    those builtins' rule, not the literal's (AGAST #2102). Anywhere else the
+    same text is a plain StringLit.
 
     Contains alternating string parts and expressions.
     parts = ["Hello, ", "!"]

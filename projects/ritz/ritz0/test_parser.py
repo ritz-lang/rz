@@ -2026,3 +2026,37 @@ class TestRitz1SourcePatterns:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestInterpolationScope:
+    """AGAST #2102: only print / eprint's literal argument interpolates."""
+
+    @staticmethod
+    def _body(src):
+        # A trailing `0` keeps the statements under test out of the block's
+        # tail-expression slot.
+        return parse("fn f()\n" + src + "    0\n").items[0].body.stmts
+
+    @pytest.mark.parametrize("fname", ["print", "eprint"])
+    def test_print_arg_becomes_interp_string(self, fname):
+        call = self._body(f'    {fname}("x={{a + 1}}!")\n')[0].expr
+        arg = call.args[0]
+        assert isinstance(arg, rast.InterpString)
+        assert arg.parts == ["x=", "!"]
+        assert isinstance(arg.exprs[0], rast.BinOp)
+
+    def test_other_call_arg_stays_plain(self):
+        call = self._body('    prints("x={a}")\n')[0].expr
+        arg = call.args[0]
+        assert isinstance(arg, rast.StringLit) and arg.value == "x={a}"
+
+    def test_let_and_bare_statement_stay_plain(self):
+        let, bare = self._body('    let s: StrView = "{a}"\n    "{b}"\n')
+        assert isinstance(let.value, rast.StringLit) and let.value.value == "{a}"
+        assert isinstance(bare.expr, rast.StringLit) and bare.expr.value == "{b}"
+
+    def test_bad_placeholder_is_only_an_error_in_print(self):
+        self._body('    let s: StrView = "{a +}"\n')
+        with pytest.raises(ParseError):
+            self._body('    print("{a +}")\n')
+

@@ -5215,9 +5215,8 @@ class LLVMEmitter:
             # Check if this is an If expression used as statement
             if isinstance(stmt.expr, rast.If):
                 return self._emit_if(stmt.expr)
-            # Interpolated strings get desugared to print calls
-            if isinstance(stmt.expr, rast.InterpString):
-                return self._emit_interp_string_print(stmt.expr)
+            # A bare "{x}" statement is a plain StringLit, not a print
+            # (AGAST #2102): only print / eprint interpolate.
             return self._emit_expr(stmt.expr)
 
         elif isinstance(stmt, rast.WhileStmt):
@@ -6411,10 +6410,10 @@ class LLVMEmitter:
         # StringLit (above) emits a StrView of the same shape.
 
         elif isinstance(expr, rast.InterpString):
-            # Interpolated strings are currently only supported as expression statements
-            # where they get desugared to print calls. When used as a value, error.
-            raise ValueError(f"Interpolated strings cannot be used as values (line {expr.span.line}). "
-                           "Use them as expression statements for printing, or build a String manually.")
+            # The parser builds an InterpString only as print / eprint's
+            # argument, which _emit_call lowers itself (AGAST #2102). Reaching
+            # here means some pass moved one out of that position.
+            raise ValueError(f"internal: InterpString outside print/eprint (line {expr.span.line})")
 
         elif isinstance(expr, rast.CharLit):
             # Character literal is a u8 constant

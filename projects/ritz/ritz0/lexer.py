@@ -162,8 +162,14 @@ class Lexer:
         """Lex a string or character literal.
 
         Single quotes with exactly one character produce a CHAR token (u8 value).
-        Double quotes produce STRING or INTERP_STRING token.
-        Interpolation uses {expr} syntax. Use {{ for literal brace.
+        Double quotes produce a STRING token.
+
+        AGAST #2102: a "..." literal is plain bytes everywhere; `{expr}`
+        placeholders mean something only to the print / eprint builtins
+        (ritz1's rule, interp.ritz). So `value` keeps every brace, and a
+        literal with a matched `{...}` additionally carries `interp`, its
+        print-time split (parts, expression strings), which the parser turns
+        into an InterpString only for `print(...)` / `eprint(...)`.
 
         AGAST #1913: `{{` / `}}` are the brace escape of print interpolation,
         not of the literal (LANGUAGE_SPEC section 2, and ritz1's rule). A plain
@@ -171,10 +177,11 @@ class Lexer:
         the text the print / eprint builtins write, with each pair collapsed
         to one brace. They are tracked side by side rather than collapsing the
         cooked value later, which could not tell `\\{{` (two braces) from `{{`.
-        INTERP_STRING parts are only ever printed, so they collapse.
+        `interp` parts are only ever printed, so they collapse.
         """
         start_span = self._span()
         quote = self._advance()  # consume opening quote
+        body_start = self.pos
         chars = []
         pchars = []     # print_value: chars with `{{` / `}}` collapsed
         has_interpolation = False
@@ -298,13 +305,41 @@ class Lexer:
                 raise LexerError("Empty character literal", start_span)
             raise LexerError(f"Character literal must contain exactly one character, got {len(chars)}", start_span)
 
-        # Interpolated string
+        # A literal with placeholders is still a plain literal (AGAST #2102).
+        # The loop above split it for print; its own bytes are the body cooked
+        # with braces as ordinary characters, placeholder text included.
         if has_interpolation:
             parts.append(''.join(pchars))  # Final part after last expr
-            return Token(TokenType.INTERP_STRING, (parts, expr_strs), start_span)
+            body = self.source[body_start:self.pos - 1]
+            return Token(TokenType.STRING, self._cook_plain(body, start_span),
+                         start_span, interp=(parts, expr_strs))
 
         return Token(TokenType.STRING, ''.join(chars), start_span,
                      print_value=''.join(pchars))
+
+    _PLAIN_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"',
+                      "'": "'", '0': '\0', '{': '{', '}': '}'}
+
+    def _cook_plain(self, body: str, span: Span) -> str:
+        """Cook a "..." body's escapes, treating every brace as a plain byte.
+
+        Used for literals holding `{...}`, whose placeholder text the print
+        split read raw (AGAST #2102).
+        """
+        out = []
+        i = 0
+        while i < len(body):
+            ch = body[i]
+            if ch == '\\':
+                esc = body[i + 1] if i + 1 < len(body) else '\0'
+                if esc not in self._PLAIN_ESCAPES:
+                    raise LexerError(f"Unknown escape sequence '\\{esc}'", span)
+                out.append(self._PLAIN_ESCAPES[esc])
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
 
     def _lex_cstring(self) -> Token:
         """Lex a C-string literal: c"...".

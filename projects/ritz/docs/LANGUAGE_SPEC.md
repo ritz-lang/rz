@@ -243,6 +243,11 @@ fn main() -> i32
     return 0
 ```
 
+Interpolation is a rule of the two builtins, not of the string literal. The
+same `"{x}"` anywhere else, such as a `let`, an argument to any other function,
+a `return` or a struct field, is the three bytes `{`, `x`, `}`. A bare
+`"{x}"` statement prints nothing (AGAST #2102).
+
 Inside a `print` or `eprint` literal, `{{` prints one `{` and `}}` one `}`.
 That escape belongs to print interpolation, not to the string literal: a plain
 `"..."` used anywhere else keeps both braces, so `"x{{y"` is four bytes and
