@@ -1844,7 +1844,7 @@ Using a value of a copy type by value copies it, and the source stays usable.
 Uses by value include binding it, assigning it, passing it to a by-value
 parameter, returning it and storing it in a field:
 
-```ritz no-compile="ritz0 still treats every struct as move-only and rejects the second copy of `a` (AGAST #2157); ritz1 accepts it"
+```ritz
 struct Point
     x: i32
     y: i32
@@ -1988,9 +1988,11 @@ fn main() -> i32
     r.handle                        # r is dropped after this is evaluated
 ```
 
-AGAST #2157 (ritz0) and #2158 (ritz1) track the compilers' progress toward
-these rules. `ritz0/test_ownership_free_count.py` counts the drops for each rule
-on all three compilers, with today's gaps marked as expected failures.
+ritz0 follows these rules (AGAST #2157), except that it doesn't yet drop enum
+payloads, arrays or tuples of move-only values, or temporaries (AGAST #2161).
+AGAST #2158 tracks ritz1. `ritz0/test_ownership_free_count.py` counts the drops
+for each rule on all three compilers, with today's gaps marked as expected
+failures.
 
 `defer` is reserved in the ritz1 grammar but is not implemented in ritz0:
 

@@ -17,6 +17,7 @@ import ritz_ast as rast
 from monomorph import resolve_alias_in
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
+from move_checker import MoveChecker, MoveTypes
 
 
 class EmitError(Exception):
@@ -592,6 +593,15 @@ class LLVMEmitter:
         # Maps alloca -> flag_alloca (using id() since AllocaInstr is not hashable)
         # The flag is set to 1 when variable is initialized, checked before dropping
         self.drop_flags: Dict[int, ir.AllocaInstr] = {}
+        # A `let` of a move-only type has no alloca; its value is spilled to
+        # one for the drop. name -> that slot, for clearing its flag on a
+        # move (AGAST #2157).
+        self._let_drop_slots: Dict[str, ir.AllocaInstr] = {}
+        # Per open drop scope: the _let_drop_slots entries it shadowed.
+        self._let_drop_saved: List[List[Tuple[str, Optional[ir.AllocaInstr]]]] = []
+        # Per open loop (parallel to loop_stack): len(drop_scope_stack) at
+        # the loop, so break/continue drop only the scopes inside it.
+        self._loop_drop_depth: List[int] = []
 
         # Type aliases: name -> Ritz type (for resolving union types)
         self.type_aliases: Dict[str, rast.Type] = {}
@@ -2239,6 +2249,13 @@ class LLVMEmitter:
         self._current_source_file = source_file
         LLVMEmitter._module_counter += 1
 
+        # Drops need the move checker's marks (Ident.moves_binding: clear the
+        # binding's drop flag there) whether or not the caller checked
+        # ownership (AGAST #2157); `--no-check-ownership` skips only errors.
+        if not getattr(module, 'moves_annotated', False):
+            MoveChecker().check(module)
+        self.move_types = MoveTypes(module)
+
         # Transform async functions into state machines (before any emission)
         module = self._transform_async_functions(module)
 
@@ -3592,12 +3609,10 @@ class LLVMEmitter:
     # =========================================================================
 
     def _type_implements_drop(self, ty: rast.Type) -> bool:
-        """Check if a type implements the Drop trait."""
-        if not isinstance(ty, rast.NamedType):
-            return False
-        # Look for impl Drop for TypeName
-        type_name = ty.name
-        return ('Drop', type_name) in self.impls
+        """Does a binding of this type need dropping? Iff it is move-only:
+        it implements Drop or contains a move-only type (LANGUAGE_SPEC
+        §13.1); _emit_drop_glue drops the parts (AGAST #2157)."""
+        return self.move_types.is_move_only(ty)
 
     def _get_drop_fn_name(self, ty: rast.Type) -> Optional[str]:
         """Get the mangled drop function name for a type, if it implements Drop."""
@@ -3674,6 +3689,7 @@ class LLVMEmitter:
         ritz_type = stmt.type or self._infer_ritz_type(stmt.value)
         if ritz_type is not None:
             self.ritz_types[stmt.name] = ritz_type
+        self._register_let_drop(stmt.name, slot, ritz_type)
         return True
 
     def _is_let_slot(self, name: str) -> bool:
@@ -3790,12 +3806,62 @@ class LLVMEmitter:
     def _push_drop_scope(self):
         """Enter a new scope for Drop tracking."""
         self.drop_scope_stack.append([])
+        self._let_drop_saved.append([])
 
     def _pop_drop_scope(self):
         """Exit the current scope, returning variables that need Drop."""
+        if self._let_drop_saved:
+            for name, prev in reversed(self._let_drop_saved.pop()):
+                if prev is None:
+                    self._let_drop_slots.pop(name, None)
+                else:
+                    self._let_drop_slots[name] = prev
         if self.drop_scope_stack:
             return self.drop_scope_stack.pop()
         return []
+
+    def _leave_drop_scope(self):
+        """Close a block's drop scope (LANGUAGE_SPEC §13.6): drop what it
+        still owns if control falls off its end, i.e. unless the block
+        already left by return/break/continue, which dropped it then."""
+        scope = self._pop_drop_scope()
+        if scope and not self.builder.block.is_terminated:
+            self._emit_drop_for_scope(scope)
+
+    def _set_let_drop_slot(self, name: str, slot: Optional[ir.AllocaInstr]) -> None:
+        """Point `name` at a `let` drop slot (None: a binding with no slot),
+        restoring the shadowed entry when the current scope closes."""
+        if self._let_drop_saved:
+            self._let_drop_saved[-1].append((name, self._let_drop_slots.get(name)))
+        if slot is None:
+            self._let_drop_slots.pop(name, None)
+        else:
+            self._let_drop_slots[name] = slot
+
+    def _drop_flag_of(self, name: str) -> Optional[ir.AllocaInstr]:
+        """The drop flag of the binding `name` currently refers to, if any."""
+        if name in self.locals:
+            return self.drop_flags.get(id(self.locals[name][0]))
+        if name in self.params:
+            slot = self._let_drop_slots.get(name)
+            if slot is not None:
+                return self.drop_flags.get(id(slot))
+        return None
+
+    def _note_move(self, expr: rast.Ident) -> None:
+        """The move checker marked this use as a move: the binding no longer
+        owns its value, so it must not be dropped (§13.6). Clearing its flag
+        at run time also covers a move on only some paths."""
+        if getattr(expr, 'moves_binding', False):
+            flag = self._drop_flag_of(expr.name)
+            if flag is not None:
+                self.builder.store(ir.Constant(self.i1, 0), flag)
+
+    def _drop_loop_scopes(self) -> None:
+        """break / continue: drop the scopes opened inside the innermost loop."""
+        depth = self._loop_drop_depth[-1] if self._loop_drop_depth else len(self.drop_scope_stack)
+        for scope in reversed(self.drop_scope_stack[depth:]):
+            self._emit_drop_for_scope(scope)
 
     def _register_drop_variable(self, name: str, alloca: ir.AllocaInstr, ritz_type: rast.Type):
         """Register a variable that may need Drop when its scope ends.
@@ -3837,6 +3903,40 @@ class LLVMEmitter:
             # Register both the variable and its flag (key by alloca id, not name)
             self.drop_scope_stack[-1].append((name, alloca, ritz_type))
             self.drop_flags[id(alloca)] = flag_alloca
+            return True
+        return False
+
+    def _store_binding(self, name: str, alloca: ir.Value, val: ir.Value) -> None:
+        """`name = val` for a local binding. §13.6: drop the old value (if
+        the binding still owns one) before storing the new; then the binding
+        owns again (AGAST #2157)."""
+        entry = next((e for sc in self.drop_scope_stack for e in sc
+                      if e[1] is alloca), None)
+        if entry is not None:
+            self._emit_flagged_drop(name, alloca, entry[2])
+        self.builder.store(val, alloca)
+        if entry is not None:
+            self._mark_drop_variable_initialized(alloca)
+
+    def _register_let_drop(self, name: str, val: ir.Value, ritz_type: Optional[rast.Type]):
+        """Register a `let` for its scope-end drop (§13.6, AGAST #2157).
+
+        A let in self.locals (a #2025 large-struct slot) is dropped in place.
+        Any other let is an SSA value: it is spilled to an entry-block slot
+        that only the drop reads, since the binding is immutable.
+        """
+        if ritz_type is None or not self._type_implements_drop(ritz_type):
+            self._set_let_drop_slot(name, None)
+            return
+        if name in self.locals and self.locals[name][0] is val:
+            slot = val
+        else:
+            slot = self._alloca_in_entry_block(val.type, f"{name}.drop")
+            self.builder.store(val, slot)
+        if self._register_drop_variable(name, slot, ritz_type):
+            self._mark_drop_variable_initialized(slot)
+            if slot is not val:
+                self._set_let_drop_slot(name, slot)
 
     def _mark_drop_variable_initialized(self, alloca: ir.AllocaInstr):
         """Set the drop flag to 1, indicating the variable is now initialized.
@@ -4077,32 +4177,67 @@ class LLVMEmitter:
             if exclude_var and name == exclude_var:
                 # Skip - this variable is being moved out (returned)
                 continue
-            drop_fn_name = self._get_drop_fn_name(ritz_type)
-            if drop_fn_name and drop_fn_name in self.functions:
-                fn, _ = self.functions[drop_fn_name]
+            self._emit_flagged_drop(name, alloca, ritz_type)
 
-                # Check drop flag - only drop if variable was initialized
-                alloca_id = id(alloca)
-                if alloca_id in self.drop_flags:
-                    flag_alloca = self.drop_flags[alloca_id]
-                    flag_val = self.builder.load(flag_alloca, name=f"{name}.flag_check")
+    def _emit_flagged_drop(self, name: str, alloca: ir.Value, ritz_type: rast.Type,
+                           clear_flag: bool = False):
+        """if (flag) drop(alloca). The flag is 0 until the binding is
+        initialised and again once it has been moved from (_note_move).
+        `clear_flag` also resets it, for reassignment's drop of the old
+        value."""
+        flag_alloca = self.drop_flags.get(id(alloca))
+        if flag_alloca is None:
+            # No flag (shouldn't happen, but fall back to unconditional)
+            self._emit_drop_glue(alloca, ritz_type)
+            return
+        flag_val = self.builder.load(flag_alloca, name=f"{name}.flag_check")
+        drop_block = self.current_fn.append_basic_block(f"drop.{name}")
+        cont_block = self.current_fn.append_basic_block(f"drop.{name}.cont")
+        self.builder.cbranch(flag_val, drop_block, cont_block)
+        self.builder.position_at_end(drop_block)
+        self._emit_drop_glue(alloca, ritz_type)
+        if clear_flag:
+            self.builder.store(ir.Constant(self.i1, 0), flag_alloca)
+        self.builder.branch(cont_block)
+        self.builder.position_at_end(cont_block)
 
-                    # Create conditional drop: if (flag) { drop(&var) }
-                    drop_block = self.current_fn.append_basic_block(f"drop.{name}")
-                    cont_block = self.current_fn.append_basic_block(f"drop.{name}.cont")
+    def _emit_drop_glue(self, ptr: ir.Value, ritz_type: rast.Type, depth: int = 0):
+        """Drop the value at `ptr` (LANGUAGE_SPEC §13.6): its own `drop`
+        first, if it has one, then each move-only field in declaration
+        order. AGAST #2157.
 
-                    self.builder.cbranch(flag_val, drop_block, cont_block)
-
-                    # Drop block
-                    self.builder.position_at_end(drop_block)
-                    self.builder.call(fn, [alloca])
-                    self.builder.branch(cont_block)
-
-                    # Continue after drop
-                    self.builder.position_at_end(cont_block)
-                else:
-                    # No flag (shouldn't happen, but fall back to unconditional)
-                    self.builder.call(fn, [alloca])
+        Not covered yet (AGAST #2161): enum payloads, and arrays and
+        tuples of move-only types, are not dropped.
+        """
+        if depth > 32 or not self.move_types.is_move_only(ritz_type):
+            return
+        while (isinstance(ritz_type, rast.NamedType) and not ritz_type.args
+               and ritz_type.name in self.move_types.aliases):
+            ritz_type = self.move_types.aliases[ritz_type.name]
+        drop_fn_name = self._get_drop_fn_name(ritz_type)
+        if drop_fn_name and drop_fn_name in self.functions:
+            fn, _ = self.functions[drop_fn_name]
+            arg = ptr
+            want = self._fn_param_types(fn)[0] if self._fn_param_types(fn) else None
+            if want is not None and arg.type != want and isinstance(want, ir.PointerType):
+                arg = self.builder.bitcast(arg, want)
+            self.builder.call(fn, [arg])
+        if not isinstance(ritz_type, rast.NamedType):
+            return
+        if not isinstance(ptr.type, ir.PointerType):
+            return
+        struct_name = self._get_struct_name_from_type(ptr.type.pointee)
+        if struct_name is None:
+            return
+        for fname, fty in self.move_types.struct_fields(ritz_type):
+            if not self.move_types.is_move_only(fty):
+                continue
+            try:
+                idx = self._get_struct_field_index(struct_name, fname)
+            except (ValueError, KeyError):
+                continue
+            fptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+            self._emit_drop_glue(fptr, fty, depth + 1)
 
     def _emit_drop_for_all_scopes(self, exclude_var: Optional[str] = None):
         """Emit drop calls for all scopes (used before return).
@@ -4360,6 +4495,9 @@ class LLVMEmitter:
         self.in_test_helper = fn_def.has_attr('test_helper')
         self.drop_scope_stack.clear()  # Clear drop scopes from previous function
         self.drop_flags.clear()  # Clear drop flags from previous function
+        self._let_drop_slots.clear()
+        self._let_drop_saved.clear()
+        self._loop_drop_depth.clear()
         self.simd_expected_type = None  # Clear SIMD type context from previous function
         self.closure_expected_type = None  # Clear closure type context from previous function
         self.expected_ritz_type = None  # Expected Ritz type of the value being emitted
@@ -5242,14 +5380,14 @@ class LLVMEmitter:
                 self._check_let_annotation(stmt, val, declared_ty)
                 self._bind_let(stmt.name, val, declared_ty)
                 self.ritz_types[stmt.name] = stmt.type  # Store Ritz type for signedness
-                # Note: let bindings don't get allocas, they're just SSA values
-                # For Drop to work, the variable needs to be addressable (use var instead of let)
+                self._register_let_drop(stmt.name, val, stmt.type)
             else:
                 # Infer Ritz type from expression for signedness tracking
                 inferred_ritz_type = self._infer_ritz_type(stmt.value, val)
                 self._bind_let(stmt.name, val, val.type)
                 if inferred_ritz_type:
                     self.ritz_types[stmt.name] = inferred_ritz_type
+                self._register_let_drop(stmt.name, val, inferred_ritz_type)
             return None
 
         elif isinstance(stmt, rast.LetTupleStmt):
@@ -5303,7 +5441,7 @@ class LLVMEmitter:
                 if name in self.locals:
                     alloca, ty = self.locals[name]
                     val = self._convert_type(val, ty)
-                    self.builder.store(val, alloca)
+                    self._store_binding(name, alloca, val)
                 elif name in self.globals:
                     gvar, ty = self.globals[name]
                     val = self._convert_type(val, ty)
@@ -5494,6 +5632,7 @@ class LLVMEmitter:
             if not self.loop_stack:
                 raise RuntimeError("break statement outside of loop")
             _, break_block = self.loop_stack[-1]
+            self._drop_loop_scopes()
             self.builder.branch(break_block)
             return True  # Terminates this block
 
@@ -5501,6 +5640,7 @@ class LLVMEmitter:
             if not self.loop_stack:
                 raise RuntimeError("continue statement outside of loop")
             continue_block, _ = self.loop_stack[-1]
+            self._drop_loop_scopes()
             self.builder.branch(continue_block)
             return True  # Terminates this block
 
@@ -6187,6 +6327,7 @@ class LLVMEmitter:
         saved_returned = self.has_returned
         self.has_returned = False
 
+        self._push_drop_scope()
         for s in if_expr.then_block.stmts:
             result = self._emit_stmt(s)
             if result is True:
@@ -6201,6 +6342,7 @@ class LLVMEmitter:
                 then_value = self._emit_expr_with_expected_enum(
                     if_expr.then_block.expr,
                     getattr(self, '_expected_enum_name', None))
+        self._leave_drop_scope()
 
         # DON'T branch yet - we may need to add type conversion first
         then_exit_block = self.builder.block  # Remember where we are after then block
@@ -6215,6 +6357,7 @@ class LLVMEmitter:
             self.builder.position_at_end(else_block)
             self.has_returned = False
 
+            self._push_drop_scope()
             for s in if_expr.else_block.stmts:
                 result = self._emit_stmt(s)
                 if result is True:
@@ -6228,6 +6371,7 @@ class LLVMEmitter:
                     else_value = self._emit_expr_with_expected_enum(
                         if_expr.else_block.expr,
                         getattr(self, '_expected_enum_name', None))
+            self._leave_drop_scope()
 
             # DON'T branch yet
             else_exit_block = self.builder.block  # Remember where we are after else block
@@ -6302,6 +6446,7 @@ class LLVMEmitter:
 
         # Push loop context for break/continue
         self.loop_stack.append((cond_block, end_block))
+        self._loop_drop_depth.append(len(self.drop_scope_stack))
 
         # Jump to condition
         self.builder.branch(cond_block)
@@ -6318,6 +6463,7 @@ class LLVMEmitter:
         saved_returned = self.has_returned
         self.has_returned = False
 
+        self._push_drop_scope()
         for s in stmt.body.stmts:
             result = self._emit_stmt(s)
             if result is True:
@@ -6329,6 +6475,7 @@ class LLVMEmitter:
                 self._emit_if(stmt.body.expr)
             else:
                 self._emit_expr(stmt.body.expr)
+        self._leave_drop_scope()
 
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
@@ -6337,6 +6484,7 @@ class LLVMEmitter:
 
         # Pop loop context
         self.loop_stack.pop()
+        self._loop_drop_depth.pop()
 
         # End
         self.builder.position_at_end(end_block)
@@ -6408,6 +6556,7 @@ class LLVMEmitter:
         # Push loop context for break/continue
         # continue goes to increment block, break goes to end block
         self.loop_stack.append((incr_block, end_block))
+        self._loop_drop_depth.append(len(self.drop_scope_stack))
 
         # Jump to condition
         self.builder.branch(cond_block)
@@ -6436,6 +6585,7 @@ class LLVMEmitter:
         saved_returned = self.has_returned
         self.has_returned = False
 
+        self._push_drop_scope()
         for s in stmt.body.stmts:
             result = self._emit_stmt(s)
             if result is True:
@@ -6447,6 +6597,7 @@ class LLVMEmitter:
                 self._emit_if(stmt.body.expr)
             else:
                 self._emit_expr(stmt.body.expr)
+        self._leave_drop_scope()
 
         # Jump to increment if not terminated
         if not self.builder.block.is_terminated:
@@ -6463,6 +6614,7 @@ class LLVMEmitter:
 
         # Pop loop context
         self.loop_stack.pop()
+        self._loop_drop_depth.pop()
 
         # End block
         self.builder.position_at_end(end_block)
@@ -6598,6 +6750,7 @@ class LLVMEmitter:
         end_block = self.current_fn.append_basic_block("for.iter.end")
 
         self.loop_stack.append((incr_block, end_block))
+        self._loop_drop_depth.append(len(self.drop_scope_stack))
         self.builder.branch(cond_block)
 
         prev_param = self.params.get(stmt.var)
@@ -6637,6 +6790,7 @@ class LLVMEmitter:
                 elem_val = self.builder.load(elem_ptr)
 
         self._bind_let(stmt.var, elem_val, elem_val.type)
+        self._push_drop_scope()
         for s in stmt.body.stmts:
             result = self._emit_stmt(s)
             if result is True:
@@ -6647,6 +6801,7 @@ class LLVMEmitter:
                 self._emit_if(stmt.body.expr)
             else:
                 self._emit_expr(stmt.body.expr)
+        self._leave_drop_scope()
 
         if not self.builder.block.is_terminated:
             self.builder.branch(incr_block)
@@ -6660,6 +6815,7 @@ class LLVMEmitter:
         self.builder.branch(cond_block)
 
         self.loop_stack.pop()
+        self._loop_drop_depth.pop()
         if prev_param is None:
             self.params.pop(stmt.var, None)
         else:
@@ -7026,11 +7182,14 @@ class LLVMEmitter:
             # in different branches of if-else, and we need to use the correct one.
             if name in self.locals:
                 alloca, ty = self.locals[name]
-                return self.builder.load(alloca)
+                loaded = self.builder.load(alloca)
+                self._note_move(expr)
+                return loaded
 
             # Check params (let bindings and function params)
             if name in self.params:
                 val, _ = self.params[name]
+                self._note_move(expr)
                 return val
 
             # Check module-level globals (var at top level)
@@ -8625,6 +8784,7 @@ class LLVMEmitter:
         if not self.loop_stack:
             raise RuntimeError("continue expression outside of loop")
         continue_block, _ = self.loop_stack[-1]
+        self._drop_loop_scopes()
         self.builder.branch(continue_block)
         # Return an undefined value - this is never used since we branched
         return ir.Undefined
@@ -8638,6 +8798,7 @@ class LLVMEmitter:
         if not self.loop_stack:
             raise RuntimeError("break expression outside of loop")
         _, break_block = self.loop_stack[-1]
+        self._drop_loop_scopes()
         self.builder.branch(break_block)
         # Return an undefined value - this is never used since we branched
         return ir.Undefined
@@ -8656,8 +8817,10 @@ class LLVMEmitter:
                 self.current_fn_def.ret_type if self.current_fn_def else None,
                 getattr(expr.value, 'span', None) or getattr(expr, 'span', None))
             ret_val = self._convert_type(ret_val, ret_type)
+            self._emit_drop_for_all_scopes()
             self.builder.ret(ret_val)
         else:
+            self._emit_drop_for_all_scopes()
             if ret_type == self.void:
                 self.builder.ret_void()
             else:
@@ -8671,18 +8834,20 @@ class LLVMEmitter:
         Evaluates all statements and returns the value of the final expression.
         Used for multiline match arms and other block contexts.
         """
+        self._push_drop_scope()
         # Emit all statements
         for stmt in block.stmts:
-            self._emit_stmt(stmt)
+            if self._emit_stmt(stmt) is True:
+                break
 
         # Emit and return the final expression (threading any expected enum
         # from the enclosing value position through the block tail)
-        if block.expr is not None:
-            return self._emit_expr_with_expected_enum(
+        result = ir.Undefined  # Void block
+        if block.expr is not None and not self.builder.block.is_terminated:
+            result = self._emit_expr_with_expected_enum(
                 block.expr, getattr(self, '_expected_enum_name', None))
-        else:
-            # Void block - return undefined
-            return ir.Undefined
+        self._leave_drop_scope()
+        return result
 
     def _emit_assign_expr(self, expr: rast.AssignExpr) -> ir.Value:
         """Emit an assignment expression: target = value.
@@ -8721,7 +8886,7 @@ class LLVMEmitter:
             if name in self.locals:
                 alloca, ty = self.locals[name]
                 val = self._convert_type(val, ty)
-                self.builder.store(val, alloca)
+                self._store_binding(name, alloca, val)
             elif name in self.globals:
                 gvar, ty = self.globals[name]
                 val = self._convert_type(val, ty)

@@ -263,6 +263,14 @@ struct Point
     x: i32
     y: i32
 
+# Drop makes Point move-only (LANGUAGE_SPEC §13.1); plain structs copy.
+trait Drop
+    fn drop(self: @&Self)
+
+impl Drop for Point
+    fn drop(self: @&Point)
+        self.x = 0
+
 fn takes_point(p: Point) -> i32
     return p.x
 

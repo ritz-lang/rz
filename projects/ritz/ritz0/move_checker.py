@@ -3,8 +3,9 @@ Move and Borrow Checker for ritz0
 
 Phase 9: Ownership & Borrowing
 
-Implements Rust-like ownership semantics:
-- Values move by default (use-after-move = error)
+Implements the ownership model of LANGUAGE_SPEC §13:
+- Move-only types (Drop, or containing a Drop) move; every other type
+  copies (use-after-move = error)
 - Borrows: &T (shared), &mut T (exclusive)
 - Aliased mutable borrows are disallowed
 
@@ -88,6 +89,120 @@ class Scope:
                 info.move_span = move_span
 
 
+def _is_lending_param(param: Optional[rast.Param]) -> bool:
+    """A parameter that borrows its argument rather than taking ownership:
+    `@T`, `@&T`, `*T` (auto-borrow, AGAST #1290) or `name:& T`."""
+    if param is None:
+        return False
+    if getattr(param, 'borrow', None) == rast.Borrow.MUTABLE:
+        return True
+    return isinstance(param.type, (rast.RefType, rast.PtrType))
+
+
+class MoveTypes:
+    """Which types are move-only (LANGUAGE_SPEC §13.1, AGAST #1854/#2157).
+
+    A type is move-only iff it implements `Drop`, or it has a field, an
+    enum-variant payload or a generic argument that is move-only, checked
+    transitively. Every other type copies. A name this module doesn't
+    define (a type parameter, a type inference couldn't name) is a copy
+    type: a wrong "copy" only skips a use-after-move error, while a wrong
+    "move" rejects valid programs, which is what #1489 and #1548 were.
+    Shared by the move checker and the emitter's drop glue.
+    """
+
+    def __init__(self, module: rast.Module):
+        self.drop_types: Set[str] = set()
+        self.structs: Dict[str, rast.StructDef] = {}
+        self.enums: Dict[str, rast.EnumDef] = {}
+        self.aliases: Dict[str, rast.Type] = {}
+        for item in module.items:
+            if isinstance(item, rast.ImplBlock) and item.trait_name == 'Drop':
+                self.drop_types.add(item.type_name)
+            elif isinstance(item, rast.StructDef):
+                self.structs[item.name] = item
+            elif isinstance(item, rast.EnumDef):
+                self.enums[item.name] = item
+            elif isinstance(item, rast.TypeAlias):
+                self.aliases[item.name] = item.target
+        self._cache: Dict[str, bool] = {}
+
+    def has_own_drop(self, ty: rast.Type) -> bool:
+        return isinstance(ty, rast.NamedType) and ty.name in self.drop_types
+
+    def is_move_only(self, ty: Optional[rast.Type]) -> bool:
+        if ty is None:
+            return False
+        key = _type_key(ty)
+        if key not in self._cache:
+            self._cache[key] = False      # cycle guard: a recursive type
+            self._cache[key] = self._compute(ty)
+        return self._cache[key]
+
+    def _compute(self, ty: rast.Type) -> bool:
+        if isinstance(ty, rast.NamedType):
+            if ty.name in self.drop_types:
+                return True
+            if any(self.is_move_only(a) for a in ty.args):
+                return True
+            if ty.name in self.aliases and not ty.args:
+                return self.is_move_only(self.aliases[ty.name])
+            if ty.name in self.structs:
+                return any(self.is_move_only(t) for _n, t in self.struct_fields(ty))
+            if ty.name in self.enums:
+                return any(self.is_move_only(t)
+                           for v in self.enums[ty.name].variants for t in v.fields)
+            return False
+        if isinstance(ty, rast.ArrayType):
+            return self.is_move_only(ty.inner)
+        if isinstance(ty, rast.TupleType):
+            return any(self.is_move_only(t) for t in ty.elements)
+        if isinstance(ty, rast.UnionType):
+            return any(self.is_move_only(t) for t in ty.variants)
+        # Pointers, references, fn types, SIMD vectors: copies.
+        return False
+
+    def struct_fields(self, ty: rast.NamedType) -> List[Tuple[str, rast.Type]]:
+        """The struct's fields with its type parameters replaced by `ty`'s args."""
+        sd = self.structs.get(ty.name)
+        if sd is None:
+            return []
+        subst = dict(zip(sd.type_params or [], ty.args))
+        return [(n, _subst(t, subst)) for n, t in sd.fields]
+
+
+def _type_key(ty: rast.Type) -> str:
+    if isinstance(ty, rast.NamedType):
+        if ty.args:
+            return f"{ty.name}<{','.join(_type_key(a) for a in ty.args)}>"
+        return ty.name
+    if isinstance(ty, rast.ArrayType):
+        return f"[{ty.size}]{_type_key(ty.inner)}"
+    if isinstance(ty, rast.TupleType):
+        return f"({','.join(_type_key(t) for t in ty.elements)})"
+    if isinstance(ty, rast.UnionType):
+        return '|'.join(_type_key(t) for t in ty.variants)
+    if isinstance(ty, (rast.PtrType, rast.RefType)):
+        return f"*{_type_key(ty.inner)}"
+    return type(ty).__name__
+
+
+def _subst(ty: rast.Type, subst: Dict[str, rast.Type]) -> rast.Type:
+    if not subst:
+        return ty
+    if isinstance(ty, rast.NamedType):
+        if not ty.args and ty.name in subst:
+            return subst[ty.name]
+        if ty.args:
+            return rast.NamedType(ty.span, ty.name, [_subst(a, subst) for a in ty.args])
+        return ty
+    if isinstance(ty, rast.ArrayType):
+        return rast.ArrayType(ty.span, ty.size, _subst(ty.inner, subst))
+    if isinstance(ty, rast.TupleType):
+        return rast.TupleType(ty.span, [_subst(t, subst) for t in ty.elements])
+    return ty
+
+
 class MoveChecker:
     """
     Checks ownership and borrowing rules.
@@ -103,21 +218,12 @@ class MoveChecker:
     - Detect multiple mutable borrows (within same scope)
     """
 
-    # Types that are Copy (don't move, they copy)
-    COPY_TYPES = {
+    # Primitive scalar names. Only `_infer_expr_type`'s `read_*` heuristic
+    # still needs them: move-vs-copy is decided by MoveTypes (LANGUAGE_SPEC
+    # §13.1), not by a list (AGAST #2157; the list was #1489 and #1548).
+    PRIMITIVES = {
         'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'bool', 'f32', 'f64',
         'usize', 'isize',
-        # SIMD vector types are trivially copyable (SSE2 128-bit = 16 bytes)
-        'v2i64', 'v4i32', 'v8i16', 'v16i8',
-        # AVX2 256-bit vectors (32 bytes, still trivially copyable)
-        'v4i64', 'v8i32', 'v16i16', 'v32i8',
-        # Small structs with only Copy fields are Copy
-        # TODO: Implement proper Copy trait checking
-        'Point2D', 'Bounds', 'BoundsRect',  # Geometry types
-        # StrView is a borrowed { ptr, len } view with no ownership — the type
-        # bare "..." literals produce (AGAST #98). Omitting it here made every
-        # by-value StrView argument a move (AGAST #1560).
-        'StrView',
     }
 
     def __init__(self):
@@ -129,53 +235,51 @@ class MoveChecker:
         self.type_aliases: Dict[str, rast.Type] = {}
         # Function return types: name -> return type
         self.fn_return_types: Dict[str, rast.Type] = {}
+        # Function parameters: name -> params, so an argument lent to an
+        # `@T` / `*T` / `:&` parameter (auto-borrow) isn't counted as a move.
+        self.fn_params: Dict[str, List[rast.Param]] = {}
+        # Method name -> every impl's FnDef of that name.
+        self.methods: Dict[str, List[rast.FnDef]] = {}
+        self.types: Optional[MoveTypes] = None
 
     def check(self, module: rast.Module) -> List[OwnershipError]:
         """Check ownership rules for a module.
 
-        Returns a list of errors (empty if all rules satisfied).
+        Returns a list of errors (empty if all rules satisfied). As a side
+        effect, every Ident that moves a move-only binding gets
+        `moves_binding = True`; the emitter clears that binding's drop flag
+        there, so a moved-from binding is never dropped (§13.6).
         """
         self.errors = []
+        self.types = MoveTypes(module)
+        module.moves_annotated = True
 
         # First pass: collect type aliases and function signatures
         for item in module.items:
             if isinstance(item, rast.TypeAlias):
                 self.type_aliases[item.name] = item.target
-            elif isinstance(item, rast.FnDef):
+            elif isinstance(item, (rast.FnDef, rast.ExternFn)):
                 # Collect function return type for call inference
                 if item.ret_type:
                     self.fn_return_types[item.name] = item.ret_type
-            elif isinstance(item, rast.ExternFn):
-                # Extern functions also have return types for inference
-                if item.ret_type:
-                    self.fn_return_types[item.name] = item.ret_type
+                self.fn_params[item.name] = list(item.params)
+            elif isinstance(item, rast.ImplBlock):
+                for m in item.methods:
+                    self.methods.setdefault(m.name, []).append(m)
 
-        # Second pass: check functions
+        # Second pass: check functions and impl methods
         for item in module.items:
             if isinstance(item, rast.FnDef):
                 self._check_fn(item)
+            elif isinstance(item, rast.ImplBlock):
+                for m in item.methods:
+                    self._check_fn(m)
 
         return self.errors
 
     def _is_copy_type(self, ty: rast.Type) -> bool:
-        """Check if a type is Copy (trivially copyable)."""
-        if isinstance(ty, rast.NamedType):
-            # Primitives are Copy
-            if ty.name in self.COPY_TYPES:
-                return True
-            # Check if it's a type alias to a Copy type
-            if ty.name in self.type_aliases:
-                return self._is_copy_type(self.type_aliases[ty.name])
-            # TODO: Check for Copy trait implementation
-            return False
-        elif isinstance(ty, rast.PtrType) or isinstance(ty, rast.RefType):
-            # Raw pointers and references are Copy
-            return True
-        elif isinstance(ty, rast.UnionType):
-            # Union types are Copy if all variants are Copy
-            return all(self._is_copy_type(v) for v in ty.variants)
-        else:
-            return False
+        """A type is Copy unless it is move-only (LANGUAGE_SPEC §13.1)."""
+        return not self.types.is_move_only(ty)
 
     def _infer_expr_type(self, expr: rast.Expr) -> rast.Type:
         """Infer the type of an expression for ownership checking.
@@ -263,7 +367,7 @@ class MoveChecker:
             # read_* methods return Result<primitive>
             if method.startswith('read_'):
                 type_suffix = method[5:]  # e.g., "u16", "u32", "i8", etc.
-                if type_suffix in self.COPY_TYPES:
+                if type_suffix in self.PRIMITIVES:
                     return rast.NamedType(expr.span, 'Result', [
                         rast.NamedType(expr.span, type_suffix, [])
                     ])
@@ -389,10 +493,13 @@ class MoveChecker:
             return True
 
         elif isinstance(stmt, rast.AssignStmt):
-            # Check the target (lvalue) - not a move
-            self._check_expr(stmt.target, is_move_context=False)
-            # Check the value - this is a move
+            # Check the value first - this is a move. `t = f(t)` reads the
+            # old t before the assignment makes t an owner again.
             self._check_expr(stmt.value, is_move_context=True)
+            # The target (lvalue) is not a move, and assigning to a bare
+            # moved-from binding is not a use of it (§13.6).
+            if not isinstance(stmt.target, rast.Ident):
+                self._check_expr(stmt.target, is_move_context=False)
             # After assignment, the target variable becomes owned again
             if isinstance(stmt.target, rast.Ident):
                 var_info = self.scope.lookup(stmt.target.name)
@@ -439,13 +546,16 @@ class MoveChecker:
                     ))
                     return
 
-                # If this is a move context and type is not Copy, mark as moved
-                # Borrow parameters (CONST or MUTABLE) are effectively Copy since
-                # they're references that can be passed multiple times
-                is_borrow_param = var_info.borrow in (rast.Borrow.CONST, rast.Borrow.MUTABLE)
+                # If this is a move context and type is not Copy, mark as moved.
+                # A `name:& T` parameter is a reference, so it never moves. A
+                # by-value `name: T` parameter (Borrow.CONST) owns its value
+                # (§13.2) and moves like any binding (AGAST #2157).
+                is_borrow_param = var_info.borrow == rast.Borrow.MUTABLE
                 if is_move_context and not is_borrow_param and not self._is_copy_type(var_info.ritz_type):
                     var_info.state = VarState.MOVED
                     var_info.move_span = expr.span
+                    # The emitter clears the binding's drop flag here.
+                    expr.moves_binding = True
 
         elif isinstance(expr, rast.BinOp):
             # Binary ops don't move their operands (they borrow or copy)
@@ -482,12 +592,27 @@ class MoveChecker:
             # Save borrow states before processing arguments
             borrow_states_before = self._save_borrow_states()
 
-            for arg in expr.args:
-                self._check_expr(arg, is_move_context=True)
+            params = (self.fn_params.get(expr.func.name)
+                      if isinstance(expr.func, rast.Ident) else None)
+            for i, arg in enumerate(expr.args):
+                param = params[i] if params and i < len(params) else None
+                self._check_expr(arg, is_move_context=not _is_lending_param(param))
 
             # Release borrows that were created for this call
             # (borrows don't outlive the call unless stored somewhere)
             self._restore_borrow_states(borrow_states_before)
+
+        elif isinstance(expr, rast.MethodCall):
+            # The receiver is borrowed (auto-ref), not moved. An argument
+            # moves when every method of that name takes it by value.
+            self._check_expr(expr.expr, is_move_context=False)
+            borrow_states_before = self._save_borrow_states()
+            for i, arg in enumerate(expr.args):
+                self._check_expr(arg, is_move_context=self._method_arg_moves(expr, i))
+            self._restore_borrow_states(borrow_states_before)
+
+        elif isinstance(expr, rast.Grouped):
+            self._check_expr(expr.expr, is_move_context=is_move_context)
 
         elif isinstance(expr, rast.Field):
             # Field access doesn't move the struct (unless the result is moved)
@@ -588,6 +713,22 @@ class MoveChecker:
         elif isinstance(expr, (rast.IntLit, rast.FloatLit, rast.StringLit,
                                rast.CStringLit, rast.BoolLit, rast.CharLit)):
             pass
+
+    def _method_arg_moves(self, call: rast.MethodCall, i: int) -> bool:
+        """Does argument `i` of `call` move? Only if every same-named method
+        takes it by value; unknown methods lend (no move, no drop-flag clear)."""
+        cands = self.methods.get(call.method)
+        if not cands:
+            return False
+        static = (isinstance(call.expr, rast.Ident)
+                  and self.scope.lookup(call.expr.name) is None)
+        for m in cands:
+            params = list(m.params)
+            if not static and params and params[0].name == 'self':
+                params = params[1:]
+            if i >= len(params) or _is_lending_param(params[i]):
+                return False
+        return True
 
     def _check_borrow(self, expr: rast.Expr, mutable: bool, span: rast.Span):
         """Check a borrow expression for validity."""

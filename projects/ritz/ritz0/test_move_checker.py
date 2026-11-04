@@ -9,6 +9,19 @@ from parser import parse
 from move_checker import MoveChecker, OwnershipError
 
 
+def drop_impl(ty: str) -> str:
+    """`impl Drop for ty`: Drop is what makes a type move-only (LANGUAGE_SPEC
+    §13.1, AGAST #2157); a struct without one copies."""
+    return f"""
+trait Drop
+    fn drop(self: @&Self)
+
+impl Drop for {ty}
+    fn drop(self: @&{ty})
+        pass
+"""
+
+
 def check(source: str) -> list:
     """Parse and run move checker, return errors."""
     module = parse(source)
@@ -56,7 +69,7 @@ fn main() -> i32
     var p: Point = Point { x: 1, y: 2 }
     takes_point(p)
     return p.x
-""")
+""" + drop_impl("Point"))
         # Point is not Copy, so p is moved, then used - should error
         assert len(errors) == 1
         assert "use of moved value" in str(errors[0])
@@ -72,7 +85,7 @@ fn main() -> i32
     var a: Data = Data { value: 100 }
     var b: Data = a
     return a.value
-""")
+""" + drop_impl("Data"))
         # a is moved to b, then a.value is accessed - should error
         assert len(errors) == 1
         assert "use of moved value" in str(errors[0])
@@ -91,7 +104,7 @@ fn main() -> i32
     consume(b)
     consume(b)
     return 0
-""")
+""" + drop_impl("Box"))
         # b is moved first time, second call is use-after-move
         assert len(errors) == 1
         assert "use of moved value" in str(errors[0])
@@ -195,7 +208,7 @@ fn main() -> i32
     consume(d)
     let r: @Data = @d
     return 0
-""")
+""" + drop_impl("Data"))
         # d is moved, then borrowed - should error
         assert len(errors) == 1
         assert "cannot borrow" in str(errors[0])
@@ -233,6 +246,25 @@ fn process(d: Data) -> i32
         # Passing it to another const-borrow parameter does not move ownership.
         assert len(errors) == 0
 
+    def test_owned_param_moved_on_then_use(self):
+        """A by-value `d: Data` param of a move-only type owns its value
+        (§13.2), so passing it on moves it (AGAST #2157). It used to be
+        exempt as a 'const borrow', and the callee then dropped a value it
+        had already given away."""
+        errors = check("""
+struct Data
+    x: i32
+
+fn consume(d: Data) -> i32
+    return d.x
+
+fn process(d: Data) -> i32
+    consume(d)
+    return d.x
+""" + drop_impl("Data"))
+        assert len(errors) == 1
+        assert "use of moved value: `d`" in str(errors[0])
+
     def test_param_explicit_move_then_use(self):
         """Explicit move param then use should error."""
         errors = check("""
@@ -245,7 +277,7 @@ fn consume(d:= Data) -> i32
 fn process(d:= Data) -> i32
     consume(d)
     return d.x
-""")
+""" + drop_impl("Data"))
         # d is explicitly moved to consume, then d.x accessed - error
         assert len(errors) == 1
         assert "use of moved value" in str(errors[0])
@@ -430,8 +462,8 @@ fn main() -> i32
 """)
         assert errors == []
 
-    def test_non_copy_struct_still_moves(self):
-        """Guard: the fix must not make every struct Copy."""
+    def test_drop_struct_still_moves(self):
+        """Guard: a Drop struct moves (§13.1)."""
         errors = check(self.SV + """
 struct Owned
     p: *u8
@@ -445,6 +477,119 @@ fn main() -> i32
     takes_owned(o)
     takes_owned(o)
     return 0
-""")
+""" + drop_impl("Owned"))
         assert len(errors) == 1
         assert "moved" in str(errors[0])
+
+
+class TestMoveOnlyFromDrop:
+    """§13.1 (AGAST #2157): move-only iff Drop, or a field / enum payload /
+    generic argument that is move-only; everything else copies. Replaced a
+    hard-coded COPY_TYPES list, under which every struct moved (#1489 Span,
+    #1548 Option<i64>)."""
+
+    TWICE = """
+fn take(x: {ty}) -> i32
+    return 0
+
+fn main() -> i32
+    var v: {ty} = {init}
+    take(v)
+    take(v)
+    return 0
+"""
+
+    DEFS = """
+struct Plain
+    x: i32
+
+struct Res
+    h: i32
+
+struct Holder
+    r: Res
+
+struct Wrap<T>
+    inner: T
+
+enum Opt<T>
+    Nothing
+    Just(T)
+
+enum ResEnum
+    Empty
+    Has(Res)
+""" + drop_impl("Res")
+
+    def _errs(self, ty, init):
+        return check(self.DEFS + self.TWICE.format(ty=ty, init=init))
+
+    @pytest.mark.parametrize("ty,init", [
+        ("Plain", "Plain { x: 1 }"),
+        ("Wrap<i32>", "Wrap<i32> { inner: 1 }"),
+        ("Opt<i64>", "Nothing"),
+        ("[4]i32", "[1, 2, 3, 4]"),
+        ("*Res", "null"),
+    ])
+    def test_copies(self, ty, init):
+        assert self._errs(ty, init) == []
+
+    @pytest.mark.parametrize("ty,init", [
+        ("Res", "Res { h: 1 }"),
+        ("Holder", "Holder { r: Res { h: 1 } }"),
+        ("Wrap<Res>", "Wrap<Res> { inner: Res { h: 1 } }"),
+        ("Opt<Res>", "Nothing"),
+        ("ResEnum", "Empty"),
+        ("[2]Res", "[Res { h: 1 }, Res { h: 2 }]"),
+    ])
+    def test_moves(self, ty, init):
+        errs = self._errs(ty, init)
+        assert len(errs) == 1 and "use of moved value: `v`" in str(errs[0]), errs
+
+    def test_lent_to_ref_param_is_not_a_move(self):
+        """Auto-borrow into `@T` (#1290) lends; the caller still owns."""
+        errs = check(self.DEFS + """
+fn peek(r: @Res) -> i32
+    return r.h
+
+fn main() -> i32
+    var r = Res { h: 1 }
+    peek(r)
+    peek(r)
+    return r.h
+""")
+        assert errs == []
+
+    def test_assign_to_moved_binding_is_not_a_use(self):
+        errs = check(self.DEFS + """
+fn take(r: Res) -> i32
+    return 0
+
+fn main() -> i32
+    var r = Res { h: 1 }
+    take(r)
+    r = Res { h: 2 }
+    return r.h
+""")
+        assert errs == []
+
+    def test_moves_are_marked_for_the_emitter(self):
+        """The emitter clears a drop flag at each Ident marked moves_binding."""
+        from parser import parse as _parse
+        module = _parse(self.DEFS + """
+fn take(r: Res) -> i32
+    return 0
+
+fn main() -> i32
+    var r = Res { h: 1 }
+    let n = r.h
+    take(r)
+    return n
+""")
+        assert MoveChecker().check(module) == []
+        main = next(i for i in module.items
+                    if getattr(i, 'name', None) == 'main')
+        call = main.body.stmts[2].expr
+        assert getattr(call.args[0], 'moves_binding', False) is True
+        n_init = main.body.stmts[1].value
+        assert not getattr(n_init.expr, 'moves_binding', False)

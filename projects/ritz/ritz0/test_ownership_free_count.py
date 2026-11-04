@@ -11,11 +11,9 @@ Every program below uses one instrumented `Drop` type, `Tracked`, whose
 (`ORDER`). The program's exit status encodes the counts it observed. The
 expected statuses come from the spec, not from what a compiler does today.
 
-Today's gaps are strict xfails, so the room that closes one has to flip it:
-  * ritz0: AGAST #2157 (block-scope drops, `let` drops, reassignment, the
-    double drop of an argument moved into a callee, field drop glue, and
-    "plain structs copy");
-  * ritz1 / ritz1_selfhosted: none since AGAST #2158 (ritz1/src/ownership.ritz).
+Every gap these programs once exposed is closed: ritz0's by AGAST #2157,
+ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). A new
+gap goes in as a strict xfail, so the room that closes it has to flip it.
 """
 
 import os
@@ -79,7 +77,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz0": 2157}),
+""", 1, {}),
 
     "scope_end_var": ("""\
 fn f()
@@ -100,7 +98,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 11, {"ritz0": 2157}),
+""", 11, {}),
 
     # Once per call, on either path.
     "early_return": ("""\
@@ -129,7 +127,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 3, {"ritz0": 2157}),
+""", 3, {}),
 
     # Four iterations, two of which leave by `continue`.
     "continue": ("""\
@@ -144,7 +142,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 4, {"ritz0": 2157}),
+""", 4, {}),
 
     # The old value is dropped by the assignment, the new one at scope end.
     "reassignment": ("""\
@@ -156,7 +154,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 12, {"ritz0": 2157}),
+""", 12, {}),
 
     # consume() owns and drops it; f must not drop it again (ritz0: 12).
     "move_into_callee": ("""\
@@ -168,7 +166,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 11, {"ritz0": 2157}),
+""", 11, {}),
 
     # build() moves t out: not dropped there, dropped once by f's scope.
     "move_out_by_return": ("""\
@@ -199,7 +197,7 @@ fn f() -> i32
 pub fn main() -> i32
     let n = f()
     return n + DROPS
-""", 16, {"ritz0": 2157}),
+""", 16, {}),
 
     # Reverse declaration order: 3, 2, 1.
     "drop_order": ("""\
@@ -221,7 +219,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER
-""", 4, {"ritz0": 2157}),
+""", 4, {}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
