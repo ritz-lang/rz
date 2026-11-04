@@ -1198,6 +1198,20 @@ pub fn find_const_entry(s: *EmitterState, name: *u8, len: i32) -> *ConstEntry
         cur = cur.next
     return null
 
+# AGAST #2155: TYPE_F32 / TYPE_F64 when `ce` is a float const whose
+# initializer is a constant integer expression (`const F: f64 = -1`,
+# `= 2 + K`), with the folded integer in *out; 0 otherwise.  The use site
+# must `sitofp` that integer to the const's type: it used to materialise it
+# as `add i64 0, <v>` and hand the i64 to float code, which clang rejected.
+# Folded here, not read from `ce.value`: a float const is never PENDING, so
+# one naming a later integer const was not folded at parse time.
+pub fn const_int_init_float_ty(s: *EmitterState, ce: *ConstEntry, out: *i64) -> i32
+    if ce == null or (ce.const_type != TYPE_F32 and ce.const_type != TYPE_F64)
+        return 0
+    if const_fold_int(s.module.constants, ce.value_expr, 1, out) == 0
+        return 0
+    ce.const_type
+
 fn is_const(s: *EmitterState, name: *u8, len: i32) -> i32
     # Check module constants first via HashMap
     if find_const_entry(s, name, len) != null
@@ -4096,6 +4110,11 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         let glob: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
         if glob != null
             return glob.var_type
+        # AGAST #2155: `const F: f64 = -1` is a double, not the i64 it folded to.
+        var folded: i64 = 0
+        let cft: i32 = const_int_init_float_ty(s, find_const_entry(s, e.ident_ptr, e.ident_len), @folded)
+        if cft != 0
+            return cft
         return TYPE_I64
     else if e.kind == EXPR_INDEX
         # Indexing: result type depends on base type.

@@ -272,17 +272,51 @@ pub fn main() -> i32
         return 3
     return 1
 """,
-}
-
-# Run through ritz0 only, for a ritz1 gap of its own:
-# * float_from_negative_int: ritz1 emits invalid IR (AGAST #2155). It went
-#   through ritz0's old `-literal` path and must still compile.
-RITZ0_ONLY_FORMS = {
+    # A float const with an integer initializer converts the folded integer
+    # to the const's float type (AGAST #2155): ritz1 materialised it as an
+    # i64 and used that as a double, which clang rejected.
     "float_from_negative_int": """\
 const F: f64 = -1
 
 pub fn main() -> i32
     if F < 0.0
+        return 3
+    return 1
+""",
+    "float_from_positive_int": """\
+const F: f64 = 3
+
+pub fn main() -> i32
+    if F == 3.0
+        return 3
+    return 1
+""",
+    "float_from_folded_int": """\
+const F: f64 = 2 + 5
+
+pub fn main() -> i32
+    if F == 7.0
+        return 3
+    return 1
+""",
+    # Names a later integer const, so it folds only at emit time; the
+    # inferred local takes the const's float type.
+    "float_from_later_int_const": """\
+const F: f64 = K - 4
+
+const K: i32 = 2
+
+pub fn main() -> i32
+    let x = F
+    if x == -2.0 and (x as i32) == -2
+        return 3
+    return 1
+""",
+    "f32_from_negative_int": """\
+const F: f32 = -2
+
+pub fn main() -> i32
+    if F < 0.0 and (F as i32) == -2
         return 3
     return 1
 """,
@@ -387,14 +421,6 @@ def test_compound_const_value(request, tmp_path, compiler, name):
     src = tmp_path / "main.ritz"
     src.write_text(FORMS[name])
     assert _build_and_run(compiler, tmp_path, src) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY_FORMS))
-def test_ritz0_compound_const_value(tmp_path, name):
-    src = tmp_path / "main.ritz"
-    src.write_text(RITZ0_ONLY_FORMS[name])
-    assert _build_and_run("ritz0", tmp_path, src) == 3
 
 
 @pytest.mark.integration
