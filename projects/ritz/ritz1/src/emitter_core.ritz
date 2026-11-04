@@ -1740,8 +1740,7 @@ fn variant_payload_size_align(s: *EmitterState, fields: *StructField, align: *i6
         var falign: i64 = 8
         var fsize: i64 = 8
         if f.field_type == TYPE_ARRAY
-            fsize = elem_size_align(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, @falign)
-            fsize = fsize * (f.array_size as i64)
+            fsize = field_array_size_align(s, f, @falign)
         else
             fsize = elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
         if falign < 1
@@ -2990,8 +2989,7 @@ fn get_struct_size_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
         var fsize: i64 = 8
         if f.field_type == TYPE_ARRAY
             # Array: size = elem_size * count, align = elem_align
-            fsize = elem_size_align(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, @falign)
-            fsize = fsize * (f.array_size as i64)
+            fsize = field_array_size_align(s, f, @falign)
         else
             fsize = elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
 
@@ -3061,6 +3059,22 @@ fn prim_name_size(name: *u8, len: i32) -> i64
 # and f32 were sized 8 and nested structs aligned to 8, so sizeof disagreed
 # with the `%T = type` body LLVM lays out. Kinds with no recorded size
 # (enums, refs, unresolved names) keep the historical 8/8.
+# Size (and, in *align, alignment) of a TYPE_ARRAY field `f`.  AGAST #2097:
+# an N-D field `m: [N][M]T` is N*M*sizeof(T), aligned as T, matching the
+# `[N x [M x T]]` emit_field_llvm_type declares; the 1-D formula would size
+# the TYPE_ARRAY element as one i64.
+fn field_array_size_align(s: *EmitterState, f: *StructField, align: *i64) -> i64
+    let sh: *ArrayShape = f.array_shape
+    if sh == null
+        let es: i64 = elem_size_align(s, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, align)
+        return es * (f.array_size as i64)
+    var n: i64 = 1
+    var d: i32 = 0
+    while d < sh.rank
+        n = n * (sh.dims[d] as i64)
+        d = d + 1
+    return n * elem_size_align(s, sh.leaf_type, sh.leaf_name, sh.leaf_name_len, align)
+
 fn elem_size_align(s: *EmitterState, t: i32, name: *u8, name_len: i32, align: *i64) -> i64
     if t == TYPE_STRUCT and name_len > 0
         *align = get_struct_align_by_name(s, name, name_len)
@@ -4163,6 +4177,9 @@ fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
         # tokens) — route through emit_llvm_type_struct for consistent
         # mapping (f32 -> float, u16 -> i16, etc.).
         emit_llvm_type_struct(s, TYPE_STRUCT, f.field_type_name, f.field_type_name_len)
+    else if f.field_type == TYPE_ARRAY and f.array_shape != null
+        # AGAST #2097: `m: [2][3]i32` is `[2 x [3 x i32]]`, ritz0's ABI.
+        emit_array_shape_llvm(s, f.array_shape, 0)
     else if f.field_type == TYPE_ARRAY
         # Emit array type: [N x elem_type]
         emit_str(s, c"[")

@@ -553,7 +553,7 @@ fn nd_index_shape(s: *EmitterState, e: *Expr, out_depth: *i32) -> *ArrayShape
     while base.kind == EXPR_INDEX
         depth = depth + 1
         base = base.left
-    let sh: *ArrayShape = nd_array_ident_shape(s, base)
+    let sh: *ArrayShape = nd_array_base_shape(s, base)
     if sh == null or depth > sh.rank
         return null
     *out_depth = depth
@@ -579,6 +579,25 @@ fn nd_array_ident_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
         return null
     return nd_array_name_shape(s, e.ident_ptr, e.ident_len)
 
+# AGAST #2097: the ArrayShape of an N-D struct field named by the member
+# chain `e` (`s.m`, `p.m`, `a.b.m`, local or global), or null.  Type-only:
+# emits nothing (resolve_member_chain_field mirrors emit_member_ptr).
+fn nd_array_member_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    if e == null or e.kind != EXPR_MEMBER
+        return null
+    let f: *StructField = resolve_member_chain_field(s, e)
+    if f == null or f.field_type != TYPE_ARRAY
+        return null
+    return f.array_shape
+
+# The N-D array an index chain's base names: a local / global, or a field.
+fn nd_array_base_shape(s: *EmitterState, base: *Expr) -> *ArrayShape
+    if base == null
+        return null
+    if base.kind == EXPR_MEMBER
+        return nd_array_member_shape(s, base)
+    return nd_array_ident_shape(s, base)
+
 # Emit the GEP for an N-D index chain `e` into *out.  Returns 0 (emitting
 # nothing) when nd_index_shape does not recognise `e`.  The indices are
 # evaluated in source order, outermost dimension first.
@@ -590,6 +609,17 @@ fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
     var base: *Expr = e
     while base.kind == EXPR_INDEX
         base = base.left
+    # AGAST #2097: a field base `s.m` / `p.m` / `a.b.m` is addressed before
+    # the indices are evaluated, as ritz0 does.
+    var base_reg: i32 = 0
+    if base.kind == EXPR_MEMBER
+        var mp: MemberPtrResult
+        emit_member_ptr(s, base, @mp)
+        # Reported, then emitted anyway (over %.0) so callers do not fall
+        # through to a 1-D path and report again; the error fails the build.
+        if mp.success != 1
+            emit_nd_error(s, e.span.line, e.span.col, c"cannot address the multi-dimensional array field this index chain starts from in ritz1")
+        base_reg = mp.reg
     var regs: [8]i32
     var j: i32 = 0
     while j < depth
@@ -607,12 +637,15 @@ fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
     emit_str(s, c" = getelementptr ")
     emit_array_shape_llvm(s, sh, 0)
     emit_str(s, c", ptr ")
-    let lv: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
-    if lv != null
-        emit_reg(s, lv.reg)
+    if base.kind == EXPR_MEMBER
+        emit_reg(s, base_reg)
     else
-        emit_str(s, c"@")
-        emit_name(s, base.ident_ptr, base.ident_len)
+        let lv: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+        if lv != null
+            emit_reg(s, lv.reg)
+        else
+            emit_str(s, c"@")
+            emit_name(s, base.ident_ptr, base.ident_len)
     emit_str(s, c", i64 0")
     j = 0
     while j < depth

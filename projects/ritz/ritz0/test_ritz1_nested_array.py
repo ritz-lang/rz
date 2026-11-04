@@ -237,6 +237,195 @@ pub fn main() -> i32
     let r: *i32 = @lp[k + 1].y
     return *q + *r
 """,
+    # AGAST #2097: an N-D array struct field `m: [2][3]i32`.  Every index is
+    # written with a distinct value and read back; the neighbouring scalar
+    # fields catch a field laid out too small (overrun) or at the wrong
+    # offset.  sum(r*3+c+1 for 2x3) = 21; 21 + tag 1 + tail 20 = 42.
+    "struct_field": """\
+struct M
+    tag: i32
+    m: [2][3]i32
+    tail: i64
+
+pub fn main() -> i32
+    var s: M
+    s.tag = 1
+    s.tail = 20
+    for r in 0..2
+        for c in 0..3
+            s.m[r][c] = r * 3 + c + 1
+    var sum: i32 = 0
+    for r in 0..2
+        for c in 0..3
+            if s.m[r][c] != r * 3 + c + 1
+                return 1
+            sum = sum + s.m[r][c]
+    if s.tag != 1 or s.tail != 20
+        return 2
+    if sizeof(M) != 40
+        return 3
+    let p: *i32 = @s.m[1][0]
+    if *p != 4 or *(p - 1) != 3 or *(p + 2) != 6
+        return 4
+    return sum + s.tag + (s.tail as i32)
+""",
+    # The same through a `type Grid = [4][4]u8` alias, a u8 leaf.
+    # sum((r*4+c) for 4x4) = 120; 120 - 78 = 42.
+    "alias_in_field": """\
+type Grid = [4][4]u8
+
+struct B
+    pre: u8
+    g: Grid
+    post: u8
+
+pub fn main() -> i32
+    var b: B
+    b.pre = 7
+    b.post = 9
+    for r in 0..4
+        for c in 0..4
+            b.g[r][c] = (r * 4 + c) as u8
+    var sum: i32 = 0
+    for r in 0..4
+        for c in 0..4
+            if b.g[r][c] as i32 != r * 4 + c
+                return 1
+            sum = sum + (b.g[r][c] as i32)
+    # sizeof(B) is not checked: ritz0 says 24 through the alias (AGAST
+    # #2151); the IR layout { i8, [4 x [4 x i8]], i8 } is 18.
+    if b.pre != 7 or b.post != 9
+        return 2
+    let row: *u8 = @b.g[2][0]
+    if *(row + 3) != 11 or *(row + 4) != 12
+        return 3
+    return sum - 78
+""",
+    # Pointer-to-struct base `p.m[i][j]` (param and local), stores through
+    # one pointer read back through the value and vice versa.
+    "ptr_base": """\
+struct M
+    tag: i32
+    m: [3][2]i64
+
+fn put(p: *M, i: i32, j: i32, v: i64)
+    p.m[i][j] = v
+
+fn get(p: *M, i: i32, j: i32) -> i64
+    return p.m[i][j]
+
+pub fn main() -> i32
+    var s: M
+    s.tag = 5
+    for r in 0..3
+        for c in 0..2
+            put(@s, r, c, (r * 2 + c) as i64)
+    let q: *M = @s
+    q.m[2][1] = 30
+    if s.m[2][1] != 30 or get(@s, 2, 0) != 4 or q.m[0][1] != 1
+        return 1
+    let e: *i64 = @q.m[1][1]
+    *e = 7
+    if s.m[1][1] != 7 or s.tag != 5
+        return 2
+    return (get(@s, 2, 1) + s.m[1][1] + q.m[0][1]) as i32 + s.tag - 1
+""",
+    # Nested member base `a.b.m[i][j]`, local and global, plus compound
+    # assignment and a 3-D field.
+    "nested_member_base": """\
+struct In
+    x: i32
+    m: [2][2]i32
+    t: [2][2][2]u16
+
+struct Out
+    h: i64
+    b: In
+
+var go: Out
+
+pub fn main() -> i32
+    var a: Out
+    a.h = 1
+    a.b.x = 2
+    for i in 0..2
+        for j in 0..2
+            a.b.m[i][j] = i * 2 + j
+            go.b.m[i][j] = 10 + i * 2 + j
+            for k in 0..2
+                a.b.t[i][j][k] = (i * 4 + j * 2 + k) as u16
+    a.b.m[1][1] += 10
+    if a.b.m[1][1] != 13 or a.b.m[1][0] != 2 or a.b.m[0][1] != 1
+        return 1
+    if go.b.m[1][0] != 12 or go.b.m[0][0] != 10
+        return 2
+    if a.b.t[1][0][1] != 5 or a.b.t[0][1][1] != 3 or a.b.t[1][1][1] != 7
+        return 3
+    let gp: *i32 = @go.b.m[0][1]
+    if *(gp + 2) != 13
+        return 4
+    return a.b.m[1][1] + go.b.m[1][1] + (a.h as i32) + a.b.x + (a.b.t[1][1][0] as i32) + 7
+""",
+    # sizeof over an N-D field, its row, and a struct holding one by value
+    # (copied, and passed by value).  24 + 12 + 6 = 42.
+    "field_sizeof_and_copy": """\
+struct M
+    t: i32
+    m: [2][3]i32
+
+fn f(x: M) -> i32
+    return x.m[1][2] + x.t
+
+pub fn main() -> i32
+    var s: M
+    s.t = 2
+    s.m[1][2] = 40
+    var c: M = s
+    if f(c) != 42 or sizeof(M) != 28
+        return 1
+    return (sizeof(s.m) + sizeof(s.m[0]) + 6) as i32
+""",
+    # A generic struct with an N-D field: every specialisation keeps the
+    # field's shape (monomorph clones it).
+    "generic_struct_field": """\
+struct Box<T>
+    v: T
+    m: [2][3]u8
+
+pub fn main() -> i32
+    var b: Box<i64>
+    b.v = 30
+    for i in 0..2
+        for j in 0..3
+            b.m[i][j] = (i * 3 + j) as u8
+    if b.m[0][2] != 2 or b.m[1][0] != 3
+        return 1
+    return (b.v as i32) + (b.m[1][2] as i32) + 7
+""",
+    # A struct leaf in a field: `s.m[i][j].f`.  H is declared before P, so
+    # %P must be emitted first (the field holds P by value).
+    "struct_leaf_in_field": """\
+struct H
+    k: i32
+    m: [2][2]P
+
+struct P
+    x: i32
+    y: i64
+
+pub fn main() -> i32
+    var h: H
+    h.k = 2
+    for i in 0..2
+        for j in 0..2
+            h.m[i][j].x = i * 2 + j
+            h.m[i][j].y = 10
+    h.m[1][1].y = 30
+    let px: *i32 = @h.m[1][0].x
+    if *px != 2 or h.m[0][1].x != 1 or h.m[1][0].y != 10
+        return 1
+    return h.m[1][1].x + (h.m[1][1].y as i32) + h.k + 7
+""",
 }
 
 
@@ -291,16 +480,6 @@ def test_ritz1_nested_array(ritz1_bin, tmp_path, name):
 # error naming the source line, never a silent `[N x i64]` (AGAST #1509).
 # `needle` is the `:line:` the error must name.
 FAIL_CLOSED = {
-    "struct_field": ("""\
-struct M
-    tag: i32
-    m: [2][3]i32
-
-pub fn main() -> i32
-    var s: M
-    s.tag = 1
-    return s.tag
-""", ":3:", "multi-dimensional array type is not supported as a struct field"),
     "param": ("""\
 fn f(a: [2][3]i32) -> i32
     return 0
@@ -313,15 +492,56 @@ pub fn main() -> i32
     var p: *[2][3]i32 = null
     return 0
 """, ":2:", "multi-dimensional array type is not supported as a pointee"),
-    "alias_in_field": ("""\
-type Grid = [4][4]u8
+    # AGAST #2097: field_new keeps an N-D shape now, but an enum payload
+    # binding has no N-D lowering (`A(g) => g[1][2]` loaded the payload as
+    # an i64 and indexed it as a byte pointer), so both payload forms stay
+    # located errors.
+    "enum_tuple_payload": ("""\
+enum E
+    A([2][3]u8)
+    B(i32)
 
-struct B
-    g: Grid
+fn get(e: E) -> i32
+    match e
+        A(g) => return g[1][2] as i32
+        B(x) => return x
+    return 0
 
 pub fn main() -> i32
+    return get(E.B(42))
+""", ":2:", "multi-dimensional array type is not supported as an enum variant payload"),
+    "enum_struct_payload": ("""\
+enum E
+    A
+        g: [2][3]u8
+    B(i32)
+
+pub fn main() -> i32
+    let e: E = E.B(1)
     return 0
-""", ":4:", "multi-dimensional array type is not supported as a struct field"),
+""", ":2:", "multi-dimensional array type is not supported as an enum variant payload"),
+    # AGAST #2097: a row of a struct field is no more a value than a row
+    # of a local.
+    "field_row_as_value": ("""\
+struct M
+    m: [2][3]i32
+
+fn take(p: i64) -> i32
+    return 0
+
+pub fn main() -> i32
+    var s: M
+    return take(s.m[1] as i64)
+""", ":9:", "a row or a struct element of a multi-dimensional array is not a value"),
+    "field_row_assign": ("""\
+struct M
+    m: [2][3]u8
+
+pub fn main() -> i32
+    var s: M
+    s.m[1] = 0
+    return 0
+""", ":6:", "assigning a row or a whole struct element"),
     # A nested array literal does not even parse in ritz1 (closed already).
     "nested_literal": ("""\
 pub fn main() -> i32
@@ -443,3 +663,33 @@ def test_ritz1_nested_array_layout(ritz1_bin, tmp_path, decl, llvm):
     ir = ll.read_text()
     assert f"@g = weak_odr global {llvm} zeroinitializer" in ir, ir
     assert f"alloca {llvm}" in ir, ir
+
+
+@pytest.mark.integration
+def test_ritz1_nested_array_field_layout(ritz1_bin, tmp_path):
+    """AGAST #2097: an N-D field is declared with ritz0's struct ABI."""
+    program = (
+        "type Grid = [4][4]u8\n\n"
+        "struct M\n    tag: i32\n    m: [2][3]i32\n    g: Grid\n\n"
+        "pub fn main() -> i32\n    var s: M\n    s.tag = 0\n    return s.tag\n"
+    )
+    comp, ll = _compile("ritz1", tmp_path, "field_layout", program)
+    assert comp.returncode == 0, comp.stderr[-2000:]
+    ir = ll.read_text()
+    assert "%M = type {i32, [2 x [3 x i32]], [4 x [4 x i8]]}" in ir, ir
+
+
+@pytest.mark.integration
+def test_ritz1_nested_array_field_struct_leaf_order(ritz1_bin, tmp_path):
+    """AGAST #2097: a `[N][M]P` field holds P by value, so %P is emitted
+    before its holder, as for a 1-D `[N]P` field (struct_deps_satisfied)."""
+    program = (
+        "struct H\n    k: i32\n    m: [2][2]P\n\n"
+        "struct P\n    x: i32\n    y: i64\n\n"
+        "pub fn main() -> i32\n    var h: H\n    h.k = 0\n    return h.k\n"
+    )
+    comp, ll = _compile("ritz1", tmp_path, "leaf_order", program)
+    assert comp.returncode == 0, comp.stderr[-2000:]
+    ir = ll.read_text()
+    assert "%H = type {i32, [2 x [2 x %P]]}" in ir, ir
+    assert ir.index("%P = type") < ir.index("%H = type"), ir

@@ -1170,8 +1170,12 @@ pub fn struct_def_new(p: *Parser, name: *u8, len: i32, fields: *StructField, lin
     return s
 
 pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *StructField
-    nd_array_reject(p, ty, line, col, c"a struct field")  # AGAST #1509
     let f: *StructField = parser_alloc(p, sizeof(StructField)) as *StructField
+    # AGAST #2097: an N-D field keeps its shape (it was a located error
+    # under #1509, and a silent `[N x i64]` before that).
+    f.array_shape = null
+    if is_nd_array_type(p, ty) == 1
+        f.array_shape = p.last_array_shape
     f.name = name as *u8
     # AGAST #1924: `rows: **i32` -> `*(*(s.rows + i) + k)` loads an i32.
     f.inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
@@ -1784,8 +1788,8 @@ var g_nd_reject_line: i32 = -1
 var g_nd_reject_col: i32 = -1
 
 # AGAST #1509: fail closed where ritz1 cannot lower a multi-dimensional
-# array type.  Only local and global `var` declarations carry an ArrayShape;
-# a struct field, parameter, return type, const or pointee of type
+# array type.  Only local and global `var` declarations and (AGAST #2097)
+# struct fields carry an ArrayShape; an enum payload, parameter, return type, const or pointee of type
 # `[N][M]T` used to be laid out as `[N x i64]` and miscompiled silently.
 # `what` names the site ("a struct field", ...).  Reported once per source
 # position (the grammar can re-run an action while backtracking); the
@@ -1794,6 +1798,10 @@ var g_nd_reject_col: i32 = -1
 pub fn nd_array_reject(p: *Parser, ty: i32, line: i32, col: i32, what: *u8) -> i32
     if is_nd_array_type(p, ty) == 0
         return 0
+    return nd_array_report(line, col, what)
+
+# The diagnostic itself, for sites that already know the type is N-D.
+fn nd_array_report(line: i32, col: i32, what: *u8) -> i32
     if line == g_nd_reject_line and col == g_nd_reject_col
         return 1
     g_nd_reject_line = line
@@ -1810,7 +1818,7 @@ pub fn nd_array_reject(p: *Parser, ty: i32, line: i32, col: i32, what: *u8) -> i
     eprint_i64(col as i64)
     eprints_cstr(c": a multi-dimensional array type is not supported as ")
     eprints_cstr(what)
-    eprintln_cstr(c" in ritz1 (only a local or global `var` can be one)")
+    eprintln_cstr(c" in ritz1 (only a local or global `var` or a struct field can be one)")
     return 1
 
 # The line / col of the token at p.pos (0 / 0 past the end), for sites whose
@@ -4066,10 +4074,24 @@ pub fn enum_variant_record(p: *Parser, name: *u8, len: i32, line: i32, col: i32)
 pub fn enum_variant_record_tuple(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> i32
     let f: *StructField = field_new(p, name, len, ty, 0, 0)
     f.next = null
+    nd_payload_reject(f, line, col)
     return enum_variant_record_impl(p, name, len, ENUM_VARIANT_TUPLE, f, 0, 0, 0, line, col)
+
+# AGAST #2097: field_new now keeps an N-D field's shape, but an enum
+# payload binding (`A(g) => g[i][j]`) has no N-D lowering: it was bound as
+# one i64 and indexed as a byte pointer.  Keep #1509's located error there
+# (ritz0 cannot index such a binding either).
+fn nd_payload_reject(fields: *StructField, line: i32, col: i32)
+    var f: *StructField = fields
+    while f != null
+        if f.array_shape != null
+            nd_array_report(line, col, c"an enum variant payload")
+            return
+        f = f.next
 
 # `Name` + an indented field block (AGAST #1797): the fields are the payload.
 pub fn enum_variant_record_struct(p: *Parser, name: *u8, len: i32, fields: *StructField, line: i32, col: i32) -> i32
+    nd_payload_reject(fields, line, col)
     return enum_variant_record_impl(p, name, len, ENUM_VARIANT_STRUCT, fields, 0, 0, 0, line, col)
 
 # `Name = N` / `Name = -N` (LANGUAGE_SPEC §10.4): a unit variant with an
