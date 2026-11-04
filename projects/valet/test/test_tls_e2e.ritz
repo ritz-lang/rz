@@ -143,6 +143,112 @@ fn test_e2e_handshake_and_data_both_ways() -> i32
     tls_server_free(@server)
     return 0
 
+# Drive a handshake up to the client's final flight, leaving it in `flight`.
+# Returns its length, or a negative step code.
+fn handshake_to_client_finished(client: *TlsClient, server: *TlsServer, flight: *u8) -> i64
+    var c_out: [4096]u8
+    var s_out: [16384]u8
+    var s_len: i64 = 0
+    var c_len: i64 = 0
+    let ch_len: i64 = tls_client_start(client, @c_out[0], 4096)
+    if ch_len <= 0
+        return -1
+    if tls_server_process(server, @c_out[0], ch_len, @s_out[0], 16384, @s_len) != TLS_RESULT_HAVE_OUTPUT
+        return -2
+    if tls_client_process(client, @s_out[0], s_len, flight, 4096, @c_len) != TLS_RESULT_HAVE_OUTPUT
+        return -3
+    return c_len
+
+# OpenSSL flushes its compatibility change_cipher_spec and its Finished in one
+# write, so one recv holds both. Skipping the CCS must go on to the Finished
+# already buffered: nothing else will arrive to wake the server (AGAST #2190).
+[[test]]
+fn test_e2e_ccs_and_finished_in_one_read() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+
+    var fin: [4096]u8
+    let fin_len: i64 = handshake_to_client_finished(@client, @server, @fin[0])
+    if fin_len <= 0
+        return 3
+
+    var both: [4200]u8
+    both[0] = 20  # change_cipher_spec
+    both[1] = 3
+    both[2] = 3
+    both[3] = 0
+    both[4] = 1
+    both[5] = 1
+    mem_copy(@both[6], @fin[0], fin_len as u64)
+
+    var s_out: [1024]u8
+    var s_len: i64 = 0
+    if tls_server_process(@server, @both[0], 6 + fin_len, @s_out[0], 1024, @s_len) != TLS_RESULT_COMPLETE
+        return 4
+    if tls_server_is_connected(@server) != 1
+        return 5
+
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+# A client may write its first request straight after its Finished, and one
+# recv can return both. The handshake must hand those bytes back rather than
+# strand them in recv_buf (AGAST #2190).
+[[test]]
+fn test_e2e_app_data_behind_finished_is_handed_back() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+
+    var both: [4200]u8
+    let fin_len: i64 = handshake_to_client_finished(@client, @server, @both[0])
+    if fin_len <= 0
+        return 3
+    let msg: *u8 = c"GET / HTTP/1.1\r\n\r\n"
+    let msg_len: i64 = cstr_len_e2e(msg)
+    let rec_len: i64 = tls_client_write(@client, msg, msg_len, @both[fin_len], 128)
+    if rec_len <= 0
+        return 4
+
+    var s_out: [1024]u8
+    var s_len: i64 = 0
+    if tls_server_process(@server, @both[0], fin_len + rec_len, @s_out[0], 1024, @s_len) != TLS_RESULT_COMPLETE
+        return 5
+
+    var pending: [1024]u8
+    if tls_server_take_buffered(@server, @pending[0], 1024) != rec_len
+        return 6
+    var got: [1024]u8
+    if tls_server_read(@server, @pending[0], rec_len, @got[0], 1024) != msg_len
+        return 7
+    if mem_eq(@got[0], msg, msg_len as u64) != 1
+        return 8
+    # Taken means gone: a second take must not replay the record.
+    if tls_server_take_buffered(@server, @pending[0], 1024) != 0
+        return 9
+
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
 # Ed25519 server key (AGAST #2111). openssl genpkey -algorithm ed25519 and a
 # self-signed CN=valet.test certificate for it (valid 2026-11-04 .. 2126).
 fn key_valet_ed25519() -> *u8

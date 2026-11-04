@@ -231,8 +231,8 @@ Shipped — these were listed as "next steps" here long after they landed:
 4. ~~**Compression**~~ ✅ `lib/compress.ritz` via squeeze
 5. ~~**Config file**~~ ✅ `lib/config.ritz`, `-c/--config`
 6. ~~**Reverse proxy**~~ ✅ `-z/--zeus-socket`
-7. ~~**TLS**~~ ✅ `lib/tls.ritz` + `lib/tls/` via cryptosec (end-to-end HTTPS not
-   measured here)
+7. ~~**TLS**~~ ✅ `lib/tls.ritz` + `lib/tls/` via cryptosec; `test/test_tls_socket.sh`
+   runs HTTPS against OpenSSL over a real socket in CI's `build-all` job
 
 Still open:
 

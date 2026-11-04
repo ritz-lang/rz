@@ -1432,6 +1432,7 @@ const TLS_CONN_STATE_HANDSHAKE: i32 = 1
 const TLS_CONN_STATE_RECV: i32 = 2
 const TLS_CONN_STATE_PARSE: i32 = 3
 const TLS_CONN_STATE_SEND: i32 = 4
+const TLS_CONN_STATE_HANDSHAKE_SEND: i32 = 5
 
 # Global TLS server instance per connection
 # We allocate these on the heap since TlsServer is large (~35KB with work buffers)
@@ -1488,12 +1489,31 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
         prints("[TLS] tls_server_init done\n")
         task.user_data = tls_data as *u8
         task.handler_state = TLS_CONN_STATE_HANDSHAKE
-        task.io_result = 0
+        # task.io_result stays TASK_IO_FRESH: the HANDSHAKE state below reads
+        # that sentinel as "submit the ClientHello recv" (AGAST #2190).
         prints("[TLS] TLS state allocated, starting handshake\n")
     else
         tls_data = task.user_data as *TlsTaskData
 
-    # State: HANDSHAKE - TLS negotiation
+    # State: HANDSHAKE_SEND - a handshake flight finished sending. io_result
+    # counts bytes sent, not received, so it must never reach the HANDSHAKE
+    # state below, which would read it as a recv length (AGAST #2190).
+    if task.handler_state == TLS_CONN_STATE_HANDSHAKE_SEND
+        # A short flight cannot be finished by the client, so don't wait on it.
+        if task.io_result != task.write_len
+            prints("[TLS] ERROR: handshake send failed\n")
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+        task.handler_state = TLS_CONN_STATE_HANDSHAKE
+        let ret = tls_task_recv(task, tls_data)
+        if ret < 0
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+        return -1
+
+    # State: HANDSHAKE - TLS negotiation. Every completion here is a recv.
     if task.handler_state == TLS_CONN_STATE_HANDSHAKE
         prints("[TLS] In HANDSHAKE state, io_result=")
         print_int(task.io_result as i64)
@@ -1502,7 +1522,7 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
         prints("\n")
 
         # Need to receive data?
-        if task.io_result == TASK_IO_FRESH && tls_server_state(@tls_data.tls) == TLS_SERVER_STATE_INIT
+        if task.io_result == TASK_IO_FRESH
             prints("[TLS] Submitting recv for ClientHello...\n")
             let ret = tls_task_recv(task, tls_data)
             if ret < 0
@@ -1511,6 +1531,13 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                 task.user_data = null
                 return 1
             return -1
+
+        # EOF (0) or error (<0): the client left mid-handshake. Resubmitting
+        # the recv here would complete at once, forever.
+        if task.io_result <= 0
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 0
 
         # Feed received data to TLS
         if task.io_result > 0
@@ -1543,6 +1570,7 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                     task.write_buf[i] = out[i]
                     i = i + 1
                 task.write_len = out_len as i32
+                task.handler_state = TLS_CONN_STATE_HANDSHAKE_SEND
                 let ret = tls_task_send(task, tls_data, out_len as i32)
                 if ret < 0
                     tls_task_data_free(tls_data)
@@ -1551,7 +1579,6 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                 return -1
 
             if result == TLS_RESULT_NEED_INPUT
-                task.io_result = 0
                 let ret = tls_task_recv(task, tls_data)
                 if ret < 0
                     tls_task_data_free(tls_data)
@@ -1561,23 +1588,17 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
 
             if result == TLS_RESULT_COMPLETE
                 task.handler_state = TLS_CONN_STATE_RECV
-                task.io_result = 0
-                let ret = tls_task_recv(task, tls_data)
-                if ret < 0
-                    tls_task_data_free(tls_data)
-                    task.user_data = null
-                    return 1
-                return -1
-
-        # After send completes, check if handshake needs more
-        if task.io_result >= 0 && tls_server_state(@tls_data.tls) == TLS_SERVER_STATE_FINISHED_SENT
-            task.io_result = 0
-            let ret = tls_task_recv(task, tls_data)
-            if ret < 0
-                tls_task_data_free(tls_data)
-                task.user_data = null
-                return 1
-            return -1
+                # The first request can share a read with the client's
+                # Finished: serve it now, as no later recv will return it.
+                let buffered: i64 = tls_server_take_buffered(@tls_data.tls, @task.read_buf[0], 8192)
+                if buffered == 0
+                    let ret = tls_task_recv(task, tls_data)
+                    if ret < 0
+                        tls_task_data_free(tls_data)
+                        task.user_data = null
+                        return 1
+                    return -1
+                task.io_result = buffered as i32
 
     # State: RECV - receive encrypted application data
     if task.handler_state == TLS_CONN_STATE_RECV
