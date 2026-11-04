@@ -19,7 +19,7 @@ Cryptosec is also used by Goliath (content-addressable filesystem) for SHA-256 c
 - HKDF key derivation (RFC 5869)
 - AES-128-GCM and AES-256-GCM (AEAD)
 - ChaCha20-Poly1305 (AEAD)
-- X25519 key exchange (Diffie-Hellman)
+- X25519 key exchange (Diffie-Hellman); P-256 ECDHE when a TLS server's HelloRetryRequest selects it
 - Ed25519 digital signatures
 - P-256/ECDSA (for TLS compatibility)
 - P-384/ECDSA verification (X.509 chains through P-384 CAs, TLS CertificateVerify)

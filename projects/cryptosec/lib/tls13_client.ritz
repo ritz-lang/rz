@@ -5,8 +5,8 @@
 #
 # Features:
 # - Full TLS 1.3 handshake (1-RTT). The middlebox-compat change_cipher_spec
-#   is dropped; a HelloRetryRequest fails with TLS_ERR_HELLO_RETRY_REQUEST.
-# - X25519 key exchange
+#   is dropped; a HelloRetryRequest is answered with a second ClientHello.
+# - X25519 key exchange; secp256r1 when a HelloRetryRequest asks for it
 # - AES-128-GCM and ChaCha20-Poly1305 cipher suites
 # - AES-128-GCM only (the record layer implements nothing else)
 # - Server authentication, fail closed. One trust anchor must be configured:
@@ -38,6 +38,7 @@ import hkdf
 import aes_gcm
 import chacha20_poly1305
 import x25519
+import p256
 import x509
 import x509_verify
 import ca_store
@@ -157,7 +158,7 @@ pub struct TlsClient
     client_hello: ClientHello
     server_hello: ServerHello
 
-    # Shared secret from X25519
+    # Shared secret from X25519 or secp256r1
     shared_secret: [32]u8
 
     # Selected cipher suite
@@ -191,6 +192,8 @@ pub struct TlsClient
     handshake_complete: i32
     encrypted_handshake: i32  # 1 after ServerHello, messages are encrypted
     ccs_received: i32         # 1 once the middlebox-compat CCS was dropped
+    hrr_received: i32         # 1 once a HelloRetryRequest was answered
+    hrr_cipher_suite: u16     # the suite it selected
 
 # ============================================================================
 # Client Lifecycle
@@ -235,6 +238,7 @@ pub fn tls_client_free(client: *TlsClient)
     mem_zero(@client.shared_secret[0], sizeof(client.shared_secret))
     mem_zero(@client.key_schedule as *u8, sizeof(TLS13KeySchedule))
     mem_zero(@client.client_hello.x25519_private[0], sizeof(client.client_hello.x25519_private))
+    mem_zero(@client.client_hello.p256_private[0], sizeof(client.client_hello.p256_private))
 
 # ============================================================================
 # Start Handshake - Generate ClientHello
@@ -247,14 +251,21 @@ pub fn tls_client_start(client: *TlsClient, out: *u8, out_cap: i64) -> i64
         client.last_error = TLS_ERR_INVALID_STATE
         return -1
 
+    let len: i64 = client_write_hello(client, out, out_cap)
+    if len < 0
+        return -1
+
+    client.state = TLS_STATE_CLIENT_HELLO_SENT
+    return len
+
+# Serialize client_hello into a record in `out` and add it to the transcript.
+# Returns the record's length, or -1 with last_error set.
+fn client_write_hello(client: *TlsClient, out: *u8, out_cap: i64) -> i64
     # Serialize ClientHello
     let ch_len: i64 = client_hello_serialize(@client.client_hello, @client.send_buf[0], 4096)
     if ch_len < 0
         client.last_error = TLS_ERR_PARSE_ERROR
         return -1
-
-    # Update transcript with ClientHello
-    transcript_update(@client.transcript, @client.send_buf[0], ch_len)
 
     # Wrap in TLS record header
     # ContentType (1) + Version (2) + Length (2) + data
@@ -262,14 +273,20 @@ pub fn tls_client_start(client: *TlsClient, out: *u8, out_cap: i64) -> i64
         client.last_error = TLS_ERR_BUFFER_TOO_SMALL
         return -1
 
+    # Update transcript with ClientHello
+    transcript_update(@client.transcript, @client.send_buf[0], ch_len)
+
     out[0] = 22  # Handshake content type
     out[1] = 0x03
-    out[2] = 0x01  # Legacy version TLS 1.0
+    # Legacy version: TLS 1.0 is allowed for the initial ClientHello only
+    # (RFC 8446 5.1); one sent after a HelloRetryRequest must say TLS 1.2.
+    out[2] = 0x01
+    if client.hrr_received != 0
+        out[2] = 0x03
     out[3] = ((ch_len >> 8) & 0xff) as u8
     out[4] = (ch_len & 0xff) as u8
     mem_copy(out + 5, @client.send_buf[0], ch_len as u64)
 
-    client.state = TLS_STATE_CLIENT_HELLO_SENT
     return ch_len + 5
 
 # ============================================================================
@@ -304,6 +321,12 @@ pub fn tls_client_process(client: *TlsClient, data: *u8, data_len: i64, out: *u8
                 client.recv_len = client.recv_len + take
                 off = off + take
         let r: i32 = client_step(client, out, out_cap, out_len)
+        # Only a change_cipher_spec can follow a HelloRetryRequest until the
+        # server has our second ClientHello: more input than recv_buf took is
+        # not that, and returning output here would lose it.
+        if r == TLS_RESULT_HAVE_OUTPUT && client.state == TLS_STATE_CLIENT_HELLO_SENT && off < data_len
+            *out_len = 0
+            return client_fail(client, TLS_ERR_UNEXPECTED_MESSAGE)
         if r != TLS_RESULT_NEED_INPUT
             return r
         if off >= data_len
@@ -359,16 +382,18 @@ fn client_step(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i64) -> i32
 # ============================================================================
 
 # Drop the one unencrypted change_cipher_spec record (body 0x01) a server may
-# send between its ServerHello and its Finished. Anything else is
-# unexpected_message: a CCS before the ServerHello, a second one, any other
-# length or body, or one that splits a handshake message across records
-# (handshake messages must not be interleaved with other record types, 5.1).
+# send after its first hello, ServerHello or HelloRetryRequest (D.4), and
+# before its Finished. Anything else is unexpected_message: a CCS before that
+# first hello, a second one, any other length or body, or one that splits a
+# handshake message across records (handshake messages must not be
+# interleaved with other record types, 5.1).
 # recv_buf holds the whole record (client_record_ready).
 fn process_change_cipher_spec(client: *TlsClient) -> i32
     let record_len: i64 = ((client.recv_buf[3] as i64) << 8) | (client.recv_buf[4] as i64)
     var ok: i32 = 1
     if client.state < TLS_STATE_SERVER_HELLO_RECEIVED || client.state > TLS_STATE_CERTIFICATE_VERIFY_RECEIVED
-        ok = 0
+        if client.state != TLS_STATE_CLIENT_HELLO_SENT || client.hrr_received == 0
+            ok = 0
     if client.ccs_received != 0 || client.hs_len != 0
         ok = 0
     if record_len != 1 || client.recv_buf[5] != 0x01
@@ -416,13 +441,9 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
 
-    # A HelloRetryRequest wants another key share or a cookie. We offer only
-    # X25519 and do not retry: fail with a distinct error rather than parse
-    # it as a ServerHello.
+    # A HelloRetryRequest wants another key share or a cookie, not keys.
     if server_hello_is_retry_request(@client.recv_buf[9], hdr.length) == 1
-        client.last_error = TLS_ERR_HELLO_RETRY_REQUEST
-        client.state = TLS_STATE_ERROR
-        return TLS_RESULT_ERROR
+        return process_hello_retry_request(client, hdr.length, record_len, out, out_cap, out_len)
 
     # Parse ServerHello
     let sh_result: i32 = server_hello_parse(@client.recv_buf[9], hdr.length, @client.server_hello)
@@ -443,6 +464,18 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
 
+    # Only a share for the group we offered can be answered. This also holds
+    # the second ServerHello to the group its HelloRetryRequest selected.
+    if client.server_hello.key_share_group != client.client_hello.key_share_group
+        return client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+
+    # The second ServerHello must match its HelloRetryRequest (RFC 8446 4.1.4).
+    if client.hrr_received != 0
+        if client.server_hello.cipher_suite != client.hrr_cipher_suite
+            return client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+        if client_session_id_echoed(client, @client.server_hello.session_id[0], client.server_hello.session_id_len) != 1
+            return client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+
     # The record layer only does AES-128-GCM; keys below are derived for it.
     if client.server_hello.cipher_suite != TLS_AES_128_GCM_SHA256
         client.last_error = TLS_ERR_UNEXPECTED_MESSAGE
@@ -453,7 +486,11 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
     client.cipher_suite = client.server_hello.cipher_suite
 
     # Compute shared secret
-    x25519(@client.shared_secret[0], @client.client_hello.x25519_private[0], @client.server_hello.x25519_public[0])
+    if client.client_hello.key_share_group == GROUP_SECP256R1
+        if p256_ecdh(@client.shared_secret[0], @client.client_hello.p256_private[0], @client.server_hello.p256_public[0]) != 0
+            return client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+    else
+        x25519(@client.shared_secret[0], @client.client_hello.x25519_private[0], @client.server_hello.x25519_public[0])
 
     # Update transcript with full ServerHello (including handshake header)
     let sh_total: i64 = 4 + hdr.length
@@ -482,6 +519,60 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
 
     # client_step goes on to any further records.
     return TLS_RESULT_NEED_INPUT
+
+# ============================================================================
+# Process HelloRetryRequest
+# ============================================================================
+
+# Fail the handshake with `err`.
+fn client_fail(client: *TlsClient, err: i32) -> i32
+    client.last_error = err
+    client.state = TLS_STATE_ERROR
+    return TLS_RESULT_ERROR
+
+# 1 if `sid` is the session id our ClientHello sent, else 0.
+fn client_session_id_echoed(client: *TlsClient, sid: *u8, sid_len: u8) -> i32
+    if sid_len != client.client_hello.session_id_len
+        return 0
+    return mem_eq(sid, @client.client_hello.session_id[0], sid_len as i64)
+
+# Answer the HelloRetryRequest at the head of recv_buf, its body `len` bytes
+# in a record of `record_len`, with a second ClientHello (RFC 8446 4.1.4).
+# The transcript becomes message_hash(CH1), HRR, CH2 (4.4.1).
+fn process_hello_retry_request(client: *TlsClient, len: i64, record_len: i64, out: *u8, out_cap: i64, out_len: *i64) -> i32
+    # One per connection, and nothing but the HRR in its record: what follows
+    # one is meant for a hello we have not sent yet.
+    if client.hrr_received != 0 || 4 + len != record_len
+        return client_fail(client, TLS_ERR_UNEXPECTED_MESSAGE)
+
+    var hrr: HelloRetryRequest
+    if hello_retry_request_parse(@client.recv_buf[9], len, @hrr) != 0
+        return client_fail(client, TLS_ERR_PARSE_ERROR)
+    if client_session_id_echoed(client, @hrr.session_id[0], hrr.session_id_len) != 1
+        return client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+
+    # The one suite we offer, as for a ServerHello. The transcript hash is
+    # SHA-256 only, so this is also what makes message_hash below correct.
+    if hrr.cipher_suite != TLS_AES_128_GCM_SHA256
+        return client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+
+    if client_hello_apply_retry(@client.client_hello, @hrr) != 0
+        return client_fail(client, TLS_ERR_HELLO_RETRY_REQUEST)
+
+    transcript_restart_for_retry(@client.transcript)
+    transcript_update(@client.transcript, @client.recv_buf[5], 4 + len)
+
+    client.hrr_received = 1
+    client.hrr_cipher_suite = hrr.cipher_suite
+
+    let hello_len: i64 = client_write_hello(client, out, out_cap)
+    if hello_len < 0
+        client.state = TLS_STATE_ERROR
+        return TLS_RESULT_ERROR
+    *out_len = hello_len
+
+    client_shift_recv_buf(client, 5 + record_len)
+    return TLS_RESULT_HAVE_OUTPUT
 
 # ============================================================================
 # Process Encrypted Handshake Messages

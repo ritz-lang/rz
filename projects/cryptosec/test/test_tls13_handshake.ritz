@@ -1381,3 +1381,581 @@ fn test_cv_verify_rsa_pss_binds_scheme_and_key_type() -> i32
     if certificate_verify_verify(@cv, @th[0], @pk) == 0
         return 5
     return 0
+
+# ============================================================================
+# HelloRetryRequest (AGAST #2182)
+# ============================================================================
+
+fn be16_2182(p: *u8, v: i64)
+    p[0] = ((v >> 8) & 0xff) as u8
+    p[1] = (v & 0xff) as u8
+
+# Start an HRR body with a `sid_len`-byte session id echo. Returns the offset
+# of the extensions length field; hrr_add_2182 and hrr_end_2182 finish it.
+fn hrr_begin_2182(out: *u8, sid_len: i64) -> i64
+    out[0] = 0x03
+    out[1] = 0x03
+    hello_retry_request_random(out + 2)
+    out[34] = sid_len as u8
+    var i: i64 = 0
+    while i < sid_len
+        out[35 + i] = 0x77
+        i += 1
+    var p: i64 = 35 + sid_len
+    be16_2182(out + p, TLS_AES_128_GCM_SHA256 as i64)
+    out[p + 2] = 0
+    return p + 3
+
+fn hrr_add_2182(out: *u8, pos: i64, ext: u16, data: *u8, len: i64) -> i64
+    be16_2182(out + pos, ext as i64)
+    be16_2182(out + pos + 2, len)
+    mem_copy(out + pos + 4, data, len)
+    return pos + 4 + len
+
+fn hrr_add_version_2182(out: *u8, pos: i64) -> i64
+    var v: [2]u8
+    v[0] = 0x03
+    v[1] = 0x04
+    return hrr_add_2182(out, pos, EXT_SUPPORTED_VERSIONS, @v[0], 2)
+
+fn hrr_add_group_2182(out: *u8, pos: i64, group: u16) -> i64
+    var g: [2]u8
+    be16_2182(@g[0], group as i64)
+    return hrr_add_2182(out, pos, EXT_KEY_SHARE, @g[0], 2)
+
+fn hrr_add_cookie_2182(out: *u8, pos: i64, len: i64) -> i64
+    var c: [64]u8
+    be16_2182(@c[0], len)
+    var i: i64 = 0
+    while i < len
+        c[2 + i] = (0x40 + i) as u8
+        i += 1
+    return hrr_add_2182(out, pos, EXT_COOKIE, @c[0], 2 + len)
+
+fn hrr_end_2182(out: *u8, ext_at: i64, end: i64) -> i64
+    be16_2182(out + ext_at, end - ext_at - 2)
+    return end
+
+# Parse an HRR holding supported_versions plus, if set, a group and a cookie.
+fn hrr_good_2182(buf: *u8, hrr: *HelloRetryRequest, group: u16, cookie_len: i64) -> i32
+    let at: i64 = hrr_begin_2182(buf, 0)
+    var p: i64 = hrr_add_version_2182(buf, at + 2)
+    if group != 0
+        p = hrr_add_group_2182(buf, p, group)
+    if cookie_len > 0
+        p = hrr_add_cookie_2182(buf, p, cookie_len)
+    return hello_retry_request_parse(buf, hrr_end_2182(buf, at, p), hrr)
+
+[[test]]
+fn test_hrr_parse_group_and_cookie() -> i32
+    var buf: [256]u8
+    let at: i64 = hrr_begin_2182(@buf[0], 32)
+    var p: i64 = hrr_add_version_2182(@buf[0], at + 2)
+    p = hrr_add_group_2182(@buf[0], p, GROUP_SECP256R1)
+    p = hrr_add_cookie_2182(@buf[0], p, 5)
+    var hrr: HelloRetryRequest
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != 0
+        return 1
+    if hrr.cipher_suite != TLS_AES_128_GCM_SHA256
+        return 2
+    if hrr.session_id_len != 32 || hrr.session_id[31] != 0x77
+        return 3
+    if hrr.has_selected_group != 1 || hrr.selected_group != GROUP_SECP256R1
+        return 4
+    if hrr.cookie_len != 5 || hrr.cookie[0] != 0x40 || hrr.cookie[4] != 0x44
+        return 5
+    return 0
+
+[[test]]
+fn test_hrr_parse_cookie_only_has_no_group() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, 0, 3) != 0
+        return 1
+    if hrr.has_selected_group != 0 || hrr.cookie_len != 3
+        return 2
+    return 0
+
+[[test]]
+fn test_hrr_parse_requires_supported_versions() -> i32
+    var buf: [256]u8
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    let p: i64 = hrr_add_group_2182(@buf[0], at + 2, GROUP_SECP256R1)
+    var hrr: HelloRetryRequest
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -15
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_other_version() -> i32
+    var buf: [256]u8
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    var v: [2]u8
+    v[0] = 0x03
+    v[1] = 0x03
+    let p: i64 = hrr_add_2182(@buf[0], at + 2, EXT_SUPPORTED_VERSIONS, @v[0], 2)
+    var hrr: HelloRetryRequest
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -10
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_bad_legacy_version() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    let n: i64 = hrr_end_2182(@buf[0], at, hrr_add_version_2182(@buf[0], at + 2))
+    buf[1] = 0x04
+    if hello_retry_request_parse(@buf[0], n, @hrr) != -2
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_compression() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    let n: i64 = hrr_end_2182(@buf[0], at, hrr_add_version_2182(@buf[0], at + 2))
+    buf[at - 1] = 1
+    if hello_retry_request_parse(@buf[0], n, @hrr) != -5
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_long_session_id() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 33)
+    let n: i64 = hrr_end_2182(@buf[0], at, hrr_add_version_2182(@buf[0], at + 2))
+    if hello_retry_request_parse(@buf[0], n, @hrr) != -3
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_truncation_at_every_length() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 4)
+    var p: i64 = hrr_add_version_2182(@buf[0], at + 2)
+    p = hrr_add_group_2182(@buf[0], p, GROUP_SECP256R1)
+    let n: i64 = hrr_end_2182(@buf[0], at, hrr_add_cookie_2182(@buf[0], p, 5))
+    var i: i64 = 0
+    while i < n
+        if hello_retry_request_parse(@buf[0], i, @hrr) >= 0
+            return 1 + i as i32
+        i += 1
+    if hello_retry_request_parse(@buf[0], n, @hrr) != 0
+        return 500
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_trailing_bytes() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    let n: i64 = hrr_end_2182(@buf[0], at, hrr_add_version_2182(@buf[0], at + 2))
+    if hello_retry_request_parse(@buf[0], n + 1, @hrr) != -6
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_extension_we_did_not_offer() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    var p: i64 = hrr_add_version_2182(@buf[0], at + 2)
+    var x: [1]u8
+    p = hrr_add_2182(@buf[0], p, EXT_SERVER_NAME, @x[0], 0)
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -14
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_duplicates() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    var p: i64 = hrr_add_version_2182(@buf[0], at + 2)
+    p = hrr_add_version_2182(@buf[0], p)
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -9
+        return 1
+    p = hrr_add_version_2182(@buf[0], at + 2)
+    p = hrr_add_group_2182(@buf[0], p, GROUP_SECP256R1)
+    p = hrr_add_group_2182(@buf[0], p, GROUP_SECP256R1)
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -11
+        return 2
+    p = hrr_add_version_2182(@buf[0], at + 2)
+    p = hrr_add_cookie_2182(@buf[0], p, 2)
+    p = hrr_add_cookie_2182(@buf[0], p, 2)
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -12
+        return 3
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_bad_key_share_length() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    var p: i64 = hrr_add_version_2182(@buf[0], at + 2)
+    var g: [4]u8
+    p = hrr_add_2182(@buf[0], p, EXT_KEY_SHARE, @g[0], 4)
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -11
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_empty_cookie() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    var p: i64 = hrr_add_version_2182(@buf[0], at + 2)
+    var c: [2]u8
+    c[0] = 0
+    c[1] = 0
+    p = hrr_add_2182(@buf[0], p, EXT_COOKIE, @c[0], 2)
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -12
+        return 1
+    return 0
+
+[[test]]
+fn test_hrr_parse_rejects_cookie_length_mismatch() -> i32
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    let at: i64 = hrr_begin_2182(@buf[0], 0)
+    var p: i64 = hrr_add_version_2182(@buf[0], at + 2)
+    var c: [5]u8
+    c[0] = 0
+    c[1] = 2  # says 2, the extension holds 3
+    p = hrr_add_2182(@buf[0], p, EXT_COOKIE, @c[0], 5)
+    if hello_retry_request_parse(@buf[0], hrr_end_2182(@buf[0], at, p), @hrr) != -13
+        return 1
+    return 0
+
+[[test]]
+fn test_transcript_restart_is_message_hash_of_client_hello() -> i32
+    # RFC 8446 4.4.1, computed here with SHA-256 directly:
+    # Hash(0xfe 00 00 20 || Hash(CH1)), then the running hash goes on from it.
+    var t: Transcript
+    transcript_init(@t)
+    transcript_update(@t, c"first hello", 11)
+    transcript_restart_for_retry(@t)
+
+    var msg: [40]u8
+    msg[0] = 0xfe
+    msg[1] = 0
+    msg[2] = 0
+    msg[3] = 32
+    sha256(c"first hello", 11, @msg[4])
+    var want: [32]u8
+    sha256(@msg[0], 36, @want[0])
+    var got: [32]u8
+    transcript_hash(@t, @got[0])
+    if mem_eq(@got[0], @want[0], 32) != 1
+        return 1
+
+    transcript_update(@t, c"hrr", 3)
+    msg[36] = 0x68
+    msg[37] = 0x72
+    msg[38] = 0x72
+    sha256(@msg[0], 39, @want[0])
+    transcript_hash(@t, @got[0])
+    if mem_eq(@got[0], @want[0], 32) != 1
+        return 2
+    return 0
+
+# Offset of extension `ext`'s data in the serialized hello `ch` (`len` bytes),
+# by walking the structure; -1 if absent.
+fn ch_ext_2182(ch: *u8, len: i64, ext: u16) -> i64
+    var p: i64 = 4 + 2 + 32
+    p = p + 1 + ch[p] as i64
+    p = p + 2 + (((ch[p] as i64) << 8) | (ch[p + 1] as i64))
+    p = p + 1 + ch[p] as i64
+    p = p + 2
+    while p + 4 <= len
+        let t: u16 = ((ch[p] as u16) << 8) | (ch[p + 1] as u16)
+        let n: i64 = ((ch[p + 2] as i64) << 8) | (ch[p + 3] as i64)
+        if t == ext
+            return p + 4
+        p = p + 4 + n
+    return -1
+
+[[test]]
+fn test_client_hello_advertises_both_groups_one_share() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var buf: [512]u8
+    let len: i64 = client_hello_serialize(@ch, @buf[0], 512)
+    let g: i64 = ch_ext_2182(@buf[0], len, EXT_SUPPORTED_GROUPS)
+    if g < 0 || buf[g + 1] != 4
+        return 2
+    if buf[g + 2] != 0x00 || buf[g + 3] != 0x1d || buf[g + 4] != 0x00 || buf[g + 5] != 0x17
+        return 3
+    let k: i64 = ch_ext_2182(@buf[0], len, EXT_KEY_SHARE)
+    if k < 0 || buf[k + 1] != 36 || buf[k + 3] != 0x1d
+        return 4
+    if ch_ext_2182(@buf[0], len, EXT_COOKIE) != -1
+        return 5
+    return 0
+
+[[test]]
+fn test_retry_cookie_only_keeps_share_and_echoes_cookie() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    client_hello_set_hostname(@ch, "test.local", 10)
+    var one: [512]u8
+    let one_len: i64 = client_hello_serialize(@ch, @one[0], 512)
+
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, 0, 5) != 0
+        return 2
+    if client_hello_apply_retry(@ch, @hrr) != 0
+        return 3
+    var two: [512]u8
+    let two_len: i64 = client_hello_serialize(@ch, @two[0], 512)
+
+    # Same hello plus one 11-byte extension: random, session id, share and all.
+    if two_len != one_len + 11
+        return 4
+    if mem_eq(@one[6], @two[6], 32) != 1
+        return 5
+    let a: i64 = ch_ext_2182(@one[0], one_len, EXT_KEY_SHARE)
+    let b: i64 = ch_ext_2182(@two[0], two_len, EXT_KEY_SHARE)
+    if a != b || mem_eq(@one[a], @two[b], 38) != 1
+        return 6
+    let c: i64 = ch_ext_2182(@two[0], two_len, EXT_COOKIE)
+    if c < 0
+        return 7
+    if two[c] != 0 || two[c + 1] != 5 || two[c + 2] != 0x40 || two[c + 6] != 0x44
+        return 8
+    if two[c - 2] != 0 || two[c - 1] != 7
+        return 9
+    return 0
+
+[[test]]
+fn test_retry_group_change_replaces_share() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var sid: [32]u8
+    mem_copy(@sid[0], @ch.session_id[0], 32)
+
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, GROUP_SECP256R1, 0) != 0
+        return 2
+    if client_hello_apply_retry(@ch, @hrr) != 0
+        return 3
+    if ch.key_share_group != GROUP_SECP256R1
+        return 4
+    if mem_is_zero(@ch.x25519_private[0], 32) != 1
+        return 5  # the abandoned share's key is gone
+    if mem_eq(@ch.session_id[0], @sid[0], 32) != 1
+        return 6
+
+    # The share goes out alone, and is a valid point for the private key.
+    var two: [512]u8
+    let len: i64 = client_hello_serialize(@ch, @two[0], 512)
+    let k: i64 = ch_ext_2182(@two[0], len, EXT_KEY_SHARE)
+    if k < 0 || two[k - 1] != 71 || two[k + 1] != 69
+        return 7
+    if two[k + 2] != 0x00 || two[k + 3] != 0x17 || two[k + 4] != 0 || two[k + 5] != 65
+        return 8
+    if mem_eq(@two[k + 6], @ch.p256_public[0], 65) != 1
+        return 9
+    var want: [65]u8
+    p256_ecdh_public(@want[0], @ch.p256_private[0])
+    if mem_eq(@want[0], @ch.p256_public[0], 65) != 1
+        return 10
+    var s: [32]u8
+    if p256_ecdh(@s[0], @ch.p256_private[0], @ch.p256_public[0]) != 0
+        return 11
+    return 0
+
+[[test]]
+fn test_retry_with_group_and_cookie_applies_both() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, GROUP_SECP256R1, 4) != 0
+        return 2
+    if client_hello_apply_retry(@ch, @hrr) != 0
+        return 3
+    if ch.key_share_group != GROUP_SECP256R1 || ch.cookie_len != 4
+        return 4
+    return 0
+
+fn retry_refused_2182(group: u16, cookie_len: i64) -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var priv: [32]u8
+    mem_copy(@priv[0], @ch.x25519_private[0], 32)
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, group, cookie_len) != 0
+        return 2
+    if client_hello_apply_retry(@ch, @hrr) != -1
+        return 3
+    if ch.key_share_group != GROUP_X25519 || ch.cookie_len != 0
+        return 4
+    if mem_eq(@ch.x25519_private[0], @priv[0], 32) != 1
+        return 5
+    return 0
+
+[[test]]
+fn test_retry_refuses_no_change() -> i32
+    return retry_refused_2182(0, 0)
+
+[[test]]
+fn test_retry_refuses_group_already_shared() -> i32
+    # 4.2.8: even with a cookie, the group must not be one we sent a share for.
+    return retry_refused_2182(GROUP_X25519, 4)
+
+[[test]]
+fn test_retry_refuses_group_not_advertised() -> i32
+    return retry_refused_2182(0x001e, 0)  # x448
+
+[[test]]
+fn test_retry_refuses_second_p256_request() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, GROUP_SECP256R1, 0) != 0
+        return 2
+    if client_hello_apply_retry(@ch, @hrr) != 0
+        return 3
+    if client_hello_apply_retry(@ch, @hrr) != -1
+        return 4
+    return 0
+
+[[test]]
+fn test_retry_cookie_size_limit() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var big: [2049]u8
+    var hrr: HelloRetryRequest
+    hrr.has_selected_group = 0
+    hrr.selected_group = 0
+    hrr.cookie = @big[0]
+    hrr.cookie_len = HRR_COOKIE_MAX + 1
+    if client_hello_apply_retry(@ch, @hrr) != -1
+        return 2
+    if ch.cookie_len != 0
+        return 3
+    hrr.cookie_len = HRR_COOKIE_MAX
+    if client_hello_apply_retry(@ch, @hrr) != 0
+        return 4
+    if ch.cookie_len != HRR_COOKIE_MAX
+        return 5
+    return 0
+
+[[test]]
+fn test_retry_fails_on_rng_failure() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, GROUP_SECP256R1, 0) != 0
+        return 2
+    # A failed draw writes nothing, so seed the buffer to see it wiped.
+    for i in 0..32
+        ch.p256_private[i] = 0xAA
+    random_test_force_failure(1)
+    let r: i32 = client_hello_apply_retry(@ch, @hrr)
+    random_test_force_failure(0)
+    if r != -1
+        return 3
+    if ch.key_share_group != GROUP_X25519
+        return 4
+    if mem_is_zero(@ch.p256_private[0], 32) != 1
+        return 5
+    if mem_is_zero(@ch.x25519_private[0], 32) != 0
+        return 6
+    return 0
+
+[[test]]
+fn test_client_hello_serialize_honours_cap_exactly() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    client_hello_set_hostname(@ch, "test.local", 10)
+    var buf: [256]u8
+    var hrr: HelloRetryRequest
+    if hrr_good_2182(@buf[0], @hrr, GROUP_SECP256R1, 9) != 0
+        return 2
+    if client_hello_apply_retry(@ch, @hrr) != 0
+        return 3
+    var out: [512]u8
+    let len: i64 = client_hello_serialize(@ch, @out[0], 512)
+    if len <= 0
+        return 4
+    if client_hello_serialize(@ch, @out[0], len) != len
+        return 5
+    if client_hello_serialize(@ch, @out[0], len - 1) != -1
+        return 6
+    return 0
+
+# A ServerHello body with one key_share entry: `key_len` bytes of 0xab.
+fn sh_with_share_2182(buf: *u8, group: u16, key_len: i64) -> i64
+    buf[0] = 0x03
+    buf[1] = 0x03
+    var i: i64 = 2
+    while i < 34
+        buf[i] = 0x11
+        i += 1
+    buf[34] = 0
+    be16_2182(buf + 35, TLS_AES_128_GCM_SHA256 as i64)
+    buf[37] = 0
+    var p: i64 = hrr_add_version_2182(buf, 40)
+    var e: [80]u8
+    be16_2182(@e[0], group as i64)
+    be16_2182(@e[2], key_len)
+    i = 0
+    while i < key_len
+        e[4 + i] = 0xab
+        i += 1
+    p = hrr_add_2182(buf, p, EXT_KEY_SHARE, @e[0], 4 + key_len)
+    be16_2182(buf + 38, p - 40)
+    return p
+
+[[test]]
+fn test_server_hello_parse_p256_share() -> i32
+    var buf: [256]u8
+    let n: i64 = sh_with_share_2182(@buf[0], GROUP_SECP256R1, 65)
+    var sh: ServerHello
+    if server_hello_parse(@buf[0], n, @sh) != 0
+        return 1
+    if sh.key_share_group != GROUP_SECP256R1 || sh.has_key_share != 1
+        return 2
+    if sh.p256_public[0] != 0xab || sh.p256_public[64] != 0xab
+        return 3
+    return 0
+
+[[test]]
+fn test_server_hello_parse_x25519_share_group() -> i32
+    var buf: [256]u8
+    let n: i64 = sh_with_share_2182(@buf[0], GROUP_X25519, 32)
+    var sh: ServerHello
+    if server_hello_parse(@buf[0], n, @sh) != 0
+        return 1
+    if sh.key_share_group != GROUP_X25519
+        return 2
+    return 0
+
+[[test]]
+fn test_server_hello_parse_rejects_wrong_p256_length() -> i32
+    var buf: [256]u8
+    let n: i64 = sh_with_share_2182(@buf[0], GROUP_SECP256R1, 64)
+    var sh: ServerHello
+    if server_hello_parse(@buf[0], n, @sh) != -11
+        return 1
+    return 0

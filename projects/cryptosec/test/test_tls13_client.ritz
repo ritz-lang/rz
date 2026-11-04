@@ -9,6 +9,8 @@ import cryptosec.random
 import cryptosec.tls13_record
 import cryptosec.ca_store
 import cryptosec.pem
+import cryptosec.p256
+import cryptosec.sha256
 
 # ============================================================================
 # Config Tests
@@ -595,8 +597,7 @@ fn test_tls_client_init_fails_on_rng_failure() -> i32
 # change_cipher_spec record, body 0x01, after their ServerHello. The client
 # must drop it. Any other CCS (wrong body/length, a second one, one before
 # the ServerHello) is unexpected_message. A HelloRetryRequest is a
-# ServerHello with a fixed random (RFC 8446 4.1.3); the client offers only
-# X25519 and does not retry, so it fails with TLS_ERR_HELLO_RETRY_REQUEST.
+# ServerHello with a fixed random (RFC 8446 4.1.3); #2182 below retries it.
 
 # A change_cipher_spec record of `len` bytes, every byte `body`.
 fn ccs_2116(out: *u8, len: i64, body: u8) -> i64
@@ -786,17 +787,6 @@ fn run_hrr_2116(client: *TlsClient, last_random_byte: u8) -> i32
     return tls_client_process(client, @buf[0], n, @out[0], 1024, @out_len)
 
 [[test]]
-fn test_client_fails_cleanly_on_hello_retry_request() -> i32
-    var client: TlsClient
-    if run_hrr_2116(@client, 0x9c) != TLS_RESULT_ERROR
-        return 1
-    if tls_client_error(@client) != TLS_ERR_HELLO_RETRY_REQUEST
-        return 100 + tls_client_error(@client)
-    if client.state != TLS_STATE_ERROR || client.encrypted_handshake != 0
-        return 3
-    return 0
-
-[[test]]
 fn test_client_near_hrr_random_is_not_hrr() -> i32
     # Control: one random bit off is an ordinary (here malformed: no key
     # share) ServerHello, a parse error rather than HELLO_RETRY_REQUEST.
@@ -805,4 +795,559 @@ fn test_client_near_hrr_random_is_not_hrr() -> i32
         return 1
     if tls_client_error(@client) != TLS_ERR_PARSE_ERROR
         return 100 + tls_client_error(@client)
+    return 0
+
+# ============================================================================
+# HelloRetryRequest retry (AGAST #2182)
+# ============================================================================
+# The client answers a HelloRetryRequest with a second ClientHello, cookie
+# echoed and key share replaced as asked. test_tls_e2e in valet runs whole
+# handshakes through it; these pin each rule of RFC 8446 4.1.3, 4.1.4, 4.2.8
+# and 4.4.1 on hand-built messages.
+
+fn be16_2182(p: *u8, v: i64)
+    p[0] = ((v >> 8) & 0xff) as u8
+    p[1] = (v & 0xff) as u8
+
+# Frame the handshake body at out[9..9+body] as one ServerHello record.
+fn frame_2182(out: *u8, body: i64) -> i64
+    out[0] = 22
+    out[1] = 0x03
+    out[2] = 0x03
+    be16_2182(out + 3, body + 4)
+    out[5] = HS_SERVER_HELLO
+    out[6] = 0
+    be16_2182(out + 7, body)
+    return 9 + body
+
+# Write version, `random`, session id echo, suite and compression at out[9..].
+# Returns the offset of the extensions length field.
+fn hello_head_2182(out: *u8, random: *u8, client: *TlsClient, suite: u16) -> i64
+    out[9] = 0x03
+    out[10] = 0x03
+    mem_copy(out + 11, random, 32)
+    out[43] = 32
+    mem_copy(out + 44, @client.client_hello.session_id[0], 32)
+    be16_2182(out + 76, suite as i64)
+    out[78] = 0
+    return 79
+
+fn ext_version_2182(out: *u8, p: i64) -> i64
+    be16_2182(out + p, 43)
+    be16_2182(out + p + 2, 2)
+    out[p + 4] = 0x03
+    out[p + 5] = 0x04
+    return p + 6
+
+# An HRR record for `client`: `group` (0: no key_share) and a `cookie_len`
+# cookie (0: none).
+fn hrr_2182(out: *u8, client: *TlsClient, suite: u16, group: u16, cookie_len: i64) -> i64
+    var magic: [32]u8
+    hello_retry_request_random(@magic[0])
+    let at: i64 = hello_head_2182(out, @magic[0], client, suite)
+    var p: i64 = ext_version_2182(out, at + 2)
+    if group != 0
+        be16_2182(out + p, 51)
+        be16_2182(out + p + 2, 2)
+        be16_2182(out + p + 4, group as i64)
+        p = p + 6
+    if cookie_len > 0
+        be16_2182(out + p, 44)
+        be16_2182(out + p + 2, cookie_len + 2)
+        be16_2182(out + p + 4, cookie_len)
+        var i: i64 = 0
+        while i < cookie_len
+            out[p + 6 + i] = (0x40 + i) as u8
+            i += 1
+        p = p + 6 + cookie_len
+    be16_2182(out + at, p - at - 2)
+    return frame_2182(out, p - 9)
+
+# A ServerHello record for `client` with one key share of `key_len` bytes.
+fn sh_2182(out: *u8, client: *TlsClient, suite: u16, group: u16, key: *u8, key_len: i64) -> i64
+    var rnd: [32]u8
+    mem_zero(@rnd[0], 32)
+    rnd[0] = 0x22
+    let at: i64 = hello_head_2182(out, @rnd[0], client, suite)
+    var p: i64 = ext_version_2182(out, at + 2)
+    be16_2182(out + p, 51)
+    be16_2182(out + p + 2, 4 + key_len)
+    be16_2182(out + p + 4, group as i64)
+    be16_2182(out + p + 6, key_len)
+    mem_copy(out + p + 8, key, key_len)
+    p = p + 8 + key_len
+    be16_2182(out + at, p - at - 2)
+    return frame_2182(out, p - 9)
+
+# Init and start `client`; CH1's record goes to ch1. Returns its length.
+fn start_2182(client: *TlsClient, ch1: *u8) -> i64
+    var cfg: TlsConfig
+    tls_config_init(@cfg)
+    tls_config_set_hostname(@cfg, "test.local", 10)
+    if tls_client_init(client, @cfg) != 0
+        return -1
+    return tls_client_start(client, ch1, 1024)
+
+# Fails `client` on one record; 0 if it is `want`, else the wrong outcome.
+fn expect_err_2182(client: *TlsClient, rec: *u8, n: i64, want: i32) -> i32
+    var out: [1024]u8
+    var out_len: i64 = 0
+    if tls_client_process(client, rec, n, @out[0], 1024, @out_len) != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(client) != want
+        return 100 - tls_client_error(client)
+    if client.state != TLS_STATE_ERROR || out_len != 0
+        return 2
+    return 0
+
+# Offset of extension `ext`'s data in the ClientHello record `rec`; -1 absent.
+fn ch_ext_2182(rec: *u8, len: i64, ext: u16) -> i64
+    var p: i64 = 5 + 4 + 2 + 32
+    p = p + 1 + rec[p] as i64
+    p = p + 2 + (((rec[p] as i64) << 8) | (rec[p + 1] as i64))
+    p = p + 1 + rec[p] as i64
+    p = p + 2
+    while p + 4 <= len
+        let t: u16 = ((rec[p] as u16) << 8) | (rec[p + 1] as u16)
+        let n: i64 = ((rec[p + 2] as i64) << 8) | (rec[p + 3] as i64)
+        if t == ext
+            return p + 4
+        p = p + 4 + n
+    return -1
+
+# `client` past an HRR asking for `group` and a `cookie_len` cookie. 0 on
+# success; CH2's record goes to ch2 and its length to *ch2_len.
+fn past_hrr_2182(client: *TlsClient, group: u16, cookie_len: i64, ch2: *u8, ch2_len: *i64) -> i32
+    var ch1: [1024]u8
+    if start_2182(client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], client, TLS_AES_128_GCM_SHA256, group, cookie_len)
+    if tls_client_process(client, @rec[0], n, ch2, 1024, ch2_len) != TLS_RESULT_HAVE_OUTPUT
+        return 200 - tls_client_error(client)
+    return 0
+
+fn x25519_share_2182(key: *u8)
+    var i: i64 = 0
+    while i < 32
+        key[i] = (i + 9) as u8
+        i += 1
+
+# A valid secp256r1 share: the point for scalar 2.
+fn p256_share_2182(key: *u8)
+    var d: [32]u8
+    mem_zero(@d[0], 32)
+    d[31] = 2
+    p256_ecdh_public(key, @d[0])
+
+[[test]]
+fn test_retry_cookie_only_sends_second_hello() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    if ch2[0] != 22 || ch2[5] != HS_CLIENT_HELLO
+        return 1
+    let rec_len: i64 = ((ch2[3] as i64) << 8) | (ch2[4] as i64)
+    if rec_len + 5 != ch2_len
+        return 2
+    let c: i64 = ch_ext_2182(@ch2[0], ch2_len, 44)
+    if c < 0 || ch2[c + 1] != 5 || ch2[c + 2] != 0x40 || ch2[c + 6] != 0x44
+        return 3
+    let k: i64 = ch_ext_2182(@ch2[0], ch2_len, 51)
+    if k < 0 || ch2[k + 3] != 0x1d
+        return 4  # the X25519 share stays
+    if mem_eq(@ch2[k + 6], @client.client_hello.x25519_public[0], 32) != 1
+        return 5
+    if client.state != TLS_STATE_CLIENT_HELLO_SENT || client.recv_len != 0
+        return 6
+    if client.encrypted_handshake != 0
+        return 7
+    return 0
+
+[[test]]
+fn test_retry_second_hello_record_version_is_0303() -> i32
+    # RFC 8446 5.1: 0x0301 is allowed only for the initial ClientHello.
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    if ch2[1] != 0x03 || ch2[2] != 0x03
+        return 1
+    return 0
+
+[[test]]
+fn test_retry_group_change_sends_p256_share() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, GROUP_SECP256R1, 0, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    let k: i64 = ch_ext_2182(@ch2[0], ch2_len, 51)
+    if k < 0 || ch2[k + 3] != 0x17 || ch2[k + 5] != 65
+        return 1
+    if ch_ext_2182(@ch2[0], ch2_len, 44) != -1
+        return 2
+    return 0
+
+[[test]]
+fn test_retry_transcript_is_message_hash_hrr_ch2() -> i32
+    # RFC 8446 4.4.1, computed with SHA-256 directly from the wire bytes.
+    var client: TlsClient
+    var ch1: [1024]u8
+    let ch1_len: i64 = start_2182(@client, @ch1[0])
+    if ch1_len <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, 5)
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    if tls_client_process(@client, @rec[0], n, @ch2[0], 1024, @ch2_len) != TLS_RESULT_HAVE_OUTPUT
+        return 2
+
+    var all: [2048]u8
+    all[0] = 0xfe
+    all[1] = 0
+    all[2] = 0
+    all[3] = 32
+    sha256(@ch1[5], ch1_len - 5, @all[4])
+    mem_copy(@all[36], @rec[5], n - 5)
+    mem_copy(@all[36 + n - 5], @ch2[5], ch2_len - 5)
+    var want: [32]u8
+    sha256(@all[0], 36 + n - 5 + ch2_len - 5, @want[0])
+    var got: [32]u8
+    transcript_hash(@client.transcript, @got[0])
+    if mem_eq(@got[0], @want[0], 32) != 1
+        return 3
+    return 0
+
+[[test]]
+fn test_retry_refuses_second_hrr() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, 0)
+    return expect_err_2182(@client, @rec[0], n, TLS_ERR_UNEXPECTED_MESSAGE)
+
+[[test]]
+fn test_retry_refuses_session_id_mismatch() -> i32
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, 0, 5)
+    rec[44] = rec[44] ^ 1
+    return expect_err_2182(@client, @rec[0], n, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_retry_refuses_suite_not_offered() -> i32
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_256_GCM_SHA384, 0, 5)
+    return expect_err_2182(@client, @rec[0], n, TLS_ERR_ILLEGAL_PARAMETER)
+
+fn refused_hrr_2182(group: u16, cookie_len: i64) -> i32
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, group, cookie_len)
+    return expect_err_2182(@client, @rec[0], n, TLS_ERR_HELLO_RETRY_REQUEST)
+
+[[test]]
+fn test_retry_refuses_hrr_changing_nothing() -> i32
+    return refused_hrr_2182(0, 0)
+
+[[test]]
+fn test_retry_refuses_group_already_offered() -> i32
+    return refused_hrr_2182(GROUP_X25519, 0)
+
+[[test]]
+fn test_retry_refuses_unsupported_group() -> i32
+    return refused_hrr_2182(0x001e, 0)
+
+[[test]]
+fn test_retry_refuses_malformed_hrr() -> i32
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, 0, 5)
+    rec[79 + 2] = 0x7f  # first extension becomes one we never offered
+    return expect_err_2182(@client, @rec[0], n, TLS_ERR_PARSE_ERROR)
+
+[[test]]
+fn test_retry_refuses_data_after_hrr_in_its_record() -> i32
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, 0, 5)
+    be16_2182(@rec[3], n - 5 + 4)
+    rec[n] = HS_ENCRYPTED_EXTENSIONS
+    rec[n + 1] = 0
+    rec[n + 2] = 0
+    rec[n + 3] = 0
+    return expect_err_2182(@client, @rec[0], n + 4, TLS_ERR_UNEXPECTED_MESSAGE)
+
+[[test]]
+fn test_retry_refuses_input_it_would_lose() -> i32
+    # More than recv_buf holds behind an HRR: nothing legitimate can follow
+    # one, and HAVE_OUTPUT would drop what did not fit.
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var big: [20000]u8
+    mem_zero(@big[0], 20000)
+    hrr_2182(@big[0], @client, TLS_AES_128_GCM_SHA256, 0, 5)
+    return expect_err_2182(@client, @big[0], 20000, TLS_ERR_UNEXPECTED_MESSAGE)
+
+[[test]]
+fn test_retry_second_hello_needs_room_in_out() -> i32
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, 0, 5)
+    var small: [16]u8
+    var out_len: i64 = 0
+    if tls_client_process(@client, @rec[0], n, @small[0], 16, @out_len) != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(@client) != TLS_ERR_BUFFER_TOO_SMALL
+        return 100 - tls_client_error(@client)
+    if client.state != TLS_STATE_ERROR
+        return 2
+    return 0
+
+[[test]]
+fn test_retry_accepts_ccs_after_hrr() -> i32
+    # HRR and CCS in one read, as OpenSSL sends them.
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [256]u8
+    let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, 0)
+    let c: i64 = ccs_2116(@rec[n], 1, 0x01)
+    var out: [1024]u8
+    var out_len: i64 = 0
+    if tls_client_process(@client, @rec[0], n + c, @out[0], 1024, @out_len) != TLS_RESULT_HAVE_OUTPUT
+        return 200 - tls_client_error(@client)
+
+    # The CCS waits behind the output; ServerHello2 goes through after it.
+    var key: [65]u8
+    p256_share_2182(@key[0])
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, @key[0], 65)
+    if tls_client_process(@client, @rec[0], m, @out[0], 1024, @out_len) != TLS_RESULT_NEED_INPUT
+        return 300 - tls_client_error(@client)
+    if client.state != TLS_STATE_SERVER_HELLO_RECEIVED || client.ccs_received != 1
+        return 2
+    return 0
+
+[[test]]
+fn test_retry_refuses_second_ccs_after_hrr() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var rec: [16]u8
+    let c: i64 = ccs_2116(@rec[0], 1, 0x01)
+    ccs_2116(@rec[c], 1, 0x01)
+    return expect_err_2182(@client, @rec[0], 2 * c, TLS_ERR_UNEXPECTED_MESSAGE)
+
+[[test]]
+fn test_retry_refuses_ccs_after_hrr_and_after_server_hello() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [32]u8
+    x25519_share_2182(@key[0])
+    var rec: [256]u8
+    let c: i64 = ccs_2116(@rec[0], 1, 0x01)
+    let m: i64 = sh_2182(@rec[c], @client, TLS_AES_128_GCM_SHA256, GROUP_X25519, @key[0], 32)
+    ccs_2116(@rec[c + m], 1, 0x01)
+    return expect_err_2182(@client, @rec[0], c + m + c, TLS_ERR_UNEXPECTED_MESSAGE)
+
+[[test]]
+fn test_retry_ccs_before_any_hello_still_refused() -> i32
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var rec: [8]u8
+    let c: i64 = ccs_2116(@rec[0], 1, 0x01)
+    return expect_err_2182(@client, @rec[0], c, TLS_ERR_UNEXPECTED_MESSAGE)
+
+[[test]]
+fn test_retry_cookie_only_then_x25519_server_hello() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [32]u8
+    x25519_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_X25519, @key[0], 32)
+    var out: [1024]u8
+    var out_len: i64 = 0
+    if tls_client_process(@client, @rec[0], m, @out[0], 1024, @out_len) != TLS_RESULT_NEED_INPUT
+        return 200 - tls_client_error(@client)
+    if client.state != TLS_STATE_SERVER_HELLO_RECEIVED
+        return 1
+    return 0
+
+[[test]]
+fn test_retry_group_change_derives_p256_secret() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, GROUP_SECP256R1, 0, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [65]u8
+    p256_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, @key[0], 65)
+    var out: [1024]u8
+    var out_len: i64 = 0
+    if tls_client_process(@client, @rec[0], m, @out[0], 1024, @out_len) != TLS_RESULT_NEED_INPUT
+        return 200 - tls_client_error(@client)
+    if client.state != TLS_STATE_SERVER_HELLO_RECEIVED
+        return 1
+
+    # The server's side of the exchange, from the share on the wire.
+    let k: i64 = ch_ext_2182(@ch2[0], ch2_len, 51)
+    var d: [32]u8
+    mem_zero(@d[0], 32)
+    d[31] = 2
+    var want: [32]u8
+    if p256_ecdh(@want[0], @d[0], @ch2[k + 6]) != 0
+        return 2
+    if mem_eq(@client.shared_secret[0], @want[0], 32) != 1
+        return 3
+    return 0
+
+[[test]]
+fn test_retry_refuses_x25519_server_hello_after_p256_hrr() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, GROUP_SECP256R1, 0, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [32]u8
+    x25519_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_X25519, @key[0], 32)
+    return expect_err_2182(@client, @rec[0], m, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_retry_refuses_p256_server_hello_after_cookie_hrr() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [65]u8
+    p256_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, @key[0], 65)
+    return expect_err_2182(@client, @rec[0], m, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_client_refuses_p256_server_hello_without_hrr() -> i32
+    # We sent no secp256r1 share: there is no key to answer this one with.
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
+    var key: [65]u8
+    p256_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, @key[0], 65)
+    return expect_err_2182(@client, @rec[0], m, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_retry_refuses_server_hello_with_other_suite() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [32]u8
+    x25519_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_CHACHA20_POLY1305_SHA256, GROUP_X25519, @key[0], 32)
+    return expect_err_2182(@client, @rec[0], m, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_retry_refuses_server_hello_with_other_session_id() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [32]u8
+    x25519_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_X25519, @key[0], 32)
+    rec[44] = rec[44] ^ 1
+    return expect_err_2182(@client, @rec[0], m, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_retry_refuses_invalid_p256_share() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, GROUP_SECP256R1, 0, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    var key: [65]u8
+    p256_share_2182(@key[0])
+    key[64] = key[64] ^ 1
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_SECP256R1, @key[0], 65)
+    return expect_err_2182(@client, @rec[0], m, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_retry_client_free_wipes_p256_key() -> i32
+    var client: TlsClient
+    var ch2: [1024]u8
+    var ch2_len: i64 = 0
+    let r: i32 = past_hrr_2182(@client, GROUP_SECP256R1, 0, @ch2[0], @ch2_len)
+    if r != 0
+        return r
+    if mem_is_zero(@client.client_hello.p256_private[0], 32) != 0
+        return 1
+    tls_client_free(@client)
+    if mem_is_zero(@client.client_hello.p256_private[0], 32) != 1
+        return 2
     return 0

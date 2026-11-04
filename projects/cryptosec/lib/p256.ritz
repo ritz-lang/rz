@@ -1,6 +1,6 @@
 # lib/p256.ritz - NIST P-256 (secp256r1) Elliptic Curve
 #
-# Implements P-256 curve operations for ECDSA signature verification.
+# Implements P-256 curve operations for ECDSA signatures and ECDHE key shares.
 #
 # Curve parameters:
 #   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
@@ -1693,6 +1693,62 @@ pub fn ecdsa_p256_pubkey_from_privkey(pub_key: *P256Point, priv_key: *Scalar256)
     p256_scalar_mult(pub_key, @priv_bytes[0], 32, @G)
 
     mem_zero(@priv_bytes[0], sizeof(priv_bytes))
+
+# ============================================================================
+# ECDHE (TLS 1.3 secp256r1 key share, RFC 8446 4.2.8.2)
+# ============================================================================
+# A key share is the uncompressed point 0x04 || X || Y, 65 bytes. The shared
+# secret is the X coordinate of d * Q, 32 bytes big-endian.
+#
+# p256_scalar_mult is not constant-time (REVIEW.md M-10). TLS key shares are
+# ephemeral, one scalar for one exchange, so there is no repeated secret to
+# average timing over; the shared fix belongs in p256_scalar_mult itself.
+
+# Write the key share for `priv` (32 bytes big-endian, in [1, n-1]) to `out`.
+pub fn p256_ecdh_public(out: *u8, priv: *u8)
+    var G: P256Point
+    p256_point_generator(@G)
+    var q: P256Point
+    p256_scalar_mult(@q, priv, 32, @G)
+    var x: FeP256
+    var y: FeP256
+    p256_point_to_affine(@q, @x, @y)
+    out[0] = 0x04
+    fep256_to_bytes(@x, out + 1)
+    fep256_to_bytes(@y, out + 33)
+
+# Compute the shared secret of `priv` and the peer's 65-byte key share into
+# `shared` (32 bytes). Returns 0, or -1 if the peer's share is not a valid
+# point: not uncompressed, a coordinate not below p, or off the curve. P-256
+# has cofactor 1, so a valid point has order n and a scalar in [1, n-1] never
+# reaches the identity; that is checked anyway rather than assumed.
+pub fn p256_ecdh(shared: *u8, priv: *u8, peer: *u8) -> i32
+    if peer[0] != 0x04
+        return -1
+    var x: FeP256
+    var y: FeP256
+    fep256_from_bytes(@x, peer + 1)
+    fep256_from_bytes(@y, peer + 33)
+    var p: FeP256
+    get_p256_prime(@p)
+    if fep256_cmp(@x, @p) >= 0 || fep256_cmp(@y, @p) >= 0
+        return -1
+    if p256_affine_on_curve(@x, @y) != 1
+        return -1
+
+    var q: P256Point
+    p256_point_from_affine(@q, @x, @y)
+    var r: P256Point
+    p256_scalar_mult(@r, priv, 32, @q)
+    var rx: FeP256
+    var ry: FeP256
+    if p256_point_to_affine(@r, @rx, @ry) != 1
+        return -1
+    fep256_to_bytes(@rx, shared)
+    mem_zero(@r as *u8, sizeof(P256Point))
+    mem_zero(@rx as *u8, sizeof(FeP256))
+    mem_zero(@ry as *u8, sizeof(FeP256))
+    return 0
 
 # ============================================================================
 # Signature Serialization

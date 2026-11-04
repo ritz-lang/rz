@@ -1221,3 +1221,124 @@ fn test_ecdsa_deterministic_signature() -> i32
         return 4
 
     return 0
+
+# ============================================================================
+# ECDHE key shares (AGAST #2182)
+# ============================================================================
+# Vector from OpenSSL 3.5: two prime256v1 keys and `openssl pkeyutl -derive`.
+# The unreduced shares are on the curve only once a coordinate is reduced mod
+# p: (5 + p, y) and (x, 5 + p). The y one is refused by the range check alone.
+# The x one would also fail p256_affine_on_curve, whose sums do not fully
+# reduce an out-of-range x, so it pins the result, not the range check.
+
+fn hex_digit_2182(c: u8) -> u8
+    if c >= 97
+        return c - 87
+    return c - 48
+
+fn hex_2182(s: *u8, out: *u8, n: i64)
+    var i: i64 = 0
+    while i < n
+        out[i] = (hex_digit_2182(s[2 * i]) << 4) | hex_digit_2182(s[2 * i + 1])
+        i += 1
+
+fn priv_a_2182() -> *u8
+    return c"f3e63864fef62db9a742c1442339ceab04dd78963c7eab2f5294b08c3c6462f1"
+
+fn pub_a_2182() -> *u8
+    return c"04eb371111e3efea4fe014215a959adba662b60f3d4a066cbd251957169875d93e77b24152c091b0fdf1ee568729e5a87dc60118f25dbc264e79aa9543133402b3"
+
+fn priv_b_2182() -> *u8
+    return c"b7abbaab5ccdcfd16ce543d4fe7f6e40037e3b830308ac4f590956cea01141fd"
+
+fn pub_b_2182() -> *u8
+    return c"04f9d036332a8213df810c5add670273ca9e6b0e7cc34c27706c258ad8206643dff7e47af54de8454e060ad059f4c9d2ff0197a03ab99d7c984685e9c03861dc36"
+
+fn shared_ab_2182() -> *u8
+    return c"4ea46f21b5a59c4f8e80a3ec6df3b59f61d8b2310eedbd3124ed53c6ef20ebb5"
+
+# `priv` against the 65-byte share in `hex`: p256_ecdh's result.
+fn ecdh_hex_2182(shared: *u8, priv_hex: *u8, peer_hex: *u8) -> i32
+    var d: [32]u8
+    var peer: [65]u8
+    hex_2182(priv_hex, @d[0], 32)
+    hex_2182(peer_hex, @peer[0], 65)
+    return p256_ecdh(shared, @d[0], @peer[0])
+
+[[test]]
+fn test_ecdh_public_matches_openssl() -> i32
+    var d: [32]u8
+    var want: [65]u8
+    var got: [65]u8
+    hex_2182(priv_a_2182(), @d[0], 32)
+    hex_2182(pub_a_2182(), @want[0], 65)
+    p256_ecdh_public(@got[0], @d[0])
+    if mem_eq(@got[0], @want[0], 65) != 1
+        return 1
+    return 0
+
+[[test]]
+fn test_ecdh_shared_secret_matches_openssl_both_ways() -> i32
+    var want: [32]u8
+    hex_2182(shared_ab_2182(), @want[0], 32)
+    var s1: [32]u8
+    if ecdh_hex_2182(@s1[0], priv_a_2182(), pub_b_2182()) != 0
+        return 1
+    if mem_eq(@s1[0], @want[0], 32) != 1
+        return 2
+    var s2: [32]u8
+    if ecdh_hex_2182(@s2[0], priv_b_2182(), pub_a_2182()) != 0
+        return 3
+    if mem_eq(@s2[0], @want[0], 32) != 1
+        return 4
+    return 0
+
+[[test]]
+fn test_ecdh_rejects_compressed_prefix() -> i32
+    var d: [32]u8
+    var peer: [65]u8
+    var s: [32]u8
+    hex_2182(priv_a_2182(), @d[0], 32)
+    hex_2182(pub_b_2182(), @peer[0], 65)
+    peer[0] = 0x02
+    if p256_ecdh(@s[0], @d[0], @peer[0]) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_ecdh_rejects_point_off_curve() -> i32
+    var d: [32]u8
+    var peer: [65]u8
+    var s: [32]u8
+    hex_2182(priv_a_2182(), @d[0], 32)
+    hex_2182(pub_b_2182(), @peer[0], 65)
+    peer[64] = peer[64] ^ 1
+    if p256_ecdh(@s[0], @d[0], @peer[0]) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_ecdh_rejects_all_zero_share() -> i32
+    var d: [32]u8
+    var peer: [65]u8
+    var s: [32]u8
+    hex_2182(priv_a_2182(), @d[0], 32)
+    mem_zero(@peer[0], 65)
+    peer[0] = 0x04
+    if p256_ecdh(@s[0], @d[0], @peer[0]) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_ecdh_rejects_unreduced_x() -> i32
+    var s: [32]u8
+    if ecdh_hex_2182(@s[0], priv_a_2182(), c"04ffffffff00000001000000000000000000000001000000000000000000000004459243b9aa581806fe913bce99817ade11ca503c64d9a3c533415c083248fbcc") != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_ecdh_rejects_unreduced_y() -> i32
+    var s: [32]u8
+    if ecdh_hex_2182(@s[0], priv_a_2182(), c"04d7325d7646cd60d80a92738ceb345f844cffaf35841022cab176f692de8de1d7ffffffff00000001000000000000000000000001000000000000000000000004") != -1
+        return 1
+    return 0
