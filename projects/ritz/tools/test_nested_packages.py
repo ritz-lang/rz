@@ -144,10 +144,21 @@ class TestRealWorkspace:
     @pytest.mark.parametrize("pkg", [
         "ritz/ritzlib/tests",          # #1345, now by walk instead of by name
         "larb/tools/ritz-stats",
-        "spire/httplib",
     ])
     def test_other_nested_packages_are_projects(self, rz, pkg):
         assert pkg in rz.discover_projects()
+
+    def test_spire_httplib_fork_stays_deleted(self, rz):
+        # #1385: this was an ungated copy of projects/http. spire depends on
+        # projects/http directly, so a second tree can only drift.
+        assert "spire/httplib" not in rz.discover_projects()
+
+    def test_known_failing_entries_name_real_projects(self, rz):
+        # Strict-xpass only fires for a project that ran, so an excuse for a
+        # deleted package is silently ignored and would outlive it forever.
+        found = set(rz.discover_projects())
+        stale = sorted(set(rz.known_failing_from_config("build")) - found)
+        assert stale == []
 
     def test_examples_are_left_to_regression_sh(self, rz):
         assert not [p for p in rz.discover_projects()
