@@ -15,8 +15,10 @@ The first gaps these programs exposed are closed: ritz0's by AGAST #2157,
 ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). AGAST
 #2161 added enum payloads, array and tuple elements, temporaries and moves
 inside loops, closed for ritz0; ritz1's by AGAST #2165, except tuple
-elements (a strict xfail citing #1526, ritz1's missing tuple literals). A new
-gap goes in as a strict xfail, so the room that closes it has to flip it.
+elements (a strict xfail citing #1526, ritz1's missing tuple literals).
+AGAST #2168 added moves out of a field, closed for ritz1; ritz0's are #2171.
+A new gap goes in as a strict xfail, so the room that closes it has to flip
+it.
 """
 
 import os
@@ -345,6 +347,62 @@ pub fn main() -> i32
     f()
     return DROPS
 """, 1, {}),
+
+    # AGAST #2168 from here on.  Moving a field out moves only that field:
+    # its new owner drops it, and the rest of the struct (nothing move-only
+    # left in a Holder) drops with the binding, so t is dropped once.
+    "field_move_return": ("""\
+fn take() -> Tracked
+    var h = Holder { t: make(4), n: 1 }
+    return h.t
+
+fn f() -> i32
+    var u = take()
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 1, {"ritz0": 2171}),
+
+    # (`u: Tracked` annotated: ritz1 can't infer it yet, AGAST #2172.)
+    "field_move_binding": ("""\
+fn f() -> i32
+    var h = Holder { t: make(4), n: 1 }
+    var u: Tracked = h.t
+    return DROPS * 10 + h.n
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 2, {"ritz0": 2171}),
+
+    # consume() drops t; h's drop must not drop it again.
+    "field_move_into_callee": ("""\
+fn f() -> i32
+    var h = Holder { t: make(4), n: 1 }
+    consume(h.t)
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {"ritz0": 2171}),
+
+    # A temporary whose move-only field is moved out isn't dropped too
+    # (`u: Tracked` annotated for ritz1, AGAST #2172).
+    "temporary_field_moved": ("""\
+fn mk(id: i32) -> Holder
+    return Holder { t: make(id), n: 0 }
+
+fn f() -> i32
+    var u: Tracked = mk(3).t
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 1, {}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -405,6 +463,14 @@ pub fn main() -> i32
         break
     return t.id
 """, "t", {}),
+
+    # AGAST #2168: the field moved out can't be used again.
+    "field_after_field_move": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    var u = h.t
+    return h.t.id
+""", "h.t", {"ritz0": 2171}),
 }
 
 

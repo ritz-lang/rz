@@ -53,10 +53,25 @@
 # or a `continue` reaches the head with the binding moved, each recorded use
 # is reported, as ritz0's re-check of the body reports it.
 #
+# Fields (AGAST #2168).  Moving a move-only field out of a binding (`return
+# h.t`, `var u = h.t`, `consume(h.t)`) moves that field only, as in Rust: the
+# binding's `fmask` bit for it is set at run time, so the binding's drop
+# skips it, and the move check rejects a later use of the field or of the
+# whole binding (a field that isn't moved, `h.n`, stays usable).  Assigning
+# the field (`h.t = v`) makes it owned again.  A type with its own `drop`
+# can't be partly moved (Rust's E0509).  A path `h.a.t` moves the field `a`
+# of h.  A temporary whose move-only field is moved out isn't dropped
+# (ritz0's rule: no partial drops of a temporary).  ritz0 doesn't track
+# field moves yet (AGAST #2171).
+#
+# Match arms (AGAST #2168, ritz0 #2161).  Each arm of a match or an
+# if-expression starts from the move state before it; afterwards a binding
+# is moved if an arm that falls through moved it (own_arms_*), `shadow`
+# included.
+#
 # A fn without move-only bindings, in a module without `impl Drop`, emits
 # nothing extra.
 #
-# Not yet: moves out of a field, and merging match-arm moves (AGAST #2168).
 # Tests: ritz0/test_ownership_free_count.py (shared with ritz0) and
 # ritz0/test_ritz1_ownership.py.
 
@@ -76,14 +91,24 @@ const OWN_INIT_CAP: i32 = 16
 # Deeper than any real struct nesting; stops a malformed recursive type.
 const OWN_MAX_DEPTH: i32 = 32
 
-# Loop move-check events (OwnState.loop_ev): [kind, slot, depth, a, b, c, d]
-# with `slot` the binding's storage register (its identity) and `depth` the
-# loop nesting depth they belong to.
-const OWN_EV_INTS: i32 = 7
-const OWN_EV_SAVE: i32 = 1    # loop entry: a = shadow before, b = moved, c:d = its move
-const OWN_EV_USE: i32 = 2     # a use while shadowed: a = 1 for a borrow, c:d = where
-const OWN_EV_HEAD: i32 = 3    # `continue` with it moved: c:d = the move
-const OWN_EV_BREAK: i32 = 4   # `break` with it moved: c:d = the move
+# Loop move-check events (OwnState.loop_ev): [kind, slot, depth, a, b, c, d,
+# e, f] with `slot` the binding's storage register (its identity) and
+# `depth` the loop nesting depth they belong to.
+const OWN_EV_INTS: i32 = 9
+# Loop entry: a = shadow before, b = moved, c:d = its move, e = fmoved,
+# f = fshadow before.
+const OWN_EV_SAVE: i32 = 1
+# A use while shadowed: a = 1 for a borrow + 2 when the whole binding was
+# shadowed, b = 1 + the field used (0 for the whole binding), c:d = where,
+# e = the fields it would be using moved (fshadow bits).
+const OWN_EV_USE: i32 = 2
+# `continue` / `break` with it (partly) moved: b = moved, c:d = the move,
+# e = fmoved.
+const OWN_EV_HEAD: i32 = 3
+const OWN_EV_BREAK: i32 = 4
+# Fields 0..30 can be moved out (one bit each of `fmask`).
+const OWN_MAX_FIELDS: i32 = 31
+const OWN_ALL_FIELDS: i32 = 0x7FFFFFFF
 
 pub fn own_init(s: *EmitterState)
     let o: *OwnState = malloc(sizeof(OwnState)) as *OwnState
@@ -112,6 +137,9 @@ pub fn own_init(s: *EmitterState)
     o.loop_ev_cap = OWN_INIT_CAP
     o.loop_depth = 0
     o.last_pop_dead = 0
+    o.fm_loc = malloc((OWN_INIT_CAP * 16) as i64) as *i32
+    o.fm_count = 0
+    o.fm_cap = OWN_INIT_CAP
     s.own = o
 
 fn own_live_at(o: *OwnState, i: i32) -> *OwnBinding
@@ -134,7 +162,7 @@ fn own_ev_at(o: *OwnState, i: i32) -> *i32
     let base: *i32 = o.loop_ev
     return base + i * OWN_EV_INTS
 
-fn own_ev_push(o: *OwnState, kind: i32, slot: i32, a: i32, b: i32, c: i32, d: i32)
+fn own_ev_push(o: *OwnState, kind: i32, slot: i32, a: i32, b: i32, c: i32, d: i32, e: i32, f: i32)
     if o.loop_ev_count >= o.loop_ev_cap
         let cap: i32 = o.loop_ev_cap * 2
         o.loop_ev = realloc(o.loop_ev as *u8, (cap * OWN_EV_INTS * 4) as i64) as *i32
@@ -147,7 +175,43 @@ fn own_ev_push(o: *OwnState, kind: i32, slot: i32, a: i32, b: i32, c: i32, d: i3
     ev[4] = b
     ev[5] = c
     ev[6] = d
+    ev[7] = e
+    ev[8] = f
     o.loop_ev_count = o.loop_ev_count + 1
+
+# AGAST #2168: remember where field `field` of the binding at `slot` moved.
+fn own_fm_push(o: *OwnState, slot: i32, field: i32, line: i32, col: i32)
+    if o.fm_count >= o.fm_cap
+        let cap: i32 = o.fm_cap * 2
+        o.fm_loc = realloc(o.fm_loc as *u8, (cap * 16) as i64) as *i32
+        o.fm_cap = cap
+    let base: *i32 = o.fm_loc
+    let r: *i32 = base + o.fm_count * 4
+    r[0] = slot
+    r[1] = field
+    r[2] = line
+    r[3] = col
+    o.fm_count = o.fm_count + 1
+
+# The latest recorded move of that field: [slot, field, line, col], or null.
+fn own_fm_find(o: *OwnState, slot: i32, field: i32) -> *i32
+    let base: *i32 = o.fm_loc
+    var i: i32 = o.fm_count - 1
+    while i >= 0
+        let r: *i32 = base + i * 4
+        if r[0] == slot and r[1] == field
+            return r
+        i -= 1
+    null
+
+# The lowest field index set in `bits` (bits != 0).
+fn own_low_bit(bits: i32) -> i32
+    var i: i32 = 0
+    while i < OWN_MAX_FIELDS
+        if (bits & (1 << i)) != 0
+            return i
+        i += 1
+    0
 
 # =============================================================================
 # Move-only types
@@ -334,6 +398,104 @@ fn own_emit_field_glue(s: *EmitterState, ptr: i32, f: *StructField, depth: i32)
     var el: i32 = 0
     if own_field_array(f, @n, @en, @el) == 1
         own_emit_array_glue(s, ptr, n, en, el, depth)
+
+# AGAST #2168: drop the struct `name` at `ptr` (no drop of its own) except
+# the fields whose bit is set in the i32 register `mask`: each move-only
+# field in declaration order, if it isn't moved out.
+fn own_emit_masked_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, mask: i32)
+    let st: *StructDef = find_struct(s, name, len)
+    if st == null
+        return
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if own_field_move_only(s, f, 0) == 1
+            var next: i32 = 0 - 1
+            if idx < OWN_MAX_FIELDS
+                let t: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, t)
+                emit_str(s, c" = and i32 ")
+                emit_reg(s, mask)
+                emit_str(s, c", ")
+                emit_int(s, (1 << idx) as i64)
+                emit_str(s, c"\n")
+                let c: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, c)
+                emit_str(s, c" = icmp eq i32 ")
+                emit_reg(s, t)
+                emit_str(s, c", 0\n")
+                let do_label: i32 = next_label(s)
+                next = next_label(s)
+                emit_str(s, c"  br i1 ")
+                emit_reg(s, c)
+                emit_str(s, c", label %")
+                emit_label(s, do_label)
+                emit_str(s, c", label %")
+                emit_label(s, next)
+                emit_str(s, c"\n")
+                begin_block(s, do_label)
+            var r: MemberPtrResult
+            emit_member_gep_from_ptr(s, @r, ptr, st, idx, f)
+            own_emit_field_glue(s, r.reg, f, 1)
+            if next >= 0
+                own_case_end(s, next)
+        idx += 1
+        f = f.next
+
+# The binding's value at `ptr`, with its moved-out fields per the mask
+# register `mask` (0: none can be).
+fn own_emit_binding_glue(s: *EmitterState, b: *OwnBinding, ptr: i32, mask: i32)
+    if mask != 0
+        own_emit_masked_glue(s, ptr, b.type_name, b.type_name_len, mask)
+    else
+        own_emit_value_glue(s, ptr, b.type_name, b.type_name_len, b.count)
+
+# Load the binding's moved-field mask (0 when it has none).
+fn own_load_mask(s: *EmitterState, b: *OwnBinding) -> i32
+    if b.fmask == 0
+        return 0
+    let m: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, m)
+    emit_str(s, c" = load i32, ptr ")
+    emit_reg(s, b.fmask)
+    emit_str(s, c"\n")
+    m
+
+# Set (`set` 1) or clear the run-time moved bit of field `idx`.
+fn own_emit_mask_bit(s: *EmitterState, b: *OwnBinding, idx: i32, set: i32)
+    if b.fmask == 0 or idx >= OWN_MAX_FIELDS
+        return
+    let m: i32 = own_load_mask(s, b)
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    if set == 1
+        emit_str(s, c" = or i32 ")
+        emit_reg(s, m)
+        emit_str(s, c", ")
+        emit_int(s, (1 << idx) as i64)
+    else
+        emit_str(s, c" = and i32 ")
+        emit_reg(s, m)
+        emit_str(s, c", ")
+        emit_int(s, (OWN_ALL_FIELDS ^ (1 << idx)) as i64)
+    emit_str(s, c"\n  store i32 ")
+    emit_reg(s, r)
+    emit_str(s, c", ptr ")
+    emit_reg(s, b.fmask)
+    emit_str(s, c"\n")
+
+fn own_store_mask(s: *EmitterState, b: *OwnBinding, v: i32)
+    if b.fmask == 0
+        return
+    emit_str(s, c"  store i32 ")
+    emit_int(s, v as i64)
+    emit_str(s, c", ptr ")
+    emit_reg(s, b.fmask)
+    emit_str(s, c"\n")
 
 # A value (count 0) or an array of `count` elements, at `ptr`.
 fn own_emit_value_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, count: i32)
@@ -539,7 +701,7 @@ fn own_emit_drop(s: *EmitterState, b: *OwnBinding)
     emit_str(s, c"  store i1 0, ptr ")
     emit_reg(s, b.flag)
     emit_str(s, c"\n")
-    own_emit_value_glue(s, b.slot, b.type_name, b.type_name_len, b.count)
+    own_emit_binding_glue(s, b, b.slot, own_load_mask(s, b))
     emit_str(s, c"  br label %")
     emit_label(s, next)
     emit_str(s, c"\n")
@@ -624,8 +786,8 @@ pub fn own_pop_scope(s: *EmitterState) -> i32
     dead
 
 # Enter / leave a loop body.  `break` and `continue` drop live[loop_base..].
-# Entering shadows every unmoved binding (all are outside the loop), saving
-# its state for own_loop_exit.
+# Entering shadows every unmoved binding (all are outside the loop), and
+# every field of it not moved out, saving its state for own_loop_exit.
 pub fn own_loop_enter(s: *EmitterState) -> i32
     let o: *OwnState = s.own
     let old: i32 = o.loop_base
@@ -634,8 +796,11 @@ pub fn own_loop_enter(s: *EmitterState) -> i32
     var i: i32 = 0
     while i < o.live_count
         let b: *OwnBinding = own_live_at(o, i)
-        own_ev_push(o, OWN_EV_SAVE, b.slot, b.shadow, b.moved, b.move_line, b.move_col)
+        own_ev_push(o, OWN_EV_SAVE, b.slot, b.shadow, b.moved, b.move_line, b.move_col, b.fmoved, b.fshadow)
         b.shadow = 1 - b.moved
+        b.fshadow = 0
+        if b.moved == 0
+            b.fshadow = OWN_ALL_FIELDS ^ b.fmoved
         i += 1
     old
 
@@ -649,34 +814,59 @@ fn own_ev_find(o: *OwnState, kind: i32, slot: i32, depth: i32) -> *i32
         j += 1
     null
 
+# Report the recorded use `ev` of `b`, given its state at the loop head
+# (`head`: [moved, line, col, fmoved]).  Returns 1 if it was an error.
+fn own_report_loop_use(s: *EmitterState, ev: *i32, b: *OwnBinding, head: *i32) -> i32
+    let borrow: i32 = ev[3] & 1
+    if (ev[3] & 2) != 0 and head[0] == 1
+        if borrow == 1
+            own_error_borrow_at(s, ev[5], ev[6], b)
+        else
+            own_error_use_at(s, ev[5], ev[6], b, head[1], head[2])
+        return 1
+    let hit: i32 = head[3] & ev[7]
+    if hit == 0
+        return 0
+    let fi: i32 = own_low_bit(hit)
+    if borrow == 1
+        own_error_borrow_field_at(s, ev[5], ev[6], b, fi)
+    else
+        own_error_field_use_at(s, ev[5], ev[6], b, fi)
+    1
+
 # After the loop body (its scope already popped, so every live binding is
-# from outside the loop).  A binding reaches the head moved when the body
-# falls through with it moved or a `continue` leaves with it moved; then
-# every use recorded while it was shadowed is an error, as in ritz0's
-# re-check of the body.  After the loop a binding is moved if it was at
-# entry, at the head, or at a `break`.
+# from outside the loop).  A binding (or a field of it) reaches the head
+# moved when the body falls through with it moved or a `continue` leaves
+# with it moved; then every use recorded while it was shadowed is an error,
+# as in ritz0's re-check of the body.  After the loop a binding (field) is
+# moved if it was at entry, at the head, or at a `break`.
 pub fn own_loop_exit(s: *EmitterState, old: i32)
     let o: *OwnState = s.own
     let depth: i32 = o.loop_depth
     let n: i32 = o.live_count
-    # Per live binding: moved at the head, and where.
+    # Per live binding: moved at the head, where, and its fields moved there.
     var head: *i32 = null
     if n > 0
-        head = malloc((n as i64) * 12) as *i32
+        head = malloc((n as i64) * 16) as *i32
     var i: i32 = 0
     while i < n
         let b: *OwnBinding = own_live_at(o, i)
-        head[i * 3] = 0
-        if o.last_pop_dead == 0 and b.moved == 1
-            head[i * 3] = 1
-            head[i * 3 + 1] = b.move_line
-            head[i * 3 + 2] = b.move_col
-        else
-            let hv: *i32 = own_ev_find(o, OWN_EV_HEAD, b.slot, depth)
-            if hv != null
-                head[i * 3] = 1
-                head[i * 3 + 1] = hv[5]
-                head[i * 3 + 2] = hv[6]
+        let h: *i32 = head + i * 4
+        h[0] = 0
+        h[3] = 0
+        if o.last_pop_dead == 0
+            h[3] = b.fmoved
+            if b.moved == 1
+                h[0] = 1
+                h[1] = b.move_line
+                h[2] = b.move_col
+        let hv: *i32 = own_ev_find(o, OWN_EV_HEAD, b.slot, depth)
+        if hv != null
+            if h[0] == 0 and hv[4] == 1
+                h[0] = 1
+                h[1] = hv[5]
+                h[2] = hv[6]
+            h[3] = h[3] | hv[7]
         i += 1
     # The recorded uses, in order: an error, or (unreported, in an inner
     # loop) a use the enclosing loop's check still has to see.
@@ -690,45 +880,58 @@ pub fn own_loop_exit(s: *EmitterState, old: i32)
                 if cb.slot == ev[1]
                     break
                 bi -= 1
-            if bi >= 0 and head[bi * 3] == 1
-                let ub: *OwnBinding = own_live_at(o, bi)
-                if ev[3] == 1
-                    own_error_borrow_at(s, ev[5], ev[6], ub)
-                else
-                    own_error_use_at(s, ev[5], ev[6], ub, head[bi * 3 + 1], head[bi * 3 + 2])
-            else if bi >= 0 and depth > 1
+            var reported: i32 = 0
+            if bi >= 0
+                reported = own_report_loop_use(s, ev, own_live_at(o, bi), head + bi * 4)
+            if bi >= 0 and reported == 0 and depth > 1
+                # Still shadowed in the enclosing loop: what it shadowed
+                # before this loop was entered.
                 let sv: *i32 = own_ev_find(o, OWN_EV_SAVE, ev[1], depth)
-                if sv != null and sv[3] == 1
-                    ev[2] = depth - 1
+                if sv != null
+                    var a: i32 = ev[3] & 1
+                    if sv[3] == 1
+                        a = a | (ev[3] & 2)
+                    let fm: i32 = ev[7] & sv[8]
+                    if (a & 2) != 0 or fm != 0
+                        ev[2] = depth - 1
+                        ev[3] = a
+                        ev[7] = fm
         j += 1
     # The state after the loop, and the enclosing loop's shadow.
     i = 0
     while i < n
         let b: *OwnBinding = own_live_at(o, i)
+        let h: *i32 = head + i * 4
         let sv: *i32 = own_ev_find(o, OWN_EV_SAVE, b.slot, depth)
+        let bv: *i32 = own_ev_find(o, OWN_EV_BREAK, b.slot, depth)
         var am: i32 = 0
         var al: i32 = 0
         var ac: i32 = 0
+        var fm: i32 = h[3]
         if sv != null and sv[4] == 1
             am = 1
             al = sv[5]
             ac = sv[6]
-        else if head[i * 3] == 1
+        else if h[0] == 1
             am = 1
-            al = head[i * 3 + 1]
-            ac = head[i * 3 + 2]
-        else
-            let bv: *i32 = own_ev_find(o, OWN_EV_BREAK, b.slot, depth)
-            if bv != null
-                am = 1
-                al = bv[5]
-                ac = bv[6]
+            al = h[1]
+            ac = h[2]
+        else if bv != null and bv[4] == 1
+            am = 1
+            al = bv[5]
+            ac = bv[6]
+        if sv != null
+            fm = fm | sv[7]
+        if bv != null
+            fm = fm | bv[7]
         b.moved = am
         if am == 1
             b.move_line = al
             b.move_col = ac
+        b.fmoved = fm
         if sv != null
             b.shadow = sv[3]
+            b.fshadow = sv[8]
         i += 1
     if head != null
         free(head as *u8)
@@ -747,7 +950,7 @@ pub fn own_loop_exit(s: *EmitterState, old: i32)
     o.loop_base = old
 
 # Before a `break` (is_continue 0) / `continue` (1) branches out of the
-# loop body: record the moved outer bindings, then drop the body's.
+# loop body: record the (partly) moved outer bindings, then drop the body's.
 pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
     let o: *OwnState = s.own
     if o.loop_base < 0
@@ -760,8 +963,16 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
     var i: i32 = 0
     while i < o.loop_base and i < o.live_count
         let b: *OwnBinding = own_live_at(o, i)
-        if b.moved == 1 and own_ev_find(o, kind, b.slot, o.loop_depth) == null
-            own_ev_push(o, kind, b.slot, 0, 1, b.move_line, b.move_col)
+        if b.moved == 1 or b.fmoved != 0
+            let ev: *i32 = own_ev_find(o, kind, b.slot, o.loop_depth)
+            if ev == null
+                own_ev_push(o, kind, b.slot, 0, b.moved, b.move_line, b.move_col, b.fmoved, 0)
+            else
+                if ev[4] == 0 and b.moved == 1
+                    ev[4] = 1
+                    ev[5] = b.move_line
+                    ev[6] = b.move_col
+                ev[7] = ev[7] | b.fmoved
         i += 1
     if o.live_count <= o.loop_base
         return
@@ -822,6 +1033,10 @@ pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     b.move_col = 0
     b.count = 0
     b.shadow = 0
+    b.fmask = 0
+    b.fmoved = 0
+    b.fshadow = 0
+    b.aux = 0
     o.temp_count = o.temp_count + 1
     # In `all` too, so a `ret` before its drop (a `return`'s value) drops it.
     own_grow_all(o)
@@ -860,6 +1075,16 @@ pub fn own_cond_end(s: *EmitterState)
     let o: *OwnState = s.own
     own_drop_temps_from(s, o.stmt_mark)
 
+# AGAST #2168: 1 when a value of struct type `name` can have fields moved
+# out: it has no drop of its own and a move-only field.
+fn own_partly_movable(s: *EmitterState, name: *u8, len: i32) -> i32
+    if own_has_drop_impl(s, name, len) == 1
+        return 0
+    let st: *StructDef = find_struct(s, name, len)
+    if st == null
+        return 0
+    own_fields_move_only(s, st.fields, 0)
+
 # Register the local at `idx` if it is a move-only value.  `owned` is 1 when
 # it starts out holding a value (an initialised declaration, a parameter).
 fn own_register(s: *EmitterState, idx: i32, owned: i32)
@@ -889,13 +1114,23 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
             lb.local_idx = idx
             lb.moved = 0
             lb.shadow = 0
+            lb.fmoved = 0
+            lb.fshadow = 0
             own_store_flag(s, lb, owned)
+            own_store_mask(s, lb, 0)
             return
         i += 1
     let flag: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, flag)
     emit_str(s, c" = alloca i1  ; drop flag\n")
+    # AGAST #2168: a struct with no drop of its own can be partly moved.
+    var fmask: i32 = 0
+    if count == 0 and own_partly_movable(s, name, len) == 1
+        fmask = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, fmask)
+        emit_str(s, c" = alloca i32  ; moved fields\n")
     own_grow_live(o)
     let b: *OwnBinding = own_live_at(o, o.live_count)
     b.name = loc.name
@@ -910,11 +1145,16 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
     b.move_col = 0
     b.count = count
     b.shadow = 0
+    b.fmask = fmask
+    b.fmoved = 0
+    b.fshadow = 0
+    b.aux = 0
     o.live_count = o.live_count + 1
     own_grow_all(o)
     own_copy_binding(own_all_at(o, o.all_count), b)
     o.all_count = o.all_count + 1
     own_store_flag(s, b, owned)
+    own_store_mask(s, b, 0)
 
 # Start of a fn body (after its params are bound): the fn's outermost block,
 # holding its by-value move-only params, which the callee owns.
@@ -931,6 +1171,7 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     o.loop_ev_count = 0
     o.loop_depth = 0
     o.last_pop_dead = 0
+    o.fm_count = 0
     own_push_scope(s)
     var p: *Param = params
     while p != null
@@ -1007,6 +1248,68 @@ fn own_error_borrow_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding)
 fn own_error_use(s: *EmitterState, e: *Expr, b: *OwnBinding)
     own_error_use_at(s, e.span.line, e.span.col, b, b.move_line, b.move_col)
 
+# Field `idx` of the struct `name`, or null.
+fn own_struct_field(s: *EmitterState, name: *u8, len: i32, idx: i32) -> *StructField
+    let st: *StructDef = find_struct(s, name, len)
+    if st == null
+        return null
+    var f: *StructField = st.fields
+    var i: i32 = 0
+    while f != null and i < idx
+        f = f.next
+        i += 1
+    f
+
+# `b.f` for field `fi` of the binding.
+fn own_eprint_field(s: *EmitterState, b: *OwnBinding, fi: i32)
+    own_eprint_name(b.name, b.name_len)
+    eprint_char('.')
+    let f: *StructField = own_struct_field(s, b.type_name, b.type_name_len, fi)
+    if f != null
+        own_eprint_name(f.name, f.name_len)
+
+# AGAST #2168: a use of field `fi` (or of the whole binding) once it is
+# moved out: `use of moved value: `h.t` (moved at F:L:C)`.
+fn own_error_field_use_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, fi: i32)
+    own_eprint_loc(line, col)
+    eprints_cstr(c": error: use of moved value: `")
+    own_eprint_field(s, b, fi)
+    eprints_cstr(c"`")
+    let r: *i32 = own_fm_find(s.own, b.slot, fi)
+    if r != null
+        eprints_cstr(c" (moved at ")
+        own_eprint_loc(r[2], r[3])
+        eprints_cstr(c")")
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+fn own_error_borrow_field_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, fi: i32)
+    own_eprint_loc(line, col)
+    eprints_cstr(c": error: cannot borrow `")
+    own_eprint_name(b.name, b.name_len)
+    eprints_cstr(c"` - `")
+    own_eprint_field(s, b, fi)
+    eprints_cstr(c"` has been moved\n")
+    s.error_count = s.error_count + 1
+
+# `x.f.g`, as written.
+fn own_eprint_path(e: *Expr)
+    if e.kind == EXPR_MEMBER
+        own_eprint_path(e.left)
+        eprint_char('.')
+        own_eprint_name(e.ident_ptr, e.ident_len)
+    else if e.kind == EXPR_IDENT
+        own_eprint_name(e.ident_ptr, e.ident_len)
+
+fn own_error_move_from_drop(s: *EmitterState, line: i32, col: i32, e: *Expr, tname: *u8, tlen: i32)
+    own_eprint_loc(line, col)
+    eprints_cstr(c": error: cannot move out of `")
+    own_eprint_path(e)
+    eprints_cstr(c"`: `")
+    own_eprint_name(tname, own_base_len(tname, tlen))
+    eprints_cstr(c"` implements Drop\n")
+    s.error_count = s.error_count + 1
+
 fn own_error_borrow(s: *EmitterState, e: *Expr, b: *OwnBinding)
     own_error_borrow_at(s, e.span.line, e.span.col, b)
 
@@ -1015,8 +1318,146 @@ fn own_error_borrow(s: *EmitterState, e: *Expr, b: *OwnBinding)
 # the use for own_loop_exit.
 fn own_note_use(s: *EmitterState, b: *OwnBinding, line: i32, col: i32, borrow: i32)
     let o: *OwnState = s.own
-    if o.loop_depth > 0 and b.shadow == 1 and b.moved == 0
-        own_ev_push(o, OWN_EV_USE, b.slot, borrow, 0, line, col)
+    if o.loop_depth == 0 or b.moved == 1
+        return
+    let fs: i32 = b.fshadow & (OWN_ALL_FIELDS ^ b.fmoved)
+    if b.shadow == 1 or fs != 0
+        own_ev_push(o, OWN_EV_USE, b.slot, borrow + b.shadow * 2, 0, line, col, fs, 0)
+
+# A use of field `fi` only (AGAST #2168).
+fn own_note_field_use(s: *EmitterState, b: *OwnBinding, fi: i32, line: i32, col: i32)
+    let o: *OwnState = s.own
+    if o.loop_depth == 0 or b.moved == 1
+        return
+    var fs: i32 = 0
+    if fi < OWN_MAX_FIELDS
+        fs = b.fshadow & (1 << fi)
+    if b.shadow == 1 or fs != 0
+        own_ev_push(o, OWN_EV_USE, b.slot, b.shadow * 2, fi + 1, line, col, fs, 0)
+
+# The binding a field / element store `x.f = v`, `x[i] = v` writes into is
+# used as a place: an error if it was moved, but not if one of its fields
+# was (that field may be the one being assigned).
+fn own_note_place_use(s: *EmitterState, b: *OwnBinding, line: i32, col: i32)
+    if b.moved == 1
+        own_error_use_at(s, line, col, b, b.move_line, b.move_col)
+        return
+    let o: *OwnState = s.own
+    if o.loop_depth > 0 and b.shadow == 1
+        own_ev_push(o, OWN_EV_USE, b.slot, 2, 0, line, col, 0, 0)
+
+# `b.<field fi> = v`: the field is owned again (AGAST #2168).
+fn own_field_assigned(s: *EmitterState, b: *OwnBinding, fi: i32)
+    if fi < 0 or fi >= OWN_MAX_FIELDS
+        return
+    let bit: i32 = 1 << fi
+    b.fshadow = b.fshadow & (OWN_ALL_FIELDS ^ bit)
+    if (b.fmoved & bit) != 0
+        b.fmoved = b.fmoved ^ bit
+        own_emit_mask_bit(s, b, fi, 0)
+
+# The leftmost operand of a member path `x.f.g` (x).
+fn own_member_root(e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r.kind == EXPR_MEMBER and r.left != null
+        r = r.left
+    r
+
+# A member path `x.f1...fn` rooted at a registered single-value binding x:
+# fn's field, with x (*out_b), f1's index (*out_top) and the first struct
+# along the path that has its own drop (*out_drop, null if none); else null.
+fn own_member_path(s: *EmitterState, e: *Expr, out_b: **OwnBinding, out_top: *i32, out_drop: **u8, out_drop_len: *i32) -> *StructField
+    if e.kind != EXPR_MEMBER or e.left == null
+        return null
+    let l: *Expr = e.left
+    var tname: *u8 = null
+    var tlen: i32 = 0
+    if l.kind == EXPR_IDENT
+        let b: *OwnBinding = own_lookup(s, l.ident_ptr, l.ident_len)
+        if b == null or b.count > 0
+            return null
+        tname = b.type_name
+        tlen = b.type_name_len
+        *out_b = b
+    else
+        let pf: *StructField = own_member_path(s, l, out_b, out_top, out_drop, out_drop_len)
+        if pf == null or pf.field_type != TYPE_STRUCT
+            return null
+        tname = pf.field_type_name
+        tlen = pf.field_type_name_len
+    let st: *StructDef = find_struct(s, tname, tlen)
+    if st == null
+        return null
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return null
+    if l.kind == EXPR_IDENT
+        *out_top = idx
+        *out_drop = null
+        *out_drop_len = 0
+    if *out_drop == null and own_has_drop_impl(s, tname, tlen) == 1
+        *out_drop = tname
+        *out_drop_len = tlen
+    own_struct_field(s, tname, tlen, idx)
+
+# `call().f` with f a move-only field (ritz0's _is_move_only_field).
+fn own_temp_field_move_only(s: *EmitterState, e: *Expr) -> i32
+    let l: *Expr = e.left
+    if l == null or l.kind != EXPR_CALL
+        return 0
+    var len: i32 = 0
+    let name: *u8 = own_call_ret_type(s, l, @len)
+    if name == null
+        return 0
+    let st: *StructDef = find_struct(s, name, len)
+    if st == null
+        return 0
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return 0
+    own_field_move_only(s, own_struct_field(s, name, len, idx), 0)
+
+# `x.f...` (AGAST #2168): a use of x's field f, or with `mv` 1 a move of it
+# when the path's value is move-only.
+fn own_walk_member(s: *EmitterState, e: *Expr, mv: i32)
+    var b: *OwnBinding = null
+    var top: i32 = 0 - 1
+    var dn: *u8 = null
+    var dl: i32 = 0
+    let f: *StructField = own_member_path(s, e, @b, @top, @dn, @dl)
+    if f == null
+        # Moving a move-only field out of a temporary: the rest of the
+        # temporary isn't dropped either (ritz0: no partial drops).
+        var lmv: i32 = 0
+        if mv == 1 and own_temp_field_move_only(s, e) == 1
+            lmv = 1
+        own_walk(s, e.left, lmv)
+        return
+    let root: *Expr = own_member_root(e)
+    let line: i32 = root.span.line
+    let col: i32 = root.span.col
+    if b.moved == 1
+        own_error_use_at(s, line, col, b, b.move_line, b.move_col)
+        return
+    if top < OWN_MAX_FIELDS and (b.fmoved & (1 << top)) != 0
+        own_error_field_use_at(s, line, col, b, top)
+        return
+    own_note_field_use(s, b, top, line, col)
+    if mv == 0 or own_field_move_only(s, f, 0) == 0
+        return
+    if dn != null
+        own_error_move_from_drop(s, line, col, e, dn, dl)
+        return
+    if b.fmask == 0 or top >= OWN_MAX_FIELDS
+        # Can't be tracked per field: the whole binding moves.
+        b.moved = 1
+        b.move_line = line
+        b.move_col = col
+        own_store_flag(s, b, 0)
+        return
+    b.fmoved = b.fmoved | (1 << top)
+    own_fm_push(s.own, b.slot, top, line, col)
+    own_emit_mask_bit(s, b, top, 1)
 
 # The move-only struct type a call returns by value (its length in
 # *out_len), or null.
@@ -1089,6 +1530,9 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
         if b.moved == 1
             own_error_use(s, e, b)
             return
+        if b.fmoved != 0
+            own_error_field_use_at(s, e.span.line, e.span.col, b, own_low_bit(b.fmoved))
+            return
         own_note_use(s, b, e.span.line, e.span.col, 0)
         if mv == 1
             b.moved = 1
@@ -1101,6 +1545,8 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
             if bb != null
                 if bb.moved == 1
                     own_error_borrow(s, e, bb)
+                else if bb.fmoved != 0
+                    own_error_borrow_field_at(s, e.span.line, e.span.col, bb, own_low_bit(bb.fmoved))
                 else
                     own_note_use(s, bb, e.span.line, e.span.col, 1)
             return
@@ -1108,7 +1554,9 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
         own_walk(s, e.left, 0)
         own_walk(s, e.right, 0)
-    else if k == EXPR_MEMBER or k == EXPR_CAST
+    else if k == EXPR_MEMBER
+        own_walk_member(s, e, mv)
+    else if k == EXPR_CAST
         own_walk(s, e.left, 0)
     else if k == EXPR_TRY
         own_walk(s, e.left, mv)
@@ -1157,6 +1605,13 @@ fn own_checking(s: *EmitterState) -> i32
         return 0
     1
 
+# The index of field `name` in the binding's struct, or -1.
+fn own_field_idx(s: *EmitterState, b: *OwnBinding, name: *u8, len: i32) -> i32
+    let st: *StructDef = find_struct(s, b.type_name, b.type_name_len)
+    if st == null
+        return 0 - 1
+    find_field_index(st, name, len)
+
 # The binding a whole-binding assignment `x = v` writes, or null.
 fn own_assign_target(s: *EmitterState, stmt: *Stmt) -> *OwnBinding
     if stmt.kind != STMT_ASSIGN
@@ -1178,9 +1633,19 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
         own_walk(s, stmt.var_init, 1)
     else if k == STMT_ASSIGN
         let t: *Expr = stmt.if_cond as *Expr
-        if stmt.assign_target_len == 0 and t != null and t.kind != EXPR_IDENT
+        # `x.f = v` (AGAST #2168): once v is checked, x.f is owned again.
+        var fb: *OwnBinding = null
+        if stmt.assign_target_len == 0 and t != null and t.kind == EXPR_MEMBER and t.left != null and t.left.kind == EXPR_IDENT
+            fb = own_lookup(s, t.left.ident_ptr, t.left.ident_len)
+            if fb != null and fb.count > 0
+                fb = null
+        if fb != null
+            own_note_place_use(s, fb, t.left.span.line, t.left.span.col)
+        else if stmt.assign_target_len == 0 and t != null and t.kind != EXPR_IDENT
             own_walk(s, t, 0)
         own_walk(s, stmt.assign_value, 1)
+        if fb != null and fb.moved == 0
+            own_field_assigned(s, fb, own_field_idx(s, fb, t.ident_ptr, t.ident_len))
     else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
         # `x[i] = v`, `x.f = v`, `x.f[i] = v`: x is used, not moved.
         var base: *OwnBinding = null
@@ -1189,13 +1654,13 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
         else
             base = own_lookup(s, stmt.var_name, stmt.var_name_len)
         if base != null
-            if base.moved == 1
-                own_error_use_at(s, stmt.span.line, stmt.span.col, base, base.move_line, base.move_col)
-            else
-                own_note_use(s, base, stmt.span.line, stmt.span.col, 0)
+            own_note_place_use(s, base, stmt.span.line, stmt.span.col)
         if k != STMT_LOCAL_FIELD_ASSIGN
             own_walk(s, stmt.while_cond, 0)
         own_walk(s, stmt.assign_value, 1)
+        # `x.f = v` (AGAST #2168): x.f is owned again, once v is checked.
+        if k == STMT_LOCAL_FIELD_ASSIGN and base != null and base.moved == 0
+            own_field_assigned(s, base, own_field_idx(s, base, stmt.assign_target, stmt.assign_target_len))
     else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
         own_walk(s, stmt.assign_value, 1)
     else if k == STMT_RETURN
@@ -1250,9 +1715,10 @@ fn own_emit_binding_type(s: *EmitterState, b: *OwnBinding)
         return
     emit_llvm_type_struct(s, TYPE_STRUCT, b.type_name, b.type_name_len)
 
-# Before `x = v` is emitted: copy x's old value aside with its flag, so it
-# can be dropped once v (which may still read x) has been stored.  Returns
-# a handle for own_assign_end, or 0 when x is not an owned binding.
+# Before `x = v` is emitted: copy x's old value aside with its flag (and
+# its moved-field mask), so it can be dropped once v (which may still read
+# x) has been stored.  Returns a handle for own_assign_end (a copy of x's
+# binding, freed there), or null when x is not an owned binding.
 pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: *i32) -> *OwnBinding
     *out_old = 0
     *out_flag = 0
@@ -1268,6 +1734,7 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     emit_str(s, c" = load i1, ptr ")
     emit_reg(s, b.flag)
     emit_str(s, c"\n")
+    let m: i32 = own_load_mask(s, b)
     let tmp: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, tmp)
@@ -1291,15 +1758,32 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     emit_str(s, c"\n")
     *out_old = tmp
     *out_flag = f
-    b
+    let h: *OwnBinding = malloc(sizeof(OwnBinding)) as *OwnBinding
+    own_copy_binding(h, b)
+    h.aux = m
+    h
 
 # After `x = v` is emitted: x owns v; drop the old value if x owned one.
-pub fn own_assign_end(s: *EmitterState, b: *OwnBinding, old: i32, old_flag: i32)
-    if b == null
+# `h` is own_assign_begin's handle; x is looked up again by its storage, as
+# emitting v may have moved the live list.
+pub fn own_assign_end(s: *EmitterState, h: *OwnBinding, old: i32, old_flag: i32)
+    if h == null
         return
+    let o: *OwnState = s.own
+    var b: *OwnBinding = h
+    var i: i32 = o.live_count - 1
+    while i >= 0
+        let lb: *OwnBinding = own_live_at(o, i)
+        if lb.slot == h.slot
+            b = lb
+            break
+        i -= 1
     b.moved = 0
     b.shadow = 0
+    b.fmoved = 0
+    b.fshadow = 0
     own_store_flag(s, b, 1)
+    own_store_mask(s, b, 0)
     let saved: i32 = last_expr_here(s)
     let do_label: i32 = next_label(s)
     let next: i32 = next_label(s)
@@ -1311,33 +1795,40 @@ pub fn own_assign_end(s: *EmitterState, b: *OwnBinding, old: i32, old_flag: i32)
     emit_label(s, next)
     emit_str(s, c"\n")
     begin_block(s, do_label)
-    own_emit_value_glue(s, old, b.type_name, b.type_name_len, b.count)
+    own_emit_binding_glue(s, h, old, h.aux)
     emit_str(s, c"  br label %")
     emit_label(s, next)
     emit_str(s, c"\n")
     begin_block(s, next)
     if saved != 0
         set_last_expr(s, saved)
+    free(h as *u8)
 
 # =============================================================================
 # `if` merge for the move check (ritz0's If handling)
 # =============================================================================
 
-# The moved state of every live binding: 4 i32s each (moved, its line and
-# column, shadow).  null when nothing is tracked.
+# The moved state of every live binding: OWN_SNAP_INTS i32s each (moved,
+# its line and column, shadow, fmoved, fshadow) after a count.  null when
+# nothing is tracked.
+const OWN_SNAP_INTS: i32 = 6
+
 pub fn own_snapshot(s: *EmitterState) -> *i32
     let o: *OwnState = s.own
     if o.live_count == 0
         return null
-    let snap: *i32 = malloc((o.live_count as i64) * 16 + 4) as *i32
+    let snap: *i32 = malloc(((o.live_count * OWN_SNAP_INTS + 1) * 4) as i64) as *i32
     snap[0] = o.live_count
     var i: i32 = 0
     while i < o.live_count
         let b: *OwnBinding = own_live_at(o, i)
-        snap[1 + i * 4] = b.moved
-        snap[2 + i * 4] = b.move_line
-        snap[3 + i * 4] = b.move_col
-        snap[4 + i * 4] = b.shadow
+        let r: *i32 = snap + 1 + i * OWN_SNAP_INTS
+        r[0] = b.moved
+        r[1] = b.move_line
+        r[2] = b.move_col
+        r[3] = b.shadow
+        r[4] = b.fmoved
+        r[5] = b.fshadow
         i += 1
     snap
 
@@ -1351,33 +1842,79 @@ pub fn own_restore(s: *EmitterState, snap: *i32)
     var i: i32 = 0
     while i < n
         let b: *OwnBinding = own_live_at(o, i)
-        b.moved = snap[1 + i * 4]
-        b.move_line = snap[2 + i * 4]
-        b.move_col = snap[3 + i * 4]
-        b.shadow = snap[4 + i * 4]
+        let r: *i32 = snap + 1 + i * OWN_SNAP_INTS
+        b.moved = r[0]
+        b.move_line = r[1]
+        b.move_col = r[2]
+        b.shadow = r[3]
+        b.fmoved = r[4]
+        b.fshadow = r[5]
+        i += 1
+
+# Paths meet: what `into` holds is moved (shadowed) if it is on either
+# path; a binding moved on both keeps `into`'s move, as ritz0's _join keeps
+# the first path's.
+fn own_join_snap(into: *i32, other: *i32)
+    var n: i32 = into[0]
+    if other[0] < n
+        n = other[0]
+    var i: i32 = 0
+    while i < n
+        let a: *i32 = into + 1 + i * OWN_SNAP_INTS
+        let b: *i32 = other + 1 + i * OWN_SNAP_INTS
+        if a[0] == 0 and b[0] == 1
+            a[0] = 1
+            a[1] = b[1]
+            a[2] = b[2]
+        a[3] = a[3] | b[3]
+        a[4] = a[4] | b[4]
+        a[5] = a[5] | b[5]
         i += 1
 
 # Neither arm returned: a binding moved in the then-arm (`after_then`) is
 # moved after the `if` too (the else-arm's state is current).  Moved in
-# both, it reports the then-arm's move, as ritz0 does.  `shadow` merges the
-# same way.
+# both, it reports the then-arm's move, as ritz0 does.  `shadow` and the
+# field bits merge the same way.
 pub fn own_merge_moved(s: *EmitterState, after_then: *i32)
     if after_then == null
         return
+    let now: *i32 = own_snapshot(s)
+    if now == null
+        return
+    own_join_snap(after_then, now)
+    own_restore(s, after_then)
+    free(now as *u8)
+
+# Match / if-expression arms (AGAST #2168, ritz0 #2161).  Each arm starts
+# from the state before the first (own_arms_begin's snapshot; own_arm_begin
+# restores it); own_arm_end joins the state of an arm that falls through
+# into `*acc`; own_arms_end settles the result: the join, or (no arm falls
+# through) the last arm's state, as ritz0 leaves it.
+pub fn own_arms_begin(s: *EmitterState) -> *i32
+    own_snapshot(s)
+
+pub fn own_arm_begin(s: *EmitterState, before: *i32)
+    own_restore(s, before)
+
+pub fn own_arm_end(s: *EmitterState, acc: **i32)
     let o: *OwnState = s.own
-    var n: i32 = after_then[0]
-    if n > o.live_count
-        n = o.live_count
-    var i: i32 = 0
-    while i < n
-        let b: *OwnBinding = own_live_at(o, i)
-        if after_then[1 + i * 4] == 1
-            b.moved = 1
-            b.move_line = after_then[2 + i * 4]
-            b.move_col = after_then[3 + i * 4]
-        if after_then[4 + i * 4] == 1
-            b.shadow = 1
-        i += 1
+    if o.last_pop_dead == 1
+        return
+    let now: *i32 = own_snapshot(s)
+    if now == null
+        return
+    if *acc == null
+        *acc = now
+        return
+    own_join_snap(*acc, now)
+    free(now as *u8)
+
+pub fn own_arms_end(s: *EmitterState, before: *i32, acc: *i32)
+    if acc != null
+        own_restore(s, acc)
+        free(acc as *u8)
+    if before != null
+        free(before as *u8)
 
 # STMT_IF, after both arms: settle the move state per ritz0.
 pub fn own_if_merge(s: *EmitterState, before: *i32, after_then: *i32, then_dead: i32, has_else: i32, else_dead: i32)
@@ -1423,7 +1960,7 @@ fn own_emit_ret_drops(s: *EmitterState)
         emit_str(s, c"  store i1 0, ptr ")
         emit_reg(s, b.flag)
         emit_str(s, c"\n")
-        own_emit_value_glue(s, b.slot, b.type_name, b.type_name_len, b.count)
+        own_emit_binding_glue(s, b, b.slot, own_load_mask(s, b))
         emit_str(s, c"  br label %own.n")
         emit_int(s, seq as i64)
         emit_str(s, c"\nown.n")

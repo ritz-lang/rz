@@ -5,8 +5,9 @@ test_ownership_free_count.py is the cross-compiler table for LANGUAGE_SPEC
 not reach: drop flags for a binding moved on some paths only, the `if` merge
 of the move check, assignment reviving a moved binding, a declaration with
 no value, `for` loops, match-arm blocks, by-value method arguments, nested
-drop glue, and a tail-expression move; and (AGAST #2165) array and enum drop
-glue, temporaries, and moves of an outer binding inside a loop.
+drop glue, and a tail-expression move; (AGAST #2165) array and enum drop
+glue, temporaries, and moves of an outer binding inside a loop; and (AGAST
+#2168) moves out of a field and the merge of match / if-expression arms.
 
 The use-after-move rejections also run through ritz0 and must report the
 same diagnostic at the same location (goal 3: ritz1 rejects what ritz0
@@ -335,6 +336,151 @@ pub fn main() -> i32
     f()
     return DROPS
 """, 4),
+
+    # AGAST #2168 from here on.  A struct with a field moved out still drops
+    # the others: consume drops 1, p's scope end 2.
+    "field_move_rest_dropped": ("""\
+struct Two
+    a: Tracked
+    b: Tracked
+
+fn f()
+    var p = Two { a: make(1), b: make(2) }
+    consume(p.a)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12),
+
+    # Moved on one path only: the field drops on the other, once.
+    "field_move_conditional": ("""\
+fn f(x: i32)
+    var h = Holder { t: make(1), n: 0 }
+    if x > 0
+        consume(h.t)
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 2),
+
+    # Assigning the field again re-owns it: 1 (consume), then 3 at scope end.
+    "field_move_reassigned": ("""\
+struct Two
+    a: Tracked
+    b: Tracked
+
+fn f()
+    var p = Two { a: make(1), b: make(2) }
+    consume(p.a)
+    p.a = make(3)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 132),
+
+    # Moved and re-assigned round a loop: consume drops 0, 1, 2; the end 3.
+    "field_move_in_loop_reassigned": ("""\
+fn f()
+    var h = Holder { t: make(0), n: 0 }
+    var i = 0
+    while i < 3
+        consume(h.t)
+        i = i + 1
+        h.t = make(i)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 4),
+
+    # A `return` drops what is left of a partly moved binding.
+    "field_move_then_return": ("""\
+struct Two
+    a: Tracked
+    b: Tracked
+
+fn f(x: i32) -> i32
+    var p = Two { a: make(1), b: make(2) }
+    consume(p.b)
+    if x > 0
+        return 5
+    return 6
+
+pub fn main() -> i32
+    f(1)
+    return ORDER
+""", 21),
+
+    # Match arms start from the state before the match (ritz0 #2161): t
+    # moved in arm 1 is still usable in arm 2.  f(1) drops it in consume,
+    # f(0) at the scope end.
+    "match_arm_moves_independent": ("""\
+fn f(x: i32) -> i32
+    var t = make(1)
+    let v = match x
+        1 => consume(t)
+        _ => t.id
+    return v
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 2),
+
+    # The same for a match statement with block arms.
+    "match_stmt_arm_moves_independent": ("""\
+fn f(x: i32)
+    var t = make(1)
+    match x
+        1 =>
+            consume(t)
+        _ =>
+            var u = t
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 2),
+
+    # An if-expression's else-arm starts from the state before the `if`
+    # too: f(1) drops t in consume, f(0) at the scope end.
+    "if_expr_arm_moves_independent": ("""\
+fn f(x: i32) -> i32
+    var t = make(1)
+    let v: i32 = if x > 0
+        consume(t)
+    else
+        t.id
+    return v
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 2),
+
+    # An arm that returns takes its move with it.
+    "match_arm_returns_move": ("""\
+fn f(x: i32) -> i32
+    var t = make(1)
+    match x
+        1 =>
+            return consume(t)
+        _ =>
+            pass
+    return t.id
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 2),
 }
 
 # name -> program body.  Each is rejected by ritz0 and ritz1 alike.
@@ -515,6 +661,140 @@ pub fn main() -> i32
         consume(t)
     return 0
 """,
+
+    # AGAST #2168 from here on: match arms merge like `if` arms (ritz0
+    # #2161).  Moved in an arm that falls through: moved after the match.
+    "moved_in_match_arm": """\
+pub fn main() -> i32
+    var t = make(1)
+    match DROPS
+        0 =>
+            consume(t)
+        _ =>
+            pass
+    return t.id
+""",
+
+    "moved_in_match_expr_arm": """\
+pub fn main() -> i32
+    var t = make(1)
+    let v = match DROPS
+        0 => consume(t)
+        _ => 0
+    return t.id + v
+""",
+
+    # Arm 1 re-assigns t, arm 2 moves it: an iteration through arm 2 reaches
+    # the head with t moved, so the next one's arm 2 uses a moved value.
+    # The loop's shadow state must flow through the match merge.
+    "move_in_loop_match_arm": """\
+pub fn main() -> i32
+    var t = make(1)
+    var i = 0
+    while i < 3
+        i = i + 1
+        match i
+            1 =>
+                t = make(2)
+            _ =>
+                consume(t)
+    return 0
+""",
+}
+
+# AGAST #2168: moves out of a field.  ritz0 doesn't track them yet (#2171),
+# so these are ritz1's own diagnostics: name -> (program body, message).
+FIELD_REJECTS = {
+    "field_used_after_move": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    var u = h.t
+    return h.t.id
+""", "main.ritz:35:12: error: use of moved value: `h.t` (moved at main.ritz:34:13)"),
+
+    "whole_after_field_move": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    consume(h.t)
+    var g = h
+    return 0
+""", "main.ritz:35:13: error: use of moved value: `h.t` (moved at main.ritz:34:13)"),
+
+    "borrow_after_field_move": ("""\
+fn peek(h: @Holder) -> i32
+    return h.n
+
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    consume(h.t)
+    return peek(@h)
+""", "main.ritz:38:17: error: cannot borrow `h` - `h.t` has been moved"),
+
+    "field_move_in_loop": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    var i = 0
+    while i < 2
+        consume(h.t)
+        i = i + 1
+    return 0
+""", "main.ritz:36:17: error: use of moved value: `h.t` (moved at main.ritz:36:17)"),
+
+    # A `continue` reaches the head with h.t moved.
+    "field_move_in_loop_continue": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    var i = 0
+    while i < 2
+        i = i + 1
+        if i == 1
+            consume(h.t)
+            continue
+        h.t = make(2)
+    return 0
+""", "main.ritz:38:21: error: use of moved value: `h.t` (moved at main.ritz:38:21)"),
+
+    # Re-assigned before its second move, h.t is owned there: only the
+    # first move (reached with h.t moved by the previous iteration) errs.
+    "field_move_in_loop_after_reassign": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    var i = 0
+    while i < 2
+        consume(h.t)
+        h.t = make(2)
+        consume(h.t)
+        i = i + 1
+    return 0
+""", "main.ritz:36:17: error: use of moved value: `h.t` (moved at main.ritz:38:17)"),
+
+    "field_moved_in_match_arm": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    match DROPS
+        0 =>
+            consume(h.t)
+        _ =>
+            pass
+    return h.t.id
+""", "main.ritz:39:12: error: use of moved value: `h.t` (moved at main.ritz:36:21)"),
+
+    # Moving a field out of a type with its own drop would leave that drop
+    # a half-moved value (as in Rust, E0509).
+    "field_move_from_drop_type": ("""\
+struct Pair
+    a: Tracked
+    n: i32
+
+impl Drop for Pair
+    fn drop(self: @&Pair)
+        ORDER = 9
+
+pub fn main() -> i32
+    var p = Pair { a: make(1), n: 0 }
+    consume(p.a)
+    return 0
+""", "main.ritz:42:13: error: cannot move out of `p.a`: `Pair` implements Drop"),
 }
 
 # `F:L:C: <message>` from either compiler's ownership diagnostic.
@@ -560,3 +840,19 @@ def test_ritz1_rejects_like_ritz0(request, tmp_path, compiler, name):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted {name}:\n{out[-1000:]}"
     assert DIAG.findall(out) == want, out[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("name", sorted(FIELD_REJECTS))
+def test_ritz1_rejects_field_move(request, tmp_path, compiler, name):
+    request.getfixturevalue("ritz1_bin")
+    body, want = FIELD_REJECTS[name]
+    _, _, comp = _run(compiler, tmp_path, body)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {name}:\n{out[-1000:]}"
+    # Exactly this diagnostic, once (the file name is the temp path's).
+    diags = [l for l in out.splitlines() if ": error: " in l and
+             ("moved" in l or "move out" in l)]
+    got = [re.sub(r"\S*main\.ritz", "main.ritz", d) for d in diags]
+    assert got == [want], out[-2000:]

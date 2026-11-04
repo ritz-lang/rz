@@ -1860,7 +1860,17 @@ The same uses of a move-only value **move** it. The destination becomes the
 owner, and the source binding can't be used again until something is assigned
 to it. A by-value parameter `name: T` of a move-only type takes ownership. To
 lend the value instead, pass `@x` or `@&x` (§13.3, §13.4). If a value is moved
-on only some paths, the binding counts as moved after those paths join.
+on only some paths, the binding counts as moved after those paths join. The
+arms of a `match` or an `if` each start from the state before it, and paths
+that leave by `return`, `break` or `continue` don't join.
+
+Using a move-only field by value (`return h.t`, `consume(h.t)`) moves that
+field out of the binding, and only that field. Afterwards `h.t` and `h` as a
+whole can't be used until `h.t` (or `h`) is assigned again, but `h`'s other
+fields can. A type that implements `Drop` itself can't have a field moved
+out, because its `drop` would see a half-moved value. Moving a field out of
+a temporary (`make().t`) takes the field, and the rest of the temporary isn't
+dropped. ritz0 doesn't track field moves of bindings yet (AGAST #2171).
 
 ```ritz expect-error="use of moved value: `r`"
 struct Resource
@@ -1960,6 +1970,7 @@ binding that still owns a value of that type when the binding's scope ends:
 Bindings are dropped in reverse declaration order. A by-value parameter is a
 binding of the callee's outermost block, so the callee drops it. A
 moved-from binding is not dropped, because its new owner drops the value.
+A binding with a field moved out drops its other fields only.
 Returning a binding moves it to the caller. A binding moved on some paths only
 is dropped only on the paths where it still owns its value. Assigning to a
 moved-from binding drops nothing and makes the binding an owner again.
