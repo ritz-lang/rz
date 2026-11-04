@@ -2532,9 +2532,12 @@ fn both(a: i32, b: i32) -> i32
     check(b)
 ```
 
-ritzunit's `assert_*` fns are `[[must_use]]`: each returns 0 or 1 for the test
-to return, and a bare `assert_eq_i32(a, b)` statement makes a test that cannot
-fail.
+ritzunit's `assert_*` fns used to be `[[must_use]]`: each returned 0 or 1 for
+the test to return, and a bare `assert_eq_i32(a, b)` statement made a test that
+could not fail. Its integer helpers are now plain `assert`, and the string
+checks it keeps (`assert_str_eq`, `assert_contains`, ...) are void
+`[[test_helper]]` fns that `assert` ([§17.1](#171-test-attribute)), so a bare
+call is the intended use.
 
 ---
 
