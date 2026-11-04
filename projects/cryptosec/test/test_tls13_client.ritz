@@ -587,3 +587,222 @@ fn test_tls_client_init_fails_on_rng_failure() -> i32
         return 3
     tls_client_free(@client)
     return 0
+
+# ============================================================================
+# Middlebox-compat change_cipher_spec and HelloRetryRequest (AGAST #2116)
+# ============================================================================
+# RFC 8446 D.4: servers (OpenSSL, nginx, most CDNs) send one unencrypted
+# change_cipher_spec record, body 0x01, after their ServerHello. The client
+# must drop it. Any other CCS (wrong body/length, a second one, one before
+# the ServerHello) is unexpected_message. A HelloRetryRequest is a
+# ServerHello with a fixed random (RFC 8446 4.1.3); the client offers only
+# X25519 and does not retry, so it fails with TLS_ERR_HELLO_RETRY_REQUEST.
+
+# A change_cipher_spec record of `len` bytes, every byte `body`.
+fn ccs_2116(out: *u8, len: i64, body: u8) -> i64
+    out[0] = 20
+    out[1] = 0x03
+    out[2] = 0x03
+    out[3] = 0
+    out[4] = len as u8
+    var i: i64 = 0
+    while i < len
+        out[5 + i] = body
+        i += 1
+    return 5 + len
+
+# Start `client`, then feed it `pre`, a ServerHello and `post` in one call.
+fn run_2116(client: *TlsClient, pre: *u8, pre_len: i64, post: *u8, post_len: i64) -> i32
+    var cfg: TlsConfig
+    tls_config_init(@cfg)
+    tls_config_set_hostname(@cfg, "test.local", 10)
+    tls_client_init(client, @cfg)
+    var out: [1024]u8
+    if tls_client_start(client, @out[0], 1024) <= 0
+        return -100
+    var buf: [512]u8
+    mem_copy(@buf[0], pre, pre_len as u64)
+    let sh_len: i64 = build_server_hello_1862(@buf[pre_len], TLS_AES_128_GCM_SHA256)
+    mem_copy(@buf[pre_len + sh_len], post, post_len as u64)
+    var out_len: i64 = 0
+    return tls_client_process(client, @buf[0], pre_len + sh_len + post_len, @out[0], 1024, @out_len)
+
+[[test]]
+fn test_client_ignores_ccs_after_server_hello() -> i32
+    var ccs: [8]u8
+    let n: i64 = ccs_2116(@ccs[0], 1, 0x01)
+    var client: TlsClient
+    if run_2116(@client, @ccs[0], 0, @ccs[0], n) != TLS_RESULT_NEED_INPUT
+        return 100 + tls_client_error(@client)
+    if client.state != TLS_STATE_SERVER_HELLO_RECEIVED
+        return 2
+    if client.recv_len != 0
+        return 3  # the CCS record was consumed
+    return 0
+
+[[test]]
+fn test_client_continues_after_ccs() -> i32
+    # The record after the CCS is still processed: here a garbage encrypted
+    # record, which fails to decrypt.
+    var post: [64]u8
+    let n: i64 = ccs_2116(@post[0], 1, 0x01)
+    post[n] = 23
+    post[n + 1] = 0x03
+    post[n + 2] = 0x03
+    post[n + 3] = 0
+    post[n + 4] = 20
+    var i: i64 = 0
+    while i < 20
+        post[n + 5 + i] = 0x5a
+        i += 1
+    var client: TlsClient
+    if run_2116(@client, @post[0], 0, @post[0], n + 25) != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(@client) != TLS_ERR_DECRYPT_FAILED
+        return 100 + tls_client_error(@client)
+    return 0
+
+[[test]]
+fn test_client_ccs_split_across_calls() -> i32
+    var client: TlsClient
+    var none: [1]u8
+    if run_2116(@client, @none[0], 0, @none[0], 0) != TLS_RESULT_NEED_INPUT
+        return 1
+    var ccs: [8]u8
+    let n: i64 = ccs_2116(@ccs[0], 1, 0x01)
+    var out: [64]u8
+    var out_len: i64 = 0
+    var i: i64 = 0
+    while i < n
+        if tls_client_process(@client, @ccs[i], 1, @out[0], 64, @out_len) != TLS_RESULT_NEED_INPUT
+            return 10 + i as i32
+        i += 1
+    if client.recv_len != 0 || client.state != TLS_STATE_SERVER_HELLO_RECEIVED
+        return 2
+    return 0
+
+fn expect_ccs_rejected_2116(r: i32, client: *TlsClient) -> i32
+    if r != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(client) != TLS_ERR_UNEXPECTED_MESSAGE
+        return 2
+    if client.state != TLS_STATE_ERROR
+        return 3
+    return 0
+
+[[test]]
+fn test_client_rejects_ccs_with_wrong_body() -> i32
+    var ccs: [8]u8
+    let n: i64 = ccs_2116(@ccs[0], 1, 0x02)
+    var client: TlsClient
+    return expect_ccs_rejected_2116(run_2116(@client, @ccs[0], 0, @ccs[0], n), @client)
+
+[[test]]
+fn test_client_rejects_ccs_with_wrong_length() -> i32
+    var ccs: [8]u8
+    let n: i64 = ccs_2116(@ccs[0], 2, 0x01)
+    var client: TlsClient
+    return expect_ccs_rejected_2116(run_2116(@client, @ccs[0], 0, @ccs[0], n), @client)
+
+[[test]]
+fn test_client_rejects_empty_ccs() -> i32
+    var ccs: [8]u8
+    let n: i64 = ccs_2116(@ccs[0], 0, 0x01)
+    var client: TlsClient
+    return expect_ccs_rejected_2116(run_2116(@client, @ccs[0], 0, @ccs[0], n), @client)
+
+[[test]]
+fn test_client_rejects_second_ccs() -> i32
+    var ccs: [16]u8
+    let n: i64 = ccs_2116(@ccs[0], 1, 0x01)
+    ccs_2116(@ccs[n], 1, 0x01)
+    var client: TlsClient
+    return expect_ccs_rejected_2116(run_2116(@client, @ccs[0], 0, @ccs[0], 2 * n), @client)
+
+[[test]]
+fn test_client_rejects_ccs_before_server_hello() -> i32
+    var ccs: [8]u8
+    let n: i64 = ccs_2116(@ccs[0], 1, 0x01)
+    var client: TlsClient
+    return expect_ccs_rejected_2116(run_2116(@client, @ccs[0], n, @ccs[0], 0), @client)
+
+# A HelloRetryRequest as a server sends it: the special random and a
+# key_share that names only the group it wants (secp256r1 here).
+fn build_hrr_2116(out: *u8, last_random_byte: u8) -> i64
+    var p: i64 = 9
+    out[p] = 0x03
+    out[p + 1] = 0x03
+    p = p + 2
+    var magic: [32]u8
+    hello_retry_request_random(@magic[0])
+    mem_copy(out + p, @magic[0], 32)
+    out[p + 31] = last_random_byte
+    p = p + 32
+    out[p] = 0  # session id
+    out[p + 1] = 0x13
+    out[p + 2] = 0x01  # TLS_AES_128_GCM_SHA256
+    out[p + 3] = 0  # compression
+    out[p + 4] = 0
+    out[p + 5] = 12  # extensions: 6 + 6
+    p = p + 6
+    # supported_versions: TLS 1.3
+    out[p] = 0x00
+    out[p + 1] = 0x2b
+    out[p + 2] = 0x00
+    out[p + 3] = 0x02
+    out[p + 4] = 0x03
+    out[p + 5] = 0x04
+    # key_share: selected_group secp256r1
+    out[p + 6] = 0x00
+    out[p + 7] = 0x33
+    out[p + 8] = 0x00
+    out[p + 9] = 0x02
+    out[p + 10] = 0x00
+    out[p + 11] = 0x17
+    p = p + 12
+    let hs_len: i64 = p - 9
+    out[0] = 22
+    out[1] = 0x03
+    out[2] = 0x03
+    out[3] = 0
+    out[4] = (hs_len + 4) as u8
+    out[5] = HS_SERVER_HELLO
+    out[6] = 0
+    out[7] = 0
+    out[8] = hs_len as u8
+    return p
+
+fn run_hrr_2116(client: *TlsClient, last_random_byte: u8) -> i32
+    var cfg: TlsConfig
+    tls_config_init(@cfg)
+    tls_config_set_hostname(@cfg, "test.local", 10)
+    tls_client_init(client, @cfg)
+    var out: [1024]u8
+    if tls_client_start(client, @out[0], 1024) <= 0
+        return -100
+    var buf: [128]u8
+    let n: i64 = build_hrr_2116(@buf[0], last_random_byte)
+    var out_len: i64 = 0
+    return tls_client_process(client, @buf[0], n, @out[0], 1024, @out_len)
+
+[[test]]
+fn test_client_fails_cleanly_on_hello_retry_request() -> i32
+    var client: TlsClient
+    if run_hrr_2116(@client, 0x9c) != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(@client) != TLS_ERR_HELLO_RETRY_REQUEST
+        return 100 + tls_client_error(@client)
+    if client.state != TLS_STATE_ERROR || client.encrypted_handshake != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_client_near_hrr_random_is_not_hrr() -> i32
+    # Control: one random bit off is an ordinary (here malformed: no key
+    # share) ServerHello, a parse error rather than HELLO_RETRY_REQUEST.
+    var client: TlsClient
+    if run_hrr_2116(@client, 0x9d) != TLS_RESULT_ERROR
+        return 1
+    if tls_client_error(@client) != TLS_ERR_PARSE_ERROR
+        return 100 + tls_client_error(@client)
+    return 0

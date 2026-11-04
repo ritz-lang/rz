@@ -641,3 +641,139 @@ fn test_e2e_client_rejects_data_after_server_finished() -> i32
         return 8
     ca_store_destroy(@store)
     return 0
+
+# ============================================================================
+# Middlebox-compat change_cipher_spec (AGAST #2116)
+# ============================================================================
+# Real servers send one dummy change_cipher_spec record (body 0x01) after
+# the ServerHello (RFC 8446 D.4). Re-send valet's flight with one inserted.
+# `split` > 0 also re-encrypts the flight `split` bytes per record and puts
+# the CCS after its first record instead; handshake messages must not be
+# interleaved with other record types (RFC 8446 5.1), so that one fails.
+fn ccs_handshake_2116(client: *TlsClient, server: *TlsServer, split: i64) -> i32
+    var ch: [4096]u8
+    let ch_len: i64 = tls_client_start(client, @ch[0], 4096)
+    var real: [16384]u8
+    var real_len: i64 = 0
+    if tls_server_process(server, @ch[0], ch_len, @real[0], 16384, @real_len) != TLS_RESULT_HAVE_OUTPUT
+        return 1
+    let sh_rec: i64 = 5 + (((real[3] as i64) << 8) | (real[4] as i64))
+
+    var wire: [32768]u8
+    mem_copy(@wire[0], @real[0], sh_rec as u64)
+    var wire_len: i64 = sh_rec
+    var ccs_at: i64 = sh_rec
+    if split <= 0
+        mem_copy(@wire[sh_rec + 6], @real[sh_rec], (real_len - sh_rec) as u64)
+        wire_len = real_len + 6
+    else
+        var rs: TlsRecordState
+        tls_record_state_init(@rs)
+        tls_record_state_set_keys(@rs, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+        var flight: [16384]u8
+        var inner: u8 = 0
+        let flight_len: i32 = tls_record_state_server_decrypt(@rs, @real[sh_rec], (real_len - sh_rec) as i32, @flight[0], 16384, @inner)
+        if flight_len <= split as i32 || inner != 22
+            return 2
+        var ws: TlsRecordState
+        tls_record_state_init(@ws)
+        tls_record_state_set_keys(@ws, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
+        var p: i64 = 0
+        while p < flight_len as i64
+            var n: i64 = flight_len as i64 - p
+            if n > split
+                n = split
+            if p > 0 && ccs_at == sh_rec
+                ccs_at = wire_len
+                wire_len = wire_len + 6
+            let enc: i32 = tls_record_state_server_encrypt(@ws, @flight[p], n as i32, 22, @wire[wire_len], 1024)
+            if enc <= 0
+                return 3
+            wire_len = wire_len + enc as i64
+            p = p + n
+    wire[ccs_at] = 20
+    wire[ccs_at + 1] = 0x03
+    wire[ccs_at + 2] = 0x03
+    wire[ccs_at + 3] = 0x00
+    wire[ccs_at + 4] = 0x01
+    wire[ccs_at + 5] = 0x01
+
+    var c_out: [4096]u8
+    var c_len: i64 = 0
+    let r: i32 = tls_client_process(client, @wire[0], wire_len, @c_out[0], 4096, @c_len)
+    if r != TLS_RESULT_HAVE_OUTPUT
+        return 100 + tls_client_error(client)
+    var s_out: [1024]u8
+    var s_len: i64 = 0
+    if tls_server_process(server, @c_out[0], c_len, @s_out[0], 1024, @s_len) != TLS_RESULT_COMPLETE
+        return 4
+    return 0
+
+[[test]]
+fn test_e2e_client_ignores_middlebox_ccs() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    let r: i32 = ccs_handshake_2116(@client, @server, 0)
+    if r != 0
+        return 10 + r
+    if send_to_server(@client, @server, c"through a middlebox") != 0
+        return 3
+    if send_to_client(@server, @client, c"and back") != 0
+        return 4
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+[[test]]
+fn test_e2e_client_rejects_ccs_inside_handshake_message() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    # 3 bytes: the CCS lands inside the EncryptedExtensions header.
+    if ccs_handshake_2116(@client, @server, 3) != 100 + TLS_ERR_UNEXPECTED_MESSAGE
+        return 3
+    if tls_client_is_connected(@client) != 0
+        return 4
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+[[test]]
+fn test_e2e_client_takes_ccs_between_whole_messages() -> i32
+    # Control for the test above: a CCS between records that end on a
+    # message boundary is fine. EncryptedExtensions from valet is 6 bytes
+    # (header + empty extensions list), so a 6-byte first record ends on it.
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    if server_setup(@scfg, @der[0], cert_valet(), key_valet()) != 0
+        return 1
+    var ccfg: TlsConfig
+    if client_setup(@ccfg, c"valet.test", @scfg) != 0
+        return 2
+    var server: TlsServer
+    tls_server_init(@server, @scfg)
+    var client: TlsClient
+    tls_client_init(@client, @ccfg)
+    let r: i32 = ccs_handshake_2116(@client, @server, 6)
+    if r != 0
+        return 10 + r
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0

@@ -4,7 +4,8 @@
 # Valet and other networking applications.
 #
 # Features:
-# - Full TLS 1.3 handshake (1-RTT)
+# - Full TLS 1.3 handshake (1-RTT). The middlebox-compat change_cipher_spec
+#   is dropped; a HelloRetryRequest fails with TLS_ERR_HELLO_RETRY_REQUEST.
 # - X25519 key exchange
 # - AES-128-GCM and ChaCha20-Poly1305 cipher suites
 # - AES-128-GCM only (the record layer implements nothing else)
@@ -187,6 +188,7 @@ pub struct TlsClient
     # Flags
     handshake_complete: i32
     encrypted_handshake: i32  # 1 after ServerHello, messages are encrypted
+    ccs_received: i32         # 1 once the middlebox-compat CCS was dropped
 
 # ============================================================================
 # Client Lifecycle
@@ -336,7 +338,9 @@ fn client_step(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i64) -> i32
         if ready == 0
             return TLS_RESULT_NEED_INPUT
         var r: i32 = TLS_RESULT_ERROR
-        if client.state == TLS_STATE_CLIENT_HELLO_SENT
+        if client.recv_buf[0] == TLS_CONTENT_CHANGE_CIPHER_SPEC
+            r = process_change_cipher_spec(client)
+        else if client.state == TLS_STATE_CLIENT_HELLO_SENT
             r = process_server_hello(client, out, out_cap, out_len)
         else if client.state >= TLS_STATE_SERVER_HELLO_RECEIVED && client.state <= TLS_STATE_CERTIFICATE_VERIFY_RECEIVED
             r = process_encrypted_handshake(client, out, out_cap, out_len)
@@ -346,6 +350,33 @@ fn client_step(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i64) -> i32
             return TLS_RESULT_ERROR
         if r != TLS_RESULT_NEED_INPUT
             return r
+    return TLS_RESULT_NEED_INPUT
+
+# ============================================================================
+# Middlebox-compatibility change_cipher_spec (RFC 8446 5, D.4)
+# ============================================================================
+
+# Drop the one unencrypted change_cipher_spec record (body 0x01) a server may
+# send between its ServerHello and its Finished. Anything else is
+# unexpected_message: a CCS before the ServerHello, a second one, any other
+# length or body, or one that splits a handshake message across records
+# (handshake messages must not be interleaved with other record types, 5.1).
+# recv_buf holds the whole record (client_record_ready).
+fn process_change_cipher_spec(client: *TlsClient) -> i32
+    let record_len: i64 = ((client.recv_buf[3] as i64) << 8) | (client.recv_buf[4] as i64)
+    var ok: i32 = 1
+    if client.state < TLS_STATE_SERVER_HELLO_RECEIVED || client.state > TLS_STATE_CERTIFICATE_VERIFY_RECEIVED
+        ok = 0
+    if client.ccs_received != 0 || client.hs_len != 0
+        ok = 0
+    if record_len != 1 || client.recv_buf[5] != 0x01
+        ok = 0
+    if ok == 0
+        client.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        client.state = TLS_STATE_ERROR
+        return TLS_RESULT_ERROR
+    client.ccs_received = 1
+    client_shift_recv_buf(client, 6)
     return TLS_RESULT_NEED_INPUT
 
 # ============================================================================
@@ -380,6 +411,14 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
 
     if hdr.msg_type != HS_SERVER_HELLO
         client.last_error = TLS_ERR_UNEXPECTED_MESSAGE
+        client.state = TLS_STATE_ERROR
+        return TLS_RESULT_ERROR
+
+    # A HelloRetryRequest wants another key share or a cookie. We offer only
+    # X25519 and do not retry: fail with a distinct error rather than parse
+    # it as a ServerHello.
+    if server_hello_is_retry_request(@client.recv_buf[9], hdr.length) == 1
+        client.last_error = TLS_ERR_HELLO_RETRY_REQUEST
         client.state = TLS_STATE_ERROR
         return TLS_RESULT_ERROR
 
