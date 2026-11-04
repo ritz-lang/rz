@@ -172,17 +172,24 @@ trait Drop
     fn drop(self: @&Self)
 ```
 
-Note: `ritzlib/drop.ritz` currently carries this declaration as a comment rather
-than live code, because ritz1 does not yet parse `trait` definitions. What is
-real today is the `impl Drop for T` blocks in `box.ritz`, `heap.ritz`,
-`hashmap.ritz` and `buf.ritz`, and the compiler's insertion of the calls.
+Note: `ritzlib/drop.ritz` holds this declaration as a comment, not live code.
+The `impl Drop for T` blocks in `box.ritz`, `heap.ritz`, `hashmap.ritz` and
+`buf.ritz` are live. `String` and `Vec<T>` don't implement `Drop` yet
+(AGAST #2159).
 
-The compiler automatically inserts drop calls at:
-- End of block scope
-- Before return statements
-- Before break/continue in loops
+The rules are in LANGUAGE_SPEC §13. In short, a type that implements `Drop`,
+or contains a field that does, is move-only, and every other type copies. The
+compiler calls `drop` on each binding that still owns such a value:
+- at the end of its block;
+- before `return`;
+- on `break`/`continue`, for bindings declared inside the loop;
+- before assigning a new value to the binding.
 
-Drop is called in reverse declaration order (LIFO).
+Drops run in reverse declaration order (LIFO). A moved-from binding is not
+dropped. Don't call `drop` yourself.
+
+ritz0 (AGAST #2157) and ritz1 (AGAST #2158) don't implement all of this yet.
+`ritz0/test_ownership_free_count.py` lists each compiler's gaps.
 
 ---
 

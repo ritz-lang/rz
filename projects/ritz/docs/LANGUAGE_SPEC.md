@@ -1812,8 +1812,22 @@ statically from the receiver's concrete type.
 
 ### 13.1 Ownership
 
-Each heap-owning value has a single owner. Ritz has no destructor insertion
-today: owners are released by calling the type's `_drop` function explicitly.
+Every value has one owner: the `let` or `var` binding, by-value parameter,
+field or temporary that holds it. Ownership is tracked only for **move-only**
+types (AGAST #1854). A type is move-only if and only if
+
+- it implements `Drop` (§13.6), or
+- it has a field, an enum-variant payload or a generic argument that is
+  move-only, checked transitively.
+
+Every other type is a **copy type**: the integer, float and `bool` types,
+pointers, references, `StrView`, and every struct, enum, tuple or array built
+only from copy types. A type doesn't become move-only by holding a raw pointer
+to heap memory. Only `Drop` makes it move-only.
+
+`String` and `Vec<T>` own heap buffers but don't implement `Drop` yet
+(AGAST #2159). Today they are copy types, and their owner releases them by
+calling `string_drop` or `vec_drop` explicitly:
 
 ```ritz
 import ritzlib.string
@@ -1826,9 +1840,48 @@ fn main() -> i32
 
 ### 13.2 Move Semantics
 
-Assignment of a struct copies its fields. For an owning type such as `String`
-that means both bindings name the same buffer, and only one of them may drop
-it — the compiler does not track this for you.
+Using a value of a copy type by value copies it, and the source stays usable.
+Uses by value include binding it, assigning it, passing it to a by-value
+parameter, returning it and storing it in a field:
+
+```ritz no-compile="ritz0 still treats every struct as move-only and rejects the second copy of `a` (AGAST #2157); ritz1 accepts it"
+struct Point
+    x: i32
+    y: i32
+
+fn main() -> i32
+    let a = Point { x: 1, y: 2 }
+    let b = a                       # copy
+    let c = a                       # another copy; a is still usable
+    a.x + b.x + c.y
+```
+
+The same uses of a move-only value **move** it. The destination becomes the
+owner, and the source binding can't be used again until something is assigned
+to it. A by-value parameter `name: T` of a move-only type takes ownership. To
+lend the value instead, pass `@x` or `@&x` (§13.3, §13.4). If a value is moved
+on only some paths, the binding counts as moved after those paths join.
+
+```ritz expect-error="use of moved value: `r`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn main() -> i32
+    var r = Resource { handle: 3 }
+    consume(r)                      # moves r into consume
+    r.handle                        # error: r was moved
+```
+
+Copying a copy type that owns a buffer, such as today's `String`, gives two
+bindings that name the same buffer. Only one of them may release it, and the
+compiler doesn't track which one does that:
 
 ```ritz
 import ritzlib.string
@@ -1894,8 +1947,30 @@ analysis is not performed, so returning a reference to a local is not caught.
 
 ### 13.6 Drop
 
-`Drop` is an ordinary trait, and implementing it does not cause the compiler to
-call `drop` for you at scope exit:
+Implementing `Drop` for a type makes the compiler call its `drop` on every
+binding that still owns a value of that type when the binding's scope ends:
+
+- at the end of the block that declares the binding, nested blocks included;
+- on `return`, for every live binding of the function, after the return
+  value has been evaluated;
+- on `break` and `continue`, for every binding declared inside the loop body;
+- on assignment to the binding, for the old value, before the new value is
+  stored.
+
+Bindings are dropped in reverse declaration order. A by-value parameter is a
+binding of the callee's outermost block, so the callee drops it. A
+moved-from binding is not dropped, because its new owner drops the value.
+Returning a binding moves it to the caller. A binding moved on some paths only
+is dropped only on the paths where it still owns its value. Assigning to a
+moved-from binding drops nothing and makes the binding an owner again.
+
+A move-only type with no `Drop` impl of its own, such as a struct with a
+`Drop` field, is dropped by dropping each move-only field in declaration
+order. A type that has its own `drop` runs it first, then drops its
+move-only fields the same way.
+
+Never call `drop` yourself: the compiler's call would release the value a
+second time.
 
 ```ritz
 struct Resource
@@ -1910,9 +1985,12 @@ impl Drop for Resource
 
 fn main() -> i32
     var r = Resource { handle: 3 }
-    r.drop()
-    r.handle
+    r.handle                        # r is dropped after this is evaluated
 ```
+
+AGAST #2157 (ritz0) and #2158 (ritz1) track the compilers' progress toward
+these rules. `ritz0/test_ownership_free_count.py` counts the drops for each rule
+on all three compilers, with today's gaps marked as expected failures.
 
 `defer` is reserved in the ritz1 grammar but is not implemented in ritz0:
 
