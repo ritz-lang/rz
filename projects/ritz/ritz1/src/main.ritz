@@ -494,6 +494,132 @@ fn append_import_display(s: *String, imp: *ImportPath)
             string_push(s, '.')
         seg = seg.next
 
+# =============================================================================
+# Constant conflicts across files (AGAST #2149)
+# =============================================================================
+#
+# A const may be defined in several merged files only if every definition is
+# the same: same declared type and a structurally identical initializer.
+# This is ritz0's rule (import_resolver.py _consts_equal / _exprs_equal): an
+# Ident compares by name, because both definitions resolve in the same
+# merged const namespace, so `5` and `2 + 3` differ even though they fold to
+# one value.  As in ritz0, a [[target_os]] const and an ungated one of the
+# same name are never compared (ritzunit's reporter.ritz has its own
+# `const TIOCGWINSZ: i64` beside ritzlib.sys's gated `u64` one).  ritz1 drops
+# non-matching [[target_os]] variants at parse time, so two gated
+# definitions left here are for the same target and are compared.
+
+fn bytes_same(a: *u8, a_len: i32, b: *u8, b_len: i32) -> i32
+    if a_len != b_len
+        return 0
+    if a_len == 0
+        return 1
+    if memcmp(a, b, a_len as i64) == 0
+        return 1
+    0
+
+fn const_exprs_same(a: *Expr, b: *Expr) -> i32
+    if a == null or b == null
+        if a == b
+            return 1
+        return 0
+    if a.kind != b.kind
+        return 0
+    let k: i32 = a.kind
+    if k == EXPR_INT_LIT or k == EXPR_CHAR_LIT
+        if a.int_val == b.int_val
+            return 1
+        return 0
+    if k == EXPR_STRING_LIT or k == EXPR_CSTRING_LIT or k == EXPR_FLOAT_LIT
+        return bytes_same(a.string_ptr, a.string_len, b.string_ptr, b.string_len)
+    if k == EXPR_IDENT
+        return bytes_same(a.ident_ptr, a.ident_len, b.ident_ptr, b.ident_len)
+    if k == EXPR_UNARY
+        if a.op != b.op
+            return 0
+        return const_exprs_same(a.operand, b.operand)
+    if k == EXPR_BINARY
+        if a.op != b.op
+            return 0
+        if const_exprs_same(a.left, b.left) == 0
+            return 0
+        return const_exprs_same(a.right, b.right)
+    if k == EXPR_CAST
+        # op is the target type; for `as *T`, int_val / ident_* name T.
+        if a.op != b.op
+            return 0
+        if a.op == TYPE_PTR
+            if a.int_val != b.int_val
+                return 0
+            if bytes_same(a.ident_ptr, a.ident_len, b.ident_ptr, b.ident_len) == 0
+                return 0
+        return const_exprs_same(a.left, b.left)
+    if k == EXPR_ARRAY_LIT
+        var ea: *Expr = a.args
+        var eb: *Expr = b.args
+        while ea != null and eb != null
+            if const_exprs_same(ea, eb) == 0
+                return 0
+            ea = ea.next
+            eb = eb.next
+        if ea == eb
+            return 1
+        return 0
+    if k == EXPR_ARRAY_FILL
+        if a.int_val != b.int_val
+            return 0
+        return const_exprs_same(a.left, b.left)
+    # Anything else (struct literals, calls, ...): conservatively different,
+    # as ritz0 does.
+    0
+
+fn consts_same(a: *ConstEntry, b: *ConstEntry) -> i32
+    if a.const_type != b.const_type
+        return 0
+    if bytes_same(a.type_name, a.type_name_len, b.type_name, b.type_name_len) == 0
+        return 0
+    if a.array_size != b.array_size or a.array_elem_type != b.array_elem_type
+        return 0
+    if bytes_same(a.array_elem_type_name, a.array_elem_type_name_len, b.array_elem_type_name, b.array_elem_type_name_len) == 0
+        return 0
+    const_exprs_same(a.value_expr, b.value_expr)
+
+# Report every const of `other` (the import at `path`, with everything it
+# imported merged in) that `m` already defines differently, at the
+# definition's own file:line:col.  Returns -1 if there was one, else 0.
+fn check_const_conflicts(m: *Module, other: *Module, path: *u8) -> i32
+    var bad: i32 = 0
+    var c: *ConstEntry = other.constants
+    while c != null
+        var e: *ConstEntry = m.constants
+        while e != null
+            if e.target_gated == c.target_gated and bytes_same(e.name, e.name_len, c.name, c.name_len) == 1
+                if consts_same(e, c) == 0
+                    var msg: String = string_from("Error: ")
+                    if c.def_file != null
+                        string_push_cstr(@msg, c.def_file)
+                    else
+                        string_push_cstr(@msg, path)
+                    string_push(@msg, ':')
+                    string_push_i64(@msg, c.line as i64)
+                    string_push(@msg, ':')
+                    string_push_i64(@msg, c.col as i64)
+                    string_push_str(@msg, ": Conflicting constant definition for '")
+                    string_push_bytes(@msg, c.name, c.name_len as i64)
+                    if c.target_gated == 1
+                        string_push_str(@msg, "': defined differently for same target_os")
+                    else
+                        string_push_str(@msg, "': defined differently in multiple files")
+                    eprintln_string(@msg)
+                    string_drop(@msg)
+                    bad = 1
+                break
+            e = e.next
+        c = c.next
+    if bad == 1
+        return -1
+    0
+
 # Merge imported_module's declarations into main module m.
 # Each list is preserved by walking to its tail and prepending the main list.
 fn merge_module_into(m: *Module, other: *Module)
@@ -754,6 +880,9 @@ fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
             string_drop(@path)
             return -1
 
+        if check_const_conflicts(m, import_module, string_as_ptr(@path)) < 0
+            string_drop(@path)
+            return -1
         merge_module_into(m, import_module)
 
         # Don't drop path — it's owned by g_processed now (we cloned above).
