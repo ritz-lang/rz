@@ -229,6 +229,18 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type = TYPE_STRUCT
                 stmt.var_type_name = src_loc.type_name
                 stmt.var_type_name_len = src_loc.type_name_len
+            # AGAST #2169: `var b = a` with `a: [N]T` -- `b` is `[N]T` too, and
+            # the init copies the whole array (it was an i64 slot holding
+            # a's first 8 bytes).  A multi-dimensional `a` keeps its shape
+            # (#1509), so the initializer check below fails it closed.
+            else if src_loc != null and src_loc.var_type == TYPE_ARRAY
+                var_type = TYPE_ARRAY
+                stmt.var_type = TYPE_ARRAY
+                stmt.var_array_size = src_loc.array_size
+                stmt.var_array_elem_type = src_loc.array_elem_type
+                stmt.var_array_shape = src_loc.array_shape
+                stmt.var_type_name = src_loc.type_name
+                stmt.var_type_name_len = src_loc.type_name_len
             # AGAST #1754: `let q = s` with `s: @&S` / `@S` -- `q` takes `s`'s
             # reference type and pointee, so `q.a` resolves and the slot holds
             # the same `ptr` / i64 `s` loads as.  (Was i64 with no struct name:
@@ -648,10 +660,11 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             emit_array_lit_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init)
             return
 
-        # AGAST #2035: `let a: [N]T = x.f` copies the inline array field.
+        # AGAST #2035 / #2169: `let a: [N]T = x.f` / `= c` / `= *p` copy
+        # the whole array.
         if var_type == TYPE_ARRAY
-            if emit_array_local_copy_from_field(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init) == 1
-                return
+            emit_array_local_whole_assign(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init)
+            return
 
         # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
         # a non-Result-returning fn still builds the right struct.  Save /
@@ -1288,12 +1301,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_reg(s, loc)
                 emit_str(s, c"\n")
             return
-        # AGAST #2035: `a = x.f` copies the inline array field into local `a`.
+        # AGAST #2035 / #2169: `a = x.f` / `= [..]` / `= c` copy the whole
+        # array into local `a`.
         if var_type == TYPE_ARRAY
             let aloc: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
-            if aloc != null
-                if emit_array_local_copy_from_field(s, loc, aloc.array_size, aloc.array_elem_type, aloc.type_name, aloc.type_name_len, stmt.assign_value) == 1
-                    return
+            if aloc != null and aloc.array_shape == null
+                emit_array_local_whole_assign(s, loc, aloc.array_size, aloc.array_elem_type, aloc.type_name, aloc.type_name_len, stmt.assign_value)
+                return
         # AGAST #1652: `p = s` (`s: @&S`) into a `*S` local.  `let` only;
         # see the #1755 note in emit_fn.
         # AGAST #2142: a non-enum local is no enum context for a ctor RHS.
@@ -2174,6 +2188,113 @@ fn emit_array_local_copy_from_field(s: *EmitterState, dst_ptr: i32, dst_size: i3
         return 1
     emit_array_field_copy(s, field, mr.reg, dst_ptr)
     1
+
+# Emit the LLVM type `[N x T]` of a 1-D local array (element struct `name`).
+# The spelling matches emit_var_decl's alloca, so a copy loads and stores
+# exactly the local's bytes.
+fn emit_local_array_llvm_type(s: *EmitterState, size: i32, et: i32, name: *u8, name_len: i32)
+    emit_str(s, c"[")
+    emit_int(s, size as i64)
+    emit_str(s, c" x ")
+    if et == TYPE_STRUCT and name_len > 0
+        emit_str(s, c"%")
+        emit_name(s, name, name_len)
+    else
+        emit_str(s, local_array_elem_llvm(et))
+    emit_str(s, c"]")
+
+# Copy a whole local `[N x T]` from `src_ptr` over `dst_ptr` as one aggregate
+# load + store: every element is read before any is written.
+fn emit_local_array_copy(s: *EmitterState, size: i32, et: i32, name: *u8, name_len: i32, src_ptr: i32, dst_ptr: i32)
+    let agg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, agg)
+    emit_str(s, c" = load ")
+    emit_local_array_llvm_type(s, size, et, name, name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, src_ptr)
+    emit_str(s, c"\n  store ")
+    emit_local_array_llvm_type(s, size, et, name, name_len)
+    emit_str(s, c" ")
+    emit_reg(s, agg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, dst_ptr)
+    emit_str(s, c"\n")
+
+# AGAST #2169: a 1-D local `[N]T` array at `dst_ptr` (length `dst_size`,
+# element `dst_et`, element struct `dst_name`) gets a whole-array value, as
+# `let a: [N]T = v` or `a = v`.  The generic scalar path loaded / stored the
+# value as ONE i64: `a = c` and `var d: [3]i64 = a` copied 8 bytes, and
+# `a = [x, y]` stored the literal's address (or `store i64 <%T>`, which clang
+# rejects).  Supported values, each checked for length and element type:
+#   * `[a, b, ..]`: built in a temporary `[N x T]` then copied over, so
+#     `a = [a[1], a[0]]` swaps (as for a field, #1934);
+#   * `[v; N]`: written in place (v is evaluated once, before any store);
+#   * another 1-D local array (`a = c`);
+#   * an inline array field (`a = x.f`, #2035);
+#   * `*p` for `p: *[N]T` (#1953).
+# Anything else fails closed: emit_expr has no whole-array value.
+fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, value: *Expr)
+    if value == null
+        emit_ir_error(s, c"whole-array assignment has no value")
+        return
+    if emit_array_local_copy_from_field(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value) == 1
+        return
+    if value.kind == EXPR_ARRAY_FILL or value.kind == EXPR_ARRAY_LIT
+        var n: i32 = 0
+        if value.kind == EXPR_ARRAY_FILL
+            n = value.int_val as i32
+        else
+            var it: *Expr = value.args
+            while it != null
+                n = n + 1
+                it = it.next
+        if n != dst_size
+            emit_ir_error(s, c"array literal length does not match the local array's length")
+            return
+        if value.kind == EXPR_ARRAY_FILL
+            emit_array_fill_into(s, dst_ptr, dst_size, dst_et, value.left)
+            return
+        let tmp: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, tmp)
+        emit_str(s, c" = alloca ")
+        emit_local_array_llvm_type(s, dst_size, dst_et, dst_name, dst_name_len)
+        emit_str(s, c"\n")
+        emit_array_lit_into(s, tmp, dst_size, dst_et, dst_name, dst_name_len, value)
+        emit_local_array_copy(s, dst_size, dst_et, dst_name, dst_name_len, tmp, dst_ptr)
+        return
+    var src_ptr: i32 = -1
+    var src_size: i32 = -1
+    var src_et: i32 = TYPE_VOID
+    var src_name: *u8 = null
+    var src_name_len: i32 = 0
+    if value.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, value.ident_ptr, value.ident_len)
+        if loc != null and loc.var_type == TYPE_ARRAY and loc.array_shape == null
+            src_ptr = loc.reg
+            src_size = loc.array_size
+            src_et = loc.array_elem_type
+            src_name = loc.type_name
+            src_name_len = loc.type_name_len
+    else if value.kind == EXPR_UNARY and value.op == OP_DEREF and value.operand != null and value.operand.kind == EXPR_IDENT
+        let ploc: *LocalVar = find_local_struct_name(s, value.operand.ident_ptr, value.operand.ident_len)
+        if ploc != null and ploc.var_type == TYPE_PTR and ploc.pointee_type == TYPE_ARRAY and ploc.pointee_array_size > 0
+            src_ptr = emit_load_ptr(s, ploc.reg)
+            src_size = ploc.pointee_array_size
+            src_et = ploc.pointee_array_elem_type
+            src_name = ploc.type_name
+            src_name_len = ploc.type_name_len
+    if src_ptr < 0
+        emit_ir_error(s, c"whole-array assignment to a local array from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
+        return
+    if src_size != dst_size
+        emit_ir_error(s, c"array length does not match the local array's length")
+        return
+    if array_elem_types_match(src_et, src_name, src_name_len, dst_et, dst_name, dst_name_len) == 0
+        emit_ir_error(s, c"array element type does not match the local array's element type")
+        return
+    emit_local_array_copy(s, dst_size, dst_et, dst_name, dst_name_len, src_ptr, dst_ptr)
 
 # AGAST #2048: `x.f = v` / `pp.f = v` / `o.p.f = v` where `f` is an f32 /
 # f64 field at `field_ptr` and `val_reg` is emit_expr(value).  Stores

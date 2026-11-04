@@ -186,13 +186,11 @@ pub fn main() -> i32
     return ORDER
 """, 12),
 
-    # Reassigning an array drops the old elements: 2 then, 2 more at the end
-    # (c moved into a).  `a = [..]` itself is AGAST #2169.
+    # Reassigning an array drops the old elements: 2 then, 2 more at the end.
     "array_reassign": ("""\
 fn f() -> i32
     var a: [2]Tracked = [make(1), make(2)]
-    var c: [2]Tracked = [make(3), make(4)]
-    a = c
+    a = [make(3), make(4)]
     return DROPS * 10
 
 pub fn main() -> i32
@@ -200,12 +198,11 @@ pub fn main() -> i32
     return inner + DROPS
 """, 24),
 
-    # A moved array is dropped by its new owner only.  (Unannotated, `var b
-    # = a` copies 8 bytes: AGAST #2169.)
+    # A moved array is dropped by its new owner only.
     "array_moved": ("""\
 fn f()
     var a: [2]Tracked = [make(1), make(2)]
-    var b: [2]Tracked = a
+    var b = a
 
 pub fn main() -> i32
     f()
