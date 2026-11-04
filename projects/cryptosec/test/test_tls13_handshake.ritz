@@ -10,6 +10,7 @@ import cryptosec.tls13_kdf
 import cryptosec.x509
 import cryptosec.p256
 import cryptosec.ed25519
+import cryptosec.rsa
 
 # ============================================================================
 # Transcript Hash Tests
@@ -890,39 +891,6 @@ fn test_cv_verify_ecdsa_rejects_other_key() -> i32
         return 3
     return 0
 
-[[test]]
-fn test_cv_verify_rejects_rsa_pkcs1() -> i32
-    # Used to hash and return success without verifying anything.
-    var pk: X509PublicKey
-    mem_zero(@pk as *u8, sizeof(X509PublicKey))
-    pk.algorithm = PUBKEY_TYPE_RSA
-    pk.key_len = 270
-    var th: [32]u8
-    cv_test_transcript(@th[0])
-    var cv: CertificateVerify
-    mem_zero(@cv as *u8, sizeof(CertificateVerify))
-    cv.algorithm = SIG_RSA_PKCS1_SHA256
-    cv.signature_len = 256
-    if certificate_verify_verify(@cv, @th[0], @pk) == 0
-        return 1
-    return 0
-
-[[test]]
-fn test_cv_verify_rejects_rsa_pss_unimplemented() -> i32
-    var pk: X509PublicKey
-    mem_zero(@pk as *u8, sizeof(X509PublicKey))
-    pk.algorithm = PUBKEY_TYPE_RSA
-    pk.key_len = 270
-    var th: [32]u8
-    cv_test_transcript(@th[0])
-    var cv: CertificateVerify
-    mem_zero(@cv as *u8, sizeof(CertificateVerify))
-    cv.algorithm = SIG_RSA_PSS_RSAE_SHA256
-    cv.signature_len = 256
-    if certificate_verify_verify(@cv, @th[0], @pk) == 0
-        return 1
-    return 0
-
 fn cv_test_ed25519(pk: *X509PublicKey, th: *u8, cv: *CertificateVerify)
     var seed: [32]u8
     var i: i32 = 0
@@ -1139,4 +1107,277 @@ fn test_server_hello_is_retry_request() -> i32
     body[2] = body[2] ^ 0x80
     if server_hello_is_retry_request(@body[0], 40) != 0
         return 4
+    return 0
+
+# ============================================================================
+# CertificateVerify under RSA keys: rsa_pss_rsae_sha256 (AGAST #2110)
+# ============================================================================
+# Python cryptography 49 (test-only keys). Every signature is over the CV
+# content for cv_test_transcript(). Keys are RSAPublicKey DER, as X.509
+# stores them.
+#   pss       RSASSA-PSS, SHA-256, MGF1-SHA-256, salt 32 (what TLS 1.3 sends)
+#   pkcs1     RSASSA-PKCS1-v1_5 SHA-256
+#   salt0     PSS with a zero-length salt (TLS 1.3 requires salt = hash length)
+#   sha384    PSS-SHA-384 / MGF1-SHA-384 / salt 48
+# Hand-built EMs (salt 32), raw-signed with the private key; H always matches
+# the salt, so each one is rejected only by the check it names:
+#   handmade  well-formed (sanity: it verifies)
+#   topbit    leftmost (8*emLen - emBits) bit of maskedDB set
+#   trailer   last byte 0xbd, not 0xbc
+#   ps        a nonzero byte in PS
+#   sep       0x02 where the 0x01 separator belongs
+# plus_n is a valid signature s with n added (s + n < 2^2048): congruent, so
+# only the s < n check rejects it. The 2049-bit key has emLen = k - 1 = 256,
+# so the RSAVP1 output's leading byte must be 0; leadbyte raw-signs
+# 0x01 || valid EM.
+
+fn rsa2048_key_hex() -> *u8
+    return c"3082010a02820101009e4d9cd376919ea69f88e8b17b293e5e484cbf47b2016aa03900c058f493ec1f1f1085bc2017906802b313f7031cfeb9b1165ae5d2d409d61cda83554f3eabdd904143f9ef97be74794f598615c839dbb29a31854508a8f8a3e1098c213cb2328293655babe5ec7020907f332ee5752810c7ef1ea7bdec2e3f74c5ca62e217ef0e6371f92c569b19d0adc71662d2c66eebc8a28a9891f0cb3273b06e35a6a598eb850a15a591d859755aea179e35567bf5c332010467685610754cbe8c58a6cfe2529972f2329790e093bc986409b85b6e61b8d03b8674a3b66937a443dcbe515b8a67f7e280bd077ffdb54ff48e87ada056c56b65afac162fb09340ec8a16990203010001"
+
+fn rsa2048_pss_hex() -> *u8
+    return c"7ef7685acd60cff0e97642abbfad709bffae33323c5e4e11b43a74fddf592a73a9584d8e264d721bb9825a1a5bbf870175998cd1e3a18b978d37400c68adab0e0c823205b7ef30fbc26f9aa7d7740367efd35953693b842515d20bfce4fcc0df96ebb755ccfb88c1109cda55cbe7f0ebf2060e6591327cb4bf9266b214c89a33a317bd0c23f8bf0ef6d64ebd88381935658eaf83b3e72eacd9c120f42ba0ed7a513bddccdbec306ec7c421a723695396fda9c74aadbf63724982e63e7d32e084ec2a74b8f04f226b8cb547978a4d1a0129ef4f8b642054998770472e23fba0c57b3aa15b114c837da0795854d1aaa16d929f75675e6d385b7cd7a26318746fdd"
+
+fn rsa2048_pkcs1_hex() -> *u8
+    return c"6a26f942f6f274ac5a58444a87dee05896be38f8f6dee1296124f198ad3dcf200d99e672d595e81a59d5c3955e86912fded10f909896b0b7abf8a97bd0c2bbd580b2dd6393425edc52aea065162e3c7d7ce5f789061c8c880ad5e2bd189b1d3636d3944aedd77440a42aa6ac7d5d5a50e7922a32961d8ded766fc423d2b3f0933ffba62e6654fa54009c7beb8c1d60026d2ab1c98806cbc391e45e1fa26d198fbdc13d0f7afd7349854310825b8e789893beb2768cf4c4e6631e0faeb31ba6643e425d43a5b9f8ab2cff8e5f875b17b53e9e77f2045d3022b90536f2fbb1e096f99856441e69038f62a1635608d2a95dc38f28cb25b1e59cd69df2d931948375"
+
+fn rsa2048_pss_salt0_hex() -> *u8
+    return c"70aa5dd9fe7dd422845aa203c224c5f07c3a6e3f253d7571ce618bf53a3a3682d1bedf334dc23e37cfc4e2a76d25794db1c2e14d41bf825b090da4a1ed08959f5c14d06b8a08eccccf3e834841f8b8c122eae019f1fba6b524cb219e59f38543684c56ade179bb8babc922ff5e556da75a7d7032d13f4d1f541c7a15e10f21c6c89bc4a18ba8ae608e2c061b264f1d75c965034560f106f13c41b51b87533f41c7c07d813fc3485ec90925d1fec2691d98444e2321a9802ce182f09bfd6344663ef6d39b5b19cb0e4e56acae63da07071426d3445356cc86a504d1abd114ac816117fb33a6eccb5276167d67ac099974723ad3ea9da7b66ad47ecb49f94af106"
+
+fn rsa2048_pss_sha384_hex() -> *u8
+    return c"60349c8055d32dff2f430aea5036c3721af45a64369c20e2b167a0f49ce95973481b1b399c8256259832ed42dcd655e74eb5e3088a1f173524bff896b9abe0f5ff05b4aab1241b9acb5935d185d1a7f79c60bfe11d3ee453173d91ad827a3107f110e34c7da164b08eb812ab3fbc01aad53e1e390c181731382edb2a0b97fdcfc897e34d3e6c0d0511784ba71cda3aa66c8488b59fca18fef049bfd5447bdf6c56035d245776b0426efad3b8c8da2ee90ec6559afd4cb89a9e40d1c270782ae83a1d8bdc0cf3f62f5feebe28b47cadc8274be9771c53cebb0339fab8f10f4dfb3e905102d9e0473f23aea807acf46a11b678e3a59d01e70bb694e44c4088b996"
+
+fn rsa2048_pss_handmade_hex() -> *u8
+    return c"13081b22f6505a7d61d9f777bb3602973de95580de407accaaa97cb04ff3b4feeee0231d626053df4c1c80ba391ffa219006a7cb9073950d44ce4f4fadf8cc26f3508f0ad6b65de6345228cc8481b03427f97b492b8a83afdcf419893bd63fcb8656d7231e720c4cd5abe068eb69e9bb235ef19731004a432faaf1f1ab6f80ba8ec7beeef76a708b9850a53d5f2cdc8889f14fac69307a669340605c4d5ae761b12d4525c77c0ba70fd9bf1937589f750d05d1377f5de5c2206ef18909d40bc1522e9cb9b9d606dc0763be301a7721a4d250924aae9dd3c785b0e1f2ccae116d72fb62702f08ae8ce8c7ac7df229d8256af898bddee27064f609f503e8ff0bcb"
+
+fn rsa2048_pss_topbit_hex() -> *u8
+    return c"6b0c09ffcfb94ad54be7829b196748e290afeed626154eea4efabc8c673ed8eb8ad488f4e9eae72d9f5928a01df72e2d5821cdb06e16ae8d3e0391db414ca806011a3c21079c53988a60990ea85d00e10cc12bbc16d4f926e9dcfe4192f897009765cf5280bace0b4c6356809ad5c015dcd16bd887f1235501c24fc016e0aed3d54aba631bba3a01fa9087c3a011ff66e25a6446f6af6cec7d820f0189b125e9b1970453f2f7fa43621d606ce9e8bde40b056a5562d3ee55a73121aac941d6378ed57c843d8e69875ba5aea0dd383d4cbf4985655c6717fe6c24a991ae01d0bb7f97741b6ce1b04b1ce744cddffe96962807930e89af8ea109435ad7c9f8d3af"
+
+fn rsa2048_pss_trailer_hex() -> *u8
+    return c"8f2ad890bded31b1e6974cff97295ccfe7dde0bd98a3f358cdfa4ec4cca953a78ba8a2459686ed43e2be8d4ba35835aa6e2d9ce12c3df0ddf6de6ba723e1cdc523e8c8200cda06b4513ef251d55b50b9671e39cd1f7e6672dc33af960f5a1a210b7c4b1c994914f01b182b7d9a4edca27dad3176cd776dd668f9548a4c328d88852c23630836761c1ef0334b5ca472a8943e8ba6fd2a20799a014503b8dcddfd439784ce8d8b539db5ffd4b450551b73d76188203e7ed25c7ab8b40f85fc6e7bd5cb997799bca9f263a0e3ec7c9d15d5a98ac387b21e780cdf42e5cdd5f084a467666c10fdb07890356ca1b9bba75a3d1734a2cacb02ba4f737ca27093e40d03"
+
+fn rsa2048_pss_ps_hex() -> *u8
+    return c"6a9ea123edc133c35d2466378f5b3531549c5c1c4d9bfd1e0885e88848938e0a3944f080f4f6e6d4476b1ea01b5bc8ce9e660d6dee3b3df89653dc7db115b8d5d611b430dd767eab3344ebabc6035f373834c5514319577710458e0c010d2762a91a00220b6a6c029406273aee7ed61d15895a95c24e5c9da5ecbee1fc9c857d76c05ee41a47e726c92bec52d1b87ee2c743e086848f1fc6b919f472af4ba98d77efb8a88ca068f7d4437760d879cb7556bb73d430d6fecf475e1d1adba450b0edd73408edb63714b072265f2b1f4c7b1dbf77a1a9cb055215079d71264c5fc3dba24bcb0b97a86af82a3c69fe40e59efbca162f5b92e378f54072078704e676"
+
+fn rsa2048_pss_sep_hex() -> *u8
+    return c"446373d9a54ef9f186c0e45b4cc96c9eb10db6b0b9b35a1364b9eae533f9021f152eb1528ff90c788749205d466607921cfa91d74b421951136683f80183332ea0773a96bf5a5d0250a407edb09e74f88dba650ead2bacb88683a5fd0826075b6d1d535d749f5e9807223e836de20f38dfa091c9c0a3ea342780b9117ea1d138441bf5d17392730b8a877dbeafdca2420ea8b263c4041395fbf3c64db814a5d9be4b4188569622d393d6a0789511fe20e392c9093a7b0ab0c4bce5bb91fe205aed9815389ae6ca13b541f89559533b20c87eb582f75e9db43fedde9671124af36765877bbe7c0a4ea1dbdb60d7006b041ea7dc500efaec7433a4baba58a17a96"
+
+fn rsa2048_pss_plus_n_hex() -> *u8
+    return c"ed193be67006630401af66a5bd2c78d366bf64e0a38edd7f599c28e86e1cf7a15c3440baf026a2d5f2c0dae714a68f4fb88cbcc8680453da0a162e05f414c47e192179aa8176b0efd4a31b74db303c59748ca061fc43391210dac74821c200f1afcb7899295f7f4ce2b89d00c7e07257a0f8084b2b03baa3706e0a76275827bd8fe233e0fd8e19b706b6f2b67e65dd7167246003add5927a91ae29e2a62f9d38f68c5ec9e9d07cc91acfdfb067cdc6b96b034496215a5db0c101f3e0fea961ffa8ec698f7be4f9195581e8c30ff0e0ffac6c4eba09d50a1c0e4a291a59fad0ae3555e4aba39ff72fc7e1694fcb25f486d195e56a8af6e060233738fa78d6a48f"
+
+fn rsa2049_key_hex() -> *u8
+    return c"3082010a02820101017ddba5e8464d15d4a66b0ba384f788e2383cb64c219a90fefec8b5ad1fdcfd2f682802ed6262843f0d2d8fe33602897acf532c2eb2a32692f6e19631fe4d3af596dd285d0eee5a567331b5e2581047d70c65292de567f198f355c6f70bfdb4d18e01521908166476d48b9fd867591414b241ab2c483d8ce0f0494e8205bff4c98c8adf3d35f6c99fd744f328c895c15e4bfb4775c6e0e5a8dabdb2bdc78cd1c26c6307f48bff5f903d5437f911c5e21324252dcf140bbc78641f0f9615a92b649c146fc76363b955f5ed13b370f219c46579955b6156f1cf5f24e3fcea533446f91e51e9218a8430b65bc6c3013e098b515612f215f9ec5d788a0e89dd56b3010203010001"
+
+fn rsa2049_pss_hex() -> *u8
+    return c"005322f005be61a0f917b8a23665aabb6b40c200d6e51e304fd30e504643f0dfac72b1f5446805343c4339581b26cfde91c29ffd6f9ade6ebcafbacadd33fa79234723cef99706f67c5386b8f57d4a4bb99a1b8725558d76da036100e0d52edd0df131f09093c67c108d8616ef367038dab2841e89e4a923ad58b0d57e9ab9f913a32d451b18acabb9e3bbb0fdc6f15b7c3277d102221669ff940510459f5b9aabd4ed876d21549e3e3e0eccebb7bc5167718c1827568f25fdbf52ae083bdf5e0c53f909dfd9074405bbebc754281f7510b71c0a8d9c26ce4352d5aa346d3972ae6118160a60dda3089005da2e70f152b882fb638b0cae9955fa210ce541c465d1"
+
+fn rsa2049_pss_leadbyte_hex() -> *u8
+    return c"002e97fb5905a4a9a483b238d15dd9c005a118c9f2a9d43b69e1b2bdb3cb817e546377313921f523fc305341ad698ab5d0e3904cd3dbdb598726b7e88d2e53ca2e8d8d3824e9ec79a0f3708bc5214d1245f5a4de5ade6860b15340ea95d56fd539de250ed2364e72fa8647c49a2d4d429618842acf77dd1c748571f944fa4ef0050bd8ae76e8a61de80690f6f622dcb7b35371402cd350e78f9f2188803ca9e748847c1127179de737f6321bf5646cb3cb2fb569e64dadf3aaa868abf9ae939b8df5c08cbccf773c2d3ac2b9b38ed95234d643700db81ca33803ea387f672550e2ab4548c9c098ebcec66e3334c050e2bfc16ff637c15407f4e4ba27897cf54ccb"
+
+fn cv_rsa_key(pk: *X509PublicKey, key_hex: *u8)
+    mem_zero(pk as *u8, sizeof(X509PublicKey))
+    pk.algorithm = PUBKEY_TYPE_RSA
+    pk.curve = EC_CURVE_UNKNOWN
+    pk.key_len = cv384_hex(key_hex, @pk.key_data[0]) as u64
+
+fn cv_rsa_sig(cv: *CertificateVerify, algorithm: u16, sig_hex: *u8)
+    mem_zero(cv as *u8, sizeof(CertificateVerify))
+    cv.algorithm = algorithm
+    cv.signature_len = cv384_hex(sig_hex, @cv.signature[0])
+
+# rsa_verify_pss_sha256 over the CV content for cv_test_transcript().
+fn rsa_pss_check(key_hex: *u8, sig_hex: *u8) -> i32
+    var der: [600]u8
+    let der_len: i64 = cv384_hex(key_hex, @der[0])
+    var key: RsaPublicKey
+    if rsa_parse_public_key(@der[0], der_len as i32, @key) != 0
+        return -1
+    var sig: [512]u8
+    let sig_len: i64 = cv384_hex(sig_hex, @sig[0])
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var content: [130]u8
+    certificate_verify_content(@th[0], @content[0])
+    return rsa_verify_pss_sha256(@key, @content[0], 130, @sig[0], sig_len as i32)
+
+[[test]]
+fn test_rsa_pss_sha256_verifies() -> i32
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_hex()) != 1
+        return 1
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_handmade_hex()) != 1
+        return 2
+    return 0
+
+[[test]]
+fn test_rsa_pss_sha256_2049_bit_modulus() -> i32
+    # modBits - 1 = 2048 is a multiple of 8: EM is one byte shorter than k.
+    if rsa_pss_check(rsa2049_key_hex(), rsa2049_pss_hex()) != 1
+        return 1
+    return 0
+
+[[test]]
+fn test_rsa_pss_sha256_rejects_other_encodings() -> i32
+    # Each of these is a genuine signature by the same key, just not
+    # PSS-SHA256 with a 32-byte salt over this message.
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pkcs1_hex()) != 0
+        return 1
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_salt0_hex()) != 0
+        return 2
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_sha384_hex()) != 0
+        return 3
+    # Signed by the 2048-bit key, checked under the 2049-bit one.
+    if rsa_pss_check(rsa2049_key_hex(), rsa2048_pss_hex()) != 0
+        return 4
+    return 0
+
+[[test]]
+fn test_rsa_pss_sha256_rejects_set_top_bit() -> i32
+    # RFC 8017 §9.1.2 step 6: the bits of maskedDB above emBits must be 0.
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_topbit_hex()) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_rsa_pss_sha256_rejects_bad_padding() -> i32
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_trailer_hex()) != 0
+        return 1
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_ps_hex()) != 0
+        return 2
+    if rsa_pss_check(rsa2048_key_hex(), rsa2048_pss_sep_hex()) != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_rsa_pss_sha256_rejects_nonzero_leading_byte() -> i32
+    # I2OSP(m, emLen) fails when m >= 256^emLen (RFC 8017 §8.1.2 step 2c).
+    if rsa_pss_check(rsa2049_key_hex(), rsa2049_pss_leadbyte_hex()) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_rsa_pss_sha256_rejects_bad_length_and_range() -> i32
+    var der: [600]u8
+    let der_len: i64 = cv384_hex(rsa2048_key_hex(), @der[0])
+    var key: RsaPublicKey
+    if rsa_parse_public_key(@der[0], der_len as i32, @key) != 0
+        return 1
+    var sig: [512]u8
+    let sig_len: i64 = cv384_hex(rsa2048_pss_hex(), @sig[0])
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var content: [130]u8
+    certificate_verify_content(@th[0], @content[0])
+    if rsa_verify_pss_sha256(@key, @content[0], 130, @sig[0], sig_len as i32) != 1
+        return 2
+    # Truncated signature
+    if rsa_verify_pss_sha256(@key, @content[0], 130, @sig[0], (sig_len - 1) as i32) != 0
+        return 3
+    # k + 1 bytes: a 0x00 prefix leaves the integer unchanged, but the
+    # signature must be exactly k bytes long.
+    var padded: [513]u8
+    padded[0] = 0
+    mem_copy(@padded[1], @sig[0], sig_len as u64)
+    if rsa_verify_pss_sha256(@key, @content[0], 130, @padded[0], (sig_len + 1) as i32) != 0
+        return 4
+    # s + n, congruent to a valid s mod n, but out of range
+    let plus_len: i64 = cv384_hex(rsa2048_pss_plus_n_hex(), @sig[0])
+    if rsa_verify_pss_sha256(@key, @content[0], 130, @sig[0], plus_len as i32) != 0
+        return 5
+    return 0
+
+[[test]]
+fn test_cv_verify_rsa_pss_valid_signature() -> i32
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv_rsa_key(@pk, rsa2048_key_hex())
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA256, rsa2048_pss_hex())
+    if certificate_verify_verify(@cv, @th[0], @pk) != 0
+        return 1
+    cv_rsa_key(@pk, rsa2049_key_hex())
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA256, rsa2049_pss_hex())
+    if certificate_verify_verify(@cv, @th[0], @pk) != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_cv_verify_rsa_pss_rejects_other_transcript() -> i32
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv_rsa_key(@pk, rsa2048_key_hex())
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA256, rsa2048_pss_hex())
+    th[5] = th[5] ^ 0x01
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    return 0
+
+[[test]]
+fn test_cv_verify_rsa_pss_rejects_corrupt_signature() -> i32
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv_rsa_key(@pk, rsa2048_key_hex())
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA256, rsa2048_pss_hex())
+    cv.signature[255] = cv.signature[255] ^ 0x01
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA256, rsa2048_pss_hex())
+    cv.signature[7] = cv.signature[7] ^ 0x80
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_cv_verify_rejects_rsa_pkcs1() -> i32
+    # rsa_pkcs1_* is forbidden in TLS 1.3 CertificateVerify (RFC 8446
+    # §4.2.3): a genuine PKCS#1 v1.5 signature must not verify, whichever
+    # scheme it is labelled with.
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv_rsa_key(@pk, rsa2048_key_hex())
+    cv_rsa_sig(@cv, SIG_RSA_PKCS1_SHA256, rsa2048_pkcs1_hex())
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    cv.algorithm = SIG_RSA_PSS_RSAE_SHA256
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 2
+    # Nor does a valid PSS signature labelled rsa_pkcs1_sha256.
+    cv_rsa_sig(@cv, SIG_RSA_PKCS1_SHA256, rsa2048_pss_hex())
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_cv_verify_rsa_pss_binds_scheme_and_key_type() -> i32
+    var pk: X509PublicKey
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    # rsa_pss_rsae_sha384 / _sha512 are not implemented: refused, even for
+    # a genuine PSS-SHA-384 signature.
+    cv_rsa_key(@pk, rsa2048_key_hex())
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA384, rsa2048_pss_sha384_hex())
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA512, rsa2048_pss_hex())
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 2
+    # rsa_pss_rsae_sha256 needs an rsaEncryption key in the certificate.
+    cv_rsa_sig(@cv, SIG_RSA_PSS_RSAE_SHA256, rsa2048_pss_hex())
+    pk.algorithm = PUBKEY_TYPE_EC
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 3
+    # And an RSA key is not an ECDSA / Ed25519 key.
+    cv_rsa_key(@pk, rsa2048_key_hex())
+    cv_rsa_sig(@cv, SIG_ECDSA_SECP256R1_SHA256, rsa2048_pss_hex())
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 4
+    cv.algorithm = SIG_ED25519
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 5
     return 0

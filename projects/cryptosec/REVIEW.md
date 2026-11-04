@@ -46,7 +46,7 @@ The cryptographic primitives (ChaCha20, Poly1305, X25519, Ed25519, AES, SHA-256/
 
 ### H-2: Server authentication completely bypassed
 
-> **Status (2026-11, AGAST #1862):** Fixed. `certificate_verify_verify` verifies ecdsa_secp256r1_sha256 and ed25519 and rejects everything else (rsa_pkcs1 is forbidden in TLS 1.3 CertificateVerify; rsa_pss is unimplemented). The client now requires, fail closed: a pinned leaf certificate (`tls_config_pin_cert`), a hostname match, a verifying CertificateVerify, and EE → Certificate → CertificateVerify → Finished order; there is no skip-verify mode. Since #2109 the client can instead trust a CA store (`tls_config_set_ca_store`): chain to an anchor, signatures, CA flags, validity and SAN hostname; with neither a pin nor a store it refuses every server. RSA-PSS is #2110. Covered by `test/test_tls13_handshake.ritz` and valet's `test/test_tls_e2e.ritz`.
+> **Status (2026-11, AGAST #1862):** Fixed. `certificate_verify_verify` verifies ecdsa_secp256r1_sha256, ed25519, ecdsa_secp384r1_sha384 (#2115) and rsa_pss_rsae_sha256 (#2110) and rejects everything else (rsa_pkcs1 is forbidden in TLS 1.3 CertificateVerify; rsa_pss_rsae_sha384/512 and rsa_pss_pss_* are unimplemented and not advertised). The client now requires, fail closed: a pinned leaf certificate (`tls_config_pin_cert`), a hostname match, a verifying CertificateVerify, and EE → Certificate → CertificateVerify → Finished order; there is no skip-verify mode. Since #2109 the client can instead trust a CA store (`tls_config_set_ca_store`): chain to an anchor, signatures, CA flags, validity and SAN hostname; with neither a pin nor a store it refuses every server. Covered by `test/test_tls13_handshake.ritz` and valet's `test/test_tls_e2e.ritz`.
 
 **File:** `tls13_handshake.ritz:754-756`, `tls13_client.ritz:493`
 **Severity:** HIGH — Full MITM
@@ -256,6 +256,8 @@ Not zeroed: `recv_buf[4096]`, `send_buf[4096]`, transcript hash, `server_certs`,
 Both comparison loops use early-exit branching, leaking hash byte position via timing.
 
 **Fix:** Replace with accumulator-based constant-time comparison.
+
+> **Status (2026-11):** Open, AGAST #2183. The RSA-PSS verifier added in #2110 already compares with an accumulator.
 
 ---
 

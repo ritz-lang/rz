@@ -24,6 +24,7 @@ import p256
 import p384
 import sha512
 import ed25519
+import rsa
 import hkdf
 import tls13_kdf
 
@@ -798,10 +799,12 @@ pub fn certificate_verify_content(transcript_hash: *u8, out: *u8)
 # pubkey: server's public key from certificate
 # Returns 0 if the signature verifies under pubkey, negative otherwise.
 #
-# Fails closed: only ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384 and
-# ed25519 are verified; each ECDSA scheme requires a key on its own curve.
-# rsa_pkcs1_* is forbidden in TLS 1.3 CertificateVerify (RFC 8446 §4.2.3) and
-# rsa_pss_* is not implemented, so both are rejected.
+# Fails closed: only ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384,
+# ed25519 and rsa_pss_rsae_sha256 are verified; each ECDSA scheme requires a
+# key on its own curve, rsa_pss_rsae_sha256 an rsaEncryption key.
+# rsa_pkcs1_* is forbidden in TLS 1.3 CertificateVerify (RFC 8446 §4.2.3);
+# rsa_pss_rsae_sha384/512 and rsa_pss_pss_* are not implemented (and not
+# advertised), so all of those are rejected.
 pub fn certificate_verify_verify(cv: *CertificateVerify, transcript_hash: *u8, pubkey: *X509PublicKey) -> i32
     var content: [130]u8
     certificate_verify_content(transcript_hash, @content[0])
@@ -855,7 +858,17 @@ pub fn certificate_verify_verify(cv: *CertificateVerify, transcript_hash: *u8, p
             return -4
         return 0
 
-    # RSA (PKCS#1 forbidden, PSS unimplemented) and anything else: refuse.
+    if cv.algorithm == SIG_RSA_PSS_RSAE_SHA256
+        if pubkey.algorithm != PUBKEY_TYPE_RSA
+            return -2
+        var rsa_key: RsaPublicKey
+        if rsa_parse_public_key(@pubkey.key_data[0], pubkey.key_len as i32, @rsa_key) != 0
+            return -2
+        if rsa_verify_pss_sha256(@rsa_key, @content[0], CV_CONTENT_LEN as i64, @cv.signature[0], cv.signature_len as i32) != 1
+            return -4
+        return 0
+
+    # RSA-PKCS1 (forbidden), other RSA-PSS variants and anything else: refuse.
     return -1
 
 # ============================================================================

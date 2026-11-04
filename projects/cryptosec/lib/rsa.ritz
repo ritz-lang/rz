@@ -1,7 +1,8 @@
 # lib/rsa.ritz - RSA Signature Verification
 #
-# Implements RSA signature verification with PKCS#1 v1.5 padding.
-# Used for verifying X.509 certificate chains (most certificates use RSA).
+# Implements RSA signature verification with PKCS#1 v1.5 padding (X.509
+# certificate chains) and RSASSA-PSS with SHA-256 (TLS 1.3
+# CertificateVerify, rsa_pss_rsae_sha256).
 #
 # References:
 # - RFC 8017 (PKCS#1 v2.2)
@@ -430,3 +431,136 @@ pub fn rsa_verify_pkcs1_sha512_hash(key: *RsaPublicKey, hash: *u8, sig: *u8, sig
     var prefix: [19]u8
     let prefix_len: i32 = get_sha512_digest_info_prefix(@prefix[0])
     return rsa_verify_pkcs1(key, hash, 64, @prefix[0], prefix_len, sig, sig_len)
+
+# ============================================================================
+# RSASSA-PSS Signature Verification (RFC 8017 §8.1.2, §9.1.2)
+# ============================================================================
+#
+# Only the parameter set TLS 1.3 uses for rsa_pss_rsae_sha256 (RFC 8446
+# §4.2.3) is supported: Hash = SHA-256, MGF = MGF1-SHA-256, sLen = hLen = 32.
+# A signature made with any other hash, MGF or salt length is rejected.
+
+const PSS_SHA256_HLEN: i32 = 32
+const PSS_SHA256_SLEN: i32 = 32
+
+# Bit length of the modulus (key.n has no leading zero bytes).
+fn rsa_modulus_bits(key: *RsaPublicKey) -> i32
+    if key.n_len <= 0
+        return 0
+    var top: u8 = key.n[0]
+    var bits: i32 = 0
+    while top != 0
+        bits += 1
+        top = top >> 1
+    return (key.n_len - 1) * 8 + bits
+
+# db[0..db_len) ^= MGF1-SHA256(seed[0..32), db_len)  (RFC 8017 §B.2.1)
+fn mgf1_sha256_xor(seed: *u8, db: *u8, db_len: i32)
+    var block: [36]u8
+    mem_copy(@block[0], seed, 32)
+    var mask: [32]u8
+    var counter: u32 = 0
+    var done: i32 = 0
+    while done < db_len
+        block[32] = (counter >> 24) as u8
+        block[33] = (counter >> 16) as u8
+        block[34] = (counter >> 8) as u8
+        block[35] = counter as u8
+        sha256(@block[0], 36, @mask[0])
+        var i: i32 = 0
+        while i < 32 && done < db_len
+            db[done] = db[done] ^ mask[i]
+            i += 1
+            done += 1
+        counter += 1
+
+# EMSA-PSS-VERIFY with SHA-256 / MGF1-SHA-256 / sLen = 32 over the message
+# hash `mhash` (32 bytes). Returns 1 if valid, 0 otherwise.
+pub fn rsa_verify_pss_sha256_hash(key: *RsaPublicKey, mhash: *u8, sig: *u8, sig_len: i32) -> i32
+    # RSASSA-PSS-VERIFY step 1: the signature is exactly k bytes
+    if sig_len != key.n_len
+        return 0
+    if key.n_len < RSA_MIN_MODULUS_BYTES || key.n_len > RSA_MAX_MODULUS_BYTES
+        return 0
+
+    # Step 2 (RSAVP1): s < n, m = s^e mod n
+    var s: BigInt
+    if bigint_from_bytes(@s, sig, sig_len) != 0
+        return 0
+    var n: BigInt
+    if bigint_from_bytes(@n, @key.n[0], key.n_len) != 0
+        return 0
+    if bigint_ge(@s, @n) == 1
+        return 0
+    var m: BigInt
+    if bigint_mod_exp_u32(@m, @s, key.e, @n) != 0
+        return 0
+    var em_full: [512]u8
+    bigint_to_bytes_fixed(@m, @em_full[0], key.n_len)
+
+    # emBits = modBits - 1, emLen = ceil(emBits / 8). When emBits is a
+    # multiple of 8, emLen = k - 1 and I2OSP(m, emLen) requires the leading
+    # byte of the k-byte representation to be zero.
+    let em_bits: i32 = rsa_modulus_bits(key) - 1
+    let em_len: i32 = (em_bits + 7) / 8
+    let em_off: i32 = key.n_len - em_len
+    if em_off != 0 && em_full[0] != 0
+        return 0
+    let em: *u8 = @em_full[em_off]
+
+    # EMSA-PSS-VERIFY (RFC 8017 §9.1.2)
+    let hlen: i32 = PSS_SHA256_HLEN
+    let slen: i32 = PSS_SHA256_SLEN
+    # Step 3
+    if em_len < hlen + slen + 2
+        return 0
+    # Step 4: trailer field
+    if em[em_len - 1] != 0xbc
+        return 0
+    # Step 5: maskedDB || H
+    let db_len: i32 = em_len - hlen - 1
+    let h: *u8 = @em[db_len]
+    # Step 6: the leftmost 8*emLen - emBits bits (0..7) of maskedDB must be
+    # zero. Masks are computed in i32 so no shift reaches the operand width.
+    let zero_bits: i32 = 8 * em_len - em_bits
+    let top_mask: u8 = ((0xff00 >> zero_bits) & 0xff) as u8
+    let keep_mask: u8 = (0xff >> zero_bits) as u8
+    if (em[0] & top_mask) != 0
+        return 0
+    # Steps 7-9: DB = maskedDB ^ MGF(H), clear the leftmost bits
+    var db: [512]u8
+    mem_copy(@db[0], em, db_len as u64)
+    mgf1_sha256_xor(h, @db[0], db_len)
+    db[0] = db[0] & keep_mask
+    # Step 10: DB = PS (zeros) || 0x01 || salt. Accumulate rather than exit
+    # early; the verdict is the same, the timing no longer depends on where
+    # the padding goes wrong.
+    let ps_len: i32 = db_len - slen - 1
+    var bad: u8 = 0
+    var i: i32 = 0
+    while i < ps_len
+        bad = bad | db[i]
+        i += 1
+    bad = bad | (db[ps_len] ^ 0x01)
+    # Steps 11-13: H' = SHA-256(0x00 * 8 || mHash || salt)
+    var mprime: [72]u8
+    mem_zero(@mprime[0], 8)
+    mem_copy(@mprime[8], mhash, 32)
+    mem_copy(@mprime[40], @db[db_len - slen], slen as u64)
+    var hprime: [32]u8
+    sha256(@mprime[0], 72, @hprime[0])
+    # Step 14: H == H'
+    i = 0
+    while i < hlen
+        bad = bad | (h[i] ^ hprime[i])
+        i += 1
+    if bad != 0
+        return 0
+    return 1
+
+# Verify an RSASSA-PSS (SHA-256, MGF1-SHA-256, salt 32) signature over msg.
+# Returns 1 if valid, 0 if invalid.
+pub fn rsa_verify_pss_sha256(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
+    var mhash: [32]u8
+    sha256(msg, msg_len as u64, @mhash[0])
+    return rsa_verify_pss_sha256_hash(key, @mhash[0], sig, sig_len)
