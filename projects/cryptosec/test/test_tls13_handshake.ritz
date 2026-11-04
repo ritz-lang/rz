@@ -1002,6 +1002,106 @@ fn test_cv_verify_rejects_key_type_mismatch() -> i32
     return 0
 
 # ============================================================================
+# CertificateVerify under P-384 keys (AGAST #2115)
+# ============================================================================
+# One P-384 key (Python cryptography, test-only) signed the CV content for
+# cv_test_transcript() under SHA-384 (cv384_sig) and SHA-256 (cv384_sig256).
+
+fn cv384_hex_nibble(c: u8) -> u8
+    if c >= 0x61
+        return c - 0x61 + 10
+    return c - 0x30
+
+fn cv384_hex(s: *u8, out: *u8) -> i64
+    var n: i64 = 0
+    while s[n * 2] != 0
+        out[n] = (cv384_hex_nibble(s[n * 2]) << 4) | cv384_hex_nibble(s[n * 2 + 1])
+        n = n + 1
+    return n
+
+fn cv384_key(pk: *X509PublicKey)
+    mem_zero(pk as *u8, sizeof(X509PublicKey))
+    pk.algorithm = PUBKEY_TYPE_EC
+    pk.curve = EC_CURVE_P384
+    pk.key_len = cv384_hex(c"04d65fea0224a5c28d4078163539a82db97fd300e9dab776399a40b9292acc2ffd3c10d7c7d4e8671f54fdd5c046fc20dfa16e683750c3e5a84b975ccbcb95501fdd1f31e1dcfbad5064caadb795a2aa2d96283a987109abc805d5fd8da1b7313c", @pk.key_data[0]) as u64
+
+fn cv384_sig(cv: *CertificateVerify, algorithm: u16, sha256_sig: i32)
+    mem_zero(cv as *u8, sizeof(CertificateVerify))
+    cv.algorithm = algorithm
+    if sha256_sig == 1
+        cv.signature_len = cv384_hex(c"3065023100bd75ffef39dc5d078344f7b3597b9e5449053a93a0697ebdf0691595d715fd0ee2f25b0c0ef55a455737f31839ac66fc023077715bc2868f88aa83c044612f94f08974a0c133a70a5a4e088b63ba1ba0d78dd2e0cf8bb4e52db4e0a9de78fc9f5180", @cv.signature[0])
+    else
+        cv.signature_len = cv384_hex(c"3065023100f7bb3094cc18c4ada2b806cd993937f5eb3bde9a0e25e253abaa682456d1078f1834da49425c4ddaf6796008202906e402303bc318e5ce911e53b55b1ff48070cbd197d9aa57f518c6b728460ae7cc2e0deddae6160f6cdb7368d2228c01bbefbf05", @cv.signature[0])
+
+[[test]]
+fn test_cv_verify_ecdsa_p384_sha384_valid_signature() -> i32
+    var pk: X509PublicKey
+    cv384_key(@pk)
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    cv384_sig(@cv, SIG_ECDSA_SECP384R1_SHA384, 0)
+    if certificate_verify_verify(@cv, @th[0], @pk) != 0
+        return 1
+    th[5] = th[5] ^ 0x01
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 2
+    th[5] = th[5] ^ 0x01
+    cv.signature[cv.signature_len - 1] = cv.signature[cv.signature_len - 1] ^ 0x40
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_cv_verify_ecdsa_p384_binds_hash_and_curve() -> i32
+    var pk: X509PublicKey
+    cv384_key(@pk)
+    var th: [32]u8
+    cv_test_transcript(@th[0])
+    var cv: CertificateVerify
+    # A SHA-256 signature labelled ecdsa_secp384r1_sha384
+    cv384_sig(@cv, SIG_ECDSA_SECP384R1_SHA384, 1)
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 1
+    # ecdsa_secp256r1_sha256 names the curve too: not under a P-384 key
+    cv384_sig(@cv, SIG_ECDSA_SECP384R1_SHA384, 0)
+    cv.algorithm = SIG_ECDSA_SECP256R1_SHA256
+    if certificate_verify_verify(@cv, @th[0], @pk) == 0
+        return 3
+    # ecdsa_secp384r1_sha384 under a P-256 key
+    var priv: Scalar256
+    var pk256: X509PublicKey
+    cv_test_p256_key(@priv, @pk256)
+    cv384_sig(@cv, SIG_ECDSA_SECP384R1_SHA384, 0)
+    if certificate_verify_verify(@cv, @th[0], @pk256) == 0
+        return 4
+    return 0
+
+[[test]]
+fn test_client_hello_advertises_ecdsa_p384() -> i32
+    var ch: ClientHello
+    if client_hello_init(@ch) != 0
+        return 1
+    var buf: [512]u8
+    let len: i64 = client_hello_serialize(@ch, @buf[0], 512)
+    if len <= 0
+        return 2
+    # signature_algorithms (0x000d): ext_len(2) list_len(2) schemes...
+    var i: i64 = 0
+    while i + 6 < len
+        if buf[i] == 0x00 && buf[i + 1] == 0x0d
+            let list_len: i64 = ((buf[i + 4] as i64) << 8) | (buf[i + 5] as i64)
+            let ext_len: i64 = ((buf[i + 2] as i64) << 8) | (buf[i + 3] as i64)
+            if ext_len == list_len + 2 && i + 6 + list_len <= len
+                var j: i64 = 0
+                while j < list_len
+                    if buf[i + 6 + j] == 0x05 && buf[i + 7 + j] == 0x03
+                        return 0
+                    j = j + 2
+        i = i + 1
+    return 3
+
+# ============================================================================
 # HelloRetryRequest detection (AGAST #2116)
 # ============================================================================
 

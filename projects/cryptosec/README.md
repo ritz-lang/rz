@@ -22,6 +22,7 @@ Cryptosec is also used by Goliath (content-addressable filesystem) for SHA-256 c
 - X25519 key exchange (Diffie-Hellman)
 - Ed25519 digital signatures
 - P-256/ECDSA (for TLS compatibility)
+- P-384/ECDSA verification (X.509 chains through P-384 CAs, TLS CertificateVerify)
 - Full TLS 1.3 handshake support
 - Certificate validation
 - Constant-time implementations (side-channel resistant)
@@ -37,7 +38,7 @@ Cryptosec is also used by Goliath (content-addressable filesystem) for SHA-256 c
 # Build from source (run from the monorepo root; `rz` sets RITZ_PATH itself)
 ./rz build cryptosec
 
-# Run the test suite (485 [[test]] functions; takes several minutes)
+# Run the test suite (615 [[test]] functions; takes several minutes)
 ./rz test cryptosec
 ```
 
@@ -86,7 +87,7 @@ x25519_shared(private_key, peer_public, @shared_secret[0])
 **Active development** - `./rz build cryptosec` is green. AES-GCM,
 ChaCha20-Poly1305, X25519, Ed25519, P-256, SHA-2, HMAC and the TLS 1.3 handshake
 all have implementations in `lib/` with tests — this README described them as
-"in progress" long after they landed. 485 `[[test]]` functions are present; run
+"in progress" long after they landed. 615 `[[test]]` functions are present; run
 `./rz test cryptosec` for the current pass count (it takes several minutes).
 
 ## License

@@ -14,6 +14,7 @@ import rsa
 import sha256
 import sha512
 import p256
+import p384
 import ed25519
 
 # ============================================================================
@@ -44,14 +45,12 @@ pub fn x509_verify_signature(cert: *X509Certificate, issuer_key: *X509PublicKey)
     if cert.sig_algorithm == SIG_ALG_ECDSA_SHA256
         var h256: [32]u8
         sha256(cert.tbs_data, cert.tbs_len as i64, @h256[0])
-        return x509_verify_ecdsa_p256(cert, issuer_key, @h256[0])
+        return x509_verify_ecdsa(cert, issuer_key, @h256[0], 32)
 
     if cert.sig_algorithm == SIG_ALG_ECDSA_SHA384
-        # Over P-256 the digest is truncated to its leftmost 256 bits
-        # (SEC 1 4.1.4 step 5 / FIPS 186-4 6.4).
         var h384: [48]u8
         sha384(cert.tbs_data, cert.tbs_len as i64, @h384[0])
-        return x509_verify_ecdsa_p256(cert, issuer_key, @h384[0])
+        return x509_verify_ecdsa(cert, issuer_key, @h384[0], 48)
 
     if cert.sig_algorithm == SIG_ALG_ED25519
         return x509_verify_ed25519(cert, issuer_key)
@@ -75,19 +74,42 @@ pub fn x509_p256_point(key: *X509PublicKey, q: *P256Point) -> i32
     p256_point_from_affine(q, @qx, @qy)
     return 1
 
-# ECDSA over P-256: signatureValue holds a DER ECDSA-Sig-Value; hash32 is
-# the (truncated) 32-byte digest of the TBS. P-384 issuer keys are not
-# implemented (AGAST #2115) and are refused.
-fn x509_verify_ecdsa_p256(cert: *X509Certificate, issuer_key: *X509PublicKey, hash32: *u8) -> i32
-    var q: P256Point
-    if x509_p256_point(issuer_key, @q) != 1
+# Load an X.509 P-384 public key (uncompressed point) into q.
+# Returns 1 if it is a valid point on the curve, 0 otherwise.
+pub fn x509_p384_point(key: *X509PublicKey, q: *P384Point) -> i32
+    if key.algorithm != PUBKEY_TYPE_EC || key.curve != EC_CURVE_P384
         return 0
-    var sig: EcdsaSignature
-    if ecdsa_sig_from_der(@cert.signature[0], cert.signature_len as i64, @sig) != 0
+    return p384_point_from_bytes(q, @key.key_data[0], key.key_len as i64)
+
+# ECDSA (ecdsa-with-SHA256/384): signatureValue holds a DER ECDSA-Sig-Value
+# and hash is the hash_len-byte digest of the TBS. The issuer key's curve
+# picks the verifier; each truncates the digest to its order's bit length
+# (SEC 1 4.1.4 step 5 / FIPS 186-4 6.4): P-256 reads the leftmost 32 bytes,
+# P-384 at most 48. Any other curve is refused.
+fn x509_verify_ecdsa(cert: *X509Certificate, issuer_key: *X509PublicKey, hash: *u8, hash_len: i64) -> i32
+    if issuer_key.algorithm != PUBKEY_TYPE_EC
         return 0
-    if ecdsa_p256_verify(hash32, @sig, @q) != 1
-        return 0
-    return 1
+    if issuer_key.curve == EC_CURVE_P256
+        var q: P256Point
+        if x509_p256_point(issuer_key, @q) != 1
+            return 0
+        var sig: EcdsaSignature
+        if ecdsa_sig_from_der(@cert.signature[0], cert.signature_len as i64, @sig) != 0
+            return 0
+        if ecdsa_p256_verify(hash, @sig, @q) != 1
+            return 0
+        return 1
+    if issuer_key.curve == EC_CURVE_P384
+        var q384: P384Point
+        if x509_p384_point(issuer_key, @q384) != 1
+            return 0
+        var sig384: EcdsaSignature384
+        if ecdsa_p384_sig_from_der(@cert.signature[0], cert.signature_len as i64, @sig384) != 0
+            return 0
+        if ecdsa_p384_verify(hash, hash_len, @sig384, @q384) != 1
+            return 0
+        return 1
+    return 0
 
 # Ed25519 (RFC 8410): the signature is over the TBS bytes themselves.
 fn x509_verify_ed25519(cert: *X509Certificate, issuer_key: *X509PublicKey) -> i32

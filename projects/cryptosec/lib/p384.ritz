@@ -1,0 +1,698 @@
+# lib/p384.ritz - NIST P-384 (secp384r1) ECDSA signature verification
+#
+# Verification only (AGAST #2115): X.509 chains through P-384 CAs (Let's
+# Encrypt E5/E6, ISRG Root X2) and TLS CertificateVerify under P-384 keys.
+# Nothing here handles secrets, so the arithmetic is not constant time.
+#
+# Curve parameters (SEC 2 / FIPS 186-4 D.1.2.4):
+#   p = 2^384 - 2^128 - 2^96 + 2^32 - 1
+#   a = -3
+#   b = B3312FA7E23EE7E4988E056BE3F82D19181D9C6EFE8141120314088F5013875A
+#       C656398D8A2ED19D2A85C8EDD3EC2AEF
+#   n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF
+#       581A0DB248B0A77AECEC196ACCC52973
+#
+# Arithmetic: 384-bit integers are 6 little-endian u64 limbs (P384Int).
+# Both moduli (p for coordinates, n for scalars) use the same Montgomery
+# multiplication (CIOS), with R = 2^384. Field elements inside points are
+# kept in Montgomery form; values crossing the API (bytes, signatures) are
+# plain integers.
+
+import cryptosec.mem
+
+# A 384-bit integer, limbs[0] least significant.
+pub struct P384Int
+    limbs: [6]u64
+
+# -m^-1 mod 2^64 for each modulus.
+const P384_P_N0: u64 = 0x0000000100000001
+const P384_N_N0: u64 = 0x6ED46089E88FDC45
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+fn p384_set6(a: *P384Int, l0: u64, l1: u64, l2: u64, l3: u64, l4: u64, l5: u64)
+    a.limbs[0] = l0
+    a.limbs[1] = l1
+    a.limbs[2] = l2
+    a.limbs[3] = l3
+    a.limbs[4] = l4
+    a.limbs[5] = l5
+
+# Field prime p
+pub fn p384_get_p(a: *P384Int)
+    p384_set6(a, 0x00000000FFFFFFFF, 0xFFFFFFFF00000000, 0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+
+# Group order n
+pub fn p384_get_n(a: *P384Int)
+    p384_set6(a, 0xECEC196ACCC52973, 0x581A0DB248B0A77A, 0xC7634D81F4372DDF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+
+# R^2 mod p and R^2 mod n (to enter Montgomery form)
+fn p384_get_r2p(a: *P384Int)
+    p384_set6(a, 0xFFFFFFFE00000001, 0x0000000200000000, 0xFFFFFFFE00000000, 0x0000000200000000, 0x0000000000000001, 0x0000000000000000)
+
+fn p384_get_r2n(a: *P384Int)
+    p384_set6(a, 0x2D319B2419B409A9, 0xFF3D81E5DF1AA419, 0xBC3E483AFCB82947, 0xD40D49174AAB1CC5, 0x3FB05B7A28266895, 0x0C84EE012B39BF21)
+
+# Curve coefficient b and generator G (plain integers)
+fn p384_get_b(a: *P384Int)
+    p384_set6(a, 0x2A85C8EDD3EC2AEF, 0xC656398D8A2ED19D, 0x0314088F5013875A, 0x181D9C6EFE814112, 0x988E056BE3F82D19, 0xB3312FA7E23EE7E4)
+
+fn p384_get_gx(a: *P384Int)
+    p384_set6(a, 0x3A545E3872760AB7, 0x5502F25DBF55296C, 0x59F741E082542A38, 0x6E1D3B628BA79B98, 0x8EB1C71EF320AD74, 0xAA87CA22BE8B0537)
+
+fn p384_get_gy(a: *P384Int)
+    p384_set6(a, 0x7A431D7C90EA0E5F, 0x0A60B1CE1D7E819D, 0xE9DA3113B5F0B8C0, 0xF8F41DBD289A147C, 0x5D9E98BF9292DC29, 0x3617DE4A96262C6F)
+
+# ============================================================================
+# Plain 384-bit integer helpers
+# ============================================================================
+
+pub fn p384_int_zero(a: *P384Int)
+    p384_set6(a, 0, 0, 0, 0, 0, 0)
+
+pub fn p384_int_copy(dst: *P384Int, src: *P384Int)
+    var i: i32 = 0
+    while i < 6
+        dst.limbs[i] = src.limbs[i]
+        i += 1
+
+pub fn p384_int_is_zero(a: *P384Int) -> i32
+    var i: i32 = 0
+    while i < 6
+        if a.limbs[i] != 0
+            return 0
+        i += 1
+    return 1
+
+# -1 if a < b, 0 if equal, 1 if a > b
+pub fn p384_int_cmp(a: *P384Int, b: *P384Int) -> i32
+    var i: i32 = 5
+    while i >= 0
+        if a.limbs[i] > b.limbs[i]
+            return 1
+        if a.limbs[i] < b.limbs[i]
+            return -1
+        i -= 1
+    return 0
+
+# c = a + b, returns the carry out
+fn p384_int_add(c: *P384Int, a: *P384Int, b: *P384Int) -> u64
+    var carry: u64 = 0
+    var i: i32 = 0
+    while i < 6
+        let s1: u64 = a.limbs[i] + b.limbs[i]
+        let c1: u64 = (s1 < a.limbs[i]) as u64
+        let s2: u64 = s1 + carry
+        let c2: u64 = (s2 < s1) as u64
+        c.limbs[i] = s2
+        carry = c1 + c2
+        i += 1
+    return carry
+
+# c = a - b, returns the borrow out
+fn p384_int_sub(c: *P384Int, a: *P384Int, b: *P384Int) -> u64
+    var borrow: u64 = 0
+    var i: i32 = 0
+    while i < 6
+        let ai: u64 = a.limbs[i]
+        let bi: u64 = b.limbs[i]
+        let d1: u64 = ai - bi
+        let b1: u64 = (ai < bi) as u64
+        let d2: u64 = d1 - borrow
+        let b2: u64 = (d1 < borrow) as u64
+        c.limbs[i] = d2
+        borrow = b1 + b2
+        i += 1
+    return borrow
+
+fn p384_load_u64_be(data: *u8) -> u64
+    var r: u64 = 0
+    var i: i32 = 0
+    while i < 8
+        r = (r << 8) | (data[i] as u64)
+        i += 1
+    return r
+
+# Load 48 big-endian bytes
+pub fn p384_int_from_bytes(a: *P384Int, data: *u8)
+    var i: i32 = 0
+    while i < 6
+        a.limbs[5 - i] = p384_load_u64_be(@data[i * 8])
+        i += 1
+
+# Store as 48 big-endian bytes
+pub fn p384_int_to_bytes(a: *P384Int, out: *u8)
+    var i: i32 = 0
+    while i < 6
+        let w: u64 = a.limbs[5 - i]
+        var j: i32 = 0
+        while j < 8
+            out[i * 8 + j] = (w >> ((7 - j) * 8) as u64) as u8
+            j += 1
+        i += 1
+
+# ============================================================================
+# Modular arithmetic (mod m, m one of p, n)
+# ============================================================================
+
+# 64x64 -> 128 multiply: returns the low half, *hi gets the high half.
+fn p384_mul64(a: u64, b: u64, hi: *u64) -> u64
+    let a_lo: u64 = a & 0xFFFFFFFF
+    let a_hi: u64 = a >> 32
+    let b_lo: u64 = b & 0xFFFFFFFF
+    let b_hi: u64 = b >> 32
+    let p0: u64 = a_lo * b_lo
+    let p1: u64 = a_lo * b_hi
+    let p2: u64 = a_hi * b_lo
+    let p3: u64 = a_hi * b_hi
+    let mid: u64 = p1 + p2
+    let mid_carry: u64 = ((mid < p1) as u64) << 32
+    let lo: u64 = p0 + (mid << 32)
+    let lo_carry: u64 = (lo < p0) as u64
+    *hi = p3 + (mid >> 32) + mid_carry + lo_carry
+    return lo
+
+# acc + x*y + carry (never overflows 128 bits): returns the low half,
+# *hi gets the high half.
+fn p384_mac(acc: u64, x: u64, y: u64, carry: u64, hi: *u64) -> u64
+    var h: u64 = 0
+    var lo: u64 = p384_mul64(x, y, @h)
+    lo = lo + acc
+    h = h + ((lo < acc) as u64)
+    lo = lo + carry
+    h = h + ((lo < carry) as u64)
+    *hi = h
+    return lo
+
+# Montgomery multiplication: c = a * b * R^-1 mod m, for a, b < m.
+# CIOS (Koc, Acar, Kaliski 1996). c may alias a or b.
+fn p384_mont_mul(c: *P384Int, a: *P384Int, b: *P384Int, m: *P384Int, n0: u64)
+    var t: [8]u64
+    var k: i32 = 0
+    while k < 8
+        t[k] = 0
+        k += 1
+
+    var i: i32 = 0
+    while i < 6
+        # t += a * b[i]
+        var carry: u64 = 0
+        var j: i32 = 0
+        while j < 6
+            var hi: u64 = 0
+            t[j] = p384_mac(t[j], a.limbs[j], b.limbs[i], carry, @hi)
+            carry = hi
+            j += 1
+        let s6: u64 = t[6] + carry
+        t[7] = (s6 < carry) as u64
+        t[6] = s6
+
+        # t = (t + q*m) / 2^64, q chosen so the low limb vanishes
+        let q: u64 = t[0] * n0
+        var hi0: u64 = 0
+        p384_mac(t[0], q, m.limbs[0], 0, @hi0)
+        carry = hi0
+        j = 1
+        while j < 6
+            var hi: u64 = 0
+            t[j - 1] = p384_mac(t[j], q, m.limbs[j], carry, @hi)
+            carry = hi
+            j += 1
+        let s5: u64 = t[6] + carry
+        let c5: u64 = (s5 < carry) as u64
+        t[5] = s5
+        t[6] = t[7] + c5
+        i += 1
+
+    var r: P384Int
+    k = 0
+    while k < 6
+        r.limbs[k] = t[k]
+        k += 1
+    if t[6] != 0 || p384_int_cmp(@r, m) >= 0
+        p384_int_sub(@r, @r, m)
+    p384_int_copy(c, @r)
+
+# c = a + b mod m (a, b < m)
+fn p384_mod_add(c: *P384Int, a: *P384Int, b: *P384Int, m: *P384Int)
+    let carry: u64 = p384_int_add(c, a, b)
+    if carry != 0 || p384_int_cmp(c, m) >= 0
+        p384_int_sub(c, c, m)
+
+# c = a - b mod m (a, b < m)
+fn p384_mod_sub(c: *P384Int, a: *P384Int, b: *P384Int, m: *P384Int)
+    let borrow: u64 = p384_int_sub(c, a, b)
+    if borrow != 0
+        p384_int_add(c, c, m)
+
+# c = a^e mod m, all in Montgomery form (a = xR gives c = x^e R).
+# `one` is R mod m. Left-to-right square and multiply.
+fn p384_mont_pow(c: *P384Int, a: *P384Int, e: *P384Int, m: *P384Int, n0: u64, one: *P384Int)
+    var result: P384Int
+    p384_int_copy(@result, one)
+    var base: P384Int
+    p384_int_copy(@base, a)
+    var i: i32 = 383
+    while i >= 0
+        p384_mont_mul(@result, @result, @result, m, n0)
+        let limb: u64 = e.limbs[i / 64]
+        if ((limb >> (i % 64) as u64) & 1) == 1
+            p384_mont_mul(@result, @result, @base, m, n0)
+        i -= 1
+    p384_int_copy(c, @result)
+
+# ============================================================================
+# Field GF(p), Montgomery form
+# ============================================================================
+
+pub fn fe384_mul(c: *P384Int, a: *P384Int, b: *P384Int)
+    var p: P384Int
+    p384_get_p(@p)
+    p384_mont_mul(c, a, b, @p, P384_P_N0)
+
+pub fn fe384_sqr(c: *P384Int, a: *P384Int)
+    fe384_mul(c, a, a)
+
+pub fn fe384_add(c: *P384Int, a: *P384Int, b: *P384Int)
+    var p: P384Int
+    p384_get_p(@p)
+    p384_mod_add(c, a, b, @p)
+
+pub fn fe384_sub(c: *P384Int, a: *P384Int, b: *P384Int)
+    var p: P384Int
+    p384_get_p(@p)
+    p384_mod_sub(c, a, b, @p)
+
+pub fn fe384_neg(c: *P384Int, a: *P384Int)
+    var z: P384Int
+    p384_int_zero(@z)
+    fe384_sub(c, @z, a)
+
+# Plain integer (< p) into Montgomery form
+pub fn fe384_to_mont(c: *P384Int, a: *P384Int)
+    var r2: P384Int
+    p384_get_r2p(@r2)
+    fe384_mul(c, a, @r2)
+
+# Montgomery form back to a plain integer
+pub fn fe384_from_mont(c: *P384Int, a: *P384Int)
+    var one: P384Int
+    p384_set6(@one, 1, 0, 0, 0, 0, 0)
+    fe384_mul(c, a, @one)
+
+# R mod p: one in Montgomery form
+pub fn fe384_one(c: *P384Int)
+    var one: P384Int
+    p384_set6(@one, 1, 0, 0, 0, 0, 0)
+    fe384_to_mont(c, @one)
+
+# c = a^-1 (Montgomery form) by Fermat: a^(p-2). a must be nonzero.
+pub fn fe384_inv(c: *P384Int, a: *P384Int)
+    var p: P384Int
+    p384_get_p(@p)
+    var e: P384Int
+    p384_set6(@e, 0x00000000FFFFFFFD, 0xFFFFFFFF00000000, 0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+    var one: P384Int
+    fe384_one(@one)
+    p384_mont_pow(c, a, @e, @p, P384_P_N0, @one)
+
+# ============================================================================
+# Scalars mod n
+# ============================================================================
+
+# c = a * b * R^-1 mod n. With a plain and b = yR this is the plain a*y.
+fn sc384_mont_mul(c: *P384Int, a: *P384Int, b: *P384Int)
+    var n: P384Int
+    p384_get_n(@n)
+    p384_mont_mul(c, a, b, @n, P384_N_N0)
+
+# c = a^-1 * R mod n for a plain nonzero a < n (the inverse, Montgomery form)
+fn sc384_inv_mont(c: *P384Int, a: *P384Int)
+    var n: P384Int
+    p384_get_n(@n)
+    var r2: P384Int
+    p384_get_r2n(@r2)
+    var am: P384Int
+    sc384_mont_mul(@am, a, @r2)
+    var one_plain: P384Int
+    p384_set6(@one_plain, 1, 0, 0, 0, 0, 0)
+    var one: P384Int
+    sc384_mont_mul(@one, @one_plain, @r2)
+    var e: P384Int
+    p384_set6(@e, 0xECEC196ACCC52971, 0x581A0DB248B0A77A, 0xC7634D81F4372DDF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+    p384_mont_pow(c, @am, @e, @n, P384_N_N0, @one)
+
+# ============================================================================
+# Points: Jacobian (X, Y, Z), coordinates in Montgomery form.
+# x = X/Z^2, y = Y/Z^3; Z = 0 is the point at infinity.
+# ============================================================================
+
+pub struct P384Point
+    x: P384Int
+    y: P384Int
+    z: P384Int
+
+pub fn p384_point_identity(r: *P384Point)
+    fe384_one(@r.x)
+    fe384_one(@r.y)
+    p384_int_zero(@r.z)
+
+pub fn p384_point_is_identity(p: *P384Point) -> i32
+    return p384_int_is_zero(@p.z)
+
+pub fn p384_point_copy(dst: *P384Point, src: *P384Point)
+    p384_int_copy(@dst.x, @src.x)
+    p384_int_copy(@dst.y, @src.y)
+    p384_int_copy(@dst.z, @src.z)
+
+# Is the plain affine point (x, y), both < p, on y^2 = x^3 - 3x + b?
+pub fn p384_affine_on_curve(x: *P384Int, y: *P384Int) -> i32
+    var xm: P384Int
+    var ym: P384Int
+    fe384_to_mont(@xm, x)
+    fe384_to_mont(@ym, y)
+    var lhs: P384Int
+    fe384_sqr(@lhs, @ym)
+    var rhs: P384Int
+    fe384_sqr(@rhs, @xm)
+    fe384_mul(@rhs, @rhs, @xm)
+    var t: P384Int
+    fe384_add(@t, @xm, @xm)
+    fe384_add(@t, @t, @xm)
+    fe384_sub(@rhs, @rhs, @t)
+    var b: P384Int
+    var bm: P384Int
+    p384_get_b(@b)
+    fe384_to_mont(@bm, @b)
+    fe384_add(@rhs, @rhs, @bm)
+    if p384_int_cmp(@lhs, @rhs) == 0
+        return 1
+    return 0
+
+# Set r from plain affine coordinates. Returns 1 if (x, y) is a point of
+# the curve (coordinates < p, equation holds), 0 otherwise.
+pub fn p384_point_from_affine(r: *P384Point, x: *P384Int, y: *P384Int) -> i32
+    var p: P384Int
+    p384_get_p(@p)
+    if p384_int_cmp(x, @p) >= 0 || p384_int_cmp(y, @p) >= 0
+        return 0
+    if p384_affine_on_curve(x, y) != 1
+        return 0
+    fe384_to_mont(@r.x, x)
+    fe384_to_mont(@r.y, y)
+    fe384_one(@r.z)
+    return 1
+
+# Parse an uncompressed SEC 1 point 0x04 || X(48) || Y(48).
+# Returns 1 if it is a valid curve point, 0 otherwise.
+pub fn p384_point_from_bytes(r: *P384Point, data: *u8, len: i64) -> i32
+    if len != 97 || data[0] != 0x04
+        return 0
+    var x: P384Int
+    var y: P384Int
+    p384_int_from_bytes(@x, @data[1])
+    p384_int_from_bytes(@y, @data[49])
+    return p384_point_from_affine(r, @x, @y)
+
+pub fn p384_point_generator(g: *P384Point)
+    var x: P384Int
+    var y: P384Int
+    p384_get_gx(@x)
+    p384_get_gy(@y)
+    fe384_to_mont(@g.x, @x)
+    fe384_to_mont(@g.y, @y)
+    fe384_one(@g.z)
+
+# Plain affine coordinates. Returns 0 for the point at infinity.
+pub fn p384_point_to_affine(p: *P384Point, x: *P384Int, y: *P384Int) -> i32
+    if p384_point_is_identity(p) == 1
+        return 0
+    var zi: P384Int
+    var zi2: P384Int
+    var zi3: P384Int
+    fe384_inv(@zi, @p.z)
+    fe384_sqr(@zi2, @zi)
+    fe384_mul(@zi3, @zi2, @zi)
+    var t: P384Int
+    fe384_mul(@t, @p.x, @zi2)
+    fe384_from_mont(x, @t)
+    fe384_mul(@t, @p.y, @zi3)
+    fe384_from_mont(y, @t)
+    return 1
+
+# r = 2p (a = -3). r may alias p.
+pub fn p384_point_double(r: *P384Point, p: *P384Point)
+    if p384_point_is_identity(p) == 1
+        p384_point_identity(r)
+        return
+    var s: P384Int
+    var m: P384Int
+    var t1: P384Int
+    var t2: P384Int
+    var y2: P384Int
+    var z2: P384Int
+    var x3: P384Int
+    var y3: P384Int
+    var z3: P384Int
+
+    fe384_sqr(@y2, @p.y)
+    # S = 4 X Y^2
+    fe384_mul(@s, @p.x, @y2)
+    fe384_add(@s, @s, @s)
+    fe384_add(@s, @s, @s)
+    # M = 3 (X - Z^2)(X + Z^2)
+    fe384_sqr(@z2, @p.z)
+    fe384_sub(@t1, @p.x, @z2)
+    fe384_add(@t2, @p.x, @z2)
+    fe384_mul(@m, @t1, @t2)
+    fe384_add(@t1, @m, @m)
+    fe384_add(@m, @t1, @m)
+    # X3 = M^2 - 2S
+    fe384_sqr(@x3, @m)
+    fe384_sub(@x3, @x3, @s)
+    fe384_sub(@x3, @x3, @s)
+    # Y3 = M (S - X3) - 8 Y^4
+    fe384_sub(@t1, @s, @x3)
+    fe384_mul(@t1, @m, @t1)
+    fe384_add(@t2, @y2, @y2)
+    fe384_sqr(@t2, @t2)
+    fe384_add(@t2, @t2, @t2)
+    fe384_sub(@y3, @t1, @t2)
+    # Z3 = 2 Y Z
+    fe384_mul(@z3, @p.y, @p.z)
+    fe384_add(@z3, @z3, @z3)
+
+    p384_int_copy(@r.x, @x3)
+    p384_int_copy(@r.y, @y3)
+    p384_int_copy(@r.z, @z3)
+
+# r = p + q. r may alias p or q.
+pub fn p384_point_add(r: *P384Point, p: *P384Point, q: *P384Point)
+    if p384_point_is_identity(p) == 1
+        p384_point_copy(r, q)
+        return
+    if p384_point_is_identity(q) == 1
+        p384_point_copy(r, p)
+        return
+
+    var z1z1: P384Int
+    var z2z2: P384Int
+    var u1: P384Int
+    var u2: P384Int
+    var s1: P384Int
+    var s2: P384Int
+    var h: P384Int
+    var rr: P384Int
+    var t1: P384Int
+    var t2: P384Int
+    var h2: P384Int
+    var h3: P384Int
+    var x3: P384Int
+    var y3: P384Int
+    var z3: P384Int
+
+    fe384_sqr(@z1z1, @p.z)
+    fe384_sqr(@z2z2, @q.z)
+    fe384_mul(@u1, @p.x, @z2z2)
+    fe384_mul(@u2, @q.x, @z1z1)
+    fe384_mul(@t1, @z2z2, @q.z)
+    fe384_mul(@s1, @p.y, @t1)
+    fe384_mul(@t1, @z1z1, @p.z)
+    fe384_mul(@s2, @q.y, @t1)
+    fe384_sub(@h, @u2, @u1)
+    fe384_sub(@rr, @s2, @s1)
+
+    if p384_int_is_zero(@h) == 1
+        if p384_int_is_zero(@rr) == 1
+            p384_point_double(r, p)
+            return
+        p384_point_identity(r)
+        return
+
+    fe384_sqr(@h2, @h)
+    fe384_mul(@h3, @h2, @h)
+    fe384_mul(@t1, @u1, @h2)
+    # X3 = R^2 - H^3 - 2 U1 H^2
+    fe384_sqr(@x3, @rr)
+    fe384_sub(@x3, @x3, @h3)
+    fe384_sub(@x3, @x3, @t1)
+    fe384_sub(@x3, @x3, @t1)
+    # Y3 = R (U1 H^2 - X3) - S1 H^3
+    fe384_sub(@t2, @t1, @x3)
+    fe384_mul(@t2, @rr, @t2)
+    fe384_mul(@t1, @s1, @h3)
+    fe384_sub(@y3, @t2, @t1)
+    # Z3 = H Z1 Z2
+    fe384_mul(@z3, @h, @p.z)
+    fe384_mul(@z3, @z3, @q.z)
+
+    p384_int_copy(@r.x, @x3)
+    p384_int_copy(@r.y, @y3)
+    p384_int_copy(@r.z, @z3)
+
+fn p384_int_bit(a: *P384Int, i: i32) -> i32
+    return ((a.limbs[i / 64] >> (i % 64) as u64) & 1) as i32
+
+# r = k * p for a plain scalar k (any 384-bit value)
+pub fn p384_scalar_mult(r: *P384Point, k: *P384Int, p: *P384Point)
+    var acc: P384Point
+    p384_point_identity(@acc)
+    var i: i32 = 383
+    while i >= 0
+        p384_point_double(@acc, @acc)
+        if p384_int_bit(k, i) == 1
+            p384_point_add(@acc, @acc, p)
+        i -= 1
+    p384_point_copy(r, @acc)
+
+# r = a * G + b * q (Shamir's trick: one shared doubling chain)
+fn p384_double_scalar_mult(r: *P384Point, a: *P384Int, b: *P384Int, q: *P384Point)
+    var g: P384Point
+    p384_point_generator(@g)
+    var gq: P384Point
+    p384_point_add(@gq, @g, q)
+    var acc: P384Point
+    p384_point_identity(@acc)
+    var i: i32 = 383
+    while i >= 0
+        p384_point_double(@acc, @acc)
+        let sel: i32 = p384_int_bit(a, i) + 2 * p384_int_bit(b, i)
+        if sel == 1
+            p384_point_add(@acc, @acc, @g)
+        if sel == 2
+            p384_point_add(@acc, @acc, q)
+        if sel == 3
+            p384_point_add(@acc, @acc, @gq)
+        i -= 1
+    p384_point_copy(r, @acc)
+
+# ============================================================================
+# ECDSA verification (SEC 1 4.1.4, FIPS 186-4 6.4)
+# ============================================================================
+
+pub struct EcdsaSignature384
+    r: P384Int
+    s: P384Int
+
+# Verify sig over the message digest `hash` (hash_len bytes, any hash; a
+# digest longer than 48 bytes is truncated to its leftmost 384 bits).
+# pub_key must come from p384_point_from_bytes / p384_point_from_affine.
+# Returns 1 if valid, 0 otherwise.
+pub fn ecdsa_p384_verify(hash: *u8, hash_len: i64, sig: *EcdsaSignature384, pub_key: *P384Point) -> i32
+    if hash_len <= 0
+        return 0
+    if p384_point_is_identity(pub_key) == 1
+        return 0
+    var n: P384Int
+    p384_get_n(@n)
+
+    # r, s in [1, n-1]
+    if p384_int_is_zero(@sig.r) == 1 || p384_int_cmp(@sig.r, @n) >= 0
+        return 0
+    if p384_int_is_zero(@sig.s) == 1 || p384_int_cmp(@sig.s, @n) >= 0
+        return 0
+
+    # z = leftmost min(hash_len, 48) bytes as a big-endian integer, mod n
+    var zb: [48]u8
+    mem_zero(@zb[0], 48)
+    var take: i64 = hash_len
+    if take > 48
+        take = 48
+    mem_copy(@zb[48 - take], hash, take)
+    var z: P384Int
+    p384_int_from_bytes(@z, @zb[0])
+    if p384_int_cmp(@z, @n) >= 0
+        p384_int_sub(@z, @z, @n)
+
+    # w = s^-1 (Montgomery form), u1 = z w, u2 = r w (plain)
+    var w: P384Int
+    sc384_inv_mont(@w, @sig.s)
+    var u1: P384Int
+    var u2: P384Int
+    sc384_mont_mul(@u1, @z, @w)
+    sc384_mont_mul(@u2, @sig.r, @w)
+
+    var rp: P384Point
+    p384_double_scalar_mult(@rp, @u1, @u2, pub_key)
+
+    var x: P384Int
+    var y: P384Int
+    if p384_point_to_affine(@rp, @x, @y) == 0
+        return 0
+    # v = x mod n (x < p < 2n)
+    if p384_int_cmp(@x, @n) >= 0
+        p384_int_sub(@x, @x, @n)
+    if p384_int_cmp(@x, @sig.r) == 0
+        return 1
+    return 0
+
+# Read one DER INTEGER at data[*pos] into a P384Int. Refuses negative,
+# non-minimal and wider-than-384-bit encodings. Returns 0 or -1.
+fn der_read_int384(data: *u8, len: i64, pos: *i64, out: *P384Int) -> i32
+    var p: i64 = *pos
+    if p + 2 > len
+        return -1
+    if data[p] != 0x02
+        return -1
+    let n: i64 = data[p + 1] as i64
+    p = p + 2
+    if n < 1 || n > 49 || p + n > len
+        return -1
+    if (data[p] & 0x80) != 0
+        return -1
+    var src: i64 = p
+    var cnt: i64 = n
+    if n > 1 && data[p] == 0
+        if (data[p + 1] & 0x80) == 0
+            return -1
+        src = src + 1
+        cnt = cnt - 1
+    if cnt > 48
+        return -1
+    var buf: [48]u8
+    mem_zero(@buf[0], 48)
+    mem_copy(@buf[48 - cnt], @data[src], cnt)
+    p384_int_from_bytes(out, @buf[0])
+    *pos = p + n
+    return 0
+
+# Parse a DER ECDSA-Sig-Value (SEQUENCE { INTEGER r, INTEGER s }); its
+# content is at most 102 bytes, so the length is always one short-form byte.
+# Returns 0 on success, -1 on any malformation (trailing bytes included).
+pub fn ecdsa_p384_sig_from_der(der: *u8, len: i64, sig: *EcdsaSignature384) -> i32
+    if len < 8 || len > 104
+        return -1
+    if der[0] != 0x30
+        return -1
+    if (der[1] as i64) != len - 2
+        return -1
+    var pos: i64 = 2
+    if der_read_int384(der, len, @pos, @sig.r) != 0
+        return -1
+    if der_read_int384(der, len, @pos, @sig.s) != 0
+        return -1
+    if pos != len
+        return -1
+    return 0

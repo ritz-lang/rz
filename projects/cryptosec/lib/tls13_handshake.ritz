@@ -21,6 +21,8 @@ import x25519
 import asn1
 import x509
 import p256
+import p384
+import sha512
 import ed25519
 import hkdf
 import tls13_kdf
@@ -62,6 +64,7 @@ pub const SIG_RSA_PKCS1_SHA256: u16 = 0x0401
 pub const SIG_RSA_PKCS1_SHA384: u16 = 0x0501
 pub const SIG_RSA_PKCS1_SHA512: u16 = 0x0601
 pub const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403
+pub const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503
 pub const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804
 pub const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805
 pub const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806
@@ -325,8 +328,9 @@ fn write_ext_signature_algorithms(out: *u8, pos: i64) -> i64
     out[pos + 1] = (EXT_SIGNATURE_ALGORITHMS & 0xff) as u8
     pos = pos + 2
 
-    # We support: RSA-PKCS1-SHA256, RSA-PSS-RSAE-SHA256, ECDSA-SHA256, Ed25519
-    let num_sigs: i32 = 4
+    # We support: RSA-PKCS1-SHA256, RSA-PSS-RSAE-SHA256, ECDSA-P256-SHA256,
+    # ECDSA-P384-SHA384, Ed25519
+    let num_sigs: i32 = 5
     let list_len: i32 = num_sigs * 2
 
     # Extension data length
@@ -352,6 +356,11 @@ fn write_ext_signature_algorithms(out: *u8, pos: i64) -> i64
     # ECDSA-SECP256R1-SHA256
     out[pos] = (SIG_ECDSA_SECP256R1_SHA256 >> 8) as u8
     out[pos + 1] = (SIG_ECDSA_SECP256R1_SHA256 & 0xff) as u8
+    pos = pos + 2
+
+    # ECDSA-SECP384R1-SHA384
+    out[pos] = (SIG_ECDSA_SECP384R1_SHA384 >> 8) as u8
+    out[pos + 1] = (SIG_ECDSA_SECP384R1_SHA384 & 0xff) as u8
     pos = pos + 2
 
     # Ed25519
@@ -789,7 +798,8 @@ pub fn certificate_verify_content(transcript_hash: *u8, out: *u8)
 # pubkey: server's public key from certificate
 # Returns 0 if the signature verifies under pubkey, negative otherwise.
 #
-# Fails closed: only ecdsa_secp256r1_sha256 and ed25519 are verified.
+# Fails closed: only ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384 and
+# ed25519 are verified; each ECDSA scheme requires a key on its own curve.
 # rsa_pkcs1_* is forbidden in TLS 1.3 CertificateVerify (RFC 8446 §4.2.3) and
 # rsa_pss_* is not implemented, so both are rejected.
 pub fn certificate_verify_verify(cv: *CertificateVerify, transcript_hash: *u8, pubkey: *X509PublicKey) -> i32
@@ -818,6 +828,21 @@ pub fn certificate_verify_verify(cv: *CertificateVerify, transcript_hash: *u8, p
         var hash: [32]u8
         sha256(@content[0], CV_CONTENT_LEN as i64, @hash[0])
         if ecdsa_p256_verify(@hash[0], @sig, @q) != 1
+            return -4
+        return 0
+
+    if cv.algorithm == SIG_ECDSA_SECP384R1_SHA384
+        if pubkey.algorithm != PUBKEY_TYPE_EC || pubkey.curve != EC_CURVE_P384
+            return -2
+        var q384: P384Point
+        if p384_point_from_bytes(@q384, @pubkey.key_data[0], pubkey.key_len as i64) != 1
+            return -2
+        var sig384: EcdsaSignature384
+        if ecdsa_p384_sig_from_der(@cv.signature[0], cv.signature_len, @sig384) != 0
+            return -3
+        var hash384: [48]u8
+        sha384(@content[0], CV_CONTENT_LEN as i64, @hash384[0])
+        if ecdsa_p384_verify(@hash384[0], 48, @sig384, @q384) != 1
             return -4
         return 0
 

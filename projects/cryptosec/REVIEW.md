@@ -388,7 +388,7 @@ Both branches of the if/else execute identical code (SHA-256 init). SHA-384 is n
 | L-1 | Arena partial-allocation waste on cert parse failure | `ca_store.ritz:138-156` |
 | L-2 | `ca_store_load_pem_file` passes `size=0` to `sys_mmap` for empty files | `ca_store.ritz:237` |
 | L-3 | BigInt intermediates not zeroed in `bigint_mod_exp` | `bigint.ritz` |
-| L-4 | ECDSA/Ed25519 X.509 verification returns 0 (fail-safe but undocumented). **Fixed #2109:** ECDSA-SHA256/384 (P-256 issuers; P-384 is #2115) and Ed25519 verified | `x509_verify.ritz:42-46` |
+| L-4 | ECDSA/Ed25519 X.509 verification returns 0 (fail-safe but undocumented). **Fixed #2109:** ECDSA-SHA256/384 (P-256 issuers; P-384 issuers since #2115) and Ed25519 verified | `x509_verify.ritz:42-46` |
 | L-5 | `GRND_NONBLOCK`/`GRND_RANDOM` constants defined but unused | `random.ritz:25-26` |
 | L-6 | `fe_reduce` in x25519 uses non-constant-time nested branches | `x25519.ritz:248-253` |
 | L-7 | `cpu_has_avx512` doesn't check AVX2 prerequisite | `cpuid.ritz:165` |
