@@ -27,7 +27,8 @@
 #   - at the end of each block, for the bindings it declared (reverse order);
 #   - on `break` / `continue`, for the bindings of the loop body;
 #   - on assignment, for the old value (copied aside first, so the new value
-#     may still read it);
+#     may still read it); and on assignment to a field, for the field's old
+#     value (AGAST #2173, see own_field_drop_cond);
 #   - before every `ret` of the fn, for every binding of the fn (reverse
 #     declaration order): own_end_fn inserts them into the finished body,
 #     because ritz1 emits `ret` from dozens of sites.  A binding whose block
@@ -146,6 +147,7 @@ pub fn own_init(s: *EmitterState)
     o.fm_count = 0
     o.fm_cap = OWN_INIT_CAP
     o.match_scrut = 0 - 1
+    o.fa_cond = 0
     s.own = o
 
 fn own_live_at(o: *OwnState, i: i32) -> *OwnBinding
@@ -1630,9 +1632,87 @@ fn own_assign_target(s: *EmitterState, stmt: *Stmt) -> *OwnBinding
         return own_lookup(s, t.ident_ptr, t.ident_len)
     null
 
+# Field stores (AGAST #2173).  `x.f = v` drops the old x.f, as `x = v`
+# drops the old x (§13.6), after v is evaluated (v may read or move it):
+# iff x owns a value (its drop flag) and f isn't moved out of it (its
+# `fmask` bit).  The move check computes that i1 after checking v (whose
+# moves it sees) and before re-owning f, into OwnState.fa_cond;
+# own_assign_begin copies the old value aside and own_assign_end drops the
+# copy once v is stored.  A deeper path `x.a.t = v` drops the old x.a.t on
+# x's flag and a's bit: the move check rejects it with a moved out (as Rust
+# does, E0382), so the store never re-owns part of a moved field.  A store
+# through a pointer, or into an array element, drops nothing (AGAST #2179).
+
+# The i1 "x owns its field `top`" (x's flag, and top's bit clear), or 0
+# when x can't own the field (an array binding, an unknown field).
+fn own_field_drop_cond(s: *EmitterState, b: *OwnBinding, top: i32) -> i32
+    if b.count > 0 or top < 0
+        return 0
+    let f: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, f)
+    emit_str(s, c" = load i1, ptr ")
+    emit_reg(s, b.flag)
+    emit_str(s, c"\n")
+    if b.fmask == 0 or top >= OWN_MAX_FIELDS
+        return f
+    let m: i32 = own_load_mask(s, b)
+    let t: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, t)
+    emit_str(s, c" = and i32 ")
+    emit_reg(s, m)
+    emit_str(s, c", ")
+    emit_int(s, (1 << top) as i64)
+    emit_str(s, c"\n")
+    let c: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, c)
+    emit_str(s, c" = icmp eq i32 ")
+    emit_reg(s, t)
+    emit_str(s, c", 0\n")
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = and i1 ")
+    emit_reg(s, f)
+    emit_str(s, c", ")
+    emit_reg(s, c)
+    emit_str(s, c"\n")
+    r
+
+# `t = v` with t a member path `x.f...` rooted at a binding: when its field
+# is move-only, the drop condition of its old value into o.fa_cond.
+fn own_field_store_cond(s: *EmitterState, t: *Expr)
+    var b: *OwnBinding = null
+    var top: i32 = 0 - 1
+    var dn: *u8 = null
+    var dl: i32 = 0
+    let f: *StructField = own_member_path(s, t, @b, @top, @dn, @dl)
+    if f == null or own_field_move_only(s, f, 0) == 0
+        return
+    let o: *OwnState = s.own
+    o.fa_cond = own_field_drop_cond(s, b, top)
+
+# `x.f = v` (STMT_LOCAL_FIELD_ASSIGN) with x the binding `b`: as
+# own_field_store_cond.
+fn own_local_field_store_cond(s: *EmitterState, b: *OwnBinding, stmt: *Stmt)
+    if b.count > 0
+        return
+    let idx: i32 = own_field_idx(s, b, stmt.assign_target, stmt.assign_target_len)
+    if idx < 0
+        return
+    let f: *StructField = own_struct_field(s, b.type_name, b.type_name_len, idx)
+    if f == null or own_field_move_only(s, f, 0) == 0
+        return
+    let o: *OwnState = s.own
+    o.fa_cond = own_field_drop_cond(s, b, idx)
+
 # Check one statement before it is emitted (emit_stmt).  Nested statement
 # lists are checked as emit_stmt reaches them.  Mirrors ritz0's _check_stmt.
 pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
+    let o: *OwnState = s.own
+    o.fa_cond = 0
     if own_checking(s) == 0
         return
     let k: i32 = stmt.kind
@@ -1651,6 +1731,8 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
         else if stmt.assign_target_len == 0 and t != null and t.kind != EXPR_IDENT
             own_walk(s, t, 0)
         own_walk(s, stmt.assign_value, 1)
+        if stmt.assign_target_len == 0 and t != null
+            own_field_store_cond(s, t)
         if fb != null and fb.moved == 0
             own_field_assigned(s, fb, own_field_idx(s, fb, t.ident_ptr, t.ident_len))
     else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
@@ -1665,6 +1747,8 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
         if k != STMT_LOCAL_FIELD_ASSIGN
             own_walk(s, stmt.while_cond, 0)
         own_walk(s, stmt.assign_value, 1)
+        if k == STMT_LOCAL_FIELD_ASSIGN and base != null
+            own_local_field_store_cond(s, base, stmt)
         # `x.f = v` (AGAST #2168): x.f is owned again, once v is checked.
         if k == STMT_LOCAL_FIELD_ASSIGN and base != null and base.moved == 0
             own_field_assigned(s, base, own_field_idx(s, base, stmt.assign_target, stmt.assign_target_len))
@@ -1734,6 +1818,10 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     *out_old = 0
     *out_flag = 0
     let o: *OwnState = s.own
+    if o.fa_cond != 0
+        let cond: i32 = o.fa_cond
+        o.fa_cond = 0
+        return own_field_store_begin(s, stmt, cond, out_old, out_flag)
     if o.live_count == 0
         return null
     let b: *OwnBinding = own_assign_target(s, stmt)
@@ -1772,13 +1860,115 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     let h: *OwnBinding = malloc(sizeof(OwnBinding)) as *OwnBinding
     own_copy_binding(h, b)
     h.aux = m
+    h.old_field = null
     h
+
+# The field `fname` of the struct `tname` at `base`: a pointer to it (and
+# the field in *out_f), or 0.
+fn own_field_ptr(s: *EmitterState, base: i32, tname: *u8, tlen: i32, fname: *u8, flen: i32, out_f: **StructField) -> i32
+    let st: *StructDef = find_struct(s, tname, tlen)
+    if st == null
+        return 0
+    let idx: i32 = find_field_index(st, fname, flen)
+    if idx < 0
+        return 0
+    let f: *StructField = get_field_type(st, idx)
+    var r: MemberPtrResult
+    emit_member_gep_from_ptr(s, @r, base, st, idx, f)
+    *out_f = f
+    r.reg
+
+# A member path `x.f...` rooted at a single-value binding x (*out_b): a
+# pointer to its field (*out_f), or 0.
+fn own_place_ptr(s: *EmitterState, e: *Expr, out_f: **StructField, out_b: **OwnBinding) -> i32
+    if e == null or e.kind != EXPR_MEMBER or e.left == null
+        return 0
+    let l: *Expr = e.left
+    if l.kind == EXPR_IDENT
+        let b: *OwnBinding = own_lookup(s, l.ident_ptr, l.ident_len)
+        if b == null or b.count > 0
+            return 0
+        *out_b = b
+        return own_field_ptr(s, b.slot, b.type_name, b.type_name_len, e.ident_ptr, e.ident_len, out_f)
+    var pf: *StructField = null
+    let base: i32 = own_place_ptr(s, l, @pf, out_b)
+    if base == 0 or pf.field_type != TYPE_STRUCT
+        return 0
+    own_field_ptr(s, base, pf.field_type_name, pf.field_type_name_len, e.ident_ptr, e.ident_len, out_f)
+
+# AGAST #2173: before the field store `x.f... = v` (own_check_stmt found
+# x owns its old value on the i1 `cond`): copy the old value aside.  The
+# handle (x's binding, with old_field set) is for own_assign_end.
+fn own_field_store_begin(s: *EmitterState, stmt: *Stmt, cond: i32, out_old: *i32, out_flag: *i32) -> *OwnBinding
+    var f: *StructField = null
+    var b: *OwnBinding = null
+    var ptr: i32 = 0
+    if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
+        b = own_lookup(s, stmt.var_name, stmt.var_name_len)
+        if b == null or b.count > 0
+            return null
+        ptr = own_field_ptr(s, b.slot, b.type_name, b.type_name_len, stmt.assign_target, stmt.assign_target_len, @f)
+    else if stmt.kind == STMT_ASSIGN
+        ptr = own_place_ptr(s, stmt.if_cond as *Expr, @f, @b)
+    if ptr == 0 or f == null or b == null
+        return null
+    let tmp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tmp)
+    emit_str(s, c" = alloca ")
+    emit_field_llvm_type(s, f)
+    emit_str(s, c"\n")
+    let v: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, v)
+    emit_str(s, c" = load ")
+    emit_field_llvm_type(s, f)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c"\n  store ")
+    emit_field_llvm_type(s, f)
+    emit_str(s, c" ")
+    emit_reg(s, v)
+    emit_str(s, c", ptr ")
+    emit_reg(s, tmp)
+    emit_str(s, c"\n")
+    *out_old = tmp
+    *out_flag = cond
+    let h: *OwnBinding = malloc(sizeof(OwnBinding)) as *OwnBinding
+    own_copy_binding(h, b)
+    h.old_field = f
+    h
+
+# After the field store: drop the old value copied aside, if x owned it.
+fn own_field_store_end(s: *EmitterState, h: *OwnBinding, old: i32, cond: i32)
+    let saved: i32 = last_expr_here(s)
+    let do_label: i32 = next_label(s)
+    let next: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond)
+    emit_str(s, c", label %")
+    emit_label(s, do_label)
+    emit_str(s, c", label %")
+    emit_label(s, next)
+    emit_str(s, c"\n")
+    begin_block(s, do_label)
+    own_emit_field_glue(s, old, h.old_field, 1)
+    emit_str(s, c"  br label %")
+    emit_label(s, next)
+    emit_str(s, c"\n")
+    begin_block(s, next)
+    if saved != 0
+        set_last_expr(s, saved)
+    free(h as *u8)
 
 # After `x = v` is emitted: x owns v; drop the old value if x owned one.
 # `h` is own_assign_begin's handle; x is looked up again by its storage, as
 # emitting v may have moved the live list.
 pub fn own_assign_end(s: *EmitterState, h: *OwnBinding, old: i32, old_flag: i32)
     if h == null
+        return
+    if h.old_field != null
+        own_field_store_end(s, h, old, old_flag)
         return
     let o: *OwnState = s.own
     var b: *OwnBinding = h

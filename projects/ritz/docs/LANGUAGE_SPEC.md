@@ -1975,6 +1975,14 @@ Returning a binding moves it to the caller. A binding moved on some paths only
 is dropped only on the paths where it still owns its value. Assigning to a
 moved-from binding drops nothing and makes the binding an owner again.
 
+Assigning to a move-only field of a binding (`h.t = v`, or deeper,
+`h.a.t = v`) drops the field's old value the same way: after `v` has been
+evaluated, so `v` may read or move the old value, and before `v` is stored.
+Nothing is dropped if the binding doesn't own a value, or if `h.t` has been
+moved out. Assigning a moved-out field drops nothing and makes the binding
+own the field again. A field of a moved-out field can't be assigned:
+`h.a.t = v` with `h.a` moved out is a use of the moved `h.a`, as in Rust.
+
 A move-only type with no `Drop` impl of its own, such as a struct with a
 `Drop` field, is dropped by dropping its move-only parts:
 

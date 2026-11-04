@@ -19,6 +19,8 @@ elements (a strict xfail citing #1526, ritz1's missing tuple literals).
 AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
 #2171. AGAST #2174 added a match owning its scrutinee, with payload
 bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
+AGAST #2173 added assigning a move-only field (the old value drops),
+closed for both.
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -523,6 +525,158 @@ pub fn main() -> i32
     return DROPS
 """, 2, {}),
 
+    # AGAST #2173 from here on.  Assigning a move-only field drops its old
+    # value (§13.6), as assigning a binding does: f's count after `h.t = ..`
+    # is 1 (old t), h's scope end then drops the new one.
+    "field_assign_drops_old": ("""\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    h.t = make(2)
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 12, {}),
+
+    # The new value is evaluated before the old one drops: make() sees
+    # DROPS == 0, so the new id is 5 (6 if the old dropped first).
+    "field_assign_value_first": ("""\
+fn f()
+    var h = Holder { t: make(1), n: 0 }
+    h.t = make(DROPS + 5)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 15, {}),
+
+    # The new value may read the old one; it is dropped after.
+    "field_assign_reads_old": ("""\
+fn f()
+    var h = Holder { t: make(1), n: 0 }
+    h.t = make(h.t.id + 1)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {}),
+
+    # The new value moves the old one: bump() drops it, the store doesn't.
+    "field_assign_moves_old": ("""\
+fn bump(t: Tracked) -> Tracked
+    return make(t.id + 1)
+
+fn f()
+    var h = Holder { t: make(1), n: 0 }
+    h.t = bump(h.t)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {}),
+
+    # Moved out on one path only: the old value drops on the other, so
+    # each call drops two Tracked (consume's or the store's, then h's).
+    "field_assign_after_conditional_move": ("""\
+fn f(x: i32)
+    var h = Holder { t: make(1), n: 0 }
+    if x > 0
+        consume(h.t)
+    h.t = make(2)
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 4, {}),
+
+    # Each iteration's store drops the previous value; the end the last.
+    "field_assign_in_loop": ("""\
+fn f()
+    var h = Holder { t: make(0), n: 0 }
+    var i = 1
+    while i < 4
+        h.t = make(i)
+        i = i + 1
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 123, {}),
+
+    # A copy field's store drops nothing.
+    "field_assign_copy_field": ("""\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    h.n = 5
+    return DROPS * 10 + h.n
+
+pub fn main() -> i32
+    let inner = f()
+    return inner * 10 + DROPS
+""", 51, {}),
+
+    # A field of a field: `o.a.t = v` drops the old o.a.t (o owns it).
+    "field_of_field_assign": ("""\
+struct Outer
+    a: Holder
+    m: i32
+
+fn f()
+    var o = Outer { a: Holder { t: make(1), n: 0 }, m: 0 }
+    o.a.t = make(2)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {}),
+
+    # Assigning a whole move-only field drops all of its old value.
+    "field_assign_struct_field": ("""\
+struct Outer
+    a: Holder
+    m: i32
+
+fn f()
+    var o = Outer { a: Holder { t: make(1), n: 0 }, m: 0 }
+    o.a = Holder { t: make(2), n: 0 }
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {}),
+
+    # A field of a type with its own drop: the old field drops at the
+    # store; at the end Wrap's drop (9), then its field.
+    "field_assign_in_drop_type": ("""\
+struct Wrap
+    t: Tracked
+
+impl Drop for Wrap
+    fn drop(self: @&Wrap)
+        ORDER = ORDER * 10 + 9
+
+fn f()
+    var w = Wrap { t: make(1) }
+    w.t = make(2)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 192, {}),
+
+    # A by-value parameter owns its fields: the store drops the caller's.
+    "field_assign_param": ("""\
+fn f(h: Holder) -> i32
+    h.t = make(2)
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f(Holder { t: make(1), n: 0 })
+    return inner + DROPS
+""", 12, {}),
+
     # AGAST #2177 from here on (ritz1's cases from #2174, now shared).
     # A match moves its scrutinee (ritz0's rule), and the match
     # owns it.  A payload binding takes the payload and drops at the end of
@@ -793,6 +947,23 @@ pub fn main() -> i32
     var u = h.t
     return h.t.id
 """, "h.t", {}),
+
+    # AGAST #2173: `o.a.t = v` with o.a moved out is rejected (Rust's
+    # E0382), so a field-of-field store never re-owns part of a moved field.
+    "assign_into_moved_field": ("""\
+struct Outer
+    a: Holder
+    m: i32
+
+fn eat(h: Holder) -> i32
+    return h.n
+
+pub fn main() -> i32
+    var o = Outer { a: Holder { t: make(1), n: 0 }, m: 0 }
+    eat(o.a)
+    o.a.t = make(2)
+    return 0
+""", "o.a", {}),
 
     # AGAST #2177: a payload binding owns the payload, so it moves once.
     "payload_after_move": (SLOT + """\

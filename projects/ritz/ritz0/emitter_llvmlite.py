@@ -3895,6 +3895,39 @@ class LLVMEmitter:
         if flag is not None:
             self.builder.store(ir.Constant(self.i1, value), flag)
 
+    def _drop_old_field(self, target: rast.Field, field_ptr: ir.Value,
+                        field_type: rast.Type) -> None:
+        """`x.f... = v`, once v is evaluated and before it is stored: drop
+        the field's old value (§13.6, AGAST #2173). Only a field of a binding
+        that owns its value (its drop flag is set), and, for a field of x
+        itself, only if it hasn't been moved out (its field flag, AGAST
+        #2171). A deeper path `x.a.t` needs `a` not moved out: the move
+        checker rejects the assignment otherwise, so x's flag decides. A
+        store through a pointer drops nothing (AGAST #2179)."""
+        if (self.builder.block.is_terminated
+                or not self.move_types.is_move_only(field_type)):
+            return
+        root = target
+        while isinstance(root, rast.Field):
+            top, root = root, root.expr
+        if not isinstance(root, rast.Ident):
+            return
+        slot = self._drop_slot_of(root.name)
+        flag = self.drop_flags.get(id(slot)) if slot is not None else None
+        if flag is None:
+            return
+        cond = self.builder.load(flag)
+        fflag = self.field_drop_flags.get(id(slot), {}).get(top.field)
+        if fflag is not None:
+            cond = self.builder.and_(cond, self.builder.load(fflag))
+        drop_block = self.current_fn.append_basic_block("drop.old_field")
+        cont_block = self.current_fn.append_basic_block("drop.old_field.cont")
+        self.builder.cbranch(cond, drop_block, cont_block)
+        self.builder.position_at_end(drop_block)
+        self._emit_drop_glue(field_ptr, field_type)
+        self.builder.branch(cont_block)
+        self.builder.position_at_end(cont_block)
+
     def _note_move(self, expr: rast.Ident) -> None:
         """The move checker marked this use as a move: the binding no longer
         owns its value, so it must not be dropped (§13.6). Clearing its flag
@@ -5773,6 +5806,7 @@ class LLVMEmitter:
                             field_llvm_type = self._ritz_type_to_llvm(field_type)
                             field_ptr = self.builder.gep(struct_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
                             val = self._convert_type(val, field_llvm_type)
+                            self._drop_old_field(stmt.target, field_ptr, field_type)
                             self.builder.store(val, field_ptr)
                         else:
                             raise ValueError(f"Cannot determine struct type for field assignment")
@@ -5787,6 +5821,7 @@ class LLVMEmitter:
                             field_llvm_type = self._ritz_type_to_llvm(field_type)
                             field_ptr = self.builder.gep(inner_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
                             val = self._convert_type(val, field_llvm_type)
+                            self._drop_old_field(stmt.target, field_ptr, field_type)
                             self.builder.store(val, field_ptr)
                         else:
                             raise ValueError(f"Cannot determine struct type for field assignment")
@@ -5802,6 +5837,7 @@ class LLVMEmitter:
                         field_llvm_type = self._ritz_type_to_llvm(field_type)
                         field_ptr = self.builder.gep(struct_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
                         val = self._convert_type(val, field_llvm_type)
+                        self._drop_old_field(stmt.target, field_ptr, field_type)
                         self.builder.store(val, field_ptr)
                     else:
                         raise ValueError(f"Cannot determine struct type for field assignment")
