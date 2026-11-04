@@ -1,0 +1,367 @@
+# spire/test/test_test_utils.ritz
+#
+# AGAST #2126: the response assertions in test/support/test_utils.ritz are
+# [[test_helper]] fns built on `assert` (LANGUAGE_SPEC §17.1, §19.2).
+#
+# Every helper gets two checks:
+#   - pass: called on a response that satisfies it, the test carries on;
+#   - fail: called in a forked child on a response that does not, the child
+#     exits 1 and its stderr names THIS file (the calling test, not
+#     test_utils.ritz), the helper that asserted, and the values involved.
+#
+# A helper that silently returns instead of asserting leaves the child to
+# reach sys_exit(0), so every fail check below goes red.
+
+import ritzlib.sys
+import ritzlib.strview { StrView, strview_contains }
+import ritzlib.span { Span, span_from_strview }
+
+import spire.http.mod { Response, response_ok, response_created, response_no_content }
+import spire.http.mod { response_bad_request, response_unauthorized, response_forbidden }
+import spire.http.mod { response_not_found, response_internal_error }
+import spire.http.mod { response_html, response_json_str, response_text }
+
+import test.support.test_utils { assert_status, assert_status_ok, assert_status_created }
+import test.support.test_utils { assert_status_no_content, assert_status_bad_request }
+import test.support.test_utils { assert_status_unauthorized, assert_status_forbidden }
+import test.support.test_utils { assert_status_not_found, assert_status_internal_error }
+import test.support.test_utils { assert_content_type_json, assert_content_type_html }
+import test.support.test_utils { assert_body_not_empty, assert_has_header, assert_header_value }
+import test.support.test_utils { assert_body_contains, assert_body_equals }
+import test.support.test_utils { assert_json_has_key, assert_json_value }
+
+# ============================================================================
+# Capture: fork, child's stderr on a pipe.
+# ============================================================================
+
+var g_err: [2048]u8
+var g_err_len: i64 = 0
+var g_pipe: [2]i32
+
+fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < cap
+        n = sys_read(fd, buf + got, cap - got)
+        if n > 0
+            got = got + n
+    got
+
+# Fork with the child's stderr on a pipe.  Returns the pid; 0 in the child.
+fn capture_begin() -> i32
+    sys_pipe(@g_pipe[0])
+    let pid: i32 = sys_fork()
+    if pid == 0
+        sys_dup2(g_pipe[1], 2)
+        sys_close(g_pipe[0])
+        sys_close(g_pipe[1])
+    pid
+
+# In the parent: the child's stderr into g_err, and its exit status.
+fn capture_end(pid: i32) -> i32
+    sys_close(g_pipe[1])
+    g_err_len = read_all(g_pipe[0], @g_err[0], 2048)
+    sys_close(g_pipe[0])
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    (status >> 8) & 255
+
+# True when the captured stderr contains `want`.
+fn stderr_has(want: StrView) -> bool
+    let err: StrView = StrView { ptr: @g_err[0], len: g_err_len }
+    strview_contains(@err, @want)
+
+# The `<file>:<line>` that starts the "assertion failed" line, or an empty
+# view if there is none.  (The harness compiles this file under another
+# name, so the test's file name is not something to match on.)
+fn failure_location() -> StrView
+    let marker: StrView = ": assertion failed"
+    var i: i64 = 0
+    while i + marker.len <= g_err_len
+        var j: i64 = 0
+        while j < marker.len and g_err[i + j] == *(marker.ptr + j)
+            j += 1
+        if j == marker.len
+            var start: i64 = i
+            while start > 0 and g_err[start - 1] != 10
+                start -= 1
+            return StrView { ptr: @g_err[start], len: i - start }
+        i += 1
+    StrView { ptr: @g_err[0], len: 0 }
+
+# The diagnostic shape every failing helper must produce: located at the
+# calling test (not in test_utils.ritz), naming the helper that asserted.
+[[test_helper]]
+fn expect_helper_failure(helper_line: StrView)
+    let loc: StrView = failure_location()
+    assert loc.len > 0, "assert diagnostic printed"
+    let helper_file: StrView = "test_utils.ritz:"
+    if strview_contains(@loc, @helper_file)
+        eprint("  location: {loc}\n")
+    assert not strview_contains(@loc, @helper_file), "failure is located at the calling test"
+    assert stderr_has(helper_line), "failure names the helper that asserted"
+
+fn body_response(text: StrView) -> Response
+    let body: Span<u8> = span_from_strview(@text)
+    response_text(@body)
+
+fn json_response(text: StrView) -> Response
+    let body: Span<u8> = span_from_strview(@text)
+    response_json_str(@body)
+
+fn html_response(text: StrView) -> Response
+    let body: Span<u8> = span_from_strview(@text)
+    response_html(@body)
+
+# ============================================================================
+# Status
+# ============================================================================
+
+[[test]]
+fn test_assert_status_passes_on_match() -> i32
+    let resp: Response = response_not_found()
+    assert_status(@resp, 404)
+    0
+
+[[test]]
+fn test_assert_status_fails_showing_both_codes() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = response_not_found()
+        assert_status(@resp, 200)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_status at test_utils.ritz:")
+    assert stderr_has("left:  404\n  right: 200\n")
+    0
+
+[[test]]
+fn test_named_status_helpers_pass_on_their_status() -> i32
+    let ok: Response = response_ok()
+    assert_status_ok(@ok)
+    let created: Response = response_created()
+    assert_status_created(@created)
+    let no_content: Response = response_no_content()
+    assert_status_no_content(@no_content)
+    let bad: Response = response_bad_request()
+    assert_status_bad_request(@bad)
+    let unauth: Response = response_unauthorized()
+    assert_status_unauthorized(@unauth)
+    let forbidden: Response = response_forbidden()
+    assert_status_forbidden(@forbidden)
+    let missing: Response = response_not_found()
+    assert_status_not_found(@missing)
+    let ise: Response = response_internal_error()
+    assert_status_internal_error(@ise)
+    0
+
+[[test]]
+fn test_assert_status_ok_fails_on_404() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = response_not_found()
+        assert_status_ok(@resp)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_status at test_utils.ritz:")
+    assert stderr_has("left:  404\n  right: 200\n")
+    0
+
+[[test]]
+fn test_assert_status_not_found_fails_on_200() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = response_ok()
+        assert_status_not_found(@resp)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_status at test_utils.ritz:")
+    assert stderr_has("left:  200\n  right: 404\n")
+    0
+
+# ============================================================================
+# Content-Type
+# ============================================================================
+
+[[test]]
+fn test_content_type_helpers_pass_on_match() -> i32
+    let json: Response = json_response("{}")
+    assert_content_type_json(@json)
+    let html: Response = html_response("<p>")
+    assert_content_type_html(@html)
+    0
+
+[[test]]
+fn test_content_type_json_fails_on_html_showing_both() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = html_response("<p>")
+        assert_content_type_json(@resp)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_content_type_contains at test_utils.ritz:")
+    assert stderr_has("Content-Type: text/html; charset=utf-8\n")
+    assert stderr_has("expected to contain: application/json\n")
+    0
+
+[[test]]
+fn test_content_type_html_fails_without_header() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = response_ok()
+        assert_content_type_html(@resp)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_content_type_contains at test_utils.ritz:")
+    assert stderr_has("assertion failed: response has a Content-Type header")
+    0
+
+# ============================================================================
+# Headers
+# ============================================================================
+
+[[test]]
+fn test_header_helpers_pass_on_match() -> i32
+    let resp: Response = json_response("{}")
+    let name: StrView = "content-type"
+    assert_has_header(@resp, @name)
+    let want: StrView = "application/json"
+    assert_header_value(@resp, @name, @want)
+    0
+
+[[test]]
+fn test_assert_has_header_fails_naming_header() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = response_ok()
+        let name: StrView = "X-Request-Id"
+        assert_has_header(@resp, @name)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_has_header at test_utils.ritz:")
+    assert stderr_has("header: X-Request-Id\n")
+    0
+
+[[test]]
+fn test_assert_header_value_fails_showing_both() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = json_response("{}")
+        let name: StrView = "Content-Type"
+        let want: StrView = "text/plain"
+        assert_header_value(@resp, @name, @want)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_header_value at test_utils.ritz:")
+    assert stderr_has("actual:   application/json\n")
+    assert stderr_has("expected: text/plain\n")
+    0
+
+[[test]]
+fn test_assert_header_value_fails_without_header() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = response_ok()
+        let name: StrView = "Location"
+        let want: StrView = "/"
+        assert_header_value(@resp, @name, @want)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    # The presence check is delegated to assert_has_header.
+    expect_helper_failure("in helper assert_has_header at test_utils.ritz:")
+    assert stderr_has("header: Location\n")
+    0
+
+# ============================================================================
+# Body
+# ============================================================================
+
+[[test]]
+fn test_body_helpers_pass_on_match() -> i32
+    let resp: Response = body_response("hello world")
+    assert_body_not_empty(@resp)
+    let needle: StrView = "lo wo"
+    assert_body_contains(@resp, @needle)
+    let whole: StrView = "hello world"
+    assert_body_equals(@resp, @whole)
+    0
+
+[[test]]
+fn test_assert_body_not_empty_fails_on_empty_body() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = response_no_content()
+        assert_body_not_empty(@resp)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_body_not_empty at test_utils.ritz:")
+    assert stderr_has("left:  0\n  right: 0\n")
+    0
+
+[[test]]
+fn test_assert_body_contains_fails_showing_body_and_needle() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = body_response("hello world")
+        let needle: StrView = "goodbye"
+        assert_body_contains(@resp, @needle)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_body_contains at test_utils.ritz:")
+    assert stderr_has("body:   hello world\n")
+    assert stderr_has("needle: goodbye\n")
+    0
+
+[[test]]
+fn test_assert_body_equals_fails_showing_both() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = body_response("hello world")
+        let want: StrView = "hello"
+        assert_body_equals(@resp, @want)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_body_equals at test_utils.ritz:")
+    assert stderr_has("actual:   hello world\n")
+    assert stderr_has("expected: hello\n")
+    0
+
+# ============================================================================
+# JSON (substring checks)
+# ============================================================================
+
+[[test]]
+fn test_json_helpers_pass_on_match() -> i32
+    let resp: Response = json_response("{\"id\": \"abc\"}")
+    let key: StrView = "\"id\""
+    assert_json_has_key(@resp, @key)
+    let value: StrView = "\"abc\""
+    assert_json_value(@resp, @key, @value)
+    0
+
+[[test]]
+fn test_assert_json_has_key_fails_on_missing_key() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = json_response("{\"id\": \"abc\"}")
+        let key: StrView = "\"name\""
+        assert_json_has_key(@resp, @key)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_body_contains at test_utils.ritz:")
+    assert stderr_has("needle: \"name\"\n")
+    0
+
+[[test]]
+fn test_assert_json_value_fails_on_missing_value() -> i32
+    let pid: i32 = capture_begin()
+    if pid == 0
+        let resp: Response = json_response("{\"id\": \"abc\"}")
+        let key: StrView = "\"id\""
+        let value: StrView = "\"xyz\""
+        assert_json_value(@resp, @key, @value)
+        sys_exit(0)
+    assert capture_end(pid) == 1
+    expect_helper_failure("in helper assert_body_contains at test_utils.ritz:")
+    assert stderr_has("needle: \"xyz\"\n")
+    0
