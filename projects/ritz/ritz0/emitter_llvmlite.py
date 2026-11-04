@@ -1869,11 +1869,69 @@ class LLVMEmitter:
         if isinstance(elem_type, ir.IntType):
             # Wrap to the element width, as the runtime arithmetic would,
             # and keep the signed form llvmlite prints.
-            bits = elem_type.width
-            value &= (1 << bits) - 1
-            if bits > 1 and value >= 1 << (bits - 1):
-                value -= 1 << bits
+            value = self._wrap_to_int_type(value, elem_type)
         return value
+
+    @staticmethod
+    def _wrap_to_int_type(value: int, ty: ir.IntType) -> int:
+        """Wrap `value` to `ty`'s width, in the signed form llvmlite prints."""
+        bits = ty.width
+        value &= (1 << bits) - 1
+        if bits > 1 and value >= 1 << (bits - 1):
+            value -= 1 << bits
+        return value
+
+    def _fold_scalar_consts(self, pending) -> None:
+        """Fold every non-literal scalar const into `self.constants`.
+
+        AGAST #2150. `pending` is the `(ConstDef, llvm_type)` list of scalar
+        consts whose initializer is an expression (`2 + 3`, `!0xF0`, `K * 2`,
+        `-1 as i64`), folded with the same ConstEvaluator as const array
+        elements, so the result matches ritz1's const_fold_int (#1502).
+
+        A const may name one declared later, or one that itself names a later
+        one, so this folds to a fixpoint: each round folds whatever has all
+        its operands known. What is left when a round makes no progress
+        (unknown name, a cycle, a call, division by zero, a non-numeric type)
+        is a located error for the first such const in source order.
+        """
+        while pending:
+            known = {
+                cname: cval for cname, (cval, cty) in self.constants.items()
+                if isinstance(cval, int) and isinstance(cty, ir.IntType)
+            }
+            stuck = []
+            for item, ty in pending:
+                try:
+                    value = ConstEvaluator(known).evaluate(item.value)
+                except ConstEvalError:
+                    stuck.append((item, ty))
+                    continue
+                if isinstance(ty, ir.IntType):
+                    value = self._wrap_to_int_type(value, ty)
+                    known[item.name] = value
+                elif not isinstance(ty, (ir.FloatType, ir.DoubleType)):
+                    stuck.append((item, ty))
+                    continue
+                # A float const keeps the integer, as `const F: f64 = 2`
+                # does; it is not an operand for other integer consts.
+                self.constants[item.name] = (value, ty)
+            if len(stuck) == len(pending):
+                item, ty = stuck[0]
+                if not isinstance(ty, (ir.IntType, ir.FloatType, ir.DoubleType)):
+                    reason = "only numeric consts may have a computed value"
+                else:
+                    try:
+                        ConstEvaluator(known).evaluate(item.value)
+                        reason = "circular definition"
+                    except ConstEvalError as e:
+                        reason = str(e)
+                raise EmitError(
+                    f"const '{item.name}': value is not a constant expression "
+                    f"({reason})",
+                    getattr(item, "span", None) or getattr(item.value, "span", None),
+                )
+            pending = stuck
 
     def _emit_const_strview(self, name: str, value: str) -> None:
         """Emit a module-level constant StrView as a global.
@@ -2239,6 +2297,7 @@ class LLVMEmitter:
 
         # Third pass: collect constants, module-level vars, and extern declarations
         const_arrays = []
+        const_exprs = []
         for item in module.items:
             if isinstance(item, rast.ConstDef):
                 ty = self._ritz_type_to_llvm(item.type)
@@ -2246,14 +2305,9 @@ class LLVMEmitter:
                     self.constants[item.name] = (item.value.value, ty)
                 elif isinstance(item.value, rast.FloatLit):
                     self.constants[item.name] = (item.value.value, ty)
-                elif isinstance(item.value, rast.UnaryOp) and item.value.op == '-':
-                    # Handle negative literals like -1 or -3.14
-                    if isinstance(item.value.operand, rast.IntLit):
-                        self.constants[item.name] = (-item.value.operand.value, ty)
-                    elif isinstance(item.value.operand, rast.FloatLit):
-                        self.constants[item.name] = (-item.value.operand.value, ty)
-                    else:
-                        raise ValueError(f"Const value must be numeric literal: {item.value}")
+                elif (isinstance(item.value, rast.UnaryOp) and item.value.op == '-'
+                        and isinstance(item.value.operand, rast.FloatLit)):
+                    self.constants[item.name] = (-item.value.operand.value, ty)
                 elif isinstance(item.value, (rast.ArrayLit, rast.ArrayFill)):
                     # Array constants - emitted once every scalar const is
                     # known, so an element may name a const declared later.
@@ -2262,11 +2316,14 @@ class LLVMEmitter:
                     # String constant - emit as global StrView
                     self._emit_const_strview(item.name, item.value.value)
                 else:
-                    raise ValueError(f"Const value must be numeric literal or array literal: {item.value}")
+                    # `-1`, `2 + 3`, `K * 2`, `-1 as i64`, ...: folded once
+                    # every literal const is known (AGAST #2150).
+                    const_exprs.append((item, ty))
             elif isinstance(item, rast.VarDef):
                 self._emit_global_var(item)
             elif isinstance(item, rast.ExternFn):
                 self._declare_extern(item)
+        self._fold_scalar_consts(const_exprs)
         for item in const_arrays:
             self._emit_const_array(item.name, item.type, item.value)
 

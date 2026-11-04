@@ -102,9 +102,9 @@ pub fn main() -> i32
 }
 
 # --- other constant expressions ritz1 zeroed before the fix -----------------
-# ritz0 accepts only a (possibly negative) numeric literal as a const
-# initializer (AGAST #1549), so there is no oracle here: each program checks
-# its own value and returns 3 when it matches.
+# Each program checks its own value and returns 3 when it matches. ritz0
+# folds these too since AGAST #2150; test_const_compound_value.py holds the
+# cross-compiler agreement tests.
 
 FOLDED_FORMS = {
     "bit_not": """\
@@ -201,7 +201,8 @@ pub fn main() -> i32
 
 ALL_RUNNABLE = {**NEGATIVE_FORMS, **WORKING_FORMS}
 
-# ritz1 already accepted these literals; ritz0 rejects them (AGAST #1549).
+# ritz1 already accepted these literals; ritz0 does too since #2150
+# (test_const_compound_value.py).
 RITZ1_ONLY_WORKING_FORMS = {
     "bool_true": """\
 const B: bool = true
@@ -391,7 +392,7 @@ def test_imported_negative_const(request, tmp_path, compiler):
 
 @pytest.mark.integration
 def test_ritz1_const_built_from_imported_const(ritz1_bin, tmp_path):
-    """ritz1-only: ritz0 rejects a non-literal initializer (AGAST #1549)."""
+    """ritz0 agrees since #2150 (test_const_compound_value.py)."""
     got = _run_with_import("ritz1", tmp_path, IMPORT_CHAIN_HELPER, IMPORT_CHAIN_MAIN)
     assert got == 3
 

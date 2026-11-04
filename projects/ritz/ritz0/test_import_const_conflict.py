@@ -11,9 +11,9 @@ main module `t` importing both.
 * `test_identical_negative_const_runs`: the reported case, end-to-end on all
   three compilers (ritz1 never had the bug; it pins the behaviour).
 * `test_identical_compound_const_resolves`: identical UnaryOp / BinOp /
-  Ident / Cast values pass ritz0's import resolver. This is
-  resolver-level because ritz0's emitter only lowers literal and `-literal`
-  const values, so `2 + 3` cannot be run end-to-end through ritz0 anyway.
+  Ident / Cast values pass ritz0's import resolver.
+* `test_identical_compound_const_runs`: the same values end-to-end on all
+  three compilers (ritz0's emitter folds them since #2150).
 * `test_differing_compound_const_rejected`: definitions that differ in one
   component (operator, operand, name, cast target) are still a conflict.
 """
@@ -126,6 +126,19 @@ def test_identical_compound_const_resolves(tmp_path, line):
     module = _resolve(tmp_path)
     consts = [i for i in module.items if getattr(i, "name", None) == "X"]
     assert len(consts) == 1, consts
+
+
+# main exits X + 50.
+SAME_EXIT = {"unary_neg": 49, "binop": 55, "nested": 60, "ident": 58, "cast": 49}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("line", [s[1] for s in SAME], ids=[s[0] for s in SAME])
+def test_identical_compound_const_runs(compiler, tmp_path, line):
+    _setup(tmp_path, line, line)
+    case = next(s[0] for s in SAME if s[1] == line)
+    assert _run(compiler, tmp_path) == SAME_EXIT[case]
 
 
 # (id, ca's line, cb's line): each pair differs in exactly one component.
