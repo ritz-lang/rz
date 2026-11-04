@@ -426,6 +426,148 @@ pub fn main() -> i32
         return 1
     return h.m[1][1].x + (h.m[1][1].y as i32) + h.k + 7
 """,
+    # AGAST #2152: an N-D field reached through an indexed base -- a local
+    # and a global array of structs, `arr[i].m[j][k]`.  Neighbouring
+    # elements and rows are checked so a wrong stride shows.
+    "index_base_array": """\
+struct M
+    t: i32
+    m: [2][3]i32
+
+var ga: [3]M
+
+pub fn main() -> i32
+    var arr: [2]M
+    for i in 0..2
+        for j in 0..3
+            arr[0].m[i][j] = 100 + i * 3 + j
+            arr[1].m[i][j] = i * 3 + j
+            ga[2].m[i][j] = 50 + i * 3 + j
+    arr[1].m[1][2] = 40
+    arr[1].m[0][1] += 5
+    if arr[0].m[1][2] != 105 or arr[1].m[0][1] != 6 or arr[1].m[1][1] != 4
+        return 1
+    if ga[2].m[1][0] != 53 or ga[2].m[0][2] != 52
+        return 2
+    let q: *i32 = @arr[1].m[1][0]
+    if *(q + 2) != 40
+        return 3
+    let k: i32 = 1
+    return arr[k].m[k][k + 1] + ga[2].m[0][0] - 48
+""",
+    # `p[i].m[j][k]` over a `*M` param, an N-D struct leaf `g[i][j].m[k][l]`,
+    # and an array-of-struct field `o.items[i].m[j][k]`.
+    "index_base_ptr_nd_and_field": """\
+struct M
+    t: i32
+    m: [2][3]i32
+
+struct O
+    h: i64
+    items: [2]M
+
+fn put(p: *M, i: i32, v: i32)
+    p[i].m[1][2] = v
+    p[i].m[0][0] = 1
+
+fn get(p: *M, i: i32) -> i32
+    return p[i].m[1][2]
+
+pub fn main() -> i32
+    var arr: [2]M
+    put(@arr[0], 1, 30)
+    put(@arr[0], 0, 7)
+    if arr[0].m[1][2] != 7 or arr[1].m[0][0] != 1
+        return 1
+    var g: [2][2]M
+    g[1][0].m[1][1] = 4
+    g[0][1].m[1][1] = 9
+    var o: O
+    o.items[1].m[0][2] = 3
+    o.items[0].m[0][2] = 8
+    if g[0][1].m[1][1] != 9 or o.items[0].m[0][2] != 8
+        return 2
+    return get(@arr[0], 1) + g[1][0].m[1][1] + o.items[1].m[0][2] + 5
+""",
+    # A dereferenced base `(*p).m[i][j]`, over a local pointer, a param and
+    # a pointer-typed field `(*w.p).m[i][j]`; and a nested field behind an
+    # index `arr[i].b.m[j][k]`.
+    "deref_base": """\
+struct M
+    t: i32
+    m: [2][3]i32
+
+struct W
+    x: i32
+    p: *M
+
+struct N
+    h: i64
+    b: M
+
+fn rd(p: *M) -> i32
+    return (*p).m[1][2]
+
+pub fn main() -> i32
+    var s: M
+    let p: *M = @s
+    (*p).m[1][2] = 20
+    (*p).m[1][1] = 3
+    (*p).m[1][2] += 10
+    var w: W
+    w.p = @s
+    (*w.p).m[0][2] = 2
+    if s.m[1][2] != 30 or s.m[1][1] != 3 or s.m[0][2] != 2
+        return 1
+    var na: [2]N
+    na[1].b.m[1][0] = 5
+    na[0].b.m[1][0] = 9
+    if na[0].b.m[1][0] != 9
+        return 2
+    return rd(@s) + (*w.p).m[0][2] + na[1].b.m[1][0] + 5
+""",
+    # The pointer-shaped bases: an array of `*M` `ap[i].m[j][k]` and a
+    # `**M` field `h.pp[i].m[j][k]`.
+    "ptr_shaped_bases": """\
+struct M
+    t: i32
+    m: [2][3]i32
+
+struct H
+    n: i32
+    pp: **M
+
+pub fn main() -> i32
+    var a: M
+    var b: M
+    a.m[1][2] = 20
+    var ap: [2]*M
+    ap[0] = @a
+    ap[1] = @b
+    ap[1].m[0][1] = 12
+    ap[0].m[0][1] = 1
+    var h: H
+    h.pp = @ap[0]
+    h.pp[1].m[1][0] = 3
+    if a.m[1][2] != 20 or b.m[0][1] != 12 or a.m[0][1] != 1 or b.m[1][0] != 3
+        return 1
+    return a.m[1][2] + ap[1].m[0][1] + h.pp[1].m[1][0] + 7
+""",
+    # sizeof over an element, a row and the whole N-D field through every
+    # base shape: 4 + 12 + 4 + 4 + 12 + 6 = 42.
+    "field_elem_sizeof": """\
+struct M
+    t: i32
+    m: [2][3]i32
+
+pub fn main() -> i32
+    var s: M
+    var arr: [2]M
+    let p: *M = @s
+    if sizeof(arr[1].m) != 24 or sizeof((*p).m) != 24
+        return 1
+    return (sizeof(s.m[0][1]) + sizeof(s.m[1]) + sizeof(arr[1].m[0][2]) + sizeof((*p).m[1][2]) + sizeof(arr[0].m[1]) + 6) as i32
+""",
 }
 
 
@@ -621,6 +763,22 @@ pub fn main() -> i32
     g[1][1] = q
     return 0
 """, ":8:", "assigning a row or a whole struct element"),
+    # AGAST #2152: `(*gp).m[i][j]` over a global `*M` resolves, but
+    # emit_member_ptr cannot address any `(*gp).f` yet (#2166), so it
+    # is a located error rather than the old unlocated "not lowered" one.
+    "global_ptr_deref_field": ("""\
+struct M
+    t: i32
+    m: [2][3]i32
+
+var gp: *M
+
+pub fn main() -> i32
+    var a: M
+    gp = @a
+    (*gp).m[1][2] = 40
+    return 0
+""", ":10:", "cannot address the multi-dimensional array field"),
     "whole_array_use": ("""\
 fn take(a: i64) -> i32
     return 0

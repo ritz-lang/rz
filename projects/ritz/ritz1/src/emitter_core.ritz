@@ -2850,6 +2850,12 @@ fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
     # AGAST #1647: `mk().f` / `p.m().f` — the callee's struct return type.
     else if e.left.kind == EXPR_CALL or e.left.kind == EXPR_METHOD
         call_result_struct_name(s, e.left, @sname, @sname_len)
+    # AGAST #2152: `arr[i].f` / `p[i].f` / `o.items[i].f` / `g[i][j].f`.
+    else if e.left.kind == EXPR_INDEX
+        index_elem_struct_name(s, e.left, @sname, @sname_len)
+    # AGAST #2152: `(*p).f` / `(*w.p).f`.
+    else if e.left.kind == EXPR_UNARY and e.left.op == OP_DEREF
+        deref_member_base_struct_name(s, e.left.operand, @sname, @sname_len)
     if sname == null or sname_len == 0
         return null
     let st: *StructDef = find_struct(s, sname, sname_len)
@@ -2859,6 +2865,142 @@ fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
     if fidx < 0
         return null
     return get_field_type(st, fidx)
+
+# AGAST #2152: the struct an index expression `ie` yields an element of, for
+# a `.field` on it, or null/0.  Type-only; mirrors emit_member_ptr's
+# EXPR_INDEX arms (an N-D chain with a struct leaf, a struct-array or
+# `**S` field, a struct / pointer-to-struct array local, a `*S` local, a
+# struct-array global).  Shapes emit_member_ptr does not lower stay null.
+fn index_elem_struct_name(s: *EmitterState, ie: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if ie == null or ie.kind != EXPR_INDEX or ie.left == null
+        return
+    var nd_depth: i32 = 0
+    let nd_sh: *ArrayShape = nd_index_shape(s, ie, @nd_depth)
+    if nd_sh != null
+        if nd_depth == nd_sh.rank and nd_sh.leaf_type == TYPE_STRUCT
+            *out_name = nd_sh.leaf_name
+            *out_len = nd_sh.leaf_name_len
+        return
+    let b: *Expr = ie.left
+    if b.kind == EXPR_MEMBER
+        let f: *StructField = resolve_member_chain_field(s, b)
+        if f == null
+            return
+        if f.field_type == TYPE_ARRAY and f.array_elem_type_name_len > 0
+            *out_name = f.array_elem_type_name
+            *out_len = f.array_elem_type_name_len
+        else if f.field_type == TYPE_PTR_PTR and f.field_type_name_len > 0
+            *out_name = f.field_type_name
+            *out_len = f.field_type_name_len
+        return
+    if b.kind != EXPR_IDENT
+        return
+    let lv: *LocalVar = find_local_struct_name(s, b.ident_ptr, b.ident_len)
+    if lv != null
+        if lv.type_name_len <= 0
+            return
+        let ae: i32 = lv.array_elem_type
+        if lv.var_type == TYPE_ARRAY and (ae == TYPE_STRUCT or ae == TYPE_PTR or ae == TYPE_PTR_PTR)
+            *out_name = lv.type_name
+            *out_len = lv.type_name_len
+        else if lv.var_type == TYPE_PTR
+            *out_name = lv.type_name
+            *out_len = lv.type_name_len
+        return
+    let g: *GlobalVarDef = find_global(s, b.ident_ptr, b.ident_len)
+    if g != null and g.var_type == TYPE_ARRAY and g.array_elem_type == TYPE_STRUCT and g.array_elem_type_name_len > 0
+        *out_name = g.array_elem_type_name
+        *out_len = g.array_elem_type_name_len
+
+# AGAST #2152: the struct `(*op).field` reads a field of: the pointee of a
+# `*S` local or global, or of a `*S` field (`(*w.p).f`), or null/0.
+fn deref_member_base_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if op == null
+        return
+    if op.kind == EXPR_IDENT
+        let lv: *LocalVar = find_local_struct_name(s, op.ident_ptr, op.ident_len)
+        if lv != null
+            if lv.var_type == TYPE_PTR and lv.type_name_len > 0
+                *out_name = lv.type_name
+                *out_len = lv.type_name_len
+            return
+        let g: *GlobalVarDef = find_global(s, op.ident_ptr, op.ident_len)
+        if g != null and g.var_type == TYPE_PTR and g.pointee_type == TYPE_STRUCT and g.pointee_type_name_len > 0
+            *out_name = g.pointee_type_name
+            *out_len = g.pointee_type_name_len
+        return
+    if op.kind == EXPR_MEMBER
+        let f: *StructField = resolve_member_chain_field(s, op)
+        if f != null and f.field_type == TYPE_PTR and f.field_type_name_len > 0
+            *out_name = f.field_type_name
+            *out_len = f.field_type_name_len
+
+
+
+# AGAST #1509 / #2097: type-only N-D array shape resolution (moved here from
+# emitter_expr_arith by #2152, since resolve_member_chain_field now needs it
+# for an indexed base `g[i][j].m` and nd_array_member_shape needs that).
+
+# The shape of the N-D array an index chain `e` indexes, with the number of
+# indices in *out_depth, or null when `e` is not such a chain (base is not a
+# local / global N-D array, or the chain is deeper than its rank).  Emits
+# nothing, so callers can test before committing to the N-D path.
+fn nd_index_shape(s: *EmitterState, e: *Expr, out_depth: *i32) -> *ArrayShape
+    if e == null or e.kind != EXPR_INDEX
+        return null
+    var depth: i32 = 0
+    var base: *Expr = e
+    while base.kind == EXPR_INDEX
+        depth = depth + 1
+        base = base.left
+    let sh: *ArrayShape = nd_array_base_shape(s, base)
+    if sh == null or depth > sh.rank
+        return null
+    *out_depth = depth
+    return sh
+
+# The ArrayShape of the local / global N-D array named `name`, or null.
+fn nd_array_name_shape(s: *EmitterState, name: *u8, len: i32) -> *ArrayShape
+    if name == null or len <= 0
+        return null
+    let lv: *LocalVar = find_local_struct_name(s, name, len)
+    if lv != null
+        if lv.var_type == TYPE_ARRAY
+            return lv.array_shape
+        return null
+    let glob: *GlobalVarDef = find_global(s, name, len)
+    if glob != null and glob.var_type == TYPE_ARRAY
+        return glob.array_shape
+    return null
+
+# The same for an EXPR_IDENT `e` (null for any other expression).
+fn nd_array_ident_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    return nd_array_name_shape(s, e.ident_ptr, e.ident_len)
+
+# AGAST #2097: the ArrayShape of an N-D struct field named by the member
+# chain `e` (`s.m`, `p.m`, `a.b.m`, local or global), or null.  Type-only:
+# emits nothing (resolve_member_chain_field mirrors emit_member_ptr).
+fn nd_array_member_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    if e == null or e.kind != EXPR_MEMBER
+        return null
+    let f: *StructField = resolve_member_chain_field(s, e)
+    if f == null or f.field_type != TYPE_ARRAY
+        return null
+    return f.array_shape
+
+# The N-D array an index chain's base names: a local / global, or a field.
+fn nd_array_base_shape(s: *EmitterState, base: *Expr) -> *ArrayShape
+    if base == null
+        return null
+    if base.kind == EXPR_MEMBER
+        return nd_array_member_shape(s, base)
+    return nd_array_ident_shape(s, base)
 
 # AGAST #1660 — the unit (fieldless) enum an expression's value is, if any.
 #
