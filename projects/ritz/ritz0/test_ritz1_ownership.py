@@ -337,83 +337,8 @@ pub fn main() -> i32
     return DROPS
 """, 4),
 
-    # AGAST #2168 from here on.  A struct with a field moved out still drops
-    # the others: consume drops 1, p's scope end 2.
-    "field_move_rest_dropped": ("""\
-struct Two
-    a: Tracked
-    b: Tracked
-
-fn f()
-    var p = Two { a: make(1), b: make(2) }
-    consume(p.a)
-
-pub fn main() -> i32
-    f()
-    return ORDER
-""", 12),
-
-    # Moved on one path only: the field drops on the other, once.
-    "field_move_conditional": ("""\
-fn f(x: i32)
-    var h = Holder { t: make(1), n: 0 }
-    if x > 0
-        consume(h.t)
-
-pub fn main() -> i32
-    f(1)
-    f(0)
-    return DROPS
-""", 2),
-
-    # Assigning the field again re-owns it: 1 (consume), then 3 at scope end.
-    "field_move_reassigned": ("""\
-struct Two
-    a: Tracked
-    b: Tracked
-
-fn f()
-    var p = Two { a: make(1), b: make(2) }
-    consume(p.a)
-    p.a = make(3)
-
-pub fn main() -> i32
-    f()
-    return ORDER
-""", 132),
-
-    # Moved and re-assigned round a loop: consume drops 0, 1, 2; the end 3.
-    "field_move_in_loop_reassigned": ("""\
-fn f()
-    var h = Holder { t: make(0), n: 0 }
-    var i = 0
-    while i < 3
-        consume(h.t)
-        i = i + 1
-        h.t = make(i)
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 4),
-
-    # A `return` drops what is left of a partly moved binding.
-    "field_move_then_return": ("""\
-struct Two
-    a: Tracked
-    b: Tracked
-
-fn f(x: i32) -> i32
-    var p = Two { a: make(1), b: make(2) }
-    consume(p.b)
-    if x > 0
-        return 5
-    return 6
-
-pub fn main() -> i32
-    f(1)
-    return ORDER
-""", 21),
+    # AGAST #2168's field-move drop counts are in test_ownership_free_count.py
+    # (shared with ritz0 since AGAST #2171).
 
     # Match arms start from the state before the match (ritz0 #2161): t
     # moved in arm 1 is still usable in arm 2.  f(1) drops it in consume,
@@ -702,8 +627,8 @@ pub fn main() -> i32
 """,
 }
 
-# AGAST #2168: moves out of a field.  ritz0 doesn't track them yet (#2171),
-# so these are ritz1's own diagnostics: name -> (program body, message).
+# AGAST #2168: moves out of a field, ritz0's since AGAST #2171.  Every
+# compiler must report exactly this: name -> (program body, message).
 FIELD_REJECTS = {
     "field_used_after_move": ("""\
 pub fn main() -> i32
@@ -779,6 +704,26 @@ pub fn main() -> i32
     return h.t.id
 """, "main.ritz:39:12: error: use of moved value: `h.t` (moved at main.ritz:36:21)"),
 
+    # AGAST #2171: moved in the `then` branch, so moved after the `if`.
+    "field_moved_in_if": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    if DROPS == 0
+        consume(h.t)
+    return h.t.id
+""", "main.ritz:36:12: error: use of moved value: `h.t` (moved at main.ritz:35:17)"),
+
+    # ...and with an `else` that doesn't move it.
+    "field_moved_in_if_else": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    if DROPS == 0
+        consume(h.t)
+    else
+        h.n = 3
+    return h.t.id
+""", "main.ritz:38:12: error: use of moved value: `h.t` (moved at main.ritz:35:17)"),
+
     # Moving a field out of a type with its own drop would leave that drop
     # a half-moved value (as in Rust, E0509).
     "field_move_from_drop_type": ("""\
@@ -842,17 +787,24 @@ def test_ritz1_rejects_like_ritz0(request, tmp_path, compiler, name):
     assert DIAG.findall(out) == want, out[-2000:]
 
 
+# `F:L:C: [error: ]<message>` from either compiler, its file names the
+# temp path's (ritz0 prints `Ownership error: F:L:C: <message>`).
+FIELD_DIAG = re.compile(r"(\S*main\.ritz:\d+:\d+): (?:error: )?"
+                        r"((?:use of moved value|cannot borrow|cannot move out)\b.*)")
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", ("ritz0",) + RITZ1S)
 @pytest.mark.parametrize("name", sorted(FIELD_REJECTS))
-def test_ritz1_rejects_field_move(request, tmp_path, compiler, name):
-    request.getfixturevalue("ritz1_bin")
+def test_rejects_field_move(request, tmp_path, compiler, name):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
     body, want = FIELD_REJECTS[name]
     _, _, comp = _run(compiler, tmp_path, body)
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted {name}:\n{out[-1000:]}"
-    # Exactly this diagnostic, once (the file name is the temp path's).
-    diags = [l for l in out.splitlines() if ": error: " in l and
-             ("moved" in l or "move out" in l)]
-    got = [re.sub(r"\S*main\.ritz", "main.ritz", d) for d in diags]
+    assert "Traceback" not in out, out[-2000:]
+    # Exactly this diagnostic, once.
+    got = [re.sub(r"\S*main\.ritz", "main.ritz", f"{loc}: error: {msg}")
+           for loc, msg in FIELD_DIAG.findall(out)]
     assert got == [want], out[-2000:]

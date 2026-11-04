@@ -1870,7 +1870,7 @@ whole can't be used until `h.t` (or `h`) is assigned again, but `h`'s other
 fields can. A type that implements `Drop` itself can't have a field moved
 out, because its `drop` would see a half-moved value. Moving a field out of
 a temporary (`make().t`) takes the field, and the rest of the temporary isn't
-dropped. ritz0 doesn't track field moves of bindings yet (AGAST #2171).
+dropped.
 
 ```ritz expect-error="use of moved value: `r`"
 struct Resource

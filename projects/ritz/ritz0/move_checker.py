@@ -51,6 +51,10 @@ class VarInfo:
     # Borrow semantics for parameters (CONST/MUTABLE/MOVE)
     # If set, this parameter is a borrow and is effectively Copy
     borrow: Optional[rast.Borrow] = None
+    # Move-only fields moved out of the binding (a partial move, §13.6,
+    # AGAST #2171): field name -> where. The binding stays usable through
+    # its other fields; using it whole, or the moved field, is an error.
+    moved_fields: Dict[str, rast.Span] = field(default_factory=dict)
 
 
 @dataclass
@@ -71,22 +75,23 @@ class Scope:
         """Define a new variable in this scope."""
         self.vars[name] = VarInfo(name, ritz_type, VarState.OWNED, span, borrow=borrow)
 
-    def save_states(self) -> Dict[str, Tuple[VarState, Optional[rast.Span]]]:
+    def save_states(self) -> Dict[str, Tuple[VarState, Optional[rast.Span], Dict[str, rast.Span]]]:
         """Save variable states (for control flow analysis)."""
         states = {}
         for name, info in self.vars.items():
-            states[name] = (info.state, info.move_span)
+            states[name] = (info.state, info.move_span, dict(info.moved_fields))
         if self.parent:
             states.update(self.parent.save_states())
         return states
 
-    def restore_states(self, states: Dict[str, Tuple[VarState, Optional[rast.Span]]]):
+    def restore_states(self, states: Dict[str, Tuple[VarState, Optional[rast.Span], Dict[str, rast.Span]]]):
         """Restore variable states."""
-        for name, (state, move_span) in states.items():
+        for name, (state, move_span, fields) in states.items():
             info = self.lookup(name)
             if info:
                 info.state = state
                 info.move_span = move_span
+                info.moved_fields = dict(fields)
 
 
 def _is_lending_param(param: Optional[rast.Param]) -> bool:
@@ -261,6 +266,9 @@ class MoveChecker:
         # Per enclosing loop: the binding states at each `break` and
         # `continue` (AGAST #2161, _check_loop).
         self._loops: List[Dict[str, list]] = []
+        # (binding name, field) pairs the current function moves out of a
+        # binding (AGAST #2171); the emitter gives those fields drop flags.
+        self._field_moves: Set[Tuple[str, str]] = set()
 
     def check(self, module: rast.Module) -> List[OwnershipError]:
         """Check ownership rules for a module.
@@ -268,7 +276,12 @@ class MoveChecker:
         Returns a list of errors (empty if all rules satisfied). As a side
         effect, every Ident that moves a move-only binding gets
         `moves_binding = True`; the emitter clears that binding's drop flag
-        there, so a moved-from binding is never dropped (§13.6).
+        there, so a moved-from binding is never dropped (§13.6). Likewise a
+        Field that moves a move-only field out of a binding gets
+        `moves_field = True`, an assignment target that gives it back
+        `reowns_field = True`, and each FnDef `field_moves`, the (binding,
+        field) pairs it moves out (AGAST #2171): the emitter keeps a drop
+        flag per such field, so the binding's drop skips a moved field.
         """
         self.errors = []
         self.types = MoveTypes(module)
@@ -454,6 +467,7 @@ class MoveChecker:
     def _check_fn(self, fn: rast.FnDef):
         """Check a function definition."""
         self.current_fn_name = fn.name
+        self._field_moves = set()
         self._push_scope()
 
         # Parameters are owned at function start
@@ -466,6 +480,7 @@ class MoveChecker:
         self._check_block(fn.body)
 
         self._pop_scope()
+        fn.field_moves = self._field_moves
         self.current_fn_name = None
 
     def _check_block(self, block: rast.Block) -> bool:
@@ -532,8 +547,14 @@ class MoveChecker:
             # old t before the assignment makes t an owner again.
             self._check_expr(stmt.value, is_move_context=True)
             # The target (lvalue) is not a move, and assigning to a bare
-            # moved-from binding is not a use of it (§13.6).
-            if not isinstance(stmt.target, rast.Ident):
+            # moved-from binding is not a use of it (§13.6). Nor is assigning
+            # to a field moved out of a binding: that field is owned again.
+            reowned = self._field_reowned(stmt.target)
+            if reowned is not None:
+                del reowned.moved_fields[stmt.target.field]
+                # The emitter sets the field's drop flag again.
+                stmt.target.reowns_field = True
+            elif not isinstance(stmt.target, rast.Ident):
                 self._check_expr(stmt.target, is_move_context=False)
             # After assignment, the target variable becomes owned again
             if isinstance(stmt.target, rast.Ident):
@@ -541,6 +562,7 @@ class MoveChecker:
                 if var_info:
                     var_info.state = VarState.OWNED
                     var_info.move_span = None
+                    var_info.moved_fields = {}
             return False
 
         elif isinstance(stmt, rast.WhileStmt):
@@ -588,38 +610,52 @@ class MoveChecker:
     # moved bindings at the head, again with the merged head state. Paths
     # that `break` don't reach the head; they join the state after the loop.
 
-    def _snapshot(self) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span]]]:
-        """Every visible binding's state, keyed by binding (not name, so a
-        shadowing binding in an inner scope can't stand in for an outer one)."""
-        out: Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span]]] = {}
+    def _snapshot(self) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span], Dict[str, rast.Span]]]:
+        """Every visible binding's state (and its moved-out fields), keyed by
+        binding (not name, so a shadowing binding in an inner scope can't
+        stand in for an outer one)."""
+        out: Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span], Dict[str, rast.Span]]] = {}
         scope = self.scope
         while scope:
             for info in scope.vars.values():
-                out.setdefault(id(info), (info, info.state, info.move_span))
+                out.setdefault(id(info), (info, info.state, info.move_span,
+                                          dict(info.moved_fields)))
             scope = scope.parent
         return out
 
     def _restore(self, snap) -> None:
-        for info, state, span in snap.values():
+        for info, state, span, fields in snap.values():
             info.state = state
             info.move_span = span
+            info.moved_fields = dict(fields)
 
     @staticmethod
-    def _join(paths) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span]]]:
+    def _join(paths) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span], Dict[str, rast.Span]]]:
         """Where `paths` meet: each binding of the first path, moved if it is
-        moved on any of them, else in the first path's state."""
+        moved on any of them, else in the first path's state; a field is
+        moved out if it is on any of them."""
         out = dict(paths[0])
-        for key, (info, state, span) in paths[0].items():
+        for key, (info, state, span, fields) in paths[0].items():
+            merged = dict(fields)
+            for p in paths:
+                got = p.get(key)
+                if got is None:
+                    continue
+                for fname, fspan in got[3].items():
+                    merged.setdefault(fname, fspan)
             for p in paths:
                 got = p.get(key)
                 if got is not None and got[1] == VarState.MOVED:
-                    out[key] = (info, VarState.MOVED, got[2])
+                    state, span = VarState.MOVED, got[2]
                     break
+            out[key] = (info, state, span, merged)
         return out
 
     @staticmethod
-    def _moved_keys(snap) -> Set[int]:
-        return {k for k, (_i, st, _s) in snap.items() if st == VarState.MOVED}
+    def _moved_keys(snap) -> Set:
+        out: Set = {k for k, (_i, st, _s, _f) in snap.items() if st == VarState.MOVED}
+        out |= {(k, f) for k, (_i, _st, _s, fields) in snap.items() for f in fields}
+        return out
 
     def _note_loop_exit(self, kind: str) -> None:
         if self._loops:
@@ -659,6 +695,14 @@ class MoveChecker:
                 if var_info.state == VarState.MOVED:
                     self.errors.append(OwnershipError(
                         f"use of moved value: `{expr.name}` (moved at {var_info.move_span})",
+                        expr.span
+                    ))
+                    return
+                # Used whole after a field was moved out (AGAST #2171).
+                if var_info.moved_fields:
+                    fname, fspan = next(iter(var_info.moved_fields.items()))
+                    self.errors.append(OwnershipError(
+                        f"use of moved value: `{expr.name}.{fname}` (moved at {fspan})",
                         expr.span
                     ))
                     return
@@ -738,6 +782,9 @@ class MoveChecker:
 
         elif isinstance(expr, rast.Grouped):
             self._check_expr(expr.expr, is_move_context=is_move_context)
+
+        elif isinstance(expr, rast.Field) and self._field_owner(expr) is not None:
+            self._check_owned_field(expr, self._field_owner(expr), is_move_context)
 
         elif isinstance(expr, rast.Field):
             # Field access doesn't move the struct (unless the result is moved)
@@ -841,16 +888,22 @@ class MoveChecker:
                 else:
                     # Neither returned - merge: if moved in either branch, mark as moved
                     states_after_else = self.scope.save_states()
-                    for name, (then_state, then_move_span) in states_after_then.items():
+                    for name, (then_state, then_move_span, then_fields) in states_after_then.items():
                         else_info = states_after_else.get(name)
                         if else_info:
-                            else_state, else_move_span = else_info
+                            else_state, else_move_span, else_fields = else_info
+                            var_info = self.scope.lookup(name)
                             # If moved in either branch, mark as moved
                             if then_state == VarState.MOVED or else_state == VarState.MOVED:
-                                var_info = self.scope.lookup(name)
                                 if var_info:
                                     var_info.state = VarState.MOVED
                                     var_info.move_span = then_move_span or else_move_span
+                            # Likewise a field moved out in either (AGAST #2171).
+                            if var_info:
+                                merged = dict(then_fields)
+                                for fname, fspan in else_fields.items():
+                                    merged.setdefault(fname, fspan)
+                                var_info.moved_fields = merged
             else:
                 # No else branch - if then returns, restore pre-if state
                 # (the non-return path is when condition is false)
@@ -897,6 +950,60 @@ class MoveChecker:
         return any(n == expr.field and self.types.is_move_only(t)
                    for n, t in self.types.struct_fields(base))
 
+    # ---- moves out of a field (AGAST #2171) ----------------------------------
+
+    def _field_owner(self, expr: rast.Field) -> Optional[VarInfo]:
+        """The binding `expr` (`b.f`) is a field of, when `b` owns a struct
+        value: a local or by-value parameter of a named type, not a pointer,
+        a reference or a `name:& T` parameter. None otherwise."""
+        if not isinstance(expr.expr, rast.Ident) or expr.field.isdigit():
+            return None
+        info = self.scope.lookup(expr.expr.name)
+        if (info is None or info.borrow == rast.Borrow.MUTABLE
+                or not isinstance(info.ritz_type, rast.NamedType)):
+            return None
+        return info
+
+    def _field_reowned(self, target: rast.Expr) -> Optional[VarInfo]:
+        """For `b.f = v` with `f` moved out of the binding `b`, the binding."""
+        if not isinstance(target, rast.Field):
+            return None
+        info = self._field_owner(target)
+        if info is None or info.state == VarState.MOVED:
+            return None
+        return info if target.field in info.moved_fields else None
+
+    def _check_owned_field(self, expr: rast.Field, info: VarInfo,
+                           is_move_context: bool) -> None:
+        """`b.f` for a binding `b` that owns its struct: a use of field `f`
+        only, so the binding's other moved-out fields don't matter. In a move
+        context a move-only `f` moves out of `b` (a partial move, §13.6)."""
+        name = expr.expr.name
+        if info.state == VarState.MOVED:
+            self.errors.append(OwnershipError(
+                f"use of moved value: `{name}` (moved at {info.move_span})",
+                expr.expr.span))
+            return
+        moved_at = info.moved_fields.get(expr.field)
+        if moved_at is not None:
+            self.errors.append(OwnershipError(
+                f"use of moved value: `{name}.{expr.field}` (moved at {moved_at})",
+                expr.span))
+            return
+        if not is_move_context or not self._is_move_only_field(expr):
+            return
+        if self.types.has_own_drop(info.ritz_type):
+            # Its drop would see a half-moved value (Rust's E0509).
+            self.errors.append(OwnershipError(
+                f"cannot move out of `{name}.{expr.field}`: "
+                f"`{info.ritz_type.name}` implements Drop",
+                expr.span))
+            return
+        info.moved_fields[expr.field] = expr.span
+        self._field_moves.add((name, expr.field))
+        # The emitter clears the field's drop flag here.
+        expr.moves_field = True
+
     def _method_lends_self(self, call: rast.MethodCall) -> bool:
         """Does every method named like `call` borrow its receiver?"""
         cands = self.methods.get(call.method)
@@ -933,6 +1040,13 @@ class MoveChecker:
                 if var_info.state == VarState.MOVED:
                     self.errors.append(OwnershipError(
                         f"cannot borrow `{expr.name}` - value has been moved",
+                        span
+                    ))
+                    return
+                if var_info.moved_fields:
+                    fname = next(iter(var_info.moved_fields))
+                    self.errors.append(OwnershipError(
+                        f"cannot borrow `{expr.name}` - `{expr.name}.{fname}` has been moved",
                         span
                     ))
                     return

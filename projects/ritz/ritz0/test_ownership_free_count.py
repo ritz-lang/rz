@@ -16,7 +16,8 @@ ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). AGAST
 #2161 added enum payloads, array and tuple elements, temporaries and moves
 inside loops, closed for ritz0; ritz1's by AGAST #2165, except tuple
 elements (a strict xfail citing #1526, ritz1's missing tuple literals).
-AGAST #2168 added moves out of a field, closed for ritz1; ritz0's are #2171.
+AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
+#2171.
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -363,7 +364,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 1, {"ritz0": 2171}),
+""", 1, {}),
 
     # (`u: Tracked` annotated: ritz1 can't infer it yet, AGAST #2172.)
     "field_move_binding": ("""\
@@ -375,7 +376,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 2, {"ritz0": 2171}),
+""", 2, {}),
 
     # consume() drops t; h's drop must not drop it again.
     "field_move_into_callee": ("""\
@@ -387,7 +388,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 11, {"ritz0": 2171}),
+""", 11, {}),
 
     # A temporary whose move-only field is moved out isn't dropped too
     # (`u: Tracked` annotated for ritz1, AGAST #2172).
@@ -403,6 +404,117 @@ pub fn main() -> i32
     let inner = f()
     return inner + DROPS
 """, 1, {}),
+
+    # AGAST #2171 from here on (ritz1's cases from #2168, now shared).  A
+    # struct with a field moved out still drops the others: consume drops 1,
+    # p's scope end 2.
+    "field_move_rest_dropped": ("""\
+struct Two
+    a: Tracked
+    b: Tracked
+
+fn f()
+    var p = Two { a: make(1), b: make(2) }
+    consume(p.a)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {}),
+
+    # Moved on one path only: the field drops on the other, once.
+    "field_move_conditional": ("""\
+fn f(x: i32)
+    var h = Holder { t: make(1), n: 0 }
+    if x > 0
+        consume(h.t)
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 2, {}),
+
+    # Assigning the field again re-owns it: 1 (consume), then 3 at scope end.
+    "field_move_reassigned": ("""\
+struct Two
+    a: Tracked
+    b: Tracked
+
+fn f()
+    var p = Two { a: make(1), b: make(2) }
+    consume(p.a)
+    p.a = make(3)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 132, {}),
+
+    # Moved and re-assigned round a loop: consume drops 0, 1, 2; the end 3.
+    "field_move_in_loop_reassigned": ("""\
+fn f()
+    var h = Holder { t: make(0), n: 0 }
+    var i = 0
+    while i < 3
+        consume(h.t)
+        i = i + 1
+        h.t = make(i)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 4, {}),
+
+    # A `return` drops what is left of a partly moved binding.
+    "field_move_then_return": ("""\
+struct Two
+    a: Tracked
+    b: Tracked
+
+fn f(x: i32) -> i32
+    var p = Two { a: make(1), b: make(2) }
+    consume(p.b)
+    if x > 0
+        return 5
+    return 6
+
+pub fn main() -> i32
+    f(1)
+    return ORDER
+""", 21, {}),
+
+    # A by-value parameter owns its fields too: take() moves t out of h and
+    # drops nothing; f's u drops it once.
+    "field_move_from_param": ("""\
+fn take(h: Holder) -> Tracked
+    return h.t
+
+fn f() -> i32
+    var u = take(Holder { t: make(4), n: 1 })
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 1, {}),
+
+    # A binding declared inside a loop starts each iteration whole: the
+    # field moved by iteration 0 doesn't stop iteration 1's h dropping its t:
+    # consume drops id 0, iteration 1's scope end id 1.
+    "field_move_fresh_each_iteration": ("""\
+fn f()
+    var i = 0
+    while i < 2
+        var h = Holder { t: make(i), n: 0 }
+        if i == 0
+            consume(h.t)
+        i = i + 1
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, {}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -470,7 +582,7 @@ pub fn main() -> i32
     var h = Holder { t: make(1), n: 2 }
     var u = h.t
     return h.t.id
-""", "h.t", {"ritz0": 2171}),
+""", "h.t", {}),
 }
 
 

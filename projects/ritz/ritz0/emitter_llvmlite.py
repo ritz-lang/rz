@@ -597,6 +597,10 @@ class LLVMEmitter:
         # Maps alloca -> flag_alloca (using id() since AllocaInstr is not hashable)
         # The flag is set to 1 when variable is initialized, checked before dropping
         self.drop_flags: Dict[int, ir.AllocaInstr] = {}
+        # Per-field drop flags of bindings a field is moved out of (a partial
+        # move, AGAST #2171): id(binding slot) -> {field name: i1 flag}. The
+        # binding's drop glue drops such a field only while its flag is set.
+        self.field_drop_flags: Dict[int, Dict[str, ir.AllocaInstr]] = {}
         # A `let` of a move-only type has no alloca; its value is spilled to
         # one for the drop. name -> that slot, for clearing its flag on a
         # move (AGAST #2157).
@@ -3863,15 +3867,30 @@ class LLVMEmitter:
         else:
             self._let_drop_slots[name] = slot
 
+    def _drop_slot_of(self, name: str) -> Optional[ir.Value]:
+        """The slot the binding `name` currently refers to is dropped from:
+        its alloca, or a `let`'s drop spill slot. None if it has neither."""
+        if name in self.locals:
+            return self.locals[name][0]
+        if name in self.params:
+            return self._let_drop_slots.get(name)
+        return None
+
     def _drop_flag_of(self, name: str) -> Optional[ir.AllocaInstr]:
         """The drop flag of the binding `name` currently refers to, if any."""
-        if name in self.locals:
-            return self.drop_flags.get(id(self.locals[name][0]))
-        if name in self.params:
-            slot = self._let_drop_slots.get(name)
-            if slot is not None:
-                return self.drop_flags.get(id(slot))
-        return None
+        slot = self._drop_slot_of(name)
+        return self.drop_flags.get(id(slot)) if slot is not None else None
+
+    def _set_field_flag(self, expr: rast.Field, value: int) -> None:
+        """Clear (a move out, 0) or set (re-owned by assignment, 1) the drop
+        flag of field `expr` (`b.f`) of the binding `b` (AGAST #2171)."""
+        if not isinstance(expr.expr, rast.Ident) or self.builder.block.is_terminated:
+            return
+        slot = self._drop_slot_of(expr.expr.name)
+        flag = (self.field_drop_flags.get(id(slot), {}).get(expr.field)
+                if slot is not None else None)
+        if flag is not None:
+            self.builder.store(ir.Constant(self.i1, value), flag)
 
     def _note_move(self, expr: rast.Ident) -> None:
         """The move checker marked this use as a move: the binding no longer
@@ -3906,6 +3925,13 @@ class LLVMEmitter:
             # Register both the variable and its flag (key by alloca id, not name)
             self.drop_scope_stack[-1].append((name, alloca, ritz_type))
             self.drop_flags[id(alloca)] = flag_alloca
+            # A flag per field the function moves out of a binding of this
+            # name (AGAST #2171); set whenever the binding is initialised.
+            moves = getattr(self.current_fn_def, 'field_moves', None) or ()
+            fields = {f: self._new_drop_flag(f"{name}.{f}")
+                      for n, f in sorted(moves) if n == name}
+            if fields:
+                self.field_drop_flags[id(alloca)] = fields
             return True
         return False
 
@@ -4005,6 +4031,9 @@ class LLVMEmitter:
         if alloca_id in self.drop_flags:
             flag_alloca = self.drop_flags[alloca_id]
             self.builder.store(ir.Constant(self.i1, 1), flag_alloca)
+        # A new value owns all of its fields again (AGAST #2171).
+        for flag in self.field_drop_flags.get(alloca_id, {}).values():
+            self.builder.store(ir.Constant(self.i1, 1), flag)
 
     # --- sret (AGAST #1736; see the note above _SretAwareBuilder) -----------
 
@@ -4244,27 +4273,31 @@ class LLVMEmitter:
         `clear_flag` also resets it, for reassignment's drop of the old
         value."""
         flag_alloca = self.drop_flags.get(id(alloca))
+        field_flags = self.field_drop_flags.get(id(alloca))
         if flag_alloca is None:
             # No flag (shouldn't happen, but fall back to unconditional)
-            self._emit_drop_glue(alloca, ritz_type)
+            self._emit_drop_glue(alloca, ritz_type, field_flags=field_flags)
             return
         flag_val = self.builder.load(flag_alloca, name=f"{name}.flag_check")
         drop_block = self.current_fn.append_basic_block(f"drop.{name}")
         cont_block = self.current_fn.append_basic_block(f"drop.{name}.cont")
         self.builder.cbranch(flag_val, drop_block, cont_block)
         self.builder.position_at_end(drop_block)
-        self._emit_drop_glue(alloca, ritz_type)
+        self._emit_drop_glue(alloca, ritz_type, field_flags=field_flags)
         if clear_flag:
             self.builder.store(ir.Constant(self.i1, 0), flag_alloca)
         self.builder.branch(cont_block)
         self.builder.position_at_end(cont_block)
 
-    def _emit_drop_glue(self, ptr: ir.Value, ritz_type: rast.Type, depth: int = 0):
+    def _emit_drop_glue(self, ptr: ir.Value, ritz_type: rast.Type, depth: int = 0,
+                        field_flags: Optional[Dict[str, ir.AllocaInstr]] = None):
         """Drop the value at `ptr` (LANGUAGE_SPEC §13.6): its own `drop`
         first, if it has one, then its move-only parts: a struct's fields in
         declaration order (AGAST #2157), the payload of the variant an enum
         holds, an array's elements in index order and a tuple's elements in
-        order (AGAST #2161).
+        order (AGAST #2161). A struct field with a flag in `field_flags`
+        drops only while that flag is set: it may have been moved out
+        (AGAST #2171).
         """
         if depth > 32 or not self.move_types.is_move_only(ritz_type):
             return
@@ -4309,7 +4342,17 @@ class LLVMEmitter:
             except (ValueError, KeyError):
                 continue
             fptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+            fflag = (field_flags or {}).get(fname)
+            if fflag is None:
+                self._emit_drop_glue(fptr, fty, depth + 1)
+                continue
+            drop_block = self.current_fn.append_basic_block(f"drop.field.{fname}")
+            cont_block = self.current_fn.append_basic_block(f"drop.field.{fname}.cont")
+            self.builder.cbranch(self.builder.load(fflag), drop_block, cont_block)
+            self.builder.position_at_end(drop_block)
             self._emit_drop_glue(fptr, fty, depth + 1)
+            self.builder.branch(cont_block)
+            self.builder.position_at_end(cont_block)
 
     def _emit_array_drop_glue(self, ptr: ir.Value, ritz_type: rast.ArrayType, depth: int):
         """Drop `[N]T`'s elements in index order, in a loop (N may be large)."""
@@ -4636,6 +4679,7 @@ class LLVMEmitter:
         self.in_test_helper = fn_def.has_attr('test_helper')
         self.drop_scope_stack.clear()  # Clear drop scopes from previous function
         self.drop_flags.clear()  # Clear drop flags from previous function
+        self.field_drop_flags.clear()
         self._let_drop_slots.clear()
         self._let_drop_saved.clear()
         self._loop_drop_depth.clear()
@@ -5035,6 +5079,9 @@ class LLVMEmitter:
         self._temp_frames.append([])
         try:
             result = self._emit_stmt_inner(stmt)
+            if (isinstance(stmt, rast.AssignStmt)
+                    and getattr(stmt.target, 'reowns_field', False)):
+                self._set_field_flag(stmt.target, 1)
             frame = self._temp_frames[-1]
             if frame and self.builder.block is not None and not self.builder.block.is_terminated:
                 self._drop_temp_frame(frame)
@@ -9664,6 +9711,9 @@ class LLVMEmitter:
         For local variables, uses GEP directly on the alloca to avoid loading
         the entire struct into a register (which can crash LLVM for large structs).
         """
+        if getattr(expr, 'moves_field', False):
+            # Moved out (AGAST #2171): the binding's drop must skip it.
+            self._set_field_flag(expr, 0)
         # Namespace-qualified symbol fallback (e.g. `instructions.NPUSHB`,
         # `Module.CONST`). When the qualifier is not a value/type in scope, treat
         # the access as a flat lookup of the field name against module-level
