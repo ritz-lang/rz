@@ -11,10 +11,17 @@
 #   3. The connection stays usable afterwards (keep-alive second request).
 #   4. A request body bigger than a zeus slot gets a clean 4xx/5xx, never a
 #      hang or a truncated 200.
+#   5. A slow reader with a tiny window gets the whole page: valet resumes
+#      a short send instead of dropping the tail (AGAST #2107).
 #
 # Needs debug builds of zeus, valet and nexus:
 #   ./rz build zeus && ./rz build valet && ./rz build nexus
 # Run from anywhere:  bash projects/nexus/test/e2e_large_page.sh
+#
+# CI runs this in main.yml's build-all job, after `./rz build --all`
+# (AGAST #2107; wiring pinned by projects/ritz/tools/test_ci_e2e.py). It is
+# not nexus's package test.sh, because `rz test --all -j N` would race the
+# zeus/valet build dirs. Exit only 0 or 1: ci_local reads 3 as SETUP ERROR.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -106,6 +113,61 @@ if [[ $rc -eq 0 && "$code" =~ ^[45][0-9][0-9]$ ]]; then
 else
     fail "oversize request -> '$code' curl exit $rc (want clean 4xx/5xx)"
 fi
+
+# --- 5. Slow reader: valet must resume a short send (AGAST #2107) -------------
+# On loopback a fast reader takes the ~50 KB page in one send(), so valet's
+# CONN_STATE_SEND resume path (b.pos < b.len) never runs.  A client with a
+# tiny receive buffer that does not read for a while caps the TCP window, so
+# the kernel accepts only part of the page and valet must re-send the rest.
+# Then a second request on the same connection checks that valet is back in
+# RECV afterwards.
+if python3 - "$PORT" <<'PY'
+import socket, sys, time
+port = int(sys.argv[1])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)  # before connect: caps the window
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 536)  # small peer MSS: valet's sndbuf starts small too
+s.settimeout(10)
+s.connect(("127.0.0.1", port))
+s.sendall(b"GET /wiki/big HTTP/1.1\r\nHost: e2e\r\n\r\n")
+time.sleep(0.5)  # let valet fill the window and get a short send back
+
+buf = b""
+def fill(n):
+    global buf
+    while len(buf) < n:
+        try:
+            chunk = s.recv(1024)
+        except socket.timeout:
+            raise SystemExit("timed out with %d of %d bytes (short send not resumed?)" % (len(buf), n))
+        if not chunk:
+            raise SystemExit("connection closed after %d bytes" % len(buf))
+        buf += chunk
+        time.sleep(0.001)
+
+def response():
+    global buf
+    while b"\r\n\r\n" not in buf:
+        fill(len(buf) + 1)
+    head, _, buf = buf.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    clen = [int(l.split(":", 1)[1]) for l in lines[1:] if l.lower().startswith("content-length:")]
+    if not clen:
+        raise SystemExit("no Content-Length in %r" % lines[0])
+    fill(clen[0])
+    body, buf = buf[:clen[0]], buf[clen[0]:]
+    return lines[0], body
+
+status, body = response()
+if " 200 " not in status + " " or body.count(b"&quot;") != 8192:
+    raise SystemExit("slow GET: %s, %d bytes, %d &quot;" % (status, len(body), body.count(b"&quot;")))
+s.sendall(b"GET /health HTTP/1.1\r\nHost: e2e\r\n\r\n")
+status, _ = response()
+if " 200 " not in status + " ":
+    raise SystemExit("keep-alive after slow GET: %s" % status)
+print("ok: slow reader -> 200, %d bytes, 8192 &quot;, keep-alive" % len(body))
+PY
+then :; else fail "slow reader (short-send resume)"; fi
 
 # valet must still be alive and serving.
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/health")"

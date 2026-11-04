@@ -478,7 +478,13 @@ def test_setup_error_does_not_stop_fail_fast(tmp_path, monkeypatch, capsys):
     assert "[B] START" in capsys.readouterr().out
 
 
-def test_real_build_all_job_is_one_rz_build_all_step():
-    """run-gate.sh relies on build-all's exit code being `rz build --all`'s."""
+def test_real_build_all_job_is_rz_build_all_then_the_e2e():
+    """run-gate.sh relies on build-all's SETUP ERROR (exit 3) coming only
+    from `rz build --all`. The one other step is the valet/zeus/nexus e2e
+    (AGAST #2107), which exits 0 or 1 and never 3 -- test_ci_e2e.py holds
+    it to that. A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
-    assert [s.run.strip() for s in steps] == ["./rz build --all"]
+    assert [s.run.strip() for s in steps] == [
+        "./rz build --all",
+        "bash projects/nexus/test/e2e_large_page.sh",
+    ]
