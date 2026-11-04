@@ -375,11 +375,10 @@ pub fn main() -> i32
     return inner + DROPS
 """, 1, {}),
 
-    # (`u: Tracked` annotated: ritz1 can't infer it yet, AGAST #2172.)
     "field_move_binding": ("""\
 fn f() -> i32
     var h = Holder { t: make(4), n: 1 }
-    var u: Tracked = h.t
+    var u = h.t
     return DROPS * 10 + h.n
 
 pub fn main() -> i32
@@ -399,14 +398,13 @@ pub fn main() -> i32
     return inner + DROPS
 """, 11, {}),
 
-    # A temporary whose move-only field is moved out isn't dropped too
-    # (`u: Tracked` annotated for ritz1, AGAST #2172).
+    # A temporary whose move-only field is moved out isn't dropped too.
     "temporary_field_moved": ("""\
 fn mk(id: i32) -> Holder
     return Holder { t: make(id), n: 0 }
 
 fn f() -> i32
-    var u: Tracked = mk(3).t
+    var u = mk(3).t
     return DROPS * 10
 
 pub fn main() -> i32
