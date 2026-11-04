@@ -11,9 +11,12 @@ Every program below uses one instrumented `Drop` type, `Tracked`, whose
 (`ORDER`). The program's exit status encodes the counts it observed. The
 expected statuses come from the spec, not from what a compiler does today.
 
-Every gap these programs once exposed is closed: ritz0's by AGAST #2157,
-ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). A new
-gap goes in as a strict xfail, so the room that closes it has to flip it.
+The first gaps these programs exposed are closed: ritz0's by AGAST #2157,
+ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). AGAST
+#2161 added enum payloads, array and tuple elements, temporaries and moves
+inside loops, closed for ritz0; ritz1's are strict xfails citing #2165 (and
+#1526, ritz1's missing tuple literals). A new gap goes in as a strict xfail,
+so the room that closes it has to flip it.
 """
 
 import os
@@ -220,6 +223,128 @@ pub fn main() -> i32
     f()
     return ORDER
 """, 4, {}),
+
+    # AGAST #2161 from here on. An enum drops the payload of the variant it
+    # holds: f(1) holds Full(1) at scope end, f(0) only Empty.
+    "enum_payload": ("""\
+enum Slot
+    Full(Tracked)
+    Empty
+
+fn f(full: i32)
+    var s = Slot.Empty
+    if full == 1
+        s = Slot.Full(make(1))
+
+pub fn main() -> i32
+    f(1)
+    f(0)
+    return DROPS
+""", 1, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # The generic enum from ritzlib, instantiated at a move-only type.
+    "option_payload": ("""\
+import ritzlib.option
+
+fn f()
+    var o: Option<Tracked> = Some(make(1))
+    var n: Option<Tracked> = None
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # Array elements drop in index order: 1, 2, 3.
+    "array_elements": ("""\
+fn f()
+    var a: [3]Tracked = [make(1), make(2), make(3)]
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 123, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # Tuple elements drop in order; the i32 in between is not dropped.
+    "tuple_elements": ("""\
+fn f()
+    var t = (make(1), 5, make(2))
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {"ritz1": 1526, "ritz1_selfhosted": 1526}),
+
+    # A temporary nobody owns drops at the end of its statement: before
+    # the `return`, so the helper already sees it.
+    "temporary_statement": ("""\
+fn f() -> i32
+    make(1)
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # Lent to an `@T` parameter, the temporary is still nobody's: it drops
+    # once the `let` statement ends. inner = 1 * 10 + 2.
+    "temporary_lent": ("""\
+fn peek(t: @Tracked) -> i32
+    return t.id
+
+fn f() -> i32
+    let n = peek(make(2))
+    return DROPS * 10 + n
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 13, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # A `return` statement's temporary drops after the value is evaluated
+    # (DROPS is still 0 there), before the function returns. inner = 2.
+    "temporary_in_return": ("""\
+fn peek(t: @Tracked) -> i32
+    return t.id
+
+fn f() -> i32
+    return peek(make(2)) + DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner * 10 + DROPS
+""", 21, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # Moving an outer binding inside a loop is fine when every path back to
+    # the loop head assigns it again: consume drops ids 0, 1 and 2, the
+    # scope end drops id 3.
+    "loop_move_reassigned": ("""\
+fn f()
+    var t = make(0)
+    var i = 0
+    while i < 3
+        consume(t)
+        i = i + 1
+        t = make(i)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 4, {}),
+
+    # ...or when the path that moved it leaves the loop.
+    "loop_move_then_break": ("""\
+fn f()
+    var t = make(1)
+    while true
+        consume(t)
+        break
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -245,6 +370,41 @@ pub fn main() -> i32
     var g = h
     return h.n
 """, "h", {}),
+
+    # AGAST #2161: the second iteration would use the value the first moved.
+    "move_in_loop": ("""\
+pub fn main() -> i32
+    var t = make(1)
+    var i = 0
+    while i < 2
+        consume(t)
+        i = i + 1
+    return 0
+""", "t", {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # A `continue` path also reaches the loop head with t moved.
+    "move_in_loop_continue": ("""\
+pub fn main() -> i32
+    var t = make(1)
+    var i = 0
+    while i < 2
+        i = i + 1
+        if i == 1
+            consume(t)
+            continue
+        t = make(2)
+    return 0
+""", "t", {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+
+    # Moved on the path that breaks out, so not usable after the loop.
+    "after_move_then_break": ("""\
+pub fn main() -> i32
+    var t = make(1)
+    while true
+        consume(t)
+        break
+    return t.id
+""", "t", {}),
 }
 
 

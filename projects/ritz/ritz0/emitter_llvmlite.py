@@ -17,7 +17,7 @@ import ritz_ast as rast
 from monomorph import resolve_alias_in
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
-from move_checker import MoveChecker, MoveTypes
+from move_checker import MoveChecker, MoveTypes, _subst as move_subst
 
 
 class EmitError(Exception):
@@ -602,6 +602,12 @@ class LLVMEmitter:
         # Per open loop (parallel to loop_stack): len(drop_scope_stack) at
         # the loop, so break/continue drop only the scopes inside it.
         self._loop_drop_depth: List[int] = []
+        # Move-only temporaries nobody owns (AGAST #2161): one frame per
+        # statement being emitted (and per loop / `if` condition), each a
+        # list of (slot, drop flag, ritz type). The frame drops at its end.
+        self._temp_frames: List[List[Tuple[ir.AllocaInstr, ir.AllocaInstr, rast.Type]]] = []
+        # Per open loop: len(_temp_frames) at the loop (see _loop_drop_depth).
+        self._loop_temp_depth: List[int] = []
 
         # Type aliases: name -> Ritz type (for resolving union types)
         self.type_aliases: Dict[str, rast.Type] = {}
@@ -1353,6 +1359,12 @@ class LLVMEmitter:
         This mirrors the type checker's inference but is used during emission
         when no explicit type annotation is provided.
         """
+        # `E.V` / `E.V(...)`: an enum value (drop tracking, AGAST #2161).
+        if isinstance(expr, (rast.Field, rast.MethodCall)) and getattr(self, "move_types", None) is not None:
+            variant_ty = self.move_types.variant_value_type(
+                expr, lambda n: n in self.locals or n in self.params)
+            if variant_ty is not None:
+                return variant_ty
         if isinstance(expr, rast.IntLit):
             # Integer literals default to i64 (signed)
             return rast.NamedType(expr.span, 'i64', [])
@@ -1501,6 +1513,12 @@ class LLVMEmitter:
                 elem_type = self._infer_ritz_type(expr.elements[0])
                 if elem_type:
                     return rast.ArrayType(expr.span, len(expr.elements), elem_type)
+            return None
+        elif isinstance(expr, rast.TupleLit):
+            # For drop tracking of a tuple of move-only values (AGAST #2161).
+            elems = [self._infer_ritz_type(e) for e in expr.elements]
+            if expr.elements and all(e is not None for e in elems):
+                return rast.TupleType(expr.span, elems)
             return None
         elif isinstance(expr, rast.If):
             if expr.then_block and expr.then_block.expr:
@@ -3859,6 +3877,9 @@ class LLVMEmitter:
 
     def _drop_loop_scopes(self) -> None:
         """break / continue: drop the scopes opened inside the innermost loop."""
+        tdepth = self._loop_temp_depth[-1] if self._loop_temp_depth else len(self._temp_frames)
+        for frame in reversed(self._temp_frames[tdepth:]):
+            self._drop_temp_frame(frame)
         depth = self._loop_drop_depth[-1] if self._loop_drop_depth else len(self.drop_scope_stack)
         for scope in reversed(self.drop_scope_stack[depth:]):
             self._emit_drop_for_scope(scope)
@@ -3874,37 +3895,67 @@ class LLVMEmitter:
         Returns the alloca for use with _mark_drop_variable_initialized.
         """
         if self.drop_scope_stack and self._type_implements_drop(ritz_type):
-            # Create a drop flag alloca at the entry block (like all allocas)
-            # Initialize to 0 (not yet initialized)
-            entry_block = self.current_fn.entry_basic_block
-
-            # Save current position
-            current_block = self.builder.block
-
-            # Insert flag alloca at start of entry block (after other allocas)
-            # Find position after existing allocas
-            first_non_alloca = None
-            for instr in entry_block.instructions:
-                if not isinstance(instr, ir.AllocaInstr):
-                    first_non_alloca = instr
-                    break
-
-            if first_non_alloca:
-                self.builder.position_before(first_non_alloca)
-            else:
-                self.builder.position_at_end(entry_block)
-
-            flag_alloca = self.builder.alloca(self.i1, name=f"{name}.drop_flag")
-            self.builder.store(ir.Constant(self.i1, 0), flag_alloca)
-
-            # Restore position
-            self.builder.position_at_end(current_block)
-
+            flag_alloca = self._new_drop_flag(name)
             # Register both the variable and its flag (key by alloca id, not name)
             self.drop_scope_stack[-1].append((name, alloca, ritz_type))
             self.drop_flags[id(alloca)] = flag_alloca
             return True
         return False
+
+    def _new_drop_flag(self, name: str) -> ir.AllocaInstr:
+        """An i1 drop flag in the entry block (like all allocas), 0 there."""
+        entry_block = self.current_fn.entry_basic_block
+        current_block = self.builder.block
+        # Insert flag alloca at start of entry block (after other allocas)
+        first_non_alloca = None
+        for instr in entry_block.instructions:
+            if not isinstance(instr, ir.AllocaInstr):
+                first_non_alloca = instr
+                break
+        if first_non_alloca:
+            self.builder.position_before(first_non_alloca)
+        else:
+            self.builder.position_at_end(entry_block)
+        flag_alloca = self.builder.alloca(self.i1, name=f"{name}.drop_flag")
+        self.builder.store(ir.Constant(self.i1, 0), flag_alloca)
+        self.builder.position_at_end(current_block)
+        return flag_alloca
+
+    def _own_temporary(self, expr: rast.Expr, val: ir.Value) -> None:
+        """A move-only value nobody takes ownership of (the move checker
+        marked `expr.drop_temp` with its type) is a temporary: keep a copy
+        for the innermost temporary frame to drop (§13.6, AGAST #2161)."""
+        ty = getattr(expr, 'drop_temp', None)
+        if (ty is None or not self._temp_frames or not self.drop_scope_stack
+                or self.current_fn is None or val is None
+                or isinstance(val.type, ir.VoidType)
+                or self.builder.block.is_terminated):
+            return
+        slot = self._alloca_in_entry_block(val.type, "tmp.drop")
+        flag = self._new_drop_flag("tmp")
+        self.builder.store(val, slot)
+        self.builder.store(ir.Constant(self.i1, 1), flag)
+        self.drop_flags[id(slot)] = flag
+        self._temp_frames[-1].append((slot, flag, ty))
+
+    def _drop_temp_frame(self, frame) -> None:
+        """Drop a frame's live temporaries, newest first. Each flag is
+        cleared, so a frame left early by return/break and again at its
+        end can't drop one twice."""
+        for slot, _flag, ty in reversed(frame):
+            self._emit_flagged_drop("tmp", slot, ty, clear_flag=True)
+
+    def _emit_cond_expr(self, expr: rast.Expr) -> ir.Value:
+        """A loop or `if` condition: its temporaries drop as soon as it has
+        been evaluated, before the branch."""
+        self._temp_frames.append([])
+        try:
+            val = self._emit_expr(expr)
+        finally:
+            frame = self._temp_frames.pop()
+        if frame and not self.builder.block.is_terminated:
+            self._drop_temp_frame(frame)
+        return val
 
     def _store_binding(self, name: str, alloca: ir.Value, val: ir.Value) -> None:
         """`name = val` for a local binding. §13.6: drop the old value (if
@@ -4203,17 +4254,29 @@ class LLVMEmitter:
 
     def _emit_drop_glue(self, ptr: ir.Value, ritz_type: rast.Type, depth: int = 0):
         """Drop the value at `ptr` (LANGUAGE_SPEC §13.6): its own `drop`
-        first, if it has one, then each move-only field in declaration
-        order. AGAST #2157.
-
-        Not covered yet (AGAST #2161): enum payloads, and arrays and
-        tuples of move-only types, are not dropped.
+        first, if it has one, then its move-only parts: a struct's fields in
+        declaration order (AGAST #2157), the payload of the variant an enum
+        holds, an array's elements in index order and a tuple's elements in
+        order (AGAST #2161).
         """
         if depth > 32 or not self.move_types.is_move_only(ritz_type):
             return
         while (isinstance(ritz_type, rast.NamedType) and not ritz_type.args
                and ritz_type.name in self.move_types.aliases):
             ritz_type = self.move_types.aliases[ritz_type.name]
+        if not isinstance(ptr.type, ir.PointerType):
+            return
+        if isinstance(ritz_type, rast.ArrayType):
+            self._emit_array_drop_glue(ptr, ritz_type, depth)
+            return
+        if isinstance(ritz_type, rast.TupleType):
+            if isinstance(ptr.type.pointee, ir.BaseStructType):
+                for i, ety in enumerate(ritz_type.elements):
+                    if i < len(ptr.type.pointee.elements) and self.move_types.is_move_only(ety):
+                        eptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0),
+                                                      ir.Constant(self.i32, i)])
+                        self._emit_drop_glue(eptr, ety, depth + 1)
+            return
         drop_fn_name = self._get_drop_fn_name(ritz_type)
         if drop_fn_name and drop_fn_name in self.functions:
             fn, _ = self.functions[drop_fn_name]
@@ -4224,7 +4287,9 @@ class LLVMEmitter:
             self.builder.call(fn, [arg])
         if not isinstance(ritz_type, rast.NamedType):
             return
-        if not isinstance(ptr.type, ir.PointerType):
+        enum_entry = self._enum_entry_of_type(ptr.type.pointee)
+        if enum_entry is not None:
+            self._emit_enum_drop_glue(ptr, ritz_type, enum_entry, depth)
             return
         struct_name = self._get_struct_name_from_type(ptr.type.pointee)
         if struct_name is None:
@@ -4239,13 +4304,82 @@ class LLVMEmitter:
             fptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
             self._emit_drop_glue(fptr, fty, depth + 1)
 
+    def _emit_array_drop_glue(self, ptr: ir.Value, ritz_type: rast.ArrayType, depth: int):
+        """Drop `[N]T`'s elements in index order, in a loop (N may be large)."""
+        if not isinstance(ptr.type.pointee, ir.ArrayType):
+            return
+        count = ptr.type.pointee.count
+        if count == 0:
+            return
+        pre = self.builder.block
+        head = self.current_fn.append_basic_block("drop.arr.head")
+        body = self.current_fn.append_basic_block("drop.arr.body")
+        done = self.current_fn.append_basic_block("drop.arr.done")
+        self.builder.branch(head)
+        self.builder.position_at_end(head)
+        idx = self.builder.phi(self.i64, name="drop.arr.i")
+        idx.add_incoming(ir.Constant(self.i64, 0), pre)
+        more = self.builder.icmp_unsigned('<', idx, ir.Constant(self.i64, count))
+        self.builder.cbranch(more, body, done)
+        self.builder.position_at_end(body)
+        eptr = self.builder.gep(ptr, [ir.Constant(self.i64, 0), idx])
+        self._emit_drop_glue(eptr, ritz_type.inner, depth + 1)
+        idx.add_incoming(self.builder.add(idx, ir.Constant(self.i64, 1)), self.builder.block)
+        self.builder.branch(head)
+        self.builder.position_at_end(done)
+
+    def _emit_enum_drop_glue(self, ptr: ir.Value, ritz_type: rast.NamedType,
+                             enum_entry, depth: int):
+        """Drop the move-only payload of the variant the enum at `ptr`
+        holds: a switch on its tag, one case per variant with such a payload."""
+        enum_name, variants = enum_entry
+        # A specialisation's variants may still name the generic's parameters.
+        generic = self.move_types.enums.get(ritz_type.name)
+        subst = {}
+        if generic is not None and generic.type_params and ritz_type.args:
+            subst = dict(zip(generic.type_params, ritz_type.args))
+        cases = []
+        for tag, variant in enumerate(variants):
+            ftys = [move_subst(t, subst) for t in variant.fields]
+            if any(self.move_types.is_move_only(t) for t in ftys):
+                cases.append((tag, variant, ftys))
+        if not cases:
+            return
+        tag_val = self.builder.load(
+            self.builder.gep(ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)]),
+            name="drop.enum.tag")
+        done = self.current_fn.append_basic_block("drop.enum.done")
+        switch = self.builder.switch(tag_val, done)
+        data_index = self._get_enum_data_index(enum_name)
+        for tag, variant, ftys in cases:
+            block = self.current_fn.append_basic_block(f"drop.enum.{variant.name}")
+            switch.add_case(ir.Constant(self.i8, tag), block)
+            self.builder.position_at_end(block)
+            data_ptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0),
+                                              ir.Constant(self.i32, data_index)])
+            offsets, _, _ = self._enum_variant_field_layout(variant)
+            for off, fty in zip(offsets, ftys):
+                if not self.move_types.is_move_only(fty):
+                    continue
+                # Same addressing as match binding / the constructor.
+                fptr = self.builder.bitcast(
+                    self.builder.gep(data_ptr, [ir.Constant(self.i32, 0),
+                                                ir.Constant(self.i32, off)]),
+                    ir.PointerType(self._ritz_type_to_llvm(fty)))
+                self._emit_drop_glue(fptr, fty, depth + 1)
+            self.builder.branch(done)
+        self.builder.position_at_end(done)
+
     def _emit_drop_for_all_scopes(self, exclude_var: Optional[str] = None):
         """Emit drop calls for all scopes (used before return).
 
         Args:
             exclude_var: Variable name to exclude from dropping (for return moves)
         """
-        # Drop all scopes from innermost to outermost
+        # The temporaries of the statements being emitted, then all scopes
+        # from innermost to outermost.
+        for frame in reversed(self._temp_frames):
+            self._drop_temp_frame(frame)
         for scope in reversed(self.drop_scope_stack):
             self._emit_drop_for_scope(scope, exclude_var)
 
@@ -4498,6 +4632,8 @@ class LLVMEmitter:
         self._let_drop_slots.clear()
         self._let_drop_saved.clear()
         self._loop_drop_depth.clear()
+        self._loop_temp_depth.clear()
+        self._temp_frames.clear()
         self.simd_expected_type = None  # Clear SIMD type context from previous function
         self.closure_expected_type = None  # Clear closure type context from previous function
         self.expected_ritz_type = None  # Expected Ritz type of the value being emitted
@@ -4888,8 +5024,14 @@ class LLVMEmitter:
         """
         saved_expected_enum = getattr(self, '_expected_enum_name', None)
         self._expected_enum_name = None
+        # The statement's temporaries drop at its end (AGAST #2161).
+        self._temp_frames.append([])
         try:
-            return self._emit_stmt_inner(stmt)
+            result = self._emit_stmt_inner(stmt)
+            frame = self._temp_frames[-1]
+            if frame and self.builder.block is not None and not self.builder.block.is_terminated:
+                self._drop_temp_frame(frame)
+            return result
         except TypeError as exc:
             # AGAST #1384. #1366 gave call-argument mismatches a location by
             # wrapping `_emit_call`; stores were never covered, and stores are
@@ -4912,6 +5054,7 @@ class LLVMEmitter:
                 getattr(stmt, 'span', None),
             ) from None
         finally:
+            self._temp_frames.pop()
             self._expected_enum_name = saved_expected_enum
 
     # llvmlite's IRBuilder.store raises TypeError with this text when the
@@ -6305,7 +6448,7 @@ class LLVMEmitter:
 
     def _emit_if(self, if_expr: rast.If):
         """Emit an if expression/statement. Returns phi value if if-expr has value, else None."""
-        cond = self._emit_expr(if_expr.cond)
+        cond = self._emit_cond_expr(if_expr.cond)
 
         # Ensure condition is i1
         if cond.type != self.i1:
@@ -6447,13 +6590,14 @@ class LLVMEmitter:
         # Push loop context for break/continue
         self.loop_stack.append((cond_block, end_block))
         self._loop_drop_depth.append(len(self.drop_scope_stack))
+        self._loop_temp_depth.append(len(self._temp_frames))
 
         # Jump to condition
         self.builder.branch(cond_block)
 
         # Condition
         self.builder.position_at_end(cond_block)
-        cond = self._emit_expr(stmt.cond)
+        cond = self._emit_cond_expr(stmt.cond)
         if cond.type != self.i1:
             cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0))
         self.builder.cbranch(cond, body_block, end_block)
@@ -6485,6 +6629,7 @@ class LLVMEmitter:
         # Pop loop context
         self.loop_stack.pop()
         self._loop_drop_depth.pop()
+        self._loop_temp_depth.pop()
 
         # End
         self.builder.position_at_end(end_block)
@@ -6557,6 +6702,7 @@ class LLVMEmitter:
         # continue goes to increment block, break goes to end block
         self.loop_stack.append((incr_block, end_block))
         self._loop_drop_depth.append(len(self.drop_scope_stack))
+        self._loop_temp_depth.append(len(self._temp_frames))
 
         # Jump to condition
         self.builder.branch(cond_block)
@@ -6615,6 +6761,7 @@ class LLVMEmitter:
         # Pop loop context
         self.loop_stack.pop()
         self._loop_drop_depth.pop()
+        self._loop_temp_depth.pop()
 
         # End block
         self.builder.position_at_end(end_block)
@@ -6751,6 +6898,7 @@ class LLVMEmitter:
 
         self.loop_stack.append((incr_block, end_block))
         self._loop_drop_depth.append(len(self.drop_scope_stack))
+        self._loop_temp_depth.append(len(self._temp_frames))
         self.builder.branch(cond_block)
 
         prev_param = self.params.get(stmt.var)
@@ -6816,6 +6964,7 @@ class LLVMEmitter:
 
         self.loop_stack.pop()
         self._loop_drop_depth.pop()
+        self._loop_temp_depth.pop()
         if prev_param is None:
             self.params.pop(stmt.var, None)
         else:
@@ -7125,6 +7274,13 @@ class LLVMEmitter:
             pre = self._assert_operands.get(id(expr))
             if pre is not None:
                 return pre
+        val = self._emit_expr_core(expr)
+        if getattr(expr, 'drop_temp', None) is not None:
+            self._own_temporary(expr, val)
+        return val
+
+    def _emit_expr_core(self, expr: rast.Expr) -> ir.Value:
+        """Emit an expression (_emit_expr, before temporaries)."""
         if isinstance(expr, rast.IntLit):
             return ir.Constant(self.i64, expr.value)
 
@@ -8984,6 +9140,9 @@ class LLVMEmitter:
         saved_params = self.params.copy()
         saved_ritz_types = self.ritz_types.copy()
         saved_has_returned = self.has_returned
+        # The closure's temporaries are its own (AGAST #2161).
+        saved_temp_frames = self._temp_frames
+        self._temp_frames = []
 
         # Set up new function context
         self.current_fn = fn
@@ -9049,6 +9208,7 @@ class LLVMEmitter:
         self.params = saved_params
         self.ritz_types = saved_ritz_types
         self.has_returned = saved_has_returned
+        self._temp_frames = saved_temp_frames
 
         # If there are no captures, return the function pointer directly
         if not captures:

@@ -593,3 +593,99 @@ fn main() -> i32
         assert getattr(call.args[0], 'moves_binding', False) is True
         n_init = main.body.stmts[1].value
         assert not getattr(n_init.expr, 'moves_binding', False)
+
+
+class TestLoopsMatchesTemporaries:
+    """AGAST #2161: loop bodies see the previous iteration's moves, match
+    arms start from the same state, and unowned move-only values are
+    marked as temporaries for the emitter to drop."""
+
+    DEFS = """
+struct Res
+    h: i32
+
+enum Slot
+    Full(Res)
+    Empty
+
+fn make() -> Res
+    return Res { h: 1 }
+
+fn take(r: Res) -> i32
+    return 0
+
+impl Res
+    fn peek(self: @Res) -> i32
+        return self.h
+    fn into(self: Res) -> i32
+        return self.h
+""" + drop_impl("Res")
+
+    def test_move_in_loop_reported_once(self):
+        errs = check(self.DEFS + """
+fn main() -> i32
+    var r = make()
+    var i = 0
+    while i < 3
+        take(r)
+        i = i + 1
+    return 0
+""")
+        assert len(errs) == 1 and "use of moved value: `r`" in str(errs[0]), errs
+
+    def test_for_loop_move_rejected(self):
+        errs = check(self.DEFS + """
+fn main() -> i32
+    var r = make()
+    for i in 0..3
+        take(r)
+    return 0
+""")
+        assert len(errs) == 1 and "use of moved value: `r`" in str(errs[0]), errs
+
+    def test_match_arms_start_from_the_same_state(self):
+        errs = check(self.DEFS + """
+fn main() -> i32
+    var r = make()
+    var k = 1
+    match k
+        1 => take(r)
+        _ => take(r)
+    return 0
+""")
+        assert errs == []
+
+    def test_match_arm_that_breaks_takes_its_move_out_of_the_loop(self):
+        errs = check(self.DEFS + """
+fn main() -> i32
+    var r = make()
+    var i = 0
+    while i < 3
+        i = i + 1
+        match i
+            2 =>
+                take(r)
+                break
+            _ => 0
+    return 0
+""")
+        assert errs == []
+
+    def _main(self, body):
+        module = parse(self.DEFS + "fn main() -> i32\n" + body)
+        assert MoveChecker().check(module) == []
+        return next(i for i in module.items if getattr(i, 'name', None) == 'main')
+
+    def test_unowned_call_is_a_temporary(self):
+        main = self._main("    make()\n    var v = make()\n    return 0\n")
+        assert getattr(main.body.stmts[0].expr, 'drop_temp', None) is not None
+        assert getattr(main.body.stmts[1].value, 'drop_temp', None) is None
+
+    def test_variant_payload_is_owned_not_temporary(self):
+        main = self._main("    var s = Slot.Full(make())\n    return 0\n")
+        assert getattr(main.body.stmts[0].value.args[0], 'drop_temp', None) is None
+
+    def test_receiver_lent_or_moved(self):
+        main = self._main("    let a = make().peek()\n    let b = make().into()\n    return 0\n")
+        assert getattr(main.body.stmts[0].value.expr, 'drop_temp', None) is not None
+        assert getattr(main.body.stmts[1].value.expr, 'drop_temp', None) is None

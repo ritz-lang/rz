@@ -1965,9 +1965,49 @@ is dropped only on the paths where it still owns its value. Assigning to a
 moved-from binding drops nothing and makes the binding an owner again.
 
 A move-only type with no `Drop` impl of its own, such as a struct with a
-`Drop` field, is dropped by dropping each move-only field in declaration
-order. A type that has its own `drop` runs it first, then drops its
-move-only fields the same way.
+`Drop` field, is dropped by dropping its move-only parts:
+
+- a struct's move-only fields, in declaration order;
+- an enum's payload, for the variant the value holds. `Option<Resource>`
+  holding `Some(r)` drops `r`, and holding `None` drops nothing;
+- an array's elements, in index order;
+- a tuple's move-only elements, in order.
+
+A type that has its own `drop` runs it first, then drops its move-only parts
+the same way.
+
+A move-only value that no binding, parameter or field takes ownership of is
+a **temporary**. Examples are a call result used as a statement, one lent to
+an `@T` parameter, or one whose field is read (`make().id`). A temporary is
+dropped at the end of the statement that creates it. A `return` drops it
+after the return value has been evaluated. A temporary in an `if` or `while`
+condition is dropped once the condition has been evaluated, before the
+branch is taken.
+
+A binding moved inside a loop body must own a value again on every path
+back to the loop head: an assignment after the move does that, and so does
+leaving the loop with `break`. Otherwise the next iteration would use the
+moved value, so it is an error:
+
+```ritz expect-error="use of moved value: `r`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn main() -> i32
+    var r = Resource { handle: 3 }
+    var i = 0
+    while i < 2
+        consume(r)                  # error on the second iteration
+        i = i + 1
+    0
+```
 
 Never call `drop` yourself: the compiler's call would release the value a
 second time.
@@ -1988,11 +2028,11 @@ fn main() -> i32
     r.handle                        # r is dropped after this is evaluated
 ```
 
-ritz0 follows these rules (AGAST #2157), except that it doesn't yet drop enum
-payloads, arrays or tuples of move-only values, or temporaries (AGAST #2161).
-AGAST #2158 tracks ritz1. `ritz0/test_ownership_free_count.py` counts the drops
-for each rule on all three compilers, with today's gaps marked as expected
-failures.
+ritz0 follows these rules (AGAST #2157, #2161). ritz1 follows them (AGAST
+#2158) except for enum payloads, arrays, temporaries and moves inside loops
+(AGAST #2165), and it has no tuple literals yet (AGAST #1526).
+`ritz0/test_ownership_free_count.py` counts the drops for each rule on all
+three compilers, with today's gaps marked as expected failures.
 
 `defer` is reserved in the ritz1 grammar but is not implemented in ritz0:
 

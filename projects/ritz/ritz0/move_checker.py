@@ -162,6 +162,23 @@ class MoveTypes:
         # Pointers, references, fn types, SIMD vectors: copies.
         return False
 
+    def variant_value_type(self, expr: rast.Expr, is_binding) -> Optional[rast.Type]:
+        """The enum type of a qualified variant value, `E.V` or `E.V(...)`,
+        when `E` is a non-generic enum declaring `V` and not a binding
+        (`is_binding(name)`). None for anything else."""
+        if isinstance(expr, rast.Field):
+            base, name = expr.expr, expr.field
+        elif isinstance(expr, rast.MethodCall):
+            base, name = expr.expr, expr.method
+        else:
+            return None
+        if not isinstance(base, rast.Ident) or is_binding(base.name):
+            return None
+        ed = self.enums.get(base.name)
+        if ed is None or ed.type_params or not any(v.name == name for v in ed.variants):
+            return None
+        return rast.NamedType(expr.span, ed.name, [])
+
     def struct_fields(self, ty: rast.NamedType) -> List[Tuple[str, rast.Type]]:
         """The struct's fields with its type parameters replaced by `ty`'s args."""
         sd = self.structs.get(ty.name)
@@ -241,6 +258,9 @@ class MoveChecker:
         # Method name -> every impl's FnDef of that name.
         self.methods: Dict[str, List[rast.FnDef]] = {}
         self.types: Optional[MoveTypes] = None
+        # Per enclosing loop: the binding states at each `break` and
+        # `continue` (AGAST #2161, _check_loop).
+        self._loops: List[Dict[str, list]] = []
 
     def check(self, module: rast.Module) -> List[OwnershipError]:
         """Check ownership rules for a module.
@@ -275,6 +295,15 @@ class MoveChecker:
                 for m in item.methods:
                     self._check_fn(m)
 
+        # A loop body checked twice (_check_loop) reports its errors twice.
+        seen = set()
+        unique = []
+        for err in self.errors:
+            key = (str(err), id(err.span) if err.span is not None else None)
+            if key not in seen:
+                seen.add(key)
+                unique.append(err)
+        self.errors = unique
         return self.errors
 
     def _is_copy_type(self, ty: rast.Type) -> bool:
@@ -337,6 +366,12 @@ class MoveChecker:
                 inner = self._infer_expr_type(expr.elements[0])
                 return rast.ArrayType(expr.span, len(expr.elements), inner)
             return rast.NamedType(expr.span, 'unknown', [])
+        elif self.types.variant_value_type(
+                expr, lambda n: self.scope.lookup(n) is not None) is not None:
+            return self.types.variant_value_type(
+                expr, lambda n: self.scope.lookup(n) is not None)
+        elif isinstance(expr, rast.TupleLit):
+            return rast.TupleType(expr.span, [self._infer_expr_type(e) for e in expr.elements])
         elif isinstance(expr, rast.Call):
             # Look up function return type
             if isinstance(expr.func, rast.Ident):
@@ -509,24 +544,106 @@ class MoveChecker:
             return False
 
         elif isinstance(stmt, rast.WhileStmt):
-            self._check_expr(stmt.cond, is_move_context=False)
-            self._push_scope()
-            self._check_block(stmt.body)
-            self._pop_scope()
+            def iteration():
+                # The condition runs at the loop head, on every iteration.
+                self._check_expr(stmt.cond, is_move_context=False)
+                self._push_scope()
+                done = self._check_block(stmt.body)
+                self._pop_scope()
+                return done
+            self._check_loop(iteration)
             return False
 
         elif isinstance(stmt, rast.ForStmt):
-            self._push_scope()
-            # The iterator is moved into the loop
+            # The iterator is moved into the loop, once.
             self._check_expr(stmt.iter, is_move_context=True)
-            # Loop variable is defined fresh each iteration
-            # For range-based for loops, the variable is i64 (Copy type)
-            self.scope.define(stmt.var, rast.NamedType(stmt.span, 'i64', []), stmt.span)
-            self._check_block(stmt.body)
-            self._pop_scope()
+
+            def iteration():
+                self._push_scope()
+                # Loop variable is defined fresh each iteration
+                # For range-based for loops, the variable is i64 (Copy type)
+                self.scope.define(stmt.var, rast.NamedType(stmt.span, 'i64', []), stmt.span)
+                done = self._check_block(stmt.body)
+                self._pop_scope()
+                return done
+            self._check_loop(iteration)
             return False
 
+        elif isinstance(stmt, rast.BreakStmt):
+            self._note_loop_exit('breaks')
+            return True
+
+        elif isinstance(stmt, rast.ContinueStmt):
+            self._note_loop_exit('continues')
+            return True
+
         return False
+
+    # ---- loops (AGAST #2161) ------------------------------------------------
+    #
+    # A loop body runs again with whatever the previous iteration left, so a
+    # binding declared outside the loop and moved inside it is moved at the
+    # loop head unless every path back there assigned it again. The body is
+    # checked once with the entry state and, while that grows the set of
+    # moved bindings at the head, again with the merged head state. Paths
+    # that `break` don't reach the head; they join the state after the loop.
+
+    def _snapshot(self) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span]]]:
+        """Every visible binding's state, keyed by binding (not name, so a
+        shadowing binding in an inner scope can't stand in for an outer one)."""
+        out: Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span]]] = {}
+        scope = self.scope
+        while scope:
+            for info in scope.vars.values():
+                out.setdefault(id(info), (info, info.state, info.move_span))
+            scope = scope.parent
+        return out
+
+    def _restore(self, snap) -> None:
+        for info, state, span in snap.values():
+            info.state = state
+            info.move_span = span
+
+    @staticmethod
+    def _join(paths) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span]]]:
+        """Where `paths` meet: each binding of the first path, moved if it is
+        moved on any of them, else in the first path's state."""
+        out = dict(paths[0])
+        for key, (info, state, span) in paths[0].items():
+            for p in paths:
+                got = p.get(key)
+                if got is not None and got[1] == VarState.MOVED:
+                    out[key] = (info, VarState.MOVED, got[2])
+                    break
+        return out
+
+    @staticmethod
+    def _moved_keys(snap) -> Set[int]:
+        return {k for k, (_i, st, _s) in snap.items() if st == VarState.MOVED}
+
+    def _note_loop_exit(self, kind: str) -> None:
+        if self._loops:
+            self._loops[-1][kind].append(self._snapshot())
+
+    def _check_loop(self, iteration) -> None:
+        """Check a loop whose one iteration `iteration()` checks (returning
+        True if the body never falls through to the loop head)."""
+        head = self._snapshot()
+        for _ in range(8):           # moves only grow; 8 passes is plenty
+            self._restore(head)
+            frame = {'breaks': [], 'continues': []}
+            self._loops.append(frame)
+            done = iteration()
+            self._loops.pop()
+            back = list(frame['continues'])
+            if not done:
+                back.append(self._snapshot())
+            new_head = self._join([head] + back)
+            if self._moved_keys(new_head) == self._moved_keys(head):
+                break
+            head = new_head
+        # Leaving: the condition failed at the head, or a `break`.
+        self._restore(self._join([head] + frame['breaks']))
 
     def _check_expr(self, expr: rast.Expr, is_move_context: bool = False):
         """Check an expression for ownership violations.
@@ -601,15 +718,23 @@ class MoveChecker:
             # Release borrows that were created for this call
             # (borrows don't outlive the call unless stored somewhere)
             self._restore_borrow_states(borrow_states_before)
+            self._mark_temporary(expr, is_move_context)
 
         elif isinstance(expr, rast.MethodCall):
             # The receiver is borrowed (auto-ref), not moved. An argument
             # moves when every method of that name takes it by value.
             self._check_expr(expr.expr, is_move_context=False)
+            if not self._method_lends_self(expr):
+                # A temporary receiver taken by value is moved, not dropped.
+                self._unmark_temporary(expr.expr)
             borrow_states_before = self._save_borrow_states()
+            # `E.V(args)` builds a variant, which owns its payload.
+            is_variant = self.types.variant_value_type(
+                expr, lambda n: self.scope.lookup(n) is not None) is not None
             for i, arg in enumerate(expr.args):
-                self._check_expr(arg, is_move_context=self._method_arg_moves(expr, i))
+                self._check_expr(arg, is_move_context=is_variant or self._method_arg_moves(expr, i))
             self._restore_borrow_states(borrow_states_before)
+            self._mark_temporary(expr, is_move_context)
 
         elif isinstance(expr, rast.Grouped):
             self._check_expr(expr.expr, is_move_context=is_move_context)
@@ -617,6 +742,10 @@ class MoveChecker:
         elif isinstance(expr, rast.Field):
             # Field access doesn't move the struct (unless the result is moved)
             self._check_expr(expr.expr, is_move_context=False)
+            if is_move_context and self._is_move_only_field(expr):
+                # Moving a move-only field out of a temporary: the rest of
+                # the temporary isn't dropped either (no partial drops).
+                self._unmark_temporary(expr.expr)
 
         elif isinstance(expr, rast.Index):
             self._check_expr(expr.expr, is_move_context=False)
@@ -625,15 +754,41 @@ class MoveChecker:
         elif isinstance(expr, rast.StructLit):
             for _name, value in expr.fields:
                 self._check_expr(value, is_move_context=True)
+            self._mark_temporary(expr, is_move_context)
 
         elif isinstance(expr, rast.Match):
             self._check_expr(expr.expr, is_move_context=True)
+            # Each arm starts from the state before the match. After it, a
+            # binding is moved if an arm that falls through moved it; an arm
+            # that leaves (`break`, `return`, ...) took its moves with it.
+            before = self._snapshot()
+            outs = []
             for arm in expr.arms:
+                self._restore(before)
                 self._push_scope()
                 # Pattern bindings
                 self._check_pattern(arm.pattern)
-                self._check_expr(arm.body, is_move_context=is_move_context)
+                if isinstance(arm.body, rast.Block):
+                    left = self._check_block(arm.body)
+                else:
+                    self._check_expr(arm.body, is_move_context=is_move_context)
+                    left = isinstance(arm.body, (rast.BreakExpr, rast.ContinueExpr,
+                                                 rast.ReturnExpr))
                 self._pop_scope()
+                if not left:
+                    outs.append(self._snapshot())
+            if outs:
+                self._restore(self._join(outs))
+
+        elif isinstance(expr, rast.BreakExpr):
+            self._note_loop_exit('breaks')
+
+        elif isinstance(expr, rast.ContinueExpr):
+            self._note_loop_exit('continues')
+
+        elif isinstance(expr, rast.ReturnExpr):
+            if expr.value is not None:
+                self._check_expr(expr.value, is_move_context=True)
 
         elif isinstance(expr, rast.TryOp):
             self._check_expr(expr.expr, is_move_context=is_move_context)
@@ -713,6 +868,45 @@ class MoveChecker:
         elif isinstance(expr, (rast.IntLit, rast.FloatLit, rast.StringLit,
                                rast.CStringLit, rast.BoolLit, rast.CharLit)):
             pass
+
+    # ---- temporaries (AGAST #2161) -------------------------------------------
+
+    def _mark_temporary(self, expr: rast.Expr, is_move_context: bool) -> None:
+        """A move-only value built by a call or literal that nothing takes
+        ownership of is a temporary: `expr.drop_temp` (its type) tells the
+        emitter to drop it at the end of its statement (§13.6)."""
+        if is_move_context:
+            return
+        ty = self._infer_expr_type(expr)
+        if self.types.is_move_only(ty):
+            expr.drop_temp = ty
+
+    @staticmethod
+    def _unmark_temporary(expr: rast.Expr) -> None:
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        if getattr(expr, 'drop_temp', None) is not None:
+            expr.drop_temp = None
+
+    def _is_move_only_field(self, expr: rast.Field) -> bool:
+        base = self._infer_expr_type(expr.expr)
+        while isinstance(base, (rast.PtrType, rast.RefType)):
+            base = base.inner
+        if not isinstance(base, rast.NamedType):
+            return False
+        return any(n == expr.field and self.types.is_move_only(t)
+                   for n, t in self.types.struct_fields(base))
+
+    def _method_lends_self(self, call: rast.MethodCall) -> bool:
+        """Does every method named like `call` borrow its receiver?"""
+        cands = self.methods.get(call.method)
+        if not cands:
+            return False
+        for m in cands:
+            params = list(m.params)
+            if not params or params[0].name != 'self' or not _is_lending_param(params[0]):
+                return False
+        return True
 
     def _method_arg_moves(self, call: rast.MethodCall, i: int) -> bool:
         """Does argument `i` of `call` move? Only if every same-named method
