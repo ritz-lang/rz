@@ -147,11 +147,52 @@ pub fn main() -> i32
         return (C as i32) - 62
     return 1
 """,
+    # An array type sized by a const (AGAST #2153): ritz1 parsed only a
+    # NUMBER there, so `[N]i32` killed the whole item.
+    "used_as_array_size": """\
+const N: i32 = 2 + 1
+
+pub fn main() -> i32
+    var a: [N]i32
+    a[N - 1] = 3
+    return a[2]
+""",
+    "literal_const_array_size": """\
+const N: i32 = 3
+
+pub fn main() -> i32
+    var a: [N]i32
+    a[N - 1] = 3
+    return a[2]
+""",
+    # sizeof checks the folded length, not just that the type parsed.
+    "const_expr_array_size": """\
+const N: i32 = 2
+
+pub fn main() -> i32
+    var a: [N * 2 - 1]i32
+    a[2] = 3
+    if sizeof(a) != 12
+        return 1
+    return a[2]
+""",
+    "const_sized_nd_array_and_field": """\
+const R: i32 = 2
+const C: i32 = R + 1
+
+struct Grid
+    cells: [C]i32
+
+pub fn main() -> i32
+    var m: [R][C]i32
+    m[R - 1][C - 1] = 2
+    var g: Grid
+    g.cells[C - 1] = 1
+    return m[1][2] + g.cells[2]
+""",
 }
 
 # Run through ritz0 only, each for a ritz1 gap of its own:
-# * used_as_array_size: ritz1 cannot parse an array type sized by a named
-#   const, even a literal one (AGAST #2153);
 # * wraps_to_width: ritz1 uses the folded value unwrapped (AGAST #2154);
 # * float_from_negative_int: ritz1 emits invalid IR (AGAST #2155). It went
 #   through ritz0's old `-literal` path and must still compile.
@@ -171,14 +212,6 @@ pub fn main() -> i32
     if M == 44
         return 3
     return 1
-""",
-    "used_as_array_size": """\
-const N: i32 = 2 + 1
-
-pub fn main() -> i32
-    var a: [N]i32
-    a[N - 1] = 3
-    return a[2]
 """,
 }
 
@@ -333,3 +366,56 @@ def test_ritz0_folded_const_is_wrapped_in_ir(tmp_path):
     ir_text = ll.read_text()
     assert "i8 300" not in ir_text
     assert "i8 44" in ir_text
+
+
+# Array lengths ritz1 cannot fold at parse time (AGAST #2153): a located error
+# at the `[`, never a silently zero-length array.  (line, col) of the `[`.
+RITZ1_UNFOLDABLE_ARRAY_SIZE = {
+    "unknown_ident": (
+        """\
+pub fn main() -> i32
+    var a: [NOPE]i32
+    return 0
+""",
+        2, 12,
+    ),
+    "call": (
+        """\
+fn five() -> i32
+    return 5
+
+pub fn main() -> i32
+    var a: [five()]i32
+    return 0
+""",
+        5, 12,
+    ),
+    "negative": (
+        """\
+const N: i32 = 0 - 2
+
+pub fn main() -> i32
+    var a: [N]i32
+    return 0
+""",
+        4, 12,
+    ),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("name", sorted(RITZ1_UNFOLDABLE_ARRAY_SIZE))
+def test_ritz1_rejects_unfoldable_array_size(request, tmp_path, compiler, name):
+    request.getfixturevalue("ritz1_bin")
+    program, line, col = RITZ1_UNFOLDABLE_ARRAY_SIZE[name]
+    src = tmp_path / "main.ritz"
+    src.write_text(program)
+    ll = tmp_path / "main.ll"
+    comp = _compile(compiler, src, ll, tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {name!r}:\n{out[-1000:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {name!r}"
+    hits = re.findall(rf"main\.ritz:{line}:{col}: array length ", out)
+    # Once, though the backtracking parser runs the action on every retry.
+    assert len(hits) == 1, out[-2000:]

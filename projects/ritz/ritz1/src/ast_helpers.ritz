@@ -272,6 +272,8 @@ pub fn parser_reset_diagnostics()
     g_dropped_items = 0
     g_attr_errors = 0
     g_attr_last_err = null
+    g_array_len_line = -1
+    g_array_len_col = -1
 
 pub fn parser_dropped_items() -> i32
     g_dropped_items
@@ -1864,6 +1866,47 @@ pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i
     for i in 0..size_len
         let digit: i32 = (*(size_str + i)) as i32 - 48  # '0' = 48
         size = size * 10 + digit
+    type_array_sized(p, size, elem_type)
+
+# AGAST #2153: `[N]T` / `[N * 2]T` — the length is a constant integer
+# expression, folded now against the consts parsed so far.  Imports are merged
+# only after parsing, so a const from an import, or one declared later in this
+# file, does not fold here: that is a located error (the item still parses, so
+# the message is the one the user sees), not a silently wrong length.
+pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem_type: i32) -> i32
+    var v: i64 = 0
+    if const_fold_int(p.module.constants, len_expr, 0, @v) == 0
+        array_len_report(line, col, c"is not a constant integer expression ritz1 can fold here (only literals and consts declared earlier in this file)")
+        v = 0
+    else if v < 0 or v > 2147483647
+        array_len_report(line, col, c"is out of range (it must be 0 to 2147483647)")
+        v = 0
+    type_array_sized(p, v as i32, elem_type)
+
+# The backtracking parser re-runs an action each time it retries the
+# alternative: report each `[` once, as nd_array_report does.
+var g_array_len_line: i32 = -1
+var g_array_len_col: i32 = -1
+
+fn array_len_report(line: i32, col: i32, why: *u8)
+    if line == g_array_len_line and col == g_array_len_col
+        return
+    g_array_len_line = line
+    g_array_len_col = col
+    g_attr_errors = g_attr_errors + 1
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": array length ")
+    eprintln_cstr(why)
+
+fn type_array_sized(p: *Parser, size: i32, elem_type: i32) -> i32
     # AGAST #1509: `[size]<array>` is multi-dimensional.  The inner array's
     # info is still in p.last_array_* (type_spec is right-recursive, so the
     # inner `[M]T` action ran just before this one): prepend `size` to its
