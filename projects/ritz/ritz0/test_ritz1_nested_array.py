@@ -553,6 +553,57 @@ pub fn main() -> i32
         return 1
     return a.m[1][2] + ap[1].m[0][1] + h.pp[1].m[1][0] + 7
 """,
+    # AGAST #2166: `(*gp).f` with a module-level `var gp: *M`.  ritz1
+    # resolved the field type (#2152) but emit_member_ptr could not address
+    # it: "unhandled EXPR_MEMBER" on both read and assign.  The scalar
+    # repro, an N-D field element, a compound assign, a nested
+    # `(*(*gp).nx).t` base, and a local `gp` shadowing the global (its
+    # writes must not land in the global's target).
+    "global_ptr_deref_scalar": """\
+struct M
+    t: i32
+    u: i32
+
+var gp: *M
+
+pub fn main() -> i32
+    var a: M
+    a.u = 7
+    gp = @a
+    (*gp).t = 40
+    if a.u != 7 or a.t != 40
+        return 1
+    return (*gp).t + 2
+""",
+    "global_ptr_deref_field": """\
+struct M
+    t: i32
+    m: [2][3]i32
+    nx: *M
+
+var gp: *M
+
+fn shadow(gp: *M) -> i32
+    (*gp).t = 5
+    return (*gp).t
+
+pub fn main() -> i32
+    var a: M
+    var b: M
+    a.nx = @b
+    b.t = 1
+    gp = @a
+    (*gp).m[1][2] = 20
+    (*gp).m[1][1] = 3
+    (*gp).m[1][2] += 10
+    (*gp).t = 2
+    (*(*gp).nx).t = 4
+    if a.m[1][2] != 30 or a.m[1][1] != 3 or a.t != 2 or b.t != 4
+        return 1
+    if shadow(@b) != 5 or a.t != 2 or b.t != 5
+        return 2
+    return (*gp).m[1][2] + (*gp).m[1][1] + (*gp).t + (*(*gp).nx).t + 2
+""",
     # sizeof over an element, a row and the whole N-D field through every
     # base shape: 4 + 12 + 4 + 4 + 12 + 6 = 42.
     "field_elem_sizeof": """\
@@ -763,22 +814,6 @@ pub fn main() -> i32
     g[1][1] = q
     return 0
 """, ":8:", "assigning a row or a whole struct element"),
-    # AGAST #2152: `(*gp).m[i][j]` over a global `*M` resolves, but
-    # emit_member_ptr cannot address any `(*gp).f` yet (#2166), so it
-    # is a located error rather than the old unlocated "not lowered" one.
-    "global_ptr_deref_field": ("""\
-struct M
-    t: i32
-    m: [2][3]i32
-
-var gp: *M
-
-pub fn main() -> i32
-    var a: M
-    gp = @a
-    (*gp).m[1][2] = 40
-    return 0
-""", ":10:", "cannot address the multi-dimensional array field"),
     "whole_array_use": ("""\
 fn take(a: i64) -> i32
     return 0
