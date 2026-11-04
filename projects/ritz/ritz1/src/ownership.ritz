@@ -69,6 +69,11 @@
 # is moved if an arm that falls through moved it (own_arms_*), `shadow`
 # included.
 #
+# Match scrutinees (AGAST #2174).  A match (statement or expression) moves
+# its scrutinee and owns it; a payload binding (`Full(t)`) owns the payload
+# for its arm (see own_match_begin).  ritz0 moves the scrutinee too but
+# doesn't track payload bindings yet (AGAST #2177).
+#
 # A fn without move-only bindings, in a module without `impl Drop`, emits
 # nothing extra.
 #
@@ -140,6 +145,7 @@ pub fn own_init(s: *EmitterState)
     o.fm_loc = malloc((OWN_INIT_CAP * 16) as i64) as *i32
     o.fm_count = 0
     o.fm_cap = OWN_INIT_CAP
+    o.match_scrut = 0 - 1
     s.own = o
 
 fn own_live_at(o: *OwnState, i: i32) -> *OwnBinding
@@ -1172,6 +1178,7 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     o.loop_depth = 0
     o.last_pop_dead = 0
     o.fm_count = 0
+    o.match_scrut = 0 - 1
     own_push_scope(s)
     var p: *Param = params
     while p != null
@@ -1667,6 +1674,10 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
         own_walk(s, stmt.return_value, 1)
     else if k == STMT_EXPR
         own_walk(s, stmt.expr, 0)
+    else if k == STMT_MATCH
+        # AGAST #2174: the scrutinee moves into the match, as in the
+        # expression form and ritz0 (own_match_begin takes ownership).
+        own_walk(s, stmt.if_cond as *Expr, 1)
     else if k == STMT_IF or k == STMT_ASSERT
         own_walk(s, stmt.if_cond, 0)
     else if k == STMT_WHILE
@@ -1915,6 +1926,105 @@ pub fn own_arms_end(s: *EmitterState, before: *i32, acc: *i32)
         free(acc as *u8)
     if before != null
         free(before as *u8)
+
+# Match scrutinees (AGAST #2174).  A match moves its scrutinee (ritz0's
+# rule), so the match owns that value: emit_match spills it, and
+# own_match_begin registers the spill as a nameless binding in a scope of
+# its own.  An arm whose pattern binds a move-only payload (`Full(t)`)
+# hands it to the binding (own_match_payload: the binding is owned and
+# drops at the arm's end unless moved; the scrutinee's flag is cleared on
+# that path); any other arm leaves it to the scrutinee, which
+# own_match_end drops after the arms meet.  A borrowed scrutinee (`match
+# @s`), or one read through a pointer, moves nothing and owns nothing.
+
+# 1 when the move check just moved `e`, a match scrutinee, by value.
+fn own_scrutinee_moved(s: *EmitterState, e: *Expr) -> i32
+    if own_checking(s) == 0
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        let b: *OwnBinding = own_lookup(s, e.ident_ptr, e.ident_len)
+        if b != null and b.count == 0 and b.moved == 1
+            return 1
+        return 0
+    if k == EXPR_CALL
+        var len: i32 = 0
+        if own_call_ret_type(s, e, @len) != null
+            return 1
+        return 0
+    if k == EXPR_MEMBER
+        var b: *OwnBinding = null
+        var top: i32 = 0 - 1
+        var dn: *u8 = null
+        var dl: i32 = 0
+        let f: *StructField = own_member_path(s, e, @b, @top, @dn, @dl)
+        if f != null and dn == null and own_field_move_only(s, f, 0) == 1
+            return 1
+    0
+
+# Before a match's arms: `slot` holds the spilled scrutinee `e` of enum
+# type `name`.  Returns the state for own_match_end.
+pub fn own_match_begin(s: *EmitterState, e: *Expr, slot: i32, name: *u8, len: i32) -> i32
+    let o: *OwnState = s.own
+    let old: i32 = o.match_scrut
+    o.match_scrut = 0 - 1
+    if e == null or slot == 0 or name == null or len <= 0
+        return old
+    if own_type_is_move_only(s, name, len) == 0 or own_scrutinee_moved(s, e) == 0
+        return old
+    own_push_scope(s)
+    let flag: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, flag)
+    emit_str(s, c" = alloca i1  ; drop flag (match scrutinee)\n")
+    own_grow_live(o)
+    let b: *OwnBinding = own_live_at(o, o.live_count)
+    b.name = null
+    b.name_len = 0
+    b.local_idx = 0 - 1
+    b.slot = slot
+    b.flag = flag
+    b.type_name = name
+    b.type_name_len = len
+    b.moved = 0
+    b.move_line = 0
+    b.move_col = 0
+    b.count = 0
+    b.shadow = 0
+    b.fmask = 0
+    b.fmoved = 0
+    b.fshadow = 0
+    b.aux = 0
+    o.match_scrut = o.live_count
+    o.live_count = o.live_count + 1
+    # In `all` too, so a `return` in an arm drops it.
+    own_grow_all(o)
+    own_copy_binding(own_all_at(o, o.all_count), b)
+    o.all_count = o.all_count + 1
+    own_store_flag(s, b, 1)
+    old
+
+# An arm bound the local `name` to a copy of the payload: when the match
+# owns its scrutinee and the payload is move-only, the binding owns it now.
+pub fn own_match_payload(s: *EmitterState, name: *u8, len: i32)
+    let o: *OwnState = s.own
+    if o.match_scrut < 0
+        return
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx < 0
+        return
+    let n: i32 = o.live_count
+    own_register(s, idx, 1)
+    if o.live_count > n
+        own_store_flag(s, own_live_at(o, o.match_scrut), 0)
+
+# After the arms have met (and the result phi is emitted): drop the
+# scrutinee where no arm took it, and restore the enclosing match's state.
+pub fn own_match_end(s: *EmitterState, old: i32)
+    let o: *OwnState = s.own
+    if o.match_scrut >= 0
+        own_pop_scope(s)
+    o.match_scrut = old
 
 # STMT_IF, after both arms: settle the move state per ritz0.
 pub fn own_if_merge(s: *EmitterState, before: *i32, after_then: *i32, then_dead: i32, has_else: i32, else_dead: i32)
