@@ -96,6 +96,8 @@ _RITZ1_TWINS = {
         "AGAST #1624 — `alias::item` calls, removed from the spec; ritz0 is the outlier",
     "test_asm":
         "AGAST #1619 — inline `asm x86_64:` blocks unsupported in ritz1",
+    "test_issue_usize_struct_field":
+        "AGAST #2198 — a `usize` struct field emits `store %usize` (invalid IR)",
     # --- codegen, runtime failures ---
 }
 

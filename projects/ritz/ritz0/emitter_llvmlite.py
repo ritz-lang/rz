@@ -950,6 +950,8 @@ class LLVMEmitter:
                 'u16': self.i16,
                 'u32': self.i32,
                 'u64': self.i64,
+                'isize': self.i64,
+                'usize': self.i64,
                 'bool': self.i1,
                 'f32': self.f32,
                 'f64': self.f64,

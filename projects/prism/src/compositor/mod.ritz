@@ -2,13 +2,16 @@
 #
 # Core compositing functionality.
 
+import ritzlib.gvec { Vec, vec_new }
 pub import compositor.window { Window, WindowState, compare_z_order }
 pub import compositor.damage { DamageTracker, DamageRegion }
 # pub import compositor.scheduler { ScanlineScheduler }  # Future
 # pub import compositor.renderer { Renderer }  # Future
 
-import types { Rect, Color, WindowId, IdGenerator }
-import backend.mock { MockBackend }
+import types.rect { Rect }
+import types.color { Color }
+import types.id { WindowId, IdGenerator }
+import backend.mock { MockBackend, min3_i32, max3_i32 }
 import protocol.command { RenderCommand, FillRectCmd, StrokeRectCmd, DrawLineCmd, FillTriangleCmd }
 
 # The main compositor
@@ -30,7 +33,7 @@ pub struct Compositor
 impl Compositor
     pub fn new(width: u32, height: u32) -> Compositor
         Compositor {
-            windows: Vec<Window>.new(),
+            windows: vec_new<Window>(),
             id_gen: IdGenerator.new(),
             focused_window: 0,
             damage: DamageTracker.new(width, height),
@@ -67,8 +70,12 @@ impl Compositor
                 # Damage the area before removing
                 self.damage.add_damage(self.windows[i].bounds(), 0)
 
-                # Remove from list
-                self.windows.remove(i)
+                # Remove from list, keeping the remaining windows in z-order
+                var j = i + 1
+                while j < self.windows.len()
+                    self.windows[j - 1] = self.windows[j]
+                    j += 1
+                self.windows.pop()
 
                 # Clear focus if this was the focused window
                 if self.focused_window == id.raw()
@@ -81,9 +88,11 @@ impl Compositor
         self.windows.len()
 
     pub fn get_window(self:&, id: WindowId) -> Option<@&Window>
-        for window in self.windows
-            if window.id.raw() == id.raw()
-                return Some(@&window)
+        var i: u64 = 0
+        while i < self.windows.len()
+            if self.windows[i].id.raw() == id.raw()
+                return Some(@&self.windows[i])
+            i += 1
         None
 
     # --- Focus ---
@@ -91,17 +100,21 @@ impl Compositor
     pub fn focus_window(self:&, id: WindowId)
         # Unfocus previous
         if self.focused_window != 0
-            for window in self.windows
-                if window.id.raw() == self.focused_window
-                    window.set_state(WindowState.Normal)
-                    window.mark_dirty_all()
+            var i: u64 = 0
+            while i < self.windows.len()
+                if self.windows[i].id.raw() == self.focused_window
+                    self.windows[i].set_state(WindowState.Normal)
+                    self.windows[i].mark_dirty_all()
+                i += 1
 
         # Focus new
         self.focused_window = id.raw()
-        for window in self.windows
-            if window.id.raw() == id.raw()
-                window.set_state(WindowState.Focused)
-                window.mark_dirty_all()
+        var j: u64 = 0
+        while j < self.windows.len()
+            if self.windows[j].id.raw() == id.raw()
+                self.windows[j].set_state(WindowState.Focused)
+                self.windows[j].mark_dirty_all()
+            j += 1
 
     pub fn focused_window_id(self) -> Option<WindowId>
         if self.focused_window == 0
@@ -127,9 +140,11 @@ impl Compositor
                 self.handle_fill_triangle(window_id, tri_cmd)
 
             RenderCommand.Invalidate(inv_cmd) =>
-                for window in self.windows
-                    if window.id.raw() == window_id.raw()
-                        window.mark_dirty(inv_cmd.region)
+                var i: u64 = 0
+                while i < self.windows.len()
+                    if self.windows[i].id.raw() == window_id.raw()
+                        self.windows[i].mark_dirty(inv_cmd.region)
+                    i += 1
 
             RenderCommand.Nop =>
                 # Do nothing
@@ -210,10 +225,10 @@ impl Compositor
         self.backend.draw_line(x0, y0, x1, y1, cmd.color, cmd.width)
 
         # Calculate damage rect (bounding box of line)
-        let min_x = if x0 < x1 { x0 } else { x1 }
-        let min_y = if y0 < y1 { y0 } else { y1 }
-        let max_x = if x0 > x1 { x0 } else { x1 }
-        let max_y = if y0 > y1 { y0 } else { y1 }
+        let min_x = if x0 < x1 then x0 else x1
+        let min_y = if y0 < y1 then y0 else y1
+        let max_x = if x0 > x1 then x0 else x1
+        let max_y = if y0 > y1 then y0 else y1
         let half_width = (cmd.width / 2) as i32
 
         let damage_rect = Rect.new(
@@ -276,6 +291,9 @@ impl Compositor
                     let screen_rect = region.offset(bounds.x, bounds.y)
                     self.damage.add_damage(screen_rect, window.id.raw())
 
+        # Every call is a frame, whether or not it had anything to present
+        self.frame_count += 1
+
         # If no damage, nothing to do
         if not self.damage.has_damage()
             return
@@ -289,10 +307,10 @@ impl Compositor
 
         # Clear damage for next frame
         self.damage.clear()
-        for window in self.windows
-            window.clear_dirty()
-
-        self.frame_count += 1
+        var i: u64 = 0
+        while i < self.windows.len()
+            self.windows[i].clear_dirty()
+            i += 1
 
     # Simple bubble sort by z-order (good enough for small window counts)
     fn sort_windows_by_z(self:&)
@@ -322,12 +340,3 @@ impl Compositor
 
     pub fn damage_tracker(self:&) -> @&DamageTracker
         @&self.damage
-
-# Helper functions for min/max of 3 values
-fn min3_i32(a: i32, b: i32, c: i32) -> i32
-    let ab = if a < b { a } else { b }
-    if ab < c { ab } else { c }
-
-fn max3_i32(a: i32, b: i32, c: i32) -> i32
-    let ab = if a > b { a } else { b }
-    if ab > c { ab } else { c }
