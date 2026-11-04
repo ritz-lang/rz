@@ -114,22 +114,21 @@ fn main() -> i32
 
 ## Status
 
-**Not "design phase" — it is implemented and compiles.** This README described
-nexus as design-only while the project had 16 source files and a green build.
+**Not "design phase" — it is implemented and compiles.**
 
-Measured 2026-09-12: `./rz build nexus` exits 0 against 6 dependencies,
-producing `build/debug/nexus`. 37 `[[test]]` markers across 4 test files.
+The binary is a Zeus worker (`nexus <shm_size> <worker_id>`), there is no `serve`
+subcommand, and invoking it by hand segfaults — see Installation above. It serves
+pages through `src/store.ritz`, which reaches mausoleum over Spire and falls back
+to in-memory with 3 seeded pages.
 
-`./rz test nexus` **exits 1**: `Σ 3 passed, 0 failed, 3 compile-failed` — three
-of the four test files fail to compile with
-`Import resolution failed: Cannot find module: services.wiki_service`. Real
-failures, not excused anywhere.
+`src/` also holds a layered application stack that the binary does **not** use
+yet: `repos/` (pages as Mausoleum documents, a Tome cache), `services/` and
+`presenters/`. `src/main.ritz` imports none of it, so `./rz build nexus` does not
+compile it; `./rz test nexus` does, and runs it against a real Mausoleum server.
 
-What is *not* done is the entry point. The binary is a Zeus worker
-(`nexus <shm_size> <worker_id>`), there is no `serve` subcommand, and invoking it
-by hand segfaults — see Installation above. Page CRUD, versioning and Markdown
-rendering exist in source; the store layer reaches mausoleum over Spire and falls
-back to in-memory with 3 seeded pages.
+Known limit of that stack: Mausoleum stores documents of at most 2 KB
+(`MAX_DOC_SIZE`), so a larger page is refused with a 500, well under the 1 MB
+`MAX_CONTENT_SIZE` that validation allows.
 
 It also does not build with the self-hosted compiler:
 `./rz clean nexus && ./rz build nexus --compiler ritz1` fails at exit 1 with

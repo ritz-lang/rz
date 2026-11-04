@@ -1,0 +1,383 @@
+# test/test_wiki_service.ritz - WikiService over a live Mausoleum (AGAST #1377)
+
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from, string_new, string_push, string_eq, string_as_view }
+import ritzlib.gvec { Vec, vec_len, vec_get }
+
+import models.wiki_page { WikiPage, wiki_page_new, wiki_page_drop }
+import errors.service_error { ServiceError }
+import repos.wiki_page_repo {
+    WikiPageRepository,
+    wiki_page_repo_new,
+    wiki_page_repo_connect,
+    wiki_page_repo_disconnect,
+    wiki_page_repo_get_by_slug,
+    wiki_page_repo_delete
+}
+import repos.page_cache {
+    PageCache,
+    page_cache_new,
+    page_cache_connect,
+    page_cache_disconnect,
+    page_cache_get
+}
+import services.wiki_service {
+    WikiService,
+    wiki_service_new,
+    wiki_service_get_page,
+    wiki_service_create_page,
+    wiki_service_update_content,
+    wiki_service_update_title,
+    wiki_service_delete_page,
+    wiki_service_page_exists,
+    wiki_service_list_pages,
+    wiki_service_get_children
+}
+import test.support.live_db { LiveDb, live_db_start, live_db_stop }
+
+
+# One test's world: a server, a repository, a cache and the service over them.
+struct World
+    db: LiveDb
+    repo: WikiPageRepository
+    cache: PageCache
+    svc: WikiService
+
+
+fn world_open(w: *World) -> i32
+    if live_db_start(@w.db) != 0
+        return 90
+    w.repo = wiki_page_repo_new()
+    match wiki_page_repo_connect(@w.repo, "127.0.0.1", w.db.port, false)
+        Ok(_) => 0
+        Err(_) => return 91
+    w.cache = page_cache_new()
+    match page_cache_connect(@w.cache, 4194304)
+        Ok(_) => 0
+        Err(_) => return 92
+    w.svc = wiki_service_new(@w.repo, @w.cache)
+    0
+
+
+fn world_close(w: *World)
+    page_cache_disconnect(@w.cache)
+    wiki_page_repo_disconnect(@w.repo)
+    live_db_stop(@w.db)
+
+
+fn create(w: *World, slug: StrView, content: StrView) -> i32
+    match wiki_service_create_page(@w.svc, slug, "Title", content)
+        Ok(_) => 0
+        Err(_) => 1
+
+
+fn expect_not_found(e: @ServiceError) -> i32
+    match *e
+        ServiceError.NotFound => 0
+        _ => 1
+
+
+fn check_create_and_get(w: *World) -> i32
+    if create(w, "home", "Welcome") != 0
+        return 1
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(page) =>
+            if not string_eq(@page.content, "Welcome")
+                return 2
+            if not string_eq(@page.title, "Title")
+                return 3
+            if page.version != 1
+                return 4
+            0
+        Err(_) => 5
+
+
+[[test]]
+fn test_created_page_can_be_read_back() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_create_and_get(@w)
+    world_close(@w)
+    rc
+
+
+fn check_duplicate(w: *World) -> i32
+    if create(w, "home", "first") != 0
+        return 1
+    match wiki_service_create_page(@w.svc, "home", "Title", "second")
+        Ok(_) => return 2
+        Err(e) =>
+            match e
+                ServiceError.AlreadyExists => 0
+                _ => return 3
+    # The first page must survive the refused create.
+    match wiki_page_repo_get_by_slug(@w.repo, "home")
+        Ok(page) => if string_eq(@page.content, "first") then 0 else 4
+        Err(_) => 5
+
+
+[[test]]
+fn test_duplicate_create_is_refused() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_duplicate(@w)
+    world_close(@w)
+    rc
+
+
+fn check_validation(w: *World) -> i32
+    match wiki_service_create_page(@w.svc, "bad slug", "Title", "x")
+        Ok(_) => return 1
+        Err(e) =>
+            match e
+                ServiceError.InvalidSlug(_) => 0
+                _ => return 2
+    match wiki_service_create_page(@w.svc, "home", "", "x")
+        Ok(_) => return 3
+        Err(e) =>
+            match e
+                ServiceError.InvalidTitle => 0
+                _ => return 4
+    # Nothing reached the database.
+    match wiki_service_list_pages(@w.svc)
+        Ok(pages) => if vec_len<WikiPage>(@pages) == 0 then 0 else 5
+        Err(_) => 6
+
+
+[[test]]
+fn test_create_validates_before_writing() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_validation(@w)
+    world_close(@w)
+    rc
+
+
+fn check_cache_aside(w: *World) -> i32
+    if create(w, "home", "cached") != 0
+        return 1
+    # Remove it behind the service's back: only the cache can answer now.
+    match wiki_page_repo_get_by_slug(@w.repo, "home")
+        Ok(page) =>
+            match wiki_page_repo_delete(@w.repo, page.id)
+                Ok(_) => 0
+                Err(_) => return 2
+        Err(_) => return 3
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(page) => if string_eq(@page.content, "cached") then 0 else 4
+        Err(_) => 5
+
+
+[[test]]
+fn test_reads_are_served_from_the_cache() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_cache_aside(@w)
+    world_close(@w)
+    rc
+
+
+fn check_fill_on_miss(w: *World) -> i32
+    if create(w, "home", "body") != 0
+        return 1
+    # An update invalidates, so the next read must miss, load and refill.
+    match wiki_service_update_content(@w.svc, "home", "body 2")
+        Ok(_) => 0
+        Err(_) => return 2
+    if page_cache_get(@w.cache, "home").is_some()
+        return 3
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(_) => 0
+        Err(_) => return 4
+    if page_cache_get(@w.cache, "home").is_none()
+        return 5
+    0
+
+
+[[test]]
+fn test_a_miss_fills_the_cache() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_fill_on_miss(@w)
+    world_close(@w)
+    rc
+
+
+fn check_update_content(w: *World) -> i32
+    if create(w, "home", "old") != 0
+        return 1
+    # Warm the cache with the old content.
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(_) => 0
+        Err(_) => return 2
+    match wiki_service_update_content(@w.svc, "home", "new")
+        Ok(page) =>
+            if page.version != 2
+                return 3
+        Err(_) => return 4
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(page) =>
+            if not string_eq(@page.content, "new")
+                return 5
+            if page.version != 2
+                return 6
+            0
+        Err(_) => 7
+
+
+[[test]]
+fn test_update_content_bumps_version_and_is_visible_at_once() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_update_content(@w)
+    world_close(@w)
+    rc
+
+
+fn check_update_title(w: *World) -> i32
+    if create(w, "home", "body") != 0
+        return 1
+    match wiki_service_update_title(@w.svc, "home", "New Title")
+        Ok(_) => 0
+        Err(_) => return 2
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(page) =>
+            if not string_eq(@page.title, "New Title")
+                return 3
+            if not string_eq(@page.content, "body")
+                return 4
+            0
+        Err(_) => 5
+
+
+[[test]]
+fn test_update_title_keeps_the_content() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_update_title(@w)
+    world_close(@w)
+    rc
+
+
+fn check_update_missing(w: *World) -> i32
+    match wiki_service_update_content(@w.svc, "missing", "x")
+        Ok(_) => 1
+        Err(e) => expect_not_found(@e)
+
+
+[[test]]
+fn test_update_of_a_missing_page_is_not_found() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_update_missing(@w)
+    world_close(@w)
+    rc
+
+
+fn check_delete(w: *World) -> i32
+    if create(w, "home", "body") != 0
+        return 1
+    # Warm the cache: a delete must take the cached copy with it.
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(_) => 0
+        Err(_) => return 2
+    match wiki_service_delete_page(@w.svc, "home")
+        Ok(_) => 0
+        Err(_) => return 3
+    if wiki_service_page_exists(@w.svc, "home")
+        return 4
+    match wiki_service_get_page(@w.svc, "home")
+        Ok(_) => return 5
+        Err(e) =>
+            if expect_not_found(@e) != 0
+                return 6
+    match wiki_service_delete_page(@w.svc, "home")
+        Ok(_) => 7
+        Err(e) => expect_not_found(@e)
+
+
+[[test]]
+fn test_delete_removes_the_page_and_its_cached_copy() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_delete(@w)
+    world_close(@w)
+    rc
+
+
+fn check_children(w: *World) -> i32
+    if create(w, "language", "root") != 0
+        return 1
+    if create(w, "language/syntax", "a") != 0
+        return 2
+    if create(w, "language/types/enums", "b") != 0
+        return 3
+    if create(w, "languages", "not a child") != 0
+        return 4
+    match wiki_service_get_children(@w.svc, "language")
+        Ok(pages) =>
+            if vec_len<WikiPage>(@pages) != 2
+                return 5
+            let first: WikiPage = vec_get<WikiPage>(@pages, 0)
+            if not string_eq(@first.slug, "language/syntax")
+                return 6
+            0
+        Err(_) => 7
+
+
+[[test]]
+fn test_children_are_slugs_below_the_parent() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_children(@w)
+    world_close(@w)
+    rc
+
+
+fn check_oversize(w: *World) -> i32
+    var content: String = string_new()
+    var i: i64 = 0
+    while i < 4000
+        string_push(@&content, 'x' as u8)
+        i += 1
+    match wiki_service_create_page(@w.svc, "big", "Big", string_as_view(@content))
+        Ok(_) => return 1
+        Err(e) =>
+            match e
+                ServiceError.RepoError(_) => 0
+                _ => return 2
+    # A refused page must not be readable from the cache.
+    if wiki_service_page_exists(@w.svc, "big")
+        return 3
+    0
+
+
+[[test]]
+fn test_page_the_database_refuses_is_not_cached() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_oversize(@w)
+    world_close(@w)
+    rc

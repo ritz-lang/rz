@@ -1,62 +1,64 @@
 # src/repos/wiki_page_repo.ritz - WikiPage repository
 #
-# Data access layer for wiki pages stored in Mausoleum.
-# Handles serialization, caching (Tome), and database operations.
+# Data access for wiki pages stored in Mausoleum, through Spire's adapter (the
+# layer store.ritz uses too). Mausoleum has no secondary indexes or update
+# operation yet, which shapes two operations here:
+#   - slug lookups scan the collection, O(pages) per lookup;
+#   - update writes the new document, then deletes the old one, so a page's
+#     document id changes on every update.
 
-import ritzlib.str { String, str_from_view, str_concat }
-import ritzlib.vec { Vec }
-import ritzlib.memory { malloc, free }
+import ritzlib.memory
+import ritzlib.strview { StrView, strview_len, strview_get, strview_as_ptr }
+import ritzlib.string { string_from }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_drop }
 
-import mausoleum.client {
-    Client,
-    client_new,
-    client_connect,
-    client_disconnect,
-    client_insert,
-    client_get,
-    client_delete,
-    client_is_connected
+import spire.repo.mausoleum {
+    Db,
+    db_init,
+    db_set_encryption,
+    db_connect,
+    db_close,
+    db_is_connected,
+    db_insert,
+    db_get,
+    db_delete,
+    db_scan,
+    db_extract_field
 }
-import mausoleum.document { DocumentId, doc_id_new }
-import mausoleum.m7m_types { Timestamp, timestamp_now }
+import mausoleum.document { DocumentId, doc_id_invalid }
 
-import models { WikiPage, wiki_page_new }
+import models.wiki_page { WikiPage }
 import errors.repo_error { RepoError }
-
-
-# Collection name for wiki pages
-const PAGES_COLLECTION: *u8 = c"nexus_pages"
-const PAGES_COLLECTION_LEN: i32 = 11
+import repos.wiki_page_codec { wiki_page_encode, wiki_page_encode_bound, wiki_page_decode }
 
 
 # WikiPage repository - handles persistence to Mausoleum
 pub struct WikiPageRepository
-    client: *Client           # Mausoleum client connection
+    db: Db
     connected: bool
 
 
 # Create a new repository (not yet connected)
 pub fn wiki_page_repo_new() -> WikiPageRepository
-    WikiPageRepository {
-        client: null,
-        connected: false
-    }
+    var repo: WikiPageRepository
+    repo.connected = false
+    repo
 
 
-# Connect to Mausoleum server
-pub fn wiki_page_repo_connect(repo: *WikiPageRepository, host: *u8, port: i32) -> Result<(), RepoError>
+# Connect to Mausoleum. `encrypted` must match the server: false only for a
+# server running with --no-encryption.
+pub fn wiki_page_repo_connect(repo: *WikiPageRepository, host: StrView, port: i32, encrypted: bool) -> Result<(), RepoError>
     if repo.connected
         return Ok(())
 
-    repo.client = client_new()
-    if repo.client == null
-        return Err(RepoError.DatabaseError(str_from_view("Failed to create client")))
+    db_init(@repo.db, strview_as_ptr(@host), strview_len(@host) as i32, port, c"nexus_pages", 11)
+    if encrypted
+        db_set_encryption(@repo.db, 1)
+    else
+        db_set_encryption(@repo.db, 0)
 
-    let result = client_connect(repo.client, host, port, PAGES_COLLECTION, PAGES_COLLECTION_LEN)
-    if result < 0
-        client_free(repo.client)
-        repo.client = null
-        return Err(RepoError.NetworkError(str_from_view("Connection failed")))
+    if db_connect(@repo.db) < 0
+        return Err(RepoError.NetworkError(string_from("Connection failed")))
 
     repo.connected = true
     Ok(())
@@ -64,238 +66,186 @@ pub fn wiki_page_repo_connect(repo: *WikiPageRepository, host: *u8, port: i32) -
 
 # Disconnect from Mausoleum
 pub fn wiki_page_repo_disconnect(repo: *WikiPageRepository)
-    if repo.connected and repo.client != null
-        client_disconnect(repo.client)
-        client_free(repo.client)
-        repo.client = null
+    if repo.connected
+        db_close(@repo.db)
         repo.connected = false
 
 
 # Check if connected
 pub fn wiki_page_repo_is_connected(repo: *WikiPageRepository) -> bool
-    repo.connected and repo.client != null and client_is_connected(repo.client) == 1
+    repo.connected and db_is_connected(@repo.db) == 1
+
+
+fn not_connected() -> RepoError
+    RepoError.NetworkError(string_from("Not connected"))
+
+
+# Decode a stored document. The id comes from the database, not the bytes: the
+# id field is only meaningful for a cached copy.
+fn decode_stored(doc_id: i64, data: *u8, len: i32) -> Result<WikiPage, RepoError>
+    var page: WikiPage = wiki_page_decode(data, len)?
+    page.id.value = doc_id
+    Ok(page)
 
 
 # Get a page by its document ID
 pub fn wiki_page_repo_get_by_id(repo: *WikiPageRepository, id: DocumentId) -> Result<WikiPage, RepoError>
     if not wiki_page_repo_is_connected(repo)
-        return Err(RepoError.NetworkError(str_from_view("Not connected")))
+        return Err(not_connected())
 
-    var doc_data: *u8 = null
-    var doc_len: i32 = 0
-    let result = client_get(repo.client, id.value, @doc_data, @doc_len)
-
+    var data: *u8 = null
+    var len: i32 = 0
+    let result: i32 = db_get(@repo.db, id.value, @data, @len)
     if result == 0
         return Err(RepoError.NotFound)
     if result < 0
-        return Err(RepoError.DatabaseError(str_from_view("Get failed")))
+        return Err(RepoError.DatabaseError(string_from("Get failed")))
 
-    # Deserialize document to WikiPage
-    let page = deserialize_wiki_page(doc_data, doc_len)?
-    Ok(page)
+    decode_stored(id.value, data, len)
+
+
+# State for one slug scan. `tmp` holds slug length + 1 bytes, so a longer
+# stored slug is cut to a length that cannot match.
+struct SlugScan
+    slug: StrView
+    tmp: *u8
+    doc_id: i64
+    found: bool
+
+
+fn slug_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+    let scan: *SlugScan = user_data as *SlugScan
+    let want: i64 = strview_len(@scan.slug)
+    let n: i32 = db_extract_field(data, len, c"slug", 4, scan.tmp, (want + 1) as i32)
+    if n as i64 != want
+        return 0
+    var i: i64 = 0
+    while i < want
+        if *(scan.tmp + i) != strview_get(@scan.slug, i)
+            return 0
+        i += 1
+    scan.doc_id = doc_id
+    scan.found = true
+    1
 
 
 # Get a page by its slug (e.g., "language/syntax")
-pub fn wiki_page_repo_get_by_slug(repo: *WikiPageRepository, slug: Span<u8>) -> Result<WikiPage, RepoError>
+pub fn wiki_page_repo_get_by_slug(repo: *WikiPageRepository, slug: StrView) -> Result<WikiPage, RepoError>
     if not wiki_page_repo_is_connected(repo)
-        return Err(RepoError.NetworkError(str_from_view("Not connected")))
+        return Err(not_connected())
 
-    # Query by slug using secondary index
-    # For now, we'd need a query operation - this is a placeholder
-    # TODO: Implement actual slug-based query when mausoleum supports secondary indexes
-    Err(RepoError.InvalidQuery(str_from_view("Slug query not yet implemented")))
+    var scan: SlugScan
+    scan.slug = slug
+    scan.tmp = malloc(strview_len(@slug) + 1)
+    if scan.tmp == null
+        return Err(RepoError.DatabaseError(string_from("Out of memory")))
+    scan.doc_id = 0
+    scan.found = false
+    let scanned: i32 = db_scan(@repo.db, slug_scan_step as *u8, @scan as *u8)
+    free(scan.tmp)
+
+    if scanned < 0
+        return Err(RepoError.DatabaseError(string_from("Scan failed")))
+    if not scan.found
+        return Err(RepoError.NotFound)
+
+    # The client can't issue a request mid-scan, so the fetch comes after it.
+    var id: DocumentId = doc_id_invalid()
+    id.value = scan.doc_id
+    wiki_page_repo_get_by_id(repo, id)
 
 
-# Save a new page (insert)
+# Encode and insert `page`, returning its new document id.
+fn insert_document(repo: *WikiPageRepository, page: *WikiPage) -> Result<i64, RepoError>
+    let bound: i64 = wiki_page_encode_bound(page)
+    let buf: *u8 = malloc(bound)
+    if buf == null
+        return Err(RepoError.SerializationError)
+    let n: i64 = wiki_page_encode(page, buf, bound)
+    if n < 0
+        free(buf)
+        return Err(RepoError.SerializationError)
+
+    let doc_id: i64 = db_insert(@repo.db, buf, n as i32)
+    free(buf)
+    if doc_id < 0
+        return Err(RepoError.DatabaseError(string_from("Insert failed")))
+    Ok(doc_id)
+
+
+# Save a new page, setting page.id to the id the database assigned
 pub fn wiki_page_repo_insert(repo: *WikiPageRepository, page: *WikiPage) -> Result<DocumentId, RepoError>
     if not wiki_page_repo_is_connected(repo)
-        return Err(RepoError.NetworkError(str_from_view("Not connected")))
+        return Err(not_connected())
 
-    # Serialize page to document format
-    var buf: [4096]u8
-    let len = serialize_wiki_page(page, @buf)
-
-    let doc_id = client_insert(repo.client, @buf as *u8, len)
-    if doc_id < 0
-        return Err(RepoError.DatabaseError(str_from_view("Insert failed")))
-
-    # Update the page's ID with the assigned value
-    page.id = doc_id_new(0, doc_id as i32)
+    page.id.value = insert_document(repo, page)?
     Ok(page.id)
 
 
-# Update an existing page
+# Update an existing page, setting page.id to its new document id.
+#
+# The new document goes in first, so a failure can't lose the page. If the old
+# one can't be removed, the new one is taken back out. A crash between the two
+# steps leaves both; slug lookup then returns the first, the older version.
 pub fn wiki_page_repo_update(repo: *WikiPageRepository, page: *WikiPage) -> Result<(), RepoError>
     if not wiki_page_repo_is_connected(repo)
-        return Err(RepoError.NetworkError(str_from_view("Not connected")))
+        return Err(not_connected())
 
-    # For now, delete and re-insert (Mausoleum will support proper update)
-    let delete_result = client_delete(repo.client, page.id.value)
-    if delete_result < 0
-        return Err(RepoError.DatabaseError(str_from_view("Update failed (delete)")))
+    let new_id: i64 = insert_document(repo, page)?
+    let deleted: i32 = db_delete(@repo.db, page.id.value)
+    if deleted <= 0
+        db_delete(@repo.db, new_id)
+        if deleted == 0
+            return Err(RepoError.NotFound)
+        return Err(RepoError.DatabaseError(string_from("Update failed (delete)")))
 
-    var buf: [4096]u8
-    let len = serialize_wiki_page(page, @buf)
-
-    let doc_id = client_insert(repo.client, @buf as *u8, len)
-    if doc_id < 0
-        return Err(RepoError.DatabaseError(str_from_view("Update failed (insert)")))
-
+    page.id.value = new_id
     Ok(())
 
 
 # Delete a page by ID
 pub fn wiki_page_repo_delete(repo: *WikiPageRepository, id: DocumentId) -> Result<(), RepoError>
     if not wiki_page_repo_is_connected(repo)
-        return Err(RepoError.NetworkError(str_from_view("Not connected")))
+        return Err(not_connected())
 
-    let result = client_delete(repo.client, id.value)
+    let result: i32 = db_delete(@repo.db, id.value)
     if result == 0
         return Err(RepoError.NotFound)
     if result < 0
-        return Err(RepoError.DatabaseError(str_from_view("Delete failed")))
-
+        return Err(RepoError.DatabaseError(string_from("Delete failed")))
     Ok(())
 
 
-# List all pages (for admin/debug)
+# State for one list scan: a document that won't decode stops the scan.
+struct ListScan
+    pages: Vec<WikiPage>
+    corrupt: bool
+
+
+fn list_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+    let scan: *ListScan = user_data as *ListScan
+    match decode_stored(doc_id, data, len)
+        Ok(page) =>
+            vec_push<WikiPage>(@&scan.pages, page)
+            0
+        Err(_) =>
+            scan.corrupt = true
+            1
+
+
+# List all pages
 pub fn wiki_page_repo_list_all(repo: *WikiPageRepository) -> Result<Vec<WikiPage>, RepoError>
     if not wiki_page_repo_is_connected(repo)
-        return Err(RepoError.NetworkError(str_from_view("Not connected")))
+        return Err(not_connected())
 
-    # TODO: Implement scan/list operation when available
-    Err(RepoError.InvalidQuery(str_from_view("List all not yet implemented")))
-
-
-# ============================================================================
-# Serialization helpers
-# ============================================================================
-
-# Serialize a WikiPage to a byte buffer
-# Format: [slug_len:u16][slug][title_len:u16][title][content_len:u32][content][version:u64][...]
-fn serialize_wiki_page(page: *WikiPage, buf: *[4096]u8) -> i32
-    var pos: i32 = 0
-    var ptr: *u8 = buf as *u8
-
-    # Write slug
-    let slug_view = page.slug.as_view()
-    let slug_len = slug_view.len() as u16
-    *(ptr + pos) = (slug_len >> 8) as u8
-    *(ptr + pos + 1) = (slug_len & 0xFF) as u8
-    pos += 2
-    memcpy(ptr + pos, slug_view.ptr(), slug_len as i64)
-    pos += slug_len as i32
-
-    # Write title
-    let title_view = page.title.as_view()
-    let title_len = title_view.len() as u16
-    *(ptr + pos) = (title_len >> 8) as u8
-    *(ptr + pos + 1) = (title_len & 0xFF) as u8
-    pos += 2
-    memcpy(ptr + pos, title_view.ptr(), title_len as i64)
-    pos += title_len as i32
-
-    # Write content
-    let content_view = page.content.as_view()
-    let content_len = content_view.len() as u32
-    *(ptr + pos) = ((content_len >> 24) & 0xFF) as u8
-    *(ptr + pos + 1) = ((content_len >> 16) & 0xFF) as u8
-    *(ptr + pos + 2) = ((content_len >> 8) & 0xFF) as u8
-    *(ptr + pos + 3) = (content_len & 0xFF) as u8
-    pos += 4
-    memcpy(ptr + pos, content_view.ptr(), content_len as i64)
-    pos += content_len as i32
-
-    # Write version
-    let version = page.version
-    var i: i32 = 0
-    while i < 8
-        *(ptr + pos + (7 - i)) = ((version >> (i * 8)) & 0xFF) as u8
-        i += 1
-    pos += 8
-
-    # Write timestamps (nanos)
-    let created = page.created_at.nanos
-    i = 0
-    while i < 8
-        *(ptr + pos + (7 - i)) = ((created >> (i * 8)) & 0xFF) as u8
-        i += 1
-    pos += 8
-
-    let updated = page.updated_at.nanos
-    i = 0
-    while i < 8
-        *(ptr + pos + (7 - i)) = ((updated >> (i * 8)) & 0xFF) as u8
-        i += 1
-    pos += 8
-
-    pos
-
-
-# Deserialize a byte buffer to WikiPage
-fn deserialize_wiki_page(data: *u8, len: i32) -> Result<WikiPage, RepoError>
-    if len < 12  # Minimum: 2 + 2 + 4 + 8 = 16 for empty strings
+    var scan: ListScan
+    scan.pages = vec_new<WikiPage>()
+    scan.corrupt = false
+    let scanned: i32 = db_scan(@repo.db, list_scan_step as *u8, @scan as *u8)
+    if scanned < 0
+        vec_drop<WikiPage>(@&scan.pages)
+        return Err(RepoError.DatabaseError(string_from("Scan failed")))
+    if scan.corrupt
+        vec_drop<WikiPage>(@&scan.pages)
         return Err(RepoError.SerializationError)
-
-    var pos: i32 = 0
-
-    # Read slug
-    let slug_len = ((*(data + pos) as u16) << 8) | (*(data + pos + 1) as u16)
-    pos += 2
-    let slug = str_from_bytes(data + pos, slug_len as i64)
-    pos += slug_len as i32
-
-    # Read title
-    let title_len = ((*(data + pos) as u16) << 8) | (*(data + pos + 1) as u16)
-    pos += 2
-    let title = str_from_bytes(data + pos, title_len as i64)
-    pos += title_len as i32
-
-    # Read content
-    let content_len = ((*(data + pos) as u32) << 24) |
-                      ((*(data + pos + 1) as u32) << 16) |
-                      ((*(data + pos + 2) as u32) << 8) |
-                      (*(data + pos + 3) as u32)
-    pos += 4
-    let content = str_from_bytes(data + pos, content_len as i64)
-    pos += content_len as i32
-
-    # Read version
-    var version: u64 = 0
-    var i: i32 = 0
-    while i < 8
-        version = (version << 8) | (*(data + pos + i) as u64)
-        i += 1
-    pos += 8
-
-    # Read timestamps
-    var created_nanos: i64 = 0
-    i = 0
-    while i < 8
-        created_nanos = (created_nanos << 8) | (*(data + pos + i) as i64)
-        i += 1
-    pos += 8
-
-    var updated_nanos: i64 = 0
-    i = 0
-    while i < 8
-        updated_nanos = (updated_nanos << 8) | (*(data + pos + i) as i64)
-        i += 1
-    pos += 8
-
-    var page = wiki_page_new(slug, title, content)
-    page.version = version
-    page.created_at.nanos = created_nanos
-    page.updated_at.nanos = updated_nanos
-
-    Ok(page)
-
-
-# Helper to create string from bytes
-fn str_from_bytes(data: *u8, len: i64) -> String
-    var s = String.with_capacity(len as u64)
-    var i: i64 = 0
-    while i < len
-        s.push_byte(*(data + i))
-        i += 1
-    s
+    Ok(scan.pages)

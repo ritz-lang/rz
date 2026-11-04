@@ -1,0 +1,191 @@
+# test/test_page_cache.ritz - Tome-backed page cache (AGAST #1377)
+
+import ritzlib.sys
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from, string_new, string_push, string_len, string_eq }
+
+import models.wiki_page { WikiPage, wiki_page_new, wiki_page_drop }
+import errors.repo_error { RepoError }
+import repos.page_cache {
+    PageCache,
+    page_cache_new,
+    page_cache_connect,
+    page_cache_disconnect,
+    page_cache_is_connected,
+    page_cache_set_ttl,
+    page_cache_get,
+    page_cache_set,
+    page_cache_invalidate
+}
+
+const CACHE_BYTES: i64 = 4194304
+
+
+fn page_of(slug: StrView, content: StrView) -> WikiPage
+    wiki_page_new(string_from(slug), string_from("Title"), string_from(content))
+
+
+fn is_cache_error(e: @RepoError) -> i32
+    match *e
+        RepoError.CacheError(_) => 0
+        _ => 1
+
+
+fn open_cache(pc: *PageCache) -> i32
+    match page_cache_connect(pc, CACHE_BYTES)
+        Ok(_) => 0
+        Err(_) => 1
+
+
+fn store(pc: *PageCache, page: *WikiPage) -> i32
+    match page_cache_set(pc, page)
+        Ok(_) => 0
+        Err(_) => 1
+
+
+[[test]]
+fn test_new_cache_is_not_connected() -> i32
+    var pc = page_cache_new()
+    if page_cache_is_connected(@pc)
+        return 1
+    0
+
+
+[[test]]
+fn test_disconnected_cache_misses_and_refuses_writes() -> i32
+    var pc = page_cache_new()
+    var page = page_of("home", "hi")
+    if page_cache_get(@pc, "home").is_some()
+        return 1
+    match page_cache_set(@pc, @page)
+        Ok(_) => return 2
+        Err(e) =>
+            if is_cache_error(@e) != 0
+                return 3
+    match page_cache_invalidate(@pc, "home")
+        Ok(_) => 4
+        Err(e) => is_cache_error(@e)
+
+
+[[test]]
+fn test_miss_on_an_unknown_slug() -> i32
+    var pc = page_cache_new()
+    if open_cache(@pc) != 0
+        return 1
+    let hit = page_cache_get(@pc, "nope").is_some()
+    page_cache_disconnect(@pc)
+    if hit
+        return 2
+    0
+
+
+[[test]]
+fn test_set_then_get_returns_the_page() -> i32
+    var pc = page_cache_new()
+    if open_cache(@pc) != 0
+        return 1
+    var page = page_of("home", "Welcome")
+    page.id.value = 77
+    page.version = 4
+    if store(@pc, @page) != 0
+        return 2
+    match page_cache_get(@pc, "home")
+        Some(got) =>
+            if not string_eq(@got.slug, "home")
+                return 3
+            if not string_eq(@got.content, "Welcome")
+                return 4
+            if got.id.value != 77
+                return 5
+            if got.version != 4
+                return 6
+            0
+        None => 7
+
+
+[[test]]
+fn test_slugs_do_not_collide() -> i32
+    var pc = page_cache_new()
+    if open_cache(@pc) != 0
+        return 1
+    var a = page_of("alpha", "first")
+    var b = page_of("alpha/beta", "second")
+    if store(@pc, @a) != 0
+        return 2
+    if store(@pc, @b) != 0
+        return 3
+    match page_cache_get(@pc, "alpha")
+        Some(got) => if string_eq(@got.content, "first") then 0 else 4
+        None => 5
+
+
+# The old cache format cut content to 7000 bytes, which a hit would have
+# returned as the page.
+[[test]]
+fn test_large_page_is_cached_whole() -> i32
+    var pc = page_cache_new()
+    if open_cache(@pc) != 0
+        return 1
+    var content: String = string_new()
+    var i: i64 = 0
+    while i < 70000
+        string_push(@&content, 'y' as u8)
+        i += 1
+    var page = wiki_page_new(string_from("big"), string_from("Big"), content)
+    if store(@pc, @page) != 0
+        return 2
+    match page_cache_get(@pc, "big")
+        Some(got) => if string_len(@got.content) == 70000 then 0 else 3
+        None => 4
+
+
+[[test]]
+fn test_invalidate_removes_only_that_page() -> i32
+    var pc = page_cache_new()
+    if open_cache(@pc) != 0
+        return 1
+    var a = page_of("alpha", "first")
+    var b = page_of("beta", "second")
+    if store(@pc, @a) != 0
+        return 2
+    if store(@pc, @b) != 0
+        return 3
+    match page_cache_invalidate(@pc, "alpha")
+        Ok(_) => 0
+        Err(_) => return 4
+    if page_cache_get(@pc, "alpha").is_some()
+        return 5
+    if page_cache_get(@pc, "beta").is_none()
+        return 6
+    0
+
+
+[[test]]
+fn test_invalidate_of_an_absent_page_is_ok() -> i32
+    var pc = page_cache_new()
+    if open_cache(@pc) != 0
+        return 1
+    match page_cache_invalidate(@pc, "nope")
+        Ok(_) => 0
+        Err(_) => 2
+
+
+[[test]]
+fn test_entries_expire_after_the_ttl() -> i32
+    var pc = page_cache_new()
+    if open_cache(@pc) != 0
+        return 1
+    page_cache_set_ttl(@pc, 1)
+    var page = page_of("home", "hi")
+    if store(@pc, @page) != 0
+        return 2
+    if page_cache_get(@pc, "home").is_none()
+        return 3
+    # Tome's clock has one-second resolution, so 1s can take nearly 2s to pass.
+    var ts: [2]i64
+    ts[0] = 2
+    ts[1] = 100000000
+    sys_nanosleep(@ts[0], null)
+    if page_cache_get(@pc, "home").is_some()
+        return 4
+    0

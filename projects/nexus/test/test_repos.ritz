@@ -1,0 +1,614 @@
+# test/test_repos.ritz - WikiPage document codec and repository (AGAST #1377)
+#
+# The codec tests are pure. The repository tests run against a real Mausoleum
+# server (test/support/live_db.ritz): the server rejects anything that is not
+# a Document, so only a live server proves a page can actually be stored.
+
+import ritzlib.memory
+import ritzlib.strview { StrView, strview_len, strview_as_ptr }
+import ritzlib.string { String, string_from, string_new, string_drop, string_push, string_len, string_eq, string_as_view }
+import ritzlib.gvec { Vec, vec_len, vec_get, vec_drop }
+
+import spire.repo.mausoleum { DbField, db_field, db_serialize_doc }
+import mausoleum.document { DocumentId, doc_id_invalid, doc_id_is_valid, doc_id_eq }
+
+import models.wiki_page { WikiPage, wiki_page_new, wiki_page_new_child, wiki_page_drop, wiki_page_update_content }
+import errors.repo_error { RepoError }
+import repos.wiki_page_codec { wiki_page_encode, wiki_page_encode_bound, wiki_page_decode }
+import repos.wiki_page_repo {
+    WikiPageRepository,
+    wiki_page_repo_new,
+    wiki_page_repo_connect,
+    wiki_page_repo_disconnect,
+    wiki_page_repo_is_connected,
+    wiki_page_repo_get_by_id,
+    wiki_page_repo_get_by_slug,
+    wiki_page_repo_insert,
+    wiki_page_repo_update,
+    wiki_page_repo_delete,
+    wiki_page_repo_list_all
+}
+import test.support.live_db { LiveDb, live_db_start, live_db_stop }
+
+
+fn page_of(slug: StrView, title: StrView, content: StrView) -> WikiPage
+    wiki_page_new(string_from(slug), string_from(title), string_from(content))
+
+
+# `n` bytes of 'x', as a String.
+fn big_string(n: i64) -> String
+    var s: String = string_new()
+    var i: i64 = 0
+    while i < n
+        string_push(@&s, 'x' as u8)
+        i += 1
+    s
+
+
+# Encode then decode, as both the database and the cache do.
+fn round_trip(page: *WikiPage) -> Result<WikiPage, RepoError>
+    let bound: i64 = wiki_page_encode_bound(page)
+    let buf: *u8 = malloc(bound)
+    let n: i64 = wiki_page_encode(page, buf, bound)
+    if n <= 0
+        free(buf)
+        return Err(RepoError.SerializationError)
+    let result = wiki_page_decode(buf, n as i32)
+    free(buf)
+    result
+
+
+# 0 = `e` is the variant the name says, 1 = any other variant.
+fn expect_not_found(e: @RepoError) -> i32
+    match *e
+        RepoError.NotFound => 0
+        _ => 1
+
+
+fn expect_network(e: @RepoError) -> i32
+    match *e
+        RepoError.NetworkError(_) => 0
+        _ => 1
+
+
+fn expect_database(e: @RepoError) -> i32
+    match *e
+        RepoError.DatabaseError(_) => 0
+        _ => 1
+
+
+fn expect_serialization(e: @RepoError) -> i32
+    match *e
+        RepoError.SerializationError => 0
+        _ => 1
+
+
+# Connect `repo` to the plaintext test server.
+fn connect(repo: *WikiPageRepository, db: *LiveDb) -> i32
+    match wiki_page_repo_connect(repo, "127.0.0.1", db.port, false)
+        Ok(_) => 0
+        Err(_) => 1
+
+
+# ============================================================================
+# Codec
+# ============================================================================
+
+[[test]]
+fn test_codec_round_trips_every_field() -> i32
+    var parent = page_of("language", "Language", "root")
+    parent.id.value = 41
+    var page = wiki_page_new_child(string_from("language/syntax"), string_from("Syntax"), string_from("# Body"), @parent)
+    page.id.value = 42
+    page.author_id.value = 7
+    page.version = 9
+    page.created_at.nanos = 1000
+    page.updated_at.nanos = 2000
+
+    match round_trip(@page)
+        Ok(got) =>
+            if not string_eq(@got.slug, "language/syntax")
+                return 1
+            if not string_eq(@got.title, "Syntax")
+                return 2
+            if not string_eq(@got.content, "# Body")
+                return 3
+            if got.id.value != 42
+                return 4
+            if got.author_id.value != 7
+                return 5
+            if got.version != 9
+                return 6
+            if got.created_at.nanos != 1000
+                return 7
+            if got.updated_at.nanos != 2000
+                return 8
+            match got.parent_id
+                Some(id) => if id.value == 41 then 0 else 9
+                None => 10
+        Err(_) => 11
+
+
+[[test]]
+fn test_codec_root_page_has_no_parent() -> i32
+    var page = page_of("home", "Home", "")
+    match round_trip(@page)
+        Ok(got) =>
+            if string_len(@got.content) != 0
+                return 1
+            if got.parent_id.is_some()
+                return 2
+            0
+        Err(_) => 3
+
+
+[[test]]
+fn test_codec_has_no_fixed_size_limit() -> i32
+    # The old codec wrote into a [4096]u8 stack buffer with no bounds check.
+    var page = wiki_page_new(string_from("big"), string_from("Big"), big_string(100000))
+    match round_trip(@page)
+        Ok(got) => if string_len(@got.content) == 100000 then 0 else 1
+        Err(_) => 2
+
+
+[[test]]
+fn test_encode_refuses_a_buffer_too_small() -> i32
+    var page = page_of("home", "Home", "content")
+    var buf: [8]u8
+    if wiki_page_encode(@page, @buf[0], 8) < 0
+        return 0
+    1
+
+
+[[test]]
+fn test_decode_rejects_garbage() -> i32
+    var junk: [64]u8
+    var i: i32 = 0
+    while i < 64
+        junk[i] = 0xFF
+        i += 1
+    match wiki_page_decode(@junk[0], 64)
+        Ok(_) => 1
+        Err(e) => expect_serialization(@e)
+
+
+[[test]]
+fn test_decode_rejects_a_truncated_document() -> i32
+    var page = page_of("home", "Home", "some content that will be cut off")
+    let bound: i64 = wiki_page_encode_bound(@page)
+    let buf: *u8 = malloc(bound)
+    let n: i64 = wiki_page_encode(@page, buf, bound)
+    let result = wiki_page_decode(buf, (n / 2) as i32)
+    free(buf)
+    match result
+        Ok(_) => 1
+        Err(e) => expect_serialization(@e)
+
+
+[[test]]
+fn test_decode_rejects_a_document_missing_fields() -> i32
+    # What store.ritz writes: a Document, but with only slug and content.
+    var buf: [512]u8
+    var fields: [2]DbField
+    fields[0] = db_field(c"slug", 4, c"home", 4)
+    fields[1] = db_field(c"content", 7, c"hi", 2)
+    let n: i64 = db_serialize_doc(@buf[0], 512, @fields[0], 2)
+    if n <= 0
+        return 2
+    match wiki_page_decode(@buf[0], n as i32)
+        Ok(_) => 1
+        Err(e) => expect_serialization(@e)
+
+
+# Every field but one: a page must not decode with a blank where its title was.
+[[test]]
+fn test_decode_rejects_a_document_missing_only_the_title() -> i32
+    var buf: [512]u8
+    var fields: [8]DbField
+    fields[0] = db_field(c"slug", 4, c"home", 4)
+    fields[1] = db_field(c"content", 7, c"hi", 2)
+    fields[2] = db_field(c"id", 2, c"1", 1)
+    fields[3] = db_field(c"version", 7, c"1", 1)
+    fields[4] = db_field(c"created_at", 10, c"1", 1)
+    fields[5] = db_field(c"updated_at", 10, c"1", 1)
+    fields[6] = db_field(c"author_id", 9, c"1", 1)
+    fields[7] = db_field(c"parent_id", 9, c"1", 1)
+    let n: i64 = db_serialize_doc(@buf[0], 512, @fields[0], 8)
+    if n <= 0
+        return 2
+    match wiki_page_decode(@buf[0], n as i32)
+        Ok(_) => 1
+        Err(e) => expect_serialization(@e)
+
+
+# ============================================================================
+# Repository, not connected
+# ============================================================================
+
+[[test]]
+fn test_repo_starts_disconnected() -> i32
+    var repo = wiki_page_repo_new()
+    if wiki_page_repo_is_connected(@repo)
+        return 1
+    0
+
+
+[[test]]
+fn test_repo_operations_fail_when_disconnected() -> i32
+    var repo = wiki_page_repo_new()
+    var page = page_of("home", "Home", "hi")
+    match wiki_page_repo_get_by_slug(@repo, "home")
+        Ok(_) => return 1
+        Err(e) =>
+            if expect_network(@e) != 0
+                return 2
+    match wiki_page_repo_get_by_id(@repo, doc_id_invalid())
+        Ok(_) => return 3
+        Err(e) =>
+            if expect_network(@e) != 0
+                return 4
+    match wiki_page_repo_insert(@repo, @page)
+        Ok(_) => return 5
+        Err(e) =>
+            if expect_network(@e) != 0
+                return 6
+    match wiki_page_repo_update(@repo, @page)
+        Ok(_) => return 7
+        Err(e) =>
+            if expect_network(@e) != 0
+                return 8
+    match wiki_page_repo_delete(@repo, doc_id_invalid())
+        Ok(_) => return 9
+        Err(e) =>
+            if expect_network(@e) != 0
+                return 10
+    match wiki_page_repo_list_all(@repo)
+        Ok(_) => 11
+        Err(e) => expect_network(@e)
+
+
+[[test]]
+fn test_repo_connect_failure_is_a_network_error() -> i32
+    var repo = wiki_page_repo_new()
+    # Port 1 is privileged and nothing in the test environment listens on it.
+    match wiki_page_repo_connect(@repo, "127.0.0.1", 1, false)
+        Ok(_) => 1
+        Err(e) => expect_network(@e)
+
+
+# ============================================================================
+# Repository, against a live server
+# ============================================================================
+
+[[test]]
+fn test_insert_assigns_an_id_and_get_by_id_returns_the_page() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        var page = page_of("home", "Home", "Welcome")
+        match wiki_page_repo_insert(@repo, @page)
+            Ok(id) =>
+                rc = check_inserted(@repo, @page, id)
+            Err(_) =>
+                rc = 2
+    else
+        rc = 1
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn check_inserted(repo: *WikiPageRepository, page: *WikiPage, id: DocumentId) -> i32
+    if doc_id_is_valid(@id) != 1
+        return 3
+    if page.id.value != id.value
+        return 4
+    match wiki_page_repo_get_by_id(repo, id)
+        Ok(got) =>
+            if not string_eq(@got.slug, "home")
+                return 5
+            if not string_eq(@got.content, "Welcome")
+                return 6
+            if got.id.value != id.value
+                return 7
+            0
+        Err(_) => 8
+
+
+[[test]]
+fn test_get_by_id_missing_is_not_found() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        var id: DocumentId = doc_id_invalid()
+        id.value = 12345
+        match wiki_page_repo_get_by_id(@repo, id)
+            Ok(_) =>
+                rc = 2
+            Err(e) =>
+                rc = expect_not_found(@e)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn insert_page(repo: *WikiPageRepository, slug: StrView, content: StrView) -> i32
+    var page = page_of(slug, "Title", content)
+    match wiki_page_repo_insert(repo, @page)
+        Ok(_) => 0
+        Err(_) => 1
+
+
+fn check_slug_lookup(repo: *WikiPageRepository) -> i32
+    # The longer and shorter slugs go in first, so a prefix match would find
+    # them before the exact one.
+    if insert_page(repo, "alpha/beta", "second") != 0
+        return 3
+    if insert_page(repo, "alph", "third") != 0
+        return 4
+    if insert_page(repo, "alpha", "first") != 0
+        return 2
+    match wiki_page_repo_get_by_slug(repo, "alpha")
+        Ok(got) =>
+            if not string_eq(@got.content, "first")
+                return 5
+            if doc_id_is_valid(@got.id) != 1
+                return 6
+        Err(_) => return 7
+    match wiki_page_repo_get_by_slug(repo, "alpha/beta")
+        Ok(got) =>
+            if not string_eq(@got.content, "second")
+                return 8
+        Err(_) => return 9
+    match wiki_page_repo_get_by_slug(repo, "missing")
+        Ok(_) => 10
+        Err(e) => expect_not_found(@e)
+
+
+[[test]]
+fn test_get_by_slug_matches_the_whole_slug() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_slug_lookup(@repo)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn check_update(repo: *WikiPageRepository) -> i32
+    var page = page_of("home", "Home", "before")
+    match wiki_page_repo_insert(repo, @page)
+        Ok(_) => 0
+        Err(_) => return 2
+    let old_id: DocumentId = page.id
+
+    wiki_page_update_content(@page, string_from("after"))
+    match wiki_page_repo_update(repo, @page)
+        Ok(_) => 0
+        Err(_) => return 3
+
+    # A second update must use the id the first one assigned.
+    wiki_page_update_content(@page, string_from("after again"))
+    match wiki_page_repo_update(repo, @page)
+        Ok(_) => 0
+        Err(_) => return 4
+
+    match wiki_page_repo_get_by_slug(repo, "home")
+        Ok(got) =>
+            if not string_eq(@got.content, "after again")
+                return 5
+            if got.version != 3
+                return 6
+            if got.id.value != page.id.value
+                return 7
+        Err(_) => return 8
+
+    match wiki_page_repo_get_by_id(repo, old_id)
+        Ok(_) => return 9
+        Err(e) =>
+            if expect_not_found(@e) != 0
+                return 10
+
+    match wiki_page_repo_list_all(repo)
+        Ok(pages) => if vec_len<WikiPage>(@pages) == 1 then 0 else 11
+        Err(_) => 12
+
+
+[[test]]
+fn test_update_replaces_the_page() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_update(@repo)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn check_update_of_deleted_page(repo: *WikiPageRepository) -> i32
+    var page = page_of("home", "Home", "before")
+    match wiki_page_repo_insert(repo, @page)
+        Ok(_) => 0
+        Err(_) => return 2
+    match wiki_page_repo_delete(repo, page.id)
+        Ok(_) => 0
+        Err(_) => return 3
+    match wiki_page_repo_update(repo, @page)
+        Ok(_) => return 4
+        Err(e) =>
+            if expect_not_found(@e) != 0
+                return 5
+    # The insert half of the update must not resurrect the page.
+    match wiki_page_repo_list_all(repo)
+        Ok(pages) => if vec_len<WikiPage>(@pages) == 0 then 0 else 6
+        Err(_) => 7
+
+
+[[test]]
+fn test_update_of_a_deleted_page_is_not_found_and_leaves_nothing() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_update_of_deleted_page(@repo)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn check_failed_update(repo: *WikiPageRepository) -> i32
+    var page = page_of("home", "Home", "kept")
+    match wiki_page_repo_insert(repo, @page)
+        Ok(_) => 0
+        Err(_) => return 2
+    wiki_page_update_content(@page, big_string(4000))
+    match wiki_page_repo_update(repo, @page)
+        Ok(_) => return 3
+        Err(e) =>
+            if expect_database(@e) != 0
+                return 4
+    match wiki_page_repo_get_by_slug(repo, "home")
+        Ok(got) => if string_eq(@got.content, "kept") then 0 else 5
+        Err(_) => 6
+
+
+# Update writes before it deletes, so a refused write cannot lose the page.
+[[test]]
+fn test_failed_update_keeps_the_old_page() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_failed_update(@repo)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn check_delete(repo: *WikiPageRepository) -> i32
+    var page = page_of("home", "Home", "hi")
+    match wiki_page_repo_insert(repo, @page)
+        Ok(_) => 0
+        Err(_) => return 2
+    match wiki_page_repo_delete(repo, page.id)
+        Ok(_) => 0
+        Err(_) => return 3
+    match wiki_page_repo_get_by_slug(repo, "home")
+        Ok(_) => return 4
+        Err(e) =>
+            if expect_not_found(@e) != 0
+                return 5
+    match wiki_page_repo_delete(repo, page.id)
+        Ok(_) => 6
+        Err(e) => expect_not_found(@e)
+
+
+[[test]]
+fn test_delete_removes_the_page() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_delete(@repo)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn check_list(repo: *WikiPageRepository) -> i32
+    match wiki_page_repo_list_all(repo)
+        Ok(pages) =>
+            if vec_len<WikiPage>(@pages) != 0
+                return 2
+        Err(_) => return 3
+    if insert_page(repo, "one", "1") != 0
+        return 4
+    if insert_page(repo, "two", "2") != 0
+        return 5
+    match wiki_page_repo_list_all(repo)
+        Ok(pages) =>
+            if vec_len<WikiPage>(@pages) != 2
+                return 6
+            let first: WikiPage = vec_get<WikiPage>(@pages, 0)
+            if not string_eq(@first.slug, "one")
+                return 7
+            0
+        Err(_) => 8
+
+
+[[test]]
+fn test_list_all_returns_every_page() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_list(@repo)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+fn check_oversize(repo: *WikiPageRepository, size: i64) -> i32
+    var page = wiki_page_new(string_from("big"), string_from("Big"), big_string(size))
+    match wiki_page_repo_insert(repo, @page)
+        Ok(_) => return 2
+        Err(e) =>
+            if expect_database(@e) != 0
+                return 3
+    # The failure must not cost us the connection.
+    if insert_page(repo, "small", "still works") != 0
+        return 4
+    match wiki_page_repo_get_by_slug(repo, "small")
+        Ok(_) => 0
+        Err(_) => 5
+
+
+# A page bigger than the server's document limit is a clean error, not a crash.
+[[test]]
+fn test_oversize_page_is_a_database_error() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_oversize(@repo, 4000)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+# Bigger than the client's 64 KB message buffer too.
+[[test]]
+fn test_page_over_the_client_buffer_is_a_database_error() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_oversize(@repo, 100000)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc

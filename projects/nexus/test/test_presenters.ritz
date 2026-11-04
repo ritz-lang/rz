@@ -1,0 +1,278 @@
+# test/test_presenters.ritz - wiki requests to HTTP responses (AGAST #1377)
+
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from, string_new, string_drop, string_len, string_contains, string_push, string_as_view }
+
+import errors.service_error { ServiceError }
+import repos.wiki_page_repo {
+    WikiPageRepository,
+    wiki_page_repo_new,
+    wiki_page_repo_connect,
+    wiki_page_repo_disconnect
+}
+import repos.page_cache { PageCache, page_cache_new, page_cache_connect, page_cache_disconnect }
+import services.wiki_service { WikiService, wiki_service_new, wiki_service_create_page }
+import presenters.page_presenter {
+    STATUS_SAVED,
+    STATUS_DELETED,
+    present_index,
+    present_page_view,
+    present_page_edit,
+    present_page_save,
+    present_page_delete
+}
+import test.support.live_db { LiveDb, live_db_start, live_db_stop }
+
+
+struct World
+    db: LiveDb
+    repo: WikiPageRepository
+    cache: PageCache
+    svc: WikiService
+
+
+fn world_open(w: *World) -> i32
+    if live_db_start(@w.db) != 0
+        return 90
+    w.repo = wiki_page_repo_new()
+    match wiki_page_repo_connect(@w.repo, "127.0.0.1", w.db.port, false)
+        Ok(_) => 0
+        Err(_) => return 91
+    w.cache = page_cache_new()
+    match page_cache_connect(@w.cache, 4194304)
+        Ok(_) => 0
+        Err(_) => return 92
+    w.svc = wiki_service_new(@w.repo, @w.cache)
+    0
+
+
+fn world_close(w: *World)
+    page_cache_disconnect(@w.cache)
+    wiki_page_repo_disconnect(@w.repo)
+    live_db_stop(@w.db)
+
+
+fn save(w: *World, slug: StrView, title: StrView, content: StrView) -> i32
+    var out: String = string_new()
+    let status: i32 = present_page_save(@w.svc, slug, title, content, @&out)
+    string_drop(@&out)
+    status
+
+
+fn check_view(w: *World) -> i32
+    if save(w, "home", "My Title", "Welcome") != STATUS_SAVED
+        return 1
+    var out: String = string_new()
+    if present_page_view(@w.svc, "home", @&out) != 200
+        return 2
+    if not string_contains(@out, "<h1>My Title</h1>")
+        return 3
+    if not string_contains(@out, "Welcome")
+        return 4
+    if not string_contains(@out, "/wiki/home/edit")
+        return 5
+    0
+
+
+[[test]]
+fn test_view_renders_title_and_content() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_view(@w)
+    world_close(@w)
+    rc
+
+
+fn check_escaping(w: *World) -> i32
+    if save(w, "home", "<b>t</b>", "<script>alert(1)</script>") != STATUS_SAVED
+        return 1
+    var out: String = string_new()
+    if present_page_view(@w.svc, "home", @&out) != 200
+        return 2
+    if string_contains(@out, "<script>alert")
+        return 3
+    if string_contains(@out, "<b>t</b>")
+        return 4
+    if not string_contains(@out, "&lt;script&gt;")
+        return 5
+    var edit: String = string_new()
+    if present_page_edit(@w.svc, "home", @&edit) != 200
+        return 6
+    if string_contains(@edit, "<script>alert")
+        return 7
+    0
+
+
+# The old presenter copied title and content into the HTML unescaped.
+[[test]]
+fn test_stored_markup_is_escaped() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_escaping(@w)
+    world_close(@w)
+    rc
+
+
+fn check_missing(w: *World) -> i32
+    var view: String = string_new()
+    if present_page_view(@w.svc, "nope", @&view) != 404
+        return 1
+    if not string_contains(@view, "Page Not Found")
+        return 2
+    var edit: String = string_new()
+    if present_page_edit(@w.svc, "nope", @&edit) != 200
+        return 3
+    if not string_contains(@edit, "New Page")
+        return 4
+    var del: String = string_new()
+    if present_page_delete(@w.svc, "nope", @&del) != 404
+        return 5
+    0
+
+
+[[test]]
+fn test_missing_page() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_missing(@w)
+    world_close(@w)
+    rc
+
+
+fn check_save_updates(w: *World) -> i32
+    if save(w, "home", "Home", "one") != STATUS_SAVED
+        return 1
+    if save(w, "home", "Home", "two") != STATUS_SAVED
+        return 2
+    var out: String = string_new()
+    if present_page_view(@w.svc, "home", @&out) != 200
+        return 3
+    if not string_contains(@out, "two")
+        return 4
+    var form: String = string_new()
+    if present_page_edit(@w.svc, "home", @&form) != 200
+        return 5
+    if not string_contains(@form, "<textarea name=\"content\">two</textarea>")
+        return 6
+    0
+
+
+[[test]]
+fn test_save_updates_an_existing_page() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_save_updates(@w)
+    world_close(@w)
+    rc
+
+
+fn check_bad_input(w: *World) -> i32
+    var out: String = string_new()
+    if present_page_save(@w.svc, "bad slug", "Title", "x", @&out) != 400
+        return 1
+    if not string_contains(@out, "Bad Request")
+        return 2
+    0
+
+
+[[test]]
+fn test_invalid_slug_is_a_400() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_bad_input(@w)
+    world_close(@w)
+    rc
+
+
+fn check_database_failure(w: *World) -> i32
+    var content: String = string_new()
+    var i: i64 = 0
+    while i < 4000
+        string_push(@&content, 'x' as u8)
+        i += 1
+    var out: String = string_new()
+    if present_page_save(@w.svc, "big", "Big", string_as_view(@content), @&out) != 500
+        return 1
+    # The response must not leak the repository's error text.
+    if string_contains(@out, "Insert failed")
+        return 2
+    if not string_contains(@out, "An error occurred")
+        return 3
+    0
+
+
+[[test]]
+fn test_database_failure_is_a_generic_500() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_database_failure(@w)
+    world_close(@w)
+    rc
+
+
+fn check_delete(w: *World) -> i32
+    if save(w, "home", "Home", "x") != STATUS_SAVED
+        return 1
+    var del: String = string_new()
+    if present_page_delete(@w.svc, "home", @&del) != STATUS_DELETED
+        return 2
+    if string_len(@del) != 0
+        return 3
+    var view: String = string_new()
+    if present_page_view(@w.svc, "home", @&view) != 404
+        return 4
+    0
+
+
+[[test]]
+fn test_delete_then_view_is_a_404() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_delete(@w)
+    world_close(@w)
+    rc
+
+
+fn check_index(w: *World) -> i32
+    var empty: String = string_new()
+    if present_index(@w.svc, @&empty) != 200
+        return 1
+    if not string_contains(@empty, "No pages yet")
+        return 2
+    if save(w, "alpha", "A", "1") != STATUS_SAVED
+        return 3
+    if save(w, "beta", "B", "2") != STATUS_SAVED
+        return 4
+    var out: String = string_new()
+    if present_index(@w.svc, @&out) != 200
+        return 5
+    if not string_contains(@out, "/wiki/alpha")
+        return 6
+    if not string_contains(@out, "/wiki/beta")
+        return 7
+    0
+
+
+[[test]]
+fn test_index_lists_the_pages() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_index(@w)
+    world_close(@w)
+    rc

@@ -1,0 +1,137 @@
+# src/repos/wiki_page_codec.ritz - WikiPage <-> Mausoleum Document bytes
+#
+# A page is stored as a real Mausoleum Document: the server deserializes every
+# insert and rejects anything else. The same bytes are the Tome cache value, so
+# a cache hit restores exactly what the database holds. Spire's document
+# helpers carry string fields only, so numeric fields are stored in page_doc_decimal.
+
+import ritzlib.memory
+import ritzlib.strview { StrView, strview_len, strview_as_ptr, strview_from_ptr, strview_parse_i64 }
+import ritzlib.string { String, string_new, string_drop, string_len, string_as_view, string_from_bytes, string_push_i64 }
+
+import spire.repo.mausoleum { DbField, db_field, db_serialize_doc, db_extract_field }
+import mausoleum.document { DocumentId, doc_id_invalid }
+
+import models.wiki_page { WikiPage, wiki_page_new }
+import errors.repo_error { RepoError }
+
+
+const FIELD_COUNT: i32 = 9
+
+# Room for the Document header and the 9 keys around the variable-length
+# values. wiki_page_encode reports an error rather than overrun if it is wrong.
+const ENCODE_OVERHEAD: i64 = 1024
+
+
+fn page_doc_text_field(key: StrView, value: @String) -> DbField
+    let view: StrView = string_as_view(value)
+    db_field(strview_as_ptr(@key), strview_len(@key) as i32, strview_as_ptr(@view), strview_len(@view) as i32)
+
+
+fn page_doc_decimal(n: i64) -> String
+    var s: String = string_new()
+    string_push_i64(@&s, n)
+    s
+
+
+# The parent's id value, or the invalid id for a root page.
+fn parent_value(page: *WikiPage) -> i64
+    match page.parent_id
+        Some(id) => id.value
+        None => doc_id_invalid().value
+
+
+# Upper bound on the bytes wiki_page_encode writes for `page`.
+pub fn wiki_page_encode_bound(page: *WikiPage) -> i64
+    string_len(@page.slug) + string_len(@page.title) + string_len(@page.content) + ENCODE_OVERHEAD
+
+
+# Serialize `page` into `buf`. Returns the byte count, or < 0 if it won't fit.
+pub fn wiki_page_encode(page: *WikiPage, buf: *u8, buf_len: i64) -> i64
+    var id: String = page_doc_decimal(page.id.value)
+    var version: String = page_doc_decimal(page.version as i64)
+    var created: String = page_doc_decimal(page.created_at.nanos)
+    var updated: String = page_doc_decimal(page.updated_at.nanos)
+    var author: String = page_doc_decimal(page.author_id.value)
+    var parent: String = page_doc_decimal(parent_value(page))
+
+    var fields: [9]DbField
+    fields[0] = page_doc_text_field("slug", @page.slug)
+    fields[1] = page_doc_text_field("title", @page.title)
+    fields[2] = page_doc_text_field("content", @page.content)
+    fields[3] = page_doc_text_field("id", @id)
+    fields[4] = page_doc_text_field("version", @version)
+    fields[5] = page_doc_text_field("created_at", @created)
+    fields[6] = page_doc_text_field("updated_at", @updated)
+    fields[7] = page_doc_text_field("author_id", @author)
+    fields[8] = page_doc_text_field("parent_id", @parent)
+    let n: i64 = db_serialize_doc(buf, buf_len, @fields[0], FIELD_COUNT)
+
+    string_drop(@&id)
+    string_drop(@&version)
+    string_drop(@&created)
+    string_drop(@&updated)
+    string_drop(@&author)
+    string_drop(@&parent)
+    n
+
+
+# Field `name` into `tmp`, which holds at least `len` bytes: no field can be
+# longer than its document, so db_extract_field can never truncate it.
+fn page_doc_field(data: *u8, len: i32, name: StrView, tmp: *u8) -> Result<i32, RepoError>
+    let n: i32 = db_extract_field(data, len, strview_as_ptr(@name), strview_len(@name) as i32, tmp, len)
+    if n < 0
+        return Err(RepoError.SerializationError)
+    Ok(n)
+
+
+fn page_doc_text(data: *u8, len: i32, name: StrView, tmp: *u8) -> Result<String, RepoError>
+    let n: i32 = page_doc_field(data, len, name, tmp)?
+    Ok(string_from_bytes(tmp, n as i64))
+
+
+fn page_doc_i64(data: *u8, len: i32, name: StrView, tmp: *u8) -> Result<i64, RepoError>
+    let n: i32 = page_doc_field(data, len, name, tmp)?
+    let digits: StrView = strview_from_ptr(tmp, n as i64)
+    match strview_parse_i64(@digits)
+        Some(v) => Ok(v)
+        None => Err(RepoError.SerializationError)
+
+
+fn page_doc_decode(data: *u8, len: i32, tmp: *u8) -> Result<WikiPage, RepoError>
+    # Numbers first: a bad document fails before any String is allocated.
+    let id: i64 = page_doc_i64(data, len, "id", tmp)?
+    let version: i64 = page_doc_i64(data, len, "version", tmp)?
+    let created: i64 = page_doc_i64(data, len, "created_at", tmp)?
+    let updated: i64 = page_doc_i64(data, len, "updated_at", tmp)?
+    let author: i64 = page_doc_i64(data, len, "author_id", tmp)?
+    let parent: i64 = page_doc_i64(data, len, "parent_id", tmp)?
+
+    let slug: String = page_doc_text(data, len, "slug", tmp)?
+    let title: String = page_doc_text(data, len, "title", tmp)?
+    let content: String = page_doc_text(data, len, "content", tmp)?
+
+    var page: WikiPage = wiki_page_new(slug, title, content)
+    page.id.value = id
+    page.version = version as u64
+    page.created_at.nanos = created
+    page.updated_at.nanos = updated
+    page.author_id.value = author
+    if parent != doc_id_invalid().value
+        var parent_id: DocumentId = doc_id_invalid()
+        parent_id.value = parent
+        page.parent_id = Some(parent_id)
+    Ok(page)
+
+
+# Rebuild a page from wiki_page_encode's bytes. Anything else, including a
+# Document that lacks a field, is a SerializationError.
+pub fn wiki_page_decode(data: *u8, len: i32) -> Result<WikiPage, RepoError>
+    if data == null or len <= 0
+        return Err(RepoError.SerializationError)
+    let tmp: *u8 = malloc(len as i64)
+    if tmp == null
+        return Err(RepoError.SerializationError)
+    let result = page_doc_decode(data, len, tmp)
+    free(tmp)
+    result
