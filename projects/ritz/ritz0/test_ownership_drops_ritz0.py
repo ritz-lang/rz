@@ -11,7 +11,8 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
     (`let`, `var`, parameter) and on whichever path it moved (drop flags);
   * `break` leaves only the scopes inside the innermost loop;
   * a value lent to an `@T` parameter (auto-borrow) is not moved;
-  * a type with its own `drop` runs it before its fields' drops.
+  * a type with its own `drop` runs it before its fields' drops;
+  * a match arm binding one payload of several owns them all (AGAST #2177).
 
 Exit statuses encode what the program observed, as in the free-count test.
 """
@@ -87,6 +88,14 @@ def _run(tmp_path, body):
     assert link.returncode == 0, link.stderr[-2000:]
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 
+
+# A move-only enum with a two-field variant (AGAST #2177).
+PAIR = """\
+enum P
+    Two(Tracked, Tracked)
+    No
+
+"""
 
 RUNS = {
     # #1489: a generic struct of copy fields copies.
@@ -234,6 +243,36 @@ pub fn main() -> i32
     let before = ORDER
     return before
 """, 1),
+
+    # AGAST #2177: an arm binding one move-only payload of several owns the
+    # whole payload; the unbound `_` one drops with its bindings, at the
+    # arm's end (ritz1 binds a single payload only, so these are ritz0's).
+    "match_pair_payload_wildcard": (PAIR + """\
+fn f() -> i32
+    var s = P.Two(make(1), make(2))
+    match s
+        Two(a, _) => a.id
+        _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 22),
+
+    # One payload moved on, the other dropped at the arm's end: once each.
+    "match_pair_payload_one_moved": (PAIR + """\
+fn f() -> i32
+    var s = P.Two(make(1), make(2))
+    match s
+        Two(a, b) => consume(b)
+        _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 22),
 }
 
 REJECTS = {

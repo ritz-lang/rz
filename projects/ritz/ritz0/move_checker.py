@@ -805,6 +805,9 @@ class MoveChecker:
 
         elif isinstance(expr, rast.Match):
             self._check_expr(expr.expr, is_move_context=True)
+            # The match owns a scrutinee it moved (AGAST #2177, ritz1 #2174).
+            owned = self._owned_scrutinee_type(expr.expr)
+            expr.owns_scrutinee = owned
             # Each arm starts from the state before the match. After it, a
             # binding is moved if an arm that falls through moved it; an arm
             # that leaves (`break`, `return`, ...) took its moves with it.
@@ -815,6 +818,8 @@ class MoveChecker:
                 self._push_scope()
                 # Pattern bindings
                 self._check_pattern(arm.pattern)
+                if owned is not None:
+                    self._own_payload(arm, owned)
                 if isinstance(arm.body, rast.Block):
                     left = self._check_block(arm.body)
                 else:
@@ -1080,6 +1085,74 @@ class MoveChecker:
         else:
             # For non-identifier borrows, just check the expression
             self._check_expr(expr, is_move_context=False)
+
+    # ---- match scrutinees and payload bindings (AGAST #2177) -----------------
+    #
+    # ritz1's rule (#2174, ownership.ritz own_match_begin / own_match_payload):
+    # a match moves its scrutinee, so the match owns that value. An arm whose
+    # pattern binds a move-only payload (`Full(t)`) hands it to the binding,
+    # which is owned and dropped at the arm's end unless moved; any other arm
+    # (`_`, `Empty`, `Full(_)`) leaves it to the scrutinee, which drops after
+    # the arms meet. A borrowed scrutinee (`match @s`), or one read through a
+    # pointer, moves nothing and owns nothing.
+
+    def _owned_scrutinee_type(self, scrut: rast.Expr) -> Optional[rast.Type]:
+        """The type of a match scrutinee the match owns, or None: a
+        move-only binding it just moved, a move-only field it just moved
+        out of a binding, or a by-value call's move-only result."""
+        while isinstance(scrut, rast.Grouped):
+            scrut = scrut.expr
+        if isinstance(scrut, rast.Ident):
+            moved = getattr(scrut, 'moves_binding', False)
+        elif isinstance(scrut, rast.Field):
+            moved = getattr(scrut, 'moves_field', False)
+        else:
+            moved = isinstance(scrut, rast.Call)
+        if not moved:
+            return None
+        if isinstance(scrut, rast.Field):
+            base = self._infer_expr_type(scrut.expr)
+            ty = next((t for n, t in self.types.struct_fields(base)
+                       if n == scrut.field), None) if isinstance(base, rast.NamedType) else None
+        else:
+            ty = self._infer_expr_type(scrut)
+        return ty if self.types.is_move_only(ty) else None
+
+    def _variant_fields(self, ty: rast.Type, variant: str) -> Optional[List[rast.Type]]:
+        """The payload types of `variant` of the enum `ty`, with the enum's
+        type parameters replaced by `ty`'s args. None if not an enum's."""
+        while (isinstance(ty, rast.NamedType) and not ty.args
+               and ty.name in self.types.aliases):
+            ty = self.types.aliases[ty.name]
+        if not isinstance(ty, rast.NamedType):
+            return None
+        ed = self.types.enums.get(ty.name)
+        if ed is None:
+            return None
+        subst = dict(zip(ed.type_params or [], ty.args))
+        for v in ed.variants:
+            if v.name == variant:
+                return [_subst(t, subst) for t in v.fields]
+        return None
+
+    def _own_payload(self, arm: rast.MatchArm, scrut_ty: rast.Type) -> None:
+        """An arm of a match that owns its scrutinee: give each payload
+        binding its payload's type, so a move-only one is move-checked and
+        the emitter drops it. `arm.takes_payload` (the arm binds a move-only
+        payload) tells the emitter the arm, not the scrutinee, owns it."""
+        arm.takes_payload = False
+        pattern = arm.pattern
+        if not isinstance(pattern, rast.VariantPattern):
+            return
+        fields = self._variant_fields(scrut_ty, pattern.name)
+        if fields is None:
+            return
+        for sub, fty in zip(pattern.fields, fields):
+            if isinstance(sub, rast.IdentPattern) and self.types.is_move_only(fty):
+                info = self.scope.vars.get(sub.name)
+                if info is not None:
+                    info.ritz_type = fty
+                    arm.takes_payload = True
 
     def _check_pattern(self, pattern: rast.Pattern):
         """Check a pattern and register any bindings."""

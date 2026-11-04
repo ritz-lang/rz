@@ -17,7 +17,8 @@ ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). AGAST
 inside loops, closed for ritz0; ritz1's by AGAST #2165, except tuple
 elements (a strict xfail citing #1526, ritz1's missing tuple literals).
 AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
-#2171.
+#2171. AGAST #2174 added a match owning its scrutinee, with payload
+bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -69,6 +70,14 @@ fn make(id: i32) -> Tracked
 # A by-value parameter of a move-only type takes ownership.
 fn consume(t: Tracked) -> i32
     return t.id
+
+"""
+
+# A move-only enum, for the match cases (AGAST #2174, #2177).
+SLOT = """\
+enum Slot
+    Full(Tracked)
+    Empty
 
 """
 
@@ -515,6 +524,209 @@ pub fn main() -> i32
     f()
     return DROPS
 """, 2, {}),
+
+    # AGAST #2177 from here on (ritz1's cases from #2174, now shared).
+    # A match moves its scrutinee (ritz0's rule), and the match
+    # owns it.  A payload binding takes the payload and drops at the end of
+    # its arm unless moved; an arm that binds nothing drops the scrutinee.
+    # Each tens digit is the count inside f, before its `return`.
+    "match_stmt_payload_drops": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Full(t) => t.id
+        _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    "match_stmt_unbound_arm_drops": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Empty => 1
+        _ => 2
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    # `Full(_)` binds nothing either.
+    "match_stmt_wildcard_payload_drops": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Full(_) => 1
+        Empty => 2
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    # The payload moved on: dropped once, in consume.
+    "match_stmt_payload_moved": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Full(t) => consume(t)
+        _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    # An arm that returns drops its payload binding at the `ret`, once.
+    "match_stmt_payload_return": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Full(t) =>
+            return DROPS * 10 + t.id
+        _ =>
+            pass
+    return 99
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 2, {}),
+
+    # Returning from an arm that binds nothing drops the scrutinee there.
+    "match_stmt_unbound_arm_return": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Empty => 1
+        _ =>
+            return DROPS * 10
+    return 99
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 1, {}),
+
+    # The expression form: the payload no longer leaks.
+    "match_expr_payload_drops": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    let v = match s
+        Full(t) => t.id
+        _ => 0
+    return DROPS * 10 + v
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS * 100
+""", 111, {}),
+
+    # The payload moved out as the arm's value: u owns it, dropped once.
+    "match_expr_payload_moved_out": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    let u = match s
+        Full(t) => t
+        _ => make(2)
+    return DROPS * 10 + u.id
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS * 100
+""", 101, {}),
+
+    # A move-only field as the scrutinee moves out of its struct.
+    "match_field_scrutinee_drops": (SLOT + """\
+struct Box2
+    s: Slot
+    n: i32
+
+fn f() -> i32
+    var b = Box2 { s: Slot.Full(make(1)), n: 1 }
+    match b.s
+        Full(t) => t.id
+        _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    # A call's result as the scrutinee: the match owns it.
+    "match_call_scrutinee_drops": (SLOT + """\
+fn full(id: i32) -> Slot
+    return Slot.Full(make(id))
+
+fn f() -> i32
+    match full(1)
+        Full(t) => t.id
+        _ => 0
+    match full(2)
+        Empty => 1
+        _ => 2
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 22, {}),
+
+    # Option<Tracked>: `Some(t)` owns the payload.
+    "match_option_payload_drops": ("""\
+import ritzlib.option
+
+fn f() -> i32
+    var o: Option<Tracked> = Some(make(1))
+    match o
+        Some(t) => t.id
+        None => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    # A match in a loop: one drop per iteration, by whichever arm ran.
+    "match_in_loop_drops": (SLOT + """\
+fn f() -> i32
+    for i in 0..4
+        var s = Slot.Empty
+        if i % 2 == 0
+            s = Slot.Full(make(1))
+        match s
+            Full(t) => t.id
+            _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 22, {}),
+
+    # A borrowed scrutinee (`match @s`) moves nothing; s drops once, at
+    # its scope's end.
+    "match_borrowed_scrutinee": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match @s
+        Full(t) => 1
+        _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 1, {}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -583,6 +795,16 @@ pub fn main() -> i32
     var u = h.t
     return h.t.id
 """, "h.t", {}),
+
+    # AGAST #2177: a payload binding owns the payload, so it moves once.
+    "payload_after_move": (SLOT + """\
+pub fn main() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Full(t) => consume(t) + consume(t)
+        _ => 0
+    return 0
+""", "t", {}),
 }
 
 

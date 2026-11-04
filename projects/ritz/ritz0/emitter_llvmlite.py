@@ -1530,6 +1530,9 @@ class LLVMEmitter:
             if expr.elements and all(e is not None for e in elems):
                 return rast.TupleType(expr.span, elems)
             return None
+        elif isinstance(expr, rast.Match):
+            # A move-only arm value (_note_match_result_type, AGAST #2177).
+            return getattr(expr, 'result_ritz_type', None)
         elif isinstance(expr, rast.If):
             if expr.then_block and expr.then_block.expr:
                 return self._infer_ritz_type(expr.then_block.expr)
@@ -13070,6 +13073,10 @@ class LLVMEmitter:
             enum_val = self.builder.load(enum_val)
         enum_alloca = self.builder.alloca(enum_type, name="match.enum")
         self.builder.store(enum_val, enum_alloca)
+        # A match owns a scrutinee it moved (AGAST #2177, set by the move
+        # checker): the spill is a nameless binding in a drop scope of its
+        # own, dropped after the arms meet unless an arm took its payload.
+        scrut_flag = self._own_match_scrutinee(expr, enum_alloca)
 
         # Load the tag
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
@@ -13146,6 +13153,13 @@ class LLVMEmitter:
         for i, (arm, arm_block) in enumerate(zip(expr.arms, arm_blocks)):
             self.builder.position_at_end(arm_block)
             pattern = arm.pattern
+            # The arm's payload bindings drop at its end (AGAST #2177).
+            if scrut_flag is not None:
+                self._push_drop_scope()
+                takes = getattr(arm, 'takes_payload', False)
+                if takes:
+                    # This arm, not the scrutinee, owns the payload now.
+                    self.builder.store(ir.Constant(self.i1, 0), scrut_flag)
 
             # Bind pattern variables if this is a VariantPattern with fields
             if isinstance(pattern, rast.VariantPattern) and pattern.fields:
@@ -13180,6 +13194,14 @@ class LLVMEmitter:
                         self.params[field_pattern.name] = (field_val, llvm_field_type)
                         # Also store the Ritz type for field access on reference types
                         self.ritz_types[field_pattern.name] = field_type
+                        if scrut_flag is not None and takes:
+                            # The binding owns a move-only payload.
+                            self._register_let_drop(field_pattern.name, field_val, field_type)
+                    elif scrut_flag is not None and takes:
+                        # `Pair(a, _)`: a move-only payload nobody binds
+                        # drops with the arm's bindings.
+                        if self._register_drop_variable("match.payload", field_ptr, field_type):
+                            self._mark_drop_variable_initialized(field_ptr)
                     # Wildcard patterns just discard the value
 
             # Emit the arm body
@@ -13193,6 +13215,11 @@ class LLVMEmitter:
             arm_val = self._emit_expr_with_expected_enum(
                 arm.body, getattr(self, '_expected_enum_name', None))
             self.has_returned = _saved_arm_returned
+            if scrut_flag is not None:
+                # Falling off the arm drops what its bindings still own.
+                self._leave_drop_scope()
+            if not self.builder.block.is_terminated:
+                self._note_match_result_type(expr, arm.body)
 
             # Remember which block we're in after emitting the body
             if not self.builder.block.is_terminated:
@@ -13217,6 +13244,45 @@ class LLVMEmitter:
         # continues here and later statements/tail must still be emitted.
         if arm_exit_blocks and all(b is None for b in arm_exit_blocks):
             self.has_returned = True
+        result = self._enum_match_result(expr, arm_values, arm_exit_blocks)
+        if scrut_flag is not None:
+            # After the result's phi: drop the scrutinee where no arm took
+            # its payload. Nothing reaches the merge when every arm left.
+            scope = self._pop_drop_scope()
+            if any(b is not None for b in arm_exit_blocks):
+                self._emit_drop_for_scope(scope)
+        return result
+
+    def _note_match_result_type(self, expr: rast.Match, body: rast.Expr) -> None:
+        """Record a move-only arm value's type on the match, inferred while
+        the arm's bindings are in scope, so `let u = match s` with
+        `Full(t) => t` owns (and drops) the value (AGAST #2177). Only
+        move-only types: other lets keep their inference unchanged."""
+        if getattr(expr, 'result_ritz_type', None) is not None:
+            return
+        ty = self._infer_ritz_type(body)
+        if ty is not None and self._type_implements_drop(ty):
+            expr.result_ritz_type = ty
+
+    def _own_match_scrutinee(self, expr: rast.Match,
+                             slot: ir.AllocaInstr) -> Optional[ir.AllocaInstr]:
+        """If the match owns its scrutinee (`expr.owns_scrutinee`, the move
+        checker's), open the match's drop scope with `slot`, the spilled
+        scrutinee, as its nameless binding. Returns that binding's drop
+        flag, or None when the match owns nothing (AGAST #2177)."""
+        ty = getattr(expr, 'owns_scrutinee', None)
+        if ty is None or not self.drop_scope_stack:
+            return None
+        self._push_drop_scope()
+        if not self._register_drop_variable("match.scrut", slot, ty):
+            self._pop_drop_scope()
+            return None
+        self._mark_drop_variable_initialized(slot)
+        return self.drop_flags[id(slot)]
+
+    def _enum_match_result(self, expr: rast.Match, arm_values: list,
+                           arm_exit_blocks: list) -> ir.Value:
+        """The value of an enum match, built in its merge block."""
 
         # Create phi node for the result if arms have values
         if arm_values and arm_exit_blocks:
