@@ -15,8 +15,7 @@ Today's gaps are strict xfails, so the room that closes one has to flip it:
   * ritz0: AGAST #2157 (block-scope drops, `let` drops, reassignment, the
     double drop of an argument moved into a callee, field drop glue, and
     "plain structs copy");
-  * ritz1 / ritz1_selfhosted: AGAST #2158 (no move checker, no drop
-    insertion at all).
+  * ritz1 / ritz1_selfhosted: none since AGAST #2158 (ritz1/src/ownership.ritz).
 """
 
 import os
@@ -80,7 +79,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz0": 2157, "ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 1, {"ritz0": 2157}),
 
     "scope_end_var": ("""\
 fn f()
@@ -89,7 +88,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 1, {}),
 
     # Dropped when the `if` body ends, not when f does.
     "nested_block_end": ("""\
@@ -101,7 +100,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 11, {"ritz0": 2157, "ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 11, {"ritz0": 2157}),
 
     # Once per call, on either path.
     "early_return": ("""\
@@ -115,7 +114,7 @@ pub fn main() -> i32
     f(1)
     f(0)
     return DROPS
-""", 2, {"ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 2, {}),
 
     # Iterations 0 and 1 drop at the end of the body; iteration 2 on `break`.
     "break": ("""\
@@ -130,7 +129,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 3, {"ritz0": 2157, "ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 3, {"ritz0": 2157}),
 
     # Four iterations, two of which leave by `continue`.
     "continue": ("""\
@@ -145,7 +144,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 4, {"ritz0": 2157, "ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 4, {"ritz0": 2157}),
 
     # The old value is dropped by the assignment, the new one at scope end.
     "reassignment": ("""\
@@ -157,7 +156,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 12, {"ritz0": 2157, "ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 12, {"ritz0": 2157}),
 
     # consume() owns and drops it; f must not drop it again (ritz0: 12).
     "move_into_callee": ("""\
@@ -169,7 +168,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 11, {"ritz0": 2157, "ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 11, {"ritz0": 2157}),
 
     # build() moves t out: not dropped there, dropped once by f's scope.
     "move_out_by_return": ("""\
@@ -184,7 +183,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 1, {"ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 1, {}),
 
     # Plain copies: `a` stays usable after every copy, and nothing drops.
     "plain_struct_copy": ("""\
@@ -212,7 +211,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER - 300
-""", 21, {"ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 21, {}),
 
     # Holder has no Drop impl; dropping it drops its Tracked field.
     "field_drop_glue": ("""\
@@ -222,7 +221,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER
-""", 4, {"ritz0": 2157, "ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", 4, {"ritz0": 2157}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -232,14 +231,14 @@ pub fn main() -> i32
     var t = make(1)
     consume(t)
     return t.id
-""", "t", {"ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", "t", {}),
 
     "after_move_by_binding": ("""\
 pub fn main() -> i32
     var t = make(1)
     var u = t
     return t.id
-""", "t", {"ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", "t", {}),
 
     # Move-only through its field.
     "holder_after_move": ("""\
@@ -247,7 +246,7 @@ pub fn main() -> i32
     var h = Holder { t: make(1), n: 2 }
     var g = h
     return h.n
-""", "h", {"ritz1": 2158, "ritz1_selfhosted": 2158}),
+""", "h", {}),
 }
 
 

@@ -50,6 +50,7 @@ import emitter_expr_call     # is_variant_carrier, is_variant_null, resolve_enum
 import emitter_expr_access   # is_ident_none
 import emitter_stmt          # emit_stmt, for block-bodied arms (AGAST #1454)
 import enum_as_int          # enum_as_int_expr (AGAST #2136)
+import ownership            # arm scopes for drops (AGAST #2158)
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
@@ -439,6 +440,7 @@ fn publish_match_type(s: *EmitterState, result: *MatchResult)
 fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: *u8, enum_name_len: i32, result: *MatchResult, arm_index: i32, end_label: i32)
     # Save local_count so arm-scoped bindings get popped after the body.
     let saved_local_count: i32 = s.local_count
+    own_push_scope(s)   # AGAST #2158: the arm is a block for drops
 
     # Bind variant payload to inner pattern name on `Constructor(binding)`.
     if arm.pattern_kind == PAT_VARIANT
@@ -527,6 +529,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         let nested: i32 = arm.body.kind == EXPR_MATCH or arm.body.kind == EXPR_IF
         if nested
             s.match_no_value = 1
+        own_check_arm(s, arm.body)   # AGAST #2158: the arm's value moves out
         body_reg = emit_expr(s, arm.body)
     if arm.is_pass == 0 and arm.body != null and body_reg == 0
         # AGAST #1654: a void call (`Some(e) => say(e)`), or a nested
@@ -571,6 +574,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         if result.agg_name == null
             body_reg = match_arm_float_settle(s, arm.body, body_reg, result)
 
+    # AGAST #2158: drop the arm's bindings once its value is computed.
+    own_pop_scope(s)
     s.local_count = saved_local_count
     # ritz-task-193 — drop the inner-arm binding from local_map so the next
     # find_local on the shadowed name returns the outer binding via the map

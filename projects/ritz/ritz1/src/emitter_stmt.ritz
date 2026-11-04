@@ -21,6 +21,7 @@ import let_check           # let_check_stmt / let_mark_decl (AGAST #2028)
 import emitter_expr_call   # method_callee_def (AGAST #1798)
 import emitter_print       # emit_assert_stmt (AGAST #1869)
 import enum_as_int        # enum_as_int_stmt (AGAST #2136)
+import ownership          # move check + drops (AGAST #2158)
 
 # resolve_member_chain_field moved to emitter_core (AGAST #1660) so the
 # binary-op emitter can type enum-valued member operands too.
@@ -1889,10 +1890,14 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c"\n")
 
     # Body statements.
+    let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
+    own_push_scope(s)
     var body_stmt: *Stmt = stmt.for_body
     while body_stmt != null
         emit_stmt(s, body_stmt, ret_type)
         body_stmt = body_stmt.next
+    own_pop_scope(s)
+    own_loop_exit(s, own_loop)
 
     emit_str(s, c"  br label %")
     emit_label(s, incr_label)
@@ -2388,7 +2393,22 @@ fn emit_local_field_store_fallback(s: *EmitterState, stmt: *Stmt, with_index: i3
     fb_st.next = null
     emit_assign(s, @fb_st)
 
+# AGAST #2158: the move check and drop insertion (ownership.ritz) wrap every
+# statement.  The check runs first, so a statement's moves clear their drop
+# flags before it executes; `x = v` drops x's old value once v is stored.
 fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
+    own_check_stmt(s, stmt)
+    if stmt.kind == STMT_ASSIGN
+        var old: i32 = 0
+        var old_flag: i32 = 0
+        let ob: *OwnBinding = own_assign_begin(s, stmt, @old, @old_flag)
+        emit_stmt_inner(s, stmt, ret_type)
+        own_assign_end(s, ob, old, old_flag)
+        return
+    emit_stmt_inner(s, stmt, ret_type)
+    own_after_stmt(s, stmt)
+
+fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # AGAST #2028: reject writes / `@&` into a `let` before emitting them.
     let_check_stmt(s, stmt)
     # AGAST #2136: an enum value where an integer is expected.
@@ -2397,6 +2417,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let locals_before: i32 = s.local_count
         emit_var_decl(s, stmt)
         let_mark_decl(s, stmt, locals_before)
+        own_decl(s, stmt, locals_before)   # AGAST #2158
     else if stmt.kind == STMT_TUPLE_DECL
         # `let (x, y) = expr` — destructure 2-field struct value.  Resolve
         # the struct type from the init expr, extract fields 0 and 1, and
@@ -2541,10 +2562,17 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
         begin_block(s, then_label)
         clear_last_expr(s)  # Reset before then branch
+        # AGAST #2158: each arm is a block for drops; the move check
+        # merges the arms' moved bindings (own_if_merge).
+        let own_before: *i32 = own_snapshot(s)
+        own_push_scope(s)
         var then_stmt: *Stmt = stmt.if_then
         while then_stmt != null
             emit_stmt(s, then_stmt, ret_type)
             then_stmt = then_stmt.next
+        let own_then_dead: i32 = own_pop_scope(s)
+        let own_after_then: *i32 = own_snapshot(s)
+        var own_else_dead: i32 = 0
         # ritz-task-1309 — `last_expr_here` (not `s.last_expr_reg`) so a value
         # produced in a block nested inside the then-arm, which the insertion
         # point has since left, is reported as "no value" instead of being
@@ -2560,10 +2588,13 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         if stmt.if_else != null
             begin_block(s, else_label)
             clear_last_expr(s)  # Reset before else branch
+            own_restore(s, own_before)
+            own_push_scope(s)
             var else_stmt: *Stmt = stmt.if_else
             while else_stmt != null
                 emit_stmt(s, else_stmt, ret_type)
                 else_stmt = else_stmt.next
+            own_else_dead = own_pop_scope(s)
             else_result = last_expr_here(s)  # Capture else branch result
             else_exit_label = s.current_label  # Capture actual exit block
             emit_str(s, c"  br label %")
@@ -2571,6 +2602,10 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c"\n")
 
         begin_block(s, end_label)
+        var own_has_else: i32 = 0
+        if stmt.if_else != null
+            own_has_else = 1
+        own_if_merge(s, own_before, own_after_then, own_then_dead, own_has_else, own_else_dead)
 
         # If both branches produce values, emit a phi node.  When the
         # enclosing fn returns a tagged-enum struct, both branches hand us
@@ -2657,10 +2692,14 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c"\n")
 
         begin_block(s, body_label)
+        let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
+        own_push_scope(s)
         var body_stmt: *Stmt = stmt.while_body
         while body_stmt != null
             emit_stmt(s, body_stmt, ret_type)
             body_stmt = body_stmt.next
+        own_pop_scope(s)
+        own_loop_exit(s, own_loop)
         emit_str(s, c"  br label %")
         emit_label(s, cond_label)
         emit_str(s, c"\n")
@@ -2695,10 +2734,14 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c"\n")
 
         begin_block(s, body_label)
+        let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
+        own_push_scope(s)
         var body_stmt: *Stmt = stmt.while_body
         while body_stmt != null
             emit_stmt(s, body_stmt, ret_type)
             body_stmt = body_stmt.next
+        own_pop_scope(s)
+        own_loop_exit(s, own_loop)
         emit_str(s, c"  br label %")
         emit_label(s, body_label)
         emit_str(s, c"\n")
@@ -2800,10 +2843,14 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
         # Body block
         begin_block(s, body_label)
+        let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
+        own_push_scope(s)
         var body_stmt: *Stmt = stmt.for_body
         while body_stmt != null
             emit_stmt(s, body_stmt, ret_type)
             body_stmt = body_stmt.next
+        own_pop_scope(s)
+        own_loop_exit(s, own_loop)
         emit_str(s, c"  br label %")
         emit_label(s, incr_label)
         emit_str(s, c"\n")
@@ -2843,6 +2890,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
     else if stmt.kind == STMT_BREAK
         if s.break_label >= 0
+            own_loop_jump(s)   # AGAST #2158: drop the loop body's bindings
             emit_str(s, c"  br label %")
             emit_label(s, s.break_label)
             emit_str(s, c"\n")
@@ -2860,6 +2908,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
     else if stmt.kind == STMT_CONTINUE
         if s.continue_label >= 0
+            own_loop_jump(s)   # AGAST #2158
             emit_str(s, c"  br label %")
             emit_label(s, s.continue_label)
             emit_str(s, c"\n")

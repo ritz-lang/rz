@@ -22,6 +22,7 @@ import ll_copy_scan   # AGAST #1732
 import emitter_print
 import narrowing         # narrowing_begin_fn (AGAST #1364)
 import enum_as_int       # enum_as_int_tail (AGAST #2136)
+import ownership         # own_begin_fn / own_end_fn (AGAST #2158)
 
 # The implicit-return tail shared by emit_fn and emit_impl_method (AGAST #1573).
 #
@@ -717,6 +718,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         param3 = param3.next
 
     clear_last_expr(s)  # Reset before processing function body (ritz-task-1309)
+    own_begin_fn(s, f.params)   # AGAST #2158: by-value move-only params
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = f.body
     while stmt != null
@@ -724,6 +726,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         if stmt.next == null and stmt.kind == STMT_EXPR
             has_explicit_return = 1
             enum_as_int_tail(s, stmt.expr, f.return_type)   # AGAST #2136
+            own_check_tail(s, stmt.expr)   # AGAST #2158: the tail is moved out
             # Special handling for struct literal returns
             if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
@@ -863,6 +866,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         stmt = stmt.next
 
     emit_implicit_return_tail(s, has_explicit_return, f.return_type, f.return_type_name, f.return_type_name_len)
+    own_end_fn(s, body_start)                    # AGAST #2158: drops before `ret`
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     align_packed_accesses(s, body_start)         # AGAST #1918
     hoist_entry_allocas(s, body_start)
@@ -1052,6 +1056,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         set_local_fn_sig(s, param2.name, param2.name_len, param2.fn_sig)  # AGAST #1671
         param2 = param2.next
 
+    own_begin_fn(s, method.params)   # AGAST #2158
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = method.body
     while stmt != null
@@ -1059,6 +1064,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         if stmt.next == null and stmt.kind == STMT_EXPR
             has_explicit_return = 1
             enum_as_int_tail(s, stmt.expr, method.return_type)   # AGAST #2136
+            own_check_tail(s, stmt.expr)   # AGAST #2158
             # Special handling for struct literal returns
             if stmt.expr.kind == EXPR_STRUCT_LIT and method.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
@@ -1204,6 +1210,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # AGAST #1573 — same tail as emit_fn: close the final block if the body
     # did not already end in a `ret`.
     emit_implicit_return_tail(s, has_explicit_return, method.return_type, method.return_type_name, method.return_type_name_len)
+    own_end_fn(s, body_start)                    # AGAST #2158: drops before `ret`
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     align_packed_accesses(s, body_start)         # AGAST #1918
     hoist_entry_allocas(s, body_start)
@@ -3060,6 +3067,7 @@ fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     s.continue_label = -1
     s.module = m
     locals_init(@s, LOCALS_INIT_CAP)
+    own_init(@s)   # AGAST #2158
     namelist_init(@s.strings, STRINGS_INIT_CAP)
     namelist_init(@s.externs, 256)
     namelist_init(@s.emitted_structs, 256)
