@@ -297,12 +297,13 @@ def find_test_functions(source_path: str) -> List[Tuple[str, rast.FnDef]]:
 
 
 def strip_main_from_source(source: str) -> str:
-    """Remove any existing main() function from source.
+    """Blank out any top-level main() function in `source`.
 
-    This is a simple approach - find 'fn main()' and remove everything after it.
-    This works because main() is typically at the end of test files.
+    `main` ends at the next non-blank, non-comment line indented no deeper
+    than `fn main` itself, whatever it is (an attribute, `const`, `fn`...).
+    Its lines are replaced by empty lines, not deleted, so every line after
+    it keeps its number: assert and diagnostic locations stay right (#2181).
     """
-    # Find 'fn main(' or 'fn main()' - must be at start of line (possibly indented)
     lines = source.split('\n')
     result_lines = []
     in_main = False
@@ -310,24 +311,13 @@ def strip_main_from_source(source: str) -> str:
 
     for line in lines:
         stripped = line.lstrip()
-        if stripped.startswith('fn main(') or stripped.startswith('fn main ()'):
+        indent = len(line) - len(stripped)
+        if in_main and stripped and not stripped.startswith('#') and indent <= main_indent:
+            in_main = False
+        if not in_main and (stripped.startswith('fn main(') or stripped.startswith('fn main (')):
             in_main = True
-            main_indent = len(line) - len(stripped)
-            continue
-
-        if in_main:
-            # Check if we've exited main (new top-level definition)
-            if stripped and not stripped.startswith('#'):
-                current_indent = len(line) - len(stripped)
-                if current_indent <= main_indent and (stripped.startswith('fn ') or
-                                                       stripped.startswith('struct ') or
-                                                       stripped.startswith('@') or
-                                                       stripped.startswith('import ')):
-                    in_main = False
-                    result_lines.append(line)
-            continue
-
-        result_lines.append(line)
+            main_indent = indent
+        result_lines.append('' if in_main else line)
 
     return '\n'.join(result_lines)
 
@@ -831,7 +821,9 @@ def build_test_binary(source_path: str, tmpdir: str,
     # it compiles the file in place; it drops `main` before emitting anything.
     harness_ll = os.path.join(tmpdir, "test_main.ll")
     if compiler == "ritz0":
-        harness_path = os.path.join(tmpdir, "test_main.ritz")
+        # Named after the test file: an assert reports its file's basename
+        # (AGAST #2181), and a diagnostic names the file it came from.
+        harness_path = os.path.join(tmpdir, Path(source_path).name)
         Path(harness_path).write_text(strip_main_from_source(Path(source_path).read_text()))
     else:
         harness_path = str(Path(source_path).resolve())

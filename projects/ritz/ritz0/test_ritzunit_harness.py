@@ -231,6 +231,74 @@ def test_crash_assert_and_timeout_are_attributed(package, tmp_path, monkeypatch)
     assert failures[0].startswith("hangs:") and "timeout" in failures[0]
 
 
+@pytest.mark.unit
+def test_strip_main_keeps_line_numbers_and_what_follows_main():
+    """AGAST #2181: `main`'s lines are blanked, not deleted, and it ends at
+    the next top-level line of any kind; an attribute after it used to be
+    swallowed with it (only `fn`/`struct`/`@`/`import` ended `main`)."""
+    source = textwrap.dedent("""\
+        fn main() -> i32
+            # a comment inside main
+            0
+
+        [[test_helper]]
+        fn helper()
+            let x: i32 = 1
+        const C: i32 = 2
+        """)
+    stripped = test_runner.strip_main_from_source(source)
+    out, src = stripped.split("\n"), source.split("\n")
+    assert len(out) == len(src)
+    assert out[:3] == ["", "", ""]
+    assert out[3:] == src[3:]
+
+
+# `main` sits above the tests: a harness that deletes its lines would shift
+# every location after it.
+ASSERT_LOCATION_SOURCE = """\
+fn main() -> i32
+    let unused: i32 = 7
+    unused
+
+[[test_helper]]
+fn expect_positive(x: i32)
+    assert x > 0
+
+[[test]]
+fn direct() -> i32
+    assert 1 == 2
+    0
+
+[[test]]
+fn via_helper() -> i32
+    expect_positive(0)
+    0
+"""
+
+
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_assert_location_names_the_test_file(package, tmp_path, request, compiler):
+    """AGAST #2181: a failing assert names the test's own file and line.
+
+    ritz0 compiled a main-stripped copy written to `<tmpdir>/test_main.ritz`,
+    so every assert read `test_main.ritz:N`, and N was shifted by the lines
+    of the stripped `main`. A [[test_helper]]'s assert reports the calling
+    test's line (#1869), in the same file.
+    """
+    if compiler == "ritz1":
+        request.getfixturevalue("ritz1_bin")
+    test_file = package(ASSERT_LOCATION_SOURCE)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    exe, error = test_runner.build_test_binary(str(test_file), str(scratch), compiler)
+    assert error is None, error
+    report = json.loads(_run(exe, "--json").stdout)
+    output = {t["name"]: t.get("output", "") for t in report["tests"]}
+    assert "test_case.ritz:11: assertion failed" in output["direct"], output
+    assert "test_case.ritz:16: assertion failed" in output["via_helper"], output
+    assert "test_main" not in "".join(output.values()), output
+
+
 def test_runner_symbols_cannot_clash_with_the_program(package, tmp_path):
     """The runner is linked with every symbol but `main` made local.
 
