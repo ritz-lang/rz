@@ -14,9 +14,9 @@ expected statuses come from the spec, not from what a compiler does today.
 The first gaps these programs exposed are closed: ritz0's by AGAST #2157,
 ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). AGAST
 #2161 added enum payloads, array and tuple elements, temporaries and moves
-inside loops, closed for ritz0; ritz1's are strict xfails citing #2165 (and
-#1526, ritz1's missing tuple literals). A new gap goes in as a strict xfail,
-so the room that closes it has to flip it.
+inside loops, closed for ritz0; ritz1's by AGAST #2165, except tuple
+elements (a strict xfail citing #1526, ritz1's missing tuple literals). A new
+gap goes in as a strict xfail, so the room that closes it has to flip it.
 """
 
 import os
@@ -240,7 +240,7 @@ pub fn main() -> i32
     f(1)
     f(0)
     return DROPS
-""", 1, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", 1, {}),
 
     # The generic enum from ritzlib, instantiated at a move-only type.
     "option_payload": ("""\
@@ -253,7 +253,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", 1, {}),
 
     # Array elements drop in index order: 1, 2, 3.
     "array_elements": ("""\
@@ -263,7 +263,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER
-""", 123, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", 123, {}),
 
     # Tuple elements drop in order; the i32 in between is not dropped.
     "tuple_elements": ("""\
@@ -285,7 +285,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 11, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", 11, {}),
 
     # Lent to an `@T` parameter, the temporary is still nobody's: it drops
     # once the `let` statement ends. inner = 1 * 10 + 2.
@@ -300,7 +300,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner + DROPS
-""", 13, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", 13, {}),
 
     # A `return` statement's temporary drops after the value is evaluated
     # (DROPS is still 0 there), before the function returns. inner = 2.
@@ -314,7 +314,7 @@ fn f() -> i32
 pub fn main() -> i32
     let inner = f()
     return inner * 10 + DROPS
-""", 21, {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", 21, {}),
 
     # Moving an outer binding inside a loop is fine when every path back to
     # the loop head assigns it again: consume drops ids 0, 1 and 2, the
@@ -380,7 +380,7 @@ pub fn main() -> i32
         consume(t)
         i = i + 1
     return 0
-""", "t", {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", "t", {}),
 
     # A `continue` path also reaches the loop head with t moved.
     "move_in_loop_continue": ("""\
@@ -394,7 +394,7 @@ pub fn main() -> i32
             continue
         t = make(2)
     return 0
-""", "t", {"ritz1": 2165, "ritz1_selfhosted": 2165}),
+""", "t", {}),
 
     # Moved on the path that breaks out, so not usable after the loop.
     "after_move_then_break": ("""\

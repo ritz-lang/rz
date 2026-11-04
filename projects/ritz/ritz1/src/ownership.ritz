@@ -33,14 +33,32 @@
 #     because ritz1 emits `ret` from dozens of sites.  A binding whose block
 #     already ended has a cleared flag, so it is not dropped twice.
 # Glue: a type's own `drop` (if it has one) runs first, then each move-only
-# field is dropped in declaration order.
+# field is dropped in declaration order.  An array drops its elements in
+# index order; an enum (a user enum, or a tagged Option / Result) drops the
+# payload of the variant its tag names (AGAST #2165).
 #
-# A fn without move-only bindings emits nothing extra: every hook below
-# returns at once when no binding is registered.
+# Temporaries (AGAST #2165).  A call whose by-value move-only result nobody
+# owns -- an expression statement `make(1)`, `make(1).id`, an argument lent
+# to an `@T` parameter -- is marked by the move check; emit_expr spills its
+# value with a drop flag, and the temporary drops at the end of its
+# statement, or of the `if` / `while` condition it is in.  A `return`'s
+# temporaries drop before the `ret`, with the fn's bindings.  As in ritz0, a
+# method call's result is not a temporary.
 #
-# Not yet (AGAST #2165): glue for array elements and enum payloads, drops of
-# temporaries, and moves out of a field.  Tests: ritz0/test_ownership_free_count.py
-# (shared with ritz0) and ritz0/test_ritz1_ownership.py.
+# Loops (AGAST #2165, ritz0's _check_loop).  A binding declared outside a
+# loop must not reach the loop head moved, or the next iteration uses a
+# moved value.  ritz1 checks the body once, as it emits it, so alongside
+# `moved` each binding carries `shadow`: moved-if-the-head-was-moved.  Uses
+# while shadowed are recorded; at the loop's end, if the body's fall-through
+# or a `continue` reaches the head with the binding moved, each recorded use
+# is reported, as ritz0's re-check of the body reports it.
+#
+# A fn without move-only bindings, in a module without `impl Drop`, emits
+# nothing extra.
+#
+# Not yet: moves out of a field, and merging match-arm moves (AGAST #2168).
+# Tests: ritz0/test_ownership_free_count.py (shared with ritz0) and
+# ritz0/test_ritz1_ownership.py.
 
 import ritzlib.sys
 import ritzlib.io
@@ -58,6 +76,15 @@ const OWN_INIT_CAP: i32 = 16
 # Deeper than any real struct nesting; stops a malformed recursive type.
 const OWN_MAX_DEPTH: i32 = 32
 
+# Loop move-check events (OwnState.loop_ev): [kind, slot, depth, a, b, c, d]
+# with `slot` the binding's storage register (its identity) and `depth` the
+# loop nesting depth they belong to.
+const OWN_EV_INTS: i32 = 7
+const OWN_EV_SAVE: i32 = 1    # loop entry: a = shadow before, b = moved, c:d = its move
+const OWN_EV_USE: i32 = 2     # a use while shadowed: a = 1 for a borrow, c:d = where
+const OWN_EV_HEAD: i32 = 3    # `continue` with it moved: c:d = the move
+const OWN_EV_BREAK: i32 = 4   # `break` with it moved: c:d = the move
+
 pub fn own_init(s: *EmitterState)
     let o: *OwnState = malloc(sizeof(OwnState)) as *OwnState
     o.live = malloc((OWN_INIT_CAP as i64) * sizeof(OwnBinding)) as *OwnBinding
@@ -72,6 +99,19 @@ pub fn own_init(s: *EmitterState)
     o.all_cap = OWN_INIT_CAP
     o.loop_base = -1
     o.ret_seq = 0
+    o.has_drop = 0 - 1
+    o.temp_exprs = malloc((OWN_INIT_CAP as i64) * 8) as **Expr
+    o.temp_expr_count = 0
+    o.temp_expr_cap = OWN_INIT_CAP
+    o.temps = malloc((OWN_INIT_CAP as i64) * sizeof(OwnBinding)) as *OwnBinding
+    o.temp_count = 0
+    o.temp_cap = OWN_INIT_CAP
+    o.stmt_mark = 0
+    o.loop_ev = malloc((OWN_INIT_CAP * OWN_EV_INTS * 4) as i64) as *i32
+    o.loop_ev_count = 0
+    o.loop_ev_cap = OWN_INIT_CAP
+    o.loop_depth = 0
+    o.last_pop_dead = 0
     s.own = o
 
 fn own_live_at(o: *OwnState, i: i32) -> *OwnBinding
@@ -84,6 +124,30 @@ fn own_all_at(o: *OwnState, i: i32) -> *OwnBinding
 
 fn own_copy_binding(dst: *OwnBinding, src: *OwnBinding)
     memcpy(dst as *u8, src as *u8, sizeof(OwnBinding))
+
+fn own_temp_at(o: *OwnState, i: i32) -> *OwnBinding
+    let base: *OwnBinding = o.temps
+    return @base[i]
+
+# Event `i` of the loop move check (OWN_EV_INTS i32s).
+fn own_ev_at(o: *OwnState, i: i32) -> *i32
+    let base: *i32 = o.loop_ev
+    return base + i * OWN_EV_INTS
+
+fn own_ev_push(o: *OwnState, kind: i32, slot: i32, a: i32, b: i32, c: i32, d: i32)
+    if o.loop_ev_count >= o.loop_ev_cap
+        let cap: i32 = o.loop_ev_cap * 2
+        o.loop_ev = realloc(o.loop_ev as *u8, (cap * OWN_EV_INTS * 4) as i64) as *i32
+        o.loop_ev_cap = cap
+    let ev: *i32 = own_ev_at(o, o.loop_ev_count)
+    ev[0] = kind
+    ev[1] = slot
+    ev[2] = o.loop_depth
+    ev[3] = a
+    ev[4] = b
+    ev[5] = c
+    ev[6] = d
+    o.loop_ev_count = o.loop_ev_count + 1
 
 # =============================================================================
 # Move-only types
@@ -127,19 +191,84 @@ fn own_move_only_depth(s: *EmitterState, name: *u8, len: i32, depth: i32) -> i32
         i = j
     let st: *StructDef = find_struct(s, name, len)
     if st == null
+        # A user enum is move-only when a variant's payload is (AGAST #2165).
+        let ei: i32 = user_enum_index(name, len)
+        if ei < 0
+            return 0
+        var vi: i32 = 0
+        while vi < enum_variant_count(ei)
+            if own_fields_move_only(s, enum_variant_fields(ei, vi), depth + 1) == 1
+                return 1
+            vi += 1
         return 0
-    var f: *StructField = st.fields
+    own_fields_move_only(s, st.fields, depth + 1)
+
+# The leaf elements of an N-D array shape, when they are structs: 1, with
+# their total count and type.
+fn own_shape_elems(sh: *ArrayShape, out_n: *i32, out_name: **u8, out_len: *i32) -> i32
+    if sh.leaf_type != TYPE_STRUCT or sh.leaf_name_len <= 0
+        return 0
+    var n: i32 = 1
+    var d: i32 = 0
+    while d < sh.rank
+        n = n * sh.dims[d]
+        d += 1
+    *out_n = n
+    *out_name = sh.leaf_name
+    *out_len = sh.leaf_name_len
+    1
+
+# An array field of struct elements: 1, with the element count (every
+# leaf of an N-D array) and the element type.
+fn own_field_array(f: *StructField, out_n: *i32, out_name: **u8, out_len: *i32) -> i32
+    if f.field_type != TYPE_ARRAY
+        return 0
+    if f.array_shape != null
+        return own_shape_elems(f.array_shape, out_n, out_name, out_len)
+    if f.array_elem_type != TYPE_STRUCT or f.array_size <= 0
+        return 0
+    *out_n = f.array_size
+    *out_name = f.array_elem_type_name
+    *out_len = f.array_elem_type_name_len
+    1
+
+# 1 when field `f` (of a struct or an enum payload) holds a move-only value.
+fn own_field_move_only(s: *EmitterState, f: *StructField, depth: i32) -> i32
+    if f.field_type == TYPE_STRUCT
+        return own_move_only_depth(s, f.field_type_name, f.field_type_name_len, depth)
+    var n: i32 = 0
+    var en: *u8 = null
+    var el: i32 = 0
+    if own_field_array(f, @n, @en, @el) == 1
+        return own_move_only_depth(s, en, el, depth)
+    0
+
+fn own_fields_move_only(s: *EmitterState, fields: *StructField, depth: i32) -> i32
+    var f: *StructField = fields
     while f != null
-        if f.field_type == TYPE_STRUCT
-            if own_move_only_depth(s, f.field_type_name, f.field_type_name_len, depth + 1) == 1
-                return 1
-        else if f.field_type == TYPE_ARRAY and f.array_elem_type == TYPE_STRUCT
-            if own_move_only_depth(s, f.array_elem_type_name, f.array_elem_type_name_len, depth + 1) == 1
-                return 1
+        if own_field_move_only(s, f, depth) == 1
+            return 1
         f = f.next
     0
 
+# 1 when the module has an `impl Drop` at all; without one nothing is
+# move-only, and the hooks skip their work.
+fn own_any_drop(s: *EmitterState) -> i32
+    let o: *OwnState = s.own
+    if o.has_drop >= 0
+        return o.has_drop
+    o.has_drop = 0
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if ib.trait_name != null and name_eq(ib.trait_name, ib.trait_name_len, c"Drop", 4) == 1
+            o.has_drop = 1
+            return 1
+        ib = ib.next
+    0
+
 pub fn own_type_is_move_only(s: *EmitterState, name: *u8, len: i32) -> i32
+    if own_any_drop(s) == 0
+        return 0
     own_move_only_depth(s, name, len, 0)
 
 # =============================================================================
@@ -171,24 +300,222 @@ fn own_emit_own_drop(s: *EmitterState, ptr: i32, name: *u8, len: i32)
     add_method_extern(s, name, len, c"drop", 4)
 
 # Drop the value of type `name` at `ptr`: its own drop, then its move-only
-# struct fields in declaration order.
+# struct fields in declaration order, or an enum's payload.
 fn own_emit_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, depth: i32)
     if depth > OWN_MAX_DEPTH
         return
     own_emit_own_drop(s, ptr, name, len)
+    if is_tagged_enum_type(name, len) == 1
+        own_emit_tagged_glue(s, ptr, name, len, depth)
+        return
     let st: *StructDef = find_struct(s, name, len)
     if st == null
+        let ei: i32 = user_enum_index(name, len)
+        if ei >= 0
+            own_emit_enum_glue(s, ptr, name, len, ei, depth)
         return
     var idx: i32 = 0
     var f: *StructField = st.fields
     while f != null
-        if f.field_type == TYPE_STRUCT
-            if own_move_only_depth(s, f.field_type_name, f.field_type_name_len, 0) == 1
-                var r: MemberPtrResult
-                emit_member_gep_from_ptr(s, @r, ptr, st, idx, f)
-                own_emit_glue(s, r.reg, f.field_type_name, f.field_type_name_len, depth + 1)
+        if own_field_move_only(s, f, 0) == 1
+            var r: MemberPtrResult
+            emit_member_gep_from_ptr(s, @r, ptr, st, idx, f)
+            own_emit_field_glue(s, r.reg, f, depth + 1)
         idx += 1
         f = f.next
+
+# Drop the move-only field `f` stored at `ptr`.
+fn own_emit_field_glue(s: *EmitterState, ptr: i32, f: *StructField, depth: i32)
+    if f.field_type == TYPE_STRUCT
+        own_emit_glue(s, ptr, f.field_type_name, f.field_type_name_len, depth)
+        return
+    var n: i32 = 0
+    var en: *u8 = null
+    var el: i32 = 0
+    if own_field_array(f, @n, @en, @el) == 1
+        own_emit_array_glue(s, ptr, n, en, el, depth)
+
+# A value (count 0) or an array of `count` elements, at `ptr`.
+fn own_emit_value_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, count: i32)
+    if count > 0
+        own_emit_array_glue(s, ptr, count, name, len, 0)
+    else
+        own_emit_glue(s, ptr, name, len, 0)
+
+# Drop `n` elements of type `name` from `ptr` on, in index order, with a
+# loop (its counter alloca is hoisted to the entry block).
+fn own_emit_array_glue(s: *EmitterState, ptr: i32, n: i32, name: *u8, len: i32, depth: i32)
+    if n <= 0 or depth > OWN_MAX_DEPTH
+        return
+    let ctr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ctr)
+    emit_str(s, c" = alloca i64  ; array drop index\n  store i64 0, ptr ")
+    emit_reg(s, ctr)
+    emit_str(s, c"\n")
+    let head: i32 = next_label(s)
+    let body: i32 = next_label(s)
+    let done: i32 = next_label(s)
+    emit_str(s, c"  br label %")
+    emit_label(s, head)
+    emit_str(s, c"\n")
+    begin_block(s, head)
+    let i: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, i)
+    emit_str(s, c" = load i64, ptr ")
+    emit_reg(s, ctr)
+    emit_str(s, c"\n")
+    let more: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, more)
+    emit_str(s, c" = icmp slt i64 ")
+    emit_reg(s, i)
+    emit_str(s, c", ")
+    emit_int(s, n as i64)
+    emit_str(s, c"\n  br i1 ")
+    emit_reg(s, more)
+    emit_str(s, c", label %")
+    emit_label(s, body)
+    emit_str(s, c", label %")
+    emit_label(s, done)
+    emit_str(s, c"\n")
+    begin_block(s, body)
+    let ep: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ep)
+    emit_str(s, c" = getelementptr ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, name, len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, i)
+    emit_str(s, c"\n")
+    own_emit_glue(s, ep, name, len, depth + 1)
+    let nx: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, nx)
+    emit_str(s, c" = add i64 ")
+    emit_reg(s, i)
+    emit_str(s, c", 1\n  store i64 ")
+    emit_reg(s, nx)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ctr)
+    emit_str(s, c"\n  br label %")
+    emit_label(s, head)
+    emit_str(s, c"\n")
+    begin_block(s, done)
+
+# `if tag == <tag> {`: branch on the tag of the enum `ename` at `ptr` and
+# open the block that drops the payload.  Returns the payload's address
+# (field 2 of every payload-carrying enum layout); *out_next gets the label
+# own_case_end closes the block with.
+fn own_case_begin(s: *EmitterState, ptr: i32, ename: *u8, elen: i32, tag: i32, out_next: *i32) -> i32
+    let tp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tp)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, ename, elen)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", i32 0, i32 0\n")
+    let t: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, t)
+    emit_str(s, c" = load i8, ptr ")
+    emit_reg(s, tp)
+    emit_str(s, c"\n")
+    let c: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, c)
+    emit_str(s, c" = icmp eq i8 ")
+    emit_reg(s, t)
+    emit_str(s, c", ")
+    emit_int(s, tag as i64)
+    emit_str(s, c"\n")
+    let do_label: i32 = next_label(s)
+    let next: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, c)
+    emit_str(s, c", label %")
+    emit_label(s, do_label)
+    emit_str(s, c", label %")
+    emit_label(s, next)
+    emit_str(s, c"\n")
+    begin_block(s, do_label)
+    let pp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pp)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, ename, elen)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", i32 0, i32 2\n")
+    *out_next = next
+    pp
+
+fn own_case_end(s: *EmitterState, next: i32)
+    emit_str(s, c"  br label %")
+    emit_label(s, next)
+    emit_str(s, c"\n")
+    begin_block(s, next)
+
+# Option$T / Result$T$E: tag 0 holds the Some / Ok payload, tag 1 Result's
+# Err payload.
+fn own_emit_tagged_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, depth: i32)
+    var variants: i32 = 1
+    if len > 7 and name_eq(name, 7, c"Result$", 7) == 1
+        variants = 2
+    var v: i32 = 0
+    while v < variants
+        var al: i32 = 0
+        let a: *u8 = tagged_enum_arg(s, name, len, v, @al)
+        if a != null and own_move_only_depth(s, a, al, depth + 1) == 1
+            var next: i32 = 0
+            let pp: i32 = own_case_begin(s, ptr, name, len, v, @next)
+            own_emit_glue(s, pp, a, al, depth + 1)
+            own_case_end(s, next)
+        v += 1
+
+# A user enum: its tag is the variant's index; the payload's fields sit in
+# the payload bytes as variant_payload_size_align lays them out.
+fn own_emit_enum_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, ei: i32, depth: i32)
+    var vi: i32 = 0
+    while vi < enum_variant_count(ei)
+        let fields: *StructField = enum_variant_fields(ei, vi)
+        if own_fields_move_only(s, fields, depth + 1) == 1
+            var next: i32 = 0
+            let pp: i32 = own_case_begin(s, ptr, name, len, vi, @next)
+            var offset: i64 = 0
+            var f: *StructField = fields
+            while f != null
+                var falign: i64 = 8
+                var fsize: i64 = 8
+                if f.field_type == TYPE_ARRAY
+                    fsize = field_array_size_align(s, f, @falign)
+                else
+                    fsize = elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
+                if falign < 1
+                    falign = 1
+                let rem: i64 = offset % falign
+                if rem != 0
+                    offset = offset + (falign - rem)
+                if own_field_move_only(s, f, depth + 1) == 1
+                    var fp: i32 = pp
+                    if offset > 0
+                        fp = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, fp)
+                        emit_str(s, c" = getelementptr i8, ptr ")
+                        emit_reg(s, pp)
+                        emit_str(s, c", i64 ")
+                        emit_int(s, offset)
+                        emit_str(s, c"\n")
+                    own_emit_field_glue(s, fp, f, depth + 1)
+                offset = offset + fsize
+                f = f.next
+            own_case_end(s, next)
+        vi += 1
 
 # `if flag { flag = 0; glue(slot) }`, as basic blocks of the current fn.
 fn own_emit_drop(s: *EmitterState, b: *OwnBinding)
@@ -212,7 +539,7 @@ fn own_emit_drop(s: *EmitterState, b: *OwnBinding)
     emit_str(s, c"  store i1 0, ptr ")
     emit_reg(s, b.flag)
     emit_str(s, c"\n")
-    own_emit_glue(s, b.slot, b.type_name, b.type_name_len, 0)
+    own_emit_value_glue(s, b.slot, b.type_name, b.type_name_len, b.count)
     emit_str(s, c"  br label %")
     emit_label(s, next)
     emit_str(s, c"\n")
@@ -293,35 +620,265 @@ pub fn own_pop_scope(s: *EmitterState) -> i32
         own_drop_from(s, start)
     o.live_count = start
     o.scope_count = o.scope_count - 1
+    o.last_pop_dead = dead
     dead
 
 # Enter / leave a loop body.  `break` and `continue` drop live[loop_base..].
+# Entering shadows every unmoved binding (all are outside the loop), saving
+# its state for own_loop_exit.
 pub fn own_loop_enter(s: *EmitterState) -> i32
     let o: *OwnState = s.own
     let old: i32 = o.loop_base
     o.loop_base = o.live_count
+    o.loop_depth = o.loop_depth + 1
+    var i: i32 = 0
+    while i < o.live_count
+        let b: *OwnBinding = own_live_at(o, i)
+        own_ev_push(o, OWN_EV_SAVE, b.slot, b.shadow, b.moved, b.move_line, b.move_col)
+        b.shadow = 1 - b.moved
+        i += 1
     old
 
+# The first event of `kind` at loop depth `depth` for the binding at `slot`.
+fn own_ev_find(o: *OwnState, kind: i32, slot: i32, depth: i32) -> *i32
+    var j: i32 = 0
+    while j < o.loop_ev_count
+        let ev: *i32 = own_ev_at(o, j)
+        if ev[0] == kind and ev[1] == slot and ev[2] == depth
+            return ev
+        j += 1
+    null
+
+# After the loop body (its scope already popped, so every live binding is
+# from outside the loop).  A binding reaches the head moved when the body
+# falls through with it moved or a `continue` leaves with it moved; then
+# every use recorded while it was shadowed is an error, as in ritz0's
+# re-check of the body.  After the loop a binding is moved if it was at
+# entry, at the head, or at a `break`.
 pub fn own_loop_exit(s: *EmitterState, old: i32)
     let o: *OwnState = s.own
+    let depth: i32 = o.loop_depth
+    let n: i32 = o.live_count
+    # Per live binding: moved at the head, and where.
+    var head: *i32 = null
+    if n > 0
+        head = malloc((n as i64) * 12) as *i32
+    var i: i32 = 0
+    while i < n
+        let b: *OwnBinding = own_live_at(o, i)
+        head[i * 3] = 0
+        if o.last_pop_dead == 0 and b.moved == 1
+            head[i * 3] = 1
+            head[i * 3 + 1] = b.move_line
+            head[i * 3 + 2] = b.move_col
+        else
+            let hv: *i32 = own_ev_find(o, OWN_EV_HEAD, b.slot, depth)
+            if hv != null
+                head[i * 3] = 1
+                head[i * 3 + 1] = hv[5]
+                head[i * 3 + 2] = hv[6]
+        i += 1
+    # The recorded uses, in order: an error, or (unreported, in an inner
+    # loop) a use the enclosing loop's check still has to see.
+    var j: i32 = 0
+    while j < o.loop_ev_count
+        let ev: *i32 = own_ev_at(o, j)
+        if ev[0] == OWN_EV_USE and ev[2] == depth
+            var bi: i32 = n - 1
+            while bi >= 0
+                let cb: *OwnBinding = own_live_at(o, bi)
+                if cb.slot == ev[1]
+                    break
+                bi -= 1
+            if bi >= 0 and head[bi * 3] == 1
+                let ub: *OwnBinding = own_live_at(o, bi)
+                if ev[3] == 1
+                    own_error_borrow_at(s, ev[5], ev[6], ub)
+                else
+                    own_error_use_at(s, ev[5], ev[6], ub, head[bi * 3 + 1], head[bi * 3 + 2])
+            else if bi >= 0 and depth > 1
+                let sv: *i32 = own_ev_find(o, OWN_EV_SAVE, ev[1], depth)
+                if sv != null and sv[3] == 1
+                    ev[2] = depth - 1
+        j += 1
+    # The state after the loop, and the enclosing loop's shadow.
+    i = 0
+    while i < n
+        let b: *OwnBinding = own_live_at(o, i)
+        let sv: *i32 = own_ev_find(o, OWN_EV_SAVE, b.slot, depth)
+        var am: i32 = 0
+        var al: i32 = 0
+        var ac: i32 = 0
+        if sv != null and sv[4] == 1
+            am = 1
+            al = sv[5]
+            ac = sv[6]
+        else if head[i * 3] == 1
+            am = 1
+            al = head[i * 3 + 1]
+            ac = head[i * 3 + 2]
+        else
+            let bv: *i32 = own_ev_find(o, OWN_EV_BREAK, b.slot, depth)
+            if bv != null
+                am = 1
+                al = bv[5]
+                ac = bv[6]
+        b.moved = am
+        if am == 1
+            b.move_line = al
+            b.move_col = ac
+        if sv != null
+            b.shadow = sv[3]
+        i += 1
+    if head != null
+        free(head as *u8)
+    # Forget this loop's events.
+    var w: i32 = 0
+    j = 0
+    while j < o.loop_ev_count
+        let ev: *i32 = own_ev_at(o, j)
+        if ev[2] < depth
+            if w != j
+                memcpy(own_ev_at(o, w) as *u8, ev as *u8, (OWN_EV_INTS * 4) as i64)
+            w += 1
+        j += 1
+    o.loop_ev_count = w
+    o.loop_depth = depth - 1
     o.loop_base = old
 
-# Before a `break` / `continue` branches out of the loop body.
-pub fn own_loop_jump(s: *EmitterState)
+# Before a `break` (is_continue 0) / `continue` (1) branches out of the
+# loop body: record the moved outer bindings, then drop the body's.
+pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
     let o: *OwnState = s.own
-    if o.loop_base < 0 or o.live_count <= o.loop_base
+    if o.loop_base < 0
         return
     if own_scope_is_dead(o) == 1
         return
+    var kind: i32 = OWN_EV_BREAK
+    if is_continue == 1
+        kind = OWN_EV_HEAD
+    var i: i32 = 0
+    while i < o.loop_base and i < o.live_count
+        let b: *OwnBinding = own_live_at(o, i)
+        if b.moved == 1 and own_ev_find(o, kind, b.slot, o.loop_depth) == null
+            own_ev_push(o, kind, b.slot, 0, 1, b.move_line, b.move_col)
+        i += 1
+    if o.live_count <= o.loop_base
+        return
     own_drop_from(s, o.loop_base)
+
+# =============================================================================
+# Temporaries (AGAST #2165)
+# =============================================================================
+
+# After emit_expr emitted call `e` as register `reg`: if the move check
+# marked it a temporary, spill it with a set drop flag and queue its drop.
+pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
+    let o: *OwnState = s.own
+    if o.temp_expr_count == 0 or reg == 0
+        return
+    let te: **Expr = o.temp_exprs
+    var i: i32 = 0
+    while i < o.temp_expr_count and te[i] != e
+        i += 1
+    if i >= o.temp_expr_count
+        return
+    o.temp_expr_count = o.temp_expr_count - 1
+    te[i] = te[o.temp_expr_count]
+    var len: i32 = 0
+    let name: *u8 = own_call_ret_type(s, e, @len)
+    if name == null
+        return
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, name, len)
+    emit_str(s, c"  ; temporary\n  store ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, name, len)
+    emit_str(s, c" ")
+    emit_reg(s, reg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+    let flag: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, flag)
+    emit_str(s, c" = alloca i1  ; drop flag\n")
+    if o.temp_count >= o.temp_cap
+        let cap: i32 = o.temp_cap * 2
+        o.temps = realloc(o.temps as *u8, (cap as i64) * sizeof(OwnBinding)) as *OwnBinding
+        o.temp_cap = cap
+    let b: *OwnBinding = own_temp_at(o, o.temp_count)
+    b.name = null
+    b.name_len = 0
+    b.local_idx = 0 - 1
+    b.slot = slot
+    b.flag = flag
+    b.type_name = name
+    b.type_name_len = len
+    b.moved = 0
+    b.move_line = 0
+    b.move_col = 0
+    b.count = 0
+    b.shadow = 0
+    o.temp_count = o.temp_count + 1
+    # In `all` too, so a `ret` before its drop (a `return`'s value) drops it.
+    own_grow_all(o)
+    own_copy_binding(own_all_at(o, o.all_count), b)
+    o.all_count = o.all_count + 1
+    own_store_flag(s, b, 1)
+
+# Drop temps[from..] (newest first) and forget them.
+fn own_drop_temps_from(s: *EmitterState, from: i32)
+    let o: *OwnState = s.own
+    if o.temp_count <= from
+        return
+    if own_scope_is_dead(o) == 0
+        var i: i32 = o.temp_count - 1
+        while i >= from
+            own_emit_drop(s, own_temp_at(o, i))
+            i -= 1
+    o.temp_count = from
+
+# Bracket each statement: own_stmt_begin before it, own_stmt_end (with
+# what begin returned) after, which drops the temporaries it made.
+pub fn own_stmt_begin(s: *EmitterState) -> i32
+    let o: *OwnState = s.own
+    let old: i32 = o.stmt_mark
+    o.stmt_mark = o.temp_count
+    old
+
+pub fn own_stmt_end(s: *EmitterState, old: i32)
+    let o: *OwnState = s.own
+    own_drop_temps_from(s, o.stmt_mark)
+    o.stmt_mark = old
+
+# After an `if` / `while` condition, before its branch: its temporaries
+# drop here, as ritz0 drops them.
+pub fn own_cond_end(s: *EmitterState)
+    let o: *OwnState = s.own
+    own_drop_temps_from(s, o.stmt_mark)
 
 # Register the local at `idx` if it is a move-only value.  `owned` is 1 when
 # it starts out holding a value (an initialised declaration, a parameter).
 fn own_register(s: *EmitterState, idx: i32, owned: i32)
     let loc: *LocalVar = local_at(s, idx)
-    if loc.var_type != TYPE_STRUCT
+    var name: *u8 = loc.type_name
+    var len: i32 = loc.type_name_len
+    var count: i32 = 0
+    if loc.var_type == TYPE_ARRAY
+        # `[N]T` / `[N][M]..T` of move-only T (AGAST #2165).
+        if loc.array_shape != null
+            if own_shape_elems(loc.array_shape, @count, @name, @len) == 0
+                return
+        else if loc.array_elem_type == TYPE_STRUCT and loc.array_size > 0
+            count = loc.array_size
+        else
+            return
+    else if loc.var_type != TYPE_STRUCT
         return
-    if own_type_is_move_only(s, loc.type_name, loc.type_name_len) == 0
+    if own_type_is_move_only(s, name, len) == 0
         return
     let o: *OwnState = s.own
     # A redeclaration that reuses its storage is the same binding.
@@ -331,6 +888,7 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
         if lb.slot == loc.reg
             lb.local_idx = idx
             lb.moved = 0
+            lb.shadow = 0
             own_store_flag(s, lb, owned)
             return
         i += 1
@@ -345,11 +903,13 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
     b.local_idx = idx
     b.slot = loc.reg
     b.flag = flag
-    b.type_name = loc.type_name
-    b.type_name_len = loc.type_name_len
+    b.type_name = name
+    b.type_name_len = len
     b.moved = 0
     b.move_line = 0
     b.move_col = 0
+    b.count = count
+    b.shadow = 0
     o.live_count = o.live_count + 1
     own_grow_all(o)
     own_copy_binding(own_all_at(o, o.all_count), b)
@@ -365,6 +925,12 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     o.all_count = 0
     o.loop_base = -1
     o.ret_seq = 0
+    o.temp_expr_count = 0
+    o.temp_count = 0
+    o.stmt_mark = 0
+    o.loop_ev_count = 0
+    o.loop_depth = 0
+    o.last_pop_dead = 0
     own_push_scope(s)
     var p: *Param = params
     while p != null
@@ -422,21 +988,63 @@ fn own_eprint_name(name: *u8, len: i32)
         eprint_char(*(name + i))
         i += 1
 
-fn own_error_use(s: *EmitterState, e: *Expr, b: *OwnBinding)
-    own_eprint_loc(e.span.line, e.span.col)
+fn own_error_use_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, move_line: i32, move_col: i32)
+    own_eprint_loc(line, col)
     eprints_cstr(c": error: use of moved value: `")
     own_eprint_name(b.name, b.name_len)
     eprints_cstr(c"` (moved at ")
-    own_eprint_loc(b.move_line, b.move_col)
+    own_eprint_loc(move_line, move_col)
     eprints_cstr(c")\n")
     s.error_count = s.error_count + 1
 
-fn own_error_borrow(s: *EmitterState, e: *Expr, b: *OwnBinding)
-    own_eprint_loc(e.span.line, e.span.col)
+fn own_error_borrow_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding)
+    own_eprint_loc(line, col)
     eprints_cstr(c": error: cannot borrow `")
     own_eprint_name(b.name, b.name_len)
     eprints_cstr(c"` - value has been moved\n")
     s.error_count = s.error_count + 1
+
+fn own_error_use(s: *EmitterState, e: *Expr, b: *OwnBinding)
+    own_error_use_at(s, e.span.line, e.span.col, b, b.move_line, b.move_col)
+
+fn own_error_borrow(s: *EmitterState, e: *Expr, b: *OwnBinding)
+    own_error_borrow_at(s, e.span.line, e.span.col, b)
+
+# A use of an unmoved binding inside a loop: if the binding is shadowed (it
+# would be moved here had the loop head been reached with it moved), record
+# the use for own_loop_exit.
+fn own_note_use(s: *EmitterState, b: *OwnBinding, line: i32, col: i32, borrow: i32)
+    let o: *OwnState = s.own
+    if o.loop_depth > 0 and b.shadow == 1 and b.moved == 0
+        own_ev_push(o, OWN_EV_USE, b.slot, borrow, 0, line, col)
+
+# The move-only struct type a call returns by value (its length in
+# *out_len), or null.
+fn own_call_ret_type(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    if e.kind != EXPR_CALL
+        return null
+    let f: *FnDef = find_call_fn(s, e)
+    if f == null or f.return_type != TYPE_STRUCT or f.return_type_name_len <= 0
+        return null
+    if own_type_is_move_only(s, f.return_type_name, f.return_type_name_len) == 0
+        return null
+    *out_len = f.return_type_name_len
+    f.return_type_name
+
+# `e`, a call whose move-only result nobody takes, yields a temporary:
+# remember it for own_note_temp.
+fn own_mark_temp(s: *EmitterState, e: *Expr)
+    var len: i32 = 0
+    if own_call_ret_type(s, e, @len) == null
+        return
+    let o: *OwnState = s.own
+    if o.temp_expr_count >= o.temp_expr_cap
+        let cap: i32 = o.temp_expr_cap * 2
+        o.temp_exprs = realloc(o.temp_exprs as *u8, (cap as i64) * 8) as **Expr
+        o.temp_expr_cap = cap
+    let te: **Expr = o.temp_exprs
+    te[o.temp_expr_count] = e
+    o.temp_expr_count = o.temp_expr_count + 1
 
 # 1 when an argument bound to `p` is passed by value (a move).  A reference
 # param borrows its argument; an unknown callee is taken as by-value.
@@ -481,6 +1089,7 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
         if b.moved == 1
             own_error_use(s, e, b)
             return
+        own_note_use(s, b, e.span.line, e.span.col, 0)
         if mv == 1
             b.moved = 1
             b.move_line = e.span.line
@@ -489,8 +1098,11 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
     else if k == EXPR_UNARY
         if (e.op == OP_ADDR or e.op == OP_ADDR_MUT) and e.operand != null and e.operand.kind == EXPR_IDENT
             let bb: *OwnBinding = own_lookup(s, e.operand.ident_ptr, e.operand.ident_len)
-            if bb != null and bb.moved == 1
-                own_error_borrow(s, e, bb)
+            if bb != null
+                if bb.moved == 1
+                    own_error_borrow(s, e, bb)
+                else
+                    own_note_use(s, bb, e.span.line, e.span.col, 1)
             return
         own_walk(s, e.operand, 0)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
@@ -509,9 +1121,16 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
         if f != null
             p = f.params
         own_walk_args(s, e.args, p)
+        # A result nobody takes is a temporary (AGAST #2165).
+        if mv == 0 and f != null
+            own_mark_temp(s, e)
     else if k == EXPR_METHOD
-        # The receiver is passed by pointer.
-        own_walk(s, e.left, 0)
+        # The receiver is passed by pointer.  A call result as receiver is
+        # not a temporary here: like ritz0, ritz1 drops no method's.
+        var rmv: i32 = 0
+        if e.left != null and e.left.kind == EXPR_CALL
+            rmv = 1
+        own_walk(s, e.left, rmv)
         var mp: *Param = null
         let m: *FnDef = own_recv_def(s, e)
         if m != null
@@ -532,7 +1151,7 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
 # 1 when the move check should look at code at this point.
 fn own_checking(s: *EmitterState) -> i32
     let o: *OwnState = s.own
-    if o.live_count == 0
+    if o.live_count == 0 and own_any_drop(s) == 0
         return 0
     if own_scope_is_dead(o) == 1
         return 0
@@ -569,14 +1188,11 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
             base = own_lookup(s, stmt.assign_target, stmt.assign_target_len)
         else
             base = own_lookup(s, stmt.var_name, stmt.var_name_len)
-        if base != null and base.moved == 1
-            own_eprint_loc(stmt.span.line, stmt.span.col)
-            eprints_cstr(c": error: use of moved value: `")
-            own_eprint_name(base.name, base.name_len)
-            eprints_cstr(c"` (moved at ")
-            own_eprint_loc(base.move_line, base.move_col)
-            eprints_cstr(c")\n")
-            s.error_count = s.error_count + 1
+        if base != null
+            if base.moved == 1
+                own_error_use_at(s, stmt.span.line, stmt.span.col, base, base.move_line, base.move_col)
+            else
+                own_note_use(s, base, stmt.span.line, stmt.span.col, 0)
         if k != STMT_LOCAL_FIELD_ASSIGN
             own_walk(s, stmt.while_cond, 0)
         own_walk(s, stmt.assign_value, 1)
@@ -594,12 +1210,17 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
         own_walk(s, stmt.for_start, 0)
         own_walk(s, stmt.for_end, 0)
 
-# After a statement is emitted: a `return` ends its block for the check.
+# After a statement is emitted: a `return` ends its block for the check,
+# and so does a `break` / `continue` in a loop (their moves reach the loop
+# head or exit through own_loop_jump's events instead).
 pub fn own_after_stmt(s: *EmitterState, stmt: *Stmt)
+    let o: *OwnState = s.own
+    if o.scope_count <= 0
+        return
     if stmt.kind == STMT_RETURN
-        let o: *OwnState = s.own
-        if o.scope_count > 0
-            own_mark_dead(o)
+        own_mark_dead(o)
+    else if (stmt.kind == STMT_BREAK or stmt.kind == STMT_CONTINUE) and o.loop_depth > 0
+        own_mark_dead(o)
 
 # A fn's tail expression is its return value: a move.
 pub fn own_check_tail(s: *EmitterState, e: *Expr)
@@ -616,6 +1237,18 @@ pub fn own_check_arm(s: *EmitterState, e: *Expr)
 # =============================================================================
 # Reassignment
 # =============================================================================
+
+# The LLVM type of a binding's storage: `[N x %T]` for an array (an N-D
+# array's leaves are contiguous, so a flat array of them is its layout).
+fn own_emit_binding_type(s: *EmitterState, b: *OwnBinding)
+    if b.count > 0
+        emit_str(s, c"[")
+        emit_int(s, b.count as i64)
+        emit_str(s, c" x ")
+        emit_llvm_type_struct(s, TYPE_STRUCT, b.type_name, b.type_name_len)
+        emit_str(s, c"]")
+        return
+    emit_llvm_type_struct(s, TYPE_STRUCT, b.type_name, b.type_name_len)
 
 # Before `x = v` is emitted: copy x's old value aside with its flag, so it
 # can be dropped once v (which may still read x) has been stored.  Returns
@@ -639,18 +1272,18 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     emit_str(s, c"  ")
     emit_reg(s, tmp)
     emit_str(s, c" = alloca ")
-    emit_llvm_type_struct(s, TYPE_STRUCT, b.type_name, b.type_name_len)
+    own_emit_binding_type(s, b)
     emit_str(s, c"\n")
     let v: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, v)
     emit_str(s, c" = load ")
-    emit_llvm_type_struct(s, TYPE_STRUCT, b.type_name, b.type_name_len)
+    own_emit_binding_type(s, b)
     emit_str(s, c", ptr ")
     emit_reg(s, b.slot)
     emit_str(s, c"\n")
     emit_str(s, c"  store ")
-    emit_llvm_type_struct(s, TYPE_STRUCT, b.type_name, b.type_name_len)
+    own_emit_binding_type(s, b)
     emit_str(s, c" ")
     emit_reg(s, v)
     emit_str(s, c", ptr ")
@@ -665,6 +1298,7 @@ pub fn own_assign_end(s: *EmitterState, b: *OwnBinding, old: i32, old_flag: i32)
     if b == null
         return
     b.moved = 0
+    b.shadow = 0
     own_store_flag(s, b, 1)
     let saved: i32 = last_expr_here(s)
     let do_label: i32 = next_label(s)
@@ -677,7 +1311,7 @@ pub fn own_assign_end(s: *EmitterState, b: *OwnBinding, old: i32, old_flag: i32)
     emit_label(s, next)
     emit_str(s, c"\n")
     begin_block(s, do_label)
-    own_emit_glue(s, old, b.type_name, b.type_name_len, 0)
+    own_emit_value_glue(s, old, b.type_name, b.type_name_len, b.count)
     emit_str(s, c"  br label %")
     emit_label(s, next)
     emit_str(s, c"\n")
@@ -689,20 +1323,21 @@ pub fn own_assign_end(s: *EmitterState, b: *OwnBinding, old: i32, old_flag: i32)
 # `if` merge for the move check (ritz0's If handling)
 # =============================================================================
 
-# The moved state of every live binding: 3 i32s each.  null when nothing is
-# tracked.
+# The moved state of every live binding: 4 i32s each (moved, its line and
+# column, shadow).  null when nothing is tracked.
 pub fn own_snapshot(s: *EmitterState) -> *i32
     let o: *OwnState = s.own
     if o.live_count == 0
         return null
-    let snap: *i32 = malloc((o.live_count as i64) * 12 + 4) as *i32
+    let snap: *i32 = malloc((o.live_count as i64) * 16 + 4) as *i32
     snap[0] = o.live_count
     var i: i32 = 0
     while i < o.live_count
         let b: *OwnBinding = own_live_at(o, i)
-        snap[1 + i * 3] = b.moved
-        snap[2 + i * 3] = b.move_line
-        snap[3 + i * 3] = b.move_col
+        snap[1 + i * 4] = b.moved
+        snap[2 + i * 4] = b.move_line
+        snap[3 + i * 4] = b.move_col
+        snap[4 + i * 4] = b.shadow
         i += 1
     snap
 
@@ -716,14 +1351,16 @@ pub fn own_restore(s: *EmitterState, snap: *i32)
     var i: i32 = 0
     while i < n
         let b: *OwnBinding = own_live_at(o, i)
-        b.moved = snap[1 + i * 3]
-        b.move_line = snap[2 + i * 3]
-        b.move_col = snap[3 + i * 3]
+        b.moved = snap[1 + i * 4]
+        b.move_line = snap[2 + i * 4]
+        b.move_col = snap[3 + i * 4]
+        b.shadow = snap[4 + i * 4]
         i += 1
 
 # Neither arm returned: a binding moved in the then-arm (`after_then`) is
 # moved after the `if` too (the else-arm's state is current).  Moved in
-# both, it reports the then-arm's move, as ritz0 does.
+# both, it reports the then-arm's move, as ritz0 does.  `shadow` merges the
+# same way.
 pub fn own_merge_moved(s: *EmitterState, after_then: *i32)
     if after_then == null
         return
@@ -734,10 +1371,12 @@ pub fn own_merge_moved(s: *EmitterState, after_then: *i32)
     var i: i32 = 0
     while i < n
         let b: *OwnBinding = own_live_at(o, i)
-        if after_then[1 + i * 3] == 1
+        if after_then[1 + i * 4] == 1
             b.moved = 1
-            b.move_line = after_then[2 + i * 3]
-            b.move_col = after_then[3 + i * 3]
+            b.move_line = after_then[2 + i * 4]
+            b.move_col = after_then[3 + i * 4]
+        if after_then[4 + i * 4] == 1
+            b.shadow = 1
         i += 1
 
 # STMT_IF, after both arms: settle the move state per ritz0.
@@ -784,7 +1423,7 @@ fn own_emit_ret_drops(s: *EmitterState)
         emit_str(s, c"  store i1 0, ptr ")
         emit_reg(s, b.flag)
         emit_str(s, c"\n")
-        own_emit_glue(s, b.slot, b.type_name, b.type_name_len, 0)
+        own_emit_value_glue(s, b.slot, b.type_name, b.type_name_len, b.count)
         emit_str(s, c"  br label %own.n")
         emit_int(s, seq as i64)
         emit_str(s, c"\nown.n")
@@ -799,6 +1438,10 @@ pub fn own_end_fn(s: *EmitterState, body_start: i64)
     o.scope_count = 0
     o.live_count = 0
     o.loop_base = -1
+    o.temp_expr_count = 0
+    o.temp_count = 0
+    o.loop_ev_count = 0
+    o.loop_depth = 0
     if o.all_count == 0
         return
     let n: i64 = s.out.len - body_start

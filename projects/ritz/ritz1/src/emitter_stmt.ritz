@@ -2396,7 +2396,12 @@ fn emit_local_field_store_fallback(s: *EmitterState, stmt: *Stmt, with_index: i3
 # AGAST #2158: the move check and drop insertion (ownership.ritz) wrap every
 # statement.  The check runs first, so a statement's moves clear their drop
 # flags before it executes; `x = v` drops x's old value once v is stored.
+#
+# AGAST #2165: own_stmt_begin / own_stmt_end bracket it, so the temporaries
+# it makes drop when it ends (an `if` / `while` condition's earlier, at
+# own_cond_end).
 fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
+    let own_mark: i32 = own_stmt_begin(s)
     own_check_stmt(s, stmt)
     if stmt.kind == STMT_ASSIGN
         var old: i32 = 0
@@ -2404,9 +2409,11 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let ob: *OwnBinding = own_assign_begin(s, stmt, @old, @old_flag)
         emit_stmt_inner(s, stmt, ret_type)
         own_assign_end(s, ob, old, old_flag)
+        own_stmt_end(s, own_mark)
         return
     emit_stmt_inner(s, stmt, ret_type)
     own_after_stmt(s, stmt)
+    own_stmt_end(s, own_mark)
 
 fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # AGAST #2028: reject writes / `@&` into a `let` before emitting them.
@@ -2542,6 +2549,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let else_label: i32 = next_label(s)
         let end_label: i32 = next_label(s)
 
+        own_cond_end(s)   # AGAST #2165: the condition's temporaries
         emit_str(s, c"  br i1 ")
         emit_reg(s, cond_i1)
         emit_str(s, c", label %")
@@ -2683,6 +2691,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c" = icmp ne i64 ")
             emit_reg(s, cond)
             emit_str(s, c", 0\n")
+        own_cond_end(s)   # AGAST #2165: dropped on every evaluation
         emit_str(s, c"  br i1 ")
         emit_reg(s, cond_i1)
         emit_str(s, c", label %")
@@ -2890,7 +2899,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
     else if stmt.kind == STMT_BREAK
         if s.break_label >= 0
-            own_loop_jump(s)   # AGAST #2158: drop the loop body's bindings
+            own_loop_jump(s, 0)   # AGAST #2158: drop the loop body's bindings
             emit_str(s, c"  br label %")
             emit_label(s, s.break_label)
             emit_str(s, c"\n")
@@ -2908,7 +2917,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
     else if stmt.kind == STMT_CONTINUE
         if s.continue_label >= 0
-            own_loop_jump(s)   # AGAST #2158
+            own_loop_jump(s, 1)   # AGAST #2158
             emit_str(s, c"  br label %")
             emit_label(s, s.continue_label)
             emit_str(s, c"\n")
