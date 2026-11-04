@@ -243,6 +243,35 @@ pub fn main() -> i32
         return 3
     return 1
 """,
+    # A folded unsigned const zero-extends: 200 stays 200, not the i8
+    # pattern -56 (AGAST #2154, #2170).
+    "unsigned_in_range_stays_positive": """\
+const M: u8 = 100 + 100
+
+pub fn main() -> i32
+    if M == 200 and (M as i32) == 200
+        return 3
+    return 1
+""",
+    # A plain literal unsigned const takes the same use-site path (#2170).
+    "unsigned_literal_stays_positive": """\
+const M: u8 = 200
+
+pub fn main() -> i32
+    if M == 200 and (M as i32) == 200
+        return 3
+    return 1
+""",
+    # A local inferred from an unsigned const keeps its unsignedness (#2170).
+    "unsigned_const_into_inferred_local": """\
+const M: u8 = 200
+
+pub fn main() -> i32
+    let x = M
+    if x == 200 and (x as i32) == 200
+        return 3
+    return 1
+""",
 }
 
 # Run through ritz0 only, for a ritz1 gap of its own:
@@ -254,21 +283,6 @@ const F: f64 = -1
 
 pub fn main() -> i32
     if F < 0.0
-        return 3
-    return 1
-""",
-}
-
-# Run through ritz1 and ritz1_selfhosted only: ritz0 sign-extends every
-# unsigned const when widening it, literal or folded (AGAST #2170).
-RITZ1_ONLY_FORMS = {
-    # A folded unsigned const zero-extends: 200 stays 200, not the i8
-    # pattern -56 (AGAST #2154).
-    "unsigned_in_range_stays_positive": """\
-const M: u8 = 100 + 100
-
-pub fn main() -> i32
-    if M == 200 and (M as i32) == 200
         return 3
     return 1
 """,
@@ -381,16 +395,6 @@ def test_ritz0_compound_const_value(tmp_path, name):
     src = tmp_path / "main.ritz"
     src.write_text(RITZ0_ONLY_FORMS[name])
     assert _build_and_run("ritz0", tmp_path, src) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY_FORMS))
-def test_ritz1_compound_const_value(request, tmp_path, compiler, name):
-    request.getfixturevalue("ritz1_bin")
-    src = tmp_path / "main.ritz"
-    src.write_text(RITZ1_ONLY_FORMS[name])
-    assert _build_and_run(compiler, tmp_path, src) == 3
 
 
 @pytest.mark.integration

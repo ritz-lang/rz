@@ -545,6 +545,10 @@ class LLVMEmitter:
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
         self.constants: Dict[str, Tuple[int, ir.Type]] = {}  # name -> (value, type)
         self.const_arrays: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
+        # name -> declared Ritz type of a scalar const. The LLVM type in
+        # self.constants drops signedness, so without this a `const M: u8 =
+        # 200` was widened with sext (200 -> -56) at its use sites (#2170).
+        self.const_ritz_types: Dict[str, rast.Type] = {}
         self.globals: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
         self.extern_fns: Dict[str, ir.Function] = {}
         # AGAST #1736: LLVM function name -> struct type it returns via sret,
@@ -1384,9 +1388,11 @@ class LLVMEmitter:
         elif isinstance(expr, rast.NullLit):
             return rast.NamedType(expr.span, 'null', [])
         elif isinstance(expr, rast.Ident):
-            # Look up existing type
+            # Look up existing type; a local shadows a const of the same name.
             if expr.name in self.ritz_types:
                 return self.ritz_types[expr.name]
+            if expr.name in self.constants:
+                return self.const_ritz_types.get(expr.name)
             return None
         elif isinstance(expr, rast.BinOp):
             # Binary ops inherit type from left operand
@@ -2336,6 +2342,7 @@ class LLVMEmitter:
         for item in module.items:
             if isinstance(item, rast.ConstDef):
                 ty = self._ritz_type_to_llvm(item.type)
+                self.const_ritz_types[item.name] = item.type
                 if isinstance(item.value, rast.IntLit):
                     self.constants[item.name] = (item.value.value, ty)
                 elif isinstance(item.value, rast.FloatLit):
@@ -12457,6 +12464,9 @@ class LLVMEmitter:
         if isinstance(expr, rast.Ident):
             if expr.name in self.ritz_types:
                 return self._is_unsigned_type(self.ritz_types[expr.name])
+            # A scalar const: its declared type, as for a local (#2170).
+            if expr.name in self.constants and expr.name in self.const_ritz_types:
+                return self._is_unsigned_type(self.const_ritz_types[expr.name])
             return False
 
         # Cast expression - check the target type (what we're casting TO)
