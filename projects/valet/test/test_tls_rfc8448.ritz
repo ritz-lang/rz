@@ -1,0 +1,220 @@
+# test/test_tls_rfc8448.ritz - TLS server known answers, RFC 8448 section 3
+#
+# The simple 1-RTT trace against valet's server. test_tls_e2e talks to our own
+# client, so it cannot catch a mistake both ends share (#2186). valet picks its
+# own random and key share and signs with its own certificate, so its first
+# flight cannot match the trace: the test seeds the state that flight leaves
+# behind, then feeds the trace's client Finished through tls_server_process.
+
+import ritzlib.strview
+
+import cryptosec.mem
+import cryptosec.tls13_handshake
+import cryptosec.tls13_kdf
+import cryptosec.tls13_record
+import lib.tls
+
+# ============================================================================
+# RFC 8448 section 3 vectors
+# ============================================================================
+
+const CLIENT_HELLO_LEN: i64 = 196
+fn client_hello() -> StrView
+    return "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"
+
+const SERVER_HELLO_LEN: i64 = 90
+fn server_hello() -> StrView
+    return "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+
+const SHARED_SECRET_LEN: i64 = 32
+fn shared_secret() -> StrView
+    return "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"
+
+const SERVER_FLIGHT_LEN: i64 = 657
+fn server_flight() -> StrView
+    return "080000240022000a00140012001d00170018001901000101010201030104001c00024001000000000b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de100000f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"
+
+const HASH_THROUGH_CLIENT_FINISHED_LEN: i64 = 32
+fn hash_through_client_finished() -> StrView
+    return "209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d"
+
+const CLIENT_AP_SECRET_LEN: i64 = 32
+fn client_ap_secret() -> StrView
+    return "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"
+
+const SERVER_AP_SECRET_LEN: i64 = 32
+fn server_ap_secret() -> StrView
+    return "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"
+
+const CLIENT_AP_KEY_LEN: i64 = 16
+fn client_ap_key() -> StrView
+    return "17422dda596ed5d9acd890e3c63f5051"
+
+const CLIENT_AP_IV_LEN: i64 = 12
+fn client_ap_iv() -> StrView
+    return "5b78923dee08579033e523d9"
+
+const SERVER_AP_KEY_LEN: i64 = 16
+fn server_ap_key() -> StrView
+    return "9f02283b6c9c07efc26bb9f2ac92e356"
+
+const SERVER_AP_IV_LEN: i64 = 12
+fn server_ap_iv() -> StrView
+    return "cf782b88dd83549aadf1e984"
+
+const CLIENT_FINISHED_RECORD_LEN: i64 = 58
+fn client_finished_record() -> StrView
+    return "170303003575ec4dc238cce60b298044a71e219c56cc77b0517fe9b93c7a4bfc44d87f38f80338ac98fc46deb384bd1caeacab6867d726c40546"
+
+const CLIENT_APP_PAYLOAD_LEN: i64 = 50
+fn client_app_payload() -> StrView
+    return "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031"
+
+const CLIENT_APP_RECORD_LEN: i64 = 72
+fn client_app_record() -> StrView
+    return "1703030043a23f7054b62c94d0affafe8228ba55cbefacea42f914aa66bcab3f2b9819a8a5b46b395bd54a9a20441e2b62974e1f5a6292a2977014bd1e3deae63aeebb21694915e4"
+
+const SERVER_APP_RECORD_LEN: i64 = 72
+fn server_app_record() -> StrView
+    return "17030300432e937e11ef4ac740e538ad36005fc4a46932fc3225d05f82aa1b36e30efaf97d90e6dffc602dcb501a59a8fcc49c4bf2e5f0a21c0047c2abf332540dd032e167c2955d"
+
+fn hex_val(c: u8) -> u8
+    if c >= 97
+        return c - 97 + 10
+    return c - 48
+
+fn from_hex(out: *u8, hex: StrView, len: i64)
+    var i: i64 = 0
+    while i < len
+        out[i] = (hex_val(hex.get(i * 2)) << 4) | hex_val(hex.get(i * 2 + 1))
+        i += 1
+
+fn eq_hex(got: *u8, hex: StrView, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if got[i] != ((hex_val(hex.get(i * 2)) << 4) | hex_val(hex.get(i * 2 + 1)))
+            return 0
+        i += 1
+    return 1
+
+# Bring `server` to where its first flight leaves it, then take the trace's
+# client Finished. Returns 0, or the number of the step that went wrong.
+fn run_trace(server: *TlsServer, cfg: *TlsServerConfig) -> i32
+    tls_server_config_init(cfg)
+    if tls_server_init(server, cfg) != 0
+        return 1
+
+    var hello: [CLIENT_HELLO_LEN]u8
+    from_hex(@hello[0], client_hello(), CLIENT_HELLO_LEN)
+    transcript_update(@server.transcript, @hello[0], CLIENT_HELLO_LEN)
+    var sh: [SERVER_HELLO_LEN]u8
+    from_hex(@sh[0], server_hello(), SERVER_HELLO_LEN)
+    transcript_update(@server.transcript, @sh[0], SERVER_HELLO_LEN)
+
+    var th: [32]u8
+    transcript_hash(@server.transcript, @th[0])
+    var shared: [SHARED_SECRET_LEN]u8
+    from_hex(@shared[0], shared_secret(), SHARED_SECRET_LEN)
+    let ks: *TLS13KeySchedule = @server.key_schedule
+    tls13_key_schedule_derive_handshake(ks, @shared[0], 32, @th[0])
+    tls13_key_schedule_derive_handshake_keys(ks, 16, 12)
+    tls_record_state_init(@server.read_state)
+    tls_record_state_set_keys(@server.read_state, @ks.client_write_key[0], @ks.client_write_iv[0], @ks.server_write_key[0], @ks.server_write_iv[0], 16)
+
+    var flight: [SERVER_FLIGHT_LEN]u8
+    from_hex(@flight[0], server_flight(), SERVER_FLIGHT_LEN)
+    transcript_update(@server.transcript, @flight[0], SERVER_FLIGHT_LEN)
+    server.state = TLS_SERVER_STATE_FINISHED_SENT
+
+    var rec: [CLIENT_FINISHED_RECORD_LEN]u8
+    from_hex(@rec[0], client_finished_record(), CLIENT_FINISHED_RECORD_LEN)
+    var out: [64]u8
+    var out_len: i64 = 0
+    if tls_server_process(server, @rec[0], CLIENT_FINISHED_RECORD_LEN, @out[0], 64, @out_len) != TLS_RESULT_COMPLETE
+        return 2
+    return 0
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+# RFC 8446 7.1: both secrets hash ClientHello...server Finished.
+[[test]]
+fn test_rfc8448_server_application_traffic_secrets() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    let r: i32 = run_trace(@server, @cfg)
+    if r != 0
+        return r
+    if eq_hex(@server.key_schedule.client_application_traffic_secret[0], client_ap_secret(), 32) != 1
+        return 10
+    if eq_hex(@server.key_schedule.server_application_traffic_secret[0], server_ap_secret(), 32) != 1
+        return 11
+    return 0
+
+[[test]]
+fn test_rfc8448_server_application_keys() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    let r: i32 = run_trace(@server, @cfg)
+    if r != 0
+        return r
+    if eq_hex(@server.read_state.client_key[0], client_ap_key(), CLIENT_AP_KEY_LEN) != 1
+        return 10
+    if eq_hex(@server.read_state.client_iv[0], client_ap_iv(), CLIENT_AP_IV_LEN) != 1
+        return 11
+    if eq_hex(@server.write_state.server_key[0], server_ap_key(), SERVER_AP_KEY_LEN) != 1
+        return 12
+    if eq_hex(@server.write_state.server_iv[0], server_ap_iv(), SERVER_AP_IV_LEN) != 1
+        return 13
+    return 0
+
+# The bug's real symptom: a peer's first application record.
+[[test]]
+fn test_rfc8448_server_reads_application_record() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    let r: i32 = run_trace(@server, @cfg)
+    if r != 0
+        return r
+    var rec: [CLIENT_APP_RECORD_LEN]u8
+    from_hex(@rec[0], client_app_record(), CLIENT_APP_RECORD_LEN)
+    var out: [256]u8
+    if tls_server_read(@server, @rec[0], CLIENT_APP_RECORD_LEN, @out[0], 256) != CLIENT_APP_PAYLOAD_LEN
+        return 10
+    if eq_hex(@out[0], client_app_payload(), CLIENT_APP_PAYLOAD_LEN) != 1
+        return 11
+    return 0
+
+[[test]]
+fn test_rfc8448_server_writes_application_record() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    let r: i32 = run_trace(@server, @cfg)
+    if r != 0
+        return r
+    # The trace's server sends a NewSessionTicket first, as record 0.
+    server.write_state.server_seq = 1
+    var payload: [CLIENT_APP_PAYLOAD_LEN]u8
+    from_hex(@payload[0], client_app_payload(), CLIENT_APP_PAYLOAD_LEN)
+    var out: [256]u8
+    if tls_server_write(@server, @payload[0], CLIENT_APP_PAYLOAD_LEN, @out[0], 256) != SERVER_APP_RECORD_LEN
+        return 10
+    if eq_hex(@out[0], server_app_record(), SERVER_APP_RECORD_LEN) != 1
+        return 11
+    return 0
+
+# resumption_master_secret does hash the client Finished: it must still reach
+# the transcript, after the application secrets are taken.
+[[test]]
+fn test_rfc8448_server_transcript_ends_with_client_finished() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    let r: i32 = run_trace(@server, @cfg)
+    if r != 0
+        return r
+    var th: [32]u8
+    transcript_hash(@server.transcript, @th[0])
+    if eq_hex(@th[0], hash_through_client_finished(), 32) != 1
+        return 10
+    return 0
