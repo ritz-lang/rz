@@ -2235,6 +2235,7 @@ The attributes are a closed set:
 | `[[always_inline]]` | `fn` | always inline |
 | `[[noinline]]` | `fn` | never inline |
 | `[[callconv = "<cc>"]]` | `fn`, `extern fn`, fn-type `type` | calling convention ([§17.7](#177-calling-conventions)) |
+| `[[must_use]]` | `fn` | a call's result may not be discarded ([§17.8](#178-must-use-functions)) |
 
 Any other attribute, a known attribute on an item kind it does not apply to,
 a value given to an attribute that takes none, or a missing value is a
@@ -2490,6 +2491,50 @@ value, and attributes are the closed set that holds such properties, each
 honoured or rejected by every compiler. Rust's `extern "win64" fn(..)` type
 syntax was rejected: `extern` means "defined in another object" in Ritz
 (§5.3).
+
+### 17.8 Must-Use Functions
+
+The result of a call to a `[[must_use]]` fn may not be thrown away. A call is
+discarded when it is an expression statement that is not its block's value:
+any statement but the last of a block, or the last statement of a fn that
+returns nothing. Both compilers reject it, located at the call (AGAST #2137):
+
+```
+t.ritz:<line>:<col>: result of [[must_use]] fn '<fn>' is discarded
+```
+
+```ritz expect-error="result of [[must_use]] fn 'check' is discarded"
+[[must_use]]
+fn check(x: i32) -> i32
+    if x == 0
+        return 1
+    0
+
+fn main() -> i32
+    check(1)
+    0
+```
+
+Binding, assigning, returning or testing the result uses it, as does making
+the call a value-returning block's last line:
+
+```ritz
+[[must_use]]
+fn check(x: i32) -> i32
+    if x == 0
+        return 1
+    0
+
+fn both(a: i32, b: i32) -> i32
+    let r: i32 = check(a)
+    if r != 0
+        return r
+    check(b)
+```
+
+ritzunit's `assert_*` fns are `[[must_use]]`: each returns 0 or 1 for the test
+to return, and a bare `assert_eq_i32(a, b)` statement makes a test that cannot
+fail.
 
 ---
 

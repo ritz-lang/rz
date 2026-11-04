@@ -577,6 +577,10 @@ class LLVMEmitter:
         self.in_test_fn = False  # True when emitting a [[test]] function
         # AGAST #1869: True when emitting a [[test_helper]] function.
         self.in_test_helper = False
+        # AGAST #2137: name -> the FnDef a bare call to that name reaches
+        # (first declaration wins, as in _declare_function), for the
+        # [[must_use]] check.
+        self._fn_defs_by_name: Dict[str, rast.FnDef] = {}
         # AGAST #1869: id(operand expr) -> its already-emitted value, while
         # _emit_assert lowers `a OP b` (see _emit_expr's first lines).
         self._assert_operands: Dict[int, ir.Value] = {}
@@ -2395,6 +2399,7 @@ class LLVMEmitter:
         for item in module.items:
             if isinstance(item, rast.FnDef):
                 self._declare_function(item)
+                self._fn_defs_by_name.setdefault(item.name, item)
                 if item.name == 'main':
                     self.main_fn_def = item
 
@@ -4808,6 +4813,9 @@ class LLVMEmitter:
         # Handle trailing expression and implicit return
         if not self.has_returned and not self.builder.block.is_terminated:
             if fn_def.body.expr:
+                # A fn that returns nothing discards its tail (AGAST #2137).
+                if fn_def.ret_type is None:
+                    self._reject_discarded_must_use(fn_def.body.expr)
                 # AGAST #1435: operands in the tail are consumed even though
                 # the tail itself is not treated as one (#1429's carve-out,
                 # hence consumed=False). The tail is no statement, so
@@ -5166,6 +5174,25 @@ class LLVMEmitter:
             if isinstance(target, rast.Field):
                 return f"cannot assign to field `{target.field}`: {llvm_msg}"
         return llvm_msg
+
+    def _reject_discarded_must_use(self, expr: Optional[rast.Expr]) -> None:
+        """Reject `expr`, whose value is discarded, if it calls a
+        `[[must_use]]` fn (LANGUAGE_SPEC §17.8, AGAST #2137).
+
+        Callers pass an expression statement (never a block's tail: the
+        parser moves that into `Block.expr`) and a void fn's tail. ritz1
+        prints the same words (ritz1/src/emitter_stmt.ritz
+        reject_discarded_must_use).
+        """
+        if not isinstance(expr, rast.Call) or not isinstance(expr.func, rast.Ident):
+            return
+        name = expr.func.name
+        if name in self.locals:
+            return   # a local fn pointer, not the fn of that name
+        fn_def = self._fn_defs_by_name.get(name)
+        if fn_def is not None and fn_def.has_attr('must_use'):
+            raise EmitError(
+                f"result of [[must_use]] fn '{name}' is discarded", expr.span)
 
     @staticmethod
     def _stmt_value_roots(stmt: rast.Stmt) -> List[tuple]:
@@ -5848,6 +5875,8 @@ class LLVMEmitter:
             return None
 
         elif isinstance(stmt, rast.ExprStmt):
+            # A statement's value is discarded (AGAST #2137).
+            self._reject_discarded_must_use(stmt.expr)
             # Check if this is an If expression used as statement
             if isinstance(stmt.expr, rast.If):
                 return self._emit_if(stmt.expr)

@@ -41,6 +41,7 @@ SOURCES = \
 	emitter_expr \
 	emitter_match \
 	enum_as_int \
+	must_use \
 	emitter_stmt \
 	emitter \
 	fn_cache \

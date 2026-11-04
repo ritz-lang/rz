@@ -44,6 +44,9 @@ ATTRS = {
     # LANGUAGE_SPEC §17.7 (AGAST #1879). On a `type` item only when the
     # alias names a fn type (parse_type_alias checks).
     "callconv": (True, ("fn", "extern fn", "type")),
+    # LANGUAGE_SPEC §17.8 (AGAST #2137): a call's result may not be
+    # discarded (emitter_llvmlite.py _reject_discarded_must_use).
+    "must_use": (False, ("fn",)),
 }
 
 # `[[callconv = "<name>"]]` values. "c" is the default, written out.
