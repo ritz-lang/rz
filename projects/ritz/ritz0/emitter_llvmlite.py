@@ -11530,6 +11530,13 @@ class LLVMEmitter:
             if name in self.struct_types and name not in self.locals and name not in self.params:
                 type_name = name
                 is_static_call = True
+            # The same for an enum's impl: `Opt.make(40)`. A variant of that
+            # name was already built above. A global named like the enum
+            # shadows it, as a local does (AGAST #2101).
+            elif (name in self.enum_types and name not in self.locals
+                    and name not in self.params and name not in self.globals):
+                type_name = name
+                is_static_call = True
             # First check ritz_types for the original Ritz type (preserves signedness)
             elif name in self.ritz_types:
                 ritz_type = self.ritz_types[name]
@@ -12806,14 +12813,16 @@ class LLVMEmitter:
             return self._emit_enum_match(expr, match_val, enum_name)
 
         # Source-level classification can fail — a UFCS method-call scrutinee
-        # (`match v.pop()`) has no inferable declared type. But the emitted
-        # value already knows: its LLVM type is the enum's identified struct,
-        # and enum_types is keyed by the same name. Falling through instead
-        # sent Option matches to _emit_integer_match, where `Some(x)` binds
-        # nothing and the arm dies with `Unknown identifier: x`. AGAST #1321.
-        struct_name = getattr(match_val.type, 'name', None)
-        if struct_name and struct_name in self.enum_types:
-            return self._emit_enum_match(expr, match_val, struct_name)
+        # (`match v.pop()`) or an unqualified constructor (`match Holds(1)`,
+        # `match Vacant`) has no inferable declared type. But the emitted
+        # value already knows: its LLVM type is the enum's identified struct.
+        # Falling through instead sent Option matches to _emit_integer_match,
+        # where `Some(x)` binds nothing and the arm dies with `Unknown
+        # identifier: x` (AGAST #1321). Compare the type itself: a user enum's
+        # struct is named `enum.<module>.Opt`, not its enum_types key (#2101).
+        for enum_name, (enum_ty, _) in self.enum_types.items():
+            if match_val.type == enum_ty:
+                return self._emit_enum_match(expr, match_val, enum_name)
 
         # Check if matching on an integer type
         if isinstance(match_val.type, ir.IntType):

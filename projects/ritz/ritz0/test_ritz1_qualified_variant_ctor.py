@@ -233,13 +233,6 @@ pub fn main() -> i32
     var Opt: S = S { v: 40 }
     return Opt.Holds(2)
 """,
-}
-
-# ritz0 rejects these, so ritz1's result is checked against the value the
-# program computes by hand (42).  ritz0: `match <rvalue enum>` is "Match on
-# type %enum.Opt not yet supported" and a static method on an enum impl is
-# "Unknown identifier: Opt" (#2101).
-RITZ1_ONLY = {
     # As a match scrutinee, including the qualified pattern form.
     "match_scrutinee": OPT
     + """
@@ -273,6 +266,93 @@ impl Opt
 pub fn main() -> i32
     let a: Opt = Opt.make(40)
     return val(a)
+""",
+    # Every arm returns: nothing reaches the merge block (the ticket's
+    # `match.unreachable:` report).
+    "match_call_every_arm_returns": OPT
+    + """
+fn mk(x: i32) -> Opt
+    Opt.Holds(x)
+
+pub fn main() -> i32
+    match mk(42)
+        Holds(v) => return v
+        Vacant => return 1
+""",
+    # The result of a static method carries the enum type to an untyped let.
+    "impl_static_method_untyped_let": OPT
+    + """
+impl Opt
+    fn make(x: i32) -> Opt
+        return Opt.Holds(x + 2)
+
+pub fn main() -> i32
+    let a = Opt.make(40)
+    return val(a)
+""",
+    # A static method and an instance method on one enum.
+    "impl_static_and_instance_method": OPT
+    + """
+impl Opt
+    fn make(x: i32) -> Opt
+        return Opt.Holds(x + 1)
+
+    fn plus(self: *Opt, y: i32) -> i32
+        return val(*self) + y
+
+pub fn main() -> i32
+    var a: Opt = Opt.make(40)
+    return a.plus(1)
+""",
+    # A global named like the enum shadows it, as a local does.
+    "global_shadows_enum_static_method": """\
+enum Opt
+    Vacant
+    Holds(i32)
+
+impl Opt
+    fn get() -> i32
+        return 1
+
+struct S
+    v: i32
+
+impl S
+    fn get(self: *S) -> i32
+        return self.v
+
+var Opt: S
+
+pub fn main() -> i32
+    Opt.v = 42
+    return Opt.get()
+""",
+}
+
+# ritz1 emits IR clang rejects for these two scrutinees: the enum aggregate
+# is compared as an i64 (#2184).  Move them to RUNNABLE when that lands.
+RITZ0_ONLY = {
+    # `match Vacant`: the unit form of the same gap.
+    "match_scrutinee_unit_unqualified": OPT
+    + """
+pub fn main() -> i32
+    var r: i32 = 0
+    match Vacant
+        Holds(v) => r = 1
+        Vacant => r = 42
+    return r
+""",
+    # A static method's result as a scrutinee.
+    "impl_static_method_as_scrutinee": OPT
+    + """
+impl Opt
+    fn make(x: i32) -> Opt
+        return Opt.Holds(x + 2)
+
+pub fn main() -> i32
+    match Opt.make(40)
+        Holds(v) => return v
+        Vacant => return 1
 """,
 }
 
@@ -447,15 +527,15 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RUNNABLE))
-def test_ritz1_qualified_variant_ctor(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", tmp_path, name, RUNNABLE[name]) == EXPECTED
+@pytest.mark.parametrize("name", sorted(RITZ0_ONLY))
+def test_ritz0_only(tmp_path, name):
+    assert _run("ritz0", tmp_path, name, RITZ0_ONLY[name]) == EXPECTED
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY))
-def test_ritz1_only(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", tmp_path, name, RITZ1_ONLY[name]) == EXPECTED
+@pytest.mark.parametrize("name", sorted(RUNNABLE))
+def test_ritz1_qualified_variant_ctor(ritz1_bin, tmp_path, name):
+    assert _run("ritz1", tmp_path, name, RUNNABLE[name]) == EXPECTED
 
 
 @pytest.mark.integration
