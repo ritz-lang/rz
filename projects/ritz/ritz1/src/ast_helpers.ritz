@@ -1390,7 +1390,7 @@ pub fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32
     c.col = col
     var folded: i64 = 0
     if val != null and const_fold_int(p.module.constants, val, 0, @folded) == 1
-        c.value = folded
+        c.value = const_wrap_to_type(ty, folded)
     else if is_int_const_type(ty) == 1
         # Names a const not seen yet (later in this file, or imported), or
         # is not a constant at all: the emitter decides once every module is
@@ -1445,6 +1445,31 @@ pub fn is_int_const_type(ty: i32) -> i32
         return 1
     0
 
+# `v` wrapped to the declared integer type `ty`, as runtime arithmetic at that
+# width would leave it (AGAST #2154): `const M: u8 = 200 + 100` is 44, not
+# 300.  Signed types sign-extend back to i64 (i8 200 is -56); unsigned ones
+# zero-extend (u8 200 stays 200); bool keeps the low bit, as ritz0 does.
+# i64/u64 and non-integer types are returned unchanged.
+pub fn const_wrap_to_type(ty: i32, v: i64) -> i64
+    if ty == TYPE_BOOL
+        return v & 1
+    if ty == TYPE_U8
+        return v & 0xFF
+    if ty == TYPE_U16
+        return v & 0xFFFF
+    if ty == TYPE_U32
+        return v & 0xFFFFFFFF
+    # Sign-extend as ((v & mask) ^ sign) - sign, not (v << k) >> k: ritz1's
+    # `>>` is always a logical shift (AGAST #1637), so the shift form only
+    # works when ritz0 builds this file.
+    if ty == TYPE_I8
+        return ((v & 0xFF) ^ 0x80) - 0x80
+    if ty == TYPE_I16
+        return ((v & 0xFFFF) ^ 0x8000) - 0x8000
+    if ty == TYPE_I32
+        return ((v & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+    v
+
 fn const_name_eq(c: *ConstEntry, name: *u8, len: i32) -> i32
     if c.name_len != len
         return 0
@@ -1465,7 +1490,7 @@ pub fn const_resolve(consts: *ConstEntry, c: *ConstEntry) -> i32
     c.fold_state = CONST_FOLD_ACTIVE
     var v: i64 = 0
     if c.value_expr != null and const_fold_int(consts, c.value_expr, 1, @v) == 1
-        c.value = v
+        c.value = const_wrap_to_type(c.const_type, v)
         c.fold_state = CONST_FOLD_DONE
         return 1
     c.fold_state = CONST_FOLD_BAD

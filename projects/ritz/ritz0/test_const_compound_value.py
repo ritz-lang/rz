@@ -190,10 +190,62 @@ pub fn main() -> i32
     g.cells[C - 1] = 1
     return m[1][2] + g.cells[2]
 """,
+    # A folded value wraps to the const's declared width, as runtime
+    # arithmetic at that width would (AGAST #2154): ritz1 used to keep the
+    # unwrapped i64, so `M == 44` compared 300 with 44.
+    "wraps_to_width": """\
+const M: u8 = 200 + 100
+
+pub fn main() -> i32
+    if M == 44
+        return 3
+    return 1
+""",
+    # Signed sign-extends: 100 + 100 in i8 is -56.
+    "signed_wraps_negative": """\
+const M: i8 = 100 + 100
+
+pub fn main() -> i32
+    if M == -56 and (M as i32) == -56
+        return 3
+    return 1
+""",
+    "u16_u32_and_i32_wrap": """\
+const A: u16 = 65535 + 2
+const B: i32 = 2147483647 + 1
+const C: u32 = 4294967295 + 4
+
+pub fn main() -> i32
+    if A == 1 and (B as i64) == -2147483648 and C == 3
+        return 3
+    return 1
+""",
+    # A const naming a wrapped one sees the wrapped value: 44 + 1, not 301.
+    # (Compared, not returned: 301 - 42 exits 3 too, modulo 256.)
+    "wrapped_const_as_operand": """\
+const M: u8 = 200 + 100
+const K: i32 = M + 1
+
+pub fn main() -> i32
+    if K == 45
+        return 3
+    return 1
+""",
+    # Resolved at emit time (names a later const), so it takes the other
+    # folding path, which must wrap too.
+    "wraps_when_resolved_late": """\
+const M: u8 = L + 100
+
+const L: i32 = 200
+
+pub fn main() -> i32
+    if M == 44
+        return 3
+    return 1
+""",
 }
 
-# Run through ritz0 only, each for a ritz1 gap of its own:
-# * wraps_to_width: ritz1 uses the folded value unwrapped (AGAST #2154);
+# Run through ritz0 only, for a ritz1 gap of its own:
 # * float_from_negative_int: ritz1 emits invalid IR (AGAST #2155). It went
 #   through ritz0's old `-literal` path and must still compile.
 RITZ0_ONLY_FORMS = {
@@ -205,11 +257,18 @@ pub fn main() -> i32
         return 3
     return 1
 """,
-    "wraps_to_width": """\
-const M: u8 = 200 + 100
+}
+
+# Run through ritz1 and ritz1_selfhosted only: ritz0 sign-extends every
+# unsigned const when widening it, literal or folded (AGAST #2170).
+RITZ1_ONLY_FORMS = {
+    # A folded unsigned const zero-extends: 200 stays 200, not the i8
+    # pattern -56 (AGAST #2154).
+    "unsigned_in_range_stays_positive": """\
+const M: u8 = 100 + 100
 
 pub fn main() -> i32
-    if M == 44
+    if M == 200 and (M as i32) == 200
         return 3
     return 1
 """,
@@ -325,6 +384,16 @@ def test_ritz0_compound_const_value(tmp_path, name):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("name", sorted(RITZ1_ONLY_FORMS))
+def test_ritz1_compound_const_value(request, tmp_path, compiler, name):
+    request.getfixturevalue("ritz1_bin")
+    src = tmp_path / "main.ritz"
+    src.write_text(RITZ1_ONLY_FORMS[name])
+    assert _build_and_run(compiler, tmp_path, src) == 3
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_compound_const_from_imported_consts(request, tmp_path, compiler):
     if compiler != "ritz0":
@@ -359,7 +428,7 @@ def test_ritz0_folded_const_is_wrapped_in_ir(tmp_path):
     either way; the IR is where an unwrapped value shows.
     """
     src = tmp_path / "main.ritz"
-    src.write_text(RITZ0_ONLY_FORMS["wraps_to_width"])
+    src.write_text(FORMS["wraps_to_width"])
     ll = tmp_path / "main.ll"
     comp = _compile("ritz0", src, ll, tmp_path)
     assert comp.returncode == 0, comp.stderr[-2000:]
