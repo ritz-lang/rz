@@ -988,6 +988,17 @@ class BinaryConfig:
             self.bin_sources = []
 
 
+@dataclass
+class LibraryConfig:
+    """A [[lib]] target: every module under its sources, and no binary.
+
+    `modules` is what `sources` matched, not what an entry point imports, so a
+    module nothing imports is still compiled.
+    """
+    name: str
+    modules: list[Path]
+
+
 def parse_dependencies(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]:
     """Parse [dependencies] section from ritz.toml config.
 
@@ -1212,27 +1223,33 @@ class SkippedBinary:
 
 @dataclass
 class BinaryPlan:
-    """What get_binaries() decided about every declared [[bin]] in a package.
+    """What plan_binaries() decided about every declared target in a package.
 
-    Three disjoint buckets, and every declared target lands in exactly one:
+    Four disjoint buckets, and every declared target lands in exactly one:
 
-    - buildable:  compile these; each must produce an artifact
+    - buildable:  binaries to compile; each must produce an artifact
+    - libraries:  [[lib]] targets to compile; each must produce an archive
     - skipped:    deliberately not compiled, with a stated reason (success)
-    - unresolved: declared as a Ritz binary but its source could not be found
+    - unresolved: declared as a Ritz target but its source could not be found
                   (failure — a target we were asked for and cannot deliver)
     """
     buildable: list[BinaryConfig]
     skipped: list[SkippedBinary]
     unresolved: list[SkippedBinary]
+    libraries: list[LibraryConfig] = field(default_factory=list)
 
 
 def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
-    """Resolve every declared [[bin]] into buildable / skipped / unresolved.
+    """Resolve every declared target into the buckets of a BinaryPlan.
 
     get_binaries() returns only the buildable bucket, which is all most callers
     need. Anything deciding whether a *package* built must use this instead, so
     that a target dropped during resolution is visibly accounted for rather
     than silently absent from the list.
+
+    A package with neither [[bin]] nor [[lib]] gets one binary named after it,
+    from main.ritz under its sources. A package with [[lib]] and no [[bin]] has
+    no binary at all (AGAST #1340).
     """
     plan = BinaryPlan(buildable=[], skipped=[], unresolved=[])
     binaries = plan.buildable
@@ -1253,6 +1270,20 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
         pkg_sources = ["src"]  # Default
     if isinstance(pkg_sources, str):
         pkg_sources = [pkg_sources]
+
+    # [[lib]] sections. `sources` overrides the package's, as it does for
+    # [[bin]]: zeus's package sources include test/, which is not library code.
+    for lib_entry in config.get("lib", []):
+        lib_sources = lib_entry.get("sources", pkg_sources)
+        if isinstance(lib_sources, str):
+            lib_sources = [lib_sources]
+        modules = discover_sources(pkg_dir, lib_sources)
+        if modules:
+            plan.libraries.append(LibraryConfig(lib_entry["name"], modules))
+        else:
+            # A library that compiles nothing must not pass for a built one.
+            plan.unresolved.append(SkippedBinary(
+                lib_entry["name"], f"[[lib]] has no .ritz modules under {lib_sources}"))
 
     # Check for [[bin]] sections
     if "bin" in config:
@@ -1350,15 +1381,20 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
                 link_runtime=link_runtime,
                 main_args=main_args,
             ))
-    else:
+    elif "lib" not in config:
         # Default: single binary with package name
         name = config["package"]["name"]
-        src_path = pkg_dir / "src" / "main.ritz"
-        binaries.append(BinaryConfig(
-            name=name,
-            src_path=src_path,
-            additional_sources=[],
-        ))
+        result = resolve_entry_point("main::main", pkg_dir, pkg_sources)
+        if result is None:
+            plan.unresolved.append(SkippedBinary(
+                name, f"no main.ritz under sources {pkg_sources}; "
+                      "declare a [[bin]] or a [[lib]]"))
+        else:
+            binaries.append(BinaryConfig(
+                name=name,
+                src_path=result[0],
+                additional_sources=[],
+            ))
 
     return plan
 
@@ -1527,6 +1563,135 @@ def binary_is_up_to_date(bin_path: Path, provenance: dict) -> bool:
     return recorded == provenance
 
 
+def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, use_cache: bool,
+                    compiler: str, dependencies: dict[str, DependencySpec] = None,
+                    source_roots: list[str] = None, pkg_dir: Path = None) -> Optional[list[Path]]:
+    """Compile each source to an object in `artifact_dir`, through the store.
+
+    All sources are compiled with --no-runtime; a binary gets _start from the
+    runtime .o at link time. Every source is attempted, so one run reports
+    every broken module (AGAST #1286).
+
+    Returns the objects in source order, or None once the failures have been
+    reported.
+    """
+    link_files = []
+    compile_failures: List[Tuple[Path, str]] = []
+    obj_failures: List[str] = []  # AGAST #1731
+    for src in sources:
+        # Use a unique name to avoid collisions (e.g., multiple sys.ritz)
+        # Hash the full path to get a unique identifier
+        path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
+        src_name = f"{src.stem}_{path_hash}"
+        ll_path = artifact_dir / f"{src_name}.ll"
+        bc_path = artifact_dir / f"{src_name}.bc"
+        obj_path = artifact_dir / f"{src_name}.o"
+
+        # AGAST #1808: the shared content-addressed store. A hit is an
+        # object compiled from exactly this source and import closure, by
+        # this compiler, with these flags: in this worktree or any other.
+        # It replaces the per-worktree .ritz-cache objects (and the
+        # .bc/.ll tiers, which a hit on the .o always made unreachable).
+        cas_key = cas_module_key(src, cache, compiler) if use_cache else None
+
+        def compile_src(src=src, ll_path=ll_path, obj_path=obj_path) -> Optional[tuple]:
+            """Emit, verify and `clang -c` one module into obj_path.
+            None on success, else ("compile" | "obj" | "no-compiler", msg)."""
+            # All sources compiled without runtime - _start comes from external .o
+            if compiler.startswith("ritz1"):
+                compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
+                if compile_cmd is None:
+                    return ("no-compiler", "")
+            else:
+                compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
+
+                # Pass dependencies if any (RFC #109 Phase 2)
+                if dependencies:
+                    deps_json = {
+                        name: {"path": str(spec.path), "sources": spec.sources}
+                        for name, spec in dependencies.items()
+                    }
+                    compile_cmd.extend(["--deps", json.dumps(deps_json)])
+                # Pass source roots if any (for import resolution)
+                if source_roots:
+                    compile_cmd.extend(["--sources", json.dumps(source_roots)])
+                # Pass project root (package directory) for source root resolution
+                if pkg_dir:
+                    compile_cmd.extend(["--project-root", str(pkg_dir)])
+
+            env = ritz1_env(dependencies) if compiler.startswith("ritz1") else os.environ.copy()
+            result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
+            if result.returncode != 0:
+                return ("compile", result.stderr)
+
+            # AGAST #1308: verify before clang, and before the .ll is cached.
+            # Caching invalid IR would make the bug survive a rebuild and then
+            # reappear on a machine whose clang is stricter, which is exactly
+            # the failure mode this is here to kill.
+            ir_error = verify_ir(ll_path, src)
+            if ir_error is not None:
+                return ("compile", ir_error)
+
+            # AGAST #192: Pre-compile freshly emitted .ll to .o.  Without
+            # this, the link step pays for full IR lowering on every file
+            # (cached or not).  Caching the .o means subsequent rebuilds —
+            # even ones that re-invoke ritz1 — skip clang's slow path.
+            #
+            # AGAST #1731: there is deliberately no .bc / .ll fallback here.
+            # One used to swallow a failed (or capped) -O2 compile and link the
+            # .ll instead, which hid #1730 for a whole gate.
+            obj_error = compile_ll_to_obj(ll_path, obj_path, src)
+            if obj_error is not None:
+                return ("obj", obj_error)
+            return None
+
+        if cas_key is None:
+            failure = compile_src()
+        else:
+            def build_fn(compile_src=compile_src, ll_path=ll_path, obj_path=obj_path):
+                failure = compile_src()
+                if failure is not None:
+                    raise cas.BuildFailed(failure)
+                return {"ll": ll_path, "o": obj_path}
+            # AGAST #1911: single-flight. A hit, or a key another
+            # process is compiling right now, is copied; only a caller
+            # that still misses under the key's lock compiles.
+            ident = cas.module_identity(src)
+            try:
+                stored, built = store.get_or_build(
+                    cas_key, "o", build_fn, identity=ident,
+                    meta={"module": ident, "compiler": compiler})
+                failure = None
+                if not built:
+                    shutil.copyfile(stored, obj_path)
+            except cas.BuildFailed as e:
+                failure = e.args[0]
+
+        if failure is not None:
+            kind, msg = failure
+            if kind == "no-compiler":
+                return None
+            if kind == "obj":
+                obj_failures.append(msg)
+            else:
+                # AGAST #1286: collect and keep going so every broken file is
+                # reported, not just whichever one happened to be compiled
+                # first. Checked after the loop, before linking.
+                compile_failures.append((src, msg))
+            continue
+        link_files.append(obj_path)
+
+    # AGAST #1286: every source has now been attempted. If any failed,
+    # report them all and stop before linking — linking a partial set of
+    # objects would only produce confusing undefined-symbol errors on top
+    # of the real diagnostics.
+    if compile_failures or obj_failures:
+        report_compile_failures(compile_failures, compiler)
+        report_obj_failures(obj_failures)
+        return None
+    return link_files
+
+
 def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None, compiler: str = "ritz0", on_rebuild=None) -> Path:
     """Compile Ritz source file(s) to a binary.
 
@@ -1555,7 +1720,6 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     Uses gcc for linking when clang is not available.
     """
     import json
-    import shutil as shutil_mod
 
     # Default profile if not specified
     if profile is None:
@@ -1664,9 +1828,6 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     else:
         artifact_dir = Path(tempfile.mkdtemp())
 
-    # Collect paths for linking: .bc if available, else .ll
-    link_files = []
-
     # Detect main's signature to choose the right runtime
     main_params = detect_main_signature(src_path)
     runtime_obj = get_runtime_object(main_params)
@@ -1676,123 +1837,11 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         return None
 
     try:
-        # Compile each source file to LLVM IR, optionally convert to bitcode
-        # All sources compiled with --no-runtime; _start comes from runtime .o
-        compile_failures: List[Tuple[Path, str]] = []
-        obj_failures: List[str] = []  # AGAST #1731
-        for i, src in enumerate(all_sources):
-            is_main = (i == len(all_sources) - 1)
-
-            # Use a unique name to avoid collisions (e.g., multiple sys.ritz)
-            # Hash the full path to get a unique identifier
-            import hashlib
-            path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
-            src_name = f"{src.stem}_{path_hash}"
-            ll_path = artifact_dir / f"{src_name}.ll"
-            bc_path = artifact_dir / f"{src_name}.bc"
-            obj_path = artifact_dir / f"{src_name}.o"
-
-            # AGAST #1808: the shared content-addressed store. A hit is an
-            # object compiled from exactly this source and import closure, by
-            # this compiler, with these flags: in this worktree or any other.
-            # It replaces the per-worktree .ritz-cache objects (and the
-            # .bc/.ll tiers, which a hit on the .o always made unreachable).
-            cas_key = cas_module_key(src, cache, compiler) if use_cache else None
-
-            def compile_src(src=src, ll_path=ll_path, obj_path=obj_path) -> Optional[tuple]:
-                """Emit, verify and `clang -c` one module into obj_path.
-                None on success, else ("compile" | "obj" | "no-compiler", msg)."""
-                # All sources compiled without runtime - _start comes from external .o
-                if compiler.startswith("ritz1"):
-                    compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
-                    if compile_cmd is None:
-                        return ("no-compiler", "")
-                else:
-                    compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
-
-                    # Pass dependencies if any (RFC #109 Phase 2)
-                    if dependencies:
-                        deps_json = {
-                            name: {"path": str(spec.path), "sources": spec.sources}
-                            for name, spec in dependencies.items()
-                        }
-                        compile_cmd.extend(["--deps", json.dumps(deps_json)])
-                    # Pass source roots if any (for import resolution)
-                    if source_roots:
-                        compile_cmd.extend(["--sources", json.dumps(source_roots)])
-                    # Pass project root (package directory) for source root resolution
-                    if pkg_dir:
-                        compile_cmd.extend(["--project-root", str(pkg_dir)])
-
-                env = ritz1_env(dependencies) if compiler.startswith("ritz1") else os.environ.copy()
-                result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
-                if result.returncode != 0:
-                    return ("compile", result.stderr)
-
-                # AGAST #1308: verify before clang, and before the .ll is cached.
-                # Caching invalid IR would make the bug survive a rebuild and then
-                # reappear on a machine whose clang is stricter, which is exactly
-                # the failure mode this is here to kill.
-                ir_error = verify_ir(ll_path, src)
-                if ir_error is not None:
-                    return ("compile", ir_error)
-
-                # AGAST #192: Pre-compile freshly emitted .ll to .o.  Without
-                # this, the link step pays for full IR lowering on every file
-                # (cached or not).  Caching the .o means subsequent rebuilds —
-                # even ones that re-invoke ritz1 — skip clang's slow path.
-                #
-                # AGAST #1731: there is deliberately no .bc / .ll fallback here.
-                # One used to swallow a failed (or capped) -O2 compile and link the
-                # .ll instead, which hid #1730 for a whole gate.
-                obj_error = compile_ll_to_obj(ll_path, obj_path, src)
-                if obj_error is not None:
-                    return ("obj", obj_error)
-                return None
-
-            if cas_key is None:
-                failure = compile_src()
-            else:
-                def build_fn(compile_src=compile_src, ll_path=ll_path, obj_path=obj_path):
-                    failure = compile_src()
-                    if failure is not None:
-                        raise cas.BuildFailed(failure)
-                    return {"ll": ll_path, "o": obj_path}
-                # AGAST #1911: single-flight. A hit, or a key another
-                # process is compiling right now, is copied; only a caller
-                # that still misses under the key's lock compiles.
-                ident = cas.module_identity(src)
-                try:
-                    stored, built = store.get_or_build(
-                        cas_key, "o", build_fn, identity=ident,
-                        meta={"module": ident, "compiler": compiler})
-                    failure = None
-                    if not built:
-                        shutil_mod.copyfile(stored, obj_path)
-                except cas.BuildFailed as e:
-                    failure = e.args[0]
-
-            if failure is not None:
-                kind, msg = failure
-                if kind == "no-compiler":
-                    return None
-                if kind == "obj":
-                    obj_failures.append(msg)
-                else:
-                    # AGAST #1286: collect and keep going so every broken file is
-                    # reported, not just whichever one happened to be compiled
-                    # first. Checked after the loop, before linking.
-                    compile_failures.append((src, msg))
-                continue
-            link_files.append(obj_path)
-
-        # AGAST #1286: every source has now been attempted. If any failed,
-        # report them all and stop before linking — linking a partial set of
-        # objects would only produce confusing undefined-symbol errors on top
-        # of the real diagnostics.
-        if compile_failures or obj_failures:
-            report_compile_failures(compile_failures, compiler)
-            report_obj_failures(obj_failures)
+        link_files = compile_modules(
+            all_sources, artifact_dir, cache=cache, store=store, use_cache=use_cache,
+            compiler=compiler, dependencies=dependencies, source_roots=source_roots,
+            pkg_dir=pkg_dir)
+        if link_files is None:
             return None
 
         # Link all .bc/.ll files with the runtime .o
@@ -1898,6 +1947,87 @@ def find_llvm_tool(name: str) -> str:
             return versioned
     # Not found
     return name  # Will fail later with helpful error
+
+
+def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool = False,
+                    use_cache: bool = True, dependencies: dict[str, DependencySpec] = None,
+                    pkg_dir: Path = None, source_roots: list[str] = None,
+                    compiler: str = "ritz0", on_rebuild=None) -> Optional[Path]:
+    """Compile a [[lib]] into `out_dir/lib<name>.a`. None on failure.
+
+    The archive holds this package's modules only. A module's imports are
+    compiled by whichever binary links them, so the archive's undefined
+    symbols are its dependencies, as for any static library.
+
+    `on_rebuild` is as for compile_binary (AGAST #1382): not invoked when the
+    archive is proven up to date.
+    """
+    archive = out_dir / f"lib{lib.name}.a"
+    cache = get_build_cache(compiler)
+    compiler_changed = cache.invalidate_if_compiler_changed() if use_cache else False
+    store = cas.ArtifactStore()
+    cache.set_import_context(
+        project_root=pkg_dir if pkg_dir else ROOT,
+        dependencies={n: (s.path, s.sources) for n, s in (dependencies or {}).items()},
+        source_roots=source_roots,
+    )
+
+    # A module's store key covers its source, its import closure, the compiler
+    # and the object flags, so equal keys prove equal objects. Keys go in the
+    # manifest instead of file hashes because no entry point names the closure.
+    # None means the module could not be scanned; the compile reports why.
+    provenance = None
+    if use_cache:
+        keys = [cas_module_key(module, cache, compiler) for module in lib.modules]
+        if None not in keys:
+            provenance = {
+                "version": BINARY_MANIFEST_VERSION,
+                "compiler": compiler,
+                "compiler_hash": cache._get_current_compiler_hash(),
+                "modules": [[str(m.resolve()), k] for m, k in zip(lib.modules, keys)],
+            }
+    if (provenance is not None and not compiler_changed
+            and binary_is_up_to_date(archive, provenance)):
+        return archive
+
+    if on_rebuild is not None:
+        on_rebuild()
+
+    artifact_dir = ROOT / "build" if keep_artifacts else Path(tempfile.mkdtemp())
+    artifact_dir.mkdir(exist_ok=True)
+    try:
+        objects = compile_modules(
+            lib.modules, artifact_dir, cache=cache, store=store, use_cache=use_cache,
+            compiler=compiler, dependencies=dependencies, source_roots=source_roots,
+            pkg_dir=pkg_dir)
+        if objects is None:
+            return None
+
+        archiver = shutil.which(find_llvm_tool("llvm-ar")) or shutil.which("ar")
+        if archiver is None:
+            record_setup_miss(f"lib{lib.name}", "llvm-ar or ar")
+            print("  ✗ Neither llvm-ar nor ar found in PATH", file=sys.stderr)
+            return None
+
+        # A fresh archive, then a rename: `ar r` into the old one would keep
+        # the members of modules that have since been deleted.
+        tmp_archive = archive.with_name(archive.name + ".tmp")
+        tmp_archive.unlink(missing_ok=True)
+        result = subprocess.run(
+            [archiver, "rcs", str(tmp_archive)] + [str(o) for o in objects],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  ✗ {archiver} failed: {result.stderr}", file=sys.stderr)
+            tmp_archive.unlink(missing_ok=True)
+            return None
+        os.replace(tmp_archive, archive)
+
+        if provenance is not None:
+            write_binary_manifest(archive, provenance)
+        return archive
+    finally:
+        if not keep_artifacts:
+            shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
 def compile_freestanding_binary(
@@ -2349,7 +2479,7 @@ class PackageBuildResult:
     def summary(self) -> str:
         """One-line human description of the failure, for callers to print."""
         parts = [f"{len(self.failed)} of {len(self.built) + len(self.failed)} "
-                 f"binaries failed: {', '.join(self.failed)}"]
+                 f"targets failed: {', '.join(self.failed)}"]
         if self.skipped:
             parts.append("skipped: " + ", ".join(
                 f"{s.name} ({s.reason})" for s in self.skipped))
@@ -2357,7 +2487,7 @@ class PackageBuildResult:
 
 
 def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None, compiler: str = "ritz0") -> PackageBuildResult:
-    """Build all binaries in a package.
+    """Build all binaries and libraries in a package.
 
     Args:
         pkg_dir: Package directory (where ritz.toml is)
@@ -2409,6 +2539,27 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     failed = [u.name for u in plan.unresolved]
     setup_failed = []       # subset of `failed`: missing tool only (#2141)
     _SETUP_MISSES.clear()   # a miss belongs to the package that recorded it
+
+    def note_failure(target: str) -> None:
+        print(f"\n  ✗ Failed to build {target}")
+        failed.append(target)
+        tool = _SETUP_MISSES.pop(target, None)
+        if tool:
+            print(f"  ⚠ SETUP ERROR: {target} needs {tool}, which this "
+                  f"machine lacks -- not verified here, not a regression")
+            setup_failed.append(target)
+
+    def display_path(path: Path) -> Path:
+        # Not everything is under ROOT (e.g. running from a subdirectory).
+        for base in (ROOT, Path.cwd()):
+            try:
+                return path.relative_to(base)
+            except ValueError:
+                pass
+        return path
+
+    for unresolved in plan.unresolved:
+        print(f"  ✗ {unresolved.name}: {unresolved.reason}", file=sys.stderr)
 
     for skipped in plan.skipped:
         print(f"  ⏭ {skipped.name} skipped: {skipped.reason}")
@@ -2477,15 +2628,7 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 # resolution): still name the target the error belongs to.
                 print(hammer, end="")
         if bin_path:
-            try:
-                rel_path = bin_path.relative_to(ROOT)
-            except ValueError:
-                # If bin_path is not relative to ROOT (e.g., running from subdirectory),
-                # just show relative to cwd
-                try:
-                    rel_path = bin_path.relative_to(Path.cwd())
-                except ValueError:
-                    rel_path = bin_path
+            rel_path = display_path(bin_path)
             if announced:
                 print(f"\n  ✓ {rel_path}")
             else:
@@ -2516,13 +2659,38 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 print(f"  ⚠ Could not create convenience symlink {convenience_link}: {e}",
                       file=sys.stderr)
         else:
-            print(f"\n  ✗ Failed to build {bin_config.name}")
-            failed.append(bin_config.name)
-            tool = _SETUP_MISSES.pop(bin_config.name, None)
-            if tool:
-                print(f"  ⚠ SETUP ERROR: {bin_config.name} needs {tool}, which this "
-                      f"machine lacks -- not verified here, not a regression")
-                setup_failed.append(bin_config.name)
+            note_failure(bin_config.name)
+
+    for lib in plan.libraries:
+        # `lib<name>`: a package's library and binary usually share a name.
+        target = f"lib{lib.name}"
+        count = len(lib.modules)
+        hammer = f"  🔨 {target} <- {count} module{'' if count == 1 else 's'}"
+        announced = False
+
+        def announce_library(hammer=hammer):
+            nonlocal announced
+            announced = True
+            print(hammer, end="")
+
+        archive = compile_library(
+            lib, out_dir,
+            keep_artifacts=keep_artifacts,
+            use_cache=use_cache,
+            dependencies=namespaces,
+            pkg_dir=pkg_dir,
+            source_roots=source_roots,
+            compiler=compiler,
+            on_rebuild=announce_library,
+        )
+        if not archive:
+            note_failure(target)
+        elif announced:
+            print(f"\n  ✓ {display_path(archive)}")
+            built.append(archive)
+        else:
+            print(f"  = {target} up to date: {display_path(archive)}")
+            built.append(archive)
 
     return PackageBuildResult(built=built, failed=failed, skipped=plan.skipped,
                               setup_failed=setup_failed)
@@ -2905,7 +3073,8 @@ def cmd_list(args):
     cwd = Path.cwd()
     for pkg_dir, config in packages:
         pkg_name = config["package"]["name"]
-        binaries = get_binaries(pkg_dir, config)
+        plan = plan_binaries(pkg_dir, config)
+        targets = [b.name for b in plan.buildable] + [f"lib{l.name}" for l in plan.libraries]
         is_test_only = config.get("build", {}).get("test_only", False)
 
         try:
@@ -2915,9 +3084,8 @@ def cmd_list(args):
 
         if is_test_only:
             print(f"  {rel_path}/  →  {pkg_name} (test-only)")
-        elif binaries:
-            bin_names = ", ".join(b.name for b in binaries)
-            print(f"  {rel_path}/  →  {pkg_name} ({bin_names})")
+        elif targets:
+            print(f"  {rel_path}/  →  {pkg_name} ({', '.join(targets)})")
         else:
             print(f"  {rel_path}/  →  {pkg_name}")
 

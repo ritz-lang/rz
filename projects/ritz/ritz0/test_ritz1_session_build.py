@@ -166,7 +166,8 @@ _FRONT = re.compile(
     r"^(test_ritz1_bin_staleness\.py::test_stale_ritz1_binary_cannot_produce_a_false_pass"
     r"|test_build_compiler_switch\.py::|test_ritzlib_output_goldens\.py::"
     r"|test_import_alias_match_arm\.py::|test_ritz1_session_build\.py::"
-    r"|test_build\.py::Test\w+::test_(build_exits_nonzero|package_builds_when))"
+    r"|test_build\.py::Test\w+::test_(build_exits_nonzero|package_builds_when)"
+    r"|test_build_lib\.py::TestLibraryBuild::)"
 )
 
 
