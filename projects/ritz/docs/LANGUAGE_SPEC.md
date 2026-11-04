@@ -2097,6 +2097,24 @@ library uses long, prefixed free-function names (`strview_find`,
 let n = sys::write(1, c"hi\n", 3)
 ```
 
+Privacy does not give a fn its own namespace either: a fn name may be defined
+at most once across a file and everything it imports, transitively, whether
+the definitions are `pub` or private, and even if they are identical. A second
+definition is an error naming both files, not a silent choice of one. A
+`[[target_os]]` variant is never compared with an ungated fn of the same
+name, and `extern fn` declarations are not definitions.
+
+```ritz expect-error="Conflicting function definition for 'area'"
+fn area() -> i32
+    1
+
+fn area() -> i32
+    2
+
+fn main() -> i32
+    area()
+```
+
 ### 15.4 Re-exports
 
 ```ritz

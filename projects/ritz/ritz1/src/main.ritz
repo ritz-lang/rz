@@ -225,6 +225,12 @@ fn add_enum_from_fns(m: *Module, first_ei: i32, path: *u8) -> i32
         err2("Parse error in the generated from() of: ", path)
         return -1
     keep_source_alive(gen)
+    # Not in the source: identical enums in two files each generate one
+    # (AGAST #2148, fns_conflict).
+    var gf: *FnDef = gm.functions
+    while gf != null
+        gf.from_generated = 1
+        gf = gf.next
     merge_module_into(m, gm)
     0
 
@@ -260,6 +266,17 @@ fn was_import_processed(path: @String) -> i32
 
 fn mark_import_processed(path: String)
     vec_push<String>(@g_processed, path)
+
+# The g_processed key of the file at `path` (AGAST #2148): its canonical
+# path, as ritz0's processed_files holds Path.resolve()d ones, so a module
+# reached by two spellings (a relative import and the RITZ_PATH symlink farm,
+# or an import cycle back to the main file) is merged once.  The raw path if
+# it cannot be canonicalised.
+fn import_key(path: *u8) -> String
+    var key: String = string_new()
+    if push_canonical_path(@key, path) == 0
+        string_push_cstr(@key, path)
+    key
 
 # Return the directory portion (up to and including the trailing '/'), or
 # an empty StrView if path has no directory component.
@@ -620,6 +637,90 @@ fn check_const_conflicts(m: *Module, other: *Module, path: *u8) -> i32
         return -1
     0
 
+# =============================================================================
+# Function conflicts across files (AGAST #2148)
+# =============================================================================
+#
+# A fn name may have at most one ungated definition in the whole import
+# closure, private or not: imported names share one flat namespace
+# (LANGUAGE_SPEC §15.3).  ritz0's rule (import_resolver.py _register_item):
+# bodies are not compared (an import is seen through its interface); a
+# [[target_os]] fn is never compared with anything; two generated `E__from`
+# fns come from enums already checked identical, so they do not conflict.
+# `extern fn` declarations (body == null) are not definitions.
+#
+# The diagnostic names the earlier definition first in ritz0's registration
+# order, where a file's imports come before the file's own items.
+
+# 1 if `a` and `b` are two definitions of one fn name that may not coexist.
+fn fns_conflict(a: *FnDef, b: *FnDef) -> i32
+    if a.def_file == null or b.def_file == null
+        return 0
+    if a.body == null or b.body == null
+        return 0
+    if a.target_gated == 1 or b.target_gated == 1
+        return 0
+    if a.from_generated == 1 and b.from_generated == 1
+        return 0
+    bytes_same(a.name, a.name_len, b.name, b.name_len)
+
+# "Error: <later>:<line>: Conflicting function definition for 'X': defined in
+# both <earlier> and <later>"
+fn report_fn_conflict(earlier: *FnDef, later: *FnDef)
+    var msg: String = string_from("Error: ")
+    string_push_cstr(@msg, later.def_file)
+    string_push(@msg, ':')
+    string_push_i64(@msg, later.line as i64)
+    string_push_str(@msg, ": Conflicting function definition for '")
+    string_push_bytes(@msg, later.name, later.name_len as i64)
+    string_push_str(@msg, "': defined in both ")
+    string_push_cstr(@msg, earlier.def_file)
+    string_push_str(@msg, " and ")
+    string_push_cstr(@msg, later.def_file)
+    eprintln_string(@msg)
+    string_drop(@msg)
+
+# Two definitions of one name inside a single freshly parsed file `m` (its
+# generated `E__from` fns included).  Returns -1 if there was one, else 0.
+fn check_fn_dups_in_file(m: *Module) -> i32
+    var bad: i32 = 0
+    var f: *FnDef = m.functions
+    while f != null
+        var g: *FnDef = f.next
+        while g != null
+            if fns_conflict(f, g) == 1
+                report_fn_conflict(f, g)
+                bad = 1
+                break
+            g = g.next
+        f = f.next
+    if bad == 1
+        return -1
+    0
+
+# Every fn of `other` (an import of the file `m_path`, with everything it
+# imported merged in) that `m` already defines.  `m` holds m_path's own fns
+# and those of its earlier imports; m_path's own come after `other`'s.
+# Returns -1 if there was a conflict, else 0.
+fn check_fn_conflicts(m: *Module, other: *Module, m_path: *u8) -> i32
+    var bad: i32 = 0
+    var c: *FnDef = other.functions
+    while c != null
+        var e: *FnDef = m.functions
+        while e != null
+            if fns_conflict(e, c) == 1
+                if streq(e.def_file, m_path) == 1
+                    report_fn_conflict(c, e)
+                else
+                    report_fn_conflict(e, c)
+                bad = 1
+                break
+            e = e.next
+        c = c.next
+    if bad == 1
+        return -1
+    0
+
 # Merge imported_module's declarations into main module m.
 # Each list is preserved by walking to its tail and prepending the main list.
 fn merge_module_into(m: *Module, other: *Module)
@@ -834,7 +935,8 @@ fn strip_to_interface(m: *Module)
         ib = ib.next
 
 # Resolve imports recursively, merging into the main module.
-fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
+# `m_path` is m's own file (AGAST #2148: check_fn_conflicts' ordering).
+fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrView) -> i32
     var imp: *ImportDecl = m.imports
     while imp != null
         # Find the import file.
@@ -850,17 +952,22 @@ fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
             return -1
 
         # Cycle detection.
-        if was_import_processed(@path) == 1
+        var key: String = import_key(string_as_ptr(@path))
+        if was_import_processed(@key) == 1
+            string_drop(@key)
             string_drop(@path)
             imp = imp.next
             continue
-        mark_import_processed(string_clone(@path))
+        mark_import_processed(key)
 
         let import_module: *Module = load_and_parse(@path)
         if import_module == null
             string_drop(@path)
             return -1
         strip_to_interface(import_module)
+        if check_fn_dups_in_file(import_module) < 0
+            string_drop(@path)
+            return -1
 
         # Child imports: ALWAYS use the resolved file's directory as the
         # source_dir for relative imports.  Earlier behaviour cleared
@@ -875,7 +982,7 @@ fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
         # special-cases ritzlib.* and skips source_dir for those, so
         # they continue to flow through RITZ_PATH.
         let child_dir: StrView = path_dir(string_as_ptr(@path))
-        let res: i32 = resolve_imports(import_module, child_dir, ritz_path)
+        let res: i32 = resolve_imports(import_module, string_as_ptr(@path), child_dir, ritz_path)
         if res < 0
             string_drop(@path)
             return -1
@@ -883,9 +990,11 @@ fn resolve_imports(m: *Module, source_dir: StrView, ritz_path: StrView) -> i32
         if check_const_conflicts(m, import_module, string_as_ptr(@path)) < 0
             string_drop(@path)
             return -1
+        if check_fn_conflicts(m, import_module, m_path) < 0
+            string_drop(@path)
+            return -1
         merge_module_into(m, import_module)
 
-        # Don't drop path — it's owned by g_processed now (we cloned above).
         string_drop(@path)
         imp = imp.next
 
@@ -1049,6 +1158,8 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
         return null
     if add_enum_from_fns(m, first_ei, input_path) < 0
         return null
+    if check_fn_dups_in_file(m) < 0
+        return null
 
     # AGAST #194: mark every FnDef parsed from THIS file as is_local=1
     # *before* resolve_imports prepends imported FnDefs (those stay
@@ -1073,7 +1184,11 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
         local_ib = local_ib.next
 
     # Resolve imports recursively
-    if resolve_imports(m, source_dir, ritz_path) < 0
+    # An import cycle back to this file must not merge it again (as ritz0's
+    # resolve() adds the main file to processed_files first): its fns would
+    # conflict with themselves (AGAST #2148).
+    mark_import_processed(import_key(input_path))
+    if resolve_imports(m, input_path, source_dir, ritz_path) < 0
         eprintln("Error: Import resolution failed")
         return null
 

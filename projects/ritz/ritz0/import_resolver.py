@@ -1234,18 +1234,25 @@ class ImportResolver:
                 # (filtering will pick the right one later)
                 self.functions[item.name].append(item)
             else:
-                # No target_os attribute - check for duplicates
-                # Keep only one non-conditional function per name
-                has_non_conditional = any(
-                    (f.get_attr_value('target_os') if hasattr(f, 'get_attr_value') else None) is None
-                    for f in self.functions[item.name]
-                )
-                if has_non_conditional:
-                    # Replace existing non-conditional function (last one wins)
-                    self.functions[item.name] = [
-                        f for f in self.functions[item.name]
-                        if (f.get_attr_value('target_os') if hasattr(f, 'get_attr_value') else None) is not None
-                    ]
+                # No target_os attribute: at most one ungated definition per
+                # name in the whole import closure, private or not (AGAST
+                # #2148).  Names share one flat namespace (LANGUAGE_SPEC
+                # §15.3); this used to keep the last one, so callers in the
+                # earlier module silently ran the later body.  Bodies are not
+                # compared: an import is seen through its interface.  Two
+                # generated `E__from` fns come from enums _enums_equal has
+                # already found identical, so the first is kept.
+                for existing in self.functions[item.name]:
+                    existing_target_os = (existing.get_attr_value('target_os')
+                                          if hasattr(existing, 'get_attr_value') else None)
+                    if existing_target_os is not None:
+                        continue
+                    if getattr(existing, 'generated', False) and getattr(item, 'generated', False):
+                        return
+                    raise ImportError(
+                        f"Conflicting function definition for '{item.name}': "
+                        f"defined in both {existing.source_file} and {source_file}"
+                    )
                 self.functions[item.name].append(item)
 
         elif isinstance(item, rast.ExternFn):
