@@ -86,6 +86,18 @@ enum Slot
 # name -> (program body, expected exit status, {compiler: gap ticket}).
 # Where a helper returns `DROPS * 10`, the tens digit is the count at that
 # point inside the helper and the units digit the count once it has returned.
+# Two levels of struct (AGAST #2232).
+NESTED = """\
+struct Inner2
+    t: Tracked
+    u: Tracked
+    n: i32
+
+struct Outer2
+    w: Inner2
+
+"""
+
 CASES = {
     "scope_end_let": ("""\
 fn f()
@@ -413,6 +425,55 @@ pub fn main() -> i32
     let inner = f()
     return inner + DROPS
 """, 1, {}),
+
+    # AGAST #2232: a move out of a nested field stops the binding dropping
+    # it, so the one value drops once. It used to drop twice.
+    "nested_field_moved": (NESTED + """\
+struct Shell
+    h: Holder
+
+fn f()
+    var v = Shell { h: Holder { t: make(1), n: 0 } }
+    consume(v.h.t)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    # Assigning it back makes the binding its owner again.
+    "nested_field_assigned_back": (NESTED + """\
+fn f()
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    consume(v.w.t)
+    v.w.t = make(4)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 142, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+
+    # Only that field moves: v.w's other fields still drop...
+    "nested_field_move_rest_dropped": (NESTED + """\
+fn f()
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    consume(v.w.t)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+
+    # ...and stay usable.
+    "nested_field_move_sibling_readable": (NESTED + """\
+fn f() -> i32
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    consume(v.w.t)
+    return v.w.n
+
+pub fn main() -> i32
+    return f()
+""", 3, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
 
     # AGAST #2171 from here on (ritz1's cases from #2168, now shared).  A
     # struct with a field moved out still drops the others: consume drops 1,
@@ -947,6 +1008,30 @@ pub fn main() -> i32
     var u = h.t
     return h.t.id
 """, "h.t", {}),
+
+    # AGAST #2232: the ticket's program. ritz1 rejects it too, naming `v.w`.
+    "nested_field_moved_twice": (NESTED + """\
+fn f() -> i32
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    consume(v.w.t)
+    consume(v.w.t)
+    return 0
+
+pub fn main() -> i32
+    return f()
+""", "v.w.t", {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+
+    # A partly moved parent can't be used whole.
+    "parent_after_nested_field_move": (NESTED + """\
+fn eat(i: Inner2) -> i32
+    return i.n
+
+pub fn main() -> i32
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    consume(v.w.t)
+    eat(v.w)
+    return 0
+""", "v.w.t", {"ritz1": 2242, "ritz1_selfhosted": 2242}),
 
     # AGAST #2173: `o.a.t = v` with o.a moved out is rejected (Rust's
     # E0382), so a field-of-field store never re-owns part of a moved field.

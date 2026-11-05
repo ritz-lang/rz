@@ -52,8 +52,9 @@ class VarInfo:
     # If set, this parameter is a borrow and is effectively Copy
     borrow: Optional[rast.Borrow] = None
     # Move-only fields moved out of the binding (a partial move, §13.6,
-    # AGAST #2171): field name -> where. The binding stays usable through
-    # its other fields; using it whole, or the moved field, is an error.
+    # AGAST #2171, #2232): dotted path below the binding (`f`, `f.g`) ->
+    # where. The binding stays usable through its other fields; using it
+    # whole, the moved field, a parent of it or a part of it is an error.
     moved_fields: Dict[str, rast.Span] = field(default_factory=dict)
 
 
@@ -92,6 +93,24 @@ class Scope:
                 info.state = state
                 info.move_span = move_span
                 info.moved_fields = dict(fields)
+
+
+def field_path(expr: rast.Expr) -> Optional[Tuple[str, str]]:
+    """`b.f.g` as the binding name and the dotted path below it, ("b", "f.g").
+    None for anything else. Move tracking and drop flags are keyed on these
+    paths, so the checker and the emitter share this."""
+    parts: List[str] = []
+    while isinstance(expr, rast.Field):
+        parts.append(expr.field)
+        expr = expr.expr
+    if not parts or not isinstance(expr, rast.Ident):
+        return None
+    return expr.name, '.'.join(reversed(parts))
+
+
+def path_within(path: str, parent: str) -> bool:
+    """Is the dotted field path `path` the field `parent` or a part of it?"""
+    return path == parent or path.startswith(parent + '.')
 
 
 def _is_lending_param(param: Optional[rast.Param]) -> bool:
@@ -134,6 +153,15 @@ class MoveTypes:
 
     def has_own_drop(self, ty: rast.Type) -> bool:
         return isinstance(ty, rast.NamedType) and ty.name in self.drop_types
+
+    def resolve(self, ty: Optional[rast.Type]) -> Optional[rast.Type]:
+        """`ty` with type aliases followed."""
+        seen: Set[str] = set()
+        while (isinstance(ty, rast.NamedType) and not ty.args
+               and ty.name in self.aliases and ty.name not in seen):
+            seen.add(ty.name)
+            ty = self.aliases[ty.name]
+        return ty
 
     def is_move_only(self, ty: Optional[rast.Type]) -> bool:
         if ty is None:
@@ -266,8 +294,8 @@ class MoveChecker:
         # Per enclosing loop: the binding states at each `break` and
         # `continue` (AGAST #2161, _check_loop).
         self._loops: List[Dict[str, list]] = []
-        # (binding name, field) pairs the current function moves out of a
-        # binding (AGAST #2171); the emitter gives those fields drop flags.
+        # (binding name, field path) pairs the current function moves out of
+        # a binding (AGAST #2171, #2232); the emitter gives those drop flags.
         self._field_moves: Set[Tuple[str, str]] = set()
 
     def check(self, module: rast.Module) -> List[OwnershipError]:
@@ -280,8 +308,8 @@ class MoveChecker:
         Field that moves a move-only field out of a binding gets
         `moves_field = True`, an assignment target that gives it back
         `reowns_field = True`, and each FnDef `field_moves`, the (binding,
-        field) pairs it moves out (AGAST #2171): the emitter keeps a drop
-        flag per such field, so the binding's drop skips a moved field.
+        field path) pairs it moves out (AGAST #2171, #2232): the emitter
+        keeps a drop flag per such path, so the binding's drop skips it.
         """
         self.errors = []
         self.types = MoveTypes(module)
@@ -552,10 +580,8 @@ class MoveChecker:
             # The target (lvalue) is not a move, and assigning to a bare
             # moved-from binding is not a use of it (§13.6). Nor is assigning
             # to a field moved out of a binding: that field is owned again.
-            reowned = self._field_reowned(stmt.target)
-            if reowned is not None:
-                del reowned.moved_fields[stmt.target.field]
-                # The emitter sets the field's drop flag again.
+            if self._reown_field(stmt.target):
+                # The emitter sets the field's drop flags again.
                 stmt.target.reowns_field = True
             elif not isinstance(stmt.target, rast.Ident):
                 self._check_expr(stmt.target, is_move_context=False)
@@ -806,10 +832,12 @@ class MoveChecker:
             if is_move_context and lent is not None:
                 if self.types.is_move_only(self._field_path_type(expr)):
                     self._reject_move_out(lent, expr.span)
-            elif is_move_context and self._is_move_only_field(expr):
+            elif is_move_context and self.types.is_move_only(self._field_path_type(expr)):
                 # Moving a move-only field out of a temporary: the rest of
                 # the temporary isn't dropped either (no partial drops).
-                self._unmark_temporary(expr.expr)
+                while isinstance(expr, rast.Field):
+                    expr = expr.expr
+                self._unmark_temporary(expr)
 
         elif isinstance(expr, rast.Index):
             self._check_expr(expr.expr, is_move_context=False)
@@ -965,15 +993,6 @@ class MoveChecker:
         if getattr(expr, 'drop_temp', None) is not None:
             expr.drop_temp = None
 
-    def _is_move_only_field(self, expr: rast.Field) -> bool:
-        base = self._infer_expr_type(expr.expr)
-        while isinstance(base, (rast.PtrType, rast.RefType)):
-            base = base.inner
-        if not isinstance(base, rast.NamedType):
-            return False
-        return any(n == expr.field and self.types.is_move_only(t)
-                   for n, t in self.types.struct_fields(base))
-
     # ---- moves out of a `name:& T` parameter (AGAST #2231) --------------------
 
     def _lent_param(self, expr: rast.Expr) -> Optional[str]:
@@ -999,9 +1018,9 @@ class MoveChecker:
         """The type of a field path `b.f.g`, at any depth, or None."""
         if not isinstance(expr, rast.Field):
             return self._infer_expr_type(expr)
-        base = self._field_path_type(expr.expr)
+        base = self.types.resolve(self._field_path_type(expr.expr))
         while isinstance(base, (rast.PtrType, rast.RefType)):
-            base = base.inner
+            base = self.types.resolve(base.inner)
         if not isinstance(base, rast.NamedType):
             return None
         return next((t for n, t in self.types.struct_fields(base)
@@ -1013,55 +1032,86 @@ class MoveChecker:
 
     # ---- moves out of a field (AGAST #2171) ----------------------------------
 
-    def _field_owner(self, expr: rast.Field) -> Optional[VarInfo]:
-        """The binding `expr` (`b.f`) is a field of, when `b` owns a struct
-        value: a local or by-value parameter of a named type, not a pointer,
-        a reference or a `name:& T` parameter. None otherwise."""
-        if not isinstance(expr.expr, rast.Ident) or expr.field.isdigit():
+    def _path_owners(self, expr: rast.Field) -> Optional[List[rast.NamedType]]:
+        """The values `expr` (`b.f.g`) is held in by value, outermost first
+        (`b`, then `b.f`), when `b` owns a struct value: a local or by-value
+        parameter of a named type, not a pointer, a reference or a `name:& T`
+        parameter. None if the path isn't held that way all along: it leaves
+        through a pointer, a tuple or an enum."""
+        base = expr.expr
+        if isinstance(base, rast.Ident):
+            info = self.scope.lookup(base.name)
+            if info is None or info.borrow == rast.Borrow.MUTABLE:
+                return None
+            ty = self.types.resolve(info.ritz_type)
+            return [ty] if isinstance(ty, rast.NamedType) else None
+        if not isinstance(base, rast.Field):
             return None
-        info = self.scope.lookup(expr.expr.name)
-        if (info is None or info.borrow == rast.Borrow.MUTABLE
-                or not isinstance(info.ritz_type, rast.NamedType)):
+        owners = self._path_owners(base)
+        if owners is None:
             return None
-        return info
+        ty = self.types.resolve(next(
+            (t for n, t in self.types.struct_fields(owners[-1]) if n == base.field), None))
+        if not isinstance(ty, rast.NamedType) or ty.name not in self.types.structs:
+            return None
+        return owners + [ty]
 
-    def _field_reowned(self, target: rast.Expr) -> Optional[VarInfo]:
-        """For `b.f = v` with `f` moved out of the binding `b`, the binding."""
-        if not isinstance(target, rast.Field):
+    def _field_owner(self, expr: rast.Field) -> Optional[VarInfo]:
+        """The binding `expr` (`b.f`, `b.f.g`) is a field of, when the binding
+        holds that field by value (_path_owners). None otherwise."""
+        if expr.field.isdigit() or self._path_owners(expr) is None:
             return None
+        path = field_path(expr)
+        return self.scope.lookup(path[0]) if path is not None else None
+
+    def _reown_field(self, target: rast.Expr) -> bool:
+        """`b.f = v` gives back whatever moved out of `b.f`, `f` itself or
+        parts of it, unless `b` or a parent of `f` is gone too. True if it
+        gave anything back."""
+        if not isinstance(target, rast.Field):
+            return False
         info = self._field_owner(target)
         if info is None or info.state == VarState.MOVED:
-            return None
-        return info if target.field in info.moved_fields else None
+            return False
+        path = field_path(target)[1]
+        if any(path_within(path, m) and m != path for m in info.moved_fields):
+            return False
+        back = [m for m in info.moved_fields if path_within(m, path)]
+        for m in back:
+            del info.moved_fields[m]
+        return bool(back)
 
     def _check_owned_field(self, expr: rast.Field, info: VarInfo,
                            is_move_context: bool) -> None:
-        """`b.f` for a binding `b` that owns its struct: a use of field `f`
-        only, so the binding's other moved-out fields don't matter. In a move
-        context a move-only `f` moves out of `b` (a partial move, §13.6)."""
-        name = expr.expr.name
+        """`b.f.g` for a binding `b` that holds it by value: a use of that
+        field only, so what moved out of its siblings doesn't matter. A moved
+        field overlaps it if it is the field, a parent (`b.f` moved) or a
+        part of it (`b.f.g.h` moved). In a move context a move-only field
+        moves out of `b` (a partial move, §13.6)."""
+        name, path = field_path(expr)
         if info.state == VarState.MOVED:
             self.errors.append(OwnershipError(
                 f"use of moved value: `{name}` (moved at {info.move_span})",
-                expr.expr.span))
-            return
-        moved_at = info.moved_fields.get(expr.field)
-        if moved_at is not None:
-            self.errors.append(OwnershipError(
-                f"use of moved value: `{name}.{expr.field}` (moved at {moved_at})",
                 expr.span))
             return
-        if not is_move_context or not self._is_move_only_field(expr):
+        for moved, moved_at in info.moved_fields.items():
+            if path_within(path, moved) or path_within(moved, path):
+                self.errors.append(OwnershipError(
+                    f"use of moved value: `{name}.{moved}` (moved at {moved_at})",
+                    expr.span))
+                return
+        if not is_move_context or not self.types.is_move_only(self._field_path_type(expr)):
             return
-        if self.types.has_own_drop(info.ritz_type):
-            # Its drop would see a half-moved value (Rust's E0509).
-            self.errors.append(OwnershipError(
-                f"cannot move out of `{name}.{expr.field}`: "
-                f"`{info.ritz_type.name}` implements Drop",
-                expr.span))
-            return
-        info.moved_fields[expr.field] = expr.span
-        self._field_moves.add((name, expr.field))
+        for owner in self._path_owners(expr):
+            if self.types.has_own_drop(owner):
+                # Its drop would see a half-moved value (Rust's E0509).
+                self.errors.append(OwnershipError(
+                    f"cannot move out of `{name}.{path}`: "
+                    f"`{owner.name}` implements Drop",
+                    expr.span))
+                return
+        info.moved_fields[path] = expr.span
+        self._field_moves.add((name, path))
         # The emitter clears the field's drop flag here.
         expr.moves_field = True
 
@@ -1166,12 +1216,7 @@ class MoveChecker:
             moved = isinstance(scrut, rast.Call)
         if not moved:
             return None
-        if isinstance(scrut, rast.Field):
-            base = self._infer_expr_type(scrut.expr)
-            ty = next((t for n, t in self.types.struct_fields(base)
-                       if n == scrut.field), None) if isinstance(base, rast.NamedType) else None
-        else:
-            ty = self._infer_expr_type(scrut)
+        ty = self._field_path_type(scrut)
         return ty if self.types.is_move_only(ty) else None
 
     def _variant_fields(self, ty: rast.Type, variant: str) -> Optional[List[rast.Type]]:

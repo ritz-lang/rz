@@ -18,7 +18,7 @@ from monomorph import resolve_alias_in
 from tail_value import value_gap
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
-from move_checker import MoveChecker, MoveTypes, _subst as move_subst
+from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 
 
 class EmitError(Exception):
@@ -3892,49 +3892,62 @@ class LLVMEmitter:
         slot = self._drop_slot_of(name)
         return self.drop_flags.get(id(slot)) if slot is not None else None
 
+    def _field_flags_of(self, name: str) -> Dict[str, ir.AllocaInstr]:
+        """The drop flags of the binding `name`'s moved-out fields, by path."""
+        slot = self._drop_slot_of(name)
+        return self.field_drop_flags.get(id(slot), {}) if slot is not None else {}
+
     def _set_field_flag(self, expr: rast.Field, value: int) -> None:
         """Clear (a move out, 0) or set (re-owned by assignment, 1) the drop
-        flag of field `expr` (`b.f`) of the binding `b` (AGAST #2171)."""
-        if not isinstance(expr.expr, rast.Ident) or self.builder.block.is_terminated:
+        flags of the field `expr` (`b.f.g`) of the binding `b` and of its
+        parts, which go and come back with it (AGAST #2171, #2232)."""
+        path = field_path(expr)
+        if path is None or self.builder.block.is_terminated:
             return
-        slot = self._drop_slot_of(expr.expr.name)
-        flag = (self.field_drop_flags.get(id(slot), {}).get(expr.field)
-                if slot is not None else None)
-        if flag is not None:
-            self.builder.store(ir.Constant(self.i1, value), flag)
+        for fpath, flag in self._field_flags_of(path[0]).items():
+            if path_within(fpath, path[1]):
+                self.builder.store(ir.Constant(self.i1, value), flag)
 
     def _drop_old_field(self, target: rast.Field, field_ptr: ir.Value,
                         field_type: rast.Type) -> None:
         """`x.f... = v`, once v is evaluated and before it is stored: drop
-        the field's old value (§13.6, AGAST #2173). Only a field of a binding
-        that owns its value (its drop flag is set), and, for a field of x
-        itself, only if it hasn't been moved out (its field flag, AGAST
-        #2171). A deeper path `x.a.t` needs `a` not moved out: the move
-        checker rejects the assignment otherwise, so x's flag decides. A
+        what is left of the field's old value (§13.6, AGAST #2173). Only a
+        field of a binding that owns its value (its drop flag is set), and
+        only if the field hasn't been moved out (its field flag, AGAST #2171);
+        parts of it that were moved out stay undropped (AGAST #2232). A moved
+        parent needs no check: the move checker rejects the assignment. A
         store through a pointer drops nothing (AGAST #2179)."""
         if (self.builder.block.is_terminated
                 or not self.move_types.is_move_only(field_type)):
             return
-        root = target
-        while isinstance(root, rast.Field):
-            top, root = root, root.expr
-        if not isinstance(root, rast.Ident):
+        path = field_path(target)
+        if path is None:
             return
-        slot = self._drop_slot_of(root.name)
+        name, fpath = path
+        slot = self._drop_slot_of(name)
         flag = self.drop_flags.get(id(slot)) if slot is not None else None
         if flag is None:
             return
         cond = self.builder.load(flag)
-        fflag = self.field_drop_flags.get(id(slot), {}).get(top.field)
+        flags = self._field_flags_of(name)
+        fflag = flags.get(fpath)
         if fflag is not None:
             cond = self.builder.and_(cond, self.builder.load(fflag))
         drop_block = self.current_fn.append_basic_block("drop.old_field")
         cont_block = self.current_fn.append_basic_block("drop.old_field.cont")
         self.builder.cbranch(cond, drop_block, cont_block)
         self.builder.position_at_end(drop_block)
-        self._emit_drop_glue(field_ptr, field_type)
+        self._emit_drop_glue(field_ptr, field_type,
+                             field_flags=self._flags_below(flags, fpath))
         self.builder.branch(cont_block)
         self.builder.position_at_end(cont_block)
+
+    @staticmethod
+    def _flags_below(flags: Dict[str, ir.AllocaInstr],
+                     field: str) -> Dict[str, ir.AllocaInstr]:
+        """`flags` for the parts of `field`, by their paths below it."""
+        return {p[len(field) + 1:]: f for p, f in flags.items()
+                if p != field and path_within(p, field)}
 
     def _note_move(self, expr: rast.Ident) -> None:
         """The move checker marked this use as a move: the binding no longer
@@ -3969,8 +3982,8 @@ class LLVMEmitter:
             # Register both the variable and its flag (key by alloca id, not name)
             self.drop_scope_stack[-1].append((name, alloca, ritz_type))
             self.drop_flags[id(alloca)] = flag_alloca
-            # A flag per field the function moves out of a binding of this
-            # name (AGAST #2171); set whenever the binding is initialised.
+            # A flag per field path the function moves out of a binding of
+            # this name (AGAST #2171, #2232); set whenever it is initialised.
             moves = getattr(self.current_fn_def, 'field_moves', None) or ()
             fields = {f: self._new_drop_flag(f"{name}.{f}")
                       for n, f in sorted(moves) if n == name}
@@ -4339,9 +4352,9 @@ class LLVMEmitter:
         first, if it has one, then its move-only parts: a struct's fields in
         declaration order (AGAST #2157), the payload of the variant an enum
         holds, an array's elements in index order and a tuple's elements in
-        order (AGAST #2161). A struct field with a flag in `field_flags`
-        drops only while that flag is set: it may have been moved out
-        (AGAST #2171).
+        order (AGAST #2161). A struct field with a flag in `field_flags`,
+        which is keyed by path below `ptr`, drops only while that flag is
+        set: it may have been moved out (AGAST #2171, #2232).
         """
         if depth > 32 or not self.move_types.is_move_only(ritz_type):
             return
@@ -4387,14 +4400,15 @@ class LLVMEmitter:
                 continue
             fptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
             fflag = (field_flags or {}).get(fname)
+            below = self._flags_below(field_flags or {}, fname)
             if fflag is None:
-                self._emit_drop_glue(fptr, fty, depth + 1)
+                self._emit_drop_glue(fptr, fty, depth + 1, field_flags=below)
                 continue
             drop_block = self.current_fn.append_basic_block(f"drop.field.{fname}")
             cont_block = self.current_fn.append_basic_block(f"drop.field.{fname}.cont")
             self.builder.cbranch(self.builder.load(fflag), drop_block, cont_block)
             self.builder.position_at_end(drop_block)
-            self._emit_drop_glue(fptr, fty, depth + 1)
+            self._emit_drop_glue(fptr, fty, depth + 1, field_flags=below)
             self.builder.branch(cont_block)
             self.builder.position_at_end(cont_block)
 

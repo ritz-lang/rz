@@ -611,6 +611,9 @@ struct Res
 struct Wrap
     r: Res
 
+struct Outer
+    w: Wrap
+
 fn bump(r:& Res)
     r.h += 1
 
@@ -664,6 +667,13 @@ fn main() -> i32
     bump(w.r)
     return w.r.h
 """, id="field_of_struct"),
+        pytest.param("""
+fn main() -> i32
+    var o = Outer { w: Wrap { r: Res { h: 1 } } }
+    bump(o.w.r)
+    bump(o.w.r)
+    return o.w.r.h
+""", id="field_of_nested_struct"),
         pytest.param("""
 fn touch<T>(v:& T) -> i32
     return 0

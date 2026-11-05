@@ -15,7 +15,9 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
   * a type with its own `drop` runs it before its fields' drops;
   * a match arm binding one payload of several owns them all (AGAST #2177);
   * a `name:& T` parameter can't be moved out of, and what reads it instead
-    leaves the caller the only owner (AGAST #2231).
+    leaves the caller the only owner (AGAST #2231);
+  * a move out of a nested field `a.b.c` is tracked per path, so its parents
+    are partly moved and their other fields still drop (AGAST #2232).
 
 Exit statuses encode what the program observed, as in the free-count test.
 """
@@ -425,6 +427,427 @@ def test_ritz0_move_out_of_lent_param_rejected(tmp_path, name):
     assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
     assert f"cannot move out of borrowed parameter `{param}`" in out, out[-2000:]
+
+
+# Moves out of a nested field (AGAST #2232). `m.d.t` is 1, `m.d.u` 2, `m.x` 3.
+NESTED = """\
+struct Deep
+    t: Tracked
+    u: Tracked
+    n: i32
+
+struct Mid
+    d: Deep
+    x: Tracked
+
+struct Top
+    m: Mid
+
+type DeepAlias = Deep
+
+struct Aliased
+    d: DeepAlias
+
+struct Gen<T>
+    v: T
+
+fn deep(a: i32, b: i32) -> Deep
+    return Deep { t: make(a), u: make(b), n: 7 }
+
+fn mid() -> Mid
+    return Mid { d: deep(1, 2), x: make(3) }
+
+fn eat(d: Deep) -> i32
+    return d.n
+
+fn look(d: @Deep) -> i32
+    return d.n
+
+"""
+
+# name -> (body defining `fn f(c: bool)`, argument, drop order).
+NESTED_RUNS = {
+    "single_move": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume(m.d.t)
+""", "true", 123),
+    "three_levels": ("""\
+fn f(c: bool)
+    var o = Top { m: mid() }
+    consume(o.m.d.t)
+""", "true", 123),
+    "let_binding": ("""\
+fn f(c: bool)
+    let m = mid()
+    consume(m.d.t)
+""", "true", 123),
+    "by_value_param": ("""\
+fn g(m: Mid)
+    consume(m.d.t)
+
+fn f(c: bool)
+    g(mid())
+""", "true", 123),
+    "grouped": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume((m.d).t)
+""", "true", 123),
+    "through_alias": ("""\
+fn f(c: bool)
+    var a = Aliased { d: deep(1, 2) }
+    consume(a.d.t)
+""", "true", 12),
+    "through_generic": ("""\
+fn f(c: bool)
+    var g = Gen<Deep> { v: deep(1, 2) }
+    consume(g.v.t)
+""", "true", 12),
+    "every_leaf_moved": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume(m.d.u)
+    consume(m.x)
+    consume(m.d.t)
+""", "true", 231),
+    "copy_sibling_still_readable": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume(m.d.t)
+    ORDER = ORDER * 10 + m.d.n
+""", "true", 1723),
+    "into_binding": ("""\
+fn f(c: bool)
+    var m = mid()
+    var u = m.d.t
+""", "true", 123),
+    "into_struct_literal": ("""\
+fn f(c: bool)
+    var m = mid()
+    var h = Holder { t: m.d.t, n: 0 }
+""", "true", 123),
+    "returned": ("""\
+fn g() -> Tracked
+    var m = mid()
+    return m.d.t
+
+fn f(c: bool)
+    consume(g())
+""", "true", 231),
+    "moved_on_taken_path": ("""\
+fn f(c: bool)
+    var m = mid()
+    if c
+        consume(m.d.t)
+    ORDER = ORDER * 10 + 9
+""", "true", 1923),
+    "not_moved_on_untaken_path": ("""\
+fn f(c: bool)
+    var m = mid()
+    if c
+        consume(m.d.t)
+    ORDER = ORDER * 10 + 9
+""", "false", 9123),
+    # Parent or child, depending on the path: both flags are in play.
+    "parent_or_child_parent": ("""\
+fn f(c: bool)
+    var m = mid()
+    if c
+        eat(m.d)
+    else
+        consume(m.d.t)
+    ORDER = ORDER * 10 + 9
+""", "true", 1293),
+    "parent_or_child_child": ("""\
+fn f(c: bool)
+    var m = mid()
+    if c
+        eat(m.d)
+    else
+        consume(m.d.t)
+    ORDER = ORDER * 10 + 9
+""", "false", 1923),
+    # Assigning what was moved out re-owns it and drops nothing.
+    "leaf_assigned_back": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume(m.d.t)
+    m.d.t = make(4)
+""", "true", 1423),
+    "live_leaf_assigned": ("""\
+fn f(c: bool)
+    var m = mid()
+    m.d.t = make(4)
+""", "true", 1423),
+    # The parent's assignment drops what's left of the old value.
+    "parent_assigned_after_child": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume(m.d.t)
+    m.d = deep(4, 5)
+""", "true", 12453),
+    "parent_assigned_child_maybe_moved": ("""\
+fn f(c: bool)
+    var m = mid()
+    if c
+        consume(m.d.t)
+    m.d = deep(4, 5)
+""", "false", 12453),
+    # The new value's fields are live again: the second move is valid.
+    "moved_again_after_parent_assigned": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume(m.d.t)
+    m.d = deep(4, 5)
+    consume(m.d.t)
+""", "true", 12453),
+    "binding_assigned_after_child": ("""\
+fn f(c: bool)
+    var m = mid()
+    consume(m.d.t)
+    m = Mid { d: deep(4, 5), x: make(6) }
+""", "true", 123456),
+    "moved_each_iteration": ("""\
+fn f(c: bool)
+    var m = mid()
+    var i = 0
+    while i < 2
+        consume(m.d.t)
+        m.d.t = make(4)
+        i = i + 1
+""", "true", 14423),
+    # A lent nested field stays where it is.
+    "lent_not_moved": ("""\
+fn f(c: bool)
+    var m = mid()
+    peek(m.d.t)
+    peek(m.d.t)
+    look(m.d)
+""", "true", 123),
+    # As for `make().t`: no partial drops of a temporary.
+    "temporary_nested_field": ("""\
+fn f(c: bool)
+    var u = mid().d.t
+""", "true", 1),
+}
+
+# name -> (body defining `fn f()`, the moved path the error names).
+NESTED_REJECTED = {
+    "moved_twice": ("""\
+fn f()
+    var m = mid()
+    consume(m.d.t)
+    consume(m.d.t)
+""", "m.d.t"),
+    "three_levels_twice": ("""\
+fn f()
+    var o = Top { m: mid() }
+    consume(o.m.d.t)
+    consume(o.m.d.t)
+""", "o.m.d.t"),
+    "grouped_twice": ("""\
+fn f()
+    var m = mid()
+    consume((m.d).t)
+    consume(m.d.t)
+""", "m.d.t"),
+    "alias_twice": ("""\
+fn f()
+    var a = Aliased { d: deep(1, 2) }
+    consume(a.d.t)
+    consume(a.d.t)
+""", "a.d.t"),
+    "read_after_move": ("""\
+fn f()
+    var m = mid()
+    consume(m.d.t)
+    ORDER = m.d.t.id
+""", "m.d.t"),
+    "lent_after_move": ("""\
+fn f()
+    var m = mid()
+    consume(m.d.t)
+    peek(m.d.t)
+""", "m.d.t"),
+    "parent_moved_after_child": ("""\
+fn f()
+    var m = mid()
+    consume(m.d.t)
+    eat(m.d)
+""", "m.d.t"),
+    "parent_lent_after_child": ("""\
+fn f()
+    var m = mid()
+    consume(m.d.t)
+    look(m.d)
+""", "m.d.t"),
+    "binding_moved_after_child": ("""\
+fn g(m: Mid)
+    consume(m.x)
+
+fn f()
+    var m = mid()
+    consume(m.d.t)
+    g(m)
+""", "m.d.t"),
+    "child_after_parent": ("""\
+fn f()
+    var m = mid()
+    eat(m.d)
+    consume(m.d.t)
+""", "m.d"),
+    "maybe_moved": ("""\
+fn f(c: bool)
+    var m = mid()
+    if c
+        consume(m.d.t)
+    consume(m.d.t)
+""", "m.d.t"),
+    "moved_in_loop": ("""\
+fn f()
+    var m = mid()
+    var i = 0
+    while i < 2
+        consume(m.d.t)
+        i = i + 1
+""", "m.d.t"),
+    # Both moved, on different paths: the leaf can't come back without m.d.
+    "assign_leaf_of_maybe_moved_parent": ("""\
+fn f(c: bool)
+    var m = mid()
+    if c
+        eat(m.d)
+    else
+        consume(m.d.t)
+    m.d.t = make(4)
+""", "m.d"),
+    "assign_leaf_of_moved_parent": ("""\
+fn f()
+    var m = mid()
+    eat(m.d)
+    m.d.t = make(4)
+""", "m.d"),
+}
+
+# Moving out of a type with its own `drop`, at any level of the path.
+NESTED_DROP_PARENT = {
+    "middle": ("""\
+struct Shell
+    o: Owner
+
+fn f(s: Shell)
+    consume(s.o.t)
+""", "s.o.t", "Owner"),
+    "root": ("""\
+struct Sealed
+    h: Holder
+
+impl Drop for Sealed
+    fn drop(self: @&Sealed)
+        DROPS = DROPS + 1
+
+fn f(s: Sealed)
+    consume(s.h.t)
+""", "s.h.t", "Sealed"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(NESTED_RUNS))
+def test_ritz0_nested_field_drops(tmp_path, name):
+    body, arg, order = NESTED_RUNS[name]
+    rc = _run(tmp_path, NESTED + body + f"""
+pub fn main() -> i32
+    f({arg})
+    return ORDER
+""")
+    # An exit status keeps the low byte, which is enough to tell orders apart.
+    assert rc == order % 256, f"{name}: exit {rc}, drop order {order} is {order % 256}"
+
+
+@pytest.mark.parametrize("name", sorted(NESTED_REJECTED))
+def test_ritz0_nested_field_use_after_move_rejected(tmp_path, name):
+    body, path = NESTED_REJECTED[name]
+    comp, _ = _compile(tmp_path, NESTED + body + "\npub fn main() -> i32\n    return 0\n")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a use after move:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert f"use of moved value: `{path}`" in out, out[-2000:]
+
+
+@pytest.mark.parametrize("name", sorted(NESTED_DROP_PARENT))
+def test_ritz0_nested_move_out_of_drop_type_rejected(tmp_path, name):
+    body, path, owner = NESTED_DROP_PARENT[name]
+    comp, _ = _compile(tmp_path, NESTED + body + "\npub fn main() -> i32\n    return 0\n")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a move out of a Drop type:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert f"cannot move out of `{path}`: `{owner}` implements Drop" in out, out[-2000:]
+
+
+# A match on a nested field owns what it moved, as on a direct one (AGAST #2177).
+NESTED_MATCH = """\
+enum Slot
+    Full(Tracked)
+    Empty
+
+struct Bag
+    s: Slot
+    k: Tracked
+
+struct Sack
+    b: Bag
+
+"""
+
+
+def test_ritz0_nested_match_payload_binding_owns_it(tmp_path):
+    rc = _run(tmp_path, NESTED_MATCH + """
+fn f()
+    var o = Sack { b: Bag { s: Slot.Full(make(1)), k: make(2) } }
+    match o.b.s
+        Full(t) => consume(t)
+        Empty => 0
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""")
+    assert rc == 12
+
+
+def test_ritz0_nested_match_unbound_payload_drops_with_scrutinee(tmp_path):
+    rc = _run(tmp_path, NESTED_MATCH + """
+fn f()
+    var o = Sack { b: Bag { s: Slot.Full(make(1)), k: make(2) } }
+    match o.b.s
+        Full(_) => ORDER = 5
+        Empty => ORDER = 6
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""")
+    assert rc == 512 % 256
+
+
+def test_ritz0_nested_match_moves_the_scrutinee(tmp_path):
+    comp, _ = _compile(tmp_path, NESTED_MATCH + """
+fn f()
+    var o = Sack { b: Bag { s: Slot.Full(make(1)), k: make(2) } }
+    match o.b.s
+        Full(_) => ORDER = 5
+        Empty => ORDER = 6
+    match o.b.s
+        Full(_) => ORDER = 5
+        Empty => ORDER = 6
+
+pub fn main() -> i32
+    return 0
+""")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"matched a moved field:\n{out[-1000:]}"
+    assert "use of moved value: `o.b.s`" in out, out[-2000:]
 
 
 @pytest.mark.parametrize("name", sorted(RUNS))

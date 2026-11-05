@@ -2012,6 +2012,99 @@ moved out. Assigning a moved-out field drops nothing and makes the binding
 own the field again. A field of a moved-out field can't be assigned:
 `h.a.t = v` with `h.a` moved out is a use of the moved `h.a`, as in Rust.
 
+A move out of a nested field moves that field only, at any depth, as in Rust.
+After `v.w.t` moves, `v` and `v.w` are **partly moved**:
+
+- the other fields of `v` and `v.w` stay usable, and drop when `v` does;
+- using `v` or `v.w` whole is an error, whether the use moves, lends or reads
+  it, and so is using `v.w.t` or anything inside it;
+- assigning `v.w.t` makes the binding own it again, as above;
+- assigning a partly moved parent, `v.w = x`, drops what is left of the old
+  `v.w` and makes all of `v.w` owned again.
+
+A field can't be moved out of a value whose type has its own `drop`, because
+that `drop` would see a half-moved value. This holds at every level: `v.w.t`
+can't move if the type of `v` or of `v.w` implements `Drop`. A path through a
+pointer or reference doesn't belong to the binding, so a move through one isn't
+tracked.
+
+```ritz expect-error="use of moved value: `v.w.t`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+struct Inner
+    t: Resource
+    n: i32
+
+struct Outer
+    w: Inner
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn main() -> i32
+    var v = Outer { w: Inner { t: Resource { handle: 3 }, n: 4 } }
+    consume(v.w.t)
+    consume(v.w.t)                  # error: v.w.t has already moved
+```
+
+```ritz expect-error="use of moved value: `v.w.t`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+struct Inner
+    t: Resource
+    n: i32
+
+struct Outer
+    w: Inner
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn take(i: Inner) -> i32
+    i.n
+
+fn main() -> i32
+    var v = Outer { w: Inner { t: Resource { handle: 3 }, n: 4 } }
+    consume(v.w.t)
+    take(v.w)                       # error: v.w is partly moved
+```
+
+```ritz
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+struct Inner
+    t: Resource
+    n: i32
+
+struct Outer
+    w: Inner
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn main() -> i32
+    var v = Outer { w: Inner { t: Resource { handle: 3 }, n: 4 } }
+    consume(v.w.t)
+    let n = v.w.n                   # fine: a field that didn't move
+    v.w.t = Resource { handle: n }  # v owns v.w.t again
+    consume(v.w.t)
+```
+
 A move-only type with no `Drop` impl of its own, such as a struct with a
 `Drop` field, is dropped by dropping its move-only parts:
 
@@ -2076,9 +2169,12 @@ fn main() -> i32
     r.handle                        # r is dropped after this is evaluated
 ```
 
-ritz0 follows these rules (AGAST #2157, #2161). ritz1 follows them (AGAST
+ritz0 follows these rules (AGAST #2157, #2161, #2232), except that a move out
+of a tuple element isn't tracked yet (AGAST #2244). ritz1 follows them (AGAST
 #2158) except for enum payloads, arrays, temporaries and moves inside loops
-(AGAST #2165), and it has no tuple literals yet (AGAST #1526).
+(AGAST #2165), and it has no tuple literals yet (AGAST #1526). A nested move
+in ritz1 moves the whole top-level field, so that field's other parts leak and
+can't be used (AGAST #2242).
 `ritz0/test_ownership_free_count.py` counts the drops for each rule on all
 three compilers, with today's gaps marked as expected failures.
 
