@@ -78,6 +78,13 @@ struct LocalVar
     # other T reads as the pointer, so the slot a value goes to decides what to
     # do; see emit_lent_referent, emit_lent_ptr and lent_array_local.
     is_lent: i32
+    # AGAST #2286: 1 for a `:&` param whose slot holds the borrow's pointer, so
+    # the place `@x` names is behind that pointer, not the slot.  Not is_lent:
+    # that covers an integer, whose slot IS the caller's variable, and leaves
+    # out `:& f64`, `:& bool` and `:& **C`.  `p:& *T` stays 0 as well: its slot
+    # is the caller's pointer variable.  A receiver not declared as a reference
+    # is 1 too, because `self` is always passed as a `ptr`.  See mark_lent_param.
+    holds_lent_ptr: i32
 
 # A let/var seen so far in the current function, with the integer type its
 # annotation WROTE (NARROW_UNKNOWN when unannotated or not an integer).
@@ -841,6 +848,7 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
     loc.pointee_array_elem_type = TYPE_VOID
     loc.array_shape = null
     loc.is_lent = 0
+    loc.holds_lent_ptr = 0
     s.local_count = idx + 1
     # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
     # Store `idx + 1` so the value is non-zero (0 = miss in
@@ -4069,6 +4077,24 @@ fn mem_builtin_id(name: *u8, len: i32) -> i32
         return MEM_FENCE
     0
 
+# AGAST #2286: the local `e` names when its slot holds a `:&` borrow's pointer,
+# so that `@e` is that pointer (LocalVar.holds_lent_ptr); null otherwise.
+fn lent_ptr_local(s: *EmitterState, e: *Expr) -> *LocalVar
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+    if loc == null or loc.holds_lent_ptr == 0
+        return null
+    return loc
+
+# lent_ptr_local, when `@e` points at a struct, which the local's type_name then
+# names.  `c:& **C` and `c:& [2]C` name `C` too, and `@c` isn't a `*C` there.
+fn lent_struct_local(s: *EmitterState, e: *Expr) -> *LocalVar
+    let loc: *LocalVar = lent_ptr_local(s, e)
+    if loc == null or loc.pointee_type != TYPE_STRUCT
+        return null
+    return loc
+
 # The pointee type a pointer expression states inline, or TYPE_VOID: `<e> as
 # *T` (the cast records T; AGAST #1453) and `@x` (x's own type).  Shared by
 # the memory builtins (#1879) and the `*p` load / `*p = v` store widths
@@ -4082,6 +4108,9 @@ fn inline_ptr_pointee(s: *EmitterState, p: *Expr) -> i32
         let ae: i32 = addr_of_array_elem_type(s, p.operand)
         if ae != TYPE_VOID
             return ae
+        let lent: *LocalVar = lent_ptr_local(s, p.operand)
+        if lent != null
+            return lent.pointee_type   # AGAST #2286: it reads as the pointer
         return get_expr_type(s, p.operand)
     TYPE_VOID
 

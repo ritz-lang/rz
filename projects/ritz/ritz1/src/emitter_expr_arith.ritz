@@ -481,7 +481,12 @@ fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_le
     else if base.kind == EXPR_UNARY and (base.op == OP_ADDR or base.op == OP_ADDR_MUT)
         # AGAST #1746: `*@x` is x's own struct type.  It loaded i64, which a
         # by-value or struct store of the result rejects.
-        resolve_expr_struct_name(s, base.operand, @cand, @cand_len)
+        let lent: *LocalVar = lent_struct_local(s, base.operand)
+        if lent != null
+            cand = lent.type_name   # AGAST #2286: `c` itself reads as the pointer
+            cand_len = lent.type_name_len
+        else
+            resolve_expr_struct_name(s, base.operand, @cand, @cand_len)
     else if base.kind == EXPR_MEMBER
         let f: *StructField = member_field_def(s, base)
         if f != null and f.field_type == TYPE_PTR
@@ -639,6 +644,10 @@ fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     if op.kind == EXPR_IDENT
         let loc: i32 = find_local(s, op.ident_ptr, op.ident_len)
         if loc >= 0
+            # AGAST #2286: `@c` of `c:& C` is the borrow's pointer.  The slot's
+            # own address is a pointer to that pointer.
+            if lent_ptr_local(s, op) != null
+                return emit_load_ptr(s, loc)
             # Convert ptr (alloca) to i64
             return loc
         # Fall through: not a local, try a global. `@g_processed` (a
@@ -1126,6 +1135,9 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
         var sname_len: i32 = 0
         deref_pointee_struct_name(s, e.operand, @sname, @sname_len)
         if sname_len > 0
+            # AGAST #2286: `*@c` reads `c:& C` by value, as `c` itself does.
+            if e.operand.kind == EXPR_UNARY and lent_struct_local(s, e.operand.operand) != null
+                own_check_lent_read(s, e.operand.operand, sname, sname_len)
             let sresult: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, sresult)

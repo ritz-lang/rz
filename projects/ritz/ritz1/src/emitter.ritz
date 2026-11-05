@@ -178,15 +178,21 @@ fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) ->
 # param with an integer, struct or array T (LocalVar.is_lent).  Checking the
 # kind matters: `c:& **C` also names `C`, and that isn't what it holds.  Nor
 # does `c:& [2]C`, which is why its readers ask for an array (AGAST #2279).
+# Whatever its T, a param bound as a reference holds the pointer in its slot
+# (AGAST #2286); bind_scalar_borrow_param's locals don't.
 fn mark_lent_param(s: *EmitterState, param: *Param)
+    let loc: *LocalVar = find_local_struct_name(s, param.name, param.name_len)
+    if loc == null
+        return
+    # `self:& C` on a free fn binds here too; in an impl it's a `*C` local.
+    if (param.is_borrow == 1 or param.is_self_borrow == 1) and loc.var_type == TYPE_MUT_REF
+        loc.holds_lent_ptr = 1
     if param.is_borrow != 1 or param.param_type != TYPE_MUT_REF
         return
     let pt: i32 = param.param_pointee_type
     if pt != TYPE_STRUCT and pt != TYPE_ARRAY and is_borrow_scalar_kind(pt) == 0
         return
-    let loc: *LocalVar = find_local_struct_name(s, param.name, param.name_len)
-    if loc != null
-        loc.is_lent = 1
+    loc.is_lent = 1
 
 # The integer kinds a `:&` borrow binds as a plain local (AGAST #1644).
 fn is_borrow_scalar_kind(t: i32) -> i32
@@ -1104,6 +1110,13 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             # Register `self` as a pointer-to-struct local so `self.field`
             # member access resolves via the impl type. (task-99 cluster #1)
             add_local_full(s, param2.name, param2.name_len, alloca_reg, TYPE_PTR, ib.type_name, ib.type_name_len, TYPE_STRUCT, 0, 0)
+            # AGAST #2286: `self` is passed as a `ptr` however it's spelled, so
+            # `@self` is that pointer.  The parser gives bare `self` and `self:&`
+            # one Param, so a by-value receiver can't be left out.  `self: @C`
+            # and `self: @&C` are references: `@self` is the reference's address.
+            if param2.param_type == TYPE_STRUCT or param2.is_self_borrow == 1
+                let self_loc: *LocalVar = find_local_struct_name(s, param2.name, param2.name_len)
+                self_loc.holds_lent_ptr = 1
         else if param2.param_type == TYPE_PTR or param2.param_type == TYPE_PTR_PTR or param2.param_type == TYPE_REF or param2.param_type == TYPE_MUT_REF
             add_local_full(s, param2.name, param2.name_len, alloca_reg, param2.param_type, param2.param_type_name, param2.param_type_name_len, param2.param_pointee_type, 0, 0)
             set_local_inner_pointee(s, param2.name, param2.name_len, param2.param_inner_pointee_type)
