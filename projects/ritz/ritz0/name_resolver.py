@@ -8,6 +8,7 @@ before attempting IR emission.
 This addresses GitHub issue #31 - the need for a type checking pass.
 """
 
+from contextlib import contextmanager
 from typing import Set, Dict, List, Optional
 from dataclasses import dataclass
 import ritz_ast as rast
@@ -38,6 +39,24 @@ class Scope:
         return False
 
 
+# Instructions the emitter lowers by name, with no declaration anywhere: the
+# type checker shares this set. Their operand checks live in the emitter.
+INTRINSICS = frozenset({
+    'simd_add', 'simd_xor', 'simd_rotl',
+    'aesenc', 'aesenclast', 'aesdec', 'aesdeclast', 'aesimc', 'aeskeygenassist',
+    'sha256rnds2', 'sha256msg1', 'sha256msg2',
+    'cpuid_raw', 'xgetbv',
+})
+
+# Syscalls the emitter lowers by name (`write` and friends unless a program
+# defines its own), and the variants of the generics it instantiates itself.
+SYSCALL_BUILTINS = frozenset(
+    {'write', 'read', 'open', 'close', 'nanosleep'}
+    | {f'syscall{n}' for n in range(7)})
+BUILTIN_VARIANTS = frozenset({'Some', 'None', 'Ok', 'Err'})
+BUILTIN_GENERICS = frozenset({'Option', 'Result', 'Span'})
+
+
 class NameResolver:
     """Verifies that all referenced names are defined."""
 
@@ -56,21 +75,29 @@ class NameResolver:
         'volatile_load', 'volatile_store', 'atomic_load', 'atomic_store',
         'atomic_xchg', 'atomic_cmpxchg', 'atomic_fetch_add', 'atomic_fetch_sub',
         'atomic_fetch_and', 'atomic_fetch_or', 'atomic_fetch_xor', 'fence',
-    }
+    } | INTRINSICS | SYSCALL_BUILTINS
 
     # Built-in types
     BUILTIN_TYPES = {
         'i8', 'i16', 'i32', 'i64',
         'u8', 'u16', 'u32', 'u64',
         'f32', 'f64',
+        'isize', 'usize',
         'bool', 'void',
+        # The type of a bare string literal: the emitter defines it on demand.
+        'StrView',
+        # `Self` in an impl or trait; the generics the emitter instantiates
+        'Self', *BUILTIN_GENERICS,
         # SIMD vector types (SSE2 128-bit)
         'v2i64', 'v4i32', 'v8i16', 'v16i8',
         # SIMD vector types (AVX2 256-bit)
         'v4i64', 'v8i32', 'v16i16', 'v32i8',
     }
 
-    def __init__(self):
+    def __init__(self, module_names: Optional[Set[str]] = None):
+        # Imported modules, which qualify names: `token.Kind`
+        self.module_names: Set[str] = set(module_names or ())
+
         # Defined names at module level
         self.functions: Set[str] = set()
         self.structs: Set[str] = set()
@@ -80,6 +107,10 @@ class NameResolver:
         self.type_aliases: Set[str] = set()
         self.traits: Set[str] = set()
         self.global_vars: Set[str] = set()
+        self.variants: Set[str] = set(BUILTIN_VARIANTS)  # every enum's variants
+
+        # Generic parameters of the items being walked (`T` in `fn f<T>`)
+        self.type_params: Set[str] = set()
 
         # Errors collected during resolution
         self.errors: List[NameError] = []
@@ -108,6 +139,8 @@ class NameResolver:
         for item in module.items:
             if isinstance(item, rast.FnDef):
                 self.functions.add(item.name)
+                if getattr(item, 'is_async', False):
+                    self.structs.add(f"{item.name}_Future")  # async_transform.py
             elif isinstance(item, rast.ExternFn):
                 self.functions.add(item.name)
             elif isinstance(item, rast.StructDef):
@@ -115,6 +148,7 @@ class NameResolver:
             elif isinstance(item, rast.EnumDef):
                 self.enums.add(item.name)
                 self.enum_variants[item.name] = {v.name for v in item.variants}
+                self.variants |= self.enum_variants[item.name]
             elif isinstance(item, rast.ConstDef):
                 self.constants.add(item.name)
             elif isinstance(item, rast.TypeAlias):
@@ -129,7 +163,8 @@ class NameResolver:
         if isinstance(item, rast.FnDef):
             self._check_function(item)
         elif isinstance(item, rast.StructDef):
-            self._check_struct(item)
+            with self._generic(item.type_params):
+                self._check_struct(item)
         elif isinstance(item, rast.ConstDef):
             self._check_const(item)
         elif isinstance(item, rast.VarDef):
@@ -142,8 +177,22 @@ class NameResolver:
         elif isinstance(item, rast.ImplBlock):
             self._check_impl(item)
 
+    @contextmanager
+    def _generic(self, params):
+        """Put an item's generic parameters in scope for its body."""
+        saved = self.type_params
+        self.type_params = saved | set(params or [])
+        try:
+            yield
+        finally:
+            self.type_params = saved
+
     def _check_function(self, fn: rast.FnDef):
         """Check a function definition."""
+        with self._generic(fn.type_params):
+            self._check_function_body(fn)
+
+    def _check_function_body(self, fn: rast.FnDef):
         # Check return type
         if fn.ret_type:
             self._check_type(fn.ret_type)
@@ -192,12 +241,13 @@ class NameResolver:
 
     def _check_impl(self, impl: rast.ImplBlock):
         """Check impl block."""
-        # Check the type being implemented for
-        self._check_type_name(impl.type_name, impl.span)
+        with self._generic(impl.type_params):
+            # Check the type being implemented for
+            self._check_type_name(impl.type_name, impl.span)
 
-        # Check each method
-        for method in impl.methods:
-            self._check_function(method)
+            # Check each method
+            for method in impl.methods:
+                self._check_function(method)
 
     def _check_block(self, block: rast.Block, scope: Scope):
         """Check a block, creating new scope for locals."""
@@ -226,6 +276,16 @@ class NameResolver:
                 self._check_expr(stmt.value, scope)
             scope.locals.add(stmt.name)
 
+        elif isinstance(stmt, rast.LetTupleStmt):
+            self._check_expr(stmt.value, scope)
+            scope.locals.update(stmt.names)
+
+        elif isinstance(stmt, rast.UnsafeBlock):
+            self._check_block(stmt.body, scope)
+
+        elif isinstance(stmt, rast.AssertStmt):
+            self._check_expr(stmt.condition, scope)
+
         elif isinstance(stmt, rast.AssignStmt):
             self._check_expr(stmt.target, scope)
             self._check_expr(stmt.value, scope)
@@ -253,19 +313,20 @@ class NameResolver:
         if isinstance(pattern, rast.IdentPattern):
             scope.locals.add(pattern.name)
         elif isinstance(pattern, rast.StructPattern):
-            self._check_type_name(pattern.struct_name, pattern.span)
-            for field_pat in pattern.fields:
-                self._check_pattern(field_pat.pattern, scope)
-        elif isinstance(pattern, rast.EnumPattern):
+            self._check_type_name(pattern.name, pattern.span)
+            for _field_name, field_pat in pattern.fields:
+                self._check_pattern(field_pat, scope)
+        elif isinstance(pattern, rast.VariantPattern):
             # Check enum type exists
-            if pattern.enum_name and pattern.enum_name not in self.enums:
+            if (pattern.qualifier and pattern.qualifier not in self.enums
+                    and pattern.qualifier not in self.module_names):
                 self.errors.append(NameError(
-                    f"Unknown enum: {pattern.enum_name}",
+                    f"Unknown enum: {pattern.qualifier}",
                     pattern.span
                 ))
             # Add any bindings from the variant pattern
-            if pattern.value_pattern:
-                self._check_pattern(pattern.value_pattern, scope)
+            for field_pat in pattern.fields:
+                self._check_pattern(field_pat, scope)
 
     def _check_expr(self, expr: rast.Expr, scope: Scope):
         """Check an expression for unresolved references."""
@@ -276,19 +337,33 @@ class NameResolver:
                     name in self.functions or
                     name in self.constants or
                     name in self.global_vars or
+                    name in self.BUILTINS or
+                    name in self.variants or
+                    name in ('nil', 'pass') or
+                    name in self.module_names or
+                    # A type as a receiver: `Point.new()`, `Errno.Fault`
                     name in self.enums or
-                    name in self.BUILTINS):
+                    name in self.structs or
+                    name in self.type_aliases or
+                    name in self.type_params):
                 self.errors.append(NameError(
                     f"Unknown identifier: {name}",
                     expr.span
                 ))
 
         elif isinstance(expr, rast.Call):
+            # `sizeof(i32)`: the argument is a type that reads as an expression
+            if isinstance(expr.func, rast.Ident) and expr.func.name == 'sizeof':
+                return
+
             # Check function name if it's a simple identifier
             if isinstance(expr.func, rast.Ident):
                 name = expr.func.name
                 if not (name in self.functions or
-                        name in self.BUILTINS):
+                        name in self.BUILTINS or
+                        name in self.variants or
+                        scope.contains(name) or
+                        name in self.global_vars):
                     self.errors.append(NameError(
                         f"Unknown function: {name}",
                         expr.span
@@ -341,18 +416,20 @@ class NameResolver:
 
         elif isinstance(expr, rast.StructLit):
             self._check_type_name(expr.name, expr.span)
-            for field in expr.fields:
-                self._check_expr(field.value, scope)
+            for _field_name, field_value in expr.fields:
+                self._check_expr(field_value, scope)
 
         elif isinstance(expr, rast.ArrayLit):
             for elem in expr.elements:
                 self._check_expr(elem, scope)
 
         elif isinstance(expr, rast.Match):
-            self._check_expr(expr.value, scope)
+            self._check_expr(expr.expr, scope)
             for arm in expr.arms:
                 arm_scope = Scope(scope, set())
                 self._check_pattern(arm.pattern, arm_scope)
+                if arm.guard:
+                    self._check_expr(arm.guard, arm_scope)
                 if arm.body:
                     self._check_expr(arm.body, arm_scope)
 
@@ -364,6 +441,38 @@ class NameResolver:
                     expr.span
                 ))
             self._check_expr(expr.expr, scope)
+
+        elif isinstance(expr, (rast.Grouped, rast.TryOp, rast.HeapExpr)):
+            self._check_expr(expr.expr, scope)
+
+        elif isinstance(expr, rast.TupleLit):
+            for elem in expr.elements:
+                self._check_expr(elem, scope)
+
+        elif isinstance(expr, rast.ArrayFill):
+            self._check_expr(expr.value, scope)
+
+        elif isinstance(expr, rast.Range):
+            for bound in (expr.start, expr.end):
+                if bound:
+                    self._check_expr(bound, scope)
+
+        elif isinstance(expr, rast.SliceExpr):
+            self._check_expr(expr.expr, scope)
+            for bound in (expr.start, expr.end):
+                if bound:
+                    self._check_expr(bound, scope)
+
+        elif isinstance(expr, rast.ReturnExpr):
+            if expr.value:
+                self._check_expr(expr.value, scope)
+
+        elif isinstance(expr, rast.AssignExpr):
+            self._check_expr(expr.target, scope)
+            self._check_expr(expr.value, scope)
+
+        elif isinstance(expr, (rast.Closure, rast.Lambda)):
+            self._check_expr(expr.body, Scope(scope, {p.name for p in expr.params}))
 
         # Literals (IntLit, FloatLit, StringLit, CharLit, BoolLit, NilLit)
         # don't need checking
@@ -385,11 +494,14 @@ class NameResolver:
             if type_node.ret:
                 self._check_type(type_node.ret)
         elif isinstance(type_node, rast.UnionType):
-            for member in type_node.members:
+            for member in type_node.variants:
                 self._check_type(member)
 
     def _check_type_name(self, name: str, span: Optional[rast.Span]):
         """Check that a type name is defined."""
+        qualifier, dot, unqualified = name.rpartition('.')
+        if dot and qualifier.rpartition('.')[2] in self.module_names:
+            name = unqualified
         if name in self.BUILTIN_TYPES:
             return
         if name in self.structs:
@@ -400,6 +512,8 @@ class NameResolver:
             return
         if name in self.traits:
             return
+        if name in self.type_params:
+            return
 
         self.errors.append(NameError(
             f"Unknown type: {name}",
@@ -407,14 +521,16 @@ class NameResolver:
         ))
 
 
-def resolve_names(module: rast.Module) -> List[NameError]:
+def resolve_names(module: rast.Module,
+                  module_names: Optional[Set[str]] = None) -> List[NameError]:
     """Resolve all names in a module.
 
     Args:
         module: The parsed module after import resolution
+        module_names: Imported module names, valid as qualifiers
 
     Returns:
         List of name resolution errors (empty if successful)
     """
-    resolver = NameResolver()
+    resolver = NameResolver(module_names)
     return resolver.resolve(module)

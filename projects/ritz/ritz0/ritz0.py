@@ -206,6 +206,11 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                                   use_interfaces=module_interface.enabled())
         module = resolver.resolve(module, source_path)
 
+        # What `token.Kind` may be qualified by: every module this compile saw.
+        module_names = {Path(f).stem for f in resolver.processed_files}
+        for aliases in resolver.import_aliases.values():
+            module_names.update(aliases)
+
         # Hash every transitive import now, before emission, so the sig vouches
         # for the sources this .ll was actually built from (AGAST #1674).
         import_hashes = build_import_hashes(
@@ -235,7 +240,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
 
         # Name resolution check (verifies all referenced names are defined)
         if check_names:
-            name_errors = resolve_names(module)
+            name_errors = resolve_names(module, module_names)
             if name_errors:
                 for err in name_errors:
                     print(f"Name error: {err}", file=sys.stderr)
@@ -243,7 +248,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
 
         # Type check (verifies type compatibility)
         if check_types:
-            type_checker = TypeChecker()
+            type_checker = TypeChecker(module_names)
             type_errors = type_checker.check(module)
             if type_errors:
                 for err in type_errors:

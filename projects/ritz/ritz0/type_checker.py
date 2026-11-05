@@ -21,6 +21,12 @@ Built-in functions:
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 import ritz_ast as rast
+from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
+                           SYSCALL_BUILTINS)
+
+
+class FloatLitType(rast.NamedType):
+    """A float literal's type: f64, unless its context makes it an f32."""
 
 
 class TypeError(Exception):
@@ -40,6 +46,7 @@ class FnSig:
     params: List[Tuple[str, rast.Type]]  # (param_name, param_type)
     ret_type: Optional[rast.Type]
     type_params: List[str] = field(default_factory=list)
+    is_async: bool = False
 
 
 @dataclass
@@ -70,22 +77,30 @@ class TypeChecker:
     """
 
     # Primitive integer types
-    INT_TYPES = {'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64'}
-    SIGNED_INT_TYPES = {'i8', 'i16', 'i32', 'i64'}
-    UNSIGNED_INT_TYPES = {'u8', 'u16', 'u32', 'u64'}
+    INT_TYPES = {'i8', 'i16', 'i32', 'i64', 'isize',
+                 'u8', 'u16', 'u32', 'u64', 'usize'}
+    SIGNED_INT_TYPES = {'i8', 'i16', 'i32', 'i64', 'isize'}
+    UNSIGNED_INT_TYPES = {'u8', 'u16', 'u32', 'u64', 'usize'}
 
     # Numeric types (integers + floats)
     NUMERIC_TYPES = INT_TYPES | {'f32', 'f64'}
 
-    def __init__(self):
+    def __init__(self, module_names: Optional[Set[str]] = None):
         self.errors: List[TypeError] = []
+
+        # Imported modules, which qualify names: `token.Kind`
+        self.module_names: Set[str] = set(module_names or ())
 
         # Symbol tables
         self.functions: Dict[str, FnSig] = {}
-        self.structs: Dict[str, StructInfo] = {}
+        # StrView is the emitter's own struct: no source file declares it.
+        self.structs: Dict[str, StructInfo] = {'StrView': StructInfo('StrView', [
+            ('ptr', rast.PtrType(None, rast.NamedType(None, 'u8', []), mutable=False)),
+            ('len', rast.NamedType(None, 'i64', []))])}
         self.enums: Dict[str, EnumInfo] = {}
         self.type_aliases: Dict[str, rast.Type] = {}
         self.constants: Dict[str, rast.Type] = {}
+        self.globals: Dict[str, Optional[rast.Type]] = {}  # module-level `var`
 
         # Variant to enum mapping
         self.variant_to_enum: Dict[str, str] = {}
@@ -113,6 +128,8 @@ class TypeChecker:
                 self.type_aliases[item.name] = item.target
             elif isinstance(item, rast.ConstDef):
                 self.constants[item.name] = item.type
+            elif isinstance(item, rast.VarDef):
+                self.globals[item.name] = item.type
 
         # Second pass: collect function signatures
         for item in module.items:
@@ -142,7 +159,7 @@ class TypeChecker:
         for item in module.items:
             if isinstance(item, rast.ImplBlock):
                 for method in item.methods:
-                    self._check_function(method)
+                    self._check_function(method, item)
 
         return self.errors
 
@@ -170,7 +187,8 @@ class TypeChecker:
             name=fn.name,
             params=[(p.name, p.type) for p in fn.params],
             ret_type=fn.ret_type,
-            type_params=fn.type_params or []
+            type_params=fn.type_params or [],
+            is_async=getattr(fn, 'is_async', False)
         )
 
     def _register_extern(self, fn: rast.ExternFn):
@@ -207,16 +225,24 @@ class TypeChecker:
             return self.locals[name]
         if name in self.constants:
             return self.constants[name]
+        if name in self.globals:
+            # An untyped global's type comes from its initialiser: not tracked.
+            return self.globals[name] or rast.NamedType(None, 'unknown', [])
         return None
 
-    def _check_function(self, fn: rast.FnDef):
-        """Type check a function body."""
-        self.current_fn = self.functions.get(fn.name)
+    def _check_function(self, fn: rast.FnDef, impl: Optional[rast.ImplBlock] = None):
+        """Type check a function body; `impl` is the block a method sits in."""
+        # A method is registered mangled: `fn.name` alone would find a free
+        # function of the same name and check against that signature.
+        self.current_fn = self.functions.get(
+            f"{impl.type_name}_{fn.name}" if impl else fn.name)
         self.locals = {}
         self.scope_stack = []
 
         # Track type parameters (T, E, etc.) so they're treated as valid types
-        self.current_type_params = set(fn.type_params) if fn.type_params else set()
+        self.current_type_params = set(fn.type_params or [])
+        if impl:
+            self.current_type_params |= set(impl.type_params or [])
 
         # Add parameters to scope
         for param in fn.params:
@@ -234,9 +260,9 @@ class TypeChecker:
             self._check_stmt(stmt)
 
         # Check trailing expression matches expected return type
-        if block.expr and expected_ret:
+        if block.expr:
             expr_type = self._infer_type(block.expr)
-            if not self._types_compatible(expr_type, expected_ret):
+            if expected_ret and not self._types_compatible(expr_type, expected_ret):
                 self._error(f"block expression has type {self._type_str(expr_type)}, "
                           f"expected {self._type_str(expected_ret)}", block.expr.span)
 
@@ -272,6 +298,18 @@ class TypeChecker:
             else:
                 self._error(f"let binding '{stmt.name}' needs type annotation or initializer", stmt.span)
 
+        elif isinstance(stmt, rast.LetTupleStmt):
+            value_type = self._infer_type(stmt.value)
+            elements = value_type.elements if isinstance(value_type, rast.TupleType) else []
+            for i, name in enumerate(stmt.names):
+                self.locals[name] = (elements[i] if i < len(elements)
+                                     else rast.NamedType(stmt.span, 'unknown', []))
+
+        elif isinstance(stmt, rast.UnsafeBlock):
+            self._push_scope()
+            self._check_block(stmt.body)
+            self._pop_scope()
+
         elif isinstance(stmt, rast.ExprStmt):
             self._infer_type(stmt.expr)
 
@@ -292,7 +330,7 @@ class TypeChecker:
 
         elif isinstance(stmt, rast.WhileStmt):
             cond_type = self._infer_type(stmt.cond)
-            if not self._is_bool_type(cond_type):
+            if not self._is_bool_or_opaque(cond_type):
                 self._error(f"while condition must be bool, got {self._type_str(cond_type)}",
                           stmt.cond.span)
             self._push_scope()
@@ -310,7 +348,7 @@ class TypeChecker:
 
         elif isinstance(stmt, rast.AssertStmt):
             cond_type = self._infer_type(stmt.condition)
-            if not self._is_bool_type(cond_type):
+            if not self._is_bool_or_opaque(cond_type):
                 self._error(f"assert condition must be bool, got {self._type_str(cond_type)}",
                           stmt.condition.span)
 
@@ -321,13 +359,18 @@ class TypeChecker:
             return rast.NamedType(expr.span, 'i64', [])
 
         elif isinstance(expr, rast.FloatLit):
-            return rast.NamedType(expr.span, 'f64', [])
+            return FloatLitType(expr.span, 'f64', [])
 
         elif isinstance(expr, rast.BoolLit):
             return rast.NamedType(expr.span, 'bool', [])
 
         elif isinstance(expr, rast.CharLit):
             return rast.NamedType(expr.span, 'u8', [])
+
+        elif isinstance(expr, rast.InterpString):
+            for part in expr.exprs:
+                self._infer_type(part)
+            return rast.NamedType(expr.span, 'StrView', [])
 
         elif isinstance(expr, rast.StringLit):
             # Bare string literals produce StrView (AGAST #98, Wave 3).
@@ -355,9 +398,47 @@ class TypeChecker:
                 if expr.name in self.variant_to_enum:
                     enum_name = self.variant_to_enum[expr.name]
                     return rast.NamedType(expr.span, enum_name, [])
+                # A type as a receiver: `Errno.Fault`, `Point.new()`
+                if expr.name in self.enums or expr.name in self.structs:
+                    return rast.NamedType(expr.span, expr.name, [])
+                if expr.name in self.type_aliases:
+                    return self.type_aliases[expr.name]
+                if expr.name in self.current_type_params:
+                    return rast.NamedType(expr.span, expr.name, [])
+                # A function as a value
+                sig = self.functions.get(expr.name)
+                if sig is not None:
+                    return rast.FnType(expr.span, [ty for _, ty in sig.params],
+                                       sig.ret_type)
+                if expr.name == 'nil':
+                    return rast.NamedType(expr.span, 'null', [])
+                if expr.name == 'pass' or expr.name in BUILTIN_VARIANTS \
+                        or expr.name in self.module_names:
+                    return rast.NamedType(expr.span, 'unknown', [])
                 self._error(f"undefined variable: {expr.name}", expr.span)
                 return rast.NamedType(expr.span, 'unknown', [])
             return ty
+
+        elif isinstance(expr, rast.Grouped):
+            return self._infer_type(expr.expr)
+
+        elif isinstance(expr, rast.HeapExpr):
+            return rast.PtrType(expr.span, self._infer_type(expr.expr), mutable=True)
+
+        elif isinstance(expr, (rast.BreakExpr, rast.ContinueExpr)):
+            return rast.NamedType(expr.span, 'unknown', [])  # the never type
+
+        elif isinstance(expr, rast.ReturnExpr):
+            if expr.value:
+                self._infer_type(expr.value)
+            return rast.NamedType(expr.span, 'unknown', [])  # the never type
+
+        elif isinstance(expr, rast.AssignExpr):
+            self._infer_type(expr.target)
+            return self._infer_type(expr.value)
+
+        elif isinstance(expr, (rast.QualifiedIdent, rast.TypeExpr)):
+            return rast.NamedType(expr.span, 'unknown', [])
 
         elif isinstance(expr, rast.BinOp):
             return self._check_binop(expr)
@@ -445,18 +526,25 @@ class TypeChecker:
         elif isinstance(expr, rast.Closure):
             # Infer closure type from parameters and body
             param_types = []
+            self._push_scope()
             for p in expr.params:
                 if p.type:
                     param_types.append(p.type)
                 else:
                     param_types.append(rast.NamedType(expr.span, 'unknown', []))
+                self.locals[p.name] = param_types[-1]
             body_type = self._infer_type(expr.body)
+            self._pop_scope()
             return rast.FnType(expr.span, param_types, body_type)
 
         elif isinstance(expr, rast.Lambda):
             # Lambda is an older form of closure with explicit param types
             param_types = [p.type for p in expr.params]
+            self._push_scope()
+            for p in expr.params:
+                self.locals[p.name] = p.type
             body_type = self._infer_type(expr.body)
+            self._pop_scope()
             return rast.FnType(expr.span, param_types, body_type if body_type else rast.NamedType(expr.span, 'unknown', []))
 
         else:
@@ -477,10 +565,10 @@ class TypeChecker:
 
         # Logical operators require bool, return bool
         if expr.op in ('&&', '||'):
-            if not self._is_bool_type(left_type):
+            if not self._is_bool_or_opaque(left_type):
                 self._error(f"logical operator requires bool, got {self._type_str(left_type)}",
                           expr.left.span)
-            if not self._is_bool_type(right_type):
+            if not self._is_bool_or_opaque(right_type):
                 self._error(f"logical operator requires bool, got {self._type_str(right_type)}",
                           expr.right.span)
             return rast.NamedType(expr.span, 'bool', [])
@@ -488,21 +576,21 @@ class TypeChecker:
         # Arithmetic operators
         if expr.op in ('+', '-', '*', '/', '%'):
             # Pointer/reference arithmetic: ptr + int or ptr - int
-            if isinstance(left_type, (rast.PtrType, rast.RefType)) and self._is_integer_type(right_type):
+            if isinstance(left_type, (rast.PtrType, rast.RefType)) and self._is_int_or_opaque(right_type):
                 # Return as pointer type for arithmetic result
                 if isinstance(left_type, rast.RefType):
                     return rast.PtrType(expr.span, left_type.inner, mutable=left_type.mutable)
                 return left_type
-            if isinstance(right_type, (rast.PtrType, rast.RefType)) and self._is_integer_type(left_type):
+            if isinstance(right_type, (rast.PtrType, rast.RefType)) and self._is_int_or_opaque(left_type):
                 if isinstance(right_type, rast.RefType):
                     return rast.PtrType(expr.span, right_type.inner, mutable=right_type.mutable)
                 return right_type
 
             # Numeric arithmetic
-            if not self._is_numeric_type(left_type):
+            if not self._is_numeric_or_opaque(left_type):
                 self._error(f"arithmetic operator requires numeric type, "
                           f"got {self._type_str(left_type)}", expr.left.span)
-            if not self._is_numeric_type(right_type):
+            if not self._is_numeric_or_opaque(right_type):
                 self._error(f"arithmetic operator requires numeric type, "
                           f"got {self._type_str(right_type)}", expr.right.span)
             # Return the "wider" type (simplified: just return left type)
@@ -510,10 +598,10 @@ class TypeChecker:
 
         # Bitwise operators
         if expr.op in ('&', '|', '^', '<<', '>>'):
-            if not self._is_integer_type(left_type):
+            if not self._is_int_or_opaque(left_type):
                 self._error(f"bitwise operator requires integer, got {self._type_str(left_type)}",
                           expr.left.span)
-            if not self._is_integer_type(right_type):
+            if not self._is_int_or_opaque(right_type):
                 self._error(f"bitwise operator requires integer, got {self._type_str(right_type)}",
                           expr.right.span)
             return left_type
@@ -525,13 +613,13 @@ class TypeChecker:
         operand_type = self._infer_type(expr.operand)
 
         if expr.op == '-':
-            if not self._is_numeric_type(operand_type):
+            if not self._is_numeric_or_opaque(operand_type):
                 self._error(f"negation requires numeric type, got {self._type_str(operand_type)}",
                           expr.operand.span)
             return operand_type
 
         elif expr.op == '!':
-            if not self._is_bool_type(operand_type):
+            if not self._is_bool_or_opaque(operand_type):
                 self._error(f"logical not requires bool, got {self._type_str(operand_type)}",
                           expr.operand.span)
             return rast.NamedType(expr.span, 'bool', [])
@@ -550,6 +638,8 @@ class TypeChecker:
                 return operand_type.inner
             elif isinstance(operand_type, rast.RefType):
                 return operand_type.inner
+            elif self._is_opaque(operand_type):
+                return rast.NamedType(expr.span, 'unknown', [])
             else:
                 self._error(f"cannot dereference non-pointer type {self._type_str(operand_type)}",
                           expr.span)
@@ -611,6 +701,24 @@ class TypeChecker:
                     self._infer_type(arg)
                 return rast.NamedType(expr.span, 'void', [])
 
+            # Instructions the emitter lowers by name
+            if fn_name in INTRINSICS or fn_name in (
+                    'simd_load', 'simd_loadu', 'simd_store', 'simd_storeu',
+                    'simd_shuffle', 'simd_extract', 'simd_insert', 'simd_sad',
+                    'simd_clmul'):
+                for arg in expr.args:
+                    self._infer_type(arg)
+                return rast.NamedType(expr.span, 'unknown', [])
+
+            # A call through a local or global function pointer
+            if fn_name in self.locals or fn_name in self.globals:
+                for arg in expr.args:
+                    self._infer_type(arg)
+                callee = self._lookup_var(fn_name)
+                if isinstance(callee, rast.FnType):
+                    return callee.ret or rast.NamedType(expr.span, 'void', [])
+                return rast.NamedType(expr.span, 'unknown', [])
+
             # Check if it's an enum variant constructor
             if fn_name in self.variant_to_enum:
                 enum_name = self.variant_to_enum[fn_name]
@@ -618,6 +726,11 @@ class TypeChecker:
 
             # Look up function
             fn_sig = self.functions.get(fn_name)
+            if fn_sig is None and (fn_name in SYSCALL_BUILTINS
+                                   or fn_name in BUILTIN_VARIANTS):
+                for arg in expr.args:
+                    self._infer_type(arg)
+                return rast.NamedType(expr.span, 'unknown', [])
             if fn_sig is None:
                 self._error(f"undefined function: {fn_name}", expr.func.span)
                 return rast.NamedType(expr.span, 'unknown', [])
@@ -634,6 +747,9 @@ class TypeChecker:
                         self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
                                   f"got {self._type_str(arg_type)}", arg.span)
 
+            if fn_sig.is_async:
+                # The call makes a `<fn>_Future`; only `.await` gives ret_type.
+                return rast.NamedType(expr.span, 'unknown', [])
             return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
 
         else:
@@ -644,8 +760,36 @@ class TypeChecker:
 
     def _check_method_call(self, expr: rast.MethodCall) -> rast.Type:
         """Type check method call."""
+        # `token.next(x)`: a function reached through its module
+        if self._is_module_ref(expr.expr):
+            for arg in expr.args:
+                self._infer_type(arg)
+            sig = self.functions.get(expr.method)
+            if sig is not None:
+                return sig.ret_type or rast.NamedType(expr.span, 'void', [])
+            return rast.NamedType(expr.span, 'unknown', [])
+
         receiver_type = self._infer_type(expr.expr)
-        type_name = self._get_type_name(receiver_type)
+
+        # `Color.Green(1)`: a variant constructed through its enum
+        if isinstance(expr.expr, rast.Ident) and expr.expr.name in self.enums:
+            enum = self.enums[expr.expr.name]
+            if any(v.name == expr.method for v in enum.variants):
+                for arg in expr.args:
+                    self._infer_type(arg)
+                return rast.NamedType(expr.span, enum.name, [])
+
+        # Primitive and built-in-generic receivers have emitter-provided
+        # methods (`x.popcnt()`, `r.unwrap()`) that no source file declares.
+        receiver = self._strip_indirection(receiver_type)
+        if self._is_opaque(receiver) or (isinstance(receiver, rast.NamedType) and (
+                receiver.name in self.NUMERIC_TYPES
+                or receiver.name in BUILTIN_GENERICS
+                or receiver.name in ('bool', 'StrView'))):
+            for arg in expr.args:
+                self._infer_type(arg)
+            return rast.NamedType(expr.span, 'unknown', [])
+        type_name = self._get_type_name(receiver)
 
         # Look up method - try several name patterns
         fn_sig = None
@@ -689,12 +833,26 @@ class TypeChecker:
 
     def _check_field_access(self, expr: rast.Field) -> rast.Type:
         """Type check field access."""
+        # `token.KIND`: a name reached through its module
+        if self._is_module_ref(expr.expr):
+            ty = self._lookup_var(expr.field)
+            if ty is None and expr.field in self.variant_to_enum:
+                ty = rast.NamedType(expr.span, self.variant_to_enum[expr.field], [])
+            return ty or rast.NamedType(expr.span, 'unknown', [])
+
         base_type = self._infer_type(expr.expr)
 
         # Unwrap pointers/refs for field access
-        inner_type = base_type
-        while isinstance(inner_type, (rast.PtrType, rast.RefType)):
-            inner_type = inner_type.inner
+        inner_type = self._strip_indirection(base_type)
+        if self._is_opaque(inner_type) or (
+                isinstance(inner_type, rast.NamedType)
+                and inner_type.name in BUILTIN_GENERICS):
+            return rast.NamedType(expr.span, 'unknown', [])
+
+        # `Errno.Fault`: a variant named through its enum
+        if isinstance(inner_type, rast.NamedType) and inner_type.name in self.enums:
+            if any(v.name == expr.field for v in self.enums[inner_type.name].variants):
+                return inner_type
 
         # Handle tuple field access: tuple.0, tuple.1, etc.
         if isinstance(inner_type, rast.TupleType):
@@ -736,7 +894,7 @@ class TypeChecker:
         index_type = self._infer_type(expr.index)
 
         # Index must be integer
-        if not self._is_integer_type(index_type):
+        if not self._is_int_or_opaque(index_type):
             self._error(f"index must be integer, got {self._type_str(index_type)}",
                       expr.index.span)
 
@@ -761,7 +919,7 @@ class TypeChecker:
     def _check_if(self, expr: rast.If) -> rast.Type:
         """Type check if expression."""
         cond_type = self._infer_type(expr.cond)
-        if not self._is_bool_type(cond_type):
+        if not self._is_bool_or_opaque(cond_type):
             self._error(f"if condition must be bool, got {self._type_str(cond_type)}",
                       expr.cond.span)
 
@@ -824,7 +982,7 @@ class TypeChecker:
             self._check_pattern(arm.pattern, match_type)
             if arm.guard:
                 guard_type = self._infer_type(arm.guard)
-                if not self._is_bool_type(guard_type):
+                if not self._is_bool_or_opaque(guard_type):
                     self._error(f"match guard must be bool", arm.guard.span)
 
             arm_type = self._infer_type(arm.body)
@@ -873,6 +1031,10 @@ class TypeChecker:
                             for sub_pat, field_type in zip(pattern.fields, variant.fields):
                                 self._check_pattern(sub_pat, field_type)
                             break
+                    return
+            # An emitter-instantiated variant (`Err(e)`): payload type untracked
+            for sub_pat in pattern.fields:
+                self._check_pattern(sub_pat, rast.NamedType(pattern.span, 'unknown', []))
         elif isinstance(pattern, rast.StructPattern):
             struct_info = self.structs.get(pattern.name)
             if struct_info:
@@ -883,25 +1045,81 @@ class TypeChecker:
 
     # Helper methods
 
+    def _resolve_alias(self, ty: rast.Type) -> rast.Type:
+        """Follow `type X = Y`, and drop a module qualifier (`token.Kind`)."""
+        seen = set()
+        while isinstance(ty, rast.NamedType) and ty.name not in seen:
+            seen.add(ty.name)
+            qualifier, dot, name = ty.name.rpartition('.')
+            if dot and qualifier.rpartition('.')[2] in self.module_names:
+                ty = rast.NamedType(ty.span, name, ty.args)
+            elif ty.name in self.type_aliases:
+                ty = self.type_aliases[ty.name]
+            else:
+                break
+        return ty
+
+    def _is_module_ref(self, expr: rast.Expr) -> bool:
+        """An identifier naming an imported module, not a shadowing value."""
+        return (isinstance(expr, rast.Ident) and expr.name in self.module_names
+                and self._lookup_var(expr.name) is None)
+
+    def _strip_indirection(self, ty: rast.Type) -> rast.Type:
+        """The type under any pointers, references and aliases."""
+        ty = self._resolve_alias(ty)
+        while isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = self._resolve_alias(ty.inner)
+        return ty
+
+    def _is_type_param(self, ty: rast.Type) -> bool:
+        """A generic parameter: declared in scope, or by the single-capital
+        convention (a generic struct's field type reaches here unsubstituted)."""
+        if not isinstance(ty, rast.NamedType):
+            return False
+        if ty.name in self.current_type_params:
+            return True
+        return (len(ty.name) == 1 and ty.name.isupper()
+                and ty.name not in self.structs and ty.name not in self.enums
+                and ty.name not in self.type_aliases)
+
+    def _is_opaque(self, ty: rast.Type) -> bool:
+        """A type that can't be judged: `unknown` was either reported where it
+        arose or is outside what this checker infers, and a type parameter
+        stands for whatever it is instantiated with."""
+        return (isinstance(ty, rast.NamedType) and ty.name in ('unknown', 'Self')) \
+            or self._is_type_param(ty)
+
     def _is_bool_type(self, ty: rast.Type) -> bool:
         """Check if type is bool."""
+        ty = self._resolve_alias(ty)
         return isinstance(ty, rast.NamedType) and ty.name == 'bool'
 
     def _is_integer_type(self, ty: rast.Type) -> bool:
         """Check if type is an integer type."""
+        ty = self._resolve_alias(ty)
         if isinstance(ty, rast.NamedType):
             return ty.name in self.INT_TYPES
         return False
 
     def _is_numeric_type(self, ty: rast.Type) -> bool:
         """Check if type is numeric (integer or float)."""
+        ty = self._resolve_alias(ty)
         if isinstance(ty, rast.NamedType):
             return ty.name in self.NUMERIC_TYPES
         return False
 
+    def _is_bool_or_opaque(self, ty: rast.Type) -> bool:
+        return self._is_bool_type(ty) or self._is_opaque(self._resolve_alias(ty))
+
+    def _is_int_or_opaque(self, ty: rast.Type) -> bool:
+        return self._is_integer_type(ty) or self._is_opaque(self._resolve_alias(ty))
+
+    def _is_numeric_or_opaque(self, ty: rast.Type) -> bool:
+        return self._is_numeric_type(ty) or self._is_opaque(self._resolve_alias(ty))
+
     def _check_integer_type(self, ty: rast.Type, span: Optional[rast.Span]):
         """Check that type is an integer, error if not."""
-        if not self._is_integer_type(ty):
+        if not self._is_int_or_opaque(ty):
             self._error(f"expected integer type, got {self._type_str(ty)}", span)
 
     def _types_compatible(self, actual: rast.Type, expected: rast.Type) -> bool:
@@ -909,6 +1127,25 @@ class TypeChecker:
         # Handle None/unknown
         if actual is None or expected is None:
             return True
+
+        actual = self._resolve_alias(actual)
+        expected = self._resolve_alias(expected)
+
+        # Nothing to judge against, and `null` may instantiate a type parameter
+        if self._is_opaque(actual) or self._is_opaque(expected):
+            return True
+
+        # A float literal is whichever float its context wants
+        for lit, other in ((actual, expected), (expected, actual)):
+            if isinstance(lit, FloatLitType) and isinstance(other, rast.NamedType) \
+                    and other.name in ('f32', 'f64'):
+                return True
+
+        # A union takes itself and each of its members
+        if isinstance(expected, rast.UnionType):
+            if isinstance(actual, rast.UnionType):
+                return all(self._types_compatible(m, expected) for m in actual.variants)
+            return any(self._types_compatible(actual, m) for m in expected.variants)
 
         # Null is compatible with any pointer type
         if isinstance(actual, rast.NamedType) and actual.name == 'null':
@@ -919,23 +1156,6 @@ class TypeChecker:
             return isinstance(actual, (rast.PtrType, rast.RefType)) or \
                    (isinstance(actual, rast.NamedType) and actual.name == 'null')
 
-        # Type parameters (T, E, etc.) are compatible with any type in their scope
-        # This allows generic functions to work without full monomorphization tracking
-        if isinstance(expected, rast.NamedType) and expected.name in self.current_type_params:
-            return True
-        if isinstance(actual, rast.NamedType) and actual.name in self.current_type_params:
-            return True
-
-        # Also treat single uppercase letters as type parameters (Ritz convention)
-        # This handles cases like Result<T, E> where the generic enum definition uses T/E
-        def is_type_param_name(name: str) -> bool:
-            return len(name) == 1 and name.isupper()
-
-        if isinstance(expected, rast.NamedType) and is_type_param_name(expected.name):
-            return True
-        if isinstance(actual, rast.NamedType) and is_type_param_name(actual.name):
-            return True
-
         # Same named type
         if isinstance(actual, rast.NamedType) and isinstance(expected, rast.NamedType):
             if actual.name == expected.name:
@@ -945,8 +1165,6 @@ class TypeChecker:
                 return True
             if actual.name in self.INT_TYPES and expected.name in self.INT_TYPES:
                 return True  # Allow integer type coercion for now
-            if actual.name == 'unknown' or expected.name == 'unknown':
-                return True
             # void compatible with no return
             if actual.name == 'void' or expected.name == 'void':
                 return True
@@ -1025,12 +1243,6 @@ class TypeChecker:
                         if self._type_implements_trait(inner.name, expected.inner.trait_name):
                             return True
 
-        # Unknown is compatible with function types (for inference)
-        if isinstance(actual, rast.NamedType) and actual.name == 'unknown':
-            return True
-        if isinstance(expected, rast.NamedType) and expected.name == 'unknown':
-            return True
-
         return False
 
     def _type_implements_trait(self, type_name: str, trait_name: str) -> bool:
@@ -1041,9 +1253,9 @@ class TypeChecker:
 
     def _promote_numeric_types(self, t1: rast.Type, t2: rast.Type) -> rast.Type:
         """Get the common type for two numeric types."""
-        # Simplified: just return the first type
+        # Simplified: the first type, unless it's a literal the other one fixes.
         # Full implementation would return the "wider" type
-        return t1
+        return t2 if isinstance(t1, FloatLitType) else t1
 
     def _get_iterator_element_type(self, iter_type: rast.Type) -> rast.Type:
         """Get element type from an iterator type."""
