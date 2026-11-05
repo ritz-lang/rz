@@ -74,6 +74,9 @@ AGAST #1392. Two things live here, and they are independent.
    Reading in-tree sources is fine; compiling into tmp_path is fine; sig
    files are per-session (item 3).  A test that copies the tree must skip
    the paths above instead (test_ritz1_bin_staleness.py does).
+   A split group still passes unless two tests collide, so
+   test_xdist_group_holds.py proves it holds (AGAST #2251: it silently didn't
+   on pytest 9.2.0, hence the cap in requirements.txt).
 
 6. Scheduling (AGAST #1804) — xdist hands out work in collection order.
    `@pytest.mark.slow` tests (minutes on their own) and xdist_group members

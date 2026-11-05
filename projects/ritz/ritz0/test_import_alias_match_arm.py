@@ -50,12 +50,13 @@ def _binary_report(bin_path: Path) -> str:
     """Say what is at `bin_path`: its sha256, manifest and `main` disassembly.
 
     AGAST #2251: CI saw test_alias_call_inside_an_expression_arm_is_resolved exit
-    7, not 11, once, with no cause found. 7 is what the other test here expects,
-    and the failed run kept no binary, so nothing shows whose code ran. This is
-    evidence for the next occurrence, not a fix. It reads the file after the run,
-    so a sha256 that differs from the manifest's binary_sha256 means something
-    rewrote the binary. Every part is best-effort: a report that raised would
-    replace the exit-code failure it is there to explain.
+    7, not 11, and this report showed why: the "tree" group had split, so the
+    other test here relinked build/main just before this one ran it. Both tests
+    still share that path, so it stays as the first evidence if something else
+    ever writes there. It reads the file after the run, so a sha256 that differs
+    from the manifest's binary_sha256 means something rewrote the binary. Every
+    part is best-effort: a report that raised would replace the exit-code failure
+    it is there to explain.
     """
     try:
         digest = hashlib.sha256(bin_path.read_bytes()).hexdigest()
