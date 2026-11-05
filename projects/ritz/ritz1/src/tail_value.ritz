@@ -1,0 +1,252 @@
+# ritz1/src/tail_value.ritz - a `-> T` fn must not reach its end without a value
+#
+# AGAST #2236 (ritz1 parity with #1429).
+#
+#     fn f(n: i64) -> i64
+#         if n > 0            # error: can fall through with no value
+#             return 1
+#
+# This is a port of ritz0/tail_value.py, and the rule is identical: walk the
+# fn's result paths for one that completes without a value.  A path is fine if
+# it yields a value or never arrives at the end at all (a `return`, a
+# `while true` with no `break`).  Procedures and `-> void` are not walked: their
+# tails run for effect.
+#
+# ritz0/test_fn_tail_requires_value.py is the specification of the rule, and
+# ritz0/test_ritz1_fn_tail_requires_value.py feeds its tables to ritz1.
+#
+# THE DIFFERENCES ARE ALL IN THE AST:
+#
+#   * ritz0 has a Block with a tail `expr`.  ritz1 has a statement list, so the
+#     last statement of a list is the tail, and only STMT_EXPR / STMT_IF /
+#     STMT_MATCH can carry a value there.  Everything else is the gap.
+#   * A MatchArm holds its tail in `body`, detached from `body_stmts` by
+#     match_arm_set_block.  EXPR_IF is two such arms, so arms are read one way.
+#   * `true` and `pass` lower to integer literals; see Expr.lit_kind.
+#
+# ritz0 walks every dataclass field for a `break`.  ritz1's Expr and Stmt reuse
+# their fields per kind and parser_alloc does not zero, so the walk below names
+# the places a statement can be: see the note at tail_expr_has_break.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+
+# =============================================================================
+# Does a `break` leave this loop?
+# =============================================================================
+#
+# Everything here is under the body of the loop being judged.  An inner loop
+# owns its own breaks, so STMT_WHILE / STMT_FOR / STMT_LOOP end the walk.
+
+fn tail_arms_have_break(arms: *MatchArm) -> i32
+    var arm: *MatchArm = arms
+    while arm != null
+        if tail_stmts_have_break(arm.body_stmts) == 1
+            return 1
+        if tail_expr_has_break(arm.body) == 1
+            return 1
+        arm = arm.next
+    0
+
+# Only the arms of a match or if expression hold statements, and those can only
+# stand whole: as a let/var initialiser, a returned value, a statement or an arm
+# body.  They end in DEDENT, which leaves no way to parse an operator after one,
+# and an `(` or `,` around one fails the same way.  So nothing deeper is walked.
+fn tail_expr_has_break(e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+        return tail_arms_have_break(e.args as *MatchArm)
+    0
+
+fn tail_stmt_has_break(st: *Stmt) -> i32
+    let k: i32 = st.kind
+    if k == STMT_BREAK
+        return 1
+    if k == STMT_EXPR
+        return tail_expr_has_break(st.expr)
+    if k == STMT_RETURN
+        return tail_expr_has_break(st.return_value)
+    if k == STMT_VAR_DECL
+        return tail_expr_has_break(st.var_init)
+    if k == STMT_IF
+        if tail_stmts_have_break(st.if_then) == 1
+            return 1
+        return tail_stmts_have_break(st.if_else)
+    if k == STMT_MATCH
+        return tail_arms_have_break(st.if_then as *MatchArm)
+    0
+
+fn tail_stmts_have_break(list: *Stmt) -> i32
+    var st: *Stmt = list
+    while st != null
+        if tail_stmt_has_break(st) == 1
+            return 1
+        st = st.next
+    0
+
+# =============================================================================
+# Does control ever get past this?
+# =============================================================================
+#
+# This is the rule's idea of diverging, not a proof the end is dead: a `match`
+# whose arms all return counts, with or without a wildcard, as it does in ritz0
+# (#2245).  ritz0's ExprStmt case has no twin here: a `match` statement is always
+# STMT_MATCH, and an inline `if` cannot diverge because its `else` cannot be a
+# block-bodied `match` (it does not parse).  Only an arm's `body` gets to
+# tail_expr_diverges.
+
+fn tail_is_true_literal(e: *Expr) -> i32
+    if e.kind == EXPR_INT_LIT and e.lit_kind == LIT_TRUE
+        return 1
+    0
+
+fn tail_stmt_diverges(st: *Stmt) -> i32
+    let k: i32 = st.kind
+    if k == STMT_RETURN
+        return 1
+    if k == STMT_LOOP
+        return 1 - tail_stmts_have_break(st.while_body)
+    if k == STMT_WHILE
+        if tail_is_true_literal(st.while_cond) == 0
+            return 0
+        return 1 - tail_stmts_have_break(st.while_body)
+    if k == STMT_IF
+        if tail_stmts_diverge(st.if_then) == 0
+            return 0
+        return tail_stmts_diverge(st.if_else)
+    if k == STMT_MATCH
+        return tail_arms_diverge(st.if_then as *MatchArm)
+    0
+
+fn tail_stmts_diverge(list: *Stmt) -> i32
+    var st: *Stmt = list
+    while st != null
+        if tail_stmt_diverges(st) == 1
+            return 1
+        st = st.next
+    0
+
+fn tail_arms_diverge(arms: *MatchArm) -> i32
+    if arms == null
+        return 0
+    var arm: *MatchArm = arms
+    while arm != null
+        var left: i32 = tail_stmts_diverge(arm.body_stmts)
+        if left == 0 and arm.body != null
+            left = tail_expr_diverges(arm.body)
+        if left == 0
+            return 0
+        arm = arm.next
+    1
+
+fn tail_expr_diverges(e: *Expr) -> i32
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        return tail_arms_diverge(e.args as *MatchArm)
+    0
+
+# =============================================================================
+# Where does a result path complete with no value?
+# =============================================================================
+#
+# Each of these returns the span to blame, or null when there is no gap.
+
+# A call to a fn declared with no return type.  As in ritz0's _is_void_call the
+# callee is looked up by name alone, a method call is not judged (AGAST #2237)
+# and `-> void` does not count.
+fn tail_is_procedure_call(s: *EmitterState, e: *Expr) -> i32
+    if e.kind != EXPR_CALL or e.func_name_len == 0
+        return 0
+    let fd: *FnDef = find_call_fn(s, e)
+    if fd == null or fd.return_type != TYPE_VOID or fd.ret_written_void == 1
+        return 0
+    1
+
+fn tail_expr_gap(s: *EmitterState, e: *Expr) -> *SrcSpan
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        return tail_arms_gap(s, e.args as *MatchArm)
+    if e.kind == EXPR_INT_LIT and e.lit_kind == LIT_PASS
+        return @e.span
+    if tail_is_procedure_call(s, e) == 1
+        return @e.span
+    null
+
+fn tail_arms_gap(s: *EmitterState, arms: *MatchArm) -> *SrcSpan
+    var arm: *MatchArm = arms
+    while arm != null
+        let gap: *SrcSpan = tail_arm_gap(s, arm)
+        if gap != null
+            return gap
+        arm = arm.next
+    null
+
+fn tail_arm_gap(s: *EmitterState, arm: *MatchArm) -> *SrcSpan
+    if tail_stmts_diverge(arm.body_stmts) == 1
+        return null
+    if arm.body != null
+        return tail_expr_gap(s, arm.body)
+    if arm.body_stmts != null
+        return tail_stmts_gap(s, arm.body_stmts)
+    @arm.pass_span
+
+fn tail_stmt_gap(s: *EmitterState, st: *Stmt) -> *SrcSpan
+    let k: i32 = st.kind
+    if k == STMT_EXPR
+        return tail_expr_gap(s, st.expr)
+    if k == STMT_MATCH
+        return tail_arms_gap(s, st.if_then as *MatchArm)
+    if k == STMT_IF and st.if_else != null
+        let gap: *SrcSpan = tail_stmts_gap(s, st.if_then)
+        if gap != null
+            return gap
+        return tail_stmts_gap(s, st.if_else)
+    @st.span
+
+fn tail_stmts_gap(s: *EmitterState, list: *Stmt) -> *SrcSpan
+    var st: *Stmt = list
+    var last: *Stmt = null
+    while st != null
+        if tail_stmt_diverges(st) == 1
+            return null
+        last = st
+        st = st.next
+    if last == null
+        return null
+    tail_stmt_gap(s, last)
+
+# =============================================================================
+# The check
+# =============================================================================
+
+# The file a fn's lines belong to: a specialised generic may come from an import.
+fn tail_value_file(f: *FnDef) -> *u8
+    if f.def_file != null
+        return f.def_file
+    let file: *u8 = emitter_source_file()
+    if file != null
+        return file
+    c"<input>"
+
+# Reject `f` if it declares a value and can reach its end without one.  Called
+# by emit_fn and emit_impl_method, so like ritz0 it sees the generics that are
+# instantiated and not the templates.
+pub fn check_tail_value(s: *EmitterState, f: *FnDef)
+    if f.return_type == TYPE_VOID or fn_is_decl(f) == 1
+        return
+    let gap: *SrcSpan = tail_stmts_gap(s, f.body)
+    if gap == null
+        return
+    eprints_cstr(tail_value_file(f))
+    eprint_char(':')
+    eprint_i64(gap.line as i64)
+    eprint_char(':')
+    eprint_i64(gap.col as i64)
+    eprints_cstr(c": error: function '")
+    eprint_bytes(f.name, f.name_len)
+    eprints_cstr(c"' declares a return type but can reach its end without producing a value\n")
+    emit_str(s, c"  ; ERROR: `-> T` fn can reach its end without a value\n")
+    s.error_count = s.error_count + 1

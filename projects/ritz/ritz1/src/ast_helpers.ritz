@@ -962,6 +962,7 @@ pub fn fn_link(first: *FnDef, rest: *FnDef) -> *FnDef
 
 pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.name = name as *u8
     f.name_len = len
@@ -992,6 +993,7 @@ pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, bod
         # both of which clang rejects.
         if rt_len == 4 and rt_name != null and *rt_name == 118 and *(rt_name + 1) == 111 and *(rt_name + 2) == 105 and *(rt_name + 3) == 100
             f.return_type = TYPE_VOID
+            f.ret_written_void = 1   # AGAST #2236
             f.return_type_name = null
             f.return_type_name_len = 0
         else
@@ -1033,6 +1035,7 @@ pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, bod
 # Extern function declaration (no body) - forward declaration
 pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, line: i32, col: i32) -> *FnDef
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.name = name as *u8
     f.name_len = len
@@ -1051,6 +1054,7 @@ pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i
         # Normalize `-> void` to TYPE_VOID — see fn_def_new for rationale.
         if rt_len == 4 and rt_name != null and *rt_name == 118 and *(rt_name + 1) == 111 and *(rt_name + 2) == 105 and *(rt_name + 3) == 100
             f.return_type = TYPE_VOID
+            f.ret_written_void = 1   # AGAST #2236
             f.return_type_name = null
             f.return_type_name_len = 0
         else
@@ -1316,6 +1320,7 @@ pub fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
 # Generic function definition (with type parameters)
 pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.name = name as *u8
     f.name_len = len
@@ -1334,6 +1339,7 @@ pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypePar
         # Normalize `-> void` to TYPE_VOID — see fn_def_new for rationale.
         if rt_len == 4 and rt_name != null and *rt_name == 118 and *(rt_name + 1) == 111 and *(rt_name + 2) == 105 and *(rt_name + 3) == 100
             f.return_type = TYPE_VOID
+            f.ret_written_void = 1   # AGAST #2236
             f.return_type_name = null
             f.return_type_name_len = 0
         else
@@ -1781,6 +1787,7 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
 # there, so it attaches to exactly the declaration whose type it is.
 pub fn type_fn(p: *Parser, params: *Param, ret: i32) -> i32
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    f.ret_written_void = 0   # AGAST #2236
     f.name = null
     f.name_len = 0
     f.params = params
@@ -3078,7 +3085,22 @@ pub fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
     e.span.line = line
     e.span.col = col
     e.int_val = val
+    e.lit_kind = LIT_PLAIN
     e.next = null
+    return e
+
+# `true` is the integer 1 to everything but tail_value.ritz, which needs it to
+# judge `while true` (AGAST #2236): `while 1` is not an endless loop in ritz0.
+pub fn expr_true(p: *Parser, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_int(p, 1, line, col)
+    e.lit_kind = LIT_TRUE
+    return e
+
+# `pass` in expression position is the integer 0 to everything but
+# tail_value.ritz, where it is the absence of a value (AGAST #2236).
+pub fn expr_pass(p: *Parser, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_int(p, 0, line, col)
+    e.lit_kind = LIT_PASS
     return e
 
 # Float literal — store the raw source bytes (digits + dot) in
@@ -3776,6 +3798,8 @@ pub fn match_arm_int(p: *Parser, val: i64) -> *MatchArm
     a.is_pass = 0
     a.body_stmts = null
     a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
     return a
 
 # Allocate a new MatchArm with wildcard pattern (_). Caller fills body + is_pass.
@@ -3792,6 +3816,8 @@ pub fn match_arm_wildcard(p: *Parser) -> *MatchArm
     a.is_pass = 0
     a.body_stmts = null
     a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
     return a
 
 # Allocate a new MatchArm with identifier binding OR unit-variant (e.g. x, None).
@@ -3808,6 +3834,8 @@ pub fn match_arm_ident(p: *Parser, name: *u8, name_len: i32) -> *MatchArm
     a.is_pass = 0
     a.body_stmts = null
     a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
     return a
 
 # Allocate a new MatchArm with variant pattern Name(inner).
@@ -3825,6 +3853,8 @@ pub fn match_arm_variant(p: *Parser, name: *u8, name_len: i32, inner_kind: i32, 
     a.is_pass = 0
     a.body_stmts = null
     a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
     return a
 
 # Set arm body (optionally marks is_pass when body_expr is null).
@@ -3938,11 +3968,14 @@ pub fn pattern_variant_inner(p: *Parser, name: *u8, name_len: i32, inner: *u8, i
             return match_arm_variant(p, name, name_len, PAT_WILDCARD, null, 0)
     return match_arm_variant(p, name, name_len, PAT_IDENT, inner, inner_len)
 
-# match_arm action: arm_body returns null for `pass` keyword, expr otherwise.
-# Mark is_pass=1 when null; otherwise store the body expr.  Returns arm.
+# match_arm action: arm_body returns an expr_pass for the `pass` keyword, the
+# expression otherwise.  A `pass` sets is_pass=1 with no body, and keeps only
+# its position (AGAST #2236); otherwise store the body expr.  Returns arm.
 pub fn match_arm_set_body_or_pass(arm: *MatchArm, body: *Expr) -> *MatchArm
-    if body == null
+    if body.kind == EXPR_INT_LIT and body.lit_kind == LIT_PASS
         match_arm_set_body(arm, null as *Expr, 1)
+        arm.pass_span.line = body.span.line
+        arm.pass_span.col = body.span.col
     else
         match_arm_set_body(arm, body, 0)
     return arm

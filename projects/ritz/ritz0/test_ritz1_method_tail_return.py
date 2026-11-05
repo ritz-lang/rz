@@ -22,10 +22,9 @@ Oracle: ritz0 compiles every program in CASES, and both binaries return the
 same exit code. Each program also has an identical free-fn twin that goes
 through emit_fn, so the method path has to match the fn path, not just ritz0.
 
-AGAST #1429 made ritz0 reject a non-void fn that reaches its end without a
-value, so ritz0 cannot be the oracle for the programs in RITZ1_ONLY_CASES.
-ritz1 still has the fallback until AGAST #2236, so they stay pinned to a known
-exit code. #2236 deletes them along with the fallback.
+AGAST #1429 and #2236 made both compilers reject a non-void fn that reaches its
+end without a value, so the shapes that once fell back to `ret <T> 0` are now
+test_ritz1_fn_tail_requires_value.py's concern, not this file's.
 """
 
 import re
@@ -33,62 +32,6 @@ import re
 import pytest
 
 from test_ritz1_builtin_struct_shadow import _run
-
-# The ticket's repro: an entry-block value, then an if-without-else. The if
-# yields no value, so the method returns 0 for either value of `c`.
-IF_NO_ELSE = """\
-struct Box
-    v: i64
-
-impl Box
-    fn zm(self, c: i64) -> i64
-        555
-        if c > 0
-            let q: i64 = 1
-
-fn zf(c: i64) -> i64
-    555
-    if c > 0
-        let q: i64 = 1
-
-pub fn main() -> i32
-    let b: Box = Box { v: 7 }
-    let r: i64 = b.zm(0) + b.zm(1) * 10 + zf(0) * 100 + zf(1) * 1000
-    if r != 0
-        return 1
-    return 42
-"""
-
-# Narrow and bool return types in the `ret <T> 0` fallback: `ret i32 0`,
-# `ret i1 0` and `ret i8 0` must match the method's signature.
-NARROW_TYPES = """\
-struct Box
-    v: i64
-
-impl Box
-    fn wi(self, n: i64) -> i32
-        var i: i64 = 0
-        while i < n
-            i = i + 1
-
-    fn wb(self, c: i64) -> bool
-        if c > 0
-            let q: i64 = 1
-
-    fn wu(self, c: i64) -> u8
-        if c > 0
-            let q: i64 = 1
-
-pub fn main() -> i32
-    let b: Box = Box { v: 7 }
-    if b.wi(5) != 0
-        return 1
-    if b.wb(1)
-        return 2
-    if b.wu(1) != 0
-        return 3
-    return 42
-"""
 
 # A method ending in an if/else whose arms both yield a value. The tail
 # returns that value through `last_expr_here`, the same way emit_fn does.
@@ -120,8 +63,9 @@ pub fn main() -> i32
 
 # Controls: an explicit trailing `return` and a bare trailing expression must
 # not gain a second `ret` (a terminator in the middle of a block is also
-# invalid IR). The void method ending in an `if` must still get `ret void`, and
-# the one ending in a bare `return` must get only one.
+# invalid IR). The void method ending in an `if` must still get `ret void`, as
+# must the `-> void` spelling (normalised to TYPE_VOID by the parser), and the
+# one ending in a bare `return` must get only one.
 CONTROLS = """\
 struct Box
     v: i64
@@ -142,44 +86,21 @@ impl Box
     fn vr(self)
         return
 
-pub fn main() -> i32
-    let b: Box = Box { v: 7 }
-    b.vd(1)
-    b.vr()
-    return (b.er(1) + b.er(0) + b.te()) as i32
-"""
-
-# The named-struct fallback gets `ret %Box zeroinitializer`. The `-> void`
-# spelling (normalised to TYPE_VOID by the parser) gets `ret void`.
-STRUCT_AND_VOID_NAMED = """\
-struct Box
-    v: i64
-
-impl Box
     fn nv(self, c: i64) -> void
         if c > 0
             let q: i64 = 1
 
-    fn mk(self, c: i64) -> Box
-        if c > 0
-            let q: i64 = 1
-
 pub fn main() -> i32
     let b: Box = Box { v: 7 }
+    b.vd(1)
+    b.vr()
     b.nv(1)
-    let z: Box = b.mk(1)
-    return (z.v + 42) as i32
+    return (b.er(1) + b.er(0) + b.te()) as i32
 """
 
 CASES = [
     ("if_else_value", IF_ELSE_VALUE),
     ("controls", CONTROLS),
-]
-
-RITZ1_ONLY_CASES = [
-    ("if_no_else", IF_NO_ELSE),
-    ("narrow_types", NARROW_TYPES),
-    ("struct_and_void_named", STRUCT_AND_VOID_NAMED),
 ]
 
 
@@ -229,13 +150,3 @@ def test_method_tail_matches_ritz0(ritz1_bin, tmp_path, name, program):
     shape = _block_shape_errors((tmp_path / f"{name}_ritz1.ll").read_text())
     assert not shape, f"{name}: malformed blocks in ritz1 IR:\n" + "\n".join(shape)
     assert got == expected, f"{name}: ritz1 exit {got}, ritz0 exit {expected}"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name,program", RITZ1_ONLY_CASES,
-                         ids=[c[0] for c in RITZ1_ONLY_CASES])
-def test_method_tail_fallback_on_ritz1(ritz1_bin, tmp_path, name, program):
-    got = _run("ritz1", tmp_path, name, program)
-    shape = _block_shape_errors((tmp_path / f"{name}_ritz1.ll").read_text())
-    assert not shape, f"{name}: malformed blocks in ritz1 IR:\n" + "\n".join(shape)
-    assert got == 42, f"{name}: ritz1 exit {got}"

@@ -24,6 +24,7 @@ import narrowing         # narrowing_begin_fn (AGAST #1364)
 import enum_as_int       # enum_as_int_tail (AGAST #2136)
 import must_use          # must_use_check (AGAST #2137)
 import ownership         # own_begin_fn / own_end_fn (AGAST #2158)
+import tail_value        # check_tail_value (AGAST #2236)
 
 # The implicit-return tail shared by emit_fn and emit_impl_method (AGAST #1573).
 #
@@ -46,9 +47,8 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
     # `last_expr_reg` raw here bypassed the dominance guard #1309 added: a
     # trailing expression inside a loop body leaked its register into the
     # loop-exit block, where the body does not dominate the ret on the
-    # zero-iteration path.  `last_expr_here` returns 0 in that case and we
-    # fall through to the `ret <T> 0` default below — exactly what ritz0
-    # does, and what an if-without-else already does post-#1309.
+    # zero-iteration path.  `last_expr_here` returns 0 in that case, and
+    # check_tail_value (AGAST #2236) has already rejected a fn that ends there.
     if has_explicit_return == 0 and ret_type != TYPE_VOID
         let ival: i32 = last_expr_here(s)
         if ival > 0
@@ -115,7 +115,14 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
                 emit_reg(s, ival)
                 emit_str(s, c"\n")
         else
-            # No value available, return 0
+            # No value here.  check_tail_value (AGAST #2236) has rejected every
+            # fn the rule says ends without one, so this terminates a block the
+            # rule lets through.  Across the corpus each one is dead: the merge
+            # after an if/else whose arms all return, or the exit of a
+            # `while true`.  It is a `ret` and not `unreachable` because two
+            # shapes do get here at run time: an arm that is a method call to
+            # a procedure (#2237), and an `if` arm that is a `match` with no
+            # wildcard whose arms all return (#2245).
             if named_struct == 1 and s.ret_sret == 1
                 emit_sret_ret_zero(s)   # AGAST #1730
             else if named_struct == 1
@@ -720,6 +727,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
 
     clear_last_expr(s)  # Reset before processing function body (ritz-task-1309)
     own_begin_fn(s, f.params)   # AGAST #2158: by-value move-only params
+    check_tail_value(s, f)      # AGAST #2236
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = f.body
     while stmt != null
@@ -1060,6 +1068,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         param2 = param2.next
 
     own_begin_fn(s, method.params)   # AGAST #2158
+    check_tail_value(s, method)      # AGAST #2236
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = method.body
     while stmt != null
