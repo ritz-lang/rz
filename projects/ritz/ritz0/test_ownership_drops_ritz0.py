@@ -22,6 +22,8 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
     moves into it and drops once (AGAST #2238).
   * a method that takes `self` by value moves its receiver, which then
     drops once, in the method (AGAST #2239).
+  * a binding from a method call has the method's return type, so a by-value
+    receiver moves it (AGAST #2257).
 
 Exit statuses encode what the program observed, as in the free-count test.
 """
@@ -1039,10 +1041,18 @@ impl Tracked
     fn pass_on(self:= Tracked) -> i32
         return self.burn()
 
+    fn new(id: i32) -> Tracked
+        return Tracked { id: id }
+
 """
 
 # name: (the body of `g`, which runs before main returns DROPS, expected DROPS)
 RECEIVER_RUNS = {
+    # AGAST #2257: the binding comes from a method call.
+    "method_binding": ("""
+    var t = Tracked.new(1)
+    return t.burn()
+""", 1),
     "var": ("""
     var t = make(1)
     return t.burn()

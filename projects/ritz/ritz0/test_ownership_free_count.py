@@ -20,7 +20,8 @@ AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
 #2171. AGAST #2174 added a match owning its scrutinee, with payload
 bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
 AGAST #2173 added assigning a move-only field (the old value drops),
-closed for both.
+closed for both. AGAST #2257 added bindings and temporaries from a method
+call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262).
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -83,6 +84,30 @@ enum Slot
 
 """
 
+# Methods that build a value, for the method-call cases (AGAST #2257).
+METHODS = """\
+impl Tracked
+    fn new(id: i32) -> Tracked
+        return Tracked { id: id }
+
+    fn again(self: @Tracked) -> Tracked
+        return Tracked { id: self.id }
+
+    fn peek(self: @Tracked) -> i32
+        return self.id
+
+struct Sink
+    n: i32
+
+impl Sink
+    fn look(self: @Sink, t: @Tracked) -> i32
+        return t.id
+
+"""
+
+# Method temporaries ritz1 doesn't drop yet.
+METHOD_TEMP_GAP = {"ritz1": 2262, "ritz1_selfhosted": 2262}
+
 # name -> (program body, expected exit status, {compiler: gap ticket}).
 # Where a helper returns `DROPS * 10`, the tens digit is the count at that
 # point inside the helper and the units digit the count once it has returned.
@@ -99,6 +124,83 @@ struct Outer2
 """
 
 CASES = {
+    # AGAST #2257: a binding from a method call has the method's return type,
+    # so it moves. Each of these dropped one value twice on ritz0.
+    "method_binding_moves_into_call": (METHODS + """\
+fn f() -> i32
+    var t = Tracked.new(1)
+    consume(t)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "method_binding_moves_to_binding": (METHODS + """\
+fn f() -> i32
+    var t = Tracked.new(1)
+    var u = t
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "method_binding_from_value_receiver": (METHODS + """\
+fn f() -> i32
+    var a = make(1)
+    var t = a.again()
+    consume(t)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, {}),
+
+    # AGAST #2257: a method's result nobody takes is a temporary (§13.6).
+    "method_temp_statement": (METHODS + """\
+fn f() -> i32
+    Tracked.new(1)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, METHOD_TEMP_GAP),
+
+    "method_temp_field": (METHODS + """\
+fn f() -> i32
+    var i = Tracked.new(1).id
+    return i
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, METHOD_TEMP_GAP),
+
+    "method_temp_lent_argument": (METHODS + """\
+fn f() -> i32
+    var s = Sink { n: 0 }
+    return s.look(Tracked.new(1))
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, METHOD_TEMP_GAP),
+
+    # ritz0 evaluates the receiver twice, so two values drop (AGAST #2261).
+    "method_temp_receiver": (METHODS + """\
+fn f() -> i32
+    return Tracked.new(1).peek()
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {"ritz0": 2261, **METHOD_TEMP_GAP}),
+
     "scope_end_let": ("""\
 fn f()
     let t = make(1)
@@ -1049,6 +1151,13 @@ pub fn main() -> i32
     o.a.t = make(2)
     return 0
 """, "o.a", {}),
+
+    # AGAST #2257: a binding from a method call moves like any other.
+    "method_binding_after_move": (METHODS + """\
+pub fn main() -> i32
+    var t = Tracked.new(1)
+    return consume(t) + consume(t)
+""", "t", {}),
 
     # AGAST #2177: a payload binding owns the payload, so it moves once.
     "payload_after_move": (SLOT + """\

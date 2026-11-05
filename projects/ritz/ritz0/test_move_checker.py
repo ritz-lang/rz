@@ -1410,6 +1410,143 @@ fn f(r: @T, p: *T) -> i32
 """) == []
 
 
+class TestMethodCallBindingType:
+    """A binding from a method call has that method's return type (AGAST
+    #2257), so it moves and drops once. The method is found on the receiver's
+    own type, for `Type.method()` and `value.method()` alike: other types'
+    methods of that name say nothing about this call.
+    """
+
+    DEFS = drop_impl("T") + """
+struct T
+    id: i32
+
+struct H
+    t: T
+
+struct Box<X>
+    v: X
+
+trait Named
+    fn name(self: @T) -> i32
+
+impl T
+    fn new(id: i32) -> T
+        return T { id: id }
+
+    fn open(id: i32) -> Result<T, i32>
+        return Ok(T { id: id })
+
+    fn again(self: @T) -> T
+        return T { id: self.id }
+
+    fn twin(self: @T) -> Self
+        return T { id: self.id }
+
+    fn look(self: @T) -> i32
+        return self.id
+
+    fn len(self: @T) -> T
+        return T { id: self.id }
+
+    fn name(self: @T) -> T
+        return T { id: self.id }
+
+impl Named for T
+    fn name(self: @T) -> i32
+        return self.id
+
+impl<X> Box<X>
+    fn get(self: @Box<X>) -> X
+        return self.v
+
+# Same method names as T's, on a type that copies.
+struct C
+    n: i32
+
+impl C
+    fn new(n: i32) -> i32
+        return n
+
+    fn again(self: @C) -> i32
+        return self.n
+
+fn eat(t: T) -> i32
+    return t.id
+
+"""
+
+    def moved_twice(self, setup: str, name: str = "u") -> list:
+        """Errors for using `name`, bound by `setup`, by value twice."""
+        return check(self.DEFS + f"""
+fn f(t: T, p: @T, h: H, bt: Box<T>, bi: Box<i32>, c: C) -> i32
+    {setup}
+    var a = {name}
+    var b = {name}
+    return 0
+""")
+
+    def assert_moves(self, setup: str, name: str = "u"):
+        errors = self.moved_twice(setup, name)
+        assert any(f"use of moved value: `{name}`" in str(e) for e in errors), errors
+
+    def assert_copies(self, setup: str, name: str = "u"):
+        assert self.moved_twice(setup, name) == []
+
+    def test_static_call(self):
+        self.assert_moves("var u = T.new(1)")
+
+    def test_let_binding(self):
+        self.assert_moves("let u = T.new(1)")
+
+    def test_value_receiver(self):
+        self.assert_moves("var u = t.again()")
+
+    def test_reference_receiver(self):
+        self.assert_moves("var u = p.again()")
+
+    def test_field_receiver(self):
+        self.assert_moves("var u = h.t.again()")
+
+    def test_chained_on_a_method_result(self):
+        self.assert_moves("var u = T.new(1).again()")
+
+    def test_try_unwraps_the_declared_result(self):
+        self.assert_moves("var u = T.open(1)?")
+
+    def test_self_return_is_the_receiver_type(self):
+        self.assert_moves("var u = t.twin()")
+
+    def test_generic_return_takes_the_receiver_argument(self):
+        self.assert_moves("var u = bt.get()")
+
+    def test_generic_return_of_a_copy_argument_copies(self):
+        self.assert_copies("var u = bi.get()")
+
+    def test_copy_return_copies(self):
+        self.assert_copies("var u = t.look()")
+
+    def test_other_type_of_the_same_method_name_copies(self):
+        self.assert_copies("var u = c.again()")
+
+    def test_static_call_on_other_type_of_the_same_method_name_copies(self):
+        self.assert_copies("var u = C.new(1)")
+
+    def test_binding_named_like_a_type_is_the_receiver(self):
+        # `C` here is a T, so this is T.again, not C.again.
+        self.assert_moves("var C = T.new(1)\n    var u = C.again()")
+
+    def test_declared_method_beats_the_name_heuristic(self):
+        self.assert_moves("var u = t.len()")
+
+    def test_undeclared_method_copies(self):
+        self.assert_copies("var u = t.nothing()")
+
+    def test_impls_disagreeing_on_the_return_type_copy(self):
+        # A wrong "move" rejects a valid program (MoveTypes).
+        self.assert_copies("var u = t.name()")
+
+
 class TestArrayTupleLiteralMoves:
     """An array or tuple literal owns its elements (AGAST #2238), so a
     move-only binding used as an element moves into the literal, wherever

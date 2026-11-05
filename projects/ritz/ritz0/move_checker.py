@@ -292,6 +292,8 @@ class MoveChecker:
         self.methods: Dict[str, List[rast.FnDef]] = {}
         # (type name, method name) -> that type's FnDefs of that name.
         self.type_methods: Dict[Tuple[str, str], List[rast.FnDef]] = {}
+        # id(method FnDef) -> its impl block, for the impl's type parameters.
+        self.method_impl: Dict[int, rast.ImplBlock] = {}
         self.types: Optional[MoveTypes] = None
         # Per enclosing loop: the binding states at each `break` and
         # `continue` (AGAST #2161, _check_loop).
@@ -330,6 +332,7 @@ class MoveChecker:
                 for m in item.methods:
                     self.methods.setdefault(m.name, []).append(m)
                     self.type_methods.setdefault((item.type_name, m.name), []).append(m)
+                    self.method_impl[id(m)] = item
 
         # Second pass: check functions and impl methods
         for item in module.items:
@@ -435,8 +438,12 @@ class MoveChecker:
             # Fallback: return unknown (could be any type)
             return rast.NamedType(expr.span, 'unknown', [])
         elif isinstance(expr, rast.MethodCall):
-            # Method calls - try to find the return type
-            # For now, check if method name suggests a primitive return type
+            # What the method declares, on the receiver's own type (AGAST
+            # #2257): the emitter types the binding from that too.
+            declared = self._method_return_type(expr)
+            if declared is not None:
+                return declared
+            # Otherwise (a builtin, a UFCS fallback), go by the method's name.
             method = expr.method
             # Common methods that return Copy types
             if method in ('len', 'cap', 'count', 'size', 'is_empty', 'is_some', 'is_none',
@@ -1157,6 +1164,28 @@ class MoveChecker:
             # `*t` of a `t:& T` is t's value, and t's type is already T.
             return self._receiver_type(expr.operand)
         return self.types.resolve(self._field_path_type(expr))
+
+    def _method_return_type(self, call: rast.MethodCall) -> Optional[rast.Type]:
+        """The type `call` returns, for `Type.method()` or `value.method()`,
+        looked up on the receiver's own type with the impl's type parameters
+        replaced by the receiver's arguments. None when the type doesn't
+        declare the method or its impls disagree on the return type."""
+        recv = call.expr
+        if isinstance(recv, rast.Ident) and self.scope.lookup(recv.name) is None:
+            ty = rast.NamedType(recv.span, recv.name, [])
+        else:
+            ty = self._receiver_type(recv)
+        while isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = self.types.resolve(ty.inner)
+        if not isinstance(ty, rast.NamedType):
+            return None
+        rets: Dict[str, rast.Type] = {}
+        for m in self.type_methods.get((ty.name, call.method), []):
+            subst = dict(zip(self.method_impl[id(m)].type_params, ty.args))
+            subst['Self'] = ty
+            ret = _subst(m.ret_type, subst)
+            rets[_type_key(ret)] = ret
+        return next(iter(rets.values())) if len(rets) == 1 else None
 
     def _method_takes_self(self, call: rast.MethodCall) -> bool:
         """Does `call` take its receiver by value? `self:= T`, `self: T` and
