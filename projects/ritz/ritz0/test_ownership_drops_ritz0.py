@@ -18,6 +18,8 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
     leaves the caller the only owner (AGAST #2231);
   * a move out of a nested field `a.b.c` is tracked per path, so its parents
     are partly moved and their other fields still drop (AGAST #2232).
+  * an array or tuple literal owns its elements, so a binding used as one
+    moves into it and drops once (AGAST #2238).
 
 Exit statuses encode what the program observed, as in the free-count test.
 """
@@ -848,6 +850,169 @@ pub fn main() -> i32
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"matched a moved field:\n{out[-1000:]}"
     assert "use of moved value: `o.b.s`" in out, out[-2000:]
+
+
+# Array and tuple literals own their elements (AGAST #2238). Each body is `f`,
+# which main calls, and the drop count main then returns.
+LITERAL_RUNS = {
+    "array_of_local": ("""
+fn f()
+    var t = make(1)
+    let a = [t]
+""", 1),
+    "tuple_of_local": ("""
+fn f()
+    var t = make(1)
+    let a = (t, 1)
+""", 1),
+    "tuple_of_by_value_param": ("""
+fn g(t:= Tracked)
+    let a = (t, 1)
+
+fn f()
+    g(make(1))
+""", 1),
+    "array_of_by_value_param": ("""
+fn g(t: Tracked)
+    let a = [t]
+
+fn f()
+    g(make(1))
+""", 1),
+    "array_of_two": ("""
+fn f()
+    var t = make(1)
+    var u = make(2)
+    let a = [t, u]
+""", 2),
+    "nested": ("""
+fn f()
+    var t = make(1)
+    var u = make(2)
+    let a = [(t, 1)]
+    let b = ([u], 1)
+""", 2),
+    # A statement's literal is a temporary: it drops, and the binding doesn't.
+    "array_statement": ("""
+fn f() -> i32
+    var t = make(1)
+    [t]
+    return 0
+""", 1),
+    "tuple_statement": ("""
+fn f() -> i32
+    var t = make(1)
+    (t, 1)
+    return 0
+""", 1),
+    "array_of_temporaries_statement": ("""
+fn f() -> i32
+    [make(1), make(2)]
+    return 0
+""", 2),
+    "tuple_read_through_a_temporary": ("""
+fn f()
+    var t = make(1)
+    let n = (t, 1).1
+""", 1),
+    "tuple_into_by_value_param": ("""
+fn g(p: (Tracked, i32))
+    pass
+
+fn f()
+    var t = make(1)
+    g((t, 1))
+""", 1),
+    "returned_tuple": ("""
+fn g() -> (Tracked, i32)
+    var t = make(1)
+    return (t, 1)
+
+fn f()
+    let p = g()
+""", 1),
+    # The field moves into the literal; the Holder has nothing left to drop.
+    "field_element": ("""
+fn f()
+    var h = Holder { t: make(1), n: 3 }
+    let a = [h.t]
+""", 1),
+    # The drop flag covers the path that didn't move.
+    "moved_on_the_taken_path": ("""
+fn f()
+    var t = make(1)
+    if DROPS == 0
+        let a = [t]
+""", 1),
+    "not_moved_on_the_other_path": ("""
+fn f()
+    var t = make(1)
+    if DROPS != 0
+        let a = [t]
+""", 1),
+    # The old value lives in `a`; the new one is a second value.
+    "assigned_again": ("""
+fn f()
+    var t = make(1)
+    let a = [t]
+    t = make(2)
+""", 2),
+    # An element that only borrows leaves the binding the owner.
+    "borrowed_element": ("""
+fn f()
+    var t = make(1)
+    let a = [@t]
+""", 1),
+}
+
+LITERAL_REJECTS = {
+    "array": "let a = [t]",
+    "tuple": "let a = (t, 1)",
+    "array_statement": "[t]",
+}
+
+
+@pytest.mark.parametrize("name", sorted(LITERAL_RUNS))
+def test_ritz0_literal_owns_its_elements(tmp_path, name):
+    body, expected = LITERAL_RUNS[name]
+    rc = _run(tmp_path, body + """
+pub fn main() -> i32
+    f()
+    return DROPS
+""")
+    assert rc == expected, f"{name}: {rc} drops, spec says {expected}"
+
+
+@pytest.mark.parametrize("name", sorted(LITERAL_REJECTS))
+def test_ritz0_use_after_move_into_literal_rejected(tmp_path, name):
+    comp, _ = _compile(tmp_path, f"""
+fn f() -> i32
+    var t = make(1)
+    {LITERAL_REJECTS[name]}
+    return t.id
+
+pub fn main() -> i32
+    return f()
+""")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a use after move:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert "use of moved value: `t`" in out, out[-2000:]
+
+
+@pytest.mark.parametrize("literal", ["[t]", "(t, 1)"])
+def test_ritz0_literal_element_of_lent_param_rejected(tmp_path, literal):
+    comp, _ = _compile(tmp_path, f"""
+fn f(t:& Tracked)
+    let a = {literal}
+
+pub fn main() -> i32
+    return 0
+""")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert "cannot move out of borrowed parameter `t`" in out, out[-2000:]
 
 
 @pytest.mark.parametrize("name", sorted(RUNS))

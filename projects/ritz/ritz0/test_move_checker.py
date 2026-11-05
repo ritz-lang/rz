@@ -888,6 +888,31 @@ impl Res
     fn burn(self:& Res) -> i32
         return eat(self)
 """, "self", id="mut_self"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let a = [t]
+    return 0
+""", "t", id="array_element"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let a = (t, 1)
+    return 0
+""", "t", id="tuple_element"),
+        pytest.param("""
+fn f(w:& Wrap) -> i32
+    let a = [w.r]
+    return 0
+""", "w", id="array_element_field"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let a = (*t, 1)
+    return 0
+""", "t", id="tuple_element_deref"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    [t]
+    return 0
+""", "t", id="array_element_of_a_temporary"),
     ])
     def test_move_out_is_rejected(self, body, param):
         errs = check(self.DEFS + body)
@@ -1098,6 +1123,222 @@ fn f(p:& P) -> i32
     let r = *p
     return take(p) + q.x + r.x
 """) == []
+
+
+class TestArrayTupleLiteralMoves:
+    """An array or tuple literal owns its elements (AGAST #2238), so a
+    move-only binding used as an element moves into the literal, wherever
+    the literal itself goes."""
+
+    DEFS = drop_impl("Res") + """
+struct Res
+    h: i32
+
+struct Holder
+    r: Res
+    n: i32
+
+struct Point
+    x: i32
+
+fn make() -> Res
+    return Res { h: 1 }
+
+fn see(r: @Res) -> i32
+    return r.h
+"""
+
+    LITERALS = [
+        pytest.param("let a = [t]", id="array"),
+        pytest.param("let a = (t, 1)", id="tuple"),
+        pytest.param("let a = [1, t]", id="array_not_first"),
+        pytest.param("let a = (1, t)", id="tuple_not_first"),
+        pytest.param("let a = [(t)]", id="grouped"),
+        pytest.param("let a = [(t, 1)]", id="tuple_in_array"),
+        pytest.param("let a = ([t], 1)", id="array_in_tuple"),
+        pytest.param("[t]", id="array_statement"),
+        pytest.param("(t, 1)", id="tuple_statement"),
+    ]
+
+    @pytest.mark.parametrize("literal", LITERALS)
+    def test_use_after_the_literal_is_rejected(self, literal):
+        errs = check(self.DEFS + f"""
+fn f() -> i32
+    var t = make()
+    {literal}
+    return t.h
+""")
+        assert len(errs) == 1, errs
+        assert "use of moved value: `t`" in str(errs[0])
+
+    @pytest.mark.parametrize("literal", LITERALS)
+    def test_element_binding_is_marked_moved(self, literal):
+        """The emitter clears the binding's drop flag at this mark; without
+        it the binding and the literal both drop the value."""
+        module = parse(self.DEFS + f"""
+fn f() -> i32
+    var t = make()
+    {literal}
+    return 0
+""")
+        assert MoveChecker().check(module) == []
+        fn = next(i for i in module.items if getattr(i, 'name', '') == 'f')
+        marks = []
+
+        def walk(node):
+            if getattr(node, 'moves_binding', False):
+                marks.append(node.name)
+            for child in vars(node).values() if hasattr(node, '__dict__') else ():
+                for c in child if isinstance(child, list) else [child]:
+                    if hasattr(c, 'span'):
+                        walk(c)
+        walk(fn.body)
+        assert marks == ['t']
+
+    @pytest.mark.parametrize("literal", ["[t, t]", "(t, t)"])
+    def test_same_binding_twice_is_rejected(self, literal):
+        errs = check(self.DEFS + f"""
+fn f() -> i32
+    var t = make()
+    let a = {literal}
+    return 0
+""")
+        assert len(errs) == 1, errs
+        assert "use of moved value: `t`" in str(errs[0])
+
+    @pytest.mark.parametrize("literal", ["[t]", "(t, 1)"])
+    def test_element_of_a_moved_binding_is_rejected(self, literal):
+        errs = check(self.DEFS + f"""
+fn f() -> i32
+    var t = make()
+    let u = t
+    let a = {literal}
+    return 0
+""")
+        assert len(errs) == 1, errs
+        assert "use of moved value: `t`" in str(errs[0])
+
+    @pytest.mark.parametrize("param", ["t: Res", "t:= Res"])
+    @pytest.mark.parametrize("literal", ["[t]", "(t, 1)"])
+    def test_owning_param_moves(self, param, literal):
+        errs = check(self.DEFS + f"""
+fn f({param}) -> i32
+    let a = {literal}
+    return t.h
+""")
+        assert len(errs) == 1, errs
+        assert "use of moved value: `t`" in str(errs[0])
+
+    def test_move_in_a_loop_is_rejected(self):
+        errs = check(self.DEFS + """
+fn f() -> i32
+    var t = make()
+    var i = 0
+    while i < 2
+        let a = [t]
+        i += 1
+    return 0
+""")
+        assert len(errs) == 1, errs
+        assert "use of moved value: `t`" in str(errs[0])
+
+    @pytest.mark.parametrize("literal", ["[h.r]", "(h.r, 1)"])
+    def test_field_element_moves_only_that_field(self, literal):
+        assert check(self.DEFS + f"""
+fn f() -> i32
+    var h = Holder {{ r: make(), n: 1 }}
+    let a = {literal}
+    return h.n
+""") == []
+        errs = check(self.DEFS + f"""
+fn f() -> i32
+    var h = Holder {{ r: make(), n: 1 }}
+    let a = {literal}
+    return h.r.h
+""")
+        assert len(errs) == 1, errs
+        assert "use of moved value: `h.r`" in str(errs[0])
+
+    @pytest.mark.parametrize("body", [
+        pytest.param("""
+fn f() -> i32
+    var t = make()
+    let a = [t]
+    t = make()
+    return t.h
+""", id="assigned_again"),
+        pytest.param("""
+fn f() -> i32
+    let p = Point { x: 1 }
+    let a = [p, p]
+    let b = (p, p)
+    return p.x
+""", id="copy_struct"),
+        pytest.param("""
+fn f() -> i32
+    let n = 1
+    let a = [n, n]
+    let b = (n, n)
+    return n
+""", id="copy_scalar"),
+        pytest.param("""
+fn f(t: @Res) -> i32
+    let a = [t, t]
+    let b = (t, t)
+    return t.h
+""", id="reference_param"),
+        pytest.param("""
+fn f() -> i32
+    var t = make()
+    let a = [@t]
+    let b = (@t, 1)
+    return t.h
+""", id="borrowed_element"),
+        pytest.param("""
+fn f() -> i32
+    var t = make()
+    let a = [see(@t), see(@t)]
+    return t.h
+""", id="element_reads_the_binding"),
+        pytest.param("""
+fn f() -> i32
+    var t = make()
+    let a = [t.h, t.h]
+    return t.h
+""", id="copy_field_element"),
+    ])
+    def test_non_moves_are_accepted(self, body):
+        assert check(self.DEFS + body) == []
+
+    @pytest.mark.parametrize("value, is_temp", [
+        pytest.param("[make()]", True, id="array"),
+        pytest.param("(make(), 1)", True, id="tuple"),
+        pytest.param("[1]", False, id="copy_array"),
+        pytest.param("(1, 2)", False, id="copy_tuple"),
+    ])
+    def test_unowned_literal_is_a_temporary(self, value, is_temp):
+        module = parse(self.DEFS + f"""
+fn f() -> i32
+    {value}
+    return 0
+""")
+        assert MoveChecker().check(module) == []
+        fn = next(i for i in module.items if getattr(i, 'name', '') == 'f')
+        literal = fn.body.stmts[0].expr
+        assert (getattr(literal, 'drop_temp', None) is not None) == is_temp
+        # The literal owns its element, so the element is no temporary.
+        assert getattr(literal.elements[0], 'drop_temp', None) is None
+
+    @pytest.mark.parametrize("value", ["[make()]", "(make(), 1)"])
+    def test_owned_literal_is_not_a_temporary(self, value):
+        module = parse(self.DEFS + f"""
+fn f() -> i32
+    let a = {value}
+    return 0
+""")
+        assert MoveChecker().check(module) == []
+        fn = next(i for i in module.items if getattr(i, 'name', '') == 'f')
+        assert getattr(fn.body.stmts[0].value, 'drop_temp', None) is None
 
 
 class TestLoopsMatchesTemporaries:

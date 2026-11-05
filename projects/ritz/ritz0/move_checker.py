@@ -855,6 +855,13 @@ class MoveChecker:
                     field_types.get(name), value))
             self._mark_temporary(expr, is_move_context)
 
+        elif isinstance(expr, (rast.ArrayLit, rast.TupleLit)):
+            # The literal owns its elements, wherever the literal itself
+            # goes (AGAST #2238).
+            for element in expr.elements:
+                self._check_expr(element, is_move_context=True)
+            self._mark_temporary(expr, is_move_context)
+
         elif isinstance(expr, rast.Match):
             # A lent parameter stays the caller's, so matching it only reads.
             self._check_expr(expr.expr,

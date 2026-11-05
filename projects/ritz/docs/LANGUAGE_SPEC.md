@@ -1844,7 +1844,7 @@ fn main() -> i32
 
 Using a value of a copy type by value copies it, and the source stays usable.
 Uses by value include binding it, assigning it, passing it to a by-value
-parameter, returning it and storing it in a field:
+parameter, returning it and storing it in a field or an array or tuple literal:
 
 ```ritz
 struct Point
