@@ -25,6 +25,8 @@ call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262). AGAST
 #2243 added bindings from a field, which ritz1 already got right. AGAST
 #2244 added moves out of a tuple element, closed for ritz0; ritz1 has no
 tuples to move out of yet (#1526).
+AGAST #2261 closed ritz0's double evaluation of a method receiver, which
+dropped two values for one call.
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -613,7 +615,7 @@ pub fn main() -> i32
     return DROPS
 """, 1, METHOD_TEMP_GAP),
 
-    # ritz0 evaluates the receiver twice, so two values drop (AGAST #2261).
+    # One evaluation, so one value to drop (AGAST #2261).
     "method_temp_receiver": (METHODS + """\
 fn f() -> i32
     return Tracked.new(1).peek()
@@ -621,7 +623,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz0": 2261, **METHOD_TEMP_GAP}),
+""", 1, METHOD_TEMP_GAP),
 
     "scope_end_let": ("""\
 fn f()

@@ -173,17 +173,11 @@ CASES = {
     "repro": (REPRO, 40),
     "rot_width_u32": (ROT_WIDTH_U32, 42),
     "paren_receiver": (PAREN_RECEIVER, 42),
+    "other_receivers": (OTHER_RECEIVERS, 42),
     "rot_widths": (ROT_WIDTHS, 42),
     "count_ops": (COUNT_OPS, 42),
     "refined_type": (REFINED_TYPE, 42),
 }
-
-# ritz1-only, hand-derived expectation: ritz0 evaluates a call receiver of a
-# BitOps method twice (g_calls == 2, exit 3), so it is no oracle here (#1563).
-RITZ1_ONLY = {
-    "other_receivers": (OTHER_RECEIVERS, 42),
-}
-
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
@@ -196,13 +190,6 @@ def test_ritz0_oracle(tmp_path, name):
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_ritz1_int_method(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
-    assert _run("ritz1", tmp_path, name, program) == want
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY))
-def test_ritz1_only_int_method(ritz1_bin, tmp_path, name):
-    program, want = RITZ1_ONLY[name]
     assert _run("ritz1", tmp_path, name, program) == want
 
 

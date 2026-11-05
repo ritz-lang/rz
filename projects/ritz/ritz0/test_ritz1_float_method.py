@@ -131,9 +131,7 @@ CASES = {
     "result_type": (RESULT_TYPE, 42),
 }
 
-# A call receiver must be evaluated exactly once. Hand-derived expectation:
-# ritz0 may evaluate a call receiver twice (cf. #1563 for BitOps), so it is
-# not used as the oracle here.
+# A call receiver must be evaluated exactly once (AGAST #2261).
 CALL_RECEIVER = """\
 var g_calls: i32 = 0
 
@@ -150,9 +148,7 @@ pub fn main() -> i32
     return 42
 """
 
-RITZ1_ONLY = {
-    "call_receiver": (CALL_RECEIVER, 42),
-}
+CASES["call_receiver"] = (CALL_RECEIVER, 42)
 
 
 @pytest.mark.integration
@@ -166,13 +162,6 @@ def test_ritz0_oracle(tmp_path, name):
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_ritz1_float_method(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
-    assert _run("ritz1", tmp_path, name, program) == want
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY))
-def test_ritz1_float_method_ritz1_only(ritz1_bin, tmp_path, name):
-    program, want = RITZ1_ONLY[name]
     assert _run("ritz1", tmp_path, name, program) == want
 
 

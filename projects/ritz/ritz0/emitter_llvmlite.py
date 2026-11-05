@@ -591,6 +591,9 @@ class LLVMEmitter:
         # AGAST #1869: id(operand expr) -> its already-emitted value, while
         # _emit_assert lowers `a OP b` (see _emit_expr's first lines).
         self._assert_operands: Dict[int, ir.Value] = {}
+        # AGAST #2261: what the method call being emitted has already
+        # evaluated, by id(expr): its receiver and the operands of a place.
+        self._evaluated_once: Dict[int, ir.Value] = {}
         self._assert_val_fn: Optional[ir.Function] = None
         self._assert_site_gvars = None
         self._assert_file_consts: Dict[str, ir.Value] = {}
@@ -4038,22 +4041,24 @@ class LLVMEmitter:
         self.builder.position_at_end(current_block)
         return flag_alloca
 
-    def _own_temporary(self, expr: rast.Expr, val: ir.Value) -> None:
+    def _own_temporary(self, expr: rast.Expr, val: ir.Value) -> Optional[ir.Value]:
         """A move-only value nobody takes ownership of (the move checker
         marked `expr.drop_temp` with its type) is a temporary: keep a copy
-        for the innermost temporary frame to drop (§13.6, AGAST #2161)."""
+        for the innermost temporary frame to drop (§13.6, AGAST #2161).
+        Returns the slot holding that copy, if there is one."""
         ty = getattr(expr, 'drop_temp', None)
         if (ty is None or not self._temp_frames or not self.drop_scope_stack
                 or self.current_fn is None or val is None
                 or isinstance(val.type, ir.VoidType)
                 or self.builder.block.is_terminated):
-            return
+            return None
         slot = self._alloca_in_entry_block(val.type, "tmp.drop")
         flag = self._new_drop_flag("tmp")
         self.builder.store(val, slot)
         self.builder.store(ir.Constant(self.i1, 1), flag)
         self.drop_flags[id(slot)] = flag
         self._temp_frames[-1].append((slot, flag, ty))
+        return slot
 
     def _drop_temp_frame(self, frame) -> None:
         """Drop a frame's live temporaries, newest first. Each flag is
@@ -7503,6 +7508,11 @@ class LLVMEmitter:
         # comparison and the failure report share one evaluation.
         if self._assert_operands:
             pre = self._assert_operands.get(id(expr))
+            if pre is not None:
+                return pre
+        # AGAST #2261: part of a method call's receiver, already evaluated.
+        if self._evaluated_once:
+            pre = self._evaluated_once.get(id(expr))
             if pre is not None:
                 return pre
         val = self._emit_expr_core(expr)
@@ -11598,6 +11608,45 @@ class LLVMEmitter:
         return None
 
     def _emit_method_call(self, expr: rast.MethodCall) -> ir.Value:
+        """Emit a method call, evaluating its receiver once (AGAST #2261).
+
+        Dispatch needs the receiver's type before it knows how the method
+        takes `self`, and several routes then re-emit the receiver: the
+        by-value path, the place path, and built-ins that never see the
+        probe. What this call evaluated stays recorded until it has been
+        emitted, so `_emit_expr` hands all of them the same value.
+        """
+        outer = self._evaluated_once
+        self._evaluated_once = dict(outer)
+        try:
+            return self._dispatch_method_call(expr)
+        finally:
+            self._evaluated_once = outer
+
+    def _evaluate_once(self, expr: rast.Expr) -> None:
+        """Evaluate `expr` now; `_emit_expr` returns this value from here on."""
+        self._evaluated_once[id(expr)] = self._emit_expr(expr)
+
+    def _evaluate_place_operands(self, expr: rast.Expr) -> None:
+        """Evaluate what a place depends on, left to right.
+
+        `arr[next()].m()` is emitted as a value for its type and as an
+        address for `self`. Those are different emissions of one place, so
+        they can only agree if its operands are evaluated before either.
+        """
+        if isinstance(expr, rast.Field):
+            self._evaluate_place_operands(expr.expr)
+        elif isinstance(expr, rast.Index):
+            self._evaluate_place_operands(expr.expr)
+            # `a[lo..hi]` lowers to a slice: its range isn't a value.
+            if not isinstance(expr.index, rast.Range):
+                self._evaluate_once(expr.index)
+        elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
+            self._evaluate_once(expr.operand)
+        elif not isinstance(expr, rast.Ident):
+            self._evaluate_once(expr)
+
+    def _dispatch_method_call(self, expr: rast.MethodCall) -> ir.Value:
         """Emit a method call: receiver.method(args...).
 
         Method calls are desugared to static function calls using name mangling:
@@ -11686,9 +11735,15 @@ class LLVMEmitter:
 
         # Look up the mangled function name (need type_name first)
         receiver_probe = None
+        receiver_slot = None  # The temporary holding the receiver, if any
         if type_name is None:
-            # Fall back to emitting the expression and checking its type
-            receiver_probe = self._emit_expr(expr.expr)
+            # Fall back to emitting the expression and checking its type.
+            # This is the receiver's one evaluation (AGAST #2261).
+            if receiver_is_lvalue:
+                self._evaluate_place_operands(expr.expr)
+            receiver_probe = self._emit_expr_core(expr.expr)
+            receiver_slot = self._own_temporary(expr.expr, receiver_probe)
+            self._evaluated_once[id(expr.expr)] = receiver_probe
             receiver_type = receiver_probe.type
             if isinstance(receiver_type, ir.PointerType):
                 type_name = self._get_struct_name_from_type(receiver_type.pointee)
@@ -11887,9 +11942,14 @@ class LLVMEmitter:
                 and not isinstance(receiver_val.type, ir.PointerType)
                 and receiver_val.type == first_param_type.pointee
             ):
-                tmp = self._alloca_in_entry_block(receiver_val.type, "recv.tmp")
-                self.builder.store(receiver_val, tmp)
-                receiver_val = tmp
+                # A temporary is lent from its own slot, so what `@&self`
+                # writes is what its drop sees.
+                if receiver_slot is not None:
+                    receiver_val = receiver_slot
+                else:
+                    tmp = self._alloca_in_entry_block(receiver_val.type, "recv.tmp")
+                    self.builder.store(receiver_val, tmp)
+                    receiver_val = tmp
 
         # Build arguments: receiver first, then explicit args
         # Auto-borrow addressable args when the method expects a pointer param.

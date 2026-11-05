@@ -817,6 +817,10 @@ Methods live in `impl` blocks. The receiver is named `self`, either bare or
 annotated `@Type` (read-only) / `@&Type` (mutating). A bare `self` is a by-value
 parameter: on a move-only type the call moves the receiver (§13.2).
 
+A call evaluates its receiver exactly once, before its arguments, however the
+method takes `self`. That includes the operands of a place: `arr[next()].m()`
+runs `next` once.
+
 ```ritz
 struct Point
     x: i32
