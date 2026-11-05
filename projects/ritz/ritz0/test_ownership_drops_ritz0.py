@@ -13,7 +13,9 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
   * a value lent to an `@T` or `name:& T` parameter (auto-borrow) is not
     moved, and a write through `:&` reaches the caller (AGAST #1315);
   * a type with its own `drop` runs it before its fields' drops;
-  * a match arm binding one payload of several owns them all (AGAST #2177).
+  * a match arm binding one payload of several owns them all (AGAST #2177);
+  * a `name:& T` parameter can't be moved out of, and what reads it instead
+    leaves the caller the only owner (AGAST #2231).
 
 Exit statuses encode what the program observed, as in the free-count test.
 """
@@ -345,6 +347,84 @@ pub fn main() -> i32
     return t.id
 """, "t"),
 }
+
+
+# Reads of a `name:& T` parameter (AGAST #2231): the caller stays the only
+# owner, so one value drops once.
+LENT_READS = {
+    "let_as_reference": """\
+fn g(t:& Tracked) -> i32
+    let p: @Tracked = t
+    return p.id
+""",
+    "let_as_pointer": """\
+fn g(t:& Tracked) -> i32
+    let p: *Tracked = t
+    return p.id
+""",
+    "relend": """\
+fn h(t:& Tracked) -> i32
+    return t.id
+
+fn g(t:& Tracked) -> i32
+    return h(t) + peek(t)
+""",
+}
+
+# Moves out of a `name:& T` parameter (AGAST #2231): each of these used to
+# compile and drop one value twice.
+LENT_MOVES = {
+    "call": ("fn g(t:& Tracked) -> i32\n    return consume(t)\n", "t"),
+    "let": ("fn g(t:& Tracked) -> i32\n    let u = t\n    return u.id\n", "t"),
+    "deref": ("fn g(t:& Tracked) -> i32\n    return consume(*t)\n", "t"),
+    "field": ("fn g(h:& Holder) -> i32\n    return consume(h.t)\n", "h"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(LENT_READS))
+def test_ritz0_lent_read_drops_once(tmp_path, name):
+    rc = _run(tmp_path, LENT_READS[name] + """
+fn f()
+    var t = make(1)
+    g(t)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""")
+    assert rc == 1, f"{name}: one value dropped {rc} times"
+
+
+def test_ritz0_lent_match_drops_once(tmp_path):
+    rc = _run(tmp_path, """
+enum Slot
+    Full(Tracked)
+    Empty
+
+fn g(s:& Slot) -> i32
+    match s
+        Full(t) => return t.id
+        Empty => return 0
+
+fn f()
+    var s = Slot.Full(make(1))
+    g(s)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""")
+    assert rc == 1, f"one value dropped {rc} times"
+
+
+@pytest.mark.parametrize("name", sorted(LENT_MOVES))
+def test_ritz0_move_out_of_lent_param_rejected(tmp_path, name):
+    body, param = LENT_MOVES[name]
+    comp, _ = _compile(tmp_path, body + "\npub fn main() -> i32\n    return 0\n")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert f"cannot move out of borrowed parameter `{param}`" in out, out[-2000:]
 
 
 @pytest.mark.parametrize("name", sorted(RUNS))

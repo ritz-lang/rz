@@ -519,9 +519,12 @@ class MoveChecker:
             return False
 
         elif isinstance(stmt, rast.LetStmt):
-            # Let binding
+            # Let binding. `let p: @T = t` of a `name:& T` parameter takes
+            # the parameter's address (AGAST #2231): a read, not a move.
             if stmt.value:
-                self._check_expr(stmt.value, is_move_context=True)
+                reborrows = (isinstance(stmt.type, (rast.RefType, rast.PtrType))
+                             and self._lent_param(stmt.value) is not None)
+                self._check_expr(stmt.value, is_move_context=not reborrows)
             # Use explicit type if present, otherwise infer from initializer
             if stmt.type:
                 var_type = stmt.type
@@ -577,8 +580,10 @@ class MoveChecker:
             return False
 
         elif isinstance(stmt, rast.ForStmt):
-            # The iterator is moved into the loop, once.
-            self._check_expr(stmt.iter, is_move_context=True)
+            # The iterator is moved into the loop, once. A lent parameter
+            # stays the caller's, so the loop only reads it.
+            self._check_expr(stmt.iter,
+                             is_move_context=self._lent_param(stmt.iter) is None)
 
             def iteration():
                 self._push_scope()
@@ -708,11 +713,14 @@ class MoveChecker:
                     return
 
                 # If this is a move context and type is not Copy, mark as moved.
-                # A `name:& T` parameter is a reference, so it never moves. A
-                # by-value `name: T` parameter (Borrow.CONST) owns its value
-                # (§13.2) and moves like any binding (AGAST #2157).
-                is_borrow_param = var_info.borrow == rast.Borrow.MUTABLE
-                if is_move_context and not is_borrow_param and not self._is_copy_type(var_info.ritz_type):
+                # A by-value `name: T` parameter (Borrow.CONST) owns its value
+                # (§13.2) and moves like any binding (AGAST #2157). A `name:& T`
+                # parameter's value stays the caller's, so it can't move
+                # (AGAST #2231).
+                if is_move_context and not self._is_copy_type(var_info.ritz_type):
+                    if var_info.borrow == rast.Borrow.MUTABLE:
+                        self._reject_move_out(expr.name, expr.span)
+                        return
                     var_info.state = VarState.MOVED
                     var_info.move_span = expr.span
                     # The emitter clears the binding's drop flag here.
@@ -735,6 +743,11 @@ class MoveChecker:
             elif expr.op == '*':
                 # Dereference - check the pointer expression
                 self._check_expr(expr.operand, is_move_context=False)
+                # `*t` of a `t:& T` is t's value, not a pointer's pointee.
+                lent = self._lent_param(expr)
+                if (is_move_context and lent is not None
+                        and not self._is_copy_type(self._infer_expr_type(expr.operand))):
+                    self._reject_move_out(lent, expr.span)
             else:
                 self._check_expr(expr.operand, is_move_context=False)
 
@@ -789,7 +802,11 @@ class MoveChecker:
         elif isinstance(expr, rast.Field):
             # Field access doesn't move the struct (unless the result is moved)
             self._check_expr(expr.expr, is_move_context=False)
-            if is_move_context and self._is_move_only_field(expr):
+            lent = self._lent_param(expr)
+            if is_move_context and lent is not None:
+                if self.types.is_move_only(self._field_path_type(expr)):
+                    self._reject_move_out(lent, expr.span)
+            elif is_move_context and self._is_move_only_field(expr):
                 # Moving a move-only field out of a temporary: the rest of
                 # the temporary isn't dropped either (no partial drops).
                 self._unmark_temporary(expr.expr)
@@ -804,7 +821,9 @@ class MoveChecker:
             self._mark_temporary(expr, is_move_context)
 
         elif isinstance(expr, rast.Match):
-            self._check_expr(expr.expr, is_move_context=True)
+            # A lent parameter stays the caller's, so matching it only reads.
+            self._check_expr(expr.expr,
+                             is_move_context=self._lent_param(expr.expr) is None)
             # The match owns a scrutinee it moved (AGAST #2177, ritz1 #2174).
             owned = self._owned_scrutinee_type(expr.expr)
             expr.owns_scrutinee = owned
@@ -954,6 +973,43 @@ class MoveChecker:
             return False
         return any(n == expr.field and self.types.is_move_only(t)
                    for n, t in self.types.struct_fields(base))
+
+    # ---- moves out of a `name:& T` parameter (AGAST #2231) --------------------
+
+    def _lent_param(self, expr: rast.Expr) -> Optional[str]:
+        """The `name:& T` parameter `expr` reads, if any: `t`, `t.f`, `t.f.g`
+        or `*t`. Its value belongs to the caller, so none of these can be
+        moved out. `@T`, `@&T` and `*T` parameters aren't tracked here: a
+        by-value use copies the reference, and only the slot it lands in
+        tells that from a copy of the referent (AGAST #2227)."""
+        while True:
+            if isinstance(expr, rast.Field):
+                expr = expr.expr
+            elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
+                expr = expr.operand
+            else:
+                break
+        if isinstance(expr, rast.Ident):
+            info = self.scope.lookup(expr.name)
+            if info is not None and info.borrow == rast.Borrow.MUTABLE:
+                return expr.name
+        return None
+
+    def _field_path_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """The type of a field path `b.f.g`, at any depth, or None."""
+        if not isinstance(expr, rast.Field):
+            return self._infer_expr_type(expr)
+        base = self._field_path_type(expr.expr)
+        while isinstance(base, (rast.PtrType, rast.RefType)):
+            base = base.inner
+        if not isinstance(base, rast.NamedType):
+            return None
+        return next((t for n, t in self.types.struct_fields(base)
+                     if n == expr.field), None)
+
+    def _reject_move_out(self, param: str, span: Optional[rast.Span]) -> None:
+        self.errors.append(OwnershipError(
+            f"cannot move out of borrowed parameter `{param}`", span))
 
     # ---- moves out of a field (AGAST #2171) ----------------------------------
 

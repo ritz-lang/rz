@@ -743,6 +743,353 @@ fn main() -> i32
         assert len(errs) == 1 and "use of moved value: `q`" in str(errs[0])
 
 
+class TestMoveOutOfMutBorrowParam:
+    """A `name:& T` parameter can't be moved out of (AGAST #2231).
+
+    The caller keeps ownership of a lent value, so a by-value use in the
+    callee would give it two owners and two drops. Reads stay legal:
+    `test_reads_are_accepted` is what a blanket "any by-value use is an
+    error" would wrongly reject.
+    """
+
+    DEFS = drop_impl("Res") + """
+struct Res
+    h: i32
+
+struct Wrap
+    r: Res
+
+struct Deep
+    w: Wrap
+
+enum Slot
+    Full(Res)
+    Empty
+
+struct Box1
+    s: Slot
+
+impl Wrap
+    fn put(self: @Wrap, r:= Res) -> i32
+        return r.h
+
+fn eat(r:= Res) -> i32
+    return r.h
+
+fn see(r: @Res) -> i32
+    return r.h
+
+fn seep(r: *Res) -> i32
+    return r.h
+
+fn bump(r:& Res)
+    r.h += 1
+
+"""
+
+    @pytest.mark.parametrize("body, param", [
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return eat(t)
+""", "t", id="call_argument"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let u = t
+    return u.h
+""", "t", id="let"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    var u = t
+    return u.h
+""", "t", id="var"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let u: Res = t
+    return u.h
+""", "t", id="let_annotated_by_value"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    var p: *Res = t
+    return p.h
+""", "t", id="var_as_pointer"),
+        pytest.param("""
+fn f(t:& Res) -> Res
+    return t
+""", "t", id="return"),
+        pytest.param("""
+fn f(t:& Res) -> Res
+    t
+""", "t", id="tail"),
+        pytest.param("""
+fn f(t:& Res, c: i32) -> Res
+    if c == 1
+        t
+    else
+        Res { h: 2 }
+""", "t", id="if_tail"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    var u = Res { h: 2 }
+    u = t
+    return u.h
+""", "t", id="assignment"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let w = Wrap { r: t }
+    return w.r.h
+""", "t", id="struct_literal_field"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let s = Slot.Full(t)
+    return 0
+""", "t", id="variant_payload"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    var w = Wrap { r: Res { h: 1 } }
+    return w.put(t)
+""", "t", id="method_argument"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return eat((t))
+""", "t", id="grouped"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return eat(*t)
+""", "t", id="deref"),
+        pytest.param("""
+fn f(w:& Wrap) -> i32
+    return eat(w.r)
+""", "w", id="field"),
+        pytest.param("""
+fn f(d:& Deep) -> i32
+    return eat(d.w.r)
+""", "d", id="nested_field"),
+        pytest.param("""
+fn f(d:& Deep) -> i32
+    return eat((d.w).r)
+""", "d", id="grouped_nested_field"),
+        pytest.param("""
+fn f(d:& Deep) -> i32
+    let w = d.w
+    return w.r.h
+""", "d", id="nested_field_into_let"),
+        pytest.param("""
+impl Res
+    fn burn(self:& Res) -> i32
+        return eat(self)
+""", "self", id="mut_self"),
+    ])
+    def test_move_out_is_rejected(self, body, param):
+        errs = check(self.DEFS + body)
+        assert len(errs) == 1, errs
+        assert f"cannot move out of borrowed parameter `{param}`" in str(errs[0])
+
+    def test_ticket_repro(self):
+        """The program AGAST #2231 reported."""
+        errs = check(self.DEFS + """
+fn steal(t:& Res) -> i32
+    return eat(t)
+
+fn main() -> i32
+    var t = Res { h: 1 }
+    steal(t)
+    return 0
+""")
+        assert len(errs) == 1
+        assert "cannot move out of borrowed parameter `t`" in str(errs[0])
+
+    def test_rejected_move_does_not_mark_moved(self):
+        """Each by-value use is its own error, and neither says "moved":
+        the parameter still holds the caller's value."""
+        errs = check(self.DEFS + """
+fn f(t:& Res) -> i32
+    eat(t)
+    return eat(t)
+""")
+        assert len(errs) == 2
+        assert all("cannot move out of borrowed parameter `t`" in str(e) for e in errs)
+
+    def test_error_points_at_the_use(self):
+        errs = check(self.DEFS + """
+fn f(t:& Res) -> i32
+    return eat(t)
+""")
+        assert errs[0].span is not None and errs[0].span.column == 16
+
+    def test_reported_once_in_a_loop(self):
+        errs = check(self.DEFS + """
+fn f(t:& Res) -> i32
+    var i = 0
+    while i < 2
+        eat(t)
+        i += 1
+    return 0
+""")
+        assert len(errs) == 1
+
+    @pytest.mark.parametrize("body", [
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return t.h
+""", id="copy_field"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    bump(t)
+    bump(t)
+    return see(t) + seep(t)
+""", id="relend"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return see(@t)
+""", id="explicit_borrow"),
+        pytest.param("""
+fn touch<T>(v:& T) -> i32
+    return 1
+
+fn f(t:& Res) -> i32
+    return touch(t)
+""", id="relend_to_generic"),
+        pytest.param("""
+fn touch<T>(v:& T) -> i32
+    return 1
+
+fn f(t:& Res) -> i32
+    return touch<Res>(t)
+""", id="relend_to_explicit_generic"),
+        pytest.param("""
+impl Res
+    fn inc(self:& Res)
+        self.h += 1
+
+fn f(t:& Res) -> i32
+    t.inc()
+    return t.h
+""", id="method_receiver"),
+        pytest.param("""
+impl Wrap
+    fn poke(self: @Wrap, r:& Res) -> i32
+        return r.h
+
+fn f(t:& Res) -> i32
+    var w = Wrap { r: Res { h: 1 } }
+    return w.poke(t)
+""", id="relend_to_method_argument"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let p: @Res = t
+    return p.h
+""", id="let_as_reference"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let p: *Res = t
+    return p.h
+""", id="let_as_pointer"),
+        pytest.param("""
+fn f(w:& Wrap) -> i32
+    let p: @Res = w.r
+    return p.h
+""", id="let_field_as_reference"),
+        pytest.param("""
+fn f(w:& Wrap) -> i32
+    bump(w.r)
+    return w.r.h
+""", id="field_relend"),
+        pytest.param("""
+fn f(d:& Deep) -> i32
+    return d.w.r.h
+""", id="nested_copy_field"),
+        pytest.param("""
+fn f(s:& Slot) -> i32
+    match s
+        Full(r) => return r.h
+        Empty => return 0
+""", id="match_param"),
+        pytest.param("""
+fn f(s:& Slot) -> i32
+    match (s)
+        Full(_) => return 1
+        Empty => return 0
+""", id="match_grouped"),
+        pytest.param("""
+fn f(b:& Box1) -> i32
+    match b.s
+        Full(r) => return r.h
+        Empty => return 0
+""", id="match_field"),
+        pytest.param("""
+fn f(t:& [2]Res) -> i32
+    var n: i32 = 0
+    for r in t
+        n += 1
+    return n
+""", id="for_iterates_in_place"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    t = Res { h: 2 }
+    return t.h
+""", id="assign_through"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    t.h = 2
+    return t.h
+""", id="field_assign_through"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let t = Res { h: 3 }
+    return eat(t)
+""", id="shadowed_by_an_owner"),
+    ])
+    def test_reads_are_accepted(self, body):
+        assert check(self.DEFS + body) == []
+
+    @pytest.mark.parametrize("param", ["t: Res", "t:= Res"])
+    def test_owning_param_still_moves(self, param):
+        """Control: an owning parameter moves, so reuse is "use of moved"."""
+        errs = check(self.DEFS + f"""
+fn f({param}) -> i32
+    eat(t)
+    return eat(t)
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    def test_owned_match_still_moves(self):
+        """Control: only a lent scrutinee is a read."""
+        errs = check(self.DEFS + """
+fn f(s:= Slot) -> i32
+    match s
+        Full(r) => eat(r)
+        Empty => 0
+    match s
+        _ => 0
+""")
+        assert len(errs) == 1 and "use of moved value: `s`" in str(errs[0])
+
+    def test_annotated_let_of_an_owner_still_moves(self):
+        """Control: the reference-annotated `let` exemption is for lent
+        parameters; an owner's behaviour there is unchanged."""
+        errs = check(self.DEFS + """
+fn f(t:= Res) -> i32
+    let p: @Res = t
+    return t.h
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    def test_copy_param_is_not_a_move_out(self):
+        """Control: without Drop the value copies, so nothing moves."""
+        assert check("""
+struct P
+    x: i32
+
+fn take(p: P) -> i32
+    return p.x
+
+fn f(p:& P) -> i32
+    let q = p
+    let r = *p
+    return take(p) + q.x + r.x
+""") == []
+
+
 class TestLoopsMatchesTemporaries:
     """AGAST #2161: loop bodies see the previous iteration's moves, match
     arms start from the same state, and unowned move-only values are

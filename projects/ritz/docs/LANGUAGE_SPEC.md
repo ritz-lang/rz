@@ -1938,6 +1938,33 @@ fn main() -> i32
     n as i32
 ```
 
+The caller keeps ownership of what it lends, so a `name:& T` parameter of a
+move-only type can't be moved out of. Using the parameter by value, or using
+one of its move-only fields or `*name` by value, is an error. Everything that
+leaves the caller as the only owner is allowed: reading and writing through
+the parameter, lending it on, `match`ing or iterating over it, and binding it
+to a reference with `let p: @T = name`. `@T`, `@&T` and `*T` parameters aren't
+checked this way yet.
+
+```ritz expect-error="cannot move out of borrowed parameter `r`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn steal(r:& Resource) -> i32
+    consume(r)                      # error: r still belongs to the caller
+
+fn main() -> i32
+    var r = Resource { handle: 3 }
+    steal(r)
+```
+
 ### 13.5 Borrow Rules
 
 The rules are Rust's, minus the lifetimes:
