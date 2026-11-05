@@ -1953,9 +1953,31 @@ The caller keeps ownership of what it lends, so a `name:& T` parameter of a
 move-only type can't be moved out of. Using the parameter by value, or using
 one of its move-only fields or `*name` by value, is an error. Everything that
 leaves the caller as the only owner is allowed: reading and writing through
-the parameter, lending it on, `match`ing or iterating over it, binding it to a
-reference with `let p: @T = name`, and storing it in a reference field. `@T`,
-`@&T` and `*T` parameters aren't checked this way yet.
+the parameter, lending it on, `match`ing or iterating over it, and putting it
+in a reference. `@T`, `@&T` and `*T` parameters aren't checked this way yet.
+
+A `name:& T` parameter reads as its referent, except where the value lands in
+an `@T` or `@&T`, or a `*T` of a struct or array: that takes the borrow's
+pointer. The destination decides, at `let`, `var`, `=`, `return`, a function's
+tail, a field, an array or tuple element and a cast, and through an `if` or
+`match` arm of any of these. Binding one with `let` or `var` counts as `@name`
+or `@&name` for §13.5, and the type behind the reference must be `T`.
+
+```ritz
+struct Counter
+    n: i32
+
+fn bump(c:& Counter) -> @&Counter
+    let p: @&Counter = c            # p refers to the caller's Counter
+    p.n = p.n + 1
+    return c                        # and so does the result
+
+fn main() -> i32
+    var c = Counter { n: 1 }
+    let r = bump(@&c)
+    r.n = r.n + 1
+    c.n
+```
 
 ```ritz expect-error="cannot move out of borrowed parameter `r`"
 struct Resource
@@ -1994,6 +2016,8 @@ let q = @&x
 
 There are no lifetime annotations and no generic lifetime parameters; escape
 analysis is not performed, so returning a reference to a local is not caught.
+Nor is a `name:& T` parameter returned as a reference outliving what the caller
+lent: the result refers to the caller's value, and that value must outlive it.
 
 ### 13.6 Drop
 

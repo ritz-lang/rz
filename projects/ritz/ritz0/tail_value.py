@@ -102,3 +102,44 @@ def value_gap(node, yields_nothing=lambda expr: False) -> Optional[rast.Node]:
     if isinstance(node, rast.Ident) and node.name == 'pass':
         return node
     return node if yields_nothing(node) else None
+
+
+def value_tails(node):
+    """The expressions `node`'s value comes from.
+
+    The node itself, or (recursively) an if branch's or block's trailing
+    expression, or a match arm's body. Parentheses leave no node to see through.
+    """
+    if isinstance(node, rast.Block):
+        if node.expr is not None:
+            yield from value_tails(node.expr)
+    elif isinstance(node, rast.If):
+        yield from value_tails(node.then_block)
+        if node.else_block is not None:
+            yield from value_tails(node.else_block)
+    elif isinstance(node, rast.Match):
+        for arm in node.arms:
+            yield from value_tails(arm.body)
+    elif node is not None:
+        yield node
+
+
+def slot_tails(slot, node, resolve=lambda ty: ty):
+    """(expression, the type of the slot it lands in) for each of `node`'s
+    value tails, when `node` lands in a `slot`-typed place: an array or tuple
+    literal's elements land in that type's elements. `resolve` sees through
+    the caller's type aliases.
+    """
+    slot = resolve(slot)
+    for tail in value_tails(node):
+        if isinstance(tail, rast.ArrayLit) and isinstance(slot, rast.ArrayType):
+            for element in tail.elements:
+                yield from slot_tails(slot.inner, element, resolve)
+        elif isinstance(tail, rast.ArrayFill) and isinstance(slot, rast.ArrayType):
+            yield from slot_tails(slot.inner, tail.value, resolve)
+        elif (isinstance(tail, rast.TupleLit) and isinstance(slot, rast.TupleType)
+                and len(tail.elements) == len(slot.elements)):
+            for element, element_slot in zip(tail.elements, slot.elements):
+                yield from slot_tails(element_slot, element, resolve)
+        else:
+            yield tail, slot

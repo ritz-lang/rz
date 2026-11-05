@@ -2419,6 +2419,28 @@ pub fn main() -> i32
     f(@n)
     return n
 """,
+    "var": """\
+fn f(n:& i32)
+    var p: *i32 = n
+    *p = 3
+
+pub fn main() -> i32
+    var n: i32 = 1
+    f(@n)
+    return n
+""",
+    "alias": """\
+type IP = *i32
+
+fn f(n:& i32)
+    let p: IP = n
+    *p = 3
+
+pub fn main() -> i32
+    var n: i32 = 1
+    f(@n)
+    return n
+""",
     "return": """\
 fn f(n:& i32) -> *i32
     return n
@@ -2426,6 +2448,16 @@ fn f(n:& i32) -> *i32
 pub fn main() -> i32
     var n: i32 = 1
     let p: *i32 = f(@n)
+    *p = 3
+    return n
+""",
+    "generic_return": """\
+fn id<T>(n:& T) -> *T
+    return n
+
+pub fn main() -> i32
+    var n: i32 = 1
+    let p: *i32 = id<i32>(@n)
     *p = 3
     return n
 """,
@@ -2879,8 +2911,8 @@ def test_by_value_slot_of_another_type_is_refused(ritz1_bin, tmp_path, compiler,
     assert re.search(r"defined with type|doesn't match function result type", link.stderr), link.stderr
 
 
-# ritz0 can't return a reference from a `:&` yet (#2249), so this is ritz1's:
-# the fn's return type decides, and only a by-value one reads the referent.
+# The fn's return type decides, and only a by-value one reads the referent.
+# test_borrow_param_ref_slot.py has the rest of #2249's slots.
 RETURNS_THE_BORROW = {
     "pointer": TYPES + """
 fn f(c:& C) -> *C
@@ -2925,9 +2957,10 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 @pytest.mark.parametrize("name", sorted(RETURNS_THE_BORROW))
-def test_ritz1_reference_return_keeps_the_borrow(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, RETURNS_THE_BORROW[name]) == 3
+def test_reference_return_keeps_the_borrow(ritz1_bin, tmp_path, compiler, name):
+    assert _run(compiler, ritz1_bin, tmp_path, name, RETURNS_THE_BORROW[name]) == 3
 
 
 # The strict xfails say these aren't done; this says what they do meanwhile.

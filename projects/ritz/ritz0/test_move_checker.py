@@ -829,11 +829,6 @@ fn f(t:& Res) -> i32
     return u.h
 """, "t", id="let_annotated_by_value"),
         pytest.param("""
-fn f(t:& Res) -> i32
-    var p: *Res = t
-    return p.h
-""", "t", id="var_as_pointer"),
-        pytest.param("""
 fn f(t:& Res) -> Res
     return t
 """, "t", id="return"),
@@ -1031,6 +1026,48 @@ fn f(t:& Res) -> i32
     return p.h
 """, id="let_as_pointer"),
         pytest.param("""
+fn f(t:& Res) -> i32
+    var p: @Res = t
+    return p.h
+""", id="var_as_reference"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    var p: *Res = t
+    return p.h
+""", id="var_as_pointer"),
+        pytest.param("""
+fn f(t:& Res) -> @&Res
+    return t
+""", id="return_as_reference"),
+        pytest.param("""
+fn f(t:& Res) -> *Res
+    t
+""", id="tail_as_pointer"),
+        pytest.param("""
+fn f(t:& Res, k: i32) -> @Res
+    if k == 0
+        t
+    else
+        t
+""", id="if_arm_as_reference"),
+        pytest.param("""
+fn f(t:& Res, k: i32) -> @Res
+    match k
+        0 => return t
+        _ => t
+""", id="match_arm_as_reference"),
+        pytest.param("""
+fn f(t:& Res, u: @Res) -> i32
+    var p: @Res = u
+    p = t
+    return p.h
+""", id="assigned_to_a_reference"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    var a: [1]@Res = [t]
+    return a[0].h
+""", id="array_element_as_reference"),
+        pytest.param("""
 fn f(w:& Wrap) -> i32
     let p: @Res = w.r
     return p.h
@@ -1087,6 +1124,16 @@ fn f(t:& Res) -> i32
     ])
     def test_reads_are_accepted(self, body):
         assert check(self.DEFS + body) == []
+
+    def test_owner_shadowing_a_lent_param_still_moves(self):
+        """A reference slot lends a `:&` param, not whatever has its name."""
+        errs = check(self.DEFS + """
+fn f(t:& Res) -> i32
+    var t: Res = Res { h: 1 }
+    var p: @Res = t
+    return t.h
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
 
     @pytest.mark.parametrize("param", ["t: Res", "t:= Res"])
     def test_owning_param_still_moves(self, param):
