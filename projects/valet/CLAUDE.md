@@ -80,7 +80,7 @@ lib/tls.ritz, lib/tls/  TLS 1.3 termination (via cryptosec)
 
 | Module | Purpose |
 |--------|---------|
-| `async_tasks.ritz` | TaskPool, TaskServer, event loop |
+| `async/tasks.ritz` | TaskPool, TaskServer, event loop |
 | `uring.ritz` | io_uring syscall wrappers |
 | `async_net.ritz` | TCP socket helpers |
 | `iovec.ritz` | Vectored I/O builder |

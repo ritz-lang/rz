@@ -2,6 +2,11 @@
 
 High-performance async I/O with explicit, opt-in threading for CPU-bound work.
 
+> **Status: design sketch.** The API below (`async.run`, `async.spawn`, `.await`
+> on methods, `TcpListener`, `ritzlib.async.fs`) does not exist. What ritzlib has
+> today is `ritzlib.async.tasks` (a task pool and TCP server on one io_uring) and
+> `ritzlib.async.runtime` (`block_on` for one future). See `STDLIB_REFERENCE.md`.
+
 ## Design Philosophy
 
 1. **Async-first for I/O** — io_uring-based, zero-copy where possible

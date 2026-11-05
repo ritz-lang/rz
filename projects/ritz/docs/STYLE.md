@@ -136,13 +136,13 @@ Use **snake_case** for module and file names:
 ritzlib/
     memory.ritz
     hash_map.ritz
-    async_tasks.ritz
+    async_net.ritz
     io.ritz
 ```
 
 **Guidelines:**
 - Module names should be short but descriptive
-- Use underscores to separate words: `async_runtime`, not `asyncruntime`
+- Use underscores to separate words: `async_net`, not `asyncnet`
 - Avoid redundant prefixes: `json.ritz`, not `json_parser.ritz`
 
 ---
@@ -496,10 +496,9 @@ Use a directory structure:
 
 ```
 async/
-    mod.ritz       # Re-exports, main interface
-    executor.ritz  # Async executor
-    task.ritz      # Task definition
-    io.ritz        # Async I/O operations
+    tasks.ritz        # Task pool, event loop, TCP server
+    runtime.ritz      # block_on for a single future
+    blocking_fs.ritz  # Blocking file calls behind `async fn`
 ```
 
 ---
@@ -1459,7 +1458,7 @@ fn fetch_user(id: i64) -> Result<User, DbError>
 | Enum Variants | PascalCase | `Some`, `None`, `Ok`, `Err` |
 | Constants | SCREAMING_SNAKE | `MAX_SIZE`, `TOK_EOF` |
 | Type Parameters | Single uppercase | `T`, `K`, `V`, `E` |
-| Modules | snake_case | `async_tasks`, `hash_map` |
+| Modules | snake_case | `async_net`, `hash_map` |
 
 ### Ownership Modifiers
 

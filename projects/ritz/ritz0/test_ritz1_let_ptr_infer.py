@@ -6,7 +6,7 @@ unannotated pointer/reference local so member access through it works.
 left the local typed as a bare i64. Member access through it then failed with
 "unhandled EXPR_MEMBER", and a store through it was silently dropped (#1439):
 
-* `let p = raw as *P` (ritzlib/async/task.ritz's task_get_ring)
+* `let p = raw as *P` (ritzlib/async/tasks.ritz's task_yield)
 * `let m = get(l)` where `get` returns a reference `@L` / `@&L` (iris)
 
 Every runnable program returns 42 only if the right field was read (or
@@ -347,14 +347,14 @@ def test_ritz1_already_working_forms(ritz1_bin, tmp_path, name):
 
 
 @pytest.mark.integration
-def test_ritz1_compiles_async_task_standalone(ritz1_bin, tmp_path):
-    """The ticket's original victim: ritzlib/async/task.ritz on its own."""
-    ll = tmp_path / "task.ll"
+def test_ritz1_compiles_async_tasks_standalone(ritz1_bin, tmp_path):
+    """The ticket's original victim, ritzlib/async/tasks.ritz, on its own."""
+    ll = tmp_path / "tasks.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     proc = subprocess.run(
         [
             str(RITZ1_BIN),
-            str(RITZ_ROOT / "ritzlib" / "async" / "task.ritz"),
+            str(RITZ_ROOT / "ritzlib" / "async" / "tasks.ritz"),
             "-o",
             str(ll),
         ],

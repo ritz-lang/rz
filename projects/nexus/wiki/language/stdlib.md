@@ -16,8 +16,8 @@ The Ritz standard library (ritzlib) provides 35 modules covering system calls, I
 | `fs` | Filesystem operations |
 | `str` | String utilities |
 | `async` | Async runtime |
-| `async_tasks` | Async task management |
-| `async_fs` | Async filesystem I/O |
+| `async.tasks` | Async task management |
+| `async.blocking_fs` | Blocking file calls behind `async fn` |
 | `async_net` | Async network I/O |
 | `uring` | io_uring bindings |
 | `args` | Command-line argument parsing |
@@ -301,7 +301,7 @@ let json_str = to_json(obj)
 
 ## uring — io_uring
 
-Low-level io_uring interface. Most users should use `async_net` or `async_fs` instead.
+Low-level io_uring interface. Most users should use `async_net` or `async.tasks` instead.
 
 ```ritz
 import ritzlib.uring { Ring, Op }

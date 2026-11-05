@@ -111,10 +111,9 @@ async fn echo_handler(conn: &mut Connection) -> Result<(), Error>
 | File | Purpose |
 |------|---------|
 | `ritzlib/uring.ritz` | io_uring syscall bindings |
-| `ritzlib/async_tasks.ritz` | TaskPool, TaskServer, event loop |
-| `ritzlib/async_runtime.ritz` | Runtime, block_on |
+| `ritzlib/async/tasks.ritz` | TaskPool, TaskServer, event loop |
+| `ritzlib/async/runtime.ritz` | Runtime, block_on |
 | `ritzlib/async_net.ritz` | Socket helpers |
-| `ritzlib/executor.ritz` | Alternative executor design |
 | `ritz0/async_transform_v2.py` | Compiler transformation |
 
 ### 2.3 Poll Convention

@@ -5,7 +5,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
-import ritzlib.executor
+import ritzlib.async.runtime
 
 # ============================================================================
 # Test 1: Direct function pointer call
@@ -82,15 +82,15 @@ fn test_simple_block_on() -> i32
 # ============================================================================
 
 # ============================================================================
-# Test 3: Executor init/destroy
+# Test 3: Runtime init/destroy
 # ============================================================================
 
 fn test_executor_init() -> i32
     prints("test_executor_init... ")
 
-    var exec: Executor
+    var rt: Runtime
     prints("calling init... ")
-    let ret: i32 = executor_init(@exec)
+    let ret: i32 = runtime_init(@rt)
     print_int(ret as i64)
     prints("\n")
 
@@ -99,17 +99,17 @@ fn test_executor_init() -> i32
         return 1
 
     prints("calling destroy... ")
-    executor_destroy(@exec)
+    runtime_destroy(@rt)
     prints("done\n")
 
     prints("OK\n")
     return 0
 
 # ============================================================================
-# Test 4: block_on with Executor
+# Test 4: block_on with Runtime
 # ============================================================================
 
-fn my_block_on(exec: *Executor, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+fn my_block_on(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
     prints("my_block_on: entering\n")
     prints("my_block_on: calling poll_fn\n")
     let result: i32 = poll_fn(future_ptr)
@@ -119,8 +119,8 @@ fn my_block_on(exec: *Executor, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
 fn test_executor_block_on() -> i32
     prints("test_executor_block_on... ")
 
-    var exec: Executor
-    let init_ret: i32 = executor_init(@exec)
+    var rt: Runtime
+    let init_ret: i32 = runtime_init(@rt)
     if init_ret < 0
         prints("FAIL: init failed\n")
         return 1
@@ -131,7 +131,7 @@ fn test_executor_block_on() -> i32
     # First test local block_on
     prints("calling my_block_on... ")
     let poll_fn1: fn(*u8) -> i32 = simple_poll
-    let result1: i32 = my_block_on(@exec, @future as *u8, poll_fn1)
+    let result1: i32 = my_block_on(@rt, @future as *u8, poll_fn1)
     prints("local got ")
     print_int(result1 as i64)
     prints("\n")
@@ -140,12 +140,12 @@ fn test_executor_block_on() -> i32
     future.value = 88  # Different value
     prints("calling imported block_on... ")
     let poll_fn2: fn(*u8) -> i32 = simple_poll
-    let result: i32 = block_on(@exec, @future as *u8, poll_fn2)
+    let result: i32 = block_on(@rt, @future as *u8, poll_fn2)
     prints("got ")
     print_int(result as i64)
     prints("\n")
 
-    executor_destroy(@exec)
+    runtime_destroy(@rt)
 
     if result != 88
         prints("FAIL: expected 88, got ")
@@ -157,12 +157,12 @@ fn test_executor_block_on() -> i32
     return 0
 
 # ============================================================================
-# Test 5: Pipe I/O with executor
+# Test 5: Pipe I/O with Runtime
 # ============================================================================
 
 struct PipeReadFuture
     state: i32
-    exec: *Executor
+    rt: *Runtime
     read_fd: i32
     buf: [16]u8
     bytes_read: i32
@@ -172,10 +172,10 @@ fn piperead_poll(self_ptr: *u8) -> i32
 
     if self.state == 0
         # State 0: Submit read request
-        let exec_ptr: *Executor = self.exec
+        let rt_ptr: *Runtime = self.rt
         let fd: i32 = self.read_fd
         let buf_ptr: *u8 = @self.buf[0]
-        let result: i32 = exec_async_read(exec_ptr, fd, buf_ptr, 16, 0)
+        let result: i32 = runtime_poll_read(rt_ptr, fd, buf_ptr, 16, 0)
 
         if result == POLL_PENDING
             self.state = 1
@@ -188,10 +188,10 @@ fn piperead_poll(self_ptr: *u8) -> i32
 
     if self.state == 1
         # State 1: Waiting for read completion - check waker_io_result
-        let exec_ptr: *Executor = self.exec
-        let io_res: i32 = exec_ptr.waker_io_result
+        let rt_ptr: *Runtime = self.rt
+        let io_res: i32 = rt_ptr.waker_io_result
         if io_res != 0
-            exec_ptr.waker_io_result = 0
+            rt_ptr.waker_io_result = 0
             self.bytes_read = io_res
             self.state = 2
             return io_res
@@ -199,7 +199,7 @@ fn piperead_poll(self_ptr: *u8) -> i32
         # Still pending - re-register
         let fd: i32 = self.read_fd
         let buf_ptr: *u8 = @self.buf[0]
-        let result: i32 = exec_async_read(exec_ptr, fd, buf_ptr, 16, 0)
+        let result: i32 = runtime_poll_read(rt_ptr, fd, buf_ptr, 16, 0)
         return result
 
     # State 2: Already completed
@@ -208,8 +208,8 @@ fn piperead_poll(self_ptr: *u8) -> i32
 fn test_pipe_io() -> i32
     prints("test_pipe_io... ")
 
-    var exec: Executor
-    let init_ret: i32 = executor_init(@exec)
+    var rt: Runtime
+    let init_ret: i32 = runtime_init(@rt)
     if init_ret < 0
         prints("FAIL: executor init failed\n")
         return 1
@@ -219,7 +219,7 @@ fn test_pipe_io() -> i32
     let pipe_ret: i32 = sys_pipe(@fds[0])
     if pipe_ret < 0
         prints("FAIL: pipe creation failed\n")
-        executor_destroy(@exec)
+        runtime_destroy(@rt)
         return 1
 
     let read_fd: i32 = fds[0]
@@ -238,7 +238,7 @@ fn test_pipe_io() -> i32
     # Create the future
     var future: PipeReadFuture
     future.state = 0
-    future.exec = @exec
+    future.rt = @rt
     future.read_fd = read_fd
     future.bytes_read = 0
 
@@ -250,12 +250,12 @@ fn test_pipe_io() -> i32
 
     # Run the future
     let poll_fn: fn(*u8) -> i32 = piperead_poll
-    let result: i32 = block_on(@exec, @future as *u8, poll_fn)
+    let result: i32 = block_on(@rt, @future as *u8, poll_fn)
 
     # Clean up
     sys_close(read_fd)
     sys_close(write_fd)
-    executor_destroy(@exec)
+    runtime_destroy(@rt)
 
     if result < 0
         prints("FAIL: read returned error ")

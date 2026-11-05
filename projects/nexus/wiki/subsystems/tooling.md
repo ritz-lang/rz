@@ -57,13 +57,13 @@ Ritzlib provides 35 modules covering everything from system calls to async I/O:
 | `hashmap.ritz` | Hash table |
 | `fs.ritz` | Filesystem operations |
 | `str.ritz` | String utilities |
-| `async.ritz` | Async runtime |
-| `async_tasks.ritz` | Async task management |
+| `async/runtime.ritz` | `block_on` for a single future |
+| `async/tasks.ritz` | Async task management |
 | `uring.ritz` | io_uring bindings |
 | `args.ritz` | Argument parsing |
 | `json.ritz` | JSON parsing and serialization |
 | `process.ritz` | Process spawning |
-| `async_fs.ritz` | Async filesystem I/O |
+| `async/blocking_fs.ritz` | Blocking file calls behind `async fn` |
 | `async_net.ritz` | Async network I/O |
 
 ### Key Statistics

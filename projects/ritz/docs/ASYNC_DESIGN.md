@@ -125,7 +125,10 @@ The state machine compiles to:
 
 ## Runtime Components
 
-### Executor (`ritzlib/async.ritz`)
+### Executor (proposed)
+
+This is the design, not the code. ritzlib today has `ritzlib/async/tasks.ritz` for
+many tasks and `ritzlib/async/runtime.ritz` for `block_on`.
 
 ```ritz
 struct Executor

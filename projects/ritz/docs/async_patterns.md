@@ -72,7 +72,7 @@ This is the pattern Valet should use for socket operations:
 ### Step 1: State Struct
 ```ritz
 struct IoReadState
-    exec: *Executor
+    rt: *Runtime
     fd: i32
     buf: *u8
     len: i32
@@ -84,17 +84,17 @@ struct IoReadState
 
 ```ritz
 fn poll_io_read(state: *IoReadState) -> i32
-    let exec: *Executor = state.exec
+    let rt: *Runtime = state.rt
 
     # Check if we already have a result from io_uring completion
-    if exec.waker_io_result != 0
-        let res: i32 = exec.waker_io_result
-        exec.waker_io_result = 0
+    if rt.waker_io_result != 0
+        let res: i32 = rt.waker_io_result
+        rt.waker_io_result = 0
         state.result = res
         return res
 
     # Submit async read to io_uring
-    return exec_async_read(exec, state.fd, state.buf, state.len, 0)
+    return runtime_poll_read(rt, state.fd, state.buf, state.len, 0)
 ```
 
 ### Step 3: Async Wrapper
@@ -111,38 +111,36 @@ fn do_async_read_wrapper(future_ptr: *u8) -> i32
     return do_async_read_poll(future)
 ```
 
-### Step 5: Usage with Executor
+### Step 5: Usage with Runtime
 ```ritz
 fn main() -> i32
-    var exec: Executor
-    executor_init(&exec)
+    var rt: Runtime
+    runtime_init(&rt)
 
     var state: IoReadState
-    state.exec = &exec
+    state.rt = &rt
     state.fd = some_fd
     state.buf = &buffer[0]
     state.len = buffer_size
 
     var future: do_async_read_Future = do_async_read(&state)
     let poll_fn: fn(*u8) -> i32 = do_async_read_wrapper
-    let result: i32 = block_on(&exec, &future as *u8, poll_fn)
+    let result: i32 = block_on(&rt, &future as *u8, poll_fn)
 
-    executor_destroy(&exec)
+    runtime_destroy(&rt)
     result
 ```
 
 ## Available Async I/O Primitives
 
-From `ritzlib/executor.ritz`:
+From `ritzlib/async/runtime.ritz`:
 
 | Function | Purpose |
 |----------|---------|
-| `exec_async_read(exec, fd, buf, len, offset)` | Async file/pipe read |
-| `exec_async_write(exec, fd, buf, len, offset)` | Async file/pipe write |
-| `exec_async_accept(exec, fd, addr, addrlen, flags)` | Async socket accept |
-| `exec_async_recv(exec, fd, buf, len, flags)` | Async socket recv |
-| `exec_async_send(exec, fd, buf, len, flags)` | Async socket send |
-| `exec_async_close(exec, fd)` | Async close |
+| `runtime_poll_read(rt, fd, buf, len, offset)` | Async file/pipe read |
+| `runtime_poll_write(rt, fd, buf, len, offset)` | Async file/pipe write |
+
+For sockets, use the `task_*` operations in `ritzlib/async/tasks.ritz`.
 
 ## Valet Refactoring Guide
 
@@ -181,7 +179,7 @@ async fn connection_handler(state: *ConnectionState) -> i32
 
 1. **No Future trait** - Ritz uses generated `_Future` structs and `_poll` functions
 2. **No Pin** - Futures are regular stack values
-3. **No async runtime** - Use `block_on` with `Executor` directly
+3. **No async runtime** - Use `block_on` with `Runtime` directly
 4. **Poll encoding** - Uses i32 (-1 = Pending, >= 0 = Ready) not enum
 
 ## Testing
@@ -229,7 +227,7 @@ spawn(&pool, &my_future as *u8, my_poll_fn)
 ```
 
 **Implementation**: Wire `async fn` futures to existing `TaskPool.spawn_task()`.
-Infrastructure exists in `async_tasks.ritz`, needs adapter layer.
+Infrastructure exists in `async/tasks.ritz`, needs adapter layer.
 
 **Effort**: 1-2 days
 

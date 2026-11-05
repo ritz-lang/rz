@@ -18,7 +18,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
-import ritzlib.executor
+import ritzlib.async.runtime
 
 # ============================================================================
 # Test 1: Simple async function (no await)
@@ -166,7 +166,7 @@ fn test_await_in_sync() -> i32
     return 0
 
 # ============================================================================
-# Test 6: Using block_on with Executor (I/O-ready pattern)
+# Test 6: Using block_on with Runtime (I/O-ready pattern)
 # ============================================================================
 
 async fn compute_with_executor(x: i32) -> i32
@@ -180,17 +180,17 @@ fn compute_wrapper(future_ptr: *u8) -> i32
 fn test_block_on() -> i32
     prints("test_block_on... ")
 
-    var exec: Executor
-    let init_ret: i32 = executor_init(@exec)
+    var rt: Runtime
+    let init_ret: i32 = runtime_init(@rt)
     if init_ret < 0
         prints("FAIL: executor init\n")
         return 1
 
     var future: compute_with_executor_Future = compute_with_executor(4)
     let poll_fn: fn(*u8) -> i32 = compute_wrapper
-    let result: i32 = block_on(@exec, @future as *u8, poll_fn)
+    let result: i32 = block_on(@rt, @future as *u8, poll_fn)
 
-    executor_destroy(@exec)
+    runtime_destroy(@rt)
 
     # Expected: 4 * 11 = 44
     if result != 44
@@ -203,11 +203,11 @@ fn test_block_on() -> i32
     return 0
 
 # ============================================================================
-# Test 7: Async I/O with exec_async_read pattern
+# Test 7: Async I/O with runtime_poll_read pattern
 # ============================================================================
 #
 # This demonstrates the IDIOMATIC pattern for async I/O in Ritz:
-# 1. Create a state struct that holds executor + I/O params
+# 1. Create a state struct that holds runtime + I/O params
 # 2. Create a poll function that uses the state
 # 3. Wrap it in an async fn
 # 4. Use await to suspend until I/O completes
@@ -216,27 +216,27 @@ fn test_block_on() -> i32
 
 # State struct for async read
 struct IoReadState
-    exec: *Executor
+    rt: *Runtime
     fd: i32
     buf: *u8
     len: i32
     result: i32
 
 # Poll function for async read - returns Poll encoding
-# Note: Must check waker_io_result before calling exec_async_read
+# Note: Must check waker_io_result before calling runtime_poll_read
 # to properly handle the completion notification from block_on.
 fn poll_io_read(state: *IoReadState) -> i32
-    let exec: *Executor = state.exec
+    let rt: *Runtime = state.rt
 
     # Check if we already have a result from io_uring completion
-    if exec.waker_io_result != 0
-        let res: i32 = exec.waker_io_result
-        exec.waker_io_result = 0
+    if rt.waker_io_result != 0
+        let res: i32 = rt.waker_io_result
+        rt.waker_io_result = 0
         state.result = res
         return res
 
     # Submit async read to io_uring
-    return exec_async_read(exec, state.fd, state.buf, state.len, 0)
+    return runtime_poll_read(rt, state.fd, state.buf, state.len, 0)
 
 # Clean async read - wraps poll function in async
 # This is the pattern we want Valet and other apps to use!
@@ -252,8 +252,8 @@ fn do_async_read_wrapper(future_ptr: *u8) -> i32
 fn test_async_io() -> i32
     prints("test_async_io... ")
 
-    var exec: Executor
-    let init_ret: i32 = executor_init(@exec)
+    var rt: Runtime
+    let init_ret: i32 = runtime_init(@rt)
     if init_ret < 0
         prints("FAIL: executor init\n")
         return 1
@@ -263,7 +263,7 @@ fn test_async_io() -> i32
     let pipe_ret: i32 = sys_pipe(@fds[0])
     if pipe_ret < 0
         prints("FAIL: pipe\n")
-        executor_destroy(@exec)
+        runtime_destroy(@rt)
         return 1
 
     let read_fd: i32 = fds[0]
@@ -283,7 +283,7 @@ fn test_async_io() -> i32
 
     # Set up read state
     var state: IoReadState
-    state.exec = @exec
+    state.rt = @rt
     state.fd = read_fd
     state.buf = @buf[0]
     state.len = 64
@@ -292,12 +292,12 @@ fn test_async_io() -> i32
     # Run async read - this demonstrates the clean pattern!
     var future: do_async_read_Future = do_async_read(@state)
     let poll_fn: fn(*u8) -> i32 = do_async_read_wrapper
-    let result: i32 = block_on(@exec, @future as *u8, poll_fn)
+    let result: i32 = block_on(@rt, @future as *u8, poll_fn)
 
     # Cleanup
     sys_close(read_fd)
     sys_close(write_fd)
-    executor_destroy(@exec)
+    runtime_destroy(@rt)
 
     # Verify result
     if result != 3

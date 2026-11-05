@@ -4,14 +4,14 @@
 # - `async fn` keyword for async functions
 # - `await` keyword to suspend at I/O points
 # - Compiler-generated state machines (Future struct + poll fn)
-# - Executor's block_on() to drive futures to completion
+# - Runtime's block_on() to drive futures to completion
 #
 # This is NOT hand-written state machines - the compiler does the work!
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
-import ritzlib.executor
+import ritzlib.async.runtime
 
 # ============================================================================
 # Async I/O primitives that return Poll values
@@ -22,9 +22,9 @@ import ritzlib.executor
 #   >= 0 = Ready with result value
 
 # Synchronous wrapper to submit and wait for io_uring read
-fn poll_read(exec: *Executor, fd: i32, buf: *u8, len: i32) -> i32
+fn poll_read(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i32
     # Submit read to io_uring
-    let result: i32 = exec_async_read(exec, fd, buf, len, 0)
+    let result: i32 = runtime_poll_read(rt, fd, buf, len, 0)
     return result
 
 # ============================================================================
@@ -101,8 +101,8 @@ fn compute_value_poll_wrapper(future_ptr: *u8) -> i32
 fn test_block_on_async() -> i32
     prints("test_block_on_async... ")
 
-    var exec: Executor
-    let init_ret: i32 = executor_init(@exec)
+    var rt: Runtime
+    let init_ret: i32 = runtime_init(@rt)
     if init_ret < 0
         prints("FAIL: executor init\n")
         return 1
@@ -112,9 +112,9 @@ fn test_block_on_async() -> i32
 
     # Run with block_on
     let poll_fn: fn(*u8) -> i32 = compute_value_poll_wrapper
-    let result: i32 = block_on(@exec, @future as *u8, poll_fn)
+    let result: i32 = block_on(@rt, @future as *u8, poll_fn)
 
-    executor_destroy(@exec)
+    runtime_destroy(@rt)
 
     # Expected: 15 * 2 + 1 = 31
     if result != 31
@@ -132,7 +132,7 @@ fn test_block_on_async() -> i32
 
 # This struct holds the async read state
 struct AsyncReadState
-    exec: *Executor
+    rt: *Runtime
     fd: i32
     buf: *u8
     len: i32
@@ -140,20 +140,20 @@ struct AsyncReadState
 
 # Poll function for async read - returns Poll encoding
 fn async_read_poll(state: *AsyncReadState) -> i32
-    let exec: *Executor = state.exec
+    let rt: *Runtime = state.rt
     let fd: i32 = state.fd
     let buf: *u8 = state.buf
     let len: i32 = state.len
 
     # Check if we already have a result from io_uring completion
-    if exec.waker_io_result != 0
-        let res: i32 = exec.waker_io_result
-        exec.waker_io_result = 0
+    if rt.waker_io_result != 0
+        let res: i32 = rt.waker_io_result
+        rt.waker_io_result = 0
         state.result = res
         return res
 
     # Submit async read to io_uring
-    let result: i32 = exec_async_read(exec, fd, buf, len, 0)
+    let result: i32 = runtime_poll_read(rt, fd, buf, len, 0)
     return result
 
 # Async function that reads from a file descriptor
@@ -169,8 +169,8 @@ fn async_read_fd_poll_wrapper(future_ptr: *u8) -> i32
 fn test_async_pipe_read() -> i32
     prints("test_async_pipe_read... ")
 
-    var exec: Executor
-    let init_ret: i32 = executor_init(@exec)
+    var rt: Runtime
+    let init_ret: i32 = runtime_init(@rt)
     if init_ret < 0
         prints("FAIL: executor init\n")
         return 1
@@ -180,7 +180,7 @@ fn test_async_pipe_read() -> i32
     let pipe_ret: i32 = sys_pipe(@fds[0])
     if pipe_ret < 0
         prints("FAIL: pipe\n")
-        executor_destroy(@exec)
+        runtime_destroy(@rt)
         return 1
 
     let read_fd: i32 = fds[0]
@@ -200,7 +200,7 @@ fn test_async_pipe_read() -> i32
         read_buf[i] = 0
 
     var read_state: AsyncReadState
-    read_state.exec = @exec
+    read_state.rt = @rt
     read_state.fd = read_fd
     read_state.buf = @read_buf[0]
     read_state.len = 16
@@ -211,12 +211,12 @@ fn test_async_pipe_read() -> i32
 
     # Run with block_on
     let poll_fn: fn(*u8) -> i32 = async_read_fd_poll_wrapper
-    let result: i32 = block_on(@exec, @future as *u8, poll_fn)
+    let result: i32 = block_on(@rt, @future as *u8, poll_fn)
 
     # Cleanup
     sys_close(read_fd)
     sys_close(write_fd)
-    executor_destroy(@exec)
+    runtime_destroy(@rt)
 
     if result < 0
         prints("FAIL: read error ")

@@ -10491,7 +10491,7 @@ class LLVMEmitter:
                     # `*T` param whose pointee matches the arg's inferred named
                     # type. Inference is not authoritative here: an Ident
                     # *holding* a `*Task` can infer as `Task` (ritzlib
-                    # async_tasks.ritz), and taking its lvalue address would
+                    # async/tasks.ritz), and taking its lvalue address would
                     # pass `Task**`. Decide from the actual emitted types:
                     #   - lvalue address matches the param -> borrow in place
                     #   - emitted value matches the param  -> already a pointer

@@ -35,12 +35,10 @@ Currently (as of January 2026), ritzlib is a flat collection of 35 modules:
 
 **Async & networking:**
 - `uring.ritz` - Linux io_uring kernel interface (598 lines, 24 functions)
-- `async.ritz` - Async types (Poll, Waker, Context)
-- `async_tasks.ritz` - Task pool and event loop (499 lines)
+- `async/tasks.ritz` - Task pool, event loop and TCP server
 - `async_net.ritz` - Async network operations
-- `async_runtime.ritz` - Async runtime wrapper
-- `async_fs.ritz` - Async file operations
-- `executor.ritz` - Task executor
+- `async/runtime.ritz` - `block_on` for a single future
+- `async/blocking_fs.ritz` - Blocking file calls behind `async fn`
 
 **Utilities:**
 - `hashmap.ritz`, `hash.ritz` - Hash tables

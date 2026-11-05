@@ -1,15 +1,13 @@
-# test_async_server.ritz - Test the async server framework
+# test_async_server.ritz - Test ritzlib's async runtime
 #
-# This test verifies that the new async module compiles and the
-# basic patterns work correctly.
+# ritzlib.async.tasks runs N tasks on one ring; ritzlib.async.runtime drives one
+# future.  These tests schedule real work through both.
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
-import ritzlib.async.task
-import ritzlib.async.io
-import ritzlib.async.server
-import ritzlib.async.executor
+import ritzlib.async.tasks
+import ritzlib.async.runtime
 
 
 # ============================================================================
@@ -134,42 +132,215 @@ fn test_task_complete() -> i32
 
 
 # ============================================================================
-# Test 4: AsyncTaskRuntime convenience wrapper
+# Test 4: run_tasks resumes a task after its I/O completes
 # ============================================================================
 
+var g_yield_polls: i32 = 0
+
+fn yield_once_handler(task: *Task) -> i32
+    g_yield_polls = g_yield_polls + 1
+    if task.handler_state == 0
+        task.handler_state = 1
+        task_yield(task)
+        return -1
+    return 0
+
 [[test]]
-fn test_async_runtime() -> i32
-    var rt: AsyncTaskRuntime
-    let ret = async_runtime_init(@rt)
-    if ret < 0
-        prints("FAIL: async_runtime_init failed\n")
+fn test_run_tasks_resumes_after_yield() -> i32
+    var ring: IoUring
+    uring_init(@ring, 64)
+
+    var pool: TaskPool
+    task_pool_init(@pool, @ring)
+
+    g_yield_polls = 0
+    spawn_task(@pool, -1, yield_once_handler)
+
+    let ret = run_tasks(@pool)
+    uring_destroy(@ring)
+
+    if ret != 0
+        prints("FAIL: run_tasks failed\n")
         return 1
-
-    if rt.initialized != 1
-        prints("FAIL: rt.initialized should be 1\n")
-        async_runtime_destroy(@rt)
+    if g_yield_polls != 2
+        prints("FAIL: the handler should be polled twice\n")
         return 1
-
-    if async_runtime_active_count(@rt) != 0
-        prints("FAIL: active_count should be 0\n")
-        async_runtime_destroy(@rt)
+    if pool.active_count != 0
+        prints("FAIL: the task should have completed\n")
         return 1
-
-    # Spawn a task
-    async_runtime_spawn(@rt, -1, dummy_handler)
-
-    if async_runtime_active_count(@rt) != 1
-        prints("FAIL: active_count should be 1 after spawn\n")
-        async_runtime_destroy(@rt)
-        return 1
-
-    async_runtime_destroy(@rt)
-    prints("OK: async_runtime\n")
     return 0
 
 
 # ============================================================================
-# Test 5: Uring vectored I/O prep functions exist
+# Test 5: block_on suspends a future on real I/O
+# ============================================================================
+
+struct PipeOp
+    rt: *Runtime
+    fd: i32
+    buf: *u8
+    len: i32
+    polls: i32
+
+fn pipe_read_poll(raw: *u8) -> i32
+    let op = raw as *PipeOp
+    op.polls = op.polls + 1
+    return runtime_poll_read(op.rt, op.fd, op.buf, op.len, 0)
+
+fn pipe_write_poll(raw: *u8) -> i32
+    let op = raw as *PipeOp
+    op.polls = op.polls + 1
+    return runtime_poll_write(op.rt, op.fd, op.buf, op.len, 0)
+
+[[test]]
+fn test_block_on_read_suspends_then_returns_the_io_result() -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) < 0
+        prints("FAIL: sys_pipe failed\n")
+        return 1
+    sys_write(fds[1], c"hello", 5)
+
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        prints("FAIL: runtime_init failed\n")
+        return 1
+
+    var buf: [8]u8
+    var op: PipeOp
+    op.rt = @rt
+    op.fd = fds[0]
+    op.buf = @buf[0]
+    op.len = 5
+    op.polls = 0
+
+    let poll_fn: fn(*u8) -> i32 = pipe_read_poll
+    let result: i32 = block_on(@rt, @op as *u8, poll_fn)
+    let leftover: i32 = rt.waker_io_result
+    let armed: i32 = rt.waker_active
+    runtime_destroy(@rt)
+    sys_close(fds[0])
+    sys_close(fds[1])
+
+    if result != 5
+        prints("FAIL: block_on should return the bytes read\n")
+        return 1
+    if op.polls != 2
+        prints("FAIL: the future should be polled once per side of the I/O\n")
+        return 1
+    if buf[0] != 104
+        prints("FAIL: the read did not land in the buffer\n")
+        return 1
+    if leftover != 0
+        prints("FAIL: taking the result should clear it\n")
+        return 1
+    if armed != 0
+        prints("FAIL: the completion should disarm the waker\n")
+        return 1
+    return 0
+
+[[test]]
+fn test_block_on_write_reaches_the_fd() -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) < 0
+        prints("FAIL: sys_pipe failed\n")
+        return 1
+
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        prints("FAIL: runtime_init failed\n")
+        return 1
+
+    var op: PipeOp
+    op.rt = @rt
+    op.fd = fds[1]
+    op.buf = c"hi"
+    op.len = 2
+    op.polls = 0
+
+    let poll_fn: fn(*u8) -> i32 = pipe_write_poll
+    let result: i32 = block_on(@rt, @op as *u8, poll_fn)
+    runtime_destroy(@rt)
+
+    var buf: [4]u8
+    let n: i64 = sys_read(fds[0], @buf[0], 4)
+    sys_close(fds[0])
+    sys_close(fds[1])
+
+    if result != 2
+        prints("FAIL: block_on should return the bytes written\n")
+        return 1
+    if n != 2
+        prints("FAIL: the bytes should be in the pipe\n")
+        return 1
+    if buf[1] != 105
+        prints("FAIL: the wrong bytes reached the pipe\n")
+        return 1
+    return 0
+
+
+# ============================================================================
+# Test 6: block_on refuses to spin on a future that can never wake
+# ============================================================================
+
+fn always_pending_poll(raw: *u8) -> i32
+    return POLL_PENDING
+
+[[test]]
+fn test_block_on_pending_without_a_waker_is_einval() -> i32
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        prints("FAIL: runtime_init failed\n")
+        return 1
+
+    var unused: i32 = 0
+    let poll_fn: fn(*u8) -> i32 = always_pending_poll
+    let result: i32 = block_on(@rt, @unused as *u8, poll_fn)
+    runtime_destroy(@rt)
+
+    if result != -22
+        prints("FAIL: expected -EINVAL\n")
+        return 1
+    return 0
+
+
+# ============================================================================
+# Test 7: only the registered operation's completion disarms the waker
+# ============================================================================
+
+fn submit_nop(rt: *Runtime, user_data: i64)
+    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
+    uring_prep_nop(sqe, user_data)
+    uring_sqe_submit(@rt.ring)
+
+[[test]]
+fn test_waker_ignores_another_operations_completion() -> i32
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        prints("FAIL: runtime_init failed\n")
+        return 1
+
+    runtime_waker_register(@rt, 500)
+
+    submit_nop(@rt, 600)
+    runtime_wait_for_io(@rt)
+    let after_stray: i32 = rt.waker_active
+
+    submit_nop(@rt, 500)
+    runtime_wait_for_io(@rt)
+    let after_match: i32 = rt.waker_active
+    runtime_destroy(@rt)
+
+    if after_stray != 1
+        prints("FAIL: a stray completion disarmed the waker\n")
+        return 1
+    if after_match != 0
+        prints("FAIL: the matching completion should disarm the waker\n")
+        return 1
+    return 0
+
+
+# ============================================================================
+# Test 8: Uring vectored I/O prep functions exist
 # ============================================================================
 
 [[test]]
@@ -200,8 +371,3 @@ fn test_uring_writev() -> i32
     uring_destroy(@ring)
     prints("OK: uring_writev\n")
     return 0
-
-
-# ============================================================================
-# Main - run all tests
-# ============================================================================

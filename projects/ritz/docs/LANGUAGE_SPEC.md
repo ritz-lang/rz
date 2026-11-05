@@ -2396,7 +2396,7 @@ fixed.
 ### 16.3 Runtime
 
 The async runtime uses io_uring for asynchronous I/O on Linux; see
-`ritzlib/uring.ritz` and `ritzlib/async_runtime.ritz`.
+`ritzlib/uring.ritz`, `ritzlib/async/runtime.ritz` and `ritzlib/async/tasks.ritz`.
 
 ---
 
@@ -2880,7 +2880,7 @@ Weaker orderings can be added when a measured need appears.
 | `json` | JSON parsing |
 | `process` | Process spawning |
 | `uring` | io_uring bindings |
-| `async_runtime` / `async_tasks` | Async runtime |
+| `async.runtime` / `async.tasks` | Async runtime |
 
 See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 

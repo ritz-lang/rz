@@ -31,7 +31,7 @@ machine, no client can stall any other.
 
 ## Architecture
 
-Reuse `ritzlib.async_tasks.TaskServer` — the same runtime valet uses.
+Reuse `ritzlib.async.tasks.TaskServer` — the same runtime valet uses.
 That gives us:
 
 - Multishot `accept` SQE for new connections (kernel ≥ 5.19)
@@ -280,4 +280,4 @@ rather than deleted — see "Phase 7 — Notes" above.
   (`CONN_STATE_RECV` / `_PARSE` / `_SEND`)
 - valet's `valet_run` calls `task_server_run(srv, valet_handle_connection)`:
   `projects/valet/lib/valet.ritz:1422-1424`
-- ritzlib `TaskServer` API: `projects/ritz/ritzlib/async_tasks.ritz:419-715`
+- ritzlib `TaskServer` API: `projects/ritz/ritzlib/async/tasks.ritz`

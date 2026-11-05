@@ -75,7 +75,9 @@ fn main(argc: i32, argv: **u8) -> i32
 | `process.ritz` | Process control (fork, exec, wait) |
 | `net.ritz` | Network socket operations |
 | `uring.ritz` | Linux io_uring async I/O |
-| `async.ritz` | Async/await primitives |
+| `async/tasks.ritz` | Task pool, event loop and TCP server on io_uring |
+| `async/runtime.ritz` | `block_on` for a single future |
+| `async/blocking_fs.ritz` | Blocking file calls behind `async fn` |
 | `json.ritz` | JSON parsing and serialization |
 | `elf.ritz` | ELF binary parsing |
 | `buf.ritz` | Buffered I/O |

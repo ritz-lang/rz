@@ -64,11 +64,9 @@ Ritzlib is built on three core principles:
    - [net](#net) - TCP/IP socket operations
    - [async_net](#async_net) - Async TCP networking
 8. [Async Runtime](#async-runtime)
-   - [async](#async) - Async primitives (Poll, Waker, Context)
-   - [async_runtime](#async_runtime) - io_uring-backed runtime
-   - [async_tasks](#async_tasks) - Multi-task executor
-   - [async_fs](#async_fs) - Async filesystem operations
-   - [executor](#executor) - Simple async executor
+   - [async.runtime](#asyncruntime) - Drive one future with `block_on`
+   - [async.tasks](#asynctasks) - Multi-task executor
+   - [async.blocking_fs](#asyncblocking_fs) - Blocking file calls behind `async fn`
    - [uring](#uring) - io_uring bindings
 9. [Process Management](#process-management)
    - [process](#process) - Subprocess spawning
@@ -1487,70 +1485,50 @@ Async TCP networking using io_uring.
 
 ## Async Runtime
 
-### async
+### async.runtime
 
-**Module**: `ritzlib.async`
+**Module**: `ritzlib.async.runtime`
 
-Core async/await primitives.
+Drives one future, or one blocking operation at a time, on an io_uring of its
+own. For many concurrent tasks, use [async.tasks](#asynctasks).
 
-```ritz
-enum Poll<T>
-    Ready(T)
-    Pending
-
-struct Waker
-    task_ptr: *u8
-    wake_fn: *u8
-
-struct Context
-    waker: *Waker
-
-struct Task
-    id: i64
-    future_ptr: *u8
-    poll_fn: *u8
-    drop_fn: *u8
-    completed: i32
-```
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `poll_is_ready` | `fn<T>(p: *Poll<T>) -> i32` | Check if Ready |
-| `poll_is_pending` | `fn<T>(p: *Poll<T>) -> i32` | Check if Pending |
-| `waker_wake` | `fn(w: *Waker)` | Wake the task |
-| `waker_clone` | `fn(w: *Waker) -> Waker` | Clone waker |
-| `context_waker` | `fn(cx: *Context) -> *Waker` | Get waker from context |
-
----
-
-### async_runtime
-
-**Module**: `ritzlib.async_runtime`
-
-io_uring-backed async runtime.
+**Constants**:
+- `POLL_PENDING`: -1. A poll function returns this while it is suspended; any other value is Ready.
 
 ```ritz
 struct Runtime
     ring: IoUring
     initialized: i32
     next_user_data: i64
+    waker_user_data: i64
+    waker_io_result: i32
+    waker_active: i32
 ```
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `runtime_init` | `fn(rt: *Runtime) -> i32` | Initialize runtime |
 | `runtime_destroy` | `fn(rt: *Runtime)` | Destroy runtime |
-| `runtime_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64` | Async read |
-| `runtime_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64` | Async write |
-| `runtime_close` | `fn(rt: *Runtime, fd: i32) -> i32` | Async close |
+| `runtime_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64` | Read, waiting for the result |
+| `runtime_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64` | Write, waiting for the result |
+| `runtime_close` | `fn(rt: *Runtime, fd: i32) -> i32` | Close, waiting for the result |
+| `block_on` | `fn(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32` | Poll a future to completion; -EINVAL if it is Pending with nothing to wake it |
+| `runtime_poll_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a read and return Pending, then return its result |
+| `runtime_poll_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a write and return Pending, then return its result |
+| `runtime_wait_for_io` | `fn(rt: *Runtime) -> i32` | Wait for a completion and record it for the waker |
+| `runtime_waker_register` | `fn(rt: *Runtime, user_data: i64)` | Suspend on an operation submitted by hand |
+| `runtime_waker_clear` | `fn(rt: *Runtime)` | Stop waiting for that operation |
 | `get_runtime` | `fn() -> *Runtime` | Get global runtime |
 | `cleanup_runtime` | `fn()` | Cleanup global runtime |
 
+A `runtime_poll_*` result of 0 cannot be told from "no result yet", so a read at
+EOF is submitted again (AGAST #2328).
+
 ---
 
-### async_tasks
+### async.tasks
 
-**Module**: `ritzlib.async_tasks`
+**Module**: `ritzlib.async.tasks`
 
 Multi-task async executor with io_uring for concurrent servers.
 
@@ -1633,11 +1611,13 @@ struct TaskServer
 
 ---
 
-### async_fs
+### async.blocking_fs
 
-**Module**: `ritzlib.async_fs`
+**Module**: `ritzlib.async.blocking_fs`
 
-Async filesystem operations.
+File calls with an `async fn` signature. Every one blocks the thread in a plain
+syscall, so nothing overlaps. For I/O that suspends, use
+[async.runtime](#asyncruntime) or [async.tasks](#asynctasks).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -1648,36 +1628,6 @@ Async filesystem operations.
 | `async_close` | `async fn(fd: i32) -> i32` | Close fd |
 | `async_read_file` | `async fn(path: *u8, buf: *u8, buf_size: i64) -> i64` | Read entire file |
 | `async_write_file` | `async fn(path: *u8, buf: *u8, count: i64) -> i64` | Write file |
-
----
-
-### executor
-
-**Module**: `ritzlib.executor`
-
-Simple async executor with io_uring.
-
-```ritz
-struct Executor
-    ring: IoUring
-    initialized: i32
-    next_user_data: i64
-    waker_user_data: i64
-    waker_io_result: i32
-    waker_active: i32
-```
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `executor_init` | `fn(exec: *Executor) -> i32` | Initialize |
-| `executor_destroy` | `fn(exec: *Executor)` | Destroy |
-| `block_on` | `fn(exec: *Executor, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32` | Run future to completion |
-| `exec_async_read` | `fn(exec: *Executor, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Async read |
-| `exec_async_write` | `fn(exec: *Executor, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Async write |
-| `exec_async_accept` | `fn(exec: *Executor, server_fd: i32) -> i32` | Async accept |
-| `exec_async_recv` | `fn(exec: *Executor, fd: i32, buf: *u8, len: i32, flags: i32) -> i32` | Async recv |
-| `exec_async_send` | `fn(exec: *Executor, fd: i32, buf: *u8, len: i32, flags: i32) -> i32` | Async send |
-| `exec_async_close` | `fn(exec: *Executor, fd: i32) -> i32` | Async close |
 
 ---
 
@@ -2275,7 +2225,7 @@ import ritzlib.gvec        # Vec<T>
 import ritzlib.memory      # malloc/free, Arena
 import ritzlib.fs          # Filesystem
 import ritzlib.net         # Networking
-import ritzlib.async_tasks # Async server
+import ritzlib.async.tasks # Async server
 ```
 
 ### Common Patterns
@@ -2324,7 +2274,7 @@ fn vec_demo() -> i32
 
 **Async server with io_uring**:
 ```ritz
-import ritzlib.async_tasks
+import ritzlib.async.tasks
 
 fn handle_connection(task: *Task) -> i32
     0

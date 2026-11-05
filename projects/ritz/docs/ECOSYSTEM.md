@@ -108,7 +108,7 @@ The Ritz ecosystem is a complete systems programming platform with twelve interc
 | `hashmap.ritz` | Hash table |
 | `fs.ritz` | Filesystem operations |
 | `str.ritz` | String utilities |
-| `async_tasks.ritz` | Async runtime |
+| `async/tasks.ritz` | Async runtime |
 | `uring.ritz` | io_uring bindings |
 | `args.ritz` | Argument parsing |
 | `json.ritz` | JSON parsing |
