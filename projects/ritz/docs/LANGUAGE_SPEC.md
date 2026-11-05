@@ -970,11 +970,13 @@ if c
     r = 1
 ```
 
-One neighbouring case is still accepted and still wrong. Do not rely on it in
-new code: a function that declares a return type and whose *last* statement is
-such an `if` falls through to an implicit `0` rather than being rejected. Sites
-in this repo are built on that behaviour, so it is being migrated before it
-becomes an error (AGAST #1429).
+A function that declares a return type is different. It is an error for such
+a function to be able to reach its end without producing a value, whether its
+last statement is an `if`, a loop, an assignment, a `pass` arm or a call to a
+procedure. There is no implicit `0`. An `if`/`else` whose arms all return, or a
+`loop` with no `break`, never reaches the end and needs nothing after it. The
+condition of a `while` counts as always true only when it is the literal
+`true`. `-> void` declares no value, so it follows the rules for a procedure.
 
 ### 6.2 While Loop
 

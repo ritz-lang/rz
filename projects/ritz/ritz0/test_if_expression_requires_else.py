@@ -60,8 +60,9 @@ part of the walk runs from every statement and from a function's tail too.
 It still never enters `Block.stmts` or a lambda/closure body.
 
 The function-tail shape (a fn declaring `-> T` whose last statement is an
-else-less `if`) is deliberately NOT covered; it is AGAST #1429, pinned below
-so a change to it is made on purpose.
+else-less `if`) is deliberately NOT covered here. AGAST #1429 rejects it, with
+every other way of reaching a fn's end without a value, on its own check; see
+test_fn_tail_requires_value.py.
 """
 
 import os
@@ -726,26 +727,13 @@ def test_procedure_whose_tail_is_an_if_else_of_assignments_still_compiles(tmp_pa
 
 @pytest.mark.integration
 @pytest.mark.unit
-def test_declared_return_type_tailing_a_valueless_if_is_unchanged(tmp_path):
-    """Scope boundary, pinned deliberately: this is NOT #1406's defect.
+def test_declared_return_type_tailing_a_valueless_if_is_rejected(tmp_path):
+    """Replaces the pin that this shape compiled to an implicit zero.
 
-    A function that declares `-> i64` and whose tail is an else-less `if`
-    with no value returns an implicit zero. That is a missing return value,
-    and it is arguably its own defect — but it is a *different* one, it
-    exists in the corpus today, and `examples/tier1_basics/91_loop_trailing_expr`
-    is built on it:
-
-        fn f_nested(n: i64) -> i64
-            var i: i64 = 0
-            if n > 0
-                while i < n
-                    i = i + 1
-
-    The third version of the #1406 fix rejected this and redded that example
-    plus `tier2_stdlib_15_cut`. Widening a fix until the corpus goes red is a
-    scope increase wearing a bug fix's clothes, so the behaviour is preserved
-    here and tracked on its own ticket. If a later change makes this an error
-    ON PURPOSE, this test should be replaced — not deleted quietly.
+    That pin held the scope boundary between #1406 and #1429 and said to
+    replace it if the shape became an error on purpose. #1429 did that, after
+    migrating the corpus. The rejection comes from #1429's own check, not from
+    #1406's, so the message is the one about the fn's end.
     """
     rc, output, _ = _compile(tmp_path, (
         "fn f_nested(n: i64) -> i64\n"
@@ -754,40 +742,29 @@ def test_declared_return_type_tailing_a_valueless_if_is_unchanged(tmp_path):
         "        while i < n\n"
         "            i = i + 1\n"
     ))
-    assert rc == 0, (
-        "a declared-return fn tailing a valueless if is out of #1406's scope "
-        f"and must still compile:\n{output}"
-    )
+    assert rc != 0, f"a declared-return fn with a valueless tail compiled:\n{output}"
+    assert "can reach its end without producing a value" in output, output
 
 
 @pytest.mark.integration
 @pytest.mark.unit
-def test_valueless_tail_if_in_a_pointer_returning_fn_emits_valid_ir(tmp_path):
-    """The implicit zero must be CONVERTED to the return type, not typed at it.
+def test_valueless_tail_if_in_a_procedure_emits_valid_ir(tmp_path):
+    """A procedure's implicit return must still be valid IR.
 
-    `ir.Constant(ptr_type, 0)` prints as `ret %"struct.E"* 0`, which clang
-    rejects: "integer constant must have integer type". The zero has to go
-    through `_convert_type`, which is what the pre-#1406 path did.
-
-    Verbatim shape of `ritz1/src/ast_helpers.ritz`. The fourth version of the
-    #1406 fix got this wrong and built a ritz1 that could not compile itself
-    — after 862 pytest tests, 199/199 doc blocks and Stages 1-3 all passed.
-    Only the self-hosting bootstrap in Stage 4 could see it, which is the
-    argument for the differential suite existing at all.
+    This replaces a test of the `-> *E` form, which #1429 made an error. That
+    form is covered by test_fn_tail_requires_value.py; what stays reachable
+    is the tail of a fn that declares nothing.
     """
     rc, output, ir_text = _compile(tmp_path, (
         "struct E\n"
         "    v: i64\n"
-        "fn touch(e: *E, c: i64) -> *E\n"
+        "fn touch(e: *E, c: i64)\n"
         "    if c == 1\n"
         "        e.v = 1\n"
     ))
-    assert rc == 0, f"pointer-returning fn with a valueless tail if:\n{output}"
+    assert rc == 0, f"procedure with a valueless tail if:\n{output}"
     assert ir_text is not None
-    assert not re.search(r'ret %"[^"]+"\* 0', ir_text), (
-        "emitted `ret %struct* 0` — an integer constant typed as a pointer, "
-        f"which clang rejects:\n{ir_text}"
-    )
+    assert re.search(r'ret i32 0', ir_text), ir_text
 
 
 @pytest.mark.integration

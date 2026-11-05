@@ -18,9 +18,14 @@ The structural check below also asserts that every ritz1 block is terminated
 and never gets a second `ret`. clang accepts a stray second `ret` as a dead unnamed block, so
 the exit code alone would not catch a doubled return.
 
-Oracle: ritz0 compiles every program, and both binaries return the same exit
-code. Each program also has an identical free-fn twin that goes through
-emit_fn, so the method path has to match the fn path, not just ritz0.
+Oracle: ritz0 compiles every program in CASES, and both binaries return the
+same exit code. Each program also has an identical free-fn twin that goes
+through emit_fn, so the method path has to match the fn path, not just ritz0.
+
+AGAST #1429 made ritz0 reject a non-void fn that reaches its end without a
+value, so ritz0 cannot be the oracle for the programs in RITZ1_ONLY_CASES.
+ritz1 still has the fallback until AGAST #2236, so they stay pinned to a known
+exit code. #2236 deletes them along with the fallback.
 """
 
 import re
@@ -167,10 +172,13 @@ pub fn main() -> i32
 """
 
 CASES = [
-    ("if_no_else", IF_NO_ELSE),
-    ("narrow_types", NARROW_TYPES),
     ("if_else_value", IF_ELSE_VALUE),
     ("controls", CONTROLS),
+]
+
+RITZ1_ONLY_CASES = [
+    ("if_no_else", IF_NO_ELSE),
+    ("narrow_types", NARROW_TYPES),
     ("struct_and_void_named", STRUCT_AND_VOID_NAMED),
 ]
 
@@ -221,3 +229,13 @@ def test_method_tail_matches_ritz0(ritz1_bin, tmp_path, name, program):
     shape = _block_shape_errors((tmp_path / f"{name}_ritz1.ll").read_text())
     assert not shape, f"{name}: malformed blocks in ritz1 IR:\n" + "\n".join(shape)
     assert got == expected, f"{name}: ritz1 exit {got}, ritz0 exit {expected}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name,program", RITZ1_ONLY_CASES,
+                         ids=[c[0] for c in RITZ1_ONLY_CASES])
+def test_method_tail_fallback_on_ritz1(ritz1_bin, tmp_path, name, program):
+    got = _run("ritz1", tmp_path, name, program)
+    shape = _block_shape_errors((tmp_path / f"{name}_ritz1.ll").read_text())
+    assert not shape, f"{name}: malformed blocks in ritz1 IR:\n" + "\n".join(shape)
+    assert got == 42, f"{name}: ritz1 exit {got}"

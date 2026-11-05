@@ -40,6 +40,7 @@ fn calculate_hash(input: StrView) -> u64
     let hash_value: u64 = 0
     var current_byte: u8 = 0
     # ...
+    hash_value
 ```
 
 **Guidelines:**

@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
 from monomorph import resolve_alias_in
+from tail_value import value_gap
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, _subst as move_subst
@@ -4814,6 +4815,7 @@ class LLVMEmitter:
 
         # Handle trailing expression and implicit return
         if not self.has_returned and not self.builder.block.is_terminated:
+            self._reject_missing_tail_value(fn_def)
             if fn_def.body.expr:
                 # A fn that returns nothing discards its tail (AGAST #2137).
                 if fn_def.ret_type is None:
@@ -4893,6 +4895,26 @@ class LLVMEmitter:
                 self.builder.ret(self._zero_constant(ret_type))
 
         return fn
+
+    def _reject_missing_tail_value(self, fn_def: rast.FnDef) -> None:
+        """A fn with a declared return type must not reach its end valueless.
+
+        AGAST #1429. This keys off the declared type and not off the absence
+        of a phi: a procedure's tail runs for effect, so ending in a guard or
+        an if/else of assignments stays legal there (`-> void` declares no
+        value either). Without this check the fallthrough returns a zero the
+        source never wrote.
+        """
+        declared = fn_def.ret_type
+        if declared is None or (isinstance(declared, rast.NamedType)
+                                and declared.name == 'void'):
+            return
+        gap = value_gap(fn_def.body, self._is_void_call)
+        if gap is not None:
+            raise EmitError(
+                f"function '{fn_def.name}' declares a return type but can "
+                f"reach its end without producing a value",
+                getattr(gap, 'span', None) or getattr(fn_def, 'span', None))
 
     def _emit_test_table(self, module: rast.Module) -> None:
         """Emit the `[[test]]` table of LANGUAGE_SPEC §17.1 (AGAST #1868).
