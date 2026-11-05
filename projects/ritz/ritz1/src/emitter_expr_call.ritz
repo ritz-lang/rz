@@ -904,14 +904,20 @@ fn param_takes_array_ref(p: *Param) -> i32
 # AGAST #2287: `g(a)` with `a` a whole array, into a param that takes it by
 # address: the address, as an i64 like `g(@a)`, which the arg cascades turn into
 # what the param is.  This argument used to read the array's first 8 bytes and
-# hand them to the callee as a pointer.  0 when `arg` is anything else; a
-# `a:& [N]T` param already reads as its pointer.
+# hand them to the callee as a pointer.  0 when `arg` is anything else.
 fn emit_array_arg_addr(s: *EmitterState, arg: *Expr, p: *Param) -> i32
-    if param_takes_array_ref(p) == 0 or lent_local(s, arg) != null
+    if param_takes_array_ref(p) == 0
         return 0
     var ptr: i32 = 0
     var place: ArraySrc
-    if array_place_shape(s, arg, @place) == 1
+    # AGAST #2290: a reborrow.  An `@[N]T` slot is an i64; the `ptr` slots take
+    # the pointer it reads as.
+    if lent_local(s, arg) != null
+        let lent: *LocalVar = lent_array_ident(s, arg)
+        if lent == null or p.param_type != TYPE_REF
+            return 0
+        ptr = lent.reg
+    else if array_place_shape(s, arg, @place) == 1
         ptr = emit_array_place_ptr(s, arg)
     else if arg.kind == EXPR_MEMBER and arg_field_is_array(s, arg) == 1
         var mr: MemberPtrResult
@@ -940,7 +946,7 @@ fn arg_field_is_array(s: *EmitterState, arg: *Expr) -> i32
 # well: an array is no `C`, so it stays the pointer, which clang refuses.
 fn emit_lent_referent(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> i32
     let loc: *LocalVar = lent_local(s, e)
-    if loc == null or loc.pointee_type == TYPE_ARRAY
+    if loc == null or loc.var_type == TYPE_ARRAY
         return 0
     if name_eq(loc.type_name, loc.type_name_len, name, name_len) == 0
         return 0
@@ -988,13 +994,13 @@ fn struct_value_local(s: *EmitterState, e: *Expr) -> *LocalVar
         return null
     return loc
 
-# AGAST #2279: the `a:& [N]T` param `e` names, read whole, or null.  Its array
-# is behind the borrow's pointer (emit_load_ptr of the local's slot), with N and
-# T in pointee_array_*.  A move-only T is reported here, as emit_lent_referent
-# does; the caller still checks the slot's length and element type.
+# AGAST #2279: the `a:& [N]T` param `e` names, read whole, or null.  It's an
+# array local whose slot is the array behind the borrow (#2290).  A move-only T
+# is reported here, as emit_lent_referent does; the caller still checks the
+# slot's length and element type.
 fn lent_array_local(s: *EmitterState, e: *Expr) -> *LocalVar
-    let loc: *LocalVar = lent_local(s, e)
-    if loc == null or loc.pointee_type != TYPE_ARRAY
+    let loc: *LocalVar = lent_array_ident(s, e)
+    if loc == null
         return null
     own_check_lent_read(s, e, loc.type_name, loc.type_name_len)
     return loc
@@ -1016,7 +1022,7 @@ fn emit_expr_by_value(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len: 
 # keeps reading the integer.  Any other `:&` local already reads as its pointer.
 fn emit_lent_ptr(s: *EmitterState, e: *Expr, field: *StructField) -> i32
     let loc: *LocalVar = lent_local(s, e)
-    if loc == null or loc.var_type == TYPE_MUT_REF or field.field_type != TYPE_PTR
+    if loc == null or loc.var_type == TYPE_MUT_REF or loc.var_type == TYPE_ARRAY or field.field_type != TYPE_PTR
         return 0
     if ptr_field_int_width(s, field) != ptr_pointee_size(s, loc.var_type, null, 0)
         return 0
@@ -1135,6 +1141,122 @@ fn param_is_span(p: *Param) -> i32
         return 0
     return memcmp(p.param_type_name, c"Span$", 5) == 0
 
+# AGAST #2290: every dimension of an array, for comparing one with the array a
+# reference param points at.  `leaf` is what the innermost dimension holds.
+struct ArrayDims
+    rank: i32
+    dims: [8]i32
+    leaf: i32
+    name: *u8
+    name_len: i32
+
+# What ref_arg_dims can say about an argument.
+const ARG_DIMS_UNKNOWN: i32 = 0
+const ARG_DIMS_ARRAY: i32 = 1
+const ARG_DIMS_NOT_ARRAY: i32 = 2
+
+fn array_dims_1d(out: *ArrayDims, size: i32, elem: i32, name: *u8, name_len: i32) -> i32
+    out.rank = 1
+    out.dims[0] = size
+    out.leaf = elem
+    out.name = name
+    out.name_len = name_len
+    ARG_DIMS_ARRAY
+
+# The array left of `sh` once `from` indices are applied.  With none left it's
+# an element.
+fn array_dims_nd(out: *ArrayDims, sh: *ArrayShape, from: i32) -> i32
+    if from >= sh.rank
+        return ARG_DIMS_NOT_ARRAY
+    out.rank = sh.rank - from
+    var i: i32 = 0
+    while i < out.rank
+        out.dims[i] = sh.dims[from + i]
+        i = i + 1
+    out.leaf = sh.leaf_type
+    out.name = sh.leaf_name
+    out.name_len = sh.leaf_name_len
+    ARG_DIMS_ARRAY
+
+fn array_dims_match(a: *ArrayDims, b: *ArrayDims) -> i32
+    if a.rank != b.rank
+        return 0
+    var i: i32 = 0
+    while i < a.rank
+        if a.dims[i] != b.dims[i]
+            return 0
+        i = i + 1
+    return array_elem_types_match(a.leaf, a.name, a.name_len, b.leaf, b.name, b.name_len)
+
+# What the place `value` holds: its array's dimensions in `out`, or that it's no
+# array, or ARG_DIMS_UNKNOWN when ritz1 can't tell from here.  Emits nothing.
+fn place_array_dims(s: *EmitterState, value: *Expr, out: *ArrayDims) -> i32
+    var src: ArraySrc
+    if arg_array_shape(s, value, @src) == 1
+        return array_dims_1d(out, src.size, src.elem, src.name, src.name_len)
+    if value.kind == EXPR_IDENT
+        let sh: *ArrayShape = nd_array_ident_shape(s, value)
+        if sh != null
+            return array_dims_nd(out, sh, 0)
+        if find_local_struct_name(s, value.ident_ptr, value.ident_len) != null or find_global(s, value.ident_ptr, value.ident_len) != null
+            return ARG_DIMS_NOT_ARRAY
+        return ARG_DIMS_UNKNOWN
+    if value.kind == EXPR_MEMBER
+        let msh: *ArrayShape = nd_array_member_shape(s, value)
+        if msh != null
+            return array_dims_nd(out, msh, 0)
+        let f: *StructField = member_field_def(s, value)
+        if f != null and f.field_type != TYPE_ARRAY
+            return ARG_DIMS_NOT_ARRAY
+        return ARG_DIMS_UNKNOWN
+    if value.kind == EXPR_INDEX
+        var depth: i32 = 0
+        let ish: *ArrayShape = nd_index_shape(s, value, @depth)
+        if ish != null
+            return array_dims_nd(out, ish, depth)
+        # An element of a 1-D array.
+        var base: ArrayDims
+        if value.left.kind != EXPR_INDEX and place_array_dims(s, value.left, @base) == ARG_DIMS_ARRAY
+            return ARG_DIMS_NOT_ARRAY
+    ARG_DIMS_UNKNOWN
+
+# What `arg` points at, for a param that takes an array by address.
+fn ref_arg_dims(s: *EmitterState, arg: *Expr, out: *ArrayDims) -> i32
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+        return place_array_dims(s, arg.operand, out)
+    if arg.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, arg.ident_ptr, arg.ident_len)
+        if loc != null and loc.var_type != TYPE_ARRAY
+            let ploc: *LocalVar = array_ptr_local(s, arg)
+            if ploc != null
+                return array_dims_1d(out, ploc.pointee_array_size, ploc.pointee_array_elem_type, ploc.type_name, ploc.type_name_len)
+            # `let p: @[N]T = @a` and `var p = @a` don't record the array they
+            # point at, so a pointer local says nothing: only a `:&` param does.
+            if loc.is_lent == 1
+                return ARG_DIMS_NOT_ARRAY
+            if loc.var_type == TYPE_PTR or loc.var_type == TYPE_PTR_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+                return ARG_DIMS_UNKNOWN
+    return place_array_dims(s, arg, out)
+
+# AGAST #2290: `a[i]` in the callee trusts the N and T its param declares, so an
+# argument that isn't that array is an out-of-bounds access there.  ritz0 checks
+# them by type; ritz1 checks what it can see from the argument.
+fn check_array_ref_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
+    var got: ArrayDims
+    let known: i32 = ref_arg_dims(s, arg, @got)
+    if known == ARG_DIMS_UNKNOWN
+        return
+    if known == ARG_DIMS_NOT_ARRAY
+        array_arg_error(s, call, fname, flen, argno, c"the parameter points at an array")
+        return
+    var want: ArrayDims
+    if p.param_pointee_array_shape != null
+        array_dims_nd(@want, p.param_pointee_array_shape, 0)
+    else
+        array_dims_1d(@want, p.param_pointee_array_size, p.param_pointee_array_elem_type, p.param_type_name, p.param_type_name_len)
+    if array_dims_match(@got, @want) == 0
+        array_arg_error(s, call, fname, flen, argno, c"the array isn't the one the parameter points at")
+
 # Fill `out` when `arg` is a whole 1-D array, as a place or an inline field.
 fn arg_array_shape(s: *EmitterState, arg: *Expr, out: *ArraySrc) -> i32
     if array_place_shape(s, arg, out) == 1
@@ -1154,6 +1276,9 @@ fn check_array_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: 
     if p == null or name_eq(p.name, p.name_len, c"self", 4) == 1
         return
     let literal: i32 = arg.kind == EXPR_ARRAY_LIT or arg.kind == EXPR_ARRAY_FILL
+    if literal == 0 and param_takes_array_ref(p) == 1
+        check_array_ref_arg(s, call, fname, flen, argno, arg, p)
+        return
     var src: ArraySrc
     if literal == 0 and arg_array_shape(s, arg, @src) == 0
         return
@@ -1166,11 +1291,7 @@ fn check_array_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: 
     if param_takes_array_ref(p) == 0
         array_arg_error(s, call, fname, flen, argno, c"the parameter doesn't take a whole array")
         return
-    if literal == 1
-        array_arg_error(s, call, fname, flen, argno, c"an array literal has no address to pass")
-        return
-    if src.size != p.param_pointee_array_size or array_elem_types_match(src.elem, src.name, src.name_len, p.param_pointee_array_elem_type, p.param_type_name, p.param_type_name_len) == 0
-        array_arg_error(s, call, fname, flen, argno, c"the array isn't the one the parameter points at")
+    array_arg_error(s, call, fname, flen, argno, c"an array literal has no address to pass")
 
 # AGAST #1948: passing a pointer to struct A where a pointer to struct B is
 # expected is a located error, as in ritz0 (#1366).  ritz1's value model

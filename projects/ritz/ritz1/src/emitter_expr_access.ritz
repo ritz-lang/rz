@@ -20,7 +20,8 @@ fn emit_whole_array_error(s: *EmitterState, e: *Expr)
 fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1509: a multi-dimensional array as a whole value (`h = g`,
     # `f(g)`, ...) is not lowered: the paths below load one i64 out of it.
-    if nd_array_ident_shape(s, e) != null
+    # `a:& [N][M]T` has a value, its pointer, as below (AGAST #2290).
+    if nd_array_ident_shape(s, e) != null and lent_array_ident(s, e) == null
         emit_nd_error(s, e.span.line, e.span.col, c"a multi-dimensional array is not a value in ritz1 (index it, or take an element's address with @)")
         return 0
     # Unit-variant None → `%Option$... = { i8 1, [N x i8] zero }` aggregate
@@ -130,7 +131,11 @@ fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
         # AGAST #2287: this path has no array value to give; loading the slot
         # read the first 8 bytes as an i64.  Whatever takes a whole array has
         # its own path (emit_array_local_whole_assign, emit_call_arg).
+        # AGAST #2290: `a:& [N]T` does have one: read bare it's the borrow's
+        # pointer, which a reference slot takes.
         if var_type == TYPE_ARRAY
+            if lent_array_ident(s, e) != null
+                return loc
             emit_whole_array_error(s, e)
             return 0
         let result: i32 = next_reg(s)
@@ -486,6 +491,10 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     #   • [N]T arrays (GEP [0, lo])
     #   • bare pointer locals (fall through)
     if e.right != null and e.right.kind == EXPR_RANGE
+        # AGAST #2290: ritz0 slices no array, so a borrowed one isn't either.
+        if local != null and base_type == TYPE_ARRAY and local.is_lent == 1
+            emit_nd_error(s, e.span.line, e.span.col, c"an `a:& [N]T` param can't be sliced (only String, Vec and Span can)")
+            return 0
         let rng_lo: i32 = emit_expr(s, e.right.left)
         var rng_base: i32 = 0
         var rng_elem_ty: *u8 = c"i8"

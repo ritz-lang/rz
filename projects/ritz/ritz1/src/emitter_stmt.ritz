@@ -225,18 +225,13 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # examples/tier2_stdlib/77_args (`run`'s `var parsed = p`).
         else if stmt.var_init.kind == EXPR_IDENT
             let src_loc: *LocalVar = find_local_struct_name(s, stmt.var_init.ident_ptr, stmt.var_init.ident_len)
-            # AGAST #2279: `var d = c` with `c:& C` or `a:& [N]T` copies the
-            # referent, as ritz0 does.  It took the reference below, so writes
-            # to `d` reached the caller.  Annotate `@C` to keep the reference.
+            # AGAST #2279: `var d = c` with `c:& C` copies the referent, as
+            # ritz0 does.  It took the reference below, so writes to `d` reached
+            # the caller.  Annotate `@C` to keep the reference.  `a:& [N]T` is
+            # an array local, so the array arm below copies it (#2290).
             if lent_local(s, stmt.var_init) != null and src_loc.var_type == TYPE_MUT_REF
-                if src_loc.pointee_type == TYPE_ARRAY
-                    var_type = TYPE_ARRAY
-                    stmt.var_type = TYPE_ARRAY
-                    stmt.var_array_size = src_loc.pointee_array_size
-                    stmt.var_array_elem_type = src_loc.pointee_array_elem_type
-                else
-                    var_type = TYPE_STRUCT
-                    stmt.var_type = TYPE_STRUCT
+                var_type = TYPE_STRUCT
+                stmt.var_type = TYPE_STRUCT
                 stmt.var_type_name = src_loc.type_name
                 stmt.var_type_name_len = src_loc.type_name_len
             else if src_loc != null and src_loc.var_type == TYPE_STRUCT and src_loc.type_name_len > 0
@@ -1053,6 +1048,11 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # knows N only for a local or param `p`, so any other target fails
         # closed: there is no length to check the value against.
         if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
+            # AGAST #2290: ritz0 reads `*a` of `a:& [N]T` but won't store through
+            # it.  `a = v` is the spelling for that.
+            if lent_array_ident(s, target_expr.operand) != null
+                emit_nd_error(s, target_expr.span.line, target_expr.span.col, c"cannot store through `*a` of an `a:& [N]T` param (assign to `a`, it is the array)")
+                return
             let arr_dst: *LocalVar = array_ptr_local(s, target_expr.operand)
             if arr_dst != null
                 emit_array_local_whole_assign(s, emit_load_ptr(s, arr_dst.reg), arr_dst.pointee_array_size, arr_dst.pointee_array_elem_type, arr_dst.type_name, arr_dst.type_name_len, stmt.assign_value)
@@ -2173,16 +2173,25 @@ fn array_src_set(out: *ArraySrc, size: i32, elem: i32, name: *u8, name_len: i32)
     out.name_len = name_len
     1
 
-# The `p: *[N]T` / `@[N]T` / `@&[N]T` local `e` names, or null.
+# The `p: *[N]T` / `@[N]T` / `@&[N]T` local `e` names, or null.  `a:& [N]T` counts:
+# as in ritz0, `*a` reads the array.
 fn array_ptr_local(s: *EmitterState, e: *Expr) -> *LocalVar
     if e == null or e.kind != EXPR_IDENT
         return null
     let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
     if loc == null or loc.pointee_type != TYPE_ARRAY or loc.pointee_array_size <= 0
         return null
+    if lent_array_ident(s, e) != null
+        return loc
     if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
         return null
     return loc
+
+# The address of the array behind array_ptr_local's `loc`.
+fn emit_array_ptr_base(s: *EmitterState, loc: *LocalVar) -> i32
+    if loc.var_type == TYPE_ARRAY
+        return loc.reg
+    return emit_load_ptr(s, loc.reg)
 
 # Fill `out` when `value` reads a whole 1-D array out of a place that needs no
 # code to find: a local or by-value param, `a:& [N]T`, a global, `*p`.  Returns
@@ -2193,8 +2202,6 @@ fn array_place_shape(s: *EmitterState, value: *Expr, out: *ArraySrc) -> i32
         if loc != null
             if loc.var_type == TYPE_ARRAY and loc.array_shape == null
                 return array_src_set(out, loc.array_size, loc.array_elem_type, loc.type_name, loc.type_name_len)
-            if loc.is_lent == 1 and loc.pointee_type == TYPE_ARRAY
-                return array_src_set(out, loc.pointee_array_size, loc.pointee_array_elem_type, loc.type_name, loc.type_name_len)
             return 0
         let g: *GlobalVarDef = find_global(s, value.ident_ptr, value.ident_len)
         if g != null and g.var_type == TYPE_ARRAY and g.array_shape == null
@@ -2226,11 +2233,11 @@ fn emit_global_array_ptr(s: *EmitterState, g: *GlobalVarDef) -> i32
 # The address of the place array_place_shape recognised in `value`.
 fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
     if value.kind == EXPR_UNARY
-        let ploc: *LocalVar = array_ptr_local(s, value.operand)
-        return emit_load_ptr(s, ploc.reg)
+        lent_array_local(s, value.operand)
+        return emit_array_ptr_base(s, array_ptr_local(s, value.operand))
     let lent: *LocalVar = lent_array_local(s, value)
     if lent != null
-        return emit_load_ptr(s, lent.reg)
+        return lent.reg
     let loc: *LocalVar = find_local_struct_name(s, value.ident_ptr, value.ident_len)
     if loc != null
         return loc.reg

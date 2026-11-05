@@ -915,7 +915,6 @@ ALL = {f"{group}_{name}": source
 # Still open on ritz1, each held to ritz0's answer by a strict xfail.
 RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
-    "array_span": "AGAST #2305: `@a` into a Span is only built for an array local",
     "array_let_ref_read": "AGAST #2304: a `let p: @[N]T` local doesn't record N, for a local either",
     "array_let_mut_ref_store": "AGAST #2304: a `let p: @&[N]T` local doesn't record N, for a local either",
     "array_untyped_read": "AGAST #2304: `let p = @b` doesn't record the pointee array",
