@@ -140,7 +140,7 @@ class NameResolver:
             if isinstance(item, rast.FnDef):
                 self.functions.add(item.name)
                 if getattr(item, 'is_async', False):
-                    self.structs.add(f"{item.name}_Future")  # async_transform.py
+                    self.structs.add(f"{item.name}_Future")  # async_transform_v2.py
             elif isinstance(item, rast.ExternFn):
                 self.functions.add(item.name)
             elif isinstance(item, rast.StructDef):

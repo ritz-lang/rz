@@ -221,7 +221,7 @@ fn test_async_io()
 
 ## Compiler Changes Required
 
-1. **`async_transform.py`**: Generate proper state machine with Poll returns
+1. **`async_transform_v2.py`**: Generate proper state machine with Poll returns
 2. **Emitter**: Handle `Poll<T>` enum correctly
 3. **Type checking**: Ensure only async fns can be awaited
 4. **Runtime**: Implement block_on() executor

@@ -1,24 +1,17 @@
 # ritzgen-py
 
-Python parser generator that reads `grammars/ritz.grammar` and generates a Python-based recursive descent parser.
-
-## Purpose
-
-Replace hand-written `ritz0/parser.py` with generated code from the canonical grammar. This ensures:
-
-1. **Single source of truth**: `grammars/ritz.grammar` defines the language
-2. **No drift**: Parser exactly matches grammar specification
-3. **Reusable**: Same grammar can generate ritz1 (self-hosted) parser
+Python parser generator that reads `grammars/ritz1.grammar` and generates the
+Ritz sources of ritz1's parser.
 
 ## Usage
 
 ```bash
-# Generate parser from grammar
-python3 -m tools.ritzgen_py.generator grammars/ritz.grammar > ritz0/parser_gen.py
-
-# Generate with verbose output
-python3 -m tools.ritzgen_py.generator grammars/ritz.grammar --verbose
+python3 tools/ritzgen_py/ritz_generator.py grammars/ritz1.grammar \
+    --monolithic --output-dir <dir>
 ```
+
+`make regen-check` runs this and fails if the committed files in `ritz1/src/`
+differ from the output. See `docs/VALIDATION.md`.
 
 ## Architecture
 
@@ -26,7 +19,7 @@ python3 -m tools.ritzgen_py.generator grammars/ritz.grammar --verbose
 tools/ritzgen_py/
 ├── __init__.py
 ├── grammar_parser.py   # Parse .grammar files
-├── generator.py        # Generate Python parser code
+├── ritz_generator.py   # Generate Ritz parser code
 └── README.md
 ```
 
@@ -48,13 +41,3 @@ rule -> ReturnType
     | alternative2 { action }
     ;
 ```
-
-## Generated Code
-
-The generator produces:
-- Token constants (TOK_*)
-- Lexer class with tokenize()
-- Parser class with parse_* methods for each rule
-- AST node classes
-
-The generated parser integrates with existing `emitter_llvmlite.py`.

@@ -68,8 +68,7 @@ COMPILER_HASH_FILE = "compiler_hash"
 # tests, but is no longer used by `compute_compiler_hash()`.
 COMPILER_CRITICAL_FILES = [
     "ritz0/emitter_llvmlite.py",
-    "ritz0/parser_gen.py",
-    "ritz0/parser_adapter.py",
+    "ritz0/parser.py",
     "ritz0/async_transform_v2.py",
     "ritz0/monomorph.py",
     "ritz0/name_resolver.py",

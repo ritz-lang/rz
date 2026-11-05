@@ -22,9 +22,7 @@ from pathlib import Path
 from typing import List
 
 from lexer import Lexer, LexerError
-# Use generated parser with adapter (comment out to use hand-written parser)
-# from parser_adapter import Parser, ParseError  # Generated parser
-from parser import Parser, ParseError  # Hand-written parser
+from parser import Parser, ParseError
 from enum_from import rewrite_enum_from
 from emitter_llvmlite import emit as emit_llvmlite, EmitError
 from import_resolver import ImportResolver, ImportError as RitzImportError

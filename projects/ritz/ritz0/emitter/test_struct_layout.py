@@ -1,5 +1,5 @@
 """
-Tests for the struct layout registry.
+Tests for the struct layout registry, the one the emitter uses.
 
 Validates field alignment, padding, and struct sizing follow
 x86_64 System V ABI rules.
@@ -12,7 +12,7 @@ from pathlib import Path
 # Add ritz0 to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from emitter.struct_layout import FieldLayout, StructLayout, StructRegistry
+from emitter_llvmlite import FieldLayout, StructLayout, StructRegistry
 import ritz_ast as rast
 from tokens import Span
 

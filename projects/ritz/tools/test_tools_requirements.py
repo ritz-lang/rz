@@ -43,6 +43,7 @@ REQUIREMENTS = [
 LOCAL_MODULES = {
     "ci_local",
     "apply_string_migration",
+    "check_liveness",
     "audit_string_literals",
     "check_doc_examples",
     "check_no_s_strings",

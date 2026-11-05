@@ -457,7 +457,7 @@ class TestCacheCompilerHash:
 
         # Create a minimal set of critical files
         (ritz0_dir / "emitter_llvmlite.py").write_text("# emitter code")
-        (ritz0_dir / "parser_gen.py").write_text("# parser code")
+        (ritz0_dir / "parser.py").write_text("# parser code")
 
         h = compute_compiler_hash(tmp_path)
         assert len(h) == 64  # SHA256 hex digest
@@ -585,12 +585,12 @@ class TestCacheWholesaleInvalidation:
         (ritz0_dir / "ritz0.py").write_text("# main")
         emitter_dir = ritz0_dir / "emitter"
         emitter_dir.mkdir()
-        (emitter_dir / "calls.py").write_text("# v1")
+        (emitter_dir / "fn_cache.py").write_text("# v1")
 
         h1 = compute_compiler_hash(tmp_path, "ritz0")
-        (emitter_dir / "calls.py").write_text("# v2")
+        (emitter_dir / "fn_cache.py").write_text("# v2")
         h2 = compute_compiler_hash(tmp_path, "ritz0")
-        assert h1 != h2, "edit to emitter/calls.py did not change fingerprint"
+        assert h1 != h2, "edit to emitter/fn_cache.py did not change fingerprint"
 
         # New file in emitter/ also changes fingerprint.
         h3a = compute_compiler_hash(tmp_path, "ritz0")
