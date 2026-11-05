@@ -1729,8 +1729,10 @@ fn f(d: D) -> i32
     def test_field_of_an_untyped_binding_copies(self):
         assert self.body("var a = nothing()\nvar x = a.t\nvar y = x\nvar z = x") == []
 
-    def test_tuple_element_copies_until_2244(self):
-        assert self.body("var p = (T { id: 1 }, 2)\nvar x = p.0\neat(x)\neat(x)") == []
+    def test_tuple_element_binding_moves(self):
+        """Was the control `test_tuple_element_copies_until_2244` (AGAST #2244)."""
+        self.assert_moved(
+            self.body("var p = (T { id: 1 }, 2)\nvar x = p.0\neat(x)\neat(x)"), "x")
 
     # ---- inference itself ----
 
@@ -2078,3 +2080,263 @@ fn main() -> i32
         main = self._main("    let a = make().peek()\n    let b = make().into()\n    return 0\n")
         assert getattr(main.body.stmts[0].value.expr, 'drop_temp', None) is not None
         assert getattr(main.body.stmts[1].value.expr, 'drop_temp', None) is None
+
+
+class TestTupleElementMoves:
+    """A tuple element moves like a struct field (§13.6, AGAST #2244): its
+    path is `0`, `pair.0`, `0.t` in the same dotted form, and a moved element
+    leaves its siblings usable.
+    """
+
+    DEFS = drop_impl("T") + """
+struct T
+    id: i32
+
+struct H
+    t: T
+    n: i32
+
+struct V
+    pair: (T, i32)
+    u: T
+
+struct Gen<A>
+    pair: (A, i32)
+
+struct D
+    t: T
+
+enum E
+    Full(T)
+    Empty
+
+type P = (T, i32)
+
+impl T
+    fn burn(self: T) -> i32
+        return self.id
+
+    fn again(self: @T) -> T
+        return T { id: self.id }
+
+    fn peek(self: @T) -> i32
+        return self.id
+
+impl Drop for D
+    fn drop(self: @&D)
+        pass
+
+fn eat(t: T) -> i32
+    return t.id
+
+fn eat_i(i: i32) -> i32
+    return i
+
+fn eat_pair(p: (T, T)) -> i32
+    return 0
+
+fn look(t: @T) -> i32
+    return t.id
+
+fn mk() -> (T, i32)
+    return (T { id: 1 }, 2)
+"""
+
+    def module(self, text: str, params: str):
+        lines = "".join(f"    {l}\n" for l in text.splitlines())
+        module = parse(self.DEFS + f"\nfn f({params}) -> i32\n{lines}    return 0\n")
+        return module, MoveChecker().check(module)
+
+    def body(self, text: str, params: str = "p: (T, i32), q: (T, T), v: V") -> list:
+        return self.module(text, params)[1]
+
+    def fn_f(self, text: str, params: str = "p: (T, i32), q: (T, T), v: V"):
+        module, errors = self.module(text, params)
+        assert errors == []
+        return next(i for i in module.items
+                    if isinstance(i, rast.FnDef) and i.name == "f")
+
+    def assert_moved(self, errors: list, name: str):
+        assert len(errors) == 1, errors
+        assert f"use of moved value: `{name}`" in str(errors[0])
+
+    # ---- the move ----
+
+    def test_second_move_is_rejected(self):
+        self.assert_moved(self.body("eat(p.0)\neat(p.0)"), "p.0")
+
+    def test_moved_once_is_fine(self):
+        assert self.body("eat(p.0)") == []
+
+    def test_local_tuple(self):
+        self.assert_moved(self.body("var l = (T { id: 1 }, 2)\neat(l.0)\neat(l.0)"), "l.0")
+
+    def test_let_tuple(self):
+        self.assert_moved(self.body("let l = (T { id: 1 }, 2)\neat(l.0)\neat(l.0)"), "l.0")
+
+    def test_alias_of_a_tuple(self):
+        self.assert_moved(self.body("eat(a.0)\neat(a.0)", "a: P"), "a.0")
+
+    def test_read_after_move_is_rejected(self):
+        self.assert_moved(self.body("eat(p.0)\nlook(@p.0)"), "p.0")
+
+    def test_whole_tuple_after_move_is_rejected(self):
+        self.assert_moved(self.body("eat(q.0)\neat_pair(q)"), "q.0")
+
+    def test_sibling_stays_usable(self):
+        assert self.body("eat(q.0)\neat(q.1)") == []
+
+    def test_copy_element_copies(self):
+        assert self.body("eat(p.0)\neat_i(p.1)\neat_i(p.1)") == []
+
+    def test_all_copy_tuple_copies(self):
+        assert self.body("eat_i(c.0)\neat_i(c.0)", "c: (i32, i32)") == []
+
+    def test_moved_in_a_branch(self):
+        self.assert_moved(self.body("if p.1 == 0\n    eat(p.0)\neat(p.0)"), "p.0")
+
+    def test_moved_in_a_loop(self):
+        self.assert_moved(self.body("while p.1 == 0\n    eat(p.0)"), "p.0")
+
+    def test_annotations_for_the_emitter(self):
+        fn = self.fn_f("eat(q.1)")
+        call = fn.body.stmts[0].expr
+        assert call.args[0].moves_field is True
+        assert fn.field_moves == {("q", "1")}
+
+    def test_read_is_not_a_move(self):
+        assert self.fn_f("look(@p.0)\neat(p.0)").field_moves == {("p", "0")}
+
+    def test_assigning_the_element_gives_it_back(self):
+        """The checker's half; ritz0 can't emit the assignment yet (#2283)."""
+        assert self.body("eat(p.0)\np.0 = T { id: 2 }\neat(p.0)") == []
+
+    def test_assigning_the_tuple_gives_it_back(self):
+        assert self.body("eat(p.0)\np = (T { id: 2 }, 3)\neat(p.0)") == []
+
+    # ---- bindings from an element ----
+
+    def test_binding_moves_the_element(self):
+        self.assert_moved(self.body("var x = p.0\neat(p.0)"), "p.0")
+
+    def test_binding_of_a_copy_element_copies(self):
+        assert self.body("var x = p.1\neat_i(x)\neat_i(x)") == []
+
+    def test_out_of_range_element_is_unknown(self):
+        """The emitter reports it; here it just isn't a move."""
+        assert self.body("var x = p.5\nvar y = x\nvar z = x") == []
+
+    def test_numeric_field_of_a_struct_is_not_an_element(self):
+        """`h.0` reads a struct positionally. It stays a use of `h`, so what
+        moved out of `h` still counts."""
+        self.assert_moved(self.body("eat(h.t)\nvar x = h.0", "h: H"), "h.t")
+
+    # ---- paths through a tuple ----
+
+    def test_tuple_in_a_field(self):
+        self.assert_moved(self.body("eat(v.pair.0)\neat(v.pair.0)"), "v.pair.0")
+
+    def test_tuple_in_a_field_leaves_the_rest(self):
+        assert self.body("eat(v.pair.0)\neat_i(v.pair.1)\neat(v.u)") == []
+
+    def test_parent_of_an_element_is_partly_moved(self):
+        self.assert_moved(self.body("eat(v.pair.0)\nvar y = v.pair"), "v.pair.0")
+
+    def test_path_in_field_moves(self):
+        assert self.fn_f("eat(v.pair.0)").field_moves == {("v", "pair.0")}
+
+    def test_binding_through_a_field(self):
+        self.assert_moved(self.body("var x = v.pair.0\neat(x)\neat(x)"), "x")
+
+    def test_generic_field(self):
+        self.assert_moved(self.body("eat(g.pair.0)\neat(g.pair.0)", "g: Gen<T>"), "g.pair.0")
+
+    def test_struct_in_an_element(self):
+        self.assert_moved(self.body("eat(e.0.t)\neat(e.0.t)", "e: (H, i32)"), "e.0.t")
+
+    def test_tuple_in_a_tuple(self):
+        self.assert_moved(self.body("eat((n.0).1)\neat((n.0).1)", "n: ((i32, T), i32)"), "n.0.1")
+
+    @pytest.mark.xfail(strict=True, reason="AGAST #2284: `0.1` lexes as a float")
+    def test_tuple_in_a_tuple_without_parens(self):
+        self.assert_moved(self.body("eat(n.0.1)\neat(n.0.1)", "n: ((i32, T), i32)"), "n.0.1")
+
+    def test_element_with_a_moved_part_is_partly_moved(self):
+        self.assert_moved(self.body("eat(e.0.t)\nvar y = e.0", "e: (H, i32)"), "e.0.t")
+
+    def test_element_implementing_drop_is_rejected(self):
+        errors = self.body("eat(e.0.t)", "e: (D, i32)")
+        assert len(errors) == 1
+        assert "cannot move out of `e.0.t`: `D` implements Drop" in str(errors[0])
+
+    def test_whole_element_implementing_drop_moves(self):
+        assert self.body("var x = e.0", "e: (D, i32)") == []
+
+    # ---- owners that lend ----
+
+    def test_lent_tuple_is_rejected(self):
+        errors = self.body("eat(l.0)", "l:& (T, i32)")
+        assert len(errors) == 1
+        assert "cannot move out of borrowed parameter `l`" in str(errors[0])
+
+    def test_lent_tuple_copy_element(self):
+        assert self.body("eat_i(l.1)\neat_i(l.1)", "l:& (T, i32)") == []
+
+    @pytest.mark.parametrize("param", ["r: @(T, i32)", "r: *(T, i32)"])
+    def test_reference_owner_keeps_its_element(self, param):
+        """Control: a move through a reference is #2227's question."""
+        assert self.body("eat(r.0)\neat(r.0)", param) == []
+
+    @pytest.mark.parametrize("param", ["r: @(T, i32)", "r: *(T, i32)"])
+    def test_binding_through_a_reference_moves(self, param):
+        self.assert_moved(self.body("var x = r.0\neat(x)\neat(x)", param), "x")
+
+    def test_path_leaving_through_a_pointer_element(self):
+        """Control: `e.0` is a pointer, so nothing owns what it points to."""
+        assert self.body("eat(e.0.t)\neat(e.0.t)", "e: (*H, i32)") == []
+
+    # ---- what the element's type feeds ----
+
+    def test_by_value_receiver_moves_the_element(self):
+        self.assert_moved(self.body("p.0.burn()\neat(p.0)"), "p.0")
+
+    def test_lending_receiver_keeps_the_element(self):
+        assert self.body("p.0.peek()\np.0.peek()\neat(p.0)") == []
+
+    def test_method_result_is_a_temporary(self):
+        stmt = self.fn_f("p.0.again()").body.stmts[0]
+        assert stmt.expr.drop_temp.name == "T"
+
+    def test_match_owns_the_element(self):
+        fn = self.fn_f("match s.0\n    Full(t) => eat(t)\n    Empty => 0", "s: (E, i32)")
+        assert fn.body.stmts[0].expr.owns_scrutinee.name == "E"
+        assert fn.field_moves == {("s", "0")}
+
+    def test_payload_binding_of_an_element_moves(self):
+        self.assert_moved(
+            self.body("match s.0\n    Full(t) => eat(t) + eat(t)\n    Empty => 0", "s: (E, i32)"),
+            "t")
+
+    def test_try_on_an_element(self):
+        errors = check(self.DEFS + """
+fn f(r: (Result<T, i32>, i32)) -> Result<i32, i32>
+    var x = r.0?
+    eat(x)
+    eat(x)
+    return Ok(0)
+""")
+        self.assert_moved(errors, "x")
+
+    def test_element_of_a_temporary_binding(self):
+        self.assert_moved(self.body("var x = mk().0\neat(x)\neat(x)"), "x")
+
+    def test_element_of_a_temporary_takes_the_temporary(self):
+        call = self.fn_f("eat(mk().0)").body.stmts[0].expr.args[0].expr
+        assert getattr(call, "drop_temp", None) is None
+
+    def test_copy_element_of_a_temporary_leaves_it_a_temporary(self):
+        call = self.fn_f("eat_i(mk().1)").body.stmts[0].expr.args[0].expr
+        assert call.drop_temp is not None
+
+    def test_literal_takes_the_element(self):
+        self.assert_moved(self.body("var a = (p.0, 1)\neat(p.0)"), "p.0")

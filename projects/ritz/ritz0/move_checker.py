@@ -1058,10 +1058,17 @@ class MoveChecker:
         base = self.types.resolve(self._field_path_type(expr.expr))
         while isinstance(base, (rast.PtrType, rast.RefType)):
             base = self.types.resolve(base.inner)
-        if not isinstance(base, rast.NamedType):
-            return None
-        return next((t for n, t in self.types.struct_fields(base)
-                     if n == expr.field), None)
+        return self._part_type(base, expr.field)
+
+    def _part_type(self, owner: Optional[rast.Type], part: str) -> Optional[rast.Type]:
+        """The type of `part` of a value of type `owner`: a struct's field by
+        name or a tuple's element by index (AGAST #2244). None if it has none."""
+        if isinstance(owner, rast.TupleType):
+            index = int(part) if part.isdigit() else len(owner.elements)
+            return owner.elements[index] if index < len(owner.elements) else None
+        if isinstance(owner, rast.NamedType):
+            return next((t for n, t in self.types.struct_fields(owner) if n == part), None)
+        return None
 
     def _reject_move_out(self, param: str, span: Optional[rast.Span]) -> None:
         self.errors.append(OwnershipError(
@@ -1069,34 +1076,36 @@ class MoveChecker:
 
     # ---- moves out of a field (AGAST #2171) ----------------------------------
 
-    def _path_owners(self, expr: rast.Field) -> Optional[List[rast.NamedType]]:
-        """The values `expr` (`b.f.g`) is held in by value, outermost first
-        (`b`, then `b.f`), when `b` owns a struct value: a local or by-value
-        parameter of a named type, not a pointer, a reference or a `name:& T`
-        parameter. None if the path isn't held that way all along: it leaves
-        through a pointer, a tuple or an enum."""
+    def _path_owners(self, expr: rast.Field) -> Optional[List[rast.Type]]:
+        """The values `expr` (`b.f.g`, `b.f.0`) is held in by value, outermost
+        first (`b`, then `b.f`), when `b` owns a struct or tuple value: a local
+        or by-value parameter of a named or tuple type, not a pointer, a
+        reference or a `name:& T` parameter. None if the path isn't held that
+        way all along: it leaves through a pointer or an enum."""
         base = expr.expr
         if isinstance(base, rast.Ident):
             info = self.scope.lookup(base.name)
             if info is None or info.borrow == rast.Borrow.MUTABLE:
                 return None
             ty = self.types.resolve(info.ritz_type)
-            return [ty] if isinstance(ty, rast.NamedType) else None
+            return [ty] if isinstance(ty, (rast.NamedType, rast.TupleType)) else None
         if not isinstance(base, rast.Field):
             return None
         owners = self._path_owners(base)
         if owners is None:
             return None
-        ty = self.types.resolve(next(
-            (t for n, t in self.types.struct_fields(owners[-1]) if n == base.field), None))
-        if not isinstance(ty, rast.NamedType) or ty.name not in self.types.structs:
-            return None
-        return owners + [ty]
+        ty = self.types.resolve(self._part_type(owners[-1], base.field))
+        if isinstance(ty, rast.TupleType) or (
+                isinstance(ty, rast.NamedType) and ty.name in self.types.structs):
+            return owners + [ty]
+        return None
 
     def _field_owner(self, expr: rast.Field) -> Optional[VarInfo]:
         """The binding `expr` (`b.f`, `b.f.g`) is a field of, when the binding
-        holds that field by value (_path_owners). None otherwise."""
-        if expr.field.isdigit() or self._path_owners(expr) is None:
+        holds that field by value (_path_owners). None otherwise, as for
+        `h.0` of a struct: a positional read, so a use of all of `h`."""
+        owners = self._path_owners(expr)
+        if owners is None or expr.field.isdigit() != isinstance(owners[-1], rast.TupleType):
             return None
         path = field_path(expr)
         return self.scope.lookup(path[0]) if path is not None else None

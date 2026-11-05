@@ -2112,6 +2112,28 @@ fn main() -> i32
     consume(v.w.t)
 ```
 
+A tuple element moves the same way, by its index: `p.0` moves out of `p`, `p.1`
+stays usable, `p` is partly moved and `p`'s drop skips the element. So does an
+element on a longer path, like `v.pair.0`. `(p.0).1` is an element of an
+element (`p.0.1` doesn't parse yet, AGAST #2284).
+
+```ritz expect-error="use of moved value: `p.0`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn main() -> i32
+    var p = (Resource { handle: 3 }, 4)
+    consume(p.0)
+    consume(p.0)                    # error: p.0 has already moved
+```
+
 A move-only type with no `Drop` impl of its own, such as a struct with a
 `Drop` field, is dropped by dropping its move-only parts:
 
@@ -2176,8 +2198,9 @@ fn main() -> i32
     r.handle                        # r is dropped after this is evaluated
 ```
 
-ritz0 follows these rules (AGAST #2157, #2161, #2232), except that a move out
-of a tuple element isn't tracked yet (AGAST #2244). ritz1 follows them (AGAST
+ritz0 follows these rules (AGAST #2157, #2161, #2232, #2244), except that
+`let (a, b) = p` isn't move-checked yet (AGAST #2282) and a tuple element can't
+be assigned to yet (AGAST #2283). ritz1 follows them (AGAST
 #2158) except for enum payloads, arrays, temporaries and moves inside loops
 (AGAST #2165), and it has no tuple literals yet (AGAST #1526). A nested move
 in ritz1 moves the whole top-level field, so that field's other parts leak and

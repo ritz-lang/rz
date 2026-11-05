@@ -22,7 +22,9 @@ bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
 AGAST #2173 added assigning a move-only field (the old value drops),
 closed for both. AGAST #2257 added bindings and temporaries from a method
 call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262). AGAST
-#2243 added bindings from a field, which ritz1 already got right.
+#2243 added bindings from a field, which ritz1 already got right. AGAST
+#2244 added moves out of a tuple element, closed for ritz0; ritz1 has no
+tuples to move out of yet (#1526).
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -147,6 +149,45 @@ BINDING_TYPE_GAP = {"ritz1": 2267, "ritz1_selfhosted": 2267}
 
 # A value moved out through a reference: what that means is #2227's question.
 THROUGH_REFERENCE_GAP = {c: 2227 for c in COMPILERS}
+
+# Shapes a move out of a tuple element can take (AGAST #2244).
+TUPLES = """\
+struct WithPair
+    pair: (Tracked, Tracked)
+    u: Tracked
+
+struct InElement
+    t: Tracked
+    s: Tracked
+
+impl Tracked
+    fn burn(self: Tracked) -> i32
+        return self.id
+
+    fn again(self: @Tracked) -> Tracked
+        return Tracked { id: self.id }
+
+    fn peek(self: @Tracked) -> i32
+        return self.id
+
+fn look(t: @Tracked) -> i32
+    return t.id
+
+fn make_pair(a: i32, b: i32) -> (Tracked, Tracked)
+    return (make(a), make(b))
+
+fn make_mixed(a: i32) -> (Tracked, i32)
+    return (make(a), 5)
+
+"""
+
+# ritz1 has no tuples yet.
+NO_TUPLES = {"ritz1": 1526, "ritz1_selfhosted": 1526}
+
+
+def tuple_gap(ticket):
+    """A ritz0 gap in something ritz1 can't compile either (#1526)."""
+    return {"ritz0": ticket, **NO_TUPLES}
 
 # Method temporaries ritz1 doesn't drop yet.
 METHOD_TEMP_GAP = {"ritz1": 2262, "ritz1_selfhosted": 2262}
@@ -1423,6 +1464,526 @@ pub fn main() -> i32
     let inner = f()
     return inner + DROPS
 """, 1, {}),
+
+    # AGAST #2244: the ticket's program. The tuple's drop skips the element.
+    "tuple_element_moved": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    consume(p.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_moved_let": (TUPLES + SLOT + """\
+fn f()
+    let p = (make(1), 2)
+    consume(p.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_sibling_still_drops": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), make(2))
+    consume(p.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    # The moved element drops in `consume`, then the rest, in order.
+    "tuple_element_sibling_order": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), make(2), make(3))
+    consume(p.1)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 213, NO_TUPLES),
+
+    "tuple_element_both_moved": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), make(2))
+    consume(p.0)
+    consume(p.1)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_binding": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    var x = p.0
+    consume(x)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    # The binding owns it now, and drops it.
+    "tuple_element_binding_unmoved": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    var x = p.0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_param": (TUPLES + SLOT + """\
+fn g(p: (Tracked, Tracked)) -> i32
+    return consume(p.1)
+
+fn f()
+    g(make_pair(1, 2))
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_from_call": (TUPLES + SLOT + """\
+fn f()
+    var p = make_pair(1, 2)
+    consume(p.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_conditional_taken": (TUPLES + SLOT + """\
+fn g(c: i32)
+    var p = (make(1), 2)
+    if c == 1
+        consume(p.0)
+
+fn f()
+    g(1)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_conditional_not_taken": (TUPLES + SLOT + """\
+fn g(c: i32)
+    var p = (make(1), 2)
+    if c == 1
+        consume(p.0)
+
+fn f()
+    g(0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_returned": (TUPLES + SLOT + """\
+fn g() -> Tracked
+    var p = (make(1), make(2))
+    return p.0
+
+fn f()
+    consume(g())
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_tail": (TUPLES + SLOT + """\
+fn g() -> Tracked
+    var p = (make(1), make(2))
+    p.1
+
+fn f()
+    consume(g())
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    # Reassigning drops what is left of the old value; the new one is whole.
+    "tuple_reassigned_after_element_move": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), make(2))
+    consume(p.0)
+    p = (make(3), make(4))
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 4, NO_TUPLES),
+
+    # A path through a tuple.
+    "tuple_element_in_field": (TUPLES + SLOT + """\
+fn f()
+    var v = WithPair { pair: (make(1), make(2)), u: make(3) }
+    consume(v.pair.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 3, NO_TUPLES),
+
+    "tuple_element_in_field_binding": (TUPLES + SLOT + """\
+fn f()
+    var v = WithPair { pair: (make(1), make(2)), u: make(3) }
+    var x = v.pair.1
+    consume(x)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 3, NO_TUPLES),
+
+    "tuple_in_field_whole_after_element_is_part": (TUPLES + SLOT + """\
+fn f()
+    var v = WithPair { pair: (make(1), make(2)), u: make(3) }
+    consume(v.pair.0)
+    consume(v.u)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 3, NO_TUPLES),
+
+    # A path through a tuple into a struct.
+    "tuple_field_of_an_element": (TUPLES + SLOT + """\
+fn f()
+    var p = (InElement { t: make(1), s: make(2) }, 7)
+    consume(p.0.t)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_in_tuple": (TUPLES + SLOT + """\
+fn f()
+    var p = ((make(1), make(2)), make(3))
+    consume((p.0).1)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 3, NO_TUPLES),
+
+    # What the element's type feeds.
+    "tuple_element_by_value_receiver": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), make(2))
+    p.0.burn()
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_method_temporary": (TUPLES + SLOT + """\
+fn f() -> i32
+    var p = (make(1), 2)
+    p.0.again()
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_match": (TUPLES + SLOT + """\
+fn f()
+    var p = (Slot.Full(make(1)), make(2))
+    match p.0
+        Full(t) => consume(t)
+        _ => 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_match_wildcard": (TUPLES + SLOT + """\
+fn f()
+    var p = (Slot.Full(make(1)), make(2))
+    match p.0
+        _ => 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_of_temporary": (TUPLES + SLOT + """\
+fn f()
+    consume(make_mixed(1).0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_of_temporary_binding": (TUPLES + SLOT + """\
+fn f()
+    var x = make_mixed(1).0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_into_literal": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), make(2))
+    var q = (p.0, 3)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_into_literal_temporary": (TUPLES + SLOT + """\
+fn f() -> i32
+    var p = (make(1), make(2))
+    (p.0, 3)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    # Lending an element takes its address, which moves nothing.
+    "tuple_element_lent": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    look(@p.0)
+    consume(p.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_lending_receiver": (TUPLES + SLOT + """\
+fn g(p: (Tracked, i32)) -> i32
+    return p.0.peek()
+
+fn f()
+    g((make(1), 2))
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    # A reference element copies, so the value drops once, from `t`.
+    "tuple_element_copy_reference": (TUPLES + SLOT + """\
+fn f()
+    var t = make(1)
+    var p = (@t, 2)
+    var x = p.0
+    look(x)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_try": (TUPLES + SLOT + """\
+fn g(r: (Result<Tracked, i32>, i32)) -> Result<i32, i32>
+    var x = r.0?
+    return Ok(consume(x))
+
+fn f()
+    var r: Result<Tracked, i32> = Ok(make(1))
+    g((r, 2))
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_for": (TUPLES + SLOT + """\
+fn f()
+    var p = ([make(1), make(2)], 3)
+    for v in p.0
+        consume(v)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_in_loop": (TUPLES + SLOT + """\
+fn f()
+    var i = 0
+    while i < 3
+        var p = (make(1), make(2))
+        consume(p.0)
+        i = i + 1
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 6, NO_TUPLES),
+
+    "tuple_element_before_break": (TUPLES + SLOT + """\
+fn f()
+    while true
+        var p = (make(1), 2)
+        consume(p.0)
+        break
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    "tuple_element_before_return": (TUPLES + SLOT + """\
+fn g() -> i32
+    var p = (make(1), make(2))
+    consume(p.0)
+    return 0
+
+fn f()
+    g()
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, NO_TUPLES),
+
+    "tuple_element_alias": (TUPLES + SLOT + """\
+type Mixed = (Tracked, i32)
+
+fn g(p: Mixed) -> i32
+    return consume(p.0)
+
+fn f()
+    g((make(1), 2))
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    # The emitter types the binding through the alias, so `x` drops it.
+    "tuple_element_alias_binding": (TUPLES + SLOT + """\
+type Mixed = (Tracked, i32)
+
+fn f()
+    var p: Mixed = (make(1), 2)
+    var x = p.0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
+
+    # What a move through a reference means is #2227's question.
+    "tuple_element_through_reference": (TUPLES + SLOT + """\
+fn g(r: @(Tracked, i64)) -> i32
+    var x = r.0
+    return consume(x)
+
+fn f()
+    var p = (make(1), 2)
+    g(@p)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, THROUGH_REFERENCE_GAP),
+
+    # Gaps next to #2244.
+    "tuple_destructure_moved": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    let (a, b) = p
+    consume(a)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, tuple_gap(2282)),
+
+    "tuple_destructure_call": (TUPLES + SLOT + """\
+fn f()
+    let (a, b) = make_pair(1, 2)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, tuple_gap(2282)),
+
+    "tuple_element_assigned_back": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    consume(p.0)
+    p.0 = make(3)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, tuple_gap(2283)),
+
+    "tuple_element_assigned_drops_old": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    p.0 = make(3)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, tuple_gap(2283)),
+
+    "tuple_element_in_generic_field": (TUPLES + SLOT + """\
+struct GenPair<A>
+    pair: (A, i32)
+
+fn f()
+    var g = GenPair<Tracked> { pair: (make(1), 2) }
+    consume(g.pair.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, tuple_gap(2285)),
+
+    # A binding from an element has the element's type, signedness included.
+    "tuple_element_keeps_its_signedness": ("""\
+pub fn main() -> i32
+    var p: (u8, i32) = (200 as u8, 1)
+    var x = p.0
+    if x > 100
+        return 1
+    return 0
+""", 1, NO_TUPLES),
+
+    "tuple_copy_element_read": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), 2)
+    var n = p.1
+    consume(p.0)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, NO_TUPLES),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -1588,6 +2149,35 @@ pub fn main() -> i32
         _ => 0
     return 0
 """, "t", {}),
+
+    "tuple_element_after_move": (TUPLES + """\
+pub fn main() -> i32
+    var p = (make(1), 2)
+    return consume(p.0) + consume(p.0)
+""", "p.0", NO_TUPLES),
+
+    "tuple_element_binding_after_move": (TUPLES + """\
+pub fn main() -> i32
+    var p = (make(1), 2)
+    var x = p.0
+    return consume(x) + consume(x)
+""", "x", NO_TUPLES),
+
+    "tuple_after_element_move": (TUPLES + """\
+pub fn main() -> i32
+    var p = (make(1), 2)
+    consume(p.0)
+    var q = p
+    return 0
+""", "p.0", NO_TUPLES),
+
+    "tuple_in_field_after_element_move": (TUPLES + """\
+pub fn main() -> i32
+    var v = WithPair { pair: (make(1), make(2)), u: make(3) }
+    consume(v.pair.0)
+    var q = v.pair
+    return 0
+""", "v.pair.0", NO_TUPLES),
 }
 
 

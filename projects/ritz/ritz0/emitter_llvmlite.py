@@ -1498,6 +1498,11 @@ class LLVMEmitter:
                     base_type = base_type.inner
                 elif isinstance(base_type, rast.RefType):
                     base_type = base_type.inner
+                # A tuple's element: the binding owns it (AGAST #2244).
+                base_type = self.move_types.resolve(base_type)
+                if isinstance(base_type, rast.TupleType):
+                    index = int(expr.field) if expr.field.isdigit() else len(base_type.elements)
+                    return base_type.elements[index] if index < len(base_type.elements) else None
                 # Look up field type in struct definition
                 if isinstance(base_type, rast.NamedType):
                     struct_name = base_type.name
@@ -4374,9 +4379,10 @@ class LLVMEmitter:
         first, if it has one, then its move-only parts: a struct's fields in
         declaration order (AGAST #2157), the payload of the variant an enum
         holds, an array's elements in index order and a tuple's elements in
-        order (AGAST #2161). A struct field with a flag in `field_flags`,
-        which is keyed by path below `ptr`, drops only while that flag is
-        set: it may have been moved out (AGAST #2171, #2232).
+        order (AGAST #2161). A struct field or tuple element with a flag in
+        `field_flags`, which is keyed by path below `ptr`, drops only while
+        that flag is set: it may have been moved out (AGAST #2171, #2232,
+        #2244).
         """
         if depth > 32 or not self.move_types.is_move_only(ritz_type):
             return
@@ -4394,7 +4400,7 @@ class LLVMEmitter:
                     if i < len(ptr.type.pointee.elements) and self.move_types.is_move_only(ety):
                         eptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0),
                                                       ir.Constant(self.i32, i)])
-                        self._emit_drop_glue(eptr, ety, depth + 1)
+                        self._emit_part_drop(eptr, ety, str(i), depth, field_flags)
             return
         drop_fn_name = self._get_drop_fn_name(ritz_type)
         if drop_fn_name and drop_fn_name in self.functions:
@@ -4421,18 +4427,24 @@ class LLVMEmitter:
             except (ValueError, KeyError):
                 continue
             fptr = self.builder.gep(ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-            fflag = (field_flags or {}).get(fname)
-            below = self._flags_below(field_flags or {}, fname)
-            if fflag is None:
-                self._emit_drop_glue(fptr, fty, depth + 1, field_flags=below)
-                continue
-            drop_block = self.current_fn.append_basic_block(f"drop.field.{fname}")
-            cont_block = self.current_fn.append_basic_block(f"drop.field.{fname}.cont")
-            self.builder.cbranch(self.builder.load(fflag), drop_block, cont_block)
-            self.builder.position_at_end(drop_block)
-            self._emit_drop_glue(fptr, fty, depth + 1, field_flags=below)
-            self.builder.branch(cont_block)
-            self.builder.position_at_end(cont_block)
+            self._emit_part_drop(fptr, fty, fname, depth, field_flags)
+
+    def _emit_part_drop(self, ptr: ir.Value, ritz_type: rast.Type, part: str, depth: int,
+                        field_flags: Optional[Dict[str, ir.AllocaInstr]]):
+        """Drop the struct field or tuple element `part` at `ptr`, while its
+        flag in `field_flags` (keyed by path from its parent) is set."""
+        flag = (field_flags or {}).get(part)
+        below = self._flags_below(field_flags or {}, part)
+        if flag is None:
+            self._emit_drop_glue(ptr, ritz_type, depth + 1, field_flags=below)
+            return
+        drop_block = self.current_fn.append_basic_block(f"drop.field.{part}")
+        cont_block = self.current_fn.append_basic_block(f"drop.field.{part}.cont")
+        self.builder.cbranch(self.builder.load(flag), drop_block, cont_block)
+        self.builder.position_at_end(drop_block)
+        self._emit_drop_glue(ptr, ritz_type, depth + 1, field_flags=below)
+        self.builder.branch(cont_block)
+        self.builder.position_at_end(cont_block)
 
     def _emit_array_drop_glue(self, ptr: ir.Value, ritz_type: rast.ArrayType, depth: int):
         """Drop `[N]T`'s elements in index order, in a loop (N may be large)."""
@@ -8897,6 +8909,10 @@ class LLVMEmitter:
             struct_addr = self._emit_lvalue_addr(expr.expr)
             if isinstance(struct_addr.type, ir.PointerType):
                 pointee = struct_addr.type.pointee
+                if isinstance(pointee, ir.LiteralStructType) and expr.field.isdigit():
+                    # A tuple's element: `@p.0`, or `p.0.m()` lending self.
+                    return self.builder.gep(struct_addr, [ir.Constant(self.i32, 0),
+                                                          ir.Constant(self.i32, int(expr.field))])
                 if isinstance(pointee, ir.BaseStructType):
                     struct_name = self._get_struct_name_from_type(pointee)
                     if struct_name:
