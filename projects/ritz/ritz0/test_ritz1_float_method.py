@@ -218,3 +218,56 @@ def test_ritz1_float_method_ir_shape(ritz1_bin, tmp_path):
         assert f"@llvm.{libcall}" not in ir
     assert "fptosi double" in ir and "sitofp i64" in ir
     assert _run("ritz1", tmp_path, "ir_shape_run", IR_SHAPE) == 3 + 2 + 8
+
+
+# AGAST #2225: a module declares llvm.fabs at exactly the widths it calls.
+# `mask & 2 == 2` parses as `mask & (2 == 2)`, which tested the f32 bit for the
+# f64 declare. IR_SHAPE uses both widths, so it could not see that.
+#
+# The declares are asserted on the IR text because running proves nothing here:
+# clang 21 accepts a call to an undeclared llvm.* intrinsic, so the f64-only
+# module linked and returned the right answer with its declare missing.
+FABS_PROGRAM = """\
+pub fn main() -> i32
+    let x: {ty} = 0.0 - 2.5
+    let y: {ty} = x.abs()
+    return (y * 2.0) as i32
+"""
+
+FABS_F32_DECLARE = "declare float @llvm.fabs.f32(float)"
+FABS_F64_DECLARE = "declare double @llvm.fabs.f64(double)"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "ty, wanted, unwanted",
+    [
+        ("f32", FABS_F32_DECLARE, FABS_F64_DECLARE),
+        ("f64", FABS_F64_DECLARE, FABS_F32_DECLARE),
+    ],
+)
+def test_ritz1_fabs_declared_only_at_used_width(
+    ritz1_bin, tmp_path, ty, wanted, unwanted
+):
+    import os
+    import subprocess
+
+    from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT
+
+    program = FABS_PROGRAM.format(ty=ty)
+    src = tmp_path / f"fabs_{ty}.ritz"
+    src.write_text(program)
+    ll = tmp_path / f"fabs_{ty}.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    comp = subprocess.run(
+        [str(RITZ1_BIN), str(src), "-o", str(ll)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert comp.returncode == 0, comp.stderr
+    ir = ll.read_text()
+    assert ir.count(wanted) == 1
+    assert ir.count(unwanted) == 0
+    assert _run("ritz1", tmp_path, f"fabs_{ty}_run", program) == 5
