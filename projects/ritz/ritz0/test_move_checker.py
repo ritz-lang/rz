@@ -7,6 +7,7 @@ Phase 9: Ownership & Borrowing
 import pytest
 from parser import parse
 from move_checker import MoveChecker, OwnershipError
+import ritz_ast as rast
 
 
 def drop_impl(ty: str) -> str:
@@ -1545,6 +1546,226 @@ fn f(t: T, p: @T, h: H, bt: Box<T>, bi: Box<i32>, c: C) -> i32
     def test_impls_disagreeing_on_the_return_type_copy(self):
         # A wrong "move" rejects a valid program (MoveTypes).
         self.assert_copies("var u = t.name()")
+
+
+class TestFieldBindingType:
+    """A binding from a field has that field's type (AGAST #2243), so it moves
+    and drops once. The move out of the field stays with the field-move
+    tracking (`_field_owner`, `_check_owned_field`); only the binding's type
+    is new.
+    """
+
+    DEFS = drop_impl("T") + """
+struct T
+    id: i32
+
+struct H
+    t: T
+    u: T
+    n: i32
+
+struct V
+    w: H
+    u: T
+
+struct Refs
+    p: *T
+    r: @T
+    n: i32
+
+struct Gen<A>
+    v: A
+
+struct Res
+    r: Result<T, i32>
+
+enum E
+    Full(T)
+    Empty
+
+struct HE
+    e: E
+
+impl T
+    fn burn(self: T) -> i32
+        return self.id
+
+    fn again(self: @T) -> T
+        return T { id: self.id }
+
+fn eat(t: T) -> i32
+    return t.id
+
+fn eat_e(e: E) -> i32
+    return 0
+
+fn eat_i(i: i32) -> i32
+    return i
+
+fn mk() -> H
+    return H { t: T { id: 1 }, u: T { id: 2 }, n: 0 }
+"""
+
+    def body(self, text: str, params: str = "h: H, v: V") -> list:
+        lines = "".join(f"    {l}\n" for l in text.splitlines())
+        return check(self.DEFS + f"\nfn f({params}) -> i32\n{lines}    return 0\n")
+
+    def assert_moved(self, errors: list, name: str):
+        assert len(errors) == 1, errors
+        assert f"use of moved value: `{name}`" in str(errors[0])
+
+    @pytest.mark.parametrize("decl", ["var x = h.t", "let x = h.t"])
+    def test_binding_moves(self, decl):
+        self.assert_moved(self.body(f"{decl}\neat(x)\neat(x)"), "x")
+
+    def test_moved_once_is_fine(self):
+        assert self.body("var x = h.t\neat(x)") == []
+
+    def test_nested_field(self):
+        self.assert_moved(self.body("var x = v.w.t\neat(x)\neat(x)"), "x")
+
+    def test_part_of_a_field_binding_moves_out_of_it(self):
+        self.assert_moved(self.body("var x = v.w\nvar y = x.t\neat(x.t)"), "x.t")
+
+    def test_alias_of_the_owner(self):
+        errors = check(self.DEFS + """
+type HA = H
+
+fn f(h: HA) -> i32
+    var x = h.t
+    eat(x)
+    return eat(x)
+""")
+        self.assert_moved(errors, "x")
+
+    def test_generic_field_with_type_args(self):
+        self.assert_moved(self.body("var x = g.v\neat(x)\neat(x)", "g: Gen<T>"), "x")
+
+    def test_generic_field_of_a_copy_type_copies(self):
+        assert self.body("var x = g.v\neat_i(x)\neat_i(x)", "g: Gen<i32>") == []
+
+    def test_field_of_a_temporary(self):
+        self.assert_moved(self.body("var x = mk().t\neat(x)\neat(x)"), "x")
+
+    def test_by_value_receiver_moves_it(self):
+        self.assert_moved(self.body("var x = h.t\nx.burn()\neat(x)"), "x")
+
+    def test_result_of_try(self):
+        errors = check(self.DEFS + """
+fn f(h: Res) -> Result<i32, i32>
+    var x = h.r?
+    eat(x)
+    eat(x)
+    return Ok(0)
+""")
+        self.assert_moved(errors, "x")
+
+    def test_deref_of_a_pointer_field(self):
+        self.assert_moved(self.body("var x = *r.p\neat(x)\neat(x)", "r: Refs"), "x")
+
+    def test_match_owns_the_binding(self):
+        self.assert_moved(self.body(
+            "var x = b.e\nmatch x\n    Full(t) => eat(t)\n    Empty => 0\neat_e(x)", "b: HE"), "x")
+
+    # ---- the field-move tracking, which the binding must agree with ----
+
+    def test_field_is_moved_out(self):
+        self.assert_moved(self.body("var x = h.t\neat(h.t)"), "h.t")
+
+    def test_owner_is_partly_moved(self):
+        self.assert_moved(self.body("var x = h.t\nvar y = h"), "h.t")
+
+    def test_parent_of_a_nested_field_is_partly_moved(self):
+        self.assert_moved(self.body("var x = v.w.t\nvar y = v.w"), "v.w.t")
+
+    def test_siblings_stay_usable(self):
+        assert self.body("var x = h.t\neat(x)\neat(h.u)\neat_i(h.n)") == []
+
+    def test_field_assigned_back_is_owned(self):
+        assert self.body("var x = h.t\nh.t = T { id: 2 }\neat(h.t)\neat(x)") == []
+
+    def test_owner_that_implements_drop_is_rejected(self):
+        errors = check(self.DEFS + """
+struct D
+    t: T
+
+impl Drop for D
+    fn drop(self: @&D)
+        pass
+
+fn f(d: D) -> i32
+    var x = d.t
+    return 0
+""")
+        assert len(errors) == 1
+        assert "cannot move out of `d.t`: `D` implements Drop" in str(errors[0])
+
+    # ---- owners that lend ----
+
+    def test_lent_owner_is_rejected(self):
+        errors = self.body("var x = h.t", "h:& H")
+        assert len(errors) == 1
+        assert "cannot move out of borrowed parameter `h`" in str(errors[0])
+
+    def test_lent_owner_copy_field(self):
+        assert self.body("var x = h.n\neat_i(x)\neat_i(x)", "h:& H") == []
+
+    @pytest.mark.parametrize("param", ["h: @H", "h: @&H", "h: *H"])
+    def test_reference_owner_binding_moves(self, param):
+        self.assert_moved(self.body("var x = h.t\neat(x)\neat(x)", param), "x")
+
+    @pytest.mark.parametrize("param", ["h: @H", "h: @&H", "h: *H"])
+    def test_reference_owner_keeps_its_field(self, param):
+        """Control: nothing tracks a move through a reference. What `var x =
+        h.t` should mean there is the #2227 question."""
+        assert self.body("var x = h.t\nvar y = h.t", param) == []
+
+    # ---- what stays a copy ----
+
+    @pytest.mark.parametrize("field", ["n", "p", "r"])
+    def test_copy_field_copies(self, field):
+        assert self.body(f"var x = r.{field}\nvar y = x\nvar z = x", "r: Refs") == []
+
+    def test_field_of_an_untyped_binding_copies(self):
+        assert self.body("var a = nothing()\nvar x = a.t\nvar y = x\nvar z = x") == []
+
+    def test_tuple_element_copies_until_2244(self):
+        assert self.body("var p = (T { id: 1 }, 2)\nvar x = p.0\neat(x)\neat(x)") == []
+
+    # ---- inference itself ----
+
+    def test_qualified_variant_is_the_enums_value(self):
+        """`E.Empty` parses as a Field; a `Field` case ahead of the variant
+        check would lose it."""
+        self.assert_moved(self.body("var e = E.Empty\neat_e(e)\neat_e(e)"), "e")
+
+    def test_unresolved_field_infers_unknown(self):
+        """`_infer_expr_type` returns a type, even for a field it can't find."""
+        checker = MoveChecker()
+        module = parse(self.DEFS + "\nfn f(h: H) -> i32\n    return h.nope\n")
+        checker.check(module)
+        checker.scope.define("h", rast.NamedType(None, "H", []))
+        field = next(i for i in module.items
+                     if isinstance(i, rast.FnDef) and i.name == "f").body.stmts[0].value
+        ty = checker._infer_expr_type(field)
+        assert isinstance(ty, rast.NamedType) and ty.name == "unknown"
+
+    # ---- what the type feeds (temporaries) ----
+
+    def drop_temp_of(self, lines: str):
+        """`drop_temp` of the last of `lines`, a body of `fn f(h: H)` before its
+        `return`."""
+        body = "".join(f"    {line}\n" for line in lines.splitlines())
+        module = parse(self.DEFS + f"\nfn f(h: H) -> i32\n{body}    return 0\n")
+        assert MoveChecker().check(module) == []
+        fn = next(i for i in module.items if isinstance(i, rast.FnDef) and i.name == "f")
+        return getattr(fn.body.stmts[-2].expr, "drop_temp", None)
+
+    def test_method_on_the_binding_is_a_temporary(self):
+        assert self.drop_temp_of("var x = h.t\nx.again()").name == "T"
+
+    def test_literal_of_fields_is_a_temporary(self):
+        assert self.drop_temp_of("[h.t]") is not None
 
 
 class TestArrayTupleLiteralMoves:

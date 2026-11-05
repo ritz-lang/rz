@@ -21,7 +21,8 @@ AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
 bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
 AGAST #2173 added assigning a move-only field (the old value drops),
 closed for both. AGAST #2257 added bindings and temporaries from a method
-call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262).
+call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262). AGAST
+#2243 added bindings from a field, which ritz1 already got right.
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -105,6 +106,48 @@ impl Sink
 
 """
 
+# Shapes a binding from a field can take (AGAST #2243).
+FIELDS = """\
+struct Pair
+    t: Tracked
+    s: Tracked
+
+struct Deep
+    p: Pair
+    u: Tracked
+
+struct Refs
+    p: *Tracked
+    n: i32
+
+struct Gen<A>
+    v: A
+
+struct Slotted
+    e: Slot
+    s: Tracked
+
+impl Tracked
+    fn burn(self: Tracked) -> i32
+        return self.id
+
+    fn again(self: @Tracked) -> Tracked
+        return Tracked { id: self.id }
+
+fn make_holder(id: i32) -> Holder
+    return Holder { t: make(id), n: 0 }
+
+"""
+
+# ritz1's array literals don't move their elements.
+ARRAY_ELEMENT_GAP = {"ritz1": 2266, "ritz1_selfhosted": 2266}
+
+# Unannotated bindings ritz1 can't type yet.
+BINDING_TYPE_GAP = {"ritz1": 2267, "ritz1_selfhosted": 2267}
+
+# A value moved out through a reference: what that means is #2227's question.
+THROUGH_REFERENCE_GAP = {c: 2227 for c in COMPILERS}
+
 # Method temporaries ritz1 doesn't drop yet.
 METHOD_TEMP_GAP = {"ritz1": 2262, "ritz1_selfhosted": 2262}
 
@@ -124,6 +167,344 @@ struct Outer2
 """
 
 CASES = {
+    # AGAST #2243: a binding from a field has the field's type, so it moves.
+    # Each `consume` or rebinding below dropped a value twice on ritz0.
+    "field_binding_moves_into_call": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_let": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    let x = h.t
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_moves_to_binding": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    var y = x
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_unmoved_drops_once": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_sibling_still_drops": (SLOT + FIELDS + """\
+fn f() -> i32
+    var p = Pair { t: make(1), s: make(2) }
+    var x = p.t
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, {}),
+
+    "field_binding_nested": (SLOT + FIELDS + """\
+fn f() -> i32
+    var d = Deep { p: Pair { t: make(1), s: make(2) }, u: make(3) }
+    var x = d.p.t
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 3, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+
+    "field_binding_part_of_a_field_binding": (SLOT + FIELDS + """\
+fn f() -> i32
+    var d = Deep { p: Pair { t: make(1), s: make(2) }, u: make(3) }
+    var x = d.p
+    var y = x.t
+    consume(y)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 3, {}),
+
+    "field_binding_moved_on_the_path_taken": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    if h.n == 0
+        consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_moved_on_the_path_not_taken": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    if h.n == 1
+        consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_field_assigned_back": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    h.t = make(2)
+    consume(h.t)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, {}),
+
+    "field_binding_assigned_after_move": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    consume(x)
+    x = make(2)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, {}),
+
+    "field_binding_by_value_receiver": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    x.burn()
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_from_temporary": (SLOT + FIELDS + """\
+fn f() -> i32
+    var x = make_holder(1).t
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_matched": (SLOT + FIELDS + """\
+fn f() -> i32
+    var b = Slotted { e: Slot.Full(make(1)), s: make(2) }
+    var x = b.e
+    match x
+        Full(t) => consume(t)
+        Empty => 0
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, {}),
+
+    "field_binding_generic_field": (SLOT + FIELDS + """\
+fn f() -> i32
+    var g = Gen<Tracked> { v: make(1) }
+    var x = g.v
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    # A Copy-typed field stays a copy, and the owner keeps its field.
+    "field_binding_copy_field_stays_a_copy": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.n
+    var y = x
+    var z = x
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "field_binding_pointer_field_stays_a_copy": (SLOT + FIELDS + """\
+fn f() -> i32
+    var t = make(1)
+    var r = Refs { p: @t, n: 0 }
+    var x = r.p
+    var y = x
+    var z = x
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    # #2243's types reach what the binding feeds: its method's unclaimed
+    # result is a temporary (it wasn't on ritz0 before).
+    "field_binding_method_temporary": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    x.again()
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, METHOD_TEMP_GAP),
+
+    # So does a literal of fields nobody takes (it leaked on ritz0 before).
+    "field_element_array_temporary": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    [h.t]
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, ARRAY_ELEMENT_GAP),
+
+    "field_element_tuple_temporary": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    (h.t, 1)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {"ritz1": 1526, "ritz1_selfhosted": 1526}),
+
+    "field_element_array_binding": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var a: [1]Tracked = [h.t]
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, ARRAY_ELEMENT_GAP),
+
+    "field_binding_pointer_member": (SLOT + FIELDS + """\
+fn f() -> i32
+    var t = make(1)
+    var r = Refs { p: @t, n: 0 }
+    var y = r.p
+    return y.id - 1
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, BINDING_TYPE_GAP),
+
+    "field_binding_from_try": (SLOT + FIELDS + """\
+struct Res
+    r: Result<Tracked, i32>
+
+fn g() -> Result<i32, i32>
+    var h = Res { r: Ok(make(1)) }
+    var x = h.r?
+    consume(x)
+    return Ok(0)
+
+fn f() -> i32
+    g()
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, BINDING_TYPE_GAP),
+
+    # Neighbours #2243 doesn't reach: `x` stays unknown, so a copy.
+    "field_binding_of_array_element": (SLOT + FIELDS + """\
+fn f() -> i32
+    var a: [1]Tracked = [make(1)]
+    var x = a[0]
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {"ritz0": 2268, "ritz1": 2268, "ritz1_selfhosted": 2268}),
+
+    "field_binding_of_global": (SLOT + FIELDS + """\
+var GLOBAL: Holder
+
+fn f() -> i32
+    GLOBAL = make_holder(1)
+    var x = GLOBAL.t
+    consume(x)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {"ritz0": 2269}),
+
+    # `var x = r.t` through `@T` copies the referent, so its owner and `x`'s new
+    # owner both drop it. #2243 only removes the third drop, `x`'s own.
+    "field_binding_through_reference": (SLOT + FIELDS + """\
+fn g(r: @Holder) -> i32
+    var x = r.t
+    return consume(x)
+
+fn f() -> i32
+    var h = make_holder(1)
+    g(@h)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, THROUGH_REFERENCE_GAP),
+
     # AGAST #2257: a binding from a method call has the method's return type,
     # so it moves. Each of these dropped one value twice on ritz0.
     "method_binding_moves_into_call": (METHODS + """\
@@ -1151,6 +1532,45 @@ pub fn main() -> i32
     o.a.t = make(2)
     return 0
 """, "o.a", {}),
+
+    # AGAST #2243: a binding from a field moves like any other, and the move
+    # out of the field agrees with the field-move tracking.
+    "field_binding_after_move": (SLOT + FIELDS + """\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    return consume(x) + consume(x)
+""", "x", {}),
+
+    "field_binding_nested_after_move": (SLOT + FIELDS + """\
+pub fn main() -> i32
+    var d = Deep { p: Pair { t: make(1), s: make(2) }, u: make(3) }
+    var x = d.p.t
+    return consume(x) + consume(x)
+""", "x", {}),
+
+    "field_after_field_binding": (SLOT + FIELDS + """\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    return consume(h.t)
+""", "h.t", {}),
+
+    "owner_after_field_binding": (SLOT + FIELDS + """\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var x = h.t
+    var y = h
+    return 0
+""", "h.t", {}),
+
+    "parent_after_nested_field_binding": (SLOT + FIELDS + """\
+pub fn main() -> i32
+    var d = Deep { p: Pair { t: make(1), s: make(2) }, u: make(3) }
+    var x = d.p.t
+    var y = d.p
+    return 0
+""", "d.p.t", {"ritz1": 2242, "ritz1_selfhosted": 2242}),
 
     # AGAST #2257: a binding from a method call moves like any other.
     "method_binding_after_move": (METHODS + """\

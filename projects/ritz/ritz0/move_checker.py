@@ -419,6 +419,11 @@ class MoveChecker:
                 expr, lambda n: self.scope.lookup(n) is not None)
         elif isinstance(expr, rast.TupleLit):
             return rast.TupleType(expr.span, [self._infer_expr_type(e) for e in expr.elements])
+        elif isinstance(expr, rast.Field):
+            # What the field declares (AGAST #2243): the emitter types the
+            # binding from that too. A qualified variant is handled above.
+            return (self._field_path_type(expr)
+                    or rast.NamedType(expr.span, 'unknown', []))
         elif isinstance(expr, rast.Call):
             # Look up function return type
             if isinstance(expr.func, rast.Ident):
