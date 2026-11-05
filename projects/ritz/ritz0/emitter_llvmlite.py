@@ -544,6 +544,9 @@ class LLVMEmitter:
         # MethodCall nodes in the tail being emitted that resolved to a
         # procedure (AGAST #2237): see _reject_missing_tail_value.
         self._procedure_method_calls: set = set()
+        # The expression a `return`/`let`/`var` takes its value from
+        # (AGAST #2255): see _reject_procedure_value.
+        self._value_source: Optional[rast.Expr] = None
         # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
@@ -4916,6 +4919,15 @@ class LLVMEmitter:
 
         return fn
 
+    @staticmethod
+    def _declares_value(fn_def: Optional[rast.FnDef]) -> bool:
+        """`fn_def` has a return type, and it is not spelled `-> void`."""
+        if fn_def is None or fn_def.ret_type is None:
+            return False
+        declared = fn_def.ret_type
+        return not (isinstance(declared, rast.NamedType)
+                    and declared.name == 'void')
+
     def _reject_missing_tail_value(self, fn_def: rast.FnDef,
                                    yields_nothing=None) -> None:
         """A fn with a declared return type must not reach its end valueless.
@@ -4932,9 +4944,7 @@ class LLVMEmitter:
         records each call it resolves to a procedure, and the second pass,
         after the tail is emitted, passes those as `yields_nothing`.
         """
-        declared = fn_def.ret_type
-        if declared is None or (isinstance(declared, rast.NamedType)
-                                and declared.name == 'void'):
+        if not self._declares_value(fn_def):
             return
         gap = value_gap(fn_def.body, yields_nothing or self._is_void_call)
         if gap is not None:
@@ -5397,7 +5407,7 @@ class LLVMEmitter:
         there is an arm with no value. A nested match/if arm is walked with
         the same flags, so its own void arm is the offender (the innermost
         call). A diverging arm (`return`) is a statement, never a call, and a
-        bare `let x = say(1)` (no arm) is left to the call checks.
+        bare `let x = say(1)` (no arm) is `_reject_procedure_value`'s.
         """
         find = self._find_void_arm
         if expr is None:
@@ -5455,11 +5465,39 @@ class LLVMEmitter:
             if void_arm is not None:
                 self._raise_void_arm(void_arm, stmt)
 
+    def _expect_returned_value_from(self, expr: Optional[rast.Expr]) -> None:
+        """A `return` wants `expr`'s value, unless the fn declares none.
+
+        A procedure hands nothing back, so its `return g()` uses no value.
+        """
+        if self._declares_value(self.current_fn_def):
+            self._value_source = expr
+
+    def _reject_procedure_value(self, call: rast.Expr, name: str) -> None:
+        """AGAST #2255: `call` resolved to a procedure; is its value wanted?
+
+        A procedure's dummy `i32 0` is not a value, but `return g(n)` and
+        `let x = g(n)` would bind it. The callers are the places a call
+        resolves, because only those know a method's callee and that a name
+        is not a local fn pointer. An identity test needs no clearing: a
+        stale `_value_source` can only name a node already emitted.
+        """
+        if call is self._value_source:
+            raise EmitError(
+                f"`{name}` returns nothing, so its call has no value to use "
+                f"here",
+                getattr(call, 'span', None),
+            )
+
     def _emit_stmt_inner(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated."""
         # Set debug location for source-level debugging
         self._set_debug_loc(stmt)
         self._reject_valueless_if(stmt)
+        if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
+            self._value_source = stmt.value
+        elif isinstance(stmt, rast.ReturnStmt):
+            self._expect_returned_value_from(stmt.value)
 
         if isinstance(stmt, rast.ReturnStmt):
             ret_type = self._fn_ret_type(self.current_fn)
@@ -9148,6 +9186,7 @@ class LLVMEmitter:
         """
         ret_type = self._fn_ret_type(self.current_fn)
         if expr.value is not None:
+            self._expect_returned_value_from(expr.value)
             ret_val = self._emit_expr(expr.value)
             self._reject_enum_as_int(
                 ret_val, ret_type,
@@ -10288,6 +10327,8 @@ class LLVMEmitter:
         # Look up user-defined function
         if fname in self.functions:
             fn, fn_def = self.functions[fname]
+            if fn_def is not None and fn_def.ret_type is None:
+                self._reject_procedure_value(call, fname.partition('$')[0])
 
             # Check argument count BEFORE processing
             if len(call.args) != len(self._fn_param_types(fn)):
@@ -11738,6 +11779,7 @@ class LLVMEmitter:
         fn, fn_def = self.functions[mangled_name]
         if fn_def.ret_type is None:
             self._procedure_method_calls.add(id(expr))
+            self._reject_procedure_value(expr, expr.method)
 
         # Check if this is a static method (no self parameter)
         # Static methods are called as Type.method() with no receiver instance
@@ -11911,6 +11953,7 @@ class LLVMEmitter:
         method_index = self._get_trait_method_index(trait_name, expr.method)
         if self.traits[trait_name][method_index - 1].ret_type is None:
             self._procedure_method_calls.add(id(expr))
+            self._reject_procedure_value(expr, expr.method)
 
         # Get vtable type for GEP
         vtable_type = self.vtable_types[trait_name]

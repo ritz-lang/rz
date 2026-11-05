@@ -221,6 +221,9 @@ struct EmitterState
     # and whether check_tail_value already reported this fn.
     proc_method_calls: *ProcMethodCall
     tail_gap_reported: i32
+    # AGAST #2255 — the expression the `return`/`let`/`var` being emitted takes
+    # its value from; see reject_procedure_value.
+    value_source: *Expr
     # AGAST #1521 — 1 once a print interpolation has called one of the
     # @__ritz_print_* helpers; emit_module then defines them.
     print_helpers_used: i32
@@ -892,11 +895,39 @@ fn fn_is_procedure(fd: *FnDef) -> i32
         return 0
     1
 
+# The file a fn's lines belong to: a specialised generic may come from an import.
+fn fn_source_file(f: *FnDef) -> *u8
+    if f != null and f.def_file != null
+        return f.def_file
+    let file: *u8 = emitter_source_file()
+    if file != null
+        return file
+    c"<input>"
+
+# AGAST #2255: `e` called a procedure named `name`.  Its dummy `i32 0` is not a
+# value, but `return g(n)` and `let x = g(n)` would bind it.  Judged where a call
+# resolves, because only there are a method's callee and a fn-pointer local known.
+fn reject_procedure_value(s: *EmitterState, e: *Expr, name: *u8, len: i32)
+    if e != s.value_source
+        return
+    eprints_cstr(fn_source_file(emitter_current_fn()))
+    eprint_char(':')
+    eprint_i64(e.span.line as i64)
+    eprint_char(':')
+    eprint_i64(e.span.col as i64)
+    eprints_cstr(c": error: `")
+    for i in 0..len
+        eprint_char(*(name + i))
+    eprints_cstr(c"` returns nothing, so its call has no value to use here\n")
+    emit_str(s, c"  ; ERROR: a procedure call has no value\n")
+    s.error_count = s.error_count + 1
+
 # AGAST #2237: remember that method call `e` dispatched to `fd`.  Only emission
 # knows a receiver's type, so check_tail_method_calls reads this after the body.
 fn note_method_callee(s: *EmitterState, e: *Expr, fd: *FnDef)
     if fn_is_procedure(fd) == 0
         return
+    reject_procedure_value(s, e, e.ident_ptr, e.ident_len)   # AGAST #2255
     let n: *ProcMethodCall = malloc(sizeof(ProcMethodCall)) as *ProcMethodCall
     n.call = e
     n.next = s.proc_method_calls

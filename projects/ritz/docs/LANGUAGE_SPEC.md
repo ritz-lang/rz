@@ -715,6 +715,11 @@ fn greet(name: *u8)
     prints_cstr(name)
 ```
 
+Such a function is a *procedure*, and a call to one has no value. Both compilers
+reject a `let`, a `var`, or a `return` from a function that declares a value when
+it would take its value from one. A procedure may still `return` a call to
+another procedure, because nothing uses a value there.
+
 ### 5.2 Return
 
 ```ritz
