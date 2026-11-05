@@ -23,9 +23,16 @@ tickets (#2221, #1858, #2222), so that file is compiled on its own here.
 
 Every program returns 3 on success, and writes through the stored reference
 after it was stored, so a pointer to a temporary copy can't pass.
+
+AGAST #2250 holds ritz1 to the same rule on every path that stores into a
+field or an element. ritz1 binds `n:& i32` as an `i32` local whose slot is the
+caller's pointer, and leaves `c:& C` a local that reads as the pointer, so the
+two destinations fail in opposite directions: a `*i32` field got the integer,
+and a by-value `C` field got the pointer.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -165,6 +172,261 @@ pub fn main() -> i32
 """,
 }
 
+# AGAST #2250: the other ways to reach a `*T` field with a primitive referent.
+PRIMITIVE = """\
+struct Q
+    p: *i32
+
+struct O
+    q: Q
+
+struct QA
+    a: [2]Q
+
+struct G<T>
+    p: *T
+
+struct RI
+    p:& i32
+
+struct AI
+    p: @&i32
+"""
+
+MAIN_FILL_Q = """
+pub fn main() -> i32
+    var n: i32 = 1
+    var q: Q
+    fill(@q, @n)
+    *q.p = 3
+    return n
+"""
+
+STORES.update({
+    "nested_primitive": PRIMITIVE + """
+fn mk(n:& i32) -> O
+    var o: O
+    o.q.p = n
+    return o
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var o: O = mk(@n)
+    *o.q.p = 3
+    return n
+""",
+    "nested_literal_primitive": PRIMITIVE + """
+fn mk(n:& i32) -> O
+    var o: O
+    o.q = Q { p: n }
+    return o
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var o: O = mk(@n)
+    *o.q.p = 3
+    return n
+""",
+    "through_pointer_primitive": PRIMITIVE + """
+fn fill(q: *Q, n:& i32)
+    q.p = n
+""" + MAIN_FILL_Q,
+    "through_explicit_deref_primitive": PRIMITIVE + """
+fn fill(q: *Q, n:& i32)
+    (*q).p = n
+""" + MAIN_FILL_Q,
+    "through_borrow_primitive": PRIMITIVE + """
+fn fill(q:& Q, n:& i32)
+    q.p = n
+""" + MAIN_FILL_Q,
+    "array_element_field_primitive": PRIMITIVE + """
+fn fill(a: *QA, n:& i32)
+    a.a[1].p = n
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var a: QA
+    fill(@a, @n)
+    *a.a[1].p = 3
+    return n
+""",
+    "local_array_element_field_primitive": PRIMITIVE + """
+fn run(n:& i32)
+    var a: [2]Q
+    a[1].p = n
+    *a[1].p = 3
+
+pub fn main() -> i32
+    var n: i32 = 1
+    run(@n)
+    return n
+""",
+    "global_field_primitive": PRIMITIVE + """
+var GQ: Q
+
+fn fill(n:& i32)
+    GQ.p = n
+
+pub fn main() -> i32
+    var n: i32 = 1
+    fill(@n)
+    *GQ.p = 3
+    return n
+""",
+    # A `:&` or `@&` field of a primitive lowers to a `*T` field.
+    "borrow_field_primitive": PRIMITIVE + """
+fn mk(n:& i32) -> RI
+    var r: RI
+    r.p = n
+    return r
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var r: RI = mk(@n)
+    *r.p = 3
+    return n
+""",
+    "borrow_field_literal_primitive": PRIMITIVE + """
+fn mk(n:& i32) -> RI
+    return RI { p: n }
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var r: RI = mk(@n)
+    *r.p = 3
+    return n
+""",
+    "at_amp_field_primitive": PRIMITIVE + """
+fn mk(n:& i32) -> AI
+    var a: AI
+    a.p = n
+    return a
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var a: AI = mk(@n)
+    *a.p = 3
+    return n
+""",
+    # A generic field's pointee comes from its arguments.
+    "generic_struct_primitive": PRIMITIVE + """
+fn mk(n:& i32) -> G<i32>
+    return G<i32> { p: n }
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var g: G<i32> = mk(@n)
+    *g.p = 3
+    return n
+""",
+    "generic_fn_primitive": PRIMITIVE + """
+fn mk<T>(n:& T) -> G<T>
+    return G<T> { p: n }
+
+pub fn main() -> i32
+    var n: i32 = 1
+    var g: G<i32> = mk<i32>(@n)
+    *g.p = 3
+    return n
+""",
+    # Each width takes the same path. Sign doesn't matter: `*i32` and `u32`
+    # are the same LLVM pointee, which is what ritz0 compares.
+    "width_u8": """\
+struct Q
+    p: *u8
+
+fn mk(n:& u8) -> Q
+    var q: Q
+    q.p = n
+    return q
+
+pub fn main() -> i32
+    var n: u8 = 1
+    var q: Q = mk(@n)
+    *q.p = 3
+    return n as i32
+""",
+    "width_i16": """\
+struct Q
+    p: *i16
+
+fn mk(n:& i16) -> Q
+    return Q { p: n }
+
+pub fn main() -> i32
+    var n: i16 = 1
+    var q: Q = mk(@n)
+    *q.p = 3
+    return n as i32
+""",
+    "width_i64": """\
+struct Q
+    p: *i64
+
+fn mk(n:& i64) -> Q
+    return Q { p: n }
+
+pub fn main() -> i32
+    var n: i64 = 1
+    var q: Q = mk(@n)
+    *q.p = 3
+    return n as i32
+""",
+    "sign_differs": """\
+struct Q
+    p: *i32
+
+fn mk(n:& u32) -> Q
+    return Q { p: n }
+
+pub fn main() -> i32
+    var n: u32 = 1
+    var q: Q = mk(@n)
+    *q.p = 3
+    return n as i32
+""",
+    # A method binds its params on a path of its own.
+    "method_param_primitive": PRIMITIVE + """
+impl O
+    fn keep(self: @O, n:& i32) -> Q
+        return Q { p: n }
+
+pub fn main() -> i32
+    var o: O
+    var n: i32 = 1
+    var q: Q = o.keep(@&n)
+    *q.p = 3
+    return n
+""",
+    # Already pointers in ritz1, so they must not gain a second conversion.
+    "float_pointer_field": """\
+struct Q
+    p: *f64
+
+fn mk(n:& f64) -> Q
+    var q: Q
+    q.p = n
+    return q
+
+pub fn main() -> i32
+    var n: f64 = 1.0
+    var q: Q = mk(@n)
+    *q.p = 3.0
+    return n as i32
+""",
+    "self_pointer_field": TYPES + """
+impl C
+    fn keep(self:& C) -> P
+        return P { ch: self }
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    var p: P = c.keep()
+    p.ch.x = 3
+    return c.x
+""",
+})
+
 # A large literal is built in place, on a path of its own (#1741). ritz0 only:
 # clang lowers ritz1's copy of it to a `memset` call, and -nostdlib has none.
 LARGE_LITERAL = """\
@@ -202,6 +464,42 @@ pub fn main() -> i32
     var p: P = mk(@q)
     p.ch.x = p.ch.x + 2
     return c.x
+""",
+    # The same with an integer pointee: a pointer is as wide as an `i64`, so
+    # comparing widths alone would take the address of the caller's variable.
+    "referent_is_a_pointer_of_the_same_width": """\
+struct Q
+    p: *i64
+
+fn mk(n:& *i64) -> Q
+    var q: Q
+    q.p = n
+    return q
+
+pub fn main() -> i32
+    var n: i64 = 1
+    var m: *i64 = @n
+    var q: Q = mk(@m)
+    *q.p = 3
+    return n as i32
+""",
+    # Locals are reused from one function to the next, and `m` is no borrow.
+    "plain_param_after_a_borrow": """\
+struct Q
+    p: *i32
+
+fn peek(n:& i32) -> i32
+    return n
+
+fn mk(m: i32) -> Q
+    var q: Q
+    q.p = m
+    return q
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var q: Q = mk(peek(@n))
+    return q.p as i64 as i32
 """,
     # A by-value field copies: the write lands in the copy.
     "by_value_field_copies": TYPES + """
@@ -247,7 +545,577 @@ pub fn main() -> i32
     p.ch.x = p.ch.x + 2
     return b.x
 """,
+    # Same for a primitive referent, and a by-value struct.
+    "shadowed_primitive_param": """\
+struct Q
+    p: *i32
+
+fn mk(n:& i32, other: *i32) -> Q
+    let n: *i32 = other
+    var q: Q
+    q.p = n
+    return q
+
+pub fn main() -> i32
+    var a: i32 = 9
+    var b: i32 = 1
+    var q: Q = mk(@a, @b)
+    *q.p = 3
+    return b
+""",
+    "shadowed_by_value_param": TYPES + """
+struct V
+    c: C
+
+fn mk(c:& C, d: C) -> V
+    let c: C = d
+    var v: V
+    v.c = c
+    return v
+
+pub fn main() -> i32
+    var a: C = C { x: 9, y: 0 }
+    var b: C = C { x: 3, y: 0 }
+    var v: V = mk(@a, b)
+    return v.c.x
+""",
+    # An integer field reads the referent, by either route.
+    "integer_field_copies": """\
+struct I
+    n: i32
+
+fn mk(n:& i32) -> I
+    var v: I
+    v.n = n
+    return v
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var v: I = mk(@n)
+    v.n = 9
+    return n
+""",
+    "integer_literal_copies": """\
+struct I
+    n: i32
+
+fn mk(n:& i32) -> I
+    return I { n: n }
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var v: I = mk(@n)
+    v.n = 9
+    return n
+""",
+    "generic_integer_field_copies": """\
+struct GV<T>
+    v: T
+
+fn mk(n:& i32) -> GV<i32>
+    return GV<i32> { v: n }
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var g: GV<i32> = mk(@n)
+    g.v = 9
+    return n
+""",
 }
+
+# AGAST #2250: every by-value slot takes a copy of the referent. Each program
+# changes the original afterwards, or the copy, and then reads the other, so a
+# stored pointer can't pass.
+BY_VALUE = TYPES + """
+struct V
+    c: C
+
+struct O
+    v: V
+
+struct VA
+    a: [2]C
+
+struct GV<T>
+    v: T
+
+enum E
+    A
+    B(i32)
+
+struct HE
+    e: E
+"""
+
+MAIN_V = """
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: V = mk(@c)
+    c.x = 9
+    return v.c.x
+"""
+
+MAIN_O = """
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var o: O = mk(@c)
+    c.x = 9
+    return o.v.c.x
+"""
+
+MAIN_FILL_V = """
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: V
+    fill(@v, @c)
+    c.x = 9
+    return v.c.x
+"""
+
+MAIN_E = """
+pub fn main() -> i32
+    var e: E = E.B(3)
+    var h: HE = mk(@e)
+    e = E.A
+    match h.e
+        E.B(n) => return n
+        E.A => return 0
+"""
+
+CONTROLS.update({
+    "by_value_field_reads_the_copy": BY_VALUE + """
+fn mk(c:& C) -> V
+    var v: V
+    v.c = c
+    return v
+""" + MAIN_V,
+    "by_value_literal_reads_the_copy": BY_VALUE + """
+fn mk(c:& C) -> V
+    return V { c: c }
+""" + MAIN_V,
+    "by_value_nested": BY_VALUE + """
+fn mk(c:& C) -> O
+    var o: O
+    o.v.c = c
+    return o
+""" + MAIN_O,
+    "by_value_nested_literal": BY_VALUE + """
+fn mk(c:& C) -> O
+    var o: O
+    o.v = V { c: c }
+    return o
+""" + MAIN_O,
+    "by_value_through_pointer": BY_VALUE + """
+fn fill(v: *V, c:& C)
+    v.c = c
+""" + MAIN_FILL_V,
+    "by_value_through_borrow": BY_VALUE + """
+fn fill(v:& V, c:& C)
+    v.c = c
+""" + MAIN_FILL_V,
+    "by_value_global_field": BY_VALUE + """
+var GV0: V
+
+fn fill(c:& C)
+    GV0.c = c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    fill(@c)
+    c.x = 9
+    return GV0.c.x
+""",
+    "by_value_generic_struct": BY_VALUE + """
+fn mk(c:& C) -> GV<C>
+    return GV<C> { v: c }
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var g: GV<C> = mk(@c)
+    c.x = 9
+    return g.v.x
+""",
+    "by_value_generic_struct_assign": BY_VALUE + """
+fn mk(c:& C) -> GV<C>
+    var g: GV<C>
+    g.v = c
+    return g
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var g: GV<C> = mk(@c)
+    c.x = 9
+    return g.v.x
+""",
+    "by_value_generic_fn": BY_VALUE + """
+fn mk<T>(c:& T) -> GV<T>
+    return GV<T> { v: c }
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var g: GV<C> = mk<C>(@c)
+    c.x = 9
+    return g.v.x
+""",
+    "by_value_enum_field": BY_VALUE + """
+fn mk(e:& E) -> HE
+    var h: HE
+    h.e = e
+    return h
+""" + MAIN_E,
+    "by_value_enum_literal": BY_VALUE + """
+fn mk(e:& E) -> HE
+    return HE { e: e }
+""" + MAIN_E,
+    "by_value_self": BY_VALUE + """
+impl C
+    fn wrap(self:& C) -> V
+        return V { c: self }
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: V = c.wrap()
+    c.x = 9
+    return v.c.x
+""",
+    "by_value_method_param": BY_VALUE + """
+impl O
+    fn wrap(self: @O, c:& C) -> V
+        return V { c: c }
+
+pub fn main() -> i32
+    var o: O
+    var c: C = C { x: 3, y: 0 }
+    var v: V = o.wrap(@&c)
+    c.x = 9
+    return v.c.x
+""",
+    "by_value_strview": """\
+import ritzlib.strview
+
+struct HS
+    s: StrView
+
+fn mk(v:& StrView) -> HS
+    return HS { s: v }
+
+pub fn main() -> i32
+    var v: StrView = "abc"
+    var h: HS = mk(@v)
+    return h.s.len as i32
+""",
+    "by_value_deref_store": BY_VALUE + """
+fn fill(p: *C, c:& C)
+    *p = c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = C { x: 0, y: 0 }
+    fill(@d, @c)
+    c.x = 9
+    return d.x
+""",
+    "by_value_local_assign": BY_VALUE + """
+fn f(c:& C) -> i32
+    var d: C = C { x: 0, y: 0 }
+    d = c
+    c.x = 9
+    return d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_field_array_element": BY_VALUE + """
+fn fill(a: *VA, c:& C)
+    a.a[1] = c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var a: VA
+    fill(@a, @c)
+    c.x = 9
+    return a.a[1].x
+""",
+    "by_value_nested_array_element": BY_VALUE + """
+struct OV
+    va: VA
+
+fn fill(o: *OV, c:& C)
+    o.va.a[1] = c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var o: OV
+    fill(@o, @c)
+    c.x = 9
+    return o.va.a[1].x
+""",
+    "by_value_local_field_array_element": BY_VALUE + """
+fn run(c:& C) -> i32
+    var a: VA
+    a.a[1] = c
+    c.x = 9
+    return a.a[1].x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return run(@c)
+""",
+    "by_value_local_array_element": BY_VALUE + """
+fn run(c:& C) -> i32
+    var a: [2]C
+    a[1] = c
+    c.x = 9
+    return a[1].x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return run(@c)
+""",
+    "by_value_pointer_element": BY_VALUE + """
+fn fill(p: *C, c:& C)
+    p[1] = c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var a: [2]C
+    fill(@a[0], @c)
+    c.x = 9
+    return a[1].x
+""",
+    "by_value_global_array_element": BY_VALUE + """
+var GA: [2]C
+
+fn fill(c:& C)
+    GA[1] = c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    fill(@c)
+    c.x = 9
+    return GA[1].x
+""",
+})
+
+# AGAST #2250: ritz0 only takes the borrow's pointer when the pointee matches.
+# Otherwise `n` reads as its integer and that converts to a pointer, which is
+# no feature (#2281), but ritz1 has to agree until that's decided. n is 3,
+# so each program returns the integer it finds in the field.
+MISMATCHED = """\
+struct S
+    x: i32
+
+struct G<T>
+    p: *T
+
+struct W
+    p: *i64
+
+struct F
+    p: *f32
+
+struct B
+    p: *bool
+
+struct T
+    p: *S
+"""
+
+CONTROLS.update({
+    "mismatched_width": MISMATCHED + """
+fn mk(n:& i32) -> W
+    var w: W
+    w.p = n
+    return w
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var w: W = mk(@n)
+    return w.p as i64 as i32
+""",
+    # A `**i64` holds pointers, which are as wide as `n`.
+    "mismatched_pointer_of_the_same_width": MISMATCHED + """
+struct PP
+    p: **i64
+
+fn mk(n:& i64) -> PP
+    return PP { p: n }
+
+pub fn main() -> i32
+    var n: i64 = 3
+    var pp: PP = mk(@n)
+    return pp.p as i64 as i32
+""",
+    "mismatched_float_of_the_same_width": MISMATCHED + """
+fn mk(n:& i32) -> F
+    return F { p: n }
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var f: F = mk(@n)
+    return f.p as i64 as i32
+""",
+    "mismatched_bool_of_the_same_width": MISMATCHED + """
+fn mk(n:& u8) -> B
+    return B { p: n }
+
+pub fn main() -> i32
+    var n: u8 = 3
+    var b: B = mk(@n)
+    return b.p as i64 as i32
+""",
+    "mismatched_struct_of_the_same_width": MISMATCHED + """
+fn mk(n:& i32) -> T
+    return T { p: n }
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var t: T = mk(@n)
+    return t.p as i64 as i32
+""",
+    "mismatched_generic_float": MISMATCHED + """
+fn mk(n:& i32) -> G<f32>
+    return G<f32> { p: n }
+
+pub fn main() -> i32
+    var n: i32 = 3
+    var g: G<f32> = mk(@n)
+    return g.p as i64 as i32
+""",
+    "mismatched_generic_bool": MISMATCHED + """
+fn mk(n:& u8) -> G<bool>
+    return G<bool> { p: n }
+
+pub fn main() -> i32
+    var n: u8 = 3
+    var g: G<bool> = mk(@n)
+    return g.p as i64 as i32
+""",
+})
+
+# AGAST #2250: known gaps next to it, each pinned by its own ticket below.
+CONTROLS.update({
+    "by_value_float_field": """\
+struct F
+    f: f64
+
+fn mk(n:& f64) -> F
+    var v: F
+    v.f = n
+    return v
+
+pub fn main() -> i32
+    var n: f64 = 3.0
+    var v: F = mk(@n)
+    return v.f as i32
+""",
+    "by_value_float_literal": """\
+struct F
+    f: f64
+
+fn mk(n:& f64) -> F
+    return F { f: n }
+
+pub fn main() -> i32
+    var n: f64 = 3.0
+    var v: F = mk(@n)
+    return v.f as i32
+""",
+    "by_value_bool_field": """\
+struct B
+    b: bool
+
+fn mk(n:& bool) -> B
+    var v: B
+    v.b = n
+    return v
+
+pub fn main() -> i32
+    var n: bool = true
+    var v: B = mk(@n)
+    if v.b
+        return 3
+    return 0
+""",
+    "by_value_bool_literal": """\
+struct B
+    b: bool
+
+fn mk(n:& bool) -> B
+    return B { b: n }
+
+pub fn main() -> i32
+    var n: bool = true
+    var v: B = mk(@n)
+    if v.b
+        return 3
+    return 0
+""",
+    "by_value_from_at_amp_param": BY_VALUE + """
+fn mk(c: @&C) -> V
+    var v: V
+    v.c = c
+    return v
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: V = mk(@&c)
+    return v.c.x
+""",
+    "by_value_from_pointer_param": BY_VALUE + """
+fn mk(c: *C) -> V
+    return V { c: c }
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: V = mk(@c)
+    return v.c.x
+""",
+    "by_value_let": BY_VALUE + """
+fn f(c:& C) -> i32
+    let d: C = c
+    return d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_argument": BY_VALUE + """
+fn g(c: C) -> i32
+    return c.x
+
+fn f(c:& C) -> i32
+    return g(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_return": BY_VALUE + """
+fn f(c:& C) -> C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c)
+    return d.x
+""",
+    "by_value_array_referent": """\
+struct H
+    a: [2]i32
+
+fn mk(a:& [2]i32) -> H
+    var h: H
+    h.a = a
+    return h
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var h: H = mk(@a)
+    return h.a[1]
+""",
+})
 
 RES = """\
 struct Res
@@ -308,15 +1176,156 @@ fn mk(t:& Res) -> V
 pub fn main() -> i32
     return 0
 """,
+    # AGAST #2250: every slot ritz1 now loads a referent for.
+    "nested": RES + """
+struct O
+    v: V
+
+fn mk(t:& Res) -> O
+    var o: O
+    o.v.r = t
+    return o
+
+pub fn main() -> i32
+    return 0
+""",
+    "through_pointer": RES + """
+fn fill(v: *V, t:& Res)
+    v.r = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "deref_store": RES + """
+fn fill(p: *Res, t:& Res)
+    *p = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "local_assign": RES + """
+fn f(t:& Res)
+    var r: Res = Res { h: 1 }
+    r = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "field_array_element": RES + """
+struct AR
+    a: [2]Res
+
+fn fill(a: *AR, t:& Res)
+    a.a[1] = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "local_array_element": RES + """
+fn f(t:& Res)
+    var a: [2]Res
+    a[1] = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "pointer_element": RES + """
+fn fill(p: *Res, t:& Res)
+    p[1] = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "global_array_element": RES + """
+var GA: [2]Res
+
+fn fill(t:& Res)
+    GA[1] = t
+
+pub fn main() -> i32
+    return 0
+""",
+    # Move-only because of what it holds, not because of an impl of its own.
+    "drop_field_inside": RES + """
+struct W
+    r: Res
+
+struct HW
+    w: W
+
+fn mk(w:& W) -> HW
+    return HW { w: w }
+
+pub fn main() -> i32
+    return 0
+""",
 }
 
 
-# ritz1 gets the ticket's case right; these are its own, separate defects.
+# Keyed by program, across STORES, CONTROLS and MOVE_OUT.
 RITZ1_GAPS = {
-    "assign_primitive": "AGAST #2250: ritz1 stores the referent in a `*T` field",
-    "literal_primitive": "AGAST #2250: ritz1 stores the referent in a `*T` field",
-    "by_value_field_copies": "AGAST #2250: ritz1 stores the borrow in a `T` field",
-    "by_value_literal_copies": "AGAST #2250: ritz1 stores the borrow in a `T` field",
+    "by_value_pointer_element": "AGAST #2277: `p[i] = v` with a struct value isn't lowered",
+    "pointer_element": "AGAST #2277: `p[i] = v` with a struct value isn't lowered",
+    "by_value_self": "AGAST #2278: ritz1 doesn't know a typed `self:& T` is a borrow",
+    "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
+    "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
+    "by_value_bool_field": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
+    "by_value_bool_literal": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
+    "by_value_from_at_amp_param": "AGAST #2227: is `@&T` read by value an implicit deref?",
+    "by_value_from_pointer_param": "AGAST #2227: is `*T` read by value an implicit deref?",
+    "by_value_let": "AGAST #2279: a by-value read outside a store takes the pointer",
+    "by_value_argument": "AGAST #2279: a by-value read outside a store takes the pointer",
+    "by_value_return": "AGAST #2279: a by-value read outside a store takes the pointer",
+    "by_value_array_referent": "AGAST #2279: a by-value read outside a store takes the pointer",
+}
+
+# Neither compiler stores the borrow's pointer here: `n` reads as the integer
+# and that becomes the pointer, so the write through it faults.
+BOTH_GAP = "AGAST #2280: `n:& i32` into a `*i32` that isn't a field reads the integer"
+BOTH_GAPS = {
+    "let": """\
+fn f(n:& i32)
+    let p: *i32 = n
+    *p = 3
+
+pub fn main() -> i32
+    var n: i32 = 1
+    f(@n)
+    return n
+""",
+    "return": """\
+fn f(n:& i32) -> *i32
+    return n
+
+pub fn main() -> i32
+    var n: i32 = 1
+    let p: *i32 = f(@n)
+    *p = 3
+    return n
+""",
+    "argument": """\
+fn g(p: *i32)
+    *p = 3
+
+fn f(n:& i32)
+    g(n)
+
+pub fn main() -> i32
+    var n: i32 = 1
+    f(@n)
+    return n
+""",
+    "array_element": """\
+fn f(n:& i32)
+    var a: [2]*i32
+    a[1] = n
+    *a[1] = 3
+
+pub fn main() -> i32
+    var n: i32 = 1
+    f(@n)
+    return n
+""",
 }
 
 
@@ -376,7 +1385,7 @@ def test_ritz0_drop_type_reborrow_is_not_a_move(tmp_path, name):
 def test_ritz0_by_value_field_is_still_a_move_out(tmp_path, name):
     comp, _, _ = _compile("ritz0", None, tmp_path, name, MOVE_OUT[name])
     assert comp.returncode != 0
-    assert "cannot move out of borrowed parameter `t`" in comp.stdout + comp.stderr
+    assert "cannot move out of borrowed parameter `" in comp.stdout + comp.stderr
 
 
 @pytest.mark.integration
@@ -406,3 +1415,113 @@ def test_ritz1_ref_field_takes_the_borrow(ritz1_bin, tmp_path, name):
 @pytest.mark.parametrize("name", _ritz1_params(CONTROLS))
 def test_ritz1_destination_decides(ritz1_bin, tmp_path, name):
     assert _run("ritz1", ritz1_bin, tmp_path, name, CONTROLS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(DROP_STORES))
+def test_ritz1_drop_type_reborrow_is_not_a_move(ritz1_bin, tmp_path, name):
+    assert _run("ritz1", ritz1_bin, tmp_path, name, DROP_STORES[name]) == 3
+
+
+# Loading the referent would hand one value to two owners, so ritz1 has to
+# refuse here where it used to leave the rejection to clang. The error names a
+# line in the source, which clang's never could.
+@pytest.mark.integration
+@pytest.mark.parametrize("name", _ritz1_params(MOVE_OUT))
+def test_ritz1_by_value_field_is_still_a_move_out(ritz1_bin, tmp_path, name):
+    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MOVE_OUT[name])
+    assert comp.returncode != 0
+    assert not ll.exists()
+    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of borrowed parameter `[tw]`",
+                     comp.stdout + comp.stderr), comp.stdout + comp.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(strict=True, reason=BOTH_GAP)
+@pytest.mark.parametrize("name", sorted(BOTH_GAPS))
+def test_ritz0_pointer_slot_takes_the_borrow(tmp_path, name):
+    assert _run("ritz0", None, tmp_path, name, BOTH_GAPS[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(strict=True, reason=BOTH_GAP)
+@pytest.mark.parametrize("name", sorted(BOTH_GAPS))
+def test_ritz1_pointer_slot_takes_the_borrow(ritz1_bin, tmp_path, name):
+    assert _run("ritz1", ritz1_bin, tmp_path, name, BOTH_GAPS[name]) == 3
+
+
+# A by-value slot only copies a referent of its own type. Reading a `C` as a
+# `D` would be a silent reinterpretation, so neither compiler may produce a
+# program. ritz1 leaves the refusal to clang.
+ANOTHER_STRUCT = TYPES + """
+struct D
+    a: i64
+    b: i64
+
+struct VD
+    d: D
+
+fn mk(c:& C) -> VD
+    var v: VD
+    v.d = c
+    return v
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: VD = mk(@c)
+    return v.d.a as i32
+"""
+
+# Nor does a `:&` of a pointer to pointer hold a `C`.
+POINTER_REFERENT = TYPES + """
+struct V
+    c: C
+
+fn mk(c:& **C) -> V
+    var v: V
+    v.c = c
+    return v
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var p: *C = @c
+    var q: **C = @p
+    var v: V = mk(@q)
+    return v.c.x
+"""
+
+# An array of `C` names `C` as well: the slot must not get its first element.
+ARRAY_REFERENT = TYPES + """
+struct V
+    c: C
+
+fn mk(c:& [2]C) -> V
+    var v: V
+    v.c = c
+    return v
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0].x = 3
+    var v: V = mk(@a)
+    return v.c.x
+"""
+
+REFUSED = {
+    "another_struct": ANOTHER_STRUCT,
+    "array_referent": ARRAY_REFERENT,
+    "pointer_referent": POINTER_REFERENT,
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(REFUSED))
+def test_by_value_slot_of_another_type_is_refused(ritz1_bin, tmp_path, compiler, name):
+    comp, ll, work = _compile(compiler, ritz1_bin, tmp_path, name, REFUSED[name])
+    if comp.returncode != 0:
+        return
+    link = subprocess.run(["clang", str(ll), "-o", str(work / "main"), "-nostdlib",
+                           str(RITZ_START)], cwd=work, capture_output=True, text=True)
+    assert link.returncode != 0
+    assert "defined with type" in link.stderr

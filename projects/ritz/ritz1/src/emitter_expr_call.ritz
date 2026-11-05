@@ -796,6 +796,10 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
 # this, `held = Some(..)` / `f.cmap = None` / `Font { cmap: Some(..) }`
 # emitted `add i64 0, 0 ; variant w/ no enum ctx` and clang rejected it.
 fn emit_expr_into_slot(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len: i32) -> i32
+    if ty == TYPE_STRUCT
+        let referent: i32 = emit_lent_referent(s, e, name, name_len)
+        if referent != 0
+            return referent
     let saved_name: *u8 = s.ctx_enum_name
     let saved_len: i32 = s.ctx_enum_name_len
     let saved_arg: i32 = s.ctx_enum_arg
@@ -811,6 +815,71 @@ fn emit_expr_into_slot(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len:
     s.ctx_enum_name_len = saved_len
     s.ctx_enum_arg = saved_arg
     return reg
+
+# The `name:& T` param `e` names, or null (LocalVar.is_lent, AGAST #2250).
+fn lent_local(s: *EmitterState, e: *Expr) -> *LocalVar
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+    if loc == null or loc.is_lent == 0
+        return null
+    return loc
+
+# AGAST #2250: `e` read into a by-value slot of struct `name`.  `c:& C` reads
+# as the pointer, but the slot holds a `C`, so a `c:& C` param of that type
+# copies its referent here: the aggregate register, as emit_expr gives for any
+# other struct value.  0 when `e` is anything else.
+fn emit_lent_referent(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> i32
+    let loc: *LocalVar = lent_local(s, e)
+    if loc == null or name_eq(loc.type_name, loc.type_name_len, name, name_len) == 0
+        return 0
+    own_check_lent_read(s, e, name, name_len)
+    let src: i32 = emit_expr(s, e)
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = load ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, name, name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, src)
+    emit_str(s, c"\n")
+    return val
+
+# emit_expr for an array element of type `ty`: a whole struct element is a
+# by-value slot too (AGAST #2250).
+fn emit_expr_into_elem(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len: i32) -> i32
+    if ty == TYPE_STRUCT
+        let referent: i32 = emit_lent_referent(s, e, name, name_len)
+        if referent != 0
+            return referent
+    return emit_expr(s, e)
+
+# AGAST #2250: `e` stored in pointer field `field`.  `n:& i32` reads as the
+# integer, but its slot IS the caller's pointer (bind_scalar_borrow_param), and
+# that is what the field holds.  Returns it as an i64, the value of any other
+# `*T`; 0 when `e` is anything else.  As in ritz0's _borrow_for_ref_slot the
+# pointee has to match, by LLVM type: `n:& u32` fits a `*i32`.  A mismatch
+# keeps reading the integer.  Any other `:&` local already reads as its pointer.
+fn emit_lent_ptr(s: *EmitterState, e: *Expr, field: *StructField) -> i32
+    let loc: *LocalVar = lent_local(s, e)
+    if loc == null or loc.var_type == TYPE_MUT_REF or field.field_type != TYPE_PTR
+        return 0
+    if ptr_field_int_width(s, field) != ptr_pointee_size(s, loc.var_type, null, 0)
+        return 0
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = ptrtoint ptr ")
+    emit_reg(s, loc.reg)
+    emit_str(s, c" to i64  ; #2250 borrow's pointer\n")
+    return val
+
+# emit_expr_into_slot for a struct field.
+fn emit_expr_into_field(s: *EmitterState, e: *Expr, field: *StructField) -> i32
+    let ptr: i32 = emit_lent_ptr(s, e, field)
+    if ptr != 0
+        return ptr
+    return emit_expr_into_slot(s, e, field.field_type, field.field_type_name, field.field_type_name_len)
 
 # AGAST #1948: the struct a pointer-to-struct param points at, or null.
 # `p: *T`, `p: @T` and `p: @&T` qualify (not the auto-deref `p:& T` borrow,
