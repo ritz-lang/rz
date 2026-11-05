@@ -3152,6 +3152,22 @@ class LLVMEmitter:
         finally:
             self._expected_enum_name = saved
 
+    def _emit_return_operand(self, value: rast.Expr) -> ir.Value:
+        """Emit a `return` operand, expecting the enum the fn returns.
+
+        The expectation is replaced rather than inherited: a `return` leaves
+        whatever value position it sits in, so a `let` initialiser's expected
+        enum says nothing about it. Without one a variant resolves through the
+        global variant map, which is whichever specialization registered last
+        (AGAST #2207).
+
+        Asks the LLVM function being emitted rather than `current_fn_def`,
+        which still names the enclosing fn inside a closure body.
+        """
+        expected_enum_name = self._resolve_enum_type_name(
+            None, self._fn_ret_type(self.current_fn))
+        return self._emit_expr_with_expected_enum(value, expected_enum_name)
+
     def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str) -> ir.Value:
         """Emit code to construct an enum variant for a specific enum type.
 
@@ -5519,23 +5535,7 @@ class LLVMEmitter:
                     self.expected_ritz_type = self.current_fn_def.ret_type
                     self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
 
-                # Check if this is an enum variant constructor that needs type context
-                # This handles return None, return Some(x), etc. for generic enum types
-                if (self._is_enum_variant_call(stmt.value) and
-                    self.current_fn_def and
-                    isinstance(self.current_fn_def.ret_type, rast.NamedType)):
-                    # Use function return type to construct the correct variant.
-                    # The return type may still carry its type arguments (e.g.
-                    # `Result<i16, StrView>` when Result comes from cached
-                    # metadata rather than a local generic def), so resolve the
-                    # specialization instead of using the bare base name.
-                    ret_named = self.current_fn_def.ret_type
-                    enum_type_name = self._resolve_enum_type_name(ret_named)
-                    if enum_type_name is None and ret_named.args:
-                        enum_type_name = self._ensure_builtin_generic_specialization(ret_named)
-                    val = self._emit_enum_variant_with_type(
-                        stmt.value, enum_type_name or ret_named.name)
-                elif self._emit_large_lit_into(
+                if self._emit_large_lit_into(
                         stmt.value, self._sret_dest(self.current_fn, ret_type)):
                     # AGAST #1741: the literal was built in the sret slot.
                     self.closure_expected_type = None
@@ -5545,7 +5545,7 @@ class LLVMEmitter:
                     self.has_returned = True
                     return True
                 else:
-                    val = self._emit_expr(stmt.value)
+                    val = self._emit_return_operand(stmt.value)
                 self.closure_expected_type = None  # Clear context
                 self.expected_ritz_type = None
                 self._reject_enum_as_int(
@@ -9187,7 +9187,7 @@ class LLVMEmitter:
         ret_type = self._fn_ret_type(self.current_fn)
         if expr.value is not None:
             self._expect_returned_value_from(expr.value)
-            ret_val = self._emit_expr(expr.value)
+            ret_val = self._emit_return_operand(expr.value)
             self._reject_enum_as_int(
                 ret_val, ret_type,
                 self.current_fn_def.ret_type if self.current_fn_def else None,
