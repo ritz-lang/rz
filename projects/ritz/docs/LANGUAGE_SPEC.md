@@ -809,7 +809,8 @@ into it.
 ### 5.4 Methods
 
 Methods live in `impl` blocks. The receiver is named `self`, either bare or
-annotated `@Type` (read-only) / `@&Type` (mutating).
+annotated `@Type` (read-only) / `@&Type` (mutating). A bare `self` is a by-value
+parameter: on a move-only type the call moves the receiver (§13.2).
 
 ```ritz
 struct Point
@@ -1844,7 +1845,8 @@ fn main() -> i32
 
 Using a value of a copy type by value copies it, and the source stays usable.
 Uses by value include binding it, assigning it, passing it to a by-value
-parameter, returning it and storing it in a field or an array or tuple literal:
+parameter, calling a method that takes `self` by value on it, returning it and
+storing it in a field or an array or tuple literal:
 
 ```ritz
 struct Point

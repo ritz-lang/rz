@@ -20,6 +20,8 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
     are partly moved and their other fields still drop (AGAST #2232).
   * an array or tuple literal owns its elements, so a binding used as one
     moves into it and drops once (AGAST #2238).
+  * a method that takes `self` by value moves its receiver, which then
+    drops once, in the method (AGAST #2239).
 
 Exit statuses encode what the program observed, as in the free-count test.
 """
@@ -1013,6 +1015,186 @@ pub fn main() -> i32
     assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
     assert "cannot move out of borrowed parameter `t`" in out, out[-2000:]
+
+
+# A by-value receiver moves into the method, which drops it (AGAST #2239).
+RECEIVER = """\
+struct Two
+    t: Tracked
+    u: Tracked
+
+impl Tracked
+    fn burn(self:= Tracked) -> i32
+        return self.id
+
+    fn typed(self: Tracked) -> i32
+        return self.id
+
+    fn bare(self) -> i32
+        return self.id
+
+    fn look(self: @Tracked) -> i32
+        return self.id
+
+    fn pass_on(self:= Tracked) -> i32
+        return self.burn()
+
+"""
+
+# name: (the body of `g`, which runs before main returns DROPS, expected DROPS)
+RECEIVER_RUNS = {
+    "var": ("""
+    var t = make(1)
+    return t.burn()
+""", 1),
+    "let": ("""
+    let t = make(1)
+    return t.burn()
+""", 1),
+    "typed_self": ("""
+    var t = make(1)
+    return t.typed()
+""", 1),
+    "bare_self": ("""
+    var t = make(1)
+    return t.bare()
+""", 1),
+    "grouped": ("""
+    var t = make(1)
+    return (t).burn()
+""", 1),
+    "statement": ("""
+    var t = make(1)
+    t.burn()
+    return 0
+""", 1),
+    "lent_first": ("""
+    var t = make(1)
+    t.look()
+    return t.burn()
+""", 1),
+    "lending_only": ("""
+    var t = make(1)
+    return t.look()
+""", 1),
+    "forwarded_by_the_method": ("""
+    var t = make(1)
+    return t.pass_on()
+""", 1),
+    "temporary": ("""
+    return make(1).burn()
+""", 1),
+    "field": ("""
+    var w = Two { t: make(1), u: make(2) }
+    return w.t.burn()
+""", 2),
+    "both_fields": ("""
+    var w = Two { t: make(1), u: make(2) }
+    return w.t.burn() + w.u.burn()
+""", 2),
+    "reassigned": ("""
+    var t = make(1)
+    t.burn()
+    t = make(2)
+    return t.burn()
+""", 2),
+    "on_one_path_taken": ("""
+    var t = make(1)
+    var n = 1
+    if n == 1
+        t.burn()
+    return 0
+""", 1),
+    "on_one_path_not_taken": ("""
+    var t = make(1)
+    var n = 0
+    if n == 1
+        t.burn()
+    return 0
+""", 1),
+    "in_a_loop": ("""
+    var i = 0
+    while i < 3
+        var t = make(1)
+        t.burn()
+        i += 1
+    return 0
+""", 3),
+}
+
+RECEIVER_REJECTS = {
+    "field_read": ("""
+    var t = make(1)
+    t.burn()
+    return t.id
+""", "t"),
+    "second_call": ("""
+    var t = make(1)
+    t.bare()
+    return t.bare()
+""", "t"),
+    "lend_after": ("""
+    var t = make(1)
+    t.typed()
+    return t.look()
+""", "t"),
+    "receiver_field": ("""
+    var w = Two { t: make(1), u: make(2) }
+    w.t.burn()
+    return w.t.id
+""", "w.t"),
+}
+
+RECEIVER_LENT = {
+    "param": ("fn f(t:& Tracked) -> i32\n    return t.burn()\n", "t"),
+    "bare_self": ("fn f(t:& Tracked) -> i32\n    return t.bare()\n", "t"),
+    "field": ("fn f(w:& Two) -> i32\n    return w.t.burn()\n", "w"),
+}
+
+
+def _receiver_program(body):
+    return (RECEIVER + "fn g() -> i32" + body
+            + "\npub fn main() -> i32\n    g()\n    return DROPS\n")
+
+
+@pytest.mark.parametrize("name", sorted(RECEIVER_RUNS))
+def test_ritz0_by_value_receiver_drops(tmp_path, name):
+    body, expected = RECEIVER_RUNS[name]
+    rc = _run(tmp_path, _receiver_program(body))
+    assert rc == expected, f"{name}: {rc} drops, spec says {expected}"
+
+
+def test_ritz0_by_value_param_receiver_drops_once(tmp_path):
+    rc = _run(tmp_path, RECEIVER + """
+fn g(t:= Tracked) -> i32
+    return t.burn()
+
+pub fn main() -> i32
+    g(make(1))
+    return DROPS
+""")
+    assert rc == 1, f"one value dropped {rc} times"
+
+
+@pytest.mark.parametrize("name", sorted(RECEIVER_REJECTS))
+def test_ritz0_use_after_by_value_receiver_rejected(tmp_path, name):
+    body, var = RECEIVER_REJECTS[name]
+    comp, _ = _compile(tmp_path, _receiver_program(body))
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a use after move:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert f"use of moved value: `{var}`" in out, out[-2000:]
+
+
+@pytest.mark.parametrize("name", sorted(RECEIVER_LENT))
+def test_ritz0_by_value_receiver_of_lent_param_rejected(tmp_path, name):
+    body, param = RECEIVER_LENT[name]
+    comp, _ = _compile(tmp_path, RECEIVER + body
+                       + "\npub fn main() -> i32\n    return 0\n")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert f"cannot move out of borrowed parameter `{param}`" in out, out[-2000:]
 
 
 @pytest.mark.parametrize("name", sorted(RUNS))

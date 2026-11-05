@@ -290,6 +290,8 @@ class MoveChecker:
         self.fn_params: Dict[str, List[rast.Param]] = {}
         # Method name -> every impl's FnDef of that name.
         self.methods: Dict[str, List[rast.FnDef]] = {}
+        # (type name, method name) -> that type's FnDefs of that name.
+        self.type_methods: Dict[Tuple[str, str], List[rast.FnDef]] = {}
         self.types: Optional[MoveTypes] = None
         # Per enclosing loop: the binding states at each `break` and
         # `continue` (AGAST #2161, _check_loop).
@@ -327,6 +329,7 @@ class MoveChecker:
             elif isinstance(item, rast.ImplBlock):
                 for m in item.methods:
                     self.methods.setdefault(m.name, []).append(m)
+                    self.type_methods.setdefault((item.type_name, m.name), []).append(m)
 
         # Second pass: check functions and impl methods
         for item in module.items:
@@ -808,9 +811,10 @@ class MoveChecker:
             self._mark_temporary(expr, is_move_context)
 
         elif isinstance(expr, rast.MethodCall):
-            # The receiver is borrowed (auto-ref), not moved. An argument
-            # moves when every method of that name takes it by value.
-            self._check_expr(expr.expr, is_move_context=False)
+            # The receiver is borrowed (auto-ref) unless the method takes it
+            # by value (AGAST #2239). An argument moves when every method of
+            # that name takes it by value.
+            self._check_expr(expr.expr, is_move_context=self._method_takes_self(expr))
             if not self._method_lends_self(expr):
                 # A temporary receiver taken by value is moved, not dropped.
                 self._unmark_temporary(expr.expr)
@@ -1144,6 +1148,31 @@ class MoveChecker:
         for m in cands:
             params = list(m.params)
             if not params or params[0].name != 'self' or not _is_lending_param(params[0]):
+                return False
+        return True
+
+    def _receiver_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """The type of a method receiver, looking through `*r`."""
+        if isinstance(expr, rast.UnaryOp) and expr.op == '*':
+            # `*t` of a `t:& T` is t's value, and t's type is already T.
+            return self._receiver_type(expr.operand)
+        return self.types.resolve(self._field_path_type(expr))
+
+    def _method_takes_self(self, call: rast.MethodCall) -> bool:
+        """Does `call` take its receiver by value? `self:= T`, `self: T` and
+        bare `self` do. The method is looked up on the receiver's own type,
+        not by name across impls: moving a receiver wrongly rejects a valid
+        program, and another type's method says nothing about this call. A
+        method the receiver's type doesn't declare (a UFCS fallback) lends."""
+        ty = self._receiver_type(call.expr)
+        if not isinstance(ty, rast.NamedType):
+            return False
+        cands = self.type_methods.get((ty.name, call.method))
+        if not cands:
+            return False
+        for m in cands:
+            params = list(m.params)
+            if not params or params[0].name != 'self' or _is_lending_param(params[0]):
                 return False
         return True
 

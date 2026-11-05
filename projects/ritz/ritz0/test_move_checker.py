@@ -783,6 +783,16 @@ impl Wrap
     fn put(self: @Wrap, r:= Res) -> i32
         return r.h
 
+impl Res
+    fn burn(self:= Res) -> i32
+        return self.h
+
+    fn look(self: @Res) -> i32
+        return self.h
+
+    fn keep(self:& Res) -> i32
+        return self.h
+
 fn eat(r:= Res) -> i32
     return r.h
 
@@ -1122,6 +1132,281 @@ fn f(p:& P) -> i32
     let q = p
     let r = *p
     return take(p) + q.x + r.x
+""") == []
+
+    @pytest.mark.parametrize("body, param", [
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return t.burn()
+""", "t", id="param"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return (t).burn()
+""", "t", id="grouped"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    return (*t).burn()
+""", "t", id="deref"),
+        pytest.param("""
+fn f(w:& Wrap) -> i32
+    return w.r.burn()
+""", "w", id="field"),
+        pytest.param("""
+fn f(d:& Deep) -> i32
+    return d.w.r.burn()
+""", "d", id="nested_field"),
+        pytest.param("""
+impl Wrap
+    fn spend(self:& Wrap) -> i32
+        return self.r.burn()
+""", "self", id="self_param"),
+    ])
+    def test_by_value_receiver_is_a_move_out(self, body, param):
+        """`t.burn()` takes the receiver by value, so on a lent `t` it's the
+        same move out as `eat(t)` (AGAST #2239)."""
+        errs = check(self.DEFS + body)
+        assert len(errs) == 1, errs
+        assert f"cannot move out of borrowed parameter `{param}`" in str(errs[0])
+
+    def test_lending_receivers_are_accepted(self):
+        """Control: a method that borrows its receiver only reads it."""
+        assert check(self.DEFS + """
+fn f(t:& Res, w:& Wrap) -> i32
+    return t.look() + t.keep() + w.r.look()
+""") == []
+
+
+class TestByValueReceiver:
+    """A method that takes `self` by value moves its receiver (AGAST #2239).
+
+    `self:= T`, `self: T` and bare `self` are all by-value parameters
+    (LANGUAGE_SPEC §5.4, §13.2). The method is found on the receiver's own
+    type: other types' methods of that name say nothing about this call.
+    """
+
+    DEFS = drop_impl("T") + """
+struct T
+    id: i32
+
+struct H
+    t: T
+    u: T
+
+impl T
+    fn burn(self:= T) -> i32
+        return self.id
+
+    fn typed(self: T) -> i32
+        return self.id
+
+    fn bare(self) -> i32
+        return self.id
+
+    fn look(self: @T) -> i32
+        return self.id
+
+    fn poke(self: @&T) -> i32
+        return self.id
+
+    fn keep(self:& T) -> i32
+        return self.id
+
+    fn make(id: i32) -> T
+        return T { id: id }
+
+fn eat(t:= T) -> i32
+    return t.id
+
+"""
+
+    @pytest.mark.parametrize("method", ["burn", "typed", "bare"])
+    def test_use_after_receiver_moved(self, method):
+        errs = check(self.DEFS + f"""
+fn f(t:= T) -> i32
+    t.{method}()
+    return t.id
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    @pytest.mark.parametrize("method", ["look", "poke", "keep"])
+    def test_lending_method_keeps_the_receiver(self, method):
+        assert check(self.DEFS + f"""
+fn f(t:= T) -> i32
+    t.{method}()
+    t.{method}()
+    return eat(t)
+""") == []
+
+    def test_second_by_value_call_is_a_use_after_move(self):
+        errs = check(self.DEFS + """
+fn f(t:= T) -> i32
+    t.burn()
+    return t.burn()
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    def test_argument_reads_the_receiver_after_it_moved(self):
+        """The receiver is evaluated first, so it has gone by the argument."""
+        errs = check(self.DEFS + """
+impl T
+    fn plus(self:= T, n: i32) -> i32
+        return self.id + n
+
+fn f(t:= T) -> i32
+    return t.plus(t.id)
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    def test_receiver_field_moves_that_field_only(self):
+        assert check(self.DEFS + """
+fn f(h:= H) -> i32
+    h.t.burn()
+    return h.u.burn()
+""") == []
+        errs = check(self.DEFS + """
+fn f(h:= H) -> i32
+    h.t.burn()
+    return h.t.id
+""")
+        assert len(errs) == 1 and "use of moved value: `h.t`" in str(errs[0])
+
+    def test_moved_in_a_loop(self):
+        errs = check(self.DEFS + """
+fn f(t:= T) -> i32
+    var i = 0
+    while i < 2
+        t.burn()
+        i += 1
+    return 0
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    def test_reassigned_receiver_is_usable_again(self):
+        assert check(self.DEFS + """
+fn f() -> i32
+    var t = T { id: 1 }
+    t.burn()
+    t = T { id: 2 }
+    return t.burn()
+""") == []
+
+    def test_copy_receiver_stays_usable(self):
+        assert check(self.DEFS + """
+struct P
+    x: i32
+
+impl P
+    fn get(self) -> i32
+        return self.x
+
+fn f(p: P) -> i32
+    p.get()
+    return p.get()
+""") == []
+
+    def test_alias_of_the_receiver_type(self):
+        errs = check(self.DEFS + """
+type Alias = T
+
+fn f(t:= Alias) -> i32
+    t.burn()
+    return t.id
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    def test_generic_receiver(self):
+        errs = check("""
+trait Drop
+    fn drop(self: @&Self)
+
+struct G<V>
+    v: V
+
+impl<V> Drop for G<V>
+    fn drop(self: @&G<V>)
+        pass
+
+impl<V> G<V>
+    fn burn(self:= G<V>) -> i32
+        return 0
+
+fn f(g:= G<i32>) -> i32
+    g.burn()
+    return g.burn()
+""")
+        assert len(errs) == 1 and "use of moved value: `g`" in str(errs[0])
+
+    def test_another_types_lending_method_does_not_save_the_receiver(self):
+        """`name` matching every impl would call `t.size()` lending."""
+        errs = check(self.DEFS + """
+struct U
+    n: i32
+
+impl U
+    fn size(self: @U) -> i32
+        return self.n
+
+impl T
+    fn size(self) -> i32
+        return self.id
+
+fn f(t:= T) -> i32
+    t.size()
+    return t.id
+""")
+        assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    def test_another_types_by_value_method_does_not_move_the_receiver(self):
+        """`peek` on U is by value and on T lends: T's receiver stays."""
+        assert check(self.DEFS + """
+struct U
+    n: i32
+
+impl U
+    fn peek(self) -> i32
+        return self.n
+
+impl T
+    fn peek(self: @T) -> i32
+        return self.id
+
+fn f(t:= T) -> i32
+    t.peek()
+    return eat(t)
+""") == []
+
+    def test_method_only_another_type_has_does_not_move(self):
+        """A method T has no impl of (a UFCS fallback, say) isn't known to
+        take T by value."""
+        assert check(self.DEFS + """
+struct U
+    n: i32
+
+impl U
+    fn only_u(self) -> i32
+        return self.n
+
+fn f(t:= T) -> i32
+    t.only_u()
+    return eat(t)
+""") == []
+
+    def test_associated_fn_called_on_a_value_does_not_move(self):
+        """No `self`, so no receiver to take."""
+        assert check(self.DEFS + """
+fn f(t:= T) -> i32
+    t.make(1)
+    return eat(t)
+""") == []
+
+    def test_pointer_receiver_does_not_move_the_pointer(self):
+        """Control: `@T` and `*T` copy; what a by-value method on one should
+        mean is the #2227 question."""
+        assert check(self.DEFS + """
+fn f(r: @T, p: *T) -> i32
+    r.burn()
+    p.burn()
+    return r.burn() + p.burn()
 """) == []
 
 
