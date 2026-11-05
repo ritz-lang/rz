@@ -664,26 +664,38 @@ pointer to it. Write `*p` only when the parameter is a raw pointer (`*T`, `*&T`)
 
 **Call sites are always clean:**
 ```ritz
+import ritzlib.strview
+
+
 struct Connection
     fd: i32
+
+impl Drop for Connection
+    fn drop(self:& Connection)
+        pass
 
 
 fn increment(counter:& i32)
     counter += 1
 
-fn calculate_hash(data: i64) -> u64
-    data as u64
+fn reconnect(conn:& Connection)
+    conn.fd += 1
+
+fn calculate_hash(data: StrView) -> u64
+    data.len as u64
 
 fn consume_connection(conn:= Connection) -> i32
     conn.fd
 
 
-fn call_sites(data: i64) -> i32
+fn call_sites(data: StrView) -> i32
     var n: i32 = 0
-    let conn = Connection { fd: 3 }
+    var conn = Connection { fd: 3 }
 
     # No sigils at call sites - Ritz, not Rust
     increment(n)                  # Not: increment(&mut n)
+    reconnect(conn)               # Not: reconnect(&mut conn)
+    let fd = conn.fd              # Only borrowed, so conn is still ours
     let h = calculate_hash(data)  # Not: calculate_hash(&data)
     consume_connection(conn)      # Same spelling; ownership transfers
 ```

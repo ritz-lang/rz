@@ -10,7 +10,8 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
   * a moved-from binding is never dropped, whichever kind of binding it is
     (`let`, `var`, parameter) and on whichever path it moved (drop flags);
   * `break` leaves only the scopes inside the innermost loop;
-  * a value lent to an `@T` parameter (auto-borrow) is not moved;
+  * a value lent to an `@T` or `name:& T` parameter (auto-borrow) is not
+    moved, and a write through `:&` reaches the caller (AGAST #1315);
   * a type with its own `drop` runs it before its fields' drops;
   * a match arm binding one payload of several owns them all (AGAST #2177).
 
@@ -126,6 +127,56 @@ pub fn main() -> i32
     let p = o
     return (get(o) + get(o) + get(p)) as i32
 """, 15),
+
+    # AGAST #1315: `:&` lends. Both writes reach the caller's value, nothing
+    # drops during the calls (exit 30 + 0), and the owner drops it once.
+    "mut_borrow_param_lends": ("""\
+fn bump(t:& Tracked)
+    t.id = t.id + 1
+
+fn f() -> i32
+    var t = make(1)
+    bump(t)
+    bump(t)
+    return t.id * 10 + DROPS
+
+pub fn main() -> i32
+    let r = f()
+    return r + DROPS
+""", 31),
+
+    # The same through a field: the holder still owns and drops it, once.
+    "mut_borrow_of_field_lends": ("""\
+fn bump(t:& Tracked)
+    t.id = t.id + 1
+
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    bump(h.t)
+    bump(h.t)
+    return h.t.id * 10 + DROPS
+
+pub fn main() -> i32
+    let r = f()
+    return r + DROPS
+""", 31),
+
+    # The same through a method receiver.
+    "mut_borrow_receiver_lends": ("""\
+impl Tracked
+    fn bump(self:& Tracked)
+        self.id = self.id + 1
+
+fn f() -> i32
+    var t = make(1)
+    t.bump()
+    t.bump()
+    return t.id * 10 + DROPS
+
+pub fn main() -> i32
+    let r = f()
+    return r + DROPS
+""", 31),
 
     # A moved `let` is not dropped again by its scope.
     "let_moved_not_dropped": ("""\

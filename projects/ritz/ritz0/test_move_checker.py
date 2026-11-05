@@ -595,6 +595,154 @@ fn main() -> i32
         assert not getattr(n_init.expr, 'moves_binding', False)
 
 
+class TestMutBorrowParamLends:
+    """A `name:& T` parameter borrows its argument (AGAST #1315).
+
+    `Res` implements Drop, so it is move-only and these cases go through the
+    lending path. A struct without Drop copies (§13.1) and would pass whether
+    or not `:&` lends, which is why the ticket's own repro, kept below as
+    `test_ticket_repro_copy_struct`, can't guard this on its own.
+    """
+
+    DEFS = drop_impl("Res") + """
+struct Res
+    h: i32
+
+struct Wrap
+    r: Res
+
+fn bump(r:& Res)
+    r.h += 1
+
+fn eat(r:= Res) -> i32
+    return r.h
+
+"""
+
+    def test_ticket_repro_copy_struct(self):
+        """The program AGAST #1315 reported, verbatim."""
+        assert check("""
+struct P
+    x: i32
+
+fn bump(p:& P)
+    p.x += 1
+
+fn main() -> i32
+    var q = P { x: 1 }
+    bump(q)
+    q.x
+""") == []
+
+    @pytest.mark.parametrize("body", [
+        pytest.param("""
+fn main() -> i32
+    var q = Res { h: 1 }
+    bump(q)
+    return q.h
+""", id="read_after_call"),
+        pytest.param("""
+fn main() -> i32
+    var q = Res { h: 1 }
+    bump(q)
+    bump(q)
+    return q.h
+""", id="two_calls"),
+        pytest.param("""
+fn main() -> i32
+    var q = Res { h: 1 }
+    var i: i32 = 0
+    while i < 3
+        bump(q)
+        i += 1
+    return q.h
+""", id="call_in_loop"),
+        pytest.param("""
+fn main() -> i32
+    var w = Wrap { r: Res { h: 1 } }
+    bump(w.r)
+    bump(w.r)
+    return w.r.h
+""", id="field_of_struct"),
+        pytest.param("""
+fn touch<T>(v:& T) -> i32
+    return 0
+
+fn main() -> i32
+    var q = Res { h: 1 }
+    touch<Res>(q)
+    touch<Res>(q)
+    return q.h
+""", id="generic_fn"),
+        pytest.param("""
+impl Res
+    fn inc(self:& Res)
+        self.h += 1
+
+fn main() -> i32
+    var q = Res { h: 1 }
+    q.inc()
+    q.inc()
+    return q.h
+""", id="method_receiver"),
+        pytest.param("""
+struct Poker
+    n: i32
+
+impl Poker
+    fn poke(self:& Poker, r:& Res)
+        r.h += self.n
+
+fn main() -> i32
+    var p = Poker { n: 1 }
+    var q = Res { h: 1 }
+    p.poke(q)
+    p.poke(q)
+    return q.h
+""", id="method_argument"),
+        pytest.param("""
+fn twice(r:& Res)
+    bump(r)
+    bump(r)
+    r.h += 1
+
+fn main() -> i32
+    var q = Res { h: 1 }
+    twice(q)
+    return q.h
+""", id="reborrow_in_callee"),
+        pytest.param("""
+fn main() -> i32
+    var q = Res { h: 1 }
+    bump(q)
+    return eat(q)
+""", id="move_after_borrow"),
+    ])
+    def test_lends(self, body):
+        assert check(self.DEFS + body) == []
+
+    def test_owned_param_still_moves(self):
+        """Control: `:=` takes ownership, so the same read is an error."""
+        errs = check(self.DEFS + """
+fn main() -> i32
+    var q = Res { h: 1 }
+    eat(q)
+    return q.h
+""")
+        assert len(errs) == 1 and "use of moved value: `q`" in str(errs[0])
+
+    def test_lending_a_moved_value_is_rejected(self):
+        """Lending needs a live value: a `:&` call doesn't revive `q`."""
+        errs = check(self.DEFS + """
+fn main() -> i32
+    var q = Res { h: 1 }
+    eat(q)
+    bump(q)
+    return 0
+""")
+        assert len(errs) == 1 and "use of moved value: `q`" in str(errs[0])
+
+
 class TestLoopsMatchesTemporaries:
     """AGAST #2161: loop bodies see the previous iteration's moves, match
     arms start from the same state, and unowned move-only values are
