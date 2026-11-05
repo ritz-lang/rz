@@ -27,7 +27,6 @@ import pytest
 
 from test_borrow_param_ref_field import _compile, _run
 
-SILENT_GAP = "AGAST #2308: ritz1 reads a scalar, array or pointer referent into a reference"
 CLOSED_GAP = "AGAST #2309: ritz1 can't take a `:&` into a reference from here"
 NOT_CHECKED_GAP = "AGAST #2310: ritz1 doesn't hold a reference to a `:&` param to these rules"
 NO_TUPLES_GAP = "AGAST #1526: ritz1 has no tuples"
@@ -799,16 +798,12 @@ def _both(*shapes):
 
 
 RITZ1_GAPS = {
-    **_gaps(["scalar_let", "scalar_var", "scalar_shared_let", "scalar_argument",
-             "scalar_return", "scalar_tail", "scalar_generic_return", "float_let",
-             "array_let", "array_return", "pointer_referent_let",
-             "pointer_referent_return"], SILENT_GAP),
     **_gaps(_both("arm_beside_a_borrow", "array_fill", "array_literal", "array_store",
                   "assign_from_if", "let_if", "let_match", "let_match_block",
                   "tail_if", "tail_match")
             + ["assign_in_arm_mut", "assign_mut", "bare_self_return_mut",
                "field_from_if", "global", "literal_field_from_if", "return_in_arm_mut",
-               "self_return_mut", "through_a_chain_mut", "through_pointer"], CLOSED_GAP),
+               "self_return_mut", "through_a_chain_mut"], CLOSED_GAP),
     **_gaps(_both("tuple", "tuple_return"), NO_TUPLES_GAP),
 }
 
@@ -861,8 +856,7 @@ def test_ritz1_reborrow_binding_counts_as_a_borrow(ritz1_bin, tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=NOT_CHECKED_GAP)
-@pytest.mark.parametrize("name", sorted(ANOTHER_POINTEE))
+@pytest.mark.parametrize("name", _params(ANOTHER_POINTEE, _gaps(set(ANOTHER_POINTEE) - {"scalar"}, NOT_CHECKED_GAP)))
 def test_ritz1_reference_to_another_type_is_refused(ritz1_bin, tmp_path, name):
     program = ANOTHER_POINTEE[name] + """
 pub fn main() -> i32

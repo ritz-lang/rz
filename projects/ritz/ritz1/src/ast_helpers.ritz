@@ -964,6 +964,7 @@ pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, bod
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
     f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
+    f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1037,6 +1038,7 @@ pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
     f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
+    f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1127,6 +1129,11 @@ fn param_type_names_pointee(p: *Parser, ty: i32) -> i32
 
 pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
     nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
+    return param_of_type(p, name, len, ty)
+
+# The just-parsed type `ty` as a param declares it.  AGAST #2308: a `@T` local
+# or return type is recorded this way too, so they all know the same things.
+fn param_of_type(p: *Parser, name: *u8, len: i32, ty: i32) -> *Param
     let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
     param.name = name as *u8
     param.name_len = len
@@ -1160,6 +1167,9 @@ pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
         param.param_pointee_array_size = p.last_array_size
         param.param_pointee_array_elem_type = p.last_array_elem_type
         param.param_pointee_array_shape = p.last_array_shape
+    param.param_ref_ptr_pointee = TYPE_VOID
+    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR
+        param.param_ref_ptr_pointee = p.last_pointee_type
     param.param_array_size = 0
     param.param_array_elem_type = TYPE_VOID
     if ty == TYPE_ARRAY
@@ -1343,6 +1353,7 @@ pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypePar
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
     f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
+    f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1730,9 +1741,20 @@ fn fn_ret_fn_sig(ret: i32) -> *FnDef
         return g_ret_fn_sig
     return null
 
+# AGAST #2308: a `-> @T` / `-> @&T`, latched as g_ret_fn_sig is.
+var g_ret_ref: *Param = null
+
+fn fn_ret_ref(ret: i32) -> *Param
+    if ret == TYPE_REF or ret == TYPE_MUT_REF
+        return g_ret_ref
+    return null
+
 pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     nd_array_reject(p, ret, parse_pos_line(p), parse_pos_col(p), c"a return type")  # AGAST #1509
     g_ret_fn_sig = fresh_fn_sig(p)   # the type_spec just ended here
+    g_ret_ref = null
+    if ret == TYPE_REF or ret == TYPE_MUT_REF
+        g_ret_ref = param_of_type(p, null, 0, ret)
     if ret == TYPE_STRUCT
         p.fn_return_type_name = p.last_type_name
         p.fn_return_type_name_len = p.last_type_name_len
@@ -1767,7 +1789,17 @@ pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
 # After parsing Vec<LineBounds>, last_type_name is "Vec$LineBounds"
 # But parsing vec_with_cap<LineBounds>(64) overwrites it with "LineBounds"
 # We save to var_type_name (separate from fn_return_type_name) and stmt_var_decl reads from there.
+#
+# AGAST #2308: an initializer overwrites what a `@T` local's referent was parsed
+# into as well, so it's latched here, whole.  A typed `let` nested in the
+# initializer (a block arm) replaces the latch, as it does var_type_name, and a
+# nested reference then wins.  No arm lends yet (#2309), which is when it matters.
+var g_var_ref: *Param = null
+
 pub fn capture_var_type(p: *Parser, ty: i32) -> i32
+    g_var_ref = null
+    if ty == TYPE_REF or ty == TYPE_MUT_REF
+        g_var_ref = param_of_type(p, null, 0, ty)
     if ty == TYPE_STRUCT
         p.var_type_name = p.last_type_name
         p.var_type_name_len = p.last_type_name_len
@@ -1829,6 +1861,7 @@ pub fn type_fn(p: *Parser, params: *Param, ret: i32) -> i32
     f.target_gated = 0
     f.from_generated = 0
     f.ret_fn_sig = null
+    f.ret_ref = null
     p.last_fn_sig = f
     p.last_fn_sig_pos = p.pos
     return TYPE_PTR
@@ -2568,9 +2601,24 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     s.var_pointee_array_size = ptr_array_pointee_size(p, ty)
     s.var_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
+    s.var_ref = null
+    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and g_var_ref != null
+        s.var_ref = g_var_ref
+        stmt_take_var_ref(s)
     s.var_init = init
     s.next = null
     return s
+
+# AGAST #2308: what `s.var_ref` records is what a `@T` local is registered with.
+# Without the referent a `let p: @&i8` read and stored 8 bytes through `*p`,
+# where the same type on a param stored one.
+pub fn stmt_take_var_ref(s: *Stmt)
+    let r: *Param = s.var_ref
+    s.var_type_name = r.param_type_name
+    s.var_type_name_len = r.param_type_name_len
+    s.var_pointee_type = r.param_pointee_type
+    s.var_pointee_array_size = r.param_pointee_array_size
+    s.var_pointee_array_elem_type = r.param_pointee_array_elem_type
 
 pub fn stmt_return(p: *Parser, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt

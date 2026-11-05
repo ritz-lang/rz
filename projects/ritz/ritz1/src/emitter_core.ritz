@@ -85,6 +85,12 @@ struct LocalVar
     # is the caller's pointer variable.  A receiver not declared as a reference
     # is 1 too, because `self` is always passed as a `ptr`.  See mark_lent_param.
     holds_lent_ptr: i32
+    # AGAST #2308: 1 for a `:&` param bound as a plain local, whose slot IS the
+    # caller's variable (bind_scalar_borrow_param): an integer, an array or a
+    # `*U`.  It reads as that variable, so a reference slot, which holds the
+    # borrow, has to ask for the slot; see lent_ref_local.  A `:& *U` is not
+    # is_lent, and `:& f64` and `:& C` aren't this: they read as the pointer.
+    lent_in_slot: i32
 
 # A let/var seen so far in the current function, with the integer type its
 # annotation WROTE (NARROW_UNKNOWN when unannotated or not an integer).
@@ -145,6 +151,7 @@ struct EmitterState
     # Current function's return type name (for struct returns)
     ret_type_name: *u8
     ret_type_name_len: i32
+    ret_ref: *Param   # AGAST #2308: FnDef.ret_ref of the fn being emitted
     # AGAST #1730 — 1 when the current fn returns its (large) struct through
     # a `ptr sret(%T) %ret.sret` first parameter; see struct_ret_uses_sret.
     ret_sret: i32
@@ -780,6 +787,14 @@ fn nth_arg(args: *Expr, j: i32) -> *Expr
     return a
 
 # The ident-only half of expr_is_ptr_valued: the shape `*x` / `*x = v` see.
+# The integer kinds a `:&` borrow binds as a plain local (AGAST #1644).
+fn is_borrow_scalar_kind(t: i32) -> i32
+    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16
+        return 1
+    if t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64
+        return 1
+    return 0
+
 # AGAST #2290: the `a:& [N]T` param `e` names, of any rank, or null.  It's an
 # array local whose slot is the array behind the borrow.
 fn lent_array_ident(s: *EmitterState, e: *Expr) -> *LocalVar
@@ -881,6 +896,7 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
     loc.array_shape = null
     loc.is_lent = 0
     loc.holds_lent_ptr = 0
+    loc.lent_in_slot = 0
     s.local_count = idx + 1
     # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
     # Store `idx + 1` so the value is non-zero (0 = miss in
@@ -4127,13 +4143,22 @@ fn lent_struct_local(s: *EmitterState, e: *Expr) -> *LocalVar
         return null
     return loc
 
+# AGAST #2308: the scalar T of a `-> @T` / `-> @&T` fn, or TYPE_VOID.
+fn ret_ref_scalar_pointee(f: *FnDef) -> i32
+    if f == null or f.ret_ref == null or primitive_name_len(f.ret_ref.param_pointee_type) == 0
+        return TYPE_VOID
+    return f.ret_ref.param_pointee_type
+
 # The pointee type a pointer expression states inline, or TYPE_VOID: `<e> as
-# *T` (the cast records T; AGAST #1453) and `@x` (x's own type).  Shared by
-# the memory builtins (#1879) and the `*p` load / `*p = v` store widths
-# (#2119), which otherwise only know a typed binding's pointee.
+# *T` (the cast records T; AGAST #1453), `@x` (x's own type) and a call that
+# returns a reference (#2308).  Shared by the memory builtins (#1879) and the
+# `*p` load / `*p = v` store widths (#2119), which otherwise only know a typed
+# binding's pointee.
 fn inline_ptr_pointee(s: *EmitterState, p: *Expr) -> i32
     if p == null
         return TYPE_VOID
+    if p.kind == EXPR_CALL
+        return ret_ref_scalar_pointee(find_call_fn(s, p))
     if p.kind == EXPR_CAST and p.op == TYPE_PTR and p.int_val != (TYPE_VOID as i64)
         return p.int_val as i32
     if p.kind == EXPR_UNARY and (p.op == OP_ADDR or p.op == OP_ADDR_MUT) and p.operand != null
@@ -4440,10 +4465,11 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                     if rb_type == TYPE_PTR and primitive_name_len(rb_pt) > 0
                         return rb_pt
                 return TYPE_I64  # Default for unknown pointer dereference
-            else if inner_type == TYPE_MUT_REF and e.operand.kind == EXPR_IDENT
+            else if (inner_type == TYPE_MUT_REF or inner_type == TYPE_REF) and e.operand.kind == EXPR_IDENT
                 # AGAST #1644: `*x` with `x: @&i32` loads the pointee's
                 # width, as `*q` with `q: *i32` does.  Struct pointees are
                 # resolved by name in the OP_DEREF arm before this is asked.
+                # AGAST #2308: so does `x: @i32`, which loaded 8 bytes.
                 let mr_pt: i32 = find_local_pointee_type(s, e.operand.ident_ptr, e.operand.ident_len)
                 if mr_pt != TYPE_STRUCT
                     return mr_pt

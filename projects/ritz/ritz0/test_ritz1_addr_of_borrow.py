@@ -915,12 +915,9 @@ ALL = {f"{group}_{name}": source
 # Still open on ritz1, each held to ritz0's answer by a strict xfail.
 RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
-    "array_let_ref_read": "AGAST #2304: a `let p: @[N]T` local doesn't record N, for a local either",
-    "array_let_mut_ref_store": "AGAST #2304: a `let p: @&[N]T` local doesn't record N, for a local either",
     "array_untyped_read": "AGAST #2304: `let p = @b` doesn't record the pointee array",
     "array_for": "AGAST #2314: `for x in @a` runs zero iterations",
     "struct_for_vec": "AGAST #2314: `for x in @v` runs zero iterations",
-    "referent_f64_mut_let": "AGAST #2315: `*p` of a `let p: @&f64` reads 0, for a local too",
     "self_by_value_field_write": "AGAST #2316: a by-value `self` isn't a copy",
     "self_by_value_address_write": "AGAST #2316: a by-value `self` isn't a copy",
     "self_generic_bare": "AGAST #2318: bare `self:&` in a generic impl doesn't compile",

@@ -156,7 +156,12 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             # TYPE_I64 — reads failed "unhandled EXPR_MEMBER" and a store
             # `m.x = v` was silently dropped (#1439).
             else if fn_def != null and (fn_def.return_type == TYPE_REF or fn_def.return_type == TYPE_MUT_REF)
-                if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+                if ret_ref_scalar_pointee(fn_def) != TYPE_VOID
+                    # AGAST #2308: `-> @&i8` keeps its width, as `-> *i8` does.
+                    var_type = TYPE_PTR
+                    stmt.var_type = TYPE_PTR
+                    stmt.var_pointee_type = ret_ref_scalar_pointee(fn_def)
+                else if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
                     if find_struct(s, fn_def.return_type_name, fn_def.return_type_name_len) != null
                         var_type = TYPE_PTR
                         stmt.var_type = TYPE_PTR
@@ -218,6 +223,10 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                         # width match (was `alloca i64; store float`).
                         var_type = m.return_type
                         stmt.var_type = m.return_type
+                    else if ret_ref_scalar_pointee(m) != TYPE_VOID
+                        var_type = TYPE_PTR   # AGAST #2308, as for a call
+                        stmt.var_type = TYPE_PTR
+                        stmt.var_pointee_type = ret_ref_scalar_pointee(m)
         # AGAST #1681: `var parsed = p` where `p` is a struct-typed local —
         # a by-value struct param or a struct `let`.  Copy its struct type
         # so the slot is `alloca %S` (was `alloca i64` → `store i64 %<%S>`
@@ -631,8 +640,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     else
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
     set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, stmt.var_fn_sig)  # AGAST #1671
-    if var_type == TYPE_PTR
-        set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953
+    if var_type == TYPE_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
+        set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308
     # `let ok = is_big(x)`: inference above leaves a bool-returning call's
     # local at TYPE_I64. (Indistinguishable here from `let ok: i64 = ...`;
     # assigning a bool call to an explicit i64 is the rare case.)
@@ -722,6 +731,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     s.ctx_simd_name_len = stmt.var_type_name_len
         var init_reg: i32 = pre_init_reg
         if pre_emitted == 0
+            init_reg = emit_lent_into_ref(s, stmt.var_init, stmt.var_ref)   # AGAST #2308
+        if pre_emitted == 0 and init_reg == 0
             set_match_float_hint(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
             init_reg = emit_expr_by_value(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
         s.ctx_enum_name = _saved_ctx
@@ -1271,13 +1282,8 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_reg(s, ptr)
             emit_str(s, c"\n")
         else if value_type == TYPE_PTR or value_type == TYPE_PTR_PTR
-            # Pointer store
-            let ptr_val: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ptr_val)
-            emit_str(s, c" = inttoptr i64 ")
-            emit_reg(s, val)
-            emit_str(s, c" to ptr\n")
+            # Pointer store.  AGAST #2308: `*p = @&d` is a `ptr` already.
+            let ptr_val: i32 = i64_value_to_ptr(s, stmt.assign_value, val)
             emit_str(s, c"  store ptr ")
             emit_reg(s, ptr_val)
             emit_str(s, c", ptr ")
@@ -1521,10 +1527,10 @@ fn set_match_float_hint(s: *EmitterState, e: *Expr, ty: i32, ty_name: *u8, ty_na
 
 fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
+        if emit_lent_return(s, stmt.return_value, ret_type) == 1   # AGAST #2279, #2308
+            return
         # Special handling for struct returns - need to load entire struct
         if ret_type == TYPE_STRUCT
-            if emit_lent_return(s, stmt.return_value, ret_type) == 1   # AGAST #2279
-                return
             # Check if return value is a struct literal (e.g., return NFAFragment { start: s0, end: s0 })
             if stmt.return_value.kind == EXPR_STRUCT_LIT
                 let alloca_reg: i32 = next_reg(s)
