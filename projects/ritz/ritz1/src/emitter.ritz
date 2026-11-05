@@ -175,12 +175,14 @@ fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) ->
     return 1
 
 # AGAST #2250: record that the local just bound for `param` is a `name:& T`
-# param with an integer or struct T (LocalVar.is_lent).  Checking the kind
-# matters: `c:& [2]C` also names `C`, and that isn't what it holds.
+# param with an integer, struct or array T (LocalVar.is_lent).  Checking the
+# kind matters: `c:& **C` also names `C`, and that isn't what it holds.  Nor
+# does `c:& [2]C`, which is why its readers ask for an array (AGAST #2279).
 fn mark_lent_param(s: *EmitterState, param: *Param)
     if param.is_borrow != 1 or param.param_type != TYPE_MUT_REF
         return
-    if param.param_pointee_type != TYPE_STRUCT and is_borrow_scalar_kind(param.param_pointee_type) == 0
+    let pt: i32 = param.param_pointee_type
+    if pt != TYPE_STRUCT and pt != TYPE_ARRAY and is_borrow_scalar_kind(pt) == 0
         return
     let loc: *LocalVar = find_local_struct_name(s, param.name, param.name_len)
     if loc != null
@@ -744,6 +746,11 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = f.body
     while stmt != null
+        # AGAST #2279: a `c:& C` tail in a `-> C` fn returns the referent.
+        if stmt.next == null and stmt.kind == STMT_EXPR and emit_lent_return(s, stmt.expr, f.return_type) == 1
+            has_explicit_return = 1
+            stmt = stmt.next
+            continue
         # Check if this is the last statement and it's an expression (implicit return)
         if stmt.next == null and stmt.kind == STMT_EXPR
             has_explicit_return = 1
@@ -783,7 +790,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 # Use emit_llvm_type_struct so tagged-enum types (Result$/Option$)
                 # auto-route to `i64` instead of `%<name>` (task-99 cluster #3).
                 if stmt.expr.kind == EXPR_IDENT
-                    let local: *LocalVar = find_local_struct_name(s, stmt.expr.ident_ptr, stmt.expr.ident_len)
+                    let local: *LocalVar = struct_value_local(s, stmt.expr)
                     if local != null and s.ret_sret == 1
                         emit_sret_ret_from_ptr(s, find_local(s, stmt.expr.ident_ptr, stmt.expr.ident_len))   # AGAST #1730
                     else if local != null
@@ -1087,6 +1094,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = method.body
     while stmt != null
+        if stmt.next == null and stmt.kind == STMT_EXPR and emit_lent_return(s, stmt.expr, method.return_type) == 1
+            has_explicit_return = 1   # AGAST #2279, as in emit_fn
+            stmt = stmt.next
+            continue
         # Check if this is the last statement and it's an expression (implicit return)
         if stmt.next == null and stmt.kind == STMT_EXPR
             has_explicit_return = 1

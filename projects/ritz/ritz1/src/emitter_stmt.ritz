@@ -225,7 +225,21 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # examples/tier2_stdlib/77_args (`run`'s `var parsed = p`).
         else if stmt.var_init.kind == EXPR_IDENT
             let src_loc: *LocalVar = find_local_struct_name(s, stmt.var_init.ident_ptr, stmt.var_init.ident_len)
-            if src_loc != null and src_loc.var_type == TYPE_STRUCT and src_loc.type_name_len > 0
+            # AGAST #2279: `var d = c` with `c:& C` or `a:& [N]T` copies the
+            # referent, as ritz0 does.  It took the reference below, so writes
+            # to `d` reached the caller.  Annotate `@C` to keep the reference.
+            if lent_local(s, stmt.var_init) != null and src_loc.var_type == TYPE_MUT_REF
+                if src_loc.pointee_type == TYPE_ARRAY
+                    var_type = TYPE_ARRAY
+                    stmt.var_type = TYPE_ARRAY
+                    stmt.var_array_size = src_loc.pointee_array_size
+                    stmt.var_array_elem_type = src_loc.pointee_array_elem_type
+                else
+                    var_type = TYPE_STRUCT
+                    stmt.var_type = TYPE_STRUCT
+                stmt.var_type_name = src_loc.type_name
+                stmt.var_type_name_len = src_loc.type_name_len
+            else if src_loc != null and src_loc.var_type == TYPE_STRUCT and src_loc.type_name_len > 0
                 var_type = TYPE_STRUCT
                 stmt.var_type = TYPE_STRUCT
                 stmt.var_type_name = src_loc.type_name
@@ -704,7 +718,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         var init_reg: i32 = pre_init_reg
         if pre_emitted == 0
             set_match_float_hint(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
-            init_reg = emit_expr(s, stmt.var_init)
+            init_reg = emit_expr_by_value(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
         s.ctx_enum_name = _saved_ctx
         s.ctx_enum_name_len = _saved_ctx_len
         s.ctx_simd_name = _saved_simd
@@ -1001,7 +1015,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     if field.field_type == TYPE_ARRAY
                         # Array field in struct - GEP to element, then store
                         let idx: i32 = emit_expr(s, target_expr.right)
-                        let val: i32 = emit_expr_into_elem(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)
+                        let val: i32 = emit_expr_by_value(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)
                         emit_field_array_elem_store(s, member_result.reg, field, idx, val, stmt.assign_value)
                         return
                     # AGAST #1596: `x.f[i] = v` with `f: *T` / `**T` —
@@ -1484,6 +1498,8 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
         # Special handling for struct returns - need to load entire struct
         if ret_type == TYPE_STRUCT
+            if emit_lent_return(s, stmt.return_value, ret_type) == 1   # AGAST #2279
+                return
             # Check if return value is a struct literal (e.g., return NFAFragment { start: s0, end: s0 })
             if stmt.return_value.kind == EXPR_STRUCT_LIT
                 let alloca_reg: i32 = next_reg(s)
@@ -1513,7 +1529,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # Check if return value is a local variable
             # Use emit_llvm_type_struct so tagged-enum types (Result$/Option$)
             # auto-route to `i64` instead of `%<name>` (task-99 cluster #3).
-            if stmt.return_value.kind == EXPR_IDENT
+            if stmt.return_value.kind == EXPR_IDENT and struct_value_local(s, stmt.return_value) != null
                 let loc: i32 = find_local(s, stmt.return_value.ident_ptr, stmt.return_value.ident_len)
                 if loc >= 0 and s.ret_sret == 1
                     emit_sret_ret_from_ptr(s, loc)   # AGAST #1730
@@ -2139,12 +2155,19 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
     var src_name_len: i32 = 0
     if value.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, value.ident_ptr, value.ident_len)
+        let lent: *LocalVar = lent_array_local(s, value)
         if loc != null and loc.var_type == TYPE_ARRAY
             src_ptr = loc.reg
             src_size = loc.array_size
             src_et = loc.array_elem_type
             src_name = loc.type_name
             src_name_len = loc.type_name_len
+        else if lent != null
+            src_ptr = emit_load_ptr(s, lent.reg)
+            src_size = lent.pointee_array_size
+            src_et = lent.pointee_array_elem_type
+            src_name = lent.type_name
+            src_name_len = lent.type_name_len
     else if value.kind == EXPR_MEMBER
         var mr: MemberPtrResult
         emit_member_ptr(s, value, @mr)
@@ -2287,12 +2310,19 @@ fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, 
     var src_name_len: i32 = 0
     if value.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, value.ident_ptr, value.ident_len)
+        let lent: *LocalVar = lent_array_local(s, value)
         if loc != null and loc.var_type == TYPE_ARRAY and loc.array_shape == null
             src_ptr = loc.reg
             src_size = loc.array_size
             src_et = loc.array_elem_type
             src_name = loc.type_name
             src_name_len = loc.type_name_len
+        else if lent != null
+            src_ptr = emit_load_ptr(s, lent.reg)
+            src_size = lent.pointee_array_size
+            src_et = lent.pointee_array_elem_type
+            src_name = lent.type_name
+            src_name_len = lent.type_name_len
     else if value.kind == EXPR_UNARY and value.op == OP_DEREF and value.operand != null and value.operand.kind == EXPR_IDENT
         let ploc: *LocalVar = find_local_struct_name(s, value.operand.ident_ptr, value.operand.ident_len)
         if ploc != null and ploc.var_type == TYPE_PTR and ploc.pointee_type == TYPE_ARRAY and ploc.pointee_array_size > 0
@@ -3307,7 +3337,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # Emit index expression
                     let idx_reg: i32 = emit_expr(s, stmt.while_cond)
                     # Emit value expression
-                    let val_reg: i32 = emit_expr_into_elem(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)
+                    let val_reg: i32 = emit_expr_by_value(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)
                     emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value)
         # AGAST #1439: unresolved here -> shared member-store path.
         if lfia_done == 0
@@ -3329,7 +3359,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             if base_type == TYPE_ARRAY and local != null
                 # Array local - use GEP [0, index] to get element
                 let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-                let val_reg: i32 = emit_expr_into_elem(s, stmt.assign_value, local.array_elem_type, local.type_name, local.type_name_len)
+                let val_reg: i32 = emit_expr_by_value(s, stmt.assign_value, local.array_elem_type, local.type_name, local.type_name_len)
                 let elem_ptr: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, elem_ptr)
@@ -3414,7 +3444,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 # Previously this fell to the pointer arm below: `load i64
                 # @g` as a base address and `store i64 %T-value` (bad IR).
                 let sidx: i32 = emit_expr(s, stmt.while_cond)
-                let sval: i32 = emit_expr_into_elem(s, stmt.assign_value, TYPE_STRUCT, glob.array_elem_type_name, glob.array_elem_type_name_len)
+                let sval: i32 = emit_expr_by_value(s, stmt.assign_value, TYPE_STRUCT, glob.array_elem_type_name, glob.array_elem_type_name_len)
                 let sptr: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, sptr)

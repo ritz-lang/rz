@@ -779,7 +779,13 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
             if is_tagged_enum_type(p.param_type_name, p.param_type_name_len) == 1
                 s.ctx_enum_name = p.param_type_name
                 s.ctx_enum_name_len = p.param_type_name_len
-    let reg: i32 = emit_expr(s, arg)
+    # AGAST #2279: a `c:& C` argument copies into a by-value `C` param.  A
+    # `self` param is always a `ptr` (emit_impl_method), whatever it spells.
+    var reg: i32 = 0
+    if p != null and name_eq(p.name, p.name_len, c"self", 4) == 0
+        reg = emit_expr_by_value(s, arg, p.param_type, p.param_type_name, p.param_type_name_len)
+    else
+        reg = emit_expr(s, arg)
     s.ctx_enum_name = saved_name
     s.ctx_enum_name_len = saved_len
     s.ctx_enum_arg = saved_arg
@@ -828,10 +834,13 @@ fn lent_local(s: *EmitterState, e: *Expr) -> *LocalVar
 # AGAST #2250: `e` read into a by-value slot of struct `name`.  `c:& C` reads
 # as the pointer, but the slot holds a `C`, so a `c:& C` param of that type
 # copies its referent here: the aggregate register, as emit_expr gives for any
-# other struct value.  0 when `e` is anything else.
+# other struct value.  0 when `e` is anything else.  `c:& [2]C` names `C` as
+# well: an array is no `C`, so it stays the pointer, which clang refuses.
 fn emit_lent_referent(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> i32
     let loc: *LocalVar = lent_local(s, e)
-    if loc == null or name_eq(loc.type_name, loc.type_name_len, name, name_len) == 0
+    if loc == null or loc.pointee_type == TYPE_ARRAY
+        return 0
+    if name_eq(loc.type_name, loc.type_name_len, name, name_len) == 0
         return 0
     own_check_lent_read(s, e, name, name_len)
     let src: i32 = emit_expr(s, e)
@@ -845,9 +854,52 @@ fn emit_lent_referent(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> i
     emit_str(s, c"\n")
     return val
 
-# emit_expr for an array element of type `ty`: a whole struct element is a
-# by-value slot too (AGAST #2250).
-fn emit_expr_into_elem(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len: i32) -> i32
+# AGAST #2279: `return c` or a tail `c` with `c:& C` in a fn returning `C`: the
+# value is the referent.  Emits the `ret` and returns 1; 0 when `e` is anything
+# else.  Only s.ret_type_name's slot reads it: a `-> @C` keeps the pointer.
+fn emit_lent_return(s: *EmitterState, e: *Expr, ret_type: i32) -> i32
+    if ret_type != TYPE_STRUCT
+        return 0
+    let val: i32 = emit_lent_referent(s, e, s.ret_type_name, s.ret_type_name_len)
+    if val == 0
+        return 0
+    if s.ret_sret == 1
+        emit_sret_ret_value(s, val)   # AGAST #1730
+        return 1
+    emit_str(s, c"  ret ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, val)
+    emit_str(s, c"\n")
+    return 1
+
+# AGAST #2279: the local `e` names, when its slot can be loaded as the struct a
+# fn returns; null otherwise.  A pointer or reference slot holds an address and
+# an array slot its first element, so loading either as the struct is a silent
+# wrong value.  They take the generic path, whose mismatch clang refuses.
+fn struct_value_local(s: *EmitterState, e: *Expr) -> *LocalVar
+    let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+    if loc == null
+        return null
+    let t: i32 = loc.var_type
+    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF or t == TYPE_ARRAY
+        return null
+    return loc
+
+# AGAST #2279: the `a:& [N]T` param `e` names, read whole, or null.  Its array
+# is behind the borrow's pointer (emit_load_ptr of the local's slot), with N and
+# T in pointee_array_*.  A move-only T is reported here, as emit_lent_referent
+# does; the caller still checks the slot's length and element type.
+fn lent_array_local(s: *EmitterState, e: *Expr) -> *LocalVar
+    let loc: *LocalVar = lent_local(s, e)
+    if loc == null or loc.pointee_type != TYPE_ARRAY
+        return null
+    own_check_lent_read(s, e, loc.type_name, loc.type_name_len)
+    return loc
+
+# emit_expr for a by-value slot of type `ty` whose enum context, if any, the
+# caller has set: an array element (AGAST #2250), a `let` or a parameter (#2279).
+fn emit_expr_by_value(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len: i32) -> i32
     if ty == TYPE_STRUCT
         let referent: i32 = emit_lent_referent(s, e, name, name_len)
         if referent != 0

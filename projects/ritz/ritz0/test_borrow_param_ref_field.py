@@ -29,6 +29,11 @@ field or an element. ritz1 binds `n:& i32` as an `i32` local whose slot is the
 caller's pointer, and leaves `c:& C` a local that reads as the pointer, so the
 two destinations fail in opposite directions: a `*i32` field got the integer,
 and a by-value `C` field got the pointer.
+
+AGAST #2279 does the same for the reads that aren't stores: `return`, a tail,
+`let`/`var` with or without a type, a by-value argument and an array-literal
+element. A whole `a:& [N]T` copies into a field or a local. A move-only referent
+is rejected at each. RITZ1_GAPS lists what's still open.
 """
 
 import os
@@ -626,6 +631,38 @@ pub fn main() -> i32
 # AGAST #2250: every by-value slot takes a copy of the referent. Each program
 # changes the original afterwards, or the copy, and then reads the other, so a
 # stored pointer can't pass.
+LARGE = """\
+struct B
+    x: i32
+    pad: [64]i64
+
+"""
+
+ENUM = """\
+enum E
+    Nope
+    Full(i32)
+
+"""
+
+ARRAY_H = """\
+struct H
+    a: [2]i32
+
+"""
+
+DROP_COUNT = """\
+var DROPS: i32 = 0
+
+struct Counted
+    h: i32
+
+impl Drop for Counted
+    fn drop(self: @&Counted)
+        DROPS = DROPS + 1
+
+"""
+
 BY_VALUE = TYPES + """
 struct V
     c: C
@@ -1115,7 +1152,880 @@ pub fn main() -> i32
     var h: H = mk(@a)
     return h.a[1]
 """,
+    # AGAST #2279: the reads that aren't stores.  Every one is a by-value slot.
+    "by_value_var": BY_VALUE + """
+fn f(c:& C) -> i32
+    var d: C = c
+    return d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_untyped_let": BY_VALUE + """
+fn f(c:& C) -> i32
+    let d = c
+    return d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    # An unannotated binding is a copy as well: it used to alias the referent,
+    # so the write below reached the caller.
+    "by_value_untyped_var_copies": BY_VALUE + """
+fn f(c:& C) -> i32
+    var d = c
+    d.x = 9
+    return c.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@&c)
+""",
+    "by_value_var_copies": BY_VALUE + """
+fn f(c:& C) -> i32
+    var d: C = c
+    c.x = 9
+    return d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@&c)
+""",
+    "by_value_argument_copies": BY_VALUE + """
+fn g(c: C) -> i32
+    var d: C = c
+    d.x = 9
+    return d.x
+
+fn f(c:& C) -> i32
+    g(c)
+    return c.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_second_argument": BY_VALUE + """
+fn g(a: i32, c: C) -> i32
+    return a + c.x
+
+fn f(c:& C) -> i32
+    return g(0, c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_method_argument": BY_VALUE + """
+struct M
+    k: i32
+
+impl M
+    fn take(self: @M, c: C) -> i32
+        return c.x
+
+fn f(m: @M, c:& C) -> i32
+    return m.take(c)
+
+pub fn main() -> i32
+    var m: M = M { k: 0 }
+    var c: C = C { x: 3, y: 0 }
+    return f(@m, @c)
+""",
+    "by_value_static_method_argument": BY_VALUE + """
+impl C
+    fn take(c: C) -> i32
+        return c.x
+
+fn f(c:& C) -> i32
+    return C.take(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_generic_argument": BY_VALUE + """
+fn g<T>(c: T) -> T
+    return c
+
+fn f(c:& C) -> C
+    return g<C>(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c)
+    return d.x
+""",
+    "by_value_tail": BY_VALUE + """
+fn f(c:& C) -> C
+    c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c)
+    return d.x
+""",
+    "by_value_return_in_branch": BY_VALUE + """
+fn f(c:& C, k: i32) -> C
+    if k == 0
+        return c
+    return C { x: 0, y: 0 }
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c, 0)
+    return d.x
+""",
+    "by_value_return_generic": BY_VALUE + """
+fn id<T>(c:& T) -> T
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = id<C>(@c)
+    return d.x
+""",
+    "by_value_return_from_method": BY_VALUE + """
+struct M
+    k: i32
+
+impl M
+    fn pick(self: @M, c:& C) -> C
+        return c
+
+pub fn main() -> i32
+    var m: M = M { k: 0 }
+    var c: C = C { x: 3, y: 0 }
+    var d: C = m.pick(@&c)
+    return d.x
+""",
+    "by_value_tail_from_method": BY_VALUE + """
+struct M
+    k: i32
+
+impl M
+    fn pick(self: @M, c:& C) -> C
+        c
+
+pub fn main() -> i32
+    var m: M = M { k: 0 }
+    var c: C = C { x: 3, y: 0 }
+    var d: C = m.pick(@&c)
+    return d.x
+""",
+    # Too big for a register: these take the sret and byval paths.
+    "by_value_large_return": LARGE + """
+fn f(b:& B) -> B
+    return b
+
+pub fn main() -> i32
+    var b: B
+    b.x = 3
+    var d: B = f(@b)
+    return d.x
+""",
+    "by_value_large_tail": LARGE + """
+fn f(b:& B) -> B
+    b
+
+pub fn main() -> i32
+    var b: B
+    b.x = 3
+    var d: B = f(@b)
+    return d.x
+""",
+    "by_value_large_let": LARGE + """
+fn f(b:& B) -> i32
+    let d: B = b
+    return d.x
+
+pub fn main() -> i32
+    var b: B
+    b.x = 3
+    return f(@b)
+""",
+    "by_value_large_argument": LARGE + """
+fn g(b: B) -> i32
+    return b.x
+
+fn f(b:& B) -> i32
+    return g(b)
+
+pub fn main() -> i32
+    var b: B
+    b.x = 3
+    return f(@b)
+""",
+    "by_value_enum_return": ENUM + """
+fn f(e:& E) -> E
+    return e
+
+pub fn main() -> i32
+    var e: E = E.Full(3)
+    var d: E = f(@e)
+    return match d
+        Full(n) => n
+        Nope => 0
+""",
+    "by_value_enum_let": ENUM + """
+fn f(e:& E) -> i32
+    let d: E = e
+    return match d
+        Full(n) => n
+        Nope => 0
+
+pub fn main() -> i32
+    var e: E = E.Full(3)
+    return f(@e)
+""",
+    "by_value_enum_argument": ENUM + """
+fn g(e: E) -> i32
+    return match e
+        Full(n) => n
+        Nope => 0
+
+fn f(e:& E) -> i32
+    return g(e)
+
+pub fn main() -> i32
+    var e: E = E.Full(3)
+    return f(@e)
+""",
+    "by_value_array_literal_element": BY_VALUE + """
+fn f(c:& C) -> i32
+    let a: [2]C = [c, c]
+    return a[1].x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    # An integer `:&` already reads as its value: nothing to copy.
+    "integer_untyped_let": """\
+fn f(n:& i32) -> i32
+    let m = n
+    return m
+
+pub fn main() -> i32
+    var n: i32 = 3
+    return f(@n)
+""",
+    "integer_untyped_var_copies": """\
+fn f(n:& i32) -> i32
+    var m = n
+    m = 9
+    return n
+
+pub fn main() -> i32
+    var n: i32 = 3
+    return f(@n)
+""",
+    # The referent is read before the fn's own locals drop, and they still do.
+    "return_drops_locals": BY_VALUE + DROP_COUNT + """
+fn f(c:& C) -> C
+    var r: Counted = Counted { h: 1 }
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 2, y: 0 }
+    var d: C = f(@c)
+    return d.x + DROPS
+""",
+    "tail_drops_locals": BY_VALUE + DROP_COUNT + """
+fn f(c:& C) -> C
+    var r: Counted = Counted { h: 1 }
+    c
+
+pub fn main() -> i32
+    var c: C = C { x: 2, y: 0 }
+    var d: C = f(@c)
+    return d.x + DROPS
+""",
+    "large_return_drops_locals": LARGE + DROP_COUNT + """
+fn f(b:& B) -> B
+    var r: Counted = Counted { h: 1 }
+    return b
+
+pub fn main() -> i32
+    var b: B
+    b.x = 2
+    var d: B = f(@b)
+    return d.x + DROPS
+""",
+    # A local of the same name isn't the borrow.
+    "shadowed_borrow_is_a_value": BY_VALUE + """
+fn f(c:& C) -> C
+    let c: C = C { x: 3, y: 0 }
+    return c
+
+pub fn main() -> i32
+    var e: C = C { x: 1, y: 0 }
+    var d: C = f(@e)
+    return d.x
+""",
+    # A reference slot keeps the pointer: writes through it reach the caller.
+    "let_reference_keeps_the_borrow": BY_VALUE + """
+fn f(c:& C) -> i32
+    let p: @C = c
+    return p.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "reborrow_keeps_the_borrow": BY_VALUE + """
+fn g(c:& C)
+    c.x = 3
+
+fn f(c:& C)
+    g(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    f(@&c)
+    return c.x
+""",
+    "reference_argument_keeps_the_borrow": BY_VALUE + """
+fn g(c: @&C)
+    c.x = 3
+
+fn f(c:& C)
+    g(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    f(@&c)
+    return c.x
+""",
+    "pointer_argument_keeps_the_borrow": BY_VALUE + """
+fn g(c: *C)
+    c.x = 3
+
+fn f(c:& C)
+    g(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    f(@&c)
+    return c.x
+""",
+    # A whole-array referent copies, at every element kind and destination.
+    "array_referent_literal": ARRAY_H + """
+fn mk(a:& [2]i32) -> H
+    return H { a: a }
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var h: H = mk(@a)
+    return h.a[1]
+""",
+    "array_referent_through_pointer": ARRAY_H + """
+fn fill(h: *H, a:& [2]i32)
+    h.a = a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var h: H
+    fill(@h, @a)
+    return h.a[1]
+""",
+    "array_referent_nested_field": ARRAY_H + """
+struct O
+    h: H
+
+fn fill(o: *O, a:& [2]i32)
+    o.h.a = a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var o: O
+    fill(@o, @a)
+    return o.h.a[1]
+""",
+    "array_referent_method_param": ARRAY_H + """
+impl H
+    fn set(self: @&H, a:& [2]i32)
+        self.a = a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var h: H
+    h.set(@&a)
+    return h.a[1]
+""",
+    "array_referent_let": """\
+fn f(a:& [2]i32) -> i32
+    let b: [2]i32 = a
+    return b[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    "array_referent_untyped_let": """\
+fn f(a:& [2]i32) -> i32
+    let b = a
+    return b[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    "array_referent_assign": """\
+fn f(a:& [2]i32) -> i32
+    var b: [2]i32 = [0, 0]
+    b = a
+    return b[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    # The write lands in the copy: reading `a` again still gives 3.
+    "array_referent_copies": """\
+fn f(a:& [2]i32) -> i32
+    var b: [2]i32 = a
+    b[1] = 9
+    let c: [2]i32 = a
+    return c[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    "array_referent_untyped_copies": """\
+fn f(a:& [2]i32) -> i32
+    var b = a
+    b[1] = 9
+    let c: [2]i32 = a
+    return c[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    "array_referent_of_structs": BY_VALUE + """
+fn mk(a:& [2]C) -> VA
+    var h: VA
+    h.a = a
+    return h
+
+pub fn main() -> i32
+    var a: [2]C
+    a[1].x = 3
+    var h: VA = mk(@a)
+    return h.a[1].x
+""",
+    "array_referent_of_bytes": """\
+struct H
+    a: [2]u8
+
+fn fill(h: *H, a:& [2]u8)
+    h.a = a
+
+pub fn main() -> i32
+    var a: [2]u8 = [1, 3]
+    var h: H
+    fill(@h, @a)
+    return h.a[1] as i32
+""",
+    "array_referent_large": """\
+struct H
+    a: [64]i64
+
+fn fill(h: *H, a:& [64]i64)
+    h.a = a
+
+pub fn main() -> i32
+    var a: [64]i64
+    a[63] = 3
+    var h: H
+    fill(@h, @a)
+    return h.a[63] as i32
+""",
+    "array_referent_generic": ARRAY_H + """
+fn fill<T>(h: *H, a:& [2]T)
+    h.a = a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var h: H
+    fill<i32>(@h, @a)
+    return h.a[1]
+""",
+    "array_referent_generic_structs": BY_VALUE + """
+fn fill<T>(h: *VA, a:& [2]T)
+    h.a = a
+
+pub fn main() -> i32
+    var a: [2]C
+    a[1].x = 3
+    var h: VA
+    fill<C>(@h, @a)
+    return h.a[1].x
+""",
+    "array_reborrow_keeps_the_borrow": """\
+fn g(a:& [2]i32) -> i32
+    return 3
+
+fn f(a:& [2]i32) -> i32
+    return g(a)
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
 })
+
+# Reads ritz1 doesn't do yet, each held to ritz0's answer by a strict xfail.
+CONTROLS.update({
+    "address_of_borrow_let": BY_VALUE + """
+fn f(c:& C) -> i32
+    let p: *C = @c
+    return p.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "address_of_borrow_argument": BY_VALUE + """
+fn h(p: *C) -> i32
+    return p.x
+
+fn f(c:& C) -> i32
+    return h(@c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "mut_address_of_borrow": BY_VALUE + """
+fn f(c:& C) -> i32
+    let p: @&C = @&c
+    return p.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_if_arm": BY_VALUE + """
+fn f(c:& C, k: i32) -> i32
+    let d: C = if k == 0
+        c
+    else
+        c
+    return d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c, 0)
+""",
+    "by_value_if_tail": BY_VALUE + """
+fn f(c:& C, k: i32) -> C
+    if k == 0
+        c
+    else
+        c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c, 0)
+    return d.x
+""",
+    "by_value_match_arm": BY_VALUE + """
+fn f(c:& C, k: i32) -> C
+    return match k
+        0 => c
+        _ => c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c, 0)
+    return d.x
+""",
+    "by_value_match_tail": BY_VALUE + """
+fn f(c:& C, k: i32) -> C
+    match k
+        0 => c
+        _ => c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c, 0)
+    return d.x
+""",
+    "by_value_variant_payload": BY_VALUE + """
+enum W
+    Nil
+    Held(C)
+
+fn f(c:& C) -> i32
+    let w: W = W.Held(c)
+    return match w
+        Held(d) => d.x
+        Nil => 0
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_bare_variant_payload": BY_VALUE + """
+enum W
+    Nil
+    Held(C)
+
+fn f(c:& C) -> i32
+    let w: W = Held(c)
+    return match w
+        Held(d) => d.x
+        Nil => 0
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_some_payload": "import ritzlib.option\n\n" + BY_VALUE + """
+fn f(c:& C) -> Option<C>
+    return Some(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var o: Option<C> = f(@c)
+    return match o
+        Some(d) => d.x
+        None => 0
+""",
+    "by_value_array_fill": BY_VALUE + """
+fn f(c:& C) -> i32
+    let a: [2]C = [c; 2]
+    return a[1].x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "by_value_cast": BY_VALUE + """
+fn f(c:& C) -> i32
+    let d: C = c as C
+    return d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "match_borrow_scrutinee": ENUM + """
+fn f(e:& E) -> i32
+    match e
+        Full(n) => return n
+        Nope => return 0
+
+pub fn main() -> i32
+    var e: E = E.Full(3)
+    return f(@e)
+""",
+    "match_borrow_scrutinee_value": ENUM + """
+fn f(e:& E) -> i32
+    return match e
+        Full(n) => n
+        Nope => 0
+
+pub fn main() -> i32
+    var e: E = E.Full(3)
+    return f(@e)
+""",
+    "array_borrow_index": """\
+fn f(a:& [2]i32) -> i32
+    return a[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    "array_borrow_index_store": """\
+fn f(a:& [2]i32)
+    a[1] = 3
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 1]
+    f(@&a)
+    return a[1]
+""",
+    "array_borrow_reference_argument": """\
+fn g(a: @[2]i32) -> i32
+    return 3
+
+fn f(a:& [2]i32) -> i32
+    return g(a)
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    "array_referent_argument": """\
+fn g(a: [2]i32) -> i32
+    return a[1]
+
+fn f(a:& [2]i32) -> i32
+    return g(a)
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    return f(@a)
+""",
+    "array_referent_return": """\
+fn f(a:& [2]i32) -> [2]i32
+    return a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var b: [2]i32 = f(@a)
+    return b[1]
+""",
+    "array_referent_deref_store": """\
+fn f(p: *[2]i32, a:& [2]i32)
+    *p = a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var b: [2]i32 = [0, 0]
+    f(@b, @a)
+    return b[1]
+""",
+    "array_referent_global": """\
+var G: [2]i32
+
+fn f(a:& [2]i32)
+    G = a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    f(@a)
+    return G[1]
+""",
+    # No borrow: [4]i32, because a first 8 bytes that hold the answer hide this.
+    "plain_array_argument": """\
+fn g(a: [4]i32) -> i32
+    return a[3]
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    return g(a)
+""",
+    "plain_array_deref_store": """\
+fn s(p: *[4]i32)
+    var a: [4]i32 = [0, 0, 0, 3]
+    *p = a
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 0]
+    s(@b)
+    return b[3]
+""",
+    "plain_array_global_store": """\
+var G: [4]i32
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    G = a
+    return G[3]
+""",
+    "generic_struct_array_field": """\
+struct G<T>
+    a: [2]T
+
+fn fill(g: *G<i32>, a:& [2]i32)
+    g.a = a
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var g: G<i32>
+    fill(@g, @a)
+    return g.a[1]
+""",
+})
+
+# ritz0 reads these by value.  ritz1 loaded the local's slot as the struct and
+# returned garbage, silently.  Until they compile they must not compile wrong.
+USED_TO_RETURN_GARBAGE = {
+    "return_from_reference": BY_VALUE + """
+fn f(c: @C) -> C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c)
+    return d.x
+""",
+    "return_from_mut_reference": BY_VALUE + """
+fn f(c: @&C) -> C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@&c)
+    return d.x
+""",
+    "return_from_pointer": BY_VALUE + """
+fn f(c: *C) -> C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c)
+    return d.x
+""",
+    "tail_from_reference": BY_VALUE + """
+fn f(c: @C) -> C
+    c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c)
+    return d.x
+""",
+    "tail_from_pointer": BY_VALUE + """
+fn f(c: *C) -> C
+    c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@c)
+    return d.x
+""",
+    "return_from_borrowed_pointer": BY_VALUE + """
+fn f(p:& *C) -> C
+    return p
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var q: *C = @c
+    var d: C = f(@q)
+    return d.x
+""",
+    "return_self_by_value": BY_VALUE + """
+impl C
+    fn me(self: C) -> C
+        return self
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = c.me()
+    return d.x
+""",
+    "return_bare_self": BY_VALUE + """
+impl C
+    fn me(self) -> C
+        return self
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = c.me()
+    return d.x
+""",
+}
+CONTROLS.update(USED_TO_RETURN_GARBAGE)
 
 RES = """\
 struct Res
@@ -1157,6 +2067,50 @@ pub fn main() -> i32
     return r.h
 """,
 }
+
+DROP_STORES.update({
+    # AGAST #2279: only a by-value slot moves.
+    "let_reference": RES + """
+fn f(t:& Res) -> i32
+    let p: @Res = t
+    return p.h
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    return f(@r)
+""",
+    "let_pointer": RES + """
+fn f(t:& Res) -> i32
+    let p: *Res = t
+    return p.h
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    return f(@r)
+""",
+    "reborrow": RES + """
+fn g(t:& Res) -> i32
+    return t.h
+
+fn f(t:& Res) -> i32
+    return g(t)
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    return f(@r)
+""",
+    "reference_argument": RES + """
+fn g(t: @Res) -> i32
+    return t.h
+
+fn f(t:& Res) -> i32
+    return g(t)
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    return f(@r)
+""",
+})
 
 # A by-value field of the same type really would take it from the caller.
 MOVE_OUT = {
@@ -1259,6 +2213,152 @@ fn mk(w:& W) -> HW
 pub fn main() -> i32
     return 0
 """,
+    # AGAST #2279: the reads that aren't stores, as ritz0 rejects them.
+    "return": RES + """
+fn f(t:& Res) -> Res
+    return t
+
+pub fn main() -> i32
+    return 0
+""",
+    "tail": RES + """
+fn f(t:& Res) -> Res
+    t
+
+pub fn main() -> i32
+    return 0
+""",
+    "let": RES + """
+fn f(t:& Res)
+    let d: Res = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "var": RES + """
+fn f(t:& Res)
+    var d: Res = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "untyped_let": RES + """
+fn f(t:& Res)
+    let d = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "untyped_var": RES + """
+fn f(t:& Res)
+    var d = t
+
+pub fn main() -> i32
+    return 0
+""",
+    "argument": RES + """
+fn g(t: Res) -> i32
+    return t.h
+
+fn f(t:& Res) -> i32
+    return g(t)
+
+pub fn main() -> i32
+    return 0
+""",
+    "method_argument": RES + """
+struct M
+    k: i32
+
+impl M
+    fn take(self: @M, t: Res) -> i32
+        return t.h
+
+fn f(m: @M, t:& Res) -> i32
+    return m.take(t)
+
+pub fn main() -> i32
+    return 0
+""",
+    "method_tail": RES + """
+struct M
+    k: i32
+
+impl M
+    fn pick(self: @M, t:& Res) -> Res
+        t
+
+pub fn main() -> i32
+    return 0
+""",
+    "return_drop_field_inside": RES + """
+struct W
+    r: Res
+
+fn f(w:& W) -> W
+    return w
+
+pub fn main() -> i32
+    return 0
+""",
+    "array_literal_element": RES + """
+fn f(t:& Res)
+    let a: [1]Res = [t]
+
+pub fn main() -> i32
+    return 0
+""",
+    "array_referent_field": RES + """
+struct HR
+    a: [2]Res
+
+fn f(h: *HR, a:& [2]Res)
+    h.a = a
+
+pub fn main() -> i32
+    return 0
+""",
+    "array_referent_let": RES + """
+fn f(a:& [2]Res)
+    let b: [2]Res = a
+
+pub fn main() -> i32
+    return 0
+""",
+    "array_referent_untyped": RES + """
+fn f(a:& [2]Res)
+    var b = a
+
+pub fn main() -> i32
+    return 0
+""",
+    "if_arm": RES + """
+fn f(t:& Res, k: i32) -> Res
+    return if k == 0
+        t
+    else
+        t
+
+pub fn main() -> i32
+    return 0
+""",
+    "array_return": RES + """
+fn f(a:& [2]Res) -> [2]Res
+    return a
+
+pub fn main() -> i32
+    return 0
+""",
+    "array_argument": RES + """
+fn g(a: [2]Res) -> i32
+    return 0
+
+fn f(a:& [2]Res) -> i32
+    return g(a)
+
+pub fn main() -> i32
+    return 0
+""",
 }
 
 
@@ -1273,10 +2373,43 @@ RITZ1_GAPS = {
     "by_value_bool_literal": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
     "by_value_from_at_amp_param": "AGAST #2227: is `@&T` read by value an implicit deref?",
     "by_value_from_pointer_param": "AGAST #2227: is `*T` read by value an implicit deref?",
-    "by_value_let": "AGAST #2279: a by-value read outside a store takes the pointer",
-    "by_value_argument": "AGAST #2279: a by-value read outside a store takes the pointer",
-    "by_value_return": "AGAST #2279: a by-value read outside a store takes the pointer",
-    "by_value_array_referent": "AGAST #2279: a by-value read outside a store takes the pointer",
+    "address_of_borrow_let": "AGAST #2286: `@c` of a `:&` struct is the slot's address",
+    "address_of_borrow_argument": "AGAST #2286: `@c` of a `:&` struct is the slot's address",
+    "mut_address_of_borrow": "AGAST #2286: `@c` of a `:&` struct is the slot's address",
+    "plain_array_argument": "AGAST #2287: a whole array reads as its first 8 bytes",
+    "plain_array_deref_store": "AGAST #2287: a whole array reads as its first 8 bytes",
+    "plain_array_global_store": "AGAST #2287: a whole array reads as its first 8 bytes",
+    "by_value_if_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_if_tail": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_match_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_match_tail": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_variant_payload": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_bare_variant_payload": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_some_payload": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_array_fill": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "by_value_cast": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "if_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
+    "match_borrow_scrutinee": "AGAST #2289: `match` on a `:&` enum spills the pointer",
+    "match_borrow_scrutinee_value": "AGAST #2289: `match` on a `:&` enum spills the pointer",
+    "array_borrow_index": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_borrow_index_store": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_borrow_reference_argument": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_referent_argument": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_referent_return": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_referent_deref_store": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_referent_global": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_return": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "array_argument": "AGAST #2290: `a:& [N]T` is only read whole, into a field or local",
+    "return_self_by_value": "AGAST #2291: `return self` doesn't read through the pointer",
+    "return_bare_self": "AGAST #2291: `return self` doesn't read through the pointer",
+    "generic_struct_array_field": "AGAST #2292: a generic struct's `[N]T` field isn't substituted",
+    "return_from_reference": "AGAST #2227: is a reference returned by value an implicit deref?",
+    "return_from_mut_reference": "AGAST #2227: is a reference returned by value an implicit deref?",
+    "return_from_pointer": "AGAST #2227: is a reference returned by value an implicit deref?",
+    "tail_from_reference": "AGAST #2227: is a reference returned by value an implicit deref?",
+    "tail_from_pointer": "AGAST #2227: is a reference returned by value an implicit deref?",
+    "return_from_borrowed_pointer": "AGAST #2227: is a reference returned by value an implicit deref?",
+    "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
 }
 
 # Neither compiler stores the borrow's pointer here: `n` reads as the integer
@@ -1432,7 +2565,7 @@ def test_ritz1_by_value_field_is_still_a_move_out(ritz1_bin, tmp_path, name):
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MOVE_OUT[name])
     assert comp.returncode != 0
     assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of borrowed parameter `[tw]`",
+    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of borrowed parameter `[atw]`",
                      comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 
@@ -1507,10 +2640,236 @@ pub fn main() -> i32
     return v.c.x
 """
 
+# AGAST #2279: the same refusals where the read isn't a store.  `return` read the
+# local's slot as the struct, so these used to compile and return garbage.
+ANOTHER_D = TYPES + """
+struct D
+    a: i64
+    b: i64
+"""
+
+REFUSED_READS = {
+    "another_struct_return": ANOTHER_D + """
+fn f(c:& C) -> D
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: D = f(@c)
+    return d.a as i32
+""",
+    "another_struct_tail": ANOTHER_D + """
+fn f(c:& C) -> D
+    c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: D = f(@c)
+    return d.a as i32
+""",
+    "another_struct_let": ANOTHER_D + """
+fn f(c:& C) -> i32
+    let d: D = c
+    return d.a as i32
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "another_struct_argument": ANOTHER_D + """
+fn g(d: D) -> i32
+    return 3
+
+fn f(c:& C) -> i32
+    return g(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    "pointer_referent_return": TYPES + """
+fn f(c:& **C) -> C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var p: *C = @c
+    var q: **C = @p
+    var d: C = f(@q)
+    return d.x
+""",
+    "pointer_pointer_return": TYPES + """
+fn f(c: **C) -> C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var p: *C = @c
+    var q: **C = @p
+    var d: C = f(q)
+    return d.x
+""",
+    "array_referent_return": TYPES + """
+fn mk(c:& [2]C) -> C
+    return c
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0].x = 3
+    var v: C = mk(@a)
+    return v.x
+""",
+    "array_referent_tail": TYPES + """
+fn mk(c:& [2]C) -> C
+    c
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0].x = 3
+    var v: C = mk(@a)
+    return v.x
+""",
+    "array_referent_let": TYPES + """
+fn mk(c:& [2]C) -> i32
+    let d: C = c
+    return d.x
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0].x = 3
+    return mk(@a)
+""",
+    "array_referent_argument": TYPES + """
+fn g(c: C) -> i32
+    return c.x
+
+fn mk(c:& [2]C) -> i32
+    return g(c)
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0].x = 3
+    return mk(@a)
+""",
+    # Monomorph rewrites a bare `T` pointee: `[2]T` has to stay an array.
+    "generic_array_referent_return": TYPES + """
+fn mk<T>(c:& [2]T) -> T
+    return c
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0].x = 3
+    var v: C = mk<C>(@a)
+    return v.x
+""",
+    "generic_array_referent_field": TYPES + """
+struct V
+    c: C
+
+fn mk<T>(c:& [2]T) -> V
+    var v: V
+    v.c = c
+    return v
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0].x = 3
+    var v: V = mk<C>(@a)
+    return v.c.x
+""",
+    # `self` is a `ptr` whatever it spells, so the referent can't go there.
+    "static_call_of_self_method": TYPES + """
+impl C
+    fn get(self: C) -> i32
+        return self.x
+
+fn f(c:& C) -> i32
+    return C.get(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""",
+    # Not a borrow at all: an array local isn't its first element either.
+    "array_local_return": TYPES + """
+fn f() -> C
+    var a: [2]C
+    a[0].x = 3
+    return a
+
+pub fn main() -> i32
+    var d: C = f()
+    return d.x
+""",
+}
+
+# An array copy has to match in length and element type.  ritz0 misses the
+# element type (#2090), so these are ritz1's alone, and ritz1 says why.
+ARRAY_MISMATCH = {
+    "length_field": ("""\
+struct H
+    a: [2]i32
+
+fn mk(a:& [3]i32) -> H
+    var h: H
+    h.a = a
+    return h
+
+pub fn main() -> i32
+    var a: [3]i32 = [1, 3, 5]
+    var h: H = mk(@a)
+    return h.a[1]
+""", "array length does not match"),
+    "length_let": ("""\
+fn f(a:& [3]i32) -> i32
+    let b: [2]i32 = a
+    return b[1]
+
+pub fn main() -> i32
+    var a: [3]i32 = [1, 3, 5]
+    return f(@a)
+""", "array length does not match"),
+    "element_field": ("""\
+struct H
+    a: [2]i32
+
+fn mk(a:& [2]i64) -> H
+    var h: H
+    h.a = a
+    return h
+
+pub fn main() -> i32
+    var a: [2]i64 = [1, 3]
+    var h: H = mk(@a)
+    return h.a[1]
+""", "array element type does not match"),
+    # A struct borrow isn't an array, whatever length it reads as.
+    "struct_referent": (TYPES + """
+fn f(c:& C) -> i32
+    let b: [2]i32 = c
+    return b[1]
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c)
+""", "whole-array assignment to a local array from this value is not supported"),
+    "element_let": ("""\
+fn f(a:& [2]i64) -> i32
+    let b: [2]i32 = a
+    return b[1]
+
+pub fn main() -> i32
+    var a: [2]i64 = [1, 3]
+    return f(@a)
+""", "array element type does not match"),
+}
+
+
 REFUSED = {
     "another_struct": ANOTHER_STRUCT,
     "array_referent": ARRAY_REFERENT,
     "pointer_referent": POINTER_REFERENT,
+    **REFUSED_READS,
 }
 
 
@@ -1524,4 +2883,80 @@ def test_by_value_slot_of_another_type_is_refused(ritz1_bin, tmp_path, compiler,
     link = subprocess.run(["clang", str(ll), "-o", str(work / "main"), "-nostdlib",
                            str(RITZ_START)], cwd=work, capture_output=True, text=True)
     assert link.returncode != 0
+    assert re.search(r"defined with type|doesn't match function result type", link.stderr), link.stderr
+
+
+# ritz0 can't return a reference from a `:&` yet (#2249), so this is ritz1's:
+# the fn's return type decides, and only a by-value one reads the referent.
+RETURNS_THE_BORROW = {
+    "pointer": TYPES + """
+fn f(c:& C) -> *C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    let p: *C = f(@&c)
+    p.x = 3
+    return c.x
+""",
+    "reference": TYPES + """
+fn f(c:& C) -> @C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    let p: @C = f(@c)
+    return p.x
+""",
+    "mut_reference": TYPES + """
+fn f(c:& C) -> @&C
+    return c
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    let p: @&C = f(@&c)
+    p.x = 3
+    return c.x
+""",
+    "mut_reference_tail": TYPES + """
+fn f(c:& C) -> @&C
+    c
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    let p: @&C = f(@&c)
+    p.x = 3
+    return c.x
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(RETURNS_THE_BORROW))
+def test_ritz1_reference_return_keeps_the_borrow(ritz1_bin, tmp_path, name):
+    assert _run("ritz1", ritz1_bin, tmp_path, name, RETURNS_THE_BORROW[name]) == 3
+
+
+# The strict xfails say these aren't done; this says what they do meanwhile.
+# Reverting the guard in emit_return turns them back into garbage, which an
+# xfail can't see: a wrong exit code is the failure it expects.
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(USED_TO_RETURN_GARBAGE))
+def test_ritz1_refuses_what_it_used_to_miscompile(ritz1_bin, tmp_path, name):
+    comp, ll, work = _compile("ritz1", ritz1_bin, tmp_path, name, USED_TO_RETURN_GARBAGE[name])
+    if comp.returncode != 0:
+        return
+    link = subprocess.run(["clang", str(ll), "-o", str(work / "main"), "-nostdlib",
+                           str(RITZ_START)], cwd=work, capture_output=True, text=True)
+    assert link.returncode != 0
     assert "defined with type" in link.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(ARRAY_MISMATCH))
+def test_ritz1_array_referent_must_match_its_slot(ritz1_bin, tmp_path, name):
+    program, message = ARRAY_MISMATCH[name]
+    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, program)
+    assert comp.returncode != 0
+    assert not ll.exists()
+    assert message in comp.stdout + comp.stderr
