@@ -1942,9 +1942,9 @@ The caller keeps ownership of what it lends, so a `name:& T` parameter of a
 move-only type can't be moved out of. Using the parameter by value, or using
 one of its move-only fields or `*name` by value, is an error. Everything that
 leaves the caller as the only owner is allowed: reading and writing through
-the parameter, lending it on, `match`ing or iterating over it, and binding it
-to a reference with `let p: @T = name`. `@T`, `@&T` and `*T` parameters aren't
-checked this way yet.
+the parameter, lending it on, `match`ing or iterating over it, binding it to a
+reference with `let p: @T = name`, and storing it in a reference field. `@T`,
+`@&T` and `*T` parameters aren't checked this way yet.
 
 ```ritz expect-error="cannot move out of borrowed parameter `r`"
 struct Resource

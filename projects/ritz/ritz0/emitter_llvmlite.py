@@ -5727,7 +5727,15 @@ class LLVMEmitter:
                 if target_enum is None and target_ritz_type.args:
                     target_enum = self._ensure_builtin_generic_specialization(
                         target_ritz_type)
-            if target_enum is not None:
+            ref_val = None
+            if (isinstance(stmt.target, rast.Field)
+                    and self._borrow_referent_slot(stmt.value) is not None):
+                field_ritz_type = self._infer_ritz_type(stmt.target)
+                if field_ritz_type is not None:
+                    ref_val = self._borrow_for_ref_slot(stmt.value, field_ritz_type)
+            if ref_val is not None:
+                val = ref_val
+            elif target_enum is not None:
                 val = self._emit_enum_variant_with_type(stmt.value, target_enum)
             else:
                 val = self._emit_expr(stmt.value)
@@ -9527,6 +9535,17 @@ class LLVMEmitter:
             return None
         return arg
 
+    def _borrow_for_ref_slot(self, expr: rast.Expr,
+                             slot_type: rast.Type) -> Optional[ir.Value]:
+        """AGAST #1302: the borrow's pointer if `expr` names a `h:& T` param
+        and `slot_type` is a reference to that `T`. A reference slot holds the
+        reference, not the referent `h` reads as. Otherwise None.
+        """
+        arg = self._borrow_referent_slot(expr)
+        if arg is None or arg.type != self._ritz_type_to_llvm(slot_type):
+            return None
+        return arg
+
     def _emit_unary(self, expr: rast.UnaryOp) -> ir.Value:
         """Emit a unary operation: -x, !x, *x, @x, @&x."""
         # Handle address-of operators: @, @&
@@ -9666,6 +9685,9 @@ class LLVMEmitter:
     def _emit_struct_lit_field(self, field_expr: rast.Expr,
                                expected_type: rast.Type) -> ir.Value:
         """One struct literal initialiser, converted to its field's type."""
+        ref_val = self._borrow_for_ref_slot(field_expr, expected_type)
+        if ref_val is not None:
+            return ref_val
         # `S { opt: None }` must build the variant for *this field's* enum:
         # variant names are global, so `None`/`Some` would otherwise pick
         # whichever Option specialization was registered last.

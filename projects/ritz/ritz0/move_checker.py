@@ -575,8 +575,12 @@ class MoveChecker:
 
         elif isinstance(stmt, rast.AssignStmt):
             # Check the value first - this is a move. `t = f(t)` reads the
-            # old t before the assignment makes t an owner again.
-            self._check_expr(stmt.value, is_move_context=True)
+            # old t before the assignment makes t an owner again. A reference
+            # field takes a `name:& T` parameter's address (AGAST #1302).
+            reborrows = (isinstance(stmt.target, rast.Field)
+                         and self._reborrows(self._field_path_type(stmt.target),
+                                             stmt.value))
+            self._check_expr(stmt.value, is_move_context=not reborrows)
             # The target (lvalue) is not a move, and assigning to a bare
             # moved-from binding is not a use of it (§13.6). Nor is assigning
             # to a field moved out of a binding: that field is owned again.
@@ -844,8 +848,11 @@ class MoveChecker:
             self._check_expr(expr.index, is_move_context=False)
 
         elif isinstance(expr, rast.StructLit):
-            for _name, value in expr.fields:
-                self._check_expr(value, is_move_context=True)
+            field_types = dict(self.types.struct_fields(
+                rast.NamedType(expr.span, expr.name, expr.type_args)))
+            for name, value in expr.fields:
+                self._check_expr(value, is_move_context=not self._reborrows(
+                    field_types.get(name), value))
             self._mark_temporary(expr, is_move_context)
 
         elif isinstance(expr, rast.Match):
@@ -1013,6 +1020,13 @@ class MoveChecker:
             if info is not None and info.borrow == rast.Borrow.MUTABLE:
                 return expr.name
         return None
+
+    def _reborrows(self, slot: Optional[rast.Type], value: rast.Expr) -> bool:
+        """Does storing `value` in a `slot`-typed field lend a `name:& T`
+        parameter on, rather than move out of it?"""
+        return (isinstance(slot, (rast.RefType, rast.PtrType))
+                and isinstance(value, rast.Ident)
+                and self._lent_param(value) is not None)
 
     def _field_path_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of a field path `b.f.g`, at any depth, or None."""
