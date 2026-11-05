@@ -155,16 +155,24 @@ fn tail_expr_diverges(e: *Expr) -> i32
 #
 # Each of these returns the span to blame, or null when there is no gap.
 
-# A call to a fn declared with no return type.  As in ritz0's _is_void_call the
-# callee is looked up by name alone, a method call is not judged (AGAST #2237)
-# and `-> void` does not count.
+# Did emission resolve method call `e` to a procedure?  Nothing is recorded yet
+# when check_tail_value runs, so only check_tail_method_calls sees a yes.
+fn tail_method_is_procedure(s: *EmitterState, e: *Expr) -> i32
+    var n: *ProcMethodCall = s.proc_method_calls
+    while n != null
+        if n.call == e
+            return 1
+        n = n.next
+    0
+
+# A call to a fn declared with no return type.  As in ritz0's _is_void_call a
+# named callee is looked up by name alone and a nameless one is not judged.
 fn tail_is_procedure_call(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_METHOD
+        return tail_method_is_procedure(s, e)
     if e.kind != EXPR_CALL or e.func_name_len == 0
         return 0
-    let fd: *FnDef = find_call_fn(s, e)
-    if fd == null or fd.return_type != TYPE_VOID or fd.ret_written_void == 1
-        return 0
-    1
+    fn_is_procedure(find_call_fn(s, e))
 
 fn tail_expr_gap(s: *EmitterState, e: *Expr) -> *SrcSpan
     if e.kind == EXPR_IF or e.kind == EXPR_MATCH
@@ -231,15 +239,13 @@ fn tail_value_file(f: *FnDef) -> *u8
         return file
     c"<input>"
 
-# Reject `f` if it declares a value and can reach its end without one.  Called
-# by emit_fn and emit_impl_method, so like ritz0 it sees the generics that are
-# instantiated and not the templates.
-pub fn check_tail_value(s: *EmitterState, f: *FnDef)
+fn tail_report_gap(s: *EmitterState, f: *FnDef)
     if f.return_type == TYPE_VOID or fn_is_decl(f) == 1
         return
     let gap: *SrcSpan = tail_stmts_gap(s, f.body)
     if gap == null
         return
+    s.tail_gap_reported = 1
     eprints_cstr(tail_value_file(f))
     eprint_char(':')
     eprint_i64(gap.line as i64)
@@ -250,3 +256,18 @@ pub fn check_tail_value(s: *EmitterState, f: *FnDef)
     eprints_cstr(c"' declares a return type but can reach its end without producing a value\n")
     emit_str(s, c"  ; ERROR: `-> T` fn can reach its end without a value\n")
     s.error_count = s.error_count + 1
+
+# Reject `f` if it declares a value and can reach its end without one.  Called
+# by emit_fn and emit_impl_method, so like ritz0 it sees the generics that are
+# instantiated and not the templates.
+pub fn check_tail_value(s: *EmitterState, f: *FnDef)
+    s.proc_method_calls = null
+    s.tail_gap_reported = 0
+    tail_report_gap(s, f)
+
+# The same walk after the body is emitted, for what only emission can tell: a
+# method call's receiver may be a local of an arm, so its callee is unknown
+# before then (AGAST #2237).
+pub fn check_tail_method_calls(s: *EmitterState, f: *FnDef)
+    if s.tail_gap_reported == 0
+        tail_report_gap(s, f)

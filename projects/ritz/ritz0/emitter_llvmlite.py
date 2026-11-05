@@ -541,6 +541,9 @@ class LLVMEmitter:
         # A name is a borrow only while `locals[name]` still holds this
         # pointer (a shadowing `let`/`var` rebinds it to an alloca).
         self._mut_borrow_args: Dict[str, ir.Value] = {}
+        # MethodCall nodes in the tail being emitted that resolved to a
+        # procedure (AGAST #2237): see _reject_missing_tail_value.
+        self._procedure_method_calls: set = set()
         # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
@@ -4862,7 +4865,10 @@ class LLVMEmitter:
                 # function's return type refers to, so we use the right
                 # specialization instead of an arbitrary one from variant_to_enum.
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
+                self._procedure_method_calls = set()
                 last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
+                self._reject_missing_tail_value(
+                    fn_def, lambda e: id(e) in self._procedure_method_calls)
                 self.closure_expected_type = None  # Clear context
                 # A tail that yields no value at all (ir.Undefined): a match
                 # used as a statement, whose arms are assignments/`pass`. That
@@ -4910,7 +4916,8 @@ class LLVMEmitter:
 
         return fn
 
-    def _reject_missing_tail_value(self, fn_def: rast.FnDef) -> None:
+    def _reject_missing_tail_value(self, fn_def: rast.FnDef,
+                                   yields_nothing=None) -> None:
         """A fn with a declared return type must not reach its end valueless.
 
         AGAST #1429. This keys off the declared type and not off the absence
@@ -4918,12 +4925,18 @@ class LLVMEmitter:
         an if/else of assignments stays legal there (`-> void` declares no
         value either). Without this check the fallthrough returns a zero the
         source never wrote.
+
+        This runs twice (AGAST #2237). The first pass is before the tail is
+        emitted, when a method call's receiver cannot be typed yet: it may be
+        a local of an arm, or a generic or `dyn` value. `_emit_method_call`
+        records each call it resolves to a procedure, and the second pass,
+        after the tail is emitted, passes those as `yields_nothing`.
         """
         declared = fn_def.ret_type
         if declared is None or (isinstance(declared, rast.NamedType)
                                 and declared.name == 'void'):
             return
-        gap = value_gap(fn_def.body, self._is_void_call)
+        gap = value_gap(fn_def.body, yields_nothing or self._is_void_call)
         if gap is not None:
             raise EmitError(
                 f"function '{fn_def.name}' declares a return type but can "
@@ -11723,6 +11736,8 @@ class LLVMEmitter:
             raise ValueError(f"Method function '{mangled_name}' not found")
 
         fn, fn_def = self.functions[mangled_name]
+        if fn_def.ret_type is None:
+            self._procedure_method_calls.add(id(expr))
 
         # Check if this is a static method (no self parameter)
         # Static methods are called as Type.method() with no receiver instance
@@ -11894,6 +11909,8 @@ class LLVMEmitter:
 
         # Get method index in vtable
         method_index = self._get_trait_method_index(trait_name, expr.method)
+        if self.traits[trait_name][method_index - 1].ret_type is None:
+            self._procedure_method_calls.add(id(expr))
 
         # Get vtable type for GEP
         vtable_type = self.vtable_types[trait_name]

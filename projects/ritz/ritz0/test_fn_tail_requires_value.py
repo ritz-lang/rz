@@ -2,7 +2,8 @@
 
 AGAST #1429. The emitter used to fall through to an implicit zero, so a fn
 promising an `i64` could quietly return 0 from a tail `if`, a tail loop, a
-`pass` arm or a call to a procedure. That is now a hard error.
+`pass` arm or a call to a procedure, named or a method (AGAST #2237). That is
+now a hard error.
 
 The accepted half matters as much as the rejected half. Every earlier attempt
 at this check (#1406 v2-v4) redded live code by rejecting shapes that are fine:
@@ -29,6 +30,15 @@ def _compile(tmp_path, source):
     proc = run_ritz0([str(src), "-o", str(out), "--no-runtime"], env=env, timeout=300)
     return proc.returncode, proc.stdout + proc.stderr
 
+
+_BOX = "struct B\n    v: i64\nimpl B\n    fn p(self)\n        var i: i64 = 1\n"
+_TRAIT = ("trait T\n"
+          "    fn t(self)\n"
+          "struct B\n"
+          "    v: i64\n"
+          "impl T for B\n"
+          "    fn t(self)\n"
+          "        var i: i64 = 1\n")
 
 # name -> (source, 1-based line the diagnostic must point at)
 REJECTED = {
@@ -90,6 +100,99 @@ REJECTED = {
         "    var i: i64 = n\n"
         "fn f(n: i64) -> i64\n"
         "    g(n)\n", 4),
+    # AGAST #2237: a method call resolves only as it is emitted, so these reach
+    # the check by every route `_emit_method_call` has to a procedure.
+    "tail_method_call_to_a_procedure": (
+        _BOX + "fn f(b: B) -> i64\n"
+        "    b.p()\n", 7),
+    "method_call_to_a_procedure_through_a_pointer": (
+        _BOX + "fn f(b: *B) -> i64\n"
+        "    b.p()\n", 7),
+    "static_method_call_to_a_procedure": (
+        "struct B\n"
+        "    v: i64\n"
+        "impl B\n"
+        "    fn s()\n"
+        "        var i: i64 = 1\n"
+        "fn f() -> i64\n"
+        "    B.s()\n", 7),
+    "method_call_to_a_procedure_in_an_if_arm": (
+        _BOX + "fn f(b: B, c: i64) -> i64\n"
+        "    if c > 0\n"
+        "        b.p()\n"
+        "    else\n"
+        "        7\n", 8),
+    "method_call_to_a_procedure_in_an_else_arm": (
+        _BOX + "fn f(b: B, c: i64) -> i64\n"
+        "    if c > 0\n"
+        "        return 7\n"
+        "    else\n"
+        "        b.p()\n", 10),
+    "method_call_to_a_procedure_in_a_match_arm": (
+        _BOX + "fn f(b: B, n: i64) -> i64\n"
+        "    match n\n"
+        "        0 => b.p()\n"
+        "        _ => 1\n", 8),
+    # The receiver is a local of the arm, so no walk before emission can type it.
+    "method_call_on_a_local_of_the_arm": (
+        _BOX + "fn f(n: i64) -> i64\n"
+        "    match n\n"
+        "        0 =>\n"
+        "            let b: B = B { v: 1 }\n"
+        "            b.p()\n"
+        "        _ => 1\n", 10),
+    "parenthesised_method_call_to_a_procedure": (
+        _BOX + "fn f(b: B) -> i64\n"
+        "    (b.p())\n", 7),
+    "method_call_to_a_procedure_on_a_call_result": (
+        _BOX + "fn mk() -> B\n"
+        "    B { v: 1 }\n"
+        "fn f() -> i64\n"
+        "    mk().p()\n", 9),
+    "method_call_to_a_procedure_on_a_field": (
+        _BOX + "struct O\n"
+        "    b: B\n"
+        "fn f(o: O) -> i64\n"
+        "    o.b.p()\n", 9),
+    "method_call_to_a_procedure_on_a_generic_struct": (
+        "struct W<T>\n"
+        "    v: T\n"
+        "impl<T> W<T>\n"
+        "    fn p(self)\n"
+        "        var i: i64 = 1\n"
+        "fn f(w: W<i64>) -> i64\n"
+        "    w.p()\n"
+        "fn main() -> i32\n"
+        "    return 0\n", 7),
+    "trait_method_call_to_a_procedure": (
+        _TRAIT + "fn f(b: B) -> i64\n"
+        "    b.t()\n", 9),
+    "method_call_to_a_procedure_on_a_generic_receiver": (
+        _TRAIT + "fn f<T>(x: T) -> i64\n"
+        "    x.t()\n"
+        "fn main() -> i32\n"
+        "    let b: B = B { v: 1 }\n"
+        "    return f<B>(b) as i32\n", 9),
+    "ufcs_method_call_to_a_procedure": (
+        "struct S\n"
+        "    v: i64\n"
+        "fn span_touch<T>(s: *Span<T>)\n"
+        "    var i: i64 = 1\n"
+        "fn f(s: Span<i64>) -> i64\n"
+        "    s.touch()\n"
+        "fn main() -> i32\n"
+        "    return 0\n", 6),
+    "method_call_to_a_procedure_in_a_method": (
+        "struct B\n"
+        "    v: i64\n"
+        "impl B\n"
+        "    fn p(self)\n"
+        "        var i: i64 = 1\n"
+        "    fn m(self) -> i64\n"
+        "        self.p()\n", 7),
+    "method_call_to_a_procedure_returning_a_struct": (
+        _BOX + "fn f(b: B) -> B\n"
+        "    b.p()\n", 7),
     "pointer_return": (
         "struct E\n"
         "    v: i64\n"
@@ -140,6 +243,13 @@ REJECTED = {
         "    while 1 == 1\n"
         "        if n > 0\n"
         "            return 1\n", 2),
+}
+
+# ritz1's grammar has no `dyn`, so its differential does not read this table.
+REJECTED_RITZ0_ONLY = {
+    "dyn_method_call_to_a_procedure": (
+        _TRAIT + "fn f(b: *dyn T) -> i64\n"
+        "    b.t()\n", 9),
 }
 
 ACCEPTED = {
@@ -249,6 +359,57 @@ ACCEPTED = {
         "        a = 1\n"
         "    else\n"
         "        a = 2\n"),
+    # AGAST #2237: only a call that ends up in value position is judged.
+    "tail_method_call_with_a_value": (
+        "struct B\n"
+        "    v: i64\n"
+        "impl B\n"
+        "    fn g(self) -> i64\n"
+        "        self.v\n"
+        "fn f(b: B) -> i64\n"
+        "    b.g()\n"),
+    "tail_method_call_in_a_procedure": (
+        _BOX + "fn f(b: B)\n"
+        "    b.p()\n"),
+    "tail_method_call_in_a_fn_spelled_void": (
+        _BOX + "fn f(b: B) -> void\n"
+        "    b.p()\n"),
+    "method_call_to_a_procedure_before_the_value": (
+        _BOX + "fn f(b: B) -> i64\n"
+        "    b.p()\n"
+        "    7\n"),
+    "method_call_to_a_procedure_before_a_return_in_an_arm": (
+        _BOX + "fn f(b: B, c: i64) -> i64\n"
+        "    if c > 0\n"
+        "        b.p()\n"
+        "        return 1\n"
+        "    else\n"
+        "        2\n"),
+    "method_call_to_a_procedure_in_a_guard_before_the_tail": (
+        _BOX + "fn f(b: B, c: i64) -> i64\n"
+        "    if c > 0\n"
+        "        b.p()\n"
+        "    7\n"),
+    # One node, two instantiations: the `.t()` of one must not judge the other.
+    "generic_receiver_whose_methods_have_values": (
+        "trait T\n"
+        "    fn t(self) -> i64\n"
+        "struct A\n"
+        "    v: i64\n"
+        "struct C\n"
+        "    v: i64\n"
+        "impl T for A\n"
+        "    fn t(self) -> i64\n"
+        "        1\n"
+        "impl T for C\n"
+        "    fn t(self) -> i64\n"
+        "        2\n"
+        "fn f<X>(x: X) -> i64\n"
+        "    x.t()\n"
+        "fn main() -> i32\n"
+        "    let a: A = A { v: 1 }\n"
+        "    let c: C = C { v: 1 }\n"
+        "    return (f<A>(a) + f<C>(c)) as i32\n"),
     "u8_is_not_mistaken_for_void": (
         "fn f(n: u8) -> u8\n"
         "    n\n"),
@@ -256,9 +417,9 @@ ACCEPTED = {
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(REJECTED))
+@pytest.mark.parametrize("name", sorted({**REJECTED, **REJECTED_RITZ0_ONLY}))
 def test_reaching_the_end_without_a_value_is_rejected(tmp_path, name):
-    source, line = REJECTED[name]
+    source, line = {**REJECTED, **REJECTED_RITZ0_ONLY}[name]
     rc, output = _compile(tmp_path, source)
     assert rc != 0, f"{name} must not compile:\n{output}"
     assert MESSAGE in output, output

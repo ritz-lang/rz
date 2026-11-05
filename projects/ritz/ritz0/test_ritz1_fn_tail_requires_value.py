@@ -105,6 +105,14 @@ def test_ritz1_diagnostic_words_match_ritz0(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("name", ["tail_if_no_else", "tail_method_call_to_a_procedure"])
+def test_ritz1_reports_a_gap_once(ritz1_bin, tmp_path, name):
+    """The check runs before and after the body; one gap is one diagnostic."""
+    r = _ritz1(ritz1_bin, tmp_path, RULE.REJECTED[name][0])
+    assert r.stderr.count(RULE.MESSAGE) == 1, r.stderr[-800:]
+
+
+@pytest.mark.integration
 def test_ritz1_rejection_writes_no_output(ritz1_bin, tmp_path):
     """A diagnostic that still leaves a .ll behind lets a build link it anyway."""
     source, _ = RULE.REJECTED["tail_if_no_else"]
@@ -113,7 +121,6 @@ def test_ritz1_rejection_writes_no_output(ritz1_bin, tmp_path):
 
 
 _PROC = "fn g(n: i64)\n    var i: i64 = n\n"
-_BOX = "struct B\n    v: i64\nimpl B\n    fn p(self)\n        var i: i64 = 1\n"
 
 # name -> (source, line). ritz0 is checked first, so a wrong case fails as one.
 RITZ1_EXTRA_REJECTED = {
@@ -331,19 +338,6 @@ RITZ1_EXTRA_ACCEPTED = {
         "        return n\n"
         "fn main() -> i32\n"
         "    return 0\n"),
-    # AGAST #2237: a method call to a procedure gets through in ritz0, so it
-    # has to here until that ticket moves both compilers together.
-    "tail_method_call_to_a_procedure": (
-        _BOX + "fn f(b: B) -> i64\n"
-        "    b.p()\n"),
-    # The arm yields no value for a phi, so this one reaches the `ret <T> 0`
-    # left in emit_implicit_return_tail at run time.
-    "method_call_to_a_procedure_in_an_if_arm": (
-        _BOX + "fn f(b: B, c: i64) -> i64\n"
-        "    if c > 0\n"
-        "        b.p()\n"
-        "    else\n"
-        "        7\n"),
 }
 
 
@@ -382,6 +376,14 @@ RITZ1_EXTRA_ACCEPTED_VERDICT_ONLY = {
         "    var i: i64 = n\n"
         "fn f(n: i64) -> i64\n"
         "    g(n)\n"),
+    "tail_method_call_to_a_method_spelled_void": (
+        "struct B\n"
+        "    v: i64\n"
+        "impl B\n"
+        "    fn p(self) -> void\n"
+        "        var i: i64 = 1\n"
+        "fn f(b: B) -> i64\n"
+        "    b.p()\n"),
     # The `-> void` mark has to reach the clone the call resolves to.
     "tail_call_to_a_generic_spelled_void": (
         "fn g<T>(n: T) -> void\n"
