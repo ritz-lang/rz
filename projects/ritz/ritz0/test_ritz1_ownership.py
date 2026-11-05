@@ -415,6 +415,40 @@ pub fn main() -> i32
 }
 
 # name -> program body.  Each is rejected by ritz0 and ritz1 alike.
+# AGAST #2242: the shapes a nested path takes, for the diagnostics below.
+NESTED = """\
+struct Inner
+    t: Tracked
+    u: Tracked
+    n: i32
+
+struct Outer
+    w: Inner
+
+fn eat_inner(i: Inner) -> i32
+    return i.n
+
+fn eat_outer(o: Outer) -> i32
+    return 0
+
+fn peek_outer(o: @Outer) -> i32
+    return 0
+
+fn peek_inner(i: @Inner) -> i32
+    return i.n
+
+fn peek_t(t: @Tracked) -> i32
+    return t.id
+
+"""
+
+NEW_V = "    var v = Outer { w: Inner { t: make(1), u: make(2), n: 3 } }\n"
+
+
+def nested(lines):
+    return NESTED + "pub fn main() -> i32\n" + NEW_V + lines + "    return 0\n"
+
+
 REJECTS = {
     # Moved in both arms (neither returns): moved after the `if`.
     "moved_in_both_arms": """\
@@ -679,6 +713,99 @@ pub fn main() -> i32
     var u = s
     return v
 """,
+
+    # AGAST #2242: named by path, once each, as ritz0 names them.
+    "nested_moved_twice": nested("""\
+    consume(v.w.t)
+    consume(v.w.t)
+"""),
+
+    "nested_binding_after_move": nested("""\
+    consume(v.w.t)
+    eat_outer(v)
+"""),
+
+    "nested_binding_after_two_moves": nested("""\
+    consume(v.w.u)
+    consume(v.w.t)
+    eat_outer(v)
+"""),
+
+    "nested_parent_after_two_moves": nested("""\
+    consume(v.w.u)
+    consume(v.w.t)
+    eat_inner(v.w)
+"""),
+
+    "nested_part_after_parent_move": nested("""\
+    eat_inner(v.w)
+    consume(v.w.t)
+"""),
+
+    "nested_borrow_binding_after_move": nested("""\
+    consume(v.w.t)
+    peek_outer(@v)
+"""),
+
+    "nested_borrow_parent_after_move": nested("""\
+    consume(v.w.t)
+    peek_inner(@v.w)
+"""),
+
+    "nested_borrow_moved_path": nested("""\
+    consume(v.w.t)
+    peek_t(@v.w.t)
+"""),
+
+    "nested_store_into_moved_parent": nested("""\
+    eat_inner(v.w)
+    v.w.t = make(5)
+"""),
+
+    "nested_scalar_store_into_moved_parent": nested("""\
+    eat_inner(v.w)
+    v.w.n = 5
+"""),
+
+    "nested_moved_in_loop": nested("""\
+    var i = 0
+    while i < 2
+        consume(v.w.t)
+        i = i + 1
+"""),
+
+    # The sibling read is fine; only the move reaches the head moved.
+    "nested_loop_sibling_read_then_move": nested("""\
+    var i = 0
+    while i < 2
+        i = i + v.w.n
+        consume(v.w.t)
+"""),
+
+    # Stored to each time round, into a parent that left on the last one.
+    "nested_loop_store_into_parent_moved_later": nested("""\
+    var i = 0
+    while i < 2
+        v.w.t = make(5)
+        eat_inner(v.w)
+        i = i + 1
+"""),
+
+    "nested_loop_scalar_store_into_parent_moved_later": nested("""\
+    var i = 0
+    while i < 2
+        v.w.n = 5
+        eat_inner(v.w)
+        i = i + 1
+"""),
+
+    # A parent used each time round, moved partway through the body.
+    "nested_loop_parent_read_then_part_moved": nested("""\
+    var i = 0
+    while i < 2
+        i = i + peek_inner(@v.w)
+        consume(v.w.t)
+"""),
 }
 
 # AGAST #2168: moves out of a field, ritz0's since AGAST #2171.  Every

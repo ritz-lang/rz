@@ -2230,9 +2230,9 @@ ritz0 follows these rules (AGAST #2157, #2161, #2232, #2244), except that
 `let (a, b) = p` isn't move-checked yet (AGAST #2282) and a tuple element can't
 be assigned to yet (AGAST #2283). ritz1 follows them (AGAST
 #2158) except for enum payloads, arrays, temporaries and moves inside loops
-(AGAST #2165), and it has no tuple literals yet (AGAST #1526). A nested move
-in ritz1 moves the whole top-level field, so that field's other parts leak and
-can't be used (AGAST #2242).
+(AGAST #2165), and it has no tuple literals yet (AGAST #1526). ritz1 tracks 31
+moved paths per binding: a move past them moves the nearest tracked parent, or
+the whole binding, so the rest of it leaks (AGAST #2319).
 `ritz0/test_ownership_free_count.py` counts the drops for each rule on all
 three compilers, with today's gaps marked as expected failures.
 

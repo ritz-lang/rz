@@ -27,6 +27,8 @@ call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262). AGAST
 tuples to move out of yet (#1526).
 AGAST #2261 closed ritz0's double evaluation of a method receiver, which
 dropped two values for one call.
+AGAST #2242 closed moves out of a nested field for ritz1, except past the 31
+paths it tracks per binding (#2319).
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -209,6 +211,50 @@ struct Outer2
 
 """
 
+# AGAST #2242: a third level, and what moves or rebuilds its parts.
+NESTED3 = NESTED + """\
+struct D3
+    a: Outer2
+    z: Tracked
+
+enum Pick
+    A
+    B
+
+fn eat_w(i: Inner2) -> i32
+    return i.n
+
+fn eat_o(o: Outer2) -> i32
+    return 0
+
+fn mk_w(a: i32, b: i32) -> Inner2
+    return Inner2 { t: make(a), u: make(b), n: 3 }
+
+"""
+
+V3 = "    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }\n"
+D3 = ("    var d = D3 { a: Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }, "
+      "z: make(4) }\n")
+
+
+def nested_order(lines, decl=V3):
+    """`f(1)` runs `lines` after `decl`; the program exits with ORDER."""
+    return (NESTED3 + "fn f(c: i32)\n" + decl + lines
+            + "\npub fn main() -> i32\n    f(1)\n    return ORDER\n")
+
+
+# A value that can leave the statement it is stored by.
+FALLIBLE = """\
+fn make_or_err(c: i32) -> Result<Tracked, i32>
+    if c == 1
+        return Err(9)
+    return Ok(make(5))
+
+"""
+
+# ritz1 tracks a binding's moved paths in 31 bits; ritz0 has no such limit.
+WIDE_GAP = {"ritz1": 2319, "ritz1_selfhosted": 2319}
+
 CASES = {
     # AGAST #2243: a binding from a field has the field's type, so it moves.
     # Each `consume` or rebinding below dropped a value twice on ritz0.
@@ -281,7 +327,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 3, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+""", 3, {}),
 
     "field_binding_part_of_a_field_binding": (SLOT + FIELDS + """\
 fn f() -> i32
@@ -977,7 +1023,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER
-""", 142, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+""", 142, {}),
 
     # Only that field moves: v.w's other fields still drop...
     "nested_field_move_rest_dropped": (NESTED + """\
@@ -988,7 +1034,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER
-""", 12, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+""", 12, {}),
 
     # ...and stay usable.
     "nested_field_move_sibling_readable": (NESTED + """\
@@ -999,7 +1045,302 @@ fn f() -> i32
 
 pub fn main() -> i32
     return f()
-""", 3, {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+""", 3, {}),
+
+    # AGAST #2242: a move on one path only.  ORDER is what the exit code
+    # shows, mod 256, so 1256 reads 232.
+    "nested_move_in_taken_if_arm": (nested_order("""\
+    if c == 1
+        consume(v.w.t)
+"""), 12, {}),
+
+    "nested_move_in_untaken_if_arm": (nested_order("""\
+    if c == 2
+        consume(v.w.t)
+"""), 12, {}),
+
+    "nested_move_of_each_part_in_if_arms": (nested_order("""\
+    if c == 1
+        consume(v.w.t)
+    else
+        consume(v.w.u)
+"""), 12, {}),
+
+    "nested_move_in_returning_if_arm": (nested_order("""\
+    if c == 1
+        consume(v.w.t)
+        return
+    consume(v.w.u)
+"""), 12, {}),
+
+    "nested_move_in_one_match_arm": (nested_order("""\
+    var p = Pick.A
+    match p
+        Pick.A => consume(v.w.t)
+        Pick.B => 0
+"""), 12, {}),
+
+    "nested_sibling_readable_after_if": (NESTED3 + """\
+fn f(c: i32) -> i32
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    if c == 1
+        consume(v.w.t)
+    return v.w.n
+
+pub fn main() -> i32
+    return f(1)
+""", 3, {}),
+
+    "nested_move_from_by_value_param": (NESTED3 + """\
+fn g(v: Outer2)
+    consume(v.w.t)
+
+fn f()
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    g(v)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 12, {}),
+
+    # A match moves the path it reads, and only that: o.s.u still drops.
+    "nested_match_scrutinee": (NESTED3 + """\
+struct InSlot
+    e: Slot
+    u: Tracked
+
+struct OutSlot
+    s: InSlot
+
+fn f()
+    var o = OutSlot { s: InSlot { e: Slot.Full(make(1)), u: make(2) } }
+    match o.s.e
+        Slot.Full(t) => consume(t)
+        Slot.Empty => 0
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""".replace("struct InSlot", SLOT + "struct InSlot"), 12, {}),
+
+    # Assigning a parent drops what is left of it: u, and not the moved t.
+    "nested_parent_assigned_after_move": (nested_order("""\
+    consume(v.w.t)
+    v.w = mk_w(5, 6)
+"""), 232, {}),
+
+    # The assignment gives back every part of v.w, so t can move again.
+    "nested_part_moves_again_after_parent_assigned": (nested_order("""\
+    consume(v.w.t)
+    v.w = mk_w(5, 6)
+    consume(v.w.t)
+"""), 232, {}),
+
+    "nested_parent_assigned_after_maybe_move": (nested_order("""\
+    if c == 1
+        consume(v.w.t)
+    v.w = mk_w(5, 6)
+"""), 232, {}),
+
+    "nested_parent_assigned_after_both_parts_moved": (nested_order("""\
+    consume(v.w.t)
+    consume(v.w.u)
+    v.w = mk_w(5, 6)
+"""), 232, {}),
+
+    "nested_binding_assigned_after_move": (nested_order("""\
+    consume(v.w.t)
+    v = Outer2 { w: mk_w(5, 6) }
+"""), 232, {}),
+
+    # A sibling isn't moved, so it can be stored to: 2 drops as it is replaced.
+    "nested_sibling_assigned_after_move": (nested_order("""\
+    consume(v.w.t)
+    v.w.u = make(5)
+"""), 125, {}),
+
+    "nested_scalar_assigned_after_move": (nested_order("""\
+    consume(v.w.t)
+    v.w.n = 5
+"""), 12, {}),
+
+    "nested_assigned_back_then_parent_moves": (nested_order("""\
+    consume(v.w.t)
+    v.w.t = make(5)
+    eat_w(v.w)
+"""), 152, {}),
+
+    "nested_assigned_back_then_binding_moves": (nested_order("""\
+    consume(v.w.t)
+    v.w.t = make(5)
+    eat_o(v)
+"""), 152, {}),
+
+    # The value moves v.w.t, so the store drops only v.w.u of the old v.w.
+    "nested_value_moves_part_of_target": (nested_order("""\
+    v.w = Inner2 { t: v.w.t, u: make(5), n: 3 }
+"""), 215, {}),
+
+    "nested_field_from_sibling": (nested_order("""\
+    v.w.t = v.w.u
+"""), 12, {}),
+
+    # Several paths at different depths: what is left drops in declaration
+    # order, depth first, whichever order the moves came in.
+    "nested_deep_sibling_order": (nested_order("""\
+    consume(d.a.w.u)
+""", D3), 214, {}),
+
+    "nested_moves_at_two_depths_order": (nested_order("""\
+    consume(d.z)
+    consume(d.a.w.t)
+""", D3), 156, {}),
+
+    "nested_middle_moved_order": (nested_order("""\
+    eat_w(d.a.w)
+""", D3), 124, {}),
+
+    "nested_every_part_moved_order": (nested_order("""\
+    consume(d.a.w.u)
+    consume(d.a.w.t)
+    consume(d.z)
+""", D3), 214, {}),
+
+    "nested_top_assigned_after_deep_move": (nested_order("""\
+    consume(d.a.w.t)
+    d.a = Outer2 { w: mk_w(5, 6) }
+""", D3), 20, {}),
+
+    "nested_middle_assigned_after_deep_move": (nested_order("""\
+    consume(d.a.w.t)
+    d.a.w = mk_w(5, 6)
+""", D3), 20, {}),
+
+    # Loops.  Moved and assigned back each time round: 1 5 then 5 2.
+    "nested_loop_move_and_assign_back": (nested_order("""\
+    var i = 0
+    while i < 2
+        consume(v.w.t)
+        v.w.t = make(5)
+        i = i + 1
+"""), 16, {}),
+
+    "nested_loop_binding_assigned_before_move": (nested_order("""\
+    var i = 0
+    while i < 2
+        v = Outer2 { w: mk_w(5, 6) }
+        consume(v.w.t)
+        i = i + 1
+"""), 216, {}),
+
+    "nested_loop_read_sibling_until_move": (nested_order("""\
+    var i = 0
+    while i < 2
+        if i == 1
+            consume(v.w.t)
+            break
+        i = i + v.w.n
+"""), 12, {}),
+
+    # The store comes before the move in the source, but the move reaches it
+    # round the loop: the second store must still make the field owned.
+    "nested_loop_store_before_move": (nested_order("""\
+    var i = 0
+    while i < 2
+        v.w.t = make(5)
+        if i == 0
+            consume(v.w.t)
+        i = i + 1
+"""), 16, {}),
+
+    "field_loop_store_before_move": ("""\
+fn f()
+    var h = Holder { t: make(1), n: 0 }
+    var i = 0
+    while i < 2
+        h.t = make(5)
+        if i == 0
+            consume(h.t)
+        i = i + 1
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 155, {}),
+
+    # A field store owns the field once the value is stored, not before: a
+    # `?` in the value leaves through the moved field, which must not drop.
+    "field_store_value_returns_early": (FALLIBLE + """\
+fn g(c: i32) -> Result<i32, i32>
+    var h = Holder { t: make(1), n: 0 }
+    consume(h.t)
+    h.t = make_or_err(c)?
+    return Ok(0)
+
+pub fn main() -> i32
+    g(1)
+    return ORDER
+""", 1, {}),
+
+    "field_store_value_succeeds": (FALLIBLE + """\
+fn g(c: i32) -> Result<i32, i32>
+    var h = Holder { t: make(1), n: 0 }
+    consume(h.t)
+    h.t = make_or_err(c)?
+    return Ok(0)
+
+pub fn main() -> i32
+    g(0)
+    return ORDER
+""", 15, {}),
+
+    "nested_store_value_returns_early": (NESTED3 + FALLIBLE + """\
+fn g(c: i32) -> Result<i32, i32>
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    consume(v.w.t)
+    v.w.t = make_or_err(c)?
+    return Ok(0)
+
+pub fn main() -> i32
+    g(1)
+    return ORDER
+""", 12, {}),
+
+    "nested_store_value_succeeds": (NESTED3 + FALLIBLE + """\
+fn g(c: i32) -> Result<i32, i32>
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    consume(v.w.t)
+    v.w.t = make_or_err(c)?
+    return Ok(0)
+
+pub fn main() -> i32
+    g(0)
+    return ORDER
+""", 152, {}),
+
+    # More paths than ritz1 has bits: every part still drops once.
+    "field_move_past_the_tracked_paths": (
+        "struct Wide\n" + "".join(f"    f{i}: Tracked\n" for i in range(33)) + """
+fn f()
+    var w = Wide { """ + ", ".join(f"f{i}: make(1)" for i in range(33)) + """ }
+    consume(w.f32)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 33, WIDE_GAP),
+
+    "nested_move_past_the_tracked_paths": (NESTED3 +
+        "struct WideN\n" + "".join(f"    g{i}: Inner2\n" for i in range(12)) + """
+fn f()
+    var w = WideN { """ + ", ".join(f"g{i}: mk_w(1, 1)" for i in range(12)) + """ }
+    consume(w.g11.u)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 24, WIDE_GAP),
 
     # AGAST #2171 from here on (ritz1's cases from #2168, now shared).  A
     # struct with a field moved out still drops the others: consume drops 1,
@@ -2055,7 +2396,7 @@ pub fn main() -> i32
     return h.t.id
 """, "h.t", {}),
 
-    # AGAST #2232: the ticket's program. ritz1 rejects it too, naming `v.w`.
+    # AGAST #2232: the ticket's program.
     "nested_field_moved_twice": (NESTED + """\
 fn f() -> i32
     var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
@@ -2065,7 +2406,7 @@ fn f() -> i32
 
 pub fn main() -> i32
     return f()
-""", "v.w.t", {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+""", "v.w.t", {}),
 
     # A partly moved parent can't be used whole.
     "parent_after_nested_field_move": (NESTED + """\
@@ -2077,7 +2418,101 @@ pub fn main() -> i32
     consume(v.w.t)
     eat(v.w)
     return 0
-""", "v.w.t", {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+""", "v.w.t", {}),
+
+    # AGAST #2242: a use overlapping a moved path, from any side.
+    "nested_field_moved_in_if_arm": (NESTED3 + """\
+fn f(c: i32) -> i32
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    if c == 1
+        consume(v.w.t)
+    return v.w.t.id
+
+pub fn main() -> i32
+    return f(1)
+""", "v.w.t", {}),
+
+    "nested_field_moved_in_loop": (nested_order("""\
+    var i = 0
+    while i < 2
+        consume(v.w.t)
+        i = i + 1
+"""), "v.w.t", {}),
+
+    # The first move is the one named, not the first field.
+    "binding_after_two_nested_moves": (nested_order("""\
+    consume(v.w.u)
+    consume(v.w.t)
+    eat_o(v)
+"""), "v.w.u", {}),
+
+    "parent_after_two_nested_moves": (nested_order("""\
+    consume(v.w.u)
+    consume(v.w.t)
+    eat_w(v.w)
+"""), "v.w.u", {}),
+
+    "part_after_parent_move": (nested_order("""\
+    eat_w(v.w)
+    consume(v.w.t)
+"""), "v.w", {}),
+
+    "scalar_part_after_parent_move": (nested_order("""\
+    eat_w(v.w)
+    v.w.n
+"""), "v.w", {}),
+
+    # A store into a moved parent doesn't make it an owner again.
+    "store_into_moved_parent": (nested_order("""\
+    eat_w(d.a.w)
+    d.a.w.t = make(5)
+""", D3), "d.a.w", {}),
+
+    "scalar_store_into_moved_parent": (nested_order("""\
+    eat_w(v.w)
+    v.w.n = 5
+"""), "v.w", {}),
+
+    # The value is checked first: it moves what the store then writes into.
+    "store_into_parent_its_value_moved": (NESTED3 + """\
+fn from_w(i: Inner2) -> Tracked
+    return make(i.n)
+
+fn f()
+    var v = Outer2 { w: Inner2 { t: make(1), u: make(2), n: 3 } }
+    v.w.t = from_w(v.w)
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", "v.w", {}),
+
+    "store_into_binding_its_value_moved": ("""\
+fn from_h(h: Holder) -> Tracked
+    return make(h.n)
+
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    h.t = from_h(h)
+    return 0
+""", "h", {}),
+
+    # The first move is named at the top level too.
+    "binding_after_two_field_moves": ("""\
+struct TwoT
+    a: Tracked
+    b: Tracked
+
+fn eat_two(x: TwoT) -> i32
+    return 0
+
+pub fn main() -> i32
+    var h = TwoT { a: make(1), b: make(2) }
+    consume(h.b)
+    consume(h.a)
+    eat_two(h)
+    return 0
+""", "h.b", {}),
 
     # AGAST #2173: `o.a.t = v` with o.a moved out is rejected (Rust's
     # E0382), so a field-of-field store never re-owns part of a moved field.
@@ -2133,7 +2568,7 @@ pub fn main() -> i32
     var x = d.p.t
     var y = d.p
     return 0
-""", "d.p.t", {"ritz1": 2242, "ritz1_selfhosted": 2242}),
+""", "d.p.t", {}),
 
     # AGAST #2257: a binding from a method call moves like any other.
     "method_binding_after_move": (METHODS + """\
