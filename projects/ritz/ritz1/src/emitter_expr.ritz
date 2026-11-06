@@ -27,13 +27,45 @@ import literal_slot # AGAST #2341
 # =============================================================================
 
 # Helper to emit GEP for local variable member access
+# AGAST #2372: pointers and references between a local's slot and the struct `.`
+# names: 0 for a struct, 1 for `*S` and `@S`, 2 for `**S` and `@*S`, and so on.
+pub fn local_struct_levels(loc: *LocalVar) -> i32
+    if loc.var_type == TYPE_PTR_PTR
+        return ptr_ptr_ident_levels(loc.inner_pointee_type)
+    if loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+        if loc.pointee_type == TYPE_PTR
+            return 2
+        if loc.pointee_type == TYPE_PTR_PTR
+            return 1 + ptr_ptr_ident_levels(loc.inner_pointee_type)
+        return 1
+    if loc.var_type == TYPE_PTR
+        return 1
+    0
+
+# The same for a field.  An `@S` field is a `*S` by now (lower_ref_fields).
+pub fn field_struct_levels(f: *StructField) -> i32
+    if f.field_type == TYPE_PTR_PTR
+        return ptr_ptr_ident_levels(f.inner_pointee_type)
+    1
+
+# 1 for a `p:& **S` param, of any depth.
+pub fn param_borrows_struct_ptr_ptr(p: *Param) -> i32
+    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF or p.param_pointee_type != TYPE_PTR_PTR
+        return 0
+    (ptr_ptr_slot_inner(p.param_inner_pointee_type) == TYPE_STRUCT) as i32
+
+# `base` loaded `levels` times.
+pub fn emit_load_levels(s: *EmitterState, base: i32, levels: i32) -> i32
+    var reg: i32 = base
+    for i in 0..levels
+        reg = emit_load_ptr(s, reg)
+    reg
+
 fn emit_member_gep_local(s: *EmitterState, e: *Expr, result: *MemberPtrResult, loc: *LocalVar, st: *StructDef, field_idx: i32, field: *StructField)
-    var base_ptr: i32 = loc.reg
     # For ptr/ref types — load the pointer natively (task #73 migration).
     # Old pattern was `load i64` + `inttoptr` round-trip; opaque pointers
     # let us just `load ptr` from the same slot.
-    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
-        base_ptr = emit_load_ptr(s, loc.reg)
+    let base_ptr: i32 = emit_load_levels(s, loc.reg, local_struct_levels(loc))
     # GEP to get pointer to field
     let field_ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -134,7 +166,7 @@ fn emit_vec_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
 # static type isn't recognised.
 #
 # Recursive over the shapes a deref operand takes in practice:
-#   IDENT          local `*St` / `@St` / `@&St` (1) or `**St` (2)
+#   IDENT          local `*St` / `@St` / `@&St` (1), or `**St` / `@*St` (2)
 #   EXPR_MEMBER    a field of type `*St` (1) or `**St` (2), via emit_member_ptr
 #   `*y`           y at levels L >= 2, loaded once more (L - 1)
 # So `(*(*b).ops).n`, `(*b.ops).n` and `(**pp).n` all resolve here.
@@ -170,11 +202,7 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
             return gp
         if loc == null or loc.type_name_len <= 0
             return 0
-        var levels: i32 = 0
-        if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
-            levels = 1
-        else if loc.var_type == TYPE_PTR_PTR
-            levels = ptr_ptr_ident_levels(loc.inner_pointee_type)
+        let levels: i32 = local_struct_levels(loc)
         if levels == 0
             return 0
         let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
@@ -307,6 +335,21 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                         emit_str(s, c"\n")
                         emit_member_gep_from_ptr(s, result, gp, pst, pfield_idx, pfield)
                         return
+            # AGAST #2372: and `var g: **S`.
+            else if glob.var_type == TYPE_PTR_PTR and glob.pointee_type_name_len > 0
+                let qst: *StructDef = find_struct(s, glob.pointee_type_name, glob.pointee_type_name_len)
+                if qst != null
+                    let qfield_idx: i32 = find_field_index(qst, e.ident_ptr, e.ident_len)
+                    if qfield_idx >= 0
+                        let qp: i32 = next_reg(s)
+                        emit_str(s, c"  ")
+                        emit_reg(s, qp)
+                        emit_str(s, c" = load ptr, ptr @")
+                        emit_name(s, glob.name, glob.name_len)
+                        emit_str(s, c"\n")
+                        let qbase: i32 = emit_load_levels(s, qp, ptr_ptr_ident_levels(glob.inner_pointee_type) - 1)
+                        emit_member_gep_from_ptr(s, result, qbase, qst, qfield_idx, get_field_type(qst, qfield_idx))
+                        return
 
     # Recursive case: e.left is another EXPR_MEMBER (nested: a.b.c)
     else if e.left.kind == EXPR_MEMBER
@@ -325,14 +368,10 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                         emit_member_gep_from_ptr(s, result, inner_result.reg, st, field_idx, field)
                         return
             # Handle pointer-to-struct field: load the pointer, then GEP into the pointed-to struct
-            else if inner_field.field_type == TYPE_PTR and inner_field.field_type_name_len > 0
+            # AGAST #2372: a `**S` field is loaded down to the struct too.
+            else if (inner_field.field_type == TYPE_PTR or inner_field.field_type == TYPE_PTR_PTR) and inner_field.field_type_name_len > 0
                 # Load the pointer value from the field
-                let loaded: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, loaded)
-                emit_str(s, c" = load ptr, ptr ")
-                emit_reg(s, inner_result.reg)
-                emit_str(s, c"\n")
+                let loaded: i32 = emit_load_levels(s, inner_result.reg, field_struct_levels(inner_field))
                 # Now GEP into the pointed-to struct
                 let st: *StructDef = find_struct(s, inner_field.field_type_name, inner_field.field_type_name_len)
                 if st != null
@@ -419,8 +458,9 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
             var d_base: i32 = emit_deref_operand_ptr(s, e.left.operand, @d_st, @d_levels)
             # AGAST #1940: `(*pp).n` with pp a `**S`: `*pp` is still a `*S`,
             # and `.n` auto-derefs it (ritz0 does the same).  Load once more.
-            if d_base != 0 and d_levels == 2
-                d_base = emit_load_ptr(s, d_base)
+            # AGAST #2372: as many times as it takes.
+            if d_base != 0 and d_levels >= 2
+                d_base = emit_load_levels(s, d_base, d_levels - 1)
                 d_levels = 1
             if d_base != 0 and d_levels == 1
                 let d_idx: i32 = find_field_index(d_st, e.ident_ptr, e.ident_len)
@@ -837,9 +877,7 @@ fn try_emit_enum_is_ok(s: *EmitterState, e: *Expr) -> i32
     # Post-task-133 layout: Result$/Option$ is `{ i8 tag, [N x i8] payload }`.
     # Receiver slot holds that struct.  Pointer-typed locals (*T, @T) store a
     # pointer to the struct; load it through first to reach the aggregate.
-    var ptr_reg: i32 = loc.reg
-    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
-        ptr_reg = emit_load_ptr(s, loc.reg)
+    let ptr_reg: i32 = emit_load_levels(s, loc.reg, local_struct_levels(loc))
 
     # GEP to tag (field 0) and load the i8 directly.  Ok/Some = 0; Err/None = 1.
     let tag_ptr: i32 = next_reg(s)

@@ -37,6 +37,30 @@ import ref_check    # ref_array_error (AGAST #2343)
 # AGAST #2321: `let p = @a`, `let p = @&a` and `let q = p` hold what an annotated
 # local does: N and T, so `p[i]` is an element, and the kind, so it loads as one.
 # Returns 1 when it typed the local.
+# AGAST #2372: `let p = @q` with `q: *S` holds an `@*S`, so `p.f` reaches S.  It
+# stayed an i64 with no struct name: "unhandled EXPR_MEMBER".
+fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt) -> i32
+    let init: *Expr = stmt.var_init
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or init == null
+        return 0
+    if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT)
+        return 0
+    if init.operand == null or init.operand.kind != EXPR_IDENT
+        return 0
+    let src: *LocalVar = find_local_struct_name(s, init.operand.ident_ptr, init.operand.ident_len)
+    if src == null or (src.var_type != TYPE_PTR and src.var_type != TYPE_PTR_PTR)
+        return 0
+    if find_struct(s, src.type_name, src.type_name_len) == null
+        return 0
+    stmt.var_type = TYPE_REF
+    if init.op == OP_ADDR_MUT
+        stmt.var_type = TYPE_MUT_REF
+    stmt.var_type_name = src.type_name
+    stmt.var_type_name_len = src.type_name_len
+    stmt.var_pointee_type = src.var_type
+    stmt.var_inner_pointee_type = src.inner_pointee_type
+    1
+
 fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
         return 0
@@ -381,6 +405,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type_name = src_loc.type_name
                 stmt.var_type_name_len = src_loc.type_name_len
                 stmt.var_pointee_type = src_loc.pointee_type
+                stmt.var_inner_pointee_type = src_loc.inner_pointee_type   # AGAST #2372: `s: @**S`
                 # AGAST #2321: `s: @[N]S`, so `q[i]` is what `s[i]` is.
                 stmt.var_pointee_array_size = src_loc.pointee_array_size
                 stmt.var_pointee_array_elem_type = src_loc.pointee_array_elem_type
@@ -608,6 +633,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type_name = addr_pointee
                     stmt.var_type_name_len = addr_pointee_len
 
+    if infer_ref_to_pointer_let(s, stmt) == 1
+        var_type = stmt.var_type
     if infer_array_ptr_let(s, stmt) == 1
         var_type = stmt.var_type
     if infer_array_elem_let(s, stmt) == 1
@@ -719,6 +746,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # AGAST #1754: `@S` / `@&S` local -- registered like a param of the
         # same type (struct name + pointee) so `q.a` resolves.
         add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_pointee_type, 0, 0)
+        set_local_inner_pointee(s, stmt.var_name, stmt.var_name_len, stmt.var_inner_pointee_type)   # AGAST #2372: `@**S`
     else if var_type == TYPE_PTR_PTR and stmt.var_type_name_len > 0
         # AGAST #1933: `let pp: **S` -- keep the struct name, as a `**S`
         # param does, so emit_deref_operand_ptr resolves `(**pp).f`.  It
@@ -3443,7 +3471,8 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     lfa_done = 1
                     # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
                     var base_ptr_reg: i32 = loc.reg
-                    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+                    let lfa_levels: i32 = local_struct_levels(loc)
+                    if lfa_levels > 0
                         # Load the pointer value, then convert to ptr
                         let loaded: i32 = next_reg(s)
                         emit_str(s, c"  ")
@@ -3457,6 +3486,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c" = inttoptr i64 ")
                         emit_reg(s, loaded)
                         emit_str(s, c" to ptr\n")
+                        base_ptr_reg = emit_load_levels(s, base_ptr_reg, lfa_levels - 1)   # AGAST #2372
                     # Get pointer to the field using GEP
                     let field_ptr: i32 = next_reg(s)
                     emit_str(s, c"  ")
@@ -3603,7 +3633,8 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     lfia_done = 1
                     # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
                     var base_ptr_reg: i32 = loc.reg
-                    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+                    let lfia_levels: i32 = local_struct_levels(loc)
+                    if lfia_levels > 0
                         # Load the pointer value, then convert to ptr
                         let loaded: i32 = next_reg(s)
                         emit_str(s, c"  ")
@@ -3617,6 +3648,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c" = inttoptr i64 ")
                         emit_reg(s, loaded)
                         emit_str(s, c" to ptr\n")
+                        base_ptr_reg = emit_load_levels(s, base_ptr_reg, lfia_levels - 1)   # AGAST #2372
                     # First GEP to get the field (array within struct)
                     let field_ptr: i32 = next_reg(s)
                     emit_str(s, c"  ")

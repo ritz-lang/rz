@@ -111,9 +111,8 @@ ALLOWED = {
     "cast_to_a_pointer": ("fn g(p: @C)\n    (p as *C).x = 3\n", "g(@c)"),
 }
 
-# ritz1 fails these with no `@T` to blame: #2373 can't lower the cast, and #2372
-# writes into the `*C` rather than through it.
-ALLOWED_GAPS = {"cast_to_a_pointer": 2373, "pointer_behind_a_shared_reference": 2372}
+# ritz1 fails this with no `@T` to blame: #2373 can't lower the cast.
+ALLOWED_GAPS = {"cast_to_a_pointer": 2373}
 
 # Whole bindings and by-value fields: the reference is what changes, not what it
 # refers to.
@@ -177,14 +176,6 @@ def test_a_write_that_a_shared_reference_does_not_guard(tmp_path, compiler, site
     fn, call = ALLOWED[site]
     src = _main(TYPES + fn, f"    var c = C {{ x: 1 }}\n    {call}\n    c.x\n")
     assert _run(compiler, tmp_path, site, src) == 3
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_pointer_behind_a_shared_reference_compiles(tmp_path, compiler):
-    """What it does at run time is #2372's. That it isn't refused is this rule's."""
-    fn, _ = ALLOWED["pointer_behind_a_shared_reference"]
-    comp, _, _ = _compile(compiler, tmp_path, "pointer_compiles", _wrap(fn))
-    assert comp.returncode == 0, comp.stdout + comp.stderr
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
