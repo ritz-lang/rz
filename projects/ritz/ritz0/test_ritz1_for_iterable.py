@@ -9,9 +9,9 @@ doesn't know is a located error, so an iterable that ritz0 accepts and ritz1
 doesn't yet is a refusal rather than a loop that silently never happens.
 
 A field is a copy and a global isn't: ritz0 reads `h.a` once through _emit_expr
-into a temporary, and walks a bare name in place.  #2387 asks whether that's the
-language; until then the three compilers agree, and test_writes_in_the_body pins
-it.
+into a temporary, and walks a bare name in place.  #2387 ruled that a `for` sees
+what its body writes, so the field copy is to go.  Until that lands the three
+compilers agree, and test_writes_in_the_body pins them.
 
 Each program returns 0, or the number of the first check that failed.
 """
@@ -411,7 +411,8 @@ _H2 = "struct H\n    n: i32\n    a: [2]i32\n\n"
 
 
 # Each compiled to a loop that never ran.  ritz0 takes this first group, so each
-# is a gap with a ticket; it refuses the second, and so does ritz1 now.
+# is a gap with a ticket (#2314, #2410); it refuses the second, and so does ritz1
+# now.  What's lowered moves out: Vec, Span and StrView are in test_ritz1_for_header.py.
 RITZ1_REFUSES = {
     "addr_of_local": (MAIN + _A + _SUM_V.format(it="@a")),
     "addr_of_global": (_G + MAIN + _SUM_V.format(it="@g")),
@@ -425,17 +426,8 @@ RITZ1_REFUSES = {
     "deref": (MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="*p")),
     "literal": (MAIN + _SUM_V.format(it="[1, 2]")),
     "row": (MAIN + "    var m: [2][2]i32\n" + _SUM_V.format(it="m[1]")),
-    "vec": (_VEC + MAIN + _NEW_VEC + _SUM_V.format(it="v")),
-    "vec_field": (_VEC + MAIN + "    var h: VH\n" + _SUM_V.format(it="h.v")),
-    "addr_of_vec_field": (_VEC + MAIN + "    var h: VH\n" + _SUM_V.format(it="@h.v")),
-    "vec_reference": (_VEC + "fn f(v: @Vec<i32>) -> i32\n" + _SUM_V.format(it="v") + "\n" + MAIN
-                      + _NEW_VEC + "    return f(@v)\n"),
     "addr_of_vec_mut_param": (_VEC + "fn f(v:& Vec<i32>) -> i32\n" + _SUM_V.format(it="@v") + "\n"
                               + MAIN + _NEW_VEC + "    return f(@&v)\n"),
-    "strview": (MAIN + "    let s: StrView = \"ab\"\n    var t: i32 = 0\n    for b in s\n"
-                "        t = t + 1\n    return t\n"),
-    "as_bytes": (MAIN + "    let s: StrView = \"ab\"\n    var t: i32 = 0\n    for b in s.as_bytes()\n"
-                 "        t = t + 1\n    return t\n"),
 }
 
 BOTH_REFUSE = {
@@ -463,7 +455,7 @@ def test_ritz0_refuses_what_isnt_iterable(compile_with, name):
     assert not ll.exists()
 
 
-# `@v` over a local Vec is the one Vec form ritz1 has, and it stays.
+# `@v` over a local Vec is the form ritz1 had first.  test_ritz1_for_header.py runs it.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 def test_the_vec_form_still_compiles(compile_with, compiler):

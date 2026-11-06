@@ -1845,46 +1845,66 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     else
         emit_str(s, c"  ret void\n")
 
-# Decode a mangled Vec<T> struct name (e.g. "Vec$u8") into its element TYPE_*
-# constant. Only int element types are recognised — unknown/struct elements
-# fall back to TYPE_I64 so the loop alloca + load still produce valid IR.
-fn vec_elem_type_from_suffix(name: *u8, name_len: i32) -> i32
-    if name_len == 6
-        # "Vec$u8" / "Vec$i8"
-        if *(name + 4) == 117 and *(name + 5) == 56   # 'u8'
-            return TYPE_U8
-        if *(name + 4) == 105 and *(name + 5) == 56   # 'i8'
-            return TYPE_I8
-    else if name_len == 7
-        # "Vec$i32"/"u32"/"i64"/"u64"/"i16"/"u16"
-        if *(name + 4) == 105 and *(name + 5) == 51 and *(name + 6) == 50
-            return TYPE_I32
-        if *(name + 4) == 117 and *(name + 5) == 51 and *(name + 6) == 50
-            return TYPE_U32
-        if *(name + 4) == 105 and *(name + 5) == 54 and *(name + 6) == 52
-            return TYPE_I64
-        if *(name + 4) == 117 and *(name + 5) == 54 and *(name + 6) == 52
-            return TYPE_U64
-        if *(name + 4) == 105 and *(name + 5) == 49 and *(name + 6) == 54
-            return TYPE_I16
-        if *(name + 4) == 117 and *(name + 5) == 49 and *(name + 6) == 54
-            return TYPE_U16
-    TYPE_I64
-
-# Check if a struct type name begins with "Vec$" (i.e. Vec<T> monomorph).
-fn is_vec_struct_name(name: *u8, name_len: i32) -> i32
+# AGAST #2388: 1 for a struct the iterable form walks through its header: a
+# Vec<T>, a Span<T> or a StrView.  ritz0 takes any struct opening with a pointer
+# and an integer; these are the ones that mean it.
+fn is_for_header_name(name: *u8, name_len: i32) -> i32
     if name == null
         return 0
-    if name_len < 5
-        return 0
-    if *(name + 0) != 86    # 'V'
-        return 0
-    if *(name + 1) != 101   # 'e'
-        return 0
-    if *(name + 2) != 99    # 'c'
-        return 0
-    if *(name + 3) != 36    # '$'
-        return 0
+    if name_len > 4 and memcmp(name, c"Vec$", 4) == 0
+        return 1
+    if name_len > 5 and memcmp(name, c"Span$", 5) == 0
+        return 1
+    name_eq(name, name_len, c"StrView", 7)
+
+# find_struct, for a name that's a header.  Null for anything else, and for a
+# header whose `data` and `len` aren't where the loop reads them.
+fn for_header_struct(s: *EmitterState, name: *u8, name_len: i32) -> *StructDef
+    if is_for_header_name(name, name_len) == 0
+        return null
+    let st: *StructDef = find_struct(s, name, name_len)
+    if st == null or st.fields == null or st.fields.next == null
+        return null
+    let data: *StructField = st.fields
+    if data.field_type != TYPE_PTR and data.field_type != TYPE_PTR_PTR
+        return null
+    if data.next.field_type != TYPE_I64
+        return null
+    st
+
+# What a header's elements are, read off its `data` field as the monomorph left
+# it: a struct T by name, a primitive T in array_elem_type, and `*T` as a `**`
+# field.  1 if that names the element; a type this can't name is refused rather
+# than walked at a guessed stride, which `Vec<S>` was at 8 bytes.
+fn for_header_elem(s: *EmitterState, st: *StructDef, out: *ForElem) -> i32
+    let data: *StructField = st.fields
+    if data.field_type == TYPE_PTR
+        if data.field_type_name_len > 0
+            if find_struct(s, data.field_type_name, data.field_type_name_len) == null
+                return 0
+            out.elem = TYPE_STRUCT
+            out.name = data.field_type_name
+            out.name_len = data.field_type_name_len
+            return 1
+        if primitive_name_len(data.array_elem_type) == 0
+            return 0
+        out.elem = data.array_elem_type
+        return 1
+    # `Vec$ptr_Node` names Node, and `Vec$ptr_u8` nothing: its pointee is only
+    # in the suffix.  `Vec$ptr_ptr_u8` names no struct there is, and is refused.
+    out.elem = TYPE_PTR
+    if data.field_type_name_len > 0
+        if find_struct(s, data.field_type_name, data.field_type_name_len) == null
+            return 0
+        out.pointee = TYPE_STRUCT
+        out.pointee_name = data.field_type_name
+        out.pointee_name_len = data.field_type_name_len
+        return 1
+    var after: i32 = 0
+    while after < st.name_len and *(st.name + after) != 36   # '$'
+        after = after + 1
+    after = after + 5   # `$ptr_`
+    out.pointee = primitive_type_from_name(st.name + after, st.name_len - after)
     1
 
 # The LLVM type of one element of a `for` iterable: `%S` for a struct element.
@@ -1898,8 +1918,8 @@ fn emit_for_elem_llvm(s: *EmitterState, elem: i32, name: *u8, name_len: i32)
 
 # AGAST #2375: a private `[N x T]` holding array field `field`, read from
 # `field_ptr`, for a loop to walk.  ritz0 reads anything but a bare name once,
-# into a temporary, so a write in the body isn't seen by the loop (#2387).  The
-# copy goes pointer to pointer: a first-class load of a large array is what
+# into a temporary, so a write in the body isn't seen by the loop.  #2387 ruled
+# that it should be, and takes this copy out.  The copy goes pointer to pointer: a first-class load of a large array is what
 # InstCombine can't digest (see SRET_MIN_BYTES).  The alloca is static, so
 # hoist_entry_allocas takes it out of any enclosing loop.
 fn emit_for_field_copy(s: *EmitterState, field_ptr: i32, field: *StructField) -> i32
@@ -1918,16 +1938,157 @@ fn emit_for_field_copy(s: *EmitterState, field_ptr: i32, field: *StructField) ->
     s.sret_helpers_used = 1
     copy
 
+# AGAST #2388: a slot for the header value `val`, which has no place of its own:
+# a call's result, a literal or a const.  Nothing else can write to it.  The alloca
+# is static, so hoist_entry_allocas takes it out of any enclosing loop.
+fn emit_for_header_spill(s: *EmitterState, st: *StructDef, val: i32) -> i32
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c"\n  store %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c" ")
+    emit_reg(s, val)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+    slot
+
+# The struct a call in iterable position returns by value.  `as_bytes` is only
+# the builtin on a StrView: a user's method of that name is whatever it says.
+fn for_call_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    call_result_struct_name(s, e, out_name, out_len)
+    if *out_len > 0 or e.kind != EXPR_METHOD or e.left == null or e.left.kind != EXPR_IDENT
+        return
+    if name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 0
+        return
+    let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+    if loc != null and name_eq(loc.type_name, loc.type_name_len, c"StrView", 7) == 1
+        *out_name = c"Span$u8"
+        *out_len = 7
+
+# A bare name holding a header, or a reference to one.  A local hides a global of
+# its name.
+fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+    let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+    if loc != null
+        let st: *StructDef = for_header_struct(s, loc.type_name, loc.type_name_len)
+        if st == null
+            return 0
+        if loc.var_type == TYPE_STRUCT
+            *out = st
+            return loc.reg
+        if local_struct_levels(loc) == 1 and loc.pointee_type == TYPE_STRUCT
+            *out = st
+            return emit_load_ptr(s, loc.reg)
+        return 0
+    let glob: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+    if glob != null
+        if glob.var_type == TYPE_STRUCT
+            let gst: *StructDef = for_header_struct(s, glob.type_name, glob.type_name_len)
+            if gst != null
+                *out = gst
+                return emit_lvalue_ptr(s, e)
+        else if glob.var_type == TYPE_PTR and glob.pointee_type == TYPE_STRUCT
+            let pst: *StructDef = for_header_struct(s, glob.pointee_type_name, glob.pointee_type_name_len)
+            if pst != null
+                var unused: *StructDef = null
+                var levels: i32 = 0
+                *out = pst
+                return emit_deref_operand_ptr(s, e, @unused, @levels)
+        return 0
+    let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+    if ce != null and ce.const_type == TYPE_STRUCT
+        let cst: *StructDef = for_header_struct(s, ce.type_name, ce.type_name_len)
+        if cst != null
+            *out = cst
+            return emit_for_header_spill(s, cst, emit_expr(s, e))
+    0
+
+# `@v` / `@&v` / `@h.v`.  `@v` of anything already a reference isn't here:
+# `v: @Vec<T>` is refused by ritz0, and `:&` is #2314.
+fn emit_for_addr_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+    let op: *Expr = e.operand
+    if op == null
+        return 0
+    if op.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, op.ident_ptr, op.ident_len)
+        if loc != null
+            if loc.var_type != TYPE_STRUCT
+                return 0
+            let st: *StructDef = for_header_struct(s, loc.type_name, loc.type_name_len)
+            if st != null
+                *out = st
+                return loc.reg
+            return 0
+        let glob: *GlobalVarDef = find_global(s, op.ident_ptr, op.ident_len)
+        if glob != null and glob.var_type == TYPE_STRUCT
+            let gst: *StructDef = for_header_struct(s, glob.type_name, glob.type_name_len)
+            if gst != null
+                *out = gst
+                return emit_lvalue_ptr(s, op)
+        return 0
+    if op.kind == EXPR_MEMBER
+        var mr: MemberPtrResult
+        emit_member_ptr(s, op, @mr)
+        if mr.success == 1 and mr.field.field_type == TYPE_STRUCT
+            let fst: *StructDef = for_header_struct(s, mr.field.field_type_name, mr.field.field_type_name_len)
+            if fst != null
+                *out = fst
+                return mr.reg
+    0
+
+# AGAST #2388: a pointer to the header `iter` names, with its struct in *out, or
+# 0 with *out null.  The loop walks that header in place, reading `len` and `data`
+# on every pass, because it sees what the body writes (#2387).  That's also what
+# makes a `push` that moves the buffer safe: nothing from before it is kept, and
+# the binding is a copy of its element, taken before the body runs.
+#
+# `iter` is evaluated once.  `mr` is its field when it's an EXPR_MEMBER: reaching
+# that again would run whatever it's reached through twice.
+fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **StructDef) -> i32
+    if iter.kind == EXPR_IDENT
+        return emit_for_ident_header(s, iter, out)
+    if iter.kind == EXPR_MEMBER
+        if mr.success != 1
+            return 0
+        let f: *StructField = mr.field
+        let st: *StructDef = for_header_struct(s, f.field_type_name, f.field_type_name_len)
+        if st == null
+            return 0
+        if f.field_type == TYPE_STRUCT
+            *out = st
+            return mr.reg
+        if f.field_type == TYPE_PTR
+            *out = st
+            return emit_load_ptr(s, mr.reg)
+        return 0
+    if iter.kind == EXPR_UNARY and (iter.op == OP_ADDR or iter.op == OP_ADDR_MUT)
+        return emit_for_addr_header(s, iter, out)
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if iter.kind == EXPR_CALL or iter.kind == EXPR_METHOD
+        for_call_struct_name(s, iter, @name, @name_len)
+    else if iter.kind == EXPR_STRING_LIT
+        resolve_expr_struct_name(s, iter, @name, @name_len)
+    let vst: *StructDef = for_header_struct(s, name, name_len)
+    if vst == null
+        return 0
+    *out = vst
+    emit_for_header_spill(s, vst, emit_expr(s, iter))
+
 # Lower `for x in iter { body }` (no `..`) — the iterable form.
 # Supports the shapes ritz1 can express today:
 #   • a local `[N]T` (TYPE_ARRAY), walked in place
 #   • a module const or global `[N]T`, walked in place at its symbol
 #   • an array field, walked in a copy (emit_for_field_copy)
-#   • `@v` where `v` has TYPE_STRUCT name = "Vec$T" (borrow of Vec<T>)
+#   • a Vec, a Span or a StrView, through its header (emit_for_header)
 # Anything else is a located error, as is a multi-dimensional array.  AGAST
 # #2375: it used to be a loop that never ran, with no diagnostic.
 fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
-    var iter_kind: i32 = 0         # 0=unsupported, 1=array in a reg, 2=vec-ref, 3=array at a symbol
+    var iter_kind: i32 = 0         # 0=unsupported, 1=array in a reg, 2=header in a reg, 3=array at a symbol
     var elem_type: i32 = TYPE_I64
     var arr_size: i32 = 0
     var data_reg: i32 = 0
@@ -1945,6 +2106,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     var elem_name: *u8 = null
     var elem_name_len: i32 = 0
 
+    var mr: MemberPtrResult
     let iter: *Expr = stmt.for_start
     if iter != null
         if iter.kind == EXPR_IDENT
@@ -1993,7 +2155,6 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         elem_name_len = glob.array_elem_type_name_len
                         bind_pointee = elem_recorded_pointee(s, elem_type, glob.array_elem_pointee, elem_name, elem_name_len, @bind_name, @bind_name_len)
         else if iter.kind == EXPR_MEMBER
-            var mr: MemberPtrResult
             emit_member_ptr(s, iter, @mr)
             if mr.success == 1 and mr.field.field_type == TYPE_ARRAY
                 let fld: *StructField = mr.field
@@ -2007,22 +2168,33 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 elem_name = fld.array_elem_type_name
                 elem_name_len = fld.array_elem_type_name_len
                 bind_pointee = elem_recorded_pointee(s, elem_type, fld.array_elem_pointee, elem_name, elem_name_len, @bind_name, @bind_name_len)
-        else if iter.kind == EXPR_UNARY
-            if iter.op == OP_ADDR or iter.op == OP_ADDR_MUT
-                if iter.operand != null
-                    if iter.operand.kind == EXPR_IDENT
-                        let loc: *LocalVar = find_local_struct_name(s, iter.operand.ident_ptr, iter.operand.ident_len)
-                        if loc != null
-                            if loc.var_type == TYPE_STRUCT
-                                if is_vec_struct_name(loc.type_name, loc.type_name_len) == 1
-                                    iter_kind = 2
-                                    elem_type = vec_elem_type_from_suffix(loc.type_name, loc.type_name_len)
-                                    type_name = loc.type_name
-                                    type_name_len = loc.type_name_len
-                                    data_reg = loc.reg
+
+    if iter_kind == 0 and iter != null
+        var hdr: *StructDef = null
+        data_reg = emit_for_header(s, iter, @mr, @hdr)
+        if hdr != null
+            var fe: ForElem
+            fe.elem = TYPE_VOID
+            fe.name = null
+            fe.name_len = 0
+            fe.pointee = TYPE_VOID
+            fe.pointee_name = null
+            fe.pointee_name_len = 0
+            if for_header_elem(s, hdr, @fe) == 0
+                emit_nd_error(s, iter.span.line, iter.span.col, c"this `for` element type is not supported in ritz1 (index the Vec, or use a struct element)")
+                return
+            iter_kind = 2
+            type_name = hdr.name
+            type_name_len = hdr.name_len
+            elem_type = fe.elem
+            elem_name = fe.name
+            elem_name_len = fe.name_len
+            bind_pointee = fe.pointee
+            bind_name = fe.pointee_name
+            bind_name_len = fe.pointee_name_len
 
     if iter_kind == 0
-        emit_nd_error(s, iter.span.line, iter.span.col, c"this `for` iterable is not supported in ritz1 (it takes an array, an array field, or `@v` over a local Vec)")
+        emit_nd_error(s, iter.span.line, iter.span.col, c"this `for` iterable is not supported in ritz1 (it takes an array, an array field, a Vec, a Span or a StrView)")
         return
 
     # Index storage (i64 counter).
@@ -2134,8 +2306,32 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     emit_reg(s, idx_reg)
     emit_str(s, c"\n")
 
-    if iter_kind == 1 or iter_kind == 3
-        let elem_ptr: i32 = next_reg(s)
+    let elem_ptr: i32 = next_reg(s)
+    if iter_kind == 2
+        # `data` is field 0 and `len` field 1, as for_header_struct checked.
+        let data_ptr_ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, c" = getelementptr %")
+        emit_name(s, type_name, type_name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, data_reg)
+        emit_str(s, c", i32 0, i32 0\n")
+        let data_ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, data_ptr)
+        emit_str(s, c" = load ptr, ptr ")
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, c"\n  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c" = getelementptr ")
+        emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, data_ptr)
+        emit_str(s, c", i64 ")
+        emit_reg(s, idx_val2)
+        emit_str(s, c"\n")
+    else
         emit_str(s, c"  ")
         emit_reg(s, elem_ptr)
         emit_str(s, c" = getelementptr [")
@@ -2153,71 +2349,30 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c", i64 0, i64 ")
         emit_reg(s, idx_val2)
         emit_str(s, c"\n")
-        let elem_val: i32 = next_reg(s)
+    let elem_val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_val)
+    emit_str(s, c" = load ")
+    emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c"\n")
+    if elem_type == TYPE_BOOL
+        let wide: i32 = next_reg(s)
         emit_str(s, c"  ")
+        emit_reg(s, wide)
+        emit_str(s, c" = zext i1 ")
         emit_reg(s, elem_val)
-        emit_str(s, c" = load ")
-        emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
-        emit_str(s, c", ptr ")
-        emit_reg(s, elem_ptr)
-        emit_str(s, c"\n")
-        if elem_type == TYPE_BOOL
-            let wide: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, wide)
-            emit_str(s, c" = zext i1 ")
-            emit_reg(s, elem_val)
-            emit_str(s, c" to i64\n  store i64 ")
-            emit_reg(s, wide)
-        else
-            emit_str(s, c"  store ")
-            emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
-            emit_str(s, c" ")
-            emit_reg(s, elem_val)
-        emit_str(s, c", ptr ")
-        emit_reg(s, var_reg)
-        emit_str(s, c"\n")
-    else if iter_kind == 2
-        # Vec.data at field 0, Vec.len at field 1 — already used above.
-        let data_ptr_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, data_ptr_ptr)
-        emit_str(s, c" = getelementptr %")
-        emit_name(s, type_name, type_name_len)
-        emit_str(s, c", ptr ")
-        emit_reg(s, data_reg)
-        emit_str(s, c", i32 0, i32 0\n")
-        let data_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, data_ptr)
-        emit_str(s, c" = load ptr, ptr ")
-        emit_reg(s, data_ptr_ptr)
-        emit_str(s, c"\n")
-        let elem_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, elem_ptr)
-        emit_str(s, c" = getelementptr ")
-        emit_llvm_type(s, elem_type)
-        emit_str(s, c", ptr ")
-        emit_reg(s, data_ptr)
-        emit_str(s, c", i64 ")
-        emit_reg(s, idx_val2)
-        emit_str(s, c"\n")
-        let elem_val: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, elem_val)
-        emit_str(s, c" = load ")
-        emit_llvm_type(s, elem_type)
-        emit_str(s, c", ptr ")
-        emit_reg(s, elem_ptr)
-        emit_str(s, c"\n")
+        emit_str(s, c" to i64\n  store i64 ")
+        emit_reg(s, wide)
+    else
         emit_str(s, c"  store ")
-        emit_llvm_type(s, elem_type)
+        emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
         emit_str(s, c" ")
         emit_reg(s, elem_val)
-        emit_str(s, c", ptr ")
-        emit_reg(s, var_reg)
-        emit_str(s, c"\n")
+    emit_str(s, c", ptr ")
+    emit_reg(s, var_reg)
+    emit_str(s, c"\n")
 
     # Body statements.
     let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
