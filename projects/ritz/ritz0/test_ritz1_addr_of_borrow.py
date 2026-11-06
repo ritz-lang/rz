@@ -26,6 +26,7 @@ import re
 
 import pytest
 
+from ref_rules import ADDR_INTO_VALUE
 from test_borrow_param_ref_field import _compile, _run
 
 TYPES = """\
@@ -912,6 +913,13 @@ ALL = {f"{group}_{name}": source
        for group, programs in GROUPS.items()
        for name, source in programs.items()}
 
+# `@x` into a by-value slot isn't a read of x: drop the `@` (§13.3, AGAST #2336).
+BY_VALUE_REFUSED = {name: ALL.pop(name) for name in (
+    "argument_by_value", "argument_by_value_byval", "argument_by_value_is_a_copy",
+    "argument_method_by_value", "argument_mut_into_by_value",
+    "argument_mut_into_by_value_byval", "array_argument_by_value", "self_by_value_argument",
+)}
+
 # Still open on ritz1, each held to ritz0's answer by a strict xfail.
 RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
@@ -921,9 +929,6 @@ RITZ1_GAPS = {
     "self_by_value_address_write": "AGAST #2316: a by-value `self` isn't a copy",
     "self_generic_bare": "AGAST #2318: bare `self:&` in a generic impl doesn't compile",
     "self_generic_by_value": "AGAST #2318: `self: W<T>` in a generic impl doesn't compile",
-    "argument_mut_into_by_value": "AGAST #2317: `h(@&x)` into a by-value param fails at clang",
-    "argument_mut_into_by_value_byval": "AGAST #2317: `h(@&x)` into a by-value param fails at clang",
-    "argument_method_by_value": "AGAST #2317: `c.g(@x)` into a by-value method param fails at clang",
     "argument_addr_receiver": "AGAST #2317: `(@c).g()` has no receiver type, for a local either",
     "control_move_only_deref_field": "AGAST #2317: `(*@t).id` is unhandled, as `(@c).g()` is",
 }
@@ -948,6 +953,17 @@ def test_ritz1_address_of_borrow(ritz1_bin, tmp_path, name):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(BY_VALUE_REFUSED))
+def test_address_of_into_a_by_value_slot_is_refused(ritz1_bin, tmp_path, name, compiler):
+    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, BY_VALUE_REFUSED[name])
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0
+    assert not ll.exists()
+    assert ADDR_INTO_VALUE in out, out
+
+
+@pytest.mark.integration
 def test_ritz1_vec_into_a_span(ritz1_bin, tmp_path):
     assert _run("ritz1", ritz1_bin, tmp_path, "vec_span", VEC_SPAN) == 3
 
@@ -966,7 +982,7 @@ def test_ritz1_deref_of_the_address_is_still_a_move_out(ritz1_bin, tmp_path, nam
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MOVE_OUT[name])
     assert comp.returncode != 0
     assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of borrowed parameter `(t|self)`",
+    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of a reference",
                      comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 

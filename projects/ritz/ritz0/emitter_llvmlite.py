@@ -22,6 +22,7 @@ from metadata import type_to_string
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
+from type_checker import check_ref_slots
 
 
 class EmitError(Exception):
@@ -14947,7 +14948,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
          test_mode: bool = False,
          target: str = 'x86_64-unknown-linux-gnu',
          target_os: str = 'linux',
-         fn_cache_data: Optional[Dict] = None) -> Union[str, Tuple[str, Dict[str, str]]]:
+         fn_cache_data: Optional[Dict] = None,
+         module_names: Optional[Set[str]] = None) -> Union[str, Tuple[str, Dict[str, str]]]:
     """Convenience function to emit a module to LLVM IR.
 
     Args:
@@ -15007,6 +15009,14 @@ def emit(module: rast.Module, no_runtime: bool = False,
         emitter._cached_fn_names = set(cached_fn_ir.keys())
     else:
         emitter._cached_fn_names = set()
+
+    # A reference in a by-value slot (§13.2, AGAST #2336). After monomorphisation,
+    # so a generic body is judged at each `T` it's instantiated with.
+    emitter._current_source_file = main_source_path
+    slot_errors = check_ref_slots(module, emitter._should_emit_body, module_names)
+    slot_errors += MoveChecker().check_instances(module)
+    if slot_errors:
+        raise EmitError('\n'.join(str(e) for e in slot_errors))
 
     # Always use separate compilation - pass source path to control body emission
     if main_source_path:

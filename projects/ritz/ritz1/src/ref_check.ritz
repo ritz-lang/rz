@@ -1,0 +1,561 @@
+# ref_check.ritz - a reference doesn't fit a by-value slot (AGAST #2336)
+#
+# LANGUAGE_SPEC §13.2-13.4, LARB ruling R1.  An `@T`, `@&T` or `*T` where a `T`
+# goes is a located error at every slot: argument, `let`/`var`, `=`, `return`,
+# tail, field, element, variant payload.  There's no implicit deref, and `@x`
+# into a by-value slot is the same mistake.
+#
+# ritz0's twin is TypeChecker._check_ref_slot; ref_rules.py has the wording and
+# ritz0/test_ref_into_value.py holds all three compilers to it.  ritz1 emits
+# bodies after monomorphize_module, so a generic is judged per instance for free.
+#
+# This runs from the ownership hooks, as code is emitted, so every local a value
+# names is in scope.  That also means an `if` or `match` can't be judged where
+# it lands: its arms bind their own names.  So a slot's tails are noted when the
+# slot is met (ref_note_*) and judged as each one is emitted (ref_landed).
+#
+# Types the tables can't name stay unjudged: wrongly refusing a valid program
+# is worse than leaving it to clang.
+#
+# ownership.ritz uses ref_ty_of and ref_through for "cannot move out of a
+# reference", which only reaches a program with a Drop in it.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import emitter_expr_call   # method_callee_def
+
+# What an expression or a slot holds.
+pub struct RefTy
+    kind: i32       # TYPE_*
+    pointee: i32    # TYPE_* behind a pointer kind, or an array's element
+    name: *u8       # the struct: kind's own, or the pointee's
+    name_len: i32
+
+# A tail and the slot it lands in.
+struct RefTail
+    e: *Expr
+    kind: i32
+    pointee: i32
+    name: *u8
+    name_len: i32
+
+var REF_TAILS: *RefTail = null
+var REF_TAIL_COUNT: i32 = 0
+var REF_TAIL_CAP: i32 = 0
+var REF_RET: RefTy
+var REF_LAST_LINE: i32 = 0
+var REF_LAST_COL: i32 = 0
+
+fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
+    out.kind = kind
+    out.pointee = pointee
+    out.name = name
+    out.name_len = len
+    1
+
+pub fn ref_is_pointer(kind: i32) -> i32
+    if kind == TYPE_PTR or kind == TYPE_REF or kind == TYPE_MUT_REF
+        return 1
+    0
+
+fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
+    if loc.bk_unsure == 1 or loc.holds_shared_ref == 1 and ref_is_pointer(loc.var_type) == 0
+        return 0
+    let t: i32 = loc.var_type
+    if ref_is_pointer(t) == 1
+        # `c:& C` reads as a `C` (§13.4), and so does a by-value `self`.
+        if (loc.is_lent == 1 or loc.holds_lent_ptr == 1) and loc.lent_in_slot == 0
+            return ref_set(out, loc.pointee_type, 0, loc.type_name, loc.type_name_len)
+        return ref_set(out, t, loc.pointee_type, loc.type_name, loc.type_name_len)
+    if t == TYPE_ARRAY
+        return ref_set(out, t, loc.array_elem_type, loc.type_name, loc.type_name_len)
+    if t == TYPE_PTR_PTR
+        return 0
+    ref_set(out, t, 0, loc.type_name, loc.type_name_len)
+
+fn ref_of_ident(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx >= 0
+        return ref_of_local(local_at(s, idx), out)
+    let g: *GlobalVarDef = find_global(s, name, len)
+    if g == null
+        return 0
+    if g.var_type == TYPE_PTR
+        return ref_set(out, TYPE_PTR, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
+    if g.var_type == TYPE_PTR_PTR
+        return 0
+    ref_set(out, g.var_type, 0, g.type_name, g.type_name_len)
+
+fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
+    if f == null or f.return_type == TYPE_VOID
+        return 0
+    if f.ret_ref != null
+        return ref_of_param(f.ret_ref, out)
+    if f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR
+        # FnDef keeps no pointee, only a struct's name.
+        if f.return_type_name_len > 0 and f.return_type == TYPE_PTR
+            return ref_set(out, TYPE_PTR, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
+        return 0
+    ref_set(out, f.return_type, 0, f.return_type_name, f.return_type_name_len)
+
+fn ref_of_param(p: *Param, out: *RefTy) -> i32
+    if p.param_type == TYPE_PTR_PTR
+        return 0
+    ref_set(out, p.param_type, p.param_pointee_type, p.param_type_name, p.param_type_name_len)
+
+fn ref_of_field(s: *EmitterState, e: *Expr, f: *StructField, out: *RefTy) -> i32
+    let t: i32 = f.field_type
+    if ref_is_pointer(t) == 1
+        var pointee: i32 = get_member_pointee_type_exact(s, e)
+        # An instance's `*T` field keeps the name and not the kind.
+        if pointee == TYPE_VOID and f.field_type_name_len > 0
+            pointee = TYPE_STRUCT
+        return ref_set(out, t, pointee, f.field_type_name, f.field_type_name_len)
+    if t == TYPE_ARRAY
+        return ref_set(out, t, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
+    if t == TYPE_PTR_PTR
+        return 0
+    ref_set(out, t, 0, f.field_type_name, f.field_type_name_len)
+
+# The method `e` (EXPR_METHOD) calls, on the receiver's own type.
+pub fn ref_method_def(s: *EmitterState, e: *Expr) -> *FnDef
+    var t: RefTy
+    if e.left != null and ref_ty_of(s, e.left, @t) == 1 and t.name_len > 0
+        return method_callee_def(s, t.name, t.name_len, e.ident_ptr, e.ident_len)
+    var len: i32 = 0
+    let name: *u8 = method_recv_type_name(s, e, @len)
+    if name == null or len == 0
+        return null
+    method_callee_def(s, name, len, e.ident_ptr, e.ident_len)
+
+# Fill `out` with the type of `e`.  0 if the tables can't say.
+pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        return ref_of_ident(s, e.ident_ptr, e.ident_len, out)
+    if k == EXPR_UNARY
+        var t: RefTy
+        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
+            if ref_ty_of(s, e.operand, @t) == 0
+                return 0
+            if ref_is_pointer(t.kind) == 1
+                return ref_set(out, TYPE_PTR, TYPE_PTR, null, 0)
+            return ref_set(out, TYPE_PTR, t.kind, t.name, t.name_len)
+        if e.op == OP_DEREF
+            if ref_ty_of(s, e.operand, @t) == 0
+                return 0
+            if ref_is_pointer(t.kind) == 0
+                return ref_set(out, t.kind, t.pointee, t.name, t.name_len)
+            if t.pointee == TYPE_VOID or ref_is_pointer(t.pointee) == 1 or t.pointee == TYPE_ARRAY
+                return 0
+            return ref_set(out, t.pointee, 0, t.name, t.name_len)
+        return 0
+    if k == EXPR_MEMBER
+        let f: *StructField = resolve_member_chain_field(s, e)
+        if f == null
+            return 0
+        return ref_of_field(s, e, f, out)
+    if k == EXPR_INDEX
+        var b: RefTy
+        if ref_ty_of(s, e.left, @b) == 0
+            return 0
+        if b.kind != TYPE_ARRAY and ref_is_pointer(b.kind) == 0
+            return 0
+        if b.pointee == TYPE_VOID or ref_is_pointer(b.pointee) == 1 or b.pointee == TYPE_ARRAY
+            return 0
+        return ref_set(out, b.pointee, 0, b.name, b.name_len)
+    if k == EXPR_CALL
+        return ref_of_fn(find_call_fn(s, e), out)
+    if k == EXPR_METHOD
+        return ref_of_fn(ref_method_def(s, e), out)
+    if k == EXPR_BINARY
+        var l: RefTy
+        if ref_ty_of(s, e.left, @l) == 1 and ref_is_pointer(l.kind) == 1
+            return ref_set(out, l.kind, l.pointee, l.name, l.name_len)
+        return 0
+    if k == EXPR_CAST and e.op == TYPE_PTR
+        return ref_set(out, TYPE_PTR, e.int_val as i32, e.ident_ptr, e.ident_len)
+    0
+
+# Does the place `e` lie behind an `@T`, `@&T`, `*T` or `:&`?  ritz0's
+# MoveChecker._through_reference.
+pub fn ref_through(s: *EmitterState, e0: *Expr) -> i32
+    var e: *Expr = e0
+    while e != null
+        var next: *Expr = null
+        if e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX
+            next = e.left
+        else if e.kind == EXPR_UNARY and e.op == OP_DEREF
+            next = e.operand
+        else
+            if e.kind != EXPR_IDENT
+                return 0
+            let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+            if idx < 0
+                return 0
+            let loc: *LocalVar = local_at(s, idx)
+            return loc.is_lent
+        e = next
+        var t: RefTy
+        if ref_ty_of(s, e, @t) == 1 and ref_is_pointer(t.kind) == 1
+            return 1
+    0
+
+fn ref_eprint_loc(line: i32, col: i32)
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+
+# 1 the first time this place is reported: `x.f` is walked as a value and a
+# tail, and a loop body's moves are checked twice.
+fn ref_first_report(line: i32, col: i32) -> i32
+    if line == REF_LAST_LINE and col == REF_LAST_COL
+        return 0
+    REF_LAST_LINE = line
+    REF_LAST_COL = col
+    1
+
+pub fn ref_error_move_out(s: *EmitterState, line: i32, col: i32)
+    if ref_first_report(line, col) == 0
+        return
+    ref_eprint_loc(line, col)
+    eprints_cstr(c": error: cannot move out of a reference\n")
+    s.error_count = s.error_count + 1
+
+fn ref_error_slot(s: *EmitterState, e: *Expr)
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        eprints_cstr(c": error: `@x` doesn't fit a by-value slot: drop the `@`\n")
+    else
+        eprints_cstr(c": error: a reference or pointer doesn't fit a by-value slot: write `*` to read through it\n")
+    s.error_count = s.error_count + 1
+
+fn ref_same_pointee(a: *RefTy, slot: *RefTy) -> i32
+    if a.pointee != slot.kind
+        return 0
+    if slot.kind != TYPE_STRUCT
+        return 1
+    if a.name_len == 0 or slot.name_len == 0
+        return 0
+    name_eq(a.name, a.name_len, slot.name, slot.name_len)
+
+fn ref_tail_set(t: *RefTail, e: *Expr, kind: i32, pointee: i32, name: *u8, len: i32)
+    t.e = e
+    t.kind = kind
+    t.pointee = pointee
+    t.name = name
+    t.name_len = len
+
+fn ref_note(e: *Expr, slot: *RefTy)
+    if REF_TAIL_COUNT == REF_TAIL_CAP
+        let cap: i32 = REF_TAIL_CAP * 2 + 16
+        let grown: *RefTail = malloc((cap as i64) * sizeof(RefTail)) as *RefTail
+        # Through a local: `G + i` on a global `*Struct` strides by 1 (#2359).
+        let was: *RefTail = REF_TAILS
+        for i in 0..REF_TAIL_COUNT
+            let old: *RefTail = was + i
+            ref_tail_set(grown + i, old.e, old.kind, old.pointee, old.name, old.name_len)
+        if REF_TAILS != null
+            free(REF_TAILS as *u8)
+        REF_TAILS = grown
+        REF_TAIL_CAP = cap
+    let tails: *RefTail = REF_TAILS
+    ref_tail_set(tails + REF_TAIL_COUNT, e, slot.kind, slot.pointee, slot.name, slot.name_len)
+    REF_TAIL_COUNT = REF_TAIL_COUNT + 1
+
+fn ref_note_arms(arms: *MatchArm, slot: *RefTy)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.is_pass == 0 and arm.body != null
+            ref_note_value(arm.body, slot)
+        else
+            ref_note_stmts(arm.body_stmts, slot)
+        arm = arm.next
+
+fn ref_note_value(e: *Expr, slot: *RefTy)
+    if e == null
+        return
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        ref_note_arms(e.args as *MatchArm, slot)
+    else
+        ref_note(e, slot)
+
+# The last statement of `list` is its value.
+fn ref_note_stmts(list: *Stmt, slot: *RefTy)
+    var st: *Stmt = list
+    if st == null
+        return
+    while st.next != null
+        st = st.next
+    if st.kind == STMT_EXPR
+        ref_note_value(st.expr, slot)
+    else if st.kind == STMT_IF
+        ref_note_stmts(st.if_then, slot)
+        ref_note_stmts(st.if_else, slot)
+    else if st.kind == STMT_MATCH
+        ref_note_arms(st.if_then as *MatchArm, slot)
+
+# `e`'s value lands in `slot`.
+fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
+    if e == null or slot.kind == TYPE_VOID
+        return
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        ref_note_value(e, slot)
+        return
+    if e.kind == EXPR_ARRAY_LIT and slot.kind == TYPE_ARRAY
+        var part: RefTy
+        ref_set(@part, slot.pointee, 0, slot.name, slot.name_len)
+        var el: *Expr = e.args
+        while el != null
+            ref_into(s, el, @part)
+            el = el.next
+        return
+    if e.kind == EXPR_ARRAY_FILL and slot.kind == TYPE_ARRAY
+        var fill: RefTy
+        ref_set(@fill, slot.pointee, 0, slot.name, slot.name_len)
+        ref_into(s, e.left, @fill)
+        return
+    var a: RefTy
+    if ref_ty_of(s, e, @a) == 1 and ref_is_pointer(a.kind) == 1 and ref_is_pointer(slot.kind) == 0
+        if ref_same_pointee(@a, slot) == 1
+            ref_error_slot(s, e)
+    ref_into_variant(s, e, slot)
+
+# `Some(x)`, `Ok(x)` or `Err(x)` into an instance of Option or Result: its name
+# says what the payload is, for a struct.
+fn ref_into_variant(s: *EmitterState, e: *Expr, slot: *RefTy)
+    if e.kind != EXPR_CALL or e.args == null or slot.kind != TYPE_STRUCT
+        return
+    var variant: i32 = 0
+    if name_eq(e.func_name, e.func_name_len, c"Err", 3) == 1
+        variant = 1
+    else if name_eq(e.func_name, e.func_name_len, c"Some", 4) == 0 and name_eq(e.func_name, e.func_name_len, c"Ok", 2) == 0
+        return
+    var len: i32 = 0
+    let name: *u8 = tagged_enum_arg(s, slot.name, slot.name_len, variant, @len)
+    if name == null or find_struct(s, name, len) == null
+        return
+    var part: RefTy
+    ref_set(@part, TYPE_STRUCT, 0, name, len)
+    ref_into(s, e.args, @part)
+
+fn ref_payload(s: *EmitterState, a0: *Expr, ei: i32, vi: i32)
+    var a: *Expr = a0
+    var f: *StructField = enum_variant_fields(ei, vi)
+    while a != null and f != null
+        var slot: RefTy
+        ref_set(@slot, f.field_type, 0, f.field_type_name, f.field_type_name_len)
+        ref_into(s, a, @slot)
+        a = a.next
+        f = f.next
+
+fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
+    var a: *Expr = a0
+    var p: *Param = p0
+    while a != null
+        if p != null
+            var slot: RefTy
+            if p.is_borrow == 0 and ref_of_param(p, @slot) == 1
+                ref_into(s, a, @slot)
+            p = p.next
+        ref_walk(s, a)
+        a = a.next
+
+fn ref_walk_list(s: *EmitterState, a0: *Expr)
+    var a: *Expr = a0
+    while a != null
+        ref_walk(s, a)
+        a = a.next
+
+fn ref_walk_struct(s: *EmitterState, e: *Expr)
+    let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        if st != null
+            let idx: i32 = find_field_index(st, fi.name, fi.name_len)
+            if idx >= 0
+                let f: *StructField = get_field_type(st, idx)
+                var slot: RefTy
+                ref_set(@slot, f.field_type, f.array_elem_type, f.field_type_name, f.field_type_name_len)
+                if f.field_type != TYPE_PTR_PTR
+                    ref_into(s, fi.value, @slot)
+        ref_walk(s, fi.value)
+        fi = fi.next
+
+# Every slot inside `e`.  An `if` or `match` is its condition here: its arms
+# come through own_check_arm.
+fn ref_walk(s: *EmitterState, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_CALL
+        if e.func_name_len == 6 and name_eq(e.func_name, e.func_name_len, c"sizeof", 6) == 1
+            return
+        var en: *u8 = null
+        var el: i32 = 0
+        user_variant_ctor_enum(e, @en, @el)
+        if en != null
+            var vi: i32 = 0
+            var other: i32 = 0
+            let ei: i32 = enum_of_variant_unique(e.func_name, e.func_name_len, @vi, @other)
+            if ei >= 0
+                ref_payload(s, e.args, ei, vi)
+            ref_walk_list(s, e.args)
+            return
+        var p: *Param = null
+        var f: *FnDef = find_call_fn(s, e)
+        if f == null and e.func_name_len > 0
+            # A call through a `fn(...)` local or param.
+            let li: i32 = find_local_idx(s, e.func_name, e.func_name_len)
+            if li >= 0
+                let callee: *LocalVar = local_at(s, li)
+                f = callee.fn_sig
+        if f != null
+            p = f.params
+        ref_args(s, e.args, p)
+    else if k == EXPR_METHOD
+        var qv: i32 = 0
+        let qe: i32 = qualified_variant(s, e, @qv)
+        if qe >= 0
+            ref_payload(s, e.args, qe, qv)
+            ref_walk_list(s, e.args)
+            return
+        ref_walk(s, e.left)
+        var mp: *Param = null
+        let m: *FnDef = ref_method_def(s, e)
+        if m != null
+            mp = m.params
+            if mp != null and name_eq(mp.name, mp.name_len, c"self", 4) == 1
+                mp = mp.next
+        ref_args(s, e.args, mp)
+    else if k == EXPR_STRUCT_LIT
+        ref_walk_struct(s, e)
+    else if k == EXPR_ARRAY_LIT
+        ref_walk_list(s, e.args)
+    else if k == EXPR_ARRAY_FILL
+        ref_walk(s, e.left)
+    else if k == EXPR_UNARY
+        ref_walk(s, e.operand)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        ref_walk(s, e.left)
+        ref_walk(s, e.right)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_MATCH or k == EXPR_IF
+        ref_walk(s, e.left)
+
+# `e` is about to be emitted as a tail: judge it against the slot it was noted
+# for, now its arm's bindings are in scope.
+fn ref_landed(s: *EmitterState, e: *Expr)
+    let tails: *RefTail = REF_TAILS
+    var i: i32 = 0
+    while i < REF_TAIL_COUNT
+        let t: *RefTail = tails + i
+        if t.e == e
+            var slot: RefTy
+            ref_set(@slot, t.kind, t.pointee, t.name, t.name_len)
+            ref_into(s, e, @slot)
+            return
+        i = i + 1
+
+pub fn ref_begin_fn(s: *EmitterState, f: *FnDef)
+    REF_TAIL_COUNT = 0
+    REF_LAST_LINE = 0
+    REF_LAST_COL = 0
+    if ref_of_fn(f, @REF_RET) == 0
+        REF_RET.kind = TYPE_VOID
+        return
+    ref_note_stmts(f.body, @REF_RET)
+
+# A tail or an arm's value.
+pub fn ref_check_value(s: *EmitterState, e: *Expr)
+    ref_landed(s, e)
+    ref_walk(s, e)
+
+fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
+    if stmt.var_declared_type == TYPE_VOID
+        return 0
+    if stmt.var_type == TYPE_PTR_PTR
+        return 0
+    if stmt.var_type == TYPE_ARRAY
+        return ref_set(out, TYPE_ARRAY, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len)
+    ref_set(out, stmt.var_type, stmt.var_pointee_type, stmt.var_type_name, stmt.var_type_name_len)
+
+# `x.f = v` and `p.f = v`: the field is named by assign_target, on `owner`.
+fn ref_into_field(s: *EmitterState, stmt: *Stmt, owner: *RefTy)
+    if owner.name_len == 0
+        return
+    let st: *StructDef = find_struct(s, owner.name, owner.name_len)
+    if st == null
+        return
+    let idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+    if idx < 0
+        return
+    let f: *StructField = get_field_type(st, idx)
+    if f.field_type == TYPE_PTR_PTR
+        return
+    var slot: RefTy
+    ref_set(@slot, f.field_type, f.array_elem_type, f.field_type_name, f.field_type_name_len)
+    ref_into(s, stmt.assign_value, @slot)
+
+pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    var slot: RefTy
+    if k == STMT_VAR_DECL
+        if stmt.var_init != null and ref_decl_slot(stmt, @slot) == 1
+            ref_into(s, stmt.var_init, @slot)
+        ref_walk(s, stmt.var_init)
+    else if k == STMT_TUPLE_DECL
+        ref_walk(s, stmt.var_init)
+    else if k == STMT_ASSIGN
+        var known: i32 = 0
+        if stmt.assign_target_len > 0
+            known = ref_of_ident(s, stmt.assign_target, stmt.assign_target_len, @slot)
+        else
+            known = ref_ty_of(s, stmt.if_cond as *Expr, @slot)
+        if known == 1
+            ref_into(s, stmt.assign_value, @slot)
+        ref_walk(s, stmt.assign_value)
+    else if k == STMT_RETURN
+        ref_into(s, stmt.return_value, @REF_RET)
+        ref_walk(s, stmt.return_value)
+    else if k == STMT_EXPR
+        ref_check_value(s, stmt.expr)
+    else if k == STMT_MATCH
+        ref_walk(s, stmt.if_cond as *Expr)
+    else if k == STMT_IF or k == STMT_ASSERT
+        ref_walk(s, stmt.if_cond)
+    else if k == STMT_WHILE
+        ref_walk(s, stmt.while_cond)
+    else if k == STMT_LOCAL_FIELD_ASSIGN
+        var owner: RefTy
+        if ref_of_ident(s, stmt.var_name, stmt.var_name_len, @owner) == 1
+            ref_into_field(s, stmt, @owner)
+        ref_walk(s, stmt.assign_value)
+    else if k == STMT_MEMBER_ASSIGN
+        var base: RefTy
+        if ref_ty_of(s, stmt.if_cond, @base) == 1
+            ref_into_field(s, stmt, @base)
+        ref_walk(s, stmt.assign_value)
+    else if k == STMT_INDEX_ASSIGN
+        var held: RefTy
+        if ref_of_ident(s, stmt.assign_target, stmt.assign_target_len, @held) == 1
+            if held.kind == TYPE_ARRAY or ref_is_pointer(held.kind) == 1
+                var part: RefTy
+                ref_set(@part, held.pointee, 0, held.name, held.name_len)
+                ref_into(s, stmt.assign_value, @part)
+        ref_walk(s, stmt.assign_value)
+    else if k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        ref_walk(s, stmt.assign_value)

@@ -43,6 +43,7 @@ from pathlib import Path
 
 import pytest
 
+from ref_rules import REF_INTO_VALUE
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -2362,6 +2363,17 @@ pub fn main() -> i32
 }
 
 
+# A reference in a by-value slot: ritz0 read through it and ritz1 failed at clang
+# or returned garbage. There's no implicit deref (§13.2, AGAST #2336).
+NO_IMPLICIT_DEREF = {name: CONTROLS.pop(name) for name in (
+    "by_value_from_at_amp_param", "by_value_from_pointer_param",
+    "return_from_reference", "return_from_mut_reference", "return_from_pointer",
+    "tail_from_reference", "tail_from_pointer", "return_from_borrowed_pointer",
+)}
+for _name in NO_IMPLICIT_DEREF:
+    USED_TO_RETURN_GARBAGE.pop(_name, None)
+
+
 # Keyed by program, across STORES, CONTROLS and MOVE_OUT.
 RITZ1_GAPS = {
     "by_value_pointer_element": "AGAST #2277: `p[i] = v` with a struct value isn't lowered",
@@ -2371,8 +2383,6 @@ RITZ1_GAPS = {
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_bool_field": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
     "by_value_bool_literal": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
-    "by_value_from_at_amp_param": "AGAST #2227: is `@&T` read by value an implicit deref?",
-    "by_value_from_pointer_param": "AGAST #2227: is `*T` read by value an implicit deref?",
     "by_value_if_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
     "by_value_if_tail": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
     "by_value_match_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
@@ -2390,12 +2400,6 @@ RITZ1_GAPS = {
     "return_self_by_value": "AGAST #2291: `return self` doesn't read through the pointer",
     "return_bare_self": "AGAST #2291: `return self` doesn't read through the pointer",
     "generic_struct_array_field": "AGAST #2292: a generic struct's `[N]T` field isn't substituted",
-    "return_from_reference": "AGAST #2227: is a reference returned by value an implicit deref?",
-    "return_from_mut_reference": "AGAST #2227: is a reference returned by value an implicit deref?",
-    "return_from_pointer": "AGAST #2227: is a reference returned by value an implicit deref?",
-    "tail_from_reference": "AGAST #2227: is a reference returned by value an implicit deref?",
-    "tail_from_pointer": "AGAST #2227: is a reference returned by value an implicit deref?",
-    "return_from_borrowed_pointer": "AGAST #2227: is a reference returned by value an implicit deref?",
     "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
 }
 
@@ -2537,7 +2541,7 @@ def test_ritz0_drop_type_reborrow_is_not_a_move(tmp_path, name):
 def test_ritz0_by_value_field_is_still_a_move_out(tmp_path, name):
     comp, _, _ = _compile("ritz0", None, tmp_path, name, MOVE_OUT[name])
     assert comp.returncode != 0
-    assert "cannot move out of borrowed parameter `" in comp.stdout + comp.stderr
+    assert "cannot move out of a reference" in comp.stdout + comp.stderr
 
 
 @pytest.mark.integration
@@ -2555,6 +2559,17 @@ def _ritz1_params(programs: dict) -> list:
     return [pytest.param(name, marks=[pytest.mark.xfail(strict=True, reason=RITZ1_GAPS[name])]
                          if name in RITZ1_GAPS else [])
             for name in sorted(programs)]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(NO_IMPLICIT_DEREF))
+def test_a_reference_is_not_its_referent(ritz1_bin, tmp_path, name, compiler):
+    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, NO_IMPLICIT_DEREF[name])
+    assert comp.returncode != 0
+    assert not ll.exists()
+    assert re.search(r"main\.ritz:\d+:\d+: (error: )?" + re.escape(REF_INTO_VALUE),
+                     comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 
 @pytest.mark.integration
@@ -2584,7 +2599,7 @@ def test_ritz1_by_value_field_is_still_a_move_out(ritz1_bin, tmp_path, name):
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MOVE_OUT[name])
     assert comp.returncode != 0
     assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of borrowed parameter `[atw]`",
+    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of a reference",
                      comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 

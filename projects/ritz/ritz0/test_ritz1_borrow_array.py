@@ -1006,7 +1006,7 @@ NOT_AN_ARRAY = WRONG_TYPE + r": the parameter points at an array"
 DEREF_STORE = r"main\.ritz:\d+:\d+: cannot store through `\*a`"
 NOT_A_VALUE = r"main\.ritz:\d+:\d+: a whole array is not a value here"
 NO_SLICE = r"main\.ritz:\d+:\d+: an `a:& \[N\]T` param can't be sliced"
-MOVE_OUT = r"main\.ritz:\d+:\d+: error: cannot move out of borrowed parameter `a`"
+MOVE_OUT = r"main\.ritz:\d+:\d+: error: cannot move out of a reference"
 
 # ritz0 refuses all of these, and so does ritz1, at the line.  A wrong-sized
 # argument matters most: `a[i]` in the callee trusts the N and T it declares.

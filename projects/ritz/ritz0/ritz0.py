@@ -317,7 +317,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                            # Per-fn IR reuse is keyed on the source alone, so
                            # it cannot tell a test-mode compile (no `main`)
                            # from a normal one: test mode always emits fresh.
-                           fn_cache_data=None if test_mode else fn_cache_data)
+                           fn_cache_data=None if test_mode else fn_cache_data,
+                           module_names=module_names)
 
         if fn_cache_data is not None and isinstance(emit_result, tuple):
             ir, emitted_fn_ir = emit_result

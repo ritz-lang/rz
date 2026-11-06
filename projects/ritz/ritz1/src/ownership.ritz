@@ -98,6 +98,7 @@ import emitter_core
 import emitter_expr        # emit_member_gep_from_ptr
 import emitter_expr_call   # method_callee_def, find_spec_impl_method
 import ll_copy_scan        # ll_line_len, ll_starts_with
+import ref_check           # ref_ty_of, ref_through (AGAST #2336)
 
 const OWN_INIT_CAP: i32 = 16
 # Deeper than any real struct nesting; stops a malformed recursive type.
@@ -1448,11 +1449,7 @@ fn own_error_move_from_drop(s: *EmitterState, line: i32, col: i32, e: *Expr, tna
 pub fn own_check_lent_read(s: *EmitterState, e: *Expr, name: *u8, len: i32)
     if own_move_only_depth(s, name, len, 0) == 0
         return
-    own_eprint_loc(e.span.line, e.span.col)
-    eprints_cstr(c": error: cannot move out of borrowed parameter `")
-    own_eprint_name(e.ident_ptr, e.ident_len)
-    eprints_cstr(c"`\n")
-    s.error_count = s.error_count + 1
+    ref_error_move_out(s, e.span.line, e.span.col)
 
 fn own_error_borrow(s: *EmitterState, e: *Expr, b: *OwnBinding)
     own_error_borrow_at(s, e.span.line, e.span.col, b)
@@ -1700,6 +1697,49 @@ fn own_recv_def(s: *EmitterState, e: *Expr) -> *FnDef
         return null
     return method_callee_def(s, loc.type_name, loc.type_name_len, e.ident_ptr, e.ident_len)
 
+# AGAST #2336: `e` (`*r`, `r.f`, `p[i]`) names a move-only value behind a
+# reference.  Used by value it would have two owners.  A bare `:&` param isn't
+# judged here: until #2337 it lends itself to a reference slot, and only the
+# slot can tell, so own_check_lent_read has it.
+fn own_moves_out(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_IDENT
+        return 0
+    var t: RefTy
+    if ref_ty_of(s, e, @t) == 0 or t.kind != TYPE_STRUCT or t.name_len == 0
+        return 0
+    if own_type_is_move_only(s, t.name, t.name_len) == 0
+        return 0
+    ref_through(s, e)
+
+# The line and column an error about `e` points at: where it starts.
+fn own_start_of(e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r.left != null and (r.kind == EXPR_MEMBER or r.kind == EXPR_INDEX or r.kind == EXPR_METHOD)
+        r = r.left
+    r
+
+# AGAST #2336: a by-value `self` method on a reference to a move-only value.
+fn own_check_ref_receiver(s: *EmitterState, e: *Expr)
+    let m: *FnDef = ref_method_def(s, e)
+    if m == null or m.params == null or own_param_moves(m.params) == 0 or m.params.is_borrow == 1
+        return
+    if name_eq(m.params.name, m.params.name_len, c"self", 4) == 0
+        return
+    var t: RefTy
+    if ref_ty_of(s, e.left, @t) == 0 or t.name_len == 0
+        return
+    if own_type_is_move_only(s, t.name, t.name_len) == 0
+        return
+    if ref_is_pointer(t.kind) == 1 or ref_through(s, e.left) == 1
+        let at: *Expr = own_start_of(e)
+        ref_error_move_out(s, at.span.line, at.span.col)
+
+# A scrutinee moves into its match, unless a reference holds it: that's a read.
+fn own_scrutinee_mv(s: *EmitterState, e: *Expr) -> i32
+    if ref_through(s, e) == 1
+        return 0
+    1
+
 # Check one expression, in evaluation order.  `mv` is 1 when its value is
 # used by value (a move for a move-only binding).  Mirrors ritz0's
 # MoveChecker._check_expr.  Match / if-expression arms are checked as their
@@ -1708,6 +1748,10 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
     if e == null
         return
     let k: i32 = e.kind
+    if mv == 1 and own_moves_out(s, e) == 1
+        let at: *Expr = own_start_of(e)
+        ref_error_move_out(s, at.span.line, at.span.col)
+        return
     if k == EXPR_IDENT
         let b: *OwnBinding = own_lookup(s, e.ident_ptr, e.ident_len)
         if b == null
@@ -1763,6 +1807,7 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
         var rmv: i32 = 0
         if e.left != null and e.left.kind == EXPR_CALL
             rmv = 1
+        own_check_ref_receiver(s, e)
         own_walk(s, e.left, rmv)
         var mp: *Param = null
         let m: *FnDef = own_recv_def(s, e)
@@ -1776,8 +1821,17 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
         while fi != null
             own_walk(s, fi.value, 1)
             fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        # A literal owns its elements (ritz0 #2238).  ritz1 doesn't track that
+        # move yet, but it can tell one that isn't there to make.
+        var el: *Expr = e.args
+        while el != null
+            if own_moves_out(s, el) == 1
+                let eat: *Expr = own_start_of(el)
+                ref_error_move_out(s, eat.span.line, eat.span.col)
+            el = el.next
     else if k == EXPR_MATCH
-        own_walk(s, e.left, 1)
+        own_walk(s, e.left, own_scrutinee_mv(s, e.left))
     else if k == EXPR_IF
         own_walk(s, e.left, 0)
 
@@ -1896,6 +1950,7 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
     o.fa_cond = 0
     o.fa_path = 0 - 1
     o.fa_mask = 0
+    ref_check_stmt(s, stmt)
     if own_checking(s) == 0
         return
     let k: i32 = stmt.kind
@@ -1948,7 +2003,7 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
     else if k == STMT_MATCH
         # AGAST #2174: the scrutinee moves into the match, as in the
         # expression form and ritz0 (own_match_begin takes ownership).
-        own_walk(s, stmt.if_cond as *Expr, 1)
+        own_walk(s, stmt.if_cond as *Expr, own_scrutinee_mv(s, stmt.if_cond as *Expr))
     else if k == STMT_IF or k == STMT_ASSERT
         own_walk(s, stmt.if_cond, 0)
     else if k == STMT_WHILE
@@ -1971,12 +2026,14 @@ pub fn own_after_stmt(s: *EmitterState, stmt: *Stmt)
 
 # A fn's tail expression is its return value: a move.
 pub fn own_check_tail(s: *EmitterState, e: *Expr)
+    ref_check_value(s, e)
     if own_checking(s) == 0
         return
     own_walk(s, e, 1)
 
 # A match / if-expression arm's value expression.
 pub fn own_check_arm(s: *EmitterState, e: *Expr)
+    ref_check_value(s, e)
     if own_checking(s) == 0
         return
     own_walk(s, e, 1)

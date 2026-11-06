@@ -12,9 +12,11 @@ Implements the ownership model of LANGUAGE_SPEC §13:
 This runs after parsing/name resolution, before code generation.
 """
 
+import copy
 from typing import Dict, Set, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
+import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
 
@@ -23,6 +25,7 @@ class OwnershipError(Exception):
     """Error for ownership/borrowing violations."""
     def __init__(self, message: str, span = None):
         self.span = span
+        self.reason = message
         if span:
             super().__init__(f"{span.file}:{span.line}:{span.column}: {message}")
         else:
@@ -320,10 +323,42 @@ class MoveChecker:
         keeps a drop flag per such path, so the binding's drop skips it.
         """
         self.errors = []
-        self.types = MoveTypes(module)
+        self._collect(module)
         module.moves_annotated = True
 
-        # First pass: collect type aliases and function signatures
+        # Second pass: check functions and impl methods
+        for item in module.items:
+            if isinstance(item, rast.FnDef):
+                self._check_fn(item)
+            elif isinstance(item, rast.ImplBlock):
+                for m in item.methods:
+                    self._check_fn(m)
+
+        self._drop_repeats()
+        return self.errors
+
+    def check_instances(self, module: rast.Module) -> List[OwnershipError]:
+        """Moves out of a reference in a monomorphised module's generic
+        instances. `check` saw those bodies with `T` a copy type (AGAST #2263),
+        so an instance at a move-only `T` is where `*p` turns into a move. Each
+        is checked on a copy: the emitter reads the marks `check` leaves, and
+        giving an instance its own is #2263's change, not this one."""
+        self.errors = []
+        self._collect(module)
+        fns = [item for item in module.items if isinstance(item, rast.FnDef)]
+        for item in module.items:
+            if isinstance(item, rast.ImplBlock):
+                fns.extend(item.methods)
+        for fn in fns:
+            if any(self.types.is_move_only(a) for a in getattr(fn, 'instance_args', ())):
+                self._check_fn(copy.deepcopy(fn))
+        self.errors = [e for e in self.errors if e.reason == ref_rules.MOVE_OUT_OF_REF]
+        self._drop_repeats()
+        return self.errors
+
+    def _collect(self, module: rast.Module) -> None:
+        """Type aliases and function signatures."""
+        self.types = MoveTypes(module)
         for item in module.items:
             if isinstance(item, rast.TypeAlias):
                 self.type_aliases[item.name] = item.target
@@ -338,24 +373,16 @@ class MoveChecker:
                     self.type_methods.setdefault((item.type_name, m.name), []).append(m)
                     self.method_impl[id(m)] = item
 
-        # Second pass: check functions and impl methods
-        for item in module.items:
-            if isinstance(item, rast.FnDef):
-                self._check_fn(item)
-            elif isinstance(item, rast.ImplBlock):
-                for m in item.methods:
-                    self._check_fn(m)
-
-        # A loop body checked twice (_check_loop) reports its errors twice.
+    def _drop_repeats(self) -> None:
+        """A loop body checked twice (_check_loop) reports its errors twice,
+        and so do two instances of one generic body."""
         seen = set()
         unique = []
         for err in self.errors:
-            key = (str(err), id(err.span) if err.span is not None else None)
-            if key not in seen:
-                seen.add(key)
+            if str(err) not in seen:
+                seen.add(str(err))
                 unique.append(err)
         self.errors = unique
-        return self.errors
 
     def _is_copy_type(self, ty: rast.Type) -> bool:
         """A type is Copy unless it is move-only (LANGUAGE_SPEC §13.1)."""
@@ -636,10 +663,10 @@ class MoveChecker:
             return False
 
         elif isinstance(stmt, rast.ForStmt):
-            # The iterator is moved into the loop, once. A lent parameter
-            # stays the caller's, so the loop only reads it.
+            # The iterator is moved into the loop, once. What a reference
+            # reaches stays its owner's, so the loop only reads it.
             self._check_expr(stmt.iter,
-                             is_move_context=self._lent_param(stmt.iter) is None)
+                             is_move_context=not self._through_reference(stmt.iter))
 
             def iteration():
                 self._push_scope()
@@ -777,7 +804,7 @@ class MoveChecker:
                 # (AGAST #2231).
                 if is_move_context and not self._is_copy_type(var_info.ritz_type):
                     if var_info.borrow == rast.Borrow.MUTABLE:
-                        self._reject_move_out(expr.name, expr.span)
+                        self._reject_move_out(expr.span)
                         return
                     var_info.state = VarState.MOVED
                     var_info.move_span = expr.span
@@ -801,11 +828,9 @@ class MoveChecker:
             elif expr.op == '*':
                 # Dereference - check the pointer expression
                 self._check_expr(expr.operand, is_move_context=False)
-                # `*t` of a `t:& T` is t's value, not a pointer's pointee.
-                lent = self._lent_param(expr)
-                if (is_move_context and lent is not None
-                        and not self._is_copy_type(self._infer_expr_type(expr.operand))):
-                    self._reject_move_out(lent, expr.span)
+                if is_move_context and self._through_reference(expr) \
+                        and self.types.is_move_only(self._place_type(expr)):
+                    self._reject_move_out(expr.span)
             else:
                 self._check_expr(expr.operand, is_move_context=False)
 
@@ -841,6 +866,7 @@ class MoveChecker:
             # by value (AGAST #2239). An argument moves when every method of
             # that name takes it by value.
             self._check_expr(expr.expr, is_move_context=self._method_takes_self(expr))
+            self._check_ref_receiver(expr)
             if not self._method_lends_self(expr):
                 # A temporary receiver taken by value is moved, not dropped.
                 self._unmark_temporary(expr.expr)
@@ -863,10 +889,9 @@ class MoveChecker:
         elif isinstance(expr, rast.Field):
             # Field access doesn't move the struct (unless the result is moved)
             self._check_expr(expr.expr, is_move_context=False)
-            lent = self._lent_param(expr)
-            if is_move_context and lent is not None:
+            if is_move_context and self._through_reference(expr):
                 if self.types.is_move_only(self._field_path_type(expr)):
-                    self._reject_move_out(lent, expr.span)
+                    self._reject_move_out(expr.span)
             elif is_move_context and self.types.is_move_only(self._field_path_type(expr)):
                 # Moving a move-only field out of a temporary: the rest of
                 # the temporary isn't dropped either (no partial drops).
@@ -877,6 +902,9 @@ class MoveChecker:
         elif isinstance(expr, rast.Index):
             self._check_expr(expr.expr, is_move_context=False)
             self._check_expr(expr.index, is_move_context=False)
+            if is_move_context and self._through_reference(expr) \
+                    and self.types.is_move_only(self._place_type(expr)):
+                self._reject_move_out(expr.span)
 
         elif isinstance(expr, rast.StructLit):
             field_types = dict(self.types.struct_fields(
@@ -894,9 +922,9 @@ class MoveChecker:
             self._mark_temporary(expr, is_move_context)
 
         elif isinstance(expr, rast.Match):
-            # A lent parameter stays the caller's, so matching it only reads.
+            # What a reference reaches stays its owner's: matching it only reads.
             self._check_expr(expr.expr,
-                             is_move_context=self._lent_param(expr.expr) is None)
+                             is_move_context=not self._through_reference(expr.expr))
             # The match owns a scrutinee it moved (AGAST #2177, ritz1 #2174).
             owned = self._owned_scrutinee_type(expr.expr)
             expr.owns_scrutinee = owned
@@ -1043,10 +1071,7 @@ class MoveChecker:
 
     def _lent_param(self, expr: rast.Expr) -> Optional[str]:
         """The `name:& T` parameter `expr` reads, if any: `t`, `t.f`, `t.f.g`
-        or `*t`. Its value belongs to the caller, so none of these can be
-        moved out. `@T`, `@&T` and `*T` parameters aren't tracked here: a
-        by-value use copies the reference, and only the slot it lands in
-        tells that from a copy of the referent (AGAST #2227)."""
+        or `*t`. Its value belongs to the caller."""
         while True:
             if isinstance(expr, rast.Field):
                 expr = expr.expr
@@ -1059,6 +1084,60 @@ class MoveChecker:
             if info is not None and info.borrow == rast.Borrow.MUTABLE:
                 return expr.name
         return None
+
+    def _place_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """The type of a place: a binding, `*p`, `p.f`, `p[i]` or a pointer
+        expression. Only the checks below read it: `_infer_expr_type` types
+        bindings, and `var x = a[0]` staying unknown there is #2268."""
+        if isinstance(expr, rast.Grouped):
+            return self._place_type(expr.expr)
+        if isinstance(expr, rast.UnaryOp) and expr.op == '*':
+            held = self.types.resolve(self._place_type(expr.operand))
+            # `*t` of a `t:& T` is t's value, and t's type is already T.
+            return held.inner if isinstance(held, (rast.PtrType, rast.RefType)) else held
+        if isinstance(expr, rast.Index):
+            held = self.types.resolve(self._place_type(expr.expr))
+            while isinstance(held, (rast.PtrType, rast.RefType, rast.ArrayType)):
+                inner = self.types.resolve(held.inner)
+                if isinstance(held, rast.ArrayType) or not isinstance(inner, rast.ArrayType):
+                    return inner
+                held = inner
+            return None
+        if isinstance(expr, rast.BinOp):
+            return self._place_type(expr.left)
+        if isinstance(expr, rast.Field):
+            base = self.types.resolve(self._place_type(expr.expr))
+            while isinstance(base, (rast.PtrType, rast.RefType)):
+                base = self.types.resolve(base.inner)
+            return self._part_type(base, expr.field)
+        return self._infer_expr_type(expr)
+
+    def _through_reference(self, expr: rast.Expr) -> bool:
+        """Does the place `expr` lie behind an `@T`, `@&T`, `*T` or `:&`? Its
+        value then has an owner elsewhere, so it can't be moved out."""
+        while True:
+            if isinstance(expr, rast.Grouped):
+                expr = expr.expr
+            elif isinstance(expr, (rast.Field, rast.Index)):
+                expr = expr.expr
+            elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
+                expr = expr.operand
+            else:
+                return self._lent_param(expr) is not None
+            if isinstance(self.types.resolve(self._place_type(expr)),
+                          (rast.PtrType, rast.RefType)):
+                return True
+
+    def _check_ref_receiver(self, call: rast.MethodCall) -> None:
+        """A by-value `self` method called on a reference to a move-only
+        value would take the value out from behind it."""
+        held = self.types.resolve(self._place_type(call.expr))
+        if not isinstance(held, (rast.PtrType, rast.RefType)):
+            return
+        while isinstance(held, (rast.PtrType, rast.RefType)):
+            held = self.types.resolve(held.inner)
+        if self.types.is_move_only(held) and self._takes_self_by_value(held, call.method):
+            self._reject_move_out(call.span)
 
     def _note_ref_slot(self, slot: Optional[rast.Type],
                        value: Optional[rast.Expr]) -> None:
@@ -1109,9 +1188,8 @@ class MoveChecker:
             return next((t for n, t in self.types.struct_fields(owner) if n == part), None)
         return None
 
-    def _reject_move_out(self, param: str, span: Optional[rast.Span]) -> None:
-        self.errors.append(OwnershipError(
-            f"cannot move out of borrowed parameter `{param}`", span))
+    def _reject_move_out(self, span: Optional[rast.Span]) -> None:
+        self.errors.append(OwnershipError(ref_rules.MOVE_OUT_OF_REF, span))
 
     # ---- moves out of a field (AGAST #2171) ----------------------------------
 
@@ -1246,10 +1324,12 @@ class MoveChecker:
         not by name across impls: moving a receiver wrongly rejects a valid
         program, and another type's method says nothing about this call. A
         method the receiver's type doesn't declare (a UFCS fallback) lends."""
-        ty = self._receiver_type(call.expr)
+        return self._takes_self_by_value(self._receiver_type(call.expr), call.method)
+
+    def _takes_self_by_value(self, ty: Optional[rast.Type], method: str) -> bool:
         if not isinstance(ty, rast.NamedType):
             return False
-        cands = self.type_methods.get((ty.name, call.method))
+        cands = self.type_methods.get((ty.name, method))
         if not cands:
             return False
         for m in cands:

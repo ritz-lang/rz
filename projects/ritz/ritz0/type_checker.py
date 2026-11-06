@@ -21,6 +21,7 @@ Built-in functions:
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 import bool_rules
+import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
 from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
@@ -49,6 +50,8 @@ class FnSig:
     ret_type: Optional[rast.Type]
     type_params: List[str] = field(default_factory=list)
     is_async: bool = False
+    # Indexes of `name:& T` params: the slot is the caller's place, not a `T`.
+    lent: Set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -87,8 +90,18 @@ class TypeChecker:
     # Numeric types (integers + floats)
     NUMERIC_TYPES = INT_TYPES | {'f32', 'f64'}
 
-    def __init__(self, module_names: Optional[Set[str]] = None):
+    def __init__(self, module_names: Optional[Set[str]] = None,
+                 slots_only: bool = False):
         self.errors: List[TypeError] = []
+
+        # Report only references in by-value slots (check_ref_slots).
+        self.slots_only = slots_only
+        # `name:& T` params of the current fn: `*name` is the `T` itself.
+        self.lent_locals: Set[str] = set()
+        # The slot an `if`, `match` or block's tails land in (_infer_into).
+        self._tail_slot: Optional[rast.Type] = None
+        # id(expr) already reported: a literal's elements are inferred twice.
+        self._slot_reported: Set[int] = set()
 
         # Imported modules, which qualify names: `token.Kind`
         self.module_names: Set[str] = set(module_names or ())
@@ -106,6 +119,9 @@ class TypeChecker:
 
         # Variant to enum mapping
         self.variant_to_enum: Dict[str, str] = {}
+        # How many enums declare each variant: an instance of a generic enum
+        # shares its variants' names with every other instance.
+        self.variant_owners: Dict[str, int] = {}
 
         # Trait implementations: trait_name -> set of type names that implement it
         self.trait_impls: Dict[str, Set[str]] = {}
@@ -116,8 +132,9 @@ class TypeChecker:
         self.scope_stack: List[Dict[str, rast.Type]] = []
         self.current_type_params: Set[str] = set()  # type parameters in scope (T, E, etc.)
 
-    def check(self, module: rast.Module) -> List[TypeError]:
-        """Type check a module. Returns list of errors."""
+    def check(self, module: rast.Module, emits_body=None) -> List[TypeError]:
+        """Type check a module. Returns list of errors. `emits_body`, if
+        given, picks the fns whose bodies are checked."""
         self.errors = []
 
         # First pass: collect all type definitions
@@ -153,15 +170,17 @@ class TypeChecker:
                     self._register_method(item, method)
 
         # Third pass: check function bodies
+        wanted = emits_body or (lambda _fn: True)
         for item in module.items:
-            if isinstance(item, rast.FnDef):
+            if isinstance(item, rast.FnDef) and wanted(item):
                 self._check_function(item)
 
         # Check impl methods
         for item in module.items:
             if isinstance(item, rast.ImplBlock):
                 for method in item.methods:
-                    self._check_function(method, item)
+                    if wanted(method):
+                        self._check_function(method, item)
 
         return self.errors
 
@@ -182,6 +201,7 @@ class TypeChecker:
         )
         for variant in enum.variants:
             self.variant_to_enum[variant.name] = enum.name
+            self.variant_owners[variant.name] = self.variant_owners.get(variant.name, 0) + 1
 
     def _register_function(self, fn: rast.FnDef):
         """Register function signature."""
@@ -190,7 +210,8 @@ class TypeChecker:
             params=[(p.name, p.type) for p in fn.params],
             ret_type=fn.ret_type,
             type_params=fn.type_params or [],
-            is_async=getattr(fn, 'is_async', False)
+            is_async=getattr(fn, 'is_async', False),
+            lent=self._lent_params(fn)
         )
 
     def _register_extern(self, fn: rast.ExternFn):
@@ -198,7 +219,8 @@ class TypeChecker:
         self.functions[fn.name] = FnSig(
             name=fn.name,
             params=[(p.name, p.type) for p in fn.params],
-            ret_type=fn.ret_type
+            ret_type=fn.ret_type,
+            lent=self._lent_params(fn)
         )
 
     def _register_method(self, impl: rast.ImplBlock, method: rast.FnDef):
@@ -209,8 +231,14 @@ class TypeChecker:
             name=mangled,
             params=[(p.name, p.type) for p in method.params],
             ret_type=method.ret_type,
-            type_params=method.type_params or []
+            type_params=method.type_params or [],
+            lent=self._lent_params(method)
         )
+
+    @staticmethod
+    def _lent_params(fn) -> Set[int]:
+        return {i for i, p in enumerate(fn.params)
+                if p.borrow == rast.Borrow.MUTABLE}
 
     def _push_scope(self):
         """Enter new scope."""
@@ -247,8 +275,11 @@ class TypeChecker:
             self.current_type_params |= set(impl.type_params or [])
 
         # Add parameters to scope
+        self.lent_locals = set()
         for param in fn.params:
             self.locals[param.name] = param.type
+            if param.borrow == rast.Borrow.MUTABLE:
+                self.lent_locals.add(param.name)
 
         # Check body
         self._check_block(fn.body, fn.ret_type)
@@ -263,7 +294,7 @@ class TypeChecker:
 
         # Check trailing expression matches expected return type
         if block.expr:
-            expr_type = self._infer_type(block.expr)
+            expr_type = self._infer_into(block.expr, expected_ret)
             if expected_ret and not self._value_fits(block.expr, expr_type, expected_ret):
                 self._error(f"block expression has type {self._type_str(expr_type)}, "
                           f"expected {self._type_str(expected_ret)}", block.expr.span)
@@ -272,7 +303,7 @@ class TypeChecker:
         """Type check a statement."""
         if isinstance(stmt, rast.VarStmt):
             if stmt.value:
-                init_type = self._infer_type(stmt.value)
+                init_type = self._infer_into(stmt.value, stmt.type)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
@@ -287,7 +318,7 @@ class TypeChecker:
 
         elif isinstance(stmt, rast.LetStmt):
             if stmt.value:
-                init_type = self._infer_type(stmt.value)
+                init_type = self._infer_into(stmt.value, stmt.type)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
@@ -317,7 +348,7 @@ class TypeChecker:
 
         elif isinstance(stmt, rast.ReturnStmt):
             if stmt.value:
-                ret_type = self._infer_type(stmt.value)
+                ret_type = self._infer_into(stmt.value, self._ret_slot())
                 if self.current_fn and self.current_fn.ret_type:
                     if not self._value_fits(stmt.value, ret_type, self.current_fn.ret_type):
                         self._error(f"return type {self._type_str(ret_type)} doesn't match "
@@ -325,7 +356,7 @@ class TypeChecker:
 
         elif isinstance(stmt, rast.AssignStmt):
             target_type = self._infer_type(stmt.target)
-            value_type = self._infer_type(stmt.value)
+            value_type = self._infer_into(stmt.value, target_type)
             if not self._value_fits(stmt.value, value_type, target_type):
                 self._error(f"cannot assign {self._type_str(value_type)} "
                           f"to {self._type_str(target_type)}", stmt.span)
@@ -432,12 +463,11 @@ class TypeChecker:
 
         elif isinstance(expr, rast.ReturnExpr):
             if expr.value:
-                self._infer_type(expr.value)
+                self._infer_into(expr.value, self._ret_slot())
             return rast.NamedType(expr.span, 'unknown', [])  # the never type
 
         elif isinstance(expr, rast.AssignExpr):
-            self._infer_type(expr.target)
-            return self._infer_type(expr.value)
+            return self._infer_into(expr.value, self._infer_type(expr.target))
 
         elif isinstance(expr, (rast.QualifiedIdent, rast.TypeExpr)):
             return rast.NamedType(expr.span, 'unknown', [])
@@ -461,12 +491,13 @@ class TypeChecker:
             return self._check_if(expr)
 
         elif isinstance(expr, rast.Block):
+            slot = self._take_tail_slot()
             self._push_scope()
             for stmt in expr.stmts:
                 self._check_stmt(stmt)
             result = rast.NamedType(expr.span, 'void', [])
             if expr.expr:
-                result = self._infer_type(expr.expr)
+                result = self._infer_into(expr.expr, slot)
             self._pop_scope()
             return result
 
@@ -643,6 +674,10 @@ class TypeChecker:
 
         elif expr.op == '*':
             # Dereference
+            if isinstance(expr.operand, rast.Ident) and expr.operand.name in self.lent_locals \
+                    and not isinstance(self._resolve_alias(operand_type),
+                                       (rast.PtrType, rast.RefType)):
+                return operand_type
             if isinstance(operand_type, rast.PtrType):
                 return operand_type.inner
             elif isinstance(operand_type, rast.RefType):
@@ -721,9 +756,10 @@ class TypeChecker:
 
             # A call through a local or global function pointer
             if fn_name in self.locals or fn_name in self.globals:
-                for arg in expr.args:
-                    self._infer_type(arg)
                 callee = self._lookup_var(fn_name)
+                slots = callee.params if isinstance(callee, rast.FnType) else []
+                for i, arg in enumerate(expr.args):
+                    self._infer_into(arg, slots[i] if i < len(slots) else None)
                 if isinstance(callee, rast.FnType):
                     return callee.ret or rast.NamedType(expr.span, 'void', [])
                 return rast.NamedType(expr.span, 'unknown', [])
@@ -731,6 +767,10 @@ class TypeChecker:
             # Check if it's an enum variant constructor
             if fn_name in self.variant_to_enum:
                 enum_name = self.variant_to_enum[fn_name]
+                # A bare `V(x)` of a name several enums declare says nothing
+                # about which: _check_parts knows when a slot does.
+                only = self.variant_owners[fn_name] == 1 and '$' not in enum_name
+                self._check_payload(expr.args, enum_name if only else None, fn_name)
                 return rast.NamedType(expr.span, enum_name, [])
 
             # Look up function
@@ -751,7 +791,15 @@ class TypeChecker:
             else:
                 # Check argument types
                 for i, (arg, (param_name, param_type)) in enumerate(zip(expr.args, fn_sig.params)):
-                    arg_type = self._infer_type(arg)
+                    if i in fn_sig.lent:
+                        # `name:& T` borrows a `T` place, and takes what
+                        # already points at one (§13.4).
+                        arg_type = self._infer_type(arg)
+                        if isinstance(self._resolve_alias(arg_type),
+                                      (rast.PtrType, rast.RefType)):
+                            continue
+                    else:
+                        arg_type = self._infer_into(arg, param_type)
                     if not self._value_fits(arg, arg_type, param_type):
                         self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
                                   f"got {self._type_str(arg_type)}", arg.span)
@@ -784,8 +832,7 @@ class TypeChecker:
         if isinstance(expr.expr, rast.Ident) and expr.expr.name in self.enums:
             enum = self.enums[expr.expr.name]
             if any(v.name == expr.method for v in enum.variants):
-                for arg in expr.args:
-                    self._infer_type(arg)
+                self._check_payload(expr.args, enum.name, expr.method)
                 return rast.NamedType(expr.span, enum.name, [])
 
         # Primitive and built-in-generic receivers have emitter-provided
@@ -803,11 +850,13 @@ class TypeChecker:
         # Look up method - try several name patterns
         fn_sig = None
         tried_names = []
+        own_method = False
 
         # Try exact match first
         mangled = f"{type_name}_{expr.method}"
         tried_names.append(mangled)
         fn_sig = self.functions.get(mangled)
+        own_method = fn_sig is not None
 
         if fn_sig is None:
             # For generic types like Vec<u8>, try base name (Vec_method)
@@ -816,6 +865,7 @@ class TypeChecker:
                 mangled = f"{base_name}_{expr.method}"
                 tried_names.append(mangled)
                 fn_sig = self.functions.get(mangled)
+                own_method = fn_sig is not None
 
         if fn_sig is None:
             # Try as free function (common for string_len, vec_push, etc.)
@@ -834,9 +884,14 @@ class TypeChecker:
                       expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
 
-        # Check args (receiver is already the first implicit arg)
-        for arg in expr.args:
-            self._infer_type(arg)
+        # Check args (receiver is already the first implicit arg). A method
+        # found by a looser name may take the receiver as an argument: its
+        # params don't line up, so the slots go unjudged.
+        skip = 1 if fn_sig.params and fn_sig.params[0][0] == 'self' else 0
+        for i, arg in enumerate(expr.args):
+            at = i + skip
+            lent = at in fn_sig.lent or at >= len(fn_sig.params) or not own_method
+            self._infer_into(arg, None if lent else fn_sig.params[at][1])
 
         return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
 
@@ -927,6 +982,7 @@ class TypeChecker:
 
     def _check_if(self, expr: rast.If) -> rast.Type:
         """Type check if expression."""
+        slot = self._take_tail_slot()
         cond_type = self._infer_type(expr.cond)
         if not self._is_bool_or_opaque(cond_type):
             self._error(f"if condition must be bool, got {self._type_str(cond_type)}",
@@ -937,7 +993,7 @@ class TypeChecker:
         for stmt in expr.then_block.stmts:
             self._check_stmt(stmt)
         if expr.then_block.expr:
-            then_type = self._infer_type(expr.then_block.expr)
+            then_type = self._infer_into(expr.then_block.expr, slot)
         self._pop_scope()
 
         if expr.else_block:
@@ -946,7 +1002,7 @@ class TypeChecker:
             for stmt in expr.else_block.stmts:
                 self._check_stmt(stmt)
             if expr.else_block.expr:
-                else_type = self._infer_type(expr.else_block.expr)
+                else_type = self._infer_into(expr.else_block.expr, slot)
             self._pop_scope()
 
             # Both branches should have same type
@@ -977,7 +1033,7 @@ class TypeChecker:
 
         for name, value in expr.fields:
             if name in expected_fields:
-                value_type = self._infer_type(value)
+                value_type = self._infer_into(value, expected_fields[name])
                 if not self._value_fits(value, value_type, expected_fields[name]):
                     self._error(f"field '{name}': expected {self._type_str(expected_fields[name])}, "
                               f"got {self._type_str(value_type)}", value.span)
@@ -986,6 +1042,7 @@ class TypeChecker:
 
     def _check_match(self, expr: rast.Match) -> rast.Type:
         """Type check match expression."""
+        slot = self._take_tail_slot()
         match_type = self._infer_type(expr.expr)
 
         result_type = None
@@ -997,7 +1054,7 @@ class TypeChecker:
                 if not self._is_bool_or_opaque(guard_type):
                     self._error(f"match guard must be bool", arm.guard.span)
 
-            arm_type = self._infer_type(arm.body)
+            arm_type = self._infer_into(arm.body, slot)
             if result_type is None:
                 result_type, result_body = arm_type, arm.body
             elif self._value_fits(arm.body, arm_type, result_type):
@@ -1058,6 +1115,80 @@ class TypeChecker:
                 for field_name, sub_pat in pattern.fields:
                     if field_name in field_types:
                         self._check_pattern(sub_pat, field_types[field_name])
+
+    # By-value slots (LANGUAGE_SPEC §13.2, AGAST #2336)
+
+    def _ret_slot(self) -> Optional[rast.Type]:
+        return self.current_fn.ret_type if self.current_fn else None
+
+    def _take_tail_slot(self) -> Optional[rast.Type]:
+        slot, self._tail_slot = self._tail_slot, None
+        return slot
+
+    def _infer_into(self, expr: rast.Expr, slot: Optional[rast.Type]) -> rast.Type:
+        """The type of `expr`, whose value lands in a `slot`-typed place.
+        `if`, `match` and block tails land there too, each in its own scope,
+        as do the parts of a literal the slot types."""
+        if isinstance(expr, rast.Grouped):
+            return self._infer_into(expr.expr, slot)
+        if isinstance(expr, (rast.If, rast.Match, rast.Block)):
+            self._tail_slot = slot
+            ty = self._infer_type(expr)
+            self._tail_slot = None
+            return ty
+        ty = self._infer_type(expr)
+        self._check_ref_slot(expr, ty, slot)
+        self._check_parts(expr, slot)
+        return ty
+
+    def _check_parts(self, expr: rast.Expr, slot: Optional[rast.Type]) -> None:
+        """The elements of a literal or the payload of a variant landing in
+        `slot`, which says what each part is."""
+        slot = self._resolve_alias(slot) if slot is not None else None
+        if isinstance(expr, rast.ArrayLit) and isinstance(slot, rast.ArrayType):
+            for element in expr.elements:
+                self._infer_into(element, slot.inner)
+        elif isinstance(expr, rast.ArrayFill) and isinstance(slot, rast.ArrayType):
+            self._infer_into(expr.value, slot.inner)
+        elif isinstance(expr, rast.TupleLit) and isinstance(slot, rast.TupleType):
+            for element, part in zip(expr.elements, slot.elements):
+                self._infer_into(element, part)
+        elif isinstance(slot, rast.NamedType) and slot.name in self.enums:
+            if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+                self._check_payload(expr.args, slot.name, expr.func.name)
+            elif isinstance(expr, rast.MethodCall):
+                self._check_payload(expr.args, slot.name, expr.method)
+        elif isinstance(slot, rast.NamedType) and isinstance(expr, rast.Call) \
+                and isinstance(expr.func, rast.Ident) and len(expr.args) == 1:
+            # The emitter's own Option and Result: the slot names the payload.
+            part = {'Some': 0, 'Ok': 0, 'Err': 1}.get(expr.func.name)
+            if slot.name in ('Option', 'Result') and part is not None and part < len(slot.args):
+                self._infer_into(expr.args[0], slot.args[part])
+
+    def _check_payload(self, args: List[rast.Expr], enum_name: Optional[str],
+                       variant: str) -> None:
+        """The arguments of `enum_name`'s `variant`, or of an unknown enum's."""
+        enum = self.enums.get(enum_name) if enum_name else None
+        found = next((v for v in enum.variants if v.name == variant), None) if enum else None
+        fields = found.fields if found is not None else []
+        for i, arg in enumerate(args):
+            self._infer_into(arg, fields[i] if i < len(fields) else None)
+
+    def _check_ref_slot(self, expr: rast.Expr, actual: rast.Type,
+                        slot: Optional[rast.Type]) -> None:
+        """An `@T`, `@&T` or `*T` doesn't fit a by-value `T` slot."""
+        if slot is None or actual is None or id(expr) in self._slot_reported:
+            return
+        actual = self._resolve_alias(actual)
+        slot = self._resolve_alias(slot)
+        if not isinstance(actual, (rast.PtrType, rast.RefType)) or self._is_opaque(slot):
+            return
+        if self._type_str(self._resolve_alias(actual.inner)) != self._type_str(slot):
+            return
+        self._slot_reported.add(id(expr))
+        addr = isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@', '&mut', '@&')
+        self._slot_error(ref_rules.ADDR_INTO_VALUE if addr else ref_rules.REF_INTO_VALUE,
+                         expr.span)
 
     # Helper methods
 
@@ -1333,4 +1464,18 @@ class TypeChecker:
 
     def _error(self, message: str, span: Optional[rast.Span]):
         """Record a type error."""
+        if not self.slots_only:
+            self.errors.append(TypeError(message, span))
+
+    def _slot_error(self, message: str, span: Optional[rast.Span]):
         self.errors.append(TypeError(message, span))
+
+
+def check_ref_slots(module: rast.Module, emits_body,
+                    module_names: Optional[Set[str]] = None) -> List[TypeError]:
+    """The by-value slot rule over a monomorphised module, for the fns
+    `emits_body` says this compile emits. `--check-types` is off by default and
+    sees generic bodies with `T` opaque, so this runs on every compile, after
+    monomorphisation, with the checker's other complaints switched off."""
+    checker = TypeChecker(module_names, slots_only=True)
+    return checker.check(module, emits_body)

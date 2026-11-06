@@ -33,6 +33,7 @@ SOURCES = \
 	ll_copy_scan \
 	narrowing \
 	let_check \
+	ref_check \
 	ownership \
 	emitter_expr_arith \
 	emitter_expr_access \

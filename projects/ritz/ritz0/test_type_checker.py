@@ -6,6 +6,7 @@ Validates that type errors are caught before code generation.
 
 import pytest
 from parser import parse
+from ref_rules import ADDR_INTO_VALUE
 from type_checker import TypeChecker, TypeError
 
 
@@ -473,3 +474,41 @@ fn main() -> i32
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+class TestLentParams:
+    """`name:& T` is the caller's place, not a by-value `T` (AGAST #2336): the
+    211 `expected T, got @T` reports #2227 counted were this."""
+
+    DEFS = """
+struct C
+    x: i32
+
+fn bump(c:& C) -> i32
+    c.x
+
+fn take(c: C) -> i32
+    c.x
+"""
+
+    @pytest.mark.parametrize("arg", ["@c", "@&c", "c"])
+    def test_lent_param_takes_a_place_or_a_reference(self, arg):
+        assert check(self.DEFS + f"""
+fn f() -> i32
+    var c = C {{ x: 1 }}
+    bump({arg})
+""") == []
+
+    def test_by_value_param_is_still_judged(self):
+        errors = check(self.DEFS + """
+fn f() -> i32
+    var c = C { x: 1 }
+    take(@c)
+""")
+        assert ADDR_INTO_VALUE in str(errors[0])
+
+    def test_deref_of_a_lent_param_is_its_value(self):
+        assert check(self.DEFS + """
+fn f(c:& C) -> i32
+    take(*c)
+""") == []

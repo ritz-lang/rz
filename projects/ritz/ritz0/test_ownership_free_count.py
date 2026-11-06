@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pytest
 
+from ref_rules import ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -150,9 +151,6 @@ ARRAY_ELEMENT_GAP = {"ritz1": 2266, "ritz1_selfhosted": 2266}
 
 # Unannotated bindings ritz1 can't type yet.
 BINDING_TYPE_GAP = {"ritz1": 2267, "ritz1_selfhosted": 2267}
-
-# A value moved out through a reference: what that means is #2227's question.
-THROUGH_REFERENCE_GAP = {c: 2227 for c in COMPILERS}
 
 # Shapes a move out of a tuple element can take (AGAST #2244).
 TUPLES = """\
@@ -576,23 +574,6 @@ pub fn main() -> i32
     f()
     return DROPS
 """, 1, {"ritz0": 2269}),
-
-    # `var x = r.t` through `@T` copies the referent, so its owner and `x`'s new
-    # owner both drop it. #2243 only removes the third drop, `x`'s own.
-    "field_binding_through_reference": (SLOT + FIELDS + """\
-fn g(r: @Holder) -> i32
-    var x = r.t
-    return consume(x)
-
-fn f() -> i32
-    var h = make_holder(1)
-    g(@h)
-    return 0
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, THROUGH_REFERENCE_GAP),
 
     # AGAST #2257: a binding from a method call has the method's return type,
     # so it moves. Each of these dropped one value twice on ritz0.
@@ -2237,21 +2218,6 @@ pub fn main() -> i32
     return DROPS
 """, 1, NO_TUPLES),
 
-    # What a move through a reference means is #2227's question.
-    "tuple_element_through_reference": (TUPLES + SLOT + """\
-fn g(r: @(Tracked, i64)) -> i32
-    var x = r.0
-    return consume(x)
-
-fn f()
-    var p = (make(1), 2)
-    g(@p)
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, THROUGH_REFERENCE_GAP),
-
     # Gaps next to #2244.
     "tuple_destructure_moved": (TUPLES + SLOT + """\
 fn f()
@@ -2330,6 +2296,48 @@ pub fn main() -> i32
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
+# AGAST #2227's double drops: one value reached through a reference, and a second
+# owner made of it. Each dropped twice or failed at clang, and is refused now.
+BURN = """\
+impl Tracked
+    fn burn(self: Tracked) -> i32
+        return self.id
+
+"""
+
+TAIL = """\
+
+pub fn main() -> i32
+    return 0
+"""
+
+THROUGH_REFERENCE = {
+    "field_binding_through_reference": (SLOT + FIELDS + """\
+fn g(r: @Holder) -> i32
+    var x = r.t
+    return consume(x)
+""" + TAIL, MOVE_OUT_OF_REF, {}),
+    "tuple_element_through_reference": (TUPLES + SLOT + """\
+fn g(r: @(Tracked, i64)) -> i32
+    var x = r.0
+    return consume(x)
+""" + TAIL, MOVE_OUT_OF_REF, NO_TUPLES),
+    "address_of_into_by_value": ("fn g(t: Tracked) -> i32\n    return consume(@t)\n" + TAIL,
+                                 ADDR_INTO_VALUE, {}),
+    "deref_of_a_reference": ("fn g(r: @Tracked) -> i32\n    return consume(*r)\n" + TAIL,
+                             MOVE_OUT_OF_REF, {}),
+    "deref_of_a_pointer": ("fn g(p: *Tracked) -> i32\n    return consume(*p)\n" + TAIL,
+                           MOVE_OUT_OF_REF, {}),
+    "field_into_by_value": ("fn g(p: @Holder) -> i32\n    return consume(p.t)\n" + TAIL,
+                            MOVE_OUT_OF_REF, {}),
+    "reference_into_by_value": ("fn g(p: @Tracked) -> i32\n    return consume(p)\n" + TAIL,
+                                REF_INTO_VALUE, {}),
+    "reference_returned": ("fn g(p: @Tracked) -> Tracked\n    return p\n" + TAIL,
+                           REF_INTO_VALUE, {}),
+    "by_value_self": (BURN + "fn g(p: @Tracked) -> i32\n    return p.burn()\n" + TAIL,
+                      MOVE_OUT_OF_REF, {}),
+}
+
 USE_AFTER_MOVE = {
     "after_move_into_callee": ("""\
 pub fn main() -> i32
@@ -2671,6 +2679,21 @@ def test_free_count(request, tmp_path, compiler, name):
     assert link.returncode == 0, f"{compiler}: link failed:\n{link.stderr[-2000:]}"
     rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
     assert rc == expected, f"{compiler} {name}: exit {rc}, spec says {expected}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,name", _params(THROUGH_REFERENCE))
+def test_second_owner_through_a_reference_rejected(request, tmp_path, compiler, name):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    body, message, _ = THROUGH_REFERENCE[name]
+    src = _write(tmp_path, body)
+    ll = tmp_path / "main.ll"
+    comp = _compile(compiler, src, ll, tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert message in out, out[-2000:]
 
 
 @pytest.mark.integration

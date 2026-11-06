@@ -2144,6 +2144,73 @@ fn main() -> i32
     r.handle                        # error: r was moved
 ```
 
+A reference isn't its referent. An `@T`, `@&T` or `*T` doesn't fit a by-value
+`T` slot: an argument, a `let` or `var` of type `T`, `=`, `return`, a function's
+tail, a field, an element, a variant's payload, or an `if` or `match` arm of any
+of these. There's no implicit deref, so write `*r`:
+
+```ritz
+struct Point
+    x: i32
+    y: i32
+
+fn sum(p: Point) -> i32
+    p.x + p.y
+
+fn twice(r: @Point) -> i32
+    sum(*r) + r.x + r.y             # `*r` and `r.x` read through r
+
+fn main() -> i32
+    let a = Point { x: 1, y: 2 }
+    twice(@a)
+```
+
+```ritz expect-error="a reference or pointer doesn't fit a by-value slot"
+struct Point
+    x: i32
+    y: i32
+
+fn sum(p: Point) -> i32
+    p.x + p.y
+
+fn twice(r: @Point) -> i32
+    sum(r)                          # error: write `*r`
+
+fn main() -> i32
+    let a = Point { x: 1, y: 2 }
+    twice(@a)
+```
+
+`*r`, `r.f`, `p[i]` and a by-value `self` method read through a reference. That's
+a copy for a copy type. For a move-only type it would leave the value with two
+owners, so using one by value is an error, for `@T`, `@&T`, `*T` and `name:& T`
+alike. Reading a copy field of it, borrowing it and `match`ing it are fine. A
+generic body is judged at each type it's instantiated with: `*p` compiles at
+`T = i32` and is this error at a move-only `T`.
+
+```ritz expect-error="cannot move out of a reference"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn steal(r: @Resource) -> i32
+    consume(*r)                     # error: the caller still owns it
+
+fn main() -> i32
+    var r = Resource { handle: 3 }
+    steal(@r)
+```
+
+Raw pointers get no exception. Code that keeps values in raw memory takes them
+out with `ptr_read<T>(p)` from `ritzlib.ptr`, a bitwise read whose caller becomes
+the owner. The memory at `p` then no longer holds a value.
+
 Copying a copy type that owns a buffer, such as today's `String`, gives two
 bindings that name the same buffer. Only one of them may release it, and the
 compiler doesn't track which one does that:
@@ -2170,6 +2237,18 @@ fn main() -> i32
     let n = string_len(@s)          # borrow for the call
     string_drop(@&s)
     n as i32
+```
+
+`@x` is a reference, so it goes where a reference goes. Into a by-value slot it's
+the §13.2 error, and the `@` is what to remove:
+
+```ritz expect-error="`@x` doesn't fit a by-value slot: drop the `@`"
+fn double(n: i32) -> i32
+    n * 2
+
+fn main() -> i32
+    let n: i32 = 4
+    double(@n)
 ```
 
 ### 13.4 Mutable Borrowing
@@ -2240,11 +2319,11 @@ fn main() -> i32
 ```
 
 The caller keeps ownership of what it lends, so a `name:& T` parameter of a
-move-only type can't be moved out of. Using the parameter by value, or using
-one of its move-only fields or `*name` by value, is an error. Everything that
-leaves the caller as the only owner is allowed: reading and writing through
-the parameter, lending it on, `match`ing or iterating over it, and putting it
-in a reference. `@T`, `@&T` and `*T` parameters aren't checked this way yet.
+move-only type can't be moved out of, like anything behind a reference (§13.2).
+Using the parameter by value, or using one of its move-only fields or `*name` by
+value, is an error. Everything that leaves the caller as the only owner is
+allowed: reading and writing through the parameter, lending it on, `match`ing or
+iterating over it, and putting it in a reference.
 
 A `name:& T` parameter reads as its referent, except where the value lands in
 an `@T` or `@&T`, or a `*T` of a struct or array: that takes the borrow's
@@ -2269,7 +2348,7 @@ fn main() -> i32
     c.n
 ```
 
-```ritz expect-error="cannot move out of borrowed parameter `r`"
+```ritz expect-error="cannot move out of a reference"
 struct Resource
     handle: i32
 

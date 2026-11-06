@@ -2,7 +2,7 @@
 dereference, `@*e` and `@&*e`:
 
     fn tab_history_go_back(history:& TabHistory) -> Option<HistoryEntry>
-        if tab_history_can_go_back(@*history) == 0
+        if tab_history_can_go_back(history) == 0
 
 ritz1's `addr_expr` was `AT AMP addr_expr | AT addr_expr | postfix_expr`. A
 deref is a unary, not a postfix, so `@*history` failed to parse and the item
@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from ref_rules import ADDR_INTO_VALUE
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -52,8 +53,8 @@ pub fn main() -> i32
     return f(@*p)
 """
 
-# `@*h` for `h: *H` into a by-value `H` param (the tempest call shape, through
-# a raw pointer, which ritz0 can compile).
+# `@*h` for `h: *H` into a by-value `H` param isn't a read of h: the `@` goes
+# (§13.3, AGAST #2336). tempest called this way until then.
 PTR_TO_VALUE_PARAM = """\
 struct H
     i: i32
@@ -68,7 +69,6 @@ pub fn main() -> i32
 
 ORACLE = {
     "ptr_to_ptr_param": PTR_TO_PTR_PARAM,
-    "ptr_to_value_param": PTR_TO_VALUE_PARAM,
 }
 
 # --- programs ritz0 gets wrong (#2045); the expected answer is the spec --------
@@ -86,8 +86,8 @@ pub fn main() -> i32
     return g(@&x)
 """
 
-# tempest lib/history.ritz:72 exactly: `:&` borrow, by-value param, the call
-# in an `if` condition, then a write through the borrow.
+# tempest lib/history.ritz:72: `:&` borrow, by-value param, the call in an `if`
+# condition, then a write through the borrow.
 TEMPEST = """\
 struct TabHistory
     current_index: i32
@@ -98,7 +98,7 @@ fn tab_history_can_go_back(history: TabHistory) -> i32
     return 0
 
 fn tab_history_go_back(history:& TabHistory) -> i32
-    if tab_history_can_go_back(@*history) == 0
+    if tab_history_can_go_back(history) == 0
         return 100
     history.current_index = history.current_index - 1
     return history.current_index
@@ -322,6 +322,27 @@ def test_ritz1_addr_of_deref(ritz1_bin, tmp_path, name):
 def test_ritz0_addr_of_deref(tmp_path, name):
     """AGAST #2045: ritz0 lowers `@*e` / `@&*e` to `e`, not to a copy of `*e`."""
     assert _run("ritz0", None, tmp_path, name, SPEC[name]) == 3
+
+
+@pytest.mark.integration
+def test_ritz0_refuses_an_address_of_deref_into_a_value(tmp_path):
+    src = tmp_path / "main.ritz"
+    src.write_text(PTR_TO_VALUE_PARAM)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    r = run_ritz0([str(src), "-o", str(tmp_path / "main.ll")], cwd=tmp_path, env=env, timeout=300)
+    assert r.returncode != 0
+    assert ADDR_INTO_VALUE in r.stderr, r.stderr
+
+
+@pytest.mark.integration
+def test_ritz1_refuses_an_address_of_deref_into_a_value(ritz1_bin, tmp_path):
+    src = tmp_path / "main.ritz"
+    src.write_text(PTR_TO_VALUE_PARAM)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    r = subprocess.run([str(ritz1_bin), str(src), "-o", str(tmp_path / "main.ll")],
+                       cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode != 0
+    assert ADDR_INTO_VALUE in r.stdout + r.stderr, r.stdout + r.stderr
 
 
 @pytest.mark.integration

@@ -432,7 +432,7 @@ def test_ritz0_move_out_of_lent_param_rejected(tmp_path, name):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
-    assert f"cannot move out of borrowed parameter `{param}`" in out, out[-2000:]
+    assert "cannot move out of a reference" in out, out[-2000:]
 
 
 # Moves out of a nested field (AGAST #2232). `m.d.t` is 1, `m.d.u` 2, `m.x` 3.
@@ -1016,7 +1016,7 @@ pub fn main() -> i32
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
-    assert "cannot move out of borrowed parameter `t`" in out, out[-2000:]
+    assert "cannot move out of a reference" in out, out[-2000:]
 
 
 # A by-value receiver moves into the method, which drops it (AGAST #2239).
@@ -1204,7 +1204,7 @@ def test_ritz0_by_value_receiver_of_lent_param_rejected(tmp_path, name):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"accepted a move out of a borrow:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
-    assert f"cannot move out of borrowed parameter `{param}`" in out, out[-2000:]
+    assert "cannot move out of a reference" in out, out[-2000:]
 
 
 @pytest.mark.parametrize("name", sorted(RUNS))

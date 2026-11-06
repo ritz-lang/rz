@@ -6,7 +6,9 @@ Phase 9: Ownership & Borrowing
 
 import pytest
 from parser import parse
+from monomorph import monomorphize
 from move_checker import MoveChecker, OwnershipError
+from ref_rules import MOVE_OUT_OF_REF
 import ritz_ast as rast
 
 
@@ -923,7 +925,7 @@ fn f(t:& Res) -> i32
     def test_move_out_is_rejected(self, body, param):
         errs = check(self.DEFS + body)
         assert len(errs) == 1, errs
-        assert f"cannot move out of borrowed parameter `{param}`" in str(errs[0])
+        assert f"cannot move out of a reference" in str(errs[0])
 
     def test_ticket_repro(self):
         """The program AGAST #2231 reported."""
@@ -937,7 +939,7 @@ fn main() -> i32
     return 0
 """)
         assert len(errs) == 1
-        assert "cannot move out of borrowed parameter `t`" in str(errs[0])
+        assert "cannot move out of a reference" in str(errs[0])
 
     def test_rejected_move_does_not_mark_moved(self):
         """Each by-value use is its own error, and neither says "moved":
@@ -948,7 +950,7 @@ fn f(t:& Res) -> i32
     return eat(t)
 """)
         assert len(errs) == 2
-        assert all("cannot move out of borrowed parameter `t`" in str(e) for e in errs)
+        assert all("cannot move out of a reference" in str(e) for e in errs)
 
     def test_error_points_at_the_use(self):
         errs = check(self.DEFS + """
@@ -1214,7 +1216,7 @@ impl Wrap
         same move out as `eat(t)` (AGAST #2239)."""
         errs = check(self.DEFS + body)
         assert len(errs) == 1, errs
-        assert f"cannot move out of borrowed parameter `{param}`" in str(errs[0])
+        assert f"cannot move out of a reference" in str(errs[0])
 
     def test_lending_receivers_are_accepted(self):
         """Control: a method that borrows its receiver only reads it."""
@@ -1448,14 +1450,16 @@ fn f(t:= T) -> i32
 """) == []
 
     def test_pointer_receiver_does_not_move_the_pointer(self):
-        """Control: `@T` and `*T` copy; what a by-value method on one should
-        mean is the #2227 question."""
-        assert check(self.DEFS + """
+        """`@T` and `*T` copy, but a by-value method would take the T out from
+        behind them (AGAST #2336). Each call is refused, and nothing is marked
+        moved: the second call is its own error, not a use after move."""
+        errors = check(self.DEFS + """
 fn f(r: @T, p: *T) -> i32
     r.burn()
     p.burn()
     return r.burn() + p.burn()
-""") == []
+""")
+        assert [e.reason for e in errors] == [MOVE_OUT_OF_REF] * 4
 
 
 class TestMethodCallBindingType:
@@ -1708,7 +1712,9 @@ fn f(h: Res) -> Result<i32, i32>
         self.assert_moved(errors, "x")
 
     def test_deref_of_a_pointer_field(self):
-        self.assert_moved(self.body("var x = *r.p\neat(x)\neat(x)", "r: Refs"), "x")
+        """What a pointer field points at isn't the holder's to give away."""
+        errors = self.body("var x = *r.p\neat(x)", "r: Refs")
+        assert [e.reason for e in errors] == [MOVE_OUT_OF_REF]
 
     def test_match_owns_the_binding(self):
         self.assert_moved(self.body(
@@ -1752,20 +1758,16 @@ fn f(d: D) -> i32
     def test_lent_owner_is_rejected(self):
         errors = self.body("var x = h.t", "h:& H")
         assert len(errors) == 1
-        assert "cannot move out of borrowed parameter `h`" in str(errors[0])
+        assert "cannot move out of a reference" in str(errors[0])
 
     def test_lent_owner_copy_field(self):
         assert self.body("var x = h.n\neat_i(x)\neat_i(x)", "h:& H") == []
 
     @pytest.mark.parametrize("param", ["h: @H", "h: @&H", "h: *H"])
-    def test_reference_owner_binding_moves(self, param):
-        self.assert_moved(self.body("var x = h.t\neat(x)\neat(x)", param), "x")
-
-    @pytest.mark.parametrize("param", ["h: @H", "h: @&H", "h: *H"])
     def test_reference_owner_keeps_its_field(self, param):
-        """Control: nothing tracks a move through a reference. What `var x =
-        h.t` should mean there is the #2227 question."""
-        assert self.body("var x = h.t\nvar y = h.t", param) == []
+        """The field stays its owner's, so each read is refused (AGAST #2336)."""
+        errors = self.body("var x = h.t\nvar y = h.t", param)
+        assert [e.reason for e in errors] == [MOVE_OUT_OF_REF] * 2
 
     # ---- what stays a copy ----
 
@@ -2324,23 +2326,21 @@ fn mk() -> (T, i32)
     def test_lent_tuple_is_rejected(self):
         errors = self.body("eat(l.0)", "l:& (T, i32)")
         assert len(errors) == 1
-        assert "cannot move out of borrowed parameter `l`" in str(errors[0])
+        assert "cannot move out of a reference" in str(errors[0])
 
     def test_lent_tuple_copy_element(self):
         assert self.body("eat_i(l.1)\neat_i(l.1)", "l:& (T, i32)") == []
 
     @pytest.mark.parametrize("param", ["r: @(T, i32)", "r: *(T, i32)"])
     def test_reference_owner_keeps_its_element(self, param):
-        """Control: a move through a reference is #2227's question."""
-        assert self.body("eat(r.0)\neat(r.0)", param) == []
-
-    @pytest.mark.parametrize("param", ["r: @(T, i32)", "r: *(T, i32)"])
-    def test_binding_through_a_reference_moves(self, param):
-        self.assert_moved(self.body("var x = r.0\neat(x)\neat(x)", param), "x")
+        """The element stays its owner's (AGAST #2336)."""
+        errors = self.body("eat(r.0)\neat(r.0)", param)
+        assert [e.reason for e in errors] == [MOVE_OUT_OF_REF] * 2
 
     def test_path_leaving_through_a_pointer_element(self):
-        """Control: `e.0` is a pointer, so nothing owns what it points to."""
-        assert self.body("eat(e.0.t)\neat(e.0.t)", "e: (*H, i32)") == []
+        """`e.0` is a pointer, so what it points to has an owner elsewhere."""
+        errors = self.body("eat(e.0.t)\neat(e.0.t)", "e: (*H, i32)")
+        assert [e.reason for e in errors] == [MOVE_OUT_OF_REF] * 2
 
     # ---- what the element's type feeds ----
 
@@ -2387,3 +2387,56 @@ fn f(r: (Result<T, i32>, i32)) -> Result<i32, i32>
 
     def test_literal_takes_the_element(self):
         self.assert_moved(self.body("var a = (p.0, 1)\neat(p.0)"), "p.0")
+
+
+class TestGenericInstances:
+    """`check_instances` judges moves out of a reference at each `T` (AGAST
+    #2336), and nothing else: what a generic body otherwise does at a move-only
+    `T` is #2263's."""
+
+    DEFS = drop_impl("T") + """
+struct T
+    id: i32
+
+fn eat<X>(x: X) -> i32
+    0
+"""
+
+    def instances(self, body):
+        module = monomorphize(parse(self.DEFS + body))
+        return module, [i for i in module.items
+                        if isinstance(i, rast.FnDef) and getattr(i, 'is_monomorphized', False)]
+
+    def test_a_move_out_is_reported_at_a_move_only_type(self):
+        module, _ = self.instances("""
+fn read<X>(p: *X) -> X
+    return *p
+
+fn f(p: *T) -> T
+    return read<T>(p)
+""")
+        assert [e.reason for e in MoveChecker().check_instances(module)] == [MOVE_OUT_OF_REF]
+
+    def test_a_use_after_move_stays_2263s(self):
+        module, _ = self.instances("""
+fn twice<X>(x: X) -> i32
+    return eat<X>(x) + eat<X>(x)
+
+fn f(t: T) -> i32
+    return twice<T>(t)
+""")
+        assert MoveChecker().check_instances(module) == []
+
+    def test_the_emitted_instance_is_left_unmarked(self):
+        """The emitter reads the marks `check` leaves on a body, so checking an
+        instance must not change what it compiles to."""
+        module, fns = self.instances("""
+fn take<X>(x: X) -> X
+    var y = x
+    return y
+
+fn f(t: T) -> T
+    return take<T>(t)
+""")
+        MoveChecker().check_instances(module)
+        assert fns and all(not hasattr(fn, 'field_moves') for fn in fns)

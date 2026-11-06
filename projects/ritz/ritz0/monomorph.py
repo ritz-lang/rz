@@ -1120,6 +1120,7 @@ class Monomorphizer:
         # Mark as monomorphized - these should be emitted locally in each consuming module
         # Don't preserve source_file so _should_emit_body returns True
         new_fn.is_monomorphized = True
+        new_fn.instance_args = list(subst.mapping.values())
         return new_fn
 
     def _specialize_impl(self, generic_impl: rast.ImplBlock, mangled_type_name: str,
@@ -1182,6 +1183,7 @@ class Monomorphizer:
         # Mark as monomorphized - emit locally in each consuming module
         # Don't preserve source_file so _should_emit_body returns True
         new_fn.is_monomorphized = True
+        new_fn.instance_args = list(subst.mapping.values())
         return new_fn
 
     def _specialize_block(self, block: rast.Block, subst: TypeSubstitution) -> rast.Block:

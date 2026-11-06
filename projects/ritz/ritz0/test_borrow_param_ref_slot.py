@@ -756,7 +756,7 @@ pub fn main() -> i32
 """
     comp, ll, _ = _compile("ritz0", None, tmp_path, name, program)
     assert comp.returncode != 0
-    assert "cannot move out of borrowed parameter `t`" in comp.stdout + comp.stderr
+    assert "cannot move out of a reference" in comp.stdout + comp.stderr
 
 
 @pytest.mark.integration

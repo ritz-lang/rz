@@ -638,7 +638,7 @@ fn g(a: [4]i32) -> i32
     return a[3]
 
 fn f(p: *[4]i32) -> i32
-    return g(p)
+    return g(*p)
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
@@ -650,7 +650,7 @@ fn g(a: [4]i32) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return g(@a)
+    return g(a)
 """,
     "span_arg": """\
 import ritzlib.span

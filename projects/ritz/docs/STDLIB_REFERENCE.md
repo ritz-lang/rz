@@ -40,6 +40,7 @@ Ritzlib is built on three core principles:
    - [drop](#drop) - Automatic cleanup trait
    - [hash](#hash) - Hashing utilities
 2. [Memory Management](#memory-management)
+   - [ptr](#ptr) - Taking a value out of raw memory
    - [memory](#memory) - Allocators (Arena, Heap, malloc/free)
    - [box](#box) - Heap-allocated single values
    - [heap](#heap) - Heap keyword support
@@ -217,6 +218,25 @@ FNV-1a hash functions for use in HashMap and other data structures.
 ---
 
 ## Memory Management
+
+### ptr
+
+**Module**: `ritzlib.ptr`
+
+`*p` of a move-only value is an error (LANGUAGE_SPEC §13.2), so code that keeps
+values in raw memory reads them with `ptr_read`.
+
+```ritz
+import ritzlib.ptr
+
+fn main() -> i32
+    var n: i32 = 3
+    ptr_read<i32>(@n)
+```
+
+`ptr_read<T>(p: *T) -> T` is a bitwise read. The caller owns the result, and the
+memory at `p` no longer holds a value: reading it again or dropping it is a
+double drop.
 
 ### memory
 
