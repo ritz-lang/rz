@@ -915,6 +915,22 @@ else
     print("many\n")
 ```
 
+A condition is a `bool`. That holds for `if`, `while` and `assert`. Nothing else
+is truthy, so test an integer with `n != 0` and a pointer with `p != null`:
+
+```ritz body expect-error="if condition must be bool, got an integer: write `x != 0`"
+let n = 1
+if n
+    print("non-zero\n")
+```
+
+```ritz body expect-error="while condition must be bool, got an integer: write `x != 0`"
+while 1
+    break
+```
+
+Write an endless loop as `loop`.
+
 `if` is also an **expression**: an `if`/`else` whose branches end in a value can
 initialise a binding, and it lowers to a real LLVM `phi` rather than to a
 temporary:
@@ -1086,6 +1102,19 @@ let either = a or b     # short-circuit OR
 let neither = not a     # NOT
 ```
 
+The operands of `and`, `or` and `not` are `bool`, and so is the result. `&&`, `||`
+and `!` are the same operators.
+
+```ritz body expect-error="operand of `and` must be bool, got an integer: write `x != 0`"
+let both = 2 and 1
+```
+
+```ritz body expect-error="operand of `not` must be bool, got a pointer: write `p != null`"
+var n: i64 = 0
+let p: *i64 = @n
+let none = not p
+```
+
 ### 7.4 Bitwise
 
 ```ritz body
@@ -1099,6 +1128,24 @@ let shl = a << 1
 let shr = a >> 1
 ```
 
+Both operands are integers, and so is the operand of `~`. A `bool` is rejected,
+even with another `bool`: use `and`, `or` and `not`.
+
+Bitwise operators bind looser than `==`, so `x & 1 == 1` is `x & (1 == 1)`, which
+is an error. Parenthesise it:
+
+```ritz body expect-error="operand of `&` must be an integer, got bool: `x & 1 == 1` is `x & (1 == 1)`: parenthesise `(x & 1) == 1`"
+let x = 6
+if x & 1 == 1
+    print("odd\n")
+```
+
+```ritz body expect-error="operand of `&` must be an integer, got bool"
+let a = true
+let b = false
+let c = a & b
+```
+
 ### 7.5 Type Casting
 
 ```ritz body
@@ -1106,6 +1153,50 @@ let x: i64 = 42 as i64
 let p: *u8 = null as *u8
 let addr: i64 = p as i64
 ```
+
+#### `bool` converts to nothing
+
+`bool` is its own type. No `let`, `var`, `return`, tail, argument, field, element
+or assignment turns a `bool` into an integer, or anything into a `bool`, and `==`
+and `!=` need both sides the same kind. Arithmetic on a `bool` is an error too.
+
+```ritz body expect-error="cannot use an integer as bool: write `x != 0`"
+let b: bool = 2
+```
+
+```ritz expect-error="cannot use bool as an integer: write `b as i32`"
+fn same(a: i64, b: i64) -> i32
+    return a == b
+
+fn main() -> i32
+    same(1, 1)
+```
+
+```ritz body expect-error="cannot compare bool with an integer"
+let b = true
+if b == 1
+    print("yes\n")
+```
+
+`b as i32`, or a cast to any other integer type, is 0 or 1:
+
+```ritz body
+let n = (2 > 1) as i32      # 1
+```
+
+`x as bool` is removed. Write the comparison you mean:
+
+```ritz body expect-error="`as bool` is removed: write `x != 0`"
+let b = 256 as bool
+```
+
+A `bool` has no cast to a float or a pointer.
+
+ritz0, ritz1 and ritz1_selfhosted give the same located error for each of these,
+and `ritz0/test_bool_type.py` runs one table through all three. ritz0 reads the
+type off the value it just emitted. ritz1 keeps a `bool` in an `i64` register, so
+it works the type out from the expression. A condition ritz1 can't type is an
+error, not a guess.
 
 #### Implicit narrowing is an error
 

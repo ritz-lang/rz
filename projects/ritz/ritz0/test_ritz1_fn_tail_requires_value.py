@@ -127,7 +127,7 @@ RITZ1_EXTRA_REJECTED = {
     # `true` and `1` share an int literal in ritz1.
     "while_one_is_not_while_true": (
         "fn f(n: i64) -> i64\n"
-        "    while 1\n"
+        "    while 1 == 1\n"
         "        if n > 0\n"
         "            return 1\n", 2),
     "while_not_false_is_not_while_true": (

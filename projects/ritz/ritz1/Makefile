@@ -42,6 +42,7 @@ SOURCES = \
 	emitter_match \
 	enum_as_int \
 	must_use \
+	bool_check \
 	tail_value \
 	emitter_stmt \
 	emitter \

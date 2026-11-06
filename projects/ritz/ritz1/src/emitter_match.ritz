@@ -54,6 +54,7 @@ import emitter_print         # interp_is_bool (AGAST #2344)
 import emitter_stmt          # emit_stmt, for block-bodied arms (AGAST #1454)
 import enum_as_int          # enum_as_int_expr (AGAST #2136)
 import ownership            # arm scopes for drops (AGAST #2158)
+import bool_check   # AGAST #2342
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
@@ -436,6 +437,17 @@ fn publish_match_type(s: *EmitterState, result: *MatchResult)
         s.last_match_agg_name_len = 0
         s.last_match_float_ty = result.float_ty
 
+# AGAST #2342: what `Constructor(v)` binds, as bool_kind would say.
+fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32) -> i32
+    if enum_name == null or enum_name_len <= 0
+        return BK_UNSURE
+    if is_tagged_enum_type(enum_name, enum_name_len) == 1
+        return bk_tagged_payload(enum_name, enum_name_len, 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len))
+    let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, user_arm_variant(enum_name, enum_name_len, arm))
+    if uf == null
+        return BK_UNSURE
+    bk_of_type(uf.field_type, uf.field_type_name, uf.field_type_name_len)
+
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
 # name is bound to the extracted payload for the duration of the arm body,
@@ -497,6 +509,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                     emit_reg(s, alloca_reg)
                     emit_str(s, c"\n")
                     add_local(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, bind_type)
+                    if bind_ft == 0
+                        bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
 
     # A catch-all name over a scalar (`other => other + 1`) binds the
     # scrutinee, as in ritz0 (LANGUAGE_SPEC §8.2).  Not a const (that arm
@@ -513,6 +527,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
             emit_reg(s, bind_reg)
             emit_str(s, c"\n")
             add_local(s, arm.pattern_name, arm.pattern_name_len, bind_reg, TYPE_I64)
+            bool_note_binding(s, s.match_scrut_kind)   # AGAST #2342
 
     # Block-bodied / statement arm (AGAST #1454, #1617): run the leading
     # statements in the arm's own scope (they are popped with the payload
@@ -532,7 +547,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         enum_as_int_expr(s, arm.body)   # AGAST #2136: call arguments
         # AGAST #2046: a match / if nested as the arm never reports its own
         # valueless arm; it returns no value and this match decides.
-        let nested: i32 = arm.body.kind == EXPR_MATCH or arm.body.kind == EXPR_IF
+        let nested: bool = arm.body.kind == EXPR_MATCH or arm.body.kind == EXPR_IF
         if nested
             s.match_no_value = 1
         own_check_arm(s, arm.body)   # AGAST #2158: the arm's value moves out
@@ -606,7 +621,7 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
 
     var cond_reg: i32 = 0
     var always_true: i32 = 0
-    let is_enum_match: i32 = (enum_name != null) and (enum_name_len > 0)
+    let is_enum_match: i32 = (enum_name != null and enum_name_len > 0) as i32
 
     if arm.pattern_kind == PAT_INT_LIT or arm.pattern_kind == PAT_BOOL
         cond_reg = next_reg(s)
@@ -1157,7 +1172,17 @@ fn match_scrutinee_is_addr(scr: *Expr) -> i32
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
 fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
+    # AGAST #2342: a catch-all name binds the scrutinee, so it is the same kind.
+    let outer_kind: i32 = s.match_scrut_kind
+    s.match_scrut_kind = bool_kind(s, scrutinee)
+    let result: i32 = emit_match_arms(s, scrutinee, arms, span)
+    s.match_scrut_kind = outer_kind
+    result
+
+fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
     let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
+    if wants_value == 1
+        bool_check_arms(s, arms)   # AGAST #2342
     # Detect whether the scrutinee is a tagged-enum struct; if so, spill
     # it into an alloca once so every arm can GEP the same pointer.
     var enum_name: *u8 = null
@@ -1338,6 +1363,9 @@ fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
     if_arm_check_value(s, then_arm)
     if_arm_check_value(s, else_arm)
 
+    bool_check_cond(s, e.left, c"if condition")
+    if wants_value == 1
+        bool_check_arms(s, then_arm)
     # Same i1 / i64 decision as STMT_IF (bool_reg_is_i1, AGAST #1367, #1646).
     let cond: i32 = emit_expr(s, e.left)
     var cond_i1: i32 = cond

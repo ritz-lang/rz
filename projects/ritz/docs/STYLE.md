@@ -1085,7 +1085,7 @@ fn parse(input: i64) -> Result<i64, ParseError>
 [[test]]
 fn test_parse_invalid_returns_error() -> i32
     let result = parse(-1)
-    assert result.is_err() == 1   # Should fail
+    assert result.is_err()   # Should fail
     0
 ```
 

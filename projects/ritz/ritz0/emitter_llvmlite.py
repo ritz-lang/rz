@@ -16,6 +16,7 @@ from llvmlite import ir
 import ritz_ast as rast
 from monomorph import resolve_alias_in
 from tail_value import slot_tails, value_gap
+import bool_rules
 import match_coverage
 from metadata import type_to_string
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
@@ -596,6 +597,9 @@ class LLVMEmitter:
         # AGAST #1869: id(operand expr) -> its already-emitted value, while
         # _emit_assert lowers `a OP b` (see _emit_expr's first lines).
         self._assert_operands: Dict[int, ir.Value] = {}
+        # id(value) -> (value, the expression it last came from): `_convert_type`
+        # reports where a value was written, and most of its callers don't say.
+        self._value_origin: Dict[int, Tuple[ir.Value, rast.Expr]] = {}
         # AGAST #2261: what the method call being emitted has already
         # evaluated, by id(expr): its receiver and the operands of a place.
         self._evaluated_once: Dict[int, ir.Value] = {}
@@ -1737,6 +1741,9 @@ class LLVMEmitter:
             # Set initializer for definitions
             if var_def.value is not None:
                 if isinstance(var_def.value, rast.IntLit):
+                    if ty == self.i1:
+                        raise EmitError(bool_rules.value_into_bool(bool_rules.INTEGER),
+                                        var_def.value.span)
                     if isinstance(ty, ir.PointerType):
                         # Pointer initialized with integer literal (e.g., 0) -> null pointer
                         gvar.initializer = ir.Constant(ty, None)
@@ -2377,6 +2384,9 @@ class LLVMEmitter:
                 ty = self._ritz_type_to_llvm(item.type)
                 self.const_ritz_types[item.name] = item.type
                 if isinstance(item.value, rast.IntLit):
+                    if ty == self.i1:
+                        raise EmitError(bool_rules.value_into_bool(bool_rules.INTEGER),
+                                        item.value.span)
                     self.constants[item.name] = (item.value.value, ty)
                 elif isinstance(item.value, rast.FloatLit):
                     self.constants[item.name] = (item.value.value, ty)
@@ -5938,7 +5948,7 @@ class LLVMEmitter:
                     raise ValueError(f"Unknown variable: {name}")
             elif isinstance(stmt.target, rast.Index):
                 # Assignment to indexed location: arr[i] = val
-                index = self._emit_expr(stmt.target.index)
+                index = self._emit_index_value(stmt.target.index)
 
                 # Special handling for identifiers that are arrays
                 if isinstance(stmt.target.expr, rast.Ident):
@@ -6711,11 +6721,7 @@ class LLVMEmitter:
         # Evaluate left operand
         left = self._emit_expr(expr.left)
 
-        # Convert to i1 if needed
-        if left.type != self.i1:
-            left_bool = self.builder.icmp_signed('!=', left, ir.Constant(left.type, 0))
-        else:
-            left_bool = left
+        left_bool = self._require_bool(left, expr.left, f"operand of `{bool_rules.SPELLING.get(expr.op, expr.op)}`")
 
         # Create blocks
         eval_right_block = self.current_fn.append_basic_block("and.right")
@@ -6732,11 +6738,7 @@ class LLVMEmitter:
         self.builder.position_at_end(eval_right_block)
         right = self._emit_expr(expr.right)
 
-        # Convert to i1 if needed
-        if right.type != self.i1:
-            right_bool = self.builder.icmp_signed('!=', right, ir.Constant(right.type, 0))
-        else:
-            right_bool = right
+        right_bool = self._require_bool(right, expr.right, f"operand of `{bool_rules.SPELLING.get(expr.op, expr.op)}`")
 
         right_exit_block = self.builder.block
         self.builder.branch(merge_block)
@@ -6758,11 +6760,7 @@ class LLVMEmitter:
         # Evaluate left operand
         left = self._emit_expr(expr.left)
 
-        # Convert to i1 if needed
-        if left.type != self.i1:
-            left_bool = self.builder.icmp_signed('!=', left, ir.Constant(left.type, 0))
-        else:
-            left_bool = left
+        left_bool = self._require_bool(left, expr.left, f"operand of `{bool_rules.SPELLING.get(expr.op, expr.op)}`")
 
         # Create blocks
         eval_right_block = self.current_fn.append_basic_block("or.right")
@@ -6779,11 +6777,7 @@ class LLVMEmitter:
         self.builder.position_at_end(eval_right_block)
         right = self._emit_expr(expr.right)
 
-        # Convert to i1 if needed
-        if right.type != self.i1:
-            right_bool = self.builder.icmp_signed('!=', right, ir.Constant(right.type, 0))
-        else:
-            right_bool = right
+        right_bool = self._require_bool(right, expr.right, f"operand of `{bool_rules.SPELLING.get(expr.op, expr.op)}`")
 
         right_exit_block = self.builder.block
         self.builder.branch(merge_block)
@@ -6800,9 +6794,7 @@ class LLVMEmitter:
         """Emit an if expression/statement. Returns phi value if if-expr has value, else None."""
         cond = self._emit_cond_expr(if_expr.cond)
 
-        # Ensure condition is i1
-        if cond.type != self.i1:
-            cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0))
+        self._require_bool(cond, if_expr.cond, "if condition")
 
         # Create blocks
         then_block = self.current_fn.append_basic_block("if.then")
@@ -6948,8 +6940,7 @@ class LLVMEmitter:
         # Condition
         self.builder.position_at_end(cond_block)
         cond = self._emit_cond_expr(stmt.cond)
-        if cond.type != self.i1:
-            cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0))
+        self._require_bool(cond, stmt.cond, "while condition")
         self.builder.cbranch(cond, body_block, end_block)
 
         # Body
@@ -7396,8 +7387,7 @@ class LLVMEmitter:
         else:
             cond = self._emit_expr(cond_expr)
 
-        if cond.type != self.i1:
-            cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0))
+        self._require_bool(cond, cond_expr, "assert condition")
 
         pass_block = self.current_fn.append_basic_block("assert.pass")
         fail_block = self.current_fn.append_basic_block("assert.fail")
@@ -7639,6 +7629,7 @@ class LLVMEmitter:
         val = self._emit_expr_core(expr)
         if getattr(expr, 'drop_temp', None) is not None:
             self._own_temporary(expr, val)
+        self._value_origin[id(val)] = (val, expr)
         return val
 
     def _emit_expr_core(self, expr: rast.Expr) -> ir.Value:
@@ -7755,48 +7746,15 @@ class LLVMEmitter:
         elif isinstance(expr, rast.BinOp):
             op = expr.op
 
-            # Handle and/or operators
-            # For boolean types (i1): use short-circuit evaluation
-            # For integer types: use bitwise operations
+            # bool only, so always short-circuit (LARB R4, AGAST #2342).
             if op in ('&&', 'and'):
-                # Check if this is a boolean context (both sides are comparisons or bool)
-                if self._is_boolean_expr(expr.left) and self._is_boolean_expr(expr.right):
-                    return self._emit_short_circuit_and(expr)
-                # Otherwise, evaluate both and use bitwise and
-                left = self._emit_expr(expr.left)
-                right = self._emit_expr(expr.right)
-                # If both are integers, use bitwise AND
-                if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-                    # Ensure same width
-                    if left.type.width != right.type.width:
-                        if left.type.width < right.type.width:
-                            left = self.builder.zext(left, right.type)
-                        else:
-                            right = self.builder.zext(right, left.type)
-                    return self.builder.and_(left, right)
-                # Fall back to short-circuit for other types
                 return self._emit_short_circuit_and(expr)
             elif op in ('||', 'or'):
-                # Check if this is a boolean context
-                if self._is_boolean_expr(expr.left) and self._is_boolean_expr(expr.right):
-                    return self._emit_short_circuit_or(expr)
-                # Otherwise, evaluate both and use bitwise or
-                left = self._emit_expr(expr.left)
-                right = self._emit_expr(expr.right)
-                # If both are integers, use bitwise OR
-                if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-                    # Ensure same width
-                    if left.type.width != right.type.width:
-                        if left.type.width < right.type.width:
-                            left = self.builder.zext(left, right.type)
-                        else:
-                            right = self.builder.zext(right, left.type)
-                    return self.builder.or_(left, right)
-                # Fall back to short-circuit for other types
                 return self._emit_short_circuit_or(expr)
 
             left = self._emit_expr(expr.left)
             right = self._emit_expr(expr.right)
+            self._check_bool_operands(expr, left, right)
 
             # Ensure same type
             if left.type != right.type:
@@ -8060,7 +8018,7 @@ class LLVMEmitter:
                 end=slice_end,
             ))
 
-        index = self._emit_expr(expr.index)
+        index = self._emit_index_value(expr.index)
 
         # Special handling for identifiers that are arrays
         if isinstance(expr.expr, rast.Ident):
@@ -8955,7 +8913,7 @@ class LLVMEmitter:
             return ptr
         elif isinstance(expr, rast.Index):
             # arr[i] -> GEP to element
-            index = self._emit_expr(expr.index)
+            index = self._emit_index_value(expr.index)
             if isinstance(expr.expr, rast.Ident):
                 name = expr.expr.name
                 if name in self.locals:
@@ -9865,6 +9823,9 @@ class LLVMEmitter:
         operand = self._emit_expr(expr.operand)
 
         if expr.op == '-':
+            if operand.type == self.i1:
+                raise EmitError(bool_rules.operand_is_bool('-', 'a number'),
+                                self._value_span(expr.operand))
             # Negation
             if isinstance(operand.type, ir.IntType):
                 return self.builder.neg(operand)
@@ -9872,9 +9833,8 @@ class LLVMEmitter:
                 return self.builder.fneg(operand)
 
         elif expr.op in ('!', 'not'):
-            # Logical not - compare with zero
-            zero = ir.Constant(operand.type, 0)
-            return self.builder.icmp_unsigned('==', operand, zero)
+            self._require_bool(operand, expr.operand, f"operand of `{bool_rules.SPELLING.get(expr.op, expr.op)}`")
+            return self.builder.not_(operand)
 
         elif expr.op == '*':
             # Dereference
@@ -9889,6 +9849,9 @@ class LLVMEmitter:
 
         elif expr.op == '~':
             # Bitwise NOT: ~x = xor x, -1
+            if operand.type == self.i1:
+                raise EmitError(bool_rules.operand_is_bool('~', bool_rules.INTEGER),
+                                self._value_span(expr.operand))
             all_ones = ir.Constant(operand.type, -1)
             return self.builder.xor(operand, all_ones)
 
@@ -10418,9 +10381,9 @@ class LLVMEmitter:
                     # Emit and convert arguments
                     args = [self._emit_expr(arg) for arg in call.args]
                     converted_args = []
-                    for arg_val, param_type in zip(args, ritz_type.params):
+                    for arg, arg_val, param_type in zip(call.args, args, ritz_type.params):
                         expected_llvm = self._ritz_type_to_llvm(param_type)
-                        converted_args.append(self._convert_type(arg_val, expected_llvm))
+                        converted_args.append(self._convert_type(arg_val, expected_llvm, arg))
                     # AGAST #1739 / #1745: large struct args go byval and a
                     # large struct result via sret, as for a direct call.
                     # AGAST #1879: a `[[callconv]]` fn-type alias's convention.
@@ -10439,8 +10402,8 @@ class LLVMEmitter:
             if ritz_type is not None:
                 ritz_type = resolve_alias_in(ritz_type, self.type_aliases)
             if isinstance(ritz_type, rast.FnType):
-                args = [self._convert_type(a, self._ritz_type_to_llvm(p))
-                        for a, p in zip(args, ritz_type.params)]
+                args = [self._convert_type(a, self._ritz_type_to_llvm(p), arg)
+                        for arg, a, p in zip(call.args, args, ritz_type.params)]
                 return self.builder.call(fn_ptr, args,
                                          cconv=_llvm_callconv(ritz_type.callconv),
                                          byval=self._fn_type_byval(ritz_type),
@@ -12073,7 +12036,7 @@ class LLVMEmitter:
             converted_args = []
             for i, arg in enumerate(all_args):
                 expected_type = self._fn_param_types(fn)[i]
-                converted = self._convert_type(arg, expected_type)
+                converted = self._convert_type(arg, expected_type, expr.args[i])
                 converted_args.append(converted)
 
             return self.builder.call(fn, converted_args)
@@ -12195,7 +12158,8 @@ class LLVMEmitter:
         converted_args = []
         for i, arg in enumerate(all_args):
             expected_type = self._fn_param_types(fn)[i]
-            converted = self._convert_type(arg, expected_type)
+            # all_args[0] is the receiver.
+            converted = self._convert_type(arg, expected_type, expr.args[i - 1] if i else None)
             converted_args.append(converted)
 
         return self.builder.call(fn, converted_args)
@@ -12445,10 +12409,95 @@ class LLVMEmitter:
             return self.builder.extract_value(pair, 0)
         return self.builder.atomic_rmw(rmw_op, ptr, vals[0], 'seq_cst')
 
-    def _convert_type(self, val: ir.Value, target_type: ir.Type) -> ir.Value:
-        """Convert a value to the target type if needed."""
+    def _value_kind(self, ty: ir.Type) -> str:
+        """The words for a type that isn't bool. i1 is only ever bool here."""
+        if isinstance(ty, ir.IntType):
+            return bool_rules.INTEGER
+        if isinstance(ty, ir.PointerType):
+            return bool_rules.POINTER
+        if self._is_float_type(ty):
+            return bool_rules.FLOAT
+        return bool_rules.OTHER
+
+    @staticmethod
+    def _value_span(expr: rast.Expr) -> Optional[rast.Span]:
+        """Where a value is reported. ritz1 keeps no parens, so neither does this."""
+        while True:
+            if isinstance(expr, rast.Grouped):
+                expr = expr.expr
+            elif isinstance(expr, rast.BinOp):
+                expr = expr.left
+            elif isinstance(expr, rast.Cast):
+                expr = expr.expr
+            else:
+                return expr.span
+
+    def _emit_index_value(self, index: rast.Expr) -> ir.Value:
+        """`a[i]`: no bool, though a bool would widen to a perfectly good GEP."""
+        val = self._emit_expr(index)
+        if val.type == self.i1:
+            raise EmitError(bool_rules.bool_into_slot(bool_rules.INTEGER),
+                            self._value_span(index))
+        return val
+
+    def _require_bool(self, val: ir.Value, expr: rast.Expr, what: str) -> ir.Value:
+        """A condition, or an operand of `and`/`or`/`not` (LARB R4)."""
+        if val.type != self.i1:
+            raise EmitError(bool_rules.must_be_bool(what, self._value_kind(val.type)),
+                            self._value_span(expr))
+        return val
+
+    def _check_bool_operands(self, expr: rast.BinOp, left: ir.Value, right: ir.Value) -> None:
+        """A binary operator other than `and`/`or`, before any widening."""
+        bools = [(val, side) for val, side in ((left, expr.left), (right, expr.right))
+                 if val.type == self.i1]
+        if not bools:
+            return
+        if expr.op in bool_rules.COMPARISONS:
+            if len(bools) == 1:
+                other = right if left.type == self.i1 else left
+                raise EmitError(bool_rules.cannot_compare(self._value_kind(other.type)),
+                                self._value_span(expr))
+            return
+        side = bools[0][1]
+        if expr.op in bool_rules.BITWISE:
+            inner = side
+            while isinstance(inner, rast.Grouped):
+                inner = inner.expr
+            compare = isinstance(inner, rast.BinOp) and inner.op in bool_rules.COMPARISONS
+            raise EmitError(bool_rules.operand_is_bool(expr.op, bool_rules.INTEGER, compare),
+                            self._value_span(side))
+        if expr.op in bool_rules.ARITHMETIC:
+            raise EmitError(bool_rules.operand_is_bool(expr.op, 'a number'),
+                            self._value_span(side))
+
+    def _check_bool_slot(self, val: ir.Value, target_type: ir.Type,
+                         at: Optional[rast.Expr]) -> None:
+        """bool converts to nothing implicitly, and nothing converts to it."""
+        scalars = (ir.IntType, ir.PointerType, ir.FloatType, ir.DoubleType)
+        if ((val.type == self.i1) == (target_type == self.i1)
+                or not isinstance(val.type, scalars)
+                or not isinstance(target_type, scalars)):
+            return
+        # Passing `@b` where a bool is wanted reads through it, below.
+        if isinstance(val.type, ir.PointerType) and val.type.pointee == target_type:
+            return
+        if at is None:
+            origin = self._value_origin.get(id(val))
+            at = origin[1] if origin is not None and origin[0] is val else None
+        span = self._value_span(at) if at is not None else None
+        if val.type == self.i1:
+            raise EmitError(bool_rules.bool_into_slot(self._value_kind(target_type)), span)
+        raise EmitError(bool_rules.value_into_bool(self._value_kind(val.type)), span)
+
+    def _convert_type(self, val: ir.Value, target_type: ir.Type,
+                      at: Optional[rast.Expr] = None) -> ir.Value:
+        """Convert a value to the target type if needed. `at` is the expression
+        it came from, for callers that emit several before converting any: one
+        SSA value can be two arguments (`s.m(n, n)`)."""
         if val.type == target_type:
             return val
+        self._check_bool_slot(val, target_type, at)
 
         # Floating-point conversions (float <-> double)
         if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
@@ -12932,42 +12981,6 @@ class LLVMEmitter:
             return ty.name in ('u8', 'u16', 'u32', 'u64')
         return False
 
-    def _is_boolean_expr(self, expr: rast.Expr) -> bool:
-        """Check if an expression is a boolean (comparison, logical, etc).
-
-        Used to determine whether 'and'/'or' should use short-circuit
-        evaluation (for booleans) or bitwise operations (for integers).
-        """
-        # Comparison operators always produce bool
-        if isinstance(expr, rast.BinOp):
-            if expr.op in ('==', '!=', '<', '<=', '>', '>='):
-                return True
-            # Nested and/or with boolean operands
-            if expr.op in ('&&', '||', 'and', 'or'):
-                return self._is_boolean_expr(expr.left) and self._is_boolean_expr(expr.right)
-
-        # Unary not on boolean
-        if isinstance(expr, rast.UnaryOp) and expr.op == 'not':
-            return True
-
-        # Bool literals
-        if isinstance(expr, rast.BoolLit):
-            return True
-
-        # Identifier with bool type
-        if isinstance(expr, rast.Ident):
-            if expr.name in self.ritz_types:
-                ritz_type = self.ritz_types[expr.name]
-                if isinstance(ritz_type, rast.NamedType) and ritz_type.name == 'bool':
-                    return True
-
-        # Method calls that return bool (e.g., is_some(), is_none())
-        if isinstance(expr, rast.MethodCall):
-            if expr.method in ('is_some', 'is_none', 'is_ok', 'is_err'):
-                return True
-
-        return False
-
     def _infer_unsigned_expr(self, expr: rast.Expr) -> bool:
         """Check if an expression produces an unsigned integer type.
 
@@ -13373,6 +13386,8 @@ class LLVMEmitter:
           and fail to dominate its phi use.
         """
         first_type = incoming[0][0].type
+        for val, _ in incoming[1:]:
+            self._check_bool_slot(val, first_type, None)
         if all(v.type == first_type for v, _ in incoming):
             phi = self.builder.phi(first_type)
             for val, block in incoming:
@@ -14328,6 +14343,12 @@ class LLVMEmitter:
             return self._emit_cast_from_union(val, src_union_name, expr.target)
 
         target_type = self._ritz_type_to_llvm(expr.target)
+
+        if target_type == self.i1:
+            raise EmitError(bool_rules.AS_BOOL_REMOVED, self._value_span(expr))
+        if val.type == self.i1 and not isinstance(target_type, ir.IntType):
+            raise EmitError(bool_rules.cannot_cast(self._value_kind(target_type)),
+                            self._value_span(expr))
 
         if isinstance(target_type, ir.IntType):
             enum_int = self._try_emit_enum_to_int(val, target_type, expr)

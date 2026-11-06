@@ -1217,7 +1217,7 @@ import ritzlib.strview
 fn count_files(path: StrView) -> i64
     var dir: DirIter = dir_open(path)
     var n: i64 = 0
-    while dir_next(@dir)
+    while dir_next(@dir) != 0
         let e: DirEntry = dir_entry(@dir)    # e.ino, e.kind, e.name: StrView
         if e.kind == DT_REG
             n += 1

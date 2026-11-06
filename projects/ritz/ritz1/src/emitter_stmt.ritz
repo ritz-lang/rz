@@ -23,6 +23,7 @@ import emitter_print       # emit_assert_stmt (AGAST #1869)
 import enum_as_int        # enum_as_int_stmt (AGAST #2136)
 import ownership          # move check + drops (AGAST #2158)
 import must_use           # must_use_check (AGAST #2137)
+import bool_check   # AGAST #2342
 
 # resolve_member_chain_field moved to emitter_core (AGAST #1660) so the
 # binary-op emitter can type enum-valued member operands too.
@@ -100,6 +101,13 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # otherwise `var best_type: i32 = -1` stores i32 into an i64 slot,
     # and callers reading i64 see garbage in the upper half.
     check_implicit_narrowing(s, stmt)   # AGAST #1364
+    # AGAST #2342: before `x` is in scope, as `let x: bool = x`.
+    var init_kind: i32 = BK_UNSURE
+    if stmt.var_init != null
+        init_kind = bool_kind(s, stmt.var_init)
+        if stmt.var_declared_type != TYPE_VOID
+            bool_check_slot(s, stmt.var_init, stmt.var_declared_type, stmt.var_type_name, stmt.var_type_name_len)
+            bool_check_array_lit(s, stmt.var_init, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len)
     var var_type: i32 = stmt.var_type
     # AGAST #1521: remember a declared bool past the i64 promotion below.
     let declared_bool: i32 = (var_type == TYPE_BOOL) as i32
@@ -713,17 +721,18 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     declared.holds_shared_ref = shared_ref
     if var_type == TYPE_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
         set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308
-    # `let ok = is_big(x)`: inference above leaves a bool-returning call's
-    # local at TYPE_I64. (Indistinguishable here from `let ok: i64 = ...`;
-    # assigning a bool call to an explicit i64 is the rare case.)
+    # An unannotated local takes its initialiser's kind; var_type can't say.
     var inferred_bool: i32 = 0
-    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
-        if stmt.var_init.kind == EXPR_CALL or stmt.var_init.kind == EXPR_METHOD
-            if get_expr_type(s, stmt.var_init) == TYPE_BOOL
-                inferred_bool = 1
+    var inferred_unsure: i32 = 0
+    if stmt.var_declared_type == TYPE_VOID and stmt.var_init != null
+        inferred_bool = (init_kind == BK_BOOL) as i32
+        inferred_unsure = (init_kind == BK_UNSURE) as i32
     if (declared_bool == 1 or inferred_bool == 1) and s.local_count > 0
         let bool_loc: *LocalVar = local_at(s, s.local_count - 1)
         bool_loc.is_bool = 1
+    if inferred_unsure == 1 and s.local_count > 0
+        let unsure_loc: *LocalVar = local_at(s, s.local_count - 1)
+        unsure_loc.bk_unsure = 1
 
     if stmt.var_init != null and stmt.var_array_shape != null
         # AGAST #1509: no initializer form of a multi-dimensional array is
@@ -1598,6 +1607,7 @@ fn set_match_float_hint(s: *EmitterState, e: *Expr, ty: i32, ty_name: *u8, ty_na
 
 fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
+        bool_check_slot(s, stmt.return_value, ret_type, s.ret_type_name, s.ret_type_name_len)
         if emit_lent_return(s, stmt.return_value, ret_type) == 1   # AGAST #2279, #2308
             return
         # Special handling for struct returns - need to load entire struct
@@ -2229,12 +2239,12 @@ fn array_elem_types_match(a: i32, a_name: *u8, a_len: i32, b: i32, b_name: *u8, 
     if a == TYPE_STRUCT or b == TYPE_STRUCT
         if a != b or a_len != b_len or a_len <= 0
             return 0
-        return memcmp(a_name, b_name, a_len as i64) == 0
+        return (memcmp(a_name, b_name, a_len as i64) == 0) as i32
     if a == b
         return 1
     if a == TYPE_ARRAY or b == TYPE_ARRAY
         return 0
-    return strcmp(local_array_elem_llvm(a), local_array_elem_llvm(b)) == 0
+    return (strcmp(local_array_elem_llvm(a), local_array_elem_llvm(b)) == 0) as i32
 
 # AGAST #2287: the shape of a whole array an expression reads.
 struct ArraySrc
@@ -2717,6 +2727,7 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # AGAST #2028: reject writes / `@&` into a `let` before emitting them.
     let_check_stmt(s, stmt)
+    bool_check_stmt(s, stmt)   # AGAST #2342
     # AGAST #2136: an enum value where an integer is expected.
     enum_as_int_stmt(s, stmt, ret_type)
     # AGAST #2255: a procedure hands nothing back, so its `return g()` uses no
@@ -2839,6 +2850,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # AGAST #1869: placement check, operand report, helper call site.
         emit_assert_stmt(s, stmt)
     else if stmt.kind == STMT_IF
+        bool_check_cond(s, stmt.if_cond, c"if condition")
         let cond: i32 = emit_expr(s, stmt.if_cond)
         # If the condition register is already an i1, use it directly in the
         # br — otherwise coerce i64 -> i1 via `icmp ne ..., 0`.  Without the
@@ -2993,6 +3005,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c"\n")
 
         begin_block(s, cond_label)
+        bool_check_cond(s, stmt.while_cond, c"while condition")
         let cond: i32 = emit_expr(s, stmt.while_cond)
         # Same i1/i64 handling as STMT_IF — skip the icmp only when the
         # register genuinely is an i1.  `while f()` on a bool-returning f hit

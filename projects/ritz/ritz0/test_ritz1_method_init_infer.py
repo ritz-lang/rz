@@ -154,7 +154,7 @@ impl Gate
 fn main() -> i32
     var g: Gate = Gate { n: 5 }
     var r = g.check()
-    return r.is_ok() * 10 + r.is_err()
+    return (r.is_ok() as i32) * 10 + (r.is_err() as i32)
 """,
         10,
     ),

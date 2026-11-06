@@ -113,7 +113,7 @@ pub fn main() -> i32
     let u = mk_param(false)
     if u.b
         return 4
-    if not f.a == 1
+    if not (f.a == 1)
         return 5
     if f.b
         if t.b

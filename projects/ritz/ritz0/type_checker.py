@@ -20,6 +20,7 @@ Built-in functions:
 
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
+import bool_rules
 import ritz_ast as rast
 from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
                            SYSCALL_BUILTINS)
@@ -487,8 +488,9 @@ class TypeChecker:
             return rast.TupleType(expr.span, element_types)
 
         elif isinstance(expr, rast.Cast):
-            # Just check the source expression is valid
             self._infer_type(expr.expr)
+            if self._is_bool_type(expr.target):
+                self._error(bool_rules.AS_BOOL_REMOVED, expr.span)
             return expr.target
 
         elif isinstance(expr, rast.Match):
@@ -557,14 +559,14 @@ class TypeChecker:
         right_type = self._infer_type(expr.right)
 
         # Comparison operators return bool
-        if expr.op in ('==', '!=', '<', '>', '<=', '>='):
+        if expr.op in bool_rules.COMPARISONS:
             if not self._types_compatible(left_type, right_type):
                 self._error(f"cannot compare {self._type_str(left_type)} "
                           f"with {self._type_str(right_type)}", expr.span)
             return rast.NamedType(expr.span, 'bool', [])
 
         # Logical operators require bool, return bool
-        if expr.op in ('&&', '||'):
+        if expr.op in bool_rules.LOGICAL:
             if not self._is_bool_or_opaque(left_type):
                 self._error(f"logical operator requires bool, got {self._type_str(left_type)}",
                           expr.left.span)
@@ -618,7 +620,13 @@ class TypeChecker:
                           expr.operand.span)
             return operand_type
 
-        elif expr.op == '!':
+        elif expr.op == '~':
+            if not self._is_int_or_opaque(operand_type):
+                self._error(f"bitwise operator requires integer, got {self._type_str(operand_type)}",
+                          expr.operand.span)
+            return operand_type
+
+        elif expr.op in ('!', 'not'):
             if not self._is_bool_or_opaque(operand_type):
                 self._error(f"logical not requires bool, got {self._type_str(operand_type)}",
                           expr.operand.span)

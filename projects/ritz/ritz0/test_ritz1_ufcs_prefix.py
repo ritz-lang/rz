@@ -85,9 +85,9 @@ fn main() -> i32
         return 2
     if s.eq("abcde") == true
         return 3
-    if s.starts_with("abc") != 1
+    if not s.starts_with("abc")
         return 4
-    if s.contains("eX") != 1
+    if not s.contains("eX")
         return 5
     return 42
 """
