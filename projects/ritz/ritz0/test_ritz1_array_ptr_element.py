@@ -423,18 +423,31 @@ def test_a_slice_of_the_array_is_not_an_element(run_with, compiler):
     assert run_with(compiler, "range", _x(_is("*a[0..2]", "a[0] as i64"))) == 0
 
 
+_FOR_G = "var g: [2]*i16\n\n"
+_FOR_H = "struct H\n    a: [2]*i16\n\n"
+# AGAST #2375: `for p in` a global or a field binds what the element points at,
+# so `*p` reads 2 bytes.  x[1] is in the 8 a wide load would take.
+FOR_OVER = {
+    "global": _x(
+        "    g[0] = @x[0]\n    g[1] = @x[0]\n    var t: i32 = 0\n    for p in g\n"
+        "        if *p == 1\n            t = t + 1\n" + _is("t", "2"), _FOR_G),
+    "field": _x(
+        "    var h: H\n    h.a[0] = @x[0]\n    h.a[1] = @x[0]\n    var t: i32 = 0\n    for p in h.a\n"
+        "        if *p == 1\n            t = t + 1\n" + _is("t", "2"), _FOR_H),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(FOR_OVER))
+def test_a_loop_binding_knows_its_pointee(run_with, compiler, name):
+    assert run_with(compiler, name, FOR_OVER[name]) == 0
+
+
 # ritz0 has these right, ritz1 doesn't, and each is its own bug.  Strict, so the
 # fix flags the row.
 _B = "    var q: *i16 = @x[0]\n    var b: [2]**i16\n    b[1] = @q\n"
-_FOR_G = "var g: [2]*i16\n\n"
-_FOR_H = "struct H\n    a: [2]*i16\n\n"
 KNOWN_GAPS = {
-    "for_over_global": (2375, _x(
-        "    g[0] = @x[0]\n    g[1] = @x[0]\n    var t: i32 = 0\n    for p in g\n"
-        "        if *p == 1\n            t = t + 1\n" + _is("t", "2"), _FOR_G)),
-    "for_over_field": (2375, _x(
-        "    var h: H\n    h.a[0] = @x[0]\n    h.a[1] = @x[0]\n    var t: i32 = 0\n    for p in h.a\n"
-        "        if *p == 1\n            t = t + 1\n" + _is("t", "2"), _FOR_H)),
     "pointer_to_pointer_load": (2376, _x(_B + _is("**b[1]"))),
     "pointer_to_pointer_store": (2376, _x(_B + "    **b[1] = 7\n" + _is("x[1]", "2"))),
     "pointer_to_pointer_inferred": (2376, _x(_B + "    let r = b[1]\n" + _is("**r"))),
