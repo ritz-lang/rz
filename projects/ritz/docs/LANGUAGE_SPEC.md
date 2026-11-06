@@ -2011,6 +2011,54 @@ fn main() -> i32
     n as i32
 ```
 
+A place passed to a `name:& T` parameter is borrowed, as if written `@&x`. It's
+the language's only implicit borrow, and it holds for every `T`, pointers
+included. A place is a local, a parameter, a field, an element or a deref.
+
+```ritz
+struct Counter
+    n: i32
+
+fn bump(c:& Counter)
+    c.n = c.n + 1
+
+fn set(n:& i32)
+    n = 3
+
+fn main() -> i32
+    var c = Counter { n: 1 }
+    bump(c)                         # c.n is 2
+    set(c.n)                        # c.n is 3
+    c.n
+```
+
+The place must be mutable: a `var`, or reached through an `@&T`, a `:&` or a
+`*T`. A `let` is refused, and so is an `@T`, written or inferred from `let p = @x`,
+and a place behind one, the nearest indirection deciding:
+
+```ritz expect-error="cannot borrow `let` binding `n` as mutable"
+fn set(n:& i32)
+    n = 3
+
+fn main() -> i32
+    let n: i32 = 1
+    set(n)
+    n
+```
+
+An rvalue is refused, since there's nothing for the caller to observe. An `@&T`
+or `*T` isn't a place of `T`: it passes as the pointer it is, from a call or
+from a place. For `name:& *U`, a `*U` place is borrowed and a `**U` passes.
+
+```ritz expect-error="a `:&` parameter needs a place to borrow"
+fn set(n:& i32)
+    n = 3
+
+fn main() -> i32
+    set(1 + 2)
+    0
+```
+
 The caller keeps ownership of what it lends, so a `name:& T` parameter of a
 move-only type can't be moved out of. Using the parameter by value, or using
 one of its move-only fields or `*name` by value, is an error. Everything that

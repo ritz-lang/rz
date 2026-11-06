@@ -1428,7 +1428,7 @@ class LLVMEmitter:
             # without them `let p = @pair` recorded p as a Pair, so
             # `sizeof(p)` was sizeof(Pair) (AGAST #2124).
             if expr.op in ('&', '@') and inner_type:
-                return rast.PtrType(expr.span, inner_type, mutable=False)
+                return rast.PtrType(expr.span, inner_type, mutable=False, shared=expr.op == '@')
             elif expr.op in ('&mut', '@&') and inner_type:
                 return rast.PtrType(expr.span, inner_type, mutable=True)
             elif expr.op == '*' and inner_type:
@@ -3832,6 +3832,110 @@ class LLVMEmitter:
         place = self._let_place(arg)
         if place is not None and not isinstance(place[1], ir.PointerType):
             self._check_let_mut_borrow(arg)
+
+    @staticmethod
+    def _takes_place(param: rast.Param) -> bool:
+        """AGAST #2335: is `param` a `name:& T`, which borrows a bare place?"""
+        return getattr(param, 'borrow', None) == rast.Borrow.MUTABLE
+
+    def _emit_place_borrow(self, arg: rast.Expr, expected_type: ir.Type,
+                           fname: str, argno: int) -> ir.Value:
+        """AGAST #2335: the pointer `arg` gives a `name:& T` parameter.
+
+        A place of type `T` is borrowed, as if written `@&x`: the language's
+        only implicit borrow, for every T, so a `*U` place into `:& *U` gives
+        its own address. What isn't a place of `T` passes if it's the pointer
+        the parameter is: an `@&T` or a `*T`, whether a place or a call result.
+        An rvalue of any other kind is refused: there's nothing for the caller
+        to observe. `@x` and `@&x` are as written (whether `@x` fits is #2339).
+
+        Decided from LLVM types, which are exact here, and not from inference:
+        an Ident holding a `*T` can infer as `T`.
+        """
+        if isinstance(arg, rast.UnaryOp) and arg.op in ('&', '@', '@&', '&mut'):
+            return self._emit_expr(arg)
+        fname = fname.partition('$')[0]
+        at = arg
+        while isinstance(at, (rast.Field, rast.Index)):
+            # A slice makes a value, so nothing reached through one is a place.
+            if isinstance(at, rast.Index) and isinstance(at.index, rast.Range):
+                raise EmitError(
+                    f"argument {argno} of `{fname}` has the wrong type: "
+                    "a `:&` parameter needs a place to borrow, and this is a temporary",
+                    arg.span)
+            at = at.expr
+        if self._behind_shared_ref(arg):
+            raise EmitError(
+                f"argument {argno} of `{fname}` has the wrong type: "
+                "a `:&` parameter can't borrow through an `@T`, which is read-only",
+                arg.span)
+        val = self._emit_place_addr(arg, expected_type)
+        if val is None:
+            val = self._emit_expr(arg)
+            if val.type != expected_type or isinstance(arg, (rast.NullLit, rast.CStringLit)):
+                raise EmitError(
+                    f"argument {argno} of `{fname}` has the wrong type: "
+                    "a `:&` parameter needs a place to borrow, and this is a temporary",
+                    arg.span)
+        elif val.type != expected_type:
+            raise EmitError(
+                f"argument {argno} of `{fname}` has the wrong type: "
+                f"{val.type} != {expected_type}", arg.span)
+        return val
+
+    def _behind_shared_ref(self, value: rast.Expr) -> bool:
+        """Is the place `value` an `@T`, or is the nearest indirection on its
+        path to the root one? An `@&T` or `*T` nearer than that makes it writable.
+        """
+        ty = self._infer_ritz_type(value)
+        if self._is_shared_ref(ty):
+            return True
+        at = value
+        while True:
+            if isinstance(at, (rast.Field, rast.Index)):
+                at = at.expr
+            elif isinstance(at, rast.UnaryOp) and at.op == '*':
+                at = at.operand
+                if isinstance(at, rast.BinOp):
+                    at = at.left
+            else:
+                return False
+            ty = self._infer_ritz_type(at)
+            if isinstance(ty, (rast.RefType, rast.PtrType)):
+                return self._is_shared_ref(ty)
+
+    @staticmethod
+    def _is_shared_ref(ty: Optional[rast.Type]) -> bool:
+        """Is `ty` an `@T`, written or inferred from `@x`?"""
+        if isinstance(ty, rast.RefType):
+            return not ty.mutable
+        return isinstance(ty, rast.PtrType) and ty.shared
+
+    def _emit_place_addr(self, value: rast.Expr, expected_type: ir.Type) -> Optional[ir.Value]:
+        """What the place `value` gives a parameter of `expected_type`.
+
+        Its address when it holds what the parameter points at, or else the
+        pointer it holds when that's the parameter's type. Anything else comes
+        back as it is, for the caller to refuse. None if `value` is no place.
+        """
+        if not (isinstance(value, (rast.Ident, rast.Field, rast.Index))
+                or (isinstance(value, rast.UnaryOp) and value.op == '*')):
+            return None
+        let_place = self._let_place(value)
+        if let_place is not None and let_place[1] == expected_type.pointee:
+            self._check_let_mut_borrow(value)
+        if (isinstance(value, rast.Ident) and value.name not in self.locals
+                and value.name in self.params):
+            # An `@T` param or a small `let`: an SSA value with no storage of
+            # its own. A temporary copy would swallow the write.
+            return self.params[value.name][0]
+        try:
+            addr = self._emit_lvalue_addr(value)
+        except ValueError:
+            return None
+        if isinstance(addr.type, ir.PointerType) and addr.type.pointee == expected_type:
+            return self.builder.load(addr)
+        return addr
 
     def _let_place(self, expr: rast.Expr) -> Optional[Tuple[str, ir.Type]]:
         """AGAST #2026: (let name, LLVM type) if `expr` is a `let`'s storage.
@@ -8842,7 +8946,13 @@ class LLVMEmitter:
                 raise ValueError(f"Unknown variable: {name}")
         elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
             # *ptr -> return ptr itself
-            return self._emit_expr(expr.operand)
+            ptr = self._emit_expr(expr.operand)
+            # `*c` of `c:& C` reads as `c`: it's that place, not a pointee.
+            if (not isinstance(ptr.type, ir.PointerType)
+                    and isinstance(expr.operand, rast.Ident)
+                    and expr.operand.name in self._mut_borrow_args):
+                return self._mut_borrow_args[expr.operand.name]
+            return ptr
         elif isinstance(expr, rast.Index):
             # arr[i] -> GEP to element
             index = self._emit_expr(expr.index)
@@ -10517,7 +10627,9 @@ class LLVMEmitter:
                             val = tmp
                         else:
                             val = self._convert_type(tmp_val, expected_type)
-                elif is_mutable_borrow or is_ref_type:
+                elif is_mutable_borrow:
+                    val = self._emit_place_borrow(arg, expected_type, fname, i + 1)
+                elif is_ref_type:
                     if arg_is_ref or arg_is_ptr or arg_is_addr_of:
                         # Argument is already a pointer type - just emit it
                         val = self._emit_expr(arg)
@@ -11950,8 +12062,12 @@ class LLVMEmitter:
         if is_static_call or not has_self_param:
             # Static method - just emit the arguments, no receiver
             all_args = []
-            for arg in expr.args:
-                all_args.append(self._emit_expr(arg))
+            for i, arg in enumerate(expr.args):
+                if i < len(fn_def.params) and self._takes_place(fn_def.params[i]):
+                    all_args.append(self._emit_place_borrow(
+                        arg, self._fn_param_types(fn)[i], expr.method, i + 1))
+                else:
+                    all_args.append(self._emit_expr(arg))
 
             # Convert argument types as needed
             converted_args = []
@@ -12035,6 +12151,9 @@ class LLVMEmitter:
         all_args = [receiver_val]
         for j, arg in enumerate(expr.args, start=1):
             expected_type = self._fn_param_types(fn)[j] if j < len(self._fn_param_types(fn)) else None
+            if j < len(fn_def.params) and self._takes_place(fn_def.params[j]):
+                all_args.append(self._emit_place_borrow(arg, expected_type, expr.method, j + 1))
+                continue
             arg_ritz_type = self._infer_ritz_type(arg)
             arg_is_ref = isinstance(arg_ritz_type, rast.RefType) if arg_ritz_type else False
             arg_is_ptr = isinstance(arg_ritz_type, rast.PtrType) if arg_ritz_type else False

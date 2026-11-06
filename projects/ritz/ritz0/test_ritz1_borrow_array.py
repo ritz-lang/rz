@@ -652,15 +652,6 @@ pub fn main() -> i32
     var a: [2]i32 = [1, 3]
     return g(@a)
 """,
-    "from_reference_let": """
-fn f(a:& [2]i32) -> i32
-    return a[1]
-
-pub fn main() -> i32
-    var a: [2]i32 = [1, 3]
-    let p: @[2]i32 = @a
-    return f(p)
-""",
     "from_call_result": """
 fn h(p: *[2]i32) -> *[2]i32
     return p
@@ -1485,15 +1476,6 @@ pub fn main() -> i32
     b[1][2] = 3
     f(@&a, @b)
     return a[1][2]
-"""),
-    "nested_bare_local_argument": ("a multi-dimensional array is not a value", """
-fn g(a:& [2][3]i32) -> i32
-    return a[1][2]
-
-pub fn main() -> i32
-    var a: [2][3]i32
-    a[1][2] = 3
-    return g(a)
 """),
 }
 

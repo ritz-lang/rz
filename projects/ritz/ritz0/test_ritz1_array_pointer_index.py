@@ -212,7 +212,8 @@ INFERRED_STAYS_A_POINTER = {
     "to_reference_param": "fn g(p: @[3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @a\n    return g(p)\n"),
     "to_mut_reference_param": "fn g(p: @&[3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @&a\n    return g(p)\n"),
     "mut_to_pointer_param": "fn g(p: *[3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @&a\n    return g(p)\n"),
-    "to_borrow_param": "fn g(p:& [3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @a\n    return g(p)\n"),
+    # R1: an `@T` into `:&` is refused, an `@&T` passes (test_bare_place_borrow.py).
+    "to_borrow_param": "fn g(p:& [3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @&a\n    return g(p)\n"),
     "returned": "fn g(a: *[3]i32) -> *[3]i32\n    let q = a\n    return q\n\n" + _a("    let p: *[3]i32 = g(@a)\n    return p[1]\n"),
     # An annotation can't be told from the default here, so these are the same
     # local as `let x = @a`, and must still read as the integer they were.

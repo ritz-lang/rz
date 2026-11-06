@@ -829,6 +829,7 @@ class MoveChecker:
             for i, arg in enumerate(expr.args):
                 param = params[i] if params and i < len(params) else None
                 self._check_expr(arg, is_move_context=not _is_lending_param(param))
+                self._check_place_borrow(arg, param)
 
             # Release borrows that were created for this call
             # (borrows don't outlive the call unless stored somewhere)
@@ -849,6 +850,7 @@ class MoveChecker:
                 expr, lambda n: self.scope.lookup(n) is not None) is not None
             for i, arg in enumerate(expr.args):
                 self._check_expr(arg, is_move_context=is_variant or self._method_arg_moves(expr, i))
+                self._check_place_borrow(arg, self._method_param(expr, i))
             self._restore_borrow_states(borrow_states_before)
             self._mark_temporary(expr, is_move_context)
 
@@ -1256,21 +1258,46 @@ class MoveChecker:
                 return False
         return True
 
-    def _method_arg_moves(self, call: rast.MethodCall, i: int) -> bool:
-        """Does argument `i` of `call` move? Only if every same-named method
-        takes it by value; unknown methods lend (no move, no drop-flag clear)."""
-        cands = self.methods.get(call.method)
-        if not cands:
-            return False
+    def _method_arg_params(self, call: rast.MethodCall, i: int) -> list:
+        """Param `i` of each same-named method; None where one has no such param."""
         static = (isinstance(call.expr, rast.Ident)
                   and self.scope.lookup(call.expr.name) is None)
-        for m in cands:
+        found = []
+        for m in self.methods.get(call.method) or []:
             params = list(m.params)
             if not static and params and params[0].name == 'self':
                 params = params[1:]
-            if i >= len(params) or _is_lending_param(params[i]):
-                return False
-        return True
+            found.append(params[i] if i < len(params) else None)
+        return found
+
+    def _method_arg_moves(self, call: rast.MethodCall, i: int) -> bool:
+        """Does argument `i` of `call` move? Only if every same-named method
+        takes it by value; unknown methods lend (no move, no drop-flag clear)."""
+        params = self._method_arg_params(call, i)
+        return bool(params) and all(p is not None and not _is_lending_param(p) for p in params)
+
+    def _method_param(self, call: rast.MethodCall, i: int) -> Optional[rast.Param]:
+        """Param `i` of the method `call` can only mean, or None."""
+        params = self._method_arg_params(call, i)
+        return params[0] if len(params) == 1 else None
+
+    def _check_place_borrow(self, arg: rast.Expr, param: Optional[rast.Param]) -> None:
+        """AGAST #2335: a place into a `name:& T` parameter is an `@&` of it
+        for §13.5. A reference or pointer into a `:& U` isn't a place of `U`: it
+        passes what it points at, so the binding itself isn't borrowed."""
+        if param is None or getattr(param, 'borrow', None) != rast.Borrow.MUTABLE:
+            return
+        if not isinstance(arg, rast.Ident):
+            return
+        info = self.scope.lookup(arg.name)
+        if info is None or info.state == VarState.MOVED:
+            return    # already reported by _check_expr
+        held = self.types.resolve(info.ritz_type)
+        wanted = self.types.resolve(param.type)
+        if (isinstance(held, (rast.RefType, rast.PtrType))
+                and not isinstance(wanted, (rast.RefType, rast.PtrType))):
+            return
+        self._check_borrow(arg, mutable=True, span=arg.span)
 
     def _check_borrow(self, expr: rast.Expr, mutable: bool, span: rast.Span):
         """Check a borrow expression for validity."""

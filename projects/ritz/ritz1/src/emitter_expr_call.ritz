@@ -780,6 +780,9 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
         let lent_addr: i32 = emit_lent_addr(s, arg, p)   # AGAST #2308
         if lent_addr != 0
             return lent_addr
+        let place_addr: i32 = emit_borrowed_place(s, arg, p)   # AGAST #2335
+        if place_addr != 0
+            return place_addr
         # The Span cascade builds its Span from the local; it reads no value.
         if param_is_span(p) == 1 and arg.kind == EXPR_IDENT
             let span_src: *LocalVar = find_local_struct_name(s, arg.ident_ptr, arg.ident_len)
@@ -910,6 +913,8 @@ fn param_takes_addr_value(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if p.param_type != TYPE_MUT_REF
         return 0
     if param_takes_array_ref(p) == 1 or lent_ref_local(s, arg, p) != null
+        return 1
+    if borrow_arg_kind(s, arg, p) == BORROW_PLACE
         return 1
     0
 
@@ -1391,6 +1396,8 @@ fn arg_array_shape(s: *EmitterState, arg: *Expr, out: *ArraySrc) -> i32
 fn check_array_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
     if p == null or name_eq(p.name, p.name_len, c"self", 4) == 1
         return
+    if check_borrow_arg(s, fname, flen, argno, arg, p) == 1
+        return
     check_lent_ref_arg(s, call, fname, flen, argno, arg, p)
     let literal: i32 = arg.kind == EXPR_ARRAY_LIT or arg.kind == EXPR_ARRAY_FILL
     if literal == 0 and param_takes_array_ref(p) == 1
@@ -1413,12 +1420,331 @@ fn check_array_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: 
 # AGAST #2308: the argument form of emit_lent_into_ref's check, in ritz0's words.
 # ritz0 refuses `g(h)` of `h:& *U` into an `@&*U` too, though `let` takes it
 # (#2325), so that isn't lent yet: this used to pass the `*U` as the reference.
+# Into `m:& *U` it's a place like any other (#2335).
 fn check_lent_ref_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
     let loc: *LocalVar = lent_in_slot_local(s, arg)
     if loc == null or slot_is_ref(p) == 0 or param_takes_array_ref(p) == 1
         return
-    if lent_ref_refused(s, arg, p) == 1 or (loc.var_type == TYPE_PTR and p.param_pointee_type == TYPE_PTR)
+    if lent_ref_refused(s, arg, p) == 1 or (loc.var_type == TYPE_PTR and p.param_pointee_type == TYPE_PTR and p.is_borrow == 0)
         array_arg_error(s, call, fname, flen, argno, c"a `:&` parameter can't go in a reference to another type")
+
+# AGAST #2335: what a bare argument to a `name:& T` param is.  LARB R1's second
+# exception: a place of type `T` is borrowed, as if written `@&x`, the language's
+# only implicit borrow, for every T.  What isn't a place of `T` passes if it's a
+# pointer to one (an `@&T` or a `*T`), whether a place or a call result.  An
+# rvalue is refused: there's nothing for the caller to observe.
+const BORROW_PASS: i32 = 0      # as it's written, by the value paths
+const BORROW_PLACE: i32 = 1     # a place of `T`: its address
+const BORROW_RVALUE: i32 = 2
+const BORROW_MISFIT: i32 = 3    # a place of something else
+const BORROW_UNTYPED: i32 = 4   # an argument ritz1 can't type from here
+const BORROW_SHARED: i32 = 5    # reached through an `@T`, which is read-only
+
+# The type of a place, as far as ritz1 can tell without emitting it.  `name` is
+# a struct's, or for a pointer the struct it points at.
+struct PlaceType
+    kind: i32
+    pointee: i32
+    name: *u8
+    name_len: i32
+
+fn place_type_set(out: *PlaceType, kind: i32, pointee: i32, name: *u8, name_len: i32) -> i32
+    out.kind = kind
+    out.pointee = pointee
+    out.name = name
+    out.name_len = name_len
+    1
+
+fn kind_is_pointer(t: i32) -> i32
+    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
+        return 1
+    0
+
+# What `*x` gives, for `x` of type `base`.
+fn place_deref_type(base: *PlaceType, out: *PlaceType) -> i32
+    var held: i32 = TYPE_UNKNOWN
+    if base.name_len > 0
+        held = TYPE_STRUCT
+    if base.kind == TYPE_PTR_PTR
+        return place_type_set(out, TYPE_PTR, held, base.name, base.name_len)
+    if kind_is_pointer(base.kind) == 0
+        return 0
+    return place_type_set(out, base.pointee, held, base.name, base.name_len)
+
+# What `x[i]` gives.  The array shapes know what they hold; a pointer is `*x`.
+fn place_index_type(s: *EmitterState, value: *Expr, out: *PlaceType) -> i32
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, value, @depth)
+    if sh != null
+        if depth < sh.rank
+            return place_type_set(out, TYPE_ARRAY, TYPE_UNKNOWN, sh.leaf_name, sh.leaf_name_len)
+        return place_type_set(out, sh.leaf_type, TYPE_UNKNOWN, sh.leaf_name, sh.leaf_name_len)
+    var src: ArraySrc
+    if arg_array_shape(s, value.left, @src) == 1
+        var held: i32 = TYPE_UNKNOWN
+        if src.name_len > 0
+            held = TYPE_STRUCT
+        return place_type_set(out, src.elem, held, src.name, src.name_len)
+    var base: PlaceType
+    if place_type_of(s, value.left, @base) == 0
+        return 0
+    return place_deref_type(@base, out)
+
+# The field `e` names on a base member_field_def can't see through: `a[i].f`,
+# `(*c).f`.  Null when the base is no struct, or a pointer to one.
+fn place_field_def(s: *EmitterState, e: *Expr) -> *StructField
+    var base: PlaceType
+    if place_type_of(s, e.left, @base) == 0 or base.name_len <= 0
+        return null
+    let st: *StructDef = find_struct(s, base.name, base.name_len)
+    if st == null
+        return null
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return null
+    get_field_type(st, idx)
+
+# 1 and `out` when ritz1 can type the place `e`.
+fn place_type_of(s: *EmitterState, e: *Expr, out: *PlaceType) -> i32
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc != null
+            if loc.holds_shared_ref == 1
+                return place_type_set(out, TYPE_REF, loc.pointee_type, loc.type_name, loc.type_name_len)
+            return place_type_set(out, loc.var_type, loc.pointee_type, loc.type_name, loc.type_name_len)
+        let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+        if g == null
+            return 0
+        if kind_is_pointer(g.var_type) == 1
+            return place_type_set(out, g.var_type, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
+        return place_type_set(out, g.var_type, TYPE_UNKNOWN, g.type_name, g.type_name_len)
+    if e.kind == EXPR_MEMBER
+        var f: *StructField = member_field_def(s, e)
+        if f == null
+            f = place_field_def(s, e)
+        if f == null
+            return 0
+        return place_type_set(out, f.field_type, ptr_field_elem_kind(f), f.field_type_name, f.field_type_name_len)
+    if e.kind == EXPR_INDEX
+        return place_index_type(s, e, out)
+    if e.kind == EXPR_UNARY and e.op == OP_DEREF
+        var base: PlaceType
+        var pointer: *Expr = e.operand
+        if pointer.kind == EXPR_BINARY
+            pointer = find_base_expr(pointer)
+        if place_type_of(s, pointer, @base) == 0
+            return 0
+        return place_deref_type(@base, out)
+    0
+
+# 1 when `e` is a place: it names storage the caller can see afterwards.
+fn arg_is_place(s: *EmitterState, e: *Expr) -> i32
+    var root: *Expr = e
+    while root.kind == EXPR_MEMBER or root.kind == EXPR_INDEX
+        if root.kind == EXPR_INDEX and root.right != null and root.right.kind == EXPR_RANGE
+            return 0
+        root = root.left
+    if root.kind == EXPR_UNARY and root.op == OP_DEREF
+        return 1
+    if root.kind == EXPR_IDENT
+        if find_local_struct_name(s, root.ident_ptr, root.ident_len) != null
+            return 1
+        return find_global(s, root.ident_ptr, root.ident_len) != null
+    # A field or element of a call result: `@&g().x` isn't lowered either.
+    0
+
+# The struct a method receiver names (by value or through a pointer), or
+# null when ritz1 cannot type it without emitting it.
+# 1 when `recv` names no value, so it's the type of a static call.
+fn method_recv_is_type(s: *EmitterState, recv: *Expr) -> i32
+    if recv == null or recv.kind != EXPR_IDENT
+        return 0
+    if find_local_struct_name(s, recv.ident_ptr, recv.ident_len) != null
+        return 0
+    return find_global(s, recv.ident_ptr, recv.ident_len) == null
+
+fn method_recv_type(s: *EmitterState, recv: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if recv == null
+        return null
+    if recv.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, recv.ident_ptr, recv.ident_len)
+        if loc != null
+            *out_len = loc.type_name_len
+            return loc.type_name
+        let g: *GlobalVarDef = find_global(s, recv.ident_ptr, recv.ident_len)
+        if g != null
+            *out_len = g.type_name_len
+            return g.type_name
+        # `S.make(..)`: a static method's receiver is the type.
+        *out_len = recv.ident_len
+        return recv.ident_ptr as *u8
+    if recv.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, recv)
+        if f == null
+            return null
+        *out_len = f.field_type_name_len
+        return f.field_type_name
+    return null
+
+# The function a method call dispatches to (UFCS helper, impl method or
+# specialized generic impl method), or null.
+fn method_call_def(s: *EmitterState, e: *Expr) -> *FnDef
+    var tlen: i32 = 0
+    let tname: *u8 = method_recv_type(s, e.left, @tlen)
+    if tname == null or tlen <= 0
+        return null
+    return method_callee_def(s, tname, tlen, e.ident_ptr, e.ident_len)
+
+# What `arg`, no place, does for `p`: it passes if it's the pointer `p` is.
+fn rvalue_borrow_kind(s: *EmitterState, arg: *Expr, p: *Param) -> i32
+    if arg.kind == EXPR_NIL_LIT or arg.kind == EXPR_CSTRING_LIT
+        return BORROW_RVALUE
+    var t: i32 = get_expr_type(s, arg)
+    # get_expr_type types a method's float result only.
+    if arg.kind == EXPR_METHOD
+        let m: *FnDef = method_call_def(s, arg)
+        if m == null
+            return BORROW_UNTYPED
+        t = m.return_type
+    if t == TYPE_REF
+        return BORROW_SHARED
+    if p.param_pointee_type == TYPE_PTR
+        if t == TYPE_PTR_PTR
+            return BORROW_PASS
+    else if kind_is_pointer(t) == 1
+        return BORROW_PASS
+    BORROW_RVALUE
+
+# 1 when pointer place `pl` is the `*U` that `p`, a `:& *U`, borrows.
+fn pointer_place_fits(s: *EmitterState, pl: *PlaceType, p: *Param) -> i32
+    let want: i32 = p.param_ref_ptr_pointee
+    # Unrecorded on one side: nothing to compare, as check_struct_ptr_arg.
+    if want == TYPE_VOID or pl.pointee == TYPE_UNKNOWN
+        return 1
+    if want == TYPE_STRUCT or pl.pointee == TYPE_STRUCT
+        return want == pl.pointee and name_eq(p.param_type_name, p.param_type_name_len, pl.name, pl.name_len) == 1
+    return ptr_pointee_size(s, want, null, 0) == ptr_pointee_size(s, pl.pointee, null, 0)
+
+# 1 when the place `arg`, of type `pl`, holds the `T` of `p`.  As in ritz0 it's
+# the LLVM type that has to match: `:& u32` takes an `i32`.
+fn place_fits_borrow(s: *EmitterState, arg: *Expr, pl: *PlaceType, p: *Param) -> i32
+    let pt: i32 = p.param_pointee_type
+    if pl.kind != TYPE_ARRAY and pl.kind != TYPE_STRUCT and pl.kind == pt
+        return 1
+    if pl.kind == TYPE_STRUCT
+        return pt == TYPE_STRUCT and name_eq(p.param_type_name, p.param_type_name_len, pl.name, pl.name_len) == 1
+    if pl.kind == TYPE_ARRAY
+        if pt != TYPE_ARRAY
+            return 0
+        var got: ArrayDims
+        var want: ArrayDims
+        if place_array_dims(s, arg, @got) != ARG_DIMS_ARRAY
+            return 0
+        param_pointee_dims(@want, p)
+        return array_dims_match(@got, @want)
+    if is_borrow_scalar_kind(pl.kind) == 0 or is_borrow_scalar_kind(pt) == 0
+        return 0
+    return ptr_pointee_size(s, pl.kind, null, 0) == ptr_pointee_size(s, pt, null, 0)
+
+# What a pointer place does for `p`: `*U` into `:& *U` is a place of `T`; into
+# `:& U`, or `**U` into `:& *U`, it's the pointer to one, and passes.
+fn pointer_place_kind(s: *EmitterState, pl: *PlaceType, p: *Param) -> i32
+    if p.param_pointee_type != TYPE_PTR
+        return BORROW_PASS
+    if pl.kind == TYPE_PTR_PTR or pl.pointee == TYPE_PTR
+        return BORROW_PASS
+    if pl.kind != TYPE_PTR
+        return BORROW_MISFIT
+    if pointer_place_fits(s, pl, p) == 1
+        return BORROW_PLACE
+    BORROW_MISFIT
+
+# 1 when the place `e` is an `@T`, or the nearest indirection on its path to the
+# root is one.  An `@&T` or `*T` nearer than that makes it writable.
+fn place_behind_shared_ref(s: *EmitterState, e: *Expr) -> i32
+    var pl: PlaceType
+    if place_type_of(s, e, @pl) == 1 and pl.kind == TYPE_REF
+        return 1
+    var at: *Expr = e
+    while at != null
+        if at.kind == EXPR_MEMBER or at.kind == EXPR_INDEX
+            at = at.left
+        else if at.kind == EXPR_UNARY and at.op == OP_DEREF
+            at = at.operand
+            if at.kind == EXPR_BINARY
+                at = find_base_expr(at)
+        else
+            return 0
+        if place_type_of(s, at, @pl) == 1
+            if pl.kind == TYPE_REF
+                return 1
+            if kind_is_pointer(pl.kind) == 1
+                return 0
+    0
+
+# Emits nothing, so it can be asked again at each step of a call.
+fn borrow_arg_kind(s: *EmitterState, arg: *Expr, p: *Param) -> i32
+    if p == null or p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+        return BORROW_PASS
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+        return BORROW_PASS
+    if lent_in_slot_local(s, arg) != null
+        return BORROW_PASS
+    if arg_is_place(s, arg) == 0
+        return rvalue_borrow_kind(s, arg, p)
+    if place_behind_shared_ref(s, arg) == 1
+        return BORROW_SHARED
+    var pl: PlaceType
+    if place_type_of(s, arg, @pl) == 0 or pl.kind == TYPE_UNKNOWN
+        return BORROW_UNTYPED
+    if kind_is_pointer(pl.kind) == 1
+        return pointer_place_kind(s, @pl, p)
+    if place_fits_borrow(s, arg, @pl, p) == 1
+        return BORROW_PLACE
+    BORROW_MISFIT
+
+fn borrow_arg_error(s: *EmitterState, arg: *Expr, fname: *u8, flen: i32, argno: i32, why: *u8)
+    emit_str(s, c"  ; ERROR: argument to a `:&` param (AGAST #2335)\n")
+    eprint_arg_type_error(arg, fname, flen, argno)
+    eprints_cstr(why)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+# Reports what can't go in `:&` param `p`, and answers 1 if it did.
+fn check_borrow_arg(s: *EmitterState, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param) -> i32
+    let k: i32 = borrow_arg_kind(s, arg, p)
+    # check_array_ref_arg says which array it wanted.
+    if k == BORROW_MISFIT and param_takes_array_ref(p) == 1
+        return 0
+    if k == BORROW_RVALUE
+        borrow_arg_error(s, arg, fname, flen, argno, c"a `:&` parameter needs a place to borrow, and this is a temporary")
+    else if k == BORROW_MISFIT
+        borrow_arg_error(s, arg, fname, flen, argno, c"this place doesn't hold what the `:&` parameter borrows")
+    else if k == BORROW_SHARED
+        borrow_arg_error(s, arg, fname, flen, argno, c"a `:&` parameter can't borrow through an `@T`, which is read-only")
+    else if k == BORROW_UNTYPED
+        borrow_arg_error(s, arg, fname, flen, argno, c"ritz1 can't tell what this argument is: write `@&` before it")
+    else
+        return 0
+    1
+
+# The address of a place borrowed by `p`, as an i64 like `@x`; every slot
+# converts that to what it is.  0 when `arg` is anything else.
+fn emit_borrowed_place(s: *EmitterState, arg: *Expr, p: *Param) -> i32
+    if borrow_arg_kind(s, arg, p) != BORROW_PLACE
+        return 0
+    let ptr: i32 = emit_lvalue_ptr(s, arg)
+    if ptr < 0
+        emit_ir_error(s, c"cannot take mutable address")
+        return 0
+    let addr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, addr)
+    emit_str(s, c" = ptrtoint ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c" to i64  ; #2335 borrowed place\n")
+    return addr
 
 # AGAST #1948: passing a pointer to struct A where a pointer to struct B is
 # expected is a located error, as in ritz0 (#1366).  ritz1's value model

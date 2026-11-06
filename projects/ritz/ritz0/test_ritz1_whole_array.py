@@ -1541,7 +1541,7 @@ LOCATED = {
     "arg_ptr_i32": "the parameter doesn't take a whole array",
     "arg_ptr_array": "the parameter doesn't take a whole array",
     "arg_scalar": "the parameter doesn't take a whole array",
-    "borrow_literal": "an array literal has no address to pass",
+    "borrow_literal": "a `:&` parameter needs a place to borrow",
     "borrow_wrong_len": "the array isn't the one the parameter points at",
     "ref_wrong_len": "the array isn't the one the parameter points at",
     "lent_to_ptr": "the parameter doesn't take a whole array",

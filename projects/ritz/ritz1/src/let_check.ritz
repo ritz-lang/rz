@@ -154,38 +154,12 @@ fn let_check_implicit(s: *EmitterState, arg: *Expr, p: *Param)
     var pl: LetPlace
     if let_place(s, arg, @pl) == 0
         return
+    # A `let` that holds a pointer passes that pointer, unless `:& *U` borrows
+    # its own storage (AGAST #2335).
     if pl.kind == TYPE_PTR or pl.kind == TYPE_PTR_PTR or pl.kind == TYPE_REF or pl.kind == TYPE_MUT_REF
-        return
+        if borrow_arg_kind(s, arg, p) != BORROW_PLACE
+            return
     let_error_borrow(s, arg.span.line, arg.span.col, @pl)
-
-# The struct a method receiver names (by value or through a pointer), or
-# null when ritz1 cannot type it without emitting it.
-fn let_recv_type(s: *EmitterState, recv: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
-    if recv == null
-        return null
-    if recv.kind == EXPR_IDENT
-        let loc: *LocalVar = find_local_struct_name(s, recv.ident_ptr, recv.ident_len)
-        if loc == null
-            return null
-        *out_len = loc.type_name_len
-        return loc.type_name
-    if recv.kind == EXPR_MEMBER
-        let f: *StructField = member_field_def(s, recv)
-        if f == null
-            return null
-        *out_len = f.field_type_name_len
-        return f.field_type_name
-    return null
-
-# The function a method call dispatches to (UFCS helper, impl method or
-# specialized generic impl method), or null.
-fn let_method_def(s: *EmitterState, e: *Expr) -> *FnDef
-    var tlen: i32 = 0
-    let tname: *u8 = let_recv_type(s, e.left, @tlen)
-    if tname == null or tlen <= 0
-        return null
-    return method_callee_def(s, tname, tlen, e.ident_ptr, e.ident_len)
 
 # Reject every `@&<let place>` in `e`.  Walks only the expression kinds
 # whose children are plain sub-expressions; a match / if / struct-literal
@@ -211,10 +185,11 @@ pub fn let_check_expr(s: *EmitterState, e: *Expr)
         var p: *Param = null
         if k == EXPR_METHOD
             let_check_expr(s, e.left)
-            let m: *FnDef = let_method_def(s, e)
+            let m: *FnDef = method_call_def(s, e)
             if m != null
                 p = m.params
-                if p != null
+                # `S.make(..)` has no receiver: its params start at the first.
+                if p != null and method_recv_is_type(s, e.left) == 0
                     let_check_implicit(s, e.left, p)
                     p = p.next
         else

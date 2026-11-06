@@ -527,10 +527,10 @@ fn f(n:& i32, s: @&S)
     s.put(n)
 """
 
-# #2325: ritz0 refuses these, so a `:& *U` isn't lent to an argument on either.
+# #2325: a `T` never fits an `@&T`, so a `:& *U` isn't lent to this on either.  Into
+# `m:& *U` it's a place like any other: test_bare_place_borrow.py's pass-on rows.
 POINTER_ARG_REFUSED = {
     "argument": TYPES + "fn g(p: @&*C, d: *C)\n    *p = d\n\nfn go(h:& *C, d: *C)\n    g(h, d)\n",
-    "pass_on": TYPES + "fn g(m:& *C, d: *C)\n    m = d\n\nfn go(h:& *C, d: *C)\n    g(h, d)\n",
 }
 # #2325: ritz0 accepts these, and shouldn't.
 ANOTHER_POINTER = {

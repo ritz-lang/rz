@@ -105,9 +105,14 @@ class RefType(Type):
 
 @dataclass
 class PtrType(Type):
-    """A raw pointer type: *T (immutable) or *mut T (mutable)."""
+    """A raw pointer type: *T (immutable) or *mut T (mutable).
+
+    `shared` marks the type inferred for `@x`, which is an `@T` (AGAST #2335).
+    It's no part of the type's identity: `*T` also has mutable False.
+    """
     inner: Type
     mutable: bool
+    shared: bool = field(default=False, compare=False)
 
 
 @dataclass
