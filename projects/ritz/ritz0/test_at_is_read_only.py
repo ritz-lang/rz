@@ -9,9 +9,8 @@ Rule 2: `@x` of a `let`'s own storage doesn't fit `@&T` or `:&`, at any slot.
 Each row runs on ritz0, ritz1 and ritz1_selfhosted, and all three must report
 the same `line:col: message`.
 
-Whether `@x` of a `var` fits `@&T` or `:&` is #2339's, and whether an `@x` held in
-a `*T` counts as a borrow is #2371's. Nothing here decides either: those rows ask
-only that rule 2 stays out of it.
+`@x` of a `var` into `@&T` or `:&` is #2339's error, and whether an `@x` held in a
+`*T` counts as a borrow is #2371's. Those rows ask only that rule 2 stays out of it.
 """
 
 import pytest

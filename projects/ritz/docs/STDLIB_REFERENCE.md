@@ -775,10 +775,10 @@ import ritzlib.strview
 
 fn key_of(line: StrView) -> StrView
     var b: Buffer = buf_new(line)
-    buf_skip_whitespace(@b)
+    buf_skip_whitespace(@&b)
     let key: StrView = buf_take_ident(@&b)
-    buf_skip_whitespace(@b)
-    if not buf_match_char(@b, '=')
+    buf_skip_whitespace(@&b)
+    if not buf_match_char(@&b, '=')
         return strview_empty()
     return key
 ```
@@ -1318,7 +1318,7 @@ fn save(dir: StrView, name: StrView, text: StrView) -> i32
             Err(e) => return e
     var path: String = path_join(dir, name)
     var r: Result<i64, i32> = write_file(string_as_view(@path), text)
-    string_drop(@path)
+    string_drop(@&path)
     match r
         Ok(_) => 0
         Err(e) => e
@@ -2262,7 +2262,7 @@ fn show_file(path: StrView) -> i32
     match r
         Ok(content) =>
             print_string(@content)
-            string_drop(@content)
+            string_drop(@&content)
             0
         Err(errno) => errno
 ```
@@ -2286,9 +2286,9 @@ import ritzlib.gvec
 
 fn vec_demo() -> i32
     var v: Vec<i32> = vec_new<i32>()
-    vec_push<i32>(@v, 42)
+    vec_push<i32>(@&v, 42)
     let val: i32 = vec_get<i32>(@v, 0)
-    vec_drop<i32>(@v)
+    vec_drop<i32>(@&v)
     val
 ```
 

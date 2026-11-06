@@ -22,7 +22,7 @@ struct; this has what's different for the others:
   a location, whatever the slot refers to. test_value_into_ref.py has each slot;
   MISFITS has a reference to something else, written out and not.
 
-Whether `@x` fits an `@&T` or a `:&` is #2339's: neither gets one here.
+`@x` doesn't fit an `@&T` or a `:&` (#2339): neither gets one here.
 """
 
 import re

@@ -2389,6 +2389,23 @@ fn main() -> i32
     double(@n)
 ```
 
+`@x` is shared. It fits an `@T` or a `*T`, and never an `@&T` or a `:&` parameter,
+at any slot. A callee that may write is given `@&x`, or a bare place if it takes
+`:&` (§13.4), so a shared borrow doesn't become a mutable one on the way in.
+
+```ritz expect-error="`@x` is shared and doesn't fit an `@&T` or `:&` slot: write `@&x`"
+struct Counter
+    n: i32
+
+fn bump(c: @&Counter)
+    c.n = c.n + 1
+
+fn main() -> i32
+    var c = Counter { n: 1 }
+    bump(@c)
+    c.n
+```
+
 An `@x` of a `let`, or of a place in the `let`'s own storage, never reaches a
 mutable slot. It doesn't fit an `@&T` or a `:&` parameter, at any slot, which is
 what `@&x` of a `let` is refused for too (§4.1). A place reached through a pointer
@@ -2444,6 +2461,18 @@ fn main() -> i32
     let n = string_len(@s)
     string_drop(@&s)
     n as i32
+```
+
+`@x` doesn't fit either form (§13.3):
+
+```ritz expect-error="`@x` is shared and doesn't fit an `@&T` or `:&` slot: write `@&x`"
+fn set(n:& i32)
+    n = 3
+
+fn main() -> i32
+    var n: i32 = 1
+    set(@n)
+    n
 ```
 
 A place passed to a `name:& T` parameter is borrowed, as if written `@&x`. It's
@@ -2602,6 +2631,22 @@ The first rule is checked. Taking `@&x` while an `@x` is live is an error:
 var x: i32 = 1
 let p = @x
 let q = @&x
+```
+
+The arguments of one call are live together, so a read of `x` can't sit beside
+`@&x` in them. Read it into a binding first:
+
+```ritz expect-error="cannot borrow `x` as immutable - already borrowed as mutable"
+fn get(n: @i32) -> i32
+    *n
+
+fn put(n: @&i32, v: i32)
+    *n = v
+
+fn main() -> i32
+    var x: i32 = 1
+    put(@&x, get(@x) + 1)
+    x
 ```
 
 There are no lifetime annotations and no generic lifetime parameters, so the

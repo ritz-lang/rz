@@ -10,8 +10,7 @@ implicit borrow left is a place into a `:&` parameter.
 Each row runs on ritz0, ritz1 and ritz1_selfhosted, and all three must report
 the same `line:col: message`.
 
-Whether `@x` fits `@&T` or `:&` is #2339's. Nothing here depends on it: an `@&T`
-slot is only ever given `@&c`.
+`@x` doesn't fit `@&T` or `:&` (#2339), so an `@&T` slot is only ever given `@&c`.
 """
 
 import pytest

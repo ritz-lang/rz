@@ -33,6 +33,10 @@ SHARED_INTO_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
 # `@&x` of a place behind an `@T`, or `@x` of one where an `@&T` or `:&` goes.
 BORROW_THROUGH_SHARED = "cannot borrow through an `@T` as mutable: make it `@&T`"
 
+# `@x` where an `@&T` or `:&` goes: `@x` is shared, and mutation is written
+# (LANGUAGE_SPEC §13.3, Aaron's ruling on AGAST #2339).
+ADDR_INTO_MUT = "`@x` is shared and doesn't fit an `@&T` or `:&` slot: write `@&x`"
+
 # A return or tail that definitely refers to a local root (LANGUAGE_SPEC §13.5,
 # LARB ruling R2, AGAST #2340). `name` is the root, however it was reached.
 def returns_local(name: str) -> str:

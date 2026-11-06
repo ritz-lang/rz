@@ -561,7 +561,7 @@ fn f(a:& [4]i32) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return f(@a)
+    return f(@&a)
 """,
     "borrow_writes": """\
 fn g(a:& [4]i32, p: *i32)
@@ -1106,7 +1106,7 @@ fn f(a:& [4]i32) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return f(@a)
+    return f(@&a)
 """,
     "lent_to_scalar_ptr": """\
 fn g(p: *i32) -> i32
@@ -1117,7 +1117,7 @@ fn f(a:& [4]i32) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return f(@a)
+    return f(@&a)
 """,
     "wrong_elem_struct": """\
 struct A

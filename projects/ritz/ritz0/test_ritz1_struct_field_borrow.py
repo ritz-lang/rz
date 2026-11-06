@@ -195,7 +195,7 @@ struct R
 
 pub fn main() -> i32
     var x: T = 3
-    var r: R = R { p: @x }
+    var r: R = R { p: @&x }
     return *r.p as i32
 """
 
@@ -238,7 +238,7 @@ pub fn main() -> i32
 _PRIM_BASE = {"read": PRIM_READ, "write": PRIM_WRITE, "mixed": PRIM_MIXED}
 _PRIM_SPELLINGS = {"colon_amp": ":& T", "at": ": @T", "at_amp": ": @&T"}
 PRIM_ACCESS = {
-    f"{name}_{spelling}_{ty}": prog.replace("FIELD", field).replace("T", ty)
+    f"{name}_{spelling}_{ty}": prog.replace("FIELD", field).replace("@&x", "@x" if field.startswith(": @") and "&" not in field else "@&x").replace("T", ty)
     for name, prog in _PRIM_BASE.items()
     for spelling, field in _PRIM_SPELLINGS.items()
     for ty in ("i32", "u8", "i64")
@@ -277,7 +277,7 @@ fn peek(q: *T) -> T
 
 pub fn main() -> i32
     var x: T = 1.5
-    var r: R = R { head: 1, p: @x, tail: 1 }
+    var r: R = R { head: 1, p: @&x, tail: 1 }
     *r.p = *r.p - 0.5
     return (peek(r.p) as i64 + r.head as i64 + r.tail) as i32
 """

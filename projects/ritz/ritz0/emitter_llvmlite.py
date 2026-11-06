@@ -3776,7 +3776,7 @@ class LLVMEmitter:
         its own address. What isn't a place of `T` passes if it's the pointer
         the parameter is: an `@&T` or a `*T`, whether a place or a call result.
         An rvalue of any other kind is refused: there's nothing for the caller
-        to observe. `@x` and `@&x` are as written (whether `@x` fits is #2339).
+        to observe. `@x` and `@&x` are as written (the checker refuses `@x`, #2339).
 
         Decided from LLVM types, which are exact here, and not from inference:
         an Ident holding a `*T` can infer as `T`.

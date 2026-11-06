@@ -7,16 +7,16 @@ reference, a field, an element, a call result.
 Rule 2: a method taking `self: @&T` is refused through an `@T` receiver, or a
 receiver behind one, whichever way the method was found.
 Rule 3: `@&` of a place behind an `@T` is an error wherever it's written. `@x` of
-one is too where it lands in `@&T` or `:&`: whatever #2339 makes of `@x`, the
-place stays read-only.
+one is too where it lands in `@&T` or `:&`, with this message and not #2339's:
+`@&x` wouldn't compile either.
 
 The walk is #2338's, so a `*T` ends it, and what's behind one isn't judged.
 
 Each row runs on ritz0, ritz1 and ritz1_selfhosted, and all three must report
 the same `line:col: message`.
 
-Whether `@x` of a `var` fits `@&T` or `:&` is #2339's, whether an `@x` held in a
-`*T` counts as a borrow is #2371's, and a reference to another type is #2367's and
+`@x` of a `var` into `@&T` or `:&` is #2339's error, whether an `@x` held in a `*T`
+counts as a borrow is #2371's, and a reference to another type is #2367's and
 #2368's. Nothing here decides those: the `@x` rows ask only that these rules stay
 out of it.
 """
@@ -241,7 +241,8 @@ COMPILES = {
                                   "fn g(s: @S) -> i64\n    s.v.len()\n",
 }
 
-# `@x` of what isn't behind an `@T`: #2339's. Each asks only that rule 3 stays out.
+# `@x` of what isn't behind an `@T`: #2339 refuses these. Each asks only that rule 3
+# stays out.
 NOT_THESE_RULES = {
     "var": "fn f() -> i32\n    var c = C { x: 1 }\n    mb(@c)\n",
     "var_field": "fn f() -> i32\n    var c = C { x: 1 }\n    mi(@c.x)\n",

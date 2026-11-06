@@ -311,8 +311,8 @@ struct LineBounds
 
 fn main() -> i32
     var lines: Vec<LineBounds> = vec_with_cap<LineBounds>(8)
-    vec_push<LineBounds>(@lines, LineBounds { start: 7, length: 2 })
-    vec_push<LineBounds>(@lines, LineBounds { start: 30, length: 3 })
+    vec_push<LineBounds>(@&lines, LineBounds { start: 7, length: 2 })
+    vec_push<LineBounds>(@&lines, LineBounds { start: 30, length: 3 })
     let l0: *LineBounds = lines.data + 0
     let l1: *LineBounds = lines.data + 1
     if l0.start != 7 or l0.length != 2

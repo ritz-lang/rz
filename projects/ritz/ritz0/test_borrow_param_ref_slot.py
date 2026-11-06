@@ -19,8 +19,8 @@ was bound, or reads through it after the referent changed, so a pointer to a
 temporary copy can't pass.
 
 test_value_into_ref.py has the refusals of the bare form at each slot. What's
-here is a shape that table doesn't have. Whether `@x` fits an `@&T` or a `:&` is
-#2339's, so an `@&T` slot or `:&` param is only ever given `@&c`, an `@&T` value
+here is a shape that table doesn't have. `@x` doesn't fit an `@&T` or a `:&`
+(#2339), so an `@&T` slot or `:&` param is only ever given `@&c`, an `@&T` value
 or a place.
 """
 

@@ -155,7 +155,7 @@ READS = {
     "infer_copy_reference": "fn f(p: @[3]i32) -> i32\n    let q = p\n    return q[1]\n\n" + _a("    return f(@a)\n"),
     "infer_copy_mut_reference": "fn f(p: @&[3]i32) -> i32\n    let q = p\n    return q[1]\n\n" + _a("    return f(@&a)\n"),
     "infer_copy_twice": "fn f(p: *[3]i32) -> i32\n    let q = p\n    let r = q\n    return r[1]\n\n" + _a("    return f(@a)\n"),
-    "infer_from_lent": "fn f(a:& [3]i32) -> i32\n    let p = @a\n    return p[1]\n\n" + _a("    return f(@a)\n"),
+    "infer_from_lent": "fn f(a:& [3]i32) -> i32\n    let p = @a\n    return p[1]\n\n" + _a("    return f(@&a)\n"),
     "infer_from_by_value": "fn f(a: [3]i32) -> i32\n    let p = @a\n    return p[1]\n\n" + _a("    return f(a)\n"),
     "infer_from_global": "var g: [3]i32\n\npub fn main() -> i32\n    g[1] = 20\n    let p = @g\n    return p[1]\n",
     "infer_mut_from_global": "var g: [3]i32\n\npub fn main() -> i32\n    g[1] = 20\n    let p = @&g\n    return p[1]\n",
@@ -453,7 +453,7 @@ def test_ritz1_refuses_a_pointer_element(compile_with, name, compiler):
 # with no diagnostic.
 _S = "struct S\n    x: i32\n    y: i64\n\n"
 _SMAIN = "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    a[1].y = 6\n    return f(@a) as i32\n"
-_SMUT = _SMAIN.replace("f(@a)", "f(@&a)")
+_SMUT = _SMAIN.replace("f(@a)", "f(@a)")
 WHOLE_STRUCT_ELEMENT = {
     "by_value": _S + "fn f(p: *[3]S) -> i32\n    let s: S = p[1]\n    return s.x\n\n" + _SMAIN,
     "by_value_argument": _S + "fn g(s: S) -> i32\n    return s.x\n\nfn f(p: *[3]S) -> i32\n    return g(p[1])\n\n" + _SMAIN,

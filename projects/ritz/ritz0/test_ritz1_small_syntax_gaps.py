@@ -206,7 +206,7 @@ fn main() -> i32
     v.push(p)
     p.y = 10
     v.push(p)
-    return dup_sum(@v)
+    return dup_sum(@&v)
 """,
         42,
     ),

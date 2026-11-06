@@ -21,7 +21,7 @@ T, pointers included. It's the language's only implicit borrow.
 - FIT. A place of another type is refused. `i32` into `:& i64` would have become
   an 8-byte store over a 4-byte place, so neighbours check the width.
 - POINTER FAMILY. The ruling's `:&` row keeps `m` and `p`: an `@&T` or `*T` isn't
-  a place of `T`, so it passes as the pointer it is. Whether `@x` fits is #2339.
+  a place of `T`, so it passes as the pointer it is. `@x` doesn't fit (#2339).
 """
 
 import os
@@ -305,7 +305,6 @@ POINTER_FAMILY = {
                           "pub fn main() -> i32\n" + GOOD +
                           "    var p: *C = @c1\n    let pp: **C = @p\n    w(pp, @c3)\n    return p.x\n",
     "explicit_mut": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n    w(@&n)\n    return n\n",
-    "explicit_shared": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n    w(@n)\n    return n\n",
     "explicit_pointer_referent": C + "fn w(r:& *C, d: *C)\n    r = d\n\n"
                                  "pub fn main() -> i32\n" + GOOD +
                                  "    var p: *C = @c1\n    w(@&p, @c3)\n    return p.x\n",
@@ -653,9 +652,9 @@ def test_a_method_place_of_another_type_is_refused(tmp_path, compiler, name):
     assert f"argument {argno} of `put` has the wrong type" in error, error
 
 
-# ritz0 only: ritz1 takes this one, and it's `@x`'s question (#2339, #2348).
+# ritz0 only: ritz1 takes this one (#2348).
 def test_an_explicit_borrow_of_another_type_is_no_temporary(tmp_path):
-    src = INT_WRITER + "pub fn main() -> i32\n    var n: i64 = 1\n    w(@n)\n    return 0\n"
+    src = INT_WRITER + "pub fn main() -> i32\n    var n: i64 = 1\n    w(@&n)\n    return 0\n"
     error = _error("ritz0", tmp_path, "explicit", src)
     assert "argument 1 of `w` has the wrong type" in error and "temporary" not in error, error
 

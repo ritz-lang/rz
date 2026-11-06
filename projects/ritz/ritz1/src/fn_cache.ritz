@@ -202,8 +202,8 @@ fn fnv1a_mix_bytes(h: u64, p: *u8, n: i64) -> u64
 fn fnv1a_mix_cwd(h: u64) -> u64
     var cwd: String = string_new()
     push_canonical_path(@cwd, c".")
-    let acc: u64 = fnv1a_mix_bytes(fnv1a_mix_u64(h, 4), string_as_ptr(@cwd), string_len(@cwd))
-    string_drop(@cwd)
+    let acc: u64 = fnv1a_mix_bytes(fnv1a_mix_u64(h, 4), string_as_ptr(@&cwd), string_len(@cwd))
+    string_drop(@&cwd)
     return acc
 
 # Fold the canonical path of the directory `dir[0..len)` into `h`.  A
@@ -219,8 +219,8 @@ fn fnv1a_mix_dir(h: u64, dir: *u8, len: i64) -> u64
     var canon: String = string_new()
     var acc: u64 = h
     if push_canonical_path(@canon, cstr) == 1
-        acc = fnv1a_mix_bytes(fnv1a_mix_u64(acc, 1), string_as_ptr(@canon), string_len(@canon))
-    string_drop(@canon)
+        acc = fnv1a_mix_bytes(fnv1a_mix_u64(acc, 1), string_as_ptr(@&canon), string_len(@canon))
+    string_drop(@&canon)
     free(cstr)
     return acc
 
@@ -327,11 +327,11 @@ pub fn push_canonical_path(out: *String, path: *u8) -> i32
     if fd < 0
         return 0
     var link: String = string_from("/proc/self/fd/")
-    string_push_i64(@link, fd as i64)
+    string_push_i64(@&link, fd as i64)
     var buf: [4096]u8
-    let n: i64 = sys_readlink(string_as_ptr(@link), @buf[0], 4096)
+    let n: i64 = sys_readlink(string_as_ptr(@&link), @buf[0], 4096)
     sys_close(fd)
-    string_drop(@link)
+    string_drop(@&link)
     if n <= 0 or n >= 4096
         return 0
     string_push_bytes(out, @buf[0], n)
@@ -342,13 +342,13 @@ pub fn push_canonical_path(out: *String, path: *u8) -> i32
 pub fn sig_path_from_src(src_path: *u8) -> String
     var s: String = string_new()
     push_cache_root(@s)
-    string_push(@s, '/')
+    string_push(@&s, '/')
     push_compiler_namespace(@s)
     # The canonical path starts with '/', which separates it from the namespace.
     if push_canonical_path(@s, src_path) == 0
-        string_clear(@s)
+        string_clear(@&s)
         return s
-    string_push_str(@s, ".sig")
+    string_push_str(@&s, ".sig")
     return s
 
 # Build "<sig_path>.tmp.<pid>" — used for atomic writes.  The pid keeps two
@@ -356,8 +356,8 @@ pub fn sig_path_from_src(src_path: *u8) -> String
 # writing into each other's temp file.
 fn sig_tmp_path(sig_path: *u8) -> String
     var s: String = string_from_cstr(sig_path)
-    string_push_str(@s, ".tmp.")
-    string_push_i64(@s, sys_getpid() as i64)
+    string_push_str(@&s, ".tmp.")
+    string_push_i64(@&s, sys_getpid() as i64)
     return s
 
 # `mkdir -p` the directory part of `path`.  Errors (EEXIST included) are
@@ -581,13 +581,13 @@ pub fn dep_record_miss(path: *u8)
     if *path != '/'
         if push_canonical_path(@abs, c".") == 0
             g_miss_lost = 1
-            string_drop(@abs)
+            string_drop(@&abs)
             return
-        string_push(@abs, '/')
-    string_push_cstr(@abs, path)
-    if sig_data_add_miss(g_dep_record, string_as_ptr(@abs), string_len(@abs)) == 0
+        string_push(@&abs, '/')
+    string_push_cstr(@&abs, path)
+    if sig_data_add_miss(g_dep_record, string_as_ptr(@&abs), string_len(@abs)) == 0
         g_miss_lost = 1
-    string_drop(@abs)
+    string_drop(@&abs)
 
 pub fn dep_record_note(path: *u8, data: *u8, len: i64)
     if g_dep_record == null
@@ -596,12 +596,12 @@ pub fn dep_record_note(path: *u8, data: *u8, len: i64)
             return
     var canon: String = string_new()
     if push_canonical_path(@canon, path) == 1
-        sig_data_add_dep(g_dep_record, string_as_ptr(@canon), string_len(@canon), fnv1a_bytes(data, len))
+        sig_data_add_dep(g_dep_record, string_as_ptr(@&canon), string_len(@canon), fnv1a_bytes(data, len))
     else
         # Unresolvable: record it under a path that can never be read back,
         # so the next fast-path check fails closed.
         sig_data_add_dep(g_dep_record, c"", 0, 0)
-    string_drop(@canon)
+    string_drop(@&canon)
 
 # Move the recorded dependencies into `sd` and mark it as carrying them
 # (a compile with no imports legitimately records none).
@@ -894,30 +894,30 @@ pub fn write_sig_file(sig_path: *u8, sd: *SigData) -> i32
         return -1
     mkdir_parents(sig_path)
     var tmp: String = sig_tmp_path(sig_path)
-    let tmp_ptr: *u8 = string_as_ptr(@tmp)
+    let tmp_ptr: *u8 = string_as_ptr(@&tmp)
 
     var buf: Vec<u8> = vec_with_cap<u8>(8192)
     sig_serialize(sd, @buf)
 
     let fd: i32 = sys_open3(tmp_ptr, O_WRONLY + O_CREAT + O_TRUNC, 420)
     if fd < 0
-        vec_drop<u8>(@buf)
-        string_drop(@tmp)
+        vec_drop<u8>(@&buf)
+        string_drop(@&tmp)
         return -1
     let n: i64 = sys_write(fd, buf.data, buf.len as i64)
     sys_close(fd)
     let want: i64 = buf.len as i64
-    vec_drop<u8>(@buf)
+    vec_drop<u8>(@&buf)
     if n != want
         sys_unlink(tmp_ptr)
-        string_drop(@tmp)
+        string_drop(@&tmp)
         return -1
     let r: i32 = sys_rename(tmp_ptr, sig_path)
     if r != 0
         sys_unlink(tmp_ptr)
-        string_drop(@tmp)
+        string_drop(@&tmp)
         return -1
-    string_drop(@tmp)
+    string_drop(@&tmp)
     return 0
 
 
@@ -976,10 +976,10 @@ pub fn check_source_unchanged(src_path: *u8, src: *u8, src_len: i64, ll_path: *u
 
     var sig_path: String = sig_path_from_src(src_path)
     if string_is_empty(@sig_path)
-        string_drop(@sig_path)
+        string_drop(@&sig_path)
         return 0
-    let sd: *SigData = read_sig_file(string_as_ptr(@sig_path))
-    string_drop(@sig_path)
+    let sd: *SigData = read_sig_file(string_as_ptr(@&sig_path))
+    string_drop(@&sig_path)
     if sd == null
         return 0
 

@@ -6,7 +6,7 @@ Validates that type errors are caught before code generation.
 
 import pytest
 from parser import parse
-from ref_rules import ADDR_INTO_VALUE
+from ref_rules import ADDR_INTO_MUT, ADDR_INTO_VALUE
 from type_checker import TypeChecker, TypeError
 
 
@@ -491,13 +491,21 @@ fn take(c: C) -> i32
     c.x
 """
 
-    @pytest.mark.parametrize("arg", ["@c", "@&c", "c"])
+    @pytest.mark.parametrize("arg", ["@&c", "c"])
     def test_lent_param_takes_a_place_or_a_reference(self, arg):
         assert check(self.DEFS + f"""
 fn f() -> i32
     var c = C {{ x: 1 }}
     bump({arg})
 """) == []
+
+    def test_lent_param_refuses_the_shared_form(self):
+        errors = check(self.DEFS + """
+fn f() -> i32
+    var c = C { x: 1 }
+    bump(@c)
+""")
+        assert [e for e in errors if ADDR_INTO_MUT in str(e)]
 
     def test_by_value_param_is_still_judged(self):
         errors = check(self.DEFS + """

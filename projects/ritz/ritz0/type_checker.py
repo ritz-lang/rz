@@ -840,7 +840,7 @@ class TypeChecker:
                         # `name:& T` borrows a `T` place, and takes what
                         # already points at one (§13.4).
                         arg_type = self._infer_type(arg)
-                        self._check_let_into_mut(arg)
+                        self._check_addr_into_mut(arg)
                         self._forget_local_ref(arg)
                         if isinstance(self._resolve_alias(arg_type),
                                       (rast.PtrType, rast.RefType)):
@@ -949,7 +949,7 @@ class TypeChecker:
             if at in fn_sig.lent:
                 self._forget_local_ref(arg)
             if at in fn_sig.lent and own_method:
-                self._check_let_into_mut(arg)
+                self._check_addr_into_mut(arg)
 
         return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
 
@@ -1253,7 +1253,7 @@ class TypeChecker:
         actual = self._resolve_alias(actual)
         slot = self._resolve_alias(slot)
         if isinstance(slot, rast.RefType) and slot.mutable:
-            self._check_let_into_mut(expr)
+            self._check_addr_into_mut(expr)
             self._check_shared_into_mut(expr, actual)
         if isinstance(slot, (rast.PtrType, rast.RefType)):
             self._check_value_into_ref(expr, actual, slot)
@@ -1381,17 +1381,18 @@ class TypeChecker:
         name = self._own_storage(place)
         return name if name is not None and self._is_let(name) else None
 
-    def _check_let_into_mut(self, expr: rast.Expr) -> None:
-        """`expr` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't, nor
-        does `@x` of a place behind an `@T`."""
-        if isinstance(expr, rast.Grouped):
-            self._check_let_into_mut(expr.expr)
-        elif isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@'):
+    def _check_addr_into_mut(self, expr: rast.Expr) -> None:
+        """`expr` lands in an `@&T` or a `:&` param, which `@x` never does. Of a
+        `let`, or of a place behind an `@T`, `@&x` wouldn't do either, so those
+        say what would."""
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@'):
             name = self._let_root(expr.operand)
             if name is not None:
                 self._report_once(expr, ref_rules.let_into_mut(name))
+            elif self._behind_shared(expr.operand):
+                self._report_once(expr, ref_rules.BORROW_THROUGH_SHARED)
             else:
-                self._check_borrow(expr)
+                self._report_once(expr, ref_rules.ADDR_INTO_MUT)
 
     # An `@T` doesn't become an `@&T` (LANGUAGE_SPEC §3.2, §13.3, AGAST #2374)
 
@@ -1401,8 +1402,8 @@ class TypeChecker:
             self._report_once(expr, ref_rules.BORROW_THROUGH_SHARED)
 
     def _check_shared_into_mut(self, expr: rast.Expr, actual: rast.Type) -> None:
-        """`expr`, of type `actual`, lands in an `@&T`. `@x` is the slot's
-        question: #2339 for a `var`, _check_let_into_mut for the rest."""
+        """`expr`, of type `actual`, lands in an `@&T`. `@x` is
+        _check_addr_into_mut's."""
         written = isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@')
         if isinstance(actual, rast.RefType) and not actual.mutable and not written:
             self._report_once(expr, ref_rules.SHARED_INTO_MUT)

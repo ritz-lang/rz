@@ -229,8 +229,8 @@ import ritzlib.string
 
 fn main() -> i32
     var s: String = string_new()
-    string_push(@s, 65)
-    string_push(@s, 66)
+    string_push(@&s, 65)
+    string_push(@&s, 66)
     let n: i64 = string_len(@s)
     let b: u8 = string_get(@s, 1)
     return n as i32 + b as i32 - 26
@@ -248,8 +248,8 @@ fn main() -> i32
     var b: LineBounds
     b.start = 30
     b.length = 12
-    vec_push<LineBounds>(@v, a)
-    vec_push<LineBounds>(@v, b)
+    vec_push<LineBounds>(@&v, a)
+    vec_push<LineBounds>(@&v, b)
     let second: *LineBounds = v.data + 1
     return second.length as i32 + v.len as i32 * 15 - 0
 """
@@ -264,8 +264,8 @@ import ritzlib.gvec
 
 fn main() -> i32
     var v = vec_new<i16>()
-    vec_push<i16>(@v, 5)
-    vec_push<i16>(@v, 40)
+    vec_push<i16>(@&v, 5)
+    vec_push<i16>(@&v, 40)
     # vec_push$i16 stores at `v.data + len`, striding by the FIELD's pointee.
     # Reading through a local `*i16` strides by 2 regardless, so a lost
     # pointee (stride 8) is caught instead of cancelling itself out.
@@ -304,8 +304,8 @@ fn main() -> i32
     var y: {name}
     y.a = 3
     y.b = 40
-    vec_push<{name}>(@w, x)
-    vec_push<{name}>(@w, y)
+    vec_push<{name}>(@&w, x)
+    vec_push<{name}>(@&w, y)
     return second_b(@&w) as i32 + w.len as i32
 """
 

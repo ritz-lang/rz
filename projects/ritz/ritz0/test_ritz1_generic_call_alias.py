@@ -45,9 +45,9 @@ fn f(d: *D) -> i64
 
 pub fn main() -> i32
     var d: D = D { v: vec_new<Id>() }
-    vec_push<Id>(@d.v, 7)
-    vec_push<Id>(@d.v, 9)
-    vec_push<Id>(@d.v, 11)
+    vec_push<Id>(@&d.v, 7)
+    vec_push<Id>(@&d.v, 9)
+    vec_push<Id>(@&d.v, 11)
     return f(@d) as i32
 """
 
@@ -68,8 +68,8 @@ fn take(doc: *Doc) -> NodeId
 
 pub fn main() -> i32
     var doc: Doc = Doc { free_list: vec_new<NodeId>() }
-    vec_push<NodeId>(@doc.free_list, 2)
-    vec_push<NodeId>(@doc.free_list, 5)
+    vec_push<NodeId>(@&doc.free_list, 2)
+    vec_push<NodeId>(@&doc.free_list, 5)
     return take(@doc) as i32
 """
 
@@ -99,8 +99,8 @@ struct D
 
 pub fn main() -> i32
     var d: D = D { v: vec_new<u32>() }
-    vec_push<Id>(@d.v, 1)
-    vec_push<Raw>(@d.v, 2)
+    vec_push<Id>(@&d.v, 1)
+    vec_push<Raw>(@&d.v, 2)
     let x: Id = vec_get<Id>(@d.v, 1)
     return (vec_len<Id>(@d.v) as i32) + (x as i32) - 1
 """
@@ -118,7 +118,7 @@ struct D
 pub fn main() -> i32
     var a: u32 = 3
     var d: D = D { v: vec_new<*u32>() }
-    vec_push<*Id>(@d.v, @a)
+    vec_push<*Id>(@&d.v, @a)
     let p: *Id = vec_get<*Id>(@d.v, 0)
     return (vec_len<*Id>(@d.v) as i32) + (*p as i32) - 1
 """
@@ -140,7 +140,7 @@ struct D
 
 pub fn main() -> i32
     var d: D = D { v: vec_new<Pair<u32>>() }
-    vec_push<Pair<Id>>(@d.v, Pair<Id> { a: 1, b: 2 })
+    vec_push<Pair<Id>>(@&d.v, Pair<Id> { a: 1, b: 2 })
     let q: Pair<Id> = vec_get<Pair<Id>>(@d.v, 0)
     return (vec_len<Pair<Id>>(@d.v) as i32) + (q.b as i32)
 """

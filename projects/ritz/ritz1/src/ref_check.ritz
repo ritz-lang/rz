@@ -30,7 +30,7 @@
 # reference", which only reaches a program with a Drop in it.
 #
 # `@T` is read-only (AGAST #2338), and doesn't become an `@&T` (AGAST #2374): near
-# the end of this file, and ref_let_into_mut.  A reference to a local doesn't
+# the end of this file, and ref_addr_into_mut.  A reference to a local doesn't
 # leave its fn (AGAST #2340): the end of this file.
 
 import ritzlib.sys
@@ -482,7 +482,7 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
         ref_note_value(e, slot)
         return
     if slot.kind == TYPE_MUT_REF
-        ref_let_into_mut(s, e)
+        ref_addr_into_mut(s, e)
         ref_shared_into_mut(s, e)
     if slot.returned == 1
         ref_check_return(s, e)
@@ -554,7 +554,7 @@ fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
         if p != null
             var slot: RefTy
             if p.is_borrow == 1
-                ref_let_into_mut(s, a)
+                ref_addr_into_mut(s, a)
                 ref_forget(s, a)
             else if ref_of_param(p, @slot) == 1
                 ref_into(s, a, @slot)
@@ -958,14 +958,20 @@ fn ref_check_write(s: *EmitterState, stmt: *Stmt)
     eprints_cstr(c": error: cannot write through an `@T`: make it `@&T`\n")
     s.error_count = s.error_count + 1
 
-# `e` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't, nor does `@x` of
-# a place behind an `@T`.
-fn ref_let_into_mut(s: *EmitterState, e: *Expr)
+# `e` lands in an `@&T` or a `:&` param, which `@x` never does (LANGUAGE_SPEC §13.3,
+# AGAST #2339).  Of a `let`, or of a place behind an `@T`, `@&x` wouldn't do either,
+# so those say what would.  ritz0's twin is TypeChecker._check_addr_into_mut.
+fn ref_addr_into_mut(s: *EmitterState, e: *Expr)
     if let_addr_of_own(s, e) == 1
         if ref_first_report(e.span.line, e.span.col) == 1
             let_error_addr(s, e)
     else if e.kind == EXPR_UNARY and e.op == OP_ADDR
-        ref_check_borrow(s, e)
+        if ref_write_is_shared(s, e.operand) == 1
+            ref_check_borrow(s, e)
+        else if ref_first_report(e.span.line, e.span.col) == 1
+            ref_eprint_loc(e.span.line, e.span.col)
+            eprints_cstr(c": error: `@x` is shared and doesn't fit an `@&T` or `:&` slot: write `@&x`\n")
+            s.error_count = s.error_count + 1
 
 # An `@T` doesn't become an `@&T` (LANGUAGE_SPEC §3.2, §13.3, AGAST #2374).  ritz0's
 # twins are TypeChecker._check_borrow, _check_shared_into_mut and _check_receiver,
@@ -988,8 +994,7 @@ fn ref_check_borrow(s: *EmitterState, e: *Expr)
     eprints_cstr(c": error: cannot borrow through an `@T` as mutable: make it `@&T`\n")
     s.error_count = s.error_count + 1
 
-# `e` lands in an `@&T`.  `@x` is the slot's question: #2339 for a `var`,
-# ref_let_into_mut for the rest.
+# `e` lands in an `@&T`.  `@x` is ref_addr_into_mut's.
 fn ref_shared_into_mut(s: *EmitterState, e: *Expr)
     if e.kind == EXPR_UNARY and e.op == OP_ADDR
         return

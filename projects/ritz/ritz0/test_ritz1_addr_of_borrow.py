@@ -57,14 +57,14 @@ enum E
 MAIN_C = """
 pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
-    return f(@c)
+    return f(@&c)
 """
 
 # The caller's `x` starts at 1: only a write through the borrow makes it 3.
 MAIN_WRITE = """
 pub fn main() -> i32
     var c: C = C { x: 1, y: 0 }
-    f(@c)
+    f(@&c)
     return c.x
 """
 
@@ -75,36 +75,41 @@ pub fn main() -> i32
     return c.x
 """
 
+# `o` comes back from a call so that no borrow of `c` is live at `@&c` (§13.5).
 MAIN_SAME = """
+fn address(c: @C) -> *C
+    return c
+
 pub fn main() -> i32
     var c: C = C { x: 1, y: 0 }
-    return f(@c, @c)
+    let o: *C = address(@c)
+    return f(@&c, o)
 """
 
 MAIN_BIG = """
 pub fn main() -> i32
     var c: Big
     c.x = 3
-    return f(@c)
+    return f(@&c)
 """
 
 MAIN_ARRAY = """
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
-    return f(@a)
+    return f(@&a)
 """
 
 MAIN_ARRAY_WRITE = """
 pub fn main() -> i32
     var a: [2]i32 = [1, 1]
-    f(@a)
+    f(@&a)
     return a[1]
 """
 
 MAIN_F64 = """
 pub fn main() -> i32
     var n: f64 = 3.0
-    return f(@n)
+    return f(@&n)
 """
 
 
@@ -117,7 +122,7 @@ struct W<T>
 MAIN_W = """
 pub fn main() -> i32
     var w: W<i32> = W<i32> { v: 3 }
-    return f(@w)
+    return f(@&w)
 """
 
 # Named so that ritz1's name-based Vec paths see it. ritzlib's would need linking.
@@ -134,7 +139,7 @@ pub fn main() -> i32
     var v: Vec<i32>
     v.data = @d[0]
     v.len = 2
-    return f(@v)
+    return f(@&v)
 """
 
 
@@ -154,7 +159,7 @@ impl Drop for Res
 MAIN_DROP = """
 fn go()
     var r: Res = Res { id: 3 }
-    f(@r)
+    f(@&r)
 
 pub fn main() -> i32
     go()
@@ -223,7 +228,7 @@ fn g(c:& C) -> *C
     return @c
 
 fn f(c:& C) -> i32
-    let p: *C = g(@c)
+    let p: *C = g(@&c)
     return p.x
 """),
     "return_ref": _body("""\
@@ -231,7 +236,7 @@ fn g(c:& C) -> @C
     return @c
 
 fn f(c:& C) -> i32
-    let p: @C = g(@c)
+    let p: @C = g(@&c)
     return p.x
 """),
     "return_mut_ref": _body("""\
@@ -247,7 +252,7 @@ fn g(c:& C) -> *C
     @c
 
 fn f(c:& C) -> i32
-    let p: *C = g(@c)
+    let p: *C = g(@&c)
     return p.x
 """),
     "tail_mut_ref": _body("""\
@@ -267,14 +272,14 @@ fn h(d:& C) -> i32
     return k(@d)
 
 fn f(c:& C) -> i32
-    return h(@c)
+    return h(@&c)
 """),
     "generic_struct": _body("""\
 fn h<T>(p:& T) -> *T
     return @p
 
 fn f(c:& C) -> i32
-    let p: *C = h<C>(@c)
+    let p: *C = h<C>(@&c)
     return p.x
 """),
     "generic_struct_type": TYPES + GENERIC + """\
@@ -293,7 +298,7 @@ fn f<T>(c:& W<T>) -> T
 
 pub fn main() -> i32
     var w: W<i32> = W<i32> { v: 3 }
-    return f<i32>(@w)
+    return f<i32>(@&w)
 """,
     "generic_struct_deref": TYPES + GENERIC + """\
 fn f(c:& W<i32>) -> i32
@@ -321,7 +326,7 @@ fn f(e:& E) -> i32
 
 pub fn main() -> i32
     var e: E = E.One(3)
-    return f(@e)
+    return f(@&e)
 """,
 }
 
@@ -330,8 +335,8 @@ ARGUMENTS = {
     "ptr": _body("fn h(p: *C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@c)\n"),
     "ref": _body("fn h(p: @C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@c)\n"),
     "mut_ref": _body("fn h(p: @&C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@&c)\n"),
-    "mut_into_ptr": _body("fn h(p: *C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@&c)\n"),
-    "borrow": _body("fn h(p:& C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@c)\n"),
+    "mut_into_ptr": _body("fn h(p: *C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@c)\n"),
+    "borrow": _body("fn h(p:& C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@&c)\n"),
     "mut_into_borrow": _body("fn h(p:& C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@&c)\n"),
     # lexis's shape: `peek(@t)` with `fn peek(t: CssTokenizer)`.
     "by_value": _body("fn h(p: C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@c)\n"),
@@ -346,8 +351,8 @@ fn f(c:& C) -> i32
     h(@c)
     return c.x
 """),
-    "mut_into_by_value": _body("fn h(p: C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@&c)\n"),
-    "mut_into_by_value_byval": _body("fn h(p: Big) -> i32\n    return p.x\n\nfn f(c:& Big) -> i32\n    return h(@&c)\n",
+    "mut_into_by_value": _body("fn h(p: C) -> i32\n    return p.x\n\nfn f(c:& C) -> i32\n    return h(@c)\n"),
+    "mut_into_by_value_byval": _body("fn h(p: Big) -> i32\n    return p.x\n\nfn f(c:& Big) -> i32\n    return h(@c)\n",
                                      MAIN_BIG),
     "method_by_value": _body("""\
 impl C
@@ -435,7 +440,7 @@ fn g(p:& [2]i32) -> i32
     return b[1]
 
 fn f(a:& [2]i32) -> i32
-    return g(@a)
+    return g(@&a)
 """, MAIN_ARRAY),
     "argument_mut_into_borrow": _body("""\
 fn g(p:& [2]i32) -> i32
@@ -452,7 +457,7 @@ fn g(a:& [2]i32) -> *[2]i32
     return @a
 
 fn f(a:& [2]i32) -> i32
-    let p: *[2]i32 = g(@a)
+    let p: *[2]i32 = g(@&a)
     let b: [2]i32 = *p
     return b[1]
 """, MAIN_ARRAY),
@@ -467,7 +472,7 @@ fn f(a:& [2]C) -> i32
 pub fn main() -> i32
     var a: [2]C
     a[1].x = 3
-    return f(@a)
+    return f(@&a)
 """),
     "for": _body("""\
 fn f(a:& [2]i32) -> i32
@@ -495,13 +500,13 @@ OTHER_REFERENTS = {
     "f64_write": _body("fn f(n:& f64)\n    let p: *f64 = @n\n    *p = 3.0\n", """
 pub fn main() -> i32
     var n: f64 = 1.0
-    f(@n)
+    f(@&n)
     return n as i32
 """),
     "f32_let": _body("fn f(n:& f32) -> i32\n    let p: *f32 = @n\n    return *p as i32\n", """
 pub fn main() -> i32
     var n: f32 = 3.0
-    return f(@n)
+    return f(@&n)
 """),
     "bool_let": _body("""\
 fn f(n:& bool) -> i32
@@ -512,12 +517,12 @@ fn f(n:& bool) -> i32
 """, """
 pub fn main() -> i32
     var n: bool = true
-    return f(@n)
+    return f(@&n)
 """),
     "bool_write": _body("fn f(n:& bool)\n    let p: *bool = @n\n    *p = true\n", """
 pub fn main() -> i32
     var n: bool = false
-    f(@n)
+    f(@&n)
     if n
         return 3
     return 0
@@ -527,7 +532,7 @@ pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     var p: *C = @c
     var q: **C = @p
-    return f(@q)
+    return f(@&q)
 """),
     # `h:& **C` names `C` as well, and `@h` is no `*C`.
     "pointer_to_pointer_deref": _body("fn f(h:& **C) -> i32\n    let q: **C = *@h\n    return (**q).x\n", """
@@ -535,26 +540,26 @@ pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     var p: *C = @c
     var q: **C = @p
-    return f(@q)
+    return f(@&q)
 """),
     "pointer_to_pointer_untyped": _body("fn f(h:& **C) -> i32\n    let p = @h\n    let q: **C = *p\n    return (**q).x\n", """
 pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     var p: *C = @c
     var q: **C = @p
-    return f(@q)
+    return f(@&q)
 """),
     "reference_referent_deref": _body("fn f(h:& @C) -> i32\n    let q: @C = *@h\n    return q.x\n", """
 pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     var p: @C = @c
-    return f(@p)
+    return f(@&p)
 """),
     "pointer_to_float_referent": _body("fn f(h:& *f64) -> i32\n    let p: **f64 = @h\n    return **p as i32\n", """
 pub fn main() -> i32
     var n: f64 = 3.0
     var p: *f64 = @n
-    return f(@p)
+    return f(@&p)
 """),
     "generic_f64": _body("""\
 fn h<T>(p:& T) -> *T
@@ -562,7 +567,7 @@ fn h<T>(p:& T) -> *T
 
 fn f() -> i32
     var n: f64 = 3.0
-    let p: *f64 = h<f64>(@n)
+    let p: *f64 = h<f64>(@&n)
     return *p as i32
 """, "\npub fn main() -> i32\n    return f()\n"),
 }
@@ -706,38 +711,38 @@ CONTROLS = {
     "int_let": _body("fn f(n:& i32) -> i32\n    let p: *i32 = @n\n    return *p\n", """
 pub fn main() -> i32
     var n: i32 = 3
-    return f(@n)
+    return f(@&n)
 """),
     "int_mut_let": _body("fn f(n:& i32) -> i32\n    let p: @&i32 = @&n\n    return *p\n", """
 pub fn main() -> i32
     var n: i32 = 3
-    return f(@n)
+    return f(@&n)
 """),
     "int_write": _body("fn f(n:& i32)\n    let p: *i32 = @n\n    *p = 3\n", """
 pub fn main() -> i32
     var n: i32 = 1
-    f(@n)
+    f(@&n)
     return n
 """),
     "int_argument": _body("fn h(p: *i32) -> i32\n    return *p\n\nfn f(n:& i32) -> i32\n    return h(@n)\n", """
 pub fn main() -> i32
     var n: i32 = 3
-    return f(@n)
+    return f(@&n)
 """),
     "int_deref": _body("fn f(n:& i32) -> i32\n    return *@n\n", """
 pub fn main() -> i32
     var n: i32 = 3
-    return f(@n)
+    return f(@&n)
 """),
     "u8_let": _body("fn f(n:& u8) -> i32\n    let p: *u8 = @n\n    return *p as i32\n", """
 pub fn main() -> i32
     var n: u8 = 3
-    return f(@n)
+    return f(@&n)
 """),
     "i64_let": _body("fn f(n:& i64) -> i64\n    let p: *i64 = @n\n    return *p\n", """
 pub fn main() -> i32
     var n: i64 = 3
-    return f(@n) as i32
+    return f(@&n) as i32
 """),
     "generic_int": _body("""\
 fn h<T>(p:& T) -> *T
@@ -745,7 +750,7 @@ fn h<T>(p:& T) -> *T
 
 fn f() -> i32
     var n: i32 = 3
-    let p: *i32 = h<i32>(@n)
+    let p: *i32 = h<i32>(@&n)
     return *p
 """, "\npub fn main() -> i32\n    return f()\n"),
     # `p:& *T`'s slot is the caller's pointer variable: `@h` is a `**T`.
@@ -753,13 +758,13 @@ fn f() -> i32
 pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     var p: *C = @c
-    return f(@p)
+    return f(@&p)
 """),
     "pointer_to_int_referent": _body("fn f(h:& *i32) -> i32\n    let p: **i32 = @h\n    return **p\n", """
 pub fn main() -> i32
     var n: i32 = 3
     var p: *i32 = @n
-    return f(@p)
+    return f(@&p)
 """),
     # Not borrows: `@x` is the address of x's own slot.
     "local": _body("""\
@@ -874,7 +879,7 @@ fn f(c:& C) -> i64
 """, """
 pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
-    return f(@c) as i32
+    return f(@&c) as i32
 """)
 
 # ritz0 compiles these two and drops the value twice (#2227). ritz1 failed at
@@ -898,7 +903,7 @@ MAIN_ELEMENTS = """
 pub fn main() -> i32
     var a: [2]C
     a[0].x = 3
-    return f(@a)
+    return f(@&a)
 """
 
 NOT_THE_ELEMENT = {

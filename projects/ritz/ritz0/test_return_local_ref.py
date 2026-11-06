@@ -18,9 +18,8 @@ loop can reach a later write first.
 Each row runs on ritz0, ritz1 and ritz1_selfhosted, and all three must report
 the same `line:col: message`.
 
-Whether `@x` of a `var` fits `@&T` or `:&` is #2339's, whether an `@x` held in a
-`*T` counts as a borrow is #2371's, and a reference to another type is #2367's and
-#2368's. Nothing here decides those.
+Whether an `@x` held in a `*T` counts as a borrow is #2371's, and a reference to
+another type is #2367's and #2368's. Nothing here decides those.
 """
 
 import pytest

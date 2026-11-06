@@ -88,18 +88,18 @@ fn intact{n}(b:& Box{n}, skip: i32, skip2: i32) -> i32
         b{n}.a[k{n}] = {fill}
         k{n} = k{n} + 1
     store_const{n}(@&b{n}.a)
-    if intact{n}(@b{n}, {last}, {last}) != 0
+    if intact{n}(@&b{n}, {last}, {last}) != 0
         return {base + 1}
     if b{n}.a[{last}] != {first}
         return {base + 2}
     store_var{n}(@&b{n}.a, 0, {second})
-    if intact{n}(@b{n}, 0, {last}) != 0
+    if intact{n}(@&b{n}, 0, {last}) != 0
         return {base + 3}
     if b{n}.a[0] != {second}
         return {base + 4}
-    if read_const{n}(@b{n}.a) != {first}
+    if read_const{n}(@&b{n}.a) != {first}
         return {base + 5}
-    if read_var{n}(@b{n}.a, 0) != {second}
+    if read_var{n}(@&b{n}.a, 0) != {second}
         return {base + 6}
 """
     return decls, main
@@ -176,8 +176,10 @@ var G: [2]i32
 MAIN_13 = """
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
-    return f(@a)
+    return f(@&a)
 """
+
+MAIN_13_SHARED = MAIN_13.replace("@&a", "@a")
 
 # Everything an element can do.  Each exits 3.
 PROGRAMS = {
@@ -201,7 +203,7 @@ fn f(a:& [2]i32)
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 1]
-    f(@a)
+    f(@&a)
     return a[1]
 """,
     "non_constant_index": """
@@ -270,7 +272,7 @@ fn f(a:& [2]i32) -> *i32
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
-    let p: *i32 = f(@a)
+    let p: *i32 = f(@&a)
     return *p
 """,
     "element_as_argument": """
@@ -283,7 +285,7 @@ fn f(a:& [2]i32, b:& [2]f64) -> i32
 pub fn main() -> i32
     var a: [2]i32 = [1, 1]
     var b: [2]f64 = [0.0, 2.0]
-    return f(@a, @b)
+    return f(@&a, @&b)
 """,
     "borrow_of_element": """
 fn g(n:& i32)
@@ -317,7 +319,7 @@ pub fn main() -> i32
     var x: i32 = 3
     var a: [2]*i32
     a[1] = @x
-    return f(@a)
+    return f(@&a)
 """,
     # Struct elements, strided by the struct.  Tiny is one byte.
     "field_read": """
@@ -328,7 +330,7 @@ pub fn main() -> i32
     var a: [3]P
     a[1].x = 9
     a[2].x = 3
-    return f(@a)
+    return f(@&a)
 """,
     "field_store": """
 fn f(a:& [3]P)
@@ -403,7 +405,7 @@ fn f(a:& [2]P) -> i32
 pub fn main() -> i32
     var a: [2]P
     a[1].x = 3
-    return f(@a)
+    return f(@&a)
 """,
     "print_element": """
 import ritzlib.io
@@ -418,7 +420,7 @@ fn f(a:& [2]Res) -> i32
 
 pub fn main() -> i32
     var a: [2]Res = [Res { n: 1 }, Res { n: 3 }]
-    return f(@a)
+    return f(@&a)
 """,
     "move_only_element_store": """
 fn f(a:& [2]Res)
@@ -437,7 +439,7 @@ fn f(a:& [2]i32, b:& [2]i32)
 pub fn main() -> i32
     var a: [2]i32 = [1, 1]
     var b: [2]i32 = [4, 3]
-    f(@&a, @b)
+    f(@&a, @&b)
     return a[1]
 """,
     "assign_literal": """
@@ -455,7 +457,7 @@ fn f(a:& [3]i8) -> i64
 
 pub fn main() -> i32
     var a: [3]i8 = [1, 2, 3]
-    return f(@a) as i32
+    return f(@&a) as i32
 """,
     "copy_is_a_copy": """
 fn f(a:& [2]i32) -> i32
@@ -484,7 +486,7 @@ fn f(a:& [3]i32) -> i32
 
 pub fn main() -> i32
     var a: [3]i32 = [1, 2, 3]
-    return f(@a)
+    return f(@&a)
 """,
     # A bare `a` is the pointer, for every slot that takes a reference.
     "reference_let": """
@@ -508,7 +510,7 @@ fn f(a:& [2]i32) -> @[2]i32
 """ + """
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
-    let p: @[2]i32 = f(@a)
+    let p: @[2]i32 = f(@&a)
     return 3
 """,
     "pointer_field": """
@@ -545,7 +547,7 @@ fn g(a:& [2]i32)
     a[0] = 3
 
 fn f(a:& [2]i32)
-    g(@a)
+    g(@&a)
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 2]
@@ -578,7 +580,7 @@ fn f(a:& [2]Res) -> i32
 
 pub fn main() -> i32
     var a: [2]Res = [Res { n: 1 }, Res { n: 3 }]
-    return f(@a)
+    return f(@&a)
 """,
     "pass_on_by_value": """
 fn g(a: [2]i32) -> i32
@@ -619,7 +621,7 @@ fn f(a:& [2]i32) -> i32
 pub fn main() -> i32
     var s: Field
     s.a[1] = 3
-    return f(@s.a)
+    return f(@&s.a)
 """,
     "from_row": """
 fn f(a:& [3]i32) -> i32
@@ -646,7 +648,7 @@ fn f(a:& [2]i32) -> i32
     return a[1]
 
 fn g(p: *[2]i32) -> i32
-    return f(@*p)
+    return f(@&*p)
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
@@ -703,7 +705,7 @@ fn f<T>(a:& [2]T) -> T
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
-    return f<i32>(@a)
+    return f<i32>(@&a)
 """,
     "generic_store_narrow": """
 fn f<T>(a:& [3]T, v: T)
@@ -760,7 +762,7 @@ fn f(a:& [2][3]i32) -> i32
 pub fn main() -> i32
     var a: [2][3]i32
     a[1][2] = 3
-    return f(@a)
+    return f(@&a)
 """,
     "nested_store_neighbours": """
 fn f(a:& [2][3]i8)
@@ -827,7 +829,7 @@ fn f(a:& [2][3]i32) -> i32
 pub fn main() -> i32
     var a: [2][3]i32
     a[1][2] = 3
-    return f(@a)
+    return f(@&a)
 """,
     "nested_pass_on": """
 fn g(a:& [2][3]i32) -> i32
@@ -839,19 +841,19 @@ fn f(a:& [2][3]i32) -> i32
 pub fn main() -> i32
     var a: [2][3]i32
     a[1][2] = 3
-    return f(@a)
+    return f(@&a)
 """,
     "nested_row_into_borrow": """
 fn g(r:& [3]i32) -> i32
     return r[2]
 
 fn f(a:& [2][3]i32) -> i32
-    return g(@a[1])
+    return g(@&a[1])
 
 pub fn main() -> i32
     var a: [2][3]i32
     a[1][2] = 3
-    return f(@a)
+    return f(@&a)
 """,
     "nested_from_field": """
 fn f(a:& [2][3]i32) -> i32
@@ -860,7 +862,7 @@ fn f(a:& [2][3]i32) -> i32
 pub fn main() -> i32
     var s: Grid
     s.m[1][2] = 3
-    return f(@s.m)
+    return f(@&s.m)
 """,
     # Two instantiations share the parsed shape: the first can't keep it.
     "nested_generic_twice": """
@@ -885,7 +887,7 @@ fn f(a:& [2][3]i32) -> i32
 
 pub fn main() -> i32
     var a: [2][3]i32
-    return f(@a)
+    return f(@&a)
 """,
     "nested_reference_param": """
 fn g(a: @[2][3]i32) -> i32
@@ -902,7 +904,7 @@ fn f<T>(a:& [2][3]T) -> T
 pub fn main() -> i32
     var a: [2][3]i32
     a[1][2] = 3
-    return f<i32>(@a)
+    return f<i32>(@&a)
 """,
     "nested_generic_store": """
 fn f<T>(a:& [2][3]T, v: T)
@@ -1027,7 +1029,7 @@ fn f(a:& [5]i32) -> i32
 
 pub fn main() -> i32
     var a: [2]i32 = [0, 0]
-    return f(@a)
+    return f(@&a)
 """),
     "wrong_length_bare": (NOT_THAT_ARRAY, """
 fn f(a:& [5]i32)
@@ -1053,7 +1055,7 @@ fn f(a:& [2]P) -> i32
 
 pub fn main() -> i32
     var a: [2]Tiny
-    return f(@a)
+    return f(@&a)
 """),
     "wrong_length_global": (NOT_THAT_ARRAY, """
 fn f(a:& [5]i32) -> i32
@@ -1068,7 +1070,7 @@ fn f(a:& [5]i32) -> i32
 
 pub fn main() -> i32
     var s: Field
-    return f(@s.a)
+    return f(@&s.a)
 """),
     "wrong_length_row": (NOT_THAT_ARRAY, """
 fn f(a:& [5]i32) -> i32
@@ -1106,7 +1108,7 @@ fn g(a:& [5]i32)
     a[4] = 3
 
 fn f(a:& [2]i32)
-    g(@a)
+    g(@&a)
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 2]
@@ -1144,7 +1146,7 @@ fn g(a:& [6]i32) -> i32
 
 pub fn main() -> i32
     var a: [2][3]i32
-    return g(@a)
+    return g(@&a)
 """),
     "nested_into_flat": (NOT_THAT_ARRAY, """
 fn f(a:& [2]i32) -> i32
@@ -1152,7 +1154,7 @@ fn f(a:& [2]i32) -> i32
 
 pub fn main() -> i32
     var a: [2][3]i32
-    return f(@a)
+    return f(@&a)
 """),
     "flat_into_nested": (NOT_THAT_ARRAY, """
 fn f(a:& [2][3]i32) -> i32
@@ -1160,7 +1162,7 @@ fn f(a:& [2][3]i32) -> i32
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 2]
-    return f(@a)
+    return f(@&a)
 """),
     "nested_field_wrong": (NOT_THAT_ARRAY, """
 fn f(a:& [2][4]i32) -> i32
@@ -1168,7 +1170,7 @@ fn f(a:& [2][4]i32) -> i32
 
 pub fn main() -> i32
     var s: Grid
-    return f(@s.m)
+    return f(@&s.m)
 """),
     "nested_deref_address_wrong": (NOT_THAT_ARRAY, """
 fn g(b:& [5]i32) -> i32
@@ -1179,7 +1181,7 @@ fn f(a:& [2][3]i32) -> i32
 
 pub fn main() -> i32
     var a: [2][3]i32
-    return f(@a)
+    return f(@&a)
 """),
     "nested_wrong_leaf": (NOT_THAT_ARRAY, """
 fn f(a:& [2][3]i64)
@@ -1199,18 +1201,18 @@ fn f(a:& [2][3]i32) -> i32
 
 pub fn main() -> i32
     var a: [2][3]i32
-    return f(@a)
+    return f(@&a)
 """),
     "nested_row_wrong": (NOT_THAT_ARRAY, """
 fn g(r:& [4]i32) -> i32
     return r[3]
 
 fn f(a:& [2][3]i32) -> i32
-    return g(@a[1])
+    return g(@&a[1])
 
 pub fn main() -> i32
     var a: [2][3]i32
-    return f(@a)
+    return f(@&a)
 """),
     "nested_reference_param_wrong": (NOT_THAT_ARRAY, """
 fn g(a: @[2][4]i32) -> i32
@@ -1316,7 +1318,7 @@ fn f(a:& [2]i32, b:& [2]i32)
 pub fn main() -> i32
     var a: [2]i32 = [0, 0]
     var b: [2]i32 = [1, 3]
-    f(@&a, @b)
+    f(@&a, @&b)
     return a[1]
 """),
     "store_through_deref_nested": (DEREF_STORE, """
@@ -1335,7 +1337,7 @@ fn f(a:& [2]i32) -> i32
 
 pub fn main() -> i32
     var a: [2]i32 = [3, 1]
-    return f(@a)
+    return f(@&a)
 """),
     "deref_then_index": (NOT_A_VALUE, """
 fn f(a:& [2]i32) -> i32
@@ -1343,7 +1345,7 @@ fn f(a:& [2]i32) -> i32
 
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
-    return f(@a)
+    return f(@&a)
 """),
     "nested_deref_as_scalar": (NOT_A_VALUE, """
 fn f(a:& [2][3]i32) -> i32
@@ -1352,7 +1354,7 @@ fn f(a:& [2][3]i32) -> i32
 
 pub fn main() -> i32
     var a: [2][3]i32
-    return f(@a)
+    return f(@&a)
 """),
     "slice": (NO_SLICE, """
 fn f(a:& [3]i32) -> i32
@@ -1361,7 +1363,7 @@ fn f(a:& [3]i32) -> i32
 
 pub fn main() -> i32
     var a: [3]i32 = [1, 2, 3]
-    return f(@a)
+    return f(@&a)
 """),
     "slice_untyped": (NO_SLICE, """
 fn f(a:& [3]i32) -> i32
@@ -1370,7 +1372,7 @@ fn f(a:& [3]i32) -> i32
 
 pub fn main() -> i32
     var a: [3]i32 = [1, 2, 3]
-    return f(@a)
+    return f(@&a)
 """),
     "move_out_whole": (MOVE_OUT, """
 fn f(a:& [2]Res) -> i32
@@ -1379,7 +1381,7 @@ fn f(a:& [2]Res) -> i32
 
 pub fn main() -> i32
     var a: [2]Res = [Res { n: 1 }, Res { n: 3 }]
-    return f(@a)
+    return f(@&a)
 """),
     "move_out_deref": (MOVE_OUT, """
 fn f(a:& [2]Res) -> i32
@@ -1388,7 +1390,7 @@ fn f(a:& [2]Res) -> i32
 
 pub fn main() -> i32
     var a: [2]Res = [Res { n: 1 }, Res { n: 3 }]
-    return f(@a)
+    return f(@&a)
 """),
     "move_out_by_value": (MOVE_OUT, """
 fn g(b: [2]Res) -> i32
@@ -1399,7 +1401,7 @@ fn f(a:& [2]Res) -> i32
 
 pub fn main() -> i32
     var a: [2]Res = [Res { n: 1 }, Res { n: 3 }]
-    return f(@a)
+    return f(@&a)
 """),
 }
 
@@ -1465,7 +1467,7 @@ fn f(a:& [2][3]i32) -> i32
 pub fn main() -> i32
     var a: [2][3]i32
     a[1][2] = 5
-    return f(@a)
+    return f(@&a)
 """),
     "nested_whole_assign": ("assigning a whole multi-dimensional array", """
 fn f(a:& [2][3]i32, b:& [2][3]i32)
@@ -1475,7 +1477,7 @@ pub fn main() -> i32
     var a: [2][3]i32
     var b: [2][3]i32
     b[1][2] = 3
-    f(@&a, @b)
+    f(@&a, @&b)
     return a[1][2]
 """),
 }
@@ -1520,7 +1522,7 @@ fn f(a:& [2]P) -> i32
 pub fn main() -> i32
     var a: [2]P
     a[1].x = 3
-    return f(@a)
+    return f(@&a)
 """,
     "let": """
 fn f(a:& [2]P) -> i32
@@ -1530,7 +1532,7 @@ fn f(a:& [2]P) -> i32
 pub fn main() -> i32
     var a: [2]P
     a[1].x = 3
-    return f(@a)
+    return f(@&a)
 """,
 }
 
@@ -1563,11 +1565,11 @@ POINTER_INDEX = {
     "reference_param": """
 fn f(a: @[2]i32) -> i32
     return a[1]
-""" + MAIN_13,
+""" + MAIN_13_SHARED,
     "pointer_param": """
 fn f(p: *[2]i32) -> i32
     return p[1]
-""" + MAIN_13,
+""" + MAIN_13_SHARED,
 }
 
 

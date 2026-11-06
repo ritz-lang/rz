@@ -26,7 +26,7 @@ ritz0 on every by-value path: stores into a field or an element, `return`, a tai
 element. A whole `a:& [N]T` copies into a field or a local. A move-only referent
 is rejected at each. RITZ1_GAPS lists what's still open.
 
-Whether `@x` fits a `:&` param is #2339's, so one is only ever given `@&x` here.
+`@x` doesn't fit a `:&` param (#2339), so one is only ever given `@&x` here.
 """
 
 import os
@@ -324,7 +324,7 @@ fn mk<T>(n:& T) -> G<T>
 
 pub fn main() -> i32
     var n: i32 = 1
-    var g: G<i32> = mk<i32>(@n)
+    var g: G<i32> = mk<i32>(@&n)
     *g.p = 3
     return n
 """,
@@ -783,7 +783,7 @@ fn mk<T>(c:& T) -> GV<T>
 
 pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
-    var g: GV<C> = mk<C>(@c)
+    var g: GV<C> = mk<C>(@&c)
     c.x = 9
     return g.v.x
 """,
