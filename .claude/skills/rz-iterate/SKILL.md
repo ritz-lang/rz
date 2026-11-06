@@ -152,9 +152,10 @@ vouches for that exact commit.
 6. **Gate that commit**, detached so a new message can't kill it:
    ```bash
    LOG=$(~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh ~/dev/ritz-lang/rz-task-<id> <id>)
-   ~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh --wait "$LOG"
+   timeout 540 ~/dev/ritz-lang/rz/.claude/skills/rz-iterate/run-gate.sh --wait "$LOG"
    ```
-   It runs a clean `make -C projects/ritz ci-local` over CI's `build-all`
+   Run the wait in the foreground and repeat it on exit 124, which only means
+   the slice ran out. It runs a clean `make -C projects/ritz ci-local` over CI's `build-all`
    and `bootstrap` jobs (#2141), one gate machine-wide, and exits with the
    gate's code (98 = no verdict, 99 = HEAD moved; neither passes). A
    `SETUP ERROR` line means a missing tool on this machine (e.g. lld-link
@@ -179,9 +180,11 @@ vouches for that exact commit.
    again straight away. Nothing merges until you do. Until that message, stay
    on your base, even after REAPing.
 
-**Never end a turn with work pending:** nothing wakes you when a gate or
-subagent finishes (#1533). Run `--wait` in the foreground, or schedule a
-wakeup before ending the turn.
+**Never end a turn with work pending:** nothing wakes you when a gate,
+mutation run or subagent finishes (#1533). Wait in the foreground, in slices
+under 10 minutes, for anything long. The harness ends a turn after 600s of
+silence on a background wait, and a `Monitor` or wakeup can be lost with it
+(#2333). The gate is detached, so `timeout` only ends the wait.
 
 **Never** check out or push `main`, merge anything, remove your worktree,
 stop your unit or delete your branch. `rz` does that after merging.
