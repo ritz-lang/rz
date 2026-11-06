@@ -624,7 +624,7 @@ def test_an_inferred_mutable_reference_passes(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, name, INFERRED_GAPS[name]) == 3
 
 
-@pytest.mark.parametrize("compiler", _ritz1_gap("AGAST #2352: an inferred `var` isn't known to hold an `@T`"))
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_var_holding_an_at_t_is_refused(tmp_path, compiler):
     src = (INT_WRITER + C + "pub fn main() -> i32\n    var c: C = C { x: 1, y: 0 }\n"
            "    var p = @c\n    w(p.x)\n    return c.x\n")

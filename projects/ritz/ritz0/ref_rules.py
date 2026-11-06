@@ -23,3 +23,11 @@ REF_TO_OTHER_POINTER = "a reference to one pointer type doesn't fit a reference 
 
 # `*r`, `r.f`, `p[i]` or a by-value `self` of a move-only value, by value.
 MOVE_OUT_OF_REF = "cannot move out of a reference"
+
+# `p.f = v`, `p[i] = v` or `*p = v` through an `@T`, or a chain of fields from one.
+WRITE_THROUGH_SHARED = "cannot write through an `@T`: make it `@&T`"
+
+# `@x` of a `let`'s own storage where an `@&T` or `:&` goes: the emitter's wording
+# for `@&x` of one, since both ask for the same thing.
+def let_into_mut(name: str) -> str:
+    return f"cannot borrow `let` binding `{name}` as mutable; declare it `var`"

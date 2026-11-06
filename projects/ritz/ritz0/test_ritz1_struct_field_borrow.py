@@ -180,6 +180,7 @@ ACCESS = {
     f"{name}_{spelling}": re.sub(r":& C$", ty, prog, flags=re.MULTILINE)
     for name, prog in _ACCESS_BASE.items()
     for spelling, ty in _FIELD_SPELLINGS.items()
+    if name == "read_only" or spelling != "at"   # an `@T` is read-only (#2338)
 }
 
 # Ref fields to a primitive (#2050). #2041 lowered ref-to-struct fields only;
@@ -241,6 +242,7 @@ PRIM_ACCESS = {
     for name, prog in _PRIM_BASE.items()
     for spelling, field in _PRIM_SPELLINGS.items()
     for ty in ("i32", "u8", "i64")
+    if name == "read" or spelling != "at"   # an `@T` is read-only (#2338)
 }
 
 # Ref fields to f32 / f64 / bool (#2053). Until `*f64` fields loaded and stored
@@ -302,8 +304,26 @@ pub fn main() -> i32
     return 100
 """
 
-_NONINT_SPELLINGS = {"colon_amp": ":& {t}", "at": ": @{t}", "at_amp": ": @&{t}"}
+# An `@T` field only reads (#2338), at each width, with neighbours.
+NONINT_REF_READ = """\
+struct R
+    head: u8
+    p: @T
+    tail: i64
+
+pub fn main() -> i32
+    var x: T = VALUE
+    let r: R = R { head: 1, p: @x, tail: 1 }
+    if *r.p == VALUE
+        return r.head as i32 + r.tail as i32 + 1
+    return 100
+"""
+
+_NONINT_SPELLINGS = {"colon_amp": ":& {t}", "at_amp": ": @&{t}"}
 NONINT_REF_ACCESS = {
+    f"read_at_{ty}": NONINT_REF_READ.replace("T", ty).replace("VALUE", value)
+    for ty, value in (("f64", "1.5"), ("f32", "1.5"), ("bool", "true"))
+} | {
     f"{name}_{spelling}_{ty}": prog.replace("FIELD", field.format(t=ty)).replace(
         "T", ty
     )

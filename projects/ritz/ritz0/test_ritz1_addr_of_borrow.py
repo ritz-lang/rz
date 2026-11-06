@@ -180,7 +180,7 @@ STRUCT = {
     "assign_ptr": _body("fn f(c:& C) -> i32\n    var p: *C = null\n    p = @c\n" + READ_P),
     "write_through_ptr": _body("fn f(c:& C)\n    let p: *C = @c\n    p.x = 3\n", MAIN_WRITE),
     "write_through_mut": _body("fn f(c:& C)\n    let p: @&C = @&c\n    p.x = 3\n", MAIN_WRITE),
-    "write_through_untyped": _body("fn f(c:& C)\n    let p = @c\n    p.x = 3\n", MAIN_WRITE),
+    "write_through_untyped": _body("fn f(c:& C)\n    let p = @&c\n    p.x = 3\n", MAIN_WRITE),
     "same_pointer": _body("""\
 fn f(c:& C, o: *C) -> i32
     let p: *C = @c

@@ -553,6 +553,26 @@ fn raw(p: *mut i32)
     pass
 ```
 
+An `@T` is read-only. `p.f = v`, `p[i] = v` and `*p = v` through one are errors,
+directly or through a chain of fields, so a place behind an `@T` stays read-only
+even where an `@&T` lies between. The fix is an `@&T`. A write that reaches a
+raw `*T` first isn't checked: it writes what the pointer points at, so an `@T`
+to a struct says nothing about a `*T` field's pointee.
+
+```ritz expect-error="cannot write through an `@T`: make it `@&T`"
+struct Point
+    x: i32
+    y: i32
+
+fn reset(p: @Point)
+    p.x = 0
+
+fn main() -> i32
+    var q = Point { x: 1, y: 2 }
+    reset(@q)
+    q.x
+```
+
 `@T` and `@&T` are types: a parameter of one holds a reference, and reads as one.
 `name:& T` is a mode: `name` has type `T`. The two share an ABI, and read
 differently:
@@ -2329,6 +2349,24 @@ fn double(n: i32) -> i32
 fn main() -> i32
     let n: i32 = 4
     double(@n)
+```
+
+An `@x` of a `let`, or of a place in the `let`'s own storage, never reaches a
+mutable slot. It doesn't fit an `@&T` or a `:&` parameter, at any slot, which is
+what `@&x` of a `let` is refused for too (§4.1). A place reached through a pointer
+or reference isn't the `let`'s own storage.
+
+```ritz expect-error="cannot borrow `let` binding `c` as mutable; declare it `var`"
+struct Counter
+    n: i32
+
+fn bump(c:& Counter)
+    c.n = c.n + 1
+
+fn main() -> i32
+    let c = Counter { n: 1 }
+    bump(@c)
+    c.n
 ```
 
 ### 13.4 Mutable Borrowing

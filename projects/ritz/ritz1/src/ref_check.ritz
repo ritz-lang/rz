@@ -28,6 +28,8 @@
 #
 # ownership.ritz uses ref_ty_of and ref_through for "cannot move out of a
 # reference", which only reaches a program with a Drop in it.
+#
+# `@T` is read-only (AGAST #2338): the end of this file, and ref_let_into_mut.
 
 import ritzlib.sys
 import ritzlib.io
@@ -36,6 +38,7 @@ import ast
 import ast_helpers
 import emitter_core
 import emitter_expr_call   # method_callee_def
+import let_check           # let_addr_of_own (AGAST #2338)
 
 # What an expression or a slot holds.
 pub struct RefTy
@@ -468,6 +471,8 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
     if e.kind == EXPR_IF or e.kind == EXPR_MATCH
         ref_note_value(e, slot)
         return
+    if slot.kind == TYPE_MUT_REF
+        ref_let_into_mut(s, e)
     if e.kind == EXPR_ARRAY_LIT and slot.kind == TYPE_ARRAY
         var part: RefTy
         ref_element(slot, @part)
@@ -533,7 +538,9 @@ fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
     while a != null
         if p != null
             var slot: RefTy
-            if p.is_borrow == 0 and ref_of_param(p, @slot) == 1
+            if p.is_borrow == 1
+                ref_let_into_mut(s, a)
+            else if ref_of_param(p, @slot) == 1
                 ref_into(s, a, @slot)
             p = p.next
         ref_walk(s, a)
@@ -692,6 +699,7 @@ fn ref_into_field(s: *EmitterState, stmt: *Stmt, owner: *RefTy)
 
 pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
     let k: i32 = stmt.kind
+    ref_check_write(s, stmt)
     var slot: RefTy
     if k == STMT_VAR_DECL
         if stmt.var_init != null and ref_decl_slot(stmt, @slot) == 1
@@ -739,3 +747,162 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
         ref_walk(s, stmt.assign_value)
     else if k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
         ref_walk(s, stmt.assign_value)
+
+# `@T` is read-only (LANGUAGE_SPEC §3.2, §13.3, LARB ruling R1, AGAST #2338).
+# ritz0's twins are TypeChecker._check_write and _check_let_into_mut, and
+# ritz0/test_at_is_read_only.py holds all three compilers to them.
+
+# What a write meets when it goes through a value.
+pub const REF_VIEW_VALUE: i32 = 0
+pub const REF_VIEW_RAW: i32 = 1
+pub const REF_VIEW_MUT: i32 = 2
+pub const REF_VIEW_SHARED: i32 = 3
+pub const REF_VIEW_UNKNOWN: i32 = 4
+
+fn ref_view_of_kind(kind: i32) -> i32
+    if kind == TYPE_REF
+        return REF_VIEW_SHARED
+    if kind == TYPE_MUT_REF
+        return REF_VIEW_MUT
+    if kind == TYPE_PTR or kind == TYPE_PTR_PTR
+        return REF_VIEW_RAW
+    REF_VIEW_VALUE
+
+fn ref_view_of_ident(s: *EmitterState, name: *u8, len: i32) -> i32
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx >= 0
+        let loc: *LocalVar = local_at(s, idx)
+        # `c:& C` is a `C`, and so is a by-value `self`.
+        if loc.is_lent == 1 or loc.holds_lent_ptr == 1
+            return REF_VIEW_VALUE
+        if loc.holds_shared_ref == 1
+            return REF_VIEW_SHARED
+        return ref_view_of_kind(loc.var_type)
+    let g: *GlobalVarDef = find_global(s, name, len)
+    if g == null
+        return REF_VIEW_UNKNOWN
+    ref_view_of_kind(g.var_type)
+
+fn ref_view_of_fn(f: *FnDef) -> i32
+    var t: RefTy
+    if ref_of_fn(f, @t) == 0
+        return REF_VIEW_UNKNOWN
+    ref_view_of_kind(t.kind)
+
+# What the value of `e` is, as far as a write through it goes.  An `@T` field is a
+# `*T` by now (lower_ref_fields), and only its flag says otherwise.
+pub fn ref_view(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return REF_VIEW_UNKNOWN
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        return ref_view_of_ident(s, e.ident_ptr, e.ident_len)
+    if k == EXPR_UNARY and e.op == OP_ADDR
+        return REF_VIEW_SHARED
+    if k == EXPR_UNARY and e.op == OP_ADDR_MUT
+        return REF_VIEW_MUT
+    if k == EXPR_MEMBER
+        let f: *StructField = resolve_member_chain_field(s, e)
+        if f == null
+            return REF_VIEW_UNKNOWN
+        if f.field_shared_ref == 1
+            return REF_VIEW_SHARED
+        if f.field_mut_ref == 1
+            return REF_VIEW_MUT
+        return ref_view_of_kind(f.field_type)
+    if k == EXPR_CALL
+        return ref_view_of_fn(find_call_fn(s, e))
+    if k == EXPR_METHOD
+        return ref_view_of_fn(ref_method_def(s, e))
+    var t: RefTy
+    if ref_ty_of(s, e, @t) == 1
+        return ref_view_of_kind(t.kind)
+    REF_VIEW_UNKNOWN
+
+# 1 when writing the place `e` goes through an `@T`.  Walk it from the place to
+# its root: a `*T` ends the walk, since what it points at is the pointer's
+# business, and so does anything the tables can't type.
+fn ref_write_is_shared(s: *EmitterState, e0: *Expr) -> i32
+    var e: *Expr = e0
+    while e != null
+        var base: *Expr = null
+        if e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX
+            base = e.left
+        else if e.kind == EXPR_UNARY and e.op == OP_DEREF
+            base = e.operand
+        else
+            return 0
+        let view: i32 = ref_view(s, base)
+        var t: RefTy
+        let known: i32 = ref_ty_of(s, base, @t)
+        if view == REF_VIEW_SHARED
+            # `.` reads through every level, so the one nearest the place counts.
+            if e.kind == EXPR_MEMBER and known == 1 and t.pointee == TYPE_PTR
+                return 0
+            return 1
+        if view == REF_VIEW_RAW or view == REF_VIEW_UNKNOWN
+            return 0
+        e = base
+    0
+
+fn ref_expr_ident(e: *Expr, name: *u8, len: i32)
+    memset(e as *u8, 0, sizeof(Expr))
+    e.kind = EXPR_IDENT
+    e.ident_ptr = name
+    e.ident_len = len
+
+fn ref_expr_member(e: *Expr, base: *Expr, name: *u8, len: i32)
+    memset(e as *u8, 0, sizeof(Expr))
+    e.kind = EXPR_MEMBER
+    e.left = base
+    e.ident_ptr = name
+    e.ident_len = len
+
+fn ref_expr_index(e: *Expr, base: *Expr)
+    memset(e as *u8, 0, sizeof(Expr))
+    e.kind = EXPR_INDEX
+    e.left = base
+
+# The statement forms the parser splits a place into, put back together.
+fn ref_stmt_writes_shared(s: *EmitterState, stmt: *Stmt) -> i32
+    let k: i32 = stmt.kind
+    var root: Expr
+    var member: Expr
+    var element: Expr
+    if k == STMT_ASSIGN
+        if stmt.assign_target_len > 0
+            return 0
+        return ref_write_is_shared(s, stmt.if_cond as *Expr)
+    if k == STMT_INDEX_ASSIGN
+        ref_expr_ident(@root, stmt.assign_target, stmt.assign_target_len)
+        ref_expr_index(@element, @root)
+        return ref_write_is_shared(s, @element)
+    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        ref_expr_ident(@root, stmt.var_name, stmt.var_name_len)
+        ref_expr_member(@member, @root, stmt.assign_target, stmt.assign_target_len)
+    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        ref_expr_member(@member, stmt.if_cond as *Expr, stmt.assign_target, stmt.assign_target_len)
+    else
+        return 0
+    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
+        return ref_write_is_shared(s, @member)
+    ref_expr_index(@element, @member)
+    ref_write_is_shared(s, @element)
+
+fn ref_check_write(s: *EmitterState, stmt: *Stmt)
+    if ref_stmt_writes_shared(s, stmt) == 0
+        return
+    # `(*p).f = v` starts at the `(`, and the place at the `*`.
+    var col: i32 = stmt.span.col
+    if stmt.kind == STMT_MEMBER_ASSIGN or stmt.kind == STMT_MEMBER_INDEX_ASSIGN
+        col = col + 1
+    if ref_first_report(stmt.span.line, col) == 0
+        return
+    ref_eprint_loc(stmt.span.line, col)
+    eprints_cstr(c": error: cannot write through an `@T`: make it `@&T`\n")
+    s.error_count = s.error_count + 1
+
+# `e` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't.
+fn ref_let_into_mut(s: *EmitterState, e: *Expr)
+    if let_addr_of_own(s, e) == 1 and ref_first_report(e.span.line, e.span.col) == 1
+        let_error_addr(s, e)

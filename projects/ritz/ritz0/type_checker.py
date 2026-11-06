@@ -18,6 +18,7 @@ Built-in functions:
 - syscallN(...) -> i64: system call wrappers
 """
 
+import copy
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 import array_rules
@@ -105,6 +106,10 @@ class TypeChecker:
         self._tail_slot: Optional[rast.Type] = None
         # id(expr) already reported: a literal's elements are inferred twice.
         self._slot_reported: Set[int] = set()
+        # The types `let` bindings of the current fn hold, each its own copy, so
+        # that a name is a `let` when its current type is one of them. A `var` or
+        # pattern binding copies what it infers, or `var d = c` would be `c`'s.
+        self._let_types: List[rast.Type] = []
 
         # Imported modules, which qualify names: `token.Kind`
         self.module_names: Set[str] = set(module_names or ())
@@ -279,6 +284,7 @@ class TypeChecker:
 
         # Add parameters to scope
         self.lent_locals = {}
+        self._let_types = []
         for param in fn.params:
             self.locals[param.name] = param.type
             if param.borrow == rast.Borrow.MUTABLE:
@@ -313,7 +319,7 @@ class TypeChecker:
                                   f"with {self._type_str(init_type)}", stmt.span)
                     self.locals[stmt.name] = stmt.type
                 else:
-                    self.locals[stmt.name] = init_type
+                    self.locals[stmt.name] = copy.copy(init_type)
             elif stmt.type:
                 self.locals[stmt.name] = stmt.type
             else:
@@ -326,11 +332,11 @@ class TypeChecker:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
                                   f"with {self._type_str(init_type)}", stmt.span)
-                    self.locals[stmt.name] = stmt.type
+                    self.locals[stmt.name] = self._as_let(stmt.type)
                 else:
-                    self.locals[stmt.name] = init_type
+                    self.locals[stmt.name] = self._as_let(init_type)
             elif stmt.type:
-                self.locals[stmt.name] = stmt.type
+                self.locals[stmt.name] = self._as_let(stmt.type)
             else:
                 self._error(f"let binding '{stmt.name}' needs type annotation or initializer", stmt.span)
 
@@ -359,6 +365,7 @@ class TypeChecker:
 
         elif isinstance(stmt, rast.AssignStmt):
             target_type = self._infer_type(stmt.target)
+            self._check_write(stmt.target)
             value_type = self._infer_into(stmt.value, target_type)
             if not self._value_fits(stmt.value, value_type, target_type):
                 self._error(f"cannot assign {self._type_str(value_type)} "
@@ -470,7 +477,9 @@ class TypeChecker:
             return rast.NamedType(expr.span, 'unknown', [])  # the never type
 
         elif isinstance(expr, rast.AssignExpr):
-            return self._infer_into(expr.value, self._infer_type(expr.target))
+            target_type = self._infer_type(expr.target)
+            self._check_write(expr.target)
+            return self._infer_into(expr.value, target_type)
 
         elif isinstance(expr, (rast.QualifiedIdent, rast.TypeExpr)):
             return rast.NamedType(expr.span, 'unknown', [])
@@ -798,6 +807,7 @@ class TypeChecker:
                         # `name:& T` borrows a `T` place, and takes what
                         # already points at one (§13.4).
                         arg_type = self._infer_type(arg)
+                        self._check_let_into_mut(arg)
                         if isinstance(self._resolve_alias(arg_type),
                                       (rast.PtrType, rast.RefType)):
                             continue
@@ -895,6 +905,8 @@ class TypeChecker:
             at = i + skip
             lent = at in fn_sig.lent or at >= len(fn_sig.params) or not own_method
             self._infer_into(arg, None if lent else fn_sig.params[at][1])
+            if at in fn_sig.lent and own_method:
+                self._check_let_into_mut(arg)
 
         return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
 
@@ -1091,7 +1103,7 @@ class TypeChecker:
     def _check_pattern(self, pattern: rast.Pattern, expected_type: rast.Type):
         """Type check a pattern and bind variables."""
         if isinstance(pattern, rast.IdentPattern):
-            self.locals[pattern.name] = expected_type
+            self.locals[pattern.name] = copy.copy(expected_type)
         elif isinstance(pattern, rast.VariantPattern):
             # Look up variant - use qualifier if provided, otherwise fall back to lookup
             enum_name = None
@@ -1195,6 +1207,8 @@ class TypeChecker:
             return
         actual = self._resolve_alias(actual)
         slot = self._resolve_alias(slot)
+        if isinstance(slot, rast.RefType) and slot.mutable:
+            self._check_let_into_mut(expr)
         if isinstance(slot, (rast.PtrType, rast.RefType)):
             self._check_value_into_ref(expr, actual, slot)
             return
@@ -1241,6 +1255,77 @@ class TypeChecker:
         mutable = isinstance(slot, rast.RefType) and slot.mutable
         self._slot_error(ref_rules.VALUE_INTO_MUT_REF if mutable
                          else ref_rules.VALUE_INTO_SHARED_REF, expr.span)
+
+    # `@T` is read-only (LANGUAGE_SPEC §3.2, §13.3, AGAST #2338)
+
+    def _quiet_type(self, expr: rast.Expr) -> rast.Type:
+        """The type of `expr`, which has already had its say."""
+        mark = len(self.errors)
+        ty = self._infer_type(expr)
+        del self.errors[mark:]
+        return self._resolve_alias(ty)
+
+    def _check_write(self, target: rast.Expr) -> None:
+        """`target` is written. Walk it from the place to its root: an `@T` on
+        the way is an error, whatever is behind it, and a `*T` ends the walk,
+        since what it points at is the pointer's business. So is anything the
+        checker can't type, which stays unjudged."""
+        place = target
+        while True:
+            if isinstance(place, rast.Grouped):
+                place = place.expr
+                continue
+            if isinstance(place, (rast.Field, rast.Index)):
+                base = place.expr
+            elif isinstance(place, rast.UnaryOp) and place.op == '*':
+                base = place.operand
+            else:
+                return
+            ty = self._quiet_type(base)
+            # `.` reads through every level, so the one nearest the place counts.
+            while isinstance(place, rast.Field) and isinstance(ty, (rast.PtrType, rast.RefType)) \
+                    and isinstance(self._resolve_alias(ty.inner), (rast.PtrType, rast.RefType)):
+                ty = self._resolve_alias(ty.inner)
+            if isinstance(ty, rast.RefType) and not ty.mutable:
+                if id(target) not in self._slot_reported:
+                    self._slot_reported.add(id(target))
+                    self._slot_error(ref_rules.WRITE_THROUGH_SHARED, target.span)
+                return
+            if isinstance(ty, rast.PtrType) or self._is_opaque(ty):
+                return
+            place = base
+
+    def _as_let(self, ty: rast.Type) -> rast.Type:
+        """`ty`, for a `let` to hold."""
+        held = copy.copy(ty)
+        self._let_types.append(held)
+        return held
+
+    def _let_root(self, place: rast.Expr) -> Optional[str]:
+        """The `let` whose own storage `place` is, reached with no pointer or
+        reference on the path. The emitter's _let_place, ahead of LLVM types."""
+        if isinstance(place, rast.Grouped):
+            return self._let_root(place.expr)
+        if isinstance(place, rast.Ident):
+            held = self.locals.get(place.name)
+            return place.name if any(held is ty for ty in self._let_types) else None
+        if isinstance(place, (rast.Field, rast.Index)):
+            base = self._quiet_type(place.expr)
+            if isinstance(base, rast.ArrayType if isinstance(place, rast.Index)
+                          else (rast.NamedType, rast.TupleType)):
+                return self._let_root(place.expr)
+        return None
+
+    def _check_let_into_mut(self, expr: rast.Expr) -> None:
+        """`expr` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't."""
+        if isinstance(expr, rast.Grouped):
+            self._check_let_into_mut(expr.expr)
+        elif isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@') \
+                and id(expr) not in self._slot_reported:
+            name = self._let_root(expr.operand)
+            if name is not None:
+                self._slot_reported.add(id(expr))
+                self._slot_error(ref_rules.let_into_mut(name), expr.span)
 
     @staticmethod
     def _is_null(ty: rast.Type) -> bool:

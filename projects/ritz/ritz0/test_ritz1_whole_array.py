@@ -130,7 +130,7 @@ pub fn main() -> i32
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
     var b: [4]i32 = [0, 0, 0, 0]
-    let p = @b
+    let p = @&b
     *p = a
     return b[3]
 """,
