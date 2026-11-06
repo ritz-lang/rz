@@ -663,7 +663,8 @@ pub fn main() -> i32
     var a: [2]i32 = [1, 3]
     return f(h(@a))
 """,
-    # `[N]u32` is `[N]i32` to both compilers, as at a by-value copy (#2287).
+    # `[N]u32` is `[N]i32` to both compilers at an address (#2287); a by-value
+    # store refuses it (#2343).  Whether this stays is #2367.
     "same_llvm_element": """
 fn f(a:& [2]i32) -> i32
     a[1] = 3

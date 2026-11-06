@@ -25,6 +25,7 @@ import ownership          # move check + drops (AGAST #2158)
 import must_use           # must_use_check (AGAST #2137)
 import bool_check   # AGAST #2342
 import literal_slot # AGAST #2341
+import ref_check    # ref_array_error (AGAST #2343)
 
 # resolve_member_chain_field moved to emitter_core (AGAST #1660) so the
 # binary-op emitter can type enum-valued member operands too.
@@ -745,6 +746,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     declared.holds_shared_ref = shared_ref
     if var_type == TYPE_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
         set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308
+        set_local_pointee_elem(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_elem_pointee)
     # An unannotated local takes its initialiser's kind; var_type can't say.
     var inferred_bool: i32 = 0
     var inferred_unsure: i32 = 0
@@ -2257,9 +2259,17 @@ fn emit_array_field_copy(s: *EmitterState, field: *StructField, src_ptr: i32, ds
     emit_reg(s, dst_ptr)
     emit_str(s, c"\n")
 
+# AGAST #2343: an array store takes the same element type, by kind: `[N]u32` is
+# not `[N]i32`.  ref_into has said so already for whatever it can name.
+fn array_store_fits(s: *EmitterState, value: *Expr, a: i32, a_name: *u8, a_len: i32, b: i32, b_name: *u8, b_len: i32) -> i32
+    if a == b and array_elem_types_match(a, a_name, a_len, b, b_name, b_len) == 1
+        return 1
+    ref_array_error(s, value)
+    0
+
 # 1 when two array element types name the same type (struct elements by name).
-# AGAST #2287: two scalars are the same when LLVM spells them the same, as for
-# ritz0: `[N]u32` is `[N]i32`, the bytes copy as they are.
+# AGAST #2287: two scalars are the same when LLVM spells them the same.  That's
+# for an address, which doesn't copy; a store asks array_store_fits.
 fn array_elem_types_match(a: i32, a_name: *u8, a_len: i32, b: i32, b_name: *u8, b_len: i32) -> i32
     if a == TYPE_STRUCT or b == TYPE_STRUCT
         if a != b or a_len != b_len or a_len <= 0
@@ -2398,8 +2408,7 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
     if src_size != field.array_size
         emit_ir_error(s, c"array length does not match the struct field's array length")
         return
-    if array_elem_types_match(src_et, src_name, src_name_len, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len) == 0
-        emit_ir_error(s, c"array element type does not match the struct field's element type")
+    if array_store_fits(s, value, src_et, src_name, src_name_len, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len) == 0
         return
     emit_array_field_copy(s, field, src_ptr, field_ptr)
 
@@ -2427,8 +2436,7 @@ fn emit_array_local_copy_from_field(s: *EmitterState, dst_ptr: i32, dst_size: i3
     if field.array_size != dst_size
         emit_ir_error(s, c"struct field's array length does not match the local array's length")
         return 1
-    if array_elem_types_match(field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, dst_et, dst_name, dst_name_len) == 0
-        emit_ir_error(s, c"struct field's array element type does not match the local array's element type")
+    if array_store_fits(s, value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, dst_et, dst_name, dst_name_len) == 0
         return 1
     emit_array_field_copy(s, field, mr.reg, dst_ptr)
     1
@@ -2503,8 +2511,7 @@ fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, 
     if place.size != dst_size
         emit_ir_error(s, c"array length does not match the local array's length")
         return
-    if array_elem_types_match(place.elem, place.name, place.name_len, dst_et, dst_name, dst_name_len) == 0
-        emit_ir_error(s, c"array element type does not match the local array's element type")
+    if array_store_fits(s, value, place.elem, place.name, place.name_len, dst_et, dst_name, dst_name_len) == 0
         return
     emit_local_array_copy(s, dst_size, dst_et, dst_name, dst_name_len, emit_array_place_ptr(s, value), dst_ptr)
 

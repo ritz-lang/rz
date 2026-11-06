@@ -966,6 +966,7 @@ pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, bod
     f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
+    f.ret_array = fn_ret_array(ret)     # AGAST #2343
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1040,6 +1041,7 @@ pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i
     f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
+    f.ret_array = fn_ret_array(ret)     # AGAST #2343
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1113,6 +1115,9 @@ fn param_type_names_pointee(p: *Parser, ty: i32) -> i32
             return 1
         if p.last_pointee_type == TYPE_ARRAY and p.last_array_elem_type == TYPE_STRUCT
             return 1
+        # AGAST #2343: `*[N]*S`, as a by-value `[N]*S` is named.
+        if p.last_pointee_type == TYPE_ARRAY and p.last_array_elem_pointee == TYPE_STRUCT
+            return 1
         return 0
     if ty == TYPE_PTR_PTR
         if ptr_ptr_slot_inner(ptr_ptr_inner_pointee(p, ty)) == TYPE_STRUCT
@@ -1125,6 +1130,8 @@ fn param_type_names_pointee(p: *Parser, ty: i32) -> i32
             return 1
         if p.last_ref_inner_type == TYPE_ARRAY and p.last_array_elem_type == TYPE_STRUCT
             return 1
+        if p.last_ref_inner_type == TYPE_ARRAY and p.last_array_elem_pointee == TYPE_STRUCT
+            return 1   # AGAST #2343: `@[N]*S`
         return 0
     return 0
 
@@ -1162,11 +1169,13 @@ fn param_of_type(p: *Parser, name: *u8, len: i32, ty: i32) -> *Param
     param.param_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     param.param_pointee_array_size = ptr_array_pointee_size(p, ty)
     param.param_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
+    param.param_pointee_array_elem_pointee = ptr_array_elem_pointee(p, ty)
     # AGAST #2279, #2287: `@[N]T` and `@&[N]T` keep N and T, as `*[N]T` does.
     param.param_pointee_array_shape = null
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_ARRAY
         param.param_pointee_array_size = p.last_array_size
         param.param_pointee_array_elem_type = p.last_array_elem_type
+        param.param_pointee_array_elem_pointee = p.last_array_elem_pointee
         param.param_pointee_array_shape = p.last_array_shape
     param.param_ref_ptr_pointee = TYPE_VOID
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR
@@ -1362,6 +1371,7 @@ pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypePar
     f.ret_written_void = 0   # AGAST #2236
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
+    f.ret_array = fn_ret_array(ret)     # AGAST #2343
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1795,10 +1805,21 @@ fn fn_ret_ref(ret: i32) -> *Param
         return g_ret_ref
     return null
 
+# AGAST #2343: a `-> [N]T`, latched the same way.
+var g_ret_array: *ArrayElem = null
+
+fn fn_ret_array(ret: i32) -> *ArrayElem
+    if ret == TYPE_ARRAY
+        return g_ret_array
+    return null
+
 pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     nd_array_reject(p, ret, parse_pos_line(p), parse_pos_col(p), c"a return type")  # AGAST #1509
     g_ret_fn_sig = fresh_fn_sig(p)   # the type_spec just ended here
     g_ret_ref = null
+    g_ret_array = null
+    if ret == TYPE_ARRAY
+        g_ret_array = array_elem_of_last(p)
     if ret == TYPE_REF or ret == TYPE_MUT_REF
         g_ret_ref = param_of_type(p, null, 0, ret)
     if ret == TYPE_STRUCT
@@ -1908,6 +1929,7 @@ pub fn type_fn(p: *Parser, params: *Param, ret: i32) -> i32
     f.from_generated = 0
     f.ret_fn_sig = null
     f.ret_ref = null
+    f.ret_array = null
     p.last_fn_sig = f
     p.last_fn_sig_pos = p.pos
     return TYPE_PTR
@@ -1932,6 +1954,7 @@ fn array_shape_prepend(p: *Parser, size: i32) -> *ArrayShape
         sh.leaf_type = p.last_array_elem_type
         sh.leaf_name = p.last_array_elem_type_name
         sh.leaf_name_len = p.last_array_elem_type_name_len
+        sh.leaf_pointee = p.last_array_elem_pointee
         return sh
     if inner.rank >= MAX_ARRAY_RANK
         eprints_cstr(c"error: ")
@@ -1947,6 +1970,7 @@ fn array_shape_prepend(p: *Parser, size: i32) -> *ArrayShape
     sh.leaf_type = inner.leaf_type
     sh.leaf_name = inner.leaf_name
     sh.leaf_name_len = inner.leaf_name_len
+    sh.leaf_pointee = inner.leaf_pointee
     return sh
 
 # AGAST #1509: 1 when the type just parsed (`ty`, with p's array state) is
@@ -2054,6 +2078,16 @@ fn array_len_report(line: i32, col: i32, why: *u8)
     eprints_cstr(c": array length ")
     eprintln_cstr(why)
 
+# AGAST #2343: the element of the `[N]T` just parsed.
+fn array_elem_of_last(p: *Parser) -> *ArrayElem
+    let a: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
+    a.elem = p.last_array_elem_type
+    a.pointee = p.last_array_elem_pointee
+    a.name = p.last_array_elem_type_name
+    a.name_len = p.last_array_elem_type_name_len
+    a.shape = p.last_array_shape
+    return a
+
 fn type_array_sized(p: *Parser, size: i32, elem_type: i32) -> i32
     # AGAST #1509: `[size]<array>` is multi-dimensional.  The inner array's
     # info is still in p.last_array_* (type_spec is right-recursive, so the
@@ -2098,6 +2132,12 @@ pub fn ptr_ptr_inner_pointee(p: *Parser, ty: i32) -> i32
     if p.last_ptr_depth < 3 or p.last_inner_pointee_type == TYPE_VOID
         return TYPE_VOID
     return p.last_inner_pointee_type + (p.last_ptr_depth - 2) * PTR_DEPTH_UNIT
+
+# AGAST #2343: U for a just-parsed `*[N]*U` (TYPE_VOID otherwise).
+pub fn ptr_array_elem_pointee(p: *Parser, ty: i32) -> i32
+    if ty != TYPE_PTR or p.last_pointee_type != TYPE_ARRAY
+        return TYPE_VOID
+    return p.last_array_elem_pointee
 
 # AGAST #1953: N for a just-parsed `*[N]T` (0 otherwise).  type_array set
 # last_array_* while parsing the pointee, so they are current exactly when
@@ -2653,6 +2693,7 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     s.var_pointee_array_size = ptr_array_pointee_size(p, ty)
     s.var_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
+    s.var_pointee_array_elem_pointee = ptr_array_elem_pointee(p, ty)
     s.var_ref = null
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and g_var_ref != null
         s.var_ref = g_var_ref
@@ -2671,6 +2712,7 @@ pub fn stmt_take_var_ref(s: *Stmt)
     s.var_pointee_type = r.param_pointee_type
     s.var_pointee_array_size = r.param_pointee_array_size
     s.var_pointee_array_elem_type = r.param_pointee_array_elem_type
+    s.var_pointee_array_elem_pointee = r.param_pointee_array_elem_pointee
 
 pub fn stmt_return(p: *Parser, val: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
@@ -3338,6 +3380,7 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
     e.left = left
     e.op = target_type
     e.cast_pointee = p.last_pointee_type
+    e.cast_array = null
     e.fn_sig = null
     e.int_val = TYPE_VOID
     e.ident_ptr = null
@@ -3532,6 +3575,9 @@ pub fn cast_tail_new(p: *Parser, ty: i32, next: *CastTail) -> *CastTail
     ct.fn_sig = null
     if next == null and ty == TYPE_PTR
         ct.fn_sig = fresh_fn_sig(p)
+    ct.array = null
+    if next == null and ty == TYPE_ARRAY
+        ct.array = array_elem_of_last(p)
     ct.pointee_type = TYPE_VOID
     ct.pointee_name = null
     ct.pointee_name_len = 0
@@ -3561,6 +3607,7 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
         result.ident_ptr = ct.pointee_name
         result.ident_len = ct.pointee_name_len
         result.fn_sig = ct.fn_sig
+        result.cast_array = ct.array
         ct = ct.next
     return result
 
@@ -3759,6 +3806,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
             let cast_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
             cast_expr.kind = EXPR_CAST
             cast_expr.fn_sig = null
+            cast_expr.cast_array = null
             cast_expr.span = result.span
             cast_expr.left = result
             cast_expr.op = op.cast_type

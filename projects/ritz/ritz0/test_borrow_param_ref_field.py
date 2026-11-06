@@ -36,6 +36,7 @@ from pathlib import Path
 
 import pytest
 
+from array_rules import ELEMENT_MISMATCH
 from ref_rules import REF_INTO_VALUE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
 
@@ -2860,7 +2861,7 @@ pub fn main() -> i32
     var a: [2]i64 = [1, 3]
     var h: H = mk(@&a)
     return h.a[1]
-""", "array element type does not match"),
+""", ELEMENT_MISMATCH),
     # A struct borrow isn't an array, whatever length it reads as.
     "struct_referent": (TYPES + """
 fn f(c:& C) -> i32
@@ -2879,7 +2880,7 @@ fn f(a:& [2]i64) -> i32
 pub fn main() -> i32
     var a: [2]i64 = [1, 3]
     return f(@&a)
-""", "array element type does not match"),
+""", ELEMENT_MISMATCH),
 }
 
 

@@ -6,7 +6,7 @@ through the matrix.
 Anything else must fail closed with a diagnostic.  Before #2035 every shape here
 compiled with exit 0 and emitted `store i64 <[N x T]>` (or a scalar into an
 array slot), which only clang caught.  None of these programs is valid Ritz;
-ritz0 rejects three and wrongly accepts three (KNOWN_RITZ0_GAPS, AGAST #2090).
+ritz0 rejects five and wrongly accepts one (KNOWN_RITZ0_GAPS, AGAST #2090).
 """
 
 import os
@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from array_rules import ELEMENT_MISMATCH
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -29,7 +30,7 @@ struct Wide
 """
 
 LEN = "array length does not match the local array's length"
-ELEM = "array element type does not match the local array's element type"
+ELEM = ELEMENT_MISMATCH
 NOT_ARRAY = "whole-array read into a local array from this member"
 
 # name -> (body of main, diagnostic substring)
@@ -62,7 +63,7 @@ CASES = {
 
 # ritz0 accepts these without a type error (AGAST #2090).  Strict xfail: once
 # ritz0 rejects one, its entry must be removed here.
-KNOWN_RITZ0_GAPS = {"let_len_mismatch", "let_elem_mismatch", "assign_elem_mismatch"}
+KNOWN_RITZ0_GAPS = {"let_len_mismatch"}
 
 
 def _program(body: str) -> str:

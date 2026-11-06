@@ -20,6 +20,7 @@ Built-in functions:
 
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
+import array_rules
 import bool_rules
 import ref_rules
 import ritz_ast as rast
@@ -522,7 +523,7 @@ class TypeChecker:
             return rast.TupleType(expr.span, element_types)
 
         elif isinstance(expr, rast.Cast):
-            self._infer_type(expr.expr)
+            self._check_array_slot(expr.expr, self._infer_type(expr.expr), expr.target)
             if self._is_bool_type(expr.target):
                 self._error(bool_rules.AS_BOOL_REMOVED, expr.span)
             return expr.target
@@ -1149,6 +1150,7 @@ class TypeChecker:
             return ty
         ty = self._infer_type(expr)
         self._check_ref_slot(expr, ty, slot)
+        self._check_array_slot(expr, ty, slot)
         self._check_parts(expr, slot)
         return ty
 
@@ -1248,6 +1250,43 @@ class TypeChecker:
     def _is_span(ty: rast.Type) -> bool:
         return isinstance(ty, rast.NamedType) and (
             ty.name == 'Span' or ty.name.startswith('Span$'))
+
+    def _check_array_slot(self, expr: rast.Expr, actual: Optional[rast.Type],
+                          slot: Optional[rast.Type]) -> None:
+        """A non-literal `[N]T1` fits `[N]T2` only if T1 is T2 (LARB R5). A
+        literal takes the slot's element type, and its parts land one by one."""
+        if (slot is None or actual is None or id(expr) in self._slot_reported
+                or isinstance(expr, (rast.ArrayLit, rast.ArrayFill, rast.TupleLit))
+                or self._arrays_fit(actual, slot)):
+            return
+        self._slot_reported.add(id(expr))
+        self._slot_error(array_rules.ELEMENT_MISMATCH, expr.span)
+
+    def _arrays_fit(self, actual: rast.Type, slot: rast.Type) -> bool:
+        """False if an array in `actual` lands on another element type in `slot`.
+        The length is judged elsewhere."""
+        actual = self._resolve_alias(actual)
+        slot = self._resolve_alias(slot)
+        if isinstance(actual, rast.ArrayType) and isinstance(slot, rast.ArrayType):
+            return self._same_type(actual.inner, slot.inner)
+        if (isinstance(actual, rast.TupleType) and isinstance(slot, rast.TupleType)
+                and len(actual.elements) == len(slot.elements)):
+            return all(self._arrays_fit(a, s) for a, s in zip(actual.elements, slot.elements))
+        return True
+
+    def _same_type(self, a: rast.Type, b: rast.Type) -> bool:
+        """`a` and `b` are one type, through aliases and module qualifiers. An
+        opaque type can't be judged, so it isn't refused."""
+        a = self._resolve_alias(a)
+        b = self._resolve_alias(b)
+        if self._is_opaque(a) or self._is_opaque(b):
+            return True
+        if isinstance(a, rast.ArrayType) and isinstance(b, rast.ArrayType):
+            return (getattr(a.size, 'value', a.size) == getattr(b.size, 'value', b.size)
+                    and self._same_type(a.inner, b.inner))
+        if isinstance(a, (rast.PtrType, rast.RefType)) and type(a) is type(b):
+            return a.mutable == b.mutable and self._same_type(a.inner, b.inner)
+        return self._type_str(a) == self._type_str(b)
 
     # Helper methods
 
@@ -1482,6 +1521,9 @@ class TypeChecker:
         if isinstance(iter_type, rast.NamedType):
             if iter_type.name == 'Range':
                 return rast.NamedType(iter_type.span, 'i64', [])
+        resolved = self._resolve_alias(iter_type)
+        if isinstance(resolved, rast.ArrayType):
+            return resolved.inner
         return rast.NamedType(None, 'unknown', [])
 
     def _get_type_name(self, ty: rast.Type) -> str:

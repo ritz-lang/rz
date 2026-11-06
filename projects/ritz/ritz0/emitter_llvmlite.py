@@ -15,7 +15,8 @@ from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
 from monomorph import resolve_alias_in
-from tail_value import slot_tails, value_gap
+from tail_value import slot_tails, value_gap, value_tails
+import array_rules
 import bool_rules
 import match_coverage
 from metadata import type_to_string
@@ -5017,7 +5018,9 @@ class LLVMEmitter:
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
                 self._procedure_method_calls = set()
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
-                last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
+                last_val = self._emit_into_array_slot(
+                    fn_def.body.expr, fn_def.ret_type,
+                    lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
                 self._reject_missing_tail_value(
                     fn_def, lambda e: id(e) in self._procedure_method_calls)
                 self.closure_expected_type = None  # Clear context
@@ -5046,7 +5049,7 @@ class LLVMEmitter:
                     self._reject_enum_as_int(
                         last_val, ret_type, fn_def.ret_type,
                         getattr(fn_def.body.expr, 'span', None))
-                last_val = self._convert_type(last_val, ret_type)
+                last_val = self._convert_type(last_val, ret_type, fn_def.body.expr)
                 # A fn with no declared return type is a procedure: its tail
                 # expression is evaluated for effect only. _convert_type
                 # silently no-ops on aggregates, so without this check a
@@ -5685,7 +5688,7 @@ class LLVMEmitter:
                     val, ret_type,
                     self.current_fn_def.ret_type if self.current_fn_def else None,
                     getattr(stmt.value, 'span', None) or getattr(stmt, 'span', None))
-                val = self._convert_type(val, ret_type)
+                val = self._convert_type(val, ret_type, stmt.value)
                 # Emit drops for all scopes before return (excluding moved variable)
                 self._emit_drop_for_all_scopes(exclude_var)
                 self.builder.ret(val)
@@ -5799,7 +5802,7 @@ class LLVMEmitter:
                     # AGAST #1736: an sret call writes the new var in place
                     # (no first-class %T, which clang -O2 lowers per byte).
                     if not self._retarget_sret_result(val, alloca):
-                        val = self._convert_type(val, ty)
+                        val = self._convert_type(val, ty, stmt.value)
                         self.builder.store(val, alloca)
             self._bind_var(stmt.name, alloca, ty)
             # Register for Drop if type is known and implements Drop
@@ -5831,6 +5834,9 @@ class LLVMEmitter:
                     if stmt.type.name in ('v8i32', 'v4i64', 'v16i16', 'v32i8',
                                           'v4i32', 'v2i64', 'v8i16', 'v16i8'):
                         self.simd_expected_type = stmt.type
+                # Restored, not cleared: this `let` may sit in an arm whose
+                # tail is still to land in the enclosing slot.
+                saved_let_expected = self.expected_ritz_type
                 self.expected_ritz_type = stmt.type
                 self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
                 # AGAST #1964: variant names are global (`Some` -> whichever
@@ -5847,7 +5853,7 @@ class LLVMEmitter:
                     self._leave_float_tails(saved_float)
                 self.closure_expected_type = None  # Clear context
                 self.simd_expected_type = None  # Clear SIMD context
-                self.expected_ritz_type = None
+                self.expected_ritz_type = saved_let_expected
             if stmt.type:
                 self._check_initialiser_has_value(stmt, val)
                 # Use declared type and convert value if needed
@@ -5855,7 +5861,7 @@ class LLVMEmitter:
                 src_ty = val.type  # before _convert_type hides any narrowing
                 self._reject_enum_as_int(val, declared_ty, stmt.type,
                                          getattr(stmt, 'span', None))
-                val = self._convert_type(val, declared_ty)
+                val = self._convert_type(val, declared_ty, stmt.value)
                 self._check_implicit_narrowing(stmt, src_ty, declared_ty)
                 self._check_let_annotation(stmt, val, declared_ty)
                 self._bind_let(stmt.name, val, declared_ty)
@@ -5913,7 +5919,7 @@ class LLVMEmitter:
             if target_enum is not None:
                 val = self._emit_enum_variant_with_type(stmt.value, target_enum)
             else:
-                val = self._emit_expr(stmt.value)
+                val = self._emit_into_array_slot(stmt.value, self._assign_slot(stmt))
             self._reject_enum_assign(stmt.target, val, getattr(stmt, 'span', None))
             if isinstance(stmt.target, rast.Ident):
                 name = stmt.target.name
@@ -5921,11 +5927,11 @@ class LLVMEmitter:
                 # _check_let_write above (AGAST #2031).
                 if name in self.locals:
                     alloca, ty = self.locals[name]
-                    val = self._convert_type(val, ty)
+                    val = self._convert_type(val, ty, stmt.value)
                     self._store_binding(name, alloca, val)
                 elif name in self.globals:
                     gvar, ty = self.globals[name]
-                    val = self._convert_type(val, ty)
+                    val = self._convert_type(val, ty, stmt.value)
                     self.builder.store(val, gvar)
                 else:
                     raise ValueError(f"Unknown variable: {name}")
@@ -6028,7 +6034,7 @@ class LLVMEmitter:
                 # Assignment to dereferenced pointer: *ptr = val
                 ptr = self._emit_expr(stmt.target.operand)
                 if isinstance(ptr.type, ir.PointerType):
-                    val = self._convert_type(val, ptr.type.pointee)
+                    val = self._convert_type(val, ptr.type.pointee, stmt.value)
                     self.builder.store(val, ptr)
                 else:
                     raise ValueError(f"Cannot dereference non-pointer: {ptr.type}")
@@ -6053,7 +6059,7 @@ class LLVMEmitter:
                             _, field_type = self.struct_fields[struct_name][idx]
                             field_llvm_type = self._ritz_type_to_llvm(field_type)
                             field_ptr = self.builder.gep(struct_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                            val = self._convert_type(val, field_llvm_type)
+                            val = self._convert_type(val, field_llvm_type, stmt.value)
                             self._drop_old_field(stmt.target, field_ptr, field_type)
                             self.builder.store(val, field_ptr)
                         else:
@@ -8514,7 +8520,7 @@ class LLVMEmitter:
         if not expr.elements:
             # `let a: [0]u8 = []` - an empty literal carries no element type of
             # its own, so it is only meaningful against a declared array type.
-            expected = self.expected_ritz_type
+            expected = self._expected_array()
             if isinstance(expected, rast.ArrayType):
                 return ir.Constant(self._ritz_type_to_llvm(expected), None)
             raise ValueError(
@@ -8523,7 +8529,8 @@ class LLVMEmitter:
 
         # Emit all elements and infer type from first element. Each element
         # lands in the element type, not the array's.
-        expected = self.expected_ritz_type
+        saved_expected = self.expected_ritz_type
+        expected = self._expected_array()
         element_type = expected.inner if isinstance(expected, rast.ArrayType) else None
         saved_ctx = getattr(self, '_literal_ctx_nodes', set())
         values = []
@@ -8534,7 +8541,7 @@ class LLVMEmitter:
             try:
                 values.append(self._emit_expr(element))
             finally:
-                self.expected_ritz_type = expected
+                self.expected_ritz_type = saved_expected
                 self._literal_ctx_nodes = saved_ctx
         elem_type = values[0].type
 
@@ -8583,19 +8590,29 @@ class LLVMEmitter:
         if expr.count <= 0:
             raise ValueError("Array fill count must be positive")
 
-        # Emit the value once
-        val = self._emit_expr(expr.value)
-        expected = self.expected_ritz_type
+        # Emit the value once. Like a literal, a fill takes its element type
+        # from the slot: `[0; 16]` into `[16]u8` is a [16 x i8] (LARB R5).
+        saved_expected = self.expected_ritz_type
+        expected = self._expected_array()
+        if isinstance(expected, rast.ArrayType):
+            self.expected_ritz_type = expected.inner
+        try:
+            emitted = self._emit_expr(expr.value)
+        finally:
+            self.expected_ritz_type = saved_expected
+        val = emitted
         if isinstance(expected, rast.ArrayType):
             declared_elem = self._ritz_type_to_llvm(expected.inner)
             self._check_element_narrowing(expr.value, val.type, declared_elem, expected.inner)
+            val = self._convert_type(val, declared_elem, expr.value)
         elem_type = val.type
 
         # Create array type
         arr_type = ir.ArrayType(elem_type, expr.count)
 
-        # Optimization: Check if this is a zero fill
-        is_zero_fill = self._is_zero_constant(val)
+        # Optimization: Check if this is a zero fill. Converting a constant
+        # makes an instruction of it, so ask what was emitted.
+        is_zero_fill = self._is_zero_constant(emitted)
 
         # For small arrays, we can use zeroinitializer or insertvalue chain
         if expr.count <= 64:
@@ -8628,7 +8645,7 @@ class LLVMEmitter:
             elem_size = self._sizeof_type(elem_type)
 
             # For single-byte fills, use memset
-            if elem_size == 1 and isinstance(val, ir.Constant):
+            if elem_size == 1 and isinstance(emitted, ir.Constant):
                 # memset(ptr, val, count)
                 ptr = self.builder.bitcast(arr_alloca, self.i8.as_pointer())
                 byte_val = val
@@ -8653,8 +8670,12 @@ class LLVMEmitter:
             # Empty tuple (unit type): return empty struct
             return ir.Constant(ir.LiteralStructType([]), ir.Undefined)
 
-        # Emit all elements
-        values = [self._emit_expr(e) for e in expr.elements]
+        # Emit all elements; an array literal among them takes its element
+        # type from the tuple's slot.
+        slot = self._expected_slot()
+        parts = (slot.elements if isinstance(slot, rast.TupleType)
+                 and len(slot.elements) == len(expr.elements) else [None] * len(expr.elements))
+        values = [self._emit_into_array_slot(e, part) for e, part in zip(expr.elements, parts)]
 
         # Create struct type from element types
         elem_types = [val.type for val in values]
@@ -8807,56 +8828,6 @@ class LLVMEmitter:
         i = self.builder.load(counter_alloca)
         elem_ptr = self.builder.gep(arr_alloca, [ir.Constant(self.i32, 0), i])
         self.builder.store(val, elem_ptr)
-        next_i = self.builder.add(i, ir.Constant(self.i64, 1))
-        self.builder.store(next_i, counter_alloca)
-        self.builder.branch(loop_header)
-
-        # Continue after loop
-        self.builder.position_at_end(loop_end)
-
-    def _emit_array_convert_loop(self, src_alloca: ir.Value, dst_alloca: ir.Value,
-                                  src_type: ir.ArrayType, dst_type: ir.ArrayType) -> None:
-        """Emit a loop to convert array elements from src to dst type.
-
-        Generates:
-            for (i64 i = 0; i < count; i++) {
-                dst[i] = convert(src[i], target_elem_type);
-            }
-        """
-        count = src_type.count
-
-        # Create basic blocks
-        loop_header = self.builder.append_basic_block("convert_header")
-        loop_body = self.builder.append_basic_block("convert_body")
-        loop_end = self.builder.append_basic_block("convert_end")
-
-        # Initialize counter
-        counter_alloca = self.builder.alloca(self.i64)
-        self.builder.store(ir.Constant(self.i64, 0), counter_alloca)
-        self.builder.branch(loop_header)
-
-        # Loop header: check if i < count
-        self.builder.position_at_end(loop_header)
-        i = self.builder.load(counter_alloca)
-        cond = self.builder.icmp_signed('<', i, ir.Constant(self.i64, count))
-        self.builder.cbranch(cond, loop_body, loop_end)
-
-        # Loop body: dst[i] = convert(src[i]); i++
-        self.builder.position_at_end(loop_body)
-        i = self.builder.load(counter_alloca)
-
-        # Load source element
-        src_elem_ptr = self.builder.gep(src_alloca, [ir.Constant(self.i32, 0), i])
-        src_elem = self.builder.load(src_elem_ptr)
-
-        # Convert to target type
-        converted = self._convert_type(src_elem, dst_type.element)
-
-        # Store to destination
-        dst_elem_ptr = self.builder.gep(dst_alloca, [ir.Constant(self.i32, 0), i])
-        self.builder.store(converted, dst_elem_ptr)
-
-        # Increment counter
         next_i = self.builder.add(i, ir.Constant(self.i64, 1))
         self.builder.store(next_i, counter_alloca)
         self.builder.branch(loop_header)
@@ -9707,18 +9678,46 @@ class LLVMEmitter:
             return None
         return arg
 
-    def _emit_into_array_slot(self, value: rast.Expr, slot: Optional[rast.Type]) -> ir.Value:
-        """Emit `value`; an array literal takes its element type from `slot`,
-        and keeps its own length, so the wrong length is still refused."""
-        if (not isinstance(value, (rast.ArrayLit, rast.ArrayFill))
-                or not isinstance(slot, rast.ArrayType)):
-            return self._emit_expr(value)
+    def _assign_slot(self, stmt: rast.AssignStmt) -> Optional[rast.Type]:
+        """What `stmt` stores into, when it stores a literal that needs to
+        know. Anything else has its type already."""
+        if not any(isinstance(tail, (rast.ArrayLit, rast.ArrayFill, rast.TupleLit))
+                   for tail in value_tails(stmt.value)):
+            return None
+        slot = self._infer_ritz_type(stmt.target)
+        # `*p` infers as `p` when `p` is a reference, not a pointer.
+        if (isinstance(slot, rast.RefType) and isinstance(stmt.target, rast.UnaryOp)
+                and stmt.target.op == '*'):
+            return slot.inner
+        return slot
+
+    def _expected_slot(self) -> Optional[rast.Type]:
+        """The slot the value being emitted lands in, through any alias."""
+        return resolve_alias_in(self.expected_ritz_type, self.type_aliases)
+
+    def _expected_array(self) -> Optional[rast.ArrayType]:
+        """The array slot the literal being emitted lands in, if it has one."""
+        slot = self._expected_slot()
+        return slot if isinstance(slot, rast.ArrayType) else None
+
+    def _emit_into_array_slot(self, value: rast.Expr, slot: Optional[rast.Type],
+                              emit=None) -> ir.Value:
+        """Emit `value`; an array literal among its tails takes its element
+        type from `slot`, and nothing else converts (LARB R5). A literal that
+        is the whole value keeps its own length, so the wrong length is still
+        refused. `emit` is how to emit it, if not `_emit_expr`."""
+        emit = emit or self._emit_expr
+        slot = resolve_alias_in(slot, self.type_aliases) if slot is not None else None
+        if not isinstance(slot, (rast.ArrayType, rast.TupleType)) or not any(
+                isinstance(tail, (rast.ArrayLit, rast.ArrayFill, rast.TupleLit))
+                for tail in value_tails(value)):
+            return emit(value)
         saved = self.expected_ritz_type
-        if isinstance(value, rast.ArrayLit):
+        if isinstance(value, rast.ArrayLit) and isinstance(slot, rast.ArrayType):
             slot = replace(slot, size=len(value.elements))
         self.expected_ritz_type = slot
         try:
-            return self._emit_expr(value)
+            return emit(value)
         finally:
             self.expected_ritz_type = saved
 
@@ -9923,7 +9922,7 @@ class LLVMEmitter:
             field_val = self._emit_enum_variant_with_type(field_expr, field_enum)
         else:
             field_val = self._emit_into_array_slot(field_expr, expected_type)
-        return self._convert_type(field_val, self._ritz_type_to_llvm(expected_type))
+        return self._convert_type(field_val, self._ritz_type_to_llvm(expected_type), field_expr)
 
     def _sret_dest(self, fn: ir.Function, ret_type: ir.Type) -> Optional[ir.Value]:
         """`fn`'s sret pointer when it returns `ret_type` through one."""
@@ -12538,46 +12537,13 @@ class LLVMEmitter:
             if val.type.pointee == target_type:
                 return self.builder.load(val)
 
-        # Array type conversion: [N x T1] to [N x T2]
-        if isinstance(val.type, ir.ArrayType) and isinstance(target_type, ir.ArrayType):
-            if val.type.count == target_type.count:
-                count = val.type.count
-
-                # For small arrays, use zeroinitializer for zero fills or element-by-element
-                if count <= 64:
-                    # Optimization: If source is zeroinitializer, use zeroinitializer of target type
-                    if (isinstance(val, ir.Constant) and
-                        val.constant is None and  # zeroinitializer
-                        isinstance(target_type.element, (ir.IntType, ir.FloatType, ir.DoubleType, ir.PointerType))):
-                        return ir.Constant(target_type, None)
-
-                    # For small arrays, convert element by element (O(N) IR but N is small)
-                    result = ir.Constant(target_type, ir.Undefined)
-                    for i in range(count):
-                        elem = self.builder.extract_value(val, i)
-                        converted_elem = self._convert_type(elem, target_type.element)
-                        result = self.builder.insert_value(result, converted_elem, i)
-                    return result
-
-                # For large arrays, we need to avoid generating huge IR or crashing LLVM
-                arr_alloca = self.builder.alloca(target_type)
-
-                # If source is zeroinitializer, use memset instead of storing the constant
-                # (storing large zeroinitializer crashes LLVM SelectionDAG)
-                if isinstance(val, ir.Constant) and val.constant is None:
-                    ptr = self.builder.bitcast(arr_alloca, self.i8.as_pointer())
-                    elem_size = self._sizeof_type(target_type.element)
-                    total_bytes = elem_size * count
-                    byte_val = ir.Constant(self.i8, 0)
-                    byte_count = ir.Constant(self.i64, total_bytes)
-                    self._emit_memset(ptr, byte_val, byte_count)
-                else:
-                    # For other values, allocate and use a conversion loop
-                    src_alloca = self.builder.alloca(val.type)
-                    self.builder.store(val, src_alloca)
-                    self._emit_array_convert_loop(src_alloca, arr_alloca, val.type, target_type)
-
-                return self.builder.load(arr_alloca)
+        # `[N x T1]` to `[N x T2]` isn't a conversion (LARB R5). A literal was
+        # built at its slot's type, and the checker refused anything else it
+        # could name, so this is what it couldn't.
+        if (isinstance(val.type, ir.ArrayType) and isinstance(target_type, ir.ArrayType)
+                and val.type.count == target_type.count):
+            raise EmitError(array_rules.ELEMENT_MISMATCH,
+                            self._value_span(at) if at is not None else None)
 
         # Struct/tuple conversion: {T1, T2, ...} to {U1, U2, ...}
         # Both LiteralStructType (tuples) and IdentifiedStructType (named structs)
@@ -14352,7 +14318,7 @@ class LLVMEmitter:
         # Check if casting FROM a union type to a variant type
         # This happens in match arms: x as i32, x as *u8, etc.
         self._literal_into_slot(expr.target, expr.expr, fit=False)
-        val = self._emit_expr(expr.expr)
+        val = self._emit_into_array_slot(expr.expr, expr.target)
 
         # Check if the source expression's type is a union
         src_union_name = self._get_union_name_from_expr(expr.expr)

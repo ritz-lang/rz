@@ -1,5 +1,6 @@
 # ref_check.ritz - a reference doesn't fit a by-value slot, nor a value a
-# reference slot (AGAST #2336, #2337)
+# reference slot (AGAST #2336, #2337), and an array only fits a slot of its own
+# element type (AGAST #2343)
 #
 # LANGUAGE_SPEC §13.2-13.4, LARB ruling R1.  An `@T`, `@&T` or `*T` where a `T`
 # goes is a located error at every slot: argument, `let`/`var`, `=`, `return`,
@@ -20,6 +21,11 @@
 # Types the tables can't name stay unjudged: wrongly refusing a valid program
 # is worse than leaving it to clang.
 #
+# LANGUAGE_SPEC §3.3, LARB ruling R5: a non-literal `[N]T1` fits `[N]T2` only if
+# T1 is T2, at the same slots, and under `as`.  ritz0's twin is
+# TypeChecker._check_array_slot; array_rules.py has the wording and
+# ritz0/test_array_store_rule.py holds all three compilers to it.
+#
 # ownership.ritz uses ref_ty_of and ref_through for "cannot move out of a
 # reference", which only reaches a program with a Drop in it.
 
@@ -37,14 +43,13 @@ pub struct RefTy
     pointee: i32    # TYPE_* behind a pointer kind, or an array's element
     name: *u8       # the struct: kind's own, or the pointee's
     name_len: i32
+    elem_pointee: i32     # U for an array's `*U` element; TYPE_VOID if unknown
+    shape: *ArrayShape    # a multi-dimensional array's, else null
 
 # A tail and the slot it lands in.
 struct RefTail
     e: *Expr
-    kind: i32
-    pointee: i32
-    name: *u8
-    name_len: i32
+    slot: RefTy
 
 var REF_TAILS: *RefTail = null
 var REF_TAIL_COUNT: i32 = 0
@@ -58,7 +63,25 @@ fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.pointee = pointee
     out.name = name
     out.name_len = len
+    out.elem_pointee = TYPE_VOID
+    out.shape = null
     1
+
+fn ref_set_array(out: *RefTy, elem: i32, elem_pointee: i32, name: *u8, len: i32, shape: *ArrayShape) -> i32
+    ref_set(out, TYPE_ARRAY, elem, name, len)
+    out.elem_pointee = elem_pointee
+    out.shape = shape
+    1
+
+fn ref_set_elem(out: *RefTy, a: *ArrayElem) -> i32
+    ref_set_array(out, a.elem, a.pointee, a.name, a.name_len, a.shape)
+
+# `out` is what `a[i]` holds for `[N][M]T`: 0 past two dimensions, or for a
+# one-dimensional `a`.
+fn ref_row(a: *RefTy, out: *RefTy) -> i32
+    if a.shape == null or a.shape.rank != 2
+        return 0
+    ref_set_array(out, a.shape.leaf_type, a.shape.leaf_pointee, a.shape.leaf_name, a.shape.leaf_name_len, null)
 
 pub fn ref_is_pointer(kind: i32) -> i32
     if kind == TYPE_PTR or kind == TYPE_REF or kind == TYPE_MUT_REF
@@ -75,7 +98,7 @@ fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
             return ref_set(out, loc.pointee_type, 0, loc.type_name, loc.type_name_len)
         return ref_set(out, t, loc.pointee_type, loc.type_name, loc.type_name_len)
     if t == TYPE_ARRAY
-        return ref_set(out, t, loc.array_elem_type, loc.type_name, loc.type_name_len)
+        return ref_set_array(out, loc.array_elem_type, loc.array_elem_pointee, loc.type_name, loc.type_name_len, loc.array_shape)
     if t == TYPE_PTR_PTR
         return 0
     ref_set(out, t, 0, loc.type_name, loc.type_name_len)
@@ -91,6 +114,8 @@ fn ref_of_ident(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
         return ref_set(out, TYPE_PTR, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
     if g.var_type == TYPE_PTR_PTR
         return 0
+    if g.var_type == TYPE_ARRAY
+        return ref_set_array(out, g.array_elem_type, g.array_elem_pointee, g.array_elem_type_name, g.array_elem_type_name_len, g.array_shape)
     ref_set(out, g.var_type, 0, g.type_name, g.type_name_len)
 
 fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
@@ -98,6 +123,8 @@ fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
         return 0
     if f.ret_ref != null
         return ref_of_param(f.ret_ref, out)
+    if f.ret_array != null
+        return ref_set_elem(out, f.ret_array)
     if f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR
         # FnDef keeps no pointee, only a struct's name.
         if f.return_type_name_len > 0 and f.return_type == TYPE_PTR
@@ -108,6 +135,8 @@ fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
 fn ref_of_param(p: *Param, out: *RefTy) -> i32
     if p.param_type == TYPE_PTR_PTR
         return 0
+    if p.param_type == TYPE_ARRAY
+        return ref_set_array(out, p.param_array_elem_type, p.param_array_elem_pointee, p.param_type_name, p.param_type_name_len, null)
     ref_set(out, p.param_type, p.param_pointee_type, p.param_type_name, p.param_type_name_len)
 
 fn ref_of_field(s: *EmitterState, e: *Expr, f: *StructField, out: *RefTy) -> i32
@@ -119,10 +148,13 @@ fn ref_of_field(s: *EmitterState, e: *Expr, f: *StructField, out: *RefTy) -> i32
             pointee = TYPE_STRUCT
         return ref_set(out, t, pointee, f.field_type_name, f.field_type_name_len)
     if t == TYPE_ARRAY
-        return ref_set(out, t, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
+        return ref_of_array_field(f, out)
     if t == TYPE_PTR_PTR
         return 0
     ref_set(out, t, 0, f.field_type_name, f.field_type_name_len)
+
+fn ref_of_array_field(f: *StructField, out: *RefTy) -> i32
+    ref_set_array(out, f.array_elem_type, f.array_elem_pointee, f.array_elem_type_name, f.array_elem_type_name_len, f.array_shape)
 
 # The method `e` (EXPR_METHOD) calls, on the receiver's own type.
 pub fn ref_method_def(s: *EmitterState, e: *Expr) -> *FnDef
@@ -156,8 +188,11 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
             if ref_ty_of(s, e.operand, @t) == 0
                 return 0
             if ref_is_pointer(t.kind) == 0
-                return ref_set(out, t.kind, t.pointee, t.name, t.name_len)
-            if t.pointee == TYPE_VOID or ref_is_pointer(t.pointee) == 1 or t.pointee == TYPE_ARRAY
+                *out = t
+                return 1
+            if t.pointee == TYPE_ARRAY
+                return ref_behind(s, e.operand, out)
+            if t.pointee == TYPE_VOID or ref_is_pointer(t.pointee) == 1
                 return 0
             return ref_set(out, t.pointee, 0, t.name, t.name_len)
         return 0
@@ -175,6 +210,8 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
             return 0
         if b.kind != TYPE_ARRAY and ref_is_pointer(b.kind) == 0
             return 0
+        if b.kind == TYPE_ARRAY and b.pointee == TYPE_ARRAY
+            return ref_row(@b, out)
         if b.pointee == TYPE_VOID or ref_is_pointer(b.pointee) == 1 or b.pointee == TYPE_ARRAY
             return 0
         return ref_set(out, b.pointee, 0, b.name, b.name_len)
@@ -190,6 +227,17 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
     if k == EXPR_CAST and e.op == TYPE_PTR
         return ref_set(out, TYPE_PTR, e.int_val as i32, e.ident_ptr, e.ident_len)
     0
+
+# The `[N]T` behind `e`, a local `*[N]T`, `@[N]T` or `@&[N]T`.  0 for any other
+# pointer: only a local keeps the element.
+fn ref_behind(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
+    if e.kind != EXPR_IDENT
+        return 0
+    let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return 0
+    let loc: *LocalVar = local_at(s, idx)
+    ref_set_array(out, loc.pointee_array_elem_type, loc.pointee_array_elem_pointee, loc.type_name, loc.type_name_len, null)
 
 # Does the place `e` lie behind an `@T`, `@&T`, `*T` or `:&`?  ritz0's
 # MoveChecker._through_reference.
@@ -251,6 +299,45 @@ fn ref_error_slot(s: *EmitterState, e: *Expr)
     else
         eprints_cstr(c": error: a reference or pointer doesn't fit a by-value slot: write `*` to read through it\n")
     s.error_count = s.error_count + 1
+
+# `e` is a non-literal array of another element type than its slot's.  The
+# emitter's own check comes here too, for what ref_into couldn't name.
+pub fn ref_array_error(s: *EmitterState, e: *Expr)
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    eprints_cstr(c": error: an array only fits a slot of the same element type: write a loop to convert it\n")
+    s.error_count = s.error_count + 1
+
+fn ref_same_shape(a: *ArrayShape, b: *ArrayShape) -> i32
+    if a == null or b == null
+        return 1
+    if a.rank != b.rank or a.leaf_type != b.leaf_type
+        return 0
+    for i in 0..a.rank
+        if a.dims[i] != b.dims[i]
+            return 0
+    if a.leaf_type != TYPE_STRUCT or a.leaf_name_len == 0 or b.leaf_name_len == 0
+        return 1
+    name_eq(a.leaf_name, a.leaf_name_len, b.leaf_name, b.leaf_name_len)
+
+# 0 only when `a`'s element is known not to be `slot`'s: what the tables can't
+# name stays unjudged, as above.
+fn ref_same_element(a: *RefTy, slot: *RefTy) -> i32
+    if a.pointee == TYPE_VOID or slot.pointee == TYPE_VOID
+        return 1
+    if a.pointee != slot.pointee
+        return 0
+    if a.pointee == TYPE_ARRAY
+        return ref_same_shape(a.shape, slot.shape)
+    if a.pointee == TYPE_PTR and a.elem_pointee != TYPE_VOID and slot.elem_pointee != TYPE_VOID
+        if a.elem_pointee != slot.elem_pointee
+            return 0
+    if a.pointee != TYPE_STRUCT and (a.pointee != TYPE_PTR or a.elem_pointee != TYPE_STRUCT)
+        return 1
+    if a.name_len == 0 or slot.name_len == 0
+        return 1
+    name_eq(a.name, a.name_len, slot.name, slot.name_len)
 
 fn ref_same_pointee(a: *RefTy, slot: *RefTy) -> i32
     if a.pointee != slot.kind
@@ -321,12 +408,9 @@ fn ref_is_span(slot: *RefTy) -> i32
         return 0
     return (memcmp(slot.name, c"Span$", 5) == 0) as i32
 
-fn ref_tail_set(t: *RefTail, e: *Expr, kind: i32, pointee: i32, name: *u8, len: i32)
+fn ref_tail_set(t: *RefTail, e: *Expr, slot: *RefTy)
     t.e = e
-    t.kind = kind
-    t.pointee = pointee
-    t.name = name
-    t.name_len = len
+    t.slot = *slot
 
 fn ref_note(e: *Expr, slot: *RefTy)
     if REF_TAIL_COUNT == REF_TAIL_CAP
@@ -336,13 +420,13 @@ fn ref_note(e: *Expr, slot: *RefTy)
         let was: *RefTail = REF_TAILS
         for i in 0..REF_TAIL_COUNT
             let old: *RefTail = was + i
-            ref_tail_set(grown + i, old.e, old.kind, old.pointee, old.name, old.name_len)
+            ref_tail_set(grown + i, old.e, @old.slot)
         if REF_TAILS != null
             free(REF_TAILS as *u8)
         REF_TAILS = grown
         REF_TAIL_CAP = cap
     let tails: *RefTail = REF_TAILS
-    ref_tail_set(tails + REF_TAIL_COUNT, e, slot.kind, slot.pointee, slot.name, slot.name_len)
+    ref_tail_set(tails + REF_TAIL_COUNT, e, slot)
     REF_TAIL_COUNT = REF_TAIL_COUNT + 1
 
 fn ref_note_arms(arms: *MatchArm, slot: *RefTy)
@@ -386,7 +470,7 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
         return
     if e.kind == EXPR_ARRAY_LIT and slot.kind == TYPE_ARRAY
         var part: RefTy
-        ref_set(@part, slot.pointee, 0, slot.name, slot.name_len)
+        ref_element(slot, @part)
         var el: *Expr = e.args
         while el != null
             ref_into(s, el, @part)
@@ -394,7 +478,7 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
         return
     if e.kind == EXPR_ARRAY_FILL and slot.kind == TYPE_ARRAY
         var fill: RefTy
-        ref_set(@fill, slot.pointee, 0, slot.name, slot.name_len)
+        ref_element(slot, @fill)
         ref_into(s, e.left, @fill)
         return
     var a: RefTy
@@ -405,7 +489,15 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
             ref_error_value(s, e, slot)
         else if ref_is_pointer(a.kind) == 1 and ref_same_pointee(@a, slot) == 1
             ref_error_slot(s, e)
+        else if a.kind == TYPE_ARRAY and slot.kind == TYPE_ARRAY and ref_same_element(@a, slot) == 0
+            ref_array_error(s, e)
     ref_into_variant(s, e, slot)
+
+# What an element of the array `slot` lands in.
+fn ref_element(slot: *RefTy, out: *RefTy)
+    if slot.pointee != TYPE_ARRAY or ref_row(slot, out) == 0
+        ref_set(out, slot.pointee, 0, slot.name, slot.name_len)
+        out.elem_pointee = TYPE_VOID
 
 # `Some(x)`, `Ok(x)` or `Err(x)` into an instance of Option or Result: its name
 # says what the payload is, for a struct.
@@ -455,7 +547,9 @@ fn ref_walk_list(s: *EmitterState, a0: *Expr)
 
 # What field `f` takes, as a slot.
 fn ref_field_slot(f: *StructField, out: *RefTy)
-    if f.field_type == TYPE_PTR and f.field_mut_ref == 1
+    if f.field_type == TYPE_ARRAY
+        ref_of_array_field(f, out)
+    else if f.field_type == TYPE_PTR and f.field_mut_ref == 1
         ref_set(out, TYPE_MUT_REF, f.array_elem_type, f.field_type_name, f.field_type_name_len)
     else
         ref_set(out, f.field_type, f.array_elem_type, f.field_type_name, f.field_type_name_len)
@@ -538,6 +632,10 @@ fn ref_walk(s: *EmitterState, e: *Expr)
         ref_walk(s, e.left)
         ref_walk(s, e.right)
     else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_MATCH or k == EXPR_IF
+        if k == EXPR_CAST and e.cast_array != null
+            var target: RefTy
+            ref_set_elem(@target, e.cast_array)
+            ref_into(s, e.left, @target)
         ref_walk(s, e.left)
 
 # `e` is about to be emitted as a tail: judge it against the slot it was noted
@@ -548,9 +646,7 @@ fn ref_landed(s: *EmitterState, e: *Expr)
     while i < REF_TAIL_COUNT
         let t: *RefTail = tails + i
         if t.e == e
-            var slot: RefTy
-            ref_set(@slot, t.kind, t.pointee, t.name, t.name_len)
-            ref_into(s, e, @slot)
+            ref_into(s, e, @t.slot)
             return
         i = i + 1
 
@@ -574,7 +670,7 @@ fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
     if stmt.var_type == TYPE_PTR_PTR
         return 0
     if stmt.var_type == TYPE_ARRAY
-        return ref_set(out, TYPE_ARRAY, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len)
+        return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, stmt.var_type_name, stmt.var_type_name_len, stmt.var_array_shape)
     ref_set(out, stmt.var_type, stmt.var_pointee_type, stmt.var_type_name, stmt.var_type_name_len)
 
 # `x.f = v` and `p.f = v`: the field is named by assign_target, on `owner`.
@@ -638,7 +734,7 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
         if ref_of_ident(s, stmt.assign_target, stmt.assign_target_len, @held) == 1
             if held.kind == TYPE_ARRAY or ref_is_pointer(held.kind) == 1
                 var part: RefTy
-                ref_set(@part, held.pointee, 0, held.name, held.name_len)
+                ref_element(@held, @part)
                 ref_into(s, stmt.assign_value, @part)
         ref_walk(s, stmt.assign_value)
     else if k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN

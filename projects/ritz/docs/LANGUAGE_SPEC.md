@@ -616,6 +616,39 @@ let zeros = [0; 10]
 let first = zeros[0]
 ```
 
+An array literal or fill has no element type of its own until a slot gives it
+one, so it takes the element type of the array it lands in, element by element
+under §7.5:
+
+```ritz body
+var bytes: [4]u8 = [1, 2, 3, 200]
+var words: [4]i32 = [0; 4]
+```
+
+Anything else already has its type, and fits an `[N]T2` only if it is an `[N]T2`.
+That holds at every store: an argument, `let`, `var`, `=`, `*p =`, a global, a
+field, a `return`, and under `as`. There's no widening, narrowing or sign change
+between arrays, even where the elements have the same size:
+
+```ritz body expect-error="an array only fits a slot of the same element type: write a loop to convert it"
+var a: [4]i64 = [0, 0, 0, 3]
+var b: [4]i32 = a
+```
+
+```ritz body expect-error="an array only fits a slot of the same element type: write a loop to convert it"
+var a: [4]u32 = [0, 0, 0, 3]
+var b: [4]i32 = a
+```
+
+A conversion is a loop you write:
+
+```ritz body
+var a: [4]i64 = [0, 0, 0, 3]
+var b: [4]i32
+for i in 0..4
+    b[i] = a[i] as i32
+```
+
 ### 3.4 Slice Types
 
 ```ritz

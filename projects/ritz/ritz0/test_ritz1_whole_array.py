@@ -22,8 +22,9 @@ THE RULE, TAKEN FROM ritz0
     * Anything else that reads a whole array where only a scalar fits is an
       error, not a silent 8 bytes.
 
-ritz0 also converts `[N]T1` to `[N]T2` element by element.  ritz1 refuses that,
-as `b = a` and `h.a = a` already do; see ELEM_GAPS below.
+A non-literal `[N]T1` fits `[N]T2` only when T1 is T2 (LARB R5, AGAST #2343), so
+the element-type programs are in REJECTED below; test_array_store_rule.py has the
+rule at every store.
 
 Sizes matter: a `[2]i32` fits the 8 bytes that were copied, so the grid below
 runs each route at sizes that fit and at sizes that don't.  ritz0 is the oracle
@@ -393,20 +394,6 @@ pub fn main() -> i32
     var a: [2]S = [S { x: 1 }, S { x: 2 }]
     let r: i32 = g(a)
     return r * 10 + D
-""",
-    "sign_arg": """\
-fn g(a: [4]i32) -> i32
-    return a[3]
-
-pub fn main() -> i32
-    var a: [4]u32 = [0, 0, 0, 3]
-    return g(a)
-""",
-    "sign_local": """\
-pub fn main() -> i32
-    var a: [4]u32 = [0, 0, 0, 3]
-    var b: [4]i32 = a
-    return b[3]
 """,
     "deref_lit": """\
 fn s(p: *[4]i32)
@@ -826,58 +813,6 @@ pub fn main() -> i32
 """,
 }
 
-ELEM_GAPS = {
-    "arg_wrong_elem": """\
-fn g(a: [4]i32) -> i32
-    return a[3]
-
-pub fn main() -> i32
-    var a: [4]i64 = [0, 0, 0, 3]
-    return g(a)
-""",
-    "wrong_elem_store": """\
-fn s(p: *[4]i32)
-    var a: [4]i64 = [0, 0, 0, 3]
-    *p = a
-
-pub fn main() -> i32
-    var b: [4]i32 = [0, 0, 0, 0]
-    s(@b)
-    return b[3]
-""",
-    "wrong_elem_global": """\
-var G: [4]i32
-
-pub fn main() -> i32
-    var a: [4]i64 = [0, 0, 0, 3]
-    G = a
-    return G[3]
-""",
-    "wrong_elem_local": """\
-pub fn main() -> i32
-    var a: [4]i64 = [0, 0, 0, 3]
-    var b: [4]i32 = [0, 0, 0, 0]
-    b = a
-    return b[3]
-""",
-    "wrong_elem_float": """\
-fn g(a: [4]i32) -> i32
-    return a[3]
-
-pub fn main() -> i32
-    var a: [4]f64 = [0.0, 0.0, 0.0, 3.0]
-    return g(a)
-""",
-    "wrong_elem_widen": """\
-fn g(a: [4]i64) -> i64
-    return a[3]
-
-pub fn main() -> i32
-    var a: [4]i32 = [0, 0, 0, 3]
-    return g(a) as i32
-""",
-}
-
 DEREF_GAPS = {
     "deref_field_ptr": """\
 struct W
@@ -1087,7 +1022,6 @@ pub fn main() -> i32
 
 GAPS = [
     (RETURN_GAPS, "AGAST #2302: a fn returning `[N]T` isn't lowered"),
-    (ELEM_GAPS, "AGAST #2303: ritz0 converts `[N]T1` to `[N]T2`; ritz1 refuses"),
     (DEREF_GAPS, "AGAST #2304: `*p = a` needs a local or param `p: *[N]T`"),
     (SOURCE_GAPS, "AGAST #2305: a whole-array source or target ritz1 doesn't lower"),
     (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
@@ -1095,9 +1029,73 @@ GAPS = [
     (ROW_GAPS, "AGAST #2099: a whole row of a multi-dimensional array"),
 ]
 
-# Programs ritz0 refuses.  ritz1 has to refuse them too, and write no .ll: each
-# of these used to read the array's first 8 bytes.
+# Programs ritz0 refuses.  ritz1 has to refuse them too, and write no .ll: most of
+# these used to read the array's first 8 bytes, and the `wrong_elem` ones went
+# through ritz0's element conversion (#2343).
 REJECTED = {
+    "arg_wrong_elem": """\
+fn g(a: [4]i32) -> i32
+    return a[3]
+
+pub fn main() -> i32
+    var a: [4]i64 = [0, 0, 0, 3]
+    return g(a)
+""",
+    "wrong_elem_store": """\
+fn s(p: *[4]i32)
+    var a: [4]i64 = [0, 0, 0, 3]
+    *p = a
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 0]
+    s(@b)
+    return b[3]
+""",
+    "wrong_elem_global": """\
+var G: [4]i32
+
+pub fn main() -> i32
+    var a: [4]i64 = [0, 0, 0, 3]
+    G = a
+    return G[3]
+""",
+    "wrong_elem_local": """\
+pub fn main() -> i32
+    var a: [4]i64 = [0, 0, 0, 3]
+    var b: [4]i32 = [0, 0, 0, 0]
+    b = a
+    return b[3]
+""",
+    "wrong_elem_float": """\
+fn g(a: [4]i32) -> i32
+    return a[3]
+
+pub fn main() -> i32
+    var a: [4]f64 = [0.0, 0.0, 0.0, 3.0]
+    return g(a)
+""",
+    "wrong_elem_widen": """\
+fn g(a: [4]i64) -> i64
+    return a[3]
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    return g(a) as i32
+""",
+    "sign_arg": """\
+fn g(a: [4]i32) -> i32
+    return a[3]
+
+pub fn main() -> i32
+    var a: [4]u32 = [0, 0, 0, 3]
+    return g(a)
+""",
+    "sign_local": """\
+pub fn main() -> i32
+    var a: [4]u32 = [0, 0, 0, 3]
+    var b: [4]i32 = a
+    return b[3]
+""",
     "lent_to_ptr": """\
 fn g(p: *[4]i32) -> i32
     var b: [4]i32 = *p
