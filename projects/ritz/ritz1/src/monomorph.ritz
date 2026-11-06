@@ -1252,6 +1252,23 @@ fn array_shape_subst(sh: *ArrayShape, type_param: *u8, type_param_len: i32, subs
     out.leaf_name_len = subst_len
     return out
 
+# A reference param that holds a pointer records what that pointer points at,
+# and a `:&` one reads as the pointer, so it needs it twice.
+fn set_ref_ptr_pointee(param: *Param, pointee: i32)
+    param.param_ref_ptr_pointee = pointee
+    if param.is_borrow == 1
+        param.param_inner_pointee_type = pointee
+
+# What a `*U` type argument points at, from get_type_name_from_suffix's name for
+# it: U's spelling, which is `ptr_C` when U is itself the pointer `*C`.
+fn ptr_arg_pointee(name: *u8, len: i32) -> i32
+    if len > 4 and memcmp(name, c"ptr_", 4) == 0
+        return TYPE_PTR
+    let prim: i32 = primitive_type_from_name(name, len)
+    if prim != 0
+        return prim
+    TYPE_STRUCT
+
 fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Param
     if params == null
         return null
@@ -1314,11 +1331,14 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
                     cloned.param_pointee_array_elem_type = subst_type
                 else if cloned.param_type != TYPE_PTR and cloned.param_pointee_type == TYPE_PTR
                     # AGAST #2308: `@&*T` is still a reference to a pointer.
-                    cloned.param_ref_ptr_pointee = subst_type
-                    if cloned.is_borrow == 1
-                        cloned.param_inner_pointee_type = subst_type
+                    set_ref_ptr_pointee(cloned, subst_type)
                 else
                     cloned.param_pointee_type = subst_type
+                    # AGAST #2345: so is `@&T` at T = `*U`.  subst_type only says
+                    # TYPE_PTR, so `r:& T` was left as `r:& *<nothing>`: it never
+                    # bound as its referent, and `r = v` overwrote its own slot.
+                    if subst_type == TYPE_PTR
+                        set_ref_ptr_pointee(cloned, ptr_arg_pointee(subst_name, subst_len))
                 cloned.param_type_name = subst_name
                 cloned.param_type_name_len = subst_len
         else

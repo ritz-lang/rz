@@ -43,6 +43,7 @@ pytestmark = pytest.mark.integration
 
 C = "struct C\n    x: i32\n    y: i64\n\n"
 GOOD = "    var c1: C = C { x: 1, y: 0 }\n    var c3: C = C { x: 3, y: 0 }\n"
+GENERIC_WRITER = "fn w<T>(r:& T, v: T)\n    r = v\n\n"
 
 # name: (T, writer, initial value, read of `{}`, extra writer arguments, setup,
 # how an element gets its start: ritz1 stores no whole struct or array there)
@@ -139,9 +140,68 @@ ROUTES = {
     "generic_struct": C + "fn id<T>(r:& T) -> @&T\n    return r\n\n"
                       "pub fn main() -> i32\n    var c: C = C { x: 1, y: 0 }\n"
                       "    let p: @&C = id<C>(c)\n    p.x = 3\n    return c.x\n",
-    "generic_pointer": C + "fn w<T>(r:& T, v: T)\n    r = v\n\n"
-                       "pub fn main() -> i32\n" + GOOD +
+    "generic_pointer": C + GENERIC_WRITER + "pub fn main() -> i32\n" + GOOD +
                        "    var p: *C = @c1\n    w<*C>(p, @c3)\n    return p.x\n",
+    "generic_pointer_explicit": C + GENERIC_WRITER + "pub fn main() -> i32\n" + GOOD +
+                                "    var p: *C = @c1\n    w<*C>(@&p, @c3)\n    return p.x\n",
+    "generic_pointer_to_int": GENERIC_WRITER + "pub fn main() -> i32\n    var a: i32 = 1\n"
+                              "    var b: i32 = 3\n    var p: *i32 = @a\n    w<*i32>(p, @b)\n"
+                              "    return *p\n",
+    "generic_pointer_to_byte": GENERIC_WRITER + "pub fn main() -> i32\n    var a: u8 = 1\n"
+                               "    var b: u8 = 3\n    var p: *u8 = @a\n    w<*u8>(p, @b)\n"
+                               "    return *p as i32\n",
+    # The space is #2355: ritz1 won't close `w<*B<i32>>`.
+    "generic_pointer_to_generic": "struct B<T>\n    v: T\n\n" + GENERIC_WRITER +
+                                  "pub fn main() -> i32\n    var b1: B<i32> = B<i32> { v: 1 }\n"
+                                  "    var b3: B<i32> = B<i32> { v: 3 }\n    var p: *B<i32> = @b1\n"
+                                  "    w<*B<i32> >(p, @b3)\n    return p.v\n",
+    "generic_pointer_to_float": GENERIC_WRITER + "pub fn main() -> i32\n    var a: f64 = 1.0\n"
+                                "    var b: f64 = 3.0\n    var p: *f64 = @a\n    w<*f64>(p, @b)\n    return *p as i32\n",
+    "generic_pointer_to_pointer": C + GENERIC_WRITER + "pub fn main() -> i32\n" + GOOD +
+                                  "    var p: *C = @c1\n    var q: *C = @c3\n    var pp: **C = @p\n"
+                                  "    var qq: **C = @q\n    w<**C>(pp, qq)\n    return (*pp).x\n",
+    # A borrow of `pp` writes `pp`, and leaves the `p` it points at alone.
+    "generic_pointer_to_pointer_owner": C + GENERIC_WRITER + "pub fn main() -> i32\n" + GOOD +
+                                        "    var p: *C = @c1\n    var q: *C = @c3\n"
+                                        "    var pp: **C = @p\n    var qq: **C = @q\n"
+                                        "    w<**C>(pp, qq)\n    return p.x + 2\n",
+    "generic_pointer_second_param": C + "fn w<U, T>(u: U, r:& T, v: T)\n    r = v\n\n"
+                                    "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c1\n"
+                                    "    w<i32, *C>(0, p, @c3)\n    return p.x\n",
+    "generic_pointer_element": C + GENERIC_WRITER + "pub fn main() -> i32\n" + GOOD +
+                               "    var a: [2]*C = [@c1, @c1]\n    w<*C>(a[1], @c3)\n"
+                               "    return a[1].x\n",
+    "generic_pointer_field": C + "struct H\n    p: *C\n\n" + GENERIC_WRITER +
+                             "pub fn main() -> i32\n" + GOOD + "    var h: H = H { p: @c1 }\n"
+                             "    w<*C>(h.p, @c3)\n    return h.p.x\n",
+    "generic_pointer_pass_on": C + GENERIC_WRITER + "fn go<T>(h:& T, v: T)\n    w<T>(h, v)\n\n"
+                               "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c1\n"
+                               "    go<*C>(p, @c3)\n    return p.x\n",
+    "generic_pointer_read": C + "fn g<T>(r:& T) -> T\n    return r\n\n"
+                            "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c3\n"
+                            "    let q: *C = g<*C>(p)\n    return q.x\n",
+    "generic_pointer_read_field": C + "fn g<T>(r:& T) -> i32\n    return r.x\n\n"
+                                  "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c3\n"
+                                  "    return g<*C>(p)\n",
+    "generic_pointer_read_deref": "fn g<T>(r:& T) -> i32\n    return *r\n\n"
+                                  "pub fn main() -> i32\n    var a: i32 = 3\n    var p: *i32 = @a\n"
+                                  "    return g<*i32>(p)\n",
+    # Already right; they clone through the same code, so they stay right.
+    "generic_pointer_returned": C + "fn id<T>(r:& T) -> @&T\n    return r\n\n"
+                                "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c1\n"
+                                "    let q: @&*C = id<*C>(p)\n    *q = @c3\n    return p.x\n",
+    "generic_pointer_named_reference": C + "fn w<T>(r: @&T, v: T)\n    *r = v\n\n"
+                                       "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c1\n"
+                                       "    w<*C>(@&p, @c3)\n    return p.x\n",
+    # At a T that's no pointer, `@&T` holds no pointer to record.
+    "generic_reference_from_pointer": C + "fn g<T>(p: @&T)\n    p.x = 3\n\n"
+                                      "fn go(h:& *C)\n    g<C>(h)\n\n"
+                                      "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c1\n"
+                                      "    go(p)\n    return c1.x\n",
+    "generic_reference_from_int_pointer": "fn g<T>(p: @&T)\n    *p = 3\n\n"
+                                          "fn go(h:& *i32)\n    g<i32>(h)\n\n"
+                                          "pub fn main() -> i32\n    var a: i32 = 1\n"
+                                          "    var p: *i32 = @a\n    go(p)\n    return a\n",
     "generic_caller": INT_WRITER + "fn go<T>(v: T) -> T\n    var x: T = v\n    w(x)\n    return x\n\n"
                       "pub fn main() -> i32\n    return go<i32>(1)\n",
     "index_evaluated_once": INT_WRITER + "var calls: i32 = 0\n\nfn next() -> i64\n"
@@ -192,8 +252,12 @@ ROUTES = {
 }
 
 
-# ritz1's callee, not the call: it's the same with an explicit `@&p`.
-ROUTE_GAPS = {"generic_pointer": "AGAST #2345: `r = v` in a `:& T` at T = `*C` writes nothing"}
+# ritz1's callee, not the call, and not generic: `:& **C` and `:& *f64` don't
+# bind as their referent either.
+ROUTE_GAPS = {
+    "generic_pointer_to_float": "AGAST #2086: `r = v` in a `:& *f64` writes nothing",
+    "generic_pointer_to_pointer": "AGAST #2086: `r = v` in a `:& **C` writes nothing",
+}
 
 
 def _neighbours(t: str, writer: str) -> str:
@@ -376,6 +440,9 @@ MISFITS = {
     "pointee": (C + "struct D\n    a: i32\n\nfn w(r:& *C)\n    r = null\n\n",
                 "var p: *D = null\n    w(p)"),
     "int_for_pointer": (C + "fn w(r:& *C)\n    r = null\n\n", "var n: i64 = 1\n    w(n)"),
+    "generic_pointee": (C + "struct D\n    a: i32\n\n" + GENERIC_WRITER,
+                        "var d: D = D { a: 1 }\n    var p: *D = @d\n    w<*C>(p, null)"),
+    "generic_pointee_width": (GENERIC_WRITER, "var n: i32 = 1\n    var p: *i32 = @n\n    w<*i64>(p, null)"),
     # A copy of the param would take the write: it has no storage to borrow.
     "reference_for_pointer": (C + "fn w(r:& *C)\n    r = null\n\nfn go(r: @&C)\n    w(r)\n\n",
                               "v = 2"),
@@ -498,7 +565,7 @@ def _route_params():
             yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
 
 
-@pytest.mark.parametrize("name,compiler", _route_params())
+@pytest.mark.parametrize("name,compiler", list(_route_params()))
 def test_each_way_of_calling_borrows(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, name, ROUTES[name]) == 3
 
