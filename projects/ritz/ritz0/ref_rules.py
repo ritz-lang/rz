@@ -27,6 +27,12 @@ MOVE_OUT_OF_REF = "cannot move out of a reference"
 # `p.f = v`, `p[i] = v` or `*p = v` through an `@T`, or a chain of fields from one.
 WRITE_THROUGH_SHARED = "cannot write through an `@T`: make it `@&T`"
 
+# An `@T` where an `@&T` goes: a value, or a receiver of a `self: @&T` method.
+SHARED_INTO_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
+
+# `@&x` of a place behind an `@T`, or `@x` of one where an `@&T` or `:&` goes.
+BORROW_THROUGH_SHARED = "cannot borrow through an `@T` as mutable: make it `@&T`"
+
 # `@x` of a `let`'s own storage where an `@&T` or `:&` goes: the emitter's wording
 # for `@&x` of one, since both ask for the same thing.
 def let_into_mut(name: str) -> str:

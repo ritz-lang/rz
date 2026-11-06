@@ -29,7 +29,8 @@
 # ownership.ritz uses ref_ty_of and ref_through for "cannot move out of a
 # reference", which only reaches a program with a Drop in it.
 #
-# `@T` is read-only (AGAST #2338): the end of this file, and ref_let_into_mut.
+# `@T` is read-only (AGAST #2338), and doesn't become an `@&T` (AGAST #2374): the
+# end of this file, and ref_let_into_mut.
 
 import ritzlib.sys
 import ritzlib.io
@@ -113,8 +114,8 @@ fn ref_of_ident(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
     let g: *GlobalVarDef = find_global(s, name, len)
     if g == null
         return 0
-    if g.var_type == TYPE_PTR
-        return ref_set(out, TYPE_PTR, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
+    if ref_is_pointer(g.var_type) == 1
+        return ref_set(out, g.var_type, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
     if g.var_type == TYPE_PTR_PTR
         return 0
     if g.var_type == TYPE_ARRAY
@@ -473,6 +474,7 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
         return
     if slot.kind == TYPE_MUT_REF
         ref_let_into_mut(s, e)
+        ref_shared_into_mut(s, e)
     if e.kind == EXPR_ARRAY_LIT and slot.kind == TYPE_ARRAY
         var part: RefTy
         ref_element(slot, @part)
@@ -622,6 +624,7 @@ fn ref_walk(s: *EmitterState, e: *Expr)
             # takes the receiver as an argument: its params don't line up, so
             # the slots go unjudged, as in ritz0.
             mp = m.params
+            ref_check_receiver(s, e, mp)
             if mp != null and name_eq(mp.name, mp.name_len, c"self", 4) == 1
                 mp = mp.next
             else
@@ -634,6 +637,8 @@ fn ref_walk(s: *EmitterState, e: *Expr)
     else if k == EXPR_ARRAY_FILL
         ref_walk(s, e.left)
     else if k == EXPR_UNARY
+        if e.op == OP_ADDR_MUT
+            ref_check_borrow(s, e)
         ref_walk(s, e.operand)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
         ref_walk(s, e.left)
@@ -697,9 +702,18 @@ fn ref_into_field(s: *EmitterState, stmt: *Stmt, owner: *RefTy)
     ref_field_slot(f, @slot)
     ref_into(s, stmt.assign_value, @slot)
 
+# What a write's place evaluates on the way: its base and its index.
+fn ref_walk_target(s: *EmitterState, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_ASSIGN and stmt.assign_target_len == 0
+        ref_walk(s, stmt.if_cond as *Expr)
+    if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        ref_walk(s, stmt.while_cond)
+
 pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
     let k: i32 = stmt.kind
     ref_check_write(s, stmt)
+    ref_walk_target(s, stmt)
     var slot: RefTy
     if k == STMT_VAR_DECL
         if stmt.var_init != null and ref_decl_slot(stmt, @slot) == 1
@@ -727,6 +741,9 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
         ref_walk(s, stmt.if_cond)
     else if k == STMT_WHILE
         ref_walk(s, stmt.while_cond)
+    else if k == STMT_FOR
+        ref_walk(s, stmt.for_start)
+        ref_walk(s, stmt.for_end)
     else if k == STMT_LOCAL_FIELD_ASSIGN
         var owner: RefTy
         if ref_of_ident(s, stmt.var_name, stmt.var_name_len, @owner) == 1
@@ -815,6 +832,13 @@ pub fn ref_view(s: *EmitterState, e: *Expr) -> i32
     if k == EXPR_METHOD
         return ref_view_of_fn(ref_method_def(s, e))
     var t: RefTy
+    if k == EXPR_INDEX or k == EXPR_UNARY and e.op == OP_DEREF
+        # What holds a pointer keeps its kind, where ref_ty_of has no pointee to give.
+        var from: *Expr = e.left
+        if k == EXPR_UNARY
+            from = e.operand
+        if ref_ty_of(s, from, @t) == 1 and ref_is_pointer(t.pointee) == 1
+            return ref_view_of_kind(t.pointee)
     if ref_ty_of(s, e, @t) == 1
         return ref_view_of_kind(t.kind)
     REF_VIEW_UNKNOWN
@@ -902,7 +926,51 @@ fn ref_check_write(s: *EmitterState, stmt: *Stmt)
     eprints_cstr(c": error: cannot write through an `@T`: make it `@&T`\n")
     s.error_count = s.error_count + 1
 
-# `e` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't.
+# `e` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't, nor does `@x` of
+# a place behind an `@T`.
 fn ref_let_into_mut(s: *EmitterState, e: *Expr)
-    if let_addr_of_own(s, e) == 1 and ref_first_report(e.span.line, e.span.col) == 1
-        let_error_addr(s, e)
+    if let_addr_of_own(s, e) == 1
+        if ref_first_report(e.span.line, e.span.col) == 1
+            let_error_addr(s, e)
+    else if e.kind == EXPR_UNARY and e.op == OP_ADDR
+        ref_check_borrow(s, e)
+
+# An `@T` doesn't become an `@&T` (LANGUAGE_SPEC §3.2, §13.3, AGAST #2374).  ritz0's
+# twins are TypeChecker._check_borrow, _check_shared_into_mut and _check_receiver,
+# and ritz0/test_at_into_mut.py holds all three compilers to them.
+
+fn ref_error_shared_into_mut(s: *EmitterState, e: *Expr)
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    eprints_cstr(c": error: an `@T` doesn't fit an `@&T` slot: make it `@&T`\n")
+    s.error_count = s.error_count + 1
+
+# `e` is a mutable borrow of its operand.
+fn ref_check_borrow(s: *EmitterState, e: *Expr)
+    if ref_write_is_shared(s, e.operand) == 0
+        return
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    eprints_cstr(c": error: cannot borrow through an `@T` as mutable: make it `@&T`\n")
+    s.error_count = s.error_count + 1
+
+# `e` lands in an `@&T`.  `@x` is the slot's question: #2339 for a `var`,
+# ref_let_into_mut for the rest.
+fn ref_shared_into_mut(s: *EmitterState, e: *Expr)
+    if e.kind == EXPR_UNARY and e.op == OP_ADDR
+        return
+    if ref_view(s, e) == REF_VIEW_SHARED
+        ref_error_shared_into_mut(s, e)
+
+# A method taking `self: @&T` writes what its receiver reaches, as `recv.f = v`
+# would: `.` finds the receiver the same way.  `p` is its first param, whatever
+# that's called: a standalone function takes the receiver there too.
+fn ref_check_receiver(s: *EmitterState, e: *Expr, p: *Param)
+    if p == null or p.param_type != TYPE_MUT_REF
+        return
+    var member: Expr
+    ref_expr_member(@member, e.left, e.ident_ptr, e.ident_len)
+    if ref_write_is_shared(s, @member) == 1
+        ref_error_shared_into_mut(s, e.left)

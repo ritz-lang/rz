@@ -573,6 +573,28 @@ fn main() -> i32
     q.x
 ```
 
+An `@T` doesn't become an `@&T`. An `@T` value, whether held in a binding or a
+field or returned by a call, doesn't fit an `@&T` slot, and a method taking
+`self: @&T` can't be called on an `@T`, or on a place behind one. The other
+pointer conversions stay free, so `@&T` fits `@T`, and `@T` fits `*T`.
+
+```ritz expect-error="an `@T` doesn't fit an `@&T` slot: make it `@&T`"
+struct Point
+    x: i32
+    y: i32
+
+fn reset(p: @&Point)
+    p.x = 0
+
+fn clear(p: @Point)
+    reset(p)
+
+fn main() -> i32
+    var q = Point { x: 1, y: 2 }
+    clear(@q)
+    q.x
+```
+
 `@T` and `@&T` are types: a parameter of one holds a reference, and reads as one.
 `name:& T` is a mode: `name` has type `T`. The two share an ABI, and read
 differently:
@@ -2366,6 +2388,26 @@ fn bump(c:& Counter)
 fn main() -> i32
     let c = Counter { n: 1 }
     bump(@c)
+    c.n
+```
+
+`@&x` of a place behind an `@T` is an error wherever it's written, by the walk
+§3.2 gives for a write: a `*T` on the way ends it. `@x` of such a place is an
+error where it lands in an `@&T` or a `:&` parameter.
+
+```ritz expect-error="cannot borrow through an `@T` as mutable: make it `@&T`"
+struct Counter
+    n: i32
+
+fn bump(n: @&i32)
+    *n = *n + 1
+
+fn tick(c: @Counter)
+    bump(@&c.n)
+
+fn main() -> i32
+    var c = Counter { n: 1 }
+    tick(@c)
     c.n
 ```
 

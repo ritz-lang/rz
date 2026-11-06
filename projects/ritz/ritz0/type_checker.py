@@ -26,6 +26,7 @@ import bool_rules
 import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
+from ufcs import find_ufcs_function
 from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
                            SYSCALL_BUILTINS)
 
@@ -682,6 +683,7 @@ class TypeChecker:
 
         elif expr.op in ('&mut', '@&'):
             # Mutable borrow: @& in RERITZ, &mut for legacy compatibility
+            self._check_borrow(expr)
             return rast.RefType(expr.span, operand_type, mutable=True)
 
         elif expr.op == '*':
@@ -879,6 +881,12 @@ class TypeChecker:
                 tried_names.append(mangled)
                 fn_sig = self.functions.get(mangled)
                 own_method = fn_sig is not None
+
+        # What the emitter dispatches to: a looser name below doesn't reach it.
+        receiver_sig = fn_sig if own_method else self.functions.get(
+            find_ufcs_function(self.functions, type_name, expr.method))
+        if receiver_sig is not None:
+            self._check_receiver(expr, receiver_sig)
 
         if fn_sig is None:
             # Try as free function (common for string_len, vec_push, etc.)
@@ -1209,6 +1217,7 @@ class TypeChecker:
         slot = self._resolve_alias(slot)
         if isinstance(slot, rast.RefType) and slot.mutable:
             self._check_let_into_mut(expr)
+            self._check_shared_into_mut(expr, actual)
         if isinstance(slot, (rast.PtrType, rast.RefType)):
             self._check_value_into_ref(expr, actual, slot)
             return
@@ -1266,8 +1275,18 @@ class TypeChecker:
         return self._resolve_alias(ty)
 
     def _check_write(self, target: rast.Expr) -> None:
-        """`target` is written. Walk it from the place to its root: an `@T` on
-        the way is an error, whatever is behind it, and a `*T` ends the walk,
+        """`target` is written."""
+        if self._behind_shared(target):
+            self._report_once(target, ref_rules.WRITE_THROUGH_SHARED)
+
+    def _report_once(self, expr: rast.Expr, message: str) -> None:
+        if id(expr) not in self._slot_reported:
+            self._slot_reported.add(id(expr))
+            self._slot_error(message, expr.span)
+
+    def _behind_shared(self, target: rast.Expr) -> bool:
+        """Walk the place `target` from itself to its root: an `@T` on the way
+        means it's read-only, whatever is behind it, and a `*T` ends the walk,
         since what it points at is the pointer's business. So is anything the
         checker can't type, which stays unjudged."""
         place = target
@@ -1280,19 +1299,16 @@ class TypeChecker:
             elif isinstance(place, rast.UnaryOp) and place.op == '*':
                 base = place.operand
             else:
-                return
+                return False
             ty = self._quiet_type(base)
             # `.` reads through every level, so the one nearest the place counts.
             while isinstance(place, rast.Field) and isinstance(ty, (rast.PtrType, rast.RefType)) \
                     and isinstance(self._resolve_alias(ty.inner), (rast.PtrType, rast.RefType)):
                 ty = self._resolve_alias(ty.inner)
             if isinstance(ty, rast.RefType) and not ty.mutable:
-                if id(target) not in self._slot_reported:
-                    self._slot_reported.add(id(target))
-                    self._slot_error(ref_rules.WRITE_THROUGH_SHARED, target.span)
-                return
+                return True
             if isinstance(ty, rast.PtrType) or self._is_opaque(ty):
-                return
+                return False
             place = base
 
     def _as_let(self, ty: rast.Type) -> rast.Type:
@@ -1317,15 +1333,41 @@ class TypeChecker:
         return None
 
     def _check_let_into_mut(self, expr: rast.Expr) -> None:
-        """`expr` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't."""
+        """`expr` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't, nor
+        does `@x` of a place behind an `@T`."""
         if isinstance(expr, rast.Grouped):
             self._check_let_into_mut(expr.expr)
-        elif isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@') \
-                and id(expr) not in self._slot_reported:
+        elif isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@'):
             name = self._let_root(expr.operand)
             if name is not None:
-                self._slot_reported.add(id(expr))
-                self._slot_error(ref_rules.let_into_mut(name), expr.span)
+                self._report_once(expr, ref_rules.let_into_mut(name))
+            else:
+                self._check_borrow(expr)
+
+    # An `@T` doesn't become an `@&T` (LANGUAGE_SPEC §3.2, §13.3, AGAST #2374)
+
+    def _check_borrow(self, expr: rast.UnaryOp) -> None:
+        """`expr` is a mutable borrow of its operand."""
+        if self._behind_shared(expr.operand):
+            self._report_once(expr, ref_rules.BORROW_THROUGH_SHARED)
+
+    def _check_shared_into_mut(self, expr: rast.Expr, actual: rast.Type) -> None:
+        """`expr`, of type `actual`, lands in an `@&T`. `@x` is the slot's
+        question: #2339 for a `var`, _check_let_into_mut for the rest."""
+        written = isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@')
+        if isinstance(actual, rast.RefType) and not actual.mutable and not written:
+            self._report_once(expr, ref_rules.SHARED_INTO_MUT)
+
+    def _check_receiver(self, expr: rast.MethodCall, sig) -> None:
+        """A method taking `self: @&T` writes what its receiver reaches, as
+        `recv.f = v` would: `.` finds the receiver the same way. A standalone
+        function takes it as its first param, whatever that's called."""
+        if not sig.params:
+            return
+        slot = self._resolve_alias(sig.params[0][1])
+        mutable = 0 in sig.lent or (isinstance(slot, rast.RefType) and slot.mutable)
+        if mutable and self._behind_shared(rast.Field(expr.span, expr.expr, expr.method)):
+            self._report_once(expr.expr, ref_rules.SHARED_INTO_MUT)
 
     @staticmethod
     def _is_null(ty: rast.Type) -> bool:
