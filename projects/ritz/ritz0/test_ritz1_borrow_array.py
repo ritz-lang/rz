@@ -1574,8 +1574,9 @@ def test_ritz1_struct_element_by_value_fails_closed(ritz1_bin, tmp_path, name):
         _run("ritz1", ritz1_bin, tmp_path, name, TYPES + STRUCT_ELEMENT_BY_VALUE[name])
 
 
-# AGAST #2321: not `:&`, and silent: the same index on a pointer param reads 0.
-SILENT_POINTER_INDEX = {
+# AGAST #2321: not `:&`: the same index on a pointer param.  Every other form of
+# it is in test_ritz1_array_pointer_index.py.
+POINTER_INDEX = {
     "reference_param": """
 fn f(a: @[2]i32) -> i32
     return a[1]
@@ -1588,16 +1589,10 @@ fn f(p: *[2]i32) -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(SILENT_POINTER_INDEX))
-def test_ritz0_indexes_through_a_pointer_param(tmp_path, name):
-    assert _run("ritz0", None, tmp_path, name, TYPES + SILENT_POINTER_INDEX[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2321: `p[i]` on `@[N]T` / `*[N]T` reads 0")
-@pytest.mark.parametrize("name", sorted(SILENT_POINTER_INDEX))
-def test_ritz1_indexes_through_a_pointer_param(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, TYPES + SILENT_POINTER_INDEX[name]) == 3
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(POINTER_INDEX))
+def test_indexes_through_a_pointer_param(ritz1_bin, tmp_path, name, compiler):
+    assert _run(compiler, ritz1_bin, tmp_path, name, TYPES + POINTER_INDEX[name]) == 3
 
 
 # AGAST #2322: ritz0 refuses these; the bare array reads as its address.

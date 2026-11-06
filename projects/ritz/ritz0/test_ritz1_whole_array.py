@@ -125,6 +125,14 @@ pub fn main() -> i32
 {fill_a}
     return r.check(a)
 """,
+    "deref_untyped_let": """\
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    var b: [4]i32 = [0, 0, 0, 0]
+    let p = @b
+    *p = a
+    return b[3]
+""",
     "deref_store": """\
 fn s(p: *{ty})
     var a: {ty}
@@ -900,14 +908,6 @@ pub fn main() -> i32
     var b: [4]i32 = [0, 0, 0, 0]
     P = @b
     *P = a
-    return b[3]
-""",
-    "deref_untyped_let": """\
-pub fn main() -> i32
-    var a: [4]i32 = [0, 0, 0, 3]
-    var b: [4]i32 = [0, 0, 0, 0]
-    let p = @b
-    *p = a
     return b[3]
 """,
     "deref_ptr_arith": """\

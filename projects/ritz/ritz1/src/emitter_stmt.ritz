@@ -30,6 +30,50 @@ import must_use           # must_use_check (AGAST #2137)
 # int_to_float_slot / expr_is_definitely_int moved to emitter_expr (AGAST
 # #2065) so emit_field_elem_narrow can convert integer values too.
 
+# AGAST #2321: `let p = @a`, `let p = @&a` and `let q = p` hold what an annotated
+# local does: N and T, so `p[i]` is an element, and the kind, so it loads as one.
+# Returns 1 when it typed the local.
+fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+        return 0
+    let init: *Expr = stmt.var_init
+    var kind: i32 = TYPE_UNKNOWN
+    var size: i32 = 0
+    var elem: i32 = TYPE_VOID
+    let src: *LocalVar = array_ptr_index_base(s, init)
+    if src != null
+        kind = src.var_type
+        size = src.pointee_array_size
+        elem = src.pointee_array_elem_type
+    else if init.kind == EXPR_UNARY and (init.op == OP_ADDR or init.op == OP_ADDR_MUT) and init.operand != null
+        let oper: *Expr = init.operand
+        kind = TYPE_REF
+        if init.op == OP_ADDR_MUT
+            kind = TYPE_MUT_REF
+        if oper.kind == EXPR_MEMBER
+            let fld: *StructField = resolve_member_chain_field(s, oper)
+            if fld != null and fld.field_type == TYPE_ARRAY
+                size = fld.array_size
+                elem = fld.array_elem_type
+        else if oper.kind == EXPR_IDENT
+            let arr: *LocalVar = find_local_struct_name(s, oper.ident_ptr, oper.ident_len)
+            if arr != null
+                if arr.var_type == TYPE_ARRAY
+                    size = arr.array_size
+                    elem = arr.array_elem_type
+            else
+                let garr: *GlobalVarDef = global_array_named(s, oper)
+                if garr != null
+                    size = garr.array_size
+                    elem = garr.array_elem_type
+    if size <= 0
+        return 0
+    stmt.var_type = kind
+    stmt.var_pointee_type = TYPE_ARRAY
+    stmt.var_pointee_array_size = size
+    stmt.var_pointee_array_elem_type = elem
+    return 1
+
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # Use the user's explicit type annotation. The parser defaults
     # missing annotations to TYPE_I64, so any TYPE_I32 we see here
@@ -280,6 +324,9 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type_name = src_loc.type_name
                 stmt.var_type_name_len = src_loc.type_name_len
                 stmt.var_pointee_type = src_loc.pointee_type
+                # AGAST #2321: `s: @[N]S`, so `q[i]` is what `s[i]` is.
+                stmt.var_pointee_array_size = src_loc.pointee_array_size
+                stmt.var_pointee_array_elem_type = src_loc.pointee_array_elem_type
             # AGAST #1938: `let pp = q` with `q: **S` -- `pp` takes `q`'s
             # TYPE_PTR_PTR and struct name, so the #1933
             # registration below keeps S and `(**pp).f` resolves.  (Was i64
@@ -503,6 +550,9 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type = TYPE_PTR
                     stmt.var_type_name = addr_pointee
                     stmt.var_type_name_len = addr_pointee_len
+
+    if infer_array_ptr_let(s, stmt) == 1
+        var_type = stmt.var_type
 
     # `let task = @member.field[i]` — when the indexed field is an array
     # of struct, infer the local as `*ElementStruct` so subsequent
@@ -2189,9 +2239,7 @@ fn array_ptr_local(s: *EmitterState, e: *Expr) -> *LocalVar
         return null
     if lent_array_ident(s, e) != null
         return loc
-    if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
-        return null
-    return loc
+    return array_ptr_index_base(s, e)
 
 # The address of the array behind array_ptr_local's `loc`.
 fn emit_array_ptr_base(s: *EmitterState, loc: *LocalVar) -> i32
@@ -3408,6 +3456,12 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # AGAST #1509: `g[i] = v` with g multi-dimensional assigns a whole
         # row (`g[i][j] = v` is an expression assignment, see emit_assign).
         emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
+    else if stmt.kind == STMT_INDEX_ASSIGN and array_ptr_named(s, stmt.assign_target, stmt.assign_target_len) != null
+        # AGAST #2321: refused, as ritz0 refuses a scalar here.  It stored an i64
+        # at stride 8: past the element, and past the array at the top end.
+        # ritz0 takes a whole `[N]T` at stride `[N]T`, against its own read, so
+        # that isn't lowered either (#2330).
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"`p[i] = v` through a pointer to an array is refused (`*p = a` stores the whole array)")
     else if stmt.kind == STMT_INDEX_ASSIGN
         # name[index] = value (array or pointer index assignment)
         # stmt.assign_target = base variable name (as *u8)

@@ -448,11 +448,64 @@ fn emit_vec_ptr_index(s: *EmitterState, vec_ptr: i32, type_name: *u8, type_name_
         return ext
     return v_val
 
+# AGAST #2321: `p[i]` on `p: *[N]T` / `@[N]T` / `@&[N]T` is element i of the array
+# behind it, stride T, as ritz0 reads it.  The pointee named no element, so this
+# took the byte path: one byte at offset i, and a clang error for `@&`.  A struct
+# element has no by-value read (#1562), so it's refused: the byte path gives an
+# integer, which `p[1] + 1` and `p[1] as i64` took without a word.  `p[1].x` never
+# gets here.  Returns 1 and sets `out` when it took `e`.
+fn emit_array_ptr_index(s: *EmitterState, e: *Expr, out: *i32) -> i32
+    let loc: *LocalVar = array_ptr_index_base(s, e.left)
+    if loc == null
+        return 0
+    let elem: i32 = loc.pointee_array_elem_type
+    if e.right != null and e.right.kind == EXPR_RANGE
+        emit_nd_error(s, e.span.line, e.span.col, c"a pointer to an array can't be sliced (only String, Vec and Span can)")
+        return 1
+    if elem == TYPE_ARRAY
+        emit_nd_error(s, e.span.line, e.span.col, c"a pointer to a multi-dimensional array can't be indexed in ritz1")
+        return 1
+    # `*p[i]` would take 8 bytes whatever the element points at (#2332).
+    if elem == TYPE_PTR or elem == TYPE_PTR_PTR
+        emit_nd_error(s, e.span.line, e.span.col, c"a pointer to an array of pointers can't be indexed in ritz1")
+        return 1
+    if elem == TYPE_STRUCT
+        emit_nd_error(s, e.span.line, e.span.col, c"a whole struct element can't be read through a pointer to an array in ritz1 (read its fields)")
+        return 1
+    let elem_ty: *u8 = local_array_elem_llvm(elem)
+    let idx: i32 = emit_expr(s, e.right)
+    let base: i32 = emit_load_ptr(s, loc.reg)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, loc.pointee_array_size as i64)
+    emit_str(s, c" x ")
+    emit_str(s, elem_ty)
+    emit_str(s, c"], ptr ")
+    emit_reg(s, base)
+    emit_str(s, c", i64 0, i64 ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    let loaded: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, loaded)
+    emit_str(s, c" = load ")
+    emit_str(s, elem_ty)
+    emit_str(s, c", ptr ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c"\n")
+    *out = emit_array_elem_widen(s, loaded, elem, elem_ty)
+    return 1
+
 fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1509: `g[i][j]` over a multi-dimensional array (one GEP chain).
     var nd_val: i32 = 0
     if emit_nd_index_value(s, e, @nd_val) == 1
         return nd_val
+    var ap_val: i32 = 0
+    if emit_array_ptr_index(s, e, @ap_val) == 1
+        return ap_val
     # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
     #
     # AGAST #1328: resolve the base through locals THEN globals, and carry the

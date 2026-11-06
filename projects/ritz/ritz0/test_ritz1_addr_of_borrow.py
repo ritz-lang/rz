@@ -915,7 +915,6 @@ ALL = {f"{group}_{name}": source
 # Still open on ritz1, each held to ritz0's answer by a strict xfail.
 RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
-    "array_untyped_read": "AGAST #2304: `let p = @b` doesn't record the pointee array",
     "array_for": "AGAST #2314: `for x in @a` runs zero iterations",
     "struct_for_vec": "AGAST #2314: `for x in @v` runs zero iterations",
     "self_by_value_field_write": "AGAST #2316: a by-value `self` isn't a copy",
