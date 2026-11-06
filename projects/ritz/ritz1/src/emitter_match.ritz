@@ -1163,6 +1163,88 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     else
         match_check_scalar(s, arms, line, col)
 
+# --- A payload is bound, never tested (AGAST #2405; LANGUAGE_SPEC §8.2) -------
+#
+# An arm is chosen by its variant alone, so a payload name that reads as a test
+# took every value of that variant.  ritz0 refuses these names and this does the
+# same: test_variant_payload_refused.py holds the two to one table.
+# name_tests_payload is the rule, and ritz0's twin is _name_tests_payload.
+
+# 1 when type `name` is an enum (a `Result$A$B`, or a tracked enum) declaring
+# `variant`.
+fn type_declares_variant(name: *u8, len: i32, variant: *u8, variant_len: i32) -> i32
+    if is_tagged_enum_type(name, len) == 1
+        if *name == 'O'
+            return (name_eq(variant, variant_len, c"Some", 4) == 1 or name_eq(variant, variant_len, c"None", 4) == 1) as i32
+        return (name_eq(variant, variant_len, c"Ok", 2) == 1 or name_eq(variant, variant_len, c"Err", 3) == 1) as i32
+    let ei: i32 = match_enum_index(name, len)
+    if ei < 0
+        return 0
+    enum_declares_variant(ei, variant, variant_len)
+
+# The type of the field `arm` binds: its name when it has one (a struct or enum,
+# or the mangled spelling of a Result / Option argument), and whether it is an
+# integer.  Both stay empty for a field this can't type, which then only binds:
+# a variant with no fields, or a generic user enum (see resolve_match_enum).
+fn arm_payload_type(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32, out_name: **u8, out_len: *i32, out_int: *i32)
+    *out_name = null
+    *out_len = 0
+    *out_int = 0
+    if is_tagged_enum_type(enum_name, enum_name_len) == 1
+        let variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+        let arg: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, variant, out_len)
+        *out_name = arg
+        # prim_name_size also knows the two floats.
+        *out_int = (prim_name_size(arg, *out_len) > 0 and *arg != 'f') as i32
+        return
+    let vi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+    if vi < 0
+        return
+    let field: *StructField = enum_variant_fields(user_enum_index(enum_name, enum_name_len), vi)
+    if field == null
+        return
+    if field.field_type == TYPE_STRUCT
+        *out_name = field.field_type_name
+        *out_len = field.field_type_name_len
+    *out_int = is_int_const_type(field.field_type)
+
+# A top-level arm's reading of a name: against an enum it is a variant, against
+# an integer a const compares.  "A const" is what ritz0's table holds: a number,
+# a float too, but no string or array.
+fn name_tests_payload(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32) -> i32
+    var ty: *u8 = null
+    var ty_len: i32 = 0
+    var is_int: i32 = 0
+    arm_payload_type(s, arm, enum_name, enum_name_len, @ty, @ty_len, @is_int)
+    if type_declares_variant(ty, ty_len, arm.pattern_inner_name, arm.pattern_inner_name_len) == 1
+        return 1
+    if is_int == 0
+        return 0
+    let ce: *ConstEntry = find_const_entry(s, arm.pattern_inner_name, arm.pattern_inner_name_len)
+    if ce == null
+        return 0
+    (is_int_const_type(ce.const_type) == 1 or ce.const_type == TYPE_F32 or ce.const_type == TYPE_F64) as i32
+
+# Every arm is read, as ritz0 reads them, whether or not one before it covers it.
+# Only a payload binding has an inner name, so no other arm can test.
+fn match_refuse_payload_tests(s: *EmitterState, arms: *MatchArm, enum_name: *u8, enum_name_len: i32)
+    var arm: *MatchArm = arms
+    while arm != null
+        if name_tests_payload(s, arm, enum_name, enum_name_len) == 1
+            eprints_cstr(fn_source_file(emitter_current_fn()))
+            eprint_char(':')
+            eprint_i64(arm.pattern_inner_span.line as i64)
+            eprint_char(':')
+            eprint_i64(arm.pattern_inner_span.col as i64)
+            eprints_cstr(c": error: a variant payload can only be bound, not tested: '")
+            eprint_bytes(arm.pattern_inner_name, arm.pattern_inner_name_len)
+            eprints_cstr(c"' in '")
+            eprint_bytes(arm.pattern_name, arm.pattern_name_len)
+            eprints_cstr(c"(...)' — bind it to a name, then test the name in the arm body\n")
+            emit_str(s, c"  ; ERROR: a variant payload tested\n")
+            s.error_count = s.error_count + 1
+        arm = arm.next
+
 # AGAST #2140: 1 when the scrutinee is a borrow, `@place` / `@&place`.
 fn match_scrutinee_is_addr(scr: *Expr) -> i32
     if scr.kind == EXPR_UNARY and (scr.op == OP_ADDR or scr.op == OP_ADDR_MUT) and scr.operand != null
@@ -1200,6 +1282,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         typed = scrutinee.operand
     is_enum = resolve_match_enum(s, typed, arms, @enum_name, @enum_name_len)
     match_check_coverage(s, typed, arms, enum_name, enum_name_len, span.line, span.col)
+    match_refuse_payload_tests(s, arms, enum_name, enum_name_len)   # AGAST #2405
     # AGAST #2344: an enum element or global is a place too.  emit_expr reads
     # `a[1]` and `g` as scalars, whatever their type.
     var from_place: i32 = is_addr
