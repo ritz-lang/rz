@@ -13547,6 +13547,7 @@ class LLVMEmitter:
                             f"match on '{pattern.name}(inner)' first, then "
                             f"match 'inner' in a second match expression",
                             field_pattern.span or pattern.span)
+                self._refuse_payload_tests(enum_name, pattern)
                 tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
                 switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
             elif isinstance(pattern, rast.IdentPattern):
@@ -13678,6 +13679,49 @@ class LLVMEmitter:
             if any(b is not None for b in arm_exit_blocks):
                 self._emit_drop_for_scope(scope)
         return result
+
+    def _refuse_payload_tests(self, enum_name: str, pattern: rast.VariantPattern) -> None:
+        """A payload is bound, never tested (AGAST #2350, LANGUAGE_SPEC §8.2).
+
+        The switch above reads the tag alone, so a test inside a variant was
+        dropped and `Some(0)` took every `Some`. Compiling it is #1291's
+        decision tree; until then, say so at the pattern.
+        """
+        fields = self._get_enum_variant(enum_name, pattern.name).fields
+        for i, field_pattern in enumerate(pattern.fields):
+            # A surplus field has no type: #2408 owns the count.
+            field_type = fields[i] if i < len(fields) else None
+            shown = self._payload_test_text(field_pattern, field_type)
+            if shown is not None:
+                raise EmitError(
+                    f"a variant payload can only be bound, not tested: "
+                    f"'{shown}' in '{pattern.name}(...)' — bind it to a name, "
+                    f"then test the name in the arm body",
+                    field_pattern.span or pattern.span)
+
+    def _payload_test_text(self, field_pattern: rast.Pattern,
+                           field_type: Optional[rast.Type]) -> Optional[str]:
+        """How `field_pattern` reads if it tests its payload, else None."""
+        if isinstance(field_pattern, rast.WildcardPattern):
+            return None
+        if isinstance(field_pattern, rast.IdentPattern):
+            return (field_pattern.name
+                    if self._name_tests_payload(field_pattern.name, field_type) else None)
+        if isinstance(field_pattern, rast.TypePattern):
+            return self._type_to_str(field_pattern.type)
+        value = getattr(field_pattern, 'value', None)
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        return f'"{value}"' if isinstance(value, str) else str(value)
+
+    def _name_tests_payload(self, name: str, field_type: rast.Type) -> bool:
+        """The same reading a top-level arm gets: against an enum a name is its
+        variant, against an integer a name that is a `const` compares."""
+        llvm_type = self._ritz_type_to_llvm(field_type)
+        for candidate, (enum_type, _) in self.enum_types.items():
+            if enum_type == llvm_type:
+                return self._has_enum_variant(candidate, name)
+        return isinstance(llvm_type, ir.IntType) and name in self.constants
 
     def _note_match_result_type(self, expr: rast.Match, body: rast.Expr) -> None:
         """Record a move-only arm value's type on the match, inferred while

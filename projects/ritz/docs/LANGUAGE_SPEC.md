@@ -1631,6 +1631,22 @@ fn main() -> i32
         None => 0
 ```
 
+A pattern inside a variant takes the payload: it is a binding or `_`. One that
+would test the payload is a compile error at that pattern, because the arm is
+chosen by the variant alone. That covers a literal, a type, a name that is an
+integer `const` against an integer payload, and a name that is a variant of an
+enum payload. Bind the payload and test it in the arm body:
+
+```ritz expect-error="a variant payload can only be bound, not tested: '0' in 'Some(...)'"
+fn f(o: Option<i32>) -> i32
+    match o
+        Some(0) => 1
+        _ => 2
+
+fn main() -> i32
+    f(Some(5))
+```
+
 #### Constant Patterns
 
 A bare identifier pattern that names an integer `const` (declared in the
