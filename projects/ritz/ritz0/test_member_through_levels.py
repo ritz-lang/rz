@@ -248,11 +248,6 @@ for _table, _prefix in ((DEREFS, "deref"), (CONTROLS, "control")):
         HOLDERS[f"{_prefix}.{_name}"] = (_main(_body, _fn + "\n", _make), _want)
 
 
-# ritz0 hands the slot to a method as `self` (#2397): silently wrong.
-RECEIVER_GAPS = {f"{level}.{shape}" for level in ("shared_ptr", "mut_ptr", "ptr_ptr", "lent_ptr_ptr")
-                 for shape in ("method_read", "method_store")}
-RECEIVER_GAPS |= {"inferred_method", "field_ptr_ptr_method"}
-
 # ritz0 refuses these (#2398).
 ONE_EXTRA_LEVEL = ("nested_store", "nested_compound", "nested_address", "nested_method_read",
                    "nested_method_store", "array_read", "array_store", "array_compound",
@@ -274,7 +269,7 @@ LOWERING_GAPS = {"lent_ptr.copy_read", "lent_ptr.copy_store", "returned_read", "
 
 def _gap(row, compiler):
     if compiler == "ritz0":
-        return 2397 if row in RECEIVER_GAPS else 2398 if row in DEPTH_GAPS else None
+        return 2398 if row in DEPTH_GAPS else None
     return 2399 if row in LOWERING_GAPS else None
 
 

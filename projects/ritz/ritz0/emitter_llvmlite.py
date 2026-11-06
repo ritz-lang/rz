@@ -11977,12 +11977,6 @@ class LLVMEmitter:
             else:
                 # For other lvalues (field, index), use normal lvalue_addr
                 receiver_val = self._emit_lvalue_addr(expr.expr)
-                # A pointer-typed field/element (`o.q` with `q: *P`) has a
-                # slot that holds the pointer: pass the pointer, not the
-                # slot's address (AGAST #1692).
-                if (receiver_val.type != first_param_type
-                        and isinstance(receiver_val.type.pointee, ir.PointerType)):
-                    receiver_val = self.builder.load(receiver_val)
         else:
             # Emit as normal expression
             receiver_val = self._emit_expr(expr.expr)
@@ -12002,6 +11996,8 @@ class LLVMEmitter:
                     tmp = self._alloca_in_entry_block(receiver_val.type, "recv.tmp")
                     self.builder.store(receiver_val, tmp)
                     receiver_val = tmp
+
+        receiver_val = self._load_to_self(receiver_val, first_param_type)
 
         # Build arguments: receiver first, then explicit args
         # Auto-borrow addressable args when the method expects a pointer param.
@@ -12060,6 +12056,31 @@ class LLVMEmitter:
             converted_args.append(converted)
 
         return self.builder.call(fn, converted_args)
+
+    @staticmethod
+    def _pointer_levels(ty: ir.Type) -> Tuple[int, ir.Type]:
+        """How many pointers `ty` is, and what they end at."""
+        levels = 0
+        while isinstance(ty, ir.PointerType):
+            levels, ty = levels + 1, ty.pointee
+        return levels, ty
+
+    def _load_to_self(self, receiver: ir.Value, self_type: ir.Type) -> ir.Value:
+        """Load through the pointers a receiver has beyond what `self` takes.
+
+        `p.set(3)` with `p: @*C` finds `C.set` from the pointee, but `p` is a
+        `C**`. `_convert_type` would bitcast that to the `C*` it wants, so the
+        method gets the slot holding the pointer (AGAST #2397). A pointer
+        `self` needn't end at the receiver's type (`string_first(s: *u8)`), so
+        it's the count that matters. A by-value `self` that isn't what the
+        pointers end at is a conversion, left to `_convert_type`.
+        """
+        levels, pointee = self._pointer_levels(receiver.type)
+        self_levels, self_pointee = self._pointer_levels(self_type)
+        if self_levels or pointee == self_pointee:
+            for _ in range(levels - self_levels):
+                receiver = self.builder.load(receiver)
+        return receiver
 
     def _emit_dyn_method_call(self, expr: rast.MethodCall, dyn_type: rast.DynType) -> ir.Value:
         """Emit a method call on a dyn Trait using dynamic dispatch.
