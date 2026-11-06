@@ -29,7 +29,7 @@ from import_resolver import ImportResolver, ImportError as RitzImportError
 import module_interface
 from name_resolver import resolve_names, NameError as RitzNameError
 from move_checker import MoveChecker, OwnershipError
-from type_checker import TypeChecker, TypeError as RitzTypeError
+from type_checker import TypeChecker, TypeError as RitzTypeError, check_ref_slots
 from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
     source_file_hash, build_hash_map, build_sig_hash_map,
@@ -258,6 +258,12 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
             checker = MoveChecker()
             ownership_errors = checker.check(module)
             if ownership_errors:
+                # `c` in a reference slot wants `@c`, not "cannot move out".
+                slot_errors = check_ref_slots(module, lambda fn: True, module_names)
+                for err in slot_errors:
+                    print(f"Type error: {err}", file=sys.stderr)
+                if slot_errors:
+                    return False
                 for err in ownership_errors:
                     print(f"Ownership error: {err}", file=sys.stderr)
                 return False

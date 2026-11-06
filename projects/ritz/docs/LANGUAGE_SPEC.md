@@ -536,7 +536,7 @@ let d: f64 = 2.718281828
 | `*mut T` | Raw mutable pointer to `T` |
 | `@T` | Immutable reference to `T` |
 | `@&T` | Mutable reference to `T` |
-| `name:& T` | Mutable-borrow parameter (equivalent to `name: @&T`) |
+| `name:& T` | Mutable-borrow parameter: `name` is the caller's place, of type `T` (§13.4) |
 
 ```ritz
 struct Point
@@ -552,6 +552,27 @@ fn scale(p: @&Point, k: i32)
 fn raw(p: *mut i32)
     pass
 ```
+
+`@T` and `@&T` are types: a parameter of one holds a reference, and reads as one.
+`name:& T` is a mode: `name` has type `T`. The two share an ABI, and read
+differently:
+
+```ritz
+struct Point
+    x: i32
+    y: i32
+
+fn through(p: @&Point)
+    let q: @&Point = p              # p is a reference
+    q.x = 1
+
+fn alias(p:& Point)
+    let q: @&Point = @&p            # p is a Point
+    q.x = 1
+```
+
+A value never fits a reference type, and a reference never fits a by-value type.
+`@x` and `@&x` make a reference, `*r` reads through one (§13.2, §13.4).
 
 **Removed in RERITZ:** `&T` and `&mut T` reference types. The compiler emits a
 migration diagnostic rather than a generic parse error:
@@ -2279,8 +2300,8 @@ fn main() -> i32
 
 ### 13.4 Mutable Borrowing
 
-`@&x` takes a mutable reference. In a parameter list, `name:& T` is an
-equivalent spelling.
+`@&x` takes a mutable reference. In a parameter list, `name:& T` borrows the
+caller's place: `name` is an alias of it, so it has type `T` in the whole body.
 
 ```ritz
 import ritzlib.string
@@ -2349,23 +2370,19 @@ move-only type can't be moved out of, like anything behind a reference (§13.2).
 Using the parameter by value, or using one of its move-only fields or `*name` by
 value, is an error. Everything that leaves the caller as the only owner is
 allowed: reading and writing through the parameter, lending it on, `match`ing or
-iterating over it, and putting it in a reference.
+iterating over it, and writing `@name` or `@&name`.
 
-A `name:& T` parameter reads as its referent, except where the value lands in
-an `@T` or `@&T`, or a `*T` of a struct or array: that takes the borrow's
-pointer. The destination decides, at `let`, `var`, `=`, `return`, a function's
-tail, a field, an array or tuple element and a cast, and through an `if` or
-`match` arm of any of these. Binding one with `let` or `var` counts as `@name`
-or `@&name` for §13.5, and the type behind the reference must be `T`.
+A reference is always written. `@c` and `@&c` of a `name:& T` parameter give the
+caller's address, and count as `@c` or `@&c` of any place for §13.5.
 
 ```ritz
 struct Counter
     n: i32
 
 fn bump(c:& Counter) -> @&Counter
-    let p: @&Counter = c            # p refers to the caller's Counter
+    let p: @&Counter = @&c          # p refers to the caller's Counter
     p.n = p.n + 1
-    return c                        # and so does the result
+    return p                        # and so does the result
 
 fn main() -> i32
     var c = Counter { n: 1 }
@@ -2373,6 +2390,54 @@ fn main() -> i32
     r.n = r.n + 1
     c.n
 ```
+
+A `T` never fits an `@T`, `@&T` or `*T`, for a `:&` parameter or any other
+binding, at `let`, `var`, `=`, `return`, a function's tail, a field, an element,
+a variant payload, an `if` or `match` arm, or an argument. Only a reference fits
+an `@T` or `@&T`, and only a pointer fits a `*T` for a `:&` parameter. There's
+no borrowing by destination:
+
+```ritz expect-error="a value doesn't fit a reference slot: write `@&x` to borrow it"
+struct Counter
+    n: i32
+
+fn bump(c:& Counter) -> @&Counter
+    return c                        # error: c is a Counter
+
+fn main() -> i32
+    var c = Counter { n: 1 }
+    bump(@&c)
+    c.n
+```
+
+```ritz expect-error="a value doesn't fit a reference slot: write `@x` to borrow it"
+struct Counter
+    n: i32
+
+fn read(c: @Counter) -> i32
+    c.n
+
+fn main() -> i32
+    var c = Counter { n: 1 }
+    read(c)                         # error: write read(@c)
+```
+
+An rvalue has no address, so `@f()` and `@"text"` are refused: bind it to a local
+first. A whole array is the same for a `Span<T>`: `@a` fits and `a` doesn't.
+
+```ritz expect-error="a value doesn't fit a reference slot: write `@x` to borrow it"
+import ritzlib.span
+
+fn total(s: Span<i32>) -> i64
+    s.len
+
+fn main() -> i32
+    var a: [2]i32 = [1, 2]
+    total(a) as i32                 # error: write total(@a)
+```
+
+A `name:& *U` parameter follows the same rule at `T` = `*U`: `h` is a `*U`, and
+`@&h` is an `@&*U`, which doesn't fit a reference to another pointer type.
 
 ```ritz expect-error="cannot move out of a reference"
 struct Resource
@@ -2410,9 +2475,9 @@ let q = @&x
 ```
 
 There are no lifetime annotations and no generic lifetime parameters; escape
-analysis is not performed, so returning a reference to a local is not caught.
-Nor is a `name:& T` parameter returned as a reference outliving what the caller
-lent: the result refers to the caller's value, and that value must outlive it.
+analysis is not performed, so returning `@local` is not caught. Nor is `@&c` of a
+`name:& T` parameter, returned, outliving what the caller lent: the result refers
+to the caller's value, and that value must outlive it.
 
 ### 13.6 Drop
 

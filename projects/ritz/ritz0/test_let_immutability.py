@@ -255,7 +255,6 @@ IMPLICIT_REJECTED = [
     ("method-arg", "var p = Pt { x: 1, y: 2 }\nlet q = Pt { x: 3, y: 4 }\np.absorb(q)", "q"),
     # Free-function autoborrow.
     ("arg-small", "let q = Pt { x: 1, y: 2 }\nset(q)", "q"),
-    ("arg-small-ref", "let q = Pt { x: 1, y: 2 }\nset_ref(q)", "q"),
     ("arg-large", "let b: Big = big_new()\nset_big(b)", "b"),
     ("arg-large-field", "let b: Big = big_new()\nset(b.pt)", "b"),
     ("arg-scalar", "let k: i64 = 4\nset_i64(k)", "k"),
@@ -279,12 +278,12 @@ IMPLICIT_ACCEPTED = [
     # Shared and by-value receivers/params of a `let`.
     ("recv-shared", "let p = Pt { x: 1, y: 2 }\nlet n = p.peek()"),
     ("recv-by-value", "let p = Pt { x: 1, y: 2 }\nlet n = p.get()"),
-    ("arg-shared", "let p = Pt { x: 1, y: 2 }\nlet n = pt_read(p)"),
+    ("arg-shared", "let p = Pt { x: 1, y: 2 }\nlet n = pt_read(@p)"),
     # `var` receivers and arguments.
     ("recv-var", "var p = Pt { x: 1, y: 2 }\np.bump()\np.bump_ref()"),
     ("recv-var-large", "var b: Big = big_new()\nb.bump()\nb.pt.bump()"),
     ("arg-var", "var p = Pt { x: 1, y: 2 }\nset(p)"),
-    ("arg-var-ref", "var p = Pt { x: 1, y: 2 }\nset_ref(p)"),
+    ("arg-var-ref", "var p = Pt { x: 1, y: 2 }\nset_ref(@&p)"),
     ("arg-var-large", "var b: Big = big_new()\nset_big(b)"),
     ("arg-var-large-field", "var b: Big = big_new()\nset(b.pt)"),
     ("var-shadows-let", "let p = Pt { x: 1, y: 2 }\nvar p = Pt { x: 3, y: 4 }\np.bump()\nset(p)"),

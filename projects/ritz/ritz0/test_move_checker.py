@@ -1019,59 +1019,59 @@ fn f(t:& Res) -> i32
 """, id="relend_to_method_argument"),
         pytest.param("""
 fn f(t:& Res) -> i32
-    let p: @Res = t
+    let p: @Res = @t
     return p.h
 """, id="let_as_reference"),
         pytest.param("""
 fn f(t:& Res) -> i32
-    let p: *Res = t
+    let p: *Res = @t
     return p.h
 """, id="let_as_pointer"),
         pytest.param("""
 fn f(t:& Res) -> i32
-    var p: @Res = t
+    var p: @Res = @t
     return p.h
 """, id="var_as_reference"),
         pytest.param("""
 fn f(t:& Res) -> i32
-    var p: *Res = t
+    var p: *Res = @t
     return p.h
 """, id="var_as_pointer"),
         pytest.param("""
 fn f(t:& Res) -> @&Res
-    return t
+    return @&t
 """, id="return_as_reference"),
         pytest.param("""
 fn f(t:& Res) -> *Res
-    t
+    @t
 """, id="tail_as_pointer"),
         pytest.param("""
 fn f(t:& Res, k: i32) -> @Res
     if k == 0
-        t
+        @t
     else
-        t
+        @t
 """, id="if_arm_as_reference"),
         pytest.param("""
 fn f(t:& Res, k: i32) -> @Res
     match k
-        0 => return t
-        _ => t
+        0 => return @t
+        _ => @t
 """, id="match_arm_as_reference"),
         pytest.param("""
 fn f(t:& Res, u: @Res) -> i32
     var p: @Res = u
-    p = t
+    p = @t
     return p.h
 """, id="assigned_to_a_reference"),
         pytest.param("""
 fn f(t:& Res) -> i32
-    var a: [1]@Res = [t]
+    var a: [1]@Res = [@t]
     return a[0].h
 """, id="array_element_as_reference"),
         pytest.param("""
 fn f(w:& Wrap) -> i32
-    let p: @Res = w.r
+    let p: @Res = @w.r
     return p.h
 """, id="let_field_as_reference"),
         pytest.param("""

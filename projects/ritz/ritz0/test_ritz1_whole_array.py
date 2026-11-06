@@ -227,7 +227,7 @@ fn g<T>(a: @[4]T) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return g<i32>(a)
+    return g<i32>(@a)
 """,
     "arg_mutate_callee": """\
 fn g(a: [4]i32) -> i32
@@ -594,7 +594,7 @@ fn g(a: @[4]i32) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return g(a)
+    return g(@a)
 """,
     "ref_at_mut_reads": """\
 fn g(a: @&[4]i32) -> i32
@@ -603,7 +603,7 @@ fn g(a: @&[4]i32) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return g(a)
+    return g(@&a)
 """,
     "ref_at_structs": """\
 struct S
@@ -617,7 +617,7 @@ fn g(a: @[3]S) -> i64
 pub fn main() -> i32
     var a: [3]S
     a[2].y = 3
-    return g(a) as i32
+    return g(@a) as i32
 """,
     "method_ref": """\
 struct R
@@ -660,7 +660,7 @@ fn g(s: Span<i32>) -> i64
 
 pub fn main() -> i32
     var a: [3]i32 = [0, 0, 3]
-    return g(a) as i32
+    return g(@a) as i32
 """,
     "span_param": """\
 import ritzlib.span
@@ -669,7 +669,7 @@ fn g(s: Span<i32>) -> i64
     return s.len
 
 fn f(a: [3]i32) -> i64
-    return g(a)
+    return g(@a)
 
 pub fn main() -> i32
     var a: [3]i32 = [0, 0, 3]

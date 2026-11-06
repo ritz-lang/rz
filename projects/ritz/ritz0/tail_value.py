@@ -129,6 +129,9 @@ def slot_tails(slot, node, resolve=lambda ty: ty):
     value tails, when `node` lands in a `slot`-typed place: an array or tuple
     literal's elements land in that type's elements. `resolve` sees through
     the caller's type aliases.
+
+    Only a literal takes its type from its slot (LARB R3), so this is for them.
+    Nothing else reads by destination: a `name:& T` param stopped at #2337.
     """
     slot = resolve(slot)
     for tail in value_tails(node):

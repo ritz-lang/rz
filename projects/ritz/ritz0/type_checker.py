@@ -94,10 +94,12 @@ class TypeChecker:
                  slots_only: bool = False):
         self.errors: List[TypeError] = []
 
-        # Report only references in by-value slots (check_ref_slots).
+        # Report only what doesn't fit between values and references
+        # (check_ref_slots).
         self.slots_only = slots_only
-        # `name:& T` params of the current fn: `*name` is the `T` itself.
-        self.lent_locals: Set[str] = set()
+        # `name:& T` params of the current fn, by name, with their `T`: `*name`
+        # is the `T` itself.
+        self.lent_locals: Dict[str, rast.Type] = {}
         # The slot an `if`, `match` or block's tails land in (_infer_into).
         self._tail_slot: Optional[rast.Type] = None
         # id(expr) already reported: a literal's elements are inferred twice.
@@ -275,11 +277,11 @@ class TypeChecker:
             self.current_type_params |= set(impl.type_params or [])
 
         # Add parameters to scope
-        self.lent_locals = set()
+        self.lent_locals = {}
         for param in fn.params:
             self.locals[param.name] = param.type
             if param.borrow == rast.Borrow.MUTABLE:
-                self.lent_locals.add(param.name)
+                self.lent_locals[param.name] = param.type
 
         # Check body
         self._check_block(fn.body, fn.ret_type)
@@ -957,6 +959,10 @@ class TypeChecker:
         base_type = self._infer_type(expr.expr)
         index_type = self._infer_type(expr.index)
 
+        # `p[1..3]` is a slice of it, not an element.
+        if isinstance(expr.index, rast.Range):
+            return rast.NamedType(expr.span, 'unknown', [])
+
         # Index must be integer
         if not self._is_int_or_opaque(index_type):
             self._error(f"index must be integer, got {self._type_str(index_type)}",
@@ -1094,6 +1100,11 @@ class TypeChecker:
             elif pattern.name in self.variant_to_enum:
                 # Unqualified pattern: look up which enum this variant belongs to
                 enum_name = self.variant_to_enum[pattern.name]
+                # Every instance of Option has a `Some`, and that's the last
+                # one registered: it says nothing about this scrutinee's.
+                if '$' in enum_name and self._type_str(
+                        self._strip_indirection(expected_type)) != enum_name:
+                    enum_name = None
 
             if enum_name:
                 enum_info = self.enums.get(enum_name)
@@ -1176,11 +1187,18 @@ class TypeChecker:
 
     def _check_ref_slot(self, expr: rast.Expr, actual: rast.Type,
                         slot: Optional[rast.Type]) -> None:
-        """An `@T`, `@&T` or `*T` doesn't fit a by-value `T` slot."""
+        """An `@T`, `@&T` or `*T` doesn't fit a by-value `T` slot, and a `T`
+        doesn't fit a reference to one. `@a` of an array fits a Span; `a` doesn't."""
         if slot is None or actual is None or id(expr) in self._slot_reported:
             return
         actual = self._resolve_alias(actual)
         slot = self._resolve_alias(slot)
+        if isinstance(slot, (rast.PtrType, rast.RefType)):
+            self._check_value_into_ref(expr, actual, slot)
+            return
+        if self._is_span(slot) and isinstance(actual, rast.ArrayType):
+            self._report_value_into_ref(expr, slot)
+            return
         if not isinstance(actual, (rast.PtrType, rast.RefType)) or self._is_opaque(slot):
             return
         if self._type_str(self._resolve_alias(actual.inner)) != self._type_str(slot):
@@ -1189,6 +1207,47 @@ class TypeChecker:
         addr = isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@', '&mut', '@&')
         self._slot_error(ref_rules.ADDR_INTO_VALUE if addr else ref_rules.REF_INTO_VALUE,
                          expr.span)
+
+    def _check_value_into_ref(self, expr: rast.Expr, actual: rast.Type,
+                              slot: rast.Type) -> None:
+        """A `T` doesn't fit an `@T`, `@&T` or `*T`: a reference is written.
+
+        Nothing but a reference fits an `@T` or `@&T`, and nothing but a pointer
+        a `*T` for a `:&` param, which is a `T` too. A plain integer into `*U`
+        of another `U` is a pointer as an integer, a different question.
+        """
+        inner = self._resolve_alias(slot.inner)
+        if self._is_opaque(inner) or self._is_opaque(actual):
+            return
+        same = self._type_str(inner) == self._type_str(actual)
+        pointer = isinstance(actual, (rast.PtrType, rast.RefType))
+        if pointer and isinstance(slot, rast.RefType) and isinstance(inner, rast.PtrType):
+            held = self._resolve_alias(actual.inner)
+            if isinstance(held, rast.PtrType) and self._type_str(held) != self._type_str(inner):
+                self._slot_reported.add(id(expr))
+                self._slot_error(ref_rules.REF_TO_OTHER_POINTER, expr.span)
+                return
+        if not same and (pointer or self._is_null(actual)):
+            return
+        lent = (isinstance(expr, rast.Ident) and expr.name in self.lent_locals
+                and self._lookup_var(expr.name) is self.lent_locals[expr.name])
+        if same or lent or isinstance(slot, rast.RefType):
+            self._report_value_into_ref(expr, slot)
+
+    def _report_value_into_ref(self, expr: rast.Expr, slot: rast.Type) -> None:
+        self._slot_reported.add(id(expr))
+        mutable = isinstance(slot, rast.RefType) and slot.mutable
+        self._slot_error(ref_rules.VALUE_INTO_MUT_REF if mutable
+                         else ref_rules.VALUE_INTO_SHARED_REF, expr.span)
+
+    @staticmethod
+    def _is_null(ty: rast.Type) -> bool:
+        return isinstance(ty, rast.NamedType) and ty.name == 'null'
+
+    @staticmethod
+    def _is_span(ty: rast.Type) -> bool:
+        return isinstance(ty, rast.NamedType) and (
+            ty.name == 'Span' or ty.name.startswith('Span$'))
 
     # Helper methods
 
@@ -1473,7 +1532,7 @@ class TypeChecker:
 
 def check_ref_slots(module: rast.Module, emits_body,
                     module_names: Optional[Set[str]] = None) -> List[TypeError]:
-    """The by-value slot rule over a monomorphised module, for the fns
+    """The slot rules over a monomorphised module, for the fns
     `emits_body` says this compile emits. `--check-types` is off by default and
     sees generic bodies with `T` opaque, so this runs on every compile, after
     monomorphisation, with the checker's other complaints switched off."""

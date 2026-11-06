@@ -489,22 +489,22 @@ pub fn main() -> i32
     # A bare `a` is the pointer, for every slot that takes a reference.
     "reference_let": """
 fn f(a:& [2]i32) -> i32
-    let p: @[2]i32 = a
+    let p: @[2]i32 = @a
     return 3
 """ + MAIN_13,
     "mut_reference_let": """
 fn f(a:& [2]i32) -> i32
-    let p: @&[2]i32 = a
+    let p: @&[2]i32 = @&a
     return 3
 """ + MAIN_13,
     "pointer_let": """
 fn f(a:& [2]i32) -> i32
-    let p: *[2]i32 = a
+    let p: *[2]i32 = @a
     return 3
 """ + MAIN_13,
     "reference_return": """
 fn f(a:& [2]i32) -> @[2]i32
-    return a
+    return @a
 """ + """
 pub fn main() -> i32
     var a: [2]i32 = [1, 3]
@@ -514,7 +514,7 @@ pub fn main() -> i32
     "pointer_field": """
 fn f(a:& [2]i32) -> i32
     var w: PF
-    w.p = a
+    w.p = @a
     return 3
 """ + MAIN_13,
     "address_cast": """
@@ -592,7 +592,7 @@ fn g(a: @[2]i32) -> i32
     return 3
 
 fn f(a:& [2]i32) -> i32
-    return g(a)
+    return g(@a)
 """ + MAIN_13,
     # Every source of the array.
     "from_bare_local": """
@@ -879,7 +879,7 @@ pub fn main() -> i32
 """,
     "nested_reference_let": """
 fn f(a:& [2][3]i32) -> i32
-    let p: @[2][3]i32 = a
+    let p: @[2][3]i32 = @a
     return 3
 
 pub fn main() -> i32
@@ -1666,7 +1666,7 @@ struct H
 
 fn f(a:& [2]i32) -> i32
     var h: H
-    h.r = a
+    h.r = @a
     return 3
 """ + MAIN_13
 
@@ -1677,7 +1677,6 @@ def test_ritz0_stores_a_borrowed_array_in_a_reference_field(tmp_path):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2323: `h.r = a` into an `@[N]T` field fails at clang")
 def test_ritz1_stores_a_borrowed_array_in_a_reference_field(ritz1_bin, tmp_path):
     assert _run("ritz1", ritz1_bin, tmp_path, "field", TYPES + REFERENCE_FIELD) == 3
 

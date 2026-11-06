@@ -632,16 +632,6 @@ pub fn main() -> i32
     return DROPS
 """, 1, METHOD_TEMP_GAP),
 
-    "method_temp_lent_argument": (METHODS + """\
-fn f() -> i32
-    var s = Sink { n: 0 }
-    return s.look(Tracked.new(1))
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, METHOD_TEMP_GAP),
-
     # One evaluation, so one value to drop (AGAST #2261).
     "method_temp_receiver": (METHODS + """\
 fn f() -> i32
@@ -865,35 +855,6 @@ pub fn main() -> i32
     let inner = f()
     return inner + DROPS
 """, 11, {}),
-
-    # Lent to an `@T` parameter, the temporary is still nobody's: it drops
-    # once the `let` statement ends. inner = 1 * 10 + 2.
-    "temporary_lent": ("""\
-fn peek(t: @Tracked) -> i32
-    return t.id
-
-fn f() -> i32
-    let n = peek(make(2))
-    return DROPS * 10 + n
-
-pub fn main() -> i32
-    let inner = f()
-    return inner + DROPS
-""", 13, {}),
-
-    # A `return` statement's temporary drops after the value is evaluated
-    # (DROPS is still 0 there), before the function returns. inner = 2.
-    "temporary_in_return": ("""\
-fn peek(t: @Tracked) -> i32
-    return t.id
-
-fn f() -> i32
-    return peek(make(2)) + DROPS * 10
-
-pub fn main() -> i32
-    let inner = f()
-    return inner * 10 + DROPS
-""", 21, {}),
 
     # Moving an outer binding inside a loop is fine when every path back to
     # the loop head assigns it again: consume drops ids 0, 1 and 2, the

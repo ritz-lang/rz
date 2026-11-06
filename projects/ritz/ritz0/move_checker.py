@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import ref_rules
 import ritz_ast as rast
-from tail_value import slot_tails
 
 
 class OwnershipError(Exception):
@@ -305,8 +304,6 @@ class MoveChecker:
         # (binding name, field path) pairs the current function moves out of
         # a binding (AGAST #2171, #2232); the emitter gives those drop flags.
         self._field_moves: Set[Tuple[str, str]] = set()
-        # id(Ident) of each value that lands in a reference (_note_ref_slot).
-        self._ref_tails: Set[int] = set()
         self.current_ret_type: Optional[rast.Type] = None
 
     def check(self, module: rast.Module) -> List[OwnershipError]:
@@ -542,7 +539,6 @@ class MoveChecker:
         """Check a function definition."""
         self.current_fn_name = fn.name
         self._field_moves = set()
-        self._ref_tails = set()
         self._push_scope()
 
         # Parameters are owned at function start
@@ -553,7 +549,6 @@ class MoveChecker:
 
         # Check function body (which is a Block)
         self.current_ret_type = fn.ret_type
-        self._note_ref_slot(fn.ret_type, fn.body)
         self._check_block(fn.body)
 
         self._pop_scope()
@@ -584,9 +579,7 @@ class MoveChecker:
         if isinstance(stmt, rast.VarStmt):
             # Variable declaration
             if stmt.value:
-                self._note_ref_slot(stmt.type, stmt.value)
                 self._check_expr(stmt.value, is_move_context=True)
-                self._hold_reborrows(stmt.type, stmt.value)
             # Use explicit type if present, otherwise infer from initializer
             if stmt.type:
                 var_type = stmt.type
@@ -598,15 +591,9 @@ class MoveChecker:
             return False
 
         elif isinstance(stmt, rast.LetStmt):
-            # Let binding. `let p: @T = t` of a `name:& T` parameter takes
-            # the parameter's address (AGAST #2231): a read, not a move.
+            # Let binding.
             if stmt.value:
-                reborrows = (isinstance(self.types.resolve(stmt.type),
-                                        (rast.RefType, rast.PtrType))
-                             and self._lent_param(stmt.value) is not None)
-                self._note_ref_slot(stmt.type, stmt.value)
-                self._check_expr(stmt.value, is_move_context=not reborrows)
-                self._hold_reborrows(stmt.type, stmt.value)
+                self._check_expr(stmt.value, is_move_context=True)
             # Use explicit type if present, otherwise infer from initializer
             if stmt.type:
                 var_type = stmt.type
@@ -623,16 +610,13 @@ class MoveChecker:
 
         elif isinstance(stmt, rast.ReturnStmt):
             if stmt.value:
-                self._note_ref_slot(self.current_ret_type, stmt.value)
                 self._check_expr(stmt.value, is_move_context=True)
             # Return terminates this control flow path
             return True
 
         elif isinstance(stmt, rast.AssignStmt):
             # Check the value first - this is a move. `t = f(t)` reads the
-            # old t before the assignment makes t an owner again. A reference
-            # takes a `name:& T` parameter's address (AGAST #1302, #2249).
-            self._note_ref_slot(self._assign_slot_type(stmt.target), stmt.value)
+            # old t before the assignment makes t an owner again.
             self._check_expr(stmt.value, is_move_context=True)
             # The target (lvalue) is not a move, and assigning to a bare
             # moved-from binding is not a use of it (§13.6). Nor is assigning
@@ -778,8 +762,6 @@ class MoveChecker:
         """
         if isinstance(expr, rast.Ident):
             var_info = self.scope.lookup(expr.name)
-            if id(expr) in self._ref_tails and self._lent_param(expr) is not None:
-                is_move_context = False
             if var_info:
                 # Check if variable has been moved
                 if var_info.state == VarState.MOVED:
@@ -907,10 +889,7 @@ class MoveChecker:
                 self._reject_move_out(expr.span)
 
         elif isinstance(expr, rast.StructLit):
-            field_types = dict(self.types.struct_fields(
-                rast.NamedType(expr.span, expr.name, expr.type_args)))
-            for name, value in expr.fields:
-                self._note_ref_slot(field_types.get(name), value)
+            for _, value in expr.fields:
                 self._check_expr(value, is_move_context=True)
             self._mark_temporary(expr, is_move_context)
 
@@ -960,7 +939,6 @@ class MoveChecker:
 
         elif isinstance(expr, rast.ReturnExpr):
             if expr.value is not None:
-                self._note_ref_slot(self.current_ret_type, expr.value)
                 self._check_expr(expr.value, is_move_context=True)
 
         elif isinstance(expr, rast.TryOp):
@@ -1138,36 +1116,6 @@ class MoveChecker:
             held = self.types.resolve(held.inner)
         if self.types.is_move_only(held) and self._takes_self_by_value(held, call.method):
             self._reject_move_out(call.span)
-
-    def _note_ref_slot(self, slot: Optional[rast.Type],
-                       value: Optional[rast.Expr]) -> None:
-        """`value` lands in a `slot`-typed place. A `name:& T` parameter that
-        reaches a reference there lends itself on rather than moves out (AGAST
-        #1302, #2249). Whether a tail still names the parameter is up to
-        _check_expr: only there is an arm's own binding in scope."""
-        for tail, tail_slot in slot_tails(slot, value, self.types.resolve):
-            if (isinstance(tail, rast.Ident)
-                    and isinstance(tail_slot, (rast.RefType, rast.PtrType))):
-                self._ref_tails.add(id(tail))
-
-    def _hold_reborrows(self, slot: Optional[rast.Type], value: rast.Expr) -> None:
-        """A `name:& T` parameter bound to a reference is borrowed from here
-        on, exactly as `@name` / `@&name` would be (§13.5's first rule). A raw
-        pointer isn't tracked, whichever way it's spelled."""
-        held = {}
-        for tail, tail_slot in slot_tails(slot, value, self.types.resolve):
-            if (isinstance(tail, rast.Ident) and isinstance(tail_slot, rast.RefType)
-                    and self._lent_param(tail) is not None):
-                held[(tail.name, tail_slot.mutable)] = tail
-        for (_, mutable), tail in held.items():
-            self._check_borrow(tail, mutable=mutable, span=tail.span)
-
-    def _assign_slot_type(self, target: rast.Expr) -> Optional[rast.Type]:
-        """The type of the slot `target = ...` writes, element or otherwise."""
-        if not isinstance(target, rast.Index):
-            return self._field_path_type(target)
-        base = self.types.resolve(self._assign_slot_type(target.expr))
-        return base.inner if isinstance(base, (rast.ArrayType, rast.PtrType)) else None
 
     def _field_path_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of a field path `b.f.g`, at any depth, or None."""

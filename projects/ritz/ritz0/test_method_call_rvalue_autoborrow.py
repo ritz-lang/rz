@@ -34,6 +34,8 @@ from pathlib import Path
 
 import pytest
 
+from ref_rules import VALUE_INTO_SHARED_REF
+
 from ritz0_inproc import run_ritz0
 
 # Every test compiles with ritz0 (AGAST #1805).
@@ -83,32 +85,11 @@ fn main() -> i32
 """
 
 
-def test_rvalue_arg_to_pointer_param_compiles(tmp_path):
-    """An rvalue argument to a `@T` method param must be spilled and borrowed.
-
-    Before the fix this raised
-    ``TypeError: Type of #2 arg mismatch: %"...Pair"* != %"...Pair"``
-    because the fallback passed the struct by value.
-    """
+def test_rvalue_arg_to_pointer_param_is_refused(tmp_path):
+    """A value never fits an `@T`, and a call result has no address (#2337)."""
     result = _compile(tmp_path, RVALUE_ARG_TO_BORROW_PARAM)
-    assert result.returncode == 0, (
-        "rvalue argument to a pointer-typed method parameter failed to "
-        f"compile:\n{result.stderr}"
-    )
-    assert "arg mismatch" not in result.stderr
-
-
-def test_rvalue_arg_is_spilled_to_stack_slot(tmp_path):
-    """The emitted IR must pass the spilled slot's address, not a value copy.
-
-    Pins the mechanism (an ``arg.tmp`` alloca + store) so a future
-    refactor that reverts to the by-value fallback — or silently bitcasts —
-    fails here even if llvmlite's type check were ever relaxed.
-    """
-    result = _compile(tmp_path, RVALUE_ARG_TO_BORROW_PARAM)
-    assert result.returncode == 0, result.stderr
-    ir = (tmp_path / "unit.ll").read_text()
-    assert "arg.tmp" in ir, "expected an arg.tmp spill slot in the emitted IR"
+    assert result.returncode != 0
+    assert VALUE_INTO_SHARED_REF in result.stderr
 
 
 def test_genuinely_mismatched_arg_still_fails(tmp_path):

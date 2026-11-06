@@ -256,12 +256,12 @@ pub fn main() -> i32
     return f()
 """, 6),
 
-    # Auto-borrow into an `@Tracked` param is a loan, not a move.
-    "autoborrow_is_not_a_move": ("""\
+    # `@t` into an `@Tracked` param is a loan, not a move.
+    "borrow_is_not_a_move": ("""\
 fn f() -> i32
     var t = make(3)
-    let a = peek(t)
-    let b = peek(t)
+    let a = peek(@t)
+    let b = peek(@t)
     return a + b + DROPS
 
 pub fn main() -> i32
@@ -362,12 +362,12 @@ pub fn main() -> i32
 LENT_READS = {
     "let_as_reference": """\
 fn g(t:& Tracked) -> i32
-    let p: @Tracked = t
+    let p: @Tracked = @t
     return p.id
 """,
     "let_as_pointer": """\
 fn g(t:& Tracked) -> i32
-    let p: *Tracked = t
+    let p: *Tracked = @t
     return p.id
 """,
     "relend": """\
@@ -375,7 +375,7 @@ fn h(t:& Tracked) -> i32
     return t.id
 
 fn g(t:& Tracked) -> i32
-    return h(t) + peek(t)
+    return h(t) + peek(@t)
 """,
 }
 
@@ -627,9 +627,9 @@ fn f(c: bool)
     "lent_not_moved": ("""\
 fn f(c: bool)
     var m = mid()
-    peek(m.d.t)
-    peek(m.d.t)
-    look(m.d)
+    peek(@m.d.t)
+    peek(@m.d.t)
+    look(@m.d)
 """, "true", 123),
     # As for `make().t`: no partial drops of a temporary.
     "temporary_nested_field": ("""\
@@ -674,7 +674,7 @@ fn f()
 fn f()
     var m = mid()
     consume(m.d.t)
-    peek(m.d.t)
+    peek(@m.d.t)
 """, "m.d.t"),
     "parent_moved_after_child": ("""\
 fn f()
@@ -686,7 +686,7 @@ fn f()
 fn f()
     var m = mid()
     consume(m.d.t)
-    look(m.d)
+    look(@m.d)
 """, "m.d.t"),
     "binding_moved_after_child": ("""\
 fn g(m: Mid)

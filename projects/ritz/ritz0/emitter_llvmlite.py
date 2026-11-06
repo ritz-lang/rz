@@ -552,9 +552,6 @@ class LLVMEmitter:
         # A name is a borrow only while `locals[name]` still holds this
         # pointer (a shadowing `let`/`var` rebinds it to an alloca).
         self._mut_borrow_args: Dict[str, ir.Value] = {}
-        # AGAST #2249: id(Ident) of a `h:& T` param in value position -> the
-        # reference slot it lands in, for _emit_expr. See _lend_to_slot.
-        self._lent_tails: Dict[int, rast.Type] = {}
         # MethodCall nodes in the tail being emitted that resolved to a
         # procedure (AGAST #2237): see _reject_missing_tail_value.
         self._procedure_method_calls: set = set()
@@ -3185,7 +3182,7 @@ class LLVMEmitter:
         """
         expected_enum_name = self._resolve_enum_type_name(
             None, self._fn_ret_type(self.current_fn))
-        self._lend_to_slot(self.current_fn_def.ret_type, value)
+        self._literal_into_slot(self.current_fn_def.ret_type, value)
         return self._emit_expr_with_expected_enum(value, expected_enum_name)
 
     def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str) -> ir.Value:
@@ -4885,7 +4882,6 @@ class LLVMEmitter:
         self.locals.clear()
         self.params.clear()
         self._mut_borrow_args.clear()
-        self._lent_tails.clear()
         self._let_slots.clear()
         self._let_values.clear()
         self.has_returned = False
@@ -5020,7 +5016,7 @@ class LLVMEmitter:
                 # specialization instead of an arbitrary one from variant_to_enum.
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
                 self._procedure_method_calls = set()
-                self._lend_to_slot(fn_def.ret_type, fn_def.body.expr)
+                self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
                 last_val = self._emit_expr_with_expected_enum(fn_def.body.expr, expected_enum_name)
                 self._reject_missing_tail_value(
                     fn_def, lambda e: id(e) in self._procedure_method_calls)
@@ -5648,7 +5644,7 @@ class LLVMEmitter:
         self._reject_valueless_if(stmt)
         if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
             self._value_source = stmt.value
-            self._lend_to_slot(stmt.type, stmt.value)
+            self._literal_into_slot(stmt.type, stmt.value)
         elif isinstance(stmt, rast.ReturnStmt):
             self._expect_returned_value_from(stmt.value)
 
@@ -5913,16 +5909,8 @@ class LLVMEmitter:
                 if target_enum is None and target_ritz_type.args:
                     target_enum = self._ensure_builtin_generic_specialization(
                         target_ritz_type)
-            ref_val = None
-            if (isinstance(stmt.target, rast.Field)
-                    and self._borrow_referent_slot(stmt.value) is not None):
-                field_ritz_type = self._infer_ritz_type(stmt.target)
-                if field_ritz_type is not None:
-                    ref_val = self._borrow_for_ref_slot(stmt.value, field_ritz_type)
-            self._lend_to_assign_target(stmt.target, stmt.value)
-            if ref_val is not None:
-                val = ref_val
-            elif target_enum is not None:
+            self._literal_into_slot(self._infer_ritz_type(stmt.target), stmt.value)
+            if target_enum is not None:
                 val = self._emit_enum_variant_with_type(stmt.value, target_enum)
             else:
                 val = self._emit_expr(stmt.value)
@@ -7614,13 +7602,6 @@ class LLVMEmitter:
             pre = self._evaluated_once.get(id(expr))
             if pre is not None:
                 return pre
-        # AGAST #2249: a `:&` param landing in a reference slot.
-        if self._lent_tails:
-            slot = self._lent_tails.get(id(expr))
-            if slot is not None:
-                borrow = self._lent_tail_borrow(expr, slot)
-                if borrow is not None:
-                    return borrow
         val = self._emit_expr_core(expr)
         if getattr(expr, 'drop_temp', None) is not None:
             self._own_temporary(expr, val)
@@ -9383,7 +9364,7 @@ class LLVMEmitter:
             if target_enum is None and target_ritz_type.args:
                 target_enum = self._ensure_builtin_generic_specialization(
                     target_ritz_type)
-        self._lend_to_assign_target(expr.target, expr.value)
+        self._literal_into_slot(self._infer_ritz_type(expr.target), expr.value)
         if target_enum is not None:
             val = self._emit_enum_variant_with_type(expr.value, target_enum)
         else:
@@ -9726,33 +9707,6 @@ class LLVMEmitter:
             return None
         return arg
 
-    def _borrow_for_ref_slot(self, expr: rast.Expr,
-                             slot_type: rast.Type) -> Optional[ir.Value]:
-        """AGAST #1302: the borrow's pointer if `expr` names a `h:& T` param
-        and `slot_type` is a reference to that `T`. A reference slot holds the
-        reference, not the referent `h` reads as. Otherwise None.
-
-        `h:& *U` qualifies only for a slot of `@*U`: a `*U` slot wants the
-        pointer `h` reads as.
-        """
-        arg = self._lent_arg(expr)
-        if arg is None or arg.type != self._ritz_type_to_llvm(slot_type):
-            return None
-        return arg
-
-    def _is_lendable_slot(self, slot: rast.Type) -> bool:
-        """Does a `slot` hold what a `h:& T` lends, rather than a `T`?
-
-        `*T` of a scalar is left out: `n:& i32` into `*i32` outside a field
-        reads the integer until #2280 decides whether it takes the pointer
-        or is rejected. A plain `dyn Trait` is a value, so it isn't a slot here.
-        """
-        if not isinstance(slot, (rast.RefType, rast.PtrType)):
-            return False
-        return not (isinstance(slot, rast.PtrType)
-                    and isinstance(self._ritz_type_to_llvm(slot).pointee,
-                                   (ir.IntType, ir.FloatType, ir.DoubleType)))
-
     def _emit_into_array_slot(self, value: rast.Expr, slot: Optional[rast.Type]) -> ir.Value:
         """Emit `value`; an array literal takes its element type from `slot`,
         and keeps its own length, so the wrong length is still refused."""
@@ -9810,45 +9764,6 @@ class LLVMEmitter:
                 value, width, self._is_unsigned_type(slot)):
             raise EmitError(f"`{value}` does not fit in `{slot.name}`",
                             self._value_span(tail))
-
-    def _lend_to_slot(self, slot: Optional[rast.Type],
-                      value: Optional[rast.Expr], fit: bool = True) -> None:
-        """AGAST #2249: `value` is about to land in a `slot`-typed place, so
-        each `h:& T` param it can come from lends its pointer there.
-
-        The answer waits for _emit_expr, because only then is it known whether
-        an arm's own binding has shadowed the param.
-        """
-        self._literal_into_slot(slot, value, fit)
-        if slot is None or value is None or not self._mut_borrow_args:
-            return
-        resolve = lambda ty: resolve_alias_in(ty, self.type_aliases)
-        for tail, tail_slot in slot_tails(slot, value, resolve):
-            if (isinstance(tail, rast.Ident) and tail.name in self._mut_borrow_args
-                    and self._is_lendable_slot(tail_slot)):
-                self._lent_tails[id(tail)] = tail_slot
-
-    def _lend_to_assign_target(self, target: rast.Expr, value: rast.Expr) -> None:
-        """_lend_to_slot for `target = value`."""
-        self._lend_to_slot(self._infer_ritz_type(target), value)
-
-    def _lent_tail_borrow(self, expr: rast.Ident,
-                          slot: rast.Type) -> Optional[ir.Value]:
-        """What `expr`, marked by _lend_to_slot, yields: the borrow's pointer,
-        or None if a binding shadows the param or `h:& *U` reads as the `*U`
-        the slot wants. A reference to another type can't hold the borrow.
-        Neither can a `*S` hold a scalar's, but what that should do is #2281's.
-        """
-        borrow = self._borrow_for_ref_slot(expr, slot)
-        if borrow is not None:
-            return borrow
-        arg = self._borrow_referent_slot(expr)
-        if arg is not None and (isinstance(slot, rast.RefType) or isinstance(
-                arg.type.pointee, (ir.BaseStructType, ir.ArrayType))):
-            raise EmitError(
-                f"a `{expr.name}:&` parameter can't be held in a reference "
-                f"to another type", expr.span)
-        return None
 
     def _emit_unary(self, expr: rast.UnaryOp) -> ir.Value:
         """Emit a unary operation: -x, !x, *x, @x, @&x."""
@@ -9994,10 +9909,7 @@ class LLVMEmitter:
     def _emit_struct_lit_field(self, field_expr: rast.Expr,
                                expected_type: rast.Type) -> ir.Value:
         """One struct literal initialiser, converted to its field's type."""
-        ref_val = self._borrow_for_ref_slot(field_expr, expected_type)
-        if ref_val is not None:
-            return ref_val
-        self._lend_to_slot(expected_type, field_expr)
+        self._literal_into_slot(expected_type, field_expr)
         # `S { opt: None }` must build the variant for *this field's* enum:
         # variant names are global, so `None`/`Some` would otherwise pick
         # whichever Option specialization was registered last.
@@ -14439,7 +14351,7 @@ class LLVMEmitter:
 
         # Check if casting FROM a union type to a variant type
         # This happens in match arms: x as i32, x as *u8, etc.
-        self._lend_to_slot(expr.target, expr.expr, fit=False)
+        self._literal_into_slot(expr.target, expr.expr, fit=False)
         val = self._emit_expr(expr.expr)
 
         # Check if the source expression's type is a union
@@ -15055,7 +14967,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
     else:
         emitter._cached_fn_names = set()
 
-    # A reference in a by-value slot (§13.2, AGAST #2336). After monomorphisation,
+    # A reference in a by-value slot or a value in a reference slot (§13.2, §13.4,
+    # AGAST #2336, #2337). After monomorphisation,
     # so a generic body is judged at each `T` it's instantiated with.
     emitter._current_source_file = main_source_path
     slot_errors = check_ref_slots(module, emitter._should_emit_body, module_names)

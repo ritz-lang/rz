@@ -283,37 +283,6 @@ pub fn main() -> i32
     return inner + DROPS
 """, 11),
 
-    # A condition's temporary drops once the condition is evaluated, before
-    # the arm runs (ritz0 #2161).
-    "temporary_in_if_cond": ("""\
-fn peek(t: @Tracked) -> i32
-    return t.id
-
-fn f() -> i32
-    var r = 0
-    if peek(make(1)) == 1
-        r = DROPS
-    return r * 10 + DROPS
-
-pub fn main() -> i32
-    return f()
-""", 11),
-
-    # ...on every evaluation of a `while` condition: ids 0, 1, 2 and 3.
-    "temporary_in_while_cond": ("""\
-fn peek(t: @Tracked) -> i32
-    return t.id
-
-fn f() -> i32
-    var i = 0
-    while peek(make(i)) < 3
-        i = i + 1
-    return DROPS
-
-pub fn main() -> i32
-    return f()
-""", 4),
-
     # A move inside a loop that leaves by `return` is fine.
     "loop_move_then_return": ("""\
 fn f() -> i32

@@ -221,9 +221,8 @@ CASES = {
     "field_of_rvalue": ("mw().p.get()", 1, 0, {"ritz0": 2294}),
     # Inside an argument.
     "in_argument": ("take(mp().get())", 1, 0, {}),
-    "in_lent_argument": ("look(mp().next())", 1, 0, {}),
-    "in_method_argument": ("var s = P { x: 1 }\n    s.other(mp().next())", 1, 0,
-                           NO_RVALUE_ARGS),
+    "in_a_borrowed_local": ("let t = mp().next()\n    look(@t)", 1, 0, {}),
+    "in_a_method_argument_local": ("var s = P { x: 1 }\n    let t = mp().next()\n    s.other(@t)", 1, 0, {}),
     "in_condition": ("if mp().get() == 1\n        return 0", 1, 0, {}),
 }
 
@@ -263,22 +262,6 @@ pub fn main() -> i32
 """, 61, NO_METHOD_TEMPS),
 
     # The receiver is evaluated before the arguments, and each once.
-    "receiver_before_arguments": ("""\
-var TRACE: i32 = 0
-
-fn first() -> P
-    TRACE = TRACE * 10 + 1
-    return P { x: 1 }
-
-fn second() -> P
-    TRACE = TRACE * 10 + 2
-    return P { x: 2 }
-
-pub fn main() -> i32
-    first().other(second())
-    return TRACE
-""", 12, NO_RVALUE_ARGS),
-
     # A loop body is emitted once: each pass evaluates the receiver once.
     "in_a_loop": ("""\
 fn g() -> i32

@@ -1,12 +1,15 @@
-# ref_check.ritz - a reference doesn't fit a by-value slot (AGAST #2336)
+# ref_check.ritz - a reference doesn't fit a by-value slot, nor a value a
+# reference slot (AGAST #2336, #2337)
 #
 # LANGUAGE_SPEC §13.2-13.4, LARB ruling R1.  An `@T`, `@&T` or `*T` where a `T`
 # goes is a located error at every slot: argument, `let`/`var`, `=`, `return`,
 # tail, field, element, variant payload.  There's no implicit deref, and `@x`
-# into a by-value slot is the same mistake.
+# into a by-value slot is the same mistake.  So is a `T` where a reference goes:
+# a `name:& T` param has type `T` in its body, and a reference is written.
 #
-# ritz0's twin is TypeChecker._check_ref_slot; ref_rules.py has the wording and
-# ritz0/test_ref_into_value.py holds all three compilers to it.  ritz1 emits
+# ritz0's twin is TypeChecker._check_ref_slot; ref_rules.py has the wording, and
+# ritz0/test_ref_into_value.py and test_value_into_ref.py hold all three
+# compilers to it.  ritz1 emits
 # bodies after monomorphize_module, so a generic is judged per instance for free.
 #
 # This runs from the ownership hooks, as code is emitted, so every local a value
@@ -68,7 +71,7 @@ fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
     let t: i32 = loc.var_type
     if ref_is_pointer(t) == 1
         # `c:& C` reads as a `C` (§13.4), and so does a by-value `self`.
-        if (loc.is_lent == 1 or loc.holds_lent_ptr == 1) and loc.lent_in_slot == 0
+        if loc.is_lent == 1 or loc.holds_lent_ptr == 1
             return ref_set(out, loc.pointee_type, 0, loc.type_name, loc.type_name_len)
         return ref_set(out, t, loc.pointee_type, loc.type_name, loc.type_name_len)
     if t == TYPE_ARRAY
@@ -139,13 +142,15 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
     let k: i32 = e.kind
     if k == EXPR_IDENT
         return ref_of_ident(s, e.ident_ptr, e.ident_len, out)
+    if k == EXPR_STRING_LIT
+        return ref_set(out, TYPE_STRUCT, 0, c"StrView", 7)
     if k == EXPR_UNARY
         var t: RefTy
         if e.op == OP_ADDR or e.op == OP_ADDR_MUT
             if ref_ty_of(s, e.operand, @t) == 0
                 return 0
             if ref_is_pointer(t.kind) == 1
-                return ref_set(out, TYPE_PTR, TYPE_PTR, null, 0)
+                return ref_set(out, TYPE_PTR, TYPE_PTR, t.name, t.name_len)
             return ref_set(out, TYPE_PTR, t.kind, t.name, t.name_len)
         if e.op == OP_DEREF
             if ref_ty_of(s, e.operand, @t) == 0
@@ -162,6 +167,9 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
             return 0
         return ref_of_field(s, e, f, out)
     if k == EXPR_INDEX
+        # `p[1..3]` is a pointer, not an element.
+        if e.right != null and e.right.kind == EXPR_RANGE
+            return 0
         var b: RefTy
         if ref_ty_of(s, e.left, @b) == 0
             return 0
@@ -253,6 +261,66 @@ fn ref_same_pointee(a: *RefTy, slot: *RefTy) -> i32
         return 0
     name_eq(a.name, a.name_len, slot.name, slot.name_len)
 
+fn ref_error_value(s: *EmitterState, e: *Expr, slot: *RefTy)
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    if slot.kind == TYPE_MUT_REF
+        eprints_cstr(c": error: a value doesn't fit a reference slot: write `@&x` to borrow it\n")
+    else
+        eprints_cstr(c": error: a value doesn't fit a reference slot: write `@x` to borrow it\n")
+    s.error_count = s.error_count + 1
+
+fn ref_error_other_pointer(s: *EmitterState, e: *Expr)
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    eprints_cstr(c": error: a reference to one pointer type doesn't fit a reference to another\n")
+    s.error_count = s.error_count + 1
+
+# 1 when `e` names a `name:& T` param.
+fn ref_names_lent(s: *EmitterState, e: *Expr) -> i32
+    if e.kind != EXPR_IDENT
+        return 0
+    let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return 0
+    let loc: *LocalVar = local_at(s, idx)
+    return loc.is_lent
+
+# `a`, which `e` has, is what `slot` refers to.
+fn ref_is_referent(a: *RefTy, slot: *RefTy) -> i32
+    # A field, an element or a payload keeps a `*S`'s name and not the kind.
+    if slot.pointee == TYPE_VOID and slot.name_len > 0 and a.kind == TYPE_STRUCT
+        return name_eq(a.name, a.name_len, slot.name, slot.name_len)
+    if a.kind != slot.pointee
+        return 0
+    if a.kind != TYPE_STRUCT
+        return 1
+    name_eq(a.name, a.name_len, slot.name, slot.name_len)
+
+# `e`, of type `a`, lands in reference or pointer `slot`.  Only a pointer fits:
+# a `T` never does, and `@T` and `@&T` take nothing else.  `*U` is a `T` too, for
+# an `@*U`.  A plain integer into a `*U` of another `U` is a pointer as an
+# integer, which is another question; a `:&` param isn't one.
+fn ref_value_into_ref(s: *EmitterState, e: *Expr, a: *RefTy, slot: *RefTy)
+    if ref_is_pointer(a.kind) == 1
+        if slot.pointee != TYPE_PTR or slot.kind == TYPE_PTR
+            return
+        if a.kind == TYPE_PTR and a.pointee != TYPE_PTR
+            ref_error_value(s, e, slot)
+        else if a.pointee == TYPE_PTR and a.name_len > 0 and slot.name_len > 0
+            if name_eq(a.name, a.name_len, slot.name, slot.name_len) == 0
+                ref_error_other_pointer(s, e)
+        return
+    if slot.kind != TYPE_PTR or ref_is_referent(a, slot) == 1 or ref_names_lent(s, e) == 1
+        ref_error_value(s, e, slot)
+
+fn ref_is_span(slot: *RefTy) -> i32
+    if slot.kind != TYPE_STRUCT or slot.name_len <= 5
+        return 0
+    return (memcmp(slot.name, c"Span$", 5) == 0) as i32
+
 fn ref_tail_set(t: *RefTail, e: *Expr, kind: i32, pointee: i32, name: *u8, len: i32)
     t.e = e
     t.kind = kind
@@ -330,8 +398,12 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
         ref_into(s, e.left, @fill)
         return
     var a: RefTy
-    if ref_ty_of(s, e, @a) == 1 and ref_is_pointer(a.kind) == 1 and ref_is_pointer(slot.kind) == 0
-        if ref_same_pointee(@a, slot) == 1
+    if ref_ty_of(s, e, @a) == 1
+        if ref_is_pointer(slot.kind) == 1
+            ref_value_into_ref(s, e, @a, slot)
+        else if a.kind == TYPE_ARRAY and ref_is_span(slot) == 1
+            ref_error_value(s, e, slot)
+        else if ref_is_pointer(a.kind) == 1 and ref_same_pointee(@a, slot) == 1
             ref_error_slot(s, e)
     ref_into_variant(s, e, slot)
 
@@ -358,7 +430,7 @@ fn ref_payload(s: *EmitterState, a0: *Expr, ei: i32, vi: i32)
     var f: *StructField = enum_variant_fields(ei, vi)
     while a != null and f != null
         var slot: RefTy
-        ref_set(@slot, f.field_type, 0, f.field_type_name, f.field_type_name_len)
+        ref_field_slot(f, @slot)
         ref_into(s, a, @slot)
         a = a.next
         f = f.next
@@ -381,6 +453,13 @@ fn ref_walk_list(s: *EmitterState, a0: *Expr)
         ref_walk(s, a)
         a = a.next
 
+# What field `f` takes, as a slot.
+fn ref_field_slot(f: *StructField, out: *RefTy)
+    if f.field_type == TYPE_PTR and f.field_mut_ref == 1
+        ref_set(out, TYPE_MUT_REF, f.array_elem_type, f.field_type_name, f.field_type_name_len)
+    else
+        ref_set(out, f.field_type, f.array_elem_type, f.field_type_name, f.field_type_name_len)
+
 fn ref_walk_struct(s: *EmitterState, e: *Expr)
     let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
     var fi: *FieldInit = e.args as *FieldInit
@@ -390,7 +469,7 @@ fn ref_walk_struct(s: *EmitterState, e: *Expr)
             if idx >= 0
                 let f: *StructField = get_field_type(st, idx)
                 var slot: RefTy
-                ref_set(@slot, f.field_type, f.array_elem_type, f.field_type_name, f.field_type_name_len)
+                ref_field_slot(f, @slot)
                 if f.field_type != TYPE_PTR_PTR
                     ref_into(s, fi.value, @slot)
         ref_walk(s, fi.value)
@@ -438,9 +517,14 @@ fn ref_walk(s: *EmitterState, e: *Expr)
         var mp: *Param = null
         let m: *FnDef = ref_method_def(s, e)
         if m != null
+            # A method found by a looser name, `v.push(x)` for `vec_push(v, x)`,
+            # takes the receiver as an argument: its params don't line up, so
+            # the slots go unjudged, as in ritz0.
             mp = m.params
             if mp != null and name_eq(mp.name, mp.name_len, c"self", 4) == 1
                 mp = mp.next
+            else
+                mp = null
         ref_args(s, e.args, mp)
     else if k == EXPR_STRUCT_LIT
         ref_walk_struct(s, e)
@@ -507,7 +591,7 @@ fn ref_into_field(s: *EmitterState, stmt: *Stmt, owner: *RefTy)
     if f.field_type == TYPE_PTR_PTR
         return
     var slot: RefTy
-    ref_set(@slot, f.field_type, f.array_elem_type, f.field_type_name, f.field_type_name_len)
+    ref_field_slot(f, @slot)
     ref_into(s, stmt.assign_value, @slot)
 
 pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Auto-borrow of rvalue arguments to `*T` PtrType params in plain calls (AGAST #1290).
+"""Rvalue arguments to `*T` PtrType params in plain calls (AGAST #1290, #2337).
+
+AGAST #2337 ended the auto-borrow described here: a value never fits a `*T`, so
+the rvalue is refused. What follows is the history of the defect it replaced.
 
 This is the `_emit_call` arm of the two-sited auto-borrow defect. The sibling
 site, `_emit_method_call`, is pinned by test_method_call_rvalue_autoborrow.py
@@ -25,6 +28,7 @@ the pointee there never matches the argument's named struct type.
 
 import pytest
 
+from ref_rules import VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
 
 pytestmark = pytest.mark.integration
@@ -54,13 +58,11 @@ fn main() -> i32
 """
 
 
-def test_rvalue_arg_to_ptr_param(tmp_path):
-    """A call-result argument to a `*T` param must be spilled and borrowed."""
+def test_rvalue_arg_to_ptr_param_is_refused(tmp_path):
+    """A value never fits a `*T`, and a call result has no address (#2337)."""
     result = _compile(tmp_path, RVALUE_TO_PTR_PARAM)
-    assert result.returncode == 0, (
-        "rvalue argument to *T PtrType parameter failed to compile:\n"
-        f"{result.stderr}"
-    )
+    assert result.returncode != 0
+    assert VALUE_INTO_SHARED_REF in result.stderr
 
 
 # Explicit address-of must keep working — the predicate must not double-borrow.

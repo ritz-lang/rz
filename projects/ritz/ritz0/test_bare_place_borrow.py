@@ -137,7 +137,7 @@ ROUTES = {
                   "    return c.x\n",
     "generic_int": "fn w<T>(r:& T, v: T)\n    r = v\n\n"
                    "pub fn main() -> i32\n    var n: i32 = 1\n    w<i32>(n, 3)\n    return n\n",
-    "generic_struct": C + "fn id<T>(r:& T) -> @&T\n    return r\n\n"
+    "generic_struct": C + "fn id<T>(r:& T) -> @&T\n    return @&r\n\n"
                       "pub fn main() -> i32\n    var c: C = C { x: 1, y: 0 }\n"
                       "    let p: @&C = id<C>(c)\n    p.x = 3\n    return c.x\n",
     "generic_pointer": C + GENERIC_WRITER + "pub fn main() -> i32\n" + GOOD +
@@ -187,7 +187,7 @@ ROUTES = {
                                   "pub fn main() -> i32\n    var a: i32 = 3\n    var p: *i32 = @a\n"
                                   "    return g<*i32>(p)\n",
     # Already right; they clone through the same code, so they stay right.
-    "generic_pointer_returned": C + "fn id<T>(r:& T) -> @&T\n    return r\n\n"
+    "generic_pointer_returned": C + "fn id<T>(r:& T) -> @&T\n    return @&r\n\n"
                                 "pub fn main() -> i32\n" + GOOD + "    var p: *C = @c1\n"
                                 "    let q: @&*C = id<*C>(p)\n    *q = @c3\n    return p.x\n",
     "generic_pointer_named_reference": C + "fn w<T>(r: @&T, v: T)\n    *r = v\n\n"
@@ -456,12 +456,6 @@ METHOD_MISFITS = {
     "static_method": (S + "impl S\n    fn put(r:& i64)\n        r = 3\n\n", "S.put(v)", 1),
 }
 
-# Bare `h` into an `@&*C` is no place into `:&`: a `T` never fits `@&T`.
-STILL_REFUSED = {
-    "reference_slot": C + "fn g(p: @&*C, d: *C)\n    *p = d\n\n"
-                      "fn go(h:& *C, d: *C)\n    g(h, d)\n",
-}
-
 DROPS = """\
 struct R
     n: i32
@@ -664,14 +658,6 @@ def test_an_explicit_borrow_of_another_type_is_no_temporary(tmp_path):
     src = INT_WRITER + "pub fn main() -> i32\n    var n: i64 = 1\n    w(@n)\n    return 0\n"
     error = _error("ritz0", tmp_path, "explicit", src)
     assert "argument 1 of `w` has the wrong type" in error and "temporary" not in error, error
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(STILL_REFUSED))
-def test_a_bare_place_into_a_reference_stays_refused(tmp_path, compiler, name):
-    src = STILL_REFUSED[name] + "\npub fn main() -> i32\n    return 0\n"
-    error = _error(compiler, tmp_path, name, src)
-    assert "argument 1 of `g` has the wrong type" in error, error
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
