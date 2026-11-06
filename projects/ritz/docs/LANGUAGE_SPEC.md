@@ -2486,7 +2486,8 @@ allowed: reading and writing through the parameter, lending it on, `match`ing or
 iterating over it, and writing `@name` or `@&name`.
 
 A reference is always written. `@c` and `@&c` of a `name:& T` parameter give the
-caller's address, and count as `@c` or `@&c` of any place for §13.5.
+caller's address, and count as `@c` or `@&c` of any place for §13.5's first rule.
+They aren't local roots: the place is the caller's.
 
 ```ritz
 struct Counter
@@ -2587,10 +2588,140 @@ let p = @x
 let q = @&x
 ```
 
-There are no lifetime annotations and no generic lifetime parameters; escape
-analysis is not performed, so returning `@local` is not caught. Nor is `@&c` of a
-`name:& T` parameter, returned, outliving what the caller lent: the result refers
-to the caller's value, and that value must outlive it.
+There are no lifetime annotations and no generic lifetime parameters, so the
+second rule can't be checked in general. It stays normative, and the compiler
+refuses the case it can see for certain: a reference to storage that ends with the
+function, leaving it. This is a check for the definite case, not a soundness
+guarantee.
+
+A **local root** is a by-value local or parameter, reached with no pointer or
+reference on the path: `x`, `x.f`, `x[i]`. That covers `let`, `var`, by-value
+parameters, and match and loop bindings. A `return` or a function's tail, through
+`if` and `match` arms, can't give:
+
+- `@x`, `@&x`, `@x.f` or `@x[i]` of a local root, as an `@T`, `@&T` or `*T`;
+- a local reference binding initialised from one of those, over any number of
+  hops;
+- a call returning `@U` or `@&U` that was given a reference to a local root with
+  pointee `U`. A `:&` parameter or a receiver is given one when its place is a
+  local root of type `U`.
+
+```ritz expect-error="cannot return a reference to local `c`: it ends with the fn"
+struct Counter
+    n: i32
+
+fn make() -> @Counter
+    var c = Counter { n: 1 }
+    return @c                       # error: c ends here
+```
+
+```ritz expect-error="cannot return a reference to local `c`: it ends with the fn"
+struct Counter
+    n: i32
+
+fn first(c: Counter) -> *i32
+    return @c.n                     # error: a by-value param is a local root
+```
+
+```ritz expect-error="cannot return a reference to local `a`: it ends with the fn"
+fn pick(b: bool, p: @i32) -> @i32
+    var a: [2]i32 = [1, 2]
+    if b
+        @a[0]                       # error: an arm of the tail
+    else
+        p
+```
+
+```ritz expect-error="cannot return a reference to local `c`: it ends with the fn"
+struct Counter
+    n: i32
+
+fn make() -> @Counter
+    var c = Counter { n: 1 }
+    let r = @c
+    let q = r
+    return q                        # error: q refers to c
+```
+
+```ritz expect-error="cannot return a reference to local `c`: it ends with the fn"
+struct Counter
+    n: i32
+
+fn same(c: @Counter) -> @Counter
+    c
+
+fn make() -> @Counter
+    var c = Counter { n: 1 }
+    return same(@c)                 # error: the result may be that reference
+```
+
+A `var` counts only while what it holds is definite. Once it's written, or has its
+address taken or is lent, it's no longer followed, and nor is it in a loop it was
+declared outside, because the loop can reach a later write first.
+
+The call rule goes by type, because a function's signature doesn't say which
+argument its result came from. A reference with another pointee doesn't count, so
+looking something up by a local key is fine, and a raw `*U` return is exempt:
+
+```ritz
+struct Entry
+    key: i32
+    value: i32
+
+fn lookup(e: @Entry, key: @i32) -> @Entry
+    e
+
+fn find(e: @Entry) -> @Entry
+    var key: i32 = 3
+    return lookup(e, @key)          # `key` is an i32: the result isn't it
+
+fn main() -> i32
+    var e = Entry { key: 3, value: 4 }
+    let r: @Entry = find(@e)
+    r.value
+```
+
+What the caller gave stays legal to return: a `name:& T`, `@T` or `@&T` parameter,
+or a reference reached through one. The result refers to the caller's value, and
+that value must outlive it. The same goes for a place behind any pointer, and for a
+global:
+
+```ritz
+struct Counter
+    n: i32
+
+var TOTAL: Counter
+
+fn lent(c:& Counter) -> @&Counter
+    return @&c                      # the caller's Counter
+
+fn through(p: *Counter) -> *i32
+    return @p.n                     # behind a pointer
+
+fn global() -> @Counter
+    return @TOTAL
+
+fn main() -> i32
+    var c = Counter { n: 1 }
+    let r = lent(c)
+    r.n = 2
+    let q = through(@c)
+    let g = global()
+    *q + g.n
+```
+
+Nothing else is checked, and each of these can still dangle:
+
+- a reference stored in a field or a global, or in a value such as a `Span<T>` or an
+  `Option<@T>`;
+- a raw pointer after a cast: `@x as *u8`;
+- anything through another function's stored state;
+- a call's result held in a binding, or passed to another call, and a call through
+  a `fn(...)` value;
+- a binding initialised from an `if` or `match`, or assigned its reference after
+  its declaration, and a reference taken behind such a binding: `@r.f`;
+- a by-value `self`: `@self` isn't a local root, because how `self` is passed isn't
+  settled.
 
 ### 13.6 Drop
 

@@ -33,6 +33,12 @@ SHARED_INTO_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
 # `@&x` of a place behind an `@T`, or `@x` of one where an `@&T` or `:&` goes.
 BORROW_THROUGH_SHARED = "cannot borrow through an `@T` as mutable: make it `@&T`"
 
+# A return or tail that definitely refers to a local root (LANGUAGE_SPEC §13.5,
+# LARB ruling R2, AGAST #2340). `name` is the root, however it was reached.
+def returns_local(name: str) -> str:
+    return f"cannot return a reference to local `{name}`: it ends with the fn"
+
+
 # `@x` of a `let`'s own storage where an `@&T` or `:&` goes: the emitter's wording
 # for `@&x` of one, since both ask for the same thing.
 def let_into_mut(name: str) -> str:

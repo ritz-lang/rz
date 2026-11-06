@@ -111,6 +111,17 @@ class TypeChecker:
         # that a name is a `let` when its current type is one of them. A `var` or
         # pattern binding copies what it infers, or `var d = c` would be `c`'s.
         self._let_types: List[rast.Type] = []
+        # Bindings of the current fn that definitely hold a reference to a local
+        # root (§13.5), by id of the type they hold: (that type, the root's name,
+        # how many loops the binding was declared in).
+        self._local_refs: Dict[int, Tuple[rast.Type, str, int]] = {}
+        # The loops around the statement being checked.
+        self._loop_depth = 0
+        # By-value `self` of the current method, which isn't a local root (#2393).
+        self._self_type: Optional[rast.Type] = None
+        # What each call in the current fn reached: its signature, and how many
+        # of its params the arguments skip.
+        self._callees: Dict[int, Tuple[FnSig, int]] = {}
 
         # Imported modules, which qualify names: `token.Kind`
         self.module_names: Set[str] = set(module_names or ())
@@ -286,10 +297,17 @@ class TypeChecker:
         # Add parameters to scope
         self.lent_locals = {}
         self._let_types = []
+        self._local_refs = {}
+        self._loop_depth = 0
+        self._self_type = None
+        self._callees = {}
         for param in fn.params:
             self.locals[param.name] = param.type
             if param.borrow == rast.Borrow.MUTABLE:
                 self.lent_locals[param.name] = param.type
+            elif impl and param.name == 'self' and not isinstance(
+                    self._resolve_alias(param.type), (rast.PtrType, rast.RefType)):
+                self._self_type = param.type
 
         # Check body
         self._check_block(fn.body, fn.ret_type)
@@ -314,13 +332,16 @@ class TypeChecker:
         if isinstance(stmt, rast.VarStmt):
             if stmt.value:
                 init_type = self._infer_into(stmt.value, stmt.type)
+                root = self._referent(stmt.value)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
                                   f"with {self._type_str(init_type)}", stmt.span)
-                    self.locals[stmt.name] = stmt.type
+                    # Its own copy: `_local_refs` tells bindings apart by it.
+                    self.locals[stmt.name] = copy.copy(stmt.type)
                 else:
                     self.locals[stmt.name] = copy.copy(init_type)
+                self._note_local_ref(stmt.name, root)
             elif stmt.type:
                 self.locals[stmt.name] = stmt.type
             else:
@@ -329,6 +350,7 @@ class TypeChecker:
         elif isinstance(stmt, rast.LetStmt):
             if stmt.value:
                 init_type = self._infer_into(stmt.value, stmt.type)
+                root = self._referent(stmt.value)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
@@ -336,6 +358,7 @@ class TypeChecker:
                     self.locals[stmt.name] = self._as_let(stmt.type)
                 else:
                     self.locals[stmt.name] = self._as_let(init_type)
+                self._note_local_ref(stmt.name, root)
             elif stmt.type:
                 self.locals[stmt.name] = self._as_let(stmt.type)
             else:
@@ -378,7 +401,9 @@ class TypeChecker:
                 self._error(f"while condition must be bool, got {self._type_str(cond_type)}",
                           stmt.cond.span)
             self._push_scope()
+            self._loop_depth += 1
             self._check_block(stmt.body)
+            self._loop_depth -= 1
             self._pop_scope()
 
         elif isinstance(stmt, rast.ForStmt):
@@ -387,7 +412,9 @@ class TypeChecker:
             iter_type = self._infer_type(stmt.iter)
             elem_type = self._get_iterator_element_type(iter_type)
             self.locals[stmt.var] = elem_type
+            self._loop_depth += 1
             self._check_block(stmt.body)
+            self._loop_depth -= 1
             self._pop_scope()
 
         elif isinstance(stmt, rast.AssertStmt):
@@ -679,11 +706,13 @@ class TypeChecker:
 
         elif expr.op in ('&', '@'):
             # Immutable borrow: @ in RERITZ, & for legacy compatibility
+            self._forget_local_ref(expr.operand)
             return rast.RefType(expr.span, operand_type, mutable=False)
 
         elif expr.op in ('&mut', '@&'):
             # Mutable borrow: @& in RERITZ, &mut for legacy compatibility
             self._check_borrow(expr)
+            self._forget_local_ref(expr.operand)
             return rast.RefType(expr.span, operand_type, mutable=True)
 
         elif expr.op == '*':
@@ -798,6 +827,8 @@ class TypeChecker:
                 self._error(f"undefined function: {fn_name}", expr.func.span)
                 return rast.NamedType(expr.span, 'unknown', [])
 
+            self._callees[id(expr)] = (fn_sig, 0)
+
             # Check argument count
             if len(expr.args) != len(fn_sig.params):
                 self._error(f"function '{fn_name}' expects {len(fn_sig.params)} arguments, "
@@ -810,6 +841,7 @@ class TypeChecker:
                         # already points at one (§13.4).
                         arg_type = self._infer_type(arg)
                         self._check_let_into_mut(arg)
+                        self._forget_local_ref(arg)
                         if isinstance(self._resolve_alias(arg_type),
                                       (rast.PtrType, rast.RefType)):
                             continue
@@ -909,10 +941,13 @@ class TypeChecker:
         # found by a looser name may take the receiver as an argument: its
         # params don't line up, so the slots go unjudged.
         skip = 1 if fn_sig.params and fn_sig.params[0][0] == 'self' else 0
+        self._callees[id(expr)] = (fn_sig, skip)
         for i, arg in enumerate(expr.args):
             at = i + skip
             lent = at in fn_sig.lent or at >= len(fn_sig.params) or not own_method
             self._infer_into(arg, None if lent else fn_sig.params[at][1])
+            if at in fn_sig.lent:
+                self._forget_local_ref(arg)
             if at in fn_sig.lent and own_method:
                 self._check_let_into_mut(arg)
 
@@ -1172,6 +1207,8 @@ class TypeChecker:
         self._check_ref_slot(expr, ty, slot)
         self._check_array_slot(expr, ty, slot)
         self._check_parts(expr, slot)
+        if slot is not None and slot is self._ret_slot():
+            self._check_return(expr)
         return ty
 
     def _check_parts(self, expr: rast.Expr, slot: Optional[rast.Type]) -> None:
@@ -1276,6 +1313,7 @@ class TypeChecker:
 
     def _check_write(self, target: rast.Expr) -> None:
         """`target` is written."""
+        self._forget_local_ref(target)
         if self._behind_shared(target):
             self._report_once(target, ref_rules.WRITE_THROUGH_SHARED)
 
@@ -1317,20 +1355,31 @@ class TypeChecker:
         self._let_types.append(held)
         return held
 
-    def _let_root(self, place: rast.Expr) -> Optional[str]:
-        """The `let` whose own storage `place` is, reached with no pointer or
-        reference on the path. The emitter's _let_place, ahead of LLVM types."""
+    def _own_storage(self, place: rast.Expr) -> Optional[str]:
+        """The local whose own storage `place` is, reached with no pointer or
+        reference on the path."""
         if isinstance(place, rast.Grouped):
-            return self._let_root(place.expr)
+            return self._own_storage(place.expr)
         if isinstance(place, rast.Ident):
-            held = self.locals.get(place.name)
-            return place.name if any(held is ty for ty in self._let_types) else None
+            return place.name if place.name in self.locals else None
         if isinstance(place, (rast.Field, rast.Index)):
+            if isinstance(place, rast.Index) and isinstance(place.index, rast.Range):
+                return None
             base = self._quiet_type(place.expr)
             if isinstance(base, rast.ArrayType if isinstance(place, rast.Index)
-                          else (rast.NamedType, rast.TupleType)):
-                return self._let_root(place.expr)
+                          else (rast.NamedType, rast.TupleType)) and not self._is_opaque(base):
+                return self._own_storage(place.expr)
         return None
+
+    def _is_let(self, name: str) -> bool:
+        held = self.locals.get(name)
+        return any(held is ty for ty in self._let_types)
+
+    def _let_root(self, place: rast.Expr) -> Optional[str]:
+        """The `let` whose own storage `place` is. The emitter's _let_place, ahead
+        of LLVM types."""
+        name = self._own_storage(place)
+        return name if name is not None and self._is_let(name) else None
 
     def _check_let_into_mut(self, expr: rast.Expr) -> None:
         """`expr` lands in an `@&T` or a `:&` param: `@x` of a `let` doesn't, nor
@@ -1368,6 +1417,92 @@ class TypeChecker:
         mutable = 0 in sig.lent or (isinstance(slot, rast.RefType) and slot.mutable)
         if mutable and self._behind_shared(rast.Field(expr.span, expr.expr, expr.method)):
             self._report_once(expr.expr, ref_rules.SHARED_INTO_MUT)
+
+    # A reference to a local doesn't leave its fn (LANGUAGE_SPEC §13.5, LARB ruling
+    # R2, AGAST #2340). A check for the definite case: what can't be told stays
+    # unjudged. ritz1's twins are in ref_check.ritz, and
+    # ritz0/test_return_local_ref.py holds all three compilers to them.
+
+    def _local_root(self, place: rast.Expr) -> Optional[str]:
+        """The local root `place` is in: its own storage, and not the caller's,
+        which a `:&` param and a by-value `self` may be (#2393)."""
+        name = self._own_storage(place)
+        if name is None:
+            return None
+        held = self.locals[name]
+        if held is self.lent_locals.get(name) or held is self._self_type:
+            return None
+        return name
+
+    def _referent(self, expr: rast.Expr) -> Optional[str]:
+        """The local root `expr` definitely refers to: `@x` of one, or a binding
+        that holds such a reference."""
+        if isinstance(expr, rast.Grouped):
+            return self._referent(expr.expr)
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@', '&mut', '@&'):
+            return self._local_root(expr.operand)
+        if not isinstance(expr, rast.Ident):
+            return None
+        held = self._local_refs.get(id(self.locals.get(expr.name)))
+        if held is None:
+            return None
+        _, root, depth = held
+        # A loop can reach a `var`'s later write before this read.
+        return root if self._is_let(expr.name) or self._loop_depth <= depth else None
+
+    def _note_local_ref(self, name: str, root: Optional[str]) -> None:
+        """`name` was just bound to a reference to `root`, if there's a root."""
+        held = self.locals[name]
+        if root is not None and isinstance(self._resolve_alias(held),
+                                           (rast.PtrType, rast.RefType)):
+            self._local_refs[id(held)] = (held, root, self._loop_depth)
+
+    def _forget_local_ref(self, place: rast.Expr) -> None:
+        """`place` is written, or its address may let it be: if it's a `var`, what
+        it holds is no longer definite."""
+        if isinstance(place, rast.Grouped):
+            self._forget_local_ref(place.expr)
+        elif isinstance(place, rast.Ident) and not self._is_let(place.name):
+            self._local_refs.pop(id(self.locals.get(place.name)), None)
+
+    def _gives_referent(self, arg: rast.Expr, lent: bool, pointee: rast.Type) -> Optional[str]:
+        """The local root `arg` refers to, if it has pointee `pointee`. A `:&`
+        param or a receiver borrows `arg` itself when it's that `T`."""
+        ty = self._quiet_type(arg)
+        root = self._referent(arg)
+        if root is not None and isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = self._resolve_alias(ty.inner)
+        elif lent:
+            root = self._local_root(arg)
+        wanted = self._resolve_alias(pointee)
+        if root is None or self._is_opaque(ty) or self._is_opaque(wanted) \
+                or self._type_str(ty) != self._type_str(wanted):
+            return None
+        return root
+
+    def _call_referent(self, call: rast.Expr) -> Optional[str]:
+        """The local root a call returning `@U` or `@&U` was given a reference to,
+        with pointee `U`: the result may be that reference, so a raw `*U` return,
+        which no reference has to live through, isn't asked."""
+        callee = self._callees.get(id(call))
+        ret = self._resolve_alias(callee[0].ret_type) if callee and callee[0].ret_type else None
+        if not isinstance(ret, rast.RefType):
+            return None
+        sig, skip = callee
+        given = [(arg, i + skip in sig.lent) for i, arg in enumerate(call.args)]
+        if isinstance(call, rast.MethodCall):
+            given.insert(0, (call.expr, True))
+        roots = (self._gives_referent(arg, lent, ret.inner) for arg, lent in given)
+        return next((root for root in roots if root is not None), None)
+
+    def _check_return(self, expr: rast.Expr) -> None:
+        """`expr` is a return value or a tail of one."""
+        root = self._referent(expr)
+        if root is None and isinstance(expr, (rast.Call, rast.MethodCall)):
+            root = self._call_referent(expr)
+        if root is not None and isinstance(self._resolve_alias(self._ret_slot()),
+                                           (rast.PtrType, rast.RefType)):
+            self._report_once(expr, ref_rules.returns_local(root))
 
     @staticmethod
     def _is_null(ty: rast.Type) -> bool:
