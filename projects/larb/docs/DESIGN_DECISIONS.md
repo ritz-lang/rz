@@ -24,6 +24,10 @@ This document captures the finalized design decisions for Ritz, prioritizing **s
 
 ## 1. Ownership & Borrowing (Finalized)
 
+> **Superseded in part.** `x: T` as a const borrow was overtaken by #1854: a by-value
+> parameter of a move-only type takes ownership. The bare `:&` call in §1.2 stands. See
+> [rulings-2026-11.md](../review/4/rulings-2026-11.md), R1.
+
 ### 1.1 Colon-Modifier Syntax
 
 The most ergonomic and visually clean approach:
@@ -319,6 +323,9 @@ var buffer: [1024]u8 = uninit()     # Explicit uninitialized (unsafe intent)
 ---
 
 ## 9. Match Exhaustiveness (Finalized)
+
+> Not yet enforced or in the spec: #2344 implements this. See
+> [rulings-2026-11.md](../review/4/rulings-2026-11.md), R6.
 
 ### 9.1 All Variants Must Be Handled
 
