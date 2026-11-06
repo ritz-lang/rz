@@ -633,7 +633,6 @@ def test_ritz1_unit_type_argument(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "unit_arg", UNIT_TYPE_ARG) == 0
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2273: payload off a call scrutinee")
 def test_ritz1_payload_member_from_call_scrutinee(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "payload_member", PAYLOAD_MEMBER) == 52
 

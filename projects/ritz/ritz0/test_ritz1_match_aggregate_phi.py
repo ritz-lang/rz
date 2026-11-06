@@ -9,8 +9,8 @@ LLVM rejects the IR:
     '%.13' defined with type '%StrView = type { ptr, i64 }' but expected 'i64'
     %.19 = phi i64 [ %.13, %L1 ], [ %.17, %L3 ], [ %.18, %L4 ]
 
-The phi, and its synthesised non-exhaustive fallthrough value, must use the
-arm's real LLVM type. That was the last ritz1 error in `import ritzlib.argspec`.
+The phi must use the arm's real LLVM type. That was the last ritz1 error in
+`import ritzlib.argspec`.
 
 Each program returns 42 when correct and a distinct small code naming the check
 that failed otherwise. ritz0 is the oracle.

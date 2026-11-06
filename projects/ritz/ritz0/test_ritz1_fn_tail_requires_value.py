@@ -323,15 +323,6 @@ RITZ1_EXTRA_ACCEPTED = {
         "                    break\n"
         "            _ => return 1\n"),
     # ritz0 walks the bodies it instantiates, and so does ritz1.
-    # AGAST #2245, the second live path into that `ret <T> 0`: the `match`
-    # counts as diverging, but n == 5 matches no arm and falls through the `if`.
-    "match_with_no_wildcard_in_an_if_arm": (
-        "fn f(n: i64, c: i64) -> i64\n"
-        "    if c > 0\n"
-        "        match n\n"
-        "            0 => return 1\n"
-        "    else\n"
-        "        return 2\n"),
     "generic_that_is_never_instantiated": (
         "fn g<T>(n: T, c: i64) -> T\n"
         "    if c > 0\n"

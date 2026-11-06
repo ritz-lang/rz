@@ -11,10 +11,12 @@
 #     match_body_N:
 #                  ... arm body emitted ...
 #                  br label %match_end
-#     match_next_N: (next arm's test, or fallthrough to end)
+#     match_next_N: (next arm's test, or `unreachable` after the last)
 # - Wildcard/ident arms unconditionally branch to their body (effectively
 #   the catch-all / default). Once we emit an unconditional arm, later
 #   arms become dead code (emitted but unreachable).
+# - match_check_coverage refuses a match that misses (LARB R6, AGAST #2344), so
+#   the block after the last arm is `unreachable`.
 # - `pass` arms emit a zero value for their body result.
 # - Match result is collected via phi over (arm_body_result, arm_exit_label)
 #   pairs so `let x = match ...` works.  The phi is i64 unless an arm yields
@@ -48,6 +50,7 @@ import let_check           # let_check_expr (AGAST #2028)
 import emitter_expr
 import emitter_expr_call     # is_variant_carrier, is_variant_null, resolve_enum_ctx
 import emitter_expr_access   # is_ident_none
+import emitter_print         # interp_is_bool (AGAST #2344)
 import emitter_stmt          # emit_stmt, for block-bodied arms (AGAST #1454)
 import enum_as_int          # enum_as_int_expr (AGAST #2136)
 import ownership            # arm scopes for drops (AGAST #2158)
@@ -62,8 +65,8 @@ struct MatchResult
     labels: *i32   # exit label numbers for each arm's result
     count: i32
     # AGAST #1645: LLVM struct type the arms yield (`%StrView`, `%Point`),
-    # or null when they yield the usual i64 scalar.  The merge phi and the
-    # non-exhaustive fallthrough value are emitted at this type.
+    # or null when they yield the usual i64 scalar.  The merge phi is emitted
+    # at this type.
     agg_name: *u8
     agg_name_len: i32
     # AGAST #1946: TYPE_F32 / TYPE_F64 when the arms yield a float, else 0.
@@ -605,7 +608,7 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
     var always_true: i32 = 0
     let is_enum_match: i32 = (enum_name != null) and (enum_name_len > 0)
 
-    if arm.pattern_kind == PAT_INT_LIT
+    if arm.pattern_kind == PAT_INT_LIT or arm.pattern_kind == PAT_BOOL
         cond_reg = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, cond_reg)
@@ -867,6 +870,284 @@ fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len:
     *out_len = 0
     return 0
 
+# AGAST #2344: the struct `scr` yields, for the shapes resolve_scrutinee_enum
+# leaves out.  It stays strict for its other callers, but a match cannot: `R` in
+# `match a[1]` is a variant or a binding by this type alone, and read as a
+# binding it took the first arm and looked covered.
+fn match_scrutinee_type(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if scr.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, scr.ident_ptr, scr.ident_len)
+        if loc != null
+            if loc.var_type == TYPE_STRUCT
+                *out_name = loc.type_name
+                *out_len = loc.type_name_len
+            return
+        let g: *GlobalVarDef = find_global(s, scr.ident_ptr, scr.ident_len)
+        if g != null and g.var_type == TYPE_STRUCT
+            *out_name = g.type_name
+            *out_len = g.type_name_len
+    else if scr.kind == EXPR_METHOD or scr.kind == EXPR_CALL
+        call_result_struct_name(s, scr, out_name, out_len)
+    else if scr.kind == EXPR_INDEX
+        index_elem_struct_name(s, scr, out_name, out_len)
+    else if scr.kind == EXPR_MEMBER
+        let fld: *StructField = resolve_member_chain_field(s, scr)
+        if fld != null and fld.field_type == TYPE_STRUCT
+            *out_name = fld.field_type_name
+            *out_len = fld.field_type_name_len
+
+# 1 when `scr` is certainly no enum, so a bare name in an arm is a binding or a
+# const.  Anything this cannot prove stays open: see match_arms_enum.
+fn match_scrutinee_is_scalar(s: *EmitterState, scr: *Expr) -> i32
+    let k: i32 = scr.kind
+    if k == EXPR_INT_LIT or k == EXPR_CHAR_LIT or k == EXPR_BINARY
+        return 1
+    if k == EXPR_UNARY
+        return (scr.op != OP_DEREF) as i32
+    if k == EXPR_CAST
+        return (scr.op != TYPE_STRUCT) as i32
+    if k == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, scr.ident_ptr, scr.ident_len)
+        if loc != null
+            return (loc.var_type != TYPE_STRUCT) as i32
+        let g: *GlobalVarDef = find_global(s, scr.ident_ptr, scr.ident_len)
+        if g != null
+            return (g.var_type != TYPE_STRUCT) as i32
+        return (find_const_entry(s, scr.ident_ptr, scr.ident_len) != null) as i32
+    if k == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, scr)
+        return (fd != null and fd.return_type != TYPE_STRUCT) as i32
+    if k == EXPR_MEMBER
+        let fld: *StructField = resolve_member_chain_field(s, scr)
+        return (fld != null and fld.field_type != TYPE_STRUCT) as i32
+    0
+
+fn enum_declares_variant(ei: i32, name: *u8, len: i32) -> i32
+    for vi in 0..enum_variant_count(ei)
+        var vlen: i32 = 0
+        let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+        if name_eq(vname, vlen, name, len) == 1
+            return 1
+    0
+
+# The enum an arm names, for a scrutinee no rule above could type, or -1.  ritz0
+# reads the type off the emitted value and ritz1 cannot, so this is what keeps
+# `R` in `match x as C` from binding: that took the first arm, and looked like a
+# catch-all to coverage.  A scalar scrutinee keeps its bindings.
+fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
+    if match_scrutinee_is_scalar(s, scr) == 1
+        return 0 - 1
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_VARIANT or arm.pattern_kind == PAT_IDENT
+            for ei in 0..enum_count()
+                if enum_declares_variant(ei, arm.pattern_name, arm.pattern_name_len) == 1
+                    return ei
+        arm = arm.next
+    0 - 1
+
+# As resolve_scrutinee_enum, for a match.  Generic enums named only by an arm or
+# by a user `W$i32` are left out: they have no enum struct to spill to, so only
+# coverage reads them.
+fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out_name: **u8, out_len: *i32) -> i32
+    if resolve_scrutinee_enum(s, scr, out_name, out_len) == 1
+        return 1
+    var name: *u8 = null
+    var len: i32 = 0
+    match_scrutinee_type(s, scr, @name, @len)
+    if name != null and (is_tagged_enum_type(name, len) == 1 or is_enum_type(name, len) == 1)
+        *out_name = name
+        *out_len = len
+        return 1
+    *out_name = null
+    *out_len = 0
+    if name == null
+        let ei: i32 = match_arms_enum(s, scr, arms)
+        if ei >= 0 and enum_is_generic(ei) == 0
+            *out_name = enum_name_at(ei, out_len)
+            return 1
+    0
+
+# --- Coverage (LARB R6, AGAST #2344; LANGUAGE_SPEC §8.1) ---------------------
+#
+# ritz0's twin is ritz0/match_coverage.py, and test_match_exhaustive.py holds the
+# two to one table.  The parser refuses guards, so no arm here has one.
+
+# The first name opens the error; `count` says how many went before.
+fn match_gap_name(line: i32, col: i32, count: *i32, name: *u8, len: i32)
+    if *count == 0
+        eprints_cstr(fn_source_file(emitter_current_fn()))
+        eprint_char(':')
+        eprint_i64(line as i64)
+        eprint_char(':')
+        eprint_i64(col as i64)
+        eprints_cstr(c": error: non-exhaustive match: missing ")
+    else
+        eprints_cstr(c", ")
+    eprint_bytes(name, len)
+    *count = *count + 1
+
+fn match_gap_end(s: *EmitterState, count: i32)
+    if count > 0
+        eprints_cstr(c"\n")
+        emit_str(s, c"  ; ERROR: non-exhaustive match\n")
+        s.error_count = s.error_count + 1
+
+# A name that is an integer const compares (§8.2, as emit_match_arm reads it).
+fn match_arm_is_catch_all(s: *EmitterState, arm: *MatchArm) -> i32
+    if arm.pattern_kind == PAT_WILDCARD
+        return 1
+    if arm.pattern_kind != PAT_IDENT
+        return 0
+    let ce: *ConstEntry = find_const_entry(s, arm.pattern_name, arm.pattern_name_len)
+    if ce != null and is_int_const_type(ce.const_type) == 1
+        return 0
+    1
+
+fn match_arms_name(arms: *MatchArm, name: *u8, len: i32) -> i32
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_IDENT or arm.pattern_kind == PAT_VARIANT
+            if name_eq(arm.pattern_name, arm.pattern_name_len, name, len) == 1
+                return 1
+        arm = arm.next
+    0
+
+# Every variant of enum `ei`, in declaration order.  A name that is no variant
+# here is a binding, and so a catch-all.
+fn match_check_enum(s: *EmitterState, arms: *MatchArm, ei: i32, line: i32, col: i32)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_WILDCARD
+            return
+        if arm.pattern_kind == PAT_IDENT and enum_declares_variant(ei, arm.pattern_name, arm.pattern_name_len) == 0
+            return
+        arm = arm.next
+    var count: i32 = 0
+    for vi in 0..enum_variant_count(ei)
+        var vlen: i32 = 0
+        let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+        if match_arms_name(arms, vname, vlen) == 0
+            match_gap_name(line, col, @count, vname, vlen)
+    match_gap_end(s, count)
+
+fn match_check_bool(s: *EmitterState, arms: *MatchArm, line: i32, col: i32)
+    var has_true: i32 = 0
+    var has_false: i32 = 0
+    var arm: *MatchArm = arms
+    while arm != null
+        if match_arm_is_catch_all(s, arm) == 1
+            return
+        if arm.pattern_kind == PAT_BOOL
+            if arm.pattern_int == 1
+                has_true = 1
+            else
+                has_false = 1
+        arm = arm.next
+    var count: i32 = 0
+    if has_true == 0
+        match_gap_name(line, col, @count, c"true", 4)
+    if has_false == 0
+        match_gap_name(line, col, @count, c"false", 5)
+    match_gap_end(s, count)
+
+fn match_check_scalar(s: *EmitterState, arms: *MatchArm, line: i32, col: i32)
+    var arm: *MatchArm = arms
+    while arm != null
+        if match_arm_is_catch_all(s, arm) == 1
+            return
+        arm = arm.next
+    var count: i32 = 0
+    match_gap_name(line, col, @count, c"a catch-all", 11)
+    match_gap_end(s, count)
+
+# Option and Result need no import, so the enum tracker may never have seen them.
+const MATCH_OPTION: i32 = 1
+const MATCH_RESULT: i32 = 2
+
+# Which of them an arm names, or 0.
+fn match_arms_builtin(arms: *MatchArm) -> i32
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_VARIANT or arm.pattern_kind == PAT_IDENT
+            if name_eq(arm.pattern_name, arm.pattern_name_len, c"Some", 4) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"None", 4) == 1
+                return MATCH_OPTION
+            if name_eq(arm.pattern_name, arm.pattern_name_len, c"Ok", 2) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"Err", 3) == 1
+                return MATCH_RESULT
+        arm = arm.next
+    0
+
+# Both variants of `a`/`b`, for Option or Result with no tracked declaration.
+fn match_check_pair(s: *EmitterState, arms: *MatchArm, a: *u8, a_len: i32, b: *u8, b_len: i32, line: i32, col: i32)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_WILDCARD
+            return
+        if arm.pattern_kind == PAT_IDENT
+            if name_eq(arm.pattern_name, arm.pattern_name_len, a, a_len) == 0 and name_eq(arm.pattern_name, arm.pattern_name_len, b, b_len) == 0
+                return
+        arm = arm.next
+    var count: i32 = 0
+    if match_arms_name(arms, a, a_len) == 0
+        match_gap_name(line, col, @count, a, a_len)
+    if match_arms_name(arms, b, b_len) == 0
+        match_gap_name(line, col, @count, b, b_len)
+    match_gap_end(s, count)
+
+# The enum a `Name$args` instantiation, or a plain name, was declared as.
+fn match_enum_index(name: *u8, len: i32) -> i32
+    var base: i32 = 0
+    while base < len and *(name + base) != '$'
+        base = base + 1
+    enum_find(name, base)
+
+fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name: *u8, enum_name_len: i32, line: i32, col: i32)
+    var name: *u8 = enum_name
+    var len: i32 = enum_name_len
+    if name == null
+        match_scrutinee_type(s, scrutinee, @name, @len)
+    var ei: i32 = 0 - 1
+    if name != null
+        ei = match_enum_index(name, len)
+    if ei < 0
+        ei = match_arms_enum(s, scrutinee, arms)
+    var builtin: i32 = 0
+    if ei < 0
+        if name != null and is_tagged_enum_type(name, len) == 1
+            builtin = MATCH_RESULT
+            if *name == 'O'
+                builtin = MATCH_OPTION
+        else if match_scrutinee_is_scalar(s, scrutinee) == 0
+            builtin = match_arms_builtin(arms)
+    var is_bool: i32 = 0
+    if ei < 0 and builtin == 0
+        is_bool = interp_is_bool(s, scrutinee)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_BOOL and is_bool == 0
+            eprints_cstr(fn_source_file(emitter_current_fn()))
+            eprint_char(':')
+            eprint_i64(arm.bool_span.line as i64)
+            eprint_char(':')
+            eprint_i64(arm.bool_span.col as i64)
+            eprints_cstr(c": error: a `true` or `false` pattern needs a bool scrutinee\n")
+            emit_str(s, c"  ; ERROR: bool pattern on a non-bool scrutinee\n")
+            s.error_count = s.error_count + 1
+            return
+        arm = arm.next
+    if ei >= 0
+        match_check_enum(s, arms, ei, line, col)
+    else if builtin == MATCH_OPTION
+        match_check_pair(s, arms, c"Some", 4, c"None", 4, line, col)
+    else if builtin == MATCH_RESULT
+        match_check_pair(s, arms, c"Ok", 2, c"Err", 3, line, col)
+    else if is_bool == 1
+        match_check_bool(s, arms, line, col)
+    else
+        match_check_scalar(s, arms, line, col)
+
 # AGAST #2140: 1 when the scrutinee is a borrow, `@place` / `@&place`.
 fn match_scrutinee_is_addr(scr: *Expr) -> i32
     if scr.kind == EXPR_UNARY and (scr.op == OP_ADDR or scr.op == OP_ADDR_MUT) and scr.operand != null
@@ -875,7 +1156,7 @@ fn match_scrutinee_is_addr(scr: *Expr) -> i32
 
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
-fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
+fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
     let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
     # Detect whether the scrutinee is a tagged-enum struct; if so, spill
     # it into an alloca once so every arm can GEP the same pointer.
@@ -889,17 +1170,24 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
     # Without this `@o` was a scalar: `Some(x)` compared the ADDRESS to 0.
     let is_addr: i32 = match_scrutinee_is_addr(scrutinee)
     var is_enum: i32 = 0
+    var typed: *Expr = scrutinee
     if is_addr == 1
-        is_enum = resolve_scrutinee_enum(s, scrutinee.operand, @enum_name, @enum_name_len)
-    else
-        is_enum = resolve_scrutinee_enum(s, scrutinee, @enum_name, @enum_name_len)
+        typed = scrutinee.operand
+    is_enum = resolve_match_enum(s, typed, arms, @enum_name, @enum_name_len)
+    match_check_coverage(s, typed, arms, enum_name, enum_name_len, span.line, span.col)
+    # AGAST #2344: an enum element or global is a place too.  emit_expr reads
+    # `a[1]` and `g` as scalars, whatever their type.
+    var from_place: i32 = is_addr
+    if is_enum == 1
+        if typed.kind == EXPR_INDEX or (typed.kind == EXPR_IDENT and find_local_struct_name(s, typed.ident_ptr, typed.ident_len) == null)
+            from_place = 1
 
     # Evaluate scrutinee.  For `@place` the place's own address (a `ptr`;
     # `@expr` as a value is a ptrtoint'd i64) is the slot.
     var scrut_reg: i32 = 0
     var scrut_slot: i32 = 0
-    if is_enum == 1 and is_addr == 1
-        scrut_slot = emit_lvalue_ptr(s, scrutinee.operand)
+    if is_enum == 1 and from_place == 1
+        scrut_slot = emit_lvalue_ptr(s, typed)
         if scrut_slot < 0
             emit_ir_error(s, c"cannot take address of match scrutinee")
             return 0
@@ -913,7 +1201,7 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
         emit_str(s, c"  ; match @place\n")
     else
         scrut_reg = emit_expr(s, scrutinee)
-    if is_enum == 1 and is_addr == 0
+    if is_enum == 1 and from_place == 0
         scrut_slot = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, scrut_slot)
@@ -956,11 +1244,8 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
         idx = idx + 1
     own_arms_end(s, own_before, own_acc)
 
-    # Current block is the last "next" block — it has no matching arm, so
-    # fall through to match end with a default value. This is the
-    # non-exhaustive safety net.  The default is the zero constant of the
-    # phi's type (`0`, `0.0`, or `zeroinitializer` for struct-valued arms,
-    # AGAST #1645 / #1946), written straight into the phi below.
+    # Current block is the last "next" block: no arm matched, and coverage has
+    # ruled that out (AGAST #2344), so it ends in `unreachable`.
     # AGAST #1666: publish the phi type for an untyped `let v = match ...`.
     # Set after every arm (nested matches inside arms included) so the
     # outermost match's type is what the enclosing let sees.
@@ -974,33 +1259,23 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
         s.last_match_agg_name_len = 0
         s.last_match_float_ty = 0
         match_void_arms_settle(s, @result, wants_value)   # AGAST #2046
-        emit_str(s, c"  br label %")
-        emit_label(s, end_label)
-        emit_str(s, c"\n")
+        emit_str(s, c"  unreachable\n")
         begin_block(s, end_label)
         own_match_end(s, own_old)
         return 0
-    var fallthrough_reg: i32 = 0
-    if result.count == 0
-        # No arm phi: the match's value is this register itself.
-        fallthrough_reg = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, fallthrough_reg)
-        emit_str(s, c" = add i64 0, 0  ; match: non-exhaustive fallthrough\n")
-    let fallthrough_label: i32 = s.current_label
-    emit_str(s, c"  br label %")
-    emit_label(s, end_label)
-    emit_str(s, c"\n")
+    emit_str(s, c"  unreachable\n")
 
-    # End block with phi over all arm results + fallthrough
+    # End block with phi over all arm results: ( arm_result, arm_exit_label ).
     begin_block(s, end_label)
 
-    # Emit phi: ( arm_result, arm_exit_label ) for each recorded arm,
-    # plus ( fallthrough_reg, fallthrough_label ) at the end.
     if result.count == 0
-        # No arms — return fallthrough value
+        # No arm phi: the match's value is this register itself.
+        let no_arm_reg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, no_arm_reg)
+        emit_str(s, c" = add i64 0, 0  ; match: no arm yields a value\n")
         own_match_end(s, own_old)
-        return fallthrough_reg
+        return no_arm_reg
 
     let phi_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -1018,12 +1293,7 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm) -> i32
         emit_label(s, result.labels[i])
         emit_str(s, c" ]")
         i = i + 1
-    # Add fallthrough entry
-    emit_str(s, c", [ ")
-    emit_match_phi_value(s, @result, MATCH_ZERO_VALUE)
-    emit_str(s, c", %")
-    emit_label(s, fallthrough_label)
-    emit_str(s, c" ]\n")
+    emit_str(s, c"\n")
     own_match_end(s, own_old)
     return phi_reg
 

@@ -16,6 +16,8 @@ from llvmlite import ir
 import ritz_ast as rast
 from monomorph import resolve_alias_in
 from tail_value import slot_tails, value_gap
+import match_coverage
+from metadata import type_to_string
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
@@ -13104,6 +13106,17 @@ class LLVMEmitter:
         raise NotImplementedError(f"Match on type {match_val.type} not yet supported")
 
     @staticmethod
+    def _require_covered(expr: rast.Match, gap: List[str]) -> None:
+        """Refuse a match that misses something (LARB R6, AGAST #2344).
+
+        Every switch below then has an `unreachable` default that really is
+        unreachable. Before this a miss ran the last arm: LLVM folds such a
+        default into a case, so `f(5)` silently took `1 => 2`.
+        """
+        if gap:
+            raise EmitError(f"non-exhaustive match: missing {', '.join(gap)}", expr.span)
+
+    @staticmethod
     def _int_const_fits(const: ir.Constant, width: int) -> bool:
         """True if integer constant `const` is representable in `width` bits.
 
@@ -13287,6 +13300,8 @@ class LLVMEmitter:
     def _emit_union_match(self, expr: rast.Match, union_val: ir.Value, union_name: str) -> ir.Value:
         """Emit a match on a union type with TypePattern arms."""
         union_type, variants = self.union_types[union_name]
+        self._require_covered(expr, match_coverage.union_gap(
+            expr.arms, variants, self._types_equal, type_to_string))
 
         # Store union to memory so we can extract tag and data
         union_alloca = self.builder.alloca(union_type, name="match.union")
@@ -13411,6 +13426,8 @@ class LLVMEmitter:
             7. Phi node for result
         """
         enum_type, variants = self.enum_types[enum_name]
+        self._require_covered(expr, match_coverage.enum_gap(
+            expr.arms, [variant.name for variant in variants]))
 
         # Store enum to memory so we can extract tag and data. Matching on a
         # place (`match self.cmap`) can hand us a pointer to the enum rather
@@ -13689,6 +13706,14 @@ class LLVMEmitter:
         and a default case for wildcard/identifier patterns.
         """
         int_type = match_val.type
+        is_bool = int_type == self.i1
+        for arm in expr.arms:
+            if (not is_bool and isinstance(arm.pattern, rast.LitPattern)
+                    and isinstance(arm.pattern.value, bool)):
+                raise EmitError("a `true` or `false` pattern needs a bool scrutinee",
+                                arm.pattern.span)
+        gap = match_coverage.bool_gap if is_bool else match_coverage.scalar_gap
+        self._require_covered(expr, gap(expr.arms, self.constants))
 
         # Create blocks for each arm and the merge block
         arm_blocks = []

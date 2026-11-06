@@ -1237,6 +1237,67 @@ fn main() -> i32
     describe(x) as i32
 ```
 
+Every `match`, statement or value, must cover its scrutinee, or it is a compile
+error naming what is missing. A `match` covers its scrutinee when it has:
+
+- an unguarded `_` or binding arm; or
+- for an enum, generic enums included, an arm for every variant; or
+- for a `bool`, both `true` and `false`; or
+- for a union, an arm for every member.
+
+An integer or string scrutinee needs a catch-all. A guarded arm never counts
+towards coverage, though no guard parses yet.
+
+```ritz expect-error="non-exhaustive match: missing a catch-all"
+fn f(n: i64) -> i64
+    match n
+        0 => 1
+        1 => 2
+
+fn main() -> i32
+    f(5) as i32
+```
+
+Missing variants are named in declaration order:
+
+```ritz expect-error="non-exhaustive match: missing Green, Blue"
+enum Color
+    Red
+    Green
+    Blue
+
+fn f(c: Color) -> i32
+    match c
+        Red => 1
+
+fn main() -> i32
+    f(Color.Red)
+```
+
+A `bool` is covered by `true` and `false`, not by the integers `1` and `0`:
+
+```ritz expect-error="non-exhaustive match: missing false"
+fn f(b: bool) -> i32
+    match b
+        true => 1
+
+fn main() -> i32
+    f(true)
+```
+
+A name that is an integer `const` compares (see Constant Patterns), so it is no
+catch-all, and a statement `match` is held to the same rule:
+
+```ritz expect-error="non-exhaustive match: missing a catch-all"
+const A: i64 = 0
+
+fn main() -> i32
+    let n: i64 = 5
+    match n
+        A => pass
+    0
+```
+
 ### 8.2 Patterns
 
 #### Literal Patterns
@@ -1438,8 +1499,9 @@ significant — reordering fields changes the layout, just as it does in a
 `Option<T>` and `Result<T, E>` are defined in `ritzlib.option` and
 `ritzlib.result` respectively; import them rather than redeclaring them.
 
-For the full treatment — memory layout, exhaustiveness rules and the design
-rationale — see [`docs/ENUM_VARIANTS.md`](ENUM_VARIANTS.md).
+A `match` on an enum must cover every variant (§8.1). For the full treatment —
+memory layout and the design rationale — see
+[`docs/ENUM_VARIANTS.md`](ENUM_VARIANTS.md).
 
 ### 10.2 Usage
 
