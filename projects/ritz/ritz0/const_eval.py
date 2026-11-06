@@ -7,7 +7,7 @@ Evaluates compile-time constant expressions for use in:
 - const fn evaluation (future)
 """
 
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Iterable, Optional, Union
 import ritz_ast as rast
 
 
@@ -30,17 +30,38 @@ class ConstEvaluator:
     `/` and `%` truncate toward zero, as the generated sdiv/srem do.
     """
 
-    def __init__(self, constants: Optional[Dict[str, int]] = None):
+    def __init__(self, constants: Optional[Dict[str, int]] = None,
+                 u64_names: Iterable[str] = ()):
         """Initialize with known constants.
 
         Args:
             constants: Dict mapping constant names to their values
+            u64_names: The names among them declared `u64`
         """
         self.constants: Dict[str, int] = constants or {}
+        self.u64_names = frozenset(u64_names)
 
     def add_constant(self, name: str, value: int) -> None:
         """Register a constant for use in expressions."""
         self.constants[name] = value
+
+    def _is_u64(self, expr: rast.Expr) -> bool:
+        """Is `expr` a u64? The emitter's _int_shape, for the width a fold can
+        lose: a literal only a u64 can hold, a u64 const, `as u64`, and any
+        operator over those. A shift's count does not count (#2356)."""
+        if isinstance(expr, rast.IntLit):
+            return expr.value >= 1 << 63
+        if isinstance(expr, rast.Ident):
+            return expr.name in self.u64_names
+        if isinstance(expr, rast.Cast):
+            return getattr(expr.target, 'name', None) == 'u64'
+        if isinstance(expr, rast.UnaryOp):
+            return self._is_u64(expr.operand)
+        if isinstance(expr, rast.BinOp):
+            if expr.op in ('<<', '>>'):
+                return self._is_u64(expr.left)
+            return self._is_u64(expr.left) or self._is_u64(expr.right)
+        return False
 
     def evaluate(self, expr: rast.Expr) -> int:
         """Evaluate a constant expression to an integer.
@@ -112,6 +133,9 @@ class ConstEvaluator:
             elif op == '>>':
                 if right < 0:
                     raise ConstEvalError("Negative shift amount in constant expression")
+                # A folded u64 is kept in its signed form (#2356).
+                if self._is_u64(expr.left):
+                    left &= (1 << 64) - 1
                 return left >> right
             elif op == '&':
                 return left & right

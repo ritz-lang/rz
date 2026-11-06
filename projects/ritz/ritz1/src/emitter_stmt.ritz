@@ -94,6 +94,22 @@ fn let_holds_shared_ref(s: *EmitterState, stmt: *Stmt) -> i32
         return 1
     src.holds_shared_ref
 
+# AGAST #2356: 1 for an unannotated `let x = init` whose init is a u64, which the
+# parser's i64 default would make `x >> n` sign-fill.  A bare literal stays i64,
+# as it does on ritz0, and a float expression is not an integer at all.
+fn inferred_u64_init(s: *EmitterState, stmt: *Stmt) -> i32
+    if stmt.var_declared_type != TYPE_VOID or stmt.var_init == null
+        return 0
+    if stmt.var_init.kind == EXPR_INT_LIT
+        return 0
+    let t: i32 = get_expr_type(s, stmt.var_init)
+    if t == TYPE_F32 or t == TYPE_F64
+        return 0
+    var uns: i32 = 0
+    if int_operand_shape(s, stmt.var_init, @uns) == 64
+        return uns
+    0
+
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     let shared_ref: i32 = let_holds_shared_ref(s, stmt)
     # Use the user's explicit type annotation. The parser defaults
@@ -102,6 +118,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # otherwise `var best_type: i32 = -1` stores i32 into an i64 slot,
     # and callers reading i64 see garbage in the upper half.
     check_implicit_narrowing(s, stmt)   # AGAST #1364
+    # AGAST #2356: as below, before `x` is in scope.
+    let init_u64: i32 = inferred_u64_init(s, stmt)
     # AGAST #2342: before `x` is in scope, as `let x: bool = x`.
     var init_kind: i32 = BK_UNSURE
     if stmt.var_init != null
@@ -739,6 +757,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     if inferred_unsure == 1 and s.local_count > 0
         let unsure_loc: *LocalVar = local_at(s, s.local_count - 1)
         unsure_loc.bk_unsure = 1
+    if init_u64 == 1 and var_type == TYPE_I64
+        declared.var_type = TYPE_U64
 
     if stmt.var_init != null and stmt.var_array_shape != null
         # AGAST #1509: no initializer form of a multi-dimensional array is

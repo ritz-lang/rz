@@ -311,6 +311,12 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     if lty == TYPE_U64 or rty == TYPE_U64
         uns = 1
 
+    # AGAST #2356: `>>` follows the left operand alone, never the count.
+    var shr_uns: i32 = 0
+    if e.op == OP_SHR
+        let shr_bits: i32 = int_operand_shape(s, e.left, @shr_uns)
+        left_reg = emit_shr_operand(s, e.left, left_reg, shr_bits, shr_uns)
+
     # AGAST #1869: a failing `assert a OP b` prints the two operands, as the
     # i64s this compare reads (not a re-evaluation; see emit_assert_stmt).
     # The float path above records nothing, so its asserts print no values.
@@ -378,7 +384,10 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     else if e.op == OP_SHL
         emit_str(s, c"shl i64 ")
     else if e.op == OP_SHR
-        emit_str(s, c"lshr i64 ")  # Logical shift right (unsigned)
+        if shr_uns == 1
+            emit_str(s, c"lshr i64 ")
+        else
+            emit_str(s, c"ashr i64 ")
     else
         emit_str(s, c"add i64 ")
 
@@ -397,6 +406,181 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         return ext_result
 
     return result
+
+# AGAST #2356: the width in bits of integer expression `e`, with *uns set if it
+# is unsigned.  get_expr_type says a binary has its left operand's type, which
+# would make `(1 + a) >> 1` signed for `a: u64`.  Here the wider operand wins, at
+# equal width the unsigned one does (as #1604 has it for `/` and `<`), and a
+# shift keeps its left operand's signedness.  A literal is an i64, unless only a
+# u64 can hold it, in which case the lexer has wrapped it negative: `-8` is a
+# negated literal.  This is ritz0's _int_shape.
+pub fn int_operand_shape(s: *EmitterState, e: *Expr, uns: *i32) -> i32
+    *uns = 0
+    if e.kind == EXPR_INT_LIT
+        if e.int_val < 0
+            *uns = 1
+        return 64
+    if e.kind == EXPR_UNARY and (e.op == OP_NEG or e.op == OP_BIT_NOT)
+        return int_operand_shape(s, e.operand, uns)
+    if e.kind == EXPR_BINARY and is_int_arith_op(e.op) == 1
+        var lu: i32 = 0
+        var ru: i32 = 0
+        let lb: i32 = int_operand_shape(s, e.left, @lu)
+        let rb: i32 = int_operand_shape(s, e.right, @ru)
+        if e.op == OP_SHL or e.op == OP_SHR
+            *uns = lu
+            if rb > lb
+                return rb
+            return lb
+        if lb > rb
+            *uns = lu
+            return lb
+        if rb > lb
+            *uns = ru
+            return rb
+        *uns = lu | ru
+        return lb
+    # A compare or `and` is a bool in an i64, whatever its operands are.
+    if e.kind == EXPR_BINARY
+        return 64
+    let t: i32 = int_leaf_type(s, e)
+    if t == TYPE_U64
+        *uns = 1
+        return 64
+    var signed: i32 = 1
+    let bits: i32 = type_code_scalar_bits(t, @signed)
+    *uns = 1 - signed
+    bits
+
+# The declared type of a non-operator expression.  get_expr_type answers what its
+# callers need, whether a value is a float or a pointer, so a u64 array element,
+# const or method result is the i64 it is held in.  Every one of those is a u64
+# that an `ashr` would sign-fill, so the forms it can't type are resolved here.
+fn int_leaf_type(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_IDENT
+        if find_local_idx(s, e.ident_ptr, e.ident_len) < 0 and find_global(s, e.ident_ptr, e.ident_len) == null
+            let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+            if ce != null
+                return ce.const_type
+    else if e.kind == EXPR_INDEX and (e.right == null or e.right.kind != EXPR_RANGE)
+        let et: i32 = indexed_elem_type(s, e.left)
+        if et != TYPE_UNKNOWN
+            return et
+    else if e.kind == EXPR_MEMBER and e.left != null
+        # `x[i].f` and `(*p).f`: a field of the element's or pointee's struct.
+        var sn: *u8 = null
+        var sl: i32 = 0
+        if e.left.kind == EXPR_INDEX
+            index_elem_struct_name(s, e.left, @sn, @sl)
+        else if e.left.kind == EXPR_UNARY and e.left.op == OP_DEREF
+            deref_member_base_struct_name(s, e.left.operand, @sn, @sl)
+        if sl > 0
+            let st: *StructDef = find_struct(s, sn, sl)
+            if st != null
+                let fi: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+                if fi >= 0
+                    let ef: *StructField = get_field_type(st, fi)
+                    return ef.field_type
+    else if e.kind == EXPR_METHOD
+        let mt: i32 = user_method_ret_type(s, e)
+        if mt != TYPE_UNKNOWN
+            return mt
+    else if e.kind == EXPR_CALL
+        # A call through a `fn(...) -> T` local.
+        let lv: *LocalVar = find_local_struct_name(s, e.func_name, e.func_name_len)
+        if lv != null and lv.fn_sig != null
+            return lv.fn_sig.return_type
+    get_expr_type(s, e)
+
+# The element type of array or pointer `base`, for what get_expr_type leaves at
+# i64: a `[N]T` local, global or const, and an array or `*T` field.
+fn indexed_elem_type(s: *EmitterState, base: *Expr) -> i32
+    if base.kind == EXPR_IDENT
+        let lv: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+        if lv != null
+            if lv.var_type == TYPE_ARRAY
+                return lv.array_elem_type
+            return vec_name_elem_type(lv.type_name, lv.type_name_len)
+        let g: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
+        if g != null
+            if g.var_type == TYPE_ARRAY
+                return g.array_elem_type
+            return TYPE_UNKNOWN
+        let ce: *ConstEntry = find_const_entry(s, base.ident_ptr, base.ident_len)
+        if ce != null and ce.const_type == TYPE_ARRAY
+            return ce.array_elem_type
+    else if base.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, base)
+        if f != null
+            if f.field_type == TYPE_ARRAY
+                return f.array_elem_type
+            let vt: i32 = vec_name_elem_type(f.field_type_name, f.field_type_name_len)
+            if vt != TYPE_UNKNOWN
+                return vt
+            return ptr_field_elem_kind(f)
+    TYPE_UNKNOWN
+
+# The integer element of monomorphised `Vec$T` (`v[i]` is the index sugar), or
+# TYPE_UNKNOWN for any other name.
+fn vec_name_elem_type(name: *u8, len: i32) -> i32
+    if name == null or len < 6 or *name != 'V' or *(name + 1) != 'e' or *(name + 2) != 'c' or *(name + 3) != '$'
+        return TYPE_UNKNOWN
+    let en: *u8 = name + 4
+    let el: i32 = len - 4
+    if name_eq(en, el, c"u8", 2) == 1
+        return TYPE_U8
+    if name_eq(en, el, c"i8", 2) == 1
+        return TYPE_I8
+    if name_eq(en, el, c"u16", 3) == 1
+        return TYPE_U16
+    if name_eq(en, el, c"i16", 3) == 1
+        return TYPE_I16
+    if name_eq(en, el, c"u32", 3) == 1
+        return TYPE_U32
+    if name_eq(en, el, c"i32", 3) == 1
+        return TYPE_I32
+    if name_eq(en, el, c"u64", 3) == 1
+        return TYPE_U64
+    TYPE_UNKNOWN
+
+fn is_int_arith_op(op: i32) -> i32
+    if op == OP_ADD or op == OP_SUB or op == OP_MUL or op == OP_DIV or op == OP_MOD
+        return 1
+    if op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR or op == OP_SHL or op == OP_SHR
+        return 1
+    0
+
+# AGAST #2356: a register holds an i64, so `a + a` or `~a` on a u8 can sit outside
+# the u8's range, and the bits a `>>` brings down would be ones the type does not
+# have.  Bring such a value back to its type.  Only an operator can leave the
+# range: a name, load, call or cast is already extended from its width.
+fn emit_shr_operand(s: *EmitterState, e: *Expr, reg: i32, bits: i32, uns: i32) -> i32
+    if bits >= 64
+        return reg
+    if e.kind != EXPR_BINARY and e.kind != EXPR_UNARY
+        return reg
+    if e.kind == EXPR_UNARY and e.op != OP_NEG and e.op != OP_BIT_NOT
+        return reg
+    let low: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, low)
+    emit_str(s, c" = trunc i64 ")
+    emit_reg(s, reg)
+    emit_str(s, c" to i")
+    emit_int(s, bits as i64)
+    emit_str(s, c"\n")
+    let wide: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, wide)
+    if uns == 1
+        emit_str(s, c" = zext i")
+    else
+        emit_str(s, c" = sext i")
+    emit_int(s, bits as i64)
+    emit_str(s, c" ")
+    emit_reg(s, low)
+    emit_str(s, c" to i64\n")
+    wide
 
 # AGAST #1660 — `reg` (the value of `operand`) as an i64.  A unit-enum
 # operand's `%Kind` aggregate becomes its zero-extended i8 tag; any other

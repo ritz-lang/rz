@@ -1213,6 +1213,32 @@ let shr = a >> 1
 Both operands are integers, and so is the operand of `~`. A `bool` is rejected,
 even with another `bool`: use `and`, `or` and `not`.
 
+`>>` is decided by the type of its left operand alone. On a signed type it is
+arithmetic, filling from the sign bit, so it rounds toward negative infinity. On
+an unsigned type it is logical, filling with zeros. The count's type has no say:
+
+```ritz body
+let a: i64 = -8
+let b: u8 = 248
+let n: u64 = 1
+let c = a >> 1    # -4
+let d = b >> 1    # 124
+let e = a >> n    # -4: `a` is signed, whatever `n` is
+```
+
+An expression on the left has the type of its operands. The wider operand wins,
+at equal width the unsigned one does, and a shift keeps its left operand's
+signedness. So with `h: u64`, `(h ^ 1) >> 33` is logical. A literal is an `i64`,
+unless its value only fits a `u64`: `0xF000000000000000 >> 60` is `15`. A constant
+expression shifts by the same rule.
+
+The left operand is a value of its type, so with `a: u8` the sum in `(a + a) >> 1`
+wraps at 8 bits first. Where a literal operand meets a narrower declared slot,
+as in `let r: u8 = (a << 4) >> 4`, the width is not yet settled (AGAST #2360).
+
+A count that is negative, or not less than the bit width of the left operand's
+type, has no defined result.
+
 Bitwise operators bind looser than `==`, so `x & 1 == 1` is `x & (1 == 1)`, which
 is an error. Parenthesise it:
 

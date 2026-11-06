@@ -1914,7 +1914,7 @@ class LLVMEmitter:
             if isinstance(cval, int) and isinstance(cty, ir.IntType)
         }
         try:
-            value = ConstEvaluator(known).evaluate(expr)
+            value = ConstEvaluator(known, self._u64_const_names()).evaluate(expr)
         except ConstEvalError as e:
             raise EmitError(
                 f"const '{name}': element {index} is not a constant integer "
@@ -1926,6 +1926,11 @@ class LLVMEmitter:
             # and keep the signed form llvmlite prints.
             value = self._wrap_to_int_type(value, elem_type)
         return value
+
+    def _u64_const_names(self) -> List[str]:
+        """The consts declared `u64`, which a fold must not read as signed."""
+        return [n for n, t in self.const_ritz_types.items()
+                if isinstance(t, rast.NamedType) and t.name == 'u64']
 
     @staticmethod
     def _wrap_to_int_type(value: int, ty: ir.IntType) -> int:
@@ -1958,7 +1963,7 @@ class LLVMEmitter:
             stuck = []
             for item, ty in pending:
                 try:
-                    value = ConstEvaluator(known).evaluate(item.value)
+                    value = ConstEvaluator(known, self._u64_const_names()).evaluate(item.value)
                 except ConstEvalError:
                     stuck.append((item, ty))
                     continue
@@ -7903,8 +7908,9 @@ class LLVMEmitter:
                 # Left shift: left << right
                 return self.builder.shl(left, right)
             elif op == '>>':
-                # Right shift: use logical shift (lshr) for unsigned, arithmetic (ashr) for signed
-                if self._infer_unsigned_expr(expr.left):
+                # Logical on an unsigned left operand, arithmetic on a signed
+                # one; the count has no say (#2356).
+                if self._int_shape(expr.left, left.type.width < 64)[1]:
                     return self.builder.lshr(left, right)
                 return self.builder.ashr(left, right)
             else:
@@ -13035,11 +13041,50 @@ class LLVMEmitter:
                 return rast.NamedType(ty.span, suffix, [])
         return None
 
+    _INT_ARITH_OPS = ('+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>')
+
     def _is_unsigned_type(self, ty: rast.Type) -> bool:
         """Check if a Ritz type is unsigned."""
         if isinstance(ty, rast.NamedType):
             return ty.name in ('u8', 'u16', 'u32', 'u64')
         return False
+
+    def _int_shape(self, expr: rast.Expr, narrowed: bool) -> Tuple[int, bool]:
+        """`(bits, unsigned)` of integer expression `expr`, for `>>` (#2356).
+
+        _infer_unsigned_expr has no arm for an operator, so `(h ^ x) >> 33` on a
+        u64 sign-filled. The wider operand wins, at equal width the unsigned one
+        does, and a shift keeps its left operand's signedness. A literal is an
+        i64, unless only a u64 can hold it, or `narrowed` says the emitted value
+        is narrower than 64 bits, which means _retype_literal_operand gave the
+        literal its sibling's type. ritz1's int_operand_shape is this.
+        """
+        if isinstance(expr, rast.IntLit):
+            return 64, expr.value >= 1 << 63
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
+            return self._int_shape(expr.operand, narrowed)
+        if isinstance(expr, rast.BinOp) and expr.op in self._INT_ARITH_OPS:
+            if narrowed and isinstance(expr.right, rast.IntLit):
+                return self._int_shape(expr.left, narrowed)
+            if narrowed and isinstance(expr.left, rast.IntLit):
+                return self._int_shape(expr.right, narrowed)
+            lbits, lunsigned = self._int_shape(expr.left, narrowed)
+            rbits, runsigned = self._int_shape(expr.right, narrowed)
+            if expr.op in ('<<', '>>'):
+                return max(lbits, rbits), lunsigned
+            if lbits != rbits:
+                return (lbits, lunsigned) if lbits > rbits else (rbits, runsigned)
+            return lbits, lunsigned or runsigned
+        ty = self._infer_ritz_type(expr)
+        if isinstance(ty, rast.RefType):       # `*r` with `r: @T`
+            ty = ty.inner
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            callee = self.ritz_types.get(expr.func.name)
+            if isinstance(callee, rast.FnType):
+                ty = callee.ret
+        name = ty.name if isinstance(ty, rast.NamedType) else None
+        unsigned = self._is_unsigned_type(ty) or self._infer_unsigned_expr(expr)
+        return self._INT_TYPE_WIDTHS.get(name, 64), unsigned
 
     def _infer_unsigned_expr(self, expr: rast.Expr) -> bool:
         """Check if an expression produces an unsigned integer type.
