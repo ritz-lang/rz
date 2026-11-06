@@ -1,0 +1,323 @@
+# ritz1/src/literal_slot.ritz - a literal takes its type from its slot (LARB R3)
+#
+# AGAST #2341.  `"..."` is StrView by default and `*u8` in any `*u8` slot, and
+# nothing else reaches `*u8`: a non-literal StrView and a String are errors, with
+# or without `as`.  A literal that can't be its slot's type is an error wherever
+# it is, and a non-literal array element narrows only under section 7.5.
+#
+# This is ritz0's `_literal_into_slot`, and ritz0/test_string_literal_slots.py
+# feeds the same tables to both.  A slot is a type kind and, for a pointer, its
+# pointee, read off whatever declared it.  A literal in a `*u8` slot is rewritten
+# to EXPR_CSTRING_LIT in place, so every later pass sees a plain `c"..."`: this
+# runs before the value is emitted, at each slot bool_check also visits.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import narrowing
+import bool_check
+
+fn lit_report(s: *EmitterState, e: *Expr) -> i32
+    bool_report_at(s, e)
+
+fn lit_report_str(s: *EmitterState, e: *Expr, is_string: i32)
+    if lit_report(s, e) == 1
+        if is_string == 1
+            eprints_cstr(c"a String is not a `*u8`: write `string_as_ptr(@&s)`\n")
+        else
+            eprints_cstr(c"a StrView is not a `*u8`: only a string literal converts; write `.ptr` if you know it is NUL-terminated\n")
+
+# `e` is a tail landing in a `*u8` slot.
+fn lit_into_ptr(s: *EmitterState, e: *Expr)
+    if e.kind == EXPR_STRING_LIT
+        e.kind = EXPR_CSTRING_LIT
+        return
+    if get_expr_type(s, e) != TYPE_STRUCT
+        return
+    var name: *u8 = null
+    var len: i32 = 0
+    resolve_expr_struct_name(s, e, @name, @len)
+    lit_refuse_named(s, e, name, len)
+
+# `e`, of the struct type `name`, lands in a `*u8` slot.
+fn lit_refuse_named(s: *EmitterState, e: *Expr, name: *u8, len: i32)
+    if name_eq(name, len, c"String", 6) == 1
+        lit_report_str(s, e, 1)
+    else if name_eq(name, len, c"StrView", 7) == 1 or name_eq(name, len, c"Span$u8", 7) == 1
+        lit_report_str(s, e, 0)
+
+# A block's tail isn't emitted yet, so its own `let`s aren't in scope: a tail
+# naming one is read off the declaration.  1 if `e` is such a tail.
+fn lit_block_local_into_ptr(s: *EmitterState, stmts: *Stmt, e: *Expr) -> i32
+    if e.kind != EXPR_IDENT
+        return 0
+    var decl: *Stmt = null
+    var st: *Stmt = stmts
+    while st != null
+        if st.kind == STMT_VAR_DECL and name_eq(st.var_name, st.var_name_len, e.ident_ptr, e.ident_len) == 1
+            decl = st
+        st = st.next
+    if decl == null
+        return 0
+    if decl.var_declared_type == TYPE_STRUCT
+        lit_refuse_named(s, e, decl.var_type_name, decl.var_type_name_len)
+    else if decl.var_declared_type == TYPE_VOID and decl.var_init != null
+        if decl.var_init.kind == EXPR_STRING_LIT
+            lit_report_str(s, e, 0)
+        else if get_expr_type(s, decl.var_init) == TYPE_STRUCT
+            var name: *u8 = null
+            var len: i32 = 0
+            resolve_expr_struct_name(s, decl.var_init, @name, @len)
+            lit_refuse_named(s, e, name, len)
+    1
+
+# The value of an integer literal, `-1` included: 1, and `out` set, if it is one.
+fn lit_int_value(e: *Expr, out: *i64) -> i32
+    if e.kind == EXPR_INT_LIT and e.lit_kind == LIT_PLAIN
+        *out = e.int_val
+        return 1
+    if e.kind == EXPR_UNARY and e.op == OP_NEG and e.operand != null
+        if e.operand.kind == EXPR_INT_LIT and e.operand.lit_kind == LIT_PLAIN
+            *out = 0 - e.operand.int_val
+            return 1
+    0
+
+fn lit_eprint_u64(v: u64)
+    if v >= 10
+        lit_eprint_u64(v / 10)
+    eprint_char((48 + (v % 10)) as u8)
+
+# `e` is a tail landing in the integer type `t`, or something else.
+fn lit_check_fits(s: *EmitterState, e: *Expr, t: i32)
+    let width: i32 = narrow_int_width(t)
+    if width <= 1
+        return
+    if e.kind == EXPR_STRING_LIT
+        if lit_report(s, e) == 1
+            eprints_cstr(c"a string literal does not fit in `")
+            eprints_cstr(narrow_type_name(t))
+            eprints_cstr(c"`\n")
+        return
+    var v: i64 = 0
+    if lit_int_value(e, @v) == 0
+        return
+    # The lexer wraps a literal above i64's range, so a plain one reads negative.
+    let wrapped: i32 = (e.kind == EXPR_INT_LIT and v < 0) as i32
+    var fits: i32 = 0
+    if width < 64
+        fits = narrow_fits(v, t)
+    else if narrow_is_unsigned(t) == 1
+        fits = (e.kind == EXPR_INT_LIT or v == 0) as i32
+    else
+        fits = 1 - wrapped
+    if fits == 0 and lit_report(s, e) == 1
+        eprint_char('`')
+        if wrapped == 1
+            lit_eprint_u64(v as u64)
+        else
+            eprint_i64(v)
+        eprints_cstr(c"` does not fit in `")
+        eprints_cstr(narrow_type_name(t))
+        eprints_cstr(c"`\n")
+
+fn lit_tail_block(s: *EmitterState, stmts: *Stmt, t: i32, pointee: i32, fit: i32)
+    var last: *Stmt = stmts
+    if last == null
+        return
+    while last.next != null
+        last = last.next
+    if last.kind == STMT_EXPR and t == TYPE_PTR and pointee == TYPE_U8
+        if lit_block_local_into_ptr(s, stmts, last.expr) == 1
+            return
+    lit_tail_stmt(s, last, t, pointee, fit)
+
+fn lit_tail_stmt(s: *EmitterState, stmt: *Stmt, t: i32, pointee: i32, fit: i32)
+    if stmt.kind == STMT_EXPR
+        lit_tails(s, stmt.expr, t, pointee, fit)
+    else if stmt.kind == STMT_IF
+        lit_tail_block(s, stmt.if_then, t, pointee, fit)
+        lit_tail_block(s, stmt.if_else, t, pointee, fit)
+    else if stmt.kind == STMT_MATCH
+        lit_tail_arms(s, stmt.if_then as *MatchArm, t, pointee, fit)
+
+fn lit_tail_arms(s: *EmitterState, arms: *MatchArm, t: i32, pointee: i32, fit: i32)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.is_pass == 0 and arm.body != null
+            var local: i32 = 0
+            if t == TYPE_PTR and pointee == TYPE_U8
+                local = lit_block_local_into_ptr(s, arm.body_stmts, arm.body)
+            if local == 0
+                lit_tails(s, arm.body, t, pointee, fit)
+        arm = arm.next
+
+fn lit_tails(s: *EmitterState, e: *Expr, t: i32, pointee: i32, fit: i32)
+    if e == null
+        return
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        lit_tail_arms(s, e.args as *MatchArm, t, pointee, fit)
+    else if t == TYPE_PTR and pointee == TYPE_U8
+        lit_into_ptr(s, e)
+    else if fit == 1
+        lit_check_fits(s, e, t)
+
+# `e` lands in a slot of kind `t`, pointing at `pointee` if it's a pointer.
+pub fn literal_slot(s: *EmitterState, e: *Expr, t: i32, pointee: i32)
+    lit_tails(s, e, t, pointee, 1)
+
+# The value of `stmt`, the last of a fn, lands in the fn's return slot.
+pub fn literal_tail(s: *EmitterState, stmt: *Stmt, t: i32, pointee: i32)
+    if stmt.kind == STMT_IF or stmt.kind == STMT_MATCH
+        lit_tail_stmt(s, stmt, t, pointee, 1)
+
+# What a fn's return slot points at: `-> *u8` keeps the name, not the kind.
+pub fn literal_ret_pointee(name: *u8, len: i32) -> i32
+    primitive_type_from_name(name, len)
+
+# `e as T`: a literal takes `*u8` here too, and a StrView still doesn't.  The cast
+# says it means to truncate, so nothing else is checked.
+pub fn literal_cast(s: *EmitterState, e: *Expr)
+    lit_tails(s, e.left, e.op, e.cast_pointee, 0)
+
+# One element of a `[N]T` literal: literals fit, and the rest narrow only as a
+# `let` would.
+fn lit_element(s: *EmitterState, el: *Expr, elem: i32, pointee: i32)
+    literal_slot(s, el, elem, pointee)
+    let src: i32 = narrow_unproven(s, el, elem)
+    if src != 0 and lit_report(s, el) == 1
+        eprints_cstr(c"implicit narrowing: this element of a `")
+        eprints_cstr(narrow_type_name(elem))
+        eprints_cstr(c"` array has type `")
+        eprints_cstr(narrow_type_name(src))
+        eprints_cstr(c"`, and the compiler cannot prove the value fits. Write `<expr> as ")
+        eprints_cstr(narrow_type_name(elem))
+        eprints_cstr(c"` if truncation is intended\n")
+
+# `e` lands in an array of `elem`.
+pub fn literal_array(s: *EmitterState, e: *Expr, elem: i32, pointee: i32)
+    if e == null
+        return
+    if e.kind == EXPR_ARRAY_FILL
+        lit_element(s, e.left, elem, pointee)
+    else if e.kind == EXPR_ARRAY_LIT
+        var el: *Expr = e.args
+        while el != null
+            lit_element(s, el, elem, pointee)
+            el = el.next
+
+fn lit_field(s: *EmitterState, e: *Expr, f: *StructField)
+    if f == null
+        return
+    if f.field_type == TYPE_ARRAY
+        literal_array(s, e, f.array_elem_type, f.array_elem_pointee)
+    else
+        literal_slot(s, e, f.field_type, f.ptr_pointee)
+
+# `S { f: e }`.
+pub fn literal_field(s: *EmitterState, e: *Expr, f: *StructField)
+    lit_field(s, e, f)
+
+fn lit_args(s: *EmitterState, params: *Param, args: *Expr)
+    var p: *Param = params
+    var a: *Expr = args
+    while p != null and a != null
+        if p.param_type == TYPE_ARRAY
+            literal_array(s, a, p.param_array_elem_type, p.param_array_elem_pointee)
+        else
+            literal_slot(s, a, p.param_type, p.param_pointee_type)
+        p = p.next
+        a = a.next
+
+pub fn literal_call(s: *EmitterState, e: *Expr)
+    if e.func_name_len == 0
+        return
+    let idx: i32 = find_local_idx(s, e.func_name, e.func_name_len)
+    if idx >= 0
+        let loc: *LocalVar = local_at(s, idx)
+        let sig: *FnDef = loc.fn_sig
+        if sig != null
+            lit_args(s, sig.params, e.args)
+        return
+    let fd: *FnDef = find_call_fn(s, e)
+    if fd != null
+        lit_args(s, fd.params, e.args)
+
+pub fn literal_method(s: *EmitterState, e: *Expr)
+    let fd: *FnDef = bk_method_def(s, e)
+    if fd == null or fd.params == null
+        return
+    # `self` is the receiver, not the first argument.
+    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1
+        lit_args(s, fd.params.next, e.args)
+    else
+        lit_args(s, fd.params, e.args)
+
+fn lit_into_local(s: *EmitterState, e: *Expr, name: *u8, len: i32)
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx >= 0
+        let loc: *LocalVar = local_at(s, idx)
+        # A narrow local lives in an i64 slot, so var_type can't say it's a u8.
+        let written: i32 = narrow_name_type(s, name, len)
+        if written != NARROW_UNKNOWN
+            literal_slot(s, e, written, TYPE_VOID)
+        else
+            literal_slot(s, e, loc.var_type, loc.pointee_type)
+        return
+    let g: *GlobalVarDef = find_global(s, name, len)
+    if g != null
+        literal_slot(s, e, g.var_type, g.pointee_type)
+
+fn lit_into_element(s: *EmitterState, e: *Expr, name: *u8, len: i32)
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx >= 0
+        let loc: *LocalVar = local_at(s, idx)
+        if loc.var_type == TYPE_ARRAY
+            literal_slot(s, e, loc.array_elem_type, loc.array_elem_pointee)
+        else if loc.var_type == TYPE_PTR
+            literal_slot(s, e, loc.pointee_type, TYPE_VOID)
+        return
+    let g: *GlobalVarDef = find_global(s, name, len)
+    if g != null and g.var_type == TYPE_ARRAY
+        literal_slot(s, e, g.array_elem_type, g.array_elem_pointee)
+
+fn lit_into_target(s: *EmitterState, e: *Expr, target: *Expr)
+    if target.kind == EXPR_IDENT
+        lit_into_local(s, e, target.ident_ptr, target.ident_len)
+    else if target.kind == EXPR_MEMBER
+        lit_field(s, e, member_field_def(s, target))
+    else if target.kind == EXPR_INDEX and target.left != null and target.left.kind == EXPR_IDENT
+        lit_into_element(s, e, target.left.ident_ptr, target.left.ident_len)
+    else if target.kind == EXPR_INDEX and target.left != null and target.left.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, target.left)
+        if f != null and f.field_type == TYPE_ARRAY
+            literal_slot(s, e, f.array_elem_type, f.array_elem_pointee)
+    else if target.kind == EXPR_UNARY and target.op == OP_DEREF
+        literal_slot(s, e, get_expr_type(s, target), TYPE_VOID)
+
+# `target = value`, in each spelling the parser has for one.
+pub fn literal_stmt(s: *EmitterState, stmt: *Stmt)
+    if stmt.kind == STMT_ASSIGN
+        if stmt.assign_target_len != 0
+            lit_into_local(s, stmt.assign_value, stmt.assign_target, stmt.assign_target_len)
+        else
+            lit_into_target(s, stmt.assign_value, stmt.if_cond as *Expr)
+    else if stmt.kind == STMT_INDEX_ASSIGN
+        lit_into_element(s, stmt.assign_value, stmt.assign_target, stmt.assign_target_len)
+    else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN or stmt.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        let loc: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
+        if loc == null
+            return
+        let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
+        if st == null
+            return
+        let idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+        if idx < 0
+            return
+        let f: *StructField = get_field_type(st, idx)
+        if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
+            lit_field(s, stmt.assign_value, f)
+        else if f.field_type == TYPE_ARRAY
+            literal_slot(s, stmt.assign_value, f.array_elem_type, f.array_elem_pointee)

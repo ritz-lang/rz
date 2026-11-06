@@ -25,8 +25,9 @@ turned out to be three ordinary source bugs.
 WHAT THESE TESTS PIN
 
 The diagnostic's *shape*, not the compiler's capability. If ritz0 later
-learns to coerce a StrView into a `*u8` slot, these tests must still pass —
-whatever it continues to reject, it must reject with a location. The control
+learns a conversion, these tests must still pass — whatever it continues to
+reject, it must reject with a location. (`p = "hello"` was the example here
+until a literal took `*u8` from its slot, LARB R3, #2341.) The control
 (`test_a_correct_store_still_compiles`) is what stops "convert every
 TypeError" from passing by rejecting everything.
 """
@@ -61,11 +62,15 @@ def _compile(tmp_path, name, source):
     )
 
 
-# A StrView assigned into a `*u8` variable. This is `projects/http`'s shape.
+# A struct assigned into a `*u8` variable.
 VAR_ASSIGN = """\
+struct Other
+    n: i64
+
 fn main() -> i32
     var p: *u8 = c"a"
-    p = "hello"
+    let v = Other { n: 1 }
+    p = v
     return 0
 """
 
@@ -76,9 +81,13 @@ FIELD_ASSIGN = """\
 struct Holder
     p: *u8
 
+struct Other
+    n: i64
+
 fn main() -> i32
     var h: Holder
-    h.p = "hello"
+    let v = Other { n: 1 }
+    h.p = v
     return 0
 """
 

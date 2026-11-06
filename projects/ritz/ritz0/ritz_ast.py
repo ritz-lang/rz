@@ -259,6 +259,10 @@ class StringLit(Expr):
     value: str
     print_value: Optional[str] = None
     interp: Optional[Tuple[List[str], List[str]]] = None
+    # Set by the emitter when the slot this literal lands in is `*u8`; the
+    # default is StrView (LARB R3, AGAST #2341). A slot visit always rewrites
+    # it, so a body shared between two instantiations can't keep a stale type.
+    as_ptr: bool = field(default=False, compare=False, repr=False)
 
 
 @dataclass

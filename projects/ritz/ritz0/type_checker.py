@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 import bool_rules
 import ritz_ast as rast
+from tail_value import slot_tails
 from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
                            SYSCALL_BUILTINS)
 
@@ -263,7 +264,7 @@ class TypeChecker:
         # Check trailing expression matches expected return type
         if block.expr:
             expr_type = self._infer_type(block.expr)
-            if expected_ret and not self._types_compatible(expr_type, expected_ret):
+            if expected_ret and not self._value_fits(block.expr, expr_type, expected_ret):
                 self._error(f"block expression has type {self._type_str(expr_type)}, "
                           f"expected {self._type_str(expected_ret)}", block.expr.span)
 
@@ -273,7 +274,7 @@ class TypeChecker:
             if stmt.value:
                 init_type = self._infer_type(stmt.value)
                 if stmt.type:
-                    if not self._types_compatible(init_type, stmt.type):
+                    if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
                                   f"with {self._type_str(init_type)}", stmt.span)
                     self.locals[stmt.name] = stmt.type
@@ -288,7 +289,7 @@ class TypeChecker:
             if stmt.value:
                 init_type = self._infer_type(stmt.value)
                 if stmt.type:
-                    if not self._types_compatible(init_type, stmt.type):
+                    if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
                                   f"with {self._type_str(init_type)}", stmt.span)
                     self.locals[stmt.name] = stmt.type
@@ -318,14 +319,14 @@ class TypeChecker:
             if stmt.value:
                 ret_type = self._infer_type(stmt.value)
                 if self.current_fn and self.current_fn.ret_type:
-                    if not self._types_compatible(ret_type, self.current_fn.ret_type):
+                    if not self._value_fits(stmt.value, ret_type, self.current_fn.ret_type):
                         self._error(f"return type {self._type_str(ret_type)} doesn't match "
                                   f"expected {self._type_str(self.current_fn.ret_type)}", stmt.span)
 
         elif isinstance(stmt, rast.AssignStmt):
             target_type = self._infer_type(stmt.target)
             value_type = self._infer_type(stmt.value)
-            if not self._types_compatible(value_type, target_type):
+            if not self._value_fits(stmt.value, value_type, target_type):
                 self._error(f"cannot assign {self._type_str(value_type)} "
                           f"to {self._type_str(target_type)}", stmt.span)
 
@@ -751,7 +752,7 @@ class TypeChecker:
                 # Check argument types
                 for i, (arg, (param_name, param_type)) in enumerate(zip(expr.args, fn_sig.params)):
                     arg_type = self._infer_type(arg)
-                    if not self._types_compatible(arg_type, param_type):
+                    if not self._value_fits(arg, arg_type, param_type):
                         self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
                                   f"got {self._type_str(arg_type)}", arg.span)
 
@@ -949,9 +950,12 @@ class TypeChecker:
             self._pop_scope()
 
             # Both branches should have same type
-            if not self._types_compatible(then_type, else_type):
-                self._error(f"if branches have different types: {self._type_str(then_type)} "
-                          f"and {self._type_str(else_type)}", expr.span)
+            if self._value_fits(expr.else_block.expr, else_type, then_type):
+                return then_type
+            if self._value_fits(expr.then_block.expr, then_type, else_type):
+                return else_type
+            self._error(f"if branches have different types: {self._type_str(then_type)} "
+                        f"and {self._type_str(else_type)}", expr.span)
             return then_type
 
         return then_type
@@ -974,7 +978,7 @@ class TypeChecker:
         for name, value in expr.fields:
             if name in expected_fields:
                 value_type = self._infer_type(value)
-                if not self._types_compatible(value_type, expected_fields[name]):
+                if not self._value_fits(value, value_type, expected_fields[name]):
                     self._error(f"field '{name}': expected {self._type_str(expected_fields[name])}, "
                               f"got {self._type_str(value_type)}", value.span)
 
@@ -995,8 +999,12 @@ class TypeChecker:
 
             arm_type = self._infer_type(arm.body)
             if result_type is None:
-                result_type = arm_type
-            elif not self._types_compatible(arm_type, result_type):
+                result_type, result_body = arm_type, arm.body
+            elif self._value_fits(arm.body, arm_type, result_type):
+                pass
+            elif self._value_fits(result_body, result_type, arm_type):
+                result_type, result_body = arm_type, arm.body
+            else:
                 self._error(f"match arms have different types: {self._type_str(result_type)} "
                           f"and {self._type_str(arm_type)}", arm.body.span)
             self._pop_scope()
@@ -1130,6 +1138,27 @@ class TypeChecker:
         if not self._is_int_or_opaque(ty):
             self._error(f"expected integer type, got {self._type_str(ty)}", span)
 
+    def _value_fits(self, value: Optional[rast.Expr], actual: rast.Type,
+                    expected: rast.Type) -> bool:
+        """`value`, of type `actual`, in an `expected` slot. A string literal has
+        no fixed type: it is `*u8` in a `*u8` slot (LARB R3), and nothing else
+        is, so a StrView or String stays a mismatch."""
+        if self._types_compatible(actual, expected):
+            return True
+        if value is None:
+            return False
+        tails = list(slot_tails(expected, value))
+        if not any(isinstance(tail, rast.StringLit) for tail, _ in tails):
+            return False
+        return all(self._is_u8_ptr(slot) if isinstance(tail, rast.StringLit)
+                   else self._types_compatible(self._infer_type(tail), slot)
+                   for tail, slot in tails)
+
+    @staticmethod
+    def _is_u8_ptr(ty: rast.Type) -> bool:
+        return (isinstance(ty, rast.PtrType) and isinstance(ty.inner, rast.NamedType)
+                and ty.inner.name == 'u8')
+
     def _types_compatible(self, actual: rast.Type, expected: rast.Type) -> bool:
         """Check if actual type is compatible with expected type."""
         # Handle None/unknown
@@ -1184,13 +1213,6 @@ class TypeChecker:
         if isinstance(actual, rast.NamedType) and isinstance(expected, (rast.PtrType, rast.RefType)):
             if actual.name in {'i64', 'u64', 'isize', 'usize'}:
                 return True
-
-        # String -> *u8 implicit coercion (Issue #89)
-        # String can be passed where *u8 is expected; compiler will call string_as_ptr()
-        if isinstance(actual, rast.NamedType) and actual.name == 'String':
-            if isinstance(expected, rast.PtrType):
-                if isinstance(expected.inner, rast.NamedType) and expected.inner.name == 'u8':
-                    return True
 
         # Pointer types
         if isinstance(actual, rast.PtrType) and isinstance(expected, rast.PtrType):

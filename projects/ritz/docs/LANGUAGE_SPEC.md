@@ -211,6 +211,53 @@ let s: StrView = "hello"        # StrView: a { ptr, len } pair, no allocation
 let c: *u8 = c"hello"           # *u8: NUL-terminated C string
 ```
 
+A literal has no fixed type until a slot gives it one, as `5`, `null` and
+`[1, 2]` already behave. `"..."` is `StrView` by default and `*u8` in a `*u8`
+slot, wherever that slot is: `let`, `var`, `=`, `return`, a tail, a field, an
+array element, an `if` or `match` arm, an argument (LARB R3, AGAST #2341).
+`c"..."` is always `*u8`, so it is what an untyped `let` needs:
+
+```ritz
+struct Name
+    text: *u8
+
+fn pick(short: bool) -> *u8
+    if short
+        "a"
+    else
+        "alpha"
+
+fn main() -> i32
+    let p: *u8 = "hello"
+    let n = Name { text: "hi" }
+    let names: [2]*u8 = ["x", "y"]
+    (*p as i32) - 104 + (*n.text as i32) - 104 + (*names[1] as i32) - 121 + (*pick(true) as i32) - 97
+```
+
+**Every string literal is stored NUL-terminated**, `"..."` and `c"..."` alike:
+the terminator follows the literal's bytes and isn't counted in a `StrView`'s
+`len`.
+
+Only the literal converts. A literal is retyped, a value isn't, so a `StrView`
+that happens to hold a literal doesn't reach `*u8` (see [String
+Types](#35-string-types)).
+
+A literal that doesn't fit its slot is an error wherever it is, including in an
+array element, and an integer literal is held to the slot's whole range, with
+hex no exception. `as` says the truncation is meant:
+
+```ritz body expect-error="`300` does not fit in `u8`"
+var a: [2]u8 = [1, 300]
+```
+
+```ritz body expect-error="`3735928559` does not fit in `i32`"
+let a: i32 = 0xDEADBEEF
+```
+
+```ritz body
+let a: i32 = 0xDEADBEEF as i32
+```
+
 **Removed in RERITZ:** the `s"..."` prefix. Bare `"..."` now produces exactly
 the `{ ptr, len }` value that `s"..."` used to, so the prefix was redundant
 (AGAST #98). `s"hello"` now lexes as the identifier `s` next to a string:
@@ -564,8 +611,8 @@ fn total(xs: Span<u8>) -> i64
 | Type | Description |
 |------|-------------|
 | `String` | Owned, heap-allocated, growable |
-| `StrView` | Borrowed `{ ptr, len }` view — the type of a `"..."` literal |
-| `*u8` | C-style NUL-terminated string — the type of a `c"..."` literal |
+| `StrView` | Borrowed `{ ptr, len }` view — the default type of a `"..."` literal |
+| `*u8` | C-style NUL-terminated string — the type of a `c"..."` literal, and of a `"..."` literal in a `*u8` slot |
 | `Span<u8>` | Borrowed byte slice with length |
 
 ```ritz
@@ -577,6 +624,41 @@ fn main() -> i32
     let n = string_len(@s)
     string_drop(@&s)
     n as i32
+```
+
+A string literal fits a `*u8` slot ([§2.6](#26-literals)). Nothing else converts,
+because a `StrView` may be a slice with no terminator and a `String` has to be
+asked for one. `sv as *u8` is refused too. Write `.ptr` if you know the view is
+NUL-terminated, and `string_as_ptr` for a `String`:
+
+```ritz body expect-error="a StrView is not a `*u8`"
+let s: StrView = "hello"
+let p: *u8 = s
+```
+
+```ritz expect-error="a String is not a `*u8`"
+import ritzlib.string
+
+fn main() -> i32
+    var s: String = string_from("hello")
+    let p: *u8 = s
+    0
+```
+
+```ritz
+import ritzlib.string
+import ritzlib.strview
+
+fn main() -> i32
+    let view: StrView = "hello"
+    let a: *u8 = view.ptr              # You know this view is terminated
+    var s: String = string_from("hello")
+    let b: *u8 = string_as_ptr(@&s)
+    let same: bool = *a == *b
+    string_drop(@&s)
+    if same
+        return 0
+    1
 ```
 
 ### 3.6 Compound Types
@@ -1227,6 +1309,13 @@ The rule does no range analysis beyond that: `if n < 255 then n else 255`
 is rejected even though it is safe, and needs an `as`. Only typed `let` and
 `var` initialisers are checked. An assignment, a call argument or a `return`
 still converts silently (#1444).
+
+A non-literal array element is held to the same rule, against the element type:
+
+```ritz body expect-error="implicit narrowing: this element of a `u8` array has type `i64`"
+let k: i64 = 300
+let a: [2]u8 = [1, k]
+```
 
 ritz0 and ritz1 both enforce this rule, and `ritz0/test_ritz1_implicit_narrowing.py`
 checks that they give the same verdict on every case in

@@ -75,8 +75,10 @@ fn main() -> i32
 ```
 
 **String literals:**
-- `"hello"` → `StrView` (a `{ ptr, len }` pair; no allocation)
+- `"hello"` → `StrView` (a `{ ptr, len }` pair; no allocation), or `*u8` in a
+  `*u8` slot. Every literal is NUL-terminated
 - `c"hello"` → `*u8` (NUL-terminated C string)
+- A non-literal `StrView` or a `String` never fits `*u8`: write `.ptr` / `string_as_ptr`
 
 `s"hello"` was removed by AGAST #98: bare `"..."` now produces a `StrView` of
 the same `{ ptr, len }` shape, so the prefix was redundant. `make

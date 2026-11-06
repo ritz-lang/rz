@@ -121,7 +121,10 @@ fn narrow_known(t: i32) -> i32
 # Ritz type of an identifier, or NARROW_UNKNOWN.  Same precedence as
 # emission: constants shadow locals.
 fn narrow_ident_type(s: *EmitterState, e: *Expr) -> i32
-    let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+    narrow_name_type(s, e.ident_ptr, e.ident_len)
+
+pub fn narrow_name_type(s: *EmitterState, name: *u8, len: i32) -> i32
+    let ce: *ConstEntry = find_const_entry(s, name, len)
     if ce != null
         if ce.fold_state != CONST_FOLD_DONE
             return NARROW_UNKNOWN
@@ -135,7 +138,7 @@ fn narrow_ident_type(s: *EmitterState, e: *Expr) -> i32
     var i: i32 = s.narrow_decl_count - 1
     while i >= 0
         let d: *NarrowDecl = @s.narrow_decls[i]
-        if name_eq(d.name, d.name_len, e.ident_ptr, e.ident_len) == 1
+        if name_eq(d.name, d.name_len, name, len) == 1
             if found == 0
                 found = 1
                 t = d.decl_type
@@ -146,12 +149,12 @@ fn narrow_ident_type(s: *EmitterState, e: *Expr) -> i32
         return t
     var p: *Param = s.narrow_params
     while p != null
-        if name_eq(p.name, p.name_len, e.ident_ptr, e.ident_len) == 1
+        if name_eq(p.name, p.name_len, name, len) == 1
             return narrow_known(p.param_type)
         p = p.next
     # A global's TYPE_I64 may be the parser's default for a missing
     # annotation, so only a narrower (necessarily written) type is trusted.
-    let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+    let g: *GlobalVarDef = find_global(s, name, len)
     if g != null
         let gw: i32 = narrow_int_width(g.var_type)
         if gw > 1 and gw < 64
@@ -483,21 +486,25 @@ fn narrow_eprint_name(name: *u8, len: i32)
 # `let x: i32 = x` still sees the outer x.
 fn check_implicit_narrowing(s: *EmitterState, stmt: *Stmt)
     let decl: i32 = stmt.var_declared_type
-    let init: *Expr = stmt.var_init
-    let dw: i32 = narrow_int_width(decl)
-    if init != null and dw > 1 and dw < 64
-        let src: i32 = narrow_src_type(s, init)
-        let sw: i32 = narrow_int_width(src)
-        if src != NARROW_UNKNOWN and src != NARROW_LIT and sw > dw
-            var lo: i64 = 0
-            var hi: i64 = 0
-            var proven: i32 = 0
-            if narrow_provable_range(s, init, 1, @lo, @hi) == 1
-                if narrow_fits(lo, decl) == 1 and narrow_fits(hi, decl) == 1
-                    proven = 1
-            if proven == 0
-                narrow_report(s, stmt, decl, src)
+    let src: i32 = narrow_unproven(s, stmt.var_init, decl)
+    if src != 0
+        narrow_report(s, stmt, decl, src)
     narrow_record_decl(s, stmt)
+
+# `init`'s type if landing in `decl` narrows it and might lose bits, else 0.
+pub fn narrow_unproven(s: *EmitterState, init: *Expr, decl: i32) -> i32
+    let dw: i32 = narrow_int_width(decl)
+    if init == null or dw <= 1 or dw >= 64
+        return 0
+    let src: i32 = narrow_src_type(s, init)
+    if src == NARROW_UNKNOWN or src == NARROW_LIT or narrow_int_width(src) <= dw
+        return 0
+    var lo: i64 = 0
+    var hi: i64 = 0
+    if narrow_provable_range(s, init, 1, @lo, @hi) == 1
+        if narrow_fits(lo, decl) == 1 and narrow_fits(hi, decl) == 1
+            return 0
+    src
 
 fn narrow_report(s: *EmitterState, stmt: *Stmt, decl: i32, src: i32)
     if stmt.var_src_file != null

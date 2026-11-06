@@ -10,7 +10,7 @@ doesn't include the x86 asm parser.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
@@ -68,6 +68,13 @@ class EmitError(Exception):
 # destination and the load is deleted. That is what tome_cli needed:
 # `var client: TomeClient = client_new()` stored an 8 KB first-class value
 # into a debug-declared alloca, and clang -O2 took 6.5 GB to lower it.
+# What a StrView or String landing in a `*u8` slot says (LARB R3, AGAST #2341).
+_STR_AS_PTR = {
+    'StrView': ("a StrView is not a `*u8`: only a string literal converts; "
+                "write `.ptr` if you know it is NUL-terminated"),
+    'String': "a String is not a `*u8`: write `string_as_ptr(@&s)`",
+}
+
 SRET_MIN_BYTES = 256
 
 # ============================================================================
@@ -600,6 +607,8 @@ class LLVMEmitter:
         # id(value) -> (value, the expression it last came from): `_convert_type`
         # reports where a value was written, and most of its callers don't say.
         self._value_origin: Dict[int, Tuple[ir.Value, rast.Expr]] = {}
+        # Ids of the tails about to land in a `*u8` slot (#2341).
+        self._ptr_tails: Set[int] = set()
         # AGAST #2261: what the method call being emitted has already
         # evaluated, by id(expr): its receiver and the operands of a place.
         self._evaluated_once: Dict[int, ir.Value] = {}
@@ -1408,6 +1417,8 @@ class LLVMEmitter:
         elif isinstance(expr, rast.CharLit):
             return rast.NamedType(expr.span, 'u8', [])
         elif isinstance(expr, rast.StringLit):
+            if expr.as_ptr:
+                return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
             # "hello" -> StrView (zero-copy view)
             return rast.NamedType(expr.span, 'StrView', [])
         elif isinstance(expr, rast.CStringLit):
@@ -1649,51 +1660,6 @@ class LLVMEmitter:
 
         return sv
 
-    def _coerce_string_to_u8_ptr(self, string_val: ir.Value, arg_expr: rast.Expr) -> ir.Value:
-        """Coerce a String value to *u8 by calling string_as_ptr().
-
-        Issue #89 Phase 2: Implicit String -> *u8 coercion in function calls.
-
-        Args:
-            string_val: The LLVM value of the String (struct type)
-            arg_expr: The original AST expression (used to find lvalue address)
-
-        Returns:
-            The *u8 pointer from string_as_ptr()
-        """
-        if "string_as_ptr" not in self.functions:
-            raise ValueError("String to *u8 coercion requires string_as_ptr() to be defined. "
-                             "Import ritzlib.string to use String type.")
-
-        fn, _ = self.functions["string_as_ptr"]
-
-        # string_as_ptr expects &mut String (pointer to String)
-        # If arg_expr is an lvalue (variable), we can get its address
-        # Otherwise, we need to store the temporary String on the stack
-
-        string_ptr = None
-
-        if isinstance(arg_expr, rast.Ident):
-            name = arg_expr.name
-            if name in self.locals:
-                # var binding - the alloca IS the pointer
-                string_ptr, _ = self.locals[name]
-            elif name in self.globals:
-                # global var - the global IS the pointer
-                string_ptr, _ = self.globals[name]
-
-        if string_ptr is None:
-            # Temporary - allocate stack space and store the String there
-            # Get String type from struct registry
-            if "String" not in self.struct_types:
-                raise ValueError("String struct not defined. Import ritzlib.string.")
-            string_type = self.struct_types["String"]
-            string_ptr = self.builder.alloca(string_type, name="string_temp")
-            self.builder.store(string_val, string_ptr)
-
-        # Call string_as_ptr(&mut string)
-        return self.builder.call(fn, [string_ptr])
-
     def _emit_global_var(self, var_def: rast.VarDef) -> None:
         """Emit a module-level mutable variable.
 
@@ -1707,6 +1673,7 @@ class LLVMEmitter:
         - imported var: external linkage (declaration only, defined elsewhere)
         """
         # Determine the type
+        self._literal_into_slot(var_def.type, var_def.value)
         if var_def.type is not None:
             ty = self._ritz_type_to_llvm(var_def.type)
             ritz_ty = var_def.type
@@ -1765,6 +1732,8 @@ class LLVMEmitter:
                             gvar.initializer = ir.Constant(ty, var_def.value.expr.value)
                     else:
                         raise ValueError(f"Complex cast initializer not supported: {var_def.value}")
+                elif isinstance(var_def.value, rast.StringLit) and var_def.value.as_ptr:
+                    gvar.initializer = self._const_str_ptr(var_def.value.value)
                 elif isinstance(var_def.value, rast.NullLit):
                     # Handle `null` initialization for pointer types
                     if isinstance(ty, ir.PointerType):
@@ -1821,6 +1790,8 @@ class LLVMEmitter:
             for elem in value.elements:
                 if isinstance(elem, rast.StringLit) and is_strview_array:
                     elements.append(self._make_const_strview_value(elem.value, f"{name}.arr", elem_type))
+                elif isinstance(elem, rast.StringLit) and elem.as_ptr:
+                    elements.append(self._const_str_ptr(elem.value))
                 elif isinstance(elem, rast.StructLit):
                     elements.append(self._make_const_struct_value(elem, elem_type, f"{name}.arr"))
                 else:
@@ -1830,6 +1801,8 @@ class LLVMEmitter:
             if isinstance(value.value, rast.StringLit) and is_strview_array:
                 fill = self._make_const_strview_value(value.value.value, f"{name}.fill", elem_type)
                 elements = [fill] * value.count
+            elif isinstance(value.value, rast.StringLit) and value.value.as_ptr:
+                elements = [self._const_str_ptr(value.value.value)] * value.count
             else:
                 fill_val = self._fold_const_array_elem(name, 0, value.value, elem_type)
                 elements = [ir.Constant(elem_type, fill_val)] * value.count
@@ -1860,9 +1833,16 @@ class LLVMEmitter:
             return ir.Constant(target_type, 1 if expr.value else 0)
         if isinstance(expr, rast.StringLit) and self._is_strview_llvm_type(target_type):
             return self._make_const_strview_value(expr.value, name_hint, target_type)
+        if isinstance(expr, rast.StringLit) and target_type == self.i8.as_pointer():
+            return self._const_str_ptr(expr.value)
         if isinstance(expr, rast.StructLit):
             return self._make_const_struct_value(expr, target_type, name_hint)
         raise ValueError(f"Unsupported const expression for target {target_type}: {expr}")
+
+    def _const_str_ptr(self, value: str) -> ir.Constant:
+        """A `*u8` constant for a string literal, NUL-terminated as they all are."""
+        zero = ir.Constant(self.i64, 0)
+        return self._get_string_constant(value).gep([zero, zero])
 
     def _make_const_struct_value(self, expr: rast.StructLit, target_type: ir.Type, name_hint: str) -> ir.Constant:
         """Create an LLVM constant for a struct literal used in const contexts."""
@@ -2383,6 +2363,7 @@ class LLVMEmitter:
             if isinstance(item, rast.ConstDef):
                 ty = self._ritz_type_to_llvm(item.type)
                 self.const_ritz_types[item.name] = item.type
+                self._literal_into_slot(item.type, item.value)
                 if isinstance(item.value, rast.IntLit):
                     if ty == self.i1:
                         raise EmitError(bool_rules.value_into_bool(bool_rules.INTEGER),
@@ -2397,6 +2378,14 @@ class LLVMEmitter:
                     # Array constants - emitted once every scalar const is
                     # known, so an element may name a const declared later.
                     const_arrays.append(item)
+                elif (isinstance(item.value, rast.CStringLit)
+                        or (isinstance(item.value, rast.StringLit) and item.value.as_ptr)):
+                    gvar = ir.GlobalVariable(self.module, ty, name=item.name)
+                    gvar.global_constant = True
+                    gvar.linkage = "internal"
+                    gvar.initializer = self._const_str_ptr(item.value.value)
+                    self.globals[item.name] = (gvar, ty)
+                    self.ritz_types[item.name] = item.type
                 elif isinstance(item.value, rast.StringLit):
                     # String constant - emit as global StrView
                     self._emit_const_strview(item.name, item.value.value)
@@ -3027,6 +3016,7 @@ class LLVMEmitter:
                 # The payload's declared type is the expected type of the
                 # argument (so e.g. a `[u8]` payload asks a Vec range-index for
                 # a view rather than a copy).
+                self._literal_into_slot(field_type, arg)
                 saved_expected = self.expected_ritz_type
                 self.expected_ritz_type = field_type
                 try:
@@ -3226,6 +3216,7 @@ class LLVMEmitter:
                 # The payload's declared type is the expected type of the
                 # argument (so e.g. a `[u8]` payload asks a Vec range-index for
                 # a view rather than a copy).
+                self._literal_into_slot(field_type, arg)
                 saved_expected = self.expected_ritz_type
                 self.expected_ritz_type = field_type
                 try:
@@ -5753,7 +5744,7 @@ class LLVMEmitter:
                 # Special case: large array fill - initialize alloca directly with memset
                 # This avoids loading/storing huge arrays which crashes LLVM SelectionDAG
                 elif isinstance(stmt.value, rast.ArrayFill) and stmt.value.count > 64:
-                    self._emit_array_fill_to_alloca(stmt.value, alloca, ty)
+                    self._emit_array_fill_to_alloca(stmt.value, alloca, ty, stmt.type)
                 # AGAST #1741: a large struct literal is built in the new var.
                 elif self._emit_large_lit_into(stmt.value, alloca):
                     pass
@@ -5801,7 +5792,6 @@ class LLVMEmitter:
                         self._check_initialiser_has_value(stmt, val)
                         self._reject_enum_as_int(val, ty, stmt.type,
                                                  getattr(stmt, 'span', None))
-                    self._check_int_literal_fits_declaration(stmt)
                     if stmt.type:
                         self._check_implicit_narrowing(stmt, val.type, ty)
                     # AGAST #1736: an sret call writes the new var in place
@@ -5864,7 +5854,6 @@ class LLVMEmitter:
                 self._reject_enum_as_int(val, declared_ty, stmt.type,
                                          getattr(stmt, 'span', None))
                 val = self._convert_type(val, declared_ty)
-                self._check_int_literal_fits_declaration(stmt)
                 self._check_implicit_narrowing(stmt, src_ty, declared_ty)
                 self._check_let_annotation(stmt, val, declared_ty)
                 self._bind_let(stmt.name, val, declared_ty)
@@ -7630,6 +7619,9 @@ class LLVMEmitter:
         if getattr(expr, 'drop_temp', None) is not None:
             self._own_temporary(expr, val)
         self._value_origin[id(val)] = (val, expr)
+        if id(expr) in self._ptr_tails:
+            self._ptr_tails.discard(id(expr))
+            self._check_str_tail(val, expr)
         return val
 
     def _emit_expr_core(self, expr: rast.Expr) -> ir.Value:
@@ -7643,12 +7635,12 @@ class LLVMEmitter:
         elif isinstance(expr, rast.BoolLit):
             return ir.Constant(self.i1, 1 if expr.value else 0)
 
-        elif isinstance(expr, rast.StringLit):
+        elif isinstance(expr, rast.StringLit) and not expr.as_ptr:
             # "hello" -> StrView (zero-copy view)
             return self._emit_strview_string_literal(expr)
 
-        elif isinstance(expr, rast.CStringLit):
-            # C-string literal: c"hello" -> *u8 (null-terminated)
+        elif isinstance(expr, (rast.StringLit, rast.CStringLit)):
+            # c"hello", or "hello" in a `*u8` slot -> *u8 (null-terminated)
             gvar = self._get_string_constant(expr.value)
             # Get pointer to first element
             zero = ir.Constant(self.i64, 0)
@@ -8541,15 +8533,27 @@ class LLVMEmitter:
                 "Empty array literal needs a declared array type "
                 "(e.g. `let a: [0]u8 = []`)")
 
-        # Emit all elements and infer type from first element
-        values = [self._emit_expr(e) for e in expr.elements]
+        # Emit all elements and infer type from first element. Each element
+        # lands in the element type, not the array's.
+        expected = self.expected_ritz_type
+        element_type = expected.inner if isinstance(expected, rast.ArrayType) else None
+        saved_ctx = getattr(self, '_literal_ctx_nodes', set())
+        values = []
+        for element in expr.elements:
+            self.expected_ritz_type = element_type
+            if element_type is not None:
+                self._literal_ctx_nodes = self._arith_context_nodes(element)
+            try:
+                values.append(self._emit_expr(element))
+            finally:
+                self.expected_ritz_type = expected
+                self._literal_ctx_nodes = saved_ctx
         elem_type = values[0].type
 
         # A declared array type wins over inference: `let b: [4]u8 = [1, 2]`
         # must produce [4 x i8], not [2 x i64]. Without this the literal kept
         # its own shape and every later use of the binding silently mismatched.
         declared_count = None
-        expected = self.expected_ritz_type
         if isinstance(expected, rast.ArrayType):
             elem_type = self._ritz_type_to_llvm(expected.inner)
             declared_count = (expected.size.value
@@ -8562,8 +8566,10 @@ class LLVMEmitter:
 
         # Convert all values to same type
         converted = []
-        for val in values:
-            converted.append(self._convert_type(val, elem_type))
+        for element, val in zip(expr.elements, values):
+            if element_type is not None:
+                self._check_element_narrowing(element, val.type, elem_type, element_type)
+            converted.append(self._convert_type(val, elem_type, element))
 
         # Create array type
         count = declared_count if isinstance(declared_count, int) else len(converted)
@@ -8591,6 +8597,10 @@ class LLVMEmitter:
 
         # Emit the value once
         val = self._emit_expr(expr.value)
+        expected = self.expected_ritz_type
+        if isinstance(expected, rast.ArrayType):
+            declared_elem = self._ritz_type_to_llvm(expected.inner)
+            self._check_element_narrowing(expr.value, val.type, declared_elem, expected.inner)
         elem_type = val.type
 
         # Create array type
@@ -8670,7 +8680,8 @@ class LLVMEmitter:
         return result
 
     def _emit_array_fill_to_alloca(self, expr: rast.ArrayFill, alloca: ir.AllocaInstr,
-                                    target_type: ir.Type) -> None:
+                                    target_type: ir.Type,
+                                    declared: Optional[rast.Type] = None) -> None:
         """Emit array fill directly to an existing alloca.
 
         This is an optimization for large array fills assigned to variables.
@@ -8691,6 +8702,9 @@ class LLVMEmitter:
         # Get target element type
         if isinstance(target_type, ir.ArrayType):
             target_elem_type = target_type.element
+            if isinstance(declared, rast.ArrayType):
+                self._check_element_narrowing(expr.value, val.type, target_elem_type,
+                                              declared.inner)
         else:
             # Should be array type, but fall back to value type if not
             target_elem_type = val.type
@@ -9174,11 +9188,12 @@ class LLVMEmitter:
         # Get the constructor function
         if fn_name not in self.functions:
             raise ValueError(f"Unknown async function: {fn_name}")
-        constructor_fn, _ = self.functions[fn_name]
+        constructor_fn, constructor_def = self.functions[fn_name]
 
         # Emit arguments with type conversion (int literals default to i64)
         emit_args = []
         for i, arg in enumerate(args):
+            self._literal_into_slot(constructor_def.params[i].type, arg)
             val = self._emit_expr(arg)
             expected_type = self._fn_param_types(constructor_fn)[i]
             val = self._convert_type(val, expected_type)
@@ -9731,14 +9746,73 @@ class LLVMEmitter:
                     and isinstance(self._ritz_type_to_llvm(slot).pointee,
                                    (ir.IntType, ir.FloatType, ir.DoubleType)))
 
+    def _emit_into_array_slot(self, value: rast.Expr, slot: Optional[rast.Type]) -> ir.Value:
+        """Emit `value`; an array literal takes its element type from `slot`,
+        and keeps its own length, so the wrong length is still refused."""
+        if (not isinstance(value, (rast.ArrayLit, rast.ArrayFill))
+                or not isinstance(slot, rast.ArrayType)):
+            return self._emit_expr(value)
+        saved = self.expected_ritz_type
+        if isinstance(value, rast.ArrayLit):
+            slot = replace(slot, size=len(value.elements))
+        self.expected_ritz_type = slot
+        try:
+            return self._emit_expr(value)
+        finally:
+            self.expected_ritz_type = saved
+
+    def _literal_into_slot(self, slot: Optional[rast.Type],
+                           value: Optional[rast.Expr], fit: bool = True) -> None:
+        """A literal has no fixed type until a slot gives it one (LARB R3).
+
+        Each string literal among `value`'s tails takes `*u8` from a `*u8`
+        slot, and only a literal does: `_emit_expr` refuses a StrView or String
+        at any tail marked here, where an arm's own locals are still in scope.
+        With `fit`, a literal that can't be the slot's type is an error too; a
+        cast passes False, since `300 as u8` says it means to truncate.
+        """
+        if slot is None or value is None:
+            return
+        resolve = lambda ty: resolve_alias_in(ty, self.type_aliases)
+        for tail, tail_slot in slot_tails(slot, value, resolve):
+            wants_ptr = self._is_u8_ptr(tail_slot)
+            if isinstance(tail, rast.StringLit):
+                tail.as_ptr = wants_ptr
+            if wants_ptr:
+                self._ptr_tails.add(id(tail))
+            elif fit:
+                self._check_literal_fits(tail, tail_slot)
+
+    @staticmethod
+    def _is_u8_ptr(ty: Optional[rast.Type]) -> bool:
+        return (isinstance(ty, rast.PtrType) and isinstance(ty.inner, rast.NamedType)
+                and ty.inner.name == 'u8')
+
+    def _check_literal_fits(self, tail: rast.Expr, slot: rast.Type) -> None:
+        """A literal that can't be `slot` is an error wherever it is (#2341)."""
+        if not isinstance(slot, rast.NamedType) or slot.args:
+            return
+        width = self._INT_TYPE_WIDTHS.get(slot.name)
+        if width is None:
+            return
+        if isinstance(tail, rast.StringLit):
+            raise EmitError(f"a string literal does not fit in `{slot.name}`",
+                            self._value_span(tail))
+        value = self._untyped_int_literal(tail)
+        if value is not None and not self._int_literal_fits(
+                value, width, self._is_unsigned_type(slot)):
+            raise EmitError(f"`{value}` does not fit in `{slot.name}`",
+                            self._value_span(tail))
+
     def _lend_to_slot(self, slot: Optional[rast.Type],
-                      value: Optional[rast.Expr]) -> None:
+                      value: Optional[rast.Expr], fit: bool = True) -> None:
         """AGAST #2249: `value` is about to land in a `slot`-typed place, so
         each `h:& T` param it can come from lends its pointer there.
 
         The answer waits for _emit_expr, because only then is it known whether
         an arm's own binding has shadowed the param.
         """
+        self._literal_into_slot(slot, value, fit)
         if slot is None or value is None or not self._mut_borrow_args:
             return
         resolve = lambda ty: resolve_alias_in(ty, self.type_aliases)
@@ -9749,8 +9823,7 @@ class LLVMEmitter:
 
     def _lend_to_assign_target(self, target: rast.Expr, value: rast.Expr) -> None:
         """_lend_to_slot for `target = value`."""
-        if self._mut_borrow_args:
-            self._lend_to_slot(self._infer_ritz_type(target), value)
+        self._lend_to_slot(self._infer_ritz_type(target), value)
 
     def _lent_tail_borrow(self, expr: rast.Ident,
                           slot: rast.Type) -> Optional[ir.Value]:
@@ -9930,7 +10003,7 @@ class LLVMEmitter:
         if field_enum is not None:
             field_val = self._emit_enum_variant_with_type(field_expr, field_enum)
         else:
-            field_val = self._emit_expr(field_expr)
+            field_val = self._emit_into_array_slot(field_expr, expected_type)
         return self._convert_type(field_val, self._ritz_type_to_llvm(expected_type))
 
     def _sret_dest(self, fn: ir.Function, ret_type: ir.Type) -> Optional[ir.Value]:
@@ -9977,7 +10050,8 @@ class LLVMEmitter:
             if (isinstance(field_expr, rast.ArrayFill)
                     and isinstance(field_ty, ir.ArrayType)
                     and field_expr.count == field_ty.count):
-                self._emit_array_fill_to_alloca(field_expr, field_ptr, field_ty)
+                self._literal_into_slot(expected_type, field_expr)
+                self._emit_array_fill_to_alloca(field_expr, field_ptr, field_ty, expected_type)
             elif self._emit_large_lit_into(field_expr, field_ptr):
                 pass
             else:
@@ -10379,6 +10453,8 @@ class LLVMEmitter:
                         raise ValueError(f"Function pointer '{fname}' not found in locals or params")
 
                     # Emit and convert arguments
+                    for arg, param_type in zip(call.args, ritz_type.params):
+                        self._literal_into_slot(param_type, arg)
                     args = [self._emit_expr(arg) for arg in call.args]
                     converted_args = []
                     for arg, arg_val, param_type in zip(call.args, args, ritz_type.params):
@@ -10394,13 +10470,16 @@ class LLVMEmitter:
         else:
             # Non-identifier function expression (e.g., field access returning fn ptr)
             fn_ptr = self._emit_expr(call.func)
-            args = [self._emit_expr(arg) for arg in call.args]
             # AGAST #2120: the callee's type is often the alias itself
             # (`(p as EfiFn)(..)`, a field, an element, a returned fn), and
             # the alias is what carries the [[callconv]]: resolve it.
             ritz_type = self._infer_ritz_type(call.func, fn_ptr)
             if ritz_type is not None:
                 ritz_type = resolve_alias_in(ritz_type, self.type_aliases)
+            if isinstance(ritz_type, rast.FnType):
+                for arg, param_type in zip(call.args, ritz_type.params):
+                    self._literal_into_slot(param_type, arg)
+            args = [self._emit_expr(arg) for arg in call.args]
             if isinstance(ritz_type, rast.FnType):
                 args = [self._convert_type(a, self._ritz_type_to_llvm(p), arg)
                         for arg, a, p in zip(call.args, args, ritz_type.params)]
@@ -10520,12 +10599,13 @@ class LLVMEmitter:
                     f"defined with {len(self._fn_param_types(fn))}",
                     self._call_span(call))
 
-            # Emit arguments with type conversion and String -> *u8 coercion
+            # Emit arguments with type conversion
             # Also handle RERITZ Borrow semantics - borrowed params need addresses
             args = []
             for i, arg in enumerate(call.args):
                 param_def = fn_def.params[i]
                 expected_type = self._fn_param_types(fn)[i]
+                self._literal_into_slot(param_def.type, arg)
 
                 # Check if this parameter is a reference type (@T or @&T in RERITZ, or :& borrow)
                 # References pass by pointer - we need to pass the address of the argument
@@ -10544,8 +10624,7 @@ class LLVMEmitter:
                 # argument's own named type is a borrow site too — an rvalue
                 # argument (e.g. a call result) must be spilled so its address
                 # can be taken. Requiring the pointee to *match* the argument's
-                # named type keeps `*u8` params on the String/StrView coercion
-                # path below, and pointer-typed arguments (arg_is_ptr) never
+                # named type keeps `*u8` params off this path, and pointer-typed arguments (arg_is_ptr) never
                 # match because their inferred type is a PtrType, not a
                 # NamedType. This is the `_emit_call` arm of the two-sited
                 # auto-borrow defect; the `_emit_method_call` arm is #1321.
@@ -10623,24 +10702,9 @@ class LLVMEmitter:
                     if param_enum is not None:
                         val = self._emit_enum_variant_with_type(arg, param_enum)
                     else:
-                        val = self._emit_expr(arg)
+                        val = self._emit_into_array_slot(arg, param_def.type)
 
-                    # Check for String -> *u8 implicit coercion (Issue #89)
-                    arg_ritz_type = self._infer_ritz_type(arg)
-                    if (arg_ritz_type and isinstance(arg_ritz_type, rast.NamedType)
-                        and arg_ritz_type.name == 'String'
-                        and isinstance(expected_type, ir.PointerType)
-                        and expected_type.pointee == self.i8):
-                        val = self._coerce_string_to_u8_ptr(val, arg)
-                    # Check for StrView -> *u8 implicit coercion (RERITZ string literals)
-                    elif (arg_ritz_type and isinstance(arg_ritz_type, rast.NamedType)
-                          and arg_ritz_type.name == 'StrView'
-                          and isinstance(expected_type, ir.PointerType)
-                          and expected_type.pointee == self.i8):
-                        # Extract ptr field from StrView struct
-                        val = self.builder.extract_value(val, 0, name='strview.ptr')
-                    else:
-                        val = self._convert_type(val, expected_type)
+                    val = self._convert_type(val, expected_type, arg)
                 args.append(val)
 
             return self.builder.call(fn, args)
@@ -10666,28 +10730,13 @@ class LLVMEmitter:
             else:
                 fn = self.module.globals[fname]
 
-            # Emit arguments with type conversion and String -> *u8 coercion
+            # Emit arguments with type conversion
             args = []
             for i, arg in enumerate(call.args):
                 val = self._emit_expr(arg)
                 if i < len(fn_type.args):
                     expected_type = fn_type.args[i]
-                    # Check for String -> *u8 implicit coercion (Issue #89)
-                    arg_ritz_type = self._infer_ritz_type(arg)
-                    if (arg_ritz_type and isinstance(arg_ritz_type, rast.NamedType)
-                        and arg_ritz_type.name == 'String'
-                        and isinstance(expected_type, ir.PointerType)
-                        and expected_type.pointee == self.i8):
-                        val = self._coerce_string_to_u8_ptr(val, arg)
-                    # Check for StrView -> *u8 implicit coercion (RERITZ string literals)
-                    elif (arg_ritz_type and isinstance(arg_ritz_type, rast.NamedType)
-                          and arg_ritz_type.name == 'StrView'
-                          and isinstance(expected_type, ir.PointerType)
-                          and expected_type.pointee == self.i8):
-                        # Extract ptr field from StrView struct
-                        val = self.builder.extract_value(val, 0, name='strview.ptr')
-                    else:
-                        val = self._convert_type(val, expected_type)
+                    val = self._convert_type(val, expected_type, arg)
                 args.append(val)
 
             return self.builder.call(fn, args)
@@ -12026,11 +12075,14 @@ class LLVMEmitter:
             # Static method - just emit the arguments, no receiver
             all_args = []
             for i, arg in enumerate(expr.args):
+                if i < len(fn_def.params):
+                    self._literal_into_slot(fn_def.params[i].type, arg)
                 if i < len(fn_def.params) and self._takes_place(fn_def.params[i]):
                     all_args.append(self._emit_place_borrow(
                         arg, self._fn_param_types(fn)[i], expr.method, i + 1))
                 else:
-                    all_args.append(self._emit_expr(arg))
+                    slot = fn_def.params[i].type if i < len(fn_def.params) else None
+                    all_args.append(self._emit_into_array_slot(arg, slot))
 
             # Convert argument types as needed
             converted_args = []
@@ -12114,6 +12166,8 @@ class LLVMEmitter:
         all_args = [receiver_val]
         for j, arg in enumerate(expr.args, start=1):
             expected_type = self._fn_param_types(fn)[j] if j < len(self._fn_param_types(fn)) else None
+            if j < len(fn_def.params):
+                self._literal_into_slot(fn_def.params[j].type, arg)
             if j < len(fn_def.params) and self._takes_place(fn_def.params[j]):
                 all_args.append(self._emit_place_borrow(arg, expected_type, expr.method, j + 1))
                 continue
@@ -12152,7 +12206,8 @@ class LLVMEmitter:
                         val = tmp_val
                 all_args.append(val)
             else:
-                all_args.append(self._emit_expr(arg))
+                slot = fn_def.params[j].type if j < len(fn_def.params) else None
+                all_args.append(self._emit_into_array_slot(arg, slot))
 
         # Convert argument types as needed
         converted_args = []
@@ -12207,6 +12262,9 @@ class LLVMEmitter:
 
         # Build arguments: data_ptr as opaque self, then explicit args
         all_args = [data_ptr]
+        trait_params = self.traits[trait_name][method_index - 1].params
+        for arg, param in zip(expr.args, trait_params[-len(expr.args):]):
+            self._literal_into_slot(param.type, arg)
         for arg in expr.args:
             all_args.append(self._emit_expr(arg))
 
@@ -12490,6 +12548,16 @@ class LLVMEmitter:
             raise EmitError(bool_rules.bool_into_slot(self._value_kind(target_type)), span)
         raise EmitError(bool_rules.value_into_bool(self._value_kind(val.type)), span)
 
+    def _check_str_tail(self, val: ir.Value, tail: rast.Expr) -> None:
+        """No conversion reaches `*u8` from a StrView or String. A literal took
+        `*u8` from its slot before it was emitted, so it never gets here."""
+        if isinstance(val.type, ir.PointerType):
+            return
+        name = self._get_struct_name_from_type(val.type)
+        if name == 'String' or self._is_strview_llvm_type(val.type):
+            raise EmitError(_STR_AS_PTR['String' if name == 'String' else 'StrView'],
+                            self._value_span(tail))
+
     def _convert_type(self, val: ir.Value, target_type: ir.Type,
                       at: Optional[rast.Expr] = None) -> ir.Value:
         """Convert a value to the target type if needed. `at` is the expression
@@ -12707,38 +12775,6 @@ class LLVMEmitter:
             i += 1
         return False
 
-    def _check_int_literal_fits_declaration(self, stmt) -> None:
-        """Reject `let n: u32 = 4294967301` — a literal that cannot be a u32.
-
-        AGAST #1396. Contextual literal typing means an untyped integer
-        literal now adopts its declared type, so a literal that does not fit
-        that type is no longer a narrowing question at all: there is no
-        possible value of the declared type the programmer could have meant.
-        `_convert_type` used to truncate it silently (4294967301 -> 5).
-
-        Deliberately narrower than #1393/#1364's open question about implicit
-        narrowing in general. This fires only on a literal whose value is
-        known at compile time and provably out of range — the corpus sweep
-        across 115 packages found ZERO such sites, so it cannot red any
-        existing code.
-        """
-        declared = getattr(stmt, "type", None)
-        if not isinstance(declared, rast.NamedType) or declared.args:
-            return
-        width = self._INT_TYPE_WIDTHS.get(declared.name)
-        if width is None:
-            return
-        value = self._untyped_int_literal(getattr(stmt, "value", None))
-        if value is None:
-            return
-        if self._int_literal_fits(value, width, self._is_unsigned_type(declared)):
-            return
-        raise EmitError(
-            f"`{value}` does not fit in `{declared.name}` "
-            f"(declared type of `{stmt.name}`)",
-            getattr(stmt, "span", None),
-        )
-
     # Ring operations folded by `_const_int_value`: their low bits do not
     # depend on the width the intermediate was computed at, so the folded
     # value truncated to the declared width is exactly what the generated
@@ -12868,28 +12904,12 @@ class LLVMEmitter:
         invisible. An explicit `as T` needs no special case: the Cast has
         already produced the declared width, so nothing narrows here.
         """
-        if not (isinstance(src_ty, ir.IntType) and isinstance(declared_ty, ir.IntType)):
-            return
-        if src_ty.width <= declared_ty.width or declared_ty.width == 1:
-            return
         declared = getattr(stmt, "type", None)
-        unsigned = self._is_unsigned_type(declared)
-        rng = self._provable_int_range(getattr(stmt, "value", None), whole=True)
-        if rng is not None:
-            lo, hi = rng
-            if (self._int_literal_fits(lo, declared_ty.width, unsigned)
-                    and self._int_literal_fits(hi, declared_ty.width, unsigned)):
-                return
+        src_name = self._unproven_narrowing(getattr(stmt, "value", None), src_ty,
+                                            declared_ty, declared)
+        if src_name is None:
+            return
         declared_name = self._format_ritz_type(declared)
-        src_name = None
-        try:
-            inferred = self._infer_ritz_type(stmt.value)
-            if isinstance(inferred, rast.NamedType) and inferred.name in self._INT_TYPE_WIDTHS:
-                src_name = inferred.name
-        except Exception:
-            src_name = None
-        if src_name is None or self._INT_TYPE_WIDTHS.get(src_name) != src_ty.width:
-            src_name = f"i{src_ty.width}"
         raise EmitError(
             f"implicit narrowing: `{stmt.name}` is declared `{declared_name}` "
             f"but its initialiser has type `{src_name}`, and the compiler "
@@ -12897,6 +12917,45 @@ class LLVMEmitter:
             f"if truncation is intended, or declare `{stmt.name}` as "
             f"`{src_name}`",
             getattr(stmt, "span", None),
+        )
+
+    def _unproven_narrowing(self, value, src_ty: ir.Type, declared_ty: ir.Type,
+                            declared) -> Optional[str]:
+        """The source type's name if `value` narrows and might lose bits."""
+        if not (isinstance(src_ty, ir.IntType) and isinstance(declared_ty, ir.IntType)):
+            return None
+        if src_ty.width <= declared_ty.width or declared_ty.width == 1:
+            return None
+        unsigned = self._is_unsigned_type(declared)
+        rng = self._provable_int_range(value, whole=True)
+        if rng is not None:
+            lo, hi = rng
+            if (self._int_literal_fits(lo, declared_ty.width, unsigned)
+                    and self._int_literal_fits(hi, declared_ty.width, unsigned)):
+                return None
+        src_name = None
+        try:
+            inferred = self._infer_ritz_type(value)
+            if isinstance(inferred, rast.NamedType) and inferred.name in self._INT_TYPE_WIDTHS:
+                src_name = inferred.name
+        except Exception:
+            src_name = None
+        if src_name is None or self._INT_TYPE_WIDTHS.get(src_name) != src_ty.width:
+            src_name = f"i{src_ty.width}"
+        return src_name
+
+    def _check_element_narrowing(self, element: rast.Expr, src_ty: ir.Type,
+                                 declared_ty: ir.Type, declared: rast.Type) -> None:
+        """Section 7.5 for one array element: `[1, k]` into `[2]u8` (#2341)."""
+        src_name = self._unproven_narrowing(element, src_ty, declared_ty, declared)
+        if src_name is None:
+            return
+        declared_name = self._format_ritz_type(declared)
+        raise EmitError(
+            f"implicit narrowing: this element of a `{declared_name}` array has "
+            f"type `{src_name}`, and the compiler cannot prove the value fits. "
+            f"Write `<expr> as {declared_name}` if truncation is intended",
+            self._value_span(element),
         )
 
     def _check_initialiser_has_value(self, stmt, val) -> None:
@@ -14334,7 +14393,7 @@ class LLVMEmitter:
 
         # Check if casting FROM a union type to a variant type
         # This happens in match arms: x as i32, x as *u8, etc.
-        self._lend_to_slot(expr.target, expr.expr)
+        self._lend_to_slot(expr.target, expr.expr, fit=False)
         val = self._emit_expr(expr.expr)
 
         # Check if the source expression's type is a union
@@ -14354,15 +14413,6 @@ class LLVMEmitter:
             enum_int = self._try_emit_enum_to_int(val, target_type, expr)
             if enum_int is not None:
                 return enum_int
-
-        # Handle StrView -> *u8 cast (common RERITZ pattern: "str" as *u8)
-        # StrView is {ptr, len}, we extract the ptr field
-        src_ritz_type = self._infer_ritz_type(expr.expr)
-        if (src_ritz_type and isinstance(src_ritz_type, rast.NamedType)
-            and src_ritz_type.name == 'StrView'
-            and isinstance(target_type, ir.PointerType)
-            and target_type.pointee == self.i8):
-            return self.builder.extract_value(val, 0, name='strview.ptr')
 
         # Check if source OR target is unsigned for proper extension
         # When casting to unsigned (e.g., i32 as u64), use zext to avoid sign pollution
