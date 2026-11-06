@@ -217,7 +217,8 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
     # emit_expr strides it by sizeof(S) (deref_pointee_struct_name names S
     # for the left operand), so `(*(*(pp + i) + k)).f` GEPs into the right
     # element.  Only the one-level case: `(**(ppp + 1)).f` keeps its error.
-    if x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB)
+    # AGAST #2332: and `a[i]` / `a[i] + k` with `a: [N]*S`.
+    if x.kind == EXPR_INDEX or (x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB))
         var b_name: *u8 = null
         var b_len: i32 = 0
         deref_pointee_struct_name(s, x, @b_name, @b_len)
@@ -516,6 +517,10 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     # Array element case: struct_array[idx].field
     # e.left is EXPR_INDEX, representing struct_array[idx]
     else if e.left.kind == EXPR_INDEX
+        # AGAST #2332: `a[i].f` / `a[i][j].f` with `a: [N]*S`, whatever holds
+        # the array.  The field arm below took it for an inline `[N]S`.
+        if emit_array_elem_member_ptr(s, e, result) == 1
+            return
         # AGAST #1509: `g[i][j].field` over a multi-dimensional array of
         # structs.  Any other member access on an N-D base is left
         # unresolved, so the caller reports it instead of guessing.
@@ -731,6 +736,31 @@ fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
 # pointer is an i64 value in ritz1, so: inttoptr, GEP one St per index, then
 # the field.  Returns 1 with `result` filled, or 0 if St or the field is
 # unknown (the caller falls through to the "unhandled EXPR_MEMBER" error).
+# AGAST #2332: address of `a[i].field` and `a[i][j].field` for `a: [N]*S`.
+# Returns 1 when it took `e`.
+fn emit_array_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult) -> i32
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if array_elem_pointee(s, e.left.left, @name, @name_len) == TYPE_STRUCT
+        return emit_ptr_elem_member_ptr(s, e, result, name, name_len)
+    if array_elem_pointee(s, e.left, @name, @name_len) != TYPE_STRUCT
+        return 0
+    let st: *StructDef = find_struct(s, name, name_len)
+    if st == null
+        return 0
+    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if field_idx < 0
+        return 0
+    let val: i32 = emit_expr(s, e.left)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, val)
+    emit_str(s, c" to ptr\n")
+    emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
+    1
+
 fn emit_ptr_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult, st_name: *u8, st_name_len: i32) -> i32
     let st: *StructDef = find_struct(s, st_name, st_name_len)
     if st == null

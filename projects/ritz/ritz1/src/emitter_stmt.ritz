@@ -78,6 +78,22 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     stmt.var_pointee_array_elem_type = elem
     return 1
 
+# AGAST #2332: `let q = a[i]` and `let q = a[i] + k` with `a: [N]*T` hold what
+# `let q: *T` does.  Returns 1 when it typed the local.
+fn infer_array_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
+    if stmt.var_declared_type != TYPE_VOID or stmt.var_init == null
+        return 0
+    var name: *u8 = null
+    var name_len: i32 = 0
+    let pointee: i32 = array_elem_pointee(s, stmt.var_init, @name, @name_len)
+    if pointee == TYPE_VOID
+        return 0
+    stmt.var_type = TYPE_PTR
+    stmt.var_pointee_type = pointee
+    stmt.var_type_name = name
+    stmt.var_type_name_len = name_len
+    return 1
+
 # AGAST #2335, #2338: 1 when an un-annotated `let` or `var` holds an `@T`:
 # `let p = @x`, or a copy of one from a local, a field or a call.  Ask before the
 # inference in emit_var_decl rewrites var_type, or `let p: *C = @c` looks like it.
@@ -594,6 +610,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
 
     if infer_array_ptr_let(s, stmt) == 1
         var_type = stmt.var_type
+    if infer_array_elem_let(s, stmt) == 1
+        var_type = stmt.var_type
 
     # `let task = @member.field[i]` — when the indexed field is an array
     # of struct, infer the local as `*ElementStruct` so subsequent
@@ -993,7 +1011,15 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
     # Check for expression assignment: expr = value
     # When assign_target_len == 0, the target is in if_cond as an expression
     if stmt.assign_target_len == 0
-        let target_expr: *Expr = stmt.if_cond as *Expr
+        var target_expr: *Expr = stmt.if_cond as *Expr
+
+        # AGAST #2332: `a[i][j] = v` with `a: [N]*T` is `*(a[i] + j) = v`.  The
+        # generic path below stored through the VALUE of `a[i][j]`.
+        var ei_sum: Expr
+        var ei_deref: Expr
+        if is_array_elem_index(s, target_expr) == 1
+            elem_index_as_deref(target_expr, @ei_sum, @ei_deref)
+            target_expr = @ei_deref
 
         # AGAST #1509: `g[i][j] = v` over a multi-dimensional array.  It fell
         # to the generic path below, which evaluated `g[i][j]` as a VALUE
@@ -1851,6 +1877,10 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # base pointer instead of an SSA reg.
     var const_name: *u8 = null
     var const_name_len: i32 = 0
+    # AGAST #2332: what the binding points at, for an element of `[N]*T`.
+    var bind_pointee: i32 = TYPE_VOID
+    var bind_name: *u8 = null
+    var bind_name_len: i32 = 0
 
     let iter: *Expr = stmt.for_start
     if iter != null
@@ -1868,6 +1898,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     elem_type = loc.array_elem_type
                     arr_size = loc.array_size
                     data_reg = loc.reg
+                    bind_pointee = elem_recorded_pointee(s, elem_type, loc.array_elem_pointee, loc.type_name, loc.type_name_len, @bind_name, @bind_name_len)
             else
                 # Iter is not a local — try a module const array
                 # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
@@ -1911,7 +1942,10 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     emit_llvm_type(s, elem_type)
     emit_str(s, c"\n")
 
-    add_local(s, stmt.for_var, stmt.for_var_len, var_reg, elem_type)
+    if bind_pointee != TYPE_VOID
+        add_local_full(s, stmt.for_var, stmt.for_var_len, var_reg, elem_type, bind_name, bind_name_len, bind_pointee, 0, 0)
+    else
+        add_local(s, stmt.for_var, stmt.for_var_len, var_reg, elem_type)
 
     let cond_label: i32 = next_label(s)
     let body_label: i32 = next_label(s)

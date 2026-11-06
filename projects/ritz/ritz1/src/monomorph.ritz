@@ -1289,6 +1289,7 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
     cloned.param_pointee_array_shape = array_shape_subst(params.param_pointee_array_shape, type_param, type_param_len, subst_type, subst_name, subst_len)  # AGAST #2290
     cloned.param_array_size = params.param_array_size
     cloned.param_array_elem_type = params.param_array_elem_type
+    cloned.param_array_elem_pointee = params.param_array_elem_pointee   # AGAST #2332
     cloned.is_borrow = params.is_borrow
     cloned.is_self_borrow = params.is_self_borrow
     cloned.param_ref_ptr_pointee = params.param_ref_ptr_pointee   # AGAST #2308
@@ -1299,6 +1300,8 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
         if cloned.param_type_name_len == type_param_len and memcmp(cloned.param_type_name, type_param, type_param_len as i64) == 0
             if cloned.param_array_elem_type == TYPE_STRUCT
                 cloned.param_array_elem_type = subst_type
+            if cloned.param_array_elem_pointee == TYPE_STRUCT
+                cloned.param_array_elem_pointee = subst_type   # AGAST #2332: `[N]*T`
             cloned.param_type_name = subst_name
             cloned.param_type_name_len = subst_len
         else
@@ -1576,6 +1579,11 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         else
             cloned.var_type_name = s.var_type_name
             cloned.var_type_name_len = s.var_type_name_len
+        # AGAST #2332: `var a: [N]*T` at T = the argument.
+        if s.var_array_elem_pointee == TYPE_STRUCT and s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+            cloned.var_array_elem_pointee = subst_type
+            cloned.var_type_name = subst_name
+            cloned.var_type_name_len = subst_len
         # AGAST #2308: `let p: @&T` concretizes T as a `@&T` param does.
         cloned.var_ref = clone_params_with_suffix(s.var_ref, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         if cloned.var_ref != null
@@ -2000,6 +2008,7 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
     # Copy array info
     cloned.array_size = fields.array_size
     cloned.array_elem_type = fields.array_elem_type
+    cloned.array_elem_pointee = fields.array_elem_pointee   # AGAST #2332
     cloned.field_mut_ref = fields.field_mut_ref
     cloned.field_shared_ref = fields.field_shared_ref
     cloned.array_elem_type_name = fields.array_elem_type_name
@@ -2014,11 +2023,22 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
         if fields.field_type_name != null and fields.field_type_name_len == type_param_len
             if memcmp(fields.field_type_name, type_param, type_param_len as i64) == 0
                 subst_pointee_field(cloned, subst_type, subst_name, subst_len)
+    subst_array_ptr_field(cloned, type_param, type_param_len, subst_type, subst_name, subst_len)
 
     # Clone rest of the list
     cloned.next = clone_struct_fields(fields.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
 
     return cloned
+
+# AGAST #2332: a field `a: [N]*T`, at T = the argument (subst_type, subst_name).
+fn subst_array_ptr_field(cloned: *StructField, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32)
+    if cloned.array_elem_pointee != TYPE_STRUCT or cloned.array_elem_type_name == null or cloned.array_elem_type_name_len != type_param_len
+        return
+    if memcmp(cloned.array_elem_type_name, type_param, type_param_len as i64) != 0
+        return
+    cloned.array_elem_pointee = subst_type
+    cloned.array_elem_type_name = subst_name
+    cloned.array_elem_type_name_len = subst_len
 
 # A by-value field `x: T`, at T = the argument (subst_type, subst_name).
 fn subst_value_field(cloned: *StructField, subst_type: i32, subst_name: *u8, subst_len: i32)
@@ -2073,6 +2093,7 @@ fn clone_struct_fields_multi(fields: *StructField, tp: *TypeParam, suffix: *u8, 
     cloned.field_type_name_len = fields.field_type_name_len
     cloned.array_size = fields.array_size
     cloned.array_elem_type = fields.array_elem_type
+    cloned.array_elem_pointee = fields.array_elem_pointee   # AGAST #2332
     cloned.field_mut_ref = fields.field_mut_ref
     cloned.field_shared_ref = fields.field_shared_ref
     cloned.array_elem_type_name = fields.array_elem_type_name
@@ -2102,6 +2123,15 @@ fn clone_struct_fields_multi(fields: *StructField, tp: *TypeParam, suffix: *u8, 
             var new_len: i32 = 0
             cloned.field_type_name = substitute_params_in_mangled(tp, suffix, starts, lens, fields.field_type_name, fields.field_type_name_len, @new_len)
             cloned.field_type_name_len = new_len
+
+    if fields.array_elem_pointee == TYPE_STRUCT and fields.array_elem_type_name != null
+        let ai: i32 = type_param_index(tp, fields.array_elem_type_name, fields.array_elem_type_name_len)
+        if ai >= 0
+            var ae_name: *u8 = null
+            var ae_len: i32 = 0
+            let arg_e: *u8 = suffix + *(starts + ai)
+            get_type_name_from_suffix(arg_e, *(lens + ai), @ae_name, @ae_len)
+            subst_array_ptr_field(cloned, fields.array_elem_type_name, fields.array_elem_type_name_len, parse_type_from_suffix(arg_e, *(lens + ai)), ae_name, ae_len)
 
     cloned.next = clone_struct_fields_multi(fields.next, tp, suffix, starts, lens)
     return cloned

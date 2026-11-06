@@ -3113,6 +3113,11 @@ fn index_elem_struct_name(s: *EmitterState, ie: *Expr, out_name: **u8, out_len: 
     *out_len = 0
     if ie == null or ie.kind != EXPR_INDEX or ie.left == null
         return
+    # AGAST #2332: an element of `[N]*S`, whatever holds the array.
+    if array_elem_pointee(s, ie, out_name, out_len) == TYPE_STRUCT
+        return
+    if array_elem_pointee(s, ie.left, out_name, out_len) == TYPE_STRUCT
+        return   # `a[i][j]`
     var nd_depth: i32 = 0
     let nd_sh: *ArrayShape = nd_index_shape(s, ie, @nd_depth)
     if nd_sh != null
@@ -3566,6 +3571,11 @@ fn member_field_def(s: *EmitterState, e: *Expr) -> *StructField
     # AGAST #1647: `mk().f` / `p.m().f` — the callee's struct return type.
     else if e.left.kind == EXPR_CALL or e.left.kind == EXPR_METHOD
         call_result_struct_name(s, e.left, @recv, @recv_len)
+    # AGAST #2332: `a[i].f` with `a: [N]*S`, so `f` has its own type.
+    else if e.left.kind == EXPR_INDEX
+        array_elem_pointee(s, e.left, @recv, @recv_len)
+        if recv == null
+            array_elem_pointee(s, e.left.left, @recv, @recv_len)   # `a[i][j].f`
     if recv == null or recv_len <= 0
         return null
     let st: *StructDef = find_struct(s, recv, recv_len)
@@ -3618,6 +3628,110 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
         return ptr_elem_size_unknown(s, e.ident_ptr, e.ident_len)
     emit_ir_error(s, c"pointer arithmetic: element size of pointee unknown for a non-name operand")
     return 1
+
+# AGAST #2332: U when `x` is an element of a `[N]*U` array (local, param, global,
+# or field at any depth, N-D too) or that element `+ k`, with a struct U's name in
+# *out_name / *out_len.  TYPE_VOID for anything else, so an integer `a[i] + 1`
+# stays an integer.  `[N]**U` records no U, and `*[N]*U` is refused (#2347).
+fn array_elem_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    var b: *Expr = x
+    while b != null and b.kind == EXPR_BINARY and (b.op == OP_ADD or b.op == OP_SUB)
+        if is_array_elem_distance(s, b) == 1
+            return TYPE_VOID
+        b = b.left
+    if b == null or b.kind != EXPR_INDEX or b.left == null
+        return TYPE_VOID
+    if b.right != null and b.right.kind == EXPR_RANGE
+        return TYPE_VOID
+    var elem: i32 = TYPE_VOID
+    var pointee: i32 = TYPE_VOID
+    var name: *u8 = null
+    var name_len: i32 = 0
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, b, @depth)
+    if sh != null
+        if depth == sh.rank
+            elem = sh.leaf_type
+            pointee = sh.leaf_pointee
+            name = sh.leaf_name
+            name_len = sh.leaf_name_len
+    else if b.left.kind == EXPR_MEMBER
+        let f: *StructField = resolve_member_chain_field(s, b.left)
+        if f != null and f.field_type == TYPE_ARRAY
+            elem = f.array_elem_type
+            pointee = f.array_elem_pointee
+            name = f.array_elem_type_name
+            name_len = f.array_elem_type_name_len
+    else if b.left.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, b.left.ident_ptr, b.left.ident_len)
+        if loc != null
+            if loc.var_type == TYPE_ARRAY
+                elem = loc.array_elem_type
+                pointee = loc.array_elem_pointee
+                name = loc.type_name
+                name_len = loc.type_name_len
+        else
+            let g: *GlobalVarDef = find_global(s, b.left.ident_ptr, b.left.ident_len)
+            if g != null and g.var_type == TYPE_ARRAY
+                elem = g.array_elem_type
+                pointee = g.array_elem_pointee
+                name = g.array_elem_type_name
+                name_len = g.array_elem_type_name_len
+    elem_recorded_pointee(s, elem, pointee, name, name_len, out_name, out_len)
+
+# What an array's record says its element points at: U for an `elem` of TYPE_PTR
+# recording `pointee` U, TYPE_VOID otherwise.  A struct U's name goes to *out_name.
+fn elem_recorded_pointee(s: *EmitterState, elem: i32, pointee: i32, name: *u8, name_len: i32, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    if elem != TYPE_PTR
+        return TYPE_VOID
+    if pointee == TYPE_STRUCT
+        if name_len <= 0
+            return TYPE_VOID
+        *out_name = name
+        *out_len = name_len
+        return TYPE_STRUCT
+    if primitive_name_len(pointee) > 0
+        return pointee
+    TYPE_VOID
+
+# array_elem_pointee, when the caller doesn't need a struct's name.
+fn array_elem_pointee_kind(s: *EmitterState, x: *Expr) -> i32
+    var name: *u8 = null
+    var name_len: i32 = 0
+    array_elem_pointee(s, x, @name, @name_len)
+
+# AGAST #2332: 1 when `e` is `a[i] - q` with `a: [N]*T` and `q` a pointer.  That's
+# a distance, in bytes as it always was: an integer with no stride.
+fn is_array_elem_distance(s: *EmitterState, e: *Expr) -> i32
+    if e.kind != EXPR_BINARY or e.op != OP_SUB or array_elem_pointee_kind(s, e.left) == TYPE_VOID
+        return 0
+    (array_elem_pointee_kind(s, e.right) != TYPE_VOID or get_expr_type(s, e.right) == TYPE_PTR) as i32
+
+# AGAST #2332: 1 when `e` is `a[i][j]` over an `a: [N]*T` element.  That's a
+# pointer index, not an array's, and elem_index_as_deref lowers it.
+fn is_array_elem_index(s: *EmitterState, e: *Expr) -> i32
+    if e == null or e.kind != EXPR_INDEX or e.left == null or e.left.kind != EXPR_INDEX
+        return 0
+    (array_elem_pointee_kind(s, e.left) != TYPE_VOID) as i32
+
+# Fill `sum` and `deref` with `*(a[i] + j)` for `e` = `a[i][j]`, so the load and
+# the store take the `*` paths: one width and one stride, struct T included.
+fn elem_index_as_deref(e: *Expr, sum: *Expr, deref: *Expr)
+    sum.kind = EXPR_BINARY
+    sum.span = e.span
+    sum.op = OP_ADD
+    sum.left = e.left
+    sum.right = e.right
+    sum.next = null
+    deref.kind = EXPR_UNARY
+    deref.span = e.span
+    deref.op = OP_DEREF
+    deref.operand = sum
+    deref.next = null
 
 # AGAST #1924: the static pointer type of `x`, as a level count plus the
 # innermost pointee.  Returns the levels (1 = `*T`, 2 = `**T`, 3 = `***T`)
@@ -3819,6 +3933,12 @@ fn ptr_arith_elem_size(s: *EmitterState, e: *Expr) -> i64
         if e.op == OP_ADD or e.op == OP_SUB
             return ptr_arith_elem_size(s, e.left)
         return 0
+    if e.kind == EXPR_INDEX
+        # AGAST #2332: `a[i] + k` with `a: [N]*T` strides by sizeof(T).
+        var ae_name: *u8 = null
+        var ae_len: i32 = 0
+        let ae: i32 = array_elem_pointee(s, e, @ae_name, @ae_len)
+        return ptr_pointee_size(s, ae, ae_name, ae_len)
     if e.kind == EXPR_UNARY
         # AGAST #1603: `@arr[i] + n`.  The address of an indexed element is a
         # pointer to that element, so it strides by the element size.  Without
@@ -3927,6 +4047,10 @@ fn get_deref_store_type(s: *EmitterState, ptr_expr: *Expr) -> i32
     let inl_pt: i32 = inline_deref_scalar_pointee(s, ptr_expr)
     if inl_pt != TYPE_VOID
         return inl_pt
+    # AGAST #2332: `*a[i] = v` / `*(a[i] + k) = v` with `a: [N]*T`.
+    let el_pt: i32 = array_elem_pointee_kind(s, ptr_expr)
+    if el_pt != TYPE_VOID
+        return el_pt
     if ptr_expr.kind == EXPR_IDENT
         let lpt: i32 = find_local_pointee_type(s, ptr_expr.ident_ptr, ptr_expr.ident_len)
         if lpt != TYPE_I64
@@ -4328,6 +4452,9 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             return cft
         return TYPE_I64
     else if e.kind == EXPR_INDEX
+        # AGAST #2332: `a[i][j]` with `a: [N]*T` is a T.
+        if is_array_elem_index(s, e) == 1
+            return array_elem_pointee_kind(s, e.left)
         # Indexing: result type depends on base type.
         # AGAST #1328: resolve the base through locals THEN globals — the old
         # code only saw locals, and find_local_type's TYPE_I64 miss value made
@@ -4421,6 +4548,10 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             let inl_pt: i32 = inline_deref_scalar_pointee(s, e.operand)
             if inl_pt != TYPE_VOID
                 return inl_pt
+            # AGAST #2332: `*a[i]` / `*(a[i] + k)` with `a: [N]*T`.
+            let el_pt: i32 = array_elem_pointee_kind(s, e.operand)
+            if el_pt != TYPE_VOID
+                return el_pt
             # AGAST #1924: `*(ppp + i)` with `ppp: ***T` is itself a `**T`.
             # The arm below calls every deref of a `**` a `*T`, so the next
             # deref out lost the pointee and `*(*(*(ppp + i) + j) + k)`

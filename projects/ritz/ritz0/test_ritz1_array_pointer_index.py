@@ -409,8 +409,9 @@ def test_ritz1_refuses_to_index_a_pointer_to_rows(compile_with, name, compiler):
     assert "a pointer to a multi-dimensional array can't be indexed" in comp.stderr
 
 
-# AGAST #2332: nothing records what an element points at, so `*p[1]` would take 8
-# bytes of an `i16`, and `*p[1] = 7` its neighbour.  Each returns 72 on ritz0.
+# `p[i]` over a pointer to an array of pointers stays refused while #2347 is open.
+# ritz0 reads these (72 for the stores).  `a[i]` on the array itself is #2332's, and
+# test_ritz1_array_ptr_element.py covers it.
 _PTRS = """
 pub fn main() -> i32
     var x: [2]i16
