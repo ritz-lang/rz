@@ -4171,27 +4171,45 @@ pub fn expr_if_inline(p: *Parser, cond: *Expr, then_val: *Expr, else_val: *Expr,
     let else_body: *Stmt = stmt_expr(p, else_val, else_val.span.line, else_val.span.col)
     return expr_if(p, cond, then_body, else_body, line, col)
 
-# One arm of an EXPR_IF.  A block ending in an `if`/`else` STATEMENT takes
-# that if's value: the grammar parses the nested `if` (and an `else if`
-# chain, whose else block is a single if_stmt) as STMT_IF, so it is rewritten
-# here into a trailing EXPR_IF expression statement before the value is
-# detached.  An else-less trailing `if` is left alone: it has no value, and
-# emit_if_expr reports the arm as valueless.
-fn if_arm_from_block(p: *Parser, stmts: *Stmt) -> *MatchArm
+# A block ending in an `if`/`else` or a `match` STATEMENT takes its value: the
+# grammar parses a nested `if` (and an `else if` chain, whose else block is a
+# single if_stmt) as STMT_IF and a nested `match` as STMT_MATCH, so the last
+# one is rewritten here into a trailing EXPR_IF / EXPR_MATCH expression
+# statement, which match_arm_set_block then detaches as the value.  An
+# else-less trailing `if` is left alone: it has no value.  Returns the head.
+#
+# AGAST #2429: match arms skipped this, so `Some(v) =>` + a block ending in
+# `match v` / `if`..`else` yielded 0, silently.  The rewritten tail is an
+# expression arm like `=> match v`, so a valueless one (void-call arms) is the
+# located error #2046 gives that form when the outer value is wanted.
+fn block_tail_as_value(p: *Parser, stmts: *Stmt) -> *Stmt
     var head: *Stmt = stmts
     var prev: *Stmt = null
     var last: *Stmt = stmts
     while last != null and last.next != null
         prev = last
         last = last.next
+    var inner: *Expr = null
     if last != null and last.kind == STMT_IF and last.if_else != null
-        let inner: *Expr = expr_if(p, last.if_cond, last.if_then, last.if_else, last.span.line, last.span.col)
+        inner = expr_if(p, last.if_cond, last.if_then, last.if_else, last.span.line, last.span.col)
+    else if last != null and last.kind == STMT_MATCH
+        inner = expr_match(p, last.if_cond, last.if_then as *MatchArm, last.span.line, last.span.col)
+    if inner != null
         let st: *Stmt = stmt_expr(p, inner, last.span.line, last.span.col)
         if prev == null
             head = st
         else
             prev.next = st
-    return match_arm_set_block(match_arm_wildcard(p), head)
+    return head
+
+# One arm of an EXPR_IF: a wildcard arm whose value is the block's tail.
+fn if_arm_from_block(p: *Parser, stmts: *Stmt) -> *MatchArm
+    return match_arm_set_block(match_arm_wildcard(p), block_tail_as_value(p, stmts))
+
+# A block-bodied match arm (`Some(v) =>` + indented statements, #1454): its
+# value is the block's tail, a trailing match or if/else included (#2429).
+pub fn match_arm_set_block_tail(p: *Parser, arm: *MatchArm, stmts: *Stmt) -> *MatchArm
+    return match_arm_set_block(arm, block_tail_as_value(p, stmts))
 
 # =============================================================================
 # Wave 5F.2 — wrappers called from the canonical grammar (ritz1.grammar)

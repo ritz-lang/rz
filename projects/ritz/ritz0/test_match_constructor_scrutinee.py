@@ -18,9 +18,8 @@ The expected exit codes come from what each program says, not from a compiler.
 ritz0 reuses a specialization the module already registered and has none to reuse
 without one (#2433), so its rows carry _REGISTERED.
 
-A nested arm here assigns, since an arm whose tail is a match loses its value
-(#2429). The types are `Pair` and `Slot` because `Option<P>` is never declared
-(#2432).
+A nested match is an arm's tail, which is its value (#2429). The types are `Pair`
+and `Slot` because `Option<P>` is never declared (#2432).
 """
 
 import os
@@ -128,22 +127,18 @@ PAYLOADS = {
                           before="let x: i32 = 2"), 5),
     "struct_param": (_P + "fn f(p: Pair) -> i32\n    match Some(p)\n        Some(v) => v.a + v.b\n"
                      "        _ => 2\n" + _MAIN + "    f(Pair { a: 2, b: 3 })\n", 5),
-    "user_variant": (_U + _MAIN + "    var r: i32 = 0\n    match Some(Holds(5))\n        Some(v) =>\n"
-                  "            match v\n                Holds(w) =>\n                    r = w\n"
-                  "                Vacant =>\n                    r = 3\n"
-                  "        _ =>\n            r = 2\n    r\n", 5),
-    "user_unit_variant": (_U + _MAIN + "    var r: i32 = 0\n    match Some(Vacant)\n        Some(v) =>\n"
-                  "            match v\n                Holds(w) =>\n                    r = 1\n"
-                  "                Vacant =>\n                    r = 3\n"
-                  "        _ =>\n            r = 2\n    r\n", 3),
-    "qualified_variant": (_U + _MAIN + "    var r: i32 = 0\n    match Some(Slot.Holds(5))\n        Some(v) =>\n"
-                  "            match v\n                Holds(w) =>\n                    r = w\n"
-                  "                Vacant =>\n                    r = 3\n"
-                  "        _ =>\n            r = 2\n    r\n", 5),
-    "user_enum_local": (_U + _MAIN + "    let u: Slot = Slot.Holds(5)\n    var r: i32 = 0\n    match Some(u)\n        Some(v) =>\n"
-                  "            match v\n                Holds(w) =>\n                    r = w\n"
-                  "                Vacant =>\n                    r = 3\n"
-                  "        _ =>\n            r = 2\n    r\n", 5),
+    "user_variant": (_U + _MAIN + "    match Some(Holds(5))\n        Some(v) =>\n"
+                  "            match v\n                Holds(w) => w\n                Vacant => 3\n"
+                  "        _ => 2\n", 5),
+    "user_unit_variant": (_U + _MAIN + "    match Some(Vacant)\n        Some(v) =>\n"
+                  "            match v\n                Holds(w) => 1\n                Vacant => 3\n"
+                  "        _ => 2\n", 3),
+    "qualified_variant": (_U + _MAIN + "    match Some(Slot.Holds(5))\n        Some(v) =>\n"
+                  "            match v\n                Holds(w) => w\n                Vacant => 3\n"
+                  "        _ => 2\n", 5),
+    "user_enum_local": (_U + _MAIN + "    let u: Slot = Slot.Holds(5)\n    match Some(u)\n        Some(v) =>\n"
+                  "            match v\n                Holds(w) => w\n                Vacant => 3\n"
+                  "        _ => 2\n", 5),
 }
 
 # The enum around the match is another one, and the scrutinee isn't its value.
@@ -170,9 +165,9 @@ AROUND = {
         "fn h(o: Option<i32>, n: i64) -> i32\n    n as i32\n" + _MAIN
         + "    let n: i64 = 5\n    h(None, n)\n", 5),
     "nested_match": (
-        _MAIN + "    var r: i32 = 0\n    match Some(5)\n        Some(v) =>\n"
-        "            match Err(v)\n                Err(e) =>\n                    r = e as i32\n"
-        "                _ =>\n                    r = 3\n        _ =>\n            r = 2\n    r\n", 5),
+        _MAIN + "    match Some(5)\n        Some(v) =>\n"
+        "            match Err(v)\n                Err(e) => e as i32\n"
+        "                _ => 3\n        _ => 2\n", 5),
     "two_payload_types_in_one_fn": (
         _MAIN + "    let x: u8 = 2\n    var r: i32 = 0\n    match Some(x)\n"
         "        Some(v) =>\n            r = v as i32\n        _ =>\n            r = 9\n"
