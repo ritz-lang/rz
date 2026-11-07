@@ -963,11 +963,165 @@ fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
         arm = arm.next
     0 - 1
 
+# --- A bare constructor as the scrutinee (AGAST #2419) -----------------------
+#
+# `match Some(5)` names no enum, so the constructor had none to build: it lowered
+# to `add i64 0, 0` and the match ran on that zero.  The payload names it, the
+# same whatever else the module says: `Some(5)` is an Option<i64>, as a literal is
+# an i64.  A type argument nothing gives (None's, Ok's E, Err's T) takes that
+# default too; no arm can read it.
+
+# 1 when a user enum declares `name`, whichever one or how many.
+fn user_enum_declares(name: *u8, len: i32) -> i32
+    for ei in 0..enum_count()
+        if enum_declares_variant(ei, name, len) == 1
+            return 1
+    0
+
+# 1 when emit_expr lowers `e` as Some/Ok/Err(x), or `e` is the Option's None: one
+# no name shadows and no user enum declares.  emit_expr_ident can't build a user's
+# None, so that stays the "cannot take address" refusal, not an Option's tag.
+fn is_tagged_ctor(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_CALL
+        return (is_variant_carrier(e.func_name, e.func_name_len) == 1 or is_variant_null(e.func_name, e.func_name_len) == 1) as i32
+    if e.kind != EXPR_IDENT or is_ident_none(e.ident_ptr, e.ident_len) == 0
+        return 0
+    if is_const(s, e.ident_ptr, e.ident_len) == 1 or find_global(s, e.ident_ptr, e.ident_len) != null
+        return 0
+    if user_enum_declares(e.ident_ptr, e.ident_len) == 1
+        return 0
+    (find_local(s, e.ident_ptr, e.ident_len) < 0) as i32
+
+# 1 when `e` is a constructor that takes its enum from its context: a tagged one,
+# or a user's bare unit variant, which is no place to take the address of.
+fn match_scrutinee_is_ctor(s: *EmitterState, e: *Expr) -> i32
+    if is_tagged_ctor(s, e) == 1
+        return 1
+    if e.kind == EXPR_IDENT and is_ident_none(e.ident_ptr, e.ident_len) == 1
+        return 0
+    var vi: i32 = 0
+    var other: i32 = 0
+    (bare_unit_variant_enum(s, e, @vi, @other) >= 0) as i32
+
+# 1 when `e` builds its enum where it stands, payload and all: nothing but the
+# match can own that value (own_scrutinee_moved).
+fn match_scrutinee_builds(s: *EmitterState, e: *Expr) -> i32
+    if is_tagged_ctor(s, e) == 1
+        return 1
+    var name: *u8 = null
+    var len: i32 = 0
+    if e.kind == EXPR_CALL
+        user_variant_ctor_enum(e, @name, @len)
+    else if e.kind == EXPR_METHOD
+        qualified_variant_enum(s, e, @name, @len)
+    (name != null) as i32
+
+# `a`, `b` and `c` as one NUL-terminated name, its length in *out_len.
+fn ctor_join(a: *u8, a_len: i32, b: *u8, b_len: i32, c: *u8, c_len: i32, out_len: *i32) -> *u8
+    let n: i32 = a_len + b_len + c_len
+    let name: *u8 = malloc((n + 1) as i64)
+    memcpy(name, a, a_len as i64)
+    memcpy(name + a_len, b, b_len as i64)
+    memcpy(name + a_len + b_len, c, c_len as i64)
+    *(name + n) = 0
+    *out_len = n
+    name
+
+# A pointer's spelling, `ptr_T`, for the shapes that record T; else 0.
+fn ctor_pointer_spelling(s: *EmitterState, e: *Expr, out: **u8) -> i32
+    if e.kind == EXPR_CSTRING_LIT
+        *out = c"ptr_u8"
+        return 6
+    if e.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+    if loc == null
+        return 0
+    var base: *u8 = loc.type_name
+    var base_len: i32 = loc.type_name_len
+    if loc.pointee_type != TYPE_STRUCT
+        base_len = primitive_arg_spelling(loc.pointee_type, @base)
+    if base_len <= 0
+        return 0
+    var n: i32 = 0
+    *out = ctor_join(c"ptr_", 4, base, base_len, c"", 0, @n)
+    n
+
+# The type argument payload `e` gives its enum, spelled as a mangled name; its
+# length, or 0 when ritz1 can't name it.  A nested constructor is one of those:
+# emit_variant_build gives the inner one the outer enum, typed or not.
+fn ctor_payload_spelling(s: *EmitterState, e: *Expr, out: **u8) -> i32
+    if is_tagged_ctor(s, e) == 1
+        return 0
+    if e.kind == EXPR_STRING_LIT
+        *out = c"StrView"   # layout-equal to the %Span$u8 it lowers to
+        return 7
+    if bool_kind(s, e) == BK_BOOL   # `true` is an EXPR_INT_LIT to get_expr_type
+        *out = c"bool"
+        return 4
+    var name: *u8 = null
+    var len: i32 = 0
+    variant_payload_aggregate(s, e, @name, @len)
+    if name != null
+        *out = name
+        return len
+    # A struct emit_variant_build would store as a scalar, which get_expr_type
+    # can call an i64: `Some(t.m())`, `Some(a[1])`.
+    match_scrutinee_type(s, e, @name, @len)
+    if name != null
+        return 0
+    let ty: i32 = get_expr_type(s, e)
+    if ty == TYPE_PTR
+        return ctor_pointer_spelling(s, e, out)
+    primitive_arg_spelling(ty, out)
+
+# The enum a constructor scrutinee builds, queued for its type decl.  null/0 when
+# `scr` is none, or its payload can't be named.
+fn ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if is_tagged_ctor(s, scr) == 0
+        return
+    var arg: *u8 = c"i64"
+    var arg_len: i32 = 3
+    let is_none: i32 = (scr.kind == EXPR_IDENT or is_ident_none(scr.func_name, scr.func_name_len) == 1) as i32
+    if is_none == 0 and scr.args != null
+        arg_len = ctor_payload_spelling(s, scr.args, @arg)
+        if arg_len <= 0
+            return
+    var len: i32 = 0
+    var name: *u8 = null
+    if is_none == 1 or name_eq(scr.func_name, scr.func_name_len, c"Some", 4) == 1
+        name = ctor_join(c"Option$", 7, arg, arg_len, c"", 0, @len)
+    else if name_eq(scr.func_name, scr.func_name_len, c"Ok", 2) == 1
+        name = ctor_join(c"Result$", 7, arg, arg_len, c"$i64", 4, @len)
+    else
+        name = ctor_join(c"Result$i64$", 11, arg, arg_len, c"", 0, @len)
+    if namelist_find(@s.late_enums, name, len) < 0
+        namelist_push(@s.late_enums, name, len)
+    *out_name = name
+    *out_len = len
+
+# `scr` under the enum the match named.  What the slot around the match wants (a
+# typed let, the fn's return type) is that match's value, not its scrutinee's.
+fn emit_ctor_scrutinee(s: *EmitterState, scr: *Expr, name: *u8, len: i32) -> i32
+    let saved_name: *u8 = s.ctx_enum_name
+    let saved_len: i32 = s.ctx_enum_name_len
+    s.ctx_enum_name = name
+    s.ctx_enum_name_len = len
+    let reg: i32 = emit_expr(s, scr)
+    s.ctx_enum_name = saved_name
+    s.ctx_enum_name_len = saved_len
+    reg
+
 # As resolve_scrutinee_enum, for a match.  Generic enums named only by an arm or
 # by a user `W$i32` are left out: they have no enum struct to spill to, so only
 # coverage reads them.
 fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out_name: **u8, out_len: *i32) -> i32
     if resolve_scrutinee_enum(s, scr, out_name, out_len) == 1
+        return 1
+    ctor_scrutinee_enum(s, scr, out_name, out_len)   # AGAST #2419
+    if *out_name != null
         return 1
     var name: *u8 = null
     var len: i32 = 0
@@ -1281,13 +1435,21 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     if is_addr == 1
         typed = scrutinee.operand
     is_enum = resolve_match_enum(s, typed, arms, @enum_name, @enum_name_len)
+    # AGAST #2419: never the zero a constructor with no enum lowers to.
+    if is_enum == 0 and is_tagged_ctor(s, typed) == 1
+        emit_nd_error(s, typed.span.line, typed.span.col, c"this constructor's type can't be inferred here: bind it with a typed `let` first")
+        return 0
     match_check_coverage(s, typed, arms, enum_name, enum_name_len, span.line, span.col)
     match_refuse_payload_tests(s, arms, enum_name, enum_name_len)   # AGAST #2405
     # AGAST #2344: an enum element or global is a place too.  emit_expr reads
     # `a[1]` and `g` as scalars, whatever their type.
     var from_place: i32 = is_addr
+    var is_ctor: i32 = 0
     if is_enum == 1
-        if typed.kind == EXPR_INDEX or (typed.kind == EXPR_IDENT and find_local_struct_name(s, typed.ident_ptr, typed.ident_len) == null)
+        is_ctor = match_scrutinee_is_ctor(s, typed)   # AGAST #2419
+        if is_ctor == 1
+            from_place = 0
+        else if typed.kind == EXPR_INDEX or (typed.kind == EXPR_IDENT and find_local_struct_name(s, typed.ident_ptr, typed.ident_len) == null)
             from_place = 1
 
     # Evaluate scrutinee.  For `@place` the place's own address (a `ptr`;
@@ -1307,6 +1469,8 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         emit_str(s, c", ptr ")
         emit_reg(s, scrut_slot)
         emit_str(s, c"  ; match @place\n")
+    else if is_ctor == 1
+        scrut_reg = emit_ctor_scrutinee(s, typed, enum_name, enum_name_len)
     else
         scrut_reg = emit_expr(s, scrutinee)
     if is_enum == 1 and from_place == 0
@@ -1326,7 +1490,10 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
 
     # AGAST #2174: the match owns a scrutinee it moved (ownership.ritz);
     # `match @place` moves nothing.
-    let own_old: i32 = own_match_begin(s, scrutinee, scrut_slot, enum_name, enum_name_len)
+    var owned: *Expr = scrutinee
+    if is_ctor == 1
+        owned = typed   # `@Some(x)` borrows a value only this match holds
+    let own_old: i32 = own_match_begin(s, owned, scrut_slot, enum_name, enum_name_len)
 
     let end_label: i32 = next_label(s)
     var n_arms: i32 = 0

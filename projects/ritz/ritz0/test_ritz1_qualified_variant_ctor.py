@@ -327,12 +327,7 @@ pub fn main() -> i32
     Opt.v = 42
     return Opt.get()
 """,
-}
-
-# ritz1 emits IR clang rejects for these two scrutinees: the enum aggregate
-# is compared as an i64 (#2184).  Move them to RUNNABLE when that lands.
-RITZ0_ONLY = {
-    # `match Vacant`: the unit form of the same gap.
+    # `match Vacant`: the unit form of the same gap (#2419).
     "match_scrutinee_unit_unqualified": OPT
     + """
 pub fn main() -> i32
@@ -342,6 +337,11 @@ pub fn main() -> i32
         Vacant => r = 42
     return r
 """,
+}
+
+# ritz1 emits IR clang rejects for this scrutinee: the enum aggregate is
+# compared as an i64 (#2184).  Move it to RUNNABLE when that lands.
+RITZ0_ONLY = {
     # A static method's result as a scrutinee.
     "impl_static_method_as_scrutinee": OPT
     + """

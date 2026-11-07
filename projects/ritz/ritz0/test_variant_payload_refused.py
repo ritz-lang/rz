@@ -323,7 +323,6 @@ KEPT = {
 RITZ1_NEVER_READS = {
     "generic_fn_const": "#2418: `Option<T>` stays %Option$T in a generic fn's signature",
     "generic_fn_variant": "#2418: `Option<T>` stays %Option$T in a generic fn's signature",
-    "scrutinee_constructor": "#2419: `match Some(5)` has no enum, and reads as 0",
 }
 
 # name -> why ritz1 can't run this row of KEPT, which ritz0 does.

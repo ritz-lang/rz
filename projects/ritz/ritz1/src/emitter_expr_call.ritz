@@ -1757,6 +1757,73 @@ fn emit_qualified_variant_ctor(s: *EmitterState, e: *Expr, ei: i32, vi: i32) -> 
         return emit_variant_build(s, en, en_len, vi, e.args)
     return emit_qualified_variant_error(s, e, c"is a struct variant: constructing one is not supported by ritz1 yet (AGAST #1295)")
 
+# The struct or enum a variant payload's register holds, null/0 for an i64-width
+# scalar.  ritz1 lacks a full expr-type oracle so this peeks at the expression
+# form: emit_variant_build stores by it, and a constructor scrutinee is named by
+# it (AGAST #2419), so the two can't disagree.
+fn variant_payload_aggregate(s: *EmitterState, payload_expr: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if payload_expr.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, payload_expr.ident_ptr, payload_expr.ident_len)
+        if loc != null
+            if loc.var_type == TYPE_STRUCT
+                if loc.type_name_len > 0
+                    *out_name = loc.type_name
+                    *out_len = loc.type_name_len
+                    return
+        # AGAST #2144: `Ok(Vacant)` / `Some(Vacant)`, a bare unit variant
+        # of a user enum, is the enum aggregate as `Ok(Opt.Vacant)` is
+        # (it was stored as an i64: invalid IR).  A same-named const /
+        # local / global / fn wins, as in emit_expr_ident.
+        var bvi: i32 = 0
+        var bother: i32 = 0
+        let bei: i32 = bare_unit_variant_enum(s, payload_expr, @bvi, @bother)
+        if bei >= 0
+            *out_name = enum_name_at(bei, out_len)
+    else if payload_expr.kind == EXPR_STRING_LIT
+        # Bare "..." lowers to a %Span$u8 aggregate (AGAST #98) —
+        # layout-equal to StrView; storing it as i64 was invalid IR
+        # for `Some("10")` (AGAST #1498).
+        *out_name = c"Span$u8"
+        *out_len = 7
+    else if payload_expr.kind == EXPR_STRUCT_LIT
+        # AGAST #1362: `Some(Point { .. })` / `Ok(Font { .. })` — the
+        # rvalue struct literal yields its loaded `%Struct` aggregate.
+        let lit_st: *StructDef = find_struct(s, payload_expr.ident_ptr, payload_expr.ident_len)
+        if lit_st != null
+            *out_name = lit_st.name
+            *out_len = lit_st.name_len
+    else if payload_expr.kind == EXPR_MEMBER
+        # AGAST #1664: `Some(s.value)` with a struct-typed field (StrView,
+        # at any depth, through @ / * / by value) — the field load yields
+        # the `%Struct` aggregate, not an i64.
+        let fld: *StructField = resolve_member_chain_field(s, payload_expr)
+        if fld != null
+            if fld.field_type == TYPE_STRUCT
+                if fld.field_type_name_len > 0
+                    *out_name = fld.field_type_name
+                    *out_len = fld.field_type_name_len
+                    return
+        # AGAST #1466: `Err(ArgError.Bad)`, a qualified unit variant, is
+        # the enum aggregate too.
+        qualified_variant_enum(s, payload_expr, out_name, out_len)
+    else if payload_expr.kind == EXPR_CALL
+        # AGAST #1466: a user-enum ctor `Err(Missing(5))` is the enum
+        # aggregate (it was stored as an i64: invalid IR).
+        user_variant_ctor_enum(payload_expr, out_name, out_len)
+        if *out_name != null
+            return
+        let fn_def: *FnDef = find_call_fn(s, payload_expr)
+        if fn_def != null
+            if fn_def.return_type == TYPE_STRUCT
+                if fn_def.return_type_name_len > 0
+                    *out_name = fn_def.return_type_name
+                    *out_len = fn_def.return_type_name_len
+    else if payload_expr.kind == EXPR_METHOD
+        # AGAST #1466: `Err(ArgError.Missing(s))`, likewise.
+        qualified_variant_enum(s, payload_expr, out_name, out_len)
+
 # Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
 # zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
 # where `tag` 0 / 1 also picks Ok-Some / Err for the payload width) or a
@@ -1818,84 +1885,10 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
         emit_reg(s, slot)
         emit_str(s, c", i32 0, i32 2\n")
 
-        # Detect aggregate payload.  ritz1 lacks a full expr-type oracle so
-        # we peek at the expression form: EXPR_IDENT of a known struct
-        # local signals an aggregate; EXPR_CALL returning a struct signals
-        # the same.  Everything else we treat as an i64-width scalar.
-        var is_aggregate: i32 = 0
         var aggregate_name: *u8 = null
         var aggregate_name_len: i32 = 0
-        if payload_expr.kind == EXPR_IDENT
-            let loc: *LocalVar = find_local_struct_name(s, payload_expr.ident_ptr, payload_expr.ident_len)
-            if loc != null
-                if loc.var_type == TYPE_STRUCT
-                    if loc.type_name_len > 0
-                        is_aggregate = 1
-                        aggregate_name = loc.type_name
-                        aggregate_name_len = loc.type_name_len
-            # AGAST #2144: `Ok(Vacant)` / `Some(Vacant)`, a bare unit variant
-            # of a user enum, is the enum aggregate as `Ok(Opt.Vacant)` is
-            # (it was stored as an i64: invalid IR).  A same-named const /
-            # local / global / fn wins, as in emit_expr_ident.
-            if is_aggregate == 0
-                var bvi: i32 = 0
-                var bother: i32 = 0
-                let bei: i32 = bare_unit_variant_enum(s, payload_expr, @bvi, @bother)
-                if bei >= 0
-                    is_aggregate = 1
-                    aggregate_name = enum_name_at(bei, @aggregate_name_len)
-        else if payload_expr.kind == EXPR_STRING_LIT
-            # Bare "..." lowers to a %Span$u8 aggregate (AGAST #98) —
-            # layout-equal to StrView; storing it as i64 was invalid IR
-            # for `Some("10")` (AGAST #1498).
-            is_aggregate = 1
-            aggregate_name = c"Span$u8"
-            aggregate_name_len = 7
-        else if payload_expr.kind == EXPR_STRUCT_LIT
-            # AGAST #1362: `Some(Point { .. })` / `Ok(Font { .. })` — the
-            # rvalue struct literal yields its loaded `%Struct` aggregate.
-            let lit_st: *StructDef = find_struct(s, payload_expr.ident_ptr, payload_expr.ident_len)
-            if lit_st != null
-                is_aggregate = 1
-                aggregate_name = lit_st.name
-                aggregate_name_len = lit_st.name_len
-        else if payload_expr.kind == EXPR_MEMBER
-            # AGAST #1664: `Some(s.value)` with a struct-typed field (StrView,
-            # at any depth, through @ / * / by value) — the field load yields
-            # the `%Struct` aggregate, not an i64.
-            let fld: *StructField = resolve_member_chain_field(s, payload_expr)
-            if fld != null
-                if fld.field_type == TYPE_STRUCT
-                    if fld.field_type_name_len > 0
-                        is_aggregate = 1
-                        aggregate_name = fld.field_type_name
-                        aggregate_name_len = fld.field_type_name_len
-            # AGAST #1466: `Err(ArgError.Bad)`, a qualified unit variant, is
-            # the enum aggregate too.
-            if is_aggregate == 0
-                qualified_variant_enum(s, payload_expr, @aggregate_name, @aggregate_name_len)
-                if aggregate_name != null
-                    is_aggregate = 1
-        else if payload_expr.kind == EXPR_CALL
-            # AGAST #1466: a user-enum ctor `Err(Missing(5))` is the enum
-            # aggregate (it was stored as an i64: invalid IR).
-            user_variant_ctor_enum(payload_expr, @aggregate_name, @aggregate_name_len)
-            if aggregate_name != null
-                is_aggregate = 1
-            var fn_def: *FnDef = null
-            if is_aggregate == 0
-                fn_def = find_call_fn(s, payload_expr)
-            if fn_def != null
-                if fn_def.return_type == TYPE_STRUCT
-                    if fn_def.return_type_name_len > 0
-                        is_aggregate = 1
-                        aggregate_name = fn_def.return_type_name
-                        aggregate_name_len = fn_def.return_type_name_len
-        else if payload_expr.kind == EXPR_METHOD
-            # AGAST #1466: `Err(ArgError.Missing(s))`, likewise.
-            qualified_variant_enum(s, payload_expr, @aggregate_name, @aggregate_name_len)
-            if aggregate_name != null
-                is_aggregate = 1
+        variant_payload_aggregate(s, payload_expr, @aggregate_name, @aggregate_name_len)
+        var is_aggregate: i32 = (aggregate_name != null) as i32
 
         # AGAST #1797: a user enum's tuple variant declares its payload
         # type; a struct one is the aggregate whatever the expression form.
