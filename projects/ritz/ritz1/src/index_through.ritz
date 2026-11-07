@@ -10,6 +10,10 @@
 # A `*T` over anything else is a raw buffer, and stays on the pointer paths.  A
 # reference to anything else is one T: every site asks index_refused first.
 #
+# AGAST #2442: the value itself is the same place.  `v[i]` on a Vec, Span or String
+# local is `*(v.data + i)`, and so is an element that is one: `v[i][j]` and `p[i][j]`
+# are `*(v[i].data + j)`.
+#
 # An array behind a pointer is #2330's, and other bases, `h.r[i]`, `g[i]`, `f()[i]`,
 # are #2329's.
 
@@ -50,6 +54,12 @@ fn through_root(base: *Expr) -> *Expr
         return base.operand
     base
 
+# 1 when `loc` is a Vec, Span or String itself (#2442).
+fn indexes_itself(loc: *LocalVar) -> i32
+    if loc.var_type != TYPE_STRUCT
+        return 0
+    name_is_indexable(loc.type_name, loc.type_name_len)
+
 # 1 when `loc` is a pointer or reference, at one level, to a struct of an indexable name.
 fn sees_through(loc: *LocalVar) -> i32
     if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
@@ -58,18 +68,49 @@ fn sees_through(loc: *LocalVar) -> i32
         return 0
     name_is_indexable(loc.type_name, loc.type_name_len)
 
+# What an element that is itself a Vec, Span or String is, for `v[i][j]`: only its
+# type_name and var_type are read, and every caller has done with it before it emits.
+var g_through_elem: LocalVar
+
 # The local `e` indexes through, or null.  index_refused has already turned down
-# `p[lo..hi]`.
+# `p[lo..hi]`, and a slice of the value itself keeps its own lowering.
 pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
-    if e == null or e.kind != EXPR_INDEX or e.right == null
+    if e == null or e.kind != EXPR_INDEX or e.right == null or e.right.kind == EXPR_RANGE
         return null
+    if e.left != null and e.left.kind == EXPR_INDEX
+        return index_through_element(s, e.left)
     let root: *Expr = through_root(e.left)
     if root == null or root.kind != EXPR_IDENT
         return null
     let loc: *LocalVar = find_local_struct_name(s, root.ident_ptr, root.ident_len)
-    if loc == null or sees_through(loc) == 0
+    if loc == null
+        return null
+    # `v[i]` on the value itself, but not `(*v)[i]`.
+    if root == e.left and indexes_itself(loc) == 1
+        return loc
+    if sees_through(loc) == 0
         return null
     loc
+
+# `inner` of `inner[j]` as a local, when `inner` is an index through and its element
+# is a Vec, Span or String, or a pointer to one: `[]` sees through that (#2442).
+# emit_through_member_ptr loads the pointer for `inner.data`.
+fn index_through_element(s: *EmitterState, inner: *Expr) -> *LocalVar
+    let outer: *LocalVar = index_through(s, inner)
+    if outer == null
+        return null
+    var name: *u8 = null
+    var name_len: i32 = 0
+    through_elem_struct(s, outer, @name, @name_len)
+    if name == null
+        return null
+    if name_is_indexable(name, name_len) == 0
+        return null
+    memset(@g_through_elem as *u8, 0, sizeof(LocalVar))
+    g_through_elem.var_type = TYPE_STRUCT
+    g_through_elem.type_name = name
+    g_through_elem.type_name_len = name_len
+    @g_through_elem
 
 fn through_member(m: *Expr, e: *Expr, base: *Expr, name: *u8, len: i32)
     m.kind = EXPR_MEMBER
@@ -129,7 +170,7 @@ pub fn through_named_elem(s: *EmitterState, name: *u8, len: i32) -> i32
     if idx < 0
         return TYPE_VOID
     let loc: *LocalVar = local_at(s, idx)
-    if sees_through(loc) == 0
+    if sees_through(loc) == 0 and indexes_itself(loc) == 0
         return TYPE_VOID
     through_elem_kind(s, loc)
 
