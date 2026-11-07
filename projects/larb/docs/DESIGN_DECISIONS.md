@@ -324,8 +324,8 @@ var buffer: [1024]u8 = uninit()     # Explicit uninitialized (unsafe intent)
 
 ## 9. Match Exhaustiveness (Finalized)
 
-> Not yet enforced or in the spec: #2344 implements this. See
-> [rulings-2026-11.md](../review/4/rulings-2026-11.md), R6.
+> Enforced since #2344, and in the spec. See
+> [rulings-2026-11.md](../review/4/rulings-2026-11.md), R6, and R13 for arm order.
 
 ### 9.1 All Variants Must Be Handled
 

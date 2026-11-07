@@ -1,4 +1,6 @@
-# LARB rulings: open language decisions, 2026-11-06
+# LARB rulings: open language decisions, November 2026
+
+Two batches: R1-R8 of 2026-11-06, then [R9-R13 of 2026-11-07](#second-batch-2026-11-07).
 
 Rulings on the groups `rz` sent on 2026-11-06, taken as a whole, at `cc4d6a8`.
 Each ruling is also on its AGAST ticket. **None of this is in
@@ -45,7 +47,8 @@ There are four exceptions, and each is a rule you can state in a line:
 3. **Pointer family, same pointee:** `@&T` to `@T`, `@T` or `@&T` to `*T`, and
    `*T` to `@T` or `@&T`. Same representation, nothing lost. `@a` of an array
    also fits `Span<T>`.
-4. **Method receivers** auto-ref and auto-deref.
+4. **Method receivers** auto-ref and auto-deref. R9 widens this one to field access
+   and indexing: operators that see through a reference, not conversions.
 
 `*T` to `@T` stays free because references carry no non-null guarantee today
 (`null` fits `@T`), so the conversion claims nothing new. 196 sites rely on it.
@@ -378,3 +381,287 @@ That should land before stage 2.
 2. **#2344, #2342, #2341:** each ends a silent divergence, at low cost.
 3. **#2336, then #2337, then #2340:** the indirection rule and what depends on it.
 4. **#2338, #2343.** #2339 when Aaron answers.
+
+# Second batch, 2026-11-07
+
+Rulings on the groups `rz` sent on 2026-11-07, at `6e1d06e`, with `ritz1` and
+`ritz1_selfhosted` rebuilt from it. #2387 merged while this was being written; its
+`for` rows were re-run on ritz0 at `1fac612`. Each ruling is on its ticket. As before,
+**none of this is in `LANGUAGE_SPEC.md`**: each implementation ticket writes its
+own entry.
+
+| # | Question | Ruling | Sites to migrate | Tickets |
+|---|---|---|---|---|
+| R9 | `*p`, and `[]` through a pointer (#2347, #2175, #2329, #2330, #2331) | `*p` is a place. `p[i]` means `(*p)[i]` when the pointee is indexable. Every binding has one address | 0 | #2175, #2329, #2330, #2331, #2440, #2441 |
+| R10 | By-value `self` (#2393) | It's a by-value parameter, no exception | 1 (#2396) | #2393 |
+| R11 | A `for` through a Vec element (#2425) | Option 1 now, then a narrow option 3 through §13.5. Option 2 is out | 0 | #2438, #2439 |
+| R12 | Names (#2407, #2350, #2386) | A local can't take the name of a const, global or variant | 3 | #2407, #2386 |
+| R13 | `match` arm order (#2349) | First match wins, and every arm must be reachable | 0 | #2349 |
+
+## How the groups really split
+
+- **Group A was two questions and a stranger.** #2347, #2175, #2329, #2330 and #2331
+  are one: what `*`, `[]` and `.` mean through a pointer (R9). #2393 is a separate
+  one about by-value parameters (R10). #2425 isn't about places: it's a reference
+  outliving what it points at, so it's §13.5's (R11).
+- **Group B is one rule.** #2407, #2350's question and #2386 all ask what a name
+  means when a local and a module value share it (R12).
+- **Group C is wider than #2349**, and R12 and R13 close one hazard from two sides:
+  a misspelt const in a pattern is a binding, so it's a catch-all.
+
+## Method and limits
+
+- **Probes:** 147 small programs, compiled and run on ritz0, ritz1 and
+  ritz1_selfhosted. Most carry an expected value worked out from the program, not
+  from a compiler. Rows exploring an open question carry none.
+- **Corpus:** a throwaway walk over ritz0's AST. Of 1283 tracked `.ritz` files, 1128
+  are kept (docs, `archive`, `bootstrap_ritzlib`, `ritz1_old` and `projects/ritz/test`
+  are out) and 1098 parse. **Every count is a lower bound.** A text scan of the 30
+  that don't parse found only spire's `(*buf)[i]`.
+- **It's syntactic, unlike batch one's checker log.** Types come from annotations, so
+  `let p = @a` isn't followed. A method counts as mutating if any method of that name
+  takes `@&`, `:&` or `*T`. Imports are resolved by path suffix, so a missed import
+  could hide a global or variant clash. Consts are checked tree-wide, so that can't
+  hide one.
+- **Every zero was tested:** a control file with each shape fires each counter. That
+  caught a wrong struct-field read. A separate count of 210 catch-alls after full
+  coverage was also wrong: bare `None` read as a binding. Fixed, it's 84 catch-alls
+  (#2344 found 85) and one candidate, which reading showed was false.
+- **Not measured:** what copying `self` costs ritz1's speed; where a callee writes
+  through a `*T` to a `let` (R9, the gate has to show it); `mk().mbump(2)`, below.
+
+## R9: places (#2347, #2175, #2329, #2330, #2331)
+
+**Rule.**
+
+1. **`*p` is a place:** the pointee, not a copy. Only reading it by value copies, and
+   for a move-only type that's "cannot move out of a reference" (R1). `(*p).m()`
+   means `p.m()`. A by-value `self` method copies the pointee, as any by-value use does.
+2. **`[]` sees through one level to anything indexable.** `p[i]` means `(*p)[i]` when
+   `p` is a `*T`, `@T` or `@&T` and `T` is an array, Vec, Span or String. It's a
+   place in every position: read, store, `+=`, `@`, `@&`, `.f`. Writes follow §3.2,
+   so `@T` refuses them.
+3. **A raw buffer stays one.** `*T` with `T` not indexable: `p[i]` is `*(p + i)`.
+4. **A reference isn't a buffer.** `@T` or `@&T` with `T` not indexable is an error.
+5. **One level.** `(*q)[1]` for `q: @*[3]i32`, `(*pp)[1]` for `pp: **[3]i32`.
+6. **Stride `T`, everywhere.** `p[i] = <whole [N]T>` is a type error. `p[lo..hi]`
+   stays refused, as on a plain array.
+7. **Every binding has one address**, `let` included. `@x` is that address, every time.
+   A write through a `*T` reaches a `let`: §3.2 and #2371 say that's unchecked.
+
+**#2347's three questions.** (1) Legal, and `(*p)[i]` is too. 306a1d3's read path
+stands. (2) No: the store refusal was an accident of ritz0's stride bug. (3) Stride `T`.
+
+**Why it fits.** R1 is about slots: a type doesn't bend to where a value lands. `.`
+and `[]` are operators reading their own operand, as receivers do, so they widen
+exception 4 and add no conversion. `*p` is already a place everywhere except
+receivers: 1780 parsed sites use `(*p).f`. The rule does give up one thing: `p[i]` isn't
+`*(p + i)` for a pointer to an array, where `p + i` strides `[N]T` and walks rows.
+`*[N]T` says "one array of N", not "a buffer of arrays", and nothing walks rows with
+`p[i]`.
+
+**Measured:**
+
+| Shape | ritz0 | ritz1, selfhosted | Want |
+|---|---|---|---|
+| `p[1]`, `p: *[3]i32` | 20 | 20 | 20 |
+| `@p[1]` | **0** | refused | 20 |
+| `p[1] = 7` | refused | refused | 7 |
+| `(*p)[1]`, also store and `@` | refused | refused | 20 |
+| `p[1] = b`, a whole array | **SIGSEGV** | refused | type error |
+| `p[1].y = 7` on `*[2]S` | refused | 7 | 7 |
+| `let s: S = p[1]` | 4 | refused | 4 |
+| `(*pp)[1]`, `pp: **[3]i32` | 20 | **0** | 20 |
+| `q[1]`, `q: @*[3]i32` | **0** | **1, and 41** | error |
+| `h.r[1]`, `h(@a)[1]` | 20 | **0** | 20 |
+| `p[1]`, `p: *Vec<i32>` | clang error | **112, and 160** | 20 |
+| `p[1] = 7`, `p: *Vec<i32>` | refused | **16, and 96** | 7 |
+| `p[1] = 7`, `p: @&Vec<i32>` | refused | **20, store lost** | 7 |
+| `p[1] = 7`, `p: @&i32` | writes past it | writes past it | error |
+| `(*p).bump(2)`, want 42 | **40** | refused | 42 |
+| `(*p).w = 7`, `@*p`, `*p = v` | right | right | |
+| `let c`, two `@c` equal | **false** | true | true |
+| `let c`, `f(@c)` writes through `*C` | **1, a copy** | 3 | 3 |
+| `let c`, `c.w()`, `self: *C` | **1, a copy** | 3 | 3 |
+
+Where two values are given, they're ritz1's and ritz1_selfhosted's. The two ritz1
+builds disagreeing on one program is itself a sign of reading the wrong memory.
+
+**Cost.** 0 to migrate: this legalises. 8 `*[N]T` params, 1 `@[N]T` param, 2 `*[N]T`
+locals, no fields, globals or returns. 1 index through one (angelo
+`simple_test.ritz:152`). 5 `(*buf)[i]`, all spire. 11 indexes through a reference to
+a non-array, all `@Vec`, all legal. 0 `(*x).m()`. 1764 `@x` sites root at a `let`,
+and rule 7 changes one only if a callee writes through it.
+
+**Compilers.** ritz0: the store and address paths go to element stride, the field
+refusals go, receivers stop copying, `@let` stops copying. ritz1: #2321's refusals
+become lowerings, a `*p` receiver arm, `p + i` on `*[N]T`, and the silent rows go.
+
+**Not ruled.** `mk().mbump(2)`, a mutating method on an rvalue, compiles on all three
+and the write goes nowhere. It's the receiver twin of `f(1 + 2)` into `:&`. They agree,
+and measuring it needs return types, because a chain through a reference is legal.
+
+## R10: by-value `self` (#2393)
+
+**Rule.** Bare `self` and `self: T` are a by-value parameter named `self`, with no
+exception: the method's own storage, a copy or a move, and a local root under R2.
+`self:& T` stays distinct. The rule is about what a program can see, so a compiler may
+pass a pointer if the callee copies first.
+
+**Why it fits.** §5.4 already says so, and #1854 settles what by-value means. An
+exception would make `c.g()` and `C_g(c)` differ.
+
+**Measured.** Worse than the ticket says: it's a silent wrong answer, not only a lifetime.
+
+| Shape | ritz0 | ritz1, selfhosted |
+|---|---|---|
+| `self.x = 9`, then `c.x` | 1 | **9** |
+| the same on a plain `s: C` param | 1 | 1 |
+| `c.g(@&c)` writes `q.x`, reads `self.x` | 1 | **9** |
+| `G.g()` writes `G.x`, reads `self.x` | 1 | **9** |
+| `return @self` | dangles | refused, unlocated |
+
+**Cost.** 452 methods with `self`: 168 by-value, 159 `:&`, 125 reference or pointer.
+0 of the 168 write `self`. 4 take `@self...`, and only #2396 returns one. So 1 site.
+
+**Compilers.** ritz0 gets the check. ritz1 splits bare `self` from `self:&` and copies.
+
+## R11: a `for` through a Vec element (#2425, §13.5)
+
+**Rule.**
+
+- **Option 2 is out.** It contradicts Aaron's "evaluated once".
+- **Option 1 ships** with #2387, and stays the limit for what nothing can see.
+- **#2438:** §13.5's rule holds on all three compilers and covers every mutable
+  borrow. While a binding holds an `@T` of a place, these are errors on the same root:
+  `@&x`, `x` bare into `:&`, a `self: @&T` or `self:& T` method, and `x = v` or a write
+  in its own storage. The loan lasts to the end of the block, as ritz0's does.
+- **#2439:** a `for` whose iterable path crosses an index into anything but an array
+  holds an `@` on the root for the loop, so `vs.push(h)` in the body is refused.
+  `vs[0].a[2] = 50` stays legal and is seen, as Aaron's ruling requires.
+- **`let p: *H = @vs[0]` stays unchecked**, by Aaron's #2371.
+
+**Why it fits.** It's §13.5's own rule, reaching what it always said. It only refuses
+programs that would read freed memory, so nothing about `for` changes. Like R2, it's
+a check for the definite case: a push through another path isn't seen.
+
+**Measured.** The ticket's "tracking that doesn't exist" is half right, and §13.5's
+"The first rule is checked" is true of ritz0 only. The doc gate compiles on ritz0
+alone (#1319), so its expect-error blocks pass anyway.
+
+| Shape | ritz0 | ritz1, selfhosted |
+|---|---|---|
+| `let p = @n`, `bump(@&n)` | refused | **exit 2** |
+| `let p = @n`, `bump(n)` into `:&` | refused | **exit 2** |
+| `let p = @c`, `c.up()` | **exit 2** | **exit 2** |
+| `let p = @n`, `n = 2` | **exit 2** | **exit 2** |
+| `let p: @H = @vs[0]`, pushes | **exit 4, freed memory** | `@vs[0]` refused, unlocated |
+| `for v in vs[0].a`, pushes, at `1fac612` | **5, freed memory** | not re-run |
+
+**Cost.** 0 for both. 1062 `for` loops: 1024 ranges, 9 bare names, 29 `h.a` or `@h.a`,
+none with an index on the path. 0 sites where a `let` holding `@place` meets a
+mutating receiver or a write to that root.
+
+**Compilers.** ritz0 adds receivers and `=`. ritz1 gets the check itself.
+
+## R12: names (#2407, #2350, #2386)
+
+**Rule.** A local binding can't take the name of a module-level value that a bare read
+would reach: a `const`, a global `var` or an enum variant, declared there or imported.
+It's a located error at the binding, for `let`, `var`, parameters, `for` variables,
+match bindings and payload bindings. A local named like a **fn** is legal and wins;
+calling a local that isn't a fn value is a located error.
+
+**The questions it answers.**
+
+- `Some(K)` and `Some(R)` stay refused. A payload doesn't simply shadow, because
+  nothing does.
+- A float const on an integer payload stays refused, and §8.2's "integer const" goes.
+  String and array consts, which bind today, are refused too. The const's type stops
+  mattering, so `name_tests_payload` loses its name branch to the binder check.
+- `Some(Red)` on `Option<i32>` binds today and is refused.
+- A top-level `F =>` naming a non-integer const: ritz0 says non-exhaustive, ritz1
+  binds it. Now the same error. `K =>` on an integer const still compares.
+- The binder check runs ahead of coverage, so the first error agrees. Agreement is
+  required on the first error only.
+
+**Why it fits.** Aaron's #2395 forbids reuse so the scope question never arises. Here
+that also gives a pattern name one reading: if locals could shadow consts, `K =>`
+would change meaning with the scope. Fns differ because a call says what it wants.
+
+**§10.2 changes.** "A local or parameter named like a variant shadows it" came from a
+crash fix (#2038, #1600), not a decision I can find. **`rz` should check.** If Aaron
+decided it, variants drop out, and `Some(R)` needs its own refusal.
+
+**The price.** A new `pub const` can break a local downstream. Today the same change
+silently alters that local's value.
+
+**Measured.** All three compilers agree on each row unless shown.
+
+| Shape | Result |
+|---|---|
+| `let K`, `var K`, param `K`, read `K` | 7: the const wins |
+| `for K in 2..3`, read `K` | 8: reads 7 |
+| `import ritzlib.sys`, `let SYS_READ = 3` | 0: an imported const wins |
+| `let G`, param `G` over a global | 3: the local wins |
+| `for v in g`, local over a global | ritz0 3, ritz1 30 |
+| `let Red` over a variant | 3: the local wins |
+| `let k = 3`, `k()` with `fn k` | ritz0 7, ritz1 **SIGSEGV** |
+| `let k: fn() -> i32 = a`, `k()` | 5, stays legal |
+
+**Cost.** 3 renames, all `broadcast_mac` in harland (`net/arp.ritz:179`,
+`net/dhcp.ritz:122`, `:221`). 56,822 binders: 0 reuse any const name anywhere in the
+tree, 0 a variant in scope, 3 a global. 77 reuse a fn name, which stays legal. 0 call a
+local that isn't a fn value.
+
+**Compilers.** One check where names are bound, on all three.
+
+### For Aaron: the rest of #2395
+
+His ruling covers a nested `let` or `var` (5 sites). He asked for the rest to be
+reported, not decided. Measured, all running on all three today: same-block rebinding
+7, plus 2 of `let _`; a `for` variable over an outer local 2; a `let` over a param 0;
+a payload over an outer local 0.
+
+**Recommendation:** extend it to all of these, with `_` exempt, so a name means one thing
+per fn. It costs 9 renames. A `for` variable reusing a local raises the scope question
+just as a nested `let` does. It's his, because he set that ruling's limits.
+
+## R13: `match` arm order (#2349)
+
+**Rule.** Arms are tried top to bottom and the first match wins, and every arm must be
+reachable. An unreachable arm is a located error at that arm, naming what covers it.
+An arm is unreachable after an unguarded catch-all; after the same literal or const
+value; after the same variant, whatever its binding; or once arms already cover the
+scrutinee under R6, so a `_` after every variant is an error. A guarded arm covers
+nothing.
+
+**Why it fits.** R6 says no value can miss every arm; this says no arm can miss every
+value. It also catches a real mistake: `KX => 1 / KK => 2`, where `KX` is a typo,
+takes the first arm silently today, and becomes an error at `KK`.
+
+**Measured.** Wider than the ticket:
+
+| Shape | ritz0 | ritz1, selfhosted |
+|---|---|---|
+| `_ => 1 / 5 => 2`, also statements | **2** | 1 |
+| `x => 1 / 5 => 2` | **2** | 1 |
+| enum `_ => 1 / B => 2` | **2** | 1 |
+| `Option`, `_ => 1 / Some(v) => v` | **2** | 1 |
+| `5 / 5`, `K / 5`, `B / B`, `Some / Some`, `true / true` | clang error, unlocated | first arm |
+| `_ / _`, full enum or bool then `_` | 1 | 1 |
+
+**Cost.** 0. 551 matches: 0 arms after a catch-all, 0 duplicates, 84 ending in a
+catch-all, 0 of those after full coverage. Consts were compared by name, not value.
+
+**Compilers.** One check beside coverage, on all three. Lowering doesn't change, so
+#2419 isn't touched.
+
+## Suggested order
+
+1. **#2440, then #2393:** silent wrong answers on ritz1 that write memory or reach the
+   caller, in shapes real code could write.
+2. **#2349, #2407 (with #2386):** end silent divergences, at 0 and 3 sites.
+3. **#2330, #2331, #2329, #2175:** one room could take them, as they share one table.
+4. **#2441,** whose cost only the gate can show.
+5. **#2438, then #2439.**
