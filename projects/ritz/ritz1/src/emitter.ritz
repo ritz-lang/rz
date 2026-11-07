@@ -1042,14 +1042,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         if first == 0
             emit_str(s, c", ")
         first = 0
-        # Bare `self` receiver (task-99 cluster #1): UFCS callers pass
-        # the receiver as `ptr <reg>` so the signature must declare it
-        # as `ptr`, not as the impl's struct type.
-        var is_self: i32 = 0
-        if param.name_len == 4
-            if *param.name == 115 and *(param.name + 1) == 101 and *(param.name + 2) == 108 and *(param.name + 3) == 102
-                is_self = 1
-        if is_self == 1
+        # A lent `self` (task-99 cluster #1): callers pass the receiver as
+        # `ptr <reg>`.  A by-value one is a by-value param (AGAST #2393).
+        if param_self_is_ptr(param) == 1
             emit_str(s, c"ptr")
         else
             # emit_llvm_type_struct so struct params declare `%Tag` rather
@@ -1084,11 +1079,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             emit_bool_param_spill(s, param2)
             param2 = param2.next
             continue
-        var p2_is_self: i32 = 0
-        if param2.name_len == 4
-            if *param2.name == 115 and *(param2.name + 1) == 101 and *(param2.name + 2) == 108 and *(param2.name + 3) == 102
-                p2_is_self = 1
-        # `self` is always passed as `ptr` (see the header above).
+        # A lent `self` is passed as `ptr` (see the header above).
+        let p2_is_self: i32 = param_self_is_ptr(param2)
         if p2_is_self == 0 and bind_byval_param(s, param2) == 1   # AGAST #1739
             param2 = param2.next
             continue
@@ -1122,10 +1114,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             # Register `self` as a pointer-to-struct local so `self.field`
             # member access resolves via the impl type. (task-99 cluster #1)
             add_local_full(s, param2.name, param2.name_len, alloca_reg, TYPE_PTR, ib.type_name, ib.type_name_len, TYPE_STRUCT, 0, 0)
-            # AGAST #2286: `self` is passed as a `ptr` however it's spelled, so
-            # `@self` is that pointer.  The parser gives bare `self` and `self:&`
-            # one Param, so a by-value receiver can't be left out.  `self: @C`
-            # and `self: @&C` are references: `@self` is the reference's address.
+            # AGAST #2286: `self:&` is passed as a `ptr`, so `@self` is that
+            # pointer.  `self: @C` and `self: @&C` are references: `@self` is the
+            # reference's address.
             if param2.param_type == TYPE_STRUCT or param2.is_self_borrow == 1
                 let self_loc: *LocalVar = find_local_struct_name(s, param2.name, param2.name_len)
                 self_loc.holds_lent_ptr = 1
@@ -1252,14 +1243,15 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     # emits `define %T @T_method(...)` so the body must
                     # `ret %T <val>`.  Two shapes:
                     #
-                    #  * EXPR_IDENT (`return self`): emit_expr loaded
+                    #  * EXPR_IDENT holding a pointer: emit_expr loaded
                     #    the local as i64 (ptr-as-int).  Need
                     #    inttoptr+load to materialise a typed struct.
                     #
-                    #  * EXPR_CALL (`return strview_slice(...)`): the
-                    #    call already produced a `%T` register, so
-                    #    just `ret %T <val>` directly.
-                    if stmt.expr.kind == EXPR_IDENT and s.ret_sret == 1
+                    #  * EXPR_CALL (`return strview_slice(...)`), or a
+                    #    struct local such as a by-value `self`: that's
+                    #    already a `%T` register, so just `ret %T <val>`.
+                    let tail_holds_ptr: i32 = (stmt.expr.kind == EXPR_IDENT and struct_value_local(s, stmt.expr) == null) as i32
+                    if tail_holds_ptr == 1 and s.ret_sret == 1
                         let spp: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, spp)
@@ -1269,7 +1261,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                         emit_sret_ret_from_ptr(s, spp)   # AGAST #1730
                     else if s.ret_sret == 1
                         emit_sret_ret_value(s, val)   # AGAST #1730
-                    else if stmt.expr.kind == EXPR_IDENT
+                    else if tail_holds_ptr == 1
                         let pp: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, pp)
@@ -1726,7 +1718,7 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len
         if first == 0
             emit_str(s, c", ")
         first = 0
-        if is_method == 1 and name_eq(p.name, p.name_len, c"self", 4) == 1
+        if is_method == 1 and param_self_is_ptr(p) == 1
             emit_str(s, c"ptr")
         else
             emit_param_llvm_type(s, p)

@@ -306,9 +306,6 @@ RITZ1_GAPS |= dict.fromkeys(("global_ptr_ptr_read", "global_ptr_ptr_store", "ele
                              "element_of_a_pointer_store", "index_is_evaluated_once", "one_level_returned",
                              "deref_leaves_a_pointer_to_a_pointer", "self_is_a_ptr_ptr",
                              "self_is_a_shared_ptr", "ufcs_by_value_self_is_a_conversion"), 2404)
-RITZ1_GAPS["receiver_is_read_before_the_arguments"] = 2401
-RITZ1_GAPS["by_value_self_is_read_before_the_arguments"] = 2316
-RITZ1_GAPS["by_value_self_is_read_before_the_arguments_two_levels"] = 2316
 RITZ1_GAPS["ptr_ptr"] = 2402
 
 GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}

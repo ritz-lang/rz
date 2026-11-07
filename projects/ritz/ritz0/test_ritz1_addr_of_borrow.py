@@ -930,8 +930,6 @@ RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
     "array_for": "AGAST #2314: `for x in @a` is refused (#2375), not lowered",
     "struct_for_vec": "AGAST #2314: `for x in @v` on `:&` is refused (#2375), not lowered",
-    "self_by_value_field_write": "AGAST #2316: a by-value `self` isn't a copy",
-    "self_by_value_address_write": "AGAST #2316: a by-value `self` isn't a copy",
     "self_generic_bare": "AGAST #2318: bare `self:&` in a generic impl doesn't compile",
     "self_generic_by_value": "AGAST #2318: `self: W<T>` in a generic impl doesn't compile",
     "argument_addr_receiver": "AGAST #2317: `(@c).g()` has no receiver type, for a local either",

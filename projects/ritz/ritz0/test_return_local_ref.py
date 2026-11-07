@@ -118,6 +118,10 @@ ADDRESSES = {
     "a_pointer_local": ("fn f(p: *C) -> **C\n    return ^@p\n", "p"),
     "a_reference_param": ("fn f(r: @C) -> @C\n    return ^@r\n", "r"),
     "a_reference_self": ("impl C\n    fn g(self: @C) -> @C\n        return ^@self\n", "self"),
+    "self_by_value": ("impl C\n    fn g(self) -> @C\n        return ^@self\n", "self"),
+    "self_by_value_typed": ("impl C\n    fn g(self: C) -> @C\n        return ^@self\n", "self"),
+    "self_by_value_field": ("impl C\n    fn g(self) -> @i32\n        return ^@self.x\n", "self"),
+    "self_by_value_field_tail": ("impl C\n    fn g(self) -> @i32\n        ^@self.x\n", "self"),
     "pattern_binding": ("fn f(e: E) -> @C\n    match e\n        V(c) => return ^@c\n        N => return null\n", "c"),
     "loop_binding": ("fn f(a: [2]C) -> @C\n    for c in a\n        return ^@c\n    null\n", "c"),
     "grouped": ("fn f() -> @C\n" + C1 + "    return (^@c)\n", "c"),
@@ -151,6 +155,7 @@ BINDINGS = {
     "pointer": ("fn f() -> *C\n" + C1 + "    let r: *C = @c\n    return ^r\n", "c"),
     "pointer_to_a_pointer": ("fn f(p: *C) -> **C\n    let r: **C = @p\n    return ^r\n", "p"),
     "by_value_param": ("fn f(c: C) -> @C\n    let r = @c\n    return ^r\n", "c"),
+    "self_by_value": ("impl C\n    fn g(self) -> @C\n        let r = @self\n        return ^r\n", "self"),
     "field": ("fn f(w: W) -> @C\n    let r = @w.c\n    return ^r\n", "w"),
     "element": ("fn f() -> *i32\n    var a: [2]i32 = [1, 2]\n    let r: *i32 = @a[0]\n    return ^r\n", "a"),
     "two_hops": ("fn f() -> @C\n" + C1 + "    let r = @c\n    let q = r\n    return ^q\n", "c"),
@@ -306,10 +311,6 @@ NOT_CHECKED = {
     "an_arm_held": "fn f(b: i32, p: @C) -> @C\n" + C1 + "    let r: @C = if b > 0\n        @c\n    else\n        p\n    return r\n",
     "assigned_not_initialised": "fn f() -> @C\n" + C1 + "    var r: @C = null\n    r = @c\n    return r\n",
     "behind_a_held_reference": "fn f(w: W) -> @i32\n    let r = @w.c\n    return @r.x\n",
-    # ritz0 copies a by-value `self`, and ritz1 passes the caller's place (#2393).
-    "self_by_value": "impl C\n    fn g(self) -> @C\n        return @self\n",
-    "self_by_value_typed": "impl C\n    fn g(self: C) -> @C\n        return @self\n",
-    "self_by_value_held": "impl C\n    fn g(self) -> @C\n        let r = @self\n        return r\n",
     # A name bound in one arm isn't the name in the next. What these do when called
     # is #2395's: both emitters let the binding outlive its block.
     "shadow_of_a_lent_param_in_the_arm_before": ("fn f(c:& C, k: i32) -> *C\n    if k == 0\n        let c: *C = @G\n"

@@ -24,6 +24,9 @@ REF_TO_OTHER_POINTER = "a reference to one pointer type doesn't fit a reference 
 # `*r`, `r.f`, `p[i]` or a by-value `self` of a move-only value, by value.
 MOVE_OUT_OF_REF = "cannot move out of a reference"
 
+# `fn drop(self)`: its own `self` would drop when it returned, and call it again.
+DROP_BY_VALUE = "`drop` can't take `self` by value: it would drop itself: write `self: @&T`"
+
 # `p.f = v`, `p[i] = v` or `*p = v` through an `@T`, or a chain of fields from one.
 WRITE_THROUGH_SHARED = "cannot write through an `@T`: make it `@&T`"
 

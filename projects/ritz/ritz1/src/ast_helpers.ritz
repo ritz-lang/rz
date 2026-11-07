@@ -731,6 +731,10 @@ pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u
             generic_method_error(mt, type_name, type_len)
         if type_params != null and fn_is_decl(mt) == 1
             decl_refused(mt.line, c"method", mt.name, mt.name_len, type_name, type_len, c"importers instantiate its body")
+        if trait_len == 4 and name_is_drop(trait_name) == 1 and mt.name_len == 4 and name_is_drop_fn(mt.name) == 1
+            drop_by_value_error(mt)
+        if type_params == null
+            impl_name_bare_self(mt, type_name, type_len)
         mt = mt.next
     return ib
 
@@ -1225,11 +1229,8 @@ pub fn param_link(first: *Param, rest: *Param) -> *Param
     return first
 
 # Untyped `self` receiver in impl methods: `fn foo(self)` or `fn foo(self:&)`.
-# The receiver type is resolved by emit_impl_method against the enclosing
-# ImplBlock's type_name, so we just record a Param named "self".  TYPE_STRUCT
-# matches the by-value-receiver convention.  The emitter special-cases the
-# "self" name to emit `ptr` at the LLVM level, so UFCS callers can pass the
-# receiver as a pointer even when the source spells it by value.  Typed
+# impl_block_new names the type of a bare `self`, which makes it `self: T`, and
+# emit_impl_method takes the type of a `self:&` from the ImplBlock.  Typed
 # `self: T` / `self:& T` receivers do not come here: the grammar passes T to
 # param_new, as it does for any other name (AGAST #1375, #1632).
 pub fn param_self(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *Param
@@ -1237,6 +1238,71 @@ pub fn param_self(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *Para
     p.last_type_name = null
     p.last_type_name_len = 0
     return param_new(p, name, len, TYPE_STRUCT, line, col)
+
+# Bare `self:&`: the caller's place, where a bare `self` is a copy (AGAST #2393).
+pub fn param_self_lent(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *Param
+    let param: *Param = param_self(p, name, len, line, col)
+    param.is_self_borrow = 1
+    return param
+
+# 1 for a param named `self`.
+pub fn param_is_self(p: *Param) -> i32
+    if p == null or p.name_len != 4
+        return 0
+    if *p.name == 115 and *(p.name + 1) == 101 and *(p.name + 2) == 108 and *(p.name + 3) == 102
+        return 1
+    0
+
+# 1 for a `self` passed as a `ptr`: a reference, a pointer or `self:&`.  A by-value
+# `self` isn't: it's a by-value param, and goes as `s: T` goes (LARB R10, AGAST
+# #2393).  A receiver whose type isn't a named struct or enum stays a `ptr`.
+pub fn param_self_is_ptr(p: *Param) -> i32
+    if param_is_self(p) == 0
+        return 0
+    if p.param_type == TYPE_STRUCT and p.is_self_borrow == 0 and p.param_type_name_len > 0
+        return 0
+    1
+
+# 1 for a by-value `self`.
+pub fn param_self_is_value(p: *Param) -> i32
+    if param_is_self(p) == 1 and param_self_is_ptr(p) == 0
+        return 1
+    0
+
+fn name_is_drop(n: *u8) -> i32
+    (*n == 68 and *(n + 1) == 114 and *(n + 2) == 111 and *(n + 3) == 112) as i32
+
+fn name_is_drop_fn(n: *u8) -> i32
+    (*n == 100 and *(n + 1) == 114 and *(n + 2) == 111 and *(n + 3) == 112) as i32
+
+# `fn drop(self)`: its own `self` would drop when it returned, and call it again
+# (AGAST #2393).  ritz0 prints the same words (ref_rules.DROP_BY_VALUE).  Once per
+# method: the grammar may re-run the action on backtracking.
+var g_drop_last_err: *FnDef = null
+
+fn drop_by_value_error(m: *FnDef)
+    let p: *Param = m.params
+    if param_is_self(p) == 0 or p.param_type != TYPE_STRUCT or p.is_self_borrow == 1 or m == g_drop_last_err
+        return
+    g_drop_last_err = m
+    g_attr_errors = g_attr_errors + 1
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(m.line as i64)
+    eprintln_cstr(c": `drop` can't take `self` by value: it would drop itself: write `self: @&T`")
+
+# A bare `self` is `self: T` (AGAST #2393).  A generic impl's T is named when it's
+# specialised, so that one stays as it was parsed.
+fn impl_name_bare_self(m: *FnDef, type_name: *u8, type_len: i32)
+    let p: *Param = m.params
+    if param_is_self(p) == 0 or p.param_type != TYPE_STRUCT or p.is_self_borrow == 1 or p.param_type_name_len > 0
+        return
+    p.param_type_name = type_name
+    p.param_type_name_len = type_len
 
 # =============================================================================
 # Struct definition helpers

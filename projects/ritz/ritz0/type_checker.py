@@ -117,8 +117,6 @@ class TypeChecker:
         self._local_refs: Dict[int, Tuple[rast.Type, str, int]] = {}
         # The loops around the statement being checked.
         self._loop_depth = 0
-        # By-value `self` of the current method, which isn't a local root (#2393).
-        self._self_type: Optional[rast.Type] = None
         # What each call in the current fn reached: its signature, and how many
         # of its params the arguments skip.
         self._callees: Dict[int, Tuple[FnSig, int]] = {}
@@ -299,15 +297,11 @@ class TypeChecker:
         self._let_types = []
         self._local_refs = {}
         self._loop_depth = 0
-        self._self_type = None
         self._callees = {}
         for param in fn.params:
             self.locals[param.name] = param.type
             if param.borrow == rast.Borrow.MUTABLE:
                 self.lent_locals[param.name] = param.type
-            elif impl and param.name == 'self' and not isinstance(
-                    self._resolve_alias(param.type), (rast.PtrType, rast.RefType)):
-                self._self_type = param.type
 
         # Check body
         self._check_block(fn.body, fn.ret_type)
@@ -1426,12 +1420,12 @@ class TypeChecker:
 
     def _local_root(self, place: rast.Expr) -> Optional[str]:
         """The local root `place` is in: its own storage, and not the caller's,
-        which a `:&` param and a by-value `self` may be (#2393)."""
+        which a `:&` param is. A by-value `self` is a local root (#2393)."""
         name = self._own_storage(place)
         if name is None:
             return None
         held = self.locals[name]
-        if held is self.lent_locals.get(name) or held is self._self_type:
+        if held is self.lent_locals.get(name):
             return None
         return name
 

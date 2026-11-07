@@ -382,6 +382,22 @@ fn find_spec_impl_method(s: *EmitterState, type_name: *u8, type_name_len: i32, m
     free(buf)
     return fd
 
+# The by-value `self` argument read from the receiver at `recv`, a `ptr`.  It's
+# read here, before the arguments, because that's when a call evaluates its
+# receiver: `c.g(bump(@&c))` passes the c from before the bump (AGAST #2393).
+fn emit_self_value(s: *EmitterState, p: *Param, recv: i32) -> i32
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = load ")
+    emit_llvm_type_struct(s, p.param_type, p.param_type_name, p.param_type_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, recv)
+    emit_str(s, c"\n")
+    if param_uses_byval(s, p) == 1
+        return spill_byval_arg(s, null, val, p)
+    val
+
 # Emit the UFCS call to `fn_def` with the receiver passed as a pointer.
 fn emit_ufcs_call(s: *EmitterState, e: *Expr, fn_def: *FnDef, receiver_reg: i32, recv_is_ptr_of_ptr: i32) -> i32
     # If the receiver is a pointer type, its stack slot holds an i64 pointer —
@@ -773,7 +789,7 @@ fn resolve_enum_ctx(s: *EmitterState, out_name: **u8, out_len: *i32) -> i32
 # return type leaks into the argument.  Saved and restored like
 # emit_var_decl does.
 fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
-    if p != null and name_eq(p.name, p.name_len, c"self", 4) == 0
+    if p != null and param_self_is_ptr(p) == 0
         if p.param_type == TYPE_ARRAY
             return emit_array_arg_value(s, arg, p)   # AGAST #2287
         let array_addr: i32 = emit_array_arg_addr(s, arg, p)
@@ -798,10 +814,10 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
             if is_tagged_enum_type(p.param_type_name, p.param_type_name_len) == 1
                 s.ctx_enum_name = p.param_type_name
                 s.ctx_enum_name_len = p.param_type_name_len
-    # AGAST #2279: a `c:& C` argument copies into a by-value `C` param.  A
-    # `self` param is always a `ptr` (emit_impl_method), whatever it spells.
+    # AGAST #2279: a `c:& C` argument copies into a by-value `C` param.  A lent
+    # `self` param is a `ptr` (emit_impl_method).
     var reg: i32 = 0
-    if p != null and name_eq(p.name, p.name_len, c"self", 4) == 0
+    if p != null and param_self_is_ptr(p) == 0
         reg = emit_expr_by_value(s, arg, p.param_type, p.param_type_name, p.param_type_name_len)
     else
         reg = emit_expr(s, arg)
@@ -4877,6 +4893,11 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 note_method_callee(s, e, sm_method)   # AGAST #2237
                 if refuse_array_return(s, e, sm_method) == 1
                     return 0
+                # A receiver is what `self` takes, and a type isn't one, as in
+                # ritz0 (AGAST #2393).
+                if param_self_is_value(sm_method.params) == 1
+                    emit_ir_error(s, c"static method call Type.method() but the method expects a `self` parameter")
+                    return 0
                 # Evaluate args first.
                 let sm_arg_regs: *i32 = call_reg_slots(e.args, 0)
                 var sm_arg_count: i32 = 0
@@ -5262,6 +5283,22 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     if refuse_array_return(s, e, mfn) == 1
         return 0
 
+    # A pointer-typed receiver (local, param or field `*T`) sits in a slot
+    # that holds the pointer: load it and pass that, not the slot (AGAST #1692).
+    if recv_is_ptr_of_ptr == 1
+        let recv_ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, recv_ptr)
+        emit_str(s, c" = load ptr, ptr ")
+        emit_reg(s, receiver_reg)
+        emit_str(s, c"\n")
+        receiver_reg = recv_ptr
+
+    var self_param: *Param = null
+    if mfn != null and param_self_is_value(mfn.params) == 1
+        self_param = mfn.params
+        receiver_reg = emit_self_value(s, self_param, receiver_reg)
+
     # First, evaluate all arguments and collect their registers
     let arg_regs: *i32 = call_reg_slots(e.args, 0)
     let conv_regs: *i32 = call_reg_slots(e.args, 0)
@@ -5380,17 +5417,6 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     if mfn != null
         rtype = mfn.return_type
 
-    # A pointer-typed receiver (local, param or field `*T`) sits in a slot
-    # that holds the pointer: load it and pass that, not the slot (AGAST #1692).
-    if recv_is_ptr_of_ptr == 1
-        let recv_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, recv_ptr)
-        emit_str(s, c" = load ptr, ptr ")
-        emit_reg(s, receiver_reg)
-        emit_str(s, c"\n")
-        receiver_reg = recv_ptr
-
     # A specialized `Type$T_method` declares a pointer self (`*W<T>`, `@W<T>`)
     # as i64 (emit_llvm_type), so pass the receiver as one (AGAST #2096).
     var recv_ty: *u8 = c"ptr "
@@ -5453,7 +5479,11 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         emit_sret_attr(s, mfn.return_type_name, mfn.return_type_name_len)
         emit_reg(s, m_sret)
         emit_str(s, c", ")
-    emit_str(s, recv_ty)
+    if self_param != null
+        emit_param_llvm_type(s, self_param)
+        emit_str(s, c" ")
+    else
+        emit_str(s, recv_ty)
     emit_reg(s, receiver_reg)
 
     # Emit args with formal types (or i64 fallback when fn_def missing).

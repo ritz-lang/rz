@@ -369,6 +369,9 @@ class MoveChecker:
                     self.methods.setdefault(m.name, []).append(m)
                     self.type_methods.setdefault((item.type_name, m.name), []).append(m)
                     self.method_impl[id(m)] = item
+                    if item.trait_name == 'Drop' and m.name == 'drop' and m.params \
+                            and m.params[0].name == 'self' and not _is_lending_param(m.params[0]):
+                        self.errors.append(OwnershipError(ref_rules.DROP_BY_VALUE, m.params[0].span))
 
     def _drop_repeats(self) -> None:
         """A loop body checked twice (_check_loop) reports its errors twice,

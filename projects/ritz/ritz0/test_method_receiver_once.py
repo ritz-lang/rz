@@ -182,7 +182,7 @@ CASES = {
     # The ticket's program, and each kind of `self` on a Drop type.
     "lent_self": ("make(1).peek()", 1, 1, NO_METHOD_TEMPS),
     "mut_self": ("make(1).bump()", 1, 1, NO_METHOD_TEMPS),
-    "value_self": ("make(1).burn()", 1, 1, NO_METHOD_TEMPS),
+    "value_self": ("make(1).burn()", 1, 1, {}),
     # The same on a type that copies.
     "copy_lent_self": ("mp().get()", 1, 0, {}),
     "copy_value_self": ("mp().val()", 1, 0, {}),

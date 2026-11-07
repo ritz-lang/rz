@@ -1992,6 +1992,9 @@ pub fn main() -> i32
 """,
 }
 CONTROLS.update(USED_TO_RETURN_GARBAGE)
+# A by-value `self` is a by-value param (#2393): it reads as `s: C` does.
+for _name in ("return_self_by_value", "return_bare_self"):
+    USED_TO_RETURN_GARBAGE.pop(_name)
 
 RES = """\
 struct Res
@@ -2362,8 +2365,6 @@ RITZ1_GAPS = {
     "match_borrow_scrutinee_value": "AGAST #2289: `match` on a `:&` enum spills the pointer",
     "array_referent_return": "AGAST #2302: ritz1 has no array return yet",
     "array_return": "AGAST #2302: ritz1 has no array return yet",
-    "return_self_by_value": "AGAST #2291: `return self` doesn't read through the pointer",
-    "return_bare_self": "AGAST #2291: `return self` doesn't read through the pointer",
     "generic_struct_array_field": "AGAST #2292: a generic struct's `[N]T` field isn't substituted",
     "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
 }
@@ -2796,7 +2797,7 @@ pub fn main() -> i32
     var v: V = mk<C>(@&a)
     return v.c.x
 """,
-    # `self` is a `ptr` whatever it spells, so the referent can't go there.
+    # A type isn't a receiver, however `self` is spelled.
     "static_call_of_self_method": TYPES + """
 impl C
     fn get(self: C) -> i32

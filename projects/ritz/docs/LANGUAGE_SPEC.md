@@ -992,8 +992,29 @@ into it.
 ### 5.4 Methods
 
 Methods live in `impl` blocks. The receiver is named `self`, either bare or
-annotated `@Type` (read-only) / `@&Type` (mutating). A bare `self` is a by-value
-parameter: on a move-only type the call moves the receiver (§13.2).
+annotated `@Type` (read-only) / `@&Type` (mutating). A bare `self` and `self: Type`
+are one thing, a by-value parameter named `self`: the method has its own storage, a
+copy type is copied and a move-only type moves (§13.2). A write to it stays in the
+method, and `@self` is a reference to a local (§13.5). `self:& Type` is the caller's
+place, and a write to it lands there.
+
+```ritz
+struct Counter
+    n: i32
+
+impl Counter
+    fn after(self) -> i32
+        self.n = self.n + 1
+        self.n
+    fn advance(self:&)
+        self.n = self.n + 1
+
+fn demo() -> i32
+    var c = Counter { n: 1 }
+    let next = c.after()    # 2, and c.n is still 1
+    c.advance()             # c.n is 2
+    next + c.n
+```
 
 A call evaluates its receiver exactly once, before its arguments, however the
 method takes `self`. That includes the operands of a place: `arr[next()].m()`
@@ -2814,9 +2835,7 @@ Nothing else is checked, and each of these can still dangle:
 - a call's result held in a binding, or passed to another call, and a call through
   a `fn(...)` value;
 - a binding initialised from an `if` or `match`, or assigned its reference after
-  its declaration, and a reference taken behind such a binding: `@r.f`;
-- a by-value `self`: `@self` isn't a local root, because how `self` is passed isn't
-  settled.
+  its declaration, and a reference taken behind such a binding: `@r.f`.
 
 ### 13.6 Drop
 
@@ -2829,6 +2848,18 @@ binding that still owns a value of that type when the binding's scope ends:
 - on `break` and `continue`, for every binding declared inside the loop body;
 - on assignment to the binding, for the old value, before the new value is
   stored.
+
+`drop` takes `self` by reference. By value it would own a `self` of its own, which
+would drop when it returned.
+
+```ritz expect-error="`drop` can't take `self` by value"
+struct Handle
+    fd: i32
+
+impl Drop for Handle
+    fn drop(self)
+        self.fd = 0
+```
 
 Bindings are dropped in reverse declaration order. A by-value parameter is a
 binding of the callee's outermost block, so the callee drops it. A
