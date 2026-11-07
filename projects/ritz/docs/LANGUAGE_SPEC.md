@@ -1218,6 +1218,40 @@ fn main() -> i32
     0
 ```
 
+A `for` iterates in place. It sees what its body writes, wherever the array, `Vec`,
+`Span` or `StrView` lives (a local, a parameter, a global, a field, or behind a
+pointer), and there is no hidden copy:
+
+```ritz
+struct H
+    a: [3]i32
+
+fn main() -> i32
+    var h: H
+    h.a[0] = 1
+    h.a[1] = 2
+    h.a[2] = 4
+    var t: i32 = 0
+    for x in h.a
+        h.a[2] = 50          # seen when the loop gets there
+        t = t + x
+    t                        # 1 + 2 + 50
+```
+
+A `Vec`'s `len` and `data` are read on every pass, so a `push` in the body adds to
+the trips, and is safe when it moves the buffer.
+
+- The iterable is evaluated once. `for x in p.a` goes on walking the array `p`
+  pointed at to begin with, whatever `p` is assigned in the body, and a call or an
+  index on the way to it runs once.
+- The binding is a copy of its element, taken before the body runs. A write to that
+  element doesn't change the binding.
+- Only an rvalue gets a temporary: a call's by-value result (`for x in mk()`, or
+  `mk().a`), or a literal. Nothing else can reach it, so nothing can write to it.
+- A place reached *through* a `Vec`'s element, such as `vs[0].a`, is an address
+  into that `Vec`'s buffer, as `@vs[0]` is. If the body moves that buffer, the
+  address is no longer valid.
+
 ### 6.4 Loop (Infinite)
 
 ```ritz body

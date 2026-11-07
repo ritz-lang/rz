@@ -589,8 +589,10 @@ class LLVMEmitter:
         # [[must_use]] check.
         self._fn_defs_by_name: Dict[str, rast.FnDef] = {}
         # AGAST #1869: id(operand expr) -> its already-emitted value, while
-        # _emit_assert lowers `a OP b` (see _emit_expr's first lines).
-        self._assert_operands: Dict[int, ir.Value] = {}
+        # _emit_assert lowers `a OP b` (see _emit_expr's first lines), or a
+        # `for` reaches its place from one (_for_reached_from).
+        self._emitted_operands: Dict[int, ir.Value] = {}
+        self._reading_place = 0    # 1 while a `for` finds its place (_field_addr)
         # id(value) -> (value, the expression it last came from): `_convert_type`
         # reports where a value was written, and most of its callers don't say.
         self._value_origin: Dict[int, Tuple[ir.Value, rast.Expr]] = {}
@@ -7063,6 +7065,10 @@ class LLVMEmitter:
                 let x = iterable[idx]
                 body
                 idx = idx + 1
+
+        The iterable is evaluated once, and a place is walked where it is:
+        the loop sees what its body writes (§6.3, AGAST #2387), and reads
+        `len` and `data` on every pass. Only an rvalue gets a slot.
         """
         iter_kind = None
         elem_ty = None
@@ -7099,7 +7105,7 @@ class LLVMEmitter:
                     arr_len = ty.count
 
         if iter_kind is None:
-            iter_val = self._emit_expr(stmt.iter)
+            iter_val = self._emit_for_iter_value(stmt.iter)
 
             if isinstance(iter_val.type, ir.ArrayType):
                 iter_kind = "array"
@@ -7233,6 +7239,69 @@ class LLVMEmitter:
         self.builder.position_at_end(end_block)
         return None
 
+    def _emit_for_iter_value(self, it: rast.Expr) -> ir.Value:
+        """What a `for` walks: a pointer to the array or header `it` names, if
+        that's in storage, and otherwise its value (AGAST #2387)."""
+        parent, root = None, it
+        while (isinstance(root, rast.Field)
+               or (isinstance(root, rast.Index) and not isinstance(root.index, rast.Range))):
+            parent, root = root, root.expr
+        if isinstance(root, rast.UnaryOp) and root.op == '*':
+            return self._for_place(it)
+        if isinstance(root, rast.Ident):
+            if self._for_root_has_storage(root.name, parent is None):
+                return self._for_place(it)
+            if (isinstance(parent, rast.Field) and not self._names_a_value(root.name)
+                    and parent.field in self.globals):
+                return self._for_reached_from(it, parent, self.globals[parent.field][0])  # `m.G`
+            return self._emit_expr(it)
+        if parent is None:
+            return self._emit_expr(it)
+        return self._for_reached_from(it, root, self._emit_expr(root))
+
+    def _for_reached_from(self, it: rast.Expr, start: rast.Expr, val: ir.Value) -> ir.Value:
+        """_emit_for_iter_value for `it`, reached from `start`, already emitted
+        as `val`, which decides it: `mkp().a` is behind a pointer, so a place,
+        and `mk().a` is a value nothing else can reach. The LLVM type is exact,
+        and inference can't always say.
+        """
+        self._emitted_operands = {id(start): val}
+        try:
+            if isinstance(val.type, ir.PointerType):
+                return self._for_place(it)
+            return self._emit_expr(it)
+        finally:
+            self._emitted_operands = {}
+
+    def _for_root_has_storage(self, name: str, bare: bool) -> bool:
+        """Does `name`, at the root of a `for` iterable, lead to storage?
+
+        A `let` held as an SSA value doesn't, and nothing can write to it. A
+        reference param is a pointer: `h.a` reaches through it, but it's its
+        own value when `bare`. Locals come first, then params, as in _emit_expr.
+        """
+        if name in self.locals:
+            return True
+        if name in self.params:
+            return not bare and isinstance(self.params[name][1], ir.PointerType)
+        return name in self.globals
+
+    def _for_place(self, it: rast.Expr) -> ir.Value:
+        """The storage of the place `it`, or the pointer it holds. Moves as
+        `_emit_expr` would: the checker has a by-value iterable moved in."""
+        if isinstance(it, rast.Ident):
+            self._note_move(it)
+        elif isinstance(it, rast.Field) and getattr(it, 'moves_field', False):
+            self._set_field_flag(it, 0)
+        self._reading_place = 1
+        try:
+            addr = self._emit_lvalue_addr(it)
+        finally:
+            self._reading_place = 0
+        if isinstance(addr.type.pointee, (ir.ArrayType, ir.BaseStructType)):
+            return addr
+        return self.builder.load(addr)
+
     def _is_signed_type(self, ty) -> bool:
         """Check if an LLVM integer type should be treated as signed."""
         # i8, i16, i32, i64 are signed by convention in Ritz
@@ -7290,11 +7359,11 @@ class LLVMEmitter:
             # `1`, so it decides the same way (emit_assert_stmt).
             if self._ASSERT_BOOL in (lk, rk) and None not in (lk, rk):
                 lk = rk = self._ASSERT_BOOL
-            self._assert_operands = {id(cond_expr.left): lv, id(cond_expr.right): rv}
+            self._emitted_operands = {id(cond_expr.left): lv, id(cond_expr.right): rv}
             try:
                 cond = self._emit_expr(cond_expr)
             finally:
-                self._assert_operands = {}
+                self._emitted_operands = {}
             if lk is not None and rk is not None:
                 operands = ((lv, lk), (rv, rk))
         else:
@@ -7523,8 +7592,8 @@ class LLVMEmitter:
         """Emit an expression."""
         # AGAST #1869: an operand _emit_assert already evaluated, so the
         # comparison and the failure report share one evaluation.
-        if self._assert_operands:
-            pre = self._assert_operands.get(id(expr))
+        if self._emitted_operands:
+            pre = self._emitted_operands.get(id(expr))
             if pre is not None:
                 return pre
         # AGAST #2261: part of a method call's receiver, already evaluated.
@@ -8782,6 +8851,8 @@ class LLVMEmitter:
         Get the address of an lvalue expression (for assignment purposes).
         Returns a pointer to the storage location, not the loaded value.
         """
+        if self._reading_place and id(expr) in self._emitted_operands:
+            return self._emitted_operands[id(expr)]    # `mkp()` of `mkp().a`
         if isinstance(expr, rast.Ident):
             name = expr.name
             if name in self.locals:
@@ -8861,70 +8932,50 @@ class LLVMEmitter:
                 return self.builder.gep(base, [index])
             raise ValueError(f"Cannot index type: {base.type}")
         elif isinstance(expr, rast.Field):
-            # struct.field -> GEP to field
-            # There are several cases:
-            # 1. Base is a local struct variable: buf.data -> GEP from alloca
-            # 2. Base is a pointer to struct: p.data where p: *Struct -> load p, then GEP
-
+            # struct.field -> GEP to field. An `@T` param is the struct's
+            # address: it has no slot, and doesn't need one (a loop would
+            # repeat it).
             if isinstance(expr.expr, rast.Ident):
                 name = expr.expr.name
-                if name in self.locals:
-                    alloca, ty = self.locals[name]
-                    # Check if this is a pointer-to-struct (e.g., b: *StackBuffer)
-                    if isinstance(ty, ir.PointerType):
-                        pointee = ty.pointee
-                        if isinstance(pointee, ir.BaseStructType):
-                            # Load the pointer first, then GEP into the struct
-                            struct_ptr = self.builder.load(alloca)
-                            struct_name = self._get_struct_name_from_type(pointee)
-                            if struct_name:
-                                idx = self._get_struct_field_index(struct_name, expr.field)
-                                return self.builder.gep(struct_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                    # Regular struct local: GEP directly from alloca
-                    if isinstance(ty, ir.BaseStructType):
-                        struct_name = self._get_struct_name_from_type(ty)
-                        if struct_name:
-                            idx = self._get_struct_field_index(struct_name, expr.field)
-                            return self.builder.gep(alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                elif name in self.params:
+                if name not in self.locals and name in self.params:
                     ptr_val, ptr_ty = self.params[name]
-                    # If it's a pointer to a struct, use the pointer directly
                     if isinstance(ptr_ty, ir.PointerType):
-                        pointee = ptr_ty.pointee
-                        if isinstance(pointee, ir.BaseStructType):
-                            struct_name = self._get_struct_name_from_type(pointee)
-                            if struct_name:
-                                idx = self._get_struct_field_index(struct_name, expr.field)
-                                return self.builder.gep(ptr_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-
-            # General case: get address of struct then GEP to field
-            struct_addr = self._emit_lvalue_addr(expr.expr)
-            if isinstance(struct_addr.type, ir.PointerType):
-                pointee = struct_addr.type.pointee
-                if isinstance(pointee, ir.LiteralStructType) and expr.field.isdigit():
-                    # A tuple's element: `@p.0`, or `p.0.m()` lending self.
-                    return self.builder.gep(struct_addr, [ir.Constant(self.i32, 0),
-                                                          ir.Constant(self.i32, int(expr.field))])
-                if isinstance(pointee, ir.BaseStructType):
-                    struct_name = self._get_struct_name_from_type(pointee)
-                    if struct_name:
-                        idx = self._get_struct_field_index(struct_name, expr.field)
-                        return self.builder.gep(struct_addr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                # Handle pointer-to-pointer case: if the field is a pointer type,
-                # we need to load it first then GEP into the struct it points to.
-                # e.g., lex.defs.defs where lex.defs is *TokenDefs
-                if isinstance(pointee, ir.PointerType):
-                    inner_pointee = pointee.pointee
-                    if isinstance(inner_pointee, ir.BaseStructType):
-                        # Load the pointer value
-                        ptr_val = self.builder.load(struct_addr)
-                        struct_name = self._get_struct_name_from_type(inner_pointee)
-                        if struct_name:
-                            idx = self._get_struct_field_index(struct_name, expr.field)
-                            return self.builder.gep(ptr_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-            raise ValueError(f"Cannot access field on type: {struct_addr.type}")
+                        return self._field_addr(ptr_val, expr.field, 0)
+            return self._field_addr(self._emit_lvalue_addr(expr.expr), expr.field, 1)
         else:
             raise ValueError(f"Cannot get address of: {type(expr)}")
+
+    def _field_addr(self, ptr: ir.Value, field: str, loads: int) -> ir.Value:
+        """The address of `field` of the struct or tuple `ptr` reaches, loading
+        up to `loads` pointers on the way (lex.defs.defs, where lex.defs is
+        *TokenDefs).
+
+        A place a `for` reads goes as far as a read does in _emit_field_access:
+        a level further, a tuple behind a pointer, and through a Box. A store
+        or `@` doesn't: how far those go is #2398's question.
+        """
+        given = ptr
+        for _ in range(loads + self._reading_place):
+            if isinstance(ptr.type, ir.PointerType) and isinstance(ptr.type.pointee, ir.PointerType):
+                ptr = self.builder.load(ptr)
+        zero = ir.Constant(self.i32, 0)
+        pointee = ptr.type.pointee if isinstance(ptr.type, ir.PointerType) else None
+        if (isinstance(pointee, ir.LiteralStructType) and field.isdigit()
+                and ((loads and ptr is given) or self._reading_place)):
+            # A tuple's element: `@p.0`, or `p.0.m()` lending self.
+            return self.builder.gep(ptr, [zero, ir.Constant(self.i32, int(field))])
+        struct_name = (self._get_struct_name_from_type(pointee)
+                       if isinstance(pointee, ir.BaseStructType) else None)
+        if not struct_name:
+            raise ValueError(f"Cannot access field on type: {ptr.type}")
+        if (self._reading_place and self._is_box_type(struct_name)
+                and not self._struct_has_field(struct_name, field)):
+            inner = self._get_box_inner_type_name(struct_name)
+            if inner and self._struct_has_field(inner, field):
+                ptr = self.builder.load(self.builder.gep(ptr, [zero, zero]))
+                struct_name = inner
+        idx = self._get_struct_field_index(struct_name, field)
+        return self.builder.gep(ptr, [zero, ir.Constant(self.i32, idx)])
 
     def _find_free_variables(self, expr: rast.Expr, bound_vars: set) -> set:
         """Find free variables in an expression (referenced but not locally bound).
@@ -9974,6 +10025,22 @@ class LLVMEmitter:
         idx = self._get_struct_field_index(struct_name, expr.field)
         return self.builder.gep(base, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
 
+    def _names_a_value(self, name: str) -> bool:
+        """Is `name` a value or a type in scope, not a module's qualifier?"""
+        return (
+            name in self.locals
+            or name in self.params
+            or name in self.globals
+            or name in self.ritz_types
+            or name in self.constants
+            or name in self.const_arrays
+            or (hasattr(self, 'const_strviews') and name in self.const_strviews)
+            or name in self.functions
+            or name in self.struct_types
+            or name in self.enum_types
+            or name in self.union_types
+        )
+
     def _emit_field_access(self, expr: rast.Field) -> ir.Value:
         """Emit field access: struct_val.field or struct_ptr->field.
 
@@ -9994,21 +10061,7 @@ class LLVMEmitter:
         # constants/globals/functions. This lets imported modules' constants be
         # accessed via a `module.NAME` style without a real namespace value.
         if isinstance(expr.expr, rast.Ident):
-            ns_name = expr.expr.name
-            qualifier_known = (
-                ns_name in self.locals
-                or ns_name in self.params
-                or ns_name in self.globals
-                or ns_name in self.ritz_types
-                or ns_name in self.constants
-                or ns_name in self.const_arrays
-                or (hasattr(self, 'const_strviews') and ns_name in self.const_strviews)
-                or ns_name in self.functions
-                or ns_name in self.struct_types
-                or ns_name in self.enum_types
-                or ns_name in self.union_types
-            )
-            if not qualifier_known:
+            if not self._names_a_value(expr.expr.name):
                 if expr.field in self.constants:
                     val, ty = self.constants[expr.field]
                     return ir.Constant(ty, val)

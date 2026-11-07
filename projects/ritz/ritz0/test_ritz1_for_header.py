@@ -15,9 +15,7 @@ element ritz1 can't name is refused, at the iterable.
 
 The loop walks the header in place and reads it on every pass, because a `for`
 sees what its body writes (#2387).  So a `push` is seen, and is safe when it moves
-the buffer: test_a_push_that_moves_the_buffer.  ritz0 still reads a Vec by value
-into a temporary, which #2387 will change; until then the rows where it does are
-strict xfails, and it reads freed memory when the buffer moves.
+the buffer: test_a_push_that_moves_the_buffer.  Only an rvalue gets a slot.
 
 The programs link the real allocator: a push is what's under test, and a single
 compile can't link ritzlib.gvec's `realloc`.  Each returns 0, or the number of
@@ -178,6 +176,9 @@ HOLDERS = {
     "generic_fn": (GVEC + "fn f<T>(v: @Vec<T>) -> i32\n" + _body(SUM.format(it="v")) + "\n" + MAIN
                    + FILL_V + "    return f<i32>(@v)\n"),
     "unannotated_reference": _in_main("r", FILL_V + "    let r = @v\n"),
+    # A `let` has no storage ritz0 can name, and nothing can write to it.
+    "let": _in_main("w", FILL_V + "    let w: Vec<i32> = v\n"),
+    "field_of_a_let": _in_main("k.v", FILL_H + "    let k: VH = h\n", VH),
 }
 
 
@@ -373,51 +374,92 @@ def test_a_struct_binding_is_a_let(compile_with, compiler):
 # sees the new `len`.
 _TRIPS = "var n: i32 = 0\nfor x in {it}\n    if n < 3\n        {place}.push(x)\n    n = n + 1\nreturn n\n"
 _GLOBAL_FILL = "".join(f"    vec_push<i32>(@&g, {v})\n" for v in SEED)
-_TRIPS_G = ("var n: i32 = 0\nfor x in {it}\n    if n < 3\n        vec_push<i32>(@&g, x)\n"
-            "    n = n + 1\nreturn n\n")
+_GH_FILL = "    gh.v = vec_new<i32>()\n" + "".join(f"    vec_push<i32>(@&gh.v, {v})\n" for v in SEED)
+_TRIPS_AT = ("var n: i32 = 0\nfor x in {it}\n    if n < 3\n        vec_push<i32>(@&{place}, x)\n"
+             "    n = n + 1\nreturn n\n")
+
+
+def _trips_in(sig: str, it: str, place: str, call: str, fill: str = FILL_V, pre: str = "") -> str:
+    return (GVEC + pre + f"fn f({sig}) -> i32\n" + _body(_TRIPS.format(it=it, place=place)) + "\n"
+            + MAIN + fill + f"    return {call}\n")
+
+
 PUSHES = {
     "local": GVEC + MAIN + FILL_V + _body(_TRIPS.format(it="v", place="v")),
+    "by_value_param": _trips_in("v: Vec<i32>", "v", "v", "f(v)"),
+    "borrow_param": _trips_in("v:& Vec<i32>", "v", "v", "f(@&v)"),
+    "mut_reference_param": _trips_in("v: @&Vec<i32>", "v", "v", "f(@&v)"),
+    "pointer_param": _trips_in("v: *Vec<i32>", "v", "v", "f(@v)"),
     "field": GVEC + VH + MAIN + FILL_H + _body(_TRIPS.format(it="h.v", place="h.v")),
-    "field_through_pointer": (GVEC + VH + "fn f(h: *VH) -> i32\n"
-                              + _body(_TRIPS.format(it="h.v", place="h.v")) + "\n" + MAIN + FILL_H
-                              + "    return f(@h)\n"),
+    "nested_field": (GVEC + VH + OUTER + MAIN + "    var o: O\n    o.h.v = vec_new<i32>()\n"
+                     + _pushes("o.h.v", SEED) + _body(_TRIPS.format(it="o.h.v", place="o.h.v"))),
+    "field_through_pointer": _trips_in("h: *VH", "h.v", "h.v", "f(@h)", FILL_H, VH),
+    "field_through_borrow": _trips_in("h:& VH", "h.v", "h.v", "f(@&h)", FILL_H, VH),
+    "field_through_two_levels": (GVEC + VH + "fn f(p: **VH, h: *VH) -> i32\n"
+                                 + _body(_TRIPS.format(it="p.v", place="h.v")) + "\n" + MAIN + FILL_H
+                                 + "    var q: *VH = @h\n    return f(@q, @h)\n"),
     "self_field": (GVEC + VH + "impl VH\n    fn f(self:&) -> i32\n"
                    + _body(_TRIPS.format(it="self.v", place="self.v"), " " * 8) + "\n" + MAIN
                    + FILL_H + "    return h.f()\n"),
-    "global": GVEC + "var g: Vec<i32>\n\n" + MAIN + _GLOBAL_FILL + _body(_TRIPS_G.format(it="g")),
-}
-# ritz0 has these right already: what it's given is a pointer.
-LIVE_ON_RITZ0 = {
+    "global": (GVEC + "var g: Vec<i32>\n\n" + MAIN + _GLOBAL_FILL
+               + _body(_TRIPS_AT.format(it="g", place="g"))),
+    "global_struct_field": (GVEC + VH + "var gh: VH\n\n" + MAIN + _GH_FILL
+                            + _body(_TRIPS_AT.format(it="gh.v", place="gh.v"))),
     "addr_of_local": GVEC + MAIN + FILL_V + _body(_TRIPS.format(it="@v", place="v")),
     "addr_of_field": GVEC + VH + MAIN + FILL_H + _body(_TRIPS.format(it="@h.v", place="h.v")),
     "addr_of_global": (GVEC + "var g: Vec<i32>\n\n" + MAIN + _GLOBAL_FILL
-                       + _body(_TRIPS_G.format(it="@g"))),
-    "mut_reference_param": (GVEC + "fn f(v: @&Vec<i32>) -> i32\n"
-                            + _body(_TRIPS.format(it="v", place="v")) + "\n" + MAIN + FILL_V
-                            + "    return f(@&v)\n"),
+                       + _body(_TRIPS_AT.format(it="@g", place="g"))),
     "pointer_field": (GVEC + PH + MAIN + FILL_V + "    var q: PH\n    q.p = @v\n"
                       + _body(_TRIPS.format(it="q.p", place="v"))),
+}
+# ritz1 refuses each of these (#2410, #2426), so it can't get them wrong.
+PUSHES_ON_RITZ0 = {
+    "deref": (GVEC + MAIN + FILL_V + "    var p: *Vec<i32> = @v\n"
+              + _body(_TRIPS.format(it="*p", place="v"))),
+    "array_element": (GVEC + MAIN + FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"
+                      + _body(_TRIPS.format(it="vs[1]", place="vs[1]"))),
+    "vec_element": (GVEC + MAIN + FILL_V + "    var vv: Vec<Vec<i32>> = vec_new<Vec<i32>>()\n"
+                    "    vv.push(v)\n" + _body(_TRIPS_AT.format(it="vv[0]", place="vv[0]"))),
+    "field_of_a_pointer_call": (GVEC + VH + "var gh: VH\n\nfn mkp() -> *VH\n    return @gh\n\n"
+                                + MAIN + _GH_FILL + _body(_TRIPS_AT.format(it="mkp().v", place="gh.v"))),
+    "deref_of_a_call": (GVEC + "var g: Vec<i32>\n\nfn mkp() -> *Vec<i32>\n    return @g\n\n" + MAIN
+                        + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="*mkp()", place="g"))),
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(PUSHES) + sorted(LIVE_ON_RITZ0))
-def test_a_push_in_the_body_is_seen(run_with, compiler, name):
-    assert run_with(compiler, name, {**PUSHES, **LIVE_ON_RITZ0}[name]) == 6
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(LIVE_ON_RITZ0))
-def test_ritz0_a_push_through_a_pointer_is_seen(run_with, name):
-    assert run_with("ritz0", name, LIVE_ON_RITZ0[name]) == 6
-
-
-@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(PUSHES))
-@pytest.mark.xfail(strict=True, reason="AGAST #2387: ritz0 walks a copy of the header")
+def test_a_push_in_the_body_is_seen(run_with, compiler, name):
+    assert run_with(compiler, name, PUSHES[name]) == 6
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(PUSHES_ON_RITZ0))
 def test_ritz0_a_push_in_the_body_is_seen(run_with, name):
-    assert run_with("ritz0", name, PUSHES[name]) == 6
+    assert run_with("ritz0", name, PUSHES_ON_RITZ0[name]) == 6
+
+
+# An rvalue's header is its own: `g` growing is no write to it.  The buffer is
+# still shared, so what it sees of the elements is what's there.  `mk()` copies
+# field by field, as a whole global is invalid IR on ritz1 (#2427).
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_call_results_header_is_its_own(run_with, compiler):
+    program = (GVEC + "var g: Vec<i32>\n\nfn mk() -> Vec<i32>\n    var v: Vec<i32>\n    v.data = g.data\n"
+               "    v.len = g.len\n    v.cap = g.cap\n    return v\n\n" + MAIN + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="mk()", place="g")))
+    assert run_with(compiler, "own_header", program) == 3
+
+
+# A slice is a view made there and then: a value, though it's written like a place.
+_SPAN_OF_A = ("import ritzlib.span\n\n" + MAIN + "    var a: [3]i32 = [1, 2, 4]\n"
+              "    var s: Span<i32> = span_from_ptr<i32>(@a[0], 3)\n    var t: i32 = 0\n"
+              "    for x in s[1..3]\n        t = t + x\n    return t\n")
+
+
+@pytest.mark.integration
+def test_ritz0_a_slice_is_walked(run_with):
+    assert run_with("ritz0", "slice", _SPAN_OF_A) == 6
 
 
 def _moves(it: str, place: str) -> str:
@@ -445,27 +487,29 @@ MOVES = {
     "addr_of_field": GVEC + VH + MAIN + _EIGHT_H + _body(_moves("@h.v", "h.v")),
     "reference_param": (GVEC + "fn f(v: @&Vec<i32>) -> i32\n" + _body(_moves("v", "v")) + "\n" + MAIN
                         + _EIGHT + "    return f(@&v)\n"),
+    "borrow_param": (GVEC + "fn f(v:& Vec<i32>) -> i32\n" + _body(_moves("v", "v")) + "\n" + MAIN
+                     + _EIGHT + "    return f(@&v)\n"),
+    "by_value_param": (GVEC + "fn f(v: Vec<i32>) -> i32\n" + _body(_moves("v", "v")) + "\n" + MAIN
+                       + _EIGHT + "    return f(v)\n"),
+    "field_through_pointer": (GVEC + VH + "fn f(h: *VH) -> i32\n" + _body(_moves("h.v", "h.v")) + "\n"
+                              + MAIN + _EIGHT_H + "    return f(@h)\n"),
+    "self_field": (GVEC + VH + "impl VH\n    fn f(self:&) -> i32\n"
+                   + _body(_moves("self.v", "self.v"), " " * 8) + "\n" + MAIN + _EIGHT_H
+                   + "    return h.f()\n"),
 }
 
 
-# #2387: safe, not refused.  ritz0 isn't run on the bare forms: it reads freed
-# memory there, which is no value to pin.
+# #2387: safe, not refused.  Nothing from before the push is kept.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(MOVES))
 def test_a_push_that_moves_the_buffer(run_with, compiler, name):
     assert run_with(compiler, name, MOVES[name]) == 0
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", ["addr_of_local", "addr_of_field", "reference_param"])
-def test_ritz0_a_push_through_a_pointer_that_moves_the_buffer(run_with, name):
-    assert run_with("ritz0", name, MOVES[name]) == 0
-
-
 # A struct element, wider than the binding's old i64 slot.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_struct_binding_survives_the_move(run_with, compiler):
     pre, values, _ = STRUCTS["twenty_four_bytes"]
     program = (GVEC + pre + MAIN + _new("S", values) + "    let w: S = S { a: 7, b: 8, c: 9 }\n"
@@ -492,7 +536,7 @@ _ADJUST = (GVEC + MAIN + FILL_V + "    var w: Vec<i32> = vec_new<i32>()\n    w.p
 
 # #2387: anything that changes the header, not only a push.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name,body,trips", [
     ("pop", "        v.pop()\n", 2),
     ("clear", "        v.clear()\n", 1),
@@ -505,11 +549,22 @@ def test_a_shorter_header_ends_the_loop(run_with, compiler, name, body, trips):
 
 # A view is the same: a `for` over a StrView sees it reassigned.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_view_written_in_the_body_is_seen(run_with, compiler):
     program = (MAIN + "    var s: StrView = \"abc\"\n    let e: StrView = \"a\"\n    var n: i32 = 0\n"
                "    for b in s\n        s = e\n        n = n + 1\n    return n\n")
     assert run_with(compiler, "view", program) == 1
+
+
+# Through a local, as `w.s = "ab"` is invalid IR on ritz1 (#2412).
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_view_field_written_in_the_body_is_seen(run_with, compiler):
+    program = ("struct W\n    k: i32\n    s: StrView\n\n" + MAIN
+               + "    let s: StrView = \"abc\"\n    let e: StrView = \"a\"\n    var w: W\n    w.s = s\n"
+               "    var n: i32 = 0\n    for b in w.s\n        w.s = e\n        n = n + 1\n"
+               "    return n\n")
+    assert run_with(compiler, "view_field", program) == 1
 
 
 @pytest.mark.integration
@@ -575,7 +630,7 @@ def test_break_and_continue(run_with, compiler, it):
 
 # #1685: at 16 bytes a pass, a slot left in the loop overruns the stack.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_call_results_slot_does_not_grow_the_stack(run_with, compiler):
     program = (GVEC + "fn mk() -> StrView\n    return \"ab\"\n\n" + MAIN
                + _body("var t: i32 = 0\nvar i: i32 = 0\nwhile i < 2000000\n"
@@ -717,9 +772,28 @@ def test_anything_else_is_refused(compile_with, compiler, name):
     _is_refused(comp, ll, UNSUPPORTED, NOT_A_HEADER[name])
 
 
+_T = "    var t: i32 = 0\n    for x in {it}\n        t = t + 1\n    return t\n"
+
+
+# Two pointers from the header is no iterable, however it's reached.
+@pytest.mark.integration
+@pytest.mark.parametrize("it,pre", [
+    ("mkpp()", ""),
+    ("p", "    var p: **Vec<i32> = mkpp()\n"),
+    ("q.pp", "    var q: QQ\n    q.pp = mkpp()\n"),
+], ids=["call", "local", "field"])
+def test_ritz0_two_pointers_are_refused(compile_with, it, pre):
+    program = (GVEC + "struct QQ\n    n: i32\n    pp: **Vec<i32>\n\n"
+               "var g: Vec<i32>\n\nvar gp: *Vec<i32> = null\n\nfn mkpp() -> **Vec<i32>\n    gp = @g\n"
+               "    return @gp\n\n" + MAIN + pre + _T.format(it=it))
+    comp, ll, _ = compile_with("ritz0", "two_pointers", program)
+    assert comp.returncode != 0
+    assert not ll.exists()
+    assert "for loop iterable not supported" in comp.stdout + comp.stderr
+
+
 ELEMENT = "this `for` element type is not supported in ritz1"
 _ENUM = "enum C\n    R(i64)\n    B\n\n"
-_T = "    var t: i32 = 0\n    for x in {it}\n        t = t + 1\n    return t\n"
 
 # Refused, not guessed at.  ritz0 runs these.  An element Vec has no struct for
 # (#2411) is refused as an iterable, and one that it can't name as an element.
@@ -768,6 +842,7 @@ REFUSED_HOLDERS = {
     "addr_of_index": GVEC + MAIN + "    var vs: [2]Vec<i32>\n" + _T.format(it="@vs[1]"),
     "addr_of_reference": (GVEC + "fn f(v: @Vec<i32>) -> i32\n" + _T.format(it="@v") + "\n" + MAIN
                           + FILL_V + "    return f(@v)\n"),
+    "slice": _SPAN_OF_A,
 }
 
 

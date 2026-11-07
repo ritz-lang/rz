@@ -1916,28 +1916,6 @@ fn emit_for_elem_llvm(s: *EmitterState, elem: i32, name: *u8, name_len: i32)
     else
         emit_llvm_type(s, elem)
 
-# AGAST #2375: a private `[N x T]` holding array field `field`, read from
-# `field_ptr`, for a loop to walk.  ritz0 reads anything but a bare name once,
-# into a temporary, so a write in the body isn't seen by the loop.  #2387 ruled
-# that it should be, and takes this copy out.  The copy goes pointer to pointer: a first-class load of a large array is what
-# InstCombine can't digest (see SRET_MIN_BYTES).  The alloca is static, so
-# hoist_entry_allocas takes it out of any enclosing loop.
-fn emit_for_field_copy(s: *EmitterState, field_ptr: i32, field: *StructField) -> i32
-    let copy: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, copy)
-    emit_str(s, c" = alloca ")
-    emit_array_field_llvm_type(s, field)
-    emit_str(s, c"\n  call void @__ritz_sret_copy(ptr ")
-    emit_reg(s, copy)
-    emit_str(s, c", ptr ")
-    emit_reg(s, field_ptr)
-    emit_str(s, c", i64 ptrtoint (ptr getelementptr (")
-    emit_array_field_llvm_type(s, field)
-    emit_str(s, c", ptr null, i32 1) to i64))\n")
-    s.sret_helpers_used = 1
-    copy
-
 # AGAST #2388: a slot for the header value `val`, which has no place of its own:
 # a call's result, a literal or a const.  Nothing else can write to it.  The alloca
 # is static, so hoist_entry_allocas takes it out of any enclosing loop.
@@ -2083,7 +2061,7 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
 # Supports the shapes ritz1 can express today:
 #   • a local `[N]T` (TYPE_ARRAY), walked in place
 #   • a module const or global `[N]T`, walked in place at its symbol
-#   • an array field, walked in a copy (emit_for_field_copy)
+#   • an array field, walked in place at its address (AGAST #2387)
 #   • a Vec, a Span or a StrView, through its header (emit_for_header)
 # Anything else is a located error, as is a multi-dimensional array.  AGAST
 # #2375: it used to be a loop that never ran, with no diagnostic.
@@ -2164,7 +2142,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 iter_kind = 1
                 elem_type = fld.array_elem_type
                 arr_size = fld.array_size
-                data_reg = emit_for_field_copy(s, mr.reg, fld)
+                data_reg = mr.reg
                 elem_name = fld.array_elem_type_name
                 elem_name_len = fld.array_elem_type_name_len
                 bind_pointee = elem_recorded_pointee(s, elem_type, fld.array_elem_pointee, elem_name, elem_name_len, @bind_name, @bind_name_len)
@@ -2339,7 +2317,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c" x ")
         emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
         emit_str(s, c"], ptr ")
-        # A local array or a field's copy is an SSA reg; a const or global
+        # A local array or a field is an SSA reg; a const or global
         # array is its symbol.
         if iter_kind == 3
             emit_str(s, c"@")
