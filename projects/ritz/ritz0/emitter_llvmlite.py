@@ -1524,11 +1524,13 @@ class LLVMEmitter:
                                 return ftype
             return None
         elif isinstance(expr, rast.Index):
+            through = self._index_through(expr)
+            if through is not None:
+                return self._infer_ritz_type(through)
             base_type = self._infer_ritz_type(expr.expr)
             if base_type:
                 # A reference to a Vec auto-derefs on index (AGAST #1968), so
-                # `d[i]` on `d: @Vec<T>` is a T, mirroring _emit_index. A raw
-                # `*Vec<T>` stays pointer arithmetic (falls through below).
+                # `d[i]` on `d: @Vec<T>` is a T, mirroring _emit_index.
                 if (isinstance(base_type, rast.RefType)
                         and self._vec_elem_type(base_type.inner) is not None):
                     base_type = base_type.inner
@@ -5863,6 +5865,11 @@ class LLVMEmitter:
                     raise ValueError(f"Unknown variable: {name}")
             elif isinstance(stmt.target, rast.Index):
                 # Assignment to indexed location: arr[i] = val
+                through = self._index_through(stmt.target)
+                if through is not None:
+                    ptr = self._emit_expr(through.operand)
+                    self.builder.store(self._convert_type(val, ptr.type.pointee, stmt.value), ptr)
+                    return None
                 index = self._emit_index_value(stmt.target.index)
 
                 # Special handling for identifiers that are arrays
@@ -7978,8 +7985,65 @@ class LLVMEmitter:
         else:
             raise NotImplementedError(f"Expression: {type(expr)}")
 
+    def _index_through(self, expr: rast.Index) -> Optional[rast.UnaryOp]:
+        """`p[i]` as the place it means, when `p` sees through to a buffer: `p` a
+        `*T`, `@T` or `@&T` and T a Vec, Span or String (AGAST #2440, LARB R9).
+        `(*p)[i]` is the same place. The answer is `*(p.data + i)`, which every
+        position (read, store, `+=`, `@`, `@&`, `.f`) already lowers at stride T.
+
+        Bases other than a name are #2329's, and an array behind a pointer is
+        #2330's. None leaves `expr` to the paths below: a `*T` over anything else
+        is a raw buffer, `*(p + i)`.
+
+        A reference to anything else is a located error, since it's one T. Every
+        index comes through here, so this is the one place that says so.
+        """
+        base = expr.expr
+        while isinstance(base, rast.Grouped):
+            base = base.expr
+        deref = isinstance(base, rast.UnaryOp) and base.op == '*'
+        root = base.operand if deref else base
+        if not isinstance(root, rast.Ident):
+            return None
+        ty = self._infer_ritz_type(root)
+        if ty is not None:
+            ty = resolve_alias_in(ty, self.type_aliases)
+        if not isinstance(ty, (rast.PtrType, rast.RefType)):
+            return None
+        inner = resolve_alias_in(ty.inner, self.type_aliases)
+        path = self._buffer_field_path(inner)
+        if path is None:
+            # `let p = @x` is an `@T` too, and PtrType.shared is how that shows.
+            is_ref = isinstance(ty, rast.RefType) or ty.shared
+            if is_ref and not deref and not isinstance(inner, rast.ArrayType):
+                raise EmitError(array_rules.NOT_A_BUFFER, expr.span)
+            return None
+        if isinstance(expr.index, rast.Range):
+            return None
+        place: rast.Expr = root
+        for field in path:
+            place = rast.Field(expr.span, place, field)
+        return rast.UnaryOp(expr.span, '*', rast.BinOp(expr.span, '+', place, expr.index))
+
+    @staticmethod
+    def _buffer_field_path(ty: Optional[rast.Type]) -> Optional[tuple]:
+        """The fields from a Vec, Span or String to its element pointer, else None."""
+        if not isinstance(ty, rast.NamedType):
+            return None
+        if ty.name == 'Vec' or ty.name.startswith('Vec$'):
+            return ('data',)
+        if ty.name == 'Span' or ty.name.startswith('Span$'):
+            return ('ptr',)
+        if ty.name == 'String':
+            return ('data', 'data')
+        return None
+
     def _emit_index(self, expr: rast.Index) -> ir.Value:
         """Emit an indexing operation: base[index]."""
+        through = self._index_through(expr)
+        if through is not None:
+            return self._emit_expr(through)
+
         # Range index: `a[start..end]` lowers to a slice operation.
         if isinstance(expr.index, rast.Range):
             slice_end = expr.index.end
@@ -8067,20 +8131,6 @@ class LLVMEmitter:
             name = expr.expr.name
             if name in self.ritz_types:
                 base_ritz_type = self.ritz_types[name]
-                # A reference to a Vec (`d: @Vec<T>` / `@&Vec<T>`) auto-derefs:
-                # `d[i]` indexes the Vec, not the reference (AGAST #1968). The
-                # reference's value already IS the Vec pointer, so it replaces
-                # `&d`. A raw `*Vec<T>` is deliberately NOT peeled: `p[i]` on a
-                # pointer is pointer arithmetic.
-                via_ref = (
-                    isinstance(base_ritz_type, rast.RefType)
-                    and isinstance(base_ritz_type.inner, rast.NamedType)
-                    and (base_ritz_type.inner.name == 'Vec'
-                         or base_ritz_type.inner.name.startswith('Vec$'))
-                )
-                if via_ref:
-                    base_ritz_type = base_ritz_type.inner
-
                 if isinstance(base_ritz_type, rast.NamedType):
                     type_name = base_ritz_type.name
 
@@ -8104,10 +8154,7 @@ class LLVMEmitter:
 
                         fn, _ = self.functions[fn_name]
                         # Get pointer to vec
-                        if via_ref:
-                            vec_ptr = self._emit_expr(expr.expr)
-                        else:
-                            vec_ptr = self._emit_lvalue_addr(expr.expr)
+                        vec_ptr = self._emit_lvalue_addr(expr.expr)
                         # Ensure index is i64
                         if index.type != self.i64:
                             index = self.builder.sext(index, self.i64)
@@ -8172,7 +8219,7 @@ class LLVMEmitter:
                     if fn_name in self.functions:
                         return self.builder.call(self.functions[fn_name][0], [vec_ptr, index])
                     # Fallback: index the `data` field (backing storage) directly.
-                    data_field_idx = self._get_struct_field_index(inferred_name, 'data')
+                    data_field_idx = self._get_struct_field_index(f"Vec${elem_type_name}", 'data')
                     data_ptr_ptr = self.builder.gep(
                         vec_ptr,
                         [ir.Constant(self.i32, 0), ir.Constant(self.i32, data_field_idx)],
@@ -8880,6 +8927,9 @@ class LLVMEmitter:
                 return self._mut_borrow_args[expr.operand.name]
             return ptr
         elif isinstance(expr, rast.Index):
+            through = self._index_through(expr)
+            if through is not None:
+                return self._emit_expr(through.operand)
             # arr[i] -> GEP to element
             index = self._emit_index_value(expr.index)
             if isinstance(expr.expr, rast.Ident):
@@ -13012,6 +13062,9 @@ class LLVMEmitter:
 
         # Index into unsigned array or pointer
         if isinstance(expr, rast.Index):
+            through = self._index_through(expr)
+            if through is not None:
+                return self._is_unsigned_type(self._infer_ritz_type(through))
             if isinstance(expr.expr, rast.Ident):
                 if expr.expr.name in self.ritz_types:
                     ritz_type = self.ritz_types[expr.expr.name]

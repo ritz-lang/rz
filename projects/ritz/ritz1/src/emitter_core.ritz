@@ -14,6 +14,7 @@ import ritzlib.hashmap
 
 import ast
 import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
+import index_through # index_through (AGAST #2440)
 import tokens_gen
 
 # =============================================================================
@@ -3145,6 +3146,8 @@ fn index_elem_struct_name(s: *EmitterState, ie: *Expr, out_name: **u8, out_len: 
     *out_len = 0
     if ie == null or ie.kind != EXPR_INDEX or ie.left == null
         return
+    if index_through_struct(s, ie, out_name, out_len) == 1
+        return   # AGAST #2440
     # AGAST #2332: an element of `[N]*S`, whatever holds the array.
     if array_elem_pointee(s, ie, out_name, out_len) == TYPE_STRUCT
         return
@@ -3605,9 +3608,10 @@ fn member_field_def(s: *EmitterState, e: *Expr) -> *StructField
         call_result_struct_name(s, e.left, @recv, @recv_len)
     # AGAST #2332: `a[i].f` with `a: [N]*S`, so `f` has its own type.
     else if e.left.kind == EXPR_INDEX
-        array_elem_pointee(s, e.left, @recv, @recv_len)
-        if recv == null
-            array_elem_pointee(s, e.left.left, @recv, @recv_len)   # `a[i][j].f`
+        if index_through_struct(s, e.left, @recv, @recv_len) == 0   # AGAST #2440
+            array_elem_pointee(s, e.left, @recv, @recv_len)
+            if recv == null
+                array_elem_pointee(s, e.left.left, @recv, @recv_len)   # `a[i][j].f`
     if recv == null or recv_len <= 0
         return null
     let st: *StructDef = find_struct(s, recv, recv_len)
@@ -4009,6 +4013,12 @@ fn index_elem_size(s: *EmitterState, idx: *Expr) -> i64
                 if gsize > 0
                     return gsize
                 return ptr_elem_size_unknown(s, base.ident_ptr, base.ident_len)
+    # AGAST #2440: through a reference or pointer it's the buffer's element.
+    let through: *LocalVar = index_through(s, idx)
+    if through != null
+        var th: ThroughIndex
+        index_through_fill(idx, through, @th)
+        return ptr_arith_elem_size(s, @th.sum)
     # `@p[i]` for a pointer `p`: the element is p's pointee.
     return ptr_arith_elem_size(s, base)
 
@@ -4487,6 +4497,12 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         # AGAST #2332: `a[i][j]` with `a: [N]*T` is a T.
         if is_array_elem_index(s, e) == 1
             return array_elem_pointee_kind(s, e.left)
+        # AGAST #2440: what `*(p.data + i)` is.
+        let through: *LocalVar = index_through(s, e)
+        if through != null
+            var th: ThroughIndex
+            index_through_fill(e, through, @th)
+            return get_expr_type(s, @th.deref)
         # Indexing: result type depends on base type.
         # AGAST #1328: resolve the base through locals THEN globals — the old
         # code only saw locals, and find_local_type's TYPE_I64 miss value made

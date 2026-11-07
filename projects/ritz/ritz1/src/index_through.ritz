@@ -1,0 +1,222 @@
+# ritz1/src/index_through.ritz - `[]` through a pointer or reference
+#
+# AGAST #2440, LARB R9.  `p[i]` means `(*p)[i]` when `p` is a `*T`, `@T` or `@&T` and
+# T is a Vec, Span or String, and it's a place in every position: read, store, `+=`,
+# `@`, `@&`, `.f`.  Each of those lowers `*(p.data + i)` already, at stride T, so a
+# site asks index_through and takes the deref index_through_fill builds, as
+# elem_index_as_deref does for `a[i][j]` (#2332).  ritz0's twin is
+# Emitter._index_through.
+#
+# A `*T` over anything else is a raw buffer, and stays on the pointer paths.  A
+# reference to anything else is one T: every site asks index_refused first.
+#
+# An array behind a pointer is #2330's, and other bases, `h.r[i]`, `g[i]`, `f()[i]`,
+# are #2329's.
+
+import ritzlib.sys
+import ritzlib.str
+
+import ast
+import emitter_core
+import emitter_expr   # emit_member_gep_from_ptr
+
+# The Exprs `*(p.data + i)` is made of, for `index_through_fill` to fill.  A String
+# reaches its bytes through a Vec, so `*(p.data.data + i)`.
+struct ThroughIndex
+    field: Expr
+    bytes: Expr
+    sum: Expr
+    deref: Expr
+
+fn name_starts(name: *u8, len: i32, prefix: *u8, prefix_len: i32) -> i32
+    if len <= prefix_len
+        return 0
+    (memcmp(name, prefix, prefix_len as i64) == 0) as i32
+
+fn through_is_string(name: *u8, len: i32) -> i32
+    if len != 6
+        return 0
+    (memcmp(name, c"String", 6) == 0) as i32
+
+# 1 when a struct of this name indexes.
+fn name_is_indexable(name: *u8, len: i32) -> i32
+    if name_starts(name, len, c"Vec$", 4) == 1 or name_starts(name, len, c"Span$", 5) == 1
+        return 1
+    through_is_string(name, len)
+
+# `p` of `p[i]` and of `(*p)[i]`.
+fn through_root(base: *Expr) -> *Expr
+    if base != null and base.kind == EXPR_UNARY and base.op == OP_DEREF
+        return base.operand
+    base
+
+# 1 when `loc` is a pointer or reference, at one level, to a struct of an indexable name.
+fn sees_through(loc: *LocalVar) -> i32
+    if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+        return 0
+    if loc.pointee_type != TYPE_STRUCT
+        return 0
+    name_is_indexable(loc.type_name, loc.type_name_len)
+
+# The local `e` indexes through, or null.  index_refused has already turned down
+# `p[lo..hi]`.
+pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
+    if e == null or e.kind != EXPR_INDEX or e.right == null
+        return null
+    let root: *Expr = through_root(e.left)
+    if root == null or root.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, root.ident_ptr, root.ident_len)
+    if loc == null or sees_through(loc) == 0
+        return null
+    loc
+
+fn through_member(m: *Expr, e: *Expr, base: *Expr, name: *u8, len: i32)
+    m.kind = EXPR_MEMBER
+    m.span = e.span
+    m.left = base
+    m.ident_ptr = name
+    m.ident_len = len
+    m.next = null
+
+# Fill `t` with `*(p.data + i)` for `e`, which index_through took as `loc`.
+pub fn index_through_fill(e: *Expr, loc: *LocalVar, t: *ThroughIndex)
+    memset(t as *u8, 0, sizeof(ThroughIndex))
+    let root: *Expr = through_root(e.left)
+    var buffer: *Expr = @t.field
+    if name_starts(loc.type_name, loc.type_name_len, c"Span$", 5) == 1
+        through_member(@t.field, e, root, c"ptr", 3)
+    else
+        through_member(@t.field, e, root, c"data", 4)
+    if through_is_string(loc.type_name, loc.type_name_len) == 1
+        through_member(@t.bytes, e, @t.field, c"data", 4)
+        buffer = @t.bytes
+    t.sum.kind = EXPR_BINARY
+    t.sum.span = e.span
+    t.sum.op = OP_ADD
+    t.sum.left = buffer
+    t.sum.right = e.right
+    t.deref.kind = EXPR_UNARY
+    t.deref.span = e.span
+    t.deref.op = OP_DEREF
+    t.deref.operand = @t.sum
+
+# The field of a Vec or Span that points at its elements, or null: a String's is
+# a Vec, so it has none here.
+fn through_buffer(s: *EmitterState, loc: *LocalVar) -> *StructField
+    let st: *StructDef = find_struct(s, loc.type_name, loc.type_name_len)
+    if st == null or through_is_string(loc.type_name, loc.type_name_len) == 1
+        return null
+    var idx: i32 = find_field_index(st, c"data", 4)
+    if idx < 0
+        idx = find_field_index(st, c"ptr", 3)
+    if idx < 0
+        return null
+    get_field_type(st, idx)
+
+# The kind of an element of `loc`, which sees through, for the slot checks.
+pub fn through_elem_kind(s: *EmitterState, loc: *LocalVar) -> i32
+    if through_is_string(loc.type_name, loc.type_name_len) == 1
+        return TYPE_U8
+    let f: *StructField = through_buffer(s, loc)
+    if f == null
+        return TYPE_UNKNOWN
+    ptr_field_elem_kind(f)
+
+# The element kind of `name[i]`, if `name` sees through, or TYPE_VOID.
+pub fn through_named_elem(s: *EmitterState, name: *u8, len: i32) -> i32
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx < 0
+        return TYPE_VOID
+    let loc: *LocalVar = local_at(s, idx)
+    if sees_through(loc) == 0
+        return TYPE_VOID
+    through_elem_kind(s, loc)
+
+# The struct an element of `loc`'s buffer is or points at, and the field's type
+# (TYPE_PTR for `*S` elements, TYPE_PTR_PTR for `*S` held in the buffer), or
+# TYPE_VOID for scalars.
+fn through_elem_struct(s: *EmitterState, loc: *LocalVar, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    let f: *StructField = through_buffer(s, loc)
+    if f == null or f.field_type_name_len <= 0 or find_struct(s, f.field_type_name, f.field_type_name_len) == null
+        return TYPE_VOID
+    *out_name = f.field_type_name
+    *out_len = f.field_type_name_len
+    f.field_type
+
+# The struct `p[i].f` takes a field of, for the type-only paths.  Returns 1 if `e`
+# is an index through.
+pub fn index_through_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    let loc: *LocalVar = index_through(s, e)
+    if loc == null
+        return 0
+    through_elem_struct(s, loc, out_name, out_len)
+    1
+
+# `p[i].f`'s address, for `e` = the EXPR_MEMBER.  Returns 1 when it took `e`.  An
+# element that's a pointer holds the struct's address; otherwise the sum is it.
+pub fn emit_through_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult) -> i32
+    let loc: *LocalVar = index_through(s, e.left)
+    if loc == null
+        return 0
+    var name: *u8 = null
+    var name_len: i32 = 0
+    let held: i32 = through_elem_struct(s, loc, @name, @name_len)
+    if name == null
+        return 0
+    let st: *StructDef = find_struct(s, name, name_len)
+    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if field_idx < 0
+        return 0
+    var t: ThroughIndex
+    index_through_fill(e.left, loc, @t)
+    var val: i32 = 0
+    if held == TYPE_PTR_PTR
+        val = emit_expr(s, @t.deref)
+    else
+        val = emit_expr(s, @t.sum)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, val)
+    emit_str(s, c" to ptr\n")
+    emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
+    1
+
+# 1 after reporting `e`, a slice through a pointer or reference.  The range block
+# in emit_expr_index reads the struct at the local's own slot, which here holds a
+# pointer to it, so a Span sliced garbage (#2448).
+fn through_slice_refused(s: *EmitterState, e: *Expr) -> i32
+    if e.right == null or e.right.kind != EXPR_RANGE
+        return 0
+    let root: *Expr = through_root(e.left)
+    if root == null or root.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, root.ident_ptr, root.ident_len)
+    if loc == null or sees_through(loc) == 0
+        return 0
+    emit_nd_error(s, e.span.line, e.span.col, c"a slice through a pointer or reference isn't lowered by ritz1")
+    1
+
+# 1 after reporting `e`, an index through a reference to something that isn't
+# indexable.  `(*q)[i]` names what's behind the reference, so it isn't one of these.
+pub fn index_refused(s: *EmitterState, e: *Expr) -> i32
+    if e == null or e.kind != EXPR_INDEX or e.left == null
+        return 0
+    if through_slice_refused(s, e) == 1
+        return 1
+    if e.left.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+    if loc == null
+        return 0
+    # `let p = @x` is an `@T` too, whatever var_type had to say.
+    if loc.holds_shared_ref == 0 and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+        return 0
+    if loc.pointee_type == TYPE_ARRAY or sees_through(loc) == 1
+        return 0
+    emit_nd_error(s, e.span.line, e.span.col, c"a reference is one value, not a buffer: `[]` needs an array, Vec, Span or String behind it")
+    1

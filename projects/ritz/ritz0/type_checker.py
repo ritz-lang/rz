@@ -1021,13 +1021,8 @@ class TypeChecker:
         # Get element type
         if isinstance(base_type, rast.ArrayType):
             return base_type.inner
-        elif isinstance(base_type, rast.PtrType):
-            return base_type.inner
-        elif isinstance(base_type, rast.RefType):
-            inner = base_type.inner
-            if isinstance(inner, rast.ArrayType):
-                return inner.inner
-            return inner
+        elif isinstance(base_type, (rast.PtrType, rast.RefType)):
+            return self._element_behind(base_type)
         elif isinstance(base_type, rast.NamedType):
             # Could be Vec<T>, String, etc - allow indexing
             # In full implementation, would look up Index trait
@@ -1035,6 +1030,20 @@ class TypeChecker:
         else:
             self._error(f"cannot index into {self._type_str(base_type)}", expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
+
+    def _element_behind(self, pointer: rast.Type) -> rast.Type:
+        """What `p[i]` is for `p: pointer`. `[]` sees through to an indexable T
+        (AGAST #2440, LARB R9); a `*T` over anything else is a raw buffer of T.
+        The emitter refuses a reference to anything else (_index_through)."""
+        inner = self._resolve_alias(pointer.inner)
+        if isinstance(inner, rast.ArrayType):
+            return inner.inner if isinstance(pointer, rast.RefType) else pointer.inner
+        if isinstance(inner, rast.NamedType):
+            if inner.name == 'String':
+                return rast.NamedType(inner.span, 'u8', [])
+            if inner.name in ('Vec', 'Span') and inner.args:
+                return inner.args[0]
+        return pointer.inner
 
     def _check_if(self, expr: rast.If) -> rast.Type:
         """Type check if expression."""

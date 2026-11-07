@@ -1548,6 +1548,65 @@ arr[0] = 7              # Index assignment
 let v = arr[0]          # Index access
 ```
 
+`[]` sees through one level. `p[i]` means `(*p)[i]` when `p` is a `*T`, `@T` or `@&T`
+and `T` is a Vec, Span or String, and `(*p)[i]` is the same place. An element is a
+place in every position: read, store, `+=`, `@`, `@&` and `.f`.
+
+```ritz
+import ritzlib.gvec
+
+struct Point
+    x: i32
+    y: i32
+
+fn third(v: @Vec<i32>) -> i32
+    v[2]
+
+fn clear(v: @&Vec<i32>, i: i64)
+    v[i] = 0
+
+fn nudge(v: *Vec<Point>)
+    v[0].y += 1
+
+fn main() -> i32
+    var v: Vec<i32> = vec_new<i32>()
+    v.push(1)
+    v.push(2)
+    v.push(3)
+    clear(@&v, 0)
+    third(@v)
+```
+
+Writes follow §3.2, so an `@T` refuses them. A `*T` over anything else is a raw
+buffer: `p[i]` is `*(p + i)`, at stride `T`. Walking rows of Vecs behind a `*Vec<T>`
+is `p + i`, not `p[i]`.
+
+```ritz expect-error="cannot write through an `@T`: make it `@&T`"
+import ritzlib.gvec
+
+fn clear(v: @Vec<i32>)
+    v[0] = 0
+
+fn main() -> i32
+    var v: Vec<i32> = vec_new<i32>()
+    v.push(1)
+    clear(@v)
+    0
+```
+
+An `@T` or `@&T` over anything else is an error: a reference is one `T`, not a buffer.
+That includes a pointer as the pointee, because `[]` sees through one level only, so
+`q: @*Vec<i32>` is `(*q)[1]`.
+
+```ritz expect-error="a reference is one value, not a buffer"
+fn second(p: @i32) -> i32
+    p[1]
+
+fn main() -> i32
+    var x: i32 = 1
+    second(@x)
+```
+
 ### 7.9 Sizeof
 
 ```ritz body
