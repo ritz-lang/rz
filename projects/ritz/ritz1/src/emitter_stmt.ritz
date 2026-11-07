@@ -143,6 +143,49 @@ fn inferred_u64_init(s: *EmitterState, stmt: *Stmt) -> i32
         return uns
     0
 
+# 1 when `name` is an enum `ctor` builds: an Option for Some / None, a Result
+# for Ok / Err.
+fn ctor_family_is(ctor: *Expr, name: *u8, len: i32) -> i32
+    if name == null or len < 7
+        return 0
+    if ctor.kind == EXPR_IDENT or name_eq(ctor.func_name, ctor.func_name_len, c"Some", 4) == 1 or name_eq(ctor.func_name, ctor.func_name_len, c"None", 4) == 1
+        return name_eq(name, 7, c"Option$", 7)
+    name_eq(name, 7, c"Result$", 7)
+
+# AGAST #2430: an unannotated `let o = Some(5)` (or None, Ok, Err) is the enum
+# it builds.  The local stayed an i64, the constructor had no enum to build and
+# lowered to a zero, and `match o` read that.  The enum is the fn's return type
+# when that is one of the constructor's family, as on ritz0 (`let o = None`
+# then `o` in a `-> Option<i32>` fn); otherwise the one its payload names, as a
+# scrutinee's (#2419).  1 when it typed the local; a payload nothing names is a
+# located error, never the zero.
+fn infer_ctor_let(s: *EmitterState, stmt: *Stmt) -> i32
+    let init: *Expr = stmt.var_init
+    if stmt.var_declared_type != TYPE_VOID or init == null
+        return 0
+    if is_tagged_ctor(s, init) == 0
+        return 0
+    if init.kind == EXPR_CALL
+        var uc_name: *u8 = null
+        var uc_len: i32 = 0
+        user_variant_ctor_enum(init, @uc_name, @uc_len)
+        if uc_name != null
+            return 0   # a user enum's own variant (#1797)
+    var name: *u8 = null
+    var len: i32 = 0
+    if ctor_family_is(init, s.ret_type_name, s.ret_type_name_len) == 1
+        name = s.ret_type_name
+        len = s.ret_type_name_len
+    else
+        ctor_scrutinee_enum(s, init, @name, @len)
+    if name == null
+        emit_nd_error(s, init.span.line, init.span.col, c"this constructor's type can't be inferred here: bind it with a typed `let` first")
+        return 0
+    stmt.var_type = TYPE_STRUCT
+    stmt.var_type_name = name
+    stmt.var_type_name_len = len
+    1
+
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     let shared_ref: i32 = let_holds_shared_ref(s, stmt)
     # Use the user's explicit type annotation. The parser defaults
@@ -206,6 +249,10 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 # `Some(x) => x` over Option<f64>: a `double` slot.
                 var_type = s.last_match_float_ty
                 stmt.var_type = var_type
+
+    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and pre_emitted == 0
+        if infer_ctor_let(s, stmt) == 1
+            var_type = TYPE_STRUCT
 
     # Infer struct type for `var IDENT = expr` (no annotation).
     # The parser defaults missing annotations to TYPE_I64, which is
