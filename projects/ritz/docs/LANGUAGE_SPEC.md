@@ -1577,6 +1577,27 @@ fn main() -> i32
     third(@v)
 ```
 
+The value itself is the same place: `v[i]` on a Vec, Span or String is its element
+in every position, and an element that is itself one indexes in turn, so `v[i][j]`
+and `p[i][j]` are places too.
+
+```ritz
+import ritzlib.gvec
+
+fn main() -> i32
+    var v: Vec<i32> = vec_new<i32>()
+    v.push(10)
+    v.push(20)
+    v[1] = 7
+    v[1] += 2
+    var rows: Vec<Vec<i32>> = vec_new<Vec<i32>>()
+    vec_push<Vec<i32>>(@&rows, v)
+    rows[0][0] = 1
+    let p: @&Vec<Vec<i32>> = @&rows
+    p[0][1] += 1
+    rows[0][0] + rows[0][1] - 11
+```
+
 Writes follow §3.2, so an `@T` refuses them. A `*T` over anything else is a raw
 buffer: `p[i]` is `*(p + i)`, at stride `T`. Walking rows of Vecs behind a `*Vec<T>`
 is `p + i`, not `p[i]`.

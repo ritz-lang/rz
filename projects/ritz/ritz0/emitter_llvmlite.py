@@ -7991,8 +7991,12 @@ class LLVMEmitter:
         `(*p)[i]` is the same place. The answer is `*(p.data + i)`, which every
         position (read, store, `+=`, `@`, `@&`, `.f`) already lowers at stride T.
 
-        Bases other than a name are #2329's, and an array behind a pointer is
-        #2330's. None leaves `expr` to the paths below: a `*T` over anything else
+        The value itself is the same place (#2442): `v[i]` on a Vec, Span or String
+        is `*(v.data + i)`. So is an element that is one, or points at one:
+        `v[i][j]` is `*(v[i].data + j)`.
+
+        Bases other than a name or an element are #2329's, and an array behind a
+        pointer is #2330's. None leaves `expr` to the paths below: a `*T` over anything else
         is a raw buffer, `*(p + i)`.
 
         A reference to anything else is a located error, since it's one T. Every
@@ -8003,11 +8007,22 @@ class LLVMEmitter:
             base = base.expr
         deref = isinstance(base, rast.UnaryOp) and base.op == '*'
         root = base.operand if deref else base
-        if not isinstance(root, rast.Ident):
+        # A name, or an element that is itself a Vec: `v[i][j]`, `p[i][j]` (#2442).
+        if not isinstance(root, (rast.Ident, rast.Index)):
             return None
         ty = self._infer_ritz_type(root)
         if ty is not None:
             ty = resolve_alias_in(ty, self.type_aliases)
+        # The value itself, `v[i]` on a Vec, Span or String local: the same place,
+        # `*(v.data + i)`, as through a pointer to it (#2442).  A slice keeps its own.
+        # So does a value whose struct this module never declared, the bare
+        # `{ ptr, i64 }` of `s.as_bytes()`: `.ptr` can't name a field of it.
+        if not deref:
+            path = self._buffer_field_path(ty)
+            if path is not None and self._type_to_name_suffix(ty) in self.struct_types:
+                if isinstance(expr.index, rast.Range):
+                    return None
+                return self._buffer_element(expr, root, path)
         if not isinstance(ty, (rast.PtrType, rast.RefType)):
             return None
         inner = resolve_alias_in(ty.inner, self.type_aliases)
@@ -8020,6 +8035,11 @@ class LLVMEmitter:
             return None
         if isinstance(expr.index, rast.Range):
             return None
+        return self._buffer_element(expr, root, path)
+
+    @staticmethod
+    def _buffer_element(expr: rast.Index, root: rast.Expr, path: tuple) -> rast.UnaryOp:
+        """`*(root.data + i)` for `expr`, `root[i]`, along `path` to the elements."""
         place: rast.Expr = root
         for field in path:
             place = rast.Field(expr.span, place, field)

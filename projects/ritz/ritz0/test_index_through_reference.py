@@ -770,11 +770,8 @@ pub fn main() -> i32
     assert run_with(compiler, "out", program) == 20
 
 
-# Gaps, each with its ticket.  A strict xfail turns red when the row starts passing.
-RITZ1_GAP = [pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#2442"))
-             for c in ("ritz1", "ritz1_selfhosted")]
-
-# `p[1][1]`: the base is itself an element (#2442).  Loud on ritz1: clang refuses it.
+# `p[1][1]`: the base is itself an element (#2442).  Its stores are in
+# test_index_value_local.py.
 NESTED = """\
 fn f(p: {spelled}Vec<Vec<i32>>) -> i32
     return p[1][1]
@@ -792,7 +789,7 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", *RITZ1_GAP])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", sorted(KINDS))
 def test_an_element_that_is_a_vec_indexes(run_with, kind, compiler):
     spelled, addr = KINDS[kind]
