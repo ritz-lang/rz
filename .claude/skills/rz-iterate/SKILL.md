@@ -29,7 +29,10 @@ Repeat until the goal is met:
      (Aaron, 2026-10-25, after its three reviews merged), so both slots go
      to ritz task rooms. Its unit is stopped and its worktree and branch are
      kept. It's a long-lived room: bring it back for follow-up reviews only
-     when Aaron asks, and it takes a slot when it runs. Its REAP lines
+     when Aaron asks. It doesn't take a slot when it runs (Aaron, 2026-11-07:
+     the limit is for compiler CPU pressure, and LARB is a decision room), so
+     brief it to stay light: no gates, one `ritz1` build or sweep at a time.
+     Its REAP lines
      (`REAP rz-larb <sha>`) go through the normal queue, and after merging
      don't remove its worktree, unit or branch.
    - **Test-speed tickets from `rz-larb` (smoke tier, faster suite,
