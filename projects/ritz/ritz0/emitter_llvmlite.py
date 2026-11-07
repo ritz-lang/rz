@@ -756,6 +756,10 @@ class LLVMEmitter:
             layout = self._struct_layout_on_demand(ty.name)
             if layout:
                 return (layout.size, layout.alignment)
+            # The built-in `{ *u8, i64 }` view, before anything registered
+            # it: `Option<StrView>` was sized with an 8-byte payload (#2433).
+            if ty.name == 'StrView':
+                return (16, 8)
 
             # Enum types (AGAST #1923): their real all-i8 layout, not 8/8.
             enum_sa = self._enum_size_and_align(ty.name)
@@ -3054,6 +3058,13 @@ class LLVMEmitter:
                                                 ir.Constant(self.i32, field_offsets[i])]),
                     ir.PointerType(llvm_field_type)
                 )
+                if (arg_val.type != llvm_field_type
+                        and isinstance(arg_val.type, ir.LiteralStructType)
+                        and isinstance(llvm_field_type, ir.IdentifiedStructType)
+                        and arg_val.type.elements == llvm_field_type.elements):
+                    # A StrView built before the struct was registered is its
+                    # anonymous `{i8*, i64}`: the same layout (#2433).
+                    field_ptr = self.builder.bitcast(field_ptr, ir.PointerType(arg_val.type))
                 self.builder.store(arg_val, field_ptr)
 
         # Load and return the enum value
@@ -3254,6 +3265,13 @@ class LLVMEmitter:
                                                 ir.Constant(self.i32, field_offsets[i])]),
                     ir.PointerType(llvm_field_type)
                 )
+                if (arg_val.type != llvm_field_type
+                        and isinstance(arg_val.type, ir.LiteralStructType)
+                        and isinstance(llvm_field_type, ir.IdentifiedStructType)
+                        and arg_val.type.elements == llvm_field_type.elements):
+                    # A StrView built before the struct was registered is its
+                    # anonymous `{i8*, i64}`: the same layout (#2433).
+                    field_ptr = self.builder.bitcast(field_ptr, ir.PointerType(arg_val.type))
                 self.builder.store(arg_val, field_ptr)
 
         # Load and return the enum value
@@ -13251,6 +13269,11 @@ class LLVMEmitter:
         For enum types with VariantPattern arms, generates a switch on the tag.
         Each arm extracts the appropriate type from the union/enum data.
         """
+        # A bare constructor names its enum by its payload alone (#2433).
+        built = self._emit_bare_ctor_scrutinee(expr)
+        if built is not None:
+            return self._emit_enum_match(expr, *built)
+
         # Emit the match expression
         match_val = self._emit_expr(expr.expr)
 
@@ -13290,6 +13313,80 @@ class LLVMEmitter:
             return self._emit_integer_match(expr, match_val)
 
         raise NotImplementedError(f"Match on type {match_val.type} not yet supported")
+
+    # The builtin constructors: (generic enum, which type argument the payload
+    # gives, or None for a unit variant).
+    _BUILTIN_CTORS = {'Some': ('Option', 0), 'None': ('Option', None),
+                      'Ok': ('Result', 0), 'Err': ('Result', 1)}
+
+    def _bare_ctor_type(self, expr: rast.Expr) -> Optional[rast.NamedType]:
+        """The enum the bare constructor `expr` builds, from it alone, or None.
+
+        `Some(5)` is `Option<i64>` and `Err("x")` is `Result<i64, StrView>`: the
+        payload gives its type argument, and one nothing gives is i64 (ritz1's
+        rule, #2419). An unqualified variant of a user's enum is that enum. What
+        the module has registered has no say (#2433): ritz0 reused the last
+        `Option<...>` it had, so with `Option<u8>` registered `Some(300)` didn't fit,
+        and without any `Some` was an unknown function. None for anything else,
+        a name a value shadows, or a payload whose type isn't inferable.
+        """
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            name, args, span = expr.func.name, expr.args, expr.func.span
+        elif isinstance(expr, rast.Ident):
+            name, args, span = expr.name, None, expr.span
+        else:
+            return None
+        if self._sizeof_is_value(name):
+            return None
+        declarers = self.variant_declarers.get(name, ())
+        if declarers:
+            self._check_variant_unambiguous(name, span)
+            return rast.NamedType(span, declarers[0], [])
+        if name not in self._BUILTIN_CTORS:
+            return None
+        base, slot = self._BUILTIN_CTORS[name]
+        if (slot is None) != (args is None) or (args is not None and len(args) != 1):
+            return None
+        type_args = [rast.NamedType(span, 'i64', []) for _ in range(2 if base == 'Result' else 1)]
+        if slot is not None:
+            arg = args[0]
+            if (isinstance(arg, rast.BinOp)
+                    and arg.op in bool_rules.COMPARISONS + bool_rules.LOGICAL):
+                # _infer_ritz_type gives a BinOp its left operand's type.
+                payload = rast.NamedType(arg.span, 'bool', [])
+            else:
+                payload = self._bare_ctor_type(arg) or self._infer_ritz_type(arg)
+            if payload is None or (isinstance(payload, rast.NamedType)
+                                   and payload.name in ('null', 'unknown')):
+                return None
+            type_args[slot] = payload
+        return rast.NamedType(span, base, type_args)
+
+    def _emit_bare_ctor_scrutinee(self, expr: rast.Match) -> Optional[tuple]:
+        """Build `match Some(5)`'s scrutinee as the enum _bare_ctor_type names.
+
+        Returns (value, enum name) for _emit_enum_match, or None when the
+        scrutinee is no bare constructor. `@Some(5)` borrows a value only the
+        match holds, so it is matched as that value. The match owns what it
+        built (#2174) by the move checker's `owns_scrutinee`.
+        """
+        scrut = expr.expr
+        while isinstance(scrut, rast.Grouped):
+            scrut = scrut.expr
+        if isinstance(scrut, rast.UnaryOp) and scrut.op in ('@', '&', '@&', '&mut'):
+            scrut = scrut.operand
+        ty = self._bare_ctor_type(scrut)
+        if ty is None:
+            return None
+        if ty.args:
+            enum_name = self._ensure_builtin_generic_specialization(ty)
+        else:
+            enum_name = ty.name
+        if enum_name not in self.enum_types:
+            return None
+        return self._emit_enum_variant_with_type(scrut, enum_name), enum_name
 
     @staticmethod
     def _require_covered(expr: rast.Match, gap: List[str]) -> None:

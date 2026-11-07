@@ -1396,6 +1396,14 @@ class MoveChecker:
         out of a binding, or a by-value call's move-only result."""
         while isinstance(scrut, rast.Grouped):
             scrut = scrut.expr
+        # A constructor (`Some(make(1))`, `@Full(make(1))`) builds a value
+        # only the match holds, borrowed or not (#2433, ritz1 #2419).
+        built = scrut
+        if isinstance(built, rast.UnaryOp) and built.op in ('@', '&', '@&', '&mut'):
+            built = built.operand
+        ctor = self._ctor_type(built)
+        if ctor is not None:
+            return ctor if self.types.is_move_only(ctor) else None
         if isinstance(scrut, rast.Ident):
             moved = getattr(scrut, 'moves_binding', False)
         elif isinstance(scrut, rast.Field):
@@ -1407,6 +1415,45 @@ class MoveChecker:
         ty = self._field_path_type(scrut)
         return ty if self.types.is_move_only(ty) else None
 
+    # The builtin constructors: (generic enum, the type argument the payload
+    # gives, or None for a unit variant). The emitter's _BUILTIN_CTORS.
+    _BUILTIN_CTORS = {'Some': ('Option', 0), 'None': ('Option', None),
+                      'Ok': ('Result', 0), 'Err': ('Result', 1)}
+
+    def _ctor_type(self, expr: rast.Expr) -> Optional[rast.NamedType]:
+        """The enum a bare constructor builds, or None (#2433): a user enum's
+        variant is that enum, and `Some(x)` is `Option<x's type>`, a type
+        argument nothing gives being i64 (ritz1 #2419). Only whether it's
+        move-only matters here; the emitter names the specialization."""
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        qualified = self.types.variant_value_type(
+            expr, lambda n: self.scope.lookup(n) is not None)
+        if qualified is not None:
+            return qualified
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            name, args = expr.func.name, expr.args
+        elif isinstance(expr, rast.Ident):
+            name, args = expr.name, None
+        else:
+            return None
+        if self.scope.lookup(name) is not None:
+            return None
+        users = [ed for ed in self.types.enums.values()
+                 if not ed.type_params and any(v.name == name for v in ed.variants)]
+        if users:
+            return rast.NamedType(expr.span, users[0].name, [])
+        if name not in self._BUILTIN_CTORS:
+            return None
+        base, slot = self._BUILTIN_CTORS[name]
+        if (slot is None) != (args is None) or (args is not None and len(args) != 1):
+            return None
+        type_args = [rast.NamedType(expr.span, 'i64', [])
+                     for _ in range(2 if base == 'Result' else 1)]
+        if slot is not None:
+            type_args[slot] = self._ctor_type(args[0]) or self._infer_expr_type(args[0])
+        return rast.NamedType(expr.span, base, type_args)
+
     def _variant_fields(self, ty: rast.Type, variant: str) -> Optional[List[rast.Type]]:
         """The payload types of `variant` of the enum `ty`, with the enum's
         type parameters replaced by `ty`'s args. None if not an enum's."""
@@ -1417,7 +1464,13 @@ class MoveChecker:
             return None
         ed = self.types.enums.get(ty.name)
         if ed is None:
-            return None
+            # Option and Result are the compiler's when no `ritzlib.option`
+            # declares them: `Some(v) => eat(v)` takes the payload.
+            fields = {('Option', 'Some'): [0], ('Option', 'None'): [],
+                      ('Result', 'Ok'): [0], ('Result', 'Err'): [1]}.get((ty.name, variant))
+            if fields is None or len(ty.args) != (2 if ty.name == 'Result' else 1):
+                return None
+            return [ty.args[i] for i in fields]
         subst = dict(zip(ed.type_params or [], ty.args))
         for v in ed.variants:
             if v.name == variant:

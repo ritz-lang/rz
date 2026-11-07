@@ -14,9 +14,9 @@ The enum comes from the payload, so it can't depend on what else the module says
 argument nothing gives, as in `None` or `Ok(5)`'s `E`, is the same default. The
 enclosing fn or `let` has no say: the scrutinee isn't its value.
 
-The expected exit codes come from what each program says, not from a compiler.
-ritz0 reuses a specialization the module already registered and has none to reuse
-without one (#2433), so its rows carry _REGISTERED.
+The expected exit codes come from what each program says, not from a compiler,
+and all three answer every row. ritz0 used to reuse a specialization the module
+already registered, and had none to reuse without one (#2433).
 
 A nested match is an arm's tail, which is its value (#2429). The types are `Pair`
 and `Slot` because `Option<P>` is never declared (#2432).
@@ -43,7 +43,6 @@ _T = (_P + "struct T\n    x: i32\n    f: f32\n    q: *i32\nimpl T\n    fn n(self
       "        5\n    fn u(self: *T) -> u8\n        200\n    fn m(self: *T) -> Pair\n"
       "        Pair { a: 2, b: 3 }\n")
 _T_LOCAL = "var i: i32 = 5\nlet t = T { x: 5, f: 2.5, q: @i }"
-_REGISTERED = "fn r0() -> Option<i64>\n    None\nfn r1() -> Result<i64, i64>\n    Ok(1)\n"
 
 
 def _on(scrutinee, *arms, before=""):
@@ -245,7 +244,7 @@ USERS_NONE = {
 }
 
 # The match owns what it built, as it owns a call's value (#2174): one drop, whichever
-# arm takes it. `DROPS` is main's exit code. ritz0 leaks each constructor here (#2433).
+# arm takes it. `DROPS` is main's exit code. ritz0 leaked each constructor here (#2433).
 _OWN = ("var DROPS: i32 = 0\nstruct Tracked\n    id: i32\nimpl Drop for Tracked\n"
         "    fn drop(self: @&Tracked)\n        DROPS = DROPS + 1\n"
         "fn make(i: i32) -> Tracked\n    Tracked { id: i }\n"
@@ -289,10 +288,24 @@ OWNED = {
                                *_arms("o", "_ => 2")), 1),
 }
 
-# ritz0 runs these once the module has registered the specialization.
-ON_RITZ0 = sorted(set(VARIANTS) - {"as_a_statement"}) + [
-    "user_unit", "user_payload", "user_qualified", "user_qualified_unit", "wider_than_i32",
-    "call", "err_call"]
+# What else the module names is no say either (#2433): ritz0 reused whichever
+# specialization it had registered, and had none to reuse without one.
+OTHERS = {
+    "nothing": "",
+    "option_u8": "fn r0() -> Option<u8>\n    None\n",
+    "result_u8": "fn r1() -> Result<u8, u8>\n    Ok(1)\n",
+    "option_i64": "fn r0() -> Option<i64>\n    None\nfn r1() -> Result<i64, i64>\n    Ok(1)\n",
+}
+
+# A payload no narrower enum holds: Option<u8> made it `300 does not fit in u8`.
+WIDE = {
+    "some_300": (_on("Some(300)", "Some(v) => (v - 295) as i32", "_ => 2"), 5),
+    "ok_300": (_on("Ok(300)", "Ok(v) => (v - 295) as i32", "_ => 2"), 5),
+    "err_300": (_on("Err(300)", "Ok(v) => 1", "Err(e) => (e - 295) as i32"), 5),
+    "some_wider_than_i32": (_on("Some(4294967301)", "Some(v) => (v / 1073741824) as i32",
+                                "_ => 2"), 4),
+    "some_negative": (_on("Some(-5)", "Some(v) => (0 - v) as i32", "_ => 2"), 5),
+}
 
 
 def _ritz1(request, compiler, tmp_path, source):
@@ -437,16 +450,82 @@ def test_ritz1_treats_a_foreign_arm_as_on_any_option(request, tmp_path, compiler
     assert (bare.returncode == 0) == (named.returncode == 0), (bare.stderr, named.stderr)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", ON_RITZ0)
-def test_ritz0_gives_each_row_the_same_answer(tmp_path, name):
-    source, code = RUNS[name]
+def _ritz0(tmp_path, source):
     src = tmp_path / "unit.ritz"
-    src.write_text(_REGISTERED + source)
+    src.write_text(source)
     ll = tmp_path / "unit.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    return proc, ll
+
+
+def _run_ritz0(tmp_path, source, name):
+    proc, ll = _ritz0(tmp_path, source)
     assert proc.returncode == 0, f"{name}:\n{(proc.stdout + proc.stderr)[-1500:]}"
     exe = tmp_path / "unit"
     subprocess.run(["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"], check=True)
-    assert subprocess.run([str(exe)], timeout=60).returncode == code, name
+    return subprocess.run([str(exe)], timeout=60).returncode
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("other", sorted(OTHERS))
+@pytest.mark.parametrize("name", sorted(WIDE))
+def test_ritz1_holds_a_wide_payload_whatever_else_is_named(request, tmp_path, compiler,
+                                                          other, name):
+    source, code = WIDE[name]
+    proc, ll = _ritz1(request, compiler, tmp_path, OTHERS[other] + source)
+    assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-800:]}"
+    assert _run_ritz1(ll, tmp_path) == code, f"{compiler}, {name}, {other}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(RUNS))
+def test_ritz0_matches_on_what_the_scrutinee_built(tmp_path, name):
+    """The module names no Option or Result: `Some` was an unknown function."""
+    source, code = RUNS[name]
+    assert _run_ritz0(tmp_path, source, name) == code, name
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("other", sorted(OTHERS))
+@pytest.mark.parametrize("name", sorted(WIDE))
+def test_ritz0_holds_a_wide_payload_whatever_else_is_named(tmp_path, other, name):
+    source, code = WIDE[name]
+    assert _run_ritz0(tmp_path, OTHERS[other] + source, name) == code, (name, other)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(OWNED))
+def test_ritz0_drops_what_the_scrutinee_built_once(tmp_path, name):
+    source, drops = OWNED[name]
+    assert _run_ritz0(tmp_path, source, name) == drops, name
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("value", ['"hello"', "x"])
+def test_ritz0_holds_a_strview_in_a_typed_option(tmp_path, value):
+    """Built before anything registered StrView, the payload slot was 8 bytes
+    and a literal's `{i8*, i64}` couldn't be stored in it (#2433)."""
+    source = (_MAIN + '    let x: StrView = "hello"\n'
+              f"    let o: Option<StrView> = Some({value})\n"
+              "    match o\n        Some(v) => v.len as i32\n        _ => 2\n")
+    assert _run_ritz0(tmp_path, source, value) == 5
+
+
+@pytest.mark.integration
+def test_ritz0_moves_a_local_into_the_scrutinee(tmp_path):
+    source = _dropped("let t = make(1)", *_arms("Some(t)", "_ => 2"), "t.id")
+    proc, ll = _ritz0(tmp_path, source)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "moved" in out, out[-800:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(REFUSED))
+def test_ritz0_holds_a_constructor_scrutinee_to_coverage(tmp_path, name):
+    source, _, _, message = REFUSED[name]
+    proc, _ = _ritz0(tmp_path, source)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"ritz0 accepted {name}:\n{out[-800:]}"
+    assert message.removeprefix("error: ") in out, out[-800:]
