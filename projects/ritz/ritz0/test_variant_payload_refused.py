@@ -472,16 +472,14 @@ def test_ritz1_still_runs_a_payload_that_binds(request, tmp_path, compiler, name
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 
 
-# Each arm has no field to read. ritz0 stops at both (#2423, and its own `Unknown
-# variant`); ritz1 binds, which #2408 and #2421 own. Here it must only get through.
-# The name is no const: one would be the binder's error (R12) before any field.
+# Each arm has no field to read. ritz0 stops at both (#2423); ritz1 binds, which
+# #2408 and #2421 own. Here it must only get through. The name is no const: one
+# would be the binder's error (R12) before any field. A variant the enum doesn't
+# declare (`Nope(k)` on a B) is refused on all three: test_match_foreign_variant.py.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("source", [
     pytest.param(_Q + _on("Q", "Z(k)", "Q.Z"), id="unit_variant"),
-    # An integer field just before B's: a miss must not read it.
-    pytest.param("enum A\n    Last(i32)\nenum B\n    Y\n" + _on("B", "Nope(k)", "B.Y"),
-                 id="no_such_variant"),
     pytest.param(_opt("i32", "None(k)", "5"), id="none"),
 ])
 def test_ritz1_reads_no_field_where_an_arm_has_none(request, tmp_path, compiler, source):

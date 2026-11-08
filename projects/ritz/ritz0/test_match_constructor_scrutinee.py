@@ -433,21 +433,8 @@ def test_ritz1_never_reads_a_users_none_as_the_options(request, tmp_path, compil
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("source", [
-    pytest.param(_on("Some(5)", "Ok(v) => v", "_ => 2"), id="ok_arm_on_an_option"),
-    pytest.param(_on("Ok(5)", "Some(v) => v", "_ => 2"), id="some_arm_on_a_result"),
-])
-def test_ritz1_treats_a_foreign_arm_as_on_any_option(request, tmp_path, compiler, source):
-    """The arm reads as it does on a typed local: `o`, below, is the same enum (#2431)."""
-    typed = source.replace("match Some(5)", "match o").replace("match Ok(5)", "match o")
-    ty = "Option<i64>" if "Some(5)" in source else "Result<i64, i64>"
-    ctor = "Some(5)" if "Some(5)" in source else "Ok(5)"
-    typed = typed.replace(_MAIN, f"{_MAIN}    let o: {ty} = {ctor}\n")
-    bare, _ = _ritz1(request, compiler, tmp_path, source)
-    named, _ = _ritz1(request, compiler, tmp_path, typed)
-    assert (bare.returncode == 0) == (named.returncode == 0), (bare.stderr, named.stderr)
+# An arm naming another enum's variant (`Ok(v)` on `Some(5)`) is refused on all
+# three, bare constructor or typed local: test_match_foreign_variant.py (#2431).
 
 
 def _ritz0(tmp_path, source):

@@ -1903,6 +1903,22 @@ fn main() -> i32
     f(Some(5))
 ```
 
+A variant pattern, qualified (`E.V`, `E.V(x)`) or not (`V(x)`), names a
+variant of the scrutinee's enum. One of any other enum is a compile error at
+the pattern, naming the enum as declared (AGAST #2431); a missing arm is
+reported first. A bare `V` of another enum is a binding, and so the binder
+error of §4.3.
+
+```ritz expect-error="Unknown variant Ok in enum Option"
+fn f(o: Option<i32>) -> i32
+    match o
+        Ok(v) => 1
+        _ => 2
+
+fn main() -> i32
+    f(Some(5))
+```
+
 #### Constant Patterns
 
 A bare identifier pattern that names an integer `const` (declared in the

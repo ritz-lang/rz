@@ -1136,8 +1136,12 @@ fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out_name: *
         let ei: i32 = match_arms_enum(s, scr, arms)
         if ei >= 0 and enum_is_generic(ei) == 0
             *out_name = enum_name_at(ei, out_len)
-            return 1
+            return MATCH_ENUM_FROM_ARMS
     0
+
+# resolve_match_enum's answer when only an arm named the enum: a guess, which
+# can't judge the arms it came from (match_refuse_foreign_arms).
+const MATCH_ENUM_FROM_ARMS: i32 = 2
 
 # --- Coverage (LARB R6, AGAST #2344; LANGUAGE_SPEC §8.1) ---------------------
 #
@@ -1307,7 +1311,55 @@ fn match_refuse_arm_names(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i
         arm = arm.next
     refused
 
-fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name: *u8, enum_name_len: i32, line: i32, col: i32)
+# --- An arm naming another enum's variant (AGAST #2431) ----------------------
+#
+# `Ok(v)` on an Option read `Ok`'s tag off it, silently: tag 0 is Some's.  A
+# variant arm, or a qualified `E.V`, must be one the scrutinee's enum declares.
+# A bare name that isn't is a binding, and R12 judges it (match_refuse_arm_names).
+# ritz0's twin is _require_enum_variant; both name the enum as it was declared,
+# since the two mangle `Result<i32, i32>` apart.
+
+# 1 when `arm` names a variant: a payload pattern, or a qualified unit one.
+fn match_arm_names_a_variant(arm: *MatchArm) -> i32
+    if arm.pattern_kind == PAT_VARIANT
+        return 1
+    (arm.pattern_kind == PAT_IDENT and arm.pattern_span.line == 0 and arm.head_span.line > 0) as i32
+
+# How many arms named a variant enum `name` doesn't declare, each said at its
+# pattern.  `name` is the scrutinee's own, maybe an instantiation (`Option$i64`).
+fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name: *u8, len: i32) -> i32
+    var base: i32 = 0
+    while base < len and *(name + base) != '$'
+        base = base + 1
+    let ei: i32 = match_enum_index(name, len)
+    var builtin: i32 = 0
+    if ei < 0 and is_tagged_enum_type(name, len) == 1
+        builtin = MATCH_RESULT
+        if *name == 'O'
+            builtin = MATCH_OPTION
+    if ei < 0 and builtin == 0
+        return 0
+    var refused: i32 = 0
+    var arm: *MatchArm = arms
+    while arm != null
+        if match_arm_names_a_variant(arm) == 1 and match_arm_name_tests(s, arm, ei, builtin) == 0
+            eprints_cstr(fn_source_file(emitter_current_fn()))
+            eprint_char(':')
+            eprint_i64(arm.head_span.line as i64)
+            eprint_char(':')
+            eprint_i64(arm.head_span.col as i64)
+            eprints_cstr(c": error: Unknown variant ")
+            eprint_bytes(arm.pattern_name, arm.pattern_name_len)
+            eprints_cstr(c" in enum ")
+            eprint_bytes(name, base)
+            eprints_cstr(c"\n")
+            emit_str(s, c"  ; ERROR: a match arm names another enum's variant\n")
+            s.error_count = s.error_count + 1
+            refused = refused + 1
+        arm = arm.next
+    refused
+
+fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name: *u8, enum_name_len: i32, from_arms: i32, line: i32, col: i32)
     var name: *u8 = enum_name
     var len: i32 = enum_name_len
     if name == null
@@ -1355,6 +1407,10 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
         match_check_bool(s, arms, line, col)
     else
         match_check_scalar(s, arms, line, col)
+    # AGAST #2431: after coverage, as on ritz0, and only against the enum the
+    # scrutinee has: one an arm named is no judge of the arms.
+    if from_arms == 0 and name != null
+        match_refuse_foreign_arms(s, arms, name, len)
 
 # AGAST #2140: 1 when the scrutinee is a borrow, `@place` / `@&place`.
 fn match_scrutinee_is_addr(scr: *Expr) -> i32
@@ -1391,12 +1447,13 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     var typed: *Expr = scrutinee
     if is_addr == 1
         typed = scrutinee.operand
-    is_enum = resolve_match_enum(s, typed, arms, @enum_name, @enum_name_len)
+    let resolved: i32 = resolve_match_enum(s, typed, arms, @enum_name, @enum_name_len)
+    is_enum = (resolved != 0) as i32
     # AGAST #2419: never the zero a constructor with no enum lowers to.
     if is_enum == 0 and is_tagged_ctor(s, typed) == 1
         emit_nd_error(s, typed.span.line, typed.span.col, c"this constructor's type can't be inferred here: bind it with a typed `let` first")
         return 0
-    match_check_coverage(s, typed, arms, enum_name, enum_name_len, span.line, span.col)
+    match_check_coverage(s, typed, arms, enum_name, enum_name_len, (resolved == MATCH_ENUM_FROM_ARMS) as i32, span.line, span.col)
     # AGAST #2344: an enum element or global is a place too.  emit_expr reads
     # `a[1]` and `g` as scalars, whatever their type.
     var from_place: i32 = is_addr

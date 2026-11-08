@@ -2970,10 +2970,15 @@ class LLVMEmitter:
         Callers that hold a span use this ahead of the tag/variant lookups so
         the user sees `file:line:column: Unknown variant X in enum Y` instead of
         a `ValueError` unwinding out of the emitter.
+
+        Y is the enum's declared name, `Option` and not the `Option$i64` this
+        instantiation mangles to: ritz1 mangles differently, and gives the same
+        error (AGAST #2431, test_match_foreign_variant.py).
         """
         if not self._has_enum_variant(enum_name, variant_name):
+            declared = enum_name.split("$", 1)[0]
             raise EmitError(
-                f"Unknown variant {variant_name} in enum {enum_name}", span)
+                f"Unknown variant {variant_name} in enum {declared}", span)
 
     def _get_enum_variant(self, enum_name: str, variant_name: str) -> rast.Variant:
         """Get the Variant object for an enum variant."""
