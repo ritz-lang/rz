@@ -537,6 +537,11 @@ class LLVMEmitter:
         self.params: Dict[str, Tuple[ir.Value, ir.Type]] = {}  # name -> (value, type)
         # AGAST #2025: name -> the slot a large-struct `let` lives in.
         self._let_slots: Dict[str, ir.Value] = {}
+        # AGAST #2441: names whose address the current function takes; a
+        # `let` among them gets one slot (see _scan_let_addresses).
+        self._let_addr_at: Set[str] = set()
+        self._let_addr_nested: Set[str] = set()
+        self._let_addr_recv: Dict[str, Set[str]] = {}
         # AGAST #2045: name -> incoming `*T` of a `name:& T` borrow param.
         # A name is a borrow only while `locals[name]` still holds this
         # pointer (a shadowing `let`/`var` rebinds it to an alloca).
@@ -3685,9 +3690,103 @@ class LLVMEmitter:
                 self.builder.store(val, slot)
             self._bind_let_slot(name, slot, ty)
             return
+        if val.type == ty and self._let_address_is_taken(name, ty):
+            # AGAST #2441, LARB R9: a binding has one address for as long as
+            # it lives. As an SSA value, each `@x` (and each `self: *T`
+            # receiver) spilled the `let` to a fresh alloca, so two `@x`
+            # differed and a write through a `*T` holding one was lost.
+            # Stored here, at the binding, so every later read sees it.
+            slot = self._alloca_in_entry_block(ty, f"{name}.addr")
+            self.builder.store(val, slot)
+            self._bind_let_slot(name, slot, ty)
+            return
         self.locals.pop(name, None)
         self.params[name] = (val, ty)
         self._let_values[name] = val
+
+    _ADDR_OPS = ('@', '&', '@&', '&mut')
+
+    @staticmethod
+    def _place_root(expr: rast.Expr) -> Optional[str]:
+        """The binding a place `x`, `x.f`, `x[i]`, `x.f[i].g` lives in, if any.
+
+        A deref (`*p`, or a pointer base) leaves the binding; that's decided
+        by the binding's type at _let_address_is_taken, not here.
+        """
+        while isinstance(expr, (rast.Field, rast.Index)):
+            expr = expr.expr
+        return expr.name if isinstance(expr, rast.Ident) else None
+
+    def _scan_let_addresses(self, body) -> None:
+        """AGAST #2441: the names whose address a function body takes.
+
+        Taken syntactically over the whole body, closures included, before
+        any of it is emitted, so a `let` read on a loop's later iteration,
+        textually before its `@x`, reads the same slot the `@x` names.
+        - `@x` / `@&x` of a place rooted at `x`: any `let x`.
+        - `x.m()`: a `let x` that m takes by pointer (resolved at the bind).
+        - `x.f.m()` / `x[i].m()`: a non-pointer `let x`, whatever m takes.
+        """
+        at: Set[str] = set()
+        nested: Set[str] = set()
+        recv: Dict[str, Set[str]] = {}
+        stack = [body]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (list, tuple)):
+                stack.extend(node)
+                continue
+            if not hasattr(node, '__dataclass_fields__'):
+                continue
+            if isinstance(node, rast.UnaryOp) and node.op in self._ADDR_OPS:
+                root = self._place_root(node.operand)
+                if root is not None:
+                    at.add(root)
+            elif isinstance(node, rast.MethodCall):
+                if isinstance(node.expr, rast.Ident):
+                    recv.setdefault(node.expr.name, set()).add(node.method)
+                else:
+                    root = self._place_root(node.expr)
+                    if root is not None:
+                        nested.add(root)
+            for f in node.__dataclass_fields__:
+                child = getattr(node, f, None)
+                if isinstance(child, (list, tuple)) or hasattr(child, '__dataclass_fields__'):
+                    stack.append(child)
+        self._let_addr_at = at
+        self._let_addr_nested = nested
+        self._let_addr_recv = recv
+
+    def _let_address_is_taken(self, name: str, ty: ir.Type) -> bool:
+        """Does this function take the address of the `let name` of type ty?
+
+        A `let` holding a pointer passed as a receiver passes that pointer,
+        so only `@x` of it takes its own address.
+        """
+        if name in self._let_addr_at:
+            return True
+        if isinstance(ty, ir.PointerType):
+            return False
+        if name in self._let_addr_nested:
+            return True
+        methods = self._let_addr_recv.get(name)
+        if not methods:
+            return False
+        type_name = self._get_struct_name_from_type(ty)
+        for method in methods:
+            mangled = None
+            if type_name is not None:
+                mangled = (self.method_lookup.get((type_name, method))
+                           or self._find_method_fallback(type_name, method))
+            entry = self.functions.get(mangled) if mangled else None
+            if entry is None:
+                # Unresolved here: one slot costs a load, a copy loses writes.
+                return True
+            fn, _ = entry
+            params = self._fn_param_types(fn)
+            if params and isinstance(params[0], ir.PointerType):
+                return True
+        return False
 
     def _bind_let_slot(self, name: str, slot: ir.Value, ty: ir.Type) -> None:
         """Bind an immutable `let` name to its #2025 slot (see _bind_let)."""
@@ -4162,8 +4261,9 @@ class LLVMEmitter:
         if ritz_type is None or not self._type_implements_drop(ritz_type):
             self._set_let_drop_slot(name, None)
             return
-        if name in self.locals and self.locals[name][0] is val:
-            slot = val
+        if self._is_let_slot(name):
+            # A #2025/#2441 slot: dropped in place, writes through `@x` and all.
+            slot = val = self.locals[name][0]
         else:
             slot = self._alloca_in_entry_block(val.type, f"{name}.drop")
             self.builder.store(val, slot)
@@ -4831,6 +4931,7 @@ class LLVMEmitter:
         self._mut_borrow_args.clear()
         self._let_slots.clear()
         self._let_values.clear()
+        self._scan_let_addresses(fn_def.body)
         self.has_returned = False
         self.current_fn_def = fn_def
         self.in_test_fn = fn_def.has_attr('test')

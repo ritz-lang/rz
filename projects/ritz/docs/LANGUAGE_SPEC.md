@@ -819,6 +819,30 @@ let p: *i64 = @&a[0]
 p[1] = 3              # OK: writes a[1] through the pointer
 ```
 
+A binding is a place with one address for as long as it lives, `let` included.
+`@x` is that address every time, so two `@x` are equal, and a receiver taken by
+reference is `@x`: a `self: *T` method called on a `let` runs on the `let`, not on
+a copy. A `*T` holding `@x` isn't checked (§3.2), so a write through it reaches
+the `let`. That is the raw-pointer escape; `@&`, `:&` and direct writes stay
+refused.
+
+```ritz
+struct C
+    x: i32
+
+impl C
+    fn set(self: *C)
+        self.x = 3
+
+fn main() -> i32
+    let c: C = C { x: 1 }
+    let p: *C = @c
+    let q: *C = @c        # p == q: one address
+    p.x = 2               # c.x is 2
+    c.set()               # runs on c: c.x is 3
+    c.x
+```
+
 ### 4.2 Mutable Bindings (var)
 
 ```ritz body
