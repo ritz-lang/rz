@@ -97,7 +97,7 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "main.yml"
 
 # Steps that configure the runner rather than test the code. Matched on the
 # step's `name`, case-insensitively, as a substring.
-SETUP_STEP_MARKERS = ("install toolchain", "install ritz0 dependencies")
+SETUP_STEP_MARKERS = ("install toolchain", "install ritz0 dependencies", "install test tools")
 
 DEFAULT_JOB = "bootstrap"
 

@@ -349,3 +349,52 @@ fn test_worker_multiple_requests() -> i32
     worker_destroy(@ctx)
     shm_destroy(@region)
     return 0
+
+# ============================================================================
+# Response back-pressure (AGAST #2464)
+# ============================================================================
+# A worker whose response ring is full must wait for a free slot rather
+# than ack the request unanswered: an unanswered ack desynchronises valet's
+# request/response pairing and wedged the stack into permanent 504s.
+
+[[test]]
+fn test_worker_wait_response_slot_free() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+
+    # Empty ring: a slot is free right away
+    assert worker_wait_response_slot(@ctx, 0) == 1
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_worker_wait_response_slot_full_times_out() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.size)
+    let cb: *ControlBlock = worker_get_control_block(@ctx)
+
+    # Fill the response ring without the consumer draining it
+    cb.resp_write_idx = cb.resp_read_idx + cb.ring_capacity
+    assert worker_begin_response(@ctx, 7) == null
+
+    # Full ring: waits out the timeout and reports no slot
+    assert worker_wait_response_slot(@ctx, 5) == 0
+
+    # Consumer drains one: a slot is free again
+    control_block_resp_read_inc(cb)
+    assert worker_wait_response_slot(@ctx, 5) == 1
+    assert worker_begin_response(@ctx, 7) != null
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0

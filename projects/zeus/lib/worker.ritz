@@ -182,6 +182,25 @@ pub fn worker_begin_response(ctx: *WorkerContext, request_id: u64) -> *ResponseS
 
     return slot
 
+# Wait up to `timeout_ms` for a free response slot (AGAST #2464).
+# Returns 1 once one is free, 0 if the ring is still full at the deadline.
+# Polls every 50us: the consumer (valet's sweep) drains in microseconds,
+# and a full response ring is a back-pressure event, not the hot path.
+# Callers must NOT ack a request they couldn't answer — leave it in the
+# request ring and retry, so valet's request/response pairing holds.
+pub fn worker_wait_response_slot(ctx: *WorkerContext, timeout_ms: i64) -> i32
+    let cb: *ControlBlock = shm_get_control_block(@ctx.region)
+    var ts: [2]i64
+    ts[0] = 0
+    ts[1] = 50000  # 50us
+    var waited_us: i64 = 0
+    while control_block_resp_full(cb) != 0
+        if waited_us >= timeout_ms * 1000
+            return 0
+        sys_nanosleep(@ts[0], null)
+        waited_us = waited_us + 50
+    return 1
+
 # Commit the current response (make it visible to Valet)
 # This advances the write index and wakes any client waiting on the
 # response futex (zero CPU cost when no one is waiting).

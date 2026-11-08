@@ -478,6 +478,13 @@ def test_setup_error_does_not_stop_fail_fast(tmp_path, monkeypatch, capsys):
     assert "[B] START" in capsys.readouterr().out
 
 
+def test_real_build_all_wrk_install_is_a_setup_step():
+    """AGAST #2464: CI apt-installs wrk for smoke_stack's stack.wrk_index.
+    That is runner setup: ci-local must skip it, not run sudo apt-get."""
+    steps = [s for s in ci_local.load_steps() if s.job == "build-all" and "wrk" in s.run]
+    assert steps and all(s.is_setup for s in steps)
+
+
 def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     """run-gate.sh relies on build-all's SETUP ERROR (exit 3) coming only
     from `rz build --all`. The other steps are the valet/zeus/nexus e2e

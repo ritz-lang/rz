@@ -113,6 +113,7 @@ XFAILS: dict[str, str] = {
 IO_TIMEOUT = 1.5      # a server that has not answered in this long is not going to
 START_TIMEOUT = 10.0  # a server that is not listening after this long is broken
 CMD_TIMEOUT = 8.0     # bound on any one CLI invocation
+WRK = shutil.which("wrk")  # stack.wrk_index's load generator (#2464)
 
 
 # --------------------------------------------------------------------------
@@ -967,8 +968,38 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
         if len(lines) < 2 or bad:
             raise CheckFailed(f"{len(lines)} connect lines, malformed: {short(' | '.join(bad), 160)}")
 
+    def wrk_index():
+        # 64 connections on / through zeus -w 2 (#2464). ResponseSlot was 56
+        # bytes in a ring sized for 48, so response slots 220-255 overlapped
+        # arena slot 0: nexus's page body clobbered response ids, the
+        # response ring filled, nexus acked requests it never answered, and
+        # every request after was a 504 until restart.
+        out = run_cmd([WRK, "-t4", "-c64", "-d10s", "--timeout", "2s",
+                       f"http://127.0.0.1:{port}/"], work, timeout=30).stdout.decode(errors="replace")
+        n = re.search(r"(\d+) requests in", out)
+        sock_err = re.search(r"Socket errors: connect (\d+), read (\d+), write (\d+), timeout (\d+)", out)
+        timeouts = int(sock_err.group(4)) if sock_err else 0
+        # wrk counts statuses outside 200-399; / answers 200, never 3xx.
+        bad = re.search(r"Non-2xx or 3xx responses: (\d+)", out)
+        non2xx = int(bad.group(1)) if bad else 0
+        if not n or int(n.group(1)) == 0:
+            raise Broken(f"wrk made no requests: {short(out, 200)}")
+        if timeouts or non2xx:
+            raise CheckFailed(f"{n.group(1)} requests: {timeouts} timeouts, {non2xx} non-2xx")
+        # And the stack is still serving afterwards.
+        after = [http_req(port, "GET", p)[0] for p in ("/health", "/")]
+        if after != [200, 200]:
+            raise CheckFailed(f"after wrk: /health, / -> {after} (want 200s)")
+        return f"{n.group(1)} requests, 0 timeouts, 0 non-2xx"
+
     r.run("stack.keepalive_100", keepalive_100)
     r.run("stack.log_lines", log_lines)
+    if WRK:
+        r.run("stack.wrk_index", wrk_index)
+    elif os.environ.get("GITHUB_ACTIONS"):
+        r.broken("stack.wrk_index", "wrk is not on PATH; main.yml's 'Install test tools' step installs it")
+    else:
+        r.skip("stack.wrk_index", "wrk is not on PATH (apt install wrk)")
     down(ps)
 
     def restart():
