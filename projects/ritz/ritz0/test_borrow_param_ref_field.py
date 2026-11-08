@@ -528,55 +528,6 @@ pub fn main() -> i32
     v.c.x = 9
     return c.x
 """,
-    # A later `let` of the same name is what the field gets.
-    "shadowed_param": TYPES + """
-fn mk(c:& C, other: *C) -> P
-    let c: *C = other
-    var p: P
-    p.ch = c
-    return p
-
-pub fn main() -> i32
-    var a: C = C { x: 9, y: 0 }
-    var b: C = C { x: 1, y: 0 }
-    var p: P = mk(@&a, @b)
-    p.ch.x = p.ch.x + 2
-    return b.x
-""",
-    # Same for a primitive referent, and a by-value struct.
-    "shadowed_primitive_param": """\
-struct Q
-    p: *i32
-
-fn mk(n:& i32, other: *i32) -> Q
-    let n: *i32 = other
-    var q: Q
-    q.p = n
-    return q
-
-pub fn main() -> i32
-    var a: i32 = 9
-    var b: i32 = 1
-    var q: Q = mk(@&a, @b)
-    *q.p = 3
-    return b
-""",
-    "shadowed_by_value_param": TYPES + """
-struct V
-    c: C
-
-fn mk(c:& C, d: C) -> V
-    let c: C = d
-    var v: V
-    v.c = c
-    return v
-
-pub fn main() -> i32
-    var a: C = C { x: 9, y: 0 }
-    var b: C = C { x: 3, y: 0 }
-    var v: V = mk(@&a, b)
-    return v.c.x
-""",
     # An integer field reads the referent, by either route.
     "integer_field_copies": """\
 struct I
@@ -1419,17 +1370,6 @@ pub fn main() -> i32
     b.x = 2
     var d: B = f(@&b)
     return d.x + DROPS
-""",
-    # A local of the same name isn't the borrow.
-    "shadowed_borrow_is_a_value": BY_VALUE + """
-fn f(c:& C) -> C
-    let c: C = C { x: 3, y: 0 }
-    return c
-
-pub fn main() -> i32
-    var e: C = C { x: 1, y: 0 }
-    var d: C = f(@&e)
-    return d.x
 """,
     # A written reference is the caller's address: writes through it reach them.
     "let_reference_keeps_the_borrow": BY_VALUE + """

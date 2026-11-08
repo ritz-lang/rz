@@ -95,9 +95,6 @@ ROWS = {
     "fresh_per_iteration": ("    var i: i32 = 0\n    var sum: i32 = 0\n    while i < 3\n"
                             "        let n: i32 = 1\n        bump(@n)\n"
                             "        sum = sum + n\n        i += 1\n    return sum\n", 9),
-    # A shadowing `let` of the same name has its own address.
-    "shadow_has_its_own": ("    let n: i32 = 1\n    let p: *i32 = @n\n    let n: i32 = 10\n"
-                           "    *p = 3\n    return n + *p\n", 13),
 }
 
 # Controls: a read-only use of `@x` leaves the `let` as it was.

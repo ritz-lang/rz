@@ -131,8 +131,6 @@ PLACES = {
     "element": ("let a: [2]i32 = [1, 2]\n    g_n(^@a[1])\n", "a"),
     "element_in_a_field": ("let w = W { c: C { x: 1 }, a: [1, 2] }\n    g_n(^@w.a[1])\n", "w"),
     "grouped": ("let c = C { x: 1 }\n    g_c((^@c))\n", "c"),
-    "shadowing_a_var": ("var c = C { x: 1 }\n    if c.x > 0\n        let c = C { x: 2 }\n"
-                        "        g_c(^@c)\n    0\n", "c"),
 }
 PLACE_TYPES = "fn g_c(p: {M}C) -> i32\n    0\n\nfn g_n(p: {M}i32) -> i32\n    0\n\n"
 MUTABLE = {"reference": "p: @&", "lent": "p:& "}
@@ -141,9 +139,6 @@ MUTABLE = {"reference": "p: @&", "lent": "p:& "}
 NOT_LET = {
     "var": "var c = C { x: 1 }\n    g(@c)\n",
     "var_field": "var w = W { c: C { x: 1 }, a: [1, 2] }\n    g(@w.c)\n",
-    "var_shadows_the_let": "let c = C { x: 1 }\n    var d = c\n    if d.x > 0\n"
-                           "        var c = d\n        g(@c)\n    0\n",
-    "pattern_shadows_the_let": "let c = C { x: 1 }\n    match c\n        c => g(@c)\n",
     "behind_a_let_pointer": "var d = C { x: 1 }\n    let p: *W = null\n    g(@p.c)\n",
     "behind_a_let_reference": "var w = W { c: C { x: 1 }, a: [1, 2] }\n"
                               "    let p: @&W = @&w\n    g(@p.c)\n",

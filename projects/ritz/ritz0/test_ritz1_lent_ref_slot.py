@@ -321,13 +321,6 @@ BY_VALUE = {
                         + POINTER_MAIN.replace("CALL", "go(@&q)"),
     "pointer_into_reference_of_the_pointee": TYPES + "fn go(h:& *C)\n    let p: @&C = h\n    p.x = 3\n"
                                              + POINTER_MAIN.replace("CALL", "go(@&q)"),
-    # A shadowing binding is its own value, not the param.
-    "shadowed_by_let": "var G: i32 = 3\n\nfn f(n:& i32) -> @&i32\n    let n: @&i32 = @&G\n    return n\n\n"
-                       "pub fn main() -> i32\n    var k: i32 = 9\n    let p: @&i32 = f(@&k)\n    return *p\n",
-    "shadowed_by_var": "var G: i32 = 3\n\nfn f(n:& i32) -> @&i32\n    var n: @&i32 = @&G\n    return n\n\n"
-                       "pub fn main() -> i32\n    var k: i32 = 9\n    let p: @&i32 = f(@&k)\n    return *p\n",
-    "shadowed_by_integer": "fn g(n: i32) -> i32\n    return n\n\nfn f(n:& i32) -> i32\n    let n: i32 = 3\n"
-                           "    return g(n)\n\npub fn main() -> i32\n    var k: i32 = 9\n    return f(@&k)\n",
 }
 for it in INTS:
     three = _lit(it, 3)

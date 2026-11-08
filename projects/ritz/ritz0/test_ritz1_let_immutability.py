@@ -47,10 +47,8 @@ EXTRA_REJECTED = [
 
 EXTRA_ACCEPTED = [
     ("var-whole-binding", "var k: i64 = 4\nk = 5\nk += 1"),
-    ("var-shadows-scalar-let", "let k: i64 = 4\nvar k: i64 = 5\nk = 6\nlet q: *i64 = @&k"),
     ("let-ptr-deref", "var k: i64 = 4\nlet p: *i64 = @&k\n*p = 5"),
     ("let-ptr-compound-field", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\np.x += 3"),
-    ("loop-var-after-let", "let i: i64 = 0\nvar s: i64 = 0\nfor i in 0..3\n    s += i"),
 ]
 
 

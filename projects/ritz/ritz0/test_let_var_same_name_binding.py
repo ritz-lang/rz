@@ -28,8 +28,9 @@ Each direction has its own test so a partial revert turns exactly one red:
   * `var` after `let`   -> _bind_var must evict self.params (the stale let is
                            still reached by params-first lookups, e.g. the
                            enum-name lookup used by `match`)
-  * `for x in arr` over an outer `var x` -> the element binding must hide the
-                           var in the body and restore it after the loop
+
+`for x in arr` over an outer `var x` is refused since AGAST #2395 (a name is
+bound once per scope in its fn): test_local_reuses_a_name.py.
 
 Assertions are on runtime exit codes, not IR text.
 """
@@ -118,20 +119,6 @@ fn main() -> i32
     return pick(true) + pick(false)
 """
 
-# The element binding of `for x in arr` is a let. Inside the body it must hide
-# the outer `var x` (s = 1+2+3, not 3*100), and afterwards the var is back
-# (x = 100). Before the fix the body read the var: 300 + 100.
-FOR_ELEM_OVER_OUTER_VAR = """\
-fn main() -> i32
-    var x: i32 = 100
-    var arr: [3]i32 = [1, 2, 3]
-    var s: i32 = 0
-    for x in arr
-        s = s + x
-    return s + x
-"""
-
-
 def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     """Compile `program` with `compiler`, link it, run it, return the exit code."""
     src = tmp_path / f"{name}_{compiler}.ritz"
@@ -178,11 +165,6 @@ def test_ritz0_var_after_sibling_branch_let_enum_lookup(tmp_path):
     assert (
         _run("ritz0", tmp_path, "var_after_let_enum", VAR_AFTER_SIBLING_LET_ENUM) == 52
     )
-
-
-@pytest.mark.integration
-def test_ritz0_for_element_hides_and_restores_outer_var(tmp_path):
-    assert _run("ritz0", tmp_path, "for_elem", FOR_ELEM_OVER_OUTER_VAR) == 106
 
 
 @pytest.mark.integration

@@ -833,27 +833,6 @@ fn f(t:& Res) -> i32
 fn f(t:& Res) -> i32
     return (*@t).id
 """ + MAIN_DROP,
-    # A local that shadows the param is that local, not the borrow.
-    "shadowed_by_struct": _body("""\
-fn h(p: *C) -> i32
-    return p.x
-
-fn f(c:& C) -> i32
-    var d: C = C { x: 3, y: 0 }
-    if d.x == 3
-        var c: C = C { x: 3, y: 0 }
-        return h(@c)
-    return 0
-""", MAIN_C.replace("x: 3", "x: 1")),
-    "shadowed_by_pointer": _body("""\
-fn h(p: **C) -> i32
-    return (*p).x
-
-fn f(c:& C) -> i32
-    var e: C = C { x: 3, y: 0 }
-    let c: *C = @e
-    return h(@c)
-""", MAIN_C.replace("x: 3", "x: 1")),
     # The field and the parenthesised forms never went through the slot.
     "field_address": _body("fn f(c:& C) -> i32\n    let p: *i32 = @c.x\n    return *p\n"),
     "parenthesised_field": _body("fn f(c:& C) -> i32\n    return (@c).x\n"),

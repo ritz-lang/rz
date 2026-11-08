@@ -208,9 +208,6 @@ EXPLICIT = {
                                        "    var c = C { x: 1 }\n    go(@&c)\n    c.x\n", 3),
     # `null` is no value of a type, and stays what it was.
     "null_into_a_reference": ("", "    let p: @C = null\n    3\n", 3),
-    # Shadowed, `c` isn't the `:&` param: an integer into a `*T` is another rule.
-    "shadowing_integer": ("fn g(p: *C) -> i32\n    3\n\nfn go(c:& C) -> i32\n    let c: i64 = 0\n    g(c)\n",
-                          "    var c = C { x: 1 }\n    go(c)\n", 3),
 }
 
 EXPLICIT_HEAD = "import ritzlib.span\n\nstruct C\n    x: i32\n\n"

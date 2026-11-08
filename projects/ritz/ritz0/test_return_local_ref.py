@@ -172,6 +172,11 @@ BINDINGS = {
     "let_in_a_loop": ("fn f(b: i32) -> @C\n" + C1 + "    while b > 0\n        let r = @c\n        return ^r\n    null\n", "c"),
     "var_of_the_loop": ("fn f(b: i32, p: @C) -> @C\n" + C1 + "    while b > 0\n        var r = @c\n"
                         "        if b > 1\n            return ^r\n        r = p\n    null\n", "c"),
+    # The same name in the arm before is out of scope here (#2395): `r` is this
+    # arm's, so it's judged.  ritz1 left a name bound twice in a fn unjudged.
+    "a_name_bound_in_the_arm_before": ("fn f(b: i32, p: @C) -> @C\n    if b > 0\n        let r = @G\n"
+                                       "        p\n    else\n        var d = C { x: 1 }\n        let r = @d\n"
+                                       "        ^r\n", "d"),
     "let_with_its_address_taken": ("fn f() -> @C\n" + C1 + "    let r = @c\n    let q = @r\n    return ^r\n", "c"),
 }
 
@@ -281,8 +286,6 @@ ALLOWED = {
                                   "    var r = @d\n    s(@&r, p)\n    return r\n", "let r = g(@c)\n    c.x = r.x + 6", 7),
     "var_lent": ("fn s(q:& *C, to: *C)\n    q = to\n\nfn g(p: *C) -> *C\n    var d = C { x: 1 }\n"
                  "    var r: *C = @d\n    s(r, p)\n    return r\n", "let r = g(@c)\n    c.x = r.x + 7", 8),
-    "shadow_in_an_arm": ("fn g(p: @C) -> @C\n    var d = C { x: 1 }\n    let r = @d\n    if p.x > 0\n"
-                         "        let r = p\n        return r\n    p\n", "let r = g(@c)\n    c.x = r.x + 8", 9),
     "a_value_read_through": ("fn g() -> i32\n    var d = C { x: 1 }\n    let r = @d\n    return r.x\n", "c.x = g()", 1),
     "a_copy_returned": ("fn g() -> C\n    var d = C { x: 2 }\n    let r = @d\n    return *r\n", "let r = g()\n    c.x = r.x", 2),
     # A pointer as an integer is a different question: the slot isn't a reference.
@@ -311,14 +314,6 @@ NOT_CHECKED = {
     "an_arm_held": "fn f(b: i32, p: @C) -> @C\n" + C1 + "    let r: @C = if b > 0\n        @c\n    else\n        p\n    return r\n",
     "assigned_not_initialised": "fn f() -> @C\n" + C1 + "    var r: @C = null\n    r = @c\n    return r\n",
     "behind_a_held_reference": "fn f(w: W) -> @i32\n    let r = @w.c\n    return @r.x\n",
-    # A name bound in one arm isn't the name in the next. What these do when called
-    # is #2395's: both emitters let the binding outlive its block.
-    "shadow_of_a_lent_param_in_the_arm_before": ("fn f(c:& C, k: i32) -> *C\n    if k == 0\n        let c: *C = @G\n"
-                                                 "        c\n    else\n        @c\n"),
-    "shadow_of_a_pointer_in_the_arm_before": ("fn f(p: *C, k: i32) -> *i32\n    if k == 0\n        var p = C { x: 1 }\n"
-                                              "        p.x = 2\n        @G.x\n    else\n        @p.x\n"),
-    "shadow_of_a_binding_in_the_arm_before": ("fn f(p: @C, k: i32) -> @C\n    if k == 0\n        var d = C { x: 1 }\n"
-                                              "        let p = @d\n        p.x\n        @G\n    else\n        p\n"),
     "a_pointer_as_an_integer": "fn f() -> *C\n" + C1 + "    let n: i64 = @c\n    return n\n",
     "a_fn_value": "fn f(g: fn(@C) -> @C) -> @C\n" + C1 + "    return g(@c)\n",
     "in_a_span": ("import ritzlib.span\n\nfn g(s: Span<i32>) -> Span<i32>\n    s\n\n"

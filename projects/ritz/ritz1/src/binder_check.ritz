@@ -1,4 +1,5 @@
-# binder_check.ritz - a local can't take a module value's name (AGAST #2407, LARB R12)
+# binder_check.ritz - a local can't take a module value's name (AGAST #2407,
+# LARB R12), nor a name already in scope in its fn (AGAST #2395)
 #
 # A local binding (`let`, `var`, a param, a `for` variable, a variant
 # payload's name) that takes the name of a `const`, a global `var` or an enum
@@ -13,9 +14,15 @@
 # here, before monomorphisation, so a generic fn is judged whether or not
 # anything instantiates it, and once.
 #
+# Nor can a binding reuse a name still in scope in its fn: an enclosing
+# block's, the same block's, a param's, a `for` variable's or an arm's
+# (LANGUAGE_SPEC §4.3, Aaron 2026-11-06 and 2026-11-08).  `_` binds nothing.
+# A name whose binding has gone out of scope is free again.
+#
 # Fn names are free: a call says it wants a fn.  ritz0's twin is
-# ritz0/binder_names.py; ritz0/test_local_takes_module_name.py holds the three
-# compilers to one table, messages and positions included.
+# ritz0/binder_names.py; ritz0/test_local_takes_module_name.py and
+# test_local_reuses_a_name.py hold the three compilers to one table, messages
+# and positions included.
 
 import ritzlib.sys
 import ritzlib.io
@@ -132,22 +139,92 @@ pub fn binder_report(file: *u8, line: i32, col: i32, name: *u8, len: i32, kind: 
     eprints_cstr(c"' — rename the local\n")
     1
 
-# 1 when `name` takes a module value's name, after saying so.
+# --- A local can't reuse a name still in scope (AGAST #2395) ------------------
+#
+# The names in scope while one fn is walked, innermost last: a block, a `for`
+# or an arm saves g_scope_top on entry and puts it back on exit.  A fn holding
+# more than BINDER_SCOPE_CAP names in scope at once has the rest unjudged.
+const BINDER_SCOPE_CAP: i32 = 8192
+var g_scope_name: [8192]*u8
+var g_scope_len: [8192]i32
+var g_scope_line: [8192]i32
+var g_scope_col: [8192]i32
+var g_scope_top: i32 = 0
+
+# The slot of the innermost name in scope that is `name`, -1 for none.
+fn binder_scope_find(name: *u8, len: i32) -> i32
+    var i: i32 = g_scope_top - 1
+    while i >= 0
+        if name_eq(g_scope_name[i], g_scope_len[i], name, len) == 1
+            return i
+        i = i - 1
+    0 - 1
+
+fn binder_is_wildcard(name: *u8, len: i32) -> i32
+    (len == 1 and *name == '_') as i32
+
+# `file:line:col: error: a local can't reuse a name bound earlier in its fn:
+# '<name>' (at L:C) — rename the local`.  Returns 1 (one error).
+fn binder_reuse_report(file: *u8, span: SrcSpan, name: *u8, len: i32, at_line: i32, at_col: i32) -> i32
+    eprints_cstr(file)
+    eprint_char(':')
+    eprint_i64(span.line as i64)
+    eprint_char(':')
+    eprint_i64(span.col as i64)
+    eprints_cstr(c": error: a local can't reuse a name bound earlier in its fn: '")
+    eprint_bytes(name, len)
+    eprints_cstr(c"' (at ")
+    eprint_i64(at_line as i64)
+    eprint_char(':')
+    eprint_i64(at_col as i64)
+    eprints_cstr(c") — rename the local\n")
+    1
+
+# 1 when `name` takes a module value's name or one still in scope, after
+# saying so.  `_` is never bound (binder_bind), so it passes.
 fn binder_judge(file: *u8, span: SrcSpan, name: *u8, len: i32) -> i32
-    let kind: i32 = binder_module_value_kind(name, len)
-    if kind == BINDER_NONE
+    if name == null or len <= 0
         return 0
-    binder_report(file, span.line, span.col, name, len, kind)
+    let kind: i32 = binder_module_value_kind(name, len)
+    if kind != BINDER_NONE
+        return binder_report(file, span.line, span.col, name, len, kind)
+    let at: i32 = binder_scope_find(name, len)
+    if at < 0
+        return 0
+    binder_reuse_report(file, span, name, len, g_scope_line[at], g_scope_col[at])
+
+# Put `name` in scope.  A module value's name is never a local's.
+fn binder_bind(span: SrcSpan, name: *u8, len: i32)
+    if name == null or len <= 0 or binder_is_wildcard(name, len) == 1
+        return
+    if binder_module_value_kind(name, len) != BINDER_NONE or g_scope_top >= BINDER_SCOPE_CAP
+        return
+    g_scope_name[g_scope_top] = name
+    g_scope_len[g_scope_top] = len
+    g_scope_line[g_scope_top] = span.line
+    g_scope_col[g_scope_top] = span.col
+    g_scope_top = g_scope_top + 1
+
+fn binder_judge_bind(file: *u8, span: SrcSpan, name: *u8, len: i32) -> i32
+    let errors: i32 = binder_judge(file, span, name, len)
+    binder_bind(span, name, len)
+    errors
 
 fn binder_check_arms(file: *u8, arms: *MatchArm) -> i32
     var errors: i32 = 0
     var arm: *MatchArm = arms
     while arm != null
-        # A bare top-level name is the match lowering's (binder_arm_refuse).
+        let mark: i32 = g_scope_top
         if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
-            errors = errors + binder_judge(file, arm.pattern_inner_span, arm.pattern_inner_name, arm.pattern_inner_name_len)
+            errors = errors + binder_judge_bind(file, arm.pattern_inner_span, arm.pattern_inner_name, arm.pattern_inner_name_len)
+        # A bare top-level name naming a module value is the match lowering's
+        # (binder_arm_refuse); any other binds.  A qualified `E.V` has no span.
+        else if arm.pattern_kind == PAT_IDENT and arm.pattern_span.line > 0
+            if binder_module_value_kind(arm.pattern_name, arm.pattern_name_len) == BINDER_NONE
+                errors = errors + binder_judge_bind(file, arm.pattern_span, arm.pattern_name, arm.pattern_name_len)
         errors = errors + binder_check_stmts(file, arm.body_stmts)
         errors = errors + binder_check_expr(file, arm.body)
+        g_scope_top = mark
         arm = arm.next
     errors
 
@@ -161,24 +238,40 @@ fn binder_check_expr(file: *u8, e: *Expr) -> i32
         return binder_check_arms(file, e.args as *MatchArm)
     0
 
+# A block: what it binds goes out of scope at its end.  A `let`'s name is
+# judged before its initialiser and bound after it, as ritz0 does.
 fn binder_check_stmts(file: *u8, first: *Stmt) -> i32
+    let mark: i32 = g_scope_top
     var errors: i32 = 0
     var s: *Stmt = first
     while s != null
         if s.kind == STMT_VAR_DECL
             errors = errors + binder_judge(file, s.name_span, s.var_name, s.var_name_len)
             errors = errors + binder_check_expr(file, s.var_init)
+            binder_bind(s.name_span, s.var_name, s.var_name_len)
         else if s.kind == STMT_TUPLE_DECL
             errors = errors + binder_judge(file, s.name_span, s.var_name, s.var_name_len)
-            errors = errors + binder_judge(file, s.name2_span, s.assign_target, s.assign_target_len)
+            # The second name against the first too: neither is bound yet.
+            if binder_is_wildcard(s.var_name, s.var_name_len) == 0 and binder_module_value_kind(s.var_name, s.var_name_len) == BINDER_NONE and binder_module_value_kind(s.assign_target, s.assign_target_len) == BINDER_NONE and binder_scope_find(s.assign_target, s.assign_target_len) < 0 and name_eq(s.var_name, s.var_name_len, s.assign_target, s.assign_target_len) == 1
+                errors = errors + binder_reuse_report(file, s.name2_span, s.assign_target, s.assign_target_len, s.name_span.line, s.name_span.col)
+            else
+                errors = errors + binder_judge(file, s.name2_span, s.assign_target, s.assign_target_len)
             errors = errors + binder_check_expr(file, s.var_init)
+            binder_bind(s.name_span, s.var_name, s.var_name_len)
+            binder_bind(s.name2_span, s.assign_target, s.assign_target_len)
         else if s.kind == STMT_FOR
-            errors = errors + binder_judge(file, s.name_span, s.for_var, s.for_var_len)
+            let for_mark: i32 = g_scope_top
+            errors = errors + binder_judge_bind(file, s.name_span, s.for_var, s.for_var_len)
             errors = errors + binder_check_stmts(file, s.for_body)
+            g_scope_top = for_mark
         else if s.kind == STMT_IF
+            errors = errors + binder_check_expr(file, s.if_cond)
             errors = errors + binder_check_stmts(file, s.if_then)
             errors = errors + binder_check_stmts(file, s.if_else)
-        else if s.kind == STMT_WHILE or s.kind == STMT_LOOP
+        else if s.kind == STMT_WHILE
+            errors = errors + binder_check_expr(file, s.while_cond)
+            errors = errors + binder_check_stmts(file, s.while_body)
+        else if s.kind == STMT_LOOP
             errors = errors + binder_check_stmts(file, s.while_body)
         else if s.kind == STMT_MATCH
             errors = errors + binder_check_arms(file, s.if_then as *MatchArm)
@@ -189,19 +282,23 @@ fn binder_check_stmts(file: *u8, first: *Stmt) -> i32
         else if s.kind == STMT_ASSIGN
             errors = errors + binder_check_expr(file, s.assign_value)
         s = s.next
+    g_scope_top = mark
     errors
 
 fn binder_check_fn(path: *u8, f: *FnDef) -> i32
     var file: *u8 = path
     if f.def_file != null
         file = f.def_file
+    g_scope_top = 0
     var errors: i32 = 0
     var p: *Param = f.params
     while p != null
         if p.name != null
-            errors = errors + binder_judge(file, p.name_span, p.name, p.name_len)
+            errors = errors + binder_judge_bind(file, p.name_span, p.name, p.name_len)
         p = p.next
-    errors + binder_check_stmts(file, f.body)
+    errors = errors + binder_check_stmts(file, f.body)
+    g_scope_top = 0
+    errors
 
 # 1 when this compile judges `f`'s binders: its own fns, and an imported
 # generic template, whose body this compile instantiates.  An imported fn that

@@ -524,11 +524,6 @@ fn f(a:& [2]i32) -> i32
     let p: *i32 = @a as *i32
     return p[1]
 """ + MAIN_13,
-    "shadowed": """
-fn f(a:& [2]i32) -> i32
-    var a: i32 = 3
-    return a
-""" + MAIN_13,
     # On to another param.  The callee writes, and the caller reads it back.
     "pass_on_store": """
 fn g(a:& [2]i32)

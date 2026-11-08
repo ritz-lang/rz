@@ -14,8 +14,8 @@ A write (`=`, `+=`, ...) or a mutable borrow (`@&`) whose place is the
 `let`'s own storage is a compile error: the binding itself, a by-value
 field of it, or an element of a by-value array in it, to any depth. A path
 that goes through a pointer (`let p: *T`, a `*T` field, a slice) writes
-the pointee, not the binding, and stays legal. So do `var`s, a `var` that
-shadows a `let`, and shared borrows `@b`.
+the pointee, not the binding, and stays legal. So do `var`s and shared
+borrows `@b`. A `var` can't take a `let`'s name in its fn (§4.3, AGAST #2395).
 """
 
 import os
@@ -124,9 +124,6 @@ ACCEPTED = [
     # Shared borrows of a `let` are fine.
     ("let-shared-borrow", "let p = Pt { x: 1, y: 2 }\nlet n = pt_x(@p)"),
     ("large-let-shared-borrow", "let b: Big = big_new()\nlet n = big_n(@b)"),
-    # A `var` that shadows a `let` is mutable.
-    ("var-shadows-let", "let p = Pt { x: 1, y: 2 }\nvar p = Pt { x: 3, y: 4 }\np.x = 5\nlet q: *Pt = @&p"),
-    ("var-shadows-large-let", "let b: Big = big_new()\nvar b: Big = big_new()\nb.n = 5\nlet q: *Big = @&b"),
 ]
 
 
@@ -148,8 +145,6 @@ WHOLE_REJECTED = [
     ("whole-scalar-in-loop", "let k: i64 = 4\nvar i = 0\nwhile i < 3\n    k = i\n    i += 1", "k"),
     ("whole-small-struct", "let p = Pt { x: 1, y: 2 }\np = Pt { x: 3, y: 4 }", "p"),
     ("whole-large-struct", "let b: Big = big_new()\nb = big_new()", "b"),
-    # A `let` that shadows a `var` is immutable from there on.
-    ("whole-let-shadows-var", "var k: i64 = 1\nlet k: i64 = 2\nk = 3", "k"),
     # A match-arm assignment is an AssignExpr, not an AssignStmt.
     ("whole-scalar-match-arm",
      "let k: i64 = 4\nlet o: Option<i64> = Some(3)\n"
@@ -175,8 +170,6 @@ def test_assigning_a_let_is_rejected(tmp_path, body, name):
 
 WHOLE_ACCEPTED = [
     ("whole-var-scalar", "var k: i64 = 4\nk = 5\nk += 1"),
-    ("whole-var-shadows-let", "let k: i64 = 4\nvar k: i64 = 5\nk = 6\nk += 1"),
-    ("whole-var-shadows-large-let", "let b: Big = big_new()\nvar b: Big = big_new()\nb = big_new()"),
     ("whole-var-match-arm",
      "var k: i64 = 4\nlet o: Option<i64> = Some(3)\n"
      "match o\n    Some(v) => k = v\n    None => k = 0"),
@@ -286,7 +279,6 @@ IMPLICIT_ACCEPTED = [
     ("arg-var-ref", "var p = Pt { x: 1, y: 2 }\nset_ref(@&p)"),
     ("arg-var-large", "var b: Big = big_new()\nset_big(b)"),
     ("arg-var-large-field", "var b: Big = big_new()\nset(b.pt)"),
-    ("var-shadows-let", "let p = Pt { x: 1, y: 2 }\nvar p = Pt { x: 3, y: 4 }\np.bump()\nset(p)"),
     # A `let` holding a pointer: the pointee is borrowed, not the binding.
     ("let-ptr-recv", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\np.bump()\np.bump_ref()"),
     ("let-ptr-arg", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\nset(p)"),

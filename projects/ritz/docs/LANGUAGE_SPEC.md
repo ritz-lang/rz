@@ -906,6 +906,48 @@ fn main() -> i32
 
 A local of fn type still calls (`let f: fn() -> i32 = size` then `f()`).
 
+#### No shadowing
+
+A binding can't reuse a name that is still in scope in its fn. That covers a
+`let` or `var` in a nested block over an enclosing one, a second `let` of the
+same name in the same block, a `let` over a parameter, a `for` variable over a
+local, and a match arm's name or a payload's name over a local. It's a compile
+error at the new name, naming where the first binding is (AGAST #2395):
+
+```ritz expect-error="a local can't reuse a name bound earlier in its fn: 'r' (at 2:9) — rename the local"
+fn pick(b: i32) -> i32
+    let r: i32 = 1
+    if b > 0
+        let r: i32 = 2
+        return r
+    r
+
+fn main() -> i32
+    pick(1)
+```
+
+So a name means one thing for as long as it's in scope, and no compiler has a
+scope rule to get wrong. A binding's scope is the block that declares it, from
+the binding on; a `for` variable's is the loop body, and an arm's names are the
+arm's. Once that scope ends, the name is free again: the other arm of an `if`,
+the next arm of a `match` and the next loop can each bind it. `_` binds
+nothing, so it can come any number of times.
+
+```ritz
+fn total(r: Result<i32, i32>) -> i32
+    var s: i32 = 0
+    for i in 0..3
+        s = s + i
+    for i in 0..2
+        s = s + i
+    match r
+        Ok(v) => s + v
+        Err(v) => s - v
+
+fn main() -> i32
+    total(Ok(4)) - 8
+```
+
 ### 4.4 Type Inference
 
 Local variable types are inferred from the initializer:

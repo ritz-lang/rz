@@ -474,50 +474,6 @@ pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     return go(@&c, 0)
 """,
-    # The name in the slot is a new binding, not the parameter.
-    "shadowed": TYPES + """\
-fn go(c:& C) -> @C
-    let c: *C = @G
-    return c
-
-var G: C
-
-pub fn main() -> i32
-    var c: C = C { x: 9, y: 0 }
-    G.x = 3
-    let p: @C = go(@&c)
-    return p.x
-""",
-    # A `let` takes the name out of the emitter's locals, a `var` replaces it.
-    "shadowed_by_var": TYPES + """\
-fn go(c:& C) -> @C
-    var c: *C = @G
-    return c
-
-var G: C
-
-pub fn main() -> i32
-    var c: C = C { x: 9, y: 0 }
-    G.x = 3
-    let p: @C = go(@&c)
-    return p.x
-""",
-    "shadowed_in_arm": TYPES + """\
-fn go(c:& C, k: i32) -> *C
-    if k == 0
-        let c: *C = @G
-        c
-    else
-        @c
-
-var G: C
-
-pub fn main() -> i32
-    var c: C = C { x: 9, y: 0 }
-    G.x = 3
-    let p: *C = go(@&c, 0)
-    return p.x
-""",
     # `h` has type `*C`, which is what the slot holds.
     "pointer_referent": TYPES + """\
 fn go(h:& *C) -> *C

@@ -770,7 +770,7 @@ def test_a_multi_dimensional_array_is_refused(compile_with, compiler, name):
 UNSUPPORTED = "this `for` iterable is not supported in ritz1"
 
 _VEC = "import ritzlib.gvec\n\nstruct VH\n    v: Vec<i32>\n\n"
-_NEW_VEC = "    var v: Vec<i32> = vec_new<i32>()\n"
+_NEW_VEC = "    var w: Vec<i32> = vec_new<i32>()\n"
 _A = "    var a: [2]i32 = [1, 3]\n"
 _G = "var g: [2]i32\n\n"
 _H2 = "struct H\n    n: i32\n    a: [2]i32\n\n"
@@ -792,8 +792,8 @@ RITZ1_REFUSES = {
     "deref": (MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="*p")),
     "literal": (MAIN + _SUM_V.format(it="[1, 2]")),
     "row": (MAIN + "    var m: [2][2]i32\n" + _SUM_V.format(it="m[1]")),
-    "addr_of_vec_mut_param": (_VEC + "fn f(v:& Vec<i32>) -> i32\n" + _SUM_V.format(it="@v") + "\n"
-                              + MAIN + _NEW_VEC + "    return f(@&v)\n"),
+    "addr_of_vec_mut_param": (_VEC + "fn f(w:& Vec<i32>) -> i32\n" + _SUM_V.format(it="@w") + "\n"
+                              + MAIN + _NEW_VEC + "    return f(@&w)\n"),
 }
 
 BOTH_REFUSE = {
@@ -825,7 +825,7 @@ def test_ritz0_refuses_what_isnt_iterable(compile_with, name):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 def test_the_vec_form_still_compiles(compile_with, compiler):
-    comp, ll, _ = compile_with(compiler, "vec_ok", _VEC + MAIN + _NEW_VEC + _SUM_V.format(it="@v"))
+    comp, ll, _ = compile_with(compiler, "vec_ok", _VEC + MAIN + _NEW_VEC + _SUM_V.format(it="@w"))
     assert comp.returncode == 0, comp.stderr
     assert ll.exists()
 

@@ -195,34 +195,6 @@ def test_assigning_a_large_let_is_rejected(tmp_path):
     assert "`let` binding `b`" in out, out[-2000:]
 
 
-SHADOW = """\
-struct Big
-    data: [1000]u8
-    n: i64
-
-fn big_new(n: i64) -> Big
-    var b: Big
-    b.n = n
-    return b
-
-fn main() -> i32
-    let b: Big = big_new(1)
-    let k: i64 = b.n
-    var b: Big = big_new(2)
-    b = big_new(9)
-    return (b.n + k) as i32
-"""
-
-
-@pytest.mark.integration
-@pytest.mark.unit
-def test_var_shadowing_a_large_let_is_assignable(tmp_path):
-    # Immutability belongs to the `let`'s slot, not to the name.
-    body = _fn_body(_ritz0_ll(tmp_path, SHADOW, "--no-runtime"), "main")
-    assert re.search(r'call void @"big_new"\([^\n]*, i64 9\)', body), (
-        f"`b = big_new(9)` was not emitted:\n{body}")
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
 def test_program_runs_correctly(tmp_path, opt):
