@@ -134,7 +134,7 @@ USED = {
 
 # Neither is a constructor's enum, so neither changes.
 UNCHANGED = {
-    "local_none": (_body("let None: i32 = 3", "let x = None", "x"), 3),
+    # A local can't be named `None` (R12, #2407): test_local_takes_module_name.py.
     "const_none": ("const None: i32 = 3\n" + _body("let x = None", "x"), 3),
     "user_payload": (_U + _body("let o = Holds(5)", "match o", "    Holds(v) => v",
                                 "    Vacant => 2"), 5),

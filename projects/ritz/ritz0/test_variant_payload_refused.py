@@ -9,13 +9,20 @@ every value of that variant:
         Some(0) => 1
         _ => 2          # f(Some(5)) gave 1
 
-Compiling the test is #1291's decision tree. Until then ritz0 refuses it, at the
-pattern. The expected exit codes below come from what each program says, not from
-a compiler.
+Compiling the test is #1291's decision tree. Until then ritz0 refuses a literal or
+a type there, at the pattern. The expected exit codes below come from what each
+program says, not from a compiler.
 
 ritz1's grammar takes only a name there, so it refuses every literal with a parse
-error. The names that test are its match lowering's, with ritz0's wording at the
-same place (#2405): each row of NAMES and NAMES_ON_BOTH runs on all three compilers.
+error.
+
+A name there only binds. §8.2 used to make one a test when it named an integer
+const or a variant of the payload's enum (#2350, #2405), and a binding otherwise,
+so what `Some(K)` meant hung on K's type. LARB R12 (AGAST #2407) took that away: no
+local may be named like a const, global or variant, so a payload named like one is
+the binder's located error on all three compilers, whatever the payload's type
+(test_local_takes_module_name.py holds the rule). Each row of NAMES, NAMES_ON_BOTH
+and NAMED_LIKE pins that error where the old test or binding stood.
 """
 
 import os
@@ -128,7 +135,7 @@ TYPES = {
     "pointer_type": (_opt("*u8", "Some(*u8)", "null"), 3, 14, "*u8", "Some"),
 }
 
-# §8.2 makes these tests, though they look like bindings.
+# Each was a test under §8.2 until R12: a payload named like a const or a variant.
 NAMES = {
     "const": ("const K: i32 = 0\n" + _opt("i32", "Some(K)", "5"), 4, 14, "K", "Some"),
     "const_declared_later": (_opt("i32", "Some(K)", "5") + "const K: i32 = 0\n",
@@ -144,14 +151,14 @@ NAMES = {
                         3, 14, "None", "Some"),
 }
 
-# The same two rules, over what ritz1 has to work out for itself. Its emitter reads
-# a field's type off a mangled `Result$A$B` or the enum tracker, not off a value.
+# The same, over what ritz1 had to work out for itself: its emitter read a
+# field's type off a mangled `Result$A$B` or the enum tracker, not off a value.
 NAMES_ON_BOTH = {
     # Silent on ritz1: `Some(R)` over a one-letter enum only failed at clang by luck.
     "variant_of_a_longer_named_enum": (
         "enum Color\n    Red\n    Green\n" + _opt("Color", "Some(Red)", "Color.Green"),
         6, 14, "Red", "Some"),
-    # Which consts: anything numeric, as `_name_tests_payload` reads the table.
+    # Which consts: anything numeric was a test.
     "float_const": ("const K: f64 = 1.0\n" + _opt("i32", "Some(K)", "5"), 4, 14, "K", "Some"),
     "narrow_float_const": ("const K: f32 = 1.0\n" + _opt("i32", "Some(K)", "5"),
                            4, 14, "K", "Some"),
@@ -243,7 +250,7 @@ NAMES_ON_BOTH = {
                         6, 14, "K", "Some"),
 }
 
-REFUSED = {**LITERALS, **TYPES, **NAMES, **NAMES_ON_BOTH}
+REFUSED = {**LITERALS, **TYPES}
 
 # name -> (source, exit code). Each is a binding or `_`, so each must still run.
 KEPT = {
@@ -258,72 +265,98 @@ KEPT = {
                              "        _ => 2\nfn main() -> i32\n    f(P.Two(1, 5))\n", 5),
     "struct_variant": (_V + "fn f(e: E) -> i32\n    match e\n        V(a) => a\n"
                        "        _ => 2\nfn main() -> i32\n    f(E.V(5))\n", 5),
-    # Named like a variant, but of an enum this payload isn't.
-    "named_like_another_enums_variant": (
-        _C + "fn f(o: Option<i32>) -> i32\n    match o\n        Some(R) => R\n"
-        "        _ => 2\nfn main() -> i32\n    f(Some(5))\n", 5),
-    "named_like_another_enums_variant_on_an_enum": (
-        _C + "enum Dir\n    X\n    Y\nfn f(o: Option<Dir>) -> i32\n    match o\n"
-        "        Some(R) => 1\n        _ => 2\nfn main() -> i32\n    f(Some(Dir.Y))\n", 1),
-    # A repr enum is no integer's type: `u64` doesn't make `X` a variant.
-    "named_like_a_repr_enums_variant": (
-        "enum D: u64\n    X = 0\n    Y = 1\nfn f(o: Option<u64>) -> i32\n    match o\n"
-        "        Some(X) => X as i32\n        _ => 2\n"
-        "fn main() -> i32\n    f(Some(5 as u64))\n", 5),
-    # Constant patterns compare integers only (§8.2).
-    "named_like_a_const_on_a_string": (
-        "const K: i32 = 0\nfn f(o: Option<StrView>) -> i32\n    match o\n"
-        "        Some(K) => 1\n        _ => 2\n"
-        'fn main() -> i32\n    f(Some("abc"))\n', 1),
     # Top-level arms keep their own rules.
     "const_at_the_top_level": ("const K: i64 = 0\nfn main() -> i32\n    let n: i64 = 5\n"
                                "    match n\n        K => 1\n        _ => 2\n", 2),
     "variant_at_the_top_level": (_C + "fn main() -> i32\n    let c: C = C.G\n    match c\n"
                                  "        R => 1\n        _ => 2\n", 2),
-    # Not numeric, so no test: ritz0 keeps these out of its const table.
-    "named_like_a_string_const": ('const K: StrView = "a"\n' + _opt("i32", "Some(K)", "5"), 1),
-    "named_like_a_c_string_const": ('const K: *u8 = c"a"\n' + _opt("i32", "Some(K)", "5"), 1),
-    "named_like_a_const_array": ("const K: [2]i32 = [1, 2]\n" + _opt("i32", "Some(K)", "5"), 1),
-    # Named like something, but no const.
-    "named_like_a_global": ("var G: i32 = 0\n" + _opt("i32", "Some(G)", "5"), 1),
+    # A fn's name is free for a local (R12).
     "named_like_a_fn": ("fn g() -> i32\n    1\n" + _opt("i32", "Some(g)", "5"), 1),
-    # Named like a builtin's variant, on a payload that is none.
-    "named_none_on_an_integer": (_opt("i32", "Some(None)", "5"), 1),
-    "named_some_on_an_integer": (_opt("i32", "Some(Some)", "5"), 1),
-    "named_ok_on_an_option": (_nested("Option<Option<i32>>", "Some(Ok)", "Some(i)"), 1),
-    "named_none_on_a_result": (_nested("Option<Result<i32, i32>>", "Some(None)", "None"), 2),
-    # A payload no integer: a const is only a name there.
-    "named_like_a_const_on_a_float": (_K + _opt("f64", "Some(K)", "1.5"), 1),
-    "named_like_a_const_on_a_pointer": (_K + _opt("*i32", "Some(K)", "null"), 1),
-    "named_like_a_const_on_a_struct": (
-        _K + "struct Tee\n    v: i32\n" + _opt("Tee", "Some(K)", "Tee { v: 1 }"), 1),
-    "named_like_a_const_on_a_struct_with_an_integer_look": (
-        _K + "struct i2c\n    v: i32\n" + _opt("i2c", "Some(K)", "i2c { v: 1 }"), 1),
-    "named_like_a_const_on_an_enum": (
-        _K + "enum Dir\n    X\n    Y\n" + _opt("Dir", "Some(K)", "Dir.Y"), 1),
-    "named_like_a_const_on_an_option": (
-        _K + _nested("Option<Option<i32>>", "Some(K)", "Some(i)"), 1),
-    "named_like_a_const_on_a_user_string": (
-        _K + _Q + _on("Q", "Text(K)", 'Q.Text("a")'), 1),
-    # A pointer to an enum is no enum.
-    "named_like_a_pointees_variant": (_C + _opt("*C", "Some(R)", "null"), 1),
-    "named_like_a_user_pointees_variant": (
-        "enum L\n    N\n    B(*L)\n" + _on("L", "B(N)", "L.N"), 2),
-    # The other side of a Result has its own type.
-    "const_on_a_string_err": (_K + _res("i32, StrView", "Err(K)", 'Err("a")'), 1),
-    "const_on_a_string_ok": (_K + _res("StrView, i32", "Ok(K)", 'Ok("a")'), 1),
-    "variant_on_an_integer_err": (_C + _res("C, i32", "Err(R)", "Err(5)"), 1),
-    "variant_on_an_integer_ok": (_C + _res("i32, C", "Ok(R)", "Ok(5)"), 1),
-    # A generic fn is read once it has a type: uninstantiated, it is never read.
-    "generic_fn_never_called": (_K + _GENERIC.format("Some(K)") + "fn main() -> i32\n    0\n", 0),
 }
 
-# name -> the ticket that keeps ritz1 from reaching this row of NAMES_ON_BOTH. None is
-# the rule's: each goes just as wrong with `Some(v)`, so each flips when it's fixed.
-RITZ1_NEVER_READS = {
-    "generic_fn_const": "#2418: `Option<T>` stays %Option$T in a generic fn's signature",
-    "generic_fn_variant": "#2418: `Option<T>` stays %Option$T in a generic fn's signature",
+# Bound until #2407, by a name that isn't the payload's test: each is refused now
+# as the rows above are. name -> (source, the name, what it names)
+NAMED_LIKE = {
+    # Named like a variant, but of an enum this payload isn't.
+    "another_enums_variant": (
+        _C + "fn f(o: Option<i32>) -> i32\n    match o\n        Some(R) => R\n"
+        "        _ => 2\nfn main() -> i32\n    f(Some(5))\n", "R", "variant"),
+    "another_enums_variant_on_an_enum": (
+        _C + "enum Dir\n    X\n    Y\nfn f(o: Option<Dir>) -> i32\n    match o\n"
+        "        Some(R) => 1\n        _ => 2\nfn main() -> i32\n    f(Some(Dir.Y))\n",
+        "R", "variant"),
+    "a_repr_enums_variant": (
+        "enum D: u64\n    X = 0\n    Y = 1\nfn f(o: Option<u64>) -> i32\n    match o\n"
+        "        Some(X) => X as i32\n        _ => 2\n"
+        "fn main() -> i32\n    f(Some(5 as u64))\n", "X", "variant"),
+    "a_const_on_a_string": (
+        "const K: i32 = 0\nfn f(o: Option<StrView>) -> i32\n    match o\n"
+        "        Some(K) => 1\n        _ => 2\n"
+        'fn main() -> i32\n    f(Some("abc"))\n', "K", "const"),
+    # Not numeric, so they were no tests: ritz0 kept them out of its const table.
+    "a_string_const": ('const K: StrView = "a"\n' + _opt("i32", "Some(K)", "5"), "K", "const"),
+    "a_c_string_const": ('const K: *u8 = c"a"\n' + _opt("i32", "Some(K)", "5"), "K", "const"),
+    "a_const_array": ("const K: [2]i32 = [1, 2]\n" + _opt("i32", "Some(K)", "5"), "K", "const"),
+    "a_global": ("var G: i32 = 0\n" + _opt("i32", "Some(G)", "5"), "G", "global"),
+    # Named like a builtin's variant, on a payload that is none.
+    "none_on_an_integer": (_opt("i32", "Some(None)", "5"), "None", "variant"),
+    "some_on_an_integer": (_opt("i32", "Some(Some)", "5"), "Some", "variant"),
+    "ok_on_an_option": (_nested("Option<Option<i32>>", "Some(Ok)", "Some(i)"), "Ok", "variant"),
+    "none_on_a_result": (_nested("Option<Result<i32, i32>>", "Some(None)", "None"),
+                         "None", "variant"),
+    # A payload no integer: a const was only a name there.
+    "a_const_on_a_float": (_K + _opt("f64", "Some(K)", "1.5"), "K", "const"),
+    "a_const_on_a_pointer": (_K + _opt("*i32", "Some(K)", "null"), "K", "const"),
+    "a_const_on_a_struct": (
+        _K + "struct Tee\n    v: i32\n" + _opt("Tee", "Some(K)", "Tee { v: 1 }"), "K", "const"),
+    "a_const_on_a_struct_with_an_integer_look": (
+        _K + "struct i2c\n    v: i32\n" + _opt("i2c", "Some(K)", "i2c { v: 1 }"), "K", "const"),
+    "a_const_on_an_enum": (
+        _K + "enum Dir\n    X\n    Y\n" + _opt("Dir", "Some(K)", "Dir.Y"), "K", "const"),
+    "a_const_on_an_option": (
+        _K + _nested("Option<Option<i32>>", "Some(K)", "Some(i)"), "K", "const"),
+    "a_const_on_a_user_string": (_K + _Q + _on("Q", "Text(K)", 'Q.Text("a")'), "K", "const"),
+    # A pointer to an enum is no enum.
+    "a_pointees_variant": (_C + _opt("*C", "Some(R)", "null"), "R", "variant"),
+    "a_user_pointees_variant": (
+        "enum L\n    N\n    B(*L)\n" + _on("L", "B(N)", "L.N"), "N", "variant"),
+    # The other side of a Result has its own type.
+    "a_const_on_a_string_err": (_K + _res("i32, StrView", "Err(K)", 'Err("a")'), "K", "const"),
+    "a_const_on_a_string_ok": (_K + _res("StrView, i32", "Ok(K)", 'Ok("a")'), "K", "const"),
+    "a_variant_on_an_integer_err": (_C + _res("C, i32", "Err(R)", "Err(5)"), "R", "variant"),
+    "a_variant_on_an_integer_ok": (_C + _res("i32, C", "Ok(R)", "Ok(5)"), "R", "variant"),
+    # The rule is about names, so a generic fn nothing instantiates is judged too.
+    "a_const_in_a_generic_fn_never_called": (
+        _K + _GENERIC.format("Some(K)") + "fn main() -> i32\n    0\n", "K", "const"),
 }
+
+
+def _where(source, name):
+    """Line and column of the payload `name` in the source's arm `X(name) =>`."""
+    for line, text in enumerate(source.splitlines(), 1):
+        at = text.find(f"({name}) =>")
+        if at >= 0:
+            return line, at + 2
+    raise AssertionError(f"no arm binds {name}")
+
+
+def _kind(shown):
+    return "const" if shown in ("K", "MK", "HIDDEN") else "variant"
+
+
+# name -> (source, line, col, the name, what it names): each payload name that
+# R12 refuses.
+BINDERS = {
+    **{name: (row[0], row[1], row[2], row[3], _kind(row[3]))
+       for name, row in {**NAMES, **NAMES_ON_BOTH}.items()},
+    **{f"named_like_{name}": (source, *_where(source, shown), shown, kind)
+       for name, (source, shown, kind) in NAMED_LIKE.items()},
+}
+
+
+def _binder_message(kind, shown):
+    return f"a local can't take the name of a {kind}: '{shown}' — rename the local"
+
 
 # name -> why ritz1 can't run this row of KEPT, which ritz0 does.
 NOT_ON_RITZ1 = {
@@ -401,21 +434,28 @@ def test_ritz1_cannot_parse_a_payload_that_tests(request, tmp_path, compiler, na
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
+def _compile(request, compiler, tmp_path, source):
+    return _ritz0(tmp_path, source) if compiler == "ritz0" else _ritz1(
+        request, compiler, tmp_path, source)
+
+
+def _binder_at(compiler, out, file, line, col, kind, shown):
+    sep = "" if compiler == "ritz0" else "error: "
+    message = _binder_message(kind, shown)
+    return re.findall(rf"{file}:{line}:{col}: {sep}{re.escape(message)}$", out, re.M)
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", [
-    pytest.param(name, marks=pytest.mark.xfail(strict=True, reason=RITZ1_NEVER_READS[name]))
-    if name in RITZ1_NEVER_READS else name
-    for name in sorted({**NAMES, **NAMES_ON_BOTH})])
-def test_ritz1_refuses_a_name_that_tests(request, tmp_path, compiler, name):
-    source, line, col, shown, variant = REFUSED[name]
-    proc, ll = _ritz1(request, compiler, tmp_path, source)
+@pytest.mark.parametrize("compiler", ["ritz0"] + RITZ1S)
+@pytest.mark.parametrize("name", sorted(BINDERS))
+def test_a_payload_name_is_only_a_binding(request, tmp_path, compiler, name):
+    """R12: so one named like a module value is refused at the name."""
+    source, line, col, shown, kind = BINDERS[name]
+    proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-800:]}"
-    message = (f"a variant payload can only be bound, not tested: "
-               f"'{shown}' in '{variant}(...)'{_HINT}")
-    hits = re.findall(rf"unit\.ritz:{line}:{col}: error: {re.escape(message)}$", out, re.M)
-    assert len(hits) == 1, f"{compiler}, {name}: want one {message!r}:\n{out[-800:]}"
+    hits = _binder_at(compiler, out, r"unit\.ritz", line, col, kind, shown)
+    assert len(hits) == 1, f"{compiler}, {name}: want one binder error at {line}:{col}:\n{out[-800:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
@@ -434,14 +474,15 @@ def test_ritz1_still_runs_a_payload_that_binds(request, tmp_path, compiler, name
 
 # Each arm has no field to read. ritz0 stops at both (#2423, and its own `Unknown
 # variant`); ritz1 binds, which #2408 and #2421 own. Here it must only get through.
+# The name is no const: one would be the binder's error (R12) before any field.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("source", [
-    pytest.param(_K + _Q + _on("Q", "Z(K)", "Q.Z"), id="unit_variant"),
+    pytest.param(_Q + _on("Q", "Z(k)", "Q.Z"), id="unit_variant"),
     # An integer field just before B's: a miss must not read it.
-    pytest.param(_K + "enum A\n    Last(i32)\nenum B\n    Y\n" + _on("B", "Nope(K)", "B.Y"),
+    pytest.param("enum A\n    Last(i32)\nenum B\n    Y\n" + _on("B", "Nope(k)", "B.Y"),
                  id="no_such_variant"),
-    pytest.param(_K + _opt("i32", "None(K)", "5"), id="none"),
+    pytest.param(_opt("i32", "None(k)", "5"), id="none"),
 ])
 def test_ritz1_reads_no_field_where_an_arm_has_none(request, tmp_path, compiler, source):
     proc, _ = _ritz1(request, compiler, tmp_path, source)
@@ -449,42 +490,28 @@ def test_ritz1_reads_no_field_where_an_arm_has_none(request, tmp_path, compiler,
 
 
 @pytest.mark.integration
-def test_ritz0_locates_a_refusal_in_the_module_that_holds_it(tmp_path):
+@pytest.mark.parametrize("compiler", ["ritz0"] + RITZ1S)
+def test_a_refusal_is_located_in_the_module_that_holds_it(request, tmp_path, compiler):
+    """An imported generic's body is judged where this compile emits it."""
     source = ("import pm\nfn main() -> i32\n    let o: Option<i32> = Some(5)\n"
               "    in_module<i32>(1, o)\n")
-    proc, _ = _ritz0(tmp_path, source)
-    assert re.search(r"pm\.ritz:8:14: a variant payload", proc.stdout + proc.stderr)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_ritz1_locates_a_refusal_in_the_module_that_holds_it(request, tmp_path, compiler):
-    source = ("import pm\nfn main() -> i32\n    let o: Option<i32> = Some(5)\n"
-              "    in_module<i32>(1, o)\n")
-    proc, _ = _ritz1(request, compiler, tmp_path, source)
+    proc, _ = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    assert re.search(r"pm\.ritz:8:14: error: a variant payload", out), out[-800:]
+    assert _binder_at(compiler, out, r"pm\.ritz", 8, 14, "const", "HIDDEN"), out[-800:]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_ritz1_reports_every_name_that_tests(request, tmp_path, compiler):
-    """ritz0 stops at the first; ritz1 carries on, and must not lose the second."""
+@pytest.mark.parametrize("compiler", ["ritz0"] + RITZ1S)
+def test_every_payload_binder_is_reported(request, tmp_path, compiler):
+    """Each compiler carries on past the first, and must not lose the second."""
     source = (_K + "const J: i32 = 1\nfn f(o: Option<i32>) -> i32\n    match o\n"
               "        Some(K) => 1\n        Some(J) => 3\n        _ => 2\n"
               "fn main() -> i32\n    f(Some(5))\n")
-    proc, _ = _ritz1(request, compiler, tmp_path, source)
+    proc, _ = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    assert re.search(r"unit\.ritz:5:14: error: a variant payload", out), out[-800:]
-    assert re.search(r"unit\.ritz:6:14: error: a variant payload", out), out[-800:]
+    assert _binder_at(compiler, out, r"unit\.ritz", 5, 14, "const", "K"), out[-800:]
+    assert _binder_at(compiler, out, r"unit\.ritz", 6, 14, "const", "J"), out[-800:]
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_coverage_comes_first_on_ritz1_too(request, tmp_path, compiler):
-    """As on ritz0: a match that misses says so, whatever else is wrong with it."""
-    source = (_K + "fn f(o: Option<i32>) -> i32\n    match o\n        Some(K) => 1\n"
-              "fn main() -> i32\n    f(Some(5))\n")
-    proc, _ = _ritz1(request, compiler, tmp_path, source)
-    out = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "non-exhaustive match: missing None" in out, out[-800:]
+# Coverage used to come first on ritz1 here; R12's binder check now runs ahead of it
+# on all three: test_local_takes_module_name.py::test_the_binder_comes_before_match_coverage.

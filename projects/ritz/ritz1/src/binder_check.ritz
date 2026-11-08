@@ -1,0 +1,272 @@
+# binder_check.ritz - a local can't take a module value's name (AGAST #2407, LARB R12)
+#
+# A local binding (`let`, `var`, a param, a `for` variable, a variant
+# payload's name) that takes the name of a `const`, a global `var` or an enum
+# variant, declared in the file or imported, is a located error at the name
+# (LANGUAGE_SPEC §4.3).  With no local named like one, a bare read of the name
+# has one meaning, and there is no lookup order to get wrong.
+#
+# A bare top-level arm name is a binding only where it isn't a test: against
+# an enum it is that enum's variant, against an integer a const compares
+# (§8.2).  Only the match lowering knows the scrutinee, so it judges those
+# with binder_arm_refuse (emitter_match.ritz).  Every other binder is judged
+# here, before monomorphisation, so a generic fn is judged whether or not
+# anything instantiates it, and once.
+#
+# Fn names are free: a call says it wants a fn.  ritz0's twin is
+# ritz0/binder_names.py; ritz0/test_local_takes_module_name.py holds the three
+# compilers to one table, messages and positions included.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.hash
+import ritzlib.hashmap
+
+import ast
+import ast_helpers
+import emitter_core
+
+const BINDER_NONE: i32 = 0
+const BINDER_CONST: i32 = 1
+const BINDER_GLOBAL: i32 = 2
+const BINDER_VARIANT: i32 = 3
+
+# fnv1a(name) -> a BINDER_* kind, a hint only: a hit is confirmed by
+# binder_kind_exact, since the map is keyed by the hash alone.
+var g_binder_map: HashMapI64
+var g_binder_module: *Module = null
+
+fn binder_is_builtin_variant(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"Some", 4) == 1 or name_eq(name, len, c"None", 4) == 1
+        return 1
+    (name_eq(name, len, c"Ok", 2) == 1 or name_eq(name, len, c"Err", 3) == 1) as i32
+
+fn binder_is_variant(name: *u8, len: i32) -> i32
+    if binder_is_builtin_variant(name, len) == 1
+        return 1
+    var ei: i32 = 0
+    while ei < enum_count()
+        var vi: i32 = 0
+        while vi < enum_variant_count(ei)
+            var vlen: i32 = 0
+            let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+            if name_eq(vname, vlen, name, len) == 1
+                return 1
+            vi = vi + 1
+        ei = ei + 1
+    0
+
+# What `name` is, by the lists themselves: a const outranks a global, and both
+# a variant.
+fn binder_kind_exact(m: *Module, name: *u8, len: i32) -> i32
+    var c: *ConstEntry = m.constants
+    while c != null
+        if name_eq(c.name, c.name_len, name, len) == 1
+            return BINDER_CONST
+        c = c.next
+    var g: *GlobalVarDef = m.globals
+    while g != null
+        if name_eq(g.name, g.name_len, name, len) == 1
+            return BINDER_GLOBAL
+        g = g.next
+    if binder_is_variant(name, len) == 1
+        return BINDER_VARIANT
+    BINDER_NONE
+
+fn binder_map_note(name: *u8, len: i32, kind: i32)
+    hashmap_i64_insert(@&g_binder_map, fnv1a_str(name, len) as i64, kind as i64)
+
+# The table every lookup reads: built once, from the merged module.
+fn binder_build_map(m: *Module)
+    g_binder_module = m
+    g_binder_map = hashmap_i64_with_cap(1024)
+    binder_map_note(c"Some", 4, BINDER_VARIANT)
+    binder_map_note(c"None", 4, BINDER_VARIANT)
+    binder_map_note(c"Ok", 2, BINDER_VARIANT)
+    binder_map_note(c"Err", 3, BINDER_VARIANT)
+    var ei: i32 = 0
+    while ei < enum_count()
+        var vi: i32 = 0
+        while vi < enum_variant_count(ei)
+            var vlen: i32 = 0
+            let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+            binder_map_note(vname, vlen, BINDER_VARIANT)
+            vi = vi + 1
+        ei = ei + 1
+    var g: *GlobalVarDef = m.globals
+    while g != null
+        binder_map_note(g.name, g.name_len, BINDER_GLOBAL)
+        g = g.next
+    var c: *ConstEntry = m.constants
+    while c != null
+        binder_map_note(c.name, c.name_len, BINDER_CONST)
+        c = c.next
+
+# The BINDER_* kind of module value `name` names, BINDER_NONE for none.
+pub fn binder_module_value_kind(name: *u8, len: i32) -> i32
+    if g_binder_module == null or name == null or len <= 0
+        return BINDER_NONE
+    if hashmap_i64_get(@g_binder_map, fnv1a_str(name, len) as i64) == 0
+        return BINDER_NONE
+    binder_kind_exact(g_binder_module, name, len)
+
+fn binder_kind_word(kind: i32) -> *u8
+    if kind == BINDER_CONST
+        return c"const"
+    if kind == BINDER_GLOBAL
+        return c"global"
+    c"variant"
+
+# `file:line:col: error: a local can't take the name of a <kind>: '<name>' —
+# rename the local`, for a binder of kind `kind`.  Returns 1 (one error).
+pub fn binder_report(file: *u8, line: i32, col: i32, name: *u8, len: i32, kind: i32) -> i32
+    eprints_cstr(file)
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": error: a local can't take the name of a ")
+    eprints_cstr(binder_kind_word(kind))
+    eprints_cstr(c": '")
+    eprint_bytes(name, len)
+    eprints_cstr(c"' — rename the local\n")
+    1
+
+# 1 when `name` takes a module value's name, after saying so.
+fn binder_judge(file: *u8, span: SrcSpan, name: *u8, len: i32) -> i32
+    let kind: i32 = binder_module_value_kind(name, len)
+    if kind == BINDER_NONE
+        return 0
+    binder_report(file, span.line, span.col, name, len, kind)
+
+fn binder_check_arms(file: *u8, arms: *MatchArm) -> i32
+    var errors: i32 = 0
+    var arm: *MatchArm = arms
+    while arm != null
+        # A bare top-level name is the match lowering's (binder_arm_refuse).
+        if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
+            errors = errors + binder_judge(file, arm.pattern_inner_span, arm.pattern_inner_name, arm.pattern_inner_name_len)
+        errors = errors + binder_check_stmts(file, arm.body_stmts)
+        errors = errors + binder_check_expr(file, arm.body)
+        arm = arm.next
+    errors
+
+# Only a match or an if/else expression holds statements, so only those are
+# walked: no other expression binds, and parser_alloc does not zero the fields
+# another kind leaves unset.
+fn binder_check_expr(file: *u8, e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+        return binder_check_arms(file, e.args as *MatchArm)
+    0
+
+fn binder_check_stmts(file: *u8, first: *Stmt) -> i32
+    var errors: i32 = 0
+    var s: *Stmt = first
+    while s != null
+        if s.kind == STMT_VAR_DECL
+            errors = errors + binder_judge(file, s.name_span, s.var_name, s.var_name_len)
+            errors = errors + binder_check_expr(file, s.var_init)
+        else if s.kind == STMT_TUPLE_DECL
+            errors = errors + binder_judge(file, s.name_span, s.var_name, s.var_name_len)
+            errors = errors + binder_judge(file, s.name2_span, s.assign_target, s.assign_target_len)
+            errors = errors + binder_check_expr(file, s.var_init)
+        else if s.kind == STMT_FOR
+            errors = errors + binder_judge(file, s.name_span, s.for_var, s.for_var_len)
+            errors = errors + binder_check_stmts(file, s.for_body)
+        else if s.kind == STMT_IF
+            errors = errors + binder_check_stmts(file, s.if_then)
+            errors = errors + binder_check_stmts(file, s.if_else)
+        else if s.kind == STMT_WHILE or s.kind == STMT_LOOP
+            errors = errors + binder_check_stmts(file, s.while_body)
+        else if s.kind == STMT_MATCH
+            errors = errors + binder_check_arms(file, s.if_then as *MatchArm)
+        else if s.kind == STMT_RETURN
+            errors = errors + binder_check_expr(file, s.return_value)
+        else if s.kind == STMT_EXPR
+            errors = errors + binder_check_expr(file, s.expr)
+        else if s.kind == STMT_ASSIGN
+            errors = errors + binder_check_expr(file, s.assign_value)
+        s = s.next
+    errors
+
+fn binder_check_fn(path: *u8, f: *FnDef) -> i32
+    var file: *u8 = path
+    if f.def_file != null
+        file = f.def_file
+    var errors: i32 = 0
+    var p: *Param = f.params
+    while p != null
+        if p.name != null
+            errors = errors + binder_judge(file, p.name_span, p.name, p.name_len)
+        p = p.next
+    errors + binder_check_stmts(file, f.body)
+
+# 1 when this compile judges `f`'s binders: its own fns, and an imported
+# generic template, whose body this compile instantiates.  An imported fn that
+# isn't generic is judged by its own file's compile.  An imported one is
+# located in its own file, so it needs that file's name.
+fn binder_judges(f: *FnDef, generic_owner: i32) -> i32
+    if f.is_local == 1
+        return 1
+    if f.body == null or f.def_file == null
+        return 0
+    (f.type_params != null or generic_owner == 1) as i32
+
+# Every binder in the fns binder_judges picks, generic templates included.
+# Runs before monomorphisation, so no clone is judged a second time.  Returns
+# how many it refused; the caller stops on any.
+pub fn binder_check_module(m: *Module, path: *u8) -> i32
+    binder_build_map(m)
+    var errors: i32 = 0
+    var f: *FnDef = m.functions
+    while f != null
+        if binder_judges(f, 0) == 1
+            errors = errors + binder_check_fn(path, f)
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        let generic: i32 = (ib.type_params != null) as i32
+        var method: *FnDef = ib.methods
+        while method != null
+            if binder_judges(method, generic) == 1
+                errors = errors + binder_check_fn(path, method)
+            method = method.next
+        ib = ib.next
+    errors
+
+# --- A call of a local that holds no fn (AGAST #2407) -------------------------
+
+# `file:line:col: error: 'k' is a local, not a fn: it can't be called`.
+pub fn binder_call_refuse(file: *u8, line: i32, col: i32, name: *u8, len: i32)
+    eprints_cstr(file)
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": error: '")
+    eprint_bytes(name, len)
+    eprints_cstr(c"' is a local, not a fn: it can't be called\n")
+
+# 1 when `init` is a literal: a binding to one holds no fn.
+fn binder_init_is_literal(init: *Expr) -> i32
+    if init == null
+        return 0
+    let k: i32 = init.kind
+    (k == EXPR_INT_LIT or k == EXPR_FLOAT_LIT or k == EXPR_STRING_LIT or k == EXPR_CSTRING_LIT or k == EXPR_CHAR_LIT or k == EXPR_ARRAY_LIT or k == EXPR_ARRAY_FILL or k == EXPR_STRUCT_LIT) as i32
+
+# After emit_var_decl, as let_mark_decl: mark the binding it registered when
+# it certainly holds no fn value.  A written type says so unless it is a fn
+# type (var_fn_sig) or a pointer; an unwritten one only for a literal.
+pub fn binder_mark_decl(s: *EmitterState, stmt: *Stmt, before: i32)
+    let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
+    if idx < before
+        return
+    var not_fn: i32 = 0
+    if stmt.var_declared_type != TYPE_VOID
+        not_fn = (stmt.var_fn_sig == null and stmt.var_declared_type != TYPE_PTR) as i32
+    else
+        not_fn = binder_init_is_literal(stmt.var_init)
+    let loc: *LocalVar = local_at(s, idx)
+    loc.not_fn = not_fn

@@ -1272,6 +1272,41 @@ fn match_enum_index(name: *u8, len: i32) -> i32
         base = base + 1
     enum_find(name, base)
 
+# --- A bare arm name that binds (AGAST #2407; LANGUAGE_SPEC §4.3, §8.2) -------
+#
+# A top-level name tests where the scrutinee gives it a meaning: a variant the
+# enum declares, or, against a scalar, an integer const (match_arm_is_catch_all
+# lowers any other name as a binding).  Anywhere else it binds, and a binding
+# can't take a const's, global's or variant's name: binder_check.ritz judges
+# every other binder, and ritz0's twin is _refuse_arm_names.
+fn match_arm_name_tests(s: *EmitterState, arm: *MatchArm, ei: i32, builtin: i32) -> i32
+    if ei >= 0
+        return enum_declares_variant(ei, arm.pattern_name, arm.pattern_name_len)
+    if builtin == MATCH_OPTION
+        return (name_eq(arm.pattern_name, arm.pattern_name_len, c"Some", 4) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"None", 4) == 1) as i32
+    if builtin == MATCH_RESULT
+        return (name_eq(arm.pattern_name, arm.pattern_name_len, c"Ok", 2) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"Err", 3) == 1) as i32
+    # An integer const, which is_int_const_type takes a bool for: ritz0 compares
+    # neither a bool const nor a float one.
+    let ce: *ConstEntry = find_const_entry(s, arm.pattern_name, arm.pattern_name_len)
+    (ce != null and ce.const_type != TYPE_BOOL and is_int_const_type(ce.const_type) == 1) as i32
+
+# How many arms were refused, each said at its name.
+fn match_refuse_arm_names(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i32) -> i32
+    var refused: i32 = 0
+    var arm: *MatchArm = arms
+    while arm != null
+        # A qualified `E.V` has no span: it is always a variant.
+        if arm.pattern_kind == PAT_IDENT and arm.pattern_span.line > 0 and match_arm_name_tests(s, arm, ei, builtin) == 0
+            let kind: i32 = binder_module_value_kind(arm.pattern_name, arm.pattern_name_len)
+            if kind != BINDER_NONE
+                binder_report(fn_source_file(emitter_current_fn()), arm.pattern_span.line, arm.pattern_span.col, arm.pattern_name, arm.pattern_name_len, kind)
+                emit_str(s, c"  ; ERROR: a match arm binds a module value's name\n")
+                s.error_count = s.error_count + 1
+                refused = refused + 1
+        arm = arm.next
+    refused
+
 fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name: *u8, enum_name_len: i32, line: i32, col: i32)
     var name: *u8 = enum_name
     var len: i32 = enum_name_len
@@ -1293,6 +1328,10 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     var is_bool: i32 = 0
     if ei < 0 and builtin == 0
         is_bool = interp_is_bool(s, scrutinee)
+    # AGAST #2407: a name that binds can't take a module value's name, and
+    # that error comes before the coverage one, as on ritz0.
+    if match_refuse_arm_names(s, arms, ei, builtin) > 0
+        return
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_BOOL and is_bool == 0
@@ -1316,88 +1355,6 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
         match_check_bool(s, arms, line, col)
     else
         match_check_scalar(s, arms, line, col)
-
-# --- A payload is bound, never tested (AGAST #2405; LANGUAGE_SPEC §8.2) -------
-#
-# An arm is chosen by its variant alone, so a payload name that reads as a test
-# took every value of that variant.  ritz0 refuses these names and this does the
-# same: test_variant_payload_refused.py holds the two to one table.
-# name_tests_payload is the rule, and ritz0's twin is _name_tests_payload.
-
-# 1 when type `name` is an enum (a `Result$A$B`, or a tracked enum) declaring
-# `variant`.
-fn type_declares_variant(name: *u8, len: i32, variant: *u8, variant_len: i32) -> i32
-    if is_tagged_enum_type(name, len) == 1
-        if *name == 'O'
-            return (name_eq(variant, variant_len, c"Some", 4) == 1 or name_eq(variant, variant_len, c"None", 4) == 1) as i32
-        return (name_eq(variant, variant_len, c"Ok", 2) == 1 or name_eq(variant, variant_len, c"Err", 3) == 1) as i32
-    let ei: i32 = match_enum_index(name, len)
-    if ei < 0
-        return 0
-    enum_declares_variant(ei, variant, variant_len)
-
-# The type of the field `arm` binds: its name when it has one (a struct or enum,
-# or the mangled spelling of a Result / Option argument), and whether it is an
-# integer.  Both stay empty for a field this can't type, which then only binds:
-# a variant with no fields, or a generic user enum (see resolve_match_enum).
-fn arm_payload_type(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32, out_name: **u8, out_len: *i32, out_int: *i32)
-    *out_name = null
-    *out_len = 0
-    *out_int = 0
-    if is_tagged_enum_type(enum_name, enum_name_len) == 1
-        let variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
-        let arg: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, variant, out_len)
-        *out_name = arg
-        # prim_name_size also knows the two floats.
-        *out_int = (prim_name_size(arg, *out_len) > 0 and *arg != 'f') as i32
-        return
-    let vi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
-    if vi < 0
-        return
-    let field: *StructField = enum_variant_fields(user_enum_index(enum_name, enum_name_len), vi)
-    if field == null
-        return
-    if field.field_type == TYPE_STRUCT
-        *out_name = field.field_type_name
-        *out_len = field.field_type_name_len
-    *out_int = is_int_const_type(field.field_type)
-
-# A top-level arm's reading of a name: against an enum it is a variant, against
-# an integer a const compares.  "A const" is what ritz0's table holds: a number,
-# a float too, but no string or array.
-fn name_tests_payload(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32) -> i32
-    var ty: *u8 = null
-    var ty_len: i32 = 0
-    var is_int: i32 = 0
-    arm_payload_type(s, arm, enum_name, enum_name_len, @ty, @ty_len, @is_int)
-    if type_declares_variant(ty, ty_len, arm.pattern_inner_name, arm.pattern_inner_name_len) == 1
-        return 1
-    if is_int == 0
-        return 0
-    let ce: *ConstEntry = find_const_entry(s, arm.pattern_inner_name, arm.pattern_inner_name_len)
-    if ce == null
-        return 0
-    (is_int_const_type(ce.const_type) == 1 or ce.const_type == TYPE_F32 or ce.const_type == TYPE_F64) as i32
-
-# Every arm is read, as ritz0 reads them, whether or not one before it covers it.
-# Only a payload binding has an inner name, so no other arm can test.
-fn match_refuse_payload_tests(s: *EmitterState, arms: *MatchArm, enum_name: *u8, enum_name_len: i32)
-    var arm: *MatchArm = arms
-    while arm != null
-        if name_tests_payload(s, arm, enum_name, enum_name_len) == 1
-            eprints_cstr(fn_source_file(emitter_current_fn()))
-            eprint_char(':')
-            eprint_i64(arm.pattern_inner_span.line as i64)
-            eprint_char(':')
-            eprint_i64(arm.pattern_inner_span.col as i64)
-            eprints_cstr(c": error: a variant payload can only be bound, not tested: '")
-            eprint_bytes(arm.pattern_inner_name, arm.pattern_inner_name_len)
-            eprints_cstr(c"' in '")
-            eprint_bytes(arm.pattern_name, arm.pattern_name_len)
-            eprints_cstr(c"(...)' — bind it to a name, then test the name in the arm body\n")
-            emit_str(s, c"  ; ERROR: a variant payload tested\n")
-            s.error_count = s.error_count + 1
-        arm = arm.next
 
 # AGAST #2140: 1 when the scrutinee is a borrow, `@place` / `@&place`.
 fn match_scrutinee_is_addr(scr: *Expr) -> i32
@@ -1440,7 +1397,6 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         emit_nd_error(s, typed.span.line, typed.span.col, c"this constructor's type can't be inferred here: bind it with a typed `let` first")
         return 0
     match_check_coverage(s, typed, arms, enum_name, enum_name_len, span.line, span.col)
-    match_refuse_payload_tests(s, arms, enum_name, enum_name_len)   # AGAST #2405
     # AGAST #2344: an enum element or global is a place too.  emit_expr reads
     # `a[1]` and `g` as scalars, whatever their type.
     var from_place: i32 = is_addr

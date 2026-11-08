@@ -1145,13 +1145,18 @@ fn param_type_names_pointee(p: *Parser, ty: i32) -> i32
 
 pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
     nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
-    return param_of_type(p, name, len, ty)
+    let param: *Param = param_of_type(p, name, len, ty)
+    param.name_span.line = line   # AGAST #2407
+    param.name_span.col = col
+    return param
 
 # The just-parsed type `ty` as a param declares it.  AGAST #2308: a `@T` local
 # or return type is recorded this way too, so they all know the same things.
 fn param_of_type(p: *Parser, name: *u8, len: i32, ty: i32) -> *Param
     let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
     param.name = name as *u8
+    param.name_span.line = 0
+    param.name_span.col = 0
     param.name_len = len
     param.param_type = ty
     # Copy the struct type name from parser state for a struct, or a pointer
@@ -2673,6 +2678,19 @@ pub fn type_generic_with_saved(p: *Parser, base_name: *u8, base_len: i32, ga: *G
 
 # AGAST #2028: `let name ... = init` -- a stmt_var_decl whose binding is
 # immutable.  let_check.ritz enforces it.
+# AGAST #2407: record where statement `s`'s name is (binder_check.ritz).
+# The grammar wraps each binding statement's action in this.
+pub fn stmt_named(s: *Stmt, line: i32, col: i32) -> *Stmt
+    s.name_span.line = line
+    s.name_span.col = col
+    return s
+
+# The second name of `let (x, y) = ..` (AGAST #2407).
+pub fn stmt_named2(s: *Stmt, line: i32, col: i32) -> *Stmt
+    s.name2_span.line = line
+    s.name2_span.col = col
+    return s
+
 pub fn stmt_let_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = stmt_var_decl(p, name, len, ty, init, line, col)
     s.var_is_let = 1
@@ -2682,6 +2700,8 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = STMT_VAR_DECL
     s.var_is_let = 0
+    s.name_span.line = 0   # AGAST #2407: stmt_named sets it
+    s.name_span.col = 0
     # AGAST #1671: typed decls go through capture_var_type, which latched
     # var_fn_sig (null unless the type is a fn type).  Untyped ones have none.
     # On a `[N]fn(..)` array it is the element signature (AGAST #1747).
@@ -2849,6 +2869,10 @@ pub fn stmt_assert(p: *Parser, cond: *Expr, msg: *u8, msg_len: i32, line: i32, c
 pub fn stmt_tuple_decl(p: *Parser, name1: *u8, len1: i32, name2: *u8, len2: i32, init: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = STMT_TUPLE_DECL
+    s.name_span.line = 0   # AGAST #2407: stmt_named and stmt_named2 set them
+    s.name_span.col = 0
+    s.name2_span.line = 0
+    s.name2_span.col = 0
     s.span.line = line
     s.span.col = col
     s.var_name = name1 as *u8
@@ -2872,6 +2896,8 @@ pub fn stmt_while(p: *Parser, cond: *Expr, body: *Stmt, line: i32, col: i32) -> 
 pub fn stmt_for(p: *Parser, var_name: *u8, var_len: i32, start: *Expr, end: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = STMT_FOR
+    s.name_span.line = 0   # AGAST #2407: stmt_named sets it
+    s.name_span.col = 0
     s.span.line = line
     s.span.col = col
     s.for_var = var_name
@@ -4052,6 +4078,8 @@ pub fn match_arm_int(p: *Parser, val: i64) -> *MatchArm
     a.next = null
     a.pass_span.line = 0
     a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
     return a
 
 # Allocate a new MatchArm with wildcard pattern (_). Caller fills body + is_pass.
@@ -4070,6 +4098,8 @@ pub fn match_arm_wildcard(p: *Parser) -> *MatchArm
     a.next = null
     a.pass_span.line = 0
     a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
     return a
 
 # Allocate a new MatchArm with identifier binding OR unit-variant (e.g. x, None).
@@ -4088,6 +4118,8 @@ pub fn match_arm_ident(p: *Parser, name: *u8, name_len: i32) -> *MatchArm
     a.next = null
     a.pass_span.line = 0
     a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
     return a
 
 # Allocate a new MatchArm with variant pattern Name(inner).
@@ -4107,6 +4139,8 @@ pub fn match_arm_variant(p: *Parser, name: *u8, name_len: i32, inner_kind: i32, 
     a.next = null
     a.pass_span.line = 0
     a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
     return a
 
 # Set arm body (optionally marks is_pass when body_expr is null).
@@ -4240,9 +4274,18 @@ pub fn pattern_ident_or_wildcard(p: *Parser, name: *u8, name_len: i32) -> *Match
             return match_arm_wildcard(p)
     return match_arm_ident(p, name, name_len)
 
+# pattern : IDENT, with where it is: a bare name binds unless the match finds
+# it tests, and a binding can't take a module value's name (AGAST #2407).
+pub fn pattern_ident_at(p: *Parser, name: *u8, name_len: i32, line: i32, col: i32) -> *MatchArm
+    let a: *MatchArm = pattern_ident_or_wildcard(p, name, name_len)
+    if a.pattern_kind == PAT_IDENT
+        a.pattern_span.line = line
+        a.pattern_span.col = col
+    return a
+
 # pattern : IDENT '(' IDENT ')'  →  PAT_VARIANT with inner = wildcard or bind.
-# Inner ident `_` becomes a wildcard payload; any other ident is a binding,
-# unless the emitter finds it tests (match_refuse_payload_tests, AGAST #2405).
+# Inner ident `_` becomes a wildcard payload; any other ident is a binding, and
+# binder_check.ritz refuses one named like a const, global or variant (#2407).
 pub fn pattern_variant_inner(p: *Parser, name: *u8, name_len: i32, inner: *u8, inner_len: i32, line: i32, col: i32) -> *MatchArm
     if inner_len == 1
         if *inner == 95  # '_'

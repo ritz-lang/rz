@@ -134,14 +134,7 @@ pub fn main() -> i32
     return INV[x - 1] as i32
 """
 
-# A local of the same name shadows the module const: must read the local.
-LOCAL_SHADOWS_CONST = """\
-const T: [4]i32 = [9, 9, 9, 9]
-
-pub fn main() -> i32
-    let T: [4]i32 = [0, 3, 0, 0]
-    return T[1]
-"""
+# A local can't take a const's name (AGAST #2407): test_local_takes_module_name.py.
 
 # Scalar consts still inline, and still work as an index into a const table.
 SCALAR_CONST_INDEX = """\
@@ -163,7 +156,6 @@ FORMS = {
     "i64_table": I64_TABLE,
     "u64_table": U64_TABLE,
     "chained_lookup": CHAINED_LOOKUP,
-    "local_shadows_const": LOCAL_SHADOWS_CONST,
     "scalar_const_index": SCALAR_CONST_INDEX,
 }
 

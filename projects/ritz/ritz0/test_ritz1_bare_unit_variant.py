@@ -229,14 +229,16 @@ BROKEN_FORMS = {
 
 # --- forms that already worked, pinned against regression --------------------
 
-# --- a local or param named like a unit variant shadows it --------------------
+# --- a local or param can't be named like a variant ---------------------------
 #
 # AGAST #2038: ritz0 crashed on these with "Unknown enum type: i32".  Every
 # site that builds a variant against an expected type (a fn's return type, a
 # let's declared type, an assignment target, a call's param, a struct field)
 # took the bare `B` as S.B by name alone, then used the i32 as its enum.  The
-# binding wins, as in ritz1 (#1600).  S.B is tag 1, so reading the variant
-# instead of the 9 would not exit 9.
+# fix let the binding win, as ritz1 did (#1600), and LANGUAGE_SPEC §10.2 said a
+# local shadows a variant.  LARB R12 (AGAST #2407, confirmed by Aaron on
+# 2026-11-08) took that back: a name has one meaning, so each of these is now a
+# located error at the binding's name on both compilers.
 
 # The ticket's repro: the `return` site (fn return type i32).
 LOCAL_SHADOWS_VARIANT = (
@@ -330,8 +332,7 @@ pub fn main() -> i32
 """
 )
 
-# The shadow is per function: outside it, bare `B` is still S.B.
-# 9 from the local + 2 from the match on the variant = 11.
+# A binding in one fn is refused there, wherever else `B` is S.B.
 SHADOW_IS_LOCAL_TO_FN = (
     ENUM_S
     + """\
@@ -350,14 +351,15 @@ pub fn main() -> i32
 """
 )
 
+# name -> (program, line and column of the binding's name)
 SHADOW_FORMS = {
-    "local_shadows_variant": (LOCAL_SHADOWS_VARIANT, 9),
-    "var_shadows_in_let": (VAR_SHADOWS_IN_LET, 9),
-    "shadow_in_assign": (SHADOW_IN_ASSIGN, 9),
-    "param_shadows_variant": (PARAM_SHADOWS_VARIANT, 9),
-    "shadow_as_call_arg": (SHADOW_AS_CALL_ARG, 9),
-    "shadow_in_struct_field": (SHADOW_IN_STRUCT_FIELD, 9),
-    "shadow_is_local_to_fn": (SHADOW_IS_LOCAL_TO_FN, 11),
+    "local_shadows_variant": (LOCAL_SHADOWS_VARIANT, 6, 9),
+    "var_shadows_in_let": (VAR_SHADOWS_IN_LET, 9, 9),
+    "shadow_in_assign": (SHADOW_IN_ASSIGN, 9, 9),
+    "param_shadows_variant": (PARAM_SHADOWS_VARIANT, 5, 6),
+    "shadow_as_call_arg": (SHADOW_AS_CALL_ARG, 13, 9),
+    "shadow_in_struct_field": (SHADOW_IN_STRUCT_FIELD, 11, 9),
+    "shadow_is_local_to_fn": (SHADOW_IS_LOCAL_TO_FN, 8, 9),
 }
 
 QUALIFIED = (
@@ -471,18 +473,19 @@ def test_ritz1_matches_ritz0(tmp_path, name):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 @pytest.mark.parametrize("name", sorted(SHADOW_FORMS))
-def test_ritz0_binding_shadows_variant(tmp_path, name):
-    """ritz0 is the oracle here too (AGAST #2038): the binding, not S.B."""
-    program, expected = SHADOW_FORMS[name]
-    assert _run("ritz0", tmp_path, name, program) == expected
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(SHADOW_FORMS))
-def test_ritz1_binding_shadows_variant(tmp_path, name):
-    program, expected = SHADOW_FORMS[name]
-    assert _run("ritz1", tmp_path, name, program) == expected
+def test_a_binding_cant_take_a_variants_name(tmp_path, compiler, name):
+    """LARB R12 (AGAST #2407): refused at the name, not read as the binding."""
+    program, line, col = SHADOW_FORMS[name]
+    comp, ll, src = _compile(compiler, tmp_path, name, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote output for {name}"
+    message = "a local can't take the name of a variant: 'B' — rename the local"
+    sep = "" if compiler == "ritz0" else "error: "
+    assert re.search(rf"{re.escape(src.name)}:{line}:{col}: {sep}{re.escape(message)}$",
+                     out, re.M), f"{compiler}, {name}:\n{out[-1500:]}"
 
 
 @pytest.mark.integration

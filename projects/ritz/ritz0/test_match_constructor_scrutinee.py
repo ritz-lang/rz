@@ -196,7 +196,7 @@ USER = {
 # `None` is a name first.
 SHADOWED = {
     "const_none": ("const None: i32 = 3\n" + _on("None", "3 => 3", "_ => 1"), 3),
-    "local_none": (_on("None", "3 => 3", "_ => 1", before="let None: i32 = 3"), 3),
+    # A local can't be named `None` (R12, #2407): test_local_takes_module_name.py.
     "global_none": ("var None: i32\n" + _on("None", "0 => 3", "_ => 1"), 3),
 }
 

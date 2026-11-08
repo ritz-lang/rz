@@ -226,9 +226,8 @@ ACCEPTED = {
                  "        0 => 1\n        _ => 2\n", 2),
     "binding": ("fn main() -> i32\n    let n: i64 = 5\n    match n\n"
                 "        0 => 1\n        k => k as i32\n", 5),
-    # `R` is a variant of an enum in scope, but `n` is an integer, so it binds.
-    "binding_named_like_a_variant": (_C + "fn main() -> i32\n    let n: i64 = 5\n    match n\n"
-                                     "        0 => 1\n        R => R as i32\n", 5),
+    # A binding named like a variant (`R =>` on an integer) is no catch-all but an
+    # error since R12 (#2407): test_local_takes_module_name.py, arm_over_a_variant_*.
     "catch_all_before_const": ("const A: i64 = 0\nfn main() -> i32\n    let n: i64 = 5\n"
                                "    match n\n        A => 1\n        _ => 2\n", 2),
     "statement_wildcard": ("fn main() -> i32\n    var r: i32 = 0\n    let n: i64 = 5\n"

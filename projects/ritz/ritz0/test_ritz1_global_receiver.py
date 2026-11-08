@@ -86,16 +86,7 @@ pub fn main() -> i32
         return 1
     return g_q.get() as i32
 """,
-    # A local of the same name shadows the global.
-    "local_shadows_global": P_DEF
-    + """\
-var g_p: P
-
-pub fn main() -> i32
-    g_p.v = 1
-    var g_p: P = P { v: 42 }
-    return g_p.get() as i32
-""",
+    # A local can't take a global's name (AGAST #2407): test_local_takes_module_name.py.
 }
 
 

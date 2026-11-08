@@ -579,6 +579,8 @@ class ClosureParam:
     """A closure parameter: name with optional type."""
     name: str
     type: Optional[Type] = None
+    # Where the name is (AGAST #2407: a binder's errors point at it).
+    span: Optional[Span] = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -669,6 +671,8 @@ class LetStmt(Stmt):
     name: str
     type: Optional[Type]
     value: Optional[Expr]
+    # Where the name is; `span` is the `let` (AGAST #2407).
+    name_span: Optional[Span] = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -676,6 +680,8 @@ class LetTupleStmt(Stmt):
     """Tuple destructuring: let (a, b, c) = expr."""
     names: List[str]
     value: Expr
+    # Where each name is (AGAST #2407).
+    name_spans: List[Span] = field(default_factory=list, compare=False, repr=False)
 
 
 @dataclass
@@ -684,6 +690,8 @@ class VarStmt(Stmt):
     name: str
     type: Optional[Type]
     value: Optional[Expr]
+    # Where the name is; `span` is the `var` (AGAST #2407).
+    name_span: Optional[Span] = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -718,6 +726,8 @@ class ForStmt(Stmt):
     var: str
     iter: Expr
     body: Block
+    # Where the loop variable is; `span` is the `for` (AGAST #2407).
+    var_span: Optional[Span] = field(default=None, compare=False, repr=False)
 
 
 @dataclass

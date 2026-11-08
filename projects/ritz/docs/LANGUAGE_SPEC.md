@@ -871,6 +871,41 @@ const PI: f64 = 3.14159265358979
 
 Constants must have explicit types and compile-time values.
 
+#### One meaning per name
+
+A local binding can't take the name of a module-level value that a bare read
+would reach: a `const`, a global `var` or an enum variant (§10), declared in
+the module or imported. "Local binding" is a `let`, a `var`, a parameter, a
+`for` variable, a match arm's name and a variant payload's name (§8.2). It is
+a compile error at the binding's name, whatever the types (AGAST #2407, LARB
+R12):
+
+```ritz expect-error="a local can't take the name of a const: 'LIMIT' — rename the local"
+const LIMIT: i32 = 7
+
+fn main() -> i32
+    let LIMIT: i32 = 3
+    LIMIT
+```
+
+So a bare `LIMIT` always reads the const, and adding a `pub const` to a module
+can't silently change what a local downstream reads: it stops that local
+compiling instead. `_` binds nothing and takes no name.
+
+A **fn** name is free: a local named like a fn is the local, since a call says
+it wants a fn. Calling a local that holds no fn value is an error at the call:
+
+```ritz expect-error="'size' is a local, not a fn: it can't be called"
+fn size() -> i32
+    7
+
+fn main() -> i32
+    let size: i32 = 3
+    size()
+```
+
+A local of fn type still calls (`let f: fn() -> i32 = size` then `f()`).
+
 ### 4.4 Type Inference
 
 Local variable types are inferred from the initializer:
@@ -1792,9 +1827,10 @@ fn main() -> i32
 
 A pattern inside a variant takes the payload: it is a binding or `_`. One that
 would test the payload is a compile error at that pattern, because the arm is
-chosen by the variant alone. That covers a literal, a type, a name that is an
-integer `const` against an integer payload, and a name that is a variant of an
-enum payload. Bind the payload and test it in the arm body:
+chosen by the variant alone. That covers a literal and a type. A name only
+binds, so one named like a `const`, a global or a variant is the binder error
+of §4.3, whatever the payload's type. Bind the payload and test it in the arm
+body:
 
 ```ritz expect-error="a variant payload can only be bound, not tested: '0' in 'Some(...)'"
 fn f(o: Option<i32>) -> i32
@@ -1809,9 +1845,11 @@ fn main() -> i32
 #### Constant Patterns
 
 A bare identifier pattern that names an integer `const` (declared in the
-module or imported) compares the scrutinee with the constant. Any other
+module or imported) compares an integer scrutinee with the constant. Any other
 identifier binds the scrutinee to a new name, which also makes it a
-catch-all (AGAST #1880):
+catch-all (AGAST #1880), and like any binding it can't take the name of a
+const, global or variant (§4.3). So a non-integer const, or an integer const
+against a scrutinee that isn't an integer, is that error.
 
 ```ritz
 const SYS_READ: u64 = 0
@@ -1830,6 +1868,18 @@ fn main() -> i32
 A const resolves wherever it is declared in the module, before or after the
 `match`. Constant patterns compare integers only: against an enum
 scrutinee, a bare name is a variant (§10.2).
+
+```ritz expect-error="a local can't take the name of a const: 'NAME' — rename the local"
+const NAME: StrView = "ritz"
+
+fn f(n: i32) -> i32
+    match n
+        0 => 1
+        NAME => 2
+
+fn main() -> i32
+    f(5)
+```
 
 #### Wildcard Pattern
 
@@ -2049,8 +2099,22 @@ fn main() -> i32
 
 The error names the two alphabetically-first declaring enums. Bare **match
 arm patterns** are the exception: the scrutinee's enum is known, so `B =>`
-against an `S` is `S.B`. A local or parameter named like a variant shadows it,
-and an enum reached twice through an import cycle is still one enum.
+against an `S` is `S.B`. An enum reached twice through an import cycle is
+still one enum.
+
+A local or parameter can't be named like a variant (§4.3), so a bare `B` is
+never a local. Until AGAST #2407 the local won; a name with two meanings is
+now an error at the binding:
+
+```ritz expect-error="a local can't take the name of a variant: 'B' — rename the local"
+enum S
+    A
+    B
+
+fn main() -> i32
+    let B: i32 = 9
+    B
+```
 
 ### 10.3 Pattern Matching
 

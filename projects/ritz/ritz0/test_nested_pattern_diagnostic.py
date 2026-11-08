@@ -51,9 +51,11 @@ fn get() -> Res
 fn main() -> i32
     match get()
         Ok(Simple(x)) => x
-        Ok(Empty) => 1
+        Ok(_) => 1
         Err(e) => e
 """
+# `Ok(Empty)` in place of `Ok(_)` is refused before the nested pattern, as a payload
+# named like a variant (LARB R12, AGAST #2407), so this keeps to the one construct.
 
 
 def test_nested_variant_pattern_diagnostic(tmp_path):

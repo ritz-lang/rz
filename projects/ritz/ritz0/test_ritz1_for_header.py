@@ -674,11 +674,10 @@ def test_a_view_walks_its_bytes(run_with, compiler, name):
     assert run_with(compiler, name, VIEWS[name]) == 195
 
 
-# ritz1 alone: ritz0 walks the global past the local (#2386), and fails to store
-# the `@s` of a StrView.  The values are the programs'.
+# ritz1 alone: ritz0 fails to store the `@s` of a StrView.  The values are the
+# programs'.  A local can't take a global's name since #2407, so `for` reading a
+# local over a global (#2386) is test_ritz1_for_iterable.py's refusal now.
 RITZ1_RUNS = {
-    "a_local_hides_a_global": (_in_main("g", FILL_V + "    var g: Vec<i32> = v\n",
-                                        "var g: [2]i32\n\n"), 0),
     "addr_of_strview": (MAIN + _SV + _body(_BYTES.format(it="@s")), 195),
     # 200 and its neighbour: a wide read isn't 200, and ritz0's is -56 (#2406).
     "a_byte_pointer_reads_a_byte": (GVEC + MAIN + "    var a: [2]u8 = [200, 201]\n"

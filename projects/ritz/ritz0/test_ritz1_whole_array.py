@@ -662,15 +662,7 @@ pub fn main() -> i32
     var a: [3]i32 = [0, 0, 3]
     return f(a) as i32
 """,
-    "shadow_global": """\
-var G: [4]i32
-
-fn g(G: i32) -> i32
-    return G
-
-pub fn main() -> i32
-    return g(3)
-""",
+    # A local can't take a global's name (AGAST #2407): test_local_takes_module_name.py.
 }
 
 # Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe

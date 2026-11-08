@@ -1472,7 +1472,7 @@ class Parser:
         if self._at(TokenType.COLON):
             self._advance()
             param_type = self.parse_type()
-        return rast.ClosureParam(name_tok.value, param_type)
+        return rast.ClosureParam(name_tok.value, param_type, name_tok.span)
 
     # ========================================================================
     # Statements
@@ -1569,7 +1569,7 @@ class Parser:
             self._expect(TokenType.IN)
             iter_expr = self.parse_expr()
             body = self.parse_block()
-            return rast.ForStmt(span, var_tok.value, iter_expr, body)
+            return rast.ForStmt(span, var_tok.value, iter_expr, body, var_tok.span)
 
         # Asm (inline assembly)
         if self._at(TokenType.ASM):
@@ -1615,9 +1615,11 @@ class Parser:
         if self._at(TokenType.LPAREN):
             self._advance()
             names = []
+            name_spans = []
             while not self._at(TokenType.RPAREN):
                 name_tok = self._expect(TokenType.IDENT)
                 names.append(name_tok.value)
+                name_spans.append(name_tok.span)
                 if self._at(TokenType.COMMA):
                     self._advance()
                 else:
@@ -1625,7 +1627,7 @@ class Parser:
             self._expect(TokenType.RPAREN)
             self._expect(TokenType.EQ)
             value = self.parse_expr()
-            return rast.LetTupleStmt(span, names, value)
+            return rast.LetTupleStmt(span, names, value, name_spans)
 
         # Regular binding
         name_tok = self._expect(TokenType.IDENT)
@@ -1640,7 +1642,7 @@ class Parser:
             self._advance()
             value = self.parse_expr()
 
-        return rast.LetStmt(span, name_tok.value, type_ann, value)
+        return rast.LetStmt(span, name_tok.value, type_ann, value, name_tok.span)
 
     def parse_var(self) -> rast.VarStmt:
         """Parse a var binding."""
@@ -1658,7 +1660,7 @@ class Parser:
             self._advance()
             value = self.parse_expr()
 
-        return rast.VarStmt(span, name_tok.value, type_ann, value)
+        return rast.VarStmt(span, name_tok.value, type_ann, value, name_tok.span)
 
     def parse_asm(self) -> rast.AsmStmt:
         """Parse an inline assembly statement.

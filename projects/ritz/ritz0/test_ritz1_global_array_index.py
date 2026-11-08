@@ -150,20 +150,7 @@ pub fn main() -> i32
     return (g[1] + g[2] + g[3] + 1) as i32
 """
 
-# A local array shadowing a global of the same name must still hit the local,
-# while main's own `g[0]` store hits the global.
-LOCAL_SHADOWS_GLOBAL = """\
-var g: [4]i64
-
-pub fn main() -> i32
-    g[0] = 100
-    return helper()
-
-fn helper() -> i32
-    var g: [4]i64
-    g[1] = 7
-    return g[1] as i32
-"""
+# A local can't take a global's name (AGAST #2407): test_local_takes_module_name.py.
 
 BROKEN_FORMS = {
     "repro_i64": REPRO_I64,
@@ -175,7 +162,6 @@ BROKEN_FORMS = {
     "read_modify_write": READ_MODIFY_WRITE,
     "two_globals": TWO_GLOBALS,
     "across_functions": ACROSS_FUNCTIONS,
-    "local_shadows_global": LOCAL_SHADOWS_GLOBAL,
 }
 
 # --- forms that already worked, pinned against regression -------------------

@@ -583,9 +583,9 @@ struct M
 
 var gp: *M
 
-fn shadow(gp: *M) -> i32
-    (*gp).t = 5
-    return (*gp).t
+fn shadow(q: *M) -> i32
+    (*q).t = 5
+    return (*q).t
 
 pub fn main() -> i32
     var a: M
@@ -850,7 +850,9 @@ def test_ritz1_nested_array_fails_closed(ritz1_bin, tmp_path, name):
 )
 def test_ritz1_nested_array_layout(ritz1_bin, tmp_path, decl, llvm):
     """The storage is the real nested type, local and global, as ritz0 lays it out."""
-    program = f"{decl}\n\npub fn main() -> i32\n    {decl}\n    return 0\n"
+    # The local is `l`: it can't take the global's name (AGAST #2407).
+    local = decl.replace("var g", "var l")
+    program = f"{decl}\n\npub fn main() -> i32\n    {local}\n    return 0\n"
     comp, ll = _compile("ritz1", tmp_path, "layout", program)
     assert comp.returncode == 0, comp.stderr[-2000:]
     ir = ll.read_text()

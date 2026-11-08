@@ -25,8 +25,9 @@ against the scrutinee's enum, which is known, so it is not ambiguous and stays
 legal (`match_arms_resolve_by_scrutinee` pins this).
 
 Controls: a variant only one enum declares stays legal next to an ambiguous
-one; the qualified form compiles; a local named like the variant shadows it
-(#2038); and one enum recorded twice through an import cycle is one enum.
+one; the qualified form compiles; and one enum recorded twice through an
+import cycle is one enum.  A local can't be named like the variant at all
+(LARB R12, AGAST #2407): `test_a_local_cant_take_an_ambiguous_variants_name`.
 """
 
 import os
@@ -322,15 +323,6 @@ pub fn main() -> i32
 """,
         43,
     ),
-    # A local named like the ambiguous variant is the local (#2038).
-    "local_shadows_ambiguous": (
-        """\
-pub fn main() -> i32
-    let B: i32 = 9
-    return B
-""",
-        9,
-    ),
 }
 
 
@@ -392,6 +384,18 @@ def test_unambiguous_forms_still_compile(tmp_path, compiler, name):
         f"{compiler} rejected {name}:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
     )
     assert _link_run(compiler, tmp_path, name, [ll]) == expected
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_local_cant_take_an_ambiguous_variants_name(tmp_path, compiler):
+    """Before #2407 the local won (#2038).  Now it's the binder's error, at the name,
+    whichever enums declare the variant."""
+    body = "pub fn main() -> i32\n    let B: i32 = 9\n    return B\n"
+    comp, ll, src = _compile(compiler, tmp_path, "local_named_b", HEADER + body)
+    sep = "" if compiler == "ritz0" else "error: "
+    msg = "a local can't take the name of a variant: 'B' — rename the local"
+    _assert_located_error(compiler, comp, ll, src, 14, 9, sep + msg)
 
 
 # --- across modules -----------------------------------------------------------

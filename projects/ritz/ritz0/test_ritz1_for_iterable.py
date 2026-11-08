@@ -16,6 +16,7 @@ Each program returns 0, or the number of the first check that failed.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -832,25 +833,18 @@ def test_the_vec_form_still_compiles(compile_with, compiler):
 _SHADOW = "var g: [2]i32\n\n" + MAIN + _fill("g", (1, 2))
 
 
-# A local hides the global of the same name, so the global's array is never
-# reached.  ritz0 looks at globals first (#2386).
+# A local named like a global was read as the local by ritz1 and as the global
+# by ritz0's `for` (#2386).  LARB R12 (AGAST #2407): it's an error at the local's
+# name on all three, so no `for` can read either.  Line 6, after the two fills.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_a_local_array_hides_a_global_one(run_with, compiler):
-    program = _SHADOW + "    var g: [2]i32 = [10, 20]\n" + _SUM_V.format(it="g")
-    assert run_with(compiler, "shadow", program) == 30
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_a_local_scalar_hides_a_global_array(compile_with, compiler):
-    program = _SHADOW + "    var g: i32 = 0\n" + _SUM_V.format(it="g")
-    comp, ll, _ = compile_with(compiler, "shadow_scalar", program)
-    _is_refused(comp, ll, UNSUPPORTED, program)
-
-
-@pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2386: ritz0 walks the global past the local")
-def test_ritz0_local_array_hides_a_global_one(run_with):
-    program = _SHADOW + "    var g: [2]i32 = [10, 20]\n" + _SUM_V.format(it="g")
-    assert run_with("ritz0", "shadow", program) == 30
+@pytest.mark.parametrize("compiler", ["ritz0"] + RITZ1S)
+@pytest.mark.parametrize("local", ["var g: [2]i32 = [10, 20]", "var g: i32 = 0"])
+def test_a_local_cant_take_a_global_arrays_name(compile_with, compiler, local):
+    program = _SHADOW + f"    {local}\n" + _SUM_V.format(it="g")
+    comp, ll, _ = compile_with(compiler, "shadow", program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert not ll.exists()
+    sep = "" if compiler == "ritz0" else "error: "
+    message = "a local can't take the name of a global: 'g' — rename the local"
+    assert re.search(rf":6:9: {sep}{re.escape(message)}$", out, re.M), out[-1500:]

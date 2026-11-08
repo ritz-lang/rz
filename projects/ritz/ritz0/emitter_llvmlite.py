@@ -18,6 +18,7 @@ from monomorph import resolve_alias_in
 from tail_value import slot_tails, value_gap, value_tails
 import array_rules
 import bool_rules
+import binder_names
 import match_coverage
 from metadata import type_to_string
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
@@ -556,6 +557,8 @@ class LLVMEmitter:
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
         self.constants: Dict[str, Tuple[int, ir.Type]] = {}  # name -> (value, type)
+        # What a local may not be named: binder_names.module_values (AGAST #2407).
+        self._module_values: Dict[str, str] = {}
         self.const_arrays: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
         # name -> declared Ritz type of a scalar const. The LLVM type in
         # self.constants drops signedness, so without this a `const M: u8 =
@@ -2297,6 +2300,7 @@ class LLVMEmitter:
         """
         self._current_source_file = source_file
         LLVMEmitter._module_counter += 1
+        self._module_values = binder_names.module_values(module)
 
         # Drops need the move checker's marks (Ident.moves_binding: clear the
         # binding's drop flag there) whether or not the caller checked
@@ -3084,13 +3088,9 @@ class LLVMEmitter:
                     return True
                 return False
         elif isinstance(expr, rast.Ident):
-            # Unit variant without parens.  A local or param of the same name
-            # shadows the variant (AGAST #2038, as ritz1 since #1600): the
-            # Ident emitter reads locals/params before variant_to_enum, so
-            # every expected-type site (return, let, assign, call arg, struct
-            # field) must not build `B` as a variant of the expected type.
-            if expr.name in self.locals or expr.name in self.params:
-                return False
+            # Unit variant without parens.  No local or param can be named
+            # like one (binder_names, AGAST #2407), so a bare variant name is
+            # the variant at every expected-type site.
             if expr.name in self.variant_to_enum:
                 self._check_variant_unambiguous(expr.name, expr.span)
                 return True
@@ -7205,30 +7205,19 @@ class LLVMEmitter:
 
         # Special-case bare identifiers that don't materialize through
         # `_emit_expr` (const arrays, global arrays, locals storing arrays).
+        # Locals first, as every other read (AGAST #2386): binder_names keeps a
+        # local from taking a global's name, so the order can't change what is
+        # read, but an order unique to this path is a trap.
         iter_val = None
         if isinstance(stmt.iter, rast.Ident):
             name = stmt.iter.name
-            if name in self.const_arrays:
-                gvar, ty = self.const_arrays[name]
-                if isinstance(ty, ir.ArrayType):
-                    iter_kind = "array_ptr"
-                    elem_ty = ty.element
-                    arr_ptr = gvar
-                    arr_len = ty.count
-            elif name in self.globals:
-                gvar, ty = self.globals[name]
-                if isinstance(ty, ir.ArrayType):
-                    iter_kind = "array_ptr"
-                    elem_ty = ty.element
-                    arr_ptr = gvar
-                    arr_len = ty.count
-            elif name in self.locals:
-                alloca, ty = self.locals[name]
-                if isinstance(ty, ir.ArrayType):
-                    iter_kind = "array_ptr"
-                    elem_ty = ty.element
-                    arr_ptr = alloca
-                    arr_len = ty.count
+            found = (self.locals.get(name) or self.const_arrays.get(name)
+                     or self.globals.get(name))
+            if found is not None and isinstance(found[1], ir.ArrayType):
+                iter_kind = "array_ptr"
+                arr_ptr, ty = found
+                elem_ty = ty.element
+                arr_len = ty.count
 
         if iter_kind is None:
             iter_val = self._emit_for_iter_value(stmt.iter)
@@ -10508,6 +10497,17 @@ class LLVMEmitter:
         return (f"argument {n} of `{fname}`: "
                 + self._enum_as_int_message(expected, enum_name))
 
+    def _local_holds_no_fn(self, name: str) -> bool:
+        """True when `name` is a local or param whose value is no fn pointer."""
+        if name in self.locals:
+            ty = self.locals[name][1]
+        elif name in self.params:
+            ty = self.params[name][1]
+        else:
+            return False
+        return not (isinstance(ty, ir.PointerType)
+                    and isinstance(getattr(ty, 'pointee', None), ir.FunctionType))
+
     def _emit_call_inner(self, call: rast.Call) -> ir.Value:
         """Emit a function call.
 
@@ -10551,6 +10551,11 @@ class LLVMEmitter:
                                              cconv=_llvm_callconv(ritz_type.callconv),
                                              byval=self._fn_type_byval(ritz_type),
                                              sret=self._fn_type_sret(ritz_type))
+            # A local named like a fn is the local (AGAST #2407): a call of
+            # one that holds no fn value isn't the fn's.
+            if self._local_holds_no_fn(fname):
+                raise EmitError(binder_names.call_refusal(fname),
+                                call.func.span or call.span)
         else:
             # Non-identifier function expression (e.g., field access returning fn ptr)
             fn_ptr = self._emit_expr(call.func)
@@ -13686,6 +13691,7 @@ class LLVMEmitter:
     def _emit_union_match(self, expr: rast.Match, union_val: ir.Value, union_name: str) -> ir.Value:
         """Emit a match on a union type with TypePattern arms."""
         union_type, variants = self.union_types[union_name]
+        self._refuse_arm_names(expr, lambda name: False)
         self._require_covered(expr, match_coverage.union_gap(
             expr.arms, variants, self._types_equal, type_to_string))
 
@@ -13812,6 +13818,8 @@ class LLVMEmitter:
             7. Phi node for result
         """
         enum_type, variants = self.enum_types[enum_name]
+        variant_names = {variant.name for variant in variants}
+        self._refuse_arm_names(expr, lambda name: name in variant_names)
         self._require_covered(expr, match_coverage.enum_gap(
             expr.arms, [variant.name for variant in variants]))
 
@@ -13871,7 +13879,7 @@ class LLVMEmitter:
                             f"match on '{pattern.name}(inner)' first, then "
                             f"match 'inner' in a second match expression",
                             field_pattern.span or pattern.span)
-                self._refuse_payload_tests(enum_name, pattern)
+                self._refuse_payload_tests(pattern)
                 tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
                 switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
             elif isinstance(pattern, rast.IdentPattern):
@@ -14004,18 +14012,32 @@ class LLVMEmitter:
                 self._emit_drop_for_scope(scope)
         return result
 
-    def _refuse_payload_tests(self, enum_name: str, pattern: rast.VariantPattern) -> None:
+    def _is_integer_const(self, name: str) -> bool:
+        ty = self.constants[name][1] if name in self.constants else None
+        return isinstance(ty, ir.IntType) and ty.width > 1
+
+    def _refuse_arm_names(self, expr: rast.Match, tests) -> None:
+        """A top-level arm's name binds unless `tests(name)` says it's a test
+        here, and a binding can't take a module value's name (AGAST #2407).
+        Ahead of coverage, as binder_names judges every other binder."""
+        for arm in expr.arms:
+            pattern = arm.pattern
+            if not isinstance(pattern, rast.IdentPattern) or tests(pattern.name):
+                continue
+            kind = self._module_values.get(pattern.name)
+            if kind is not None:
+                raise EmitError(binder_names.refusal(kind, pattern.name),
+                                pattern.span or arm.span)
+
+    def _refuse_payload_tests(self, pattern: rast.VariantPattern) -> None:
         """A payload is bound, never tested (AGAST #2350, LANGUAGE_SPEC §8.2).
 
         The switch above reads the tag alone, so a test inside a variant was
         dropped and `Some(0)` took every `Some`. Compiling it is #1291's
         decision tree; until then, say so at the pattern.
         """
-        fields = self._get_enum_variant(enum_name, pattern.name).fields
-        for i, field_pattern in enumerate(pattern.fields):
-            # A surplus field has no type: #2408 owns the count.
-            field_type = fields[i] if i < len(fields) else None
-            shown = self._payload_test_text(field_pattern, field_type)
+        for field_pattern in pattern.fields:
+            shown = self._payload_test_text(field_pattern)
             if shown is not None:
                 raise EmitError(
                     f"a variant payload can only be bound, not tested: "
@@ -14023,29 +14045,18 @@ class LLVMEmitter:
                     f"then test the name in the arm body",
                     field_pattern.span or pattern.span)
 
-    def _payload_test_text(self, field_pattern: rast.Pattern,
-                           field_type: Optional[rast.Type]) -> Optional[str]:
+    def _payload_test_text(self, field_pattern: rast.Pattern) -> Optional[str]:
         """How `field_pattern` reads if it tests its payload, else None."""
-        if isinstance(field_pattern, rast.WildcardPattern):
+        # A name only binds: binder_names refused one named like a const or a
+        # variant before anything was emitted (AGAST #2407).
+        if isinstance(field_pattern, (rast.WildcardPattern, rast.IdentPattern)):
             return None
-        if isinstance(field_pattern, rast.IdentPattern):
-            return (field_pattern.name
-                    if self._name_tests_payload(field_pattern.name, field_type) else None)
         if isinstance(field_pattern, rast.TypePattern):
             return self._type_to_str(field_pattern.type)
         value = getattr(field_pattern, 'value', None)
         if isinstance(value, bool):
             return 'true' if value else 'false'
         return f'"{value}"' if isinstance(value, str) else str(value)
-
-    def _name_tests_payload(self, name: str, field_type: rast.Type) -> bool:
-        """The same reading a top-level arm gets: against an enum a name is its
-        variant, against an integer a name that is a `const` compares."""
-        llvm_type = self._ritz_type_to_llvm(field_type)
-        for candidate, (enum_type, _) in self.enum_types.items():
-            if enum_type == llvm_type:
-                return self._has_enum_variant(candidate, name)
-        return isinstance(llvm_type, ir.IntType) and name in self.constants
 
     def _note_match_result_type(self, expr: rast.Match, body: rast.Expr) -> None:
         """Record a move-only arm value's type on the match, inferred while
@@ -14142,6 +14153,9 @@ class LLVMEmitter:
                     and isinstance(arm.pattern.value, bool)):
                 raise EmitError("a `true` or `false` pattern needs a bool scrutinee",
                                 arm.pattern.span)
+        # A name that is an integer `const` compares (§8.2); a float or bool
+        # one would bind, and can't (AGAST #2407).
+        self._refuse_arm_names(expr, self._is_integer_const)
         gap = match_coverage.bool_gap if is_bool else match_coverage.scalar_gap
         self._require_covered(expr, gap(expr.arms, self.constants))
 
