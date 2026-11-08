@@ -77,8 +77,22 @@ Measured 2026-09-26: `./rz build mausoleum` exits 0, producing three binaries â€
 and `test_storage` binaries are now `[[test]]` files: `test/test_integration.ritz`
 starts its own `mausoleum serve --no-encryption` on a pid-derived port, and
 `test/test_storage_persistence.ritz` does the open/commit/reopen round trip.)
-`lib/` holds 18 modules and the project carries 406 `[[test]]` markers across
-19 test files. Run `./rz test mausoleum` for the current pass count.
+Run `./rz test mausoleum` for the current pass count.
+
+Persistence (AGAST #2458): with `serve --data-dir DIR`, every INSERT / UPDATE /
+DELETE is committed before it is acknowledged: dirty pages and the collection's
+root page and counters go to the WAL as one transaction, then to `data.m7m` and
+`meta.m7m`. A restart on DIR (including after `kill -9`, or a crash mid-flush)
+redoes the WAL and reopens the same collection; a checkpoint (on open, on close,
+or past 4 MiB) cuts the WAL back. `test/test_restart.ritz` restarts a store
+those ways; `projects/ritz/tools/smoke_stack.py mausoleum` does it with the
+real binaries.
+
+`mausoleum shell` and `wiki-seed` speak the encrypted protocol by default, like
+the server; pass `--no-encryption` to both for a `serve --no-encryption` server.
+The shell takes `put key=value ...`, `get <id>`, `delete <id>`, `list`, `ping`
+and `help`, reads commands from a pipe as well as a terminal, and exits 1 if any
+command failed.
 
 Not yet proven: it does **not** build with the self-hosted compiler.
 `./rz clean mausoleum && ./rz build mausoleum --compiler ritz1` fails at exit 1

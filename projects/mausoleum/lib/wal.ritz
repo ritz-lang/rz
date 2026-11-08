@@ -45,6 +45,7 @@ const WAL_REC_UPDATE: u8 = 5
 const WAL_REC_DELETE: u8 = 6
 const WAL_REC_CHECKPOINT: u8 = 7
 const WAL_REC_PAGE_WRITE: u8 = 8         # Full page write
+const WAL_REC_META: u8 = 9               # CollectionMeta snapshot (AGAST #2458)
 
 # ============================================================================
 # WAL Record Header
@@ -187,6 +188,11 @@ pub fn wal_writer_open(writer: *WalWriter) -> i32
         return ERR_IO
 
     writer.fd = fd
+
+    # Appending to an existing segment: start counting from its size.
+    var st: Stat
+    if sys_fstat2(fd, @st) == 0
+        writer.segment_pos = st.st_size
     return ERR_OK
 
 # Close WAL writer
@@ -441,6 +447,52 @@ pub fn wal_write_page(w: *WalWriter, tid: i64, prev: i64, pid: i64, p: *Page) ->
     let lsn: i64 = writer.current_lsn
     writer.current_lsn += 1
     return lsn
+
+# Write a META record: the collection's root page and counters as of this
+# transaction.  Recovery applies the last committed one, so a restart finds
+# the B-tree the redone pages belong to.
+pub fn wal_write_meta(writer: *WalWriter, txn_id: i64, prev_lsn: i64, meta: *CollectionMeta) -> i64
+    if writer == null or meta == null
+        return -1
+
+    let payload_len: i64 = sizeof(CollectionMeta)
+    var header: WalRecordHeader
+    header.lsn = writer.current_lsn
+    header.txn_id = txn_id
+    header.prev_lsn = prev_lsn
+    header.len = (WAL_HEADER_SIZE + payload_len) as i32
+    header.rec_type = WAL_REC_META
+    header.flags = 0
+    header.checksum = 0
+    header.checksum = crc16(@header as *u8, WAL_HEADER_SIZE - 2)
+
+    var err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)
+    if err != ERR_OK
+        return -1
+    err = write_bytes(writer, meta as *u8, payload_len)
+    if err != ERR_OK
+        return -1
+
+    let lsn: i64 = writer.current_lsn
+    writer.current_lsn += 1
+    return lsn
+
+# Discard every record: called once all of them are known to be in the data
+# file (checkpoint).  The fd is O_APPEND, so later writes start at 0 again.
+pub fn wal_writer_truncate(writer: *WalWriter) -> i32
+    if writer == null or writer.fd < 0
+        return ERR_INVALID
+    writer.buffer_pos = 0
+    if sys_ftruncate(writer.fd, 0) < 0
+        return ERR_IO
+    writer.segment_pos = 0
+    return ERR_OK
+
+# Bytes in the current segment, including buffered, not-yet-written ones.
+pub fn wal_writer_size(writer: *WalWriter) -> i64
+    if writer == null
+        return 0
+    return writer.segment_pos + writer.buffer_pos
 
 # Write a CHECKPOINT record
 pub fn wal_write_checkpoint(writer: *WalWriter) -> i64

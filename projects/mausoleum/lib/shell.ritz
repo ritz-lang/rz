@@ -1,0 +1,443 @@
+# lib/shell.ritz - `mausoleum shell`: line commands over a connected Client
+#
+#   help                         list the commands
+#   ping                         round-trip to the server
+#   put key=value [key=value..]  insert a document, print its id
+#                                (value: "quoted text", or digits for an int)
+#   get <id>                     print one document
+#   delete <id>                  delete one document
+#   list                         one line per document
+#   quit | exit                  disconnect
+#
+# Lines come from a LineReader, which buffers stdin itself: a single read()
+# of piped input ("ping\nquit\n") used to arrive as one "line" and every
+# command in it was answered "Unknown command" (AGAST #2458).
+#
+# shell_run returns how many commands failed, so `mausoleum shell` can exit
+# non-zero when driven from a script.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.memory
+
+import mausoleum.m7m_types
+import mausoleum.document
+import mausoleum.collection
+import mausoleum.protocol
+import mausoleum.client
+
+const SHELL_READ_BUF: i32 = 8192
+const SHELL_LINE_MAX: i32 = 4096
+const SHELL_DOC_BUF: i64 = 8192
+const SHELL_LIST_VALUE_MAX: i64 = 48
+
+# ============================================================================
+# LineReader - newline-delimited lines from an fd
+# ============================================================================
+
+struct LineReader
+    fd: i32
+    buf: [8192]u8
+    start: i32          # first unconsumed byte
+    end: i32            # one past the last buffered byte
+    eof: i32
+
+pub fn line_reader_init(r: *LineReader, fd: i32)
+    r.fd = fd
+    r.start = 0
+    r.end = 0
+    r.eof = 0
+
+# Copy the next line, without its "\n" (or "\r\n"), into out as a
+# NUL-terminated string; a line longer than out_cap - 1 is cut there.
+# Returns its length, or -1 once input is exhausted.  A last line with no
+# trailing newline is still returned.
+pub fn line_reader_next(r: *LineReader, out: *u8, out_cap: i32) -> i32
+    loop
+        var i: i32 = r.start
+        while i < r.end
+            if r.buf[i] == 10
+                return line_take(r, i, i + 1, out, out_cap)
+            i += 1
+
+        if r.eof != 0 or r.end - r.start >= SHELL_READ_BUF
+            # EOF, or a line that fills the whole buffer: hand out what is
+            # there as one line.
+            if r.start >= r.end
+                return -1
+            return line_take(r, r.end, r.end, out, out_cap)
+
+        # Compact, then read more.
+        if r.start > 0
+            let pending: i32 = r.end - r.start
+            if pending > 0
+                memmove(@r.buf[0], @r.buf[r.start], pending as i64)
+            r.start = 0
+            r.end = pending
+        let n: i64 = sys_read(r.fd, @r.buf[r.end], (SHELL_READ_BUF - r.end) as i64)
+        if n <= 0
+            r.eof = 1
+        else
+            r.end += n as i32
+
+# Line = buf[start..stop) (minus a trailing '\r'); consume up to `next`.
+fn line_take(r: *LineReader, stop: i32, next: i32, out: *u8, out_cap: i32) -> i32
+    var len: i32 = stop - r.start
+    if len > 0 and r.buf[r.start + len - 1] == 13
+        len -= 1
+    if len > out_cap - 1
+        len = out_cap - 1
+    if len > 0
+        memcpy(out, @r.buf[r.start], len as i64)
+    *(out + len) = 0
+    r.start = next
+    return len
+
+# ============================================================================
+# Parsing
+# ============================================================================
+
+fn is_space(c: u8) -> bool
+    return c == 32 or c == 9
+
+# Advance *pos past blanks; then the token [*tok_start, *tok_start + *tok_len)
+# runs to the next blank outside double quotes.  Returns 0 at end of line.
+pub fn shell_next_token(line: *u8, len: i32, pos: *i32, tok_start: *i32, tok_len: *i32) -> i32
+    var p: i32 = *pos
+    while p < len and is_space(*(line + p))
+        p += 1
+    if p >= len
+        *pos = p
+        return 0
+    let s: i32 = p
+    var quoted: bool = false
+    while p < len
+        let c: u8 = *(line + p)
+        if c == 34
+            quoted = not quoted
+        else if is_space(c) and not quoted
+            break
+        p += 1
+    *tok_start = s
+    *tok_len = p - s
+    *pos = p
+    return 1
+
+# Decimal document id: digits only, at most 18 of them.  1 = ok.
+pub fn shell_parse_id(s: *u8, len: i32, out: *i64) -> i32
+    if len <= 0 or len > 18
+        return 0
+    var v: i64 = 0
+    var i: i32 = 0
+    while i < len
+        let c: u8 = *(s + i)
+        if c < 48 or c > 57
+            return 0
+        v = v * 10 + (c - 48) as i64
+        i += 1
+    *out = v
+    return 1
+
+# Optional '-' then digits, at most 18.  1 = ok.
+fn parse_int_value(s: *u8, len: i32, out: *i64) -> i32
+    if len > 0 and *s == 45
+        var mag: i64 = 0
+        if shell_parse_id(s + 1, len - 1, @mag) == 0
+            return 0
+        *out = -mag
+        return 1
+    return shell_parse_id(s, len, out)
+
+const SHELL_PUT_NO_FIELDS: i32 = -1
+const SHELL_PUT_NOT_KEY_VALUE: i32 = -2
+const SHELL_PUT_BAD_KEY: i32 = -3
+const SHELL_PUT_TOO_MANY: i32 = -4
+
+# Fill doc from the key=value tokens of line[pos..len).  String values
+# point into `line`, which must outlive the serialization of doc.
+# Returns the number of fields, or a SHELL_PUT_* error.
+pub fn shell_build_doc(line: *u8, len: i32, pos: i32, doc: *Document) -> i32
+    var tmp: DocumentId = doc_id_invalid()
+    doc_init(doc, @tmp)
+
+    var p: i32 = pos
+    var ts: i32 = 0
+    var tl: i32 = 0
+    var n: i32 = 0
+    while shell_next_token(line, len, @p, @ts, @tl) == 1
+        let tok: *u8 = line + ts
+        var eq: i32 = 0
+        while eq < tl and *(tok + eq) != 61
+            eq += 1
+        if eq >= tl
+            return SHELL_PUT_NOT_KEY_VALUE
+        if eq == 0 or eq as i64 > MAX_KEY_LEN
+            return SHELL_PUT_BAD_KEY
+
+        var val: *u8 = tok + eq + 1
+        var vlen: i32 = tl - eq - 1
+        var field: Field
+        var iv: i64 = 0
+        if vlen >= 2 and *val == 34 and *(val + vlen - 1) == 34
+            field = field_string(val + 1, (vlen - 2) as i64)
+        else if parse_int_value(val, vlen, @iv) == 1
+            field = field_int(iv)
+        else
+            field = field_string(val, vlen as i64)
+
+        let rc: i32 = doc_set_field(doc, strview_from_ptr(tok, eq as i64), @field)
+        if rc == ERR_FULL
+            return SHELL_PUT_TOO_MANY
+        if rc != ERR_OK
+            return SHELL_PUT_BAD_KEY
+        n += 1
+    if n == 0
+        return SHELL_PUT_NO_FIELDS
+    return n
+
+# ============================================================================
+# Printing
+# ============================================================================
+
+# Print len bytes; with `one_line`, newlines become "\n" and the value is
+# cut at SHELL_LIST_VALUE_MAX bytes ("...").
+fn print_bytes(p: *u8, len: i64, one_line: i32)
+    var n: i64 = len
+    var cut: bool = false
+    if one_line != 0 and n > SHELL_LIST_VALUE_MAX
+        n = SHELL_LIST_VALUE_MAX
+        cut = true
+    var i: i64 = 0
+    while i < n
+        let c: u8 = *(p + i)
+        if one_line != 0 and c == 10
+            prints("\\n")
+        else
+            print_char(c)
+        i += 1
+    if cut
+        prints("...")
+
+fn print_field_value(f: *Field, one_line: i32)
+    let t: i32 = field_type(f)
+    if t == FIELD_INT
+        print_i64(field_as_int(f))
+    else if t == FIELD_BOOL
+        if field_as_bool(f) != 0
+            prints("true")
+        else
+            prints("false")
+    else if t == FIELD_STRING
+        print_char(34)
+        print_bytes(field_string_ptr(f), field_string_len(f), one_line)
+        print_char(34)
+    else if t == FIELD_NULL
+        prints("null")
+    else if t == FIELD_BYTES
+        prints("<")
+        print_i64(field_bytes_len(f))
+        prints(" bytes>")
+    else
+        prints("<field type ")
+        print_i64(t as i64)
+        prints(">")
+
+# Print a serialized document: "<id> key=value ..." on one line, or the id
+# then "  key = value" per line.
+pub fn shell_print_doc(id: i64, data: *u8, len: i32, one_line: i32)
+    var doc: Document
+    print_i64(id)
+    if doc_deserialize(data, len as i64, @doc) != ERR_OK
+        prints("  <undecodable document, ")
+        print_i64(len as i64)
+        prints(" bytes>\n")
+        return
+    if one_line == 0
+        prints("\n")
+    var i: i32 = 0
+    while i < doc.field_count
+        let e: *FieldEntry = @doc.fields[i]
+        if one_line != 0
+            prints("  ")
+            prints_cstr(@e.key[0])
+            prints("=")
+        else
+            prints("  ")
+            prints_cstr(@e.key[0])
+            prints(" = ")
+        print_field_value(@e.value, one_line)
+        if one_line == 0
+            prints("\n")
+        i += 1
+    if one_line != 0
+        prints("\n")
+
+fn shell_list_cb(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+    shell_print_doc(doc_id, data, len, 1)
+    return 0
+
+# ============================================================================
+# The command loop
+# ============================================================================
+
+pub fn shell_print_help()
+    prints("Commands:\n")
+    prints("  put key=value [key=value ...]  insert a document, print its id\n")
+    prints("                                 (value: \"quoted text\", or digits for an int)\n")
+    prints("  get <id>                       print one document\n")
+    prints("  delete <id>                    delete one document\n")
+    prints("  list                           one line per document\n")
+    prints("  ping                           round-trip to the server\n")
+    prints("  help                           this list\n")
+    prints("  quit | exit                    disconnect\n")
+
+fn tok_is(line: *u8, ts: i32, tl: i32, word: StrView) -> bool
+    if tl as i64 != word.len
+        return false
+    return memcmp(line + ts, word.ptr, word.len) == 0
+
+fn report_error(what: StrView, client: *Client)
+    prints("Error: ")
+    prints(what)
+    prints(" (error ")
+    print_i64(client_last_error(client) as i64)
+    prints(")\n")
+
+# Read the id argument of get/delete. 1 = ok; prints usage otherwise.
+fn id_arg(line: *u8, len: i32, pos: *i32, cmd: StrView, out: *i64) -> i32
+    var ts: i32 = 0
+    var tl: i32 = 0
+    if shell_next_token(line, len, pos, @ts, @tl) == 1
+        if shell_parse_id(line + ts, tl, out) == 1
+            var p2: i32 = *pos
+            if shell_next_token(line, len, @p2, @ts, @tl) == 0
+                return 1
+    prints("Usage: ")
+    prints(cmd)
+    prints(" <id>   (a decimal document id, as printed by put / list)\n")
+    return 0
+
+# Run commands from `input` until quit/exit or end of input.  Returns the
+# number of commands that failed.
+pub fn shell_run(client: *Client, input: i32) -> i32
+    var reader: LineReader
+    line_reader_init(@reader, input)
+    var line: [4096]u8
+    var failures: i32 = 0
+
+    loop
+        if client_is_connected(client) == 0
+            prints("Error: connection to the server lost\n")
+            failures += 1
+            break
+        prints("m7m> ")
+        let len: i32 = line_reader_next(@reader, @line[0], SHELL_LINE_MAX)
+        if len < 0
+            prints("\n")
+            break
+        let lp: *u8 = @line[0]
+        var pos: i32 = 0
+        var ts: i32 = 0
+        var tl: i32 = 0
+        if shell_next_token(lp, len, @pos, @ts, @tl) == 0
+            continue
+
+        if tok_is(lp, ts, tl, "quit") or tok_is(lp, ts, tl, "exit")
+            break
+
+        else if tok_is(lp, ts, tl, "help")
+            shell_print_help()
+
+        else if tok_is(lp, ts, tl, "ping")
+            if client_ping(client) == 0
+                prints("PONG\n")
+            else
+                report_error("ping failed", client)
+                failures += 1
+
+        else if tok_is(lp, ts, tl, "put")
+            var doc: Document
+            let nf: i32 = shell_build_doc(lp, len, pos, @doc)
+            if nf < 0
+                if nf == SHELL_PUT_NO_FIELDS
+                    prints("Usage: put key=value [key=value ...]\n")
+                else if nf == SHELL_PUT_NOT_KEY_VALUE
+                    prints("Error: every argument of put is key=value\n")
+                else if nf == SHELL_PUT_TOO_MANY
+                    prints("Error: too many fields\n")
+                else
+                    prints("Error: a key is empty or longer than 63 bytes\n")
+                failures += 1
+            else
+                var buf: [8192]u8
+                let size: i64 = doc_serialize(@doc, @buf[0], SHELL_DOC_BUF)
+                if size < 0
+                    prints("Error: document too large\n")
+                    failures += 1
+                else
+                    let id: i64 = client_insert(client, @buf[0], size as i32)
+                    if id < 0
+                        report_error("put failed", client)
+                        failures += 1
+                    else
+                        prints("inserted ")
+                        print_i64(id)
+                        prints("\n")
+
+        else if tok_is(lp, ts, tl, "get")
+            var id: i64 = 0
+            if id_arg(lp, len, @pos, "get", @id) == 0
+                failures += 1
+            else
+                var data: *u8 = null
+                var dlen: i32 = 0
+                let rc: i32 = client_get(client, id, @data, @dlen)
+                if rc == 1
+                    shell_print_doc(id, data, dlen, 0)
+                else if rc == 0
+                    prints("not found: ")
+                    print_i64(id)
+                    prints("\n")
+                    failures += 1
+                else
+                    report_error("get failed", client)
+                    failures += 1
+
+        else if tok_is(lp, ts, tl, "delete")
+            var id: i64 = 0
+            if id_arg(lp, len, @pos, "delete", @id) == 0
+                failures += 1
+            else
+                let rc: i32 = client_delete(client, id)
+                if rc == 1
+                    prints("deleted ")
+                    print_i64(id)
+                    prints("\n")
+                else if rc == 0
+                    prints("not found: ")
+                    print_i64(id)
+                    prints("\n")
+                    failures += 1
+                else
+                    report_error("delete failed", client)
+                    failures += 1
+
+        else if tok_is(lp, ts, tl, "list")
+            let n: i32 = client_scan(client, shell_list_cb as *u8, null)
+            if n < 0
+                report_error("list failed", client)
+                failures += 1
+            else
+                prints("(")
+                print_i64(n as i64)
+                prints(" document(s))\n")
+
+        else
+            prints("Unknown command: ")
+            print_bytes(lp + ts, tl as i64, 1)
+            prints(". Try: help\n")
+            failures += 1
+
+    return failures

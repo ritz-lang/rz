@@ -1,0 +1,131 @@
+# test/test_shell.ritz - `mausoleum shell` input handling (AGAST #2458)
+#
+# The shell read stdin with one read() per "line": piped input such as
+# "ping\nquit\n" arrived in one read and was answered "Unknown command".
+# LineReader must split it, and put's key=value parser must build the
+# document the server stores.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview
+
+import lib.m7m_types
+import lib.document
+import lib.collection
+import lib.client
+import lib.shell
+
+# A pipe whose read end holds `data` and whose write end is closed.
+fn pipe_with(data: *u8, len: i64) -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) < 0
+        return -1
+    sys_write(fds[1], data, len)
+    sys_close(fds[1])
+    return fds[0]
+
+fn eq(s: *u8, lit: *u8) -> bool
+    return strcmp(s, lit) == 0
+
+[[test]]
+fn test_line_reader_splits_one_read_into_lines() -> i32
+    let fd: i32 = pipe_with(c"ping\nquit\n", 10)
+    var r: LineReader
+    line_reader_init(@r, fd)
+    var out: [64]u8
+    var rc: i32 = 0
+    if line_reader_next(@r, @out[0], 64) != 4 or not eq(@out[0], c"ping")
+        rc = 1
+    else if line_reader_next(@r, @out[0], 64) != 4 or not eq(@out[0], c"quit")
+        rc = 2
+    else if line_reader_next(@r, @out[0], 64) != -1
+        rc = 3
+    sys_close(fd)
+    return rc
+
+[[test]]
+fn test_line_reader_crlf_blank_and_unterminated_last_line() -> i32
+    let fd: i32 = pipe_with(c"get 1\r\n\nlist", 12)
+    var r: LineReader
+    line_reader_init(@r, fd)
+    var out: [64]u8
+    var rc: i32 = 0
+    if line_reader_next(@r, @out[0], 64) != 5 or not eq(@out[0], c"get 1")
+        rc = 1
+    else if line_reader_next(@r, @out[0], 64) != 0
+        rc = 2
+    else if line_reader_next(@r, @out[0], 64) != 4 or not eq(@out[0], c"list")
+        rc = 3
+    else if line_reader_next(@r, @out[0], 64) != -1
+        rc = 4
+    sys_close(fd)
+    return rc
+
+[[test]]
+fn test_line_reader_cuts_long_line_and_keeps_going() -> i32
+    let fd: i32 = pipe_with(c"abcdefghij\nok\n", 14)
+    var r: LineReader
+    line_reader_init(@r, fd)
+    var out: [8]u8
+    var rc: i32 = 0
+    if line_reader_next(@r, @out[0], 8) != 7 or not eq(@out[0], c"abcdefg")
+        rc = 1
+    else if line_reader_next(@r, @out[0], 8) != 2 or not eq(@out[0], c"ok")
+        rc = 2
+    sys_close(fd)
+    return rc
+
+[[test]]
+fn test_build_doc_strings_quotes_and_ints() -> i32
+    let line: *u8 = c"put slug=home title=\"Hello world\" n=42 neg=-3"
+    let len: i32 = strlen(line) as i32
+    var doc: Document
+    if shell_build_doc(line, len, 3, @doc) != 4
+        return 1
+    var f: Field
+    if doc_get_field(@doc, "slug", @f) != ERR_OK or field_type(@f) != FIELD_STRING
+        return 2
+    if field_string_len(@f) != 4 or memcmp(field_string_ptr(@f), c"home", 4) != 0
+        return 3
+    if doc_get_field(@doc, "title", @f) != ERR_OK or field_string_len(@f) != 11
+        return 4
+    if memcmp(field_string_ptr(@f), c"Hello world", 11) != 0
+        return 5
+    if doc_get_field(@doc, "n", @f) != ERR_OK or field_type(@f) != FIELD_INT or field_as_int(@f) != 42
+        return 6
+    if doc_get_field(@doc, "neg", @f) != ERR_OK or field_as_int(@f) != -3
+        return 7
+    # A quoted number stays a string.
+    let l2: *u8 = c"put v=\"42\""
+    if shell_build_doc(l2, strlen(l2) as i32, 3, @doc) != 1
+        return 8
+    if doc_get_field(@doc, "v", @f) != ERR_OK or field_type(@f) != FIELD_STRING
+        return 9
+    return 0
+
+[[test]]
+fn test_build_doc_rejects_bad_input() -> i32
+    var doc: Document
+    let a: *u8 = c"put"
+    if shell_build_doc(a, 3, 3, @doc) != SHELL_PUT_NO_FIELDS
+        return 1
+    let b: *u8 = c"put justtext"
+    if shell_build_doc(b, strlen(b) as i32, 3, @doc) != SHELL_PUT_NOT_KEY_VALUE
+        return 2
+    let c: *u8 = c"put =v"
+    if shell_build_doc(c, strlen(c) as i32, 3, @doc) != SHELL_PUT_BAD_KEY
+        return 3
+    return 0
+
+[[test]]
+fn test_parse_id() -> i32
+    var v: i64 = 0
+    if shell_parse_id(c"4294967297", 10, @v) != 1 or v != 4294967297
+        return 1
+    if shell_parse_id(c"12x", 3, @v) != 0
+        return 2
+    if shell_parse_id(c"", 0, @v) != 0
+        return 3
+    if shell_parse_id(c"-1", 2, @v) != 0
+        return 4
+    return 0

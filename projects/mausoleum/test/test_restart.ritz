@@ -1,0 +1,363 @@
+# test/test_restart.ritz - A collection survives a restart on its data directory
+#
+# AGAST #2458: `mausoleum serve -d DIR` returned every document while it ran
+# and none after a restart on the same DIR, and the WAL stayed 0 bytes.  These
+# tests drive the same open / write / commit sequence the server runs
+# (collection_open_storage + collection_commit) and then restart it three ways:
+#
+#   - cleanly (storage_destroy, what SIGTERM does),
+#   - abandoned after a commit (no close at all: what kill -9 leaves behind),
+#   - abandoned after the WAL commit but before a single data page reached
+#     data.m7m (a crash mid-flush): only WAL redo can bring the documents back.
+#
+# Each test uses its own /tmp/m7m_restart_<pid>_<tag> directory and removes it.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.option
+
+import lib.m7m_types
+import lib.page
+import lib.buffer_pool
+import lib.storage
+import lib.document
+import lib.collection
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn append_uint(buf: *u8, pos: i64, n: i32) -> i64
+    var digits: [16]u8
+    var len: i32 = 0
+    var v: i32 = n
+    if v == 0
+        digits[0] = 48
+        len = 1
+    while v > 0
+        digits[len] = ((v % 10) + 48) as u8
+        v = v / 10
+        len += 1
+    var p: i64 = pos
+    while len > 0
+        len -= 1
+        *(buf + p) = digits[len]
+        p += 1
+    return p
+
+fn append_cstr(buf: *u8, pos: i64, s: *u8) -> i64
+    var p: i64 = pos
+    var i: i64 = 0
+    while *(s + i) != 0
+        *(buf + p) = *(s + i)
+        p += 1
+        i += 1
+    return p
+
+# "/tmp/m7m_restart_<pid>_<tag>" into buf (NUL-terminated).
+fn make_tmp_path(buf: *u8, tag: *u8)
+    var p: i64 = append_cstr(buf, 0, c"/tmp/m7m_restart_")
+    p = append_uint(buf, p, sys_getpid())
+    p = append_cstr(buf, p, c"_")
+    p = append_cstr(buf, p, tag)
+    *(buf + p) = 0
+
+# Remove every entry of a flat directory, then the directory.
+fn rm_dir_flat(dir: *u8)
+    let fd: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
+    if fd >= 0
+        var ents: [4096]u8
+        var child: [512]u8
+        loop
+            let n: i64 = sys_getdents64(fd, @ents[0], 4096)
+            if n <= 0
+                break
+            var off: i64 = 0
+            while off < n
+                let rec: *u8 = @ents[off]
+                let reclen: i64 = (*(rec + 16) as i64) + ((*(rec + 17) as i64) << 8)
+                let name: *u8 = rec + 19
+                let is_dot: bool = *name == 46 and *(name + 1) == 0
+                let is_dotdot: bool = *name == 46 and *(name + 1) == 46 and *(name + 2) == 0
+                if not is_dot and not is_dotdot
+                    var p: i64 = append_cstr(@child[0], 0, dir)
+                    p = append_cstr(@child[0], p, c"/")
+                    p = append_cstr(@child[0], p, name)
+                    child[p] = 0
+                    sys_unlink(@child[0])
+                off += reclen
+        sys_close(fd)
+    sys_rmdir(dir)
+
+# Size in bytes of <dir>/<name>, or -1 if it cannot be opened.
+fn file_size(dir: *u8, name: *u8) -> i64
+    var path: [512]u8
+    var p: i64 = append_cstr(@path[0], 0, dir)
+    p = append_cstr(@path[0], p, name)
+    path[p] = 0
+    let fd: i32 = sys_open(@path[0], O_RDONLY)
+    if fd < 0
+        return -1
+    var st: Stat
+    var size: i64 = -1
+    if sys_fstat2(fd, @st) == 0
+        size = st.st_size
+    sys_close(fd)
+    return size
+
+fn open_store(path: *u8) -> *Storage
+    let opt: Option<*Storage> = storage_open(path)
+    if option_is_none<*Storage>(@opt) == 1
+        return null
+    return option_unwrap_or<*Storage>(@opt, null)
+
+# A ~240-byte document: {"n": i, "body": <filler>}.
+fn insert_numbered(col: *Collection, i: i32, out_id: *DocumentId) -> i32
+    var doc: Document
+    var tmp: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp)
+    var nf: Field = field_int(i as i64)
+    doc_set_field(@doc, "n", @nf)
+    let body: StrView = "Where data is entombed forever. Where data is entombed forever. Where data is entombed forever. Where data is entombed forever. Where data is entombed forever. Where data is entombed forever."
+    var bf: Field = field_string(body.ptr, body.len)
+    doc_set_field(@doc, "body", @bf)
+    return collection_insert(col, @doc, out_id)
+
+# 1 if document `seq` of collection 1 exists and its "n" field is `seq`.
+fn has_numbered(col: *Collection, seq: i32) -> i32
+    var id: DocumentId = doc_id_new(1, seq)
+    var doc: Document
+    if collection_get(col, @id, @doc) != ERR_OK
+        return 0
+    var nf: Field
+    if doc_get_field(@doc, "n", @nf) != ERR_OK
+        return 0
+    if field_as_int(@nf) != seq as i64
+        return 0
+    return 1
+
+# Open DIR, insert `count` documents numbered 1..count, committing after each
+# exactly as the server does.  Returns the open storage (caller decides how
+# it "stops"), or null on failure.
+fn seed(path: *u8, col: *Collection, count: i32) -> *Storage
+    let s: *Storage = open_store(path)
+    if s == null
+        return null
+    if collection_open_storage(col, s, 1) != ERR_OK
+        return null
+    var i: i32 = 1
+    while i <= count
+        var id: DocumentId
+        if insert_numbered(col, i, @id) != ERR_OK
+            return null
+        if doc_id_sequence(@id) != i
+            return null
+        if collection_commit(col, s) != ERR_OK
+            return null
+        i += 1
+    return s
+
+# Reopen DIR and check documents 1..count are all there, the count matches
+# and the next insert gets sequence count+1 (no id reuse).  0 = ok.
+fn reopen_and_check(path: *u8, count: i32) -> i32
+    let s: *Storage = open_store(path)
+    if s == null
+        return 101
+    var col: Collection
+    if collection_open_storage(@col, s, 1) != ERR_OK
+        storage_destroy(s)
+        return 102
+    var i: i32 = 1
+    while i <= count
+        if has_numbered(@col, i) == 0
+            storage_destroy(s)
+            return 103
+        i += 1
+    if collection_count(@col) != count as i64
+        storage_destroy(s)
+        return 104
+    var id: DocumentId
+    if insert_numbered(@col, count + 1, @id) != ERR_OK
+        storage_destroy(s)
+        return 105
+    if doc_id_sequence(@id) != count + 1
+        storage_destroy(s)
+        return 106
+    collection_commit(@col, s)
+    collection_destroy(@col)
+    storage_destroy(s)
+    return 0
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+# SIGTERM path: commit, close, reopen.
+[[test]]
+fn test_restart_after_close_keeps_documents() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"close")
+    rm_dir_flat(@path[0])
+
+    var col: Collection
+    let s: *Storage = seed(@path[0], @col, 5)
+    if s == null
+        rm_dir_flat(@path[0])
+        return 1
+    collection_destroy(@col)
+    storage_destroy(s)
+
+    var rc: i32 = reopen_and_check(@path[0], 5)
+    # A second restart (with one more document from the first) still holds.
+    if rc == 0
+        rc = reopen_and_check(@path[0], 6)
+    rm_dir_flat(@path[0])
+    return rc
+
+# kill -9 path: commit, then never close.  The WAL must have been written.
+[[test]]
+fn test_restart_after_abandon_keeps_documents() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"abandon")
+    rm_dir_flat(@path[0])
+
+    var col: Collection
+    let s: *Storage = seed(@path[0], @col, 5)
+    if s == null
+        rm_dir_flat(@path[0])
+        return 1
+    # The ticket's symptom: wal.wal.000000 stayed 0 bytes after writes.
+    # Five committed inserts log at least one full page image.
+    if file_size(@path[0], c"/wal.wal.000000") < 4096
+        rm_dir_flat(@path[0])
+        return 2
+    # No storage_destroy: the process "dies" here.
+
+    let rc: i32 = reopen_and_check(@path[0], 5)
+    rm_dir_flat(@path[0])
+    return rc
+
+# Crash mid-flush: the WAL holds the committed pages, data.m7m does not.
+[[test]]
+fn test_restart_recovers_from_wal_alone() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"walonly")
+    rm_dir_flat(@path[0])
+
+    let s: *Storage = open_store(@path[0])
+    if s == null
+        return 1
+    var col: Collection
+    if collection_open_storage(@col, s, 1) != ERR_OK
+        rm_dir_flat(@path[0])
+        return 2
+    let data_before: i64 = file_size(@path[0], c"/data.m7m")
+
+    var i: i32 = 1
+    while i <= 5
+        var id: DocumentId
+        if insert_numbered(@col, i, @id) != ERR_OK
+            rm_dir_flat(@path[0])
+            return 3
+        i += 1
+    var meta: CollectionMeta
+    collection_meta(@col, @meta)
+    storage_set_collection_meta(s, @meta)
+    # WAL commit only - the "crash" comes before the data pages are written.
+    if storage_wal_commit(s) != ERR_OK
+        rm_dir_flat(@path[0])
+        return 4
+    if file_size(@path[0], c"/data.m7m") != data_before
+        rm_dir_flat(@path[0])
+        return 5  # pages reached data.m7m, so this would not test redo
+
+    let rc: i32 = reopen_and_check(@path[0], 5)
+    rm_dir_flat(@path[0])
+    return rc
+
+# Enough documents to split the root: the root page moves and the tree
+# grows a level.  Both must come back, or lookups walk the wrong pages.
+[[test]]
+fn test_restart_after_root_split_keeps_documents() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"split")
+    rm_dir_flat(@path[0])
+
+    var col: Collection
+    let s: *Storage = seed(@path[0], @col, 200)
+    if s == null
+        rm_dir_flat(@path[0])
+        return 1
+    var meta: CollectionMeta
+    collection_meta(@col, @meta)
+    if meta.tree_height < 2
+        rm_dir_flat(@path[0])
+        return 2  # never split: the test would not cover a moved root
+    collection_destroy(@col)
+    storage_destroy(s)
+
+    let rc: i32 = reopen_and_check(@path[0], 200)
+    rm_dir_flat(@path[0])
+    return rc
+
+# Deletes persist too, and the count follows them.
+[[test]]
+fn test_restart_after_delete_keeps_it_deleted() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"delete")
+    rm_dir_flat(@path[0])
+
+    var col: Collection
+    let s: *Storage = seed(@path[0], @col, 3)
+    if s == null
+        rm_dir_flat(@path[0])
+        return 1
+    var id: DocumentId = doc_id_new(1, 2)
+    if collection_delete(@col, @id) != ERR_OK
+        rm_dir_flat(@path[0])
+        return 2
+    collection_commit(@col, s)
+    # abandoned, like kill -9
+
+    let s2: *Storage = open_store(@path[0])
+    if s2 == null
+        rm_dir_flat(@path[0])
+        return 3
+    var col2: Collection
+    var rc: i32 = 0
+    if collection_open_storage(@col2, s2, 1) != ERR_OK
+        rc = 4
+    else if has_numbered(@col2, 1) == 0 or has_numbered(@col2, 3) == 0
+        rc = 5
+    else if has_numbered(@col2, 2) != 0
+        rc = 6
+    else if collection_count(@col2) != 2
+        rc = 7
+    storage_destroy(s2)
+    rm_dir_flat(@path[0])
+    return rc
+
+# A clean close checkpoints: the WAL is cut back to (at most) its checkpoint
+# record instead of growing forever across restarts.
+[[test]]
+fn test_close_checkpoints_the_wal() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"ckpt")
+    rm_dir_flat(@path[0])
+
+    var col: Collection
+    let s: *Storage = seed(@path[0], @col, 5)
+    if s == null
+        rm_dir_flat(@path[0])
+        return 1
+    let wal_open: i64 = storage_wal_size(s)
+    collection_destroy(@col)
+    storage_destroy(s)
+    let wal_closed: i64 = file_size(@path[0], c"/wal.wal.000000")
+    rm_dir_flat(@path[0])
+    if wal_open < 4096
+        return 2  # 5 committed writes logged less than one page image
+    if wal_closed < 0 or wal_closed > 64
+        return 3
+    return 0

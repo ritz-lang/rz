@@ -12,7 +12,8 @@
 #
 # Usage:
 #   mausoleum serve [--port PORT]     Start the encrypted database server
-#   mausoleum shell [--host HOST] [--port PORT]  Connect to server with interactive shell
+#   mausoleum shell [--host HOST] [--port PORT] [--no-encryption]
+#                                     Shell: put/get/delete/list documents
 #   mausoleum version                 Print version information
 #   mausoleum help                    Print help
 
@@ -41,6 +42,7 @@ import mausoleum.server_async
 import mausoleum.client
 import mausoleum.protocol
 import mausoleum.encrypted_channel
+import mausoleum.shell
 
 # ============================================================================
 # Constants
@@ -165,6 +167,9 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
                     i += 2
                 else
                     i += 1
+            else if arg_eq(arg, "--no-encryption") != 0
+                args.no_encryption = 1
+                i += 1
             else
                 i += 1
         return
@@ -196,7 +201,9 @@ fn print_help()
     prints("\n")
     prints("Usage:\n")
     prints("  mausoleum serve [OPTIONS]               Start the server\n")
-    prints("  mausoleum shell [--host H] [--port P]   Connect to server with interactive shell\n")
+    prints("  mausoleum shell [--host H] [--port P] [--no-encryption]\n")
+    prints("                                          Connect to a server: put/get/delete/list\n")
+    prints("                                          (exits 1 if any command failed)\n")
     prints("  mausoleum version                       Print version information\n")
     prints("  mausoleum help                          Print this help\n")
     prints("\n")
@@ -250,13 +257,12 @@ fn print_i32(n: i32)
 # Collection Metadata Persistence Helper
 # ============================================================================
 
-# Save collection metadata to storage for persistence across restarts
-fn save_collection_metadata(storage: *Storage, col: *Collection)
+# Commit a write (WAL, data pages, collection meta) so it survives a restart
+# on the same --data-dir, including kill -9.  No-op in in-memory mode.
+fn commit_write(storage: *Storage, col: *Collection)
     if storage == null or col == null
         return
-    storage_set_root_page_id(storage, collection_root_page_id(col))
-    storage_set_next_sequence(storage, collection_next_sequence(col))
-    storage_set_doc_count(storage, collection_doc_count(col))
+    collection_commit(col, storage)
 
 # ============================================================================
 # Serve Command - Encrypted Database Server
@@ -316,8 +322,15 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
     var collection: Collection
     var col_result: i32 = ERR_OK
 
-    # TODO: Implement collection persistence - for now always create new
-    col_result = collection_init(@collection, pool, 1)
+    if storage != null
+        # Reopen the collection this data directory holds (or start one).
+        col_result = collection_open_storage(@collection, storage, 1)
+        if col_result >= 0
+            prints("Loaded ")
+            print_i64(collection_count(@collection))
+            prints(" document(s).\n")
+    else
+        col_result = collection_init(@collection, pool, 1)
 
     if col_result < 0
         prints("Error: Failed to create/load collection\n")
@@ -370,7 +383,7 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
     print_i32(port)
     prints("\n")
     prints("Press Ctrl+C to stop.\n")
-    prints("Note: Data is flushed after each write operation.\n")
+    prints("Note: Each write is committed (WAL + data file) before it is acknowledged.\n")
     prints("\n")
 
     # Accept loop selection — phase 7 flipped async to the default:
@@ -535,27 +548,21 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
 
         else if msg_type == MSG_INSERT
             handle_insert(@reader, @resp, request_id, collection)
-            # Flush to disk and update metadata after insert
-            if storage != null
-                save_collection_metadata(storage, collection)
-                storage_flush(storage)
+            # Commit (WAL + data + collection meta) after insert
+            commit_write(storage, collection)
 
         else if msg_type == MSG_GET
             handle_get(@reader, @resp, request_id, collection)
 
         else if msg_type == MSG_UPDATE
             handle_update(@reader, @resp, request_id, collection)
-            # Flush to disk and update metadata after update
-            if storage != null
-                save_collection_metadata(storage, collection)
-                storage_flush(storage)
+            # Commit (WAL + data + collection meta) after update
+            commit_write(storage, collection)
 
         else if msg_type == MSG_DELETE
             handle_delete(@reader, @resp, request_id, collection)
-            # Flush to disk and update metadata after delete
-            if storage != null
-                save_collection_metadata(storage, collection)
-                storage_flush(storage)
+            # Commit (WAL + data + collection meta) after delete
+            commit_write(storage, collection)
 
         else if msg_type == MSG_TXN_BEGIN
             if storage != null
@@ -986,27 +993,21 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, collectio
 
         else if msg_type == MSG_INSERT
             handle_insert(@reader, @resp, request_id, collection)
-            # Flush to disk and update metadata after insert
-            if storage != null
-                save_collection_metadata(storage, collection)
-                storage_flush(storage)
+            # Commit (WAL + data + collection meta) after insert
+            commit_write(storage, collection)
 
         else if msg_type == MSG_GET
             handle_get(@reader, @resp, request_id, collection)
 
         else if msg_type == MSG_UPDATE
             handle_update(@reader, @resp, request_id, collection)
-            # Flush to disk and update metadata after update
-            if storage != null
-                save_collection_metadata(storage, collection)
-                storage_flush(storage)
+            # Commit (WAL + data + collection meta) after update
+            commit_write(storage, collection)
 
         else if msg_type == MSG_DELETE
             handle_delete(@reader, @resp, request_id, collection)
-            # Flush to disk and update metadata after delete
-            if storage != null
-                save_collection_metadata(storage, collection)
-                storage_flush(storage)
+            # Commit (WAL + data + collection meta) after delete
+            commit_write(storage, collection)
 
         else if msg_type == MSG_TXN_BEGIN
             if storage != null
@@ -1052,121 +1053,51 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, collectio
 # Shell Command - Interactive Client
 # ============================================================================
 
-fn cmd_shell(host: StrView, port: i32) -> i32
+fn cmd_shell(host: StrView, port: i32, no_encryption: i32) -> i32
     prints("Mausoleum Shell\n")
     prints("Connecting to ")
     # Print StrView (it's null-terminated since it's a literal or from strview_from_cstr)
     prints_cstr(host.ptr)
     prints(":")
     print_i32(port)
-    prints(" (encrypted)...\n")
+    if no_encryption != 0
+        prints(" (plain)...\n")
+    else
+        prints(" (encrypted)...\n")
 
-    # Create socket
-    var sock: Socket = socket_tcp()
-    if sock.fd < 0
-        prints("Error: Failed to create socket\n")
+    let client: *Client = client_new()
+    if client == null
+        prints("Error: Failed to create client\n")
         return 1
 
-    # Connect to server - socket_connect needs *u8, use .ptr at FFI boundary
-    let result: i32 = socket_connect(@sock, host.ptr, port)
-    if result < 0
-        prints("Error: Failed to connect to server\n")
-        socket_close(@sock)
+    var rc: i32 = 0
+    if no_encryption != 0
+        rc = client_connect(client, host.ptr, port, "shell", 5)
+    else
+        rc = client_connect_encrypted(client, host.ptr, port, "shell", 5)
+    if rc < 0
+        prints("Error: Failed to connect to server (error ")
+        print_i32(rc)
+        prints(")\n")
+        client_free(client)
         return 1
 
-    # Initialize encrypted channel (channel takes ownership of socket)
-    var channel: EncryptedChannel
-    let sock_fd: i32 = sock.fd
-    if channel_init_client(@channel, sock) < 0
-        prints("Error: Channel init failed\n")
-        sys_close(sock_fd)
-        return 1
-
-    # Perform handshake
-    prints("Performing encrypted handshake...\n")
-    if channel_handshake_client(@channel) < 0
-        prints("Error: Handshake failed\n")
-        channel_free(@channel)
-        return 1
-
-    prints("Encrypted session established.\n")
+    if no_encryption != 0
+        prints("Session established (unencrypted).\n")
+    else
+        prints("Encrypted session established.\n")
     prints("\n")
-    prints("Commands: ping, quit\n")
+    shell_print_help()
     prints("\n")
 
-    # Interactive loop
-    shell_loop(@channel)
+    let failures: i32 = shell_run(client, STDIN)
 
-    # Cleanup (channel_free closes the socket)
-    channel_free(@channel)
-
+    client_disconnect(client)
+    client_free(client)
     prints("Disconnected.\n")
+    if failures > 0
+        return 1
     return 0
-
-fn shell_loop(ch: *EncryptedChannel)
-    var line_buf: [256]u8
-    var request_id: i32 = 1
-    var msg_buf: [512]u8
-
-    loop
-        # Print prompt
-        prints("m7m> ")
-
-        # Read line from stdin
-        let n: i64 = sys_read(STDIN, @line_buf[0], 255)
-        if n <= 0
-            break
-
-        # Null-terminate and strip newlines
-        var len: i32 = n as i32
-        line_buf[len] = 0
-
-        # Strip trailing newline/carriage return
-        while len > 0 and (line_buf[len - 1] == 10 or line_buf[len - 1] == 13)
-            len -= 1
-            line_buf[len] = 0
-
-        # Parse command - convert line buffer to StrView for comparison
-        let line: StrView = strview_from_ptr(@line_buf[0], len as i64)
-
-        if strview_eq_cstr(@line, "quit") or strview_eq_cstr(@line, "exit")
-            # Send disconnect
-            var resp: MessageBuffer
-            msgbuf_init(@resp, @msg_buf[0], 512)
-            build_disconnect(@resp, request_id)
-            channel_send(ch, msgbuf_data(@resp), msgbuf_len(@resp))
-            break
-
-        else if strview_eq_cstr(@line, "ping")
-            # Send ping
-            var req: MessageBuffer
-            msgbuf_init(@req, @msg_buf[0], 512)
-            build_ping(@req, request_id)
-            request_id += 1
-
-            if channel_send(ch, msgbuf_data(@req), msgbuf_len(@req)) < 0
-                prints("Error: Send failed\n")
-                break
-
-            # Receive response
-            var recv_buf: [512]u8
-            let recv_n: i32 = channel_recv(ch, @recv_buf[0], 512)
-            if recv_n < 0
-                prints("Error: Receive failed\n")
-                break
-
-            var reader: MessageReader
-            if msgreader_init(@reader, @recv_buf[0], recv_n) == PROTO_OK
-                let msg_type: i32 = msgreader_msg_type(@reader)
-                if msg_type == MSG_PONG
-                    prints("PONG received.\n")
-                else
-                    prints("Unexpected response.\n")
-            else
-                prints("Parse error.\n")
-
-        else if line_buf[0] != 0
-            prints("Unknown command. Try: ping, quit\n")
 
 # ============================================================================
 # Main Entry Point
@@ -1188,6 +1119,6 @@ pub fn main(argc: i32, argv: **u8) -> i32
         return cmd_serve(args.port, args.data_dir, args.no_encryption, args.serial_mode)
 
     if args.command == CMD_SHELL
-        return cmd_shell(args.host, args.port)
+        return cmd_shell(args.host, args.port, args.no_encryption)
 
     return 0

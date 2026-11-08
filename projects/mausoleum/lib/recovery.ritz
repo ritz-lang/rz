@@ -73,6 +73,10 @@ struct RecoveryManager
     # Recovery stats
     stats: RecoveryStats
 
+    # Last committed WAL_REC_META seen by redo (has_meta == 1 if any)
+    has_meta: i32
+    meta: CollectionMeta
+
 # ============================================================================
 # Recovery Manager Creation/Destruction
 # ============================================================================
@@ -115,6 +119,8 @@ pub fn recovery_mgr_new(pool: *BufferPool, wal_path: *u8) -> *RecoveryManager
     mgr.stats.pages_recovered = 0
     mgr.stats.checkpoint_lsn = 0
     mgr.stats.recovery_lsn = 0
+    mgr.has_meta = 0
+    collection_meta_clear(@mgr.meta)
 
     return mgr
 
@@ -182,6 +188,8 @@ pub fn recovery_recover(mgr: *RecoveryManager) -> i32
     mgr.stats.txns_aborted = 0
     mgr.stats.pages_recovered = 0
     mgr.txn_count = 0
+    mgr.has_meta = 0
+    collection_meta_clear(@mgr.meta)
 
     # Build WAL file path
     var path_buf: [256]u8
@@ -266,7 +274,7 @@ fn recovery_analysis_pass(mgr: *RecoveryManager, reader: *WalReader) -> i32
         else if header.rec_type == WAL_REC_CHECKPOINT
             mgr.stats.checkpoint_lsn = header.lsn
 
-        else if header.rec_type == WAL_REC_INSERT or header.rec_type == WAL_REC_UPDATE or header.rec_type == WAL_REC_PAGE_WRITE
+        else if header.rec_type == WAL_REC_INSERT or header.rec_type == WAL_REC_UPDATE or header.rec_type == WAL_REC_PAGE_WRITE or header.rec_type == WAL_REC_META
             # Update last LSN for this transaction
             let entry: *TxnEntry = find_txn(mgr, header.txn_id)
             if entry != null
@@ -336,6 +344,18 @@ fn recovery_redo_pass(mgr: *RecoveryManager, reader: *WalReader) -> i32
                 if apply_result == ERR_OK
                     mgr.stats.pages_recovered += 1
 
+        else if header.rec_type == WAL_REC_META and is_committed
+            var meta: CollectionMeta
+            let meta_len: i64 = sizeof(CollectionMeta)
+            if (header.len as i64) - WAL_HEADER_SIZE != meta_len
+                return ERR_CORRUPT
+            let meta_read: i64 = sys_read(reader.fd, @meta as *u8, meta_len)
+            if meta_read != meta_len
+                return ERR_IO
+            # Records are in commit order: the last one wins.
+            memcpy(@mgr.meta as *u8, @meta as *u8, meta_len)
+            mgr.has_meta = 1
+
         else
             # Skip payload for non-redo records or uncommitted transactions
             wal_reader_skip_payload(reader, @header)
@@ -351,37 +371,22 @@ fn recovery_redo_pass(mgr: *RecoveryManager, reader: *WalReader) -> i32
 # Page Recovery Helpers
 # ============================================================================
 
+# Put a logged full-page image back as page `rec_page_id`.  (It used to be
+# copied into a freshly allocated page, which left the real page stale and
+# appended a stray copy: AGAST #2458.)
 fn recovery_apply_page(mgr: *RecoveryManager, rec_page_id: i64, page_data: *u8) -> i32
-    # Allocate a new page in buffer pool
-    let page_opt: Option<*Page> = buffer_pool_alloc(mgr.pool, PAGE_MAGIC_HEAP)
-    if option_is_none<*Page>(@page_opt) == 1
-        return ERR_NO_MEMORY
-    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
-
-    # Get the allocated page's ID
-    let alloc_page_id: i64 = buffer_pool_page_id(mgr.pool, page)
-
-    # Copy page data
-    memcpy(page as *u8, page_data, PAGE_SIZE)
-
-    # Mark page as dirty (needs to be written back eventually)
-    page_set_dirty(page)
-
-    # Unpin page (dirty=1 since we modified it)
-    buffer_pool_unpin(mgr.pool, alloc_page_id, 1)
-    return ERR_OK
+    return buffer_pool_put_page(mgr.pool, rec_page_id, page_data)
 
 fn recovery_apply_insert(mgr: *RecoveryManager, rec_page_id: i64, offset: i32, data: *u8, data_len: i32) -> i32
     # For inserts, we need to fetch/create the page and apply the data
     # This is a simplified implementation - real DBs would handle this more carefully
 
-    let page_opt: Option<*Page> = buffer_pool_alloc(mgr.pool, PAGE_MAGIC_HEAP)
+    let page_opt: Option<*Page> = buffer_pool_fetch(mgr.pool, rec_page_id)
     if option_is_none<*Page>(@page_opt) == 1
         return ERR_NO_MEMORY
     let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
-
-    # Get the allocated page's ID
-    let alloc_page_id: i64 = buffer_pool_page_id(mgr.pool, page)
+    let alloc_page_id: i64 = rec_page_id
+    buffer_pool_reserve_page_id(mgr.pool, rec_page_id)
 
     # Apply insert data to page
     let pg_data: *u8 = page_data(page)
@@ -429,6 +434,14 @@ pub fn recovery_checkpoint(mgr: *RecoveryManager) -> i32
 # ============================================================================
 # Stats Access
 # ============================================================================
+
+# The collection meta of the last committed transaction that logged one.
+# Returns 1 and fills *out if recovery found one, else 0.
+pub fn recovery_collection_meta(mgr: *RecoveryManager, out: *CollectionMeta) -> i32
+    if mgr == null or out == null or mgr.has_meta == 0
+        return 0
+    memcpy(out as *u8, @mgr.meta as *u8, sizeof(CollectionMeta))
+    return 1
 
 pub fn recovery_stats(mgr: *RecoveryManager) -> *RecoveryStats
     if mgr == null

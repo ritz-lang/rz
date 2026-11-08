@@ -536,6 +536,109 @@ fn test_recovery_page_write_replay() -> i32
     free(base_path)
     return 0
 
+# A replayed page image lands on the page it was logged for (AGAST #2458:
+# redo used to copy every image into a freshly allocated page instead), and
+# the pool never hands that page id out again.
+[[test]]
+fn test_recovery_page_write_replays_onto_its_own_page() -> i32
+    let base_path: *u8 = make_test_path(c"own_page")
+    let pool_opt = buffer_pool_new(16)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 99
+    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+    var img: Page
+    page_init_heap(@img, 3)
+    let data: *u8 = page_data(@img)
+    data[0] = 0xCA
+    data[1] = 0xFE
+
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+    var lsn: i64 = wal_write_begin(writer, 7)
+    lsn = wal_write_page(writer, 7, lsn, 3, @img)
+    lsn = wal_write_commit(writer, 7, lsn)
+    wal_writer_destroy(writer)
+
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var rc: i32 = 0
+    if recovery_recover(mgr) != ERR_OK
+        rc = 1
+    else
+        let got_opt = buffer_pool_fetch(pool, 3)
+        if option_is_none<*Page>(@got_opt) == 1
+            rc = 2
+        else
+            let got: *Page = option_unwrap_or<*Page>(@got_opt, null)
+            let gd: *u8 = page_data(got)
+            if gd[0] != 0xCA or gd[1] != 0xFE
+                rc = 3
+            buffer_pool_unpin(pool, 3, 0)
+        if rc == 0
+            # The next fresh page must not collide with the replayed one.
+            let fresh_opt = buffer_pool_alloc(pool, PAGE_MAGIC_HEAP)
+            if option_is_none<*Page>(@fresh_opt) == 1
+                rc = 4
+            else
+                let fresh: *Page = option_unwrap_or<*Page>(@fresh_opt, null)
+                if buffer_pool_page_id(pool, fresh) <= 3
+                    rc = 5
+
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return rc
+
+# A WAL cut off mid-record (a crash during the append) is read up to the
+# last whole record: the committed transaction before it is still redone.
+# (wal_reader_next reports a short header as ERR_IO, which is -1, the same
+# value as its EOF; this pins that a torn tail ends the log, not recovery.)
+[[test]]
+fn test_recovery_torn_tail_keeps_committed_prefix() -> i32
+    let base_path: *u8 = make_test_path(c"torn_tail")
+    let pool_opt = buffer_pool_new(16)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 99
+    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+    var img: Page
+    page_init_heap(@img, 2)
+    let data: *u8 = page_data(@img)
+    data[0] = 0x42
+
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+    var lsn: i64 = wal_write_begin(writer, 1)
+    lsn = wal_write_page(writer, 1, lsn, 2, @img)
+    lsn = wal_write_commit(writer, 1, lsn)
+    wal_writer_destroy(writer)
+
+    # Append half a record header.
+    var path_buf: [256]u8
+    let base_len: i64 = strlen(base_path)
+    memcpy(@path_buf[0], base_path, base_len)
+    memcpy(@path_buf[base_len], c".wal.000000", 12)
+    let fd: i32 = sys_open3(@path_buf[0], O_WRONLY | O_APPEND, 420)
+    var junk: [16]u8
+    memset(@junk[0], 0x5A, 16)
+    sys_write(fd, @junk[0], 16)
+    sys_close(fd)
+
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var rc: i32 = 0
+    if recovery_recover(mgr) != ERR_OK
+        rc = 1
+    else
+        let st: *RecoveryStats = recovery_stats(mgr)
+        if st.pages_recovered != 1
+            rc = 2
+    recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return rc
+
 # ============================================================================
 # Error Handling Tests
 # ============================================================================

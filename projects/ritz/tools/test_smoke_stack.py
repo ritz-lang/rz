@@ -120,9 +120,11 @@ def test_every_xfail_belongs_to_a_suite():
 
 @pytest.mark.unit
 def test_child_tickets_each_have_a_check():
-    """#2456's acceptance: every child ticket's repro is one of its checks."""
+    """#2456's acceptance: every child ticket's repro is one of its checks.
+    A fixed child drops out of this set in the change that deletes its last
+    XFAILS entry (#2458: its checks are plain passing checks now)."""
     cited = {m for reason in ss.XFAILS.values() for m in re.findall(r"#(\d+)", reason)}
-    assert {"2457", "2458", "2459", "2460", "2461"} <= cited
+    assert {"2457", "2459", "2460", "2461"} <= cited
 
 
 # --- binaries by target --------------------------------------------------------

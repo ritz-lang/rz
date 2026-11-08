@@ -91,16 +91,9 @@ XFAILS: dict[str, str] = {
     "tome.blocking.pipeline": "#2457 -b answers only the first of two pipelined commands",
     "tome.blocking.cli": "#2457 tome-cli -c hangs after 'Connecting to ...'",
     "tome.blocking.cli_stdin": "#2457 tome-cli prints 'Connecting to ...' and nothing else",
-    # mausoleum (#2458)
-    "mausoleum.restart_term": "#2458 documents are gone after a restart with the same --data-dir",
-    "mausoleum.restart_kill9": "#2458 documents are gone after kill -9 and restart (WAL stays 0 bytes)",
-    "mausoleum.seed_encrypted": "#2458 wiki-seed cannot speak the default encrypted protocol",
-    "mausoleum.shell_ping": "#2458 the shell offers 'ping' and answers it 'Unknown command'",
-    "mausoleum.shell_commands": "#2458 mausoleum shell knows only ping and quit",
     # nexus (#2459)
     "stack.read_4x": "#2459 each worker has its own page index: 404, 200, 404, 200",
     "stack.edit_4x": "#2459 an edit shows on alternate GETs only",
-    "stack.restart": "#2459 (+#2458) a page is gone after restarting the stack on the same data dir",
     # hollow entry points (#2460)
     "hollow.sage_runs_js": "#2460 sage prints its version and exits 0 without reading the file",
     "hollow.goliath_unknown_command": "#2460 goliath's main prints 'Run tests with: make test' and exits 0",
@@ -673,8 +666,10 @@ def suite_mausoleum(r: Reporter, procs: Procs, tmp: Path) -> None:
         wait_listening(p, port)
         return p
 
-    def seed_cmd(port: int, *flags: str) -> subprocess.CompletedProcess:
-        return run_cmd([str(seed), "-p", str(port), *flags], work)
+    def seed_cmd(port: int, *flags: str, encrypted: bool = False) -> subprocess.CompletedProcess:
+        # wiki-seed speaks the encrypted protocol by default, like the server.
+        mode = [] if encrypted else ["--no-encryption"]
+        return run_cmd([str(seed), "-p", str(port), *mode, *flags], work)
 
     def verified(res: subprocess.CompletedProcess) -> bool:
         return res.returncode == 0 and b"[OK]" in res.stdout and b"[FAIL]" not in res.stdout
@@ -766,8 +761,8 @@ def suite_mausoleum(r: Reporter, procs: Procs, tmp: Path) -> None:
         return
 
     def seed_encrypted():
-        a = seed_cmd(porte, "--seed")
-        b = seed_cmd(porte, "--verify")
+        a = seed_cmd(porte, "--seed", encrypted=True)
+        b = seed_cmd(porte, "--verify", encrypted=True)
         if a.returncode != 0 or not verified(b):
             raise CheckFailed(f"--seed exit {a.returncode}: {short(a.stdout, 70)}; "
                               f"--verify exit {b.returncode}: {short(b.stdout, 70)}")
@@ -789,10 +784,29 @@ def suite_mausoleum(r: Reporter, procs: Procs, tmp: Path) -> None:
         if missing:
             raise CheckFailed(f"shell lacks {', '.join(missing)}: {short(res.stdout, 100)}")
 
+    def shell_crud():
+        # put -> list -> get -> delete -> get, by id, over the encrypted protocol.
+        res = run_cmd([str(m7m), "shell", "-p", str(porte)], work,
+                      stdin=b'put slug=smoke title="Smoke test" n=7\nlist\nquit\n')
+        out = res.stdout.decode(errors="replace")
+        m = re.search(r"inserted (\d+)", out)
+        if res.returncode != 0 or not m or not re.search(rf"^(m7m> )*{m.group(1)}\s.*slug=\"smoke\"", out, re.M):
+            raise CheckFailed(f"shell put/list -> exit {res.returncode}: {short(res.stdout[-120:], 120)}")
+        doc = m.group(1)
+        res = run_cmd([str(m7m), "shell", "-p", str(porte)], work,
+                      stdin=f"get {doc}\ndelete {doc}\nquit\n".encode())
+        out = res.stdout.decode(errors="replace")
+        if res.returncode != 0 or 'title = "Smoke test"' not in out or f"deleted {doc}" not in out:
+            raise CheckFailed(f"shell get/delete -> exit {res.returncode}: {short(res.stdout[-120:], 120)}")
+        res = run_cmd([str(m7m), "shell", "-p", str(porte)], work, stdin=f"get {doc}\nquit\n".encode())
+        if res.returncode == 0 or b"not found" not in res.stdout:
+            raise CheckFailed(f"shell get after delete -> exit {res.returncode}: {short(res.stdout[-90:], 90)}")
+
     r.run("mausoleum.seed_encrypted", seed_encrypted)
     r.run("mausoleum.shell_handshake", shell_handshake)
     r.run("mausoleum.shell_ping", shell_ping)
     r.run("mausoleum.shell_commands", shell_commands)
+    r.run("mausoleum.shell_crud", shell_crud)
     procs.stop(pe)
 
 

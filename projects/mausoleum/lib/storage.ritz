@@ -47,6 +47,14 @@ const META_FILE_NAME: StrView = "/meta.m7m"
 
 const DEFAULT_BUFFER_SIZE: i32 = 256    # 256 pages = 1MB cache
 
+# meta.m7m written before the collection fields existed: magic..last_open.
+const STORAGE_META_LEGACY_SIZE: i64 = 48
+
+# A checkpoint cuts the WAL back once it grows past this (every committed
+# write is also in data.m7m by then, so the records are only crash insurance
+# for the write in flight).
+const WAL_CHECKPOINT_BYTES: i64 = 4194304   # 4 MiB
+
 # ============================================================================
 # Storage Metadata
 # ============================================================================
@@ -60,6 +68,14 @@ struct StorageMeta
     next_txn_id: i64        # Next transaction ID
     created_at: i64         # Creation timestamp (nanos)
     last_open: i64          # Last open timestamp (nanos)
+    # The collection's B-tree root and counters (AGAST #2458).  Absent from
+    # legacy 48-byte files; root_page_id == INVALID_PAGE_ID then.
+    coll_root_page_id: i64
+    coll_tree_height: i64
+    coll_tree_count: i64
+    coll_tree_node_count: i64
+    coll_next_sequence: i64
+    coll_doc_count: i64
 
 # ============================================================================
 # Storage Engine Structure
@@ -77,6 +93,7 @@ struct Storage
     meta_fd: i32            # File descriptor for meta file
 
     current_txn: i64        # Current active transaction ID (0 = none)
+    meta_dirty: i32         # Collection meta changed since the last commit
     current_lsn: i64        # Current LSN for the active transaction
 
     is_open: i32
@@ -105,6 +122,28 @@ fn meta_init(meta: *StorageMeta)
     let now: Timestamp = timestamp_now()
     meta.created_at = now.nanos
     meta.last_open = now.nanos
+    meta_clear_collection(meta)
+
+fn meta_clear_collection(meta: *StorageMeta)
+    var none: CollectionMeta
+    collection_meta_clear(@none)
+    meta_put_collection(meta, @none)
+
+fn meta_put_collection(meta: *StorageMeta, c: *CollectionMeta)
+    meta.coll_root_page_id = c.root_page_id
+    meta.coll_tree_height = c.tree_height
+    meta.coll_tree_count = c.tree_count
+    meta.coll_tree_node_count = c.tree_node_count
+    meta.coll_next_sequence = c.next_sequence
+    meta.coll_doc_count = c.doc_count
+
+fn meta_get_collection(meta: *StorageMeta, c: *CollectionMeta)
+    c.root_page_id = meta.coll_root_page_id
+    c.tree_height = meta.coll_tree_height
+    c.tree_count = meta.coll_tree_count
+    c.tree_node_count = meta.coll_tree_node_count
+    c.next_sequence = meta.coll_next_sequence
+    c.doc_count = meta.coll_doc_count
 
 fn meta_read(fd: i32, meta: *StorageMeta) -> i32
     let result: i64 = sys_lseek(fd, 0, 0)  # SEEK_SET
@@ -112,7 +151,10 @@ fn meta_read(fd: i32, meta: *StorageMeta) -> i32
         return ERR_IO
 
     let bytes_read: i64 = sys_read(fd, meta as *u8, sizeof(StorageMeta))
-    if bytes_read != sizeof(StorageMeta)
+    if bytes_read == STORAGE_META_LEGACY_SIZE
+        # Written before collections were persisted: no collection recorded.
+        meta_clear_collection(meta)
+    else if bytes_read != sizeof(StorageMeta)
         return ERR_CORRUPT
 
     if meta.magic != STORAGE_MAGIC
@@ -169,6 +211,7 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     storage.meta_fd = -1
     storage.current_txn = 0
     storage.current_lsn = 0
+    storage.meta_dirty = 0
     storage.is_open = 0
 
     # Try to create directory (may already exist)
@@ -232,24 +275,34 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
         free(storage as *u8)
         return None
 
+    # Recovery first: redo every committed WAL transaction onto its pages
+    # and take the collection meta from the last one that logged it.  A WAL
+    # that cannot be read is not discarded: refuse to open instead.
+    storage.recovery_mgr = recovery_mgr_new(storage.pool, @wal_path[0])
+    if is_new == 0 and storage.recovery_mgr != null
+        if recovery_recover(storage.recovery_mgr) != ERR_OK
+            recovery_mgr_destroy(storage.recovery_mgr)
+            buffer_pool_destroy(storage.pool)
+            sys_close(meta_fd)
+            free(base_copy)
+            free(storage as *u8)
+            return None
+        var recovered: CollectionMeta
+        if recovery_collection_meta(storage.recovery_mgr, @recovered) == 1
+            meta_put_collection(@storage.meta, @recovered)
+
     # Create WAL writer
     storage.wal_writer = wal_writer_new(@wal_path[0])
     if storage.wal_writer != null
         wal_writer_open(storage.wal_writer)
 
-    # Create recovery manager
-    storage.recovery_mgr = recovery_mgr_new(storage.pool, @wal_path[0])
-
-    # Perform recovery if needed (only if not a new database)
-    if is_new == 0 and storage.recovery_mgr != null
-        recovery_recover(storage.recovery_mgr)
-
     # Update last open time
     let now: Timestamp = timestamp_now()
     storage.meta.last_open = now.nanos
-    meta_write(meta_fd, @storage.meta)
-
     storage.is_open = 1
+
+    # Write what recovery redid to data.m7m / meta.m7m, then cut the WAL.
+    storage_checkpoint(storage)
     return Some(storage)
 
 # Close storage
@@ -429,30 +482,89 @@ pub fn storage_unpin_page(storage: *Storage, page_id: i64, dirty: i32)
 # Durability Operations
 # ============================================================================
 
-# Flush all dirty pages to disk
+# Log every dirty page and (if it changed) the collection meta to the WAL as
+# one committed transaction, and write it out.  Nothing reaches data.m7m.
+# This is the durability point of a write: once it returns ERR_OK a crash
+# at any later moment is redone on the next storage_open.
+pub fn storage_wal_commit(storage: *Storage) -> i32
+    if storage == null or storage.is_open == 0
+        return ERR_INVALID
+    let w: *WalWriter = storage.wal_writer
+    if w == null
+        return ERR_OK
+    if buffer_pool_dirty_count(storage.pool) == 0 and storage.meta_dirty == 0
+        return wal_writer_flush(w)
+
+    let txn_id: i64 = storage.meta.next_txn_id
+    storage.meta.next_txn_id += 1
+
+    var lsn: i64 = wal_write_begin(w, txn_id)
+    if lsn < 0
+        return ERR_IO
+    let frames: i32 = buffer_pool_num_frames(storage.pool)
+    var i: i32 = 0
+    while i < frames
+        var page_id: i64 = INVALID_PAGE_ID
+        let page: *Page = buffer_pool_dirty_page(storage.pool, i, @page_id)
+        if page != null
+            lsn = wal_write_page(w, txn_id, lsn, page_id, page)
+            if lsn < 0
+                return ERR_IO
+        i += 1
+    if storage.meta_dirty != 0
+        var cm: CollectionMeta
+        meta_get_collection(@storage.meta, @cm)
+        lsn = wal_write_meta(w, txn_id, lsn, @cm)
+        if lsn < 0
+            return ERR_IO
+    # COMMIT flushes the WAL buffer.
+    if wal_write_commit(w, txn_id, lsn) < 0
+        return ERR_IO
+    return ERR_OK
+
+# Commit everything written so far: WAL first (write-ahead), then the dirty
+# pages to data.m7m, then meta.m7m.  The server calls this after every
+# INSERT / UPDATE / DELETE.
 pub fn storage_flush(storage: *Storage) -> i32
     if storage == null or storage.is_open == 0
         return ERR_INVALID
 
-    # Flush WAL first (write-ahead)
-    if storage.wal_writer != null
-        wal_writer_flush(storage.wal_writer)
+    let wal_result: i32 = storage_wal_commit(storage)
+    if wal_result != ERR_OK
+        return wal_result
 
-    # Then flush buffer pool
-    return buffer_pool_flush_all(storage.pool)
+    let pool_result: i32 = buffer_pool_flush_all(storage.pool)
+    if pool_result != ERR_OK
+        return pool_result
+
+    let meta_result: i32 = meta_write(storage.meta_fd, @storage.meta)
+    if meta_result != ERR_OK
+        return meta_result
+    storage.meta_dirty = 0
+
+    # Everything logged so far is now in data.m7m; keep the WAL bounded.
+    if storage.wal_writer != null and wal_writer_size(storage.wal_writer) > WAL_CHECKPOINT_BYTES
+        return storage_checkpoint(storage)
+    return ERR_OK
 
 # Create a checkpoint (flushes everything and updates metadata)
 pub fn storage_checkpoint(storage: *Storage) -> i32
     if storage == null or storage.is_open == 0
         return ERR_INVALID
 
-    # Flush all dirty pages
-    let flush_result: i32 = storage_flush(storage)
+    # Write all dirty pages and the meta file directly: a checkpoint makes
+    # the WAL redundant, so there is no point logging them first.
+    let flush_result: i32 = buffer_pool_flush_all(storage.pool)
     if flush_result != ERR_OK
         return flush_result
+    let meta_result: i32 = meta_write(storage.meta_fd, @storage.meta)
+    if meta_result != ERR_OK
+        return meta_result
+    storage.meta_dirty = 0
 
-    # Write checkpoint record to WAL
+    # Data and meta are on disk: drop the redo records, mark the checkpoint.
     if storage.wal_writer != null
+        wal_writer_truncate(storage.wal_writer)
         let lsn: i64 = wal_write_checkpoint(storage.wal_writer)
         if lsn > 0
             storage.meta.checkpoint_lsn = lsn
@@ -479,20 +591,34 @@ pub fn storage_is_open(storage: *Storage) -> i32
         return 0
     return storage.is_open
 
+# Bytes currently in the WAL segment (including buffered ones).
+pub fn storage_wal_size(storage: *Storage) -> i64
+    if storage == null
+        return 0
+    return wal_writer_size(storage.wal_writer)
+
 # ============================================================================
-# Collection Metadata Persistence Stubs
+# Collection Metadata Persistence
 # ============================================================================
-# These are stub functions to support collection persistence.
-# The actual metadata is stored in the collection btree root page.
+# Where the collection's B-tree root is and its counters.  These used to be
+# no-op stubs, so a restart never found the tree it had written (#2458).
 
-pub fn storage_set_root_page_id(storage: *Storage, page_id: i64)
-    # Stub - collection root is stored in collection btree
-    return
+# Record the collection's meta; the next storage_flush logs and persists it.
+pub fn storage_set_collection_meta(storage: *Storage, meta: *CollectionMeta)
+    if storage == null or meta == null
+        return
+    var cur: CollectionMeta
+    meta_get_collection(@storage.meta, @cur)
+    if memcmp(@cur as *u8, meta as *u8, sizeof(CollectionMeta)) != 0
+        meta_put_collection(@storage.meta, meta)
+        storage.meta_dirty = 1
 
-pub fn storage_set_next_sequence(storage: *Storage, seq: i64)
-    # Stub - sequence is stored in collection metadata
-    return
-
-pub fn storage_set_doc_count(storage: *Storage, count: i64)
-    # Stub - doc count is stored in collection metadata
-    return
+# Fill *out with the recorded collection meta.  Returns 1 if a collection
+# has been recorded on this data directory, 0 if not.
+pub fn storage_collection_meta(storage: *Storage, out: *CollectionMeta) -> i32
+    if storage == null or out == null
+        return 0
+    meta_get_collection(@storage.meta, out)
+    if out.root_page_id == INVALID_PAGE_ID
+        return 0
+    return 1

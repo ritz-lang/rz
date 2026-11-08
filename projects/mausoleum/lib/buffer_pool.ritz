@@ -456,6 +456,70 @@ pub fn buffer_pool_page_id(pool: *BufferPool, page: *Page) -> i64
 
     return INVALID_PAGE_ID
 
+# Never hand out `page_id` (or anything below it) from buffer_pool_alloc.
+# Recovery calls this for every page it replays: a page that reached the
+# WAL but not the data file lies past the file's end, where next_page_id
+# (derived from the file size) would otherwise allocate it a second time.
+pub fn buffer_pool_reserve_page_id(pool: *BufferPool, page_id: i64)
+    if pool == null or page_id < 0
+        return
+    if page_id >= pool.next_page_id
+        pool.next_page_id = page_id + 1
+
+# Install a full page image as page `page_id`, dirty, without reading the
+# old contents from disk (WAL redo: the image replaces them wholesale).
+pub fn buffer_pool_put_page(pool: *BufferPool, page_id: i64, image: *u8) -> i32
+    if pool == null or image == null or page_id < 0
+        return ERR_INVALID
+
+    var frame_idx: i32 = find_frame(pool, page_id)
+    if frame_idx >= 0
+        let frame: *Frame = get_frame(pool, frame_idx)
+        memcpy(@frame.page as *u8, image, PAGE_SIZE)
+        frame.dirty = 1
+        buffer_pool_reserve_page_id(pool, page_id)
+        return ERR_OK
+
+    frame_idx = get_free_frame(pool)
+    if frame_idx < 0
+        return ERR_NO_MEMORY
+    let frame: *Frame = get_frame(pool, frame_idx)
+    memcpy(@frame.page as *u8, image, PAGE_SIZE)
+    frame.page_id = page_id
+    frame.pin_count = 0
+    frame.dirty = 1
+    hash_insert(pool, frame_idx, page_id)
+    lru_add(pool, frame_idx)
+    buffer_pool_reserve_page_id(pool, page_id)
+    return ERR_OK
+
+# Number of frames (for iterating with buffer_pool_dirty_page).
+pub fn buffer_pool_num_frames(pool: *BufferPool) -> i32
+    if pool == null
+        return 0
+    return pool.num_frames
+
+# Number of dirty pages currently held.
+pub fn buffer_pool_dirty_count(pool: *BufferPool) -> i32
+    if pool == null
+        return 0
+    var n: i32 = 0
+    for i in 0..pool.num_frames
+        let frame: *Frame = get_frame(pool, i)
+        if frame.dirty != 0 and frame.page_id != INVALID_PAGE_ID
+            n += 1
+    return n
+
+# The page in frame `idx` if it is dirty (its id in *out_page_id), else null.
+pub fn buffer_pool_dirty_page(pool: *BufferPool, idx: i32, out_page_id: *i64) -> *Page
+    if pool == null or idx < 0 or idx >= pool.num_frames
+        return null
+    let frame: *Frame = get_frame(pool, idx)
+    if frame.dirty == 0 or frame.page_id == INVALID_PAGE_ID
+        return null
+    *out_page_id = frame.page_id
+    return @frame.page
+
 # ============================================================================
 # Flushing Operations
 # ============================================================================
