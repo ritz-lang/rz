@@ -276,8 +276,8 @@ def test_an_int_element_is_not_a_condition(compile_with, compiler):
     _refused(compile_with, compiler, "cond", program, "if condition must be bool")
 
 
-# A slice of the value keeps its own lowering: `v[1..3]` isn't an element.  Only
-# `t[0]`: past it, and a slice of a Vec local, ritz1 reads garbage, as before (#2451).
+# A slice of the value keeps its own lowering: `v[1..3]` isn't an element.  The
+# slice itself is test_slice_value_local.py's (#2451).
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_slice_of_a_span_is_not_an_element(run_with, compiler):

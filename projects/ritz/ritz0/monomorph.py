@@ -552,8 +552,11 @@ class Monomorphizer:
         elif isinstance(expr, rast.Index):
             self._visit_expr(expr.expr)
             self._visit_expr(expr.index)
-            # Register vec_get<T> for Vec<T> indexing sugar.
+            # Register vec_get<T> for Vec<T> indexing sugar, and vec_slice<T>
+            # for `v[lo..hi]`, which lowers as `v[lo:hi]` does (AGAST #2451).
             self._register_index_instantiation(expr)
+            if isinstance(expr.index, rast.Range):
+                self._register_slice_instantiation(expr)
         elif isinstance(expr, rast.Field):
             self._visit_expr(expr.expr)
         elif isinstance(expr, rast.MethodCall):
@@ -687,8 +690,9 @@ class Monomorphizer:
             if plain is not None and plain.ret_type is not None:
                 return plain.ret_type
 
-        # `a[:]` / `a[i:j]` on a Vec<T> lowers to vec_slice<T>: a Vec<T>.
-        if isinstance(expr, rast.SliceExpr):
+        # `a[:]` / `a[i:j]` / `a[i..j]` on a Vec<T> lowers to vec_slice<T>: a Vec<T>.
+        if (isinstance(expr, rast.SliceExpr)
+                or (isinstance(expr, rast.Index) and isinstance(expr.index, rast.Range))):
             base_type = self._infer_value_type(expr.expr)
             while isinstance(base_type, (rast.PtrType, rast.RefType)):
                 base_type = base_type.inner

@@ -1539,6 +1539,8 @@ class LLVMEmitter:
             through = self._index_through(expr)
             if through is not None:
                 return self._infer_ritz_type(through)
+            if isinstance(expr.index, rast.Range):
+                return self._slice_ritz_type(expr.expr)
             base_type = self._infer_ritz_type(expr.expr)
             if base_type:
                 # A reference to a Vec auto-derefs on index (AGAST #1968), so
@@ -3572,7 +3574,7 @@ class LLVMEmitter:
         for i, (name, _) in enumerate(self.struct_fields[struct_name]):
             if name == field_name:
                 return i
-        raise ValueError(f"Unknown field {field_name} in struct {struct_name}")
+        raise ValueError(f"Unknown field '{field_name}' in struct '{struct_name}'")
 
     def _get_struct_name_from_type(self, ty: ir.Type) -> Optional[str]:
         """Get the struct name from an LLVM type."""
@@ -8046,7 +8048,14 @@ class LLVMEmitter:
             return self._emit_tuple_lit(expr)
 
         elif isinstance(expr, rast.Field):
-            return self._emit_field_access(expr)
+            try:
+                return self._emit_field_access(expr)
+            except ValueError as err:
+                # AGAST #2451: `t.len` on a String names no field.  The struct
+                # layout raises it unlocated; it's the user's error, so say where.
+                if str(err).startswith("Unknown field"):
+                    raise EmitError(str(err), expr.span) from None
+                raise
 
         elif isinstance(expr, rast.Cast):
             return self._emit_cast(expr)
@@ -8427,6 +8436,28 @@ class LLVMEmitter:
                 return self.builder.load(ptr)
         else:
             raise ValueError(f"Cannot index type: {base.type}")
+
+    def _slice_ritz_type(self, base: rast.Expr) -> Optional[rast.Type]:
+        """The type of `base[lo..hi]`, as _emit_slice builds it (AGAST #2451).
+
+        A slice of a Vec is a Vec (a Span where one is expected), of a Span a
+        Span and of a String a String.  It was inferred as the element type, so
+        `let t = v[1..3]` bound `t` as an `i32` and `t[1]` couldn't index it.
+        """
+        base_type = self._infer_ritz_type(base)
+        while isinstance(base_type, (rast.PtrType, rast.RefType)):
+            base_type = base_type.inner
+        if not isinstance(base_type, rast.NamedType):
+            return None
+        name = base_type.name
+        if name == 'Vec' or name.startswith('Vec$'):
+            if self._expects_span():
+                elem = self._vec_element_ritz_type(base_type, name)
+                return rast.NamedType(base_type.span, 'Span', [elem])
+            return base_type
+        if name in ('Span', 'String') or name.startswith('Span$'):
+            return base_type
+        return None
 
     def _emit_slice(self, expr: rast.SliceExpr) -> ir.Value:
         """Emit a slice operation: a[start:end].

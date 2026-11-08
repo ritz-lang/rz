@@ -702,6 +702,25 @@ fn total(xs: Span<u8>) -> i64
 
 `Span<T>` is a fat pointer: `(*T, len)`.
 
+`a[lo..hi]` slices a `Vec`, `Span` or `String`: elements `lo` up to but not
+including `hi`, and `a[lo..=hi]` includes `hi`. A slice of a `Span` is a `Span`
+over the same elements, so a write through it lands in `a`. A slice of a `Vec` or
+`String` is a new `Vec` or `String`, a copy (`vec_slice`, `string_slice`), unless a
+`Span` is expected, where it is a view like a `Span`'s.
+
+```ritz
+import ritzlib.gvec
+
+fn main() -> i32
+    var v: Vec<i32> = vec_new<i32>()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    let t = v[1..3]
+    let u = v[0..=1]
+    t[1] + u.len as i32
+```
+
 ### 3.5 String Types
 
 | Type | Description |
