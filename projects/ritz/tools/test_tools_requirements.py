@@ -49,6 +49,7 @@ LOCAL_MODULES = {
     "check_no_s_strings",
     "run_regression_matrix",
     "smoke",
+    "smoke_stack",
     "ab_test",
     "ritzgen_py",
 }

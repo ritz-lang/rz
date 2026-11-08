@@ -36,6 +36,9 @@ import ci_local  # noqa: E402
 E2ES = [
     "projects/nexus/test/e2e_large_page.sh",
     "projects/valet/test/test_tls_socket.sh",
+    # AGAST #2456: the stack smoke gate, same constraints (needs the debug
+    # binaries, real servers, must exit 0 or 1 only).
+    "projects/ritz/tools/smoke_stack.py",
 ]
 REPO = ci_local.WORKFLOW.resolve().parents[2]
 
@@ -93,6 +96,15 @@ def test_e2e_never_exits_with_the_setup_code(e2e):
     the code) and does not stop --fail-fast for it. A red e2e must read as
     a regression, so the script may only exit 0 or 1."""
     src = (REPO / e2e).read_text()
+    if e2e.endswith(".py"):
+        # Python: every sys.exit(N) / exit(N) literal and every `return N`
+        # out of main(). The script exits via sys.exit(main()).
+        codes = set(re.findall(r"\bexit\((\d+)\)", src))
+        main_src = src[src.index("\ndef main("):]
+        codes |= set(re.findall(r"^\s+return (\d+)\b", main_src, re.M))
+        assert "sys.exit(main())" in src
+        assert codes <= {"0", "1"}, f"{e2e} exits with {sorted(codes)}"
+        return
     # Statements, not prose: "curl exit $rc" in a message is not one.
     codes = set(re.findall(r"(?<!curl )\bexit\s+([^\s;})\"']+)", src))
     assert codes <= {"0", "1"}, f"{e2e} exits with {sorted(codes)}"

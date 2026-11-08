@@ -107,6 +107,13 @@ harness-selftest:
 smoke:
 	@$(PYTHON) tools/smoke.py
 
+# AGAST #2456: start every server/CLI and make real requests, against the
+# debug binaries `./rz build --all` leaves behind. CI runs it in build-all;
+# strict xfails cite the tickets that own today's failures. ~30s.
+.PHONY: smoke-stack
+smoke-stack:
+	@$(PYTHON) tools/smoke_stack.py $(ARGS)
+
 # Run exactly what .github/workflows/main.yml runs, by PARSING it — AGAST #1363.
 #
 # Not a restatement of the gate commands. A remembered list drifts from CI, and
