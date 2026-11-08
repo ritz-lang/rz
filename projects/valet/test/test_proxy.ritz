@@ -110,3 +110,78 @@ fn test_total_len_wrapping_content_length() -> i32
     if request_total_len(r, strlen(r) as i32) >= 0
         return 1
     return 0
+
+
+# ----------------------------------------------------------------------------
+# proxy_copy_headers(dst, cap, src, len, closing) - valet owns `Connection`
+#
+# The worker always writes "Connection: keep-alive", but valet closes the
+# connection after keepalive_requests responses (and after a client's
+# "Connection: close"). Passing the worker's header through promised reuse
+# valet then refused: every 100th request through zeus was a client read
+# error (~1% under wrk, AGAST #2459).
+# ----------------------------------------------------------------------------
+
+fn copied_is(dst: *u8, n: i64, want: *u8) -> i32
+    if n != strlen(want)
+        return 0
+    for i in 0..n
+        if *(dst + i) != *(want + i)
+            return 0
+    return 1
+
+[[test]]
+fn test_proxy_headers_last_response_says_close() -> i32
+    let src: *u8 = c"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n"
+    var dst: [256]u8
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 1)
+    if copied_is(@dst[0], n, c"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n") == 0
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_headers_reused_connection_says_keep_alive() -> i32
+    let src: *u8 = c"HTTP/1.1 303 See Other\r\nconnection: close\r\nLocation: /wiki/x\r\n\r\n"
+    var dst: [256]u8
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 0)
+    if copied_is(@dst[0], n, c"HTTP/1.1 303 See Other\r\nLocation: /wiki/x\r\nConnection: keep-alive\r\n\r\n") == 0
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_headers_without_connection_gain_one() -> i32
+    let src: *u8 = c"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+    var dst: [256]u8
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 1)
+    if copied_is(@dst[0], n, c"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") == 0
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_headers_keep_lookalike_names() -> i32
+    # Only the Connection header itself is valet's.
+    let src: *u8 = c"HTTP/1.1 200 OK\r\nX-Connection-Id: 7\r\n\r\n"
+    var dst: [256]u8
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 0)
+    if copied_is(@dst[0], n, c"HTTP/1.1 200 OK\r\nX-Connection-Id: 7\r\nConnection: keep-alive\r\n\r\n") == 0
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_headers_refuse_a_small_buffer() -> i32
+    let src: *u8 = c"HTTP/1.1 200 OK\r\n\r\n"
+    var dst: [32]u8
+    if proxy_copy_headers(@dst[0], 20, src, strlen(src), 0) != -1
+        return 1
+    return 0
+
+[[test]]
+fn test_proxy_headers_extra_bound_covers_growth() -> i32
+    # Replacing a short Connection line, or adding one, grows the block by at
+    # most PROXY_CONNECTION_EXTRA bytes: callers size their buffer with it.
+    let src: *u8 = c"HTTP/1.1 200 OK\r\n\r\n"
+    var dst: [256]u8
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 0)
+    if n < 0 or n > strlen(src) + PROXY_CONNECTION_EXTRA
+        return 1
+    return 0

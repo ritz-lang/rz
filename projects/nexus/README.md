@@ -116,10 +116,14 @@ fn main() -> i32
 
 **Not "design phase" — it is implemented and compiles.**
 
-The binary is a Zeus worker (`nexus <shm_size> <worker_id>`), there is no `serve`
-subcommand, and invoking it by hand segfaults — see Installation above. It serves
-pages through `src/store.ritz`, which reaches mausoleum over Spire and falls back
-to in-memory with 3 seeded pages.
+The binary is a Zeus worker (`nexus <shm_size> <worker_id> <worker_count>`),
+there is no `serve` subcommand, and invoking it by hand segfaults — see
+Installation above. It serves pages through `src/store.ritz`, which reaches
+mausoleum (encrypted, 127.0.0.1:7777, #2466) over Spire. Mausoleum is the only
+copy of a page: every request reads it there, so all of Zeus's workers serve
+the same wiki (#2459). Without mausoleum, a single worker (`zeus -w 1`) falls
+back to an in-memory wiki with 3 seeded pages; with several workers every page
+request is a 503, since each would otherwise serve a private wiki.
 
 `src/` also holds a layered application stack that the binary does **not** use
 yet: `repos/` (pages as Mausoleum documents, a Tome cache), `services/` and

@@ -14,7 +14,9 @@ does, after `./rz build --all`, using the debug binaries that step built:
   mausoleum wiki-seed writes, restart on the same --data-dir, read back;
             wiki-seed exit codes; the encrypted protocol; the shell
   stack     valet -> zeus (2 workers) -> nexus + mausoleum: create a page,
-            GET it 4 times, edit it, restart the whole stack, GET it again
+            GET it 4 times, edit it, restart the whole stack, GET it again;
+            100 keep-alive requests (the last says Connection: close);
+            whole log lines; no mausoleum with 2 workers -> 503, not 404
   hollow    sage, goliath, rzrz and ritz-lsp must not report success for
             work they did not do
   rzsh      the Linux shell: echo, cd, $X, $?, >, |, external commands
@@ -31,7 +33,7 @@ Every process is started in its own session and killed by process group
 (zeus's nexus workers included) on exit, on failure and on SIGTERM/SIGINT.
 The run checks afterwards that nothing it started survived. Ports come from
 the kernel (bind to 0) except mausoleum's 7777, which nexus's store dials
-unconditionally (#2459); if 7777 is taken the stack suite is SKIPPED, loudly.
+unconditionally (#2466); if 7777 is taken the stack suite is SKIPPED, loudly.
 
 Run from anywhere, after `./rz build --all`:
     python3 projects/ritz/tools/smoke_stack.py            # everything
@@ -91,9 +93,6 @@ XFAILS: dict[str, str] = {
     "tome.blocking.pipeline": "#2457 -b answers only the first of two pipelined commands",
     "tome.blocking.cli": "#2457 tome-cli -c hangs after 'Connecting to ...'",
     "tome.blocking.cli_stdin": "#2457 tome-cli prints 'Connecting to ...' and nothing else",
-    # nexus (#2459)
-    "stack.read_4x": "#2459 each worker has its own page index: 404, 200, 404, 200",
-    "stack.edit_4x": "#2459 an edit shows on alternate GETs only",
     # hollow entry points (#2460)
     "hollow.sage_runs_js": "#2460 sage prints its version and exits 0 without reading the file",
     "hollow.goliath_unknown_command": "#2460 goliath's main prints 'Run tests with: make test' and exits 0",
@@ -814,7 +813,7 @@ def suite_mausoleum(r: Reporter, procs: Procs, tmp: Path) -> None:
 # stack: valet -> zeus -> nexus (+ encrypted mausoleum on 7777)
 # --------------------------------------------------------------------------
 
-NEXUS_STORE_PORT = 7777  # hardcoded in nexus src/store.ritz (#2459)
+NEXUS_STORE_PORT = 7777  # hardcoded in nexus src/store.ritz (#2466)
 
 
 def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
@@ -828,7 +827,7 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
         return
     if port_in_use(NEXUS_STORE_PORT):
         r.skip("stack.*", f"127.0.0.1:{NEXUS_STORE_PORT} is taken; nexus can only dial mausoleum "
-                          f"there (#2459), so the stack cannot run on this host now")
+                          f"there (#2466), so the stack cannot run on this host now")
         return
     work = tmp / "stack"
     data = work / "m7m"
@@ -836,12 +835,13 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
     sock = work / "zeus.sock"
     port = free_port()
 
-    def up() -> list[subprocess.Popen]:
+    def up(with_store: bool = True) -> list[subprocess.Popen]:
         if sock.exists():
             sock.unlink()
         # 7777 is fixed, so a restart can race the old socket's teardown;
         # retry a bind failure briefly rather than flake.
-        for attempt in range(6):
+        m = None
+        for attempt in range(6 if with_store else 0):
             m = procs.start("stack-mausoleum", [str(m7m), "serve", "-p", str(NEXUS_STORE_PORT), "-d", str(data)], work)
             try:
                 wait_listening(m, NEXUS_STORE_PORT)
@@ -868,7 +868,7 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
                 raise Broken(f"/health never answered 200 through zeus: {log_tail(z)}")
             time.sleep(0.1)
         time.sleep(0.3)
-        return [v, z, m]
+        return [v, z] + ([m] if m is not None else [])
 
     def down(ps: list[subprocess.Popen]) -> None:
         for p in ps:
@@ -938,6 +938,37 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
         r.run("stack.edit_4x", edit_4x)
     else:
         r.broken("stack.edit_4x", "the edit POST failed, so there is no edit to read back")
+
+    def keepalive_100():
+        # valet closes a connection after 100 responses. Through zeus it used
+        # to pass on the worker's "Connection: keep-alive" for the 100th too,
+        # then close: the client's next request was a read error, ~1% of all
+        # requests under wrk (#2459).
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            for i in range(1, 101):
+                conn.request("GET", "/health")
+                resp = conn.getresponse()
+                resp.read()
+                said = (resp.getheader("Connection") or "").lower()
+                want = "close" if i == 100 else "keep-alive"
+                if resp.status != 200 or said != want:
+                    raise CheckFailed(f"response {i}: {resp.status}, Connection: {said or '(none)'} (want {want})")
+        finally:
+            conn.close()
+
+    def log_lines():
+        # Workers share stdout; a line written in pieces interleaved with the
+        # other worker's ("...Spire at 7127.0.0.11:87777", #2459).
+        log = Path(zeus_proc.log).read_text(errors="replace")  # type: ignore[attr-defined]
+        lines = [ln for ln in log.splitlines() if "Connecting to mausoleum" in ln]
+        want = re.compile(rf"\[nexus \d+\] \[STORE\] Connecting to mausoleum via Spire at 127\.0\.0\.1:{NEXUS_STORE_PORT}")
+        bad = [ln for ln in lines if not want.fullmatch(ln)]
+        if len(lines) < 2 or bad:
+            raise CheckFailed(f"{len(lines)} connect lines, malformed: {short(' | '.join(bad), 160)}")
+
+    r.run("stack.keepalive_100", keepalive_100)
+    r.run("stack.log_lines", log_lines)
     down(ps)
 
     def restart():
@@ -952,6 +983,24 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
             raise CheckFailed(f"after restarting the stack, 4 GETs -> {', '.join(seen)}")
 
     r.run("stack.restart", restart)
+
+    def no_store():
+        # No mausoleum, 2 workers: each would serve a private in-memory wiki,
+        # so a page created on one is a 404 on the next request (#2459).
+        # Every page request must fail instead, with a 503.
+        ps3 = up(with_store=False)
+        try:
+            seen = [http_req(port, "GET", "/wiki/welcome")[0] for _ in range(4)]
+            post = http_req(port, "POST", "/wiki", body=f"slug={slug}-x&content=x".encode(), headers=form)[0]
+            log = Path(ps3[1].log).read_text(errors="replace")  # type: ignore[attr-defined]
+        finally:
+            down(ps3)
+        if seen != [503] * 4 or post != 503:
+            raise CheckFailed(f"4 GETs -> {seen}, POST /wiki -> {post} (want 503s)")
+        if log.count("REFUSING to serve pages") < 2:
+            raise CheckFailed(f"workers did not log why they refuse: {short(log[-200:], 200)}")
+
+    r.run("stack.no_store_503", no_store)
 
 
 # --------------------------------------------------------------------------

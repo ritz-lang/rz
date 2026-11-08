@@ -24,7 +24,7 @@ import lib.config
 import lib.log
 import lib.router
 import lib.json_builder
-import lib.proxy { proxy_response_bytes }
+import lib.proxy { proxy_response_bytes, proxy_copy_headers, PROXY_CONNECTION_EXTRA }
 import lib.response {
     response_init,
     response_status,
@@ -545,14 +545,20 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
             hdr_ptr = @fallback[0]
             hdr_len = hres.len as i64
 
-        let out_len: i64 = hdr_len + body_len
-        let out: *u8 = valet_response_buffer(task, out_len)
+        # The worker's Connection header is replaced by valet's: only valet
+        # knows whether it keeps this connection (AGAST #2459).
+        let cap: i64 = hdr_len + PROXY_CONNECTION_EXTRA + body_len
+        let out: *u8 = valet_response_buffer(task, cap)
         if out == null
             g_proxy_bad_response = g_proxy_bad_response + 1
             return proxy_send_error(task, 502, c"zeus worker response too large\n")
-        memcpy(out, hdr_ptr, hdr_len)
+        let out_hdr_len: i64 = proxy_copy_headers(out, hdr_len + PROXY_CONNECTION_EXTRA, hdr_ptr, hdr_len, valet_task_closing(task))
+        if out_hdr_len < 0
+            g_proxy_bad_response = g_proxy_bad_response + 1
+            return proxy_send_error(task, 502, c"zeus worker response headers malformed\n")
         if body_len > 0
-            memcpy(out + hdr_len, data_arena_offset_to_ptr(@arena, resp.body_offset as i64), body_len)
+            memcpy(out + out_hdr_len, data_arena_offset_to_ptr(@arena, resp.body_offset as i64), body_len)
+        let out_len: i64 = out_hdr_len + body_len
 
         let ret: i32 = valet_task_send_response(task, out, out_len)
         if ret > 0

@@ -1,0 +1,378 @@
+# test/test_store.ritz - the page store nexus's handlers serve from (AGAST #2459)
+#
+# zeus runs several nexus workers, each its own process with its own store.
+# Each test plays one worker against a real Mausoleum (test/support/live_db),
+# and uses a second, raw connection as "another worker" writing behind its
+# back. Every worker must see every other worker's writes on the next request:
+# the database is the only copy of a page, so no per-worker index or cache may
+# answer for it.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+
+import spire.repo.mausoleum { Db, DbField, db_init, db_set_encryption, db_connect, db_close }
+import spire.repo.mausoleum { db_insert, db_delete, db_scan, db_field, db_serialize_doc, db_extract_field }
+
+import src.store
+import test.support.live_db { LiveDb, live_db_start, live_db_stop, live_db_restart }
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Point this process's store at `port` (plaintext, as live_db serves) and init.
+fn store_on(port: i32, workers: i32) -> i32
+    wiki_store_set_connection(c"127.0.0.1", 9, port)
+    wiki_store_set_encryption(0)
+    wiki_store_set_worker_count(workers)
+    wiki_store_init()
+
+
+# A port nothing listens on.
+fn dead_port() -> i32
+    return 1     # tcp/1 (tcpmux): never served on a dev or CI host
+
+
+# "Another worker": its own connection to the same database.
+fn other_connect(db: *Db, port: i32) -> i32
+    db_init(db, c"127.0.0.1", 9, port, c"wiki", 4)
+    db_set_encryption(db, 0)
+    db_connect(db)
+
+
+# Write a page document the way any worker stores one. Returns its id.
+fn other_put(db: *Db, slug: *u8, content: *u8) -> i64
+    var fields: [2]DbField
+    fields[0] = db_field(c"slug", 4, slug, strlen(slug) as i32)
+    fields[1] = db_field(c"content", 7, content, strlen(content) as i32)
+    var buf: [1024]u8
+    let n: i64 = db_serialize_doc(@buf[0], 1024, @fields[0], 2)
+    if n < 0
+        return -1
+    db_insert(db, @buf[0], n as i32)
+
+
+fn bytes_eq(buf: *u8, len: i32, want: *u8) -> bool
+    if len as i64 != strlen(want)
+        return false
+    for i in 0..len
+        if *(buf + i) != *(want + i)
+            return false
+    true
+
+
+# The page `slug` as this worker serves it: 1 + content in `out`, 0 absent, < 0 error.
+fn get(slug: *u8, out: *u8, out_len: *i32) -> i32
+    wiki_store_get(slug, strlen(slug) as i32, out, out_len)
+
+
+fn save(slug: *u8, content: *u8) -> i32
+    wiki_store_save(slug, strlen(slug) as i32, content, strlen(content) as i32)
+
+
+# Does this worker serve `slug` with exactly `want`?
+fn serves(slug: *u8, want: *u8) -> bool
+    var buf: [8192]u8
+    var len: i32 = 0
+    if get(slug, @buf[0], @len) != 1
+        return false
+    bytes_eq(@buf[0], len, want)
+
+
+struct SlugCount
+    slug: *u8
+    n: i32
+
+
+fn count_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+    let sc: *SlugCount = user as *SlugCount
+    var got: [129]u8
+    let n: i32 = db_extract_field(data, len, c"slug", 4, @got[0], 129)
+    if n >= 0 and bytes_eq(@got[0], n, sc.slug)
+        sc.n += 1
+    0
+
+
+# How many documents in the database hold `slug`.
+fn docs_for(db: *Db, slug: *u8) -> i32
+    var sc: SlugCount
+    sc.slug = slug
+    sc.n = 0
+    if db_scan(db, count_step as *u8, @sc as *u8) < 0
+        return -1
+    sc.n
+
+
+# Is `slug` a line of wiki_store_list's output?
+fn listed(slug: *u8) -> bool
+    var buf: [4096]u8
+    memset(@buf[0], 0, 4096)
+    if wiki_store_list(@buf[0], 4096) < 0
+        return false
+    let want: i32 = strlen(slug) as i32
+    var start: i32 = 0
+    var i: i32 = 0
+    while i < 4096 and buf[i] != 0
+        if buf[i] == 10
+            if i - start == want and bytes_eq(@buf[start], want, slug)
+                return true
+            start = i + 1
+        i += 1
+    false
+
+
+# ============================================================================
+# One database, many workers
+# ============================================================================
+
+[[test]]
+fn test_store_serves_a_page_another_worker_created() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    var other: Db
+    if other_connect(@other, live.port) < 0
+        return 2
+    if other_put(@other, c"made-elsewhere", c"hello from worker b") < 0
+        return 3
+    # Before #2459 this worker's slug index was built once at startup.
+    let ok: bool = serves(c"made-elsewhere", c"hello from worker b")
+    db_close(@other)
+    live_db_stop(@live)
+    if ok then 0 else 4
+
+
+[[test]]
+fn test_store_serves_another_workers_edit() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    if save(c"page", c"version one") != 1
+        return 2
+    if not serves(c"page", c"version one")     # warms any per-worker cache
+        return 3
+    # Worker b edits: its new document in, every old one out.
+    var other: Db
+    if other_connect(@other, live.port) < 0
+        return 4
+    other_put(@other, c"page", c"version two")
+    var buf: [8192]u8
+    var len: i32 = 0
+    let ok: bool = serves(c"page", c"version two")
+    db_close(@other)
+    live_db_stop(@live)
+    if ok then 0 else 5
+
+
+[[test]]
+fn test_store_drops_a_page_another_worker_deleted() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    var other: Db
+    if other_connect(@other, live.port) < 0
+        return 2
+    let id: i64 = other_put(@other, c"doomed", c"short-lived")
+    if not serves(c"doomed", c"short-lived")
+        return 3
+    db_delete(@other, id)
+    var buf: [8192]u8
+    var len: i32 = 0
+    let rc: i32 = get(c"doomed", @buf[0], @len)
+    db_close(@other)
+    live_db_stop(@live)
+    if rc == 0 then 0 else 4
+
+
+[[test]]
+fn test_store_lists_pages_from_every_worker() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    save(c"mine", c"a")
+    var other: Db
+    if other_connect(@other, live.port) < 0
+        return 2
+    other_put(@other, c"theirs", c"b")
+    let ok_mine: bool = listed(c"mine")
+    let ok_theirs: bool = listed(c"theirs")
+    let count: i32 = wiki_store_count()
+    db_close(@other)
+    live_db_stop(@live)
+    if not ok_mine
+        return 3
+    if not ok_theirs
+        return 4
+    if count == 2 then 0 else 5
+
+
+# ============================================================================
+# Two documents for one slug (a save interrupted between insert and delete,
+# or two workers saving at once)
+# ============================================================================
+
+[[test]]
+fn test_store_serves_the_newest_copy_of_a_slug() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    var other: Db
+    if other_connect(@other, live.port) < 0
+        return 2
+    other_put(@other, c"twice", c"older")
+    other_put(@other, c"twice", c"newer")
+    let ok: bool = serves(c"twice", c"newer")
+    db_close(@other)
+    live_db_stop(@live)
+    if ok then 0 else 3
+
+
+[[test]]
+fn test_store_save_leaves_one_document_per_slug() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    var other: Db
+    if other_connect(@other, live.port) < 0
+        return 2
+    other_put(@other, c"twice", c"older")
+    other_put(@other, c"twice", c"newer")
+    if save(c"twice", c"newest") != 1
+        return 3
+    let n: i32 = docs_for(@other, c"twice")
+    let ok: bool = serves(c"twice", c"newest")
+    db_close(@other)
+    live_db_stop(@live)
+    if n != 1
+        return 4
+    if ok then 0 else 5
+
+
+# ============================================================================
+# Database trouble is an error, never a silent switch to private pages
+# ============================================================================
+
+[[test]]
+fn test_store_without_database_refuses_with_several_workers() -> i32
+    # Each worker would serve its own in-memory pages: a page created on one
+    # is a 404 on the next request. Fail every request instead.
+    if store_on(dead_port(), 2) != STORE_UNAVAILABLE
+        return 1
+    if save(c"page", c"content") != 0
+        return 2
+    var buf: [8192]u8
+    var len: i32 = 0
+    if get(c"welcome", @buf[0], @len) >= 0
+        return 3
+    if wiki_store_list(@buf[0], 8192) >= 0
+        return 4
+    0
+
+
+[[test]]
+fn test_store_without_database_falls_back_with_one_worker() -> i32
+    # One worker: its in-memory pages are the only copy, so they are coherent.
+    if store_on(dead_port(), 1) != STORE_FALLBACK
+        return 1
+    if save(c"page", c"content") != 1
+        return 2
+    if not serves(c"page", c"content")
+        return 3
+    if listed(c"page") then 0 else 4
+
+
+[[test]]
+fn test_store_reports_a_lost_database_as_an_error_not_a_missing_page() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    if save(c"kept", c"safe") != 1
+        return 2
+    live_db_stop(@live)
+    var buf: [8192]u8
+    var len: i32 = 0
+    # Before #2459: 0, a 404 for a page that exists.
+    let rc: i32 = get(c"kept", @buf[0], @len)
+    if rc >= 0
+        return 3
+    # Nor does a write land in a private fallback the other workers can't see.
+    if save(c"orphan", c"lost") != 0
+        return 4
+    0
+
+
+[[test]]
+fn test_store_reconnects_when_the_database_comes_back() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    if live_db_restart(@live) != 0
+        return 101
+    # The old connection is dead; the next request dials again.
+    if save(c"after", c"restart") != 1
+        live_db_stop(@live)
+        return 2
+    let ok: bool = serves(c"after", c"restart")
+    live_db_stop(@live)
+    if ok then 0 else 3
+
+
+# ============================================================================
+# Connection failure explains itself
+# ============================================================================
+
+[[test]]
+fn test_store_hint_names_the_encryption_mismatch() -> i32
+    # -6: the handshake (or CONNECT reply) never arrived, which is what an
+    # encrypted client sees from a --no-encryption server.
+    let hint: *u8 = wiki_store_connect_hint(-6, 1)
+    if hint == null
+        return 1
+    if strstr(hint, c"--no-encryption") == null
+        return 2
+    0
+
+
+[[test]]
+fn test_store_hint_is_silent_for_a_refused_connection() -> i32
+    # Nothing listening is not an encryption problem.
+    let hint: *u8 = wiki_store_connect_hint(-4, 1)
+    if hint == null
+        return 0
+    if strstr(hint, c"encryption") == null then 0 else 1
+
+
+[[test]]
+fn test_store_lists_a_slug_with_two_copies_once() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        return 1
+    var other: Db
+    if other_connect(@other, live.port) < 0
+        return 2
+    other_put(@other, c"twice", c"older")
+    other_put(@other, c"twice", c"newer")
+    let count: i32 = wiki_store_count()
+    db_close(@other)
+    live_db_stop(@live)
+    if count == 1 then 0 else 3

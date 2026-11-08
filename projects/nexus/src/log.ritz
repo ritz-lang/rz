@@ -1,0 +1,50 @@
+# src/log.ritz - whole-line logging for nexus workers
+#
+# zeus runs several nexus workers that share one stdout. Printing a line in
+# pieces (one write(2) per fragment) let two workers' fragments interleave
+# mid-line: "Connecting to mausoleum via Spire at 7127.0.0.11:87777" (AGAST
+# #2459). Build each line in a String, then emit it with a single write; a
+# write of at most PIPE_BUF bytes to a pipe is atomic, and to a shared file
+# description it lands whole at the shared offset.
+#
+#   var line: String = log_begin()
+#   string_push_cstr(@&line, c"Connected to ")
+#   string_push_i64(@&line, port as i64)
+#   log_end(@&line)
+#
+# Every line is prefixed "[nexus <worker>] " so a reader can tell workers apart.
+
+import ritzlib.io
+import ritzlib.string { String, string_new, string_drop, string_push, string_push_cstr, string_push_i64 }
+
+var g_log_worker: i32 = -1
+
+
+# Tag subsequent lines with this worker's id (zeus's argv[2]).
+pub fn log_set_worker(id: i32)
+    g_log_worker = id
+
+
+# A new line holding just the prefix.
+pub fn log_begin() -> String
+    var line: String = string_new()
+    string_push_cstr(@&line, c"[nexus")
+    if g_log_worker >= 0
+        string_push_cstr(@&line, c" ")
+        string_push_i64(@&line, g_log_worker as i64)
+    string_push_cstr(@&line, c"] ")
+    line
+
+
+# Terminate `line`, write it in one write(2), and free it.
+pub fn log_end(line: @&String)
+    string_push(line, 10)
+    print_string(line)
+    string_drop(line)
+
+
+# One whole line from a C string.
+pub fn log_cstr(msg: *u8)
+    var line: String = log_begin()
+    string_push_cstr(@&line, msg)
+    log_end(@&line)

@@ -11,6 +11,9 @@
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.string { String, string_from_cstr, string_push_i64, string_push, string_as_ptr, string_drop }
 import zeus.main_helpers
 
 # ============================================================================
@@ -241,3 +244,70 @@ fn test_pid_file_path() -> i32
         return 1
 
     return 0
+
+
+# ============================================================================
+# Test: Worker argv (AGAST #2459)
+#
+# A worker needs to know how many siblings it has: nexus must refuse to serve
+# private in-memory pages when it is one of several, since consecutive
+# requests land on different workers. zeus passes the count as argv[3].
+# ============================================================================
+
+# Exec a script that writes its arguments to `out`, wait, read them back.
+fn spawn_and_capture(dir: *u8, worker_count: i32, out: *u8, out_cap: i64) -> i64
+    var script: [256]u8
+    var record: [256]u8
+    let d: i64 = strlen(dir)
+    memcpy(@script[0], dir, d)
+    memcpy(@script[d], c"/w.sh", 6)
+    memcpy(@record[0], dir, d)
+    memcpy(@record[d], c"/argv", 6)
+
+    # #!/bin/sh + `echo "$@" > <dir>/argv`
+    let fd: i32 = sys_open3(@script[0], 577, 493)    # O_WRONLY|O_CREAT|O_TRUNC, 0755
+    if fd < 0
+        return -1
+    let head: *u8 = c"#!/bin/sh\necho \"$@\" > "
+    sys_write(fd, head, strlen(head))
+    sys_write(fd, @record[0], strlen(@record[0]))
+    sys_write(fd, c"\n", 1)
+    sys_close(fd)
+
+    let shm: i32 = sys_open(c"/dev/null", 0)
+    let pid: i32 = spawn_worker(shm, 4096, 7, worker_count, @script[0])
+    if pid <= 0
+        return -2
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+
+    let rfd: i32 = sys_open(@record[0], 0)
+    if rfd < 0
+        return -3
+    let got: i64 = sys_read(rfd, out, out_cap)
+    sys_close(rfd)
+    sys_unlink(@record[0])
+    sys_unlink(@script[0])
+    got
+
+
+[[test]]
+fn test_spawn_worker_passes_worker_count() -> i32
+    var dir: String = string_from_cstr(c"/tmp/zeus-argv-")
+    string_push_i64(@&dir, sys_getpid() as i64)
+    string_push(@&dir, 0)
+    sys_mkdir(string_as_ptr(@&dir), 448)
+    var out: [64]u8
+    let n: i64 = spawn_and_capture(string_as_ptr(@&dir), 3, @out[0], 64)
+    sys_rmdir(string_as_ptr(@&dir))
+    string_drop(@&dir)
+    if n < 0
+        return 1
+    # "<shm_size> <worker_id> <worker_count>\n"
+    let want: *u8 = c"4096 7 3\n"
+    if n != strlen(want)
+        return 2
+    for i in 0..n
+        if out[i] != *(want + i)
+            return 3
+    0

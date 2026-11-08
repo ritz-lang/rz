@@ -25,7 +25,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
-import ritzlib.string { String, string_new, string_drop, string_len, string_as_ptr, string_push_cstr }
+import ritzlib.string { String, string_new, string_drop, string_len, string_as_ptr, string_push_cstr, string_push_i64 }
 
 import zeus.worker { WorkerContext }
 import zeus.worker { worker_init, worker_destroy }
@@ -41,6 +41,7 @@ import zeus.ring { response_slot_set_body, response_slot_set_headers }
 import zeus.ring { RESP_FLAG_COMPLETE }
 
 import src.store
+import src.log { log_set_worker, log_begin, log_end, log_cstr }
 import src.slug { MAX_SLUG, path_starts_with, validate_slug, slug_from_path }
 import src.pages { render_index_page, render_not_found_page, render_view_page }
 import src.pages { render_new_page, render_edit_page, render_error_page }
@@ -231,6 +232,13 @@ fn send_error_page(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, title:
     return send_body(ctx, resp, status, c"text/html; charset=utf-8", @&body)
 
 
+# 503: mausoleum is unreachable, or several workers run without it (AGAST
+# #2459). Never a 404 for a page that may well exist, and never a private
+# per-worker page another request can't see.
+fn send_store_unavailable(ctx: *WorkerContext, resp: *ResponseSlot) -> i32
+    return send_error_page(ctx, resp, 503, c"Store Unavailable", c"The wiki's page store (mausoleum) is unavailable. Try again shortly.")
+
+
 # ============================================================================
 # Handlers
 # ============================================================================
@@ -240,7 +248,8 @@ fn handle_index(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> 
     # zero the buffer: the renderer stops at the first NUL.
     var slugs: [2048]u8
     memset(@slugs[0], 0, 2048)
-    wiki_store_list(@slugs[0], 2048)
+    if wiki_store_list(@slugs[0], 2048) < 0
+        return send_store_unavailable(ctx, resp)
     var body: String = string_new()
     render_index_page(@&body, @slugs[0], 2048)
     return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @&body)
@@ -271,8 +280,11 @@ fn handle_wiki_view(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot)
 
     var content: [8192]u8
     var content_len: i32 = 0
+    let found: i32 = wiki_store_get(@slug[0], slug_len, @content[0], @content_len)
+    if found < 0
+        return send_store_unavailable(ctx, resp)
     var body: String = string_new()
-    if wiki_store_get(@slug[0], slug_len, @content[0], @content_len) == 0
+    if found == 0
         render_not_found_page(@&body, @slug[0], slug_len)
         return send_body(ctx, resp, 404, c"text/html; charset=utf-8", @&body)
 
@@ -319,7 +331,10 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     # Reject duplicate slug — caller should POST to /wiki/:slug to update
     var probe: [8192]u8
     var probe_len: i32 = 0
-    if wiki_store_get(@slug[0], slug_len, @probe[0], @probe_len) == 1
+    let exists: i32 = wiki_store_get(@slug[0], slug_len, @probe[0], @probe_len)
+    if exists < 0
+        return send_store_unavailable(ctx, resp)
+    if exists == 1
         return send_error_page(ctx, resp, 409, c"Slug Already Exists", c"A page with that slug already exists. Edit it from its page, or pick a different slug.")
 
     if wiki_store_save(@slug[0], slug_len, @content[0], content_len) == 0
@@ -352,6 +367,8 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if content_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
 
+    if wiki_store_mode() == STORE_UNAVAILABLE
+        return send_store_unavailable(ctx, resp)
     if wiki_store_save(@slug[0], slug_len, @content[0], content_len) == 0
         return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the page.")
 
@@ -371,7 +388,10 @@ fn handle_wiki_edit_form(ctx: *WorkerContext, req: *RequestSlot, resp: *Response
 
     var content: [8192]u8
     var content_len: i32 = 0
-    if wiki_store_get(@slug[0], slug_len, @content[0], @content_len) == 0
+    let found: i32 = wiki_store_get(@slug[0], slug_len, @content[0], @content_len)
+    if found < 0
+        return send_store_unavailable(ctx, resp)
+    if found == 0
         return handle_not_found(ctx, req, resp)
 
     var body: String = string_new()
@@ -459,39 +479,52 @@ fn parse_i32(s: *u8) -> i32
 # ============================================================================
 
 pub fn main(argc: i32, argv: **u8) -> i32
-    prints_cstr(c"Nexus Wiki Worker starting...\n")
-
-    # Expect: nexus <shm_size> <worker_id>
+    # Expect: nexus <shm_size> <worker_id> [<worker_count>]
     if argc < 3
-        prints_cstr(c"Usage: nexus <shm_size> <worker_id>\n")
+        prints_cstr(c"Usage: nexus <shm_size> <worker_id> [<worker_count>]\n")
         prints_cstr(c"  (This binary is spawned by Zeus daemon)\n")
         return 1
 
     let shm_size: i64 = parse_i64(*(argv + 1))
     let worker_id: i32 = parse_i32(*(argv + 2))
+    # zeus passes how many workers it runs (AGAST #2459); an older zeus
+    # doesn't, so assume one.
+    var worker_count: i32 = 1
+    if argc >= 4
+        worker_count = parse_i32(*(argv + 3))
+        if worker_count < 1
+            worker_count = 1
 
-    prints_cstr(c"  Worker ID: ")
-    print_int(worker_id as i64)
-    prints_cstr(c"\n  SHM Size: ")
-    print_int(shm_size)
-    prints_cstr(c" bytes\n")
+    # One write per line: workers share stdout (src/log.ritz).
+    log_set_worker(worker_id)
+    var line: String = log_begin()
+    string_push_cstr(@&line, c"Nexus Wiki Worker starting: worker ")
+    string_push_i64(@&line, worker_id as i64)
+    string_push_cstr(@&line, c" of ")
+    string_push_i64(@&line, worker_count as i64)
+    string_push_cstr(@&line, c", SHM ")
+    string_push_i64(@&line, shm_size)
+    string_push_cstr(@&line, c" bytes")
+    log_end(@&line)
 
     # Initialize store (connects to mausoleum)
-    wiki_store_init()
-    store_seed()
-    prints_cstr(c"  Store initialized with ")
-    print_int(wiki_store_count() as i64)
-    prints_cstr(c" pages\n")
+    wiki_store_set_worker_count(worker_count)
+    if wiki_store_init() != STORE_UNAVAILABLE
+        store_seed()
+        var count_line: String = log_begin()
+        string_push_cstr(@&count_line, c"Store initialized with ")
+        string_push_i64(@&count_line, wiki_store_count() as i64)
+        string_push_cstr(@&count_line, c" pages")
+        log_end(@&count_line)
 
     # Initialize zeus worker context
     var ctx: WorkerContext
     let init_result: i32 = worker_init(@ctx, SHM_FD, shm_size)
     if init_result != 0
-        prints_cstr(c"Failed to initialize worker context\n")
+        log_cstr(c"Failed to initialize worker context")
         return 1
 
-    prints_cstr(c"  Worker attached to shared memory\n")
-    prints_cstr(c"  Ready to process requests\n\n")
+    log_cstr(c"Worker attached to shared memory; ready to process requests")
 
     worker_set_running(@ctx)
 
@@ -519,6 +552,6 @@ pub fn main(argc: i32, argv: **u8) -> i32
 
     worker_destroy(@ctx)
     wiki_store_close()
-    prints_cstr(c"Worker shutting down\n")
+    log_cstr(c"Worker shutting down")
 
     return 0

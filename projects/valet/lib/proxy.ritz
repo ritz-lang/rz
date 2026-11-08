@@ -30,3 +30,79 @@ pub fn proxy_response_bytes(slot_start: i64, slot_end: i64, headers_off: i64, he
     if proxy_range_ok(slot_start, slot_end, body_off, body_len) == 0
         return -1
     return headers_len + body_len
+
+
+# ----------------------------------------------------------------------------
+# Connection header (AGAST #2459)
+#
+# valet, not the worker, decides whether a connection survives a response: it
+# closes after keepalive_requests responses and after a client's "Connection:
+# close". The worker's header block always says keep-alive, and passing that
+# through promised reuse valet then refused (every 100th proxied request was a
+# client read error). So the worker's Connection line is dropped and valet's
+# own is written.
+# ----------------------------------------------------------------------------
+
+# Most a header block can grow by: a "Connection: keep-alive\r\n" line added.
+pub const PROXY_CONNECTION_EXTRA: i64 = 24
+
+
+fn proxy_lower(c: u8) -> u8
+    if c >= 'A' and c <= 'Z'
+        return c + 32
+    return c
+
+
+# Is the line at `p` (length `len`, no CRLF) a Connection header?
+fn proxy_is_connection_line(p: *u8, len: i64) -> i32
+    let name: *u8 = c"connection:"
+    if len < 11
+        return 0
+    for i in 0..11
+        if proxy_lower(*(p + i)) != *(name + i)
+            return 0
+    return 1
+
+
+fn proxy_put(dst: *u8, cap: i64, pos: i64, src: *u8, n: i64) -> i64
+    if pos + n > cap
+        return -1
+    for i in 0..n
+        *(dst + pos + i) = *(src + i)
+    return pos + n
+
+
+# Copy the worker's header block `src[0..len)` ("status\r\n" + header lines,
+# ended by an empty line) into `dst`, dropping every Connection line and
+# ending with valet's own: "close" if `closing`, else "keep-alive".
+# Returns the bytes written, or -1 if `cap` is too small.
+pub fn proxy_copy_headers(dst: *u8, cap: i64, src: *u8, len: i64, closing: i32) -> i64
+    var pos: i64 = 0
+    var start: i64 = 0
+    var first: i32 = 1
+    while start < len
+        # One line: [start, end), CRLF (or a bare end of block) after it.
+        var end: i64 = start
+        while end < len and *(src + end) != 10
+            end += 1
+        var text_end: i64 = end
+        if text_end > start and *(src + text_end - 1) == 13
+            text_end -= 1
+        let next: i64 = if end < len then end + 1 else end
+        if text_end == start
+            break                       # the empty line: end of headers
+        if first == 1 or proxy_is_connection_line(src + start, text_end - start) == 0
+            pos = proxy_put(dst, cap, pos, src + start, text_end - start)
+            if pos < 0
+                return -1
+            pos = proxy_put(dst, cap, pos, c"\r\n", 2)
+            if pos < 0
+                return -1
+        first = 0
+        start = next
+
+    if closing != 0
+        pos = proxy_put(dst, cap, pos, c"Connection: close\r\n\r\n", 21)
+    else
+        pos = proxy_put(dst, cap, pos, c"Connection: keep-alive\r\n\r\n", 26)
+    return pos
