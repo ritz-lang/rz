@@ -52,6 +52,12 @@ Repeat until the goal is met:
    no REAP has probably ended its turn with work pending (#1533). Send it one
    message (`ask_claude=True`) stating its last known state and the current
    `main`, and tell it to resume.
+   **A room that isn't working gets restarted, not worked around.** That
+   covers 401 or expired-token errors in its journal, a `pending-mcp` file
+   in its git dir (`.git/worktrees/rz-task-<id>/pending-mcp`), or no response
+   to a nudge. Run `systemctl --user restart adele-agent@ritz-task-<id>`,
+   then send it that nudge. It picks up the current token at startup. Never
+   merge a commit the room hasn't REAPed, even with a passing gate log.
 4. **No tickets for the milestone?** Spawn a **survey room**: it measures the
    milestone, files one AGAST ticket per defect found, and REAPs with only its
    notes (or no commit at all; see "Survey rooms").
@@ -189,8 +195,21 @@ under 10 minutes, for anything long. The harness ends a turn after 600s of
 silence on a background wait, and a `Monitor` or wakeup can be lost with it
 (#2333). The gate is detached, so `timeout` only ends the wait.
 
+**An MCP call rejected (401, expired or invalid token)? Restart yourself.**
+Don't retry, and don't work around it. Your token is read once, at startup
+(#2546). Save the message you were sending, schedule your own restart, and
+end your turn:
+```bash
+P=$(git rev-parse --git-dir)/pending-mcp   # outside the tree, never committed
+printf '%s\n' "REAP ritz-task-<id> <full-sha> — <one line>" > "$P"
+systemd-run --user --on-active=15 systemctl --user restart adele-agent@ritz-task-<id>.service
+```
+On every rejoin, check for that file first. If it's there, send its line
+exactly as in step 8, then delete it.
+
 **Never** check out or push `main`, merge anything, remove your worktree,
-stop your unit or delete your branch. `rz` does that after merging.
+stop or disable your unit (the scheduled restart above is the one
+exception), or delete your branch. `rz` does that after merging.
 ````
 
 ## Reaping
