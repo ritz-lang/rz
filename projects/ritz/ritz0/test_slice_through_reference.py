@@ -227,8 +227,8 @@ def test_a_vec_slice_into_a_span_is_refused_on_ritz1(compile_with, kind, compile
              "this slice of a Vec, Span or String isn't lowered by ritz1")
 
 
-# An array doesn't slice, so neither does a pointer to one (R9 rule 6).  ritz0's
-# refusal is unlocated: #2521.
+# An array doesn't slice, so neither does a pointer to one (R9 rule 6).  ritz0
+# says so located too (#2521, test_slice_only_three.py).
 ARRAY = (f"{HEADER}fn f(p: *[4]i32) -> i32\n    let t = p[1..3]\n    return 0\n\n"
          "pub fn main() -> i32\n    var a: [4]i32 = [10, 20, 30, 40]\n    return f(@a)\n")
 
@@ -243,11 +243,12 @@ def test_a_slice_through_a_pointer_to_an_array_is_refused(compile_with, compiler
 def test_ritz0_refuses_a_slice_through_a_pointer_to_an_array(compile_with):
     comp, _, _ = compile_with("ritz0", "array", ARRAY)
     assert comp.returncode != 0
-    assert "Only String, Vec and Span types support slicing" in comp.stdout + comp.stderr
+    assert "a pointer to an array can't be sliced" in comp.stdout + comp.stderr
+    assert "main.ritz:" in comp.stdout + comp.stderr
 
 
-# One level (R9 rule 5): `pp[lo..hi]` on a `**Vec` isn't the Vec's slice.  ritz0
-# refuses it, unlocated; ritz1 reads garbage.  Both are #2521's.
+# One level (R9 rule 5): `pp[lo..hi]` on a `**Vec` isn't the Vec's slice.  All
+# three refuse it, located (#2521, test_slice_only_three.py).
 DOUBLE = (f"{HEADER}fn f(pp: **Vec<i32>) -> i32\n    let t = pp[1..3]\n    return t[0]\n\n"
           f"pub fn main() -> i32\n{BOXES['Vec'][0]}    var p: *Vec<i32> = @v\n    return f(@p)\n")
 

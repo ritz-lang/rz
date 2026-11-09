@@ -462,14 +462,6 @@ def test_an_element_slice_is_not_a_store_target(compile_with, compiler):
     assert comp.returncode != 0
 
 
-# `a[lo..hi]` points into the array, at an element that's still a whole pointer.
-# ritz0 refuses the slice.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_a_slice_of_the_array_is_not_an_element(run_with, compiler):
-    assert run_with(compiler, "range", _x(_is("*a[0..2]", "a[0] as i64"))) == 0
-
-
 _FOR_G = "var g: [2]*i16\n\n"
 _FOR_H = "struct H\n    a: [2]*i16\n\n"
 # AGAST #2375: `for p in` a global or a field binds what the element points at,

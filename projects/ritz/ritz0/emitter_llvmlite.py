@@ -8551,9 +8551,12 @@ class LLVMEmitter:
                         return self._emit_span_slice(expr)
 
         # Non-identifier receivers (e.g. `self.data[a..b]`, parameters, call
-        # results): fall back to the inferred Ritz type.
-        inferred = self._infer_ritz_type(expr.expr)
-        while isinstance(inferred, (rast.PtrType, rast.RefType)):
+        # results): fall back to the inferred Ritz type.  Through one pointer
+        # or reference only (R9 rule 5): behind a `**Vec` is a pointer, and
+        # stripping every level handed vec_slice the `*Vec` (AGAST #2521).
+        base_type = self._infer_ritz_type(expr.expr)
+        inferred = base_type
+        if isinstance(inferred, (rast.PtrType, rast.RefType)):
             inferred = inferred.inner
         if isinstance(inferred, rast.NamedType):
             if inferred.name == 'Span' or inferred.name.startswith('Span$'):
@@ -8565,8 +8568,25 @@ class LLVMEmitter:
                     return self._emit_vec_span_slice(expr, inferred, inferred.name)
                 return self._emit_vec_slice(expr, inferred.name, inferred)
 
-        raise ValueError(f"Slice operation not supported for this type. "
-                         f"Only String, Vec and Span types support slicing.")
+        # AGAST #2521: located, worded as ritz1 words it, at the index.
+        raise EmitError(f"{self._unsliceable(base_type)} can't be sliced "
+                        f"(only String, Vec and Span can)", expr.span)
+
+    @staticmethod
+    def _unsliceable(base_type: Optional[rast.Type]) -> str:
+        """What a refused slice's base is, as the refusal names it."""
+        pointers = (rast.PtrType, rast.RefType)
+        if isinstance(base_type, rast.ArrayType):
+            return "an array"
+        if isinstance(base_type, pointers):
+            if isinstance(base_type.inner, rast.ArrayType):
+                return "a pointer to an array"
+            if isinstance(base_type.inner, pointers):
+                return "a pointer to a pointer"
+            return "a pointer"
+        if isinstance(base_type, rast.NamedType):
+            return "a struct"
+        return "this"
 
     def _emit_span_slice(self, expr: rast.SliceExpr) -> ir.Value:
         """Emit span slice: `s[a..b]` -> `Span<T> { ptr + a, b - a }`.

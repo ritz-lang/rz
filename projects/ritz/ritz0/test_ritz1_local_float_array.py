@@ -112,28 +112,3 @@ pub fn main() -> i32
 @pytest.mark.integration
 def test_local_float_array_addr_of_element(ritz1_bin, tmp_path):
     assert _run("ritz1", tmp_path, "addr_of", ADDR_OF) == 42
-
-
-# `loc[a..b]` is a pointer to element a (AGAST #110), GEP'd at the alloca's
-# element type: with an i64 stride `a[2..4]` would point at a[4], past the
-# end.  Also pins that get_expr_type does not call a range index an f32
-# (the `as *u32` cast would then be an fptosi of a pointer).
-SLICE = """\
-pub fn main() -> i32
-    var a: [4]f32 = [1.0, 2.0, 3.0, 4.0]
-    var d: [3]f64 = [1.0, 2.0, -0.5]
-    let q: *u32 = a[2..4] as *u32
-    if q[0] != 0x40400000
-        return 1
-    if q[1] != 0x40800000
-        return 2
-    let r: *u64 = d[2..3] as *u64
-    if r[0] != 0xBFE0000000000000
-        return 3
-    return 42
-"""
-
-
-@pytest.mark.integration
-def test_local_float_array_range_slice(ritz1_bin, tmp_path):
-    assert _run("ritz1", tmp_path, "slice", SLICE) == 42

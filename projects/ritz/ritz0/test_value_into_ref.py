@@ -290,8 +290,9 @@ def test_a_pattern_binds_its_own_instances_payload(tmp_path, order):
 
 def test_a_range_of_a_pointer_is_not_a_value_in_a_slot(tmp_path):
     """`p[1..3]` is a slice, not an element, so it's no `T` in a `*T`. ritz0
-    doesn't slice a raw pointer at all; test_ritz1_ptr_range_stride.py has ritz1."""
+    doesn't slice a raw pointer at all, and nor does ritz1 (test_slice_only_three.py)."""
     src = _main("fn tail(p: *i32) -> *i32\n    p[1..3]\n", "    0\n")
     comp, _, _ = _compile("ritz0", tmp_path, "range", src)
     assert comp.returncode != 0
-    assert "Slice operation not supported" in comp.stdout + comp.stderr
+    assert "main.ritz:" in comp.stdout + comp.stderr
+    assert "a pointer can't be sliced (only String, Vec and Span can)" in comp.stdout + comp.stderr

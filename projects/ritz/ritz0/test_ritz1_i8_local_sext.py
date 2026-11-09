@@ -141,8 +141,6 @@ pub fn main() -> i32
     g = p
     if *(g + 2) != -3
         return 5
-    if *(g[2..4]) != -3
-        return 6
     # unsigned control: *u8 keeps zero-extending
     var b: [1]u8 = [253]
     let bp: *u8 = @b as *u8
@@ -155,9 +153,8 @@ COMPILERS = ["ritz0", "ritz1"]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1"])
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_i8_ptr_deref(compiler, tmp_path):
-    # ritz1 only: ritz0 rejects slicing a bare pointer (`g[2..4]`).
     assert _run(compiler, tmp_path, "i8_deref", DEREF) == 42
 
 
