@@ -13605,6 +13605,21 @@ class LLVMEmitter:
             raise EmitError(f"non-exhaustive match: missing {', '.join(gap)}", expr.span)
 
     @staticmethod
+    def _require_reachable(expr: rast.Match, gap, test) -> None:
+        """Refuse an arm no value can reach (LARB R13, AGAST #2349).
+
+        Arms are tried in order, so before this `_ => 1 / 5 => 2` gave 2 here
+        (the catch-all became the switch default and `5` still a case) and 1
+        on ritz1, silently, and a repeated value failed at clang, unlocated.
+        `gap` is the R6 check for this scrutinee, asked of the arms so far.
+        """
+        found = match_coverage.unreachable_arm(expr.arms, gap, test)
+        if found:
+            arm, cover = found
+            raise EmitError(f"unreachable match arm: the arm at line "
+                            f"{cover.pattern.span.line} covers it", arm.pattern.span)
+
+    @staticmethod
     def _int_const_fits(const: ir.Constant, width: int) -> bool:
         """True if integer constant `const` is representable in `width` bits.
 
@@ -13793,6 +13808,10 @@ class LLVMEmitter:
         self._refuse_arm_names(expr, lambda name: False)
         self._require_covered(expr, match_coverage.union_gap(
             expr.arms, variants, self._types_equal, type_to_string))
+        self._require_reachable(
+            expr, lambda arms: match_coverage.union_gap(
+                arms, variants, self._types_equal, type_to_string),
+            match_coverage.union_test(type_to_string))
 
         # Store union to memory so we can extract tag and data
         union_alloca = self.builder.alloca(union_type, name="match.union")
@@ -13919,8 +13938,15 @@ class LLVMEmitter:
         enum_type, variants = self.enum_types[enum_name]
         variant_names = {variant.name for variant in variants}
         self._refuse_arm_names(expr, lambda name: name in variant_names)
-        self._require_covered(expr, match_coverage.enum_gap(
-            expr.arms, [variant.name for variant in variants]))
+        names = [variant.name for variant in variants]
+        self._require_covered(expr, match_coverage.enum_gap(expr.arms, names))
+        # An arm naming a variant this enum doesn't declare is that error, not
+        # an unreachable arm, though it follows every variant (AGAST #2349).
+        for arm in expr.arms:
+            if isinstance(arm.pattern, rast.VariantPattern):
+                self._require_enum_variant(enum_name, arm.pattern.name, arm.pattern.span)
+        self._require_reachable(expr, lambda arms: match_coverage.enum_gap(arms, names),
+                                match_coverage.enum_test(variant_names))
 
         # Store enum to memory so we can extract tag and data. Matching on a
         # place (`match self.cmap`) can hand us a pointer to the enum rather
@@ -14257,6 +14283,9 @@ class LLVMEmitter:
         self._refuse_arm_names(expr, self._is_integer_const)
         gap = match_coverage.bool_gap if is_bool else match_coverage.scalar_gap
         self._require_covered(expr, gap(expr.arms, self.constants))
+        values = {name: value for name, (value, _ty) in self.constants.items()}
+        self._require_reachable(expr, lambda arms: gap(arms, values),
+                                match_coverage.scalar_test(values))
 
         # Create blocks for each arm and the merge block
         arm_blocks = []

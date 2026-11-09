@@ -1878,6 +1878,80 @@ fn main() -> i32
     0
 ```
 
+Arms are tried top to bottom, and the first that matches wins. Every arm must
+also be reachable: an arm that no value can reach is a compile error at that
+arm, naming the line of the arm that covers it. An arm is unreachable when it
+comes after:
+
+- an unguarded catch-all, `_` or a binding;
+- an arm with the same literal or the same `const` value (`K =>` then `5 =>`,
+  where `K` is 5);
+- an arm for the same variant, whatever its payload binds; or
+- arms that already cover the scrutinee, so a `_` after every variant, or after
+  `true` and `false`, is an error too.
+
+A guarded arm covers nothing, as for coverage, but it can itself be
+unreachable. Since no arm hides behind another, reordering the arms of a match
+that compiles never changes which arm a value takes.
+
+```ritz expect-error="unreachable match arm: the arm at line 3 covers it"
+fn f(n: i64) -> i64
+    match n
+        _ => 1
+        5 => 2
+
+fn main() -> i32
+    f(5) as i32
+```
+
+A misspelt `const` is a binding, so it takes every value, and the arm after it
+is the one in error:
+
+```ritz expect-error="unreachable match arm: the arm at line 5 covers it"
+const KK: i64 = 1
+
+fn f(n: i64) -> i64
+    match n
+        KX => 1
+        KK => 2
+
+fn main() -> i32
+    f(1) as i32
+```
+
+A repeated variant names the first arm for it, and a catch-all after every
+variant names the arm that completed the coverage:
+
+```ritz expect-error="unreachable match arm: the arm at line 5 covers it"
+import ritzlib.option
+
+fn f(o: Option<i64>) -> i64
+    match o
+        Some(v) => v
+        None => 0
+        Some(w) => w
+
+fn main() -> i32
+    f(None) as i32
+```
+
+```ritz expect-error="unreachable match arm: the arm at line 10 covers it"
+enum Color
+    Red
+    Green
+    Blue
+
+fn f(c: Color) -> i32
+    match c
+        Red => 1
+        Green => 2
+        Blue => 3
+        _ => 4
+
+fn main() -> i32
+    f(Color.Red)
+```
+
 ### 8.2 Patterns
 
 #### Literal Patterns

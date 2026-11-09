@@ -1174,12 +1174,12 @@ fn unexpected_token() -> i32
     -1
 
 
-# Prefer: match for multi-way branching
+# Prefer: match for multi-way branching. It covers every variant, so it needs no
+# `_`; one would be unreachable, and an error (LANGUAGE_SPEC §8.1).
 fn dispatch(token: Token) -> i32
     match token.kind
         Ident => handle_ident(token)
         Number => handle_number(token)
-        _ => unexpected_token()
 
 
 # Avoid: chained if/else if for enums

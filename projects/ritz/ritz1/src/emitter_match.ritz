@@ -1359,6 +1359,99 @@ fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name: *u8, len: 
         arm = arm.next
     refused
 
+# --- Reachability (LARB R13, AGAST #2349; LANGUAGE_SPEC §8.1) ----------------
+#
+# Arms are tried top to bottom and the first that matches wins, so an arm no
+# value can reach is an error at its pattern, naming the arm that covers it: an
+# earlier arm testing the same literal, const value or variant, or, once the
+# arms so far leave no gap under R6, the arm that closed it.  ritz0's twin is
+# unreachable_arm in ritz0/match_coverage.py.  No arm has a guard (#1939).
+
+# 1 when `a` and `b` test the same thing.  `ei`/`builtin` say the scrutinee is
+# an enum; otherwise a literal and an integer const compare by value (§8.2).
+fn match_arms_test_same(s: *EmitterState, a: *MatchArm, b: *MatchArm, ei: i32, builtin: i32) -> i32
+    if ei >= 0 or builtin != 0
+        if match_arm_is_variant(s, a, ei, builtin) == 0 or match_arm_is_variant(s, b, ei, builtin) == 0
+            return 0
+        return name_eq(a.pattern_name, a.pattern_name_len, b.pattern_name, b.pattern_name_len)
+    if a.pattern_kind == PAT_BOOL or b.pattern_kind == PAT_BOOL
+        return (a.pattern_kind == b.pattern_kind and a.pattern_int == b.pattern_int) as i32
+    var va: i64 = 0
+    var vb: i64 = 0
+    if match_arm_int_value(s, a, @va) == 0 or match_arm_int_value(s, b, @vb) == 0
+        return 0
+    (va == vb) as i32
+
+# 1 when `arm` names a variant of the scrutinee's enum, whatever it binds.
+fn match_arm_is_variant(s: *EmitterState, arm: *MatchArm, ei: i32, builtin: i32) -> i32
+    if arm.pattern_kind != PAT_IDENT and arm.pattern_kind != PAT_VARIANT
+        return 0
+    match_arm_name_tests(s, arm, ei, builtin)
+
+# The integer a literal or an integer-const arm tests, into `out`; 0 for any other.
+fn match_arm_int_value(s: *EmitterState, arm: *MatchArm, out: *i64) -> i32
+    if arm.pattern_kind == PAT_INT_LIT
+        *out = arm.pattern_int
+        return 1
+    if arm.pattern_kind == PAT_IDENT and match_arm_is_catch_all(s, arm) == 0
+        let ce: *ConstEntry = find_const_entry(s, arm.pattern_name, arm.pattern_name_len)
+        *out = ce.value
+        return 1
+    0
+
+fn match_report_unreachable(s: *EmitterState, arm: *MatchArm, cover: *MatchArm)
+    eprints_cstr(fn_source_file(emitter_current_fn()))
+    eprint_char(':')
+    eprint_i64(arm.head_span.line as i64)
+    eprint_char(':')
+    eprint_i64(arm.head_span.col as i64)
+    eprints_cstr(c": error: unreachable match arm: the arm at line ")
+    eprint_i64(cover.head_span.line as i64)
+    eprints_cstr(c" covers it\n")
+    emit_str(s, c"  ; ERROR: unreachable match arm\n")
+    s.error_count = s.error_count + 1
+
+# 1 when an arm was refused.  Asked once the arms cover the scrutinee (R6).
+fn match_check_reachable(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i32, is_bool: i32) -> i32
+    # How many distinct values or variants close the match without a catch-all:
+    # an integer never closes.
+    var total: i32 = 0
+    if ei >= 0
+        total = enum_variant_count(ei)
+    else if builtin != 0
+        total = 2
+    else if is_bool == 1
+        total = 2
+    let is_enum: i32 = (ei >= 0 or builtin != 0) as i32
+    var seen: i32 = 0
+    var closer: *MatchArm = null
+    var arm: *MatchArm = arms
+    while arm != null
+        # A repeat names the arm it repeats, even once all is covered.
+        var prev: *MatchArm = arms
+        while prev != arm
+            if match_arms_test_same(s, prev, arm, ei, builtin) == 1
+                match_report_unreachable(s, arm, prev)
+                return 1
+            prev = prev.next
+        if closer != null
+            match_report_unreachable(s, arm, closer)
+            return 1
+        var catch_all: i32 = 0
+        var counts: i32 = 0
+        if is_enum == 1
+            catch_all = (arm.pattern_kind == PAT_WILDCARD or (arm.pattern_kind == PAT_IDENT and match_arm_is_variant(s, arm, ei, builtin) == 0)) as i32
+            counts = match_arm_is_variant(s, arm, ei, builtin)
+        else
+            catch_all = match_arm_is_catch_all(s, arm)
+            counts = (is_bool == 1 and arm.pattern_kind == PAT_BOOL) as i32
+        if counts == 1
+            seen = seen + 1
+        if catch_all == 1 or (total > 0 and seen == total)
+            closer = arm
+        arm = arm.next
+    0
+
 fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name: *u8, enum_name_len: i32, from_arms: i32, line: i32, col: i32)
     var name: *u8 = enum_name
     var len: i32 = enum_name_len
@@ -1397,6 +1490,7 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
             s.error_count = s.error_count + 1
             return
         arm = arm.next
+    let errors_before: i32 = s.error_count
     if ei >= 0
         match_check_enum(s, arms, ei, line, col)
     else if builtin == MATCH_OPTION
@@ -1411,6 +1505,10 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     # scrutinee has: one an arm named is no judge of the arms.
     if from_arms == 0 and name != null
         match_refuse_foreign_arms(s, arms, name, len)
+    # AGAST #2349: then every arm must be reachable, as on ritz0.  A foreign
+    # arm is that error, not an unreachable one, so this comes after it.
+    if s.error_count == errors_before
+        match_check_reachable(s, arms, ei, builtin, is_bool)
 
 # AGAST #2140: 1 when the scrutinee is a borrow, `@place` / `@&place`.
 fn match_scrutinee_is_addr(scr: *Expr) -> i32

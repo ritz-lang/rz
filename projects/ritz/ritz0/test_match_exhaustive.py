@@ -329,6 +329,139 @@ ACCEPTED_RITZ0_ONLY = {
 RITZ1_CANNOT_PARSE = ("union_member_missing", "literal_payload", "two_field_variant",
                       "value_call_argument")
 
+# --- Every arm must be reachable (LARB R13, AGAST #2349) ------------------------
+#
+# Arms are tried top to bottom and the first that matches wins. An arm no value
+# can reach is an error at its pattern, naming the arm that covers it: an
+# unguarded catch-all, an arm testing the same literal, const value or variant,
+# or, when every value is covered by then, the arm that completed the coverage.
+# Before this `_ => 1 / 5 => 2` gave 2 on ritz0 (the catch-all became the switch
+# default and `5` still a case) and 1 on ritz1, silently; a duplicate value
+# failed at clang, unlocated, on ritz0 and took the first arm on ritz1.
+#
+# name -> (source, line, col, line of the covering arm)
+UNREACHABLE = {
+    "after_wildcard": (_int_fn("    match n\n        _ => 1\n        5 => 2\n"), 4, 9, 3),
+    "after_wildcard_statement": ("fn f(n: i64)\n    match n\n        _ => pass\n"
+                                 "        5 => pass\n" + _MAIN, 4, 9, 3),
+    "after_binding": (_int_fn("    match n\n        x => 1\n        5 => 2\n"), 4, 9, 3),
+    "after_a_literal_and_a_wildcard": (_int_fn("    match n\n        1 => 9\n        _ => 1\n"
+                                               "        5 => 2\n"), 5, 9, 4),
+    "wildcard_twice": (_int_fn("    match n\n        _ => 1\n        _ => 2\n"), 4, 9, 3),
+    # Only the first is reported: the later ones are as dead, but one is enough.
+    "two_after_wildcard": (_int_fn("    match n\n        _ => 1\n        5 => 2\n"
+                                   "        6 => 3\n"), 4, 9, 3),
+    "duplicate_literal": (_int_fn("    match n\n        5 => 1\n        5 => 2\n"
+                                  "        _ => 3\n"), 4, 9, 3),
+    "literal_equal_to_const": ("const K: i64 = 5\n" + _int_fn(
+        "    match n\n        K => 1\n        5 => 2\n        _ => 3\n"), 5, 9, 4),
+    "const_equal_to_literal": ("const K: i64 = 5\n" + _int_fn(
+        "    match n\n        5 => 1\n        K => 2\n        _ => 3\n"), 5, 9, 4),
+    # R13's case: `KX` misspells a const, so it binds, and takes every value.
+    "misspelt_const": ("const KK: i64 = 1\n" + _int_fn(
+        "    match n\n        KX => 1\n        KK => 2\n"), 5, 9, 4),
+    "enum_after_wildcard": (_C + "fn f(c: C) -> i64\n    match c\n        _ => 1\n"
+                            "        B => 2\n" + _MAIN, 8, 9, 7),
+    "enum_after_binding": (_C + "fn f(c: C) -> i64\n    match c\n        other => 1\n"
+                           "        B => 2\n" + _MAIN, 8, 9, 7),
+    "enum_duplicate_variant": (_C + "fn f(c: C) -> i64\n    match c\n        R => 1\n"
+                               "        B => 2\n        B => 3\n        G => 4\n" + _MAIN,
+                               9, 9, 8),
+    "enum_duplicate_qualified": (_C + "fn f(c: C) -> i64\n    match c\n        C.B => 1\n"
+                                 "        R => 2\n        B => 3\n        G => 4\n" + _MAIN,
+                                 9, 9, 7),
+    "enum_full_then_wildcard": (_C + "fn f(c: C) -> i64\n    match c\n        R => 1\n"
+                                "        G => 2\n        B => 3\n        _ => 4\n" + _MAIN,
+                                10, 9, 9),
+    # Coverage is complete at the last new variant, whatever order the arms are in.
+    "enum_full_out_of_order_then_binding": (
+        _C + "fn f(c: C) -> i64\n    match c\n        B => 1\n        R => 2\n"
+        "        G => 3\n        other => 4\n" + _MAIN, 10, 9, 9),
+    "option_after_wildcard": (_OPT + "fn f(o: Option<i64>) -> i64\n    match o\n"
+                              "        _ => 1\n        Some(v) => v\n" + _MAIN, 5, 9, 4),
+    # Whatever the payload binds, it is the same variant.
+    "option_duplicate_some": (_OPT + "fn f(o: Option<i64>) -> i64\n    match o\n"
+                              "        Some(v) => v\n        Some(w) => w\n"
+                              "        None => 0\n" + _MAIN, 5, 9, 4),
+    "option_some_then_some_wildcard": (_OPT + "fn f(o: Option<i64>) -> i64\n    match o\n"
+                                       "        Some(v) => v\n        None => 0\n"
+                                       "        Some(_) => 1\n" + _MAIN, 6, 9, 4),
+    "option_full_then_wildcard": (_OPT + "fn f(o: Option<i64>) -> i64\n    match o\n"
+                                  "        Some(v) => v\n        None => 0\n"
+                                  "        _ => 1\n" + _MAIN, 6, 9, 5),
+    "option_unimported_after_wildcard": ("fn f(o: Option<i64>) -> i64\n    match o\n"
+                                         "        _ => 1\n        None => 0\n" + _MAIN,
+                                         4, 9, 3),
+    "result_duplicate_err": (_RES + "fn f(r: Result<i64, i32>) -> i64\n    match r\n"
+                             "        Err(e) => 0\n        Ok(v) => v\n        Err(_) => 1\n"
+                             + _MAIN, 6, 9, 4),
+    "bool_duplicate": ("fn f(b: bool) -> i64\n    match b\n        true => 1\n"
+                       "        true => 2\n        false => 3\n" + _MAIN, 4, 9, 3),
+    "bool_full_then_wildcard": ("fn f(b: bool) -> i64\n    match b\n        true => 1\n"
+                                "        false => 2\n        _ => 3\n" + _MAIN, 5, 9, 4),
+}
+
+# ritz1 parses none of these patterns or types.
+UNREACHABLE_RITZ0_ONLY = {
+    "union_full_then_wildcard": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
+                                 "        i64 => 1\n        bool => 2\n        _ => 3\n" + _MAIN,
+                                 6, 9, 5),
+    "union_duplicate_member": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
+                               "        i64 => 1\n        i64 => 2\n        bool => 3\n" + _MAIN,
+                               5, 9, 4),
+    "two_field_variant_duplicate": ("enum P\n    Two(i64, i64)\n    Z\nfn f(p: P) -> i64\n"
+                                    "    match p\n        Two(a, b) => a\n        Z => 0\n"
+                                    "        Two(_, d) => d\n" + _MAIN, 8, 9, 6),
+}
+
+# Still legal: each arm takes a value no arm above it does. name -> (source, code)
+REACHABLE = {
+    "literal_then_wildcard": ("fn main() -> i32\n    let n: i64 = 5\n    match n\n"
+                              "        5 => 1\n        _ => 2\n", 1),
+    "const_and_another_literal": ("const K: i64 = 5\nfn main() -> i32\n    let n: i64 = 6\n"
+                                  "    match n\n        K => 1\n        6 => 2\n        _ => 3\n", 2),
+    "every_variant_no_catch_all": (_C + "fn main() -> i32\n    let c: C = C.G\n    match c\n"
+                                   "        R => 1\n        G => 2\n        B => 3\n", 2),
+    "some_then_none": (_OPT + "fn f(o: Option<i32>) -> i32\n    match o\n        Some(v) => v\n"
+                       "        None => 8\nfn main() -> i32\n    f(Some(4))\n", 4),
+    "some_wildcard_then_wildcard": (_OPT + "fn f(o: Option<i32>) -> i32\n    match o\n"
+                                    "        Some(_) => 4\n        _ => 8\n"
+                                    "fn main() -> i32\n    f(None)\n", 8),
+}
+
+
+def _unreachable(covering_line):
+    return f"unreachable match arm: the arm at line {covering_line} covers it"
+
+
+def _assert_unreachable(request, compiler, tmp_path, name, entry):
+    source, line, col, covering = entry
+    proc, ll = _compile(request, compiler, tmp_path, source, {})
+    _assert_error(proc, ll, compiler, name, line, col, _unreachable(covering))
+    out = proc.stdout + proc.stderr
+    assert out.count("unreachable match arm") == 1, f"{compiler}, {name}:\n{out[-1500:]}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(UNREACHABLE))
+def test_an_arm_that_cannot_be_reached_is_an_error(request, tmp_path, compiler, name):
+    _assert_unreachable(request, compiler, tmp_path, name, UNREACHABLE[name])
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(UNREACHABLE_RITZ0_ONLY))
+def test_ritz0_only_shapes_that_cannot_be_reached(request, tmp_path, name):
+    _assert_unreachable(request, "ritz0", tmp_path, name, UNREACHABLE_RITZ0_ONLY[name])
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(REACHABLE))
+def test_every_arm_reachable_compiles_and_runs(request, tmp_path, compiler, name):
+    _assert_runs(request, compiler, tmp_path, name, REACHABLE[name])
+
+
 # A `true` pattern tests a bool. On an integer ritz0 emitted `switch i64 true`,
 # which clang rejected, and the pattern is meaningless there either way.
 NOT_A_BOOL = {
@@ -530,6 +663,55 @@ def test_a_guarded_arm_never_counts():
     assert match_coverage.enum_gap([_arm(variant.pattern, guard)], ["R"]) == ["R"]
     assert match_coverage.enum_gap([_arm(wildcard.pattern, guard)], ["R"]) == ["R"]
     assert match_coverage.bool_gap([_arm(wildcard.pattern, guard)], ()) == ["true", "false"]
+
+
+def _scalar_unreachable(arms, constants=None):
+    constants = constants or {}
+    return match_coverage.unreachable_arm(
+        arms, lambda prefix: match_coverage.scalar_gap(prefix, constants),
+        match_coverage.scalar_test(constants))
+
+
+@pytest.mark.unit
+def test_a_guarded_arm_covers_nothing_but_can_itself_be_unreachable():
+    """R13: a guarded arm covers nothing, as in R6; one after `_` is still dead."""
+    wildcard, five, other = _parse_arms("        _ => 1\n        5 => 2\n        _ => 3\n")
+    guard = object()
+    guarded_wildcard = _arm(wildcard.pattern, guard)
+    guarded_five = _arm(five.pattern, guard)
+    assert _scalar_unreachable([guarded_wildcard, five, other]) is None
+    assert _scalar_unreachable([guarded_five, five, other]) is None
+    assert _scalar_unreachable([wildcard, guarded_five]) == (guarded_five, wildcard)
+
+
+@pytest.mark.unit
+def test_the_first_unreachable_arm_is_named_with_its_cover():
+    first, dup, wildcard, late = _parse_arms(
+        "        5 => 1\n        5 => 2\n        _ => 3\n        6 => 4\n")
+    assert _scalar_unreachable([first, dup, wildcard, late]) == (dup, first)
+    assert _scalar_unreachable([first, wildcard, late]) == (late, wildcard)
+    assert _scalar_unreachable([first, wildcard]) is None
+
+
+@pytest.mark.unit
+def test_a_literal_payload_tests_its_variant_but_does_not_cover_it():
+    """ritz0 refuses `Some(0)` today; the rule must not count it the day it parses."""
+    literal, binding, none = _parse_arms(
+        "        Some(0) => 1\n        Some(v) => 2\n        None => 3\n")
+    names = ["Some", "None"]
+    def unreachable(arms):
+        return match_coverage.unreachable_arm(
+            arms, lambda prefix: match_coverage.enum_gap(prefix, names),
+            match_coverage.enum_test(names))
+    assert unreachable([literal, binding, none]) is None
+    assert unreachable([binding, literal, none]) == (literal, binding)
+
+
+@pytest.mark.unit
+def test_a_bool_arm_is_not_the_integer_it_repeats():
+    """`True == 1` in Python, so `true` then `1` must not read as a repeat."""
+    true, one, other = _parse_arms("        true => 1\n        1 => 2\n        _ => 3\n")
+    assert _scalar_unreachable([true, one, other]) is None
 
 
 @pytest.mark.unit
