@@ -932,10 +932,33 @@ fn set_local_pointee_array(s: *EmitterState, name: *u8, len: i32, size: i32, ele
         loc.pointee_array_elem_type = elem
 
 # AGAST #2343: U, on the same local, for `*[N]*U`.
+# AGAST #2522: and on its `p#` view, which add_array_view bound before U was known.
 fn set_local_pointee_elem(s: *EmitterState, name: *u8, len: i32, pointee: i32)
-    let loc: *LocalVar = find_local_struct_name(s, name, len)
-    if loc != null
-        loc.pointee_array_elem_pointee = pointee
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx < 0
+        return
+    let loc: *LocalVar = local_at(s, idx)
+    loc.pointee_array_elem_pointee = pointee
+    if idx < 1
+        return
+    let view: *LocalVar = local_at(s, idx - 1)
+    if view.array_view == 1 and view.reg == loc.reg
+        view_holds_pointers(view, pointee)
+
+# AGAST #2522: the `p#` view of a `*[N]*U` is a `**U`, bound as a `**U` param is:
+# pointee TYPE_PTR, U the inner pointee.  A `*T` view with a TYPE_PTR pointee read
+# and stored `*p[i]` at 8 bytes, whatever U was (#2330's 70 for 72).
+fn view_holds_pointers(view: *LocalVar, pointee: i32)
+    if view.pointee_type != TYPE_PTR or pointee == TYPE_VOID
+        return
+    view.var_type = TYPE_PTR_PTR
+    view.inner_pointee_type = pointee
+
+# AGAST #2522: 1 for the view of a `*[N]*U` whose U wasn't recorded.  It's still a
+# `*T` over pointers, which would read and store `*p[i]` at 8 bytes, so it isn't
+# used: `p[i]` keeps #2321's located refusal.
+pub fn view_lacks_pointee(view: *LocalVar) -> i32
+    (view.pointee_type == TYPE_PTR and view.var_type != TYPE_PTR_PTR) as i32
 
 # AGAST #2330, LARB R9: `p[i]` on a `*[N]T`, `@[N]T` or `@&[N]T` local is element i
 # at stride T, as a place: read, store, `+=`, `@`, `@&`, `.f`, a by-value copy.
@@ -944,7 +967,8 @@ fn set_local_pointee_elem(s: *EmitterState, name: *u8, len: i32, pointee: i32)
 # `*(p# + i)`.  The slot holds the array's address, which is element 0's, and a
 # store to `p` moves both.  Call it just BEFORE adding `p`, so `p` is still the
 # last local (its binders read local_at(count - 1)) and the view rolls back with
-# it.  Rows and pointer elements get no view: they keep #2321's located refusals.
+# it.  Rows get no view: they keep #2321's located refusal.  A `*[N]*U`'s view is a
+# `**U` (set_local_pointee_elem, #2522).
 pub fn add_array_view(s: *EmitterState, name: *u8, len: i32, reg: i32, kind: i32, pointee: i32, size: i32, elem: i32, type_name: *u8, type_name_len: i32)
     if pointee != TYPE_ARRAY or size <= 0
         return
@@ -964,9 +988,10 @@ fn array_view_elem_ok(s: *EmitterState, elem: i32, type_name: *u8, type_name_len
     if elem == TYPE_STRUCT
         if type_name_len <= 0 or find_struct(s, type_name, type_name_len) == null
             return 0
-    else if elem == TYPE_PTR or elem == TYPE_PTR_PTR or ptr_pointee_size(s, elem, null, 0) == 0
-        # `*[N]*U`: `*p[1] = 7` stored past a `*i16`'s pointee through a view, so
-        # it keeps #2321's refusal (#2330's NOT DONE).
+    else if elem == TYPE_PTR
+        # `*[N]*U` (#2522): set_local_pointee_elem makes the view a `**U`.
+        return 1
+    else if elem == TYPE_PTR_PTR or ptr_pointee_size(s, elem, null, 0) == 0
         return 0
     1
 
@@ -1016,6 +1041,9 @@ pub fn base_array_view(s: *EmitterState, root: *Expr) -> *LocalVar
     v.inner_pointee_type = TYPE_VOID
     v.pointee_array_elem_type = TYPE_VOID
     v.pointee_array_elem_pointee = TYPE_VOID
+    view_holds_pointers(v, pa.param_pointee_array_elem_pointee)   # AGAST #2522
+    if view_lacks_pointee(v) == 1
+        return null
     v
 
 var g_base_spills: i32 = 0
@@ -3817,8 +3845,8 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
 # AGAST #2332: U when `x` is an element of a `[N]*U` array (local, param, global,
 # or field at any depth, N-D too) or that element `+ k`, with a struct U's name in
 # *out_name / *out_len.  TYPE_VOID for anything else, so an integer `a[i] + 1`
-# stays an integer.  A `[N]**U` element is ptr_levels_of's, and `*[N]*U` is
-# refused (#2347).
+# stays an integer.  `p[i]` through a `*[N]*U` is such an element too (#2522); a
+# `[N]**U` element is ptr_levels_of's.
 fn array_elem_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
@@ -3846,6 +3874,17 @@ fn array_elem_record(s: *EmitterState, b: *Expr, out_elem: *i32, out_pointee: *i
     if b == null or b.kind != EXPR_INDEX or b.left == null
         return
     if b.right != null and b.right.kind == EXPR_RANGE
+        return
+    # AGAST #2522: `p[i]` through a `*[N]*U`, `@[N]*U` or `@&[N]*U` is an element of
+    # the array behind it (LARB R9), and its `**U` view records U.  Without this
+    # `*p[i] = v` stored 8 bytes into a U, and `p[i][j]` / `p[i] + k` had no stride.
+    let view: *LocalVar = index_through(s, b)
+    if view != null and view.array_view == 1
+        if view.var_type == TYPE_PTR_PTR
+            *out_elem = TYPE_PTR
+            *out_pointee = view.inner_pointee_type
+            *out_name = view.type_name
+            *out_len = view.type_name_len
         return
     var depth: i32 = 0
     let sh: *ArrayShape = nd_index_shape(s, b, @depth)

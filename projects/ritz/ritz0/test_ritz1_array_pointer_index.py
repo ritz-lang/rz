@@ -757,44 +757,110 @@ def test_ritz1_refuses_to_index_a_pointer_to_rows(compile_with, name, compiler):
     assert "a pointer to a multi-dimensional array can't be indexed" in comp.stderr
 
 
-# `p[i]` over a pointer to an array of pointers stays refused on ritz1 (#2522).  R9
-# makes it element i, and ritz0 reads these (72 for the stores), but #2330's view
-# stored 8 bytes through `*p[1]` (70), so it isn't lowered that way.  `a[i]` on the array itself is #2332's, and
-# test_ritz1_array_ptr_element.py covers it.
+# `p[i]` over a pointer to an array of pointers is element i, a pointer (LARB R9,
+# #2522).  The traps are widths: a store through `*p[1]` writes the element's
+# pointee, not 8 bytes (#2330's view gave 70 for 72 at i16, clobbering x[1]).  A
+# second array right behind x catches a store that runs past it.  `a[i]` on the
+# array itself is #2332's, and test_ritz1_array_ptr_element.py covers it.
+# {t}: the pointee; x[0] and x[1] are 1 and 2, so a right store of 7 into x[0]
+# answers 72 and a read of x[0], x[1] answers 13 when the elements are swapped.
 _PTRS = """
 pub fn main() -> i32
-    var x: [2]i16
+    var x: [2]{t}
+    var y: [2]{t}
     x[0] = 1
     x[1] = 2
-    var a: [2]*i16
+    y[0] = 4
+    y[1] = 4
+    var a: [2]*{t}
     a[0] = @x[1]
     a[1] = @x[0]
-    return f({addr}a) + (x[0] * 10 + x[1]) as i32
+    return f({addr}a) + (x[0] * 10 + x[1]) as i32 + (y[0] + y[1]) as i32 - 8
 """
-POINTER_ELEMENT = {
-    "deref_store": ("fn f(p: *[2]*i16) -> i32\n    *p[1] = 7\n    return 0\n" + _PTRS.format(addr="@"), 72),
-    "deref_store_reference": ("fn f(p: @[2]*i16) -> i32\n    *p[1] = 7\n    return 0\n" + _PTRS.format(addr="@"), 72),
-    "deref_store_mut_reference": ("fn f(p: @&[2]*i16) -> i32\n    *p[1] = 7\n    return 0\n" + _PTRS.format(addr="@&"), 72),
-    "deref_load": ("fn f(p: *[2]*i16) -> i32\n    return *p[1] as i32\n" + _PTRS.format(addr="@"), 13),
-    "infer_then_deref": ("fn f(p: *[2]*i16) -> i32\n    let q = p[1]\n    return *q as i32\n" + _PTRS.format(addr="@"), 13),
-    "annotated": ("fn f(p: *[2]*i16) -> i32\n    let q: *i16 = p[1]\n    return *q as i32\n" + _PTRS.format(addr="@"), 13),
+# all: every kind.  w: the writable kinds; the element's own store goes through the
+# array, which `@[N]T` refuses (§3.2).  A store through the element is the
+# pointee's business (#2443), so `@` takes those.  *: `*` only, a read.
+_PTR_FNS = {
+    "deref_store": ("all", "fn f(p: {k}[2]*{t}) -> i32\n    *p[1] = 7\n    return 0\n", 72),
+    "deref_store_plus": ("all", "fn f(p: {k}[2]*{t}) -> i32\n    *p[1] += 6\n    return 0\n", 72),
+    "index_store": ("all", "fn f(p: {k}[2]*{t}) -> i32\n    p[1][1] = 9\n    return 0\n", 19),
+    "deref_load": ("*", "fn f(p: {k}[2]*{t}) -> i32\n    return *p[1] as i32\n", 13),
+    "index_load": ("*", "fn f(p: {k}[2]*{t}) -> i32\n    return p[1][0] as i32 * 100 + p[0][0] as i32\n", 114),
+    "infer_then_deref": ("*", "fn f(p: {k}[2]*{t}) -> i32\n    let q = p[1]\n    return *q as i32\n", 13),
+    "annotated": ("*", "fn f(p: {k}[2]*{t}) -> i32\n    let q: *{t} = p[1]\n    return *q as i32\n", 13),
+    "element_store": ("w", "fn f(p: {k}[2]*{t}) -> i32\n    p[1] = p[0]\n    *p[1] = 5\n    return 0\n", 15),
+    "address": ("w", "fn f(p: {k}[2]*{t}) -> i32\n    let pp: **{t} = @p[0]\n    **pp = 8\n    return 0\n", 18),
 }
+POINTER_ELEMENT = {}
+for _t in ("u8", "i16", "i32", "u64"):
+    for _kind in ("pointer", "reference", "mut_reference"):
+        for _form, (_only, _fn, _want) in _PTR_FNS.items():
+            spelled, addr = KINDS[_kind]
+            if (_only == "*" and _kind != "pointer") or (_only == "w" and _kind not in WRITABLE):
+                continue
+            POINTER_ELEMENT[f"{_form}_{_kind}_{_t}"] = (
+                _fn.format(k=spelled, t=_t) + _PTRS.format(t=_t, addr=addr), _want)
+# A struct pointee: `p[1].x` through the element.
+_SP = """struct S
+    x: i32
+    y: i32
+
+fn f(p: {k}[2]*S) -> i32
+{body}
+pub fn main() -> i32
+    var s: [2]S
+    var t: [2]S
+    s[0].x = 1
+    s[0].y = 2
+    s[1].x = 3
+    s[1].y = 4
+    t[0].x = 5
+    var a: [2]*S
+    a[0] = @s[1]
+    a[1] = @s[0]
+    return f({addr}a) + s[0].x * 10 + s[0].y + t[0].x - 5
+"""
+for _kind in ("pointer", "reference", "mut_reference"):
+    spelled, addr = KINDS[_kind]
+    POINTER_ELEMENT[f"struct_load_{_kind}"] = (
+        _SP.format(k=spelled, addr=addr, body="    return p[1].y * 10 + p[0].x\n"), 35)
+    POINTER_ELEMENT[f"struct_store_{_kind}"] = (
+        _SP.format(k=spelled, addr=addr, body="    p[1].x = 7\n    return 0\n"), 72)
+    POINTER_ELEMENT[f"struct_field_address_{_kind}"] = (
+        _SP.format(k=spelled, addr=addr, body="    let q: *i32 = @p[1].y\n    *q = 6\n    return 0\n"), 16)
+
+
+# Bases that aren't locals (#2329) bind their view at the site (through_spill).
+_PMAIN = _PTRS.replace("    return f({addr}a)", "{setup}    return f({arg})")
+for _t in ("i16", "i32"):
+    for _base, _decl, _setup, _arg, _b in (
+            ("field", "struct H\n    r: *[2]*{t}\n\nfn f(h: *H) -> i32\n", "    var h: H\n    h.r = @a\n", "@h", "h.r"),
+            ("global", "var g: *[2]*{t}\n\nfn f(z: i32) -> i32\n", "    g = @a\n", "0", "g"),
+            ("call", "fn h(p: *[2]*{t}) -> *[2]*{t}\n    return p\n\nfn f(p: *[2]*{t}) -> i32\n", "", "@a", "h(p)")):
+        for _form, _body, _want in (("deref_store", "    *B[1] = 7\n    return 0\n", 72),
+                                    ("deref_load", "    return *B[1] as i32\n", 13),
+                                    ("index_store", "    B[1][1] = 9\n    return 0\n", 19)):
+            POINTER_ELEMENT[f"{_base}_{_form}_{_t}"] = (
+                _decl.format(t=_t) + _body.replace("B", _b)
+                + _PMAIN.format(t=_t, setup=_setup, arg=_arg), _want)
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(POINTER_ELEMENT))
-def test_ritz0_reads_a_pointer_element(run_with, name):
+def test_a_pointer_element(run_with, name, compiler):
     program, expected = POINTER_ELEMENT[name]
-    assert run_with("ritz0", name, program) == expected
+    assert run_with(compiler, name, program) == expected
 
 
+# §3.2: the element of an `@[N]*U` is the array's, so storing one is refused, at
+# the place; a store through it is the pointee's business, and runs above.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(POINTER_ELEMENT))
-def test_ritz1_refuses_a_pointer_element(compile_with, name, compiler):
-    comp, _, _ = compile_with(compiler, name, POINTER_ELEMENT[name][0])
-    assert comp.returncode != 0
-    assert "array of pointers" in comp.stderr
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("op", ["    p[1] = p[0]\n", "    p[1] += 1\n"])
+def test_a_shared_pointer_element_is_read_only(compile_with, op, compiler):
+    program = "fn f(p: @[2]*i16) -> i32\n" + op + "    return 0\n" + _PTRS.format(t="i16", addr="@")
+    _located(compile_with, compiler, "shared_ptr_elem", program, ref_rules.WRITE_THROUGH_SHARED, "2:5")
 
 
 # A whole struct element by value.  R9 makes a copy legal: `let s: S = p[i]`, `g(p[i])`.
