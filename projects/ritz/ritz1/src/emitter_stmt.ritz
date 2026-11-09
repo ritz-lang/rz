@@ -52,6 +52,10 @@ fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt) -> i32
     let src: *LocalVar = find_local_struct_name(s, init.operand.ident_ptr, init.operand.ident_len)
     if src == null or (src.var_type != TYPE_PTR and src.var_type != TYPE_PTR_PTR)
         return 0
+    if src.var_type == TYPE_PTR and src.pointee_type == TYPE_ARRAY
+        return infer_ref_to_array_pointer_let(stmt, src)
+    if src.type_name_len > 0 and is_enum_type(src.type_name, src.type_name_len) == 1
+        return infer_ref_to_enum_pointer_let(stmt, src)
     if find_struct(s, src.type_name, src.type_name_len) == null
         return infer_ref_to_scalar_pointer_let(stmt, src)
     stmt.var_type = TYPE_REF
@@ -80,6 +84,43 @@ fn infer_ref_to_scalar_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
     stmt.var_inner_pointee_type = inner
     1
 
+# AGAST #2539: `let r = @q` with `q: *E` or `**E`, E an enum, holds what
+# `let r: **E` / `***E` does: the name, so `**r` loads and stores an %E.  It
+# was an i64: `**r = E.V` stored an i64 of a %E and clang refused it.
+fn infer_ref_to_enum_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
+    var inner: i32 = src.pointee_type
+    if src.var_type == TYPE_PTR_PTR
+        inner = src.inner_pointee_type + PTR_DEPTH_UNIT
+    stmt.var_type = TYPE_PTR_PTR
+    stmt.var_pointee_type = TYPE_PTR
+    stmt.var_inner_pointee_type = inner
+    stmt.var_type_name = src.type_name
+    stmt.var_type_name_len = src.type_name_len
+    1
+
+# AGAST #2539: `let r = @q` with `q: *[N]T` holds what `let r: **[N]T` does: a
+# `**` whose inner pointee is the array, with N and T, so `let p = *r` is a
+# `*[N]T` again.  It was an i64: `p[1]` strode one byte, and a store crashed.
+# Checked before the struct arm: a `*[N]S` names S, and isn't a `*S`.
+fn infer_ref_to_array_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
+    if src.pointee_array_size <= 0
+        return 0
+    stmt.var_type = TYPE_PTR_PTR
+    stmt.var_pointee_type = TYPE_PTR
+    stmt.var_inner_pointee_type = TYPE_ARRAY
+    stmt.var_pointee_array_size = src.pointee_array_size
+    stmt.var_pointee_array_elem_type = src.pointee_array_elem_type
+    1
+
+# AGAST #2539: the `**[N]T` local that `*e` reads a `*[N]T` out of, or null.
+fn array_ptr_ptr_deref_base(s: *EmitterState, e: *Expr) -> *LocalVar
+    if e == null or e.kind != EXPR_UNARY or e.op != OP_DEREF or e.operand == null or e.operand.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, e.operand.ident_ptr, e.operand.ident_len)
+    if loc == null or loc.var_type != TYPE_PTR_PTR or loc.inner_pointee_type != TYPE_ARRAY or loc.pointee_array_size <= 0
+        return null
+    loc
+
 fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     if stmt.var_declared_type == TYPE_VOID and stmt.var_init != null
         # AGAST #2329: `let q = h(p)`, `let q = h.r` and `let q = g` hold what they
@@ -103,10 +144,15 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     # AGAST #2330: `let q = p + k` walks rows, and is the same kind of pointer.
     if src == null and init.kind == EXPR_BINARY and (init.op == OP_ADD or init.op == OP_SUB)
         src = array_ptr_index_base(s, init.left)
+    let pp: *LocalVar = array_ptr_ptr_deref_base(s, init)   # #2539: `let p = *r`
     if src != null
         kind = src.var_type
         size = src.pointee_array_size
         elem = src.pointee_array_elem_type
+    else if pp != null
+        kind = TYPE_PTR
+        size = pp.pointee_array_size
+        elem = pp.pointee_array_elem_type
     else if init.kind == EXPR_UNARY and (init.op == OP_ADDR or init.op == OP_ADDR_MUT) and init.operand != null
         let oper: *Expr = init.operand
         kind = TYPE_REF
@@ -1067,8 +1113,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, stmt.var_fn_sig)  # AGAST #1671
     let declared: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
     declared.holds_shared_ref = shared_ref
-    if var_type == TYPE_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
-        set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308
+    if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
+        set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308, #2539 (`**[N]T`)
         set_local_pointee_elem(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_elem_pointee)
     # An unannotated local takes its initialiser's kind; var_type can't say.
     var inferred_bool: i32 = 0

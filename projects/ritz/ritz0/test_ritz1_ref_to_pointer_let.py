@@ -140,3 +140,145 @@ def test_index_through_deref(run_with, ty, compiler):
         )
         == 0
     )
+
+
+# AGAST #2539: `let r = @q` with `q: *[N]T` or `q: *Enum` stayed an i64 after
+# #2532.  The array form was silent: after `let p = *r`, `p[1]` read the wrong
+# slot (exit 1) and a store through it crashed.  The enum form was invalid IR.
+# ritz0 is the oracle: 0 on every row.  `{ann}` is "" (inferred) or the
+# written-out type, the control: inference must match it.  The written-out
+# `**[3]T` was just as wrong: ritz1's parser dropped N and T past one `*`.
+_ARRAY = """\
+pub fn main() -> i32
+    var x: [3]{t}
+    x[0] = {v0}
+    x[1] = {v1}
+    x[2] = {v2}
+    var q: *[3]{t} = @x
+    let r{ann} = {amp}q
+{body}"""
+
+ARRAY_BODIES = {
+    # The ticket's program: copy the array pointer out, then index it.
+    "copy_out": "    let p = *r\n"
+    "    if p[1] != {v1}\n        return 1\n"
+    "    p[1] = {v3}\n"
+    "    if x[1] != {v3}\n        return 2\n"
+    "    if x[0] != {v0}\n        return 3\n"
+    "    if x[2] != {v2}\n        return 4\n"
+    "    return 0\n",
+    # Index through the deref without the copy.
+    "index_through": "    if (*r)[2] != {v2}\n        return 1\n"
+    "    (*r)[0] = {v3}\n"
+    "    if x[0] != {v3}\n        return 2\n"
+    "    if x[1] != {v1}\n        return 3\n"
+    "    return 0\n",
+    # `*r` is q itself: re-pointing it through r re-points q.
+    "replace_through": "    var y: [3]{t}\n    y[1] = {v3}\n"
+    "    *r = @y\n"
+    "    if q[1] != {v3}\n        return 1\n"
+    "    return 0\n",
+}
+
+ARRAY_TYPES = ["i8", "u8", "i16", "i32", "i64", "f64"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", ARRAY_TYPES)
+@pytest.mark.parametrize("ann", ["inferred", "annotated"])
+@pytest.mark.parametrize("body", sorted(ARRAY_BODIES))
+def test_reference_to_an_array_pointer(request, run_with, body, ann, ty, compiler):
+    if body == "copy_out" and ty == "u8" and compiler == "ritz0":
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True, reason="AGAST #2541: ritz0 sexts a *[N]u8 element"
+            )
+        )
+    if body == "index_through" and compiler in RITZ1S:
+        request.applymarker(
+            pytest.mark.xfail(strict=True, reason="AGAST #2331: (*pp)[i] on a **[N]T")
+        )
+    v0, v1, v2, v3 = SCALARS[ty]
+    amp = "@&" if body == "replace_through" else "@"
+    program = _ARRAY.format(
+        t=ty,
+        v0=v0,
+        v1=v1,
+        v2=v2,
+        amp=amp,
+        ann="" if ann == "inferred" else f": **[3]{ty}",
+        body=ARRAY_BODIES[body].format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3),
+    )
+    assert run_with(compiler, f"arr_{body}_{ann}_{ty}", program) == 0
+
+
+_ENUM = """\
+enum Color
+    Red
+    Green
+    Blue
+
+pub fn main() -> i32
+    var c = Color.Green
+    var q: *Color = @c
+    let r{ann} = @q
+{body}"""
+
+ENUM_BODIES = {
+    "match_load": "    match **r\n        Color.Green => 0\n        _ => 1\n",
+    "store_then_match": "    **r = Color.Blue\n"
+    "    match c\n        Color.Blue => 0\n        _ => 1\n",
+    "store_then_load": "    **r = Color.Red\n"
+    "    let v = **r\n"
+    "    match v\n        Color.Red => 0\n        _ => 1\n",
+    "compare": "    if **r == Color.Green\n        return 0\n    return 1\n",
+    # store_then_load's control: the written-out `v` needs no inference.
+    "store_then_load_annotated_v": "    **r = Color.Red\n"
+    "    let v: Color = **r\n"
+    "    match v\n        Color.Red => 0\n        _ => 1\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ann", ["inferred", "annotated"])
+@pytest.mark.parametrize("body", sorted(ENUM_BODIES))
+def test_reference_to_an_enum_pointer(request, run_with, body, ann, compiler):
+    if body == "store_then_load" and compiler in RITZ1S:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True, reason="AGAST #2542: `let v = *p` isn't typed"
+            )
+        )
+    program = _ENUM.format(
+        ann="" if ann == "inferred" else ": **Color", body=ENUM_BODIES[body]
+    )
+    assert run_with(compiler, f"enum_{body}_{ann}", program) == 0
+
+
+_COLOR = "enum Color\n    Red\n    Green\n    Blue\n\n"
+_S3 = "struct S\n    a: i32\n    b: i32\n\npub fn main() -> i32\n    var x: [3]S\n    x[1].b = 5\n"
+
+AGGREGATE_SHAPES = {
+    # `q: **Color`: `r` is a `***Color`, three levels to the enum.
+    "enum_three_levels": _COLOR
+    + "pub fn main() -> i32\n    var c = Color.Green\n    var p: *Color = @c\n    var q: **Color = @p\n"
+    + "    let r = @q\n    ***r = Color.Blue\n    if ***r != Color.Blue\n        return 1\n"
+    + "    let v: Color = ***r\n    match v\n        Color.Blue => 0\n        _ => 2\n",
+    # One level, no `@q`: the tag compare reads the %Color `*q` loads.
+    "enum_one_level_compare": _COLOR
+    + "pub fn main() -> i32\n    var c = Color.Green\n    var q: *Color = @c\n"
+    + "    if *q == Color.Green\n        return 0\n    return 1\n",
+    # A `*[3]S` names S, but `@q` isn't an `@*S`: re-point q through r.
+    "struct_array_replace": _S3
+    + "    var q: *[3]S = @x\n    let r = @&q\n    var y: [3]S\n    y[1].b = 7\n    *r = @y\n"
+    + _is("q[1].b", "7"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(AGGREGATE_SHAPES))
+def test_reference_to_an_aggregate_pointer_shape(run_with, name, compiler):
+    assert run_with(compiler, name, AGGREGATE_SHAPES[name]) == 0
