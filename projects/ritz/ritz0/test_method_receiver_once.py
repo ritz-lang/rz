@@ -212,8 +212,8 @@ CASES = {
     # The same with the side effect at the root of the place.
     "index_of_call": ("var p = P { x: 1 }\n    mq(@p)[0].get()", 1, 0,
                       NO_CALL_ROOTED_PLACE),
-    "field_through_deref": ("var w = W { p: P { x: 1 } }\n    (*pw(@w)).p.get()", 1, 0,
-                            NO_CALL_ROOTED_PLACE),
+    # AGAST #2526: `(*f()).p` names the struct `*f()` loads.
+    "field_through_deref": ("var w = W { p: P { x: 1 } }\n    (*pw(@w)).p.get()", 1, 0, {}),
     # `a[lo..hi]` is a slice, not a place, and its range is not a value.
     "span_range_index": ("var s = ms()\n    s[idx()..0].len()", 2, 0, NO_SPAN_EMPTY),
     "span_range_end": ("var s = ms()\n    s[0..idx()].len()", 2, 0, NO_SPAN_EMPTY),
