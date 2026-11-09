@@ -480,7 +480,7 @@ DROP_COUNT = DROPS.replace(
     "fn go()\n    var r: R = R { n: 1 }\n    w(r)\n    w(r)\n\n"
     "pub fn main() -> i32\n    go()\n    return drops + 2\n")
 
-IMMUTABLE = "cannot borrow `n` as mutable - already borrowed as immutable"
+IMMUTABLE = "cannot borrow `n` as mutable - `n` is already borrowed as immutable"
 ALIASED = {
     "shared": (INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n    let p = @n\n"
                "    w(n)\n    return *p\n", IMMUTABLE),
@@ -489,7 +489,7 @@ ALIASED = {
                "    let p = @n\n    s.put(n)\n    return *p\n", IMMUTABLE),
     "twice": ("fn w(a:& i32, b:& i32)\n    a = 1\n\n"
               "pub fn main() -> i32\n    var n: i32 = 1\n    w(n, n)\n    return n\n",
-              "cannot borrow `n` as mutable - already borrowed as mutable"),
+              "cannot borrow `n` as mutable - `n` is already borrowed as mutable"),
 }
 NOT_ALIASED = {
     "shared_pointer": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n    var p: *i32 = @n\n"
@@ -669,14 +669,18 @@ def test_a_borrowed_value_drops_once(tmp_path, compiler):
     assert _run(compiler, tmp_path, "drop_count", DROP_COUNT) == 3
 
 
-# ritz0 only: ritz1 has no §13.5 check for `@&x` either (#2310 part 1).
+# §13.5 on all three compilers, at one place (#2438).
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(ALIASED))
-def test_a_borrow_is_a_mutable_borrow_for_the_borrow_rules(tmp_path, name):
+def test_a_borrow_is_a_mutable_borrow_for_the_borrow_rules(tmp_path, compiler, name):
     src, needle = ALIASED[name]
-    error = _error("ritz0", tmp_path, name, src)
+    error = _error(compiler, tmp_path, name, src)
     assert needle in error, error
+    if compiler != "ritz0":
+        assert error == _error("ritz0", tmp_path, f"{name}_oracle", src)
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(NOT_ALIASED))
-def test_a_pointer_passed_on_borrows_nothing(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, NOT_ALIASED[name]) == 3
+def test_a_pointer_passed_on_borrows_nothing(tmp_path, compiler, name):
+    assert _run(compiler, tmp_path, name, NOT_ALIASED[name]) == 3

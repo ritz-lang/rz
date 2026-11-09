@@ -34,7 +34,6 @@ from test_borrow_param_ref_field import _compile, _run
 NO_TUPLES_GAP = "AGAST #1526: ritz1 has no tuples"
 BY_VALUE_ARM_GAP = "AGAST #2288: ritz1 can't read a `:&` by value in an arm"
 ARM_GAP = "AGAST #2288: an `@&x` arm value fails at clang on ritz1, with or without a `:&`"
-NOT_CHECKED_GAP = "AGAST #2310 part 1: ritz1 doesn't check §13.5's first rule, on any binding"
 
 # None of these needs a `:&` to fail. #2309 lists each, and is closing.
 ELEMENT_GAP = "AGAST #2369: `a[0].x` through an `@&C` or `@C` element is `unhandled EXPR_MEMBER` on ritz1"
@@ -279,9 +278,12 @@ pub fn main() -> i32
 """
 
 PROGRAMS.update({
-    # `@T` can't write, so these change the referent and read through it.
-    "let_ref": TYPES + "fn go(c:& C) -> i32\n    let p: @C = @c\n    c.x = 3\n    return p.x\n" + READ,
-    "var_ref": TYPES + "fn go(c:& C) -> i32\n    var p: @C = @c\n    c.x = 3\n    return p.x\n" + READ,
+    # `@T` can't write, so these change the referent and read through it. Not
+    # by its name, which the `@T` borrows (§13.5, #2438), but through a `*T`.
+    "let_ref": TYPES + "fn go(c:& C) -> i32\n    let w: *C = @c\n    let p: @C = @c\n    w.x = 3\n"
+               "    return p.x\n" + READ,
+    "var_ref": TYPES + "fn go(c:& C) -> i32\n    let w: *C = @c\n    var p: @C = @c\n    w.x = 3\n"
+               "    return p.x\n" + READ,
     "assign_ref": TYPES + """\
 fn go(c:& C) -> i32
     var d: C = C { x: 9, y: 0 }
@@ -344,8 +346,9 @@ pub fn main() -> i32
                   + SCALAR_MAIN.replace("CALL", "f(@&n)"),
     "scalar_shared_let": """\
 fn f(n:& i32) -> i32
+    let w: *i32 = @n
     let p: @i32 = @n
-    n = 3
+    *w = 3
     return *p
 
 pub fn main() -> i32
@@ -627,31 +630,31 @@ fn go(c:& C)
     let q: @&C = @&c
     p.x = 2
     q.x = 3
-""", "cannot borrow `c` as mutable - already borrowed as mutable"),
+""", "cannot borrow `c` as mutable - `c` is already borrowed as mutable"),
     "mut_var_then_mut_let": ("""\
 fn go(c:& C)
     var p: @&C = @&c
     let q: @&C = @&c
     q.x = 3
-""", "cannot borrow `c` as mutable - already borrowed as mutable"),
+""", "cannot borrow `c` as mutable - `c` is already borrowed as mutable"),
     "mut_then_untyped": ("""\
 fn go(c:& C)
     let p: @&C = @&c
     let q = @&c
     q.x = 3
-""", "cannot borrow `c` as mutable - already borrowed as mutable"),
+""", "cannot borrow `c` as mutable - `c` is already borrowed as mutable"),
     "shared_then_mut": ("""\
 fn go(c:& C)
     let p: @C = @c
     let q: @&C = @&c
     q.x = 3
-""", "cannot borrow `c` as mutable - already borrowed as immutable"),
+""", "cannot borrow `c` as mutable - `c` is already borrowed as immutable"),
     "mut_then_shared": ("""\
 fn go(c:& C)
     let p: @&C = @&c
     let q: @C = @c
     p.x = 3
-""", "cannot borrow `c` as immutable - already borrowed as mutable"),
+""", "cannot borrow `c` as immutable - `c` is already borrowed as mutable"),
     "from_an_arm": ("""\
 fn go(c:& C, k: i32)
     let p: @&C = if k == 0
@@ -660,7 +663,7 @@ fn go(c:& C, k: i32)
         @&c
     let q: @&C = @&c
     q.x = 3
-""", "cannot borrow `c` as mutable - already borrowed as mutable"),
+""", "cannot borrow `c` as mutable - `c` is already borrowed as mutable"),
     "argument_while_bound": ("""\
 fn g(p: @&C)
     p.x = 3
@@ -668,7 +671,7 @@ fn g(p: @&C)
 fn go(c:& C)
     let p: @&C = @&c
     g(@&c)
-""", "cannot borrow `c` as mutable - already borrowed as mutable"),
+""", "cannot borrow `c` as mutable - `c` is already borrowed as mutable"),
     "lent_on_while_bound": ("""\
 fn g(m:& C)
     m.x = 3
@@ -676,7 +679,13 @@ fn g(m:& C)
 fn go(c:& C)
     let p: @&C = @&c
     g(c)
-""", "cannot borrow `c` as mutable - already borrowed as mutable"),
+""", "cannot borrow `c` as mutable - `c` is already borrowed as mutable"),
+    # A write into the place is a mutable borrow of it (LARB ruling R11, #2438).
+    "write_beside_a_shared_reference": ("""\
+fn go(c:& C)
+    let p: @C = @c
+    c.x = 3
+""", "cannot assign to `c.x` - `c` is already borrowed as immutable"),
 }
 
 # What rule 1 doesn't touch.
@@ -698,12 +707,6 @@ fn go(c:& C)
     p.x = 2
     q.x = p.x + 1
 """ + GO,
-    "write_beside_a_shared_reference": TYPES + """\
-fn go(c:& C) -> i32
-    let p: @C = @c
-    c.x = 3
-    return p.x
-""" + READ,
 }
 
 
@@ -844,7 +847,6 @@ def test_ritz1_conflicts_only_with_a_borrow(ritz1_bin, tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=NOT_CHECKED_GAP)
 @pytest.mark.parametrize("name", sorted(BORROW_CONFLICTS))
 def test_ritz1_written_reference_counts_as_a_borrow(ritz1_bin, tmp_path, name):
     body, message = BORROW_CONFLICTS[name]

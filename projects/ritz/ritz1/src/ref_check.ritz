@@ -70,6 +70,26 @@ var REF_DECL_ROOT_LEN: i32 = 0
 var REF_DECL_TY: RefTy
 var REF_LOOPS: i32 = 0
 
+# A loan of a place, held by a binding declared at ownership scope `depth`
+# (AGAST #2438).  `root` is the place's local's index, and `place` the borrowed
+# expression (an ident, member or index chain down to it); the loan ends when
+# that scope does.
+struct RefLoan
+    root: i32
+    mutable: i32
+    depth: i32
+    place: *Expr
+
+var REF_LOANS: *RefLoan = null
+var REF_LOAN_COUNT: i32 = 0
+var REF_LOAN_CAP: i32 = 0
+# The ownership scope depth of the statement being checked (own_check_stmt).
+var REF_DEPTH: i32 = 0
+# Call arguments being walked, and the depth of an argument's loan: deeper than
+# any scope, so only ref_args ends it.
+var REF_IN_ARGS: i32 = 0
+const REF_LOAN_ARG: i32 = 1000000000
+
 fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.kind = kind
     out.pointee = pointee
@@ -548,6 +568,9 @@ fn ref_payload(s: *EmitterState, a0: *Expr, ei: i32, vi: i32)
         f = f.next
 
 fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
+    # An argument's loan lasts until the call's arguments are done (#2438).
+    let loans: i32 = REF_LOAN_COUNT
+    REF_IN_ARGS = REF_IN_ARGS + 1
     var a: *Expr = a0
     var p: *Param = p0
     while a != null
@@ -555,12 +578,19 @@ fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
             var slot: RefTy
             if p.is_borrow == 1
                 ref_addr_into_mut(s, a)
+                if ref_lends_place(s, a, p) == 1
+                    let root: i32 = ref_loan_root(s, a)
+                    if ref_loan_use(s, a.span.line, a.span.col, root, a, 1, 0) == 1
+                        ref_loan_add(root, a, 1, REF_LOAN_ARG)
                 ref_forget(s, a)
             else if ref_of_param(p, @slot) == 1
                 ref_into(s, a, @slot)
             p = p.next
         ref_walk(s, a)
         a = a.next
+    REF_IN_ARGS = REF_IN_ARGS - 1
+    if REF_LOAN_COUNT > loans
+        REF_LOAN_COUNT = loans
 
 fn ref_walk_list(s: *EmitterState, a0: *Expr)
     var a: *Expr = a0
@@ -639,6 +669,7 @@ fn ref_walk(s: *EmitterState, e: *Expr)
             # the slots go unjudged, as in ritz0.
             mp = m.params
             ref_check_receiver(s, e, mp)
+            ref_loan_receiver(s, e, mp)
             if mp != null and name_eq(mp.name, mp.name_len, c"self", 4) == 1
                 mp = mp.next
             else
@@ -651,6 +682,13 @@ fn ref_walk(s: *EmitterState, e: *Expr)
     else if k == EXPR_ARRAY_FILL
         ref_walk(s, e.left)
     else if k == EXPR_UNARY
+        if e.op == OP_ADDR_MUT or e.op == OP_ADDR
+            var mutable: i32 = 0
+            if e.op == OP_ADDR_MUT
+                mutable = 1
+            let root: i32 = ref_loan_root(s, e.operand)
+            if ref_loan_use(s, e.span.line, e.span.col, root, e.operand, mutable, 0) == 1 and REF_IN_ARGS > 0
+                ref_loan_add(root, e.operand, mutable, REF_LOAN_ARG)
         if e.op == OP_ADDR_MUT
             ref_check_borrow(s, e)
         if e.op == OP_ADDR_MUT or e.op == OP_ADDR
@@ -684,6 +722,8 @@ pub fn ref_begin_fn(s: *EmitterState, f: *FnDef)
     REF_LAST_COL = 0
     REF_LOOPS = 0
     REF_DECL_ROOT = null
+    REF_LOAN_COUNT = 0
+    REF_IN_ARGS = 0
     ref_mark_params(s, f.params)
     if ref_of_fn(f, @REF_RET) == 0
         REF_RET.kind = TYPE_VOID
@@ -737,11 +777,15 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
     let k: i32 = stmt.kind
     ref_check_write(s, stmt)
     ref_walk_target(s, stmt)
+    ref_loan_write(s, stmt)
     var slot: RefTy
     if k == STMT_VAR_DECL
         if stmt.var_init != null and ref_decl_slot(stmt, @slot) == 1
             ref_into(s, stmt.var_init, @slot)
         ref_walk(s, stmt.var_init)
+        # `@x` held in a `*T` isn't a borrow (#2371).
+        if stmt.var_declared_type != TYPE_PTR
+            ref_hold(s, stmt.var_init)
         REF_DECL_ROOT = ref_referent(s, stmt.var_init, @REF_DECL_ROOT_LEN)
         if REF_DECL_ROOT != null and ref_referent_ty(s, stmt.var_init, @REF_DECL_TY) == 0
             REF_DECL_TY.pointee = TYPE_VOID
@@ -1205,3 +1249,302 @@ fn ref_check_return(s: *EmitterState, e: *Expr)
         root = ref_call_referent(s, e, @len)
     if root != null
         ref_error_returns_local(s, e, root, len)
+
+# LANGUAGE_SPEC §13.5's first rule (LARB rulings R11 and R11a, AGAST #2438).  A
+# borrow is of a place: a root local and its field and index steps.  Two places
+# overlap when one's path is a prefix of the other's (field names must match; any
+# two indexes are equal).  While a binding holds an `@T` of a place, or within one
+# call's arguments, a mutable borrow of an overlapping place is a located error
+# naming both places; while it holds an `@&T`, any borrow is.  The mutable borrows
+# are `@&p`, `p` bare into a `:&` param, a receiver taken `self: @&T` or `self:& T`
+# (or as a UFCS fn's first `@&T` param), and a write into p's own storage.  A loan lasts to the end
+# of its holder's block: own_pop_scope calls ref_loans_end.  Only a declaration's
+# value is held, so `p = @x` and a call's `@x` borrow nothing past the statement.
+# ritz0's twin is the loan half of move_checker.py, and
+# ritz0/test_borrow_conflict_all_compilers.py holds all three compilers to it.
+
+pub fn ref_loans_at(depth: i32)
+    REF_DEPTH = depth
+
+pub fn ref_loans_end(depth: i32)
+    let loans: *RefLoan = REF_LOANS
+    var kept: i32 = 0
+    for i in 0..REF_LOAN_COUNT
+        let l: *RefLoan = loans + i
+        if l.depth <= depth or l.depth == REF_LOAN_ARG
+            let to: *RefLoan = loans + kept
+            to.root = l.root
+            to.mutable = l.mutable
+            to.depth = l.depth
+            to.place = l.place
+            kept = kept + 1
+    REF_LOAN_COUNT = kept
+
+# The index of the local whose storage the place `e0` is in, reached by fields and
+# indexes with no pointer or reference on the way, or -1.  An index into a Vec
+# counts as a step of its place (R11a): `@vs[0]` is a loan of `vs[_]`, and a write
+# into `vs[0].a` is a write inside it.
+fn ref_loan_root(s: *EmitterState, e0: *Expr) -> i32
+    var e: *Expr = e0
+    while e != null
+        if e.kind == EXPR_IDENT
+            return find_local_idx(s, e.ident_ptr, e.ident_len)
+        if e.kind != EXPR_MEMBER and e.kind != EXPR_INDEX
+            return 0 - 1
+        var base: RefTy
+        if ref_loan_ty(s, e.left, @base) == 0 or ref_is_pointer(base.kind) == 1
+            return 0 - 1
+        if e.kind == EXPR_INDEX
+            if e.right == null or e.right.kind == EXPR_RANGE
+                return 0 - 1
+        e = e.left
+    0 - 1
+
+# ref_ty_of, also through a Vec's element (`vs[1].a`), for the steps of a place.
+# Only the loan check reads it.  As ritz0's MoveChecker._loan_type.
+fn ref_loan_ty(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
+    if e.kind == EXPR_INDEX or e.kind == EXPR_MEMBER
+        var b: RefTy
+        if ref_loan_ty(s, e.left, @b) == 1 and b.kind == TYPE_STRUCT
+            if e.kind == EXPR_INDEX
+                if ref_vec_elem(s, @b, out) == 1
+                    return 1
+            else
+                let st: *StructDef = find_struct(s, b.name, b.name_len)
+                if st != null
+                    let fi: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+                    if fi >= 0
+                        return ref_of_field(s, e, get_field_type(st, fi), out)
+    ref_ty_of(s, e, out)
+
+# The element of the instantiated `Vec$T` `v`, from its `data: *T` field (as
+# emit_vec_elem_member_ptr finds it): a struct or an integer.  0 otherwise.
+fn ref_vec_elem(s: *EmitterState, v: *RefTy, out: *RefTy) -> i32
+    if v.name_len <= 4 or *v.name != 'V' or *(v.name + 1) != 'e' or *(v.name + 2) != 'c' or *(v.name + 3) != '$'
+        return 0
+    let vec_st: *StructDef = find_struct(s, v.name, v.name_len)
+    if vec_st == null
+        return 0
+    let di: i32 = find_field_index(vec_st, c"data", 4)
+    if di < 0
+        return 0
+    let data: *StructField = get_field_type(vec_st, di)
+    if data.field_type != TYPE_PTR or data.field_type_name_len <= 0
+        return 0
+    if find_struct(s, data.field_type_name, data.field_type_name_len) != null
+        return ref_set(out, TYPE_STRUCT, 0, data.field_type_name, data.field_type_name_len)
+    let k: i32 = vec_name_elem_type(v.name, v.name_len)
+    if k == TYPE_UNKNOWN
+        return 0
+    ref_set(out, k, 0, null, 0)
+
+# How many field and index steps place `e` takes below its root.
+fn ref_place_depth(e0: *Expr) -> i32
+    var n: i32 = 0
+    var e: *Expr = e0
+    while e != null and (e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX)
+        n = n + 1
+        e = e.left
+    n
+
+# Two steps are the same: one field, or any two indexes.
+fn ref_step_eq(a: *Expr, b: *Expr) -> i32
+    if a.kind != b.kind
+        return 0
+    if a.kind == EXPR_INDEX
+        return 1
+    name_eq(a.ident_ptr, a.ident_len, b.ident_ptr, b.ident_len)
+
+# Do places `a0` and `b0`, of one root, overlap: is one's path a prefix of the
+# other's?  Trim the longer to the shorter's length, then compare step by step.
+fn ref_places_overlap(a0: *Expr, b0: *Expr) -> i32
+    var a: *Expr = a0
+    var b: *Expr = b0
+    var da: i32 = ref_place_depth(a)
+    var db: i32 = ref_place_depth(b)
+    while da > db
+        a = a.left
+        da = da - 1
+    while db > da
+        b = b.left
+        db = db - 1
+    while da > 0
+        if ref_step_eq(a, b) == 0
+            return 0
+        a = a.left
+        b = b.left
+        da = da - 1
+    1
+
+# The loan a new borrow of `place` on local `root` (`mutable` or not) conflicts
+# with, or null: an overlapping mutable loan first, else, for a mutable borrow, an
+# overlapping shared one.  As ritz0's MoveChecker._conflict.
+fn ref_loan_conflict(root: i32, place: *Expr, mutable: i32) -> *RefLoan
+    let loans: *RefLoan = REF_LOANS
+    var shared: *RefLoan = null
+    for i in 0..REF_LOAN_COUNT
+        let l: *RefLoan = loans + i
+        if l.root == root and ref_places_overlap(l.place, place) == 1
+            if l.mutable == 1
+                return l
+            if shared == null
+                shared = l
+    if mutable == 1
+        return shared
+    null
+
+# `c.x`, `vs[_]`: a place as the error names it.
+fn ref_eprint_place(e: *Expr)
+    if e == null
+        return
+    if e.kind == EXPR_MEMBER
+        ref_eprint_place(e.left)
+        eprint_char('.')
+        for i in 0..e.ident_len
+            eprint_char(*(e.ident_ptr + i))
+    else if e.kind == EXPR_INDEX
+        ref_eprint_place(e.left)
+        eprints_cstr(c"[_]")
+    else
+        for i in 0..e.ident_len
+            eprint_char(*(e.ident_ptr + i))
+
+# A borrow of `place`, on local `root`, at line:col (a write when `assign` is 1).
+# 1 if there's no conflict, so the borrow can be lent; 0 otherwise.
+fn ref_loan_use(s: *EmitterState, line: i32, col: i32, root: i32, place: *Expr, mutable: i32, assign: i32) -> i32
+    if root < 0
+        return 0
+    let l: *RefLoan = ref_loan_conflict(root, place, mutable)
+    if l == null
+        return 1
+    if ref_first_report(line, col) == 0
+        return 0
+    ref_eprint_loc(line, col)
+    if assign == 1
+        eprints_cstr(c": error: cannot assign to `")
+    else
+        eprints_cstr(c": error: cannot borrow `")
+    ref_eprint_place(place)
+    if assign == 1
+        eprints_cstr(c"` - `")
+    else if mutable == 1
+        eprints_cstr(c"` as mutable - `")
+    else
+        eprints_cstr(c"` as immutable - `")
+    ref_eprint_place(l.place)
+    if l.mutable == 1
+        eprints_cstr(c"` is already borrowed as mutable\n")
+    else
+        eprints_cstr(c"` is already borrowed as immutable\n")
+    s.error_count = s.error_count + 1
+    0
+
+# The method `e` takes its receiver as `p`, its first param.  `self: *T` and
+# `self: @T` don't borrow it mutably, and nor does a receiver that's a pointer.
+fn ref_loan_receiver(s: *EmitterState, e: *Expr, p: *Param)
+    if p == null or p.param_type != TYPE_MUT_REF
+        return
+    var t: RefTy
+    if ref_ty_of(s, e.left, @t) == 0 or ref_is_pointer(t.kind) == 1
+        return
+    ref_loan_use(s, e.left.span.line, e.left.span.col, ref_loan_root(s, e.left), e.left, 1, 0)
+
+# A write into a local's own storage, in each statement form the parser splits a
+# place into.
+fn ref_loan_write(s: *EmitterState, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    var root: Expr
+    var member: Expr
+    var element: Expr
+    var at: i32 = 0 - 1
+    var place: *Expr = null
+    if k == STMT_ASSIGN
+        if stmt.assign_target_len > 0
+            ref_expr_ident(@root, stmt.assign_target, stmt.assign_target_len)
+            place = @root
+            at = find_local_idx(s, stmt.assign_target, stmt.assign_target_len)
+        else
+            place = stmt.if_cond as *Expr
+            at = ref_loan_root(s, place)
+    else if k == STMT_INDEX_ASSIGN
+        ref_expr_ident(@root, stmt.assign_target, stmt.assign_target_len)
+        ref_expr_index(@element, @root)
+        element.right = stmt.while_cond
+        place = @element
+        at = ref_loan_root(s, @element)
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+            ref_expr_ident(@root, stmt.var_name, stmt.var_name_len)
+            ref_expr_member(@member, @root, stmt.assign_target, stmt.assign_target_len)
+        else
+            ref_expr_member(@member, stmt.if_cond as *Expr, stmt.assign_target, stmt.assign_target_len)
+        if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
+            place = @member
+            at = ref_loan_root(s, @member)
+        else
+            ref_expr_index(@element, @member)
+            element.right = stmt.while_cond
+            place = @element
+            at = ref_loan_root(s, @element)
+    else
+        return
+    ref_loan_use(s, stmt.span.line, stmt.span.col, at, place, 1, 1)
+
+# A place (a local, a field or an element) passed bare into the `:&` param `p` is
+# an `@&` of it (#2335, R11a).  A pointer into a `:& U` isn't a place of `U`: it
+# passes what it points at.  As ritz0's MoveChecker._check_place_borrow.
+fn ref_lends_place(s: *EmitterState, a: *Expr, p: *Param) -> i32
+    if a.kind != EXPR_IDENT and a.kind != EXPR_MEMBER and a.kind != EXPR_INDEX
+        return 0
+    var t: RefTy
+    if ref_ty_of(s, a, @t) == 1 and ref_is_pointer(t.kind) == 1 and p.param_pointee_type != TYPE_PTR
+        return 0
+    1
+
+fn ref_loan_add(root: i32, place: *Expr, mutable: i32, depth: i32)
+    if REF_LOAN_COUNT == REF_LOAN_CAP
+        let cap: i32 = REF_LOAN_CAP * 2 + 16
+        let grown: *RefLoan = malloc((cap as i64) * sizeof(RefLoan)) as *RefLoan
+        let was: *RefLoan = REF_LOANS
+        for i in 0..REF_LOAN_COUNT
+            let from: *RefLoan = was + i
+            let to: *RefLoan = grown + i
+            to.root = from.root
+            to.mutable = from.mutable
+            to.depth = from.depth
+            to.place = from.place
+        if REF_LOANS != null
+            free(REF_LOANS as *u8)
+        REF_LOANS = grown
+        REF_LOAN_CAP = cap
+    let l: *RefLoan = REF_LOANS + REF_LOAN_COUNT
+    l.root = root
+    l.mutable = mutable
+    l.depth = depth
+    l.place = place
+    REF_LOAN_COUNT = REF_LOAN_COUNT + 1
+
+# The `@place` and `@&place` a declaration's binding holds: its value, or an arm's
+# tail of an `if` or `match` value.
+fn ref_hold(s: *EmitterState, e: *Expr)
+    if e == null
+        return
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        let root: i32 = ref_loan_root(s, e.operand)
+        if root >= 0
+            var mutable: i32 = 0
+            if e.op == OP_ADDR_MUT
+                mutable = 1
+            ref_loan_add(root, e.operand, mutable, REF_DEPTH)
+    else if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        var arm: *MatchArm = e.args as *MatchArm
+        while arm != null
+            if arm.is_pass == 0 and arm.body != null
+                ref_hold(s, arm.body)
+            else if arm.body_stmts != null
+                var st: *Stmt = arm.body_stmts
+                while st.next != null
+                    st = st.next
+                if st.kind == STMT_EXPR
+                    ref_hold(s, st.expr)
+            arm = arm.next

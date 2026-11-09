@@ -2925,18 +2925,64 @@ The rules are Rust's, minus the lifetimes:
   (mutable) borrow;
 - a borrow must not outlive the owner.
 
-The first rule is checked. Taking `@&x` while an `@x` is live is an error:
+The first rule is checked, on places. A **place** is a root binding followed by
+field (`.f`) and index (`[i]`) steps. Two places **overlap** when one's path is a
+prefix of the other's: field names must match exactly, and any two indexes count
+as equal, since which element an index names isn't known until it runs. Taking
+`@&x` while an `@x` is live is an error, and the error names both places:
 
-```ritz body expect-error="cannot borrow `x` as mutable - already borrowed as immutable"
+```ritz body expect-error="cannot borrow `x` as mutable - `x` is already borrowed as immutable"
 var x: i32 = 1
 let p = @x
 let q = @&x
 ```
 
+A mutable borrow of a place `p` is any of: `@&p`; `p` passed bare to a `:&`
+parameter; a method call on `p` that takes `self: @&T` or `self:& T`; and a write
+(`p = v`, or a write inside `p` such as `p.f = v` or an array element
+`p[i] = v`). Each is an error on any place that overlaps one a binding holds an
+`@` of, or one an earlier argument of the same call borrows (LARB rulings R11 and
+R11a). The binding holds that loan to the end of the block it's declared in.
+`@x` held in a `*T` isn't a borrow, and nor is a `self: *T` receiver.
+
+Disjoint fields of one root don't overlap, so they're free while the other is
+borrowed, and two of them can be lent mutably to one call:
+
+```ritz
+struct C
+    x: i32
+    y: i32
+
+fn swap(a: @&i32, b: @&i32)
+    let t: i32 = *a
+    *a = *b
+    *b = t
+
+fn main() -> i32
+    var c = C { x: 1, y: 2 }
+    swap(@&c.x, @&c.y)      # x is 2, y is 1
+    let p = @c.x
+    c.y = 5                 # `c.y` doesn't overlap `c.x`
+    c.y - *p
+```
+
+Two indexes always overlap, whatever their values:
+
+```ritz body expect-error="cannot assign to `a[_]` - `a[_]` is already borrowed as immutable"
+var a: [3]i32 = [1, 2, 3]
+let p = @a[1]
+a[2] = 5
+```
+
+So a push can't move a Vec's buffer out from under a reference to its element:
+`let p: @H = @vs[0]` is a loan of `vs[_]`, which overlaps `vs`, so `vs.push(h)`
+is refused. A write through a field or element that's itself overlapped
+(`let e = @c.x` then `c.x.k = 2`, or `c.up()`) is refused just the same.
+
 The arguments of one call are live together, so a read of `x` can't sit beside
 `@&x` in them. Read it into a binding first:
 
-```ritz expect-error="cannot borrow `x` as immutable - already borrowed as mutable"
+```ritz expect-error="cannot borrow `x` as immutable - `x` is already borrowed as mutable"
 fn get(n: @i32) -> i32
     *n
 

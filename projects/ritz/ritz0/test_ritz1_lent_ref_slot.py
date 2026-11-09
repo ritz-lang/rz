@@ -131,9 +131,12 @@ def _int_only(t: str) -> dict:
     arg = "@&a[1]"
     by_value = f"let r: {t} = f({arg})\n    a[1] = r"
     return {
-        "shared_let": f"fn f(n:& {t}) -> {t}\n    let p: @{t} = @n\n    n = {v}\n    return *p\n"
+        # Written through a `*T`: by name is a borrow of `n` (§13.5, #2438).
+        "shared_let": f"fn f(n:& {t}) -> {t}\n    let w: *{t} = @n\n    let p: @{t} = @n\n    *w = {v}\n"
+                      f"    return *p\n"
                       + _neighbours(t, by_value),
-        "shared_var": f"fn f(n:& {t}) -> {t}\n    var p: @{t} = @n\n    n = {v}\n    return *p\n"
+        "shared_var": f"fn f(n:& {t}) -> {t}\n    let w: *{t} = @n\n    var p: @{t} = @n\n    *w = {v}\n"
+                      f"    return *p\n"
                       + _neighbours(t, by_value),
         "shared_argument": f"fn g(p: @{t}) -> {t}\n    return *p\n\nfn f(n:& {t}) -> {t}\n    n = {v}\n    return g(@n)\n"
                            + _neighbours(t, by_value),
@@ -227,7 +230,8 @@ def _arrays(t: str) -> dict:
         "tail": f"fn f(a:& [2]{t}) -> @&[2]{t}\n    @&a\n" + main(through),
         "argument": f"fn g(p: @&[2]{t})\n    {store}\n\nfn f(a:& [2]{t})\n    g(@&a)\n" + main("f(@&a)"),
         "pass_on": f"fn g(b:& [2]{t})\n    b[1] = {three}\n\nfn f(a:& [2]{t})\n    g(a)\n" + main("f(@&a)"),
-        "shared_let": f"fn f(a:& [2]{t}) -> {t}\n    let p: @[2]{t} = @a\n    a[1] = {three}\n"
+        "shared_let": f"fn f(a:& [2]{t}) -> {t}\n    let w: *{t} = @a[1]\n    let p: @[2]{t} = @a\n"
+                      f"    *w = {three}\n"
                       f"    let v: [2]{t} = *p\n    return v[1]\n"
                       + main(f"let r: {t} = f(@&a)\n    a[1] = r"),
         "shared_return": f"fn f(a:& [2]{t}) -> @[2]{t}\n    return @a\n" + main(shared),
@@ -262,7 +266,7 @@ POINTERS = {
               + POINTER_MAIN.replace("CALL", "let p: @&*C = go(@&q)\n    *p = @d"),
     "tail": TYPES + "fn go(h:& *C) -> @&*C\n    @&h\n"
             + POINTER_MAIN.replace("CALL", "let p: @&*C = go(@&q)\n    *p = @d"),
-    "shared_let": TYPES + "fn go(h:& *C, d: *C) -> i32\n    let p: @*C = @h\n    h = d\n"
+    "shared_let": TYPES + "fn go(h:& *C, d: *C) -> i32\n    let w: **C = @h\n    let p: @*C = @h\n    *w = d\n"
                   "    let r: *C = *p\n    return r.x\n"
                   + POINTER_MAIN.replace("CALL", "let r: i32 = go(@&q, @d)\n    q.x = r"),
     "integer_let": "fn go(h:& *i32, d: *i32)\n    let p: @&*i32 = @&h\n    *p = d\n"

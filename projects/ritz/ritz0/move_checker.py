@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import ref_rules
 import ritz_ast as rast
+from ufcs import UFCS_NON_GENERIC_PREFIXES
 
 
 class OwnershipError(Exception):
@@ -32,11 +33,23 @@ class OwnershipError(Exception):
 
 
 class VarState(Enum):
-    """State of a variable in the ownership system."""
+    """State of a variable in the ownership system. Whether it's borrowed is
+    in VarInfo.borrows."""
     OWNED = auto()       # Variable owns its value
     MOVED = auto()       # Value has been moved out
-    BORROWED = auto()    # Shared borrow active (&T)
-    MUT_BORROWED = auto() # Mutable borrow active (&mut T)
+
+
+@dataclass(eq=False)
+class Loan:
+    """An `@` or `@&` of a place, on the place's root (AGAST #2438). One made
+    inside a statement ends with it; `holder` is the binding a declaration gave
+    it to, and it ends with that binding's block (_pop_scope)."""
+    span: Optional[rast.Span]
+    mutable: bool
+    holder: Optional['VarInfo'] = field(default=None, repr=False)
+    # The place's steps below the root: a field's name, or '[]' for an index
+    # (R11a: any two indexes count as equal). `@c.x` is ('x',).
+    path: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -49,8 +62,8 @@ class VarInfo:
     def_span: Optional[rast.Span] = None
     # Where the variable was moved (if moved)
     move_span: Optional[rast.Span] = None
-    # Active borrows (borrow location -> is_mutable)
-    borrows: List[Tuple[rast.Span, bool]] = field(default_factory=list)
+    # The loans of this binding, or of a place in it, still active.
+    borrows: List[Loan] = field(default_factory=list)
     # Borrow semantics for parameters (CONST/MUTABLE/MOVE)
     # If set, this parameter is a borrow and is effectively Copy
     borrow: Optional[rast.Borrow] = None
@@ -125,6 +138,14 @@ def _is_lending_param(param: Optional[rast.Param]) -> bool:
         return True
     return isinstance(param.type, (rast.RefType, rast.PtrType))
 
+
+
+def _lends_mut(param: rast.Param) -> bool:
+    """`name:& T` or `name: @&T`: a mutable borrow of the argument's place.
+    Not `*T` (#2371) or `@T`."""
+    if getattr(param, 'borrow', None) == rast.Borrow.MUTABLE:
+        return True
+    return isinstance(param.type, rast.RefType) and param.type.mutable
 
 class MoveTypes:
     """Which types are move-only (LANGUAGE_SPEC §13.1, AGAST #1854/#2157).
@@ -305,6 +326,12 @@ class MoveChecker:
         # a binding (AGAST #2171, #2232); the emitter gives those drop flags.
         self._field_moves: Set[Tuple[str, str]] = set()
         self.current_ret_type: Optional[rast.Type] = None
+        # The loans call arguments are making, which no binding holds: each
+        # ends with its call (_restore_borrow_states), or sooner with the
+        # statement or arm it's in (AGAST #2438). Outside a call's arguments a
+        # borrow nothing holds lends nothing, as on ritz1.
+        self._arg_loans: List[Tuple[VarInfo, Loan]] = []
+        self._in_args = 0
 
     def check(self, module: rast.Module) -> List[OwnershipError]:
         """Check ownership rules for a module.
@@ -503,40 +530,206 @@ class MoveChecker:
         self.scope = Scope(parent=self.scope)
 
     def _pop_scope(self):
-        """Exit current scope."""
+        """Exit current scope. The loans its bindings hold end here: a loan
+        lasts to the end of its holder's block (AGAST #2438)."""
+        gone = {id(info) for info in self.scope.vars.values()}
+        scope = self.scope.parent
+        while scope:
+            for info in scope.vars.values():
+                info.borrows = [b for b in info.borrows
+                                if b.holder is None or id(b.holder) not in gone]
+            scope = scope.parent
         if self.scope.parent:
             self.scope = self.scope.parent
 
-    def _save_borrow_states(self) -> Dict[str, Tuple[VarState, List]]:
-        """Save borrow states for all variables in scope.
-
-        Returns a dict mapping var name to (state, borrows list copy).
-        Only saves borrow-related state, not move state.
-        """
+    def _save_borrow_states(self) -> Dict[int, Tuple[VarInfo, List[Loan]]]:
+        """Every visible binding's loans, keyed by binding."""
         states = {}
         scope = self.scope
         while scope:
-            for name, info in scope.vars.items():
-                if name not in states:  # Don't override inner scope with outer
-                    states[name] = (info.state, list(info.borrows))
+            for info in scope.vars.values():
+                states.setdefault(id(info), (info, list(info.borrows)))
             scope = scope.parent
         return states
 
-    def _restore_borrow_states(self, saved: Dict[str, Tuple[VarState, List]]):
-        """Restore borrow states, preserving move states.
+    def _restore_borrow_states(self, saved: Dict[int, Tuple[VarInfo, List[Loan]]]):
+        """End the loans made since `saved`: a call's arguments' (the loans
+        don't outlive the call). Moves stay."""
+        for info, borrows in saved.values():
+            info.borrows = list(borrows)
 
-        This releases borrows that were created after the save point,
-        but does NOT restore moved values (moves are permanent until reassigned).
-        """
-        for name, (saved_state, saved_borrows) in saved.items():
-            info = self.scope.lookup(name)
-            if info:
-                # Don't restore if the variable was moved - moves are permanent
-                if info.state == VarState.MOVED:
-                    continue
-                # Restore borrow state (releases borrows created after save)
-                info.state = saved_state
-                info.borrows = saved_borrows
+    # ---- loans (LANGUAGE_SPEC §13.5, LARB rulings R11 and R11a, AGAST #2438) -
+    #
+    # A borrow is of a place: a root binding and its field and index steps.
+    # Two places overlap when one's path is a prefix of the other's (field
+    # names must match; any two indexes are equal). While a binding holds an
+    # `@T` of a place, or within one call's arguments, a mutable borrow of an
+    # overlapping place is an error; while it holds an `@&T`, any borrow is.
+    # The mutable borrows are `@&p`, `p` into a `:&` param, a receiver taken
+    # `self: @&T` or `self:& T`, and a write into p's own storage. ritz1's twin
+    # is the loan half of ref_check.ritz, and
+    # test_borrow_conflict_all_compilers.py holds the three compilers to one
+    # table.
+
+    Place = Tuple[str, Tuple[str, ...]]
+
+    @staticmethod
+    def _steps(place: rast.Expr):
+        """`place`'s root expression and its steps, root first."""
+        steps: List[str] = []
+        while True:
+            if isinstance(place, rast.Grouped):
+                place = place.expr
+            elif isinstance(place, rast.Field):
+                steps.append(place.field)
+                place = place.expr
+            elif isinstance(place, rast.Index):
+                steps.append('[]')
+                place = place.expr
+            else:
+                return place, tuple(reversed(steps))
+
+    def _loan_root(self, place: rast.Expr) -> Optional[str]:
+        """The binding `@place` borrows (see _loan_place)."""
+        found = self._loan_place(place)
+        return found[0] if found else None
+
+    def _loan_place(self, place: rast.Expr) -> Optional['MoveChecker.Place']:
+        """The place `@place` borrows: a binding and the steps `place` takes
+        from it by fields and indexes with no pointer or reference on the way,
+        so `@c.x` and `@vs[0]` borrow `c.x` and `vs[]`. None if there's none,
+        or the type on the way is unknown."""
+        top = place
+        while True:
+            if isinstance(place, rast.Grouped):
+                place = place.expr
+            elif isinstance(place, rast.Ident):
+                if self.scope.lookup(place.name) is None:
+                    return None
+                return place.name, self._steps(top)[1]
+            elif isinstance(place, (rast.Field, rast.Index)):
+                if isinstance(place, rast.Index) and isinstance(place.index, rast.Range):
+                    return None
+                if not self._holds_by_value(place.expr):
+                    return None
+                place = place.expr
+            else:
+                return None
+
+    def _loan_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """_place_type, also through a Vec's element (`vs[1].a`), for the steps
+        of a place. Only the loan check reads it. ritz1's is ref_loan_ty."""
+        if isinstance(expr, rast.Grouped):
+            return self._loan_type(expr.expr)
+        if isinstance(expr, rast.Index):
+            held = self.types.resolve(self._loan_type(expr.expr))
+            if (isinstance(held, rast.NamedType) and held.name == 'Vec'
+                    and len(held.args) == 1):
+                return held.args[0]
+        elif isinstance(expr, rast.Field):
+            base = self.types.resolve(self._loan_type(expr.expr))
+            if isinstance(base, rast.TupleType) or (
+                    isinstance(base, rast.NamedType) and base.name != 'unknown'):
+                return self._part_type(base, expr.field)
+        return self._place_type(expr)
+
+    def _holds_by_value(self, base: rast.Expr) -> bool:
+        """Is `base` a value, not a pointer or reference to one?"""
+        held = self.types.resolve(self._loan_type(base))
+        if held is None or isinstance(held, (rast.PtrType, rast.RefType)):
+            return False
+        return not (isinstance(held, rast.NamedType) and held.name == 'unknown')
+
+    @staticmethod
+    def _overlap(a: Tuple[str, ...], b: Tuple[str, ...]) -> bool:
+        """Is one path a prefix of the other?"""
+        return all(x == y for x, y in zip(a, b))
+
+    @staticmethod
+    def _place_str(name: str, path: Tuple[str, ...]) -> str:
+        return name + ''.join('[_]' if s == '[]' else f'.{s}' for s in path)
+
+    def _conflict(self, info: VarInfo, path: Tuple[str, ...],
+                  mutable: bool) -> Optional[Loan]:
+        """The loan on `info` a new borrow of `path` (`mutable` or not)
+        conflicts with: an overlapping mutable loan first, else, for a mutable
+        borrow, an overlapping shared one."""
+        near = [b for b in info.borrows if self._overlap(b.path, path)]
+        for b in near:
+            if b.mutable:
+                return b
+        return near[0] if mutable and near else None
+
+    def _report(self, name: str, path: Tuple[str, ...], loan: Loan,
+                what: str, span) -> None:
+        """`what` is "assign", "mutable" or "immutable"."""
+        here = self._place_str(name, path)
+        held = self._place_str(name, loan.path)
+        kind = "mutable" if loan.mutable else "immutable"
+        if what == "assign":
+            head = f"cannot assign to `{here}`"
+        else:
+            head = f"cannot borrow `{here}` as {what}"
+        self.errors.append(OwnershipError(
+            f"{head} - `{held}` is already borrowed as {kind}", span))
+
+    def _check_mut_use(self, place: Optional['MoveChecker.Place'], span, verb: str) -> None:
+        """A mutable borrow of `place` that ends with the statement: a receiver
+        (verb "borrow") or a write (verb "assign")."""
+        info = self.scope.lookup(place[0]) if place is not None else None
+        if info is None:
+            return
+        loan = self._conflict(info, place[1], mutable=True)
+        if loan is not None:
+            self._report(place[0], place[1], loan,
+                         "assign" if verb == "assign" else "mutable", span)
+
+    def _held_borrows(self, value: Optional[rast.Expr]) -> List[rast.UnaryOp]:
+        """The `@place` and `@&place` a declaration's binding holds: its value,
+        or an arm's tail of an `if` or `match` value."""
+        out: List[rast.UnaryOp] = []
+
+        def tail(block):
+            if isinstance(block, rast.Block):
+                if block.expr is not None:
+                    walk(block.expr)
+                elif block.stmts and isinstance(block.stmts[-1], rast.ExprStmt):
+                    walk(block.stmts[-1].expr)
+            elif block is not None:
+                walk(block)
+
+        def walk(e):
+            if isinstance(e, rast.Grouped):
+                walk(e.expr)
+            elif isinstance(e, rast.UnaryOp) and e.op in ('&', '@', '&mut', '@&'):
+                out.append(e)
+            elif isinstance(e, rast.If):
+                tail(e.then_block)
+                tail(e.else_block)
+            elif isinstance(e, rast.Match):
+                for arm in e.arms:
+                    tail(arm.body)
+        walk(value)
+        return out
+
+    def _hold_loans(self, holder: VarInfo, value: Optional[rast.Expr],
+                    declared: Optional[rast.Type]) -> None:
+        """The loans `holder`, just declared with `value`, holds to the end of
+        its block. `@x` held in a `*T` isn't a borrow (#2371)."""
+        held = self.types.resolve(declared) if declared is not None else None
+        if isinstance(held, rast.PtrType) and not held.shared:
+            return
+        for e in self._held_borrows(value):
+            place = self._loan_place(e.operand)
+            info = self.scope.lookup(place[0]) if place is not None else None
+            if info is not None and info is not holder:
+                info.borrows.append(Loan(e.span, e.op in ('&mut', '@&'), holder, place[1]))
+
+    def _release_arg_loans(self, mark: int) -> None:
+        """End the argument loans made since `mark`."""
+        for info, loan in self._arg_loans[mark:]:
+            info.borrows = [b for b in info.borrows if b is not loan]
+        del self._arg_loans[mark:]
 
     def _check_fn(self, fn: rast.FnDef):
         """Check a function definition."""
@@ -571,14 +764,26 @@ class MoveChecker:
                 # move is in a return and the "use" is after the return
                 return True
         if block.expr:
+            # A block's value is a statement of its own for loans: an arm's
+            # `@&c` doesn't meet the next arm's.
+            mark = len(self._arg_loans)
             self._check_expr(block.expr, is_move_context=True)
+            self._release_arg_loans(mark)
         return False
 
     def _check_stmt(self, stmt: rast.Stmt) -> bool:
-        """Check a statement for ownership violations.
+        """Check a statement for ownership violations. The loans it makes
+        that no binding holds end with it (AGAST #2438).
 
         Returns True if statement definitely returns (terminates control flow).
         """
+        mark = len(self._arg_loans)
+        try:
+            return self._check_one_stmt(stmt)
+        finally:
+            self._release_arg_loans(mark)
+
+    def _check_one_stmt(self, stmt: rast.Stmt) -> bool:
         if isinstance(stmt, rast.VarStmt):
             # Variable declaration
             if stmt.value:
@@ -591,6 +796,7 @@ class MoveChecker:
             else:
                 var_type = rast.NamedType(stmt.span, 'unknown', [])
             self.scope.define(stmt.name, var_type, stmt.span)
+            self._hold_loans(self.scope.vars[stmt.name], stmt.value, stmt.type)
             return False
 
         elif isinstance(stmt, rast.LetStmt):
@@ -605,10 +811,17 @@ class MoveChecker:
             else:
                 var_type = rast.NamedType(stmt.span, 'unknown', [])
             self.scope.define(stmt.name, var_type, stmt.span)
+            self._hold_loans(self.scope.vars[stmt.name], stmt.value, stmt.type)
             return False
 
         elif isinstance(stmt, rast.ExprStmt):
             self._check_expr(stmt.expr, is_move_context=False)
+            return False
+
+        elif isinstance(stmt, rast.AssertStmt):
+            # Its condition is checked like any expression, as on ritz1: a
+            # call's `@&s, @s` is the same conflict there (AGAST #2438).
+            self._check_expr(stmt.condition, is_move_context=False)
             return False
 
         elif isinstance(stmt, rast.ReturnStmt):
@@ -629,6 +842,8 @@ class MoveChecker:
                 stmt.target.reowns_field = True
             elif not isinstance(stmt.target, rast.Ident):
                 self._check_expr(stmt.target, is_move_context=False)
+            # A write inside a borrowed place (AGAST #2438, R11a).
+            self._check_mut_use(self._loan_place(stmt.target), stmt.target.span, "assign")
             # After assignment, the target variable becomes owned again
             if isinstance(stmt.target, rast.Ident):
                 var_info = self.scope.lookup(stmt.target.name)
@@ -836,10 +1051,12 @@ class MoveChecker:
 
             params = (self.fn_params.get(expr.func.name)
                       if isinstance(expr.func, rast.Ident) else None)
+            self._in_args += 1
             for i, arg in enumerate(expr.args):
                 param = params[i] if params and i < len(params) else None
                 self._check_expr(arg, is_move_context=not _is_lending_param(param))
                 self._check_place_borrow(arg, param)
+            self._in_args -= 1
 
             # Release borrows that were created for this call
             # (borrows don't outlive the call unless stored somewhere)
@@ -852,6 +1069,10 @@ class MoveChecker:
             # that name takes it by value.
             self._check_expr(expr.expr, is_move_context=self._method_takes_self(expr))
             self._check_ref_receiver(expr)
+            # A receiver taken `self: @&T` or `self:& T` is a mutable borrow of
+            # its place.
+            if self._lends_self_mut(expr) and self._holds_by_value(expr.expr):
+                self._check_mut_use(self._loan_place(expr.expr), expr.expr.span, "borrow")
             if not self._method_lends_self(expr):
                 # A temporary receiver taken by value is moved, not dropped.
                 self._unmark_temporary(expr.expr)
@@ -859,9 +1080,11 @@ class MoveChecker:
             # `E.V(args)` builds a variant, which owns its payload.
             is_variant = self.types.variant_value_type(
                 expr, lambda n: self.scope.lookup(n) is not None) is not None
+            self._in_args += 1
             for i, arg in enumerate(expr.args):
                 self._check_expr(arg, is_move_context=is_variant or self._method_arg_moves(expr, i))
                 self._check_place_borrow(arg, self._method_param(expr, i))
+            self._in_args -= 1
             self._restore_borrow_states(borrow_states_before)
             self._mark_temporary(expr, is_move_context)
 
@@ -915,8 +1138,10 @@ class MoveChecker:
             # that leaves (`break`, `return`, ...) took its moves with it.
             before = self._snapshot()
             outs = []
+            mark = len(self._arg_loans)
             for arm in expr.arms:
                 self._restore(before)
+                self._release_arg_loans(mark)
                 self._push_scope()
                 # Pattern bindings
                 self._check_pattern(arm.pattern)
@@ -1240,6 +1465,27 @@ class MoveChecker:
                 return False
         return True
 
+    # The free function `v.m()` means on a type with no `m` of its own: Vec's
+    # `vec_m`, String's `string_m` (ufcs.py has the emitter's table).
+    UFCS_PREFIXES = {'Vec': 'vec_', 'Span': 'span_', 'Option': 'option_',
+                     'Result': 'result_', 'Box': 'box_', **UFCS_NON_GENERIC_PREFIXES}
+
+    def _lends_self_mut(self, call: rast.MethodCall) -> bool:
+        """Does `call` take its receiver `self: @&T`, `self:& T`, or as a UFCS
+        function's first param of either kind? A mutable borrow of the
+        receiver's place (AGAST #2438). False where the callee is unknown."""
+        ty = self._receiver_type(call.expr)
+        if not isinstance(ty, rast.NamedType):
+            return False
+        cands = [list(m.params) for m in self.type_methods.get((ty.name, call.method)) or []]
+        if cands:
+            cands = [ps for ps in cands if ps and ps[0].name == 'self']
+        else:
+            prefix = self.UFCS_PREFIXES.get(ty.name)
+            params = self.fn_params.get(f"{prefix}{call.method}") if prefix else None
+            cands = [params] if params else []
+        return bool(cands) and all(ps and _lends_mut(ps[0]) for ps in cands)
+
     def _receiver_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of a method receiver, looking through `*r`."""
         if isinstance(expr, rast.UnaryOp) and expr.op == '*':
@@ -1318,12 +1564,16 @@ class MoveChecker:
         passes what it points at, so the binding itself isn't borrowed."""
         if param is None or getattr(param, 'borrow', None) != rast.Borrow.MUTABLE:
             return
-        if not isinstance(arg, rast.Ident):
+        if isinstance(arg, rast.Ident):
+            info = self.scope.lookup(arg.name)
+            if info is None or info.state == VarState.MOVED:
+                return    # already reported by _check_expr
+            held = self.types.resolve(info.ritz_type)
+        elif isinstance(arg, (rast.Field, rast.Index)):
+            # A field or element is a place too (R11a): `f(r.a)` lends `r.a`.
+            held = self.types.resolve(self._place_type(arg))
+        else:
             return
-        info = self.scope.lookup(arg.name)
-        if info is None or info.state == VarState.MOVED:
-            return    # already reported by _check_expr
-        held = self.types.resolve(info.ritz_type)
         wanted = self.types.resolve(param.type)
         if (isinstance(held, (rast.RefType, rast.PtrType))
                 and not isinstance(wanted, (rast.RefType, rast.PtrType))):
@@ -1331,7 +1581,9 @@ class MoveChecker:
         self._check_borrow(arg, mutable=True, span=arg.span)
 
     def _check_borrow(self, expr: rast.Expr, mutable: bool, span: rast.Span):
-        """Check a borrow expression for validity."""
+        """`@expr` or `@&expr` (`mutable`): a borrow of expr's root. A call's
+        argument lends it until the call returns; a declaration holds it to
+        the end of its block (_hold_loans)."""
         if isinstance(expr, rast.Ident):
             var_info = self.scope.lookup(expr.name)
             if var_info:
@@ -1349,36 +1601,22 @@ class MoveChecker:
                         span
                     ))
                     return
-
-                # Check for conflicting borrows
-                if mutable:
-                    # Mutable borrow conflicts with any existing borrow
-                    if var_info.state == VarState.BORROWED:
-                        self.errors.append(OwnershipError(
-                            f"cannot borrow `{expr.name}` as mutable - already borrowed as immutable",
-                            span
-                        ))
-                    elif var_info.state == VarState.MUT_BORROWED:
-                        self.errors.append(OwnershipError(
-                            f"cannot borrow `{expr.name}` as mutable - already borrowed as mutable",
-                            span
-                        ))
-                    else:
-                        var_info.state = VarState.MUT_BORROWED
-                        var_info.borrows.append((span, True))
-                else:
-                    # Shared borrow conflicts with mutable borrow
-                    if var_info.state == VarState.MUT_BORROWED:
-                        self.errors.append(OwnershipError(
-                            f"cannot borrow `{expr.name}` as immutable - already borrowed as mutable",
-                            span
-                        ))
-                    else:
-                        var_info.state = VarState.BORROWED
-                        var_info.borrows.append((span, False))
         else:
-            # For non-identifier borrows, just check the expression
+            # For non-identifier borrows, check the expression
             self._check_expr(expr, is_move_context=False)
+        place = self._loan_place(expr)
+        info = self.scope.lookup(place[0]) if place is not None else None
+        if info is None:
+            return
+        loan = self._conflict(info, place[1], mutable)
+        if loan is not None:
+            self._report(place[0], place[1], loan,
+                         'mutable' if mutable else 'immutable', span)
+            return
+        if self._in_args:
+            loan = Loan(span, mutable, None, place[1])
+            info.borrows.append(loan)
+            self._arg_loans.append((info, loan))
 
     # ---- match scrutinees and payload bindings (AGAST #2177) -----------------
     #
