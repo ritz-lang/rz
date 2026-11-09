@@ -25,6 +25,10 @@ something else. ritz0 is run as the oracle.
 
 A deref whose pointee is a struct that ritz1 still cannot name is now a
 located error rather than a silent i64 load.
+
+AGAST #2359: a global `*D` names D (it used to stride 1 byte and fail to
+name the load), so `*(g_p + 1)` is a broken form fixed rather than the
+located-error fixture it was here.
 """
 
 import os
@@ -367,10 +371,8 @@ WORKING_FORMS = {
     "stale_let_name": STALE_LET_NAME,
 }
 
-# A global `*D` records no pointee struct name (follow-up ticket), so ritz1
-# cannot name the struct `*(g_p + 1)` loads.  It must say so at the deref's
-# position instead of emitting `load i64`.
-UNRESOLVED_GLOBAL_PTR = STRUCT_D + """\
+# AGAST #2359: `*(g_p + 1)` on a global `*D` steps sizeof(D) and loads a D.
+GLOBAL_PTR_ADD = STRUCT_D + """\
 var g_p: *D = null
 
 pub fn main() -> i32
@@ -381,6 +383,7 @@ pub fn main() -> i32
     let d: D = *(g_p + 1)
     return (d.a + d.b) as i32
 """
+BROKEN_FORMS["global_ptr_add"] = GLOBAL_PTR_ADD
 
 
 def _compile(compiler: str, tmp_path: Path, name: str, program: str):
@@ -453,15 +456,13 @@ def test_ritz1_repro_ir_loads_struct(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_unresolved_struct_deref_is_located_error(ritz1_bin, tmp_path):
-    """No silent `load i64`: an unnameable struct pointee is a located error."""
-    comp, ll = _compile("ritz1", tmp_path, "glob_ptr", UNRESOLVED_GLOBAL_PTR)
-    out = comp.stderr + comp.stdout
-    assert comp.returncode != 0
-    # Line 12, column 16 is the `*` of `*(g_p + 1)`.
-    assert "12:16: error: ritz1 cannot emit: " in out, out[-2000:]
-    assert "cannot determine the struct type loaded by this '*' deref" in out
-    assert not ll.exists()
+def test_ritz1_global_ptr_add_ir_loads_struct(ritz1_bin, tmp_path):
+    """AGAST #2359: `*(g_p + 1)` is a `load %D` stepped by sizeof(D) = 16."""
+    comp, ll = _compile("ritz1", tmp_path, "glob_ptr", GLOBAL_PTR_ADD)
+    assert comp.returncode == 0, comp.stderr[-2000:]
+    main_body = ll.read_text().split("@main(", 1)[1].split("\n}", 1)[0]
+    assert "= load %D, ptr" in main_body, main_body
+    assert re.search(r"= mul i64 %[\w.]+, 16\n", main_body), main_body
 
 
 # `*(p + 1)` over a tagged enum: the deref resolves `%Option$i32`, but a
