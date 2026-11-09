@@ -37,7 +37,7 @@ fn tagged_enum_operand(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32
 # ritz0's located refusal: a variant carries a payload, so `==` would compare
 # the tags alone.  ritz1 compiled it: `None` had no enum and was the `add i64
 # 0, 0` fallback, and two Options were an `icmp` clang rejects.  A user's
-# payload enum is compared by its tag (#1660), as before.  1 when refused.
+# payload enum is refuse_aggregate_eq's (#2510).  1 when refused.
 fn refuse_tagged_enum_eq(s: *EmitterState, e: *Expr) -> i32
     var name: *u8 = null
     var len: i32 = 0
@@ -59,6 +59,71 @@ fn refuse_tagged_enum_eq(s: *EmitterState, e: *Expr) -> i32
     let head: *u8 = ctor_join(op, 4, c" is not supported for struct type '", strlen(c" is not supported for struct type '") as i32, name, len, @n)
     let tail: *u8 = c"' — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
     let msg: *u8 = ctor_join(head, n, tail, strlen(tail) as i32, c"", 0, @n)
+    emit_nd_error(s, e.span.line, e.span.col, msg)
+    1
+
+# The by-value struct or user enum `e` is, as its LLVM type names it; null when
+# it is a scalar, a pointer, or not statically known.
+fn eq_aggregate_operand(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null
+        return
+    var name: *u8 = null
+    var len: i32 = 0
+    if e.kind == EXPR_MEMBER
+        qualified_variant_enum(s, e, @name, @len)   # `Shape.Dot`
+        if name == null
+            let fld: *StructField = resolve_member_chain_field(s, e)
+            if fld != null and fld.field_type == TYPE_STRUCT and fld.field_type_name_len > 0
+                name = fld.field_type_name
+                len = fld.field_type_name_len
+    else
+        resolve_expr_struct_name(s, e, @name, @len)
+    if name == null or len == 0 or is_tagged_enum_type(name, len) == 1
+        return
+    let ei: i32 = enum_find(name, len)
+    if ei >= 0
+        # A fieldless enum compares its tags (#1660); one with a payload can't.
+        var vi: i32 = 0
+        var payload: i32 = 0
+        while vi < enum_variant_count(ei)
+            if enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
+                payload = 1
+            vi = vi + 1
+        if payload == 0
+            return
+    else if find_struct(s, name, len) == null and name_eq(name, len, c"StrView", 7) == 0 and name_eq(name, len, c"String", 6) == 0
+        return
+    *out_name = name
+    *out_len = len
+
+# AGAST #2510: `==` / `!=` on a user enum whose variants carry a payload, or on
+# a struct, is ritz0's located refusal (_reject_aggregate_compare).  ritz1
+# compared a payload enum's tags alone (`Circle(1) == Circle(2)` was true) and
+# wrote a struct as an `icmp eq i64` clang rejects.  The left operand names the
+# type, as in ritz0; the right one when the left is no aggregate.  1 when refused.
+fn refuse_aggregate_eq(s: *EmitterState, e: *Expr) -> i32
+    var name: *u8 = null
+    var len: i32 = 0
+    eq_aggregate_operand(s, e.left, @name, @len)
+    if name == null
+        eq_aggregate_operand(s, e.right, @name, @len)
+    if name == null
+        return 0
+    var op: *u8 = c"'=='"
+    if e.op == OP_NE
+        op = c"'!='"
+    var hint: *u8 = c""
+    if enum_find(name, len) >= 0
+        hint = c" — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
+    else if name_eq(name, len, c"StrView", 7) == 1
+        hint = c" — use strview_eq(@a, @b) from ritzlib.strview"
+    else if name_eq(name, len, c"String", 6) == 1
+        hint = c" — use string_eq_string(@a, @b) from ritzlib.string"
+    var n: i32 = 0
+    let head: *u8 = ctor_join(op, 4, c" is not supported for struct type '", strlen(c" is not supported for struct type '") as i32, name, len, @n)
+    let msg: *u8 = ctor_join(head, n, c"'", 1, hint, strlen(hint) as i32, @n)
     emit_nd_error(s, e.span.line, e.span.col, msg)
     1
 
@@ -221,6 +286,8 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
 
     if (e.op == OP_EQ or e.op == OP_NE) and refuse_tagged_enum_eq(s, e) == 1
         return 0   # AGAST #2454
+    if (e.op == OP_EQ or e.op == OP_NE) and refuse_aggregate_eq(s, e) == 1
+        return 0   # AGAST #2510
 
     var left_reg: i32 = emit_expr(s, e.left)
     var right_reg: i32 = emit_expr(s, e.right)
