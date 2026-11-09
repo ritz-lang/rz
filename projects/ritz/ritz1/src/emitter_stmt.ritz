@@ -1337,6 +1337,39 @@ fn emit_through_index_assign(s: *EmitterState, stmt: *Stmt) -> i32
     emit_assign(s, @store)
     1
 
+# AGAST #2346: `r = v` where `r` is a `r:& T` param and T is a struct, an enum
+# (tagged or not), StrView, f32 or f64.  ritz0 auto-dereferences the borrow, so
+# the whole referent is overwritten.  These params stay TYPE_MUT_REF locals
+# whose slot holds the caller's pointer (bind_scalar_borrow_param binds only
+# integer and array pointees as the referent itself).  The generic arm stored
+# the value as an i64 into that slot: a clang error for an aggregate or a
+# float, and for `r = v` with `v:& C` too, a silent reseat of `r` onto `v`.
+# Load the pointer and store the value at T.  `slot` is `r`'s slot register.
+# Returns 1 when it emitted the store.
+fn emit_lent_whole_store(s: *EmitterState, stmt: *Stmt, slot: i32) -> i32
+    let loc: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+    if loc == null or loc.var_type != TYPE_MUT_REF or loc.holds_lent_ptr == 0
+        return 0
+    let pt: i32 = loc.pointee_type
+    if pt == TYPE_STRUCT and loc.type_name_len > 0
+        # Evaluated before the pointer is loaded: the value may read `r`.
+        let raw: i32 = emit_expr_into_slot(s, stmt.assign_value, TYPE_STRUCT, loc.type_name, loc.type_name_len)
+        # A bare "..." is a %Span$u8; `r:& StrView` wants it as a %StrView.
+        let val: i32 = coerce_struct_ret_value(s, stmt.assign_value, raw, loc.type_name, loc.type_name_len)
+        let dst: i32 = emit_load_ptr(s, slot)
+        emit_str(s, c"  store ")
+        emit_llvm_type_struct(s, TYPE_STRUCT, loc.type_name, loc.type_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, val)
+        emit_str(s, c", ptr ")
+        emit_reg(s, dst)
+        emit_str(s, c"\n")
+        return 1
+    if pt == TYPE_F32 or pt == TYPE_F64
+        let fval: i32 = emit_expr(s, stmt.assign_value)
+        return emit_float_field_store(s, emit_load_ptr(s, slot), pt, fval, stmt.assign_value)
+    0
+
 fn emit_assign(s: *EmitterState, stmt: *Stmt)
     # Check for expression assignment: expr = value
     # When assign_target_len == 0, the target is in if_cond as an expression
@@ -1774,6 +1807,9 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
     let loc: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
     if loc >= 0
         let var_type: i32 = find_local_type(s, stmt.assign_target, stmt.assign_target_len)
+        # AGAST #2346: `r = v` on a `r:& T` param writes the referent.
+        if emit_lent_whole_store(s, stmt, loc) == 1
+            return
         # Special handling for struct-typed assignments
         if var_type == TYPE_STRUCT
             # For struct literal assignment, use alloca + field init
