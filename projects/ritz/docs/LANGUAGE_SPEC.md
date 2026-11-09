@@ -1670,7 +1670,10 @@ let v = arr[0]          # Index access
 
 `[]` sees through one level. `p[i]` means `(*p)[i]` when `p` is a `*T`, `@T` or `@&T`
 and `T` is a Vec, Span or String, and `(*p)[i]` is the same place. An element is a
-place in every position: read, store, `+=`, `@`, `@&` and `.f`.
+place in every position: read, store, `+=`, `@`, `@&` and `.f`. Read by value, it's a
+read through a reference: a copy, or for a move-only element "cannot move out of a
+reference" (§13.2), as `p[i].f` and a by-value `self` on `p[i]` are. A Vec has no
+`Drop`, so a `Vec<Vec<i32>>`'s element is a copy.
 
 ```ritz
 import ritzlib.gvec

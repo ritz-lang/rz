@@ -140,6 +140,18 @@ def _is_lending_param(param: Optional[rast.Param]) -> bool:
 
 
 
+def _element_of(ty: Optional[rast.Type]) -> Optional[rast.Type]:
+    """What `[]` reads from a Vec<T> or Span<T> (T) or a String (u8), else
+    None. The emitter's twin is Emitter._buffer_field_path."""
+    if not isinstance(ty, rast.NamedType):
+        return None
+    if ty.name in ('Vec', 'Span') and len(ty.args) == 1:
+        return ty.args[0]
+    if ty.name == 'String' and not ty.args:
+        return rast.NamedType(ty.span, 'u8', [])
+    return None
+
+
 def _lends_mut(param: rast.Param) -> bool:
     """`name:& T` or `name: @&T`: a mutable borrow of the argument's place.
     Not `*T` (#2371) or `@T`."""
@@ -1067,7 +1079,8 @@ class MoveChecker:
             # The receiver is borrowed (auto-ref) unless the method takes it
             # by value (AGAST #2239). An argument moves when every method of
             # that name takes it by value.
-            self._check_expr(expr.expr, is_move_context=self._method_takes_self(expr))
+            self._check_expr(expr.expr, is_move_context=self._method_takes_self(expr)
+                             or self._takes_place_behind(expr))
             self._check_ref_receiver(expr)
             # A receiver taken `self: @&T` or `self:& T` is a mutable borrow of
             # its place.
@@ -1098,7 +1111,8 @@ class MoveChecker:
             # Field access doesn't move the struct (unless the result is moved)
             self._check_expr(expr.expr, is_move_context=False)
             if is_move_context and self._through_reference(expr):
-                if self.types.is_move_only(self._field_path_type(expr)):
+                # `p[i].f`: _field_path_type doesn't type an element (#2444).
+                if self.types.is_move_only(self._field_path_type(expr) or self._place_type(expr)):
                     self._reject_move_out(expr.span)
             elif is_move_context and self.types.is_move_only(self._field_path_type(expr)):
                 # Moving a move-only field out of a temporary: the rest of
@@ -1303,6 +1317,14 @@ class MoveChecker:
             return held.inner if isinstance(held, (rast.PtrType, rast.RefType)) else held
         if isinstance(expr, rast.Index):
             held = self.types.resolve(self._place_type(expr.expr))
+            # R9: `p[i]` and `(*p)[i]` are an element of the Vec, Span or String
+            # `p` sees through to, and `v[i]` of one held by value (#2444). A
+            # slice isn't an element.
+            if isinstance(held, (rast.PtrType, rast.RefType)) \
+                    and _element_of(self.types.resolve(held.inner)) is not None:
+                held = self.types.resolve(held.inner)
+            if _element_of(held) is not None:
+                return None if isinstance(expr.index, rast.Range) else _element_of(held)
             while isinstance(held, (rast.PtrType, rast.RefType, rast.ArrayType)):
                 inner = self.types.resolve(held.inner)
                 if isinstance(held, rast.ArrayType) or not isinstance(inner, rast.ArrayType):
@@ -1344,6 +1366,15 @@ class MoveChecker:
             held = self.types.resolve(held.inner)
         if self.types.is_move_only(held) and self._takes_self_by_value(held, call.method):
             self._reject_move_out(call.span)
+
+    def _takes_place_behind(self, call: rast.MethodCall) -> bool:
+        """A by-value `self` on an element or a deref: `p[i].m()`, `(*p)[i].m()`,
+        `(*p).m()` (#2444, R9). _receiver_type doesn't type an element or see
+        through a deref, so this asks the place's own type. The place then reads
+        as a move: behind a reference that's the "cannot move out" error, and an
+        owned element or deref has nothing else a move would change."""
+        return self._takes_self_by_value(self.types.resolve(self._place_type(call.expr)),
+                                         call.method)
 
     def _field_path_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of a field path `b.f.g`, at any depth, or None."""

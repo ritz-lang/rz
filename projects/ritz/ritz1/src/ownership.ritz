@@ -99,6 +99,7 @@ import emitter_expr        # emit_member_gep_from_ptr
 import emitter_expr_call   # method_callee_def, find_spec_impl_method
 import ll_copy_scan        # ll_line_len, ll_starts_with
 import ref_check           # ref_ty_of, ref_through (AGAST #2336)
+import index_through       # index_through_value_struct (AGAST #2444)
 
 const OWN_INIT_CAP: i32 = 16
 # Deeper than any real struct nesting; stops a malformed recursive type.
@@ -1704,12 +1705,25 @@ fn own_recv_def(s: *EmitterState, e: *Expr) -> *FnDef
 fn own_moves_out(s: *EmitterState, e: *Expr) -> i32
     if e.kind == EXPR_IDENT
         return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if own_value_struct(s, e, @name, @len) == 0
+        return 0
+    if own_type_is_move_only(s, name, len) == 0
+        return 0
+    ref_through(s, e)
+
+# The struct `e` holds by value: 1 and its name, or 0.  `p[i]` and `(*p)[i]` through
+# a Vec or Span hold its element (AGAST #2444, R9), which ref_ty_of doesn't name.
+fn own_value_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if e.kind == EXPR_INDEX and index_through(s, e) != null
+        return index_through_value_struct(s, e, out_name, out_len)
     var t: RefTy
     if ref_ty_of(s, e, @t) == 0 or t.kind != TYPE_STRUCT or t.name_len == 0
         return 0
-    if own_type_is_move_only(s, t.name, t.name_len) == 0
-        return 0
-    ref_through(s, e)
+    *out_name = t.name
+    *out_len = t.name_len
+    1
 
 # The line and column an error about `e` points at: where it starts.
 fn own_start_of(e: *Expr) -> *Expr
@@ -1720,17 +1734,30 @@ fn own_start_of(e: *Expr) -> *Expr
 
 # AGAST #2336: a by-value `self` method on a reference to a move-only value.
 fn own_check_ref_receiver(s: *EmitterState, e: *Expr)
-    let m: *FnDef = ref_method_def(s, e)
+    var name: *u8 = null
+    var len: i32 = 0
+    var is_ptr: i32 = 0
+    var m: *FnDef = null
+    if e.left != null and e.left.kind == EXPR_INDEX and index_through(s, e.left) != null
+        # `p[i].m()`: the element's method, on the element's type (AGAST #2444).
+        if index_through_value_struct(s, e.left, @name, @len) == 0
+            return
+        m = method_callee_def(s, name, len, e.ident_ptr, e.ident_len)
+    else
+        var t: RefTy
+        if ref_ty_of(s, e.left, @t) == 0 or t.name_len == 0
+            return
+        name = t.name
+        len = t.name_len
+        is_ptr = ref_is_pointer(t.kind)
+        m = ref_method_def(s, e)
     if m == null or m.params == null or own_param_moves(m.params) == 0 or m.params.is_borrow == 1
         return
     if name_eq(m.params.name, m.params.name_len, c"self", 4) == 0
         return
-    var t: RefTy
-    if ref_ty_of(s, e.left, @t) == 0 or t.name_len == 0
+    if own_type_is_move_only(s, name, len) == 0
         return
-    if own_type_is_move_only(s, t.name, t.name_len) == 0
-        return
-    if ref_is_pointer(t.kind) == 1 or ref_through(s, e.left) == 1
+    if is_ptr == 1 or ref_through(s, e.left) == 1
         let at: *Expr = own_start_of(e)
         ref_error_move_out(s, at.span.line, at.span.col)
 
