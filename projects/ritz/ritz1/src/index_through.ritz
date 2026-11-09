@@ -16,8 +16,11 @@
 #
 # AGAST #2330: an array behind a pointer is the same place.  `p[i]` and `(*p)[i]` on a
 # `*[N]T`, `@[N]T` or `@&[N]T` local are `*(p# + i)`, element i at stride T, where
-# `p#` is the `*T` view add_array_view bound with `p`.  Other bases, `h.r[i]`,
-# `g[i]`, `f()[i]`, are #2329's.
+# `p#` is the `*T` view add_array_view bound with `p`.
+#
+# AGAST #2329: so are other bases, `h.r[i]`, `g[i]` and `h(p)[i]`.  Their view is in
+# no scope (base_array_view): an emitting site binds it with through_spill, which
+# evaluates the base once into a `#k` local, and `x[i]` is `*(#k + i)`.
 
 import ritzlib.sys
 import ritzlib.str
@@ -83,11 +86,13 @@ pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
     if e.left != null and e.left.kind == EXPR_INDEX
         return index_through_element(s, e.left)
     let root: *Expr = through_root(e.left)
-    if root == null or root.kind != EXPR_IDENT
+    if root == null
         return null
+    if root.kind != EXPR_IDENT
+        return base_array_view(s, root)   # `h.r[i]`, `h(p)[i]` (#2329)
     let loc: *LocalVar = find_local_struct_name(s, root.ident_ptr, root.ident_len)
     if loc == null
-        return null
+        return base_array_view(s, root)   # `g[i]` (#2329)
     # `v[i]` on the value itself, but not `(*v)[i]`.
     if root == e.left and indexes_itself(loc) == 1
         return loc
@@ -270,7 +275,7 @@ pub fn emit_through_elem_ptr(s: *EmitterState, e: *Expr, out_name: **u8, out_len
     if name == null
         return 0
     var t: ThroughIndex
-    index_through_fill(e, loc, @t)
+    index_through_fill(e, through_spill(s, loc), @t)
     var val: i32 = 0
     if held == TYPE_PTR_PTR
         val = emit_expr(s, @t.deref)

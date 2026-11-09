@@ -865,7 +865,9 @@ pub fn main() -> i32
     assert run_with(compiler, "element", program) == 47
 
 
-# AGAST #2329: bases that record no N and T.  Fields, globals and call results.
+# AGAST #2329, LARB R9: every base follows #2330's table, not just locals and
+# params.  A field, a global, a call result and `let q = h(p)` record no pointee N
+# and T on ritz1, which read 0 and stored `g[1] = 7` 8 bytes wide at stride 8.
 _H = "struct H\n    r: {ty}\n\nfn f(h: *H) -> i32\n    return h.r[1]\n\npub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n    var h: H\n    h.r = @a\n    return f(@h)\n"
 _G = "var g: *[3]i32 = null\n\n" + _a("    g = @a\n    return g[1]\n")
 _R = "fn h(p: *[3]i32) -> {ty}\n    return p\n\nfn f(p: *[3]i32) -> i32\n    return h(p)[1]\n\n" + _a("    return f(@a)\n")
@@ -880,30 +882,193 @@ OPEN_BASES = {
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(OPEN_BASES))
-def test_ritz0_indexes_every_base(run_with, name):
-    assert run_with("ritz0", name, OPEN_BASES[name]) == 20
-
-
-@pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2329: this base records no N and T, so `p[i]` reads 0")
-@pytest.mark.parametrize("name", sorted(OPEN_BASES))
-def test_ritz1_indexes_every_base(run_with, name):
-    assert run_with("ritz1", name, OPEN_BASES[name]) == 20
+def test_every_base_reads_element_i(run_with, name, compiler):
+    assert run_with(compiler, name, OPEN_BASES[name]) == 20
 
 
 GLOBAL_STORE = "var g: *[3]i32 = null\n\n" + _a("    g = @a\n    g[1] = 7\n    return a[1]\n")
 
 
-# R9 makes `g[1] = 7` element 1's store, as for a local.  ritz0 refused it, because
-# it stored at stride `[N]T`; #2330's fix to that path is base-blind, so ritz0 gets
-# this row of #2329's for free.  ritz1 doesn't.
+# R9 makes `g[1] = 7` element 1's store, as for a local.
 @pytest.mark.integration
-def test_ritz0_stores_through_a_global(run_with):
-    assert run_with("ritz0", "global_store", GLOBAL_STORE) == 7
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_global_stores_element_i(run_with, compiler):
+    assert run_with(compiler, "global_store", GLOBAL_STORE) == 7
+
+
+def _base(base: str, kind: str, body: str, check: str) -> str:
+    """`body` in `f`, with `B` the base `base` over `a`, a `[3]i32` of 10, 20, 30.
+    main returns `check`, with `r` what f returned."""
+    spelled, addr = KINDS[kind]
+    ty = f"{spelled}[3]i32"
+    decls, params, args, setup, prefix, b = "", "", "", "", "", ""
+    if base == "field":
+        decls = f"struct H\n    r: {ty}\n\n"
+        params, args, setup, b = "h: *H", "@h", f"    var h: H\n    h.r = {addr}a\n", "h.r"
+    elif base == "global":
+        decls = f"var g: {ty} = null\n\n"
+        setup, b = f"    g = {addr}a\n", "g"
+    else:
+        decls = f"fn h(p: {ty}) -> {ty}\n    return p\n\n"
+        params, args, b = f"p: {ty}", f"{addr}a", "h(p)"
+        if base == "let_from_call":
+            prefix, b = "    let q = h(p)\n", "q"
+    return (decls + "fn rd(q: *i32) -> i32\n    return *q\n\n"
+            + f"fn f({params}) -> i32\n{prefix}{body.replace('B', b)}\n"
+            + "pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
+            + f"{setup}    let r: i32 = f({args})\n    return {check}\n")
+
+
+# Each returns 20.  The neighbours are checked, since `g[1] = 7` once stored an
+# i64 at offset 8 and cleared a[2].
+_NEIGHBOURS = " + a[0] - 10 + a[2] - 30"
+BASE_OPS = {
+    "read": ("    return B[1]\n", "r"),
+    "read_var": ("    var i: i32 = 2\n    return B[i] - 10\n", "r"),
+    "address": ("    return rd(@B[1] as *i32)\n", "r"),
+    # `@B[0]` is an `*i32`, so `+ 1` steps one element.
+    "address_step": ("    return rd(@B[0] + 1)\n", "r"),
+    "store": ("    B[1] = 7\n    return 0\n", "a[1] + 13" + _NEIGHBOURS),
+    "store_var": ("    var i: i32 = 1\n    B[i] = 7\n    return 0\n", "a[1] + 13" + _NEIGHBOURS),
+    "compound": ("    B[1] += 7\n    return 0\n", "a[1] - 7" + _NEIGHBOURS),
+    "mut_address": ("    let e: @&i32 = @&B[1]\n    *e = 7\n    return 0\n", "a[1] + 13" + _NEIGHBOURS),
+}
+BASES = ("field", "global", "call", "let_from_call")
+_WRITES = {"store", "store_var", "compound", "mut_address"}
+
+
+def _base_cases():
+    for base in BASES:
+        # A global is null until main points it, and only a pointer is nullable.
+        kinds = ("pointer",) if base == "global" else sorted(KINDS)
+        for kind in kinds:
+            for op in sorted(BASE_OPS):
+                yield base, kind, op
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2329: `g[i] = v` stores 8 bytes at stride 8")
-def test_ritz1_stores_through_a_global(run_with):
-    assert run_with("ritz1", "global_store", GLOBAL_STORE) == 7
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("base,kind,op", list(_base_cases()))
+def test_every_base_is_element_i_in_every_position(run_with, compile_with, base, kind, op, compiler):
+    body, check = BASE_OPS[op]
+    program = _base(base, kind, body, check)
+    if kind == "reference" and op in _WRITES:
+        # §3.2: nothing is written through an `@[N]T`, whatever the base.
+        message = ("cannot borrow through an `@T` as mutable" if op == "mut_address"
+                   else ref_rules.WRITE_THROUGH_SHARED)
+        comp, _, _ = compile_with(compiler, f"{base}_{op}", program)
+        out = comp.stdout + comp.stderr
+        assert comp.returncode != 0, f"{compiler} took {base} {op}"
+        assert message in out, out[-1500:]
+    else:
+        assert run_with(compiler, f"{base}_{op}", program) == 20
+
+
+# A struct element through each base: `.f` reads and writes element i's field.
+_SB = "struct S\n    x: i32\n    y: i64\n\n"
+_SA = "    var a: [3]S\n    a[1].x = 5\n    a[1].y = 6\n"
+STRUCT_BASES = {
+    "field_read": _SB + "struct H\n    r: *[3]S\n\nfn f(h: *H) -> i32\n    return h.r[1].y as i32 + h.r[1].x\n\n"
+                  "pub fn main() -> i32\n" + _SA + "    var h: H\n    h.r = @a\n    return f(@h)\n",
+    "field_write": _SB + "struct H\n    r: @&[3]S\n\nfn f(h: *H)\n    h.r[1].y = 9\n\n"
+                   "pub fn main() -> i32\n" + _SA + "    var h: H\n    h.r = @&a\n    f(@h)\n    return a[1].y as i32 + a[0].x + a[2].x + 2\n",
+    "global_write": _SB + "var g: *[3]S = null\n\npub fn main() -> i32\n" + _SA
+                    + "    a[0].x = 0\n    a[2].x = 0\n    g = @a\n    g[1].x = 7\n    return a[1].x + a[0].x + a[2].x + 4\n",
+    "call_read": _SB + "fn h(p: *[3]S) -> *[3]S\n    return p\n\npub fn main() -> i32\n" + _SA
+                 + "    return h(@a)[1].y as i32 + h(@a)[1].x\n",
+    "let_from_call_read": _SB + "fn h(p: @&[3]S) -> @&[3]S\n    return p\n\npub fn main() -> i32\n" + _SA
+                          + "    let q = h(@&a)\n    return q[1].y as i32 + q[1].x\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(STRUCT_BASES))
+def test_every_base_reaches_a_struct_element(run_with, name, compiler):
+    assert run_with(compiler, name, STRUCT_BASES[name]) == 11
+
+
+# The base is evaluated once per use: a store and an address call h once each.
+# (`h(p)[1] += 7` calls it twice on all three, as `x op= v` is `x = x op v`: AGAST #2529.)
+CALLED_ONCE = """\
+var calls: i32 = 0
+
+fn h(p: *[3]i32) -> *[3]i32
+    calls = calls + 1
+    return p
+
+pub fn main() -> i32
+    var a: [3]i32 = [10, 20, 30]
+    h(@a)[1] = 27
+    let e: *i32 = @h(@a)[2] as *i32
+    *e = 1
+    return a[1] - 27 + a[2] - 1 + calls * 10
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_call_base_is_evaluated_once(run_with, compiler):
+    assert run_with(compiler, "called_once", CALLED_ONCE) == 20
+
+
+# The element's type, where nothing annotates it: `let v = B[1]` is an f64.
+_F = "    var a: [3]f64 = [1.5, 10.0, 2.5]\n"
+FLOAT_BASES = {
+    "field": "struct H\n    r: *[3]f64\n\npub fn main() -> i32\n" + _F
+             + "    var h: H\n    h.r = @a\n    let v = h.r[1]\n    return (v * 2.0) as i32\n",
+    "global": "var g: @[3]f64 = null\n\npub fn main() -> i32\n" + _F
+              + "    g = @a\n    let v = g[1]\n    return (v * 2.0) as i32\n",
+    "call": "fn h(p: @&[3]f64) -> @&[3]f64\n    return p\n\npub fn main() -> i32\n" + _F
+            + "    let v = h(@&a)[1]\n    return (v * 2.0) as i32\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(FLOAT_BASES))
+def test_every_base_types_its_element(run_with, name, compiler):
+    assert run_with(compiler, name, FLOAT_BASES[name]) == 20
+
+
+# A generic struct's field and a generic fn's return keep N and T when T is a scalar.
+GENERIC_BASES = {
+    "struct_field": "struct Box<T>\n    r: *[3]i32\n    t: T\n\npub fn main() -> i32\n"
+                    "    var a: [3]i32 = [10, 20, 30]\n    var b: Box<i64>\n    b.r = @a\n    b.t = 0\n"
+                    "    b.r[2] = 7\n    return b.r[1] + a[2] - 7\n",
+    "fn_return": "fn h<T>(p: *[3]i32, t: T) -> *[3]i32\n    return p\n\npub fn main() -> i32\n"
+                 "    var a: [3]i32 = [10, 20, 30]\n    h<i64>(@a, 0)[2] = 7\n    return h<i64>(@a, 0)[1] + a[2] - 7\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(GENERIC_BASES))
+def test_a_generic_base_is_element_i(run_with, name, compiler):
+    assert run_with(compiler, name, GENERIC_BASES[name]) == 20
+
+
+# A field of a field: `a.b.data[2] = 1` was ritz1's fail-closed refusal (an array
+# pointee had no element kind), pinned in test_ritz1_member_store_fail_closed.py.
+NESTED_FIELD = """\
+struct B
+    data: *[4]u8
+
+struct A
+    b: B
+
+pub fn main() -> i32
+    var buf: [4]u8 = [9, 9, 9, 9]
+    var a: A
+    a.b.data = @buf
+    a.b.data[2] = 1
+    return buf[0] + buf[1] + buf[2] * 10 + buf[3]
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_nested_field_stores_element_i(run_with, compiler):
+    assert run_with(compiler, "nested_field", NESTED_FIELD) == 37

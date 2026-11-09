@@ -64,6 +64,18 @@ fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt) -> i32
     1
 
 fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
+    if stmt.var_declared_type == TYPE_VOID and stmt.var_init != null
+        # AGAST #2329: `let q = h(p)`, `let q = h.r` and `let q = g` hold what they
+        # copy.  `-> @[N]S` named S, which made `q` a `*S`.
+        let pa: *Param = base_ptr_array(s, stmt.var_init)
+        if pa != null
+            stmt.var_type = pa.param_type
+            stmt.var_type_name = null
+            stmt.var_type_name_len = 0
+            stmt.var_pointee_type = TYPE_ARRAY
+            stmt.var_pointee_array_size = pa.param_pointee_array_size
+            stmt.var_pointee_array_elem_type = pa.param_pointee_array_elem_type
+            return 1
     if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
         return 0
     let init: *Expr = stmt.var_init
@@ -121,6 +133,10 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, out_len: *i32) -> *u8
     if src != null
         *out_len = src.type_name_len
         return src.type_name
+    let pa: *Param = base_ptr_array(s, init)   # #2329
+    if pa != null
+        *out_len = pa.param_type_name_len
+        return pa.param_type_name
     if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT) or init.operand == null
         return null
     let oper: *Expr = init.operand
@@ -1285,7 +1301,7 @@ fn emit_through_index_assign(s: *EmitterState, stmt: *Stmt) -> i32
     if through_whole_array_refused(s, through, stmt.assign_value, stmt.span.line, stmt.span.col) == 1
         return 1
     var th: ThroughIndex
-    index_through_fill(@target, through, @th)
+    index_through_fill(@target, through_spill(s, through), @th)
     var store: Stmt
     memset(@store as *u8, 0, sizeof(Stmt))
     store.kind = STMT_ASSIGN
@@ -1315,7 +1331,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         if through != null
             if through_whole_array_refused(s, through, stmt.assign_value, stmt.span.line, stmt.span.col) == 1
                 return
-            index_through_fill(target_expr, through, @th)
+            index_through_fill(target_expr, through_spill(s, through), @th)
             target_expr = @th.deref
 
         # AGAST #1509: `g[i][j] = v` over a multi-dimensional array.  It fell
@@ -1399,8 +1415,11 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c", ptr ")
                     emit_reg(s, member_result.reg)
                     emit_str(s, c"\n")
-                else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
+                else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR or field.field_type == TYPE_REF or field.field_type == TYPE_MUT_REF
                     # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`.
+                    # AGAST #2329: so is `h.r = @&a` into an `@&[N]T`, which
+                    # lower_ref_fields leaves a reference, and which fell to a
+                    # `store i64` of the `ptr`.
                     let ival: i32 = ptr_value_to_i64(s, stmt.assign_value, val)
                     let ptr_val: i32 = next_reg(s)
                     emit_str(s, c"  ")
@@ -2018,7 +2037,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             var ret_th: ThroughIndex
             let ret_through: *LocalVar = index_through(s, ret_val)
             if ret_through != null and ret_through.array_view == 1
-                index_through_fill(ret_val, ret_through, @ret_th)
+                index_through_fill(ret_val, through_spill(s, ret_through), @ret_th)
                 ret_val = @ret_th.deref
             # Check if return value is a dereference (e.g., *ptr or *(ptr + offset))
             if ret_val.kind == EXPR_UNARY and ret_val.op == OP_DEREF
@@ -3987,8 +4006,9 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c", ptr ")
                         emit_reg(s, field_ptr)
                         emit_str(s, c"\n")
-                    else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
-                        # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`.
+                    else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR or field.field_type == TYPE_REF or field.field_type == TYPE_MUT_REF
+                        # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`,
+                        # and so is `h.r = @&a` into an `@&[N]T` (#2329).
                         let ival: i32 = ptr_value_to_i64(s, stmt.assign_value, val_reg)
                         let ptr_val: i32 = next_reg(s)
                         emit_str(s, c"  ")
@@ -4043,6 +4063,11 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 if field_idx >= 0
                     let pf: *StructField = get_field_type(st, field_idx)
                     if pf.field_type == TYPE_PTR or pf.field_type == TYPE_PTR_PTR
+                        lfia_field_is_ptr = 1
+                    # AGAST #2329: nor is an `@[N]T` / `@&[N]T` one, which
+                    # lower_ref_fields leaves a reference.  `h.r[1] = 7` wrote
+                    # into h.
+                    if pf.ptr_array != null
                         lfia_field_is_ptr = 1
                 if field_idx >= 0 and lfia_field_is_ptr == 0
                     let field: *StructField = get_field_type(st, field_idx)

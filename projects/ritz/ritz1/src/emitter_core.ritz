@@ -117,6 +117,10 @@ struct LocalVar
     # `p[i]` is `*(p# + i)`: element i at stride T in every position (LARB R9).
     # See add_array_view and index_through.
     array_view: i32
+    # AGAST #2329: for the view index_through makes of a base that isn't a local,
+    # `h.r`, `g` or `h(p)`, that base; null otherwise.  It's in no scope: an
+    # emitting site has through_spill bind it, the type-only ones read it as is.
+    array_base: *Expr
 
 # A let/var seen so far in the current function, with the integer type its
 # annotation WROTE (NARROW_UNKNOWN when unannotated or not an integer).
@@ -945,20 +949,99 @@ pub fn add_array_view(s: *EmitterState, name: *u8, len: i32, reg: i32, kind: i32
         return
     if kind != TYPE_PTR and kind != TYPE_REF and kind != TYPE_MUT_REF
         return
-    var view_kind: i32 = TYPE_PTR
-    if elem == TYPE_STRUCT
-        if type_name_len <= 0 or find_struct(s, type_name, type_name_len) == null
-            return
-    else if elem == TYPE_PTR or elem == TYPE_PTR_PTR or ptr_pointee_size(s, elem, null, 0) == 0
-        # `*[N]*U`: `*p[1] = 7` stored past a `*i16`'s pointee through a view, so
-        # it keeps #2321's refusal (#2330's NOT DONE).
+    if array_view_elem_ok(s, elem, type_name, type_name_len) == 0
         return
     let view_name: *u8 = malloc(len as i64 + 1)
     memcpy(view_name, name, len as i64)
     *(view_name + len) = 35   # '#': no identifier has one, so `p#` names only this
-    add_local_full(s, view_name, len + 1, reg, view_kind, type_name, type_name_len, elem, 0, 0)
+    add_local_full(s, view_name, len + 1, reg, TYPE_PTR, type_name, type_name_len, elem, 0, 0)
     let view: *LocalVar = local_at(s, s.local_count - 1)
     view.array_view = 1
+
+# 1 when an array of `elem` gets a view: a scalar, or a struct ritz1 knows.
+fn array_view_elem_ok(s: *EmitterState, elem: i32, type_name: *u8, type_name_len: i32) -> i32
+    if elem == TYPE_STRUCT
+        if type_name_len <= 0 or find_struct(s, type_name, type_name_len) == null
+            return 0
+    else if elem == TYPE_PTR or elem == TYPE_PTR_PTR or ptr_pointee_size(s, elem, null, 0) == 0
+        # `*[N]*U`: `*p[1] = 7` stored past a `*i16`'s pointee through a view, so
+        # it keeps #2321's refusal (#2330's NOT DONE).
+        return 0
+    1
+
+# AGAST #2329: what a `*[N]T`, `@[N]T` or `@&[N]T` base that isn't a local was
+# declared as: a field `h.r`, a global `g` or a call `h(p)`.  Each records the type
+# as a param would (ptr_array_of_last), so `x[i]` on one is element i at stride T,
+# as on a local (LARB R9).  null for anything else, a local included.
+pub fn base_ptr_array(s: *EmitterState, e: *Expr) -> *Param
+    if e == null
+        return null
+    var pa: *Param = null
+    if e.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, e)
+        if f != null
+            pa = f.ptr_array
+    else if e.kind == EXPR_IDENT
+        if find_local_struct_name(s, e.ident_ptr, e.ident_len) != null
+            return null
+        let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+        if g != null
+            pa = g.ptr_array
+    else if e.kind == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, e)
+        if fd != null
+            pa = fd.ret_ptr_array
+    if pa == null or pa.param_pointee_array_size <= 0
+        return null
+    pa
+
+# AGAST #2329: the view of `root`, a base_ptr_array, as add_array_view would bind it
+# for a local, but in no scope, holding `root` in array_base; null if it has none.
+pub fn base_array_view(s: *EmitterState, root: *Expr) -> *LocalVar
+    let pa: *Param = base_ptr_array(s, root)
+    if pa == null
+        return null
+    let elem: i32 = pa.param_pointee_array_elem_type
+    if array_view_elem_ok(s, elem, pa.param_type_name, pa.param_type_name_len) == 0
+        return null
+    let v: *LocalVar = malloc(sizeof(LocalVar)) as *LocalVar
+    memset(v as *u8, 0, sizeof(LocalVar))
+    v.var_type = TYPE_PTR
+    v.pointee_type = elem
+    v.type_name = pa.param_type_name
+    v.type_name_len = pa.param_type_name_len
+    v.array_view = 1
+    v.array_base = root
+    v.inner_pointee_type = TYPE_VOID
+    v.pointee_array_elem_type = TYPE_VOID
+    v.pointee_array_elem_pointee = TYPE_VOID
+    v
+
+var g_base_spills: i32 = 0
+
+# AGAST #2329: `view`, bound, at an emitting site.  A base_array_view's base is
+# evaluated once, into a `*T` local named `#k`, so `x[i]` is `*(#k + i)` the way a
+# local's is `*(p# + i)`; anything else is `view` itself.
+pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
+    if view == null or view.array_base == null
+        return view
+    let val: i32 = emit_expr(s, view.array_base)
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca i64\n  store i64 ")
+    emit_reg(s, val)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+    g_base_spills = g_base_spills + 1
+    let name: *u8 = malloc(24)
+    *name = 35   # '#': no identifier has one
+    let len: i32 = 1 + fmt_i64_into(name + 1, g_base_spills as i64) as i32
+    add_local_full(s, name, len, slot, TYPE_PTR, view.type_name, view.type_name_len, view.pointee_type, 0, 0)
+    let bound: *LocalVar = local_at(s, s.local_count - 1)
+    bound.array_view = 1
+    bound
 
 fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32, type_name: *u8, type_name_len: i32, pointee: i32, arr_size: i32, arr_elem: i32)
     if s.local_count >= s.locals_cap
@@ -998,6 +1081,7 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
     loc.ref_root_name_len = 0
     loc.not_fn = 0
     loc.array_view = 0
+    loc.array_base = null
     s.local_count = idx + 1
     # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
     # Store `idx + 1` so the value is non-zero (0 = miss in
@@ -4079,6 +4163,8 @@ fn index_elem_size(s: *EmitterState, idx: *Expr) -> i64
                 return ptr_elem_size_unknown(s, base.ident_ptr, base.ident_len)
     # AGAST #2440: through a reference or pointer it's the buffer's element.
     let through: *LocalVar = index_through(s, idx)
+    if through != null and through.array_base != null
+        return ptr_pointee_size(s, through.pointee_type, through.type_name, through.type_name_len)   # #2329
     if through != null
         var th: ThroughIndex
         index_through_fill(idx, through, @th)
@@ -4563,6 +4649,8 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             return array_elem_pointee_kind(s, e.left)
         # AGAST #2440: what `*(p.data + i)` is.
         let through: *LocalVar = index_through(s, e)
+        if through != null and through.array_base != null
+            return through.pointee_type   # the element of `h.r[i]`, `g[i]`, `h(p)[i]` (#2329)
         if through != null
             var th: ThroughIndex
             index_through_fill(e, through, @th)

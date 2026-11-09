@@ -856,6 +856,7 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
     else
         g.pointee_type = TYPE_I64
     g.inner_pointee_type = ptr_ptr_inner_pointee(p, var_type)
+    g.ptr_array = ptr_array_of_last(p, var_type)   # AGAST #2329
     # AGAST #190: capture array dimensions for `var g: [N]T` so the global
     # gets emitted as `[N x %T] zeroinitializer` and indexing GEPs can
     # synthesise the right stride.  Mirrors what var_decl does for locals
@@ -972,6 +973,7 @@ pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, bod
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
     f.ret_array = fn_ret_array(ret)     # AGAST #2343
+    f.ret_ptr_array = fn_ret_ptr_array(ret)   # AGAST #2329
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1047,6 +1049,7 @@ pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
     f.ret_array = fn_ret_array(ret)     # AGAST #2343
+    f.ret_ptr_array = fn_ret_ptr_array(ret)   # AGAST #2329
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1208,6 +1211,17 @@ fn param_of_type(p: *Parser, name: *u8, len: i32, ty: i32) -> *Param
         param.fn_sig = fresh_fn_sig(p)
     return param
 
+# AGAST #2329: the just-parsed `ty` as a param would hold it, when it's a `*[N]T`,
+# `@[N]T` or `@&[N]T`, so a field, a global or a return type knows N and T, and
+# `x[i]` on one is element i at stride T, as on a local (#2330, LARB R9).  null
+# for any other type.
+pub fn ptr_array_of_last(p: *Parser, ty: i32) -> *Param
+    if ty == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
+        return param_of_type(p, null, 0, ty)
+    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_ARRAY
+        return param_of_type(p, null, 0, ty)
+    null
+
 # `name:& T` (AGAST #1644): a TYPE_MUT_REF param that ritz0 auto-derefs.
 pub fn param_borrow(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
     nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
@@ -1339,6 +1353,7 @@ pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
     f.ptr_pointee = TYPE_VOID
     if ty == TYPE_PTR
         f.ptr_pointee = p.last_pointee_type
+    f.ptr_array = ptr_array_of_last(p, ty)   # AGAST #2329
     # AGAST #2120: `f: EfiFn` keeps the signature, so `(t.f)(..)` calls typed.
     # The action runs after the field's NEWLINE, one token past the type.
     f.fn_sig = null
@@ -1449,6 +1464,7 @@ pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypePar
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
     f.ret_array = fn_ret_array(ret)     # AGAST #2343
+    f.ret_ptr_array = fn_ret_ptr_array(ret)   # AGAST #2329
     f.name = name as *u8
     f.name_len = len
     f.params = params
@@ -1885,6 +1901,14 @@ fn fn_ret_ref(ret: i32) -> *Param
 # AGAST #2343: a `-> [N]T`, latched the same way.
 var g_ret_array: *ArrayElem = null
 
+# AGAST #2329: a `-> *[N]T`, `-> @[N]T` or `-> @&[N]T`, latched the same way.
+var g_ret_ptr_array: *Param = null
+
+fn fn_ret_ptr_array(ret: i32) -> *Param
+    if ret == TYPE_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
+        return g_ret_ptr_array
+    return null
+
 fn fn_ret_array(ret: i32) -> *ArrayElem
     if ret == TYPE_ARRAY
         return g_ret_array
@@ -1897,6 +1921,7 @@ pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     g_ret_array = null
     if ret == TYPE_ARRAY
         g_ret_array = array_elem_of_last(p)
+    g_ret_ptr_array = ptr_array_of_last(p, ret)   # AGAST #2329
     if ret == TYPE_REF or ret == TYPE_MUT_REF
         g_ret_ref = param_of_type(p, null, 0, ret)
     if ret == TYPE_STRUCT
@@ -2007,6 +2032,7 @@ pub fn type_fn(p: *Parser, params: *Param, ret: i32) -> i32
     f.ret_fn_sig = null
     f.ret_ref = null
     f.ret_array = null
+    f.ret_ptr_array = null
     p.last_fn_sig = f
     p.last_fn_sig_pos = p.pos
     return TYPE_PTR

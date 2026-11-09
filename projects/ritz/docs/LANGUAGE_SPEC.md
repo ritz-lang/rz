@@ -1787,6 +1787,29 @@ fn main() -> i32
     0
 ```
 
+The base can be any expression of that type, not only a name: a field, a global or a
+call's result. It's evaluated once each time it's used.
+
+```ritz
+struct Grid
+    row: @&[3]i32
+
+var cursor: *[3]i32 = null
+
+fn pick(p: *[3]i32) -> *[3]i32
+    p
+
+fn main() -> i32
+    var a: [3]i32 = [10, 20, 30]
+    var g: Grid
+    g.row = @&a
+    g.row[0] = 1
+    cursor = @a
+    cursor[1] += 2
+    pick(@a)[2] = 3
+    a[0] + a[1] + a[2] - 26
+```
+
 Writes follow §3.2, so an `@T` refuses them. A `*T` over anything else is a raw
 buffer: `p[i]` is `*(p + i)`, at stride `T`. Walking rows of Vecs behind a `*Vec<T>`
 is `p + i`, not `p[i]`.
