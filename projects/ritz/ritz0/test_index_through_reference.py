@@ -796,18 +796,156 @@ def test_an_element_that_is_a_vec_indexes(run_with, kind, compiler):
     assert run_with(compiler, "nested", HEADER + NESTED.format(spelled=spelled, addr=addr)) == 20
 
 
-# A method on an element (#2443).  Loud on ritz1: no receiver type.
-RECEIVERS = [pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#2443"))
-             for c in ("ritz1", "ritz1_selfhosted")]
-
-
+# A method on an element (#2443): the element is the receiver.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", *RECEIVERS])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", sorted(KINDS))
 def test_a_method_on_an_element(run_with, kind, compiler):
     spelled, addr = KINDS[kind]
     row = ("Vec<A>", ARRAYS, "    return p[1].get1()\n", "    return f({a}v)\n", 20)
     assert run_with(compiler, "method", _inside(spelled, addr, row)) == 20
+
+
+# The element is the receiver, in place: `self: @M` reads it, `self: @&M` writes it,
+# `self: M` takes a copy.  `y` is at a non-zero offset, so a receiver at the wrong
+# address reads `x`.
+M_ELEMENT = """\
+struct M
+    x: i32
+    y: i32
+
+impl M
+    fn gety(self: @M) -> i32
+        return self.y
+    fn sety(self: @&M, v: i32)
+        self.y = v
+    fn sum(self: M) -> i32
+        return self.x + self.y
+
+"""
+M_HOLDERS = {
+    "Vec": ("Vec<M>",
+            "    var v: Vec<M> = vec_new<M>()\n"
+            "    v.push(M { x: 1, y: 2 })\n    v.push(M { x: 3, y: 20 })\n",
+            "(*(v.data + 1)).y"),
+    "Span": ("Span<M>",
+             "    var a: [2]M\n    a[0].x = 1\n    a[0].y = 2\n    a[1].x = 3\n    a[1].y = 20\n"
+             "    var v: Span<M> = span_from_ptr<M>(@a[0], 2)\n",
+             "a[1].y"),
+    "Vec_of_pointers": ("Vec<*M>",
+                        "    var m0: M = M { x: 1, y: 2 }\n    var m1: M = M { x: 3, y: 20 }\n"
+                        "    var v: Vec<*M> = vec_new<*M>()\n    vec_push<*M>(@&v, @m0)\n"
+                        "    vec_push<*M>(@&v, @m1)\n",
+                        "m1.y"),
+}
+# A call through `(*p)[1]` and `p[1]`, and what f returns.
+M_READS = {
+    "read": ("    return p[1].gety()\n", 20),
+    "read_deref": ("    return (*p)[1].gety()\n", 20),
+    "by_value": ("    return p[1].sum()\n", 23),
+    "in_expression": ("    return p[1].gety() + p[0].gety()\n", 22),
+}
+M_WRITES = {
+    "write": "    p[1].sety(7)\n    return 0\n",
+    "write_deref": "    (*p)[1].sety(7)\n    return 0\n",
+}
+
+
+def _m_program(spelled, holder, addr, body, after):
+    ty, setup, back = M_HOLDERS[holder]
+    return (f"{HEADER}{M_ELEMENT}fn f(p: {spelled}{ty}) -> i32\n{body}\n"
+            f"pub fn main() -> i32\n{setup}    let r: i32 = f({addr}v)\n"
+            + after.format(back=back))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("kind", sorted(KINDS))
+@pytest.mark.parametrize("holder", sorted(M_HOLDERS))
+@pytest.mark.parametrize("name", sorted(M_READS))
+def test_a_method_reads_its_element(run_with, name, holder, kind, compiler):
+    spelled, addr = KINDS[kind]
+    body, want = M_READS[name]
+    program = _m_program(spelled, holder, addr, body, "    return r\n")
+    assert run_with(compiler, f"m_{name}", program) == want
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("kind", WRITABLE)
+@pytest.mark.parametrize("holder", sorted(M_HOLDERS))
+@pytest.mark.parametrize("name", sorted(M_WRITES))
+def test_a_mutating_method_writes_its_element(run_with, name, holder, kind, compiler):
+    spelled, addr = KINDS[kind]
+    program = _m_program(spelled, holder, addr, M_WRITES[name], "    return {back}\n")
+    assert run_with(compiler, f"m_{name}", program) == 7
+
+
+# Through an `@T`, a `self: @&M` method is a mutable borrow of the element, as
+# `q.sety(7)` is on `q: @M`: refused at the receiver, the same place on all three.
+# An element that's a `*M` is the pointer's business, and `self: @M` only reads.
+SHARED_INTO_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
+SHARED_RECEIVERS = {"element": ("p[1].sety(7)", 5), "element_deref": ("(*p)[1].sety(7)", 6)}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("holder", ["Span", "Vec"])
+@pytest.mark.parametrize("name", sorted(SHARED_RECEIVERS))
+def test_a_shared_reference_refuses_a_mutating_method(compile_with, name, holder, compiler):
+    call, col = SHARED_RECEIVERS[name]
+    program = _m_program("@", holder, "@", f"    {call}\n    return 0\n", "    return r\n")
+    line = program.splitlines().index(f"    {call}") + 1
+    _refused(compile_with, compiler, name, program, SHARED_INTO_MUT)
+    comp, _, _ = compile_with(compiler, name + "_at", program)
+    assert f"main.ritz:{line}:{col}:" in comp.stdout + comp.stderr, (comp.stdout + comp.stderr)[-1000:]
+
+
+SHARED_LEGAL = {
+    "pointer_element": ("Vec_of_pointers", "    p[1].sety(7)\n    return 0\n", "    return {back}\n", 7),
+    "pointer_element_deref": ("Vec_of_pointers", "    (*p)[1].sety(7)\n    return 0\n",
+                              "    return {back}\n", 7),
+    "reading_method": ("Vec", "    return p[1].gety()\n", "    return r\n", 20),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(SHARED_LEGAL))
+def test_a_shared_reference_takes_what_does_not_write_its_element(run_with, name, compiler):
+    holder, body, after, want = SHARED_LEGAL[name]
+    assert run_with(compiler, name, _m_program("@", holder, "@", body, after)) == want
+
+
+# On the value itself: `v[1].m()` on a Vec or Span local.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("holder", sorted(M_HOLDERS))
+def test_a_method_on_an_element_of_a_local(run_with, holder, compiler):
+    ty, setup, back = M_HOLDERS[holder]
+    program = (f"{HEADER}{M_ELEMENT}pub fn main() -> i32\n{setup}"
+               f"    v[1].sety(v[1].gety() + 5)\n    return {back}\n")
+    assert run_with(compiler, "m_local", program) == 25
+
+
+# An element that's a Vec: Vec's own methods (`len`, `get`) on it.  `get` needs
+# `vec_get<i32>`, and neither monomorphizer types an element as a receiver, so it's
+# never instantiated: undefined `Vec$i32_get` at link, on a local Vec too (#2519).
+UNINSTANTIATED = pytest.mark.xfail(strict=True, reason="#2519")
+VEC_METHODS = {"len": ("p[1].len() as i32", 2), "get": ("p[1].get(1)", 20)}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("kind", sorted(KINDS))
+@pytest.mark.parametrize("method", sorted(VEC_METHODS))
+def test_a_vec_method_on_an_element_that_is_a_vec(run_with, method, kind, compiler, request):
+    if method == "get":
+        request.applymarker(UNINSTANTIATED)
+    spelled, addr = KINDS[kind]
+    call, want = VEC_METHODS[method]
+    program = HEADER + NESTED.replace("p[1][1]", call).format(spelled=spelled, addr=addr)
+    assert run_with(compiler, f"vm_{method}", program) == want
 
 
 # `let p = @&x` isn't recorded as a reference anywhere (#2445): ritz0 reads past it,

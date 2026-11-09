@@ -1024,8 +1024,14 @@ class TypeChecker:
         elif isinstance(base_type, (rast.PtrType, rast.RefType)):
             return self._element_behind(base_type)
         elif isinstance(base_type, rast.NamedType):
-            # Could be Vec<T>, String, etc - allow indexing
-            # In full implementation, would look up Index trait
+            # A Vec or Span gives its element (#2443: `(*p)[i].m()` and
+            # `v[i].m()` reach M's receiver check). Anything else could be a
+            # String etc - allow indexing. In full implementation, would look
+            # up Index trait
+            named = self._resolve_alias(base_type)
+            held = self._mangled_buffer_element(named.name) if isinstance(named, rast.NamedType) else None
+            if held is not None:
+                return held
             return rast.NamedType(expr.span, 'unknown', [])
         else:
             self._error(f"cannot index into {self._type_str(base_type)}", expr.span)
@@ -1043,7 +1049,23 @@ class TypeChecker:
                 return rast.NamedType(inner.span, 'u8', [])
             if inner.name in ('Vec', 'Span') and inner.args:
                 return inner.args[0]
+            held = self._mangled_buffer_element(inner.name)
+            if held is not None:
+                return held
         return pointer.inner
+
+    def _mangled_buffer_element(self, name: str) -> Optional[rast.Type]:
+        """T for a monomorphized `Vec$T` or `Span$T`: what its buffer field
+        (`data`, `ptr`) points at. Without it `p[i]` on a `@Vec$M` typed as the
+        Vec, so `p[i].m()` missed M's methods and their receiver check (#2443)."""
+        buffer = {'Vec': 'data', 'Span': 'ptr'}.get(name.split('$', 1)[0])
+        info = self.structs.get(name) if '$' in name else None
+        if buffer is None or info is None:
+            return None
+        for field_name, field_type in info.fields:
+            if field_name == buffer and isinstance(field_type, rast.PtrType):
+                return field_type.inner
+        return None
 
     def _check_if(self, expr: rast.If) -> rast.Type:
         """Type check if expression."""
