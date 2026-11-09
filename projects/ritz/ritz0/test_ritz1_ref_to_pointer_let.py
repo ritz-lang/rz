@@ -117,26 +117,75 @@ def test_reference_to_pointer_shape(run_with, name, compiler):
     assert run_with(compiler, name, SHAPES[name]) == 0
 
 
-# AGAST #2537: `(*r)[i]` with `r: **T` loads one byte on ritz1 whatever T is,
-# annotated or inferred, and is invalid IR on a float.  Not this ticket's.
+# AGAST #2537: `(*r)[i]` with `r: **T` loaded one byte on ritz1 whatever T was
+# (`getelementptr i8` + `load i8`), annotated or inferred: wrong values on an
+# integer, invalid IR on a float.  `*(*r + k)` already had T's stride.  Every
+# `*(*r + k)` in _CHECKS becomes `(*r)[k]`; `**r` stays as the control.
+def _indexed(source: str, amp: str, ty: str, annotate: bool) -> str:
+    text = (
+        _program(source, amp, ty)
+        .replace("*(*r + 1)", "(*r)[1]")
+        .replace("*(*r + 2)", "(*r)[2]")
+    )
+    if annotate:
+        text = text.replace(f"let r = {amp}q", f"let r: **{ty} = {amp}q")
+    return text
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    "compiler",
-    [
-        "ritz0",
-        *(
-            pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="AGAST #2537"))
-            for c in RITZ1S
-        ),
-    ],
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(SCALARS))
+@pytest.mark.parametrize("amp", ["@", "@&"], ids=["shared", "mut"])
+@pytest.mark.parametrize("source", sorted(SOURCES))
+def test_index_through_deref(run_with, source, amp, ty, compiler):
+    name = f"index_{source}_{'mut' if amp == '@&' else 'shared'}_{ty}"
+    assert run_with(compiler, name, _indexed(source, amp, ty, False)) == 0
+
+
+# The written-out `let r: **T` took the same byte path.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(SCALARS))
+def test_index_through_deref_annotated(run_with, ty, compiler):
+    assert run_with(compiler, f"index_ann_{ty}", _indexed("local", "@", ty, True)) == 0
+
+
+# A `r: **T` parameter, not a `let`: the base is `*r` all the same.
+_PARAM_PP = (
+    """\
+fn g(r: **{t}) -> i32
+    if (*r)[0] != {v0}
+        return 1
+    if (*r)[1] != {v1}
+        return 2
+    if (*r)[2] != {v2}
+        return 3
+    let i: i64 = 2
+    let v = (*r)[i]
+    if v != {v2}
+        return 4
+    return 0
+
+pub fn main() -> i32
+"""
+    + _FILL
+    + """\
+    var q: *{t} = @x[0]
+    return g(@q)
+"""
 )
-@pytest.mark.parametrize("ty", ["i16", "f64"])
-def test_index_through_deref(run_with, ty, compiler):
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(SCALARS))
+def test_index_through_deref_param(run_with, ty, compiler):
+    v0, v1, v2, _ = SCALARS[ty]
     assert (
         run_with(
             compiler,
-            f"index_{ty}",
-            _program("local", "@", ty).replace("*(*r + 2)", "(*r)[2]"),
+            f"index_pp_param_{ty}",
+            _PARAM_PP.format(t=ty, v0=v0, v1=v1, v2=v2),
         )
         == 0
     )

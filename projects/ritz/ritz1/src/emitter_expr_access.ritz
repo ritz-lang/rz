@@ -524,6 +524,40 @@ fn unsliceable_message(base_type: i32) -> *u8
         return c"a pointer can't be sliced (only String, Vec and Span can)"
     return c"this can't be sliced (only String, Vec and Span can)"
 
+# AGAST #2537: `(*r)[i]` where `*r` is a `*T` and T is the scalar `elem`:
+# `*r` is the pointer (an i64), so GEP it at T's own memory type
+# (local_array_elem_llvm: `i1` for bool, `float` / `double` for floats) and
+# widen as an array element is.
+fn emit_deref_index(s: *EmitterState, e: *Expr, elem: i32) -> i32
+    let ty: *u8 = local_array_elem_llvm(elem)
+    let base: i32 = emit_expr(s, e.left)
+    let idx: i32 = emit_expr(s, e.right)
+    let base_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, base)
+    emit_str(s, c" to ptr\n")
+    let ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr)
+    emit_str(s, c" = getelementptr ")
+    emit_str(s, ty)
+    emit_str(s, c", ptr ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = load ")
+    emit_str(s, ty)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c"\n")
+    return emit_array_elem_widen(s, val, elem, ty)
+
 fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # AGAST #2440: `p[i]` through a reference or pointer.
     if index_refused(s, e) == 1
@@ -1209,6 +1243,13 @@ fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                     emit_str(s, c" to i64\n")
                     return ext
                 return val2
+
+    # AGAST #2537: `(*r)[i]` with `r: **T` GEPs and loads T (get_expr_type's
+    # deref_index_elem), widened as an array element is.  It took the byte
+    # path below: wrong values on an integer, invalid IR on a float.
+    let dix: i32 = deref_index_elem(s, e)
+    if dix != TYPE_VOID
+        return emit_deref_index(s, e, dix)
 
     let base: i32 = emit_expr(s, e.left)
     let idx: i32 = emit_expr(s, e.right)
