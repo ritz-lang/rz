@@ -964,6 +964,15 @@ class TypeChecker:
                 ty = rast.NamedType(expr.span, self.variant_to_enum[expr.field], [])
             return ty or rast.NamedType(expr.span, 'unknown', [])
 
+        # `RepoError.NotFound` is a `RepoError`, though `ServiceError` has a
+        # variant `RepoError(RepoError)` and a `NotFound` too (AGAST #2534):
+        # a bare name looked up as a value finds that variant first. As
+        # `Color.Green(1)` does in _check_method_call.
+        if isinstance(expr.expr, rast.Ident) and expr.expr.name in self.enums:
+            enum = self.enums[expr.expr.name]
+            if any(v.name == expr.field for v in enum.variants):
+                return rast.NamedType(expr.span, enum.name, [])
+
         base_type = self._infer_type(expr.expr)
 
         # Unwrap pointers/refs for field access
