@@ -564,6 +564,43 @@ mutating receiver or a write to that root.
 
 **Compilers.** ritz0 adds receivers and `=`. ritz1 gets the check itself.
 
+### R11a: overlapping places, not the same root (#2511, 2026-11-09)
+
+R11's "on the same root" was loose wording. The rule compares **places**.
+
+**Rule (text for §13.5).** A borrow is of a place: a root binding followed by field
+(`.f`) and index (`[i]`) steps. Two places overlap when one path is a prefix of the
+other. Field names must match exactly, and any two indexes count as equal. While a
+binding holds an `@` of a place, or within the arguments of one call, these are errors
+on any overlapping place: a mutable borrow (`@&p`, `p` passed bare to `:&`, a
+`self: @&T` or `self:& T` method on `p`), or a write (`p = v`, or a write inside `p`).
+Disjoint fields of one root don't conflict.
+
+| Shape | Ruling |
+|---|---|
+| `let a = @c.x`, then `c.y = 2` | legal |
+| `f(@&r.a, @&r.b)` | legal |
+| `let a = @c.x`, then `c.x = 2` / `c = d` / `c.up()` | refused |
+| `let a = @c.x`, then `c.x.k = 2` | refused (write inside the loaned place) |
+| `let e = @a[1]`, then `a[2] = 5` | refused (indexes overlap) |
+| `let e = @vs[0]`, then `vs.push(h)` | refused |
+| `f(@&r.a, @&r.a.b)` | refused |
+
+**Why.** §13.5 says the rules are Rust's, and a field is separate storage. R9 already
+made `x.f` and `x[i]` places. Comparing indexes would need values, so any two indexes
+overlap. As before, this is a check for the definite case: the path is syntactic, and
+an alias through another binding isn't seen. The loan still lasts to the end of the
+block.
+
+**Cost.** (A) costs 2 sites and (B) 3, not the 0 and 3 #2511 gave. angelo's
+`GlyphCache.get` and `SubpixelGlyphCache.get` write `self.entries[i].access_count`
+while `entry = @self.entries[i]` is live, and the loan is a prefix of that write. They
+need the rewrite either way: drop `entry` and compare `self.entries[i].key.hash()`, as
+`contains` already does. The overlapping-place rule makes tempest `tab_renderer.ritz:275` legal.
+
+**Compilers.** ritz0, ritz1 and ritz1_selfhosted record a place path on each loan and
+test for overlap. The error names both places, not just the root.
+
 ## R12: names (#2407, #2350, #2386)
 
 **Rule.** A local binding can't take the name of a module-level value that a bare read
