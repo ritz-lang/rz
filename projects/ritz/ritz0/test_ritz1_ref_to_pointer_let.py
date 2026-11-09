@@ -382,13 +382,7 @@ ENUM_BODIES = {
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("ann", ["inferred", "annotated"])
 @pytest.mark.parametrize("body", sorted(ENUM_BODIES))
-def test_reference_to_an_enum_pointer(request, run_with, body, ann, compiler):
-    if body == "store_then_load" and compiler in RITZ1S:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True, reason="AGAST #2542: `let v = *p` isn't typed"
-            )
-        )
+def test_reference_to_an_enum_pointer(run_with, body, ann, compiler):
     program = _ENUM.format(
         ann="" if ann == "inferred" else ": **Color", body=ENUM_BODIES[body]
     )
@@ -420,3 +414,79 @@ AGGREGATE_SHAPES = {
 @pytest.mark.parametrize("name", sorted(AGGREGATE_SHAPES))
 def test_reference_to_an_aggregate_pointer_shape(run_with, name, compiler):
     assert run_with(compiler, name, AGGREGATE_SHAPES[name]) == 0
+
+
+# AGAST #2542: `let v = <deref>` with no annotation is the pointee's type, the
+# `%S` / `%Color` the deref loads.  ritz1 left `v` an untyped i64 slot: `v.b`
+# was refused "unlowerable", and `match v` on an enum reported a false
+# "unreachable arm".  `{ann}` is "" or the written-out type, the control.
+_S2 = "struct S\n    a: i32\n    b: i32\n\n"
+_TWO_S = "    var x: [2]S\n    x[0] = S {{ a: 1, b: 2 }}\n    x[1] = S {{ a: 3, b: 4 }}\n"
+DEREF_LETS = {
+    "struct_local": (
+        "S",
+        _S2 + "pub fn main() -> i32\n    var x = S {{ a: 1, b: 2 }}\n"
+        "    var p: *S = @x\n    let v{ann} = *p\n" + _is("v.a + v.b", "3"),
+    ),
+    "struct_param": (
+        "S",
+        _S2
+        + "fn f(p: *S) -> i32\n    let v{ann} = *p\n"
+        + _is("v.b", "2")
+        + "\npub fn main() -> i32\n    var x = S {{ a: 1, b: 2 }}\n    return f(@x)\n",
+    ),
+    "struct_offset": (
+        "S",
+        _S2
+        + "pub fn main() -> i32\n"
+        + _TWO_S
+        + "    var p: *S = @x[0]\n    let v{ann} = *(p + 1)\n"
+        + _is("v.b", "4"),
+    ),
+    "struct_ptr_ptr": (
+        "S",
+        _S2 + "pub fn main() -> i32\n    var x = S {{ a: 1, b: 2 }}\n"
+        "    var p: *S = @x\n    var pp: **S = @p\n    let v{ann} = **pp\n"
+        + _is("v.b", "2"),
+    ),
+    # A copy, not an alias: writing v leaves x alone.
+    "struct_copy": (
+        "S",
+        _S2 + "pub fn main() -> i32\n    var x = S {{ a: 1, b: 2 }}\n"
+        "    var p: *S = @x\n    var v{ann} = *p\n    v.b = 9\n"
+        + _is("x.b + v.b", "11"),
+    ),
+    "enum_local": (
+        "Color",
+        _COLOR + "pub fn main() -> i32\n    var c = Color.Green\n"
+        "    var q: *Color = @c\n    let v{ann} = *q\n"
+        "    match v\n        Color.Green => 0\n        _ => 1\n",
+    ),
+    "enum_ptr_ptr": (
+        "Color",
+        _COLOR + "pub fn main() -> i32\n    var c = Color.Blue\n"
+        "    var q: *Color = @c\n    var r: **Color = @q\n    let v{ann} = **r\n"
+        "    match v\n        Color.Blue => 0\n        _ => 1\n",
+    ),
+    "enum_compare": (
+        "Color",
+        _COLOR + "pub fn main() -> i32\n    var c = Color.Red\n"
+        "    var q: *Color = @c\n    let v{ann} = *q\n" + _is("v", "Color.Red"),
+    ),
+    # A primitive pointee keeps its width: v is an i16, not 8 bytes of x.
+    "prim_i16": (
+        "i16",
+        "pub fn main() -> i32\n    var x: [4]i16\n    x[0] = -2\n    x[1] = 5\n"
+        "    var p: *i16 = @x[0]\n    let v{ann} = *p\n" + _is("v", "-2"),
+    ),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ann", ["inferred", "annotated"])
+@pytest.mark.parametrize("name", sorted(DEREF_LETS))
+def test_let_of_a_deref_is_the_pointee(run_with, name, ann, compiler):
+    ty, program = DEREF_LETS[name]
+    program = program.format(ann="" if ann == "inferred" else f": {ty}")
+    assert run_with(compiler, f"deref_let_{name}_{ann}", program) == 0

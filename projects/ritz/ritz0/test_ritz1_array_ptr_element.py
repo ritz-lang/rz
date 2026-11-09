@@ -483,10 +483,17 @@ def test_a_loop_binding_knows_its_pointee(run_with, compiler, name):
     assert run_with(compiler, name, FOR_OVER[name]) == 0
 
 
+# AGAST #2542 (was a #2377 known gap): `let c = *a[1]` with `a: [2]*S` is an S.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_inferred_copy_of_a_struct_element_deref(run_with, compiler):
+    program = _s("    let c = *a[1]\n" + _is("c.q", "2"))
+    assert run_with(compiler, "struct_inferred_copy", program) == 0
+
+
 # ritz0 has these right, ritz1 doesn't, and each is its own bug.  Strict, so the
 # fix flags the row.
 KNOWN_GAPS = {
-    "struct_inferred_copy": (2377, _s("    let c = *a[1]\n" + _is("c.q", "2"))),
     "struct_index_inferred_copy": (2377, _PAIR + _PAIR_MAIN + "    let c = a[1][1]\n" + _is("c.q", "2")),
     "generic_element_mut_param": (2378, (
         "fn f<T>(a:& [2]*T, t: T) -> i32\n" + _is("*a[1]") + "\n"
