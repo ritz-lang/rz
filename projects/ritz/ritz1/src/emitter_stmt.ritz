@@ -2282,13 +2282,22 @@ fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
             return emit_for_header_spill(s, cst, emit_expr(s, e))
     0
 
-# `@v` / `@&v` / `@h.v`.  `@v` of anything already a reference isn't here:
-# `v: @Vec<T>` is refused by ritz0, and `:&` is #2314.
+# `@v` / `@&v` / `@h.v`.  `@v` of a pointer or a reference isn't here: ritz0
+# refuses `v: *Vec<T>` and `v: @Vec<T>`.
 fn emit_for_addr_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
     let op: *Expr = e.operand
     if op == null
         return 0
     if op.kind == EXPR_IDENT
+        # AGAST #2314: `v:& Vec<T>`'s slot holds the borrow's pointer, and `@v` is
+        # that pointer (#2286), not the slot's address.
+        let lent: *LocalVar = lent_struct_local(s, op)
+        if lent != null
+            let lst: *StructDef = for_header_struct(s, lent.type_name, lent.type_name_len)
+            if lst == null
+                return 0
+            *out = lst
+            return emit_load_ptr(s, lent.reg)
         let loc: *LocalVar = find_local_struct_name(s, op.ident_ptr, op.ident_len)
         if loc != null
             if loc.var_type != TYPE_STRUCT
@@ -2383,9 +2392,17 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
     var mr: MemberPtrResult
     let iter: *Expr = stmt.for_start
+    # AGAST #2314: `@a` / `@&a` walks the array `a` names, in place, as `a` does:
+    # a local or by-value `[N]T`, `a:& [N]T` (whose slot is the array behind the
+    # borrow) or a global.  A const isn't, as in ritz0.
+    var arr_ident: *Expr = iter
+    var via_addr: i32 = 0
+    if iter != null and iter.kind == EXPR_UNARY and (iter.op == OP_ADDR or iter.op == OP_ADDR_MUT) and iter.operand != null and iter.operand.kind == EXPR_IDENT
+        arr_ident = iter.operand
+        via_addr = 1
     if iter != null
-        if iter.kind == EXPR_IDENT
-            let loc: *LocalVar = find_local_struct_name(s, iter.ident_ptr, iter.ident_len)
+        if arr_ident.kind == EXPR_IDENT
+            let loc: *LocalVar = find_local_struct_name(s, arr_ident.ident_ptr, arr_ident.ident_len)
             if loc != null
                 if loc.var_type == TYPE_ARRAY and loc.array_shape != null
                     # AGAST #1509: iterating a multi-dimensional array yields
@@ -2406,8 +2423,8 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
                 # emits `@VALUES = internal constant [3 x i32] [...]`; we GEP
                 # off the global symbol below.
-                let centry: *ConstEntry = find_const_entry(s, iter.ident_ptr, iter.ident_len)
-                if centry != null and centry.const_type == TYPE_ARRAY
+                let centry: *ConstEntry = find_const_entry(s, arr_ident.ident_ptr, arr_ident.ident_len)
+                if centry != null and centry.const_type == TYPE_ARRAY and via_addr == 0
                     iter_kind = 3
                     elem_type = centry.array_elem_type
                     arr_size = centry.array_size
@@ -2416,7 +2433,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     elem_name = centry.array_elem_type_name
                     elem_name_len = centry.array_elem_type_name_len
                 else
-                    let glob: *GlobalVarDef = find_global(s, iter.ident_ptr, iter.ident_len)
+                    let glob: *GlobalVarDef = find_global(s, arr_ident.ident_ptr, arr_ident.ident_len)
                     if glob != null and glob.var_type == TYPE_ARRAY
                         if glob.array_shape != null
                             emit_nd_error(s, iter.span.line, iter.span.col, c"iterating a multi-dimensional array is not supported in ritz1 (index it with nested ranges)")

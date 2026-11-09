@@ -775,14 +775,11 @@ _H2 = "struct H\n    n: i32\n    a: [2]i32\n\n"
 
 
 # Each compiled to a loop that never ran.  ritz0 takes this first group, so each
-# is a gap with a ticket (#2314, #2410); it refuses the second, and so does ritz1
-# now.  What's lowered moves out: Vec, Span and StrView are in test_ritz1_for_header.py.
+# is a gap with a ticket (#2410); it refuses the second, and so does ritz1 now.
+# What's lowered moves out: Vec, Span and StrView are in test_ritz1_for_header.py,
+# and `@a` / `@v` in test_ritz1_for_addr_of.py (#2314).
 RITZ1_REFUSES = {
-    "addr_of_local": (MAIN + _A + _SUM_V.format(it="@a")),
-    "addr_of_global": (_G + MAIN + _SUM_V.format(it="@g")),
     "addr_of_field": (_H2 + MAIN + "    var h: H\n" + _SUM_V.format(it="@h.a")),
-    "addr_of_mut_param": ("fn f(a:& [2]i32) -> i32\n" + _SUM_V.format(it="@a") + "\n" + MAIN
-                          + _A + "    return f(@&a)\n"),
     "pointer_to_array": ("fn f(a: *[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
                          + _A + "    return f(@a)\n"),
     "reference_to_array": ("fn f(a: @[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
@@ -790,8 +787,6 @@ RITZ1_REFUSES = {
     "deref": (MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="*p")),
     "literal": (MAIN + _SUM_V.format(it="[1, 2]")),
     "row": (MAIN + "    var m: [2][2]i32\n" + _SUM_V.format(it="m[1]")),
-    "addr_of_vec_mut_param": (_VEC + "fn f(w:& Vec<i32>) -> i32\n" + _SUM_V.format(it="@w") + "\n"
-                              + MAIN + _NEW_VEC + "    return f(@&w)\n"),
 }
 
 BOTH_REFUSE = {
