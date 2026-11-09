@@ -5121,6 +5121,12 @@ class LLVMEmitter:
                 # Emit drops before implicit return
                 self._emit_drop_for_all_scopes()
                 self.builder.ret(self._zero_constant(ret_type))
+        elif not self.builder.block.is_terminated:
+            # Every path already returned: an `if`/`else` or `match` whose
+            # arms all diverge leaves us in its dead merge block, perhaps
+            # holding dead statements. Nothing reaches it, but LLVM needs a
+            # terminator (AGAST #2485, #2271).
+            self.builder.unreachable()
 
         return fn
 

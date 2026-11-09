@@ -623,7 +623,6 @@ def test_ritz0_tuple_args_do_not_collide(tmp_path):
     assert _run("ritz0", tmp_path, "tuple_args", TUPLE_ARGS) == 3
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2271: unterminated match.merge")
 def test_ritz0_dead_code_after_all_arms_return(tmp_path):
     assert _run("ritz0", tmp_path, "dead_tail", DEAD_TAIL) == 1
 
