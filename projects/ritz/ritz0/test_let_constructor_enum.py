@@ -157,6 +157,48 @@ UNNAMED = {
     "borrow": _body("var x: i32 = 5", "let o = Some(@x)", "0"),
 }
 
+def _users(variant, *lines, fn=_MAIN, second=False):
+    """`enum E` declaring `variant(i32)` (after `Bad` if `second`), then `lines`."""
+    arms = ["Bad", f"{variant}(i32)"] if second else [f"{variant}(i32)", "Bad"]
+    return "enum E\n" + "".join(f"    {a}\n" for a in arms) + _body(*lines, fn=fn)
+
+
+def _match_e(variant):
+    return ["match x", f"    {variant}(v) => v", "    Bad => 2"]
+
+
+# A user enum declaring a builtin constructor's name (#2453).
+USERS = {}
+for _v in ("Ok", "Some"):
+    USERS.update({
+        f"{_v.lower()}_let": (_users(_v, f"let x = {_v}(5)", *_match_e(_v)), 5),
+        f"{_v.lower()}_var": (_users(_v, f"var x = {_v}(5)", *_match_e(_v)), 5),
+        f"{_v.lower()}_typed_let": (_users(_v, f"let x: E = {_v}(5)", *_match_e(_v)), 5),
+        f"{_v.lower()}_not_the_first_variant": (
+            _users(_v, f"let x = {_v}(5)", *_match_e(_v), second=True), 5),
+        f"{_v.lower()}_argument": (
+            "fn h(x: E) -> i32\n" + "".join(f"    {l}\n" for l in _match_e(_v))
+            + _users(_v, f"h({_v}(5))"), 5),
+    })
+USERS.update({
+    # In an Option-returning fn ritz1's slot is the user's enum (#1797) and ritz0's
+    # the Option (#2513): the let must build whichever its slot is.
+    "some_let_in_an_option_fn": (
+        _users("Some", "let x = Some(5)", "var r: i32 = 2", "match x", "    Some(v) =>",
+               "        r = v", "    _ =>", "        r = 3", "Some(r)",
+               fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
+    "typed_some_let_in_an_option_fn": (
+        _users("Some", "let x: E = Some(5)", "var r: i32 = 2", "match x", "    Some(v) =>",
+               "        r = v", "    _ =>", "        r = 3", "Some(r)",
+               fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
+    # The tail of an Option-returning fn is the builtin.
+    "builtin_some_beside_a_users": (
+        _users("Some", "Some(7)", fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 7),
+})
+
 ON_RITZ0 = sorted(BOUND) + ["i32_local", "passed_to_a_fn", "returned_as_the_fns_enum",
                             "none_returned_as_the_fns_enum"]
 
@@ -212,20 +254,30 @@ def test_ritz1_types_the_local_by_the_payload(request, tmp_path, compiler, ctor,
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("ctor", ["Ok(5)", "Some(5)"])
-def test_ritz1_leaves_a_users_variant_its_own_enum(request, tmp_path, compiler, ctor):
-    """A user enum that declares `Ok` / `Some` keeps the slot (#1797): #2430 doesn't
-    take it over.  Building that variant is its own bug (#2453): ritz1 builds it as
-    the builtin with no enum, which since #2454 is the located refusal, not a zero."""
-    variant = ctor.split("(")[0]
-    source = f"enum E\n    {variant}(i32)\n    Bad\n" + _body(f"let x = {ctor}", "0")
+@pytest.mark.parametrize("name", sorted(USERS))
+def test_ritz1_builds_a_users_variant_as_its_own_enum(request, tmp_path, compiler, name):
+    """A user enum that declares `Ok` / `Some` keeps the slot (#1797) and builds it
+    (#2453): ritz1 sent the call to the builtin path, which had no enum (the zero,
+    then #2454's located refusal).  An Option / Result slot keeps the builtin.  A
+    builtin `Ok(v)` arm beside a user `Ok` is #2512's."""
+    source, code = USERS[name]
     proc, ll = _ritz1(request, compiler, tmp_path, source)
-    out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, out[-800:]
-    line = source.split("\n").index(f"    let x = {ctor}") + 1
-    hits = re.findall(rf"unit\.ritz:{line}:13: {re.escape(_LOCATED)}$", out, re.M)
-    assert len(hits) == 1, f"{compiler}: want one located refusal:\n{out[-800:]}"
-    assert not ll.exists(), f"{compiler} wrote IR"
+    assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-800:]}"
+    assert "constructor with no enum" not in ll.read_text(), f"{compiler}, {name}"
+    assert _run(ll, tmp_path, str(RITZ_START)) == code, f"{compiler}, {name}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(USERS))
+def test_ritz0_builds_a_users_variant_the_same(tmp_path, name):
+    source, code = USERS[name]
+    src = tmp_path / "unit.ritz"
+    src.write_text(source)
+    ll = tmp_path / "unit.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    assert proc.returncode == 0, f"{name}:\n{(proc.stdout + proc.stderr)[-1500:]}"
+    assert _run(ll, tmp_path) == code, name
 
 
 @pytest.mark.integration

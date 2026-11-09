@@ -1749,6 +1749,32 @@ fn emit_no_enum_ctx_error(s: *EmitterState, ctor: *Expr) -> i32
     emit_str(s, c" = add i64 0, 0  ; constructor with no enum (error)\n")
     return z
 
+# AGAST #2453: 1 when the call `e` named like a builtin constructor (Some /
+# Ok / None / Err) is a user enum's variant here: a user enum declares it (or
+# two do: try_emit_user_variant_ctor reports that) and no Option / Result
+# slot gives the builtin an enum.  ritz0's slot decides the same way: in an
+# Option-returning fn the tail `Some(7)` stays the builtin.
+fn users_variant_wins(s: *EmitterState, e: *Expr) -> i32
+    if is_variant_carrier(e.func_name, e.func_name_len) == 0 and is_variant_null(e.func_name, e.func_name_len) == 0
+        return 0
+    var a: i32 = 0
+    var b: i32 = 0
+    if user_variant_ctor_ambiguous(e, @a, @b) == 0
+        var en: *u8 = null
+        var en_len: i32 = 0
+        user_variant_ctor_enum(e, @en, @en_len)
+        if en == null
+            return 0
+        # The let's slot is this user enum (`let x: E = Ok(5)`, or an untyped
+        # let #1797 typed %E): the user's variant, whatever the fn returns.
+        if s.ctx_enum_name != null and name_eq(s.ctx_enum_name, s.ctx_enum_name_len, en, en_len) == 1
+            return 1
+    var bn: *u8 = null
+    var bn_len: i32 = 0
+    if resolve_enum_ctx(s, @bn, @bn_len) == 1
+        return 0
+    return 1
+
 # AGAST #1797: `Holds(x)`, a payload variant of a user enum (unqualified, as
 # ritz0's variant_to_enum resolves it: enum_of_variant).  Only a tuple
 # variant's single payload is constructed here; a struct variant's field
@@ -3124,6 +3150,10 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # Variant constructor: Some(x) / Ok(x) / None / Err(x) -> %Result$.../
     # Option$... struct.  Handled before the generic call path so
     # match/return paths get a type-correct aggregate (ritz-task-133).
+    # AGAST #2453: a user enum declaring `Ok` / `Some` (or `Err` / `None`)
+    # builds its own variant unless an Option / Result slot names the builtin.
+    if users_variant_wins(s, e) == 1
+        return try_emit_user_variant_ctor(s, e)
     if is_variant_carrier(e.func_name, e.func_name_len) == 1
         # Ok / Some = tag 0
         return emit_variant_struct(s, 0, e)
