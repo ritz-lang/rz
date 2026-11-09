@@ -339,6 +339,53 @@ def test_element_shape(run_with, name, compiler):
     assert run_with(compiler, name, SHAPES[name]) == 0
 
 
+# AGAST #2376: an element of a `[N]**T` is a `**T`, and `**b[i]` is a T: two
+# bytes here, where ritz1 took 8 and the store overwrote x[1].  `@a[i]` with
+# `a: [N]*T` is the same `**T`.
+_B = "    var q: *i16 = @x[0]\n    var b: [2]**i16\n    b[1] = @q\n"
+_BG = "var g: [2]**i16\n\n"
+_BH = "struct H\n    n: i64\n    b: [2]**i16\n\n"
+POINTER_TO_POINTER = {
+    "load": _x(_B + _is("**b[1]")),
+    "store": _x(_B + "    **b[1] = 7\n" + _is("x[1]", "2")),
+    "store_lands": _x(_B + "    **b[1] = 7\n" + _is("x[0]", "7")),
+    "compound": _x(_B + "    x[0] = -1\n    **b[1] += 1\n" + _is("x[1]", "2")),
+    "inner_stride": _x(_B + _is("*(*b[1] + 1)", "2")),
+    "inferred": _x(_B + "    let r = b[1]\n" + _is("**r")),
+    "inferred_store": _x(_B + "    let r = b[1]\n    **r = 7\n" + _is("x[1]", "2")),
+    "inferred_deref": _x(_B + "    let r = *b[1]\n" + _is("*r")),
+    "inferred_deref_store": _x(_B + "    let r = *b[1]\n    *r = 7\n" + _is("x[1]", "2")),
+    "address_of_element": _x("    let r = @a[1]\n" + _is("**r")),
+    "address_of_element_store": _x("    let r = @a[1]\n    **r = 7\n" + _is("x[1]", "2")),
+    "global": _x("    var q: *i16 = @x[0]\n    g[1] = @q\n    **g[1] = 7\n" + _is("x[1]", "2"), _BG),
+    "global_load": _x("    var q: *i16 = @x[0]\n    g[1] = @q\n" + _is("**g[1]"), _BG),
+    "field": _x("    var q: *i16 = @x[0]\n    var h: H\n    h.b[1] = @q\n    **h.b[1] = 7\n"
+                + _is("x[1]", "2"), _BH),
+    "field_load": _x("    var q: *i16 = @x[0]\n    var h: H\n    h.b[1] = @q\n" + _is("**h.b[1]"), _BH),
+    "param": _x("    var q: *i16 = @x[0]\n    var b: [2]**i16\n    b[1] = @q\n    return f(b)\n",
+                "fn f(b: [2]**i16) -> i32\n    **b[1] = 7\n    if **b[1] == 7\n        return 0\n"
+                "    return 1\n\n"),
+    "two_dimensional": _x("    var q: *i16 = @x[0]\n    var b: [2][2]**i16\n    b[1][1] = @q\n"
+                          "    **b[1][1] = 7\n" + _is("x[1]", "2")),
+    "mut_param": _x("    var q: *i16 = @x[0]\n    var b: [2]**i16\n    b[1] = @q\n    return f(b)\n",
+                    "fn f(b:& [2]**i16) -> i32\n    let r = b[1]\n    **r = 7\n" + _is("**b[1]", "7") + "\n"),
+    # A struct pointee: `(**b[i]).f` and `(**r).f` reach S.
+    "struct_load": _s("    var p: *S = @s\n    var b: [2]**S\n    b[1] = @p\n" + _is("(**b[1]).q", "2")),
+    "struct_store": _s("    var p: *S = @s\n    var b: [2]**S\n    b[1] = @p\n    (**b[1]).q = 7\n"
+                       + _is("s.q", "7")),
+    "struct_inferred": _s("    var p: *S = @s\n    var b: [2]**S\n    b[1] = @p\n    let r = b[1]\n"
+                          + _is("(**r).q", "2")),
+    "struct_address_of_element": _s("    let r = @a[1]\n" + _is("(**r).q", "2")),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(POINTER_TO_POINTER))
+def test_pointer_to_pointer_element(run_with, name, compiler):
+    assert run_with(compiler, name, POINTER_TO_POINTER[name]) == 0
+
+
 # ritz0 refuses this at clang (`sub` on two pointers), so it's no oracle, but the
 # new stride mustn't reach here: `q - p` scaled q as if it were a count.  ritz1
 # has always given the distance in bytes.
@@ -446,12 +493,7 @@ def test_a_loop_binding_knows_its_pointee(run_with, compiler, name):
 
 # ritz0 has these right, ritz1 doesn't, and each is its own bug.  Strict, so the
 # fix flags the row.
-_B = "    var q: *i16 = @x[0]\n    var b: [2]**i16\n    b[1] = @q\n"
 KNOWN_GAPS = {
-    "pointer_to_pointer_load": (2376, _x(_B + _is("**b[1]"))),
-    "pointer_to_pointer_store": (2376, _x(_B + "    **b[1] = 7\n" + _is("x[1]", "2"))),
-    "pointer_to_pointer_inferred": (2376, _x(_B + "    let r = b[1]\n" + _is("**r"))),
-    "address_of_element_inferred": (2376, _x("    let r = @a[1]\n" + _is("**r"))),
     "struct_inferred_copy": (2377, _s("    let c = *a[1]\n" + _is("c.q", "2"))),
     "struct_index_inferred_copy": (2377, _PAIR + _PAIR_MAIN + "    let c = a[1][1]\n" + _is("c.q", "2")),
     "generic_element_mut_param": (2378, (

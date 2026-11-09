@@ -3816,7 +3816,8 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
 # AGAST #2332: U when `x` is an element of a `[N]*U` array (local, param, global,
 # or field at any depth, N-D too) or that element `+ k`, with a struct U's name in
 # *out_name / *out_len.  TYPE_VOID for anything else, so an integer `a[i] + 1`
-# stays an integer.  `[N]**U` records no U, and `*[N]*U` is refused (#2347).
+# stays an integer.  A `[N]**U` element is ptr_levels_of's, and `*[N]*U` is
+# refused (#2347).
 fn array_elem_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
@@ -3825,45 +3826,56 @@ fn array_elem_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32)
         if is_array_elem_distance(s, b) == 1
             return TYPE_VOID
         b = b.left
-    if b == null or b.kind != EXPR_INDEX or b.left == null
-        return TYPE_VOID
-    if b.right != null and b.right.kind == EXPR_RANGE
-        return TYPE_VOID
     var elem: i32 = TYPE_VOID
     var pointee: i32 = TYPE_VOID
     var name: *u8 = null
     var name_len: i32 = 0
+    array_elem_record(s, b, @elem, @pointee, @name, @name_len)
+    elem_recorded_pointee(s, elem, pointee, name, name_len, out_name, out_len)
+
+# What the array that `b` = `a[i]` indexes records of its element: the element's
+# kind, what it points at (U for `[N]*U`, the packed inner-pointee slot for
+# `[N]**U`, AGAST #2376) and the struct name.  TYPE_VOID in *out_elem when `b`
+# isn't a whole element of a recorded array.
+fn array_elem_record(s: *EmitterState, b: *Expr, out_elem: *i32, out_pointee: *i32, out_name: **u8, out_len: *i32)
+    *out_elem = TYPE_VOID
+    *out_pointee = TYPE_VOID
+    *out_name = null
+    *out_len = 0
+    if b == null or b.kind != EXPR_INDEX or b.left == null
+        return
+    if b.right != null and b.right.kind == EXPR_RANGE
+        return
     var depth: i32 = 0
     let sh: *ArrayShape = nd_index_shape(s, b, @depth)
     if sh != null
         if depth == sh.rank
-            elem = sh.leaf_type
-            pointee = sh.leaf_pointee
-            name = sh.leaf_name
-            name_len = sh.leaf_name_len
+            *out_elem = sh.leaf_type
+            *out_pointee = sh.leaf_pointee
+            *out_name = sh.leaf_name
+            *out_len = sh.leaf_name_len
     else if b.left.kind == EXPR_MEMBER
         let f: *StructField = resolve_member_chain_field(s, b.left)
         if f != null and f.field_type == TYPE_ARRAY
-            elem = f.array_elem_type
-            pointee = f.array_elem_pointee
-            name = f.array_elem_type_name
-            name_len = f.array_elem_type_name_len
+            *out_elem = f.array_elem_type
+            *out_pointee = f.array_elem_pointee
+            *out_name = f.array_elem_type_name
+            *out_len = f.array_elem_type_name_len
     else if b.left.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, b.left.ident_ptr, b.left.ident_len)
         if loc != null
             if loc.var_type == TYPE_ARRAY
-                elem = loc.array_elem_type
-                pointee = loc.array_elem_pointee
-                name = loc.type_name
-                name_len = loc.type_name_len
+                *out_elem = loc.array_elem_type
+                *out_pointee = loc.array_elem_pointee
+                *out_name = loc.type_name
+                *out_len = loc.type_name_len
         else
             let g: *GlobalVarDef = find_global(s, b.left.ident_ptr, b.left.ident_len)
             if g != null and g.var_type == TYPE_ARRAY
-                elem = g.array_elem_type
-                pointee = g.array_elem_pointee
-                name = g.array_elem_type_name
-                name_len = g.array_elem_type_name_len
-    elem_recorded_pointee(s, elem, pointee, name, name_len, out_name, out_len)
+                *out_elem = g.array_elem_type
+                *out_pointee = g.array_elem_pointee
+                *out_name = g.array_elem_type_name
+                *out_len = g.array_elem_type_name_len
 
 # What an array's record says its element points at: U for an `elem` of TYPE_PTR
 # recording `pointee` U, TYPE_VOID otherwise.  A struct U's name goes to *out_name.
@@ -3942,6 +3954,8 @@ fn ptr_levels_of(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8, ou
             return ptr_levels_of(s, x.left, out_inner, out_name, out_len)
         return 0
     if x.kind == EXPR_UNARY
+        if (x.op == OP_ADDR or x.op == OP_ADDR_MUT) and x.operand != null and x.operand.kind == EXPR_INDEX
+            return addr_of_elem_levels(s, x.operand, out_inner, out_name, out_len)
         if x.op != OP_DEREF or x.operand == null
             return 0
         let sub: i32 = ptr_levels_of(s, x.operand, out_inner, out_name, out_len)
@@ -3976,6 +3990,12 @@ fn ptr_levels_of(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8, ou
         slot = fld.inner_pointee_type
         name = fld.field_type_name
         name_len = fld.field_type_name_len
+    else if x.kind == EXPR_INDEX
+        # AGAST #2376: an element of a `[N]**T` array, which records T packed.
+        var elem: i32 = TYPE_VOID
+        array_elem_record(s, x, @elem, @slot, @name, @name_len)
+        if elem != TYPE_PTR_PTR
+            return 0
     else
         return 0
     let levels: i32 = ptr_ptr_slot_levels(slot)
@@ -3988,6 +4008,41 @@ fn ptr_levels_of(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8, ou
         *out_name = name
         *out_len = name_len
     return levels
+
+# AGAST #2376: `@a[i]` points at an element that is itself a pointer: a `**U`
+# for `a: [N]*U`, one level more than the element for `a: [N]**U`.  0 for any
+# other element, which isn't a pointer to pointer.
+fn addr_of_elem_levels(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8, out_len: *i32) -> i32
+    var elem: i32 = TYPE_VOID
+    var pointee: i32 = TYPE_VOID
+    var name: *u8 = null
+    var name_len: i32 = 0
+    array_elem_record(s, x, @elem, @pointee, @name, @name_len)
+    if elem == TYPE_PTR
+        let u: i32 = elem_recorded_pointee(s, elem, pointee, name, name_len, out_name, out_len)
+        if u == TYPE_VOID
+            return 0
+        *out_inner = u
+        return 2
+    if elem != TYPE_PTR_PTR or ptr_ptr_slot_levels(pointee) < 2
+        return 0
+    *out_inner = ptr_ptr_slot_inner(pointee)
+    if *out_inner == TYPE_STRUCT
+        *out_name = name
+        *out_len = name_len
+    ptr_ptr_slot_levels(pointee) + 1
+
+# AGAST #2376: 1 when `x` (past any `+ k`) is an array element `a[i]` or its
+# address `@a[i]`, the roots ptr_levels_of resolves through an array's record.
+pub fn elem_rooted(x: *Expr) -> i32
+    var b: *Expr = x
+    while b != null and b.kind == EXPR_BINARY and (b.op == OP_ADD or b.op == OP_SUB)
+        b = b.left
+    if b == null
+        return 0
+    if b.kind == EXPR_UNARY and (b.op == OP_ADDR or b.op == OP_ADDR_MUT)
+        b = b.operand
+    (b != null and b.kind == EXPR_INDEX) as i32
 
 # AGAST #1815: the element a `*(pp + i)` (or `*pp`) points at, when that is
 # a primitive T: `*(*(pp + i) + k)` loads a T and `*(pp + i) + k` strides by
@@ -4759,8 +4814,14 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             var dl_inner: i32 = TYPE_VOID
             var dl_name: *u8 = null
             var dl_len: i32 = 0
-            if ptr_levels_of(s, e, @dl_inner, @dl_name, @dl_len) >= 2
+            let dl_levels: i32 = ptr_levels_of(s, e, @dl_inner, @dl_name, @dl_len)
+            if dl_levels >= 2
                 return TYPE_PTR_PTR
+            # AGAST #2376: `*a[i]` with `a: [N]**T` (or `*@a[i]` with `a: [N]*T`)
+            # is a `*T`, so `**a[i]` reads its T below.  The element itself isn't
+            # typed as a `**`.
+            if dl_levels == 1 and elem_rooted(e.operand) == 1
+                return TYPE_PTR
             let inner_type: i32 = get_expr_type(s, e.operand)
             if inner_type == TYPE_PTR_PTR
                 return TYPE_PTR  # Deref **T gives *T
