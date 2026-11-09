@@ -29,8 +29,10 @@ import re
 
 import pytest
 
-from ref_rules import REF_TO_OTHER_POINTER, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
+from ref_rules import REF_TO_OTHER_POINTER, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from test_borrow_param_ref_field import _compile, _run
+from test_ref_into_value import COMPILERS, _assert_refused
+from test_ref_into_value import _compile as _compile_three, _run as _run_three
 
 INTS = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"]
 FLOATS = ["f32", "f64"]
@@ -426,10 +428,10 @@ pub fn main() -> i32
     *p = 3
     return n
 """,
-    # Sign doesn't matter here: `u32` and `i32` are the same LLVM pointee.
-    "sign_blind": """\
+    # `as` is how a reference to one type becomes one to another (#2368).
+    "sign_cast": """\
 fn f(n:& u32)
-    let p: @&i32 = @&n
+    let p: *i32 = @&n as *i32
     *p = 3
 
 pub fn main() -> i32
@@ -496,16 +498,23 @@ pub fn main() -> i32
 # A reference to something else. `^` is where the reference goes, and the row's
 # last item the `@` or `@&` the slot asks for. Bare, each is a value in a reference
 # slot, located on both compilers. Written out, each is R1's "pointees must be the
-# same type" (#2325).
+# same type" (#2325): exactly the same type, not the same width (#2368), so the
+# sign rows are refused too.
 D = "struct D\n    a: i32\n\n"
 ENTRY = "\npub fn main() -> i32\n    return 0\n"
 MISFITS = {
     "wider": ("fn f(n:& i32)\n    let p: @&i64 = ^n\n    *p = 3\n", "@&"),
+    "sign": ("fn f(n:& u32)\n    let p: @&i32 = ^n\n    *p = 3\n", "@&"),
+    "sign_pointer": ("fn f(n:& u32)\n    let p: *i32 = ^n\n    *p = 3\n", "@"),
+    "local": ("fn f()\n    var n: u32 = 1\n    let p: @&i32 = ^n\n", "@&"),
+    "bool_local": ("fn f()\n    var b: bool = true\n    let p: @&i8 = ^b\n", "@&"),
+    "local_untyped": ("fn f(m: u32)\n    var n = m\n    let p: @&i32 = ^n\n", "@&"),
     "narrower": ("fn f(n:& i64) -> @i32\n    return ^n\n", "@"),
     "wider_tail": ("fn f(n:& i32) -> @i64\n    ^n\n", "@"),
     "float_of_the_same_size": ("fn f(n:& i64)\n    let p: @&f64 = ^n\n", "@&"),
     "bool_of_the_same_size": ("fn f(n:& i8)\n    let p: @&bool = ^n\n", "@&"),
     "pointer_of_the_same_size": ("fn f(n:& i64)\n    let p: @&*i64 = ^n\n", "@&"),
+    "pointer_into_its_pointee": ("fn f(q:& *i64)\n    let p: @&i64 = ^q\n", "@&"),
     "struct": (TYPES + "fn f(n:& i32)\n    let p: @&C = ^n\n", "@&"),
     "array": ("fn f(n:& i32)\n    let p: @&[1]i32 = ^n\n", "@&"),
     "array_length": ("fn f(a:& [2]i32)\n    let p: @&[3]i32 = ^a\n", "@&"),
@@ -525,14 +534,161 @@ fn f(n:& i32, s: @&S)
 """, "@&"),
 }
 # test_value_into_ref.py's lent_other_scalar is this, bare.
-MISFITS_BARE = sorted(set(MISFITS) - {"narrower"})
-MESSAGE = {"@": VALUE_INTO_SHARED_REF, "@&": VALUE_INTO_MUT_REF}
+MISFITS_BARE = sorted(set(MISFITS) - {"narrower", "sign", "sign_pointer", "local", "local_untyped", "bool_local",
+                                      "pointer_into_its_pointee"})
+# ritz1 keeps an un-annotated scalar local as `i64`, so it can't say what `@&n` is.
+UNTYPED_LOCAL_GAP = "AGAST #2527: ritz1 doesn't judge `@x` of an un-annotated scalar `let` / `var`"
+MISFIT_GAPS = {("local_untyped", "ritz1"): UNTYPED_LOCAL_GAP,
+               ("local_untyped", "ritz1_selfhosted"): UNTYPED_LOCAL_GAP}
 
-# Which compilers let a written one through.
-MISFIT_GAP = "AGAST #2368: a written reference to another type compiles, and the reference is reinterpreted"
-MISFIT_ACCEPTED_BY = {name: ("ritz0", "ritz1") for name in MISFITS}
-MISFIT_ACCEPTED_BY.update({"argument_wider": ("ritz1",), "argument_array_to_its_element": ("ritz1",),
-                           "pointer_of_the_same_size": ("ritz0",)})
+# Into a `name:& T` param, `@x` / `@&x` of another type is reinterpreted the
+# same way (#2367). `^` is where the argument goes, and the row's last item what's
+# written there before the name. A bare place of another type is
+# test_bare_place_borrow.py's MISFITS, in its own words; its sign gap is #2530.
+LENT_MISFITS = {
+    "array_sign": ("fn f(a:& [2]i32) -> i32\n    a[1] = 3\n    return a[1]\n", "var a: [2]u32 = [1, 2]", "a", "@&"),
+    "array_length": ("fn f(a:& [3]i32) -> i32\n    return a[1]\n", "var a: [2]i32 = [1, 2]", "a", "@&"),
+    "scalar_sign": ("fn f(n:& i32) -> i32\n    n = 3\n    return n\n", "var n: u32 = 1", "n", "@&"),
+    "scalar_wider": ("fn f(n:& i64) -> i32\n    n = 3\n    return 0\n", "var n: i32 = 1", "n", "@&"),
+    "struct": ("struct D\n    a: i32\n\nfn f(d:& D) -> i32\n    return d.a\n", "var c: C = C { x: 3, y: 0 }", "c", "@&"),
+    "method": (METHOD_TYPES + "impl S\n    fn put(self: @&S, n:& i64)\n        n = 3\n",
+               "var s: S = S { v: 0 }\n    var n: i32 = 1", "n", "@&"),
+    # `[2]i32` from a type argument is spelled as written, not as an annotation.
+    "generic_array_sign": ("fn id<T>(c:& T) -> i32\n    return 0\n", "var a: [2]u32 = [1, 2]", "a", "@&"),
+}
+GENERIC_ARRAY_GAP = "AGAST #2531: ritz1's clone of `c:& T` at an array `T` keeps no length or element"
+LENT_MISFIT_GAPS = {("generic_array_sign", "ritz1"): GENERIC_ARRAY_GAP,
+                    ("generic_array_sign", "ritz1_selfhosted"): GENERIC_ARRAY_GAP}
+
+
+def _lent_misfit(name):
+    body, decl, place, addr = LENT_MISFITS[name]
+    callee = {"method": "s.put", "generic_array_sign": "id<[2]i32>"}.get(name, "f")
+    call = f"{callee}(^{addr}{place})" + ("\n    return 0" if name == "method" else "")
+    call = call if name == "method" else "return " + call
+    return TYPES + body + f"\npub fn main() -> i32\n    {decl}\n    {call}\n"
+
+
+def _lent_misfit_params():
+    for name in sorted(LENT_MISFITS):
+        for compiler in COMPILERS:
+            gap = LENT_MISFIT_GAPS.get((name, compiler))
+            marks = [pytest.mark.xfail(strict=True, reason=gap)] if gap else []
+            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name,compiler", list(_lent_misfit_params()))
+def test_a_lent_param_of_another_type_is_refused(tmp_path, compiler, name):
+    _assert_refused(compiler, tmp_path, name, _lent_misfit(name), REF_TO_OTHER_TYPE)
+
+
+BARE_SIGN_GAP = "AGAST #2530: a bare place of another sign into a `:&` param compiles"
+BARE_SIGN = """\
+fn w(n:& i32)
+    n = 3
+
+pub fn main() -> i32
+    var n: u32 = 1
+    w(n)
+    return 0
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(strict=True, reason=BARE_SIGN_GAP)
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_bare_place_of_another_sign_is_refused(tmp_path, compiler):
+    comp, ll, _ = _compile_three(compiler, tmp_path, "bare_sign", BARE_SIGN)
+    assert comp.returncode != 0 and not ll.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_lent_param_of_its_own_type_still_takes_it(tmp_path, compiler):
+    program = """\
+fn f(a:& [2]u32, n:& u32) -> i32
+    a[1] = 3
+    n = 3
+    return 0
+
+pub fn main() -> i32
+    var a: [2]u32 = [1, 2]
+    var n: u32 = 1
+    f(@&a, n)
+    return (a[1] + n) as i32
+"""
+    assert _run_three(compiler, tmp_path, "own_type", program) == 6
+
+
+# A generic struct is the type its instance is: `@b` of a `Box<T>` fits
+# `*Box<T>` once `T` is `i32` (test_issue_generic_plain_struct_name.ritz).
+GENERIC_OWN_TYPE = """\
+struct Box<T>
+    val: T
+
+fn get<T>(b: *Box<T>) -> T
+    return b.val
+
+fn mk<T>(x: T) -> T
+    let b: Box<T> = Box<T> { val: x }
+    return get<T>(@b)
+
+pub fn main() -> i32
+    return mk<i32>(3)
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_generic_struct_fits_a_reference_to_its_instance(tmp_path, compiler):
+    assert _run_three(compiler, tmp_path, "generic_own_type", GENERIC_OWN_TYPE) == 3
+
+
+# What ritz0's checker can't type stays unjudged: an un-annotated global is
+# `unknown` to it. ritz1 doesn't parse one, so this row is ritz0's alone.
+UNTYPED_REFERENT = """\
+var G = 3
+
+pub fn main() -> i32
+    let p: @i32 = @G
+    return *p
+"""
+
+
+@pytest.mark.integration
+def test_ritz0_leaves_a_reference_to_what_it_cant_type_unjudged(tmp_path):
+    assert _run_three("ritz0", tmp_path, "untyped_referent", UNTYPED_REFERENT) == 3
+
+
+# An un-annotated copy of a struct is that struct: `@b` fits `@Rect` (prism's
+# damage_region_bounds).
+UNTYPED_COPY = """\
+struct Rect
+    x: i32
+    w: u32
+
+struct Region
+    rects: [2]Rect
+
+fn widest(a: @Rect, b: @Rect) -> Rect
+    if a.w > b.w
+        return *a
+    *b
+
+fn bounds(region: @Region) -> Rect
+    var b = region.rects[0]
+    b = widest(@b, @region.rects[1])
+    b
+
+pub fn main() -> i32
+    var r: Region
+    r.rects[0] = Rect { x: 1, w: 1 }
+    r.rects[1] = Rect { x: 3, w: 2 }
+    let b: Rect = bounds(@r)
+    return b.x
+"""
+MESSAGE = {"@": VALUE_INTO_SHARED_REF, "@&": VALUE_INTO_MUT_REF}
 
 # `@&h` is an `@&*u32`, and `*u32` isn't `*i32` (R1 on #2325).
 SIGN_BLIND_POINTER = ("fn go(h:& *u32) -> @&*i32\n    return @&h\n\npub fn main() -> i32\n    var n: u32 = 3\n"
@@ -585,21 +741,36 @@ def test_a_value_into_a_reference_to_something_else_is_refused(ritz1_bin, tmp_pa
     _refused(comp, ll, MESSAGE[addr])
 
 
-def _misfit_params():
+def _written_misfit_params():
     for name in sorted(MISFITS):
-        for compiler in ("ritz0", "ritz1"):
-            marks = ([pytest.mark.xfail(strict=True, reason=MISFIT_GAP)]
-                     if compiler in MISFIT_ACCEPTED_BY[name] else [])
+        for compiler in COMPILERS:
+            gap = MISFIT_GAPS.get((name, compiler))
+            marks = [pytest.mark.xfail(strict=True, reason=gap)] if gap else []
             yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_misfit_params()))
-def test_a_written_reference_to_something_else_is_refused(ritz1_bin, tmp_path, compiler, name):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_untyped_copy_of_a_struct_fits_a_reference_to_it(tmp_path, compiler):
+    comp, ll, _ = _compile_three(compiler, tmp_path, "untyped_copy", UNTYPED_COPY)
+    assert comp.returncode == 0 and ll.exists(), (comp.stdout + comp.stderr)[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", [
+    "ritz0",
+    *(pytest.param(c, marks=pytest.mark.xfail(strict=True, reason=(
+        "AGAST #2524: ritz1 stores an un-annotated copy of a struct element as an i64, "
+        "which clang refuses"))) for c in ("ritz1", "ritz1_selfhosted"))])
+def test_an_untyped_copy_of_a_struct_runs(tmp_path, compiler):
+    assert _run_three(compiler, tmp_path, "untyped_copy", UNTYPED_COPY) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name,compiler", list(_written_misfit_params()))
+def test_a_written_reference_to_something_else_is_refused(tmp_path, compiler, name):
     program, addr = MISFITS[name]
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, program.replace("^", addr) + ENTRY)
-    assert comp.returncode != 0
-    assert not ll.exists()
+    _assert_refused(compiler, tmp_path, name, program.replace("^", "^" + addr) + ENTRY, REF_TO_OTHER_TYPE)
 
 
 @pytest.mark.integration

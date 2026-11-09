@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from ref_rules import REF_TO_OTHER_TYPE
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -652,11 +653,13 @@ def test_a_method_place_of_another_type_is_refused(tmp_path, compiler, name):
     assert f"argument {argno} of `put` has the wrong type" in error, error
 
 
-# ritz0 only: ritz1 takes this one (#2348).
-def test_an_explicit_borrow_of_another_type_is_no_temporary(tmp_path):
+# A reference to another type, refused on all three since #2368 (it was #2348's
+# on ritz1), and no temporary.
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_explicit_borrow_of_another_type_is_no_temporary(tmp_path, compiler):
     src = INT_WRITER + "pub fn main() -> i32\n    var n: i64 = 1\n    w(@&n)\n    return 0\n"
-    error = _error("ritz0", tmp_path, "explicit", src)
-    assert "argument 1 of `w` has the wrong type" in error and "temporary" not in error, error
+    error = _error(compiler, tmp_path, "explicit", src)
+    assert REF_TO_OTHER_TYPE in error and "temporary" not in error, error
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

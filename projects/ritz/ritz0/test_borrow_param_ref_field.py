@@ -37,8 +37,9 @@ from pathlib import Path
 import pytest
 
 from array_rules import ELEMENT_MISMATCH
-from ref_rules import REF_INTO_VALUE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
+from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
+from test_ref_into_value import COMPILERS, _assert_refused
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
@@ -371,12 +372,13 @@ pub fn main() -> i32
     *q.p = 3
     return n as i32
 """,
-    "sign_differs": """\
+    # Another sign is another type (#2368): `as` says so.
+    "sign_cast": """\
 struct Q
     p: *i32
 
 fn mk(n:& u32) -> Q
-    return Q { p: @n }
+    return Q { p: @n as *i32 }
 
 pub fn main() -> i32
     var n: u32 = 1
@@ -942,11 +944,28 @@ fn mk(n:& i32) -> G<f32>
 fn mk(n:& u8) -> G<bool>
     return G<bool> { p: ^n }
 """ + ENTRY,
+    # Exactly the same type, not the same width (#2368).
+    "sign_differs": MISMATCHED + """
+struct Q
+    p: *i32
+
+fn mk(n:& u32) -> Q
+    return Q { p: ^n }
+""" + ENTRY,
+    "sign_differs_store": MISMATCHED + """
+struct Q
+    p: *i32
+
+fn mk(n:& u32) -> Q
+    var q: Q
+    q.p = ^n
+    return q
+""" + ENTRY,
 }
 # test_value_into_ref.py's lent_field_other_pointee is this, bare.
-MISMATCHES_BARE = sorted(set(MISMATCHES) - {"width"})
-MISMATCH_GAP = "AGAST #2368: a written reference into a field of another pointee compiles, on both compilers"
+MISMATCHES_BARE = sorted(set(MISMATCHES) - {"width", "sign_differs", "sign_differs_store"})
 POINTER_TO_POINTER_GAP = "AGAST #2370: ritz1 takes a bare `n:& i64` into a `**i64`; ritz0 refuses it, and `*i64` is refused"
+WRITTEN_POINTER_TO_POINTER_GAP = "AGAST #2528: ritz1 judges nothing into a `**T` field, so `@n` of an `i64` into a `**i64` compiles"
 
 # AGAST #2250: known gaps next to it, each pinned by its own ticket below.
 CONTROLS.update({
@@ -2533,14 +2552,18 @@ def test_a_value_into_a_field_of_another_pointee_is_refused(ritz1_bin, tmp_path,
     assert re.search(r"main\.ritz:\d+:\d+: (error: )?" + re.escape(VALUE_INTO_SHARED_REF), out), out[-2000:]
 
 
+def _written_mismatch_params():
+    for name in sorted(MISMATCHES):
+        for compiler in COMPILERS:
+            marks = ([pytest.mark.xfail(strict=True, reason=WRITTEN_POINTER_TO_POINTER_GAP)]
+                     if name == "pointer_of_the_same_width" and compiler != "ritz0" else [])
+            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
+
+
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=MISMATCH_GAP)
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(MISMATCHES))
-def test_a_written_reference_into_a_field_of_another_pointee_is_refused(ritz1_bin, tmp_path, compiler, name):
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, MISMATCHES[name].replace("^", "@"))
-    assert comp.returncode != 0
-    assert not ll.exists()
+@pytest.mark.parametrize("name,compiler", list(_written_mismatch_params()))
+def test_a_written_reference_into_a_field_of_another_pointee_is_refused(tmp_path, compiler, name):
+    _assert_refused(compiler, tmp_path, name, MISMATCHES[name].replace("^", "^@"), REF_TO_OTHER_TYPE)
 
 
 # A by-value slot only copies a referent of its own type. Reading a `C` as a

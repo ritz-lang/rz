@@ -52,6 +52,9 @@ pub struct RefTy
     elem_pointee: i32     # U for an array's `*U` element; TYPE_VOID if unknown
     shape: *ArrayShape    # a multi-dimensional array's, else null
     returned: i32         # 1 for a slot that leaves the fn as a pointer or reference
+    ref_size: i32         # N for a pointer kind to `[N]T`; 0 if unknown
+    ref_elem: i32         # its T's kind (a struct T is `name`); TYPE_VOID if unknown
+    name_only: i32        # 1 for a `-> *X` return: only a name, maybe a stale one
 
 # A tail and the slot it lands in.
 struct RefTail
@@ -99,6 +102,9 @@ fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.elem_pointee = TYPE_VOID
     out.shape = null
     out.returned = 0
+    out.ref_size = 0
+    out.ref_elem = TYPE_VOID
+    out.name_only = 0
     1
 
 fn ref_set_array(out: *RefTy, elem: i32, elem_pointee: i32, name: *u8, len: i32, shape: *ArrayShape) -> i32
@@ -162,7 +168,9 @@ fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
     if f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR
         # FnDef keeps no pointee, only a struct's name.
         if f.return_type_name_len > 0 and f.return_type == TYPE_PTR
-            return ref_set(out, TYPE_PTR, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
+            ref_set(out, TYPE_PTR, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
+            out.name_only = 1
+            return 1
         return 0
     ref_set(out, f.return_type, 0, f.return_type_name, f.return_type_name_len)
 
@@ -172,6 +180,10 @@ fn ref_of_param(p: *Param, out: *RefTy) -> i32
     if p.param_type == TYPE_ARRAY
         return ref_set_array(out, p.param_array_elem_type, p.param_array_elem_pointee, p.param_type_name, p.param_type_name_len, null)
     ref_set(out, p.param_type, p.param_pointee_type, p.param_type_name, p.param_type_name_len)
+    if p.param_pointee_type == TYPE_ARRAY
+        out.ref_size = p.param_pointee_array_size
+        out.ref_elem = p.param_pointee_array_elem_type
+    1
 
 fn ref_of_field(s: *EmitterState, e: *Expr, f: *StructField, out: *RefTy) -> i32
     let t: i32 = f.field_type
@@ -180,6 +192,10 @@ fn ref_of_field(s: *EmitterState, e: *Expr, f: *StructField, out: *RefTy) -> i32
         # An instance's `*T` field keeps the name and not the kind.
         if pointee == TYPE_VOID and f.field_type_name_len > 0
             pointee = TYPE_STRUCT
+        # A primitive `*T` field says what it points at itself (#1304), which
+        # the member chain can lose behind an element, `a.a[1].p` (#2368).
+        if t == TYPE_PTR and f.field_type_name_len == 0 and f.array_elem_type != TYPE_VOID
+            pointee = f.array_elem_type
         return ref_set(out, t, pointee, f.field_type_name, f.field_type_name_len)
     if t == TYPE_ARRAY
         return ref_of_array_field(f, out)
@@ -225,7 +241,10 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
                 return 0
             if ref_is_pointer(t.kind) == 1
                 return ref_set(out, TYPE_PTR, TYPE_PTR, t.name, t.name_len)
-            return ref_set(out, TYPE_PTR, t.kind, t.name, t.name_len)
+            ref_set(out, TYPE_PTR, t.kind, t.name, t.name_len)
+            if t.kind == TYPE_ARRAY
+                ref_array_referent(s, e.operand, out)
+            return 1
         if e.op == OP_DEREF
             if ref_ty_of(s, e.operand, @t) == 0
                 return 0
@@ -269,6 +288,22 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
     if k == EXPR_CAST and e.op == TYPE_PTR
         return ref_set(out, TYPE_PTR, e.int_val as i32, e.ident_ptr, e.ident_len)
     0
+
+# `out` is `@a`: its `[N]T`'s N and T, for an `a` that is a local array or a
+# `:&` one.  Unknown for anything else.
+fn ref_array_referent(s: *EmitterState, e: *Expr, out: *RefTy)
+    if e.kind != EXPR_IDENT
+        return
+    let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return
+    let loc: *LocalVar = local_at(s, idx)
+    if loc.var_type == TYPE_ARRAY
+        out.ref_size = loc.array_size
+        out.ref_elem = loc.array_elem_type
+    else if loc.is_lent == 1 and loc.pointee_type == TYPE_ARRAY
+        out.ref_size = loc.pointee_array_size
+        out.ref_elem = loc.pointee_array_elem_type
 
 # The `[N]T` behind `e`, a local `*[N]T`, `@[N]T` or `@&[N]T`.  0 for any other
 # pointer: only a local keeps the element.
@@ -407,6 +442,146 @@ fn ref_error_other_pointer(s: *EmitterState, e: *Expr)
     eprints_cstr(c": error: a reference to one pointer type doesn't fit a reference to another\n")
     s.error_count = s.error_count + 1
 
+fn ref_error_other_type(s: *EmitterState, e: *Expr)
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    eprints_cstr(c": error: a reference to one type doesn't fit a reference to another: cast it with `as`\n")
+    s.error_count = s.error_count + 1
+
+# 1 for `@x` or `@&x`, written where the slot is.
+fn ref_is_written(e: *Expr) -> i32
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        return 1
+    0
+
+# `a` goes to the `name:& T` param `p`: `@x` / `@&x` of another type than T
+# would be reinterpreted (#2367, #2368).  A bare place is check_lent_ref_arg's
+# "argument N has the wrong type".  ritz0's twin is
+# TypeChecker._check_lent_referent.
+fn ref_lent_referent(s: *EmitterState, a: *Expr, p: *Param)
+    if ref_is_written(a) == 0
+        return
+    var slot: RefTy
+    if ref_of_param(p, @slot) == 0
+        return
+    var t: RefTy
+    if ref_ty_of(s, a, @t) == 0
+        return
+    if ref_is_pointer(t.kind) == 1 and ref_unsure_referent(s, a) == 0 and ref_other_written(s, a, @t, @slot) == 1
+        ref_error_other_type(s, a)
+
+# ref_other_referent for `e`, `@x` of type `a`: a `bool` local is a `bool`,
+# though its slot is kept wider.
+fn ref_other_written(s: *EmitterState, e: *Expr, a: *RefTy, slot: *RefTy) -> i32
+    let kept: i32 = a.pointee
+    if ref_bool_local(s, e.operand) == 1
+        a.pointee = TYPE_BOOL
+    let other: i32 = ref_other_referent(s, a, slot)
+    a.pointee = kept
+    other
+
+# 1 when `x` names a local declared `bool`.
+fn ref_bool_local(s: *EmitterState, x: *Expr) -> i32
+    if x == null or x.kind != EXPR_IDENT
+        return 0
+    let idx: i32 = find_local_idx(s, x.ident_ptr, x.ident_len)
+    if idx < 0
+        return 0
+    let loc: *LocalVar = local_at(s, idx)
+    loc.is_bool
+
+# 1 when `e` is `@x` of what the tables can't vouch for: an element through a
+# struct, or an un-annotated `let` or `var` of a scalar, which the parser leaves
+# as `i64` whatever its initialiser is (see sizeof_local_size).
+fn ref_unsure_referent(s: *EmitterState, e: *Expr) -> i32
+    let x: *Expr = e.operand
+    if x == null
+        return 0
+    # An element through a Vec, Span or String: ref_ty_of names the container
+    # (AGAST #2443), not the element.
+    var en: *u8 = null
+    var el: i32 = 0
+    if x.kind == EXPR_INDEX and index_through_struct(s, x, @en, @el) == 1
+        return 1
+    if x.kind != EXPR_IDENT
+        return 0
+    let idx: i32 = find_local_idx(s, x.ident_ptr, x.ident_len)
+    if idx < 0
+        return 0
+    let loc: *LocalVar = local_at(s, idx)
+    let t: i32 = loc.var_type
+    if t == TYPE_STRUCT or t == TYPE_ARRAY or t == TYPE_PTR_PTR or ref_is_pointer(t) == 1
+        return 0
+    if s.narrow_decl_overflow != 0
+        return 1
+    var i: i32 = s.narrow_decl_count - 1
+    while i >= 0
+        let d: *NarrowDecl = @s.narrow_decls[i]
+        if name_eq(d.name, d.name_len, x.ident_ptr, x.ident_len) == 1
+            return (d.declared == TYPE_VOID) as i32
+        i = i - 1
+    0
+
+# `a` is `@x` of an `x` known not to be what `slot` refers to: exactly, not by
+# width (Aaron's ruling on AGAST #2368), so `@&u32` doesn't fit `@&i32`.  ritz0's
+# twin is TypeChecker._other_referent.  A `*T` x into an `@*U` is
+# ref_value_into_ref's own question, "a reference to one pointer type", and what
+# the tables can't name stays unjudged.
+fn ref_other_referent(s: *EmitterState, a: *RefTy, slot: *RefTy) -> i32
+    var x: i32 = a.pointee
+    var want: i32 = slot.pointee
+    # A field, an element or a payload keeps a `*S`'s name and not the kind.
+    if want == TYPE_VOID and slot.name_len > 0
+        want = TYPE_STRUCT
+    # The parser names a `-> *X` return after the last type it saw when X isn't
+    # a struct (`-> *[2]i32` after a `*C`), so that name only judges a struct.
+    if slot.name_only == 1 and x != TYPE_STRUCT
+        return 0
+    # A scalar pointee with a name contradicts itself: a generic's `v: T` at
+    # `T = *i32` or `*C` keeps the name and a defaulted kind (`i64`).
+    if want != TYPE_STRUCT and want != TYPE_ARRAY and slot.name_len > 0
+        return 0
+    # A pointer referent is another type than any the tables name; two of them
+    # are ref_value_into_ref's "a reference to one pointer type".
+    let xp: i32 = (x == TYPE_PTR or x == TYPE_PTR_PTR) as i32
+    let wp: i32 = (want == TYPE_PTR or want == TYPE_PTR_PTR) as i32
+    if xp == 1 and wp == 1
+        return 0
+    if xp == 1
+        return ref_judged(s, want, slot)
+    if wp == 1
+        return ref_judged(s, x, a)
+    if ref_judged(s, x, a) == 0 or ref_judged(s, want, slot) == 0
+        return 0
+    if x != want
+        return 1
+    if x == TYPE_STRUCT
+        return 1 - name_eq(a.name, a.name_len, slot.name, slot.name_len)
+    if x == TYPE_ARRAY
+        if a.ref_size > 0 and slot.ref_size > 0 and a.ref_size != slot.ref_size
+            return 1
+        if ref_judged(s, a.ref_elem, a) == 1 and ref_judged(s, slot.ref_elem, slot) == 1
+            if a.ref_elem != slot.ref_elem
+                return 1
+            if a.ref_elem == TYPE_STRUCT
+                return 1 - name_eq(a.name, a.name_len, slot.name, slot.name_len)
+    0
+
+# 1 when `kind`, with `t`'s name, is a referent the tables name: a scalar, an
+# array, or a struct that is one.  A `*i32` return or field, or a generic's
+# `*T`, keeps a name and no kind, so a name that isn't a struct is unjudged.
+fn ref_judged(s: *EmitterState, kind: i32, t: *RefTy) -> i32
+    if kind == TYPE_VOID or kind == TYPE_UNKNOWN or kind == TYPE_PTR or kind == TYPE_PTR_PTR
+        return 0
+    if ref_is_pointer(kind) == 1
+        return 0
+    if kind != TYPE_STRUCT
+        return 1
+    if t.name_len == 0 or find_struct(s, t.name, t.name_len) == null
+        return 0
+    1
+
 # 1 when `e` names a `name:& T` param.
 fn ref_names_lent(s: *EmitterState, e: *Expr) -> i32
     if e.kind != EXPR_IDENT
@@ -434,6 +609,9 @@ fn ref_is_referent(a: *RefTy, slot: *RefTy) -> i32
 # integer, which is another question; a `:&` param isn't one.
 fn ref_value_into_ref(s: *EmitterState, e: *Expr, a: *RefTy, slot: *RefTy)
     if ref_is_pointer(a.kind) == 1
+        if ref_is_written(e) == 1 and ref_unsure_referent(s, e) == 0 and ref_other_written(s, e, a, slot) == 1
+            ref_error_other_type(s, e)
+            return
         if slot.pointee != TYPE_PTR or slot.kind == TYPE_PTR
             return
         if a.kind == TYPE_PTR and a.pointee != TYPE_PTR
@@ -584,6 +762,7 @@ fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
             var slot: RefTy
             if p.is_borrow == 1
                 ref_addr_into_mut(s, a)
+                ref_lent_referent(s, a, p)
                 if ref_lends_place(s, a, p) == 1
                     let root: i32 = ref_loan_root(s, a)
                     if ref_loan_use(s, a.span.line, a.span.col, root, a, 1, 0) == 1
@@ -753,6 +932,10 @@ fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
     if stmt.var_type == TYPE_ARRAY
         return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, stmt.var_type_name, stmt.var_type_name_len, stmt.var_array_shape)
     ref_set(out, stmt.var_type, stmt.var_pointee_type, stmt.var_type_name, stmt.var_type_name_len)
+    if stmt.var_pointee_type == TYPE_ARRAY
+        out.ref_size = stmt.var_pointee_array_size
+        out.ref_elem = stmt.var_pointee_array_elem_type
+    1
 
 # `x.f = v` and `p.f = v`: the field is named by assign_target, on `owner`.
 fn ref_into_field(s: *EmitterState, stmt: *Stmt, owner: *RefTy)

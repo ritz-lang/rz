@@ -57,9 +57,9 @@ fn main() -> i32
     var n: NFA
     var states: [{slots}]NFAState
     var trans: [{slots}]Transition
-    var sto: [{slots}]i64
-    var stc: [{slots}]i64
-    var ti: [{slots}]i64
+    var sto: [{slots}]i32
+    var stc: [{slots}]i32
+    var ti: [{slots}]i32
     states[{cap}].id = 777
     trans[{cap}].kind = 777
     nfa_init(@n, @states[0], @trans[0], @sto[0], @stc[0], @ti[0], {cap}, {cap})

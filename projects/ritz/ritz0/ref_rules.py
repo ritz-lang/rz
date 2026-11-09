@@ -21,6 +21,11 @@ VALUE_INTO_MUT_REF = "a value doesn't fit a reference slot: write `@&x` to borro
 # `@&h` of an `h: *C` where an `@&*D` goes. A `*C` can't be stored through it.
 REF_TO_OTHER_POINTER = "a reference to one pointer type doesn't fit a reference to another"
 
+# `@x` or `@&x` where an `@U`, `@&U` or `*U` of another `U` goes: the reference
+# would be reinterpreted. Exactly the same type, not the same width (Aaron's
+# ruling on AGAST #2368): `@&u32` doesn't fit `@&i32` either.
+REF_TO_OTHER_TYPE = "a reference to one type doesn't fit a reference to another: cast it with `as`"
+
 # `*r`, `r.f`, `p[i]` or a by-value `self` of a move-only value, by value.
 MOVE_OUT_OF_REF = "cannot move out of a reference"
 

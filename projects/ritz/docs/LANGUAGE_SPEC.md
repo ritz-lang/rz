@@ -595,6 +595,36 @@ fn main() -> i32
     q.x
 ```
 
+A reference refers to exactly one type. `@x` or `@&x` fits an `@U`, `@&U` or
+`*U` slot only when `x` is a `U`: the same type, not one of the same width, so
+`@&n` of a `u32` doesn't fit `@&i32`, and `@&a` of a `[2]u32` doesn't fit
+`a:& [2]i32`. A place passed to a `name:& U` parameter is held to the same rule.
+To reinterpret, cast: `@&n as *i32`. A `*T` value that isn't written as `@x`
+going into a `*U` isn't judged by this rule.
+
+```ritz expect-error="a reference to one type doesn't fit a reference to another: cast it with `as`"
+fn widen(n:& i32) -> i32
+    let p: @&i64 = @&n
+    *p = 3
+    0
+
+fn main() -> i32
+    var n: i32 = 1
+    widen(@&n)
+```
+
+```ritz
+fn bits(n:& u32) -> i32
+    let p: *i32 = @&n as *i32
+    *p = 3
+    0
+
+fn main() -> i32
+    var n: u32 = 1
+    bits(@&n)
+    n as i32
+```
+
 `@T` and `@&T` are types: a parameter of one holds a reference, and reads as one.
 `name:& T` is a mode: `name` has type `T`. The two share an ABI, and read
 differently:

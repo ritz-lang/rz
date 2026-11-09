@@ -215,6 +215,6 @@ def test_one_report_for_one_site(tmp_path, compiler):
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_narrower_integer_slot_is_refused_at_the_address(tmp_path, compiler):
-    """#2348's program as written. `@&n` of the same `i64` is still #2348's on ritz1."""
+    """#2348's program as written. `@&n` of the same `i64` is another type (#2368)."""
     src = _main("fn w(r:& i32)\n    r = 3\n\n", "    var n: i64 = 1\n    w(^@n)\n    return n as i32\n")
     _assert_refused(compiler, tmp_path, "narrow", src, ADDR_INTO_MUT)

@@ -28,8 +28,9 @@ import re
 
 import pytest
 
-from ref_rules import VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
+from ref_rules import REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from test_borrow_param_ref_field import _compile, _run
+from test_ref_into_value import COMPILERS, _assert_refused
 
 NO_TUPLES_GAP = "AGAST #1526: ritz1 has no tuples"
 BY_VALUE_ARM_GAP = "AGAST #2288: ritz1 can't read a `:&` by value in an arm"
@@ -494,7 +495,7 @@ pub fn main() -> i32
 # A reference to the wrong type. `^` is where the reference goes, and the row's
 # last item the `@` or `@&` the slot asks for. Bare, it's a value in a reference
 # slot, whatever the types. Written out, it's R1's "pointees must be the same
-# type" (#2325), which neither compiler holds a struct or a scalar to yet.
+# type" (#2325): exactly the same, not the same width (#2368).
 D = "struct D\n    a: i32\n\n"
 ANOTHER_POINTEE = {
     "return": (TYPES + D + "fn f(c:& C) -> @D\n    return ^c\n", "@"),
@@ -528,8 +529,6 @@ fn f(t:& T) -> @D
 }
 # test_value_into_ref.py's lent_other_struct and lent_other_scalar are these, bare.
 ANOTHER_POINTEE_BARE = sorted(set(ANOTHER_POINTEE) - {"return", "scalar"})
-EXPLICIT_MISFIT_GAP = ("AGAST #2368: an `@x` or `@&x` into a reference to another type compiles, "
-                       "and the reference is reinterpreted")
 
 MESSAGE = {"@": VALUE_INTO_SHARED_REF, "@&": VALUE_INTO_MUT_REF}
 
@@ -793,17 +792,14 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=EXPLICIT_MISFIT_GAP)
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(ANOTHER_POINTEE))
-def test_a_written_reference_to_another_type_is_refused(ritz1_bin, tmp_path, compiler, name):
+def test_a_written_reference_to_another_type_is_refused(tmp_path, compiler, name):
     program, addr = ANOTHER_POINTEE[name]
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, program.replace("^", addr) + """
+    _assert_refused(compiler, tmp_path, name, program.replace("^", "^" + addr) + """
 pub fn main() -> i32
     return 0
-""")
-    assert comp.returncode != 0
-    assert not ll.exists()
+""", REF_TO_OTHER_TYPE)
 
 
 @pytest.mark.integration

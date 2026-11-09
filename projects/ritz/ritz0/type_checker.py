@@ -26,6 +26,7 @@ import bool_rules
 import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
+from monomorph import mangle_generic_name
 from ufcs import find_ufcs_function
 from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
                            SYSCALL_BUILTINS)
@@ -100,6 +101,7 @@ class TypeChecker:
         # Report only what doesn't fit between values and references
         # (check_ref_slots).
         self.slots_only = slots_only
+        self._arg_depth = 0  # >0 while a call argument is checked
         # `name:& T` params of the current fn, by name, with their `T`: `*name`
         # is the `T` itself.
         self.lent_locals: Dict[str, rast.Type] = {}
@@ -835,12 +837,15 @@ class TypeChecker:
                         # already points at one (§13.4).
                         arg_type = self._infer_type(arg)
                         self._check_addr_into_mut(arg)
+                        self._check_lent_referent(arg, arg_type, param_type)
                         self._forget_local_ref(arg)
                         if isinstance(self._resolve_alias(arg_type),
                                       (rast.PtrType, rast.RefType)):
                             continue
                     else:
+                        self._arg_depth += 1
                         arg_type = self._infer_into(arg, param_type)
+                        self._arg_depth -= 1
                     if not self._value_fits(arg, arg_type, param_type):
                         self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
                                   f"got {self._type_str(arg_type)}", arg.span)
@@ -939,11 +944,14 @@ class TypeChecker:
         for i, arg in enumerate(expr.args):
             at = i + skip
             lent = at in fn_sig.lent or at >= len(fn_sig.params) or not own_method
+            self._arg_depth += 1
             self._infer_into(arg, None if lent else fn_sig.params[at][1])
+            self._arg_depth -= 1
             if at in fn_sig.lent:
                 self._forget_local_ref(arg)
             if at in fn_sig.lent and own_method:
                 self._check_addr_into_mut(arg)
+                self._check_lent_referent(arg, self._quiet_type(arg), fn_sig.params[at][1])
 
         return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
 
@@ -1043,7 +1051,8 @@ class TypeChecker:
         The emitter refuses a reference to anything else (_index_through)."""
         inner = self._resolve_alias(pointer.inner)
         if isinstance(inner, rast.ArrayType):
-            return inner.inner if isinstance(pointer, rast.RefType) else pointer.inner
+            # `*[N]T` too since #2330: element i at stride T, in every position.
+            return inner.inner
         if isinstance(inner, rast.NamedType):
             if inner.name == 'String':
                 return rast.NamedType(inner.span, 'u8', [])
@@ -1234,6 +1243,7 @@ class TypeChecker:
         self._check_parts(expr, slot)
         if slot is not None and slot is self._ret_slot():
             self._check_return(expr)
+        self._check_other_referent(expr, ty, slot)
         return ty
 
     def _check_parts(self, expr: rast.Expr, slot: Optional[rast.Type]) -> None:
@@ -1320,6 +1330,86 @@ class TypeChecker:
                 and self._lookup_var(expr.name) is self.lent_locals[expr.name])
         if same or lent or isinstance(slot, rast.RefType):
             self._report_value_into_ref(expr, slot)
+
+    def _check_other_referent(self, expr: rast.Expr, actual: Optional[rast.Type],
+                              slot: Optional[rast.Type]) -> None:
+        """`@x` or `@&x` lands in an `@U`, `@&U` or `*U` of another `U`: the
+        reference would be reinterpreted. Exactly the same type, not the same
+        width (Aaron's ruling on AGAST #2368). After the return check, as
+        ritz1's ref_into does, so a reference to a local says that first.
+        A `*T` value into a `*U` isn't judged here: that's still open."""
+        if slot is None or actual is None or not self._is_written_ref(expr):
+            return
+        actual = self._resolve_alias(actual)
+        slot = self._resolve_alias(slot)
+        if not isinstance(slot, (rast.PtrType, rast.RefType)) \
+                or not isinstance(actual, (rast.PtrType, rast.RefType)):
+            return
+        # A struct for another struct at a call is #1948's "argument N of `f`
+        # has the wrong type", which ritz1 says too; this doesn't pre-empt it.
+        if self._arg_depth and self._is_struct(actual.inner) and self._is_struct(slot.inner):
+            return
+        # `@&h` of a `*C` into `@&*D` was REF_TO_OTHER_POINTER, said first.
+        if self._other_referent(actual.inner, slot.inner):
+            self._report_once(expr, ref_rules.REF_TO_OTHER_TYPE)
+
+    def _check_lent_referent(self, arg: rast.Expr, actual: Optional[rast.Type],
+                             referent: rast.Type) -> None:
+        """`@x` or `@&x` goes to a `name:& T` param, whose referent is `referent`:
+        of another type, it would be reinterpreted (#2367, #2368). A bare place
+        is the emitter's "argument N has the wrong type"."""
+        if actual is None or not self._is_written_ref(arg):
+            return
+        actual = self._resolve_alias(actual)
+        if isinstance(actual, (rast.PtrType, rast.RefType)) \
+                and self._other_referent(actual.inner, referent):
+            self._report_once(arg, ref_rules.REF_TO_OTHER_TYPE)
+
+    def _is_struct(self, ty: rast.Type) -> bool:
+        ty = self._resolve_alias(ty)
+        return isinstance(ty, rast.NamedType) and self._referent_key(ty) is not None \
+            and (ty.args != [] or ty.name in self.structs or '$' in ty.name)
+
+    def _other_referent(self, held: rast.Type, inner: rast.Type) -> bool:
+        """`held` is known not to be `inner`: exactly, not by width. What the
+        checker can't name stays unjudged."""
+        a, b = self._referent_key(held), self._referent_key(inner)
+        return a is not None and b is not None and a != b
+
+    def _referent_key(self, ty: rast.Type) -> Optional[str]:
+        """`ty` spelled one way, whatever its aliases, with a generic struct as
+        monomorphisation names it (`Box<i32>` is `Box$i32`). A pointer inside is
+        `*` whatever its kind: `@T` fits `*T`, so `@@C` fits `**C`. None if any
+        part of it is opaque or a type this doesn't spell."""
+        ty = self._resolve_alias(ty)
+        if ty is None or self._is_opaque(ty):
+            return None
+        if isinstance(ty, (rast.PtrType, rast.RefType)):
+            inner = self._referent_key(ty.inner)
+            return None if inner is None else f"*{inner}"
+        if isinstance(ty, rast.ArrayType):
+            inner = self._referent_key(ty.inner)
+            size = ty.size.value if isinstance(ty.size, rast.IntLit) else ty.size
+            if inner is None or not isinstance(size, int):
+                return None
+            return f"[{size}]{inner}"
+        if isinstance(ty, rast.TupleType):
+            parts = [self._referent_key(part) for part in ty.elements]
+            return None if None in parts else f"({', '.join(parts)})"
+        if not isinstance(ty, rast.NamedType):
+            return None
+        if ty.args:
+            if any(self._referent_key(arg) is None for arg in ty.args):
+                return None
+            return mangle_generic_name(ty.name, ty.args)
+        return ty.name
+
+    @staticmethod
+    def _is_written_ref(expr: rast.Expr) -> bool:
+        """`@x` or `@&x`, written where the slot is."""
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        return isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@', '&mut', '@&')
 
     def _report_value_into_ref(self, expr: rast.Expr, slot: rast.Type) -> None:
         self._slot_reported.add(id(expr))
