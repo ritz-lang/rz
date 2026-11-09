@@ -167,10 +167,8 @@ NON_ENUM_SLOT = {
     "index_assign_i64": (_body("var a: [2]i64", "a[0] = None", "0"), "None"),
 }
 
-# ritz0 builds an array literal's constructors as the registered Option, and crashes
-# on the element type (#2509); an Err("abc") needs its own Result registered (#2433).
-RITZ0_OWN_BUGS = {"array_literal", "array_literal_none", "array_literal_result",
-                  "array_literal_u8", "if_err_names_its_own_payload"}
+# An Err("abc") needs its own Result registered on ritz0 (#2433).
+RITZ0_OWN_BUGS = {"if_err_names_its_own_payload"}
 ON_RITZ0 = sorted(set(RUNS) - RITZ0_OWN_BUGS)
 
 
@@ -270,3 +268,16 @@ def test_ritz0_refuses_eq_on_a_payload_enum(tmp_path, name):
     assert proc.returncode != 0, f"ritz0 accepted {name}"
     line, col = _where(source, "if ", 3)
     assert re.search(rf"unit\.ritz:{line}:{col}: .*{re.escape(_TAGS)}", out), out[-800:]
+
+
+@pytest.mark.integration
+def test_ritz0_array_literal_needs_no_registration(tmp_path):
+    """The element type materializes its own Option, as a typed let's does (#2509)."""
+    source, code = ARRAY_LITERAL["array_literal"]
+    src = tmp_path / "unit.ritz"
+    src.write_text(source)
+    ll = tmp_path / "unit.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-1500:]
+    assert _run(ll, tmp_path) == code

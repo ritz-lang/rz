@@ -8753,6 +8753,11 @@ class LLVMEmitter:
         saved_expected = self.expected_ritz_type
         expected = self._expected_array()
         element_type = expected.inner if isinstance(expected, rast.ArrayType) else None
+        # AGAST #2509: a constructor element builds the element's enum, as a
+        # typed `let` does. Variant names are global, so without this
+        # `[Some(5), None]` into `[2]Option<i32>` built whichever Option
+        # registered last (`Option$i64`) and llvmlite refused the insert.
+        element_enum = self._let_annotation_enum(element_type)
         saved_ctx = getattr(self, '_literal_ctx_nodes', set())
         values = []
         for element in expr.elements:
@@ -8760,7 +8765,7 @@ class LLVMEmitter:
             if element_type is not None:
                 self._literal_ctx_nodes = self._arith_context_nodes(element)
             try:
-                values.append(self._emit_expr(element))
+                values.append(self._emit_expr_with_expected_enum(element, element_enum))
             finally:
                 self.expected_ritz_type = saved_expected
                 self._literal_ctx_nodes = saved_ctx
