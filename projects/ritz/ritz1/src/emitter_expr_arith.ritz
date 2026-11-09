@@ -12,6 +12,56 @@ import emitter_stmt          # array_ptr_local (AGAST #2287)
 import bool_check   # AGAST #2342
 
 
+# The Option / Result `e` is, by its type, or as a constructor naming one; null.
+fn tagged_enum_operand(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if builtin_tagged_ctor(s, e) == 1
+        ctor_scrutinee_enum(s, e, out_name, out_len)
+        if *out_name == null   # a payload ritz1 can't name: its family will do
+            if ctor_family_is(e, c"Option$", 7) == 1
+                *out_name = c"Option"
+                *out_len = 6
+            else
+                *out_name = c"Result"
+                *out_len = 6
+        return
+    var name: *u8 = null
+    var len: i32 = 0
+    match_scrutinee_type(s, e, @name, @len)
+    if name != null and is_tagged_enum_type(name, len) == 1
+        *out_name = name
+        *out_len = len
+
+# AGAST #2454: `o == None`, `r != Ok(5)`, `o == p` over an Option or a Result is
+# ritz0's located refusal: a variant carries a payload, so `==` would compare
+# the tags alone.  ritz1 compiled it: `None` had no enum and was the `add i64
+# 0, 0` fallback, and two Options were an `icmp` clang rejects.  A user's
+# payload enum is compared by its tag (#1660), as before.  1 when refused.
+fn refuse_tagged_enum_eq(s: *EmitterState, e: *Expr) -> i32
+    var name: *u8 = null
+    var len: i32 = 0
+    tagged_enum_operand(s, e.left, @name, @len)
+    if name == null or builtin_tagged_ctor(s, e.left) == 1
+        # A typed side names the enum better than a constructor's guess.
+        var rname: *u8 = null
+        var rlen: i32 = 0
+        tagged_enum_operand(s, e.right, @rname, @rlen)
+        if rname != null and (name == null or builtin_tagged_ctor(s, e.right) == 0)
+            name = rname
+            len = rlen
+    if name == null
+        return 0
+    var op: *u8 = c"'=='"
+    if e.op == OP_NE
+        op = c"'!='"
+    var n: i32 = 0
+    let head: *u8 = ctor_join(op, 4, c" is not supported for struct type '", strlen(c" is not supported for struct type '") as i32, name, len, @n)
+    let tail: *u8 = c"' — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
+    let msg: *u8 = ctor_join(head, n, tail, strlen(tail) as i32, c"", 0, @n)
+    emit_nd_error(s, e.span.line, e.span.col, msg)
+    1
+
 fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     bool_check_binary(s, e)   # AGAST #2342
     # Short-circuit logical AND / OR.  Without this, ritz1 emits
@@ -168,6 +218,9 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
             if elem != 0
                 is_ptr_arith = 1
                 ptr_elem_size = elem
+
+    if (e.op == OP_EQ or e.op == OP_NE) and refuse_tagged_enum_eq(s, e) == 1
+        return 0   # AGAST #2454
 
     var left_reg: i32 = emit_expr(s, e.left)
     var right_reg: i32 = emit_expr(s, e.right)

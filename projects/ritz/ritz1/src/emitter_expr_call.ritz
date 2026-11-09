@@ -1038,7 +1038,8 @@ fn lent_array_local(s: *EmitterState, e: *Expr) -> *LocalVar
     return loc
 
 # emit_expr for a by-value slot of type `ty` whose enum context, if any, the
-# caller has set: an array element (AGAST #2250), a `let` or a parameter (#2279).
+# caller has set: a `let` or a parameter (#2279).  An array element (#2250) is
+# emit_expr_into_slot's, which sets the element's enum (AGAST #2454).
 fn emit_expr_by_value(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len: i32) -> i32
     if ty == TYPE_STRUCT
         let referent: i32 = emit_lent_referent(s, e, name, name_len)
@@ -1709,27 +1710,44 @@ fn spill_byval_arg(s: *EmitterState, arg: *Expr, reg: i32, p: *Param) -> i32
 # Emit an Ok/Some/Err/None constructor as a `%Result$.../Option$...` struct
 # value. `tag` is the variant index (0 = Ok/Some, 1 = Err/None).
 # `payload_expr` is null for unit variants.  Returns the register holding
-# the loaded struct value.  Falls back to emitting `zeroinitializer` when no
-# enum context is available — this is defensive so a bad input doesn't
-# break the whole module.
-fn emit_variant_struct(s: *EmitterState, tag: i32, payload_expr: *Expr) -> i32
+# the loaded struct value.  `ctor` is the constructor, for the error when
+# nothing names its enum.
+fn emit_variant_struct(s: *EmitterState, tag: i32, ctor: *Expr) -> i32
     var enum_name: *u8 = null
     var enum_name_len: i32 = 0
     let ok: i32 = resolve_enum_ctx(s, @enum_name, @enum_name_len)
     if ok == 0
-        # AGAST #1498: in a call argument whose param isn't an enum, fail
-        # here rather than emit an i64 that only clang rejects.
-        if s.ctx_enum_arg == 1
-            emit_ir_error(s, c"variant constructor has no enum context: the call parameter it is passed to is not an Option/Result")
-        # Fallback: produce a zeroed i64 (legacy callers that don't set ctx).
-        # This is wrong semantically but keeps IR well-formed while we phase
-        # the caller table forward.
-        let z: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, z)
-        emit_str(s, c" = add i64 0, 0  ; variant w/ no enum ctx\n")
-        return z
-    return emit_variant_build(s, enum_name, enum_name_len, tag, payload_expr)
+        return emit_no_enum_ctx_error(s, ctor)
+    return emit_variant_build(s, enum_name, enum_name_len, tag, ctor.args)
+
+# The constructor emit_ctor_type_error last refused.
+var g_ctor_refused: *Expr = null
+
+# "this constructor's type can't be inferred here", at `ctor`, once: a let or
+# arms that couldn't name the enum say so, and then the constructor, emitted
+# with none, reaches the fallback below (AGAST #2430, #2454).
+fn emit_ctor_type_error(s: *EmitterState, ctor: *Expr)
+    if ctor == g_ctor_refused
+        return
+    g_ctor_refused = ctor
+    emit_nd_error(s, ctor.span.line, ctor.span.col, c"this constructor's type can't be inferred here: bind it with a typed `let` first")
+
+# AGAST #2454: a Some/None/Ok/Err that nothing gives an enum is a located
+# error.  It lowered to `add i64 0, 0` and the program ran on that zero: an
+# array literal's, an if / match arm's, `a[i] = ` and a statement's all did,
+# until each took its enum.  Inside a call argument or a slot whose type isn't
+# an enum it is #1498 / #2142's refusal, now located too.  Returns an i64 zero
+# so the rest of the fn still emits; the error stops the output.
+fn emit_no_enum_ctx_error(s: *EmitterState, ctor: *Expr) -> i32
+    if s.ctx_enum_arg == 1
+        emit_nd_error(s, ctor.span.line, ctor.span.col, c"variant constructor has no enum context: the parameter or slot it goes into is not an Option/Result")
+    else
+        emit_ctor_type_error(s, ctor)
+    let z: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, z)
+    emit_str(s, c" = add i64 0, 0  ; constructor with no enum (error)\n")
+    return z
 
 # AGAST #1797: `Holds(x)`, a payload variant of a user enum (unqualified, as
 # ritz0's variant_to_enum resolves it: enum_of_variant).  Only a tuple
@@ -3108,10 +3126,10 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # match/return paths get a type-correct aggregate (ritz-task-133).
     if is_variant_carrier(e.func_name, e.func_name_len) == 1
         # Ok / Some = tag 0
-        return emit_variant_struct(s, 0, e.args)
+        return emit_variant_struct(s, 0, e)
     if is_variant_null(e.func_name, e.func_name_len) == 1
         # Err = tag 1 (None is the no-arg case, handled in emit_expr_ident)
-        return emit_variant_struct(s, 1, e.args)
+        return emit_variant_struct(s, 1, e)
     # User-enum payload variant `Holds(x)` (AGAST #1797).  Before the
     # generic call path, as ritz0 checks variant_to_enum before functions.
     let user_ctor: i32 = try_emit_user_variant_ctor(s, e)

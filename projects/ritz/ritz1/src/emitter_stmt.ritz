@@ -180,12 +180,138 @@ fn infer_ctor_let(s: *EmitterState, stmt: *Stmt) -> i32
     else
         ctor_scrutinee_enum(s, init, @name, @len)
     if name == null
-        emit_nd_error(s, init.span.line, init.span.col, c"this constructor's type can't be inferred here: bind it with a typed `let` first")
+        emit_ctor_type_error(s, init)
         return 0
     stmt.var_type = TYPE_STRUCT
     stmt.var_type_name = name
     stmt.var_type_name_len = len
     1
+
+# 1 when `e` is a Some/None/Ok/Err the builtin Option / Result builds: not a
+# user enum's own `Ok` / `Some` (#1797, #2453).
+fn builtin_tagged_ctor(s: *EmitterState, e: *Expr) -> i32
+    if is_tagged_ctor(s, e) == 0
+        return 0
+    if e.kind == EXPR_CALL
+        var uc_name: *u8 = null
+        var uc_len: i32 = 0
+        user_variant_ctor_enum(e, @uc_name, @uc_len)
+        if uc_name != null
+            return 0
+    1
+
+# The arms an if / match expression `e` ends in, through nested ones (`else
+# if`, a match arm that is one): the first constructor (*any), the first
+# Some / Ok (*val) and the first Err (*err).  *mixed is the first that builds
+# the other family from *any's, an Option among Results or the reverse.
+fn arm_ctors(s: *EmitterState, e: *Expr, any: **Expr, val: **Expr, err: **Expr, mixed: **Expr)
+    if e == null
+        return
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        var arm: *MatchArm = e.args as *MatchArm
+        while arm != null
+            if arm.is_pass == 0
+                arm_ctors(s, arm.body, any, val, err, mixed)
+            arm = arm.next
+        return
+    if builtin_tagged_ctor(s, e) == 0
+        return
+    if *any == null
+        *any = e
+    else if *mixed == null and ctor_family_is(e, c"Option$", 7) != ctor_family_is(*any, c"Option$", 7)
+        *mixed = e
+    if e.kind != EXPR_CALL
+        return   # None
+    if name_eq(e.func_name, e.func_name_len, c"Err", 3) == 1
+        if *err == null
+            *err = e
+    else if *val == null
+        *val = e
+
+# A constructor's payload, spelled for its enum's name; i64 when there is
+# none (None, or no arm of that variant).  0 when ritz1 can't name it.
+fn arm_payload_spelling(s: *EmitterState, ctor: *Expr, out: **u8) -> i32
+    if ctor == null or ctor.args == null
+        *out = c"i64"
+        return 3
+    ctor_payload_spelling(s, ctor.args, out)
+
+# AGAST #2454: an unannotated `let o = if c then Some(5) else None`, or a
+# match expression whose arms build one, is the enum the arms build.  The
+# arms had no enum, lowered to `add i64 0, 0`, and `match o` read that zero.
+# As infer_ctor_let (#2430): the fn's return type when it is the arms'
+# family, else the one their payloads name: an Option's T from its first
+# Some, a Result's T from its first Ok and E from its first Err, i64 where no
+# arm gives one.  Writes the name and returns 1 when it named one; 0 when no arm ends in a constructor.  Arms building both
+# an Option and a Result, or a payload ritz1 can't name, are a located error:
+# -1, and the caller emits nothing more for them.
+fn infer_ctor_arms(s: *EmitterState, stmt: *Stmt, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    let init: *Expr = stmt.var_init
+    if stmt.var_declared_type != TYPE_VOID or init == null
+        return 0
+    if init.kind != EXPR_IF and init.kind != EXPR_MATCH
+        return 0
+    var any: *Expr = null
+    var val: *Expr = null
+    var err: *Expr = null
+    var mixed: *Expr = null
+    arm_ctors(s, init, @any, @val, @err, @mixed)
+    if any == null
+        return 0
+    if mixed != null
+        emit_ctor_type_error(s, mixed)
+        return -1
+    if ctor_family_is(any, s.ret_type_name, s.ret_type_name_len) == 1
+        *out_name = s.ret_type_name
+        *out_len = s.ret_type_name_len
+        return 1
+    var t: *u8 = null
+    let t_len: i32 = arm_payload_spelling(s, val, @t)
+    if t_len <= 0
+        emit_ctor_type_error(s, val)
+        return -1
+    var len: i32 = 0
+    var name: *u8 = null
+    if ctor_family_is(any, c"Option$", 7) == 1
+        name = ctor_join(c"Option$", 7, t, t_len, c"", 0, @len)
+    else
+        var e: *u8 = null
+        let e_len: i32 = arm_payload_spelling(s, err, @e)
+        if e_len <= 0
+            emit_ctor_type_error(s, err)
+            return -1
+        let head: *u8 = ctor_join(c"Result$", 7, t, t_len, c"$", 1, @len)
+        name = ctor_join(head, len, e, e_len, c"", 0, @len)
+    if namelist_find(@s.late_enums, name, len) < 0
+        namelist_push(@s.late_enums, name, len)
+    *out_name = name
+    *out_len = len
+    1
+
+# An i64 zero: a value for an init that was refused, so the let still binds.
+fn emit_zero_i64(s: *EmitterState) -> i32
+    let z: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, z)
+    emit_str(s, c" = add i64 0, 0\n")
+    z
+
+# AGAST #2454: `Some(5)` as a statement.  Its value is dropped, but with no
+# enum it was still the `add i64 0, 0` fallback.  It builds the enum around
+# it when that is its family (a tail in a `-> Option<T>` fn), else the one its
+# payload names.  Emits it; returns the register.
+fn emit_ctor_stmt(s: *EmitterState, e: *Expr) -> i32
+    var name: *u8 = null
+    var len: i32 = 0
+    resolve_enum_ctx(s, @name, @len)
+    if name != null and ctor_family_is(e, name, len) == 1
+        return emit_expr(s, e)
+    ctor_scrutinee_enum(s, e, @name, @len)
+    if name == null
+        return emit_expr(s, e)   # the located error
+    emit_ctor_scrutinee(s, e, name, len)
 
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     let shared_ref: i32 = let_holds_shared_ref(s, stmt)
@@ -238,7 +364,17 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             s.last_match_agg_name = null
             s.last_match_agg_name_len = 0
             s.last_match_float_ty = 0
-            pre_init_reg = emit_expr(s, stmt.var_init)
+            # AGAST #2454: arms ending in Some / None / Ok / Err build the
+            # enum they name, not the no-enum zero.
+            var arms_enum: *u8 = null
+            var arms_enum_len: i32 = 0
+            let arms: i32 = infer_ctor_arms(s, stmt, @arms_enum, @arms_enum_len)
+            if arms == 1
+                pre_init_reg = emit_ctor_scrutinee(s, stmt.var_init, arms_enum, arms_enum_len)
+            else if arms == 0
+                pre_init_reg = emit_expr(s, stmt.var_init)
+            else
+                pre_init_reg = emit_zero_i64(s)   # refused: its arms are not emitted
             pre_emitted = 1
             if s.last_match_agg_name != null and s.last_match_agg_name_len > 0
                 var_type = TYPE_STRUCT
@@ -1269,7 +1405,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     if field.field_type == TYPE_ARRAY
                         # Array field in struct - GEP to element, then store
                         let idx: i32 = emit_expr(s, target_expr.right)
-                        let val: i32 = emit_expr_by_value(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)
+                        let val: i32 = emit_expr_into_slot(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)   # AGAST #2454
                         emit_field_array_elem_store(s, member_result.reg, field, idx, val, stmt.assign_value)
                         return
                     # AGAST #1596: `x.f[i] = v` with `f: *T` / `**T` —
@@ -1689,7 +1825,8 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             # emit_llvm_type_struct so primitive-aliased struct names
             # (`u16`, `f32`, etc.) and SIMD vector types lower correctly.
             if glob.var_type == TYPE_STRUCT
-                let val: i32 = emit_expr(s, stmt.assign_value)
+                # AGAST #2454: `g = Some(5)` builds the global's enum.
+                let val: i32 = emit_expr_into_slot(s, stmt.assign_value, TYPE_STRUCT, glob.type_name, glob.type_name_len)
                 emit_str(s, c"  store ")
                 emit_llvm_type_struct(s, TYPE_STRUCT, glob.type_name, glob.type_name_len)
                 emit_str(s, c" ")
@@ -3666,7 +3803,11 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # AGAST #2137: only a block's last statement can be its value.
             if stmt.next != null
                 must_use_check(s, stmt.expr)
-            let expr_reg: i32 = emit_expr(s, stmt.expr)
+            var expr_reg: i32 = 0
+            if builtin_tagged_ctor(s, stmt.expr) == 1
+                expr_reg = emit_ctor_stmt(s, stmt.expr)   # AGAST #2454
+            else
+                expr_reg = emit_expr(s, stmt.expr)
             set_last_expr(s, expr_reg)  # Track for if/else phi nodes
     else if stmt.kind == STMT_MATCH
         # Statement-form match: `match scrut \n pattern => body ...`
@@ -3884,7 +4025,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # Emit index expression
                     let idx_reg: i32 = emit_expr(s, stmt.while_cond)
                     # Emit value expression
-                    let val_reg: i32 = emit_expr_by_value(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)
+                    let val_reg: i32 = emit_expr_into_slot(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)   # AGAST #2454
                     emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value)
         # AGAST #1439: unresolved here -> shared member-store path.
         if lfia_done == 0
@@ -3915,7 +4056,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             if base_type == TYPE_ARRAY and local != null
                 # Array local - use GEP [0, index] to get element
                 let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-                let val_reg: i32 = emit_expr_by_value(s, stmt.assign_value, local.array_elem_type, local.type_name, local.type_name_len)
+                let val_reg: i32 = emit_expr_into_slot(s, stmt.assign_value, local.array_elem_type, local.type_name, local.type_name_len)   # AGAST #2454
                 let elem_ptr: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, elem_ptr)
@@ -4000,7 +4141,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 # Previously this fell to the pointer arm below: `load i64
                 # @g` as a base address and `store i64 %T-value` (bad IR).
                 let sidx: i32 = emit_expr(s, stmt.while_cond)
-                let sval: i32 = emit_expr_by_value(s, stmt.assign_value, TYPE_STRUCT, glob.array_elem_type_name, glob.array_elem_type_name_len)
+                let sval: i32 = emit_expr_into_slot(s, stmt.assign_value, TYPE_STRUCT, glob.array_elem_type_name, glob.array_elem_type_name_len)   # AGAST #2454
                 let sptr: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, sptr)

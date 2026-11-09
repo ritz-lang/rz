@@ -16,7 +16,7 @@ The enum is the fn's return type when that is one of the constructor's family
 payload names, as a scrutinee's (#2419): a literal is an `i64`, and a type argument
 nothing gives is the same default. A payload ritz1 can't name is a located error.
 
-Other shapes still reach the `no enum ctx` fallback (an array literal, an if / match
+Other shapes reached the `no enum ctx` fallback (an array literal, an if / match
 expression's arms, `a[i] = Some(5)`, `o == None`): #2454.
 
 The expected exit codes come from what each program says, not from a compiler.
@@ -214,15 +214,18 @@ def test_ritz1_types_the_local_by_the_payload(request, tmp_path, compiler, ctor,
 @pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("ctor", ["Ok(5)", "Some(5)"])
 def test_ritz1_leaves_a_users_variant_its_own_enum(request, tmp_path, compiler, ctor):
-    """A user enum that declares `Ok` / `Some` keeps the slot (#1797). Building that
-    variant is its own bug (#2453): this pins only that #2430 didn't take it over."""
+    """A user enum that declares `Ok` / `Some` keeps the slot (#1797): #2430 doesn't
+    take it over.  Building that variant is its own bug (#2453): ritz1 builds it as
+    the builtin with no enum, which since #2454 is the located refusal, not a zero."""
     variant = ctor.split("(")[0]
     source = f"enum E\n    {variant}(i32)\n    Bad\n" + _body(f"let x = {ctor}", "0")
     proc, ll = _ritz1(request, compiler, tmp_path, source)
-    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-800:]
-    ir = ll.read_text()
-    assert re.search(r"= alloca %E\b", ir), ir[-1500:]
-    assert not re.search(r"= alloca %(Option|Result)\$", ir), ir[-1500:]
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out[-800:]
+    line = source.split("\n").index(f"    let x = {ctor}") + 1
+    hits = re.findall(rf"unit\.ritz:{line}:13: {re.escape(_LOCATED)}$", out, re.M)
+    assert len(hits) == 1, f"{compiler}: want one located refusal:\n{out[-800:]}"
+    assert not ll.exists(), f"{compiler} wrote IR"
 
 
 @pytest.mark.integration
