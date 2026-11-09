@@ -8181,7 +8181,18 @@ class LLVMEmitter:
         return None
 
     def _emit_index(self, expr: rast.Index) -> ir.Value:
-        """Emit an indexing operation: base[index]."""
+        """Emit an indexing operation: base[index].
+
+        What _spill_call_root evaluates is recorded only until this returns.
+        """
+        outer = self._evaluated_once
+        self._evaluated_once = dict(outer)
+        try:
+            return self._emit_index_core(expr)
+        finally:
+            self._evaluated_once = outer
+
+    def _emit_index_core(self, expr: rast.Index) -> ir.Value:
         through = self._index_through(expr)
         if through is not None:
             return self._emit_expr(through)
@@ -8246,7 +8257,7 @@ class LLVMEmitter:
         # Special handling for struct field that is an array (e.g., buf.data[0])
         if isinstance(expr.expr, rast.Field):
             # Get the address of the array field, then index into it
-            field_addr = self._emit_lvalue_addr(expr.expr)
+            field_addr = self._emit_lvalue_addr(expr.expr, rvalue_root=True)
             if isinstance(field_addr.type, ir.PointerType):
                 pointee = field_addr.type.pointee
                 if isinstance(pointee, ir.ArrayType):
@@ -8258,7 +8269,7 @@ class LLVMEmitter:
         # Special handling for nested array indexing (e.g., arr[i][j] where arr is [N][M]T)
         if isinstance(expr.expr, rast.Index):
             # Get pointer to inner array element using lvalue_addr
-            inner_addr = self._emit_lvalue_addr(expr.expr)
+            inner_addr = self._emit_lvalue_addr(expr.expr, rvalue_root=True)
             if isinstance(inner_addr.type, ir.PointerType):
                 pointee = inner_addr.type.pointee
                 if isinstance(pointee, ir.ArrayType):
@@ -9057,10 +9068,15 @@ class LLVMEmitter:
             return addr
         return None
 
-    def _emit_lvalue_addr(self, expr: rast.Expr) -> ir.Value:
+    def _emit_lvalue_addr(self, expr: rast.Expr, rvalue_root: bool = False) -> ir.Value:
         """
         Get the address of an lvalue expression (for assignment purposes).
         Returns a pointer to the storage location, not the loaded value.
+
+        `rvalue_root` is for a read (`mk().m[1]`, AGAST #2428): a call at the
+        root of a field/index chain is spilled to a slot, as a local holding
+        its value would be. A store or `@` never passes it, so those still
+        refuse a call's value.
         """
         if self._reading_place and id(expr) in self._emitted_operands:
             return self._emitted_operands[id(expr)]    # `mkp()` of `mkp().a`
@@ -9111,7 +9127,7 @@ class LLVMEmitter:
                         return self.builder.gep(gvar, [zero, index])
             # Handle struct field that is an array (e.g., buf.data[0] = x)
             if isinstance(expr.expr, rast.Field):
-                field_addr = self._emit_lvalue_addr(expr.expr)
+                field_addr = self._emit_lvalue_addr(expr.expr, rvalue_root)
                 if isinstance(field_addr.type, ir.PointerType):
                     pointee = field_addr.type.pointee
                     if isinstance(pointee, ir.ArrayType):
@@ -9119,7 +9135,7 @@ class LLVMEmitter:
                         return self.builder.gep(field_addr, [zero, index])
             # Handle nested array indexing (e.g., arr[i][j] where arr is [N][M]T)
             if isinstance(expr.expr, rast.Index):
-                inner_addr = self._emit_lvalue_addr(expr.expr)
+                inner_addr = self._emit_lvalue_addr(expr.expr, rvalue_root)
                 if isinstance(inner_addr.type, ir.PointerType):
                     pointee = inner_addr.type.pointee
                     if isinstance(pointee, ir.ArrayType):
@@ -9155,9 +9171,27 @@ class LLVMEmitter:
                     ptr_val, ptr_ty = self.params[name]
                     if isinstance(ptr_ty, ir.PointerType):
                         return self._field_addr(ptr_val, expr.field, 0)
-            return self._field_addr(self._emit_lvalue_addr(expr.expr), expr.field, 1)
+            return self._field_addr(self._emit_lvalue_addr(expr.expr, rvalue_root),
+                                    expr.field, 1)
+        elif rvalue_root and isinstance(expr, (rast.Call, rast.MethodCall)):
+            return self._spill_call_root(expr)
         else:
             raise ValueError(f"Cannot get address of: {type(expr)}")
+
+    def _spill_call_root(self, expr: rast.Expr) -> ir.Value:
+        """A slot holding the value of the call `expr`, the root of a read
+        like `mk().m[1]` (AGAST #2428), as a local holding it would be: a
+        `*R` result is reached through, as from a `*R` local.
+
+        The call is evaluated once: `_emit_expr` hands back a value a `for`
+        already emitted, and what this emits is recorded for the rest of the
+        `_emit_index`, so a later route that re-emits it gets the same value.
+        """
+        val = self._emit_expr(expr)
+        self._evaluated_once[id(expr)] = val
+        slot = self._alloca_in_entry_block(val.type, "call.val")
+        self.builder.store(val, slot)
+        return slot
 
     def _field_addr(self, ptr: ir.Value, field: str, loads: int) -> ir.Value:
         """The address of `field` of the struct or tuple `ptr` reaches, loading
