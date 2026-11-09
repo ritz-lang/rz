@@ -721,6 +721,26 @@ fn main() -> i32
     t[1] + u.len as i32
 ```
 
+Through a `*T`, `@T` or `@&T` to a `Vec`, `Span` or `String`, `p[lo..hi]` slices what
+`p` points at: it's `(*p)[lo..hi]`, as `p[i]` is `(*p)[i]` (§7.8). An array doesn't
+slice, so neither does a pointer to one.
+
+```ritz
+import ritzlib.gvec
+
+fn middle(p: @Vec<i32>) -> Vec<i32>
+    p[1..=2]
+
+fn main() -> i32
+    var v: Vec<i32> = vec_new<i32>()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    v.push(40)
+    let t = middle(@v)
+    t[1] + t.len as i32 - 32
+```
+
 ### 3.5 String Types
 
 | Type | Description |

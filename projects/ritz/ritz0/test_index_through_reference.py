@@ -720,8 +720,9 @@ def test_inside_an_element_writes(run_with, name, kind, compiler):
     assert run_with(compiler, name, _inside(spelled, addr, INSIDE_WRITES[name])) == INSIDE_WRITES[name][4]
 
 
-# A range isn't an element.  ritz0 slices the Span behind the pointer; ritz1 refuses
-# it at the index, and used to read garbage (#2448).
+# A range isn't an element: `p[lo..hi]` slices what `p` points at, on all three
+# (#2448; the table is test_slice_through_reference.py).  ritz1 read garbage here,
+# then refused it.
 SLICE = """\
 fn f(p: {spelled}Span<i32>) -> i32
     let t = p[1..3]
@@ -735,19 +736,11 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", sorted(KINDS))
-def test_ritz0_slices_through_a_pointer(run_with, kind):
+def test_a_slice_through_a_pointer(run_with, kind, compiler):
     spelled, addr = KINDS[kind]
-    assert run_with("ritz0", "slice", HEADER + SLICE.format(spelled=spelled, addr=addr)) == 20
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_slice_through_a_pointer_is_refused_not_guessed(compile_with, kind, compiler):
-    spelled, addr = KINDS[kind]
-    _refused(compile_with, compiler, "slice", HEADER + SLICE.format(spelled=spelled, addr=addr),
-             "a slice through a pointer or reference isn't lowered by ritz1")
+    assert run_with(compiler, "slice", HEADER + SLICE.format(spelled=spelled, addr=addr)) == 20
 
 
 # One level out, `(*q)[1]` is the form R9 points at: not this error, and #2331's to lower.

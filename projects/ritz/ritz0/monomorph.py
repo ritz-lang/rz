@@ -655,6 +655,24 @@ class Monomorphizer:
         if isinstance(expr, rast.Ident):
             return self.var_types.get(expr.name)
 
+        # `*p`, `(*p)`: what `p` points at, so `(*p)[lo..hi]` on a `*Vec<T>`
+        # registers vec_slice<T> as `p[lo..hi]` does (AGAST #2448).
+        if isinstance(expr, rast.Grouped):
+            return self._infer_value_type(expr.expr)
+        if isinstance(expr, rast.UnaryOp) and expr.op == '*':
+            inner = self._infer_value_type(expr.operand)
+            if isinstance(inner, (rast.PtrType, rast.RefType)):
+                return inner.inner
+            return None
+        # `let p = @v`: a pointer to v, as the emitter's _infer_ritz_type has it,
+        # so `p[lo..hi]` registers vec_slice<T> (AGAST #2448).
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('@', '&', '@&', '&mut'):
+            inner = self._infer_value_type(expr.operand)
+            if inner is None:
+                return None
+            return rast.PtrType(expr.span, inner, mutable=expr.op in ('@&', '&mut'),
+                                shared=expr.op == '@')
+
         # Field access: resolve the base struct and look the field up. This is
         # what makes `self.edges.push(x)` register vec_push<Edge>.
         if isinstance(expr, rast.Field):

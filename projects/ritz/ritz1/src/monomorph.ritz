@@ -198,6 +198,7 @@ var g_lv_suffix_lens: *i32 = null
 var g_lv_type_names: **u8 = null       # Kind 0: the struct's name (e.g. "R")
 var g_lv_type_name_lens: *i32 = null
 var g_lv_by_value: *i32 = null         # 1: the local IS the struct, not *T / @T (AGAST #2451)
+                                       # 2: a *T, @T or @&T of it, one level (AGAST #2448)
 var g_lv_count: i32 = 0
 var g_lv_cap: i32 = 0
 var g_lv_initialized: i32 = 0
@@ -278,6 +279,30 @@ fn track_typed_local(name: *u8, name_len: i32, type_kind: i32, type_name: *u8, t
         add_local_struct_var(name, name_len, type_name, type_name_len)
     if type_kind == TYPE_STRUCT
         mark_last_local_by_value()
+
+# track_typed_local, and a `*T`, `@T` or `@&T` whose pointee is the struct
+# itself (not `**T`) is marked as one, so `p[lo..hi]` can slice what it points
+# at (AGAST #2448).  `pointee` is the param's or let's pointee type.
+fn track_typed_local_through(name: *u8, name_len: i32, type_kind: i32, pointee: i32, type_name: *u8, type_name_len: i32)
+    let before: i32 = g_lv_count
+    track_typed_local(name, name_len, type_kind, type_name, type_name_len)
+    if g_lv_count == before or pointee != TYPE_STRUCT
+        return
+    if type_kind == TYPE_PTR or type_kind == TYPE_REF or type_kind == TYPE_MUT_REF
+        *(g_lv_by_value + g_lv_count - 1) = 2
+
+# Un-annotated `let p = @v` / `@&v` of a by-value Vec, Span or String local:
+# `p` points at it, one level, as `let p: @Vec<T> = @v` would (AGAST #2448).
+fn track_address_of_local(name: *u8, name_len: i32, of: *Expr)
+    if of == null or of.kind != EXPR_IDENT
+        return
+    let idx: i32 = find_local_var_idx(of.ident_ptr, of.ident_len)
+    if idx < 0 or *(g_lv_by_value + idx) != 1
+        return
+    add_local_var(name, name_len, *(g_lv_prefix_kind + idx), *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx))
+    *(g_lv_type_names + g_lv_count - 1) = *(g_lv_type_names + idx)
+    *(g_lv_type_name_lens + g_lv_count - 1) = *(g_lv_type_name_lens + idx)
+    *(g_lv_by_value + g_lv_count - 1) = 2
 
 # Resolve the type of the field named by an EXPR_MEMBER chain rooted at a
 # tracked local: `r.raw` → "Vec$u8", `o.q.a` → "A".  Emits nothing.  Returns
@@ -685,7 +710,7 @@ fn collect_instantiations_from_module(m: *Module)
             reset_local_var_tracker()
             var pp: *Param = f.params
             while pp != null
-                track_typed_local(pp.name, pp.name_len, pp.param_type, pp.param_type_name, pp.param_type_name_len)
+                track_typed_local_through(pp.name, pp.name_len, pp.param_type, pp.param_pointee_type, pp.param_type_name, pp.param_type_name_len)
                 pp = pp.next
             # Walk function body
             collect_from_fn_body(m, f.body)
@@ -707,7 +732,7 @@ fn collect_instantiations_from_module(m: *Module)
                 reset_local_var_tracker()
                 var ipp: *Param = method.params
                 while ipp != null
-                    track_typed_local(ipp.name, ipp.name_len, ipp.param_type, ipp.param_type_name, ipp.param_type_name_len)
+                    track_typed_local_through(ipp.name, ipp.name_len, ipp.param_type, ipp.param_pointee_type, ipp.param_type_name, ipp.param_type_name_len)
                     ipp = ipp.next
                 collect_from_fn_body(m, method.body)
                 method = method.next
@@ -795,7 +820,9 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
             mark_last_local_by_value()
         else if s.var_type_name != null and s.var_type_name_len > 0
             # Plain struct (or pointer/ref to one): root of a field receiver.
-            track_typed_local(s.var_name, s.var_name_len, s.var_type, s.var_type_name, s.var_type_name_len)
+            track_typed_local_through(s.var_name, s.var_name_len, s.var_type, s.var_pointee_type, s.var_type_name, s.var_type_name_len)
+        else if s.var_init != null and s.var_init.kind == EXPR_UNARY and (s.var_init.op == OP_ADDR or s.var_init.op == OP_ADDR_MUT)
+            track_address_of_local(s.var_name, s.var_name_len, s.var_init.operand)
         else if s.var_init != null and s.var_init.kind == EXPR_STRUCT_LIT
             # Un-annotated `var r = R { ... }`: the literal names the type.
             add_local_struct_var(s.var_name, s.var_name_len, s.var_init.ident_ptr, s.var_init.ident_len)
@@ -905,10 +932,19 @@ fn rewrite_enum_from_call(m: *Module, e: *Expr)
 fn rewrite_value_slice(m: *Module, e: *Expr)
     if e == null or e == g_slice_kept or e.kind != EXPR_INDEX or e.right == null or e.right.kind != EXPR_RANGE
         return
-    if e.left == null or e.left.kind != EXPR_IDENT
+    # Through a pointer or reference, `p[lo..hi]` and `(*p)[lo..hi]` are both
+    # `(*p)[lo..hi]` (R9 rule 2, AGAST #2448): `p.slice(lo, hi)`, which UFCS
+    # dispatch passes `p` itself to.
+    var base: *Expr = e.left
+    if base != null and base.kind == EXPR_UNARY and base.op == OP_DEREF
+        base = base.operand
+    if base == null or base.kind != EXPR_IDENT
         return
-    let idx: i32 = find_local_var_idx(e.left.ident_ptr, e.left.ident_len)
-    if idx < 0 or *(g_lv_by_value + idx) == 0
+    let idx: i32 = find_local_var_idx(base.ident_ptr, base.ident_len)
+    if idx < 0
+        return
+    let by_value: i32 = *(g_lv_by_value + idx)
+    if by_value == 0 or (base != e.left and by_value != 2)
         return
     if *(g_lv_prefix_kind + idx) == 0
         if buf_eq(*(g_lv_type_names + idx), *(g_lv_type_name_lens + idx), c"String", 6) == 0
@@ -919,6 +955,7 @@ fn rewrite_value_slice(m: *Module, e: *Expr)
         # No ritzlib.span (a Span<u8> needs none): the view itself.
         span_view_in_place(e, *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx))
         return
+    e.left = base
     lo.next = rng.right
     rng.right.next = null
     e.kind = EXPR_METHOD
@@ -931,7 +968,8 @@ fn rewrite_value_slice(m: *Module, e: *Expr)
 
 # `v[lo..hi]` on a Span, as `Span$T { ptr: v.ptr + lo, len: hi - lo }`: ritz0's
 # _emit_span_slice.  `lo` is read twice, so only a literal or a name is taken;
-# anything else stays an index and is refused.
+# anything else stays an index and is refused.  Through a pointer, `p.ptr` and
+# `(*p).ptr` both read through it (AGAST #2448).
 fn span_view_in_place(e: *Expr, suf: *u8, suf_len: i32)
     let lo: *Expr = e.right.left
     let hi: *Expr = e.right.right

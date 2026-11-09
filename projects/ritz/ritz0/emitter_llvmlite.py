@@ -8165,6 +8165,24 @@ class LLVMEmitter:
             return None
         return self._buffer_element(expr, root, path)
 
+    def _slice_base(self, base: rast.Expr) -> rast.Expr:
+        """What `base[lo..hi]` slices: `*p` when `base` is a name `p` that sees
+        through, a `*T`, `@T` or `@&T` with T a Vec, Span or String (AGAST #2448,
+        LARB R9 rule 2), so `p[lo..hi]` is `(*p)[lo..hi]`.  The slice paths take
+        the struct's address from `_emit_lvalue_addr`, which for the name is the
+        pointer's own slot.  Anything else is sliced as it stands.
+        """
+        if not isinstance(base, rast.Ident):
+            return base
+        ty = self._infer_ritz_type(base)
+        if ty is not None:
+            ty = resolve_alias_in(ty, self.type_aliases)
+        if not isinstance(ty, (rast.PtrType, rast.RefType)):
+            return base
+        if self._buffer_field_path(resolve_alias_in(ty.inner, self.type_aliases)) is None:
+            return base
+        return rast.UnaryOp(base.span, '*', base)
+
     @staticmethod
     def _buffer_element(expr: rast.Index, root: rast.Expr, path: tuple) -> rast.UnaryOp:
         """`*(root.data + i)` for `expr`, `root[i]`, along `path` to the elements."""
@@ -8215,7 +8233,7 @@ class LLVMEmitter:
                 )
             return self._emit_slice(rast.SliceExpr(
                 span=expr.span,
-                expr=expr.expr,
+                expr=self._slice_base(expr.expr),
                 start=expr.index.start,
                 end=slice_end,
             ))
