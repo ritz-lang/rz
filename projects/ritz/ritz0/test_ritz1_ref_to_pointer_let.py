@@ -191,6 +191,101 @@ def test_index_through_deref_param(run_with, ty, compiler):
     )
 
 
+# AGAST #2545: the store side, `(*r)[i] = v` with `r: **T`.  ritz1 stored
+# through the VALUE `(*r)[i]` read (segfault on i16) and as an i64 (invalid IR
+# on f64).  Each store checks the element it aimed at and both neighbours, so a
+# wide or byte-strided store can't pass; 7 reads the store back through r.
+_STORE_CHECKS = """\
+    let r = {amp}q
+    (*r)[1] = {v3}
+    if x[1] != {v3}
+        return 1
+    if x[0] != {v0}
+        return 2
+    if x[2] != {v2}
+        return 3
+    let i: i64 = 2
+    (*r)[i] = {v3}
+    if x[2] != {v3}
+        return 4
+    if x[1] != {v3}
+        return 5
+    if x[0] != {v0}
+        return 6
+    (*r)[0] = {v1}
+    if (*r)[0] != {v1}
+        return 7
+    if x[1] != {v3}
+        return 8
+    return 0
+"""
+
+
+def _stored(source: str, amp: str, ty: str, annotate: bool) -> str:
+    v0, v1, v2, v3 = SCALARS[ty]
+    text = (
+        SOURCES[source]
+        .replace(_CHECKS, _STORE_CHECKS)
+        .format(amp=amp, t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
+    )
+    if annotate:
+        text = text.replace(f"let r = {amp}q", f"let r: **{ty} = {amp}q")
+    return text
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(SCALARS))
+@pytest.mark.parametrize("amp", ["@", "@&"], ids=["shared", "mut"])
+@pytest.mark.parametrize("source", sorted(SOURCES))
+def test_store_through_deref_index(run_with, source, amp, ty, compiler):
+    name = f"store_{source}_{'mut' if amp == '@&' else 'shared'}_{ty}"
+    assert run_with(compiler, name, _stored(source, amp, ty, False)) == 0
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(SCALARS))
+def test_store_through_deref_index_annotated(run_with, ty, compiler):
+    assert run_with(compiler, f"store_ann_{ty}", _stored("local", "@", ty, True)) == 0
+
+
+# A `r: **T` parameter stores through `*r` all the same.
+_PARAM_PP_STORE = (
+    """\
+fn g(r: **{t}) -> i32
+    (*r)[1] = {v2}
+    let i: i64 = 2
+    (*r)[i] = {v3}
+    return 0
+
+pub fn main() -> i32
+"""
+    + _FILL
+    + """\
+    var q: *{t} = @x[0]
+    if g(@q) != 0
+        return 9
+    if x[0] != {v0}
+        return 1
+    if x[1] != {v2}
+        return 2
+    if x[2] != {v3}
+        return 3
+    return 0
+"""
+)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(SCALARS))
+def test_store_through_deref_index_param(run_with, ty, compiler):
+    v0, v1, v2, v3 = SCALARS[ty]
+    program = _PARAM_PP_STORE.format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
+    assert run_with(compiler, f"store_pp_param_{ty}", program) == 0
+
+
 # AGAST #2539: `let r = @q` with `q: *[N]T` or `q: *Enum` stayed an i64 after
 # #2532.  The array form was silent: after `let p = *r`, `p[1]` read the wrong
 # slot (exit 1) and a store through it crashed.  The enum form was invalid IR.

@@ -1456,6 +1456,22 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             index_through_fill(target_expr, through_spill(s, through), @th)
             target_expr = @th.deref
 
+        # AGAST #2545: `(*r)[i] = v` with `r: **T` GEPs and stores T, as
+        # `(*r)[i]` loads it (#2537's deref_index_elem).  It fell to the
+        # generic path below, which stored through the VALUE `(*r)[i]` read,
+        # as an i64: a segfault on i16, invalid IR on f64.
+        let dix: i32 = deref_index_elem(s, target_expr)
+        if dix != TYPE_VOID
+            let dbase: i32 = emit_expr(s, target_expr.left)
+            let dptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, dptr)
+            emit_str(s, c" = inttoptr i64 ")
+            emit_reg(s, dbase)
+            emit_str(s, c" to ptr\n")
+            emit_ptr_elem_store(s, target_expr.right, stmt.assign_value, dptr, TYPE_PTR, dix)
+            return
+
         # AGAST #1509: `g[i][j] = v` over a multi-dimensional array.  It fell
         # to the generic path below, which evaluated `g[i][j]` as a VALUE
         # (over a flattened [N x i64]) and stored through it.
@@ -2852,8 +2868,13 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 # stride/width.  Index and value are emitted here to preserve the historical
 # evaluation order (index before value, both after the base load).
 fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, base_type: i32, pointee: i32)
-    let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-    let val_reg: i32 = emit_expr(s, stmt.assign_value)
+    emit_ptr_elem_store(s, stmt.while_cond, stmt.assign_value, base_ptr, base_type, pointee)
+
+# The body of emit_index_assign_ptr_store, for any index / value pair.  AGAST
+# #2545: `(*r)[i] = v` (an expression-target assign) stores through it too.
+fn emit_ptr_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, base_ptr: i32, base_type: i32, pointee: i32)
+    let idx_reg: i32 = emit_expr(s, idx_expr)
+    let val_reg: i32 = emit_expr(s, value)
     let elem_ptr: i32 = next_reg(s)
     if base_type == TYPE_PTR_PTR
         # Pointer-to-pointer: element is a pointer.
@@ -2884,7 +2905,7 @@ fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, bas
         # *bool strides and stores one `i1`, as every bool array element
         # is laid out (#2063); it stored an i64 8 bytes apart.
         let fty: *u8 = local_array_elem_llvm(pointee)
-        let fval: i32 = emit_field_elem_narrow(s, val_reg, pointee, stmt.assign_value)
+        let fval: i32 = emit_field_elem_narrow(s, val_reg, pointee, value)
         emit_str(s, c"  ")
         emit_reg(s, elem_ptr)
         emit_str(s, c" = getelementptr ")
