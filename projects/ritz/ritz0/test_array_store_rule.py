@@ -346,7 +346,9 @@ TARGETS = {
     "row_of_global": "var M: [2][2]u8\n\nfn f() -> i32\n    M[1] = {L}\n    var b: [2]u8 = M[1]\n{R}",
     "row_of_field": ("struct H\n    m: [2][2]u8\n\nfn f() -> i32\n    var h: H\n    h.m[1] = {L}\n"
                      "    var b: [2]u8 = h.m[1]\n{R}"),
-    "pointer_as_array": ("fn s(p: *[2]u8)\n    p[0] = {L}\n\nfn f() -> i32\n    var b: [2]u8\n    s(@b)\n{R}"),
+    # `p[0] = {L}` took the whole array at stride `[N]T` here.  R9 makes `p[0]` element
+    # 0, a u8, so the whole array is `*p` (#2330, test_ritz1_array_pointer_index.py).
+    "pointer_as_array": ("fn s(p: *[2]u8)\n    *p = {L}\n\nfn f() -> i32\n    var b: [2]u8\n    s(@b)\n{R}"),
     "inferred_local": "fn f() -> i32\n    var a: [2]u8\n    var b = a\n    b = {L}\n{R}",
     "alias_pointer": "type A = [2]u8\n\nfn s(p: *A)\n    *p = {L}\n\nfn f() -> i32\n    var b: A\n    s(@b)\n{R}",
     "alias_field": "type A = [2]u8\n\nstruct H\n    b: A\n\nfn f() -> i32\n    var h: H\n    h.b = {L}\n    var b: [2]u8 = h.b\n{R}",

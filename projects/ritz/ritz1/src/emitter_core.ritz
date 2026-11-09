@@ -112,6 +112,11 @@ struct LocalVar
     # of its name is an error, not a jump.  0 when it may hold one: ritz1
     # types an untyped `let h = t.h` as an i64.
     not_fn: i32
+    # AGAST #2330: 1 for the `*T` view of a `*[N]T`, `@[N]T` or `@&[N]T` local `p`,
+    # named `p#`.  It shares p's slot, which holds the address of element 0, so
+    # `p[i]` is `*(p# + i)`: element i at stride T in every position (LARB R9).
+    # See add_array_view and index_through.
+    array_view: i32
 
 # A let/var seen so far in the current function, with the integer type its
 # annotation WROTE (NARROW_UNKNOWN when unannotated or not an integer).
@@ -202,6 +207,11 @@ struct EmitterState
     # the only valid enum context is the callee's parameter type, already in
     # ctx_enum_name; resolve_enum_ctx must NOT fall back to ret_type_name.
     ctx_enum_arg: i32
+    # AGAST #2330: the expression being emitted into a struct slot, a copy, or null.
+    # emit_expr_index lets a struct element of a pointer to an array be that, and
+    # nothing else: a struct value is its address, so an integer context took the
+    # address as a number and failed at clang.
+    struct_copy_expr: *Expr
     # AGAST #167: SIMD-typed binding context.  When emitting `let v: v4i32 =
     # simd_loadu(...)`, the var-decl pre-sets these so emit_expr_call's
     # SIMD intrinsic dispatch knows which `<N x iM>` type to produce.  Null
@@ -922,6 +932,34 @@ fn set_local_pointee_elem(s: *EmitterState, name: *u8, len: i32, pointee: i32)
     if loc != null
         loc.pointee_array_elem_pointee = pointee
 
+# AGAST #2330, LARB R9: `p[i]` on a `*[N]T`, `@[N]T` or `@&[N]T` local is element i
+# at stride T, as a place: read, store, `+=`, `@`, `@&`, `.f`, a by-value copy.
+# Each of those lowers `*(q + i)` for a `q: *T` already, so the binding of `p` adds
+# `p#`, a `*T` over the same slot, and index_through hands `p[i]` over as
+# `*(p# + i)`.  The slot holds the array's address, which is element 0's, and a
+# store to `p` moves both.  Call it just BEFORE adding `p`, so `p` is still the
+# last local (its binders read local_at(count - 1)) and the view rolls back with
+# it.  Rows and pointer elements get no view: they keep #2321's located refusals.
+pub fn add_array_view(s: *EmitterState, name: *u8, len: i32, reg: i32, kind: i32, pointee: i32, size: i32, elem: i32, type_name: *u8, type_name_len: i32)
+    if pointee != TYPE_ARRAY or size <= 0
+        return
+    if kind != TYPE_PTR and kind != TYPE_REF and kind != TYPE_MUT_REF
+        return
+    var view_kind: i32 = TYPE_PTR
+    if elem == TYPE_STRUCT
+        if type_name_len <= 0 or find_struct(s, type_name, type_name_len) == null
+            return
+    else if elem == TYPE_PTR or elem == TYPE_PTR_PTR or ptr_pointee_size(s, elem, null, 0) == 0
+        # `*[N]*U`: `*p[1] = 7` stored past a `*i16`'s pointee through a view, so
+        # it keeps #2321's refusal (#2330's NOT DONE).
+        return
+    let view_name: *u8 = malloc(len as i64 + 1)
+    memcpy(view_name, name, len as i64)
+    *(view_name + len) = 35   # '#': no identifier has one, so `p#` names only this
+    add_local_full(s, view_name, len + 1, reg, view_kind, type_name, type_name_len, elem, 0, 0)
+    let view: *LocalVar = local_at(s, s.local_count - 1)
+    view.array_view = 1
+
 fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32, type_name: *u8, type_name_len: i32, pointee: i32, arr_size: i32, arr_elem: i32)
     if s.local_count >= s.locals_cap
         let cap: i64 = (s.locals_cap as i64) * 2
@@ -959,6 +997,7 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
     loc.ref_root_name = null
     loc.ref_root_name_len = 0
     loc.not_fn = 0
+    loc.array_view = 0
     s.local_count = idx + 1
     # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
     # Store `idx + 1` so the value is non-zero (0 = miss in
@@ -3660,6 +3699,11 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
         if loc.var_type == TYPE_PTR_PTR
             return 8
         if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+            # AGAST #2330, LARB R9: `p + i` on a `*[N]T` walks rows, at stride `[N]T`.
+            if loc.pointee_type == TYPE_ARRAY and loc.pointee_array_size > 0
+                let row_elem: i64 = ptr_pointee_size(s, loc.pointee_array_elem_type, loc.type_name, loc.type_name_len)
+                if row_elem > 0
+                    return row_elem * (loc.pointee_array_size as i64)
             let size: i64 = ptr_pointee_size(s, loc.pointee_type, loc.type_name, loc.type_name_len)
             if size > 0
                 return size

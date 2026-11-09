@@ -1741,6 +1741,52 @@ fn main() -> i32
     rows[0][0] + rows[0][1] - 11
 ```
 
+An array behind a pointer is the same. `p[i]` on a `*[N]T`, `@[N]T` or `@&[N]T` is
+element `i` of the array, at stride `T`, in every position, and by value it's a
+copy. So for a pointer to an array, `p[i]` is not `*(p + i)`: `p + i` steps by the
+pointee, a whole `[N]T`, and is how to walk rows.
+
+```ritz
+struct Point
+    x: i32
+    y: i64
+
+fn bump(p: *[3]i32, i: i64)
+    p[i] += 1
+    let q: *i32 = @p[2]
+    *q = 9
+
+fn shift(p: @&[3]Point) -> i32
+    p[1].x = 7
+    let s: Point = p[1]
+    s.x
+
+fn second_row(p: *[3]i32) -> i32
+    let r = p + 1
+    r[0]
+
+fn main() -> i32
+    var g: [2][3]i32
+    g[0][1] = 0
+    g[1][0] = 4
+    bump(@g[0], 1)
+    var pts: [3]Point
+    shift(@&pts) + second_row(@g[0]) + g[0][1] + g[0][2] - 21
+```
+
+The element is a `T`, so a whole `[N]T` doesn't fit it. `*p = a` stores the array.
+
+```ritz expect-error="`p[i]` is one element of the array behind `p`"
+fn put(p: *[3]i32)
+    var b: [3]i32 = [1, 2, 3]
+    p[1] = b
+
+fn main() -> i32
+    var a: [3]i32
+    put(@a)
+    0
+```
+
 Writes follow §3.2, so an `@T` refuses them. A `*T` over anything else is a raw
 buffer: `p[i]` is `*(p + i)`, at stride `T`. Walking rows of Vecs behind a `*Vec<T>`
 is `p + i`, not `p[i]`.

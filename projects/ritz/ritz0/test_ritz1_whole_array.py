@@ -1023,7 +1023,9 @@ GAPS = [
 
 # Programs ritz0 refuses.  ritz1 has to refuse them too, and write no .ll: most of
 # these used to read the array's first 8 bytes, and the `wrong_elem` ones went
-# through ritz0's element conversion (#2343).
+# through ritz0's element conversion (#2343).  `self_copy`, `*p = [(*p)[3], ...]`, was
+# here: ritz0 refuses it only by failing on `(*p)[i]` (#2331), which LARB R9 makes
+# legal, so it's in test_ritz1_array_pointer_index.py now (#2330).
 REJECTED = {
     "arg_wrong_elem": """\
 fn g(a: [4]i32) -> i32
@@ -1382,15 +1384,6 @@ fn g(a: [4]i32) -> i32
 
 pub fn main() -> i32
     return g([1, 2])
-""",
-    "self_copy": """\
-fn s(p: *[4]i32)
-    *p = [(*p)[3], (*p)[2], (*p)[1], (*p)[0]]
-
-pub fn main() -> i32
-    var b: [4]i32 = [3, 0, 0, 0]
-    s(@b)
-    return b[3]
 """,
     "ret_index": """\
 fn f() -> [4]i32

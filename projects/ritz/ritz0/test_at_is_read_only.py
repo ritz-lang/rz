@@ -85,8 +85,10 @@ WRITES = {
     "generic_instance": "fn g<T>(p: @T, v: T)\n    ^*p = v\n\nfn f(p: @i32)\n    g<i32>(p, 3)\n",
 }
 
-# ritz1 can't lower `p[i].f = v` at all (#2373): it's refused, but not by this rule.
-WRITE_GAPS = {"element_field": 2373}
+# ritz1 couldn't lower `p[i].f = v` at all (#2373), so it was refused, but not by
+# this rule.  Through a pointer to an array it's `*(p# + i)` now (#2330), and this
+# rule refuses it.
+WRITE_GAPS = {}
 
 # The same writes where the place isn't behind an `@T`. Each leaves 3 in `c.x`.
 ALLOWED = {

@@ -1557,7 +1557,14 @@ class LLVMEmitter:
                     return elem
                 if isinstance(base_type, rast.ArrayType):
                     return base_type.inner
-                elif isinstance(base_type, rast.PtrType):
+                if isinstance(base_type, (rast.PtrType, rast.RefType)):
+                    # AGAST #2330, LARB R9: through a pointer to an array, `p[i]` is
+                    # the element.  This said `[N]T`, so `p[1] = 300` into a `*[3]u8`
+                    # met no slot and stored 44.
+                    pointee = resolve_alias_in(base_type.inner, self.type_aliases)
+                    if isinstance(pointee, rast.ArrayType):
+                        return pointee.inner
+                if isinstance(base_type, rast.PtrType):
                     return base_type.inner
             return None
         elif isinstance(expr, rast.Cast):
@@ -6089,7 +6096,16 @@ class LLVMEmitter:
 
                 # General case - pointer indexing
                 base = self._emit_expr(stmt.target.expr)
-                if isinstance(base.type, ir.PointerType):
+                if isinstance(base.type, ir.PointerType) and isinstance(base.type.pointee, ir.ArrayType):
+                    # AGAST #2330, LARB R9: element i at stride T, as the read.  This
+                    # took GEP [i], at stride `[N]T`, so a scalar didn't fit and a
+                    # whole `[N]T` was stored over the next row.
+                    elem = base.type.pointee.element
+                    if isinstance(val.type, ir.ArrayType) and not isinstance(elem, ir.ArrayType):
+                        raise EmitError(array_rules.ELEMENT_NOT_ARRAY, stmt.span)
+                    ptr = self.builder.gep(base, [ir.Constant(self.i32, 0), index])
+                    self.builder.store(self._convert_type(val, elem, stmt.value), ptr)
+                elif isinstance(base.type, ir.PointerType):
                     ptr = self.builder.gep(base, [index])
                     val = self._convert_type(val, base.type.pointee)
                     self.builder.store(val, ptr)
@@ -9188,6 +9204,12 @@ class LLVMEmitter:
 
             base = self._emit_expr(expr.expr)
             if isinstance(base.type, ir.PointerType):
+                if isinstance(base.type.pointee, ir.ArrayType):
+                    # AGAST #2330, LARB R9: `p[i]` on a `*[N]T`, `@[N]T` or `@&[N]T`
+                    # is element i at stride T, as _emit_index_core reads it.  GEP
+                    # [i] strode `[N]T`: `@p[1]` was past the end, and a store
+                    # took a whole `[N]T`.
+                    return self.builder.gep(base, [ir.Constant(self.i32, 0), index])
                 return self.builder.gep(base, [index])
             raise ValueError(f"Cannot index type: {base.type}")
         elif isinstance(expr, rast.Field):

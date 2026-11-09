@@ -152,8 +152,9 @@ RECEIVERS = {
                        "fn f(s: S)\n    ^s.v.push(3 as u8)\n",
 }
 
-# ritz1 can't lower `p[1].m()` (#2382): it's refused, but not by this rule.
-RECEIVER_GAPS = {"element_behind": 2382}
+# ritz1 couldn't lower `p[1].m()` (#2382), so it was refused, but not by this rule.
+# Through a pointer to an array it's `*(p# + 1)` now (#2330), and this rule refuses it.
+RECEIVER_GAPS = {}
 
 # Rule 3. `^` as above.
 PLACES = {

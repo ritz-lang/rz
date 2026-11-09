@@ -915,8 +915,9 @@ pub fn main() -> i32
     _refused(comp, ll, VALUE_INTO_SHARED_REF)
 
 
+# AGAST #2311: ritz0 refused this ("cannot store i64 to [2 x i32]*") until #2330
+# made its store stride T, as its read does (LARB R9).
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2311: `p[i]` through a `@&[N]T`")
 def test_ritz0_index_through_a_reference_to_an_array(tmp_path):
     program = """\
 fn f(a:& [2]i32)

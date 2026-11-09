@@ -12,3 +12,9 @@ ELEMENT_MISMATCH = "an array only fits a slot of the same element type: write a 
 # the same words, from index_through.ritz.
 NOT_A_BUFFER = ('a reference is one value, not a buffer: '
                 '`[]` needs an array, Vec, Span or String behind it')
+
+# `p[i] = b` with `p` a `*[N]T`, `@[N]T` or `@&[N]T` and `b` a whole `[N]T` (AGAST #2330,
+# LARB R9).  `p[i]` is element i, a T; ritz0 stored `b` at stride `[N]T`, a row
+# on.  ritz1 prints the same words, from index_through.ritz.
+ELEMENT_NOT_ARRAY = ('`p[i]` is one element of the array behind `p`, '
+                     'not the whole array: `*p = a` stores the array')

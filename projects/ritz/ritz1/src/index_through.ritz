@@ -14,8 +14,10 @@
 # local is `*(v.data + i)`, and so is an element that is one: `v[i][j]` and `p[i][j]`
 # are `*(v[i].data + j)`.
 #
-# An array behind a pointer is #2330's, and other bases, `h.r[i]`, `g[i]`, `f()[i]`,
-# are #2329's.
+# AGAST #2330: an array behind a pointer is the same place.  `p[i]` and `(*p)[i]` on a
+# `*[N]T`, `@[N]T` or `@&[N]T` local are `*(p# + i)`, element i at stride T, where
+# `p#` is the `*T` view add_array_view bound with `p`.  Other bases, `h.r[i]`,
+# `g[i]`, `f()[i]`, are #2329's.
 
 import ritzlib.sys
 import ritzlib.str
@@ -89,9 +91,29 @@ pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
     # `v[i]` on the value itself, but not `(*v)[i]`.
     if root == e.left and indexes_itself(loc) == 1
         return loc
+    if loc.pointee_type == TYPE_ARRAY
+        return array_view_of(s, root)
     if sees_through(loc) == 0
         return null
     loc
+
+# AGAST #2330: the `p#` view of `root`, a `*[N]T`, `@[N]T` or `@&[N]T` local, or null:
+# rows and `**U` elements have none.  It's the local just before `p`, over the same
+# slot.
+fn array_view_of(s: *EmitterState, root: *Expr) -> *LocalVar
+    array_view_named(s, root.ident_ptr, root.ident_len)
+
+fn array_view_named(s: *EmitterState, name: *u8, len: i32) -> *LocalVar
+    if array_ptr_named(s, name, len) == null
+        return null
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx < 1
+        return null
+    let loc: *LocalVar = local_at(s, idx)
+    let view: *LocalVar = local_at(s, idx - 1)
+    if view.array_view == 0 or view.reg != loc.reg
+        return null
+    view
 
 # `inner` of `inner[j]` as a local, when `inner` is an index through and its element
 # is a Vec, Span or String, or a pointer to one: `[]` sees through that (#2442).
@@ -121,12 +143,22 @@ fn through_member(m: *Expr, e: *Expr, base: *Expr, name: *u8, len: i32)
     m.ident_len = len
     m.next = null
 
+# `m` names `view`, the `p#` of `root` (#2330).
+fn through_view(m: *Expr, root: *Expr, view: *LocalVar)
+    m.kind = EXPR_IDENT
+    m.span = root.span
+    m.ident_ptr = view.name
+    m.ident_len = view.name_len
+    m.next = null
+
 # Fill `t` with `*(p.data + i)` for `e`, which index_through took as `loc`.
 pub fn index_through_fill(e: *Expr, loc: *LocalVar, t: *ThroughIndex)
     memset(t as *u8, 0, sizeof(ThroughIndex))
     let root: *Expr = through_root(e.left)
     var buffer: *Expr = @t.field
-    if name_starts(loc.type_name, loc.type_name_len, c"Span$", 5) == 1
+    if loc.array_view == 1
+        through_view(@t.field, root, loc)   # `*(p# + i)` (#2330)
+    else if name_starts(loc.type_name, loc.type_name_len, c"Span$", 5) == 1
         through_member(@t.field, e, root, c"ptr", 3)
     else
         through_member(@t.field, e, root, c"data", 4)
@@ -158,6 +190,8 @@ fn through_buffer(s: *EmitterState, loc: *LocalVar) -> *StructField
 
 # The kind of an element of `loc`, which sees through, for the slot checks.
 pub fn through_elem_kind(s: *EmitterState, loc: *LocalVar) -> i32
+    if loc.array_view == 1
+        return loc.pointee_type
     if through_is_string(loc.type_name, loc.type_name_len) == 1
         return TYPE_U8
     let f: *StructField = through_buffer(s, loc)
@@ -171,6 +205,10 @@ pub fn through_named_elem(s: *EmitterState, name: *u8, len: i32) -> i32
     if idx < 0
         return TYPE_VOID
     let loc: *LocalVar = local_at(s, idx)
+    # AGAST #2330: through a pointer to an array, the slot is the element.
+    let view: *LocalVar = array_view_named(s, name, len)
+    if view != null
+        return through_elem_kind(s, view)
     if sees_through(loc) == 0 and indexes_itself(loc) == 0
         return TYPE_VOID
     through_elem_kind(s, loc)
@@ -181,6 +219,13 @@ pub fn through_named_elem(s: *EmitterState, name: *u8, len: i32) -> i32
 fn through_elem_struct(s: *EmitterState, loc: *LocalVar, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
+    if loc.array_view == 1
+        # A struct T, named by the view's type_name, is held in the array.
+        if loc.pointee_type != TYPE_STRUCT
+            return TYPE_VOID
+        *out_name = loc.type_name
+        *out_len = loc.type_name_len
+        return TYPE_PTR
     let f: *StructField = through_buffer(s, loc)
     if f == null or f.field_type_name_len <= 0 or find_struct(s, f.field_type_name, f.field_type_name_len) == null
         return TYPE_VOID
@@ -290,4 +335,16 @@ pub fn index_refused(s: *EmitterState, e: *Expr) -> i32
     if loc.pointee_type == TYPE_ARRAY or sees_through(loc) == 1
         return 0
     emit_nd_error(s, e.span.line, e.span.col, c"a reference is one value, not a buffer: `[]` needs an array, Vec, Span or String behind it")
+    1
+
+# AGAST #2330: 1 after reporting `p[i] = b` with `b` a whole array, when `loc` is the
+# view of a `*[N]T`, `@[N]T` or `@&[N]T`.  `p[i]` is one T (LARB R9), and ritz0
+# stored `b` a row on.  ritz0 says the same, from array_rules.ELEMENT_NOT_ARRAY.
+pub fn through_whole_array_refused(s: *EmitterState, loc: *LocalVar, value: *Expr, line: i32, col: i32) -> i32
+    if loc.array_view == 0 or value == null
+        return 0
+    let literal: i32 = (value.kind == EXPR_ARRAY_LIT or value.kind == EXPR_ARRAY_FILL) as i32
+    if literal == 0 and get_expr_type(s, value) != TYPE_ARRAY
+        return 0
+    emit_nd_error(s, line, col, c"`p[i]` is one element of the array behind `p`, not the whole array: `*p = a` stores the array")
     1
