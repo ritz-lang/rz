@@ -13355,9 +13355,13 @@ class LLVMEmitter:
                     ritz_type = self.ritz_types[expr.expr.name]
                     if isinstance(ritz_type, rast.ArrayType):
                         return self._is_unsigned_type(ritz_type.inner)
-                    # Also handle pointer indexing: ptr[idx] where ptr is *u8
+                    # Also handle pointer indexing: ptr[idx] where ptr is *u8.
+                    # Through a `*[N]T` the element is T, not the array
+                    # (AGAST #2541): asking about `[N]u8` said signed, so
+                    # 201u8 widened with sext to -55. _infer_ritz_type sees
+                    # through the array (#2330).
                     if isinstance(ritz_type, rast.PtrType):
-                        return self._is_unsigned_type(ritz_type.inner)
+                        return self._is_unsigned_type(self._infer_ritz_type(expr))
             # Handle struct field array indexing: s.data[0] where data is [N]u8
             # Issue #98: This case was missing, causing sext instead of zext
             elif isinstance(expr.expr, rast.Field):
@@ -13366,6 +13370,10 @@ class LLVMEmitter:
                     if isinstance(field_type, rast.ArrayType):
                         return self._is_unsigned_type(field_type.inner)
                     if isinstance(field_type, rast.PtrType):
+                        # `s.p[i]` with `p: *[N]u8` is a u8, as above (#2541).
+                        pointee = resolve_alias_in(field_type.inner, self.type_aliases)
+                        if isinstance(pointee, rast.ArrayType):
+                            return self._is_unsigned_type(pointee.inner)
                         return self._is_unsigned_type(field_type.inner)
             # Anything else, notably the Vec index sugar `v[i]` / `d[i]` on a
             # `@Vec<T>` (AGAST #1979): vec_get$T returns a bare i8/i16, so

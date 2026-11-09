@@ -333,12 +333,6 @@ ARRAY_TYPES = ["i8", "u8", "i16", "i32", "i64", "f64"]
 @pytest.mark.parametrize("ann", ["inferred", "annotated"])
 @pytest.mark.parametrize("body", sorted(ARRAY_BODIES))
 def test_reference_to_an_array_pointer(request, run_with, body, ann, ty, compiler):
-    if body == "copy_out" and ty == "u8" and compiler == "ritz0":
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True, reason="AGAST #2541: ritz0 sexts a *[N]u8 element"
-            )
-        )
     if body == "index_through" and compiler in RITZ1S:
         request.applymarker(
             pytest.mark.xfail(strict=True, reason="AGAST #2331: (*pp)[i] on a **[N]T")
