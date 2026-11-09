@@ -125,7 +125,8 @@ SPELLINGS = {
 
 
 # A plain param's gaps, which are nothing to do with `self`: the receiver forms pass.
-PLAIN_GAPS = {"write_to_a_global": 2446, "big_write_to_a_global": 2446, "receiver_is_an_element": 2446}
+# `g(G)`, a global passed whole, was #2446's other half and runs since #2427.
+PLAIN_GAPS = {"receiver_is_an_element": 2446}
 
 
 def _source(spelling, row):

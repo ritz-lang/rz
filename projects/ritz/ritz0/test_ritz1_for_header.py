@@ -441,13 +441,11 @@ def test_ritz0_a_push_in_the_body_is_seen(run_with, name):
 
 
 # An rvalue's header is its own: `g` growing is no write to it.  The buffer is
-# still shared, so what it sees of the elements is what's there.  `mk()` copies
-# field by field, as a whole global is invalid IR on ritz1 (#2427).
+# still shared, so what it sees of the elements is what's there.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_call_results_header_is_its_own(run_with, compiler):
-    program = (GVEC + "var g: Vec<i32>\n\nfn mk() -> Vec<i32>\n    var v: Vec<i32>\n    v.data = g.data\n"
-               "    v.len = g.len\n    v.cap = g.cap\n    return v\n\n" + MAIN + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="mk()", place="g")))
+    program = (GVEC + "var g: Vec<i32>\n\nfn mk() -> Vec<i32>\n    return g\n\n" + MAIN + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="mk()", place="g")))
     assert run_with(compiler, "own_header", program) == 3
 
 

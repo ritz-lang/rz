@@ -496,11 +496,9 @@ def test_a_callers_struct_is_not_a_by_value_params(run_with, compiler):
 
 
 # An rvalue has a temporary, and nothing else can reach it.  So `g` changing is
-# no write to it: 1 + 2 + 4.  `mk()` copies field by field, as `return gh` is
-# invalid IR on ritz1 (#2427).
+# no write to it: 1 + 2 + 4.
 RVALUES = {
-    "field_of_a_call": (_GH + "fn mk() -> H\n    var h: H\n    h.a[0] = gh.a[0]\n"
-                        "    h.a[1] = gh.a[1]\n    h.a[2] = gh.a[2]\n    return h\n\n" + MAIN
+    "field_of_a_call": (_GH + "fn mk() -> H\n    return gh\n\n" + MAIN
                         + _FILL_GH + _WRITES.format(it="mk().a", place="gh.a")),
 }
 RVALUES_ON_RITZ0 = {
