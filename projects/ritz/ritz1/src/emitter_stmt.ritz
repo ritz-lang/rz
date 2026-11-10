@@ -263,6 +263,26 @@ fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name: *u8, len: i32)
         loc.pointee_array_elem_name = name
         loc.pointee_array_elem_name_len = len
 
+# AGAST #2564: `let e = v[i]` and `let e = x.vf[i]`, on a Vec, Span or String whose
+# element is a struct S held by value, is a copy of that S, as `let e: S = v[i]`.
+# The slot stayed i64 with no name, so `e.f` was "unhandled EXPR_MEMBER".  An
+# array behind a pointer (`p[i]`, `p: *[N]S`) isn't one: its element is a value only
+# when annotated (#2330, #2524).  Returns 1 when it typed the local.
+fn infer_through_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+        return 0
+    let loc: *LocalVar = index_through(s, stmt.var_init)
+    if loc == null or loc.array_view == 1
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if index_through_value_struct(s, stmt.var_init, @name, @len) == 0
+        return 0
+    stmt.var_type = TYPE_STRUCT
+    stmt.var_type_name = name
+    stmt.var_type_name_len = len
+    1
+
 # AGAST #2332: `let q = a[i]` and `let q = a[i] + k` with `a: [N]*T` hold what
 # `let q: *T` does.  Returns 1 when it typed the local.
 fn infer_array_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
@@ -1023,6 +1043,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     if infer_array_ptr_let(s, stmt) == 1
         var_type = stmt.var_type
     if infer_array_elem_let(s, stmt) == 1
+        var_type = stmt.var_type
+    if infer_through_elem_let(s, stmt) == 1
         var_type = stmt.var_type
 
     # `let task = @member.field[i]` — when the indexed field is an array
@@ -4338,6 +4360,13 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # lower_ref_fields leaves a reference.  `h.r[1] = 7` wrote
                     # into h.
                     if pf.ptr_array != null
+                        lfia_field_is_ptr = 1
+                    # AGAST #2564: nor is a Vec, Span or String held by value:
+                    # emit_assign stores `t.v[i] = x` through its buffer, as
+                    # index_through takes it.  `t.v[1] = 7` through a `t: @&T`
+                    # wrote 7 into the Vec's len, SILENT, and a struct element
+                    # was a `store i64` of a `%E` (invalid IR).
+                    if pf.field_type == TYPE_STRUCT and name_is_indexable(pf.field_type_name, pf.field_type_name_len) == 1
                         lfia_field_is_ptr = 1
                 if field_idx >= 0 and lfia_field_is_ptr == 0
                     let field: *StructField = get_field_type(st, field_idx)

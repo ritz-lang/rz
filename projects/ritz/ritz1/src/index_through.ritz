@@ -49,7 +49,7 @@ fn through_is_string(name: *u8, len: i32) -> i32
     (memcmp(name, c"String", 6) == 0) as i32
 
 # 1 when a struct of this name indexes.
-fn name_is_indexable(name: *u8, len: i32) -> i32
+pub fn name_is_indexable(name: *u8, len: i32) -> i32
     if name_starts(name, len, c"Vec$", 4) == 1 or name_starts(name, len, c"Span$", 5) == 1
         return 1
     through_is_string(name, len)
@@ -90,6 +90,9 @@ pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
     if root == null
         return null
     if root.kind != EXPR_IDENT
+        let fv: *LocalVar = vec_field_through(s, e.left)   # `x.vf[i]` (#2564)
+        if fv != null
+            return fv
         return base_array_view(s, root)   # `h.r[i]`, `h(p)[i]` (#2329)
     let loc: *LocalVar = find_local_struct_name(s, root.ident_ptr, root.ident_len)
     if loc == null
@@ -106,6 +109,48 @@ pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
     if sees_through(loc) == 0
         return null
     loc
+
+# AGAST #2564: `base`, a field `x.vf` that is a Vec, Span or String by value, as the
+# local `v[i]` takes on a Vec name (#2442): index_through_fill makes `x.vf[i]` the
+# place `*(x.vf.data + i)`, and an element that is a struct S names S.  The member
+# path found no S through `x.vf[i]`, so `x.vf[i].f`, `x.vf[i].m()` and
+# `x.vf[i] = ...` were "unhandled EXPR_MEMBER", unlocated.  The fill names `base`
+# again at each use, so a base holding a call (`h().vf[i]`) isn't taken: it would
+# run twice under `+=`.  None reaches here today (member_field_def types no `*T`
+# call's field, #2517), so that guard is for when one does.  It's in no scope:
+# only type_name and var_type are read.
+fn vec_field_through(s: *EmitterState, base: *Expr) -> *LocalVar
+    if base == null or base.kind != EXPR_MEMBER or place_without_call(base) == 0
+        return null
+    let f: *StructField = member_field_def(s, base)
+    if f == null or f.field_type != TYPE_STRUCT
+        return null
+    if name_is_indexable(f.field_type_name, f.field_type_name_len) == 0
+        return null
+    let v: *LocalVar = malloc(sizeof(LocalVar)) as *LocalVar
+    memset(v as *u8, 0, sizeof(LocalVar))
+    v.var_type = TYPE_STRUCT
+    v.type_name = f.field_type_name
+    v.type_name_len = f.field_type_name_len
+    v.inner_pointee_type = TYPE_VOID
+    v.pointee_array_elem_type = TYPE_VOID
+    v.pointee_array_elem_pointee = TYPE_VOID
+    v
+
+# 1 when `e` names a place with no call in it: names, fields, indexes, derefs, and
+# arithmetic on those in an index (`a[i - 1].vf`).
+fn place_without_call(e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_IDENT or e.kind == EXPR_INT_LIT
+        return 1
+    if e.kind == EXPR_MEMBER
+        return place_without_call(e.left)
+    if e.kind == EXPR_INDEX or e.kind == EXPR_BINARY
+        return (place_without_call(e.left) == 1 and place_without_call(e.right) == 1) as i32
+    if e.kind == EXPR_UNARY
+        return place_without_call(e.operand)
+    0
 
 # AGAST #2330: the `p#` view of `root`, a `*[N]T`, `@[N]T` or `@&[N]T` local, or null:
 # rows and `*[N]**U` have none (#2522).  It's the local just before `p`, over the
