@@ -118,6 +118,9 @@ FILL_V = _new("i32", SEED)
 VH = "struct VH\n    k: i64\n    v: Vec<i32>\n    z: i64\n\n"
 FILL_H = "    var h: VH\n    h.v = vec_new<i32>()\n" + _pushes("h.v", SEED)
 OUTER = "struct O\n    n: i32\n    h: VH\n\n"
+# AGAST #2411: a Vec field of a generic struct.  `B$i32` held a `%Vec$T`.
+GB = "struct B<T>\n    k: i32\n    v: Vec<T>\n\n"
+FILL_B = "    var b: B<i32>\n    b.v = vec_new<i32>()\n" + _pushes("b.v", SEED)
 PH = "struct PH\n    k: i32\n    p: *Vec<i32>\n\n"
 
 
@@ -178,6 +181,12 @@ HOLDERS = {
     "unannotated_reference": _in_main("r", FILL_V + "    let r = @v\n"),
     # A `let` has no storage ritz0 can name, and nothing can write to it.
     "let": _in_main("w", FILL_V + "    let w: Vec<i32> = v\n"),
+    "generic_struct_field": (GVEC + GB + "fn f<T>(b: @B<T>) -> i32\n" + _body(SUM.format(it="b.v"))
+                             + "\n" + MAIN + FILL_B + "    return f<i32>(@b)\n"),
+    "addr_of_generic_struct_field": (GVEC + GB + "fn f<T>(b: @B<T>) -> i32\n"
+                                     + _body(SUM.format(it="@b.v")) + "\n" + MAIN + FILL_B
+                                     + "    return f<i32>(@b)\n"),
+    "generic_struct_field_in_main": _in_main("b.v", FILL_B, GB),
     "field_of_a_let": _in_main("k.v", FILL_H + "    let k: VH = h\n", VH),
 }
 
@@ -320,6 +329,98 @@ def test_a_vec_of_vecs(run_with, compiler):
                + _body("var t: i32 = 0\nfor r in v\n    for x in r\n        t = t + x\n"
                        "if t != 7\n    return 1\nreturn 0\n"))
     assert run_with(compiler, "vv", program) == 0
+
+
+# AGAST #2411: `usize` / `isize` are names to ritz1, not primitives, and a
+# Vec<usize> had no element size.  The middle value doesn't fit 32 bits.
+WORDS = {"usize": (1, 5000000000, 7), "isize": (-3, 5000000000, -70000)}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("it", FORMS)
+@pytest.mark.parametrize("ty", sorted(WORDS))
+def test_a_word_element_is_read_at_its_width(run_with, compiler, it, ty):
+    vs = WORDS[ty]
+    program = GVEC + MAIN + _new(ty, vs) + _body(_walk(it, 3, _check(ty, vs)))
+    assert run_with(compiler, f"w_{ty}", program) == 0
+
+
+# AGAST #2411: a Vec of a user enum.  `Vec$C` was taken for a type parameter's
+# placeholder, so it had no struct.  The payload enum is 16 bytes, the unit one
+# 1: each is walked at its own stride.  The weights make the order count.
+UNIT_ENUM = "enum U\n    A\n    Bb\n    Cc\n\n"
+PAYLOAD_ENUM = "enum C\n    R(i64)\n    B\n\n"
+_FILL_U = "    var v: Vec<U> = vec_new<U>()\n" + _pushes("v", ("U.A", "U.Cc", "U.Bb"))
+_FILL_C = "    var v: Vec<C> = vec_new<C>()\n" + _pushes("v", ("C.R(5)", "C.B", "C.R(7)"))
+ENUM_WALKS = {
+    # 1 + 30 + 200
+    "unit": (UNIT_ENUM, _FILL_U, "var t: i64 = 0\nvar i: i64 = 1\nfor x in {it}\n    match x\n"
+             "        U.A => t = t + i\n        U.Bb => t = t + 2 * i\n"
+             "        U.Cc => t = t + 3 * i\n    i = i * 10\nif t != 231\n    return 1\n"
+             "return 0\n"),
+    # 5 + 200 + 21
+    "payload": (PAYLOAD_ENUM, _FILL_C, "var t: i64 = 0\nvar i: i64 = 1\nfor x in {it}\n"
+                "    match x\n        C.R(n) => t = t + n * i\n        C.B => t = t + 100 * i\n"
+                "    i = i + 1\nif t != 226\n    return 1\nreturn 0\n"),
+    # prism's shape: Vec<WindowEvent>, Vec<DrawCommand>.  A longer name was never
+    # taken for a placeholder, but was walked at no stride all the same.
+    "named": ("enum Event\n    Key(i32)\n    Quit\n\n",
+              "    var v: Vec<Event> = vec_new<Event>()\n"
+              + _pushes("v", ("Event.Key(5)", "Event.Quit", "Event.Key(7)")),
+              "var t: i32 = 0\nvar i: i32 = 1\nfor x in {it}\n    match x\n"
+              "        Event.Key(k) => t = t + k * i\n        Event.Quit => t = t + 100 * i\n"
+              "    i = i + 1\nif t != 226\n    return 1\nreturn 0\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("it", FORMS)
+@pytest.mark.parametrize("name", sorted(ENUM_WALKS))
+def test_an_enum_element_is_walked_at_its_stride(run_with, compiler, it, name):
+    pre, fill, walk = ENUM_WALKS[name]
+    program = GVEC + pre + MAIN + fill + _body(walk.format(it=it))
+    assert run_with(compiler, f"e_{name}", program) == 0
+
+
+# AGAST #2411: the same, with no `for`.  Each failed to compile on ritz1 before
+# any loop was involved.  The values are what ritz0 returns.
+NO_LOOP = {
+    "enum_vec_get": (GVEC + UNIT_ENUM + MAIN + _FILL_U + "    let g: U = vec_get<U>(@v, 1)\n"
+                     "    match g\n        U.Cc => 0\n        _ => 1\n", 0),
+    "enum_vec_push": (GVEC + UNIT_ENUM + MAIN + "    var v: Vec<U> = vec_new<U>()\n"
+                      "    vec_push<U>(@&v, U.Bb)\n    let g: U = vec_get<U>(@v, 0)\n"
+                      "    match g\n        U.Bb => 0\n        _ => 1\n", 0),
+    "enum_len": (GVEC + UNIT_ENUM + MAIN + _FILL_U + "    return v.len as i32\n", 3),
+    "payload_enum_vec_get": (GVEC + PAYLOAD_ENUM + MAIN + _FILL_C
+                             + "    let g: C = vec_get<C>(@v, 2)\n    match g\n"
+                             "        C.R(n) => n as i32\n        C.B => 100\n", 7),
+    "usize_push_get_len": (GVEC + MAIN + "    var v: Vec<usize> = vec_new<usize>()\n"
+                           "    v.push(5000000000)\n    v.push(7)\n"
+                           "    let g: usize = vec_get<usize>(@v, 0)\n    if g != 5000000000\n"
+                           "        return 1\n    return v.len as i32\n", 2),
+    "generic_struct_field_len": (GVEC + GB + "fn f<T>(b: @B<T>) -> i32\n"
+                                 "    return b.v.len as i32\n\n" + MAIN + FILL_B
+                                 + "    return f<i32>(@b)\n", 3),
+    "generic_struct_field_len_in_main": (GVEC + GB + MAIN + FILL_B + "    return b.v.len as i32\n",
+                                         3),
+    # Only the field names `Vec$u16`: nothing else instantiates it.
+    "generic_struct_field_layout": (GVEC + GB + MAIN + "    var b: B<u16>\n    b.k = 4\n"
+                                    "    return b.k\n", 4),
+    "generic_struct_of_an_enum": (GVEC + UNIT_ENUM + GB + "fn f<T>(b: @B<T>) -> i32\n"
+                                  "    return b.v.len as i32\n\n" + MAIN + "    var b: B<U>\n"
+                                  "    b.v = vec_new<U>()\n    b.v.push(U.A)\n    b.v.push(U.Cc)\n"
+                                  "    return f<U>(@b)\n", 2),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NO_LOOP))
+def test_a_vec_ritz1_had_no_struct_for(run_with, compiler, name):
+    program, want = NO_LOOP[name]
+    assert run_with(compiler, name, program) == want
 
 
 # No `push` for this one on ritz1 (#2412), so the header is built by hand.
@@ -790,22 +891,15 @@ def test_ritz0_two_pointers_are_refused(compile_with, it, pre):
 
 
 ELEMENT = "this `for` element type is not supported in ritz1"
-_ENUM = "enum C\n    R(i64)\n    B\n\n"
 
 # Refused, not guessed at.  ritz0 runs these.  An element Vec has no struct for
-# (#2411) is refused as an iterable, and one that it can't name as an element.
+# is refused as an iterable, and one that it can't name as an element.
 REFUSED_ELEMENTS = {
-    "enum": (GVEC + _ENUM + MAIN + "    var v: Vec<C> = vec_new<C>()\n" + _T.format(it="v"),
-             UNSUPPORTED),
-    "addr_of_enum": (GVEC + _ENUM + MAIN + "    var v: Vec<C> = vec_new<C>()\n"
-                     + _T.format(it="@v"), UNSUPPORTED),
     "option": (GVEC + "import ritzlib.option\n\n" + MAIN
                + "    var v: Vec<Option<i32>> = vec_new<Option<i32>>()\n" + _T.format(it="v"),
                ELEMENT),
     "array": (GVEC + MAIN + "    var v: Vec<[2]i32> = vec_new<[2]i32>()\n" + _T.format(it="v"),
               UNSUPPORTED),
-    "usize": (GVEC + MAIN + "    var v: Vec<usize> = vec_new<usize>()\n" + _T.format(it="v"),
-              ELEMENT),
     "pointer_to_an_array": ("struct Vec<T>\n    data: *[2]i32\n    len: i64\n\n" + MAIN
                             + "    var v: Vec<i32>\n" + _T.format(it="v"), ELEMENT),
     "pointer_to_void": ("struct Vec<T>\n    data: *void\n    len: i64\n\n" + MAIN
@@ -827,13 +921,9 @@ def test_an_element_ritz1_cant_name_is_refused(compile_with, compiler, name):
     _is_refused(comp, ll, message, program)
 
 
-# Refused for now, at the iterable; ritz0 runs these (#2410, #2411).  `@v` of a
-# reference is on neither ticket: ritz0 refuses it, and `:&` is #2314.
+# Refused for now, at the iterable; ritz0 runs these (#2410).  `@v` of a
+# reference is on no ticket: ritz0 refuses it, and `:&` is #2314.
 REFUSED_HOLDERS = {
-    "generic_struct_field": (GVEC + "struct B<T>\n    k: i32\n    v: Vec<T>\n\n"
-                             "fn f<T>(b: @B<T>) -> i32\n" + _T.format(it="b.v") + "\n" + MAIN
-                             + "    var b: B<i32>\n    b.v = vec_new<i32>()\n"
-                             "    return f<i32>(@b)\n"),
     "deref": GVEC + MAIN + FILL_V + "    var p: *Vec<i32> = @v\n" + _T.format(it="*p"),
     "index": GVEC + MAIN + "    var vs: [2]Vec<i32>\n" + _T.format(it="vs[1]"),
     "addr_of_index": GVEC + MAIN + "    var vs: [2]Vec<i32>\n" + _T.format(it="@vs[1]"),

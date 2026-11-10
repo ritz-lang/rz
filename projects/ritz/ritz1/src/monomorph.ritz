@@ -327,7 +327,7 @@ fn resolve_member_field(m: *Module, e: *Expr) -> *StructField
         return null
     let st: *StructDef = find_concrete_struct(m, sname, sname_len)
     if st == null
-        return null
+        return template_member_field(m, sname, sname_len, e)
     var f: *StructField = st.fields
     while f != null
         if f.name_len == e.ident_len
@@ -335,6 +335,34 @@ fn resolve_member_field(m: *Module, e: *Expr) -> *StructField
                 return f
         f = f.next
     return null
+
+# AGAST #2411: field `e` of `B$i32` before it's specialised (instantiations are
+# collected first): the one-parameter template's field, with a `Vec$T` type
+# rewritten to `Vec$i32`, so `b.v.push(3)` instantiates `vec_push$i32`.  null
+# for anything else.
+fn template_member_field(m: *Module, sname: *u8, sname_len: i32, e: *Expr) -> *StructField
+    let dollar: i32 = find_dollar_sign(sname, sname_len)
+    if dollar <= 0
+        return null
+    let tmpl: *StructDef = find_generic_struct(m, sname, dollar)
+    if tmpl == null or count_type_params(tmpl.type_params) != 1
+        return null
+    var f: *StructField = tmpl.fields
+    while f != null
+        if f.name_len == e.ident_len and memcmp(f.name, e.ident_ptr, e.ident_len as i64) == 0
+            break
+        f = f.next
+    if f == null or f.field_type != TYPE_STRUCT or f.field_type_name == null
+        return null
+    if find_dollar_sign(f.field_type_name, f.field_type_name_len) <= 0
+        return null
+    let out: *StructField = malloc(sizeof(StructField)) as *StructField
+    memcpy(out as *u8, f as *u8, sizeof(StructField))
+    var sub_len: i32 = 0
+    substitute_type_param_in_name(f.field_type_name, f.field_type_name_len, tmpl.type_params.name, tmpl.type_params.name_len, sname + dollar, sname_len - dollar, @out.field_type_name, @sub_len)
+    out.field_type_name_len = sub_len
+    out.next = null
+    out
 
 # The generic UFCS template `<prefix><method>` (vec_/span_) a method call on
 # a Vec/Span receiver of the given kind dispatches to, or null.
@@ -503,10 +531,13 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
     # instantiation.  A lone ASCII capital after `$` is a type parameter —
     # unless the module defines a concrete struct by that name: `Vec<P>` for
     # a user `struct P` mangles to `Vec$P`, the same shape (AGAST #1487).
+    # Or a user `enum C`: `Vec<C>` is `Vec$C` too, and taking it for the
+    # placeholder left `Vec$C` with no struct, so `vec_get<C>` and every
+    # `v.len` on it was `unhandled EXPR_MEMBER` (AGAST #2411).
     if suffix_len == 2
         let ch: i32 = *(suffix + 1) as i32
         if ch >= 65 and ch <= 90
-            if find_concrete_struct(m, suffix + 1, 1) == null
+            if find_concrete_struct(m, suffix + 1, 1) == null and names_concrete_enum(suffix + 1, 1) == 0
                 return
 
     add_struct_instantiation(base_name, base_len, suffix, suffix_len)
@@ -650,6 +681,13 @@ fn substitute_params_in_mangled(tp: *TypeParam, suffix: *u8, starts: *i32, lens:
     *out_len = o
     out
 
+# 1 if (name, len) is a non-generic enum the module declares (AGAST #2411).
+fn names_concrete_enum(name: *u8, len: i32) -> i32
+    let ei: i32 = enum_find(name, len)
+    if ei < 0 or enum_is_generic(ei) == 1
+        return 0
+    1
+
 # Find a non-generic struct by name.
 fn find_concrete_struct(m: *Module, name: *u8, name_len: i32) -> *StructDef
     var st: *StructDef = m.structs
@@ -682,6 +720,15 @@ fn collect_struct_types_from_signature(m: *Module, f: *FnDef)
 fn collect_struct_types_from_fn(m: *Module, f: *FnDef)
     collect_struct_types_from_signature(m, f)
     collect_struct_types_from_stmts(m, f.body)
+
+# AGAST #2411: a specialised struct's by-value fields, `B$usize.v: Vec$usize`:
+# the field's layout must exist even when no fn names it.
+fn collect_struct_types_from_fields(m: *Module, f: *StructField)
+    var cur: *StructField = f
+    while cur != null
+        if cur.field_type == TYPE_STRUCT and cur.field_type_name != null
+            add_struct_from_mangled_name(m, cur.field_type_name, cur.field_type_name_len)
+        cur = cur.next
 
 fn collect_struct_types_from_stmts(m: *Module, body: *Stmt)
     var s: *Stmt = body
@@ -2198,7 +2245,16 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
 
     # Check if field type is the type parameter
     if fields.field_type == TYPE_STRUCT
-        if fields.field_type_name != null and fields.field_type_name_len == type_param_len
+        if fields.field_type_name != null and find_dollar_sign(fields.field_type_name, fields.field_type_name_len) > 0
+            # AGAST #2411: a generic over the parameter, `v: Vec<T>` is
+            # `Vec$T`: rewrite its `$T`, to `Vec$i32`.  It was copied as it
+            # stood, so `B$i32` held a `%Vec$T`, which names no struct, and
+            # `b.v.len` was `unhandled EXPR_MEMBER`.
+            cloned.field_type = fields.field_type
+            var sub_len: i32 = 0
+            substitute_type_param_in_name(fields.field_type_name, fields.field_type_name_len, type_param, type_param_len, suffix, suffix_len, @cloned.field_type_name, @sub_len)
+            cloned.field_type_name_len = sub_len
+        else if fields.field_type_name != null and fields.field_type_name_len == type_param_len
             if memcmp(fields.field_type_name, type_param, type_param_len as i64) == 0
                 # Substitute with concrete type
                 subst_value_field(cloned, subst_type, subst_name, subst_len)
@@ -2466,6 +2522,7 @@ fn specialize_pending_structs(m: *Module, start: i32) -> i32
             if specialized != null
                 specialized.next = m.structs
                 m.structs = specialized
+                collect_struct_types_from_fields(m, specialized.fields)
 
             # Also specialize impl block methods for this struct
             specialize_impl_methods(m, name, name_len, suffix, suffix_len)
