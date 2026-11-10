@@ -18,8 +18,8 @@ The expected exit codes come from what each program says, not from a compiler,
 and all three answer every row. ritz0 used to reuse a specialization the module
 already registered, and had none to reuse without one (#2433).
 
-A nested match is an arm's tail, which is its value (#2429). The types are `Pair`
-and `Slot` because `Option<P>` is never declared (#2432).
+A nested match is an arm's tail, which is its value (#2429). A type whose name is
+one letter is the same case: `Option<P>` went undeclared once (#2432).
 """
 
 import os
@@ -135,6 +135,15 @@ PAYLOADS = {
     "qualified_variant": (_U + _MAIN + "    match Some(Slot.Holds(5))\n        Some(v) =>\n"
                   "            match v\n                Holds(w) => w\n                Vacant => 3\n"
                   "        _ => 2\n", 5),
+    "one_letter_struct": ("struct P\n    a: i32\n    b: i32\n"
+                          + _on("Some(P { a: 2, b: 3 })", "Some(v) => v.a + v.b", "_ => 2"), 5),
+    "one_letter_struct_local": ("struct P\n    a: i32\n    b: i32\n"
+                                + _on("Some(p)", "Some(v) => v.a + v.b", "_ => 2",
+                                      before="let p = P { a: 2, b: 3 }"), 5),
+    "one_letter_enum": ("enum C\n    Holds(i32)\n    Vacant\n" + _MAIN
+                        + "    match Some(C.Holds(5))\n        Some(v) =>\n"
+                        "            match v\n                Holds(w) => w\n"
+                        "                Vacant => 3\n        _ => 2\n", 5),
     "user_enum_local": (_U + _MAIN + "    let u: Slot = Slot.Holds(5)\n    match Some(u)\n        Some(v) =>\n"
                   "            match v\n                Holds(w) => w\n                Vacant => 3\n"
                   "        _ => 2\n", 5),

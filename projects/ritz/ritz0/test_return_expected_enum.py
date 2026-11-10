@@ -636,7 +636,7 @@ def test_ritz1_payload_member_from_call_scrutinee(tmp_path, ritz1_bin, ritz_star
     assert _run("ritz1", tmp_path, "payload_member", PAYLOAD_MEMBER) == 52
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2274: `Option$A` read as a template")
+# AGAST #2274, fixed by #2432: `Option$A` is no template when `struct A` exists.
 def test_ritz1_one_letter_struct_payload(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "one_letter", ONE_LETTER_STRUCT) == 21
 
