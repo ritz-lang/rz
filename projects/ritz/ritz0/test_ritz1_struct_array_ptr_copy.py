@@ -115,6 +115,11 @@ NOT_AN_ELEMENT = {
     "ref_deref_field": "    let r = @q\n    return (*r).b\n",
     "ref_annotated_deref_field": "    let r: **[3]S = @q\n    return (*r).b\n",
     "ref_copy_field": "    let r = @q\n    let p = *r\n    return p.b\n",
+    # #2552: an annotated `@[N]S` / `@&[N]S` local named S as an `@S` local does.
+    "ref_annotated_field": "    let p: @[3]S = @x\n    return p.b\n",
+    "mut_ref_annotated_field": "    let p: @&[3]S = @&x\n    return p.b\n",
+    "mut_ref_annotated_store_field": "    let p: @&[3]S = @&x\n    p.b = 4\n    return 0\n",
+    "ref_annotated_copy_field": "    let p: @[3]S = @x\n    let p2 = p\n    return p2.b\n",
 }
 
 
@@ -150,12 +155,9 @@ PARAM_TYPES = {"ptr": "*[3]S", "ref": "@[3]S", "mut_ref": "@&[3]S"}
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("pty", sorted(PARAM_TYPES))
 @pytest.mark.parametrize("name", sorted(PARAM_NOT_AN_ELEMENT))
-def test_struct_array_pointer_param_is_not_its_element(request, run_with, name, pty, compiler):
+def test_struct_array_pointer_param_is_not_its_element(run_with, name, pty, compiler):
     if pty == "ref" and name == "param_store_field":
         pytest.skip("an `@[N]S` can't be stored through either way")
-    if name == "param_copy_annotated_field" and pty != "ptr" and compiler != "ritz0":
-        # The local `p: @[3]S` / `p: @&[3]S` names S as an `@S` local does.
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2552"))
     ty = PARAM_TYPES[pty]
     program = (
         _S
@@ -165,6 +167,32 @@ def test_struct_array_pointer_param_is_not_its_element(request, run_with, name, 
     )
     with pytest.raises(AssertionError, match=f"failed on {name}_{pty}"):
         run_with(compiler, f"{name}_{pty}", program)
+
+
+# AGAST #2552: an annotated `@[N]S` / `@&[N]S` local keeps its element paths
+# once S is out of its type_name: `p[i].f` reads, stores and compound stores,
+# and through `let p2 = p`.  An `@[3]S` is read-only, so it runs the reads.
+_READS = """\
+    if p[1].b != 5
+        return 1
+    if p[2].a + p[0].b != 9
+        return 2
+    let p2 = p
+    if p2[2].b != 11
+        return 7
+    return 0
+"""
+
+ANNOTATED_LOCALS = {"ref": "    let p: @[3]S = @x\n", "mut_ref": "    let p: @&[3]S = @&x\n"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("pty", sorted(ANNOTATED_LOCALS))
+def test_annotated_ref_array_local_elements(run_with, pty, compiler):
+    checks = _CHECKS if pty == "mut_ref" else _READS
+    program = _S + "pub fn main() -> i32\n" + _FILL + ANNOTATED_LOCALS[pty] + checks
+    assert run_with(compiler, f"annotated_local_elements_{pty}", program) == 0
 
 
 # A method's params bind on their own path (emitter.ritz, the impl loop).
@@ -236,6 +264,9 @@ def _whole_program(holder: str, op: str) -> str:
     if holder == "local_copy":
         return (_S + _FNS + "pub fn main() -> i32\n" + _X
                 + "    var q: *[3]S = @x\n    let p = q\n" + body.replace("P", "p"))
+    if holder == "mut_ref_local":   # #2552
+        return (_S + _FNS + "pub fn main() -> i32\n" + _X
+                + "    let p: @&[3]S = @&x\n" + body.replace("P", "p"))
     ty = "@&[3]S" if holder.startswith("mut_ref") else "*[3]S"
     copy = holder.endswith("_copy")
     return (_S + _FNS + f"fn f(q: {ty}) -> i32\n"
@@ -246,11 +277,11 @@ def _whole_program(holder: str, op: str) -> str:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("holder", ["param", "param_copy", "mut_ref_param", "local_copy"])
+@pytest.mark.parametrize("holder", ["param", "param_copy", "mut_ref_param", "local_copy", "mut_ref_local"])
 @pytest.mark.parametrize("op", sorted(WHOLE_OPS))
 def test_struct_array_pointer_whole(request, run_with, op, holder, compiler):
-    if op == "row_arith" and holder == "mut_ref_param" and compiler != "ritz0":
-        # `q + k` on any `@&[N]T` param emits IR clang rejects.
+    if op == "row_arith" and holder.startswith("mut_ref") and compiler != "ritz0":
+        # `q + k` on any `@&[N]T` param or local emits IR clang rejects.
         request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2554"))
     assert run_with(compiler, f"whole_{op}_{holder}", _whole_program(holder, op)) == 6
 
