@@ -732,6 +732,31 @@ fn total(xs: Span<u8>) -> i64
 
 `Span<T>` is a fat pointer: `(*T, len)`.
 
+`[T]` is sugar for `Span<T>`. It names the same type, not a second one with the
+same shape, so either spelling fits wherever the other does: a parameter, a
+return type, a local, a struct field, or a type argument (`Option<[u8]>`,
+`Result<[u8], E>`). The size is what tells the two bracket forms apart: `[N]T` is
+an array (§3.3), `[T]` a span.
+
+```ritz
+import ritzlib.span
+
+fn head(s: [u8], n: i64) -> Span<u8>
+    s[0..n]
+
+fn first(s: Span<u8>) -> Option<[u8]>
+    if s.len == 0
+        return None
+    Some(head(s, 1))
+
+fn main() -> i32
+    let a: [3]u8 = [7, 8, 9]
+    let h: [u8] = head(@a, 2)
+    match first(h)
+        Some(f) => f[0] as i32
+        None => 0
+```
+
 `a[lo..hi]` slices a `Vec`, `Span` or `String`: elements `lo` up to but not
 including `hi`, and `a[lo..=hi]` includes `hi`. A slice of a `Span` is a `Span`
 over the same elements, so a write through it lands in `a`. A slice of a `Vec` or

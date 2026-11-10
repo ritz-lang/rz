@@ -79,10 +79,13 @@ _RITZ1_TWINS = {
     "test_trait_bounds":
         "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "
         "(multi-arg generic calls)",
+    # `[T]` parses since #1614; these stop later now.
     "test_issue_slice_generic_payload":
-        "AGAST #1614 — slice type `[T]` (ritz0-only sugar)",
+        "AGAST #2572 — `Some(s[lo..hi])` payload stored as i64; also AGAST "
+        "#2573 (slice of a match-pattern binding)",
     "test_issue_slice_generic_siblings":
-        "AGAST #1614 — `[T]`; also AGAST #1615 (2.5f32), #1616 (empty [])",
+        "AGAST #1615 (2.5f32); also AGAST #2501 (a Vec slice into a Span / "
+        "`[u8]` payload), #1616 (empty [])",
     "test_issue_struct_enum_variants":
         "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "
         "patterns",
