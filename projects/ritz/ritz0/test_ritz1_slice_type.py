@@ -140,8 +140,9 @@ pub fn main() -> i32
     let v: [u8] = @b
     return count(@v) as i32
 """, 5),
-    # Generic arguments. The payload is a name or a call; a range slice
-    # written straight into `Some(..)` / `Ok(..)` is #2572 (the next rows).
+    # Generic arguments. The payload is a name or a call here; the
+    # `*_payload` rows write a range slice straight into `Some(..)` / `Ok(..)`
+    # (#2572; test_slice_variant_payload.py covers every box and ctor).
     "option_arg": (CROSS + """\
 fn pick(s: [u8], ok: bool) -> Option<[u8]>
     if ok
@@ -243,8 +244,6 @@ RITZ1_GAPS = {
     "local_from_array": "AGAST #2502 — `@array` into a Span local emits invalid IR",
     "struct_field_from_array": "AGAST #2502 — `@array` into a Span field",
     "through_pointer_from_array": "AGAST #2502 — `@array` into a Span local",
-    "option_payload": "AGAST #2572 — `Some(s[lo..hi])` stores the Span as i64",
-    "result_payload": "AGAST #2572 — `Ok(s[lo..hi])` stores the Span as i64",
 }
 
 

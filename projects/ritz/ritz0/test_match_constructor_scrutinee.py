@@ -103,6 +103,9 @@ PAYLOADS = {
                                    before="var p = Pair { a: 2, b: 3 }\nlet q: *Pair = @p"), 5),
     "method_i32": (_T + _on("Some(t.n())", "Some(v) => v", "_ => 2", before=_T_LOCAL), 5),
     "method_u8": (_T + _on("Some(t.u())", "Some(v) => v as i32", "_ => 2", before=_T_LOCAL), 200),
+    # #2572: the method's struct return names it, as `struct_call`'s does.
+    "method_struct": (_T + _on("Some(t.m())", "Some(v) => v.a + v.b", "_ => 2",
+                               before=_T_LOCAL), 5),
     "field_i32": (_T + _on("Some(t.x)", "Some(v) => v", "_ => 2", before=_T_LOCAL), 5),
     "field_f32": (_T + _on("Some(t.f)", "Some(v) => (v * 2.0) as i32", "_ => 2",
                            before=_T_LOCAL), 5),
@@ -232,7 +235,6 @@ UNNAMED = {
     "nested_ok": _on("Ok(Err(5))", "Ok(v) => 1", "_ => 2"),
     "pointer_to_pointer": _on("Some(q)", "Some(v) => 1", "_ => 2",
                               before="var x: i32 = 5\nvar p: *i32 = @x\nlet q: **i32 = @p"),
-    "method_struct": _T + _on("Some(t.m())", "Some(v) => 7", "_ => 2", before=_T_LOCAL),
     "element_struct": _P + _on("Some(a[1])", "Some(v) => 7", "_ => 2", before="var a: [2]Pair"),
     "deref_struct": _P + _on("Some(*p)", "Some(v) => 7", "_ => 2",
                              before="var x = Pair { a: 2, b: 3 }\nlet p: *Pair = @x"),
