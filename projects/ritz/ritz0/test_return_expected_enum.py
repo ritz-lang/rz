@@ -408,13 +408,13 @@ RITZ0_ONLY = {
     "closure_return": (CLOSURE_RETURN, 4),
     "closure_block_arm_return": (CLOSURE_BLOCK_ARM_RETURN, 4),
     "call_arg_arm": (CALL_ARG_ARM, 12),
-    "generic_fn": (GENERIC_FN, 8),  # ritz1: AGAST #2275
 }
 
 WHOLE_PROGRAMS = {
     "sret_return": (SRET_RETURN, 11),
     "option_return": (OPTION_RETURN, 25),
     "method": (METHOD, 9),
+    "generic_fn": (GENERIC_FN, 8),  # ritz1 since AGAST #2418 (was #2275)
 }
 
 # The second symptom's shape, in both orders. `ritzlib.result` is what routes
@@ -641,7 +641,7 @@ def test_ritz1_one_letter_struct_payload(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "one_letter", ONE_LETTER_STRUCT) == 21
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2275: `T` left in `Option<T>`")
+# AGAST #2275, fixed by #2418: `o: Option<T>` was defined as `%Option$T`.
 def test_ritz1_generic_enum_signature(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "generic_sig", GENERIC_ENUM_SIGNATURE) == 7
 

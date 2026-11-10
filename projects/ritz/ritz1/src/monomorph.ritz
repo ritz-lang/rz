@@ -1482,12 +1482,20 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
             cloned.param_type_name_len = arr_len
 
     # Handle struct type name substitution for TYPE_STRUCT
-    if cloned.param_type == TYPE_STRUCT
-        if cloned.param_type_name != null and cloned.param_type_name_len == type_param_len
-            if memcmp(cloned.param_type_name, type_param, type_param_len as i64) == 0
-                cloned.param_type = subst_type
-                cloned.param_type_name = subst_name
-                cloned.param_type_name_len = subst_len
+    if cloned.param_type == TYPE_STRUCT and cloned.param_type_name != null
+        if cloned.param_type_name_len == type_param_len and memcmp(cloned.param_type_name, type_param, type_param_len as i64) == 0
+            cloned.param_type = subst_type
+            cloned.param_type_name = subst_name
+            cloned.param_type_name_len = subst_len
+        else
+            # AGAST #2418: a by-value `o: Option<T>` / `r: Result<T, E>` /
+            # `p: Pair<T>` is named "Option$T" etc.  It kept that name, so
+            # `f<i32>` was defined with a `%Option$T` argument.
+            var by_name: *u8 = null
+            var by_len: i32 = 0
+            substitute_type_param_in_name(cloned.param_type_name, cloned.param_type_name_len, type_param, type_param_len, suffix, suffix_len, @by_name, @by_len)
+            cloned.param_type_name = by_name
+            cloned.param_type_name_len = by_len
 
     # Handle pointer/reference-to-struct type name substitution (e.g., *Vec<T> -> *Vec$u8, @&Vec<T> -> @&Vec$u8)
     if (cloned.param_type == TYPE_PTR or cloned.param_type == TYPE_REF or cloned.param_type == TYPE_MUT_REF) and cloned.param_type_name != null
@@ -1643,6 +1651,16 @@ fn substitute_type_param_in_name(name: *u8, name_len: i32, type_param: *u8, type
                 *out_name = result
                 *out_len = new_len
                 return
+
+    # AGAST #2418: T as an inner component, `Result$T$i32` at T = i32 is
+    # `Result$i32$i32` (one-parameter fn over `Result<T, i32>`).
+    if new_suffix_len > 0 and find_dollar_sign(name, name_len) >= 0
+        var hit_len: i32 = name_len
+        let hit: *u8 = replace_param_component(name, name_len, type_param, type_param_len, new_suffix, new_suffix_len, @hit_len)
+        if hit != name
+            *out_name = hit
+            *out_len = hit_len
+            return
 
     # If the name doesn't have $T pattern, it might be a bare struct name like "Vec"
     # that needs the suffix appended (for @&Vec<T> parameters).  Only a generic
