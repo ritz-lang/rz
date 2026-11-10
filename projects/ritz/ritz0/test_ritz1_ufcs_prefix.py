@@ -53,7 +53,8 @@ import emitter_llvmlite
 
 from ritz0_inproc import run_ritz0
 
-RITZ1_CALL_SRC = RITZ_ROOT / "ritz1" / "src" / "emitter_expr_call.ritz"
+# ast_helpers, so monomorph shares it with the emitter (AGAST #2575).
+RITZ1_CALL_SRC = RITZ_ROOT / "ritz1" / "src" / "ast_helpers.ritz"
 
 # The ticket's repro, on the post-#1474 API (push_str takes a StrView).
 REPRO = """\

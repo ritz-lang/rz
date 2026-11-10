@@ -34,6 +34,7 @@ from dataclasses import dataclass
 import copy
 import dataclasses
 import ritz_ast as rast
+from ufcs import UFCS_NON_GENERIC_PREFIXES
 
 
 def map_child_nodes(node, on_expr, on_stmt, on_type):
@@ -750,6 +751,19 @@ class Monomorphizer:
         vec_slice<T>, substituted at the receiver's type args) and methods of
         a user impl block on the receiver's struct (generic or not).
         """
+        # AGAST #2575: a static-style call on a non-generic ritzlib type with
+        # no impl method, `String.from(x)`, is the free fn `string_from(x)`
+        # (the emitter's #1321 fallback), so `var t = String.from(..)` is a
+        # String and `t.data.push(..)` registers vec_push<u8>.  A binding of
+        # that name is a value, not the type.
+        if (isinstance(expr.expr, rast.Ident)
+                and expr.expr.name in UFCS_NON_GENERIC_PREFIXES
+                and expr.expr.name not in self.var_types
+                and expr.method not in self.impl_methods.get(expr.expr.name, {})):
+            free = self.fn_signatures.get(
+                UFCS_NON_GENERIC_PREFIXES[expr.expr.name] + expr.method)
+            if free is not None:
+                return free.ret_type
         recv_type = self._infer_value_type(expr.expr)
         while isinstance(recv_type, (rast.PtrType, rast.RefType)):
             recv_type = recv_type.inner

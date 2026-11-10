@@ -218,8 +218,19 @@ fn init_local_var_tracker()
     g_lv_initialized = 1
     g_lv_count = 0
 
+# AGAST #2575: 1 once a param or local of the fn being walked is named like a
+# non-generic UFCS type (`let String = 5`): its `String.new()` is a method on
+# that value, which ritz0 refuses, so rewrite_static_ufcs_call leaves it be.
+var g_ufcs_shadowed: i32 = 0
+
 fn reset_local_var_tracker()
     g_lv_count = 0
+    g_ufcs_shadowed = 0
+
+fn note_ufcs_shadow(name: *u8, name_len: i32)
+    var pl: i32 = 0
+    if ufcs_non_generic_prefix(name, name_len, @pl) != null
+        g_ufcs_shadowed = 1
 
 fn add_local_var(name: *u8, name_len: i32, prefix_kind: i32, suffix: *u8, suffix_len: i32)
     if g_lv_count >= g_lv_cap
@@ -284,6 +295,7 @@ fn track_typed_local(name: *u8, name_len: i32, type_kind: i32, type_name: *u8, t
 # itself (not `**T`) is marked as one, so `p[lo..hi]` can slice what it points
 # at (AGAST #2448).  `pointee` is the param's or let's pointee type.
 fn track_typed_local_through(name: *u8, name_len: i32, type_kind: i32, pointee: i32, type_name: *u8, type_name_len: i32)
+    note_ufcs_shadow(name, name_len)   # every param comes through here (AGAST #2575)
     let before: i32 = g_lv_count
     track_typed_local(name, name_len, type_kind, type_name, type_name_len)
     if g_lv_count == before or pointee != TYPE_STRUCT
@@ -837,6 +849,8 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
             if slice_into_span_annotation(s) == 1
                 g_slice_kept = s.var_init
             rewrite_value_slice(m, s.var_init)
+            rewrite_static_ufcs_call(m, s.var_init)   # AGAST #2575
+        note_ufcs_shadow(s.var_name, s.var_name_len)
         # Check if variable type is a generic struct — by value or behind a
         # pointer/reference (`var v: *Vec<u8>` needs Vec$u8 just the same).
         if s.var_type_name != null
@@ -973,6 +987,55 @@ fn rewrite_enum_from_call(m: *Module, e: *Expr)
     e.call_type_suffix = null
     e.call_type_suffix_len = 0
     e.left = null
+
+# AGAST #2575: rewrite the static-style call `String.from(x)` in place into
+# the UFCS free fn `string_from(x)`, arguments unchanged, as ritz0 lowers it
+# (#1321).  Only for a non-generic ritzlib type (ufcs_non_generic_prefix),
+# only when that fn exists, and never over an impl method of the same name or
+# a param or local named like the type (g_ufcs_shadowed).  A global of that
+# name doesn't shadow it, in ritz0 either.  As a plain call, `let s =
+# String.new()` is typed by its callee's return like `let s = string_new()`.
+# Anything else is left to emit_expr_method, which refuses it.
+fn rewrite_static_ufcs_call(m: *Module, e: *Expr)
+    if e.kind != EXPR_METHOD or e.left == null or e.left.kind != EXPR_IDENT
+        return
+    let tn: *u8 = e.left.ident_ptr
+    let tn_len: i32 = e.left.ident_len
+    var pfx_len: i32 = 0
+    let pfx: *u8 = ufcs_non_generic_prefix(tn, tn_len, @pfx_len)
+    if pfx == null
+        return
+    if g_ufcs_shadowed == 1
+        return
+    if impl_has_method(m, tn, tn_len, e.ident_ptr, e.ident_len) == 1
+        return
+    let len: i32 = pfx_len + e.ident_len
+    let name: *u8 = malloc(len as i64 + 1)
+    memcpy(name, pfx, pfx_len as i64)
+    memcpy(name + pfx_len, e.ident_ptr, e.ident_len as i64)
+    *(name + len) = 0
+    if find_fn_in_module(m, name, len) == null
+        free(name)
+        return
+    e.kind = EXPR_CALL
+    e.func_name = name
+    e.func_name_len = len
+    e.call_type_suffix = null
+    e.call_type_suffix_len = 0
+    e.left = null
+
+# 1 when an impl of `tn` (any, generic or not) has a method `meth`.
+fn impl_has_method(m: *Module, tn: *u8, tn_len: i32, meth: *u8, meth_len: i32) -> i32
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if buf_eq(ib.type_name, ib.type_name_len, tn, tn_len) == 1
+            var f: *FnDef = ib.methods
+            while f != null
+                if buf_eq(f.name, f.name_len, meth, meth_len) == 1
+                    return 1
+                f = f.next
+        ib = ib.next
+    return 0
 
 # AGAST #2451: `v[lo..hi]` on a Vec, Span or String local (the value, not a
 # pointer to one) is rewritten in place into `v.slice(lo, hi)`, ritz0's lowering
@@ -1113,6 +1176,7 @@ fn collect_from_expr(m: *Module, e: *Expr)
         return
 
     rewrite_enum_from_call(m, e)
+    rewrite_static_ufcs_call(m, e)   # AGAST #2575
     rewrite_value_slice(m, e)
     let k: i32 = e.kind
 
@@ -2031,9 +2095,11 @@ fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, s
         cloned.ident_len = e.ident_len
         cloned.args = clone_expr_list(e.args, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         # A generic body is never walked by collect_from_expr, so its
-        # specialisation is where `E.from(...)` becomes `E__from(...)`.
+        # specialisation is where `E.from(...)` becomes `E__from(...)`, and
+        # `String.from(..)` `string_from(..)`.
         if g_mono_module != null
             rewrite_enum_from_call(g_mono_module, cloned)
+            rewrite_static_ufcs_call(g_mono_module, cloned)   # AGAST #2575
     else if k == EXPR_CAST
         cloned.cast_array = null   # AGAST #2343: `[N]T` keeps T's own name; left unjudged
         # Parser stores operand in e.left, not e.operand

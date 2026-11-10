@@ -4099,6 +4099,51 @@ fn ptr_levels_of(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8, ou
         *out_len = name_len
     return levels
 
+# AGAST #2575: the struct S when `x` is pointer arithmetic on a `*S`: `y + k`
+# or `y - k` down the left spine (as ptr_arith_elem_size reads a chain),
+# rooted in a call returning `*S` (`vec_as_ptr<E>(@v) + 1`, `mkp() + 1`) or a
+# `*S` local or param (`p + 1`).  Writes the name and returns 1, else 0.  An
+# un-annotated `let e = <x>` takes `*S` from it, as if annotated; it was an
+# i64, so `e.b` was "unhandled EXPR_MEMBER" and `@e.b` "cannot take address".
+# A scalar pointee isn't asked for: emit_var_decl already sized those.
+fn ptr_arith_struct_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    if x == null or x.kind != EXPR_BINARY or (x.op != OP_ADD and x.op != OP_SUB)
+        return 0
+    # `q - p` of two pointers is a count, not a pointer.
+    if x.op == OP_SUB and (ptr_arith_elem_size(s, x.right) != 0 or ptr_root_struct(s, x.right, out_name, out_len) == 1)
+        *out_name = null
+        *out_len = 0
+        return 0
+    if x.left.kind == EXPR_BINARY
+        return ptr_arith_struct_pointee(s, x.left, out_name, out_len)
+    ptr_root_struct(s, x.left, out_name, out_len)
+
+# The struct S when `x` is a call returning `*S` or a `*S` local or param.
+fn ptr_root_struct(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if x.kind == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, x)
+        if fd == null or fd.return_type != TYPE_PTR
+            return 0
+        name = fd.return_type_name
+        name_len = fd.return_type_name_len
+    else if x.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+        if loc == null or loc.var_type != TYPE_PTR
+            return 0
+        name = loc.type_name
+        name_len = loc.type_name_len
+    else
+        return 0
+    if name == null or name_len == 0 or find_struct(s, name, name_len) == null
+        return 0
+    *out_name = name
+    *out_len = name_len
+    1
+
 # AGAST #2376: `@a[i]` points at an element that is itself a pointer: a `**U`
 # for `a: [N]*U`, one level more than the element for `a: [N]**U`.  0 for any
 # other element, which isn't a pointer to pointer.
