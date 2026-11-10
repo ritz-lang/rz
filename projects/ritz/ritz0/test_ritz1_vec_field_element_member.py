@@ -234,12 +234,10 @@ NESTED = {
 }
 
 # ritz0 can't index `o.ts[i].edges` (#2567); the values above are worked by hand.
-# ritz1 refuses `a[i].edges[j]` (#2566): a field of a by-value array element has no
-# StructField in member_field_def, so taking it strode `a[i].edges.data` by bytes.
+# `a[i].edges[j]` was refused on ritz1 until member_field_def typed a field of a
+# by-value array element (#2566); test_ritz1_array_elem_field_type.py has the rest.
 _NESTED_XFAIL = {
     ("vec_of_t", "ritz0"): "#2567: ritz0 crashes, 'Cannot index type: Vec$E'",
-    ("array_of_t", "ritz1"): "#2566: refused, unhandled EXPR_MEMBER",
-    ("array_of_t", "ritz1_selfhosted"): "#2566: refused, unhandled EXPR_MEMBER",
 }
 
 
