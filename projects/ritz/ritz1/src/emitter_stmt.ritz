@@ -3582,6 +3582,28 @@ fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt, out_name: **u8, out_len: *i32)
     if *out_name == null
         call_result_struct_name(s, e, out_name, out_len)
 
+# AGAST #2563: the phi type a statement-`if` arm of struct type `agg` asks
+# for.  The Span$u8 / StrView pair (layout-equal, #168) takes the fn's return
+# type when that is one of the two, since a tail `if` feeds the implicit
+# `ret`: a `"..."` arm is a %Span$u8 (#98) but a `-> StrView` fn returns
+# %StrView.  Any other type is `agg` itself.
+fn if_stmt_phi_type(s: *EmitterState, agg: *u8, agg_len: i32, ret_type: i32, out_name: **u8, out_len: *i32)
+    *out_name = agg
+    *out_len = agg_len
+    if agg == null or agg_len <= 0 or ret_type != TYPE_STRUCT or s.ret_type_name_len <= 0
+        return
+    if is_layout_equiv_pair(agg, agg_len, s.ret_type_name, s.ret_type_name_len) == 1
+        *out_name = s.ret_type_name
+        *out_len = s.ret_type_name_len
+
+# AGAST #2563: rebuild a statement-`if` arm's value `reg` of type `agg` as
+# the phi's type when they are the Span$u8 / StrView pair, in the arm's own
+# block before its `br` (as emit_match_arm_body does, #1662).
+fn if_stmt_arm_settle(s: *EmitterState, reg: i32, agg: *u8, agg_len: i32, phi: *u8, phi_len: i32) -> i32
+    if reg > 0 and is_layout_equiv_pair(agg, agg_len, phi, phi_len) == 1
+        return rebuild_layout_equiv(s, reg, agg, agg_len, phi, phi_len)
+    reg
+
 # AGAST #2158: the move check and drop insertion (ownership.ritz) wrap every
 # statement.  The check runs first, so a statement's moves clear their drop
 # flags before it executes; `x = v` drops x's old value once v is stored.
@@ -3798,7 +3820,13 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # produced in a block nested inside the then-arm, which the insertion
         # point has since left, is reported as "no value" instead of being
         # falsely attributed to `then_exit_label` below.
-        let then_result: i32 = last_expr_here(s)  # Capture then branch result
+        var then_result: i32 = last_expr_here(s)  # Capture then branch result
+        # AGAST #2563: a Span$u8 / StrView arm takes the phi's type here.
+        var then_phi: *u8 = null
+        var then_phi_len: i32 = 0
+        if_stmt_phi_type(s, then_agg, then_agg_len, ret_type, @then_phi, @then_phi_len)
+        if stmt.if_else != null
+            then_result = if_stmt_arm_settle(s, then_result, then_agg, then_agg_len, then_phi, then_phi_len)
         let then_exit_label: i32 = s.current_label  # Capture actual exit block
         emit_str(s, c"  br label %")
         emit_label(s, end_label)
@@ -3820,6 +3848,16 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
             own_else_dead = own_pop_scope(s)
             else_result = last_expr_here(s)  # Capture else branch result
+            # AGAST #2563: the phi's type is the then-arm's when it has one.
+            var else_phi: *u8 = null
+            var else_phi_len: i32 = 0
+            if_stmt_phi_type(s, else_agg, else_agg_len, ret_type, @else_phi, @else_phi_len)
+            if then_phi != null and then_phi_len > 0
+                else_phi = then_phi
+                else_phi_len = then_phi_len
+            else_result = if_stmt_arm_settle(s, else_result, else_agg, else_agg_len, else_phi, else_phi_len)
+            else_agg = else_phi
+            else_agg_len = else_phi_len
             else_exit_label = s.current_label  # Capture actual exit block
             emit_str(s, c"  br label %")
             emit_label(s, end_label)
@@ -3843,9 +3881,9 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             if ret_type == TYPE_STRUCT and s.ret_type_name_len > 0 and is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1
                 phi_agg = s.ret_type_name
                 phi_agg_len = s.ret_type_name_len
-            else if then_agg != null and then_agg_len > 0
-                phi_agg = then_agg
-                phi_agg_len = then_agg_len
+            else if then_phi != null and then_phi_len > 0
+                phi_agg = then_phi
+                phi_agg_len = then_phi_len
             else if else_agg != null and else_agg_len > 0
                 phi_agg = else_agg
                 phi_agg_len = else_agg_len
