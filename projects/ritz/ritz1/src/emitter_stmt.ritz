@@ -121,6 +121,18 @@ fn array_ptr_ptr_deref_base(s: *EmitterState, e: *Expr) -> *LocalVar
         return null
     loc
 
+# AGAST #2555: the shape of the N-D local, global or field that `e`, an index
+# chain one short of its rank, takes a row of, or null.  `let q = @x[i]` with
+# `x: [M][N]T` (or `@x[i][j]` of `[L][M][N]T`) holds an `@[N]T`, as the
+# annotated `let q: @[N]T = @x[i]` does.  It recorded no N or T: `q + 1` strode
+# a byte and `r[1]` loaded an i8, SILENT, and `q[1]` was "unlowerable".
+fn nd_row_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, e, @depth)
+    if sh == null or depth != sh.rank - 1
+        return null
+    sh
+
 fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     if stmt.var_declared_type == TYPE_VOID and stmt.var_init != null
         # AGAST #2329: `let q = h(p)`, `let q = h.r` and `let q = g` hold what they
@@ -158,7 +170,12 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
         kind = TYPE_REF
         if init.op == OP_ADDR_MUT
             kind = TYPE_MUT_REF
-        if oper.kind == EXPR_MEMBER
+        let row: *ArrayShape = nd_row_shape(s, oper)   # #2555: `@x[i]`
+        if row != null
+            size = row.dims[row.rank - 1]
+            elem = row.leaf_type
+            stmt.var_pointee_array_elem_pointee = row.leaf_pointee
+        else if oper.kind == EXPR_MEMBER
             let fld: *StructField = resolve_member_chain_field(s, oper)
             if fld != null and fld.field_type == TYPE_ARRAY
                 size = fld.array_size
@@ -205,6 +222,10 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, out_len: *i32) -> *u8
     if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT) or init.operand == null
         return null
     let oper: *Expr = init.operand
+    let row: *ArrayShape = nd_row_shape(s, oper)   # #2555: `@x[i]`
+    if row != null
+        *out_len = row.leaf_name_len
+        return row.leaf_name
     if oper.kind == EXPR_MEMBER
         let fld: *StructField = resolve_member_chain_field(s, oper)
         if fld != null and fld.field_type == TYPE_ARRAY

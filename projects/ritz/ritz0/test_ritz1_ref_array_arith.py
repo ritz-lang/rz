@@ -53,15 +53,10 @@ HOLDERS = {
     "mut_ref_inferred_row": "local:=@&x[0]",
 }
 
-# AGAST #2555: an inferred `let q = @x[0]` on a 2-D array records no row type,
-# so `q + 1` strides a byte and `r[1]` loads an i8 (silent), and a struct `r[1].b`
-# is refused.  Annotated, it's right.
-INFERRED_ROW = {"ref_inferred_row", "mut_ref_inferred_row"}
-
-# AGAST #2556: an annotated `let q: *[3]S = @x[0]` on a 2-D struct array names
-# no S, so `q + 1` has no row size (and `q[1].b` is refused too).  Loud.  The
-# `@[3]S` / `@&[3]S` annotations and the scalar `*[3]i32` one are right.
-STRUCT_PTR_ROW = {("struct", "ptr_local")}
+# AGAST #2555: an inferred `let q = @x[0]` on a 2-D array recorded no row type,
+# so `q + 1` strode a byte and `r[1]` loaded an i8 (silent).  It now holds an
+# `@[3]T`, and S for a struct row, which also names S for an annotated
+# `let q: *[3]S = @x[0]` (#2556).  More rows: test_ritz1_inferred_row_let.py.
 
 
 def _fill(elem: str, flat: bool) -> str:
@@ -103,11 +98,7 @@ CASES = [(e, h, k) for e in sorted(ELEMS) for h in sorted(HOLDERS)
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("elem,holder,k", CASES)
-def test_reference_row_arith(request, run_with, elem, holder, k, compiler):
-    if holder in INFERRED_ROW and compiler != "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2555"))
-    if (elem, holder) in STRUCT_PTR_ROW and compiler != "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2556"))
+def test_reference_row_arith(run_with, elem, holder, k, compiler):
     name = f"{elem}_{holder}_{k}"
     assert run_with(compiler, name, _program(elem, holder, k)) == VALUES[k]
 
