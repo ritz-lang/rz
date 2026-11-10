@@ -21,10 +21,13 @@ Repeat until the goal is met:
    `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
    and queue any REAP whose SHA is not on `origin/main`, not already in the
    scratchpad, and not already superseded by a newer REAP from the same room.
-2. **Fill the free slots.** **At most 2 rooms** at a time (user limit,
-   2026-10-24: 4 parallel rooms kill WSL with OOM from agents plus their
-   builds and gates). Never exceed 2, survey rooms included. Spawn a new
-   room only when a running one has merged or been paused.
+2. **Fill the free slots.** Slots are **per host** (see "Hosts"): omegalisk
+   has **2** (user limit, 2026-10-24: 4 parallel rooms kill WSL with OOM
+   from agents plus their builds and gates), and each remote host has the
+   number in its row. Only hosts marked **ready** count. Never exceed a
+   host's slots, survey rooms included. Spawn a new room only when a room
+   on that host has merged or been paused. Fill omegalisk first; a remote
+   host takes a room only when omegalisk is full.
    - **`rz-larb` (LARB retrospective, #1800) has given up its slot**
      (Aaron, 2026-10-25, after its three reviews merged), so both slots go
      to ritz task rooms. Its unit is stopped and its worktree and branch are
@@ -42,7 +45,8 @@ Repeat until the goal is met:
      disabled (`systemctl --user disable --now adele-agent@ritz-task-<id>`) but
      whose worktree still exists is paused, not finished. Resume it
      (`enable --now`, then a message stating `main` and its last state) before
-     spawning anything new.
+     spawning anything new. Remote hosts have no pause verb yet; a remote
+     room runs until it merges or is torn down.
    - Otherwise pick `ready` AGAST tickets that move the current milestone
      forward (see "Where to start"), up to the limit.
    - Don't run two rooms that will rewrite the same heavily edited file
@@ -58,6 +62,10 @@ Repeat until the goal is met:
    to a nudge. Run `systemctl --user restart adele-agent@ritz-task-<id>`,
    then send it that nudge. It picks up the current token at startup. Never
    merge a commit the room hasn't REAPed, even with a passing gate log.
+   **Remote rooms:** you can't read their journal or git dir. Send `STATUS`
+   to the host room (see "Hosts") and judge from its last journal line per
+   room. A room that isn't working gets `RESTART ritz-task-<id>` sent to the
+   host room, then the same nudge sent to the room itself.
 4. **No tickets for the milestone?** Spawn a **survey room**: it measures the
    milestone, files one AGAST ticket per defect found, and REAPs with only its
    notes (or no commit at all; see "Survey rooms").
@@ -65,14 +73,55 @@ Repeat until the goal is met:
    prompt `/rz-iterate`). REAP messages arrive with `ask_claude=True` and wake
    the room sooner.
 
-Each turn, the report to the user is short: what merged, what's running,
-what's queued. No long write-ups.
+Each turn, the report to the user is short: what merged, what's running
+(and on which host), what's queued. No long write-ups.
+
+## Hosts
+
+Rooms run on omegalisk (this machine) or on a remote host (project Borque,
+AGAST #2609). This room stays the only coordinator, and the reap queue
+stays here; remote hosts only run rooms.
+
+| Host | Host room | Ritz slots | Ready | Notes |
+|---|---|---|---|---|
+| omegalisk | (local: `systemctl`, `git worktree`) | 2 | yes | 12 cores, 15 GB, WSL |
+| starbux | `adele-starbux` | 1 | no | 8 cores, 14 GB. Host agent not connected (#2607); no `llvmlite` or `lld`, suspends when idle, no linger (#2608) |
+| toffee | `adele-toffee` | 1 | no | 8 cores, 14 GB. Host agent not connected (#2607); no `llvmlite`, suspends when idle, no linger (#2608) |
+| chungus | `adele-chungus` | 1 | no | 8 cores, 14 GB, ~5 GB free with a Minecraft server running. Host agent not connected (#2607); no `llvmlite` or `lld`, no linger (#2608) |
+
+- **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
+  changes its slots. Edit this table and commit it on `main` when they do.
+  A host's first room is a small, low-risk ticket.
+- **One gate per host.** `run-gate.sh` locks slots under the host's own
+  `~/dev/ritz-lang/gate-logs`, so a remote gate never waits on omegalisk's
+  gate.
+- **Which host a room is on is recorded in AGAST, in the claim's agent
+  name:** `ritz-task-<id>` on omegalisk, `ritz-task-<id>@<host>` on a remote
+  host. To see what's running where, list `executing` tickets and read
+  `assigned_agent`. Never record hosts in the scratchpad.
+- **Host room verbs** (always `send_room_message(room_id="adele-<host>",
+  ..., sender_name="rz", ask_claude=True)`):
+  - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz model=opus`, then
+    the briefing. The host answers `SPAWNED ritz-task-<id> on <host>` or
+    `SPAWN-FAILED ritz-task-<id> on <host>: <reason>`.
+  - `RESTART ritz-task-<id>`: restarts a room that isn't working.
+  - `TEARDOWN ritz-task-<id>`: removes the room's unit, budget, worktree and
+    local branch after its merge.
+  - `STATUS`: free memory, running rooms, each room's last journal line.
+- **Host answers aren't REAPs.** `SPAWNED`, `SPAWN-FAILED` and `STATUS`
+  replies never go in the scratchpad. On `SPAWN-FAILED`, release the claim
+  (`release_task`), tell Aaron the reason in the turn report, and don't
+  retry that host until the cause is fixed.
+- **A host that doesn't answer within 10 minutes** (asleep, agent
+  disconnected) is treated as not ready until Aaron says otherwise. Its
+  rooms' tickets stay claimed; report them as stuck.
 
 ## What the main room may and may not do
 
 **May:** read/claim/create/update AGAST tickets; spawn rooms; read the
 scratchpad; `git fetch`, `git merge --ff-only`, `git push origin main`; clean
-up reaped worktrees, branches and units; glance at GitHub CI (`gh run list`).
+up reaped worktrees, branches and units; send host rooms the verbs in
+"Hosts"; glance at GitHub CI (`gh run list`).
 
 **Must not:** edit code, run tests or gates, rebase or squash a room's branch,
 or investigate a failure. Anything like that becomes an AGAST ticket and a
@@ -125,6 +174,29 @@ The cap is per room, not per command, so a room can't bypass it by running
 found that way). A quick grep for the fix the ticket describes is enough; if
 it's there, `complete_task` with the evidence instead of spawning. Also add a
 "step 0: is it already fixed?" to each briefing.
+
+### Spawning on a remote host
+
+You can't run `git worktree`, `systemctl`, `provision-room.sh` or
+`host-budget.sh` there; the host room does all of that. What stays here:
+
+1. **Create the room on the server first**, as above (`send_room_message`
+   "Room initialized for AGAST #<id>.", then `update_room_description`), so
+   the remote agent doesn't crash-loop on HTTP 400.
+2. **Claim the ticket here** as `ritz-task-<id>@<host>`. The hosts have no
+   AGAST credentials.
+3. **Send `SPAWN`** to `adele-<host>`: the verb line, then the briefing below
+   with the remote additions filled in. The host creates
+   `~/dev/ritz-lang/rz-task-<id>` off `origin/main`, provisions it, puts it
+   on the budget, installs, starts it and sends it the briefing.
+4. **Wait for `SPAWNED`** (it wakes this room). Then check the agent woke
+   by watching for its first room message or description change, not by
+   reading a journal. No answer in 10 minutes: send `STATUS`.
+
+Paths in the briefing (`~/dev/ritz-lang/...`) are the same on every host.
+`run-gate.sh` is read from the host's own `~/dev/ritz-lang/rz` checkout, so
+the host must keep that checkout on current `origin/main`; the SPAWN's fetch
+covers it.
 
 ### The briefing (send verbatim, with the placeholders filled)
 
@@ -212,6 +284,26 @@ stop or disable your unit (the scheduled restart above is the one
 exception), or delete your branch. `rz` does that after merging.
 ````
 
+**Remote additions to the briefing** (only for a room on a remote host;
+add them after the room line):
+
+````markdown
+You're on **<host>**, not omegalisk. `rz` can't read your files or journal,
+so:
+
+- **Your REAP must quote the gate's verdict:** add `gate <log name>
+  SHA=<first 12> EXIT=0` to the REAP line, copied from the log. `rz` checks
+  that the SHA matches the one you REAP.
+- **AGAST:** the ticket text is pasted below; it is the full spec. If your
+  AGAST tools fail, don't file or complete tickets yourself. List
+  follow-ups in your REAP (one line each: title, file:line, why) and
+  `rz` files them. For step 1, REAP `none` with the evidence instead of
+  calling `complete_task`.
+- **Self-restart** (the `systemd-run` above) works the same on this host.
+
+<full AGAST ticket text>
+````
+
 ## Reaping
 
 **The scratchpad is the reap queue and nothing else.** One line per request,
@@ -231,12 +323,20 @@ reap ritz-task-1450 1a2b3c4
    git merge-base --is-ancestor origin/main <sha>       # must be on current main
    test "$(git rev-list --count origin/main..<sha>)" = 1   # exactly one commit
    ```
+   These work from `origin/ritz-task-<id>`, so they're the same for a remote
+   room. A remote room's REAP must also quote `SHA=<12> EXIT=0` from its
+   gate log, and that SHA must be the REAP SHA's prefix. A REAP without it
+   is a room mistake (step 7). Its gate log stays on its host; ask the host
+   room for it only if CI later goes red on that commit.
 4. **Pass:** `git merge --ff-only <sha> && git push origin main`. Then
    `complete_task` in AGAST, `check_scratchpad_item`, and clean up
    (`systemctl --user stop/disable adele-agent@ritz-task-<id>`, remove
    `~/.config/adele/rooms/ritz-task-<id>`, `.claude/host-budget.sh --remove
    ritz-task-<id>`, `git worktree remove`,
    `git branch -D`, `git push origin --delete ritz-task-<id>`).
+   **Remote room:** send `TEARDOWN ritz-task-<id>` to its host room instead
+   of the local steps, and still run `git push origin --delete
+   ritz-task-<id>` here. Its slot is free once the host confirms.
 5. **Not on current main (the usual case):** this room is next, so it gets
    the turn. Send it one line with `ask_claude=True`:
    "your turn: rebase onto <sha7>, re-gate and REAP again". Leave its item
