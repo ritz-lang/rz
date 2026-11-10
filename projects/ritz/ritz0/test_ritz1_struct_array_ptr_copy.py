@@ -279,10 +279,8 @@ def _whole_program(holder: str, op: str) -> str:
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("holder", ["param", "param_copy", "mut_ref_param", "local_copy", "mut_ref_local"])
 @pytest.mark.parametrize("op", sorted(WHOLE_OPS))
-def test_struct_array_pointer_whole(request, run_with, op, holder, compiler):
-    if op == "row_arith" and holder.startswith("mut_ref") and compiler != "ritz0":
-        # `q + k` on any `@&[N]T` param or local emits IR clang rejects.
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2554"))
+def test_struct_array_pointer_whole(run_with, op, holder, compiler):
+    # row_arith on mut_ref_param / mut_ref_local: `q + k` of an `@&[N]S` (#2554).
     assert run_with(compiler, f"whole_{op}_{holder}", _whole_program(holder, op)) == 6
 
 

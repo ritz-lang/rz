@@ -543,9 +543,8 @@ ROW_WALK = {
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("name", sorted(ROW_WALK))
-def test_pointer_arithmetic_walks_rows(request, run_with, name, kind, compiler):
-    if kind == "mut_reference" and compiler != "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2523: `p + 1` on an `@&T` local fails at clang on ritz1"))
+def test_pointer_arithmetic_walks_rows(run_with, name, kind, compiler):
+    # mut_reference: `p + 1` of an `@&[3]i32` was a `ptr` fed to inttoptr (#2554).
     spelled, addr = KINDS[kind]
     if name == "annotated":
         program_body = ROW_WALK[name].replace("*[3]i32", f"{spelled}[3]i32")
@@ -656,9 +655,7 @@ def test_a_struct_element_write_through_a_shared_array_is_section_3_2s(compile_w
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", WRITABLE)
 @pytest.mark.parametrize("bind", ["let q = p", "var q = p", "let q = p + 0"])
-def test_an_inferred_local_writes_a_struct_element(request, run_with, bind, kind, compiler):
-    if bind.endswith("+ 0") and kind == "mut_reference" and compiler != "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2523: `p + 1` on an `@&T` local fails at clang on ritz1"))
+def test_an_inferred_local_writes_a_struct_element(run_with, bind, kind, compiler):
     body = f"    {bind}\n    q[1].x = 7\n    let r: *i32 = @q[2].x\n    *r = 1\n    let s: S = q[1]\n"
     program = _struct_program("S", kind, body, "s.x * 10 + p[2].x")
     assert run_with(compiler, "inferred", program) == 71
