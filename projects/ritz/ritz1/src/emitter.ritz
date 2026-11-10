@@ -29,6 +29,27 @@ import ownership         # own_begin_fn / own_end_fn (AGAST #2158)
 import ref_check         # ref_begin_fn (AGAST #2336)
 import tail_value        # check_tail_value (AGAST #2236)
 
+# AGAST #2565: an impl method's (non-sret) return type, as its `define` line
+# and its implicit-tail `ret` both spell it.  usize/isize/f32/... parse as
+# TYPE_STRUCT named "usize" etc.; emit_llvm_type_struct maps those names to
+# their LLVM primitive, and a TYPE_STRUCT that lost its name keeps
+# emit_llvm_type's i64.
+fn emit_method_ret_type(s: *EmitterState, method: *FnDef)
+    if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
+        emit_llvm_type_struct(s, method.return_type, method.return_type_name, method.return_type_name_len)
+    else
+        emit_llvm_type(s, method.return_type)
+
+# 1 if the method returns a real named struct (`define %T`), 0 for a scalar,
+# including a primitive spelled as a TYPE_STRUCT name (`-> usize`): its tail
+# is a scalar register, not a struct to load and `ret %T`.
+fn method_returns_named_struct(method: *FnDef) -> i32
+    if method.return_type != TYPE_STRUCT or method.return_type_name == null or method.return_type_name_len <= 0
+        return 0
+    if is_primitive_type_name(method.return_type_name, method.return_type_name_len) == 1
+        return 0
+    1
+
 # The implicit-return tail shared by emit_fn and emit_impl_method (AGAST #1573).
 #
 # Called after the body loop. `has_explicit_return` is 1 when the body's last
@@ -1047,10 +1068,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # name during parse — strview_slice etc. land here).
     if s.ret_sret == 1
         emit_str(s, c"void")
-    else if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
-        emit_llvm_type_struct(s, method.return_type, method.return_type_name, method.return_type_name_len)
     else
-        emit_llvm_type(s, method.return_type)
+        emit_method_ret_type(s, method)
     emit_str(s, c" @")
     # Emit mangled name: Type_method
     emit_name(s, ib.type_name, ib.type_name_len)
@@ -1266,7 +1285,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     emit_str(s, c"\n")
                 else if method.return_type == 0
                     emit_str(s, c"  ret void\n")
-                else if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
+                else if method_returns_named_struct(method) == 1
                     # Struct-returning impl method.  Function header
                     # emits `define %T @T_method(...)` so the body must
                     # `ret %T <val>`.  Two shapes:
@@ -1319,8 +1338,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                         emit_reg(s, ret_reg)
                         emit_str(s, c"\n")
                 else
+                    # AGAST #2565: typed as the `define` line types it.
                     emit_str(s, c"  ret ")
-                    emit_llvm_type(s, method.return_type)
+                    emit_method_ret_type(s, method)
                     emit_str(s, c" ")
                     emit_reg(s, val)
                     emit_str(s, c"\n")
