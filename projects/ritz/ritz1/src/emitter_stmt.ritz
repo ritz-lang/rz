@@ -194,8 +194,10 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, out_len: *i32) -> *u8
     if src == null and init.kind == EXPR_BINARY and (init.op == OP_ADD or init.op == OP_SUB)
         src = array_ptr_index_base(s, init.left)
     if src != null
-        *out_len = src.type_name_len
-        return src.type_name
+        return array_ptr_elem_name(src, out_len)
+    let pp: *LocalVar = array_ptr_ptr_deref_base(s, init)   # #2543: `let p = *r`
+    if pp != null
+        return array_ptr_elem_name(pp, out_len)
     let pa: *Param = base_ptr_array(s, init)   # #2329
     if pa != null
         *out_len = pa.param_type_name_len
@@ -214,12 +216,39 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, out_len: *i32) -> *u8
             if arr.var_type == TYPE_ARRAY
                 *out_len = arr.type_name_len
                 return arr.type_name
+            # #2543: `let r = @q` with `q: *[N]S`, for name_array_ptr_local.
+            if array_ptr_index_base(s, oper) != null
+                return array_ptr_elem_name(arr, out_len)
         else
             let garr: *GlobalVarDef = global_array_named(s, oper)
             if garr != null
                 *out_len = garr.array_elem_type_name_len
                 return garr.array_elem_type_name
     return null
+
+# AGAST #2543: the S of `loc`, a `*[N]S` or `**[N]S` local or param, or null.
+fn array_ptr_elem_name(loc: *LocalVar, out_len: *i32) -> *u8
+    if loc.pointee_array_elem_name_len > 0
+        *out_len = loc.pointee_array_elem_name_len
+        return loc.pointee_array_elem_name
+    *out_len = loc.type_name_len
+    loc.type_name
+
+# AGAST #2543: a `*[N]S`, `@[N]S`, `@&[N]S` or `**[N]S` local records S, as a param
+# of the type does in type_name.  It recorded none, so `let p = q` and `let p =
+# *r`, which take S from what they copy, had none for `p#`, and `p[i].f` was
+# refused "unhandled EXPR_MEMBER".
+fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name: *u8, len: i32)
+    if loc.type_name_len > 0 or name == null or len <= 0
+        return
+    if stmt.var_pointee_array_size <= 0 or stmt.var_pointee_array_elem_type != TYPE_STRUCT
+        return
+    let t: i32 = loc.var_type
+    let one: bool = (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_ARRAY
+    let two: bool = t == TYPE_PTR_PTR and stmt.var_inner_pointee_type == TYPE_ARRAY
+    if one or two
+        loc.pointee_array_elem_name = name
+        loc.pointee_array_elem_name_len = len
 
 # AGAST #2332: `let q = a[i]` and `let q = a[i] + k` with `a: [N]*T` hold what
 # `let q: *T` does.  Returns 1 when it typed the local.
@@ -1131,6 +1160,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
         set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308, #2539 (`**[N]T`)
         set_local_pointee_elem(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_elem_pointee)
+        name_array_ptr_local(declared, stmt, view_name, view_name_len)   # AGAST #2543
     # An unannotated local takes its initialiser's kind; var_type can't say.
     var inferred_bool: i32 = 0
     var inferred_unsure: i32 = 0
