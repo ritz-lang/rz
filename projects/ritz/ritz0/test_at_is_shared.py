@@ -134,6 +134,25 @@ ALLOWED = {
                             "    var c = C { x: 1 }\n    wr(@c)\n    c.x\n", 3),
     "mutable_into_shared": ("fn rd(c: @C) -> i32\n    c.x\n\n",
                             "    var c = C { x: 3 }\n    rd(@&c)\n", 3),
+    # #2416: `@&x` is a `ptr` in ritz1, an `@T` slot is the i64 value model.
+    # W is 12 bytes, so it can't ride in a register either.
+    "mutable_into_shared_large": ("fn rw(w: @W) -> i32\n    w.c.x + w.a[1]\n\n",
+                                  "    var w = W { c: C { x: 1 }, a: [0, 2] }\n    rw(@&w)\n", 3),
+    "mutable_field_into_shared": ("fn rd(c: @C) -> i32\n    c.x\n\n",
+                                  "    var w = W { c: C { x: 3 }, a: [0, 2] }\n    rd(@&w.c)\n", 3),
+    "mutable_scalar_into_shared": ("fn ri(n: @i32) -> i32\n    *n\n\n",
+                                   "    var n: i32 = 3\n    ri(@&n)\n", 3),
+    "mutable_into_shared_method_arg": (
+        "struct R\n    n: i32\n\nimpl R\n    fn get(self: @R, c: @C) -> i32\n        c.x + self.n\n\n",
+        "    let r = R { n: 0 }\n    var c = C { x: 3 }\n    r.get(@&c)\n", 3),
+    "mutable_into_shared_method_arg_large": (
+        "struct R\n    n: i32\n\nimpl R\n    fn get(self: @R, w: @W) -> i32\n        w.c.x + w.a[1] + self.n\n\n",
+        "    let r = R { n: 0 }\n    var w = W { c: C { x: 1 }, a: [0, 2] }\n    r.get(@&w)\n", 3),
+    # `(@&d).rd()` isn't here: ritz1 can't type a parenthesised `@d` receiver
+    # either (#2550); a held `@&D` reaches the receiver path.
+    "mutable_reference_receiver_into_shared": (
+        "struct D\n    x: i32\n\nimpl D\n    fn rd(self: @D) -> i32\n        self.x\n\n",
+        "    var d = D { x: 3 }\n    let m: @&D = @&d\n    m.rd()\n", 3),
     "mutable_into_pointer": ("fn wr(c: *C)\n    c.x = 3\n\n",
                              "    var c = C { x: 1 }\n    wr(@&c)\n    c.x\n", 3),
     "held_mutable": ("", "    var c = C { x: 1 }\n    let m: @&C = @&c\n    mb(m)\n    c.x\n", 3),
@@ -148,7 +167,7 @@ ALLOWED = {
 }
 
 # Rows ritz1 and ritz1_selfhosted do not meet yet, each with its ticket.
-GAPS = {"fn_pointer": 2417, "mutable_into_shared": 2416}
+GAPS = {"fn_pointer": 2417}
 
 
 def _wrap(body):

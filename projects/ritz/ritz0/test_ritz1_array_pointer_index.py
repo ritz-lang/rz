@@ -236,29 +236,25 @@ def test_an_inferred_local_stays_a_pointer(run_with, name, compiler):
     assert run_with(compiler, name, INFERRED_STAYS_A_POINTER[name]) == 20
 
 
-# `@&T` fits `@T` (LARB R1), but an `@&` local into an `@` param fails at clang on
-# ritz1, annotated or not.  An inferred `@&a` is an `@&` local, as an annotated one
-# is: R1 makes `@T` read-only, so recording it as `@` to get past this would be
-# refused at `*p = b` once that's checked.
+# `@&T` fits `@T` (LARB R1).  An `@&` local is a `ptr` on ritz1 and an `@` param
+# the i64 value model, so the call converts it (#2334, #2416).  An inferred `@&a`
+# is an `@&` local, as an annotated one is: R1 makes `@T` read-only, so recording
+# it as `@` instead would be refused at `*p = b` once that's checked.
 MUT_INTO_SHARED = {
     "param": "fn g(p: @[3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @&a\n    return g(p)\n"),
     "copy": "fn g(p: @[3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @&a\n    let q = p\n    return g(q)\n"),
     "method": "struct W\n    v: i32\n\nimpl W\n    fn m(self:& W, q: @[3]i32) -> i32\n        return q[1]\n\n" + _a("    let p = @&a\n    var w: W\n    w.v = 0\n    return w.m(p)\n"),
     "annotated": "fn g(p: @[3]i32) -> i32\n    return p[1]\n\n" + _a("    let p: @&[3]i32 = @&a\n    return g(p)\n"),
+    "from_param": "fn g(p: @[3]i32) -> i32\n    return p[1]\n\nfn f(p: @&[3]i32) -> i32\n    return g(p)\n\n"
+                  + _a("    return f(@&a)\n"),
+    "scalar": "fn g(q: @i32) -> i32\n    return *q\n\n" + _a("    let p: @&i32 = @&a[1]\n    return g(p)\n"),
 }
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(MUT_INTO_SHARED))
-def test_ritz0_passes_an_mut_reference_as_a_reference(run_with, name):
-    assert run_with("ritz0", name, MUT_INTO_SHARED[name]) == 20
-
-
-@pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2334: an `@&` local into an `@` param fails at clang")
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(MUT_INTO_SHARED))
-def test_ritz1_passes_an_mut_reference_as_a_reference(run_with, name, compiler):
+def test_an_mut_reference_passes_as_a_reference(run_with, name, compiler):
     assert run_with(compiler, name, MUT_INTO_SHARED[name]) == 20
 
 
