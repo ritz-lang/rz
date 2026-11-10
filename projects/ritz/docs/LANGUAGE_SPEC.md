@@ -2346,10 +2346,9 @@ fn main() -> i32
 ```
 
 **Removed in RERITZ:** the `::` path separator, everywhere. `Color::Red`,
-`String::from(...)` and `sys::write(...)` all parse into a qualified
-identifier that no longer lowers:
+`String::from(...)` and `sys::write(...)` are each a located error:
 
-```ritz body expect-error="Expression: <class 'ritz_ast.QualifiedIdent'>"
+```ritz body expect-error="`Color::Red`: `::` was removed in RERITZ"
 let c = Color::Red
 ```
 
@@ -3679,7 +3678,7 @@ form. Imported names land in a single flat namespace, which is why the standard
 library uses long, prefixed free-function names (`strview_find`,
 `vec_push`, `string_from`) instead of short names behind a module path.
 
-```ritz body expect-error="Expression: <class 'ritz_ast.QualifiedIdent'>"
+```ritz body expect-error="`sys::write`: `::` was removed in RERITZ"
 let n = sys::write(1, c"hi\n", 3)
 ```
 

@@ -629,11 +629,10 @@ class ImportResolver:
             if expr.qualifier in aliases:
                 # Transform sys::write -> write
                 return rast.Ident(expr.span, expr.name)
-            else:
-                raise RitzImportError(
-                    f"Unknown import alias: '{expr.qualifier}' in '{expr.qualifier}::{expr.name}'",
-                    expr.span
-                )
+            # Not an alias: leave it. The emitter reports every QualifiedIdent
+            # nothing lowered, with its location (AGAST #2591); this used to
+            # raise `RitzImportError`, a name this module never defined.
+            return expr
 
         # Recursively transform sub-expressions using replace()
         if isinstance(expr, rast.BinOp):

@@ -48,6 +48,14 @@ class EmitError(Exception):
             super().__init__(message)
 
 
+def qualified_access_removed(expr: rast.QualifiedIdent) -> str:
+    """The diagnostic for an `a::b` nothing lowered (AGAST #2591)."""
+    q, n = expr.qualifier, expr.name
+    return (f"`{q}::{n}`: `::` was removed in RERITZ (LANGUAGE_SPEC §15.3). "
+            f"Imported names share one namespace, so write `{n}`; "
+            f"an enum variant is `{q}.{n}`")
+
+
 # ============================================================================
 # Large struct returns via sret (AGAST #1736)
 # ============================================================================
@@ -8125,6 +8133,14 @@ class LLVMEmitter:
 
         elif isinstance(expr, rast.AssignExpr):
             return self._emit_assign_expr(expr)
+
+        elif isinstance(expr, rast.QualifiedIdent):
+            # AGAST #2591: `::` is not Ritz syntax (LANGUAGE_SPEC §10.2, §15.3).
+            # The parser still builds a QualifiedIdent so this can say so; the
+            # only one lowered is `alias::item` under `import ... as alias`
+            # (ImportResolver rewrites it to `item`, AGAST #1624). Any other
+            # reaching here is a source error, not a missing emitter case.
+            raise EmitError(qualified_access_removed(expr), expr.span)
 
         else:
             raise NotImplementedError(f"Expression: {type(expr)}")
