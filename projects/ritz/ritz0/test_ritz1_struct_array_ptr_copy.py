@@ -322,3 +322,82 @@ def test_struct_array_pointer_deref_is_its_array(run_with, holder, compiler):
     program = _S + _T + fn + "\npub fn main() -> i32\n    var x: [3]S\n    let y = rt(@x)\n    return y[1].b\n"
     with pytest.raises(AssertionError, match=rf":{line}:12:( error:)? an array only fits a slot of the same element type"):
         run_with(compiler, f"deref_is_array_{holder}", program)
+
+
+# AGAST #2553: a `**[N]S` param, `fn f(r: **[3]S)`.  #2539/#2543 made the local
+# forms work (the deref_* rows above); the param bound S in its type_name, and no
+# `(*r)[i].f` or `let p = *r; p[i].f` found it: "unhandled EXPR_MEMBER".  S now
+# sits in pointee_array_elem_name, as for a `*[N]S` param (#2548).  `@*[N]S` and
+# `@&*[N]S` params bind on the same path.
+PTR_PTR_PARAMS = {
+    "ptr_ptr": ("**[3]S", "@q"),
+    "ref_ptr": ("@*[3]S", "@q"),
+    "mut_ref_ptr": ("@&*[3]S", "@&q"),
+}
+
+
+def _ptr_ptr_program(pty: str, body: str) -> str:
+    ty, arg = PTR_PTR_PARAMS[pty]
+    return (_S + f"fn f(r: {ty}, x: *[3]S) -> i32\n" + body
+            + "\npub fn main() -> i32\n" + _FILL
+            + f"    var q: *[3]S = @x\n    return f({arg}, @x)\n")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("pty", sorted(PTR_PTR_PARAMS))
+@pytest.mark.parametrize("via", ["deref", "copy", "copy_annotated"])
+def test_struct_array_pointer_pointer_param_elements(request, run_with, via, pty, compiler):
+    if pty != "ptr_ptr" and compiler != "ritz0":
+        # A reference to a `*[N]T` param records no N or T in ritz1 (scalars: SILENT).
+        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2331: `@*[N]T` param"))
+    if pty != "ptr_ptr" and compiler == "ritz0" and via == "copy":
+        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2557"))
+    # `p` is `(*r)` itself (deref) or `let p = *r` / `let p: *[3]S = *r` (copy).
+    if via == "deref":
+        # `p2` annotated: an inferred `let p2 = *r` is the copy rows' business.
+        body = _CHECKS.replace("p[", "(*r)[").replace("let p2 = p", "let p2: *[3]S = *r")
+    else:
+        body = ("    let p = *r\n" if via == "copy" else "    let p: *[3]S = *r\n") + _CHECKS
+    assert run_with(compiler, f"ptr_ptr_elements_{pty}_{via}", _ptr_ptr_program(pty, body)) == 0
+
+
+# The ticket's program: 18 on ritz0.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_struct_array_pointer_pointer_param_ticket(run_with, compiler):
+    program = (_S + "fn f(r: **[3]S) -> i32\n    let p = *r\n    p[1].b = 9\n"
+               "    return (*r)[1].b + p[1].b\n\npub fn main() -> i32\n"
+               "    var x: [3]S\n    var q: *[3]S = @x\n    return f(@q)\n")
+    assert run_with(compiler, "ptr_ptr_ticket", program) == 18
+
+
+# And `*r` is a `*[3]S`, not a `*S`: no `.b` on it, as for a local (#2543).
+PTR_PTR_NOT_AN_ELEMENT = {
+    "pp_deref_field": "    return (*r).b\n",
+    "pp_copy_field": "    let p = *r\n    return p.b\n",
+    "pp_copy_annotated_field": "    let p: *[3]S = *r\n    return p.b\n",
+    "pp_deref_store_field": "    (*r).b = 4\n    return 0\n",
+    "pp_copy_store_field": "    let p = *r\n    p.b = 4\n    return 0\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("pty", sorted(PTR_PTR_PARAMS))
+@pytest.mark.parametrize("name", sorted(PTR_PTR_NOT_AN_ELEMENT))
+def test_struct_array_pointer_pointer_param_is_not_its_element(run_with, name, pty, compiler):
+    program = _ptr_ptr_program(pty, PTR_PTR_NOT_AN_ELEMENT[name])
+    with pytest.raises(AssertionError, match=f"failed on {name}_{pty}"):
+        run_with(compiler, f"{name}_{pty}", program)
+
+
+# The same `(*r)[i].f` on a `**[3]S` local: #2539/#2543 covered only `let p = *r`.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("source", ["deref_inferred_r", "deref_annotated_r", "deref_mut_r"])
+def test_struct_array_pointer_pointer_local_elements(run_with, source, compiler):
+    setup = SOURCES[source].split("    let p{pann}")[0]
+    checks = _CHECKS.replace("p[", "(*r)[").replace("let p2 = p", "let p2 = *r")
+    program = _S + "pub fn main() -> i32\n" + _FILL + setup + checks
+    assert run_with(compiler, f"ptr_ptr_local_{source}", program) == 0

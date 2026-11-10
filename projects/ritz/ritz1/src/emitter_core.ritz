@@ -80,7 +80,7 @@ struct LocalVar
     pointee_array_elem_pointee: i32   # AGAST #2343: U for `*[N]*U`
     # AGAST #2543: S for a `*[N]S` / `**[N]S` local, and (#2548) a `*[N]S`,
     # `@[N]S` or `@&[N]S` param.  Not type_name: that makes `p.f` and `(*r).f` a
-    # `*S`'s field.  A `**[N]S` param still names S in type_name (#2553).
+    # `*S`'s field.  And (#2553) a `**[N]S` param.
     pointee_array_elem_name: *u8
     pointee_array_elem_name_len: i32
     # AGAST #1509: every dimension of a `var g: [N][M]..T` local (array_size
@@ -854,7 +854,7 @@ fn lent_array_ident(s: *EmitterState, e: *Expr) -> *LocalVar
 
 # AGAST #2543: the S of `loc`, a `*[N]S` or `**[N]S` local or param, or null.
 # #2548: every reader of a `*[N]S`'s element name asks here, not type_name, which
-# a `*[N]S` local or param leaves empty (a `**[N]S` param still uses it, #2553).
+# a `*[N]S` or `**[N]S` local or param leaves empty (#2553).
 pub fn array_ptr_elem_name(loc: *LocalVar, out_len: *i32) -> *u8
     if loc.pointee_array_elem_name_len > 0
         *out_len = loc.pointee_array_elem_name_len
@@ -1042,21 +1042,37 @@ pub fn base_array_view(s: *EmitterState, root: *Expr) -> *LocalVar
     let pa: *Param = base_ptr_array(s, root)
     if pa == null
         return null
-    let elem: i32 = pa.param_pointee_array_elem_type
-    if array_view_elem_ok(s, elem, pa.param_type_name, pa.param_type_name_len) == 0
+    return unscoped_array_view(s, root, pa.param_pointee_array_elem_type, pa.param_type_name, pa.param_type_name_len, pa.param_pointee_array_elem_pointee)
+
+# AGAST #2553: the view of `d`, a `*r` with `r` a `**[N]T` local or param, so
+# `(*r)[i]` is element i of the array behind `*r`, at stride T, as `p[i]` is on
+# the `*[N]T` that `let p = *r` copies (#2539).  It took the byte path: a scalar
+# `(*r)[i]` read and stored the wrong bytes, SILENT, and `(*r)[i].f` was
+# "unhandled EXPR_MEMBER".  null when `loc` isn't one.
+pub fn deref_array_view(s: *EmitterState, d: *Expr, loc: *LocalVar) -> *LocalVar
+    if loc.var_type != TYPE_PTR_PTR or loc.inner_pointee_type != TYPE_ARRAY or loc.pointee_array_size <= 0
+        return null
+    var en_len: i32 = 0
+    let en: *u8 = array_ptr_elem_name(loc, @en_len)
+    unscoped_array_view(s, d, loc.pointee_array_elem_type, en, en_len, loc.pointee_array_elem_pointee)
+
+# AGAST #2329: a view of the `*[N]T` that `root` evaluates to, in no scope: an
+# emitting site binds it with through_spill.  null if T gets no view.
+fn unscoped_array_view(s: *EmitterState, root: *Expr, elem: i32, name: *u8, name_len: i32, elem_pointee: i32) -> *LocalVar
+    if array_view_elem_ok(s, elem, name, name_len) == 0
         return null
     let v: *LocalVar = malloc(sizeof(LocalVar)) as *LocalVar
     memset(v as *u8, 0, sizeof(LocalVar))
     v.var_type = TYPE_PTR
     v.pointee_type = elem
-    v.type_name = pa.param_type_name
-    v.type_name_len = pa.param_type_name_len
+    v.type_name = name
+    v.type_name_len = name_len
     v.array_view = 1
     v.array_base = root
     v.inner_pointee_type = TYPE_VOID
     v.pointee_array_elem_type = TYPE_VOID
     v.pointee_array_elem_pointee = TYPE_VOID
-    view_holds_pointers(v, pa.param_pointee_array_elem_pointee)   # AGAST #2522
+    view_holds_pointers(v, elem_pointee)   # AGAST #2522
     if view_lacks_pointee(v) == 1
         return null
     v

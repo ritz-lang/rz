@@ -18,7 +18,7 @@ Expected values come from the program; ritz0 agrees on every row.
 
 import pytest
 
-from test_ritz1_array_ptr_element import COMPILERS, RITZ1S, SCALARS, run_with  # noqa: F401  (fixture)
+from test_ritz1_array_ptr_element import COMPILERS, SCALARS, run_with  # noqa: F401  (fixture)
 
 # 1-3 load, 4-5 store, 6-7 compound, 8 the value a `let` copies out.  `{amp}` is
 # `@` or `@&`, `x` the three scalars, and q points at x[0].
@@ -316,6 +316,10 @@ ARRAY_BODIES = {
     "    (*r)[0] = {v3}\n"
     "    if x[0] != {v3}\n        return 2\n"
     "    if x[1] != {v1}\n        return 3\n"
+    # #2553: and a compound store, at stride T.
+    "    (*r)[2] += {v3}\n"
+    "    if x[2] != {v2} + {v3}\n        return 4\n"
+    "    if x[1] != {v1}\n        return 5\n"
     "    return 0\n",
     # `*r` is q itself: re-pointing it through r re-points q.
     "replace_through": "    var y: [3]{t}\n    y[1] = {v3}\n"
@@ -332,11 +336,8 @@ ARRAY_TYPES = ["i8", "u8", "i16", "i32", "i64", "f64"]
 @pytest.mark.parametrize("ty", ARRAY_TYPES)
 @pytest.mark.parametrize("ann", ["inferred", "annotated"])
 @pytest.mark.parametrize("body", sorted(ARRAY_BODIES))
-def test_reference_to_an_array_pointer(request, run_with, body, ann, ty, compiler):
-    if body == "index_through" and compiler in RITZ1S:
-        request.applymarker(
-            pytest.mark.xfail(strict=True, reason="AGAST #2331: (*pp)[i] on a **[N]T")
-        )
+def test_reference_to_an_array_pointer(run_with, body, ann, ty, compiler):
+    # `(*r)[i]` read and stored the wrong bytes on ritz1 until #2553.
     v0, v1, v2, v3 = SCALARS[ty]
     amp = "@&" if body == "replace_through" else "@"
     program = _ARRAY.format(
@@ -349,6 +350,30 @@ def test_reference_to_an_array_pointer(request, run_with, body, ann, ty, compile
         body=ARRAY_BODIES[body].format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3),
     )
     assert run_with(compiler, f"arr_{body}_{ann}_{ty}", program) == 0
+
+
+# AGAST #2553: the same through a `**[3]T` param.
+_ARRAY_PARAM = """\
+fn f(r: **[3]{t}, x: *[3]{t}) -> i32
+{body}
+pub fn main() -> i32
+    var x: [3]{t}
+    x[0] = {v0}
+    x[1] = {v1}
+    x[2] = {v2}
+    var q: *[3]{t} = @x
+    return f(@q, @x)
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", ARRAY_TYPES)
+def test_index_through_an_array_pointer_pointer_param(run_with, ty, compiler):
+    v0, v1, v2, v3 = SCALARS[ty]
+    body = ARRAY_BODIES["index_through"].format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
+    program = _ARRAY_PARAM.format(t=ty, v0=v0, v1=v1, v2=v2, body=body)
+    assert run_with(compiler, f"arr_param_index_through_{ty}", program) == 0
 
 
 _ENUM = """\
