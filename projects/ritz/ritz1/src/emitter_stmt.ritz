@@ -3531,6 +3531,35 @@ fn emit_local_field_store_fallback(s: *EmitterState, stmt: *Stmt, with_index: i3
     fb_st.next = null
     emit_assign(s, @fb_st)
 
+# AGAST #2559: the struct type of a statement-`if` arm's value, or null/0.
+# The arm's last statement is its value: a trailing expression (a static
+# call `B.new(..)` is typed by its callee), a `match` (emit_match published
+# its phi type, #1666), or a nested statement `if` (an `else if` chain),
+# which published its own.  Called right after the arm is emitted, so its
+# `let`s are still in scope.
+fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    var last: *Stmt = list
+    if last == null
+        return
+    while last.next != null
+        last = last.next
+    if last.kind == STMT_IF
+        *out_name = s.last_if_stmt_agg_name
+        *out_len = s.last_if_stmt_agg_name_len
+        return
+    if last.kind == STMT_MATCH
+        *out_name = s.last_match_agg_name
+        *out_len = s.last_match_agg_name_len
+        return
+    if last.kind != STMT_EXPR or last.expr == null
+        return
+    let e: *Expr = last.expr
+    resolve_expr_struct_name(s, e, out_name, out_len)
+    if *out_name == null
+        call_result_struct_name(s, e, out_name, out_len)
+
 # AGAST #2158: the move check and drop insertion (ownership.ritz) wrap every
 # statement.  The check runs first, so a statement's moves clear their drop
 # flags before it executes; `x = v` drops x's old value once v is stored.
@@ -3736,6 +3765,10 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         while then_stmt != null
             emit_stmt(s, then_stmt, ret_type)
             then_stmt = then_stmt.next
+        # AGAST #2559: the arm value's struct type, while its bindings resolve.
+        var then_agg: *u8 = null
+        var then_agg_len: i32 = 0
+        if_stmt_arm_agg(s, stmt.if_then, @then_agg, @then_agg_len)
         let own_then_dead: i32 = own_pop_scope(s)
         let own_after_then: *i32 = own_snapshot(s)
         var own_else_dead: i32 = 0
@@ -3751,6 +3784,8 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
         var else_result: i32 = 0
         var else_exit_label: i32 = else_label
+        var else_agg: *u8 = null
+        var else_agg_len: i32 = 0
         if stmt.if_else != null
             begin_block(s, else_label)
             clear_last_expr(s)  # Reset before else branch
@@ -3760,6 +3795,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             while else_stmt != null
                 emit_stmt(s, else_stmt, ret_type)
                 else_stmt = else_stmt.next
+            if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
             own_else_dead = own_pop_scope(s)
             else_result = last_expr_here(s)  # Capture else branch result
             else_exit_label = s.current_label  # Capture actual exit block
@@ -3776,20 +3812,31 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # If both branches produce values, emit a phi node.  When the
         # enclosing fn returns a tagged-enum struct, both branches hand us
         # `%Result$.../Option$...` struct values — the phi must match that
-        # type or LLVM rejects the IR. (ritz-task-133)
+        # type or LLVM rejects the IR. (ritz-task-133)  Otherwise a struct
+        # value in either arm types it (AGAST #2559): `if c / a / else / b`
+        # over `%B` locals, params, literals and calls.
+        var phi_agg: *u8 = null
+        var phi_agg_len: i32 = 0
+        if stmt.if_else != null and then_result > 0 and else_result > 0
+            if ret_type == TYPE_STRUCT and s.ret_type_name_len > 0 and is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1
+                phi_agg = s.ret_type_name
+                phi_agg_len = s.ret_type_name_len
+            else if then_agg != null and then_agg_len > 0
+                phi_agg = then_agg
+                phi_agg_len = then_agg_len
+            else if else_agg != null and else_agg_len > 0
+                phi_agg = else_agg
+                phi_agg_len = else_agg_len
+        # AGAST #2559: publish it for an enclosing `if` ending in this one.
+        s.last_if_stmt_agg_name = phi_agg
+        s.last_if_stmt_agg_name_len = phi_agg_len
         if stmt.if_else != null and then_result > 0 and else_result > 0
             let phi_reg: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, phi_reg)
             emit_str(s, c" = phi ")
-            if ret_type == TYPE_STRUCT
-                if s.ret_type_name_len > 0
-                    if is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1
-                        emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
-                    else
-                        emit_str(s, c"i64")
-                else
-                    emit_str(s, c"i64")
+            if phi_agg != null
+                emit_llvm_type_struct(s, TYPE_STRUCT, phi_agg, phi_agg_len)
             else
                 emit_str(s, c"i64")
             emit_str(s, c" [ ")
