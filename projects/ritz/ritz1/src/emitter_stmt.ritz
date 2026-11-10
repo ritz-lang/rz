@@ -533,6 +533,159 @@ fn emit_ctor_stmt(s: *EmitterState, e: *Expr) -> i32
         return emit_expr(s, e)   # the located error
     emit_ctor_scrutinee(s, e, name, len)
 
+# AGAST #2574: the struct `let (a, b) = init` destructures, or null/0.  A call
+# or method call (`mk(3)`, `c.tp(3)`, a static `C.sm(5)`) names it by its
+# callee's return type; anything else (a struct local, a struct literal) by
+# resolve_expr_struct_name.  Only a free fn's return was looked at before,
+# so a method call bound nothing.
+fn tuple_decl_struct_name(s: *EmitterState, init: *Expr, out_name: **u8, out_len: *i32)
+    call_result_struct_name(s, init, out_name, out_len)
+    if *out_len == 0
+        resolve_expr_struct_name(s, init, out_name, out_len)
+    # A struct field (`h.p`, `hs[0].p`, `mk().p`) names its own type.
+    if *out_len == 0 and init.kind == EXPR_MEMBER
+        let fld: *StructField = resolve_member_chain_field(s, init)
+        if fld != null and fld.field_type == TYPE_STRUCT and fld.field_type_name_len > 0
+            *out_name = fld.field_type_name
+            *out_len = fld.field_type_name_len
+    # `*q`, q a `*S` (as `(*q).f` resolves it).
+    if *out_len == 0 and init.kind == EXPR_UNARY and init.op == OP_DEREF
+        deref_member_base_struct_name(s, init.operand, out_name, out_len)
+    # A struct global, when no local has the name.
+    if *out_len == 0 and init.kind == EXPR_IDENT and find_local_struct_name(s, init.ident_ptr, init.ident_len) == null
+        let g: *GlobalVarDef = find_global(s, init.ident_ptr, init.ident_len)
+        if g != null and g.var_type == TYPE_STRUCT and g.type_name_len > 0
+            *out_name = g.type_name
+            *out_len = g.type_name_len
+
+# AGAST #2574: 1 if a destructured field of this kind can be bound as a local:
+# a scalar, bool, float, struct or plain pointer.  Arrays, `@` / `@&` fields
+# and fn-typed fields are refused rather than guessed at.
+fn tuple_field_bindable(fld: *StructField) -> i32
+    if fld.field_mut_ref == 1 or fld.field_shared_ref == 1 or fld.fn_sig != null
+        return 0
+    let ft: i32 = fld.field_type
+    if ft == TYPE_I8 or ft == TYPE_U8 or ft == TYPE_I16 or ft == TYPE_U16
+        return 1
+    if ft == TYPE_I32 or ft == TYPE_U32 or ft == TYPE_I64 or ft == TYPE_U64
+        return 1
+    if ft == TYPE_F32 or ft == TYPE_F64 or ft == TYPE_BOOL
+        return 1
+    if ft == TYPE_STRUCT and fld.field_type_name_len > 0
+        return 1
+    if ft == TYPE_PTR or ft == TYPE_PTR_PTR
+        return 1
+    0
+
+# AGAST #2574: bind field `idx` of the struct value `init_reg` to `name`, at
+# the field's own type: the slot and local an annotated `let a: T = p.f`
+# gives it.  A bool is held as i64 (the unified value model) and marked
+# is_bool; a pointer as the i64 every pointer local holds, with its pointee.
+# Before, every field went into an i64 slot and only i32 / u32 were widened,
+# so an i16 / i8 / f32 field gave IR clang refused.
+fn tuple_bind_field(s: *EmitterState, fld: *StructField, sname: *u8, slen: i32, init_reg: i32, idx: i32, name: *u8, name_len: i32)
+    let ft: i32 = fld.field_type
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = extractvalue %")
+    emit_name(s, sname, slen)
+    emit_str(s, c" ")
+    emit_reg(s, init_reg)
+    emit_str(s, c", ")
+    emit_int(s, idx as i64)
+    emit_str(s, c"\n")
+    var stored: i32 = val
+    var slot_type: i32 = ft
+    if ft == TYPE_BOOL
+        stored = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, stored)
+        emit_str(s, c" = zext i1 ")
+        emit_reg(s, val)
+        emit_str(s, c" to i64\n")
+        slot_type = TYPE_I64
+    else if ft == TYPE_PTR or ft == TYPE_PTR_PTR
+        stored = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, stored)
+        emit_str(s, c" = ptrtoint ptr ")
+        emit_reg(s, val)
+        emit_str(s, c" to i64\n")
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca ")
+    if ft == TYPE_STRUCT
+        emit_llvm_type_struct(s, TYPE_STRUCT, fld.field_type_name, fld.field_type_name_len)
+    else
+        emit_llvm_type(s, slot_type)
+    emit_str(s, c"\n  store ")
+    if ft == TYPE_STRUCT
+        emit_llvm_type_struct(s, TYPE_STRUCT, fld.field_type_name, fld.field_type_name_len)
+    else
+        emit_llvm_type(s, slot_type)
+    emit_str(s, c" ")
+    emit_reg(s, stored)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+    if ft == TYPE_PTR or ft == TYPE_PTR_PTR
+        add_local_full(s, name, name_len, slot, ft, fld.field_type_name, fld.field_type_name_len, fld.ptr_pointee, 0, 0)
+        let ploc: *LocalVar = local_at(s, s.local_count - 1)
+        ploc.inner_pointee_type = fld.inner_pointee_type
+    else if ft == TYPE_STRUCT
+        add_local_struct(s, name, name_len, slot, ft, fld.field_type_name, fld.field_type_name_len)
+    else
+        add_local(s, name, name_len, slot, slot_type)
+        if ft == TYPE_BOOL
+            let bloc: *LocalVar = local_at(s, s.local_count - 1)
+            bloc.is_bool = 1
+
+# AGAST #2574: after a refused destructure, bind both names to an i64 slot so
+# each later use isn't a second, unlocated "unknown identifier" error.  The
+# error count already stops any output being written.
+fn tuple_decl_placeholders(s: *EmitterState, stmt: *Stmt)
+    let a: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, a)
+    emit_str(s, c" = alloca i64\n")
+    add_local(s, stmt.var_name, stmt.var_name_len, a, TYPE_I64)
+    let b: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, b)
+    emit_str(s, c" = alloca i64\n")
+    add_local(s, stmt.assign_target, stmt.assign_target_len, b, TYPE_I64)
+
+# `let (x, y) = expr` (AGAST #2574): destructure a struct value into two
+# locals, its fields 0 and 1, each at its field's type.  A struct ritz1 can't
+# name, or a field it can't bind, is a located error at the `let`: before,
+# nothing was bound and every use failed, unlocated, as an unknown name.
+fn emit_tuple_decl(s: *EmitterState, stmt: *Stmt)
+    var sname: *u8 = null
+    var slen: i32 = 0
+    tuple_decl_struct_name(s, stmt.var_init, @sname, @slen)
+    var st: *StructDef = null
+    if slen > 0
+        st = find_struct(s, sname, slen)
+    let init_reg: i32 = emit_expr(s, stmt.var_init)
+    if st == null
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"ritz1 can't tell which struct this `let (a, b) = ...` destructures (destructure a call's result or a struct local, or bind the value with an annotated `let` first)")
+        tuple_decl_placeholders(s, stmt)
+        return
+    let f0: *StructField = get_field_type(st, 0)
+    let f1: *StructField = get_field_type(st, 1)
+    if f0 == null or f1 == null
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"`let (a, b) = ...` needs a struct with at least two fields to destructure")
+        tuple_decl_placeholders(s, stmt)
+        return
+    if tuple_field_bindable(f0) == 0 or tuple_field_bindable(f1) == 0
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"ritz1 can't destructure a field of this type (an array, `@` / `@&` or fn-typed field): read it as `v.f` instead")
+        tuple_decl_placeholders(s, stmt)
+        return
+    tuple_bind_field(s, f0, sname, slen, init_reg, 0, stmt.var_name, stmt.var_name_len)
+    tuple_bind_field(s, f1, sname, slen, init_reg, 1, stmt.assign_target, stmt.assign_target_len)
+
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     let shared_ref: i32 = let_holds_shared_ref(s, stmt)
     # Use the user's explicit type annotation. The parser defaults
@@ -3678,97 +3831,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         binder_mark_decl(s, stmt, locals_before)   # AGAST #2407
         own_decl(s, stmt, locals_before)   # AGAST #2158
     else if stmt.kind == STMT_TUPLE_DECL
-        # `let (x, y) = expr` — destructure 2-field struct value.  Resolve
-        # the struct type from the init expr, extract fields 0 and 1, and
-        # bind two locals (sign/zero-extended to i64 for uniform storage).
-        let init_reg: i32 = emit_expr(s, stmt.var_init)
-        let init_type: i32 = get_expr_type(s, stmt.var_init)
-        var struct_name: *u8 = null
-        var struct_name_len: i32 = 0
-        # Pull the type name from the call/expr's return-type metadata.
-        if stmt.var_init.kind == EXPR_CALL
-            let cn: *u8 = stmt.var_init.func_name
-            let cn_len: i32 = stmt.var_init.func_name_len
-            let fn_def: *FnDef = find_fn(s, cn, cn_len)
-            if fn_def != null and fn_def.return_type_name_len > 0
-                struct_name = fn_def.return_type_name as *u8
-                struct_name_len = fn_def.return_type_name_len
-        # Fall back: if init is a struct ident, use its type name.
-        if struct_name_len == 0
-            if stmt.var_init.kind == EXPR_IDENT
-                let lv: *LocalVar = find_local_struct_name(s, stmt.var_init.ident_ptr, stmt.var_init.ident_len)
-                if lv != null
-                    struct_name = lv.type_name
-                    struct_name_len = lv.type_name_len
-        if struct_name_len > 0
-            let st: *StructDef = find_struct(s, struct_name, struct_name_len)
-            # Slot 1 — first field
-            let slot1: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, slot1)
-            emit_str(s, c" = alloca i64\n")
-            let f1_val: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, f1_val)
-            emit_str(s, c" = extractvalue %")
-            emit_name(s, struct_name, struct_name_len)
-            emit_str(s, c" ")
-            emit_reg(s, init_reg)
-            emit_str(s, c", 0\n")
-            # Widen field 0 to i64 (i32 sext / i8 sext / i64 passthrough).
-            var f1_ext: i32 = f1_val
-            if st != null
-                let fld0: *StructField = get_field_type(st, 0)
-                if fld0 != null
-                    if fld0.field_type == TYPE_I32 or fld0.field_type == TYPE_U32
-                        f1_ext = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, f1_ext)
-                        if fld0.field_type == TYPE_I32
-                            emit_str(s, c" = sext i32 ")
-                        else
-                            emit_str(s, c" = zext i32 ")
-                        emit_reg(s, f1_val)
-                        emit_str(s, c" to i64\n")
-            emit_str(s, c"  store i64 ")
-            emit_reg(s, f1_ext)
-            emit_str(s, c", ptr ")
-            emit_reg(s, slot1)
-            emit_str(s, c"\n")
-            add_local(s, stmt.var_name, stmt.var_name_len, slot1, TYPE_I64)
-            # Slot 2 — second field
-            let slot2: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, slot2)
-            emit_str(s, c" = alloca i64\n")
-            let f2_val: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, f2_val)
-            emit_str(s, c" = extractvalue %")
-            emit_name(s, struct_name, struct_name_len)
-            emit_str(s, c" ")
-            emit_reg(s, init_reg)
-            emit_str(s, c", 1\n")
-            var f2_ext: i32 = f2_val
-            if st != null
-                let fld1: *StructField = get_field_type(st, 1)
-                if fld1 != null
-                    if fld1.field_type == TYPE_I32 or fld1.field_type == TYPE_U32
-                        f2_ext = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, f2_ext)
-                        if fld1.field_type == TYPE_I32
-                            emit_str(s, c" = sext i32 ")
-                        else
-                            emit_str(s, c" = zext i32 ")
-                        emit_reg(s, f2_val)
-                        emit_str(s, c" to i64\n")
-            emit_str(s, c"  store i64 ")
-            emit_reg(s, f2_ext)
-            emit_str(s, c", ptr ")
-            emit_reg(s, slot2)
-            emit_str(s, c"\n")
-            add_local(s, stmt.assign_target, stmt.assign_target_len, slot2, TYPE_I64)
+        emit_tuple_decl(s, stmt)   # AGAST #2574
     else if stmt.kind == STMT_ASSIGN
         emit_assign(s, stmt)
     else if stmt.kind == STMT_RETURN
