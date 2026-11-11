@@ -5,6 +5,7 @@
 import ritzlib.sys
 
 import aes_gcm
+import crypto_error
 import mem
 
 # ============================================================================
@@ -153,7 +154,13 @@ pub fn tls13_record_encrypt(key: *u8, key_len: i32, iv: *u8, seq: u64, plaintext
         return -3
 
     var tag: [16]u8
-    aes128_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 5, @inner[0], inner_len as u64, @out[TLS_RECORD_HEADER_LEN], @tag[0])
+    # inner_len <= 8192, far under the GCM limit; still fail closed on Err.
+    match aes128_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 5, @inner[0], inner_len as i64, @out[TLS_RECORD_HEADER_LEN], @tag[0])
+        Ok(_) => 0
+        Err(_) =>
+            mem_zero(@inner[0], inner_len as u64)
+            mem_zero(@nonce[0], sizeof(nonce))
+            return -4
     mem_copy(@out[TLS_RECORD_HEADER_LEN + inner_len], @tag[0], 16)
 
     mem_zero(@inner[0], inner_len as u64)
@@ -216,8 +223,11 @@ pub fn tls13_record_decrypt(key: *u8, key_len: i32, iv: *u8, seq: u64, record: *
     let ct_ptr: *u8 = @record[TLS_RECORD_HEADER_LEN]
     let tag_ptr: *u8 = @record[TLS_RECORD_HEADER_LEN + inner_len]
 
-    let result: i32 = aes128_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], 5, ct_ptr, inner_len as u64, tag_ptr, @inner[0])
-    if result != 1
+    var authentic: bool = false
+    match aes128_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], 5, ct_ptr, inner_len as i64, tag_ptr, @inner[0])
+        Ok(_) => authentic = true
+        Err(_) => authentic = false
+    if not authentic
         mem_zero(@inner[0], inner_len as u64)
         mem_zero(@nonce[0], sizeof(nonce))
         return -7

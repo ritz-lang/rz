@@ -9,6 +9,7 @@
 
 import aes
 import cpuid
+import crypto_error
 
 # Memory helpers (inlined to work around module resolution issue)
 fn gcm_mem_zero(dst: *u8, len: i64) -> void
@@ -405,6 +406,28 @@ fn make_j0(nonce: *u8, nonce_len: i64, h: *GF128, j0: *u8) -> void
         gf128_to_bytes(@x, j0)
 
 # =============================================================================
+# Length limits (NIST SP 800-38D §5.2.1.1)
+# =============================================================================
+
+# Longest plaintext/ciphertext per invocation: len(P) <= 2^39 - 256 bits.
+# With a 96-bit IV the payload counter runs from inc32(J0) = 2 up to 2^32 - 1;
+# one more block and inc32 would wrap onto J0 (the tag mask) and then reuse the
+# keystream. So 2^32 - 2 blocks of 16 bytes = 2^36 - 32 bytes (~64 GiB).
+pub const AES_GCM_MAX_PT_LEN: i64 = 0xFFFFFFFE * 16
+
+# Longest AAD: len(A) <= 2^64 - 1 bits, i.e. 2^61 - 1 whole bytes.
+pub const AES_GCM_MAX_AAD_LEN: i64 = 0x1FFFFFFFFFFFFFFF
+
+# Refuse any AAD or text length past the SP 800-38D limits. Ok = text_len.
+# Every GCM entry point calls this before reading or writing a buffer.
+pub fn aes_gcm_check_lengths(aad_len: i64, text_len: i64) -> Result<i64, CryptoError>
+    if text_len > AES_GCM_MAX_PT_LEN
+        return Err(CryptoError.MessageTooLong)
+    if aad_len > AES_GCM_MAX_AAD_LEN
+        return Err(CryptoError.MessageTooLong)
+    Ok(text_len)
+
+# =============================================================================
 # AES-128-GCM API
 # =============================================================================
 
@@ -419,7 +442,12 @@ pub fn aes128_gcm_init(ctx: *AesGcm128, key: *u8) -> void
     aes128_encrypt_block(@ctx.aes_ctx, @zero_block[0], @h_bytes[0])
     ctx.h = gf128_from_bytes(@h_bytes[0])
 
-pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> i64
+# Encrypt pt into ct and write the 16-byte tag. Ok = ciphertext length.
+# Err(MessageTooLong) if pt_len > AES_GCM_MAX_PT_LEN or
+# aad_len > AES_GCM_MAX_AAD_LEN; then nothing is read or written.
+pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
+    aes_gcm_check_lengths(aad_len, pt_len)?
+
     var j0: [16]u8
     var counter: [16]u8
     var ectr: [16]u8
@@ -460,9 +488,15 @@ pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
         tag[i] = s[i] ^ ectr[i]
         i += 1
 
-    pt_len
+    Ok(pt_len)
 
-pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> i32
+# Verify the tag, then decrypt ct into pt. Ok = plaintext length.
+# Err(MessageTooLong) if ct_len or aad_len is past its SP 800-38D limit
+# (nothing is read or written); Err(AuthenticationFailed) if the tag does not
+# verify (pt is left untouched).
+pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
+    aes_gcm_check_lengths(aad_len, ct_len)?
+
     var j0: [16]u8
     var counter: [16]u8
     var ectr: [16]u8
@@ -482,7 +516,7 @@ pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
 
     # Constant-time tag comparison
     if gcm_mem_eq(@computed_tag[0], tag, 16) == 0
-        return 0  # Tag mismatch
+        return Err(CryptoError.AuthenticationFailed)
 
     # Decrypt ciphertext
     gcm_mem_copy(@counter[0], @j0[0], 16)
@@ -499,7 +533,7 @@ pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
 
         i = i + 16
 
-    1  # Success
+    Ok(ct_len)
 
 # =============================================================================
 # AES-256-GCM API
@@ -514,7 +548,10 @@ pub fn aes256_gcm_init(ctx: *AesGcm256, key: *u8) -> void
     aes256_encrypt_block(@ctx.aes_ctx, @zero_block[0], @h_bytes[0])
     ctx.h = gf128_from_bytes(@h_bytes[0])
 
-pub fn aes256_gcm_encrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> i64
+# As aes128_gcm_encrypt, with a 256-bit key.
+pub fn aes256_gcm_encrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
+    aes_gcm_check_lengths(aad_len, pt_len)?
+
     var j0: [16]u8
     var counter: [16]u8
     var ectr: [16]u8
@@ -543,9 +580,12 @@ pub fn aes256_gcm_encrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8,
         tag[i] = s[i] ^ ectr[i]
         i += 1
 
-    pt_len
+    Ok(pt_len)
 
-pub fn aes256_gcm_decrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> i32
+# As aes128_gcm_decrypt, with a 256-bit key.
+pub fn aes256_gcm_decrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
+    aes_gcm_check_lengths(aad_len, ct_len)?
+
     var j0: [16]u8
     var counter: [16]u8
     var ectr: [16]u8
@@ -563,7 +603,7 @@ pub fn aes256_gcm_decrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8,
         i += 1
 
     if gcm_mem_eq(@computed_tag[0], tag, 16) == 0
-        return 0
+        return Err(CryptoError.AuthenticationFailed)
 
     gcm_mem_copy(@counter[0], @j0[0], 16)
 
@@ -579,4 +619,4 @@ pub fn aes256_gcm_decrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8,
 
         i = i + 16
 
-    1
+    Ok(ct_len)

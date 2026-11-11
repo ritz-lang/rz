@@ -2,6 +2,7 @@
 # Test vectors from NIST SP 800-38D and RFC 5116
 
 import cryptosec.aes_gcm
+import cryptosec.crypto_error
 import cryptosec.mem
 import cryptosec.cpuid
 
@@ -13,6 +14,28 @@ fn bytes_equal(a: *u8, b: *u8, len: i64) -> i32
             return 0
         i += 1
     return 1
+
+# Bytes processed by an Ok result, or -1 for Err.
+fn ok_bytes(r: Result<i64, CryptoError>) -> i64
+    match r
+        Ok(n) => n
+        Err(_) => -1
+
+fn is_auth_failed(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.AuthenticationFailed => true
+                _ => false
+
+fn is_message_too_long(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.MessageTooLong => true
+                _ => false
 
 # =============================================================================
 # AES-128-GCM Tests
@@ -32,7 +55,9 @@ fn test_aes128_gcm_empty_pt_no_aad() -> i32
     var ctx: AesGcm128
     aes128_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, nil, 0, @ct[0], @tag[0])
+    let ct_len: i64 = ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, nil, 0, @ct[0], @tag[0]))
+    if ct_len != 0
+        return 90
 
     # Expected tag: 58e2fccefa7e3061367f1d57a4e7455a
     var expected_tag: [16]u8
@@ -75,7 +100,9 @@ fn test_aes128_gcm_16byte_pt() -> i32
     var ctx: AesGcm128
     aes128_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 16, @ct[0], @tag[0])
+    let ct_len: i64 = ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 16, @ct[0], @tag[0]))
+    if ct_len != 16
+        return 90
 
     # Expected ciphertext: 0388dace60b6a392f328c2b971b2fe78
     var expected_ct: [16]u8
@@ -149,10 +176,12 @@ fn test_aes128_gcm_roundtrip() -> i32
     var ctx: AesGcm128
     aes128_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 32, @ct[0], @tag[0])
-    let result: i32 = aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let ct_len: i64 = ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 32, @ct[0], @tag[0]))
+    if ct_len != 32
+        return 90
+    let result: i64 = ok_bytes(aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 1
+    if result != ct_len
         return 1
     if bytes_equal(@pt[0], @decrypted[0], 32) == 0
         return 2
@@ -183,10 +212,12 @@ fn test_aes128_gcm_with_aad() -> i32
     var ctx: AesGcm128
     aes128_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes128_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 16, @pt[0], 16, @ct[0], @tag[0])
-    let result: i32 = aes128_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], 16, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let ct_len: i64 = ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 16, @pt[0], 16, @ct[0], @tag[0]))
+    if ct_len != 16
+        return 90
+    let result: i64 = ok_bytes(aes128_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], 16, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 1
+    if result != ct_len
         return 1
     if bytes_equal(@pt[0], @decrypted[0], 16) == 0
         return 2
@@ -209,14 +240,16 @@ fn test_aes128_gcm_tampered_ct() -> i32
     var ctx: AesGcm128
     aes128_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 16, @ct[0], @tag[0])
+    let ct_len: i64 = ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 16, @ct[0], @tag[0]))
+    if ct_len != 16
+        return 90
 
     # Tamper with ciphertext
     ct[0] = ct[0] ^ 0x01
 
-    let result: i32 = aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let rejected: bool = is_auth_failed(aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 0
+    if not rejected
         return 1
     return 0
 
@@ -237,14 +270,16 @@ fn test_aes128_gcm_tampered_tag() -> i32
     var ctx: AesGcm128
     aes128_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 16, @ct[0], @tag[0])
+    let ct_len: i64 = ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 16, @ct[0], @tag[0]))
+    if ct_len != 16
+        return 90
 
     # Tamper with tag
     tag[0] = tag[0] ^ 0x01
 
-    let result: i32 = aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let rejected: bool = is_auth_failed(aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 0
+    if not rejected
         return 1
     return 0
 
@@ -277,10 +312,12 @@ fn test_aes256_gcm_roundtrip() -> i32
     var ctx: AesGcm256
     aes256_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes256_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 48, @ct[0], @tag[0])
-    let result: i32 = aes256_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let ct_len: i64 = ok_bytes(aes256_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 48, @ct[0], @tag[0]))
+    if ct_len != 48
+        return 90
+    let result: i64 = ok_bytes(aes256_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 1
+    if result != ct_len
         return 1
     if bytes_equal(@pt[0], @decrypted[0], 48) == 0
         return 2
@@ -316,10 +353,12 @@ fn test_aes256_gcm_with_aad() -> i32
     var ctx: AesGcm256
     aes256_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes256_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 20, @pt[0], 64, @ct[0], @tag[0])
-    let result: i32 = aes256_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], 20, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let ct_len: i64 = ok_bytes(aes256_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 20, @pt[0], 64, @ct[0], @tag[0]))
+    if ct_len != 64
+        return 90
+    let result: i64 = ok_bytes(aes256_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], 20, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 1
+    if result != ct_len
         return 1
     if bytes_equal(@pt[0], @decrypted[0], 64) == 0
         return 2
@@ -347,9 +386,269 @@ fn test_aes256_gcm_wrong_aad() -> i32
     var ctx: AesGcm256
     aes256_gcm_init(@ctx, @key[0])
 
-    let ct_len: i64 = aes256_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 16, @pt[0], 16, @ct[0], @tag[0])
-    let result: i32 = aes256_gcm_decrypt(@ctx, @nonce[0], 12, @wrong_aad[0], 16, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let ct_len: i64 = ok_bytes(aes256_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], 16, @pt[0], 16, @ct[0], @tag[0]))
+    if ct_len != 16
+        return 90
+    let rejected: bool = is_auth_failed(aes256_gcm_decrypt(@ctx, @nonce[0], 12, @wrong_aad[0], 16, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 0
+    if not rejected
         return 1
+    return 0
+
+# =============================================================================
+# Length limits (AGAST #2578, GitHub #133, NIST SP 800-38D §5.2.1.1)
+#
+# len(P) <= 2^39 - 256 bits: with a 96-bit IV the payload counter runs from
+# 2 to 2^32 - 1 (inc32 would wrap after that), so 2^32 - 2 blocks of 16 bytes.
+# len(A) <= 2^64 - 1 bits, i.e. 2^61 - 1 whole bytes.
+#
+# The at-limit side is checked through aes_gcm_check_lengths (a 64 GiB buffer
+# is not an option); the over-limit side through the real entry points, whose
+# buffers are far smaller than the claimed length, so any read or write before
+# the refusal would show up as a crash or a clobbered sentinel.
+# =============================================================================
+
+const SENTINEL: u8 = 0xAA
+const GCM_MAX_PT: i64 = 68719476704          # 2^36 - 32 bytes
+const GCM_MAX_AAD: i64 = 0x1FFFFFFFFFFFFFFF  # 2^61 - 1 bytes
+
+fn fill_sentinel(buf: *u8, len: i64) -> void
+    var i: i64 = 0
+    while i < len
+        buf[i] = SENTINEL
+        i += 1
+
+fn untouched(buf: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if buf[i] != SENTINEL
+            return 0
+        i += 1
+    return 1
+
+[[test]]
+fn test_aes_gcm_limit_constants() -> i32
+    if AES_GCM_MAX_PT_LEN != GCM_MAX_PT
+        return 1
+    if AES_GCM_MAX_AAD_LEN != GCM_MAX_AAD
+        return 2
+    return 0
+
+[[test]]
+fn test_aes_gcm_check_lengths_boundary() -> i32
+    # Text: at the limit is fine, one byte more is refused
+    if ok_bytes(aes_gcm_check_lengths(0, GCM_MAX_PT)) != GCM_MAX_PT
+        return 1
+    if not is_message_too_long(aes_gcm_check_lengths(0, GCM_MAX_PT + 1))
+        return 2
+    # AAD: same, independently of the text length
+    if ok_bytes(aes_gcm_check_lengths(GCM_MAX_AAD, 16)) != 16
+        return 3
+    if not is_message_too_long(aes_gcm_check_lengths(GCM_MAX_AAD + 1, 16))
+        return 4
+    # Both at the limit together
+    if ok_bytes(aes_gcm_check_lengths(GCM_MAX_AAD, GCM_MAX_PT)) != GCM_MAX_PT
+        return 5
+    return 0
+
+[[test]]
+fn test_aes128_gcm_encrypt_pt_too_long() -> i32
+    var key: [16]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 16)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm128
+    aes128_gcm_init(@ctx, @key[0])
+    var pt: [64]u8
+    var ct: [64]u8
+    var tag: [16]u8
+    fill_sentinel(@ct[0], 64)
+    fill_sentinel(@tag[0], 16)
+
+    if not is_message_too_long(aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], GCM_MAX_PT + 1, @ct[0], @tag[0]))
+        return 1
+    if untouched(@ct[0], 64) == 0
+        return 2
+    if untouched(@tag[0], 16) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_aes128_gcm_encrypt_aad_too_long() -> i32
+    var key: [16]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 16)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm128
+    aes128_gcm_init(@ctx, @key[0])
+    var aad: [16]u8
+    var pt: [16]u8
+    var ct: [16]u8
+    var tag: [16]u8
+    mem_zero(@pt[0], 16)
+    fill_sentinel(@ct[0], 16)
+    fill_sentinel(@tag[0], 16)
+
+    if not is_message_too_long(aes128_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], GCM_MAX_AAD + 1, @pt[0], 16, @ct[0], @tag[0]))
+        return 1
+    if untouched(@ct[0], 16) == 0
+        return 2
+    if untouched(@tag[0], 16) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_aes128_gcm_decrypt_ct_too_long() -> i32
+    var key: [16]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 16)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm128
+    aes128_gcm_init(@ctx, @key[0])
+    var ct: [64]u8
+    var tag: [16]u8
+    var pt: [64]u8
+    mem_zero(@ct[0], 64)
+    mem_zero(@tag[0], 16)
+    fill_sentinel(@pt[0], 64)
+
+    if not is_message_too_long(aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], GCM_MAX_PT + 1, @tag[0], @pt[0]))
+        return 1
+    if untouched(@pt[0], 64) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_aes128_gcm_decrypt_aad_too_long() -> i32
+    var key: [16]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 16)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm128
+    aes128_gcm_init(@ctx, @key[0])
+    var aad: [16]u8
+    var ct: [16]u8
+    var tag: [16]u8
+    var pt: [16]u8
+    mem_zero(@ct[0], 16)
+    mem_zero(@tag[0], 16)
+    fill_sentinel(@pt[0], 16)
+
+    if not is_message_too_long(aes128_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], GCM_MAX_AAD + 1, @ct[0], 16, @tag[0], @pt[0]))
+        return 1
+    if untouched(@pt[0], 16) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_aes256_gcm_encrypt_pt_too_long() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm256
+    aes256_gcm_init(@ctx, @key[0])
+    var pt: [64]u8
+    var ct: [64]u8
+    var tag: [16]u8
+    fill_sentinel(@ct[0], 64)
+    fill_sentinel(@tag[0], 16)
+
+    if not is_message_too_long(aes256_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], GCM_MAX_PT + 1, @ct[0], @tag[0]))
+        return 1
+    if untouched(@ct[0], 64) == 0
+        return 2
+    if untouched(@tag[0], 16) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_aes256_gcm_encrypt_aad_too_long() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm256
+    aes256_gcm_init(@ctx, @key[0])
+    var aad: [16]u8
+    var pt: [16]u8
+    var ct: [16]u8
+    var tag: [16]u8
+    mem_zero(@pt[0], 16)
+    fill_sentinel(@ct[0], 16)
+    fill_sentinel(@tag[0], 16)
+
+    if not is_message_too_long(aes256_gcm_encrypt(@ctx, @nonce[0], 12, @aad[0], GCM_MAX_AAD + 1, @pt[0], 16, @ct[0], @tag[0]))
+        return 1
+    if untouched(@ct[0], 16) == 0
+        return 2
+    if untouched(@tag[0], 16) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_aes256_gcm_decrypt_ct_too_long() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm256
+    aes256_gcm_init(@ctx, @key[0])
+    var ct: [64]u8
+    var tag: [16]u8
+    var pt: [64]u8
+    mem_zero(@ct[0], 64)
+    mem_zero(@tag[0], 16)
+    fill_sentinel(@pt[0], 64)
+
+    if not is_message_too_long(aes256_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], GCM_MAX_PT + 1, @tag[0], @pt[0]))
+        return 1
+    if untouched(@pt[0], 64) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_aes256_gcm_decrypt_aad_too_long() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm256
+    aes256_gcm_init(@ctx, @key[0])
+    var aad: [16]u8
+    var ct: [16]u8
+    var tag: [16]u8
+    var pt: [16]u8
+    mem_zero(@ct[0], 16)
+    mem_zero(@tag[0], 16)
+    fill_sentinel(@pt[0], 16)
+
+    if not is_message_too_long(aes256_gcm_decrypt(@ctx, @nonce[0], 12, @aad[0], GCM_MAX_AAD + 1, @ct[0], 16, @tag[0], @pt[0]))
+        return 1
+    if untouched(@pt[0], 16) == 0
+        return 2
+    return 0
+
+# A forged tag is refused and the plaintext buffer is left untouched.
+[[test]]
+fn test_aes128_gcm_auth_failure_writes_nothing() -> i32
+    var key: [16]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 16)
+    mem_zero(@nonce[0], 12)
+    var ctx: AesGcm128
+    aes128_gcm_init(@ctx, @key[0])
+    var pt: [32]u8
+    mem_zero(@pt[0], 32)
+    var ct: [32]u8
+    var tag: [16]u8
+    if ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, nil, 0, @pt[0], 32, @ct[0], @tag[0])) != 32
+        return 1
+    tag[15] = tag[15] ^ 0x80
+    var out: [32]u8
+    fill_sentinel(@out[0], 32)
+    if not is_auth_failed(aes128_gcm_decrypt(@ctx, @nonce[0], 12, nil, 0, @ct[0], 32, @tag[0], @out[0]))
+        return 2
+    if untouched(@out[0], 32) == 0
+        return 3
     return 0

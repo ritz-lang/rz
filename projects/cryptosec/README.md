@@ -59,13 +59,21 @@ hmac_sha256(key, key_len, message, msg_len, @mac[0])
 ```ritz
 import lib.aes_gcm
 
-# AES-256-GCM encryption
+# AES-256-GCM encryption. Both calls return Result<i64, CryptoError>:
+# Err(MessageTooLong) past the NIST SP 800-38D limits (nothing is written),
+# Err(AuthenticationFailed) on a bad tag (plaintext is left untouched).
+var ctx: AesGcm256
+aes256_gcm_init(@ctx, key)
 var ciphertext: [MAX_LEN]u8
 var tag: [16]u8
-aes256_gcm_encrypt(key, nonce, plaintext, pt_len, @ciphertext[0], @tag[0])
+match aes256_gcm_encrypt(@ctx, nonce, 12, aad, aad_len, plaintext, pt_len, @ciphertext[0], @tag[0])
+    Ok(n) => n
+    Err(e) => return -1
 
 # AES-256-GCM decryption (authenticated)
-let ok: i32 = aes256_gcm_decrypt(key, nonce, ciphertext, ct_len, tag, @plaintext[0])
+match aes256_gcm_decrypt(@ctx, nonce, 12, aad, aad_len, @ciphertext[0], ct_len, @tag[0], @plaintext[0])
+    Ok(n) => n
+    Err(e) => return -1
 ```
 
 ```ritz
