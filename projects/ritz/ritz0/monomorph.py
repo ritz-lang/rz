@@ -185,8 +185,32 @@ def mangle_type_name(ty: rast.Type) -> str:
         return f"arr{ty.size}_{mangle_type_name(ty.inner)}"
     elif isinstance(ty, rast.SliceType):
         return f"slice_{mangle_type_name(ty.inner)}"
-    else:
-        return "unknown"
+    # Every type below fell through to "unknown" until AGAST #2270, so e.g.
+    # `wrap<Result<(), E>>` and `wrap<Result<(i64, i64), E>>` were one
+    # instantiation and a valid program was rejected.
+    elif isinstance(ty, rast.TupleType):
+        # Spelled as the emitter's `_type_to_name_suffix` spells it, so a tuple
+        # has one name whether or not the monomorphizer routes it.
+        if not ty.elements:
+            return "unit"
+        return "tuple_" + "_".join(mangle_type_name(e) for e in ty.elements)
+    elif isinstance(ty, rast.FnType):
+        # The arity and `ret` marker keep params and return type apart:
+        # fn(i32) -> i64 is fn1_i32_ret_i64, fn(i64) -> i32 is fn1_i64_ret_i32.
+        params = "".join(f"_{mangle_type_name(p)}" for p in ty.params)
+        ret = mangle_type_name(ty.ret) if ty.ret is not None else "unit"
+        return f"fn{len(ty.params)}{params}_ret_{ret}"
+    elif isinstance(ty, rast.DynType):
+        args = "".join(f"_{mangle_type_name(a)}" for a in ty.args)
+        return f"dyn_{ty.trait_name}{args}"
+    elif isinstance(ty, rast.VectorType):
+        return f"vec{ty.count}_{mangle_type_name(ty.inner)}"
+    elif isinstance(ty, rast.UnionType):
+        variants = "_".join(mangle_type_name(v) for v in ty.variants)
+        return f"union{len(ty.variants)}_{variants}"
+    # A shared fallback name is what made distinct types collide: a new Type
+    # node must be given a spelling here.
+    raise TypeError(f"mangle_type_name: no spelling for {type(ty).__name__}")
 
 
 def mangle_generic_name(base_name: str, type_args: List[rast.Type]) -> str:

@@ -21,7 +21,7 @@ later as IR clang rejects, a `ret` of the wrong type:
     ret %"enum...Result$Vec_Page_Er" %".27"     (in a `Result$unknown_Er` fn)
 
 which is the ticket's second symptom. The `unknown` in that name is a separate
-defect in `mangle_type_name`, AGAST #2270, pinned by a strict xfail below.
+defect in `mangle_type_name`, AGAST #2270, fixed and pinned below.
 
 Every program declares the competing specialization AFTER the fn under test
 where order matters, since the last one registered is the one that wins. Each
@@ -618,7 +618,7 @@ fn main() -> i32
 """
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2270: every tuple mangles as unknown")
+# AGAST #2270: every tuple mangled as `unknown`, so both `wrap`s collided.
 def test_ritz0_tuple_args_do_not_collide(tmp_path):
     assert _run("ritz0", tmp_path, "tuple_args", TUPLE_ARGS) == 3
 
