@@ -185,6 +185,16 @@ brief, verify the agent woke), with these ritz values:
 | Model | `opus` |
 | Callback room | `rz` |
 
+**"START poke sent" doesn't mean the room started.** Within ~2 minutes of
+`adele room spawn`, check the room has posted a `claude_response` or tool use
+(`get_conversation_messages`). If it's silent, re-send with
+`adele room spawn <room> … --poke`. The poke is a live broadcast, not a
+queued message: #2573's agent connected, lost its socket a second later and
+reconnected 5 s after that, and the poke landed in the gap (2026-11-11; Aaron
+had to re-poke it by hand). AGAST #2724 (adele) makes `adele room spawn`
+wait for the turn to start and re-poke itself; keep this check until it has
+landed and been confirmed here.
+
 Create the room on the server **before** `systemctl start`, or the agent
 crash-loops on HTTP 400. Use `send_room_message` ("Room initialized for AGAST
 #<id>."); `update_room_description` does NOT create a room, it returns "not
