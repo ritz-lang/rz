@@ -89,10 +89,16 @@ stays here; remote hosts only run rooms.
 | toffee | `adele-toffee` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~10 GB free. Linger on, `llvmlite` and `lld` 21 installed, smoke passes. First remote trial host |
 | starbux | `adele-starbux` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~9 GB free beside `adele`'s rooms. Smoke passes; `lld` is a user-local copy (`~/.local/opt/lld-21`). Hold lifted by Aaron 2026-11-11 (first room #2577) |
 | chungus | `adele-chungus` | 1 | no | 8 cores, 14 GB, only ~5 GB free (another user's desktop session) and 47 GB disk. Smoke passes. Not ready until Aaron says so |
+| huburght | `adele-huburght` | 1 (trial) | yes (2026-11-11) | 12 cores, 47 GB, WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. First room #2582; 2 slots once it merges cleanly. Coarse mtime clock (#2689) |
 
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
   changes its slots. Edit this table and commit it on `main` when they do.
   A host's first room is a small, low-risk ticket.
+- **Before a new host's first room**, check more than smoke: smoke doesn't
+  use LLVM, so it passed on huburght with only LLVM 20 and the gate then
+  failed at setup. Check `ls /usr/lib/llvm-21/bin/{clang,opt,llc,lld}` and
+  `~/dev/.venv/bin/pip show pytest` (must be `<9.2`; 9.2.0 broke the toffee
+  gate) as well.
 - **No harland/UEFI tickets on remote hosts** until an `lld`-linked harland
   build has passed there. No host has node or docker. No full gate has
   run on a remote host before the toffee trial; if a remote gate can't run,
@@ -137,7 +143,7 @@ stays here; remote hosts only run rooms.
 - **Push by refspec on remote hosts.** Plain `git fetch` / `git push` work
   on every host (the `ssh -F /dev/null` workaround from toffee 2026-11-11 is
   no longer needed; don't put it in briefings). Remote rooms push with the
-  explicit refspec `git push -f origin HEAD:refs/heads/ritz-task-<id>`: host
+  explicit refspec `git push --force-with-lease origin HEAD:refs/heads/ritz-task-<id>`: host
   worktrees are created with `-b ... origin/main`, so the branch tracks
   `main`, and a bare `git push` would aim at `main`.
 - **Shared hosts.** `adele` runs its own rooms on the same hosts (for
@@ -292,8 +298,12 @@ vouches for that exact commit.
    Otherwise fix, re-squash, re-run.
 7. **Don't chase `main`.** REAP the commit you gated. `rz` tells you when to
    rebase.
-8. **Push and REAP:** `git push -f origin ritz-task-<id>` (remote rooms:
-   `git push -f origin HEAD:refs/heads/ritz-task-<id>`), then exactly one:
+8. **Push and REAP:** `git push --force-with-lease origin ritz-task-<id>`
+   (remote rooms: `git push --force-with-lease origin
+   HEAD:refs/heads/ritz-task-<id>`). Never `-f`/`--force`: the lease refuses
+   to overwrite a branch someone else moved. If it's rejected as stale,
+   `git fetch origin`, check `origin/ritz-task-<id>` is your own earlier
+   push, and retry; if it isn't yours, stop and tell `rz`. Then exactly one:
    ```
    mcp__adele-context__send_room_message(
        room_id="rz",
