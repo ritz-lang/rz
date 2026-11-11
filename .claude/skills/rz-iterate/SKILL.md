@@ -45,8 +45,9 @@ Repeat until the goal is met:
      disabled (`systemctl --user disable --now adele-agent@ritz-task-<id>`) but
      whose worktree still exists is paused, not finished. Resume it
      (`enable --now`, then a message stating `main` and its last state) before
-     spawning anything new. Remote hosts have no pause verb yet; a remote
-     room runs until it merges or is torn down.
+     spawning anything new. A paused remote room gets `RESUME
+     ritz-task-<id>` sent to its host room (see "Hosts"), then the same
+     message.
    - Otherwise pick `ready` AGAST tickets that move the current milestone
      forward (see "Where to start"), up to the limit.
    - Don't run two rooms that will rewrite the same heavily edited file
@@ -112,15 +113,42 @@ stays here; remote hosts only run rooms.
     `origin/main`, because `run-gate.sh` is read from there.
   - `RESTART ritz-task-<id>`: restarts a room that isn't working.
   - `TEARDOWN ritz-task-<id>`: removes the room's unit, budget, worktree and
-    local branch after its merge. The host answers `TORN-DOWN ritz-task-<id>
-    on <host>`; the slot is free from then.
+    local branch after its merge. The host answers `TORNDOWN ritz-task-<id>
+    on <host>` (one word, no hyphen); the slot is free from then. Refusal is
+    `TEARDOWN-REFUSED ritz-task-<id> on <host>: <blocker>`.
   - `STATUS`: free memory, running rooms, each room's last journal line, and
     any room with a `pending-mcp` file or 401s in its journal.
-  - Proposed in #2609, not yet agreed: `PAUSE` / `RESUME ritz-task-<id>`
-    (stop and disable the unit, keeping the worktree; answered `PAUSED` /
-    `RESUMED`). Every host answer is sent with `ask_claude=True`.
-- **Host answers aren't REAPs.** `SPAWNED`, `SPAWN-FAILED` and `STATUS`
-  replies never go in the scratchpad. On `SPAWN-FAILED`, release the claim
+  - `PAUSE` / `RESUME ritz-task-<id>`: disable and stop the unit, keeping the
+    worktree and branch. Answered `PAUSED` / `RESUMED ritz-task-<id> on
+    <host>`.
+  - Every host answer is sent with `ask_claude=True`.
+- **What to spell out in a host message.** All three hosts run the `borque`
+  skill (adele `9db5b9a`, confirmed 2026-11-11), so `SPAWN` and `TEARDOWN`
+  no longer need their steps written out. Until `adele` says PR #25 has
+  landed and been pulled, still spell out inline:
+  - the fast-forward of the host's `~/dev/ritz-lang/rz` to `origin/main`
+    (first step of every `SPAWN`; refuse with `SPAWN-FAILED` if it won't
+    fast-forward);
+  - what `PAUSE` / `RESUME` do, if you send them.
+  Every `SPAWN` still tells the host to **save the briefing with a Bash
+  here-doc, never the `Write` tool**: `Write` outside the host's workspace
+  waits on an approval nobody gives, and the host room stalls for up to 30
+  minutes (starbux 2026-11-10, toffee 2026-11-11).
+- **Git over ssh on remote hosts.** Under the agent's user namespace the
+  host's `ssh_config.d` fails a permissions check, so plain `git fetch` /
+  `git push` fail (toffee, 2026-11-11). Every remote briefing tells the room
+  to use `GIT_SSH_COMMAND="ssh -F /dev/null"` for fetch and push, and to push
+  with the explicit refspec `git push -f origin
+  HEAD:refs/heads/ritz-task-<id>`. Host worktrees are created with
+  `-b ... origin/main`, so the branch tracks `main`, and a bare `git push`
+  would aim at `main`.
+- **Shared hosts.** `adele` runs its own rooms on the same hosts (for
+  example `task-2546` on toffee) within the host's slots. Never send
+  `PAUSE`, `RESTART` or `TEARDOWN` for a room that isn't `ritz-task-*`. If
+  a gate looks starved by one, message `adele` (main) and it will pause it.
+  `adele` has ssh to every host; ask it to look if a host room goes quiet.
+- **Host answers aren't REAPs.** `SPAWNED`, `SPAWN-FAILED`, `TORNDOWN`,
+  `PAUSED`, `RESUMED` and `STATUS` replies never go in the scratchpad. On `SPAWN-FAILED`, release the claim
   (`release_task`), tell Aaron the reason in the turn report, and don't
   retry that host until the cause is fixed.
 - **A host that doesn't answer within 10 minutes** (asleep, agent
@@ -261,7 +289,9 @@ vouches for that exact commit.
    Otherwise fix, re-squash, re-run.
 7. **Don't chase `main`.** REAP the commit you gated. `rz` tells you when to
    rebase.
-8. **Push and REAP:** `git push -f origin ritz-task-<id>`, then exactly one:
+8. **Push and REAP:** `git push -f origin ritz-task-<id>` (remote rooms:
+   `GIT_SSH_COMMAND="ssh -F /dev/null" git push -f origin
+   HEAD:refs/heads/ritz-task-<id>`), then exactly one:
    ```
    mcp__adele-context__send_room_message(
        room_id="rz",
@@ -347,7 +377,7 @@ reap ritz-task-1450 1a2b3c4
    `git branch -D`, `git push origin --delete ritz-task-<id>`).
    **Remote room:** send `TEARDOWN ritz-task-<id>` to its host room instead
    of the local steps, and still run `git push origin --delete
-   ritz-task-<id>` here. Its slot is free once the host confirms.
+   ritz-task-<id>` here. Its slot is free once the host answers `TORNDOWN`.
 5. **Not on current main (the usual case):** this room is next, so it gets
    the turn. Send it one line with `ask_claude=True`:
    "your turn: rebase onto <sha7>, re-gate and REAP again". Leave its item
