@@ -161,7 +161,7 @@ def test_run_steps_counts_an_exception_as_failure():
 def test_step_order_is_the_design():
     # fast-iteration.md §4: cheapest, most-likely-broken first.
     assert [s.name for s in smoke.build_steps()] == [
-        "check-no-s-strings", "regen-check", "pytest -m smoke",
+        "timeout --signal=KILL", "check-no-s-strings", "regen-check", "pytest -m smoke",
         "build ritz1", "canary matrix", "ritz1 self-compile",
     ]
 
@@ -169,6 +169,72 @@ def test_step_order_is_the_design():
 @pytest.mark.unit
 def test_budgets_sum_within_two_minutes():
     assert sum(s.budget for s in smoke.build_steps()) <= 120
+
+
+# --------------------------------------------------------------------------
+# AGAST #2745: `timeout --signal=KILL` must enforce its limit
+# --------------------------------------------------------------------------
+# uutils 0.2.x `timeout --signal=KILL 1s sleep 6` runs the full 6 s, so
+# regression.sh's per-example run budgets silently stop existing and a hanging
+# example hangs the gate. Smoke probes it first and calls it a SETUP ERROR.
+
+def _fake_timeout(tmp_path, body: str) -> dict:
+    """A PATH whose `timeout` is a shell script with `body`, then the real PATH."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "timeout"
+    fake.write_text("#!/bin/sh\n" + body)
+    fake.chmod(0o755)
+    import os
+    return {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+
+# Short probe parameters keep the tests fast; production uses 1s / 3 s.
+FAST = {"limit": 0.2, "sleep": 1.5}
+
+
+@pytest.mark.integration
+def test_timeout_probe_passes_with_the_real_timeout():
+    out = io.StringIO()
+    assert smoke.timeout_kill_probe(out=out, **FAST) == 0
+    assert "SETUP ERROR" not in out.getvalue()
+
+
+@pytest.mark.integration
+def test_timeout_probe_reports_setup_error_when_the_limit_is_ignored(tmp_path):
+    # The uutils 0.2.x behaviour: ignore `--signal=KILL <limit>`, run the
+    # command to completion, then exit 124 as if it had timed out -- so only
+    # the wall time gives it away.
+    env = _fake_timeout(tmp_path, 'shift 2\n"$@"\nexit 124\n')
+    out = io.StringIO()
+    rc = smoke.timeout_kill_probe(out=out, env=env, **FAST)
+    text = out.getvalue()
+    assert rc == smoke.EXIT_SETUP == 3
+    assert "SETUP ERROR" in text
+    assert "coreutils-from-gnu" in text  # names the fix
+
+
+@pytest.mark.integration
+def test_timeout_probe_reports_setup_error_when_timeout_is_missing(tmp_path):
+    out = io.StringIO()
+    rc = smoke.timeout_kill_probe(out=out, env={"PATH": str(tmp_path)}, **FAST)
+    assert rc == smoke.EXIT_SETUP
+    assert "SETUP ERROR" in out.getvalue()
+
+
+@pytest.mark.integration
+def test_timeout_probe_reports_setup_error_when_the_command_is_not_killed(tmp_path):
+    # Returns on time but never killed anything (exit 0): not a working timeout.
+    env = _fake_timeout(tmp_path, "exit 0\n")
+    out = io.StringIO()
+    assert smoke.timeout_kill_probe(out=out, env=env, **FAST) == smoke.EXIT_SETUP
+    assert "SETUP ERROR" in out.getvalue()
+
+
+@pytest.mark.unit
+def test_smoke_setup_error_exit_code_matches_ci_local():
+    # run-gate.sh / ci_local read exit 3 as "the machine's fault".
+    assert smoke.EXIT_SETUP == ci_local.EXIT_SETUP
 
 
 @pytest.mark.integration

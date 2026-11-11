@@ -9,6 +9,8 @@ the first step of main.yml's bootstrap job — and stops at the first failure.
 
 Steps, cheapest and most-likely-broken first:
 
+  0. timeout --signal=KILL                the run budgets regression.sh relies
+                                          on are enforced (#2745; SETUP ERROR)
   1. check-no-s-strings, regen-check      banned syntax, generator drift
   2. pytest -m smoke  (ritz0/, serial)    broken ritz0 front end / tooling
   3. build ritz1 (incremental, -j)        ritz1 does not build
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,6 +54,9 @@ SELF_COMPILE_SRC = RITZ_ROOT / "ritz1" / "src" / "tokens_gen.ritz"
 RITZ1_BIN = Path(matrix.RITZ1)
 # Lines of a failing step's captured output to show.
 FAIL_TAIL = 60
+# "This machine lacks a working tool", not "this commit is broken" -- the same
+# code as ci_local.EXIT_SETUP and build.py's (AGAST #2141).
+EXIT_SETUP = 3
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +176,52 @@ def _make(*targets: str, cwd: Path = RITZ_ROOT) -> list[str]:
 # Steps
 # --------------------------------------------------------------------------
 
+def timeout_kill_probe(limit: float = 1.0, sleep: float = 3.0,
+                       out: TextIO = sys.stdout,
+                       env: dict | None = None) -> int:
+    """`timeout --signal=KILL` really kills at its limit (AGAST #2745).
+
+    regression.sh wraps every example run (and each example's test.sh) in
+    `timeout --signal=KILL <budget>`.  uutils 0.2.x (Ubuntu's
+    coreutils-from-uutils) ignores the limit with --signal=KILL and runs the
+    command to completion, so on such a host no run budget exists and one
+    hanging example hangs the whole gate.  That is the machine's fault, not the
+    commit's: report it as a SETUP ERROR (exit EXIT_SETUP), naming the fix.
+
+    `env` overrides os.environ (tests put a fake `timeout` on PATH).
+    """
+    run_env = dict(os.environ, **(env or {}))
+    path = run_env.get("PATH", "")
+    exe = shutil.which("timeout", path=path) or "timeout"
+    cmd = [exe, "--signal=KILL", f"{limit:g}s", "sleep", f"{sleep:g}"]
+    # Killed at `limit`, or ran to `sleep`: split the difference so a
+    # contended host's scheduling jitter cannot flip the verdict.
+    deadline = (limit + sleep) / 2
+    t0 = time.monotonic()
+    try:
+        rc = subprocess.run(cmd, check=False, env=run_env, timeout=sleep + 30,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL).returncode
+        why = None
+    except FileNotFoundError:
+        rc, why = None, f"no `timeout` on PATH ({path})"
+    dt = time.monotonic() - t0
+    if why is None and dt >= deadline:
+        why = (f"`{' '.join(cmd)}` ran {dt:.1f} s: the {limit:g} s limit "
+               f"was not enforced")
+    elif why is None and rc not in (124, 137):
+        # GNU exits 137 (killed by SIGKILL); uutils >= 0.8 exits 124.
+        why = f"`{' '.join(cmd)}` exited {rc} after {dt:.1f} s, not 124/137"
+    if why is None:
+        return 0
+    print(f"  ⚠ SETUP ERROR: {why}.", file=out)
+    print("    regression.sh's per-example run budgets use `timeout --signal=KILL`;"
+          " without it a hanging example hangs the gate.", file=out)
+    print("    Fix: `sudo apt install coreutils-from-gnu` (GNU timeout), or a newer"
+          " uutils (0.8.0 enforces it). Not a regression.", file=out)
+    return EXIT_SETUP
+
+
 def pytest_smoke(out: TextIO = sys.stdout) -> int:
     # Serial on purpose: under xdist the controller builds ritz1 before any
     # worker starts (ritz0/conftest.py item 4) — step 3's job, not this one's.
@@ -221,6 +273,8 @@ def self_compile(ritz1: Path = RITZ1_BIN, src: Path = SELF_COMPILE_SRC,
 
 def build_steps(out: TextIO = sys.stdout) -> list[Step]:
     return [
+        # First: a broken timeout makes every later run budget meaningless.
+        Step("timeout --signal=KILL", 2, lambda: timeout_kill_probe(out=out)),
         Step("check-no-s-strings", 2, lambda: _run(_make("check-no-s-strings"), out=out)),
         Step("regen-check", 3, lambda: _run(_make("regen-check"), out=out)),
         Step("pytest -m smoke", 45, lambda: pytest_smoke(out)),
