@@ -219,6 +219,11 @@ it's there, `complete_task` with the evidence instead of spawning. Also add a
 You can't run `git worktree`, `systemctl`, `provision-room.sh` or
 `host-budget.sh` there; the host room does all of that. What stays here:
 
+0. **Ask the host for `STATUS` first** and wait for the answer. Count its
+   rooms from that reply, not from an earlier report: `adele` starts and
+   stops its own rooms there, and a 1-hour-old count put #2577 on starbux as
+   a 3rd room on a 2-slot host (2026-11-11). Don't send `SPAWN` and `STATUS`
+   together; the host may act on the `SPAWN` before it reads the `STATUS`.
 1. **Create the room on the server first**, as above (`send_room_message`
    "Room initialized for AGAST #<id>.", then `update_room_description`), so
    the remote agent doesn't crash-loop on HTTP 400.
