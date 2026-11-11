@@ -79,9 +79,7 @@ _RITZ1_TWINS = {
     "test_trait_bounds":
         "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "
         "(multi-arg generic calls)",
-    # `[T]` parses since #1614; these stop later now.
-    "test_issue_slice_generic_payload":
-        "AGAST #2573 — slice of a match-pattern binding (`Ok(s) => s[1..3]`)",
+    # `[T]` parses since #1614; this stops later now.
     "test_issue_slice_generic_siblings":
         "AGAST #1615 (2.5f32); also AGAST #2501 (a Vec slice into a Span / "
         "`[u8]` payload), #1616 (empty [])",

@@ -960,12 +960,124 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
         # *Expr — they're real expressions, not Stmts.
         if s.if_cond != null
             collect_from_expr(m, s.if_cond)
-        var sarm: *MatchArm = s.if_then as *MatchArm
-        while sarm != null
-            collect_from_fn_body(m, sarm.body_stmts)   # block arm (AGAST #1454)
-            if sarm.body != null
-                collect_from_expr(m, sarm.body)
-            sarm = sarm.next
+        collect_from_arms(m, s.if_cond, s.if_then as *MatchArm)
+
+# Walk a match's (or an if's) arms.  Each arm is a scope (AGAST #2573): its
+# payload binding (`Some(x)`, `Ok(x)`, `Hit(x)`) is recorded at the payload's
+# type for that arm only, and the arm's own lets go with it, so a second arm
+# binding `x` at another type finds its own.  (No outer local can share the
+# name: #2395 refuses that.)  `scrut` is null for an if.
+fn collect_from_arms(m: *Module, scrut: *Expr, arms: *MatchArm)
+    var tn_len: i32 = 0
+    let tn: *u8 = scrutinee_type_name(m, scrut, @tn_len)
+    var arm: *MatchArm = arms
+    while arm != null
+        let saved_count: i32 = g_lv_count
+        bind_arm_payload(m, arm, tn, tn_len)
+        collect_from_fn_body(m, arm.body_stmts)   # block arm (AGAST #1454)
+        if arm.body != null
+            collect_from_expr(m, arm.body)
+        g_lv_count = saved_count
+        arm = arm.next
+
+# AGAST #2573: the mangled type of a match scrutinee, as far as this walk
+# knows it: a tracked local's (`let o = wrap(v)`, a param), or a plain fn
+# call's return type (`match wrap(v)`).  null for anything else.
+fn scrutinee_type_name(m: *Module, e: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if e == null
+        return null
+    if e.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(e.ident_ptr, e.ident_len)
+        if idx < 0 or *(g_lv_by_value + idx) != 1 or *(g_lv_prefix_kind + idx) != 0
+            return null
+        *out_len = *(g_lv_type_name_lens + idx)
+        return *(g_lv_type_names + idx)
+    if e.kind == EXPR_CALL and e.call_type_suffix_len == 0
+        let f: *FnDef = find_fn_in_module(m, e.func_name, e.func_name_len)
+        if f == null or f.type_params != null or f.return_type != TYPE_STRUCT or f.return_type_name == null
+            return null
+        *out_len = f.return_type_name_len
+        return f.return_type_name
+    return null
+
+# Record `Ctor(x)`'s `x` at its payload's type, so `x[lo..hi]` is a slice of
+# a Vec, Span or String (rewrite_value_slice) and `x.push(..)` instantiates.
+fn bind_arm_payload(m: *Module, arm: *MatchArm, tn: *u8, tn_len: i32)
+    if arm.pattern_kind != PAT_VARIANT or arm.pattern_inner_kind != PAT_IDENT
+        return
+    let name: *u8 = arm.pattern_inner_name
+    let name_len: i32 = arm.pattern_inner_name_len
+    if name_len <= 0 or (name_len == 1 and *name == 95)   # `_`
+        return
+    var pay_len: i32 = 0
+    let pay: *u8 = variant_payload_type(m, tn, tn_len, arm.pattern_name, arm.pattern_name_len, @pay_len)
+    if pay != null and pay_len > 0
+        track_typed_local(name, name_len, TYPE_STRUCT, pay, pay_len)
+
+# The mangled type variant `ctor` of `tn` carries, or null: Option's Some the
+# whole suffix, Result's Ok its T and Err its E, a non-generic user enum's
+# single-field tuple variant that field's struct type.
+fn variant_payload_type(m: *Module, tn: *u8, tn_len: i32, ctor: *u8, ctor_len: i32, out_len: *i32) -> *u8
+    *out_len = 0
+    if tn == null or tn_len <= 0
+        return null
+    if tn_len > 7 and memcmp(tn, c"Option$", 7) == 0
+        if buf_eq(ctor, ctor_len, c"Some", 4) == 0
+            return null
+        *out_len = tn_len - 7
+        return tn + 7
+    if tn_len > 7 and memcmp(tn, c"Result$", 7) == 0
+        let sfx: *u8 = tn + 7
+        let sfx_len: i32 = tn_len - 7
+        let t_len: i32 = mangled_type_extent(m, sfx, sfx_len)
+        if buf_eq(ctor, ctor_len, c"Ok", 2) == 1
+            *out_len = t_len
+            return sfx
+        if buf_eq(ctor, ctor_len, c"Err", 3) == 1 and t_len + 1 < sfx_len
+            *out_len = sfx_len - t_len - 1
+            return sfx + t_len + 1
+        return null
+    let ei: i32 = enum_find(tn, tn_len)
+    if ei < 0 or enum_is_generic(ei) == 1
+        return null
+    let vi: i32 = enum_variant_index(tn, tn_len, ctor, ctor_len)
+    if vi < 0 or enum_variant_kind(ei, vi) != ENUM_VARIANT_TUPLE
+        return null
+    let f: *StructField = enum_variant_fields(ei, vi)
+    if f == null or f.next != null or f.field_type != TYPE_STRUCT or f.field_type_name == null
+        return null
+    *out_len = f.field_type_name_len
+    return f.field_type_name
+
+# Byte length of the first whole type in the `$`-joined mangled list `p`
+# (AGAST #1574): `Vec$i32$i32` -> `Vec$i32`, `Result$Vec$u8$i32$i64` ->
+# `Result$Vec$u8$i32`.  A component takes as many types after it as it has
+# type parameters; one it doesn't know as generic takes none.
+fn mangled_type_extent(m: *Module, p: *u8, len: i32) -> i32
+    var end: i32 = 0
+    while end < len and *(p + end) != 36   # '$'
+        end = end + 1
+    var pos: i32 = end
+    let arity: i32 = mangled_generic_arity(m, p, end)
+    for a in 0..arity
+        if pos >= len
+            return pos
+        pos = pos + 1 + mangled_type_extent(m, p + pos + 1, len - pos - 1)
+    return pos
+
+# How many type arguments the mangled name component `p` takes: a generic
+# struct's own count, and the three that may have no template here: Span
+# (`[u8]` needs no ritzlib.span), Option and Result.
+fn mangled_generic_arity(m: *Module, p: *u8, len: i32) -> i32
+    if buf_eq(p, len, c"Span", 4) == 1 or buf_eq(p, len, c"Option", 6) == 1
+        return 1
+    if buf_eq(p, len, c"Result", 6) == 1
+        return 2
+    let st: *StructDef = find_generic_struct(m, p, len)
+    if st != null
+        return count_type_params(st.type_params)
+    return 0
 
 # Rewrite `E.from(args)` in place into the plain call `E__from(args)` of the
 # generated fn (main.ritz, add_enum_from_fns), as ritz0's enum_from.py does,
@@ -1254,12 +1366,10 @@ fn collect_from_expr(m: *Module, e: *Expr)
         # Each arm has body: *Expr (or null for `pass` arms).  Walking
         # arms as *Expr would crash for the same reason struct lits did.
         collect_from_expr(m, e.left)
-        var arm: *MatchArm = e.args as *MatchArm
-        while arm != null
-            collect_from_fn_body(m, arm.body_stmts)   # block arm (AGAST #1454)
-            if arm.body != null
-                collect_from_expr(m, arm.body)
-            arm = arm.next
+        var scrut: *Expr = null
+        if k == EXPR_MATCH
+            scrut = e.left
+        collect_from_arms(m, scrut, e.args as *MatchArm)
 
 # ============================================================================
 # Generic Function Lookup
