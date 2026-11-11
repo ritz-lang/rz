@@ -109,7 +109,10 @@ stays here; remote hosts only run rooms.
 - **Which host a room is on is recorded in AGAST, in the claim's agent
   name:** `ritz-task-<id>` on omegalisk, `ritz-task-<id>@<host>` on a remote
   host. To see what's running where, list `executing` tickets and read
-  `assigned_agent`. Never record hosts in the scratchpad.
+  `assigned_agent`. Never record hosts in the scratchpad. Search by the
+  exact claim name: `assigned_agent="ritz-task-2592"` finds nothing when
+  the claim is `ritz-task-2592@toffee` (2026-11-11, a false "never
+  claimed"). See "Who owns the ticket" for the whole claim-to-close path.
 - **Host room verbs** (always `send_room_message(room_id="adele-<host>",
   ..., sender_name="rz", ask_claude=True)`):
   - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz model=opus`, then
@@ -170,6 +173,34 @@ up reaped worktrees, branches and units; send host rooms the verbs in
 or investigate a failure. Anything like that becomes an AGAST ticket and a
 room. If CI on `main` goes red with a *new* failure, file it at high priority
 and spawn a room for it. Don't fix it here.
+
+## Who owns the ticket
+
+A ticket is closed when its code is on `main`, not when a room thinks it's
+done. `rz` holds both ends; the room only works in between.
+
+| Step | Who | What |
+|---|---|---|
+| Claim | `rz`, **before** anything is created | `claim_task` as `ritz-task-<id>` (omegalisk) or `ritz-task-<id>@<host>`. Check the reply says `executing` with that name; a claim conflict aborts the spawn. Spawn with `--no-claim`, and say in the briefing (and the `SPAWN`) which name holds it |
+| Work | room | Reads the ticket and files new tickets for anything out of scope. **Never** claims, releases or completes its own ticket when it has a commit to REAP. The evidence goes in the REAP line |
+| Close (merged) | `rz`, after `git push origin main` | `complete_task` with `Merged to main as <sha8>. <the REAP line>` |
+| Close (already fixed) | room | REAP `none`: the room may `complete_task` with the evidence (briefing step 1). That's final: it makes no commit after it. If a test is still worth landing, `rz` files a new ticket for it |
+| Abandon | `rz` | Torn down or `SPAWN-FAILED` without a merge: `release_task`, so the ticket is `ready` again |
+| Wait on another | `rz` | `add_dependency`. The waiting room keeps its claim (e.g. #2582 holding for #2689) |
+
+**`complete_task` refused ("must be in executing status")?** Don't move on.
+Look the ticket up by its exact claim name. If the room closed it itself
+(#2595 at 01:26 and #2592 17 s before its REAP, 2026-11-11), it's already
+`completed`: check its `results` name the merged SHA, and if they don't, or
+say something that's no longer true (#2595's said "REAP none" for a test that
+then merged), append `MERGED to main as <sha8> (<date>)` to its description
+with `update_task`. Then tell the room in one line that it broke "Who owns
+the ticket". If it's `ready` or unclaimed instead, `claim_task` as `rz`,
+then `complete_task`.
+
+**After `TORNDOWN`**, the ticket must be `completed` (merged) or `ready`
+(released). An `executing` ticket with no room behind it is a leak: fix it
+in the same turn.
 
 ## Spawning a room
 
@@ -242,8 +273,10 @@ You can't run `git worktree`, `systemctl`, `provision-room.sh` or
    "Room initialized for AGAST #<id>.", then `update_room_description`), so
    the remote agent doesn't crash-loop on HTTP 400.
 2. **Claim the ticket here** as `ritz-task-<id>@<host>`, so the claim records
-   the host. Remote rooms have the AGAST tools (2026-11-10) and use them
-   like local rooms: read, complete and file tickets themselves.
+   the host, and confirm the result says `executing` with that name before
+   sending `SPAWN`. The host spawns with `--no-claim`. Remote rooms have the
+   AGAST tools (2026-11-10): they read the ticket and file new ones, but
+   close it only for REAP `none` (see "Who owns the ticket").
 3. **Send `SPAWN`** to `adele-<host>`: the verb line, then the briefing below
    with the remote additions filled in. The host creates
    `~/dev/ritz-lang/rz-task-<id>` off `origin/main`, provisions it, puts it
@@ -279,7 +312,10 @@ vouches for that exact commit.
    concise sentence, about 20-30 characters, 60 at most ("Fix ritz1 slice
    bounds checks", "Re-gating after rebase").
 1. **Already fixed on `origin/main`?** `complete_task` with the evidence and
-   REAP `none`.
+   REAP `none`. That's final: commit nothing after it. This is the only time
+   you touch your ticket's status. `rz` claimed it as `<claim name>` and
+   closes it when your commit merges. Never claim, release or complete it
+   yourself, even though your general instructions say to mark tasks done.
 2. **Test first.** Write tests that fail for the reason they name, then fix.
    Mutation-check: break each part of the fix and confirm only its own tests
    go red.
@@ -321,6 +357,8 @@ vouches for that exact commit.
        sender_name="ritz-task-<id>",
        ask_claude=True)
    ```
+   Don't `complete_task`: the REAP line is your evidence, and `rz` closes the
+   ticket once your commit is on `main`.
 9. **On "your turn: rebase onto <sha7>"**: rebase, re-gate, push and REAP
    again straight away. Nothing merges until you do. Until that message, stay
    on your base, even after REAPing.
@@ -358,8 +396,9 @@ so:
 - **Your REAP must quote the gate's verdict:** add `gate <log name>
   SHA=<first 12> EXIT=0` to the REAP line, copied from the log. `rz` checks
   that the SHA matches the one you REAP.
-- **AGAST:** use your AGAST tools as a local room would. The ticket text
-  is also pasted below. If an AGAST call fails, say so in your REAP, list
+- **AGAST:** read your ticket and file new ones as a local room would. The
+  ticket is claimed as `ritz-task-<id>@<host>`; leave its status alone
+  (step 1). The ticket text is also pasted below. If an AGAST call fails, say so in your REAP, list
   follow-ups there (one line each: title, file:line, why) for `rz` to file,
   and for step 1 REAP `none` with the evidence.
 - **Self-restart** (the `systemd-run` above) works the same on this host.
@@ -392,7 +431,8 @@ reap ritz-task-1450 1a2b3c4
    is a room mistake (step 7). Its gate log stays on its host; ask the host
    room for it only if CI later goes red on that commit.
 4. **Pass:** `git merge --ff-only <sha> && git push origin main`. Then
-   `complete_task` in AGAST, `check_scratchpad_item`, and clean up
+   `complete_task` in AGAST (`Merged to main as <sha8>. <REAP line>`; if it's
+   refused, see "Who owns the ticket"), `check_scratchpad_item`, and clean up
    (`systemctl --user stop/disable adele-agent@ritz-task-<id>`, remove
    `~/.config/adele/rooms/ritz-task-<id>`, `.claude/host-budget.sh --remove
    ritz-task-<id>`, `git worktree remove`,

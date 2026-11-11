@@ -45,9 +45,11 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 
 ## Process
 
-1. **Fetch the AGAST task** to get title/description:
+1. **Fetch and claim the AGAST task** before creating anything, so a claim
+   conflict aborts the spawn (see `rz-iterate` "Who owns the ticket"):
    ```
    mcp__agast__search_tasks(query="", status="ready")
+   mcp__agast__claim_task(task_id=<id>, agent_name="ritz-task-<id>")   # must come back `executing`
    ```
 
 2. **Create the Django room** (must exist before agent connects):
@@ -126,10 +128,7 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    systemctl --user start adele-agent@ritz-task-<id>.service
    ```
 
-7. **Claim the AGAST task**:
-   ```
-   mcp__agast__claim_task(task_id=<id>, agent_name="ritz-task-<id>")
-   ```
+7. **The AGAST task is already claimed** (step 1). Don't claim it again.
 
 8. **Send the briefing** with verification commands and merge rules:
 
@@ -190,10 +189,9 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
    )
    ```
 
-   Also complete the AGAST task:
-   ```
-   mcp__agast__complete_task(task_id={id}, results="<summary of what was done>")
-   ```
+   Do NOT complete the AGAST task: `rz` closes it once your commit is on
+   `main`. The only exception is REAP `none` (already fixed on `main`), where
+   you `complete_task` with the evidence and commit nothing more.
    ````
 
    Send with `ask_claude=True`:
