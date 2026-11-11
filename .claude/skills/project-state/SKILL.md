@@ -87,12 +87,18 @@ If the ROADMAP's track table changes, update this table from it. That table is
 the authority.
 
 **Decisions waiting on Aaron.** These are the hexagons in the diagram.
-Re-check each with `search_tasks(query="#ID")`, and drop any that is completed:
-- #1854: Ownership/Drop model (blocks M1.2, and through it M1.4 and Track 3)
-- #1849: AWS credentials and budget (blocks M2.3)
-- #1853: laptop model (blocks M2.4)
+None are open as of 2026-11-10: #1854 (Drop) was decided as option (a), and
+its parts are #2156–#2159. #1849 (AWS) and #1853 (laptop) were decided on
+2026-11-08 (record: #2455).
 
 Add new ones as they appear (ticket text asks Aaron to choose, approve or provide).
+To re-check one, **don't** use `search_tasks(query="#ID")`: it searches text, so
+it returns tickets that *mention* the ID, not the ticket itself. A ticket also
+stays open after Aaron decides it, because the implementation hangs off it.
+Instead, read the ticket's own description (via a child's `parent_task_id` or
+`get_task_dependencies`) for a `DECISION` / `AARON <date>` header, and search
+for a decision-record ticket (`search_tasks(query="DECISIONS (Aaron")`). The
+11-09 report showed three hexagons that had already been decided because of this.
 
 ## 3. Decide each layer's State
 
