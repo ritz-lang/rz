@@ -1484,9 +1484,9 @@ def test_ritz1_nested_gap_is_located(ritz1_bin, tmp_path, name):
     assert message in comp.stdout + comp.stderr, comp.stdout + comp.stderr
 
 
-# ritz0 gives 3; ritz1 emits IR clang refuses.  A whole struct element has no
-# by-value read on a plain array either, so the borrow inherits AGAST #1562, and
-# no binary comes out of it.
+# ritz0 gives 3.  ritz1 emitted IR clang refused (AGAST #1562): a whole struct
+# element had no by-value read on a plain array either.  #2592 loads it as a
+# `%P`, through the borrow too.
 STRUCT_ELEMENT_BY_VALUE = {
     "element_to_element": """
 fn f(a:& [4]P)
@@ -1530,19 +1530,9 @@ def test_ritz0_reads_a_struct_element_by_value(tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #1562: a whole struct element has no by-value read")
 @pytest.mark.parametrize("name", sorted(STRUCT_ELEMENT_BY_VALUE))
 def test_ritz1_reads_a_struct_element_by_value(ritz1_bin, tmp_path, name):
     assert _run("ritz1", ritz1_bin, tmp_path, name, TYPES + STRUCT_ELEMENT_BY_VALUE[name]) == 3
-
-
-# The strict xfail can't tell a clang refusal from a wrong answer, and a wrong
-# answer is what this ticket was.  So: no binary.
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(STRUCT_ELEMENT_BY_VALUE))
-def test_ritz1_struct_element_by_value_fails_closed(ritz1_bin, tmp_path, name):
-    with pytest.raises(AssertionError, match="would not link"):
-        _run("ritz1", ritz1_bin, tmp_path, name, TYPES + STRUCT_ELEMENT_BY_VALUE[name])
 
 
 # AGAST #2321: not `:&`: the same index on a pointer param.  Every other form of

@@ -757,11 +757,9 @@ def test_an_untyped_copy_of_a_struct_fits_a_reference_to_it(tmp_path, compiler):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", [
-    "ritz0",
-    *(pytest.param(c, marks=pytest.mark.xfail(strict=True, reason=(
-        "AGAST #2524: ritz1 stores an un-annotated copy of a struct element as an i64, "
-        "which clang refuses"))) for c in ("ritz1", "ritz1_selfhosted"))])
+# AGAST #2524: ritz1 stored the un-annotated copy as an i64, which clang
+# refused; #2592 types it as the element's struct.
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_an_untyped_copy_of_a_struct_runs(tmp_path, compiler):
     assert _run_three(compiler, tmp_path, "untyped_copy", UNTYPED_COPY) == 3
 

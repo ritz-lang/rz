@@ -261,9 +261,6 @@ impl C
 pub fn main() -> i32
 """
 REFUSED = {
-    # #2592: a struct array element read by value is an i64 on ritz1.
-    "array_element": ("    var ps: [2]P\n    ps[1] = P { x: 1, y: 6 }\n"
-                      "    let (a, b) = ps[1]\n", 2592),
     # #2594: an Option payload and a chained method call.
     "unwrap": ("    let r: Option<P> = Some(P { x: 1, y: 6 })\n"
                "    let (a, b) = r.unwrap()\n", 2594),
@@ -296,6 +293,40 @@ def test_unnamed_struct_runs_like_ritz0(request, run_with, name, compiler):
         request.applymarker(pytest.mark.xfail(
             strict=True, reason=f"AGAST #{REFUSED[name][1]}: ritz1 refuses this shape"))
     assert run_with(compiler, name, _refused(name)) == 7
+
+
+# #2592: an element of a `[N]P` local, field or global is a `%P`, so it
+# destructures like any struct value.  These were refused ("can't tell which
+# struct") while the element read as an i64.  ritz0 gives 7 for each.
+INDEXED = {
+    "local": "    var ps: [2]P\n    ps[1] = P { x: 1, y: 6 }\n"
+             "    let (a, b) = ps[1]\n",
+    "field": "    var h: H\n    h.ps[1] = P { x: 1, y: 6 }\n"
+             "    let (a, b) = h.ps[1]\n",
+    "global": "    gp[0] = P { x: 1, y: 6 }\n    let (a, b) = gp[0]\n",
+}
+
+_INDEXED_PRE = """\
+struct P
+    x: i32
+    y: i32
+
+struct H
+    n: i64
+    ps: [2]P
+
+var gp: [2]P
+
+pub fn main() -> i32
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(INDEXED))
+def test_array_element_destructures(run_with, name, compiler):
+    prog = _INDEXED_PRE + INDEXED[name] + "    return a + b\n"
+    assert run_with(compiler, f"indexed_{name}", prog) == 7
 
 
 # A field ritz1 can't hold in a local (an array here) is refused, located.
