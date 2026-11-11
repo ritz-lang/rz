@@ -239,9 +239,14 @@ build priority for rooms" or "Re-gating after rebase".
 
 **Provision every worktree** with `.claude/provision-room.sh <worktree>` after
 `git worktree add` and before starting the agent. It must print "room
-permissions OK". Without it the worktree is untrusted, and every `Write` blocks
-for 30 minutes on an approval nobody gives (#1378). On cleanup, run
-`.claude/provision-room.sh --remove <worktree>` after `git worktree remove`.
+permissions OK". Trust is not per-worktree: for a worktree the CLI checks the
+**main checkout's** key (`~/dev/ritz-lang/rz`) in
+`${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json`, so the script trusts that key as
+well as the worktree's own (#2746). Without it the room's allow list is ignored,
+and every `Write`, `rm` or `git push` waits on an approval nobody gives (#1378).
+On cleanup, run `.claude/provision-room.sh --remove <worktree>` after
+`git worktree remove`. That drops only the worktree's key. The main key stays,
+because the parent room and every live room share it.
 
 **Put every room on the machine budget** with `.claude/host-budget.sh
 ritz-task-<id>` before `systemctl --user start` (it must print "host budget

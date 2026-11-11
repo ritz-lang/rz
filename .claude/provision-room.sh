@@ -5,7 +5,11 @@
 #
 #   .claude/provision-room.sh <worktree-path>
 #   .claude/provision-room.sh --verify <worktree-path>   # check only, no writes
-#   .claude/provision-room.sh --remove <worktree-path>   # drop trust entry (reap)
+#   .claude/provision-room.sh --remove <worktree-path>   # drop worktree trust entry (reap)
+#
+# Config file: ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json.  Trust is set under the
+# MAIN checkout's path (the key the CLI checks for a worktree, AGAST #2746) and
+# under the worktree's own path.  See TRUST_KEY below.
 #
 # ---------------------------------------------------------------------------
 # WHY THIS EXISTS  (AGAST #1378 — measured 2026-09-08, not theorised)
@@ -29,7 +33,10 @@
 #   6. A spawned room has no human in it.  30 minutes later: denied.
 #
 # The parent room does not hit this because ~/dev/ritz-lang/rz has
-# hasTrustDialogAccepted: true.  Every worktree we spawn starts without it.
+# hasTrustDialogAccepted: true.  In September 2026 each worktree needed its own
+# entry.  Since CLI 2.1.316 (AGAST #2746) the CLI looks a worktree up under the
+# MAIN checkout's key instead, so a host whose main checkout was never trusted
+# ignores every room's allow list.  This script now trusts both keys.
 #
 # ---------------------------------------------------------------------------
 # TWO FACTS THAT LOOK LIKE TYPOS AND ARE NOT
@@ -92,6 +99,26 @@ fi
 
 SETTINGS="$WT/.claude/settings.json"
 
+# The global config the CLI reads: $CLAUDE_CONFIG_DIR/.claude.json when that is
+# set, else ~/.claude.json.  The CLI's own warning names the file it consults.
+CLAUDE_JSON="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+
+# The key the CLI checks trust under.  For a git WORKTREE, Claude Code (at
+# least 2.1.316 .. 2.1.322) does NOT look up the worktree's own path: it looks
+# up the MAIN checkout's.  Measured (AGAST #1378, 2026-11-11), cwd = worktree:
+#   trusted: worktree only   -> "Ignoring 7 permissions.allow entries ...
+#                                set projects["<main checkout>"]..."  (callback hit)
+#   trusted: main checkout   -> entries honoured, callback never reached
+# This script used to trust only the worktree path, and --verify checked that
+# same path, so it passed while every Ritz room's allow list was ignored.
+# The main checkout is the parent of the common git dir.  Not a worktree (or
+# --remove after the dir is gone): fall back to the path itself.
+TRUST_KEY="$WT"
+if COMMON="$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    COMMON="$(cd "$COMMON" && pwd -P)"
+    [[ "$(basename "$COMMON")" == .git ]] && TRUST_KEY="$(dirname "$COMMON")"
+fi
+
 # Tools a headless room must never block on.  Bare names only — see fact (a).
 #
 # Bash is already allowed at the user level, but it is repeated here so the
@@ -108,10 +135,10 @@ read -r -d '' ALLOW_JSON <<'EOF' || true
 EOF
 
 trusted() {
-    python3 - "$WT" <<'PY'
+    python3 - "$1" "$CLAUDE_JSON" <<'PY'
 import json, pathlib, sys
 wt = sys.argv[1]
-p = pathlib.Path.home() / '.claude.json'
+p = pathlib.Path(sys.argv[2])
 try:
     d = json.loads(p.read_text())
 except Exception:
@@ -121,10 +148,12 @@ PY
 }
 
 if [[ $MODE == remove ]]; then
-    python3 - "$WT" <<'PY'
+    # Drops the WORKTREE's own entry only.  The main checkout's entry is shared
+    # by the parent room and every live worktree; never remove it here.
+    python3 - "$WT" "$CLAUDE_JSON" <<'PY'
 import json, pathlib, sys
 wt = sys.argv[1]
-p = pathlib.Path.home() / '.claude.json'
+p = pathlib.Path(sys.argv[2])
 d = json.loads(p.read_text())
 gone = d.get('projects', {}).pop(wt, None)
 p.write_text(json.dumps(d, indent=2))
@@ -135,19 +164,21 @@ fi
 
 if [[ $MODE == verify ]]; then
     rc=0
-    if trusted; then
-        echo "  ✓ workspace trusted in ~/.claude.json: $WT"
+    if trusted "$TRUST_KEY"; then
+        echo "  ✓ trusted in $CLAUDE_JSON under the key the CLI checks: $TRUST_KEY"
     else
-        echo "  ✗ workspace NOT trusted — project permissions will be IGNORED: $WT" >&2
+        echo "  ✗ NOT trusted under $TRUST_KEY in $CLAUDE_JSON — project permissions will be IGNORED" >&2
         rc=1
     fi
-    if [[ -f "$SETTINGS" ]] && python3 -c "
-import json,sys
-allow = json.load(open('$SETTINGS')).get('permissions', {}).get('allow', [])
-sys.exit(0 if 'Write' in allow else 1)"; then
-        echo "  ✓ bare 'Write' allow entry present: $SETTINGS"
+    if [[ -f "$SETTINGS" ]] && python3 - "$SETTINGS" <<'PY'
+import json, sys
+allow = json.load(open(sys.argv[1])).get('permissions', {}).get('allow', [])
+sys.exit(0 if {'Write', 'Bash'} <= set(allow) else 1)
+PY
+    then
+        echo "  ✓ bare 'Write' and 'Bash' allow entries present: $SETTINGS"
     else
-        echo "  ✗ $SETTINGS missing a bare 'Write' allow entry" >&2
+        echo "  ✗ $SETTINGS missing a bare 'Write' or 'Bash' allow entry" >&2
         rc=1
     fi
     [[ $rc -eq 0 ]] && echo "  room permissions OK — a headless Write will not block"
@@ -158,15 +189,16 @@ fi
 
 # Trust the workspace.  Read-modify-write via python so we never mangle the
 # rest of ~/.claude.json (it holds auth and per-project history).
-python3 - "$WT" <<'PY'
+# Both keys: the main checkout is what the CLI checks today; the worktree's
+# own key is kept so a CLI that keys on cwd again still finds it.
+python3 - "$CLAUDE_JSON" "$TRUST_KEY" "$WT" <<'PY'
 import json, pathlib, sys
-wt = sys.argv[1]
-p = pathlib.Path.home() / '.claude.json'
+p = pathlib.Path(sys.argv[1])
 d = json.loads(p.read_text())
-entry = d.setdefault('projects', {}).setdefault(wt, {})
-entry['hasTrustDialogAccepted'] = True
+for key in dict.fromkeys(sys.argv[2:]):
+    d.setdefault('projects', {}).setdefault(key, {})['hasTrustDialogAccepted'] = True
+    print(f"  trusted workspace key: {key}")
 p.write_text(json.dumps(d, indent=2))
-print(f"  trusted workspace: {wt}")
 PY
 
 mkdir -p "$WT/.claude"
