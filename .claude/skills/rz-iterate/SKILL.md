@@ -87,7 +87,7 @@ stays here; remote hosts only run rooms.
 |---|---|---|---|---|
 | omegalisk | (local: `systemctl`, `git worktree`) | 2 | yes | 12 cores, 15 GB, WSL |
 | toffee | `adele-toffee` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~10 GB free. Linger on, `llvmlite` and `lld` 21 installed, smoke passes. First remote trial host |
-| starbux | `adele-starbux` | 1 | yes (2026-11-10), **held** | 8 cores, 14 GB, ~11 GB free. Smoke passes; `lld` is a user-local copy (`~/.local/opt/lld-21`). No spawns until the toffee trial has reported to `adele` |
+| starbux | `adele-starbux` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~9 GB free beside `adele`'s rooms. Smoke passes; `lld` is a user-local copy (`~/.local/opt/lld-21`). Hold lifted by Aaron 2026-11-11 (first room #2577) |
 | chungus | `adele-chungus` | 1 | no | 8 cores, 14 GB, only ~5 GB free (another user's desktop session) and 47 GB disk. Smoke passes. Not ready until Aaron says so |
 
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
