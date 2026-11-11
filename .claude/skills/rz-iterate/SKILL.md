@@ -134,14 +134,12 @@ stays here; remote hosts only run rooms.
   here-doc, never the `Write` tool**: `Write` outside the host's workspace
   waits on an approval nobody gives, and the host room stalls for up to 30
   minutes (starbux 2026-11-10, toffee 2026-11-11).
-- **Git over ssh on remote hosts.** Under the agent's user namespace the
-  host's `ssh_config.d` fails a permissions check, so plain `git fetch` /
-  `git push` fail (toffee, 2026-11-11). Every remote briefing tells the room
-  to use `GIT_SSH_COMMAND="ssh -F /dev/null"` for fetch and push, and to push
-  with the explicit refspec `git push -f origin
-  HEAD:refs/heads/ritz-task-<id>`. Host worktrees are created with
-  `-b ... origin/main`, so the branch tracks `main`, and a bare `git push`
-  would aim at `main`.
+- **Push by refspec on remote hosts.** Plain `git fetch` / `git push` work
+  on every host (the `ssh -F /dev/null` workaround from toffee 2026-11-11 is
+  no longer needed; don't put it in briefings). Remote rooms push with the
+  explicit refspec `git push -f origin HEAD:refs/heads/ritz-task-<id>`: host
+  worktrees are created with `-b ... origin/main`, so the branch tracks
+  `main`, and a bare `git push` would aim at `main`.
 - **Shared hosts.** `adele` runs its own rooms on the same hosts (for
   example `task-2546` on toffee) within the host's slots. Never send
   `PAUSE`, `RESTART` or `TEARDOWN` for a room that isn't `ritz-task-*`. If
@@ -295,8 +293,7 @@ vouches for that exact commit.
 7. **Don't chase `main`.** REAP the commit you gated. `rz` tells you when to
    rebase.
 8. **Push and REAP:** `git push -f origin ritz-task-<id>` (remote rooms:
-   `GIT_SSH_COMMAND="ssh -F /dev/null" git push -f origin
-   HEAD:refs/heads/ritz-task-<id>`), then exactly one:
+   `git push -f origin HEAD:refs/heads/ritz-task-<id>`), then exactly one:
    ```
    mcp__adele-context__send_room_message(
        room_id="rz",

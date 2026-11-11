@@ -44,7 +44,7 @@ room until the current one is merged, pushed, and verified.
 3. **Fetch latest and update main**:
    ```bash
    cd ~/dev/ritz-lang/rz
-   GIT_SSH_COMMAND="ssh -F /dev/null" git fetch origin
+   git fetch origin
    git rebase origin/main  # ensure main is up to date
    ```
 
@@ -131,7 +131,7 @@ room until the current one is merged, pushed, and verified.
 
 8. **Push**:
    ```bash
-   GIT_SSH_COMMAND="ssh -F /dev/null" git push origin main
+   git push origin main
    ```
 
 9. **Clean up**:

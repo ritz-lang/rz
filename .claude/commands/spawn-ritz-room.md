@@ -283,10 +283,3 @@ systemctl --user start adele-agent@ritz-task-70.service
 
 # 4. Send briefings (with ask_claude=True)
 ```
-
-## SSH Workaround
-
-If `git push` fails with SSH config errors, use:
-```bash
-GIT_SSH_COMMAND="ssh -F /dev/null" git push origin main
-```
