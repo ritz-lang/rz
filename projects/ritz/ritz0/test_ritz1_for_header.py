@@ -556,9 +556,11 @@ _SPAN_OF_A = ("import ritzlib.span\n\n" + MAIN + "    var a: [3]i32 = [1, 2, 4]\
               "    for x in s[1..3]\n        t = t + x\n    return t\n")
 
 
+# ritz1 reaches it since #2726 typed a field of `s.slice(lo, hi)`'s result.
 @pytest.mark.integration
-def test_ritz0_a_slice_is_walked(run_with):
-    assert run_with("ritz0", "slice", _SPAN_OF_A) == 6
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_slice_is_walked(run_with, compiler):
+    assert run_with(compiler, "slice", _SPAN_OF_A) == 6
 
 
 def _moves(it: str, place: str) -> str:
@@ -929,7 +931,6 @@ REFUSED_HOLDERS = {
     "addr_of_index": GVEC + MAIN + "    var vs: [2]Vec<i32>\n" + _T.format(it="@vs[1]"),
     "addr_of_reference": (GVEC + "fn f(v: @Vec<i32>) -> i32\n" + _T.format(it="@v") + "\n" + MAIN
                           + FILL_V + "    return f(@v)\n"),
-    "slice": _SPAN_OF_A,
 }
 
 

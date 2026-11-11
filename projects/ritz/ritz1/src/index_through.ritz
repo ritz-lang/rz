@@ -93,6 +93,10 @@ pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
         let fv: *LocalVar = vec_field_through(s, e.left)   # `x.vf[i]` (#2564)
         if fv != null
             return fv
+        if root == e.left
+            let cv: *LocalVar = call_result_view(s, root)   # `v[1..3][i]` (#2726)
+            if cv != null
+                return cv
         return base_array_view(s, root)   # `h.r[i]`, `h(p)[i]` (#2329)
     let loc: *LocalVar = find_local_struct_name(s, root.ident_ptr, root.ident_len)
     if loc == null
@@ -136,6 +140,37 @@ fn vec_field_through(s: *EmitterState, base: *Expr) -> *LocalVar
     v.pointee_array_elem_type = TYPE_VOID
     v.pointee_array_elem_pointee = TYPE_VOID
     v
+
+# AGAST #2726: `base`, a call that returns a Vec or Span by value, as the view of
+# its buffer.  #2451 makes `v[lo..hi]` the call `v.slice(lo, hi)`, so `v[1..3][i]`
+# indexes a call's result: emit_expr_index took the aggregate for a pointer
+# (`inttoptr i64 %"Span$i32"`, which clang refuses).  The view's base is the field
+# `base.ptr` / `base.data`, which through_spill evaluates once (the call runs once),
+# so `x[i]` is `*(#k + i)` at stride T, as for `h(p)[i]` (#2329).  A String's
+# buffer is a Vec, one more level, and isn't taken; nor is an element that's a
+# pointer (its pointee isn't recorded).  It's in no scope.
+fn call_result_view(s: *EmitterState, base: *Expr) -> *LocalVar
+    if base.kind != EXPR_CALL and base.kind != EXPR_METHOD
+        return null
+    var name: *u8 = null
+    var name_len: i32 = 0
+    call_result_struct_name(s, base, @name, @name_len)
+    if name == null or name_is_indexable(name, name_len) == 0 or through_is_string(name, name_len) == 1
+        return null
+    var probe: LocalVar
+    memset(@probe as *u8, 0, sizeof(LocalVar))
+    probe.type_name = name
+    probe.type_name_len = name_len
+    let f: *StructField = through_buffer(s, @probe)
+    if f == null or f.field_type != TYPE_PTR
+        return null
+    let buf: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(buf as *u8, 0, sizeof(Expr))
+    if name_starts(name, name_len, c"Span$", 5) == 1
+        through_member(buf, base, base, c"ptr", 3)
+    else
+        through_member(buf, base, base, c"data", 4)
+    unscoped_array_view(s, buf, ptr_field_elem_kind(f), f.field_type_name, f.field_type_name_len, TYPE_VOID)
 
 # 1 when `e` names a place with no call in it: names, fields, indexes, derefs, and
 # arithmetic on those in an index (`a[i - 1].vf`).

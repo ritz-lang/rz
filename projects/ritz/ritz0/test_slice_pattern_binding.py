@@ -128,28 +128,11 @@ def test_a_slice_of_a_pattern_binding(run_with, box, ctor, scrutinee, position, 
     assert run_with(compiler, "pat", program) == length + last
 
 
-# ritz1 doesn't type a member of a slice used in place (#2726), a pattern
-# binding's or a param's alike.
-RITZ1_IN_PLACE = pytest.mark.xfail(
-    strict=True, reason="AGAST #2726: ritz1 `v[lo..hi].len`: unhandled EXPR_MEMBER")
-
-
-def _in_place_cells():
-    cells = []
-    for box, compiler in [(b, c) for b in ("Span", "Vec") for c in COMPILERS]:
-        if compiler == "ritz0" and box == "Vec":
-            cells.append(pytest.param(box, compiler, marks=RITZ0_VEC))
-        elif compiler != "ritz0":
-            cells.append(pytest.param(box, compiler, marks=RITZ1_IN_PLACE))
-        else:
-            cells.append((box, compiler))
-    return cells
-
-
 # The slice used in place, never bound: `return x[1..3].len + x[1..3][1]`.
+# ritz1 typed no member of it until #2726 (test_slice_in_place_member.py).
 @pytest.mark.integration
 @pytest.mark.parametrize("ctor", sorted(CTORS))
-@pytest.mark.parametrize("box,compiler", _in_place_cells())
+@pytest.mark.parametrize("box,compiler", _cells(("Span", "Vec")))
 def test_a_slice_of_a_pattern_binding_returned(run_with, box, ctor, compiler):
     ty, setup, _, _, _ = BOXES[box]
     ret, make, pat = CTORS[ctor]
