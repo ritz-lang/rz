@@ -2,6 +2,7 @@
 # RFC 8439 test vectors
 
 import cryptosec.chacha20_poly1305
+import cryptosec.crypto_error
 import cryptosec.mem
 
 # Helper to check if two byte arrays are equal
@@ -12,6 +13,28 @@ fn bytes_equal(a: *u8, b: *u8, len: i64) -> i32
             return 0
         i += 1
     return 1
+
+# Bytes processed by an Ok result, or -1 for Err.
+fn ok_bytes(r: Result<i64, CryptoError>) -> i64
+    match r
+        Ok(n) => n
+        Err(_) => -1
+
+fn is_auth_failed(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.AuthenticationFailed => true
+                _ => false
+
+fn is_message_too_long(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.MessageTooLong => true
+                _ => false
 
 # =============================================================================
 # RFC 8439 AEAD Test Vectors
@@ -205,7 +228,9 @@ fn test_chacha20_poly1305_rfc8439() -> i32
     var ct: [114]u8
     var tag: [16]u8
 
-    let ct_len: i64 = chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 12, @pt[0], 114, @ct[0], @tag[0])
+    let ct_len: i64 = ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 12, @pt[0], 114, @ct[0], @tag[0]))
+    if ct_len != 114
+        return 90
 
     # Expected ciphertext first 16 bytes: d3 1a 8d 34 64 8e 60 db 7b 86 af bc 53 ef 7e c2
     var expected_ct: [16]u8
@@ -290,10 +315,12 @@ fn test_chacha20_poly1305_roundtrip() -> i32
         pt[i] = (i * 5) as u8
         i += 1
 
-    let ct_len: i64 = chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 16, @pt[0], 64, @ct[0], @tag[0])
-    let result: i32 = chacha20_poly1305_decrypt(@key[0], @nonce[0], @aad[0], 16, @ct[0], ct_len, @tag[0], @decrypted[0])
+    let ct_len: i64 = ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 16, @pt[0], 64, @ct[0], @tag[0]))
+    if ct_len != 64
+        return 90
+    let result: i64 = ok_bytes(chacha20_poly1305_decrypt(@key[0], @nonce[0], @aad[0], 16, @ct[0], ct_len, @tag[0], @decrypted[0]))
 
-    if result != 1
+    if result != ct_len
         return 1
     if bytes_equal(@pt[0], @decrypted[0], 64) == 0
         return 2
@@ -317,10 +344,11 @@ fn test_chacha20_poly1305_no_aad() -> i32
         pt[i] = i as u8
         i += 1
 
-    chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], 32, @ct[0], @tag[0])
-    let result: i32 = chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], 32, @tag[0], @decrypted[0])
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], 32, @ct[0], @tag[0])) != 32
+        return 90
+    let result: i64 = ok_bytes(chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], 32, @tag[0], @decrypted[0]))
 
-    if result != 1
+    if result != 32
         return 1
     if bytes_equal(@pt[0], @decrypted[0], 32) == 0
         return 2
@@ -340,14 +368,15 @@ fn test_chacha20_poly1305_tampered_ct() -> i32
     mem_zero(@nonce[0], 12)
     mem_zero(@pt[0], 32)
 
-    chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], 32, @ct[0], @tag[0])
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], 32, @ct[0], @tag[0])) != 32
+        return 90
 
     # Tamper with ciphertext
     ct[0] = ct[0] ^ 0x01
 
-    let result: i32 = chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], 32, @tag[0], @decrypted[0])
+    let rejected: bool = is_auth_failed(chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], 32, @tag[0], @decrypted[0]))
 
-    if result != 0
+    if not rejected
         return 1
     return 0
 
@@ -365,14 +394,15 @@ fn test_chacha20_poly1305_tampered_tag() -> i32
     mem_zero(@nonce[0], 12)
     mem_zero(@pt[0], 32)
 
-    chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], 32, @ct[0], @tag[0])
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], 32, @ct[0], @tag[0])) != 32
+        return 90
 
     # Tamper with tag
     tag[0] = tag[0] ^ 0x01
 
-    let result: i32 = chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], 32, @tag[0], @decrypted[0])
+    let rejected: bool = is_auth_failed(chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], 32, @tag[0], @decrypted[0]))
 
-    if result != 0
+    if not rejected
         return 1
     return 0
 
@@ -395,10 +425,11 @@ fn test_chacha20_poly1305_wrong_aad() -> i32
     mem_zero(@pt[0], 16)
     wrong_aad[0] = 1
 
-    chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 8, @pt[0], 16, @ct[0], @tag[0])
-    let result: i32 = chacha20_poly1305_decrypt(@key[0], @nonce[0], @wrong_aad[0], 8, @ct[0], 16, @tag[0], @decrypted[0])
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 8, @pt[0], 16, @ct[0], @tag[0])) != 16
+        return 90
+    let rejected: bool = is_auth_failed(chacha20_poly1305_decrypt(@key[0], @nonce[0], @wrong_aad[0], 8, @ct[0], 16, @tag[0], @decrypted[0]))
 
-    if result != 0
+    if not rejected
         return 1
     return 0
 
@@ -426,11 +457,97 @@ fn test_chacha20_poly1305_empty_pt() -> i32
         i += 1
 
     # Encrypt empty plaintext with AAD
-    chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 16, nil, 0, nil, @tag[0])
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], 16, nil, 0, nil, @tag[0])) != 0
+        return 90
 
-    # Decrypt should succeed
-    let result: i32 = chacha20_poly1305_decrypt(@key[0], @nonce[0], @aad[0], 16, nil, 0, @tag[0], nil)
+    let result: i64 = ok_bytes(chacha20_poly1305_decrypt(@key[0], @nonce[0], @aad[0], 16, nil, 0, @tag[0], nil))
 
-    if result != 1
+    if result != 0
         return 1
+    return 0
+
+# =============================================================================
+# Message length limit (AGAST #2577, GitHub #132, RFC 8439 §2.8)
+#
+# The AEAD encrypts from block counter 1, so at most (2^32 - 1) * 64 bytes fit
+# before the counter would wrap. Longer messages are refused up front, before
+# any buffer is read or written (the buffers here are far smaller than `len`).
+# =============================================================================
+
+const SENTINEL: u8 = 0xAA
+const AEAD_MAX_LEN: i64 = 0xFFFFFFFF * 64
+
+fn fill_sentinel(buf: *u8, len: i64) -> void
+    var i: i64 = 0
+    while i < len
+        buf[i] = SENTINEL
+        i += 1
+
+fn untouched(buf: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if buf[i] != SENTINEL
+            return 0
+        i += 1
+    return 1
+
+[[test]]
+fn test_chacha20_poly1305_encrypt_too_long() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var pt: [64]u8
+    var ct: [64]u8
+    var tag: [16]u8
+    fill_sentinel(@ct[0], 64)
+    fill_sentinel(@tag[0], 16)
+
+    if not is_message_too_long(chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], AEAD_MAX_LEN + 1, @ct[0], @tag[0]))
+        return 1
+    if untouched(@ct[0], 64) == 0
+        return 2
+    if untouched(@tag[0], 16) == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_chacha20_poly1305_decrypt_too_long() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var ct: [64]u8
+    var tag: [16]u8
+    var pt: [64]u8
+    mem_zero(@ct[0], 64)
+    mem_zero(@tag[0], 16)
+    fill_sentinel(@pt[0], 64)
+
+    if not is_message_too_long(chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], AEAD_MAX_LEN + 1, @tag[0], @pt[0]))
+        return 1
+    if untouched(@pt[0], 64) == 0
+        return 2
+    return 0
+
+# A forged tag is refused and the plaintext buffer is left untouched.
+[[test]]
+fn test_chacha20_poly1305_auth_failure_writes_nothing() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var pt: [32]u8
+    mem_zero(@pt[0], 32)
+    var ct: [32]u8
+    var tag: [16]u8
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], nil, 0, @pt[0], 32, @ct[0], @tag[0])) != 32
+        return 1
+    tag[15] = tag[15] ^ 0x80
+    var out: [32]u8
+    fill_sentinel(@out[0], 32)
+    if not is_auth_failed(chacha20_poly1305_decrypt(@key[0], @nonce[0], nil, 0, @ct[0], 32, @tag[0], @out[0]))
+        return 2
+    if untouched(@out[0], 32) == 0
+        return 3
     return 0

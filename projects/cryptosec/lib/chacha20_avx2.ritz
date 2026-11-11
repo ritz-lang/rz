@@ -8,6 +8,8 @@
 # Performance: ~2-3x faster than scalar implementation for bulk data.
 
 import mem
+import chacha20 { chacha20_counter_room }
+import crypto_error
 
 # =============================================================================
 # ChaCha20 Constants
@@ -207,7 +209,8 @@ pub fn chacha20_block_avx2(key: *u8, counter: u32, nonce: *u8, out: *u8) -> void
 struct ChaCha20Avx2
     key: [32]u8
     nonce: [12]u8
-    counter: u32
+    # Next block to generate; u64 so exhaustion (2^32) cannot wrap to 0.
+    counter: u64
 
 pub fn chacha20_avx2_init(ctx: *ChaCha20Avx2, key: *u8, nonce: *u8) -> void
     mem_copy(@ctx.key[0], key, 32)
@@ -215,40 +218,17 @@ pub fn chacha20_avx2_init(ctx: *ChaCha20Avx2, key: *u8, nonce: *u8) -> void
     ctx.counter = 0
 
 pub fn chacha20_avx2_set_counter(ctx: *ChaCha20Avx2, counter: u32) -> void
-    ctx.counter = counter
+    ctx.counter = counter as u64
 
-pub fn chacha20_avx2_encrypt(ctx: *ChaCha20Avx2, pt: *u8, pt_len: i64, ct: *u8) -> void
+# XOR `len` bytes of AVX2 keystream from block `counter` onwards. The caller
+# has checked chacha20_counter_room, so the counter stays within 32 bits.
+fn chacha20_avx2_keystream_xor(key: *u8, nonce: *u8, counter: u64, input: *u8, len: i64, output: *u8) -> void
     var block: [64]u8
-    var i: i64 = 0
-
-    while i < pt_len
-        # Generate keystream block using AVX2
-        chacha20_block_avx2(@ctx.key[0], ctx.counter, @ctx.nonce[0], @block[0])
-        ctx.counter = ctx.counter + 1
-
-        # XOR with plaintext
-        var j: i64 = 0
-        while j < 64 && (i + j) < pt_len
-            ct[i + j] = pt[i + j] ^ block[j]
-            j += 1
-
-        i = i + 64
-
-# Decrypt is same as encrypt for stream ciphers
-pub fn chacha20_avx2_decrypt(ctx: *ChaCha20Avx2, ct: *u8, ct_len: i64, pt: *u8) -> void
-    chacha20_avx2_encrypt(ctx, ct, ct_len, pt)
-
-# =============================================================================
-# Single-shot API (for AEAD use)
-# =============================================================================
-
-pub fn chacha20_avx2_xor(key: *u8, nonce: *u8, counter: u32, input: *u8, len: i64, output: *u8) -> void
-    var block: [64]u8
-    var ctr: u32 = counter
+    var ctr: u64 = counter
     var i: i64 = 0
 
     while i < len
-        chacha20_block_avx2(key, ctr, nonce, @block[0])
+        chacha20_block_avx2(key, ctr as u32, nonce, @block[0])
         ctr += 1
 
         var j: i64 = 0
@@ -257,3 +237,35 @@ pub fn chacha20_avx2_xor(key: *u8, nonce: *u8, counter: u32, input: *u8, len: i6
             j += 1
 
         i = i + 64
+    mem_zero(@block[0], 64)
+
+# Encrypt pt_len bytes, advancing the context's counter. Err(CounterExhausted)
+# if that would take the counter past 0xFFFFFFFF; then nothing is written and
+# the counter is unchanged.
+pub fn chacha20_avx2_encrypt(ctx: *ChaCha20Avx2, pt: *u8, pt_len: i64, ct: *u8) -> Result<i64, CryptoError>
+    if not chacha20_counter_room(ctx.counter, pt_len)
+        return Err(CryptoError.CounterExhausted)
+    if pt_len <= 0
+        return Ok(0)
+    chacha20_avx2_keystream_xor(@ctx.key[0], @ctx.nonce[0], ctx.counter, pt, pt_len, ct)
+    ctx.counter = ctx.counter + ((pt_len + 63) / 64) as u64
+    Ok(pt_len)
+
+# Decrypt is same as encrypt for stream ciphers
+pub fn chacha20_avx2_decrypt(ctx: *ChaCha20Avx2, ct: *u8, ct_len: i64, pt: *u8) -> Result<i64, CryptoError>
+    chacha20_avx2_encrypt(ctx, ct, ct_len, pt)
+
+# =============================================================================
+# Single-shot API (for AEAD use)
+# =============================================================================
+
+# XOR `len` bytes with the keystream starting at block `counter`.
+# Err(CounterExhausted) if the blocks needed would take the counter past
+# 0xFFFFFFFF; then nothing is written. The block at 0xFFFFFFFF is allowed.
+pub fn chacha20_avx2_xor(key: *u8, nonce: *u8, counter: u32, input: *u8, len: i64, output: *u8) -> Result<i64, CryptoError>
+    if not chacha20_counter_room(counter as u64, len)
+        return Err(CryptoError.CounterExhausted)
+    if len <= 0
+        return Ok(0)
+    chacha20_avx2_keystream_xor(key, nonce, counter as u64, input, len, output)
+    Ok(len)

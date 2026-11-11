@@ -3,6 +3,7 @@
 
 import cryptosec.chacha20_avx2
 import cryptosec.chacha20
+import cryptosec.crypto_error
 import cryptosec.mem
 
 # Helper to check if two byte arrays are equal
@@ -304,7 +305,8 @@ fn test_chacha20_avx2_encrypt_sunscreen() -> i32
     pt[113] = 0x2e # .
 
     var ct: [114]u8
-    chacha20_avx2_xor(@key[0], @nonce[0], 1, @pt[0], 114, @ct[0])
+    if ok_bytes(chacha20_avx2_xor(@key[0], @nonce[0], 1, @pt[0], 114, @ct[0])) != 114
+        return 91
 
     # Expected first 16 bytes of ciphertext
     var expected: [16]u8
@@ -355,10 +357,12 @@ fn test_chacha20_avx2_roundtrip() -> i32
 
     var ctx: ChaCha20Avx2
     chacha20_avx2_init(@ctx, @key[0], @nonce[0])
-    chacha20_avx2_encrypt(@ctx, @pt[0], 64, @ct[0])
+    if ok_bytes(chacha20_avx2_encrypt(@ctx, @pt[0], 64, @ct[0])) != 64
+        return 92
 
     chacha20_avx2_init(@ctx, @key[0], @nonce[0])
-    chacha20_avx2_decrypt(@ctx, @ct[0], 64, @decrypted[0])
+    if ok_bytes(chacha20_avx2_decrypt(@ctx, @ct[0], 64, @decrypted[0])) != 64
+        return 93
 
     if bytes_equal(@pt[0], @decrypted[0], 64) == 0
         return 1
@@ -381,8 +385,10 @@ fn test_chacha20_avx2_partial_block() -> i32
         pt[i] = i as u8
         i += 1
 
-    chacha20_avx2_xor(@key[0], @nonce[0], 0, @pt[0], 37, @ct[0])
-    chacha20_avx2_xor(@key[0], @nonce[0], 0, @ct[0], 37, @decrypted[0])
+    if ok_bytes(chacha20_avx2_xor(@key[0], @nonce[0], 0, @pt[0], 37, @ct[0])) != 37
+        return 94
+    if ok_bytes(chacha20_avx2_xor(@key[0], @nonce[0], 0, @ct[0], 37, @decrypted[0])) != 37
+        return 95
 
     if bytes_equal(@pt[0], @decrypted[0], 37) == 0
         return 1
@@ -413,12 +419,128 @@ fn test_chacha20_avx2_full_ct_matches_scalar() -> i32
         i += 1
 
     # Encrypt with AVX2
-    chacha20_avx2_xor(@key[0], @nonce[0], 0, @pt[0], 200, @ct_avx2[0])
+    if ok_bytes(chacha20_avx2_xor(@key[0], @nonce[0], 0, @pt[0], 200, @ct_avx2[0])) != 200
+        return 96
 
     # Encrypt with scalar
-    chacha20_xor(@key[0], @nonce[0], 0, @pt[0], 200, @ct_scalar[0])
+    if ok_bytes(chacha20_xor(@key[0], @nonce[0], 0, @pt[0], 200, @ct_scalar[0])) != 200
+        return 97
 
     # Must match exactly
     if bytes_equal(@ct_avx2[0], @ct_scalar[0], 200) == 0
         return 1
+    return 0
+
+# =============================================================================
+# Block counter exhaustion (AGAST #2577, GitHub #132, RFC 8439 §2.4)
+#
+# Same contract as the scalar implementation: block 0xFFFFFFFF is the last one;
+# a call needing more refuses with Err(CounterExhausted) and writes nothing.
+# =============================================================================
+
+const SENTINEL: u8 = 0xAA
+
+# Bytes processed by an Ok result, or -1 for Err.
+fn ok_bytes(r: Result<i64, CryptoError>) -> i64
+    match r
+        Ok(n) => n
+        Err(_) => -1
+
+fn is_counter_exhausted(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.CounterExhausted => true
+                _ => false
+
+fn fill_sentinel(buf: *u8, len: i64) -> void
+    var i: i64 = 0
+    while i < len
+        buf[i] = SENTINEL
+        i += 1
+
+# 1 if every byte of buf[0..len] is still SENTINEL.
+fn untouched(buf: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        if buf[i] != SENTINEL
+            return 0
+        i += 1
+    return 1
+
+fn fill_key_nonce(key: *u8, nonce: *u8) -> void
+    var i: i64 = 0
+    while i < 32
+        key[i] = (i * 9 + 1) as u8
+        i += 1
+    i = 0
+    while i < 12
+        nonce[i] = (i * 17 + 5) as u8
+        i += 1
+
+[[test]]
+fn test_chacha20_avx2_xor_counter_boundary() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    fill_key_nonce(@key[0], @nonce[0])
+    var pt: [128]u8
+    mem_zero(@pt[0], 128)
+    var out: [128]u8
+    var expected: [64]u8
+    chacha20_block(@key[0], 0xFFFFFFFF, @nonce[0], @expected[0])
+
+    # The last block is allowed and matches the scalar keystream.
+    if ok_bytes(chacha20_avx2_xor(@key[0], @nonce[0], 0xFFFFFFFF, @pt[0], 64, @out[0])) != 64
+        return 1
+    if bytes_equal(@out[0], @expected[0], 64) == 0
+        return 2
+    # One byte more would wrap to counter 0.
+    fill_sentinel(@out[0], 128)
+    if not is_counter_exhausted(chacha20_avx2_xor(@key[0], @nonce[0], 0xFFFFFFFF, @pt[0], 65, @out[0]))
+        return 3
+    if untouched(@out[0], 128) == 0
+        return 4
+    # 2^32 + 1 blocks from 0: refused before touching the (small) buffers.
+    let len: i64 = 0x100000000 * 64 + 1
+    if not is_counter_exhausted(chacha20_avx2_xor(@key[0], @nonce[0], 0, @pt[0], len, @out[0]))
+        return 5
+    if untouched(@out[0], 128) == 0
+        return 6
+    return 0
+
+[[test]]
+fn test_chacha20_avx2_ctx_no_wrap_after_last_block() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    fill_key_nonce(@key[0], @nonce[0])
+    var pt: [128]u8
+    mem_zero(@pt[0], 128)
+    var out: [128]u8
+    fill_sentinel(@out[0], 128)
+    var expected: [64]u8
+    chacha20_block(@key[0], 0xFFFFFFFF, @nonce[0], @expected[0])
+
+    var ctx: ChaCha20Avx2
+    chacha20_avx2_init(@ctx, @key[0], @nonce[0])
+    chacha20_avx2_set_counter(@ctx, 0xFFFFFFFF)
+    # Refusal leaves the counter where it was.
+    if not is_counter_exhausted(chacha20_avx2_encrypt(@ctx, @pt[0], 65, @out[0]))
+        return 1
+    if untouched(@out[0], 128) == 0
+        return 2
+    if ok_bytes(chacha20_avx2_encrypt(@ctx, @pt[0], 64, @out[0])) != 64
+        return 3
+    if bytes_equal(@out[0], @expected[0], 64) == 0
+        return 4
+    # Now exhausted: must refuse, not wrap to counter 0.
+    fill_sentinel(@out[0], 128)
+    if not is_counter_exhausted(chacha20_avx2_encrypt(@ctx, @pt[0], 1, @out[0]))
+        return 5
+    if not is_counter_exhausted(chacha20_avx2_decrypt(@ctx, @pt[0], 1, @out[0]))
+        return 6
+    if untouched(@out[0], 128) == 0
+        return 7
+    if ok_bytes(chacha20_avx2_encrypt(@ctx, @pt[0], 0, @out[0])) != 0
+        return 8
     return 0

@@ -5,6 +5,7 @@
 # It operates on 512-bit blocks and uses a 256-bit key and 96-bit nonce.
 
 import mem
+import crypto_error
 
 # =============================================================================
 # ChaCha20 Constants
@@ -118,10 +119,16 @@ pub fn chacha20_block(key: *u8, counter: u32, nonce: *u8, out: *u8) -> void
 # ChaCha20 Context and API
 # =============================================================================
 
+# ChaCha20's block counter is 32 bits (RFC 8439 §2.4) and must never wrap:
+# 0xFFFFFFFF is the last block a key/nonce pair can produce.
+const CHACHA20_COUNTER_LIMIT: u64 = 0x100000000  # number of usable blocks
+
 struct ChaCha20
     key: [32]u8
     nonce: [12]u8
-    counter: u32
+    # Next block to generate. u64 so that "all 2^32 blocks used" is
+    # representable (== CHACHA20_COUNTER_LIMIT) instead of wrapping to 0.
+    counter: u64
 
 pub fn chacha20_init(ctx: *ChaCha20, key: *u8, nonce: *u8) -> void
     mem_copy(@ctx.key[0], key, 32)
@@ -129,40 +136,31 @@ pub fn chacha20_init(ctx: *ChaCha20, key: *u8, nonce: *u8) -> void
     ctx.counter = 0
 
 pub fn chacha20_set_counter(ctx: *ChaCha20, counter: u32) -> void
-    ctx.counter = counter
+    ctx.counter = counter as u64
 
-pub fn chacha20_encrypt(ctx: *ChaCha20, pt: *u8, pt_len: i64, ct: *u8) -> void
+# Can `len` bytes be produced starting at block `counter` without the block
+# counter passing 0xFFFFFFFF? Shared with the AVX2 implementation.
+pub fn chacha20_counter_room(counter: u64, len: i64) -> bool
+    if len <= 0
+        return true
+    if counter >= CHACHA20_COUNTER_LIMIT
+        return false
+    # Ceiling division without overflowing `len + 63`.
+    var blocks: u64 = (len / 64) as u64
+    if len % 64 != 0
+        blocks += 1
+    blocks <= CHACHA20_COUNTER_LIMIT - counter
+
+# XOR `len` bytes of keystream from block `counter` onwards into output.
+# The caller has already checked chacha20_counter_room, so `counter` plus the
+# blocks used stays within 32 bits.
+fn chacha20_keystream_xor(key: *u8, nonce: *u8, counter: u64, input: *u8, len: i64, output: *u8) -> void
     var block: [64]u8
-    var i: i64 = 0
-
-    while i < pt_len
-        # Generate keystream block
-        chacha20_block(@ctx.key[0], ctx.counter, @ctx.nonce[0], @block[0])
-        ctx.counter = ctx.counter + 1
-
-        # XOR with plaintext
-        var j: i64 = 0
-        while j < 64 && (i + j) < pt_len
-            ct[i + j] = pt[i + j] ^ block[j]
-            j += 1
-
-        i = i + 64
-
-# Decrypt is same as encrypt for stream ciphers
-pub fn chacha20_decrypt(ctx: *ChaCha20, ct: *u8, ct_len: i64, pt: *u8) -> void
-    chacha20_encrypt(ctx, ct, ct_len, pt)
-
-# =============================================================================
-# Single-shot API (for AEAD use)
-# =============================================================================
-
-pub fn chacha20_xor(key: *u8, nonce: *u8, counter: u32, input: *u8, len: i64, output: *u8) -> void
-    var block: [64]u8
-    var ctr: u32 = counter
+    var ctr: u64 = counter
     var i: i64 = 0
 
     while i < len
-        chacha20_block(key, ctr, nonce, @block[0])
+        chacha20_block(key, ctr as u32, nonce, @block[0])
         ctr += 1
 
         var j: i64 = 0
@@ -171,3 +169,35 @@ pub fn chacha20_xor(key: *u8, nonce: *u8, counter: u32, input: *u8, len: i64, ou
             j += 1
 
         i = i + 64
+    mem_zero(@block[0], 64)
+
+# Encrypt pt_len bytes, advancing the context's counter.
+# Err(CounterExhausted) if that would take the counter past 0xFFFFFFFF; then
+# nothing is written and the counter is unchanged.
+pub fn chacha20_encrypt(ctx: *ChaCha20, pt: *u8, pt_len: i64, ct: *u8) -> Result<i64, CryptoError>
+    if not chacha20_counter_room(ctx.counter, pt_len)
+        return Err(CryptoError.CounterExhausted)
+    if pt_len <= 0
+        return Ok(0)
+    chacha20_keystream_xor(@ctx.key[0], @ctx.nonce[0], ctx.counter, pt, pt_len, ct)
+    ctx.counter = ctx.counter + ((pt_len + 63) / 64) as u64
+    Ok(pt_len)
+
+# Decrypt is same as encrypt for stream ciphers
+pub fn chacha20_decrypt(ctx: *ChaCha20, ct: *u8, ct_len: i64, pt: *u8) -> Result<i64, CryptoError>
+    chacha20_encrypt(ctx, ct, ct_len, pt)
+
+# =============================================================================
+# Single-shot API (for AEAD use)
+# =============================================================================
+
+# XOR `len` bytes with the keystream starting at block `counter`.
+# Err(CounterExhausted) if the blocks needed would take the counter past
+# 0xFFFFFFFF; then nothing is written. The block at 0xFFFFFFFF is allowed.
+pub fn chacha20_xor(key: *u8, nonce: *u8, counter: u32, input: *u8, len: i64, output: *u8) -> Result<i64, CryptoError>
+    if not chacha20_counter_room(counter as u64, len)
+        return Err(CryptoError.CounterExhausted)
+    if len <= 0
+        return Ok(0)
+    chacha20_keystream_xor(key, nonce, counter as u64, input, len, output)
+    Ok(len)

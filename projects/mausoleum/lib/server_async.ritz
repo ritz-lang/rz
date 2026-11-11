@@ -57,6 +57,7 @@ import mausoleum.btree {
 # but driven by the io_uring state machine instead of blocking sockets.
 import cryptosec.x25519
 import cryptosec.chacha20_poly1305
+import cryptosec.crypto_error
 import cryptosec.hkdf
 import cryptosec.random
 import cryptosec.mem
@@ -274,7 +275,8 @@ fn cipher_build_nonce(nonce: *u8, counter: u64)
 # Encrypt a plaintext M7SP message into the outer wire format.
 # Writes `[4 BE length][12 nonce][ciphertext: plaintext_len][16 tag]`
 # to wire_out and returns total wire bytes (4 + 12 + plaintext_len + 16),
-# or -1 if it would not fit in `wire_cap`.
+# -1 if it would not fit in `wire_cap`, or -2 if the AEAD refused
+# (CryptoError; nothing was encrypted).
 fn cipher_encrypt_msg(session: *M7SPSession, plaintext: *u8, plaintext_len: i32, wire_out: *u8, wire_cap: i32) -> i32
     let payload_len: i32 = ENC_NONCE_SIZE + plaintext_len + ENC_TAG_SIZE
     let wire_len: i32 = ENC_LEN_PREFIX_SIZE + payload_len
@@ -297,8 +299,9 @@ fn cipher_encrypt_msg(session: *M7SPSession, plaintext: *u8, plaintext_len: i32,
 
     let ciphertext: *u8 = wire_out + ENC_LEN_PREFIX_SIZE + ENC_NONCE_SIZE
     let tag: *u8 = ciphertext + plaintext_len
-    chacha20_poly1305_encrypt(@session.cipher_send_key[0], @nonce[0], null, 0, plaintext, plaintext_len as i64, ciphertext, tag)
-    return wire_len
+    match chacha20_poly1305_encrypt(@session.cipher_send_key[0], @nonce[0], null, 0, plaintext, plaintext_len as i64, ciphertext, tag)
+        Ok(_) => wire_len
+        Err(_) => -2
 
 
 # Decrypt one outer encrypted frame into plaintext.  `wire_in` points
@@ -338,15 +341,11 @@ fn cipher_decrypt_msg(session: *M7SPSession, wire_in: *u8, wire_len: i32, plaint
 
     let ciphertext: *u8 = wire_in + ENC_LEN_PREFIX_SIZE + ENC_NONCE_SIZE
     let tag: *u8 = ciphertext + ct_len
-    # `chacha20_poly1305_decrypt` returns 1 on AEAD success, 0 on tag
-    # mismatch — see cryptosec/test/test_chacha20_poly1305.ritz:296
-    # (`if result != 1 return 1`).  The serial path's `channel_recv` in
-    # encrypted_channel.ritz had this inverted historically; we get it
-    # right here AND fix it there in this same commit so both sides
-    # actually round-trip.
-    let result: i32 = chacha20_poly1305_decrypt(@session.cipher_recv_key[0], nonce, null, 0, ciphertext, ct_len as i64, tag, plaintext_out)
-    if result != 1
-        return -5
+    # Err: forged tag (AuthenticationFailed, plaintext_out untouched) or an
+    # over-long message. Both are an AEAD failure for the caller.
+    match chacha20_poly1305_decrypt(@session.cipher_recv_key[0], nonce, null, 0, ciphertext, ct_len as i64, tag, plaintext_out)
+        Ok(_) => 0
+        Err(_) => return -5
     return ct_len
 
 

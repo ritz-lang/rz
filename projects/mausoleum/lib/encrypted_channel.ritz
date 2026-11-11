@@ -24,6 +24,7 @@ import ritzlib.net
 
 import cryptosec.x25519
 import cryptosec.chacha20_poly1305
+import cryptosec.crypto_error
 import cryptosec.hkdf
 import cryptosec.sha256
 import cryptosec.random
@@ -51,6 +52,7 @@ pub const CHANNEL_ERR_DECRYPT: i32 = -2
 pub const CHANNEL_ERR_BUFFER: i32 = -3
 pub const CHANNEL_ERR_IO: i32 = -4
 pub const CHANNEL_ERR_REPLAY: i32 = -5
+pub const CHANNEL_ERR_ENCRYPT: i32 = -6   # AEAD refused to encrypt (CryptoError)
 
 # ============================================================================
 # Encrypted Channel Structure
@@ -339,7 +341,13 @@ pub fn channel_send(ch: *EncryptedChannel, data: *u8, len: i32) -> i32
     # Encrypt with ChaCha20-Poly1305
     var ciphertext: *u8 = msg + 4 + CHANNEL_NONCE_SIZE
     var tag: *u8 = ciphertext + len
-    chacha20_poly1305_encrypt(@ch.send_key[0], @nonce[0], null, 0, data, len as i64, ciphertext, tag)
+    match chacha20_poly1305_encrypt(@ch.send_key[0], @nonce[0], null, 0, data, len as i64, ciphertext, tag)
+        Ok(_) => 0
+        Err(_) =>
+            # Nothing was written; the nonce is burned, never reused.
+            free(msg)
+            ch.last_error = CHANNEL_ERR_ENCRYPT
+            return -5
 
     # Send message
     var sent: i32 = 0
@@ -431,16 +439,14 @@ pub fn channel_recv(ch: *EncryptedChannel, data: *u8, cap: i32) -> i32
         ch.last_error = CHANNEL_ERR_BUFFER
         return -7
 
-    # Decrypt with ChaCha20-Poly1305.  The AEAD returns 1 on success
-    # and 0 on tag-mismatch (see cryptosec/test/test_chacha20_poly1305
-    # which asserts `if result != 1`).  This check used to read
-    # `if result != 0` which treated SUCCESS as failure and silently
-    # broke every encrypted round-trip — caught while wiring up the
-    # async encrypted path (phase 6, ritz-task-155).
-    let result: i32 = chacha20_poly1305_decrypt(@ch.recv_key[0], @nonce[0], null, 0, ciphertext, ct_len as i64, tag, data)
-    if result != 1
-        ch.last_error = CHANNEL_ERR_DECRYPT
-        return -8
+    # Decrypt with ChaCha20-Poly1305. Err covers a forged tag
+    # (AuthenticationFailed: `data` is left untouched) and an over-long
+    # message; either way the frame is rejected.
+    match chacha20_poly1305_decrypt(@ch.recv_key[0], @nonce[0], null, 0, ciphertext, ct_len as i64, tag, data)
+        Ok(_) => 0
+        Err(_) =>
+            ch.last_error = CHANNEL_ERR_DECRYPT
+            return -8
 
     return ct_len
 

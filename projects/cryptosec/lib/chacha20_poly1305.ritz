@@ -7,6 +7,7 @@
 import chacha20
 import poly1305
 import mem
+import crypto_error
 
 # =============================================================================
 # Helper Functions
@@ -41,95 +42,82 @@ fn store64_le(dst: *u8, val: u64) -> void
 # 3. Construct Poly1305 input: AAD || pad(AAD) || ciphertext || pad(ciphertext) || len(AAD) || len(ciphertext)
 # 4. Compute Poly1305 tag
 
-pub fn chacha20_poly1305_encrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> i64
-    var poly_key: [64]u8
+# Longest message one key/nonce can carry: the payload starts at block counter
+# 1, and the counter must not pass 0xFFFFFFFF (RFC 8439 §2.8), so
+# 2^32 - 1 blocks of 64 bytes.
+pub const CHACHA20_POLY1305_MAX_LEN: i64 = 0xFFFFFFFF * 64
 
-    # Generate Poly1305 one-time key (first 32 bytes of ChaCha20 block 0)
-    chacha20_block(key, 0, nonce, @poly_key[0])
-
-    # Encrypt plaintext starting at counter=1
-    chacha20_xor(key, nonce, 1, pt, pt_len, ct)
-
-    # Compute Poly1305 tag
+# Poly1305 tag over AAD and ciphertext (step 3-4 above).
+fn aead_compute_tag(poly_key: *u8, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8) -> void
     var poly_ctx: Poly1305
-    poly1305_init(@poly_ctx, @poly_key[0])
+    poly1305_init(@poly_ctx, poly_key)
 
-    # Process AAD
+    var zeros: [16]u8
+    mem_zero(@zeros[0], 16)
+
+    # AAD, padded to a 16-byte boundary
     if aad_len > 0
         poly1305_update(@poly_ctx, aad, aad_len)
-
-    # Pad AAD to 16-byte boundary
     var pad_aad: i64 = pad16_len(aad_len)
     if pad_aad > 0
-        var zeros: [16]u8
-        mem_zero(@zeros[0], 16)
         poly1305_update(@poly_ctx, @zeros[0], pad_aad)
 
-    # Process ciphertext
-    if pt_len > 0
-        poly1305_update(@poly_ctx, ct, pt_len)
-
-    # Pad ciphertext to 16-byte boundary
-    var pad_ct: i64 = pad16_len(pt_len)
-    if pad_ct > 0
-        var zeros: [16]u8
-        mem_zero(@zeros[0], 16)
-        poly1305_update(@poly_ctx, @zeros[0], pad_ct)
-
-    # Add lengths as 64-bit little-endian
-    var lens: [16]u8
-    store64_le(@lens[0], aad_len as u64)
-    store64_le(@lens[8], pt_len as u64)
-    poly1305_update(@poly_ctx, @lens[0], 16)
-
-    # Finalize tag
-    poly1305_final(@poly_ctx, tag)
-
-    pt_len
-
-pub fn chacha20_poly1305_decrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> i32
-    var poly_key: [64]u8
-    var computed_tag: [16]u8
-
-    # Generate Poly1305 one-time key
-    chacha20_block(key, 0, nonce, @poly_key[0])
-
-    # Verify tag first
-    var poly_ctx: Poly1305
-    poly1305_init(@poly_ctx, @poly_key[0])
-
-    # Process AAD
-    if aad_len > 0
-        poly1305_update(@poly_ctx, aad, aad_len)
-
-    var pad_aad: i64 = pad16_len(aad_len)
-    if pad_aad > 0
-        var zeros: [16]u8
-        mem_zero(@zeros[0], 16)
-        poly1305_update(@poly_ctx, @zeros[0], pad_aad)
-
-    # Process ciphertext
+    # Ciphertext, padded to a 16-byte boundary
     if ct_len > 0
         poly1305_update(@poly_ctx, ct, ct_len)
-
     var pad_ct: i64 = pad16_len(ct_len)
     if pad_ct > 0
-        var zeros: [16]u8
-        mem_zero(@zeros[0], 16)
         poly1305_update(@poly_ctx, @zeros[0], pad_ct)
 
+    # Lengths as 64-bit little-endian
     var lens: [16]u8
     store64_le(@lens[0], aad_len as u64)
     store64_le(@lens[8], ct_len as u64)
     poly1305_update(@poly_ctx, @lens[0], 16)
 
-    poly1305_final(@poly_ctx, @computed_tag[0])
+    poly1305_final(@poly_ctx, tag)
+
+# Encrypt pt into ct and write the 16-byte tag. Ok = ciphertext length.
+# Err(MessageTooLong) if pt_len > CHACHA20_POLY1305_MAX_LEN; then nothing is
+# read or written.
+pub fn chacha20_poly1305_encrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
+    if pt_len > CHACHA20_POLY1305_MAX_LEN
+        return Err(CryptoError.MessageTooLong)
+
+    # Poly1305 one-time key: first 32 bytes of ChaCha20 block 0
+    var poly_key: [64]u8
+    chacha20_block(key, 0, nonce, @poly_key[0])
+
+    # Encrypt plaintext starting at counter=1
+    let n: i64 = chacha20_xor(key, nonce, 1, pt, pt_len, ct)?
+
+    aead_compute_tag(@poly_key[0], aad, aad_len, ct, n, tag)
+    mem_zero(@poly_key[0], 64)
+    Ok(n)
+
+# Verify the tag, then decrypt ct into pt. Ok = plaintext length.
+# Err(MessageTooLong) if ct_len > CHACHA20_POLY1305_MAX_LEN (nothing is read
+# or written); Err(AuthenticationFailed) if the tag does not verify (pt is
+# left untouched).
+pub fn chacha20_poly1305_decrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
+    if ct_len > CHACHA20_POLY1305_MAX_LEN
+        return Err(CryptoError.MessageTooLong)
+
+    var poly_key: [64]u8
+    chacha20_block(key, 0, nonce, @poly_key[0])
+
+    # Verify tag first
+    var computed_tag: [16]u8
+    var len: i64 = ct_len
+    if len < 0
+        len = 0
+    aead_compute_tag(@poly_key[0], aad, aad_len, ct, len, @computed_tag[0])
+    mem_zero(@poly_key[0], 64)
 
     # Constant-time tag comparison
     if mem_eq(@computed_tag[0], tag, 16) == 0
-        return 0
+        return Err(CryptoError.AuthenticationFailed)
 
     # Decrypt ciphertext
-    chacha20_xor(key, nonce, 1, ct, ct_len, pt)
-
-    1
+    let n: i64 = chacha20_xor(key, nonce, 1, ct, len, pt)?
+    Ok(n)
