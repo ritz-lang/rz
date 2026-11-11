@@ -124,7 +124,15 @@ class TypeSubstitution:
         elif isinstance(ty, rast.FnType):
             new_params = [self.apply(p) for p in ty.params]
             new_ret = self.apply(ty.ret) if ty.ret else None
-            return rast.FnType(ty.span, new_params, new_ret)
+            return rast.FnType(ty.span, new_params, new_ret, ty.callconv)
+        # A type parameter inside a tuple, dyn arg or SIMD vector was left
+        # unsubstituted until AGAST #2741 and lowered as i8.
+        elif isinstance(ty, rast.TupleType):
+            return rast.TupleType(ty.span, [self.apply(e) for e in ty.elements])
+        elif isinstance(ty, rast.DynType):
+            return rast.DynType(ty.span, ty.trait_name, [self.apply(a) for a in ty.args])
+        elif isinstance(ty, rast.VectorType):
+            return rast.VectorType(ty.span, ty.count, self.apply(ty.inner))
         else:
             return ty
 
@@ -478,6 +486,14 @@ class Monomorphizer:
                 self._visit_type(p)
             if ty.ret:
                 self._visit_type(ty.ret)
+        elif isinstance(ty, rast.TupleType):
+            for e in ty.elements:
+                self._visit_type(e)
+        elif isinstance(ty, rast.DynType):
+            for a in ty.args:
+                self._visit_type(a)
+        elif isinstance(ty, rast.VectorType):
+            self._visit_type(ty.inner)
 
     def _visit_block(self, block: rast.Block) -> None:
         """Visit a block to find instantiations."""
@@ -1577,7 +1593,14 @@ class Monomorphizer:
         elif isinstance(ty, rast.FnType):
             new_params = [self._rewrite_type(p) for p in ty.params]
             new_ret = self._rewrite_type(ty.ret) if ty.ret else None
-            return rast.FnType(ty.span, new_params, new_ret)
+            return rast.FnType(ty.span, new_params, new_ret, ty.callconv)
+        elif isinstance(ty, rast.TupleType):
+            return rast.TupleType(ty.span, [self._rewrite_type(e) for e in ty.elements])
+        elif isinstance(ty, rast.DynType):
+            return rast.DynType(ty.span, ty.trait_name,
+                                [self._rewrite_type(a) for a in ty.args])
+        elif isinstance(ty, rast.VectorType):
+            return rast.VectorType(ty.span, ty.count, self._rewrite_type(ty.inner))
         else:
             return ty
 

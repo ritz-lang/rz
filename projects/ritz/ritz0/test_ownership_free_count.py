@@ -2232,7 +2232,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, tuple_gap(2285)),
+""", 1, NO_TUPLES),  # ritz0 fixed by #2741 (was #2285)
 
     # A binding from an element has the element's type, signedness included.
     "tuple_element_keeps_its_signedness": ("""\
