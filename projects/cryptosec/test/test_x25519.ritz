@@ -493,3 +493,74 @@ fn test_x25519_clamp() -> i32
     if scalar[31] != 0x7f
         return 2
     return 0
+
+# ============================================================================
+# Secret wiping (AGAST #2581, GitHub #139)
+# ============================================================================
+# x25519_scalarmult clamps the private scalar into a local k[32]. It must be
+# wiped before return, or the clamped key stays in the dead stack frame.
+# stack_holds_2581 reads the stack just below the caller's frame, which is
+# where the callee's frames lived, and looks for the secret's bytes.
+
+const RESIDUE_SPAN_2581: i64 = 32768
+
+[[noinline]]
+fn stack_holds_2581(pat: *u8, plen: i64) -> bool
+    var buf: [32768]u8
+    # Make buf escape so the reads below are real loads of what is there.
+    let p: *u8 = @buf[0]
+    asm x86_64:
+        nopl ({p})
+    var i: i64 = 0
+    while i + plen <= RESIDUE_SPAN_2581
+        var j: i64 = 0
+        while j < plen and buf[i + j] == pat[j]
+            j += 1
+        if j == plen
+            return true
+        i += 1
+    return false
+
+[[test]]
+fn test_x25519_wipes_clamped_scalar() -> i32
+    # Unclamped, so its clamped form exists only inside x25519_scalarmult.
+    var scalar: [32]u8
+    for i in 0..32
+        scalar[i] = (0x5B + i * 7) as u8
+    scalar[0] = 0xA7
+    scalar[31] = 0xE3
+    var clamped: [32]u8
+    mem_copy(@clamped[0], @scalar[0], 32)
+    x25519_clamp(@clamped[0])
+    if stack_holds_2581(@clamped[0], 32)
+        return 1  # residue before the call: the probe cannot tell
+
+    var base: [32]u8
+    mem_zero(@base[0], 32)
+    base[0] = 9
+    var out: [32]u8
+    x25519(@out[0], @scalar[0], @base[0])
+
+    if stack_holds_2581(@clamped[0], 32)
+        return 2  # clamped scalar k left on the stack
+    return 0
+
+[[noinline]]
+fn plant_2581(v: u8)
+    var m: [32]u8
+    for i in 0..32
+        m[i] = v
+    let p: *u8 = @m[0]
+    asm x86_64:
+        nopl ({p})
+
+[[test]]
+fn test_stack_holds_2581_sees_residue() -> i32
+    # Control: the probe finds bytes a returned callee left in its frame.
+    var pat: [32]u8
+    for i in 0..32
+        pat[i] = 0xC5 as u8
+    plant_2581(0xC5 as u8)
+    if stack_holds_2581(@pat[0], 32)
+        return 0
+    return 9

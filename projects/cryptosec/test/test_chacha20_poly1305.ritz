@@ -1,6 +1,7 @@
 # ChaCha20-Poly1305 AEAD tests
 # RFC 8439 test vectors
 
+import cryptosec.chacha20
 import cryptosec.chacha20_poly1305
 import cryptosec.crypto_error
 import cryptosec.mem
@@ -550,4 +551,95 @@ fn test_chacha20_poly1305_auth_failure_writes_nothing() -> i32
         return 2
     if untouched(@out[0], 32) == 0
         return 3
+    return 0
+
+# =============================================================================
+# Secret wiping (AGAST #2581, GitHub #139)
+# =============================================================================
+# The Poly1305 one-time key (ChaCha20 block 0) forges tags for this
+# (key, nonce); it must not outlive encrypt or decrypt, on any path.
+# stack_holds_2581 reads the stack just below the caller's frame, where the
+# callee's frames lived, looking for its bytes.
+
+const RESIDUE_SPAN_2581: i64 = 32768
+
+[[noinline]]
+fn stack_holds_2581(pat: *u8, plen: i64) -> bool
+    var buf: [32768]u8
+    # Make buf escape so the reads below are real loads of what is there.
+    let p: *u8 = @buf[0]
+    asm x86_64:
+        nopl ({p})
+    var i: i64 = 0
+    while i + plen <= RESIDUE_SPAN_2581
+        var j: i64 = 0
+        while j < plen and buf[i + j] == pat[j]
+            j += 1
+        if j == plen
+            return true
+        i += 1
+    return false
+
+# Zero the span stack_holds_2581 reads, so only later calls' residue is seen.
+# chacha20_block itself leaves its keystream in its frame (setup_2581 calls it).
+[[noinline]]
+fn scrub_2581()
+    var buf: [32768]u8
+    mem_zero(@buf[0], RESIDUE_SPAN_2581)
+
+fn setup_2581(key: *u8, nonce: *u8, pt: *u8, poly_key: *u8)
+    for i in 0..32
+        key[i] = (0x80 + i * 3) as u8
+    for i in 0..12
+        nonce[i] = (0x40 + i) as u8
+    for i in 0..64
+        pt[i] = (i * 5) as u8
+    # Only the first 32 bytes are the Poly1305 key.
+    var block: [64]u8
+    chacha20_block(key, 0, nonce, @block[0])
+    mem_copy(poly_key, @block[0], 32)
+    mem_zero(@block[0], 64)
+
+[[test]]
+fn test_aead_encrypt_wipes_poly_key() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    var pt: [64]u8
+    var poly_key: [32]u8
+    setup_2581(@key[0], @nonce[0], @pt[0], @poly_key[0])
+    scrub_2581()
+    if stack_holds_2581(@poly_key[0], 32)
+        return 1  # residue before the call: the probe cannot tell
+    var ct: [64]u8
+    var tag: [16]u8
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], @nonce[0], 12, @pt[0], 64, @ct[0], @tag[0])) != 64
+        return 2
+    if stack_holds_2581(@poly_key[0], 32)
+        return 3
+    return 0
+
+[[test]]
+fn test_aead_decrypt_wipes_poly_key() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    var pt: [64]u8
+    var poly_key: [32]u8
+    setup_2581(@key[0], @nonce[0], @pt[0], @poly_key[0])
+    scrub_2581()
+    var ct: [64]u8
+    var tag: [16]u8
+    if ok_bytes(chacha20_poly1305_encrypt(@key[0], @nonce[0], @nonce[0], 12, @pt[0], 64, @ct[0], @tag[0])) != 64
+        return 1
+    scrub_2581()
+    var out: [64]u8
+    if ok_bytes(chacha20_poly1305_decrypt(@key[0], @nonce[0], @nonce[0], 12, @ct[0], 64, @tag[0], @out[0])) != 64
+        return 2
+    if stack_holds_2581(@poly_key[0], 32)
+        return 3  # left by decrypt's Ok path
+    tag[0] = tag[0] ^ 1
+    scrub_2581()
+    if not is_auth_failed(chacha20_poly1305_decrypt(@key[0], @nonce[0], @nonce[0], 12, @ct[0], 64, @tag[0], @out[0]))
+        return 4
+    if stack_holds_2581(@poly_key[0], 32)
+        return 5  # left by decrypt's AuthenticationFailed path
     return 0

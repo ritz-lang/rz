@@ -1528,7 +1528,25 @@ fn rfc6979_generate_k(k: *Scalar256, priv_key: *Scalar256, hash: *u8)
 #
 # Returns: 1 on success, 0 on failure
 
+# Every value below gives away the private key d (with the public r, s and
+# z): rd = r*d and z_rd = z + r*d directly, k and k_inv through s. They live
+# in one struct the caller of ecdsa_p256_sign_with wipes, so no exit path
+# can skip the wipe (AGAST #2581).
+struct EcdsaSignSecrets
+    k: Scalar256
+    k_bytes: [32]u8
+    k_inv: Scalar256
+    rd: Scalar256
+    z_rd: Scalar256
+
 pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) -> i32
+    var sec: EcdsaSignSecrets
+    let rc: i32 = ecdsa_p256_sign_with(sig, hash, priv_key, @sec)
+    mem_zero(@sec as *u8, sizeof(EcdsaSignSecrets))
+    return rc
+
+# ecdsa_p256_sign's body; keeps every secret in *sec, which it does not wipe.
+fn ecdsa_p256_sign_with(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256, sec: *EcdsaSignSecrets) -> i32
     var n: Scalar256
     get_p256_order(@n)
 
@@ -1540,20 +1558,18 @@ pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) ->
         scalar256_sub(@z, @z, @n)
 
     # Generate deterministic k using RFC 6979
-    var k: Scalar256
-    rfc6979_generate_k(@k, priv_key, hash)
+    rfc6979_generate_k(@sec.k, priv_key, hash)
 
-    if scalar256_is_zero(@k) == 1
+    if scalar256_is_zero(@sec.k) == 1
         return 0  # Failed to generate valid k
 
     # Compute R = k * G
-    var k_bytes: [32]u8
-    scalar256_to_bytes(@k, @k_bytes[0])
+    scalar256_to_bytes(@sec.k, @sec.k_bytes[0])
 
     var R: P256Point
     var G: P256Point
     p256_point_generator(@G)
-    p256_scalar_mult(@R, @k_bytes[0], 32, @G)
+    p256_scalar_mult(@R, @sec.k_bytes[0], 32, @G)
 
     if p256_point_is_identity(@R) == 1
         return 0
@@ -1574,24 +1590,13 @@ pub fn ecdsa_p256_sign(sig: *EcdsaSignature, hash: *u8, priv_key: *Scalar256) ->
         return 0
 
     # s = k^(-1) * (z + r * d) mod n
-    var k_inv: Scalar256
-    scalar256_inv(@k_inv, @k)
-
-    var rd: Scalar256
-    scalar256_mul(@rd, @sig.r, priv_key)
-
-    var z_rd: Scalar256
-    scalar256_add(@z_rd, @z, @rd)
-
-    scalar256_mul(@sig.s, @k_inv, @z_rd)
+    scalar256_inv(@sec.k_inv, @sec.k)
+    scalar256_mul(@sec.rd, @sig.r, priv_key)
+    scalar256_add(@sec.z_rd, @z, @sec.rd)
+    scalar256_mul(@sig.s, @sec.k_inv, @sec.z_rd)
 
     if scalar256_is_zero(@sig.s) == 1
         return 0
-
-    # Zero sensitive data
-    mem_zero(@k_bytes[0], sizeof(k_bytes))
-    scalar256_zero(@k)
-    scalar256_zero(@k_inv)
 
     return 1
 

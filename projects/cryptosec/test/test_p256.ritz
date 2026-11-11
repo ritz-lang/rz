@@ -1435,3 +1435,82 @@ fn test_der_control_first_byte_0x22_is_not_padded() -> i32
 [[test]]
 fn test_der_control_zero_r_is_one_zero_byte() -> i32
     return der_expect_2224(c"0000000000000000000000000000000000000000000000000000000000000000", c"2244444444444444444444444444444444444444444444444444444444444444", c"302502010002202244444444444444444444444444444444444444444444444444444444444444", 39)
+
+# ============================================================================
+# Secret wiping in ecdsa_p256_sign (AGAST #2581, GitHub #139)
+# ============================================================================
+# s = k^-1 * (z + r*d): rd = r*d and z_rd = z + r*d each give away the
+# private key d given the public r and z, and k / k_inv give it away given s.
+# None may outlive the call. stack_holds_2581 reads the stack just below the
+# caller's frame, where the callee's frames lived, looking for their bytes.
+
+const RESIDUE_SPAN_2581: i64 = 65536
+
+[[noinline]]
+fn stack_holds_2581(pat: *u8, plen: i64) -> bool
+    var buf: [65536]u8
+    # Make buf escape so the reads below are real loads of what is there.
+    let p: *u8 = @buf[0]
+    asm x86_64:
+        nopl ({p})
+    var i: i64 = 0
+    while i + plen <= RESIDUE_SPAN_2581
+        var j: i64 = 0
+        while j < plen and buf[i + j] == pat[j]
+            j += 1
+        if j == plen
+            return true
+        i += 1
+    return false
+
+# The signing secrets for (priv, hash), recomputed from a signature.
+struct SignSecrets2581
+    rd: Scalar256
+    z_rd: Scalar256
+    k: Scalar256
+    k_inv: Scalar256
+
+[[noinline]]
+fn sign_secrets_2581(out: *SignSecrets2581, priv_key: *Scalar256, hash: *u8) -> i32
+    var sig: EcdsaSignature
+    if ecdsa_p256_sign(@sig, hash, priv_key) != 1
+        return 1
+    var z: Scalar256
+    scalar256_from_bytes(@z, hash)  # the test hash is < n, so z needs no reduction
+    scalar256_mul(@out.rd, @sig.r, priv_key)
+    scalar256_add(@out.z_rd, @z, @out.rd)
+    var s_inv: Scalar256
+    scalar256_inv(@s_inv, @sig.s)
+    scalar256_mul(@out.k, @s_inv, @out.z_rd)  # k = s^-1 * (z + r*d)
+    scalar256_inv(@out.k_inv, @out.k)
+    return 0
+
+[[test]]
+fn test_ecdsa_sign_wipes_secrets() -> i32
+    var priv_key: Scalar256
+    priv_key.limbs[0] = 0x0123456789ABCDEF
+    priv_key.limbs[1] = 0x1122334455667788
+    priv_key.limbs[2] = 0x99AABBCCDDEEFF00
+    priv_key.limbs[3] = 0x0F1E2D3C4B5A6978
+    var hash: [32]u8
+    for i in 0..32
+        hash[i] = ((i * 29 + 11) % 256) as u8
+    hash[0] = 0x3A  # keep z < n
+
+    var sec: SignSecrets2581
+    if sign_secrets_2581(@sec, @priv_key, @hash[0]) != 0
+        return 1
+
+    # Sign again: whatever the frames hold now is this call's residue.
+    var sig: EcdsaSignature
+    if ecdsa_p256_sign(@sig, @hash[0], @priv_key) != 1
+        return 2
+    if stack_holds_2581(@sec.rd as *u8, sizeof(Scalar256))
+        return 3  # rd = r*d left on the stack
+    if stack_holds_2581(@sec.z_rd as *u8, sizeof(Scalar256))
+        return 4  # z + r*d left on the stack
+    if stack_holds_2581(@sec.k as *u8, sizeof(Scalar256))
+        return 5  # nonce k left on the stack
+    if stack_holds_2581(@sec.k_inv as *u8, sizeof(Scalar256))
+        return 6  # k^-1 left on the stack
+    return 0
