@@ -4099,41 +4099,52 @@ fn ptr_levels_of(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8, ou
         *out_len = name_len
     return levels
 
-# AGAST #2575: the struct S when `x` is pointer arithmetic on a `*S`: `y + k`
-# or `y - k` down the left spine (as ptr_arith_elem_size reads a chain),
-# rooted in a call returning `*S` (`vec_as_ptr<E>(@v) + 1`, `mkp() + 1`) or a
-# `*S` local or param (`p + 1`).  Writes the name and returns 1, else 0.  An
-# un-annotated `let e = <x>` takes `*S` from it, as if annotated; it was an
-# i64, so `e.b` was "unhandled EXPR_MEMBER" and `@e.b` "cannot take address".
-# A scalar pointee isn't asked for: emit_var_decl already sized those.
-fn ptr_arith_struct_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+# AGAST #2575 / #2598: the pointee of `x` when it is pointer arithmetic on a
+# `*T`: `y + k` or `y - k` down the left spine (as ptr_arith_elem_size reads a
+# chain), rooted in a call returning `*T` (`vec_as_ptr<E>(@v) + 1`,
+# `mkp() + 1`) or a `*T` local or param (`p + 1`).  Returns TYPE_STRUCT and
+# writes the struct's name for a `*S`, the primitive kind (TYPE_I32, ...) for
+# a scalar `*T`, else 0.  An un-annotated `let e = <x>` takes `*T` from it, as
+# if annotated.  It was an i64 with no pointee: `e.b` was "unhandled
+# EXPR_MEMBER", `*e = v` stored 8 bytes whatever T was, and `e + 1` stepped
+# one byte (#2598, silently).
+fn ptr_arith_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
     if x == null or x.kind != EXPR_BINARY or (x.op != OP_ADD and x.op != OP_SUB)
         return 0
     # `q - p` of two pointers is a count, not a pointer.
-    if x.op == OP_SUB and (ptr_arith_elem_size(s, x.right) != 0 or ptr_root_struct(s, x.right, out_name, out_len) == 1)
+    if x.op == OP_SUB and (ptr_arith_elem_size(s, x.right) != 0 or ptr_root_pointee(s, x.right, out_name, out_len) != 0)
         *out_name = null
         *out_len = 0
         return 0
     if x.left.kind == EXPR_BINARY
-        return ptr_arith_struct_pointee(s, x.left, out_name, out_len)
-    ptr_root_struct(s, x.left, out_name, out_len)
+        return ptr_arith_pointee(s, x.left, out_name, out_len)
+    ptr_root_pointee(s, x.left, out_name, out_len)
 
-# The struct S when `x` is a call returning `*S` or a `*S` local or param.
-fn ptr_root_struct(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+# The pointee of `x` when it is a call returning `*T` or a `*T` local or
+# param: TYPE_STRUCT (name written) for a `*S`, the primitive kind for a
+# scalar `*T`, else 0.
+fn ptr_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
     var name: *u8 = null
     var name_len: i32 = 0
     if x.kind == EXPR_CALL
         let fd: *FnDef = find_call_fn(s, x)
         if fd == null or fd.return_type != TYPE_PTR
             return 0
+        # capture_fn_return_type names a primitive pointee ("i32") on
+        # return_type_name (#1984), as ptr_arith_elem_size reads it (#2540).
+        let rp: i32 = primitive_type_from_name(fd.return_type_name, fd.return_type_name_len)
+        if rp != 0   # primitive_type_from_name's miss value
+            return rp
         name = fd.return_type_name
         name_len = fd.return_type_name_len
     else if x.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
         if loc == null or loc.var_type != TYPE_PTR
             return 0
+        if primitive_name_len(loc.pointee_type) > 0
+            return loc.pointee_type
         name = loc.type_name
         name_len = loc.type_name_len
     else
@@ -4142,7 +4153,7 @@ fn ptr_root_struct(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) ->
         return 0
     *out_name = name
     *out_len = name_len
-    1
+    TYPE_STRUCT
 
 # AGAST #2376: `@a[i]` points at an element that is itself a pointer: a `**U`
 # for `a: [N]*U`, one level more than the element for `a: [N]**U`.  0 for any

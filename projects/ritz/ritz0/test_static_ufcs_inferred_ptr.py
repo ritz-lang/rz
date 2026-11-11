@@ -147,38 +147,41 @@ USES = {
 }
 
 
-# Control: a scalar pointer must not be taken for a struct one.  w holds 5, 7,
-# 9; each let names element 1.  `*i64` is right today when nothing strides `e`
-# (the let's i64 default is its width).  `*i32` is #2598, a silent 8-byte store
-# over element 2, pinned below; so is `e + 1` on either, which steps one byte.
+# A scalar pointee too (#2598): `let e = <*T> ± k` is a `*T`.  w holds 5, 7,
+# 9; each let names element 1.  It was an i64 with no pointee, so `*e = 30`
+# stored 8 bytes (over element 2 for a `*i32`) and `e + 1` stepped one byte.
+# `*i64` stores were right by luck (the let's i64 default is its width).
 SCALAR_INITS = {"generic_call": "vec_as_ptr<{T}>(@w) + 1", "local": "q + 1",
-                "chain": "q + 2 - 1"}
+                "chain": "q + 2 - 1", "local_chain": "q + i + 1 - 1"}
+
+# How main uses `e`, and what ritz0 returns.
+SCALAR_USES = {
+    "store": ("    *e = 30\n    (*e + w[0] + w[2]) as i32\n", 44),
+    "next_element": ("    *(e + 1) as i32\n", 9),
+    "previous_element": ("    *(e - 1) as i32\n", 5),
+}
+
+SCALAR_TYPES = ["i64", "i32", "i16", "u8"]
 
 
-def _scalar(ty: str, init: str) -> str:
+def _scalar(ty: str, init: str, use: str) -> str:
     body = (f"    var w = vec_new<{ty}>()\n    w.push(5)\n    w.push(7)\n    w.push(9)\n"
             f"    let q: *{ty} = vec_as_ptr<{ty}>(@w)\n"
+            "    var i: i64 = 1\n"
             f"    let e = {SCALAR_INITS[init].format(T=ty)}\n"
-            "    *e = 30\n    (*e + w[0] + w[2]) as i32\n")
+            f"{SCALAR_USES[use][0]}")
     return f"{PTR_HEADER}pub fn main() -> i32\n{body}"
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("use", sorted(SCALAR_USES))
 @pytest.mark.parametrize("init", sorted(SCALAR_INITS))
-def test_an_inferred_i64_pointer(run_with, init, compiler):
-    assert run_with(compiler, f"i64_{init}", _scalar("i64", init)) == 44
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", [
-    "ritz0",
-    pytest.param("ritz1", marks=pytest.mark.xfail(strict=True, reason="#2598")),
-    pytest.param("ritz1_selfhosted", marks=pytest.mark.xfail(strict=True, reason="#2598")),
-])
-@pytest.mark.parametrize("init", sorted(SCALAR_INITS))
-def test_an_inferred_i32_pointer(run_with, init, compiler):
-    assert run_with(compiler, f"i32_{init}", _scalar("i32", init)) == 44
+@pytest.mark.parametrize("ty", SCALAR_TYPES)
+def test_an_inferred_scalar_pointer(run_with, ty, init, use, compiler):
+    """`let e = <*T> ± k` is a `*T`, exactly as if annotated."""
+    got = run_with(compiler, f"{ty}_{init}_{use}", _scalar(ty, init, use))
+    assert got == SCALAR_USES[use][1]
 
 
 @pytest.mark.integration
