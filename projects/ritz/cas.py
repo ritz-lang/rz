@@ -70,6 +70,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -138,20 +139,35 @@ def module_identity(path: Path, repo_root: Optional[Path] = None) -> str:
 
 _FILE_HASHES: Dict[tuple, str] = {}
 
+# A file whose mtime is this close to "now" (or in the future) is "racy", as
+# git calls it: a same-size rewrite inside the filesystem's mtime granularity
+# keeps the same (size, mtime_ns), so its memo key cannot tell the two
+# contents apart. Coarse clocks are real: on WSL2 kernel 6.6, 1987 of 2000
+# back-to-back writes shared an mtime_ns (AGAST #2689). Two seconds covers
+# FAT's 2 s stamps and any jiffy-based clock with room to spare.
+RACY_MTIME_WINDOW_NS = 2 * 10**9
+
 
 def file_sha256(path: Path) -> str:
-    """sha256 of a file, memoised per (path, size, mtime_ns) for the process."""
+    """sha256 of a file, memoised per (path, size, mtime_ns) for the process.
+
+    Racy files (mtime within RACY_MTIME_WINDOW_NS of now) are hashed every
+    time and never stored, so a rewrite in the same mtime tick cannot be
+    answered with the old digest. Once the file ages it is memoised as usual.
+    """
     p = Path(path)
     st = p.stat()
     memo_key = (str(p), st.st_size, st.st_mtime_ns)
-    digest = _FILE_HASHES.get(memo_key)
+    racy = time.time_ns() - st.st_mtime_ns < RACY_MTIME_WINDOW_NS
+    digest = None if racy else _FILE_HASHES.get(memo_key)
     if digest is None:
         h = hashlib.sha256()
         with open(p, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 16), b""):
                 h.update(chunk)
         digest = h.hexdigest()
-        _FILE_HASHES[memo_key] = digest
+        if not racy:
+            _FILE_HASHES[memo_key] = digest
     return digest
 
 

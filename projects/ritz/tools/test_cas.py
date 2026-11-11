@@ -96,6 +96,64 @@ def test_changing_an_import_changes_every_dependents_key(tmp_path):
     assert after["other"] == before["other"], "unrelated module was invalidated"
 
 
+def _count_opens(monkeypatch) -> list:
+    """Record every path `cas` opens. A module global shadows the builtin."""
+    opened = []
+
+    def spy(path, *a, **kw):
+        opened.append(Path(path))
+        return open(path, *a, **kw)
+
+    monkeypatch.setattr(cas, "open", spy, raising=False)
+    return opened
+
+
+@pytest.mark.unit
+def test_same_size_rewrite_within_one_mtime_tick_rehashes(tmp_path):
+    """AGAST #2689: a coarse-mtime filesystem gives a same-size rewrite the
+    old (size, mtime_ns). Restoring the stamp by hand reproduces that on any
+    host, whatever its clock granularity."""
+    p = tmp_path / "leaf.ritz"
+    p.write_text("pub struct S\n    x: i32\n")
+    st = p.stat()
+    before = cas.file_sha256(p)
+    p.write_text("pub struct S\n    x: i64\n")
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert p.stat().st_size == st.st_size
+    assert p.stat().st_mtime_ns == st.st_mtime_ns
+    assert cas.file_sha256(p) != before, "stale memoised digest for a rewritten file"
+
+
+@pytest.mark.unit
+def test_unchanged_old_file_hits_the_memo(tmp_path, monkeypatch):
+    """The memo still saves the read for a file last written long ago."""
+    p = tmp_path / "old.ritz"
+    p.write_text("fn f() -> i32\n    1\n")
+    old = p.stat().st_mtime_ns - 3600 * 10**9
+    os.utime(p, ns=(old, old))
+    opened = _count_opens(monkeypatch)
+    first = cas.file_sha256(p)
+    assert cas.file_sha256(p) == first
+    assert cas.file_sha256(p) == first
+    assert opened == [p], f"expected one read, got {len(opened)}"
+
+
+@pytest.mark.unit
+def test_fresh_file_is_memoised_once_it_ages(tmp_path, monkeypatch):
+    """A racy entry is re-read, not poisoned: once the file is old it sticks."""
+    p = tmp_path / "fresh.ritz"
+    p.write_text("fn f() -> i32\n    1\n")
+    opened = _count_opens(monkeypatch)
+    cas.file_sha256(p)
+    cas.file_sha256(p)
+    assert len(opened) == 2, "a just-written file must not be trusted from the memo"
+    old = p.stat().st_mtime_ns - 3600 * 10**9
+    os.utime(p, ns=(old, old))
+    cas.file_sha256(p)
+    cas.file_sha256(p)
+    assert len(opened) == 3, "an aged file was not memoised"
+
+
 @pytest.mark.unit
 def test_compiler_change_misses_and_leaves_old_entries(tmp_path):
     """Acceptance 2."""
