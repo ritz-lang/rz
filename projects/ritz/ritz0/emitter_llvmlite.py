@@ -14719,25 +14719,46 @@ class LLVMEmitter:
 
         A type alias spells as its target, as in the monomorphizer: `Pair<Id>`
         with `type Id = u32` is Pair$u32, not Pair$Id (AGAST #2049).
+
+        Every node spells as `monomorph.mangle_type_name` spells it, except a
+        nested generic NamedType, which keeps the `Base$args` name its struct
+        is registered under. There is no `str(ty)` fallback: it embeds the
+        source span, so one type written at two places got two names
+        (AGAST #1321 for tuples, #2742 for fn/dyn/ref/array/vector/union).
         """
         ty = resolve_alias_in(ty, self.type_aliases)
+        suffix = self._type_to_name_suffix
         if isinstance(ty, rast.NamedType):
             if ty.args:
                 return self._get_specialized_type_name(ty)
             return ty.name
         elif isinstance(ty, rast.PtrType):
-            return "ptr_" + self._type_to_name_suffix(ty.inner)
+            # `*mut T` and `*T` are distinct types (AGAST #2742).
+            return ("ptrmut_" if ty.mutable else "ptr_") + suffix(ty.inner)
+        elif isinstance(ty, rast.RefType):
+            return ("refmut_" if ty.mutable else "ref_") + suffix(ty.inner)
+        elif isinstance(ty, rast.ArrayType):
+            return f"arr{ty.size}_{suffix(ty.inner)}"
+        elif isinstance(ty, rast.SliceType):
+            return f"slice_{suffix(ty.inner)}"
         elif isinstance(ty, rast.TupleType):
-            # str(ty) embeds the source *span*, so `Result<(), E>` written in
-            # two places produced two distinct enum names for the same type —
-            # invalid IR at the ret boundary (AGAST #1321,
-            # angelo hinting/interpreter.ritz).
             if not ty.elements:
                 return "unit"
-            return "tuple_" + "_".join(
-                self._type_to_name_suffix(e) for e in ty.elements)
-        else:
-            return str(ty)
+            return "tuple_" + "_".join(suffix(e) for e in ty.elements)
+        elif isinstance(ty, rast.FnType):
+            params = "".join(f"_{suffix(p)}" for p in ty.params)
+            ret = suffix(ty.ret) if ty.ret is not None else "unit"
+            return f"fn{len(ty.params)}{params}_ret_{ret}"
+        elif isinstance(ty, rast.DynType):
+            args = "".join(f"_{suffix(a)}" for a in ty.args)
+            return f"dyn_{ty.trait_name}{args}"
+        elif isinstance(ty, rast.VectorType):
+            return f"vec{ty.count}_{suffix(ty.inner)}"
+        elif isinstance(ty, rast.UnionType):
+            variants = "_".join(suffix(v) for v in ty.variants)
+            return f"union{len(ty.variants)}_{variants}"
+        raise TypeError(
+            f"_type_to_name_suffix: no spelling for {type(ty).__name__}")
 
     def _fieldless_enum_variants(self, ty: ir.Type) -> Optional[list]:
         """Variants of `ty` if it is an enum whose variants ALL carry no payload.
