@@ -85,13 +85,17 @@ stays here; remote hosts only run rooms.
 | Host | Host room | Ritz slots | Ready | Notes |
 |---|---|---|---|---|
 | omegalisk | (local: `systemctl`, `git worktree`) | 2 | yes | 12 cores, 15 GB, WSL |
-| starbux | `adele-starbux` | 1 | no | 8 cores, 14 GB. Host agent not connected (#2607); no `llvmlite` or `lld`, suspends when idle, no linger (#2608) |
-| toffee | `adele-toffee` | 1 | no | 8 cores, 14 GB. Host agent not connected (#2607); no `llvmlite`, suspends when idle, no linger (#2608) |
-| chungus | `adele-chungus` | 1 | no | 8 cores, 14 GB, ~5 GB free with a Minecraft server running. Host agent not connected (#2607); no `llvmlite` or `lld`, no linger (#2608) |
+| toffee | `adele-toffee` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~10 GB free. Linger on, `llvmlite` and `lld` 21 installed, smoke passes. First remote trial host |
+| starbux | `adele-starbux` | 1 | yes (2026-11-10), **held** | 8 cores, 14 GB, ~11 GB free. Smoke passes; `lld` is a user-local copy (`~/.local/opt/lld-21`). No spawns until the toffee trial has reported to `adele` |
+| chungus | `adele-chungus` | 1 | no | 8 cores, 14 GB, only ~5 GB free (another user's desktop session) and 47 GB disk. Smoke passes. Not ready until Aaron says so |
 
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
   changes its slots. Edit this table and commit it on `main` when they do.
   A host's first room is a small, low-risk ticket.
+- **No harland/UEFI tickets on remote hosts** until an `lld`-linked harland
+  build has passed there. No host has node or docker. No full gate has
+  run on a remote host before the toffee trial; if a remote gate can't run,
+  the room says so in place of a REAP, and nothing merges ungated.
 - **One gate per host.** `run-gate.sh` locks slots under the host's own
   `~/dev/ritz-lang/gate-logs`, so a remote gate never waits on omegalisk's
   gate.
@@ -104,10 +108,17 @@ stays here; remote hosts only run rooms.
   - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz model=opus`, then
     the briefing. The host answers `SPAWNED ritz-task-<id> on <host>` or
     `SPAWN-FAILED ritz-task-<id> on <host>: <reason>`.
+    `SPAWN` also fast-forwards the host's `~/dev/ritz-lang/rz` to
+    `origin/main`, because `run-gate.sh` is read from there.
   - `RESTART ritz-task-<id>`: restarts a room that isn't working.
   - `TEARDOWN ritz-task-<id>`: removes the room's unit, budget, worktree and
-    local branch after its merge.
-  - `STATUS`: free memory, running rooms, each room's last journal line.
+    local branch after its merge. The host answers `TORN-DOWN ritz-task-<id>
+    on <host>`; the slot is free from then.
+  - `STATUS`: free memory, running rooms, each room's last journal line, and
+    any room with a `pending-mcp` file or 401s in its journal.
+  - Proposed in #2609, not yet agreed: `PAUSE` / `RESUME ritz-task-<id>`
+    (stop and disable the unit, keeping the worktree; answered `PAUSED` /
+    `RESUMED`). Every host answer is sent with `ask_claude=True`.
 - **Host answers aren't REAPs.** `SPAWNED`, `SPAWN-FAILED` and `STATUS`
   replies never go in the scratchpad. On `SPAWN-FAILED`, release the claim
   (`release_task`), tell Aaron the reason in the turn report, and don't
@@ -183,8 +194,9 @@ You can't run `git worktree`, `systemctl`, `provision-room.sh` or
 1. **Create the room on the server first**, as above (`send_room_message`
    "Room initialized for AGAST #<id>.", then `update_room_description`), so
    the remote agent doesn't crash-loop on HTTP 400.
-2. **Claim the ticket here** as `ritz-task-<id>@<host>`. The hosts have no
-   AGAST credentials.
+2. **Claim the ticket here** as `ritz-task-<id>@<host>`, so the claim records
+   the host. Remote rooms have the AGAST tools (2026-11-10) and use them
+   like local rooms: read, complete and file tickets themselves.
 3. **Send `SPAWN`** to `adele-<host>`: the verb line, then the briefing below
    with the remote additions filled in. The host creates
    `~/dev/ritz-lang/rz-task-<id>` off `origin/main`, provisions it, puts it
@@ -294,11 +306,10 @@ so:
 - **Your REAP must quote the gate's verdict:** add `gate <log name>
   SHA=<first 12> EXIT=0` to the REAP line, copied from the log. `rz` checks
   that the SHA matches the one you REAP.
-- **AGAST:** the ticket text is pasted below; it is the full spec. If your
-  AGAST tools fail, don't file or complete tickets yourself. List
-  follow-ups in your REAP (one line each: title, file:line, why) and
-  `rz` files them. For step 1, REAP `none` with the evidence instead of
-  calling `complete_task`.
+- **AGAST:** use your AGAST tools as a local room would. The ticket text
+  is also pasted below. If an AGAST call fails, say so in your REAP, list
+  follow-ups there (one line each: title, file:line, why) for `rz` to file,
+  and for step 1 REAP `none` with the evidence.
 - **Self-restart** (the `systemd-run` above) works the same on this host.
 
 <full AGAST ticket text>
