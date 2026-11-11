@@ -46,6 +46,8 @@ import ritzlib.io
 import ritzlib.strview
 
 import cryptosec.tls13_kdf
+import cryptosec.hkdf
+import cryptosec.crypto_error
 import cryptosec.mem
 import cryptosec.sha256
 
@@ -481,4 +483,213 @@ fn test_key_schedule_init_clears_whole_struct() -> i32
         return 1
     if mem_is_zero(@ks.server_write_iv[0], 12) != 1
         return 2
+    0
+
+# ============================================================================
+# HKDF-Expand-Label length limits (AGAST #2579, GitHub #140)
+#
+# RFC 8446 §7.1: label<7..255> = "tls13 " + Label, so Label is 1..249 bytes;
+# context<0..255>; Length is a uint16. hkdf_expand_label used to build the
+# HkdfLabel in a 256-byte stack buffer with no checks, so a long label or
+# context wrote past it. Out of range now means Err(InvalidLength) and no
+# output written.
+# ============================================================================
+
+fn kdf_ok_len(r: Result<i64, CryptoError>) -> i64
+    match r
+        Ok(n) => n
+        Err(_) => -1
+
+fn kdf_is_invalid_length(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.InvalidLength => true
+                _ => false
+
+fn kdf_fill(buf: *u8, seed: i64, len: i64)
+    var i: i64 = 0
+    while i < len
+        buf[i] = ((i * 13 + seed) & 0xff) as u8
+        i += 1
+
+# HKDF-Expand(secret, HkdfLabel, out_len) with the HkdfLabel built by hand.
+fn expand_label_by_hand(secret: *u8, label: *u8, label_len: i64, context: *u8, context_len: i64, out: *u8, out_len: i64)
+    var info: [600]u8
+    info[0] = ((out_len >> 8) & 0xff) as u8
+    info[1] = (out_len & 0xff) as u8
+    info[2] = (6 + label_len) as u8
+    let prefix = "tls13 "
+    mem_copy(@info[3], prefix.ptr, 6)
+    mem_copy(@info[9], label, label_len)
+    info[9 + label_len] = context_len as u8
+    mem_copy(@info[10 + label_len], context, context_len)
+    hkdf_expand(secret, @info[0], (10 + label_len + context_len) as u64, out, out_len as u64)
+
+# 0 when hkdf_expand_label returns Ok(32) for these lengths and matches the
+# hand-built HkdfLabel, with nothing written outside `out`.
+fn check_label_lengths(label_len: i32, context_len: i32) -> i32
+    var secret: [32]u8
+    kdf_fill(@secret[0], 1, 32)
+    var label: [300]u8
+    kdf_fill(@label[0], 5, 300)
+    var context: [300]u8
+    kdf_fill(@context[0], 9, 300)
+
+    var out: [64]u8
+    var i: i32 = 0
+    while i < 64
+        out[i] = 0xa5
+        i += 1
+    if kdf_ok_len(hkdf_expand_label(@secret[0], @label[0], label_len, @context[0], context_len, @out[16], 32)) != 32
+        return 1
+
+    var expected: [32]u8
+    expand_label_by_hand(@secret[0], @label[0], label_len as i64, @context[0], context_len as i64, @expected[0], 32)
+    if mem_eq(@out[16], @expected[0], 32) != 1
+        return 2
+    i = 0
+    while i < 16
+        if out[i] != 0xa5 || out[48 + i] != 0xa5
+            return 3
+        i += 1
+    0
+
+# 0 when hkdf_expand_label refuses these lengths with InvalidLength and
+# writes nothing.
+fn check_label_refused(label_len: i32, context_len: i32, out_len: i32) -> i32
+    var secret: [32]u8
+    kdf_fill(@secret[0], 1, 32)
+    var label: [300]u8
+    kdf_fill(@label[0], 5, 300)
+    var context: [300]u8
+    kdf_fill(@context[0], 9, 300)
+
+    var out: [64]u8
+    var i: i32 = 0
+    while i < 64
+        out[i] = 0xa5
+        i += 1
+    if not kdf_is_invalid_length(hkdf_expand_label(@secret[0], @label[0], label_len, @context[0], context_len, @out[0], out_len))
+        return 1
+    i = 0
+    while i < 64
+        if out[i] != 0xa5
+            return 2
+        i += 1
+    0
+
+[[test]]
+fn test_hkdf_expand_label_label_at_max() -> i32
+    # "tls13 " + 249 = 255, the most the label<7..255> length byte allows.
+    check_label_lengths(249, 0)
+
+[[test]]
+fn test_hkdf_expand_label_label_just_over_max_refused() -> i32
+    check_label_refused(250, 0, 32)
+
+[[test]]
+fn test_hkdf_expand_label_empty_label_refused() -> i32
+    # label<7..255>: "tls13 " alone (6 bytes) is below the floor.
+    check_label_refused(0, 0, 32)
+
+[[test]]
+fn test_hkdf_expand_label_negative_label_refused() -> i32
+    check_label_refused(-1, 0, 32)
+
+[[test]]
+fn test_hkdf_expand_label_context_at_max() -> i32
+    check_label_lengths(3, 255)
+
+[[test]]
+fn test_hkdf_expand_label_context_just_over_max_refused() -> i32
+    check_label_refused(3, 256, 32)
+
+[[test]]
+fn test_hkdf_expand_label_negative_context_refused() -> i32
+    check_label_refused(3, -1, 32)
+
+[[test]]
+fn test_hkdf_expand_label_label_and_context_at_max() -> i32
+    # 2 + 1 + 255 + 1 + 255 = 514 bytes of HkdfLabel: twice the old buffer.
+    check_label_lengths(249, 255)
+
+[[test]]
+fn test_hkdf_expand_label_negative_length_refused() -> i32
+    check_label_refused(3, 0, -1)
+
+[[test]]
+fn test_hkdf_expand_label_length_over_hkdf_max_refused() -> i32
+    # 8161 > 255 * 32: HKDF-Expand refuses, and so must the label wrapper.
+    check_label_refused(3, 0, 8161)
+
+[[test]]
+fn test_hkdf_expand_label_length_over_uint16_refused() -> i32
+    check_label_refused(3, 0, 65536)
+
+[[test]]
+fn test_hkdf_expand_label_null_context_with_length_refused() -> i32
+    # Writing context_len into the struct with no bytes behind it would
+    # derive from a label the caller never meant.
+    var secret: [32]u8
+    kdf_fill(@secret[0], 1, 32)
+    var out: [32]u8
+    if not kdf_is_invalid_length(hkdf_expand_label(@secret[0], "key", 3, null, 4, @out[0], 32))
+        return 1
+    0
+
+[[test]]
+fn test_derive_secret_and_traffic_keys_return_ok() -> i32
+    var secret: [32]u8
+    kdf_fill(@secret[0], 1, 32)
+    var out: [32]u8
+    if kdf_ok_len(derive_secret(@secret[0], "derived", 7, null, 0, @out[0])) != 32
+        return 1
+    var key: [16]u8
+    var iv: [12]u8
+    if kdf_ok_len(tls13_derive_traffic_keys(@secret[0], @key[0], 16, @iv[0], 12)) != 28
+        return 2
+    if not kdf_is_invalid_length(tls13_derive_traffic_keys(@secret[0], @key[0], -1, @iv[0], 12))
+        return 3
+    0
+
+[[test]]
+fn test_key_schedule_key_lengths_bounded_by_struct() -> i32
+    # client/server_write_key are [32]u8 and write_iv [12]u8: anything
+    # bigger would write past them into the next field.
+    var ks: TLS13KeySchedule
+    tls13_key_schedule_init(@ks)
+    if kdf_ok_len(tls13_key_schedule_derive_handshake_keys(@ks, 32, 12)) != 0
+        return 1
+    if not kdf_is_invalid_length(tls13_key_schedule_derive_handshake_keys(@ks, 33, 12))
+        return 2
+    if not kdf_is_invalid_length(tls13_key_schedule_derive_handshake_keys(@ks, 16, 13))
+        return 3
+    if not kdf_is_invalid_length(tls13_key_schedule_derive_application_keys(@ks, 33, 12))
+        return 4
+    if not kdf_is_invalid_length(tls13_key_schedule_derive_application_keys(@ks, 16, 13))
+        return 5
+    if kdf_ok_len(tls13_key_schedule_derive_application_keys(@ks, 16, 12)) != 0
+        return 6
+    0
+
+[[test]]
+fn test_traffic_keys_bad_iv_len_writes_no_key() -> i32
+    # A bad iv_len must be refused before the key is derived, not after.
+    var secret: [32]u8
+    kdf_fill(@secret[0], 1, 32)
+    var key: [16]u8
+    var i: i32 = 0
+    while i < 16
+        key[i] = 0xa5
+        i += 1
+    var iv: [12]u8
+    if not kdf_is_invalid_length(tls13_derive_traffic_keys(@secret[0], @key[0], 16, @iv[0], -1))
+        return 1
+    i = 0
+    while i < 16
+        if key[i] != 0xa5
+            return 2
+        i += 1
     0

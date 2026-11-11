@@ -8,6 +8,8 @@ import ritzlib.io
 import ritzlib.strview
 
 import cryptosec.hkdf
+import cryptosec.hmac
+import cryptosec.crypto_error
 import cryptosec.mem
 
 # ============================================================================
@@ -364,4 +366,152 @@ fn test_hkdf_expand_str_api() -> i32
     let expected = "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
     if bytes_eq_hex(@okm[0], expected, 42) != 1
         return 1
+    0
+
+# ============================================================================
+# Length limits (AGAST #2579, GitHub #140)
+#
+# hkdf_expand used to build T(i-1) || info || i in a 256-byte stack buffer,
+# so info longer than 223 bytes wrote past it. RFC 5869 puts no limit on
+# info; the one limit it has is L <= 255 * HashLen (8160 for SHA-256).
+# ============================================================================
+
+# Bytes written by an Ok result, or -1 for Err.
+fn ok_len(r: Result<i64, CryptoError>) -> i64
+    match r
+        Ok(n) => n
+        Err(_) => -1
+
+fn is_invalid_length(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.InvalidLength => true
+                _ => false
+
+const BIG_INFO: i64 = 4096
+
+# RFC 5869 §2.3 by hand for two blocks, straight from hmac_sha256:
+#   T(1) = HMAC(PRK, info || 0x01), T(2) = HMAC(PRK, T(1) || info || 0x02)
+fn expand_two_blocks_by_hand(prk: *u8, info: *u8, info_len: i64, out: *u8)
+    var msg: [4200]u8
+    mem_copy(@msg[0], info, info_len)
+    msg[info_len] = 1
+    hmac_sha256(prk, 32, @msg[0], (info_len + 1) as u64, out)
+    mem_copy(@msg[0], out, 32)
+    mem_copy(@msg[32], info, info_len)
+    msg[32 + info_len] = 2
+    hmac_sha256(prk, 32, @msg[0], (32 + info_len + 1) as u64, out + 32)
+
+fn fill_byte(buf: *u8, b: u8, len: i64)
+    var i: i64 = 0
+    while i < len
+        buf[i] = b
+        i += 1
+
+fn fill_pattern(buf: *u8, len: i64)
+    var i: i64 = 0
+    while i < len
+        buf[i] = ((i * 7 + 3) & 0xff) as u8
+        i += 1
+
+# info_len -> 0 when hkdf_expand returns Ok(64) and matches the hand-built
+# RFC 5869 output, else a non-zero code.
+fn check_expand_info_len(info_len: i64) -> i32
+    var prk: [32]u8
+    fill_pattern(@prk[0], 32)
+    var info: [4096]u8
+    fill_pattern(@info[0], info_len)
+
+    # Guard bytes either side of okm catch any stray write.
+    var okm: [96]u8
+    fill_byte(@okm[0], 0xa5, 96)
+    if ok_len(hkdf_expand(@prk[0], @info[0], info_len as u64, @okm[16], 64)) != 64
+        return 1
+
+    var expected: [64]u8
+    expand_two_blocks_by_hand(@prk[0], @info[0], info_len, @expected[0])
+    if mem_eq(@okm[16], @expected[0], 64) != 1
+        return 2
+    var i: i32 = 0
+    while i < 16
+        if okm[i] != 0xa5 || okm[80 + i] != 0xa5
+            return 3
+        i += 1
+    0
+
+[[test]]
+fn test_hkdf_expand_info_at_old_buffer_limit() -> i32
+    # 32 (T) + 223 + 1 (counter) = 256: the largest the old buffer held.
+    check_expand_info_len(223)
+
+[[test]]
+fn test_hkdf_expand_info_just_over_old_buffer() -> i32
+    # 32 + 224 + 1 = 257: one byte past the old 256-byte buffer.
+    check_expand_info_len(224)
+
+[[test]]
+fn test_hkdf_expand_long_info() -> i32
+    # RFC 5869 does not bound info; a long one must still derive correctly.
+    check_expand_info_len(BIG_INFO)
+
+[[test]]
+fn test_hkdf_expand_max_output() -> i32
+    # L = 255 * 32 = 8160 is the most HKDF-SHA256 can produce.
+    var prk: [32]u8
+    fill_pattern(@prk[0], 32)
+    var okm: [8160]u8
+    if ok_len(hkdf_expand(@prk[0], null, 0, @okm[0], 8160)) != 8160
+        return 1
+    # The last block is T(255) = HMAC(PRK, T(254) || 0xff): counter 255,
+    # not a wrapped 0x00.
+    var t254: [33]u8
+    mem_copy(@t254[0], @okm[8160 - 64], 32)
+    t254[32] = 255
+    var t255: [32]u8
+    hmac_sha256(@prk[0], 32, @t254[0], 33, @t255[0])
+    if mem_eq(@okm[8160 - 32], @t255[0], 32) != 1
+        return 2
+    0
+
+[[test]]
+fn test_hkdf_expand_output_just_over_max_refused() -> i32
+    # 8161 would need T(256): the one-byte counter would wrap. Refuse, and
+    # write nothing.
+    var prk: [32]u8
+    fill_pattern(@prk[0], 32)
+    var okm: [8161]u8
+    fill_byte(@okm[0], 0xa5, 8161)
+    if not is_invalid_length(hkdf_expand(@prk[0], null, 0, @okm[0], 8161))
+        return 1
+    var i: i64 = 0
+    while i < 8161
+        if okm[i] != 0xa5
+            return 2
+        i += 1
+    0
+
+[[test]]
+fn test_hkdf_expand_null_info_with_length_refused() -> i32
+    # A non-zero info_len with no info is a caller bug: refuse, don't guess.
+    var prk: [32]u8
+    fill_pattern(@prk[0], 32)
+    var okm: [32]u8
+    fill_byte(@okm[0], 0xa5, 32)
+    if not is_invalid_length(hkdf_expand(@prk[0], null, 5, @okm[0], 32))
+        return 1
+    if okm[0] != 0xa5
+        return 2
+    0
+
+[[test]]
+fn test_hkdf_sha256_propagates_refusal() -> i32
+    var ikm: [16]u8
+    fill_pattern(@ikm[0], 16)
+    var okm: [8161]u8
+    if not is_invalid_length(hkdf_sha256(null, 0, @ikm[0], 16, null, 0, @okm[0], 8161))
+        return 1
+    if ok_len(hkdf_sha256(null, 0, @ikm[0], 16, null, 0, @okm[0], 42)) != 42
+        return 2
     0

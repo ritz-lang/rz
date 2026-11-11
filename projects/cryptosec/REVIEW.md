@@ -217,6 +217,8 @@ Not zeroed: `recv_buf[4096]`, `send_buf[4096]`, transcript hash, `server_certs`,
 
 **Fix:** Add `if info_len > 223 { return }` at the top of `hkdf_expand`.
 
+> **Status (2026-11, AGAST #2579, GitHub #140):** Fixed. `hkdf_expand` streams HMAC-SHA256 through SHA-256 (`hkdf_sha256_block`), so there is no concatenation buffer and `info` of any length is correct (RFC 5869 sets no limit). It returns `Result<i64, CryptoError>`: `Err(InvalidLength)`, with nothing written, for `okm_len > 255 * 32` (the one-octet counter would wrap) or a null `info` with a non-zero `info_len`. Covered by `test/test_hkdf.ritz`.
+
 ---
 
 ### M-5: `hkdf_expand_label` buffer could overflow
@@ -226,6 +228,8 @@ Not zeroed: `recv_buf[4096]`, `send_buf[4096]`, transcript hash, `server_certs`,
 `hkdf_label[256]` comment acknowledges 520-byte theoretical max. Unbounded `label_len`/`context_len` parameters can overflow.
 
 **Fix:** Either validate `label_len + context_len <= 247` at entry or increase buffer to `[520]u8`.
+
+> **Status (2026-11, AGAST #2579, GitHub #140):** Fixed. `hkdf_expand_label` refuses, before writing anything, a Label outside 1..249 bytes ("tls13 " + Label must fit `label<7..255>`), a Context over 255 bytes, a null pointer with a non-zero length, and (via `hkdf_expand`) a Length over 8160; the HkdfLabel buffer is `[514]u8`, the most both maxima need. The derive and key schedule functions return its `Result`, the `*_keys` steps also refuse key/IV lengths past the `TLS13KeySchedule` fields, and the client fails the handshake on `Err`. Covered by `test/test_tls13_kdf.ritz`.
 
 ---
 
@@ -539,7 +543,7 @@ Only `ca_store.ritz` performs heap allocations:
 12. Implement SAN hostname verification
 13. Add volatile semantics to `mem_zero`
 14. Fix all hardcoded `sizeof` approximations
-15. Add bounds check to `hkdf_expand`
+15. ~~Add bounds check to `hkdf_expand`~~ (done, #2579)
 16. Make P-256 scalar mult constant-time
 17. Fix `ed25519_verify` return convention and add `s < l` check
 18. Zero all sensitive intermediates (poly_key, HMAC contexts, SHA contexts, ECDSA scalars)

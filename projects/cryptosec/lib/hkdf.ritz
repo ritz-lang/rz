@@ -11,8 +11,10 @@
 import ritzlib.sys
 import ritzlib.strview
 
+import crypto_error
 import hmac
 import mem
+import sha256
 
 # ============================================================================
 # Constants
@@ -43,69 +45,90 @@ pub fn hkdf_extract(salt: *u8, salt_len: u64, ikm: *u8, ikm_len: u64, prk: *u8)
 # HKDF-Expand
 # ============================================================================
 
-# Expand a pseudorandom key into output keying material
+# Most output one HKDF-SHA256 expand can give: 255 * HashLen (RFC 5869 §2.3).
+# The block counter is one octet, so T(256) does not exist.
+pub const HKDF_SHA256_MAX_OKM_LEN: u64 = 8160
+
+# out = T(i) = HMAC-SHA256(PRK, T(i-1) || info || i), RFC 5869 §2.3.
+# HMAC is streamed through SHA-256 so info of any length is hashed in place:
+# no concatenation buffer to outgrow (AGAST #2579, GitHub #140).
+# t_prev_len is 0 for T(1) (T(0) is empty) and 32 after.
+fn hkdf_sha256_block(prk: *u8, t_prev: *u8, t_prev_len: u64, info: *u8, info_len: u64, counter: u8, out: *u8)
+    # PRK is HashLen (32) bytes, under the 64-byte block, so K' = PRK || 0*.
+    var pad: [64]u8
+    mem_zero(@pad[0], 64)
+    mem_copy(@pad[0], prk, 32)
+    var i: i32 = 0
+    while i < 64
+        pad[i] = pad[i] ^ 0x36
+        i += 1
+
+    var ctx: Sha256
+    sha256_init(@ctx)
+    sha256_update(@ctx, @pad[0], 64)
+    sha256_update(@ctx, t_prev, t_prev_len)
+    sha256_update(@ctx, info, info_len)
+    var c: [1]u8
+    c[0] = counter
+    sha256_update(@ctx, @c[0], 1)
+    var inner: [32]u8
+    sha256_final(@ctx, @inner[0])
+
+    # K' ^ opad = (K' ^ ipad) ^ (0x36 ^ 0x5c)
+    i = 0
+    while i < 64
+        pad[i] = pad[i] ^ 0x6a
+        i += 1
+    sha256_init(@ctx)
+    sha256_update(@ctx, @pad[0], 64)
+    sha256_update(@ctx, @inner[0], 32)
+    sha256_final(@ctx, out)
+
+    mem_zero(@pad[0], sizeof(pad))
+    mem_zero(@inner[0], sizeof(inner))
+    mem_zero(@ctx as *u8, sizeof(Sha256))
+
+# Expand a pseudorandom key into output keying material (RFC 5869 §2.3)
 # prk: pseudorandom key (from extract, 32 bytes)
-# info: optional context/application-specific info (can be null)
-# info_len: length of info in bytes
+# info: optional context/application-specific info (null only if info_len is 0)
+# info_len: length of info in bytes (no limit)
 # okm: output keying material buffer
-# okm_len: desired length of OKM in bytes (max 255 * hash_len = 8160)
-pub fn hkdf_expand(prk: *u8, info: *u8, info_len: u64, okm: *u8, okm_len: u64)
-    # N = ceil(okm_len / hash_len)
-    var hash_len: u64 = 32
-    var n: u64 = (okm_len + hash_len - 1) / hash_len
+# okm_len: desired length of OKM in bytes, at most HKDF_SHA256_MAX_OKM_LEN
+#
+# Ok(okm_len) on success. Err(InvalidLength) if okm_len is over the maximum
+# or info is null with a non-zero info_len; nothing is written then.
+pub fn hkdf_expand(prk: *u8, info: *u8, info_len: u64, okm: *u8, okm_len: u64) -> Result<i64, CryptoError>
+    if okm_len > HKDF_SHA256_MAX_OKM_LEN
+        return Err(CryptoError.InvalidLength)
+    if info == null && info_len > 0
+        return Err(CryptoError.InvalidLength)
 
-    # T(0) = empty string
-    # T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
+    let hash_len: u64 = 32
+    # N = ceil(okm_len / hash_len) <= 255
+    let n: u64 = (okm_len + hash_len - 1) / hash_len
 
-    var t_prev: [32]u8
-    var t_prev_len: u64 = 0  # T(0) is empty
-
+    var t: [32]u8
     var offset: u64 = 0
     var i: u64 = 1
     while i <= n
-        # Build input: T(i-1) || info || i
-        # Max size: 32 (T) + info_len + 1 (counter)
-        var input: [256]u8  # Should be enough for reasonable info
-        var input_len: u64 = 0
-
-        # Copy T(i-1)
-        if t_prev_len > 0
-            mem_copy(@input[0], @t_prev[0], t_prev_len)
-            input_len = t_prev_len
-
-        # Copy info
-        if info != null && info_len > 0
-            mem_copy(@input[input_len], info, info_len)
-            input_len = input_len + info_len
-
-        # Append counter byte
-        input[input_len] = i as u8
-        input_len += 1
-
-        # T(i) = HMAC-Hash(PRK, input)
-        var t_current: [32]u8
-        hmac_sha256(prk, 32, @input[0], input_len, @t_current[0])
+        # T(i-1) is t; T(0) is empty. Reading and writing t in one call is
+        # safe: t_prev is fully hashed before out is written.
+        var t_prev_len: u64 = 32
+        if i == 1
+            t_prev_len = 0
+        hkdf_sha256_block(prk, @t[0], t_prev_len, info, info_len, i as u8, @t[0])
 
         # Copy to output (may be partial for last block)
         var to_copy: u64 = hash_len
         if offset + to_copy > okm_len
             to_copy = okm_len - offset
-
-        mem_copy(@okm[offset], @t_current[0], to_copy)
+        mem_copy(@okm[offset], @t[0], to_copy as i64)
         offset = offset + to_copy
-
-        # T(i-1) = T(i) for next iteration
-        mem_copy(@t_prev[0], @t_current[0], 32)
-        t_prev_len = 32
-
-        # Zero sensitive data
-        mem_zero(@t_current[0], sizeof(t_current))
-        mem_zero(@input[0], input_len)
 
         i += 1
 
-    # Zero sensitive data
-    mem_zero(@t_prev[0], sizeof(t_prev))
+    mem_zero(@t[0], sizeof(t))
+    return Ok(okm_len as i64)
 
 # ============================================================================
 # Combined HKDF
@@ -119,17 +142,20 @@ pub fn hkdf_expand(prk: *u8, info: *u8, info_len: u64, okm: *u8, okm_len: u64)
 # info: optional context info (can be null)
 # info_len: length of info
 # okm: output buffer
-# okm_len: desired output length
-pub fn hkdf_sha256(salt: *u8, salt_len: u64, ikm: *u8, ikm_len: u64, info: *u8, info_len: u64, okm: *u8, okm_len: u64)
+# okm_len: desired output length, at most HKDF_SHA256_MAX_OKM_LEN
+#
+# Ok(okm_len), or hkdf_expand's Err with nothing written.
+pub fn hkdf_sha256(salt: *u8, salt_len: u64, ikm: *u8, ikm_len: u64, info: *u8, info_len: u64, okm: *u8, okm_len: u64) -> Result<i64, CryptoError>
     # Extract
     var prk: [32]u8
     hkdf_extract(salt, salt_len, ikm, ikm_len, @prk[0])
 
-    # Expand
-    hkdf_expand(@prk[0], info, info_len, okm, okm_len)
+    # Expand (refuses before writing okm)
+    let r: Result<i64, CryptoError> = hkdf_expand(@prk[0], info, info_len, okm, okm_len)
 
     # Zero PRK
     mem_zero(@prk[0], sizeof(prk))
+    return r
 
 # ============================================================================
 # Idiomatic StrView API
@@ -140,9 +166,9 @@ pub fn hkdf_extract_str(salt: @StrView, ikm: @StrView, prk: *u8)
     hkdf_extract(salt.ptr, salt.len as u64, ikm.ptr, ikm.len as u64, prk)
 
 # HKDF-Expand with StrView inputs (idiomatic Ritz API)
-pub fn hkdf_expand_str(prk: @StrView, info: @StrView, okm: *u8, okm_len: u64)
-    hkdf_expand(prk.ptr, info.ptr, info.len as u64, okm, okm_len)
+pub fn hkdf_expand_str(prk: @StrView, info: @StrView, okm: *u8, okm_len: u64) -> Result<i64, CryptoError>
+    return hkdf_expand(prk.ptr, info.ptr, info.len as u64, okm, okm_len)
 
 # Combined HKDF with StrView inputs (idiomatic Ritz API)
-pub fn hkdf_sha256_str(salt: @StrView, ikm: @StrView, info: @StrView, okm: *u8, okm_len: u64)
-    hkdf_sha256(salt.ptr, salt.len as u64, ikm.ptr, ikm.len as u64, info.ptr, info.len as u64, okm, okm_len)
+pub fn hkdf_sha256_str(salt: @StrView, ikm: @StrView, info: @StrView, okm: *u8, okm_len: u64) -> Result<i64, CryptoError>
+    return hkdf_sha256(salt.ptr, salt.len as u64, ikm.ptr, ikm.len as u64, info.ptr, info.len as u64, okm, okm_len)
