@@ -145,16 +145,13 @@ OTHER_CONTROLS = {
     "annotated_elem_ptr": _HEAD + "    let q: *i32 = @x[0][0][0]\n    return q[7]\n",
     "direct": _HEAD + "    return x[1][0][1]\n",
     "full_element": _HEAD + "    let q = @x[1][0][1]\n    return *q\n",
+    # #2571: a `*i32`, as ritz0 types it (test_ritz1_inferred_elem_ref_let.py)
     "full_element_mut": _HEAD + "    let q = @&x[1][0][1]\n    return *q\n",
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", [
-    pytest.param(n, c, marks=pytest.mark.xfail(
-        strict=True, reason="AGAST #2571: ritz1 stores an inferred `@&x[i]` element "
-        "ptr as i64, so clang rejects the IR (not N-D: a 1-D `@&x[1]` does too)"))
-    if n == "full_element_mut" and c != "ritz0" else (n, c)
-    for n in sorted(OTHER_CONTROLS) for c in COMPILERS])
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(OTHER_CONTROLS))
 def test_other_forms_unchanged(run_with, name, compiler):
     assert run_with(compiler, f"ctl_{name}", OTHER_CONTROLS[name]) == 9

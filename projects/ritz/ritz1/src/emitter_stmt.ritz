@@ -214,6 +214,63 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     stmt.var_pointee_array_elem_type = elem
     return 1
 
+# AGAST #2571: the scalar element type of the local, global or field array that
+# `e`, an index chain of exactly its rank, names an element of; TYPE_VOID for
+# anything else (a row, a plane, a pointer or Vec index, a struct or pointer
+# element: other arms type those).
+fn full_scalar_elem_type(s: *EmitterState, e: *Expr) -> i32
+    if e == null or e.kind != EXPR_INDEX or e.left == null
+        return TYPE_VOID
+    var leaf: i32 = TYPE_VOID
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, e, @depth)
+    if sh != null
+        if depth == sh.rank
+            leaf = sh.leaf_type
+    else if e.left.kind == EXPR_IDENT
+        let arr: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        if arr != null
+            if arr.var_type == TYPE_ARRAY and arr.array_shape == null
+                leaf = arr.array_elem_type
+        else
+            let garr: *GlobalVarDef = global_array_named(s, e.left)
+            if garr != null and garr.array_shape == null
+                leaf = garr.array_elem_type
+    else if e.left.kind == EXPR_MEMBER
+        let fld: *StructField = resolve_member_chain_field(s, e.left)
+        if fld != null and fld.field_type == TYPE_ARRAY and fld.array_shape == null
+            leaf = fld.array_elem_type
+    if leaf < TYPE_I32 or leaf > TYPE_F64 or leaf == TYPE_PTR or leaf == TYPE_PTR_PTR
+        return TYPE_VOID
+    leaf
+
+# AGAST #2571: `let q = @x[i]` and `let q = @&x[i]..`, a full element of an
+# array, hold what `let q: *T = @x[i]` does, as ritz0 types them.  The slot
+# stayed i64: `@&` stored its ptr there and clang rejected the IR, unlocated;
+# `@` went through ptrtoint, then `*q` loaded and stored 8 bytes and `q + 1`
+# strode one.  A scalar T is the pointee; an N-D struct or enum element
+# (`x: [M][N]S`) is a `*S`, as the #175 arm in emit_var_decl types a 1-D one
+# (that arm walks one index only).  Returns 1 when it typed the local.
+fn infer_full_elem_ref_let(s: *EmitterState, stmt: *Stmt) -> i32
+    let init: *Expr = stmt.var_init
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or init == null
+        return 0
+    if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT)
+        return 0
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, init.operand, @depth)
+    if sh != null and depth == sh.rank and sh.leaf_type == TYPE_STRUCT and sh.leaf_name_len > 0
+        stmt.var_type = TYPE_PTR
+        stmt.var_type_name = sh.leaf_name
+        stmt.var_type_name_len = sh.leaf_name_len
+        return 1
+    let leaf: i32 = full_scalar_elem_type(s, init.operand)
+    if leaf == TYPE_VOID
+        return 0
+    stmt.var_type = TYPE_PTR
+    stmt.var_pointee_type = leaf
+    1
+
 # AGAST #2330: the struct an un-annotated `let p = @a`, `let q = p` or `let q = p + k`
 # holds an array of, for add_array_view: infer_array_ptr_let records N and T but
 # no name, since a name would register `p` as a `*S`.  null for scalars.
@@ -1252,6 +1309,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     if infer_through_elem_let(s, stmt) == 1
         var_type = stmt.var_type
     if infer_struct_elem_let(s, stmt) == 1
+        var_type = stmt.var_type
+    if infer_full_elem_ref_let(s, stmt) == 1   # #2571: `@&x[i]`, an element
         var_type = stmt.var_type
 
     # `let task = @member.field[i]` — when the indexed field is an array
