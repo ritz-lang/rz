@@ -121,6 +121,52 @@ fn g(b: i32) -> i32
 fn main() -> i32
     g(1) * 10 + g(0)
 """, 12),
+    # AGAST #2823: dead code after a plain `return` in a void fn, holding an
+    # `if` whose body returns. ritz1 emitted `ret void` then `br` in one block
+    # and left the `if.end` block with no terminator; clang refused the IR.
+    "return_then_returning_if": ("""\
+fn g(p: *u8, out_name: **u8, out_len: *i32)
+    *out_name = p
+    *out_len = 1
+    return
+    let q: *u8 = null
+    if q == null
+        return
+    *out_name = q
+
+pub fn main() -> i32
+    var n: *u8 = null
+    var l: i32 = 0
+    g(c"x", @n, @l)
+    return l - 1
+""", 0),
+    # The same shape in a method: emit_impl_method has its own body loop.
+    "method_return_then_returning_if": ("""\
+struct S
+    n: i32
+impl S
+    fn set(self: *S, b: i32)
+        self.n = b
+        return
+        if b > 0
+            return
+        self.n = 99
+fn main() -> i32
+    var s = S { n: 0 }
+    s.set(4)
+    s.n
+""", 4),
+    # A value fn: the dead block after the `if` ends `unreachable`.
+    "value_fn_return_then_returning_if": ("""\
+var G: i32
+fn g(b: i32) -> i32
+    return b + 1
+    if b > 0
+        return 7
+    G = 9
+fn main() -> i32
+    g(2) + G
+""", 3),
 }
 
 
