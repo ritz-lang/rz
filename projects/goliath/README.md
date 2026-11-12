@@ -1,6 +1,11 @@
 # Goliath
 
-Content-addressable filesystem for Harland - immutable blob storage with mutable namespace overlays.
+Content-addressable filesystem for Harland, as a Ritz library. **What works
+today:** the library: SHA-256 blob ids, an in-memory blob store
+(put/get/exists/delete), a VirtIO-backed store, and a path namespace
+(`./rz test goliath`: 33 tests). **There is no CLI yet** (AGAST #2788): the
+`goliath` binary answers `--help`, and `put`/`get`/`ls` exit 1 with
+`not implemented`.
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
@@ -85,6 +90,11 @@ only re-ran the same `[[test]]` functions that `ritz0 --test` already runs.
 
 Core blob store (put/get/exists), namespaces and path handling are implemented.
 Garbage collection and snapshot support are still planned.
+
+The `goliath` binary is not a tool yet. `goliath --help` prints usage (exit 0);
+`put`, `get` and `ls` exit 1 with `not implemented`; anything else is an unknown
+command (exit 2). It used to print "Run tests with: make test" and exit 0 for
+any input (AGAST #2460). `test.sh` pins this; the CLI itself is #2788.
 
 ## License
 

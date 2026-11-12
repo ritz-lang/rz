@@ -1,12 +1,18 @@
 # ritz-lsp
 
-Language Server Protocol (LSP) implementation for the Ritz programming language, written in Ritz.
+Language Server Protocol (LSP) server for Ritz, written in Ritz. **What works
+today:** JSON-RPC 2.0 over stdio, the initialize/shutdown handshake, and
+full-text document sync, plus Vim syntax highlighting via `install.sh`. It
+advertises only `textDocumentSync`. **No diagnostics, hover, definition or
+completion yet** (AGAST #2789); hover and definition requests get
+MethodNotFound.
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
 ## Overview
 
-ritz-lsp provides IDE integration for the Ritz programming language through the Language Server Protocol. It runs as a background server that communicates with editors via JSON-RPC 2.0 over stdio, providing real-time diagnostics, navigation, and code intelligence as you write Ritz code.
+ritz-lsp provides IDE integration for the Ritz programming language through the Language Server Protocol. It runs as a background server that communicates with editors via JSON-RPC 2.0 over stdio, and is meant to provide diagnostics, navigation and code intelligence; today it
+only keeps the editor's open documents in sync (see [Status](#status)).
 
 The server is written entirely in Ritz itself, making it a useful showcase of ritzlib's JSON parsing and string handling capabilities. It integrates with Vim/Neovim via coc.nvim or native LSP, and can work with any LSP-compatible editor. It also installs Ritz syntax highlighting for Vim.
 
@@ -17,9 +23,9 @@ The server is written entirely in Ritz itself, making it a useful showcase of ri
 - Document synchronization (open, change, close)
 - Vim and Neovim syntax highlighting for `.ritz` files
 - coc.nvim automatic configuration
-- Diagnostics (syntax errors, type errors) - in progress
-- Hover information (types, documentation) - planned
-- Go to definition - planned
+- Diagnostics (syntax errors, type errors) - planned (AGAST #2789)
+- Hover information (types, documentation) - planned, not advertised (#2789)
+- Go to definition - planned, not advertised (#2789)
 - Completions (keywords, variables, fields) - planned
 
 ## Installation
@@ -112,15 +118,16 @@ binary answers an `initialize` request over stdio at exit 0.
 | Document sync | Working |
 | Vim syntax highlighting | Working (`install.sh --vim`) |
 | `install.sh --build` | **Broken** — expects a pre-consolidation `ritz` submodule; use `./rz build ritz-lsp` |
-| Diagnostics | In progress |
-| Hover | Advertised in capabilities, not implemented |
-| Go to definition | Advertised in capabilities, not implemented |
+| Diagnostics | Planned (#2789): no `publishDiagnostics` is sent |
+| Hover | Not implemented, not advertised: MethodNotFound (#2789) |
+| Go to definition | Not implemented, not advertised: MethodNotFound (#2789) |
 | Completions | Planned, not advertised |
 
-The hover/definition rows need care: the server's `initialize` reply claims
-`"hoverProvider":true,"definitionProvider":true`, so editors will offer both and
-then get nothing useful back. Either implement them or stop advertising them —
-advertising an unimplemented capability is worse than omitting it.
+Hover and definition used to be advertised (`"hoverProvider":true,
+"definitionProvider":true`) and answered `null` for every position, so editors
+offered both and got nothing back. Since AGAST #2460 `initialize` advertises
+only `textDocumentSync`. `test.sh` pins the capabilities and the MethodNotFound
+replies.
 
 ## License
 

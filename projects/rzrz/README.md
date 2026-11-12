@@ -1,7 +1,10 @@
 # rzrz
 
 `rz` rewritten in Ritz — the Ritz-native port of the workspace CLI.
-("rz in rz" = rzrz.)
+("rz in rz" = rzrz.) **What works today:** `build` (by spawning
+`python3 ./rz build <p> --compiler ritz1`), `list`, `--help` and `--version`.
+`test`, `run`, `clean` and `compare` are **not implemented**: each exits 1
+saying so (AGAST #2790), and an unknown command exits 2.
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
@@ -31,7 +34,7 @@ file (`test/test_args.ritz`), and `ritzlib` as its only dependency.
 ./rz clean rzrz && ./rz build rzrz --compiler ritz1_selfhosted
 
 # Tests
-./rz test rzrz          # 1 file, 4 assertions
+./rz test rzrz          # test/test_args.ritz, then test.sh (CLI exit codes)
 ```
 
 All four commands above were measured at exit 0 on 2026-09-12.
@@ -51,11 +54,11 @@ rz - Unified workspace CLI for the Ritz ecosystem
 
 Usage:
     rz build [PROJECT]     Build a project (or all with --all)
-    rz test [PROJECT]      Run tests for a project (or all with --all)
-    rz run PROJECT         Build and run a project
+    rz test [PROJECT]      (not implemented: use ./rz test)
+    rz run PROJECT         (not implemented: use ./rz run)
     rz list                List all projects in workspace
-    rz clean [PROJECT]     Clean build artifacts
-    rz compare [TIER]      Compare ritz0 vs ritz1 on examples
+    rz clean [PROJECT]     (not implemented: use ./rz clean)
+    rz compare [TIER]      (not implemented)
 
 Options:
     --all                  Apply to all projects
@@ -86,8 +89,10 @@ So two things that are easy to assume are not true:
 `docs/STACK_MATRIX.md` described `rzrz` as the tool that "drives
 ritz1_selfhosted" until 2026-09-12; it never did.
 
-Also note `rz run` is a stub — `src/main.ritz` carries a
-`# TODO: Build then exec the binary` comment at that path.
+`test`, `run`, `clean` and `compare` used to print "Testing project: X" (and
+so on) and exit 0 having done nothing. Since AGAST #2460 each exits 1 with
+`rzrz: <cmd>: not implemented`; implementing them is #2790. `test.sh` pins
+every exit code.
 
 ## Dependencies
 

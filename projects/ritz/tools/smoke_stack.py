@@ -93,15 +93,8 @@ XFAILS: dict[str, str] = {
     "tome.blocking.pipeline": "#2457 -b answers only the first of two pipelined commands",
     "tome.blocking.cli": "#2457 tome-cli -c hangs after 'Connecting to ...'",
     "tome.blocking.cli_stdin": "#2457 tome-cli prints 'Connecting to ...' and nothing else",
-    # hollow entry points (#2460)
-    "hollow.sage_runs_js": "#2460 sage prints its version and exits 0 without reading the file",
-    "hollow.goliath_unknown_command": "#2460 goliath's main prints 'Run tests with: make test' and exits 0",
-    "hollow.rzrz_test": "#2460 rzrz test prints 'Testing project' and returns 0",
-    "hollow.rzrz_run": "#2460 rzrz run is a TODO that returns 0",
-    "hollow.rzrz_clean": "#2460 rzrz clean prints and returns 0",
-    "hollow.rzrz_compare": "#2460 rzrz compare is a TODO that returns 0",
-    "hollow.lsp_hover": "#2460 ritz-lsp advertises hoverProvider and answers null",
-    "hollow.lsp_definition": "#2460 ritz-lsp advertises definitionProvider and answers null",
+    # hollow entry points (#2460 made the rest honest; sage still runs nothing)
+    "hollow.sage_runs_js": "#2787 sage has no interpreter: `sage t.js` exits 1 'not implemented'",
     # rzsh (#2461)
     "rzsh.cd": "#2461 cd does not change directory",
     "rzsh.var": "#2461 $X is not expanded",
@@ -1078,7 +1071,16 @@ def suite_hollow(r: Reporter, tmp: Path) -> None:
         if res.returncode == 0:
             raise CheckFailed(f"unknown command, exit 0: {short(res.stdout, 80)}")
 
+    def sage_no_false_success():
+        # Whatever sage can do, exit 0 on a script means it ran it (#2460).
+        sage = binary("sage/build/debug/sage")
+        (work / "t.js").write_text("console.log(6 * 7);\n")
+        res = run_cmd([str(sage), "t.js"], work)
+        if res.returncode == 0 and not re.search(rb"(?m)^42$", res.stdout):
+            raise CheckFailed(f"sage t.js -> exit 0 without running it: {short(res.stdout, 80)}")
+
     r.run("hollow.sage_runs_js", sage_runs_js)
+    r.run("hollow.sage_no_false_success", sage_no_false_success)
     r.run("hollow.goliath_unknown_command", goliath_unknown)
 
     # rzrz: a subcommand on a project that does not exist did no work, so it
