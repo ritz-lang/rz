@@ -1305,6 +1305,10 @@ class TypeChecker:
         if self._is_span(slot) and isinstance(actual, rast.ArrayType):
             self._report_value_into_ref(expr, slot)
             return
+        if self._span_of_other_element(actual, slot):
+            self._slot_reported.add(id(expr))
+            self._slot_error(array_rules.ELEMENT_MISMATCH, expr.span)
+            return
         if not isinstance(actual, (rast.PtrType, rast.RefType)) or self._is_opaque(slot):
             return
         if self._type_str(self._resolve_alias(actual.inner)) != self._type_str(slot):
@@ -1313,6 +1317,28 @@ class TypeChecker:
         addr = isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@', '&mut', '@&')
         self._slot_error(ref_rules.ADDR_INTO_VALUE if addr else ref_rules.REF_INTO_VALUE,
                          expr.span)
+
+    def _span_of_other_element(self, actual: rast.Type, slot: rast.Type) -> bool:
+        """`@a` with `a: [N]T1` into a `Span<T2>` / `[T2]` slot, T1 not T2
+        (AGAST #2781, #2366). The emitter builds `Span { &a[0], N }` from it,
+        which views the array at T2's stride: LARB R5's rule for an array
+        store holds here too, and converting is a loop you write."""
+        if not self._is_span(slot) or not isinstance(actual, (rast.PtrType, rast.RefType)):
+            return False
+        array = self._resolve_alias(actual.inner)
+        if not isinstance(array, rast.ArrayType):
+            return False
+        held = self._resolve_alias(array.inner)
+        if self._is_opaque(held):
+            return False
+        # Monomorphisation has spelled the slot `Span$T`: spell T1 the same way.
+        if slot.args:
+            if len(slot.args) != 1 or self._is_opaque(self._resolve_alias(slot.args[0])):
+                return False
+            slot_name = mangle_generic_name('Span', slot.args)
+        else:
+            slot_name = slot.name
+        return slot_name != mangle_generic_name('Span', [held])
 
     def _check_value_into_ref(self, expr: rast.Expr, actual: rast.Type,
                               slot: rast.Type) -> None:

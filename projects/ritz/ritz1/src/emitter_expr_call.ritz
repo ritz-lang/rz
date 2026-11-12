@@ -885,7 +885,37 @@ fn coerce_array_to_span(s: *EmitterState, e: *Expr, reg: i32, name: *u8, name_le
     let loc: *LocalVar = span_array_source(s, e, name, name_len)
     if loc == null
         return reg
+    span_array_elem_fits(s, e, loc, name, name_len)   # AGAST #2781
     return emit_span_of_array(s, loc, name, name_len)
+
+# AGAST #2781, #2366: `@a` with `a: [N]T1` fits the `Span$T2` slot (name,
+# name_len) only when T1 is T2, or the Span views the array at T2's stride.  The
+# array-store rule (LARB R5, #2343): the same located error as ritz0, at `e`.
+# Compared as monomorphisation spells T: `u8`, a struct's name, `ptr_u8`.  An
+# element this can't spell (a deeper pointer, a nested array) isn't judged.
+fn span_array_elem_fits(s: *EmitterState, e: *Expr, loc: *LocalVar, name: *u8, name_len: i32) -> i32
+    if loc.array_shape != null
+        return 1
+    var elem: *u8 = null
+    var elem_len: i32 = 0
+    var ptr_prefix: i32 = 0
+    if loc.array_elem_type == TYPE_STRUCT
+        elem = loc.type_name
+        elem_len = loc.type_name_len
+    else if loc.array_elem_type == TYPE_PTR
+        elem_len = primitive_arg_spelling(loc.array_elem_pointee, @elem)
+        ptr_prefix = 4
+    else
+        elem_len = primitive_arg_spelling(loc.array_elem_type, @elem)
+    if elem == null or elem_len <= 0
+        return 1
+    # name is `Span$` + [`ptr_`] + elem.
+    if name_len == 5 + ptr_prefix + elem_len
+        if ptr_prefix == 0 or memcmp(name + 5, c"ptr_", 4) == 0
+            if memcmp(name + 5 + ptr_prefix, elem, elem_len as i64) == 0
+                return 1
+    ref_array_error(s, e)
+    0
 
 # `Span { &a[0], N }` of the `[N]T` local `loc`, as a `%<span_name>` register.
 fn emit_span_of_array(s: *EmitterState, loc: *LocalVar, span_name: *u8, span_name_len: i32) -> i32
@@ -3960,6 +3990,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     if coerced == 0 and span_arg_expr.operand.kind == EXPR_IDENT
                         let arr_loc2: *LocalVar = find_local_struct_name(s, span_arg_expr.operand.ident_ptr, span_arg_expr.operand.ident_len)
                         if arr_loc2 != null and arr_loc2.var_type == TYPE_ARRAY
+                            span_array_elem_fits(s, span_arg_expr, arr_loc2, param_ptr.param_type_name, param_ptr.param_type_name_len)   # AGAST #2366
                             converted_regs[j] = emit_span_of_array(s, arr_loc2, param_ptr.param_type_name, param_ptr.param_type_name_len)
                             coerced = 1
                 if coerced == 0

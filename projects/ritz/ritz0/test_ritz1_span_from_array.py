@@ -11,10 +11,15 @@ spellings (`local_from_array`, `struct_field_from_array`,
 `through_pointer_from_array`).
 
 ritz0 is the oracle: each expected exit status is checked against it too.
+
+AGAST #2781 (and #2366 for a parameter): the array's element must be the
+Span's T. MISMATCHED holds the refusals, the same located error on all three.
 """
 
 import pytest
 
+from array_rules import ELEMENT_MISMATCH
+from test_ref_into_value import _assert_refused
 from test_ritz1_move_param import _run
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
@@ -104,6 +109,132 @@ pub fn main() -> i32
     return sum(@a)
 """, 6),
 }
+
+
+# AGAST #2781 (and #2366, the parameter): `@a` with `a: [N]T1` fits a
+# `Span<T2>` / `[T2]` slot only when T1 is T2.  Before the fix a let, var, `=`
+# and struct-literal field slot took any element on all three compilers, and
+# a parameter on ritz1: the Span viewed the array at the wrong stride.  The
+# error is the array-store one (LARB R5): converting is a loop you write.
+#
+# `^` marks where the error lands.
+POINT = "struct P\n    x: i32\n\nstruct Q\n    x: i32\n\n"
+
+MISMATCHED = {
+    # The ticket's repro.
+    "let_u8_from_i32": SPAN + """\
+pub fn main() -> i32
+    let a: [2]i32 = [1, 2]
+    let v: Span<u8> = ^@a
+    return v.len as i32
+""",
+    "let_slice_spelling": SPAN + """\
+pub fn main() -> i32
+    let a: [2]i32 = [1, 2]
+    let v: [u8] = ^@a
+    return v.len as i32
+""",
+    "var_i32_from_i64": SPAN + """\
+pub fn main() -> i32
+    var a: [3]i64 = [1, 2, 3]
+    var v: Span<i32> = ^@a
+    return v.len as i32
+""",
+    # Same width, other sign: LLVM spells both `i32`.
+    "let_u32_from_i32": SPAN + """\
+pub fn main() -> i32
+    let a: [2]i32 = [1, 2]
+    let v: Span<u32> = ^@a
+    return v.len as i32
+""",
+    "assign": SPAN + """\
+pub fn main() -> i32
+    let a: [2]u8 = [1, 2]
+    let b: [3]i32 = [4, 5, 6]
+    var v: Span<u8> = @a
+    v = ^@b
+    return v.len as i32
+""",
+    "struct_literal_field": SPAN + """\
+struct Packet
+    tag: i32
+    data: Span<u8>
+
+pub fn main() -> i32
+    let b: [3]i64 = [4, 5, 6]
+    let p = Packet { tag: 10, data: ^@b }
+    return p.tag
+""",
+    "struct_literal_slice_field": SPAN + """\
+struct Bag
+    xs: [i32]
+
+pub fn main() -> i32
+    let b: [2]u8 = [20, 22]
+    let g = Bag { xs: ^@b }
+    return g.xs.len as i32
+""",
+    "struct_element": SPAN + POINT + """\
+pub fn main() -> i32
+    let a: [2]P = [P { x: 1 }, P { x: 2 }]
+    let v: Span<Q> = ^@a
+    return v.len as i32
+""",
+    # #2366: the parameter, which ritz1 let through.
+    "param": SPAN + """\
+fn g(s: Span<i32>) -> i32
+    return s.len as i32
+
+pub fn main() -> i32
+    var a: [3]i64 = [1, 2, 3]
+    return g(^@a)
+""",
+}
+
+# #2781: matching elements of every kind the check spells still coerce.
+FORMS.update({
+    "let_span_struct": (SPAN + POINT + """\
+pub fn main() -> i32
+    let a: [2]P = [P { x: 3 }, P { x: 4 }]
+    let v: Span<P> = @a
+    return v[0].x * 10 + v[1].x + v.len as i32
+""", 36),
+    "let_span_bool": (SPAN + """\
+pub fn main() -> i32
+    let a: [3]bool = [false, true, false]
+    let v: Span<bool> = @a
+    if v[1]
+        return v.len as i32
+    return 0
+""", 3),
+    "let_span_f64": (SPAN + """\
+pub fn main() -> i32
+    let a: [2]f64 = [1.5, 2.5]
+    let v: [f64] = @a
+    return (v[0] + v[1]) as i32
+""", 4),
+    "let_span_u16": (SPAN + """\
+pub fn main() -> i32
+    let a: [2]u16 = [300, 7]
+    let v: Span<u16> = @a
+    return (v[0] - 290) as i32 + v[1] as i32
+""", 17),
+    "let_span_ptr": (SPAN + """\
+pub fn main() -> i32
+    let a: [2]*u8 = [c"ab", c"xyz"]
+    let v: Span<*u8> = @a
+    return *(v[1] + 2) as i32
+""", 122),
+})
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(MISMATCHED))
+def test_span_from_array_of_other_element_is_refused(request, tmp_path, compiler, name):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    _assert_refused(compiler, tmp_path, name, MISMATCHED[name], ELEMENT_MISMATCH)
 
 
 @pytest.mark.integration
