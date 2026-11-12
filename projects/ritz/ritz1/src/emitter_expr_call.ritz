@@ -851,11 +851,84 @@ fn emit_expr_into_slot(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len:
         if is_tagged_enum_type(name, name_len) == 1
             s.ctx_enum_name = name
             s.ctx_enum_name_len = name_len
-    let reg: i32 = emit_struct_copy(s, e, ty)
+    var reg: i32 = emit_struct_copy(s, e, ty)
     s.ctx_enum_name = saved_name
     s.ctx_enum_name_len = saved_len
     s.ctx_enum_arg = saved_arg
+    if ty == TYPE_STRUCT
+        reg = coerce_array_to_span(s, e, reg, name, name_len)   # AGAST #2502
     return reg
+
+# AGAST #2502: the `[N]T` local `@e` names when `e` is `@a` and the slot
+# (name, name_len) is a `Span<T>` / `[T]` (one type since #1614); else null.
+fn span_array_source(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> *LocalVar
+    if e == null or name == null or name_len <= 5
+        return null
+    if memcmp(name, c"Span$", 5) != 0
+        return null
+    if e.kind != EXPR_UNARY or e.op != OP_ADDR or e.operand == null
+        return null
+    if e.operand.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, e.operand.ident_ptr, e.operand.ident_len)
+    if loc == null or loc.var_type != TYPE_ARRAY
+        return null
+    return loc
+
+# AGAST #2502: `reg` is `e`'s value headed for a `Span<T>` / `[T]` slot.  When
+# `e` is `@a` over an `[N]T` local, that value is `@a`'s address as an i64,
+# which no Span slot holds: build `Span { &a[0], N }` instead, as the Span
+# parameter cascade in emit_expr_call does (ritz-task-102).  A `let` / `var`
+# initialiser, an assignment and a struct-literal field emitted
+# `store %Span$u8 <i64>` and clang rejected it.  Any other `e`: `reg`.
+fn coerce_array_to_span(s: *EmitterState, e: *Expr, reg: i32, name: *u8, name_len: i32) -> i32
+    let loc: *LocalVar = span_array_source(s, e, name, name_len)
+    if loc == null
+        return reg
+    return emit_span_of_array(s, loc, name, name_len)
+
+# `Span { &a[0], N }` of the `[N]T` local `loc`, as a `%<span_name>` register.
+fn emit_span_of_array(s: *EmitterState, loc: *LocalVar, span_name: *u8, span_name_len: i32) -> i32
+    let elem0: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem0)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, loc.array_size as i64)
+    emit_str(s, c" x ")
+    if loc.array_elem_type == TYPE_I32 or loc.array_elem_type == TYPE_U32
+        emit_str(s, c"i32")
+    else if loc.array_elem_type == TYPE_I64 or loc.array_elem_type == TYPE_U64
+        emit_str(s, c"i64")
+    else if loc.array_elem_type == TYPE_U8 or loc.array_elem_type == TYPE_I8
+        emit_str(s, c"i8")
+    else if loc.array_elem_type == TYPE_U16 or loc.array_elem_type == TYPE_I16
+        emit_str(s, c"i16")
+    else if loc.array_elem_type == TYPE_PTR or loc.array_elem_type == TYPE_PTR_PTR
+        emit_str(s, c"ptr")
+    else
+        emit_str(s, c"i64")
+    emit_str(s, c"], ptr ")
+    emit_reg(s, loc.reg)
+    emit_str(s, c", i64 0, i64 0\n")
+    let sp1: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, sp1)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, span_name, span_name_len)
+    emit_str(s, c" undef, ptr ")
+    emit_reg(s, elem0)
+    emit_str(s, c", 0\n")
+    let sp2: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, sp2)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, span_name, span_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, sp1)
+    emit_str(s, c", i64 ")
+    emit_int(s, loc.array_size as i64)
+    emit_str(s, c", 1\n")
+    return sp2
 
 # The `name:& T` param `e` names, or null (LocalVar.is_lent, AGAST #2250).
 fn lent_local(s: *EmitterState, e: *Expr) -> *LocalVar
@@ -3814,46 +3887,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                 if span_arg_expr != null and span_arg_expr.kind == EXPR_IDENT
                     let arr_loc: *LocalVar = find_local_struct_name(s, span_arg_expr.ident_ptr, span_arg_expr.ident_len)
                     if arr_loc != null and arr_loc.var_type == TYPE_ARRAY
-                        let arr_elem0: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, arr_elem0)
-                        emit_str(s, c" = getelementptr [")
-                        emit_int(s, arr_loc.array_size as i64)
-                        emit_str(s, c" x ")
-                        if arr_loc.array_elem_type == TYPE_I32 or arr_loc.array_elem_type == TYPE_U32
-                            emit_str(s, c"i32")
-                        else if arr_loc.array_elem_type == TYPE_I64 or arr_loc.array_elem_type == TYPE_U64
-                            emit_str(s, c"i64")
-                        else if arr_loc.array_elem_type == TYPE_U8 or arr_loc.array_elem_type == TYPE_I8
-                            emit_str(s, c"i8")
-                        else if arr_loc.array_elem_type == TYPE_U16 or arr_loc.array_elem_type == TYPE_I16
-                            emit_str(s, c"i16")
-                        else if arr_loc.array_elem_type == TYPE_PTR or arr_loc.array_elem_type == TYPE_PTR_PTR
-                            emit_str(s, c"ptr")
-                        else
-                            emit_str(s, c"i64")
-                        emit_str(s, c"], ptr ")
-                        emit_reg(s, arr_loc.reg)
-                        emit_str(s, c", i64 0, i64 0\n")
-                        let arr_sp1: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, arr_sp1)
-                        emit_str(s, c" = insertvalue %")
-                        emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                        emit_str(s, c" undef, ptr ")
-                        emit_reg(s, arr_elem0)
-                        emit_str(s, c", 0\n")
-                        let arr_sp2: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, arr_sp2)
-                        emit_str(s, c" = insertvalue %")
-                        emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                        emit_str(s, c" ")
-                        emit_reg(s, arr_sp1)
-                        emit_str(s, c", i64 ")
-                        emit_int(s, arr_loc.array_size as i64)
-                        emit_str(s, c", 1\n")
-                        converted_regs[j] = arr_sp2
+                        converted_regs[j] = emit_span_of_array(s, arr_loc, param_ptr.param_type_name, param_ptr.param_type_name_len)
                         coerced = 1
                 if coerced == 0 and span_arg_expr != null and span_arg_expr.kind == EXPR_UNARY
                     if span_arg_expr.op == OP_ADDR and span_arg_expr.operand.kind == EXPR_IDENT
@@ -3926,46 +3960,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     if coerced == 0 and span_arg_expr.operand.kind == EXPR_IDENT
                         let arr_loc2: *LocalVar = find_local_struct_name(s, span_arg_expr.operand.ident_ptr, span_arg_expr.operand.ident_len)
                         if arr_loc2 != null and arr_loc2.var_type == TYPE_ARRAY
-                            let a2_elem0: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, a2_elem0)
-                            emit_str(s, c" = getelementptr [")
-                            emit_int(s, arr_loc2.array_size as i64)
-                            emit_str(s, c" x ")
-                            if arr_loc2.array_elem_type == TYPE_I32 or arr_loc2.array_elem_type == TYPE_U32
-                                emit_str(s, c"i32")
-                            else if arr_loc2.array_elem_type == TYPE_I64 or arr_loc2.array_elem_type == TYPE_U64
-                                emit_str(s, c"i64")
-                            else if arr_loc2.array_elem_type == TYPE_U8 or arr_loc2.array_elem_type == TYPE_I8
-                                emit_str(s, c"i8")
-                            else if arr_loc2.array_elem_type == TYPE_U16 or arr_loc2.array_elem_type == TYPE_I16
-                                emit_str(s, c"i16")
-                            else if arr_loc2.array_elem_type == TYPE_PTR or arr_loc2.array_elem_type == TYPE_PTR_PTR
-                                emit_str(s, c"ptr")
-                            else
-                                emit_str(s, c"i64")
-                            emit_str(s, c"], ptr ")
-                            emit_reg(s, arr_loc2.reg)
-                            emit_str(s, c", i64 0, i64 0\n")
-                            let a2_sp1: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, a2_sp1)
-                            emit_str(s, c" = insertvalue %")
-                            emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                            emit_str(s, c" undef, ptr ")
-                            emit_reg(s, a2_elem0)
-                            emit_str(s, c", 0\n")
-                            let a2_sp2: i32 = next_reg(s)
-                            emit_str(s, c"  ")
-                            emit_reg(s, a2_sp2)
-                            emit_str(s, c" = insertvalue %")
-                            emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                            emit_str(s, c" ")
-                            emit_reg(s, a2_sp1)
-                            emit_str(s, c", i64 ")
-                            emit_int(s, arr_loc2.array_size as i64)
-                            emit_str(s, c", 1\n")
-                            converted_regs[j] = a2_sp2
+                            converted_regs[j] = emit_span_of_array(s, arr_loc2, param_ptr.param_type_name, param_ptr.param_type_name_len)
                             coerced = 1
                 if coerced == 0
                     converted_regs[j] = arg_regs[j]

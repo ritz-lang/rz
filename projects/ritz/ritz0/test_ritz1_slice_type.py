@@ -32,8 +32,8 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 SPAN = "import ritzlib.span\n\n"
 
 # Crossers: each takes one spelling and returns the other, so a value changes
-# spelling at every call. They also hand a `[u8]` local its value without the
-# `@array` initialiser that #2502 refuses.
+# spelling at every call. The `*_from_array` rows take `@array` directly
+# (#2502; test_ritz1_span_from_array.py covers the `Span<T>` slots).
 CROSS = SPAN + """\
 fn as_slice(s: Span<u8>) -> [u8]
     return s
@@ -240,11 +240,7 @@ pub fn main() -> i32
 # `Span<T>` written out fails identically (test_slice_and_span_emit_the_same_ir
 # checks that), so each is the named ticket's, not #1614's. Strict: a fix
 # turns the row XPASS, and the gate red until the entry goes.
-RITZ1_GAPS = {
-    "local_from_array": "AGAST #2502 — `@array` into a Span local emits invalid IR",
-    "struct_field_from_array": "AGAST #2502 — `@array` into a Span field",
-    "through_pointer_from_array": "AGAST #2502 — `@array` into a Span local",
-}
+RITZ1_GAPS: dict[str, str] = {}
 
 
 def _as_span(program: str) -> str:
