@@ -79,8 +79,8 @@ def _in_generic(ty, a, b, check):
     # The tuple-decl inside a generic body: specialised, then visited again.
     return (PRELUDE + "fn sum<T>(a: T, b: T) -> T\n"
             "    let (u, v) = mk<T>(a, b)\n"
-            # Through a local: ritz1 refuses `mk<T>(u, v).flip()` here, fail
-            # closed ("can't tell which struct this destructures").
+            # Through a local; the direct `mk<T>(u, v).flip()` is a chained_*
+            # row (AGAST #2784).
             "    var p: Pair<T> = mk<T>(u, v)\n"
             "    let (s, t) = p.flip()\n"
             "    return s + t + u + v\n\n"
@@ -90,11 +90,55 @@ def _in_generic(ty, a, b, check):
             "    if r == w + w\n        return 0\n    return 1\n")
 
 
+def _chained(ty, a, b, check):
+    # AGAST #2784: a method called directly on a generic call's result, with
+    # no local in between. ritz1 refused it ("can't tell which struct this
+    # destructures"); ritz0 accepted it since #2593.
+    return (PRELUDE + "pub fn main() -> i32\n"
+            f"    let (a, b) = mk<{ty}>({b}, {a}).flip()\n"
+            f"    if {check}\n        return 0\n    return 1\n")
+
+
+def _chained_in_generic(ty, a, b, check):
+    # AGAST #2784: the same, inside a generic body, where the type argument is
+    # the enclosing fn's own T (the ticket's `mk<T>(u, v).flip()`).
+    return (PRELUDE + "fn sum<T>(a: T, b: T) -> T\n"
+            "    let (u, v) = mk<T>(a, b)\n"
+            "    let (s, t) = mk<T>(u, v).flip()\n"
+            "    return s + t + u + v\n\n"
+            "fn snd<T>(a: T, b: T) -> T\n"
+            "    let (s, t) = mk<T>(a, b).flip()\n"
+            "    return s\n\n"
+            "pub fn main() -> i32\n"
+            f"    let r: {ty} = sum<{ty}>({a}, {b})\n"
+            f"    let w: {ty} = {a} + {b}\n"
+            "    if r != w + w\n        return 1\n"
+            f"    let s: {ty} = snd<{ty}>({a}, {b})\n"
+            f"    if s != {b}\n        return 2\n"
+            "    return 0\n")
+
+
+def _chained_other_struct(ty, a, b, check):
+    # AGAST #2784: the method returns a struct other than its receiver's, so
+    # the destructure must be named by the method's return, not the receiver.
+    return (PRELUDE + "struct Tagged<T>\n    k: i32\n    v: T\n\n"
+            "impl<T> Pair<T>\n"
+            "    fn tag(self: *Pair<T>) -> Tagged<T>\n"
+            "        Tagged<T> { k: 41, v: self.y }\n\n"
+            "pub fn main() -> i32\n"
+            f"    let (k, v) = mk<{ty}>({a}, {b}).tag()\n"
+            f"    if k != 41 or v != {b}\n        return 1\n"
+            "    return 0\n")
+
+
 PROGRAMS = {}
 for _ty, _case in CASES.items():
     PROGRAMS[f"free_{_ty}"] = _free(*_case)
     PROGRAMS[f"method_{_ty}"] = _method(*_case)
     PROGRAMS[f"in_generic_{_ty}"] = _in_generic(*_case)
+    PROGRAMS[f"chained_{_ty}"] = _chained(*_case)
+    PROGRAMS[f"chained_in_generic_{_ty}"] = _chained_in_generic(*_case)
+    PROGRAMS[f"chained_other_struct_{_ty}"] = _chained_other_struct(*_case)
 # The briefing's program, verbatim: (-300 + 2 + 400) = 102.
 PROGRAMS["briefing"] = PRELUDE + (
     "pub fn main() -> i32\n"
