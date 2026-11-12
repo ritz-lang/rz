@@ -2031,6 +2031,12 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     else
         p.var_type_name = null
         p.var_type_name_len = 0
+    # AGAST #2805: `let qq: **S = vec_as_ptr<*S>(@w)` -- the `<*S>` re-sets
+    # last_pointee_type, so stmt_var_decl read a `*S`'s pointee and slot for
+    # qq: `qq + 1` strode sizeof(S), not 8, and `(*(qq + 1)).b` was "unhandled
+    # EXPR_MEMBER".  `let p: *i32 = f<*u8>(..)` strode one byte the same way.
+    p.var_pointee = p.last_pointee_type
+    p.var_inner_pointee = ptr_ptr_inner_pointee(p, ty)
     # AGAST #1671: latch a `let f: fn(...) -> T` signature before the
     # initializer is parsed (it may contain fn types of its own).
     # AGAST #1747: on a `[N]fn(...) -> T` array it is the ELEMENT signature
@@ -2872,13 +2878,23 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     if ty == TYPE_ARRAY
         s.var_array_elem_pointee = p.last_array_elem_pointee
     # Copy pointee type from parser state if this is a pointer type
-    if ty == TYPE_PTR or ty == TYPE_PTR_PTR
+    # AGAST #2805: latched by capture_var_type for a typed decl with an
+    # initializer, as the inner pointee slot below is.
+    if (ty == TYPE_PTR or ty == TYPE_PTR_PTR) and init != null
+        s.var_pointee_type = p.var_pointee
+    else if ty == TYPE_PTR or ty == TYPE_PTR_PTR
         s.var_pointee_type = p.last_pointee_type
     else if (ty == TYPE_REF or ty == TYPE_MUT_REF) and s.var_type_name_len > 0
         s.var_pointee_type = TYPE_STRUCT  # AGAST #1754, as param_new
     else
         s.var_pointee_type = TYPE_I64  # Default
-    s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
+    # AGAST #2805: a typed decl with an initializer went through
+    # capture_var_type, which latched the slot before the initializer was
+    # parsed.  Without one (`var x: **S`) the parser state is still current.
+    if init != null and ty != 0
+        s.var_inner_pointee_type = p.var_inner_pointee
+    else
+        s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
     s.var_pointee_array_size = ptr_array_pointee_size(p, ty)
     s.var_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
     s.var_pointee_array_elem_pointee = ptr_array_elem_pointee(p, ty)

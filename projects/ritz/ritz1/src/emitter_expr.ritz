@@ -265,6 +265,25 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
             *out_st = pl_st
             *out_levels = pl
             return pl_ptr
+    # AGAST #2805: `y + k` / `y - k` where y is a `**S` (`qq + 1`, or a call
+    # returning one, `vec_as_ptr<*S>(@w) + 1`), or such a call bare: emit_expr
+    # strides it by 8, and `(*(qq + 1)).f` loads the `*S` and GEPs into S.  It
+    # fell through to the `*S` arm below, which names no S for it, and was an
+    # unlocated "unhandled EXPR_MEMBER".
+    if x.kind == EXPR_CALL or (x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB))
+        var pp_st: *StructDef = null
+        let pp_levels: i32 = ptr_ptr_struct_operand(s, x, @pp_st)
+        if pp_levels >= 2
+            let pp_val: i32 = emit_expr(s, x)
+            let pp_ptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, pp_ptr)
+            emit_str(s, c" = inttoptr i64 ")
+            emit_reg(s, pp_val)
+            emit_str(s, c" to ptr\n")
+            *out_st = pp_st
+            *out_levels = pp_levels
+            return pp_ptr
     # AGAST #1924: `y + k` / `y - k` where y is a `*S` (`*(pp + i) + k`):
     # emit_expr strides it by sizeof(S) (deref_pointee_struct_name names S
     # for the left operand), so `(*(*(pp + i) + k)).f` GEPs into the right
@@ -291,6 +310,46 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
         *out_levels = 1
         return b_ptr
     return 0
+
+# AGAST #2805: the pointer levels (>= 2) of `x` when it is a pointer to
+# pointer to a struct S, writing S to *out_st: pointer arithmetic down the left
+# spine rooted in anything ptr_levels_of resolves (a `**S` local, param, global
+# or field), or in a call returning `**S` (written, or `vec_as_ptr<*S>`, which
+# monomorph records as TYPE_PTR_PTR named S, a `ptr_` per extra level, #2791).
+# 0 for any other shape.
+fn ptr_ptr_struct_operand(s: *EmitterState, x: *Expr, out_st: **StructDef) -> i32
+    *out_st = null
+    var root: *Expr = x
+    while root != null and root.kind == EXPR_BINARY and (root.op == OP_ADD or root.op == OP_SUB)
+        root = root.left
+    if root == null
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    var levels: i32 = 0
+    if root.kind == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, root)
+        if fd == null or fd.return_type != TYPE_PTR_PTR or fd.return_type_name == null
+            return 0
+        name = fd.return_type_name
+        len = fd.return_type_name_len
+        levels = 2
+        while len > 4 and memcmp(name, c"ptr_", 4) == 0
+            name = name + 4
+            len = len - 4
+            levels = levels + 1
+    else
+        var inner: i32 = TYPE_VOID
+        levels = ptr_levels_of(s, x, @inner, @name, @len)
+        if inner != TYPE_STRUCT
+            return 0
+    if levels < 2 or name == null or len <= 0
+        return 0
+    let st: *StructDef = find_struct(s, name, len)
+    if st == null
+        return 0
+    *out_st = st
+    levels
 
 # AGAST #1924: pointer levels of a `**S` local/param/field from its inner
 # pointee slot: 3 for `***S`.  2 when the slot records nothing (the
