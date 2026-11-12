@@ -16,6 +16,7 @@ import ast
 import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
 import index_through # index_through (AGAST #2440)
 import tokens_gen
+import ownership     # own_before_ret (AGAST #1625)
 
 # =============================================================================
 # Emitter State
@@ -331,6 +332,9 @@ struct EmitterState
     # AGAST #2158 — move checking and drop insertion (ownership.ritz).
     # Allocated by own_init in emit_module.
     own: *OwnState
+    # AGAST #1625: how many `defer`s are registered (OwnState.defer_count),
+    # so emit_str can tell cheaply whether a `ret` must run them first.
+    defer_live: i32
 
 # AGAST #2242 — a path a binding's value can be moved out along: a move-only
 # field of it, or of a field of it that can itself be partly moved.  A path's
@@ -443,16 +447,56 @@ struct OwnState
     fa_cond: i32
     fa_path: i32
     fa_mask: i32
+    # AGAST #1625 (`defer`, LANGUAGE_SPEC §13.7): the registered deferred
+    # statements, innermost last: each one's STMT_DEFER, the `live` count when
+    # it was reached (bindings below it were declared before it) and the
+    # enclosing fn's return type.  scope_dstart is, per open block, the
+    # defer_count where it starts; loop_dstart, per loop depth, the
+    # defer_count where the loop body starts (what `break` / `continue` run).
+    defer_stmts: **Stmt
+    defer_pos: *i32
+    defer_ret: *i32
+    defer_count: i32
+    defer_cap: i32
+    scope_dstart: *i32
+    loop_dstart: *i32
+    loop_dcap: i32
+    # The STMT_DEFER being emitted at an exit (for the moved-binding error,
+    # located at the `defer`), or null; in_ret is 1 while a `ret` runs them.
+    cur_defer: *Stmt
+    in_ret: i32
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
 fn emit_str(s: *EmitterState, text: *u8)
+    # AGAST #1625: every way out of a fn is a `ret`, written from dozens of
+    # sites once the return value is computed.  A registered `defer` has to
+    # run there, after the value and before the `ret` (own_before_ret).
+    if s.defer_live > 0
+        if *text == 32
+            if emit_str_is_ret(text) == 1
+                own_before_ret(s)
     var i: i32 = 0
     while *(text + i) != 0
         i += 1
     vec_push_bytes<u8>(s.out, text, i as i64)
+
+# `  ret ...` / `  ret\n`: the start of a `ret` instruction.
+fn emit_str_is_ret(text: *u8) -> i32
+    if *(text + 1) != 32
+        return 0
+    if *(text + 2) != 114
+        return 0
+    if *(text + 3) != 101
+        return 0
+    if *(text + 4) != 116
+        return 0
+    let c: u8 = *(text + 5)
+    if c == 32 or c == 10
+        return 1
+    0
 
 fn emit_name(s: *EmitterState, name: *u8, len: i32)
     vec_push_bytes<u8>(s.out, name, len as i64)

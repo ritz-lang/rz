@@ -148,6 +148,8 @@ class AsyncAnalyzer:
         elif isinstance(stmt, rast.WhileStmt):
             self._analyze_expr(stmt.cond)
             self._analyze_block(stmt.body)
+        elif isinstance(stmt, rast.DeferStmt):
+            self._analyze_block(stmt.body)
 
     def _analyze_expr(self, expr: rast.Expr):
         """Analyze an expression, recording await points."""

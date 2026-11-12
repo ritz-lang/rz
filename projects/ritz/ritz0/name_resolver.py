@@ -280,7 +280,7 @@ class NameResolver:
             self._check_expr(stmt.value, scope)
             scope.locals.update(stmt.names)
 
-        elif isinstance(stmt, rast.UnsafeBlock):
+        elif isinstance(stmt, (rast.UnsafeBlock, rast.DeferStmt)):
             self._check_block(stmt.body, scope)
 
         elif isinstance(stmt, rast.AssertStmt):

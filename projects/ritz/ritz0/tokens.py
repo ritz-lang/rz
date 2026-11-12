@@ -44,6 +44,7 @@ class TokenType(Enum):
     STATIC_ASSERT = auto()
     BREAK = auto()
     CONTINUE = auto()
+    DEFER = auto()
     AS = auto()
     TYPE = auto()
     TRAIT = auto()
@@ -161,6 +162,7 @@ KEYWORDS = {
     'static_assert': TokenType.STATIC_ASSERT,
     'break': TokenType.BREAK,
     'continue': TokenType.CONTINUE,
+    'defer': TokenType.DEFER,
     'as': TokenType.AS,
     'type': TokenType.TYPE,
     'trait': TokenType.TRAIT,

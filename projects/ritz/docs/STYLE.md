@@ -717,25 +717,8 @@ rejects `@x` on a value already borrowed as `@&x`.
 
 ### 5.3 Resource Cleanup with `defer`
 
-Use `defer` for cleanup operations that must run at scope exit:
-
-**`defer` is not implemented in ritz0.** The block below is the intended style,
-and the checker asserts that ritz0 still rejects it with
-`Unknown identifier: defer`; when the compiler grows `defer`, this block starts
-compiling and the build tells us to drop this caveat.
-
-```ritz expect-error="Unknown identifier: defer"
-import ritzlib.memory
-
-
-fn read_config(size: i64) -> i64
-    var arena = arena_new(size)
-    defer arena_destroy(@arena)   # Always destroy, even on early return
-
-    arena_used(@arena)
-```
-
-Until then, write the cleanup out at each exit point:
+Use `defer` for cleanup that has no `Drop` type of its own and must run at every
+exit of a block (LANGUAGE_SPEC §13.7):
 
 ```ritz
 import ritzlib.memory
@@ -743,19 +726,17 @@ import ritzlib.memory
 
 fn read_config(size: i64) -> i64
     var arena = arena_new(size)
+    defer arena_destroy(@arena)   # runs on every exit, the early return included
     if arena_valid(@arena) == 0
-        arena_destroy(@arena)
         return -1
-
-    let used = arena_used(@arena)
-    arena_destroy(@arena)
-    used
+    arena_used(@arena)            # the value is computed before the defer runs
 ```
 
-**Guidelines (for when `defer` lands):**
+**Guidelines:**
 - Place `defer` immediately after acquiring a resource
 - Multiple defers execute in **reverse order** (LIFO)
 - Prefer `defer` over manual cleanup at each return point
+- A `defer` belongs to the innermost block: in a loop body it runs every pass
 
 ### 5.4 Error Handling: Result vs Panic
 

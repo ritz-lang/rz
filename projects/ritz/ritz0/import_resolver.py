@@ -613,6 +613,8 @@ class ImportResolver:
             new_cond = self._transform_expr(stmt.cond, aliases)
             new_body = self._transform_block(stmt.body, aliases)
             return replace(stmt, cond=new_cond, body=new_body)
+        elif isinstance(stmt, rast.DeferStmt):
+            return replace(stmt, body=self._transform_block(stmt.body, aliases))
         elif isinstance(stmt, rast.ForStmt):
             new_iter = self._transform_expr(stmt.iter, aliases)
             new_body = self._transform_block(stmt.body, aliases)

@@ -565,6 +565,8 @@ class Monomorphizer:
         elif isinstance(stmt, rast.WhileStmt):
             self._visit_expr(stmt.cond)
             self._visit_block(stmt.body)
+        elif isinstance(stmt, rast.DeferStmt):
+            self._visit_block(stmt.body)
         elif isinstance(stmt, rast.ForStmt):
             self._visit_expr(stmt.iter)
             self._visit_block(stmt.body)

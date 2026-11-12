@@ -100,6 +100,7 @@ import emitter_expr_call   # method_callee_def, find_spec_impl_method
 import ll_copy_scan        # ll_line_len, ll_starts_with
 import ref_check           # ref_ty_of, ref_through (AGAST #2336)
 import index_through       # index_through_value_struct (AGAST #2444)
+import emitter_stmt        # emit_stmt, for a deferred statement (AGAST #1625)
 
 const OWN_INIT_CAP: i32 = 16
 # Deeper than any real struct nesting; stops a malformed recursive type.
@@ -157,7 +158,18 @@ pub fn own_init(s: *EmitterState)
     o.fa_cond = 0
     o.fa_path = 0 - 1
     o.fa_mask = 0
+    o.defer_stmts = malloc((OWN_INIT_CAP as i64) * 8) as **Stmt
+    o.defer_pos = malloc((OWN_INIT_CAP as i64) * 4) as *i32
+    o.defer_ret = malloc((OWN_INIT_CAP as i64) * 4) as *i32
+    o.defer_count = 0
+    o.defer_cap = OWN_INIT_CAP
+    o.scope_dstart = malloc((OWN_INIT_CAP as i64) * 4) as *i32
+    o.loop_dstart = malloc((OWN_INIT_CAP as i64) * 4) as *i32
+    o.loop_dcap = OWN_INIT_CAP
+    o.cur_defer = null
+    o.in_ret = 0
     s.own = o
+    s.defer_live = 0
 
 fn own_live_at(o: *OwnState, i: i32) -> *OwnBinding
     let base: *OwnBinding = o.live
@@ -786,11 +798,14 @@ pub fn own_push_scope(s: *EmitterState)
         let cap: i32 = o.scope_cap * 2
         o.scope_start = realloc(o.scope_start as *u8, (cap as i64) * 4) as *i32
         o.scope_dead = realloc(o.scope_dead as *u8, (cap as i64) * 4) as *i32
+        o.scope_dstart = realloc(o.scope_dstart as *u8, (cap as i64) * 4) as *i32
         o.scope_cap = cap
     let starts: *i32 = o.scope_start
     let deads: *i32 = o.scope_dead
+    let dstarts: *i32 = o.scope_dstart
     starts[o.scope_count] = o.live_count
     deads[o.scope_count] = 0
+    dstarts[o.scope_count] = o.defer_count
     o.scope_count = o.scope_count + 1
 
 fn own_scope_is_dead(o: *OwnState) -> i32
@@ -822,9 +837,13 @@ pub fn own_pop_scope(s: *EmitterState) -> i32
         return 0
     let starts: *i32 = o.scope_start
     let start: i32 = starts[o.scope_count - 1]
+    let dstarts: *i32 = o.scope_dstart
+    let dstart: i32 = dstarts[o.scope_count - 1]
     let dead: i32 = own_scope_is_dead(o)
     if dead == 0
-        own_drop_from(s, start)
+        own_unwind(s, start, dstart)   # drops and deferred statements (#1625)
+    o.defer_count = dstart
+    s.defer_live = dstart
     o.live_count = start
     o.scope_count = o.scope_count - 1
     ref_loans_end(o.scope_count)   # a loan ends with its holder's block (#2438)
@@ -839,6 +858,13 @@ pub fn own_loop_enter(s: *EmitterState) -> i32
     let old: i32 = o.loop_base
     o.loop_base = o.live_count
     o.loop_depth = o.loop_depth + 1
+    # AGAST #1625: `break` / `continue` run the defers registered from here.
+    if o.loop_depth >= o.loop_dcap
+        let dcap: i32 = o.loop_dcap * 2
+        o.loop_dstart = realloc(o.loop_dstart as *u8, (dcap as i64) * 4) as *i32
+        o.loop_dcap = dcap
+    let ld: *i32 = o.loop_dstart
+    ld[o.loop_depth] = o.defer_count
     var i: i32 = 0
     while i < o.live_count
         let b: *OwnBinding = own_live_at(o, i)
@@ -1019,6 +1045,17 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
                     ev[6] = b.move_col
                 ev[7] = ev[7] | b.fmoved
         i += 1
+    let ld: *i32 = o.loop_dstart
+    let dbase: i32 = ld[o.loop_depth]
+    if o.defer_count > dbase
+        # AGAST #1625: the body's deferred statements run too.  What follows
+        # the jump is unreachable from here, so their moves don't stay.
+        let snap: *i32 = own_snapshot(s)
+        own_unwind(s, o.loop_base, dbase)
+        own_restore(s, snap)
+        if snap != null
+            free(snap as *u8)
+        return
     if o.live_count <= o.loop_base
         return
     own_drop_from(s, o.loop_base)
@@ -1302,6 +1339,10 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     o.last_pop_dead = 0
     o.fm_count = 0
     o.match_scrut = 0 - 1
+    o.defer_count = 0
+    o.cur_defer = null
+    o.in_ret = 0
+    s.defer_live = 0
     own_push_scope(s)
     var p: *Param = params
     while p != null
@@ -1359,7 +1400,24 @@ fn own_eprint_name(name: *u8, len: i32)
         eprint_char(*(name + i))
         i += 1
 
+# AGAST #1625: a deferred statement is checked as if written at each exit it
+# runs on.  A binding it names that is moved by then is reported at the
+# `defer`, as ritz0 reports it.  Returns 1 when it reported.
+fn own_error_in_defer(s: *EmitterState, b: *OwnBinding) -> i32
+    let o: *OwnState = s.own
+    let d: *Stmt = o.cur_defer
+    if d == null
+        return 0
+    own_eprint_loc(d.span.line, d.span.col)
+    eprints_cstr(c": error: `")
+    own_eprint_name(b.name, b.name_len)
+    eprints_cstr(c"` may be moved before the deferred statement runs\n")
+    s.error_count = s.error_count + 1
+    1
+
 fn own_error_use_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, move_line: i32, move_col: i32)
+    if own_error_in_defer(s, b) == 1
+        return
     own_eprint_loc(line, col)
     eprints_cstr(c": error: use of moved value: `")
     own_eprint_name(b.name, b.name_len)
@@ -1369,6 +1427,8 @@ fn own_error_use_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, move_
     s.error_count = s.error_count + 1
 
 fn own_error_borrow_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding)
+    if own_error_in_defer(s, b) == 1
+        return
     own_eprint_loc(line, col)
     eprints_cstr(c": error: cannot borrow `")
     own_eprint_name(b.name, b.name_len)
@@ -1403,6 +1463,8 @@ fn own_eprint_binding_path(b: *OwnBinding, path: i32)
 # AGAST #2168: a use of one of the moved paths `bits` (or of the whole
 # binding): `use of moved value: `h.t` (moved at F:L:C)`, for the first moved.
 fn own_error_field_use_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, bits: i32)
+    if own_error_in_defer(s, b) == 1
+        return
     let path: i32 = own_first_moved(s.own, b.slot, bits)
     own_eprint_loc(line, col)
     eprints_cstr(c": error: use of moved value: `")
@@ -1417,6 +1479,8 @@ fn own_error_field_use_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding,
     s.error_count = s.error_count + 1
 
 fn own_error_borrow_field_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, bits: i32)
+    if own_error_in_defer(s, b) == 1
+        return
     own_eprint_loc(line, col)
     eprints_cstr(c": error: cannot borrow `")
     own_eprint_name(b.name, b.name_len)
@@ -2572,6 +2636,8 @@ pub fn own_end_fn(s: *EmitterState, body_start: i64)
     o.temp_count = 0
     o.loop_ev_count = 0
     o.loop_depth = 0
+    o.defer_count = 0
+    s.defer_live = 0
     if o.all_count == 0
         return
     let n: i64 = s.out.len - body_start
@@ -2594,3 +2660,285 @@ pub fn own_end_fn(s: *EmitterState, body_start: i64)
         p = p + ll
     free(base)
     o.all_count = 0
+
+# =============================================================================
+# `defer` (LANGUAGE_SPEC §13.7, LARB R14, AGAST #1625)
+# =============================================================================
+#
+# Nothing is emitted at a `defer`: own_defer registers it in the innermost
+# block, at the current end of `live`.  Every exit of that block then emits
+# the statement in place, through emit_stmt, as if it were written there --
+# so it reads its names' values at exit, and the move check sees it at
+# each exit.  A block's deferred statements and its bindings' drops run
+# together, newest first (own_unwind):
+#   - falling off the end: own_pop_scope (after the arm's value);
+#   - `break` / `continue`: own_loop_jump, for the blocks inside the loop;
+#   - `return`, `?` and a fn's tail: own_before_ret, before every `ret`
+#     (emit_str spots it, once the value is computed), for every block.
+# A `defer` that isn't reached registers nothing, since the emitter only
+# reaches it on the paths that do.  A deferred statement may move a binding:
+# its flag clears, so the drop that follows it is skipped at run time.
+
+fn own_grow_defers(o: *OwnState)
+    if o.defer_count < o.defer_cap
+        return
+    let cap: i32 = o.defer_cap * 2
+    o.defer_stmts = realloc(o.defer_stmts as *u8, (cap as i64) * 8) as **Stmt
+    o.defer_pos = realloc(o.defer_pos as *u8, (cap as i64) * 4) as *i32
+    o.defer_ret = realloc(o.defer_ret as *u8, (cap as i64) * 4) as *i32
+    o.defer_cap = cap
+
+# Emit deferred statement `j` here.  Its statements are a block of their
+# own, so a `defer` inside it belongs to it.  The value the enclosing block
+# was producing (an `if` arm's) still stands afterwards.
+fn own_run_defer(s: *EmitterState, j: i32)
+    let o: *OwnState = s.own
+    let ds: **Stmt = o.defer_stmts
+    let d: *Stmt = ds[j]
+    let rets: *i32 = o.defer_ret
+    let ret_type: i32 = rets[j]
+    let saved: i32 = last_expr_here(s)
+    let saved_src: *Expr = s.value_source
+    let saved_ctx: *u8 = s.ctx_enum_name
+    let saved_ctx_len: i32 = s.ctx_enum_name_len
+    let saved_defer: *Stmt = o.cur_defer
+    own_push_scope(s)
+    var st: *Stmt = d.while_body
+    while st != null
+        o.cur_defer = d
+        emit_stmt(s, st, ret_type)
+        st = st.next
+    o.cur_defer = d
+    own_pop_scope(s)
+    o.cur_defer = saved_defer
+    s.value_source = saved_src
+    s.ctx_enum_name = saved_ctx
+    s.ctx_enum_name_len = saved_ctx_len
+    if saved != 0
+        set_last_expr(s, saved)
+
+# Leave the blocks holding live[from..] and defers[dfrom..]: each binding's
+# drop and each deferred statement, in reverse order of where they appear.
+# A deferred statement reached after binding i (defer_pos > i) runs first.
+fn own_unwind(s: *EmitterState, from: i32, dfrom: i32)
+    let o: *OwnState = s.own
+    if o.defer_count <= dfrom
+        own_drop_from(s, from)
+        return
+    var i: i32 = o.live_count - 1
+    var j: i32 = o.defer_count - 1
+    while i >= from or j >= dfrom
+        var run: i32 = 0
+        if j >= dfrom
+            if i < from
+                run = 1
+            else
+                let pos: *i32 = o.defer_pos
+                if pos[j] > i
+                    run = 1
+        if run == 1
+            own_run_defer(s, j)
+            j -= 1
+        else
+            own_emit_drop(s, own_live_at(o, i))
+            i -= 1
+
+# Called by emit_str as a `ret` starts while a `defer` is registered: every
+# block is being left, so run them all, innermost first, with the drops
+# they interleave with (own_end_fn's drops then find those flags clear).
+# What follows a `ret` is unreachable from it, so the moves don't stay.
+pub fn own_before_ret(s: *EmitterState)
+    let o: *OwnState = s.own
+    if o.in_ret == 1 or o.defer_count == 0
+        return
+    if own_scope_is_dead(o) == 1
+        return
+    o.in_ret = 1
+    let snap: *i32 = own_snapshot(s)
+    own_unwind(s, 0, 0)
+    own_restore(s, snap)
+    if snap != null
+        free(snap as *u8)
+    o.in_ret = 0
+
+fn own_defer_error(s: *EmitterState, d: *Stmt, msg: *u8)
+    own_eprint_loc(d.span.line, d.span.col)
+    eprints_cstr(c": error: ")
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+    s.error_count = s.error_count + 1
+
+# What would leave a deferred statement: 0 nothing, 1 `return`, 2 `?`,
+# 3 `break`, 4 `continue`.  `loops` counts the loops entered inside it, which
+# own their `break` / `continue`.  A nested `defer` is judged when reached.
+const DEFER_OK: i32 = 0
+const DEFER_RETURN: i32 = 1
+const DEFER_TRY: i32 = 2
+const DEFER_BREAK: i32 = 3
+const DEFER_CONTINUE: i32 = 4
+
+fn own_defer_leaves_arms(arms: *MatchArm, loops: i32) -> i32
+    var arm: *MatchArm = arms
+    while arm != null
+        var r: i32 = own_defer_leaves_stmts(arm.body_stmts, loops)
+        if r == DEFER_OK
+            r = own_defer_leaves_expr(arm.body, loops)
+        if r != DEFER_OK
+            return r
+        arm = arm.next
+    DEFER_OK
+
+fn own_defer_leaves_list(e: *Expr, loops: i32) -> i32
+    var a: *Expr = e
+    while a != null
+        let r: i32 = own_defer_leaves_expr(a, loops)
+        if r != DEFER_OK
+            return r
+        a = a.next
+    DEFER_OK
+
+# The kinds own_walk visits, plus a match / if expression's arms.
+fn own_defer_leaves_expr(e: *Expr, loops: i32) -> i32
+    if e == null
+        return DEFER_OK
+    let k: i32 = e.kind
+    if k == EXPR_TRY
+        return DEFER_TRY
+    if k == EXPR_UNARY
+        return own_defer_leaves_expr(e.operand, loops)
+    if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        let r: i32 = own_defer_leaves_expr(e.left, loops)
+        if r != DEFER_OK
+            return r
+        return own_defer_leaves_expr(e.right, loops)
+    if k == EXPR_MEMBER or k == EXPR_CAST
+        return own_defer_leaves_expr(e.left, loops)
+    if k == EXPR_CALL or k == EXPR_ARRAY_LIT
+        return own_defer_leaves_list(e.args, loops)
+    if k == EXPR_METHOD
+        let r: i32 = own_defer_leaves_expr(e.left, loops)
+        if r != DEFER_OK
+            return r
+        return own_defer_leaves_list(e.args, loops)
+    if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            let r: i32 = own_defer_leaves_expr(fi.value, loops)
+            if r != DEFER_OK
+                return r
+            fi = fi.next
+        return DEFER_OK
+    if k == EXPR_MATCH or k == EXPR_IF
+        let r: i32 = own_defer_leaves_expr(e.left, loops)
+        if r != DEFER_OK
+            return r
+        return own_defer_leaves_arms(e.args as *MatchArm, loops)
+    DEFER_OK
+
+fn own_defer_leaves_stmt(st: *Stmt, loops: i32) -> i32
+    let k: i32 = st.kind
+    if k == STMT_RETURN
+        return DEFER_RETURN
+    if k == STMT_BREAK
+        if loops == 0
+            return DEFER_BREAK
+        return DEFER_OK
+    if k == STMT_CONTINUE
+        if loops == 0
+            return DEFER_CONTINUE
+        return DEFER_OK
+    if k == STMT_EXPR
+        return own_defer_leaves_expr(st.expr, loops)
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        return own_defer_leaves_expr(st.var_init, loops)
+    if k == STMT_IF
+        var r: i32 = own_defer_leaves_expr(st.if_cond, loops)
+        if r == DEFER_OK
+            r = own_defer_leaves_stmts(st.if_then, loops)
+        if r == DEFER_OK
+            r = own_defer_leaves_stmts(st.if_else, loops)
+        return r
+    if k == STMT_ASSERT
+        return own_defer_leaves_expr(st.if_cond, loops)
+    if k == STMT_WHILE
+        let r: i32 = own_defer_leaves_expr(st.while_cond, loops)
+        if r != DEFER_OK
+            return r
+        return own_defer_leaves_stmts(st.while_body, loops + 1)
+    if k == STMT_LOOP
+        return own_defer_leaves_stmts(st.while_body, loops + 1)
+    if k == STMT_FOR
+        var r: i32 = own_defer_leaves_expr(st.for_start, loops)
+        if r == DEFER_OK
+            r = own_defer_leaves_expr(st.for_end, loops)
+        if r == DEFER_OK
+            r = own_defer_leaves_stmts(st.for_body, loops + 1)
+        return r
+    if k == STMT_MATCH
+        let r: i32 = own_defer_leaves_expr(st.if_cond as *Expr, loops)
+        if r != DEFER_OK
+            return r
+        return own_defer_leaves_arms(st.if_then as *MatchArm, loops)
+    if k == STMT_ASSIGN
+        if st.assign_target_len == 0
+            let r: i32 = own_defer_leaves_expr(st.if_cond as *Expr, loops)
+            if r != DEFER_OK
+                return r
+        return own_defer_leaves_expr(st.assign_value, loops)
+    if k == STMT_MEMBER_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN
+        return own_defer_leaves_expr(st.assign_value, loops)
+    if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        let r: i32 = own_defer_leaves_expr(st.while_cond, loops)
+        if r != DEFER_OK
+            return r
+        return own_defer_leaves_expr(st.assign_value, loops)
+    DEFER_OK
+
+fn own_defer_leaves_stmts(list: *Stmt, loops: i32) -> i32
+    var st: *Stmt = list
+    while st != null
+        let r: i32 = own_defer_leaves_stmt(st, loops)
+        if r != DEFER_OK
+            return r
+        st = st.next
+    DEFER_OK
+
+# The error a `defer` can't be registered with, reported at the `defer`;
+# 1 if there was one.
+fn own_defer_refusal(s: *EmitterState, d: *Stmt) -> i32
+    let body: *Stmt = d.while_body
+    if body == null
+        own_defer_error(s, d, c"`defer` needs a statement")
+        return 1
+    if d.defer_is_block == 0 and (body.kind == STMT_VAR_DECL or body.kind == STMT_TUPLE_DECL)
+        own_defer_error(s, d, c"a deferred `let` or `var` would die at once")
+        return 1
+    let r: i32 = own_defer_leaves_stmts(body, 0)
+    if r == DEFER_RETURN
+        own_defer_error(s, d, c"`return` can't leave a deferred statement")
+    else if r == DEFER_TRY
+        own_defer_error(s, d, c"`?` can't leave a deferred statement")
+    else if r == DEFER_BREAK
+        own_defer_error(s, d, c"`break` can't leave a deferred statement")
+    else if r == DEFER_CONTINUE
+        own_defer_error(s, d, c"`continue` can't leave a deferred statement")
+    if r != DEFER_OK
+        return 1
+    0
+
+# A STMT_DEFER is reached: register it with the innermost block.
+pub fn own_defer(s: *EmitterState, d: *Stmt, ret_type: i32)
+    let o: *OwnState = s.own
+    if own_defer_refusal(s, d) == 1
+        return
+    if own_scope_is_dead(o) == 1
+        return
+    own_grow_defers(o)
+    let ds: **Stmt = o.defer_stmts
+    let pos: *i32 = o.defer_pos
+    let rets: *i32 = o.defer_ret
+    ds[o.defer_count] = d
+    pos[o.defer_count] = o.live_count
+    rets[o.defer_count] = ret_type
+    o.defer_count = o.defer_count + 1
+    s.defer_live = o.defer_count

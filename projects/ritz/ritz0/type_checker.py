@@ -367,7 +367,7 @@ class TypeChecker:
                 self.locals[name] = (elements[i] if i < len(elements)
                                      else rast.NamedType(stmt.span, 'unknown', []))
 
-        elif isinstance(stmt, rast.UnsafeBlock):
+        elif isinstance(stmt, (rast.UnsafeBlock, rast.DeferStmt)):
             self._push_scope()
             self._check_block(stmt.body)
             self._pop_scope()

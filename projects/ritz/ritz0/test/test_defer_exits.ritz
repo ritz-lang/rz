@@ -1,0 +1,173 @@
+# `defer` on every exit (LANGUAGE_SPEC §13.7, LARB R14, AGAST #1625).
+#
+# test_level41 covers fallthrough, `return` and LIFO order. This file covers
+# the rest: `?`, `break`/`continue`, a pass of a loop, an `if` arm, the tail
+# and return value evaluated before the defer, the block form, a nested
+# defer and interleaving with Drop. Each test records the order things ran
+# in `log`, one decimal digit per event.
+
+import ritzlib.result
+
+var log: i64 = 0
+
+pub fn note(d: i64) -> i32
+    log = log * 10 + d
+    0
+
+# ---------------------------------------------------------------------------
+# `?`: the defer runs when `?` returns the Err, and on the Ok path too
+# ---------------------------------------------------------------------------
+
+fn fails(bad: i32) -> Result<i32, i32>
+    if bad == 1
+        return Err(7)
+    Ok(5)
+
+fn try_through(bad: i32) -> Result<i32, i32>
+    defer note(9)
+    let v = fails(bad)?
+    note(1)
+    Ok(v)
+
+[[test]]
+fn test_defer_on_try() -> i32
+    log = 0
+    let e = try_through(1)
+    assert e.is_err(), "fails(1) is an Err"
+    assert log == 9, "`?` should run the defer, and skip note(1)"
+    log = 0
+    let o = try_through(0)
+    assert o.is_ok(), "fails(0) is Ok"
+    assert log == 19, "the Ok path runs note(1), then the defer"
+    0
+
+# ---------------------------------------------------------------------------
+# Loops: the body's defer runs every pass, on `continue` and on `break`
+# ---------------------------------------------------------------------------
+
+fn per_pass() -> i64
+    var closed: i64 = 0
+    var i: i64 = 0
+    while i < 4
+        i = i + 1
+        defer closed += 1
+        if i == 2
+            continue
+        note(i)
+    closed
+
+[[test]]
+fn test_defer_per_pass_and_continue() -> i32
+    log = 0
+    let n = per_pass()
+    assert n == 4, "the defer runs on each of the 4 passes, `continue` included"
+    assert log == 134, "note(2) is skipped by `continue`"
+    0
+
+fn break_out() -> i64
+    for i in 0..10
+        defer note(9)
+        if i == 1
+            break
+        note(1)
+    note(2)
+    0
+
+[[test]]
+fn test_defer_on_break() -> i32
+    log = 0
+    break_out()
+    assert log == 1992, "pass 0 runs note(1) then the defer; `break` runs it too"
+    0
+
+# ---------------------------------------------------------------------------
+# An `if` arm is a block: its defer runs when the arm ends, not the fn
+# ---------------------------------------------------------------------------
+
+fn in_arm(take: i32) -> i64
+    if take == 1
+        defer note(9)
+        note(1)
+    note(2)
+    0
+
+[[test]]
+fn test_defer_in_if_arm() -> i32
+    log = 0
+    in_arm(1)
+    assert log == 192, "the arm's defer runs at the arm's end, before note(2)"
+    log = 0
+    in_arm(0)
+    assert log == 2, "an unreached defer registers nothing"
+    0
+
+# ---------------------------------------------------------------------------
+# The tail value and the return value are evaluated before the defer runs
+# ---------------------------------------------------------------------------
+
+var cell: i64 = 0
+
+fn tail_then_defer() -> i64
+    cell = 1
+    defer cell = 50
+    cell + 1
+
+fn return_then_defer() -> i64
+    cell = 3
+    defer cell = 60
+    return cell * 2
+
+[[test]]
+fn test_defer_after_tail_and_return_value() -> i32
+    assert tail_then_defer() == 2, "the tail value is evaluated before the defer"
+    assert cell == 50, "the defer then ran"
+    assert return_then_defer() == 6, "the return value is evaluated before the defer"
+    assert cell == 60, "the defer then ran"
+    0
+
+# ---------------------------------------------------------------------------
+# The block form, and a defer nested in a deferred block
+# ---------------------------------------------------------------------------
+
+fn block_form() -> i64
+    defer
+        note(1)
+        defer note(3)
+        note(2)
+    note(5)
+    0
+
+[[test]]
+fn test_defer_block_and_nested() -> i32
+    log = 0
+    block_form()
+    assert log == 5123, "the block runs at exit; its own defer runs when it ends"
+    0
+
+# ---------------------------------------------------------------------------
+# Drop: deferred statements and drops run in reverse source order together
+# ---------------------------------------------------------------------------
+
+struct Noisy
+    id: i64
+
+impl Drop for Noisy
+    fn drop(self: @&Noisy)
+        note(self.id)
+
+fn with_drops() -> i64
+    let a = Noisy { id: 1 }
+    defer note(2)
+    let b = Noisy { id: 3 }
+    a.id + b.id
+
+[[test]]
+fn test_defer_interleaves_with_drop() -> i32
+    log = 0
+    let s = with_drops()
+    assert s == 4, "the tail reads a and b while both are alive"
+    assert log == 321, "b drops, then the defer, then a"
+    0
+
+fn main() -> i32
+    0

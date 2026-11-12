@@ -19,6 +19,37 @@ from lexer import Lexer, LexerError
 import ritz_ast as rast
 
 
+def _defer_escape(node, in_loop: bool) -> Optional[str]:
+    """The first `return`, `?`, `break` or `continue` that would leave a
+    deferred statement, or None (LANGUAGE_SPEC §13.7). A `break`/`continue`
+    inside a loop that is itself inside the deferred statement is fine. A
+    nested `defer` was checked when it was parsed; a lambda is its own fn."""
+    if isinstance(node, (rast.ReturnStmt, rast.ReturnExpr)):
+        return "return"
+    if isinstance(node, rast.TryOp):
+        return "?"
+    if isinstance(node, (rast.BreakStmt, rast.BreakExpr)) and not in_loop:
+        return "break"
+    if isinstance(node, (rast.ContinueStmt, rast.ContinueExpr)) and not in_loop:
+        return "continue"
+    if isinstance(node, (rast.DeferStmt, rast.Lambda, rast.Closure)):
+        return None
+    if isinstance(node, (rast.WhileStmt, rast.ForStmt)):
+        in_loop = True
+    if isinstance(node, list):
+        children = node
+    elif isinstance(node, rast.Node):
+        children = [getattr(node, f) for f in node.__dataclass_fields__]
+    else:
+        return None
+    for child in children:
+        if isinstance(child, (list, rast.Node)):
+            found = _defer_escape(child, in_loop)
+            if found is not None:
+                return found
+    return None
+
+
 class ParseError(Exception):
     """Parser error with source location."""
     def __init__(self, message: str, span: Span):
@@ -1548,6 +1579,10 @@ class Parser:
             self._advance()
             return rast.ContinueStmt(span)
 
+        # Defer (LANGUAGE_SPEC §13.7)
+        if self._at(TokenType.DEFER):
+            return self.parse_defer()
+
         # While
         if self._at(TokenType.WHILE):
             self._advance()
@@ -1599,6 +1634,38 @@ class Parser:
             return rast.AssignStmt(span, expr, value)
 
         return rast.ExprStmt(span, expr)
+
+    def parse_defer(self) -> rast.DeferStmt:
+        """`defer <stmt>` or `defer` + an indented block (LANGUAGE_SPEC §13.7).
+
+        The refusals that need only the syntax are made here, all located at
+        the `defer`: a bare `defer`, a deferred `let`/`var`, and a `return`,
+        `?`, `break` or `continue` that would leave the deferred statement.
+        (A moved-before-exit name is the move checker's.)
+        """
+        span = self._expect(TokenType.DEFER).span
+        if self._at(TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF):
+            # The block form: an indented block must follow.
+            save = self.pos
+            self._skip_newlines()
+            if not self._at(TokenType.INDENT):
+                self.pos = save
+                raise ParseError("`defer` needs a statement", span)
+            self.pos = save
+            block = self.parse_block()
+            if block.expr is not None:
+                # Its value is discarded: keep it as a statement.
+                block.stmts.append(rast.ExprStmt(block.expr.span, block.expr))
+                block.expr = None
+        else:
+            stmt = self.parse_stmt()
+            if isinstance(stmt, (rast.LetStmt, rast.VarStmt, rast.LetTupleStmt)):
+                raise ParseError("a deferred `let` or `var` would die at once", span)
+            block = rast.Block(stmt.span, [stmt], None)
+        escape = _defer_escape(block, in_loop=False)
+        if escape is not None:
+            raise ParseError(f"`{escape}` can't leave a deferred statement", span)
+        return rast.DeferStmt(span, block)
 
     def parse_let(self) -> rast.Stmt:
         """Parse a let binding.

@@ -102,7 +102,6 @@ _RITZ1_TWINS = {
 # Files no compiler can build: they target draft features (LARB-0013) that
 # exist in no implementation. Listed for all three compilers.
 _ALL_COMPILERS = {
-    "test_level41": "AGAST #1625 — `defer` is reserved but implemented nowhere",
     "test_level42": "AGAST #1626 — `[[cfg(...)]]` is implemented nowhere",
 }
 

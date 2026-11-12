@@ -344,6 +344,14 @@ class MoveChecker:
         # borrow nothing holds lends nothing, as on ritz1.
         self._arg_loans: List[Tuple[VarInfo, Loan]] = []
         self._in_args = 0
+        # `defer` (LANGUAGE_SPEC §13.7): per open block, its (DeferStmt, the
+        # Scope at the defer) in source order; per open loop, how many block
+        # frames were open at it. A deferred statement is checked as if it
+        # were written at each exit it runs on (_run_defers).
+        self._defers: List[List[Tuple[rast.DeferStmt, Scope]]] = []
+        self._loop_defer_depth: List[int] = []
+        # Defers already refused, so one reached by several exits is one error.
+        self._refused_defers: Set[int] = set()
 
     def check(self, module: rast.Module) -> List[OwnershipError]:
         """Check ownership rules for a module.
@@ -768,20 +776,77 @@ class MoveChecker:
 
         Returns True if block definitely returns (via ReturnStmt).
         """
-        for stmt in block.stmts:
-            returned = self._check_stmt(stmt)
-            if returned:
-                # Rest of block is dead code - skip checking it
-                # This prevents false positives like "use after move" when the
-                # move is in a return and the "use" is after the return
-                return True
-        if block.expr:
-            # A block's value is a statement of its own for loans: an arm's
-            # `@&c` doesn't meet the next arm's.
-            mark = len(self._arg_loans)
-            self._check_expr(block.expr, is_move_context=True)
-            self._release_arg_loans(mark)
-        return False
+        self._defers.append([])
+        try:
+            for stmt in block.stmts:
+                returned = self._check_stmt(stmt)
+                if returned:
+                    # Rest of block is dead code - skip checking it
+                    # This prevents false positives like "use after move" when the
+                    # move is in a return and the "use" is after the return
+                    return True
+            if block.expr:
+                # A block's value is a statement of its own for loans: an arm's
+                # `@&c` doesn't meet the next arm's.
+                mark = len(self._arg_loans)
+                self._check_expr(block.expr, is_move_context=True)
+                self._release_arg_loans(mark)
+            # Falling off the end, after the tail value.
+            self._run_defers(len(self._defers) - 1)
+            return False
+        finally:
+            self._defers.pop()
+
+    def _run_defers(self, depth: int) -> None:
+        """Check the deferred statements of the blocks from `depth` up, innermost
+        first and LIFO, as if written here (an exit of those blocks). Each is
+        checked in the scope it was written in. A name it uses that is moved
+        here is an error at the `defer`; otherwise its own moves count, so a
+        deferred move is the binding's last use (LANGUAGE_SPEC §13.7)."""
+        for frame in reversed(self._defers[depth:]):
+            for stmt, scope in reversed(frame):
+                moved = self._moved_in_defer(stmt, scope)
+                if moved is not None:
+                    if id(stmt) not in self._refused_defers:
+                        self._refused_defers.add(id(stmt))
+                        self.errors.append(OwnershipError(
+                            f"`{moved}` may be moved before the deferred statement runs",
+                            stmt.span))
+                    continue
+                saved = self.scope
+                self.scope = scope
+                try:
+                    self._push_scope()
+                    self._check_block(stmt.body)
+                    self._pop_scope()
+                finally:
+                    self.scope = saved
+
+    def _moved_in_defer(self, stmt: rast.DeferStmt, scope: Scope) -> Optional[str]:
+        """The first name the deferred statement uses that is moved (or has a
+        field moved out) now, or None."""
+        found: List[str] = []
+
+        def walk(node):
+            if found:
+                return
+            if isinstance(node, rast.Ident):
+                info = scope.lookup(node.name)
+                if info is not None and (info.state == VarState.MOVED or info.moved_fields):
+                    found.append(node.name)
+                return
+            if isinstance(node, (rast.Lambda, rast.Closure)):
+                return
+            if isinstance(node, list):
+                for child in node:
+                    walk(child)
+            elif isinstance(node, rast.Node):
+                for f in node.__dataclass_fields__:
+                    child = getattr(node, f)
+                    if isinstance(child, (list, rast.Node)):
+                        walk(child)
+        walk(stmt.body)
+        return found[0] if found else None
 
     def _check_stmt(self, stmt: rast.Stmt) -> bool:
         """Check a statement for ownership violations. The loans it makes
@@ -839,8 +904,15 @@ class MoveChecker:
         elif isinstance(stmt, rast.ReturnStmt):
             if stmt.value:
                 self._check_expr(stmt.value, is_move_context=True)
+            self._run_defers(0)
             # Return terminates this control flow path
             return True
+
+        elif isinstance(stmt, rast.DeferStmt):
+            # Nothing runs here: it's checked at each exit (_run_defers).
+            if self._defers:
+                self._defers[-1].append((stmt, self.scope))
+            return False
 
         elif isinstance(stmt, rast.AssignStmt):
             # Check the value first - this is a move. `t = f(t)` reads the
@@ -894,10 +966,12 @@ class MoveChecker:
             return False
 
         elif isinstance(stmt, rast.BreakStmt):
+            self._run_loop_defers()
             self._note_loop_exit('breaks')
             return True
 
         elif isinstance(stmt, rast.ContinueStmt):
+            self._run_loop_defers()
             self._note_loop_exit('continues')
             return True
 
@@ -959,6 +1033,11 @@ class MoveChecker:
         out |= {(k, f) for k, (_i, _st, _s, fields) in snap.items() for f in fields}
         return out
 
+    def _run_loop_defers(self) -> None:
+        """break / continue: the defers of the blocks inside the loop."""
+        if self._loop_defer_depth:
+            self._run_defers(self._loop_defer_depth[-1])
+
     def _note_loop_exit(self, kind: str) -> None:
         if self._loops:
             self._loops[-1][kind].append(self._snapshot())
@@ -971,7 +1050,11 @@ class MoveChecker:
             self._restore(head)
             frame = {'breaks': [], 'continues': []}
             self._loops.append(frame)
-            done = iteration()
+            self._loop_defer_depth.append(len(self._defers))
+            try:
+                done = iteration()
+            finally:
+                self._loop_defer_depth.pop()
             self._loops.pop()
             back = list(frame['continues'])
             if not done:
@@ -1174,17 +1257,26 @@ class MoveChecker:
                 self._restore(self._join(outs))
 
         elif isinstance(expr, rast.BreakExpr):
+            self._run_loop_defers()
             self._note_loop_exit('breaks')
 
         elif isinstance(expr, rast.ContinueExpr):
+            self._run_loop_defers()
             self._note_loop_exit('continues')
 
         elif isinstance(expr, rast.ReturnExpr):
             if expr.value is not None:
                 self._check_expr(expr.value, is_move_context=True)
+            self._run_defers(0)
 
         elif isinstance(expr, rast.TryOp):
             self._check_expr(expr.expr, is_move_context=is_move_context)
+            # The Err path returns through every block's defers; the Ok path
+            # goes on, so their moves don't carry past the `?`.
+            if self._defers and any(self._defers):
+                snap = self._snapshot()
+                self._run_defers(0)
+                self._restore(snap)
 
         elif isinstance(expr, rast.Cast):
             self._check_expr(expr.expr, is_move_context=False)

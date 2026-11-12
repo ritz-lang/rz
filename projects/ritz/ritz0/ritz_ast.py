@@ -743,6 +743,19 @@ class ContinueStmt(Stmt):
 
 
 @dataclass
+class DeferStmt(Stmt):
+    """`defer <stmt>` or `defer` + an indented block (LANGUAGE_SPEC §13.7).
+
+    `body` holds the deferred statements; its `expr` is always None (a trailing
+    expression is kept as an ExprStmt, since its value is discarded). Nothing
+    is evaluated at the `defer`: the emitter runs `body` at each exit of the
+    enclosing block, interleaved with that block's drops. `span` is the
+    `defer` keyword, where every defer error is located.
+    """
+    body: 'Block'
+
+
+@dataclass
 class AssertStmt(Stmt):
     """Assert statement (only allowed in @test functions)."""
     condition: 'Expr'

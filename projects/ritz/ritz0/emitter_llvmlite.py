@@ -4531,12 +4531,49 @@ class LLVMEmitter:
             drop_vars: List of (name, alloca, ritz_type) tuples
             exclude_var: Variable name to skip (for return moves)
         """
-        # Drop in reverse order (LIFO - last declared, first dropped)
+        # Drop in reverse order (LIFO - last declared, first dropped). A
+        # `defer`'s entry sits among them, so it runs in the same order.
         for name, alloca, ritz_type in reversed(drop_vars):
+            if name == self._DEFER_ENTRY:
+                self._emit_deferred(*alloca)
+                continue
             if exclude_var and name == exclude_var:
                 # Skip - this variable is being moved out (returned)
                 continue
             self._emit_flagged_drop(name, alloca, ritz_type)
+
+    # The name of a drop-scope entry that is a `defer`, not a binding: no
+    # identifier can spell it. Its "alloca" is (DeferStmt, names snapshot).
+    _DEFER_ENTRY = "<defer>"
+    # The name -> binding maps a deferred statement resolves through.
+    _DEFER_NAME_MAPS = ('locals', 'params', '_let_values', '_let_drop_slots')
+
+    def _register_defer(self, stmt: rast.DeferStmt) -> None:
+        """`defer` (LANGUAGE_SPEC §13.7): nothing is evaluated here. Add an
+        entry to the innermost block's drop scope, so the statement runs at
+        every exit of that block (fallthrough, return, `?`, break and
+        continue all walk the drop scopes), interleaved with its drops in
+        reverse source order. The names in scope are snapshotted, so the
+        statement means what it would at the `defer` even if a later binding
+        shadows one of them."""
+        snapshot = {m: dict(getattr(self, m)) for m in self._DEFER_NAME_MAPS}
+        self.drop_scope_stack[-1].append((self._DEFER_ENTRY, (stmt, snapshot), None))
+
+    def _emit_deferred(self, stmt: rast.DeferStmt, snapshot) -> None:
+        """Emit a deferred block at one exit, as its own block (its bindings
+        and nested defers end with it)."""
+        saved = {m: getattr(self, m) for m in self._DEFER_NAME_MAPS}
+        for m, names in snapshot.items():
+            setattr(self, m, dict(names))
+        try:
+            self._push_drop_scope()
+            for s in stmt.body.stmts:
+                if self._emit_stmt(s) is True or self.builder.block.is_terminated:
+                    break
+            self._leave_drop_scope()
+        finally:
+            for m, names in saved.items():
+                setattr(self, m, names)
 
     def _emit_flagged_drop(self, name: str, alloca: ir.Value, ritz_type: rast.Type,
                            clear_flag: bool = False):
@@ -6224,6 +6261,10 @@ class LLVMEmitter:
             self._drop_loop_scopes()
             self.builder.branch(continue_block)
             return True  # Terminates this block
+
+        elif isinstance(stmt, rast.DeferStmt):
+            self._register_defer(stmt)
+            return False
 
         elif isinstance(stmt, rast.AsmStmt):
             return self._emit_asm(stmt)

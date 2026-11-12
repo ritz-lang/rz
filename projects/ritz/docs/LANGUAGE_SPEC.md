@@ -3654,29 +3654,28 @@ three compilers, with today's gaps marked as expected failures.
 
 ### 13.7 Defer
 
-*Ruled by LARB on 2026-11-12 (AGAST #2802). Neither compiler implements this yet; it
-lands with AGAST #1625, so the examples are `text` until then. Until it lands, ritz0
-refuses `defer`:*
-
-```ritz body expect-error="Unknown identifier: defer"
-defer print("bye\n")
-```
+*Ruled by LARB on 2026-11-12 (AGAST #2802, R14); implemented by ritz0, ritz1 and
+ritz1_selfhosted (AGAST #1625).*
 
 `defer` schedules a statement to run when the enclosing block exits. It's for cleanup
 that has no `Drop` type of its own, such as a raw fd, a lock or a buffer from `alloc`.
 
-```text
+```ritz
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.str
+
 fn read_header(path: *u8, out: *u8) -> i64
     let fd: i32 = sys_open(path, O_RDONLY)
     if fd < 0
         return -1
     defer sys_close(fd)
-    let buf: *u8 = alloc(4096)
+    let buf: *u8 = malloc(4096)
     defer free(buf)                 # runs before sys_close: LIFO
     let n: i64 = sys_read(fd, buf, 4096)
     if n < 16
         return -1                   # free(buf), then sys_close(fd)
-    mem_copy(out, buf, 16)
+    memcpy(out, buf, 16)
     16                              # 16 is evaluated, then free, then sys_close
 ```
 
@@ -3710,16 +3709,53 @@ fn read_header(path: *u8, out: *u8) -> i64
   binding's last use, so the binding isn't dropped afterwards. A deferred statement
   holds no loan between the `defer` line and the exit.
 
+```ritz expect-error="`x` may be moved before the deferred statement runs"
+struct Fd
+    n: i32
+
+impl Drop for Fd
+    fn drop(self: @&Fd)
+        self.n = -1
+
+fn take(f: Fd) -> i32
+    f.n
+
+fn main() -> i32
+    let x = Fd { n: 3 }
+    defer take(x)                   # runs at exit, but x is gone by then
+    take(x)
+```
+
 These are errors, located at the `defer`:
 - a `return`, `?`, `break` or `continue` that would leave the deferred statement.
   A loop wholly inside a deferred block may still `break` out of itself;
 - a deferred `let` or `var`, whose binding would die at once;
 - a `defer` with no statement after it.
 
+```ritz body expect-error="`return` can't leave a deferred statement"
+defer
+    return 1
+```
+
+```ritz body expect-error="`break` can't leave a deferred statement"
+while true
+    defer break
+```
+
+```ritz body expect-error="a deferred `let` or `var` would die at once"
+defer let x = 1
+```
+
+```ritz body expect-error="`defer` needs a statement"
+defer
+```
+
 A `defer` inside a deferred block belongs to that block, and runs when that block
 finishes.
 
-```text
+```ritz
+import ritzlib.sys
+
 fn drain(fds: [4]i32) -> i32
     var closed: i32 = 0
     for fd in fds
@@ -4501,7 +4537,8 @@ type         := 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'bool'
 
 stmt         := let_stmt | var_stmt | return_stmt | if_stmt | while_stmt
               | for_stmt | loop_stmt | match_stmt | assert_stmt
-              | break_stmt | continue_stmt | assign_stmt | expr_stmt
+              | break_stmt | continue_stmt | defer_stmt | assign_stmt | expr_stmt
+defer_stmt   := 'defer' (stmt | NEWLINE INDENT stmt+ DEDENT)
 expr         := binary | unary | cast | call | field | index | try | match
               | literal | struct_lit | array_lit | IDENT
 ```

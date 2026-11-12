@@ -316,6 +316,8 @@ class ConstEvalPass:
         elif isinstance(stmt, rast.WhileStmt):
             self._process_expr(stmt.cond)
             self._process_block(stmt.body)
+        elif isinstance(stmt, rast.DeferStmt):
+            self._process_block(stmt.body)
         elif isinstance(stmt, rast.ForStmt):
             self._process_expr(stmt.iter)
             self._process_block(stmt.body)
