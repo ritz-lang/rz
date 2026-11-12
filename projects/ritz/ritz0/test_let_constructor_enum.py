@@ -197,6 +197,39 @@ USERS.update({
     "builtin_some_beside_a_users": (
         _users("Some", "Some(7)", fn="fn g() -> Option<i32>\n")
         + _body("match g()", "    Some(v) => v", "    _ => 2"), 7),
+    # A builtin scrutinee's arms are the builtin's (#2512): the `Ok` arm named E,
+    # so the match was "non-exhaustive: missing Bad".
+    "builtin_ok_arm_beside_a_users": (
+        _users("Ok", "let r: Result<i32, i32> = Ok(7)", "match r", "    Ok(v) => v",
+               "    Err(e) => 2"), 7),
+    "builtin_ok_arm_beside_a_users_second": (
+        _users("Ok", "let r: Result<i32, i32> = Ok(7)", "match r", "    Ok(v) => v",
+               "    Err(e) => 2", second=True), 7),
+    "builtin_some_arm_beside_a_users": (
+        _users("Some", "let o: Option<i32> = Some(7)", "match o", "    Some(v) => v",
+               "    None => 2"), 7),
+    "builtin_ok_param_beside_a_users": (
+        "fn h(r: Result<i32, i32>) -> i32\n    match r\n        Ok(v) => v\n"
+        "        Err(e) => 2\n" + _users("Ok", "h(Ok(7))"), 7),
+    # An arm's value is the match's slot (#2512): `Some(v)` built E, so the
+    # match's phi was an E over the `None` arm's Option.
+    "builtin_some_arm_value_beside_a_users": (
+        _users("Some", "let x = Some(5)", "match x", "    Some(v) => Some(v)",
+               "    _ => None", fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
+    "builtin_some_arm_value_from_an_option": (
+        _users("Some", "let x: Option<i32> = Some(5)", "match x", "    Some(v) => Some(v)",
+               "    _ => None", fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
+    "builtin_ok_arm_value_beside_a_users": (
+        _users("Ok", "let x: Result<i32, i32> = Ok(5)", "match x", "    Ok(v) => Ok(v)",
+               "    Err(e) => Err(e)", fn="fn g() -> Result<i32, i32>\n")
+        + _body("match g()", "    Ok(v) => v", "    Err(e) => 2"), 5),
+    # The user's own arms beside them still name E.
+    "users_ok_arm_value_in_a_result_fn": (
+        _users("Ok", "let x: E = Ok(5)", "match x", "    Ok(v) => Ok(v)",
+               "    Bad => Err(2)", fn="fn g() -> Result<i32, i32>\n")
+        + _body("match g()", "    Ok(v) => v", "    Err(e) => 3"), 5),
 })
 
 ON_RITZ0 = sorted(BOUND) + ["i32_local", "passed_to_a_fn", "returned_as_the_fns_enum",
@@ -258,8 +291,9 @@ def test_ritz1_types_the_local_by_the_payload(request, tmp_path, compiler, ctor,
 def test_ritz1_builds_a_users_variant_as_its_own_enum(request, tmp_path, compiler, name):
     """A user enum that declares `Ok` / `Some` keeps the slot (#1797) and builds it
     (#2453): ritz1 sent the call to the builtin path, which had no enum (the zero,
-    then #2454's located refusal).  An Option / Result slot keeps the builtin.  A
-    builtin `Ok(v)` arm beside a user `Ok` is #2512's."""
+    then #2454's located refusal).  An Option / Result slot keeps the builtin, and
+    so does an Option / Result scrutinee's arm and an arm value that slot built
+    (#2512)."""
     source, code = USERS[name]
     proc, ll = _ritz1(request, compiler, tmp_path, source)
     assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-800:]}"
