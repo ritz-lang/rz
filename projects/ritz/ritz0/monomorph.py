@@ -546,6 +546,11 @@ class Monomorphizer:
                     self._visit_type(inferred)
             if stmt.value:
                 self._visit_expr(stmt.value)
+        elif isinstance(stmt, rast.LetTupleStmt):
+            # `let (a, b) = mk<i16>(...)`: the initialiser's generic calls
+            # must be registered like a `let`'s, or no `mk$i16` is ever
+            # specialised and the emitter refuses the call (AGAST #2593).
+            self._visit_expr(stmt.value)
         elif isinstance(stmt, rast.ExprStmt):
             self._visit_expr(stmt.expr)
         elif isinstance(stmt, rast.AssignStmt):
@@ -1342,7 +1347,8 @@ class Monomorphizer:
             # `let (a, b) = init`: the initialiser can mention T (e.g.
             # sizeof(T)), so it must be specialized too (AGAST #1928).
             return rast.LetTupleStmt(stmt.span, stmt.names,
-                                     self._specialize_expr(stmt.value, subst))
+                                     self._specialize_expr(stmt.value, subst),
+                                     stmt.name_spans)
         elif isinstance(stmt, rast.ExprStmt):
             return rast.ExprStmt(stmt.span, self._specialize_expr(stmt.expr, subst))
         elif isinstance(stmt, rast.AssignStmt):
