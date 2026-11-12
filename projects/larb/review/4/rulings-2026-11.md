@@ -702,3 +702,138 @@ catch-all, 0 of those after full coverage. Consts were compared by name, not val
 3. **#2330, #2331, #2329, #2175:** one room could take them, as they share one table.
 4. **#2441,** whose cost only the gate can show.
 5. **#2438, then #2439.**
+
+---
+
+# Third batch, 2026-11-12: `defer` and struct indexing
+
+Aaron decided to implement `defer` (#1625) and real struct indexing (#1635), with
+LARB writing the spec first (#2802, #2803). Both rules are in `LANGUAGE_SPEC.md`
+(§13.7 and §7.8, "Indexing a struct"). Their examples are `text` until the
+implementation tickets land, because neither compiler implements them.
+
+**Measured:** spec §12, §13.6 and §7.8 at `a7942060`; ritz0's two `HashMapI64` special
+cases (`emitter_llvmlite.py:6068`, `:8386`); the corpus for `fn index`/`index_mut`/
+`index_set` methods and `[]` on `HashMapI64` bindings; generic lang-trait impls in
+ritzlib and ritz1. **Not measured:** no compiler was built and nothing was probed,
+because both features would only fail to parse.
+
+## R14: `defer` (#2802)
+
+**Rule (§13.7).**
+- **Form.** `defer` takes one statement or an indented block.
+- **Scope.** It belongs to the innermost block.
+- **Order.** At exit it runs LIFO, interleaved with that block's drops in reverse
+  source order.
+- **Evaluation.** Nothing is evaluated at the `defer` line. The statement is checked
+  and run as if written at each exit.
+- **Exits.** It runs on fallthrough (after the tail value), on `return` and `?` (after
+  the return value), and on `break` and `continue`, the same exits as §13.6's drops.
+- **Errors.** `return`, `?`, `break` or `continue` out of the deferred statement; a
+  deferred `let`/`var`; a bare `defer`.
+
+**Why.**
+- **Evaluated at exit, not at the line (Zig, not Go).** It needs no hidden temporaries
+  (Aaron's `for` ruling: no hidden copy). It lowers by placing the statement at each
+  exit, as LARB-0013 §1.5 already said. It is what `test_defer_captures_by_ref` assumes.
+- **Block scope, not function scope.** A function-scope `defer` in a loop needs a
+  runtime list. Block scope runs once per pass and stays a compile-time rewrite.
+- **Sharing §13.6's exits and order.** This leaves one cleanup model. "Everything a
+  deferred statement names is alive when it runs" then holds by construction.
+- **Changed from LARB-0013:** §1.4 said a deferred statement must not move. Checking
+  it as if written at the exit allows a last-use move and catches the unsafe case.
+
+**Cost:** 0 sites. `defer` doesn't compile today.
+
+**`test_level41` against the rules.** No test expects a value the spec changes. Three
+can't fail, and one is misnamed:
+
+| Test | Verdict |
+|---|---|
+| `test_defer_basic` | Legal, but can't fail: it asserts nothing after the `defer` runs. Rewrite as a wrapper plus check, like `test_defer_lifo_check` |
+| `test_defer_lifo_order` | Legal, can't fail; it duplicates `test_defer_lifo_check`. Delete it |
+| `test_defer_lifo_check` | Correct |
+| `test_defer_early_return` | Correct |
+| `test_defer_captures_by_ref` | The value (20) is right; the name and comments are wrong. Nothing is captured: the statement runs at exit. Rename to `test_defer_evaluates_at_exit` |
+| `test_defer_function_calls` | Correct |
+| `test_defer_simple` | Legal; its `assert counter == 0` runs before the defer, so it only shows registration doesn't run the statement. Keep it, with that comment |
+
+**#1625 must add tests for:**
+- `?` and `break`/`continue` exits;
+- per-pass runs in a loop;
+- a `defer` in an `if` arm;
+- the tail or return value being evaluated before the defer runs;
+- interleaving with `Drop` (a binding declared after the `defer` drops first);
+- each error, with an `expect-error` spec block.
+
+All of them must run on ritz0, ritz1 and ritz1_selfhosted. ritz1 already lexes
+`TOK_DEFER` (`lexer_setup_gen.ritz:40`). The grammar sketch (Appendix A) and
+`grammars/ritz1.grammar` gain `defer_stmt` with #1625.
+
+## R15: indexing a struct (#2803)
+
+**Rule (§7.8).**
+- **Built in:** arrays, pointers, Vec, Span and String. None of them can opt in.
+- **Other structs** opt in through three compiler-known traits, resolved statically
+  like `Drop`:
+  - `Index`: `index(self: @M, k: K) -> @V`
+  - `IndexMut`: `index_mut(self: @&M, k: K) -> @&V`
+  - `IndexSet`: `index_set(self: @&M, k: K, v: V)`
+- **`m[k]` is a place** (R9):
+  - shared uses go through `index`;
+  - mutable uses, including `op=`, go through `index_mut`;
+  - plain `m[k] = v` uses `index_set`, or `index_mut` when there's no `IndexSet`.
+- **A missing key:** `index` and `index_mut` must not return. Only `index_set`
+  inserts.
+- **Keys** follow the argument rules.
+- **Borrows:** `[k]` is an index step for R11a.
+- **Errors** are located at the `[` and name the missing trait.
+
+**Why.**
+- **A trait, not a method-name convention.** The opt-in is explicit, so a struct with an
+  unrelated `index` method doesn't silently gain `[]`. The corpus has 0 such methods
+  today, so this is a safeguard, not a migration. It needs nothing ritz1 lacks: lang
+  traits already resolve statically by name for `Drop`, including generic impls
+  (`impl<T> Drop for Box<T>`, `ritzlib/box.ritz:30`; ritz1 `monomorph.ritz:2589`).
+  `test_trait_bounds`' 5 ritz1 failures are about bounds on generic params, which
+  this doesn't use.
+- **A place, not a value.** §7.8 and R9 make every built-in element a place in every
+  position. A value-returning `index` would make `m[k].f = x`, `@&m[k]` and
+  `m[k] += 1` mean something different on a user type than on a Vec.
+- **Three traits, not two.** A reference-returning `index_mut` can't insert a missing
+  key without a default `V`, and Ritz has no `Default`. `IndexSet` keeps `m[k] = v`
+  as "insert or replace" for maps. `IndexMut` alone serves types whose keys are
+  fixed, such as a grid.
+- **A missing key ends the program.** A reference can't be empty, and
+  `index -> Option<@V>` would make `m[k]` mean something different from a Vec
+  element. A key test is a method call (`contains`, or an `Option`-returning `get`).
+  There's no caller location for the message yet (#1869).
+
+**Cost:**
+- **Migration:** 1 line. The only `[]` users of `HashMapI64` are 3 of `test_level33`'s
+  13 functions; the other 10 call `hashmap_i64_*` and are unaffected.
+  `test_hashmap_index_get`'s `m[999] == 0` (line 186) becomes a program exit under the
+  rule. Rewrite it as `hashmap_i64_get(@m, 999) == 0` or a `contains` check.
+  `test_hashmap_index_set` and `test_hashmap_index_mixed` keep their meaning.
+- **ritz0 keys:** today ritz0 sign-extends any integer key to `i64`, and under the
+  rule an `i32` variable key needs `as i64`. That costs 0 sites, because every key in
+  the corpus is a literal or an `i64`.
+- **ritzlib:** `ritzlib.hashmap` gains the three impls and a "missing key" exit helper
+  (ritzlib has no `abort` today).
+
+**Compilers.** All three need the same work:
+- drop ritz0's two `HashMapI64` branches and the "`HashMapI64` indexing requires …"
+  errors;
+- add trait lookup at `[]`, with the error texts in §7.8;
+- add `expect-error` spec blocks for the three errors.
+
+ritz1 and ritz1_selfhosted must pass `test_level33` with all 13 functions, which they
+don't today (invalid IR).
+
+### For Aaron: trait or method convention
+
+I ruled trait (above). It's the only choice here that changes what a user writes, so
+it's flagged for confirmation before #1635 starts. The alternative is that any struct
+with methods named `index`/`index_mut`/`index_set` gets `[]` automatically. That's
+less to type and the same work for the compilers, but it makes `[]` appear on a type
+without anyone asking for it.

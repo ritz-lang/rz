@@ -1895,6 +1895,81 @@ fn main() -> i32
     second(@x)
 ```
 
+#### Indexing a struct
+
+*Ruled by LARB on 2026-11-12 (AGAST #2803). Neither compiler implements this yet; it
+lands with AGAST #1635, so the examples are `text` until then. Today ritz0 rewrites
+`m[k]` only for a local named exactly `HashMapI64`, and ritz1 emits invalid IR for it.*
+
+Arrays, pointers, Vec, Span and String index as described above, and stay built in. Any
+other struct opts into `[]` by implementing up to three traits. Like `Drop`, the
+compiler knows these traits by name. Their methods are resolved statically from the
+concrete type (§12.2), so they need no trait bounds and no dynamic dispatch. An impl
+chooses its key type `K` and element type `V`:
+
+```text
+impl Index for M                                # m[k] read: a shared place
+    fn index(self: @M, key: K) -> @V
+impl IndexMut for M                             # m[k] as a mutable place
+    fn index_mut(self: @&M, key: K) -> @&V
+impl IndexSet for M                             # m[k] = v, which may insert
+    fn index_set(self: @&M, key: K, value: V)
+```
+
+`m[k]` is a place, like a Vec element, and each position uses one method:
+
+| Use | Means |
+|---|---|
+| `m[k]` read by value, `m[k].f`, `@m[k]`, `for x in m[k]` | `*index(@m, k)` |
+| `@&m[k]`, `m[k].f = x`, `m[k] += x`, a `:&` argument, a mutating `self` call | `*index_mut(@&m, k)` |
+| `m[k] = v` | `index_set(@&m, k, v)`, or `*index_mut(@&m, k) = v` without `IndexSet` |
+
+- **A read is a read through a reference.** `m[k]` by value is a copy, and for a
+  move-only `V` it's "cannot move out of a reference" (§13.2).
+- **A missing key is the impl's to handle, and `index` and `index_mut` must not return
+  for one.** A reference can't be empty, so ritzlib's maps end the program with a
+  message. To test for a key, call a method such as `contains` or one that returns
+  `Option`. Only `index_set` adds keys.
+- **`m[k] op= x` evaluates `m`'s place and `k` once** and calls `index_mut` once
+  (AGAST #2529). It never reads through `index` and then calls `index_set`.
+- **The key is an ordinary argument**, so the rules for any argument apply and nothing is
+  converted implicitly. A literal key fits `K` as a literal argument would. An `i32`
+  variable doesn't fit an `i64` key; write `k as i64`.
+- **`[]` sees through one level.** `p[k]` on an `@M`, `@&M` or `*M` is `(*p)[k]`, and
+  writing needs `IndexMut` or `IndexSet` and a mutable `p`, as above.
+- **For §13.5, `m[k]` is an index step on `m`.** It overlaps every other `m[j]` and `m`
+  itself, so `let r = @m[1]` followed by `m[2] = 5` is refused (R11a).
+- **The built-in types can't opt in.** An `impl Index` for an array, pointer, Vec, Span
+  or String is an error, so `[]` on those types keeps one meaning.
+
+```text
+import ritzlib.hashmap
+
+fn main() -> i32
+    var m: HashMapI64 = hashmap_i64_new()
+    m[1] = 10                       # index_set inserts
+    m[1] += 5                       # index_mut, m and 1 evaluated once
+    let p: @i64 = @m[1]             # index
+    let v: i64 = *p - 15            # 0
+    hashmap_i64_drop(@&m)
+    v as i32
+```
+
+Indexing a struct that doesn't implement the trait a use needs is an error, located at
+the `[`:
+
+```text
+error: `Point` can't be indexed: it doesn't implement `Index` (§7.8)
+error: `m[k] = v` needs `IndexSet` or `IndexMut`, and `Lookup` implements only `Index`
+error: `@&m[k]` needs `IndexMut`, and `Lookup` implements only `Index` and `IndexSet`
+```
+
+`HashMapI64` implements all three in `ritzlib.hashmap`, at `K` = `V` = `i64`. Its
+`index` and `index_mut` end the program on a missing key, and `index_set` is
+`hashmap_i64_insert`. A generic `HashMap<K, V>` (AGAST #1858) implements them with
+`impl<K, V> Index for HashMap<K, V>`, the same way `ritzlib.box` writes
+`impl<T> Drop for Box<T>`.
+
 ### 7.9 Sizeof
 
 ```ritz body
@@ -3577,10 +3652,82 @@ the whole binding, so the rest of it leaks (AGAST #2319).
 `ritz0/test_ownership_free_count.py` counts the drops for each rule on all
 three compilers, with today's gaps marked as expected failures.
 
-`defer` is reserved in the ritz1 grammar but is not implemented in ritz0:
+### 13.7 Defer
+
+*Ruled by LARB on 2026-11-12 (AGAST #2802). Neither compiler implements this yet; it
+lands with AGAST #1625, so the examples are `text` until then. Until it lands, ritz0
+refuses `defer`:*
 
 ```ritz body expect-error="Unknown identifier: defer"
 defer print("bye\n")
+```
+
+`defer` schedules a statement to run when the enclosing block exits. It's for cleanup
+that has no `Drop` type of its own, such as a raw fd, a lock or a buffer from `alloc`.
+
+```text
+fn read_header(path: *u8, out: *u8) -> i64
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        return -1
+    defer sys_close(fd)
+    let buf: *u8 = alloc(4096)
+    defer free(buf)                 # runs before sys_close: LIFO
+    let n: i64 = sys_read(fd, buf, 4096)
+    if n < 16
+        return -1                   # free(buf), then sys_close(fd)
+    mem_copy(out, buf, 16)
+    16                              # 16 is evaluated, then free, then sys_close
+```
+
+- **Form.** `defer` is followed by one statement on the same line, or by an indented
+  block on the lines below it. The statement is an expression statement, an
+  assignment or a compound assignment. Any value it produces is discarded.
+- **Scope.** A deferred statement belongs to the innermost block containing the
+  `defer`. That covers a function body, an `if` or `else` arm, a `match` arm, and a loop
+  body, where it runs at the end of every pass. It never waits for the end of the
+  function.
+- **Order.** At a block's exit, its deferred statements and its bindings' drops (§13.6)
+  run in reverse order of where they appear. A binding declared after a `defer` is
+  dropped before that statement runs. One declared before it is still alive, so
+  everything a deferred statement can name is alive when it runs.
+- **Evaluated at exit.** Nothing is evaluated at the `defer` line. The whole statement,
+  operands included, runs at exit, so it sees the values its names hold then. It
+  isn't a closure and it doesn't capture anything: it behaves as if it were written
+  at each exit. `defer counter = x` followed by `x = 20` stores 20.
+- **Every exit runs it,** using the same exits as §13.6's drops:
+  - falling off the end of the block, after the block's tail value is evaluated;
+  - `return` and `?`, after the return value is evaluated, for every block being
+    left, innermost first;
+  - `break` and `continue`, for every block left inside the loop, innermost first.
+
+  A `defer` that hasn't been reached registers nothing. Ending the process with
+  `sys_exit` runs nothing.
+- **Checked as if written at each exit.** Moves, borrows and types are checked as if
+  the statement appeared at each exit it runs on. A name moved before one of those
+  exits makes the statement an error ("`x` may be moved before the deferred statement
+  runs", located at the `defer`). A deferred statement may move a binding: it's the
+  binding's last use, so the binding isn't dropped afterwards. A deferred statement
+  holds no loan between the `defer` line and the exit.
+
+These are errors, located at the `defer`:
+- a `return`, `?`, `break` or `continue` that would leave the deferred statement.
+  A loop wholly inside a deferred block may still `break` out of itself;
+- a deferred `let` or `var`, whose binding would die at once;
+- a `defer` with no statement after it.
+
+A `defer` inside a deferred block belongs to that block, and runs when that block
+finishes.
+
+```text
+fn drain(fds: [4]i32) -> i32
+    var closed: i32 = 0
+    for fd in fds
+        defer closed += 1               # once per pass, `continue` included
+        if fd < 0
+            continue
+        sys_close(fd)
+    closed                              # 4
 ```
 
 ---
