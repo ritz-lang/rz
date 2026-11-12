@@ -2,6 +2,7 @@
 # Test vectors from NIST SP 800-38D and RFC 5116
 
 import cryptosec.aes_gcm
+import cryptosec.aes
 import cryptosec.crypto_error
 import cryptosec.mem
 import cryptosec.cpuid
@@ -652,3 +653,126 @@ fn test_aes128_gcm_auth_failure_writes_nothing() -> i32
     if untouched(@out[0], 32) == 0
         return 3
     return 0
+
+# =============================================================================
+# Secret wiping (AGAST #2771)
+# =============================================================================
+# On AuthenticationFailed, decrypt has computed the valid tag for the
+# attacker's (aad, ct); left on the stack, a stack disclosure turns the
+# rejected forgery into an accepted one. So are the two halves it is XORed
+# from, GHASH output S and the tag mask E(K, J0): either both are wiped or the
+# tag is. stack_holds_2771 reads the stack just below the caller's frame,
+# where the callee's frames lived.
+
+const RESIDUE_SPAN_2771: i64 = 32768
+
+[[noinline]]
+fn stack_holds_2771(pat: *u8, plen: i64) -> bool
+    var buf: [32768]u8
+    # Make buf escape so the reads below are real loads of what is there.
+    let p: *u8 = @buf[0]
+    asm x86_64:
+        nopl ({p})
+    var i: i64 = 0
+    while i + plen <= RESIDUE_SPAN_2771
+        var j: i64 = 0
+        while j < plen and buf[i + j] == pat[j]
+            j += 1
+        if j == plen
+            return true
+        i += 1
+    return false
+
+# Zero the span stack_holds_2771 reads, so only later calls' residue is seen.
+[[noinline]]
+fn scrub_2771()
+    var buf: [32768]u8
+    mem_zero(@buf[0], RESIDUE_SPAN_2771)
+
+fn setup_2771(key: *u8, key_len: i64, nonce: *u8, pt: *u8)
+    for i in 0..key_len
+        key[i] = (0x80 + i * 3) as u8
+    for i in 0..12
+        nonce[i] = (0x40 + i) as u8
+    for i in 0..64
+        pt[i] = (i * 5) as u8
+
+# Reject a forgery of tag (a flipped bit), then look for what decrypt left.
+# mask = E(K, J0) and s = tag ^ mask are the halves of the valid tag.
+# 0 = clean; 1 = setup; 2-4 = residue before the call (the probe cannot
+# tell); 5 = not rejected; 6 = valid tag, 7 = tag mask, 8 = GHASH S left.
+fn check_fail_residue_2771(is256: bool, ctx128: *AesGcm128, ctx256: *AesGcm256, nonce: *u8, ct: *u8, tag: *u8, mask: *u8) -> i32
+    var valid: [16]u8
+    var s: [16]u8
+    mem_copy(@valid[0], tag, 16)
+    for i in 0..16
+        s[i] = valid[i] ^ mask[i]
+    tag[0] = tag[0] ^ 1
+    scrub_2771()
+    if stack_holds_2771(@valid[0], 16)
+        return 2
+    if stack_holds_2771(mask, 16)
+        return 3
+    if stack_holds_2771(@s[0], 16)
+        return 4
+    var out: [64]u8
+    var rejected: bool = false
+    if is256
+        rejected = is_auth_failed(aes256_gcm_decrypt(ctx256, nonce, 12, nonce, 12, ct, 64, tag, @out[0]))
+    else
+        rejected = is_auth_failed(aes128_gcm_decrypt(ctx128, nonce, 12, nonce, 12, ct, 64, tag, @out[0]))
+    if not rejected
+        return 5
+    if stack_holds_2771(@valid[0], 16)
+        return 6
+    if stack_holds_2771(mask, 16)
+        return 7
+    if stack_holds_2771(@s[0], 16)
+        return 8
+    return 0
+
+# J0 for a 96-bit nonce: nonce || 0x00000001 (SP 800-38D §7.1).
+fn j0_2771(nonce: *u8, j0: *u8)
+    mem_copy(j0, nonce, 12)
+    j0[12] = 0
+    j0[13] = 0
+    j0[14] = 0
+    j0[15] = 1
+
+[[test]]
+fn test_aes128_gcm_decrypt_fail_wipes_computed_tag() -> i32
+    var key: [16]u8
+    var nonce: [12]u8
+    var pt: [64]u8
+    setup_2771(@key[0], 16, @nonce[0], @pt[0])
+    var ctx: AesGcm128
+    aes128_gcm_init(@ctx, @key[0])
+    var ct: [64]u8
+    var tag: [16]u8
+    if ok_bytes(aes128_gcm_encrypt(@ctx, @nonce[0], 12, @nonce[0], 12, @pt[0], 64, @ct[0], @tag[0])) != 64
+        return 1
+    var j0: [16]u8
+    var mask: [16]u8
+    j0_2771(@nonce[0], @j0[0])
+    aes128_encrypt_block(@ctx.aes_ctx, @j0[0], @mask[0])
+    var unused: AesGcm256
+    return check_fail_residue_2771(false, @ctx, @unused, @nonce[0], @ct[0], @tag[0], @mask[0])
+
+[[test]]
+fn test_aes256_gcm_decrypt_fail_wipes_computed_tag() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    var pt: [64]u8
+    setup_2771(@key[0], 32, @nonce[0], @pt[0])
+    var ctx: AesGcm256
+    aes256_gcm_init(@ctx, @key[0])
+    var ct: [64]u8
+    var tag: [16]u8
+    if ok_bytes(aes256_gcm_encrypt(@ctx, @nonce[0], 12, @nonce[0], 12, @pt[0], 64, @ct[0], @tag[0])) != 64
+        return 1
+    var j0: [16]u8
+    var mask: [16]u8
+    j0_2771(@nonce[0], @j0[0])
+    aes256_encrypt_block(@ctx.aes_ctx, @j0[0], @mask[0])
+    var unused: AesGcm128
+    return check_fail_residue_2771(true, @unused, @ctx, @nonce[0], @ct[0], @tag[0], @mask[0])
