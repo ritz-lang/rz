@@ -299,6 +299,8 @@ Documented but unfixed. Unacceptable for a cryptographic library.
 
 ### M-12: `ed25519_verify` return convention inverted
 
+> **Status (2026-11, AGAST #2584):** Fixed. `ed25519_verify` returns 1 = valid, 0 = invalid (malformed inputs included); `x509_verify.ritz` and `tls13_handshake.ritz` now test `!= 1`.
+
 **File:** `ed25519.ritz:755`
 
 Returns 0 on success and -1 on failure, while every other verify function returns 1 on success and 0 on failure.
