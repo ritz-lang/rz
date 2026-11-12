@@ -1,102 +1,123 @@
-# test_args.ritz - Tests for argument parsing
+# test_args.ritz - parse_args (src/args.ritz) on real argv vectors.
 #
-# TDD: Write tests first, then implement.
+# Every test builds an argv, calls parse_args, and returns 1 on any
+# mismatch. These used to assert constants against themselves and never
+# call parse_args (AGAST #2790).
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import src.args
 
-# Test infrastructure
-var g_passed: i32 = 0
-var g_failed: i32 = 0
+fn fail(name: *u8) -> i32
+    prints_cstr("FAIL: ")
+    prints_cstr(name)
+    prints_cstr("\n")
+    1
 
-fn assert_eq(name: *u8, got: i32, expected: i32)
-    if got == expected
-        g_passed += 1
-    else
-        prints_cstr("FAIL: ")
-        prints_cstr(name)
-        prints_cstr(" - expected ")
-        print_int(expected as i64)
-        prints_cstr(", got ")
-        print_int(got as i64)
-        prints_cstr("\n")
-        g_failed += 1
+# Null-safe string equality: both null, or both non-null and equal.
+fn same(got: *u8, want: *u8) -> bool
+    if got == null or want == null
+        return got == want
+    strcmp(got, want) == 0
 
-fn assert_streq(name: *u8, got: *u8, expected: *u8)
-    if strcmp(got, expected) == 0
-        g_passed += 1
-    else
-        prints_cstr("FAIL: ")
-        prints_cstr(name)
-        prints_cstr(" - expected '")
-        prints_cstr(expected)
-        prints_cstr("', got '")
-        prints_cstr(got)
-        prints_cstr("'\n")
-        g_failed += 1
+# parse_args(argc, argv) with argv = ["rzrz", a1, a2, ...]; null ends the list.
+fn parse5(a1: *u8, a2: *u8, a3: *u8, a4: *u8, a5: *u8) -> Args
+    var argv: [7]*u8
+    argv[0] = c"rzrz"
+    argv[1] = a1
+    argv[2] = a2
+    argv[3] = a3
+    argv[4] = a4
+    argv[5] = a5
+    argv[6] = null
+    var argc: i32 = 1
+    while argc < 6 and argv[argc] != null
+        argc += 1
+    parse_args(argc, @argv[0])
 
-# ============================================================================
-# Command Parsing Tests
-# ============================================================================
-
-# Command enum values (to be defined in main.ritz)
-const CMD_NONE: i32 = 0
-const CMD_BUILD: i32 = 1
-const CMD_TEST: i32 = 2
-const CMD_RUN: i32 = 3
-const CMD_LIST: i32 = 4
-const CMD_CLEAN: i32 = 5
-const CMD_COMPARE: i32 = 6
-const CMD_HELP: i32 = 7
+fn command_of(a1: *u8) -> i32
+    let args: Args = parse5(a1, null, null, null, null)
+    args.command
 
 [[test]]
 fn test_parse_no_args() -> i32
-    # With no arguments, should return CMD_HELP
-    # Simulated: argc=1, argv=["rz"]
-    let cmd: i32 = CMD_HELP  # Expected result
-    assert_eq(c"no_args_returns_help", cmd, CMD_HELP)
+    let args: Args = parse5(null, null, null, null, null)
+    if args.command != CMD_HELP
+        return fail(c"no args -> CMD_HELP")
+    if args.project != null or args.all_projects != 0 or args.release_mode != 0
+        return fail(c"no args -> empty Args")
     0
 
 [[test]]
-fn test_parse_build_command() -> i32
-    # "rz build" should return CMD_BUILD
-    let cmd: i32 = CMD_BUILD
-    assert_eq(c"build_command", cmd, CMD_BUILD)
+fn test_parse_each_command() -> i32
+    if command_of(c"build") != CMD_BUILD
+        return fail(c"build")
+    if command_of(c"test") != CMD_TEST
+        return fail(c"test")
+    if command_of(c"run") != CMD_RUN
+        return fail(c"run")
+    if command_of(c"list") != CMD_LIST
+        return fail(c"list")
+    if command_of(c"clean") != CMD_CLEAN
+        return fail(c"clean")
+    if command_of(c"compare") != CMD_COMPARE
+        return fail(c"compare")
+    if command_of(c"--help") != CMD_HELP or command_of(c"-h") != CMD_HELP
+        return fail(c"--help/-h")
+    if command_of(c"--version") != CMD_VERSION or command_of(c"-V") != CMD_VERSION
+        return fail(c"--version/-V")
     0
 
 [[test]]
-fn test_parse_test_command() -> i32
-    # "rz test" should return CMD_TEST
-    let cmd: i32 = CMD_TEST
-    assert_eq(c"test_command", cmd, CMD_TEST)
+fn test_parse_unknown_command() -> i32
+    if command_of(c"bogus") != CMD_NONE
+        return fail(c"unknown -> CMD_NONE")
     0
 
 [[test]]
-fn test_parse_list_command() -> i32
-    # "rz list" should return CMD_LIST
-    let cmd: i32 = CMD_LIST
-    assert_eq(c"list_command", cmd, CMD_LIST)
+fn test_parse_project_and_flags() -> i32
+    let args: Args = parse5(c"build", c"--release", c"sage", c"--all", null)
+    if args.command != CMD_BUILD
+        return fail(c"flags: command")
+    if not same(args.project, c"sage")
+        return fail(c"flags: project")
+    if args.all_projects != 1
+        return fail(c"flags: --all")
+    if args.release_mode != 1
+        return fail(c"flags: --release")
+    if args.rest_index != 0
+        return fail(c"flags: no -- means rest_index 0")
     0
 
-# ============================================================================
-# Main test runner
-# ============================================================================
+[[test]]
+fn test_parse_no_flags() -> i32
+    let args: Args = parse5(c"test", c"sage", null, null, null)
+    if not same(args.project, c"sage")
+        return fail(c"no flags: project")
+    if args.all_projects != 0 or args.release_mode != 0
+        return fail(c"no flags: flags stay 0")
+    0
 
-fn main(argc: i32, argv: **u8) -> i32
-    prints_cstr("Running rz-cli argument parsing tests...\n\n")
+[[test]]
+fn test_parse_compare_tier_is_first_positional() -> i32
+    let args: Args = parse5(c"compare", c"tier2", null, null, null)
+    if args.command != CMD_COMPARE
+        return fail(c"compare: command")
+    if not same(args.project, c"tier2")
+        return fail(c"compare: tier in project slot")
+    0
 
-    test_parse_no_args()
-    test_parse_build_command()
-    test_parse_test_command()
-    test_parse_list_command()
-
-    prints_cstr("\n")
-    print_int(g_passed as i64)
-    prints_cstr(" passed, ")
-    print_int(g_failed as i64)
-    prints_cstr(" failed\n")
-
-    if g_failed > 0
-        return 1
+[[test]]
+fn test_parse_double_dash_stops_parsing() -> i32
+    # rzrz run p -- x --all : argv[3] is "--", the rest is the program's.
+    let args: Args = parse5(c"run", c"p", c"--", c"x", c"--all")
+    if not same(args.project, c"p")
+        return fail(c"--: project")
+    if args.rest_index != 4
+        return fail(c"--: rest_index is the index after --")
+    if args.all_projects != 0
+        return fail(c"--: --all after -- is not ours")
+    if args.tier != null
+        return fail(c"--: x after -- is not a tier")
     0

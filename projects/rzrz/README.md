@@ -1,10 +1,10 @@
 # rzrz
 
 `rz` rewritten in Ritz — the Ritz-native port of the workspace CLI.
-("rz in rz" = rzrz.) **What works today:** `build` (by spawning
-`python3 ./rz build <p> --compiler ritz1`), `list`, `--help` and `--version`.
-`test`, `run`, `clean` and `compare` are **not implemented**: each exits 1
-saying so (AGAST #2790), and an unknown command exits 2.
+("rz in rz" = rzrz.) `list`, `--help` and `--version` run natively.
+`build`, `test`, `run`, `clean` and `compare` delegate to `python3 ./rz`
+(see below) and exit with its status (AGAST #2790). An unknown command
+exits 2.
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
@@ -16,8 +16,10 @@ built by the ecosystem. It is the subject of
 [`docs/STACK_MATRIX.md`](../../docs/STACK_MATRIX.md), which tracks the compiler
 bootstrap layering.
 
-The project is deliberately small: one source file (`src/main.ritz`), one test
-file (`test/test_args.ritz`), and `ritzlib` as its only dependency.
+The project is deliberately small: two source files (`src/main.ritz`, the
+commands; `src/args.ritz`, `parse_args`), one test file
+(`test/test_args.ritz`, which calls `parse_args` on real argv vectors),
+`test.sh`, and `ritzlib` as its only dependency.
 
 ## Build
 
@@ -45,6 +47,10 @@ All four commands above were measured at exit 0 on 2026-09-12.
 ./projects/rzrz/build/debug/rzrz --help
 ./projects/rzrz/build/debug/rzrz list
 ./projects/rzrz/build/debug/rzrz build <project>
+./projects/rzrz/build/debug/rzrz test <project>      # or --all
+./projects/rzrz/build/debug/rzrz run <project> -- <program args>
+./projects/rzrz/build/debug/rzrz clean <project>     # or --all
+./projects/rzrz/build/debug/rzrz compare tier2
 ```
 
 `--help` reports:
@@ -53,28 +59,44 @@ All four commands above were measured at exit 0 on 2026-09-12.
 rz - Unified workspace CLI for the Ritz ecosystem
 
 Usage:
-    rz build [PROJECT]     Build a project (or all with --all)
-    rz test [PROJECT]      (not implemented: use ./rz test)
-    rz run PROJECT         (not implemented: use ./rz run)
-    rz list                List all projects in workspace
-    rz clean [PROJECT]     (not implemented: use ./rz clean)
-    rz compare [TIER]      (not implemented)
+    rz build [PROJECT]          Build a project (or all with --all)
+    rz test [PROJECT]           Test a project (or all with --all)
+    rz run PROJECT [-- ARGS]    Build and run a project
+    rz list                     List all projects in workspace
+    rz clean [PROJECT]          Remove build artifacts (or all with --all)
+    rz compare [TIER]           Compare ritz0 vs ritz1 on example TIER
 
 Options:
-    --all                  Apply to all projects
-    --release              Build with release profile
-    --help, -h             Show this help message
-    --version, -V          Show version information
+    --all                       Apply to all projects
+    --release                   Build with release profile
+    --help, -h                  Show this help message
+    --version, -V               Show version information
+
+build/test/run/clean/compare run `python3 ./rz` (build, test and
+run with --compiler ritz1) from the workspace root.
 ```
 
 ## Current limitation: it re-enters Python
 
-`rzrz` does **not** compile anything itself. `build_project()`
-(`src/main.ritz:225-248`) spawns:
+`rzrz` does **not** compile anything itself. Every command but `list`,
+`--help` and `--version` runs `python3 ./rz` with the child on rzrz's own
+stdin/stdout/stderr, and exits with the child's status:
 
-```
-python3 ./rz build <project> --compiler ritz1
-```
+| rzrz                               | runs                                                |
+|------------------------------------|-----------------------------------------------------|
+| `build <p> [--release]`            | `./rz build <p> --compiler ritz1 [--release]`       |
+| `build --all`                      | the above, once per `projects/*/ritz.toml`          |
+| `test <p>` / `test --all`          | `./rz test <p>\|--all --compiler ritz1`             |
+| `run <p> [--release] [-- ARGS]`    | `./rz run <p> --compiler ritz1 [--release] [-- ARGS]` |
+| `clean <p>` / `clean --all`        | `./rz clean <p>\|--all`                             |
+| `compare [TIER]`                   | `./rz compare [TIER]`                               |
+
+Before #2790 `build` read the child's stdout to EOF and only then its
+stderr, through pipes: a child writing more than a pipe's worth (64 KiB) to
+stderr hung it. Inherited stdio can't; `test.sh` pins it with 1 MiB.
+
+`build`, `test`, `run` and `clean` without a project (`run` takes no
+`--all`) are an error and spawn nothing.
 
 So two things that are easy to assume are not true:
 
@@ -90,9 +112,9 @@ So two things that are easy to assume are not true:
 ritz1_selfhosted" until 2026-09-12; it never did.
 
 `test`, `run`, `clean` and `compare` used to print "Testing project: X" (and
-so on) and exit 0 having done nothing. Since AGAST #2460 each exits 1 with
-`rzrz: <cmd>: not implemented`; implementing them is #2790. `test.sh` pins
-every exit code.
+so on) and exit 0 having done nothing; #2460 made them exit 1, and #2790
+implemented them by delegation. `test.sh` pins every exit code and the exact
+argv each command hands `./rz`, using a fake `./rz` in a scratch directory.
 
 ## Dependencies
 

@@ -1,12 +1,15 @@
-# rz-cli - Ritz Workspace CLI
+# rzrz - the Ritz workspace CLI, written in Ritz.
 #
 # Usage:
-#     rz build [PROJECT]     Build a project (or all with --all)
-#     rz test [PROJECT]      (not implemented: use ./rz test)
-#     rz run PROJECT         (not implemented: use ./rz run)
-#     rz list                List all projects in workspace
-#     rz clean [PROJECT]     (not implemented: use ./rz clean)
-#     rz compare [TIER]      (not implemented)
+#     rzrz build [PROJECT]          Build a project (or all with --all)
+#     rzrz test [PROJECT]           Test a project (or all with --all)
+#     rzrz run PROJECT [-- ARGS]    Build and run a project
+#     rzrz list                     List all projects in workspace
+#     rzrz clean [PROJECT]          Remove a project's build/ (or all with --all)
+#     rzrz compare [TIER]           ritz0 vs ritz1 dashboard over example TIER
+#
+# Everything except list/--help/--version delegates to `python3 ./rz <cmd>`
+# in the current directory and exits with its status (AGAST #2790).
 
 import ritzlib.sys
 import ritzlib.io
@@ -16,87 +19,8 @@ import ritzlib.string
 import ritzlib.strview
 import ritzlib.process
 import ritzlib.gvec
-
-# ============================================================================
-# Command Enum
-# ============================================================================
-
-const CMD_NONE: i32 = 0
-const CMD_BUILD: i32 = 1
-const CMD_TEST: i32 = 2
-const CMD_RUN: i32 = 3
-const CMD_LIST: i32 = 4
-const CMD_CLEAN: i32 = 5
-const CMD_COMPARE: i32 = 6
-const CMD_HELP: i32 = 7
-const CMD_VERSION: i32 = 8
-
-# ============================================================================
-# Argument Parsing
-# ============================================================================
-
-struct Args
-    command: i32
-    project: *u8
-    all_projects: i32
-    release_mode: i32
-    tier: *u8
-
-fn parse_args(argc: i32, argv: **u8) -> Args
-    var args: Args
-    args.command = CMD_HELP
-    args.project = null
-    args.all_projects = 0
-    args.release_mode = 0
-    args.tier = null
-
-    if argc < 2
-        return args
-
-    # Parse command
-    let cmd: *u8 = argv[1]
-
-    if strcmp(cmd, c"build") == 0
-        args.command = CMD_BUILD
-    else if strcmp(cmd, c"test") == 0
-        args.command = CMD_TEST
-    else if strcmp(cmd, c"run") == 0
-        args.command = CMD_RUN
-    else if strcmp(cmd, c"list") == 0
-        args.command = CMD_LIST
-    else if strcmp(cmd, c"clean") == 0
-        args.command = CMD_CLEAN
-    else if strcmp(cmd, c"compare") == 0
-        args.command = CMD_COMPARE
-    else if strcmp(cmd, c"--help") == 0 or strcmp(cmd, c"-h") == 0
-        args.command = CMD_HELP
-    else if strcmp(cmd, c"--version") == 0 or strcmp(cmd, c"-V") == 0
-        args.command = CMD_VERSION
-    else
-        # Unknown command: an error, never help-and-exit-0 (#2460)
-        eprints_cstr("Error: Unknown command '")
-        eprints_cstr(cmd)
-        eprints_cstr("'\n")
-        args.command = CMD_NONE
-
-    # Parse remaining arguments
-    var i: i32 = 2
-    while i < argc
-        let arg: *u8 = argv[i]
-
-        if strcmp(arg, c"--all") == 0
-            args.all_projects = 1
-        else if strcmp(arg, c"--release") == 0
-            args.release_mode = 1
-        else if *(arg + 0) != 45  # Not starting with '-'
-            if args.project == null
-                args.project = arg
-            else if args.tier == null
-                args.tier = arg
-
-        i += 1
-
-    args
+import ritzlib.os.env
+import src.args
 
 # ============================================================================
 # Commands
@@ -106,18 +30,21 @@ fn print_help()
     prints_cstr("rz - Unified workspace CLI for the Ritz ecosystem\n")
     prints_cstr("\n")
     prints_cstr("Usage:\n")
-    prints_cstr("    rz build [PROJECT]     Build a project (or all with --all)\n")
-    prints_cstr("    rz test [PROJECT]      (not implemented: use ./rz test)\n")
-    prints_cstr("    rz run PROJECT         (not implemented: use ./rz run)\n")
-    prints_cstr("    rz list                List all projects in workspace\n")
-    prints_cstr("    rz clean [PROJECT]     (not implemented: use ./rz clean)\n")
-    prints_cstr("    rz compare [TIER]      (not implemented)\n")
+    prints_cstr("    rz build [PROJECT]          Build a project (or all with --all)\n")
+    prints_cstr("    rz test [PROJECT]           Test a project (or all with --all)\n")
+    prints_cstr("    rz run PROJECT [-- ARGS]    Build and run a project\n")
+    prints_cstr("    rz list                     List all projects in workspace\n")
+    prints_cstr("    rz clean [PROJECT]          Remove build artifacts (or all with --all)\n")
+    prints_cstr("    rz compare [TIER]           Compare ritz0 vs ritz1 on example TIER\n")
     prints_cstr("\n")
     prints_cstr("Options:\n")
-    prints_cstr("    --all                  Apply to all projects\n")
-    prints_cstr("    --release              Build with release profile\n")
-    prints_cstr("    --help, -h             Show this help message\n")
-    prints_cstr("    --version, -V          Show version information\n")
+    prints_cstr("    --all                       Apply to all projects\n")
+    prints_cstr("    --release                   Build with release profile\n")
+    prints_cstr("    --help, -h                  Show this help message\n")
+    prints_cstr("    --version, -V               Show version information\n")
+    prints_cstr("\n")
+    prints_cstr("build/test/run/clean/compare run `python3 ./rz` (build, test and\n")
+    prints_cstr("run with --compiler ritz1) from the workspace root.\n")
 
 fn print_version()
     prints_cstr("rz 0.1.0 (ritz1 bootstrap)\n")
@@ -165,9 +92,113 @@ fn cmd_list() -> i32
     prints_cstr(" projects found\n")
     0
 
-fn cmd_build(args: Args) -> i32
-    if args.project == null and args.all_projects == 0
+# `python3 ./rz <cmd>`: the start of every argv handed to delegate().
+fn rz_argv(cmd: *u8) -> Vec<*u8>
+    var v: Vec<*u8> = vec_new<*u8>()
+    vec_push<*u8>(@&v, c"python3")
+    vec_push<*u8>(@&v, c"./rz")
+    vec_push<*u8>(@&v, cmd)
+    v
+
+# Run argv (from rz_argv) with OUR stdin/stdout/stderr, then drop it, and
+# return the child's exit status (128+N if killed by signal N). Inherited
+# stdio, not pipes: `run` may start an interactive program, and draining
+# two pipes in turn can deadlock once the unread one fills.
+#
+# Callers build the whole argv, so nothing here indexes through
+# `vec_as_ptr(...) + i`: ritz1 does not scale that (AGAST #2791).
+fn delegate(argv: @&Vec<*u8>) -> i32
+    vec_push<*u8>(argv, null)
+
+    # Resolved before fork: both may allocate.
+    let envp: **u8 = env_raw_envp()
+    var path_buf: [4096]u8
+    var cmd_path: *u8 = find_command_in_path(c"python3", @path_buf[0], 4096)
+    if cmd_path == null
+        cmd_path = c"python3"
+
+    let pid: i32 = sys_fork()
+    if pid < 0
+        vec_drop<*u8>(argv)
+        eprints_cstr("Error: Could not spawn python3 ./rz\n")
+        return 1
+    if pid == 0
+        sys_execve(cmd_path, vec_as_ptr<*u8>(argv), envp)
+        sys_exit(127)
+
+    vec_drop<*u8>(argv)
+    var status: i32 = 0
+    if sys_wait4(pid, @status, 0, null) < 0
+        eprints_cstr("Error: Could not wait for python3 ./rz\n")
+        return 1
+    let sig: i32 = status & 127
+    if sig == 0
+        return (status / 256) & 255
+    128 + sig
+
+# `--compiler ritz1`: rzrz is the third matrix column, so the compiles it
+# drives MUST go through ritz1, not the default ritz0. See
+# docs/STACK_MATRIX.md.
+fn push_ritz1(v: @&Vec<*u8>)
+    vec_push<*u8>(v, c"--compiler")
+    vec_push<*u8>(v, c"ritz1")
+
+fn need_project(args: Args, allow_all: i32) -> i32
+    if args.project != null
+        return 0
+    if allow_all != 0 and args.all_projects != 0
+        return 0
+    if allow_all != 0
         eprints_cstr("Error: Specify a project or use --all\n")
+    else
+        eprints_cstr("Error: Specify a project\n")
+    1
+
+# `<cmd> <project>` or `<cmd> --all`, then `--compiler ritz1` if with_ritz1.
+fn delegate_project(cmd: *u8, args: Args, with_ritz1: i32) -> i32
+    if need_project(args, 1) != 0
+        return 1
+    var v: Vec<*u8> = rz_argv(cmd)
+    if args.project != null
+        vec_push<*u8>(@&v, args.project)
+    else
+        vec_push<*u8>(@&v, c"--all")
+    if with_ritz1 != 0
+        push_ritz1(@&v)
+    delegate(@&v)
+
+fn cmd_test(args: Args) -> i32
+    delegate_project(c"test", args, 1)
+
+fn cmd_clean(args: Args) -> i32
+    # ./rz clean takes no --compiler.
+    delegate_project(c"clean", args, 0)
+
+fn cmd_run(args: Args, argc: i32, argv: **u8) -> i32
+    if need_project(args, 0) != 0
+        return 1
+    var v: Vec<*u8> = rz_argv(c"run")
+    vec_push<*u8>(@&v, args.project)
+    push_ritz1(@&v)
+    if args.release_mode != 0
+        vec_push<*u8>(@&v, c"--release")
+    if args.rest_index != 0
+        vec_push<*u8>(@&v, c"--")
+        var i: i32 = args.rest_index
+        while i < argc
+            vec_push<*u8>(@&v, argv[i])
+            i += 1
+    delegate(@&v)
+
+fn cmd_compare(args: Args) -> i32
+    # The first positional is the tier; ./rz defaults it to tier1.
+    var v: Vec<*u8> = rz_argv(c"compare")
+    if args.project != null
+        vec_push<*u8>(@&v, args.project)
+    delegate(@&v)
+
+fn cmd_build(args: Args) -> i32
+    if need_project(args, 1) != 0
         return 1
 
     if args.all_projects == 1
@@ -221,68 +252,18 @@ fn cmd_build(args: Args) -> i32
     # Build single project
     return build_project(args.project, args.release_mode)
 
+# python3 ./rz build <project> --compiler ritz1 [--release]
 fn build_project(name: *u8, release: i32) -> i32
     prints_cstr("Building: ")
     prints_cstr(name)
     prints_cstr("\n")
 
-    # Use python3 to run the rz script
-    # python3 ./rz build <project> --compiler ritz1 [--release]
-    #
-    # rzrz is the third matrix column — its child compiles MUST go through
-    # ritz1, not the default ritz0. See docs/STACK_MATRIX.md.
-    var argv: [8]*u8
-    argv[0] = c"python3"
-    argv[1] = c"./rz"
-    argv[2] = c"build"
-    argv[3] = name
-    argv[4] = c"--compiler"
-    argv[5] = c"ritz1"
+    var v: Vec<*u8> = rz_argv(c"build")
+    vec_push<*u8>(@&v, name)
+    push_ritz1(@&v)
     if release != 0
-        argv[6] = c"--release"
-        argv[7] = null
-    else
-        argv[6] = null
-
-    # spawn_args passes a null envp, which spawn_full resolves to OUR
-    # environment: the child ./rz needs PATH and RITZ_PATH (AGAST #1750).
-    var proc: Process = spawn_args(c"python3", @argv[0])
-    if process_valid(@proc) == 0
-        eprints_cstr("Error: Could not spawn build process\n")
-        return 1
-
-    # Read and print stdout
-    var stdout: Vec<u8> = process_read_stdout_all(@proc)
-    if vec_len<u8>(@stdout) > 0
-        let data: *u8 = vec_as_ptr<u8>(@stdout)
-        sys_write(STDOUT, data, vec_len<u8>(@stdout))
-    vec_drop<u8>(@&stdout)
-
-    # Also read stderr
-    var stderr: Vec<u8> = process_read_stderr_all(@proc)
-    if vec_len<u8>(@stderr) > 0
-        let err_data: *u8 = vec_as_ptr<u8>(@stderr)
-        sys_write(STDERR, err_data, vec_len<u8>(@stderr))
-    vec_drop<u8>(@&stderr)
-
-    # Wait for completion
-    let result: ProcessResult = process_wait(@proc)
-    process_close_pipes(@proc)
-
-    if result_success(@result) != 0
-        return 0
-    return 1
-
-# test, run, clean and compare are not implemented (AGAST #2790). They used
-# to print "Testing project: X" and return 0 having done nothing; a false
-# success is worse than an error (#2460). Use the Python `./rz` meanwhile.
-fn cmd_not_implemented(name: *u8) -> i32
-    eprints_cstr("rzrz: ")
-    eprints_cstr(name)
-    eprints_cstr(": not implemented (use ./rz ")
-    eprints_cstr(name)
-    eprints_cstr("; AGAST #2790)\n")
-    1
+        vec_push<*u8>(@&v, c"--release")
+    delegate(@&v)
 
 # ============================================================================
 # Main
@@ -302,13 +283,13 @@ fn main(argc: i32, argv: **u8) -> i32
     if args.command == CMD_BUILD
         return cmd_build(args)
     if args.command == CMD_TEST
-        return cmd_not_implemented("test")
+        return cmd_test(args)
     if args.command == CMD_RUN
-        return cmd_not_implemented("run")
+        return cmd_run(args, argc, argv)
     if args.command == CMD_CLEAN
-        return cmd_not_implemented("clean")
+        return cmd_clean(args)
     if args.command == CMD_COMPARE
-        return cmd_not_implemented("compare")
+        return cmd_compare(args)
 
     # CMD_NONE: parse_args already named the unknown command.
     eprints_cstr("Run 'rzrz --help' for usage\n")
