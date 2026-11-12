@@ -88,7 +88,7 @@ stays here; remote hosts only run rooms.
 | omegalisk | (local: `systemctl`, `git worktree`) | 2 | yes | 12 cores, 15 GB, WSL |
 | toffee | `adele-toffee` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~10 GB free. Linger on, `llvmlite` and `lld` 21 installed, smoke passes. First remote trial host |
 | starbux | `adele-starbux` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~9 GB free beside `adele`'s rooms. Smoke passes; `lld` is a user-local copy (`~/.local/opt/lld-21`). Hold lifted by Aaron 2026-11-11 (first room #2577) |
-| chungus | `adele-chungus` | 1 | no | 8 cores, 14 GB, only ~5 GB free (another user's desktop session) and 47 GB disk. Smoke passes. Not ready until Aaron says so |
+| chungus | `adele-chungus` | 1 | yes (2026-11-12) | 8 cores, 14 GB, ~5-8 GB free (another user's desktop session) and 47 GB disk free (95% used). Smoke passes. `clang`/`lld`/`llvm` 21.1.8; `lld` is a user-local copy (`~/.local/opt/lld-21`). Approved by Aaron 2026-11-12 |
 | huburght | `adele-huburght` | 1 (trial) | yes (2026-11-11) | 12 cores, 47 GB, WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. First room #2582; 2 slots once it merges cleanly. Coarse mtime clock (#2689) |
 
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
