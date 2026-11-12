@@ -2513,3 +2513,145 @@ fn test_ed25519_pubkey_non_canonical_rejected() -> i32
     if ed25519_pubkey_ok(@nc[0]) != 0
         return 5
     return 0
+
+# ============================================================================
+# AGAST #2780: small-order / non-canonical R (libsodium rejects both)
+# ============================================================================
+
+# A small-order R can verify. Take a mixed-order key A = [a]B + T, where T is
+# the small-order point that R encodes, and s = k*a mod l. Then
+#   [s]B - [k]A = -[k]T,
+# which is T (= R) whenever k = -1 mod 8 (the order of T divides 8). Before
+# #2780 every one of these 8 signatures verified; libsodium refuses them all.
+# Index 0 (R = identity) needs no torsion: with k*a, [s]B - [k]A is the
+# identity for any k.
+[[test]]
+fn test_ed25519_rejects_small_order_r() -> i32
+    var a: [32]u8
+    var i: i32 = 0
+    while i < 32
+        a[i] = (i * 11 + 5) as u8
+        i += 1
+    a[31] = 0x0f  # a < l
+    var aB: Ge25519
+    ge_scalarmult_base(@aB, @a[0])
+
+    var zero: [32]u8
+    so_fill(@zero[0], 0, 0)
+    var sig: [64]u8
+    var pk: [32]u8
+    var T: Ge25519
+    var A: Ge25519
+    var msg: [1]u8
+    var k_hash: [64]u8
+    var ctx: Sha512
+    var idx: i32 = 0
+    while idx < 8
+        small_order_encoding(@sig[0], idx)  # R = T
+        if ge_frombytes(@T, @sig[0]) != 0
+            return 200 + idx
+        ge_add(@A, @aB, @T)
+        ge_tobytes(@pk[0], @A)
+        if ed25519_pubkey_ok(@pk[0]) != 1
+            return 300 + idx  # mixed-order A is a legitimate key
+        # find a message whose challenge k is -1 mod 8
+        var m: i32 = 0
+        var found: i32 = 0
+        while m < 256 && found == 0
+            msg[0] = m as u8
+            sha512_init(@ctx)
+            sha512_update(@ctx, @sig[0], 32)
+            sha512_update(@ctx, @pk[0], 32)
+            sha512_update(@ctx, @msg[0], 1)
+            sha512_final(@ctx, @k_hash[0])
+            sc_reduce(@k_hash[0])
+            if (k_hash[0] & 7) == 7
+                found = 1
+            else
+                m += 1
+        if found == 0
+            return 100 + idx
+        sc_muladd(@sig[32], @k_hash[0], @a[0], @zero[0])  # s = k*a
+        if ed25519_verify(@sig[0], @msg[0], 1, @pk[0]) != 0
+            return 1 + idx
+        idx += 1
+    return 0
+
+# Control for the construction above: the same key and message with an
+# honest signature still verify, and so does a real key's real signature.
+[[test]]
+fn test_ed25519_r_check_keeps_honest_signatures() -> i32
+    var seed: [32]u8
+    var i: i32 = 0
+    while i < 32
+        seed[i] = (i * 13 + 9) as u8
+        i += 1
+    var pk: [32]u8
+    var sk: [64]u8
+    ed25519_keygen(@pk[0], @sk[0], @seed[0])
+    var msg: [3]u8
+    msg[0] = 120
+    msg[1] = 121
+    msg[2] = 122
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 3, @sk[0])
+    if ed25519_verify(@sig[0], @msg[0], 3, @pk[0]) != 1
+        return 1
+    if ed25519_point_ok(@sig[0]) != 1
+        return 2  # an honest R is canonical and of large order
+    return 0
+
+# R encodings libsodium refuses: the 8 small-order points, their
+# non-canonical aliases (y >= p, x = "-0"), and the y + p twin of a
+# large-order point. Each is refused by ed25519_point_ok, and a signature
+# carrying it is refused by ed25519_verify.
+[[test]]
+fn test_ed25519_rejects_non_canonical_r() -> i32
+    var seed: [32]u8
+    var i: i32 = 0
+    while i < 32
+        seed[i] = (i * 17 + 2) as u8
+        i += 1
+    var pk: [32]u8
+    var sk: [64]u8
+    ed25519_keygen(@pk[0], @sk[0], @seed[0])
+    var msg: [2]u8
+    msg[0] = 111
+    msg[1] = 107
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 2, @sk[0])
+    if ed25519_verify(@sig[0], @msg[0], 2, @pk[0]) != 1
+        return 1  # control
+
+    var idx: i32 = 0
+    while idx < 12
+        small_order_encoding(@sig[0], idx)
+        if ed25519_point_ok(@sig[0]) != 0
+            return 10 + idx
+        if ed25519_verify(@sig[0], @msg[0], 2, @pk[0]) != 0
+            return 30 + idx
+        idx += 1
+
+    # y + p twin of a large-order point with small y
+    var canon: [32]u8
+    var probe: Ge25519
+    var y: i32 = 2
+    var found: i32 = 0
+    while y < 19 && found == 0
+        so_fill(@canon[0], 0, 0)
+        canon[0] = y as u8
+        if ge_frombytes(@probe, @canon[0]) == 0
+            found = 1
+        else
+            y += 1
+    if found == 0
+        return 2
+    if ed25519_point_ok(@canon[0]) != 1
+        return 3  # control: canonical, large order
+    so_fill(@sig[0], 0xff, 0x7f)
+    sig[0] = (0xed + y) as u8
+    if ed25519_point_ok(@sig[0]) != 0
+        return 4
+    if ed25519_verify(@sig[0], @msg[0], 2, @pk[0]) != 0
+        return 5
+    return 0
