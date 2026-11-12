@@ -587,13 +587,12 @@ def cas_object(src: Path, out_obj: Path, *, project_root: Path,
     # compile it once between them.
     ident = cas.module_identity(src)
     try:
-        stored, built = cas.ArtifactStore().get_or_build(
-            key, "o", build_fn, identity=ident,
+        # AGAST #2794: fetch, so a hit gc'd before the copy rebuilds.
+        cas.ArtifactStore().fetch(
+            key, "o", build_fn, out_obj, identity=ident,
             meta={"module": ident, "compiler": "ritz0"})
     except cas.BuildFailed as e:
         return str(e)
-    if not built:
-        shutil.copyfile(stored, out_obj)
     return None
 
 
@@ -1668,12 +1667,10 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
             # that still misses under the key's lock compiles.
             ident = cas.module_identity(src)
             try:
-                stored, built = store.get_or_build(
-                    cas_key, "o", build_fn, identity=ident,
-                    meta={"module": ident, "compiler": compiler})
+                # AGAST #2794: fetch, so a hit gc'd before the copy rebuilds.
+                store.fetch(cas_key, "o", build_fn, obj_path, identity=ident,
+                            meta={"module": ident, "compiler": compiler})
                 failure = None
-                if not built:
-                    shutil.copyfile(stored, obj_path)
             except cas.BuildFailed as e:
                 failure = e.args[0]
 

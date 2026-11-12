@@ -85,6 +85,9 @@ KEY_SCHEMA = "ritz-cas-v1"
 # compiler fingerprint's worth of ritzlib, ritz1 and test closures), so 4 GiB
 # keeps several compiler versions -- other worktrees, a bisect -- warm.
 DEFAULT_GC_BYTES = 4 * 1024 ** 3
+# ArtifactStore.fetch: hits lost to a concurrent gc before giving up. Each
+# retry after the first rebuilds under the key's lock, so 2 is the norm.
+_FETCH_ATTEMPTS = 5
 
 
 def default_max_bytes() -> int:
@@ -406,6 +409,29 @@ class ArtifactStore:
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
+    def fetch(self, key: str, ext: str, build_fn: Callable[[], Dict[str, Path]],
+              dest: Path, *, identity: str = "", meta: Optional[dict] = None) -> bool:
+        """`get_or_build`, then copy a hit out to `dest`. Returns `built`.
+
+        `build_fn` must write its `ext` output to `dest` itself, as build.py's
+        do. A hit is not locked against gc: another gate's `gc()` may unlink
+        the object between the hit and the copy (AGAST #2794). That object is
+        gone from the store, so it is treated as the miss it now is: go round
+        again, and `get_or_build` rebuilds it under the key's lock.
+        """
+        for _ in range(_FETCH_ATTEMPTS):
+            stored, built = self.get_or_build(key, ext, build_fn, identity=identity, meta=meta)
+            if built:
+                return True
+            try:
+                shutil.copyfile(stored, dest)
+                return False
+            except FileNotFoundError:
+                if not Path(dest).parent.is_dir():
+                    raise  # the destination is missing, not the stored object
+        raise FileNotFoundError(f"{key[:12]}.{ext} vanished from {self.root} "
+                                f"{_FETCH_ATTEMPTS} times between hit and copy")
+
     def _hit(self, p: Path) -> Path:
         STATS.hits += 1
         try:
@@ -428,7 +454,10 @@ class ArtifactStore:
         for p in objects.rglob("*"):
             if not p.is_file() or p.name.startswith("."):
                 continue
-            st = p.stat()
+            try:
+                st = p.stat()
+            except FileNotFoundError:
+                continue  # a concurrent gc removed it after is_file() (AGAST #2794)
             files.append((st.st_mtime, st.st_size, p))
             total += st.st_size
         files.sort()
