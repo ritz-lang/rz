@@ -140,7 +140,8 @@ READS = {
 }
 
 # Each fails on ritz1 with no reference in sight, or only behind a `*C`.
-READ_GAPS = {"if_arm": 2288, "match_arm": 2288, "reference_binding": 2358}
+# `reference_binding` through a `*C` (`let q = r`) closed by #2596.
+READ_GAPS = {"if_arm": 2288, "match_arm": 2288}
 
 MOVE = """\
 var DROPS: i32 = 0
@@ -378,8 +379,6 @@ def _read_params():
         for ref in _ids(REFS):
             for compiler in COMPILERS:
                 gap = READ_GAPS.get(site) if compiler != "ritz0" else None
-                if site == "reference_binding" and ref != "pointer":
-                    gap = None
                 marks = [pytest.mark.xfail(strict=True, reason=f"AGAST #{gap}")] if gap else []
                 yield pytest.param(site, ref, compiler, marks=marks)
 

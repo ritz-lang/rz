@@ -126,24 +126,29 @@ PTR_SETUP = (
     "    var i: i64 = 1\n"
 )
 
-# The let's initialiser, each naming element 1 (E{3,4}).
+# The let's initialiser -> the element it names, k.
 INITS = {
-    "generic_call": "vec_as_ptr<E>(@v) + 1",
-    "generic_call_index": "vec_as_ptr<E>(@v) + i",
-    "parenthesised": "(vec_as_ptr<E>(@v) + 1)",
-    "chain": "vec_as_ptr<E>(@v) + 2 - 1",
-    "plain_call": "mkp(@v) + 1",
-    "local": "p + 1",
-    "local_chain": "p + i + 1 - 1",
+    "generic_call": ("vec_as_ptr<E>(@v) + 1", 1),
+    "generic_call_index": ("vec_as_ptr<E>(@v) + i", 1),
+    "parenthesised": ("(vec_as_ptr<E>(@v) + 1)", 1),
+    "chain": ("vec_as_ptr<E>(@v) + 2 - 1", 1),
+    "plain_call": ("mkp(@v) + 1", 1),
+    "local": ("p + 1", 1),
+    "local_chain": ("p + i + 1 - 1", 1),
+    # #2596: a plain copy of a `*E` local, and the `*E` field of an inferred
+    # generic Vec, bare or offset.
+    "copy": ("p", 0),
+    "vec_field": ("v.data", 0),
+    "vec_field_offset": ("v.data + 1", 1),
 }
 
-# How main uses `e`, and what ritz0 returns for element 1.
+# How main uses `e` (element k is E{2k+1, 2k+2}), and what ritz0 returns.
 USES = {
-    "address_of_field": ("    rd(@e.b) as i32\n", 4),
-    "field": ("    e.b as i32\n", 4),
-    "field_store": ("    e.b = 40\n    v[1].b as i32\n", 40),
-    "next_element": ("    (*(e + 1)).a as i32\n", 5),
-    "deref": ("    let c = *e\n    c.a as i32\n", 3),
+    "address_of_field": ("    rd(@e.b) as i32\n", lambda k: 2 * k + 2),
+    "field": ("    e.b as i32\n", lambda k: 2 * k + 2),
+    "field_store": ("    e.b = 40\n    v[{k}].b as i32\n", lambda k: 40),
+    "next_element": ("    (*(e + 1)).a as i32\n", lambda k: 2 * k + 3),
+    "deref": ("    let c = *e\n    c.a as i32\n", lambda k: 2 * k + 1),
 }
 
 
@@ -152,7 +157,9 @@ USES = {
 # stored 8 bytes (over element 2 for a `*i32`) and `e + 1` stepped one byte.
 # `*i64` stores were right by luck (the let's i64 default is its width).
 SCALAR_INITS = {"generic_call": "vec_as_ptr<{T}>(@w) + 1", "local": "q + 1",
-                "chain": "q + 2 - 1", "local_chain": "q + i + 1 - 1"}
+                "chain": "q + 2 - 1", "local_chain": "q + i + 1 - 1",
+                # #2596: a plain copy of a `*T` local, and a Vec's `*T` field.
+                "copy": "q1", "vec_field": "w.data + 1"}
 
 # How main uses `e`, and what ritz0 returns.
 SCALAR_USES = {
@@ -167,6 +174,7 @@ SCALAR_TYPES = ["i64", "i32", "i16", "u8"]
 def _scalar(ty: str, init: str, use: str) -> str:
     body = (f"    var w = vec_new<{ty}>()\n    w.push(5)\n    w.push(7)\n    w.push(9)\n"
             f"    let q: *{ty} = vec_as_ptr<{ty}>(@w)\n"
+            f"    let q1: *{ty} = q + 1\n"
             "    var i: i64 = 1\n"
             f"    let e = {SCALAR_INITS[init].format(T=ty)}\n"
             f"{SCALAR_USES[use][0]}")
@@ -189,7 +197,9 @@ def test_an_inferred_scalar_pointer(run_with, ty, init, use, compiler):
 @pytest.mark.parametrize("use", sorted(USES))
 @pytest.mark.parametrize("init", sorted(INITS))
 def test_an_inferred_struct_pointer(run_with, init, use, compiler):
-    """`let e = <*E> ± k` is a `*E`, exactly as if annotated."""
+    """`let e = <*E> ± k` (or a plain `*E` copy) is a `*E`, as if annotated."""
+    init_expr, k = INITS[init]
     body, want = USES[use]
-    program = f"{PTR_HEADER}pub fn main() -> i32\n{PTR_SETUP}    let e = {INITS[init]}\n{body}"
-    assert run_with(compiler, f"{init}_{use}", program) == want
+    program = (f"{PTR_HEADER}pub fn main() -> i32\n{PTR_SETUP}    let e = {init_expr}\n"
+               f"{body.format(k=k)}")
+    assert run_with(compiler, f"{init}_{use}", program) == want(k)

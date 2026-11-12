@@ -261,7 +261,8 @@ DEPTH_GAPS |= {"let_shared_ptr_ptr_store", "inferred_from_ptr_ptr", "tag_through
                "let_annotated_deep", "copy_deep", "field_borrowed_through_levels"}
 
 # ritz1 refuses these (#2399).
-LOWERING_GAPS = {"lent_ptr.copy_read", "lent_ptr.copy_store", "returned_read", "returned_store",
+# `lent_ptr.copy_*` (`let r = p` of a `*S`) closed by #2596.
+LOWERING_GAPS = {"returned_read", "returned_store",
                  "returned_ptr_ptr_read", "global_shared_ptr_read", "field_shared_ptr_read",
                  "field_mut_ptr_store", "ptr_to_shared_read", "ptr_to_mut_store",
                  "shared_to_shared_read", "shared_to_mut_read", "mut_to_mut_store"}

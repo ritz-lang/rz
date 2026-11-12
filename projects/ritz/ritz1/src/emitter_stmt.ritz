@@ -764,6 +764,20 @@ fn emit_tuple_decl(s: *EmitterState, stmt: *Stmt)
     tuple_bind_field(s, f0, sname, slen, init_reg, 0, stmt.var_name, stmt.var_name_len)
     tuple_bind_field(s, f1, sname, slen, init_reg, 1, stmt.assign_target, stmt.assign_target_len)
 
+# AGAST #2575 / #2596: type an un-annotated let as the `*T` that
+# ptr_root_pointee / ptr_arith_pointee resolved: `kind` is TYPE_STRUCT (with
+# the struct's name) for a `*S`, the primitive kind for a scalar `*T`, 0 for
+# neither.  Returns TYPE_PTR once the let is typed, else 0 (stmt untouched).
+fn narrow_to_ptr(stmt: *Stmt, kind: i32, name: *u8, name_len: i32) -> i32
+    if kind == 0
+        return 0
+    stmt.var_type = TYPE_PTR
+    stmt.var_pointee_type = kind
+    if kind == TYPE_STRUCT
+        stmt.var_type_name = name
+        stmt.var_type_name_len = name_len
+    TYPE_PTR
+
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     let shared_ref: i32 = let_holds_shared_ref(s, stmt)
     # Use the user's explicit type annotation. The parser defaults
@@ -1057,6 +1071,15 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 # AGAST #1941: and q's inner pointee, so `*pp + 1` strides
                 # sizeof(S) (ptr_levels_of reads it).
                 stmt.var_inner_pointee_type = src_loc.inner_pointee_type
+            # AGAST #2596: `let e = p` with `p: *S` / `*T` -- `e` is a `*S` /
+            # `*T` too.  It was an i64 with no pointee: `e.b` "unhandled
+            # EXPR_MEMBER", `@e.b` "cannot take address".
+            else if src_loc != null and src_loc.var_type == TYPE_PTR
+                var cp_name: *u8 = null
+                var cp_len: i32 = 0
+                let cp_kind: i32 = ptr_root_pointee(s, stmt.var_init, @cp_name, @cp_len)
+                if narrow_to_ptr(stmt, cp_kind, cp_name, cp_len) != 0
+                    var_type = TYPE_PTR
             # AGAST #1600: `let s = C`, a bare unit variant -- the slot is
             # `alloca %S` like the qualified `let s = S.C` below.
             else if src_loc == null
@@ -1144,6 +1167,15 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                         stmt.var_type = TYPE_STRUCT
                         stmt.var_type_name = mf.field_type_name
                         stmt.var_type_name_len = mf.field_type_name_len
+                # AGAST #2596: a `*T` field -- `let e = v.data` of a `Vec<E>`
+                # -- is a `*T`, as if annotated (was i64: `e.b` "unhandled
+                # EXPR_MEMBER").
+                else if mf != null and mf.field_type == TYPE_PTR
+                    var fp_name: *u8 = null
+                    var fp_len: i32 = 0
+                    let fp_kind: i32 = ptr_root_pointee(s, stmt.var_init, @fp_name, @fp_len)
+                    if narrow_to_ptr(stmt, fp_kind, fp_name, fp_len) != 0
+                        var_type = TYPE_PTR
         # try-expression: `let data = read_bytes()?`. The try-emit hands back
         # the unwrapped Ok payload, which is a struct (e.g., %Vec$u8) when
         # the Result's Ok variant carries a struct.  Narrow var_type to that
@@ -1224,16 +1256,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             var pa_name: *u8 = null
             var pa_len: i32 = 0
             let pa_kind: i32 = ptr_arith_pointee(s, stmt.var_init, @pa_name, @pa_len)
-            if pa_kind == TYPE_STRUCT
+            if narrow_to_ptr(stmt, pa_kind, pa_name, pa_len) != 0
                 var_type = TYPE_PTR
-                stmt.var_type = TYPE_PTR
-                stmt.var_type_name = pa_name
-                stmt.var_type_name_len = pa_len
-                stmt.var_pointee_type = TYPE_STRUCT
-            else if pa_kind != 0
-                var_type = TYPE_PTR
-                stmt.var_type = TYPE_PTR
-                stmt.var_pointee_type = pa_kind
         # AGAST #175: address-of expression. `let task = @pool.tasks[i]` used
         # to keep var_type=TYPE_I64 with no type_name → the local was added as
         # a plain i64 binding, so later `task.field` calls find_local_struct_name

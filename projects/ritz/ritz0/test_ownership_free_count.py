@@ -527,7 +527,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, BINDING_TYPE_GAP),
+""", 1, {}),
 
     "field_binding_from_try": (SLOT + FIELDS + """\
 struct Res
