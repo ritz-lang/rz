@@ -215,6 +215,27 @@ def test_timeout_probe_reports_setup_error_when_the_limit_is_ignored(tmp_path):
 
 
 @pytest.mark.integration
+def test_timeout_probe_passes_when_timeout_dies_by_sigkill_at_the_limit(tmp_path):
+    # AGAST #2775: GNU `timeout --signal=KILL` (without --foreground) also
+    # KILLs its own process group, so `timeout` itself dies by SIGKILL. A
+    # shell reports 137; Python's returncode is -9. The limit WAS enforced.
+    env = _fake_timeout(tmp_path, 'sleep "${2%s}"\nkill -KILL $$\n')
+    out = io.StringIO()
+    assert smoke.timeout_kill_probe(out=out, env=env, **FAST) == 0
+    assert "SETUP ERROR" not in out.getvalue()
+
+
+@pytest.mark.integration
+def test_timeout_probe_reports_setup_error_when_sigkilled_after_the_limit(tmp_path):
+    # Dying by SIGKILL is only accepted on time: the overrun check stays the
+    # real test, so a timeout that ran the command out and then died fails.
+    env = _fake_timeout(tmp_path, 'shift 2\n"$@"\nkill -KILL $$\n')
+    out = io.StringIO()
+    assert smoke.timeout_kill_probe(out=out, env=env, **FAST) == smoke.EXIT_SETUP
+    assert "was not enforced" in out.getvalue()
+
+
+@pytest.mark.integration
 def test_timeout_probe_reports_setup_error_when_timeout_is_missing(tmp_path):
     out = io.StringIO()
     rc = smoke.timeout_kill_probe(out=out, env={"PATH": str(tmp_path)}, **FAST)

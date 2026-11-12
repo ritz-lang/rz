@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -209,9 +210,12 @@ def timeout_kill_probe(limit: float = 1.0, sleep: float = 3.0,
     if why is None and dt >= deadline:
         why = (f"`{' '.join(cmd)}` ran {dt:.1f} s: the {limit:g} s limit "
                f"was not enforced")
-    elif why is None and rc not in (124, 137):
-        # GNU exits 137 (killed by SIGKILL); uutils >= 0.8 exits 124.
-        why = f"`{' '.join(cmd)}` exited {rc} after {dt:.1f} s, not 124/137"
+    elif why is None and rc not in (124, 137, -signal.SIGKILL):
+        # GNU exits 137, or (without --foreground) KILLs its own process group
+        # and so dies by SIGKILL itself, which Python reports as -9 (#2775);
+        # uutils >= 0.8 exits 124. The overrun check above is the real test.
+        why = (f"`{' '.join(cmd)}` exited {rc} after {dt:.1f} s, "
+               f"not 124/137/-{int(signal.SIGKILL)}")
     if why is None:
         return 0
     print(f"  ⚠ SETUP ERROR: {why}.", file=out)
