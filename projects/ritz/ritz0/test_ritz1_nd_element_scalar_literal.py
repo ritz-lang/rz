@@ -13,8 +13,11 @@ the IR, unlocated.  1-D `[3]f32` and `*f32` derefs were fine.
 
 Each program writes two neighbouring elements, then reads both back through
 every comparison and arithmetic shape a literal can sit in, so a red cell says
-which one broke (the return value) on which type and rank.  bool is pinned on
-1-D only here: an N-D bool element store is #2768.
+which one broke (the return value) on which type and rank.
+
+AGAST #2768: bool takes the comparison shapes on every rank too.  An N-D bool
+element store (`x[1][1] = true`) was refused "cannot use bool as an integer":
+the element's expression type fell to i64, so bool_check saw an integer slot.
 """
 
 import pytest
@@ -104,10 +107,11 @@ def test_nd_scalar_element_with_literal(run_with, rank, base, ty, compiler):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("base", sorted(BASES))
-def test_1d_bool_element_with_literal(run_with, base, compiler):
-    """bool on 1-D; N-D bool element stores are #2768."""
-    assert run_with(compiler, f"b_{base}", _program("1d", base, "bool")) == 42
+@pytest.mark.parametrize("rank,base", list(_cells()))
+def test_bool_element_with_literal(run_with, rank, base, compiler):
+    """bool on every rank and base (#2768)."""
+    program = _program(rank, base, "bool")
+    assert run_with(compiler, f"b_{rank}_{base}", program) == 42
 
 
 # The ticket's own repro, verbatim, plus its 3-D twin.
@@ -116,6 +120,10 @@ TICKET = {
            "    if x[1][1] != 1.5\n        return 4\n    return 9\n"),
     "3d": ("pub fn main() -> i32\n    var x: [2][2][3]f32\n    x[1][0][1] = 1.5\n"
            "    if x[1][0][1] != 1.5\n        return 4\n    return 9\n"),
+    # AGAST #2768's repro, verbatim, plus a read back.
+    "bool_2d": "pub fn main() -> i32\n    var x: [2][3]bool\n    x[1][1] = true\n    return 9\n",
+    "bool_3d": ("pub fn main() -> i32\n    var x: [2][2][3]bool\n    x[1][0][1] = true\n"
+                "    if !x[1][0][1]\n        return 4\n    return 9\n"),
 }
 
 
