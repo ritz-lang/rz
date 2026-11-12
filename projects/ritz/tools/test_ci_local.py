@@ -33,6 +33,24 @@ import ci_local  # noqa: E402
 
 
 # --------------------------------------------------------------------------
+# A real (non --dry-run) main() ends by trimming the artifact store and sets
+# RITZ_CAS_STATS_LOG in os.environ for its steps (right for a gate process).
+# In a test that meant gc() on the machine's shared ~/.cache/ritz/cas, run
+# concurrently by every xdist worker while other workers' builds read from it,
+# and a stats log leaked into the rest of the session (AGAST #2792).
+# --------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def private_cas(tmp_path, monkeypatch):
+    store = tmp_path / "cas"
+    monkeypatch.setenv("RITZ_CACHE_DIR", str(store))
+    # "" reads as unset to main(); setenv's undo restores the session's value
+    # over whatever main() writes to os.environ.
+    monkeypatch.setenv("RITZ_CAS_STATS_LOG", "")
+    return store
+
+
+# --------------------------------------------------------------------------
 # Against the real workflow
 # --------------------------------------------------------------------------
 
@@ -208,6 +226,17 @@ def test_without_fail_fast_every_step_runs(three_steps):
     """Default keeps per-step semantics: a failure is recorded, later steps run."""
     assert ci_local.main([]) == 1
     assert three_steps.exists()
+
+
+def test_a_real_run_trims_this_tests_store_not_the_shared_one(
+        three_steps, private_cas, capsys):
+    """AGAST #2792. Fails without `private_cas`: alone, the gc line names
+    ~/.cache/ritz/cas; after another real main() on the same worker, the
+    leaked RITZ_CAS_STATS_LOG suppresses the trim and there is no gc line."""
+    ci_local.main([])
+    gc = [ln for ln in capsys.readouterr().out.splitlines()
+          if ln.startswith("[ritz-cas] gc:")]
+    assert gc == [f"[ritz-cas] gc: removed 0 files, freed 0 bytes from {private_cas}"]
 
 
 def test_each_step_prints_start_and_end_with_duration(three_steps, capsys):

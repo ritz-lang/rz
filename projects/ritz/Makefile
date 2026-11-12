@@ -68,10 +68,15 @@ check-doc-examples:
 # wired into nothing — tools/test_check_no_s_strings.py had never been run by
 # make or by CI. A guard whose own tests do not run is a guard on the honour
 # system.
+#
+# Parallel like `unit` below, with the same PYTEST_J knob (AGAST #2792: 312 s
+# serial in the gate).  A test that writes a fixed path another test uses must
+# make that write safe (atomic rename, private tmp dir) or, failing that, take
+# an xdist_group mark, which --dist loadgroup honours.
 .PHONY: tools-unit
 tools-unit:
-	@echo "=== Running tools/ unit tests ==="
-	@$(PYTHON) -m pytest -q tools/
+	@echo "=== Running tools/ unit tests (-n $(PYTEST_J)) ==="
+	@$(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup tools/
 
 # Self-tests for scripts/regression.sh's own logic. Same problem as tools-unit
 # above, one layer down: scripts/test-regression-stage5.sh existed since the

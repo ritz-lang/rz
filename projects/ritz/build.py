@@ -701,15 +701,25 @@ def ensure_runtime_object(obj_path: Path) -> bool:
     if obj_path.exists() and obj_path.stat().st_mtime >= ll_path.stat().st_mtime:
         return True
 
+    # Build into a private temp file and rename it into place (AGAST #2792).
+    # The object is at a fixed path shared by every concurrent build (xdist
+    # workers, parallel rooms' tools): written in place, a second process
+    # sees an existing, newer-than-.ll, half-written object and links it.
+    # rename() is atomic on one filesystem, hence the same directory.
     obj_path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["clang", "-c", "-o", str(obj_path), str(ll_path)],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"  ✗ Failed to build runtime object {obj_path.name}:\n{result.stderr}",
-              file=sys.stderr)
-        return False
+    tmp_path = obj_path.with_name(f".{obj_path.name}.{os.getpid()}.tmp")
+    try:
+        result = subprocess.run(
+            ["clang", "-c", "-o", str(tmp_path), str(ll_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  ✗ Failed to build runtime object {obj_path.name}:\n"
+                  f"{result.stderr}", file=sys.stderr)
+            return False
+        os.replace(tmp_path, obj_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return True
 
 
