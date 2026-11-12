@@ -50,8 +50,12 @@ fn quarter_round(state: *u32, a: i64, b: i64, c: i64, d: i64) -> void
     state[c] = state[c] + state[d]
     state[b] = (state[b] ^ state[c]).rotl(7)
 
-# ChaCha20 block function - generates 64 bytes of keystream
-pub fn chacha20_block(key: *u8, counter: u32, nonce: *u8, out: *u8) -> void
+# ChaCha20 block function - generates 64 bytes of keystream.
+# Its frame holds the key and keystream, and spill slots that no mem_zero
+# reaches, so it is [[noinline]]: callers run mem_burn_stack after it returns
+# (chacha20_block below, or once after a loop of blocks). AGAST #2770.
+[[noinline]]
+fn chacha20_block_core(key: *u8, counter: u32, nonce: *u8, out: *u8) -> void
     var state: [16]u32
     var working: [16]u32
 
@@ -115,6 +119,15 @@ pub fn chacha20_block(key: *u8, counter: u32, nonce: *u8, out: *u8) -> void
         store32_le(@out[i * 4], working[i])
         i += 1
 
+    # state[4..11] is the key and working is now the keystream: neither may
+    # outlive the call (AGAST #2770). mem_zero's barrier keeps these stores.
+    mem_zero(@state[0] as *u8, 64)
+    mem_zero(@working[0] as *u8, 64)
+
+pub fn chacha20_block(key: *u8, counter: u32, nonce: *u8, out: *u8) -> void
+    chacha20_block_core(key, counter, nonce, out)
+    mem_burn_stack()
+
 # =============================================================================
 # ChaCha20 Context and API
 # =============================================================================
@@ -160,7 +173,7 @@ fn chacha20_keystream_xor(key: *u8, nonce: *u8, counter: u64, input: *u8, len: i
     var i: i64 = 0
 
     while i < len
-        chacha20_block(key, ctr as u32, nonce, @block[0])
+        chacha20_block_core(key, ctr as u32, nonce, @block[0])
         ctr += 1
 
         var j: i64 = 0
@@ -170,6 +183,8 @@ fn chacha20_keystream_xor(key: *u8, nonce: *u8, counter: u64, input: *u8, len: i
 
         i = i + 64
     mem_zero(@block[0], 64)
+    # One burn for the loop: every block_core frame sat at the same depth.
+    mem_burn_stack()
 
 # Encrypt pt_len bytes, advancing the context's counter.
 # Err(CounterExhausted) if that would take the counter past 0xFFFFFFFF; then

@@ -259,3 +259,63 @@ fn test_mem_is_zero_empty() -> i32
     let result: i32 = mem_is_zero(@buf[0], 0)
     assert result == 1, "empty buffer should return 1"
     0
+
+# ============================================================================
+# mem_burn_stack tests (AGAST #2770)
+# ============================================================================
+# A [[noinline]] callee's dead frame keeps whatever it held, including spill
+# slots no source name reaches; mem_burn_stack, called right after it returns,
+# must zero that frame. stack_holds_2770 reads the stack just below the
+# caller's frame, where the callee's frame lived.
+
+const RESIDUE_SPAN_2770: i64 = 32768
+
+[[noinline]]
+fn stack_holds_2770(pat: *u8, plen: i64) -> bool
+    var buf: [32768]u8
+    # Make buf escape so the reads below are real loads of what is there.
+    let p: *u8 = @buf[0]
+    asm x86_64:
+        nopl ({p})
+    var i: i64 = 0
+    while i + plen <= RESIDUE_SPAN_2770
+        var j: i64 = 0
+        while j < plen and buf[i + j] == pat[j]
+            j += 1
+        if j == plen
+            return true
+        i += 1
+    return false
+
+[[noinline]]
+fn scrub_2770()
+    var buf: [32768]u8
+    mem_zero(@buf[0], RESIDUE_SPAN_2770)
+
+# Leave a copy of the 16-byte secret in this function's (soon dead) frame.
+[[noinline]]
+fn leave_secret_2770(secret: *u8)
+    var copy: [16]u8
+    mem_copy(@copy[0], secret, 16)
+    let p: *u8 = @copy[0]
+    asm x86_64:
+        nopl ({p})
+
+fn fill_secret_2770(secret: *u8)
+    for i in 0..16
+        secret[i] = (0xA5 ^ (i * 29)) as u8
+
+[[test]]
+fn test_mem_burn_stack_wipes_dead_frame() -> i32
+    var secret: [16]u8
+    fill_secret_2770(@secret[0])
+    scrub_2770()
+    leave_secret_2770(@secret[0])
+    if not stack_holds_2770(@secret[0], 16)
+        return 1  # the probe must see the residue it is meant to catch
+    scrub_2770()
+    leave_secret_2770(@secret[0])
+    mem_burn_stack()
+    if stack_holds_2770(@secret[0], 16)
+        return 2
+    return 0

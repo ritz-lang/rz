@@ -524,3 +524,136 @@ fn test_chacha20_ctx_refusal_keeps_counter() -> i32
     if bytes_equal(@out[0], @expected[0], 64) == 0
         return 4
     return 0
+
+# =============================================================================
+# Secret wiping (AGAST #2770, GitHub #139)
+# =============================================================================
+# chacha20_block holds the key in its state and the keystream in its working
+# array; neither may outlive the call. stack_holds_2770 reads the stack just
+# below the caller's frame, where the callee's frames lived.
+
+const RESIDUE_SPAN_2770: i64 = 32768
+
+[[noinline]]
+fn stack_holds_2770(pat: *u8, plen: i64) -> bool
+    var buf: [32768]u8
+    # Make buf escape so the reads below are real loads of what is there.
+    let p: *u8 = @buf[0]
+    asm x86_64:
+        nopl ({p})
+    var i: i64 = 0
+    while i + plen <= RESIDUE_SPAN_2770
+        var j: i64 = 0
+        while j < plen and buf[i + j] == pat[j]
+            j += 1
+        if j == plen
+            return true
+        i += 1
+    return false
+
+# Zero the span stack_holds_2770 reads, so only later calls' residue is seen.
+[[noinline]]
+fn scrub_2770()
+    var buf: [32768]u8
+    mem_zero(@buf[0], RESIDUE_SPAN_2770)
+
+# Is any aligned 4-byte word of the `len` secret bytes at sec left on the
+# stack? Word-sized: the compiler keeps the key as eight u32 words, not
+# necessarily contiguous, so a 32-byte search misses it.
+fn secret_left_2770(sec: *u8, len: i64) -> bool
+    var i: i64 = 0
+    while i + 4 <= len
+        if stack_holds_2770(@sec[i], 4)
+            return true
+        i += 4
+    return false
+
+fn le32_2770(p: *u8) -> u32
+    (p[0] as u32) | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | ((p[3] as u32) << 24)
+
+fn put32_2770(p: *u8, v: u32)
+    p[0] = (v & 0xff) as u8
+    p[1] = ((v >> 8) & 0xff) as u8
+    p[2] = ((v >> 16) & 0xff) as u8
+    p[3] = ((v >> 24) & 0xff) as u8
+
+# The working state after the 20 rounds, before the input is added back:
+# keystream word i minus input word i. With the keystream it gives the key
+# (key word = keystream word - this word), so it must not be left either.
+fn final_rounds_2770(key: *u8, counter: u32, nonce: *u8, ks: *u8, dst: *u8)
+    var init: [16]u32
+    init[0] = 0x61707865
+    init[1] = 0x3320646e
+    init[2] = 0x79622d32
+    init[3] = 0x6b206574
+    for i in 0..8
+        init[4 + i] = le32_2770(@key[i * 4])
+    init[12] = counter
+    for i in 0..3
+        init[13 + i] = le32_2770(@nonce[i * 4])
+    for i in 0..16
+        put32_2770(@dst[i * 4], le32_2770(@ks[i * 4]) - init[i])
+
+[[test]]
+fn test_chacha20_block_wipes_key_and_keystream() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    fill_key_nonce(@key[0], @nonce[0])
+    # Expected words, computed before the scrub: final_rounds_2770 leaves
+    # them in its own frame, which the probe would then find.
+    var out: [64]u8
+    chacha20_block(@key[0], 1, @nonce[0], @out[0])
+    var rounds: [64]u8
+    final_rounds_2770(@key[0], 1, @nonce[0], @out[0], @rounds[0])
+    scrub_2770()
+    if secret_left_2770(@key[0], 32) or secret_left_2770(@rounds[0], 64)
+        return 1  # residue before the call: the probe cannot tell
+    chacha20_block(@key[0], 1, @nonce[0], @out[0])
+    if secret_left_2770(@key[0], 32)
+        return 2  # key left in state[4..11]
+    if secret_left_2770(@out[0], 64)
+        return 3  # keystream left in working
+    if secret_left_2770(@rounds[0], 64)
+        return 4  # final working state left before the add
+    return 0
+
+[[test]]
+fn test_chacha20_xor_wipes_key_and_keystream() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    fill_key_nonce(@key[0], @nonce[0])
+    # Three blocks, the last partial; with zero input the output is keystream.
+    var pt: [130]u8
+    mem_zero(@pt[0], 130)
+    var last: [64]u8
+    chacha20_block(@key[0], 9, @nonce[0], @last[0])
+    var out: [130]u8
+    scrub_2770()
+    if ok_bytes(chacha20_xor(@key[0], @nonce[0], 7, @pt[0], 130, @out[0])) != 130
+        return 1
+    if secret_left_2770(@key[0], 32)
+        return 2
+    if secret_left_2770(@out[0], 128)
+        return 3
+    if secret_left_2770(@last[0], 64)
+        return 4  # the partial block's unused keystream
+    return 0
+
+[[test]]
+fn test_chacha20_ctx_encrypt_wipes_key_and_keystream() -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    fill_key_nonce(@key[0], @nonce[0])
+    var pt: [64]u8
+    mem_zero(@pt[0], 64)
+    var out: [64]u8
+    var ctx: ChaCha20
+    chacha20_init(@ctx, @key[0], @nonce[0])
+    scrub_2770()
+    if ok_bytes(chacha20_encrypt(@ctx, @pt[0], 64, @out[0])) != 64
+        return 1
+    if secret_left_2770(@key[0], 32)
+        return 2
+    if secret_left_2770(@out[0], 64)
+        return 3
+    return 0
