@@ -239,6 +239,11 @@ def mangle_generic_name(base_name: str, type_args: List[rast.Type]) -> str:
     return f"{base_name}${arg_names}"
 
 
+# Option and Result's payloads when no ritzlib.option / ritzlib.result defines
+# them (the compiler's built-ins): (enum, variant) -> index of its type arg.
+_BUILTIN_PAYLOADS = {('Option', 'Some'): 0, ('Result', 'Ok'): 0, ('Result', 'Err'): 1}
+
+
 class Monomorphizer:
     """
     Monomorphizes generic code.
@@ -287,6 +292,10 @@ class Monomorphizer:
 
         # All struct definitions by name (for field-type inference).
         self.struct_defs: Dict[str, rast.StructDef] = {}
+
+        # All enum definitions by name, generic or not: a match arm's
+        # `Hit(x)` binds x at Hit's payload type (AGAST #2725).
+        self.enum_defs: Dict[str, rast.EnumDef] = {}
 
         # Non-generic impl methods: type name -> method name -> definition
         # (for return-type inference of `var v = b.items()`, AGAST #2095).
@@ -396,6 +405,9 @@ class Monomorphizer:
                 self.struct_defs[item.name] = item
             elif isinstance(item, rast.EnumDef) and item.is_generic():
                 self.generic_enums[item.name] = item
+                self.enum_defs[item.name] = item
+            elif isinstance(item, rast.EnumDef):
+                self.enum_defs[item.name] = item
             elif isinstance(item, rast.FnDef) and item.is_generic():
                 self.generic_functions[item.name] = item
             elif isinstance(item, rast.FnDef):
@@ -613,7 +625,15 @@ class Monomorphizer:
                 self._visit_block(expr.else_block)
         elif isinstance(expr, rast.Match):
             self._visit_expr(expr.expr)
+            scrut_type = self._infer_value_type(expr.expr)
             for arm in expr.arms:
+                # AGAST #2725: `Some(x) => x[1..3]` -- x is the payload's type
+                # in this arm, so its slice/index/method sugar registers
+                # vec_slice<T> etc. as a let of that type would.  A later arm
+                # rebinding `x` overwrites it; no other local can reuse the
+                # name in this fn (the name checker refuses it), so nothing
+                # outside the arm reads the entry.
+                self.var_types.update(self._pattern_bindings(arm.pattern, scrut_type))
                 if arm.guard:
                     self._visit_expr(arm.guard)
                 self._visit_expr(arm.body)
@@ -647,6 +667,46 @@ class Monomorphizer:
                 self._visit_expr(expr.end)
             # If base is an identifier with known Vec<T> type, register vec_slice<T>
             self._register_slice_instantiation(expr)
+
+    def _variant_payload_types(self, scrut_type: Optional[rast.Type],
+                               variant: str) -> Optional[List[rast.Type]]:
+        """Payload types of `variant` of the scrutinee's enum, substituted at
+        its type args, or None when either is unknown."""
+        while isinstance(scrut_type, (rast.PtrType, rast.RefType)):
+            scrut_type = scrut_type.inner
+        if not isinstance(scrut_type, rast.NamedType):
+            return None
+        enum_def = self.enum_defs.get(scrut_type.name)
+        if enum_def is None:
+            idx = _BUILTIN_PAYLOADS.get((scrut_type.name, variant))
+            if idx is None or idx >= len(scrut_type.args):
+                return None
+            return [scrut_type.args[idx]]
+        for v in enum_def.variants:
+            if v.name != variant:
+                continue
+            if enum_def.type_params and scrut_type.args:
+                subst = TypeSubstitution(dict(zip(enum_def.type_params, scrut_type.args)))
+                return [subst.apply(f) for f in v.fields]
+            return list(v.fields)
+        return None
+
+    def _pattern_bindings(self, pattern: rast.Pattern,
+                          scrut_type: Optional[rast.Type]) -> Dict[str, rast.Type]:
+        """Names a match pattern binds, each at its payload's type (AGAST #2725).
+
+        Only what's known is returned: an untyped binding stays unrecorded, as
+        before, rather than guessed."""
+        out: Dict[str, rast.Type] = {}
+        if isinstance(pattern, rast.IdentPattern):
+            if scrut_type is not None:
+                out[pattern.name] = scrut_type
+        elif isinstance(pattern, rast.VariantPattern) and pattern.fields:
+            payload = self._variant_payload_types(scrut_type, pattern.name)
+            if payload is not None and len(payload) == len(pattern.fields):
+                for sub, ty in zip(pattern.fields, payload):
+                    out.update(self._pattern_bindings(sub, ty))
+        return out
 
     def _register_slice_instantiation(self, expr: rast.SliceExpr) -> None:
         """Register vec_slice<T> instantiation for slice expressions on Vec types."""

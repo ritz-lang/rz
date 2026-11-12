@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
-from monomorph import resolve_alias_in
+from monomorph import mangle_type_name, resolve_alias_in
 from tail_value import slot_tails, value_gap, value_tails
 import array_rules
 import bool_rules
@@ -8677,13 +8677,12 @@ class LLVMEmitter:
         # Get element type from Vec$T name
         if type_name.startswith('Vec$'):
             elem_type_name = type_name[4:]  # Strip "Vec$"
+        elif base_ritz_type.args:
+            # An unmangled `Vec<T>`, as a built-in Option's `Some(x)` binds it
+            # (AGAST #2725): spell T as monomorph mangled vec_slice<T>.
+            elem_type_name = mangle_type_name(base_ritz_type.args[0])
         else:
-            # Try to get from type args
-            if base_ritz_type.args:
-                elem_ty = base_ritz_type.args[0]
-                elem_type_name = self._type_to_mangled_name(elem_ty)
-            else:
-                raise ValueError("Vec type without element type")
+            raise ValueError("Vec type without element type")
 
         fn_name = f"vec_slice${elem_type_name}"
         if fn_name not in self.functions:

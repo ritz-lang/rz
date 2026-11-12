@@ -28,27 +28,18 @@ run_with = slice_local.run_with
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
-# ritz0 never instantiates vec_slice<T> for a pattern-bound Vec (#2725): every
-# ritz0 cell with a Vec binding is a strict xfail, so it goes red once fixed.
-RITZ0_VEC = pytest.mark.xfail(
-    strict=True, reason="AGAST #2725: ritz0 doesn't instantiate vec_slice<T> for a pattern-bound Vec")
-
-
-def _cell(compiler, box):
-    if compiler == "ritz0" and box == "Vec":
-        return pytest.param(compiler, marks=RITZ0_VEC)
-    return compiler
+# ritz0's monomorph types a pattern binding by its payload, per arm (#2725), so
+# a pattern-bound Vec's slice instantiates vec_slice<T> on every compiler.
 
 
 def _cells(boxes):
-    """(box, compiler) pairs, ritz0's Vec ones xfail."""
-    return [pytest.param(b, c, marks=RITZ0_VEC) if (c == "ritz0" and b == "Vec") else (b, c)
-            for b in boxes for c in COMPILERS]
+    """(box, compiler) pairs."""
+    return [(b, c) for b in boxes for c in COMPILERS]
 
 # box -> (its type, how main makes `v` hold 10, 20, 30, 40, an empty one,
 #         t's length, t's element {k}).  A String's element is read through
 #         its bytes: ritz0 indexes a String only when it's a let's own slice
-#         (#2725), and that isn't what this tests.
+#         (#2779), and that isn't what this tests.
 BOXES = {
     "Vec": ("Vec<i32>",
             "    var v: Vec<i32> = vec_new<i32>()\n"
@@ -159,7 +150,7 @@ SECOND = {
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", [_cell(c, "Vec") for c in COMPILERS])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("second", sorted(SECOND))
 @pytest.mark.parametrize("first", ["A", "B"])
 def test_a_binding_is_its_own_arms(run_with, first, second, compiler):
@@ -231,3 +222,24 @@ def test_a_result_payload_after_a_nested_type(run_with, nested, compiler):
                f"        _ => return 1\n"
                f"    return 2\n")
     assert run_with(compiler, "nested", program) == 23
+
+
+# An open end, `x[1:]`: ritz0 takes the end from vec_len<T>, named by the same
+# element type as vec_slice<T> when the binding's Vec<T> is unmangled (#2725).
+# ritz0 only: `x[1:]` is ritz0's colon slice, which ritz1 doesn't parse.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0"])
+@pytest.mark.parametrize("ctor", sorted(CTORS))
+def test_an_open_ended_slice_of_a_pattern_binding(run_with, ctor, compiler):
+    ty, setup, _, _, _ = BOXES["Vec"]
+    ret, make, pat = CTORS[ctor]
+    program = (f"{HEADER}enum Got\n    Hit({ty})\n    Miss\n\n"
+               f"fn wrap(v: {ty}) -> {ret.format(T=ty)}\n    {make}(v)\n\n"
+               f"pub fn main() -> i32\n{setup}"
+               f"    match wrap(v)\n"
+               f"        {pat}(x) =>\n"
+               f"            let t = x[1:]\n"
+               f"            return t.len as i32 + t[2] as i32\n"
+               f"        _ => return 1\n"
+               f"    return 2\n")
+    assert run_with(compiler, "open", program) == 43
