@@ -93,22 +93,33 @@ def test_gc_survives_a_file_unlinked_between_is_file_and_stat(
 def test_gc_counts_a_file_another_gc_already_unlinked_as_not_freed(
     tmp_path, private_store, monkeypatch
 ):
-    """Scanned, then removed by someone else before our unlink: skipped, not counted."""
+    """Scanned, then removed by someone else before our unlink: skipped, not counted.
+
+    The race fires inside gc's own `unlink()` of the oldest file, so the scan
+    (is_file + stat) is untouched. Hooking `Path.stat` instead was
+    interpreter-dependent: on Python <= 3.13 `Path.is_file()` calls
+    `self.stat()`, so the file vanished during the scan, gc never tried to
+    unlink it, and the test saw (0, 0) on CI's 3.12 (AGAST #2828).
+    """
     store = cas.ArtifactStore(private_store)
-    keys = _populate(store, tmp_path)
+    keys = _populate(store, tmp_path)  # explicit mtimes: keys[0] oldest, keys[1] next
     oldest = store.path(keys[0], "o")
-    real_stat = Path.stat
+    real_unlink = Path.unlink
+    raced = []
 
-    def racing_stat(self, *a, **kw):
-        st = real_stat(self, *a, **kw)
+    def racing_unlink(self, *a, **kw):
         if self == oldest:
-            os.unlink(self)  # gone by the time gc tries to unlink it
-        return st
+            raced.append(self)
+            os.unlink(self)  # the concurrent gc gets there first
+        return real_unlink(self, *a, **kw)
 
-    monkeypatch.setattr(Path, "stat", racing_stat)
+    monkeypatch.setattr(Path, "unlink", racing_unlink)
 
     removed, freed = store.gc(5 * 100)
-    monkeypatch.setattr(Path, "stat", real_stat)
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    assert raced == [oldest], (
+        "gc should have scanned the oldest file and tried to unlink it"
+    )
     assert not oldest.exists()
     # Our gc did not remove the oldest file, so it went on to the next one.
     assert (removed, freed) == (1, 100)
