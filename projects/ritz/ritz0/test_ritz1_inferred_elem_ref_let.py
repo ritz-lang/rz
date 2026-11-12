@@ -93,8 +93,9 @@ def test_inferred_i32_element_ref(run_with, rank, base, binder, use, compiler):
 def test_inferred_element_ref_every_scalar(run_with, ty, use, compiler):
     """Every scalar element width, through `@&` on a local 1-D array.
 
-    1-D, not N-D: ritz1 can't yet compare an N-D f32 element with a literal
-    (#2767) or store a bool into an N-D element (#2768), both without any q.
+    1-D, not N-D: ritz1 can't yet store a bool into an N-D element (#2768),
+    even without any q.  N-D float elements beside a literal (#2767) are
+    swept in test_ritz1_nd_element_scalar_literal.py.
     """
     program = _program("1d", "local", "let_mut_ref", use, ty)
     assert run_with(compiler, f"t_{ty}_{use}", program) == 9
