@@ -4,8 +4,12 @@
 # Note: Full integration tests would require socketpair or loopback sockets.
 
 import ritzlib.sys
+import ritzlib.net
 
 import lib.encrypted_channel
+import cryptosec.x25519
+import cryptosec.random
+import cryptosec.mem
 
 # ============================================================================
 # Channel Constant Tests
@@ -112,4 +116,106 @@ fn test_max_payload_size() -> i32
 
     # Should allow at least 64KB - 32 bytes of payload
     assert max_payload > 65000
+    0
+
+# ============================================================================
+# Small-order peer key (#2772): x25519 refuses the all-zero shared secret
+# (RFC 7748 §6.1), so the handshake must fail instead of deriving keys.
+# ============================================================================
+
+fn ec_socketpair(sv: *i32) -> i32
+    return syscall4(53, 1, 1, 0, sv as i64) as i32   # SYS_socketpair(AF_UNIX, SOCK_STREAM)
+
+# Run one handshake side against a peer that sends `peer_pub`.
+# Returns the handshake result; the channel is left for the caller to inspect.
+fn ec_handshake_with_peer(ch: *EncryptedChannel, server: i32, peer_pub: *u8) -> i32
+    var sv: [2]i32
+    if ec_socketpair(@sv[0]) < 0
+        return 100
+    var sock: Socket
+    sock.fd = sv[0]
+    sock.family = 1
+    sock.socktype = 1
+    if server != 0
+        channel_init_server(ch, sock)
+    else
+        channel_init_client(ch, sock)
+    # Init leaves the symmetric keys unset; zero them so "no keys derived"
+    # is observable.
+    mem_zero(@ch.send_key[0], 32)
+    mem_zero(@ch.recv_key[0], 32)
+    # The peer's key is already queued; ours lands in sv[1]'s buffer.
+    if sys_write(sv[1], peer_pub, 32) != 32
+        return 101
+    var rc: i32 = 0
+    if server != 0
+        rc = channel_handshake_server(ch)
+    else
+        rc = channel_handshake_client(ch)
+    sys_close(sv[1])
+    return rc
+
+fn ec_all_zero(p: *u8, n: i32) -> i32
+    var i: i32 = 0
+    while i < n
+        if p[i] != 0
+            return 0
+        i += 1
+    return 1
+
+[[test]]
+fn test_client_handshake_refuses_all_zero_peer_key() -> i32
+    var zero: [32]u8
+    mem_zero(@zero[0], 32)
+    var ch: EncryptedChannel
+    let rc: i32 = ec_handshake_with_peer(@ch, 0, @zero[0])
+    assert rc < 0
+    assert rc != 100
+    assert rc != 101
+    assert ch.state == CHANNEL_STATE_ERROR
+    assert ch.last_error == CHANNEL_ERR_HANDSHAKE
+    # The refused secret never became keys.
+    assert ec_all_zero(@ch.send_key[0], 32) == 1
+    assert ec_all_zero(@ch.recv_key[0], 32) == 1
+    assert channel_send(@ch, @zero[0], 1) < 0
+    channel_free(@ch)
+    0
+
+[[test]]
+fn test_server_handshake_refuses_all_zero_peer_key() -> i32
+    var zero: [32]u8
+    mem_zero(@zero[0], 32)
+    var ch: EncryptedChannel
+    let rc: i32 = ec_handshake_with_peer(@ch, 1, @zero[0])
+    assert rc < 0
+    assert rc != 100
+    assert rc != 101
+    assert ch.state == CHANNEL_STATE_ERROR
+    assert ch.last_error == CHANNEL_ERR_HANDSHAKE
+    assert ec_all_zero(@ch.send_key[0], 32) == 1
+    assert ec_all_zero(@ch.recv_key[0], 32) == 1
+    assert channel_send(@ch, @zero[0], 1) < 0
+    channel_free(@ch)
+    0
+
+# Control: a genuine peer key still completes the handshake on both sides.
+[[test]]
+fn test_handshake_accepts_valid_peer_key() -> i32
+    var peer_priv: [32]u8
+    var peer_pub: [32]u8
+    getrandom(@peer_priv[0], 32, 0)
+    x25519_clamp(@peer_priv[0])
+    x25519_pubkey(@peer_pub[0], @peer_priv[0])
+
+    var cli: EncryptedChannel
+    assert ec_handshake_with_peer(@cli, 0, @peer_pub[0]) == 0
+    assert cli.state == CHANNEL_STATE_CONNECTED
+    assert ec_all_zero(@cli.send_key[0], 32) == 0
+    channel_free(@cli)
+
+    var srv: EncryptedChannel
+    assert ec_handshake_with_peer(@srv, 1, @peer_pub[0]) == 0
+    assert srv.state == CHANNEL_STATE_CONNECTED
+    assert ec_all_zero(@srv.send_key[0], 32) == 0
+    channel_free(@srv)
     0

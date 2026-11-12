@@ -153,6 +153,11 @@ struct M7SPSession
 var g_sessions: [256]M7SPSession
 
 
+# Session slot by index (tests reach sessions through this, not the global).
+fn m7sp_session_at(idx: i32) -> *M7SPSession
+    return @g_sessions[idx]
+
+
 fn m7sp_session_init(idx: i32)
     g_sessions[idx].in_use = 1
     g_sessions[idx].parse_state = PARSE_NEED_HEADER
@@ -221,9 +226,13 @@ fn m7sp_session_init_encrypted(idx: i32)
 # `derive_keys` in encrypted_channel.ritz: HKDF-SHA256(salt=0x00, IKM=
 # x25519(priv, peer_pub), info="mausoleum-v1") → 64 bytes; first 32 →
 # server.send (i.e. client.recv), second 32 → server.recv (client.send).
-fn cipher_derive_session_keys(session: *M7SPSession)
+# Returns 0, or -1 with nothing derived when x25519 refuses a small-order
+# peer key (all-zero secret, RFC 7748 §6.1; #2772).
+fn cipher_derive_session_keys(session: *M7SPSession) -> i32
     var shared: [32]u8
-    x25519(@shared[0], @session.cipher_private_key[0], @session.cipher_peer_pubkey[0])
+    match x25519(@shared[0], @session.cipher_private_key[0], @session.cipher_peer_pubkey[0])
+        Ok(_) => 0
+        Err(_) => return -1
 
     var prk: [32]u8
     var salt: [1]u8
@@ -254,6 +263,19 @@ fn cipher_derive_session_keys(session: *M7SPSession)
     mem_zero(@shared[0], 32)
     mem_zero(@prk[0], 32)
     mem_zero(@okm[0], 64)
+    return 0
+
+
+# Encrypted handshake step: adopt the client's 32-byte pubkey and derive
+# the session keys.  Returns 0, or -1 with the session already destroyed
+# (keys wiped, slot freed) when the peer key is refused; the caller then
+# closes the connection.
+fn m7sp_enc_accept_client_pubkey(idx: i32, peer_pub: *u8) -> i32
+    mem_copy(@g_sessions[idx].cipher_peer_pubkey[0], peer_pub, 32)
+    if cipher_derive_session_keys(@g_sessions[idx]) < 0
+        m7sp_session_destroy(idx)
+        return -1
+    return 0
 
 
 # Build a 12-byte ChaCha20-Poly1305 nonce from a u64 counter.
@@ -1139,8 +1161,8 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         # Have full client pubkey — derive session keys, then queue the
         # server's pubkey for send.  After it ships, the next recv
         # starts the encrypted post-handshake stream.
-        mem_copy(@session.cipher_peer_pubkey[0], @task.read_buf[0], 32)
-        cipher_derive_session_keys(session)
+        if m7sp_enc_accept_client_pubkey(idx, @task.read_buf[0]) < 0
+            return 1
         mem_copy(@task.write_buf[0], @session.cipher_public_key[0], 32)
 
         session.parse_state = PARSE_HANDSHAKE_SEND

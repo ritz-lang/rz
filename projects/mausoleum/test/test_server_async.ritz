@@ -1,0 +1,57 @@
+# test/test_server_async.ritz - Encrypted handshake step of the async server
+#
+# #2772: x25519 refuses a small-order client key (all-zero shared secret,
+# RFC 7748 §6.1).  The async server must close the session rather than
+# derive session keys from an unwritten secret.
+
+import ritzlib.sys
+
+import lib.server_async
+import cryptosec.x25519
+import cryptosec.random
+import cryptosec.mem
+
+fn sa_all_zero(p: *u8, n: i32) -> i32
+    var i: i32 = 0
+    while i < n
+        if p[i] != 0
+            return 0
+        i += 1
+    return 1
+
+[[test]]
+fn test_async_handshake_refuses_all_zero_client_key() -> i32
+    let idx: i32 = 7
+    m7sp_session_init_encrypted(idx)
+    let s: *M7SPSession = m7sp_session_at(idx)
+    assert s.in_use == 1
+
+    var zero: [32]u8
+    mem_zero(@zero[0], 32)
+    assert m7sp_enc_accept_client_pubkey(idx, @zero[0]) < 0
+    # Session closed: slot freed, no keys derived from the refused secret.
+    assert s.in_use == 0
+    assert sa_all_zero(@s.cipher_send_key[0], 32) == 1
+    assert sa_all_zero(@s.cipher_recv_key[0], 32) == 1
+    assert sa_all_zero(@s.cipher_private_key[0], 32) == 1
+    0
+
+# Control: a genuine client key derives keys and keeps the session open.
+[[test]]
+fn test_async_handshake_accepts_valid_client_key() -> i32
+    let idx: i32 = 8
+    m7sp_session_init_encrypted(idx)
+    let s: *M7SPSession = m7sp_session_at(idx)
+
+    var cli_priv: [32]u8
+    var cli_pub: [32]u8
+    getrandom(@cli_priv[0], 32, 0)
+    x25519_clamp(@cli_priv[0])
+    x25519_pubkey(@cli_pub[0], @cli_priv[0])
+
+    assert m7sp_enc_accept_client_pubkey(idx, @cli_pub[0]) == 0
+    assert s.in_use == 1
+    assert sa_all_zero(@s.cipher_send_key[0], 32) == 0
+    assert sa_all_zero(@s.cipher_recv_key[0], 32) == 0
+    m7sp_session_destroy(idx)
+    0
