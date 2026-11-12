@@ -414,6 +414,39 @@ fn infer_elem_ptr_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     stmt.var_inner_pointee_type = inner + (levels - 2) * PTR_DEPTH_UNIT
     return 1
 
+# AGAST #2791: `let p = f()` with `f() -> **U` (`vec_as_ptr<*U>`, or written)
+# holds what `let p: **U` does, U a scalar or a struct, so `*(p + i)` strides
+# by 8 and `**p` loads a U.  It stayed an i64: `p + i` was a raw byte add and
+# `*(p + i)` silently loaded the wrong pointer.  Monomorph spells a pointer U
+# `ptr_C` (`vec_as_ptr<**u8>` names "ptr_u8"): each `ptr_` is one more level,
+# packed as `let p: ***u8` packs it.  An unknown U is a `*U`, as the `*T`
+# record was before, so arithmetic on it is refused, not a byte add.
+# Returns the local's var_type.
+fn infer_ptr_ptr_call_let(s: *EmitterState, stmt: *Stmt, fd: *FnDef) -> i32
+    var name: *u8 = fd.return_type_name
+    var len: i32 = fd.return_type_name_len
+    if name == null or len <= 0
+        return TYPE_I64
+    var extra: i32 = 0
+    while len > 4 and memcmp(name, c"ptr_", 4) == 0
+        name = name + 4
+        len = len - 4
+        extra = extra + 1
+    var inner: i32 = primitive_type_from_name(name, len)
+    if inner == 0   # primitive_type_from_name's miss value
+        if find_struct(s, name, len) == null
+            stmt.var_type = TYPE_PTR
+            stmt.var_type_name = fd.return_type_name
+            stmt.var_type_name_len = fd.return_type_name_len
+            return TYPE_PTR
+        inner = TYPE_STRUCT
+        stmt.var_type_name = name
+        stmt.var_type_name_len = len
+    stmt.var_type = TYPE_PTR_PTR
+    stmt.var_pointee_type = TYPE_PTR
+    stmt.var_inner_pointee_type = inner + extra * PTR_DEPTH_UNIT
+    TYPE_PTR_PTR
+
 # AGAST #2335, #2338: 1 when an un-annotated `let` or `var` holds an `@T`:
 # `let p = @x`, or a copy of one from a local, a field or a call.  Ask before the
 # inference in emit_var_decl rewrites var_type, or `let p: *C = @c` looks like it.
@@ -877,7 +910,9 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type_name_len = uc_len
             else
                 fn_def = find_call_fn(s, stmt.var_init)
-            if fn_def != null and fn_def.return_type == TYPE_STRUCT
+            if fn_def != null and fn_def.return_type == TYPE_PTR_PTR
+                var_type = infer_ptr_ptr_call_let(s, stmt, fn_def)
+            else if fn_def != null and fn_def.return_type == TYPE_STRUCT
                 if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
                     var_type = TYPE_STRUCT
                     stmt.var_type = TYPE_STRUCT
