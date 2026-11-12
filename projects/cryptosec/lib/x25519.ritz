@@ -9,6 +9,7 @@
 
 import mem
 import u128
+import crypto_error
 
 # ============================================================================
 # Field element representation
@@ -683,9 +684,31 @@ pub fn x25519_clamp(scalar: *u8)
     scalar[31] = scalar[31] & 0x7f
     scalar[31] = scalar[31] | 0x40
 
-# Main X25519 function: out = scalar * point
-pub fn x25519(out: *u8, scalar: *u8, point: *u8)
-    x25519_scalarmult(out, scalar, point)
+# Main X25519 function: out = scalar * point, the 32-byte shared secret.
+#
+# Ok(32) on success. Err(SmallOrderPoint) when the result is all zero, which
+# happens exactly when `point` has small order (RFC 7748 §6.1): the secret is
+# then known to anyone, so the caller must abort the key exchange. On Err
+# nothing is written to `out`.
+pub fn x25519(out: *u8, scalar: *u8, point: *u8) -> Result<i64, CryptoError>
+    var ss: [32]u8
+    x25519_scalarmult(@ss[0], scalar, point)
+
+    # Constant-time OR-reduce: every byte is read whatever its value, and
+    # only the final verdict (public: the handshake aborts) is branched on.
+    var acc: u8 = 0
+    var i: i64 = 0
+    while i < 32
+        acc = acc | ss[i]
+        i += 1
+
+    if acc == 0
+        mem_zero(@ss[0], sizeof(ss))
+        return Err(CryptoError.SmallOrderPoint)
+
+    mem_copy(out, @ss[0], 32)
+    mem_zero(@ss[0], sizeof(ss))
+    return Ok(32)
 
 # Generate public key from private key: pubkey = scalar * basepoint
 pub fn x25519_pubkey(pubkey: *u8, privkey: *u8)

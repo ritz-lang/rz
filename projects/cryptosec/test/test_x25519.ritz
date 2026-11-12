@@ -4,6 +4,7 @@
 
 import cryptosec.x25519
 import cryptosec.mem
+import cryptosec.crypto_error
 
 # ============================================================================
 # RFC 7748 Test Vectors
@@ -564,3 +565,111 @@ fn test_stack_holds_2581_sees_residue() -> i32
     if stack_holds_2581(@pat[0], 32)
         return 0
     return 9
+
+# ============================================================================
+# All-zero shared secret (RFC 7748 §6.1, AGAST #2580, GitHub #143)
+#
+# A peer key of small order forces the all-zero shared secret whatever our
+# scalar is. x25519 must refuse it with Err(SmallOrderPoint) and write nothing.
+# ============================================================================
+
+fn hexnib_2580(c: u8) -> u8
+    if c >= 0x30 && c <= 0x39
+        return c - 0x30
+    return c - 0x61 + 10
+
+# 64 lowercase hex digits -> 32 bytes, in wire (little-endian) order.
+fn unhex_2580(out: *u8, hex: *u8)
+    var i: i64 = 0
+    while i < 32
+        out[i] = (hexnib_2580(hex[2 * i]) << 4) | hexnib_2580(hex[2 * i + 1])
+        i += 1
+
+fn scalar_2580(k: *u8)
+    var i: i64 = 0
+    while i < 32
+        k[i] = (0x31 + 7 * i) as u8
+        i += 1
+
+# 0 if x25519 refuses `point` with SmallOrderPoint and leaves out untouched.
+fn expect_small_order_2580(hex: *u8) -> i32
+    var point: [32]u8
+    unhex_2580(@point[0], hex)
+    var k: [32]u8
+    scalar_2580(@k[0])
+    var out: [32]u8
+    var i: i64 = 0
+    while i < 32
+        out[i] = 0xaa
+        i += 1
+    let r: Result<i64, CryptoError> = x25519(@out[0], @k[0], @point[0])
+    var code: i32 = 0
+    match r
+        Ok(_) => code = 1
+        Err(e) =>
+            match e
+                CryptoError.SmallOrderPoint => code = 0
+                _ => code = 2
+    if code != 0
+        return code
+    i = 0
+    while i < 32
+        if out[i] != 0xaa
+            return 3
+        i += 1
+    return 0
+
+[[test]]
+fn test_x25519_refuses_zero_point() -> i32
+    return expect_small_order_2580(c"0000000000000000000000000000000000000000000000000000000000000000")
+
+[[test]]
+fn test_x25519_refuses_point_one() -> i32
+    return expect_small_order_2580(c"0100000000000000000000000000000000000000000000000000000000000000")
+
+[[test]]
+fn test_x25519_refuses_order8_point_a() -> i32
+    return expect_small_order_2580(c"e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")
+
+[[test]]
+fn test_x25519_refuses_order8_point_b() -> i32
+    return expect_small_order_2580(c"5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157")
+
+[[test]]
+fn test_x25519_refuses_p_minus_1() -> i32
+    return expect_small_order_2580(c"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")
+
+[[test]]
+fn test_x25519_refuses_noncanonical_p() -> i32
+    # u = p is 0 mod p (RFC 7748 §5: non-canonical values are accepted).
+    return expect_small_order_2580(c"edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")
+
+[[test]]
+fn test_x25519_refuses_noncanonical_p_plus_1() -> i32
+    return expect_small_order_2580(c"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")
+
+[[test]]
+fn test_x25519_refuses_zero_point_with_high_bit() -> i32
+    # The top bit is masked (RFC 7748 §5), so this is u = 0.
+    return expect_small_order_2580(c"0000000000000000000000000000000000000000000000000000000000000080")
+
+[[test]]
+fn test_x25519_valid_point_is_ok() -> i32
+    # Control: RFC 7748 §5.2 vector 1 returns Ok(32) and the expected output.
+    var k: [32]u8
+    unhex_2580(@k[0], c"a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
+    var u: [32]u8
+    unhex_2580(@u[0], c"e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
+    var want: [32]u8
+    unhex_2580(@want[0], c"c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+    var out: [32]u8
+    let r: Result<i64, CryptoError> = x25519(@out[0], @k[0], @u[0])
+    var n: i64 = -1
+    match r
+        Ok(v) => n = v
+        Err(_) => n = -2
+    if n != 32
+        return 1
+    if mem_eq(@out[0], @want[0], 32) == 0
+        return 2
+    return 0

@@ -387,6 +387,16 @@ Both branches of the if/else execute identical code (SHA-256 init). SHA-384 is n
 
 ---
 
+### M-21: X25519 accepts an all-zero shared secret
+
+**File:** `x25519.ritz` (`x25519`), callers `tls13_client.ritz`, `valet/lib/tls.ritz`
+
+A small-order peer public key (e.g. all zeros) forces the all-zero shared secret whatever the private scalar is, and the TLS callers derived handshake keys from it (RFC 7748 §6.1).
+
+> **Status (2026-11, AGAST #2580, GitHub #143):** Fixed. `x25519` returns `Result<i64, CryptoError>`: it computes into a local, OR-reduces all 32 bytes in constant time and returns `Err(SmallOrderPoint)`, with nothing written, when the result is zero. The TLS client and valet's server abort the handshake with `TLS_ERR_ILLEGAL_PARAMETER`. Covered by `test/test_x25519.ritz` (all eight small-order encodings, including non-canonical ones), `test/test_tls13_client.ritz` and valet's `test/test_tls.ritz`. mausoleum still discards the Result: #2772.
+
+---
+
 ## LOW Severity
 
 | # | Finding | File |
