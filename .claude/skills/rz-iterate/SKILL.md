@@ -14,8 +14,8 @@ full. It keeps looping until the goal at the bottom of this file is met.
 
 Repeat until the goal is met:
 
-1. **Drain the reap queue** (see "Reaping"). Merges first. Only the room at
-   the head of the queue ever rebases; see "One rebase at a time".
+1. **Drain the reap queue** (see "Reaping"). Merges first. Queued REAPs land
+   together as one merge train with one gate; rooms don't rebase for it.
    **First, recover dropped REAPs:** a REAP turn can be interrupted by the
    next REAP's turn before it queues anything (1485 was lost this way twice).
    `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
@@ -89,7 +89,7 @@ stays here; remote hosts only run rooms.
 | toffee | `adele-toffee` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~10 GB free. Linger on, `llvmlite` and `lld` 21 installed, smoke passes. First remote trial host |
 | starbux | `adele-starbux` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~9 GB free beside `adele`'s rooms. Smoke passes; `lld` is a user-local copy (`~/.local/opt/lld-21`). Hold lifted by Aaron 2026-11-11 (first room #2577) |
 | chungus | `adele-chungus` | 1 | yes (2026-11-12) | 8 cores, 14 GB, ~5-8 GB free (another user's desktop session) and 47 GB disk free (95% used). Smoke passes. `clang`/`lld`/`llvm` 21.1.8; `lld` is a user-local copy (`~/.local/opt/lld-21`). Approved by Aaron 2026-11-12 |
-| huburght | `adele-huburght` | 1 (trial) | yes (2026-11-11) | 12 cores, 47 GB, WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. First room #2582; 2 slots once it merges cleanly. Coarse mtime clock (#2689) |
+| huburght | `adele-huburght` | 2 | yes (2026-11-11) | 12 cores, 47 GB (~42 GB free), WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. 2 slots from 2026-11-12 (Aaron: "tons of memory free"; #2582 and #2780 merged cleanly). Coarse mtime clock (#2689) |
 
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
   changes its slots. Edit this table and commit it on `main` when they do.
@@ -167,11 +167,13 @@ stays here; remote hosts only run rooms.
 **May:** read/claim/create/update AGAST tickets; spawn rooms; read the
 scratchpad; `git fetch`, `git merge --ff-only`, `git push origin main`; clean
 up reaped worktrees, branches and units; send host rooms the verbs in
-"Hosts"; glance at GitHub CI (`gh run list`).
+"Hosts"; glance at GitHub CI (`gh run list`); build, gate and land merge
+trains with `train.sh` (see "Reaping"), which cherry-picks REAPed commits
+unchanged and runs `run-gate.sh` on the stack.
 
-**Must not:** edit code, run tests or gates, rebase or squash a room's branch,
-or investigate a failure. Anything like that becomes an AGAST ticket and a
-room. If CI on `main` goes red with a *new* failure, file it at high priority
+**Must not:** edit code, run any test or gate other than a train's, resolve a
+conflict, edit, rebase or squash a room's branch, or investigate a failure.
+Anything like that becomes an AGAST ticket and a room. If CI on `main` goes red with a *new* failure, file it at high priority
 and spawn a room for it. Don't fix it here.
 
 ## Who owns the ticket
@@ -347,8 +349,10 @@ vouches for that exact commit.
    compare failures against `origin/main` before calling them pre-existing.
    **Only exit 0 passes.**
    Otherwise fix, re-squash, re-run.
-7. **Don't chase `main`.** REAP the commit you gated. `rz` tells you when to
-   rebase.
+7. **Don't chase `main`.** REAP the commit you gated. `rz` usually lands it
+   by cherry-picking it onto `main` in a batch with other rooms' commits and
+   gating the batch, so it may reach `main` under a different SHA. You only
+   rebase if `rz` tells you to.
 8. **Push and REAP:** `git push --force-with-lease origin ritz-task-<id>`
    (remote rooms: `git push --force-with-lease origin
    HEAD:refs/heads/ritz-task-<id>`). Never `-f`/`--force`: the lease refuses
@@ -364,9 +368,10 @@ vouches for that exact commit.
    ```
    Don't `complete_task`: the REAP line is your evidence, and `rz` closes the
    ticket once your commit is on `main`.
-9. **On "your turn: rebase onto <sha7>"**: rebase, re-gate, push and REAP
-   again straight away. Nothing merges until you do. Until that message, stay
-   on your base, even after REAPing.
+9. **On "rebase onto <sha7>"** (your commit conflicted with `main` or failed
+   the gate on top of it; the message says which, with the failing lines):
+   rebase, fix if needed, re-gate, push and REAP again. Until that message,
+   stay on your base, even after REAPing.
 
 **Never end a turn with work pending:** nothing wakes you when a gate,
 mutation run or subagent finishes (#1533). Wait in the foreground, in slices
@@ -420,65 +425,88 @@ nothing more than it takes to act on it:
 reap ritz-task-1450 1a2b3c4
 ```
 
-1. **REAP arrives:** (this section, not `/reap-ritz-room`, handles it) `append_scratchpad_item` immediately (even mid-reap), then
-   say in one line what's queued. Don't interrupt a reap in progress.
-2. **Take the oldest unchecked item** (`get_scratchpad` first, never from memory).
-3. **Two checks only, no tests:**
+### Merge trains (Aaron, 2026-11-12)
+
+Every REAP is one squashed commit that its room already gated on its own
+base. Rather than have each room rebase and re-gate in turn (one ~25-minute
+gate per merge), `rz` stacks every queued commit on `origin/main` in queue
+order and gates only the top of the stack. If that passes, every commit
+below it has passed too, and they all land in one push. This is the one
+gate `rz` runs; it still never edits, rebases or fixes a room's commit.
+
+`.claude/skills/rz-iterate/train.sh` does the git work in its own worktree,
+`~/dev/ritz-lang/rz-train` (created on first use, detached HEAD, never a
+room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
+
+1. **REAP arrives:** (this section, not `/reap-ritz-room`, handles it)
+   `append_scratchpad_item` immediately, even while a train is gating, then
+   say in one line what's queued. Never add to a train that's gating: a REAP
+   that arrives then rides the next train.
+2. **Check each REAP line before it boards.** A remote room's REAP must
+   quote `SHA=<12> EXIT=0` from its gate log, and that SHA must be the REAP
+   SHA's prefix. Without it, it's a room mistake (step 7). (`train.sh build`
+   checks the rest: the branch tip is the REAP SHA, and it's one commit.)
+3. **Build the train** from every unchecked item, oldest first
+   (`get_scratchpad` first, never from memory):
    ```bash
-   git fetch origin
-   git rev-parse origin/ritz-task-<id>                  # must equal the REAP sha
-   git merge-base --is-ancestor origin/main <sha>       # must be on current main
-   test "$(git rev-list --count origin/main..<sha>)" = 1   # exactly one commit
+   .claude/skills/rz-iterate/train.sh build ritz-task-2593:3f42ab80 ritz-task-1844:4b699a83 ...
    ```
-   These work from `origin/ritz-task-<id>`, so they're the same for a remote
-   room. A remote room's REAP must also quote `SHA=<12> EXIT=0` from its
-   gate log, and that SHA must be the REAP SHA's prefix. A REAP without it
-   is a room mistake (step 7). Its gate log stays on its host; ask the host
-   room for it only if CI later goes red on that commit.
-4. **Pass:** `git merge --ff-only <sha> && git push origin main`. Then
-   `complete_task` in AGAST (`Merged to main as <sha8>. <REAP line>`; if it's
-   refused, see "Who owns the ticket"), `check_scratchpad_item`, and clean up
-   (`systemctl --user stop/disable adele-agent@ritz-task-<id>`, remove
-   `~/.config/adele/rooms/ritz-task-<id>`, `.claude/host-budget.sh --remove
-   ritz-task-<id>`, `git worktree remove`,
-   `git branch -D`, `git push origin --delete ritz-task-<id>`).
-   **Remote room:** send `TEARDOWN ritz-task-<id>` to its host room instead
-   of the local steps, and still run `git push origin --delete
-   ritz-task-<id>` here. Its slot is free once the host answers `TORNDOWN`.
-5. **Not on current main (the usual case):** this room is next, so it gets
-   the turn. Send it one line with `ask_claude=True`:
-   "your turn: rebase onto <sha7>, re-gate and REAP again". Leave its item
-   **unchecked** at the head; it keeps its place. Then **stop merging** until
-   that room REAPs again, even if a later item would fast-forward cleanly.
-   Merging anything else would move `main` under the rebase and waste its gate.
-6. **The head room's new REAP:** check its old item and handle the new one
-   next, wherever the scratchpad put it (it holds the turn). Run step 3
-   again. It only fails if something else moved `main`; if so, give it the
-   turn again.
-7. **SHA mismatch or more than one commit:** these are the room's mistakes.
-   Send it one line saying which check failed, check the item, and move on;
-   its next REAP goes to the back of the queue.
+   It prints one line per item (`KEPT`, `APPLIED`, `CONFLICT`, `EMPTY`,
+   `BAD`) and a `TRAIN ... n=<k> gate=<needed|not-needed>` summary.
+   `rz-larb` boards like any room (`rz-larb:<sha>`).
+4. **Gate it, unless `gate=not-needed`** (a lone commit already on `main`:
+   its own gate covers it):
+   ```bash
+   LOG=$(.claude/skills/rz-iterate/train.sh gate)
+   .claude/skills/rz-iterate/run-gate.sh --wait "$LOG"    # Bash run_in_background
+   ```
+   Run the wait with `run_in_background`, so it wakes this room when the gate
+   ends, and keep the usual 1800 s fallback wakeup. Carry on with the loop
+   (slots, nudges) meanwhile. On a context reset, `train.sh show` prints the
+   train, and the newest `gate-logs/train-<sha12>.log` holds the gate. The
+   train gate uses omegalisk's one gate slot, so it may wait behind a local
+   room's gate.
+5. **Gate passes (exit 0), or `gate=not-needed`:**
+   ```bash
+   .claude/skills/rz-iterate/train.sh land "$LOG"      # no log when not needed
+   ```
+   It refuses if the log isn't for the train's tip, didn't pass, or `main`
+   moved since the build; then rebuild and re-gate. It pushes the tip to
+   `main` (never forced), fast-forwards `~/dev/ritz-lang/rz`, and prints
+   `MERGED <branch> <room sha12> as <main sha12>` per commit. For each:
+   `complete_task` (`Merged to main as <main sha8> (train <tip sha8>). <REAP
+   line>`; if refused, see "Who owns the ticket"), `check_scratchpad_item`,
+   and clean up (`systemctl --user stop/disable adele-agent@ritz-task-<id>`,
+   remove `~/.config/adele/rooms/ritz-task-<id>`, `.claude/host-budget.sh
+   --remove ritz-task-<id>`, `git worktree remove`, `git branch -D`,
+   `git push origin --delete ritz-task-<id>`).
+   **Remote room:** send `TEARDOWN ritz-task-<id> merged=<main sha12>` to its
+   host room instead of the local steps, and still delete the branch on
+   GitHub here. Spell out in the message that the commit was cherry-picked,
+   so `git cherry origin/main ritz-task-<id>` prints `- <sha>` (same patch),
+   not nothing; a `+` line is fine only if `<main sha12>`'s subject matches
+   the branch tip's. The slot is free once the host answers `TORNDOWN`.
+6. **Gate fails:** find the culprit by halving. With `k` commits, rebuild
+   with the first `ceil(k/2)` and gate that. If it passes, land it; the rest
+   ride the next train. If it fails, halve again. A single commit that fails
+   on top of `main` goes back to its room: check its item and send it one
+   line, "rebase onto <main sha7>: your commit fails the gate on top of
+   `main`", with the gate's failing lines (`run-gate.sh --wait` prints them).
+   Its fixed REAP goes to the back of the queue. Never investigate the
+   failure here.
+7. **`CONFLICT`, `BAD` or a missing gate quote** leave that item out of the
+   train. Once the train has landed, check the item and send its room one
+   line: for `CONFLICT`, "rebase onto <new main sha7>, re-gate and REAP";
+   otherwise, which check failed. Its next REAP goes to the back of the
+   queue. **`EMPTY`** means the patch is already on `main`: check the item,
+   then close and clean up as in step 5.
 8. **All items checked:** `clear_scratchpad`.
 
-### One rebase at a time
-
-Rebasing is serialised through the queue, not broadcast:
-
-- **Never tell running rooms that `main` moved.** No "main moved, rebase"
-  messages to rooms that aren't at the head of the queue, whether they're
-  still working, gating or already REAPed. They keep their base until their
-  turn. (Broadcasting made five rooms re-gate at once, filling both gate
-  slots with work that was stale again by the next merge.)
-- **Exactly one room holds the turn at a time**: the head of the queue. On a
-  context reset, the head is the oldest unchecked scratchpad item. If its
-  room was already sent "your turn", don't send it again unless the room has
-  been idle for 30+ minutes (see "Nudge idle rooms").
-- **A room holding the turn that goes quiet** gets the usual idle nudge. If it
-  still can't produce a gated REAP (its rebase conflicts or the gate fails),
-  check its item, tell it to REAP again when it's fixed, and give the turn
-  to the next item.
-- **Committing to `main` from this room** (skill edits and the like) doesn't
-  need any rooms told; the head room finds out when its turn comes.
+**Never tell running rooms that `main` moved.** A room rebases only when its
+own commit conflicted or failed (steps 6 and 7). Broadcasting made five rooms
+re-gate at once, filling both gate slots with work that was stale again by
+the next merge. Committing to `main` from this room (skill edits and the
+like) needs no message either; it just becomes the next train's base.
 
 GitHub CI: glance at `gh run list -L 3` each turn. Red on an already-known
 failure set is normal (`test-all` has known reds). A **new** failure becomes a
@@ -523,4 +551,5 @@ Iterate from the bottom up:
 4. In parallel, work down the ritz1 known-failure list and `#1440`.
 
 Prefer many small tickets over one large one: small commits merge cleanly
-through `--ff-only`, and a room's rebase and re-gate hold up the whole queue.
+through a train, and a commit that conflicts or fails sends its room back to
+rebase and re-gate while the rest of the train lands.
