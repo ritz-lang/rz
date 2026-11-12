@@ -207,3 +207,38 @@ def test_oracle_is_cached_by_source():
     assert ritz0_inproc.STATS["oracle_hits"] == before["oracle_hits"] + 1
     other = ritz0_oracle(OK_PROGRAM.replace("-7", "-6"))
     assert other.rc == 6
+
+
+# AGAST #2793: a module ritz0 imports inside a compile is imported again by
+# every forked child (its copy of sys.modules is the forkserver's).  Three
+# such modules cost each compile ~14 ms of ~64.  The forkserver preloads them;
+# this pins that a compile imports nothing beyond ritz0_inproc.PRELOAD.
+LAZY_IMPORTS_PROBE = """\
+import contextlib, io, os, sys
+sys.path.insert(0, sys.argv[1])
+import ritz0_inproc
+for name in ritz0_inproc.PRELOAD:
+    __import__(name)
+before = set(sys.modules)
+import ritz0
+sys.argv = ["ritz0.py", sys.argv[2], "-o", sys.argv[3]]
+with contextlib.redirect_stdout(io.StringIO()):
+    try:
+        ritz0.main()
+    except SystemExit:
+        pass
+sys.__stdout__.write(" ".join(sorted(set(sys.modules) - before)))
+"""
+
+
+def test_a_compile_imports_nothing_the_forkserver_did_not_preload(tmp_path):
+    src = tmp_path / "main.ritz"
+    src.write_text(OK_PROGRAM)
+    probe = subprocess.run(
+        [sys.executable, "-c", LAZY_IMPORTS_PROBE, str(ritz0_inproc.RITZ0_DIR),
+         str(src), str(tmp_path / "main.ll")],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=300)
+    assert probe.returncode == 0, probe.stderr
+    assert (tmp_path / "main.ll").exists(), probe.stderr
+    assert probe.stdout == "", (
+        f"a compile imported {probe.stdout}: add it to ritz0_inproc.PRELOAD")

@@ -107,6 +107,13 @@ AGAST #1392. Two things live here, and they are independent.
 9. `spawn_guard` (AGAST #1805) — a test that starts any process (or runs
    ritz0 in-process) without `@pytest.mark.integration` fails, naming the
    command.  So `-m "not integration"` really is the no-subprocess tier.
+
+10. `fast_link` (AGAST #2793) — `fast_link.clang(cmd, **kw)` stands in for
+   `subprocess.run(clang_cmd, **kw)` on a link expected to succeed: llvmlite
+   codegen in a helper process plus clang's own `ld` line, ~6 ms instead of
+   clang's ~50 ms startup.  Anything it does not model, and every failure,
+   runs real clang, so a refusal's message is clang's.  Importable and offered
+   as the `clang_link` fixture; RITZ_TEST_LINK=clang turns it off.
 """
 
 import os
@@ -117,6 +124,7 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
 import ritz0_inproc
 
 pytest_plugins = ["spawn_guard"]
@@ -334,3 +342,9 @@ def ritz0_oracle():
 def run_ritz0():
     """`run_ritz0(args, cwd=, env=, timeout=)`: in-process `ritz0.py` (item 8)."""
     return ritz0_inproc.run_ritz0
+
+
+@pytest.fixture(scope="session")
+def clang_link():
+    """`clang_link(cmd, **kw)`: `subprocess.run` for a clang link (item 10)."""
+    return fast_link.clang

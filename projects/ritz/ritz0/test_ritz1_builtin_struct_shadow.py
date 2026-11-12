@@ -102,14 +102,20 @@ def _run_pkg(compiler: str, tmp_path: Path, name: str, program: str) -> int:
         f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n'
         '[build]\ntarget = "x86_64-linux"\n'
     )
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    # AGAST #2793: build with the cache.  The session's content-addressed
+    # store (RITZ_CACHE_DIR, conftest.py) hands every case after the first
+    # its ritzlib objects, compiled by this same compiler binary; only
+    # main.ritz is compiled per case.  `--no-cache` recompiled all of
+    # ritzlib every time (3-6 s a case, 17 files).  The per-project index
+    # goes in the package, so the tree's .ritz-cache is left alone.
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT),
+               RITZ_BUILD_CACHE_DIR=str(pkg / ".build-cache"))
     proc = subprocess.run(
         [
             "python3",
             str(RITZ_ROOT / "build.py"),
             "build",
             str(pkg),
-            "--no-cache",
             "--compiler",
             compiler,
         ],

@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -411,7 +413,7 @@ def test_ritz0_still_runs_a_payload_that_binds(tmp_path, name):
     proc, ll = _ritz0(tmp_path, source)
     assert proc.returncode == 0, f"{name}:\n{(proc.stdout + proc.stderr)[-1500:]}"
     exe = tmp_path / "unit"
-    subprocess.run(["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"], check=True)
+    fast_link.clang(["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"], check=True)
     assert subprocess.run([str(exe)], timeout=60).returncode == code, name
 
 
@@ -467,7 +469,7 @@ def test_ritz1_still_runs_a_payload_that_binds(request, tmp_path, compiler, name
     proc, ll = _ritz1(request, compiler, tmp_path, source)
     assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-800:]}"
     exe = tmp_path / "unit"
-    subprocess.run(["clang", "-w", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
+    fast_link.clang(["clang", "-w", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
                    check=True)
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 

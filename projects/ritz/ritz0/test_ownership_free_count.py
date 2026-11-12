@@ -39,6 +39,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ref_rules import ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE
 from ritz0_inproc import run_ritz0
 
@@ -2636,7 +2638,7 @@ def test_free_count(request, tmp_path, compiler, name):
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         link_cmd.insert(2, str(RITZ_START))
-    link = subprocess.run(link_cmd, cwd=tmp_path, capture_output=True, text=True)
+    link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler}: link failed:\n{link.stderr[-2000:]}"
     rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
     assert rc == expected, f"{compiler} {name}: exit {rc}, spec says {expected}"

@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ref_rules import ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE
 from ritz0_inproc import run_ritz0
 
@@ -313,7 +315,7 @@ def _run(compiler, tmp_path, name, src):
     cmd = ["clang", "-Wno-override-module", str(ll), "-o", str(exe), "-nostdlib", "-no-pie"]
     if compiler != "ritz0":
         cmd.insert(1, str(RITZ_START))
-    link = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
+    link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler}: {name} would not link:\n{link.stderr[-2000:]}"
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 

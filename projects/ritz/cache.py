@@ -557,7 +557,14 @@ class BuildCache:
         and end up in `.gitignore` patterns.
         """
         if self._cache_dir is None:
-            base = self.project_root if self.project_root else Path.cwd()
+            # RITZ_BUILD_CACHE_DIR (AGAST #2793) moves it out of the project:
+            # the ritz0 suite's throwaway package builds keep their index
+            # there, out of the tree the xdist_group("tree") tests inspect.
+            override = os.environ.get("RITZ_BUILD_CACHE_DIR")
+            if override:
+                base = Path(override)
+            else:
+                base = self.project_root if self.project_root else Path.cwd()
             if self.compiler == "ritz0":
                 self._cache_dir = base / CACHE_DIR_NAME
             else:

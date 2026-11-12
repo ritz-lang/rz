@@ -527,3 +527,14 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/valet/test/test_tls_socket.sh",
         "python3 projects/ritz/tools/smoke_stack.py",
     ]
+
+
+def test_the_ritz0_suite_loads_no_stray_plugins():
+    """AGAST #2793: ci-local runs main.yml in the caller's venv.  Its plugins
+    (django, anyio, ddtrace, ...) cost each of ~31k ritz0 tests ~2 ms and
+    capped the xdist controller near 300 tests/s, so the step names the one
+    plugin it uses and loads no other."""
+    [step] = [s for s in ci_local.load_steps() if s.name == "ritz0 unit tests"]
+    words = step.run.split()
+    assert "--disable-plugin-autoload" in words
+    assert words[words.index("--disable-plugin-autoload") + 1:][:2] == ["-p", "xdist"]

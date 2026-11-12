@@ -36,6 +36,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from array_rules import ELEMENT_MISMATCH
 from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
@@ -2432,7 +2434,7 @@ def _run(compiler, ritz1_bin, tmp_path: Path, name: str, program: str) -> int:
     cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler == "ritz1":
         cmd.insert(2, str(RITZ_START))
-    link = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
+    link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
     assert link.returncode == 0, f"{name} would not link:\n{link.stderr[-2000:]}"
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 

@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 import test_ritz1_for_header as for_header
 from test_index_through_reference import HEADER, _refused
 
@@ -48,7 +50,7 @@ def _string_objects(compiler, ritz1_bin) -> tuple:
         comp = for_header._emit(compiler, ritz1_bin, for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz", ll)
         assert comp.returncode == 0, comp.stdout + comp.stderr
         obj = work / f"{unit}.o"
-        subprocess.run(["clang", "-w", "-c", str(ll), "-o", str(obj)], check=True)
+        fast_link.clang(["clang", "-w", "-c", str(ll), "-o", str(obj)], check=True)
         objects.append(str(obj))
     return tuple(objects)
 
@@ -64,7 +66,7 @@ def run_with(ritz1_bin, compile_with):
                *_string_objects(compiler, ritz1_bin), "-o", str(exe), "-nostdlib"]
         if compiler != "ritz0":
             cmd.insert(2, str(for_header.RITZ_START))
-        link = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
+        link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
         assert link.returncode == 0, f"{name} would not link:\n{link.stderr[-2000:]}"
         return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
     return go

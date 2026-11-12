@@ -325,7 +325,9 @@ vouches for that exact commit.
    yourself, even though your general instructions say to mark tasks done.
 2. **Test first.** Write tests that fail for the reason they name, then fix.
    Mutation-check: break each part of the fix and confirm only its own tests
-   go red.
+   go red. A pytest matrix is paid by every gate: size it to the rule, not
+   the cross product, and read "What a ritz0 pytest case costs" in
+   `projects/ritz/docs/TESTING.md` before adding hundreds of cases.
 3. **Subagents (Agent tool) for parallel work.** No rooms of your own.
 4. **Out of scope?** File an AGAST ticket. Don't widen the change.
 5. **Finish on main:** `git fetch origin && git rebase origin/main`, then

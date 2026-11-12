@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 import ritz0_inproc
 from test_borrow_param_ref_field import _compile, _run
 
@@ -587,7 +589,7 @@ def test_ritz0_a_module_global_is_live(tmp_path, name, decl, fill, it, write):
                                       env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)), timeout=300)
         assert comp.returncode == 0, comp.stdout + comp.stderr
         lls.append(str(ll))
-    subprocess.run(["clang", "-w", *lls, "-o", str(tmp_path / "main"), "-nostdlib"], check=True)
+    fast_link.clang(["clang", "-w", *lls, "-o", str(tmp_path / "main"), "-nostdlib"], check=True)
     assert subprocess.run([str(tmp_path / "main")], timeout=60).returncode == 53
 
 

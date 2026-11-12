@@ -230,7 +230,9 @@ def pytest_smoke(out: TextIO = sys.stdout) -> int:
     # Serial on purpose: under xdist the controller builds ritz1 before any
     # worker starts (ritz0/conftest.py item 4) — step 3's job, not this one's.
     # -p no:cacheprovider: smoke must not leave .pytest_cache state behind.
+    # --disable-plugin-autoload: none of a venv's other plugins (AGAST #2793).
     return _run([sys.executable, "-m", "pytest", "-q", "-m", "smoke",
+                 "--disable-plugin-autoload",
                  "-p", "no:cacheprovider", "-o", "addopts="],
                 cwd=RITZ_ROOT / "ritz0", out=out, timeout=600)
 

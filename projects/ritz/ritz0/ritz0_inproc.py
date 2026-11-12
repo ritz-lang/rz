@@ -60,6 +60,13 @@ STATS = {"forks": 0, "cache_hits": 0, "oracle_runs": 0, "oracle_hits": 0}
 # test_ritz0_inproc.py sets this to make a child sleep, to exercise timeouts.
 _CHILD_DELAY_FOR_TESTS = 0.0
 
+# What the forkserver imports once, for every child to inherit.  Besides ritz0
+# itself, the modules a compile imports lazily (AGAST #2793): a forked child
+# would import each of them again, every compile (~14 ms of ~64).
+# test_ritz0_inproc.py pins that a compile imports nothing outside this list.
+# A name this Python lacks is skipped by the forkserver, not an error.
+PRELOAD = ["ritz0_inproc", "ritz0", "datetime", "tomllib", "_colorize"]
+
 _lock = threading.Lock()
 _ctx = None
 _compile_cache: dict[str, tuple] = {}
@@ -75,7 +82,7 @@ def _context():
                 sys.path.insert(0, str(RITZ0_DIR))
             ctx = multiprocessing.get_context("forkserver")
             # The forkserver imports these once; every child inherits them.
-            ctx.set_forkserver_preload(["ritz0_inproc", "ritz0"])
+            ctx.set_forkserver_preload(PRELOAD)
             _ctx = ctx
         return _ctx
 

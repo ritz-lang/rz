@@ -396,7 +396,10 @@ def test_ritz1_builtins_link_across_modules(ritz1_bin, tmp_path):
         '[package]\nname = "twomod"\nversion = "0.1.0"\n\n'
         '[build]\ntarget = "x86_64-linux"\n'
     )
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    # AGAST #2793: cached build; ritzlib objects come from the session's
+    # content-addressed store, the per-project index stays in the package.
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT),
+               RITZ_BUILD_CACHE_DIR=str(pkg / ".build-cache"))
     for compiler in ("ritz0", "ritz1"):
         proc = subprocess.run(
             [
@@ -404,7 +407,6 @@ def test_ritz1_builtins_link_across_modules(ritz1_bin, tmp_path):
                 str(RITZ_ROOT / "build.py"),
                 "build",
                 str(pkg),
-                "--no-cache",
                 "--compiler",
                 compiler,
             ],

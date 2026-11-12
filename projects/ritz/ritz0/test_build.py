@@ -308,7 +308,6 @@ class TestDependencyParsing:
         assert deps["squeeze"].sources == ["lib"]
 
 
-@pytest.mark.xfail(reason="DependencySpec.resolve_import moved to import_resolver.DependencyMapping")
 class TestDependencyResolution:
     """Test dependency import resolution."""
 

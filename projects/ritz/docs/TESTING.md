@@ -319,6 +319,52 @@ vs. clean rebuilds, when matrix-full is needed, hard rules).
 
 ---
 
+## What a ritz0 pytest case costs (read before adding a matrix)
+
+The `ritz0/` pytest suite is a gate step, and it grows with every ticket:
+150 files on 2026-10-29, 332 on 2026-11-12, ~31k cases and over half the
+gate before AGAST #2793.  Every parametrised row is paid on every gate, by
+every room, forever.  Rough per-case costs on the gate host (idle; the gate's
+own load multiplies them 2-4x):
+
+| Step | Cost | Notes |
+|---|---|---|
+| pytest + xdist bookkeeping | ~1-2 ms | ~5 ms per case with a venv's stray plugins; the gate runs `--disable-plugin-autoload -p xdist` |
+| ritz0 compile (`run_ritz0`, forked) | ~25-50 ms | `python3 ritz0.py` would be ~160 ms: never spawn it per case |
+| ritz1 / ritz1_selfhosted compile | ~5-10 ms | |
+| link with `clang` | ~50 ms | almost all of it clang starting up |
+| link with `fast_link.clang` | ~6 ms | drop-in for `subprocess.run(clang_cmd, ...)` on a link expected to succeed |
+| `build.py build` of a package | ~1 s | with `--no-cache` it recompiles all of ritzlib: 3-6 s |
+
+Rules:
+
+1. **Size the matrix to the rule, not to the cross product.** A row earns
+   its place by being able to fail on its own for a reason no other row
+   covers.  A ticket that adds hundreds of single-compile cases is adding
+   minutes to every gate; pick the rows that separate the code paths.
+2. **Batch rows that can share a program.**  All three compilers report
+   every error in a file, so refusal rows whose programs don't collide can
+   be checked in one compile (one `line:col: message` per row); run rows
+   can be functions of one program that reports each result.  Keep a
+   per-row failure message, and mutation-check that a broken row still
+   fails by itself.
+3. **Link with `fast_link.clang`** when the link is expected to succeed.
+   Anything it does not model, and every failure, is answered by real clang,
+   so messages are clang's.  Call clang directly when a test asserts that a
+   link *fails*.
+4. **Build packages with the cache.**  Drop `--no-cache` and set
+   `RITZ_BUILD_CACHE_DIR` to a directory in the test's package: ritzlib
+   objects then come from the session's content-addressed store, and the
+   tree's `.ritz-cache` is left alone (see `_run_pkg` in
+   `ritz0/test_ritz1_builtin_struct_shadow.py`).
+5. **Compile ritz0 in process** (`ritz0_inproc.run_ritz0` / `ritz0_oracle`),
+   never `python3 ritz0.py` per case.
+6. **Measure.**  `pytest --durations=0` or `--junitxml` and sum by file;
+   anything over ~200 ms a case, or a file over a minute of test time,
+   needs a reason.
+
+---
+
 ## Test attributes reference
 
 | Attribute | Status | Description |

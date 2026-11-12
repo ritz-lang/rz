@@ -44,10 +44,13 @@ def _build(compiler: str, tmp_path: Path, name: str, program: str):
         f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n'
         '[build]\ntarget = "x86_64-linux"\n'
     )
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    # AGAST #2793: cached build; ritzlib objects come from the session's
+    # content-addressed store, the per-project index stays in the package.
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT),
+               RITZ_BUILD_CACHE_DIR=str(pkg / ".build-cache"))
     proc = subprocess.run(
         ["python3", str(RITZ_ROOT / "build.py"), "build", str(pkg),
-         "--no-cache", "--compiler", compiler],
+         "--compiler", compiler],
         cwd=RITZ_ROOT, env=env, capture_output=True, text=True, timeout=600,
     )
     return proc, pkg / "build" / "debug" / name

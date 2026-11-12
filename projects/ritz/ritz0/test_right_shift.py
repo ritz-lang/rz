@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -220,7 +222,7 @@ def _run(request, compiler, tmp_path, source):
     link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         link.insert(2, str(RITZ_START))
-    built = subprocess.run(link, cwd=tmp_path, capture_output=True, text=True)
+    built = fast_link.clang(link, cwd=tmp_path, capture_output=True, text=True)
     assert built.returncode == 0, f"{compiler}: link:\n{built.stderr[-1500:]}"
     return subprocess.run([str(exe)], timeout=60).returncode
 

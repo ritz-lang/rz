@@ -140,11 +140,13 @@ ci-local:
 # #1804).  PYTEST_J workers, default 8: with -n auto a 12-core host would run
 # 12 on a VM shared with the gate and the task rooms.  `--dist loadgroup` keeps
 # xdist_group("tree") tests on one worker; see ritz0/conftest.py.  PYTEST_J=0
-# runs serially.
+# runs serially.  --disable-plugin-autoload -p xdist: the suite needs no
+# other installed plugin, and a venv's (django, anyio, ...) cost every one of
+# ~31k tests (AGAST #2793, as in main.yml).
 PYTEST_J ?= 8
 unit:
 	@echo "=== Running ritz0 unit tests (-n $(PYTEST_J)) ==="
-	@cd ritz0 && $(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup
+	@cd ritz0 && $(PYTHON) -m pytest -q --disable-plugin-autoload -p xdist -n $(PYTEST_J) --dist loadgroup
 
 # Run .ritz language tests (test levels)
 ritz:
