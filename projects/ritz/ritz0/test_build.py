@@ -10,7 +10,6 @@ Tests:
 
 import os
 import pytest
-import tempfile
 from pathlib import Path
 
 # Import build system functions
@@ -164,7 +163,8 @@ class TestSourceDiscovery:
         assert src_dir / "main.ritz" in sources
 
         # Without src/ - should use current dir
-        tmp_path2 = Path(tempfile.mkdtemp())
+        tmp_path2 = tmp_path / "no_src"
+        tmp_path2.mkdir()
         (tmp_path2 / "main.ritz").write_text("fn main() -> i32\n  0\n")
 
         sources2 = discover_sources(tmp_path2, None)

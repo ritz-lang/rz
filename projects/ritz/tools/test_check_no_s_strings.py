@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -61,8 +60,12 @@ class TestRegex:
 
 
 class TestFindViolations:
+    @pytest.fixture(autouse=True)
+    def _tmp(self, tmp_path):
+        self.tmp_path = tmp_path  # pytest removes it; mkdtemp leaked one per test (#2875)
+
     def _setup(self, files: dict[str, str]) -> Path:
-        tmpdir = Path(tempfile.mkdtemp(prefix='check_no_s_strings_'))
+        tmpdir = self.tmp_path
         for name, body in files.items():
             path = tmpdir / name
             path.parent.mkdir(parents=True, exist_ok=True)

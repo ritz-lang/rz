@@ -20,7 +20,9 @@ is `lo..hi + 1`.  A String has no `len` field (`t.data.len` is its length), so
 Through a pointer or reference it's #2448.
 """
 
+import atexit
 import functools
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -45,6 +47,7 @@ STRING_UNITS = ("string", "strview", "hash")
 @functools.lru_cache(maxsize=None)
 def _string_objects(compiler, ritz1_bin) -> tuple:
     work = Path(tempfile.mkdtemp(prefix=f"slice_string_{compiler}_"))
+    atexit.register(shutil.rmtree, work, True)  # process-wide cache: see for_header._objects (#2875)
     objects = []
     for unit in STRING_UNITS:
         ll = work / f"{unit}.ll"

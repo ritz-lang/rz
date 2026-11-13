@@ -22,8 +22,10 @@ compile can't link ritzlib.gvec's `realloc`.  Each returns 0, or the number of
 the first check that failed, unless it says otherwise.
 """
 
+import atexit
 import functools
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -61,6 +63,9 @@ def _emit(compiler, ritz1_bin, src: Path, ll: Path):
 def _objects(compiler, ritz1_bin) -> tuple:
     """The allocator's objects, compiled by `compiler`, once per process."""
     work = Path(tempfile.mkdtemp(prefix=f"for_header_{compiler}_"))
+    # Cached for the whole process, so no test owns it: remove it at exit, or
+    # every gate leaves one per compiler per xdist worker in /tmp (#2875).
+    atexit.register(shutil.rmtree, work, True)
     objects = []
     for unit in UNITS:
         ll = work / f"{unit}.ll"

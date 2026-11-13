@@ -207,7 +207,7 @@ _SCRATCH_LOCK = threading.Lock()
 
 def make_scratch_dir() -> str:
     """Create a scratch directory outside the tree under test, and register it."""
-    path = tempfile.mkdtemp(prefix=_SCRATCH_PREFIX)
+    path = tempfile.mkdtemp(prefix=_SCRATCH_PREFIX)  # tempdir-ok: registered; cleanup_scratch_dir removes it
     with _SCRATCH_LOCK:
         _SCRATCH_DIRS.add(path)
     return path

@@ -47,6 +47,7 @@ LOCAL_MODULES = {
     "audit_string_literals",
     "check_doc_examples",
     "check_no_s_strings",
+    "check_test_tempdirs",
     "run_regression_matrix",
     "smoke",
     "smoke_stack",
