@@ -864,20 +864,27 @@ def test_a_shared_pointer_element_is_read_only(compile_with, op, compiler):
 # ritz1 keeps #2321's located refusal, since `*(p# + i)` there failed at clang (#2525).
 _S = "struct S\n    x: i32\n    y: i64\n\n"
 _SMAIN = "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    a[1].y = 6\n    return f(@a) as i32\n"
-_SMUT = _SMAIN.replace("f(@a)", "f(@a)")
+_SMUT = _SMAIN.replace("f(@a)", "f(@&a)")
 STRUCT_COPIES = {
     "by_value": _S + "fn f(p: *[3]S) -> i32\n    let s: S = p[1]\n    return s.x\n\n" + _SMAIN,
     "by_value_argument": _S + "fn g(s: S) -> i32\n    return s.x\n\nfn f(p: *[3]S) -> i32\n    return g(p[1])\n\n" + _SMAIN,
     "by_value_inferred": _S + "fn f(p: *[3]S) -> i32\n    let s = p[1]\n    return s.x\n\n" + _SMAIN,
+    # AGAST #2524: the un-annotated copy through a reference, and the `*(q + 1)`
+    # whole-struct deref it stands for, type as S.  A `var` copy is a copy too.
+    "by_value_inferred_reference": _S + "fn f(p: @[3]S) -> i32\n    let s = p[1]\n    return s.x\n\n" + _SMAIN,
+    "by_value_inferred_mut_reference": _S + "fn f(p: @&[3]S) -> i32\n    var s = p[1]\n    s.x = 9\n    return p[1].x + s.x - 9\n\n"
+    + _SMUT,
+    "by_value_inferred_deref": _S + "fn f(q: *S) -> i32\n    let s = *(q + 1)\n    return s.x\n\n"
+    + _SMAIN.replace("f(@a)", "f(@a[0])"),
+    "by_value_inferred_deref_plain": _S + "fn f(q: *S) -> i32\n    let s = *q\n    return s.x\n\n"
+    + _SMAIN.replace("f(@a)", "f(@a[1])"),
 }
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(STRUCT_COPIES))
-def test_a_whole_struct_element_copies(request, run_with, name, compiler):
-    if name == "by_value_inferred" and compiler != "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2524: ritz1 types `let s = p[1]` as an i64"))
+def test_a_whole_struct_element_copies(run_with, name, compiler):
     assert run_with(compiler, name, STRUCT_COPIES[name]) == 5
 
 
