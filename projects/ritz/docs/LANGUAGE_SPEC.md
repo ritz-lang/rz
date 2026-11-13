@@ -2962,6 +2962,39 @@ enum Either<T, E>
     Right(E)
 ```
 
+A bare constructor builds the instance its slot names: a typed `let`'s, a
+parameter's, a field's, the fn's return type. An untyped `let` or `var` has no
+slot. It takes the fn's return type when that is an instance of the variant's
+enum. Otherwise it takes the instance its payload binds, by §4.4's rule for a
+generic call: `Present(5)` is a `Maybe<i64>`, and `Present(x)` with `x: u8`
+is a `Maybe<u8>` (AGAST #2927):
+
+```ritz
+enum Maybe<T>
+    Present(T)
+    Absent
+
+fn main() -> i32
+    let a = Present(5)               # Maybe<i64>
+    let b: Maybe<i64> = Absent       # nothing binds T: the binding says it
+    match a
+        Present(v) => v as i32 - 5
+        Absent => 1
+```
+
+A type parameter the payload leaves unbound is an error at the constructor.
+That includes every parameter of a unit variant's enum:
+
+```ritz expect-error="can't infer `T` for `Absent`: give the binding a type"
+enum Maybe<T>
+    Present(T)
+    Absent
+
+fn main() -> i32
+    let b = Absent
+    0
+```
+
 ### 11.4 Monomorphization
 
 Generics are monomorphized at compile time; each instantiation generates

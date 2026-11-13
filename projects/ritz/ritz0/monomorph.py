@@ -481,6 +481,7 @@ class Monomorphizer:
         if fn.body is None:
             return
         self.var_types = {}
+        self._infer_ret_type = fn.ret_type
         for param in fn.params:
             param_type = param.type
             if param_type is None and param.name == 'self' and impl_type_name:
@@ -512,6 +513,8 @@ class Monomorphizer:
                 continue
             self._infer_walk(getattr(node, f.name))
         if isinstance(node, (rast.LetStmt, rast.VarStmt)):
+            if node.type is None and node.value is not None:
+                node.type = self._infer_variant_let(node.value)
             if node.type is not None:
                 self.var_types[node.name] = node.type
             elif node.value is not None:
@@ -520,6 +523,72 @@ class Monomorphizer:
                     self.var_types[node.name] = inferred
         elif isinstance(node, rast.Call):
             self._infer_one_call(node)
+
+    def _generic_variant(self, name: str):
+        """(enum, variant) when `name` is a variant of a generic user enum and
+        of no other enum, else None.  Option / Result are the builtin
+        constructors' (#2430); two enums declaring it is #2039's error."""
+        if name in self.var_types or name in self.fn_signatures \
+                or name in self.generic_functions:
+            return None
+        found = [(e, v) for e in self.enum_defs.values() for v in e.variants
+                 if v.name == name]
+        if len(found) != 1:
+            return None
+        enum_def, variant = found[0]
+        if not enum_def.type_params or enum_def.name in ('Option', 'Result'):
+            return None
+        return enum_def, variant
+
+    def _infer_variant_let(self, value: rast.Expr) -> Optional[rast.Type]:
+        """The type of an untyped `let s = Full(5)` / `var s = Empty`, `Full`
+        a variant of a generic `enum Slot<T>` (AGAST #2927), or None for any
+        other initialiser.
+
+        The fn's return type when it is an instance of that enum, as #2430
+        has it for `let o = Some(5)`; else the instance the payload binds, by
+        section 4.4's rule for a generic call: `Full(5)` is a `Slot<i64>`.  A
+        type param the payload leaves unbound (any of a unit variant's) is a
+        located error: ritz0 crashed unlocated and ritz1 called `@Full`.
+        """
+        if isinstance(value, rast.Call) and isinstance(value.func, rast.Ident) \
+                and not value.type_args:
+            name, args = value.func.name, value.args
+        elif isinstance(value, rast.Ident):
+            name, args = value.name, []
+        else:
+            return None
+        found = self._generic_variant(name)
+        if found is None:
+            return None
+        enum_def, variant = found
+        ret = self._infer_ret_type
+        if isinstance(ret, rast.NamedType) and ret.name == enum_def.name \
+                and len(ret.args) == len(enum_def.type_params):
+            return copy.deepcopy(ret)
+        params = enum_def.type_params
+        bound: Dict[str, rast.Type] = {}
+        conflict: Set[str] = set()
+        literal: Dict[str, rast.Type] = {}
+        for field_type, arg in zip(variant.fields, args):
+            if (isinstance(arg, rast.IntLit)
+                    or (isinstance(arg, rast.UnaryOp) and arg.op == '-'
+                        and isinstance(arg.operand, rast.IntLit))):
+                p = resolve_alias(field_type)
+                if isinstance(p, rast.NamedType) and p.name in params and not p.args:
+                    literal.setdefault(p.name, self._infer_arg_type(arg))
+                continue
+            arg_type = self._infer_arg_type(arg)
+            if arg_type is not None:
+                self._unify(field_type, arg_type, params, bound, conflict)
+        for tp, ty in literal.items():
+            bound.setdefault(tp, ty)
+        for tp in params:
+            if tp not in bound or tp in conflict:
+                raise GenericInferError(
+                    f"can't infer `{tp}` for `{name}`: give the binding a type", value.span)
+        return rast.NamedType(value.span, enum_def.name,
+                              [copy.deepcopy(bound[tp]) for tp in params])
 
     def _infer_arg_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of a call argument, or None when it can't be told here.

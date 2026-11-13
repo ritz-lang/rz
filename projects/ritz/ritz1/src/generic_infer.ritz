@@ -518,10 +518,159 @@ fn gi_note_decl(m: *Module, s: *Stmt)
     else if gi_type_of(m, s.var_init, @t) == 1
         gi_add_local(s.var_name, s.var_name_len, @t)
 
+# ----------------------------------------------------------------------------
+# AGAST #2927: an untyped `let s = Full(5)` / `var s = Empty`, `Full` a variant
+# of a generic `enum Slot<T>` that no other enum declares.  No slot names the
+# instance, so ritz1 lowered it to a call to an undefined `@Full`.  The let is
+# typed here, before monomorph records the instances lets name, as if written
+# `let s: Slot<i64> = Full(5)`: the fn's return type when it is an instance of
+# that enum (as #2430 has it for `Some(5)`), else the instance the payload
+# binds by the section 4.4 rule above.  A type param the payload leaves
+# unbound (any of a unit variant's) is a located error.  Mirrors ritz0's
+# Monomorphizer._infer_variant_let.
+# ----------------------------------------------------------------------------
+var g_gi_ret_name: *u8 = null   # the walked fn's return type, a struct's name
+var g_gi_ret_len: i32 = 0
+
+# 1 when a fn of the module is named `name`: it is called, not constructed.
+fn gi_fn_named(m: *Module, name: *u8, len: i32) -> i32
+    var f: *FnDef = m.functions
+    while f != null
+        if f.name_len == len and memcmp(f.name, name, len as i64) == 0
+            return 1
+        f = f.next
+    0
+
+fn gi_variant_error(e: *Expr, tp: *TypeParam, name: *u8, len: i32)
+    eprints_cstr(c"error: ")
+    eprints_cstr(g_gi_file)
+    eprint_char(':')
+    eprint_i64(e.span.line as i64)
+    eprint_char(':')
+    eprint_i64(e.span.col as i64)
+    eprints_cstr(c": can't infer `")
+    gi_eprint_n(tp.name, tp.name_len)
+    eprints_cstr(c"` for `")
+    gi_eprint_n(name, len)
+    eprints_cstr(c"`: give the binding a type\n")
+    g_gi_errors = g_gi_errors + 1
+
+# A variant's payload field `f` against its argument `arg`: what it binds.
+fn gi_unify_field(m: *Module, tps: *TypeParam, f: *StructField, arg: *Expr, b: *GiBind)
+    if f.field_type_name == null or f.field_type_name_len <= 0
+        return
+    if gi_is_int_literal(arg) == 1
+        if f.field_type == TYPE_STRUCT
+            let li: i32 = type_param_index(tps, f.field_type_name, f.field_type_name_len)
+            if li >= 0
+                *(b.lit + li) = 1
+        return
+    var t: GiType
+    if gi_type_of(m, arg, @t) == 0
+        return
+    if f.field_type == TYPE_STRUCT
+        gi_unify_named(m, tps, f.field_type_name, f.field_type_name_len, @t, b)
+    else if gi_is_ptr_kind(f.field_type) == 1 and f.ptr_pointee == TYPE_STRUCT and gi_is_ptr_kind(t.kind) == 1
+        var inner: GiType
+        if t.pointee == TYPE_STRUCT
+            gi_set(@inner, TYPE_STRUCT, t.name, t.name_len, TYPE_VOID)
+        else
+            gi_set(@inner, t.pointee, null, 0, TYPE_VOID)
+        gi_unify_named(m, tps, f.field_type_name, f.field_type_name_len, @inner, b)
+
+fn gi_type_variant_let(m: *Module, s: *Stmt)
+    let init: *Expr = s.var_init
+    if s.var_declared_type != TYPE_VOID or init == null
+        return
+    var name: *u8 = null
+    var len: i32 = 0
+    var args: *Expr = null
+    if init.kind == EXPR_CALL and init.call_type_suffix_len == 0
+        name = init.func_name
+        len = init.func_name_len
+        args = init.args
+    else if init.kind == EXPR_IDENT
+        name = init.ident_ptr
+        len = init.ident_len
+    else
+        return
+    if name == null or gi_find_local(name, len) >= 0 or gi_fn_named(m, name, len) == 1
+        return
+    var vi: i32 = 0
+    let ei: i32 = generic_enum_of_variant(name, len, @vi)
+    if ei < 0
+        return
+    var en_len: i32 = 0
+    let en: *u8 = enum_name_at(ei, @en_len)
+    if en_len == 6 and (memcmp(en, c"Option", 6) == 0 or memcmp(en, c"Result", 6) == 0)
+        return   # the builtin constructors' (#2430)
+    var tname: *u8 = null
+    var tlen: i32 = 0
+    if g_gi_ret_len > en_len and memcmp(g_gi_ret_name, en, en_len as i64) == 0 and *(g_gi_ret_name + en_len) == 36
+        tname = g_gi_ret_name
+        tlen = g_gi_ret_len
+    else
+        let tps: *TypeParam = generic_enum_params(ei)
+        let n: i32 = count_type_params(tps)
+        if n == 0
+            return
+        var b: GiBind
+        b.names = malloc((n as i64) * 8) as **u8
+        b.lens = malloc((n as i64) * 4) as *i32
+        b.conflict = malloc((n as i64) * 4) as *i32
+        b.lit = malloc((n as i64) * 4) as *i32
+        for i in 0..n
+            *(b.names + i) = null
+            *(b.lens + i) = 0
+            *(b.conflict + i) = 0
+            *(b.lit + i) = 0
+        var f: *StructField = enum_variant_fields(ei, vi)
+        var arg: *Expr = args
+        while f != null and arg != null
+            gi_unify_field(m, tps, f, arg, @b)
+            f = f.next
+            arg = arg.next
+        # The name: the enum's, then "$" and each binding in param order.
+        var total: i32 = en_len
+        var tp: *TypeParam = tps
+        var i: i32 = 0
+        while tp != null
+            if *(b.names + i) == null and *(b.lit + i) == 1
+                *(b.names + i) = c"i64"
+                *(b.lens + i) = 3
+            if (*(b.names + i) == null or *(b.conflict + i) == 1) and tname == null
+                gi_variant_error(init, tp, name, len)
+                tname = c""
+            total = total + 1 + *(b.lens + i)
+            tp = tp.next
+            i = i + 1
+        if tname == null
+            let buf: *u8 = malloc((total + 1) as i64)
+            memcpy(buf, en, en_len as i64)
+            var pos: i32 = en_len
+            for j in 0..n
+                *(buf + pos) = 36   # '$'
+                memcpy(buf + pos + 1, *(b.names + j), *(b.lens + j) as i64)
+                pos = pos + 1 + *(b.lens + j)
+            *(buf + pos) = 0
+            tname = buf
+            tlen = pos
+        free(b.names as *u8)
+        free(b.lens as *u8)
+        free(b.conflict as *u8)
+        free(b.lit as *u8)
+    if tlen <= 0
+        return   # refused
+    s.var_declared_type = TYPE_STRUCT
+    s.var_type = TYPE_STRUCT
+    s.var_type_name = tname
+    s.var_type_name_len = tlen
+
 fn gi_walk_stmt(m: *Module, s: *Stmt)
     let k: i32 = s.kind
     if k == STMT_VAR_DECL
         gi_walk_expr(m, s.var_init)
+        gi_type_variant_let(m, s)
         gi_note_decl(m, s)
     else if k == STMT_EXPR
         gi_walk_expr(m, s.expr)
@@ -590,6 +739,11 @@ fn gi_walk_expr(m: *Module, e: *Expr)
 
 fn gi_walk_fn(m: *Module, f: *FnDef, impl_name: *u8, impl_len: i32)
     g_gi_count = 0
+    g_gi_ret_name = null
+    g_gi_ret_len = 0
+    if f.return_type == TYPE_STRUCT and f.return_type_name != null
+        g_gi_ret_name = f.return_type_name
+        g_gi_ret_len = f.return_type_name_len
     g_gi_file = g_gi_input
     if f.def_file != null
         g_gi_file = f.def_file

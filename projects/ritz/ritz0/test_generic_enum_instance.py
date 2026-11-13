@@ -22,6 +22,7 @@ test_variant_payload_refused.py holds those rows.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -119,6 +120,34 @@ RUNS = {
                                      "                None => 3\n        Lacks => 4\n"
                                      "fn main() -> i32\n    let a: H = Has(Some(6))\n"
                                      "    let b: H = Has(None)\n    f(a) * 10 + f(b)\n", 63),
+    # AGAST #2927: an untyped `let` / `var` bound to a bare constructor is the
+    # instance its payload binds, as a generic call's T is (LANGUAGE_SPEC
+    # section 4.4).  ritz0 crashed (`Unknown function: Full`, no location) and
+    # ritz1 called an undefined `@Full`.  A literal is an i64...
+    "untyped_let": (SLOT + "fn main() -> i32\n    let s = Full(5)\n    match s\n"
+                    "        Full(v) => v\n        _ => 2\n", 5),
+    "untyped_let_literal_is_i64": (SLOT + "fn f(o: Slot<i64>) -> i64\n    match o\n"
+                                   "        Full(v) => v\n        _ => 2\n"
+                                   "fn main() -> i32\n    let s = Full(0x100000009)\n"
+                                   "    (f(s) - 0x100000000) as i32\n", 9),
+    # ...a typed local its own type, and a `var` can be reassigned.
+    "untyped_let_takes_the_payloads_type": (SLOT + F + "fn main() -> i32\n"
+                                            "    let x: i32 = 6\n    let s = Full(x)\n    f(s)\n", 6),
+    "untyped_var": (SLOT + "fn main() -> i32\n    var s = Full(5)\n    s = Empty\n"
+                    "    match s\n        Full(v) => v as i32\n        Empty => 7\n", 7),
+    # The fn's return type, when it is an instance of the variant's enum, as
+    # #2430 has it for `let o = Some(5)` in a `-> Option<i32>` fn.
+    "untyped_let_in_a_fn_returning_it": (SLOT + F + "fn mk() -> Slot<i32>\n    let s = Full(5)\n"
+                                         "    s\nfn main() -> i32\n    f(mk())\n", 5),
+    # A concrete enum declaring the variant too keeps it, as before.
+    "untyped_let_beside_a_concrete_enum": (SLOT + "enum Q\n    Full(i32)\n    Nope\n"
+                                           "fn main() -> i32\n    let q = Full(4)\n    match q\n"
+                                           "        Full(v) => v\n        Nope => 3\n", 4),
+    # In a generic fn the payload's T is the fn's, substituted per instance.
+    "untyped_let_in_a_generic_fn": (SLOT + "fn g<T>(x: T) -> i32\n    let s = Full(x)\n"
+                                    "    match s\n        Full(v) => 1\n        Empty => 2\n"
+                                    "fn main() -> i32\n    let a: u8 = 3\n    g<i32>(4) * 10 + g<u8>(a)\n",
+                                    11),
 }
 
 
@@ -199,3 +228,40 @@ def test_an_imported_generic_enum_is_instantiated_here(tmp_path, need_ritz1, com
     src = ("import gm\nfn f(o: Box2<i32>) -> i32\n    match o\n        Has(v) => v\n"
            "        Nil => 2\nfn main() -> i32\n    let a: Box2<i32> = Has(8)\n    f(a)\n")
     assert _run(compiler, tmp_path, src, {"gm.ritz": module}) == 8, compiler
+
+
+# AGAST #2927: an untyped let whose constructor leaves a type parameter
+# unbound is the section 4.4 error at the constructor, on all three compilers.
+# name -> (main's body, line:col of the constructor, type param, variant)
+UNINFERABLE = {
+    "unit_variant": ("    let s = Empty\n    0\n", "8:13", "T", "Empty"),
+    "unit_variant_var": ("    var s = Empty\n    0\n", "8:13", "T", "Empty"),
+    "a_param_the_payload_leaves": ("    let t = L(4)\n    0\n", "8:13", "B", "L"),
+}
+TWO = "enum Two<A, B>\n    L(A)\n    R(B)\n"
+
+
+def _uninferable_message(tp, variant):
+    return f"can't infer `{tp}` for `{variant}`: give the binding a type"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(UNINFERABLE))
+def test_an_uninferable_constructor_is_refused_at_it(tmp_path, need_ritz1, compiler, name):
+    need_ritz1(compiler)
+    body, where, tp, variant = UNINFERABLE[name]
+    src = SLOT + TWO + "fn main() -> i32\n" + body
+    at = tuple(map(int, where.split(":")))
+    got = batching.refused(compiler, src, _batch_compile, at=at)
+    if got is not None:  # AGAST #2806: this row's diagnostics from its chunk's batch
+        out, where = got
+    else:
+        batching.per_row()
+        path, ll = tmp_path / "main.ritz", tmp_path / "main.ll"
+        path.write_text(src)
+        comp = _emit(compiler, path, ll, tmp_path)
+        out = comp.stdout + comp.stderr
+        assert comp.returncode != 0, f"{compiler} accepted {name}:\n{src}\n{out}"
+    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+    assert (where, _uninferable_message(tp, variant)) in found, \
+        f"{compiler}: {name}, wanted {where}:\n{src}\n{out[-2000:]}"
