@@ -213,12 +213,22 @@ def test_oracle_is_cached_by_source():
 # every forked child (its copy of sys.modules is the forkserver's).  Three
 # such modules cost each compile ~14 ms of ~64.  The forkserver preloads them;
 # this pins that a compile imports nothing beyond ritz0_inproc.PRELOAD.
-LAZY_IMPORTS_PROBE = """\
+#
+# The probe preloads as the forkserver does, skipping a name this Python lacks
+# (multiprocessing.forkserver.main: `except ImportError: pass`).  PRELOAD names
+# _colorize, stdlib only from 3.13; importing it unguarded failed this test on
+# CI's 3.12 (AGAST #2844).  MISSING_PRELOAD_NAME is preloaded too, so a probe
+# that stops skipping fails on every version, not just on CI's.
+MISSING_PRELOAD_NAME = "_ritz_no_such_module_2844"
+LAZY_IMPORTS_PROBE = f"""\
 import contextlib, io, os, sys
 sys.path.insert(0, sys.argv[1])
 import ritz0_inproc
-for name in ritz0_inproc.PRELOAD:
-    __import__(name)
+for name in ritz0_inproc.PRELOAD + [{MISSING_PRELOAD_NAME!r}]:
+    try:
+        __import__(name)
+    except ImportError:
+        pass
 before = set(sys.modules)
 import ritz0
 sys.argv = ["ritz0.py", sys.argv[2], "-o", sys.argv[3]]
