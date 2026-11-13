@@ -29,6 +29,9 @@ AGAST #2261 closed ritz0's double evaluation of a method receiver, which
 dropped two values for one call.
 AGAST #2242 closed moves out of a nested field for ritz1, except past the 31
 paths it tracks per binding (#2319).
+AGAST #2266 closed ritz1's array literals: an element moves in, a literal
+nobody takes drops its elements, and an unannotated literal of a struct is
+`[N]T`.
 A new gap goes in as a strict xfail, so the room that closes it has to flip
 it.
 """
@@ -147,9 +150,6 @@ fn make_holder(id: i32) -> Holder
     return Holder { t: make(id), n: 0 }
 
 """
-
-# ritz1's array literals don't move their elements.
-ARRAY_ELEMENT_GAP = {"ritz1": 2266, "ritz1_selfhosted": 2266}
 
 # Unannotated bindings ritz1 can't type yet.
 BINDING_TYPE_GAP = {"ritz1": 2267, "ritz1_selfhosted": 2267}
@@ -495,7 +495,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, ARRAY_ELEMENT_GAP),
+""", 1, {}),
 
     "field_element_tuple_temporary": (SLOT + FIELDS + """\
 fn f() -> i32
@@ -517,7 +517,53 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, ARRAY_ELEMENT_GAP),
+""", 1, {}),
+
+    # A binding moves into a literal as a field does (AGAST #2266).
+    "array_element_binding": (SLOT + FIELDS + """\
+fn f() -> i32
+    var t = make(1)
+    var a: [1]Tracked = [t]
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    # Unannotated, the literal is `[1]Tracked` (ritz1 gave it an i64 slot).
+    "array_element_unannotated_binding": (SLOT + FIELDS + """\
+fn f() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    var a = [h.t]
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    # A temporary literal drops every element, in index order.
+    "array_temporary_drops_each_element": (SLOT + FIELDS + """\
+fn f() -> i32
+    [make(1), make(2)]
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS * 100 + ORDER
+""", 212, {}),
+
+    # A copy-typed struct literal gets its element type too, and copies.
+    "array_unannotated_copy_elements": (SLOT + FIELDS + """\
+fn f() -> i32
+    var a = [Plain { x: 3, y: 4 }, Plain { x: 1, y: 2 }]
+    var p = a[0]
+    return a[0].x * 100 + a[1].y * 10 + p.y
+
+pub fn main() -> i32
+    return f() - 300
+""", 24, {}),
 
     "field_binding_pointer_member": (SLOT + FIELDS + """\
 fn f() -> i32
@@ -2313,6 +2359,14 @@ pub fn main() -> i32
 pub fn main() -> i32
     var t = make(1)
     var u = t
+    return t.id
+""", "t", {}),
+
+    # An array literal takes its elements (AGAST #2266).
+    "after_move_into_array_literal": ("""\
+pub fn main() -> i32
+    var t = make(1)
+    [t]
     return t.id
 """, "t", {}),
 

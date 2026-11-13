@@ -1073,16 +1073,8 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
 # marked it a temporary, spill it with a set drop flag and queue its drop.
 pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     let o: *OwnState = s.own
-    if o.temp_expr_count == 0 or reg == 0
+    if reg == 0 or own_take_temp_mark(o, e) == 0
         return
-    let te: **Expr = o.temp_exprs
-    var i: i32 = 0
-    while i < o.temp_expr_count and te[i] != e
-        i += 1
-    if i >= o.temp_expr_count
-        return
-    o.temp_expr_count = o.temp_expr_count - 1
-    te[i] = te[o.temp_expr_count]
     var len: i32 = 0
     let name: *u8 = own_call_ret_type(s, e, @len)
     if name == null
@@ -1099,6 +1091,40 @@ pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     emit_str(s, c", ptr ")
     emit_reg(s, slot)
     emit_str(s, c"\n")
+    own_push_temp(s, slot, name, len, 0)
+
+# 1 when the move check marked `e` a temporary; forgets the mark.
+fn own_take_temp_mark(o: *OwnState, e: *Expr) -> i32
+    if o.temp_expr_count == 0
+        return 0
+    let te: **Expr = o.temp_exprs
+    var i: i32 = 0
+    while i < o.temp_expr_count and te[i] != e
+        i += 1
+    if i >= o.temp_expr_count
+        return 0
+    o.temp_expr_count = o.temp_expr_count - 1
+    te[i] = te[o.temp_expr_count]
+    1
+
+# AGAST #2266: after emit_expr wrote array literal `e` (`[N]T` of struct T)
+# into the alloca `slot`: if the move check marked it a temporary (nobody
+# takes it), queue the drop of its elements, as a `[N]T` binding's.
+pub fn own_note_array_temp(s: *EmitterState, e: *Expr, slot: i32)
+    let o: *OwnState = s.own
+    if own_take_temp_mark(o, e) == 0
+        return
+    var len: i32 = 0
+    var count: i32 = 0
+    let name: *u8 = own_temp_type(s, e, @len, @count)
+    if name == null
+        return
+    own_push_temp(s, slot, name, len, count)
+
+# Queue the drop of the temporary at `slot` (a `T`, or `[count]T` when count
+# > 0), with a set drop flag.
+fn own_push_temp(s: *EmitterState, slot: i32, name: *u8, len: i32, count: i32)
+    let o: *OwnState = s.own
     let flag: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, flag)
@@ -1118,7 +1144,7 @@ pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     b.moved = 0
     b.move_line = 0
     b.move_col = 0
-    b.count = 0
+    b.count = count
     b.shadow = 0
     b.paths = null
     b.path_count = 0
@@ -1738,11 +1764,53 @@ fn own_call_ret_type(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
     *out_len = f.return_type_name_len
     f.return_type_name
 
-# `e`, a call whose move-only result nobody takes, yields a temporary:
-# remember it for own_note_temp.
+# AGAST #2266: the struct T an array literal `[a, b, ..]` holds, as `[N]T`:
+# returns N and writes T's name, or returns 0 (name null) when no element
+# names a struct.  The first element whose type ritz1 can name decides; a
+# string literal names none (its `%Span$u8` isn't the slot's `%StrView`).
+pub fn array_lit_struct_elem(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    if e == null or e.kind != EXPR_ARRAY_LIT
+        return 0
+    var n: i32 = 0
+    var it: *Expr = e.args
+    while it != null
+        if *out_len == 0 and it.kind == EXPR_STRUCT_LIT and it.ident_len > 0
+            *out_name = it.ident_ptr as *u8
+            *out_len = it.ident_len
+        else if *out_len == 0 and it.kind != EXPR_STRING_LIT
+            var t: RefTy
+            if ref_ty_of(s, it, @t) == 1 and t.kind == TYPE_STRUCT and t.name_len > 0
+                *out_name = t.name
+                *out_len = t.name_len
+        n += 1
+        it = it.next
+    if *out_len == 0
+        return 0
+    n
+
+# The move-only type a temporary `e` holds, or null: a call's result (count
+# 0), or an array literal's elements (count N, AGAST #2266).
+fn own_temp_type(s: *EmitterState, e: *Expr, out_len: *i32, out_count: *i32) -> *u8
+    *out_count = 0
+    if e.kind != EXPR_ARRAY_LIT
+        return own_call_ret_type(s, e, out_len)
+    var name: *u8 = null
+    var len: i32 = 0
+    let n: i32 = array_lit_struct_elem(s, e, @name, @len)
+    if n == 0 or own_type_is_move_only(s, name, len) == 0
+        return null
+    *out_len = len
+    *out_count = n
+    name
+
+# `e`, a call or array literal whose move-only value nobody takes, yields a
+# temporary: remember it for own_note_temp / own_note_array_temp.
 fn own_mark_temp(s: *EmitterState, e: *Expr)
     var len: i32 = 0
-    if own_call_ret_type(s, e, @len) == null
+    var count: i32 = 0
+    if own_temp_type(s, e, @len, @count) == null
         return
     let o: *OwnState = s.own
     if o.temp_expr_count >= o.temp_expr_cap
@@ -1936,14 +2004,19 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
             own_walk(s, fi.value, 1)
             fi = fi.next
     else if k == EXPR_ARRAY_LIT
-        # A literal owns its elements (ritz0 #2238).  ritz1 doesn't track that
-        # move yet, but it can tell one that isn't there to make.
+        # A literal owns its elements (ritz0 #2238, AGAST #2266): each moves
+        # in, as into a struct literal's field, and a literal nobody takes
+        # is a temporary that drops them.
         var el: *Expr = e.args
         while el != null
             if own_moves_out(s, el) == 1
                 let eat: *Expr = own_start_of(el)
                 ref_error_move_out(s, eat.span.line, eat.span.col)
+            else
+                own_walk(s, el, 1)
             el = el.next
+        if mv == 0
+            own_mark_temp(s, e)
     else if k == EXPR_MATCH
         own_walk(s, e.left, own_scrutinee_mv(s, e.left))
     else if k == EXPR_IF
