@@ -22,10 +22,13 @@ from ufcs import UFCS_NON_GENERIC_PREFIXES
 
 
 class OwnershipError(Exception):
-    """Error for ownership/borrowing violations."""
-    def __init__(self, message: str, span = None):
+    """Error for ownership/borrowing violations. `after_move` marks a use or
+    a borrow of a value that already moved: at a move-only `T` a generic
+    instance can do that where its generic body doesn't (AGAST #2921)."""
+    def __init__(self, message: str, span = None, after_move: bool = False):
         self.span = span
         self.reason = message
+        self.after_move = after_move
         if span:
             super().__init__(f"{span.file}:{span.line}:{span.column}: {message}")
         else:
@@ -382,11 +385,13 @@ class MoveChecker:
         return self.errors
 
     def check_instances(self, module: rast.Module) -> List[OwnershipError]:
-        """Moves out of a reference in a monomorphised module's generic
-        instances. `check` saw those bodies with `T` a copy type (AGAST #2263),
-        so an instance at a move-only `T` is where `*p` turns into a move. Each
-        is checked on a copy: the emitter reads the marks `check` leaves, and
-        giving an instance its own is #2263's change, not this one."""
+        """Moves out of a reference, and uses or borrows of a moved value, in
+        a monomorphised module's generic instances. `check` saw those bodies
+        with `T` a copy type (AGAST #2263), so an instance at a move-only `T`
+        is where `*p` turns into a move and where `let b: T = x` after
+        `let a: T = x` uses a moved `x` (AGAST #2921, as ritz1 refuses it).
+        Each is checked on a copy: the emitter reads the marks `check` leaves,
+        and giving an instance its own is #2263's change, not this one."""
         self.errors = []
         self._collect(module)
         fns = [item for item in module.items if isinstance(item, rast.FnDef)]
@@ -396,7 +401,8 @@ class MoveChecker:
         for fn in fns:
             if any(self.types.is_move_only(a) for a in getattr(fn, 'instance_args', ())):
                 self._check_fn(copy.deepcopy(fn))
-        self.errors = [e for e in self.errors if e.reason == ref_rules.MOVE_OUT_OF_REF]
+        self.errors = [e for e in self.errors
+                       if e.reason == ref_rules.MOVE_OUT_OF_REF or e.after_move]
         self._drop_repeats()
         return self.errors
 
@@ -1080,7 +1086,7 @@ class MoveChecker:
                 if var_info.state == VarState.MOVED:
                     self.errors.append(OwnershipError(
                         f"use of moved value: `{expr.name}` (moved at {var_info.move_span})",
-                        expr.span
+                        expr.span, after_move=True
                     ))
                     return
                 # Used whole after a field was moved out (AGAST #2171).
@@ -1088,7 +1094,7 @@ class MoveChecker:
                     fname, fspan = next(iter(var_info.moved_fields.items()))
                     self.errors.append(OwnershipError(
                         f"use of moved value: `{expr.name}.{fname}` (moved at {fspan})",
-                        expr.span
+                        expr.span, after_move=True
                     ))
                     return
 
@@ -1554,13 +1560,13 @@ class MoveChecker:
         if info.state == VarState.MOVED:
             self.errors.append(OwnershipError(
                 f"use of moved value: `{name}` (moved at {info.move_span})",
-                expr.span))
+                expr.span, after_move=True))
             return
         for moved, moved_at in info.moved_fields.items():
             if path_within(path, moved) or path_within(moved, path):
                 self.errors.append(OwnershipError(
                     f"use of moved value: `{name}.{moved}` (moved at {moved_at})",
-                    expr.span))
+                    expr.span, after_move=True))
                 return
         if not is_move_context or not self.types.is_move_only(self._field_path_type(expr)):
             return
@@ -1714,14 +1720,14 @@ class MoveChecker:
                 if var_info.state == VarState.MOVED:
                     self.errors.append(OwnershipError(
                         f"cannot borrow `{expr.name}` - value has been moved",
-                        span
+                        span, after_move=True
                     ))
                     return
                 if var_info.moved_fields:
                     fname = next(iter(var_info.moved_fields))
                     self.errors.append(OwnershipError(
                         f"cannot borrow `{expr.name}` - `{expr.name}.{fname}` has been moved",
-                        span
+                        span, after_move=True
                     ))
                     return
         else:

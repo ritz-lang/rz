@@ -2390,9 +2390,9 @@ fn f(r: (Result<T, i32>, i32)) -> Result<i32, i32>
 
 
 class TestGenericInstances:
-    """`check_instances` judges moves out of a reference at each `T` (AGAST
-    #2336), and nothing else: what a generic body otherwise does at a move-only
-    `T` is #2263's."""
+    """`check_instances` judges moves out of a reference (AGAST #2336) and uses
+    or borrows of a moved value (AGAST #2921) at each `T`. What else a generic
+    body does at a move-only `T`, its drops among them, is #2263's."""
 
     DEFS = drop_impl("T") + """
 struct T
@@ -2417,13 +2417,25 @@ fn f(p: *T) -> T
 """)
         assert [e.reason for e in MoveChecker().check_instances(module)] == [MOVE_OUT_OF_REF]
 
-    def test_a_use_after_move_stays_2263s(self):
+    def test_a_use_after_move_is_reported_at_a_move_only_type(self):
         module, _ = self.instances("""
 fn twice<X>(x: X) -> i32
     return eat<X>(x) + eat<X>(x)
 
 fn f(t: T) -> i32
     return twice<T>(t)
+""")
+        errors = MoveChecker().check_instances(module)
+        assert [e.after_move for e in errors] == [True]
+        assert "use of moved value: `x`" in errors[0].reason
+
+    def test_a_use_after_move_is_not_reported_at_a_copy_type(self):
+        module, _ = self.instances("""
+fn twice<X>(x: X) -> i32
+    return eat<X>(x) + eat<X>(x)
+
+fn f(t: i32) -> i32
+    return twice<i32>(t)
 """)
         assert MoveChecker().check_instances(module) == []
 
