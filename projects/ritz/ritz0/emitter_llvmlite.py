@@ -1555,6 +1555,10 @@ class LLVMEmitter:
                 return self._slice_ritz_type(expr.expr)
             base_type = self._infer_ritz_type(expr.expr)
             if base_type:
+                # `b[i]` on `b: A` with `type A = [4]u8` is a u8 (AGAST #2365).
+                # Unresolved, `A` is a NamedType, the element came back None and
+                # _infer_unsigned_expr read it signed: 200 compared as -56.
+                base_type = resolve_alias_in(base_type, self.type_aliases)
                 # A reference to a Vec auto-derefs on index (AGAST #1968), so
                 # `d[i]` on `d: @Vec<T>` is a T, mirroring _emit_index.
                 if (isinstance(base_type, rast.RefType)

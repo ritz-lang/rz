@@ -232,9 +232,6 @@ LITERALS = {
 }
 
 
-ALIAS_READS_SIGNED = ("u8", "u32", "fill_u8")
-
-
 def _literal_program(template, name):
     elem, literal, value = LITERALS[name]
     check = f"if b[3] != {value}\n"
@@ -256,8 +253,6 @@ def test_a_literal_takes_the_slots_element_type(tmp_path, compiler, store, liter
 @pytest.mark.parametrize("literal", _ids(LITERALS))
 @pytest.mark.parametrize("store", _ids(LITERAL_STORES_RITZ0))
 def test_a_literal_tail_takes_the_slots_element_type(tmp_path, store, literal):
-    if store.startswith("alias") and literal in ALIAS_READS_SIGNED:
-        pytest.skip("indexing an aliased unsigned array reads it signed, on any array")
     assert _run("ritz0", tmp_path, f"{store}_{literal}",
                 _literal_program(LITERAL_STORES_RITZ0[store], literal)) == 0
 
