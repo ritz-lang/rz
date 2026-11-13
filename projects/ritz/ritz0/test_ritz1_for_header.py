@@ -149,12 +149,6 @@ def _new(ty: str, values, name: str = "v") -> str:
     return f"    var {name}: Vec<{ty}> = vec_new<{ty}>()\n" + _pushes(name, values)
 
 
-def _new_through_locals(ty: str, values) -> str:
-    """_new, for a literal ritz1 can't pass as it stands: `push(1.5)` to an f32 is #2412."""
-    locals_ = "".join(f"    var c{i}: {ty} = {v}\n" for i, v in enumerate(values))
-    return locals_ + _new(ty, [f"c{i}" for i in range(len(values))])
-
-
 # Sums a `Vec<i32>`.  Seven, from 1, 2 and 4: a skipped or repeated element shows.
 SUM = "var t: i32 = 0\nfor x in {it}\n    t = t + x\nif t != 7\n    return 1\nreturn 0\n"
 SEED = (1, 2, 4)
@@ -211,11 +205,9 @@ HOLDERS = {
     "global_struct_field": _in_main("gh.v", "    gh.v = vec_new<i32>()\n" + "".join(
         f"    vec_push<i32>(@&gh.v, {v})\n" for v in SEED), VH + "var gh: VH\n\n"),
     "call": _in_main("mk()", "", "fn mk() -> Vec<i32>\n" + FILL_V + "    return v\n\n"),
-    # vec_push, as `v.push` doesn't link in a generic fn (#2412).
     "generic_call": _in_main("mk<i32>(1)", "", "fn mk<T>(a: T) -> Vec<T>\n"
-                             "    var v: Vec<T> = vec_new<T>()\n    vec_push<T>(@&v, a)\n"
-                             "    vec_push<T>(@&v, a + 1)\n    vec_push<T>(@&v, a + 3)\n"
-                             "    return v\n\n"),
+                             "    var v: Vec<T> = vec_new<T>()\n    v.push(a)\n"
+                             "    v.push(a + 1)\n    v.push(a + 3)\n    return v\n\n"),
     "method_call": (GVEC + "struct K\n    n: i32\n\nimpl K\n    fn mk(self: @K) -> Vec<i32>\n"
                     + _body(FILL_V, "    ") + "        return v\n\n" + MAIN
                     + "    var k: K\n" + _body(SUM.format(it="k.mk()"))),
@@ -286,7 +278,7 @@ FORMS = ["v", "@v"]
 @pytest.mark.parametrize("ty", NUMBERS)
 def test_a_number_is_read_at_its_own_width(run_with, compiler, it, ty):
     vs = SCALARS[ty]
-    program = GVEC + MAIN + _new_through_locals(ty, vs) + _body(_walk(it, 3, _check(ty, vs)))
+    program = GVEC + MAIN + _new(ty, vs) + _body(_walk(it, 3, _check(ty, vs)))
     assert run_with(compiler, f"n_{ty}", program) == 0
 
 
@@ -467,7 +459,7 @@ def test_a_vec_ritz1_had_no_struct_for(run_with, compiler, name):
     assert run_with(compiler, name, program) == want
 
 
-# No `push` for this one on ritz1 (#2412), so the header is built by hand.
+# No `push` for this one on ritz1 (#2942), so the header is built by hand.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("it", FORMS)
@@ -701,12 +693,11 @@ def test_a_view_written_in_the_body_is_seen(run_with, compiler):
     assert run_with(compiler, "view", program) == 1
 
 
-# Through a local, as `w.s = "ab"` is invalid IR on ritz1 (#2412).
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_view_field_written_in_the_body_is_seen(run_with, compiler):
     program = ("struct W\n    k: i32\n    s: StrView\n\n" + MAIN
-               + "    let s: StrView = \"abc\"\n    let e: StrView = \"a\"\n    var w: W\n    w.s = s\n"
+               + "    let e: StrView = \"a\"\n    var w: W\n    w.s = \"abc\"\n"
                "    var n: i32 = 0\n    for b in w.s\n        w.s = e\n        n = n + 1\n"
                "    return n\n")
     assert run_with(compiler, "view_field", program) == 1
@@ -796,10 +787,9 @@ VIEWS = {
                       + "    return f(\"ab\")\n"),
     "strview_reference": ("fn f(s: @StrView) -> i32\n" + _body(_BYTES.format(it="s")) + "\n" + MAIN
                           + _SV + "    return f(@s)\n"),
-    # Through a local, as `w.s = "ab"` is invalid IR on ritz1 (#2412).
-    "strview_field": (_W + MAIN + _SV + "    var w: W\n    w.s = s\n"
+    "strview_field": (_W + MAIN + "    var w: W\n    w.s = \"ab\"\n"
                       + _body(_BYTES.format(it="w.s"))),
-    "addr_of_strview_field": (_W + MAIN + _SV + "    var w: W\n    w.s = s\n"
+    "addr_of_strview_field": (_W + MAIN + "    var w: W\n    w.s = \"ab\"\n"
                               + _body(_BYTES.format(it="@w.s"))),
     "as_bytes_through_a_reference": ("fn f(s: @StrView) -> i32\n"
                                      + _body(_BYTES.format(it="s.as_bytes()")) + "\n" + MAIN + _SV

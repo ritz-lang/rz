@@ -490,6 +490,10 @@ fn emit_ufcs_call(s: *EmitterState, e: *Expr, fn_def: *FnDef, receiver_reg: i32,
                     emit_reg(s, arg_regs[j])
                     emit_str(s, c" to i1\n")
                     converted_regs[j] = bool_trunc
+            else if param_float_type(param_ptr) != 0
+                # AGAST #2412: `v.push(1.5)` on a Vec<f32> passed the literal's
+                # `double` as `float`.  vec_push$f32's `item: T` is f32 by now.
+                converted_regs[j] = ufcs_float_arg(s, param_ptr, nth_arg(e.args, j), arg_regs[j])
             else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len > 0
                 # Scalar→struct newtype boxing: when the formal is a single-
                 # field (or narrow aggregate) struct but the arg is an
@@ -5691,6 +5695,29 @@ fn method_float_arg(s: *EmitterState, p: *Param, arg: *Expr, reg: i32) -> i32
     if src_ty != TYPE_F32 and src_ty != TYPE_F64
         src_ty = TYPE_I64
     emit_float_coerce(s, reg, src_ty, p.param_type)
+
+# TYPE_F32 / TYPE_F64 when param `p` is a float: declared so, or a generic
+# `T` monomorph substituted with f32 / f64 and left TYPE_STRUCT.  Else 0.
+fn param_float_type(p: *Param) -> i32
+    if p.param_type == TYPE_F32 or p.param_type == TYPE_F64
+        return p.param_type
+    if p.param_type != TYPE_STRUCT
+        return 0
+    if name_eq(p.param_type_name, p.param_type_name_len, c"f32", 3) == 1
+        return TYPE_F32
+    if name_eq(p.param_type_name, p.param_type_name_len, c"f64", 3) == 1
+        return TYPE_F64
+    0
+
+# A UFCS call's arg register `reg` coerced to its float param `p` (AGAST
+# #2412): fptrunc a double, fpext a float, sitofp an integer.
+fn ufcs_float_arg(s: *EmitterState, p: *Param, arg: *Expr, reg: i32) -> i32
+    var src_ty: i32 = TYPE_I64
+    if arg != null
+        src_ty = get_expr_type(s, arg)
+    if src_ty != TYPE_F32 and src_ty != TYPE_F64
+        src_ty = TYPE_I64
+    emit_float_coerce(s, reg, src_ty, param_float_type(p))
 
 # Emit `%t = trunc i64 <reg><suffix>` and return %t.  One format_into
 # rather than five emit_str / emit_reg calls (AGAST #1824).

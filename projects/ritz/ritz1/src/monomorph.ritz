@@ -2117,7 +2117,9 @@ fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suff
         if template.type_params != null
             tp_name = template.type_params.name
             tp_len = template.type_params.name_len
-        return specialize_fn_one_param(m, template, tp_name, tp_len, suffix, suffix_len)
+        let one: *FnDef = specialize_fn_one_param(m, template, tp_name, tp_len, suffix, suffix_len)
+        collect_receiver_methods(m, one)
+        return one
 
     let cap: i64 = 4 * mangled_arg_capacity(suffix, suffix_len) as i64
     let starts: *i32 = malloc(cap) as *i32
@@ -2145,6 +2147,30 @@ fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suff
     g_mono_ret_len = saved_ret_len
     g_mono_tail = saved_tail
     cur
+
+# AGAST #2412: walk a one-parameter specialisation's finished body, as the
+# multi-parameter path does, so a method on a local the substitution made
+# concrete registers its UFCS helper: `v.push(a)` in `mk<T>` with
+# `v: Vec<T>` needs `vec_push$i32` in `mk$i32`.  clone_expr registers only
+# explicit generic calls (`vec_push<T>(@&v, a)`); a method's helper is named
+# by its receiver's type, which only the local-var tracker knows.  Templates
+# are never walked, so the receiver's `Vec$T` never registered `vec_push$T`.
+fn collect_receiver_methods(m: *Module, f: *FnDef)
+    if f == null
+        return
+    let saved_ret: *u8 = g_mono_ret_name
+    let saved_ret_len: i32 = g_mono_ret_len
+    let saved_tail: *Stmt = g_mono_tail
+    reset_local_var_tracker()
+    var pp: *Param = f.params
+    while pp != null
+        track_typed_local_through(pp.name, pp.name_len, pp.param_type, pp.param_pointee_type, pp.param_type_name, pp.param_type_name_len)
+        pp = pp.next
+    set_mono_fn_context(null)   # A specialisation has no slot context (#2877).
+    collect_from_fn_body(m, f.body)
+    g_mono_ret_name = saved_ret
+    g_mono_ret_len = saved_ret_len
+    g_mono_tail = saved_tail
 
 # Rewrite every `$`-separated component of `name` that equals type_param to
 # the argument of the one-argument suffix "$arg" (new_suffix):
