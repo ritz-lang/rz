@@ -2414,6 +2414,22 @@ fn main() -> i32
     f(Some(5))
 ```
 
+A variant pattern with a field list lists every field of its variant, in
+order: `Two(a, b)` on `Two(i32, i32)`, `_` for one it doesn't bind. Any other
+count, including a field on a variant that has none, is a compile error at the
+pattern naming both counts (AGAST #2408), reported before a missing arm. A bare
+`Two` tests the variant alone.
+
+```ritz expect-error="variant 'None' has 0 fields, but this pattern lists 1"
+fn f(o: Option<i32>) -> i32
+    match o
+        Some(v) => v
+        None(k) => 0
+
+fn main() -> i32
+    f(Some(5))
+```
+
 A variant pattern, qualified (`E.V`, `E.V(x)`) or not (`V(x)`), names a
 variant of the scrutinee's enum. One of any other enum is a compile error at
 the pattern, naming the enum as declared (AGAST #2431); a missing arm is

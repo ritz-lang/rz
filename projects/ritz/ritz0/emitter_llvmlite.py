@@ -14431,6 +14431,10 @@ class LLVMEmitter:
         variant_names = {variant.name for variant in variants}
         self._refuse_arm_names(expr, lambda name: name in variant_names)
         names = [variant.name for variant in variants]
+        # Ahead of coverage, which judges the fields a pattern has: `Two(a)`
+        # covered `Two(i32, i32)` (AGAST #2408).
+        for arm in expr.arms:
+            self._require_field_count(enum_name, arm.pattern)
         self._require_covered(expr, match_coverage.enum_gap(expr.arms, names))
         # An arm naming a variant this enum doesn't declare is that error, not
         # an unreachable arm, though it follows every variant (AGAST #2349).
@@ -14645,6 +14649,24 @@ class LLVMEmitter:
             if kind is not None:
                 raise EmitError(binder_names.refusal(kind, pattern.name),
                                 pattern.span or arm.span)
+
+    def _require_field_count(self, enum_name: str, pattern: rast.Pattern) -> None:
+        """A variant pattern lists every field of its variant (AGAST #2408).
+
+        The arms zip the two, so a mismatch was cut to the shorter: `Two(a)`
+        read one field of two, and `Z(a)` on a bare `Z` bound nothing and died
+        unlocated. A bare `Two` tests the tag alone and has no list to count;
+        a variant the enum doesn't declare is _require_enum_variant's error.
+        """
+        if (not isinstance(pattern, rast.VariantPattern) or not pattern.fields
+                or not self._has_enum_variant(enum_name, pattern.name)):
+            return
+        has = len(self._get_enum_variant(enum_name, pattern.name).fields)
+        if has != len(pattern.fields):
+            noun = "field" if has == 1 else "fields"
+            raise EmitError(
+                f"variant '{pattern.name}' has {has} {noun}, but this pattern "
+                f"lists {len(pattern.fields)}", pattern.span)
 
     def _refuse_payload_tests(self, pattern: rast.VariantPattern) -> None:
         """A payload is bound, never tested (AGAST #2350, LANGUAGE_SPEC §8.2).

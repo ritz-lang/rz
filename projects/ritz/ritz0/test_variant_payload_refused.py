@@ -125,10 +125,8 @@ LITERALS = {
     "behind_a_covering_arm": ("fn f(o: Option<i32>) -> i32\n    match o\n        Some(0) => 1\n"
                               "        Some(v) => v\n        None => 2\n"
                               "fn main() -> i32\n    f(Some(5))\n", 3, 14, "0", "Some"),
-    "more_fields_than_the_variant": (_opt("i32", "Some(a, 0)", "5"), 3, 17, "0", "Some"),
-    "payload_on_a_bare_variant": (_P + "fn f(p: P) -> i32\n    match p\n        Z(0) => 1\n"
-                                  "        _ => 2\nfn main() -> i32\n    f(P.Z)\n",
-                                  7, 11, "0", "Z"),
+    # `Some(a, 0)` and `Z(0)` list a field their variant lacks, and that count is
+    # the error now, ahead of this one: test_variant_pattern_field_count.py.
 }
 
 # A type names no value here: `Some(bool)` took an `Option<i32>`'s every `Some`.
@@ -482,19 +480,10 @@ def test_ritz1_still_runs_a_payload_that_binds(request, tmp_path, compiler, name
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 
 
-# Each arm has no field to read. ritz0 stops at both (#2423); ritz1 binds, which
-# #2408 and #2421 own. Here it must only get through. The name is no const: one
-# would be the binder's error (R12) before any field. A variant the enum doesn't
-# declare (`Nope(k)` on a B) is refused on all three: test_match_foreign_variant.py.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("source", [
-    pytest.param(_Q + _on("Q", "Z(k)", "Q.Z"), id="unit_variant"),
-    pytest.param(_opt("i32", "None(k)", "5"), id="none"),
-])
-def test_ritz1_reads_no_field_where_an_arm_has_none(request, tmp_path, compiler, source):
-    proc, _ = _ritz1(request, compiler, tmp_path, source)
-    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-800:]
+# A name on a variant with no field (`Z(k)`, `None(k)`) is the field count's error
+# on all three (#2408): test_variant_pattern_field_count.py. A variant the enum
+# doesn't declare (`Nope(k)` on a B) is refused on all three:
+# test_match_foreign_variant.py.
 
 
 @pytest.mark.integration

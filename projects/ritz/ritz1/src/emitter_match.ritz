@@ -1400,6 +1400,64 @@ fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name: *u8, len: 
         arm = arm.next
     refused
 
+# --- Field count (AGAST #2408; LANGUAGE_SPEC §8.2) ----------------------------
+#
+# A variant pattern lists one field per field of its variant.  The grammar takes
+# one name, so this is a name on a bare variant (`Z(a)`, `None(k)`), bound to
+# nothing, or on a struct variant of more fields than one.  ritz0's twin is
+# _require_field_count, which also counts the lists ritz1 can't parse.
+
+# How many fields variant `name` of the scrutinee has, or -1 if it has none so
+# called: that is match_refuse_foreign_arms' error, after coverage.
+fn match_variant_field_count(ei: i32, builtin: i32, name: *u8, len: i32) -> i32
+    if ei < 0
+        if builtin == MATCH_OPTION and name_eq(name, len, c"None", 4) == 1
+            return 0
+        return 1
+    for vi in 0..enum_variant_count(ei)
+        var vlen: i32 = 0
+        let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+        if name_eq(vname, vlen, name, len) == 1
+            let kind: i32 = enum_variant_kind(ei, vi)
+            if kind == ENUM_VARIANT_UNIT
+                return 0
+            if kind == ENUM_VARIANT_TUPLE
+                return 1
+            var n: i32 = 0
+            var f: *StructField = enum_variant_fields(ei, vi)
+            while f != null
+                n = n + 1
+                f = f.next
+            return n
+    0 - 1
+
+# How many arms list a field count their variant doesn't have, each said at its
+# pattern, naming both counts.
+fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i32) -> i32
+    if ei < 0 and builtin == 0
+        return 0
+    var refused: i32 = 0
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_VARIANT
+            let has: i32 = match_variant_field_count(ei, builtin, arm.pattern_name, arm.pattern_name_len)
+            if has >= 0 and has != 1
+                eprints_cstr(fn_source_file(emitter_current_fn()))
+                eprint_char(':')
+                eprint_i64(arm.head_span.line as i64)
+                eprint_char(':')
+                eprint_i64(arm.head_span.col as i64)
+                eprints_cstr(c": error: variant '")
+                eprint_bytes(arm.pattern_name, arm.pattern_name_len)
+                eprints_cstr(c"' has ")
+                eprint_i64(has as i64)
+                eprints_cstr(c" fields, but this pattern lists 1\n")
+                emit_str(s, c"  ; ERROR: a variant pattern lists a field count its variant doesn't have\n")
+                s.error_count = s.error_count + 1
+                refused = refused + 1
+        arm = arm.next
+    refused
+
 # --- Reachability (LARB R13, AGAST #2349; LANGUAGE_SPEC §8.1) ----------------
 #
 # Arms are tried top to bottom and the first that matches wins, so an arm no
@@ -1521,6 +1579,9 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     # AGAST #2407: a name that binds can't take a module value's name, and
     # that error comes before the coverage one, as on ritz0.
     if match_refuse_arm_names(s, arms, ei, builtin) > 0
+        return
+    # AGAST #2408: a pattern's fields are its variant's, ahead of coverage.
+    if match_refuse_field_counts(s, arms, ei, builtin) > 0
         return
     var arm: *MatchArm = arms
     while arm != null
