@@ -27,6 +27,8 @@ import ritzlib.sys
 import ritzlib.str
 
 import ast
+import ast_helpers    # primitive_name_from_type
+import struct_index   # si_traits, si_needs_index_msg (AGAST #2452)
 import emitter_core
 import emitter_expr   # emit_member_gep_from_ptr
 
@@ -417,6 +419,10 @@ pub fn index_refused(s: *EmitterState, e: *Expr) -> i32
         return 0
     if through_slice_refused(s, e) == 1
         return 1
+    if e.left.kind == EXPR_INDEX
+        return element_refused(s, e)
+    if e.left.kind == EXPR_UNARY and e.left.op == OP_DEREF
+        return deref_value_refused(s, e.left)
     if e.left.kind != EXPR_IDENT
         return 0
     let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
@@ -428,6 +434,80 @@ pub fn index_refused(s: *EmitterState, e: *Expr) -> i32
     if loc.pointee_type == TYPE_ARRAY or sees_through(loc) == 1
         return 0
     emit_nd_error(s, e.span.line, e.span.col, c"a reference is one value, not a buffer: `[]` needs an array, Vec, Span or String behind it")
+    1
+
+# Where `e`'s `[` is: the parser's record of it, else (an index the compiler
+# built) the start of `e`.
+pub fn index_bracket_line(e: *Expr) -> i32
+    if e.bracket.line > 0
+        return e.bracket.line
+    e.span.line
+
+pub fn index_bracket_col(e: *Expr) -> i32
+    if e.bracket.line > 0
+        return e.bracket.col
+    e.span.col
+
+# AGAST #2452: 1 after reporting `e`, `x[i][j]` with `x[i]` an element held in a
+# Vec, Span, String or local `[N]T` that has nothing to index: a struct without
+# `Index`, or a scalar.  ritz1 took `sv[0][1]` on a `Vec<S>` for a buffer and failed at clang,
+# and `v[0][1]` on a `Vec<i32>` compiled.  §7.8's words, at the second `[`, as
+# ritz0's _struct_index and _index_through say them.  An element that's a
+# pointer is a raw buffer, and one that's a Vec, Span or String indexes (#2442).
+fn element_refused(s: *EmitterState, e: *Expr) -> i32
+    if e.right == null or e.right.kind == EXPR_RANGE
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    var held: i32 = TYPE_PTR
+    var kind: i32 = TYPE_VOID
+    let arr: *LocalVar = array_local_of(s, e.left)
+    if arr != null
+        kind = arr.array_elem_type
+        if kind == TYPE_STRUCT
+            name = arr.type_name
+            len = arr.type_name_len
+    else
+        let outer: *LocalVar = index_through(s, e.left)
+        if outer == null
+            return 0
+        held = through_elem_struct(s, outer, @name, @len)
+        if name == null
+            kind = through_elem_kind(s, outer)
+    if name != null
+        if held != TYPE_PTR or name_is_indexable(name, len) == 1
+            return 0
+        if (si_traits(s.module, name, len) & SI_INDEX) != 0
+            return 0
+    else
+        name = primitive_name_from_type(kind)
+        if name == null
+            return 0
+        len = strlen(name) as i32
+    emit_nd_error(s, index_bracket_line(e), index_bracket_col(e), si_needs_index_msg(name, len))
+    1
+
+# The local `[N]T` that `x`, `a[i]`, indexes, or null.
+fn array_local_of(s: *EmitterState, x: *Expr) -> *LocalVar
+    if x.left == null or x.left.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, x.left.ident_ptr, x.left.ident_len)
+    if loc == null or loc.var_type != TYPE_ARRAY
+        return null
+    loc
+
+# AGAST #2452: 1 after reporting `d`, the `*v` of `(*v)[i]`, when `v` is a
+# struct by value (a Vec, Span, String or any other): there is no pointer to
+# follow.  ritz1 read the struct's bytes as an address, and failed at clang or
+# compiled.  ritz0 says the same, from array_rules.NOT_A_POINTER.
+fn deref_value_refused(s: *EmitterState, d: *Expr) -> i32
+    let v: *Expr = d.operand
+    if v == null or v.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, v.ident_ptr, v.ident_len)
+    if loc == null or loc.var_type != TYPE_STRUCT
+        return 0
+    emit_nd_error(s, d.span.line, d.span.col, c"`*x` needs `x` to be a pointer or a reference: this one is a value")
     1
 
 # AGAST #2330: 1 after reporting `p[i] = b` with `b` a whole array, when `loc` is the

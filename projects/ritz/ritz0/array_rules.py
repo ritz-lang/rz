@@ -13,6 +13,11 @@ ELEMENT_MISMATCH = "an array only fits a slot of the same element type: write a 
 NOT_A_BUFFER = ('a reference is one value, not a buffer: '
                 '`[]` needs an array, Vec, Span or String behind it')
 
+# `(*v)[i]` with `v` a Vec, Span, String or struct value, not a pointer to one
+# (AGAST #2452).  ritz0 raised a Python AttributeError, ritz1 failed at clang.
+# ritz1 prints the same words, from index_through.ritz.
+NOT_A_POINTER = '`*x` needs `x` to be a pointer or a reference: this one is a value'
+
 # `p[i] = b` with `p` a `*[N]T`, `@[N]T` or `@&[N]T` and `b` a whole `[N]T` (AGAST #2330,
 # LARB R9).  `p[i]` is element i, a T; ritz0 stored `b` at stride `[N]T`, a row
 # on.  ritz1 prints the same words, from index_through.ritz.

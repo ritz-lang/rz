@@ -8359,12 +8359,19 @@ class LLVMEmitter:
             base = base.expr
         deref = isinstance(base, rast.UnaryOp) and base.op == '*'
         root = base.operand if deref else base
+        if deref:
+            self._refuse_deref_of_value(base)
         # A name, or an element that is itself a Vec: `v[i][j]`, `p[i][j]` (#2442).
         if not isinstance(root, (rast.Ident, rast.Index)):
             return None
         ty = self._infer_ritz_type(root)
         if ty is not None:
             ty = resolve_alias_in(ty, self.type_aliases)
+        # An element that is a scalar has nothing to index (#2452).  One that is a
+        # struct was _struct_index's, above.
+        if (isinstance(root, rast.Index) and not deref and isinstance(ty, rast.NamedType)
+                and ty.name in index_rules.SCALARS and not isinstance(expr.index, rast.Range)):
+            raise EmitError(index_rules.needs_index(ty.name), expr.bracket or expr.span)
         # The value itself, `v[i]` on a Vec, Span or String local: the same place,
         # `*(v.data + i)`, as through a pointer to it (#2442).  A slice keeps its own.
         # So does a value whose struct this module never declared, the bare
@@ -8388,6 +8395,26 @@ class LLVMEmitter:
         if isinstance(expr.index, rast.Range):
             return None
         return self._buffer_element(expr, root, path)
+
+    def _refuse_deref_of_value(self, deref: rast.UnaryOp) -> None:
+        """`(*v)[i]` with `v` a Vec, Span, String or struct by value: a located
+        error (AGAST #2452).  The paths below took `*v`'s operand for a pointer,
+        and raised a Python AttributeError.  A borrow that reads as its referent
+        (`h:& T`, #2045) is a pointer underneath, and is left alone.
+        """
+        operand = deref.operand
+        while isinstance(operand, rast.Grouped):
+            operand = operand.expr
+        ty = self._infer_ritz_type(operand)
+        if ty is not None:
+            ty = resolve_alias_in(ty, self.type_aliases)
+        if not isinstance(ty, rast.NamedType):
+            return
+        if ty.name not in self.struct_types and self._buffer_field_path(ty) is None:
+            return
+        if self._borrow_referent_slot(operand) is not None:
+            return
+        raise EmitError(array_rules.NOT_A_POINTER, deref.span)
 
     def _slice_base(self, base: rast.Expr) -> rast.Expr:
         """What `base[lo..hi]` slices: `*p` when `base` is a name `p` that sees
