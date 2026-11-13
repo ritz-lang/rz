@@ -47,6 +47,7 @@ _V = "enum E\n    V\n        x: i32\n    W\n"
 _Q = _C + "enum Q\n    One(i32)\n    Hold(C)\n    Text(StrView)\n    Z\n"
 _S = _C + "enum S\n    V\n        x: i32\n    U\n        c: C\n    W\n"
 _K = "const K: i32 = 0\n"
+_SLOT = "enum Slot<T>\n    Full(T)\n    Empty\n"
 _HINT = " — bind it to a name, then test the name in the arm body"
 # Every test compiles beside this module, so a row can import it.
 _MODULE = ("pub const MK: i32 = 0\nconst HIDDEN: i32 = 1\npub enum MC\n    MR\n    MG\n"
@@ -198,6 +199,13 @@ NAMES_ON_BOTH = {
         6, 13, "None", "Has"),
     "struct_variant_const": (_K + _S + _on("S", "V(K)", "S.W"), 13, 11, "K", "V"),
     "struct_variant_holding_an_enum": (_S + _on("S", "U(R)", "S.W"), 12, 11, "R", "U"),
+    # A generic enum's instance, `T` substituted (AGAST #2422).
+    "generic_user_enum_const": (_K + _SLOT + _on("Slot<i32>", "Full(K)", "Full(5)"),
+                                7, 14, "K", "Full"),
+    "generic_user_enum_holding_an_enum": (_C + _SLOT + _on("Slot<C>", "Full(R)", "Empty"),
+                                          9, 14, "R", "Full"),
+    "generic_user_enum_holding_an_option": (_SLOT + _on("Slot<Option<i32>>", "Full(None)", "Empty"),
+                                            6, 14, "None", "Full"),
     # A type the parser spelled through an alias, whichever side of it.
     "alias_of_an_integer": (_K + "type Id = i32\n" + _opt("Id", "Some(K)", "5"),
                             5, 14, "K", "Some"),

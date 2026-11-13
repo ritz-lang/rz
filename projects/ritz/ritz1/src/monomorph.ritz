@@ -529,6 +529,7 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
     # Only add if this is actually a generic struct template
     let template: *StructDef = find_generic_struct(m, base_name, base_len)
     if template == null
+        add_enum_instance(m, name, len, dollar_pos)   # AGAST #2422
         return  # Not a generic struct we know about
 
     # Create suffix including the '$'
@@ -604,7 +605,88 @@ fn mangled_component_arity(m: *Module, name: *u8, len: i32) -> i32
         return 2
     if len == 6 and memcmp(name, c"Option", 6) == 0
         return 1
+    let gei: i32 = enum_find(name, len)
+    if gei >= 0 and enum_is_generic(gei) == 1
+        return count_type_params(generic_enum_params(gei))   # AGAST #2422
     0
+
+# ----------------------------------------------------------------------------
+# Generic user enums (AGAST #2422)
+# ----------------------------------------------------------------------------
+# `enum Slot<T>` records its variants with `T` unsubstituted, so `Slot<i32>`
+# (mangled `Slot$i32`) had no layout: ritz1 named `%Slot$i32` in signatures and
+# allocas and never declared it, and clang refused the IR.  Each instance a
+# program names is recorded here as a concrete enum of that name, its payload
+# fields cloned with every parameter substituted, exactly as a generic struct's
+# are.  From there it is any user enum: ritz0's layout, constructors, match.
+
+# `enum Slot<A, B>`'s parameters, read off the source after its name: the
+# grammar's action records the enum as generic but drops the list
+# (enum_def_header).  null when no `<...>` follows the name.
+fn generic_enum_params(ei: i32) -> *TypeParam
+    var len: i32 = 0
+    let name: *u8 = enum_name_at(ei, @len)
+    var p: *u8 = name + len
+    while *p == 32 or *p == 9
+        p = p + 1
+    if *p != 60   # '<'
+        return null
+    p = p + 1
+    var first: *TypeParam = null
+    var last: *TypeParam = null
+    while *p != 62 and *p != 0 and *p != 10   # '>', NUL, newline
+        if *p == 32 or *p == 9 or *p == 44   # ' ', '\t', ','
+            p = p + 1
+        else
+            let start: *u8 = p
+            var n: i32 = 0
+            while *p != 62 and *p != 0 and *p != 10 and *p != 32 and *p != 9 and *p != 44
+                p = p + 1
+                n = n + 1
+            let tp: *TypeParam = malloc(sizeof(TypeParam)) as *TypeParam
+            tp.name = start
+            tp.name_len = n
+            tp.next = null
+            if last == null
+                first = tp
+            else
+                last.next = tp
+            last = tp
+    first
+
+# Record `name` (`Slot$i32`, its `$` at dollar_pos) as an instance of the
+# generic enum its base names, once, and instantiate what its payloads name
+# (`Full(Box<T>)` at i32 needs `Box$i32`).  Anything else is left alone.
+fn add_enum_instance(m: *Module, name: *u8, len: i32, dollar_pos: i32)
+    let base: i32 = enum_find(name, dollar_pos)
+    if base < 0 or enum_is_generic(base) != 1 or enum_find(name, len) >= 0
+        return
+    let tp: *TypeParam = generic_enum_params(base)
+    let suffix: *u8 = name + dollar_pos
+    let suffix_len: i32 = len - dollar_pos
+    let n: i32 = count_type_params(tp)
+    if n == 0
+        return
+    let cap: i64 = 4 * mangled_arg_capacity(suffix, suffix_len) as i64
+    let starts: *i32 = malloc(cap) as *i32
+    let lens: *i32 = malloc(cap) as *i32
+    if n == 1
+        # One parameter: the whole suffix is its argument (`Slot$Slot$i32`).
+        *starts = 0
+        *lens = suffix_len
+    else if split_mangled_args(m, suffix, suffix_len, starts, lens) != n
+        return
+    let count: i32 = enum_variant_count(base)
+    let fields: **StructField = malloc((count as i64 + 1) * 8) as **StructField
+    for vi in 0..count
+        *(fields + vi) = clone_struct_fields_multi(enum_variant_fields(base, vi), tp, suffix, starts, lens)
+    enum_record_instance(base, name, len, fields)
+    for vj in 0..count
+        var f: *StructField = *(fields + vj)
+        while f != null
+            if f.field_type_name != null
+                add_struct_from_mangled_name(m, f.field_type_name, f.field_type_name_len)
+            f = f.next
 
 # End (exclusive) of the mangled type argument that starts at s[pos]: its
 # first component plus, if that names a generic, one nested argument per
