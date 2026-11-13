@@ -30,6 +30,7 @@ SOURCES = \
 	interp \
 	struct_index \
 	monomorph \
+	generic_infer \
 	emitter_core \
 	binder_check \
 	index_through \

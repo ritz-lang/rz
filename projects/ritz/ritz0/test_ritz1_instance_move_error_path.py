@@ -11,10 +11,10 @@ fn too: before, a method's error named the file of whatever fn was emitted
 before it, which became dup.ritz once that could be an instance.
 
 What #2890 reported as "ritz1 skips the move check" was a call written
-`twice(3)`, without type arguments. LANGUAGE_SPEC §4.4 refuses that and
-ritz0 says so; ritz1 creates no instance and emits a call to an undeclared
-`@twice`, so there is nothing to check. That fail-open is #1982, not the
-move check.
+`twice(3)`, without type arguments: ritz1 created no instance and emitted a
+call to an undeclared `@twice`, so there was nothing to check. Since #1982
+the call infers `twice<i64>` (LANGUAGE_SPEC §4.4) and is checked like the
+spelled-out one (the `_inferred` rows).
 
 Each row compiles `main.ritz` beside one module, `dup.ritz`. Each expected
 location names the file its line and column are counted in.
@@ -61,6 +61,9 @@ CASES = {
     "t_param_at_drop_type": (_PARAM, "", "twice<D>(D { id: 1 })", ("dup", 8, 16, "x", 7, 16)),
     "moved_once": (_ONCE, "", "twice<i32>(3)", None),
     "main_method_after_instance": (_ONCE, _METHOD, "twice<i32>(3)", ("main", 8, 17, "d", 7, 17)),
+    # #1982: `twice(3)` infers T = i64, so its instance exists and is checked.
+    "drop_local_inferred": (_LOCAL, "", "twice(3)", ("dup", 9, 13, "d", 8, 13)),
+    "moved_once_inferred": (_ONCE, "", "twice(3)", None),
 }
 
 # ritz0 checks moves on the generic body, where T is not a Drop type

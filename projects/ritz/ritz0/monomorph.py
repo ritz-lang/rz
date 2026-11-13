@@ -37,6 +37,18 @@ import ritz_ast as rast
 from ufcs import UFCS_NON_GENERIC_PREFIXES
 
 
+class GenericInferError(Exception):
+    """A generic call whose type args its arguments don't determine (AGAST
+    #1982).  The message carries `file:line:column`, as ritz1's does."""
+
+    def __init__(self, message: str, span=None):
+        self.span = span
+        self.reason = message
+        if span is not None:
+            message = f"{span.file}:{span.line}:{span.column}: {message}"
+        super().__init__(message)
+
+
 def map_child_nodes(node, on_expr, on_stmt, on_type):
     """Rebuild `node` with on_expr / on_stmt / on_type applied to its children.
 
@@ -347,6 +359,11 @@ class Monomorphizer:
         # Phase 1: Collect generic definitions
         self._collect_generics(module)
 
+        # Phase 1b: `f(args)` to a generic `f<T>` gets its type args from its
+        # arguments (LANGUAGE_SPEC section 4.4, AGAST #1982), so every later
+        # phase sees the call as if it were written `f<T>(args)`.
+        self._infer_call_type_args(module)
+
         # Phase 2: Find all instantiations
         self._find_instantiations(module)
 
@@ -439,6 +456,175 @@ class Monomorphizer:
                 methods = self.impl_methods.setdefault(item.type_name, {})
                 for method in item.methods:
                     methods.setdefault(method.name, method)
+
+    # ------------------------------------------------------------------
+    # Type-argument inference for generic calls (AGAST #1982)
+    # ------------------------------------------------------------------
+
+    def _infer_call_type_args(self, module: rast.Module) -> None:
+        """Fill in the type args of every `f(args)` call to a generic `f`.
+
+        Every fn body is walked, generic ones too: in `fn g<T>(x: T)` a call
+        `f(x)` becomes `f<T>(x)`, and specialising g substitutes T as it does
+        for a spelled-out call.  Calls are inferred inside-out, so `f(g(x))`
+        knows g's instance before it types f's argument.
+        """
+        for item in module.items:
+            if isinstance(item, rast.FnDef):
+                self._infer_in_fn(item, None)
+            elif isinstance(item, rast.ImplBlock):
+                for method in item.methods:
+                    self._infer_in_fn(method, item.type_name, item.type_params)
+
+    def _infer_in_fn(self, fn: rast.FnDef, impl_type_name: Optional[str],
+                     impl_type_params: Optional[List[str]] = None) -> None:
+        if fn.body is None:
+            return
+        self.var_types = {}
+        for param in fn.params:
+            param_type = param.type
+            if param_type is None and param.name == 'self' and impl_type_name:
+                args = [rast.NamedType(fn.span, tp, []) for tp in (impl_type_params or [])]
+                param_type = rast.NamedType(fn.span, impl_type_name, args)
+            if param_type is not None:
+                self.var_types[param.name] = param_type
+        self._infer_walk(fn.body)
+        self.var_types = {}
+
+    def _infer_walk(self, node) -> None:
+        """Visit `node` in source order: a let's value before its name is
+        typed, a call's arguments before the call."""
+        if isinstance(node, list):
+            for child in node:
+                self._infer_walk(child)
+            return
+        if not dataclasses.is_dataclass(node) or isinstance(node, type):
+            return
+        if isinstance(node, rast.Type):
+            return
+        if isinstance(node, rast.Lambda):
+            # A closure's params are its own scope's; type them for its body.
+            for param in node.params:
+                if getattr(param, 'type', None) is not None:
+                    self.var_types[param.name] = param.type
+        for f in dataclasses.fields(node):
+            if f.name == 'span':
+                continue
+            self._infer_walk(getattr(node, f.name))
+        if isinstance(node, (rast.LetStmt, rast.VarStmt)):
+            if node.type is not None:
+                self.var_types[node.name] = node.type
+            elif node.value is not None:
+                inferred = self._infer_arg_type(node.value)
+                if inferred is not None:
+                    self.var_types[node.name] = inferred
+        elif isinstance(node, rast.Call):
+            self._infer_one_call(node)
+
+    def _infer_arg_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """The type of a call argument, or None when it can't be told here.
+        Literals take their default type, as `let x = <literal>` gives them."""
+        if isinstance(expr, rast.IntLit):
+            return rast.NamedType(expr.span, 'i64', [])
+        if isinstance(expr, rast.FloatLit):
+            return rast.NamedType(expr.span, 'f64', [])
+        if isinstance(expr, rast.BoolLit):
+            return rast.NamedType(expr.span, 'bool', [])
+        if isinstance(expr, rast.CharLit):
+            return rast.NamedType(expr.span, 'u8', [])
+        if isinstance(expr, rast.StringLit):
+            return rast.NamedType(expr.span, 'StrView', [])
+        if isinstance(expr, rast.Cast):
+            return expr.target
+        if isinstance(expr, rast.Grouped):
+            return self._infer_arg_type(expr.expr)
+        if isinstance(expr, rast.UnaryOp) and expr.op == '-':
+            return self._infer_arg_type(expr.operand)
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('!', 'not'):
+            return rast.NamedType(expr.span, 'bool', [])
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('@', '&', '@&', '&mut'):
+            inner = self._infer_arg_type(expr.operand)
+            if inner is None:
+                return None
+            return rast.PtrType(expr.span, inner, mutable=expr.op in ('@&', '&mut'),
+                                shared=expr.op == '@')
+        if isinstance(expr, rast.BinOp):
+            if expr.op in ('==', '!=', '<', '<=', '>', '>=', '&&', '||', 'and', 'or'):
+                return rast.NamedType(expr.span, 'bool', [])
+            left = self._infer_arg_type(expr.left)
+            if isinstance(expr.left, rast.IntLit) or left is None:
+                right = self._infer_arg_type(expr.right)
+                if right is not None and not isinstance(expr.right, rast.IntLit):
+                    return right
+            return left
+        return self._infer_value_type(expr)
+
+    def _infer_one_call(self, call: rast.Call) -> None:
+        """Bind the type params of a generic `f(args)` from its arguments.
+
+        An argument binds each T its parameter's type mentions, matched
+        structurally (`T`, `@T`, `*T`, `Vec<T>`, `@Vec<T>`...).  An integer
+        literal binds a bare `T` param only when no other argument binds T,
+        so `vec_push(@&v, 3)` on a Vec<i32> is vec_push<i32>.  A T no
+        argument binds, or two bind differently, is a located error.
+        """
+        if call.type_args or not isinstance(call.func, rast.Ident):
+            return
+        fn_name = call.func.name
+        fn_def = self.generic_functions.get(fn_name)
+        if fn_def is None or fn_name in self.var_types:
+            return
+        params = fn_def.type_params
+        bound: Dict[str, rast.Type] = {}
+        conflict: Set[str] = set()
+        literal: Dict[str, rast.Type] = {}
+        for param, arg in zip(fn_def.params, call.args):
+            if param.type is None:
+                continue
+            if (isinstance(arg, rast.IntLit)
+                    or (isinstance(arg, rast.UnaryOp) and arg.op == '-'
+                        and isinstance(arg.operand, rast.IntLit))):
+                p = resolve_alias(param.type)
+                if isinstance(p, rast.NamedType) and p.name in params and not p.args:
+                    literal.setdefault(p.name, self._infer_arg_type(arg))
+                continue
+            arg_type = self._infer_arg_type(arg)
+            if arg_type is not None:
+                self._unify(param.type, arg_type, params, bound, conflict)
+        for name, ty in literal.items():
+            bound.setdefault(name, ty)
+        for tp in params:
+            if tp not in bound or tp in conflict:
+                raise GenericInferError(
+                    f"can't infer `{tp}` for `{fn_name}`: write `{fn_name}<{tp}>(...)`",
+                    call.span)
+        call.type_args = [copy.deepcopy(bound[tp]) for tp in params]
+
+    def _unify(self, param: rast.Type, arg: rast.Type, params: List[str],
+               bound: Dict[str, rast.Type], conflict: Set[str]) -> None:
+        """Match a param type against an argument type, binding type params."""
+        param = resolve_alias(param)
+        arg = resolve_alias(arg)
+        if isinstance(param, rast.NamedType) and param.name in params and not param.args:
+            prev = bound.get(param.name)
+            if prev is None:
+                bound[param.name] = arg
+            elif mangle_type_name(resolve_alias(prev)) != mangle_type_name(arg):
+                conflict.add(param.name)
+            return
+        ptrs = (rast.PtrType, rast.RefType)
+        if isinstance(param, ptrs) and isinstance(arg, ptrs):
+            self._unify(param.inner, arg.inner, params, bound, conflict)
+        elif isinstance(param, rast.NamedType) and isinstance(arg, rast.NamedType):
+            if param.name == arg.name and len(param.args) == len(arg.args):
+                for p, a in zip(param.args, arg.args):
+                    self._unify(p, a, params, bound, conflict)
+        elif isinstance(param, rast.ArrayType) and isinstance(arg, rast.ArrayType):
+            self._unify(param.inner, arg.inner, params, bound, conflict)
+        elif isinstance(param, rast.TupleType) and isinstance(arg, rast.TupleType):
+            if len(param.elements) == len(arg.elements):
+                for p, a in zip(param.elements, arg.elements):
+                    self._unify(p, a, params, bound, conflict)
 
     def _find_instantiations(self, module: rast.Module) -> None:
         """Walk the AST to find all generic instantiations."""

@@ -11271,13 +11271,14 @@ class LLVMEmitter:
 
             return self.builder.call(fn, args)
 
-        # A generic fn called without type args: ritz does not infer them from
-        # the arguments (LANGUAGE_SPEC section 4.4), so name the fix (#1968).
+        # A generic fn called without type args.  Monomorph infers them from
+        # the arguments or refuses the call (AGAST #1982), so this is only
+        # reached by a call it skips, e.g. through a local that shadows the
+        # fn's name; name the fix rather than "Unknown function" (#1968).
         if fname in getattr(self, 'generic_fn_names', ()):
             raise ValueError(
-                f"generic function `{fname}` needs explicit type arguments: "
-                f"write `{fname}<T>(...)`; type arguments are not inferred "
-                f"from the call's arguments")
+                f"generic function `{fname}` needs explicit type arguments here: "
+                f"write `{fname}<T>(...)`")
         raise ValueError(f"Unknown function: {fname}")
 
     def _try_emit_simd_builtin(self, fname: str, args: list) -> Optional[ir.Value]:
@@ -15764,10 +15765,14 @@ def emit(module: rast.Module, no_runtime: bool = False,
     # Monomorphize generics before emission. Note the generic fn names first:
     # monomorph drops their definitions, and a call that names one without
     # type args deserves a better error than "Unknown function" (#1968).
-    from monomorph import monomorphize
+    from monomorph import monomorphize, GenericInferError
     generic_fn_names = {item.name for item in module.items
                         if isinstance(item, rast.FnDef) and item.is_generic()}
-    module = monomorphize(module)
+    try:
+        module = monomorphize(module)
+    except GenericInferError as e:
+        # `f(args)` whose args don't determine f's T (AGAST #1982).
+        raise EmitError(str(e)) from None
 
     # Test mode (§17.1): the runner supplies `main`, so the file's own goes.
     if test_mode:

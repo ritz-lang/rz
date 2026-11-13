@@ -1080,19 +1080,35 @@ let s = "hello"       # StrView
 let c = c"hello"      # *u8
 ```
 
-Generic calls need their type argument spelled out; there is no inference from
-the binding's annotation:
+A generic call takes its type arguments from its arguments. A call `f(args)` to a
+generic `f<T...>` binds each `T` by matching each parameter's type against its
+argument's type, structurally: `T`, `@T`, `@&T`, `*T`, `Vec<T>`, `@Vec<T>`, and
+so on. An explicit `f<T>(...)` still works and wins. An integer literal argument
+to a bare `T` parameter binds `T` to the literal's default type, `i64` (as
+`let x = 3` would), unless another argument binds `T`. Then the literal takes
+that type, so `vec_push(@&v, 42)` on a `Vec<i32>` is `vec_push<i32>`:
 
 ```ritz
 import ritzlib.gvec
 
+fn twice<T>(x: T) -> T
+    x
+
 fn main() -> i32
-    var v = vec_new<i32>()
-    vec_push<i32>(@&v, 42)
-    let first = vec_get<i32>(@v, 0)
-    vec_drop<i32>(@&v)
-    first
+    var v = vec_new<i32>()     # nothing binds T here: it is spelled out
+    vec_push(@&v, 42)          # T = i32, from `@&Vec<T>`
+    let first = vec_get(@v, 0)
+    let p = vec_as_ptr(@v)     # *i32
+    let n = twice(3)           # T = i64
+    vec_drop(@&v)
+    first + p[0] + n as i32 - 87
 ```
+
+A `T` that no argument binds (one that appears only in the return type, as in
+`vec_new`), or that two arguments bind differently, is a compile error at the
+call: ``can't infer `T` for `f`: write `f<T>(...)` ``. There is no inference
+from the binding's annotation: `let v: Vec<i32> = vec_new()` is that error.
+Inside a generic fn, `f(x)` with `x: T` is `f<T>(x)`.
 
 ---
 

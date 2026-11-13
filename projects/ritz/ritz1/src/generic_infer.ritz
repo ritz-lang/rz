@@ -1,0 +1,627 @@
+# generic_infer.ritz - a generic call's type args, from its arguments (AGAST #1982)
+#
+# LANGUAGE_SPEC section 4.4: a call `f(args)` to a generic `f<T...>` binds
+# each T by matching each param's type against its argument's type (`T`,
+# `@T`, `@&T`, `*T`, `Vec<T>`, `@Vec<T>` ...).  An integer literal argument
+# to a bare `T` param binds T to i64, as `let x = 3` would, unless another
+# argument binds T.  An explicit `f<T>(...)` is left alone.  A T that no
+# argument binds (one only in the return type), or that two arguments bind
+# differently, is a located error:
+#
+#     can't infer `T` for `f`: write `f<T>(...)`
+#
+# The pass runs before monomorphize_module and only fills in
+# Expr.call_type_suffix, so the call is then exactly the spelled-out one.
+# Every body is walked, generic templates too: in `fn g<T>(x: T)` a call
+# `f(x)` becomes `f<T>(x)` ("$T"), which specialising g substitutes as it
+# does for a written `f<T>(x)`.  Calls are inferred inside-out, so `f(g(x))`
+# knows g's instance before it types f's argument.
+#
+# Mirrors ritz0's Monomorphizer._infer_call_type_args (monomorph.py): the
+# same argument typing, the same literal rule, the same message.  An
+# argument whose type this pass can't tell binds nothing.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.str
+
+import ast
+import ast_helpers
+import monomorph
+
+# The type of an expression, as far as this pass can tell.  kind is a TYPE_*;
+# name is the struct's mangled name for TYPE_STRUCT, and the pointee struct's
+# for a TYPE_PTR / TYPE_REF / TYPE_MUT_REF whose pointee is TYPE_STRUCT.
+struct GiType
+    kind: i32
+    name: *u8
+    name_len: i32
+    pointee: i32
+
+# ----------------------------------------------------------------------------
+# Locals of the fn being walked: params, then each let/var as it's declared.
+# Names are unique within a fn (#2395), so a flat table per fn is enough.
+# ----------------------------------------------------------------------------
+var g_gi_names: **u8 = null
+var g_gi_name_lens: *i32 = null
+var g_gi_kinds: *i32 = null
+var g_gi_tnames: **u8 = null
+var g_gi_tname_lens: *i32 = null
+var g_gi_pointees: *i32 = null
+var g_gi_count: i32 = 0
+var g_gi_cap: i32 = 0
+
+var g_gi_errors: i32 = 0
+var g_gi_input: *u8 = null   # the file compiled
+var g_gi_file: *u8 = null    # the file the fn being walked is written in
+
+fn gi_add_local(name: *u8, name_len: i32, t: *GiType)
+    if g_gi_count >= g_gi_cap
+        var cap: i64 = (g_gi_cap as i64) * 2
+        if cap < 64
+            cap = 64
+        g_gi_names = realloc(g_gi_names as *u8, cap * 8) as **u8
+        g_gi_name_lens = realloc(g_gi_name_lens as *u8, cap * 4) as *i32
+        g_gi_kinds = realloc(g_gi_kinds as *u8, cap * 4) as *i32
+        g_gi_tnames = realloc(g_gi_tnames as *u8, cap * 8) as **u8
+        g_gi_tname_lens = realloc(g_gi_tname_lens as *u8, cap * 4) as *i32
+        g_gi_pointees = realloc(g_gi_pointees as *u8, cap * 4) as *i32
+        g_gi_cap = cap as i32
+    *(g_gi_names + g_gi_count) = name
+    *(g_gi_name_lens + g_gi_count) = name_len
+    *(g_gi_kinds + g_gi_count) = t.kind
+    *(g_gi_tnames + g_gi_count) = t.name
+    *(g_gi_tname_lens + g_gi_count) = t.name_len
+    *(g_gi_pointees + g_gi_count) = t.pointee
+    g_gi_count = g_gi_count + 1
+
+fn gi_find_local(name: *u8, name_len: i32) -> i32
+    var i: i32 = g_gi_count - 1
+    while i >= 0
+        if *(g_gi_name_lens + i) == name_len and memcmp(*(g_gi_names + i), name, name_len as i64) == 0
+            return i
+        i = i - 1
+    -1
+
+fn gi_set(out: *GiType, kind: i32, name: *u8, name_len: i32, pointee: i32) -> i32
+    out.kind = kind
+    out.name = name
+    out.name_len = name_len
+    out.pointee = pointee
+    1
+
+fn gi_is_ptr_kind(k: i32) -> i32
+    if k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF
+        return 1
+    0
+
+# 1 for a primitive TYPE_* that a suffix can spell.
+fn gi_is_prim(k: i32) -> i32
+    var s: *u8 = null
+    if primitive_arg_spelling(k, @s) > 0
+        return 1
+    0
+
+# A plain integer literal (`3`, `-3`): its T binds weakly (see the header).
+fn gi_is_int_literal(e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_UNARY and e.op == OP_NEG
+        return gi_is_int_literal(e.operand)
+    if e.kind != EXPR_INT_LIT
+        return 0
+    if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE or e.lit_kind == LIT_UNIT or e.lit_kind == LIT_PASS
+        return 0
+    1
+
+# The type a one-argument suffix ("$u8", "$Vec$u8", "$ptr_u8") names.
+fn gi_type_from_suffix(suffix: *u8, suffix_len: i32, out: *GiType) -> i32
+    let k: i32 = parse_type_from_suffix(suffix, suffix_len)
+    if k == TYPE_VOID or k == TYPE_ARRAY
+        return 0
+    var n: *u8 = null
+    var nl: i32 = 0
+    get_type_name_from_suffix(suffix, suffix_len, @n, @nl)
+    if k == TYPE_PTR
+        let pk: i32 = primitive_type_from_name(n, nl)
+        if pk != 0
+            return gi_set(out, TYPE_PTR, null, 0, pk)
+        return gi_set(out, TYPE_PTR, n, nl, TYPE_STRUCT)
+    if k == TYPE_STRUCT
+        return gi_set(out, TYPE_STRUCT, n, nl, TYPE_VOID)
+    gi_set(out, k, null, 0, TYPE_VOID)
+
+# The return type of a call: a plain fn's, or a one-parameter generic's with
+# its suffix substituted (`vec_new<u64>()` is a Vec$u64).
+fn gi_call_type(m: *Module, e: *Expr, out: *GiType) -> i32
+    let f: *FnDef = find_fn_in_module(m, e.func_name, e.func_name_len)
+    if f == null or f.return_type == TYPE_VOID
+        return 0
+    if f.type_params == null
+        if f.return_type == TYPE_STRUCT
+            if f.return_type_name == null
+                return 0
+            return gi_set(out, TYPE_STRUCT, f.return_type_name, f.return_type_name_len, TYPE_VOID)
+        if gi_is_prim(f.return_type) == 1
+            return gi_set(out, f.return_type, null, 0, TYPE_VOID)
+        return 0
+    if e.call_type_suffix_len <= 0 or f.type_params.next != null or f.return_type_name == null
+        return 0
+    let tp: *TypeParam = f.type_params
+    let rn: *u8 = f.return_type_name
+    let rl: i32 = f.return_type_name_len
+    var is_tp: i32 = 0
+    if rl == tp.name_len and memcmp(rn, tp.name, rl as i64) == 0
+        is_tp = 1
+    if f.return_type == TYPE_STRUCT
+        if is_tp == 1
+            return gi_type_from_suffix(e.call_type_suffix, e.call_type_suffix_len, out)
+        var sn: *u8 = null
+        var sl: i32 = 0
+        substitute_type_param_in_name(rn, rl, tp.name, tp.name_len, e.call_type_suffix, e.call_type_suffix_len, @sn, @sl)
+        return gi_set(out, TYPE_STRUCT, sn, sl, TYPE_VOID)
+    if gi_is_ptr_kind(f.return_type) == 1 and is_tp == 1
+        var inner: GiType
+        if gi_type_from_suffix(e.call_type_suffix, e.call_type_suffix_len, @inner) == 0
+            return 0
+        if inner.kind == TYPE_STRUCT
+            return gi_set(out, f.return_type, inner.name, inner.name_len, TYPE_STRUCT)
+        if gi_is_prim(inner.kind) == 1
+            return gi_set(out, f.return_type, null, 0, inner.kind)
+    0
+
+# The struct a value of type t is, or points at (one level): its name, or null.
+fn gi_struct_of(t: *GiType, out_len: *i32) -> *u8
+    if t.kind == TYPE_STRUCT or (gi_is_ptr_kind(t.kind) == 1 and t.pointee == TYPE_STRUCT)
+        *out_len = t.name_len
+        return t.name
+    *out_len = 0
+    null
+
+fn gi_member_type(m: *Module, e: *Expr, out: *GiType) -> i32
+    var base: GiType
+    if gi_type_of(m, e.left, @base) == 0
+        return 0
+    var sl: i32 = 0
+    let sn: *u8 = gi_struct_of(@base, @sl)
+    if sn == null
+        return 0
+    let st: *StructDef = find_concrete_struct(m, sn, sl)
+    if st == null
+        return 0
+    var f: *StructField = st.fields
+    while f != null
+        if f.name_len == e.ident_len and memcmp(f.name, e.ident_ptr, e.ident_len as i64) == 0
+            if f.field_type == TYPE_STRUCT and f.field_type_name != null
+                return gi_set(out, TYPE_STRUCT, f.field_type_name, f.field_type_name_len, TYPE_VOID)
+            if gi_is_prim(f.field_type) == 1
+                return gi_set(out, f.field_type, null, 0, TYPE_VOID)
+            return 0
+        f = f.next
+    0
+
+# `b[i]`: a Vec's or Span's element, or a `*T`'s T.
+fn gi_index_type(m: *Module, e: *Expr, out: *GiType) -> i32
+    var base: GiType
+    if gi_type_of(m, e.left, @base) == 0
+        return 0
+    if base.kind == TYPE_PTR and base.pointee != TYPE_STRUCT and gi_is_prim(base.pointee) == 1
+        return gi_set(out, base.pointee, null, 0, TYPE_VOID)
+    var sl: i32 = 0
+    let sn: *u8 = gi_struct_of(@base, @sl)
+    if sn == null
+        return 0
+    var suf: *u8 = null
+    var suf_len: i32 = 0
+    if classify_collection_type(sn, sl, @suf, @suf_len) == 0
+        return 0
+    gi_type_from_suffix(suf, suf_len, out)
+
+# The type of `e`, or 0 when this pass can't tell.  Literals take their
+# default type, as `let x = <literal>` gives them.
+fn gi_type_of(m: *Module, e: *Expr, out: *GiType) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_INT_LIT
+        if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
+            return gi_set(out, TYPE_BOOL, null, 0, TYPE_VOID)
+        if e.lit_kind == LIT_UNIT or e.lit_kind == LIT_PASS
+            return 0
+        return gi_set(out, TYPE_I64, null, 0, TYPE_VOID)
+    if k == EXPR_FLOAT_LIT
+        return gi_set(out, TYPE_F64, null, 0, TYPE_VOID)
+    if k == EXPR_CHAR_LIT
+        return gi_set(out, TYPE_U8, null, 0, TYPE_VOID)
+    if k == EXPR_STRING_LIT
+        return gi_set(out, TYPE_STRUCT, c"StrView", 7, TYPE_VOID)
+    if k == EXPR_CSTRING_LIT
+        return gi_set(out, TYPE_PTR, null, 0, TYPE_U8)
+    if k == EXPR_IDENT
+        let idx: i32 = gi_find_local(e.ident_ptr, e.ident_len)
+        if idx < 0
+            return 0
+        return gi_set(out, *(g_gi_kinds + idx), *(g_gi_tnames + idx), *(g_gi_tname_lens + idx), *(g_gi_pointees + idx))
+    if k == EXPR_CAST
+        if e.op == TYPE_PTR
+            if e.cast_pointee == TYPE_STRUCT and e.ident_ptr != null
+                return gi_set(out, TYPE_PTR, e.ident_ptr, e.ident_len, TYPE_STRUCT)
+            if gi_is_prim(e.cast_pointee) == 1
+                return gi_set(out, TYPE_PTR, null, 0, e.cast_pointee)
+            return 0
+        if gi_is_prim(e.op) == 1
+            return gi_set(out, e.op, null, 0, TYPE_VOID)
+        return 0
+    if k == EXPR_UNARY
+        if e.op == OP_NOT
+            return gi_set(out, TYPE_BOOL, null, 0, TYPE_VOID)
+        var inner: GiType
+        if gi_type_of(m, e.operand, @inner) == 0
+            return 0
+        if e.op == OP_NEG or e.op == OP_BIT_NOT
+            return gi_set(out, inner.kind, inner.name, inner.name_len, inner.pointee)
+        if e.op == OP_DEREF
+            if gi_is_ptr_kind(inner.kind) == 0
+                return 0
+            if inner.pointee == TYPE_STRUCT
+                return gi_set(out, TYPE_STRUCT, inner.name, inner.name_len, TYPE_VOID)
+            if gi_is_prim(inner.pointee) == 1
+                return gi_set(out, inner.pointee, null, 0, TYPE_VOID)
+            return 0
+        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
+            var rk: i32 = TYPE_REF
+            if e.op == OP_ADDR_MUT
+                rk = TYPE_MUT_REF
+            if inner.kind == TYPE_STRUCT
+                return gi_set(out, rk, inner.name, inner.name_len, TYPE_STRUCT)
+            if gi_is_prim(inner.kind) == 1
+                return gi_set(out, rk, null, 0, inner.kind)
+        return 0
+    if k == EXPR_BINARY
+        if e.op >= OP_EQ and e.op <= OP_OR
+            return gi_set(out, TYPE_BOOL, null, 0, TYPE_VOID)
+        let lk: i32 = gi_type_of(m, e.left, out)
+        if lk == 0 or gi_is_int_literal(e.left) == 1
+            var r: GiType
+            if gi_is_int_literal(e.right) == 0 and gi_type_of(m, e.right, @r) == 1
+                return gi_set(out, r.kind, r.name, r.name_len, r.pointee)
+        return lk
+    if k == EXPR_CALL
+        return gi_call_type(m, e, out)
+    if k == EXPR_MEMBER
+        return gi_member_type(m, e, out)
+    if k == EXPR_INDEX
+        return gi_index_type(m, e, out)
+    0
+
+# How a type binds a bare T: a primitive's name, a struct's mangled name, or
+# "ptr_" and the pointee's.  null for anything a suffix can't spell.
+fn gi_spell(t: *GiType, out_len: *i32) -> *u8
+    var s: *u8 = null
+    var n: i32 = 0
+    if t.kind == TYPE_STRUCT
+        *out_len = t.name_len
+        return t.name
+    if gi_is_ptr_kind(t.kind) == 1
+        if t.pointee == TYPE_STRUCT
+            s = t.name
+            n = t.name_len
+        else
+            n = primitive_arg_spelling(t.pointee, @s)
+        if s == null or n <= 0
+            *out_len = 0
+            return null
+        let buf: *u8 = malloc((n + 5) as i64)
+        memcpy(buf, c"ptr_", 4)
+        memcpy(buf + 4, s, n as i64)
+        *(buf + 4 + n) = 0
+        *out_len = n + 4
+        return buf
+    n = primitive_arg_spelling(t.kind, @s)
+    *out_len = n
+    if n <= 0
+        return null
+    s
+
+# ----------------------------------------------------------------------------
+# Binding: one slot per type param of the callee.
+# ----------------------------------------------------------------------------
+struct GiBind
+    names: **u8      # bound spelling, null when unbound
+    lens: *i32
+    conflict: *i32   # 1 when two arguments bound it differently
+    lit: *i32        # 1 when an integer literal would bind it (to i64)
+
+fn gi_bind(b: *GiBind, idx: i32, s: *u8, n: i32)
+    if s == null or n <= 0
+        return
+    let prev: *u8 = *(b.names + idx)
+    if prev == null
+        *(b.names + idx) = s
+        *(b.lens + idx) = n
+        return
+    let pl: i32 = *(b.lens + idx)
+    if pl != n or memcmp(prev, s, n as i64) != 0
+        *(b.conflict + idx) = 1
+
+# Match a mangled param type name (`Vec$T`, `Pair$T$U`) against an
+# argument's (`Vec$u64`), component by component: a type param's component
+# takes one whole mangled argument (`Vec$u8` in `Vec$Vec$u8`).
+fn gi_match_mangled(m: *Module, tps: *TypeParam, p: *u8, plen: i32, a: *u8, alen: i32, b: *GiBind)
+    var pi: i32 = 0
+    var ai: i32 = 0
+    while pi < plen
+        if ai >= alen
+            return
+        var pe: i32 = pi
+        while pe < plen and *(p + pe) != 36   # '$'
+            pe = pe + 1
+        let idx: i32 = type_param_index(tps, p + pi, pe - pi)
+        var ae: i32 = ai
+        if idx >= 0
+            ae = mangled_arg_end(m, a, alen, ai)
+            gi_bind(b, idx, a + ai, ae - ai)
+        else
+            while ae < alen and *(a + ae) != 36
+                ae = ae + 1
+            if ae - ai != pe - pi or memcmp(p + pi, a + ai, (pe - pi) as i64) != 0
+                return
+        pi = pe + 1
+        ai = ae + 1
+
+# A param written `pname` (a struct-ish name: `T`, `Vec$T`) against an
+# argument of type t.
+fn gi_unify_named(m: *Module, tps: *TypeParam, pname: *u8, plen: i32, t: *GiType, b: *GiBind)
+    let idx: i32 = type_param_index(tps, pname, plen)
+    if idx >= 0
+        var n: i32 = 0
+        let s: *u8 = gi_spell(t, @n)
+        gi_bind(b, idx, s, n)
+        return
+    if t.kind == TYPE_STRUCT
+        gi_match_mangled(m, tps, pname, plen, t.name, t.name_len, b)
+
+fn gi_unify_param(m: *Module, tps: *TypeParam, p: *Param, t: *GiType, b: *GiBind)
+    let pk: i32 = p.param_type
+    if p.param_type_name == null or p.param_type_name_len <= 0
+        return
+    # `x:& T` takes T's value; its argument is the referent itself.
+    if p.is_borrow == 1 or pk == TYPE_STRUCT
+        if p.is_borrow == 1 and p.param_pointee_type != TYPE_STRUCT
+            return
+        gi_unify_named(m, tps, p.param_type_name, p.param_type_name_len, t, b)
+        return
+    if gi_is_ptr_kind(pk) == 1 and p.param_pointee_type == TYPE_STRUCT and gi_is_ptr_kind(t.kind) == 1
+        var inner: GiType
+        if t.pointee == TYPE_STRUCT
+            gi_set(@inner, TYPE_STRUCT, t.name, t.name_len, TYPE_VOID)
+        else
+            gi_set(@inner, t.pointee, null, 0, TYPE_VOID)
+        gi_unify_named(m, tps, p.param_type_name, p.param_type_name_len, @inner, b)
+
+# 1 when `p` is a bare `T` (or `x:& T`) of the callee: what a literal binds.
+fn gi_bare_param_index(tps: *TypeParam, p: *Param) -> i32
+    if p.param_type_name == null
+        return -1
+    if p.param_type == TYPE_STRUCT or (p.is_borrow == 1 and p.param_pointee_type == TYPE_STRUCT)
+        return type_param_index(tps, p.param_type_name, p.param_type_name_len)
+    -1
+
+fn gi_eprint_n(s: *u8, n: i32)
+    for i in 0..n
+        eprint_char(*(s + i))
+
+fn gi_error(e: *Expr, tp: *TypeParam, fname: *u8, flen: i32)
+    eprints_cstr(c"error: ")
+    eprints_cstr(g_gi_file)
+    eprint_char(':')
+    eprint_i64(e.span.line as i64)
+    eprint_char(':')
+    eprint_i64(e.span.col as i64)
+    eprints_cstr(c": can't infer `")
+    gi_eprint_n(tp.name, tp.name_len)
+    eprints_cstr(c"` for `")
+    gi_eprint_n(fname, flen)
+    eprints_cstr(c"`: write `")
+    gi_eprint_n(fname, flen)
+    eprint_char('<')
+    gi_eprint_n(tp.name, tp.name_len)
+    eprints_cstr(c">(...)`\n")
+    g_gi_errors = g_gi_errors + 1
+
+fn gi_infer_call(m: *Module, e: *Expr)
+    if e.call_type_suffix_len > 0
+        return
+    let f: *FnDef = find_generic_function(m, e.func_name, e.func_name_len)
+    if f == null or gi_find_local(e.func_name, e.func_name_len) >= 0
+        return
+    let n: i32 = count_type_params(f.type_params)
+    var b: GiBind
+    b.names = malloc((n as i64) * 8) as **u8
+    b.lens = malloc((n as i64) * 4) as *i32
+    b.conflict = malloc((n as i64) * 4) as *i32
+    b.lit = malloc((n as i64) * 4) as *i32
+    for i in 0..n
+        *(b.names + i) = null
+        *(b.lens + i) = 0
+        *(b.conflict + i) = 0
+        *(b.lit + i) = 0
+    var p: *Param = f.params
+    var arg: *Expr = e.args
+    while p != null and arg != null
+        if gi_is_int_literal(arg) == 1
+            let li: i32 = gi_bare_param_index(f.type_params, p)
+            if li >= 0
+                *(b.lit + li) = 1
+        else
+            var t: GiType
+            if gi_type_of(m, arg, @t) == 1
+                gi_unify_param(m, f.type_params, p, @t, @b)
+        p = p.next
+        arg = arg.next
+    # The suffix: "$" and each binding, in the callee's param order.
+    var total: i32 = 0
+    var tp: *TypeParam = f.type_params
+    var i: i32 = 0
+    var failed: i32 = 0
+    while tp != null
+        if *(b.names + i) == null and *(b.lit + i) == 1
+            *(b.names + i) = c"i64"
+            *(b.lens + i) = 3
+        if *(b.names + i) == null or *(b.conflict + i) == 1
+            if failed == 0
+                gi_error(e, tp, e.func_name, e.func_name_len)
+            failed = 1
+        total = total + 1 + *(b.lens + i)
+        tp = tp.next
+        i = i + 1
+    if failed == 0
+        let buf: *u8 = malloc((total + 1) as i64)
+        var pos: i32 = 0
+        for j in 0..n
+            *(buf + pos) = 36   # '$'
+            memcpy(buf + pos + 1, *(b.names + j), *(b.lens + j) as i64)
+            pos = pos + 1 + *(b.lens + j)
+        *(buf + pos) = 0
+        e.call_type_suffix = buf
+        e.call_type_suffix_len = pos
+    free(b.names as *u8)
+    free(b.lens as *u8)
+    free(b.conflict as *u8)
+    free(b.lit as *u8)
+
+# ----------------------------------------------------------------------------
+# The walk: statements in order, a let's value before its name is typed, a
+# call's arguments before the call.
+# ----------------------------------------------------------------------------
+fn gi_walk_stmts(m: *Module, s: *Stmt)
+    var cur: *Stmt = s
+    while cur != null
+        gi_walk_stmt(m, cur)
+        cur = cur.next
+
+fn gi_walk_arms(m: *Module, arms: *MatchArm)
+    var arm: *MatchArm = arms
+    while arm != null
+        gi_walk_stmts(m, arm.body_stmts)
+        gi_walk_expr(m, arm.body)
+        arm = arm.next
+
+fn gi_note_decl(m: *Module, s: *Stmt)
+    var t: GiType
+    if s.var_declared_type != TYPE_VOID
+        if s.var_type == TYPE_STRUCT and s.var_type_name == null
+            return
+        gi_set(@t, s.var_type, s.var_type_name, s.var_type_name_len, s.var_pointee_type)
+        gi_add_local(s.var_name, s.var_name_len, @t)
+    else if gi_type_of(m, s.var_init, @t) == 1
+        gi_add_local(s.var_name, s.var_name_len, @t)
+
+fn gi_walk_stmt(m: *Module, s: *Stmt)
+    let k: i32 = s.kind
+    if k == STMT_VAR_DECL
+        gi_walk_expr(m, s.var_init)
+        gi_note_decl(m, s)
+    else if k == STMT_EXPR
+        gi_walk_expr(m, s.expr)
+    else if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN
+        gi_walk_expr(m, s.assign_value)
+    else if k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        gi_walk_expr(m, s.while_cond)
+        gi_walk_expr(m, s.assign_value)
+    else if k == STMT_IF
+        gi_walk_expr(m, s.if_cond)
+        gi_walk_stmts(m, s.if_then)
+        gi_walk_stmts(m, s.if_else)
+    else if k == STMT_WHILE
+        gi_walk_expr(m, s.while_cond)
+        gi_walk_stmts(m, s.while_body)
+    else if k == STMT_FOR
+        gi_walk_expr(m, s.for_start)
+        gi_walk_expr(m, s.for_end)
+        gi_walk_stmts(m, s.for_body)
+    else if k == STMT_LOOP or k == STMT_DEFER
+        gi_walk_stmts(m, s.while_body)
+    else if k == STMT_RETURN
+        gi_walk_expr(m, s.return_value)
+    else if k == STMT_ASSERT
+        gi_walk_expr(m, s.if_cond)
+    else if k == STMT_TUPLE_DECL
+        gi_walk_expr(m, s.var_init)
+    else if k == STMT_MATCH
+        gi_walk_expr(m, s.if_cond)
+        gi_walk_arms(m, s.if_then as *MatchArm)
+
+fn gi_walk_list(m: *Module, list: *Expr)
+    var cur: *Expr = list
+    while cur != null
+        gi_walk_expr(m, cur)
+        cur = cur.next
+
+fn gi_walk_expr(m: *Module, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_CALL
+        gi_walk_list(m, e.args)
+        gi_infer_call(m, e)
+    else if k == EXPR_STRUCT_LIT
+        # The field inits are a *FieldInit list recast to *Expr.
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            gi_walk_expr(m, fi.value)
+            fi = fi.next
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        gi_walk_expr(m, e.left)
+        gi_walk_expr(m, e.right)
+    else if k == EXPR_UNARY
+        gi_walk_expr(m, e.operand)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        gi_walk_expr(m, e.left)
+    else if k == EXPR_METHOD
+        gi_walk_expr(m, e.left)
+        gi_walk_list(m, e.args)
+    else if k == EXPR_ARRAY_LIT
+        gi_walk_list(m, e.args)
+    else if k == EXPR_MATCH or k == EXPR_IF
+        gi_walk_expr(m, e.left)
+        gi_walk_arms(m, e.args as *MatchArm)
+
+fn gi_walk_fn(m: *Module, f: *FnDef, impl_name: *u8, impl_len: i32)
+    g_gi_count = 0
+    g_gi_file = g_gi_input
+    if f.def_file != null
+        g_gi_file = f.def_file
+    var p: *Param = f.params
+    while p != null
+        var t: GiType
+        if p.is_self_borrow == 1 and p.param_type_name_len == 0
+            gi_set(@t, TYPE_STRUCT, impl_name, impl_len, TYPE_VOID)
+        else if p.is_borrow == 1 and p.param_pointee_type == TYPE_STRUCT
+            gi_set(@t, TYPE_STRUCT, p.param_type_name, p.param_type_name_len, TYPE_VOID)
+        else if p.is_borrow == 1
+            gi_set(@t, p.param_pointee_type, null, 0, TYPE_VOID)
+        else
+            gi_set(@t, p.param_type, p.param_type_name, p.param_type_name_len, p.param_pointee_type)
+        gi_add_local(p.name, p.name_len, @t)
+        p = p.next
+    gi_walk_stmts(m, f.body)
+
+# Fill in the type args of every `f(args)` call to a generic `f`.  Returns
+# how many calls it refused (each already reported).
+pub fn infer_generic_calls(m: *Module, input_path: *u8) -> i32
+    g_gi_input = input_path
+    g_gi_errors = 0
+    var f: *FnDef = m.functions
+    while f != null
+        gi_walk_fn(m, f, null, 0)
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            gi_walk_fn(m, method, ib.type_name, ib.type_name_len)
+            method = method.next
+        ib = ib.next
+    g_gi_errors
