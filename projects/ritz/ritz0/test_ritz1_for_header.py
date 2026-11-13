@@ -813,7 +813,7 @@ def test_a_view_walks_its_bytes(run_with, compiler, name):
 # local over a global (#2386) is test_ritz1_for_iterable.py's refusal now.
 RITZ1_RUNS = {
     "addr_of_strview": (MAIN + _SV + _body(_BYTES.format(it="@s")), 195),
-    # 200 and its neighbour: a wide read isn't 200, and ritz0's is -56 (#2406).
+    # 200 and its neighbour: a wide read isn't 200, nor a sign-extended one (#2406).
     "a_byte_pointer_reads_a_byte": (GVEC + MAIN + "    var a: [2]u8 = [200, 201]\n"
                                     "    var v: Vec<*u8> = vec_new<*u8>()\n    v.push(@a[0])\n"
                                     "    var t: i32 = 0\n    for x in v\n"
@@ -830,8 +830,8 @@ def test_ritz1_runs(run_with, compiler, name):
     assert run_with(compiler, name, program) == want
 
 
-# A byte is unsigned: 200 isn't -56.  ritz0 sign-extends a `for` binding, over an
-# array too (#2406), so ritz1 is pinned to what the program says.
+# A byte is unsigned: 200 isn't -56.  ritz0 sign-extended a `for` binding (#2406):
+# its rows are test_ritz0_a_byte_widens_unsigned.
 _WIDE = (MAIN + "    var a: [2]u8 = [200, 97]\n    var s: StrView\n    s.ptr = @a[0]\n    s.len = 2\n"
          "    var t: i32 = 0\n    for b in s\n        t = t + (b as i32)\n"
          "    if t != 297\n        return 1\n    return 0\n")
@@ -843,10 +843,25 @@ def test_a_byte_widens_unsigned(run_with, compiler):
     assert run_with(compiler, "wide", _WIDE) == 0
 
 
+# AGAST #2406: ritz0's `for` binding keeps its element's Ritz type, so a u8 widens
+# with zext over each kind of iterable it walks.  ritz1's rows are above.
+_A2 = "    var a: [2]u8 = [200, 201]\n"
+_CHECK = "    if t != 200\n        return 1\n    return 0\n"
+RITZ0_BYTES = {
+    "array": MAIN + _A2 + "    var t: i32 = 0\n    for b in a\n        t = b as i32\n        break\n" + _CHECK,
+    "vec": (GVEC + MAIN + "    var v: Vec<u8> = vec_new<u8>()\n    v.push(200)\n"
+            "    var t: i32 = 0\n    for b in v\n        t = b as i32\n" + _CHECK),
+    "array_pointer": (MAIN + _A2 + "    var p: *[2]u8 = @a\n    var t: i32 = 0\n    for b in p\n"
+                      "        t = b as i32\n        break\n" + _CHECK),
+    "strview": _WIDE,
+    "byte_pointer": RITZ1_RUNS["a_byte_pointer_reads_a_byte"][0],
+}
+
+
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2406: ritz0 sign-extends a u8 `for` binding")
-def test_ritz0_a_byte_widens_unsigned(run_with):
-    assert run_with("ritz0", "wide", _WIDE) == 0
+@pytest.mark.parametrize("name", sorted(RITZ0_BYTES))
+def test_ritz0_a_byte_widens_unsigned(run_with, name):
+    assert run_with("ritz0", name, RITZ0_BYTES[name]) == 0
 
 
 @pytest.mark.integration

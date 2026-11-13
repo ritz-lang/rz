@@ -7508,6 +7508,13 @@ class LLVMEmitter:
                 elem_val = self.builder.load(elem_ptr)
 
         self._bind_let(stmt.var, elem_val, elem_val.type)
+        # AGAST #2406: the binding's Ritz type, for signedness. Without it a
+        # u8 element widened with sext: `b as i32` was -56 for 200 (as #2170).
+        elem_ritz = self._for_elem_ritz_type(stmt.iter, iter_kind, vec_ptr, elem_ty)
+        if elem_ritz is not None:
+            self.ritz_types[stmt.var] = elem_ritz
+        else:
+            self.ritz_types.pop(stmt.var, None)
         self._push_drop_scope()
         for s in stmt.body.stmts:
             result = self._emit_stmt(s)
@@ -7548,6 +7555,35 @@ class LLVMEmitter:
 
         self.builder.position_at_end(end_block)
         return None
+
+    def _for_elem_ritz_type(self, it: rast.Expr, iter_kind: str, vec_ptr,
+                            elem_ty: ir.Type) -> Optional[rast.Type]:
+        """The Ritz type of what `for x in it` binds x to, if known (AGAST #2406).
+
+        An array's is its element type.  A header's is what its `data` field,
+        the first, points at: Vec<T>, Span<T> and StrView alike.  A type that
+        doesn't lower to the element read is dropped, never guessed at.
+        """
+        found = None
+        if iter_kind in ("array", "array_ptr"):
+            arr = self._infer_ritz_type(it)
+            while isinstance(arr, (rast.PtrType, rast.RefType)):
+                arr = arr.inner
+            if isinstance(arr, rast.ArrayType):
+                found = arr.inner
+        elif vec_ptr is not None:
+            name = self._get_struct_name_from_type(vec_ptr.type.pointee)
+            fields = self.struct_fields.get(name) if name else None
+            if fields and isinstance(fields[0][1], (rast.PtrType, rast.RefType)):
+                found = fields[0][1].inner
+        if found is None:
+            return None
+        try:
+            if self._ritz_type_to_llvm(found) != elem_ty:
+                return None
+        except ValueError:  # an unknown type: say nothing, as before
+            return None
+        return found
 
     def _emit_for_iter_value(self, it: rast.Expr) -> ir.Value:
         """What a `for` walks: a pointer to the array or header `it` names, if
