@@ -6211,6 +6211,11 @@ class LLVMEmitter:
                          if isinstance(stmt.target.expr, rast.Index) else None)
                 if place is not None:
                     struct_val = self._emit_expr(place.operand)
+                if struct_val is None and self._call_rooted_field(stmt.target.expr):
+                    # AGAST #2879: `sp(@s).inner.y = v`: address the field
+                    # through the call's pointer.  Reading `sp(@s).inner` as a
+                    # value, then addressing it, ran the call twice.
+                    struct_val = self._emit_lvalue_addr(stmt.target.expr)
                 if struct_val is None:
                     struct_val = self._emit_expr(stmt.target.expr)
 
@@ -9490,6 +9495,16 @@ class LLVMEmitter:
                 finally:
                     self._index_use = None
                 return self._field_addr(root, expr.field, 1)
+            if not rvalue_root and isinstance(expr.expr, (rast.Call, rast.MethodCall)):
+                # AGAST #2879: a field of a `*S` call's result is a place,
+                # `sp(@s).arr[2] = 5`: the call yields the struct's address.
+                # A struct returned by value has none to store into (#2518).
+                base = self._emit_expr(expr.expr)
+                if not isinstance(base.type, ir.PointerType):
+                    raise ValueError(
+                        f"cannot store into field '{expr.field}' of a call's "
+                        f"by-value result")
+                return self._field_addr(base, expr.field, 1)
             return self._field_addr(self._emit_lvalue_addr(expr.expr, rvalue_root),
                                     expr.field, 1)
         elif rvalue_root and isinstance(expr, (rast.Call, rast.MethodCall)):
@@ -10554,6 +10569,15 @@ class LLVMEmitter:
                 alloca, _ = self.locals[name]
                 return alloca
         return None
+
+    @staticmethod
+    def _call_rooted_field(expr: rast.Expr) -> bool:
+        """Whether `expr` is a field chain on a call, `sp(@s).inner`."""
+        if not isinstance(expr, rast.Field):
+            return False
+        while isinstance(expr, rast.Field):
+            expr = expr.expr
+        return isinstance(expr, (rast.Call, rast.MethodCall))
 
     def _struct_place_addr(self, expr: rast.Expr) -> Optional[ir.Value]:
         """The address of `expr` if it names struct storage, else None.

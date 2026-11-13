@@ -12,9 +12,9 @@ it there, as if a local held it, and evaluates the call once. A store or `@`
 into a call's value still isn't a place (#2518 wants a located refusal).
 
 ritz1 and ritz1_selfhosted read an element of a by-value call's field rows.
-They refuse a `for` over a row, a whole row into a `let`, and any field read
-through a call returning `*R` (#2517): pinned below as refusals, so a change
-there shows up.
+They refuse a `for` over a row, a whole row into a `let`, and, through a call
+returning `*R`, all but a one-dimensional row's element (#2517): pinned below as
+refusals, so a change there shows up.
 
 Each program returns 0, or the number of the first check that failed.
 """
@@ -167,8 +167,13 @@ RUNS["generic_body_twice"] = PRELUDE.replace(
 RITZ0_ONLY = {f"{root}_for": _prog(_walk(call)) for root, call in BY_VALUE.items()}
 RITZ0_ONLY.update({f"{root}_whole_row": _prog(_reads(call)["whole_row"])
                    for root, call in BY_VALUE.items()})
+# A one-dimensional field row through `*R` reads on ritz1 since #2879 made a
+# `*S` call's field a place; the rest of #2517 is still refused.
+POINTER_RUNS = ("row_elem", "call_index")
+RUNS.update({f"pointer_call_{shape}": _prog(body)
+             for shape, body in _reads("mkp()").items() if shape in POINTER_RUNS})
 RITZ0_ONLY.update({f"pointer_call_{shape}": _prog(body)
-                   for shape, body in _reads("mkp()").items()})
+                   for shape, body in _reads("mkp()").items() if shape not in POINTER_RUNS})
 RITZ0_ONLY["pointer_call_for"] = _prog(_walk("mkp()"))
 # A `*R` result is the struct it points at, not a copy: a write shows.
 RITZ0_ONLY["pointer_call_is_live"] = _prog(

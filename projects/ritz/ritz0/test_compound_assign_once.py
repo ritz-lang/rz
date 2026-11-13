@@ -98,6 +98,14 @@ PROGRAMS = {
     "generic_two_params": _COUNT + "fn bump<T, U>(a: *[3]T, v: T, u: U)\n    *cell(@a[idx(2)] as *i32) -= v\n\n"
                           "pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n    bump<i32, i64>(@a, 7, 1)\n"
                           "    return a[2] - 23 + calls * 5\n",
+    # A field of a `*S` call's result is a place (AGAST #2879): the call runs
+    # once and the store goes through the pointer it returns.
+    "member_call": _COUNT + "pub fn main() -> i32\n" + _S
+                   + "    sp(@s).x *= 3\n    return s.x - 12 + calls * 10\n",
+    "method_member": _COUNT + "pub fn main() -> i32\n" + _S
+                     + "    s.me().x += 5\n    return s.x - 9 + calls * 10\n",
+    "member_call_index": _COUNT + "pub fn main() -> i32\n" + _S
+                         + "    sp(@s).arr[idx(2)] += 5\n    return s.arr[2] - 8 + calls * 5\n",
     # Control: written out, the read and the store are two places, so two calls
     # (four over two exits), each emission its own.
     "written_out_defer": _COUNT + "fn bump(a: *[3]i32, early: i32) -> i32\n    defer h(a)[0] = h(a)[0] + 1\n"
@@ -112,19 +120,3 @@ PROGRAMS = {
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
 def test_the_place_is_evaluated_once(run_with, name, compiler):  # noqa: F811
     assert run_with(compiler, name, PROGRAMS[name]) == 10
-
-
-# A field of a `*S` call's result.  ritz1 can't store into one at all yet
-# ("unhandled EXPR_MEMBER in assignment", even `sp(@s).x = 3`): AGAST #2879.
-RITZ0_ONLY = {
-    "member_call": _COUNT + "pub fn main() -> i32\n" + _S
-                   + "    sp(@s).x *= 3\n    return s.x - 12 + calls * 10\n",
-    "method_member": _COUNT + "pub fn main() -> i32\n" + _S
-                     + "    s.me().x += 5\n    return s.x - 9 + calls * 10\n",
-}
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY))
-def test_ritz0_evaluates_a_call_root_once(run_with, name):  # noqa: F811
-    assert run_with("ritz0", name, RITZ0_ONLY[name]) == 10
