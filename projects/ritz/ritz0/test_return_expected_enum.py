@@ -30,6 +30,7 @@ fails as well as a rejected compile.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -625,6 +626,38 @@ fn main() -> i32
     t
 """
 
+# AGAST #2941: the zero-byte payload of `Option<()>` / `Result<(), ()>` built
+# outside a return (let, argument) and bound by name in a match arm, not only
+# matched with `_`.  Every variant payload is zero bytes here, unlike
+# `Result<(), i32>`, whose `Err` gives the enum a real data buffer.
+UNIT_ONLY_PAYLOADS = """\
+import ritzlib.option
+import ritzlib.result
+
+fn r(n: i32) -> Result<(), ()>
+    if n > 0
+        return Ok(())
+    Err(())
+
+fn some_count(o: Option<()>) -> i32
+    match o
+        Some(u) => 1
+        None => 0
+
+fn main() -> i32
+    var t: i32 = 0
+    let s: Option<()> = Some(())
+    let n: Option<()> = None
+    t = t + some_count(s) * 2 + some_count(n) * 100
+    match r(1)
+        Ok(u) => t = t + 3
+        Err(e) => t = t + 100
+    match r(0)
+        Ok(_) => t = t + 100
+        Err(e) => t = t + 5
+    t
+"""
+
 PAYLOAD_MEMBER = """\
 import ritzlib.result
 
@@ -722,9 +755,22 @@ def test_ritz1_option_unit(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "option_unit", OPTION_UNIT) == 30
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2941: Option<()> IndexError")
+# AGAST #2941: ritz0 gave `Option<()>` the tag-only body `{ i8 }`, then GEPed
+# its data field (IndexError).  A variant with a field keeps a data field even
+# when it is zero bytes: `{ i8, [0 x i8] }`, layout-equal to ritz1's
+# `{ i8, [0 x i8], [0 x i8] }` (size 1, payload at offset 1).
 def test_ritz0_option_unit(tmp_path):
     assert _run("ritz0", tmp_path, "option_unit", OPTION_UNIT) == 30
+    ll = (tmp_path / "option_unit_ritz0.ll").read_text()
+    assert re.search(r'Option\$unit" = type \{i8, \[0 x i8\]\}', ll), ll[:2000]
+
+
+def test_ritz0_unit_only_payloads(tmp_path):
+    assert _run("ritz0", tmp_path, "unit_only", UNIT_ONLY_PAYLOADS) == 10
+
+
+def test_ritz1_unit_only_payloads(tmp_path, ritz1_bin, ritz_start):
+    assert _run("ritz1", tmp_path, "unit_only", UNIT_ONLY_PAYLOADS) == 10
 
 
 def test_ritz1_payload_member_from_call_scrutinee(tmp_path, ritz1_bin, ritz_start):

@@ -2856,8 +2856,14 @@ class LLVMEmitter:
     def _set_enum_body(self, enum_type, variants) -> None:
         """Give an enum its `{ i8 tag, [P x i8] pad, [N x i8] data }` body."""
         padding, data_size = self._enum_payload_shape(variants)
-        if data_size == 0:
+        if not any(variant.fields for variant in variants):
             enum_type.set_body(self.i8)      # all unit variants: just a tag
+        elif data_size == 0:
+            # AGAST #2941: a payload of zero bytes (`Option<()>`) still has a
+            # field, and `_get_enum_data_index` / construction / match binding
+            # all GEP field 1 for it, so keep a zero-length data buffer there.
+            # Layout-equal to ritz1's `{ i8, [0 x i8], [0 x i8] }`.
+            enum_type.set_body(self.i8, ir.ArrayType(self.i8, 0))
         elif padding > 0:
             enum_type.set_body(self.i8, ir.ArrayType(self.i8, padding),
                                ir.ArrayType(self.i8, data_size))
