@@ -17,6 +17,7 @@ from typing import List, Optional, Callable
 from tokens import Token, TokenType, Span, KEYWORDS
 from lexer import Lexer, LexerError
 import ritz_ast as rast
+import index_rules
 
 
 def _defer_escape(node, in_loop: bool) -> Optional[str]:
@@ -918,7 +919,7 @@ class Parser:
 
             elif self._at(TokenType.LBRACKET):
                 # Index or Slice: a[i] or a[start:end] or a[:end] or a[start:]
-                self._advance()
+                bracket = self._advance().span
 
                 # Check for slice with empty start: [:end] or [:]
                 if self._at(TokenType.COLON):
@@ -951,7 +952,7 @@ class Parser:
                     else:
                         # [i] - simple index
                         self._expect(TokenType.RBRACKET)
-                        expr = rast.Index(expr.span, expr, first)
+                        expr = rast.Index(expr.span, expr, first, bracket)
 
             elif self._at(TokenType.DOT):
                 # Field access, tuple field access, or method call
@@ -1631,6 +1632,7 @@ class Parser:
                     TokenType.SLASHEQ: '/',
                 }[op_tok.type]
                 value = rast.BinOp(span, op, expr, value)
+                return rast.AssignStmt(span, expr, value, op)
             return rast.AssignStmt(span, expr, value)
 
         return rast.ExprStmt(span, expr)
@@ -2559,8 +2561,13 @@ class Parser:
         if self._at(TokenType.FOR):
             self._advance()
             trait_name = first_name
-            type_name = self._expect(TokenType.IDENT).value
+            type_tok = self._expect(TokenType.IDENT)
+            type_name = type_tok.value
             impl_type = None  # Reset - impl_type will be parsed next
+            if trait_name in index_rules.TRAITS and type_name in index_rules.BUILT_IN:
+                # `[]` on a Vec, Span or String keeps one meaning (§7.8).
+                raise ParseError(index_rules.builtin_impl(trait_name, type_name),
+                                 type_tok.span)
 
             # Check for type args on the implementing type (e.g., for Box<T>)
             if self._at(TokenType.LT):

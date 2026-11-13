@@ -28,6 +28,7 @@ SOURCES = \
 	ast_helpers \
 	parser_gen \
 	interp \
+	struct_index \
 	monomorph \
 	emitter_core \
 	binder_check \

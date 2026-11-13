@@ -549,8 +549,27 @@ struct HashMapI64
 | `hashmap_i64_cap` | `fn(m: @HashMapI64) -> i64` | Get capacity |
 | `hashmap_i64_is_empty` | `fn(m: @HashMapI64) -> i32` | Check if empty |
 | `hashmap_i64_drop` | `fn(m: @&HashMapI64)` | Free the map |
+| `hashmap_i64_value_ptr` | `fn(m: @HashMapI64, key: i64) -> *i64` | The value's slot (null if not found) |
+| `hashmap_i64_missing_key` | `fn(key: i64)` | Exit 101: `HashMapI64: key not found: <key>` |
 
 **Methods** (via impl): `len`, `cap`, `is_empty`, `insert`, `get`, `contains`, `remove`
+
+**Indexing** (LANGUAGE_SPEC §7.8): `HashMapI64` implements `Index`, `IndexMut` and
+`IndexSet` at `K` = `V` = `i64`. `m[k] = v` inserts or replaces; `m[k]`, `@m[k]`,
+`@&m[k]` and `m[k] += x` end the program through `hashmap_i64_missing_key` when `k`
+is missing. Test for a key with `hashmap_i64_contains` or `hashmap_i64_get`.
+
+```ritz
+import ritzlib.hashmap
+
+fn main() -> i32
+    var m: HashMapI64 = hashmap_i64_new()
+    m[7] = 1
+    m[7] += 2
+    if hashmap_i64_contains(@m, 8) == 0
+        m[8] = 0
+    (m[7] + m[8] - 3) as i32
+```
 
 ---
 

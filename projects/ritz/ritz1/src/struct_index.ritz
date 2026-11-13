@@ -1,0 +1,243 @@
+# struct_index.ritz - indexing a struct through `Index`, `IndexMut` and
+# `IndexSet` (LANGUAGE_SPEC §7.8, LARB ruling R15, AGAST #1635).
+#
+# A struct opts into `[]` by implementing up to three compiler-known traits,
+# resolved statically by name like `Drop`.  monomorph.ritz rewrites each use of
+# `m[k]` on such a struct into the method it means:
+#
+#   a read, `.f`                 *m.index(k)
+#   `@m[k]`                      m.index(k)
+#   `@&m[k]`, `m[k].f = x`       m.index_mut(k) / *m.index_mut(k)
+#   `m[k] = v`                   m.index_set(k, v), else *m.index_mut(k) = v
+#   `m[k] op= x`                 *C = *C op x, C = m.index_mut(k), called once
+#
+# This module holds what monomorph and the emitter share: which traits a type
+# implements, the located refusals (ritz0 prints the same words, from
+# ritz0/index_rules.py), and the calls that must be evaluated once.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.str
+
+import ast
+
+# Which traits a type implements, as a mask.
+const SI_INDEX: i32 = 1
+const SI_INDEX_MUT: i32 = 2
+const SI_INDEX_SET: i32 = 4
+
+# How `m[k]` is used, which decides the trait it needs.
+const SI_USE_READ: i32 = 0         # a read, `.f`, `@m[k]`: Index
+const SI_USE_ASSIGN: i32 = 1       # `m[k] = v`: IndexSet or IndexMut
+const SI_USE_ADDR_MUT: i32 = 2     # `@&m[k]`: IndexMut
+const SI_USE_COMPOUND: i32 = 3     # `m[k] op= x`: IndexMut
+const SI_USE_FIELD_STORE: i32 = 4  # `m[k].f = x`: IndexMut
+
+var g_si_errors: i32 = 0
+var g_si_file: *u8 = null
+
+pub fn struct_index_set_file(path: *u8)
+    g_si_file = path
+
+pub fn struct_index_errors() -> i32
+    g_si_errors
+
+fn si_name_eq(a: *u8, a_len: i32, b: *u8, b_len: i32) -> i32
+    if a_len != b_len
+        return 0
+    if a_len == 0
+        return 1
+    if memcmp(a, b, a_len as i64) == 0
+        return 1
+    0
+
+# The traits `type_name` implements, from the module's non-generic impls.
+pub fn si_traits(m: *Module, type_name: *u8, type_len: i32) -> i32
+    var mask: i32 = 0
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.trait_name != null and ib.type_params == null and si_name_eq(ib.type_name, ib.type_name_len, type_name, type_len) == 1
+            if si_name_eq(ib.trait_name, ib.trait_name_len, c"Index", 5) == 1
+                mask = mask | SI_INDEX
+            else if si_name_eq(ib.trait_name, ib.trait_name_len, c"IndexMut", 8) == 1
+                mask = mask | SI_INDEX_MUT
+            else if si_name_eq(ib.trait_name, ib.trait_name_len, c"IndexSet", 8) == 1
+                mask = mask | SI_INDEX_SET
+        ib = ib.next
+    mask
+
+# 1 when the module (imports merged) declares a non-generic struct `name`.
+pub fn si_is_struct(m: *Module, name: *u8, len: i32) -> i32
+    var st: *StructDef = m.structs
+    while st != null
+        if st.type_params == null and si_name_eq(st.name, st.name_len, name, len) == 1
+            return 1
+        st = st.next
+    0
+
+# `Vec$T`, `Span$T` and `String` index as the language says (§7.8).
+pub fn si_built_in(name: *u8, len: i32) -> i32
+    if si_name_eq(name, len, c"String", 6) == 1
+        return 1
+    if len >= 4 and memcmp(name, c"Vec$", 4) == 0
+        return 1
+    if len >= 5 and memcmp(name, c"Span$", 5) == 0
+        return 1
+    if si_name_eq(name, len, c"Vec", 3) == 1 or si_name_eq(name, len, c"Span", 4) == 1
+        return 1
+    0
+
+fn si_error_at(line: i32, col: i32)
+    g_si_errors = g_si_errors + 1
+    eprints_cstr(c"error: ")
+    if g_si_file != null
+        eprints_cstr(g_si_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": ")
+
+# `Index`, `Index` and `IndexSet`, `Index`, `IndexMut` and `IndexSet`.
+fn si_print_listed(mask: i32)
+    var names: [3]*u8
+    var n: i32 = 0
+    if (mask & SI_INDEX) != 0
+        names[n] = c"`Index`"
+        n += 1
+    if (mask & SI_INDEX_MUT) != 0
+        names[n] = c"`IndexMut`"
+        n += 1
+    if (mask & SI_INDEX_SET) != 0
+        names[n] = c"`IndexSet`"
+        n += 1
+    var i: i32 = 0
+    while i < n
+        if i > 0
+            if i == n - 1
+                eprints_cstr(c" and ")
+            else
+                eprints_cstr(c", ")
+        eprints_cstr(names[i])
+        i += 1
+
+# 1 when `use` of `m[k]` on `type_name`, which implements `mask`, is allowed;
+# else the located refusal, and 0.  (ritz0: index_rules.message.)
+pub fn si_check(line: i32, col: i32, type_name: *u8, type_len: i32, mask: i32, use: i32) -> i32
+    var ok: i32 = 0
+    if mask != 0
+        if use == SI_USE_READ
+            ok = ((mask & SI_INDEX) != 0) as i32
+        else if use == SI_USE_ASSIGN
+            ok = ((mask & (SI_INDEX_SET | SI_INDEX_MUT)) != 0) as i32
+        else
+            ok = ((mask & SI_INDEX_MUT) != 0) as i32
+    if ok == 1
+        return 1
+    si_error_at(line, col)
+    if mask == 0 or use == SI_USE_READ
+        eprint_char('`')
+        sys_write(2, type_name, type_len as i64)
+        eprintln_cstr(c"` can't be indexed: it doesn't implement `Index` (§7.8)")
+        return 0
+    if use == SI_USE_ASSIGN
+        eprints_cstr(c"`m[k] = v` needs `IndexSet` or `IndexMut`, and `")
+    else
+        if use == SI_USE_ADDR_MUT
+            eprints_cstr(c"`@&m[k]`")
+        else if use == SI_USE_COMPOUND
+            eprints_cstr(c"`m[k] op= x`")
+        else
+            eprints_cstr(c"`m[k].f = x`")
+        eprints_cstr(c" needs `IndexMut`, and `")
+    sys_write(2, type_name, type_len as i64)
+    eprints_cstr(c"` implements only ")
+    si_print_listed(mask)
+    eprints_cstr(c"\n")
+    0
+
+# `p[k] = v` and the other writes with `p` an `@M` (§3.2): ref_check's words,
+# which it can't say itself once the store is a method call.
+pub fn si_refuse_write_through(line: i32, col: i32)
+    si_error_at(line, col)
+    eprintln_cstr(c"cannot write through an `@T`: make it `@&T`")
+
+# A fresh, zeroed Expr.
+pub fn si_new_expr(kind: i32, line: i32, col: i32) -> *Expr
+    let e: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(e as *u8, 0, sizeof(Expr))
+    e.kind = kind
+    e.span.line = line
+    e.span.col = col
+    e.next = null
+    e
+
+# `recv.<method>(args)`: `args` is a list linked through `next`.
+pub fn si_method(recv: *Expr, method: *u8, method_len: i32, args: *Expr, line: i32, col: i32) -> *Expr
+    let call: *Expr = si_new_expr(EXPR_METHOD, line, col)
+    call.left = recv
+    call.ident_ptr = method
+    call.ident_len = method_len
+    call.args = args
+    call
+
+# `*e`.
+pub fn si_deref(e: *Expr, line: i32, col: i32) -> *Expr
+    let d: *Expr = si_new_expr(EXPR_UNARY, line, col)
+    d.op = OP_DEREF
+    d.operand = e
+    d
+
+# ----------------------------------------------------------------------------
+# Calls evaluated once.  `m[k] op= x` arrives as `*C = *C op x` with one call
+# node C shared by the store and the read: the emitter emits C at the first and
+# hands its register to the second, so `index_mut` runs once (AGAST #2529).
+# Each emission of the statement (a `defer` body is emitted at every exit)
+# comes as such a pair, so the second of each clears the entry.
+# ----------------------------------------------------------------------------
+
+var g_si_once: **Expr = null
+var g_si_once_reg: *i32 = null
+var g_si_once_count: i32 = 0
+var g_si_once_cap: i32 = 0
+
+pub fn si_once_add(e: *Expr)
+    if g_si_once_count == g_si_once_cap
+        var cap: i32 = 16
+        if g_si_once_cap > 0
+            cap = g_si_once_cap * 2
+        let nodes: **Expr = malloc((cap as i64) * 8) as **Expr
+        let regs: *i32 = malloc((cap as i64) * 4) as *i32
+        var i: i32 = 0
+        while i < g_si_once_count
+            *(nodes + i) = *(g_si_once + i)
+            *(regs + i) = *(g_si_once_reg + i)
+            i += 1
+        g_si_once = nodes
+        g_si_once_reg = regs
+        g_si_once_cap = cap
+    *(g_si_once + g_si_once_count) = e
+    *(g_si_once_reg + g_si_once_count) = -1
+    g_si_once_count += 1
+
+# The slot of `e` among the calls evaluated once, or -1.
+pub fn si_once_find(e: *Expr) -> i32
+    var i: i32 = 0
+    while i < g_si_once_count
+        if *(g_si_once + i) == e
+            return i
+        i += 1
+    -1
+
+# The register an earlier emission of slot `i` left, or -1 when this is the
+# first of the pair (record it with si_once_set).  Reading it clears the slot.
+pub fn si_once_take(i: i32) -> i32
+    let r: i32 = *(g_si_once_reg + i)
+    *(g_si_once_reg + i) = -1
+    r
+
+pub fn si_once_set(i: i32, reg: i32)
+    *(g_si_once_reg + i) = reg

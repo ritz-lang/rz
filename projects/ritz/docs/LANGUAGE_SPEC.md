@@ -1897,9 +1897,7 @@ fn main() -> i32
 
 #### Indexing a struct
 
-*Ruled by LARB on 2026-11-12 (AGAST #2803). Neither compiler implements this yet; it
-lands with AGAST #1635, so the examples are `text` until then. Today ritz0 rewrites
-`m[k]` only for a local named exactly `HashMapI64`, and ritz1 emits invalid IR for it.*
+*Ruled by LARB on 2026-11-12 (AGAST #2803), implemented by AGAST #1635.*
 
 Arrays, pointers, Vec, Span and String index as described above, and stay built in. Any
 other struct opts into `[]` by implementing up to three traits. Like `Drop`, the
@@ -1907,14 +1905,31 @@ compiler knows these traits by name. Their methods are resolved statically from 
 concrete type (§12.2), so they need no trait bounds and no dynamic dispatch. An impl
 chooses its key type `K` and element type `V`:
 
-```text
+```ritz
+struct Cell
+    v: i32
+
+struct M
+    cells: [4]Cell
+
 impl Index for M                                # m[k] read: a shared place
-    fn index(self: @M, key: K) -> @V
+    fn index(self: @M, key: i64) -> @Cell
+        @self.cells[key]
 impl IndexMut for M                             # m[k] as a mutable place
-    fn index_mut(self: @&M, key: K) -> @&V
+    fn index_mut(self: @&M, key: i64) -> @&Cell
+        @&self.cells[key]
 impl IndexSet for M                             # m[k] = v, which may insert
-    fn index_set(self: @&M, key: K, value: V)
+    fn index_set(self: @&M, key: i64, value: Cell)
+        self.cells[key] = value
+
+fn main() -> i32
+    var m: M
+    m[0] = Cell { v: 2 }                        # index_set
+    m[1].v = 3                                  # index_mut
+    m[0].v + m[1].v - 5                         # index
 ```
+
+Here `K` is `i64` and `V` is `Cell`; an impl chooses its own.
 
 `m[k]` is a place, like a Vec element, and each position uses one method:
 
@@ -1942,7 +1957,7 @@ impl IndexSet for M                             # m[k] = v, which may insert
 - **The built-in types can't opt in.** An `impl Index` for an array, pointer, Vec, Span
   or String is an error, so `[]` on those types keeps one meaning.
 
-```text
+```ritz
 import ritzlib.hashmap
 
 fn main() -> i32
@@ -1951,21 +1966,70 @@ fn main() -> i32
     m[1] += 5                       # index_mut, m and 1 evaluated once
     let p: @i64 = @m[1]             # index
     let v: i64 = *p - 15            # 0
-    hashmap_i64_drop(@&m)
     v as i32
 ```
 
 Indexing a struct that doesn't implement the trait a use needs is an error, located at
 the `[`:
 
-```text
-error: `Point` can't be indexed: it doesn't implement `Index` (§7.8)
-error: `m[k] = v` needs `IndexSet` or `IndexMut`, and `Lookup` implements only `Index`
-error: `@&m[k]` needs `IndexMut`, and `Lookup` implements only `Index` and `IndexSet`
+```ritz expect-error="`Point` can't be indexed: it doesn't implement `Index` (§7.8)"
+struct Point
+    x: i32
+
+fn main() -> i32
+    var p: Point
+    p[0]
+```
+
+```ritz expect-error="`m[k] = v` needs `IndexSet` or `IndexMut`, and `Lookup` implements only `Index`"
+struct Lookup
+    n: [2]i64
+
+impl Index for Lookup
+    fn index(self: @Lookup, key: i64) -> @i64
+        @self.n[key]
+
+fn main() -> i32
+    var m: Lookup
+    m[0] = 1
+    0
+```
+
+```ritz expect-error="`@&m[k]` needs `IndexMut`, and `Lookup` implements only `Index` and `IndexSet`"
+struct Lookup
+    n: [2]i64
+
+impl Index for Lookup
+    fn index(self: @Lookup, key: i64) -> @i64
+        @self.n[key]
+
+impl IndexSet for Lookup
+    fn index_set(self: @&Lookup, key: i64, value: i64)
+        self.n[key] = value
+
+fn main() -> i32
+    var m: Lookup
+    let r: @&i64 = @&m[0]
+    0
+```
+
+The other mutable uses name themselves the same way (`` `m[k] op= x` ``,
+`` `m[k].f = x` ``), and an impl for a built-in type is refused at its name:
+
+```ritz expect-error="`String` is indexed by the language: it can't implement `Index` (§7.8)"
+import ritzlib.string
+
+impl Index for String
+    fn index(self: @String, key: i64) -> @u8
+        @self.data.data[key]
+
+fn main() -> i32
+    0
 ```
 
 `HashMapI64` implements all three in `ritzlib.hashmap`, at `K` = `V` = `i64`. Its
-`index` and `index_mut` end the program on a missing key, and `index_set` is
+`index` and `index_mut` end the program on a missing key (status 101, with
+`HashMapI64: key not found: <k>` on stderr), and `index_set` is
 `hashmap_i64_insert`. A generic `HashMap<K, V>` (AGAST #1858) implements them with
 `impl<K, V> Index for HashMap<K, V>`, the same way `ritzlib.box` writes
 `impl<T> Drop for Box<T>`.

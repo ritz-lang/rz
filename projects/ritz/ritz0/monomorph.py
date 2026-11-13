@@ -1356,7 +1356,8 @@ class Monomorphizer:
         elif isinstance(stmt, rast.AssignStmt):
             return rast.AssignStmt(stmt.span,
                                    self._specialize_expr(stmt.target, subst),
-                                   self._specialize_expr(stmt.value, subst))
+                                   self._specialize_expr(stmt.value, subst),
+                                   stmt.op)
         elif isinstance(stmt, rast.ReturnStmt):
             new_value = self._specialize_expr(stmt.value, subst) if stmt.value else None
             return rast.ReturnStmt(stmt.span, new_value)
@@ -1454,7 +1455,8 @@ class Monomorphizer:
         elif isinstance(expr, rast.Index):
             return rast.Index(expr.span,
                              self._specialize_expr(expr.expr, subst),
-                             self._specialize_expr(expr.index, subst))
+                             self._specialize_expr(expr.index, subst),
+                             expr.bracket)
         elif isinstance(expr, rast.Field):
             return rast.Field(expr.span,
                              self._specialize_expr(expr.expr, subst),
@@ -1693,7 +1695,8 @@ class Monomorphizer:
         elif isinstance(stmt, rast.AssignStmt):
             return rast.AssignStmt(stmt.span,
                                    self._rewrite_expr(stmt.target),
-                                   self._rewrite_expr(stmt.value))
+                                   self._rewrite_expr(stmt.value),
+                                   stmt.op)
         elif isinstance(stmt, rast.ReturnStmt):
             new_value = self._rewrite_expr(stmt.value) if stmt.value else None
             return rast.ReturnStmt(stmt.span, new_value)
@@ -1757,7 +1760,8 @@ class Monomorphizer:
         elif isinstance(expr, rast.Index):
             return rast.Index(expr.span,
                              self._rewrite_expr(expr.expr),
-                             self._rewrite_expr(expr.index))
+                             self._rewrite_expr(expr.index),
+                             expr.bracket)
         elif isinstance(expr, rast.Field):
             return rast.Field(expr.span,
                              self._rewrite_expr(expr.expr),

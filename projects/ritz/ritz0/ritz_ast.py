@@ -372,9 +372,11 @@ class Call(Expr):
 
 @dataclass
 class Index(Expr):
-    """Index operation: a[i]."""
+    """Index operation: a[i]. `bracket` is where the `[` is: the errors for
+    indexing a struct are located there (LANGUAGE_SPEC §7.8)."""
     expr: Expr
     index: Expr
+    bracket: Optional[Span] = None
 
 
 @dataclass
@@ -702,9 +704,15 @@ class ExprStmt(Stmt):
 
 @dataclass
 class AssignStmt(Stmt):
-    """Assignment: x = expr, a[i] = expr, s.field = expr."""
+    """Assignment: x = expr, a[i] = expr, s.field = expr.
+
+    `x op= y` arrives as `x = x op y`, with `op` its operator ('+', ...). Most
+    paths only need the desugared value; a struct's `m[k] op= x` calls
+    `index_mut` once (LANGUAGE_SPEC §7.8), so it needs to know.
+    """
     target: Expr
     value: Expr
+    op: Optional[str] = None
 
 
 @dataclass

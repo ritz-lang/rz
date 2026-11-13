@@ -13,6 +13,7 @@
 
 import ast
 import ast_helpers
+import struct_index   # AGAST #1635
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
@@ -199,6 +200,7 @@ var g_lv_type_names: **u8 = null       # Kind 0: the struct's name (e.g. "R")
 var g_lv_type_name_lens: *i32 = null
 var g_lv_by_value: *i32 = null         # 1: the local IS the struct, not *T / @T (AGAST #2451)
                                        # 2: a *T, @T or @&T of it, one level (AGAST #2448)
+var g_lv_shared: *i32 = null           # 1: an `@T` param or local, which refuses writes (§3.2)
 var g_lv_count: i32 = 0
 var g_lv_cap: i32 = 0
 var g_lv_initialized: i32 = 0
@@ -215,6 +217,7 @@ fn init_local_var_tracker()
     g_lv_type_names = malloc((g_lv_cap as i64) * 8) as **u8
     g_lv_type_name_lens = malloc((g_lv_cap as i64) * 4) as *i32
     g_lv_by_value = malloc((g_lv_cap as i64) * 4) as *i32
+    g_lv_shared = malloc((g_lv_cap as i64) * 4) as *i32
     g_lv_initialized = 1
     g_lv_count = 0
 
@@ -243,6 +246,7 @@ fn add_local_var(name: *u8, name_len: i32, prefix_kind: i32, suffix: *u8, suffix
         g_lv_type_names = realloc(g_lv_type_names as *u8, cap * 8) as **u8
         g_lv_type_name_lens = realloc(g_lv_type_name_lens as *u8, cap * 4) as *i32
         g_lv_by_value = realloc(g_lv_by_value as *u8, cap * 4) as *i32
+        g_lv_shared = realloc(g_lv_shared as *u8, cap * 4) as *i32
         g_lv_cap = cap as i32
     *(g_lv_names + g_lv_count) = name
     *(g_lv_name_lens + g_lv_count) = name_len
@@ -252,6 +256,7 @@ fn add_local_var(name: *u8, name_len: i32, prefix_kind: i32, suffix: *u8, suffix
     *(g_lv_type_names + g_lv_count) = null
     *(g_lv_type_name_lens + g_lv_count) = 0
     *(g_lv_by_value + g_lv_count) = 0
+    *(g_lv_shared + g_lv_count) = 0
     g_lv_count = g_lv_count + 1
 
 # The local just added holds the struct itself, not a pointer to one.
@@ -302,6 +307,8 @@ fn track_typed_local_through(name: *u8, name_len: i32, type_kind: i32, pointee: 
         return
     if type_kind == TYPE_PTR or type_kind == TYPE_REF or type_kind == TYPE_MUT_REF
         *(g_lv_by_value + g_lv_count - 1) = 2
+    if type_kind == TYPE_REF
+        *(g_lv_shared + g_lv_count - 1) = 1
 
 # Un-annotated `let p = @v` / `@&v` of a by-value Vec, Span or String local:
 # `p` points at it, one level, as `let p: @Vec<T> = @v` would (AGAST #2448).
@@ -839,6 +846,7 @@ fn collect_from_fn_body(m: *Module, body: *Stmt)
         s = s.next
 
 fn collect_from_stmt(m: *Module, s: *Stmt)
+    rewrite_struct_index_stmt(m, s)   # AGAST #1635
     let k: i32 = s.kind
     if k == STMT_EXPR
         collect_from_expr(m, s.expr)
@@ -1149,6 +1157,243 @@ fn impl_has_method(m: *Module, tn: *u8, tn_len: i32, meth: *u8, meth_len: i32) -
         ib = ib.next
     return 0
 
+# ----------------------------------------------------------------------------
+# Indexing a struct (LANGUAGE_SPEC §7.8, LARB R15, AGAST #1635): `m[k]` on a
+# struct with `impl Index` / `IndexMut` / `IndexSet` becomes the method call it
+# means, in place.  struct_index.ritz says which, and holds the refusals.
+# ----------------------------------------------------------------------------
+
+# The struct `base[k]` indexes, when `base` is a tracked local (by value, or one
+# `@` / `@&` / `*` level) or a field of one, and that struct isn't built in;
+# else null.  `*out_mask` gets the traits it implements.  A pointer to a struct
+# with none of them is a raw buffer, and a reference to one is refused as one
+# value (index_through.ritz): both are left alone.
+fn si_base_struct(m: *Module, base: *Expr, out_len: *i32, out_mask: *i32) -> *u8
+    *out_len = 0
+    *out_mask = 0
+    if base == null
+        return null
+    var name: *u8 = null
+    var len: i32 = 0
+    var through: i32 = 0
+    if base.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(base.ident_ptr, base.ident_len)
+        if idx < 0 or *(g_lv_prefix_kind + idx) != 0
+            return null
+        let bv: i32 = *(g_lv_by_value + idx)
+        if bv != 1 and bv != 2
+            return null
+        if bv == 2
+            through = 1
+        name = *(g_lv_type_names + idx)
+        len = *(g_lv_type_name_lens + idx)
+    else if base.kind == EXPR_MEMBER
+        let f: *StructField = resolve_member_field(m, base)
+        if f == null or f.field_type != TYPE_STRUCT
+            return null
+        name = f.field_type_name
+        len = f.field_type_name_len
+    else
+        return null
+    if name == null or len <= 0 or si_built_in(name, len) == 1 or si_is_struct(m, name, len) == 0
+        return null
+    let mask: i32 = si_traits(m, name, len)
+    if through == 1 and mask == 0
+        return null
+    *out_len = len
+    *out_mask = mask
+    name
+
+# A write to `p[k]` with `p` an `@M` (§3.2): located at `p`, as ref_check
+# refuses any other write through one.  1 when refused.
+fn si_refuse_shared_write(m: *Module, base: *Expr) -> i32
+    # `p.m[k]`, `p.a.m[k]`: the root, reached through fields held by value.  A
+    # pointer field on the way is its own place, not in what `p` refers to.
+    var root: *Expr = base
+    while root != null and root.kind == EXPR_MEMBER
+        if root != base
+            let f: *StructField = resolve_member_field(m, root)
+            if f == null or f.field_type != TYPE_STRUCT
+                return 0
+        root = root.left
+    if root == null or root.kind != EXPR_IDENT
+        return 0
+    let idx: i32 = find_local_var_idx(root.ident_ptr, root.ident_len)
+    if idx < 0 or *(g_lv_shared + idx) != 1
+        return 0
+    si_refuse_write_through(root.span.line, root.span.col)
+    1
+
+# The column of the `[` after `base` (`m[`, `h.t[`): the errors are located
+# there, as ritz0's are.
+fn si_bracket_col(base: *Expr) -> i32
+    if base.kind == EXPR_IDENT
+        return base.span.col + base.ident_len
+    if base.kind == EXPR_MEMBER and base.left != null
+        if base.left.kind == EXPR_IDENT or base.left.kind == EXPR_MEMBER
+            return si_bracket_col(base.left) + 1 + base.ident_len
+    base.span.col
+
+# `e`, an index on a struct, as `*<call>` in place.
+fn si_into_deref(e: *Expr, call: *Expr)
+    e.kind = EXPR_UNARY
+    e.op = OP_DEREF
+    e.operand = call
+    e.left = null
+    e.right = null
+
+# A read of `m[k]` (`*m.index(k)`), `@m[k]` (`m.index(k)`) or `@&m[k]`
+# (`m.index_mut(k)`).  Called on each expression before its children.
+fn rewrite_struct_index(m: *Module, e: *Expr)
+    if e == null
+        return
+    var x: *Expr = e
+    var use: i32 = SI_USE_READ
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        x = e.operand
+        if e.op == OP_ADDR_MUT
+            use = SI_USE_ADDR_MUT
+    if x == null or x.kind != EXPR_INDEX or x.right == null or x.right.kind == EXPR_RANGE
+        return
+    var len: i32 = 0
+    var mask: i32 = 0
+    let name: *u8 = si_base_struct(m, x.left, @len, @mask)
+    if name == null
+        return
+    if si_check(x.left.span.line, si_bracket_col(x.left), name, len, mask, use) == 0
+        return
+    if use == SI_USE_ADDR_MUT and si_refuse_shared_write(m, x.left) == 1
+        return
+    let key: *Expr = x.right
+    if x == e
+        si_into_deref(e, si_method(x.left, c"index", 5, key, e.span.line, e.span.col))
+        return
+    # `@m[k]` / `@&m[k]` is the reference the method returns.
+    e.kind = EXPR_METHOD
+    e.left = x.left
+    if use == SI_USE_ADDR_MUT
+        e.ident_ptr = c"index_mut"
+        e.ident_len = 9
+    else
+        e.ident_ptr = c"index"
+        e.ident_len = 5
+    e.args = key
+    e.operand = null
+    e.call_type_suffix = null
+    e.call_type_suffix_len = 0
+
+# `s`, a store to `base[key]` of `value`, as `index_set` or a store through
+# `index_mut`; `m[k] op= x` (compound) through one `index_mut` call.
+fn si_rewrite_assign(m: *Module, s: *Stmt, base: *Expr, key: *Expr, value: *Expr, compound: i32, line: i32, col: i32) -> i32
+    var len: i32 = 0
+    var mask: i32 = 0
+    let name: *u8 = si_base_struct(m, base, @len, @mask)
+    if name == null
+        return 0
+    var use: i32 = SI_USE_ASSIGN
+    if compound == 1
+        use = SI_USE_COMPOUND
+    if si_check(line, col, name, len, mask, use) == 0
+        return 0
+    if si_refuse_shared_write(m, base) == 1
+        return 0
+    key.next = null
+    if compound == 0 and (mask & SI_INDEX_SET) != 0
+        key.next = value
+        s.kind = STMT_EXPR
+        s.expr = si_method(base, c"index_set", 9, key, line, col)
+        return 1
+    let call: *Expr = si_method(base, c"index_mut", 9, key, line, col)
+    if compound == 1
+        # The read `m[k]` of `m[k] = m[k] op x` shares the call.
+        si_once_add(call)
+        value.left = si_deref(call, line, col)
+    s.kind = STMT_ASSIGN
+    s.if_cond = si_deref(call, line, col)
+    s.assign_target = null
+    s.assign_target_len = 0
+    s.assign_value = value
+    return 1
+
+# Statement forms of `m[k]` on a struct: `m[k] = v`, `m[k] op= x` and a store
+# to a field of one (`m[k].f = x`, `m[k].f op= x`).  Before the statement's
+# expressions are walked.
+fn rewrite_struct_index_stmt(m: *Module, s: *Stmt)
+    if s.kind == STMT_INDEX_ASSIGN
+        # `name[k] = v` keeps the name, not an expression.
+        let base: *Expr = si_new_expr(EXPR_IDENT, s.span.line, s.span.col)
+        base.ident_ptr = s.assign_target
+        base.ident_len = s.assign_target_len
+        let key: *Expr = s.while_cond
+        let v: *Expr = s.assign_value
+        var compound: i32 = 0
+        if v != null and v.kind == EXPR_BINARY and v.left != null and v.left.kind == EXPR_INDEX and v.left.right == key
+            compound = 1   # stmt_compound_assign_index shares the key
+        if si_rewrite_assign(m, s, base, key, v, compound, s.span.line, s.span.col + s.assign_target_len) == 1
+            collect_from_expr(m, key)
+        return
+    if s.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN or s.kind == STMT_MEMBER_INDEX_ASSIGN
+        # `h.t[k] = v` (a local's field) / `p.t[k] = v` (through a pointer
+        # expression): the base is the field `t`.
+        var owner: *Expr = null
+        if s.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
+            owner = si_new_expr(EXPR_IDENT, s.span.line, s.span.col)
+            owner.ident_ptr = s.var_name
+            owner.ident_len = s.var_name_len
+        else
+            owner = s.if_cond
+        if owner == null
+            return
+        let fbase: *Expr = si_new_expr(EXPR_MEMBER, owner.span.line, owner.span.col)
+        fbase.left = owner
+        fbase.ident_ptr = s.assign_target
+        fbase.ident_len = s.assign_target_len
+        let fkey: *Expr = s.while_cond
+        let fv: *Expr = s.assign_value
+        var fcompound: i32 = 0
+        if fv != null and fv.kind == EXPR_BINARY and fv.left != null and fv.left.kind == EXPR_INDEX and fv.left.right == fkey
+            fcompound = 1   # stmt_compound_assign_*_field_index shares the key
+        if si_rewrite_assign(m, s, fbase, fkey, fv, fcompound, fbase.span.line, si_bracket_col(fbase)) == 1
+            collect_from_expr(m, fkey)
+        return
+    if s.kind != STMT_ASSIGN or s.assign_target_len != 0 or s.if_cond == null
+        return
+    let t: *Expr = s.if_cond
+    let v: *Expr = s.assign_value
+    var compound: i32 = 0
+    if v != null and v.kind == EXPR_BINARY and v.left == t
+        compound = 1   # stmt_compound_assign_expr shares the target
+    if t.kind == EXPR_INDEX
+        if t.right == null or t.right.kind == EXPR_RANGE
+            return
+        let key: *Expr = t.right
+        if si_rewrite_assign(m, s, t.left, key, v, compound, t.left.span.line, si_bracket_col(t.left)) == 1
+            collect_from_expr(m, key)
+        return
+    if t.kind != EXPR_MEMBER
+        return
+    var root: *Expr = t
+    while root.left != null and root.kind == EXPR_MEMBER
+        root = root.left
+    if root.kind != EXPR_INDEX or root.right == null or root.right.kind == EXPR_RANGE
+        return
+    var len: i32 = 0
+    var mask: i32 = 0
+    let name: *u8 = si_base_struct(m, root.left, @len, @mask)
+    if name == null
+        return
+    if si_check(root.left.span.line, si_bracket_col(root.left), name, len, mask, SI_USE_FIELD_STORE) == 0
+        return
+    if si_refuse_shared_write(m, root.left) == 1
+        return
+    let key: *Expr = root.right
+    key.next = null
+    let call: *Expr = si_method(root.left, c"index_mut", 9, key, root.span.line, root.span.col)
+    if compound == 1
+        si_once_add(call)
+    si_into_deref(root, call)
+    collect_from_expr(m, key)
+
 # AGAST #2451: `v[lo..hi]` on a Vec, Span or String local (the value, not a
 # pointer to one) is rewritten in place into `v.slice(lo, hi)`, ritz0's lowering
 # (_emit_slice): vec_slice<T> and string_slice copy, span_slice is a view.  It
@@ -1290,6 +1535,7 @@ fn collect_from_expr(m: *Module, e: *Expr)
     rewrite_enum_from_call(m, e)
     rewrite_static_ufcs_call(m, e)   # AGAST #2575
     rewrite_value_slice(m, e)
+    rewrite_struct_index(m, e)       # AGAST #1635
     let k: i32 = e.kind
 
     if k == EXPR_CALL

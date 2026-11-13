@@ -5,9 +5,11 @@
 #
 # Usage:
 #   var m: HashMapI64 = hashmap_i64_new()
-#   hashmap_i64_insert(@m, 42, 100)
+#   hashmap_i64_insert(@&m, 42, 100)
 #   let val: i64 = hashmap_i64_get(@m, 42)
-#   hashmap_i64_drop(@m)
+#
+# Or by index (LANGUAGE_SPEC §7.8): `m[42] = 100` inserts, and `m[42]` reads,
+# ending the program on a missing key.
 #
 # Note: This is a specialized implementation for i64 keys and i64 values.
 # Generic HashMap<K,V> requires parser support for multi-param generics in casts.
@@ -239,6 +241,79 @@ pub fn hashmap_i64_get(m: @HashMapI64, key: i64) -> i64
         i += 1
 
     return 0  # Not found
+
+# The value slot for key, or null when the key is missing.
+pub fn hashmap_i64_value_ptr(m: @HashMapI64, key: i64) -> *i64
+    let h: u64 = hash_i64(key)
+    let mask: i64 = m.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < m.cap
+        let entry: *HashMapEntryI64 = m.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return null
+
+        if entry.state == 1  # OCCUPIED
+            if entry.key == key
+                return @entry.value
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# `m[key]` on a key the map doesn't hold (LANGUAGE_SPEC §7.8): a reference can't be
+# empty, so `index` and `index_mut` end the program here, with status 101.
+# Test for a key with hashmap_i64_contains, or read it with hashmap_i64_get.
+pub fn hashmap_i64_missing_key(key: i64)
+    let msg: *u8 = c"HashMapI64: key not found: "
+    sys_write(2, msg, 27)
+    var buf: [24]u8
+    var pos: i64 = 24
+    var n: i64 = key
+    # Digits from the low end; a negative n gives negative remainders.
+    while true
+        var d: i64 = n % 10
+        if d < 0
+            d = 0 - d
+        pos -= 1
+        buf[pos] = (48 + d) as u8
+        n = n / 10
+        if n == 0
+            break
+    if key < 0
+        pos -= 1
+        buf[pos] = 45  # '-'
+    sys_write(2, @buf[pos], 24 - pos)
+    sys_write(2, c"\n", 1)
+    sys_exit(101)
+
+# ============================================================================
+# Indexing: m[k] (LANGUAGE_SPEC §7.8, LARB R15)
+# ============================================================================
+
+# A shared use of `m[k]`: a read, `.f`, `@m[k]`.
+impl Index for HashMapI64
+    fn index(self: @HashMapI64, key: i64) -> @i64
+        let p: *i64 = hashmap_i64_value_ptr(self, key)
+        if p == null
+            hashmap_i64_missing_key(key)
+        @*p
+
+# A mutable use of `m[k]`: `@&m[k]`, `m[k] += x`.
+impl IndexMut for HashMapI64
+    fn index_mut(self: @&HashMapI64, key: i64) -> @&i64
+        let p: *i64 = hashmap_i64_value_ptr(self, key)
+        if p == null
+            hashmap_i64_missing_key(key)
+        @&*p
+
+# `m[k] = v`, which inserts a missing key.
+impl IndexSet for HashMapI64
+    fn index_set(self: @&HashMapI64, key: i64, value: i64)
+        hashmap_i64_insert(self, key, value)
 
 # Check if key exists
 pub fn hashmap_i64_contains(m: @HashMapI64, key: i64) -> i32

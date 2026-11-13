@@ -17,6 +17,7 @@ import ritz_ast as rast
 from monomorph import mangle_type_name, resolve_alias_in
 from tail_value import slot_tails, value_gap, value_tails
 import array_rules
+import index_rules
 import bool_rules
 import binder_names
 import match_coverage
@@ -617,6 +618,9 @@ class LLVMEmitter:
         # AGAST #2261: what the method call being emitted has already
         # evaluated, by id(expr): its receiver and the operands of a place.
         self._evaluated_once: Dict[int, ir.Value] = {}
+        # How the `m[k]` an address is being taken of is used (§7.8): "read" for
+        # `@`, else a mutable use's spelling. None outside one.
+        self._index_use: Optional[str] = None
         self._assert_val_fn: Optional[ir.Function] = None
         self._assert_site_gvars = None
         self._assert_file_consts: Dict[str, ir.Value] = {}
@@ -6012,6 +6016,15 @@ class LLVMEmitter:
 
         elif isinstance(stmt, rast.AssignStmt):
             self._check_let_write(stmt.target)
+            # `m[k] = v` / `m[k] op= x` on a struct (§7.8, AGAST #1635).
+            if isinstance(stmt.target, rast.Index) and self._emit_struct_index_assign(stmt):
+                return None
+            # `m[k].f = x` needs `IndexMut`: refuse it with the use spelled out.
+            root = stmt.target
+            while isinstance(root, rast.Field):
+                root = root.expr
+            if root is not stmt.target and isinstance(root, rast.Index):
+                self._struct_index(root, "m[k].f = x")
             # `x = Some(v)` must build the variant for the *target's* enum.
             # Variant names are global (`Some` -> whichever Option was
             # specialized last), so without the target type an assignment to
@@ -6102,28 +6115,6 @@ class LLVMEmitter:
                             self.builder.store(val, ptr)
                             return None
 
-                # Special handling for HashMapI64 indexed assignment: m[k] = v -> hashmap_i64_insert(&m, k, v)
-                if isinstance(stmt.target.expr, rast.Ident):
-                    name = stmt.target.expr.name
-                    if name in self.ritz_types:
-                        base_ritz_type = self.ritz_types[name]
-                        if isinstance(base_ritz_type, rast.NamedType):
-                            if base_ritz_type.name == 'HashMapI64':
-                                fn_name = "hashmap_i64_insert"
-                                if fn_name not in self.functions:
-                                    raise ValueError(f"HashMapI64 indexed assignment requires {fn_name} to be defined")
-                                fn, _ = self.functions[fn_name]
-                                # Get pointer to hashmap
-                                map_ptr = self._emit_lvalue_addr(stmt.target.expr)
-                                # Ensure key is i64
-                                if index.type != self.i64:
-                                    index = self.builder.sext(index, self.i64)
-                                # Ensure value is i64
-                                if val.type != self.i64:
-                                    val = self.builder.sext(val, self.i64)
-                                self.builder.call(fn, [map_ptr, index, val])
-                                return None
-
                 # Vec<T> element assignment: `v[i] = x` writes into the Vec's
                 # heap buffer.
                 vec_addr = self._try_vec_lvalue_base(stmt.target.expr)
@@ -6172,6 +6163,12 @@ class LLVMEmitter:
                 # global or field chain) is addressed directly: evaluating it
                 # as a value loads the whole struct (AGAST #1914).
                 struct_val = self._struct_place_addr(stmt.target.expr)
+                # `m[k].f = x` on a struct's `[]`: the element `index_mut` gives
+                # (§7.8), never a read of it first.
+                place = (self._struct_index(stmt.target.expr, "m[k].f = x")
+                         if isinstance(stmt.target.expr, rast.Index) else None)
+                if place is not None:
+                    struct_val = self._emit_expr(place.operand)
                 if struct_val is None:
                     struct_val = self._emit_expr(stmt.target.expr)
 
@@ -8186,6 +8183,112 @@ class LLVMEmitter:
         else:
             raise NotImplementedError(f"Expression: {type(expr)}")
 
+    def _index_traits(self, type_name: str) -> Set[str]:
+        """Which of `Index`, `IndexMut` and `IndexSet` `type_name` implements."""
+        return {trait for trait, ty in self.impls
+                if ty == type_name and trait in index_rules.TRAITS}
+
+    def _struct_index_base(self, expr: rast.Index) -> Optional[tuple]:
+        """`(M, base, through, traits)` when `expr` is `m[k]` on a struct M that
+        isn't built in (LANGUAGE_SPEC §7.8, AGAST #1635), else None.
+
+        `through` is True when `base` is an `@M`, `@&M` or `*M` that `[]` sees
+        through: the receiver is `base` itself. A pointer to a struct with none of
+        the traits is left alone: a `*M` is a raw buffer, and the paths below
+        refuse an `@M` as one value.
+        """
+        if isinstance(expr.index, rast.Range):
+            return None
+        base = expr.expr
+        while isinstance(base, rast.Grouped):
+            base = base.expr
+        ty = self._infer_ritz_type(base)
+        if ty is not None:
+            ty = resolve_alias_in(ty, self.type_aliases)
+        through = isinstance(ty, (rast.PtrType, rast.RefType))
+        if through:
+            ty = resolve_alias_in(ty.inner, self.type_aliases)
+        if not isinstance(ty, rast.NamedType) or ty.args:
+            return None
+        if ty.name not in self.struct_types or self._buffer_field_path(ty) is not None:
+            return None
+        traits = self._index_traits(ty.name)
+        if through and not traits:
+            return None
+        return ty.name, base, through, traits
+
+    def _struct_index_call(self, expr: rast.Index, method: str,
+                           extra: Optional[List[rast.Expr]] = None) -> Optional[rast.Call]:
+        """`M_<method>(recv, k, *extra)` for `m[k]` on a struct, with no checks."""
+        info = self._struct_index_base(expr)
+        if info is None:
+            return None
+        name, base, through, _ = info
+        span = expr.span
+        if through:
+            recv = base
+        else:
+            recv = rast.UnaryOp(span, '@' if method == 'index' else '@&', base)
+        return rast.Call(span, rast.Ident(span, f"{name}_{method}"),
+                         [recv, expr.index] + list(extra or []))
+
+    def _struct_index(self, expr: rast.Index, use: str) -> Optional[rast.UnaryOp]:
+        """`m[k]` on a struct as the place it means (§7.8): `*M_index(@m, k)` for
+        `use` "read", else `*M_index_mut(@&m, k)`. `use` spells a mutable use for
+        its error (`@&m[k]`, `m[k] op= x`, `m[k].f = x`). None when `m` isn't
+        such a struct; a located error, at the `[`, when M lacks the trait.
+        """
+        info = self._struct_index_base(expr)
+        if info is None:
+            return None
+        name, _, _, traits = info
+        where = expr.bracket or expr.span
+        refused = index_rules.message(traits, name, use)
+        if refused is not None:
+            raise EmitError(refused, where)
+        mutable = use != "read"
+        call = self._struct_index_call(expr, 'index_mut' if mutable else 'index')
+        return rast.UnaryOp(expr.span, '*', call)
+
+    def _emit_struct_index_assign(self, stmt) -> bool:
+        """`m[k] = v` and `m[k] op= x` on a struct (§7.8). False if `m` isn't one.
+
+        `m[k] = v` is `M_index_set(@&m, k, v)`, or a store through `index_mut`
+        without `IndexSet`. The parser spells `m[k] op= x` as `m[k] = m[k] op x`
+        and records `op`; that's one `index_mut` call, whose place the read and
+        the store share (AGAST #2529).
+        """
+        target = stmt.target
+        if self._struct_index_base(target) is None:
+            return False
+        value = stmt.value
+        if stmt.op is not None and isinstance(value, rast.BinOp):
+            place = self._struct_index(target, "m[k] op= x")
+            ptr = self._emit_expr(place.operand)
+            outer = self._evaluated_once
+            self._evaluated_once = dict(outer)
+            try:
+                self._evaluated_once[id(value.left)] = self.builder.load(ptr)
+                val = self._emit_expr(value)
+            finally:
+                self._evaluated_once = outer
+            self.builder.store(self._convert_type(val, ptr.type.pointee, value), ptr)
+            return True
+        name, _, _, traits = self._struct_index_base(target)
+        refused = index_rules.message(traits, name, "assign")
+        if refused is not None:
+            raise EmitError(refused, target.bracket or target.span)
+        if "IndexSet" in traits:
+            # A write through an `@M` was refused already (§3.2, TypeChecker).
+            self._emit_expr(self._struct_index_call(target, 'index_set', [value]))
+            return True
+        place = self._struct_index(target, "m[k] = v")
+        self._literal_into_slot(self._infer_ritz_type(place), value)
+        val = self._emit_expr(value)
+        ptr = self._emit_expr(place.operand)
+        self.builder.store(self._convert_type(val, ptr.type.pointee, value), ptr)
+        return True
+
     def _index_through(self, expr: rast.Index) -> Optional[rast.UnaryOp]:
         """`p[i]` as the place it means, when `p` sees through to a buffer: `p` a
         `*T`, `@T` or `@&T` and T a Vec, Span or String (AGAST #2440, LARB R9).
@@ -8202,7 +8305,13 @@ class LLVMEmitter:
 
         A reference to anything else is a located error, since it's one T. Every
         index comes through here, so this is the one place that says so.
+
+        A struct that implements `Index` (§7.8) reads through it: `*M_index(@m, k)`.
+        A store or a mutable use is caught before it gets here.
         """
+        place = self._struct_index(expr, "read")
+        if place is not None:
+            return place
         base = expr.expr
         while isinstance(base, rast.Grouped):
             base = base.expr
@@ -8423,20 +8532,6 @@ class LLVMEmitter:
                         if index.type != self.i64:
                             index = self.builder.sext(index, self.i64)
                         return self.builder.call(fn, [str_ptr, index])
-
-                    # Handle HashMapI64 indexing: m[k] -> hashmap_i64_get(&m, k)
-                    elif type_name == 'HashMapI64':
-                        fn_name = "hashmap_i64_get"
-                        if fn_name not in self.functions:
-                            raise ValueError(f"HashMapI64 indexing requires {fn_name} to be defined")
-
-                        fn, _ = self.functions[fn_name]
-                        # Get pointer to hashmap
-                        map_ptr = self._emit_lvalue_addr(expr.expr)
-                        # Ensure key is i64
-                        if index.type != self.i64:
-                            index = self.builder.sext(index, self.i64)
-                        return self.builder.call(fn, [map_ptr, index])
 
         # Vec<T> indexing sugar for non-identifier receivers, e.g.
         # `s.entries[i]` or `mk()[i]`. We infer the base Ritz type and, if it
@@ -9228,6 +9323,12 @@ class LLVMEmitter:
                 return self._mut_borrow_args[expr.operand.name]
             return ptr
         elif isinstance(expr, rast.Index):
+            # A struct's `m[k]` (§7.8): a read through `index`; `@&`, a field
+            # store and other mutable uses through `index_mut`.
+            use = "read" if rvalue_root else (self._index_use or "@&m[k]")
+            place = self._struct_index(expr, use)
+            if place is not None:
+                return self._emit_expr(place.operand)
             through = self._index_through(expr)
             if through is not None:
                 return self._emit_expr(through.operand)
@@ -9298,6 +9399,14 @@ class LLVMEmitter:
                     ptr_val, ptr_ty = self.params[name]
                     if isinstance(ptr_ty, ir.PointerType):
                         return self._field_addr(ptr_val, expr.field, 0)
+            if isinstance(expr.expr, rast.Index) and self._index_use is None:
+                # `m[k].f = x` on a struct is a mutable use (§7.8).
+                self._index_use = "m[k].f = x"
+                try:
+                    root = self._emit_lvalue_addr(expr.expr, rvalue_root)
+                finally:
+                    self._index_use = None
+                return self._field_addr(root, expr.field, 1)
             return self._field_addr(self._emit_lvalue_addr(expr.expr, rvalue_root),
                                     expr.field, 1)
         elif rvalue_root and isinstance(expr, (rast.Call, rast.MethodCall)):
@@ -10123,6 +10232,15 @@ class LLVMEmitter:
         if expr.op in ('&', '@', '&mut', '@&'):
             if expr.op in ('&mut', '@&'):
                 self._check_let_mut_borrow(expr.operand)
+            if isinstance(expr.operand, (rast.Index, rast.Field)):
+                # `@m[k]` reads a struct through `index`, `@&m[k]` through
+                # `index_mut` (§7.8); a `.f` on it is the same use.
+                outer = self._index_use
+                self._index_use = "read" if expr.op in ('&', '@') else "@&m[k]"
+                try:
+                    return self._emit_lvalue_addr(expr.operand)
+                finally:
+                    self._index_use = outer
             if isinstance(expr.operand, rast.Ident):
                 name = expr.operand.name
                 if name in self.locals:

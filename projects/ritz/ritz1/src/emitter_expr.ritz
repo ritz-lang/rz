@@ -19,6 +19,7 @@ import emitter_expr_call     # emit_expr_call, emit_expr_method
 import emitter_match         # emit_match (for EXPR_MATCH)
 import ownership             # own_note_temp (AGAST #2165)
 import bool_check   # AGAST #2342
+import struct_index # si_once_* (AGAST #1635)
 import literal_slot # AGAST #2341
 
 # =============================================================================
@@ -212,6 +213,27 @@ fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_l
         *out_st = st
         *out_levels = levels
         return emit_load_ptr(s, loc.reg)
+    if x.kind == EXPR_METHOD
+        # AGAST #1635: `(*m.index(k)).f`, which a struct's `m[k].f` becomes.
+        # The method returns an `@S`, `@&S` or `*S`: an address, in an i64.
+        let fd: *FnDef = method_call_def(s, x)
+        if fd == null or fd.return_type_name_len <= 0
+            return 0
+        if fd.return_type != TYPE_REF and fd.return_type != TYPE_MUT_REF and fd.return_type != TYPE_PTR
+            return 0
+        let mst: *StructDef = find_struct(s, fd.return_type_name, fd.return_type_name_len)
+        if mst == null
+            return 0
+        let addr: i32 = emit_expr(s, x)
+        let mp: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, mp)
+        emit_str(s, c" = inttoptr i64 ")
+        emit_reg(s, addr)
+        emit_str(s, c" to ptr\n")
+        *out_st = mst
+        *out_levels = 1
+        return mp
     if x.kind == EXPR_MEMBER
         var inner: MemberPtrResult
         emit_member_ptr(s, x, @inner)
@@ -1501,6 +1523,16 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
         let pred_reg: i32 = try_emit_enum_is_ok(s, e)
         if pred_reg >= 0
             return pred_reg
+        # `m[k] op= x` on a struct: its `index_mut` call is shared by the
+        # store and the read, and runs once (struct_index.ritz, AGAST #1635).
+        let once: i32 = si_once_find(e)
+        if once >= 0
+            let prev: i32 = si_once_take(once)
+            if prev >= 0
+                return prev
+            let first: i32 = emit_expr_method(s, e)
+            si_once_set(once, first)
+            return first
         return emit_expr_method(s, e)
     else if e.kind == EXPR_MATCH
         # Match expression — scrutinee in `left`, arms in `args` (recast).
