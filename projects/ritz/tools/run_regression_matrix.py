@@ -90,9 +90,6 @@ _RITZ1_TWINS = {
     "test_issue_usize_struct_field":
         "AGAST #2198 — a `usize` struct field emits `store %usize` (invalid IR)",
     # --- codegen, runtime failures ---
-    # The file builds since #2877; `s.is_empty()` calls the bool span_is_empty$u8 as i64.
-    "test_issue_slice_generic_siblings::test_span_builtin_methods":
-        "AGAST #2882 — a bool UFCS method's result read as i64 (upper bits garbage)",
 }
 
 # Files no compiler can build: they target draft features (LARB-0013) that
