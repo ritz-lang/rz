@@ -1,0 +1,103 @@
+# Harland Syscall Runtime - Working Directory (AGAST #2751, from main.ritz)
+# Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
+# syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
+
+import fs.knamespace { KNamespace, knamespace_get, knamespace_list }
+import fs.kdir_entry { KDirEntry }
+import fs.kpath { strview_from_ptr }
+import mm.uptr { uptr_validate_string, uptr_check_write }
+import serial { StrView }
+import syscall.errno { Errno }
+
+# ============================================================================
+# Working Directory Syscalls
+# ============================================================================
+#
+# Per-process current working directory support.
+# CWD is stored as a simple path string (max 255 bytes).
+# These syscalls allow userspace to:
+#   1. Get the current working directory (getcwd)
+#   2. Change the current working directory (chdir)
+
+# Global CWD storage (single process for now)
+var g_cwd: [256]u8
+var g_cwd_len: u16 = 1
+
+# Initialize CWD to root
+pub fn init_cwd()
+    g_cwd[0] = 47  # '/'
+    g_cwd[1] = 0   # null terminator
+    g_cwd_len = 1
+
+# sys_getcwd_impl: Get current working directory
+# Args: buf = buffer to write path to, size = buffer size
+# Returns: length of path on success, Errno.Range if buffer too small
+fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
+    # Check buffer size (need room for null terminator)
+    if size < (g_cwd_len as u64 + 1)
+        return Errno.Range as i64
+
+    # Copy CWD to user buffer
+    var i: u16 = 0
+    while i < g_cwd_len
+        *(buf + i as i64) = g_cwd[i]
+        i = i + 1
+    *(buf + g_cwd_len as i64) = 0  # Null terminate
+
+    return g_cwd_len as i64
+
+# sys_chdir_impl: Change current working directory
+# Args: path = path to new directory (null-terminated)
+# Returns: 0 on success, Errno.NoEnt / NameTooLong / NoDev on error
+fn sys_chdir_impl(path: *u8) -> i64
+    # Get path length
+    var path_len: i64 = 0
+    while *(path + path_len) != 0 and path_len < 255
+        path_len = path_len + 1
+
+    if path_len == 0
+        return Errno.NoEnt as i64
+    if path_len >= 255
+        return Errno.NameTooLong as i64
+
+    # Verify the path exists in the namespace
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        return Errno.NoDev as i64
+
+    let path_view: StrView = strview_from_ptr(path, path_len)
+
+    # Check if path exists (by trying to list it as a directory)
+    var entries: [1]KDirEntry
+    let count: i32 = knamespace_list(ns, @path_view, @entries[0], 1)
+
+    # knamespace_list returns an Errno (NoEnt, NotDir) if the path is no directory
+    if count < 0
+        return count as i64
+
+    # Path exists, update CWD
+    var i: i64 = 0
+    while i < path_len
+        g_cwd[i] = *(path + i)
+        i = i + 1
+    g_cwd[path_len] = 0
+    g_cwd_len = path_len as u16
+
+    return 0
+
+# getcwd(buf, size) -> length or -errno
+pub fn sys_getcwd_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate output buffer is writable
+    if rsi > 0
+        let buf_result: i64 = uptr_check_write(rdi as *u8, rsi as u64)
+        if buf_result != 0
+            return Errno.Fault as i64
+    return sys_getcwd_impl(rdi as *u8, rsi)
+
+# chdir(path) -> 0 or -errno
+pub fn sys_chdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate path string
+    let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+    if path_result < 0
+        return Errno.Fault as i64
+    return sys_chdir_impl(rdi as *u8)

@@ -1,0 +1,283 @@
+# Harland Syscall Runtime - Memory (AGAST #2751, from main.ritz)
+#
+# User stacks (alloc_user_stack is also bound by `extern fn` from
+# loader/elf.ritz) and anonymous mmap/munmap.
+# Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
+# syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
+
+import serial { prints, serial_print_hex, serial_print_dec }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_NO_EXECUTE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys }
+import syscall.errno { Errno }
+
+# ============================================================================
+# Memory Mapping (mmap/munmap)
+# ============================================================================
+#
+# Harland uses a simplified mmap interface:
+#   sys_mmap(addr_hint, length, prot, flags) -> mapped_addr or -errno
+#   sys_munmap(addr, length) -> 0 or -errno
+#
+# We only support anonymous mappings (no file-backed mmap yet).
+# The kernel allocates physical pages and maps them into the process.
+
+# Protection flags (simplified - we always allow read)
+const PROT_READ: u64 = 1
+const PROT_WRITE: u64 = 2
+const PROT_EXEC: u64 = 4
+
+# Mapping flags
+const MAP_PRIVATE: u64 = 0x02     # Private mapping (copy-on-write if file-backed)
+const MAP_ANONYMOUS: u64 = 0x20   # No file backing
+const MAP_FIXED: u64 = 0x10       # Map at exact address (hint is required)
+
+# User address space limits
+const USER_MMAP_START: u64 = 0x10000000      # 256MB - start of mmap region
+const USER_MMAP_END: u64 = 0x7FFFFFF00000    # Just below stack
+
+# User stack configuration
+# Stack grows DOWN from the top of the stack region.
+# We map 16 pages (64KB) from USER_STACK_BASE to USER_STACK_TOP.
+# The stack pointer starts at USER_STACK_TOP + PAGE_SIZE (one byte past the top page).
+#
+# Memory layout:
+#   USER_STACK_BASE   = 0x7FFFFFFEF000  (page 0, lowest address)
+#   ...
+#   USER_STACK_TOP    = 0x7FFFFFFFE000  (page 15, highest mapped page)
+#   Stack grows DOWN from USER_STACK_TOP + PAGE_SIZE - 16
+const USER_STACK_PAGES: u64 = 16
+const USER_STACK_SIZE: u64 = 65536  # 16 * 4096 = 64KB
+pub const USER_STACK_TOP: u64 = 0x7FFFFFFFE000   # Highest mapped page of user stack
+const USER_STACK_BASE: u64 = 0x7FFFFFFEF000  # Lowest page of stack (TOP - 15*PAGE_SIZE)
+
+# Simple mmap allocator state - tracks next free address for hint=0 case
+var g_next_mmap_addr: u64 = 0x10000000  # USER_MMAP_START
+
+# ============================================================================
+# User Stack Allocation Helper
+# ============================================================================
+#
+# Allocates and maps a multi-page user stack. The stack grows DOWN from
+# USER_STACK_TOP. We allocate USER_STACK_PAGES physical pages and map them
+# contiguously.
+#
+# ============================================================================
+# User Stack Allocation Helper
+# ============================================================================
+#
+# Allocates and maps a multi-page user stack. The stack grows DOWN from
+# USER_STACK_TOP. We allocate USER_STACK_PAGES physical pages and map them
+# contiguously.
+#
+# Returns: Stack pointer (top of usable stack), or 0 on failure
+pub fn alloc_user_stack() -> u64
+    # Allocate and map USER_STACK_PAGES pages starting from USER_STACK_BASE
+    var i: u64 = 0
+    while i < USER_STACK_PAGES
+        let phys_page: u64 = pmm_alloc_page()
+        if phys_page == 0
+            # Allocation failed - unmap what we've done so far
+            var j: u64 = 0
+            while j < i
+                let vaddr: u64 = USER_STACK_BASE + (j * PAGE_SIZE)
+                let paddr: u64 = vmm_virt_to_phys(vaddr)
+                vmm_unmap_page(vaddr)
+                if paddr != 0
+                    pmm_free_page(paddr)
+                j = j + 1
+            return 0
+
+        # Map page at USER_STACK_BASE + (i * PAGE_SIZE)
+        let vaddr: u64 = USER_STACK_BASE + (i * PAGE_SIZE)
+        let map_result: i32 = vmm_map_page(vaddr, phys_page, PTE_WRITABLE | PTE_USER)
+        if map_result != 0
+            # Map failed - free this page and unmap previous pages
+            pmm_free_page(phys_page)
+            var j: u64 = 0
+            while j < i
+                let prev_vaddr: u64 = USER_STACK_BASE + (j * PAGE_SIZE)
+                let paddr: u64 = vmm_virt_to_phys(prev_vaddr)
+                vmm_unmap_page(prev_vaddr)
+                if paddr != 0
+                    pmm_free_page(paddr)
+                j = j + 1
+            return 0
+
+        i = i + 1
+
+    # Stack pointer points to top of mapped region (stack grows DOWN)
+    # USER_STACK_TOP + PAGE_SIZE is the first unmapped address
+    # So stack_ptr = USER_STACK_TOP + PAGE_SIZE - 16 (aligned, with some headroom)
+    let stack_ptr: u64 = USER_STACK_TOP + PAGE_SIZE - 16
+    return stack_ptr
+
+# Free a user stack allocated by alloc_user_stack
+fn free_user_stack()
+    var i: u64 = 0
+    while i < USER_STACK_PAGES
+        let vaddr: u64 = USER_STACK_BASE + (i * PAGE_SIZE)
+        let paddr: u64 = vmm_virt_to_phys(vaddr)
+        vmm_unmap_page(vaddr)
+        if paddr != 0
+            pmm_free_page(paddr)
+        i = i + 1
+
+# ============================================================================
+# sys_mmap: Map anonymous memory pages
+# ============================================================================
+#
+# Arguments:
+#   addr_hint: Suggested address (0 = kernel chooses)
+#   length: Number of bytes to map (will be rounded up to page size)
+#   prot: Protection flags (PROT_READ | PROT_WRITE | PROT_EXEC)
+#   flags: Mapping flags (MAP_ANONYMOUS | MAP_PRIVATE)
+#
+# Returns:
+#   Address of mapped region, or Errno.Inval / Errno.NoMem
+#
+# Note: We only support anonymous private mappings for now.
+fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
+    # Validate flags - we only support anonymous private mappings
+    if (flags & MAP_ANONYMOUS) == 0
+        prints("[mmap] ERROR: only anonymous mappings supported\n")
+        return Errno.Inval as i64
+
+    if length == 0
+        prints("[mmap] ERROR: length cannot be zero\n")
+        return Errno.Inval as i64
+
+    # Round length up to page size
+    let num_pages: u64 = (length + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # Determine the mapping address
+    var map_addr: u64 = 0
+    if (flags & MAP_FIXED) != 0
+        # Must map at the exact address
+        if addr_hint == 0 or (addr_hint & 0xFFF) != 0
+            prints("[mmap] ERROR: MAP_FIXED requires page-aligned address\n")
+            return Errno.Inval as i64
+        map_addr = addr_hint
+    else if addr_hint != 0 and (addr_hint & 0xFFF) == 0
+        # Try the hint address if it's page-aligned
+        map_addr = addr_hint
+    else
+        # Kernel chooses - use simple bump allocator
+        map_addr = g_next_mmap_addr
+        g_next_mmap_addr = g_next_mmap_addr + (num_pages * PAGE_SIZE)
+
+    # Validate address is in user mmap region
+    if map_addr < USER_MMAP_START or map_addr >= USER_MMAP_END
+        prints("[mmap] ERROR: address outside user mmap region\n")
+        return Errno.NoMem as i64
+
+    if (map_addr + num_pages * PAGE_SIZE) > USER_MMAP_END
+        prints("[mmap] ERROR: mapping would exceed mmap region\n")
+        return Errno.NoMem as i64
+
+    # Compute page table flags from protection
+    var pte_flags: u64 = PTE_PRESENT | PTE_USER
+    if (prot & PROT_WRITE) != 0
+        pte_flags = pte_flags | PTE_WRITABLE
+    if (prot & PROT_EXEC) == 0
+        pte_flags = pte_flags | PTE_NO_EXECUTE
+
+    # Allocate and map each page
+    var i: u64 = 0
+    while i < num_pages
+        let page_phys: u64 = pmm_alloc_page()
+        if page_phys == 0
+            prints("[mmap] ERROR: out of physical memory\n")
+            # TODO: Unmap already-mapped pages
+            return Errno.NoMem as i64
+
+        let page_virt: u64 = map_addr + (i * PAGE_SIZE)
+        let result: i32 = vmm_map_page(page_virt, page_phys, pte_flags)
+        if result != 0
+            prints("[mmap] ERROR: failed to map page at 0x")
+            serial_print_hex(page_virt)
+            prints("\n")
+            pmm_free_page(page_phys)
+            # TODO: Unmap already-mapped pages
+            return Errno.NoMem as i64
+
+        # Zero the page for security
+        var p: u64 = 0
+        while p < PAGE_SIZE
+            *((page_virt + p) as *u8) = 0
+            p = p + 1
+
+        i = i + 1
+
+    # Debug output
+    prints("[mmap] Mapped ")
+    serial_print_dec(num_pages as i64)
+    prints(" pages at 0x")
+    serial_print_hex(map_addr)
+    prints("\n")
+
+    return map_addr as i64
+
+# ============================================================================
+# sys_munmap: Unmap memory pages
+# ============================================================================
+#
+# Arguments:
+#   addr: Address of region to unmap (must be page-aligned)
+#   length: Number of bytes to unmap (will be rounded up to page size)
+#
+# Returns:
+#   0 on success, Errno.Inval for a bad address
+fn sys_munmap_impl(addr: u64, length: u64) -> i64
+    # Validate address alignment
+    if (addr & 0xFFF) != 0
+        prints("[munmap] ERROR: address not page-aligned\n")
+        return Errno.Inval as i64
+
+    if length == 0
+        return 0  # Nothing to do
+
+    # Validate address is in user mmap region
+    if addr < USER_MMAP_START or addr >= USER_MMAP_END
+        prints("[munmap] ERROR: address outside user mmap region\n")
+        return Errno.Inval as i64
+
+    # Round length up to page size
+    let num_pages: u64 = (length + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # Unmap each page
+    var i: u64 = 0
+    while i < num_pages
+        let page_virt: u64 = addr + (i * PAGE_SIZE)
+
+        # vmm_unmap_page returns the physical address that WAS mapped, or 0
+        # if nothing was -- not a 0=success status. Treating it as a status
+        # (through an i32 that truncated it) meant no page was ever freed
+        # (#1443). Every page in the mmap region comes from sys_mmap_impl's
+        # pmm_alloc_page and nothing else maps it, so freeing exactly what
+        # was unmapped cannot double-free.
+        let unmapped_phys: u64 = vmm_unmap_page(page_virt)
+        if unmapped_phys != 0
+            pmm_free_page(unmapped_phys)
+
+        i = i + 1
+
+    # Debug output
+    prints("[munmap] Unmapped ")
+    serial_print_dec(num_pages as i64)
+    prints(" pages at 0x")
+    serial_print_hex(addr)
+    prints("\n")
+
+    return 0
+
+# ============================================================================
+# Memory syscall handlers
+# ============================================================================
+
+# mmap(addr, length, prot, flags)
+pub fn sys_mmap_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_mmap_impl(rdi, rsi, rdx, r10)
+
+# munmap(addr, length)
+pub fn sys_munmap_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_munmap_impl(rdi, rsi)

@@ -1,0 +1,170 @@
+# Harland Syscall Runtime - Entry (AGAST #2751, from main.ritz)
+#
+# SYSCALL/SYSRET MSR setup, the dispatch-table fill and the asm entry target.
+# syscall_entry.s calls syscall_handler by name; it looks the number up in
+# the #2121 table (syscall/dispatch.ritz), whose handlers live in the
+# syscall/runtime/<area>.ritz modules imported below.
+
+import io { rdmsr, wrmsr }
+import serial { prints, serial_print_hex, serial_print_dec }
+import syscall.numbers { Syscall }
+import syscall.errno { Errno }
+import syscall.dispatch { syscall_register, syscall_has_handler, syscall_dispatch }
+import syscall.runtime.process { sys_exit_handler, sys_open_handler, sys_spawn_handler, sys_spawn_args_handler, sys_wait_handler, sys_getpid_handler, sys_yield_handler, sys_acpi_poweroff_handler }
+import syscall.runtime.file { sys_read_handler, sys_write_handler, sys_close_handler, sys_lseek_handler, sys_mkdir_handler, sys_readdir_handler }
+import syscall.runtime.ipc { sys_channel_create_handler, sys_ipc_send_handler, sys_ipc_recv_handler, sys_ipc_close_handler, sys_cap_grant_handler, sys_cap_revoke_handler, sys_cap_derive_handler, sys_cap_info_handler, sys_cap_check_handler }
+import syscall.runtime.memory { sys_mmap_handler, sys_munmap_handler }
+import syscall.runtime.cwd { sys_getcwd_handler, sys_chdir_handler }
+import syscall.runtime.input { sys_input_poll_handler, sys_input_read_handler }
+import syscall.runtime.framebuffer { sys_fb_info_handler, sys_fb_map_handler }
+
+extern fn syscall_entry()
+
+# MSR numbers for SYSCALL/SYSRET
+const MSR_EFER: u32 = 0xC0000080
+const MSR_STAR: u32 = 0xC0000081
+const MSR_LSTAR: u32 = 0xC0000082
+const MSR_SFMASK: u32 = 0xC0000084
+const EFER_SCE: u64 = 1
+
+# rdmsr and wrmsr are imported from io module
+
+pub fn syscall_init() -> i32
+    # Enable SYSCALL/SYSRET in EFER
+    let efer: u64 = rdmsr(MSR_EFER)
+    wrmsr(MSR_EFER, efer | EFER_SCE)
+
+    # Set up STAR MSR
+    # Bits 47:32 = kernel CS (used on SYSCALL entry)
+    # Bits 63:48 = user segment base (used for SYSRET to compute user CS/SS)
+    #   SYSRET sets CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    #   Our user code is selector 0x18+3=0x1B, user data is 0x20+3=0x23
+    #   So we need STAR[63:48] = 0x10 (0x10+16=0x20, but with RPL 3 = 0x23 for data)
+    #   Actually SYSRET adds RPL 3 automatically, so:
+    #     User CS = (STAR[63:48] + 16) | 3 = should give 0x1B
+    #     User SS = (STAR[63:48] + 8) | 3 = should give 0x23
+    #   0x1B = 0x18 | 3 = (0x10 + 8) | 3, so STAR[63:48] should be 0x10? No wait...
+    #   Actually: (STAR[63:48] + 16) | 3 = 0x1B means STAR[63:48] = 0x08
+    #   Because (0x08 + 16) | 3 = (0x08 + 0x10) | 3 = 0x18 | 3 = 0x1B  ✓
+    #   And user SS = (0x08 + 8) | 3 = 0x10 | 3 = 0x13... but we want 0x23!
+    #
+    # Wait, this is wrong. Let me reconsider.
+    # In our GDT: user code = index 3 (selector 0x18), user data = index 4 (selector 0x20)
+    # SYSRET computes:
+    #   CS = (STAR[63:48] + 16) | 3
+    #   SS = (STAR[63:48] + 8) | 3
+    # For CS = 0x1B = 0x18 | 3, we need STAR[63:48] + 16 = 0x18, so STAR[63:48] = 0x08
+    # For SS = 0x23 = 0x20 | 3, we need STAR[63:48] + 8 = 0x20, so STAR[63:48] = 0x18
+    # These are inconsistent! Our GDT layout doesn't match SYSRET's expectations.
+    #
+    # SYSRET expects:
+    #   Index N: 32-bit user code
+    #   Index N+1: user data  (used for SS)
+    #   Index N+2: 64-bit user code (used for CS)
+    #
+    # But our GDT is:
+    #   Index 0: NULL
+    #   Index 1: kernel code (0x08)
+    #   Index 2: kernel data (0x10)
+    #   Index 3: user code (0x18/0x1B)
+    #   Index 4: user data (0x20/0x23)
+    #
+    # We could use SYSRET with STAR[63:48] = 0x10, giving:
+    #   CS = 0x10 + 16 | 3 = 0x20 | 3 = 0x23 (wrong - that's our data segment!)
+    #   SS = 0x10 + 8 | 3 = 0x18 | 3 = 0x1B (wrong - that's our code segment!)
+    #
+    # Our GDT doesn't support SYSRET! We use IRETQ instead (which is fine).
+    # For SYSCALL entry, we only need bits 47:32 (kernel CS).
+    let star: u64 = (0x08 as u64) << 32
+    wrmsr(MSR_STAR, star)
+
+    # Set LSTAR to syscall entry point
+    let entry_addr: u64 = syscall_entry as u64
+    wrmsr(MSR_LSTAR, entry_addr)
+
+    # Set SFMASK - clear IF on syscall entry
+    let sfmask: u64 = 0x200
+    wrmsr(MSR_SFMASK, sfmask)
+
+    # DEBUG: Read back MSRs to verify they're set correctly
+    let efer_check: u64 = rdmsr(MSR_EFER)
+    let star_check: u64 = rdmsr(MSR_STAR)
+    let lstar_check: u64 = rdmsr(MSR_LSTAR)
+    let sfmask_check: u64 = rdmsr(MSR_SFMASK)
+
+    prints("      EFER:   ")
+    serial_print_hex(efer_check)
+    prints(" (SCE=")
+    if (efer_check & EFER_SCE) != 0
+        prints("1")
+    else
+        prints("0")
+    prints(")\n")
+    prints("      STAR:   ")
+    serial_print_hex(star_check)
+    prints("\n")
+    prints("      LSTAR:  ")
+    serial_print_hex(lstar_check)
+    prints("\n")
+    prints("      SFMASK: ")
+    serial_print_hex(sfmask_check)
+    prints("\n")
+
+    # Handlers go in before the first user program can issue a syscall.
+    syscall_table_init()
+
+    return 0
+
+# Syscall handlers (AGAST #2121)
+# ============================================================================
+#
+# One fn per syscall, each `fn(rdi, rsi, rdx, r10) -> i64`, registered by
+# number in syscall_table_init and run by syscall_handler through the table
+# in syscall/dispatch.ritz. A handler ignores the argument registers it
+# doesn't use.
+
+# Fill the dispatch table: one line per dispatched syscall. A Syscall
+# variant without a line here answers Errno.NoSys (see syscall/dispatch.ritz).
+fn syscall_table_init()
+    syscall_register(Syscall.Read, sys_read_handler)
+    syscall_register(Syscall.Write, sys_write_handler)
+    syscall_register(Syscall.DebugPrint, sys_write_handler)
+    syscall_register(Syscall.Open, sys_open_handler)
+    syscall_register(Syscall.Close, sys_close_handler)
+    syscall_register(Syscall.Lseek, sys_lseek_handler)
+    syscall_register(Syscall.Mkdir, sys_mkdir_handler)
+    syscall_register(Syscall.Readdir, sys_readdir_handler)
+    syscall_register(Syscall.Mmap, sys_mmap_handler)
+    syscall_register(Syscall.Munmap, sys_munmap_handler)
+    syscall_register(Syscall.Exit, sys_exit_handler)
+    syscall_register(Syscall.Spawn, sys_spawn_handler)
+    syscall_register(Syscall.SpawnArgs, sys_spawn_args_handler)
+    syscall_register(Syscall.Wait, sys_wait_handler)
+    syscall_register(Syscall.Getpid, sys_getpid_handler)
+    syscall_register(Syscall.Yield, sys_yield_handler)
+    syscall_register(Syscall.Getcwd, sys_getcwd_handler)
+    syscall_register(Syscall.Chdir, sys_chdir_handler)
+    syscall_register(Syscall.ChannelCreate, sys_channel_create_handler)
+    syscall_register(Syscall.IpcSend, sys_ipc_send_handler)
+    syscall_register(Syscall.IpcRecv, sys_ipc_recv_handler)
+    syscall_register(Syscall.IpcClose, sys_ipc_close_handler)
+    syscall_register(Syscall.CapGrant, sys_cap_grant_handler)
+    syscall_register(Syscall.CapRevoke, sys_cap_revoke_handler)
+    syscall_register(Syscall.CapDerive, sys_cap_derive_handler)
+    syscall_register(Syscall.CapInfo, sys_cap_info_handler)
+    syscall_register(Syscall.CapCheck, sys_cap_check_handler)
+    syscall_register(Syscall.InputPoll, sys_input_poll_handler)
+    syscall_register(Syscall.InputRead, sys_input_read_handler)
+    syscall_register(Syscall.AcpiPoweroff, sys_acpi_poweroff_handler)
+    syscall_register(Syscall.FbInfo, sys_fb_info_handler)
+    syscall_register(Syscall.FbMap, sys_fb_map_handler)
+
+# Syscall handler (called from assembly)
+# Arguments: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4
+pub fn syscall_handler(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if not syscall_has_handler(rax)
+        prints("[syscall] unknown: ")
+        serial_print_dec(rax)
+        prints("\n")
+        return Errno.NoSys as i64
+    return syscall_dispatch(rax, rdi, rsi, rdx, r10)

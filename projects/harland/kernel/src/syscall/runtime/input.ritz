@@ -1,0 +1,68 @@
+# Harland Syscall Runtime - Input (AGAST #2751, from main.ritz)
+# Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
+# syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
+
+import drivers.virtio.input { VirtioInputEvent, virtio_input_poll, virtio_input_get_event, virtio_input_available, ring_count }
+import mm.uptr { uptr_check_write }
+import syscall.errno { Errno }
+
+# ============================================================================
+# Input Device Syscalls
+# ============================================================================
+#
+# Provides userspace access to keyboard, mouse, and other input devices.
+# Uses VirtIO input device (virtio-keyboard, virtio-mouse).
+#
+# Event structure (8 bytes):
+#   u16 event_type - EV_KEY, EV_REL, EV_ABS, etc.
+#   u16 code       - Key code or axis code
+#   i32 value      - Press/release (0/1) or axis value
+
+# sys_input_poll: Poll for pending input events
+# Returns: number of events pending in the queue
+fn sys_input_poll_impl() -> i64
+    if not virtio_input_available()
+        return 0
+
+    # Poll the device for new events
+    virtio_input_poll()
+
+    # Return count of pending events
+    return ring_count() as i64
+
+# sys_input_read: Read next input event
+# Args: event_ptr = pointer to 8-byte VirtioInputEvent structure
+# Returns: 0 if event read successfully, Errno.Again if no events pending
+# (Errno.NoDev without an input device)
+fn sys_input_read_impl(event_ptr: *VirtioInputEvent) -> i64
+    if not virtio_input_available()
+        return Errno.NoDev as i64
+
+    if event_ptr == 0 as *VirtioInputEvent
+        return Errno.Fault as i64
+
+    # Poll for new events first
+    virtio_input_poll()
+
+    # Try to read an event from the ring buffer
+    var event: VirtioInputEvent
+    if virtio_input_get_event(@event)
+        # Copy to userspace
+        (*event_ptr).event_type = event.event_type
+        (*event_ptr).code = event.code
+        (*event_ptr).value = event.value
+        return 0
+
+    return Errno.Again as i64
+
+# input_poll() -> number of events pending
+pub fn sys_input_poll_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return sys_input_poll_impl()
+
+# input_read(event_ptr) -> 0 if event read, -EAGAIN if no events
+pub fn sys_input_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: Validate VirtioInputEvent output struct (8 bytes) is writable
+    let event_result: i64 = uptr_check_write(rdi as *u8, 8)
+    if event_result != 0
+        return Errno.Fault as i64
+    return sys_input_read_impl(rdi as *VirtioInputEvent)

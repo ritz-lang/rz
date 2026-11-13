@@ -241,7 +241,8 @@ ELF_PRELUDE = """\
 ELF_MODULES = ["loader.elf", "mm.vmm", "mm.pmm", *SERIAL]
 
 
-# elf_exec calls into main.ritz (extern fns); the host program supplies them.
+# elf_exec calls into the kernel (extern fns: alloc_user_stack is in
+# syscall/runtime/memory.ritz since #2751); the host program supplies them.
 ELF_STUBS = """\
 pub fn alloc_user_stack() -> u64
     0
@@ -273,9 +274,10 @@ def test_elf_status_owns_its_codes():
     assert re.search(r"^pub fn elf_validate_header\(.*\) -> ElfStatus$", src, re.M)
     assert not re.search(r"\bELF_(OK|ERR_\w+)\b", src), "ELF_OK/ELF_ERR_* constants remain"
     assert "syscall.errno" not in src, "the loader should not speak errno"
-    main = (KERNEL_SRC / "main.ritz").read_text()
+    # run_init (main.ritz) and spawn (syscall/runtime/process.ritz, #2751) load ELFs.
+    main = (KERNEL_SRC / "main.ritz").read_text() + (KERNEL_SRC / "syscall" / "runtime" / "process.ritz").read_text()
     uses = re.findall(r"load_result\.error[^\n]*", main)
-    assert uses, "main.ritz no longer checks load_result.error"
+    assert uses, "main.ritz / process.ritz no longer check load_result.error"
     for use in uses:
         assert re.match(r"load_result\.error( != ElfStatus\.Ok$|\))", use), \
             f"an ElfStatus used other than compared or passed to elf_status_errno/elf_status_code: {use}"
@@ -284,9 +286,9 @@ def test_elf_status_owns_its_codes():
 def test_spawn_maps_elf_status_to_errno():
     """A failed load answers ENOMEM (out of pages) or ENOEXEC (not a loadable
     x86-64 executable): both spawn paths go through elf_status_errno."""
-    main = (KERNEL_SRC / "main.ritz").read_text()
+    main = (KERNEL_SRC / "syscall" / "runtime" / "process.ritz").read_text()  # from main.ritz (#2751)
     m = re.search(r"^fn elf_status_errno\(s: ElfStatus\) -> i64\n((?:[ \t]+.*\n)+)", main, re.M)
-    assert m, "main.ritz has no elf_status_errno"
+    assert m, "syscall/runtime/process.ritz has no elf_status_errno"
     body = m.group(1)
     assert re.search(r"AllocFailed => Errno\.NoMem as i64", body)
     assert re.search(r"MapFailed => Errno\.NoMem as i64", body)

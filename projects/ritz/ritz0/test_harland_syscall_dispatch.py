@@ -1,10 +1,11 @@
 """Harland dispatches syscalls through a table keyed by `enum Syscall: u64` (AGAST #2121).
 
-syscall_handler (kernel/src/main.ritz) was a 29-arm `if rax == SYS_X` ladder,
-cyclomatic complexity 62. #1880 gave the language enums with explicit
+syscall_handler (kernel/src/main.ritz, now syscall/runtime/entry.ritz) was a
+29-arm `if rax == SYS_X` ladder, cyclomatic complexity 62. #1880 gave the language enums with explicit
 discriminants and `E.from(v) -> Option<E>`; harland now declares its syscall
 ABI as `pub enum Syscall: u64` (syscall/numbers.ritz) and dispatches through a
-handler table (syscall/dispatch.ritz) that main.ritz fills once at init.
+handler table (syscall/dispatch.ritz) that syscall/runtime/entry.ritz fills
+once at init (it was main.ritz until #2751).
 
 The tests compile the real harland modules into small host programs, so each
 claim is checked as behaviour on every compiler:
@@ -39,6 +40,8 @@ RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 HARLAND = RITZ_ROOT.parent / "harland"
 KERNEL_SRC = HARLAND / "kernel" / "src"
+# syscall_init, syscall_table_init and syscall_handler moved here from main.ritz (#2751).
+ENTRY = KERNEL_SRC / "syscall" / "runtime" / "entry.ritz"
 METRICS = RITZ_ROOT.parent / "larb" / "tools" / "ritz-metrics" / "ritz_metrics.py"
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
@@ -202,7 +205,7 @@ def test_dispatch_table(compiler, tmp_path):
 def test_syscall_handler_cc_at_most_15(tmp_path):
     out = tmp_path / "m.json"
     proc = subprocess.run([sys.executable, str(METRICS), "--json", str(out),
-                           str(KERNEL_SRC / "main.ritz")], capture_output=True, text=True)
+                           str(ENTRY)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     fns = [f for f in json.loads(out.read_text())["functions"] if f["name"] == "syscall_handler"]
     assert len(fns) == 1, fns
@@ -210,7 +213,7 @@ def test_syscall_handler_cc_at_most_15(tmp_path):
 
 
 def test_kernel_registers_every_dispatched_syscall():
-    src = (KERNEL_SRC / "main.ritz").read_text()
+    src = ENTRY.read_text()
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", src, re.M)
     names = [n for n, _ in regs]
     assert len(names) == len(set(names)), f"registered twice: {names}"
@@ -219,11 +222,12 @@ def test_kernel_registers_every_dispatched_syscall():
 
 
 def test_syscall_init_fills_the_table(tmp_path):
-    """main.ritz compiles as `rz build harland` does, and syscall_init (run before
-    any user program) fills the table: without it every syscall is ENOSYS."""
-    out = tmp_path / "main.ll"
+    """syscall/runtime/entry.ritz compiles as `rz build harland` does, and
+    syscall_init (run before any user program) fills the table: without it every
+    syscall is ENOSYS."""
+    out = tmp_path / "entry.ll"
     proc = subprocess.run(
-        [sys.executable, str(RITZ0_DIR / "ritz0.py"), str(KERNEL_SRC / "main.ritz"), "-o", str(out),
+        [sys.executable, str(RITZ0_DIR / "ritz0.py"), str(ENTRY), "-o", str(out),
          "--no-runtime", "--project-root", str(HARLAND), "--sources", '["kernel/src"]',
          "--target", "x86_64-none-elf"],
         capture_output=True, text=True, cwd=RITZ0_DIR, timeout=300,
@@ -298,7 +302,7 @@ def test_ritzlib_diff_sees_a_drifted_number():
 def test_every_declared_syscall_is_dispatched():
     """No declared-but-undispatched syscalls: a user program can only name a
     number the kernel has a handler for (anything else answers ENOSYS)."""
-    src = (KERNEL_SRC / "main.ritz").read_text()
+    src = ENTRY.read_text()
     registered = set(re.findall(r"^\s+syscall_register\(Syscall\.(\w+),", src, re.M))
     assert set(_kernel_enum()) == registered, \
         f"declared, not dispatched: {sorted(set(_kernel_enum()) - registered)}"
