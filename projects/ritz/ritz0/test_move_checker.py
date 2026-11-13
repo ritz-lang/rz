@@ -921,6 +921,17 @@ fn f(t:& Res) -> i32
     [t]
     return 0
 """, "t", id="array_element_of_a_temporary"),
+        # AGAST #2948: a fill's value and a cast's operand are by-value reads.
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let a = [t; 2]
+    return 0
+""", "t", id="array_fill"),
+        pytest.param("""
+fn f(t:& Res) -> i32
+    let d: Res = t as Res
+    return 0
+""", "t", id="cast"),
     ])
     def test_move_out_is_rejected(self, body, param):
         errs = check(self.DEFS + body)
@@ -1852,6 +1863,9 @@ fn see(r: @Res) -> i32
         pytest.param("let a = ([t], 1)", id="array_in_tuple"),
         pytest.param("[t]", id="array_statement"),
         pytest.param("(t, 1)", id="tuple_statement"),
+        # AGAST #2948: a fill owns its value and a cast passes its operand on.
+        pytest.param("let a = [t; 1]", id="array_fill"),
+        pytest.param("let a: Res = t as Res", id="cast"),
     ]
 
     @pytest.mark.parametrize("literal", LITERALS)

@@ -1229,6 +1229,11 @@ class MoveChecker:
                 self._check_expr(element, is_move_context=True)
             self._mark_temporary(expr, is_move_context)
 
+        elif isinstance(expr, rast.ArrayFill):
+            # `[v; n]` owns its value like a literal owns its elements, so
+            # `[t; 2]` with `t:& Res` moves out of the reference (AGAST #2948).
+            self._check_expr(expr.value, is_move_context=True)
+
         elif isinstance(expr, rast.Match):
             # What a reference reaches stays its owner's: matching it only reads.
             self._check_expr(expr.expr,
@@ -1285,7 +1290,9 @@ class MoveChecker:
                 self._restore(snap)
 
         elif isinstance(expr, rast.Cast):
-            self._check_expr(expr.expr, is_move_context=False)
+            # `v as T` hands its operand's value on: it moves wherever the
+            # cast does (AGAST #2948; `t as Res` with `t:& Res` copied out).
+            self._check_expr(expr.expr, is_move_context=is_move_context)
 
         elif isinstance(expr, rast.If):
             # If expression with proper control flow handling:

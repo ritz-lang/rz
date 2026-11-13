@@ -2415,12 +2415,6 @@ pub fn main() -> i32
 }
 
 
-# AGAST #2288: ritz0 misses these two moves out of a borrow (AGAST #2948),
-# so only ritz1 is held to the rule: `[t; 2]` and `t as Res` would hand the
-# caller's move-only `Res` to a second owner.
-RITZ0_MISSED_MOVE_OUT = {name: MOVE_OUT.pop(name) for name in ("array_fill", "cast")}
-
-
 # A reference in a by-value slot: ritz0 read through it and ritz1 failed at clang
 # or returned garbage. There's no implicit deref (§13.2, AGAST #2336).
 NO_IMPLICIT_DEREF = {name: CONTROLS.pop(name) for name in (
@@ -2677,16 +2671,6 @@ def test_ritz1_reference_to_a_drop_type_is_not_a_move(ritz1_bin, tmp_path, name)
 @pytest.mark.parametrize("name", _ritz1_params(MOVE_OUT))
 def test_ritz1_by_value_field_is_still_a_move_out(ritz1_bin, tmp_path, name):
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MOVE_OUT[name])
-    assert comp.returncode != 0
-    assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of a reference",
-                     comp.stdout + comp.stderr), comp.stdout + comp.stderr
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_MISSED_MOVE_OUT))
-def test_ritz1_refuses_a_move_out_ritz0_misses(ritz1_bin, tmp_path, name):
-    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, RITZ0_MISSED_MOVE_OUT[name])
     assert comp.returncode != 0
     assert not ll.exists()
     assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of a reference",
