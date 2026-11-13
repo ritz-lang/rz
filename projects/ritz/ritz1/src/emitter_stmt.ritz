@@ -4056,6 +4056,23 @@ fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt, out_name: **u8, out_len: *i32)
     resolve_expr_struct_name(s, e, out_name, out_len)
     if *out_name == null
         call_result_struct_name(s, e, out_name, out_len)
+    # AGAST #2950: `*r` with `r: @C` / `@&C` / `*C` loads the %C.
+    if *out_name == null and e.kind == EXPR_UNARY and e.op == OP_DEREF
+        deref_pointee_struct_name(s, e.operand, out_name, out_len)
+
+# AGAST #2950: a statement-`if` arm's `@&x` value `reg` (a `ptr`) as the i64
+# its phi holds, asked while the arm's `let`s are in scope.  The phi was i64
+# over `ptr`s; a tail one in a `-> @&C` fn is converted back at the `ret`
+# (emit_implicit_return_tail).
+fn if_stmt_arm_ptr_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8) -> i32
+    if reg <= 0 or agg != null
+        return reg
+    var last: *Stmt = list
+    while last.next != null
+        last = last.next
+    if last.kind != STMT_EXPR or arm_value_is_ptr(s, last.expr) == 0
+        return reg
+    ptr_value_to_i64(s, last.expr, reg)
 
 # A statement-`if` arm's statements.  AGAST #2288: a trailing `c` with
 # `c:& C` is the arm's value, so it reads the referent, as in ritz0 (which
@@ -4200,6 +4217,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # block. (ritz-task-1309)
         let saved_last: i32 = s.last_expr_reg
         let saved_last_label: i32 = s.last_expr_label
+        let saved_last_model: i32 = s.last_expr_model
 
         begin_block(s, then_label)
         clear_last_expr(s)  # Reset before then branch
@@ -4226,6 +4244,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         if_stmt_phi_type(s, then_agg, then_agg_len, ret_type, @then_phi, @then_phi_len)
         if stmt.if_else != null
             then_result = if_stmt_arm_settle(s, then_result, then_agg, then_agg_len, then_phi, then_phi_len)
+            then_result = if_stmt_arm_ptr_settle(s, stmt.if_then, then_result, then_agg)
         let then_exit_label: i32 = s.current_label  # Capture actual exit block
         emit_str(s, c"  br label %")
         emit_label(s, end_label)
@@ -4252,6 +4271,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 else_phi = then_phi
                 else_phi_len = then_phi_len
             else_result = if_stmt_arm_settle(s, else_result, else_agg, else_agg_len, else_phi, else_phi_len)
+            else_result = if_stmt_arm_ptr_settle(s, stmt.if_else, else_result, else_agg)
             else_agg = else_phi
             else_agg_len = else_phi_len
             else_exit_label = s.current_label  # Capture actual exit block
@@ -4305,6 +4325,8 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_label(s, else_exit_label)
             emit_str(s, c" ]\n")
             set_last_expr(s, phi_reg)
+            if phi_agg == null
+                set_last_expr_phi(s, phi_reg, 0)   # AGAST #2950: an i64
         else
             # ritz-task-1309 — no phi, so this `if` contributes no value that
             # is live in the merge block.
@@ -4324,6 +4346,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # it dominates, still correctly rejected as a phi incoming here.
             s.last_expr_reg = saved_last  # Restore if no result
             s.last_expr_label = saved_last_label
+            s.last_expr_model = saved_last_model
 
     else if stmt.kind == STMT_WHILE
         let cond_label: i32 = next_label(s)
@@ -4620,6 +4643,9 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         s.match_no_value = 1   # AGAST #2046: void-call arms are legal here
         let match_reg: i32 = emit_match(s, stmt.if_cond, arms, stmt.span)
         set_last_expr(s, match_reg)
+        # AGAST #2950: its phi is a `ptr` or an i64 (emit_match_phi_type).
+        if match_reg > 0 and s.last_match_agg_name == null and s.last_match_float_ty == 0
+            set_last_expr_phi(s, match_reg, arms_ptr_valued(s, arms))
     else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
         # local_var.field = value
         # stmt.var_name = variable name

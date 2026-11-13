@@ -143,9 +143,9 @@ READS = {
 }
 
 # Each fails on ritz1 with no reference in sight, or only behind a `*C`.
-# `reference_binding` through a `*C` (`let q = r`) closed by #2596.  A `*r`
-# arm types its phi i64 (#2950; #2288 fixed a `c:& C` arm).
-READ_GAPS = {"if_arm": 2950, "match_arm": 2950}
+# `reference_binding` through a `*C` (`let q = r`) closed by #2596, a `*r` arm's
+# i64 phi by #2950 (#2288 fixed a `c:& C` arm).
+READ_GAPS = {}
 
 MOVE = """\
 var DROPS: i32 = 0

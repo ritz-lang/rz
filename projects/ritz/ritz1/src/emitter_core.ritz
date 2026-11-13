@@ -186,6 +186,10 @@ struct EmitterState
     # detectable: `last_expr_here` returns the register only when it was
     # defined in the block we are currently emitting into, and 0 otherwise.
     last_expr_label: i32
+    # AGAST #2950: what LLVM type last_expr_reg has, when an `if` / `match`
+    # statement set it: LAST_EXPR_I64 or LAST_EXPR_PTR (its phi), else
+    # LAST_EXPR_UNKNOWN.  A tail one in a `-> @&T` / `-> *T` fn is converted.
+    last_expr_model: i32
     # Track current label for phi node predecessors (needed for nested control flow)
     current_label: i32
     # Current function's return type name (for struct returns)
@@ -703,9 +707,21 @@ fn begin_block(s: *EmitterState, label: i32)
 
 # Record `reg` as the last expression value, produced by the block we are
 # currently emitting into.
+const LAST_EXPR_UNKNOWN: i32 = 0
+const LAST_EXPR_I64: i32 = 1
+const LAST_EXPR_PTR: i32 = 2
+
 fn set_last_expr(s: *EmitterState, reg: i32)
     s.last_expr_reg = reg
     s.last_expr_label = s.current_label
+    s.last_expr_model = LAST_EXPR_UNKNOWN
+
+# AGAST #2950: an `if` / `match` statement's phi, `ptr` when `ptr_ty` is 1.
+fn set_last_expr_phi(s: *EmitterState, reg: i32, ptr_ty: i32)
+    set_last_expr(s, reg)
+    s.last_expr_model = LAST_EXPR_I64
+    if ptr_ty == 1
+        s.last_expr_model = LAST_EXPR_PTR
 
 # Drop the tracked value.  Used where control flow makes any previous value
 # unavailable at the new insertion point (break/continue dead blocks, and the
@@ -713,6 +729,7 @@ fn set_last_expr(s: *EmitterState, reg: i32)
 fn clear_last_expr(s: *EmitterState)
     s.last_expr_reg = 0
     s.last_expr_label = s.current_label
+    s.last_expr_model = LAST_EXPR_UNKNOWN
 
 # Read the last expression value, but ONLY if it was defined in the block we
 # are currently emitting into; 0 otherwise.
@@ -838,7 +855,36 @@ fn expr_is_ptr_valued(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1754: `v as @&T` yields a `ptr` (see the EXPR_CAST arm).
     if e.kind == EXPR_CAST and e.op == TYPE_MUT_REF
         return 1
+    # AGAST #2950: an if / match whose every value arm is one has a `ptr` phi.
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        return arms_ptr_valued(s, e.args as *MatchArm)
     return deref_operand_is_ptr(s, e)
+
+# AGAST #2950: 1 when the value arm `e` yields a `ptr`.  A `c` with `c:& C`
+# (C a struct) reads the referent (#2288), so it is no `ptr` here.
+fn arm_value_is_ptr(s: *EmitterState, e: *Expr) -> i32
+    if e != null and e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc != null and loc.is_lent == 1 and loc.var_type == TYPE_MUT_REF and loc.pointee_type == TYPE_STRUCT
+            return 0
+    expr_is_ptr_valued(s, e)
+
+# AGAST #2950: the phi of an if / match is a `ptr` when every arm with a value
+# yields one (`@&x`, an `@&T` local), and i64 otherwise.  Asked in the scope
+# the if / match sits in, before its arms are emitted and by whoever reads its
+# value after, so both see the same answer.  An arm can only know more (its
+# own `let`, which no name reuses): an `@&` arm in an i64 phi is converted in
+# its block (emit_match_arm_body).
+fn arms_ptr_valued(s: *EmitterState, arms: *MatchArm) -> i32
+    var n: i32 = 0
+    var a: *MatchArm = arms
+    while a != null
+        if a.is_pass == 0 and a.body != null
+            if arm_value_is_ptr(s, a.body) == 0
+                return 0
+            n = n + 1
+        a = a.next
+    (n > 0) as i32
 
 # AGAST #1652/#1672: bring `reg` (the value emit_expr(e) produced) into the
 # i64 value model.  A `*T` slot -- `let p: *T = v`, `p = v`, `return v`,

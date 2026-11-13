@@ -33,13 +33,10 @@ from test_borrow_param_ref_field import _compile, _run
 from test_ref_into_value import COMPILERS, _assert_refused
 
 NO_TUPLES_GAP = "AGAST #1526: ritz1 has no tuples"
-ARM_GAP = "AGAST #2950: an `@&x` arm value fails at clang on ritz1, with or without a `:&`"
 
 # None of these needs a `:&` to fail. #2309 lists each, and is closing.
 ELEMENT_GAP = "AGAST #2369: `a[0].x` through an `@&C` or `@C` element is `unhandled EXPR_MEMBER` on ritz1"
 IF_VALUE_GAP = "AGAST #2369: ritz1 doesn't parse an `if` value after `=` or in a struct literal"
-CALL_RETURN_GAP = "AGAST #2369: `return` of an `@&C` from a call or in a match arm fails at clang on ritz1"
-BLOCK_ARM_GAP = "AGAST #2369: `p.x` after a typed `let` in a block arm is `unhandled EXPR_MEMBER` on ritz1"
 # No ticket has these.
 PAYLOAD_GAP = "AGAST #2369: `p.x = 3` on a reference payload is `unhandled EXPR_MEMBER` on ritz1, without a `:&` too"
 CAST_GAP = ("AGAST #2370: a value cast to a reference isn't refused: ritz1 runs it, and ritz0 reports "
@@ -718,17 +715,12 @@ def _both(*shapes):
 
 RITZ1_GAPS = {
     **_gaps(_both("tuple", "tuple_return"), NO_TUPLES_GAP),
-    **_gaps(["arm_beside_a_borrow_mut", "let_if_mut", "let_match_mut", "tail_if_mut", "tail_match_mut"], ARM_GAP),
     **_gaps(["array_fill_mut", "array_literal_mut", "array_store_mut"], ELEMENT_GAP),
     **_gaps(_both("assign_from_if") + ["field_from_if", "literal_field_from_if"], IF_VALUE_GAP),
-    "return_in_arm_mut": CALL_RETURN_GAP,
-    "let_match_block_mut": BLOCK_ARM_GAP,
 }
 
 RITZ1_MOVE_ONLY_GAPS = {
-    **_gaps(["let_match_mut", "tail_if_mut"], ARM_GAP),
     **_gaps(["array_literal_mut", "array_literal_ref", "array_store_mut", "array_store_ref"], ELEMENT_GAP),
-    "return_in_arm_mut": CALL_RETURN_GAP,
 }
 
 RITZ1_BY_VALUE_GAPS = {}
@@ -849,6 +841,99 @@ def test_ritz1_written_reference_counts_as_a_borrow(ritz1_bin, tmp_path, name):
     comp, _, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + body + entry)
     assert comp.returncode != 0
     assert message in comp.stdout + comp.stderr
+
+
+# AGAST #2950: an if / match's value has one LLVM type on ritz1.  An `@&c` arm
+# is a `ptr` there and a `*C` one an i64, so an arm of each meets in one model;
+# a `ptr` value leaves a `-> *C` fn as an i64; and a `*r` arm is the struct
+# (READS in test_ref_into_value.py has the statement forms, this the value one).
+ARM_MODELS = {
+    "mixed_let_if": TYPES + """\
+fn go(c:& C, q: *C, k: i32)
+    let p: @&C = if k == 0
+        @&c
+    else
+        q
+    p.x = 3
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    var d: C = C { x: 1, y: 0 }
+    go(@&c, @d, 0)
+    go(@&c, @d, 1)
+    return c.x * d.x - 6
+""",
+    "mixed_tail_match": TYPES + """\
+fn pick(c:& C, q: *C, k: i32) -> @&C
+    match k
+        0 => q
+        _ => @&c
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    var d: C = C { x: 3, y: 0 }
+    let p: @&C = pick(@&c, @d, 0)
+    let r: @&C = pick(@&c, @d, 1)
+    return p.x * r.x
+""",
+    "mixed_tail_if": TYPES + """\
+fn pick(c:& C, q: *C, k: i32) -> @&C
+    if k == 0
+        @&c
+    else
+        q
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    var d: C = C { x: 3, y: 0 }
+    let p: @&C = pick(@&c, @d, 1)
+    let r: @&C = pick(@&c, @d, 0)
+    r.x = 1
+    return p.x * r.x
+""",
+    "pointer_tail_if": TYPES + """\
+fn raw(c:& C, k: i32) -> *C
+    if k == 0
+        @&c
+    else
+        @&c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    let q: *C = raw(@&c, 0)
+    return q.x
+""",
+    "pointer_tail_match": TYPES + """\
+fn raw(c:& C, k: i32) -> *C
+    match k
+        0 => @&c
+        _ => @&c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    let q: *C = raw(@&c, 1)
+    return q.x
+""",
+    "deref_let_if": TYPES + """\
+fn f(r: @C, k: i32) -> i32
+    let d: C = if k == 0
+        *r
+    else
+        *r
+    d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@c, 0)
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(ARM_MODELS))
+def test_an_arm_value_takes_the_phi_model(ritz1_bin, tmp_path, compiler, name):
+    assert _run(compiler, ritz1_bin, tmp_path, name, ARM_MODELS[name]) == 3
 
 
 # A variant payload is a reference slot like any other.
