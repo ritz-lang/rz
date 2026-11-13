@@ -65,12 +65,30 @@ pub fn main() -> i32
     0
 """
 
+# AGAST #2926: a variant's payload is a slot too.  `Has(W)` gives the inner
+# ctor no enum, so it must not borrow the fn's Option<i64> return type.
+VARIANT_PAYLOAD = """\
+struct W
+    n: i64
+
+enum H
+    Has(W)
+    Lacks
+
+fn h() -> Option<i64>
+    let a: H = Has(Some(1))
+    None
+
+pub fn main() -> i32
+    0
+"""
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "program",
-    [ASSIGN_LOCAL, FIELD, STRUCT_LIT, STRUCT_LIT_LET_LEAK],
-    ids=["assign_local", "field", "struct_lit", "struct_lit_let_leak"],
+    [ASSIGN_LOCAL, FIELD, STRUCT_LIT, STRUCT_LIT_LET_LEAK, VARIANT_PAYLOAD],
+    ids=["assign_local", "field", "struct_lit", "struct_lit_let_leak", "variant_payload"],
 )
 def test_ritz1_ctor_into_non_enum_slot_is_an_error(ritz1_bin, tmp_path, program):
     src = tmp_path / "slot.ritz"

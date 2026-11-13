@@ -1996,14 +1996,46 @@ fn emit_lent_payload(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: 
     if lent_referent_local(s, e) == null
         return 0
     var pay_len: i32 = 0
-    var pay: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, tag, @pay_len)
-    let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, tag)
-    if uf != null and uf.field_type == TYPE_STRUCT
-        pay = uf.field_type_name
-        pay_len = uf.field_type_name_len
+    let pay: *u8 = variant_payload_type_name(s, enum_name, enum_name_len, tag, @pay_len)
     if pay == null or pay_len <= 0
         return 0
     return emit_lent_referent(s, e, pay, pay_len)
+
+# The struct / enum type variant `tag` of `enum_name` declares for its payload:
+# a tagged enum's type argument, or a user enum's (or instance's) tuple field.
+# null (out_len 0) when the payload is a scalar or unknown.
+fn variant_payload_type_name(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, out_len: *i32) -> *u8
+    var pay: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, tag, out_len)
+    let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, tag)
+    if uf != null and uf.field_type == TYPE_STRUCT
+        pay = uf.field_type_name
+        *out_len = uf.field_type_name_len
+    pay
+
+# AGAST #2926: emit a variant's payload with the enum context its declared
+# type gives, as emit_call_arg does for a parameter: `Has(Some(6))` with
+# `Has(Option<i32>)` builds `%Option$i32`, and a payload slot that is no enum
+# bars the outer one.  Only a payload whose type is known takes a slot; any
+# other keeps the context it had.
+fn emit_payload_into_slot(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, e: *Expr) -> i32
+    var pay_len: i32 = 0
+    let pay: *u8 = variant_payload_type_name(s, enum_name, enum_name_len, tag, @pay_len)
+    if pay == null or pay_len <= 0
+        return emit_expr(s, e)
+    let saved_name: *u8 = s.ctx_enum_name
+    let saved_len: i32 = s.ctx_enum_name_len
+    let saved_arg: i32 = s.ctx_enum_arg
+    s.ctx_enum_name = null
+    s.ctx_enum_name_len = 0
+    s.ctx_enum_arg = 1
+    if is_tagged_enum_type(pay, pay_len) == 1 or is_enum_instance(pay, pay_len) == 1
+        s.ctx_enum_name = pay
+        s.ctx_enum_name_len = pay_len
+    let reg: i32 = emit_expr(s, e)
+    s.ctx_enum_name = saved_name
+    s.ctx_enum_name_len = saved_len
+    s.ctx_enum_arg = saved_arg
+    reg
 
 # Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
 # zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
@@ -2018,7 +2050,7 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
     if payload_expr != null and is_unit_expr(payload_expr) == 0
         payload_reg = emit_lent_payload(s, enum_name, enum_name_len, tag, payload_expr)
         if payload_reg == 0
-            payload_reg = emit_expr(s, payload_expr)
+            payload_reg = emit_payload_into_slot(s, enum_name, enum_name_len, tag, payload_expr)
         have_payload = 1
 
     # alloca %Enum

@@ -104,6 +104,21 @@ RUNS = {
                                "        Nope => 3\nfn main() -> i32\n"
                                "    let a: Slot<i32> = Full(5)\n    let q: Q = Full(4)\n"
                                "    f(a) * 10 + g(q)\n", 54),
+    # AGAST #2926: a bare constructor as a variant's payload builds the
+    # payload's declared type, as an argument builds its parameter's: an
+    # instance's `Full(Some(6))`, and a concrete enum's `Has(Some(6))` /
+    # `Has(None)`.  ritz1 gave the payload no slot and refused the inner one.
+    "constructor_payload": (SLOT + "fn f(o: Slot<Option<i32>>) -> i32\n    match o\n"
+                            "        Full(x) =>\n            match x\n                Some(v) => v\n"
+                            "                None => 3\n        Empty => 4\n"
+                            "fn main() -> i32\n    let a: Slot<Option<i32>> = Full(Some(6))\n"
+                            "    f(a)\n", 6),
+    "concrete_constructor_payload": ("enum H\n    Has(Option<i32>)\n    Lacks\n"
+                                     "fn f(o: H) -> i32\n    match o\n        Has(x) =>\n"
+                                     "            match x\n                Some(v) => v\n"
+                                     "                None => 3\n        Lacks => 4\n"
+                                     "fn main() -> i32\n    let a: H = Has(Some(6))\n"
+                                     "    let b: H = Has(None)\n    f(a) * 10 + f(b)\n", 63),
 }
 
 
