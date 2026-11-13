@@ -847,6 +847,7 @@ fn collect_from_fn_body(m: *Module, body: *Stmt)
 
 fn collect_from_stmt(m: *Module, s: *Stmt)
     rewrite_struct_index_stmt(m, s)   # AGAST #1635
+    note_compound_calls(s)            # AGAST #2529, after the rewrite above
     let k: i32 = s.kind
     if k == STMT_EXPR
         collect_from_expr(m, s.expr)
@@ -1290,6 +1291,74 @@ fn rewrite_struct_index(m: *Module, e: *Expr)
     e.operand = null
     e.call_type_suffix = null
     e.call_type_suffix_len = 0
+
+# ----------------------------------------------------------------------------
+# AGAST #2529: `x op= v` arrives as `x = x op v` (ast_helpers.ritz
+# stmt_compound_assign_*), the read and the store sharing the nodes of x's
+# operands.  A call among them is noted as evaluated once (si_once), so the
+# emitter runs it at the first of the two and hands its register to the second:
+# `h(@a)[1] += 7` and `a[f()] += 1` call once.  Only a node both sides reach is
+# noted; a user's `a[f()] = a[f()] + 1` has two calls and keeps them.
+# ----------------------------------------------------------------------------
+
+# Whether `e` is reached from `root` through a place's operands: an index's
+# base and key, a member's or cast's left, a deref, a binary's sides.  A call
+# is a leaf: its arguments are evaluated with it.
+fn place_reaches(root: *Expr, e: *Expr) -> i32
+    if root == null
+        return 0
+    if root == e
+        return 1
+    let k: i32 = root.kind
+    if k == EXPR_INDEX or k == EXPR_BINARY
+        if place_reaches(root.left, e) == 1
+            return 1
+        return place_reaches(root.right, e)
+    if k == EXPR_MEMBER or k == EXPR_CAST
+        return place_reaches(root.left, e)
+    if k == EXPR_UNARY
+        return place_reaches(root.operand, e)
+    0
+
+# Note each call in the read `e` that the store reaches from `a` or `b`.
+fn note_shared_calls(e: *Expr, a: *Expr, b: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_CALL or k == EXPR_METHOD
+        if si_once_find(e) < 0 and (place_reaches(a, e) == 1 or place_reaches(b, e) == 1)
+            si_once_add(e)
+        return
+    if k == EXPR_INDEX or k == EXPR_BINARY
+        note_shared_calls(e.left, a, b)
+        note_shared_calls(e.right, a, b)
+    else if k == EXPR_MEMBER or k == EXPR_CAST
+        note_shared_calls(e.left, a, b)
+    else if k == EXPR_UNARY
+        note_shared_calls(e.operand, a, b)
+
+# Where each store form keeps the place's shared operands (ast_helpers.ritz).
+fn note_compound_calls(s: *Stmt)
+    let k: i32 = s.kind
+    if is_store_stmt(k) == 0
+        return
+    let v: *Expr = s.assign_value
+    if v == null or v.kind != EXPR_BINARY or v.left == null
+        return
+    var a: *Expr = null
+    var b: *Expr = null
+    if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        a = s.while_cond
+    else if k == STMT_MEMBER_INDEX_ASSIGN
+        a = s.if_cond
+        b = s.while_cond
+    else if k == STMT_MEMBER_ASSIGN
+        a = s.if_cond
+    else if k == STMT_ASSIGN and s.assign_target_len == 0
+        a = s.if_cond
+    else
+        return
+    note_shared_calls(v.left, a, b)
 
 # `s`, a store to `base[key]` of `value`, as `index_set` or a store through
 # `index_mut`; `m[k] op= x` (compound) through one `index_mut` call.
@@ -2381,6 +2450,11 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
     cloned.next = null
 
     let k: i32 = s.kind
+    # A store keeps the template's sharing (AGAST #2529, clone_memo_find).
+    let memo_was: i32 = g_clone_memo_on
+    let memo_base: i32 = g_clone_memo_count
+    if is_store_stmt(k) == 1
+        g_clone_memo_on = 1
     if k == STMT_EXPR
         cloned.expr = clone_expr(s.expr, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
     else if k == STMT_RETURN
@@ -2516,6 +2590,11 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
     else
         clone_unknown_kind(c"clone_stmt", k)
 
+    g_clone_memo_on = memo_was
+    g_clone_memo_count = memo_base
+    # A specialised body isn't walked by collect_from_stmt: note its calls here.
+    if is_store_stmt(k) == 1
+        note_compound_calls(cloned)
     return cloned
 
 # `sizeof(T)` with T := subst (AGAST #2124): one value of the concrete kind,
@@ -2549,13 +2628,64 @@ fn sizeof_subst_operand(at: *Expr, subst_type: i32, subst_name: *u8, subst_len: 
     op.next = null
     return op
 
+# AGAST #2529: a node one statement of the template shares stays shared in its
+# clone.  `x op= v`'s read and store share x's operands (ast_helpers.ritz
+# stmt_compound_assign_*), and note_compound_calls finds a call to evaluate
+# once by that sharing: clone each such node once per statement.
+var g_clone_memo_from: **Expr = null
+var g_clone_memo_to: **Expr = null
+var g_clone_memo_count: i32 = 0
+var g_clone_memo_cap: i32 = 0
+var g_clone_memo_on: i32 = 0
+
+fn clone_memo_find(e: *Expr) -> *Expr
+    var i: i32 = 0
+    while i < g_clone_memo_count
+        if *(g_clone_memo_from + i) == e
+            return *(g_clone_memo_to + i)
+        i += 1
+    return null
+
+fn clone_memo_add(e: *Expr, c: *Expr)
+    if g_clone_memo_count == g_clone_memo_cap
+        var cap: i32 = 64
+        if g_clone_memo_cap > 0
+            cap = g_clone_memo_cap * 2
+        let from: **Expr = malloc((cap as i64) * 8) as **Expr
+        let to: **Expr = malloc((cap as i64) * 8) as **Expr
+        var i: i32 = 0
+        while i < g_clone_memo_count
+            *(from + i) = *(g_clone_memo_from + i)
+            *(to + i) = *(g_clone_memo_to + i)
+            i += 1
+        g_clone_memo_from = from
+        g_clone_memo_to = to
+        g_clone_memo_cap = cap
+    *(g_clone_memo_from + g_clone_memo_count) = e
+    *(g_clone_memo_to + g_clone_memo_count) = c
+    g_clone_memo_count += 1
+
+# The store forms `x op= v` desugars into (note_compound_calls).
+fn is_store_stmt(k: i32) -> i32
+    if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN
+        return 1
+    if k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        return 1
+    return 0
+
 fn clone_expr(e: *Expr, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Expr
     if e == null
         return null
+    if g_clone_memo_on == 1
+        let seen: *Expr = clone_memo_find(e)
+        if seen != null
+            return seen
 
     let cloned: *Expr = malloc(sizeof(Expr)) as *Expr
     memcpy(cloned as *u8, e as *u8, sizeof(Expr))  # AGAST #1925; see clone_stmt
     cloned.next = null
+    if g_clone_memo_on == 1
+        clone_memo_add(e, cloned)
 
     let k: i32 = e.kind
 

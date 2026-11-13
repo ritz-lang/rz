@@ -1052,8 +1052,8 @@ def test_every_base_reaches_a_struct_element(run_with, name, compiler):
     assert run_with(compiler, name, STRUCT_BASES[name]) == 11
 
 
-# The base is evaluated once per use: a store and an address call h once each.
-# (`h(p)[1] += 7` calls it twice on all three, as `x op= v` is `x = x op v`: AGAST #2529.)
+# The base is evaluated once per use: a store, an address and `op=` call h once
+# each (`x op= v` reads and writes one place: AGAST #2529, test_compound_assign_once.py).
 CALLED_ONCE = """\
 var calls: i32 = 0
 
@@ -1066,14 +1066,15 @@ pub fn main() -> i32
     h(@a)[1] = 27
     let e: *i32 = @h(@a)[2] as *i32
     *e = 1
-    return a[1] - 27 + a[2] - 1 + calls * 10
+    h(@a)[0] += 7
+    return a[1] - 27 + a[2] - 1 + a[0] - 17 + calls * 10
 """
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_call_base_is_evaluated_once(run_with, compiler):
-    assert run_with(compiler, "called_once", CALLED_ONCE) == 20
+    assert run_with(compiler, "called_once", CALLED_ONCE) == 30
 
 
 # The element's type, where nothing annotates it: `let v = B[1]` is an f64.

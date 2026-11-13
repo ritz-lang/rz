@@ -5427,6 +5427,49 @@ class LLVMEmitter:
         builder = ir.IRBuilder(done)
         builder.ret(dest)
 
+    def _emit_compound_assign(self, stmt: rast.AssignStmt) -> Union[bool, ir.Value, None]:
+        """`x op= v`, which arrives as `x = x op v`: what the place x depends on
+        is evaluated once, and the read and the store both reuse it (AGAST
+        #2529).  The parser shares x's node between them, but later passes
+        may copy one, so the read's copy is matched to the store's by shape.
+        """
+        outer = self._evaluated_once
+        self._evaluated_once = dict(outer)
+        try:
+            read = stmt.value.left if isinstance(stmt.value, rast.BinOp) else None
+            self._evaluate_compound_place(stmt.target, read)
+            return self._emit_stmt_inner(stmt)
+        finally:
+            self._evaluated_once = outer
+
+    def _evaluate_compound_place(self, expr: rast.Expr, read: Optional[rast.Expr]) -> None:
+        """Evaluate the operands of `x op= v`'s place `expr` that could run
+        code, recording each for `read`'s matching node too.
+
+        `_evaluate_place_operands`'s walk, but a name or literal is left to its
+        use: neither has an effect, and a literal is typed by its slot.
+        """
+        if read is not None and type(read) is not type(expr):
+            read = None
+        if isinstance(expr, rast.Field):
+            self._evaluate_compound_place(expr.expr, read.expr if read is not None else None)
+        elif isinstance(expr, rast.Index):
+            self._evaluate_compound_place(expr.expr, read.expr if read is not None else None)
+            # `a[lo..hi]` lowers to a slice: its range isn't a value.
+            if not isinstance(expr.index, (rast.Range, rast.Ident, rast.IntLit)):
+                self._evaluate_shared(expr.index, read.index if read is not None else None)
+        elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
+            if not isinstance(expr.operand, rast.Ident):
+                self._evaluate_shared(expr.operand, read.operand if read is not None else None)
+        elif not isinstance(expr, (rast.Ident, rast.IntLit)):
+            self._evaluate_shared(expr, read)
+
+    def _evaluate_shared(self, expr: rast.Expr, twin: Optional[rast.Expr]) -> None:
+        """Evaluate `expr` once; `_emit_expr` returns it for `expr` and `twin`."""
+        self._evaluate_once(expr)
+        if twin is not None and type(twin) is type(expr):
+            self._evaluated_once[id(twin)] = self._evaluated_once[id(expr)]
+
     def _emit_stmt(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated.
 
@@ -5441,7 +5484,10 @@ class LLVMEmitter:
         # The statement's temporaries drop at its end (AGAST #2161).
         self._temp_frames.append([])
         try:
-            result = self._emit_stmt_inner(stmt)
+            if isinstance(stmt, rast.AssignStmt) and stmt.op is not None:
+                result = self._emit_compound_assign(stmt)
+            else:
+                result = self._emit_stmt_inner(stmt)
             if (isinstance(stmt, rast.AssignStmt)
                     and getattr(stmt.target, 'reowns_field', False)):
                 self._set_field_flag(stmt.target, 1)
