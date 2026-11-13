@@ -10,8 +10,10 @@ The same for `a:& [N]T`, whose slot is the array behind the borrow (#2290), and
 for `v:& Vec<T>`, whose slot holds the borrow's pointer: `@v` is that pointer
 (#2286), not the slot's address.  `@&` reads the same.
 
-`@` of a pointer or a reference, and of a const, isn't an iterable to ritz0, and
-ritz1 refuses each of them too.
+`@h.a` walks the array field `h.a` in place, as `h.a` does (#2533).
+
+`@` of a pointer or a reference, of a const, and of a call's field isn't an
+iterable to ritz0, and ritz1 refuses each of them too.
 
 Each program returns 0, or the number of the first check that failed.
 """
@@ -144,6 +146,84 @@ def test_address_of_a_non_iterable_is_refused(compile_with, compiler, name):
     if compiler != "ritz0":
         assert "this `for` iterable is not supported in ritz1" in comp.stdout + comp.stderr
 
+
+# AGAST #2533: `@h.a` walks the array field `h.a` in place, as `h.a` does.  The
+# member is reached once: emit_for_iterable hands what it reached to the header
+# path rather than reaching it again.  Canaries either side of the array show up
+# a wrong offset; i8 and i64 a stride taken from anything but the field.
+def _h(ty):
+    return f"struct H\n    lo: i64\n    a: [3]{ty}\n    hi: i64\n\n"
+
+
+def _in_main(it, op="@", ty="i32", pre="", fill="h.a", decl="    var h: H\n", setup=""):
+    vs = SCALARS[ty]
+    return (_h(ty) + pre + MAIN + decl + _fill(fill, vs) + setup
+            + _walk(f"{op}{it}", ty, vs))
+
+
+def _field_param(sig, it, call):
+    vs = SCALARS["i32"]
+    return (_h("i32") + f"fn f({sig}) -> i32\n" + _walk(f"@{it}", "i32", vs) + "\n" + MAIN
+            + "    var h: H\n" + _fill("h.a", vs) + f"    return {call}\n")
+
+
+FIELDS = {
+    "local_i8": _in_main("h.a", ty="i8"),
+    "local_i64": _in_main("h.a", ty="i64"),
+    "local_mut": _in_main("h.a", op="@&"),
+    "nested": _in_main("o.h.a", pre="struct O\n    k: i8\n    h: H\n\n", fill="o.h.a",
+                       decl="    var o: O\n"),
+    "global": _in_main("g.a", pre="var g: H\n\n", fill="g.a", decl=""),
+    "array_element": _in_main("hs[1].a", fill="hs[1].a", decl="    var hs: [2]H\n"),
+    "pointer_param": _field_param("h: *H", "h.a", "f(@h)"),
+    "borrow_param": _field_param("h:& H", "h.a", "f(@&h)"),
+    "self": (_h("i32") + "impl H\n    fn f(self:&) -> i32\n"
+             + _walk("@self.a", "i32", SCALARS["i32"], " " * 8) + "\n" + MAIN
+             + "    var h: H\n" + _fill("h.a", SCALARS["i32"]) + "    return h.f()\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(FIELDS))
+def test_address_of_an_array_field_walks_it(run_with, compiler, name):
+    assert run_with(compiler, name, FIELDS[name]) == 0
+
+
+# In place, so a store in the body shows on a later pass: 1 + 2 + 50.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("op", ["@", "@&"])
+def test_a_write_to_the_field_in_the_body_is_seen(run_with, compiler, op):
+    program = (_h("i32") + MAIN + "    var h: H\n" + _fill("h.a", (1, 2, 4))
+               + _LIVE.format(it=f"{op}h.a", place="h.a"))
+    assert run_with(compiler, f"live_field{op == '@&'}", program) == 53
+
+
+# A call's field has no address: ritz0 says "Cannot get address of: Call".
+# ritz1 refuses it before reaching the member, so the call isn't run for nothing.
+_MK = "fn mk() -> O\n    var o: O\n    return o\n\n"
+_O = _h("i32") + "struct O\n    h: H\n\n"
+NOT_A_PLACE = {
+    "field_of_a_call": _O + _MK + MAIN + _SUM.format(n="mk().h.a"),
+    "field_of_a_call_mut": _O + _MK + MAIN + _SUM.format(n="mk().h.a").replace("@", "@&"),
+    "direct_field_of_a_call": (_h("i32") + "fn mk() -> H\n    var h: H\n    return h\n\n" + MAIN
+                               + _SUM.format(n="mk().a")),
+    "method_field": (_O + "impl O\n    fn mk(self:&) -> O\n        return *self\n\n" + MAIN
+                     + "    var o: O\n" + _SUM.format(n="o.mk().h.a")),
+    "scalar_field": _h("i32") + MAIN + "    var h: H\n" + _SUM.format(n="h.lo"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NOT_A_PLACE))
+def test_address_of_a_field_that_isnt_a_place_is_refused(compile_with, compiler, name):
+    comp, ll, _ = compile_with(compiler, name, NOT_A_PLACE[name])
+    assert comp.returncode != 0
+    assert not ll.exists()
+    if compiler != "ritz0":
+        assert "this `for` iterable is not supported in ritz1" in comp.stdout + comp.stderr
 
 
 # ritzlib's Vec, with its real header, borrowed and walked through `@w`.  It links

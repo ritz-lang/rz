@@ -2950,8 +2950,9 @@ fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
     0
 
 # `@v` / `@&v` / `@h.v`.  `@v` of a pointer or a reference isn't here: ritz0
-# refuses `v: *Vec<T>` and `v: @Vec<T>`.
-fn emit_for_addr_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+# refuses `v: *Vec<T>` and `v: @Vec<T>`.  `mr` is `h.v`, which emit_for_iterable
+# has already reached (AGAST #2533): reaching it again would emit it twice.
+fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, out: **StructDef) -> i32
     let op: *Expr = e.operand
     if op == null
         return 0
@@ -2982,8 +2983,6 @@ fn emit_for_addr_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
                 return emit_lvalue_ptr(s, op)
         return 0
     if op.kind == EXPR_MEMBER
-        var mr: MemberPtrResult
-        emit_member_ptr(s, op, @mr)
         if mr.success == 1 and mr.field.field_type == TYPE_STRUCT
             let fst: *StructDef = for_header_struct(s, mr.field.field_type_name, mr.field.field_type_name_len)
             if fst != null
@@ -2997,8 +2996,8 @@ fn emit_for_addr_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
 # makes a `push` that moves the buffer safe: nothing from before it is kept, and
 # the binding is a copy of its element, taken before the body runs.
 #
-# `iter` is evaluated once.  `mr` is its field when it's an EXPR_MEMBER: reaching
-# that again would run whatever it's reached through twice.
+# `iter` is evaluated once.  `mr` is its field when it's an EXPR_MEMBER, or `@` /
+# `@&` of one: reaching that again would run whatever it's reached through twice.
 fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **StructDef) -> i32
     if iter.kind == EXPR_IDENT
         return emit_for_ident_header(s, iter, out)
@@ -3017,7 +3016,7 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
             return emit_load_ptr(s, mr.reg)
         return 0
     if iter.kind == EXPR_UNARY and (iter.op == OP_ADDR or iter.op == OP_ADDR_MUT)
-        return emit_for_addr_header(s, iter, out)
+        return emit_for_addr_header(s, iter, mr, out)
     var name: *u8 = null
     var name_len: i32 = 0
     if iter.kind == EXPR_CALL or iter.kind == EXPR_METHOD
@@ -3029,6 +3028,17 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
         return 0
     *out = vst
     emit_for_header_spill(s, vst, emit_expr(s, iter))
+
+# AGAST #2533: whether the field `e` names is a field of a call's result, as in
+# `mk().a` or `mk().p.a`.  ritz0 takes no address of one.  `mkp()[0].a` is a
+# place, and ritz0 walks it: an index stops the search.
+fn member_reached_through_call(e: *Expr) -> i32
+    var base: *Expr = e
+    while base != null and base.kind == EXPR_MEMBER
+        base = base.left
+    if base != null and (base.kind == EXPR_CALL or base.kind == EXPR_METHOD)
+        return 1
+    0
 
 # Lower `for x in iter { body }` (no `..`) — the iterable form.
 # Supports the shapes ritz1 can express today:
@@ -3058,13 +3068,17 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     var elem_name_len: i32 = 0
 
     var mr: MemberPtrResult
+    mr.reg = 0
+    mr.field = null
+    mr.success = 0
     let iter: *Expr = stmt.for_start
     # AGAST #2314: `@a` / `@&a` walks the array `a` names, in place, as `a` does:
     # a local or by-value `[N]T`, `a:& [N]T` (whose slot is the array behind the
-    # borrow) or a global.  A const isn't, as in ritz0.
+    # borrow) or a global.  A const isn't, as in ritz0.  AGAST #2533: and `@h.a`
+    # walks the field `h.a`, as `h.a` does.
     var arr_ident: *Expr = iter
     var via_addr: i32 = 0
-    if iter != null and iter.kind == EXPR_UNARY and (iter.op == OP_ADDR or iter.op == OP_ADDR_MUT) and iter.operand != null and iter.operand.kind == EXPR_IDENT
+    if iter != null and iter.kind == EXPR_UNARY and (iter.op == OP_ADDR or iter.op == OP_ADDR_MUT) and iter.operand != null and (iter.operand.kind == EXPR_IDENT or iter.operand.kind == EXPR_MEMBER)
         arr_ident = iter.operand
         via_addr = 1
     if iter != null
@@ -3113,8 +3127,11 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         elem_name = glob.array_elem_type_name
                         elem_name_len = glob.array_elem_type_name_len
                         bind_pointee = elem_recorded_pointee(s, elem_type, glob.array_elem_pointee, elem_name, elem_name_len, @bind_name, @bind_name_len)
-        else if iter.kind == EXPR_MEMBER
-            emit_member_ptr(s, iter, @mr)
+        else if arr_ident.kind == EXPR_MEMBER
+            # `@mk().a` has no address: ritz0 says "Cannot get address of: Call".
+            # Refused before the member is reached, which would run the call.
+            if via_addr == 0 or member_reached_through_call(arr_ident) == 0
+                emit_member_ptr(s, arr_ident, @mr)
             if mr.success == 1 and mr.field.field_type == TYPE_ARRAY
                 let fld: *StructField = mr.field
                 if fld.array_shape != null

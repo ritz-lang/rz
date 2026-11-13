@@ -779,9 +779,8 @@ _H2 = "struct H\n    n: i32\n    a: [2]i32\n\n"
 # Each compiled to a loop that never ran.  ritz0 takes this first group, so each
 # is a gap with a ticket (#2410); it refuses the second, and so does ritz1 now.
 # What's lowered moves out: Vec, Span and StrView are in test_ritz1_for_header.py,
-# and `@a` / `@v` in test_ritz1_for_addr_of.py (#2314).
+# and `@a` / `@v` / `@h.a` in test_ritz1_for_addr_of.py (#2314, #2533).
 RITZ1_REFUSES = {
-    "addr_of_field": (_H2 + MAIN + "    var h: H\n" + _SUM_V.format(it="@h.a")),
     "pointer_to_array": ("fn f(a: *[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
                          + _A + "    return f(@a)\n"),
     "reference_to_array": ("fn f(a: @[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
