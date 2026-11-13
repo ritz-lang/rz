@@ -1176,6 +1176,12 @@ class Monomorphizer:
         if not isinstance(var_type, rast.NamedType):
             return
 
+        # AGAST #2944: in a specialisation's body `Vec<T>` has already been
+        # rewritten to the struct it instantiates, `Vec$i32`, with no args.
+        # Recover `Vec<i32>`, or `v.push(a)` in `mk<T>` registers nothing and
+        # links only if other code happened to instantiate vec_push<i32>.
+        var_type = self._generic_instance_of(var_type)
+
         type_name = var_type.name
         if type_name not in self.TYPE_TO_UFCS_PREFIX:
             return
@@ -1183,6 +1189,20 @@ class Monomorphizer:
         # Register instantiation with the type's type args
         if var_type.args:
             self._register_ufcs_instantiation(type_name, expr.method, var_type.args)
+
+    def _generic_instance_of(self, ty: rast.NamedType) -> rast.NamedType:
+        """`Vec<i32>` for a mangled `Vec$i32`; any other type unchanged."""
+        if ty.args:
+            return ty
+        for instantiations in (self.struct_instantiations, self.enum_instantiations):
+            for (base_name, type_args_key), mangled_name in instantiations.items():
+                if mangled_name == ty.name and base_name in self.TYPE_TO_UFCS_PREFIX:
+                    generic_def = (self.generic_structs.get(base_name)
+                                   or self.generic_enums.get(base_name))
+                    params = generic_def.type_params if generic_def else []
+                    args = self._parse_type_args_key(type_args_key, params)
+                    return rast.NamedType(ty.span, base_name, args)
+        return ty
 
     TYPE_TO_UFCS_PREFIX = {
         'Vec': 'vec_',

@@ -75,9 +75,8 @@ def test_push_coerces_a_literal_to_the_element(run_with, compiler, name):  # noq
     assert run_with(compiler, name, program) == 0
 
 
-# `v.push(a)` in a generic fn, instantiated at a scalar and at a struct.  Read
-# with a `for`: ritz0 only compiles the push when something else instantiates
-# vec_push$T, as a `for` over the result does (AGAST #2944).
+# `v.push(a)` in a generic fn, instantiated at a scalar and at a struct, and
+# read with a `for`.
 GENERIC = ("fn mk<T>(a: T, b: T) -> Vec<T>\n    var v: Vec<T> = vec_new<T>()\n"
            "    v.push(a)\n    v.push(b)\n    return v\n\n")
 P = "struct P\n    x: i64\n    y: i64\n\n"
@@ -97,9 +96,10 @@ def test_push_in_a_generic_fn_links(run_with, compiler, name):  # noqa: F811
     assert run_with(compiler, name, program) == 0
 
 
-# Nothing but the generic fn pushes: the case ritz0 can't compile yet (#2944).
+# Nothing but the generic fn pushes: no other code instantiates vec_push$T, so
+# the specialisation's own `v.push` must (AGAST #2944).
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_push_in_a_generic_fn_is_its_only_push(run_with, compiler):  # noqa: F811
     program = (GVEC + GENERIC + MAIN + "    let v: Vec<i32> = mk<i32>(3, 4)\n"
                + _body("if v.len != 2\n    return 1\nif v[0] + v[1] != 7\n    return 2\nreturn 0\n"))
