@@ -3913,7 +3913,7 @@ class LLVMEmitter:
         return getattr(param, 'borrow', None) == rast.Borrow.MUTABLE
 
     def _emit_place_borrow(self, arg: rast.Expr, expected_type: ir.Type,
-                           fname: str, argno: int) -> ir.Value:
+                           fname: str, argno: int, param: rast.Param) -> ir.Value:
         """AGAST #2335: the pointer `arg` gives a `name:& T` parameter.
 
         A place of type `T` is borrowed, as if written `@&x`: the language's
@@ -3955,7 +3955,61 @@ class LLVMEmitter:
             raise EmitError(
                 f"argument {argno} of `{fname}` has the wrong type: "
                 f"{val.type} != {expected_type}", arg.span)
+        else:
+            self._check_place_sign(arg, param.type, fname, argno)
         return val
+
+    _UNSIGNED = frozenset(('u8', 'u16', 'u32', 'u64', 'usize'))
+
+    def _check_place_sign(self, arg: rast.Expr, want: rast.Type,
+                          fname: str, argno: int) -> None:
+        """AGAST #2530: a place fits a `name:& T` param if it's exactly a `T`,
+        not a `T` of the same width (Aaron's ruling on #2368). The LLVM types
+        have matched, so only an integer's sign can still differ, at any depth.
+        What the emitter can't type stays unjudged."""
+        got = self._infer_ritz_type(arg)
+        pair = self._sign_misfit(got, want)
+        if pair is not None:
+            raise EmitError(
+                f"argument {argno} of `{fname}` has the wrong type: "
+                f"{pair[0]} != {pair[1]}", arg.span)
+
+    def _sign_misfit(self, got: Optional[rast.Type],
+                     want: Optional[rast.Type]) -> Optional[Tuple[str, str]]:
+        """`got` and `want` spelled out, when they're alike but for an
+        integer's sign; None if they aren't, or either can't be read."""
+        if got is None or want is None:
+            return None
+        got = resolve_alias_in(got, self.type_aliases)
+        want = resolve_alias_in(want, self.type_aliases)
+        if isinstance(got, (rast.PtrType, rast.RefType)) \
+                and isinstance(want, (rast.PtrType, rast.RefType)):
+            pair = self._sign_misfit(got.inner, want.inner)
+            return None if pair is None else \
+                (self._ref_prefix(got) + pair[0], self._ref_prefix(want) + pair[1])
+        if isinstance(got, rast.ArrayType) and isinstance(want, rast.ArrayType):
+            pair = self._sign_misfit(got.inner, want.inner)
+            return None if pair is None else \
+                (self._array_prefix(got) + pair[0], self._array_prefix(want) + pair[1])
+        if not (isinstance(got, rast.NamedType) and isinstance(want, rast.NamedType)):
+            return None
+        widths = self._INT_TYPE_WIDTHS
+        if got.name in widths and want.name in widths \
+                and widths[got.name] == widths[want.name] \
+                and (got.name in self._UNSIGNED) != (want.name in self._UNSIGNED):
+            return got.name, want.name
+        return None
+
+    @staticmethod
+    def _ref_prefix(ty: rast.Type) -> str:
+        if isinstance(ty, rast.RefType):
+            return '@&' if ty.mutable else '@'
+        return '*'
+
+    @staticmethod
+    def _array_prefix(ty: rast.ArrayType) -> str:
+        size = ty.size.value if isinstance(ty.size, rast.IntLit) else ty.size
+        return f"[{size}]"
 
     def _behind_shared_ref(self, value: rast.Expr) -> bool:
         """Is the place `value` an `@T`, or is the nearest indirection on its
@@ -11221,7 +11275,7 @@ class LLVMEmitter:
                         else:
                             val = self._convert_type(tmp_val, expected_type)
                 elif is_mutable_borrow:
-                    val = self._emit_place_borrow(arg, expected_type, fname, i + 1)
+                    val = self._emit_place_borrow(arg, expected_type, fname, i + 1, param_def)
                 elif is_ref_type:
                     if arg_is_ref or arg_is_ptr or arg_is_addr_of:
                         # Argument is already a pointer type - just emit it
@@ -12635,7 +12689,8 @@ class LLVMEmitter:
                     self._literal_into_slot(fn_def.params[i].type, arg)
                 if i < len(fn_def.params) and self._takes_place(fn_def.params[i]):
                     all_args.append(self._emit_place_borrow(
-                        arg, self._fn_param_types(fn)[i], expr.method, i + 1))
+                        arg, self._fn_param_types(fn)[i], expr.method, i + 1,
+                        fn_def.params[i]))
                 else:
                     slot = fn_def.params[i].type if i < len(fn_def.params) else None
                     all_args.append(self._emit_into_array_slot(arg, slot))
@@ -12721,7 +12776,8 @@ class LLVMEmitter:
             if j < len(fn_def.params):
                 self._literal_into_slot(fn_def.params[j].type, arg)
             if j < len(fn_def.params) and self._takes_place(fn_def.params[j]):
-                all_args.append(self._emit_place_borrow(arg, expected_type, expr.method, j + 1))
+                all_args.append(self._emit_place_borrow(arg, expected_type, expr.method, j + 1,
+                                                         fn_def.params[j]))
                 continue
             arg_ritz_type = self._infer_ritz_type(arg)
             arg_is_ref = isinstance(arg_ritz_type, rast.RefType) if arg_ritz_type else False

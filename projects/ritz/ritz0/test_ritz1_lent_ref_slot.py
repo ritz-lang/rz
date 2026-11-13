@@ -544,7 +544,7 @@ MISFIT_GAPS = {("local_untyped", "ritz1"): UNTYPED_LOCAL_GAP,
 # Into a `name:& T` param, `@x` / `@&x` of another type is reinterpreted the
 # same way (#2367). `^` is where the argument goes, and the row's last item what's
 # written there before the name. A bare place of another type is
-# test_bare_place_borrow.py's MISFITS, in its own words; its sign gap is #2530.
+# test_bare_place_borrow.py's MISFITS, in its own words, sign included (#2530).
 LENT_MISFITS = {
     "array_sign": ("fn f(a:& [2]i32) -> i32\n    a[1] = 3\n    return a[1]\n", "var a: [2]u32 = [1, 2]", "a", "@&"),
     "array_length": ("fn f(a:& [3]i32) -> i32\n    return a[1]\n", "var a: [2]i32 = [1, 2]", "a", "@&"),
@@ -583,7 +583,8 @@ def test_a_lent_param_of_another_type_is_refused(tmp_path, compiler, name):
     _assert_refused(compiler, tmp_path, name, _lent_misfit(name), REF_TO_OTHER_TYPE)
 
 
-BARE_SIGN_GAP = "AGAST #2530: a bare place of another sign into a `:&` param compiles"
+# A bare place of another sign is the fit check's, like one of another width
+# (test_bare_place_borrow.py MISFITS), in its words: exactly the same type (#2530).
 BARE_SIGN = """\
 fn w(n:& i32)
     n = 3
@@ -596,11 +597,12 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=BARE_SIGN_GAP)
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_bare_place_of_another_sign_is_refused(tmp_path, compiler):
     comp, ll, _ = _compile_three(compiler, tmp_path, "bare_sign", BARE_SIGN)
-    assert comp.returncode != 0 and not ll.exists()
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0 and not ll.exists(), out
+    assert "main.ritz:6:7: argument 1 of `w` has the wrong type" in out, out
 
 
 @pytest.mark.integration

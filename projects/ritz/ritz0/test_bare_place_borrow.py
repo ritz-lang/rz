@@ -448,6 +448,13 @@ MISFITS = {
     # A copy of the param would take the write: it has no storage to borrow.
     "reference_for_pointer": (C + "fn w(r:& *C)\n    r = null\n\nfn go(r: @&C)\n    w(r)\n\n",
                               "v = 2"),
+    # Exactly the same type, not the same width (Aaron's ruling on #2368): one
+    # sign for another is refused too, though LLVM spells both alike (#2530).
+    "sign": (INT_WRITER, "var n: u32 = 1\n    w(n)"),
+    "array_sign": ("fn w(a:& [2]i32)\n    a[1] = 3\n\n", "var a: [2]u32 = [1, 2]\n    w(a)"),
+    "element_sign": (INT_WRITER, "var a: [2]u32 = [1, 1]\n    w(a[1])"),
+    "pointee_sign": ("fn w(r:& *i32)\n    r = null\n\n", "var p: *u32 = null\n    w(p)"),
+    "generic_sign": (GENERIC_WRITER, "var n: u32 = 1\n    w<i32>(n, 3)"),
 }
 # ritz0's method paths convert what they're given, so these need their own check.
 METHOD_MISFITS = {
@@ -456,6 +463,10 @@ METHOD_MISFITS = {
     "method_on_a_global": (S + "impl S\n    fn put(self: @&S, r:& i64)\n        r = 3\n\n"
                            "var g: S\n\n", "g.put(v)", 2),
     "static_method": (S + "impl S\n    fn put(r:& i64)\n        r = 3\n\n", "S.put(v)", 1),
+    # `v` is an `i32`; #2530's sign, on each of ritz0's method paths.
+    "method_sign": (S + "impl S\n    fn put(self: @&S, r:& u32)\n        r = 3\n\n",
+                    "var s: S = S { v: 0 }\n    s.put(v)", 2),
+    "static_method_sign": (S + "impl S\n    fn put(r:& u32)\n        r = 3\n\n", "S.put(v)", 1),
 }
 
 DROPS = """\
