@@ -14414,12 +14414,17 @@ class LLVMEmitter:
     def _note_match_result_type(self, expr: rast.Match, body: rast.Expr) -> None:
         """Record a move-only arm value's type on the match, inferred while
         the arm's bindings are in scope, so `let u = match s` with
-        `Full(t) => t` owns (and drops) the value (AGAST #2177). Only
-        move-only types: other lets keep their inference unchanged."""
+        `Full(t) => t` owns (and drops) the value (AGAST #2177).
+
+        Also a Vec, Span or String: index sugar on the let reads its ritz
+        type, so `let t = match o` with `Some(x) => x[1..3]` over a String
+        left `t[0]` "Cannot index type: String" (AGAST #2779).  Other lets
+        keep their inference unchanged."""
         if getattr(expr, 'result_ritz_type', None) is not None:
             return
         ty = self._infer_ritz_type(body)
-        if ty is not None and self._type_implements_drop(ty):
+        if ty is not None and (self._type_implements_drop(ty)
+                               or self._buffer_field_path(ty) is not None):
             expr.result_ritz_type = ty
 
     def _own_match_scrutinee(self, expr: rast.Match,

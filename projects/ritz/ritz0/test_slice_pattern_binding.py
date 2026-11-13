@@ -40,9 +40,8 @@ def _cells(boxes):
     return [(b, c) for b in boxes for c in COMPILERS]
 
 # box -> (its type, how main makes `v` hold 10, 20, 30, 40, an empty one,
-#         t's length, t's element {k}).  A String's element is read through
-#         its bytes: ritz0 indexes a String only when it's a let's own slice
-#         (#2779), and that isn't what this tests.
+#         t's length, t's element {k}).  A String's element is `t[{k}]` too:
+#         ritz0 types a `let` whose initializer is a match by its arms (#2779).
 BOXES = {
     "Vec": ("Vec<i32>",
             "    var v: Vec<i32> = vec_new<i32>()\n"
@@ -55,7 +54,7 @@ BOXES = {
     "String": ("String",
                "    var v: String\n    v.data = vec_new<u8>()\n"
                "    v.data.push(10)\n    v.data.push(20)\n    v.data.push(30)\n    v.data.push(40)\n",
-               "string_new()", "t.data.len", "*(t.data.data + {k})"),
+               "string_new()", "t.data.len", "t[{k}]"),
 }
 
 # name -> (range, length, last element).  An off-by-one in `..=` moves both.
