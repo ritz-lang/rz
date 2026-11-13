@@ -296,9 +296,9 @@ MOVES = {
 
 
 # ritz0 has none. All of ritz1's refuse, except #2316's, #2401's and #2402's.
-# (`chained_field` ran once #2391 returned a `-> @&T` call result as a `ptr`.)
-RITZ1_GAPS = {f"{level}.{name}": gap for level in LEVELS
-              for name, gap in (("chained_method", 2295), ("chained_store", 2295))}
+# (`chained_field` ran once #2391 returned a `-> @&T` call result as a `ptr`;
+# `chained_method`, through `mp() -> *C`, once #2883 named a `*S` link's impl.)
+RITZ1_GAPS = {f"{level}.chained_store": 2295 for level in LEVELS}
 RITZ1_GAPS |= dict.fromkeys(("field_shared_ptr_read", "field_mut_ptr_store", "global_shared_ptr_read",
                              "returned_shared_ptr_store", "returned_ptr_ptr_read", "returned_ptr_ptr_store",
                              "returned_is_called_once", "shared_to_shared_read", "mut_to_mut_store",

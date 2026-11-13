@@ -7,7 +7,9 @@ A function or method returning `*S` gives a real place, so
     sp(@s).arr[2] = 5       # ritz1: "unhandled indexed EXPR_MEMBER in assignment"
                             # ritz0: ValueError: Cannot get address of: Call
 
-store through the returned pointer, calling once.  (#2518's by-value results
+store through the returned pointer, calling once.  A method on such a
+result, `s.me().me().x = 12` (#2883), takes the returned pointer as its
+receiver, so every link runs once.  (#2518's by-value results
 are not places; #2517 is ritz1's reads through a `*R` call.)
 
 Each program returns 0 when right, else the number of the first check that
@@ -76,6 +78,13 @@ STORES = [
     # A pointer receiver, and a call in the call.
     ("let p: *S = @s\n    p.me().x = 11", "s.x == 11", 1),
     ("sp(sp(@s)).arr[2] = 13", "s.arr[2] == 13", 2),
+    # AGAST #2883: a method on a `*S` method's result -- the returned pointer
+    # is the receiver, so each link runs once and the store lands in `s`.
+    ("let q: *S = s.me().me()\n    q.x = 9", "s.x == 9", 2),
+    ("s.me().me().x = 12", "s.x == 12", 2),
+    ("let r: i32 = s.me().me().x", "r == 12", 2),
+    ("s.me().me().x += 5", "s.x == 17", 2),
+    ("s.me().me().me().arr[1] = 14", "s.arr[1] == 14", 3),
 ]
 
 
