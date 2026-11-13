@@ -114,6 +114,13 @@ AGAST #1392. Two things live here, and they are independent.
    clang's ~50 ms startup.  Anything it does not model, and every failure,
    runs real clang, so a refusal's message is clang's.  Importable and offered
    as the `clang_link` fixture; RITZ_TEST_LINK=clang turns it off.
+
+11. `batched` (AGAST #2806) — a matrix file marked `pytest.mark.batched`
+   compiles CHUNK of a test function's rows as one program per compiler
+   (ritz0/batching.py).  `pytest_pyfunc_call` below runs such a test with
+   batching on and, if it fails on a batched answer, again with it off, so
+   every failure is the row's own per-row compile.  RITZ_TEST_BATCH=0 turns
+   it off.
 """
 
 import os
@@ -124,6 +131,7 @@ from pathlib import Path
 
 import pytest
 
+import batching
 import fast_link
 import ritz0_inproc
 
@@ -274,6 +282,15 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "smoke: in the `make smoke` tier; applied from SMOKE_FILES"
     )
+    config.addinivalue_line(
+        "markers", "batched: matrix rows share one compile per compiler (item 11)"
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """Item 11: a `batched` test runs batched, then per-row if that fails."""
+    return batching.pyfunc_call(pyfuncitem)
 
 
 # tryfirst: the marker must be on the items before pytest's own `-m`
@@ -296,6 +313,8 @@ def pytest_collection_modifyitems(config, items):
             return 1
         return 2
     items.sort(key=rank)
+    # Item 11, after the sort: a batch's xdist_group is not the "tree" kind.
+    batching.assign_groups(items)
 
 
 @pytest.hookimpl(optionalhook=True)

@@ -342,12 +342,23 @@ Rules:
    its place by being able to fail on its own for a reason no other row
    covers.  A ticket that adds hundreds of single-compile cases is adding
    minutes to every gate; pick the rows that separate the code paths.
-2. **Batch rows that can share a program.**  All three compilers report
-   every error in a file, so refusal rows whose programs don't collide can
-   be checked in one compile (one `line:col: message` per row); run rows
-   can be functions of one program that reports each result.  Keep a
-   per-row failure message, and mutation-check that a broken row still
-   fails by itself.
+2. **Batch rows that can share a program.**  Mark the file
+   `pytestmark = pytest.mark.batched` and have its harness function ask
+   `batching.run(compiler, program, build)` /
+   `batching.refused(compiler, program, compile, at=)` first (AGAST #2806;
+   `_run` / `_assert_refused` in `test_ref_into_value.py`, `run_with` in
+   `test_ritz1_for_header.py` already do).  48 rows of a test function
+   (`RITZ_TEST_BATCH_CHUNK`) then compile and link as one program per
+   compiler: each row's `main` becomes a function, the names rows define
+   differently are renamed per row, and each row runs in its own process
+   (run rows) or is handed the diagnostics inside its own lines (refusal
+   rows; ritz1 reports every error, ritz0's checker does, ritz0's emitter
+   stops at its first).  A batch only ever passes a row: anything it can't
+   answer, and any test that fails on a batched answer, is compiled again
+   on its own, so every failure is the row's own.  Each chunk is an
+   `xdist_group`, so one worker compiles it.  `RITZ_TEST_BATCH=0` turns it
+   off; `RITZ_TEST_BATCH_LOG=<file>` logs each batch and every miss.  The
+   11 files #2806 converted went from 529 to 160 test-seconds.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

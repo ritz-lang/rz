@@ -18,6 +18,9 @@ import pytest
 import test_ritz1_for_header as for_header
 import test_slice_value_local as slice_local
 
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
+
 # #2451's fixtures: compile, link with gvec/span/string, run.
 compile_with = for_header.compile_with
 run_with = slice_local.run_with

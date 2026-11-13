@@ -14,7 +14,8 @@ import pytest
 
 from test_ref_into_value import COMPILERS, _run
 
-pytestmark = pytest.mark.integration
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
 TYPES = """\
 struct C

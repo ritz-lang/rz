@@ -22,8 +22,12 @@ Arrays behind a pointer are #2330 and other bases (`h.r[i]`, `g[i]`, `f()[i]`) a
 
 import pytest
 
+import batching
 import test_ritz1_for_header as for_header
 from test_ritz1_for_header import _new
+
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
 
 compile_with = for_header.compile_with
 run_with = for_header.run_with
@@ -204,9 +208,14 @@ SHARED_FIELD_REFUSALS = {
 
 
 def _refused(compile_with, compiler, name, program, message):
-    comp, _, _ = compile_with(compiler, name, program)
-    assert comp.returncode != 0, f"{compiler} took {name}"
-    out = comp.stdout + comp.stderr
+    batch = getattr(compile_with, "batch_compile", None)
+    got = batching.refused(compiler, program, batch) if batch else None  # AGAST #2806
+    if got is not None:
+        out = got[0]  # the batch's diagnostics inside this row's own lines
+    else:
+        comp, _, _ = compile_with(compiler, name, program)
+        assert comp.returncode != 0, f"{compiler} took {name}"
+        out = comp.stdout + comp.stderr
     assert message in out, out[-1000:]
     assert "main.ritz:" in out, f"unlocated: {out[-1000:]}"
 

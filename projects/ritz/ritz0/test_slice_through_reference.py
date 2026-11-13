@@ -21,6 +21,9 @@ from test_index_through_reference import HEADER, KINDS, _refused
 import test_slice_value_local as value_local
 from test_slice_value_local import BOXES, RANGES, WRITES_THROUGH
 
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
+
 # The by-value table's fixtures: it links ritzlib/string for a String slice.
 compile_with = value_local.compile_with
 run_with = value_local.run_with

@@ -23,7 +23,8 @@ from array_rules import ELEMENT_MISMATCH
 from emitter_llvmlite import EmitError, LLVMEmitter
 from test_ref_into_value import COMPILERS, _assert_refused, _compile, _ids, _main, _run
 
-pytestmark = pytest.mark.integration
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
 # A fill can lower to a call to memset, and these programs link nothing else.
 PRELUDE = """\

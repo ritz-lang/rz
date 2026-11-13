@@ -37,8 +37,12 @@ import subprocess
 
 import pytest
 
+import batching
 from ritz0_inproc import run_ritz0
 from test_ritz1_builtin_struct_shadow import RITZ_ROOT, _run
+
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
 
 
 def _ints(values):
@@ -1397,6 +1401,7 @@ pub fn main() -> i32
 
 
 def _compile(compiler, ritz1_bin, tmp_path, name, program):
+    batching.per_row()  # AGAST #2806
     src = tmp_path / f"{name}_{compiler}.ritz"
     src.write_text(program)
     ll = tmp_path / f"{name}_{compiler}.ll"

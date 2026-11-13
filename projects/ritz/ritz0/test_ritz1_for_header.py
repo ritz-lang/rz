@@ -30,11 +30,15 @@ from pathlib import Path
 
 import pytest
 
+import batching
 import fast_link
 
 import ritz0_inproc
 from test_ritz1_for_iterable import (COMPILERS, MAIN, RITZ1S, SCALARS, SELFHOSTED_BIN, UNSUPPORTED,
                                      _is_refused)
+
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
@@ -71,25 +75,57 @@ def _objects(compiler, ritz1_bin) -> tuple:
 @pytest.fixture
 def compile_with(ritz1_bin, tmp_path):
     def go(compiler, name, program):
+        batching.per_row()  # AGAST #2806
         work = tmp_path / f"{name}_{compiler}"
         work.mkdir()
         src, ll = work / "main.ritz", work / "main.ll"
         src.write_text(program)
         return _emit(compiler, ritz1_bin, src, ll), ll, work
+    go.batch_compile = batch_compile(ritz1_bin)  # for batching.refused (AGAST #2806)
     return go
+
+
+def _link(compiler, ritz1_bin, ll, work, extra=()):
+    exe = work / "main"
+    cmd = ["clang", "-w", str(ll), *_objects(compiler, ritz1_bin), *extra, "-o", str(exe), "-nostdlib"]
+    if compiler != "ritz0":
+        cmd.insert(2, str(RITZ_START))
+    return fast_link.clang(cmd, cwd=work, capture_output=True, text=True), exe
+
+
+def batch_build(ritz1_bin, extra=lambda compiler: ()):
+    """batching.run's `build`: compile and link a batch the way `run_with` does a row.
+
+    `extra(compiler)` names objects to link beyond the allocator's.
+    """
+    def build(compiler, src, work):
+        ll = work / "main.ll"
+        comp = _emit(compiler, ritz1_bin, src, ll)
+        if comp.returncode != 0 or not ll.exists():
+            return False, comp.stdout + comp.stderr, None
+        link, exe = _link(compiler, ritz1_bin, ll, work, extra(compiler))
+        return link.returncode == 0, link.stderr, exe
+    return build
+
+
+def batch_compile(ritz1_bin):
+    """batching.refused's `compile`, for `compile_with`'s callers."""
+    def compile(compiler, src, work):
+        comp = _emit(compiler, ritz1_bin, src, work / "main.ll")
+        return comp.returncode, comp.stdout + comp.stderr
+    return compile
 
 
 @pytest.fixture
 def run_with(ritz1_bin, compile_with):
     def go(compiler, name, program):
+        got = batching.run(compiler, program, batch_build(ritz1_bin))  # AGAST #2806
+        if got is not None:
+            return got
         comp, ll, work = compile_with(compiler, name, program)
         assert comp.returncode == 0 and ll.exists(), (
             f"{compiler} failed on {name}:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}")
-        exe = work / "main"
-        cmd = ["clang", "-w", str(ll), *_objects(compiler, ritz1_bin), "-o", str(exe), "-nostdlib"]
-        if compiler != "ritz0":
-            cmd.insert(2, str(RITZ_START))
-        link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
+        link, exe = _link(compiler, ritz1_bin, ll, work)
         assert link.returncode == 0, f"{name} would not link:\n{link.stderr[-2000:]}"
         return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
     return go

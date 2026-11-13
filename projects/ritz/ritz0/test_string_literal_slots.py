@@ -23,7 +23,12 @@ from pathlib import Path
 
 import pytest
 
+import batching
+import fast_link
 from ritz0_inproc import run_ritz0
+
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -287,31 +292,73 @@ _STRING_AS_PTR = (_IMPORT_STRING + 'fn main() -> i32\n    var s: String = string
                   "    let p: *u8 = string_as_ptr(@&s)\n    *p as i32\n")
 
 
+def _emit(compiler, src, ll, work, roots):
+    env = dict(os.environ, RITZ_PATH=roots)
+    if compiler == "ritz0":
+        return run_ritz0([str(src), "-o", str(ll)], cwd=work, env=env, timeout=300)
+    binary = RITZ1_BUILD / compiler
+    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    return subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=work,
+                          env=env, capture_output=True, text=True, timeout=300)
+
+
 def _compile(request, compiler, tmp_path, source):
+    batching.per_row()  # AGAST #2806
     src = tmp_path / "unit.ritz"
     src.write_text(_PRELUDE + source)
     ll = tmp_path / "unit.ll"
-    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{tmp_path}")
-    if compiler == "ritz0":
-        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
-    else:
+    if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
-        binary = RITZ1_BUILD / compiler
-        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
-        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
-        proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path,
-                              env=env, capture_output=True, text=True, timeout=300)
-    return proc, ll
+    return _emit(compiler, src, ll, tmp_path, f"{RITZ_ROOT}:{tmp_path}"), ll
 
 
-def _assert_runs(request, compiler, tmp_path, name, source, code):
-    proc, ll = _compile(request, compiler, tmp_path, source)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    exe = tmp_path / "unit"
+def _link_cmd(compiler, ll, exe):
     link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         link.insert(2, str(RITZ_START))
-    built = subprocess.run(link, cwd=tmp_path, capture_output=True, text=True)
+    return link
+
+
+def _batch_build(compiler, src, work):
+    """batching.run's `build`: compile and link a batch the way `_assert_runs` does a row."""
+    ll = work / "unit.ll"
+    proc = _emit(compiler, src, ll, work, f"{RITZ_ROOT}:{work}")
+    if proc.returncode != 0 or not ll.exists():
+        return False, proc.stdout + proc.stderr, None
+    exe = work / "unit"
+    link = fast_link.clang(_link_cmd(compiler, ll, exe), cwd=work, capture_output=True, text=True)
+    return link.returncode == 0, link.stderr, exe
+
+
+def _batch_compile(compiler, src, work):
+    proc = _emit(compiler, src, work / "unit.ll", work, f"{RITZ_ROOT}:{work}")
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _refusal(request, compiler, tmp_path, source, line, col):
+    """(returncode, output, "line:col" to look for): batched if it can be (AGAST #2806)."""
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    got = batching.refused(compiler, _PRELUDE + source, _batch_compile, at=(line + 1, col),
+                           filename="unit.ritz")
+    if got is not None:
+        return 1, got[0], got[1]
+    proc, _ = _compile(request, compiler, tmp_path, source)
+    return proc.returncode, proc.stdout + proc.stderr, f"{line + 1}:{col}"
+
+
+def _assert_runs(request, compiler, tmp_path, name, source, code):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    got = batching.run(compiler, _PRELUDE + source, _batch_build, filename="unit.ritz")  # #2806
+    if got is not None:
+        assert got == code, f"{compiler}, {name}"
+        return
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    exe = tmp_path / "unit"
+    built = subprocess.run(_link_cmd(compiler, ll, exe), cwd=tmp_path, capture_output=True, text=True)
     assert built.returncode == 0, f"{compiler}, {name}: link:\n{built.stderr[-1500:]}"
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 
@@ -321,11 +368,10 @@ def _assert_runs(request, compiler, tmp_path, name, source, code):
 @pytest.mark.parametrize("name", sorted(REJECTED))
 def test_what_does_not_fit_is_a_located_error(request, tmp_path, compiler, name):
     source, line, col, message = REJECTED[name]
-    proc, _ = _compile(request, compiler, tmp_path, source)
-    output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"{compiler} accepted it:\n{output}"
+    code, output, where = _refusal(request, compiler, tmp_path, source, line, col)
+    assert code != 0, f"{compiler} accepted it:\n{output}"
     assert message in output, output
-    assert re.search(rf"unit\.ritz:{line + 1}:{col}\b", output), output
+    assert re.search(rf"unit\.ritz:{where}\b", output), output
 
 
 @pytest.mark.integration
@@ -340,10 +386,9 @@ def test_what_fits_compiles_and_runs(request, tmp_path, compiler, name):
 @pytest.mark.parametrize("name", sorted(RITZ0_REJECTED))
 def test_ritz0_only_rejected(request, tmp_path, name):
     source, line, col, message = RITZ0_REJECTED[name]
-    proc, _ = _compile(request, "ritz0", tmp_path, source)
-    output = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and message in output, output
-    assert re.search(rf"unit\.ritz:{line + 1}:{col}\b", output), output
+    code, output, where = _refusal(request, "ritz0", tmp_path, source, line, col)
+    assert code != 0 and message in output, output
+    assert re.search(rf"unit\.ritz:{where}\b", output), output
 
 
 @pytest.mark.integration

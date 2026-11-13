@@ -27,6 +27,9 @@ import pytest
 import test_ritz1_for_header as for_header
 from test_index_through_reference import HEADER, KINDS, SCALARS, STRUCTS, _refused
 
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
+
 compile_with = for_header.compile_with
 run_with = for_header.run_with
 

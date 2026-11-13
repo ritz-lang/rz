@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import batching
 import fast_link
 
 from ref_rules import ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE
@@ -290,32 +291,58 @@ pub fn main() -> i32
 """
 
 
+def _emit(compiler, path, ll, work):
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    if compiler == "ritz0":
+        return run_ritz0([str(path), "-o", str(ll)], cwd=work, env=env, timeout=300)
+    binary = RITZ1_BUILD / compiler
+    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    return subprocess.run([str(binary), str(path), "-o", str(ll)], cwd=work, env=env,
+                          capture_output=True, text=True, timeout=300)
+
+
 def _compile(compiler, tmp_path, name, src):
+    batching.per_row()  # AGAST #2806
     work = tmp_path / f"{name}_{compiler}"
     work.mkdir()
     path = work / "main.ritz"
     path.write_text(src)
     ll = work / "main.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    if compiler == "ritz0":
-        return run_ritz0([str(path), "-o", str(ll)], cwd=work, env=env, timeout=300), ll, work
-    binary = RITZ1_BUILD / compiler
-    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
-    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
-    proc = subprocess.run([str(binary), str(path), "-o", str(ll)], cwd=work, env=env,
-                          capture_output=True, text=True, timeout=300)
-    return proc, ll, work
+    return _emit(compiler, path, ll, work), ll, work
 
 
-def _run(compiler, tmp_path, name, src):
-    comp, ll, work = _compile(compiler, tmp_path, name, src)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode == 0 and ll.exists(), f"{compiler} refused {name}:\n{src}\n{out[-2000:]}"
+def _link(compiler, ll, work):
     exe = work / "main"
     cmd = ["clang", "-Wno-override-module", str(ll), "-o", str(exe), "-nostdlib", "-no-pie"]
     if compiler != "ritz0":
         cmd.insert(1, str(RITZ_START))
-    link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
+    return fast_link.clang(cmd, cwd=work, capture_output=True, text=True), exe
+
+
+def _batch_build(compiler, path, work):
+    """batching.run's `build`: compile and link a batch the way `_run` does a row."""
+    ll = work / "main.ll"
+    comp = _emit(compiler, path, ll, work)
+    if comp.returncode != 0 or not ll.exists():
+        return False, comp.stdout + comp.stderr, None
+    link, exe = _link(compiler, ll, work)
+    return link.returncode == 0, link.stderr, exe
+
+
+def _batch_compile(compiler, path, work):
+    comp = _emit(compiler, path, work / "main.ll", work)
+    return comp.returncode, comp.stdout + comp.stderr
+
+
+def _run(compiler, tmp_path, name, src):
+    got = batching.run(compiler, src, _batch_build)  # AGAST #2806: None unless batched
+    if got is not None:
+        return got
+    comp, ll, work = _compile(compiler, tmp_path, name, src)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode == 0 and ll.exists(), f"{compiler} refused {name}:\n{src}\n{out[-2000:]}"
+    link, exe = _link(compiler, ll, work)
     assert link.returncode == 0, f"{compiler}: {name} would not link:\n{link.stderr[-2000:]}"
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 
@@ -329,10 +356,14 @@ def _located(text):
 
 def _assert_refused(compiler, tmp_path, name, marked, message):
     src, where = _located(marked)
-    comp, ll, _ = _compile(compiler, tmp_path, name, src)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted {name}:\n{src}"
-    assert not ll.exists()
+    got = batching.refused(compiler, src, _batch_compile, at=tuple(map(int, where.split(":"))))
+    if got is not None:  # AGAST #2806: this row's diagnostics from its chunk's batch
+        out, where = got
+    else:
+        comp, ll, _ = _compile(compiler, tmp_path, name, src)
+        out = comp.stdout + comp.stderr
+        assert comp.returncode != 0, f"{compiler} accepted {name}:\n{src}"
+        assert not ll.exists()
     found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
     assert (where, message) in found, f"{compiler}: {name}, wanted {where}:\n{src}\n{out[-2000:]}"
 

@@ -53,6 +53,8 @@ from pathlib import Path
 
 import pytest
 
+import batching
+import fast_link
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -64,8 +66,31 @@ RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
 
+def _batch_build(compiler: str, src: Path, work: Path):
+    """batching.run's `build`: compile and link a batch the way `_run` does a row."""
+    ll = work / "main.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    if compiler == "ritz0":
+        comp = run_ritz0([str(src), "-o", str(ll)], cwd=work, env=env, timeout=300)
+    else:
+        comp = subprocess.run([str(RITZ1_BIN), str(src), "-o", str(ll)], cwd=work, env=env,
+                              capture_output=True, text=True, timeout=300, check=False)
+    if comp.returncode != 0 or not ll.exists():
+        return False, comp.stdout + comp.stderr, None
+    exe = work / "main"
+    cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
+    if compiler == "ritz1":
+        cmd.insert(2, str(RITZ_START))
+    link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
+    return link.returncode == 0, link.stderr, exe
+
+
 def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     """Compile `program` with `compiler`, link it, run it, return the exit code."""
+    got = batching.run(compiler, program, _batch_build)  # AGAST #2806: None unless batched
+    if got is not None:
+        return got
+    batching.per_row()
     src = tmp_path / f"{name}_{compiler}.ritz"
     src.write_text(program)
     ll = tmp_path / f"{name}_{compiler}.ll"

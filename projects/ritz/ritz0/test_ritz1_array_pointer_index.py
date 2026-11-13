@@ -31,6 +31,9 @@ import array_rules
 import ref_rules
 from test_borrow_param_ref_field import _compile, _run
 
+# AGAST #2806: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]

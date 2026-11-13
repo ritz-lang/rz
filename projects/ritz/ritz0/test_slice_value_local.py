@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+import batching
 import fast_link
 
 import test_ritz1_for_header as for_header
@@ -57,16 +58,17 @@ def _string_objects(compiler, ritz1_bin) -> tuple:
 
 @pytest.fixture
 def run_with(ritz1_bin, compile_with):
+    def strings(compiler):
+        return _string_objects(compiler, ritz1_bin)
+
     def go(compiler, name, program):
+        got = batching.run(compiler, program, for_header.batch_build(ritz1_bin, strings))  # #2806
+        if got is not None:
+            return got
         comp, ll, work = compile_with(compiler, name, program)
         assert comp.returncode == 0 and ll.exists(), (
             f"{compiler} failed on {name}:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}")
-        exe = work / "main"
-        cmd = ["clang", "-w", str(ll), *for_header._objects(compiler, ritz1_bin),
-               *_string_objects(compiler, ritz1_bin), "-o", str(exe), "-nostdlib"]
-        if compiler != "ritz0":
-            cmd.insert(2, str(for_header.RITZ_START))
-        link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
+        link, exe = for_header._link(compiler, ritz1_bin, ll, work, strings(compiler))
         assert link.returncode == 0, f"{name} would not link:\n{link.stderr[-2000:]}"
         return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
     return go
