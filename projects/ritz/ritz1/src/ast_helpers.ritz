@@ -2009,12 +2009,110 @@ pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
 # initializer (a block arm) replaces the latch, as it does var_type_name, and a
 # nested reference then wins.  No arm lends yet (#2309), which is when it matters.
 var g_var_ref: *Param = null
+# AGAST #2822: likewise a `[N]T` annotation's shape (`<[M]U>` in the
+# initializer re-sets last_array_*), and a `*[N]T`'s pointee array.
+var g_var_array: *ArrayElem = null
+var g_var_array_size: i32 = 0
+var g_var_ptr_array_size: i32 = 0
+var g_var_ptr_array_elem: i32 = 0
+var g_var_ptr_array_elem_pointee: i32 = 0
+
+# AGAST #2822: one record of all the latches above per typed decl, so a typed
+# `let` nested in the initializer (a block arm) can't replace the outer decl's.
+# capture_var_type pushes one, tagged with where the annotation ends;
+# stmt_var_decl restores the first one after its `let` (the inner decls'
+# records sit above it) and drops it and everything above it.  The grammar
+# backtracks: a re-capture first drops the records at or after its own end,
+# which a failed alternative left behind.
+struct VarLatch
+    tokens: *Token
+    line: i32
+    col: i32
+    below: *VarLatch
+    type_name: *u8
+    type_name_len: i32
+    pointee: i32
+    inner_pointee: i32
+    fn_sig: *FnDef
+    ref: *Param
+    array: *ArrayElem
+    array_size: i32
+    ptr_array_size: i32
+    ptr_array_elem: i32
+    ptr_array_elem_pointee: i32
+
+var g_var_latch: *VarLatch = null
+
+# (line, col) strictly after (line2, col2).
+fn pos_after(line: i32, col: i32, line2: i32, col2: i32) -> i32
+    if line > line2 or (line == line2 and col > col2)
+        return 1
+    return 0
+
+fn push_var_latch(p: *Parser)
+    let end: *Token = p.tokens + (p.pos - 1)
+    # A record from another file's parse, or one at/after this annotation
+    # (a failed alternative's), is stale.
+    while g_var_latch != null and (g_var_latch.tokens != p.tokens or pos_after(end.line, end.col, g_var_latch.line, g_var_latch.col) == 0)
+        g_var_latch = g_var_latch.below
+    let r: *VarLatch = parser_alloc(p, sizeof(VarLatch)) as *VarLatch
+    r.tokens = p.tokens
+    r.line = end.line
+    r.col = end.col
+    r.below = g_var_latch
+    r.type_name = p.var_type_name
+    r.type_name_len = p.var_type_name_len
+    r.pointee = p.var_pointee
+    r.inner_pointee = p.var_inner_pointee
+    r.fn_sig = p.var_fn_sig
+    r.ref = g_var_ref
+    r.array = g_var_array
+    r.array_size = g_var_array_size
+    r.ptr_array_size = g_var_ptr_array_size
+    r.ptr_array_elem = g_var_ptr_array_elem
+    r.ptr_array_elem_pointee = g_var_ptr_array_elem_pointee
+    g_var_latch = r
+
+# Restore the latches of the typed decl whose `let` is at (line, col).
+fn pop_var_latch(p: *Parser, line: i32, col: i32)
+    var mine: *VarLatch = null
+    var r: *VarLatch = g_var_latch
+    while r != null and r.tokens == p.tokens and pos_after(r.line, r.col, line, col) != 0
+        mine = r
+        r = r.below
+    if mine == null
+        return
+    g_var_latch = mine.below
+    p.var_type_name = mine.type_name
+    p.var_type_name_len = mine.type_name_len
+    p.var_pointee = mine.pointee
+    p.var_inner_pointee = mine.inner_pointee
+    p.var_fn_sig = mine.fn_sig
+    g_var_ref = mine.ref
+    g_var_array = mine.array
+    g_var_array_size = mine.array_size
+    g_var_ptr_array_size = mine.ptr_array_size
+    g_var_ptr_array_elem = mine.ptr_array_elem
+    g_var_ptr_array_elem_pointee = mine.ptr_array_elem_pointee
 
 pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     g_var_ref = null
     if ty == TYPE_REF or ty == TYPE_MUT_REF
         g_var_ref = param_of_type(p, null, 0, ty)
+    g_var_array = null
+    g_var_array_size = 0
+    if ty == TYPE_ARRAY
+        g_var_array = array_elem_of_last(p)
+        g_var_array_size = p.last_array_size
+    g_var_ptr_array_size = ptr_array_pointee_size(p, ty)
+    g_var_ptr_array_elem = ptr_array_pointee_elem(p, ty)
+    g_var_ptr_array_elem_pointee = ptr_array_elem_pointee(p, ty)
     if ty == TYPE_STRUCT
+        p.var_type_name = p.last_type_name
+        p.var_type_name_len = p.last_type_name_len
+    else if ty == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
+        # AGAST #2822: `let p: *A = pick<*B>(..)` -- the `<*B>` re-sets
+        # last_type_name, so p took B's field offsets and stride.
         p.var_type_name = p.last_type_name
         p.var_type_name_len = p.last_type_name_len
     else if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_STRUCT
@@ -2044,6 +2142,7 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     p.var_fn_sig = null
     if ty == TYPE_PTR or ty == TYPE_ARRAY
         p.var_fn_sig = fresh_fn_sig(p)
+    push_var_latch(p)
     return ty
 
 # =============================================================================
@@ -2800,6 +2899,9 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     s.var_is_let = 0
     s.name_span.line = 0   # AGAST #2407: stmt_named sets it
     s.name_span.col = 0
+    # AGAST #2822: this decl's latches, not a nested typed `let`'s.
+    if ty != 0
+        pop_var_latch(p, line, col)
     # AGAST #1671: typed decls go through capture_var_type, which latched
     # var_fn_sig (null unless the type is a fn type).  Untyped ones have none.
     # On a `[N]fn(..)` array it is the element signature (AGAST #1747).
@@ -2840,10 +2942,11 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         else
             s.var_type_name = p.last_type_name as *u8
             s.var_type_name_len = p.last_type_name_len
-    else if ty == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
-        # Pointer to struct - need to track the struct name for ptr.field access
-        s.var_type_name = p.last_type_name as *u8
-        s.var_type_name_len = p.last_type_name_len
+    else if ty == TYPE_PTR and p.var_pointee == TYPE_STRUCT and p.var_type_name != null
+        # AGAST #2822: `*S`, latched by capture_var_type (every typed decl
+        # goes through it) before a `<*B>` in the initializer re-set it.
+        s.var_type_name = p.var_type_name as *u8
+        s.var_type_name_len = p.var_type_name_len
     else if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.var_type_name != null
         # AGAST #1754: reference to struct, latched by capture_var_type.
         s.var_type_name = p.var_type_name as *u8
@@ -2857,26 +2960,28 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         s.var_type_name_len = 0
     # Copy array info from parser state if this is an array type
     s.var_array_shape = null
-    if ty == TYPE_ARRAY
-        s.var_array_size = p.last_array_size
-        s.var_array_elem_type = p.last_array_elem_type
-        s.var_array_shape = p.last_array_shape  # AGAST #1509
+    # AGAST #2822: latched by capture_var_type (every typed decl goes through
+    # it) before a `<[M]U>` in the initializer re-set last_array_*.
+    let arr: *ArrayElem = g_var_array
+    s.var_array_elem_pointee = TYPE_VOID
+    if ty == TYPE_ARRAY and arr != null
+        s.var_array_size = g_var_array_size
+        s.var_array_elem_type = arr.elem
+        s.var_array_shape = arr.shape  # AGAST #1509
+        s.var_array_elem_pointee = arr.pointee
         # For arrays of structs, store the struct name in var_type_name
         # so the emitter can allocate with correct element size
-        if p.last_array_elem_type == TYPE_STRUCT
-            s.var_type_name = p.last_array_elem_type_name as *u8
-            s.var_type_name_len = p.last_array_elem_type_name_len
-        else if (p.last_array_elem_type == TYPE_PTR or p.last_array_elem_type == TYPE_PTR_PTR) and p.last_array_elem_type_name_len > 0
+        if arr.elem == TYPE_STRUCT
+            s.var_type_name = arr.name
+            s.var_type_name_len = arr.name_len
+        else if (arr.elem == TYPE_PTR or arr.elem == TYPE_PTR_PTR) and arr.name_len > 0
             # AGAST #184: [N]*Foo arrays — propagate the inner pointee
             # struct name so emit_member_ptr can resolve `arr[i].field`.
-            s.var_type_name = p.last_array_elem_type_name as *u8
-            s.var_type_name_len = p.last_array_elem_type_name_len
+            s.var_type_name = arr.name
+            s.var_type_name_len = arr.name_len
     else
         s.var_array_size = 0
         s.var_array_elem_type = 0
-    s.var_array_elem_pointee = TYPE_VOID
-    if ty == TYPE_ARRAY
-        s.var_array_elem_pointee = p.last_array_elem_pointee
     # Copy pointee type from parser state if this is a pointer type
     # AGAST #2805: latched by capture_var_type for a typed decl with an
     # initializer, as the inner pointee slot below is.
@@ -2895,9 +3000,14 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         s.var_inner_pointee_type = p.var_inner_pointee
     else
         s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
-    s.var_pointee_array_size = ptr_array_pointee_size(p, ty)
-    s.var_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
-    s.var_pointee_array_elem_pointee = ptr_array_elem_pointee(p, ty)
+    # AGAST #2822: a `*[N]T`'s pointee array, latched by capture_var_type.
+    s.var_pointee_array_size = 0
+    s.var_pointee_array_elem_type = TYPE_VOID
+    s.var_pointee_array_elem_pointee = TYPE_VOID
+    if ty != 0
+        s.var_pointee_array_size = g_var_ptr_array_size
+        s.var_pointee_array_elem_type = g_var_ptr_array_elem
+        s.var_pointee_array_elem_pointee = g_var_ptr_array_elem_pointee
     s.var_ref = null
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and g_var_ref != null
         s.var_ref = g_var_ref
