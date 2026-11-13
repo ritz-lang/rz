@@ -908,8 +908,7 @@ BY_VALUE_REFUSED = {name: ALL.pop(name) for name in (
 RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
     "self_generic_bare": "AGAST #2318: bare `self:&` in a generic impl doesn't compile",
-    "argument_addr_receiver": "AGAST #2317: `(@c).g()` has no receiver type, for a local either",
-    "control_move_only_deref_field": "AGAST #2317: `(*@t).id` is unhandled, as `(@c).g()` is",
+    "control_move_only_deref_field": "AGAST #2317: `(*@t).id` is unhandled",
 }
 
 

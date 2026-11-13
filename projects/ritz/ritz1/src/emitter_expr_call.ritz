@@ -5098,9 +5098,15 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 # widened to the i64 value model like the instance arm's,
                 # or `return C.get(...)` from an i32 fn truncs an i32 reg.
                 return widen_method_result(s, sm_result, sm_method.return_type)
-    if e.left.kind == EXPR_IDENT
+    # AGAST #2550: `(@d).m()` and `(@&d).m()` dispatch on `d`, as in ritz0 —
+    # the receiver is auto-borrowed anyway, so the address-of names the
+    # same place.  Its `@T`-into-`@&T` refusal already ran in the checker.
+    var recv: *Expr = e.left
+    while recv.kind == EXPR_UNARY and (recv.op == OP_ADDR or recv.op == OP_ADDR_MUT) and recv.operand != null
+        recv = recv.operand
+    if recv.kind == EXPR_IDENT
         # Look up the receiver type from locals
-        let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+        let loc: *LocalVar = find_local_struct_name(s, recv.ident_ptr, recv.ident_len)
         if loc != null
             type_name = loc.type_name
             type_name_len = loc.type_name_len
@@ -5120,7 +5126,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             # so a mutating method writes the global); a `*S` global holds
             # a pointer in `@g`, so it is dispatched ptr-of-ptr, like a
             # pointer-typed local (cf. emit_member_ptr's #1892 arm).
-            let rglob: *GlobalVarDef = find_global(s, e.left.ident_ptr, e.left.ident_len)
+            let rglob: *GlobalVarDef = find_global(s, recv.ident_ptr, recv.ident_len)
             if rglob != null
                 var rg_ptr_of_ptr: i32 = -1
                 if rglob.var_type == TYPE_STRUCT and rglob.type_name_len > 0
@@ -5142,17 +5148,17 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                     emit_str(s, c", i64 0  ; global receiver\n")
                     receiver_reg = rg_reg
                     recv_is_ptr_of_ptr = rg_ptr_of_ptr
-    else if e.left.kind == EXPR_INDEX and index_through_struct(s, e.left, @elem_recv, @elem_recv_len) == 1 and elem_recv != null
+    else if recv.kind == EXPR_INDEX and index_through_struct(s, recv, @elem_recv, @elem_recv_len) == 1 and elem_recv != null
         # AGAST #2443: `p[i].m()` through a `*`, `@` or `@&` Vec, Span or String
         # (R9), and `v[i].m()` on one: the element's address is the receiver, so
         # a mutating method writes the element in place.
-        receiver_reg = emit_through_elem_ptr(s, e.left, @elem_recv, @elem_recv_len)
+        receiver_reg = emit_through_elem_ptr(s, recv, @elem_recv, @elem_recv_len)
         type_name = elem_recv
         type_name_len = elem_recv_len
         recv_is_ptr_of_ptr = 0
-    else if e.left.kind == EXPR_INDEX and array_elem_pointee(s, e.left, @elem_recv, @elem_recv_len) == TYPE_STRUCT
+    else if recv.kind == EXPR_INDEX and array_elem_pointee(s, recv, @elem_recv, @elem_recv_len) == TYPE_STRUCT
         # AGAST #2332: `a[i].m()` with `a: [N]*S`: the element IS the receiver.
-        let elem_val: i32 = emit_expr(s, e.left)
+        let elem_val: i32 = emit_expr(s, recv)
         let elem_ptr: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, elem_ptr)
@@ -5163,15 +5169,15 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         type_name_len = elem_recv_len
         receiver_reg = elem_ptr
         recv_is_ptr_of_ptr = 0
-    else if e.left.kind == EXPR_INDEX and e.left.left != null and e.left.left.kind == EXPR_IDENT and (e.left.right == null or e.left.right.kind != EXPR_RANGE)
+    else if recv.kind == EXPR_INDEX and recv.left != null and recv.left.kind == EXPR_IDENT and (recv.right == null or recv.right.kind != EXPR_RANGE)
         # AGAST #1981: `arr[i].m()` on a local `[N]St` -- the element's
         # address is the receiver, dispatched in place (a mutating method
         # such as Vec.push writes the array slot, not a copy).  Mirrors
         # emit_member_ptr's `arr[i].field` arm.  Without it the receiver
         # type went unresolved ("cannot determine receiver type").
-        let arr_loc: *LocalVar = find_local_struct_name(s, e.left.left.ident_ptr, e.left.left.ident_len)
+        let arr_loc: *LocalVar = find_local_struct_name(s, recv.left.ident_ptr, recv.left.ident_len)
         if arr_loc != null and arr_loc.var_type == TYPE_ARRAY and arr_loc.array_elem_type == TYPE_STRUCT and arr_loc.type_name_len > 0
-            let arr_idx: i32 = emit_expr(s, e.left.right)
+            let arr_idx: i32 = emit_expr(s, recv.right)
             let arr_elem: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, arr_elem)
@@ -5188,19 +5194,19 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             type_name_len = arr_loc.type_name_len
             receiver_reg = arr_elem
             recv_is_ptr_of_ptr = 0
-    else if e.left.kind == EXPR_CALL
+    else if recv.kind == EXPR_CALL
         # Receiver is a direct call. Resolve its callee's return type name
         # so we know which struct we're calling a method on, then emit the
         # call itself and materialise the result into a stack slot so the
         # ptr-dispatch fallback paths still have something to pass.
         # (ritz-task-106)
-        let fn_def: *FnDef = find_call_fn(s, e.left)
+        let fn_def: *FnDef = find_call_fn(s, recv)
         if fn_def != null
             if fn_def.return_type == TYPE_STRUCT
                 if fn_def.return_type_name_len > 0
                     type_name = fn_def.return_type_name
                     type_name_len = fn_def.return_type_name_len
-        recv_value_reg = emit_expr(s, e.left)
+        recv_value_reg = emit_expr(s, recv)
         var call_slot: i32 = 0
         if type_name_len > 0 and s.sret_last_slot > 0 and s.sret_last_val == recv_value_reg
             # AGAST #2073: an sret call already left its result in memory
@@ -5236,7 +5242,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c"\n")
         receiver_reg = call_slot
         recv_is_ptr_of_ptr = 0
-    else if e.left.kind == EXPR_METHOD
+    else if recv.kind == EXPR_METHOD
         # Recursive chain: `a.foo().bar()`. Emit the inner method call to
         # get the value and spill it to a stack slot. We cannot name the
         # outer receiver's struct type without an impl-table lookup, so
@@ -5244,7 +5250,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         # ignores type_name matches.  Enum-unwrap is gated on a non-null
         # type_name so recursive chaining through `.unwrap()` isn't
         # supported yet. (ritz-task-106)
-        recv_value_reg = emit_expr(s, e.left)
+        recv_value_reg = emit_expr(s, recv)
         let chain_slot: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, chain_slot)
@@ -5256,24 +5262,24 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c"\n")
         receiver_reg = chain_slot
         recv_is_ptr_of_ptr = 0
-    else if e.left.kind == EXPR_STRUCT_LIT
+    else if recv.kind == EXPR_STRUCT_LIT
         # Rvalue-struct receiver: `Point { x: 2.0 }.scale(...)`.  Spill
         # the struct literal into a stack slot and use that slot as the
         # receiver pointer, mirroring the pattern used for chained calls.
-        # The struct lit's name (e.left.ident_ptr/_len) IS the type name,
+        # The struct lit's name (recv.ident_ptr/_len) IS the type name,
         # so we know which impl table to consult without value emission.
-        type_name = e.left.ident_ptr as *u8
-        type_name_len = e.left.ident_len
+        type_name = recv.ident_ptr as *u8
+        type_name_len = recv.ident_len
         let lit_slot: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, lit_slot)
         emit_str(s, c" = alloca %")
         emit_name(s, type_name, type_name_len)
         emit_str(s, c"  ; rvalue struct-lit receiver\n")
-        emit_struct_lit_to_alloca(s, e.left, lit_slot)
+        emit_struct_lit_to_alloca(s, recv, lit_slot)
         receiver_reg = lit_slot
         recv_is_ptr_of_ptr = 0
-    else if e.left.kind == EXPR_MEMBER
+    else if recv.kind == EXPR_MEMBER
         # Field receiver: `r.raw.push(9)`, `q.a.get()`, `o.q.a.get()`.
         # emit_member_ptr yields the field's address, which IS the
         # receiver pointer for in-place (auto-borrowed) dispatch — a
@@ -5282,7 +5288,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         # it is dispatched ptr-of-ptr, like a pointer-typed local.
         # (AGAST #1512)
         var mres: MemberPtrResult
-        emit_member_ptr(s, e.left, @mres)
+        emit_member_ptr(s, recv, @mres)
         if mres.success == 1 and mres.field != null
             let rf: *StructField = mres.field
             if rf.field_type_name_len > 0
@@ -5296,7 +5302,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                     type_name_len = rf.field_type_name_len
                     receiver_reg = emit_load_levels(s, mres.reg, field_struct_levels(rf) - 1)   # AGAST #2372
                     recv_is_ptr_of_ptr = 1
-    else if e.left.kind == EXPR_UNARY and e.left.op == OP_DEREF
+    else if recv.kind == EXPR_UNARY and recv.op == OP_DEREF
         # AGAST #2145: `(*pp).m()` with pp a `**S` (param, local, field):
         # `*pp` is a `*S` value, so dispatch like a `*S` local -- the
         # loaded pp points at the slot holding the `*S` (ptr-of-ptr).
@@ -5306,7 +5312,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         # method on a copy there, which ritz1 does not mirror (#2175).
         var dr_st: *StructDef = null
         var dr_levels: i32 = 0
-        let dr_reg: i32 = emit_deref_operand_ptr(s, e.left.operand, @dr_st, @dr_levels)
+        let dr_reg: i32 = emit_deref_operand_ptr(s, recv.operand, @dr_st, @dr_levels)
         if dr_reg != 0 and dr_levels == 2
             type_name = dr_st.name
             type_name_len = dr_st.name_len

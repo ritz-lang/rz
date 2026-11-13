@@ -148,11 +148,18 @@ ALLOWED = {
     "mutable_into_shared_method_arg_large": (
         "struct R\n    n: i32\n\nimpl R\n    fn get(self: @R, w: @W) -> i32\n        w.c.x + w.a[1] + self.n\n\n",
         "    let r = R { n: 0 }\n    var w = W { c: C { x: 1 }, a: [0, 2] }\n    r.get(@&w)\n", 3),
-    # `(@&d).rd()` isn't here: ritz1 can't type a parenthesised `@d` receiver
-    # either (#2550); a held `@&D` reaches the receiver path.
     "mutable_reference_receiver_into_shared": (
         "struct D\n    x: i32\n\nimpl D\n    fn rd(self: @D) -> i32\n        self.x\n\n",
         "    var d = D { x: 3 }\n    let m: @&D = @&d\n    m.rd()\n", 3),
+    # #2550: an address-of receiver is the place's own address.
+    "mutable_address_receiver_into_shared": (
+        "struct D\n    x: i32\n\nimpl D\n    fn rd(self: @D) -> i32\n        self.x\n\n",
+        "    var d = D { x: 3 }\n    (@&d).rd()\n", 3),
+    "shared_address_receiver_into_shared": (
+        "struct D\n    x: i32\n\nimpl D\n    fn rd(self: @D) -> i32\n        self.x\n\n",
+        "    var d = D { x: 3 }\n    (@d).rd()\n", 3),
+    "mutable_address_receiver_writes_the_place": (
+        "", "    var c = C { x: 1 }\n    var e = C { x: 3 }\n    (@&c).add(@&e)\n    c.x\n", 3),
     "mutable_into_pointer": ("fn wr(c: *C)\n    c.x = 3\n\n",
                              "    var c = C { x: 1 }\n    wr(@&c)\n    c.x\n", 3),
     "held_mutable": ("", "    var c = C { x: 1 }\n    let m: @&C = @&c\n    mb(m)\n    c.x\n", 3),
