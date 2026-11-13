@@ -68,6 +68,11 @@ NOT_INDEXABLES = {
     "array_element": ("S", "    var a: [2]S\n", "    return a[0]@[1].x\n"),
     "array_scalar_element": ("i32", "    var a: [3]i32 = [10, 20, 30]\n", "    return a[0]@[1]\n"),
     "struct_local": ("S", "    var s: S = S { x: 1, y: 2 }\n", "    return s@[1].x\n"),
+    # AGAST #2886: a scalar local.  ritz0 said "Cannot index type: i32" unlocated;
+    # ritz1 and ritz1_selfhosted compiled it.
+    "scalar_local": ("i32", "    var n: i32 = 5\n", "    return n@[1]\n"),
+    "scalar_local_store": ("i32", "    var n: i32 = 5\n", "    n@[1] = 7\n    return n\n"),
+    "scalar_local_add": ("i32", "    var n: i32 = 5\n", "    n@[1] += 7\n    return n\n"),
 }
 
 # `@` marks the `*`.

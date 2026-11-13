@@ -8396,9 +8396,9 @@ class LLVMEmitter:
         ty = self._infer_ritz_type(root)
         if ty is not None:
             ty = resolve_alias_in(ty, self.type_aliases)
-        # An element that is a scalar has nothing to index (#2452).  One that is a
-        # struct was _struct_index's, above.
-        if (isinstance(root, rast.Index) and not deref and isinstance(ty, rast.NamedType)
+        # An element that is a scalar has nothing to index (#2452), and nor does a
+        # scalar name, `n[1]` (#2886).  One that is a struct was _struct_index's, above.
+        if (not deref and isinstance(ty, rast.NamedType)
                 and ty.name in index_rules.SCALARS and not isinstance(expr.index, rast.Range)):
             raise EmitError(index_rules.needs_index(ty.name), expr.bracket or expr.span)
         # The value itself, `v[i]` on a Vec, Span or String local: the same place,
