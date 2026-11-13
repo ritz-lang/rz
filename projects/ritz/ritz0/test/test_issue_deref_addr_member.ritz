@@ -1,0 +1,92 @@
+# AGAST #2449: a field of a deref of an address, `(*(@e)).f`.
+#
+# THE DEFECT (ritz1)
+#
+# `(*(@s)).x` and `(*(@v[1])).x` built on ritz0 but ritz1 refused them,
+# unlocated, with "unhandled EXPR_MEMBER": the member path resolved the
+# struct of a deref base `(*X).f` for a pointer-typed X, never for the
+# address-of `@e`.  `(*(q + 0)).x` already worked.
+#
+# Every struct has its probed field second, so a GEP at the wrong offset
+# reads `a`, not `x`.  Each case reads, stores and compound-stores.
+#
+# Oracle: same exit code under ritz0, ritz1 and ritz1_selfhosted.
+
+import ritzlib.gvec
+
+struct S
+    a: i32
+    x: i32
+
+struct Outer
+    pad: i64
+    s: S
+
+[[test]]
+fn test_deref_addr_local_member() -> i32
+    var s: S = S { a: 1, x: 4 }
+    assert (*(@s)).x == 4
+    (*(@&s)).x = 9
+    assert s.x == 9
+    (*(@&s)).x += 3
+    assert s.x == 12
+    assert s.a == 1
+    0
+
+[[test]]
+fn test_deref_addr_field_member() -> i32
+    var o: Outer = Outer { pad: 7, s: S { a: 1, x: 4 } }
+    assert (*(@o.s)).x == 4
+    (*(@&o.s)).x = 9
+    assert o.s.x == 9
+    assert o.s.a == 1
+    assert o.pad == 7
+    0
+
+[[test]]
+fn test_deref_addr_array_elem_member() -> i32
+    var arr: [3]S = [S { a: 1, x: 2 }, S { a: 3, x: 4 }, S { a: 5, x: 6 }]
+    assert (*(@arr[1])).x == 4
+    (*(@&arr[1])).x = 40
+    assert arr[1].x == 40
+    assert arr[1].a == 3
+    assert arr[2].x == 6
+    0
+
+[[test]]
+fn test_deref_addr_vec_elem_member() -> i32
+    var v = vec_new<S>()
+    v.push(S { a: 1, x: 2 })
+    v.push(S { a: 3, x: 4 })
+    v.push(S { a: 5, x: 6 })
+    assert (*(@v[1])).x == 4
+    (*(@&v[1])).x = 40
+    assert v[1].x == 40
+    (*(@&v[1])).x += 2
+    assert v[1].x == 42
+    assert v[1].a == 3
+    assert v[2].x == 6
+    0
+
+# The field's own width is loaded and stored (u8 and an i64 above 2^32), and
+# a chain continues past the first field.
+struct W
+    a: u8
+    b: u8
+    big: i64
+
+struct OW
+    pad: i64
+    w: W
+
+[[test]]
+fn test_deref_addr_member_width_and_chain() -> i32
+    var o: OW = OW { pad: 3, w: W { a: 200, b: 2, big: 5000000000 } }
+    assert (*(@o.w)).a as i64 == 200
+    assert (*(@o)).w.big == 5000000000
+    (*(@&o)).w.b = 9
+    (*(@&o.w)).big = 6000000000
+    assert o.w.b as i64 == 9
+    assert o.w.big == 6000000000
+    assert o.w.a as i64 == 200
+    0

@@ -908,8 +908,8 @@ BY_VALUE_REFUSED = {name: ALL.pop(name) for name in (
 RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
     "self_generic_bare": "AGAST #2318: bare `self:&` in a generic impl doesn't compile",
-    "control_move_only_deref_field": "AGAST #2317: `(*@t).id` is unhandled",
 }
+# control_move_only_deref_field, `(*@t).id`, was here until AGAST #2449.
 
 
 def _ritz1_params() -> list:
