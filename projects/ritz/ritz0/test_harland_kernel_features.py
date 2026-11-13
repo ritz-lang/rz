@@ -76,6 +76,12 @@ def main_ir(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+def apic_ir(tmp_path_factory):
+    # AP bring-up moved here from main.ritz (#2750).
+    return _compile(tmp_path_factory, "arch/x86_64/apic.ritz")
+
+
+@pytest.fixture(scope="module")
 def virtio_ir(tmp_path_factory):
     return _compile(tmp_path_factory, "drivers/virtio/common.ritz")
 
@@ -99,19 +105,20 @@ def test_sched_unlock_is_atomic_store(sched_ir):
     assert re.search(r'store atomic i32 \S+, i32\* @"scheduler_lock" seq_cst', body), body
 
 
-# --- main.ritz: AP bring-up counter and linker symbols ---------------------
+# --- main.ritz and arch/x86_64/apic.ritz: AP counter and linker symbols -----
 
-def test_ap_count_increment_is_atomic(main_ir):
-    body = _body(main_ir, "ap_entry")
+def test_ap_count_increment_is_atomic(apic_ir):
+    body = _body(apic_ir, "ap_entry")
     assert re.search(r'atomicrmw add i32\* @"ap_count", i32 \S+ seq_cst', body), body
 
 
-@pytest.mark.parametrize("sym", ["__bss_start", "__bss_end",
-                                 "ap_trampoline_start", "ap_trampoline_end"])
-def test_linker_symbols_are_extern_vars(main_ir, sym):
-    assert re.search(rf'^@"{sym}" = external global i8\b', main_ir, re.M), \
+@pytest.mark.parametrize("module,sym", [("main", "__bss_start"), ("main", "__bss_end"),
+                                        ("apic", "ap_trampoline_start"), ("apic", "ap_trampoline_end")])
+def test_linker_symbols_are_extern_vars(request, module, sym):
+    ir = request.getfixturevalue(f"{module}_ir")
+    assert re.search(rf'^@"{sym}" = external global i8\b', ir, re.M), \
         f"{sym} is not an `extern var NAME: u8`"
-    assert not re.search(rf'^declare [^\n]*@"{sym}"\(', main_ir, re.M), \
+    assert not re.search(rf'^declare [^\n]*@"{sym}"\(', ir, re.M), \
         f"{sym} is still declared as a function"
 
 
