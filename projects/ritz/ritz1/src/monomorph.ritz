@@ -1292,6 +1292,28 @@ fn si_base_struct(m: *Module, base: *Expr, out_len: *i32, out_mask: *i32) -> *u8
             return null
         name = f.field_type_name
         len = f.field_type_name_len
+    else if base.kind == EXPR_INDEX
+        # AGAST #2884: `lv[0][k]`, an element of a Vec or Span local (or of
+        # one behind a pointer) that's a struct by value: its type is the
+        # local's whole `$T` suffix.  `pv[0][k]` on a `Vec<*S>` names no
+        # struct here, and stays a raw buffer (#2887).
+        if base.left == null or base.left.kind != EXPR_IDENT or base.right == null or base.right.kind == EXPR_RANGE
+            return null
+        let eidx: i32 = find_local_var_idx(base.left.ident_ptr, base.left.ident_len)
+        if eidx < 0 or *(g_lv_prefix_kind + eidx) == 0 or *(g_lv_by_value + eidx) == 0
+            return null
+        let suf: *u8 = *(g_lv_suffixes + eidx)
+        let suf_len: i32 = *(g_lv_suffix_lens + eidx)
+        if suf == null or suf_len < 2 or *suf != 36   # '$'
+            return null
+        name = suf + 1
+        len = suf_len - 1
+        # A generic element (`Pair$i32`) or a nested collection isn't one name.
+        var d: i32 = 0
+        while d < len
+            if *(name + d) == 36
+                return null
+            d = d + 1
     else
         return null
     if name == null or len <= 0 or si_built_in(name, len) == 1 or si_is_struct(m, name, len) == 0
@@ -1333,6 +1355,18 @@ fn si_bracket_col(base: *Expr) -> i32
             return si_bracket_col(base.left) + 1 + base.ident_len
     base.span.col
 
+# Where `x`'s `[` is, `x` an index on a struct.  An element base (`lv[0][k]`,
+# #2884) has no name to count from: the parser's record of the second `[`.
+fn si_index_line(x: *Expr) -> i32
+    if x.left.kind == EXPR_INDEX and x.bracket.line > 0
+        return x.bracket.line
+    x.left.span.line
+
+fn si_index_col(x: *Expr) -> i32
+    if x.left.kind == EXPR_INDEX and x.bracket.line > 0
+        return x.bracket.col
+    si_bracket_col(x.left)
+
 # `e`, an index on a struct, as `*<call>` in place.
 fn si_into_deref(e: *Expr, call: *Expr)
     e.kind = EXPR_UNARY
@@ -1359,7 +1393,7 @@ fn rewrite_struct_index(m: *Module, e: *Expr)
     let name: *u8 = si_base_struct(m, x.left, @len, @mask)
     if name == null
         return
-    if si_check(x.left.span.line, si_bracket_col(x.left), name, len, mask, use) == 0
+    if si_check(si_index_line(x), si_index_col(x), name, len, mask, use) == 0
         return
     if use == SI_USE_ADDR_MUT and si_refuse_shared_write(m, x.left) == 1
         return
@@ -1534,7 +1568,7 @@ fn rewrite_struct_index_stmt(m: *Module, s: *Stmt)
         if t.right == null or t.right.kind == EXPR_RANGE
             return
         let key: *Expr = t.right
-        if si_rewrite_assign(m, s, t.left, key, v, compound, t.left.span.line, si_bracket_col(t.left)) == 1
+        if si_rewrite_assign(m, s, t.left, key, v, compound, si_index_line(t), si_index_col(t)) == 1
             collect_from_expr(m, key)
         return
     if t.kind != EXPR_MEMBER
@@ -1549,7 +1583,7 @@ fn rewrite_struct_index_stmt(m: *Module, s: *Stmt)
     let name: *u8 = si_base_struct(m, root.left, @len, @mask)
     if name == null
         return
-    if si_check(root.left.span.line, si_bracket_col(root.left), name, len, mask, SI_USE_FIELD_STORE) == 0
+    if si_check(si_index_line(root), si_index_col(root), name, len, mask, SI_USE_FIELD_STORE) == 0
         return
     if si_refuse_shared_write(m, root.left) == 1
         return

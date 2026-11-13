@@ -234,13 +234,9 @@ def test_a_borrow_derefs_to_its_vec(run_with, compiler):
 
 
 # An element that implements `Index` (§7.8) isn't one of these: `lv[0][1]` reads
-# through it.  ritz1's monomorph rewrites `m[k]` only on a name or a field (#2884).
-WITH_INDEX = ["ritz0"] + [pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#2884"))
-                          for c in ("ritz1", "ritz1_selfhosted")]
-
-
+# through it, as `*lv[0].index(1)` (#2884).
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", WITH_INDEX)
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_an_element_with_index_reads_through_it(run_with, compiler):
     program = f"""\
 {HEADER}struct L
