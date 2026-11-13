@@ -67,6 +67,12 @@ REFUSED = {
     "moved_before": ("pub fn main() -> i32\n    let a = Noisy { id: 1 }\n"
                      "    defer note(a.id)\n    consume(a)\n    0\n",
                      f"{L + 1}:5", "`a` may be moved before the deferred statement runs"),
+    # AGAST #2810: a deferred move of an outer binding, run on `continue`,
+    # reaches the loop head moved, so the next pass's defer finds it gone.
+    "moved_on_continue": ("pub fn main() -> i32\n    let a = Noisy { id: 1 }\n"
+                          "    for i in 0..2\n        defer consume(a)\n"
+                          "        continue\n    0\n",
+                          f"{L + 2}:9", "`a` may be moved before the deferred statement runs"),
 }
 
 # name: (program after HEAD, main's exit code). main returns `log`'s low digits.
@@ -80,6 +86,12 @@ RUNS = {
     "deferred_move": ("pub fn go() -> i32\n    let a = Noisy { id: 1 }\n"
                       "    defer consume(a)\n    note(2)\n    0\n\n"
                       "pub fn main() -> i32\n    go()\n    log as i32\n", 251),
+    # AGAST #2810: a `return` expression's temporaries drop before the
+    # defers run (§13.6 then §13.7): the temporary's 2, then the defer's 1.
+    "return_temp_first": ("fn mk(id: i64) -> Noisy\n    Noisy { id: id }\n\n"
+                          "pub fn go() -> i64\n    defer note(1)\n"
+                          "    return mk(2).id\n\n"
+                          "pub fn main() -> i32\n    go()\n    log as i32\n", 21),
 }
 
 

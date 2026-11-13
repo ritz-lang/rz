@@ -114,7 +114,8 @@ const OWN_EV_INTS: i32 = 9
 # f = fshadow before.
 const OWN_EV_SAVE: i32 = 1
 # A use while shadowed: a = 1 for a borrow + 2 when the whole binding was
-# shadowed, c:d = where, e = the paths it would be using moved (fshadow bits).
+# shadowed, c:d = where, e = the paths it would be using moved (fshadow bits),
+# b:f = the `defer` it is in (0:0 for none), where it is reported (#2810).
 const OWN_EV_USE: i32 = 2
 # `continue` / `break` with it (partly) moved: b = moved, c:d = the move,
 # e = fmoved.
@@ -890,6 +891,10 @@ fn own_ev_find(o: *OwnState, kind: i32, slot: i32, depth: i32) -> *i32
 # (`head`: [moved, line, col, fmoved]).  Returns 1 if it was an error.
 fn own_report_loop_use(s: *EmitterState, ev: *i32, b: *OwnBinding, head: *i32) -> i32
     let borrow: i32 = ev[3] & 1
+    if ev[4] != 0 and (((ev[3] & 2) != 0 and head[0] == 1) or (head[3] & ev[7]) != 0)
+        # In a deferred statement: reported at the `defer` (AGAST #2810).
+        own_error_defer_at(s, ev[4], ev[8], b)
+        return 1
     if (ev[3] & 2) != 0 and head[0] == 1
         if borrow == 1
             own_error_borrow_at(s, ev[5], ev[6], b)
@@ -1028,6 +1033,17 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
         return
     if own_scope_is_dead(o) == 1
         return
+    # AGAST #1625: the body's deferred statements run first, and (#2810) what
+    # they move reaches the head / the loop's exit moved.  What follows the
+    # jump is unreachable from here, so their moves don't stay.
+    let ld: *i32 = o.loop_dstart
+    let dbase: i32 = ld[o.loop_depth]
+    var snap: *i32 = null
+    if o.defer_count > dbase
+        snap = own_snapshot(s)
+        own_unwind(s, o.loop_base, dbase)
+    else if o.live_count > o.loop_base
+        own_drop_from(s, o.loop_base)
     var kind: i32 = OWN_EV_BREAK
     if is_continue == 1
         kind = OWN_EV_HEAD
@@ -1045,20 +1061,9 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
                     ev[6] = b.move_col
                 ev[7] = ev[7] | b.fmoved
         i += 1
-    let ld: *i32 = o.loop_dstart
-    let dbase: i32 = ld[o.loop_depth]
-    if o.defer_count > dbase
-        # AGAST #1625: the body's deferred statements run too.  What follows
-        # the jump is unreachable from here, so their moves don't stay.
-        let snap: *i32 = own_snapshot(s)
-        own_unwind(s, o.loop_base, dbase)
+    if snap != null
         own_restore(s, snap)
-        if snap != null
-            free(snap as *u8)
-        return
-    if o.live_count <= o.loop_base
-        return
-    own_drop_from(s, o.loop_base)
+        free(snap as *u8)
 
 # =============================================================================
 # Temporaries (AGAST #2165)
@@ -1408,12 +1413,15 @@ fn own_error_in_defer(s: *EmitterState, b: *OwnBinding) -> i32
     let d: *Stmt = o.cur_defer
     if d == null
         return 0
-    own_eprint_loc(d.span.line, d.span.col)
+    own_error_defer_at(s, d.span.line, d.span.col, b)
+    1
+
+fn own_error_defer_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding)
+    own_eprint_loc(line, col)
     eprints_cstr(c": error: `")
     own_eprint_name(b.name, b.name_len)
     eprints_cstr(c"` may be moved before the deferred statement runs\n")
     s.error_count = s.error_count + 1
-    1
 
 fn own_error_use_at(s: *EmitterState, line: i32, col: i32, b: *OwnBinding, move_line: i32, move_col: i32)
     if own_error_in_defer(s, b) == 1
@@ -1520,6 +1528,16 @@ pub fn own_check_lent_read(s: *EmitterState, e: *Expr, name: *u8, len: i32)
 fn own_error_borrow(s: *EmitterState, e: *Expr, b: *OwnBinding)
     own_error_borrow_at(s, e.span.line, e.span.col, b)
 
+# Record a use while shadowed (OWN_EV_USE), with the `defer` it is in.
+fn own_note_use_ev(o: *OwnState, slot: i32, a: i32, line: i32, col: i32, fs: i32)
+    var dl: i32 = 0
+    var dc: i32 = 0
+    let d: *Stmt = o.cur_defer
+    if d != null
+        dl = d.span.line
+        dc = d.span.col
+    own_ev_push(o, OWN_EV_USE, slot, a, dl, line, col, fs, dc)
+
 # A use of an unmoved binding inside a loop: if the binding is shadowed (it
 # would be moved here had the loop head been reached with it moved), record
 # the use for own_loop_exit.
@@ -1529,7 +1547,7 @@ fn own_note_use(s: *EmitterState, b: *OwnBinding, line: i32, col: i32, borrow: i
         return
     let fs: i32 = b.fshadow & (OWN_ALL_PATHS ^ b.fmoved)
     if b.shadow == 1 or fs != 0
-        own_ev_push(o, OWN_EV_USE, b.slot, borrow + b.shadow * 2, 0, line, col, fs, 0)
+        own_note_use_ev(o, b.slot, borrow + b.shadow * 2, line, col, fs)
 
 # A use of the paths `bits` only (AGAST #2168).
 fn own_note_field_use(s: *EmitterState, b: *OwnBinding, bits: i32, line: i32, col: i32)
@@ -1538,7 +1556,7 @@ fn own_note_field_use(s: *EmitterState, b: *OwnBinding, bits: i32, line: i32, co
         return
     let fs: i32 = b.fshadow & bits
     if b.shadow == 1 or fs != 0
-        own_ev_push(o, OWN_EV_USE, b.slot, b.shadow * 2, 0, line, col, fs, 0)
+        own_note_use_ev(o, b.slot, b.shadow * 2, line, col, fs)
 
 # The binding a field / element store `x.f = v`, `x[i] = v` writes into is
 # used as a place: an error if it was moved, but not if one of its fields
@@ -1549,7 +1567,7 @@ fn own_note_place_use(s: *EmitterState, b: *OwnBinding, line: i32, col: i32)
         return
     let o: *OwnState = s.own
     if o.loop_depth > 0 and b.shadow == 1
-        own_ev_push(o, OWN_EV_USE, b.slot, 2, 0, line, col, 0, 0)
+        own_note_use_ev(o, b.slot, 2, line, col, 0)
 
 # AGAST #2242: the paths a use of `path` overlaps: it and its parents, and
 # with `exact` 0 no more, as that names a field of `path` no path covers, so
@@ -2747,6 +2765,9 @@ fn own_unwind(s: *EmitterState, from: i32, dfrom: i32)
 # block is being left, so run them all, innermost first, with the drops
 # they interleave with (own_end_fn's drops then find those flags clear).
 # What follows a `ret` is unreachable from it, so the moves don't stay.
+# The live temporaries (the `return` / `?` / tail expression's) drop first,
+# as ritz0 drops the statement's temp frames before its defers (AGAST #2810,
+# §13.6 then §13.7); their flags clear, so the `ret`'s drops skip them.
 pub fn own_before_ret(s: *EmitterState)
     let o: *OwnState = s.own
     if o.in_ret == 1 or o.defer_count == 0
@@ -2754,6 +2775,10 @@ pub fn own_before_ret(s: *EmitterState)
     if own_scope_is_dead(o) == 1
         return
     o.in_ret = 1
+    var t: i32 = o.temp_count - 1
+    while t >= 0
+        own_emit_drop(s, own_temp_at(o, t))
+        t -= 1
     let snap: *i32 = own_snapshot(s)
     own_unwind(s, 0, 0)
     own_restore(s, snap)
