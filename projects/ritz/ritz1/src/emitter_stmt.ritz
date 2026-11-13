@@ -67,6 +67,69 @@ fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt) -> i32
     stmt.var_inner_pointee_type = src.inner_pointee_type
     1
 
+# AGAST #2960: the struct a `ptr`-valued if / match arm points at, or null:
+# `@&x` with x a struct (or `:&` struct) local, `@&a.b` a struct field, an
+# `@&S` local, or a nested if / match all of whose value arms name one S.
+fn ptr_arm_struct(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if e == null
+        return null
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        return ptr_arms_struct(s, e.args as *MatchArm, out_len)
+    if e.kind == EXPR_IDENT
+        let rl: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if rl == null or rl.var_type != TYPE_MUT_REF or rl.pointee_type != TYPE_STRUCT or rl.type_name_len == 0
+            return null
+        *out_len = rl.type_name_len
+        return rl.type_name
+    if e.kind != EXPR_UNARY or e.op != OP_ADDR_MUT or e.operand == null
+        return null
+    let o: *Expr = e.operand
+    if o.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, o.ident_ptr, o.ident_len)
+        if loc == null or loc.type_name_len == 0
+            return null
+        if loc.var_type != TYPE_STRUCT and lent_struct_local(s, o) == null
+            return null
+        *out_len = loc.type_name_len
+        return loc.type_name
+    if o.kind == EXPR_MEMBER
+        let f: *StructField = resolve_member_chain_field(s, o)
+        if f == null or f.field_type != TYPE_STRUCT or f.field_type_name_len == 0
+            return null
+        *out_len = f.field_type_name_len
+        return f.field_type_name
+    null
+
+# AGAST #2960: the one struct every value arm of `arms` points at, or null.
+fn ptr_arms_struct(s: *EmitterState, arms: *MatchArm, out_len: *i32) -> *u8
+    var name: *u8 = null
+    var len: i32 = 0
+    var a: *MatchArm = arms
+    while a != null
+        if a.is_pass == 0 and a.body != null
+            var alen: i32 = 0
+            let an: *u8 = ptr_arm_struct(s, a.body, @alen)
+            if an == null or (name != null and name_eq(name, len, an, alen) == 0)
+                *out_len = 0
+                return null
+            name = an
+            len = alen
+        a = a.next
+    *out_len = len
+    name
+
+# AGAST #2960: an un-annotated `let p = if … @&c else @&c` (or match) holds
+# what `let p: @&C = …` does: an `@&C` slot, the `ptr` phi stored as is, so
+# `p.x` reaches C.  Asked before the arms are emitted, in the let's scope, as
+# arms_ptr_valued is.  It stayed an i64 with no name: `p.x = 3` was
+# "unhandled EXPR_MEMBER".  Returns the struct's name, or null.
+fn ptr_phi_let_struct(s: *EmitterState, init: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if arms_ptr_valued(s, init.args as *MatchArm) == 0
+        return null
+    ptr_arms_struct(s, init.args as *MatchArm, out_len)
+
 # AGAST #2532: `let r = @q` with `q: *T` or `**T`, T a scalar, holds what
 # `let r: **T` / `***T` does, as #2376 types `let r = @a[i]`.  It was an i64,
 # so `**r` loaded and stored 8 bytes and `*r + 1` strode by one.
@@ -951,6 +1014,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             # enum they name, not the no-enum zero.
             var arms_enum: *u8 = null
             var arms_enum_len: i32 = 0
+            var ptr_phi_len: i32 = 0
+            let ptr_phi_name: *u8 = ptr_phi_let_struct(s, stmt.var_init, @ptr_phi_len)   # AGAST #2960
             let arms: i32 = infer_ctor_arms(s, stmt, @arms_enum, @arms_enum_len)
             if arms == 1
                 pre_init_reg = emit_ctor_scrutinee(s, stmt.var_init, arms_enum, arms_enum_len)
@@ -969,6 +1034,13 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 # `Some(x) => x` over Option<f64>: a `double` slot.
                 var_type = s.last_match_float_ty
                 stmt.var_type = var_type
+            else if ptr_phi_name != null and arms == 0
+                # AGAST #2960: a `ptr` phi of `@&C` arms is an `@&C` slot.
+                var_type = TYPE_MUT_REF
+                stmt.var_type = TYPE_MUT_REF
+                stmt.var_type_name = ptr_phi_name
+                stmt.var_type_name_len = ptr_phi_len
+                stmt.var_pointee_type = TYPE_STRUCT
 
     if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and pre_emitted == 0
         if infer_ctor_let(s, stmt) == 1

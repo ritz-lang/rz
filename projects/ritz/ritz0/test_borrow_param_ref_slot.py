@@ -911,6 +911,65 @@ pub fn main() -> i32
     let q: *C = raw(@&c, 1)
     return q.x
 """,
+    # AGAST #2960: an un-annotated `let` of an all-`@&x` if / match holds an
+    # `@&C`, as `let p = @&c` does, so `p.x` reaches C.
+    "untyped_let_if": TYPES + """\
+fn go(c:& C, k: i32)
+    let p = if k == 0
+        @&c
+    else
+        @&c
+    p.x = p.x + 1
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    go(@&c, 0)
+    go(@&c, 1)
+    return c.x
+""",
+    "untyped_let_match": TYPES + """\
+fn go(c:& C, k: i32)
+    let p = match k
+        0 => @&c
+        _ => @&c
+    p.x = p.x + 1
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    go(@&c, 0)
+    go(@&c, 1)
+    return c.x
+""",
+    "untyped_let_if_locals": TYPES + """\
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    var d: C = C { x: 1, y: 0 }
+    let k: i32 = 1
+    let p = if k == 0
+        @&c
+    else
+        @&d
+    p.x = 2
+    return c.x + d.x
+""",
+    "untyped_let_if_field_and_ref": TYPES + """\
+struct W
+    c: C
+
+fn go(w:& W, r: @&C, k: i32)
+    let p = if k == 0
+        @&w.c
+    else
+        r
+    p.x = p.x + 1
+
+pub fn main() -> i32
+    var w: W = W { c: C { x: 1, y: 0 } }
+    var d: C = C { x: 1, y: 0 }
+    go(@&w, @&d, 0)
+    go(@&w, @&d, 1)
+    return w.c.x + d.x - 1
+""",
     "deref_let_if": TYPES + """\
 fn f(r: @C, k: i32) -> i32
     let d: C = if k == 0
