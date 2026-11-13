@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 import ritz_ast as rast
 from monomorph import Monomorphizer, TypeSubstitution, monomorphize
 from parser import parse
@@ -185,7 +187,7 @@ def test_ritz0_tuple_generic_param_runs(tmp_path):
     assert comp.returncode == 0 and ll.exists(), comp.stderr[-2000:]
     assert '{i8, i32}' not in ll.read_text()
     exe = tmp_path / "first"
-    link = subprocess.run(["clang", str(ll), "-o", str(exe), "-nostdlib"],
+    link = fast_link.clang(["clang", str(ll), "-o", str(exe), "-nostdlib"],
                           capture_output=True, text=True)
     assert link.returncode == 0, link.stderr[-2000:]
     assert subprocess.run([str(exe)], timeout=60).returncode == 5

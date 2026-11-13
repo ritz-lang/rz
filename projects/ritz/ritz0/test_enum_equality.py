@@ -38,6 +38,8 @@ import sys
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 # Every test compiles with ritz0 (AGAST #1805).
@@ -156,7 +158,7 @@ def test_enum_equality_discriminates(tmp_path):
     exe = tmp_path / "disc"
     # -nostdlib matches build.py: ritz0 emits its own `_start` and makes raw
     # syscalls, so linking against crt1.o would double-define the entry point.
-    link = subprocess.run(
+    link = fast_link.clang(
         ["clang", str(tmp_path / "disc.ll"), "-o", str(exe), "-nostdlib"],
         capture_output=True, text=True)
     assert link.returncode == 0, (

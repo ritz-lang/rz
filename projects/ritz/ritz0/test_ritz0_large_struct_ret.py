@@ -42,6 +42,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ0_DIR = Path(__file__).resolve().parent
@@ -350,7 +352,7 @@ def test_sret_is_abi_compatible_with_first_class_return(tmp_path):
     fc_ll.write_text(FIRST_CLASS_IR)
     objs = [_o2_object(ritz_ll), _o2_object(fc_ll)]
     exe = tmp_path / "interop"
-    link = subprocess.run(
+    link = fast_link.clang(
         ["clang", "-nostdlib", "-o", str(exe), *map(str, objs)],
         capture_output=True, text=True, timeout=120)
     assert link.returncode == 0, link.stderr[-2000:]

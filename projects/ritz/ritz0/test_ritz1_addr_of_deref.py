@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ref_rules import ADDR_INTO_VALUE
 from ritz0_inproc import run_ritz0
 
@@ -281,7 +283,7 @@ def _run(compiler: str, ritz1_bin, tmp_path: Path, name: str, program: str) -> i
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler == "ritz1":
         link_cmd.insert(2, str(RITZ_START))
-    link = subprocess.run(link_cmd, cwd=work, capture_output=True, text=True)
+    link = fast_link.clang(link_cmd, cwd=work, capture_output=True, text=True)
     assert link.returncode == 0, (
         f"{compiler} emitted IR that would not link for {name}:\n{link.stderr[-2000:]}"
     )

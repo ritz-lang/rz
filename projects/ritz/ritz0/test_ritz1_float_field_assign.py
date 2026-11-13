@@ -18,6 +18,7 @@ field is fptrunc'd.
 import re
 import subprocess
 
+import fast_link
 import pytest
 
 SHAPE = """\
@@ -94,7 +95,7 @@ def test_float_field_assign_ir_stores_field_width(ritz1_bin, tmp_path, elem, llv
         if elem == "f32" and name in LITERAL_FNS:
             # The f64 literal is narrowed for an f32 field.
             assert "fptrunc double" in body, (name, body)
-    proc = subprocess.run(
+    proc = fast_link.clang(
         ["clang", "-c", str(ll), "-o", str(tmp_path / "o.o")],
         capture_output=True,
         text=True,

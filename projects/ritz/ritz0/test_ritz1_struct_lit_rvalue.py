@@ -33,6 +33,8 @@ import subprocess
 
 import pytest
 
+import fast_link
+
 from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run, _run_pkg
 
 # --- function / method arguments -------------------------------------------
@@ -409,7 +411,7 @@ def test_ritz1_compiles_ritzlib_lang_tokens(ritz1_bin, tmp_path):
         f"{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
     )
     # The IR must also be valid, not merely emitted.
-    obj = subprocess.run(
+    obj = fast_link.clang(
         ["clang", "-c", str(out), "-o", str(tmp_path / "tokens.o")],
         capture_output=True,
         text=True,

@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -272,7 +274,7 @@ def test_what_the_rule_leaves_alone_still_runs(request, tmp_path, compiler, name
     link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         link.insert(3, str(RITZ_START))
-    subprocess.run(link, check=True)
+    fast_link.clang(link, check=True)
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 
 

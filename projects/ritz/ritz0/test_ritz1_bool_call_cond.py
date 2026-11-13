@@ -49,6 +49,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -196,7 +198,7 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler == "ritz1":
         link_cmd.insert(2, str(RITZ_START))
-    link = subprocess.run(link_cmd, cwd=tmp_path, capture_output=True, text=True)
+    link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     # This is where #1367 lands: the module is rejected as invalid IR, naming
     # the branch operand. Surface that message rather than a bare exit code.
     assert link.returncode == 0, (

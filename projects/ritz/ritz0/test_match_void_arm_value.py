@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -285,8 +287,8 @@ def test_statement_and_diverging_forms_stay_legal(
         request, tmp_path, compiler, name):
     rc, output, ll = _compile(compiler, request, tmp_path, HEADER + LEGAL[name])
     assert rc == 0 and ll.exists(), output
-    cc = subprocess.run(
-        ["clang", "-w", "-c", "-x", "ir", str(ll), "-o", str(tmp_path / "unit.o")],
+    cc = fast_link.clang(
+        ["clang", "-w", "-c", str(ll), "-o", str(tmp_path / "unit.o")],
         capture_output=True, text=True, timeout=300,
     )
     assert cc.returncode == 0, cc.stderr[-2000:]

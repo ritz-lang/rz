@@ -13,6 +13,7 @@ import re
 import subprocess
 from pathlib import Path
 
+import fast_link
 import pytest
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -89,8 +90,8 @@ def _compile(ritz1_bin: Path, tmp_path: Path, name: str, program: str) -> str:
     assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
     # clang accepts the module (it rejected `%.0` before the fix).
     obj = tmp_path / f"{name}.o"
-    cc = subprocess.run(
-        ["clang", "-c", "-x", "ir", str(ll), "-o", str(obj)],
+    cc = fast_link.clang(
+        ["clang", "-c", str(ll), "-o", str(obj)],
         capture_output=True, text=True,
     )
     assert cc.returncode == 0, cc.stderr[-2000:]

@@ -26,6 +26,7 @@ the exit code is compared against ritz0's (the acceptance criterion).
 import subprocess
 from pathlib import Path
 
+import fast_link
 import pytest
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -142,7 +143,7 @@ def _ritz1_run(tmp_path: Path, name: str, program: str, ritz_start: Path) -> int
         f"ritz1 failed on {name}:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
     )
     exe = tmp_path / f"{name}.r1"
-    link = subprocess.run(
+    link = fast_link.clang(
         [
             "clang",
             "-nostdlib",

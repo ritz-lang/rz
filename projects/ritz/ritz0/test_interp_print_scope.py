@@ -28,6 +28,8 @@ import subprocess
 
 import pytest
 
+import fast_link
+
 from test_ritz1_builtin_struct_shadow import RITZ_START
 from test_ritz1_print_interpolation import _compile
 
@@ -45,7 +47,7 @@ def _run(compiler, tmp_path, name, program):
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler == "ritz1":
         link_cmd.insert(2, str(RITZ_START))
-    link = subprocess.run(link_cmd, cwd=tmp_path, capture_output=True, text=True)
+    link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler} IR would not link:\n{link.stderr[-2000:]}"
     run = subprocess.run([str(exe)], capture_output=True, timeout=60)
     assert run.returncode == 0, f"{compiler} binary for {name} exited {run.returncode}"

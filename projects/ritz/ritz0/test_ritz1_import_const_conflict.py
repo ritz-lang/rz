@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -93,7 +95,7 @@ def _run_ritz1(compiler, tmp_path):
         assert proc.returncode == 0 and ll.exists(), f"{compiler} rejected {name}:\n{out}"
         objs.append(str(ll))
     exe = tmp_path / f"t_{compiler}"
-    link = subprocess.run(["clang", "-Wno-override-module", *objs, "-o", str(exe),
+    link = fast_link.clang(["clang", "-Wno-override-module", *objs, "-o", str(exe),
                            "-nostdlib", "-no-pie"], capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler}: link failed:\n{link.stderr[-3000:]}"
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode

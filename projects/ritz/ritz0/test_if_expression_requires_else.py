@@ -72,6 +72,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -103,7 +105,7 @@ def _run(tmp_path, source):
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     proc = run_ritz0([str(src), "-o", str(ll)], env=env, timeout=300)
     assert proc.returncode == 0, f"compile failed:\n{proc.stdout}{proc.stderr}"
-    link = subprocess.run(
+    link = fast_link.clang(
         ["clang", "-w", "-O0", "-nostdlib", str(ll), "-o", str(exe)],
         capture_output=True, text=True, timeout=300,
     )

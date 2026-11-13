@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -162,7 +164,7 @@ def test_links_against_definition(compiler, tmp_path):
            "-o", str(exe), "-nostdlib", "-no-pie"]
     if compiler != "ritz0":
         cmd.insert(1, str(RITZ_START))
-    link = subprocess.run(cmd, capture_output=True, text=True)
+    link = fast_link.clang(cmd, capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler} did not link:\n{link.stderr[-2000:]}"
     run = subprocess.run([str(exe)], capture_output=True, timeout=60)
     assert run.returncode == EXPECTED_EXIT

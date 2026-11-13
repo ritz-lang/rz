@@ -24,6 +24,8 @@ import subprocess
 
 import pytest
 
+import fast_link
+
 from test_ritz1_builtin_struct_shadow import _run
 
 SHAPE = """\
@@ -74,7 +76,7 @@ def test_ptr_float_index_ir_uses_float_elements(ritz1_bin, tmp_path, elem, llvm)
     if elem == "f32":
         # The f64 literal is narrowed for an f32 slot.
         assert "fptrunc double" in lit, lit
-    proc = subprocess.run(
+    proc = fast_link.clang(
         ["clang", "-c", str(ll), "-o", str(tmp_path / "o.o")],
         capture_output=True,
         text=True,

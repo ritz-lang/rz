@@ -34,6 +34,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 pytestmark = pytest.mark.integration
@@ -94,7 +96,7 @@ def _run(tmp_path, body):
     assert comp.returncode == 0 and ll.exists(), (
         f"ritz0 failed to compile:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}")
     exe = tmp_path / "main"
-    link = subprocess.run(["clang", str(ll), "-o", str(exe), "-nostdlib"],
+    link = fast_link.clang(["clang", str(ll), "-o", str(exe), "-nostdlib"],
                           cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, link.stderr[-2000:]
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode

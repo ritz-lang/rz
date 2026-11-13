@@ -16,6 +16,7 @@ f64 value stored into an f32 element is fptrunc'd.
 import re
 import subprocess
 
+import fast_link
 import pytest
 
 SHAPE = """\
@@ -68,7 +69,7 @@ def test_global_float_array_ir_uses_float_elements(ritz1_bin, tmp_path, elem, ll
     if elem == "f32":
         # The f64 literal is narrowed for an f32 slot.
         assert "fptrunc double" in lit, lit
-    proc = subprocess.run(
+    proc = fast_link.clang(
         ["clang", "-c", str(ll), "-o", str(tmp_path / "o.o")],
         capture_output=True,
         text=True,

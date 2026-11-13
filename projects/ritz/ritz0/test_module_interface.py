@@ -28,6 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import fast_link
 import pytest
 
 RITZ0_DIR = Path(__file__).resolve().parent
@@ -37,7 +38,6 @@ sys.path.insert(0, str(RITZ_DIR))
 
 import module_interface as mi  # noqa: E402
 import ritz_ast as rast  # noqa: E402
-
 
 LIB = """\
 pub struct Pair
@@ -438,7 +438,7 @@ class TestRitz1Compiler:
             "import lib\n\nfn main() -> i32\n    (make() - 1) as i32\n")
         ll = tmp_path / "main.ll"
         _ritz1(d / "main.ritz", ll)
-        cc = subprocess.run(["clang", "-c", "-x", "ir", str(ll), "-o",
+        cc = fast_link.clang(["clang", "-c", str(ll), "-o",
                              str(tmp_path / "main.o")], capture_output=True, text=True)
         assert cc.returncode == 0, cc.stderr
 

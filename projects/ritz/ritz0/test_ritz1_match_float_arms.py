@@ -20,6 +20,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import fast_link
 import pytest
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -102,7 +103,7 @@ def test_annotated_int_arm_is_converted(ritz1_bin, tmp_path):
     comp, ll = _compile(ritz1_bin, tmp_path, "annotated_int", ANNOTATED_INT_ARM)
     assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
     exe = tmp_path / "annotated_int"
-    link = subprocess.run(
+    link = fast_link.clang(
         ["clang", str(RITZ_START), str(ll), "-o", str(exe), "-nostdlib"],
         cwd=tmp_path, capture_output=True, text=True,
     )

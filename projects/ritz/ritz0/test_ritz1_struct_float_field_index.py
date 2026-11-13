@@ -18,6 +18,7 @@ into an f32 slot is fptrunc'd.
 import re
 import subprocess
 
+import fast_link
 import pytest
 
 SHAPE = """\
@@ -81,7 +82,7 @@ def test_struct_float_field_index_ir(ritz1_bin, tmp_path, elem, llvm):
     if elem == "f32":
         # The f64 literal is narrowed for an f32 slot.
         assert "fptrunc double" in lit, lit
-    proc = subprocess.run(
+    proc = fast_link.clang(
         ["clang", "-c", str(ll), "-o", str(tmp_path / "o.o")],
         capture_output=True,
         text=True,

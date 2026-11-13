@@ -27,6 +27,8 @@ import subprocess
 
 import pytest
 
+import fast_link
+
 from test_ritz1_builtin_struct_shadow import _run
 
 # The callee only receives the pointer; indexing through a `*f32` / `*f64`
@@ -74,7 +76,7 @@ def test_local_float_array_ir_uses_float_elements(ritz1_bin, tmp_path, elem, llv
     if elem == "f32":
         # f64 literals are narrowed for an f32 element.
         assert "fptrunc double" in main_ir
-    proc = subprocess.run(["clang", "-c", str(ll), "-o", str(tmp_path / "o.o")],
+    proc = fast_link.clang(["clang", "-c", str(ll), "-o", str(tmp_path / "o.o")],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
 

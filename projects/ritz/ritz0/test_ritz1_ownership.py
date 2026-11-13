@@ -21,6 +21,8 @@ import re
 
 import pytest
 
+import fast_link
+
 from test_ownership_free_count import PRELUDE, SLOT, _compile, RITZ_START
 
 RITZ1S = ("ritz1", "ritz1_selfhosted")
@@ -915,7 +917,7 @@ def test_ritz1_drop_count(request, tmp_path, compiler, name):
         f"{compiler} failed to compile:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
     )
     exe = tmp_path / "main"
-    link = subprocess.run(["clang", str(RITZ_START), str(ll), "-o", str(exe), "-nostdlib"],
+    link = fast_link.clang(["clang", str(RITZ_START), str(ll), "-o", str(exe), "-nostdlib"],
                           cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler}: link failed:\n{link.stderr[-2000:]}"
     rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode

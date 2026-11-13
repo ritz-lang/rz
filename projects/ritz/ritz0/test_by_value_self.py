@@ -18,6 +18,8 @@ import subprocess
 
 import pytest
 
+import fast_link
+
 from ref_rules import DROP_BY_VALUE
 from test_ref_into_value import COMPILERS, RITZ1_BUILD, RITZ_ROOT, RITZ_START, _compile, _run
 
@@ -413,7 +415,7 @@ def test_an_imported_method_is_declared_as_it_is_defined(compiler, tmp_path):
         built = subprocess.run([str(binary), f"{name}.ritz", "-o", f"{name}.ll"], cwd=tmp_path, env=env,
                                capture_output=True, text=True)
         assert built.returncode == 0, built.stderr
-    link = subprocess.run(["clang", "-Wno-override-module", str(RITZ_START), "main.ll", "lib.ll", "-o", "m",
+    link = fast_link.clang(["clang", "-Wno-override-module", str(RITZ_START), "main.ll", "lib.ll", "-o", "m",
                            "-nostdlib", "-no-pie"], cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, link.stderr
     assert subprocess.run([str(tmp_path / "m")]).returncode == 21

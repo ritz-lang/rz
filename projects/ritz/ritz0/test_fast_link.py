@@ -169,8 +169,18 @@ def test_check_raises_like_subprocess(tmp_path):
                         check=True, capture_output=True)
 
 
-@pytest.mark.parametrize("extra", [["-O2"], ["-march=native"], ["-lc"], ["-g"], ["x.c"]],
-                         ids=["opt", "march", "lib", "debug", "c_source"])
+def test_explicit_O0_links_fast(tmp_path):
+    """-O0 is clang's default and the helper's own level: the same link (#2808)."""
+    ll = _ritz0_ll(tmp_path)
+    exe = tmp_path / "o0"
+    before = _counts()
+    fast_link.clang(["clang", "-w", "-O0", str(ll), "-o", str(exe), "-nostdlib"], check=True)
+    assert _delta(before) == {"fast": 1, "fallback": 0}
+    assert subprocess.run([str(exe)]).returncode == 42
+
+
+@pytest.mark.parametrize("extra", [["-O2"], ["-O1"], ["-march=native"], ["-lc"], ["-g"], ["x.c"]],
+                         ids=["opt", "opt1", "march", "lib", "debug", "c_source"])
 def test_anything_else_goes_to_clang(tmp_path, extra):
     ll = _ritz0_ll(tmp_path)
     (tmp_path / "x.c").write_text("int helper(void) { return 0; }\n")

@@ -20,6 +20,8 @@ import subprocess
 
 import pytest
 
+import fast_link
+
 import test_ritz1_for_iterable as _for_iterable
 from test_ritz1_for_header import RITZ_START, _emit, _objects
 from test_ritz1_for_iterable import COMPILERS, MAIN, SCALARS, _fill, _walk
@@ -163,5 +165,5 @@ def test_a_borrowed_ritzlib_vec(ritz1_bin, tmp_path, compiler, op):
     cmd = ["clang", "-w", str(ll), *_objects(compiler, ritz1_bin), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         cmd.insert(2, str(RITZ_START))
-    subprocess.run(cmd, check=True)
+    fast_link.clang(cmd, check=True)
     assert subprocess.run([str(exe)], timeout=60).returncode == 7

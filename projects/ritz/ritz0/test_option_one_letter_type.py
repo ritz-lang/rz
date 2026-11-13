@@ -20,6 +20,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import fast_link
 import pytest
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -76,7 +77,7 @@ def test_ritz1_declares_option_over_a_one_letter_type(request, tmp_path, compile
     proc, ll = _compile(request, compiler, tmp_path, source)
     assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-800:]}"
     exe = tmp_path / "unit"
-    cc = subprocess.run(["clang", "-w", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
+    cc = fast_link.clang(["clang", "-w", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
                         capture_output=True, text=True)
     assert cc.returncode == 0, f"{compiler}, {name}: clang rejected the IR:\n{cc.stderr[-800:]}"
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"

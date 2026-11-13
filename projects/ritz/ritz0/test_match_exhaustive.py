@@ -22,6 +22,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import fast_link
+
 import match_coverage
 import parser as ritz_parser
 from ritz0_inproc import run_ritz0
@@ -522,7 +524,7 @@ def _assert_runs(request, compiler, tmp_path, name, entry):
     link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         link.insert(2, str(RITZ_START))
-    built = subprocess.run(link, cwd=tmp_path, capture_output=True, text=True)
+    built = fast_link.clang(link, cwd=tmp_path, capture_output=True, text=True)
     assert built.returncode == 0, f"{compiler}, {name}: link:\n{built.stderr[-1500:]}"
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 
@@ -555,7 +557,7 @@ def test_an_untyped_scrutinee_never_takes_the_wrong_arm(request, tmp_path, compi
     link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         link.insert(2, str(RITZ_START))
-    if subprocess.run(link, cwd=tmp_path, capture_output=True).returncode != 0:
+    if fast_link.clang(link, cwd=tmp_path, capture_output=True).returncode != 0:
         assert compiler != "ritz0", "ritz0 emitted invalid IR"
         return
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"

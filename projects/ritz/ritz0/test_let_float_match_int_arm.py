@@ -33,6 +33,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import fast_link
 import pytest
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -361,7 +362,7 @@ def _ritz1_run(ritz1_bin: Path, tmp_path: Path, program: str):
     if comp.returncode != 0 or not ll.exists():
         return None, comp.stdout + comp.stderr
     exe = tmp_path / "prog"
-    link = subprocess.run(
+    link = fast_link.clang(
         ["clang", str(RITZ_START), str(ll), "-o", str(exe), "-nostdlib"],
         cwd=tmp_path, capture_output=True, text=True,
     )

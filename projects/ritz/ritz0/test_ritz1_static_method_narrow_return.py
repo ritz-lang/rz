@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -118,7 +120,7 @@ def _build_and_run(compiler, tmp_path, src):
     link_cmd = ["clang", "-Wno-override-module", str(ll), "-o", str(exe), "-nostdlib", "-no-pie"]
     if compiler != "ritz0":
         link_cmd.insert(1, str(RITZ_START))
-    link = subprocess.run(link_cmd, capture_output=True, text=True)
+    link = fast_link.clang(link_cmd, capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler} IR did not link:\n{link.stderr[-2000:]}"
     return subprocess.run([str(exe)], timeout=60).returncode
 

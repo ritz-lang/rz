@@ -18,6 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import fast_link
 import pytest
 from ritz0_inproc import run_ritz0
 
@@ -52,7 +53,7 @@ def _link_run(compiler: str, tmp_path: Path, name: str, ll: Path) -> int:
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler == "ritz1":
         link_cmd.insert(1, str(RITZ_START))
-    link = subprocess.run(link_cmd, cwd=tmp_path, capture_output=True, text=True)
+    link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, (
         f"{compiler} emitted IR that would not link ({name}):\n{link.stderr[-2000:]}"
     )
@@ -321,7 +322,7 @@ def test_ritz1_declares_every_extern_past_2048(ritz1_bin, tmp_path):
     missing = [i for i in range(N_EXTERNS) if f"declare i64 @ext{i}(" not in ir]
     assert not missing, f"{len(missing)} externs not declared, first: ext{missing[0]}"
     obj = tmp_path / "externs.o"
-    cc = subprocess.run(
+    cc = fast_link.clang(
         ["clang", "-c", str(ll), "-o", str(obj)], capture_output=True, text=True
     )
     assert cc.returncode == 0, cc.stderr[-2000:]

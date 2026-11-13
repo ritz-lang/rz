@@ -40,6 +40,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, RITZ_START
 
 # clang on ritz0's IR for tokens.ritz takes ~0.1 s at -O2.  20 s and 2 GB are
@@ -143,7 +145,7 @@ def _link_run(objs: list, exe: Path, with_start: bool) -> int:
     if with_start:
         cmd.append(str(RITZ_START))
     cmd += [str(o) for o in objs]
-    link = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    link = fast_link.clang(cmd, capture_output=True, text=True, timeout=120)
     assert link.returncode == 0, f"link failed for {exe.name}:\n{link.stderr[-2000:]}"
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 

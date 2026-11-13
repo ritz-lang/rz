@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -204,7 +206,7 @@ def _link_and_run(compiler: str, cwd: Path, lls: list, exe: Path) -> int:
     link_cmd = ["clang", *map(str, lls), "-o", str(exe), "-nostdlib"]
     if compiler == "ritz1":
         link_cmd.insert(1, str(RITZ_START))
-    link = subprocess.run(link_cmd, cwd=cwd, capture_output=True, text=True)
+    link = fast_link.clang(link_cmd, cwd=cwd, capture_output=True, text=True)
     assert link.returncode == 0, (
         f"{compiler} emitted IR that would not link ({exe.name}):\n"
         f"{link.stderr[-2000:]}"

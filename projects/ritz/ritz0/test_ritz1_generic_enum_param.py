@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -134,7 +136,7 @@ def test_generic_enum_param_runs(request, tmp_path, compiler, name):
     exe = tmp_path / "unit"
     # ritz0 emits its own `_start`; ritz1 links the runtime's.
     start = [] if compiler == "ritz0" else [str(RITZ_START)]
-    link = subprocess.run(["clang", "-w", str(ll), *start, "-o", str(exe), "-nostdlib"],
+    link = fast_link.clang(["clang", "-w", str(ll), *start, "-o", str(exe), "-nostdlib"],
                           capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler}, {name}: clang\n{link.stderr[-1500:]}"
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"

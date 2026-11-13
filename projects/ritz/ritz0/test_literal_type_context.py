@@ -64,6 +64,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -321,7 +323,7 @@ def test_arithmetic_results_are_unchanged_at_the_declared_width(tmp_path):
     build = run_ritz0([str(src), "-o", str(ll)], env=env, timeout=300)
     assert build.returncode == 0, build.stderr
     # -nostdlib matches build.py: ritz0 emits its own `_start`.
-    link = subprocess.run(
+    link = fast_link.clang(
         ["clang", str(ll), "-o", str(exe), "-nostdlib"],
         capture_output=True, text=True, timeout=300,
     )

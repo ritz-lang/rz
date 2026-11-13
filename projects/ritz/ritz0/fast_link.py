@@ -9,7 +9,7 @@ of `ld`.  Thousands of cases paid the startup each.
 How: `clang(cmd, **kw)` is a drop-in for `subprocess.run(cmd, **kw)`.
 
 * For the shapes the matrices use — `.ll`/`.o` inputs, `-o`, `-c`, `-w`,
-  `-Wno-override-module`, `-nostdlib`, `-no-pie`, and nothing else — each
+  `-Wno-override-module`, `-nostdlib`, `-no-pie`, `-O0`, and nothing else — each
   `.ll` is compiled to an object by a helper process that has llvmlite
   loaded (LLVM aborts the process on a fatal error, so not in the pytest
   worker), the way clang's cc1 job would: the host triple clang reports
@@ -43,7 +43,8 @@ from pathlib import Path
 
 STATS = {"fast": 0, "fallback": 0}
 
-_FLAGS = {"-w", "-Wno-override-module", "-nostdlib", "-no-pie", "-c"}
+# -O0 is clang's default and the level the helper compiles at (AGAST #2808).
+_FLAGS = {"-w", "-Wno-override-module", "-nostdlib", "-no-pie", "-c", "-O0"}
 # subprocess.run keywords the fast path can honour.
 _KWARGS = {"cwd", "capture_output", "text", "check", "timeout"}
 # A helper answer slower than this is treated as dead.

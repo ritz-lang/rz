@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+import fast_link
+
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -155,7 +157,7 @@ def test_ritz1_keeps_scalar_compares(request, tmp_path, compiler, name):
     proc, ll = _ritz1(request, compiler, tmp_path, source)
     assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-800:]}"
     exe = tmp_path / "unit"
-    subprocess.run(["clang", "-w", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
+    fast_link.clang(["clang", "-w", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
                    check=True)
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 
