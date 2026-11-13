@@ -713,6 +713,9 @@ let zeros = [0; 10]
 let first = zeros[0]
 ```
 
+The value is copied into every element, so a move-only value fills at most one
+(§13.2).
+
 An array literal or fill has no element type of its own until a slot gives it
 one, so it takes the element type of the array it lands in, element by element
 under §7.5:
@@ -3031,6 +3034,28 @@ fn main() -> i32
     var r = Resource { handle: 3 }
     consume(r)                      # moves r into consume
     r.handle                        # error: r was moved
+```
+
+An array fill `[v; n]` moves `v` into the array and copies it into each of the
+`n` elements. For a move-only `v` those copies would be `n` owners of one value,
+each dropping it, so a fill of a move-only value has a count of at most 1. That
+holds whether `v` is a binding, a field or a temporary such as `[make(); 2]`,
+and in a generic body at each move-only `T` it's instantiated with. `[r; 1]`
+moves `r` into the one element. To fill more, build each element separately:
+`[make(), make()]`.
+
+```ritz expect-error="`[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+fn main() -> i32
+    let r = Resource { handle: 3 }
+    let a: [2]Resource = [r; 2]     # error: two owners of r
+    0
 ```
 
 A reference isn't its referent. An `@T`, `@&T` or `*T` doesn't fit a by-value

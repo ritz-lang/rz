@@ -42,6 +42,7 @@ import emitter_core
 import emitter_expr_call   # method_callee_def
 import let_check           # let_addr_of_own (AGAST #2338)
 import index_through       # index_through_struct (AGAST #2443)
+import ownership            # own_type_is_move_only (AGAST #2963)
 
 # What an expression or a slot holds.
 pub struct RefTy
@@ -809,6 +810,30 @@ fn ref_walk_struct(s: *EmitterState, e: *Expr)
 
 # Every slot inside `e`.  An `if` or `match` is its condition here: its arms
 # come through own_check_arm.
+# `[v; n]` copies its one value into each element: n > 1 of a move-only `v`
+# would drop it n times (AGAST #2963). ritz0's words, from array_rules.py.
+fn ref_check_fill(s: *EmitterState, e: *Expr)
+    if e.int_val <= 1
+        return
+    var name: *u8 = null
+    var len: i32 = 0
+    if e.left.kind == EXPR_STRUCT_LIT
+        name = e.left.ident_ptr
+        len = e.left.ident_len
+    else
+        var t: RefTy
+        if ref_ty_of(s, e.left, @t) == 0 or ref_is_pointer(t.kind) == 1
+            return
+        name = t.name
+        len = t.name_len
+    if len == 0 or own_type_is_move_only(s, name, len) == 0
+        return
+    if ref_first_report(e.span.line, e.span.col) == 0
+        return
+    ref_eprint_loc(e.span.line, e.span.col)
+    eprints_cstr(c": error: `[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`\n")
+    s.error_count = s.error_count + 1
+
 fn ref_walk(s: *EmitterState, e: *Expr)
     if e == null
         return
@@ -865,6 +890,7 @@ fn ref_walk(s: *EmitterState, e: *Expr)
     else if k == EXPR_ARRAY_LIT
         ref_walk_list(s, e.args)
     else if k == EXPR_ARRAY_FILL
+        ref_check_fill(s, e)
         ref_walk(s, e.left)
     else if k == EXPR_UNARY
         if e.op == OP_ADDR_MUT or e.op == OP_ADDR

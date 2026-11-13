@@ -16,6 +16,7 @@ import copy
 from typing import Dict, Set, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
+import array_rules
 import ref_rules
 import ritz_ast as rast
 from ufcs import UFCS_NON_GENERIC_PREFIXES
@@ -402,7 +403,8 @@ class MoveChecker:
             if any(self.types.is_move_only(a) for a in getattr(fn, 'instance_args', ())):
                 self._check_fn(copy.deepcopy(fn))
         self.errors = [e for e in self.errors
-                       if e.reason == ref_rules.MOVE_OUT_OF_REF or e.after_move]
+                       if e.reason in (ref_rules.MOVE_OUT_OF_REF, array_rules.FILL_MOVE_ONLY)
+                       or e.after_move]
         self._drop_repeats()
         return self.errors
 
@@ -1233,6 +1235,10 @@ class MoveChecker:
             # `[v; n]` owns its value like a literal owns its elements, so
             # `[t; 2]` with `t:& Res` moves out of the reference (AGAST #2948).
             self._check_expr(expr.value, is_move_context=True)
+            # It copies that one value into each element: n > 1 of a
+            # move-only one would drop it n times (AGAST #2963).
+            if expr.count > 1 and self.types.is_move_only(self._fill_value_type(expr.value)):
+                self.errors.append(OwnershipError(array_rules.FILL_MOVE_ONLY, expr.span))
 
         elif isinstance(expr, rast.Match):
             # What a reference reaches stays its owner's: matching it only reads.
@@ -1384,6 +1390,14 @@ class MoveChecker:
         ty = self._infer_expr_type(expr)
         if self.types.is_move_only(ty):
             expr.drop_temp = ty
+
+    def _fill_value_type(self, value: rast.Expr) -> Optional[rast.Type]:
+        """The type of a fill's value: a binding, call or literal as
+        `_infer_expr_type` has it, else a place (`*p`, `p[i]`)."""
+        ty = self._infer_expr_type(value)
+        if isinstance(ty, rast.NamedType) and ty.name == 'unknown':
+            return self._place_type(value)
+        return ty
 
     @staticmethod
     def _unmark_temporary(expr: rast.Expr) -> None:

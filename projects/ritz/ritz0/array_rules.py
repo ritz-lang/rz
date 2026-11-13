@@ -23,3 +23,9 @@ NOT_A_POINTER = '`*x` needs `x` to be a pointer or a reference: this one is a va
 # on.  ritz1 prints the same words, from index_through.ritz.
 ELEMENT_NOT_ARRAY = ('`p[i]` is one element of the array behind `p`, '
                      'not the whole array: `*p = a` stores the array')
+
+# `[v; n]` with n > 1 of a move-only `v` (AGAST #2963): one value copied into n
+# elements, each of which would drop it. ritz1 prints the same words, from
+# ref_check.ritz.
+FILL_MOVE_ONLY = ('`[v; n]` copies `v` into every element: '
+                  'a move-only value fills one, `[v; 1]`')

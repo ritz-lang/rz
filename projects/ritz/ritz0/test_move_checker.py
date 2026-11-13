@@ -8,6 +8,7 @@ import pytest
 from parser import parse
 from monomorph import monomorphize
 from move_checker import MoveChecker, OwnershipError
+from array_rules import FILL_MOVE_ONLY
 from ref_rules import MOVE_OUT_OF_REF
 import ritz_ast as rast
 
@@ -922,9 +923,10 @@ fn f(t:& Res) -> i32
     return 0
 """, "t", id="array_element_of_a_temporary"),
         # AGAST #2948: a fill's value and a cast's operand are by-value reads.
+        # `[t; 1]`: a count above 1 is its own error too (AGAST #2963).
         pytest.param("""
 fn f(t:& Res) -> i32
-    let a = [t; 2]
+    let a = [t; 1]
     return 0
 """, "t", id="array_fill"),
         pytest.param("""
@@ -937,6 +939,16 @@ fn f(t:& Res) -> i32
         errs = check(self.DEFS + body)
         assert len(errs) == 1, errs
         assert f"cannot move out of a reference" in str(errs[0])
+
+    def test_fill_of_two_is_both_errors(self):
+        """`[t; 2]` moves out of the reference and copies the value twice:
+        each is reported, at the value and at the fill (AGAST #2963)."""
+        errs = check(self.DEFS + """
+fn f(t:& Res) -> i32
+    let a = [t; 2]
+    return 0
+""")
+        assert sorted(e.reason for e in errs) == sorted([FILL_MOVE_ONLY, MOVE_OUT_OF_REF]), errs
 
     def test_ticket_repro(self):
         """The program AGAST #2231 reported."""
