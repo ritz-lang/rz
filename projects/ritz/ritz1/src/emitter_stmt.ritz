@@ -1671,7 +1671,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         # squeeze/cryptosec/valet rely on this for inflate/sbox tables.
         # Lowering strategy lives in emit_array_fill_into (emitter_expr).
         if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_FILL
-            emit_array_fill_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_init.left)
+            emit_array_fill_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init.left)
             return
 
         # Array-literal init for typed [N]T slots (ritz0 parity —
@@ -3782,7 +3782,7 @@ fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, 
             emit_ir_error(s, c"array literal length does not match the local array's length")
             return
         if value.kind == EXPR_ARRAY_FILL
-            emit_array_fill_into(s, dst_ptr, dst_size, dst_et, value.left)
+            emit_array_fill_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value.left)
             return
         let tmp: i32 = next_reg(s)
         emit_str(s, c"  ")
@@ -3858,7 +3858,7 @@ fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *Struc
         emit_ir_error(s, c"array literal length does not match the struct field's array length")
         return
     if value.kind == EXPR_ARRAY_FILL
-        emit_array_fill_into(s, field_ptr, field.array_size, et, value.left)
+        emit_array_fill_into(s, field_ptr, field.array_size, et, field.array_elem_type_name, field.array_elem_type_name_len, value.left)
         return
     # Build in a temporary (a fixed-size alloca, hoisted to the entry block),
     # then copy the whole aggregate over the field.
@@ -4048,9 +4048,29 @@ fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt, out_name: **u8, out_len: *i32)
     if last.kind != STMT_EXPR or last.expr == null
         return
     let e: *Expr = last.expr
+    let lent: *LocalVar = lent_referent_local(s, e)
+    if lent != null   # AGAST #2288: emit_if_stmt_arm read the referent
+        *out_name = lent.type_name
+        *out_len = lent.type_name_len
+        return
     resolve_expr_struct_name(s, e, out_name, out_len)
     if *out_name == null
         call_result_struct_name(s, e, out_name, out_len)
+
+# A statement-`if` arm's statements.  AGAST #2288: a trailing `c` with
+# `c:& C` is the arm's value, so it reads the referent, as in ritz0 (which
+# reports a move-only C there).  It read as the pointer, so a tail `if` typed
+# its phi i64 over `ptr`s.  if_stmt_arm_agg types it C.  It still goes through
+# emit_stmt, whose checks refuse it in a `-> @&C` fn.
+fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32)
+    let saved: *Stmt = s.if_arm_value
+    var st: *Stmt = list
+    while st != null
+        if st.next == null and st.kind == STMT_EXPR
+            s.if_arm_value = st
+        emit_stmt(s, st, ret_type)
+        s.if_arm_value = saved
+        st = st.next
 
 # AGAST #2563: the phi type a statement-`if` arm of struct type `agg` asks
 # for.  The Span$u8 / StrView pair (layout-equal, #168) takes the fn's return
@@ -4187,10 +4207,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # merges the arms' moved bindings (own_if_merge).
         let own_before: *i32 = own_snapshot(s)
         own_push_scope(s)
-        var then_stmt: *Stmt = stmt.if_then
-        while then_stmt != null
-            emit_stmt(s, then_stmt, ret_type)
-            then_stmt = then_stmt.next
+        emit_if_stmt_arm(s, stmt.if_then, ret_type)
         # AGAST #2559: the arm value's struct type, while its bindings resolve.
         var then_agg: *u8 = null
         var then_agg_len: i32 = 0
@@ -4223,10 +4240,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             clear_last_expr(s)  # Reset before else branch
             own_restore(s, own_before)
             own_push_scope(s)
-            var else_stmt: *Stmt = stmt.if_else
-            while else_stmt != null
-                emit_stmt(s, else_stmt, ret_type)
-                else_stmt = else_stmt.next
+            emit_if_stmt_arm(s, stmt.if_else, ret_type)
             if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
             own_else_dead = own_pop_scope(s)
             else_result = last_expr_here(s)  # Capture else branch result
@@ -4589,7 +4603,11 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             if stmt.next != null
                 must_use_check(s, stmt.expr)
             var expr_reg: i32 = 0
-            if builtin_tagged_ctor(s, stmt.expr) == 1
+            let lent: *LocalVar = lent_referent_local(s, stmt.expr)
+            if stmt == s.if_arm_value and lent != null
+                # AGAST #2288: an if arm's value (emit_if_stmt_arm).
+                expr_reg = emit_lent_referent(s, stmt.expr, lent.type_name, lent.type_name_len)
+            else if builtin_tagged_ctor(s, stmt.expr) == 1
                 expr_reg = emit_ctor_stmt(s, stmt.expr)   # AGAST #2454
             else
                 expr_reg = emit_expr(s, stmt.expr)

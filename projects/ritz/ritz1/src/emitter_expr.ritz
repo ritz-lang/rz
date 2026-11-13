@@ -1350,6 +1350,12 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
         # fptrunc / fpext); same-class casts pass through as i64 wraps
         # (the unified value model already keeps narrow ints in i64).
         let target_ty: i32 = e.op
+        # AGAST #2288: `c as C` with `c:& C` is the referent, as in ritz0.
+        # It read as the pointer and ptrtoint'd it.
+        if target_ty == TYPE_STRUCT and e.ident_len > 0 and lent_referent_local(s, e.left) != null
+            let referent: i32 = emit_lent_referent(s, e.left, e.ident_ptr, e.ident_len)
+            if referent != 0
+                return referent
         # AGAST #1652: `s as *S` with `s: @&S` (a `ptr`) must yield the i64
         # address the rest of the value model expects; only `as @&T` keeps it.
         # AGAST #1754: and `p as @&S` (`p: *S`, i64) must inttoptr into the
@@ -1891,8 +1897,9 @@ fn array_elem_typed_scalar(elem_ty: i32) -> i32
 
 # Write `[v; arr_size]` into the array at `base_reg`, a local array or an
 # inline STRUCT FIELD array: both share one element layout (bool `i1`,
-# f32 / f64 `float` / `double`; array_elem_typed_scalar).
-fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, fill_val: *Expr)
+# f32 / f64 `float` / `double`; array_elem_typed_scalar).  `elem_name` names a
+# struct element's type (AGAST #2288).
+fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: i32, elem_name: *u8, elem_name_len: i32, fill_val: *Expr)
     let fill_elem_ty: i32 = elem_ty
     let fill_arr_size: i32 = arr_size
     var fill_elem_llvm: *u8 = c"i64"
@@ -1925,6 +1932,15 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
             let agg: i32 = emit_struct_lit_value(s, fill_val)
             emit_array_fill_struct_loop(s, base_reg, fill_arr_size, lit_st, agg)
             return
+    # AGAST #2288: `[c; N]` with `c:& C` into a `[N]C` fills with the referent,
+    # as in ritz0.  It stored the pointer as an i64.
+    if elem_ty == TYPE_STRUCT and lent_referent_local(s, fill_val) != null
+        let lent_st: *StructDef = find_struct(s, elem_name, elem_name_len)
+        if lent_st != null
+            let referent: i32 = emit_lent_referent(s, fill_val, elem_name, elem_name_len)
+            if referent != 0
+                emit_array_fill_struct_loop(s, base_reg, fill_arr_size, lent_st, referent)
+                return
     # Fast path: integer-literal zero fill — collapse to memset.
     # Detect EXPR_INT_LIT with int_val == 0 (common case for
     # squeeze's `[0; 65536]` lz_symbols arrays) and EXPR_UNARY
@@ -2216,7 +2232,7 @@ fn emit_struct_lit_array_fill_field(s: *EmitterState, st: *StructDef, field_idx:
     if value.kind == EXPR_ARRAY_LIT
         emit_array_lit_into(s, field_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, value)
     else
-        emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, value.left)
+        emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, value.left)
     1
 
 # Evaluate struct-literal field `field_idx` of `st` and store it into the

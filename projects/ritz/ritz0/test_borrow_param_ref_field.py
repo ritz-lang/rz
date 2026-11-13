@@ -1744,6 +1744,75 @@ pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     return f(@&c)
 """,
+    # AGAST #2288: the payload's declared type decides, for each variant.
+    "by_value_ok_payload": "import ritzlib.result\n\n" + BY_VALUE + """
+fn f(c:& C) -> Result<C, i32>
+    return Ok(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var r: Result<C, i32> = f(@&c)
+    return match r
+        Ok(d) => d.x
+        Err(e) => e
+""",
+    "by_value_err_payload": "import ritzlib.result\n\n" + BY_VALUE + """
+fn f(c:& C) -> Result<i32, C>
+    return Err(c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var r: Result<i32, C> = f(@&c)
+    return match r
+        Ok(n) => n
+        Err(d) => d.x
+""",
+    # A `*C` payload keeps the pointer: the write through it reaches `c`.
+    "pointer_payload_keeps_pointer": BY_VALUE + """
+enum W
+    Nil
+    Held(*C)
+
+fn f(c:& C) -> W
+    return W.Held(@c)
+
+fn set(p: *C)
+    p.x = 3
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    let w: W = f(@&c)
+    match w
+        Held(p) => set(p)
+        Nil => pass
+    return c.x
+""",
+    # The arm is a copy: a write to it leaves the caller's `c` alone.
+    "by_value_if_arm_copies": BY_VALUE + """
+fn f(c:& C, k: i32) -> i32
+    var d: C = if k == 0
+        c
+    else
+        C { x: 1, y: 0 }
+    d.x = 9
+    return c.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@&c, 0)
+""",
+    # A literal arm types the phi first.
+    "by_value_match_arm_after_literal": BY_VALUE + """
+fn f(c:& C, k: i32) -> C
+    return match k
+        0 => C { x: 1, y: 0 }
+        _ => c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: C = f(@&c, 1)
+    return d.x
+""",
     "match_borrow_scrutinee": ENUM + """
 fn f(e:& E) -> i32
     match e
@@ -2274,6 +2343,58 @@ fn f(t:& Res, k: i32) -> Res
 pub fn main() -> i32
     return 0
 """,
+    # AGAST #2288: the rest of the by-value reads #2279 left.
+    "if_tail": RES + """
+fn f(t:& Res, k: i32) -> Res
+    if k == 0
+        t
+    else
+        t
+
+pub fn main() -> i32
+    return 0
+""",
+    "match_arm": RES + """
+fn f(t:& Res, k: i32) -> Res
+    match k
+        0 => t
+        _ => t
+
+pub fn main() -> i32
+    return 0
+""",
+    "variant_payload": RES + """
+enum W
+    Nil
+    Held(Res)
+
+fn f(t:& Res) -> W
+    return W.Held(t)
+
+pub fn main() -> i32
+    return 0
+""",
+    "some_payload": "import ritzlib.option\n\n" + RES + """
+fn f(t:& Res) -> Option<Res>
+    return Some(t)
+
+pub fn main() -> i32
+    return 0
+""",
+    "array_fill": RES + """
+fn f(t:& Res)
+    let a: [2]Res = [t; 2]
+
+pub fn main() -> i32
+    return 0
+""",
+    "cast": RES + """
+fn f(t:& Res)
+    let d: Res = t as Res
+
+pub fn main() -> i32
+    return 0
+""",
     "array_return": RES + """
 fn f(a:& [2]Res) -> [2]Res
     return a
@@ -2292,6 +2413,12 @@ pub fn main() -> i32
     return 0
 """,
 }
+
+
+# AGAST #2288: ritz0 misses these two moves out of a borrow (AGAST #2948),
+# so only ritz1 is held to the rule: `[t; 2]` and `t as Res` would hand the
+# caller's move-only `Res` to a second owner.
+RITZ0_MISSED_MOVE_OUT = {name: MOVE_OUT.pop(name) for name in ("array_fill", "cast")}
 
 
 # A reference in a by-value slot: ritz0 read through it and ritz1 failed at clang
@@ -2314,16 +2441,6 @@ RITZ1_GAPS = {
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_bool_field": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
     "by_value_bool_literal": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
-    "by_value_if_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_if_tail": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_match_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_match_tail": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_variant_payload": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_bare_variant_payload": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_some_payload": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_array_fill": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "by_value_cast": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
-    "if_arm": "AGAST #2288: a by-value read with no slot type at hand takes the pointer",
     "match_borrow_scrutinee": "AGAST #2289: `match` on a `:&` enum spills the pointer",
     "match_borrow_scrutinee_value": "AGAST #2289: `match` on a `:&` enum spills the pointer",
     "array_referent_return": "AGAST #2302: ritz1 has no array return yet",
@@ -2560,6 +2677,16 @@ def test_ritz1_reference_to_a_drop_type_is_not_a_move(ritz1_bin, tmp_path, name)
 @pytest.mark.parametrize("name", _ritz1_params(MOVE_OUT))
 def test_ritz1_by_value_field_is_still_a_move_out(ritz1_bin, tmp_path, name):
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MOVE_OUT[name])
+    assert comp.returncode != 0
+    assert not ll.exists()
+    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of a reference",
+                     comp.stdout + comp.stderr), comp.stdout + comp.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(RITZ0_MISSED_MOVE_OUT))
+def test_ritz1_refuses_a_move_out_ritz0_misses(ritz1_bin, tmp_path, name):
+    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, RITZ0_MISSED_MOVE_OUT[name])
     assert comp.returncode != 0
     assert not ll.exists()
     assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of a reference",

@@ -33,8 +33,7 @@ from test_borrow_param_ref_field import _compile, _run
 from test_ref_into_value import COMPILERS, _assert_refused
 
 NO_TUPLES_GAP = "AGAST #1526: ritz1 has no tuples"
-BY_VALUE_ARM_GAP = "AGAST #2288: ritz1 can't read a `:&` by value in an arm"
-ARM_GAP = "AGAST #2288: an `@&x` arm value fails at clang on ritz1, with or without a `:&`"
+ARM_GAP = "AGAST #2950: an `@&x` arm value fails at clang on ritz1, with or without a `:&`"
 
 # None of these needs a `:&` to fail. #2309 lists each, and is closing.
 ELEMENT_GAP = "AGAST #2369: `a[0].x` through an `@&C` or `@C` element is `unhandled EXPR_MEMBER` on ritz1"
@@ -732,7 +731,7 @@ RITZ1_MOVE_ONLY_GAPS = {
     "return_in_arm_mut": CALL_RETURN_GAP,
 }
 
-RITZ1_BY_VALUE_GAPS = {"if_arm": BY_VALUE_ARM_GAP}
+RITZ1_BY_VALUE_GAPS = {}
 RITZ0_NO_CONFLICT_GAPS = {}
 
 

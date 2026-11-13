@@ -538,6 +538,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     # A valueless arm (`pass`, or no trailing expression) feeds the phi the
     # zero of its type (AGAST #1946).
     var body_reg: i32 = MATCH_ZERO_VALUE
+    var lent_arm: *LocalVar = null
     if arm.is_pass == 1
         body_reg = MATCH_ZERO_VALUE
     else if arm.body != null
@@ -551,7 +552,13 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         if nested
             s.match_no_value = 1
         own_check_arm(s, arm.body)   # AGAST #2158: the arm's value moves out
-        body_reg = emit_expr(s, arm.body)
+        # AGAST #2288: a `c:& C` arm's value is the referent, as in ritz0.
+        # It read as the pointer, so the phi was an i64 over `ptr`s.
+        lent_arm = lent_referent_local(s, arm.body)
+        if lent_arm != null
+            body_reg = emit_lent_referent(s, arm.body, lent_arm.type_name, lent_arm.type_name_len)
+        else
+            body_reg = emit_expr(s, arm.body)
     if arm.is_pass == 0 and arm.body != null and body_reg == 0
         # AGAST #1654: a void call (`Some(e) => say(e)`), or a nested
         # valueless match.  Register 0 is never defined; record a zero so
@@ -572,10 +579,13 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # binding (`Some(v) => v`) is still in scope; it is popped below.
         var arm_ty: *u8 = null
         var arm_ty_len: i32 = 0
+        if lent_arm != null
+            arm_ty = lent_arm.type_name
+            arm_ty_len = lent_arm.type_name_len
         # AGAST #2512: a `Some(v)` the slot built as the builtin (#2453) is
         # the slot's enum, not the user enum that also declares `Some`: that
         # typed the phi %E over the arm's %Option$i32.
-        if arm.body.kind == EXPR_CALL and users_variant_wins(s, arm.body) == 0
+        if arm_ty == null and arm.body.kind == EXPR_CALL and users_variant_wins(s, arm.body) == 0
             variant_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)
         if arm_ty == null
             resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)

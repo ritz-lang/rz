@@ -1057,6 +1057,16 @@ fn emit_lent_referent(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> i
     emit_str(s, c"\n")
     return val
 
+# AGAST #2288: the `c:& C` param `e` names, when C is a struct, or null.  A
+# by-value read with no slot type at hand (an if / match arm, a `c as C`)
+# takes C from the param itself: an integer T is already a plain local and
+# `a:& [N]T` an array one.
+fn lent_referent_local(s: *EmitterState, e: *Expr) -> *LocalVar
+    let loc: *LocalVar = lent_local(s, e)
+    if loc == null or loc.var_type != TYPE_MUT_REF or loc.pointee_type != TYPE_STRUCT
+        return null
+    return loc
+
 # AGAST #2279: `return c` or a tail `c` with `c:& C` in a fn returning `C`: the
 # value is the referent.  Emits the `ret` and returns 1; 0 when `e` is anything
 # else.  Only s.ret_type_name's slot reads it.
@@ -1979,6 +1989,22 @@ fn variant_payload_aggregate(s: *EmitterState, payload_expr: *Expr, out_name: **
                     *out_name = md.return_type_name
                     *out_len = md.return_type_name_len
 
+# AGAST #2288: `E.Full(c)`, `Full(c)` or `Some(c)` with `c:& C`, when the
+# variant's declared payload is `C`: the referent, as in ritz0.  0 when `e` is
+# anything else, or the payload is no `C` (a `Full(*C)` keeps the pointer).
+fn emit_lent_payload(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, e: *Expr) -> i32
+    if lent_referent_local(s, e) == null
+        return 0
+    var pay_len: i32 = 0
+    var pay: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, tag, @pay_len)
+    let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, tag)
+    if uf != null and uf.field_type == TYPE_STRUCT
+        pay = uf.field_type_name
+        pay_len = uf.field_type_name_len
+    if pay == null or pay_len <= 0
+        return 0
+    return emit_lent_referent(s, e, pay, pay_len)
+
 # Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
 # zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
 # where `tag` 0 / 1 also picks Ok-Some / Err for the payload width) or a
@@ -1990,7 +2016,9 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
     var have_payload: i32 = 0
     # AGAST #2272: `Ok(())` carries a zero-byte payload: nothing to store.
     if payload_expr != null and is_unit_expr(payload_expr) == 0
-        payload_reg = emit_expr(s, payload_expr)
+        payload_reg = emit_lent_payload(s, enum_name, enum_name_len, tag, payload_expr)
+        if payload_reg == 0
+            payload_reg = emit_expr(s, payload_expr)
         have_payload = 1
 
     # alloca %Enum
