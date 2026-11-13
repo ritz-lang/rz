@@ -215,6 +215,17 @@ pub fn main() -> i32
     return DROPS
 """, 2),
 
+    # AGAST #2964: `t as Tracked` hands t on, so only `d` drops it.
+    "cast_moved": ("""\
+fn f()
+    var t = make(1)
+    let d: Tracked = t as Tracked
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1),
+
     # An enum field drops its payload with the struct.
     "enum_in_struct": ("""\
 enum Slot
@@ -438,6 +449,15 @@ pub fn main() -> i32
     var t = make(1)
     if DROPS == 0
         consume(t)
+    return t.id
+""",
+
+    # AGAST #2964: a cast's operand moves wherever the cast does (ritz0
+    # since #2948, test_move_checker.py TestArrayTupleLiteralMoves `cast`).
+    "use_after_cast": """\
+pub fn main() -> i32
+    var t = make(1)
+    let d: Tracked = t as Tracked
     return t.id
 """,
 
