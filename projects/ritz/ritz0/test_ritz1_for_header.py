@@ -459,13 +459,12 @@ def test_a_vec_ritz1_had_no_struct_for(run_with, compiler, name):
     assert run_with(compiler, name, program) == want
 
 
-# No `push` for this one on ritz1 (#2942), so the header is built by hand.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("it", FORMS)
 def test_a_bool_element_is_a_condition(run_with, compiler, it):
-    program = (GVEC + MAIN + "    var a: [3]bool = [true, false, true]\n    var v: Vec<bool>\n"
-               "    v.data = @a[0]\n    v.len = 3\n    v.cap = 3\n"
+    program = (GVEC + MAIN + "    var v: Vec<bool> = vec_new<bool>()\n"
+               + _pushes("v", ("true", "false", "true"))
                + _body(f"var t: i32 = 0\nfor x in {it}\n    if x\n        t = t + 1\n"
                        "if t != 2\n    return 1\nreturn 0\n"))
     assert run_with(compiler, "bools", program) == 0

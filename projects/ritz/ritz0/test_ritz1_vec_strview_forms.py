@@ -104,3 +104,31 @@ def test_push_in_a_generic_fn_is_its_only_push(run_with, compiler):  # noqa: F81
     program = (GVEC + GENERIC + MAIN + "    let v: Vec<i32> = mk<i32>(3, 4)\n"
                + _body("if v.len != 2\n    return 1\nif v[0] + v[1] != 7\n    return 2\nreturn 0\n"))
     assert run_with(compiler, "only_push", program) == 0
+
+
+# AGAST #2942: `v.push(true)` on a Vec<bool>.  vec_push's receiver is `v`, not
+# `self`, so ritz1's bool check held the argument up against `v: *Vec<T>` and
+# refused it: "cannot use bool as a pointer".  One row per way a bool reaches
+# the push as a register: a literal, a bool local, a comparison (an i1) and a
+# bool call (a zext'd i64).  Pushed true, false, true: 5 = 0b101 if each lands.
+YES = "fn yes() -> bool\n    return true\n\n"
+BOOL_ARGS = {
+    "literal": ("", "true", "false", "true"),
+    "local": ("", "t", "f", "t"),
+    "comparison": ("", "1 < 2", "2 < 1", "1 < 2"),
+    "call": (YES, "yes()", "not yes()", "yes()"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(BOOL_ARGS))
+def test_push_a_bool(run_with, compiler, name):  # noqa: F811
+    prelude, *args = BOOL_ARGS[name]
+    program = (GVEC + prelude + MAIN + "    let t: bool = true\n    let f: bool = false\n"
+               "    var v: Vec<bool> = vec_new<bool>()\n"
+               + "".join(f"    v.push({a})\n" for a in args)
+               + _body("if v.len != 3\n    return 1\nvar m: i32 = 0\nvar i: i64 = 0\n"
+                       "while i < v.len\n    if v[i]\n        m = m + (1 << i as i32)\n    i = i + 1\n"
+                       "if m != 5\n    return 2\nreturn 0\n"))
+    assert run_with(compiler, name, program) == 0

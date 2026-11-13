@@ -19,7 +19,7 @@ import ritzlib.io
 import ast
 import ast_helpers
 import emitter_core
-import emitter_expr_call   # method_callee_def
+import emitter_expr_call   # method_callee_def, ufcs_fn_def
 import index_through       # through_named_elem (AGAST #2440)
 
 # What an expression is, as far as this rule cares.
@@ -156,12 +156,21 @@ fn bk_payload_of(s: *EmitterState, e: *Expr) -> i32
 # The fn a method call dispatches to, or null.
 pub fn bk_method_def(s: *EmitterState, e: *Expr) -> *FnDef
     var tn_len: i32 = 0
+    let tn: *u8 = bk_method_recv(s, e, @tn_len)
+    if tn == null
+        return null
+    method_callee_def(s, tn, tn_len, e.ident_ptr, e.ident_len)
+
+# The type name method call `e` dispatches on, or null.
+fn bk_method_recv(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    var tn_len: i32 = 0
     var tn: *u8 = method_recv_type_name(s, e, @tn_len)
     if tn == null or tn_len == 0
         bk_receiver(s, e.left, @tn, @tn_len)
     if tn == null or tn_len == 0
         return null
-    method_callee_def(s, tn, tn_len, e.ident_ptr, e.ident_len)
+    *out_len = tn_len
+    tn
 
 fn bk_method(s: *EmitterState, e: *Expr) -> i32
     if name_eq(e.ident_ptr, e.ident_len, c"is_some", 7) == 1 or name_eq(e.ident_ptr, e.ident_len, c"is_none", 7) == 1
@@ -528,11 +537,23 @@ pub fn bool_check_method(s: *EmitterState, e: *Expr)
     let fd: *FnDef = bk_method_def(s, e)
     if fd == null or fd.params == null
         return
-    # `self` is the receiver, not the first argument.
-    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1
+    # `self` is the receiver, not the first argument.  So is a UFCS helper's
+    # first param, whatever it's called: vec_push's is `v: *Vec<T>`, and
+    # `v.push(true)` was "cannot use bool as a pointer" (AGAST #2942).
+    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1 or bk_method_is_ufcs(s, e, fd) == 1
         bool_check_args(s, fd.params.next, e.args)
     else
         bool_check_args(s, fd.params, e.args)
+
+# 1 when `fd`, method call `e`'s callee, is the UFCS helper it dispatches to.
+fn bk_method_is_ufcs(s: *EmitterState, e: *Expr, fd: *FnDef) -> i32
+    var tn_len: i32 = 0
+    let tn: *u8 = bk_method_recv(s, e, @tn_len)
+    if tn == null
+        return 0
+    if ufcs_fn_def(s, tn, tn_len, e.ident_ptr, e.ident_len) == fd
+        return 1
+    0
 
 # `target = value`, in each spelling the parser has for one.
 pub fn bool_check_stmt(s: *EmitterState, stmt: *Stmt)
