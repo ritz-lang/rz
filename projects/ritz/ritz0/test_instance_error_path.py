@@ -12,7 +12,9 @@ because ref_check located every error in the driver's input file.
 
 Whether a Span of a Drop T should be refused at all is #2159's question; this
 only pins where the refusal points.  A user module (`cell.ritz`, written beside
-main.ritz) is checked as well as ritzlib, so the rule isn't "ritzlib paths".
+main.ritz) is checked as well as ritzlib, so the rule isn't "ritzlib paths",
+and so is an error inside a generic impl's method (#2913), whose instance
+ritz1 located in main.ritz because impl methods carried no def_file.
 """
 
 import os
@@ -47,6 +49,30 @@ impl<T> Cell<T>
         return cell_get<T>(self)
 """
 
+# AGAST #2913: the move is in the generic impl's own method, at 6:16.
+CELL_METHOD = """\
+pub struct Cell<T>
+    ptr: *T
+
+impl<T> Cell<T>
+    pub fn get(self: *Cell<T>) -> T
+        return *(self.ptr + 0)
+"""
+
+# The same method's file names binder_check's refusal at 8:13, which it judges
+# for an imported generic impl only once the method has a def_file.
+CELL_BINDER = """\
+pub const K: i32 = 3
+
+pub struct Cell<T>
+    ptr: *T
+
+impl<T> Cell<T>
+    pub fn get(self: *Cell<T>) -> i32
+        let K: i32 = 1
+        K
+"""
+
 # The `@S` receiver's push wants `@&Vec`: an error at 8:9 in main.ritz's own method.
 METHOD = """\
 import ritzlib.gvec
@@ -76,6 +102,20 @@ CASES = {
         "cell.ritz",
         "5:12",
         MOVE_OUT,
+    ),
+    "user_method": (
+        f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    return 0\n",
+        {"cell.ritz": CELL_METHOD},
+        "cell.ritz",
+        "6:16",
+        MOVE_OUT,
+    ),
+    "user_method_binder": (
+        "import cell\n\nfn f(p: *Cell<i32>) -> i32\n    return p.get()\n",
+        {"cell.ritz": CELL_BINDER},
+        "cell.ritz",
+        "8:13",
+        "a local can't take the name of a const: 'K'",
     ),
     "main_method": (
         METHOD,
