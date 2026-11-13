@@ -722,7 +722,7 @@ RITZ1_GAPS = {
     **_gaps(["arm_beside_a_borrow_mut", "let_if_mut", "let_match_mut", "tail_if_mut", "tail_match_mut"], ARM_GAP),
     **_gaps(["array_fill_mut", "array_literal_mut", "array_store_mut"], ELEMENT_GAP),
     **_gaps(_both("assign_from_if") + ["field_from_if", "literal_field_from_if"], IF_VALUE_GAP),
-    **_gaps(["return_in_arm_mut", "through_a_chain_mut"], CALL_RETURN_GAP),
+    "return_in_arm_mut": CALL_RETURN_GAP,
     "let_match_block_mut": BLOCK_ARM_GAP,
 }
 

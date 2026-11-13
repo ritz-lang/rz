@@ -817,7 +817,6 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2327: a `*C` value into `-> @&C` fails at clang")
 @pytest.mark.parametrize("name", sorted(POINTER_VALUE_RETURN))
 def test_ritz1_pointer_value_returned_as_a_reference(ritz1_bin, tmp_path, name):
     assert _run("ritz1", ritz1_bin, tmp_path, name, POINTER_VALUE_RETURN[name]) == 3

@@ -52,8 +52,8 @@ enum E
 impl C
     fn me(self: @C) -> @C
         self
-    fn mine(self:&) -> @&C
-        return @&self
+    fn mine(self: @&C) -> @&C
+        self
     fn other(self: @C, o: @C) -> @C
         o
     fn raw(self: @C) -> *C
@@ -229,6 +229,11 @@ ALLOWED = {
                    "var n: f64 = 1.0\n    let q = g(n)\n    c.x = 5", 5),
     "lent_self": ("impl C\n    fn g(self:&) -> @&C\n        return @&self\n", "let r: @&C = c.g()\n    r.x = 2", 2),
     "lent_passed_on": ("fn g(c:& C) -> @&C\n    return id(@&c)\n", "let r = g(c)\n    r.x = 3", 3),
+    # AGAST #2391: a `-> @&T` call result or `self: @&T` is a `ptr` at the return.
+    "lent_passed_on_tail": ("fn g(c:& C) -> @&C\n    id(@&c)\n", "let r = g(c)\n    r.x = 4", 4),
+    "mutable_param_passed_on": ("fn g(r: @&C) -> @&C\n    return id(r)\n", "let r = g(@&c)\n    r.x = 5", 5),
+    "mutable_self": ("impl C\n    fn g(self: @&C) -> @&C\n        return self\n", "let r: @&C = c.g()\n    r.x = 6", 6),
+    "mutable_self_method": ("fn g(c:& C) -> @&C\n    return c.mine()\n", "let r = g(c)\n    r.x = 7", 7),
     "shared_param": ("fn g(r: @C) -> @C\n    return r\n", "let r = g(@c)\n    c.x = r.x + 1", 2),
     "mutable_param": ("fn g(r: @&C) -> @&C\n    return r\n", "let r = g(@&c)\n    r.x = 7", 7),
     "pointer_param": ("fn g(r: *C) -> *C\n    return r\n", "let r = g(@c)\n    r.x = 5", 5),
@@ -292,9 +297,6 @@ ALLOWED = {
     "an_integer_return": ("fn g() -> i64\n    var d = C { x: 1 }\n    return @d\n", "c.x = (g() - g()) as i32 + 3", 3),
 }
 
-# ritz1 emits `-> @&T` of a call result as an integer, which clang refuses.
-RET_GAPS = {"lent_passed_on": 2391}
-
 # ritz1 stores a nested `-> @C` result as a `C`, which clang refuses.
 UNCHECKED_GAPS = {"a_call_of_a_call": 2394}
 
@@ -347,7 +349,7 @@ def test_a_reference_to_a_local_is_refused(tmp_path, compiler, site, row):
     _assert_refused(compiler, tmp_path, site, _wrap(body), returns_local(root))
 
 
-@pytest.mark.parametrize("site,row,compiler", list(_rows(("", ALLOWED, RET_GAPS))))
+@pytest.mark.parametrize("site,row,compiler", list(_rows(("", ALLOWED, {}))))
 def test_what_outlives_the_fn_still_runs(tmp_path, compiler, site, row):
     fn, call, want = row
     src = _main(TYPES + fn, f"    var c = C {{ x: 1 }}\n    {call}\n    c.x\n")
