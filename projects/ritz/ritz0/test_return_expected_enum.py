@@ -420,8 +420,8 @@ WHOLE_PROGRAMS = {
 }
 
 # The second symptom's shape, in both orders. `ritzlib.result` is what routes
-# `Result<(), E>` through `mangle_type_name`. ritz1 cannot parse `()` as a type
-# argument at all (AGAST #2272), so this one is ritz0 only.
+# `Result<(), E>` through `mangle_type_name`. Both compilers run it; ritz1
+# could not parse `()` as a type argument until AGAST #2272.
 UNIT_RESULT_CHECK = """\
 fn check(n: i64) -> Result<(), Er>
     match load(n)
@@ -512,6 +512,16 @@ def test_ritz0_unit_result_return_in_arm(tmp_path, competitor_first, arg, want):
     assert _run("ritz0", tmp_path, "unit", source) == want
 
 
+# AGAST #2272: the same programs under ritz1, once `()` parsed as a type argument.
+@pytest.mark.parametrize("competitor_first", [False, True])
+@pytest.mark.parametrize("arg,want", [(5, 40), (200, 59)])
+def test_ritz1_unit_result_return_in_arm(
+    tmp_path, ritz1_bin, ritz_start, competitor_first, arg, want
+):
+    source = unit_program(competitor_first, arg)
+    assert _run("ritz1", tmp_path, "unit", source) == want
+
+
 @pytest.mark.parametrize("name", sorted(RITZ0_ONLY))
 def test_ritz0_only_forms(tmp_path, name):
     source, want = RITZ0_ONLY[name]
@@ -569,6 +579,50 @@ fn f(n: i32) -> Result<(), i32>
 
 fn main() -> i32
     0
+"""
+
+# AGAST #2272: `()` as an argument to Result, a generic fn and Option, `Ok(())`
+# built and matched (bound and wildcard).  Exercises the zero-byte payload
+# layout: `Result$unit$i32` is { i8, [3 x i8], [4 x i8] }, as in ritz0.
+UNIT_ARG_USES = """\
+import ritzlib.result
+
+fn f(n: i32) -> Result<(), i32>
+    if n < 0
+        return Err(n)
+    Ok(())
+
+fn main() -> i32
+    var t: i32 = 0
+    match f(3)
+        Ok(u) => t = t + 1
+        Err(e) => t = t + 100
+    match f(0 - 7)
+        Ok(_) => t = t + 100
+        Err(e) => t = t - e
+    let r: Result<(), i32> = f(1)
+    if result_is_ok<(), i32>(@r) != 0
+        t = t + 20
+    t
+"""
+
+OPTION_UNIT = """\
+import ritzlib.option
+
+fn g(n: i32) -> Option<()>
+    if n > 0
+        return Some(())
+    None
+
+fn main() -> i32
+    var t: i32 = 0
+    match g(1)
+        Some(_) => t = t + 10
+        None => t = t + 100
+    match g(0)
+        Some(_) => t = t + 100
+        None => t = t + 20
+    t
 """
 
 PAYLOAD_MEMBER = """\
@@ -629,9 +683,48 @@ def test_ritz0_dead_code_after_all_arms_return(tmp_path):
     assert _run("ritz0", tmp_path, "dead_tail", DEAD_TAIL) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2272: `()` type argument")
+# AGAST #2272: ritz1 refused the whole module, `()` was no type argument.
 def test_ritz1_unit_type_argument(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "unit_arg", UNIT_TYPE_ARG) == 0
+
+
+def test_ritz0_unit_type_argument_uses(tmp_path):
+    assert _run("ritz0", tmp_path, "unit_uses", UNIT_ARG_USES) == 28
+
+
+def test_ritz1_unit_type_argument_uses(tmp_path, ritz1_bin, ritz_start):
+    assert _run("ritz1", tmp_path, "unit_uses", UNIT_ARG_USES) == 28
+
+
+# The layout is what crosses a ritz0/ritz1 object boundary, and a wrong one
+# (an unspelled `Result$$i32`, or the 144-byte unmeasured fallback) is still
+# self-consistent inside ritz1, so the run tests above cannot see it.
+@pytest.mark.parametrize(
+    "name,source,want",
+    [
+        (
+            "unit_uses",
+            UNIT_ARG_USES,
+            "%Result$unit$i32 = type { i8, [3 x i8], [4 x i8] }",
+        ),
+        ("option_unit", OPTION_UNIT, "%Option$unit = type { i8, [0 x i8], [0 x i8] }"),
+    ],
+    ids=["result", "option"],
+)
+def test_ritz1_unit_argument_layout(
+    tmp_path, ritz1_bin, ritz_start, name, source, want
+):
+    _run("ritz1", tmp_path, name, source)
+    assert want in (tmp_path / f"{name}_ritz1.ll").read_text()
+
+
+def test_ritz1_option_unit(tmp_path, ritz1_bin, ritz_start):
+    assert _run("ritz1", tmp_path, "option_unit", OPTION_UNIT) == 30
+
+
+@pytest.mark.xfail(strict=True, reason="AGAST #2941: Option<()> IndexError")
+def test_ritz0_option_unit(tmp_path):
+    assert _run("ritz0", tmp_path, "option_unit", OPTION_UNIT) == 30
 
 
 def test_ritz1_payload_member_from_call_scrutinee(tmp_path, ritz1_bin, ritz_start):
