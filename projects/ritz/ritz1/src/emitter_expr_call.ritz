@@ -4737,6 +4737,99 @@ fn emit_float_intrinsic_decls(s: *EmitterState)
     if (g_float_decl_mask & 2) == 2
         emit_str(s, c"declare double @llvm.fabs.f64(double)\n")
     g_float_decl_mask = 0
+    var k: i32 = 0
+    while k < 16
+        if ((g_fptoi_sat_mask >> k) & 1) == 1
+            emit_str(s, c"declare ")
+            fptoi_sat_name(s, k, 1)
+            emit_str(s, c"(")
+            emit_float_llvm_ty(s, fptoi_sat_src(k))
+            emit_str(s, c")\n")
+        k += 1
+    g_fptoi_sat_mask = 0
+
+# llvm.fpto[su]i.sat declarations referenced by the current module, one bit per
+# (source width, signedness, target width): see fptoi_sat_key.  Cleared once
+# emitted, by emit_float_intrinsic_decls.
+var g_fptoi_sat_mask: i64 = 0
+
+# Bit index for a saturating conversion: bit 3 = f64 source, bit 2 = unsigned,
+# bits 0-1 = log2(target bits / 8).
+fn fptoi_sat_key(ft: i32, bits: i32, unsigned: i32) -> i32
+    var k: i32 = 3
+    if bits == 8
+        k = 0
+    else if bits == 16
+        k = 1
+    else if bits == 32
+        k = 2
+    if unsigned == 1
+        k = k + 4
+    if ft != TYPE_F32
+        k = k + 8
+    k
+
+fn fptoi_sat_src(k: i32) -> i32
+    if (k & 8) == 8
+        return TYPE_F64
+    TYPE_F32
+
+fn fptoi_sat_bits(k: i32) -> i32
+    8 << (k & 3)
+
+# `iN @llvm.fpto[su]i.sat.iN.f{32,64}`, without the `iN ` return type unless
+# `with_ret`.
+fn fptoi_sat_name(s: *EmitterState, k: i32, with_ret: i32)
+    if with_ret == 1
+        emit_str(s, c"i")
+        emit_int(s, fptoi_sat_bits(k) as i64)
+        emit_str(s, c" ")
+    if (k & 4) == 4
+        emit_str(s, c"@llvm.fptoui.sat.i")
+    else
+        emit_str(s, c"@llvm.fptosi.sat.i")
+    emit_int(s, fptoi_sat_bits(k) as i64)
+    if (k & 8) == 8
+        emit_str(s, c".f64")
+    else
+        emit_str(s, c".f32")
+
+# `x as <int>` for a float `x` of type ft (LANGUAGE_SPEC §7.5, AGAST #2192):
+# round toward zero, saturate at the target's range, NaN is 0, then extend back
+# to the i64 every integer is carried in, by the target's signedness.  A bare
+# fptosi is poison out of range (`200.0 as u8` through an i8), and could not
+# reach a u64 above 2^63 at all.  ritz0's _emit_float_to_int_sat.
+pub fn emit_float_to_int_sat(s: *EmitterState, ft: i32, x: i32, target_ty: i32) -> i32
+    var signed: i32 = 1
+    let bits: i32 = type_code_scalar_bits(target_ty, @signed)
+    if target_ty == TYPE_U64
+        signed = 0
+    let k: i32 = fptoi_sat_key(ft, bits, 1 - signed)
+    g_fptoi_sat_mask = g_fptoi_sat_mask | (1 << k)
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = call ")
+    fptoi_sat_name(s, k, 1)
+    emit_str(s, c"(")
+    emit_float_llvm_ty(s, ft)
+    emit_str(s, c" ")
+    emit_reg(s, x)
+    emit_str(s, c")\n")
+    if bits == 64
+        return r
+    let ext: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ext)
+    if signed == 1
+        emit_str(s, c" = sext i")
+    else
+        emit_str(s, c" = zext i")
+    emit_int(s, bits as i64)
+    emit_str(s, c" ")
+    emit_reg(s, r)
+    emit_str(s, c" to i64\n")
+    ext
 
 # `t = sitofp(fptosi(x))`: truncation toward zero through i64.
 fn emit_float_trunc(s: *EmitterState, ft: i32, x: i32) -> i32

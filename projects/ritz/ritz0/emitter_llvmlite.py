@@ -15180,8 +15180,33 @@ class LLVMEmitter:
             else:
                 return val  # Same width
 
+        # Integer <-> float (AGAST #2192): the integer side's signedness picks
+        # the instruction.  _convert_type can't know it and assumes signed.
+        floats = (ir.FloatType, ir.DoubleType)
+        if isinstance(val.type, ir.IntType) and isinstance(target_type, floats):
+            if self._infer_unsigned_expr(expr.expr):
+                return self.builder.uitofp(val, target_type)
+            return self.builder.sitofp(val, target_type)
+        if isinstance(val.type, floats) and isinstance(target_type, ir.IntType):
+            unsigned = self._is_unsigned_type(resolve_alias_in(expr.target, self.type_aliases))
+            return self._emit_float_to_int_sat(val, target_type, unsigned)
+
         # Use _convert_type for other conversions
         return self._convert_type(val, target_type)
+
+    def _emit_float_to_int_sat(self, val: ir.Value, target_type: ir.IntType,
+                               unsigned: bool) -> ir.Value:
+        """`f as <int>`: round toward zero, saturate at the target's range, NaN
+        is 0 (LANGUAGE_SPEC §7.5, AGAST #2192).  A bare fptosi/fptoui is
+        poison out of range, and -O2 deletes whatever depends on poison: a
+        `[[test]]` doing `assert (200.0 as u8) == 200` lost its body, `ret`
+        included, and ran off its end into SIGSEGV."""
+        src = 'f32' if isinstance(val.type, ir.FloatType) else 'f64'
+        name = f"llvm.fpto{'u' if unsigned else 's'}i.sat.i{target_type.width}.{src}"
+        fn = self.module.globals.get(name)
+        if fn is None:
+            fn = ir.Function(self.module, ir.FunctionType(target_type, [val.type]), name=name)
+        return self.builder.call(fn, [val])
 
     def _enum_entry_of_type(self, ty: ir.Type) -> Optional[Tuple[str, List[rast.Variant]]]:
         """`(enum name, variants)` when `ty` is an enum's LLVM type, else None."""

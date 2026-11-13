@@ -1679,6 +1679,36 @@ type off the value it just emitted. ritz1 keeps a `bool` in an `i64` register, s
 it works the type out from the expression. A condition ritz1 can't type is an
 error, not a guess.
 
+#### Integer and float conversions
+
+`x as f32` / `x as f64` converts by the integer's own type: an unsigned value
+is never read as negative.
+
+```ritz body
+let b: u8 = 255
+let f = b as f32                 # 255.0, not -1.0
+let big: u64 = 13835058055282163712
+let d = big as f64               # 1.3835058055282164e19
+```
+
+A float → integer `as` rounds toward zero and **saturates**: a value below the
+target's range gives its minimum, a value above gives its maximum, and NaN
+gives 0. Every float converts to every integer type; nothing is undefined.
+
+```ritz body
+let x: f64 = 300.0
+let y: f64 = 0.0 - 1.5
+let a = x as u8                  # 255
+let b = y as u8                  # 0
+let c = y as i32                 # -1
+let d = x as i8                  # 127
+```
+
+This is LLVM's `fptoui.sat` / `fptosi.sat`, and it's the same rule on all three
+compilers (`ritz0/test_unsigned_float_cast.py`, AGAST #2192). A bare
+`fptosi` gives poison out of range, and the optimiser is then free to delete
+code that depends on the result.
+
 #### Implicit narrowing is an error
 
 A typed `let` or `var` whose initialiser is a wider integer is rejected, unless
