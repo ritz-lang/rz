@@ -215,22 +215,60 @@ def test_a_span_slices_however_it_was_bound(run_with, shape, compiler):
     assert run_with(compiler, shape, program) == 32
 
 
-# Not lowered by ritz1, and refused where it was read as an address.  ritz0 makes
-# a Vec slice into a Span slot a view (_emit_vec_span_slice); ritz1 had no shape
-# for it ("unhandled EXPR_MEMBER", unlocated).
-VEC_INTO_SPAN = (f"{HEADER}pub fn main() -> i32\n{BOXES['Vec'][0]}"
-                 "    let t: Span<i32> = v[1..3]\n    return (t[1] + t.len) as i32\n")
+# AGAST #2501: a Vec slice into a Span slot is a view of the Vec, not
+# vec_slice's copy (ritz0's _emit_vec_span_slice, LANGUAGE_SPEC §3.4):
+# `Span$T { ptr: v.data + lo, len: hi - lo }`.  ritz1 refused it, located
+# ("this slice ... isn't lowered by ritz1"); before #2451, unlocated.
+VEC_SETUP = BOXES["Vec"][0]
+COUNTER = "var g_calls: i32 = 0\n\nfn idx() -> i64\n    g_calls += 1\n    return 1\n\n"
+
+
+def _into_span(rng: str, body: str, before: str = "") -> str:
+    return (f"{HEADER}{before}pub fn main() -> i32\n{VEC_SETUP}"
+            f"    let t: Span<i32> = v[{rng}]\n{body}")
 
 
 @pytest.mark.integration
-def test_a_vec_slice_into_a_span_is_a_view_on_ritz0(run_with):
-    assert run_with("ritz0", "into_span", VEC_INTO_SPAN) == 32
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_vec_slice_into_a_span_reads_the_vec(run_with, compiler):
+    program = _into_span("1..3", "    return (t[1] + t.len) as i32\n")
+    assert run_with(compiler, "into_span", program) == 32
 
 
+# A view, so a write through `t` lands in `v` (a copy's wouldn't: 720).
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_write_through_a_vec_slice_into_a_span_lands_in_the_vec(run_with, compiler):
+    body = "    t[0] = 7\n    return (t[0] as i32) * 100 + *(v.data + 1)\n"
+    assert run_with(compiler, "into_span_write", _into_span("1..3", body)) == 707 % 256
+
+
+# The Vec can be a by-value field: `b.data[1..3]` is the same view.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_vec_field_slice_into_a_span_reads_the_vec(run_with, compiler):
+    program = (f"{HEADER}struct B\n    data: Vec<i32>\n\npub fn main() -> i32\n{VEC_SETUP}"
+               "    let b = B { data: v }\n    let t: Span<i32> = b.data[1..3]\n"
+               "    return (t[1] + t.len) as i32\n")
+    assert run_with(compiler, "field_into_span", program) == 32
+
+
+# `lo` appears in both fields, and is evaluated once: idx() runs one time.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_call_in_the_low_bound_of_a_vec_view_runs_once(run_with, compiler):
+    body = "    return (t[0] + t.len * 10) as i32 + g_calls * 100\n"  # 20 + 2 * 10 + 1 * 100
+    program = _into_span("idx()..3", body, COUNTER)
+    assert run_with(compiler, "into_span_once", program) == (20 + 20 + 100) % 256
+
+
+# A call inside the bound isn't the bound itself, so it can't be shared: ritz1
+# refuses rather than run it twice.  ritz0 emits the bound once and takes it.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_a_vec_slice_into_a_span_is_refused_on_ritz1(compile_with, compiler):
-    _refused(compile_with, compiler, "into_span", VEC_INTO_SPAN,
+def test_a_call_inside_the_low_bound_of_a_vec_view_is_refused_on_ritz1(compile_with, compiler):
+    program = _into_span("idx() + 0..3", "    return t.len as i32\n", COUNTER)
+    _refused(compile_with, compiler, "into_span_nested", program,
              "this slice of a Vec, Span or String isn't lowered by ritz1")
 
 

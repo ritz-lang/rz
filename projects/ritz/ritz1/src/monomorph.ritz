@@ -854,7 +854,7 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
         # Before tracking: `let t = v[1..3]` is `let t = v.slice(1, 3)`, so `t`
         # is tracked as that call's result (AGAST #2451).
         if s.var_init != null
-            if slice_into_span_annotation(s) == 1
+            if slice_into_span_annotation(m, s) == 1
                 g_slice_kept = s.var_init
             rewrite_value_slice(m, s.var_init)
             rewrite_static_ufcs_call(m, s.var_init)   # AGAST #2575
@@ -1436,7 +1436,9 @@ fn rewrite_value_slice(m: *Module, e: *Expr)
     let lo: *Expr = rng.left
     if *(g_lv_prefix_kind + idx) == 2 and find_generic_function(m, c"span_slice", 10) == null
         # No ritzlib.span (a Span<u8> needs none): the view itself.
-        span_view_in_place(e, *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx))
+        let lo_kind: i32 = rng.left.kind
+        if lo_kind == EXPR_INT_LIT or lo_kind == EXPR_IDENT
+            span_view_in_place(e, c"ptr", 3, *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx))
         return
     e.left = base
     lo.next = rng.right
@@ -1449,18 +1451,17 @@ fn rewrite_value_slice(m: *Module, e: *Expr)
     e.call_type_suffix = null
     e.call_type_suffix_len = 0
 
-# `v[lo..hi]` on a Span, as `Span$T { ptr: v.ptr + lo, len: hi - lo }`: ritz0's
-# _emit_span_slice.  `lo` is read twice, so only a literal or a name is taken;
-# anything else stays an index and is refused.  Through a pointer, `p.ptr` and
-# `(*p).ptr` both read through it (AGAST #2448).
-fn span_view_in_place(e: *Expr, suf: *u8, suf_len: i32)
+# `v[lo..hi]` as `Span$T { ptr: v.<field> + lo, len: hi - lo }`: ritz0's
+# _emit_span_slice on a Span (`field` is `ptr`) and _emit_vec_span_slice on a
+# Vec (`data`, AGAST #2501).  `lo` is read twice: the caller takes only a
+# bound that's safe to, or registers it to be evaluated once.  Through a
+# pointer, `p.ptr` and `(*p).ptr` both read through it (AGAST #2448).
+fn span_view_in_place(e: *Expr, field: *u8, field_len: i32, suf: *u8, suf_len: i32)
     let lo: *Expr = e.right.left
     let hi: *Expr = e.right.right
-    if lo.kind != EXPR_INT_LIT and lo.kind != EXPR_IDENT
-        return
     let base: *Expr = slice_node(EXPR_MEMBER, e, e.left, null)
-    base.ident_ptr = c"ptr"
-    base.ident_len = 3
+    base.ident_ptr = field
+    base.ident_len = field_len
     let at: *Expr = slice_node(EXPR_BINARY, e, base, lo)
     at.op = OP_ADD
     let len: *Expr = slice_node(EXPR_BINARY, e, hi, lo)
@@ -1496,9 +1497,17 @@ fn slice_node(kind: i32, at: *Expr, left: *Expr, right: *Expr) -> *Expr
 
 var g_slice_kept: *Expr = null
 
-# `let s: Span<T> = v[lo..hi]` on a Vec is a view in ritz0 (_emit_vec_span_slice),
-# not vec_slice's copy.  ritz1 doesn't lower that; left as an index, it's refused.
-fn slice_into_span_annotation(s: *Stmt) -> i32
+# AGAST #2501: `let s: Span<T> = v[lo..hi]` on a Vec is a view, as ritz0 makes
+# it (_emit_vec_span_slice, LANGUAGE_SPEC §3.4), not vec_slice's copy:
+# `Span$T { ptr: v.data + lo, len: hi - lo }`.  `v` is a Vec local, a `*T`,
+# `@T` or `@&T` of one (`p[lo..hi]` and `(*p)[lo..hi]` are `(*p)[lo..hi]`, R9
+# rule 2, AGAST #2448: `p.data` reads through it), or a by-value Vec field
+# (`b.data[lo..hi]`).  `lo` appears in both fields: a call is evaluated once
+# (si_once, the emitter shares its register), and any other bound must be free
+# of calls, so reading it twice reads the same value.  Returns 1 if `s` is such
+# a let; it's rewritten when its bound allows, and is otherwise left as an
+# index for the emitter to refuse, located.
+fn slice_into_span_annotation(m: *Module, s: *Stmt) -> i32
     if s.var_type_name == null or s.var_type_name_len < 5
         return 0
     if memcmp(s.var_type_name, c"Span$", 5) != 0
@@ -1506,11 +1515,56 @@ fn slice_into_span_annotation(s: *Stmt) -> i32
     let e: *Expr = s.var_init
     if e.kind != EXPR_INDEX or e.right == null or e.right.kind != EXPR_RANGE
         return 0
-    if e.left == null or e.left.kind != EXPR_IDENT
+    var base: *Expr = e.left
+    if base != null and base.kind == EXPR_UNARY and base.op == OP_DEREF
+        base = base.operand
+    if base == null
         return 0
-    let idx: i32 = find_local_var_idx(e.left.ident_ptr, e.left.ident_len)
-    if idx >= 0 and *(g_lv_prefix_kind + idx) == 1
+    var suf: *u8 = null
+    var suf_len: i32 = 0
+    if base.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(base.ident_ptr, base.ident_len)
+        if idx < 0 or *(g_lv_prefix_kind + idx) != 1
+            return 0
+        # The Vec itself, or one level from it (`(*p)` needs the level).
+        let by_value: i32 = *(g_lv_by_value + idx)
+        if by_value == 0 or (base != e.left and by_value != 2)
+            return 1
+        suf = *(g_lv_suffixes + idx)
+        suf_len = *(g_lv_suffix_lens + idx)
+    else if base == e.left and base.kind == EXPR_MEMBER
+        # A by-value Vec field, `b.data[0..2]`: the same view of it.
+        let rf: *StructField = resolve_member_field(m, e.left)
+        if rf == null or rf.field_type != TYPE_STRUCT
+            return 0
+        if classify_collection_type(rf.field_type_name, rf.field_type_name_len, @suf, @suf_len) != 1
+            return 0
+    else
+        return 0
+    let lo: *Expr = e.right.left
+    if lo.kind == EXPR_CALL or lo.kind == EXPR_METHOD
+        si_once_add(lo)
+    else if slice_bound_rereadable(lo) == 0
         return 1
+    e.left = base
+    span_view_in_place(e, c"data", 4, suf, suf_len)
+    return 1
+
+# 1 if reading `e` twice gives the same value with no effect: literals, names,
+# fields, and arithmetic, casts and derefs of those.  A call isn't.
+fn slice_bound_rereadable(e: *Expr) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_INT_LIT or k == EXPR_IDENT
+        return 1
+    if k == EXPR_MEMBER or k == EXPR_CAST
+        return slice_bound_rereadable(e.left)
+    if k == EXPR_UNARY
+        return slice_bound_rereadable(e.operand)
+    if k == EXPR_BINARY
+        if slice_bound_rereadable(e.left) == 1
+            return slice_bound_rereadable(e.right)
     return 0
 
 # Register the UFCS instantiation a call of `method` on receiver `recv`

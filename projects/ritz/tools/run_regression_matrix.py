@@ -78,7 +78,7 @@ _RITZ1_TWINS = {
         "(multi-arg generic calls)",
     # `[T]` parses since #1614; this stops later now.
     "test_issue_slice_generic_siblings":
-        "AGAST #2501 (a Vec slice into a Span / `[u8]` payload); also "
+        "AGAST #2877 (a Vec slice into a `[u8]` payload, :189); also "
         "AGAST #1616 (empty [])",
     "test_issue_struct_enum_variants":
         "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "

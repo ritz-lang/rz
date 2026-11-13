@@ -207,27 +207,21 @@ def test_a_span_of_bytes_needs_no_import(run_with, kind, form, compiler):
     assert run_with(compiler, "no_import", program) == (32 * 10 + 7) % 256
 
 
-# Into a Span slot a Vec slice is a view on ritz0, and refused by ritz1, located,
-# as on the value (#2501).
+# Into a Span slot a Vec slice is a view of what `p` points at, as on the value
+# (#2501): t[1] is v[2], 30.  ritz1 refused it, located.
 INTO_SPAN = (f"{HEADER}fn f(p: {{spelled}}Vec<i32>) -> i32\n"
-             "    let t: Span<i32> = p[1..3]\n    return (t[1] + t.len) as i32\n\n"
+             "    let t: Span<i32> = {base}[1..3]\n    return (t[1] + t.len) as i32\n\n"
              f"pub fn main() -> i32\n{BOXES['Vec'][0]}    return f({{addr}}v)\n")
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(FORMS))
 @pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_vec_slice_into_a_span_is_a_view_on_ritz0(run_with, kind):
+def test_a_vec_slice_into_a_span_is_a_view(run_with, kind, form, compiler):
     spelled, addr = KINDS[kind]
-    assert run_with("ritz0", "into_span", INTO_SPAN.format(spelled=spelled, addr=addr)) == 32
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_vec_slice_into_a_span_is_refused_on_ritz1(compile_with, kind, compiler):
-    spelled, addr = KINDS[kind]
-    _refused(compile_with, compiler, "into_span", INTO_SPAN.format(spelled=spelled, addr=addr),
-             "this slice of a Vec, Span or String isn't lowered by ritz1")
+    program = INTO_SPAN.format(spelled=spelled, addr=addr, base=FORMS[form])
+    assert run_with(compiler, "into_span", program) == 32
 
 
 # An array doesn't slice, so neither does a pointer to one (R9 rule 6).  ritz0
