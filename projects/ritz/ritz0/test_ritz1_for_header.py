@@ -124,7 +124,8 @@ def batch_compile(ritz1_bin):
 @pytest.fixture
 def run_with(ritz1_bin, compile_with):
     def go(compiler, name, program):
-        got = batching.run(compiler, program, batch_build(ritz1_bin))  # AGAST #2806
+        got = batching.run(compiler, program, batch_build(ritz1_bin),  # AGAST #2806
+                           compile=batch_compile(ritz1_bin))  # #2867
         if got is not None:
             return got
         comp, ll, work = compile_with(compiler, name, program)

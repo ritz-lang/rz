@@ -65,7 +65,8 @@ def run_with(ritz1_bin, compile_with):
         return _string_objects(compiler, ritz1_bin)
 
     def go(compiler, name, program):
-        got = batching.run(compiler, program, for_header.batch_build(ritz1_bin, strings))  # #2806
+        got = batching.run(compiler, program, for_header.batch_build(ritz1_bin, strings),  # #2806
+                           compile=for_header.batch_compile(ritz1_bin))
         if got is not None:
             return got
         comp, ll, work = compile_with(compiler, name, program)

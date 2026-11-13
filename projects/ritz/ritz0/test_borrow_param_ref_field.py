@@ -2429,9 +2429,9 @@ def _compile(compiler, ritz1_bin, tmp_path: Path, name: str, program: str):
     return comp, ll, work
 
 
-def _batch_build(ritz1_bin):
-    """batching.run's `build`: compile and link a batch the way `_run` does a row."""
-    def build(compiler, src, work):
+def _batch_compile(ritz1_bin):
+    """batching.run's `compile`: the compile alone, into `work/main.ll` (AGAST #2867)."""
+    def compile(compiler, src, work):
         ll = work / "main.ll"
         env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
         if compiler == "ritz0":
@@ -2439,8 +2439,17 @@ def _batch_build(ritz1_bin):
         else:
             comp = subprocess.run([str(ritz1_bin), str(src), "-o", str(ll)], cwd=work,
                                   env=env, capture_output=True, text=True, timeout=300, check=False)
-        if comp.returncode != 0 or not ll.exists():
-            return False, comp.stdout + comp.stderr, None
+        return comp.returncode, comp.stdout + comp.stderr
+    return compile
+
+
+def _batch_build(ritz1_bin):
+    """batching.run's `build`: compile and link a batch the way `_run` does a row."""
+    def build(compiler, src, work):
+        ll = work / "main.ll"
+        code, output = _batch_compile(ritz1_bin)(compiler, src, work)
+        if code != 0 or not ll.exists():
+            return False, output, None
         exe = work / "main"
         cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
         if compiler == "ritz1":
@@ -2451,7 +2460,8 @@ def _batch_build(ritz1_bin):
 
 
 def _run(compiler, ritz1_bin, tmp_path: Path, name: str, program: str) -> int:
-    got = batching.run(compiler, program, _batch_build(ritz1_bin))  # AGAST #2806
+    got = batching.run(compiler, program, _batch_build(ritz1_bin),  # AGAST #2806
+                       compile=_batch_compile(ritz1_bin))  # #2867
     if got is not None:
         return got
     comp, ll, work = _compile(compiler, ritz1_bin, tmp_path, name, program)

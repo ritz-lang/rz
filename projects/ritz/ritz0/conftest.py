@@ -119,8 +119,10 @@ AGAST #1392. Two things live here, and they are independent.
    compiles CHUNK of a test function's rows as one program per compiler
    (ritz0/batching.py).  `pytest_pyfunc_call` below runs such a test with
    batching on and, if it fails on a batched answer, again with it off, so
-   every failure is the row's own per-row compile.  RITZ_TEST_BATCH=0 turns
-   it off.
+   every failure is the row's own per-row compile.  A row that could lean on
+   another row's import or generic instance is compiled alone too, and gets
+   no batched answer if it does (AGAST #2867).  RITZ_TEST_BATCH=0 turns it
+   off.
 """
 
 import os

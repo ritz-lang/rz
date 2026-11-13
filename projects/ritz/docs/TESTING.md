@@ -344,7 +344,7 @@ Rules:
    minutes to every gate; pick the rows that separate the code paths.
 2. **Batch rows that can share a program.**  Mark the file
    `pytestmark = pytest.mark.batched` and have its harness function ask
-   `batching.run(compiler, program, build)` /
+   `batching.run(compiler, program, build, compile=compile)` /
    `batching.refused(compiler, program, compile, at=)` first (AGAST #2806;
    `_run` / `_assert_refused` in `test_ref_into_value.py`, `run_with` in
    `test_ritz1_for_header.py` already do).  48 rows of a test function
@@ -359,6 +359,20 @@ Rules:
    `xdist_group`, so one worker compiles it.  `RITZ_TEST_BATCH=0` turns it
    off; `RITZ_TEST_BATCH_LOG=<file>` logs each batch and every miss.  The
    11 files #2806 converted went from 529 to 160 test-seconds.
+
+   **A row can't borrow from its batch (AGAST #2867).**  A batch is one
+   module, so a generic instance (`vec_get$i32`) or an import one row's code
+   brings in is there for every row: a row whose compiler never registers
+   the instance it calls still links.  So a row that could lean (it lacks an
+   import the batch has, or code it reaches from `__row<k>` mentions a `$`
+   instance) is also compiled on its own, `compile=` above, the emit only.
+   It gets a batched answer only if that compile succeeds and its module
+   declares nothing external the batch's didn't; otherwise it runs alone and
+   fails as its own.  A test pinning "X gets instantiated" is then as strong
+   batched as unbatched; the log names the symbol (`lean ... leans on
+   Vec$i32_get`).  It costs: the 12 batched files went from 605 to 1078
+   test-seconds (unbatched: 1600), almost all of it ritz0's ~120 ms emit for
+   rows that touch a generic.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

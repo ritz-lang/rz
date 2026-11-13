@@ -29,6 +29,12 @@ if a test fails on a batched answer, conftest's `pytest_pyfunc_call` runs it
 again with batching off, so every failure, and its message, is the row's own
 per-row compile.  `RITZ_TEST_BATCH=0` turns batching off.
 
+**Nor can a batch pass a row that would fail alone by borrowing from another
+row** (AGAST #2867).  The batch's imports and generic instances are every
+row's, so a run row that lacks an import the batch has, or reaches a generic
+instance, is compiled alone too, and answered only if that compiles and needs
+nothing from outside the batch didn't (see "leaning" below).
+
 How the harness learns the other rows: on its first call in a batched test,
 the helper runs each sibling test in the chunk (same function, same
 `compiler` parameter) in *record* mode, where the harness call raises
@@ -261,6 +267,79 @@ def unrename(text: str) -> str:
     return _SUFFIX.sub(r"\1", text)
 
 
+# ---- leaning: a row can't borrow from its batch (AGAST #2867) ---------------
+#
+# A batch is one module, so whatever one row's code makes the compiler emit is
+# there for every row: an import, and every generic instance (`vec_get$i32`).
+# A row whose own compile never registers an instance it calls still links
+# beside a row that did.  #2519 measured it: ritz1 lowered `let w = p[1];
+# w.get(1)` alone to an external `Vec$i32_get` that nothing defines, and
+# batched to `vec_get$i32`, because another row had asked for that instance.
+#
+# So a row that could lean is also compiled on its own (the compile only: no
+# codegen, link or run), and is answered only if that compile succeeds and its
+# module needs nothing from outside that the batch didn't: the batch linked,
+# so its externals resolve, and the row's own are known to resolve the same way.
+#
+# A row could lean if it lacks an import the batch has, or if any code it
+# reaches in the batch's module (from `__row<k>`, through calls) mentions a
+# generic instance: a `$` in a function's name or body, its types included.
+# Those are the only things a compile emits for one row's code that another
+# row's could need.  Only these rows pay for the second compile: ritz0's, in
+# process, costs ~120 ms, about what the whole row would have alone.
+
+_SYM = r'@(?:"((?:[^"\\]|\\.)*)"|([-\w.$]+))'
+_DECLARE = re.compile(rf"^declare\b[^@\n]*{_SYM}", re.MULTILINE)
+_DEFINE = re.compile(rf"^define\b[^@\n]*{_SYM}\(", re.MULTILINE)
+_REF = re.compile(_SYM)
+
+
+def reaches_generic(ll: str, roots) -> set:
+    """Which of `roots` (function names) reach a `$` in `ll`'s functions.
+
+    A root that isn't defined in `ll` is counted as reaching one: unknown is
+    not safe.
+    """
+    calls, generic = {}, set()
+    for m in _DEFINE.finditer(ll):
+        end = ll.find("\n}", m.start())
+        body = ll[m.start():end if end >= 0 else len(ll)]
+        name = m.group(1) or m.group(2)
+        calls[name] = {q or b for q, b in _REF.findall(body)}
+        if "$" in body:
+            generic.add(name)
+    out = set()
+    for root in roots:
+        seen, todo = set(), [root]
+        while todo:
+            n = todo.pop()
+            if n in seen or n not in calls:
+                continue
+            seen.add(n)
+            todo += calls[n]
+        if root not in calls or seen & generic:
+            out.add(root)
+    return out
+
+
+def _imports(program: str) -> set:
+    return {ln.strip() for ln in program.splitlines() if ln.startswith("import ")}
+
+
+def externals(ll: str) -> set:
+    """What an LLVM module needs from outside, in the rows' own names.
+
+    That is what it declares (a module can't both declare and define a name).
+    LLVM intrinsics are the backend's, not a symbol anything links.
+    """
+    return {unrename(q or b) for q, b in _DECLARE.findall(ll) if not (q or b).startswith("llvm.")}
+
+
+def leans(row_ll: str, batch_ll: str) -> set:
+    """What a row's own module needs from outside that its batch's did not."""
+    return externals(row_ll) - externals(batch_ll)
+
+
 def _located(output: str, filename: str):
     """(line, text) for each output line located in `filename`."""
     pat = re.compile(rf"(?:^|[\s/]){re.escape(filename)}:(\d+):\d+")
@@ -272,14 +351,43 @@ def _located(output: str, filename: str):
 
 # ---- runners ----------------------------------------------------------------
 
-def run_rows(compiler: str, programs: list, build, work: Path, filename: str = "main.ritz") -> list:
+def run_rows(compiler: str, programs: list, build, work: Path, filename: str = "main.ritz", *,
+             compile, log=None) -> list:
     """Each row's exit code, or None where the batch has no answer for it.
 
     `build(compiler, src, work) -> (ok, output, exe)` compiles and links the
     program at `src` into `work` the way the harness would.
+    `compile(compiler, src, work) -> (rc, output)` only compiles it, the LLVM
+    module going to `work/<filename's stem>.ll`, as `build` puts it: a row
+    that could lean on the batch is compiled alone too, and is not answered
+    if it does (see "leaning" above).
+    `log(row, why)` hears of each row left out that way.
     """
     answers = [None] * len(programs)
     counter = [0]
+    ll_name = Path(filename).with_suffix(".ll").name
+
+    def own(i, here, k, batch_ll):
+        """Whether row `i` stands on its own: compiles alone, needs no more than the batch."""
+        mine = here / f"row{k}"
+        mine.mkdir()
+        src = mine / filename
+        src.write_text(programs[i])
+        try:
+            code = compile(compiler, src, mine)[0]
+        except Exception:  # noqa: BLE001 - a harness assert, a timeout: no answer
+            code = None
+        ll = mine / ll_name
+        if code != 0 or not ll.exists():
+            why = f"alone rc={code}"
+        else:
+            missing = leans(ll.read_text(), batch_ll)
+            if not missing:
+                return True
+            why = "leans on " + " ".join(sorted(missing))
+        if log:
+            log(i, why)
+        return False
 
     def solve(idx):
         if not idx:
@@ -307,8 +415,17 @@ def run_rows(compiler: str, programs: list, build, work: Path, filename: str = "
                 solve(live[:half])
                 solve(live[half:])
             return
+        batch_ll = here / ll_name
+        if not batch_ll.exists():
+            return  # nothing to hold a row's own module against: no answers
+        batch_ll = batch_ll.read_text()
+        everyones = set().union(*(_imports(programs[i]) for i in live))
+        generic = reaches_generic(batch_ll, [_ROW_FN.format(k) for k, good in enumerate(merged.ok) if good])
         for k, i in enumerate(idx):
             if not merged.ok[k]:
+                continue
+            could_lean = _ROW_FN.format(k) in generic or _imports(programs[i]) != everyones
+            if could_lean and not own(i, here, k, batch_ll):
                 continue
             try:
                 code = subprocess.run([str(exe), *["-"] * k], capture_output=True,
@@ -420,12 +537,15 @@ def per_row() -> None:
         raise _Recorded(None)
 
 
-def run(compiler: str, program: str, build, filename: str = "main.ritz"):
+def run(compiler: str, program: str, build, *, compile, filename: str = "main.ritz"):
     """Row's exit code from its chunk's batch, or None: compile it yourself.
 
-    `build(compiler, src: Path, work: Path) -> (ok, output, exe)`.
+    `build(compiler, src: Path, work: Path) -> (ok, output, exe)`;
+    `compile(compiler, src, work) -> (rc, output)`, the compile alone, its
+    module in `work/<filename's stem>.ll`: a row is answered only if it
+    compiles alone and needs nothing the batch didn't (AGAST #2867).
     """
-    return _ask("run", compiler, program, filename, None, build)
+    return _ask("run", compiler, program, filename, None, (build, compile))
 
 
 def refused(compiler: str, program: str, compile, at=None, filename: str = "main.ritz"):
@@ -576,17 +696,22 @@ def _chunk(item, kind, compiler, filename, worker) -> dict:
                 rows.append((sib.nodeid, call[2]))
         work = shared / key
         programs = [p for _, p in rows]
+        log = os.environ.get("RITZ_TEST_BATCH_LOG")
+        leaning = []
         if kind == "run":
-            got = run_rows(compiler, programs, worker, work, filename)
+            build, compile = worker
+            got = run_rows(compiler, programs, build, work, filename, compile=compile,
+                           log=lambda i, why: leaning.append((i, why)))
         else:
             got = refuse_rows(compiler, programs, worker, work, filename)
         answers = {nid: [_digest(p), g] for (nid, p), g in zip(rows, got)}
-        log = os.environ.get("RITZ_TEST_BATCH_LOG")
         if log:
             with open(log, "a") as fh:
                 fh.write(f"{os.getpid()} {kind} {compiler} {chunk[0].nodeid} chunk={len(chunk)} "
                          f"rows={len(rows)} answered={sum(g is not None for g in got)} "
                          f"secs={time.monotonic() - t0:.2f}\n")
+                for i, why in leaning:
+                    fh.write(f"{os.getpid()} lean {rows[i][0]} {why}\n")
         tmp = answers_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(answers))
         tmp.replace(answers_path)

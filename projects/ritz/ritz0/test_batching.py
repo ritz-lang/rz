@@ -133,6 +133,70 @@ def test_suffixes_come_off_a_rows_diagnostics():
     assert batching.unrename("main.ritz:9:5: H__r12.b wants f__r3") == "main.ritz:9:5: H.b wants f"
 
 
+# ---- leaning: what a row's own module needs from outside (AGAST #2867) -----
+
+_LL = '''\
+@.str = private constant [2 x i8] c"@\\00"
+@"g$i32" = global i32 0
+define i32 @"vec_get$i32"(ptr %v, i64 %i) {
+  %r = call i64 @realloc(ptr null, i64 0)
+  ret i32 0
+}
+define weak_odr i32 @f__r2(i64 %p) {
+  ret i32 0
+}
+declare i64 @realloc(...)
+declare i64 @"Vec$i32_get"(...)
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+declare i32 @f__r3(...)
+'''
+
+
+@pytest.mark.unit
+def test_externals_are_what_a_module_declares():
+    # Intrinsics are the backend's own; a row's renamed names come back as the row's.
+    assert batching.externals(_LL) == {"realloc", "Vec$i32_get", "f"}
+
+
+@pytest.mark.unit
+def test_a_row_leans_on_what_it_needs_from_outside_and_the_batch_did_not():
+    # #2519's ritz1 bug: alone, the row lowers `w.get(1)` to an external
+    # `Vec$i32_get` because nothing registered `vec_get$i32`; batched, another
+    # row registered it and the call resolved.
+    row = "declare i64 @realloc(...)\ndeclare i64 @\"Vec$i32_get\"(...)\n"
+    batch = "define i32 @\"vec_get$i32\"(ptr %v) {\n  ret i32 0\n}\ndeclare i64 @realloc(...)\n"
+    assert batching.leans(row, batch) == {"Vec$i32_get"}
+    assert batching.leans("declare i64 @realloc(...)\n", batch) == set()
+
+
+_REACH = '''\
+define i32 @__row0() {
+  %r = call i32 @f__r0()
+  ret i32 %r
+}
+define i32 @f__r0() {
+  %v = alloca %"Vec$i32"
+  ret i32 0
+}
+define i32 @__row1() {
+  %r = call i32 @g()
+  ret i32 %r
+}
+define i32 @g() {
+  ret i32 0
+}
+declare i32 @"h$i32"(...)
+'''
+
+
+@pytest.mark.unit
+def test_a_row_reaches_a_generic_instance_through_its_calls_and_types():
+    # __row0 calls f__r0, whose body holds a Vec$i32; __row1's calls hold none
+    # (the `$` in a declare after g's body is no part of it); __row2 isn't
+    # there, and what isn't known is checked.
+    assert batching.reaches_generic(_REACH, ["__row0", "__row1", "__row2"]) == {"__row0", "__row2"}
+
+
 # ---- runners: real compiles, ritz0 ----------------------------------------
 
 def _build(compiler, src, work):
@@ -156,14 +220,76 @@ def test_each_row_answers_for_itself(tmp_path):
     rows = [_row("fn f() -> i32\n    3\n"), _row("fn f() -> i32\n    4\n"),
             _row("fn f() -> i32\n    var p: *i32 = 0 as *i32\n    *p\n"),  # crashes
             _row("fn f() -> i32\n    5\n")]
-    assert batching.run_rows("ritz0", rows, _build, tmp_path) == [3, 4, None, 5]
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=_compile) == [3, 4, None, 5]
 
 
 @pytest.mark.integration
 def test_a_row_that_does_not_compile_costs_no_other_row(tmp_path):
     rows = [_row("fn f() -> i32\n    3\n"), _row("fn f() -> i32\n    undefined_thing()\n"),
             _row("fn f() -> i32\n    5\n")]
-    assert batching.run_rows("ritz0", rows, _build, tmp_path) == [3, None, 5]
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=_compile) == [3, None, 5]
+
+
+def _vec(n):
+    return f"fn f() -> i32\n    var v: Vec<i32> = vec_new<i32>()\n    v.len as i32 + {n}\n"
+
+
+GVEC = "import ritzlib.gvec\n\n"
+
+
+@pytest.mark.integration
+def test_a_row_that_only_compiles_beside_another_gets_no_answer(tmp_path):
+    # Imports are hoisted into the batch, so row 1's `vec_new` is row 0's
+    # import's.  Alone, row 1 is "Unknown function: vec_new" (AGAST #2867).
+    rows = [_row(_vec(4), top=GVEC), _row(_vec(4))]
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=_compile) == [4, None]
+
+
+def _compile_failing(marker):
+    """`_compile`, failing alone any row whose program holds `marker`."""
+    def compile(compiler, src, work):
+        if marker in src.read_text():
+            return 1, "alone, no"
+        return _compile(compiler, src, work)
+    return compile
+
+
+@pytest.mark.integration
+def test_a_row_missing_an_import_the_batch_has_is_compiled_alone(tmp_path):
+    # Row 1 reaches nothing generic: its import set is what makes it suspect.
+    rows = [_row("fn f() -> i32\n    3\n", top="import ritzlib.str\n\n"), _row("fn f() -> i32\n    4\n")]
+    compile = _compile_failing("    4\n")
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, None]
+
+
+@pytest.mark.integration
+def test_a_row_that_reaches_no_instance_is_not_compiled_alone(tmp_path):
+    # Same imports, nothing generic: nothing another row emits can be its.
+    def compile(compiler, src, work):
+        raise AssertionError("compiled alone")
+    rows = [_row("fn f() -> i32\n    3\n"), _row("fn f() -> i32\n    4\n")]
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, 4]
+
+
+@pytest.mark.integration
+def test_a_row_that_leans_on_another_rows_instance_gets_no_answer(tmp_path):
+    # #2519's shape, with the compiler's bug played by `compile`: alone, row 1's
+    # module wants an instance only the batch defines, and would not link.
+    def compile(compiler, src, work):
+        code, out = _compile(compiler, src, work)
+        if "+ 4\n" in src.read_text():
+            with open(work / "main.ll", "a") as fh:
+                fh.write('\ndeclare i32 @"vec_get$i32"(...)\n')
+        return code, out
+    rows = [_row(_vec(n), top=GVEC) for n in (3, 4, 5)]
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, None, 5]
+
+
+@pytest.mark.unit
+def test_a_batched_run_needs_the_rows_own_compile():
+    # Without one the batch can't tell a row that leans on another (#2867).
+    with pytest.raises(TypeError):
+        batching.run("ritz0", _row("fn f() -> i32\n    3\n"), _build)
 
 
 @pytest.mark.integration
@@ -199,7 +325,7 @@ def test_an_accepted_batch_answers_no_refusal(tmp_path):
 
 @pytest.mark.unit
 def test_batching_is_off_outside_a_batched_test():
-    assert batching.run("ritz0", _row("fn f() -> i32\n    3\n"), _build) is None
+    assert batching.run("ritz0", _row("fn f() -> i32\n    3\n"), _build, compile=_compile) is None
     assert batching.refused("ritz0", _row("fn f() -> i32\n    3\n"), _compile) is None
 
 
@@ -251,7 +377,7 @@ def _program(name):
 
 
 def _run(tmp_path, name):
-    got = batching.run("ritz0", _program(name), tb._build)
+    got = batching.run("ritz0", _program(name), tb._build, compile=tb._compile)
     if got is not None:
         return got
     with open(os.environ["PER_ROW_LOG"], "a") as fh:

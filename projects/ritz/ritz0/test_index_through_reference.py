@@ -977,8 +977,9 @@ def test_a_vec_method_on_an_element_of_a_local_vec(run_with, compiler):
 
 # The other bases an element receiver is reached from (#2519): `(*p)[i]`, a
 # field, and an un-annotated `let` of an element, which ritz0 types the same way.
-# Batched, the rows share one compile and so one `vec_get$i32`: a row that never
-# registers it still links (#2867).  Check a change here with RITZ_TEST_BATCH=0.
+# Batched, the rows share one compile and so one `vec_get$i32`; a row that never
+# registers it is caught by its own compile, which needs an external `Vec$i32_get`
+# the batch didn't (#2867), and then fails alone.
 ELEMENT_RECEIVERS = {
     "deref_form": "fn f(p: *Vec<Vec<i32>>) -> i32\n    return (*p)[1].get(1)\n",
     "field": "fn f(p: *Vec<Vec<i32>>) -> i32\n    var h: H\n    h.vv = *p\n    return h.vv[1].get(1)\n",

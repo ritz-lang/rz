@@ -336,7 +336,7 @@ def _batch_compile(compiler, path, work):
 
 
 def _run(compiler, tmp_path, name, src):
-    got = batching.run(compiler, src, _batch_build)  # AGAST #2806: None unless batched
+    got = batching.run(compiler, src, _batch_build, compile=_batch_compile)  # #2806: None unless batched
     if got is not None:
         return got
     comp, ll, work = _compile(compiler, tmp_path, name, src)

@@ -126,19 +126,25 @@ def _link(compiler, ll, work):
     return fast_link.clang(cmd, cwd=work, capture_output=True, text=True), exe
 
 
+def _batch_compile(compiler, path, work):
+    """batching.run's `compile`: the compile alone, into `work/main.ll` (AGAST #2867)."""
+    comp = _emit(compiler, path, work / "main.ll", work)
+    return comp.returncode, comp.stdout + comp.stderr
+
+
 def _batch_build(compiler, path, work):
     """batching.run's `build`: compile and link a batch the way `_run` does a row."""
     ll = work / "main.ll"
-    comp = _emit(compiler, path, ll, work)
-    if comp.returncode != 0 or not ll.exists():
-        return False, comp.stdout + comp.stderr, None
+    code, output = _batch_compile(compiler, path, work)
+    if code != 0 or not ll.exists():
+        return False, output, None
     link, exe = _link(compiler, ll, work)
     return link.returncode == 0, link.stderr, exe
 
 
 def _run(compiler, work, src, modules=None):
     if modules is None:
-        got = batching.run(compiler, src, _batch_build)  # AGAST #2806: None unless batched
+        got = batching.run(compiler, src, _batch_build, compile=_batch_compile)  # #2806, #2867
         if got is not None:
             return got
     batching.per_row()

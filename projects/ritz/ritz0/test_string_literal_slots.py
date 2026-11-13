@@ -351,7 +351,8 @@ def _refusal(request, compiler, tmp_path, source, line, col):
 def _assert_runs(request, compiler, tmp_path, name, source, code):
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
-    got = batching.run(compiler, _PRELUDE + source, _batch_build, filename="unit.ritz")  # #2806
+    got = batching.run(compiler, _PRELUDE + source, _batch_build, compile=_batch_compile,  # #2806
+                       filename="unit.ritz")
     if got is not None:
         assert got == code, f"{compiler}, {name}"
         return
