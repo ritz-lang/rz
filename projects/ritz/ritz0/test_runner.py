@@ -555,14 +555,13 @@ def compile_dependencies(
             # AGAST #1911: single-flight. Parallel test_runner processes that
             # miss on one key together compile it once; the rest wait and hit.
             ident = build.cas.module_identity(Path(src_key))
+            # fetch, not get_or_build + copy: gc may remove a hit before it
+            # is copied out (AGAST #2809).
             try:
-                stored, built = store.get_or_build(
-                    cas_key, "o", build_fn, identity=ident,
-                    meta={"module": ident, "compiler": compiler})
+                store.fetch(cas_key, "o", build_fn, Path(obj_path), identity=ident,
+                            meta={"module": ident, "compiler": compiler})
             except build.cas.BuildFailed as e:
                 return None, str(e)
-            if not built:
-                shutil.copyfile(stored, obj_path)
             ll_path = obj_path
 
         ll_cache[src_key] = ll_path
@@ -653,14 +652,11 @@ def _harness_obj(source_path: str, harness_path: str, harness_ll: str,
         return {"ll": Path(harness_ll), "o": Path(harness_obj)}
 
     ident = build.cas.module_identity(Path(source_path)) + "#test-table"
-    try:
-        stored, built = build.cas.ArtifactStore().get_or_build(
-            key, "o", build_fn, identity=ident,
-            meta={"module": ident, "compiler": compiler})
+    try:  # fetch: gc may remove a hit before it is copied out (AGAST #2809)
+        build.cas.ArtifactStore().fetch(key, "o", build_fn, Path(harness_obj), identity=ident,
+                                        meta={"module": ident, "compiler": compiler})
     except build.cas.BuildFailed as e:
         return None, str(e)
-    if not built:
-        shutil.copyfile(stored, harness_obj)
     return harness_obj, None
 
 

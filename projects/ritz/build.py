@@ -2260,13 +2260,12 @@ def compile_freestanding_binary(
                     return {"ll": ll_path, "o": obj_path}
                 ident = cas.module_identity(src)
                 try:
-                    stored, built = store.get_or_build(
-                        cas_key, "o", build_fn, identity=ident,
-                        meta={"module": ident, "compiler": compiler,
-                              "freestanding": object_flags})
+                    # fetch, not get_or_build + copy: gc may remove a hit
+                    # before it is copied out (AGAST #2809).
+                    store.fetch(cas_key, "o", build_fn, obj_path, identity=ident,
+                                meta={"module": ident, "compiler": compiler,
+                                      "freestanding": object_flags})
                     failure = None
-                    if not built:
-                        shutil_mod.copyfile(stored, obj_path)
                 except cas.BuildFailed as e:
                     failure = e.args[0]
 

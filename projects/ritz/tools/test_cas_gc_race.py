@@ -17,6 +17,7 @@ Every store lives under tmp_path, never the shared ~/.cache/ritz/cas.
 import ast
 import importlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -217,13 +218,22 @@ def _load_build():
     return buildpy
 
 
-def _gc_after_every_hit(monkeypatch):
-    """Each store hit is followed at once by a gc that removes that object."""
+def _gc_after_every_hit(monkeypatch, only=None):
+    """Each store hit is followed at once by a gc that removes that object.
+
+    `only(module)`, if given, picks the hits to race by the `module` its meta
+    names (AGAST #2809: a test run hits both module and harness objects).
+    """
     real_hit = cas.ArtifactStore._hit
     hits = []
 
     def racing_hit(self, p):
         p = real_hit(self, p)
+        if only is not None:
+            meta = self.meta_path(p.name.split(".", 1)[0])
+            module = json.loads(meta.read_text()).get("module", "") if meta.is_file() else ""
+            if not only(module):
+                return p
         hits.append(p)
         p.unlink()
         return p
@@ -279,3 +289,76 @@ def test_build_py_compile_modules_rebuilds_when_gc_wins_after_the_hit(
     assert hits, "the second build should have hit the store"
     assert bin_path is not None, "a cache hit gc'd before the copy failed the build"
     assert subprocess.run([str(bin_path)], timeout=30, check=False).returncode == 7
+
+
+# --- AGAST #2809: the remaining store readers ---------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not HAS_CLANG, reason="clang not on PATH")
+def test_freestanding_build_rebuilds_when_gc_wins_after_the_hit(
+    tmp_path, private_store, monkeypatch
+):
+    """build.py compile_freestanding_binary copied a hit out with no lock."""
+    buildpy = _load_build()
+    buildpy.get_build_cache("ritz0")._cache_dir = tmp_path / ".ritz-cache"
+    monkeypatch.setenv("RITZ_PATH", str(PKG_DIR))
+    pkg = tmp_path / "fs_pkg"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "ritz.toml").write_text(
+        '[package]\nname = "fs_pkg"\nversion = "0.1.0"\n\n'
+        '[[bin]]\nname = "kern"\ntarget = "x86_64-unknown-none"\nfreestanding = true\n'
+    )
+    (pkg / "src" / "kern.ritz").write_text("fn _start()\n    return\n")
+
+    def build():
+        # --debug keeps build/debug/obj, where the link reads the object from.
+        argv = ["build.py", "build", str(pkg), "--compiler", "ritz0", "--debug"]
+        monkeypatch.setattr(sys, "argv", argv)
+        buildpy.main()  # the link outcome (ld.lld present?) is irrelevant here
+
+    build()
+    hits = _gc_after_every_hit(monkeypatch)
+    build()
+    assert hits, "the second build should have hit the store"
+    kept = list((pkg / "build" / "debug" / "obj").glob("kern_*.o"))
+    assert len(kept) == 1 and kept[0].stat().st_size > 0
+
+
+def _test_pkg(tmp_path):
+    """A test-only package: src/b.ritz, and test/test_b.ritz importing it."""
+    pkg = tmp_path / "pkg"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "test").mkdir()
+    (pkg / "ritz.toml").write_text(
+        '[package]\nname = "t"\nversion = "0.1.0"\nsources = ["src"]\n\n'
+        "[build]\ntest_only = true\n"
+    )
+    (pkg / "src" / "b.ritz").write_text("pub fn seven() -> i32\n    7\n")
+    t = pkg / "test" / "test_b.ritz"
+    t.write_text(
+        "import b\n\n[[test]]\nfn test_seven() -> i32\n    assert seven() == 7\n    0\n"
+    )
+    return t
+
+
+def _harness(module):
+    return module.endswith("#test-table")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not HAS_CLANG, reason="clang not on PATH")
+@pytest.mark.parametrize(
+    "only",
+    [lambda m: not _harness(m), _harness],
+    ids=["dependency-object", "harness-object"],
+)
+def test_test_runner_rebuilds_when_gc_wins_after_the_hit(tmp_path, monkeypatch, only):
+    """ritz0/test_runner.py copied a module (compile_dependencies) or harness
+    (_harness_obj) hit out with no lock."""
+    test_runner = importlib.import_module("test_runner")
+    t = _test_pkg(tmp_path)
+    assert test_runner.run_test_file(str(t))[:2] == (1, 0)
+    hits = _gc_after_every_hit(monkeypatch, only=only)
+    assert test_runner.run_test_file(str(t))[:2] == (1, 0)
+    assert hits, "the warm run should have hit the store"
