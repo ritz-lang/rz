@@ -127,19 +127,41 @@ POINTERS = ("    var a: [2]S\n    a[1].x = 20\n    var pv: Vec<*S> = vec_new<*S>
             "    pv.push(@a[0])\n")
 POINTER_ELEMENT = "    let s: S = pv[0][1]\n    return s.x\n"
 
+# AGAST #2887: each place `pv[0][1]` is, element 1 of the buffer `pv[0]` points at.
+# ritz1 took the element for an i64 (clang refused it), and `.x` was "unhandled
+# EXPR_MEMBER".  `pv[0]` is evaluated once (`pv[i()][1]` calls `i` once).
+RAW_ELEMENTS = {
+    "copy": POINTER_ELEMENT,
+    "field": "    return pv[0][1].x\n",
+    "field_store": "    pv[0][1].y = 7\n    return a[1].y + 13\n",
+    "store": "    pv[0][1] = S { x: 5, y: 15 }\n    return a[1].x + a[1].y\n",
+    "field_add": "    pv[0][1].x += 1\n    return a[1].x - 1\n",
+    "address": "    let q: *S = @pv[0][1]\n    return q.x\n",
+    "index_once": "    let s: S = pv[once(@n)][1]\n    return s.x + n - 1\n",
+}
+ONCE = "fn once(n: *i32) -> i64\n    *n = *n + 1\n    0\n\n"
+# ritz0 refuses `.f =` and `+=` on it, reads `@` as the wrong place, and evaluates
+# `pv[i]` twice (#2968).
+RITZ0_PLACES = ("address", "field_add", "field_store", "index_once")
 
-RAW_ELEMENT = ["ritz0"] + [pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#2887"))
-                           for c in ("ritz1", "ritz1_selfhosted")]
+
+def _raw_cases():
+    for name in sorted(RAW_ELEMENTS):
+        for c in COMPILERS:
+            marks = [pytest.mark.xfail(strict=True, reason="#2968")] \
+                if c == "ritz0" and name in RITZ0_PLACES else []
+            yield pytest.param(name, c, marks=marks, id=f"{name}-{c}")
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RAW_ELEMENT)
-def test_an_element_that_is_a_pointer_indexes_raw(run_with, compiler):
-    program = f"{HEADER}pub fn main() -> i32\n{POINTERS}{POINTER_ELEMENT}"
-    assert run_with(compiler, "pointer_element", program) == 20
+@pytest.mark.parametrize("name,compiler", list(_raw_cases()))
+def test_an_element_that_is_a_pointer_indexes_raw(run_with, name, compiler):
+    program = (f"{HEADER}{ONCE}pub fn main() -> i32\n    var n: i32 = 0\n"
+               f"{POINTERS}{RAW_ELEMENTS[name]}")
+    assert run_with(compiler, name, program) == 20
 
 
-# Whatever ritz1 makes of it (#2887), it isn't this rule's error.
+# Whatever ritz1 makes of it, it isn't this rule's error.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_an_element_that_is_a_pointer_is_not_refused(compile_with, compiler):
