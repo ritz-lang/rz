@@ -233,19 +233,13 @@ NESTED = {
     "array_of_t": _MAIN + "    var a: [2]T\n    a[1] = t\n    var i: i64 = 2\n" + _NESTED.format(b="a[i - 1]"),
 }
 
-# ritz0 can't index `o.ts[i].edges` (#2567); the values above are worked by hand.
+# ritz0 crashed indexing `o.ts[i].edges`, 'Cannot index type: Vec$E' (#2567).
 # `a[i].edges[j]` was refused on ritz1 until member_field_def typed a field of a
 # by-value array element (#2566); test_ritz1_array_elem_field_type.py has the rest.
-_NESTED_XFAIL = {
-    ("vec_of_t", "ritz0"): "#2567: ritz0 crashes, 'Cannot index type: Vec$E'",
-}
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(NESTED))
-def test_vec_field_of_an_element(run_with, name, compiler, request):
-    reason = _NESTED_XFAIL.get((name, compiler))
-    if reason:
-        request.applymarker(pytest.mark.xfail(reason=reason, strict=True))
+def test_vec_field_of_an_element(run_with, name, compiler):
     assert run_with(compiler, name, NESTED[name]) == 0

@@ -13396,9 +13396,12 @@ class LLVMEmitter:
     def _vec_elem_type(self, ty: Optional[rast.Type]) -> Optional[rast.Type]:
         """Element type of a `Vec<T>` / mangled `Vec$T` type, else None.
 
-        For the mangled form only a plain scalar suffix (`Vec$u8`) is mapped
-        back to a type; a composite suffix (`Vec$ptr_u8`) is not reversible
-        from the name alone, so it answers None (no signedness claim).
+        A plain scalar suffix (`Vec$u8`) maps straight back.  Any other suffix
+        (`Vec$T`, `Vec$ptr_u8`) isn't reversible from the name, so the element
+        is read off the instantiated struct's `data: *T` field.  A struct field
+        `ts: Vec<T>` is stored as `Vec$T`, and without this `o.ts[i]` had no
+        type: `o.ts[i].edges` then wasn't seen as a Vec and ritz0 crashed,
+        "Cannot index type: Vec$E" (AGAST #2567).
         """
         if not isinstance(ty, rast.NamedType):
             return None
@@ -13409,6 +13412,9 @@ class LLVMEmitter:
             if suffix in ('u8', 'u16', 'u32', 'u64', 'i8', 'i16', 'i32',
                           'i64', 'f32', 'f64', 'bool'):
                 return rast.NamedType(ty.span, suffix, [])
+            for fname, ftype in self.struct_fields.get(ty.name, ()):
+                if fname == 'data' and isinstance(ftype, rast.PtrType):
+                    return ftype.inner
         return None
 
     _INT_ARITH_OPS = ('+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>')
