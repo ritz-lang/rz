@@ -112,8 +112,8 @@ ALLOWED = {
     "cast_to_a_pointer": ("fn g(p: @C)\n    (p as *C).x = 3\n", "g(@c)"),
 }
 
-# ritz1 fails this with no `@T` to blame: #2373 can't lower the cast.
-ALLOWED_GAPS = {"cast_to_a_pointer": 2373}
+# ritz1 couldn't lower `(p as *C).x = 3` (#2373); it does now.
+ALLOWED_GAPS = {}
 
 # Whole bindings and by-value fields: the reference is what changes, not what it
 # refers to.
