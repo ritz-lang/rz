@@ -878,6 +878,14 @@ STRUCT_COPIES = {
     + _SMAIN.replace("f(@a)", "f(@a[0])"),
     "by_value_inferred_deref_plain": _S + "fn f(q: *S) -> i32\n    let s = *q\n    return s.x\n\n"
     + _SMAIN.replace("f(@a)", "f(@a[1])"),
+    # AGAST #2996: `return a[1]` from a `-> S` fn, on a `[3]S` itself, is a copy
+    # too, beside the integer uses WHOLE_STRUCT_ELEMENT refuses.
+    "returned_local": _S + "fn f() -> S\n    var a: [3]S\n    a[1].x = 5\n    return a[1]\n\n"
+    + "pub fn main() -> i32\n    let s = f()\n    return s.x\n",
+    "returned_global": _S + "var G: [3]S\n\nfn f() -> S\n    return G[1]\n\n"
+    + "pub fn main() -> i32\n    G[1].x = 5\n    let s = f()\n    return s.x\n",
+    "returned_field": _S + "struct H\n    cs: [3]S\n\nfn f() -> S\n    var h: H\n    h.cs[1].x = 5\n    return h.cs[1]\n\n"
+    + "pub fn main() -> i32\n    let s = f()\n    return s.x\n",
 }
 
 
@@ -911,6 +919,24 @@ WHOLE_STRUCT_ELEMENT = {
     "let_integer_global": _S + "var G: [3]S\n\npub fn main() -> i32\n    let n: i64 = G[1]\n    return n as i32\n",
     "let_integer_field": _S + "struct H\n    cs: [3]S\n\npub fn main() -> i32\n    var h: H\n    let n: i64 = h.cs[1]\n    return n as i32\n",
 }
+# AGAST #2996: every other integer use of `a[1]` on a `[3]S` itself.  ritz1 loaded
+# a `%S` and clang refused the IR, unlocated.  ritz0 refuses `+` and `=`, and fails
+# at clang on `as` and `return` (#2999).
+_DIRECT_BASES = {
+    "local": ("", "    var a: [3]S\n", "a"),
+    "global": ("var G: [3]S\n\n", "", "G"),
+    "field": ("struct H\n    cs: [3]S\n\n", "    var h: H\n", "h.cs"),
+}
+_DIRECT_USES = {
+    "cast": "    return B[1] as i32\n",
+    "added": "    let n: i64 = B[1] + 1\n    return n as i32\n",
+    "assigned": "    var n: i64 = 0\n    n = B[1]\n    return n as i32\n",
+}
+for _db, (_ddecl, _dsetup, _dname) in _DIRECT_BASES.items():
+    for _u, _body in _DIRECT_USES.items():
+        WHOLE_STRUCT_ELEMENT[f"{_u}_{_db}"] = _S + _ddecl + "pub fn main() -> i32\n" + _dsetup + _body.replace("B", _dname)
+    WHOLE_STRUCT_ELEMENT[f"returned_{_db}"] = (_S + _ddecl + "fn f() -> i64\n" + _dsetup + f"    return {_dname}[1]\n\n"
+                                             + "pub fn main() -> i32\n    return f() as i32\n")
 
 
 @pytest.mark.integration

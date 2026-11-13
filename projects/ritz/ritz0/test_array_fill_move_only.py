@@ -142,12 +142,16 @@ def test_move_only_fill_of_more_than_one_is_refused(tmp_path, compiler, site):
 # ritz1 lowers a fill of a struct value, or of a generic `T`, into `[N x i64]`
 # slots: clang refuses the IR. Only a `c:& C` source is copied right (#2288).
 LOWERING_GAP = "AGAST #2976: ritz1 stores a struct fill's value as an i64"
+# AGAST #2996: a `[N]T` local takes T's argument (monomorph), so `[t; 2]` at
+# T = i32 is two i32 slots and `a[1]` an i32, not a load of a placeholder `%T`.
+LOWERED = ("copy_generic_instance",)
 
 
 def _accepted_params():
     for site in sorted(ACCEPTED):
         for compiler in COMPILERS:
-            marks = [pytest.mark.xfail(strict=True, reason=LOWERING_GAP)] if compiler != "ritz0" else []
+            gap = compiler != "ritz0" and site not in LOWERED
+            marks = [pytest.mark.xfail(strict=True, reason=LOWERING_GAP)] if gap else []
             yield pytest.param(site, compiler, marks=marks)
 
 
