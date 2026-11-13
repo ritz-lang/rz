@@ -430,19 +430,22 @@ def test_literal_has_to_fit_the_pointee(compile_with, target, compiler):
     assert "does not fit in `i16`" in comp.stdout + comp.stderr
 
 
-# The chain through `c[i][j]`.  ritz1 has this right and ritz0 segfaults.
-_INDEXED_ELEMENT = (
+# The chain through `c[i][j]`, `*(c[i] + j)`.  ritz0 segfaulted (#2380) until
+# #2968 took an element that's a `*N` for a raw buffer.
+_INDEXED_SETUP = (
     "struct N\n    m: i64\n    b: [2]*i16\n\npub fn main() -> i32\n" + _X
-    + "    var n: [2]N\n    n[1].b[1] = @x[0]\n    var c: [2]*N\n    c[1] = @n[0]\n"
-    + _is("*c[1][1].b[1]"))
+    + "    var n: [2]N\n    n[1].b[1] = @x[0]\n    var c: [2]*N\n    c[1] = @n[0]\n")
+_INDEXED_ELEMENT = {
+    "deref": _is("*c[1][1].b[1]"),
+    "let": "    let e: *i16 = c[1][1].b[1]\n" + _is("*e"),
+}
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", [
-    pytest.param("ritz0", marks=pytest.mark.xfail(strict=True, reason="AGAST #2380")),
-    *RITZ1S])
-def test_element_of_indexed_element(run_with, compiler):
-    assert run_with(compiler, "indexed", _INDEXED_ELEMENT) == 0
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(_INDEXED_ELEMENT))
+def test_element_of_indexed_element(run_with, form, compiler):
+    assert run_with(compiler, "indexed", _INDEXED_SETUP + _INDEXED_ELEMENT[form]) == 0
 
 
 # ritz0 slices no pointer element.  ritz1 took `a[1][0..2]` at stride 1.

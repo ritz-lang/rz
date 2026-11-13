@@ -8474,6 +8474,14 @@ class LLVMEmitter:
             is_ref = isinstance(ty, rast.RefType) or ty.shared
             if is_ref and not deref and not isinstance(inner, rast.ArrayType):
                 raise EmitError(array_rules.NOT_A_BUFFER, expr.span)
+            # An element that's a `*T` over anything else is a raw buffer (R9):
+            # `pv[i][j]` is the place `*(pv[i] + j)`, which every position lowers
+            # at stride T with `pv[i]` evaluated once (#2968, ritz1's #2887).
+            if (not deref and isinstance(root, rast.Index)
+                    and not isinstance(inner, rast.ArrayType)
+                    and not isinstance(expr.index, rast.Range)):
+                return rast.UnaryOp(expr.span, '*',
+                                    rast.BinOp(expr.span, '+', root, expr.index))
             return None
         if isinstance(expr.index, rast.Range):
             return None

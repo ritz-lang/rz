@@ -166,6 +166,9 @@ LEGAL = {
                    "    return vv[0][1]\n", 20),
     "vec_element_field": (STRUCTS, "    return sv[1].y\n", 20),
     "array_of_arrays": ("    var g: [2][3]i32\n    g[1][2] = 20\n", "    return g[1][2]\n", 20),
+    # A `*[3]i32` element indexes the array, not a raw buffer of arrays (#2968).
+    "array_pointer_element": ("    var g: [2][3]i32\n    g[0][1] = 20\n    var pg: [1]*[3]i32\n"
+                              "    pg[0] = @g[0]\n", "    return pg[0][1]\n", 20),
     "deref_of_pointer": (_new("i32", (10, 20, 30)) + "    let p: *Vec<i32> = @v\n",
                          "    return (*p)[1]\n", 20),
     "deref_of_inferred_ref": (_new("i32", (10, 20, 30)) + "    let p = @v\n",
@@ -180,6 +183,8 @@ POINTER_ELEMENT = "    let s: S = pv[0][1]\n    return s.x\n"
 # AGAST #2887: each place `pv[0][1]` is, element 1 of the buffer `pv[0]` points at.
 # ritz1 took the element for an i64 (clang refused it), and `.x` was "unhandled
 # EXPR_MEMBER".  `pv[0]` is evaluated once (`pv[i()][1]` calls `i` once).
+# ritz0 refused `.f =` and `+=` on it, read `@` as the wrong place, and evaluated
+# `pv[i]` twice (#2968).
 RAW_ELEMENTS = {
     "copy": POINTER_ELEMENT,
     "field": "    return pv[0][1].x\n",
@@ -190,21 +195,11 @@ RAW_ELEMENTS = {
     "index_once": "    let s: S = pv[once(@n)][1]\n    return s.x + n - 1\n",
 }
 ONCE = "fn once(n: *i32) -> i64\n    *n = *n + 1\n    0\n\n"
-# ritz0 refuses `.f =` and `+=` on it, reads `@` as the wrong place, and evaluates
-# `pv[i]` twice (#2968).
-RITZ0_PLACES = ("address", "field_add", "field_store", "index_once")
-
-
-def _raw_cases():
-    for name in sorted(RAW_ELEMENTS):
-        for c in COMPILERS:
-            marks = [pytest.mark.xfail(strict=True, reason="#2968")] \
-                if c == "ritz0" and name in RITZ0_PLACES else []
-            yield pytest.param(name, c, marks=marks, id=f"{name}-{c}")
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_raw_cases()))
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(RAW_ELEMENTS))
 def test_an_element_that_is_a_pointer_indexes_raw(run_with, name, compiler):
     program = (f"{HEADER}{ONCE}pub fn main() -> i32\n    var n: i32 = 0\n"
                f"{POINTERS}{RAW_ELEMENTS[name]}")
@@ -220,9 +215,17 @@ def test_an_element_that_is_a_pointer_is_not_refused(compile_with, compiler):
     assert NEEDS_INDEX("S") not in comp.stdout + comp.stderr
 
 
+# ritz1 reads garbage through a `*[N]T` element, silently (#2995).
+def _legal_cases():
+    for name in sorted(LEGAL):
+        for c in COMPILERS:
+            marks = [pytest.mark.xfail(strict=True, reason="#2995")] \
+                if name == "array_pointer_element" and c != "ritz0" else []
+            yield pytest.param(name, c, marks=marks, id=f"{name}-{c}")
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(LEGAL))
+@pytest.mark.parametrize("name,compiler", list(_legal_cases()))
 def test_the_legal_neighbours_still_run(run_with, name, compiler):
     setup, body, want = LEGAL[name]
     assert run_with(compiler, name, f"{HEADER}pub fn main() -> i32\n{setup}{body}") == want
