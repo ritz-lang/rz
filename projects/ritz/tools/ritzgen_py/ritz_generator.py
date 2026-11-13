@@ -410,6 +410,8 @@ class RitzGenerator:
         self._emit('    p.last_fn_sig = null')
         self._emit('    p.last_fn_sig_pos = -1')
         self._emit('    p.var_fn_sig = null')
+        # AGAST #2943: furthest token reached, for dropped-item diagnostics.
+        self._emit('    p.max_pos = 0')
 
     def _generate_parser_helpers(self):
         self._emit('fn p_peek(p: *Parser) -> i32')
@@ -421,6 +423,11 @@ class RitzGenerator:
         self._emit('    let k: i32 = p_peek(p)')
         self._emit('    if p.pos < p.token_count')
         self._emit('        p.pos = p.pos + 1')
+        # AGAST #2943: record how far the parse got.  Backtracking rewinds
+        # p.pos, not this, so a failed item can be reported where its
+        # deepest attempt stopped rather than at the item's first token.
+        self._emit('        if p.pos > p.max_pos')
+        self._emit('            p.max_pos = p.pos')
         self._emit('    return k')
         self._emit('')
         self._emit('fn p_expect(p: *Parser, kind: i32) -> i32')

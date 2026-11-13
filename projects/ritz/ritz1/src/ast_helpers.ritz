@@ -298,11 +298,18 @@ var g_parse_file: *u8
 # file), checked by module_require_eof.  Non-zero ⇒ hard parse failure.
 var g_dropped_items: i32 = 0
 
+# AGAST #2943: the failure point (Parser.max_pos) of the last dropped item
+# reported, -1 for none.  Recovery skips one token and re-tries from the next
+# anchor, so `pub fn f` fails twice, at `pub` then at `fn`; both attempts stop
+# at the same token, and only the first is reported (and counted).
+var g_last_drop_at: i32 = -1
+
 pub fn parser_set_source_file(path: *u8)
     g_parse_file = path
 
 pub fn parser_reset_diagnostics()
     g_dropped_items = 0
+    g_last_drop_at = -1
     g_attr_errors = 0
     g_attr_last_err = null
     g_array_len_line = -1
@@ -322,13 +329,17 @@ fn eprint_lexeme(start: *u8, len: i32)
 
 # Print "<file>:<line>:<col>: " for the token at p.pos.
 fn eprint_parse_location(p: *Parser)
+    eprint_location_at(p, p.pos)
+
+# `file:line:col: ` of token `pos` (`file:0:0: ` past the end).
+fn eprint_location_at(p: *Parser, pos: i32)
     if g_parse_file != null
         eprints_cstr(g_parse_file)
     else
         eprints_cstr(c"<input>")
     eprint_char(':')
-    if p.pos < p.token_count
-        let tok: *Token = p.tokens + p.pos
+    if pos >= 0 and pos < p.token_count
+        let tok: *Token = p.tokens + pos
         eprint_i64(tok.line as i64)
         eprint_char(':')
         eprint_i64(tok.col as i64)
@@ -343,10 +354,17 @@ fn eprint_construct(p: *Parser)
     if p.pos >= p.token_count
         eprints_cstr(c"<end of file>")
         return
-    let tok: *Token = p.tokens + p.pos
+    var at: i32 = p.pos
+    var tok: *Token = p.tokens + at
+    # `pub fn main` reads better than a bare `pub` (AGAST #2943).
+    if tok.kind == TOK_PUB and at + 1 < p.token_count
+        eprint_lexeme(tok.start, tok.len)
+        eprint_char(' ')
+        at = at + 1
+        tok = p.tokens + at
     eprint_lexeme(tok.start, tok.len)
-    if p.pos + 1 < p.token_count
-        let nxt: *Token = p.tokens + (p.pos + 1)
+    if at + 1 < p.token_count
+        let nxt: *Token = p.tokens + (at + 1)
         if nxt.kind == TOK_IDENT
             eprint_char(' ')
             eprint_lexeme(nxt.start, nxt.len)
@@ -634,6 +652,26 @@ pub fn fn_copy_instance_attrs(dst: *FnDef, src: *FnDef)
     if bits != 0
         item_attr_record(dst as *u8, bits)
 
+# Describe token `pos` for a diagnostic: its quoted lexeme, or a name for
+# the layout tokens whose lexeme is whitespace or empty.
+fn eprint_token_desc(p: *Parser, pos: i32)
+    if pos < 0 or pos >= p.token_count
+        eprints_cstr(c"end of file")
+        return
+    let tok: *Token = p.tokens + pos
+    if tok.kind == TOK_EOF
+        eprints_cstr(c"end of file")
+    else if tok.kind == TOK_NEWLINE
+        eprints_cstr(c"end of line")
+    else if tok.kind == TOK_INDENT
+        eprints_cstr(c"indent")
+    else if tok.kind == TOK_DEDENT
+        eprints_cstr(c"dedent")
+    else
+        eprint_char(39 as u8)
+        eprint_lexeme(tok.start, tok.len)
+        eprint_char(39 as u8)
+
 # Called by the generated anchor-skip recovery in parse_item BEFORE it
 # skips the construct it could not parse.  p.pos is still at the first
 # token of that construct (every failed alternative rewinds to start_pos).
@@ -642,9 +680,27 @@ pub fn fn_copy_instance_attrs(dst: *FnDef, src: *FnDef)
 # but it must not be silent, and it must not leave the parse "successful".
 # Recording the drop here is what turns a vanished function into a
 # compile-time error instead of a link-time mystery (AGAST #1301).
+#
+# AGAST #2943: the error is located at p.max_pos, the furthest token any
+# attempt reached (the `>>` of `Vec<*Vec<i32>>`, not the fn holding it), and
+# a note names the item.  When nothing past the item's first token was
+# consumed there is no deeper point, and the item itself is the error.
 pub fn parser_report_dropped_item(p: *Parser) -> i32
-    g_dropped_items = g_dropped_items + 1
-    eprints_cstr(c"error: ")
+    let fail_at: i32 = p.max_pos
+    if fail_at > p.pos
+        if fail_at == g_last_drop_at
+            return 1
+        g_last_drop_at = fail_at
+        g_dropped_items = g_dropped_items + 1
+        eprints_cstr(c"error: ")
+        eprint_location_at(p, fail_at)
+        eprints_cstr(c"unexpected ")
+        eprint_token_desc(p, fail_at)
+        eprintln_cstr(c"")
+        eprints_cstr(c"note: ")
+    else
+        g_dropped_items = g_dropped_items + 1
+        eprints_cstr(c"error: ")
     eprint_parse_location(p)
     eprints_cstr(c"cannot parse item starting at '")
     eprint_construct(p)
