@@ -1197,29 +1197,35 @@ FREESTANDING_LIBC_SYMBOLS = {
 # unless the IR says not to. Ritz links -nostdlib, so such a call is an
 # undefined reference at link time -- or, for ritzlib's own memcpy, infinite
 # self-recursion at runtime.
+# The helpers are `pub` (external linkage) on purpose (AGAST #2839). Private
+# helpers are `internal`, so -O2 inlines them into main with constant sizes;
+# the resulting fixed-size memset/memcpy intrinsics are expanded inline by the
+# backend and never reach libc. That left clang 21's strlen idiom (new in
+# LLVM 21) as the only leak, so clang 20 saw none. A standalone body with a
+# runtime `n` makes loop-idiom emit a real memset call on clang 20 and 21.
 _LOOP_IDIOM_SOURCE = """\
 var src_buf: [256]u8
 var dst_buf: [256]u8
 
-fn str_len(s: *u8) -> i64
+pub fn str_len(s: *u8) -> i64
     var len: i64 = 0
     while *(s + len) != 0
         len = len + 1
     return len
 
-fn mem_copy(dst: *u8, src: *u8, n: i64)
+pub fn mem_copy(dst: *u8, src: *u8, n: i64)
     var i: i64 = 0
     while i < n
         *(dst + i) = *(src + i)
         i = i + 1
 
-fn mem_set(dst: *u8, v: u8, n: i64)
+pub fn mem_set(dst: *u8, v: u8, n: i64)
     var i: i64 = 0
     while i < n
         *(dst + i) = v
         i = i + 1
 
-fn mem_cmp(a: *u8, b: *u8, n: i64) -> i64
+pub fn mem_cmp(a: *u8, b: *u8, n: i64) -> i64
     var i: i64 = 0
     while i < n
         if *(a + i) != *(b + i)
@@ -1247,6 +1253,14 @@ def _undefined_libc_symbols(obj_path):
         if parts:
             found.add(parts[-1])
     return found & FREESTANDING_LIBC_SYMBOLS
+
+
+def _clang_version():
+    """First line of `clang --version`, for setup-style failure messages."""
+    import subprocess
+    proc = subprocess.run(["clang", "--version"], capture_output=True, text=True)
+    lines = proc.stdout.splitlines()
+    return lines[0].strip() if lines else "clang (version unknown)"
 
 
 @pytest.mark.integration
@@ -1337,9 +1351,13 @@ class TestFreestandingIRHasNoLibcCalls:
 
         # Non-vacuity guard: without the attribute clang MUST synthesise the
         # calls, otherwise the comparison below is between two empty sets.
+        # Not a skip: a clang that stops rewriting must be looked at, so the
+        # message names the version to make it read as a setup problem.
         assert bare, (
-            "stripping \"no-builtins\" did not reproduce the libc leak, so "
-            "this test can no longer distinguish the flags from the fix")
+            f"SETUP: {_clang_version()} no longer rewrites any loop in "
+            "_LOOP_IDIOM_SOURCE into a libc call once \"no-builtins\" is "
+            "stripped, so this test cannot distinguish the flags from the "
+            "fix. Add a loop this clang does rewrite (AGAST #2839).")
         assert flagged == bare, (
             "-ffreestanding/-fno-builtin changed the outcome on .ll input "
             f"({sorted(bare)} -> {sorted(flagged)}); they are now "
