@@ -779,7 +779,9 @@ fn collect_instantiations_from_module(m: *Module)
                 track_typed_local_through(pp.name, pp.name_len, pp.param_type, pp.param_pointee_type, pp.param_type_name, pp.param_type_name_len)
                 pp = pp.next
             # Walk function body
+            set_mono_fn_context(f)
             collect_from_fn_body(m, f.body)
+            set_mono_fn_context(null)
         f = f.next
 
     # Walk impl block methods.  Skip generic impl blocks (those with
@@ -807,7 +809,9 @@ fn collect_instantiations_from_module(m: *Module)
                     else
                         track_typed_local_through(ipp.name, ipp.name_len, ipp.param_type, ipp.param_pointee_type, ipp.param_type_name, ipp.param_type_name_len)
                     ipp = ipp.next
+                set_mono_fn_context(method)
                 collect_from_fn_body(m, method.body)
+                set_mono_fn_context(null)
                 method = method.next
         ib = ib.next
 
@@ -850,6 +854,8 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
     note_compound_calls(s)            # AGAST #2529, after the rewrite above
     let k: i32 = s.kind
     if k == STMT_EXPR
+        if s == g_mono_tail
+            slice_into_expected(m, s.expr, g_mono_ret_name, g_mono_ret_len)   # AGAST #2877
         collect_from_expr(m, s.expr)
     else if k == STMT_VAR_DECL
         # Before tracking: `let t = v[1..3]` is `let t = v.slice(1, 3)`, so `t`
@@ -961,6 +967,7 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
         collect_from_fn_body(m, s.while_body)
     else if k == STMT_RETURN
         if s.return_value != null
+            slice_into_expected(m, s.return_value, g_mono_ret_name, g_mono_ret_len)   # AGAST #2877
             collect_from_expr(m, s.return_value)
     else if k == STMT_ASSERT
         # `assert <cond>` — cond stored in if_cond (slot reuse).  Generic
@@ -1577,11 +1584,14 @@ var g_slice_kept: *Expr = null
 # a let; it's rewritten when its bound allows, and is otherwise left as an
 # index for the emitter to refuse, located.
 fn slice_into_span_annotation(m: *Module, s: *Stmt) -> i32
-    if s.var_type_name == null or s.var_type_name_len < 5
+    return slice_into_span_slot(m, s.var_init, s.var_type_name, s.var_type_name_len)
+
+# The same view of `e` into any slot of type `tn` (AGAST #2877).
+fn slice_into_span_slot(m: *Module, e: *Expr, tn: *u8, tn_len: i32) -> i32
+    if e == null or tn == null or tn_len < 5
         return 0
-    if memcmp(s.var_type_name, c"Span$", 5) != 0
+    if memcmp(tn, c"Span$", 5) != 0
         return 0
-    let e: *Expr = s.var_init
     if e.kind != EXPR_INDEX or e.right == null or e.right.kind != EXPR_RANGE
         return 0
     var base: *Expr = e.left
@@ -1618,6 +1628,57 @@ fn slice_into_span_annotation(m: *Module, s: *Stmt) -> i32
     e.left = base
     span_view_in_place(e, c"data", 4, suf, suf_len)
     return 1
+
+# AGAST #2877: `e` lands in a slot of mangled type `tn`: a return (`-> Span<T>`,
+# `-> [T]`, the tail), an argument, or a Span let.  A Vec slice there is the
+# view slice_into_span_slot builds, as ritz0 makes it (_expects_span), and a
+# variant constructor passes its payload's type on: `Some(b.data[0..1])` into
+# `-> Option<[u8]>` is a view of `b.data`, `Ok(v[1..3])` into `Result<Span<T>,
+# E>` too.  A slice it can't rewrite is kept (g_slice_kept) for the emitter to
+# refuse, located: as vec_slice's copy it was a Vec in a Span slot.
+fn slice_into_expected(m: *Module, e: *Expr, tn: *u8, tn_len: i32)
+    if e == null or tn == null or tn_len <= 0
+        return
+    if e.kind == EXPR_INDEX
+        if slice_into_span_slot(m, e, tn, tn_len) == 1 and e.kind == EXPR_INDEX
+            g_slice_kept = e
+        return
+    if e.kind != EXPR_CALL or e.call_type_suffix_len != 0 or e.args == null or e.args.next != null
+        return
+    var pay_len: i32 = 0
+    let pay: *u8 = variant_payload_type(m, tn, tn_len, e.func_name, e.func_name_len, @pay_len)
+    if pay != null and pay_len > 0
+        slice_into_expected(m, e.args, pay, pay_len)
+
+# The return type of the fn whose body collect_from_fn_body walks, and its
+# tail statement (a `-> T` fn's value), for slice_into_expected.  null in a
+# generic's specialisation, which is left as it was.
+var g_mono_ret_name: *u8 = null
+var g_mono_ret_len: i32 = 0
+var g_mono_tail: *Stmt = null
+
+fn set_mono_fn_context(f: *FnDef)
+    g_mono_ret_name = null
+    g_mono_ret_len = 0
+    g_mono_tail = null
+    if f == null or f.return_type_name == null or f.return_type_name_len <= 0
+        return
+    g_mono_ret_name = f.return_type_name
+    g_mono_ret_len = f.return_type_name_len
+    var st: *Stmt = f.body
+    while st != null and st.next != null
+        st = st.next
+    if st != null and st.kind == STMT_EXPR
+        g_mono_tail = st
+
+# A plain (non-generic) fn call's callee, whose params type its arguments.
+fn slice_callee(m: *Module, e: *Expr) -> *FnDef
+    if e.call_type_suffix_len != 0
+        return null
+    let f: *FnDef = find_fn_in_module(m, e.func_name, e.func_name_len)
+    if f == null or f.type_params != null
+        return null
+    return f
 
 # 1 if reading `e` twice gives the same value with no effect: literals, names,
 # fields, and arithmetic, casts and derefs of those.  A call isn't.
@@ -1723,9 +1784,17 @@ fn collect_from_expr(m: *Module, e: *Expr)
         # vec_push_bytes$u8) needs that method even when nothing else calls it.
         if e.args != null and buf_eq(e.func_name, e.func_name_len, c"format_into", 11) == 1
             register_receiver_method(m, e.args, c"push_bytes", 10)
-        # Recurse into arguments
+        # Recurse into arguments, each into its parameter's slot (AGAST #2877).
+        let callee: *FnDef = slice_callee(m, e)
+        var par: *Param = null
+        if callee != null
+            par = callee.params
         var arg: *Expr = e.args
         while arg != null
+            if par != null
+                if par.param_type == TYPE_STRUCT
+                    slice_into_expected(m, arg, par.param_type_name, par.param_type_name_len)
+                par = par.next
             collect_from_expr(m, arg)
             arg = arg.next
     else if k == EXPR_STRUCT_LIT
@@ -1984,7 +2053,15 @@ fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suff
         tp = tp.next
         i = i + 1
     g_mono_component_mode = 0
+    # A specialisation's body has no slot context (AGAST #2877).
+    let saved_ret: *u8 = g_mono_ret_name
+    let saved_ret_len: i32 = g_mono_ret_len
+    let saved_tail: *Stmt = g_mono_tail
+    set_mono_fn_context(null)
     collect_from_fn_body(m, cur.body)
+    g_mono_ret_name = saved_ret
+    g_mono_ret_len = saved_ret_len
+    g_mono_tail = saved_tail
     cur
 
 # Rewrite every `$`-separated component of `name` that equals type_param to

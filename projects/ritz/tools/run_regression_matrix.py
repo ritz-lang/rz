@@ -76,10 +76,6 @@ _RITZ1_TWINS = {
     "test_trait_bounds":
         "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "
         "(multi-arg generic calls)",
-    # `[T]` parses since #1614; this stops later now.
-    "test_issue_slice_generic_siblings":
-        "AGAST #2877 (a Vec slice into a `[u8]` payload, :189); also "
-        "AGAST #1616 (empty [])",
     "test_issue_struct_enum_variants":
         "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "
         "patterns",
@@ -94,6 +90,9 @@ _RITZ1_TWINS = {
     "test_issue_usize_struct_field":
         "AGAST #2198 — a `usize` struct field emits `store %usize` (invalid IR)",
     # --- codegen, runtime failures ---
+    # The file builds since #2877; `s.is_empty()` calls the bool span_is_empty$u8 as i64.
+    "test_issue_slice_generic_siblings::test_span_builtin_methods":
+        "AGAST #2882 — a bool UFCS method's result read as i64 (upper bits garbage)",
 }
 
 # Files no compiler can build: they target draft features (LARB-0013) that

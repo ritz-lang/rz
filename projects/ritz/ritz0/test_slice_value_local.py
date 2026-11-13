@@ -275,6 +275,66 @@ def test_a_call_inside_the_low_bound_of_a_vec_view_is_refused_on_ritz1(compile_w
              "this slice of a Vec, Span or String isn't lowered by ritz1")
 
 
+# AGAST #2877: the same view wherever a Span is expected, not only an annotated
+# let: a return (`-> Span<T>`, `-> [T]`, or the tail), an argument, and a
+# variant payload (`Some(..)` into `-> Option<[T]>`, `Ok(..)`).  ritz1 made a
+# vec_slice copy there (a Vec in a Span slot) or, for a field through a `&B`,
+# refused it.  Each program reads back through the view, then writes through
+# it: a copy would leave `v` at 20 (score 20 * 100 + 2 -> 210 mod 256).
+INTO_SPAN_SITES = {
+    "return": ("fn view(v:& Vec<i32>, lo: i64) -> Span<i32>\n    return v[lo..3]\n\n",
+               "    var t = view(@&v, 1)\n"),
+    "bracket_return": ("fn view(v:& Vec<i32>, lo: i64) -> [i32]\n    return v[lo..3]\n\n",
+                       "    var t = view(@&v, 1)\n"),
+    "tail": ("fn view(v:& Vec<i32>, lo: i64) -> Span<i32>\n    v[lo..3]\n\n",
+             "    var t = view(@&v, 1)\n"),
+    "argument": ("fn through(s: Span<i32>) -> Span<i32>\n    s\n\n",
+                 "    var t = through(v[1..3])\n"),
+    "some_field_through_ref": ("struct B\n    data: Vec<i32>\n\n"
+                               "fn head(b:& B) -> Option<[i32]>\n    Some(b.data[1..3])\n\n",
+                               "    var b = B { data: v }\n"
+                               "    var t = match head(@&b)\n        Some(s) => s\n"
+                               "        None => span_empty<i32>()\n"),
+    "ok_return": ("fn view(v:& Vec<i32>) -> Result<Span<i32>, i32>\n    return Ok(v[1..3])\n\n",
+                  "    var t = match view(@&v)\n        Ok(s) => s\n"
+                  "        Err(_) => span_empty<i32>()\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("site", sorted(INTO_SPAN_SITES))
+def test_a_vec_slice_where_a_span_is_expected_is_a_view(run_with, site, compiler):
+    before, setup = INTO_SPAN_SITES[site]
+    body = ("    t[0] = 7\n"
+            "    let back: i32 = *(v.data + 1)\n"
+            "    return (t[1] - 30 + t.len as i32 + back * 100 - 700) as i32\n")
+    program = f"{HEADER}{before}pub fn main() -> i32\n{VEC_SETUP}{setup}{body}"
+    # t = [20, 30]: t[1] - 30 = 0, t.len = 2, back = 7 through a view.
+    assert run_with(compiler, f"into_span_{site}", program) == 2
+
+
+# `lo` is in both of the view's fields; a call there runs once, as for a let.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_call_in_the_low_bound_of_a_returned_view_runs_once(run_with, compiler):
+    program = (f"{HEADER}{COUNTER}fn view(v:& Vec<i32>) -> Span<i32>\n    return v[idx()..3]\n\n"
+               f"pub fn main() -> i32\n{VEC_SETUP}    let t = view(@&v)\n"
+               "    return (t[0] + t.len * 10) as i32 + g_calls * 100\n")
+    assert run_with(compiler, "return_span_once", program) == (20 + 20 + 100) % 256
+
+
+# A call inside the bound can't be shared: refused, located, not made a copy
+# (a Vec in the Span return slot, invalid IR).
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_a_call_inside_the_low_bound_of_a_returned_view_is_refused_on_ritz1(compile_with, compiler):
+    program = (f"{HEADER}{COUNTER}fn view(v:& Vec<i32>) -> Span<i32>\n    return v[idx() + 0..3]\n\n"
+               f"pub fn main() -> i32\n{VEC_SETUP}    return view(@&v).len as i32\n")
+    _refused(compile_with, compiler, "return_span_nested", program,
+             "this slice of a Vec, Span or String isn't lowered by ritz1")
+
+
 # A struct that isn't one of the three has no slice.  ritz1 read it as an address.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])

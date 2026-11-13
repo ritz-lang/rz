@@ -5119,9 +5119,14 @@ class LLVMEmitter:
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
                 self._procedure_method_calls = set()
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
-                last_val = self._emit_into_array_slot(
-                    fn_def.body.expr, fn_def.ret_type,
-                    lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
+                if self._is_range_index(fn_def.body.expr):
+                    # AGAST #2877: a Vec slice as a `-> Span<T>` tail is a
+                    # view, as after `return`.
+                    last_val = self._emit_slice_into(fn_def.body.expr, fn_def.ret_type)
+                else:
+                    last_val = self._emit_into_array_slot(
+                        fn_def.body.expr, fn_def.ret_type,
+                        lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
                 self._reject_missing_tail_value(
                     fn_def, lambda e: id(e) in self._procedure_method_calls)
                 self.closure_expected_type = None  # Clear context
@@ -8938,6 +8943,22 @@ class LLVMEmitter:
             return rast.NamedType(base_ritz_type.span, type_name[4:], [])
         raise ValueError("Vec type without element type")
 
+    @staticmethod
+    def _is_range_index(expr: rast.Expr) -> bool:
+        """`v[lo..hi]`: a slice, whose shape its slot decides."""
+        return (isinstance(expr, (rast.Index, rast.SliceExpr))
+                and (isinstance(expr, rast.SliceExpr) or isinstance(expr.index, rast.Range)))
+
+    def _emit_slice_into(self, expr: rast.Expr, slot: Optional[rast.Type]) -> ir.Value:
+        """Emit the slice `expr` into a `slot`-typed place: a Vec slice into
+        a Span slot is a view (_expects_span), as for a Span let (AGAST #2877)."""
+        saved = self.expected_ritz_type
+        self.expected_ritz_type = slot
+        try:
+            return self._emit_expr(expr)
+        finally:
+            self.expected_ritz_type = saved
+
     def _expects_span(self) -> bool:
         """True when the value being emitted is required to be a Span."""
         expected = self.expected_ritz_type
@@ -11140,6 +11161,10 @@ class LLVMEmitter:
                                 param_def.type)
                     if param_enum is not None:
                         val = self._emit_enum_variant_with_type(arg, param_enum)
+                    elif self._is_range_index(arg):
+                        # AGAST #2877: a Vec slice into a `Span<T>` param is
+                        # a view (_emit_vec_span_slice), as into a Span let.
+                        val = self._emit_slice_into(arg, param_def.type)
                     else:
                         val = self._emit_into_array_slot(arg, param_def.type)
 

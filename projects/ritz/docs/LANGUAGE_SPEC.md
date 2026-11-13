@@ -761,7 +761,9 @@ fn main() -> i32
 including `hi`, and `a[lo..=hi]` includes `hi`. A slice of a `Span` is a `Span`
 over the same elements, so a write through it lands in `a`. A slice of a `Vec` or
 `String` is a new `Vec` or `String`, a copy (`vec_slice`, `string_slice`), unless a
-`Span` is expected, where it is a view like a `Span`'s.
+`Span` is expected, where it is a view like a `Span`'s: a `Span<T>` (or `[T]`)
+`let`, return value, argument, or variant payload (`Some(v[0..1])` into an
+`Option<[T]>`).
 
 ```ritz
 import ritzlib.gvec
