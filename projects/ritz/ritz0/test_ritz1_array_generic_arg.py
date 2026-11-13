@@ -6,9 +6,12 @@ one function, `@first$`.  Its T was void, so a body that used it failed to
 compile.  A field after the array silently read the wrong offset.
 
 ritz1 now spells `[N]E` as `arrN_E` and `*[N]E` as `ptr_arrN_E`, the form
-ritz0's mangle_type_name means (`arr{size}_{inner}`; ritz0 currently prints
-the size's AST node there, #2843), and the monomorphizer takes `arrN_E` back
-to an array T.  ritz0 is the oracle.
+ritz0's mangle_type_name spells (`arr{size}_{inner}`), and the monomorphizer
+takes `arrN_E` back to an array T.  ritz0 is the oracle.
+
+ritz0 printed the size's AST node there, `first$arrIntLit(span=/tmp/.../
+main.ritz:10:27, value=2)_i8`, until #2843: the symbol named the build path
+and column.  It now prints the folded size, so both compilers agree.
 
 Each program returns 0, or the number of the check that failed.
 """
@@ -23,7 +26,6 @@ compile_with = for_header.compile_with
 run_with = for_header.run_with
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
-RITZ1S = ["ritz1", "ritz1_selfhosted"]
 
 # Box<[2]i8> is 16 bytes with tag at 8; Box<[4]i64> is 40 with tag at 32.
 # Reading the tag at its raw offset tells the two layouts apart.
@@ -175,16 +177,22 @@ def test_sizeof_array_type_param(run_with, compiler):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_mangled_names(compile_with, compiler):
-    """Each array argument spells as `arrN_E` / `ptr_arrN_E`; none is bare."""
+    """Each array argument spells as `arrN_E` / `ptr_arrN_E` on every compiler.
+
+    ritz1 named none at all before #2832; ritz0 named the size's AST node
+    (source path and column included) before #2843.
+    """
     comp, ll, _ = compile_with(compiler, "names", FIRST)
     assert comp.returncode == 0, comp.stderr[-2000:]
     ir = ll.read_text()
     defined = set(re.findall(r'define [^@]*@"?(first[^"(]*)', ir))
     assert defined == {"first$ptr_arr2_i8", "first$ptr_arr3_i64"}
+    assert "IntLit" not in ir and "span=" not in ir
     comp, ll, _ = compile_with(compiler, "box_names", BOX)
     assert comp.returncode == 0, comp.stderr[-2000:]
     ir = ll.read_text()
-    assert "%Box$arr2_i8 = type" in ir and "%Box$arr4_i64 = type" in ir
-    assert "%Box$ = type" not in ir
+    # ritz0 qualifies a struct by module: `%"struct.ritz_module_1.Box$arr2_i8"`.
+    structs = set(re.findall(r'%"?(?:struct\.[\w.]+\.)?(Box\$[^" ]*)"? = type', ir))
+    assert structs == {"Box$arr2_i8", "Box$arr4_i64"}
