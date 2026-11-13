@@ -351,8 +351,6 @@ def test_struct_array_pointer_pointer_param_elements(request, run_with, via, pty
     if pty != "ptr_ptr" and compiler != "ritz0":
         # A reference to a `*[N]T` param records no N or T in ritz1 (scalars: SILENT).
         request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2331: `@*[N]T` param"))
-    if pty != "ptr_ptr" and compiler == "ritz0" and via == "copy":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2557"))
     # `p` is `(*r)` itself (deref) or `let p = *r` / `let p: *[3]S = *r` (copy).
     if via == "deref":
         # `p2` annotated: an inferred `let p2 = *r` is the copy rows' business.

@@ -1456,7 +1456,11 @@ class LLVMEmitter:
             elif expr.op in ('&mut', '@&') and inner_type:
                 return rast.PtrType(expr.span, inner_type, mutable=True)
             elif expr.op == '*' and inner_type:
-                if isinstance(inner_type, rast.PtrType):
+                # `*r` of an `@T` / `@&T` is the T it refers to (LARB R9), as for
+                # a `*T`: without RefType here `let p = *r` with `r: @*[3]S` kept
+                # r's reference type, and `p[i]` was refused as "one value, not a
+                # buffer" (AGAST #2557).
+                if isinstance(inner_type, (rast.PtrType, rast.RefType)):
                     return inner_type.inner
             return inner_type
         elif isinstance(expr, rast.Call):

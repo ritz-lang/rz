@@ -694,10 +694,9 @@ MESSAGE = {"@": VALUE_INTO_SHARED_REF, "@&": VALUE_INTO_MUT_REF}
 SIGN_BLIND_POINTER = ("fn go(h:& *u32) -> @&*i32\n    return @&h\n\npub fn main() -> i32\n    var n: u32 = 3\n"
                       "    var q: *u32 = @n\n    go(@&q)\n    return *q as i32\n")
 
-RITZ0_GAPS = {
-    **{f"u8_read_{form}": "AGAST #2326: `*p == 200` through `@u8` is false on ritz0"
-       for form in ("shared", "shared_param", "shared_plain", "mut", "mut_param", "mut_plain")},
-}
+# The u8_read_* rows were AGAST #2326's: ritz0 typed `*p` of an `@u8` as the
+# `@u8`, so `*p == 200` compared signed and was false.  #2557 types it as the u8.
+RITZ0_GAPS: dict[str, str] = {}
 
 
 def _params(programs, gaps):

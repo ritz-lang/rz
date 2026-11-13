@@ -772,6 +772,26 @@ pub fn main() -> i32
     assert run_with(compiler, "out", program) == 20
 
 
+# AGAST #2557: `let p = *q` copies that `*[3]i32` out, so p is a pointer and
+# indexes, a store included.  ritz0 kept q's reference type for `*q`, and refused
+# `p[1]` as one value.  ritz1's side of a `@*[N]T` param is #2331's.
+@pytest.mark.integration
+@pytest.mark.parametrize("ref", ["@", "@&"])
+def test_one_level_out_copied_is_the_pointer(run_with, ref):
+    program = f"""\
+fn f(q: {ref}*[3]i32) -> i32
+    let p = *q
+    p[2] = 4
+    return p[1] + p[2]
+
+pub fn main() -> i32
+    var a: [3]i32 = [10, 20, 30]
+    var p: *[3]i32 = @a
+    return f({ref}p) + a[2]
+"""
+    assert run_with("ritz0", f"out_copy_{ref == '@&'}", program) == 28
+
+
 # `p[1][1]`: the base is itself an element (#2442).  Its stores are in
 # test_index_value_local.py.
 NESTED = """\
