@@ -1553,9 +1553,12 @@ class TypeChecker:
 
     def _check_shared_into_mut(self, expr: rast.Expr, actual: rast.Type) -> None:
         """`expr`, of type `actual`, lands in an `@&T`. `@x` is
-        _check_addr_into_mut's."""
+        _check_addr_into_mut's. An `@&T` reached through an `@T`, as `h.m` of
+        `h: @H` is, is read-only too (#2381): what `expr` points at is walked."""
         written = isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@')
-        if isinstance(actual, rast.RefType) and not actual.mutable and not written:
+        if not isinstance(actual, rast.RefType) or written:
+            return
+        if not actual.mutable or self._behind_shared(rast.UnaryOp(expr.span, '*', expr)):
             self._report_once(expr, ref_rules.SHARED_INTO_MUT)
 
     def _check_receiver(self, expr: rast.MethodCall, sig) -> None:

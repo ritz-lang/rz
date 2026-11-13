@@ -94,6 +94,11 @@ error. `x` is a place of type `T`, `r` is `@T`, `m` is `@&T`, `p` is `*T`.
   `-> @&C` and `let p: @&C = c` become type errors. Write `@&c`.
 - **`@T` is read-only.** Writing through it is an error. `@x` of a `let` binding
   never reaches a mutable slot.
+- **An `m` reached through an `@T` is not the `m` column** (Aaron, 2026-11-06,
+  #2381). Read-only reaches everything behind an `@T`, so with `h: @H` and an
+  `@&C` field `m`, `h.m` into `@&T` is ✗, as an argument or a `let`. The table's
+  `m` into `@&T` ✓ holds for an `@&T` held in a value, in another `@&T`, or behind
+  a `*T`.
 - **Moves.** By-value use of a move-only value through `@T`, `@&T`, `*T` or `:&`
   is "cannot move out of a reference": `*r`, `r.f`, a by-value `self` receiver.
   Raw pointers get no exception. Container code uses an explicit bitwise read:

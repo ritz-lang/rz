@@ -6,6 +6,7 @@ Rule 1: an `@T` value where an `@&T` goes is an error, at every slot: a held
 reference, a field, an element, a call result.
 Rule 2: a method taking `self: @&T` is refused through an `@T` receiver, or a
 receiver behind one, whichever way the method was found.
+Rule 1 reaches an `@&T` behind an `@T` too (#2381): `h.m` of `h: @H` is refused.
 Rule 3: `@&` of a place behind an `@T` is an error wherever it's written. `@x` of
 one is too where it lands in `@&T` or `:&`, with this message and not #2339's:
 `@&x` wouldn't compile either.
@@ -225,6 +226,12 @@ ALLOWED = {
                                        "var h = H { r: null, m: null, q: @&c }\n    g(@h)", 3),
     "shared_borrow_behind_shared": ("fn g(r: @C) -> i32\n    let n: @i32 = @r.x\n    *n\n",
                                     "g(@c)", 1),
+    "mutable_field_of_mutable": ("fn g(h: @&H) -> i32\n    mb(h.m)\n",
+                                 "var h = H { r: null, m: @&c, q: null }\n    g(@&h)", 3),
+    "mutable_field_of_a_value": ("fn g(h: H) -> i32\n    mb(h.m)\n",
+                                 "var h = H { r: null, m: @&c, q: null }\n    g(h)", 3),
+    "mutable_field_of_pointer": ("fn g(h: *H) -> i32\n    mb(h.m)\n",
+                                 "var h = H { r: null, m: @&c, q: null }\n    g(@&h)", 3),
     "borrow_of_the_binding": ("fn g(r: @C) -> i32\n    var q = r\n    let h: @&@C = @&q\n    0\n",
                               "g(@c)", 1),
 }
@@ -317,19 +324,17 @@ def test_these_rules_stay_out_of_address_of(tmp_path, compiler, site):
     assert SHARED_INTO_MUT not in out and BORROW_THROUGH_SHARED not in out
 
 
-@pytest.mark.xfail(strict=True, reason="#2381")
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_mutable_field_behind_shared(tmp_path, compiler):
-    """`h.m` is an `@&T`, so rule 1 doesn't reach it, though `h.m.x = v`, `h.m.bump()`
-    and `@&h.m.x` are refused. Whether it should be is #2381's."""
-    _assert_refused(compiler, tmp_path, "mutable_field", _wrap("fn f(h: @H) -> i32\n    mb(^h.m)\n"),
-                    SHARED_INTO_MUT)
+# An `@&T` reached through an `@T` (#2381): read-only reaches everything behind an
+# `@T`, so passing it on is refused like writing through it. `^` as above.
+MUTABLE_BEHIND = {
+    "argument": "fn f(h: @H) -> i32\n    mb(^h.m)\n",
+    "let_annotated": "fn f(h: @H) -> i32\n    let m: @&C = ^h.m\n    0\n",
+    "deref": "fn f(r: @@&C) -> i32\n    mb(^*r)\n",
+    "chain": "struct K\n    h: H\n\nfn f(k: @K) -> i32\n    mb(^k.h.m)\n",
+}
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_mutable_field_behind_shared_writes_today(tmp_path, compiler):
-    """What #2381 has to decide: this is a write past an `@T`, and it happens."""
-    src = _main(TYPES + "fn g(h: @H) -> i32\n    mb(h.m)\n",
-                "    var c = C { x: 1 }\n    var h = H { r: null, m: @&c, q: null }\n"
-                "    g(@h)\n    c.x\n")
-    assert _run(compiler, tmp_path, "mutable_field_writes", src) == 3
+@pytest.mark.parametrize("site", _ids(MUTABLE_BEHIND))
+def test_a_mutable_reference_behind_a_shared_one_is_refused(tmp_path, compiler, site):
+    _assert_refused(compiler, tmp_path, site, _wrap(MUTABLE_BEHIND[site]), SHARED_INTO_MUT)

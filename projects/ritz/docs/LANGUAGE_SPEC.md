@@ -578,6 +578,31 @@ field or returned by a call, doesn't fit an `@&T` slot, and a method taking
 `self: @&T` can't be called on an `@T`, or on a place behind one. The other
 pointer conversions stay free, so `@&T` fits `@T`, and `@T` fits `*T`.
 
+Read-only reaches everything behind an `@T`, an `@&T` field too. With `h: @H`
+and `m: @&C` a field of `H`, `h.m` doesn't fit an `@&T` slot either, as an
+argument or in `let m: @&C = h.m`, though an `@&T` held in a value, in another
+`@&T`, or behind a raw `*T` still does.
+
+```ritz expect-error="an `@T` doesn't fit an `@&T` slot: make it `@&T`"
+struct Point
+    x: i32
+
+struct Holder
+    m: @&Point
+
+fn reset(p: @&Point)
+    p.x = 0
+
+fn clear(h: @Holder)
+    reset(h.m)
+
+fn main() -> i32
+    var q = Point { x: 1 }
+    var h = Holder { m: @&q }
+    clear(@h)
+    q.x
+```
+
 ```ritz expect-error="an `@T` doesn't fit an `@&T` slot: make it `@&T`"
 struct Point
     x: i32
