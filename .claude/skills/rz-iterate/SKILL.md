@@ -89,7 +89,7 @@ stays here; remote hosts only run rooms.
 | toffee | `adele-toffee` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~10 GB free. Linger on, `llvmlite` and `lld` 21 installed, smoke passes. First remote trial host |
 | starbux | `adele-starbux` | 1 | yes (2026-11-10) | 8 cores, 14 GB, ~9 GB free beside `adele`'s rooms. Smoke passes; `lld` is a user-local copy (`~/.local/opt/lld-21`). Hold lifted by Aaron 2026-11-11 (first room #2577) |
 | chungus | `adele-chungus` | 1 | yes (2026-11-12) | 8 cores, 14 GB, ~5-8 GB free (another user's desktop session) and 47 GB disk free (95% used). Smoke passes. `clang`/`lld`/`llvm` 21.1.8; `lld` is a user-local copy (`~/.local/opt/lld-21`). Approved by Aaron 2026-11-12 |
-| huburght | `adele-huburght` | 2 | yes (2026-11-11) | 12 cores, 47 GB (~42 GB free), WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. 2 slots from 2026-11-12 (Aaron: "tons of memory free"; #2582 and #2780 merged cleanly). Coarse mtime clock (#2689) |
+| huburght | `adele-huburght` | 6 (2 until #2998) | yes (2026-11-11) | 12 cores, 47 GB (~42 GB free), WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. 2 slots from 2026-11-12 (Aaron: "tons of memory free"; #2582 and #2780 merged cleanly). **6 slots from 2026-11-13** (Aaron; omegalisk stays at 2), but only once #2998 has landed and huburght's per-host config gives its rooms ~32 GB together and 2 gate slots: until then `host-budget.sh` caps all rooms on a host at 8 GB and `run-gate.sh` runs one gate per host, so rooms 3-6 would starve. Coarse mtime clock (#2689) |
 
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
   changes its slots. Edit this table and commit it on `main` when they do.
@@ -146,9 +146,12 @@ stays here; remote hosts only run rooms.
 - **Push by refspec on remote hosts.** Plain `git fetch` / `git push` work
   on every host (the `ssh -F /dev/null` workaround from toffee 2026-11-11 is
   no longer needed; don't put it in briefings). Remote rooms push with the
-  explicit refspec `git push --force-with-lease origin HEAD:refs/heads/ritz-task-<id>`: host
-  worktrees are created with `-b ... origin/main`, so the branch tracks
-  `main`, and a bare `git push` would aim at `main`.
+  explicit refspec `git push --force-with-lease origin HEAD:refs/heads/ritz-task-<id>`.
+  Host worktrees are created with `-b ... origin/main --no-track`, so the
+  branch has no upstream and a bare `git push` has no target (and without
+  `--no-track` it would aim at `main`). The explicit refspec is right
+  either way; don't tell rooms their branch "tracks `main`" (huburght,
+  2026-11-13).
 - **Shared hosts.** `adele` runs its own rooms on the same hosts (for
   example `task-2546` on toffee) within the host's slots. Never send
   `PAUSE`, `RESTART` or `TEARDOWN` for a room that isn't `ritz-task-*`. If
