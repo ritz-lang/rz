@@ -905,6 +905,11 @@ WHOLE_STRUCT_ELEMENT = {
     "inferred_borrow": _S + "fn f(a:& [3]S) -> i64\n    let p = @a\n    return p[1] as i64\n\n" + _SMAIN,
     "inferred_global": _S + "var G: [3]S\n\npub fn main() -> i32\n    let p = @G\n    return p[1] as i32\n",
     "inferred_field": _S + "struct H\n    cs: [3]S\n\npub fn main() -> i32\n    var h: H\n    let p = @h.cs\n    return p[1] as i32\n",
+    # AGAST #2993: `let n: i64 = a[1]` on a `[3]S` itself (local, global, field) is
+    # declared i64; #2592's `let r = a[1]` copy must not retype it as %S.
+    "let_integer_local": _S + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    let n: i64 = a[1]\n    return n as i32\n",
+    "let_integer_global": _S + "var G: [3]S\n\npub fn main() -> i32\n    let n: i64 = G[1]\n    return n as i32\n",
+    "let_integer_field": _S + "struct H\n    cs: [3]S\n\npub fn main() -> i32\n    var h: H\n    let n: i64 = h.cs[1]\n    return n as i32\n",
 }
 
 
