@@ -227,8 +227,8 @@ fn main() -> i32
     x
 """
 
-# An arm that leaves via `return` has no value and needs none.  ritz1-only:
-# ritz0 binds 0 here instead of 2 (AGAST #1752), so it cannot be the oracle.
+# An arm that leaves via `return` has no value and needs none: the binding
+# takes the surviving arm's value. ritz0 bound 0 here (AGAST #1752).
 DIVERGING = """\
 fn f(c: i32) -> i32
     let n: i64 = if c != 0
@@ -239,6 +239,56 @@ fn f(c: i32) -> i32
 
 fn main() -> i32
     f(0) + f(1)
+"""
+
+# The same with the THEN arm diverging, and inside a loop via `break`.
+DIVERGING_THEN = """\
+fn f(c: i32) -> i32
+    let n: i64 = if c == 0
+        return 30
+    else
+        6
+    n as i32
+
+fn main() -> i32
+    var t: i32 = 0
+    for i in 0..10
+        let d: i32 = if i == 2
+            break
+        else
+            3
+        t = t + d
+    f(0) + f(1) + t
+"""
+
+# A StrView-valued surviving arm: ritz0 used to crash with "Cannot access
+# field on non-struct type: i32" on `s.len` (AGAST #1752).
+DIVERGING_STRVIEW = """\
+import ritzlib.strview
+
+fn f(c: i32) -> i32
+    let s = if c != 0
+        "ab"
+    else
+        return 40
+    s.len as i32
+
+fn main() -> i32
+    f(0) + f(1)
+"""
+
+# A match with a diverging arm binds the other arms' values, and the arm
+# that returns does not block proving the i64 literals fit `i32`.
+DIVERGING_MATCH = """\
+fn f(c: i32) -> i32
+    let n: i32 = match c
+        0 => return 30
+        1 => 10
+        _ => 2
+    n
+
+fn main() -> i32
+    f(0) + f(1) + f(5)
 """
 
 # A generic instantiation reached ONLY from inside an if arm: monomorph's
@@ -341,10 +391,10 @@ PROGRAMS = {
     "strview": STRVIEW,
     "in_loop": IN_LOOP,
     "generic": GENERIC,
-}
-
-RITZ1_ONLY = {
     "diverging": DIVERGING,
+    "diverging_then": DIVERGING_THEN,
+    "diverging_strview": DIVERGING_STRVIEW,
+    "diverging_match": DIVERGING_MATCH,
 }
 
 # An if-expression with no `else` has no value; both compilers reject it.
@@ -410,8 +460,7 @@ def _compile(compiler: str, tmp_path: Path, name: str, program: str):
 
 def _run(compiler: str, tmp_path: Path, name: str):
     """Compile PROGRAMS[name] with `compiler`, link and run it; return the process."""
-    program = PROGRAMS[name] if name in PROGRAMS else RITZ1_ONLY[name]
-    comp, ll, work = _compile(compiler, tmp_path, name, program)
+    comp, ll, work = _compile(compiler, tmp_path, name, PROGRAMS[name])
     assert comp.returncode == 0 and ll.exists(), (
         f"{compiler} failed to compile {name}:\n"
         f"{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
@@ -442,13 +491,6 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
 def test_ritz1_if_expr(ritz1_bin, tmp_path, name):
     """AGAST #1613. Before the fix these died with `cannot parse item`."""
-    _check(_run("ritz1", tmp_path, name), name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY))
-def test_ritz1_if_expr_beyond_ritz0(ritz1_bin, tmp_path, name):
-    """Shapes ritz0 gets wrong; each names its ritz0 ticket above."""
     _check(_run("ritz1", tmp_path, name), name)
 
 

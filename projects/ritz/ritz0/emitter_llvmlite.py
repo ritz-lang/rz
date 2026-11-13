@@ -15,7 +15,7 @@ from typing import Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
 from monomorph import mangle_type_name, resolve_alias_in
-from tail_value import slot_tails, value_gap, value_tails
+from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 import index_rules
 import bool_rules
@@ -7090,6 +7090,15 @@ class LLVMEmitter:
             phi.add_incoming(else_value, else_exit_block)
             return phi
 
+        # One arm diverged (return/break/continue) and the other has a value
+        # (AGAST #1752): end_block's only predecessor is the surviving arm, so
+        # its value dominates the use. Returning None here bound 0 instead.
+        if if_expr.else_block:
+            if then_value is not None and else_value is None and else_terminated:
+                return then_value
+            if else_value is not None and then_value is None and then_terminated:
+                return else_value
+
         return None
 
     def _emit_while(self, stmt: rast.WhileStmt) -> None:
@@ -13391,7 +13400,10 @@ class LLVMEmitter:
             arms = [arm.body for arm in expr.arms]
         else:
             return None
-        ranges = [self._provable_int_range(arm) for arm in arms]
+        # An arm that leaves (return/break/continue) yields no value to fit
+        # (AGAST #1752): `let n: i32 = if c then 2 else return 40` is provable.
+        ranges = [self._provable_int_range(arm) for arm in arms
+                  if not arm_diverges(arm)]
         if not ranges or any(r is None for r in ranges):
             return None
         return (min(r[0] for r in ranges), max(r[1] for r in ranges))

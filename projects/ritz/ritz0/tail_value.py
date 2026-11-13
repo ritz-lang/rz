@@ -72,6 +72,25 @@ def _expr_diverges(expr) -> bool:
     return False
 
 
+def arm_diverges(node) -> bool:
+    """Whether the if/match arm `node` leaves without ever yielding a value.
+
+    Unlike `_expr_diverges`, a `break` or `continue` counts: the arm is not a
+    loop body, so either one leaves the expression the arm belongs to (#1752).
+    """
+    loop_exit = (rast.BreakStmt, rast.ContinueStmt, rast.BreakExpr, rast.ContinueExpr)
+    if isinstance(node, loop_exit):
+        return True
+    if isinstance(node, rast.Block):
+        if any(isinstance(s, loop_exit)
+               or (isinstance(s, rast.ExprStmt) and arm_diverges(s.expr))
+               for s in node.stmts):
+            return True
+        if node.expr is not None and arm_diverges(node.expr):
+            return True
+    return _expr_diverges(node)
+
+
 def value_gap(node, yields_nothing=lambda expr: False) -> Optional[rast.Node]:
     """The node where `node`, in value position, completes with no value.
 
