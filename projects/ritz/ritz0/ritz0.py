@@ -33,7 +33,7 @@ from move_checker import MoveChecker, OwnershipError
 from type_checker import TypeChecker, TypeError as RitzTypeError, check_ref_slots
 from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
-    source_file_hash, build_hash_map, build_sig_hash_map,
+    source_file_hash, hash_maps,
     read_sig_file, write_sig_file, check_source_hash,
     check_import_hashes, check_import_misses, build_import_hashes,
     build_sig_data, detect_sig_changes, invalidate_dependents,
@@ -180,7 +180,16 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         source_dir = str(source_path_obj.parent.resolve()) if source_path_obj.parent else "."
 
         # Lex and parse (counted: RITZ0_PARSE_LOG, module_interface.PARSED)
-        module = module_interface.parse_source(source, source_path)
+        tokens, module = module_interface.parse_source_tokens(source, source_path)
+
+        # The fn cache's token hashes, from this one lex and parse (AGAST
+        # #2807: it used to lex the source four more times). Now, while
+        # `module.items` are still this file's: resolve_imports replaces them.
+        try:
+            source_hashes = hash_maps(tokens, module.items)
+        except Exception:
+            source_hashes = None
+        del tokens
 
         # Capture import paths BEFORE resolve_imports — that pass replaces
         # `module.items` with merged items from all transitive imports and
@@ -281,8 +290,9 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # Build hash map and check against cached data before emission
         fn_cache_data = None
         try:
-            fn_hashes = build_hash_map(source, source_abs_path)
-            sig_hashes = build_sig_hash_map(source, source_abs_path)
+            if source_hashes is None:
+                raise ValueError("fn hashes unavailable")
+            fn_hashes, sig_hashes = source_hashes
             old_sig_data = read_sig_file(source_abs_path)
 
             # Detect signature changes and invalidate dependent modules

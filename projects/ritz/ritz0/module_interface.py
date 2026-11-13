@@ -138,6 +138,13 @@ def parse_source(source: str, path: str) -> rast.Module:
     return _parse_with_tokens(source, path)[1]
 
 
+def parse_source_tokens(source: str, path: str) -> Tuple[list, rast.Module]:
+    """`parse_source`, plus the lexer's tokens: the parser gets a copy of the
+    list (it splits `>>`/`>=` in place), so these are unsplit and can be
+    hashed by the fn cache without lexing the source again (AGAST #2807)."""
+    return _parse_with_tokens(source, path)
+
+
 # ============================================================================
 # Stripping
 # ============================================================================

@@ -8,6 +8,7 @@ whose hash is unchanged can reuse cached LLVM IR.
 Key components:
   - fn_token_hash(): Hash a function's token stream (SHA-256, 16 hex chars)
   - source_file_hash(): Hash entire source file contents
+  - hash_maps(): {name: hash} and {pub name: sig hash} from one lex + parse
   - build_hash_map(): Parse a source file, hash every function -> {name: hash}
   - .ritz.sig file I/O: read_sig_file() / write_sig_file()
   - check_cache(): Compare current vs cached hashes -> (hits, misses)
@@ -140,6 +141,42 @@ def source_file_hash(source: str) -> str:
 # Hash Map Building
 # ============================================================================
 
+def hash_maps(tokens: list, items: list) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Token hash of every fn, and signature hash of every pub fn.
+
+    One lex and one parse serve both maps and the compile itself (AGAST
+    #2807: compile_file used to lex its source 5 times). `tokens` must be the
+    lexer's output, not a list a Parser was given: the parser splits
+    `>>`/`>=` in its own list. module_interface.parse_source_tokens returns
+    such tokens; `items` are the parsed module's items, before import
+    resolution replaces them.
+
+    Returns:
+        ({fn name: token hash}, {pub fn name: signature hash})
+    """
+    import ritz_ast as rast
+
+    hash_map = {}
+    sig_map = {}
+    for item in items:
+        if isinstance(item, rast.FnDef):
+            # Get tokens for this function by span range
+            fn_tokens = _extract_fn_tokens(tokens, item)
+            hash_map[item.name] = fn_token_hash(fn_tokens)
+            if getattr(item, 'is_pub', False):
+                sig_map[item.name] = sig_token_hash(fn_tokens)
+    return hash_map, sig_map
+
+
+def _lex_and_parse(source: str, source_path: str):
+    from lexer import Lexer
+    from parser import Parser
+
+    tokens = Lexer(source, source_path).tokenize()
+    # A copy: the parser splits `>>` in the list it is given.
+    return tokens, Parser(list(tokens)).parse_module()
+
+
 def build_hash_map(source: str, source_path: str = "<unknown>") -> Dict[str, str]:
     """Parse a source file and hash every function.
 
@@ -150,27 +187,8 @@ def build_hash_map(source: str, source_path: str = "<unknown>") -> Dict[str, str
     Returns:
         Dict mapping function names to their token hashes
     """
-    from lexer import Lexer
-    from parser import Parser
-
-    lexer = Lexer(source, source_path)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens)
-    module = parser.parse_module()
-
-    # Re-lex to get raw tokens for hashing
-    lexer2 = Lexer(source, source_path)
-    all_tokens = lexer2.tokenize()
-
-    hash_map = {}
-    import ritz_ast as rast
-    for item in module.items:
-        if isinstance(item, rast.FnDef):
-            # Get tokens for this function by span range
-            fn_tokens = _extract_fn_tokens(all_tokens, item)
-            hash_map[item.name] = fn_token_hash(fn_tokens)
-
-    return hash_map
+    tokens, module = _lex_and_parse(source, source_path)
+    return hash_maps(tokens, module.items)[0]
 
 
 def build_sig_hash_map(source: str, source_path: str = "<unknown>") -> Dict[str, str]:
@@ -183,26 +201,8 @@ def build_sig_hash_map(source: str, source_path: str = "<unknown>") -> Dict[str,
     Returns:
         Dict mapping pub function names to their signature hashes
     """
-    from lexer import Lexer
-    from parser import Parser
-
-    lexer = Lexer(source, source_path)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens)
-    module = parser.parse_module()
-
-    # Re-lex to get raw tokens for hashing
-    lexer2 = Lexer(source, source_path)
-    all_tokens = lexer2.tokenize()
-
-    sig_map = {}
-    import ritz_ast as rast
-    for item in module.items:
-        if isinstance(item, rast.FnDef) and getattr(item, 'is_pub', False):
-            fn_tokens = _extract_fn_tokens(all_tokens, item)
-            sig_map[item.name] = sig_token_hash(fn_tokens)
-
-    return sig_map
+    tokens, module = _lex_and_parse(source, source_path)
+    return hash_maps(tokens, module.items)[1]
 
 
 def _extract_fn_tokens(all_tokens: list, fn_def) -> list:
