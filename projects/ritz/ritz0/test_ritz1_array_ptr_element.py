@@ -386,9 +386,9 @@ def test_pointer_to_pointer_element(run_with, name, compiler):
     assert run_with(compiler, name, POINTER_TO_POINTER[name]) == 0
 
 
-# ritz0 refuses this at clang (`sub` on two pointers), so it's no oracle, but the
-# new stride mustn't reach here: `q - p` scaled q as if it were a count.  ritz1
-# has always given the distance in bytes.
+# The new stride mustn't reach here: `q - p` scaled q as if it were a count.
+# AGAST #2928: the distance is in elements (LANGUAGE_SPEC §7.1 "Pointer
+# difference"), on all three compilers: `@x[2] - @x[0]` is 2, not 4 bytes.
 DIFFERENCES = {
     "two_elements": "    a[0] = @x[2]\n    return (a[0] - a[1]) as i32\n",
     "element_and_local": "    a[0] = @x[2]\n    let p: *i16 = @x[0]\n    return (a[0] - p) as i32\n",
@@ -398,10 +398,10 @@ DIFFERENCES = {
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(DIFFERENCES))
 def test_difference_of_pointers_is_not_a_stride(run_with, name, compiler):
-    assert run_with(compiler, name, _x(DIFFERENCES[name])) == 4
+    assert run_with(compiler, name, _x(DIFFERENCES[name])) == 2
 
 
 # An integer on the right is still a stride.

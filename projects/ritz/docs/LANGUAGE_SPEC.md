@@ -1550,6 +1550,25 @@ let quot = a / b
 let rem = a % b
 ```
 
+#### Pointer difference
+
+`p + n` and `p - n` on a `*T` step by whole elements of `T`. `q - p` on two pointers
+to the same `T` is the inverse: their distance in elements of `T`, an `i64`, so
+`(p + n) - p == n`. It's negative when `q` comes before `p`. Two pointers to
+different types have no common element to count in, and ritz0 refuses them.
+
+```ritz body
+var a: [8]i32
+let s: *i32 = @a[0]
+let p: *i32 = s + 5
+let n = p - s         # 5 elements, not 20 bytes
+let back = s - p      # -5
+```
+
+For a struct `T` the element is `sizeof(T)`, padding included. Before AGAST #2928
+ritz0 emitted `sub` on two pointers, which clang rejected, and ritz1 gave
+`q - p * sizeof(T)`, except for an element of a `[N]*T` array, which gave bytes.
+
 ### 7.2 Comparison
 
 ```ritz body

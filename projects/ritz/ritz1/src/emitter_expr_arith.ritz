@@ -263,28 +263,18 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # left-associated chain (`s.ptr + i - 1`) whose left operand is itself
     # a binary expression.  It returns 0 for "not a pointer"; a real element
     # size is never 0, so the sentinel is unambiguous.
+    # AGAST #2928 / #2597: `q - p` on two pointers is their distance in
+    # elements of the left's pointee: (q - p) / sizeof(T), an i64.
+    if is_ptr_distance(s, e) == 1
+        return emit_ptr_distance(s, e)
+
     var is_ptr_arith: i32 = 0
     var ptr_elem_size: i64 = 1
-    if (e.op == OP_ADD or e.op == OP_SUB) and is_array_elem_distance(s, e) == 0
-        # AGAST #1505: a left operand statically known to be `*S` strides by
-        # sizeof(S) — the same resolution the OP_DEREF arm loads through, so
-        # `*(q + i)` steps and loads the same type.  ptr_arith_elem_size
-        # alone does not scale a nested `a.b.items` field at all.
-        var ps_name: *u8 = null
-        var ps_len: i32 = 0
-        deref_pointee_struct_name(s, e.left, @ps_name, @ps_len)
-        # Only a StructDef has a size here; get_struct_size_by_name says 8
-        # for a tagged enum, so those keep ptr_arith_elem_size's answer.
-        if ps_len > 0 and find_struct(s, ps_name, ps_len) == null
-            ps_len = 0
-        if ps_len > 0
+    if e.op == OP_ADD or e.op == OP_SUB
+        let elem: i64 = ptr_operand_stride(s, e.left)
+        if elem != 0
             is_ptr_arith = 1
-            ptr_elem_size = get_struct_size_by_name(s, ps_name, ps_len)
-        else
-            let elem: i64 = ptr_arith_elem_size(s, e.left)
-            if elem != 0
-                is_ptr_arith = 1
-                ptr_elem_size = elem
+            ptr_elem_size = elem
 
     if (e.op == OP_EQ or e.op == OP_NE) and refuse_tagged_enum_eq(s, e) == 1
         return 0   # AGAST #2454
@@ -759,6 +749,52 @@ fn unit_enum_tag_to_i64(s: *EmitterState, operand: *Expr, reg: i32) -> i32
 # "u8") never resolve, so they keep their width-specific loads.  A bare `*p`
 # keeps its pre-#1505 unverified trust.  Writes null/0 when the pointee is not
 # a known aggregate.
+# What `x + 1` steps by when `x` is a pointer: sizeof its pointee.  0 when `x`
+# isn't a pointer (a real element size is never 0).
+fn ptr_operand_stride(s: *EmitterState, x: *Expr) -> i64
+    # AGAST #1505: an operand statically known to be `*S` strides by
+    # sizeof(S) — the same resolution the OP_DEREF arm loads through, so
+    # `*(q + i)` steps and loads the same type.  ptr_arith_elem_size
+    # alone does not scale a nested `a.b.items` field at all.
+    var ps_name: *u8 = null
+    var ps_len: i32 = 0
+    deref_pointee_struct_name(s, x, @ps_name, @ps_len)
+    # Only a StructDef has a size here; get_struct_size_by_name says 8
+    # for a tagged enum, so those keep ptr_arith_elem_size's answer.
+    if ps_len > 0 and find_struct(s, ps_name, ps_len) != null
+        return get_struct_size_by_name(s, ps_name, ps_len)
+    ptr_arith_elem_size(s, x)
+
+# AGAST #2928: `q - p` on two pointers, as an i64 count of elements.  Both
+# sides come into the i64 value model (an `@&T` operand is a `ptr`, #1754),
+# and the byte distance divides by the left's stride (plain sdiv, as ritz0:
+# `exact` would make an unaligned pair poison).
+fn emit_ptr_distance(s: *EmitterState, e: *Expr) -> i32
+    var stride: i64 = ptr_operand_stride(s, e.left)
+    if stride <= 0
+        stride = 1
+    let l: i32 = ptr_value_to_i64(s, e.left, emit_expr(s, e.left))
+    let r: i32 = ptr_value_to_i64(s, e.right, emit_expr(s, e.right))
+    let bytes: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, bytes)
+    emit_str(s, c" = sub i64 ")
+    emit_reg(s, l)
+    emit_str(s, c", ")
+    emit_reg(s, r)
+    emit_str(s, c"\n")
+    if stride == 1
+        return bytes
+    let count: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, count)
+    emit_str(s, c" = sdiv i64 ")
+    emit_reg(s, bytes)
+    emit_str(s, c", ")
+    emit_int(s, stride)
+    emit_str(s, c"\n")
+    count
+
 fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0

@@ -8063,6 +8063,11 @@ class LLVMEmitter:
                 if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
                     neg_right = self.builder.neg(right)
                     return self.builder.gep(left, [neg_right])
+                # AGAST #2928 / #2597: ptr - ptr is the distance in elements
+                # (LANGUAGE_SPEC §7.1 "Pointer difference"), the inverse of
+                # `p + n`.  `sub` on pointers is invalid IR.
+                if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.PointerType):
+                    return self._pointer_difference(left, right, expr)
                 if is_float:
                     return self.builder.fsub(left, right)
                 return self.builder.sub(left, right)
@@ -9297,6 +9302,22 @@ class LLVMEmitter:
             return val.constant is None
 
         return False
+
+    def _pointer_difference(self, left: ir.Value, right: ir.Value, expr: rast.Expr) -> ir.Value:
+        """`left - right` on two pointers: their distance in elements, an i64.
+
+        The stride is `gep null, 1`, the one `p + n` steps by, so padding is
+        counted the way LLVM lays the type out.  Both must point at the same
+        type; otherwise there is no element to count in.
+        """
+        if left.type != right.type:
+            raise EmitError(
+                f"pointer difference needs two pointers to the same type, got "
+                f"`{left.type}` and `{right.type}`", expr.span)
+        diff = self.builder.sub(self.builder.ptrtoint(left, self.i64),
+                                self.builder.ptrtoint(right, self.i64))
+        stride = ir.Constant(left.type, None).gep([ir.Constant(self.i64, 1)]).ptrtoint(self.i64)
+        return self.builder.sdiv(diff, stride)
 
     def _sizeof_type(self, ty: ir.Type) -> int:
         """Get the size in bytes of an LLVM type."""
