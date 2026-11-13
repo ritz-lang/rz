@@ -368,6 +368,8 @@ vouches for that exact commit.
        sender_name="ritz-task-<id>",
        ask_claude=True)
    ```
+   A remote room's line also quotes its gate, before the dash:
+   `REAP ritz-task-<id> <full-sha> gate <log name> SHA=<first 12> EXIT=0 — <one line>`.
    Don't `complete_task`: the REAP line is your evidence, and `rz` closes the
    ticket once your commit is on `main`.
 9. **On "rebase onto <sha7>"** (your commit conflicted with `main` or failed
@@ -413,7 +415,8 @@ so:
   (step 1). The ticket text is also pasted below. If an AGAST call fails, say so in your REAP, list
   follow-ups there (one line each: title, file:line, why) for `rz` to file,
   and for step 1 REAP `none` with the evidence.
-- **Self-restart** (the `systemd-run` above) works the same on this host.
+- **Self-restart** (the `systemd-run` under "An MCP call rejected", below)
+  works the same on this host.
 
 <full AGAST ticket text>
 ````
