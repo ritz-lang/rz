@@ -1677,8 +1677,58 @@ fn parse_type_from_suffix(suffix: *u8, suffix_len: i32) -> i32
     if prim != 0
         return prim
 
+    # AGAST #2832: `$arr2_i8` is the array `[2]i8`.
+    var a: ArrayArg
+    if array_arg_decode(type_name, type_len, @a) == 1
+        return TYPE_ARRAY
+
     # Could be a struct type
     return TYPE_STRUCT
+
+# AGAST #2832: an array type argument as ast_helpers' spell_last_array spells
+# it, "arr" N "_" E: E a primitive's name, a struct's, or "ptr_" + either.
+struct ArrayArg
+    size: i32
+    elem: i32          # TYPE_* of the element
+    pointee: i32       # for a TYPE_PTR element, its pointee's TYPE_*
+    name: *u8          # the struct named by the element or its pointee
+    name_len: i32
+
+# 1 and *out filled when name[0..len] spells an array, else 0.
+fn array_arg_decode(name: *u8, len: i32, out: *ArrayArg) -> i32
+    if name == null or len < 6 or memcmp(name, c"arr", 3) != 0
+        return 0
+    var pos: i32 = 3
+    var size: i32 = 0
+    while pos < len and *(name + pos) >= 48 and *(name + pos) <= 57
+        size = size * 10 + (*(name + pos) - 48) as i32
+        pos = pos + 1
+    if pos == 3 or pos + 1 >= len or *(name + pos) != 95   # digits, '_', element
+        return 0
+    pos = pos + 1
+    var elem: *u8 = name + pos
+    var elem_len: i32 = len - pos
+    out.size = size
+    out.elem = TYPE_STRUCT
+    out.pointee = TYPE_VOID
+    if elem_len > 4 and memcmp(elem, c"ptr_", 4) == 0
+        out.elem = TYPE_PTR
+        elem = elem + 4
+        elem_len = elem_len - 4
+    let prim: i32 = primitive_type_from_name(elem, elem_len)
+    if prim != 0
+        out.name = null
+        out.name_len = 0
+        if out.elem == TYPE_PTR
+            out.pointee = prim
+        else
+            out.elem = prim
+        return 1
+    out.name = elem
+    out.name_len = elem_len
+    if out.elem == TYPE_PTR
+        out.pointee = TYPE_STRUCT
+    1
 
 fn get_type_name_from_suffix(suffix: *u8, suffix_len: i32, out_name: **u8, out_len: *i32)
     # Suffix format: "$typename" or (AGAST #186) "$ptr_<typename>".
@@ -2005,6 +2055,17 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
                         set_ref_ptr_pointee(cloned, ptr_arg_pointee(subst_name, subst_len))
                 cloned.param_type_name = subst_name
                 cloned.param_type_name_len = subst_len
+                # AGAST #2832: a bare `c:& T` / `*T` at T = `[2]f64` points at
+                # that array, recorded as a written `c:& [2]f64` is (N, E, E's
+                # name).  Not `c:& [2]T`, which held TYPE_ARRAY already.
+                var arr: ArrayArg
+                if params.param_pointee_type != TYPE_ARRAY and cloned.param_pointee_type == TYPE_ARRAY and array_arg_decode(subst_name, subst_len, @arr) == 1
+                    cloned.param_pointee_array_size = arr.size
+                    cloned.param_pointee_array_elem_type = arr.elem
+                    cloned.param_pointee_array_elem_pointee = arr.pointee
+                    cloned.param_pointee_array_shape = null
+                    cloned.param_type_name = arr.name
+                    cloned.param_type_name_len = arr.name_len
         else
             var new_name: *u8 = null
             var new_len: i32 = 0
@@ -2355,9 +2416,19 @@ fn sizeof_subst_operand(at: *Expr, subst_type: i32, subst_name: *u8, subst_len: 
     # TYPE_STRUCT leaf named `i32` as the primitive, and rejects a non-type.
     if subst_type == TYPE_VOID
         op.op = TYPE_STRUCT
+    # AGAST #2832: T = `[N]E` is N values of E, as sizeof_array_type_call
+    # records a written `sizeof([N]E)`.
+    var leaf_name: *u8 = subst_name
+    var leaf_len: i32 = subst_len
+    var a: ArrayArg
+    if subst_type == TYPE_ARRAY and array_arg_decode(subst_name, subst_len, @a) == 1
+        op.int_val = op.int_val * a.size as i64
+        op.op = a.elem
+        leaf_name = a.name
+        leaf_len = a.name_len
     if op.op == TYPE_STRUCT
-        op.ident_ptr = subst_name
-        op.ident_len = subst_len
+        op.ident_ptr = leaf_name
+        op.ident_len = leaf_len
     op.next = null
     return op
 
@@ -2673,6 +2744,16 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
     cloned.array_shape = fields.array_shape  # AGAST #2097
     cloned.ptr_array = ptr_array_unless_generic(fields.ptr_array)  # AGAST #2329
 
+    # Copy array info first: substituting `v: T` at an array T writes it
+    # (AGAST #2832).
+    cloned.array_size = fields.array_size
+    cloned.array_elem_type = fields.array_elem_type
+    cloned.array_elem_pointee = fields.array_elem_pointee   # AGAST #2332
+    cloned.field_mut_ref = fields.field_mut_ref
+    cloned.field_shared_ref = fields.field_shared_ref
+    cloned.array_elem_type_name = fields.array_elem_type_name
+    cloned.array_elem_type_name_len = fields.array_elem_type_name_len
+
     # Check if field type is the type parameter
     if fields.field_type == TYPE_STRUCT
         if fields.field_type_name != null and find_dollar_sign(fields.field_type_name, fields.field_type_name_len) > 0
@@ -2701,15 +2782,6 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
         cloned.field_type = fields.field_type
         cloned.field_type_name = fields.field_type_name
         cloned.field_type_name_len = fields.field_type_name_len
-
-    # Copy array info
-    cloned.array_size = fields.array_size
-    cloned.array_elem_type = fields.array_elem_type
-    cloned.array_elem_pointee = fields.array_elem_pointee   # AGAST #2332
-    cloned.field_mut_ref = fields.field_mut_ref
-    cloned.field_shared_ref = fields.field_shared_ref
-    cloned.array_elem_type_name = fields.array_elem_type_name
-    cloned.array_elem_type_name_len = fields.array_elem_type_name_len
 
     # `data: *T` — substitute the pointee.  The parser records a struct
     # pointee in field_type_name and a primitive one in array_elem_type; `T`
@@ -2742,6 +2814,18 @@ fn subst_value_field(cloned: *StructField, subst_type: i32, subst_name: *u8, sub
     cloned.field_type = subst_type
     cloned.field_type_name = subst_name
     cloned.field_type_name_len = subst_len
+    # AGAST #2832: `v: T` at T = `[4]i64` is the array field `v: [4]i64`,
+    # recorded as field_new records a written one.
+    var a: ArrayArg
+    if subst_type == TYPE_ARRAY and array_arg_decode(subst_name, subst_len, @a) == 1
+        cloned.field_type_name = null
+        cloned.field_type_name_len = 0
+        cloned.array_size = a.size
+        cloned.array_elem_type = a.elem
+        cloned.array_elem_pointee = a.pointee
+        cloned.array_elem_type_name = a.name
+        cloned.array_elem_type_name_len = a.name_len
+        cloned.array_shape = null
 
 # A `*T` / `@T` / `@&T` field at T = the argument.  The parser records a
 # struct pointee in field_type_name and a primitive one in array_elem_type.

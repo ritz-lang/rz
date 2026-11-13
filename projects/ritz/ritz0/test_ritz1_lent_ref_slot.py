@@ -556,9 +556,9 @@ LENT_MISFITS = {
     # `[2]i32` from a type argument is spelled as written, not as an annotation.
     "generic_array_sign": ("fn id<T>(c:& T) -> i32\n    return 0\n", "var a: [2]u32 = [1, 2]", "a", "@&"),
 }
-GENERIC_ARRAY_GAP = "AGAST #2531: ritz1's clone of `c:& T` at an array `T` keeps no length or element"
-LENT_MISFIT_GAPS = {("generic_array_sign", "ritz1"): GENERIC_ARRAY_GAP,
-                    ("generic_array_sign", "ritz1_selfhosted"): GENERIC_ARRAY_GAP}
+# (row, compiler) -> reason, for a strict xfail.  #2531's `generic_array_sign`
+# pin went with #2832: a clone of `c:& T` at an array T keeps N and E now.
+LENT_MISFIT_GAPS = {}
 
 
 def _lent_misfit(name):

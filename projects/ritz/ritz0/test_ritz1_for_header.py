@@ -938,8 +938,10 @@ REFUSED_ELEMENTS = {
     "option": (GVEC + "import ritzlib.option\n\n" + MAIN
                + "    var v: Vec<Option<i32>> = vec_new<Option<i32>>()\n" + _T.format(it="v"),
                ELEMENT),
+    # `Vec<[2]i32>` is `Vec$arr2_i32` since #2832 (it was a bare `Vec$`, no
+    # struct, so refused as an iterable): its element is what's refused now.
     "array": (GVEC + MAIN + "    var v: Vec<[2]i32> = vec_new<[2]i32>()\n" + _T.format(it="v"),
-              UNSUPPORTED),
+              ELEMENT),
     "pointer_to_an_array": ("struct Vec<T>\n    data: *[2]i32\n    len: i64\n\n" + MAIN
                             + "    var v: Vec<i32>\n" + _T.format(it="v"), ELEMENT),
     "pointer_to_void": ("struct Vec<T>\n    data: *void\n    len: i64\n\n" + MAIN

@@ -2722,6 +2722,12 @@ pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
         var n: i32 = 0
         ga.name = spell_ptr_generic_arg(p, ty, @n)
         ga.name_len = n
+    else if ty == TYPE_ARRAY
+        # AGAST #2832: `[2]i8` is "arr2_i8".  It spelled as nothing, so
+        # `Box<[2]i8>` and `Box<[4]i64>` were one `%Box$`.
+        var n: i32 = 0
+        ga.name = spell_last_array(p, @n)
+        ga.name_len = n
     else
         ga.name = null
         ga.name_len = 0
@@ -2776,7 +2782,77 @@ fn primitive_arg_spelling(ty: i32, out: **u8) -> i32
 # the innermost pointee, so depth is exact up to two levels; a deeper
 # pointer spells as "" (clang then rejects the IR loudly).
 fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
+    if p.last_inner_pointee_type == TYPE_ARRAY
+        # AGAST #2832: `*[2]i8` is "ptr_arr2_i8".  The array's spelling stands
+        # where a struct pointee's name would.
+        var n: i32 = 0
+        let arr: *u8 = spell_last_array(p, @n)
+        return spell_ptr_parts(p, ty, p.last_pointee_type, TYPE_STRUCT, arr, n, out_len)
     return spell_ptr_parts(p, ty, p.last_pointee_type, p.last_inner_pointee_type, p.last_type_name, p.last_type_name_len, out_len)
+
+# AGAST #2832: the `[N]E` that just parsed, spelled as ritz0's
+# mangle_type_name means it: "arr" N "_" E, E being a primitive's name, a
+# struct's, or "ptr_" + either for a one-level pointer element.  `[2]i8` is
+# "arr2_i8", `[3]Foo` "arr3_Foo", `[4]*u8` "arr4_ptr_u8".  Any other element
+# spells as "" (out_len 0), as an unspellable argument always has.  Reads
+# p.last_array_*, which type_array wrote for this array.
+fn spell_last_array(p: *Parser, out_len: *i32) -> *u8
+    var elem: *u8 = null
+    var elem_len: i32 = 0
+    var ptr: i32 = 0
+    let et: i32 = p.last_array_elem_type
+    if et == TYPE_STRUCT
+        elem = p.last_array_elem_type_name
+        elem_len = p.last_array_elem_type_name_len
+    else if et == TYPE_PTR
+        ptr = 1
+        if p.last_array_elem_pointee == TYPE_STRUCT
+            elem = p.last_array_elem_type_name
+            elem_len = p.last_array_elem_type_name_len
+        else
+            elem_len = primitive_arg_spelling(p.last_array_elem_pointee, @elem)
+    else
+        elem_len = primitive_arg_spelling(et, @elem)
+    if elem_len <= 0 or elem == null
+        *out_len = 0
+        return null
+    # "arr" + up to 10 digits + "_" + "ptr_" + elem
+    let name: *u8 = parser_alloc(p, (elem_len + 19) as i64)
+    *name = 97        # 'a'
+    *(name + 1) = 114 # 'r'
+    *(name + 2) = 114 # 'r'
+    var pos: i32 = 3
+    pos = pos + write_dec_i32(name + pos, p.last_array_size)
+    *(name + pos) = 95  # '_'
+    pos = pos + 1
+    if ptr == 1
+        *(name + pos) = 112      # 'p'
+        *(name + pos + 1) = 116  # 't'
+        *(name + pos + 2) = 114  # 'r'
+        *(name + pos + 3) = 95   # '_'
+        pos = pos + 4
+    for i in 0..elem_len
+        *(name + pos) = *(elem + i)
+        pos = pos + 1
+    *(name + pos) = 0
+    *out_len = pos
+    return name
+
+# The decimal digits of n >= 0 at buf; returns how many.
+fn write_dec_i32(buf: *u8, n: i32) -> i32
+    var digits: [10]u8
+    var count: i32 = 0
+    var v: i32 = n
+    if v <= 0
+        *buf = 48  # '0'
+        return 1
+    while v > 0
+        digits[count] = (48 + v % 10) as u8
+        v = v / 10
+        count = count + 1
+    for i in 0..count
+        *(buf + i) = digits[count - 1 - i]
+    return count
 
 # spell_ptr_generic_arg over explicit parts, so an alias table entry (which
 # saved the same fields) spells without replaying itself into p.
@@ -2863,7 +2939,7 @@ pub fn link_generic_arg(first: *GenericArg, rest: *GenericArg) -> *GenericArg
 # struct literals and generic-call suffixes.  Returns its length and stores
 # the bytes' address in *out.
 fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
-    if ga.ty == TYPE_STRUCT or ga.ty == TYPE_PTR or ga.ty == TYPE_PTR_PTR
+    if ga.ty == TYPE_STRUCT or ga.ty == TYPE_PTR or ga.ty == TYPE_PTR_PTR or ga.ty == TYPE_ARRAY
         *out = ga.name
         return ga.name_len
     return primitive_arg_spelling(ga.ty, out)
