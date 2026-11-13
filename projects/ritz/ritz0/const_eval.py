@@ -7,6 +7,8 @@ Evaluates compile-time constant expressions for use in:
 - const fn evaluation (future)
 """
 
+import dataclasses
+import functools
 from typing import Dict, Any, Iterable, Optional, Union
 import ritz_ast as rast
 
@@ -223,9 +225,8 @@ class ConstEvalPass:
             if isinstance(item, rast.StaticAssert):
                 self._evaluate_static_assert(item)
 
-        # Third pass: evaluate array sizes in types
-        for item in module.items:
-            self._process_item(item)
+        # Third pass: evaluate array sizes in types, wherever they appear
+        self._walk(module.items)
 
         return self.errors
 
@@ -262,158 +263,50 @@ class ConstEvalPass:
                 f"Cannot evaluate static_assert condition: {e}"
             ))
 
-    def _process_item(self, item) -> None:
-        """Process an item, evaluating array sizes in its types."""
-        if isinstance(item, rast.FnDef):
-            self._process_function(item)
-        elif isinstance(item, rast.StructDef):
-            self._process_struct(item)
-        elif isinstance(item, rast.VarDef):
-            self._process_type(item.type)
-        elif isinstance(item, rast.ConstDef):
-            if item.type:
-                self._process_type(item.type)
-        elif isinstance(item, rast.TypeAlias):
-            self._process_type(item.target)
-        elif isinstance(item, rast.ImplBlock):
-            for method in item.methods:
-                self._process_function(method)
+    def _walk(self, node) -> None:
+        """Fold every array size reachable from `node`, through all AST fields.
 
-    def _process_function(self, fn: rast.FnDef) -> None:
-        """Process a function, evaluating array sizes in parameters and body."""
-        # Process parameter types
-        for param in fn.params:
-            self._process_type(param.type)
-
-        # Process return type
-        if fn.ret_type:
-            self._process_type(fn.ret_type)
-
-        # Process function body
-        if fn.body:
-            self._process_block(fn.body)
-
-    def _process_struct(self, struct: rast.StructDef) -> None:
-        """Process a struct's field types."""
-        for _name, field_type in struct.fields:
-            self._process_type(field_type)
-
-    def _process_block(self, block: rast.Block) -> None:
-        """Process a block, evaluating array sizes in variable declarations."""
-        for stmt in block.stmts:
-            self._process_stmt(stmt)
-
-    def _process_stmt(self, stmt) -> None:
-        """Process a statement."""
-        if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
-            if stmt.type:
-                self._process_type(stmt.type)
-            if stmt.value:
-                self._process_expr(stmt.value)
-        elif isinstance(stmt, rast.If):
-            # If is an expression in Ritz
-            self._process_expr(stmt)
-        elif isinstance(stmt, rast.WhileStmt):
-            self._process_expr(stmt.cond)
-            self._process_block(stmt.body)
-        elif isinstance(stmt, rast.DeferStmt):
-            self._process_block(stmt.body)
-        elif isinstance(stmt, rast.ForStmt):
-            self._process_expr(stmt.iter)
-            self._process_block(stmt.body)
-        elif isinstance(stmt, rast.ReturnStmt):
-            if stmt.value:
-                self._process_expr(stmt.value)
-        elif isinstance(stmt, rast.ExprStmt):
-            self._process_expr(stmt.expr)
-        elif isinstance(stmt, rast.Block):
-            self._process_block(stmt)
-        elif isinstance(stmt, rast.Match):
-            # Match is an expression in Ritz
-            self._process_expr(stmt)
-
-    def _process_expr(self, expr) -> None:
-        """Process an expression, looking for array types in casts."""
-        if isinstance(expr, rast.Cast):
-            self._process_type(expr.target)
-            self._process_expr(expr.expr)
-        elif isinstance(expr, rast.BinOp):
-            self._process_expr(expr.left)
-            self._process_expr(expr.right)
-        elif isinstance(expr, rast.UnaryOp):
-            self._process_expr(expr.operand)
-        elif isinstance(expr, rast.Call):
-            for arg in expr.args:
-                self._process_expr(arg)
-        elif isinstance(expr, rast.Index):
-            self._process_expr(expr.expr)
-            self._process_expr(expr.index)
-        elif isinstance(expr, rast.Field):
-            self._process_expr(expr.expr)
-        elif isinstance(expr, rast.ArrayLit):
-            for elem in expr.elements:
-                self._process_expr(elem)
-        elif isinstance(expr, rast.ArrayFill):
-            self._process_expr(expr.value)
-        elif isinstance(expr, rast.If):
-            self._process_expr(expr.cond)
-            self._process_block(expr.then_block)
-            if expr.else_block:
-                if isinstance(expr.else_block, rast.Block):
-                    self._process_block(expr.else_block)
-                else:
-                    self._process_expr(expr.else_block)
-        elif isinstance(expr, rast.Match):
-            self._process_expr(expr.expr)
-            for arm in expr.arms:
-                if arm.guard:
-                    self._process_expr(arm.guard)
-                # arm.body is an Expr, not a Block
-                self._process_expr(arm.body)
-
-    def _process_type(self, type_node) -> None:
-        """Process a type, evaluating array size if needed."""
-        if type_node is None:
+        A per-kind walker visited a Call's args but not its type_args, and
+        skipped struct literals, method calls, grouping, `sizeof`, lambdas,
+        tuple types and enum payloads, so `first<*[N]i8>(@x)` kept
+        `size = Ident('N')` and crashed the emitter (AGAST #2857).  Walking
+        every field means a new node kind can't hide an array type from this
+        pass, and the emitter can take every size as an int.
+        """
+        if node is None:
             return
+        if isinstance(node, list) or isinstance(node, tuple):
+            for item in node:
+                self._walk(item)
+            return
+        if not isinstance(node, rast.Node):
+            return
+        if isinstance(node, rast.ArrayType):
+            self._fold_size(node)
+        for name in _child_fields(type(node)):
+            self._walk(getattr(node, name))
 
-        if isinstance(type_node, rast.ArrayType):
-            # If size is already an int, nothing to do
-            if isinstance(type_node.size, int):
-                self._process_type(type_node.inner)
-                return
+    def _fold_size(self, type_node: rast.ArrayType) -> None:
+        """Replace an array type's size expression with its int value."""
+        if isinstance(type_node.size, int):
+            return
+        try:
+            size = self.evaluator.evaluate(type_node.size)
+            if size < 0:
+                self.errors.append(ConstEvalError(
+                    f"Array size cannot be negative: {size}"
+                ))
+                size = 0  # Use 0 to allow compilation to continue
+            type_node.size = size
+        except ConstEvalError as e:
+            self.errors.append(e)
+            type_node.size = 0  # Use 0 to allow compilation to continue
 
-            # Evaluate the size expression
-            try:
-                size = self.evaluator.evaluate(type_node.size)
-                if size < 0:
-                    self.errors.append(ConstEvalError(
-                        f"Array size cannot be negative: {size}"
-                    ))
-                    size = 0  # Use 0 to allow compilation to continue
-                type_node.size = size
-            except ConstEvalError as e:
-                self.errors.append(e)
-                type_node.size = 0  # Use 0 to allow compilation to continue
 
-            self._process_type(type_node.inner)
-
-        elif isinstance(type_node, rast.PtrType):
-            self._process_type(type_node.inner)
-        elif isinstance(type_node, rast.RefType):
-            self._process_type(type_node.inner)
-        elif isinstance(type_node, rast.SliceType):
-            self._process_type(type_node.inner)
-        elif isinstance(type_node, rast.NamedType):
-            for arg in type_node.args:
-                self._process_type(arg)
-        elif isinstance(type_node, rast.FnType):
-            for param in type_node.params:
-                self._process_type(param)
-            if type_node.ret:
-                self._process_type(type_node.ret)
-        elif isinstance(type_node, rast.UnionType):
-            for variant in type_node.variants:
-                self._process_type(variant)
+@functools.cache
+def _child_fields(cls) -> tuple:
+    """The dataclass fields of an AST node class that can hold child nodes."""
+    return tuple(f.name for f in dataclasses.fields(cls) if f.name != "span")
 
 
 def evaluate_array_sizes(module: rast.Module) -> list:

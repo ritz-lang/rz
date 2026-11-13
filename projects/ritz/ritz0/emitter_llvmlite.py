@@ -815,9 +815,7 @@ class LLVMEmitter:
         elif isinstance(ty, rast.ArrayType):
             # Array: element_size * count, alignment = element alignment
             elem_size, elem_align = self._ritz_type_size_and_align(ty.inner)
-            # Extract integer size (may be int or IntLit)
-            array_size = ty.size.value if isinstance(ty.size, rast.IntLit) else ty.size
-            return (elem_size * array_size, elem_align)
+            return (elem_size * ty.size, elem_align)
 
         elif isinstance(ty, rast.VectorType):
             # SIMD vector: size = count * element_size, alignment = total size
@@ -1062,9 +1060,7 @@ class LLVMEmitter:
             return ir.PointerType(inner)
         elif isinstance(ty, rast.ArrayType):
             inner = self._ritz_type_to_llvm(ty.inner)
-            # Extract integer size (may be int or IntLit)
-            array_size = ty.size.value if isinstance(ty.size, rast.IntLit) else ty.size
-            return ir.ArrayType(inner, array_size)
+            return ir.ArrayType(inner, ty.size)
         elif isinstance(ty, rast.UnionType):
             # Anonymous union type - compute layout
             # Union layout: { i8 tag, [max_size x i8] data }
@@ -2226,13 +2222,7 @@ class LLVMEmitter:
             if not inner_di:
                 return None
 
-            # Extract integer size (may be int or IntLit AST node after const eval)
             array_size = ritz_type.size
-            if isinstance(array_size, rast.IntLit):
-                array_size = array_size.value
-            elif not isinstance(array_size, int):
-                # If size is still an unevaluated expression, skip debug info
-                return None
 
             arr_key = f'[{array_size}]{self._type_to_str(ritz_type.inner)}'
             if arr_key in self.di_types:
@@ -2266,11 +2256,7 @@ class LLVMEmitter:
         elif isinstance(ritz_type, rast.RefType):
             return f'&{self._type_to_str(ritz_type.inner)}'
         elif isinstance(ritz_type, rast.ArrayType):
-            # Extract integer size (may be int or IntLit)
-            size = ritz_type.size
-            if isinstance(size, rast.IntLit):
-                size = size.value
-            return f'[{size}]{self._type_to_str(ritz_type.inner)}'
+            return f'[{ritz_type.size}]{self._type_to_str(ritz_type.inner)}'
         return 'unknown'
 
     def _emit_dbg_declare(self, alloca: ir.AllocaInstr, name: str, ritz_type: rast.Type, line: int) -> None:
@@ -3362,10 +3348,7 @@ class LLVMEmitter:
         if isinstance(a, rast.RefType):
             return a.mutable == b.mutable and self._types_equal(a.inner, b.inner)
         if isinstance(a, rast.ArrayType):
-            # Extract integer sizes (may be int or IntLit)
-            size_a = a.size.value if isinstance(a.size, rast.IntLit) else a.size
-            size_b = b.size.value if isinstance(b.size, rast.IntLit) else b.size
-            return size_a == size_b and self._types_equal(a.inner, b.inner)
+            return a.size == b.size and self._types_equal(a.inner, b.inner)
         return False
 
     def _process_trait(self, trait_def: rast.TraitDef):
@@ -8986,9 +8969,7 @@ class LLVMEmitter:
         declared_count = None
         if isinstance(expected, rast.ArrayType):
             elem_type = self._ritz_type_to_llvm(expected.inner)
-            declared_count = (expected.size.value
-                              if isinstance(expected.size, rast.IntLit)
-                              else expected.size)
+            declared_count = expected.size
             if isinstance(declared_count, int) and len(values) > declared_count:
                 raise ValueError(
                     f"Array literal has {len(values)} elements but the declared "

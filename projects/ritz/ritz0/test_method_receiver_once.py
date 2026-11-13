@@ -17,6 +17,8 @@ import pytest
 
 import fast_link
 
+from const_eval import evaluate_array_sizes
+
 from emitter_llvmlite import LLVMEmitter
 from lexer import tokenize
 from parser import Parser
@@ -376,6 +378,8 @@ pub fn main() -> i32
     var arr: [1]P = [P { x: 1 }]
     return mp().get() + arr[0].get()
 """
+    module = Parser(tokenize(source)).parse_module()
+    assert evaluate_array_sizes(module) == []  # as ritz0.py does before emitting
     emitter = LLVMEmitter()
-    emitter.emit_module(Parser(tokenize(source)).parse_module())
+    emitter.emit_module(module)
     assert emitter._evaluated_once == {}

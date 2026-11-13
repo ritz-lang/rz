@@ -85,22 +85,24 @@ class TestOtherTypes:
 class TestArray:
     """AGAST #2843: the size is the folded integer, not its AST node.
 
-    The parser leaves `[2]i8` in a call's type argument as an IntLit, which
+    The parser left `[2]i8` in a call's type argument as an IntLit, which
     printed as `arrIntLit(span=/path/main.ritz:10:27, value=2)_i8`: a symbol
     that embedded the build path and column, so one instance had a name per
-    module and the IR changed with the build directory.
+    module and the IR changed with the build directory.  Since #2857 const
+    eval folds it, so an IntLit here is an unfolded size like any other.
     """
 
-    def test_int_literal_size_prints_its_value(self):
+    def test_int_literal_size_is_unfolded(self):
         ty = rast.ArrayType(None, rast.IntLit(None, 2), named("i8"))
-        assert mangle_type_name(ty) == "arr2_i8"
+        with pytest.raises(TypeError, match="IntLit"):
+            mangle_type_name(ty)
 
     def test_folded_int_size(self):
         ty = rast.ArrayType(None, 3, I64)
         assert mangle_type_name(ty) == "arr3_i64"
 
     def test_pointer_to_array(self):
-        arr = rast.ArrayType(None, rast.IntLit(None, 2), named("i8"))
+        arr = rast.ArrayType(None, 2, named("i8"))
         ty = rast.PtrType(None, arr, False)
         assert mangle_type_name(ty) == "ptr_arr2_i8"
 

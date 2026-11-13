@@ -224,14 +224,12 @@ def mangle_type_name(ty: rast.Type) -> str:
 def _folded_array_size(ty: rast.ArrayType) -> int:
     """The integer size of `[N]T`, as a mangled name spells it (AGAST #2843).
 
-    Const eval folds most sizes to an int, but a call's type argument
-    (`first<*[2]i8>`) keeps its IntLit.  Printing that node put
+    Const eval folds every size to an int (AGAST #2857 made it reach a call's
+    type argument, `first<*[2]i8>`).  Printing an unfolded node put
     `IntLit(span=/path/main.ritz:10:27, value=2)` in the symbol, so the IR
-    named the build path and one instance had a name per module.
+    named the build path; an unfolded size is a const-eval bug, so it raises.
     """
     size = ty.size
-    if isinstance(size, rast.IntLit):
-        size = size.value
     if isinstance(size, bool) or not isinstance(size, int):
         raise TypeError(
             f"mangle_type_name: array size {type(size).__name__} is not folded")

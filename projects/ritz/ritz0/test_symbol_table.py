@@ -486,6 +486,9 @@ class TestStubIREquivalence:
     def _compile_to_ir(self, module, source_path):
         """Compile a module to LLVM IR string, returning the IR."""
         from emitter_llvmlite import emit as emit_llvmlite
+        from const_eval import evaluate_array_sizes
+        # ritz0.py folds array sizes before emitting; the emitter relies on it.
+        assert evaluate_array_sizes(module) == []
         source_abs = str(Path(source_path).resolve())
         return emit_llvmlite(
             module,
@@ -707,6 +710,9 @@ class TestSymbolTableImportMode:
 
     def _compile_to_ir(self, module, source_path):
         from emitter_llvmlite import emit as emit_llvmlite
+        from const_eval import evaluate_array_sizes
+        # ritz0.py folds array sizes before emitting; the emitter relies on it.
+        assert evaluate_array_sizes(module) == []
         source_abs = str(Path(source_path).resolve())
         return emit_llvmlite(
             module,
