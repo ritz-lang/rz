@@ -120,6 +120,29 @@ fn tabbed() -> i32
 	return x
 ```
 
+**Line continuation.** A line ends its statement, except when its last
+token is a binary operator (`and`, `or`, `&&`, `||`, `|`, `^`, `&`, a
+comparison, `<<`, `>>`, `+`, `-`, `*`, `/`, `%`) or `as`: the expression then
+continues on the next line, at the **same** indent (AGAST #2954). Blank and
+comment-only lines between the two are skipped.
+
+```ritz
+fn inside(x: i32, lo: i32, hi: i32) -> bool
+    x >= lo and
+    x < hi
+
+fn pack(r: u8, g: u8) -> u32
+    ((r as u32) << 8) |
+    (g as u32)
+```
+
+A line that does not end in an operator ends the statement, even when the
+next line could carry on the expression: `x = x + 1` followed by `-x` is two
+statements. A continuation indented *deeper* than its first line is not
+accepted: the indent opens a block, and the operator is left without a right
+operand. Whether it should be is AGAST #2193, undecided. Inside `(`, `[` or
+`{` line breaks and indentation are ignored altogether.
+
 ### 2.3 Comments
 
 ```ritz
