@@ -175,6 +175,9 @@ FIELDS = {
                        decl="    var o: O\n"),
     "global": _in_main("g.a", pre="var g: H\n\n", fill="g.a", decl=""),
     "array_element": _in_main("hs[1].a", fill="hs[1].a", decl="    var hs: [2]H\n"),
+    # AGAST #2870: an element of a `*H` call's result is a place; the call runs once.
+    "element_of_a_pointer_call": _for_iterable._through_a_call("mkp()[1].a", "@"),
+    "element_of_a_pointer_call_mut": _for_iterable._through_a_call("mkp()[1].a", "@&"),
     "pointer_param": _field_param("h: *H", "h.a", "f(@h)"),
     "borrow_param": _field_param("h:& H", "h.a", "f(@&h)"),
     "self": (_h("i32") + "impl H\n    fn f(self:&) -> i32\n"
@@ -207,7 +210,12 @@ _O = _h("i32") + "struct O\n    h: H\n\n"
 NOT_A_PLACE = {
     "field_of_a_call": _O + _MK + MAIN + _SUM.format(n="mk().h.a"),
     "field_of_a_call_mut": _O + _MK + MAIN + _SUM.format(n="mk().h.a").replace("@", "@&"),
-    "direct_field_of_a_call": (_h("i32") + "fn mk() -> H\n    var h: H\n    return h\n\n" + MAIN
+    # A pointer field of a call's result is a field of the call too, though it
+    # points at a place (#2870 lowers an index, not this).
+    "pointer_field_of_a_call": ("struct P\n    p: *H\n\n" + _h("i32")
+                                + "fn mk() -> P\n    var o: P\n    return o\n\n" + MAIN
+                                + _SUM.format(n="mk().p.a")),
+    "direct_field_of_a_call":(_h("i32") + "fn mk() -> H\n    var h: H\n    return h\n\n" + MAIN
                                + _SUM.format(n="mk().a")),
     "method_field": (_O + "impl O\n    fn mk(self:&) -> O\n        return *self\n\n" + MAIN
                      + "    var o: O\n" + _SUM.format(n="o.mk().h.a")),

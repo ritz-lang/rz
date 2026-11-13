@@ -130,6 +130,19 @@ def _callee(sig: str, it: str, call: str) -> str:
             + f"    return {call}\n")
 
 
+# AGAST #2870: `mkp()[1].a`, an element of what a `*H` call returns, is a place.  The
+# call runs once: 5 if not.  Element 1, so a stride but sizeof(H) shows up.
+_CALLS = ("var hs: [2]H\nvar calls: i32 = 0\n\nfn mkp() -> *H\n    calls = calls + 1\n"
+          "    return @hs[0]\n\nstruct K\n    n: i32\n\nimpl K\n    fn p(self: @K) -> *H\n"
+          "        calls = calls + 1\n        return @hs[0]\n\n")
+
+
+def _through_a_call(it: str, op: str = "") -> str:
+    return (_H + _CALLS + "fn f() -> i32\n    var k: K\n" + _walk(op + it, "i32", V) + "\n" + MAIN
+            + _fill("hs[1].a", V) + "    let r: i32 = f()\n    if r != 0\n        return r\n"
+            "    if calls != 1\n        return 5\n    return 0\n")
+
+
 # Every way emit_member_ptr reaches a field.
 HOLDERS = {
     "by_value_param": _callee("h: H", "h.a", "f(h)"),
@@ -147,6 +160,8 @@ HOLDERS = {
                     + _walk("mk().a", "i32", V)),
     "array_element": (_H + MAIN + "    var hs: [2]H\n" + _fill("hs[1].a", V)
                       + _walk("hs[1].a", "i32", V)),
+    "element_of_a_pointer_call": _through_a_call("mkp()[1].a"),
+    "element_of_a_pointer_method": _through_a_call("k.p()[1].a"),
     "deref": _H + MAIN + _FILL + "    var p: *H = @h\n" + _walk("(*p).a", "i32", V),
     "alias": ("type T3 = [3]i32\nstruct H\n    a: T3\n\n" + MAIN + _FILL
               + _walk("h.a", "i32", V)),
