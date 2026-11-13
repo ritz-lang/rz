@@ -6201,8 +6201,11 @@ class LLVMEmitter:
                 if isinstance(ptr.type, ir.PointerType):
                     val = self._convert_type(val, ptr.type.pointee, stmt.value)
                     self.builder.store(val, ptr)
-                else:
+                elif self._borrow_referent_slot(stmt.target.operand) is not None:
+                    # `*h = v` on an integer borrow: not a value (#2972).
                     raise ValueError(f"Cannot dereference non-pointer: {ptr.type}")
+                else:
+                    raise EmitError(array_rules.NOT_A_POINTER, stmt.target.span)  # AGAST #2885
             elif isinstance(stmt.target, rast.Field):
                 # Assignment to struct field: obj.field = val
                 # First, try to get the value of the expression
@@ -10409,7 +10412,7 @@ class LLVMEmitter:
                     return slot
                 ptr = self._emit_expr(inner)
                 if not isinstance(ptr.type, ir.PointerType):
-                    raise ValueError(f"Cannot dereference non-pointer: {ptr.type}")
+                    raise EmitError(array_rules.NOT_A_POINTER, expr.operand.span)  # AGAST #2885
                 return ptr
             else:
                 # For more complex expressions, emit the value (might be a pointer already)
@@ -10441,7 +10444,7 @@ class LLVMEmitter:
             if isinstance(operand.type, ir.PointerType):
                 return self.builder.load(operand)
             else:
-                raise ValueError(f"Cannot dereference non-pointer: {operand.type}")
+                raise EmitError(array_rules.NOT_A_POINTER, expr.span)  # AGAST #2885
 
         elif expr.op == '~':
             # Bitwise NOT: ~x = xor x, -1

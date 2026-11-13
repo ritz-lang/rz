@@ -14,6 +14,9 @@ failed at clang, said "unhandled EXPR_MEMBER", or compiled them.
 Now each is one located error on all three, in the shape of #2440's NOT_A_BUFFER:
 one string, said by ritz0 and ritz1 alike, at one place.
 
+AGAST #2885 does the same for a `*x` outside a `[]` (`*n` on an i32, `*v = ...`,
+`@*v` on a Vec value).
+
     an element with nothing to index    index_rules.needs_index, at the second `[`
                                         (§7.8's words; ritz1: struct_index.ritz)
     `*v` on a struct by value           array_rules.NOT_A_POINTER, at the `*`
@@ -76,11 +79,11 @@ NOT_POINTERS = {
 }
 
 
-def _located(compile_with, compiler, name, setup, body, message):
+def _located(compile_with, compiler, name, setup, body, message, mark="@"):
     marked = body.splitlines()[0]
-    column = 1 + marked.index("@")
+    column = 1 + marked.index(mark)
     line = 1 + (HEADER + "pub fn main() -> i32\n" + setup).count("\n")
-    program = f"{HEADER}pub fn main() -> i32\n{setup}{body.replace('@', '', 1)}"
+    program = f"{HEADER}pub fn main() -> i32\n{setup}{body.replace(mark, '', 1)}"
     batch = getattr(compile_with, "batch_compile", None)
     got = batching.refused(compiler, program, batch) if batch else None  # AGAST #2806
     if got is not None:
@@ -107,6 +110,48 @@ def test_an_element_that_holds_nothing_is_not_indexable(compile_with, name, comp
 def test_a_value_is_not_a_pointer(compile_with, name, compiler):
     setup, body = NOT_POINTERS[name]
     _located(compile_with, compiler, name, setup, body, NOT_A_POINTER)
+
+
+# AGAST #2885: the same `*x` outside a `[]`.  ritz0 raised an unlocated Python
+# ValueError ("Cannot dereference non-pointer") from each of its three deref sites
+# (a read, a `*x = ...` store, an `@*x`); ritz1 and ritz1_selfhosted compiled them.
+# `^` marks the `*`.
+INT = "    var n: i32 = 5\n"
+VEC = _new("i32", (10, 20, 30))
+BARE_DEREFS = {
+    "int_read": (INT, "    return ^*n\n"),
+    "int_store": (INT, "    ^*n = 7\n    return n\n"),
+    "vec_read": (VEC, "    let w: Vec<i32> = ^*v\n    return w[0]\n"),
+    "vec_store": (VEC, "    ^*v = vec_new<i32>()\n    return 0\n"),
+    "vec_address": (VEC, "    let p: *Vec<i32> = @^*v\n    return (*p)[0]\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(BARE_DEREFS))
+def test_a_bare_deref_of_a_value_is_not_a_pointer(compile_with, name, compiler):
+    setup, body = BARE_DEREFS[name]
+    _located(compile_with, compiler, name, setup, body, NOT_A_POINTER, mark="^")
+
+
+# The legal neighbour: `*p` of a pointer to an int, read and stored.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_bare_deref_of_a_pointer_still_runs(run_with, compiler):
+    program = f"{HEADER}pub fn main() -> i32\n{INT}    let p: *i32 = @n\n    *p = *p + 10\n    return n\n"
+    assert run_with(compiler, "int_pointer", program) == 15
+
+
+# `*h` of an integer borrow reads as the caller's int (#2045): it isn't a value.
+# ritz1 compiles it, then loads through the int (#2971).
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_bare_deref_of_a_borrow_is_not_refused(compile_with, compiler):
+    program = (f"{HEADER}fn f(h:& i32) -> i32\n    return *h + 1\n\n"
+               f"pub fn main() -> i32\n{INT}    return f(@&n)\n")
+    comp, _, _ = compile_with(compiler, "int_borrow", program)
+    assert comp.returncode == 0, (comp.stdout + comp.stderr)[-1000:]
 
 
 # The legal neighbours: an element that is indexable, and a field of a struct element.
