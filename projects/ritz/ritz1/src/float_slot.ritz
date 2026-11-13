@@ -1,0 +1,95 @@
+# ritz1/src/float_slot.ritz - an integer into a float slot: only where exact
+#
+# AGAST #2945, LANGUAGE_SPEC §7.5 "Integer and float conversions".
+#
+#     let x: u32 = 4000000000
+#     let d: f64 = x          # 4e9, by uitofp; sitofp would read the top bit
+#     let e: f64 = big_i64    # error: write `big_i64 as f64`
+#
+# A non-literal integer converts implicitly into an f32 / f64 slot (a let/var
+# initialiser, an assignment, an argument, a return, a field) only when every
+# value of its type is exact there: f64 takes i8 i16 i32 u8 u16 u32, f32 takes
+# i8 i16 u8 u16.  It converts by its own signedness.  Every other pair is an
+# error asking for `as`.  A literal is exempt.
+#
+# This is ritz0's `_int_into_float_slot`, and ritz0/test_implicit_int_to_float.py
+# feeds the same programs to both; the words are ritz0/float_rules.py's.  The
+# source type comes from narrowing.ritz's narrow_src_type, which answers
+# NARROW_UNKNOWN when unsure: then the value converts as before (sitofp of the
+# i64 register) and nothing is refused, so a gap here is a missed refusal,
+# never a refused program ritz0 accepts.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import narrowing
+import bool_check
+
+# Is `e` built from integer literals alone (`4000000000`, `-3`, `2 * 3`)?
+# ritz0's _int_literal_only.
+fn fs_literal_only(e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
+        return 1
+    if e.kind == EXPR_UNARY and (e.op == OP_NEG or e.op == OP_BIT_NOT)
+        return fs_literal_only(e.operand)
+    if e.kind == EXPR_BINARY and narrow_is_arith_op(e.op) == 1
+        if fs_literal_only(e.left) == 1 and fs_literal_only(e.right) == 1
+            return 1
+    0
+
+# Where a value is reported: ritz0's _value_span (a binary at its left
+# operand, a cast at its operand).
+fn fs_report_at(e: *Expr) -> *Expr
+    var at: *Expr = e
+    while at.kind == EXPR_BINARY or at.kind == EXPR_CAST
+        at = at.left
+    at
+
+# Is every value of integer type `src` exact in float type `dst`?
+fn fs_exact(src: i32, dst: i32) -> i32
+    let bits: i32 = narrow_int_width(src)
+    if dst == TYPE_F64
+        return if bits <= 32 then 1 else 0
+    if bits <= 16 then 1 else 0
+
+# `val_reg`, the i64 register integer expression `value` was emitted into,
+# converted for an f32 / f64 slot of type `dst_ty`.  Refuses an inexact
+# source (see the header) and still returns a register so emission goes on.
+pub fn int_into_float_slot(s: *EmitterState, val_reg: i32, value: *Expr, dst_ty: i32) -> i32
+    if value == null or fs_literal_only(value) == 1
+        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
+    let src: i32 = narrow_src_type(s, value)
+    if src == NARROW_UNKNOWN or src == NARROW_LIT or narrow_int_width(src) <= 1
+        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
+    if fs_exact(src, dst_ty) == 0
+        if bool_report_at(s, fs_report_at(value)) == 1
+            eprints_cstr(c"implicit conversion from `")
+            eprints_cstr(narrow_type_name(src))
+            eprints_cstr(c"` to `")
+            eprints_cstr(c_float_name(dst_ty))
+            eprints_cstr(c"` can lose precision: write `<expr> as ")
+            eprints_cstr(c_float_name(dst_ty))
+            eprints_cstr(c"`\n")
+        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
+    if narrow_is_unsigned(src) == 0
+        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
+    # u8 / u16 / u32 sit zero-extended in their i64 register.
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = uitofp i64 ")
+    emit_reg(s, val_reg)
+    emit_str(s, c" to ")
+    emit_str(s, float_llvm_name(dst_ty))
+    emit_str(s, c"\n")
+    r
+
+fn c_float_name(t: i32) -> *u8
+    if t == TYPE_F32
+        return c"f32"
+    c"f64"

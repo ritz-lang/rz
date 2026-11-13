@@ -19,6 +19,7 @@ from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 import index_rules
 import bool_rules
+import float_rules
 import binder_names
 import match_coverage
 from metadata import type_to_string
@@ -13134,6 +13135,49 @@ class LLVMEmitter:
             raise EmitError(_STR_AS_PTR['String' if name == 'String' else 'StrView'],
                             self._value_span(tail))
 
+    @staticmethod
+    def _int_literal_only(expr: rast.Expr) -> bool:
+        """Is `expr` built from integer literals alone (`4000000000`, `-3`,
+        `2 * 3`)?  Literals are not held to §7.5's exactness rule (#2945).
+        ritz1's fs_literal_only is this."""
+        if isinstance(expr, (rast.IntLit, rast.CharLit)):
+            return True
+        if isinstance(expr, rast.Grouped):
+            return LLVMEmitter._int_literal_only(expr.expr)
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
+            return LLVMEmitter._int_literal_only(expr.operand)
+        if isinstance(expr, rast.BinOp) and expr.op in LLVMEmitter._INT_ARITH_OPS:
+            return (LLVMEmitter._int_literal_only(expr.left)
+                    and LLVMEmitter._int_literal_only(expr.right))
+        return False
+
+    def _int_into_float_slot(self, val: ir.Value, target_type: ir.Type,
+                             at: Optional[rast.Expr]) -> ir.Value:
+        """An integer value landing in an f32 / f64 slot (LANGUAGE_SPEC §7.5,
+        AGAST #2945): a let/var initialiser, an assignment, an argument, a
+        return, a field.  Allowed only when every value of the source type is
+        exact in the float (f64: <= 32 bits, f32: <= 16 bits), and converted
+        by the source's signedness: `let d: f64 = x` with x: u32 = 4e9 was
+        sitofp'd to a negative.  A literal is exempt; anything else inexact is
+        an error asking for `as`, which keeps #2192's conversion."""
+        src = at
+        if src is None:
+            origin = self._value_origin.get(id(val))
+            if origin is not None and origin[0] is val:
+                src = origin[1]
+        if src is None or self._int_literal_only(src):
+            return self.builder.sitofp(val, target_type)
+        width = val.type.width
+        unsigned = self._int_shape(src, width < 64)[1]
+        dst = 'f32' if isinstance(target_type, ir.FloatType) else 'f64'
+        if not float_rules.is_exact(width, dst):
+            src_name = f"{'u' if unsigned else 'i'}{width}"
+            raise EmitError(float_rules.int_into_float_inexact(src_name, dst),
+                            self._value_span(src))
+        if unsigned:
+            return self.builder.uitofp(val, target_type)
+        return self.builder.sitofp(val, target_type)
+
     def _convert_type(self, val: ir.Value, target_type: ir.Type,
                       at: Optional[rast.Expr] = None) -> ir.Value:
         """Convert a value to the target type if needed. `at` is the expression
@@ -13149,10 +13193,10 @@ class LLVMEmitter:
         if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
             return self.builder.fptrunc(val, target_type)
 
-        # Integer <-> floating-point conversions
-        # Full signedness provenance is not tracked here; default to signed.
+        # Integer -> floating-point: only where exact, by the source's
+        # signedness (LANGUAGE_SPEC §7.5, AGAST #2945).
         if isinstance(val.type, ir.IntType) and isinstance(target_type, (ir.FloatType, ir.DoubleType)):
-            return self.builder.sitofp(val, target_type)
+            return self._int_into_float_slot(val, target_type, at)
         if isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(target_type, ir.IntType):
             return self.builder.fptosi(val, target_type)
 

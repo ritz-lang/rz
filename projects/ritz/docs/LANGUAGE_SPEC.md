@@ -1770,6 +1770,39 @@ compilers (`ritz0/test_unsigned_float_cast.py`, AGAST #2192). A bare
 `fptosi` gives poison out of range, and the optimiser is then free to delete
 code that depends on the result.
 
+Without `as`, an integer converts into a float slot (a `let` or `var`
+initialiser, an assignment, an argument, a `return`, a field) only when every
+value of its type is exact in the float. It converts by its own signedness,
+so an unsigned value is never read as negative:
+
+| Slot | Converts implicitly from |
+|---|---|
+| `f64` | `i8` `i16` `i32` `u8` `u16` `u32` |
+| `f32` | `i8` `i16` `u8` `u16` |
+
+```ritz body
+let x: u32 = 4000000000
+let d: f64 = x                   # 4000000000.0
+let h: u16 = 40000
+let f: f32 = h                   # 40000.0
+let n: i64 = 5
+let e: f64 = n as f64            # i64 needs `as`
+```
+
+Every other pair is an error. Write `as` to accept the rounding:
+
+```ritz body expect-error="implicit conversion from `i64` to `f64` can lose precision: write `<expr> as f64`"
+let n: i64 = 9007199254740993
+let d: f64 = n                   # would round to 9007199254740992.0
+```
+
+Integer literals are exempt: `let d: f64 = 4000000000` and `let f: f32 = -3`
+need no `as`. This follows Rust's `From` conversions: f64 has a 53-bit
+significand and f32 has a 24-bit one. It's the same rule on all three
+compilers (`ritz0/test_implicit_int_to_float.py`, AGAST #2945). ritz1 works
+out the integer's type from its Ritz types. Where it can't, for example for an
+unannotated local, it converts without checking rather than guess.
+
 #### Implicit narrowing is an error
 
 A typed `let` or `var` whose initialiser is a wider integer is rejected, unless

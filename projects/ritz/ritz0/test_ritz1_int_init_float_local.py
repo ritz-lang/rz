@@ -10,8 +10,8 @@ init was already a float.
 `*p = 3` through a `*f64` (emit_assign's deref arm) had the same gap and is
 covered here. AGAST #2065 extends it to the sibling store paths that lower
 through emit_field_elem_narrow / emit_assign's local arm: struct-literal float
-fields (`R { a: 3 }`), `r.a = 3`, `p[i] = 3`, a plain `x = 3`, and a u64
-source (sitofp, as ritz0 does).
+fields (`R { a: 3 }`), `r.a = 3`, `p[i] = 3`, a plain `x = 3`, and an
+unsigned source (a u16 since #2945, which refuses an implicit u64).
 
 Each program is instantiated for f64 and f32 and returns 3 on success.
 ritz0 is the oracle.
@@ -49,14 +49,15 @@ pub fn main() -> i32
 """
 
 # Integer-typed locals of several widths, including one that is not a
-# literal at all: sitofp, not a bit-reinterpretation.
+# literal at all: sitofp, not a bit-reinterpretation.  An i64 needs `as`
+# (#2945: only widths exact in f32 convert implicitly, and i16 is one).
 INT_LOCAL = """\
 pub fn main() -> i32
-    let n: i32 = 1
+    let n: i16 = 1
     let m: i64 = 1
     let k: u8 = 1
     var x: T = n
-    let y: T = m
+    let y: T = m as T
     let z: T = k
     return (x + y + z) as i32
 """
@@ -118,7 +119,7 @@ struct R
     b: T
 
 pub fn main() -> i32
-    let n: i32 = 2
+    let n: i16 = 2
     let r: R = R { a: 1, b: n }
     return (r.a + r.b) as i32
 """
@@ -165,13 +166,14 @@ pub fn main() -> i32
     return g as i32
 """
 
-# AGAST #2065: a u64 source is sitofp'd too (ritz0 does; values here fit).
+# AGAST #2065: an unsigned source converts too.  #2945: by uitofp, and only
+# from a width exact in the float (a u64 needs `as`), so this is a u16.
 U64_SOURCE = """\
 struct R
     a: T
 
 pub fn main() -> i32
-    let u: u64 = 1
+    let u: u16 = 1
     var r: R = R { a: u }
     var x: T = 0.5
     x = u

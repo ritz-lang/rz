@@ -49,6 +49,7 @@ SOURCES = \
 	must_use \
 	bool_check \
 	literal_slot \
+	float_slot \
 	tail_value \
 	emitter_stmt \
 	emitter \

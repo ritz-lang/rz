@@ -149,7 +149,7 @@ fn main() -> i32
 NON_LITERAL_INT_ARM = """\
 import ritzlib.option
 
-fn seven() -> i64
+fn seven() -> i32
     return 7
 
 fn f(o: Option<f64>, k: i32) -> f64
@@ -247,7 +247,7 @@ fn main() -> i32
 IF_BLOCK_TAIL = """\
 fn f(n: i32) -> f64
     let a: f64 = if n > 2
-        let m = n * 2
+        let m = n + n
         m
     else
         0.5
