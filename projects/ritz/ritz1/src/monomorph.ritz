@@ -902,6 +902,15 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
         else if s.var_init != null and s.var_init.kind == EXPR_STRUCT_LIT
             # Un-annotated `var r = R { ... }`: the literal names the type.
             add_local_struct_var(s.var_name, s.var_name_len, s.var_init.ident_ptr, s.var_init.ident_len)
+        else if s.var_init != null and s.var_init.kind == EXPR_INDEX
+            # Un-annotated `let w = p[1]` of a Vec<Vec<T>>: `w` is the element,
+            # a Vec<T>, so `w.get(1)` registers vec_get$T (AGAST #2519).
+            var esuf: *u8 = null
+            var esuf_len: i32 = 0
+            let ekind: i32 = indexed_element_collection(m, s.var_init, @esuf, @esuf_len)
+            if ekind > 0
+                add_local_var(s.var_name, s.var_name_len, ekind, esuf, esuf_len)
+                mark_last_local_by_value()
         else if s.var_init != null and s.var_init.kind == EXPR_METHOD
             track_method_init_local(m, s.var_name, s.var_name_len, s.var_init)
         else if s.var_init != null and s.var_init.kind == EXPR_CALL and s.var_init.call_type_suffix_len == 0
@@ -1527,6 +1536,50 @@ fn register_receiver_method(m: *Module, recv: *Expr, method: *u8, method_len: i3
             var fsuf_len: i32 = 0
             let fkind: i32 = classify_collection_type(rf.field_type_name, rf.field_type_name_len, @fsuf, @fsuf_len)
             register_ufcs_instantiation(m, fkind, fsuf, fsuf_len, method, method_len)
+    else if r.kind == EXPR_INDEX
+        # AGAST #2519: `v[1].get(1)` on a Vec<Vec<i32>>: the element is the
+        # receiver, one level into the collection's suffix ("$Vec$i32" ->
+        # "Vec$i32" -> vec_get$i32).
+        var esuf: *u8 = null
+        var esuf_len: i32 = 0
+        let ekind: i32 = indexed_element_collection(m, r, @esuf, @esuf_len)
+        register_ufcs_instantiation(m, ekind, esuf, esuf_len, method, method_len)
+
+# AGAST #2519: if `e` is `b[i]` (or `(*b)[i]`) on a Vec or Span whose element
+# is itself a Vec or Span, return that element's kind and write its "$T"
+# suffix to out; 0 otherwise.  `b` is a tracked local (the collection itself,
+# or a `*`/`@`/`@&` of it, one level: LARB R9) or a field of one.  A range
+# index is a slice, not an element.
+fn indexed_element_collection(m: *Module, e: *Expr, out_suffix: **u8, out_suffix_len: *i32) -> i32
+    if e.left == null or e.right == null or e.right.kind == EXPR_RANGE
+        return 0
+    var b: *Expr = e.left
+    if b.kind == EXPR_UNARY and b.op == OP_DEREF
+        b = b.operand
+    if b == null
+        return 0
+    var csuf: *u8 = null
+    var csuf_len: i32 = 0
+    if b.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(b.ident_ptr, b.ident_len)
+        # by_value 0 with a collection kind is a `**Vec<T>`: `b[i]` is a raw
+        # buffer of pointers there, not an element of the Vec.
+        if idx < 0 or *(g_lv_prefix_kind + idx) == 0 or *(g_lv_by_value + idx) == 0
+            return 0
+        csuf = *(g_lv_suffixes + idx)
+        csuf_len = *(g_lv_suffix_lens + idx)
+    else if b.kind == EXPR_MEMBER
+        let rf: *StructField = resolve_member_field(m, b)
+        if rf == null or (rf.field_type != TYPE_STRUCT and rf.field_type != TYPE_PTR)
+            return 0
+        if classify_collection_type(rf.field_type_name, rf.field_type_name_len, @csuf, @csuf_len) == 0
+            return 0
+    else
+        return 0
+    # The collection's suffix is "$<element>": classify the element.
+    if csuf == null or csuf_len < 2
+        return 0
+    return classify_collection_type(csuf + 1, csuf_len - 1, out_suffix, out_suffix_len)
 
 fn collect_from_expr(m: *Module, e: *Expr)
     if e == null

@@ -842,6 +842,14 @@ class Monomorphizer:
                 return base_type
             return None
 
+        # `v[i]`: the element, so `v[1].get(1)` on a Vec<Vec<i32>> registers
+        # vec_get<i32> (AGAST #2519).  `[]` sees through one `*`/`@`/`@&` to a
+        # Vec, Span, String or array (LARB R9); a `*T` to anything else is a raw
+        # buffer whose element is T.  This also types an un-annotated
+        # `let w = v[i]`, which is the element there too.
+        if isinstance(expr, rast.Index):
+            return self._element_type(self._infer_value_type(expr.expr))
+
         # Any other method call: the return type of the function it resolves
         # to (AGAST #2095).  Without this `var s = a.slice(0, n)` stays
         # untyped and a generic method reached only through `s` (`s.pop()`)
@@ -864,6 +872,33 @@ class Monomorphizer:
                     and recv_type.name in ('Result', 'Option')
                     and recv_type.args):
                 return recv_type.args[0]
+        return None
+
+    @staticmethod
+    def _element_type(base: Optional[rast.Type]) -> Optional[rast.Type]:
+        """The type of `b[i]` for a `b` of type `base`, or None if unknown."""
+
+        def of(t: Optional[rast.Type]) -> Optional[rast.Type]:
+            if isinstance(t, rast.ArrayType):
+                return t.inner
+            if isinstance(t, rast.NamedType):
+                if t.name in ('Vec', 'Span') and len(t.args) == 1:
+                    return t.args[0]
+                if t.name == 'String' and not t.args:
+                    return rast.NamedType(t.span, 'u8')
+            return None
+
+        direct = of(base)
+        if direct is not None:
+            return direct
+        if isinstance(base, (rast.PtrType, rast.RefType)):
+            # One level: `p[i]` is `(*p)[i]` when the pointee is indexable.
+            through = of(base.inner)
+            if through is not None:
+                return through
+            # Otherwise only a raw `*T` is a buffer; a reference is one value.
+            if isinstance(base, rast.PtrType) and not base.shared:
+                return base.inner
         return None
 
     def _infer_method_call_type(self, expr: rast.MethodCall) -> Optional[rast.Type]:

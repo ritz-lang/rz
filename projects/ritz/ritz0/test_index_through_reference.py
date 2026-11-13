@@ -931,9 +931,8 @@ def test_a_method_on_an_element_of_a_local(run_with, holder, compiler):
 
 
 # An element that's a Vec: Vec's own methods (`len`, `get`) on it.  `get` needs
-# `vec_get<i32>`, and neither monomorphizer types an element as a receiver, so it's
-# never instantiated: undefined `Vec$i32_get` at link, on a local Vec too (#2519).
-UNINSTANTIATED = pytest.mark.xfail(strict=True, reason="#2519")
+# `vec_get<i32>`, so each monomorphizer has to type the element as the receiver,
+# or it's never instantiated: undefined `Vec$i32_get` at link (#2519).
 VEC_METHODS = {"len": ("p[1].len() as i32", 2), "get": ("p[1].get(1)", 20)}
 
 
@@ -941,13 +940,40 @@ VEC_METHODS = {"len": ("p[1].len() as i32", 2), "get": ("p[1].get(1)", 20)}
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("method", sorted(VEC_METHODS))
-def test_a_vec_method_on_an_element_that_is_a_vec(run_with, method, kind, compiler, request):
-    if method == "get":
-        request.applymarker(UNINSTANTIATED)
+def test_a_vec_method_on_an_element_that_is_a_vec(run_with, method, kind, compiler):
     spelled, addr = KINDS[kind]
     call, want = VEC_METHODS[method]
     program = HEADER + NESTED.replace("p[1][1]", call).format(spelled=spelled, addr=addr)
     assert run_with(compiler, f"vm_{method}", program) == want
+
+
+# The same on the local Vec itself: no reference in the way (#2519).
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_vec_method_on_an_element_of_a_local_vec(run_with, compiler):
+    program = HEADER + NESTED.replace("return f({addr}v)", "return v[1].get(1)").format(spelled="*")
+    assert run_with(compiler, "vm_local", program) == 20
+
+
+# The other bases an element receiver is reached from (#2519): `(*p)[i]`, a
+# field, and an un-annotated `let` of an element, which ritz0 types the same way.
+# Batched, the rows share one compile and so one `vec_get$i32`: a row that never
+# registers it still links (#2867).  Check a change here with RITZ_TEST_BATCH=0.
+ELEMENT_RECEIVERS = {
+    "deref_form": "fn f(p: *Vec<Vec<i32>>) -> i32\n    return (*p)[1].get(1)\n",
+    "field": "fn f(p: *Vec<Vec<i32>>) -> i32\n    var h: H\n    h.vv = *p\n    return h.vv[1].get(1)\n",
+    "let_element": "fn f(p: *Vec<Vec<i32>>) -> i32\n    let w = p[1]\n    return w.get(1)\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(ELEMENT_RECEIVERS))
+def test_a_vec_method_on_an_element_reached_another_way(run_with, form, compiler):
+    head, _, rest = NESTED.partition("pub fn main")
+    program = (HEADER + "struct H\n    vv: Vec<Vec<i32>>\n\n" + ELEMENT_RECEIVERS[form]
+               + "\npub fn main" + rest.format(addr="@"))
+    assert run_with(compiler, f"vm_{form}", program) == 20
 
 
 # `let p = @&x` isn't recorded as a reference anywhere (#2445): ritz0 reads past it,
