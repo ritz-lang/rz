@@ -4450,6 +4450,22 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     emit_str(s, c", ptr ")
     emit_reg(s, scrut_slot)
     emit_str(s, c", i32 0, i32 2\n")
+    if is_unwrap == 1
+        # AGAST #2594: a struct payload (`Option<P>`) loads as its `%P`, as
+        # `?` does (emit_try's aggregate arm); an i64 load gave clang
+        # `store %P <i64>`.  unwrap_or's select is still i64 (#2863).
+        var pay_name_len: i32 = 0
+        let pay_name: *u8 = tagged_enum_payload_named(s, type_name, type_name_len, @pay_name_len, 0)
+        if pay_name != null
+            let agg: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, agg)
+            emit_str(s, c" = load %")
+            emit_name(s, pay_name, pay_name_len)
+            emit_str(s, c", ptr ")
+            emit_reg(s, pay_ptr)
+            emit_str(s, c"  ; unwrap struct payload\n")
+            return agg
     let payload: i32 = emit_tagged_payload_load(s, pay_ptr, type_name, type_name_len, 0)
 
     if is_unwrap == 1
@@ -5250,16 +5266,40 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         # ignores type_name matches.  Enum-unwrap is gated on a non-null
         # type_name so recursive chaining through `.unwrap()` isn't
         # supported yet. (ritz-task-106)
+        # AGAST #2594: when the inner method returns a struct
+        # (`c.me().tp(3)`), call_result_struct_name names it; the result is a
+        # `%S` value, spilled at that type and dispatched like a call's.
+        call_result_struct_name(s, recv, @type_name, @type_name_len)
         recv_value_reg = emit_expr(s, recv)
-        let chain_slot: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, chain_slot)
-        emit_str(s, c" = alloca i64  ; method-call-on-method-result receiver\n")
-        emit_str(s, c"  store i64 ")
-        emit_reg(s, recv_value_reg)
-        emit_str(s, c", ptr ")
-        emit_reg(s, chain_slot)
-        emit_str(s, c"\n")
+        var chain_slot: i32 = 0
+        if type_name_len > 0 and s.sret_last_slot > 0 and s.sret_last_val == recv_value_reg
+            chain_slot = s.sret_last_slot   # as the EXPR_CALL arm (#2073)
+        else if type_name_len > 0 and is_primitive_type_name(type_name, type_name_len) == 0
+            chain_slot = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, chain_slot)
+            emit_str(s, c" = alloca %")
+            emit_name(s, type_name, type_name_len)
+            emit_str(s, c"  ; method-on-method-result (struct value)\n")
+            emit_str(s, c"  store %")
+            emit_name(s, type_name, type_name_len)
+            emit_str(s, c" ")
+            emit_reg(s, recv_value_reg)
+            emit_str(s, c", ptr ")
+            emit_reg(s, chain_slot)
+            emit_str(s, c"\n")
+        else
+            type_name = null
+            type_name_len = 0
+            chain_slot = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, chain_slot)
+            emit_str(s, c" = alloca i64  ; method-call-on-method-result receiver\n")
+            emit_str(s, c"  store i64 ")
+            emit_reg(s, recv_value_reg)
+            emit_str(s, c", ptr ")
+            emit_reg(s, chain_slot)
+            emit_str(s, c"\n")
         receiver_reg = chain_slot
         recv_is_ptr_of_ptr = 0
     else if recv.kind == EXPR_STRUCT_LIT

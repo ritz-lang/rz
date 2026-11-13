@@ -238,10 +238,14 @@ def test_struct_from_a_field_global_or_pointer(run_with, compiler):
     assert run_with(compiler, "places", PLACES) == 20
 
 
-# Shapes ritz1 still can't name the struct of.  Each is refused, located at
-# the `let`, instead of binding nothing and failing at every later use with
-# an unlocated "unknown identifier".  ritz0 runs each (7): a known gap.
-_REFUSED_PRE = """\
+# Inits whose struct is named by more than a call's or a local's type.  Each
+# was refused, located ("can't tell which struct"), or for the block forms did
+# not parse at all (#2594); ritz0 gives 7 for each.
+#   unwrap          an Option<P>'s payload, read at %P, not as an i64
+#   chained_method  `c.me()` names the C `.tp(3)` is dispatched on
+#   match / if      a block init (angelo raster/fill.ritz:59): the arms' phi
+#                   names it; the grammar took a one-line init only
+_NAMED_PRE = """\
 import ritzlib.option
 
 struct P
@@ -259,12 +263,35 @@ impl C
         P { x: a + self.k, y: a }
 
 pub fn main() -> i32
+    let t = 1
 """
+NAMED = {
+    "unwrap": "    let r: Option<P> = Some(P { x: 1, y: 6 })\n"
+              "    let (a, b) = r.unwrap()\n",
+    "chained_method": "    let c = C { k: 1 }\n    let (a, b) = c.me().tp(3)\n",
+    "match": "    let (a, b) = match t\n        1 => P { x: 1, y: 6 }\n"
+             "        _ => P { x: 3, y: 5 }\n",
+    "if": "    let (a, b) = if t == 1\n        P { x: 1, y: 6 }\n"
+          "    else\n        P { x: 3, y: 5 }\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NAMED))
+def test_named_struct_runs_like_ritz0(run_with, name, compiler):
+    prog = _NAMED_PRE + NAMED[name] + "    return a + b\n"
+    assert run_with(compiler, f"named_{name}", prog) == 7
+
+
+# Shapes ritz1 still can't name the struct of.  Each is refused, located at
+# the `let`, instead of binding nothing and failing at every later use with
+# an unlocated "unknown identifier".  ritz0 runs each (7): a known gap.
+_REFUSED_PRE = _NAMED_PRE
 REFUSED = {
-    # #2594: an Option payload and a chained method call.
-    "unwrap": ("    let r: Option<P> = Some(P { x: 1, y: 6 })\n"
-               "    let (a, b) = r.unwrap()\n", 2594),
-    "chained_method": ("    let c = C { k: 1 }\n    let (a, b) = c.me().tp(3)\n", 2594),
+    # #2863: unwrap_or still selects an i64, so its struct isn't named.
+    "unwrap_or": ("    let r: Option<P> = None\n"
+                  "    let (a, b) = r.unwrap_or(P { x: 1, y: 6 })\n", 2863),
 }
 
 
@@ -329,12 +356,17 @@ def test_array_element_destructures(run_with, name, compiler):
     assert run_with(compiler, f"indexed_{name}", prog) == 7
 
 
-# A field ritz1 can't hold in a local (an array here) is refused, located.
-# ritz0 runs it (7): a known gap, #2594.
+# #2594: an array field binds an array local, a copy of the field, indexed at
+# its element's width.  Field 0 from a call's result; field 1, an i16 array
+# with a value negative above the low byte, from a local.  ritz0 gives 7.
 ARRAY_FIELD = """\
 struct P
     x: [2]i32
     y: i32
+
+struct Q
+    n: i8
+    w: [3]i16
 
 fn mk() -> P
     var p: P
@@ -343,24 +375,51 @@ fn mk() -> P
     p
 
 pub fn main() -> i32
+    var q: Q
+    q.n = 2
+    q.w[2] = -300
+    let (n, w) = q
+    if w[2] != -300 or n != 2
+        return 1
     let (a, b) = mk()
     return a[1] + b
 """
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_array_field_runs_like_ritz0(run_with, compiler):
+    assert run_with(compiler, "array_field", ARRAY_FIELD) == 7
+
+
+# A field ritz1 still can't bind (`@` here; `@&` and fn-typed are refused
+# the same way) is refused, located.  ritz0 runs it (7): #2864.
+REF_FIELD = """\
+struct Q
+    r: @i32
+    y: i32
+
+pub fn main() -> i32
+    let v: i32 = 3
+    let q = Q { r: @v, y: 4 }
+    let (a, b) = q
+    return *a + b
+"""
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-def test_array_field_is_a_located_error(compile_with, compiler):
-    comp, _ll, _work = compile_with(compiler, "array_field", ARRAY_FIELD)
+def test_ref_field_is_a_located_error(compile_with, compiler):
+    comp, _ll, _work = compile_with(compiler, "ref_field", REF_FIELD)
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, out
-    assert ":12:5: ritz1 can't destructure a field of this type" in out, out
+    assert ":8:5: ritz1 can't destructure a field of this type" in out, out
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_array_field_runs_like_ritz0(request, run_with, compiler):
+def test_ref_field_runs_like_ritz0(request, run_with, compiler):
     if compiler != "ritz0":
         request.applymarker(pytest.mark.xfail(
-            strict=True, reason="AGAST #2594: ritz1 refuses an array field"))
-    assert run_with(compiler, "array_field", ARRAY_FIELD) == 7
+            strict=True, reason="AGAST #2864: ritz1 refuses an `@` field"))
+    assert run_with(compiler, "ref_field", REF_FIELD) == 7

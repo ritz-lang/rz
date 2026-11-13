@@ -289,8 +289,6 @@ fn make() -> T
 
 """
 
-CHAIN_GAP = 2295
-
 # How many times the value drops, whichever way the receiver gets there.
 DROPS = {
     "binding": ("let t = T { x: 1 }\n    t.burn()\n    0\n", 1),
@@ -309,10 +307,8 @@ DROPS = {
 def _drops():
     for name in sorted(DROPS):
         for compiler in COMPILERS:
-            marks = []
-            if name == "handed_back_and_burned" and compiler != "ritz0":
-                marks = [pytest.mark.xfail(strict=True, reason=f"#{CHAIN_GAP}: no receiver type for `t.keep().burn()`")]
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
+            # `t.keep().burn()` dispatches on the T `keep` returns (#2594).
+            yield pytest.param(name, compiler, id=f"{name}-{compiler}")
 
 
 @pytest.mark.parametrize("name,compiler", list(_drops()))
