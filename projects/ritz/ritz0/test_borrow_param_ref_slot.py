@@ -32,8 +32,6 @@ from ref_rules import REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_R
 from test_borrow_param_ref_field import _compile, _run
 from test_ref_into_value import COMPILERS, _assert_refused
 
-NO_TUPLES_GAP = "AGAST #1526: ritz1 has no tuples"
-
 # None of these needs a `:&` to fail. #2309 lists each, and is closing.
 ELEMENT_GAP = "AGAST #2369: `a[0].x` through an `@&C` or `@C` element is `unhandled EXPR_MEMBER` on ritz1"
 IF_VALUE_GAP = "AGAST #2369: ritz1 doesn't parse an `if` value after `=` or in a struct literal"
@@ -714,7 +712,6 @@ def _both(*shapes):
 
 
 RITZ1_GAPS = {
-    **_gaps(_both("tuple", "tuple_return"), NO_TUPLES_GAP),
     **_gaps(["array_fill_mut", "array_literal_mut", "array_store_mut"], ELEMENT_GAP),
     **_gaps(_both("assign_from_if") + ["field_from_if", "literal_field_from_if"], IF_VALUE_GAP),
 }

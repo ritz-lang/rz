@@ -15,7 +15,8 @@ The first gaps these programs exposed are closed: ritz0's by AGAST #2157,
 ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). AGAST
 #2161 added enum payloads, array and tuple elements, temporaries and moves
 inside loops, closed for ritz0; ritz1's by AGAST #2165, except tuple
-elements (a strict xfail citing #1526, ritz1's missing tuple literals).
+elements (a strict xfail citing #1526, ritz1's missing tuple literals;
+#2956 added tuple types and literals, closing some of those rows).
 AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
 #2171. AGAST #2174 added a match owning its scrutinee, with payload
 bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
@@ -1883,7 +1884,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_from_call": (TUPLES + SLOT + """\
 fn f()
@@ -1893,7 +1894,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_conditional_taken": (TUPLES + SLOT + """\
 fn g(c: i32)
@@ -2067,7 +2068,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_of_temporary_binding": (TUPLES + SLOT + """\
 fn f()
@@ -2076,7 +2077,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_into_literal": (TUPLES + SLOT + """\
 fn f()
@@ -2290,7 +2291,7 @@ pub fn main() -> i32
     if x > 100
         return 1
     return 0
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_copy_element_read": (TUPLES + SLOT + """\
 fn f()
@@ -2330,7 +2331,7 @@ fn g(r: @Holder) -> i32
 fn g(r: @(Tracked, i64)) -> i32
     var x = r.0
     return consume(x)
-""" + TAIL, MOVE_OUT_OF_REF, NO_TUPLES),
+""" + TAIL, MOVE_OUT_OF_REF, {}),
     "address_of_into_by_value": ("fn g(t: Tracked) -> i32\n    return consume(@t)\n" + TAIL,
                                  ADDR_INTO_VALUE, {}),
     "deref_of_a_reference": ("fn g(r: @Tracked) -> i32\n    return consume(*r)\n" + TAIL,

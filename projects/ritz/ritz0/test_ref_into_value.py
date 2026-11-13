@@ -109,7 +109,7 @@ SHAPES = {
 }
 
 # ritz1 doesn't record what an un-annotated `let p = @n` points at for a scalar.
-SHAPE_GAPS = {"inferred_scalar": 2352, "tuple_element": 1526}
+SHAPE_GAPS = {"inferred_scalar": 2352}
 
 ADDR_SLOTS = {
     "shared": "fn f(d: C) -> i32\n    val(^@d)\n",
