@@ -9,7 +9,8 @@ A function or method returning `*S` gives a real place, so
 
 store through the returned pointer, calling once.  A method on such a
 result, `s.me().me().x = 12` (#2883), takes the returned pointer as its
-receiver, so every link runs once.  (#2518's by-value results
+receiver, so every link runs once; so does a free call's, `sp(@s).me().x`
+(#2946).  (#2518's by-value results
 are not places; #2517 is ritz1's reads through a `*R` call.)
 
 Each program returns 0 when right, else the number of the first check that
@@ -85,6 +86,14 @@ STORES = [
     ("let r: i32 = s.me().me().x", "r == 12", 2),
     ("s.me().me().x += 5", "s.x == 17", 2),
     ("s.me().me().me().arr[1] = 14", "s.arr[1] == 14", 3),
+    # AGAST #2946: a method on a `*S` free call's result -- the same, with a
+    # free function as the first link.
+    ("let q2: *S = sp(@s).me()\n    q2.x = 21", "s.x == 21", 2),
+    ("sp(@s).me().x = 22", "s.x == 22", 2),
+    ("let r2: i32 = sp(@s).me().x", "r2 == 22", 2),
+    ("sp(@s).me().x += 3", "s.x == 25", 2),
+    ("sp(@s).me().me().arr[0] = 23", "s.arr[0] == 23", 3),
+    ("sp(sp(@s)).me().w = 24", "s.w == 24", 3),
 ]
 
 

@@ -297,14 +297,15 @@ MOVES = {
 
 # ritz0 has none. All of ritz1's refuse, except #2316's, #2401's and #2402's.
 # (`chained_field` ran once #2391 returned a `-> @&T` call result as a `ptr`;
-# `chained_method`, through `mp() -> *C`, once #2883 named a `*S` link's impl.)
+# `chained_method`, through `mp() -> *C`, once #2883 named a `*S` link's impl;
+# `one_level_returned`, `h(q).set(3)`, once #2946 named a `*S` free call's.)
 RITZ1_GAPS = {f"{level}.chained_store": 2295 for level in LEVELS}
 RITZ1_GAPS |= dict.fromkeys(("field_shared_ptr_read", "field_mut_ptr_store", "global_shared_ptr_read",
                              "returned_shared_ptr_store", "returned_ptr_ptr_read", "returned_ptr_ptr_store",
                              "returned_is_called_once", "shared_to_shared_read", "mut_to_mut_store",
                              "ptr_to_mut_store"), 2399)
 RITZ1_GAPS |= dict.fromkeys(("global_ptr_ptr_read", "global_ptr_ptr_store", "element_ptr_ptr_store",
-                             "element_of_a_pointer_store", "index_is_evaluated_once", "one_level_returned",
+                             "element_of_a_pointer_store", "index_is_evaluated_once",
                              "deref_leaves_a_pointer_to_a_pointer", "self_is_a_ptr_ptr",
                              "self_is_a_shared_ptr", "ufcs_by_value_self_is_a_conversion"), 2404)
 RITZ1_GAPS["ptr_ptr"] = 2402
