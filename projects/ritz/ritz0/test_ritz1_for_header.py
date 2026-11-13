@@ -224,6 +224,10 @@ HOLDERS = {
                                      + "    return f<i32>(@b)\n"),
     "generic_struct_field_in_main": _in_main("b.v", FILL_B, GB),
     "field_of_a_let": _in_main("k.v", FILL_H + "    let k: VH = h\n", VH),
+    # AGAST #2410: each walked in place.
+    "deref": _in_main("*p", FILL_V + "    var p: *Vec<i32> = @v\n"),
+    "array_element": _in_main("vs[1]", FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"),
+    "addr_of_array_element": _in_main("@vs[1]", FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"),
 }
 
 
@@ -547,13 +551,13 @@ PUSHES = {
                        + _body(_TRIPS_AT.format(it="@g", place="g"))),
     "pointer_field": (GVEC + PH + MAIN + FILL_V + "    var q: PH\n    q.p = @v\n"
                       + _body(_TRIPS.format(it="q.p", place="v"))),
-}
-# ritz1 refuses each of these (#2410, #2426), so it can't get them wrong.
-PUSHES_ON_RITZ0 = {
     "deref": (GVEC + MAIN + FILL_V + "    var p: *Vec<i32> = @v\n"
               + _body(_TRIPS.format(it="*p", place="v"))),
     "array_element": (GVEC + MAIN + FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"
                       + _body(_TRIPS.format(it="vs[1]", place="vs[1]"))),
+}
+# ritz1 refuses each of these (#2426), so it can't get them wrong.
+PUSHES_ON_RITZ0 = {
     "vec_element": (GVEC + MAIN + FILL_V + "    var vv: Vec<Vec<i32>> = vec_new<Vec<i32>>()\n"
                     "    vv.push(v)\n" + _body(_TRIPS_AT.format(it="vv[0]", place="vv[0]"))),
     "field_of_a_pointer_call": (GVEC + VH + "var gh: VH\n\nfn mkp() -> *VH\n    return @gh\n\n"
@@ -906,10 +910,18 @@ NOT_A_HEADER = {
                     "    for x in mk()\n        t = t + 1\n    return t\n"),
     "pointer_to_pointer": (GVEC + "fn f(v: **Vec<i32>) -> i32\n    var t: i32 = 0\n    for x in v\n"
                            "        t = t + 1\n    return t\n\n" + MAIN + "    return 0\n"),
-    "pointer_to_an_array_of_vecs": (GVEC + "fn f(v: *[2]Vec<i32>) -> i32\n    var t: i32 = 0\n"
-                                    "    for x in v\n        t = t + 1\n    return t\n\n" + MAIN
-                                    + "    return 0\n"),
 }
+
+
+# AGAST #2410: a `*[N]Vec<T>` is a pointer to an array, whose elements are Vecs: 3 + 0.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_pointer_to_an_array_of_vecs_walks_the_vecs(run_with, compiler):
+    program = (GVEC + "fn f(vs: *[2]Vec<i32>) -> i32\n    var t: i32 = 0\n    for x in vs\n"
+               "        t = t + (x.len as i32) * 10 + 1\n    return t\n\n" + MAIN + FILL_V
+               + "    var vs: [2]Vec<i32>\n    vs[0] = v\n    vs[1] = vec_new<i32>()\n"
+               "    return f(@vs)\n")
+    assert run_with(compiler, "array_of_vecs", program) == 32
 
 
 @pytest.mark.integration
@@ -973,12 +985,9 @@ def test_an_element_ritz1_cant_name_is_refused(compile_with, compiler, name):
     _is_refused(comp, ll, message, program)
 
 
-# Refused for now, at the iterable; ritz0 runs these (#2410).  `@v` of a
-# reference is on no ticket: ritz0 refuses it, and `:&` is #2314.
+# Refused, at the iterable.  `@v` of a reference is on no ticket: ritz0 refuses
+# it, and `:&` is #2314.
 REFUSED_HOLDERS = {
-    "deref": GVEC + MAIN + FILL_V + "    var p: *Vec<i32> = @v\n" + _T.format(it="*p"),
-    "index": GVEC + MAIN + "    var vs: [2]Vec<i32>\n" + _T.format(it="vs[1]"),
-    "addr_of_index": GVEC + MAIN + "    var vs: [2]Vec<i32>\n" + _T.format(it="@vs[1]"),
     "addr_of_reference": (GVEC + "fn f(v: @Vec<i32>) -> i32\n" + _T.format(it="@v") + "\n" + MAIN
                           + FILL_V + "    return f(@v)\n"),
 }

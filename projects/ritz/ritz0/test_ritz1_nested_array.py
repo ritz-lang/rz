@@ -771,9 +771,10 @@ pub fn main() -> i32
     var g: [2][3]i32
     return take(g[1] as i64)
 """, ":6:", "a row or a struct element of a multi-dimensional array is not a value"),
+    # A `[N][M]T` is walked by rows since #2410; a row of this is itself 2-D.
     "for_in": ("""\
 pub fn main() -> i32
-    var g: [2][3]u8
+    var g: [2][3][2]u8
     for row in g
         return 1
     return 0

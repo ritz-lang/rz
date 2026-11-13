@@ -3082,7 +3082,37 @@ fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, out: *
             if fst != null
                 *out = fst
                 return mr.reg
+    if op.kind == EXPR_INDEX
+        return emit_for_element_header(s, op, out)   # AGAST #2410: `@vs[i]` is `vs[i]`
     0
+
+# AGAST #2410: `*p`, with `p` a pointer to a header: the header it points at.
+fn emit_for_deref_header(s: *EmitterState, op: *Expr, out: **StructDef) -> i32
+    var dst: *StructDef = null
+    var levels: i32 = 0
+    let reg: i32 = emit_deref_operand_ptr(s, op, @dst, @levels)
+    if dst == null or levels != 1
+        return 0
+    let st: *StructDef = for_header_struct(s, dst.name, dst.name_len)
+    if st == null
+        return 0
+    *out = st
+    reg
+
+# AGAST #2410: `vs[i]`, an element that is a header, at its own address.  The
+# index is evaluated once, before the loop.
+fn emit_for_element_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+    var t: RefTy
+    if ref_ty_of(s, e, @t) == 0 or t.kind != TYPE_STRUCT
+        return 0
+    let st: *StructDef = for_header_struct(s, t.name, t.name_len)
+    if st == null
+        return 0
+    let reg: i32 = emit_lvalue_ptr(s, e)
+    if reg < 0
+        return 0
+    *out = st
+    reg
 
 # AGAST #2388: a pointer to the header `iter` names, with its struct in *out, or
 # 0 with *out null.  The loop walks that header in place, reading `len` and `data`
@@ -3111,6 +3141,11 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
         return 0
     if iter.kind == EXPR_UNARY and (iter.op == OP_ADDR or iter.op == OP_ADDR_MUT)
         return emit_for_addr_header(s, iter, mr, out)
+    # AGAST #2410: `*p` and `vs[i]` are places: walked where they are.
+    if iter.kind == EXPR_UNARY and iter.op == OP_DEREF
+        return emit_for_deref_header(s, iter.operand, out)
+    if iter.kind == EXPR_INDEX
+        return emit_for_element_header(s, iter, out)
     var name: *u8 = null
     var name_len: i32 = 0
     if iter.kind == EXPR_CALL or iter.kind == EXPR_METHOD
@@ -3122,6 +3157,77 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
         return 0
     *out = vst
     emit_for_header_spill(s, vst, emit_expr(s, iter))
+
+# AGAST #2410: the LLVM type of what the loop binds: an element, or a `[M x T]` row
+# when `row` is M.
+fn emit_for_slot_llvm(s: *EmitterState, elem: i32, name: *u8, name_len: i32, row: i32)
+    if row > 0
+        emit_str(s, c"[")
+        emit_int(s, row as i64)
+        emit_str(s, c" x ")
+        emit_for_elem_llvm(s, elem, name, name_len)
+        emit_str(s, c"]")
+    else
+        emit_for_elem_llvm(s, elem, name, name_len)
+
+# AGAST #2410: the array a `*[N]T` / `@[N]T` / `@&[N]T` local points at, read once,
+# with its N and T in the outs.  (`*[N][M]T` doesn't parse on ritz1.)
+fn for_array_ptr(s: *EmitterState, loc: *LocalVar, elem: *i32, size: *i32, name: **u8, name_len: *i32, pointee: *i32, p_name: **u8, p_name_len: *i32) -> i32
+    *elem = loc.pointee_array_elem_type
+    *size = loc.pointee_array_size
+    var en_len: i32 = 0
+    let en: *u8 = array_ptr_elem_name(loc, @en_len)
+    *name = en
+    *name_len = en_len
+    *pointee = elem_recorded_pointee(s, *elem, loc.pointee_array_elem_pointee, en, en_len, p_name, p_name_len)
+    emit_load_ptr(s, loc.reg)
+
+# AGAST #2410: the element type of the literal `e`, from its first element as
+# ritz0 has it: a struct, a bool, a float or an integer.  TYPE_VOID for any other.
+fn for_literal_elem(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32) -> i32
+    if array_lit_struct_elem(s, e, name, name_len) > 0
+        return TYPE_STRUCT
+    let first: *Expr = e.args
+    if first == null
+        return TYPE_VOID
+    let k: i32 = bool_kind(s, first)
+    if k == BK_BOOL
+        return TYPE_BOOL
+    let t: i32 = get_expr_type(s, first)
+    if k == BK_FLOAT
+        if t == TYPE_F32
+            return TYPE_F32
+        return TYPE_F64
+    if k == BK_INT
+        if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32 or t == TYPE_U64
+            return t
+        return TYPE_I64
+    TYPE_VOID
+
+# AGAST #2410: the literal `e` in a slot of its own, a static alloca that
+# hoist_entry_allocas takes out of any enclosing loop; 0 for a literal ritz1
+# can't type.
+fn emit_for_literal(s: *EmitterState, e: *Expr, elem: *i32, size: *i32, name: **u8, name_len: *i32) -> i32
+    let t: i32 = for_literal_elem(s, e, name, name_len)
+    if t == TYPE_VOID
+        return 0
+    var n: i32 = 0
+    var it: *Expr = e.args
+    while it != null
+        n = n + 1
+        it = it.next
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca [")
+    emit_int(s, n as i64)
+    emit_str(s, c" x ")
+    emit_for_elem_llvm(s, t, *name, *name_len)
+    emit_str(s, c"]\n")
+    emit_array_lit_into(s, slot, n, t, *name, *name_len, e)
+    *elem = t
+    *size = n
+    slot
 
 # AGAST #2533: whether the field `e` names is a field of a call's result, as in
 # `mk().a` or `mk().p.a`.  ritz0 takes no address of one.  `mkp()[0].a` is a
@@ -3139,8 +3245,12 @@ fn member_reached_through_call(e: *Expr) -> i32
 #   • a local `[N]T` (TYPE_ARRAY), walked in place
 #   • a module const or global `[N]T`, walked in place at its symbol
 #   • an array field, walked in place at its address (AGAST #2387)
+#   • what a `*[N]T` / `@[N]T` / `@&[N]T` local points at, as `p` or `*p`, and a
+#     row `m[i]` of a `[N][M]T`, walked in place (AGAST #2410)
+#   • a literal, walked in a slot of its own: nothing else can reach it
+#   • a `[N][M]T`, whose binding is each row, a copy as an element is
 #   • a Vec, a Span or a StrView, through its header (emit_for_header)
-# Anything else is a located error, as is a multi-dimensional array.  AGAST
+# Anything else is a located error, as is an array of rank 3 or more.  AGAST
 # #2375: it used to be a loop that never ran, with no diagnostic.
 fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     var iter_kind: i32 = 0         # 0=unsupported, 1=array in a reg, 2=header in a reg, 3=array at a symbol
@@ -3160,6 +3270,12 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # AGAST #2375: the element's struct, for an element of `[N]S`.
     var elem_name: *u8 = null
     var elem_name_len: i32 = 0
+    # AGAST #2410: what an N-D iterable is, and how many of its indices are
+    # applied.  for_nd_rows turns it into the walk.
+    var nd_shape: *ArrayShape = null
+    var nd_depth: i32 = 0
+    # M when the element is itself a `[M]T` row, which the binding holds.
+    var row_size: i32 = 0
 
     var mr: MemberPtrResult
     mr.reg = 0
@@ -3180,12 +3296,12 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             let loc: *LocalVar = find_local_struct_name(s, arr_ident.ident_ptr, arr_ident.ident_len)
             if loc != null
                 if loc.var_type == TYPE_ARRAY and loc.array_shape != null
-                    # AGAST #1509: iterating a multi-dimensional array yields
-                    # rows, which ritz1 cannot hold; it used to GEP the
-                    # alloca as `[N x i64]` and load garbage.
-                    emit_nd_error(s, iter.span.line, iter.span.col, c"iterating a multi-dimensional array is not supported in ritz1 (index it with nested ranges)")
-                    return
-                if loc.var_type == TYPE_ARRAY
+                    # AGAST #1509: a multi-dimensional array yields rows.  It
+                    # used to GEP the alloca as `[N x i64]` and load garbage.
+                    nd_shape = loc.array_shape
+                    iter_kind = 1
+                    data_reg = loc.reg
+                else if loc.var_type == TYPE_ARRAY
                     iter_kind = 1
                     elem_type = loc.array_elem_type
                     arr_size = loc.array_size
@@ -3193,6 +3309,11 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     elem_name = loc.type_name
                     elem_name_len = loc.type_name_len
                     bind_pointee = elem_recorded_pointee(s, elem_type, loc.array_elem_pointee, loc.type_name, loc.type_name_len, @bind_name, @bind_name_len)
+                else if via_addr == 0 and array_ptr_named(s, arr_ident.ident_ptr, arr_ident.ident_len) != null
+                    # AGAST #2410: `a: *[N]T` / `@[N]T` / `@&[N]T` walks the array
+                    # it points at.
+                    data_reg = for_array_ptr(s, loc, @elem_type, @arr_size, @elem_name, @elem_name_len, @bind_pointee, @bind_name, @bind_name_len)
+                    iter_kind = 1
             else
                 # Iter is not a local — try a module const array
                 # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
@@ -3209,10 +3330,12 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     elem_name_len = centry.array_elem_type_name_len
                 else
                     let glob: *GlobalVarDef = find_global(s, arr_ident.ident_ptr, arr_ident.ident_len)
-                    if glob != null and glob.var_type == TYPE_ARRAY
-                        if glob.array_shape != null
-                            emit_nd_error(s, iter.span.line, iter.span.col, c"iterating a multi-dimensional array is not supported in ritz1 (index it with nested ranges)")
-                            return
+                    if glob != null and glob.var_type == TYPE_ARRAY and glob.array_shape != null
+                        nd_shape = glob.array_shape
+                        iter_kind = 3
+                        const_name = glob.name
+                        const_name_len = glob.name_len
+                    else if glob != null and glob.var_type == TYPE_ARRAY
                         iter_kind = 3
                         elem_type = glob.array_elem_type
                         arr_size = glob.array_size
@@ -3228,16 +3351,50 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_member_ptr(s, arr_ident, @mr)
             if mr.success == 1 and mr.field.field_type == TYPE_ARRAY
                 let fld: *StructField = mr.field
-                if fld.array_shape != null
-                    emit_nd_error(s, iter.span.line, iter.span.col, c"iterating a multi-dimensional array is not supported in ritz1 (index it with nested ranges)")
-                    return
                 iter_kind = 1
+                data_reg = mr.reg
+                if fld.array_shape != null
+                    nd_shape = fld.array_shape
                 elem_type = fld.array_elem_type
                 arr_size = fld.array_size
                 data_reg = mr.reg
                 elem_name = fld.array_elem_type_name
                 elem_name_len = fld.array_elem_type_name_len
                 bind_pointee = elem_recorded_pointee(s, elem_type, fld.array_elem_pointee, elem_name, elem_name_len, @bind_name, @bind_name_len)
+        else if iter.kind == EXPR_UNARY and iter.op == OP_DEREF and iter.operand != null and iter.operand.kind == EXPR_IDENT
+            # AGAST #2410: `*p` is the array `p` points at, not a copy of it.
+            let ap: *LocalVar = array_ptr_named(s, iter.operand.ident_ptr, iter.operand.ident_len)
+            if ap != null
+                data_reg = for_array_ptr(s, ap, @elem_type, @arr_size, @elem_name, @elem_name_len, @bind_pointee, @bind_name, @bind_name_len)
+                iter_kind = 1
+        else if iter.kind == EXPR_INDEX
+            # AGAST #2410: a row `m[i]` of a `[N][M]T`, where it is.
+            let sh: *ArrayShape = nd_index_shape(s, iter, @nd_depth)
+            if sh != null and nd_depth < sh.rank and (iter.right == null or iter.right.kind != EXPR_RANGE)
+                var ndp: NdIndexPtr
+                if emit_nd_index_ptr(s, iter, @ndp) == 1
+                    nd_shape = sh
+                    iter_kind = 1
+                    data_reg = ndp.reg
+        else if iter.kind == EXPR_ARRAY_LIT
+            # AGAST #2410: a literal is an rvalue: a slot of its own.
+            data_reg = emit_for_literal(s, iter, @elem_type, @arr_size, @elem_name, @elem_name_len)
+            if data_reg != 0
+                iter_kind = 1
+
+    if nd_shape != null
+        # Rows of a `[N][M]T`, or the elements of a row: rank 3 and up isn't.
+        let left: i32 = nd_shape.rank - nd_depth
+        if left > 2
+            emit_nd_error(s, iter.span.line, iter.span.col, c"iterating a multi-dimensional array is not supported in ritz1 (index it with nested ranges)")
+            return
+        arr_size = nd_shape.dims[nd_depth]
+        if left == 2
+            row_size = nd_shape.dims[nd_depth + 1]
+        elem_type = nd_shape.leaf_type
+        elem_name = nd_shape.leaf_name
+        elem_name_len = nd_shape.leaf_name_len
+        bind_pointee = elem_recorded_pointee(s, elem_type, nd_shape.leaf_pointee, elem_name, elem_name_len, @bind_name, @bind_name_len)
 
     if iter_kind == 0 and iter != null
         var hdr: *StructDef = null
@@ -3283,13 +3440,19 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     emit_str(s, c" = alloca ")
     # A bool local is an i64 slot, as emit_var_decl has it, and `elem_type` an
     # `i1` in the array.  The body reads the binding as any other bool local.
-    if elem_type == TYPE_BOOL
+    if elem_type == TYPE_BOOL and row_size == 0
         emit_str(s, c"i64")
     else
-        emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
+        emit_for_slot_llvm(s, elem_type, elem_name, elem_name_len, row_size)
     emit_str(s, c"\n")
 
-    if bind_pointee != TYPE_VOID
+    if row_size > 0
+        # AGAST #2410: a row is a `[M]T` local.  ritz0 binds a `let`.
+        add_local_full(s, stmt.for_var, stmt.for_var_len, var_reg, TYPE_ARRAY, elem_name, elem_name_len, TYPE_I64, row_size, elem_type)
+        let row_loc: *LocalVar = local_at(s, s.local_count - 1)
+        row_loc.array_elem_pointee = bind_pointee
+        row_loc.is_let = 1
+    else if bind_pointee != TYPE_VOID
         add_local_full(s, stmt.for_var, stmt.for_var_len, var_reg, elem_type, bind_name, bind_name_len, bind_pointee, 0, 0)
     else if elem_type == TYPE_STRUCT and elem_name_len > 0
         add_local_struct(s, stmt.for_var, stmt.for_var_len, var_reg, elem_type, elem_name, elem_name_len)
@@ -3407,7 +3570,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c" = getelementptr [")
         emit_int(s, arr_size as i64)
         emit_str(s, c" x ")
-        emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
+        emit_for_slot_llvm(s, elem_type, elem_name, elem_name_len, row_size)
         emit_str(s, c"], ptr ")
         # A local array or a field is an SSA reg; a const or global
         # array is its symbol.
@@ -3423,11 +3586,11 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     emit_str(s, c"  ")
     emit_reg(s, elem_val)
     emit_str(s, c" = load ")
-    emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
+    emit_for_slot_llvm(s, elem_type, elem_name, elem_name_len, row_size)
     emit_str(s, c", ptr ")
     emit_reg(s, elem_ptr)
     emit_str(s, c"\n")
-    if elem_type == TYPE_BOOL
+    if elem_type == TYPE_BOOL and row_size == 0
         let wide: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, wide)
@@ -3437,7 +3600,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_reg(s, wide)
     else
         emit_str(s, c"  store ")
-        emit_for_elem_llvm(s, elem_type, elem_name, elem_name_len)
+        emit_for_slot_llvm(s, elem_type, elem_name, elem_name_len, row_size)
         emit_str(s, c" ")
         emit_reg(s, elem_val)
     emit_str(s, c", ptr ")

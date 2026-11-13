@@ -190,7 +190,11 @@ _IF_V = ("    var t: i32 = 0\n    for v in {it}\n        if v\n            t = t
     ("global", "var g: [3]bool\n\n" + MAIN + _fill("g", _BOOLS) + _IF_V.format(it="g")),
     ("field", _struct("bool") + MAIN + "    var h: H\n" + _fill("h.a", _BOOLS)
      + _IF_V.format(it="h.a")),
-], ids=["local", "global", "field"])
+    ("pointer", "fn f(a: *[3]bool) -> i32\n" + _IF_V.format(it="a") + "\n" + MAIN
+     + "    var a: [3]bool = [true, false, true]\n    return f(@a)\n"),
+    ("row", MAIN + "    var m: [2][3]bool\n" + _fill("m[1]", _BOOLS) + _IF_V.format(it="m[1]")),
+    ("literal", MAIN + _IF_V.format(it="[true, false, true]")),
+], ids=["local", "global", "field", "pointer", "row", "literal"])
 def test_a_bool_binding_is_a_condition(run_with, compiler, name, program):
     assert run_with(compiler, name, program) == 0
 
@@ -214,6 +218,11 @@ STRUCT_ELEMENTS = {
               + _SUM.format(it="w.a")),
     "const": (_S + "const C: [2]S = [S { p: 1, q: 2, r: 3 }, S { p: 10, q: 20, r: 30 }]\n\n"
               + MAIN + _SUM.format(it="C")),
+    "pointer": (_S + "fn f(a: *[2]S) -> i32\n" + _SUM.format(it="a") + "\n" + MAIN
+                + "    var a: [2]S\n" + _set("a") + "    return f(@a)\n"),
+    "row": _S + MAIN + "    var m: [2][2]S\n" + _set("m[1]") + _SUM.format(it="m[1]"),
+    "literal": (_S + MAIN + _SUM.format(
+        it="[S { p: 1, q: 2, r: 3 }, S { p: 10, q: 20, r: 30 }]")),
 }
 
 
@@ -332,12 +341,7 @@ LIVE = {
               + _fill("h.a", _SEED) + _WRITES.format(it="h.a", place="h.a")),
     "through_a_pointer_to_it": (_H3 + MAIN + _FILL3 + "    var p: *H = @h\n"
                                 + _WRITES.format(it="h.a", place="p.a")),
-}
-
-
-# ritz0 alone: ritz1 refuses each of these, so it can't get them wrong (#2410, #2426).
-_POINTER_FN = "fn mkp() -> *H\n    return @gh\n\n"
-LIVE_ON_RITZ0 = {
+    # AGAST #2410: what a `*[N]T`, a `*p` or a row names is walked in place.
     "deref": (MAIN + "    var a: [3]i32 = [1, 2, 4]\n    var p: *[3]i32 = @a\n"
               + _WRITES.format(it="*p", place="a")),
     "row": (MAIN + "    var m: [2][3]i32\n" + _fill("m[1]", _SEED)
@@ -346,6 +350,18 @@ LIVE_ON_RITZ0 = {
                    + _WRITES.format(it="m[1]", place="m[1]")),
     "field_row": ("struct R\n    m: [2][3]i32\n\n" + MAIN + "    var r: R\n" + _fill("r.m[1]", _SEED)
                   + _WRITES.format(it="r.m[1]", place="r.m[1]")),
+    # It was live before #2387, and stays so: what's given is the pointer.
+    "pointer_to_an_array": ("fn f(a: *[3]i32, e: *i32) -> i32\n    var t: i32 = 0\n    for v in a\n"
+                            "        *e = 50\n        t = t + v\n    return t\n\n" + MAIN
+                            + "    var a: [3]i32 = [1, 2, 4]\n    return f(@a, @a[2])\n"),
+    "mut_reference_to_an_array": ("fn f(a: @&[3]i32) -> i32\n" + _WRITES.format(it="a", place="a")
+                                  + "\n" + MAIN + "    var a: [3]i32 = [1, 2, 4]\n    return f(@&a)\n"),
+}
+
+
+# ritz0 alone: ritz1 refuses each of these, so it can't get them wrong (#2426).
+_POINTER_FN = "fn mkp() -> *H\n    return @gh\n\n"
+LIVE_ON_RITZ0 = {
     "field_of_a_pointer_call": (_GH + _POINTER_FN + MAIN + _FILL_GH
                                 + _WRITES.format(it="mkp().a", place="gh.a")),
     "field_of_a_pointer_method": (_GH + "struct K\n    n: i32\n\nimpl K\n"
@@ -364,10 +380,6 @@ LIVE_ON_RITZ0 = {
                               + _WRITES.format(it="mkp().m[1]", place="gr.m[1]")),
     "tuple_element": (MAIN + "    var p: (i32, [3]i32) = (0, [1, 2, 4])\n"
                       + _WRITES.format(it="p.1", place="p.1")),
-    # It was live before #2387, and stays so: what's given is the pointer.
-    "pointer_to_an_array": ("fn f(a: *[3]i32, e: *i32) -> i32\n    var t: i32 = 0\n    for v in a\n"
-                            "        *e = 50\n        t = t + v\n    return t\n\n" + MAIN
-                            + "    var a: [3]i32 = [1, 2, 4]\n    return f(@a, @a[2])\n"),
 }
 
 
@@ -382,6 +394,53 @@ def test_writes_in_the_body(run_with, compiler, name):
 @pytest.mark.parametrize("name", sorted(LIVE_ON_RITZ0))
 def test_ritz0_writes_in_the_body(run_with, name):
     assert run_with("ritz0", name, LIVE_ON_RITZ0[name]) == 53
+
+
+# AGAST #2410: each was a located error on ritz1.  4, from 1 and 3.
+_A = "    var a: [2]i32 = [1, 3]\n"
+ARRAY_FAMILY = {
+    "pointer_to_array": ("fn f(a: *[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
+                         + _A + "    return f(@a)\n"),
+    "reference_to_array": ("fn f(a: @[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
+                           + _A + "    return f(@a)\n"),
+    "local_pointer": MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="p"),
+    "deref": MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="*p"),
+    "literal": MAIN + _SUM_V.format(it="[1, 3]"),
+    "row": MAIN + "    var m: [2][2]i32\n" + _fill("m[1]", (1, 3)) + _SUM_V.format(it="m[1]"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ARRAY_FAMILY))
+def test_the_array_family_runs(run_with, compiler, name):
+    assert run_with(compiler, name, ARRAY_FAMILY[name]) == 4
+
+
+# The stride is the element's own, through a pointer and along a row.
+TYPED = ("i8", "u16", "u32", "i64", "f32", "f64", "bool")
+FAMILY_WALKS = {
+    "pointer": lambda ty, vs: (f"fn f(a: *[3]{ty}) -> i32\n" + _walk("a", ty, vs) + "\n" + MAIN
+                               + f"    var a: [3]{ty}\n" + _fill("a", vs) + "    return f(@a)\n"),
+    "row": lambda ty, vs: (MAIN + f"    var m: [2][3]{ty}\n" + _fill("m[1]", vs)
+                           + _walk("m[1]", ty, vs)),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(FAMILY_WALKS))
+@pytest.mark.parametrize("ty", TYPED)
+def test_the_array_family_reads_at_its_width(run_with, compiler, form, ty):
+    assert run_with(compiler, f"{form}_{ty}", FAMILY_WALKS[form](ty, SCALARS[ty])) == 0
+
+
+# A literal's element type is its first element's: f64 for `1.5`.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_float_literal_is_walked_as_floats(run_with, compiler):
+    program = MAIN + _walk("[1.5, 2.5, 3.5]", "f64", SCALARS["f64"])
+    assert run_with(compiler, "lit_f64", program) == 0
 
 
 # Through a `**H`, which ritz0 only reads, so the write goes by way of `h`.
@@ -517,12 +576,13 @@ def test_a_callers_struct_is_not_a_by_value_params(run_with, compiler):
 RVALUES = {
     "field_of_a_call": (_GH + "fn mk() -> H\n    return gh\n\n" + MAIN
                         + _FILL_GH + _WRITES.format(it="mk().a", place="gh.a")),
+    "literal": (MAIN + "    var a: [3]i32 = [1, 2, 4]\n"
+                + _WRITES.format(it="[a[0], a[1], a[2]]", place="a")),
 }
+# ritz1 has no array return value yet: it refuses `return g` (#2302, then #2997).
 RVALUES_ON_RITZ0 = {
     "call": ("var g: [3]i32\n\nfn mk() -> [3]i32\n    return g\n\n" + MAIN + _fill("g", _SEED)
              + _WRITES.format(it="mk()", place="g")),
-    "literal": (MAIN + "    var a: [3]i32 = [1, 2, 4]\n"
-                + _WRITES.format(it="[a[0], a[1], a[2]]", place="a")),
 }
 
 
@@ -713,14 +773,25 @@ def test_a_loop_over_a_field_of_a_let_does_not_grow_the_stack(run_with, compiler
     assert run_with(compiler, "stack_let", program) == 0
 
 
-# A reference is its own value: nothing to spill.  ritz1 refuses this (#2410).
+# A reference is its own value: nothing to spill.
 @pytest.mark.integration
-def test_ritz0_a_loop_over_a_reference_does_not_grow_the_stack(run_with):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_loop_over_a_reference_does_not_grow_the_stack(run_with, compiler):
     program = ("fn f(a: @[3]i32) -> i32\n    var t: i32 = 0\n    var i: i32 = 0\n"
                "    while i < 2000000\n        for v in a\n            t = t + v\n"
                "        i = i + 1\n    if t != 14000000\n        return 1\n    return 0\n\n"
                + MAIN + "    var a: [3]i32 = [1, 2, 4]\n    return f(@a)\n")
-    assert run_with("ritz0", "stack_ref", program) == 0
+    assert run_with(compiler, "stack_ref", program) == 0
+
+
+# A literal's slot is static: a loop around the `for` doesn't make a new one a pass.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_literals_slot_does_not_grow_the_stack(run_with, compiler):
+    program = (MAIN + "    var t: i32 = 0\n    var i: i32 = 0\n    while i < 2000000\n"
+               "        for v in [1, 2, 4]\n            t = t + v\n        i = i + 1\n"
+               "    if t != 14000000\n        return 1\n    return 0\n")
+    assert run_with(compiler, "stack_lit", program) == 0
 
 
 # A first-class load of a large array is what sends clang past 13 GB at -O2
@@ -753,13 +824,84 @@ def test_a_large_field_is_walked_to_its_end(run_with, compiler):
 _ND = "    var t: i32 = 3\n    for r in {it}\n        t = t + 0\n    return t\n"
 ND_MESSAGE = "iterating a multi-dimensional array is not supported in ritz1"
 
-# Multi-dimensional iterables stay refused, as a local one is (#1509).
+# AGAST #2410: `for r in m` over a `[N][M]T` binds each row, itself a `[M]T`.  A
+# write to a later row shows when the loop gets there: 1 + 2 + 4 + 50 + 16 + 32.
+_ROWS = ("    var t: i32 = 0\n    var k: i32 = 0\n    for r in {it}\n"
+         "        {place}[1][0] = 50\n        t = t + r[0] + r[1] + r[2]\n        k = k + 1\n"
+         "    if k != 2\n        return 1\n    return t\n")
+
+
+def _rows(place: str) -> str:
+    return _fill(f"{place}[0]", (1, 2, 4)) + _fill(f"{place}[1]", (8, 16, 32)) + _ROWS.format(
+        it=place, place=place)
+
+
+ROWS = {
+    "local": MAIN + "    var m: [2][3]i32\n" + _rows("m"),
+    "global": "var m: [2][3]i32\n\n" + MAIN + _rows("m"),
+    "field": "struct N\n    m: [2][3]i32\n\n" + MAIN + "    var n: N\n" + _rows("n.m"),
+    "alias_field": ("type G = [2][3]i32\nstruct N\n    m: G\n\n" + MAIN + "    var n: N\n"
+                    + _rows("n.m")),
+    "slice_of_3d": MAIN + "    var m: [2][2][3]i32\n" + _rows("m[1]"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ROWS))
+def test_a_row_binding_is_an_array(run_with, compiler, name):
+    assert run_with(compiler, name, ROWS[name]) == 105
+
+
+# A row is a copy of its row, as an element is, taken before the body runs.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_row_binding_keeps_its_row(run_with, compiler):
+    program = (MAIN + "    var m: [2][2]i64\n" + _fill("m[0]", (1, 2)) + _fill("m[1]", (4, 8))
+               + "    var t: i64 = 0\n    for r in m\n        m[0][1] = 100\n"
+               "        t = t + r[1]\n    return t as i32\n")
+    assert run_with(compiler, "row_copy", program) == 10
+
+
+# A bool row is `i1`s, as a `[M]bool` local is: a condition takes `r[2]`.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_bool_row_is_a_bool_array(run_with, compiler):
+    program = (MAIN + "    var m: [2][3]bool\n" + _fill("m[0]", ("false", "false", "true"))
+               + _fill("m[1]", ("true", "true", "false")) + "    var t: i32 = 0\n    for r in m\n"
+               "        if r[2]\n            t = t + 1\n        if r[0]\n            t = t + 10\n"
+               "    return t\n")
+    assert run_with(compiler, "bool_rows", program) == 11
+
+
+# Its slot is the row, not the i64 a bool element's binding is: a `[16 x i1]` row
+# stored to an 8-byte slot would overrun it, whatever a run happens to show.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+def test_a_bool_rows_slot_is_the_row(compile_with, compiler):
+    program = (MAIN + "    var m: [2][16]bool\n    var t: i32 = 0\n    for r in m\n"
+               "        if r[15]\n            t = t + 1\n    return t\n")
+    comp, ll, _ = compile_with(compiler, "bool_row_slot", program)
+    assert comp.returncode == 0, comp.stderr
+    assert "alloca [16 x i1]" in ll.read_text()
+
+
+# The row binding is a `let`, as an element is: a write to its copy is refused.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_row_binding_is_a_let(compile_with, compiler):
+    program = MAIN + "    var m: [2][2]i32\n    for r in m\n        r[0] = 5\n    return 0\n"
+    comp, ll, _ = compile_with(compiler, "row_let", program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert not ll.exists()
+    assert "4:9:" in out and "cannot assign through `let` binding `r`; declare it `var`" in out, out
+
+
+# A row of a 3-D array is itself 2-D, and stays refused (#1509).
 NOT_LOWERED_ND = {
-    "local": (MAIN + "    var m: [2][2]i32\n" + _ND.format(it="m")),
-    "global": ("var m: [2][2]i32\n\n" + MAIN + _ND.format(it="m")),
-    "field": ("struct N\n    m: [2][2]i32\n\n" + MAIN + "    var n: N\n" + _ND.format(it="n.m")),
-    "alias_field": ("type G = [2][2]i32\nstruct N\n    m: G\n\n" + MAIN + "    var n: N\n"
-                    + _ND.format(it="n.m")),
+    "local": (MAIN + "    var m: [2][2][2]i32\n" + _ND.format(it="m")),
+    "global": ("var m: [2][2][2]i32\n\n" + MAIN + _ND.format(it="m")),
 }
 
 
@@ -786,25 +928,14 @@ UNSUPPORTED = "this `for` iterable is not supported in ritz1"
 
 _VEC = "import ritzlib.gvec\n\nstruct VH\n    v: Vec<i32>\n\n"
 _NEW_VEC = "    var w: Vec<i32> = vec_new<i32>()\n"
-_A = "    var a: [2]i32 = [1, 3]\n"
 _G = "var g: [2]i32\n\n"
 _H2 = "struct H\n    n: i32\n    a: [2]i32\n\n"
 
 
-# Each compiled to a loop that never ran.  ritz0 takes this first group, so each
-# is a gap with a ticket (#2410); it refuses the second, and so does ritz1 now.
-# What's lowered moves out: Vec, Span and StrView are in test_ritz1_for_header.py,
-# and `@a` / `@v` / `@h.a` in test_ritz1_for_addr_of.py (#2314, #2533).
-RITZ1_REFUSES = {
-    "pointer_to_array": ("fn f(a: *[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
-                         + _A + "    return f(@a)\n"),
-    "reference_to_array": ("fn f(a: @[2]i32) -> i32\n" + _SUM_V.format(it="a") + "\n" + MAIN
-                           + _A + "    return f(@a)\n"),
-    "deref": (MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="*p")),
-    "literal": (MAIN + _SUM_V.format(it="[1, 2]")),
-    "row": (MAIN + "    var m: [2][2]i32\n" + _SUM_V.format(it="m[1]")),
-}
-
+# Each compiled to a loop that never ran.  ritz0 refuses these, and so does ritz1
+# now.  What's lowered moves out: Vec, Span and StrView are in
+# test_ritz1_for_header.py, `@a` / `@v` / `@h.a` in test_ritz1_for_addr_of.py
+# (#2314, #2533), and the array family below (#2410).
 BOTH_REFUSE = {
     "local_scalar": (MAIN + "    var n: i32 = 3\n" + _SUM_V.format(it="n")),
     "global_scalar": ("var n: i32\n\n" + MAIN + _SUM_V.format(it="n")),
@@ -815,9 +946,9 @@ BOTH_REFUSE = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(RITZ1_REFUSES) + sorted(BOTH_REFUSE))
+@pytest.mark.parametrize("name", sorted(BOTH_REFUSE))
 def test_anything_else_is_a_located_error(compile_with, compiler, name):
-    program = {**RITZ1_REFUSES, **BOTH_REFUSE}[name]
+    program = BOTH_REFUSE[name]
     comp, ll, _ = compile_with(compiler, name, program)
     _is_refused(comp, ll, UNSUPPORTED, program)
 
