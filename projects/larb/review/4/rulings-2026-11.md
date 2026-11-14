@@ -1051,3 +1051,251 @@ the recommendation to refuse it are withdrawn. The text above is amended to say 
 1. **#3037** (R16): 0 sites and an error on all three compilers. Any room can take it.
 2. **#3015** (R17, `Deref`/`DerefMut`): independent of #1635, but both add a
    compiler-known-trait lookup, so whichever lands second should reuse the first's.
+
+---
+
+# Batch of 2026-11-14 (evening): R19–R21, for Aaron to confirm
+
+Aaron answered six open questions on 2026-11-14. He settled three (#2514, #3048,
+#2518) and sent three to LARB (#3040, #3106, #3112). Each recommendation below goes
+back to him to confirm, as R18 did, so each ticket stays `blocked` until he does.
+
+## Method and limits
+
+- **Base:** `6d147565`.
+- **Compilers:** 29 small programs on ritz0 only. The machine was loaded (load 10,
+  about 4 GiB free) and the local `ritz1` binaries predate `main`, so I didn't rebuild.
+  ritz1's behaviour is taken from the tickets (#3040, #3106, #3112 each measured it),
+  not re-run.
+- **Corpus:** a syntactic scan of 1210 tracked `.ritz` files (archive, bootstrap copies,
+  `ritz1_old` and docs excluded). Types come from parameter lists and annotated
+  `let`/`var` only, so every count is a lower bound. Each shape counted as zero has a
+  control the scanner did find (named below).
+
+## The three settled answers: no conflict
+
+- **#2514 (`p == "lit"`, `p: *u8`, refused).** No conflict. R3 gives a literal `*u8`
+  in a *slot* (let, var, =, return, tail, field, element, arm, argument, cast), and an
+  operand of `==` was never one. One gap to close in the same ticket: `p == c"lit"` is
+  already `*u8 == *u8`, so it type-checks and compares addresses, which is the same trap.
+  I recommend the refusal covers a string or c-string literal on either side of `==`
+  and `!=`.
+- **#3048 (`*T` into `**T`, refused unless the pointee is a pointer).** No conflict. R1
+  exception 3 allows the pointer family only with the *same pointee*.
+- **#2518 (store or `@` into a call's temporary: errors, reads stay).** No conflict
+  with an R-ruling: R9 makes a call result an rvalue, not a place. Two edges for whoever
+  writes the spec text:
+  1. **`@make()` as a call argument can be done safely**: the temporary lives until the
+     call returns and is dropped then (Rust and C++ both do this). That is #3050's
+     question, and Aaron's "only if it can be done safely" reads as allowing that one
+     case. A `let p = @make()` that outlives the statement can't, and stays an error.
+     I recommend `rz` asks Aaron whether #3050's argument case is the exception.
+  2. **A method that takes `self` mutably on a temporary** (`make().bump()`) is a store
+     by R1 exception 4's auto-ref, so it's refused with the rest. A read-only method
+     (`make().get()`) is a read and stays.
+
+## R19: `int as Enum` (#3040), recommended: refused
+
+**Aaron (2026-11-14):** "Does this make sense? The semantic value of an enum can change
+if there are steps inserted. I'm not sure how to call this as C and most other languages
+allow converting an ordinal value into an enum. Might need LARB for this too."
+
+**Recommended rule.**
+1. **`n as E` is an error for every enum `E`**, on all three compilers, located at
+   `as`: "an integer can't be converted to enum `E` with `as`: it may name no variant;
+   `match` on it". `e as U` (§10.4, enum to integer) is unchanged.
+2. **The safe ways in** are a `match` on the integer, which the programmer writes today,
+   and, as a second step if Aaron wants it, a checked conversion the compiler provides
+   for each fieldless enum: `E.from_discriminant(n) -> Option<E>`. It compares against
+   the discriminants (§10.4's `= N`), not declaration order, and gives `None` for an
+   integer that names no variant.
+3. **An enum that carries data has no conversion at all**, checked or not. No integer
+   says what the payload is, and `e as U` is already refused for it.
+
+**Why.**
+- **It makes values that aren't any variant.** On ritz0 `7 as A` (three variants)
+  compiles and the `match` runs the last arm. That breaks R6 and R13: a `match` that
+  covers every variant would no longer cover every value.
+- **ritz0 doesn't even convert what §10.4 says an enum's integer is.** With
+  `enum Sc: u64` and `Ex = 60`, `Sc.Ex as u64` is 60, but `60 as Sc` stores 60 as the
+  *declaration index*, which is no variant. `1 as Sc` gives `Ex`. The round trip
+  `(e as u64) as Sc` is wrong today.
+- **Aaron's worry about inserted variants is real, and it already has an answer.** An
+  enum whose numbers matter outside the program (a syscall, a file format, a wire
+  protocol) should name a representation type and give explicit `= N` discriminants
+  (§10.4, #1880). Inserting a variant then renumbers nothing. A checked conversion
+  that reads discriminants follows the explicit numbers; `as` on declaration order
+  doesn't.
+- **Other languages.** C and C++ allow the cast and leave an out-of-range value
+  unspecified or undefined. Rust has no `as` from integer to enum and uses
+  `TryFrom` (a checked conversion). Swift generates `init?(rawValue:)`, which returns
+  an optional. Zig's `@enumFromInt` is checked in safe builds. The languages that care
+  about safety all check it.
+
+**Measured.**
+
+| Shape | ritz0 | ritz1 (from #3040) | Rule |
+|---|---|---|---|
+| `1 as A`, fieldless, in range | runs, `P` | invalid IR (`store %B` of an i64) | error |
+| `7 as A`, out of range | runs, last arm | invalid IR | error |
+| `60 as Sc` (`Ex = 60`) | runs, wrong tag | not measured | error |
+| `n as B`, `B` carries data | crash: `cannot store i32 to %enum..B*` | invalid IR | error |
+
+**Cost.** 0 corpus sites: no `as E` for any of the 75 enums, and no hand-written
+integer-to-enum function (the 34 functions of shape `fn f(n: int) -> E` are all
+constructors such as `mk_ok`). The scanner's control: it finds every `as i64` etc.
+on the same pass. #3040's own repro becomes an `expect-error` row.
+
+**Implementation, once confirmed.** ritz0: refuse in the type checker's `as` arm when
+the target is an enum, before the emitter (removes the crash). ritz1 and
+ritz1_selfhosted: the same refusal where `as` is typed (the source of the invalid IR).
+Spec §10.4 gets one sentence and an `expect-error` block. `from_discriminant` is a
+separate ticket, only if Aaron asks for it.
+
+## R20: `p + 1` on `let p = @x` (#3106), recommended: refused, as R16
+
+**Aaron (2026-11-14):** "Maybe? I don't want to start creating footguns and C-isms by
+allowing stupid overflows to happen. So as long as we aren't giving someone an easy way
+to read past the end of what they should be, I think this is okay; otherwise disallow.
+LARB might have its 2c as well."
+
+**Recommended rule.** R16 covers every `@T` and `@&T`, however it got its type. By R1,
+`let p = @x` *is* an `@T` and `let p = @&x` an `@&T`, and so is a copy `let q = p`. So
+`p + 1`, `p - 1`, `+=`, `-=` and `p - q` on them are R16's error, with R16's wording.
+The row walk on an `@[N]T` (R18) and `(p as *T) + 1` stay legal.
+
+**Why.**
+- **It is exactly the "easy way to read past the end".** On ritz0, `var x: i32 = 7`,
+  `let p = @x`, `*(p + 1)` compiles and reads whatever is next to `x` (it returned 0).
+  Nothing says it's unchecked.
+- **An annotation shouldn't change what's legal.** `let p: @i32 = @a[0]` then `p + 1`
+  is already R16's error on ritz0. Without the annotation the same program compiles.
+  R1's principle is that an expression's type comes from the expression, and R16 is a
+  rule about the type.
+- **Walking an array has safe forms**: `a[i]`, `for x in a`, `@a[i]` per element, or a
+  Span. When raw stepping is really wanted, `(p as *T) + i` says so in the source.
+
+**Measured (ritz0).**
+
+| Shape | ritz0 | Rule |
+|---|---|---|
+| `let p = @x` (scalar), `*(p + 1)` | runs, reads past `x` | error |
+| `let p = @a[0]`, `*(p + 1)` | 2 | error |
+| `let p = @a[0]; let r = p`, `*(r + 2)` | 3 | error |
+| `let p = @&a[0]`, `*(p + 1)` | 2 | error |
+| `let p: @i32 = @a[0]`, `p + 1` | R16's error | error |
+| `let p: *i32 = @a[0]`, `*(p + 1)` | 2 | 2 |
+| `let p = @a`, `(p as *i32) + 1` | 2 | 2 |
+
+ritz1 accepts the same forms on purpose (`LocalVar.addr_let`, #3079), to match ritz0.
+
+**Cost.** 0 corpus sites. There are 10 un-annotated `let p = @...` in the corpus and none
+is stepped. The control: the scanner found `ritz_stats.ritz:126`'s `line + ws`, which
+turned out to be a `*u8` (its initialiser casts), so it's not a site.
+
+**Implementation, once confirmed.** As #3106 says: ritz0's `_infer_ritz_type` gives a
+`RefType` for an `@x`/`@&x` initialiser, so `_refuse_reference_arithmetic` sees it;
+ritz1 drops the `addr_let` exception in `ref_arith_pointee`; the `*_arith` rows of
+`test_bare_place_borrow.py` STRUCT_REFS flip to R16's error on all three; #3129's
+"pending #3106" note is resolved. No spec change: §7.1 already says "an `@T` or `@&T`".
+
+## R21: the type of `m + 1` with `m: u32` (#3112), recommended: `u32`
+
+**Aaron (2026-11-14):** "Is this just for the wrapping cases? What's the rationale for
+picking one over the other?"
+
+**The answer to his question: mostly yes, plus three type-level differences.** When
+`m + 1` fits in a `u32`, both rules give the same number. They differ:
+1. **When the result doesn't fit**: `4294967295 + 1` is 0 as a `u32` and 4294967296 as
+   an `i64`. Unsigned subtraction below 0 is the common case: `m - 2` with `m = 1`.
+2. **In the variable's type**: `var n = m + 1` is a `u32` or an `i64`. That decides
+   which `@&n` fits (#3112's original report), and whether passing `n` to a `u32`
+   parameter is a narrowing.
+3. **In signedness**: as an `i64`, `n < 0` can be true; as a `u32` it never is.
+
+**What ritz0 does today is neither rule.** Measured with `m: u32 = 4294967295`:
+
+| Program | ritz0 | `u32` rule | `i64` rule |
+|---|---|---|---|
+| `var n = m + 1`, `n` | 4294967296 | 0 | 4294967296 |
+| `let n: u32 = m + 1` | 0, silently | 0 | narrowing error (§7.4 says) |
+| `m = m + 1` / `m += 1` | 0 | 0 | narrowing error |
+| `m + 1 > m` | true | false | true |
+| `let o: u32 = 1; var n = m + o` | **0** | 0 | 0 |
+| `m = 1; var n = m - 2; n < 0` | **false**, though `n` was computed as -1 | false (n = 4294967295) | true |
+| `k: i8 = 127; let c = k + 1; c < 0` | false (128) | true (wraps to -128) | false |
+| `x: u8 = 200; let y = x * 2` | 400 | 144 | 400 |
+| `var n = m + 1; let p: @&i64 = @&n` | refused | refused | fits |
+| `var n = m + 1; let p: @&u32 = @&n` | fits | fits | refused |
+| `let n = m + 1; take_u32(n)` | 6, silent narrowing | 6 | narrowing error |
+
+The worst row is `m + o`: replacing the literal `1` with a `u32` named `o` that holds 1
+changes the answer. The checker and the emitter disagree, so `n < 0` is false for a
+value the program computed as -1.
+
+**Recommended rule.** In a binary arithmetic or bitwise operation, an integer literal
+takes the type of the other operand, as it would in a slot (R1's first exception). Two
+literals are `i64`. So `m + 1` is a `u32`, and it wraps exactly as `m + o` does. A
+literal that doesn't fit the other operand's type is an error (`x + 300` with `x: u8`),
+as it is in a slot. A shift's count has no say (§7.4), so in `1 << n` the left `1` is
+an `i64`.
+
+**Why `u32` and not `i64`.**
+- **One rule for literals.** R1 says a literal has no type until its context gives it
+  one. In `m + 1` the context is `m`. With the `i64` rule, `m + 1` and `m + o` differ.
+- **The variable keeps the type of the data.** With the `i64` rule, a function that
+  works in `u32` grows `i64` locals wherever someone wrote `+ 1`, and each one needs a
+  cast to go back into a `u32` slot.
+- **The `i64` rule doesn't stop overflow, it moves it.** `let n: u32 = m + 1` and
+  `m += 1` still wrap. The wider type only helps in the middle of an expression, and
+  only when a literal happens to be there.
+- **Precedent.** Rust, Go, Swift, Zig, C# and Kotlin all give `m + 1` the type of `m`.
+  C promotes only types narrower than `int` (so `u8 + 1` is an `int` but `u32 + 1` is
+  still a `u32`). Java has no unsigned types and promotes to `int`. No mainstream
+  language makes `u32 + 1` a 64-bit value.
+
+**What this reverses.** §7.4's sentence "A literal is an `i64`, unless its value only
+fits a `u64`", and its two examples built on it: `((a << 4) >> 4) as u8` with
+`a: u8 = 248` becomes 8, not 248, and the `expect-error` block `let r: u8 =
+(a << 4) >> 4` compiles (to 8). That text was written by #2356's room to describe
+ritz0's emitter; it wasn't a ruling. #2356's `>>` rule itself (the left operand's type
+decides arithmetic vs logical) is unchanged.
+
+**What it doesn't fix: overflow.** Aaron's concern on #3106 ("stupid overflows") is
+not answered by either rule. Both wrap silently today. If he wants overflow caught,
+that is a separate decision, and I'd put it to him as one: plain `+`, `-`, `*` trap on
+overflow in debug builds (Rust's and Swift's choice) and explicit `wrapping_add` and
+friends say when wrapping is meant. Crypto, hashing and checksum code in the corpus
+relies on wrapping, so that change has a real cost and I haven't measured it.
+
+**Cost (lower bound).** 27 un-annotated `let`/`var` mix a narrow-typed name, an
+operator and a literal; 33 more mix narrow names with no literal (which already wrap).
+Of the 27, most are counts and indexes that can't overflow (`x + 1` beside
+`x < width`). One site changes behaviour, and it shows the rule's cost:
+`prism/src/backend/mock.ritz:237`, `let inner_height = rect.height - width * 2` then
+`if inner_height > 0`, with both `u32`. Today the `* 2` makes it an `i64`, so a stroke
+wider than half the rect goes negative and the guard skips it. As a `u32` it wraps to
+about 4 billion and the guard passes. It needs rewriting as
+`if rect.height > width * 2` first. Expect a handful more like
+it in code ritz0 can't type today. 15
+narrow `<<` sites: all shift a `u16` by at most 10, or a nibble by 4, so none loses
+bits (`net.ritz:146`'s `(low << 8) | high` is a `u16` holding at most 255). I didn't
+diff IR across the corpus; the implementation ticket should, as #2527 did.
+
+**Implementation, once confirmed.** ritz0: the emitter's `_int_shape` gives a literal
+the other operand's shape (the checker already does), so `var n = m + 1` gets a
+`u32` slot. ritz1 and ritz1_selfhosted: `int_operand_shape` / `inferred_int_init`
+(`emitter_stmt.ritz`) the same. Flip `wraps_sum` in `test_ritz1_lent_ref_slot.py`
+(213 today) and rewrite §7.4's literal paragraph and its two examples; the
+`expect-error` block needs a different narrowing example (a plain `i64` into a `u8`).
+Then IR-diff the corpus.
+
+## Suggested order (this batch)
+
+1. **#3106** (R20): 0 sites, one rule on all three. Smallest.
+2. **#3040** (R19): 0 sites; the refusal removes a ritz0 crash and ritz1 invalid IR.
+3. **#3112** (R21): touches every narrow-int expression with a literal. Needs the
+   corpus IR diff, and each underflow like prism's `mock.ritz:237` fixed in the same
+   commit. Independent of the overflow question, though if Aaron wants overflow
+   trapped, deciding that first would turn sites like prism's into loud failures
+   instead of silent ones.
