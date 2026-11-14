@@ -408,18 +408,23 @@ SHARED_PLACES = {
                              "fn go()\n    var c: C = C { x: 1, y: 0 }\n    let p = @c\n    let q = p\n    w(q.x)\n\n"),
     "inferred_scalar": (INT_WRITER, "fn go()\n    var n: i32 = 1\n    let p = @n\n    w(p)\n\n"),
     "inferred_scalar_deref": (INT_WRITER, "fn go()\n    var n: i32 = 1\n    let p = @n\n    w(*p)\n\n"),
+    "inferred_scalar_copy": (INT_WRITER, "fn go()\n    var n: i32 = 1\n    let p = @n\n    let q = p\n    w(*q)\n\n"),
     "inferred_copy_of_a_param": (INT_WRITER + C, "fn go(r: @C)\n    let q = r\n    w(q.x)\n\n"),
     "inferred_copy_of_a_scalar_param": (INT_WRITER, "fn go(r: @i32)\n    let q = r\n    w(q)\n\n"),
     "inferred_deref_of_a_copied_param": (INT_WRITER, "fn go(r: @i32)\n    let q = r\n    w(*q)\n\n"),
 }
-# AGAST #2352: ritz1 doesn't type these locals as references. All legal under R1.
-INFERRED_GAPS = {
+# An un-annotated `@&` local is an `@&T`, a scalar one too (#2352). All legal under R1.
+INFERRED_MUT = {
     "mut_scalar": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n"
                   "    let p = @&n\n    w(p)\n    return n\n",
     "mut_scalar_deref": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n"
                         "    let p = @&n\n    w(*p)\n    return n\n",
     "mut_copy": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n"
                 "    let p = @&n\n    let q = p\n    w(*q)\n    return n\n",
+    "mut_copy_bare": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n"
+                     "    let p = @&n\n    let q = p\n    w(q)\n    return n\n",
+    "mut_var": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n"
+               "    var p = @&n\n    w(*p)\n    return n\n",
 }
 # A nearer `@&T` or `*T` is what the place is reached through.
 NOT_SHARED = {
@@ -668,16 +673,10 @@ def test_a_place_behind_an_at_t_is_refused_alike(tmp_path, name):
     assert len(set(errors.values())) == 1, errors
 
 
-def _ritz1_gap(reason):
-    """COMPILERS, with both ritz1s a strict xfail for `reason`."""
-    return [c if c == "ritz0" else pytest.param(c, marks=pytest.mark.xfail(reason=reason, strict=True))
-            for c in COMPILERS]
-
-
-@pytest.mark.parametrize("compiler", _ritz1_gap("AGAST #2352: an inferred `@&` local isn't typed"))
-@pytest.mark.parametrize("name", sorted(INFERRED_GAPS))
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(INFERRED_MUT))
 def test_an_inferred_mutable_reference_passes(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, INFERRED_GAPS[name]) == 3
+    assert _run(compiler, tmp_path, name, INFERRED_MUT[name]) == 3
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

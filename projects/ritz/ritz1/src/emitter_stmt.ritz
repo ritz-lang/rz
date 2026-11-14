@@ -148,6 +148,35 @@ fn infer_ref_to_scalar_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
     stmt.var_inner_pointee_type = inner
     1
 
+# AGAST #2352: `let p = @n` / `@&n` with `n` a scalar local holds
+# what `let p: @T` / `@&T` does.  It stayed an i64 holding the address, so
+# `w(p)` into a `:& T` was "cannot borrow `let` binding `p`", `w(*p)` couldn't
+# tell what `*p` was, and `v(p)` into a by-value T wasn't R1's error.  A `:&`
+# scalar param is a plain T local that borrows its caller's place, so `@&r`
+# of it is left alone, as is `@x` of anything already a pointer.
+fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt) -> i32
+    let init: *Expr = stmt.var_init
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_declared_type != TYPE_VOID or init == null
+        return 0
+    if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT) or init.operand == null
+        return 0
+    let o: *Expr = init.operand
+    if o.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, o.ident_ptr, o.ident_len)
+    if loc == null or loc.is_lent != 0 or loc.type_name_len != 0 or scalar_pointee(loc.var_type) == 0
+        return 0
+    let pointee: i32 = loc.var_type
+    stmt.var_type = TYPE_REF
+    if init.op == OP_ADDR_MUT
+        stmt.var_type = TYPE_MUT_REF
+    stmt.var_pointee_type = pointee
+    1
+
+# 1 for the integer and float kinds an `@T` local can point at by value.
+fn scalar_pointee(t: i32) -> i32
+    (t == TYPE_I32 or t == TYPE_I64 or t == TYPE_U8 or t == TYPE_I8 or t == TYPE_U16 or t == TYPE_U32 or t == TYPE_I16 or t == TYPE_U64 or t == TYPE_F32 or t == TYPE_F64) as i32
+
 # AGAST #2539: `let r = @q` with `q: *E` or `**E`, E an enum, holds what
 # `let r: **E` / `***E` does: the name, so `**r` loads and stores an %E.  It
 # was an i64: `**r = E.V` stored an i64 of a %E and clang refused it.
@@ -1364,7 +1393,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             # reference type and pointee, so `q.a` resolves and the slot holds
             # the same `ptr` / i64 `s` loads as.  (Was i64 with no struct name:
             # "unhandled EXPR_MEMBER".)
-            else if src_loc != null and (src_loc.var_type == TYPE_MUT_REF or src_loc.var_type == TYPE_REF) and src_loc.type_name_len > 0
+            # AGAST #2352: and `p: @&i32` / `@i32`, a scalar pointee and no name.
+            else if src_loc != null and (src_loc.var_type == TYPE_MUT_REF or src_loc.var_type == TYPE_REF) and (src_loc.type_name_len > 0 or scalar_pointee(src_loc.pointee_type) == 1)
                 var_type = src_loc.var_type
                 stmt.var_type = src_loc.var_type
                 stmt.var_type_name = src_loc.type_name
@@ -1642,6 +1672,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     stmt.var_type_name_len = dr_len
 
     if infer_ref_to_pointer_let(s, stmt) == 1
+        var_type = stmt.var_type
+    if infer_ref_to_scalar_let(s, stmt) == 1
         var_type = stmt.var_type
     if infer_array_ptr_let(s, stmt) == 1
         var_type = stmt.var_type

@@ -224,8 +224,8 @@ INFERRED_STAYS_A_POINTER = {
     # R1: an `@T` into `:&` is refused, an `@&T` passes (test_bare_place_borrow.py).
     "to_borrow_param": "fn g(p:& [3]i32) -> i32\n    return p[1]\n\n" + _a("    let p = @&a\n    return g(p)\n"),
     "returned": "fn g(a: *[3]i32) -> *[3]i32\n    let q = a\n    return q\n\n" + _a("    let p: *[3]i32 = g(@a)\n    return p[1]\n"),
-    # An annotation can't be told from the default here, so these are the same
-    # local as `let x = @a`, and must still read as the integer they were.
+    # Written `: i64`, these are integers (var_declared_type, #2352), not the
+    # inferred `let x = @a` above, and must still read as the integer they were.
     "annotated_integer": _a("    let x: i64 = @a\n    return 20\n"),
     "annotated_integer_copy": "fn f(p: *[3]i32) -> i32\n    let x: i64 = p\n    return 20\n\n" + _a("    return f(@a)\n"),
     "annotated_integer_arithmetic": _a("    let x: i64 = @a as i64\n    let y: i64 = x + 4\n    let q: *i32 = y as *i32\n    return *q\n"),

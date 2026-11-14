@@ -108,8 +108,9 @@ SHAPES = {
     "value_arm": "fn f(r: @C, b: i32) -> i32\n    let d: C = if b > 0\n        ^r\n    else\n        *r\n    d.x\n",
 }
 
-# ritz1 doesn't record what an un-annotated `let p = @n` points at for a scalar.
-SHAPE_GAPS = {"inferred_scalar": 2352}
+# Shapes ritz1 doesn't see as a reference yet, each an AGAST ticket number.
+# `inferred_scalar`, `let p = @n`, closed by #2352.
+SHAPE_GAPS = {}
 
 ADDR_SLOTS = {
     "shared": "fn f(d: C) -> i32\n    val(^@d)\n",
