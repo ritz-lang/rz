@@ -146,6 +146,34 @@ GENERIC_SHAPES = {
                           "if w.k != 11 or w.hi != 22\n    return 9\n"
                           "var n: i64 = 0\nfor v in w.a\n    n = n + v as i64\n"
                           "if n != 80001\n    return 1\nreturn 0\n")),
+    # AGAST #3080: ritz0 left a generic struct named in a field of a generic
+    # struct (`Box<T>` -> `Box<i32>`) uninstantiated, so it lowered as i8.
+    # Each row's inner instance appears nowhere else in the program, except
+    # ptr_box_elem's, which needs a Box<u16> to point at.
+    # The plain field: it was `i8` as the array was `[2 x i8]`.
+    "box_field": (_BOX + "struct W<T>\n    lo: i64\n    b: Box<T>\n    hi: i64\n\n" + MAIN
+                  + _ind("var w: W<i64>\nw.lo = 11\nw.hi = 22\nw.b.v = 5000000000\n"
+                         "if w.lo != 11 or w.hi != 22\n    return 9\n"
+                         "if w.b.v != 5000000000\n    return 1\nreturn 0\n")),
+    # Two levels: W<i32> needs Box<Box<i32>>, which needs Box<i32>.
+    "box_box_elem": (_BOX + "struct W<T>\n    lo: i64\n    a: [2]Box<Box<T>>\n    hi: i64\n\n" + MAIN
+                     + _ind("var w: W<i32>\nw.lo = 11\nw.hi = 22\nw.a[0].v.v = -70000\nw.a[1].v.v = 6\n"
+                            "if w.lo != 11 or w.hi != 22\n    return 9\n"
+                            "if w.a[0].v.v != -70000 or w.a[1].v.v != 6\n    return 1\nreturn 0\n")),
+    # Through a pointer: the pointee is the instance, not i8.
+    "ptr_box_elem": (_BOX + "struct W<T>\n    lo: i64\n    a: [2]*Box<T>\n    hi: i64\n\n" + MAIN
+                     + _ind("var x: Box<u16>\nvar y: Box<u16>\nvar w: W<u16>\nw.lo = 11\nw.hi = 22\n"
+                            "w.a[0] = @x\nw.a[1] = @y\nw.a[0].v = 40000\nw.a[1].v = 40001\n"
+                            "if w.lo != 11 or w.hi != 22\n    return 9\n"
+                            "if x.v != 40000 or y.v != 40001\n    return 1\nreturn 0\n")),
+    # Both parameters reach one generic element, in swapped order.
+    "two_param_elem": ("struct Pair<A, B>\n    a: A\n    b: B\n\n"
+                       "struct KV<K, V>\n    lo: i64\n    a: [2]Pair<V, K>\n    hi: i64\n\n" + MAIN
+                       + _ind("var w: KV<u8, i64>\nw.lo = 11\nw.hi = 22\n"
+                              "w.a[1].a = 5000000000\nw.a[1].b = 200\nw.a[0].b = 7\n"
+                              "if w.lo != 11 or w.hi != 22\n    return 9\n"
+                              "if w.a[1].a != 5000000000 or w.a[1].b != 200 or w.a[0].b != 7\n"
+                              "    return 1\nreturn 0\n")),
 }
 
 
@@ -153,8 +181,8 @@ def _shape_rows():
     for shape in sorted(GENERIC_SHAPES):
         for compiler in COMPILERS:
             marks = ()
-            if shape == "box_elem" and compiler == "ritz0":
-                marks = pytest.mark.xfail(strict=True, reason="AGAST #3080: ritz0 crashes on it")
+            if shape == "ptr_box_elem" and compiler != "ritz0":
+                marks = pytest.mark.xfail(strict=True, reason="AGAST #3099: ritz1 can't reach it")
             yield pytest.param(shape, compiler, marks=marks, id=f"{shape}-{compiler}")
 
 

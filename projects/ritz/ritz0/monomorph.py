@@ -118,8 +118,11 @@ class TypeSubstitution:
 
             # If this is a generic struct with type args, mangle the name
             if new_args and self.struct_manglings and ty.name in self.struct_manglings:
-                # Create a key from the substituted type args
-                args_key = tuple(mangle_type_name(arg) for arg in new_args)
+                # Create a key from the substituted type args, before their
+                # own mangling: Box<Box<i32>> is keyed `Box_i32`, as
+                # _type_args_to_key spells it, not `Box$i32` (AGAST #3080).
+                bare = TypeSubstitution(self.mapping)
+                args_key = tuple(mangle_type_name(bare.apply(arg)) for arg in ty.args)
                 mangled = self.struct_manglings[ty.name].get(args_key)
                 if mangled:
                     return rast.NamedType(ty.span, mangled, [])
@@ -1375,7 +1378,14 @@ class Monomorphizer:
                         generic_def.type_params, type_args, bounds
                     )
 
-                subst = TypeSubstitution(dict(zip(generic_def.type_params, type_args)), struct_manglings)
+                mapping = dict(zip(generic_def.type_params, type_args))
+                # A generic struct named in a field (`a: [2]Box<T>`) is an
+                # instance only once T is substituted: register `Box<i32>`
+                # before W<i32>'s fields are mangled, or the field keeps the
+                # unmangled name and lowers as i8 (AGAST #3080).  Box<i32>'s own
+                # fields are specialised next iteration, so nesting recurses.
+                self._register_field_instances(generic_def, mapping, struct_manglings)
+                subst = TypeSubstitution(mapping, struct_manglings)
                 specialized = self._specialize_struct(generic_def, mangled_name, subst)
                 self.specialized_structs.append(specialized)
                 processed_structs.add(key)
@@ -1449,6 +1459,20 @@ class Monomorphizer:
                 # CRITICAL: Scan the specialized function body for new instantiations
                 # This discovers transitive generic calls like vec_ensure_cap<i32>
                 self._scan_for_new_instantiations(specialized)
+
+    def _register_field_instances(self, generic_def: rast.StructDef,
+                                  mapping: Dict[str, rast.Type],
+                                  struct_manglings: Dict[str, Dict[Tuple[str, ...], str]]) -> None:
+        """Register each generic instance a field names once `mapping` is applied.
+
+        `struct_manglings` is updated in place so the caller's substitution of
+        this struct's fields already finds the new mangled names.
+        """
+        bare = TypeSubstitution(mapping)
+        for _, field_type in generic_def.fields:
+            self._visit_type(bare.apply(field_type))
+        for (base_name, type_args_key), mangled in self.struct_instantiations.items():
+            struct_manglings.setdefault(base_name, {}).setdefault(type_args_key, mangled)
 
     def _scan_for_new_instantiations(self, fn: rast.FnDef) -> None:
         """Scan a specialized function for new generic instantiations.
