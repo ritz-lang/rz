@@ -483,19 +483,56 @@ def test_address_of_element_index_is_the_sum(run_with, name, compiler):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_address_of_element_slice_is_refused(compile_with, compiler):
-    comp, _, _ = compile_with(compiler, "addr_slice", _x("    let r = @a[1][0..2]\n    return 0\n"))
-    assert comp.returncode != 0
-    if compiler != "ritz0":
-        assert "can't be sliced" in comp.stdout + comp.stderr
+    # AGAST #3088: ritz0 raised NotImplementedError (Range) from the `@` path.
+    _refused_at(compile_with, compiler, "addr_slice", _x("    let r = @a[1][0..2]\n    return 0\n"),
+                ELEMENT_NOT_SLICED, "9:14")
 
 
 # ritz0 slices no pointer element.  ritz1 took `a[1][0..2]` at stride 1.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_an_element_is_not_sliced(compile_with, compiler):
-    comp, _, _ = compile_with(compiler, "slice", _x("    let r = a[1][0..2]\n    return 0\n"))
-    assert comp.returncode != 0
-    assert "slic" in (comp.stdout + comp.stderr).lower()
+    _refused_at(compile_with, compiler, "slice", _x("    let r = a[1][0..2]\n    return 0\n"),
+                ELEMENT_NOT_SLICED, "9:13")
+
+
+ELEMENT_NOT_SLICED = "an element of an array of pointers can't be sliced (only String, Vec and Span can)"
+
+
+def _refused_at(compile_with, compiler, name, program, message, where):
+    """`program` fails to compile with `message`, at `main.ritz:<where>:`."""
+    comp, _, _ = compile_with(compiler, name, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} took {name}"
+    assert "Traceback" not in out, out[-1500:]
+    assert message in out, out[-1500:]
+    assert f"main.ritz:{where}:" in out, out[-1500:]
+
+
+# AGAST #3088: `@x[lo..hi]` on any other place refuses as `x[lo..hi]` does, at
+# the place, where ritz0 raised NotImplementedError.  ritz0 only: ritz1 says an
+# unlocated "cannot take address" (AGAST #3145).
+_ADDR_H = "struct H\n    a: [2]*i16\n    p: *i16\n\n"
+ADDR_OF_SLICE = {
+    "array_local": ("", "    let r = @x[0..2]\n", "an array can't be sliced"),
+    "pointer_local": ("", "    var p: *i16 = @x[0]\n    let r = @p[0..2]\n", "a pointer can't be sliced"),
+    "array_field": (_ADDR_H, "    var h: H\n    let r = @h.a[0..2]\n", "an array can't be sliced"),
+    "pointer_field": (_ADDR_H, "    var h: H\n    h.p = @x[0]\n    let r = @h.p[0..2]\n",
+                      "a pointer can't be sliced"),
+    # A String slices, but its slice is a new value, with no place to point at.
+    "string": ("import ritzlib.string\n\n",
+               '    var s: String = string_from("abcd")\n    let r = @s[0..2]\n',
+               "can't take the address of a slice"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(ADDR_OF_SLICE))
+def test_address_of_a_slice_is_refused_located(compile_with, name):
+    pre, body, message = ADDR_OF_SLICE[name]
+    program = _x(body + "    return 0\n", pre)
+    line = program.splitlines().index(body.splitlines()[-1]) + 1
+    _refused_at(compile_with, "ritz0", name, program, message, f"{line}:14")
 
 
 # No store takes a range.  Each compiler says so in its own words.

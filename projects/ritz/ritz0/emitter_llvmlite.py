@@ -9311,9 +9311,24 @@ class LLVMEmitter:
                     return self._emit_vec_span_slice(expr, inferred, inferred.name)
                 return self._emit_vec_slice(expr, inferred.name, inferred)
 
-        # AGAST #2521: located, worded as ritz1 words it, at the index.
-        raise EmitError(f"{self._unsliceable(base_type)} can't be sliced "
-                        f"(only String, Vec and Span can)", expr.span)
+        raise self._slice_refusal(expr, base_type)
+
+    def _slice_refusal(self, expr: rast.Expr, base_type: Optional[rast.Type]) -> EmitError:
+        """`expr` (`x[lo..hi]`) refused: located, worded as ritz1 words it (AGAST #2521).
+
+        An element of a `[N]*T` is a `*T`, but ritz1 names it for what it is,
+        and so does this (AGAST #3088).
+        """
+        what = self._unsliceable(base_type)
+        if (isinstance(expr.expr, rast.Index) and not isinstance(expr.expr.index, rast.Range)
+                and self._is_pointer_array(self._infer_ritz_type(expr.expr.expr))):
+            what = "an element of an array of pointers"
+        return EmitError(f"{what} can't be sliced (only String, Vec and Span can)", expr.span)
+
+    @staticmethod
+    def _is_pointer_array(ty: Optional[rast.Type]) -> bool:
+        return (isinstance(ty, rast.ArrayType)
+                and isinstance(ty.inner, (rast.PtrType, rast.RefType)))
 
     @staticmethod
     def _unsliceable(base_type: Optional[rast.Type]) -> str:
@@ -9966,6 +9981,12 @@ class LLVMEmitter:
             through = self._index_through(expr)
             if through is not None:
                 return self._emit_expr(through.operand)
+            # AGAST #3088: `@x[lo..hi]` is no element.  A String, Vec or Span
+            # slice is a new value with no place; anything else isn't sliced.
+            if isinstance(expr.index, rast.Range):
+                if self._slice_ritz_type(expr.expr) is not None:
+                    raise EmitError("can't take the address of a slice", expr.span)
+                raise self._slice_refusal(expr, self._infer_ritz_type(expr.expr))
             # arr[i] -> GEP to element
             index = self._emit_index_value(expr.index)
             if isinstance(expr.expr, rast.Ident):
