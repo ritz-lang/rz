@@ -994,6 +994,24 @@ fn narrow_to_ptr(stmt: *Stmt, kind: i32, name: *u8, name_len: i32) -> i32
         stmt.var_type_name_len = name_len
     TYPE_PTR
 
+# AGAST #2417: the signature of an un-annotated `let f = mb`, a bare fn
+# name: mb's own.  Without it a call `f(..)` was the untyped `call i64` and
+# ref_walk had no slots to judge its arguments by.  Null when a local or a
+# global of that name shadows the fn (the ident is that value, as
+# emit_ident resolves it), or when the fn is generic.
+fn inferred_fn_sig(s: *EmitterState, stmt: *Stmt) -> *FnDef
+    if stmt.var_fn_sig != null or stmt.var_declared_type != TYPE_VOID
+        return stmt.var_fn_sig
+    let init: *Expr = stmt.var_init
+    if init == null or init.kind != EXPR_IDENT
+        return null
+    if find_local(s, init.ident_ptr, init.ident_len) >= 0 or find_global(s, init.ident_ptr, init.ident_len) != null
+        return null
+    let f: *FnDef = find_fn(s, init.ident_ptr, init.ident_len)
+    if f == null or f.type_params != null
+        return null
+    f
+
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     let shared_ref: i32 = let_holds_shared_ref(s, stmt)
     # Use the user's explicit type annotation. The parser defaults
@@ -1004,6 +1022,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     check_implicit_narrowing(s, stmt)   # AGAST #1364
     # AGAST #2356: as below, before `x` is in scope.
     let init_u64: i32 = inferred_u64_init(s, stmt)
+    let fn_sig: *FnDef = inferred_fn_sig(s, stmt)   # AGAST #2417, before `f` is in scope
     # AGAST #2342: before `x` is in scope, as `let x: bool = x`.
     var init_kind: i32 = BK_UNSURE
     if stmt.var_init != null
@@ -1740,7 +1759,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             nd_loc.array_shape = stmt.var_array_shape  # AGAST #1509
     else
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
-    set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, stmt.var_fn_sig)  # AGAST #1671
+    set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, fn_sig)  # AGAST #1671, #2417
     let declared: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
     declared.holds_shared_ref = shared_ref
     if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF

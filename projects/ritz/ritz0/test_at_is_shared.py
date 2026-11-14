@@ -99,6 +99,9 @@ PLACES = {
     "method_lent": "var c = C { x: 1 }\n    let k = K { n: 1 }\n    k.lend(^@c)\n",
     "receiver_method": "var c = C { x: 1 }\n    var d = C { x: 1 }\n    c.add(^@d)\n    0\n",
     "fn_pointer": "var c = C { x: 1 }\n    let f = mb\n    f(^@c)\n",
+    # #2417: `f` above is also the enclosing fn's name; `g` is no fn's.
+    "inferred_fn_pointer": "var c = C { x: 1 }\n    let g = mb\n    g(^@c)\n",
+    "inferred_lent_fn_pointer": "var c = C { x: 1 }\n    let g = lb\n    g(^@c)\n",
     "let_slot": "var c = C { x: 1 }\n    let p: @&C = ^@c\n    0\n",
     "var_slot": "var c = C { x: 1 }\n    var p: @&C = ^@c\n    0\n",
 }
@@ -169,12 +172,18 @@ ALLOWED = {
                              "    var c = C { x: 1 }\n    on(c)\n    c.x\n", 3),
     "pass_on_written": ("fn on(c:& C) -> i32\n    mb(@&c)\n\n",
                         "    var c = C { x: 1 }\n    on(c)\n    c.x\n", 3),
+    # #2417: an un-annotated `let f = mb` carries mb's signature, so the call
+    # is typed (it was `call i64 %f(i64 ptr)`). ritz0 can't call it yet: #3034.
+    "written_through_an_inferred_fn_local": (
+        "", "    var c = C { x: 1 }\n    let f = mb\n    f(@&c)\n    c.x\n", 3),
     "mutable_reference_into_shared": ("fn rd(c: @C) -> i32\n    c.x\n\nfn on(m: @&C) -> i32\n    rd(m)\n\n",
                                       "    var c = C { x: 3 }\n    on(@&c)\n", 3),
 }
 
 # Rows ritz1 and ritz1_selfhosted do not meet yet, each with its ticket.
-GAPS = {"fn_pointer": 2417}
+GAPS = {}
+# Rows ritz0 does not meet yet.
+RITZ0_GAPS = {"written_through_an_inferred_fn_local": 3034, "inferred_lent_fn_pointer": 3035}
 
 
 def _wrap(body):
@@ -187,6 +196,9 @@ def _with_gaps(table):
             if site in GAPS and compiler != "ritz0":
                 yield pytest.param(site, compiler,
                                    marks=pytest.mark.xfail(strict=True, reason=f"#{GAPS[site]}"))
+            elif site in RITZ0_GAPS and compiler == "ritz0":
+                yield pytest.param(site, compiler,
+                                   marks=pytest.mark.xfail(strict=True, reason=f"#{RITZ0_GAPS[site]}"))
             else:
                 yield pytest.param(site, compiler)
 
