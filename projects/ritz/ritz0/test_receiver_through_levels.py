@@ -169,6 +169,8 @@ HOLDERS = {
     "global_ptr_ptr_read": (_main("    G = @&q\n    G.get()\n", "var G: **C = null\n\n"), 1),
     "global_ptr_ptr_store": (_main("    G = @&q\n    G.set(3)\n    c.x\n", "var G: **C = null\n\n"), 3),
     "global_shared_ptr_read": (_main("    G = @q\n    G.get()\n", "var G: @*C = null\n\n"), 1),
+    # `G = @&c` stored the `ptr` into the global's i64 (#2399).
+    "global_ptr_of_an_address_store": (_main("    G = @&c\n    G.set(3)\n    c.x\n", "var G: *C = null\n\n"), 3),
     "element_ptr_ptr_store": (_main("    var a: [1]**C = [@&q]\n    a[0].set(3)\n    c.x\n"), 3),
     "element_of_a_pointer_store": (_main("    var r: **C = @&q\n    g(@&r)\n    c.x\n", "fn g(a: ***C)\n    a[0].set(3)\n\n"), 3),
     "returned_shared_ptr_store": (_main("    h(@q).set(3)\n    c.x\n", "fn h(p: @*C) -> @*C\n    p\n\n"), 3),
@@ -270,6 +272,11 @@ HOLDERS |= {
                           "    var q: *C = @&c\n    var r: **C = @&q\n    r.swap(@&e)\n    q.x * 10 + r.rd()\n", 33),
     "self_is_a_shared_ptr": (KEEPS_THE_POINTER + "fn g(p: @*C) -> i32\n    p.sh()\n\n"
                              "pub fn main() -> i32\n    var c = C { x: 3 }\n    var q: *C = @&c\n    g(@q)\n", 3),
+    # The `**C` a global or an array element holds is that `self` (#2404).
+    "self_is_a_global_ptr_ptr": (KEEPS_THE_POINTER + "var G: **C = null\n\npub fn main() -> i32\n    var c = C { x: 1 }\n"
+                                 "    var e = C { x: 3 }\n    var q: *C = @&c\n    G = @&q\n    G.swap(@&e)\n    q.x * 10 + G.rd()\n", 33),
+    "self_is_an_element_ptr_ptr": (KEEPS_THE_POINTER + "pub fn main() -> i32\n    var c = C { x: 1 }\n    var e = C { x: 3 }\n"
+                                   "    var q: *C = @&c\n    var a: [1]**C = [@&q]\n    a[0].swap(@&e)\n    q.x * 10 + a[0].rd()\n", 33),
 }
 
 RESOURCE = """\
@@ -304,13 +311,10 @@ MOVES = {
 # `chained_method`, through `mp() -> *C`, once #2883 named a `*S` link's impl;
 # `one_level_returned`, `h(q).set(3)`, once #2946 named a `*S` free call's.)
 # `chained_store` (#2295) runs since #3015 made an `@S` / `@&S` call result a place.
-# #2399's rows run since it lowered `@@C`, `@*S` fields and `-> @*S` / `**S` calls;
-# `var G: @*C` is a `**C` global now, so `G.get()` is #2404's `global_ptr_ptr_read`.
-RITZ1_GAPS = dict.fromkeys(("global_shared_ptr_read", "global_ptr_ptr_read", "global_ptr_ptr_store",
-                             "element_ptr_ptr_store",
-                             "element_of_a_pointer_store", "index_is_evaluated_once",
-                             "deref_leaves_a_pointer_to_a_pointer",
-                             "ufcs_by_value_self_is_a_conversion"), 2404)
+# #2399's rows run since it lowered `@@C`, `@*S` fields and `-> @*S` / `**S` calls.
+# The global, element and `(*p)` rows, `global_shared_ptr_read` and the UFCS
+# Span conversion run since #2404.
+RITZ1_GAPS = {}
 
 GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}
 
