@@ -5428,6 +5428,14 @@ class LLVMEmitter:
                 self._reject_missing_tail_value(
                     fn_def, lambda e: id(e) in self._procedure_method_calls)
                 self.closure_expected_type = None  # Clear context
+                # AGAST #3205: every arm of the tail left by `return` (`0 =>
+                # return A.V(7)`), so we sit in its dead merge block and the
+                # tail's value is the match's dummy `i32 0`.  Converting that
+                # to a data-carrying enum emitted `ret i32 0` in a `-> A` fn.
+                # Nothing reaches here: end the block as the `elif` below does.
+                if self.has_returned and not self.builder.block.is_terminated:
+                    self.builder.unreachable()
+                    return fn
                 # A tail that yields no value at all (ir.Undefined): a match
                 # used as a statement, whose arms are assignments/`pass`. That
                 # is legal ONLY in a procedure, where the tail runs for effect

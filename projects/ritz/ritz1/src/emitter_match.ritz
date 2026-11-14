@@ -481,6 +481,21 @@ fn instance_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *
     if ei >= 0
         *out_name = enum_name_at(ei, out_len)
 
+# AGAST #3205: an arm yielding a qualified unit variant (`0 => A.V`) is the
+# `%A` emit_expr_member builds, under the same test, so the merge phi has
+# that type.  The phi was i64 over `%A`s, which clang rejected.
+fn qualified_unit_variant_arm_type(e: *Expr, out_name: **u8, out_len: *i32)
+    if e.kind != EXPR_MEMBER or e.left == null or e.left.kind != EXPR_IDENT
+        return
+    if is_enum_type(e.left.ident_ptr, e.left.ident_len) == 0
+        return
+    if enum_variant_index(e.left.ident_ptr, e.left.ident_len, e.ident_ptr, e.ident_len) < 0
+        return
+    if enum_is_generic(enum_find(e.left.ident_ptr, e.left.ident_len)) == 1
+        return   # emit_expr_member refuses it (#1466)
+    *out_name = e.left.ident_ptr
+    *out_len = e.left.ident_len
+
 # Emit a block arm's statements (AGAST #1454).  `return` leaves the block
 # terminated by `ret`, but the arm still records a phi incoming and emits its
 # `br` to the match end.  Without a fresh block the phi would name the block
@@ -810,6 +825,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
             variant_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)
         if arm_ty == null
             instance_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)   # AGAST #3117
+        if arm_ty == null
+            qualified_unit_variant_arm_type(arm.body, @arm_ty, @arm_ty_len)   # AGAST #3205
         if arm_ty == null
             resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
         if arm_ty == null
@@ -2086,6 +2103,11 @@ fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan
 
 fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
     let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
+    # AGAST #3205: taken before the scrutinee, so a match there can't see it.
+    let agg_hint: *u8 = s.match_agg_hint
+    let agg_hint_len: i32 = s.match_agg_hint_len
+    s.match_agg_hint = null
+    s.match_agg_hint_len = 0
     if wants_value == 1
         bool_check_arms(s, arms)   # AGAST #2342
     # Detect whether the scrutinee is a tagged-enum struct; if so, spill
@@ -2202,6 +2224,12 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     # AGAST #1666: publish the phi type for an untyped `let v = match ...`.
     # Set after every arm (nested matches inside arms included) so the
     # outermost match's type is what the enclosing let sees.
+    # AGAST #3205: no arm yielded a value (each `return`s), so nothing typed
+    # the phi; as a `-> S` fn's tail it is an S of zeros, which no path
+    # reaches, not the i64 the implicit `ret %S` would name.
+    if result.agg_name == null and result.ptr_ty == 0 and result.float_ty == 0 and result.int_arms == 0 and agg_hint_len > 0
+        result.agg_name = agg_hint
+        result.agg_name_len = agg_hint_len
     publish_match_type(s, @result)
     if result.void_arms > 0
         # AGAST #1654: an arm yields no value (a void call), so the match is
