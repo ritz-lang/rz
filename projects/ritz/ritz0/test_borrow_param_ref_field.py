@@ -922,6 +922,62 @@ pub fn main() -> i32
         return 0
     return a[0].x + a[1].x
 """,
+    # AGAST #3122: the same store as `(*r)[i] = d` through a `**C` (#2545's
+    # path), and a `@&*C`.  ritz1 strode and stored i64 there: a segfault.
+    "plain_deref_pointer_element": BY_VALUE + """
+fn fill(r: **C, d: C)
+    (*r)[1] = d
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 1, y: 0 }
+    var p: *C = @a[0]
+    var d: C = C { x: 2, y: 7 }
+    fill(@p, d)
+    if a[1].y != 7
+        return 0
+    return a[0].x + a[1].x
+""",
+    "plain_deref_mut_ref_pointer_element": BY_VALUE + """
+fn fill(r: @&*C, d: C)
+    (*r)[1] = d
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 1, y: 0 }
+    var p: *C = @a[0]
+    var d: C = C { x: 2, y: 7 }
+    fill(@&p, d)
+    if a[1].y != 7
+        return 0
+    return a[0].x + a[1].x
+""",
+    # Through a `*[2]C` it's #2440's `(*p)[i]`, which already stored a `C`.
+    "plain_deref_array_pointer_element": BY_VALUE + """
+fn fill(r: *[2]C, d: C)
+    (*r)[1] = d
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 1, y: 0 }
+    var d: C = C { x: 2, y: 7 }
+    fill(@a, d)
+    if a[1].y != 7
+        return 0
+    return a[0].x + a[1].x
+""",
+    "by_value_deref_pointer_element": BY_VALUE + """
+fn fill(r: **C, c:& C)
+    (*r)[1] = c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var a: [2]C
+    var p: *C = @a[0]
+    fill(@p, @&c)
+    c.x = 9
+    return a[1].x
+""",
     "by_value_global_array_element": BY_VALUE + """
 var GA: [2]C
 
@@ -2336,6 +2392,14 @@ fn fill(p: *Res, t:& Res)
 pub fn main() -> i32
     return 0
 """,
+    # AGAST #3122: `(*r)[i] = t` through a `**Res`.
+    "deref_pointer_element": RES + """
+fn fill(r: **Res, t:& Res)
+    (*r)[1] = t
+
+pub fn main() -> i32
+    return 0
+""",
     "global_array_element": RES + """
 var GA: [2]Res
 
@@ -2636,6 +2700,7 @@ RITZ1_GAPS = {
     "array_referent_return": "AGAST #2302: ritz1 has no array return yet",
     "array_return": "AGAST #2302: ritz1 has no array return yet",
     "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
+    "plain_deref_mut_ref_pointer_element": "AGAST #3131: an `@&*T` param isn't #2545's `**T` path",
 }
 
 # `@n` into a `*i32` that isn't a field: the caller's address, so the write
