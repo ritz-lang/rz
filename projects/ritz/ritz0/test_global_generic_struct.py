@@ -118,6 +118,22 @@ PROGRAMS = {
                                "    if w.a[1][2] != 1099511627776\n        return 1\n"
                                "    if w.b[1][2] != 7\n        return 2\n"
                                "    if w.b[1][1] != 4\n        return 3\n    return 0\n"),
+    # AGAST #3120: a `[2][3]P<T>` local in a generic fn body.  The clone
+    # substituted var_type_name but kept the shape's leaf `P$T`, so P$i64 was
+    # never instantiated and `lb[1][2].v` was "unhandled EXPR_MEMBER".
+    "generic_fn_local_array_2d": (_P + "fn pick<T>(x: T, y: T) -> i32\n"
+                                  "    var lb: [2][3]P<T>\n"
+                                  "    lb[1][2].v = x\n    lb[0][1].v = y\n"
+                                  "    if lb[1][2].v != x\n        return 1\n"
+                                  "    if lb[0][1].v != y\n        return 2\n    return 0\n\n"
+                                  + _MAIN + "    pick(1099511627776, 5)\n"),
+    # ... and a bare `[2][3]T` local: the leaf `T` is the argument type itself.
+    "generic_fn_local_bare_array_2d": ("fn pick<T>(x: T, y: T) -> i32\n"
+                                       "    var lb: [2][3]T\n"
+                                       "    lb[1][2] = x\n    lb[0][1] = y\n"
+                                       "    if lb[1][2] != x\n        return 1\n"
+                                       "    if lb[0][1] != y\n        return 2\n    return 0\n\n"
+                                       + _MAIN + "    pick(1099511627776, 5)\n"),
 }
 
 
