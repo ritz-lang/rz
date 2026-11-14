@@ -655,7 +655,12 @@ fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
     if sz <= 0
         sys_close(fd)
         return null
-    let buf: *u8 = malloc(sz + 1)
+    # `sz` is only a first guess at capacity: the file can also be LARGER
+    # than stat said (under valgrind, whenever ritz1 outgrows memcheck), so
+    # read to EOF and grow the buffer, or the fingerprint hashes a prefix
+    # and differs from the native run (AGAST #2414).
+    var cap: i64 = sz
+    var buf: *u8 = malloc(cap + 1)
     if buf == null
         sys_close(fd)
         return null
@@ -664,8 +669,16 @@ fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
     # compiler fingerprint hashed garbage (AGAST #1663).
     var total: i64 = 0
     var done: i32 = 0
-    while done == 0 and total < sz
-        let n: i64 = sys_read(fd, buf + total, sz - total)
+    while done == 0
+        if total == cap
+            cap = cap * 2
+            let grown: *u8 = realloc(buf, cap + 1)
+            if grown == null
+                sys_close(fd)
+                free(buf)
+                return null
+            buf = grown
+        let n: i64 = sys_read(fd, buf + total, cap - total)
         if n < 0
             sys_close(fd)
             free(buf)

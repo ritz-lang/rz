@@ -151,9 +151,9 @@ fn view_helpers_hold() -> i32
     var b: StrView = strview_from_cstr(c"needle in haystack")
     var pre: StrView = strview_from_cstr(c"needle")
     var mid: StrView = strview_from_cstr(c"in hay")
-    assert_str_eq_sv(@a, @b)
-    assert_starts_with_sv(@a, @pre)
-    assert_contains_sv(@a, @mid)
+    assert_str_eq_sv(a, b)
+    assert_starts_with_sv(a, pre)
+    assert_contains_sv(a, mid)
     0
 """
 
@@ -173,11 +173,11 @@ FAILING = {
                            ['string: "hello"', 'prefix: "help"']),
     "assert_contains": ('assert_contains(c"hello", c"xyz")',
                         ['haystack: "hello"', 'needle:   "xyz"']),
-    "assert_str_eq_sv": ("assert_str_eq_sv(@a, @b)",
+    "assert_str_eq_sv": ("assert_str_eq_sv(a, b)",
                          ['expected: "abd"', 'actual:   "abc"']),
-    "assert_starts_with_sv": ("assert_starts_with_sv(@a, @b)",
+    "assert_starts_with_sv": ("assert_starts_with_sv(a, b)",
                               ['string: "abc"', 'prefix: "abd"']),
-    "assert_contains_sv": ("assert_contains_sv(@a, @b)",
+    "assert_contains_sv": ("assert_contains_sv(a, b)",
                            ['haystack: "abc"', 'needle:   "abd"']),
 }
 
@@ -205,13 +205,13 @@ fn fails() -> i32
 
 
 def _failing_source(call: str) -> str:
-    view = call.endswith("(@a, @b)")
+    view = call.endswith("(a, b)")
     return (VIEW_SOURCE if view else CSTR_SOURCE).format(call=call)
 
 
 def _failing_line(call: str) -> int:
     """The line `{call}` lands on: the test's line the diagnostic must name."""
-    return 8 if call.endswith("(@a, @b)") else 6
+    return 8 if call.endswith("(a, b)") else 6
 
 
 @pytest.mark.integration

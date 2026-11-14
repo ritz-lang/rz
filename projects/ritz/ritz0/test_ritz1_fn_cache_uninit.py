@@ -110,6 +110,48 @@ def test_compiler_hash_independent_of_stat_size(ritz1_bin, valgrind, tmp_path):
     assert native["compiler_hash"] == under_vg["compiler_hash"]
 
 
+def _memcheck_size() -> int:
+    """Size of valgrind's memcheck tool: what stat("/proc/self/exe") reports."""
+    for d in ("/usr/libexec/valgrind", "/usr/lib/x86_64-linux-gnu/valgrind",
+              "/usr/lib/valgrind", "/usr/local/libexec/valgrind",
+              "/usr/local/lib/valgrind"):
+        p = Path(d) / "memcheck-amd64-linux"
+        if p.exists():
+            return p.stat().st_size
+    return 64 * 1024 * 1024  # unknown layout: pad well past any memcheck
+
+
+@pytest.mark.integration
+def test_compiler_hash_reads_past_stat_size(ritz1_bin, valgrind, tmp_path):
+    """A ritz1 larger than memcheck must still hash all of itself (AGAST #2414).
+
+    `stat("/proc/self/exe")` under valgrind gives memcheck's size, an upper
+    bound only when ritz1 is smaller.  A ritz1 that outgrew the host's
+    memcheck hashed a truncated prefix under valgrind, so the
+    test above passed or failed with the binary's size.  Pad a copy past
+    memcheck so this host exercises the larger case whatever ritz1's size.
+    """
+    # The sig namespace is the binary's basename; keep the copy beside ritz1
+    # so it finds its runtime files the same way.
+    big = ritz1_bin.parent / f"ritz1_padtest_{tmp_path.name}"
+    shutil.copy2(ritz1_bin, big)
+    try:
+        pad = max(0, _memcheck_size() - big.stat().st_size) + 65536
+        with open(big, "ab") as f:
+            f.write(b"\0" * pad)
+        src = tmp_path / "g.ritz"
+        hashes = []
+        sig = sig_path_for(src, big.name)
+        for prefix in ([], [valgrind, "-q"]):
+            sig.unlink(missing_ok=True)
+            _compile(prefix, big, tmp_path)
+            assert sig.exists(), f"no sig from {prefix or 'native'} run"
+            hashes.append(json.loads(sig.read_text())["compiler_hash"])
+        assert hashes[0] == hashes[1]
+    finally:
+        big.unlink(missing_ok=True)
+
+
 @pytest.mark.unit
 def test_monomorph_clones_sized_with_sizeof():
     """monomorph must allocate cloned AST nodes with sizeof(), not literals."""

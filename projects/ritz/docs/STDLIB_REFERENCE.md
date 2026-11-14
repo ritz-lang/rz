@@ -153,7 +153,7 @@ import ritzlib.result
 import ritzlib.strview
 
 fn parse_int(s: StrView) -> Result<i64, i32>
-    match strview_parse_i64(@s)
+    match strview_parse_i64(s)
         Some(n) => Ok(n)
         None => Err(1)             # error code: not a whole decimal number
 ```
@@ -669,7 +669,7 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 | `strstr` | `strview_find`, `strview_contains` |
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `strview_take` to bound it |
 | `strcat` | `string_push_str`, `string_push_string` |
-| `atoi` | `strview_parse_i64(s: @StrView) -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
+| `atoi` | `strview_parse_i64(s: StrView) -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
 | `itoa` | `string_push_i64(s: @&String, n: i64) -> i32` / `string_from_i64`: no caller-sized buffer |
 
 The byte predicates (`isdigit` .. `tolower`) take a `u8`, not a C string, and

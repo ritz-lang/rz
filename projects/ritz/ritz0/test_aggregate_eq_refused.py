@@ -43,7 +43,7 @@ def _main(*lines, pre=""):
 
 
 _TAGS = "a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
-_STRVIEW = "use strview_eq(@a, @b) from ritzlib.strview"
+_STRVIEW = "use strview_eq(a, b) from ritzlib.strview"
 
 # Each row: the source, the type the refusal names, and the hint it gives ("" for none).
 # The refusal is at the comparison's left operand, the token after `if `.

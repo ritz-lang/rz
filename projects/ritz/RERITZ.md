@@ -46,7 +46,7 @@
 | `prints_cstr(s)` | `fn prints_cstr(s: *u8)` | Print C string (deprecated) |
 | `string_from(sv)` | `fn string_from(sv: StrView) -> String` | Convert StrView to owned String |
 | `string_from_cstr(s)` | `fn string_from_cstr(s: *u8) -> String` | Convert C string to String (FFI) |
-| `strview_to_cstr(s)` | `fn strview_to_cstr(s: *StrView) -> *u8` | Allocate null-terminated copy |
+| `strview_to_cstr(s)` | `fn strview_to_cstr(s: StrView) -> *u8` | Allocate null-terminated copy |
 
 ### Migration Status
 

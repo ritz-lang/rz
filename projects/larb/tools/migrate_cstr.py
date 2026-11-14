@@ -7,7 +7,7 @@ Migrates Ritz code from C-style strings to idiomatic StrView/String usage.
 Transformations:
 1. c"string" -> "string" (when used with StrView APIs)
 2. c"string" -> "string".as_ptr() (when passed to *u8 functions)
-3. streq(a, b) -> strview_eq(@a, @b) (when args are StrView)
+3. streq(a, b) -> strview_eq(a, b) (when args are StrView)
 
 Usage:
     python migrate_cstr.py path/to/file.ritz        # Preview changes
