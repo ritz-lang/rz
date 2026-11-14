@@ -510,29 +510,36 @@ def _refused_at(compile_with, compiler, name, program, message, where):
 
 
 # AGAST #3088: `@x[lo..hi]` on any other place refuses as `x[lo..hi]` does, at
-# the place, where ritz0 raised NotImplementedError.  ritz0 only: ritz1 says an
-# unlocated "cannot take address" (AGAST #3145).
-_ADDR_H = "struct H\n    a: [2]*i16\n    p: *i16\n\n"
+# the place, where ritz0 raised NotImplementedError.  ritz1 said "unknown
+# expression kind" or "cannot take address", unlocated (AGAST #3145).  An i32
+# field shares only the tail: ritz0 calls it "a struct" (AGAST #3146).
+_ADDR_H = "struct H\n    a: [2]*i16\n    p: *i16\n    k: i32\n\n"
+_UNSLICEABLE = "can't be sliced (only String, Vec and Span can)"
 ADDR_OF_SLICE = {
     "array_local": ("", "    let r = @x[0..2]\n", "an array can't be sliced"),
     "pointer_local": ("", "    var p: *i16 = @x[0]\n    let r = @p[0..2]\n", "a pointer can't be sliced"),
     "array_field": (_ADDR_H, "    var h: H\n    let r = @h.a[0..2]\n", "an array can't be sliced"),
     "pointer_field": (_ADDR_H, "    var h: H\n    h.p = @x[0]\n    let r = @h.p[0..2]\n",
                       "a pointer can't be sliced"),
+    "int_field": (_ADDR_H, "    var h: H\n    h.k = 1\n    let r = @h.k[0..2]\n", _UNSLICEABLE),
     # A String slices, but its slice is a new value, with no place to point at.
     "string": ("import ritzlib.string\n\n",
                '    var s: String = string_from("abcd")\n    let r = @s[0..2]\n',
                "can't take the address of a slice"),
+    "vec": ("import ritzlib.gvec\n\n",
+            "    var v: Vec<i32> = vec_new<i32>()\n    let r = @v[0..1]\n",
+            "can't take the address of a slice"),
 }
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(ADDR_OF_SLICE))
-def test_address_of_a_slice_is_refused_located(compile_with, name):
+def test_address_of_a_slice_is_refused_located(compile_with, name, compiler):
     pre, body, message = ADDR_OF_SLICE[name]
     program = _x(body + "    return 0\n", pre)
     line = program.splitlines().index(body.splitlines()[-1]) + 1
-    _refused_at(compile_with, "ritz0", name, program, message, f"{line}:14")
+    _refused_at(compile_with, compiler, name, program, message, f"{line}:14")
 
 
 # No store takes a range.  Each compiler says so in its own words.

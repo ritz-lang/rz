@@ -1257,6 +1257,42 @@ fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
     *out_reg = emit_array_elem_widen(s, v, sh.leaf_type, ty)
     return 1
 
+# AGAST #3145: `@x[lo..hi]` refused at the index, in ritz0's words (#3088).  A
+# String, Vec or Span slice is a new value with no place to point at; anything
+# else isn't sliced, and emit_expr_index says so as it does for `x[lo..hi]`.
+# Both were unlocated: "unknown expression kind" or "cannot take address".
+fn addr_of_slice_refused(s: *EmitterState, op: *Expr)
+    if slice_base_is_sliceable(s, op.left) == 1
+        emit_nd_error(s, op.span.line, op.span.col, c"can't take the address of a slice")
+        return
+    emit_expr_index(s, op)
+
+# 1 when `base` (`v`, `*p`, `b.f`) is a String, Vec or Span, or a pointer to
+# one, as ritz0's _slice_ritz_type reads it.
+fn slice_base_is_sliceable(s: *EmitterState, base: *Expr) -> i32
+    var b: *Expr = base
+    if b != null and b.kind == EXPR_UNARY and b.op == OP_DEREF
+        b = b.operand
+    if b == null
+        return 0
+    if b.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, b.ident_ptr, b.ident_len)
+        if loc == null
+            return 0
+        let vt: i32 = loc.var_type
+        if vt != TYPE_STRUCT and vt != TYPE_PTR and vt != TYPE_REF and vt != TYPE_MUT_REF
+            return 0
+        return is_sliceable_name(loc.type_name, loc.type_name_len)
+    if b.kind == EXPR_MEMBER
+        let fld: *StructField = resolve_member_chain_field(s, b)
+        if fld == null
+            return 0
+        let ft: i32 = fld.field_type
+        if ft != TYPE_STRUCT and ft != TYPE_PTR and ft != TYPE_REF and ft != TYPE_MUT_REF
+            return 0
+        return is_sliceable_name(fld.field_type_name, fld.field_type_name_len)
+    return 0
+
 fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     # AGAST #2379: `a[i][j]` with `a: [N]*T` is `*(a[i] + j)` (#2332), so its
     # address is `a[i] + j`.  It was "cannot take address".
@@ -1275,6 +1311,10 @@ fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
         emit_reg(s, ei_val)
         emit_str(s, c" to ptr\n")
         return ei_ptr
+    # AGAST #3145: `@x[lo..hi]` is no element, so it has no address.
+    if op.kind == EXPR_INDEX and op.right != null and op.right.kind == EXPR_RANGE
+        addr_of_slice_refused(s, op)
+        return 0
     # AGAST #1509: `@g[i][j]` / `@g[i]` over a multi-dimensional array.
     var nd_addr: NdIndexPtr
     if emit_nd_index_ptr(s, op, @nd_addr) == 1
