@@ -1581,6 +1581,12 @@ fn f(a:& [2]i32) -> i32
     let x: i64 = a as i64
     return 3
 """ + MAIN_13,
+    # AGAST #3190: ritz0 wrote `ret [2 x i32]` in an i64 fn; ritz1 returns the
+    # address (#2322).
+    "return_to_integer": """
+fn f(a:& [2]i32) -> i64
+    return a
+""" + MAIN_13,
     "compare_with_null": """
 fn f(a:& [2]i32) -> i32
     if a == null

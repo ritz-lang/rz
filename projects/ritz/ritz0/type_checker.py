@@ -558,6 +558,7 @@ class TypeChecker:
         elif isinstance(expr, rast.Cast):
             source = self._infer_type(expr.expr)
             self._check_array_slot(expr.expr, source, expr.target)
+            self._check_array_into_scalar(expr.expr, source, expr.target)
             self._check_cast_to_ref(expr, source)
             if self._is_bool_type(expr.target):
                 self._error(bool_rules.AS_BOOL_REMOVED, expr.span)
@@ -1267,6 +1268,7 @@ class TypeChecker:
         self._check_array_slot(expr, ty, slot)
         self._check_parts(expr, slot)
         if slot is not None and slot is self._ret_slot():
+            self._check_array_into_scalar(expr, ty, slot)
             self._check_return(expr)
         self._check_other_referent(expr, ty, slot)
         return ty
@@ -1386,6 +1388,21 @@ class TypeChecker:
             # emitter refuses it at the array, in its words. Into an `@U`, or
             # from a `:&` param, it's the value-into-reference error above, as
             # it is in ritz1.
+            self._slot_reported.add(id(expr))
+            self._slot_error(array_rules.WHOLE_ARRAY_NOT_A_VALUE, expr.span)
+
+    def _check_array_into_scalar(self, expr: rast.Expr, actual: Optional[rast.Type],
+                                 slot: Optional[rast.Type]) -> None:
+        """A whole array, literal or named, returned from a number or bool fn
+        or cast to one (AGAST #3187, #3190). The emitter wrote a `ret [N x T]`
+        in a scalar fn, which clang rejects; ritz1 refuses it at the array.
+        Only these two sites: a `let`/`var`/assign/argument already refuses it
+        as a store mismatch, and a pointer, reference or Span slot has its own
+        rule (_check_value_into_ref)."""
+        if slot is None or actual is None or id(expr) in self._slot_reported:
+            return
+        if isinstance(self._resolve_alias(actual), rast.ArrayType) and (
+                self._is_numeric_type(slot) or self._is_bool_type(slot)):
             self._slot_reported.add(id(expr))
             self._slot_error(array_rules.WHOLE_ARRAY_NOT_A_VALUE, expr.span)
 
