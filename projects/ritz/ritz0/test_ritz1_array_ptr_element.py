@@ -725,16 +725,24 @@ def test_pointer_index_reads_the_struct(run_with, name, compiler):
 # ... and it isn't an i64: ritz1 took `let n: i64 = p[0]` silently.  Each says so
 # in its own words, ritz0 at the `let` and ritz1 at the init, as each refuses
 # `let n: i64 = *(p + 0)` (test_struct_deref_value.py).
+# AGAST #3053: so is `a[1][1]` with `a: [2]*S`.  ritz1 put the `%S` load in the
+# i64 slot: a clang error, unlocated.
 NOT_AN_INTEGER = {
     "ritz0": ("`n` is declared `i64` but its initialiser has type", 5),
     "ritz1": ("a whole struct is not a value here in ritz1", 18),
+}
+STRUCT_READS_AS_I64 = {
+    "pointer_index": (_T_MAIN, "p[0]"),
+    "element_index": (_COPY_MAIN, "a[1][1]"),
 }
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_pointer_index_struct_is_not_an_integer(compile_with, compiler):
-    program = _T_MAIN + "    let n: i64 = p[0]\n    return 0\n"
+@pytest.mark.parametrize("form", sorted(STRUCT_READS_AS_I64))
+def test_struct_read_through_a_pointer_is_not_an_integer(compile_with, form, compiler):
+    main, init = STRUCT_READS_AS_I64[form]
+    program = main + f"    let n: i64 = {init}\n    return 0\n"
     message, col = NOT_AN_INTEGER[compiler.removesuffix("_selfhosted")]
-    _refused_at(compile_with, compiler, "ptr_index_as_i64", program, message,
-                f"{_T_MAIN.count(chr(10)) + 1}:{col}")
+    _refused_at(compile_with, compiler, f"{form}_as_i64", program, message,
+                f"{main.count(chr(10)) + 1}:{col}")
