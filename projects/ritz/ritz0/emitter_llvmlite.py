@@ -6377,9 +6377,22 @@ class LLVMEmitter:
                 raise ValueError(f"Tuple destructuring mismatch: expected {len(elements)} "
                                f"elements, got {len(stmt.names)} names")
 
+            # AGAST #3192: each name takes its element's Ritz type, as a
+            # `let` takes its value's.  Without it a `u8` element (or the
+            # `**u8` of `(*T, i32)` at T = *u8) was a bare LLVM `i8`, which
+            # widens signed: 200 read as -56.
+            tuple_ritz = self._infer_ritz_type(stmt.value, tuple_val)
+            elem_ritz = (tuple_ritz.elements if isinstance(tuple_ritz, rast.TupleType)
+                         and len(tuple_ritz.elements) == len(elements) else None)
             for i, name in enumerate(stmt.names):
                 elem_val = self.builder.extract_value(tuple_val, i)
                 self._bind_let(name, elem_val, elem_val.type)
+                # Popped when unknown: a stale type from an earlier binding
+                # of the name must not survive the rebind.
+                if elem_ritz is not None:
+                    self.ritz_types[name] = elem_ritz[i]
+                else:
+                    self.ritz_types.pop(name, None)
             return None
 
         elif isinstance(stmt, rast.AssignStmt):

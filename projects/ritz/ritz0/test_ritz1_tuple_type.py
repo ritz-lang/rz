@@ -292,24 +292,30 @@ pub fn main() -> i32
     let (s, e) = pp<Foo>(@g)
     let (w, z) = pp<*u8>(@pb)
     var k: i32 = 0
-    let bv: u8 = **w   # ritz0 reads a bare `**w` wide (AGAST #3192)
-    if bv == 200
+    if **w == 200
         k = 11
     *q + c + s.a + e + k + z
 """
 
 # `*T` at T = *u8 is `**u8`: `**w` loads a u8.  The u8 is the low byte of
 # a u16 0x07C8, so a wider load reads 1992 or more, compared in full (an
-# exit status keeps only the low byte).  ritz1 only: ritz0 loads it wide
-# (AGAST #3192).
+# exit status keeps only the low byte).  A destructured name is typed by its
+# tuple element, generic or not: ritz0 dropped that type, so `b` and `**w`
+# were bare LLVM `i8`s and widened signed, 200 -> -56 (AGAST #3192).
 GEN_PTR_U8 = """\
 fn pp<T>(p: *T) -> (*T, i32)
     (p, 1)
+
+fn qq(b: u8) -> (u8, i32)
+    (b, 1)
 
 pub fn main() -> i32
     var h: u16 = 1992
     var pb: *u8 = @h as *u8
     let (w, z) = pp<*u8>(@pb)
+    let (b, y) = qq(200)
+    if b as i32 != 200
+        return 4
     if **w as i32 == 200
         return 10 + z
     3
@@ -545,9 +551,11 @@ def test_ritz1_substitutes_tuple_over_generic_param(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_tuple_element_pointing_at_pointer_arg_loads_its_width(ritz1_bin, tmp_path):
-    """AGAST #3173: `(*T, i32)` at T = *u8 binds a `**u8` (ritz1 only, #3192)."""
-    assert _run_pkg("ritz1", tmp_path, "tuple_generic_ptr_u8", GEN_PTR_U8) == 11
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_destructured_u8_widens_unsigned(ritz1_bin, tmp_path, compiler):
+    """AGAST #3173/#3192: `(*T, i32)` at T = *u8 binds a `**u8`, and a
+    destructured `u8` (generic or not) widens as a u8."""
+    assert _run_pkg(compiler, tmp_path, "tuple_generic_ptr_u8", GEN_PTR_U8) == 11
 
 
 @pytest.mark.integration
