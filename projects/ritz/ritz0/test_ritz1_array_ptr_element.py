@@ -448,6 +448,47 @@ def test_element_of_indexed_element(run_with, form, compiler):
     assert run_with(compiler, "indexed", _INDEXED_SETUP + _INDEXED_ELEMENT[form]) == 0
 
 
+# AGAST #2379: `a[i][j]` is `*(a[i] + j)`, so `@a[i][j]` is `a[i] + j`, a `*T`.
+# ritz0 took the address of the `[N]*T` slot j (typed) or failed at clang
+# (inferred); ritz1 said "cannot take address".  a[1] points at x[0], so
+# `@a[1][1]` is x[1].  A 2-D array's `@b[i][j]` is still its own slot.
+_ADDR_H = "struct H\n    n: i64\n    a: [2]*i16\n\n"
+ELEMENT_ADDRESSES = {
+    "typed": _x("    let r: *i16 = @a[1][1]\n" + _is("*r", "2")),
+    "inferred": _x("    let r = @a[1][1]\n" + _is("*r", "2")),
+    "typed_store": _x("    let r: *i16 = @a[1][1]\n    *r = 7\n" + _is("x[1] * 10 + x[2]", "73")),
+    "inferred_store": _x("    let r = @&a[1][1]\n    *r = 7\n" + _is("x[1] * 10 + x[2]", "73")),
+    "inferred_stride": _x("    let r = @a[1][1]\n" + _is("*(r + 1)", "3")),
+    "deref": _x(_is("*@a[1][1]", "2")),
+    "field": _x("    var h: H\n    h.a[1] = @x[0]\n    let r = @&h.a[1][1]\n    *r = 7\n"
+                + _is("x[1]", "7"), _ADDR_H),
+    "struct": _PAIR + _PAIR_MAIN + "    let r = @&a[1][1]\n    r.q = 5\n" + _is("s[1].q", "5"),
+    "two_dimensional_pointers": _x(
+        "    var b: [2][2]*i16\n    b[1][1] = @x[0]\n    let r = @b[1][1]\n" + _is("**r")),
+    "two_dimensional_values": (
+        "pub fn main() -> i32\n    var b: [2][2]i16\n    let r = @&b[1][1]\n    *r = 7\n"
+        + _is("b[1][1]", "7")),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ELEMENT_ADDRESSES))
+def test_address_of_element_index_is_the_sum(run_with, name, compiler):
+    assert run_with(compiler, f"addr_{name}", ELEMENT_ADDRESSES[name]) == 0
+
+
+# A range isn't an element, so it has no address either.  ritz0 refuses it with
+# a NotImplementedError traceback (#3088), the ritz1s in words.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_address_of_element_slice_is_refused(compile_with, compiler):
+    comp, _, _ = compile_with(compiler, "addr_slice", _x("    let r = @a[1][0..2]\n    return 0\n"))
+    assert comp.returncode != 0
+    if compiler != "ritz0":
+        assert "can't be sliced" in comp.stdout + comp.stderr
+
+
 # ritz0 slices no pointer element.  ritz1 took `a[1][0..2]` at stride 1.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
