@@ -541,14 +541,51 @@ RUN_SANDBOX=""
 RUN_PORT=""
 RUN_TIMEOUT=""
 
+# watchdog_wait SID BUDGET -- wait for background job SID, a session leader
+# started by the caller, for at most BUDGET (a sleep(1) duration).  Returns
+# its status, or 137 after KILLing its whole session if the budget ran out.
+# Shared by run_binary and run_test_script.
+#
+# The budget is enforced here, not by timeout(1), whose behaviour depends on
+# which one is installed: GNU `timeout --signal=KILL` exits 137, uutils 0.10
+# exits 124 for the same KILL, and uutils 0.2.2 never delivers the KILL at
+# all -- AGAST #3139, #3157.  A watchdog `sleep` races the job under
+# `wait -n`; if the watchdog wins, the session is KILLed and the result is
+# 137 on every host.  Either way the loser is killed and reaped, so neither
+# outlives us.  `wait -n -p` (bash >= 5.1) names the job that finished and
+# consumes its status, so only the other one is waited for afterwards.
+#
+# The caller learns SID from `setsid CMD &`: a background job of this
+# non-interactive shell is not a group leader, so setsid execs in place (no
+# fork) and $! is the session leader's pid, i.e. the sid.  Must run in the
+# caller's own shell (not a subshell), which alone can wait for its jobs;
+# wrap the call in `{ ...; } 2>/dev/null` to swallow bash's "Killed" report.
+watchdog_wait() {
+    local sid="$1" budget="$2" wd first result
+    sleep "$budget" &
+    wd=$!
+    wait -n -p first "$sid" "$wd"
+    result=$?
+    if [[ "$first" == "$wd" ]]; then
+        # Watchdog fired with the job still running: timed out.
+        pkill -KILL -s "$sid" 2>/dev/null
+        wait "$sid"
+        result=137
+    else
+        kill "$wd" 2>/dev/null
+        wait "$wd"
+    fi
+    return $result
+}
+
 run_binary() {
     local binary="$1"
     local stdout_file="$2"
     local exit_file="$3"
 
-    # A missing binary must never become a baseline.  `timeout` reports 127
-    # ("command not found") for a path that does not exist, which is
-    # indistinguishable from a program that genuinely exited 127 -- so an
+    # A missing binary must never become a baseline.  `env` (`timeout`, until
+    # #3157) reports 127 ("command not found") for a path that does not exist,
+    # which is indistinguishable from a program that genuinely exited 127 -- so an
     # absent binary used to be recorded as "exit=127, no output", and the next
     # stage's equally-absent binary matched it perfectly.  Two things that
     # never ran comparing equal is not a passing test.
@@ -588,7 +625,7 @@ run_binary() {
     _build_fixture_tree "$sandbox"
 
     # Close stdin (</dev/null) to prevent programs like cat/grep from hanging.
-    # Use timeout with KILL signal to ensure cleanup.
+    # Bound it with a KILL at the budget (watchdog_wait, below).
     #
     # Write straight to a file.  Do NOT reintroduce a pipe here.  The original
     # form was:
@@ -644,8 +681,17 @@ run_binary() {
     # reports "File size limit exceeded" with the whole command line on its
     # own stderr, three times per gate.  That death is the expected outcome
     # and is recorded below as exit 153 / non-terminating.
-    { ( cd "$sandbox" && ulimit -f 1024 && \
-      exec env -i \
+    #
+    # Bounded by watchdog_wait (see there), not timeout(1) -- AGAST #3157:
+    # under uutils 0.2.2 `timeout --signal=KILL` never KILLed, so a hung
+    # example ran unbounded.  The program runs as its own session leader
+    # (`&` + exec setsid, which execs in place), so on timeout the whole
+    # session is KILLed and recorded as 137.  `trap - INT QUIT` undoes the
+    # SIG_IGN bash gives an `&` job without job control: the program must see
+    # the default dispositions it saw when run in the foreground.
+    local sid exit_code
+    { ( cd "$sandbox" && ulimit -f 1024 && trap - INT QUIT && \
+      exec setsid env -i \
         PATH=/usr/local/bin:/usr/bin:/bin \
         HOME=/nonexistent \
         LANG=C \
@@ -654,8 +700,10 @@ run_binary() {
         SHELL=/bin/sh \
         TERM=dumb \
         "${port_env[@]}" \
-        timeout --signal=KILL "${RUN_TIMEOUT:-$RUN_BUDGET}" "$binary" < /dev/null > "$raw" 2>&1 ); } 2>/dev/null
-    local exit_code=$?
+        "$binary" < /dev/null > "$raw" 2>&1 ) &
+      sid=$!
+      watchdog_wait "$sid" "${RUN_TIMEOUT:-$RUN_BUDGET}"
+      exit_code=$?; } 2>/dev/null
 
     # Reap anything the program forked and left behind.  Orphans are harmless
     # to *this* measurement now that the pipe is gone, but a surviving server
@@ -769,35 +817,13 @@ run_test_script() {
     # the timed-out case, and only for processes still in timeout's group; the
     # session survives both a normal exit and a child that set its own group.
     #
-    # `&` + `wait`, not a plain foreground call, to learn the session id: a
-    # background job of this non-interactive shell is not a group leader, so
-    # setsid execs in place (no fork) and $! is the session leader's pid,
-    # i.e. the sid.  `{ ...; } 2>/dev/null` swallows bash's "Killed" report.
-    #
-    # The budget is enforced here, not by timeout(1), whose behaviour depends
-    # on which one is installed: GNU `timeout --signal=KILL` exits 137, uutils
-    # 0.10 exits 124 for the same KILL, and uutils 0.2.2 never delivers the KILL
-    # at all.  A watchdog `sleep` races test.sh under `wait -n`; if the
-    # watchdog wins, the whole session is KILLed and the result is 137 on every
-    # host.  Either way the loser is killed and reaped, so neither outlives us.
-    # `wait -n -p` (bash >= 5.1) names the job that finished and consumes its
-    # status, so only the other one is waited for afterwards.
-    local sid wd first result
+    # Bounded by watchdog_wait (see there), not timeout(1): a timeout is
+    # reported as 137 whichever timeout is installed.
+    local sid result
     { setsid bash "$test_script" >/dev/null 2>&1 </dev/null &
       sid=$!
-      sleep "${TEST_SCRIPT_TIMEOUT:-30}" &
-      wd=$!
-      wait -n -p first "$sid" "$wd"
-      result=$?
-      if [[ "$first" == "$wd" ]]; then
-          # Watchdog fired with test.sh still running: timed out.
-          pkill -KILL -s "$sid" 2>/dev/null
-          wait "$sid"
-          result=137
-      else
-          kill "$wd" 2>/dev/null
-          wait "$wd"
-      fi; } 2>/dev/null
+      watchdog_wait "$sid" "${TEST_SCRIPT_TIMEOUT:-30}"
+      result=$?; } 2>/dev/null
     pkill -KILL -s "$sid" 2>/dev/null || true
 
     for n in "${linked[@]}"; do rm -f "./$n"; done
