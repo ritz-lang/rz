@@ -6,7 +6,7 @@
 # the briefing's hard gates:
 #
 #   1. Parallel wiki-seed   — two seed processes vs same DB
-#   2. Slow-client isolation — silent nc + concurrent --ping-loop
+#   2. Slow-client isolation — silent /dev/tcp client + concurrent wiki-seed
 #   3. Mid-scan starvation  — 3 BG scan-loops (large) + 10 ping-loops
 #
 # Each test asserts exit-code 0 on every concurrent client and that the
@@ -56,19 +56,47 @@ PASS=0
 FAIL=0
 FAILED_TESTS=()
 
-# Pick a high-numbered port range that's unlikely to clash with anything.
-PORT_BASE="${PORT_BASE:-17800}"
+# True if something is listening on 127.0.0.1:$1.
+#
+# The `{ ...; } 2>/dev/null` group scopes the stderr redirect to this one
+# `exec`.  A bare `exec 6<>... 2>/dev/null` has no command to run, so its
+# redirections apply to the shell itself: stderr stayed /dev/null for the rest
+# of the script and every later diagnostic was lost (AGAST #3202).
+port_listening() {
+    if { exec 6<>/dev/tcp/127.0.0.1/"$1"; } 2>/dev/null; then
+        exec 6>&-
+        return 0
+    fi
+    return 1
+}
+
+# Three consecutive ports (one per test) that nothing is listening on.  Rooms
+# share a host, so a fixed default range collides when two of them run this at
+# once (AGAST #3202).  Drawn from 20000-31999, below Linux's default ephemeral
+# range (32768+), so an outgoing connection's local port can't be holding one.
+# The probe-then-bind race remains, but boot_server catches a lost one.
+pick_free_port_base() {
+    local tries base i
+    for tries in $(seq 1 50); do
+        base=$(( 20000 + RANDOM % 12000 ))
+        for i in 0 1 2; do
+            port_listening $((base + i)) && continue 2
+        done
+        echo "$base"
+        return 0
+    done
+    echo "  no free port range found" >&2
+    return 1
+}
+
+PORT_BASE="${PORT_BASE:-$(pick_free_port_base)}" || exit 2
 
 # Wait for tcp listener — beats `sleep 1` since it's correct on slow CI.
 wait_for_port() {
     local port="$1"
     local i
     for i in $(seq 1 50); do
-        if exec 6<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null; then
-            exec 6<&-
-            exec 6>&-
-            return 0
-        fi
+        port_listening "$port" && return 0
         sleep 0.05
     done
     echo "  port $port never opened" >&2
@@ -88,6 +116,14 @@ boot_server() {
     SERVER_PID=$!
     if ! wait_for_port "$port"; then
         kill -9 "$SERVER_PID" 2>/dev/null
+        return 1
+    fi
+    # A listener answered, but if our server lost the bind race it has exited
+    # and the answer came from someone else's process on that port.
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "  server on port $port exited at startup (port taken?)" >&2
+        wait "$SERVER_PID" 2>/dev/null
+        SERVER_PID=""
         return 1
     fi
     return 0
@@ -161,9 +197,13 @@ test_slow_client_isolation() {
         return
     fi
 
-    # Open a silent nc — never sends bytes, holds the slot open.
-    nc 127.0.0.1 "$port" < /dev/null > /dev/null 2>&1 &
-    local nc_pid=$!
+    # Hold a silent connection: a `sleep` whose fd 0 is a /dev/tcp socket
+    # never sends a byte and keeps the slot open until we kill it.  This was
+    # `nc 127.0.0.1 "$port" &`, but where AppArmor confines nc
+    # (nc.openbsd//&unprivileged_userns on starbux) the test may not signal
+    # it: the kill failed and `wait` hung forever (AGAST #3202).
+    sleep 600 <>/dev/tcp/127.0.0.1/"$port" &
+    local hold_pid=$!
     sleep 0.5
 
     # Time wiki-seed concurrently.  On a working async loop this finishes
@@ -176,16 +216,21 @@ test_slow_client_isolation() {
     t_end=$(date +%s%N)
     elapsed_ms=$(( (t_end - t_start) / 1000000 ))
 
-    record "wiki-seed completes alongside silent nc (${elapsed_ms}ms)" "$rc"
+    record "wiki-seed completes alongside silent client (${elapsed_ms}ms)" "$rc"
     if [[ "$elapsed_ms" -lt 1000 ]]; then
-        record "wiki-seed not stalled by silent nc" 0
+        record "wiki-seed not stalled by silent client" 0
     else
-        record "wiki-seed stalled by silent nc (${elapsed_ms}ms)" 1
+        record "wiki-seed stalled by silent client (${elapsed_ms}ms)" 1
     fi
     assert_alive; record "server alive after slow-client" $?
 
-    kill "$nc_pid" 2>/dev/null
-    wait "$nc_pid" 2>/dev/null
+    # Only wait on a process we could signal: a refused kill must fail the
+    # test, not hang it.
+    if kill "$hold_pid"; then
+        wait "$hold_pid" 2>/dev/null
+    else
+        record "release silent client (kill refused)" 1
+    fi
     stop_server
 }
 
