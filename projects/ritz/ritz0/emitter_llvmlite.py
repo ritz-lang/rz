@@ -2852,6 +2852,22 @@ class LLVMEmitter:
                 if enum_def.name not in declarers:
                     declarers.append(enum_def.name)
 
+    def _bare_variant_enum(self, name: str) -> str:
+        """The enum a bare variant with no expected enum builds.
+
+        The one user enum declaring it, Option / Result aside (LANGUAGE_SPEC
+        §10 "Bare variants"), else the last enum to register the name. An
+        untyped `let x = Some(5)` has no slot, and the fn's return type is not
+        its slot (§4.4): an `Option<i32>` return registers `Option$i32` after
+        a user's `enum E` declaring `Some`, so `Some` was the Option in an
+        Option-returning fn and E elsewhere. ritz1 takes E (#1797, #2513).
+        Two user declarers are #2039's error, raised before this is reached.
+        """
+        declarers = self.variant_declarers.get(name, ())
+        if len(declarers) == 1:
+            return declarers[0]
+        return self.variant_to_enum[name]
+
     def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span]):
         """Reject a bare variant name two or more user enums declare (AGAST #2039).
 
@@ -3089,7 +3105,7 @@ class LLVMEmitter:
             2. Get the tag for None (1)
             3. Create enum value with just the tag
         """
-        enum_name = self.variant_to_enum[variant_name]
+        enum_name = self._bare_variant_enum(variant_name)
         enum_type, variants = self.enum_types[enum_name]
         tag = self._get_enum_variant_tag(enum_name, variant_name)
         variant = self._get_enum_variant(enum_name, variant_name)
@@ -8146,7 +8162,7 @@ class LLVMEmitter:
             if name in self.variant_to_enum:
                 self._check_variant_unambiguous(name, expr.span)
                 # Get the variant and check if it's a unit variant (no fields)
-                enum_name = self.variant_to_enum[name]
+                enum_name = self._bare_variant_enum(name)
                 variant = self._get_enum_variant(enum_name, name)
                 if not variant.fields:
                     # Unit variant - construct it with no args

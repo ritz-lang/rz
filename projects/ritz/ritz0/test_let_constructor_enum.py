@@ -187,16 +187,31 @@ for _v in ("Ok", "Some"):
             + _users(_v, f"h({_v}(5))"), 5),
     })
 USERS.update({
-    # In an Option-returning fn ritz1's slot is the user's enum (#1797) and ritz0's
-    # the Option (#2513): the let must build whichever its slot is.
+    # An untyped `let` has no slot, and the fn's return type is not its slot: a
+    # bare `Some` is the one user enum declaring it (LANGUAGE_SPEC §10 "Bare
+    # variants", Option/Result aside; §4.4), in any fn (#2513). The `Bad` arm
+    # only compiles against E: ritz0 took the Option the return type had
+    # registered last, and read `Bad` as a binding.
     "some_let_in_an_option_fn": (
         _users("Some", "let x = Some(5)", "var r: i32 = 2", "match x", "    Some(v) =>",
-               "        r = v", "    _ =>", "        r = 3", "Some(r)",
+               "        r = v", "    Bad =>", "        r = 3", "Some(r)",
                fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
+    "some_var_in_an_option_fn": (
+        _users("Some", "var x = Some(5)", "var r: i32 = 2", "match x", "    Some(v) =>",
+               "        r = v", "    Bad =>", "        r = 3", "Some(r)",
+               fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
+    # A user's unit `Some`: the Option's has a payload, so a bare `Some` read as
+    # the Option's was no unit variant, and no value.
+    "unit_some_let_in_an_option_fn": (
+        "enum E\n    Some\n    Bad\n"
+        + _body("let x = Some", "match x", "    Some => Some(5)", "    Bad => Some(3)",
+                fn="fn g() -> Option<i32>\n")
         + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
     "typed_some_let_in_an_option_fn": (
         _users("Some", "let x: E = Some(5)", "var r: i32 = 2", "match x", "    Some(v) =>",
-               "        r = v", "    _ =>", "        r = 3", "Some(r)",
+               "        r = v", "    Bad =>", "        r = 3", "Some(r)",
                fn="fn g() -> Option<i32>\n")
         + _body("match g()", "    Some(v) => v", "    _ => 2"), 5),
     # The tail of an Option-returning fn is the builtin.
@@ -268,11 +283,10 @@ USERS.update({
                     "    None => Some(7)", "    _ => Some(3)", fn="fn g(k: i32) -> Option<i32>\n")
         + _body("match g(0)", "    Some(v) => v", "    _ => 2"), 7),
     "none_assigned": (_users_none("var x: E = Some(5)", "x = None", *_MATCH_NONE), 7),
-    # In an Option-returning fn the let's slot is the user's enum, as `Some(5)`'s.
+    # In an Option-returning fn the let's `None` is the user's enum, as `Some(5)`'s
+    # (#2513): only an E can be passed to `h`.
     "none_let_in_an_option_fn": (
-        _users_none("let x = None", "var r: i32 = 2", "match x", "    None =>",
-                    "        r = 7", "    _ =>", "        r = 3", "Some(r)",
-                    fn="fn g() -> Option<i32>\n")
+        _H_NONE + _users_none("let x = None", "Some(h(x))", fn="fn g() -> Option<i32>\n")
         + _body("match g()", "    Some(v) => v", "    _ => 2"), 7),
     # An Option slot keeps the Option's.
     "builtin_none_beside_a_users": (
