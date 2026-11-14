@@ -1074,6 +1074,18 @@ back to him to confirm, as R18 did, so each ticket stays `blocked` until he does
 
 ## The three settled answers: no conflict
 
+**Both edges CONFIRMED by Aaron (2026-11-14, ~20:04 UTC, via `rz`):**
+- **#2514's edge:** `p == c"lit"` is refused too. `rz` filed it as **#3196**.
+- **#2518's edge 1:** `@make()` passed *directly* as a call argument is allowed; the
+  temporary is dropped when the call returns. Every other escape of a call's temporary
+  (a `let p = @make()`, a store, `@&`) stays an error. `rz` wrote this into #2518, and
+  it answers **#3050**: `s.look(@make(1))` spills the temporary, passes its address and
+  drops it after the call (DROPS = 1) on all three compilers.
+- Edge 2 (a mutating method on a temporary is a store, so refused) was not contested and
+  stands with #2518.
+
+What went to Aaron:
+
 - **#2514 (`p == "lit"`, `p: *u8`, refused).** No conflict. R3 gives a literal `*u8`
   in a *slot* (let, var, =, return, tail, field, element, arm, argument, cast), and an
   operand of `==` was never one. One gap to close in the same ticket: `p == c"lit"` is
@@ -1094,7 +1106,16 @@ back to him to confirm, as R18 did, so each ticket stays `blocked` until he does
      by R1 exception 4's auto-ref, so it's refused with the rest. A read-only method
      (`make().get()`) is a read and stays.
 
-## R19: `int as Enum` (#3040), recommended: refused
+## R19: `int as Enum` (#3040): refused, CONFIRMED
+
+**CONFIRMED by Aaron (2026-11-14, ~20:04 UTC, via `rz`): refuse, match only.** Rule 1
+stands as written: `n as E` is a located error for every enum on all three compilers,
+and `e as U` is unchanged. **`from_discriminant` is declined for now:** Aaron chose
+"match only" over "refuse plus `from_discriminant`", so rule 2's second step is not
+filed. Rule 3 (no conversion for an enum that carries data) follows from rule 1. #3040
+is `ready`.
+
+The recommendation as it went to Aaron:
 
 **Aaron (2026-11-14):** "Does this make sense? The semantic value of an enum can change
 if there are steps inserted. I'm not sure how to call this as C and most other languages
@@ -1152,7 +1173,14 @@ ritz1_selfhosted: the same refusal where `as` is typed (the source of the invali
 Spec §10.4 gets one sentence and an `expect-error` block. `from_discriminant` is a
 separate ticket, only if Aaron asks for it.
 
-## R20: `p + 1` on `let p = @x` (#3106), recommended: refused, as R16
+## R20: `p + 1` on `let p = @x` (#3106): refused, as R16, CONFIRMED
+
+**CONFIRMED by Aaron (2026-11-14, ~20:04 UTC, via `rz`): refuse.** `let p = @x`,
+`let p = @&x` and copies of them are `@T`/`@&T`, so `+`, `-`, `+=`, `-=` and `p - q`
+on them get R16's error. The row walk (R18) and `(p as *T) + 1` stay legal. #3106 is
+`ready`, and #3129's "follows ritz0 (accepted) pending #3106" note is resolved by it.
+
+The recommendation as it went to Aaron:
 
 **Aaron (2026-11-14):** "Maybe? I don't want to start creating footguns and C-isms by
 allowing stupid overflows to happen. So as long as we aren't giving someone an easy way
@@ -1199,7 +1227,21 @@ ritz1 drops the `addr_let` exception in `ref_arith_pointee`; the `*_arith` rows 
 `test_bare_place_borrow.py` STRUCT_REFS flip to R16's error on all three; #3129's
 "pending #3106" note is resolved. No spec change: §7.1 already says "an `@T` or `@&T`".
 
-## R21: the type of `m + 1` with `m: u32` (#3112), recommended: `u32`
+## R21: the type of `m + 1` with `m: u32` (#3112): `u32`, CONFIRMED
+
+**CONFIRMED by Aaron (2026-11-14, ~20:04 UTC, via `rz`): `u32`.** In an arithmetic or
+bitwise operation an integer literal takes the other operand's type; two literals are
+`i64`. §7.4's "a literal is an `i64`" paragraph and its two examples are reversed in
+the implementing commit, which also rewrites prism `mock.ritz:237` and carries the
+corpus IR diff. #3112 is `ready`.
+
+**Overflow: measure first.** Aaron asked LARB to measure the cost of trapping on
+overflow in debug builds, with explicit `wrapping_add` and friends, before anything
+changes. That is **#3197**: which crypto, hash and checksum sites rely on wrapping, how
+many need an explicit op, and a recommendation that goes back to him. Until it's
+decided, `+`, `-` and `*` keep wrapping silently on all three compilers.
+
+The recommendation as it went to Aaron:
 
 **Aaron (2026-11-14):** "Is this just for the wrapping cases? What's the rationale for
 picking one over the other?"
@@ -1290,7 +1332,7 @@ the other operand's shape (the checker already does), so `var n = m + 1` gets a
 `expect-error` block needs a different narrowing example (a plain `i64` into a `u8`).
 Then IR-diff the corpus.
 
-## Suggested order (this batch)
+## Suggested order (this batch), confirmed by `rz`
 
 1. **#3106** (R20): 0 sites, one rule on all three. Smallest.
 2. **#3040** (R19): 0 sites; the refusal removes a ritz0 crash and ritz1 invalid IR.
