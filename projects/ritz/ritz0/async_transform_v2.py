@@ -123,14 +123,8 @@ class AsyncAnalyzer:
 
     def _analyze_stmt(self, stmt: rast.Stmt):
         """Analyze a statement."""
-        if isinstance(stmt, rast.LetStmt):
+        if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
             # Track the let target for await point association
-            self.current_let_target = (stmt.name, stmt.type)
-            if stmt.value:
-                self._analyze_expr(stmt.value)
-            self.current_let_target = None
-            self.current_locals[stmt.name] = stmt.type
-        elif isinstance(stmt, rast.VarStmt):
             self.current_let_target = (stmt.name, stmt.type)
             if stmt.value:
                 self._analyze_expr(stmt.value)
@@ -154,13 +148,19 @@ class AsyncAnalyzer:
     def _analyze_expr(self, expr: rast.Expr):
         """Analyze an expression, recording await points."""
         if isinstance(expr, rast.Await):
-            # Found an await point!
+            # Found an await point!  An await nested in the awaited expression
+            # (`await g(await f(x))`) runs first: record it first, so points
+            # are in evaluation order and each state reads its earlier ones.
+            let_target = self.current_let_target
+            self.current_let_target = None
+            self._analyze_expr(expr.expr)
+
             result_var = f"__await_result_{self.await_index}"
             result_type = rast.NamedType(span=rast.Span(0,0,0,0), name='i32')
 
             # If we're in a let statement, use that variable name
-            if self.current_let_target:
-                result_var, result_type = self.current_let_target
+            if let_target:
+                result_var, result_type = let_target
             else:
                 # Add synthetic result variable to locals so it gets a field
                 self.current_locals[result_var] = result_type
@@ -174,8 +174,6 @@ class AsyncAnalyzer:
             )
             self.await_points.append(ap)
             self.await_index += 1
-            # Also analyze the inner expression
-            self._analyze_expr(expr.expr)
 
         elif isinstance(expr, rast.BinOp):
             self._analyze_expr(expr.left)
@@ -584,10 +582,15 @@ class TrueAsyncGenerator:
         Transform the original body's return expression to use self.field
         for any variables that were stored across awaits.
         """
-        # Get the final expression from the body
-        if self.fn_def.body.expr:
-            transformer = SimpleBodyTransformer(self.analysis, self.fn_def)
-            return transformer._transform_expr(self.fn_def.body.expr)
+        # Each await in it reads its stored result (AGAST #3011): a tail
+        # `await f(x)` lowered to `f(x)`, the future, before.
+        transformer = SimpleBodyTransformer(self.analysis, self.fn_def)
+        body = self.fn_def.body
+        if body.expr:
+            return transformer._transform_expr(body.expr)
+        # `return await f(x)` as the last statement: its value, not 0.
+        if body.stmts and isinstance(body.stmts[-1], rast.ReturnStmt) and body.stmts[-1].value:
+            return transformer._transform_expr(body.stmts[-1].value)
 
         # Default: return 0
         return self._make_int(0)
@@ -602,13 +605,27 @@ class SimpleBodyTransformer:
         self.dummy_span = rast.Span(0, 0, 0, 0)
         self.cross_await_vars = analysis.cross_await_locals
         self.param_names = {p.name for p in fn_def.params}
+        # An await already driven by an earlier state -> its result field.
+        self.await_results = {id(ap.expr): ap.result_var for ap in analysis.await_points}
 
     def transform(self, block: rast.Block) -> rast.Block:
         new_stmts = [self._transform_stmt(s) for s in block.stmts]
         new_expr = self._transform_expr(block.expr) if block.expr else None
         return rast.Block(span=block.span, stmts=new_stmts, expr=new_expr)
 
+    def _self_field(self, name: str, span) -> rast.Field:
+        """(*self).name"""
+        return rast.Field(
+            span=span,
+            expr=rast.UnaryOp(span=span, op='*', operand=rast.Ident(span=span, name='self')),
+            field=name
+        )
+
     def _transform_stmt(self, stmt: rast.Stmt) -> rast.Stmt:
+        if isinstance(stmt, (rast.LetStmt, rast.VarStmt)) and stmt.name in self.cross_await_vars:
+            # The local lives in the future struct, where its uses read it.
+            value = self._transform_expr(stmt.value) if stmt.value else rast.IntLit(span=stmt.span, value=0)
+            return rast.AssignStmt(span=stmt.span, target=self._self_field(stmt.name, stmt.span), value=value)
         if isinstance(stmt, rast.LetStmt):
             new_value = self._transform_expr(stmt.value) if stmt.value else None
             return rast.LetStmt(
@@ -629,8 +646,22 @@ class SimpleBodyTransformer:
             return None
 
         if isinstance(expr, rast.Await):
-            # Should not reach here in final transform - awaits handled by state machine
+            # A state already drove it: its result is stored (AGAST #3011).
+            if id(expr) in self.await_results:
+                return self._self_field(self.await_results[id(expr)], expr.span)
             return self._transform_expr(expr.expr)
+
+        elif isinstance(expr, rast.If):
+            return rast.If(
+                span=expr.span,
+                cond=self._transform_expr(expr.cond),
+                then_block=self.transform(expr.then_block),
+                # an `else if` may be an If, not a Block
+                else_block=self._transform_expr(expr.else_block) if expr.else_block else None
+            )
+
+        elif isinstance(expr, rast.Block):
+            return self.transform(expr)
 
         elif isinstance(expr, rast.Ident):
             # If this is a cross-await variable or parameter, access through self
