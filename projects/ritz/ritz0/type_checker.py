@@ -556,7 +556,9 @@ class TypeChecker:
             return rast.TupleType(expr.span, element_types)
 
         elif isinstance(expr, rast.Cast):
-            self._check_array_slot(expr.expr, self._infer_type(expr.expr), expr.target)
+            source = self._infer_type(expr.expr)
+            self._check_array_slot(expr.expr, source, expr.target)
+            self._check_cast_to_ref(expr, source)
             if self._is_bool_type(expr.target):
                 self._error(bool_rules.AS_BOOL_REMOVED, expr.span)
             return expr.target
@@ -1386,6 +1388,28 @@ class TypeChecker:
             # it is in ritz1.
             self._slot_reported.add(id(expr))
             self._slot_error(array_rules.WHOLE_ARRAY_NOT_A_VALUE, expr.span)
+
+    def _check_cast_to_ref(self, cast: rast.Cast, source: Optional[rast.Type]) -> None:
+        """`c as @&C`, `c as @C` or `c as *C` with `c` a struct or array value,
+        a `:&` param's included (AGAST #2370): a cast isn't a borrow, so it's
+        the bare form's error, as ritz1's ref_cast_value_to_ref. An integer
+        source is the integer-to-pointer cast and stays; a string literal is a
+        `*u8` already, and a StrView or String into a `*T` has LARB R3's own
+        words (the emitter's _STR_AS_PTR, AGAST #2341)."""
+        target = self._resolve_alias(cast.target)
+        if source is None or not isinstance(target, (rast.PtrType, rast.RefType)):
+            return
+        operand = cast.expr
+        while isinstance(operand, rast.Grouped):
+            operand = operand.expr
+        if isinstance(operand, rast.StringLit) or id(operand) in self._slot_reported:
+            return
+        source = self._resolve_alias(source)
+        if isinstance(target, rast.PtrType) and isinstance(source, rast.NamedType) \
+                and source.name in ('StrView', 'String'):
+            return
+        if isinstance(source, rast.ArrayType) or self._is_struct(source):
+            self._report_value_into_ref(operand, target)
 
     def _check_other_referent(self, expr: rast.Expr, actual: Optional[rast.Type],
                               slot: Optional[rast.Type]) -> None:

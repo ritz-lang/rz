@@ -1589,9 +1589,17 @@ def test_ritz0_refuses_a_bare_array_as_an_address(tmp_path, name):
     assert comp.returncode != 0
 
 
+# AGAST #2370 refuses the cast to a pointer on ritz1: a value cast to a
+# reference is the bare form's error.
+LAX_GAPS = sorted(set(LAX) - {"cast_to_pointer"})
+
+
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2322: a bare `:&` array reads as its pointer")
-@pytest.mark.parametrize("name", sorted(LAX))
+@pytest.mark.parametrize("name", [
+    *(pytest.param(n, marks=pytest.mark.xfail(
+        strict=True, reason="AGAST #2322: a bare `:&` array reads as its pointer")) for n in LAX_GAPS),
+    "cast_to_pointer",
+])
 def test_ritz1_refuses_a_bare_array_as_an_address(ritz1_bin, tmp_path, name):
     comp, _, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + LAX[name])
     assert comp.returncode != 0

@@ -40,8 +40,6 @@ PAYLOAD_GAPS = {
     "own_enum": "AGAST #3046: ritz1 stores `E.Full(@&c)`'s ptr as `store i64`, clang refuses",
     "option": "AGAST #2384: `Option<@&C>` mangles to a bare `Option$`, so the payload has no type",
 }
-CAST_GAP = ("AGAST #2370: a value cast to a reference isn't refused: ritz1 runs it, and ritz0 reports "
-            "`cannot store` at the later `p.x = 3`")
 
 TYPES = """\
 struct C
@@ -1092,13 +1090,50 @@ BARE_CASTS = {
     "mut": ("fn go(c:& C)\n    let p: @&C = c as @&C\n    p.x = 3\n", VALUE_INTO_MUT_REF),
     "ptr": ("fn go(c:& C)\n    let p: *C = c as *C\n    p.x = 3\n", VALUE_INTO_SHARED_REF),
 }
+# An array is a value as a struct is: `a as *i32` doesn't borrow it either.
+BARE_ARRAY_CAST = """\
+fn f(a:& [2]i32)
+    let p: *i32 = a as *i32
+    p[1] = 3
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 1]
+    f(@&a)
+    return a[1]
+"""
+
+
+# AGAST #2370: refused at the cast, whatever slot it lands in.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(BARE_CASTS) + ["array"])
+def test_a_value_cast_to_a_reference_is_refused(ritz1_bin, tmp_path, compiler, name):
+    if name == "array":
+        program, message = BARE_ARRAY_CAST, VALUE_INTO_SHARED_REF
+    else:
+        body, message = BARE_CASTS[name]
+        program = TYPES + body + GO
+    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, program)
+    _refused(comp, ll, message)
+
+
+# What the cast rule leaves alone: an integer is the integer-to-pointer cast,
+# and a written reference is already a pointer.
+CAST_CONTROLS = {
+    "integer": """\
+pub fn main() -> i32
+    var n: i64 = 1
+    let addr: i64 = @n as i64
+    let p: *i64 = addr as *i64
+    *p = 3
+    return n as i32
+""",
+    "written": TYPES + "fn go(c:& C)\n    let p: *C = @c as *C\n    p.x = 3\n" + GO,
+}
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason=CAST_GAP)
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(BARE_CASTS))
-def test_a_value_cast_to_a_reference_is_refused(ritz1_bin, tmp_path, compiler, name):
-    body, message = BARE_CASTS[name]
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, TYPES + body + GO)
-    _refused(comp, ll, message)
+@pytest.mark.parametrize("name", sorted(CAST_CONTROLS))
+def test_a_cast_to_a_pointer_from_a_non_value_runs(ritz1_bin, tmp_path, compiler, name):
+    assert _run(compiler, ritz1_bin, tmp_path, name, CAST_CONTROLS[name]) == 3
