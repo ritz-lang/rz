@@ -3,6 +3,10 @@
 #
 # build.py invokes this with CWD=pkg_dir and `./grep` symlinked to build/debug/grep.
 set -euo pipefail
+# Scratch from mktemp -d, removed only by this trap: gates share /tmp
+# (AGAST #3178), so a fixed /tmp name is shared with every other gate.
+T=$(mktemp -d) || exit 1
+trap 'rm -rf "$T"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -12,12 +16,10 @@ expected=$(printf 'apple\napricot')
 [[ "$got" == "$expected" ]] || fail "basic match: expected '$expected', got '$got'"
 
 # --- no matches → empty output, exit 1 (standard grep behavior) ---
-if printf 'one\ntwo\n' | ./grep 'xyz' > /tmp/grep_out.$$ 2>/dev/null; then
+if printf 'one\ntwo\n' | ./grep 'xyz' > "$T"/grep_out 2>/dev/null; then
   # grep found something when it shouldn't
-  rm -f /tmp/grep_out.$$
   fail "no-match case should fail but succeeded"
 fi
-rm -f /tmp/grep_out.$$
 
 # --- match everything ---
 got=$(printf 'a\nb\nc\n' | ./grep '')

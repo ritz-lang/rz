@@ -1,6 +1,10 @@
 #!/bin/bash
 # Integration tests for `time` — measure elapsed wall/user/sys time of a command.
 set -euo pipefail
+# Scratch from mktemp -d, removed only by this trap: gates share /tmp
+# (AGAST #3178), so a fixed /tmp name is shared with every other gate.
+T=$(mktemp -d) || exit 1
+trap 'rm -rf "$T"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -16,13 +20,12 @@ out=$("$TIME" /bin/true 2>&1)
 # --- timing a command that exits non-zero still emits the report
 # and propagates the child's exit code (time's job is to wrap, not eat errors).
 set +e
-"$TIME" /bin/false > /tmp/time_out.$$ 2>&1
+"$TIME" /bin/false > "$T"/time_out 2>&1
 rc=$?
 set -e
 # child exited with 1 → wrapper exits with 1 (coreutils behavior). Some
 # implementations always return 0; accept either but require 'real' in report.
-out=$(cat /tmp/time_out.$$)
-rm -f /tmp/time_out.$$
+out=$(cat "$T"/time_out)
 [[ "$out" == *"real"* ]] || fail "expected 'real' for /bin/false, got:\n$out"
 
 # --- environment passthrough: the child inherits our environment exactly — same entries, same

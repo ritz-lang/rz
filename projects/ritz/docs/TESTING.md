@@ -27,6 +27,14 @@ compiled in test mode, linked with ritzunit as `main` (LANGUAGE_SPEC.md
 §17.1). ritzunit forks a child per `[[test]]` function, so a SIGSEGV in one
 test does not stop the others. Exit 0 = pass, anything else = fail.
 
+A `test.sh` that needs scratch files takes them from its own `mktemp -d`
+and removes that dir in its own EXIT trap: `T=$(mktemp -d) || exit 1;
+trap 'rm -rf "$T"' EXIT`. Every gate runs every `test.sh`, and two gates
+share the host's /tmp, so a fixed name like `/tmp/ritz_ls_test` belongs to
+both of them, and a glob cleanup deletes the other gate's files.
+`tools/test_gate_tmpdirs.py` fails on any literal /tmp path in a `test.sh`,
+the regression scripts or the Makefile (AGAST #3178).
+
 A test binary run by hand takes `-j N` to run up to N of its tests at once.
 Each child gets its own output capture, and results are reported in table
 order whatever order the children finish in. The harness does not pass `-j`.

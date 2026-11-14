@@ -1,5 +1,9 @@
 #!/bin/bash
 set -e
+# Scratch from mktemp -d, removed only by this trap: gates share /tmp
+# (AGAST #3178), so a fixed /tmp name is shared with every other gate.
+T=$(mktemp -d) || exit 1
+trap 'rm -rf "$T"' EXIT
 
 # Get the directory of the test script
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,22 +33,21 @@ result=$(printf 'let s: *u8 = "hello world"\n' | $FMT)
 echo "$result" | grep -q '"hello world"' || { echo "FAIL: preserve string"; exit 1; }
 
 # Test 6: Check mode - already formatted
-printf "fn foo()\n    return 0\n" > /tmp/fmt_test.ritz
-$FMT -c /tmp/fmt_test.ritz || { echo "FAIL: check formatted"; exit 1; }
+printf "fn foo()\n    return 0\n" > "$T"/fmt_test.ritz
+$FMT -c "$T"/fmt_test.ritz || { echo "FAIL: check formatted"; exit 1; }
 
 # Test 7: Check mode - needs formatting
-printf "fn foo()   \n    return 0\n" > /tmp/fmt_test.ritz
-! $FMT -c /tmp/fmt_test.ritz 2>/dev/null || { echo "FAIL: check unformatted"; exit 1; }
+printf "fn foo()   \n    return 0\n" > "$T"/fmt_test.ritz
+! $FMT -c "$T"/fmt_test.ritz 2>/dev/null || { echo "FAIL: check unformatted"; exit 1; }
 
 # Test 8: Write mode
-printf "fn foo()   \n" > /tmp/fmt_test.ritz
-$FMT -w /tmp/fmt_test.ritz
-result=$(cat /tmp/fmt_test.ritz)
+printf "fn foo()   \n" > "$T"/fmt_test.ritz
+$FMT -w "$T"/fmt_test.ritz
+result=$(cat "$T"/fmt_test.ritz)
 echo "$result" | grep -q "fn foo()$" || { echo "FAIL: write mode"; exit 1; }
 
 # Test 9: Custom indent width - 2 space indents
 result=$(printf "fn foo()\n  x\n" | $FMT -i 2)
 echo "$result" | grep -q "^  x" || { echo "FAIL: custom indent"; exit 1; }
 
-rm -f /tmp/fmt_test.ritz
 echo "All ritzfmt tests passed!"

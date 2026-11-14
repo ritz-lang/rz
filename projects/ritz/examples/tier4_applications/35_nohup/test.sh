@@ -3,7 +3,7 @@
 set -e
 
 # Clean up any previous test artifacts
-rm -f nohup.out /tmp/nohup_test_output.txt
+rm -f nohup.out
 
 # Test 1: Basic execution with output redirection
 # When stdout is not a tty (piped), output should go to stdout

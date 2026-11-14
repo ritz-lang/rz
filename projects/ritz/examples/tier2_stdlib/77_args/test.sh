@@ -6,6 +6,10 @@
 # ./argdemo linked to that compiler's build, so passing here under every
 # stage means ritz0 and ritz1 builds agree on every case below.
 set -uo pipefail
+# Scratch from mktemp -d, removed only by this trap: gates share /tmp
+# (AGAST #3178), so a fixed /tmp name is shared with every other gate.
+T=$(mktemp -d) || exit 1
+trap 'rm -rf "$T"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -13,8 +17,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() {
     local want_rc="$1" want_out="$2" want_err="$3"; shift 4
     local out err rc
-    out=$(./argdemo "$@" 2>/tmp/argdemo_err.$$); rc=$?
-    err=$(cat /tmp/argdemo_err.$$); rm -f /tmp/argdemo_err.$$
+    out=$(./argdemo "$@" 2>"$T"/argdemo_err); rc=$?
+    err=$(cat "$T"/argdemo_err); rm -f "$T"/argdemo_err
     [[ "$rc" == "$want_rc" ]]   || fail "argdemo $*: exit $rc, want $want_rc"
     [[ "$out" == "$want_out" ]] || fail "argdemo $*: stdout
 --- got ---

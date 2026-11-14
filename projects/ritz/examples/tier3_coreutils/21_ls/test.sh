@@ -1,4 +1,9 @@
 #!/bin/bash
+# Scratch from mktemp -d, removed only by this trap: gates share /tmp
+# (AGAST #3178), so a fixed /tmp name is shared with every other gate.
+T=$(mktemp -d) || exit 1
+trap 'rm -rf "$T"' EXIT
+
 # Test ls: basic listing
 ./ls . | grep -q "src" || exit 1
 
@@ -19,8 +24,7 @@ COUNT=$(./ls -1 . | wc -l)
 ./ls . .. | grep -q "src" || exit 1
 
 # Test ls: classify
-mkdir -p /tmp/ritz_ls_test
-touch /tmp/ritz_ls_test/file.txt
-mkdir /tmp/ritz_ls_test/subdir
-./ls -F /tmp/ritz_ls_test | grep -q "subdir/" || exit 1
-rm -rf /tmp/ritz_ls_test
+mkdir -p "$T"/ritz_ls_test
+touch "$T"/ritz_ls_test/file.txt
+mkdir "$T"/ritz_ls_test/subdir
+./ls -F "$T"/ritz_ls_test | grep -q "subdir/" || exit 1
