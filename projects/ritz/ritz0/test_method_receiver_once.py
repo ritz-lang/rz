@@ -171,7 +171,6 @@ fn ms() -> Span<u8>
 # ritz1 evaluates these receivers once too, where it can compile them. What's
 # missing is something else, so each row cites its own ticket.
 BOTH_RITZ1 = ("ritz1", "ritz1_selfhosted")
-NO_METHOD_TEMPS = {c: 2262 for c in BOTH_RITZ1}
 NO_CHAINS = {c: 2295 for c in BOTH_RITZ1}
 NO_SPAN_EMPTY = {c: 2296 for c in BOTH_RITZ1}
 NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
@@ -184,8 +183,8 @@ NESTED = "var arr: [2]W = [W { p: P { x: 1 } }, W { p: P { x: 2 } }]\n    "
 # name -> (body of `g`, expected MADE, expected DROPS, {compiler: gap ticket})
 CASES = {
     # The ticket's program, and each kind of `self` on a Drop type.
-    "lent_self": ("make(1).peek()", 1, 1, NO_METHOD_TEMPS),
-    "mut_self": ("make(1).bump()", 1, 1, NO_METHOD_TEMPS),
+    "lent_self": ("make(1).peek()", 1, 1, {}),
+    "mut_self": ("make(1).bump()", 1, 1, {}),
     "value_self": ("make(1).burn()", 1, 1, {}),
     # The same on a type that copies.
     "copy_lent_self": ("mp().get()", 1, 0, {}),
@@ -263,7 +262,20 @@ fn g() -> i32
 pub fn main() -> i32
     g()
     return LAST * 10 + DROPS
-""", 61, NO_METHOD_TEMPS),
+""", 61, {}),
+
+    # So on a method's result: `again`'s temporary is the one `bump` writes
+    # and the one dropped first (AGAST #2262).
+    "drop_sees_the_mutation_chain": ("""\
+fn g() -> i32
+    var t = make(2)
+    t.again().bump()
+    return LAST
+
+pub fn main() -> i32
+    let last = g()
+    return last * 10 + DROPS
+""", 72, {}),
 
     # The receiver is evaluated before the arguments, and each once.
     # A loop body is emitted once: each pass evaluates the receiver once.
@@ -278,7 +290,7 @@ fn g() -> i32
 pub fn main() -> i32
     g()
     return MADE * 10 + DROPS
-""", 33, NO_METHOD_TEMPS),
+""", 33, {}),
 
     # One body, emitted per instantiation: what the first emission evaluated
     # doesn't carry over to the second.

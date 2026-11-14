@@ -143,6 +143,8 @@ pub fn own_init(s: *EmitterState)
     o.temp_exprs = malloc((OWN_INIT_CAP as i64) * 8) as **Expr
     o.temp_expr_count = 0
     o.temp_expr_cap = OWN_INIT_CAP
+    o.temp_last_reg = 0
+    o.temp_last_slot = 0
     o.temps = malloc((OWN_INIT_CAP as i64) * sizeof(OwnBinding)) as *OwnBinding
     o.temp_count = 0
     o.temp_cap = OWN_INIT_CAP
@@ -1092,6 +1094,16 @@ pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     emit_reg(s, slot)
     emit_str(s, c"\n")
     own_push_temp(s, slot, name, len, 0)
+    o.temp_last_reg = reg
+    o.temp_last_slot = slot
+
+# AGAST #2262: the slot own_note_temp just spilled `reg` to, or 0.  A method
+# receiver that is a temporary is passed as that slot, not a copy of it.
+pub fn own_temp_slot_of(s: *EmitterState, reg: i32) -> i32
+    let o: *OwnState = s.own
+    if reg == 0 or o.temp_last_reg != reg
+        return 0
+    o.temp_last_slot
 
 # 1 when the move check marked `e` a temporary; forgets the mark.
 fn own_take_temp_mark(o: *OwnState, e: *Expr) -> i32
@@ -1365,6 +1377,7 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     o.temp_expr_count = 0
     o.temp_count = 0
     o.stmt_mark = 0
+    o.temp_last_reg = 0   # registers restart per function
     o.loop_ev_count = 0
     o.loop_depth = 0
     o.last_pop_dead = 0
@@ -1765,12 +1778,14 @@ fn own_walk_member(s: *EmitterState, e: *Expr, mv: i32)
     own_fm_push(s.own, b.slot, path, line, col)
     own_emit_mask_bits(s, b, 1 << path, 1)
 
-# The move-only struct type a call returns by value (its length in
+# The move-only struct type a call or method call returns by value (its length in
 # *out_len), or null.
 fn own_call_ret_type(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
-    if e.kind != EXPR_CALL
-        return null
-    let f: *FnDef = find_call_fn(s, e)
+    var f: *FnDef = null
+    if e.kind == EXPR_CALL
+        f = find_call_fn(s, e)
+    else if e.kind == EXPR_METHOD
+        f = ref_method_def(s, e)   # AGAST #2262
     if f == null or f.return_type != TYPE_STRUCT or f.return_type_name_len <= 0
         return null
     if own_type_is_move_only(s, f.return_type_name, f.return_type_name_len) == 0
@@ -2022,14 +2037,16 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
             own_mark_temp(s, e)
     else if k == EXPR_METHOD
         # A by-value `self` takes the receiver, as a by-value param takes its
-        # argument (AGAST #2393).  Any other is passed by pointer.  A call result
-        # as receiver is not a temporary here: ritz1 drops no method's yet
-        # (AGAST #2262).
+        # argument (AGAST #2393).  Any other is passed by pointer, so a call
+        # result as receiver is lent: a temporary, dropped after the call
+        # (AGAST #2262).  When ritz1 can't find the method, such a receiver
+        # stays a move: a leak, where a by-value `self` dropped as a
+        # temporary too would be dropped twice.
         let m: *FnDef = own_recv_def(s, e)
         var rmv: i32 = 0
-        if e.left != null and e.left.kind == EXPR_CALL
-            rmv = 1
         let taken: *FnDef = ref_method_def(s, e)
+        if taken == null and e.left != null and (e.left.kind == EXPR_CALL or e.left.kind == EXPR_METHOD)
+            rmv = 1
         if taken != null and param_self_is_value(taken.params) == 1
             rmv = 1
         own_check_ref_receiver(s, e)
@@ -2040,6 +2057,9 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
             if mp != null
                 mp = mp.next
         own_walk_args(s, e.args, mp)
+        # A result nobody takes is a temporary, as a call's (AGAST #2262).
+        if mv == 0 and taken != null
+            own_mark_temp(s, e)
     else if k == EXPR_STRUCT_LIT
         var fi: *FieldInit = e.args as *FieldInit
         while fi != null
@@ -2774,6 +2794,7 @@ pub fn own_end_fn(s: *EmitterState, body_start: i64)
     o.temp_expr_count = 0
     o.temp_count = 0
     o.loop_ev_count = 0
+    o.temp_last_reg = 0   # registers restart per function
     o.loop_depth = 0
     o.defer_count = 0
     s.defer_live = 0

@@ -23,7 +23,7 @@ AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
 bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
 AGAST #2173 added assigning a move-only field (the old value drops),
 closed for both. AGAST #2257 added bindings and temporaries from a method
-call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262). AGAST
+call; ritz1 drops their temporaries since #2262. AGAST
 #2243 added bindings from a field, which ritz1 already got right. AGAST
 #2244 added moves out of a tuple element, closed for ritz0; for ritz1 by
 #2956 / #3005, except the rows citing their own tickets.
@@ -194,8 +194,9 @@ TUPLE_PTR_ELEM = {"ritz1": 3024, "ritz1_selfhosted": 3024}
 TUPLE_ALIAS = {"ritz1": 3030, "ritz1_selfhosted": 3030}
 TUPLE_TEMP_GAP = {"ritz1": 3031, "ritz1_selfhosted": 3031}
 
-# Method temporaries ritz1 doesn't drop yet.
-METHOD_TEMP_GAP = {"ritz1": 2262, "ritz1_selfhosted": 2262}
+# `@<call>` lent to a method: ritz0 crashes lowering it, ritz1 can't take
+# its address (AGAST #3050).
+LENT_TEMP_GAP = {"ritz0": 3050, "ritz1": 3050, "ritz1_selfhosted": 3050}
 
 # name -> (program body, expected exit status, {compiler: gap ticket}).
 # Where a helper returns `DROPS * 10`, the tens digit is the count at that
@@ -484,7 +485,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, METHOD_TEMP_GAP),
+""", 2, {}),
 
     # So does a literal of fields nobody takes (it leaked on ritz0 before).
     "field_element_array_temporary": (SLOT + FIELDS + """\
@@ -669,7 +670,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, METHOD_TEMP_GAP),
+""", 1, {}),
 
     "method_temp_field": (METHODS + """\
 fn f() -> i32
@@ -679,7 +680,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, METHOD_TEMP_GAP),
+""", 1, {}),
 
     # One evaluation, so one value to drop (AGAST #2261).
     "method_temp_receiver": (METHODS + """\
@@ -689,7 +690,19 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, METHOD_TEMP_GAP),
+""", 1, {}),
+
+    # Lent to a method, the result is still nobody's: it drops after the
+    # call (AGAST #3050).
+    "method_temp_lent_arg": (METHODS + """\
+fn f() -> i32
+    var s = Sink { n: 0 }
+    return s.look(@Tracked.new(1))
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, LENT_TEMP_GAP),
 
     "scope_end_let": ("""\
 fn f()
@@ -2036,7 +2049,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, METHOD_TEMP_GAP),
+""", 2, {}),
 
     "tuple_element_match": (TUPLES + SLOT + """\
 fn f()
