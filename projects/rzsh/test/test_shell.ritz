@@ -1,0 +1,171 @@
+# test/test_shell.ritz - run_line end to end (AGAST #2461)
+#
+# Each case runs one line through shell.run_line in a forked child (so `cd`
+# and variables don't leak between tests) with its stdout piped back.
+# Before #2461: cd was an external command with no effect, $X/$? stayed
+# literal, and `>`/`|` were passed to the command as arguments.
+
+import ritzlib.sys {
+    sys_read, sys_pipe, sys_fork, sys_dup2, sys_close, sys_exit, sys_wait4,
+    sys_mkdir, sys_rmdir, sys_unlink, sys_getpid
+}
+import ritzlib.str { strlen, strcpy, strcat }
+import ritzlib.fmt { fmt_i64_into }
+
+import src.shell { run_line }
+
+var g_out: [512]u8
+var g_out_len: i64 = 0
+
+fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < cap
+        n = sys_read(fd, buf + got, cap - got)
+        if n > 0
+            got = got + n
+    got
+
+# 0 when the captured stdout is exactly `want`.
+fn out_differs(want: *u8) -> i32
+    let wl: i64 = strlen(want)
+    if g_out_len != wl
+        return 1
+    var i: i64 = 0
+    while i < g_out_len
+        if g_out[i as i32] != *(want + i)
+            return 2
+        i += 1
+    0
+
+# Runs `line` in a child; returns run_line's status, stdout in g_out.
+fn run(line: *u8) -> i32
+    var o: [2]i32
+    sys_pipe(@o[0])
+    let pid: i32 = sys_fork()
+    if pid == 0
+        sys_dup2(o[1], 1)
+        sys_close(o[0])
+        sys_close(o[1])
+        sys_exit(run_line(line))
+    sys_close(o[1])
+    g_out_len = read_all(o[0], @g_out[0], 512)
+    sys_close(o[0])
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    (status >> 8) & 255
+
+# A scratch dir in the cwd, named per process: ".rzsh_test_<pid>".
+var g_dir: [64]u8
+var g_path: [128]u8
+
+fn scratch_dir() -> *u8
+    strcpy(@g_dir[0], c".rzsh_test_")
+    let len: i64 = strlen(@g_dir[0])
+    let n: i64 = fmt_i64_into(@g_dir[0] + len, sys_getpid() as i64)
+    g_dir[(len + n) as i32] = 0
+    sys_mkdir(@g_dir[0], 448)
+    @g_dir[0]
+
+fn in_dir(name: *u8) -> *u8
+    strcpy(@g_path[0], @g_dir[0])
+    strcat(@g_path[0], c"/")
+    strcat(@g_path[0], name)
+    @g_path[0]
+
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_cd_changes_directory() -> i32
+    assert run(c"cd / ; pwd") == 0
+    assert out_differs(c"/\n") == 0
+    assert run(c"cd /nonexistent_2461 ; pwd") == 0
+    assert out_differs(c"") != 0   # pwd still ran, in the old directory
+    assert run(c"cd /nonexistent_2461") == 1
+    0
+
+[[test]]
+fn test_variables_expand() -> i32
+    assert run(c"export X=5 ; echo X=$X") == 0
+    assert out_differs(c"X=5\n") == 0
+    assert run(c"Y=a ; Y=${Y}b ; echo \"$Y\" '$Y'") == 0
+    assert out_differs(c"ab $Y\n") == 0
+    0
+
+[[test]]
+fn test_exported_reaches_child() -> i32
+    # Only exported variables go into an external command's environment.
+    assert run(c"export X=5 ; L=1 ; env | grep -c -e ^X=5 -e ^L=") == 0
+    assert out_differs(c"1\n") == 0
+    0
+
+[[test]]
+fn test_status_expands() -> i32
+    assert run(c"false ; echo status=$?") == 0
+    assert out_differs(c"status=1\n") == 0
+    assert run(c"true ; echo status=$?") == 0
+    assert out_differs(c"status=0\n") == 0
+    assert run(c"no_such_command_2461 ; echo $?") == 0
+    assert out_differs(c"127\n") == 0
+    assert run(c"false") == 1
+    0
+
+[[test]]
+fn test_redirect_out_append_in() -> i32
+    scratch_dir()
+    # Paths name the scratch dir directly, so a broken `cd` or `;` can't
+    # make the test write into its cwd.
+    let f: *u8 = in_dir(c"f.txt")
+    var line: [256]u8
+    strcpy(@line[0], c"echo one > ")
+    strcat(@line[0], f)
+    strcat(@line[0], c" ; echo two >> ")
+    strcat(@line[0], f)
+    strcat(@line[0], c" ; echo shown ; cat < ")
+    strcat(@line[0], f)
+    let st: i32 = run(@line[0])
+    sys_unlink(f)
+    sys_rmdir(@g_dir[0])
+    assert st == 0
+    # The builtin's redirect is undone: "shown" reached the real stdout.
+    assert out_differs(c"shown\none\ntwo\n") == 0
+    0
+
+[[test]]
+fn test_redirect_truncates_external() -> i32
+    scratch_dir()
+    let g: *u8 = in_dir(c"g.txt")
+    var line: [256]u8
+    strcpy(@line[0], c"echo long-line > ")
+    strcat(@line[0], g)
+    strcat(@line[0], c" ; printf x > ")
+    strcat(@line[0], g)
+    strcat(@line[0], c" ; cat ")
+    strcat(@line[0], g)
+    let st: i32 = run(@line[0])
+    sys_unlink(g)
+    sys_rmdir(@g_dir[0])
+    assert st == 0
+    assert out_differs(c"x") == 0
+    0
+
+[[test]]
+fn test_pipe() -> i32
+    assert run(c"echo piped | tr p P") == 0
+    assert out_differs(c"PiPed\n") == 0
+    assert run(c"echo abc | tr a A | tr c C") == 0
+    assert out_differs(c"AbC\n") == 0
+    # A pipeline's status is its last command's.
+    assert run(c"echo x | false") == 1
+    assert run(c"false | cat ; echo $?") == 0
+    assert out_differs(c"0\n") == 0
+    0
+
+[[test]]
+fn test_syntax_errors() -> i32
+    assert run(c"echo 'open") == 2
+    assert run(c"echo a | | cat") == 2
+    assert run(c"echo a >") == 2
+    assert run(c"| cat") == 2
+    assert out_differs(c"") == 0
+    0

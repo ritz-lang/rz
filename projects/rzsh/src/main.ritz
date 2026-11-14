@@ -12,17 +12,18 @@ import common {
     line_clear, line_add_char, line_backspace, line_delete,
     line_cursor_left, line_cursor_right, line_cursor_home, line_cursor_end,
     line_kill_to_end, line_kill_to_start, line_set, line_length, line_cursor_pos,
-    g_argv, parse_args,
-    cmd_help, cmd_exit, cmd_pid, cmd_echo, cmd_clear, print_prompt,
-    MAX_LINE, MAX_ARGS, MAX_PATH,
+    print_prompt,
+    MAX_LINE,
     STDIN, STDOUT, STDERR
 }
 
 import os {
-    os_readdir, os_spawn_and_wait, os_yield,
-    os_default_ls_path, os_bin_path_1, os_bin_path_2,
+    os_yield, os_environ, os_input_ended,
     os_enable_raw_mode, os_disable_raw_mode, os_is_raw_mode
 }
+
+import parse { g_environ }
+import shell { run_line }
 
 import input {
     input_reset, input_parse_byte, input_in_escape, input_get_char,
@@ -55,137 +56,14 @@ fn version_string() -> *u8
     return c"rzsh - Ritz Shell v0.1 (harland)"
 
 # ============================================================================
-# ls command
-# ============================================================================
-
-fn cmd_ls(argc: i32) -> i32
-    var path: *u8 = os_default_ls_path()
-    if argc > 1
-        path = g_argv[1]
-
-    var buf: [4096]u8
-    let n: i64 = os_readdir(path, @buf[0], 4096)
-
-    if n < 0
-        puts(c"ls: cannot access '")
-        puts(path)
-        println(c"'")
-        return 1
-
-    var pos: i64 = 0
-    while pos < n
-        let entry: *u8 = @buf[0] + pos
-        let entry_len: i64 = strlen(entry)
-        if entry_len > 0
-            puts(c"  ")
-            println(entry)
-        pos = pos + entry_len + 1
-
-    return 0
-
-# ============================================================================
-# External Command Execution
-# ============================================================================
-
-fn exec_external(argc: i32) -> i32
-    let cmd: *u8 = g_argv[0]
-
-    var path_buf: [256]u8
-    var path: *u8 = cmd
-
-    if *cmd != 47  # Not starting with '/'
-        # Build full path: prefix + cmd
-        let prefix: *u8 = os_bin_path_1()
-        var prefix_len: i64 = strlen(prefix)
-        var i: i64 = 0
-
-        # Copy prefix
-        while i < prefix_len
-            path_buf[i as i32] = *(prefix + i)
-            i = i + 1
-
-        # Copy command
-        var j: i64 = 0
-        while *(cmd + j) != 0 and (i + j) < MAX_PATH - 1
-            path_buf[(i + j) as i32] = *(cmd + j)
-            j = j + 1
-        path_buf[(i + j) as i32] = 0
-        path = @path_buf[0]
-
-    let orig_argv0: *u8 = g_argv[0]
-    g_argv[0] = path
-
-    let result: i32 = os_spawn_and_wait(path, @g_argv[0], argc)
-
-    g_argv[0] = orig_argv0
-
-    if result < 0
-        # Try second path
-        let prefix2: *u8 = os_bin_path_2()
-        var prefix_len: i64 = strlen(prefix2)
-        var i: i64 = 0
-
-        # Copy prefix
-        while i < prefix_len
-            path_buf[i as i32] = *(prefix2 + i)
-            i = i + 1
-
-        # Copy command
-        var j: i64 = 0
-        while *(cmd + j) != 0 and (i + j) < MAX_PATH - 1
-            path_buf[(i + j) as i32] = *(cmd + j)
-            j = j + 1
-        path_buf[(i + j) as i32] = 0
-        path = @path_buf[0]
-
-        g_argv[0] = path
-        let result2: i32 = os_spawn_and_wait(path, @g_argv[0], argc)
-        g_argv[0] = orig_argv0
-
-        if result2 < 0
-            puts(c"rzsh: command not found: ")
-            println(cmd)
-            return 127
-
-        return result2
-
-    return result
-
-# ============================================================================
 # Command Dispatch
 # ============================================================================
 
 fn process_line() -> i32
     if g_line_pos == 0
         return 0
-
     g_line_buffer[g_line_pos as i32] = 0
-
-    let argc: i32 = parse_args(@g_line_buffer[0])
-    if argc == 0
-        return 0
-
-    let cmd: *u8 = g_argv[0]
-
-    if strcmp(cmd, c"help") == 0
-        return cmd_help()
-
-    if strcmp(cmd, c"exit") == 0
-        return cmd_exit(argc)
-
-    if strcmp(cmd, c"pid") == 0
-        return cmd_pid()
-
-    if strcmp(cmd, c"echo") == 0
-        return cmd_echo(argc)
-
-    if strcmp(cmd, c"ls") == 0
-        return cmd_ls(argc)
-
-    if strcmp(cmd, c"clear") == 0
-        return cmd_clear()
-
-    return exec_external(argc)
+    return run_line(@g_line_buffer[0])
 
 # ============================================================================
 # Help message
@@ -206,6 +84,12 @@ fn print_help()
     println(c"  echo ...  Print arguments")
     println(c"  ls [DIR]  List directory contents")
     println(c"  clear     Clear the screen")
+    println(c"  cd [DIR]  Change directory      pwd        Print it")
+    println(c"  export N[=V], unset N, N=V      Shell variables")
+    println(c"")
+    println(c"Syntax: $N ${N} $? expansion, '...' and double quotes, \\x,")
+    println(c"  a ; b, # comments. Linux only: a > f, a >> f, a < f, a | b.")
+    println(c"  Not supported: &&, ||, &, globbing, $(...), here-docs.")
 
 # ============================================================================
 # Redraw line from cursor position
@@ -234,6 +118,8 @@ fn redraw_line_from_cursor()
 # ============================================================================
 
 pub fn main(argc: i32, argv: **u8) -> i32
+    g_environ = os_environ(argc, argv)
+
     # Check for --help flag (for non-interactive testing)
     if argc > 1
         let arg: *u8 = *(argv + 1)
@@ -408,6 +294,9 @@ pub fn main(argc: i32, argv: **u8) -> i32
 
                 # Other keys (TAB, CTRL_W, etc.) can be added later
 
+            else if os_input_ended(n)
+                running = 0
+                reading = 0
             else
                 os_yield()
 

@@ -10,7 +10,8 @@ import ritzlib.sys {
     # Common
     sys_read, sys_write,
     # Linux-specific (only used when target_os=linux)
-    sys_open, sys_close, sys_getdents64, sys_fork, sys_execve, sys_wait4, sys_exit,
+    sys_open, sys_open3, sys_close, sys_getdents64, sys_fork, sys_execve, sys_wait4, sys_exit,
+    sys_pipe, sys_dup, sys_dup2, sys_chdir, sys_getcwd,
     O_RDONLY, O_DIRECTORY,
     tcgetattr, tcsetattr, Termios,
     ECHO, ICANON, ISIG, IEXTEN, ICRNL, IXON,
@@ -75,47 +76,232 @@ pub fn os_readdir(path: *u8, buf: *u8, buf_size: i64) -> i64
 # Process spawning
 # ============================================================================
 
-# Linux: fork + execve + wait4
-[[target_os = "linux"]]
-pub fn os_spawn_and_wait(path: *u8, argv: **u8, argc: i32) -> i32
-    let pid: i32 = sys_fork()
+# os_spawn_search runs `cmd` with `argv` (argv[argc] must be null) and
+# returns its exit status. A `cmd` containing '/' is run as given; otherwise
+# each ':'-separated directory of `search` is tried in turn. Returns 127 (after
+# printing "command not found" to stderr) when nothing could be executed.
 
-    if pid < 0
+fn has_slash(s: *u8) -> bool
+    var i: i64 = 0
+    while *(s + i) != 0
+        if *(s + i) == 47
+            return true
+        i = i + 1
+    return false
+
+# Writes "<dir>/<cmd>" for the directory of `search` starting at `pos` into
+# `buf`. Returns the index of the next directory, or -1 when none are left.
+fn next_candidate(search: *u8, pos: i64, cmd: *u8, buf: *u8, cap: i64) -> i64
+    if *(search + pos) == 0
         return -1
+    var end: i64 = pos
+    while *(search + end) != 0 and *(search + end) != 58
+        end = end + 1
+    var n: i64 = 0
+    var i: i64 = pos
+    while i < end and n < cap - 2
+        *(buf + n) = *(search + i)
+        n = n + 1
+        i = i + 1
+    if n == 0  # an empty PATH entry means the current directory
+        *(buf + n) = 46
+        n = n + 1
+    if *(buf + n - 1) != 47
+        *(buf + n) = 47
+        n = n + 1
+    i = 0
+    while *(cmd + i) != 0 and n < cap - 1
+        *(buf + n) = *(cmd + i)
+        n = n + 1
+        i = i + 1
+    *(buf + n) = 0
+    if *(search + end) == 58
+        return end + 1
+    return end
+
+fn not_found(cmd: *u8)
+    let msg: *u8 = c"rzsh: command not found: "
+    sys_write(2, msg, strlen(msg))
+    sys_write(2, cmd, strlen(cmd))
+    var nl: u8 = 10
+    sys_write(2, @nl, 1)
+
+# Linux: fork, then the child tries each candidate with execve.
+[[target_os = "linux"]]
+pub fn os_spawn_search(cmd: *u8, search: *u8, argv: **u8, envp: **u8) -> i32
+    let pid: i32 = sys_fork()
+    if pid < 0
+        return 126
 
     if pid == 0
-        # Child process
-        # Null-terminate argv
-        *(argv + argc) = null
-
-        var envp: [1]*u8
-        envp[0] = null
-
-        sys_execve(path, argv, @envp[0])
-
-        # If execve returns, it failed
+        if has_slash(cmd)
+            sys_execve(cmd, argv, envp)
+        else
+            var buf: [512]u8
+            var pos: i64 = 0
+            while pos >= 0
+                pos = next_candidate(search, pos, cmd, @buf[0], 512)
+                if pos >= 0
+                    sys_execve(@buf[0], argv, envp)
+        not_found(cmd)
         sys_exit(127)
 
-    # Parent process - wait for child
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
+    return os_wait(pid)
 
-    return (status >> 8) & 255
-
-# Harland: sys_spawn_args + sys_wait
+# Harland: try sys_spawn_args on each candidate until one starts. No
+# environment is passed (harland has none).
 [[target_os = "harland"]]
-pub fn os_spawn_and_wait(path: *u8, argv: **u8, argc: i32) -> i32
-    let pid: i64 = sys_spawn_args(path, argv, argc)
+pub fn os_spawn_search(cmd: *u8, search: *u8, argv: **u8, envp: **u8) -> i32
+    var argc: i32 = 0
+    while *(argv + argc) != null
+        argc = argc + 1
+
+    var pid: i64 = -1
+    if has_slash(cmd)
+        pid = sys_spawn_args(cmd, argv, argc)
+    else
+        var buf: [512]u8
+        var pos: i64 = 0
+        while pos >= 0 and pid < 0
+            pos = next_candidate(search, pos, cmd, @buf[0], 512)
+            if pos >= 0
+                pid = sys_spawn_args(@buf[0], argv, argc)
 
     if pid < 0
-        return -1
+        not_found(cmd)
+        return 127
+    return sys_wait(pid as i32) as i32
 
-    let status: i64 = sys_wait(pid as i32)
-    return status as i32
+# ============================================================================
+# Process and file-descriptor control (pipes, redirection)
+# ============================================================================
+# Linux has fork/pipe/dup2, so `|`, `>`, `>>` and `<` work. Harland has none
+# of these syscalls yet: os_has_fd_control() is false there and the shell
+# reports those operators as unsupported instead of calling the stubs below.
+
+# Waits for `pid`; its exit code, or 128+signal when a signal killed it.
+[[target_os = "linux"]]
+pub fn os_wait(pid: i32) -> i32
+    var status: i32 = 0
+    if sys_wait4(pid, @status, 0, null) < 0
+        return 1
+    if (status & 127) != 0
+        return 128 + (status & 127)
+    return (status >> 8) & 255
+
+[[target_os = "linux"]]
+pub fn os_has_fd_control() -> bool
+    return true
+
+[[target_os = "linux"]]
+pub fn os_fork() -> i32
+    return sys_fork()
+
+[[target_os = "linux"]]
+pub fn os_pipe(fds: *i32) -> i32
+    return sys_pipe(fds)
+
+[[target_os = "linux"]]
+pub fn os_dup(fd: i32) -> i32
+    return sys_dup(fd)
+
+[[target_os = "linux"]]
+pub fn os_dup2(oldfd: i32, newfd: i32) -> i32
+    return sys_dup2(oldfd, newfd)
+
+[[target_os = "linux"]]
+pub fn os_close(fd: i32) -> i32
+    return sys_close(fd)
+
+# O_WRONLY|O_CREAT|O_TRUNC = 577, O_WRONLY|O_CREAT|O_APPEND = 1089, mode 0644
+# (ritzlib.sys keeps those O_* private).
+[[target_os = "linux"]]
+pub fn os_open_write(path: *u8, append: bool) -> i32
+    if append
+        return sys_open3(path, 1089, 420)
+    return sys_open3(path, 577, 420)
+
+[[target_os = "linux"]]
+pub fn os_open_read(path: *u8) -> i32
+    return sys_open(path, O_RDONLY)
+
+[[target_os = "harland"]]
+pub fn os_wait(pid: i32) -> i32
+    return sys_wait(pid) as i32
+
+[[target_os = "harland"]]
+pub fn os_has_fd_control() -> bool
+    return false
+
+[[target_os = "harland"]]
+pub fn os_fork() -> i32
+    return -1
+
+[[target_os = "harland"]]
+pub fn os_pipe(fds: *i32) -> i32
+    return -1
+
+[[target_os = "harland"]]
+pub fn os_dup(fd: i32) -> i32
+    return -1
+
+[[target_os = "harland"]]
+pub fn os_dup2(oldfd: i32, newfd: i32) -> i32
+    return -1
+
+[[target_os = "harland"]]
+pub fn os_close(fd: i32) -> i32
+    return -1
+
+[[target_os = "harland"]]
+pub fn os_open_write(path: *u8, append: bool) -> i32
+    return -1
+
+[[target_os = "harland"]]
+pub fn os_open_read(path: *u8) -> i32
+    return -1
+
+# ============================================================================
+# Working directory
+# ============================================================================
+
+pub fn os_chdir(path: *u8) -> i32
+    return sys_chdir(path)
+
+# Fills `buf` with the NUL-terminated cwd. Returns < 0 on error.
+pub fn os_getcwd(buf: *u8, size: i64) -> i64
+    return sys_getcwd(buf, size)
+
+# ============================================================================
+# Environment
+# ============================================================================
+
+# Linux: the kernel puts envp right after argv's terminating NULL.
+[[target_os = "linux"]]
+pub fn os_environ(argc: i32, argv: **u8) -> **u8
+    if argv == null
+        return null
+    return argv + (argc as i64) + 1
+
+[[target_os = "harland"]]
+pub fn os_environ(argc: i32, argv: **u8) -> **u8
+    return null
 
 # ============================================================================
 # Input waiting
 # ============================================================================
+
+# True when a stdin read result means "no more input, ever". On Linux a
+# blocking read returns 0 only at EOF (a closed pipe, ^D in cooked mode):
+# without this the shell spun on EOF forever. EINTR (-4) is not the end.
+[[target_os = "linux"]]
+pub fn os_input_ended(n: i64) -> bool
+    return n == 0 or (n < 0 and n != -4)
+
+# Harland's console read is non-blocking: 0 just means nothing yet.
+[[target_os = "harland"]]
+pub fn os_input_ended(n: i64) -> bool
+    return false
 
 # Linux: blocking read handles waiting, no need to do anything
 [[target_os = "linux"]]
@@ -144,21 +330,14 @@ pub fn os_default_ls_path() -> *u8
 # Search paths for external commands
 # ============================================================================
 
+# Used when $PATH is unset.
 [[target_os = "linux"]]
-pub fn os_bin_path_1() -> *u8
-    return c"/usr/bin/"
-
-[[target_os = "linux"]]
-pub fn os_bin_path_2() -> *u8
-    return c"/bin/"
+pub fn os_default_path() -> *u8
+    return c"/usr/local/bin:/usr/bin:/bin"
 
 [[target_os = "harland"]]
-pub fn os_bin_path_1() -> *u8
-    return c"/bin/"
-
-[[target_os = "harland"]]
-pub fn os_bin_path_2() -> *u8
-    return c"/bin/"  # Only one path on Harland for now
+pub fn os_default_path() -> *u8
+    return c"/bin"
 
 # ============================================================================
 # Terminal raw mode

@@ -1,0 +1,363 @@
+# shell.ritz - rzsh command execution (AGAST #2461)
+#
+# run_line() takes one input line through parse.tokenize() and runs it:
+#
+#   list       pipeline ; pipeline ; ...
+#   pipeline   command | command | ...         (Linux only)
+#   command    [NAME=VALUE...] | word... [< file] [> file] [>> file]
+#
+# Builtins run in the shell process (so `cd` and `export` stick); a
+# redirection around a builtin swaps fds 0/1 for its duration. Each stage of
+# a pipeline runs in a forked child. `$?` is the last command's status.
+
+import common {
+    puts, println, putchar, print_int,
+    g_argv, cmd_help, cmd_exit, cmd_pid, cmd_echo, cmd_clear,
+    MAX_ARGS
+}
+
+import parse {
+    tokenize, g_tok_kind, g_tok_word, g_tok_count, g_last_status,
+    g_tok_next, TOK_WORD, TOK_PIPE, TOK_OUT, TOK_APPEND, TOK_IN,
+    PARSE_UNTERMINATED,
+    var_set, var_lookup, var_unset, var_export, assignment_pos, is_valid_name,
+    var_exported_name, var_value, vars_build_envp, MAX_VARS
+}
+
+import os {
+    os_readdir, os_default_ls_path, os_default_path, os_spawn_search,
+    os_has_fd_control, os_fork, os_pipe, os_dup, os_dup2, os_close,
+    os_open_write, os_open_read, os_wait, os_chdir, os_getcwd,
+    os_disable_raw_mode
+}
+
+import ritzlib.sys { sys_write, sys_exit }
+import ritzlib.str { strlen, strcmp }
+
+const MAX_STAGES: i32 = 16
+
+# ============================================================================
+# stderr
+# ============================================================================
+
+fn eputs(s: *u8)
+    sys_write(2, s, strlen(s))
+
+fn eputs3(a: *u8, b: *u8, c: *u8)
+    eputs(a)
+    eputs(b)
+    eputs(c)
+
+# ============================================================================
+# Builtins
+# ============================================================================
+
+fn cmd_cd(argc: i32) -> i32
+    var dir: *u8 = null
+    if argc > 2
+        eputs(c"rzsh: cd: too many arguments\n")
+        return 1
+    if argc == 2
+        dir = g_argv[1]
+    else
+        dir = var_lookup(c"HOME", 4)
+        if dir == null
+            dir = c"/"
+    if os_chdir(dir) != 0
+        eputs3(c"rzsh: cd: ", dir, c": cannot change directory\n")
+        return 1
+    return 0
+
+fn cmd_pwd() -> i32
+    var buf: [4096]u8
+    if os_getcwd(@buf[0], 4096) < 0
+        eputs(c"rzsh: pwd: cannot get working directory\n")
+        return 1
+    println(@buf[0])
+    return 0
+
+fn cmd_export(argc: i32) -> i32
+    if argc == 1
+        var idx: i32 = 0
+        while idx < MAX_VARS
+            let name: *u8 = var_exported_name(idx)
+            if name != null
+                puts(c"export ")
+                puts(name)
+                puts(c"=")
+                println(var_value(idx))
+            idx = idx + 1
+        return 0
+
+    var status: i32 = 0
+    var i: i32 = 1
+    while i < argc
+        let arg: *u8 = g_argv[i]
+        let eq: i64 = assignment_pos(arg)
+        if eq >= 0
+            if var_set(arg, eq, arg + eq + 1, strlen(arg + eq + 1), 1) != 0
+                eputs3(c"rzsh: export: cannot set ", arg, c"\n")
+                status = 1
+        else if is_valid_name(arg, strlen(arg))
+            var_export(arg, strlen(arg))  # exporting an unset name is a no-op
+        else
+            eputs3(c"rzsh: export: not a valid name: ", arg, c"\n")
+            status = 1
+        i = i + 1
+    return status
+
+fn cmd_unset(argc: i32) -> i32
+    var i: i32 = 1
+    while i < argc
+        var_unset(g_argv[i], strlen(g_argv[i]))
+        i = i + 1
+    return 0
+
+pub fn cmd_ls(argc: i32) -> i32
+    var path: *u8 = os_default_ls_path()
+    if argc > 1
+        path = g_argv[1]
+
+    var buf: [4096]u8
+    let n: i64 = os_readdir(path, @buf[0], 4096)
+
+    if n < 0
+        eputs3(c"ls: cannot access '", path, c"'\n")
+        return 1
+
+    var pos: i64 = 0
+    while pos < n
+        let entry: *u8 = @buf[0] + pos
+        let entry_len: i64 = strlen(entry)
+        if entry_len > 0
+            puts(c"  ")
+            println(entry)
+        pos = pos + entry_len + 1
+
+    return 0
+
+fn exec_external(argc: i32) -> i32
+    g_argv[argc] = null
+    var envp: [128]*u8
+    vars_build_envp(@envp[0], 128)
+    var search: *u8 = var_lookup(c"PATH", 4)
+    if search == null
+        search = os_default_path()
+    return os_spawn_search(g_argv[0], search, @g_argv[0], @envp[0])
+
+# The builtin `ls` takes only `ls [DIR]`; with options, the system's ls runs.
+fn has_option(argc: i32) -> bool
+    var i: i32 = 1
+    while i < argc
+        if *g_argv[i] == 45
+            return true
+        i = i + 1
+    return false
+
+# Runs g_argv[0..argc] as a builtin or external command.
+fn dispatch(argc: i32) -> i32
+    let cmd: *u8 = g_argv[0]
+    if strcmp(cmd, c"cd") == 0
+        return cmd_cd(argc)
+    if strcmp(cmd, c"pwd") == 0
+        return cmd_pwd()
+    if strcmp(cmd, c"export") == 0
+        return cmd_export(argc)
+    if strcmp(cmd, c"unset") == 0
+        return cmd_unset(argc)
+    if strcmp(cmd, c"help") == 0
+        return cmd_help()
+    if strcmp(cmd, c"exit") == 0
+        os_disable_raw_mode()
+        return cmd_exit(argc)
+    if strcmp(cmd, c"pid") == 0
+        return cmd_pid()
+    if strcmp(cmd, c"echo") == 0
+        return cmd_echo(argc)
+    if strcmp(cmd, c"ls") == 0 and not has_option(argc)
+        return cmd_ls(argc)
+    if strcmp(cmd, c"clear") == 0
+        return cmd_clear()
+    return exec_external(argc)
+
+# ============================================================================
+# Simple command: words + redirections over tokens [start, end)
+# ============================================================================
+
+fn run_command(start: i32, end: i32) -> i32
+    var argc: i32 = 0
+    var out_path: *u8 = null
+    var out_append: bool = false
+    var in_path: *u8 = null
+
+    var t: i32 = start
+    while t < end
+        let kind: i32 = g_tok_kind[t]
+        if kind == TOK_WORD
+            if argc >= MAX_ARGS - 1
+                eputs(c"rzsh: too many arguments\n")
+                return 2
+            g_argv[argc] = g_tok_word[t]
+            argc = argc + 1
+        else
+            if t + 1 >= end or g_tok_kind[t + 1] != TOK_WORD
+                eputs(c"rzsh: syntax error: redirection needs a file name\n")
+                return 2
+            if kind == TOK_IN
+                in_path = g_tok_word[t + 1]
+            else
+                out_path = g_tok_word[t + 1]
+                out_append = kind == TOK_APPEND
+            t = t + 1
+        t = t + 1
+
+    # NAME=VALUE ... with no command sets shell variables.
+    if argc > 0 and assignment_pos(g_argv[0]) >= 0
+        var all: bool = true
+        var i: i32 = 0
+        while i < argc
+            if assignment_pos(g_argv[i]) < 0
+                all = false
+            i = i + 1
+        if all
+            i = 0
+            while i < argc
+                let a: *u8 = g_argv[i]
+                let eq: i64 = assignment_pos(a)
+                if var_set(a, eq, a + eq + 1, strlen(a + eq + 1), 0) != 0
+                    eputs3(c"rzsh: cannot set ", a, c"\n")
+                    return 1
+                i = i + 1
+            return 0
+
+    if out_path == null and in_path == null
+        if argc == 0
+            return 0
+        return dispatch(argc)
+
+    if not os_has_fd_control()
+        eputs(c"rzsh: redirection is not supported on this system\n")
+        return 2
+
+    var saved_in: i32 = -1
+    var saved_out: i32 = -1
+    if in_path != null
+        let fd: i32 = os_open_read(in_path)
+        if fd < 0
+            eputs3(c"rzsh: cannot open ", in_path, c"\n")
+            return 1
+        saved_in = os_dup(0)
+        os_dup2(fd, 0)
+        os_close(fd)
+    if out_path != null
+        let fd: i32 = os_open_write(out_path, out_append)
+        if fd < 0
+            eputs3(c"rzsh: cannot create ", out_path, c"\n")
+            if saved_in >= 0
+                os_dup2(saved_in, 0)
+                os_close(saved_in)
+            return 1
+        saved_out = os_dup(1)
+        os_dup2(fd, 1)
+        os_close(fd)
+
+    var status: i32 = 0
+    if argc > 0
+        status = dispatch(argc)
+
+    if saved_out >= 0
+        os_dup2(saved_out, 1)
+        os_close(saved_out)
+    if saved_in >= 0
+        os_dup2(saved_in, 0)
+        os_close(saved_in)
+    return status
+
+# ============================================================================
+# Pipeline over tokens [start, end)
+# ============================================================================
+
+fn run_pipeline(start: i32, end: i32) -> i32
+    # Stage boundaries; an empty stage is a syntax error.
+    var bounds: [17]i32
+    var stages: i32 = 0
+    bounds[0] = start
+    var t: i32 = start
+    while t <= end
+        if t == end or g_tok_kind[t] == TOK_PIPE
+            if t == bounds[stages]
+                eputs(c"rzsh: syntax error near '|'\n")
+                return 2
+            if stages >= MAX_STAGES
+                eputs(c"rzsh: pipeline too long\n")
+                return 2
+            stages = stages + 1
+            bounds[stages] = t + 1
+        t = t + 1
+
+    if stages == 1
+        return run_command(start, end)
+
+    if not os_has_fd_control()
+        eputs(c"rzsh: pipes are not supported on this system\n")
+        return 2
+
+    var pids: [16]i32
+    var prev_read: i32 = -1
+    var s: i32 = 0
+    while s < stages
+        let last: bool = s == stages - 1
+        var fds: [2]i32
+        if not last
+            if os_pipe(@fds[0]) < 0
+                eputs(c"rzsh: pipe failed\n")
+                return 1
+        let pid: i32 = os_fork()
+        if pid == 0
+            if prev_read >= 0
+                os_dup2(prev_read, 0)
+                os_close(prev_read)
+            if not last
+                os_dup2(fds[1], 1)
+                os_close(fds[1])
+                os_close(fds[0])
+            sys_exit(run_command(bounds[s], bounds[s + 1] - 1))
+        if prev_read >= 0
+            os_close(prev_read)
+            prev_read = -1
+        if not last
+            os_close(fds[1])
+            prev_read = fds[0]
+        pids[s] = pid
+        s = s + 1
+
+    var status: i32 = 0
+    s = 0
+    while s < stages
+        if pids[s] > 0
+            status = os_wait(pids[s])
+        else
+            status = 1
+        s = s + 1
+    return status
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+# Runs one input line; returns (and records for `$?`) the last status.
+pub fn run_line(line: *u8) -> i32
+    var pos: i64 = 0
+    while pos >= 0
+        let n: i32 = tokenize(line, pos)
+        if n < 0
+            if n == PARSE_UNTERMINATED
+                eputs(c"rzsh: syntax error: unterminated quote\n")
+            else
+                eputs(c"rzsh: line too long\n")
+            g_last_status = 2
+            return 2
+        if n > 0
+            g_last_status = run_pipeline(0, n)
+        pos = g_tok_next
+    return g_last_status

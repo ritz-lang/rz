@@ -24,7 +24,7 @@ does, after `./rz build --all`, using the debug binaries that step built:
             hot reload reaps it; zeus logs each line in one write(2)
   hollow    sage, goliath, rzrz and ritz-lsp must not report success for
             work they did not do
-  rzsh      the Linux shell: echo, cd, $X, $?, >, |, external commands
+  rzsh      the Linux shell: echo, cd, $X, $?, >, |, external commands, EOF
 
 What fails today is a STRICT xfail citing the child ticket that owns the
 bug (XFAILS below). A check that starts passing fails the run (XPASS) until
@@ -89,12 +89,6 @@ XFAILS: dict[str, str] = {
     "help:zeus/test_client": "#2462 prints its usage and exits 1",
     # hollow entry points (#2460 made the rest honest; sage still runs nothing)
     "hollow.sage_runs_js": "#2787 sage has no interpreter: `sage t.js` exits 1 'not implemented'",
-    # rzsh (#2461)
-    "rzsh.cd": "#2461 cd does not change directory",
-    "rzsh.var": "#2461 $X is not expanded",
-    "rzsh.status": "#2461 $? is not expanded",
-    "rzsh.redirect": "#2461 > is passed to echo as an argument",
-    "rzsh.pipe": "#2461 | is ignored",
 }
 
 IO_TIMEOUT = 1.5      # a server that has not answered in this long is not going to
@@ -1507,7 +1501,16 @@ def suite_rzsh(r: Reporter, tmp: Path) -> None:
     r.run("rzsh.var", lambda: expect_line("export X=5\necho X=$X", "X=5"))
     r.run("rzsh.status", lambda: expect_line("false\necho status=$?", "status=1"))
     r.run("rzsh.redirect", redirect)
-    r.run("rzsh.pipe", lambda: expect_line("echo piped | /usr/bin/tr p P", "Piped"))
+    r.run("rzsh.pipe", lambda: expect_line("echo piped | /usr/bin/tr p P", "PiPed"))
+
+    def eof():
+        # No trailing `exit`: end of stdin must end the shell (it used to spin).
+        rzsh = binary("rzsh/build/debug/rzsh.linux")
+        res = run_cmd([str(rzsh)], work, stdin=b"echo before-eof\n", timeout=5)
+        if res.returncode != 0 or "before-eof" not in res.stdout.decode(errors="replace").split():
+            raise CheckFailed(f"rc={res.returncode} stdout {short(res.stdout, 80)}")
+
+    r.run("rzsh.eof", eof)
 
 
 # --------------------------------------------------------------------------

@@ -1,0 +1,189 @@
+# test/test_parse.ritz - tokenizer, $-expansion and variables (AGAST #2461)
+#
+# Before #2461 a line was split on whitespace only, so `$X`, `$?`, `>` and
+# `|` reached the command as literal arguments.
+
+import ritzlib.str { strlen, strcmp }
+
+import src.parse {
+    tokenize, g_tok_kind, g_tok_word, g_tok_count, g_last_status, g_environ,
+    g_tok_next, TOK_WORD, TOK_PIPE, TOK_OUT, TOK_APPEND, TOK_IN,
+    PARSE_UNTERMINATED,
+    vars_clear, var_set, var_lookup, var_unset, var_export, assignment_pos,
+    vars_build_envp
+}
+
+fn word_is(idx: i32, want: *u8) -> bool
+    return g_tok_kind[idx] == TOK_WORD and strcmp(g_tok_word[idx], want) == 0
+
+# ----------------------------------------------------------------------------
+# Words and operators
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_tokenize_words() -> i32
+    vars_clear()
+    assert tokenize(c"  echo   hello\tworld ", 0) == 3
+    assert word_is(0, c"echo")
+    assert word_is(1, c"hello")
+    assert word_is(2, c"world")
+    0
+
+[[test]]
+fn test_tokenize_operators() -> i32
+    vars_clear()
+    # Operators split words even without surrounding blanks.
+    assert tokenize(c"a|b>d>>e<f", 0) == 9
+    assert word_is(0, c"a")
+    assert g_tok_kind[1] == TOK_PIPE
+    assert word_is(2, c"b")
+    assert g_tok_kind[3] == TOK_OUT
+    assert word_is(4, c"d")
+    assert g_tok_kind[5] == TOK_APPEND
+    assert word_is(6, c"e")
+    assert g_tok_kind[7] == TOK_IN
+    assert word_is(8, c"f")
+    assert g_tok_next == -1
+    0
+
+[[test]]
+fn test_tokenize_semicolon_items() -> i32
+    vars_clear()
+    # Each ';' item is tokenized on its own, so expansion in a later item
+    # sees what an earlier item set.
+    let line: *u8 = c"X=1;echo $X ; ';' ;"
+    assert tokenize(line, 0) == 1
+    assert word_is(0, c"X=1")
+    assert g_tok_next == 4
+    var_set(c"X", 1, c"1", 1, 0)
+    assert tokenize(line, g_tok_next) == 2
+    assert word_is(1, c"1")
+    assert tokenize(line, g_tok_next) == 1
+    assert word_is(0, c";")
+    assert tokenize(line, g_tok_next) == 0
+    assert g_tok_next == -1
+    0
+
+[[test]]
+fn test_tokenize_quotes() -> i32
+    vars_clear()
+    var_set(c"X", 1, c"5", 1, 0)
+    # '' is literal, "" expands, \ escapes; quoted operators are words.
+    assert tokenize(c"'$X | y' \"x=$X >\" a\\ b \"\"", 0) == 4
+    assert word_is(0, c"$X | y")
+    assert word_is(1, c"x=5 >")
+    assert word_is(2, c"a b")
+    assert word_is(3, c"")
+    assert tokenize(c"echo 'oops", 0) == PARSE_UNTERMINATED
+    assert tokenize(c"echo \"oops", 0) == PARSE_UNTERMINATED
+    0
+
+[[test]]
+fn test_tokenize_comment() -> i32
+    vars_clear()
+    assert tokenize(c"echo a # b c", 0) == 2
+    assert tokenize(c"echo a#b", 0) == 2
+    assert word_is(1, c"a#b")
+    0
+
+# ----------------------------------------------------------------------------
+# Expansion
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_expand_var() -> i32
+    vars_clear()
+    assert var_set(c"X", 1, c"5", 1, 0) == 0
+    assert tokenize(c"echo X=$X ${X}y $Xy", 0) == 3
+    assert word_is(1, c"X=5")
+    assert word_is(2, c"5y")
+    # $Xy names the unset variable Xy: the unquoted empty word is dropped.
+    0
+
+[[test]]
+fn test_expand_unset_and_literal_dollar() -> i32
+    vars_clear()
+    assert tokenize(c"echo $NOPE \"$NOPE\" $ a$ ${", 0) == 5
+    assert word_is(1, c"")
+    assert word_is(2, c"$")
+    assert word_is(3, c"a$")
+    assert word_is(4, c"${")
+    0
+
+[[test]]
+fn test_expand_status() -> i32
+    vars_clear()
+    g_last_status = 1
+    assert tokenize(c"echo status=$?", 0) == 2
+    assert word_is(1, c"status=1")
+    g_last_status = 127
+    assert tokenize(c"echo \"$?\"", 0) == 2
+    assert word_is(1, c"127")
+    g_last_status = 0
+    0
+
+# ----------------------------------------------------------------------------
+# Variables and environment
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_var_table() -> i32
+    vars_clear()
+    assert var_set(c"1X", 2, c"v", 1, 0) == -1
+    assert var_set(c"FOO", 3, c"one", 3, 0) == 0
+    assert var_set(c"FOO", 3, c"two", 3, 0) == 0
+    assert strcmp(var_lookup(c"FOO", 3), c"two") == 0
+    assert var_lookup(c"FO", 2) == null
+    var_unset(c"FOO", 3)
+    assert var_lookup(c"FOO", 3) == null
+    assert assignment_pos(c"X=5") == 1
+    assert assignment_pos(c"LONG_NAME=") == 9
+    assert assignment_pos(c"=5") == -1
+    assert assignment_pos(c"1X=5") == -1
+    assert assignment_pos(c"echo") == -1
+    0
+
+[[test]]
+fn test_envp_inherit_and_export() -> i32
+    vars_clear()
+    var env: [4]*u8
+    env[0] = c"HOME=/home/u"
+    env[1] = c"PATH=/bin"
+    env[2] = null
+    g_environ = @env[0]
+
+    # Lookups fall back to the inherited environment.
+    assert strcmp(var_lookup(c"HOME", 4), c"/home/u") == 0
+
+    # Unexported shell variables stay out of the child; exported ones and
+    # overrides of inherited ones go in.
+    var_set(c"LOCAL", 5, c"x", 1, 0)
+    var_set(c"X", 1, c"5", 1, 1)
+    var_set(c"PATH", 4, c"/usr/bin", 8, 0)
+    var_unset(c"HOME", 4)
+    assert var_lookup(c"HOME", 4) == null
+
+    var out: [16]*u8
+    let n: i32 = vars_build_envp(@out[0], 16)
+    assert n == 2
+    assert out[2] == null
+    var saw_x: i32 = 0
+    var saw_path: i32 = 0
+    var k: i32 = 0
+    while k < n
+        if strcmp(out[k], c"X=5") == 0
+            saw_x = 1
+        if strcmp(out[k], c"PATH=/usr/bin") == 0
+            saw_path = 1
+        k = k + 1
+    assert saw_x == 1
+    assert saw_path == 1
+
+    # export of an unset name fails; of a local one marks it exported.
+    assert var_export(c"NOPE", 4) == -1
+    assert var_export(c"LOCAL", 5) == 0
+    assert vars_build_envp(@out[0], 16) == 3
+
+    g_environ = null
+    vars_clear()
+    0

@@ -13,9 +13,15 @@ The shell provides basic interactive use: a prompt, command history, line editin
 ## Features
 
 - Interactive line editing with backspace
-- Built-in commands: help, exit, pid, echo, clear, ls
-- External command execution via spawn-and-wait
-- Path search in `/bin` and standard paths
+- Built-in commands: help, exit, cd, pwd, export, unset, pid, echo, clear, ls
+- Shell variables (`N=V`, `export N=V`) and expansion: `$N`, `${N}`, `$?`
+- Quoting (`'...'`, `"..."`, `\x`), `;` lists, `#` comments
+- Redirection (`>`, `>>`, `<`) and pipelines (`a | b`): Linux only for now;
+  harland has no fork/pipe/dup2 yet, so rzsh.elf reports them as unsupported
+- External command execution via spawn-and-wait, searched in `$PATH`
+  (default `/usr/local/bin:/usr/bin:/bin` on Linux, `/bin` on harland);
+  exported variables and the inherited environment reach children (Linux)
+- Not supported: `&&`, `||`, `&`, globbing, `$(...)`, here-docs
 - Directory listing via OS abstraction layer
 - Cross-platform: compiles for both Harland and Linux
 - Conditional compilation via `[[target_os]]` attributes
@@ -88,7 +94,13 @@ both `build/debug/rzsh.elf` (Harland) and `build/debug/rzsh.linux`;
 Interactive shell loop, built-in commands, line editing and external command
 execution work on both Linux and Harland. The shell runs on Harland as part of
 the Indium distribution's init sequence (`make -C projects/indium rzsh` pulls it
-in). Pipes, redirection, environment variables and history are still planned.
+in).
+
+AGAST #2461 added `cd`/`pwd`, variables, `$?`, `;`, quoting, redirection and
+pipes; `projects/ritz/tools/smoke_stack.py rzsh` runs a scripted session per
+feature against rzsh.linux, and `test/test_parse.ritz` / `test/test_shell.ritz`
+cover the tokenizer and `run_line`. Redirection and pipes wait on harland
+syscalls (fork/pipe/dup2).
 
 ## License
 

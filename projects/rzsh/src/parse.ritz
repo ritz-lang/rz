@@ -1,0 +1,448 @@
+# parse.ritz - rzsh command-line tokenizer, $-expansion and shell variables
+#
+# AGAST #2461: the shell used to split a line on whitespace and nothing else,
+# so `$X`, `$?`, `>` and `|` reached the command as literal arguments. A line
+# is now tokenized into words and operators, with expansion done while the
+# word is built (so quoting decides what expands):
+#
+#   words      foo  'single quoted'  "double $QUOTED"  back\ slash
+#   operators  |  >  >>  <     (';' separates items: see tokenize)
+#   expansion  $NAME  ${NAME}  $?   (no field splitting, no globbing)
+#   comments   # to end of line, at the start of a word
+#
+# An unquoted word that expands to nothing (`echo $UNSET`) is dropped, as in
+# sh. Variables live in a small fixed table; lookups fall back to the
+# environment the shell was started with (g_environ, Linux only).
+
+import ritzlib.str { strlen }
+import ritzlib.fmt { fmt_i64_into }
+
+# ============================================================================
+# Tokens
+# ============================================================================
+
+pub const TOK_WORD: i32 = 0
+pub const TOK_PIPE: i32 = 1     # |
+pub const TOK_OUT: i32 = 3      # >
+pub const TOK_APPEND: i32 = 4   # >>
+pub const TOK_IN: i32 = 5       # <
+
+pub const MAX_TOKENS: i32 = 64
+const WORD_BUF_SIZE: i64 = 2048
+
+# tokenize() errors
+pub const PARSE_UNTERMINATED: i32 = -1
+pub const PARSE_OVERFLOW: i32 = -2
+
+pub var g_tok_kind: [64]i32
+pub var g_tok_word: [64]*u8      # TOK_WORD only: NUL-terminated, in g_word_buf
+pub var g_tok_count: i32 = 0
+
+var g_word_buf: [2048]u8
+var g_word_len: i64 = 0
+var g_overflow: i32 = 0
+
+# Exit status of the last command, for `$?`.
+pub var g_last_status: i32 = 0
+
+# ============================================================================
+# Character classes
+# ============================================================================
+
+fn is_blank(c: u8) -> bool
+    return c == 32 or c == 9 or c == 10 or c == 13
+
+# | ; > <
+fn is_operator(c: u8) -> bool
+    return c == 124 or c == 59 or c == 62 or c == 60
+
+pub fn is_name_start(c: u8) -> bool
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+
+pub fn is_name_char(c: u8) -> bool
+    return is_name_start(c) or (c >= 48 and c <= 57)
+
+# ============================================================================
+# Word buffer
+# ============================================================================
+
+fn emit(c: u8)
+    if g_word_len >= WORD_BUF_SIZE
+        g_overflow = 1
+        return
+    g_word_buf[g_word_len as i32] = c
+    g_word_len = g_word_len + 1
+
+fn emit_str(s: *u8)
+    var i: i64 = 0
+    while *(s + i) != 0
+        emit(*(s + i))
+        i = i + 1
+
+fn push_token(kind: i32, word: *u8)
+    if g_tok_count >= MAX_TOKENS
+        g_overflow = 1
+        return
+    g_tok_kind[g_tok_count] = kind
+    g_tok_word[g_tok_count] = word
+    g_tok_count = g_tok_count + 1
+
+# ============================================================================
+# $-expansion
+# ============================================================================
+
+# `line + i` is at '$'. Emits the expansion and returns the index just past it.
+fn expand_dollar(line: *u8, i: i64) -> i64
+    let c: u8 = *(line + i + 1)
+
+    if c == 63  # $?
+        var num: [24]u8
+        let n: i64 = fmt_i64_into(@num[0], g_last_status as i64)
+        var k: i64 = 0
+        while k < n
+            emit(num[k as i32])
+            k = k + 1
+        return i + 2
+
+    if c == 123  # ${NAME}
+        var j: i64 = i + 2
+        while is_name_char(*(line + j))
+            j = j + 1
+        if *(line + j) != 125 or j == i + 2
+            # Not a well-formed ${NAME}: keep the '$' literally.
+            emit(36)
+            return i + 1
+        let v: *u8 = var_lookup(line + i + 2, j - (i + 2))
+        if v != null
+            emit_str(v)
+        return j + 1
+
+    if is_name_start(c)  # $NAME
+        var j: i64 = i + 1
+        while is_name_char(*(line + j))
+            j = j + 1
+        let v: *u8 = var_lookup(line + i + 1, j - (i + 1))
+        if v != null
+            emit_str(v)
+        return j
+
+    # A lone '$' (end of word, "$ ", "$1"...) stays literal.
+    emit(36)
+    return i + 1
+
+# ============================================================================
+# Tokenizer
+# ============================================================================
+
+# Index in the line just past the ';' that ended the last tokenize(), or -1
+# when it reached the end of the line.
+pub var g_tok_next: i64 = -1
+
+# Splits one list item of `line`, from `pos` up to the next unquoted ';' or
+# the end, into g_tok_kind/g_tok_word. Items are tokenized one at a time,
+# right before they run, so `export X=5 ; echo $X` and `false ; echo $?` see
+# the earlier item's effect. Returns the token count (sets g_tok_next), or
+# PARSE_UNTERMINATED / PARSE_OVERFLOW.
+pub fn tokenize(line: *u8, pos: i64) -> i32
+    g_tok_count = 0
+    g_word_len = 0
+    g_overflow = 0
+    g_tok_next = -1
+    var i: i64 = pos
+
+    while true
+        while is_blank(*(line + i))
+            i = i + 1
+        let c: u8 = *(line + i)
+        if c == 0 or c == 35  # end, or a '#' comment
+            break
+        if c == 59  # ';' ends this item
+            g_tok_next = i + 1
+            break
+
+        if c == 124
+            push_token(TOK_PIPE, null)
+            i = i + 1
+            continue
+        if c == 60
+            push_token(TOK_IN, null)
+            i = i + 1
+            continue
+        if c == 62
+            if *(line + i + 1) == 62
+                push_token(TOK_APPEND, null)
+                i = i + 2
+            else
+                push_token(TOK_OUT, null)
+                i = i + 1
+            continue
+
+        # A word: runs until a blank or operator outside quotes.
+        let start: i64 = g_word_len
+        var quoted: bool = false
+        while *(line + i) != 0 and not is_blank(*(line + i)) and not is_operator(*(line + i))
+            let w: u8 = *(line + i)
+            if w == 39  # '...': everything literal
+                quoted = true
+                i = i + 1
+                while *(line + i) != 39
+                    if *(line + i) == 0
+                        return PARSE_UNTERMINATED
+                    emit(*(line + i))
+                    i = i + 1
+                i = i + 1
+            else if w == 34  # "...": $ expands, \ escapes $ " \ `
+                quoted = true
+                i = i + 1
+                while *(line + i) != 34
+                    let d: u8 = *(line + i)
+                    if d == 0
+                        return PARSE_UNTERMINATED
+                    let nx: u8 = *(line + i + 1)
+                    if d == 92 and (nx == 36 or nx == 34 or nx == 92 or nx == 96)
+                        emit(nx)
+                        i = i + 2
+                    else if d == 36
+                        i = expand_dollar(line, i)
+                    else
+                        emit(d)
+                        i = i + 1
+                i = i + 1
+            else if w == 92  # \x outside quotes: x literally
+                quoted = true
+                if *(line + i + 1) != 0
+                    emit(*(line + i + 1))
+                    i = i + 2
+                else
+                    i = i + 1
+            else if w == 36
+                i = expand_dollar(line, i)
+            else
+                emit(w)
+                i = i + 1
+
+        if quoted or g_word_len > start
+            emit(0)
+            if g_overflow == 0
+                push_token(TOK_WORD, @g_word_buf[start as i32])
+
+    if g_overflow != 0
+        return PARSE_OVERFLOW
+    return g_tok_count
+
+# ============================================================================
+# Shell variables
+# ============================================================================
+
+pub const MAX_VARS: i32 = 32
+pub const VAR_NAME_MAX: i64 = 32
+pub const VAR_VALUE_MAX: i64 = 256
+
+var g_var_names: [1024]u8      # MAX_VARS * VAR_NAME_MAX
+var g_var_values: [8192]u8     # MAX_VARS * VAR_VALUE_MAX
+var g_var_used: [32]i32
+var g_var_exported: [32]i32
+
+# The environment rzsh was started with (NULL-terminated "K=V" array), or
+# null. Set once by main on Linux; harland has no environment.
+pub var g_environ: **u8 = null
+
+fn var_name_at(idx: i32) -> *u8
+    return @g_var_names[0] + (idx as i64) * VAR_NAME_MAX
+
+fn var_value_at(idx: i32) -> *u8
+    return @g_var_values[0] + (idx as i64) * VAR_VALUE_MAX
+
+# True when `name` (len bytes) is a valid shell variable name.
+pub fn is_valid_name(name: *u8, len: i64) -> bool
+    if len <= 0 or not is_name_start(*name)
+        return false
+    var i: i64 = 1
+    while i < len
+        if not is_name_char(*(name + i))
+            return false
+        i = i + 1
+    return true
+
+fn name_eq(cstr: *u8, name: *u8, len: i64) -> bool
+    var i: i64 = 0
+    while i < len
+        if *(cstr + i) != *(name + i)
+            return false
+        i = i + 1
+    return *(cstr + len) == 0
+
+fn var_find(name: *u8, len: i64) -> i32
+    var idx: i32 = 0
+    while idx < MAX_VARS
+        if g_var_used[idx] != 0 and name_eq(var_name_at(idx), name, len)
+            return idx
+        idx = idx + 1
+    return -1
+
+# The value part of the environ entry for `name`, or null.
+fn env_find(name: *u8, len: i64) -> *u8
+    if g_environ == null
+        return null
+    var k: i64 = 0
+    while *(g_environ + k) != null
+        let e: *u8 = *(g_environ + k)
+        var i: i64 = 0
+        while i < len and *(e + i) == *(name + i)
+            i = i + 1
+        if i == len and *(e + len) == 61
+            return e + len + 1
+        k = k + 1
+    return null
+
+pub fn vars_clear()
+    var idx: i32 = 0
+    while idx < MAX_VARS
+        g_var_used[idx] = 0
+        g_var_exported[idx] = 0
+        idx = idx + 1
+
+# Sets `name` to `value` (byte lengths given). export != 0 marks it exported;
+# a variable inherited from the environment stays exported. Returns 0, or -1
+# for a bad name, an over-long name/value, or a full table.
+pub fn var_set(name: *u8, len: i64, value: *u8, vlen: i64, export: i32) -> i32
+    if not is_valid_name(name, len) or len >= VAR_NAME_MAX or vlen >= VAR_VALUE_MAX
+        return -1
+    var idx: i32 = var_find(name, len)
+    if idx < 0
+        idx = 0
+        while idx < MAX_VARS and g_var_used[idx] != 0
+            idx = idx + 1
+        if idx == MAX_VARS
+            return -1
+        let n: *u8 = var_name_at(idx)
+        var i: i64 = 0
+        while i < len
+            *(n + i) = *(name + i)
+            i = i + 1
+        *(n + len) = 0
+        g_var_used[idx] = 1
+        g_var_exported[idx] = 0
+        if env_find(name, len) != null
+            g_var_exported[idx] = 1
+    let v: *u8 = var_value_at(idx)
+    var i: i64 = 0
+    while i < vlen
+        *(v + i) = *(value + i)
+        i = i + 1
+    *(v + vlen) = 0
+    if export != 0
+        g_var_exported[idx] = 1
+    return 0
+
+# Marks an existing variable exported, importing it from the environment
+# first if needed. Returns 0, or -1 if it isn't set anywhere.
+pub fn var_export(name: *u8, len: i64) -> i32
+    let idx: i32 = var_find(name, len)
+    if idx >= 0
+        g_var_exported[idx] = 1
+        return 0
+    let e: *u8 = env_find(name, len)
+    if e == null
+        return -1
+    return var_set(name, len, e, strlen(e), 1)
+
+pub fn var_unset(name: *u8, len: i64)
+    let idx: i32 = var_find(name, len)
+    if idx >= 0
+        g_var_used[idx] = 0
+        g_var_exported[idx] = 0
+    # An inherited variable needs a tombstone (used == 2) to hide the environ
+    # entry from lookups and from children.
+    if env_find(name, len) != null and len < VAR_NAME_MAX
+        var t: i32 = 0
+        while t < MAX_VARS and g_var_used[t] != 0
+            t = t + 1
+        if t < MAX_VARS
+            let n: *u8 = var_name_at(t)
+            var i: i64 = 0
+            while i < len
+                *(n + i) = *(name + i)
+                i = i + 1
+            *(n + len) = 0
+            g_var_used[t] = 2   # tombstone: unset, hides the environ entry
+            g_var_exported[t] = 0
+
+# The value of `name`, or null when unset. Shell table first, then environ.
+pub fn var_lookup(name: *u8, len: i64) -> *u8
+    let idx: i32 = var_find(name, len)
+    if idx >= 0
+        if g_var_used[idx] == 2
+            return null
+        return var_value_at(idx)
+    return env_find(name, len)
+
+# Index of '=' when `word` is an assignment (NAME=...), else -1.
+pub fn assignment_pos(word: *u8) -> i64
+    var i: i64 = 0
+    while *(word + i) != 0 and *(word + i) != 61
+        i = i + 1
+    if *(word + i) != 61 or not is_valid_name(word, i)
+        return -1
+    return i
+
+# Table walk for `export` with no arguments: the name of slot `idx` if it
+# holds an exported variable, else null.
+pub fn var_exported_name(idx: i32) -> *u8
+    if idx < 0 or idx >= MAX_VARS or g_var_used[idx] != 1 or g_var_exported[idx] == 0
+        return null
+    return var_name_at(idx)
+
+pub fn var_value(idx: i32) -> *u8
+    return var_value_at(idx)
+
+# ============================================================================
+# Child environment
+# ============================================================================
+
+var g_envp_buf: [8192]u8
+
+# Fills `out` with a NULL-terminated envp for a child: exported shell
+# variables, then inherited entries the shell table doesn't shadow.
+# Returns the number of entries (excluding the NULL).
+pub fn vars_build_envp(out: **u8, cap: i32) -> i32
+    var n: i32 = 0
+    var pos: i64 = 0
+    var idx: i32 = 0
+    while idx < MAX_VARS and n < cap - 1
+        if g_var_used[idx] == 1 and g_var_exported[idx] != 0
+            let name: *u8 = var_name_at(idx)
+            let value: *u8 = var_value_at(idx)
+            let nl: i64 = strlen(name)
+            let vl: i64 = strlen(value)
+            if pos + nl + vl + 2 <= 8192
+                let dst: *u8 = @g_envp_buf[0] + pos
+                var i: i64 = 0
+                while i < nl
+                    *(dst + i) = *(name + i)
+                    i = i + 1
+                *(dst + nl) = 61
+                i = 0
+                while i < vl
+                    *(dst + nl + 1 + i) = *(value + i)
+                    i = i + 1
+                *(dst + nl + 1 + vl) = 0
+                *(out + n) = dst
+                n = n + 1
+                pos = pos + nl + vl + 2
+        idx = idx + 1
+
+    if g_environ != null
+        var k: i64 = 0
+        while *(g_environ + k) != null and n < cap - 1
+            let e: *u8 = *(g_environ + k)
+            var nl: i64 = 0
+            while *(e + nl) != 0 and *(e + nl) != 61
+                nl = nl + 1
+            if var_find(e, nl) < 0
+                *(out + n) = e
+                n = n + 1
+            k = k + 1
+
+    *(out + n) = null
+    return n
