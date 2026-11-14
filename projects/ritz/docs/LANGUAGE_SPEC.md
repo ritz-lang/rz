@@ -1784,8 +1784,25 @@ unless its value only fits a `u64`: `0xF000000000000000 >> 60` is `15`. A consta
 expression shifts by the same rule.
 
 The left operand is a value of its type, so with `a: u8` the sum in `(a + a) >> 1`
-wraps at 8 bits first. Where a literal operand meets a narrower declared slot,
-as in `let r: u8 = (a << 4) >> 4`, the width is not yet settled (AGAST #2360).
+wraps at 8 bits first. A declared slot gives no type to a literal through a `>>`,
+so an expression has the same value wherever it is stored. In `(a << 4) >> 4` the
+`4` is an `i64`, so the left operand is too, and at `a = 248` the result is `248`,
+not the `8` an 8-bit `<<` would leave. Below a narrower slot that is a narrowing:
+
+```ritz body expect-error="implicit narrowing: `r` is declared `u8` but its initialiser has type `i64`"
+let a: u8 = 248
+let r: u8 = (a << 4) >> 4
+```
+
+Say which width you mean. A literal count takes no part in this: `a >> 1` keeps
+the type of `a`.
+
+```ritz body
+let a: u8 = 248
+let wide: u8 = ((a << 4) >> 4) as u8      # 248: shifted at 64 bits
+let narrow: u8 = ((a << 4) as u8) >> 4    # 8: shifted at 8 bits
+let half: u8 = a >> 1                     # 124
+```
 
 A count that is negative, or not less than the bit width of the left operand's
 type, has no defined result.

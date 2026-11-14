@@ -1295,7 +1295,8 @@ class LLVMEmitter:
         So the qualifying set is computed by descending from the declared
         value through arithmetic only. It stops at a Call, an Index, a Field
         or a Cast, because at each of those the value is consumed at a
-        position whose type we have not established.
+        position whose type we have not established. It also stops at `>>`
+        (AGAST #2360), whose result depends on its left operand's high bits.
         """
         qualifying = set()
         stack = [root]
@@ -1307,6 +1308,21 @@ class LLVMEmitter:
             seen.add(id(node))
             if isinstance(node, rast.BinOp):
                 qualifying.add(id(node))
+                if node.op == '>>':
+                    # AGAST #2360: the slot's type stops here. `>>` is not
+                    # congruent mod 2**width, so its left operand's high bits
+                    # come down into the result, and narrowing `(a << 4)` in
+                    # `let r: u8 = (a << 4) >> 4` would give that expression
+                    # a different value from the one it has anywhere else.
+                    # The count is an amount, not a value consumed at the
+                    # slot's width, so it is not descended into either.
+                    # A `>>` straight on the left, as in `(a >> 1) >> 1`, is
+                    # followed: all it can retype is its own literal count,
+                    # which never changes a value, and its left operand stops
+                    # here in turn.
+                    if isinstance(node.left, rast.BinOp) and node.left.op == '>>':
+                        stack.append(node.left)
+                    continue
                 stack.append(node.left)
                 stack.append(node.right)
             elif isinstance(node, rast.UnaryOp):
@@ -1389,6 +1405,12 @@ class LLVMEmitter:
         if (lit_left is None) == (lit_right is None):
             return None
 
+        # A left literal of `>>` is an `i64` (spec §7.4), never the slot's
+        # type (AGAST #2360): `let r: u8 = 64 >> a` is a narrowing, not a u8
+        # shift. A literal count may still take the slot's width, because the
+        # count's type has no say in the result.
+        if expr.op == '>>' and lit_left is not None:
+            return None
         if lit_left is None:
             lit_val, other, other_expr = lit_right, left, expr.left
         else:

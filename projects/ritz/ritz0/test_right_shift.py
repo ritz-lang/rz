@@ -13,10 +13,11 @@ folded the same source differently. `narrowing.ritz` bounds `<<` with a signed
 `>>` too, and that made them disagree on which programs compile. The tables go
 through ritz0, ritz1 and ritz1_selfhosted, so they pin that as well.
 
-Not here: a literal in a narrow slot, as in `let r: u8 = (a << 4) >> 4`. ritz0
-retypes the literal from the slot and ritz1 has no slot to read, so the two differ
-once the left operand leaves the type's range (#2360 asks what the language
-should say).
+A declared slot's type stops at `>>` (#2360). ritz0 used to retype a literal
+inside the left operand from the slot, so `let r: u8 = (a << 4) >> 4` shifted 8
+bits (8 at a = 248) while `((a << 4) >> 4) as i64` and ritz1 shifted 64 (248).
+Now the left operand is an i64 under any slot, and a narrow slot is a narrowing
+on every compiler: `SLOT` pins the values, `REFUSED` the refusals.
 """
 
 import os
@@ -100,7 +101,9 @@ def _forms(ty, bits, signed):
         # An expression on the left has its operands' type.
         "xor": ("", f"{a}let z: {ty} = 0\n{let_r}(a ^ z) >> 1{ret}", e),
         "or": ("", f"{a}let z: {ty} = 0\n{let_r}(a | z) >> 1{ret}", e),
-        "literal_left": ("", f"{a}{let_r}(1 * a) >> 1{ret}", e),
+        # A literal in the left operand is an i64 under any slot (#2360), so
+        # the result is taken at 64 bits: a narrow slot would be a narrowing.
+        "literal_left": ("", f"{a}((1 * a) >> 1) as i64", e),
 
         # A compare reads the shift's own register, with no store to narrow it.
         "compare_sign": ("", f"{a}var q: i64 = 0\nif (a >> 1) < 0\n    q = 1\nq", int(e < 0)),
@@ -231,6 +234,35 @@ def _main(body):
     return "fn main() -> i32\n" + _indent(body)
 
 
+def _slot_forms():
+    """A literal under a narrow slot, masked so the slot accepts it (#2360).
+
+    The value is the one the expression has anywhere: computed at 64 bits,
+    because the literal is an i64 whatever slot is below it. Narrowed to the
+    slot it was 8, 0, 127 and 120.
+    """
+    def form(ty, a, expr, mask, want):
+        return ("", f"let a: {ty} = {a}\nlet r: {ty} = ({expr}) & {mask}\nr as i64", want)
+    return {
+        "shl_u8": form("u8", 248, "(a << 4) >> 4", 255, _shr(248 << 4, 4, 64, True) & 255),
+        "add_u8": form("u8", 255, "(a + 1) >> 1", 255, _shr(256, 1, 64, True) & 255),
+        "sub_u8": form("u8", 1, "(a - 2) >> 1", 255, _shr(-1, 1, 64, True) & 255),
+        # The sign-extension idiom: no sign bit at 64, so no sign extension.
+        "shl_i8": form("i8", 8, "(a << 4) >> 4", 127, _shr(8 << 4, 4, 64, True) & 127),
+        # A literal count still takes the left operand's width: no narrowing.
+        "count": ("", "let a: u8 = 200\nlet r: u8 = a >> 1\nr as i64", 100),
+    }
+
+
+SLOT = _slot_forms()
+
+# Unmasked under a narrow slot, the shift is an i64 and the narrowing is refused.
+REFUSED = {
+    "ticket": "let a: u8 = 248\nlet r: u8 = (a << 4) >> 4\nr as i32",
+    "left_literal": "let a: u8 = 3\nlet r: u8 = 64 >> a\nr as i32",
+}
+
+
 # Whole programs: name -> (source, exit code).
 EXACT = {
     # The ticket's repro.
@@ -283,6 +315,24 @@ def test_every_way_to_reach_a_u64(request, compiler, tmp_path):
 def test_exact_programs(request, compiler, tmp_path, name):
     source, code = EXACT[name]
     assert _run(request, compiler, tmp_path, source) == code, f"{compiler}, {name}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_slot_stops_at_the_shift(request, compiler, tmp_path):
+    code = _run(request, compiler, tmp_path, _program(SLOT))
+    wrong = list(SLOT)[code - 1] if 0 < code <= len(SLOT) else code
+    assert code == 0, f"{compiler}: {wrong}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(REFUSED))
+def test_a_narrow_slot_refuses_the_shift(request, compiler, tmp_path, name):
+    proc, _ = _compile(request, compiler, tmp_path, _main(REFUSED[name]))
+    assert proc.returncode != 0, f"{compiler}, {name}: compiled"
+    assert "implicit narrowing: `r` is declared `u8` but its initialiser has type `i64`" \
+        in proc.stdout + proc.stderr, f"{compiler}, {name}"
 
 
 @pytest.mark.integration
