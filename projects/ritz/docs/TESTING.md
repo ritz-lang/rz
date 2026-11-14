@@ -314,6 +314,12 @@ make -C projects/ritz matrix-full     # full bootstrap + matrix, ~1m 40s
 resolves. `build.py` sets it automatically; if you call ritz0 directly,
 set it yourself.
 
+Mutation-checking ritz0 needs no fresh `RITZ_CACHE_DIR`: each ritz0 sig records
+a hash of ritz0's own `.py` sources, and a sig from any other ritz0 counts as a
+miss, so an edited emitter recompiles unchanged `.ritz` files (AGAST #3086).
+Before #3086 the "Skipped (unchanged)" path served the old ritz0's IR, and
+mutants passed. ritz1's sigs record its binary's hash in the same way (#1279).
+
 See `docs/VALIDATION.md` for the full validation workflow (incremental
 vs. clean rebuilds, when matrix-full is needed, hard rules).
 

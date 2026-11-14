@@ -16,6 +16,7 @@ Key components:
 
 .ritz.sig format (JSON):
 {
+  "compiler_hash": "<sha256 of ritz0's own .py sources>",
   "source_hash": "<sha256 of source file>",
   "functions": {
     "fn_name": {
@@ -47,6 +48,9 @@ without it a recompile in another mode (--no-runtime, test mode, --target,
 --target-os, another import root, other checks) or into an output the sig
 never wrote "Skipped" and kept the wrong IR.  Entries survive only while the
 source and import hashes they were written under still hold.
+
+`compiler_hash` (AGAST #3086) identifies the ritz0 that wrote the sig;
+`read_current_sig` treats a sig from any other ritz0 as absent (see below).
 """
 
 import hashlib
@@ -309,6 +313,53 @@ def sig_path_for(source_path, compiler: str = 'ritz0') -> Path:
 def _sig_path(source_path: str) -> Path:
     """ritz0's own sig file for a source file (never beside the source)."""
     return sig_path_for(source_path, 'ritz0')
+
+
+# Which ritz0 wrote a sig (AGAST #3086).
+#
+# Every check below (source hash, import hashes and misses, output entry)
+# vouches for the INPUTS of a compile; none for the compiler. After an edit to
+# ritz0, an unchanged source was "Skipped (unchanged)" and kept the old
+# ritz0's IR, so mutation checks of the emitter passed against the mutant.
+# Each sig now records COMPILER_HASH, and read_current_sig() treats a sig
+# from any other ritz0 (or from before this field) as absent.
+#
+# The hash covers the same files as build.py's ritz0 fingerprint
+# (cache.compute_compiler_hash, #1382): every .py under ritz0/ except tests
+# and bytecode. It is taken once, when this module is imported, so it
+# describes the code this process loaded (ritz0_inproc's forkserver children
+# inherit it), not whatever is on disk at compile time. About 2 ms for 1.7 MB.
+
+_EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "test"}
+_EXCLUDE_FILE_PREFIXES = ("test_",)
+
+
+def hash_ritz0_sources(ritz0_root) -> str:
+    """Hex sha256 over every codegen .py under `ritz0_root`, by relative path."""
+    root = Path(ritz0_root)
+    sources = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _EXCLUDE_DIRS]
+        for fn in filenames:
+            if fn.endswith(".py") and not fn.startswith(_EXCLUDE_FILE_PREFIXES):
+                sources.append(Path(dirpath) / fn)
+    h = hashlib.sha256(b"ritz0-sig\n")
+    for src in sorted(sources, key=lambda p: p.relative_to(root).as_posix()):
+        h.update(src.relative_to(root).as_posix().encode() + b"\0")
+        h.update(src.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+COMPILER_HASH = hash_ritz0_sources(Path(__file__).resolve().parent.parent)
+
+
+def read_current_sig(source_path: str) -> Optional[Dict[str, Any]]:
+    """The sig for `source_path` if THIS ritz0 wrote it, else None."""
+    data = read_sig_file(source_path)
+    if data is None or data.get('compiler_hash') != COMPILER_HASH:
+        return None
+    return data
 
 
 def read_sig_file(source_path: str) -> Optional[Dict[str, Any]]:
@@ -648,6 +699,7 @@ def build_sig_data(
         functions[fn_name] = entry
 
     return {
+        'compiler_hash': COMPILER_HASH,
         'source_hash': source_file_hash(source),
         'functions': functions,
         'imports': imports,

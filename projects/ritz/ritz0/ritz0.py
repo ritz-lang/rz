@@ -34,7 +34,7 @@ from type_checker import TypeChecker, TypeError as RitzTypeError, check_ref_slot
 from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
     source_file_hash, hash_maps,
-    read_sig_file, write_sig_file, check_source_hash,
+    read_current_sig, write_sig_file, check_source_hash,
     check_import_hashes, check_import_misses, build_import_hashes,
     build_sig_data, detect_sig_changes, invalidate_dependents,
     compile_mode_key, check_output_entry, build_outputs,
@@ -157,6 +157,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # And every candidate import resolution probed and missed must still
         # be missing: a new file there would change what an import resolves
         # to, behind import hashes that all still match (AGAST #2030).
+        # And the sig must come from THIS ritz0: read_current_sig drops one
+        # another ritz0 wrote, so editing ritz0 recompiles (AGAST #3086).
         mode_key = compile_mode_key(_compile_mode(
             no_runtime, check_names, check_ownership, check_types,
             dependencies, source_roots, project_root, target, target_os,
@@ -165,7 +167,7 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         if output_file.exists():
             source_mtime = Path(source_path).stat().st_mtime
             output_mtime = output_file.stat().st_mtime
-            prior_sig = read_sig_file(source_abs_path)
+            prior_sig = read_current_sig(source_abs_path)
             if (output_mtime >= source_mtime
                     and check_source_hash(source, source_abs_path)
                     and check_import_hashes(prior_sig)
@@ -293,7 +295,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
             if source_hashes is None:
                 raise ValueError("fn hashes unavailable")
             fn_hashes, sig_hashes = source_hashes
-            old_sig_data = read_sig_file(source_abs_path)
+            # Another ritz0's sig carries no outputs or fn IR forward (#3086).
+            old_sig_data = read_current_sig(source_abs_path)
 
             # Detect signature changes and invalidate dependent modules
             changed_sigs = detect_sig_changes(source_abs_path, sig_hashes)

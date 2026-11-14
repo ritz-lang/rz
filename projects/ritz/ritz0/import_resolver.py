@@ -28,7 +28,7 @@ import os
 import ritz_ast as rast
 import module_interface
 from metadata import MetadataCache, extract_metadata, ModuleMetadata
-from emitter.fn_cache import read_sig_file, source_file_hash, check_source_hash
+from emitter.fn_cache import read_current_sig, source_file_hash, check_source_hash
 
 
 _CACHED_SPAN = rast.Span("<cached>", 0, 0, 0)
@@ -854,7 +854,7 @@ class ImportResolver:
             # with a matching source hash. If so, use cached metadata instead
             # of re-lexing/re-parsing. This eliminates re-parsing all 34+
             # ritzlib modules on every compilation.
-            sig_data = read_sig_file(import_path)
+            sig_data = read_current_sig(import_path)
             if sig_data is not None:
                 try:
                     import_source = Path(import_path).read_text()
