@@ -95,6 +95,22 @@ PROGRAMS = {
                                "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
                                "    if w.a[1][2].v != 1099511627776\n        return 1\n"
                                "    if w.a[0][1].v != 5\n        return 2\n    return 0\n"),
+    # AGAST #3140: ... through the multi-parameter clone, which copied the
+    # shape as it stood, leaf `P$T` (or `P$U`): "unhandled EXPR_MEMBER".
+    # Over the first parameter, beside a field of the second ...
+    "generic2_field_array_2d_t": (_P + "struct W<T, U>\n    a: [2][3]P<T>\n    u: U\n\n" + _MAIN
+                                  + "    var w: W<i64, i32>\n    w.u = 9\n"
+                                  "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                                  "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                                  "    if w.a[0][1].v != 5\n        return 2\n"
+                                  "    if w.u != 9\n        return 3\n    return 0\n"),
+    # ... and over the second, so the leaf takes U's argument, not T's.
+    "generic2_field_array_2d_u": (_P + "struct W<T, U>\n    t: T\n    a: [2][3]P<U>\n\n" + _MAIN
+                                  + "    var w: W<i8, i64>\n    w.t = 9\n"
+                                  "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                                  "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                                  "    if w.a[0][1].v != 5\n        return 2\n"
+                                  "    if w.t != 9\n        return 3\n    return 0\n"),
     # AGAST #3141: a generic struct's bare `[2][3]T` field.  The field clone
     # kept the shape's leaf as a struct named `T`, so ritz1 refused
     # `w.a[1][2] = x` ("assigning a row or a whole struct element").
