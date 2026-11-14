@@ -15,7 +15,7 @@ the same `line:col: message`.
 
 import pytest
 
-from ref_rules import REF_TO_OTHER_POINTER, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
+from ref_rules import REF_TO_OTHER_POINTER, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from test_ref_into_value import COMPILERS, _assert_refused, _compile, _ids, _main, _run
 
 pytestmark = pytest.mark.integration
@@ -155,6 +155,12 @@ OTHER_SHAPES = {
     "other_scalar_pointer_declared": ("fn f(h:& *i32) -> i32\n    let q: @&*i32 = @&h\n    let p: @&*i64 = ^q\n    0\n",
                                       REF_TO_OTHER_POINTER),
     "other_scalar_pointer_shared": ("fn f(h:& *i32) -> i32\n    let p: @*i64 = ^@h\n    0\n", REF_TO_OTHER_POINTER),
+    # #3160: `@&q` of a reference `q: @&i32` refers to an `@&i32`, a `*i32`:
+    # another U is "a reference to one type", as it is to ritz0.
+    "other_reference_pointee": ("fn f(q: @&i32) -> i32\n    let p: @&*i64 = ^@&q\n    0\n", REF_TO_OTHER_TYPE),
+    "other_reference_pointee_shared": ("fn f(q: @i32) -> i32\n    let p: @*i64 = ^@q\n    0\n", REF_TO_OTHER_TYPE),
+    "other_reference_struct": ("struct C\n    x: i32\n\nstruct D\n    a: i32\n\n"
+                               "fn f(q: @&C) -> i32\n    let p: @&*D = ^@&q\n    0\n", REF_TO_OTHER_TYPE),
     # A generic instance keeps U's name, scalar or not, and its kind.
     "other_scalar_pointer_generic": ("fn g<T>(p: @&*T) -> i32\n    0\n\nfn f(h:& *i32) -> i32\n    g<i64>(^@&h)\n",
                                      REF_TO_OTHER_POINTER),
@@ -222,6 +228,9 @@ EXPLICIT = {
     "scalar_pointer_param_borrowed": ("fn go(h:& *i32, d: *i32)\n    let p: @&*i32 = @&h\n    *p = d\n",
                                       "    var n: i32 = 3\n    var m: i32 = 1\n    var p: *i32 = @m\n"
                                       "    go(p, @n)\n    *p\n", 3),
+    # #3160: `@&q` of a reference to the same U still fits.
+    "reference_pointee_borrowed": ("fn go(q: @&i32)\n    let p: @&*i32 = @&q\n    **p = 3\n",
+                                   "    var n: i32 = 1\n    go(@&n)\n    n\n", 3),
     # An un-annotated copy records no U, and isn't judged for it.
     "scalar_pointer_untyped_copy": ("fn go(h:& *i32, d: *i32)\n    let r = @&h\n    let p: @&*i32 = r\n    *p = d\n",
                                     "    var n: i32 = 3\n    var m: i32 = 1\n    var p: *i32 = @m\n"
