@@ -985,9 +985,30 @@ def test_ritz0_refuses_a_struct_as_an_integer(compile_with, name):
     assert "main.ritz:" in comp.stderr
 
 
+# AGAST #3008: ritz1 refused only the `[N]S` element (#2996); a struct local, param
+# or call result cast or returned as an integer passed it and failed at clang.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("name", sorted(STRUCT_AS_INTEGER))
+def test_ritz1_refuses_a_struct_as_an_integer(compile_with, name, compiler):
+    comp, _, _ = compile_with(compiler, name, STRUCT_AS_INTEGER[name])
+    assert comp.returncode != 0
+    assert "a struct is not an integer" in comp.stderr
+    assert ("cannot cast struct `S`" if name.startswith("cast") else "the fn returns `i") in comp.stderr
+    assert "main.ritz:" in comp.stderr
+
+
 # What stays legal beside it: the element's address cast to a pointer, an integer
 # field cast, and (STRUCT_COPIES' returned_*) `return a[1]` from an `-> S` fn.
+# AGAST #3008: and the same of a struct local, param or call result.
 STRUCT_NEIGHBOURS = {
+    "cast_local_address": _S + "pub fn main() -> i32\n    var s: S\n    s.x = 5\n    let p = @s as *i32\n    return *p\n",
+    "cast_local_field": _S + "fn f(s: S) -> i64\n    return s.x as i64\n\npub fn main() -> i32\n    var s: S\n    s.x = 5\n"
+    + "    return f(s) as i32\n",
+    "cast_call_field": _S + _SMK + "pub fn main() -> i32\n    return mk().x as i32\n",
+    "returned_struct_as_struct": _S + _SMK + "fn f() -> S\n    let s = mk()\n    return s\n\n"
+    + "pub fn main() -> i32\n    let s = f()\n    return s.x\n",
+    "tail_struct_as_struct": _S + _SMK + "fn f() -> S\n    mk()\n\npub fn main() -> i32\n    return f().x\n",
     "cast_address": _S + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    let p = @a[1] as *i32\n"
     + "    return *p\n",
     "cast_field": _S + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    return a[1].x as i32\n",

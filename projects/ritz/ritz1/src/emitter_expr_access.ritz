@@ -592,10 +592,67 @@ fn emit_deref_index(s: *EmitterState, e: *Expr, elem: i32) -> i32
 # where clang wanted an i64 (`a[i] as i32`, `return a[i]`, `a[i] + 1`).  Refuses
 # it, located, and returns 1; returns 0 for a copy.
 fn whole_struct_elem_refused(s: *EmitterState, e: *Expr) -> i32
+    return struct_value_refused(s, e, c"a whole struct element is not a value here in ritz1 (copy it into a `let s: S`, or read its fields)")
+
+# The shared refusal: a struct value `e` where a number goes, located at `e`
+# with `msg`.  1 when refused; 0 when `e` is the copy being emitted.
+fn struct_value_refused(s: *EmitterState, e: *Expr, msg: *u8) -> i32
     if s.struct_copy_expr == e
         return 0
-    emit_nd_error(s, e.span.line, e.span.col, c"a whole struct element is not a value here in ritz1 (copy it into a `let s: S`, or read its fields)")
+    emit_nd_error(s, e.span.line, e.span.col, msg)
     return 1
+
+# AGAST #3008: the plain struct `e` is by value, when it is a local, a param or
+# a call result (`s`, `mk()`, `q.make()`); null/0 otherwise.  An enum, which
+# resolve_expr_struct_name names too, is no struct to find_struct: it is an
+# integer to `as` (§10.4) with its own refusals.  A `[N]S` element is
+# whole_struct_elem_refused's.
+fn struct_value_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null or (e.kind != EXPR_IDENT and e.kind != EXPR_CALL and e.kind != EXPR_METHOD)
+        return
+    var name: *u8 = null
+    var len: i32 = 0
+    resolve_expr_struct_name(s, e, @name, @len)
+    if name == null or len == 0 or find_struct(s, name, len) == null
+        return
+    *out_name = name
+    *out_len = len
+
+# AGAST #3008: `s as i32`, `mk() as i32` on a struct `S`: ritz0's refusal (#2999).
+# ritz1 emitted the `%S` as the integer and clang refused the IR.  1 when refused.
+fn struct_cast_to_int_refused(s: *EmitterState, e: *Expr) -> i32
+    if int_prim_bits(e.op) == 0
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    struct_value_name(s, e.left, @name, @len)
+    if name == null
+        return 0
+    let target: *u8 = primitive_name_from_type(e.op)
+    var n: i32 = 0
+    let head: *u8 = ctor_join(c"cannot cast struct `", 20, name, len, c"` to `", 6, @n)
+    let tail: *u8 = c"`: a struct is not an integer (read one of its fields, or take its address with @)"
+    let msg: *u8 = ctor_join(head, n, target, strlen(target) as i32, tail, strlen(tail) as i32, @n)
+    return struct_value_refused(s, e.left, msg)
+
+# AGAST #3008: `return s`, `return mk()` or a tail `mk()` in an `-> i64` fn, on a
+# struct `S`: ritz0's refusal (#2999).  1 when refused.
+fn struct_return_as_int_refused(s: *EmitterState, value: *Expr, ret_type: i32) -> i32
+    if int_prim_bits(ret_type) == 0
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    struct_value_name(s, value, @name, @len)
+    if name == null
+        return 0
+    let ret_name: *u8 = primitive_name_from_type(ret_type)
+    var n: i32 = 0
+    let head: *u8 = ctor_join(c"the fn returns `", 16, ret_name, strlen(ret_name) as i32, c"`, but this is struct `", 23, @n)
+    let tail: *u8 = c"`: a struct is not an integer (return one of its fields)"
+    let msg: *u8 = ctor_join(head, n, name, len, tail, strlen(tail) as i32, @n)
+    return struct_value_refused(s, value, msg)
 
 fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # AGAST #2440: `p[i]` through a reference or pointer.
