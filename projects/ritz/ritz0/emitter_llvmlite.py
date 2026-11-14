@@ -14348,7 +14348,7 @@ class LLVMEmitter:
     def _emit_union_match(self, expr: rast.Match, union_val: ir.Value, union_name: str) -> ir.Value:
         """Emit a match on a union type with TypePattern arms."""
         union_type, variants = self.union_types[union_name]
-        self._refuse_pattern_kind(expr, rast.VariantPattern)
+        self._refuse_pattern_kind(expr, rast.VariantPattern, rast.LitPattern)
         self._refuse_arm_names(expr, lambda name: False)
         self._require_covered(expr, match_coverage.union_gap(
             expr.arms, variants, self._types_equal, type_to_string))
@@ -14481,6 +14481,7 @@ class LLVMEmitter:
         """
         enum_type, variants = self.enum_types[enum_name]
         variant_names = {variant.name for variant in variants}
+        self._refuse_pattern_kind(expr, rast.LitPattern)
         self._refuse_arm_names(expr, lambda name: name in variant_names)
         names = [variant.name for variant in variants]
         # Ahead of coverage, which judges the fields a pattern has: `Two(a)`
@@ -14705,7 +14706,8 @@ class LLVMEmitter:
     # What each pattern kind tests, for the error when the scrutinee isn't one.
     _PATTERN_NEEDS: ClassVar[dict[type, str]] = {
         rast.VariantPattern: "a variant pattern needs an enum scrutinee",
-        rast.TypePattern: "a type pattern needs a union scrutinee"}
+        rast.TypePattern: "a type pattern needs a union scrutinee",
+        rast.LitPattern: "a literal pattern needs an integer scrutinee"}
 
     def _refuse_pattern_kind(self, expr: rast.Match, *kinds: type) -> None:
         """Refuse an arm whose pattern can't test this scrutinee (AGAST #2409).
@@ -14714,11 +14716,17 @@ class LLVMEmitter:
         union one only for a type, so `Some(v)` on an i64 was an arm no value
         reached and `match n` gave the next one, silently. Like `true` on an
         integer (#2344), it is the wrong kind of pattern, said at the pattern.
+        A literal on an enum or a union raised an unlocated NotImplementedError
+        (#3002); a `true` there says what #2344 says, as ritz1 does.
         """
         for arm in expr.arms:
-            if isinstance(arm.pattern, kinds):
-                raise EmitError(self._PATTERN_NEEDS[type(arm.pattern)],
-                                arm.pattern.span or arm.span)
+            pattern = arm.pattern
+            if not isinstance(pattern, kinds):
+                continue
+            message = self._PATTERN_NEEDS[type(pattern)]
+            if isinstance(pattern, rast.LitPattern) and isinstance(pattern.value, bool):
+                message = "a `true` or `false` pattern needs a bool scrutinee"
+            raise EmitError(message, pattern.span or arm.span)
 
     def _resolve_module_consts(self, expr: rast.Match) -> None:
         """`mod.CONST =>` on an integer compares, as `mod.CONST` does in an

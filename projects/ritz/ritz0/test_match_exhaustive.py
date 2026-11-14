@@ -471,6 +471,9 @@ NOT_A_BOOL = {
                            3, 9),
     "false_on_an_integer": ("fn f(n: i64) -> i64\n    match n\n        0 => 0\n        false => 1\n"
                             "        _ => 2\n" + _MAIN, 4, 9),
+    # AGAST #3002: on an enum ritz0 raised an unlocated NotImplementedError.
+    "true_on_an_enum": (_C + "fn f(c: C) -> i64\n    match c\n        true => 1\n"
+                        "        _ => 2\n" + _MAIN, 7, 9),
 }
 
 # A variant pattern tests an enum's tag (AGAST #2409). On an integer or a bool
@@ -496,6 +499,24 @@ NOT_AN_ENUM_RITZ0_ONLY = {
                            "        i64 => 0\n        Some(v) => 1\n        _ => 2\n" + _MAIN, 5, 9),
 }
 _VARIANT_NEEDS_ENUM = "a variant pattern needs an enum scrutinee"
+
+# A literal pattern compares an integer (AGAST #3002). On an enum or a union
+# ritz0 raised an unlocated NotImplementedError, and ritz1 compared the `%C`
+# aggregate to an i64, IR clang rejected. A `true` there is NOT_A_BOOL's error.
+NOT_AN_INTEGER = {
+    "integer_on_an_enum": (_C + "fn f(c: C) -> i64\n    match c\n        R => 0\n"
+                           "        5 => 1\n        _ => 2\n" + _MAIN, 8, 9),
+    "integer_on_an_option": (_OPT + "fn f(o: Option<i64>) -> i64\n    match o\n        5 => 1\n"
+                             "        _ => 2\n" + _MAIN, 4, 9),
+}
+# ritz1 parses no string pattern, and has no unions.
+NOT_AN_INTEGER_RITZ0_ONLY = {
+    "string_on_an_enum": (_C + "fn f(c: C) -> i64\n    match c\n        \"hi\" => 1\n"
+                          "        _ => 2\n" + _MAIN, 7, 9),
+    "integer_on_a_union": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
+                           "        i64 => 0\n        5 => 1\n        _ => 2\n" + _MAIN, 5, 9),
+}
+_LITERAL_NEEDS_INTEGER = "a literal pattern needs an integer scrutinee"
 
 # `mod.CONST =>` parses as the qualified variant `C.G` does, but names an integer
 # const in a module, so on an integer it compares (angelo's `instructions.POP`).
@@ -643,6 +664,23 @@ def test_ritz0_only_variant_patterns_need_an_enum_scrutinee(request, tmp_path, n
     source, line, col = NOT_AN_ENUM_RITZ0_ONLY[name]
     proc, ll = _compile(request, "ritz0", tmp_path, source, {})
     _assert_error(proc, ll, "ritz0", name, line, col, _VARIANT_NEEDS_ENUM)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NOT_AN_INTEGER))
+def test_a_literal_pattern_needs_an_integer_scrutinee(request, tmp_path, compiler, name):
+    source, line, col = NOT_AN_INTEGER[name]
+    proc, ll = _compile(request, compiler, tmp_path, source, {})
+    _assert_error(proc, ll, compiler, name, line, col, _LITERAL_NEEDS_INTEGER)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(NOT_AN_INTEGER_RITZ0_ONLY))
+def test_ritz0_only_literal_patterns_need_an_integer_scrutinee(request, tmp_path, name):
+    source, line, col = NOT_AN_INTEGER_RITZ0_ONLY[name]
+    proc, ll = _compile(request, "ritz0", tmp_path, source, {})
+    _assert_error(proc, ll, "ritz0", name, line, col, _LITERAL_NEEDS_INTEGER)
 
 
 @pytest.mark.integration
