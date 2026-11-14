@@ -119,6 +119,71 @@ pub fn main() -> i32
     t.0 + t.1 as i32 + t.2 as i32 + a + b + c
 """
 
+# AGAST #2974: `let (x, y) = ..` of a tuple literal, or of an if / match whose
+# arms are tuple literals, has no tuple type to name; ritz1 binds each name to
+# its element instead.  `sp` is the ticket's program (angelo
+# raster/fill.ritz:59).  sp(1, 4) + sp(4, 1) + pick(0) + pick(1) + pick(7)
+# = 3 + 3 + 12 + 34 + 56 = 108.
+SPLIT_IF = """\
+fn sp(a: f32, b: f32) -> i32
+    let (x0, x1) = if a <= b
+        (a, b)
+    else
+        (b, a)
+    (x1 - x0) as i32
+
+fn pick(n: i32) -> i32
+    let (p, q) = if n == 0
+        (1, 2)
+    else if n == 1
+        (3, 4)
+    else
+        (5, 6)
+    p * 10 + q
+
+pub fn main() -> i32
+    sp(1.0, 4.0) + sp(4.0, 1.0) + pick(0) + pick(1) + pick(7)
+"""
+
+# A literal, one of locals, and one whose elements differ in type.
+# (40 - 3) + (5 + 7) = 49.
+SPLIT_LITERAL = """\
+pub fn main() -> i32
+    let (x, y) = (3, 40)
+    let (u, v) = (y, x)
+    let (f, n) = (2.5, 7u8)
+    u - v + (f * 2.0) as i32 + n as i32
+"""
+
+# A match whose arms bind nothing.  12 + 34 + 56 = 102.
+SPLIT_MATCH = """\
+fn m(n: i32) -> i32
+    let (a, b) = match n
+        0 => (1, 2)
+        1 => (3, 4)
+        _ => (5, 6)
+    a * 10 + b
+
+pub fn main() -> i32
+    m(0) + m(1) + m(9)
+"""
+
+# The condition and the chosen arm's elements each run once, in order.
+SPLIT_ONCE = """\
+var g: i32 = 0
+
+fn bump(k: i32) -> i32
+    g = g * 10 + k
+    k
+
+pub fn main() -> i32
+    let (a, b) = if bump(1) == 1
+        (bump(2), bump(3))
+    else
+        (bump(4), bump(5))
+    g + (a + b) * 0
+"""
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
@@ -129,6 +194,10 @@ pub fn main() -> i32
         ("tuple_box_ticket", TICKET_BOX, 7),
         ("tuple_generic", GENERIC, 54),
         ("tuple_wide_nested", WIDE_AND_NESTED, 48),
+        ("tuple_split_if", SPLIT_IF, 108),
+        ("tuple_split_literal", SPLIT_LITERAL, 49),
+        ("tuple_split_match", SPLIT_MATCH, 102),
+        ("tuple_split_once", SPLIT_ONCE, 123),
     ],
 )
 def test_tuple_programs_run(ritz1_bin, tmp_path, compiler, name, program, expected):
@@ -175,15 +244,49 @@ def test_ritz1_mangles_and_lays_out_tuples_as_ritz0(ritz1_bin, tmp_path):
 
 @pytest.mark.integration
 def test_ritz1_rejects_tuple_expr_with_no_known_type(ritz1_bin, tmp_path):
-    """A tuple expression whose slot names no tuple type is a located error,
-    not a struct literal of an unnamed type."""
+    """A tuple expression whose slot names no tuple type, and that no
+    `let (x, y) =` splits, is a located error, not a struct literal of an
+    unnamed type (AGAST #3005 would infer it)."""
     proc = _ritz1_ir(
         ritz1_bin,
         tmp_path,
         "fn f(a: i32) -> i32\n    let x = (a, a)\n    a\n\npub fn main() -> i32\n    f(1)\n",
     )
     assert proc.returncode != 0
-    assert re.search(r"t\.ritz:2:13: .*tuple", proc.stderr), proc.stderr[-2000:]
+    assert re.search(r"t\.ritz:2:13: .*tuple.*#3005", proc.stderr), proc.stderr[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "src,where",
+    [
+        # An arm with statements before its tuple, whose elements may read them.
+        (
+            (
+                "fn f(c: bool) -> i32\n    let (x, y) = if c\n        let q = 3\n        (q, 1)\n"
+                "    else\n        (0, 0)\n    x + y\n\npub fn main() -> i32\n    f(true)\n"
+            ),
+            "4:9",
+        ),
+        # A match arm that binds a name its elements may read.
+        (
+            (
+                "import ritzlib.option\n\nfn f(o: Option<i32>) -> i32\n    let (x, y) = match o\n"
+                "        Some(v) => (v, 1)\n        _ => (0, 0)\n    x + y\n\n"
+                "pub fn main() -> i32\n    f(Some(2))\n"
+            ),
+            "5:20",
+        ),
+    ],
+    ids=["if_arm_stmts", "match_arm_binds"],
+)
+def test_ritz1_rejects_tuple_destructure_it_cannot_split(ritz1_bin, tmp_path, src, where):
+    """`let (x, y) = if / match ..` splits only arms that are bare tuple
+    literals binding nothing; any other arm leaves the tuple a located error
+    (AGAST #3005)."""
+    proc = _ritz1_ir(ritz1_bin, tmp_path, src)
+    assert proc.returncode != 0
+    assert re.search(rf"t\.ritz:{where}: .*tuple.*#3005", proc.stderr), proc.stderr[-2000:]
 
 
 @pytest.mark.integration

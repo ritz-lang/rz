@@ -3093,7 +3093,9 @@ pub fn type_slice(p: *Parser, elem: *GenericArg) -> i32
 # (ident_len 0).  tuple_resolve_module, at module end, names it from its
 # slot: the enclosing fn's return type (tail or `return`), an annotated
 # `let` / `var`, an if/match arm in either, or an enclosing tuple literal's
-# element.  One left nameless is a located error.
+# element.  `let (x, y) = (a, b)` (or an if / match of such) needs no type:
+# tuple_split_decl binds each name to its element (AGAST #2974).  One left
+# nameless is a located error.
 
 struct TupleElem
     ga: *GenericArg       # the element's mangled spelling
@@ -3282,6 +3284,163 @@ fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
         fi = fi.next
         f = f.next
 
+# =============================================================================
+# `let (x, y) = ..` of a tuple with no tuple type (AGAST #2974)
+# =============================================================================
+#
+# `let (x, y) = (a, b)`, or an if / match whose arms are such literals
+# (`let (x0, x1) = if a <= b (a, b) else (b, a)`, angelo raster/fill.ritz),
+# names no tuple type, and ritz1 infers none (AGAST #3005).  None is needed:
+# each name is bound to its element directly.  A literal splits into
+#
+#     let x = a
+#     let y = b
+#
+# and an if / match into the index of the arm it takes, then each element
+# chosen by that index:
+#
+#     let $tk<N> = if a <= b 0 else 1        # the if / match, arms -> 0, 1, ..
+#     let x0 = if $tk<N> == 0 a else b
+#     let x1 = if $tk<N> == 0 b else a
+#
+# So the condition / scrutinee runs once, and of the chosen arm's elements
+# each runs once, in order, as ritz0 runs them.  A local can't reuse a name
+# in its fn, so `y`'s element can't read the `x` just bound.
+#
+# Split only when every arm is a bare literal of two elements, and no match
+# arm binds a name (its elements might read it, and the element `if`s are
+# outside the arm): an arm with statements before its tuple, a `Some(v) =>`
+# or bare `v =>` arm stays the located error of tuple_report_unresolved.
+
+var g_tuple_p: *Parser = null      # tuple_resolve_module's, for the AST built here
+var g_tuple_split_n: i32 = 0       # numbers the arm-index locals, unique per compile
+
+# A nameless tuple literal of exactly two elements?
+fn tuple_split_pair(e: *Expr) -> i32
+    if e == null or e.kind != EXPR_STRUCT_LIT or e.ident_len != 0
+        return 0
+    let fi: *FieldInit = e.args as *FieldInit
+    if fi == null or fi.next == null or fi.next.next != null
+        return 0
+    1
+
+# Does match arm `arm` bind no name?  A bare `x =>` binds one unless it is a
+# unit variant, which the parser can't tell; a qualified `E.V` (no
+# pattern_span) never does.
+fn tuple_split_arm_binds_none(arm: *MatchArm) -> i32
+    let k: i32 = arm.pattern_kind
+    if k == PAT_INT_LIT or k == PAT_WILDCARD or k == PAT_BOOL
+        return 1
+    if k == PAT_VARIANT
+        return (arm.pattern_inner_kind != PAT_IDENT) as i32
+    if k == PAT_IDENT
+        return (arm.pattern_span.line == 0) as i32
+    0
+
+# The number of tuple literals `e` yields (one per arm, through nested if /
+# match arms), or 0 when it is no splittable tree.
+fn tuple_split_leaves(e: *Expr) -> i32
+    if tuple_split_pair(e) == 1
+        return 1
+    if e == null or (e.kind != EXPR_IF and e.kind != EXPR_MATCH)
+        return 0
+    var n: i32 = 0
+    var arm: *MatchArm = e.args as *MatchArm
+    while arm != null
+        if arm.body_stmts != null or arm.is_pass != 0
+            return 0
+        if e.kind == EXPR_MATCH and tuple_split_arm_binds_none(arm) == 0
+            return 0
+        let m: i32 = tuple_split_leaves(arm.body)
+        if m == 0
+            return 0
+        n = n + m
+        arm = arm.next
+    n
+
+# Replace each tuple literal of tree `e` by its index (0, 1, .. in arm
+# order), recording the literal at leaves[index].  Returns the new tree.
+fn tuple_split_index(e: *Expr, leaves: **Expr, next_idx: *i32) -> *Expr
+    if tuple_split_pair(e) == 1
+        let i: i32 = *next_idx
+        *(leaves + i) = e
+        *next_idx = i + 1
+        # Consumed: tuple_report_unresolved must not report it.
+        e.ident_ptr = c"(split)"
+        e.ident_len = 7
+        return expr_int(g_tuple_p, i as i64, e.span.line, e.span.col)
+    var arm: *MatchArm = e.args as *MatchArm
+    while arm != null
+        arm.body = tuple_split_index(arm.body, leaves, next_idx)
+        arm = arm.next
+    e
+
+# Element `j` (0 / 1) of tuple literal `lit`.
+fn tuple_split_elem(lit: *Expr, j: i32) -> *Expr
+    var fi: *FieldInit = lit.args as *FieldInit
+    if j == 1
+        fi = fi.next
+    fi.value
+
+# `if k == 0 L0.j else if k == 1 L1.j .. else Ln-1.j`
+fn tuple_split_pick(leaves: **Expr, n: i32, j: i32, k: *u8, k_len: i32, line: i32, col: i32) -> *Expr
+    var acc: *Expr = tuple_split_elem(*(leaves + (n - 1)), j)
+    var i: i32 = n - 2
+    while i >= 0
+        let lhs: *Expr = expr_ident(g_tuple_p, k, k_len, line, col)
+        let cond: *Expr = expr_binary(g_tuple_p, OP_EQ, lhs, expr_int(g_tuple_p, i as i64, line, col))
+        acc = expr_if_inline(g_tuple_p, cond, tuple_split_elem(*(leaves + i), j), acc, line, col)
+        i = i - 1
+    acc
+
+# `let x = ..` for the destructure's first (which == 0) or second name.
+fn tuple_split_let(s: *Stmt, which: i32, init: *Expr) -> *Stmt
+    var d: *Stmt = null
+    if which == 0
+        d = stmt_let_decl(g_tuple_p, s.var_name, s.var_name_len, 0, init, s.span.line, s.span.col)
+        d.name_span = s.name_span
+    else
+        d = stmt_let_decl(g_tuple_p, s.assign_target, s.assign_target_len, 0, init, s.span.line, s.span.col)
+        d.name_span = s.name2_span
+    d
+
+# Rewrite STMT_TUPLE_DECL `s` in place into the `let`s above, when its init
+# is a tuple literal or a splittable if / match of them.
+fn tuple_split_decl(s: *Stmt)
+    let init: *Expr = s.var_init
+    let n: i32 = tuple_split_leaves(init)
+    if n == 0
+        return
+    let rest: *Stmt = s.next
+    var first: *Stmt = null
+    var second: *Stmt = null
+    if tuple_split_pair(init) == 1
+        init.ident_ptr = c"(split)"
+        init.ident_len = 7
+        first = tuple_split_let(s, 0, tuple_split_elem(init, 0))
+        second = tuple_split_let(s, 1, tuple_split_elem(init, 1))
+        first.next = second
+    else
+        let leaves: **Expr = parser_alloc(g_tuple_p, (n as i64) * 8) as **Expr
+        var idx: i32 = 0
+        let tree: *Expr = tuple_split_index(init, leaves, @idx)
+        # "$tk<N>": no source name can collide with it.
+        let k: *u8 = parser_alloc(g_tuple_p, 16)
+        memcpy(k, c"$tk", 3)
+        let k_len: i32 = 3 + write_dec_i32(k + 3, g_tuple_split_n)
+        *(k + k_len) = 0
+        g_tuple_split_n = g_tuple_split_n + 1
+        first = stmt_let_decl(g_tuple_p, k, k_len, 0, tree, s.span.line, s.span.col)
+        let line: i32 = s.span.line
+        let col: i32 = s.span.col
+        let a: *Stmt = tuple_split_let(s, 0, tuple_split_pick(leaves, n, 0, k, k_len, line, col))
+        second = tuple_split_let(s, 1, tuple_split_pick(leaves, n, 1, k, k_len, line, col))
+        first.next = a
+        a.next = second
+    second.next = rest
+    # `s` is referenced by its predecessor: it becomes `first`.
+    memcpy(s as *u8, first as *u8, sizeof(Stmt))
+
 # Walk a statement list for tuple-literal slots.  `tail` is the slot of the
 # list's last statement when it is the enclosing value (a fn body's tail).
 fn tuple_resolve_stmts(first: *Stmt, tail: *StructDef)
@@ -3297,6 +3456,8 @@ fn tuple_resolve_stmts(first: *Stmt, tail: *StructDef)
             tuple_resolve_expr(s.return_value, g_tuple_ret_slot)
         else if k == STMT_VAR_DECL
             tuple_resolve_expr(s.var_init, tuple_slot(s.var_type, s.var_type_name, s.var_type_name_len))
+        else if k == STMT_TUPLE_DECL
+            tuple_split_decl(s)   # AGAST #2974
         else if k == STMT_IF
             tuple_resolve_stmts(s.if_then, here)
             tuple_resolve_stmts(s.if_else, here)
@@ -3348,7 +3509,7 @@ fn tuple_report_unresolved()
                 eprint_i64(e.span.line as i64)
                 eprint_char(':')
                 eprint_i64(e.span.col as i64)
-                eprintln_cstr(c": a tuple expression needs a tuple type with as many elements from where it is used (a fn's return type, an annotated `let` / `var`, or an enclosing tuple); ritz1 does not infer one (AGAST #2974)")
+                eprintln_cstr(c": a tuple expression needs a tuple type with as many elements from where it is used (a fn's return type, an annotated `let` / `var`, or an enclosing tuple), or a `let (x, y) =` that splits it (a tuple, or an if / match whose arms are bare tuples binding nothing); ritz1 does not infer one (AGAST #3005)")
         r = r.next
 
 fn type_params_name(tp: *TypeParam, name: *u8, len: i32) -> i32
@@ -3418,6 +3579,7 @@ pub fn tuple_resolve_module(p: *Parser)
     tuple_reject_generic(p)
     if g_tuple_lits == null
         return
+    g_tuple_p = p
     var f: *FnDef = p.module.functions
     while f != null
         tuple_resolve_fn(f)
