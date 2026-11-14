@@ -829,6 +829,9 @@ fn collect_struct_types_from_fields(m: *Module, f: *StructField)
     while cur != null
         if cur.field_type == TYPE_STRUCT and cur.field_type_name != null
             add_struct_from_mangled_name(m, cur.field_type_name, cur.field_type_name_len)
+        # AGAST #2390: and its array elements', `W$i32.a: [2]Box$i32`.
+        if cur.field_type == TYPE_ARRAY and cur.array_elem_type == TYPE_STRUCT and cur.array_elem_type_name != null
+            add_struct_from_mangled_name(m, cur.array_elem_type_name, cur.array_elem_type_name_len)
         cur = cur.next
 
 fn collect_struct_types_from_stmts(m: *Module, body: *Stmt)
@@ -3276,6 +3279,13 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
             if memcmp(fields.field_type_name, type_param, type_param_len as i64) == 0
                 subst_pointee_field(cloned, subst_type, subst_name, subst_len)
     subst_array_ptr_field(cloned, type_param, type_param_len, subst_type, subst_name, subst_len)
+    subst_array_elem_field(cloned, type_param, type_param_len, subst_type, subst_name, subst_len)
+    if cloned.field_type == TYPE_ARRAY and cloned.array_elem_type == TYPE_STRUCT and cloned.array_elem_type_name != null
+        if find_dollar_sign(cloned.array_elem_type_name, cloned.array_elem_type_name_len) > 0
+            # AGAST #2390: `a: [2]Box<T>` is `[2]Box$T`: rewrite its `$T`.
+            var ae_len: i32 = 0
+            substitute_type_param_in_name(fields.array_elem_type_name, fields.array_elem_type_name_len, type_param, type_param_len, suffix, suffix_len, @cloned.array_elem_type_name, @ae_len)
+            cloned.array_elem_type_name_len = ae_len
 
     # Clone rest of the list
     cloned.next = clone_struct_fields(fields.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
@@ -3291,6 +3301,42 @@ fn subst_array_ptr_field(cloned: *StructField, type_param: *u8, type_param_len: 
     cloned.array_elem_pointee = subst_type
     cloned.array_elem_type_name = subst_name
     cloned.array_elem_type_name_len = subst_len
+
+# AGAST #2390: a field `a: [N]T`, at T = the argument (subst_type, subst_name).
+# The parser records the element as a struct named "T"; it was copied as it
+# stood, so `W$i32` was `{[2 x %T]}` and clang refused the unsized alloca.
+# The element is encoded as field_new encodes a written one (and as
+# array_arg_decode does): a primitive by its type and no name, a struct by
+# its name, `*X` as TYPE_PTR with X the pointee.  An array argument (a nested
+# `[N][M]X`) isn't rewritten here.
+fn subst_array_elem_field(cloned: *StructField, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32)
+    if cloned.field_type != TYPE_ARRAY or cloned.array_elem_type != TYPE_STRUCT
+        return
+    if cloned.array_elem_type_name == null or cloned.array_elem_type_name_len != type_param_len
+        return
+    if memcmp(cloned.array_elem_type_name, type_param, type_param_len as i64) != 0
+        return
+    if subst_type == TYPE_ARRAY or subst_type == 0
+        return
+    if subst_type == TYPE_STRUCT
+        cloned.array_elem_type_name = subst_name
+        cloned.array_elem_type_name_len = subst_len
+        return
+    if subst_type == TYPE_PTR
+        cloned.array_elem_type = TYPE_PTR
+        let prim: i32 = primitive_type_from_name(subst_name, subst_len)
+        if prim != 0
+            cloned.array_elem_pointee = prim
+            cloned.array_elem_type_name = null
+            cloned.array_elem_type_name_len = 0
+        else
+            cloned.array_elem_pointee = TYPE_STRUCT
+            cloned.array_elem_type_name = subst_name
+            cloned.array_elem_type_name_len = subst_len
+        return
+    cloned.array_elem_type = subst_type
+    cloned.array_elem_type_name = null
+    cloned.array_elem_type_name_len = 0
 
 # A by-value field `x: T`, at T = the argument (subst_type, subst_name).
 fn subst_value_field(cloned: *StructField, subst_type: i32, subst_name: *u8, subst_len: i32)
@@ -3398,6 +3444,20 @@ fn clone_struct_fields_multi(fields: *StructField, tp: *TypeParam, suffix: *u8, 
             let arg_e: *u8 = suffix + *(starts + ai)
             get_type_name_from_suffix(arg_e, *(lens + ai), @ae_name, @ae_len)
             subst_array_ptr_field(cloned, fields.array_elem_type_name, fields.array_elem_type_name_len, parse_type_from_suffix(arg_e, *(lens + ai)), ae_name, ae_len)
+
+    # AGAST #2390: `a: [N]T` / `a: [N]Box<T>` with T one of several parameters.
+    if ft == TYPE_ARRAY and fields.array_elem_type == TYPE_STRUCT and fields.array_elem_type_name != null
+        let ei: i32 = type_param_index(tp, fields.array_elem_type_name, fields.array_elem_type_name_len)
+        if ei >= 0
+            var ev_name: *u8 = null
+            var ev_len: i32 = 0
+            let arg_v: *u8 = suffix + *(starts + ei)
+            get_type_name_from_suffix(arg_v, *(lens + ei), @ev_name, @ev_len)
+            subst_array_elem_field(cloned, fields.array_elem_type_name, fields.array_elem_type_name_len, parse_type_from_suffix(arg_v, *(lens + ei)), ev_name, ev_len)
+        else if find_dollar_sign(fields.array_elem_type_name, fields.array_elem_type_name_len) > 0
+            var em_len: i32 = 0
+            cloned.array_elem_type_name = substitute_params_in_mangled(tp, suffix, starts, lens, fields.array_elem_type_name, fields.array_elem_type_name_len, @em_len)
+            cloned.array_elem_type_name_len = em_len
 
     cloned.next = clone_struct_fields_multi(fields.next, tp, suffix, starts, lens)
     return cloned

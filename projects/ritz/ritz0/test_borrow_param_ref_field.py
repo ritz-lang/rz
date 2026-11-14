@@ -2605,7 +2605,6 @@ RITZ1_GAPS = {
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "array_referent_return": "AGAST #2302: ritz1 has no array return yet",
     "array_return": "AGAST #2302: ritz1 has no array return yet",
-    "generic_struct_array_field": "AGAST #2292: a generic struct's `[N]T` field isn't substituted",
     "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
 }
 
