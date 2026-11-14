@@ -23,6 +23,7 @@ import os
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import textwrap
 import threading
@@ -152,8 +153,27 @@ def _gone(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().split(") ", 1)[1].startswith("Z")  # zombie = dead
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # ENOENT: no such pid. ESRCH: reaped between open() and read() (#3152).
         return True
+
+
+@pytest.mark.unit
+def test_gone_treats_a_pid_reaped_between_open_and_read_as_gone(monkeypatch):
+    # #3152: a process reaped after open() of /proc/<pid>/stat but before
+    # read() makes read() raise ProcessLookupError (ESRCH). Pin that window:
+    # open the real file, then kill and reap the child, then hand it back.
+    child = subprocess.Popen(["sleep", "30"])
+    real_open = open
+
+    def open_then_reap(path, *a, **kw):
+        f = real_open(path, *a, **kw)
+        child.kill()
+        child.wait()
+        return f
+
+    monkeypatch.setitem(globals(), "open", open_then_reap)
+    assert _gone(child.pid)
 
 
 # --- the acceptance tests from the ticket ----------------------------------
