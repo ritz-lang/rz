@@ -968,8 +968,39 @@ fn mk(n:& u32) -> Q
 }
 # test_value_into_ref.py's lent_field_other_pointee is this, bare.
 MISMATCHES_BARE = sorted(set(MISMATCHES) - {"width", "sign_differs", "sign_differs_store"})
-POINTER_TO_POINTER_GAP = "AGAST #2370: ritz1 takes a bare `n:& i64` into a `**i64`; ritz0 refuses it, and `*i64` is refused"
-WRITTEN_POINTER_TO_POINTER_GAP = "AGAST #2528: ritz1 judges nothing into a `**T` field, so `@n` of an `i64` into a `**i64` compiles"
+
+# A `**i64` slot refers to a `*i64`, so neither `n` of an `i64` nor `@n` fits it,
+# at a `let`, an `=` or a field store (AGAST #2370, #2528). The field literal is
+# MISMATCHES' pointer_of_the_same_width. `^` is where the value starts.
+POINTER_TO_POINTER = {
+    "let": """\
+fn mk(n:& i64) -> i32
+    let p: **i64 = ^n
+    return 0
+""",
+    "assign": """\
+fn mk(n:& i64) -> i32
+    var p: **i64 = null
+    p = ^n
+    return 0
+""",
+    "assign_global": """\
+var G: **i64 = null
+
+fn mk(n:& i64) -> i32
+    G = ^n
+    return 0
+""",
+    "store": """\
+struct PP
+    p: **i64
+
+fn mk(n:& i64) -> PP
+    var w: PP
+    w.p = ^n
+    return w
+""",
+}
 
 # AGAST #2250: known gaps next to it, each pinned by its own ticket below.
 CONTROLS.update({
@@ -2615,6 +2646,26 @@ pub fn main() -> i32
     f(@&n)
     return n
 """,
+    # A `**T` field takes `@q` of a `*T` (AGAST #2528), written and stored.
+    "pointer_to_pointer_field": """\
+struct PP
+    p: **i32
+
+fn f(n:& i32)
+    var q: *i32 = @n
+    let w = PP { p: @q }
+    var v: PP
+    v.p = @q
+    let r: *i32 = *v.p
+    let t: *i32 = *w.p
+    *r = 1
+    *t = *t + 2
+
+pub fn main() -> i32
+    var n: i32 = 0
+    f(@&n)
+    return n
+""",
 }
 
 
@@ -2778,16 +2829,9 @@ def test_pointer_slot_holds_the_written_reference(ritz1_bin, tmp_path, compiler,
     assert _run(compiler, ritz1_bin, tmp_path, name, POINTER_SLOTS[name]) == 3
 
 
-def _mismatch_params():
-    for name in MISMATCHES_BARE:
-        for compiler in ("ritz0", "ritz1"):
-            marks = ([pytest.mark.xfail(strict=True, reason=POINTER_TO_POINTER_GAP)]
-                     if (name, compiler) == ("pointer_of_the_same_width", "ritz1") else [])
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
-
-
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_mismatch_params()))
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", MISMATCHES_BARE)
 def test_a_value_into_a_field_of_another_pointee_is_refused(ritz1_bin, tmp_path, compiler, name):
     comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, MISMATCHES[name].replace("^", ""))
     out = comp.stdout + comp.stderr
@@ -2796,18 +2840,21 @@ def test_a_value_into_a_field_of_another_pointee_is_refused(ritz1_bin, tmp_path,
     assert re.search(r"main\.ritz:\d+:\d+: (error: )?" + re.escape(VALUE_INTO_SHARED_REF), out), out[-2000:]
 
 
-def _written_mismatch_params():
-    for name in sorted(MISMATCHES):
-        for compiler in COMPILERS:
-            marks = ([pytest.mark.xfail(strict=True, reason=WRITTEN_POINTER_TO_POINTER_GAP)]
-                     if name == "pointer_of_the_same_width" and compiler != "ritz0" else [])
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(MISMATCHES))
+def test_a_written_reference_into_a_field_of_another_pointee_is_refused(tmp_path, compiler, name):
+    _assert_refused(compiler, tmp_path, name, MISMATCHES[name].replace("^", "^@"), REF_TO_OTHER_TYPE)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_written_mismatch_params()))
-def test_a_written_reference_into_a_field_of_another_pointee_is_refused(tmp_path, compiler, name):
-    _assert_refused(compiler, tmp_path, name, MISMATCHES[name].replace("^", "^@"), REF_TO_OTHER_TYPE)
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form,message", [("", VALUE_INTO_SHARED_REF), ("@", REF_TO_OTHER_TYPE)],
+                         ids=["bare", "written"])
+@pytest.mark.parametrize("name", sorted(POINTER_TO_POINTER))
+def test_an_i64_into_a_pointer_to_pointer_slot_is_refused(tmp_path, compiler, name, form, message):
+    program = POINTER_TO_POINTER[name].replace("^", "^" + form) + ENTRY
+    _assert_refused(compiler, tmp_path, f"{name}_{form or 'bare'}", program, message)
 
 
 # A by-value slot only copies a referent of its own type. Reading a `C` as a

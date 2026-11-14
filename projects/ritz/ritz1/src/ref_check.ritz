@@ -784,10 +784,36 @@ fn ref_walk_list(s: *EmitterState, a0: *Expr)
         ref_walk(s, a)
         a = a.next
 
+# A `**T` slot, at a field, a `let` or an `=` (AGAST #2370, #2528): a pointer
+# whose referent is a pointer, whatever T is.  Nameless, so ref_other_referent
+# judges `@n` of any type the tables name as another type, and a `:&` param
+# bare is a value; `@q` of a `*U` and a `**U` value stay unjudged, and so does a
+# `*U` value, which ritz0 refuses (AGAST #3048).
+fn ref_ptr_ptr_slot(out: *RefTy) -> i32
+    ref_set(out, TYPE_PTR, TYPE_PTR, null, 0)
+
+# The slot an `=` to the name `name` writes: what it holds, or a `**T` slot.
+fn ref_slot_of_name(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
+    if ref_of_ident(s, name, len, out) == 1
+        return 1
+    let idx: i32 = find_local_idx(s, name, len)
+    var t: i32 = TYPE_VOID
+    if idx >= 0
+        t = local_at(s, idx).var_type
+    else
+        let g: *GlobalVarDef = find_global(s, name, len)
+        if g != null
+            t = g.var_type
+    if t != TYPE_PTR_PTR
+        return 0
+    ref_ptr_ptr_slot(out)
+
 # What field `f` takes, as a slot.
 fn ref_field_slot(f: *StructField, out: *RefTy)
     if f.field_type == TYPE_ARRAY
         ref_of_array_field(f, out)
+    else if f.field_type == TYPE_PTR_PTR
+        ref_ptr_ptr_slot(out)
     else if f.field_type == TYPE_PTR and f.field_mut_ref == 1
         ref_set(out, TYPE_MUT_REF, f.array_elem_type, f.field_type_name, f.field_type_name_len)
     else
@@ -803,8 +829,7 @@ fn ref_walk_struct(s: *EmitterState, e: *Expr)
                 let f: *StructField = get_field_type(st, idx)
                 var slot: RefTy
                 ref_field_slot(f, @slot)
-                if f.field_type != TYPE_PTR_PTR
-                    ref_into(s, fi.value, @slot)
+                ref_into(s, fi.value, @slot)
         ref_walk(s, fi.value)
         fi = fi.next
 
@@ -989,7 +1014,7 @@ fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
     if stmt.var_declared_type == TYPE_VOID
         return 0
     if stmt.var_type == TYPE_PTR_PTR
-        return 0
+        return ref_ptr_ptr_slot(out)
     if stmt.var_type == TYPE_ARRAY
         return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, stmt.var_type_name, stmt.var_type_name_len, stmt.var_array_shape)
     ref_set(out, stmt.var_type, stmt.var_pointee_type, stmt.var_type_name, stmt.var_type_name_len)
@@ -1009,8 +1034,6 @@ fn ref_into_field(s: *EmitterState, stmt: *Stmt, owner: *RefTy)
     if idx < 0
         return
     let f: *StructField = get_field_type(st, idx)
-    if f.field_type == TYPE_PTR_PTR
-        return
     var slot: RefTy
     ref_field_slot(f, @slot)
     ref_into(s, stmt.assign_value, @slot)
@@ -1041,7 +1064,7 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
     else if k == STMT_ASSIGN
         var known: i32 = 0
         if stmt.assign_target_len > 0
-            known = ref_of_ident(s, stmt.assign_target, stmt.assign_target_len, @slot)
+            known = ref_slot_of_name(s, stmt.assign_target, stmt.assign_target_len, @slot)
         else
             known = ref_ty_of(s, stmt.if_cond as *Expr, @slot)
         if known == 1
