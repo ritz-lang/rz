@@ -2332,7 +2332,6 @@ fn mk() -> (T, i32)
     def test_tuple_in_a_tuple(self):
         self.assert_moved(self.body("eat((n.0).1)\neat((n.0).1)", "n: ((i32, T), i32)"), "n.0.1")
 
-    @pytest.mark.xfail(strict=True, reason="AGAST #2284: `0.1` lexes as a float")
     def test_tuple_in_a_tuple_without_parens(self):
         self.assert_moved(self.body("eat(n.0.1)\neat(n.0.1)", "n: ((i32, T), i32)"), "n.0.1")
 

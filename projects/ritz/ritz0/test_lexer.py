@@ -61,6 +61,20 @@ class TestNumbers:
         assert token_values("1e10") == [(TokenType.FLOAT, 1e10), (TokenType.EOF, None)]
         assert token_values("1.5e-3") == [(TokenType.FLOAT, 1.5e-3), (TokenType.EOF, None)]
 
+    # AGAST #2284: a number right after `.` is a tuple field, so `p.0.1` is
+    # the path p . 0 . 1 and not p . FLOAT(0.1), as in Rust.
+    def test_field_after_dot_is_not_a_float(self):
+        assert token_values("p.0.1") == [
+            (TokenType.IDENT, "p"), (TokenType.DOT, "."), (TokenType.INT, 0),
+            (TokenType.DOT, "."), (TokenType.INT, 1), (TokenType.EOF, None),
+        ]
+
+    def test_float_not_after_dot_still_lexes(self):
+        assert token_values("x = 0.1") == [
+            (TokenType.IDENT, "x"), (TokenType.EQ, "="),
+            (TokenType.FLOAT, 0.1), (TokenType.EOF, None),
+        ]
+
 
 class TestStrings:
     def test_simple_string(self):

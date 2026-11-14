@@ -444,6 +444,13 @@ class Lexer:
         while self._peek().isdigit() or self._peek() == '_':
             self._advance()
 
+        # A number right after `.` is a tuple field index, never a float:
+        # `p.0.1` is the path p . 0 . 1, not p . FLOAT(0.1) (AGAST #2284).
+        # Rust splits the float token in its parser for the same reason.
+        if self.last_token_type == TokenType.DOT:
+            text = self.source[start_pos:self.pos].replace('_', '')
+            return Token(TokenType.INT, int(text), start_span)
+
         # Check for float
         is_float = False
         if self._peek() == '.' and self._peek(1).isdigit():
