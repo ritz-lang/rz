@@ -33,7 +33,8 @@ per-row compile.  `RITZ_TEST_BATCH=0` turns batching off.
 row** (AGAST #2867).  The batch's imports and generic instances are every
 row's, so a run row that lacks an import the batch has, or reaches a generic
 instance, is compiled alone too, and answered only if that compiles and needs
-nothing from outside the batch didn't (see "leaning" below).
+nothing from outside the batch didn't, a named type included (#2988; see
+"leaning" below).
 
 How the harness learns the other rows: on its first call in a batched test,
 the helper runs each sibling test in the chunk (same function, same
@@ -283,30 +284,65 @@ def unrename(text: str) -> str:
 #
 # A row could lean if it lacks an import the batch has, or if any code it
 # reaches in the batch's module (from `__row<k>`, through calls) mentions a
-# generic instance: a `$` in a function's name or body, its types included.
-# Those are the only things a compile emits for one row's code that another
-# row's could need.  Only these rows pay for the second compile: ritz0's, in
+# generic instance: a `$` in a function's name or body, its types included,
+# or a named type that holds one.  Those are the only things a compile emits
+# for one row's code that another row's could need.
+#
+# The things it needs are the symbols it declares, and (AGAST #2988) the named
+# types it uses without defining.  #2926 measured that: ritz1 lowered a row's
+# `Has(Some(6))` alone to an `alloca %Option$i32` it never defined, which clang
+# refuses ("Cannot allocate unsized type"); batched, another row's definition
+# of `%Option$i32` served it.  Only these rows pay for the second compile: ritz0's, in
 # process, costs ~120 ms, about what the whole row would have alone.
 
 _SYM = r'@(?:"((?:[^"\\]|\\.)*)"|([-\w.$]+))'
 _DECLARE = re.compile(rf"^declare\b[^@\n]*{_SYM}", re.MULTILINE)
 _DEFINE = re.compile(rf"^define\b[^@\n]*{_SYM}\(", re.MULTILINE)
 _REF = re.compile(_SYM)
+# Named types (AGAST #2988): `%T = type {...}`, and a `%T` wherever it's named.
+# A local value is spelled the same way, so a name only counts as a type use
+# where the batch defines a type of that name.
+_TNAME = r'%(?:"((?:[^"\\]|\\.)*)"|([-\w.$]+))'
+_TYPEDEF = re.compile(rf"^{_TNAME}\s*=\s*type\b(.*)$", re.MULTILINE)
+_TREF = re.compile(_TNAME)
+
+
+def _types(ll: str) -> dict:
+    """{name: its definition's right-hand side} for `ll`'s named types, opaque ones left out.
+
+    An opaque type is unsized: a row that only has it can't allocate one.
+    """
+    return {q or b: rhs for q, b, rhs in _TYPEDEF.findall(ll) if rhs.strip() != "opaque"}
+
+
+def _generic_types(ll: str) -> set:
+    """`ll`'s named types that are, or hold, a generic instance (a `$`)."""
+    defs = _types(ll)
+    generic = {n for n, rhs in defs.items() if "$" in n or "$" in rhs}
+    grew = True
+    while grew:
+        grew = False
+        for n, rhs in defs.items():
+            if n not in generic and {q or b for q, b in _TREF.findall(rhs)} & generic:
+                generic.add(n)
+                grew = True
+    return generic
 
 
 def reaches_generic(ll: str, roots) -> set:
     """Which of `roots` (function names) reach a `$` in `ll`'s functions.
 
-    A root that isn't defined in `ll` is counted as reaching one: unknown is
-    not safe.
+    Naming a type that holds a generic instance counts (#2988).  A root that
+    isn't defined in `ll` is counted as reaching one: unknown is not safe.
     """
     calls, generic = {}, set()
+    generic_types = _generic_types(ll)
     for m in _DEFINE.finditer(ll):
         end = ll.find("\n}", m.start())
         body = ll[m.start():end if end >= 0 else len(ll)]
         name = m.group(1) or m.group(2)
         calls[name] = {q or b for q, b in _REF.findall(body)}
-        if "$" in body:
+        if "$" in body or {q or b for q, b in _TREF.findall(body)} & generic_types:
             generic.add(name)
     out = set()
     for root in roots:
@@ -335,9 +371,24 @@ def externals(ll: str) -> set:
     return {unrename(q or b) for q, b in _DECLARE.findall(ll) if not (q or b).startswith("llvm.")}
 
 
+def borrowed_types(row_ll: str, batch_ll: str) -> set:
+    """The named types a row's own module uses, doesn't define, and its batch does (#2988).
+
+    Alone, such a type is undefined or opaque: unsized, and clang refuses to
+    allocate one.  Batched, another row's definition made it whole.  They come
+    back `%`-prefixed, in the row's own names.
+    """
+    batch = {unrename(n) for n in _types(batch_ll)}
+    used = {q or b for q, b in _TREF.findall(row_ll)}
+    return {"%" + n for n in (used & batch) - set(_types(row_ll))}
+
+
 def leans(row_ll: str, batch_ll: str) -> set:
-    """What a row's own module needs from outside that its batch's did not."""
-    return externals(row_ll) - externals(batch_ll)
+    """What a row's own module needs from outside that its batch's did not.
+
+    Symbols it declares, and named types it uses but only the batch defines.
+    """
+    return (externals(row_ll) - externals(batch_ll)) | borrowed_types(row_ll, batch_ll)
 
 
 def _located(output: str, filename: str):

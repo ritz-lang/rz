@@ -367,12 +367,15 @@ Rules:
    import the batch has, or code it reaches from `__row<k>` mentions a `$`
    instance) is also compiled on its own, `compile=` above, the emit only.
    It gets a batched answer only if that compile succeeds and its module
-   declares nothing external the batch's didn't; otherwise it runs alone and
-   fails as its own.  A test pinning "X gets instantiated" is then as strong
-   batched as unbatched; the log names the symbol (`lean ... leans on
-   Vec$i32_get`).  It costs: the 12 batched files went from 605 to 1078
-   test-seconds (unbatched: 1600), almost all of it ritz0's ~120 ms emit for
-   rows that touch a generic.
+   declares nothing external the batch's didn't, and uses no named type it
+   doesn't define that the batch's does (#2988: an `alloca %Option$i32` a
+   row's own module never defined, which clang refuses alone, ran batched on
+   a sibling's definition); otherwise it runs alone and fails as its own.  A
+   test pinning "X gets instantiated" is then as strong batched as
+   unbatched; the log names the symbol or type (`lean ... leans on
+   Vec$i32_get`, `leans on %Option$i32`).  It costs: the 12 batched files
+   went from 605 to 1078 test-seconds (unbatched: 1600), almost all of it
+   ritz0's ~120 ms emit for rows that touch a generic.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

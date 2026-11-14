@@ -169,6 +169,44 @@ def test_a_row_leans_on_what_it_needs_from_outside_and_the_batch_did_not():
     assert batching.leans("declare i64 @realloc(...)\n", batch) == set()
 
 
+_TYPES = '''\
+%H__r1 = type { i8, [0 x i8], [8 x i8] }
+%"Option$i32" = type { i8, [3 x i8], [4 x i8] }
+%"Vec$i32" = type { ptr, i64 }
+define i32 @__row1() {
+  %v = alloca %"Option$i32"
+  ret i32 0
+}
+'''
+
+
+@pytest.mark.unit
+def test_a_row_leans_on_a_type_it_uses_and_the_batch_alone_defines():
+    # AGAST #2988, #2926's ritz1 bug: alone, the row's module allocas an
+    # `%Option$i32` it never defines (clang: "Cannot allocate unsized type");
+    # batched, another row's defined it.  Quoted or not, it's the same type.
+    row = "%H = type { i8, [0 x i8], [8 x i8] }\ndefine i32 @f() {\n  %.9 = alloca %Option$i32\n  ret i32 0\n}\n"
+    assert batching.leans(row, _TYPES) == {"%Option$i32"}
+    # Defined by the row itself (`%H`, `%Option$i32`), or never used (`%Vec$i32`): nothing.
+    assert batching.leans('%"Option$i32" = type { i8, [3 x i8], [4 x i8] }\n' + row, _TYPES) == set()
+    # A type the batch renamed is the row's own name.
+    assert batching.leans("define i32 @f() {\n  %h = alloca %H\n  ret i32 0\n}\n", _TYPES) == {"%H"}
+    # An opaque type is no definition: it's unsized all the same.
+    assert batching.leans("%Option$i32 = type opaque\n" + row, _TYPES) == {"%Option$i32"}
+
+
+@pytest.mark.unit
+def test_a_row_reaches_a_generic_instance_through_a_type_it_names():
+    # `%R` holds an `%S`, which holds an `Option$i32`: a row that only names
+    # `%R` can still lean on the batch for `Option$i32`'s definition, so it's
+    # compiled alone too.
+    ll = ('%R = type { i8, %S }\n%S = type { %"Option$i32" }\n'
+          '%"Option$i32" = type { i8, [3 x i8], [4 x i8] }\n%T = type { i32 }\n'
+          "define i32 @__row0() {\n  %r = alloca %R\n  ret i32 0\n}\n"
+          "define i32 @__row1() {\n  %t = alloca %T\n  ret i32 0\n}\n")
+    assert batching.reaches_generic(ll, ["__row0", "__row1"]) == {"__row0"}
+
+
 _REACH = '''\
 define i32 @__row0() {
   %r = call i32 @f__r0()
@@ -283,6 +321,27 @@ def test_a_row_that_leans_on_another_rows_instance_gets_no_answer(tmp_path):
         return code, out
     rows = [_row(_vec(n), top=GVEC) for n in (3, 4, 5)]
     assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, None, 5]
+
+
+def _opt(n):
+    return (f"fn f() -> i32\n    let o: Option<i32> = Some({n})\n    match o\n"
+            "        Some(v) => v\n        None => 0\n")
+
+
+@pytest.mark.integration
+def test_a_row_that_leans_on_another_rows_type_gets_no_answer(tmp_path):
+    # AGAST #2988, #2926's shape, with ritz1's bug played by `compile`: alone,
+    # row 1's module uses `%Option$i32` and never defines it, so clang refuses
+    # it ("Cannot allocate unsized type"); batched, row 0's definition served.
+    def compile(compiler, src, work):
+        code, out = _compile(compiler, src, work)
+        if "Some(4)" in src.read_text():
+            ll = work / "main.ll"
+            ll.write_text("".join(ln for ln in ll.read_text().splitlines(keepends=True)
+                                  if not ln.startswith('%"Option$i32" = type')))
+        return code, out
+    rows = [_row(_opt(n)) for n in (3, 4)]
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, None]
 
 
 @pytest.mark.unit
