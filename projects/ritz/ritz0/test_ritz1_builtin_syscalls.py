@@ -300,12 +300,10 @@ def test_ritz0_is_the_oracle(tmp_path, name):
     assert _run("ritz0", tmp_path, name, _program(name, tmp_path)) == EXPECTED
 
 
-# ritz1 gives every inferred `var x = f()` an i64 slot, whatever f returns
-# (#1795, not specific to the builtins).  This is the one program that can see
-# get_expr_type's TYPE_I32 for open/close; strict, so the fix must re-arm it.
-RITZ1_XFAIL = {
-    "inferred_open_close_are_i32_slots": "AGAST #1795 — inferred var slot is always i64",
-}
+# `inferred_open_close_are_i32_slots` is the one program that can see
+# get_expr_type's TYPE_I32 for open/close.  Its #1795 pin went with #2527: an
+# inferred `var x = f()` is a slot of what f returns, not always an i64.
+RITZ1_XFAIL = {}
 
 
 @pytest.mark.integration

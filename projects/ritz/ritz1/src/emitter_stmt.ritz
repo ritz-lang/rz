@@ -681,21 +681,48 @@ fn type_ref_view_let(stmt: *Stmt, view: i32) -> i32
         stmt.var_type = TYPE_MUT_REF
     1
 
-# AGAST #2356: 1 for an unannotated `let x = init` whose init is a u64, which the
-# parser's i64 default would make `x >> n` sign-fill.  A bare literal stays i64,
-# as it does on ritz0, and a float expression is not an integer at all.
-fn inferred_u64_init(s: *EmitterState, stmt: *Stmt) -> i32
+# The integer type an unannotated `let x = init` takes from `init`, as ritz0
+# types it; TYPE_VOID when it stays the parser's i64 default.  A bare literal
+# stays i64, as it does on ritz0, and a float expression is not an integer at all.
+# AGAST #2356: a u64, which the i64 default would make `x >> n` sign-fill.
+# AGAST #2527: an i8 .. u32, `var n = m` with `m: u32`.  The local stayed an i64
+# slot, so `@&n` into an `@&i32` couldn't be refused, and an `@&u32` of it read
+# the low half of the i64.  `int_kind` is bool_kind's answer for `init`: only a
+# known integer narrows (a bool is a u8 to int_operand_shape).
+fn inferred_int_init(s: *EmitterState, stmt: *Stmt, int_kind: i32) -> i32
     if stmt.var_declared_type != TYPE_VOID or stmt.var_init == null
-        return 0
+        return TYPE_VOID
     if stmt.var_init.kind == EXPR_INT_LIT
-        return 0
+        return TYPE_VOID
     let t: i32 = get_expr_type(s, stmt.var_init)
     if t == TYPE_F32 or t == TYPE_F64
-        return 0
+        return TYPE_VOID
     var uns: i32 = 0
-    if int_operand_shape(s, stmt.var_init, @uns) == 64
-        return uns
-    0
+    let bits: i32 = int_operand_shape(s, stmt.var_init, @uns)
+    if bits == 64 and uns == 1
+        return TYPE_U64
+    if int_kind != BK_INT
+        return TYPE_VOID
+    # int_operand_shape is ritz0's emitter's _int_shape: `m + 1` is an i64
+    # there (the literal is), and ritz0 holds it in an i64 slot (AGAST #3112).
+    narrow_int_kind(bits, uns)
+
+# The TYPE_* of an integer `bits` wide (8, 16 or 32), unsigned when `uns` is 1;
+# TYPE_VOID for any other width.
+fn narrow_int_kind(bits: i32, uns: i32) -> i32
+    if bits == 8
+        if uns == 1
+            return TYPE_U8
+        return TYPE_I8
+    if bits == 16
+        if uns == 1
+            return TYPE_U16
+        return TYPE_I16
+    if bits == 32
+        if uns == 1
+            return TYPE_U32
+        return TYPE_I32
+    TYPE_VOID
 
 # 1 when `name` is an enum `ctor` builds: an Option for Some / None, a Result
 # for Ok / Err.
@@ -1150,8 +1177,6 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # otherwise `var best_type: i32 = -1` stores i32 into an i64 slot,
     # and callers reading i64 see garbage in the upper half.
     check_implicit_narrowing(s, stmt)   # AGAST #1364
-    # AGAST #2356: as below, before `x` is in scope.
-    let init_u64: i32 = inferred_u64_init(s, stmt)
     let fn_sig: *FnDef = inferred_fn_sig(s, stmt)   # AGAST #2417, before `f` is in scope
     # AGAST #2342: before `x` is in scope, as `let x: bool = x`.
     var init_kind: i32 = BK_UNSURE
@@ -1163,6 +1188,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             literal_slot(s, stmt.var_init, stmt.var_declared_type, stmt.var_pointee_type)   # AGAST #2341
             if stmt.var_declared_type == TYPE_ARRAY
                 literal_array(s, stmt.var_init, stmt.var_array_elem_type, stmt.var_array_elem_pointee)
+    # AGAST #2356 / #2527: as below, before `x` is in scope.
+    let init_int: i32 = inferred_int_init(s, stmt, init_kind)
     var var_type: i32 = stmt.var_type
     # AGAST #1521: remember a declared bool past the i64 promotion below.
     let declared_bool: i32 = (var_type == TYPE_BOOL) as i32
@@ -1830,6 +1857,11 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         if init_fty == TYPE_F32 or init_fty == TYPE_F64
             var_type = init_fty
             stmt.var_type = init_fty
+        # AGAST #2527: an i8 .. u32 initialiser no arm above typed is a slot of
+        # that type, as if annotated.  (A u64 keeps the i64 slot; see below.)
+        else if init_int != TYPE_VOID and init_int != TYPE_U64
+            var_type = init_int
+            stmt.var_type = init_int
 
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -1933,7 +1965,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     if inferred_unsure == 1 and s.local_count > 0
         let unsure_loc: *LocalVar = local_at(s, s.local_count - 1)
         unsure_loc.bk_unsure = 1
-    if init_u64 == 1 and var_type == TYPE_I64
+    if init_int == TYPE_U64 and var_type == TYPE_I64
         declared.var_type = TYPE_U64
 
     if stmt.var_init != null and stmt.var_array_shape != null

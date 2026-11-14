@@ -536,10 +536,9 @@ fn f(n:& i32, s: @&S)
 # test_value_into_ref.py's lent_other_scalar is this, bare.
 MISFITS_BARE = sorted(set(MISFITS) - {"narrower", "sign", "sign_pointer", "local", "local_untyped", "bool_local",
                                       "pointer_into_its_pointee"})
-# ritz1 keeps an un-annotated scalar local as `i64`, so it can't say what `@&n` is.
-UNTYPED_LOCAL_GAP = "AGAST #2527: ritz1 doesn't judge `@x` of an un-annotated scalar `let` / `var`"
-MISFIT_GAPS = {("local_untyped", "ritz1"): UNTYPED_LOCAL_GAP,
-               ("local_untyped", "ritz1_selfhosted"): UNTYPED_LOCAL_GAP}
+# (row, compiler) -> reason, for a strict xfail.  #2527's `local_untyped` pin
+# went when ritz1 typed an un-annotated scalar local as its initialiser.
+MISFIT_GAPS = {}
 
 # Into a `name:& T` param, `@x` / `@&x` of another type is reinterpreted the
 # same way (#2367). `^` is where the argument goes, and the row's last item what's
@@ -661,6 +660,62 @@ pub fn main() -> i32
 @pytest.mark.integration
 def test_ritz0_leaves_a_reference_to_what_it_cant_type_unjudged(tmp_path):
     assert _run_three("ritz0", tmp_path, "untyped_referent", UNTYPED_REFERENT) == 3
+
+
+# An un-annotated scalar local is its initialiser's type (#2527), so `@&n` of
+# `var n = m` with `m: u32` fits an `@&u32` and holds the whole u32.  ritz1 kept
+# it an i64 slot: `n - 1` didn't wrap, and `*p` wrote the low half of the i64,
+# so `n == 1` was false (4); `b + 1` didn't wrap to -128 (20).  `k + 1` is an
+# i64 to ritz0's emitter (a literal is), so `c` doesn't wrap (200; AGAST #3112).
+# `var x = three()` is an i16 (#1795): `*p = -5` through a `*i16` left the i64's
+# high bytes zero, so `x == -5` was false (30).  3 + 10 + 200 + 0 on ritz0.
+UNTYPED_SCALAR = """\
+fn three() -> i16
+    3
+
+fn set_neg(p: *i16)
+    *p = -5
+
+fn from_call() -> i32
+    var x = three()
+    set_neg(@x)
+    if x == -5
+        return 0
+    return 30
+
+fn bump(p: @&u32)
+    *p = *p + 2
+
+fn wraps(m: u32) -> i32
+    var n = m
+    n = n - 1
+    bump(@&n)
+    if n == 1
+        return 3
+    return 4
+
+fn wraps_signed(k: i8) -> i32
+    var b = k
+    b = b + 1
+    if b < 0
+        return 10
+    return 20
+
+fn wraps_sum(k: i8) -> i32
+    let c = k + 1
+    if c < 0
+        return 100
+    return 200
+
+pub fn main() -> i32
+    return wraps(0) + wraps_signed(127) + wraps_sum(127) + from_call()
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_untyped_scalar_local_is_its_initialisers_type(tmp_path, compiler):
+    assert _run_three(compiler, tmp_path, "untyped_scalar", UNTYPED_SCALAR) == 213
 
 
 # An un-annotated copy of a struct is that struct: `@b` fits `@Rect` (prism's
