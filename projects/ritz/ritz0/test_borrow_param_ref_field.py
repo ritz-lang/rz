@@ -2071,6 +2071,45 @@ pub fn main() -> i32
 
 DROP_STORES.update({
     # AGAST #2279: only a by-value slot moves.
+    # AGAST #2949: a bare `t` mid-block is discarded, and so is a `defer`
+    # body's last one; `t.h` reads a field.  None of them move `t`.
+    "stmt_mid_block": RES + """
+fn f(t:& Res) -> i32
+    t
+    return t.h
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    return f(@&r)
+""",
+    "stmt_field_tail": RES + """
+fn f(t:& Res)
+    t.h
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    f(@&r)
+    return r.h
+""",
+    "stmt_defer_tail": RES + """
+fn f(t:& Res) -> i32
+    defer
+        t
+    return t.h
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    return f(@&r)
+""",
+    "stmt_copy_tail": """
+fn f(t:& i32)
+    t
+
+pub fn main() -> i32
+    var n: i32 = 3
+    f(@&n)
+    return n
+""",
     "let_reference": RES + """
 fn f(t:& Res) -> i32
     let p: @Res = @t
@@ -2408,6 +2447,63 @@ fn g(a: [2]Res) -> i32
 
 fn f(a:& [2]Res) -> i32
     return g(a)
+
+pub fn main() -> i32
+    return 0
+""",
+    # AGAST #2949: a block's last statement is its value, so a bare `t` there
+    # reads the referent, in a void fn too.  #2288 had the `if` arm's alone.
+    "stmt_tail": RES + """
+fn f(t:& Res, k: i32)
+    t
+
+pub fn main() -> i32
+    return 0
+""",
+    "stmt_method_tail": RES + """
+struct M
+    k: i32
+
+impl M
+    fn g(self: @M, t:& Res)
+        t
+
+pub fn main() -> i32
+    return 0
+""",
+    "stmt_while": RES + """
+fn f(t:& Res, k: i32)
+    var i: i32 = 0
+    while i < k
+        i = i + 1
+        t
+
+pub fn main() -> i32
+    return 0
+""",
+    "stmt_for": RES + """
+fn f(t:& Res, k: i32)
+    for i in 0..k
+        t
+
+pub fn main() -> i32
+    return 0
+""",
+    "stmt_match_arm": RES + """
+fn f(t:& Res, k: i32)
+    match k
+        0 =>
+            let z: i32 = 1
+            t
+        _ => pass
+    let y: i32 = k
+
+pub fn main() -> i32
+    return 0
+""",
+    "stmt_array": RES + """
+fn f(a:& [2]Res, k: i32)
+    a
 
 pub fn main() -> i32
     return 0
