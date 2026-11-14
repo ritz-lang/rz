@@ -232,6 +232,29 @@ NOT_MOVES = {
     "match_deref": "fn g(e: E) -> i32\n    0\n\nfn f(r: {T}) -> i32\n    match (*r).id\n        4 => 4\n        _ => 0\n",
 }
 
+# AGAST #2985: `r as T` is the plain slot's mistake when T is move-only: the
+# cast would copy the value out, and both owners drop it. Where the cast lands
+# doesn't matter, so one site is enough for each kind of reference.
+CAST_MOVES = {
+    "let_shared": "fn f(r: @T) -> i32\n    let d: T = ^r as T\n    d.id\n",
+    "let_mutable": "fn f(r: @&T) -> i32\n    let d: T = ^r as T\n    d.id\n",
+    "let_pointer": "fn f(r: *T) -> i32\n    let d: T = ^r as T\n    d.id\n",
+    "argument": "fn f(r: @T) -> i32\n    eat(^r as T)\n",
+}
+
+# ... and what stays legal: `n * 10 + DROPS` from main.
+CAST_CONTROLS = {
+    # Two by-value types: the cast moves `t`, so one drop (#2964).
+    "value_to_value": ("fn f() -> i32\n    var t = T { id: 4 }\n    let d: T = t as T\n    d.id\n\n"
+                       "pub fn main() -> i32\n    let n = f()\n    n * 10 + DROPS\n", 41),
+    # To a pointer type: still a reference, nothing is copied or dropped.
+    "to_pointer": ("fn f(r: @T) -> i32\n    let p = r as *T\n    p.id\n\n"
+                   "pub fn main() -> i32\n    var t = T { id: 4 }\n    let n = f(@t)\n    n * 10 + DROPS\n", 40),
+}
+
+# A copy type reads through the cast; only a move-only one is this rule.
+COPY_CAST = COPY + "fn f(r: @C) -> i32\n    let d: C = r as C\n    d.x\n\npub fn main() -> i32\n    0\n"
+
 MATCHES = {
     "deref": "fn f(e: {E}) -> i32\n    match *e\n        V(t) => 4\n        N => 0\n",
     "field": "fn f(w: {W}) -> i32\n    match w.e\n        V(t) => 4\n        N => 0\n",
@@ -450,6 +473,25 @@ def test_move_out_of_a_lent_param(tmp_path, compiler, site):
 @pytest.mark.parametrize("site", _ids(GENERIC_MOVES))
 def test_move_out_is_judged_per_instance(tmp_path, compiler, site):
     _assert_refused(compiler, tmp_path, site, MOVE + _main(GENERIC_MOVES[site], CALL_T), MOVE_OUT_OF_REF)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("site", _ids(CAST_MOVES))
+def test_a_cast_does_not_copy_a_move_only_value_out(tmp_path, compiler, site):
+    _assert_refused(compiler, tmp_path, site, MOVE + _main(CAST_MOVES[site], CALL_T), REF_INTO_VALUE)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", _ids(CAST_CONTROLS))
+def test_casts_that_copy_nothing_out(tmp_path, compiler, name):
+    src, want = CAST_CONTROLS[name]
+    assert _run(compiler, tmp_path, name, MOVE + src) == want
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_copy_type_cast_from_a_reference_is_not_this_rule(tmp_path, compiler):
+    comp, _, _ = _compile(compiler, tmp_path, "copy_cast", COPY_CAST)
+    assert comp.returncode == 0, (comp.stdout + comp.stderr)[-2000:]
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

@@ -1298,6 +1298,7 @@ class MoveChecker:
         elif isinstance(expr, rast.Cast):
             # `v as T` hands its operand's value on: it moves wherever the
             # cast does (AGAST #2948; `t as Res` with `t:& Res` copied out).
+            self._check_ref_cast(expr)
             self._check_expr(expr.expr, is_move_context=is_move_context)
 
         elif isinstance(expr, rast.If):
@@ -1513,6 +1514,20 @@ class MoveChecker:
         if isinstance(owner, rast.NamedType):
             return next((t for n, t in self.types.struct_fields(owner) if n == part), None)
         return None
+
+    def _check_ref_cast(self, cast: rast.Cast) -> None:
+        """`r as T` with `r: @T`, `@&T` or `*T` and T move-only (AGAST #2985):
+        the plain slot's error, at `r`. Without it the cast copies the value
+        out from behind the reference, and both owners drop it. A copy T reads
+        through, and a cast to a pointer type stays a reference."""
+        target = self.types.resolve(cast.target)
+        if not self.types.is_move_only(target):
+            return
+        held = self.types.resolve(self._infer_expr_type(cast.expr))
+        if not isinstance(held, (rast.PtrType, rast.RefType)):
+            return
+        if _type_key(self.types.resolve(held.inner)) == _type_key(target):
+            self.errors.append(OwnershipError(ref_rules.REF_INTO_VALUE, cast.expr.span))
 
     def _reject_move_out(self, span: Optional[rast.Span]) -> None:
         self.errors.append(OwnershipError(ref_rules.MOVE_OUT_OF_REF, span))
