@@ -868,6 +868,26 @@ def test_ritz1_deref_of_a_method_call_has_its_width(ritz1_bin, tmp_path, name):
     assert _run("ritz1", ritz1_bin, tmp_path, name, METHOD_DEREF[name]) == 3
 
 
+# AGAST #3176: so is `*x.m()` of a `-> *i8` method, as `*f()` of a `-> *i8`
+# fn is (#2540).  Same rows, a raw pointer in and out.
+METHOD_PTR_GO = METHOD_TYPES + """\
+impl S
+    fn go(self: @&S, n: *i8) -> *i8
+        return n
+
+pub fn main() -> i32
+    var s: S = S { v: 0 }
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(METHOD_DEREF))
+def test_deref_of_a_pointer_method_call_has_its_width(ritz1_bin, tmp_path, compiler, name):
+    program = METHOD_DEREF[name].replace(METHOD_GO, METHOD_PTR_GO).replace("@&a[1]", "@a[1]")
+    assert _run(compiler, ritz1_bin, tmp_path, name, program) == 3
+
+
 POINTER_VALUE_RETURN = {
     "plain": TYPES + """\
 fn f(p: *C) -> @&C
