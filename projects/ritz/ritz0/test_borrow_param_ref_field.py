@@ -613,6 +613,25 @@ impl Drop for Counted
 
 """
 
+# A move-only enum matched through a `:&` param: 2 from the payload, plus 1
+# drop of `s` when g returns.  The match moving or dropping it makes that 4.
+LENT_SLOT = """\
+enum Slot
+    Full(Counted)
+    Empty
+
+"""
+
+LENT_SLOT_MAIN = """
+fn g() -> i32
+    var s: Slot = Slot.Full(Counted { h: 2 })
+    return f(@&s)
+
+pub fn main() -> i32
+    let h: i32 = g()
+    return h + DROPS
+"""
+
 BY_VALUE = TYPES + """
 struct V
     c: C
@@ -1864,6 +1883,30 @@ pub fn main() -> i32
     var e: E = E.Full(3)
     return f(@&e)
 """,
+    "match_borrow_scrutinee_grouped": ENUM + """
+fn f(e:& E) -> i32
+    match (e)
+        Full(n) => return n
+        Nope => return 0
+
+pub fn main() -> i32
+    var e: E = E.Full(3)
+    return f(@&e)
+""",
+    # AGAST #2289: a lent scrutinee is lent to the match, not copied into it,
+    # so only the caller drops it.
+    "match_borrow_scrutinee_drops_once": DROP_COUNT + LENT_SLOT + """
+fn f(s:& Slot) -> i32
+    match s
+        Full(r) => return r.h
+        Empty => return 0
+""" + LENT_SLOT_MAIN,
+    "match_borrow_scrutinee_value_drops_once": DROP_COUNT + LENT_SLOT + """
+fn f(s:& Slot) -> i32
+    return match s
+        Full(r) => r.h
+        Empty => 0
+""" + LENT_SLOT_MAIN,
     "array_borrow_index": """\
 fn f(a:& [2]i32) -> i32
     return a[1]
@@ -2560,8 +2603,6 @@ RITZ1_GAPS = {
     "by_value_self": "AGAST #2278: ritz1 doesn't know a typed `self:& T` is a borrow",
     "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
-    "match_borrow_scrutinee": "AGAST #2289: `match` on a `:&` enum spills the pointer",
-    "match_borrow_scrutinee_value": "AGAST #2289: `match` on a `:&` enum spills the pointer",
     "array_referent_return": "AGAST #2302: ritz1 has no array return yet",
     "array_return": "AGAST #2302: ritz1 has no array return yet",
     "generic_struct_array_field": "AGAST #2292: a generic struct's `[N]T` field isn't substituted",

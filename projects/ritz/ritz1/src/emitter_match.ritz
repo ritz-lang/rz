@@ -1861,6 +1861,18 @@ fn match_scrutinee_is_addr(scr: *Expr) -> i32
         return 1
     0
 
+# The `%E` value in a place-scrutinee's slot, for arms that use the register.
+fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name: *u8, enum_name_len: i32) -> i32
+    let reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, reg)
+    emit_str(s, c" = load %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"  ; match @place\n")
+    reg
+
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
 fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
@@ -1910,24 +1922,27 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
             from_place = 0
         else if typed.kind == EXPR_INDEX or (typed.kind == EXPR_IDENT and find_local_struct_name(s, typed.ident_ptr, typed.ident_len) == null)
             from_place = 1
+    # AGAST #2289: an `e:& E` param reads as the borrow's pointer, so it is a
+    # place as `@place` is: that pointer is the slot.  Spilled as a `%E` it
+    # was a `ptr` clang refused.
+    var lent: i32 = 0
+    if is_enum == 1 and is_ctor == 0 and lent_referent_local(s, typed) != null
+        lent = 1
 
     # Evaluate scrutinee.  For `@place` the place's own address (a `ptr`;
     # `@expr` as a value is a ptrtoint'd i64) is the slot.
     var scrut_reg: i32 = 0
     var scrut_slot: i32 = 0
-    if is_enum == 1 and from_place == 1
+    if lent == 1
+        from_place = 1
+        scrut_slot = emit_expr(s, typed)
+        scrut_reg = emit_match_place_load(s, scrut_slot, enum_name, enum_name_len)
+    else if is_enum == 1 and from_place == 1
         scrut_slot = emit_lvalue_ptr(s, typed)
         if scrut_slot < 0
             emit_ir_error(s, c"cannot take address of match scrutinee")
             return 0
-        scrut_reg = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, scrut_reg)
-        emit_str(s, c" = load %")
-        emit_name(s, enum_name, enum_name_len)
-        emit_str(s, c", ptr ")
-        emit_reg(s, scrut_slot)
-        emit_str(s, c"  ; match @place\n")
+        scrut_reg = emit_match_place_load(s, scrut_slot, enum_name, enum_name_len)
     else if is_ctor == 1
         scrut_reg = emit_ctor_scrutinee(s, typed, enum_name, enum_name_len)
     else
