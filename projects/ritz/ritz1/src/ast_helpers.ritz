@@ -4512,6 +4512,8 @@ pub fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
     e.span.col = col
     e.int_val = val
     e.lit_kind = LIT_PLAIN
+    e.ident_ptr = null      # no overflowed source text (expr_int_lit)
+    e.ident_len = 0
     e.next = null
     return e
 
@@ -5214,6 +5216,58 @@ pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *Str
 # =============================================================================
 # Numeric parsing
 # =============================================================================
+
+# A NUMBER token's literal.  One of 2^64 or more doesn't fit an i64, which
+# parse_int wraps it into: it keeps its source text in ident_ptr/ident_len, so
+# literal_slot.ritz can refuse it and name it (AGAST #3083).  Null otherwise.
+pub fn expr_int_lit(p: *Parser, start: *u8, len: i32, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_int(p, parse_int(start, len), line, col)
+    if parse_int_overflows(start, len) == 1
+        e.ident_ptr = start
+        e.ident_len = len
+    return e
+
+# The base of a NUMBER token's digits (10, 16 or 2), and where they start.
+pub fn int_lit_base(start: *u8, len: i32, digits: **u8) -> i64
+    *digits = start
+    if len >= 3 and *start == 48  # '0'
+        let prefix: i32 = *(start + 1) as i32
+        if prefix == 120 or prefix == 88  # 'x' or 'X'
+            *digits = start + 2
+            return 16
+        if prefix == 98 or prefix == 66   # 'b' or 'B'
+            *digits = start + 2
+            return 2
+    10
+
+# The value of one digit of `base`, or -1 if `ch` isn't one (a suffix).
+pub fn int_lit_digit(ch: i32, base: i64) -> i64
+    var d: i64 = -1
+    if ch >= 48 and ch <= 57
+        d = (ch - 48) as i64
+    else if base == 16 and ch >= 65 and ch <= 70
+        d = (ch - 55) as i64
+    else if base == 16 and ch >= 97 and ch <= 102
+        d = (ch - 87) as i64
+    if d >= base
+        return -1
+    d
+
+# 1 if the literal is 2^64 or more: past every integer type.
+pub fn parse_int_overflows(start: *u8, len: i32) -> i32
+    var digits: *u8 = null
+    let base: i64 = int_lit_base(start, len, @digits)
+    let n: i32 = len - (digits - start) as i32
+    let max: u64 = 0xFFFFFFFFFFFFFFFF
+    var val: u64 = 0
+    for i in 0..n
+        let d: i64 = int_lit_digit(*(digits + i) as i32, base)
+        if d < 0
+            return 0
+        if val > (max - d as u64) / base as u64
+            return 1
+        val = val * base as u64 + d as u64
+    0
 
 pub fn parse_int(start: *u8, len: i32) -> i64
     # Check for hex prefix (0x or 0X)

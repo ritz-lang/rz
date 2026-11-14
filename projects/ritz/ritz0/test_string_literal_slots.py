@@ -143,6 +143,20 @@ REJECTED = {
                               _fits(-9223372036854775809, "u64")),
     "fit_i32_below_i64_min": (_fn("", "let a: i32 = -9223372036854775809\n0"), 2, 18,
                               _fits(-9223372036854775809, "i32")),
+    # AGAST #3083: ritz1 read 2^64.. mod 2^64, so these were 0, 10 and -1. A literal
+    # past u64 fits nothing, in any base, and is named in decimal as ritz0 does.
+    "fit_u64_two_64": (_fn("", "let a: u64 = 18446744073709551616\n0"), 2, 18,
+                       _fits(18446744073709551616, "u64")),
+    "fit_u8_wraps_small": (_fn("", "let a: u8 = 18446744073709551626\n0"), 2, 17,
+                           _fits(18446744073709551626, "u8")),
+    "fit_u64_hex_two_64": (_fn("", "let a: u64 = 0x10000000000000000\n0"), 2, 18,
+                           _fits(18446744073709551616, "u64")),
+    "fit_u64_bin_two_64": (_fn("", "let a: u64 = 0b1" + "0" * 64 + "\n0"), 2, 18,
+                           _fits(18446744073709551616, "u64")),
+    "fit_i64_neg_u64_max": (_fn("", "let c: i64 = -18446744073709551615\n0"), 2, 18,
+                            _fits(-18446744073709551615, "i64")),
+    "fit_i64_neg_two_64": (_fn("", "let c: i64 = -18446744073709551616\n0"), 2, 18,
+                           _fits(-18446744073709551616, "i64")),
     "fit_const": ("const K: u8 = 300\n" + _MAIN, 1, 15, _fits(300, "u8")),
     "fit_const_element": ("const A: [2]u8 = [1, 300]\n" + _MAIN, 1, 22, _fits(300, "u8")),
     "fit_global": ("var G: u8 = 300\n" + _MAIN, 1, 13, _fits(300, "u8")),
@@ -264,6 +278,9 @@ ACCEPTED = {
                        "    (a >> 63) as i32\n", 1),
     "fit_u64_max": ("fn main() -> i32\n    let a: u64 = 18446744073709551615\n"
                     "    (a >> 60) as i32\n", 15),
+    # AGAST #3083: u64::MAX in hex is the last literal that doesn't overflow.
+    "fit_u64_hex_max": ("fn main() -> i32\n    let a: u64 = 0xFFFFFFFFFFFFFFFF\n"
+                        "    (a >> 60) as i32\n", 15),
     "fit_i64_max": ("fn main() -> i32\n    let a: i64 = 9223372036854775807\n"
                     "    (a >> 62) as i32\n", 1),
     "fit_cast_says_so": ("fn main() -> i32\n    let c: i64 = 0xF000000000000000 as i64\n    if c < 0\n"

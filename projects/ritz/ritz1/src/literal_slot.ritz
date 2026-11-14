@@ -91,6 +91,48 @@ fn lit_eprint_u64(v: u64)
         lit_eprint_u64(v / 10)
     eprint_char((48 + (v % 10)) as u8)
 
+# The literal of 2^64 or more under `e`, `-` and all, or null (AGAST #3083).
+fn lit_overflowed(e: *Expr) -> *Expr
+    var lit: *Expr = e
+    if e.kind == EXPR_UNARY
+        lit = e.operand
+    if lit.ident_ptr == null
+        return null
+    lit
+
+# An overflowed literal's digits, in decimal whatever their base, as ritz0
+# names it.  Each decimal digit holds at most ~1.21 source digits' worth.
+fn lit_eprint_overflowed(lit: *Expr)
+    var digits: *u8 = null
+    let base: i64 = int_lit_base(lit.ident_ptr, lit.ident_len, @digits)
+    let n: i32 = lit.ident_len - (digits - lit.ident_ptr) as i32
+    var dec: [512]u8                # little-endian decimal digits
+    var used: i32 = 1
+    dec[0] = 0
+    if n > 400                      # too long for `dec`: as written
+        for i in 0..lit.ident_len
+            eprint_char(*(lit.ident_ptr + i))
+        return
+    for i in 0..n
+        let d: i64 = int_lit_digit(*(digits + i) as i32, base)
+        if d < 0
+            break
+        var carry: i64 = d
+        for j in 0..used
+            let x: i64 = (dec[j] as i64) * base + carry
+            dec[j] = (x % 10) as u8
+            carry = x / 10
+        while carry > 0
+            dec[used] = (carry % 10) as u8
+            carry = carry / 10
+            used = used + 1
+    while used > 1 and dec[used - 1] == 0
+        used = used - 1
+    var k: i32 = used - 1
+    while k >= 0
+        eprint_char((48 + dec[k]) as u8)
+        k = k - 1
+
 # `e` is a tail landing in the integer type `t`, or something else.
 fn lit_check_fits(s: *EmitterState, e: *Expr, t: i32)
     let width: i32 = narrow_int_width(t)
@@ -110,7 +152,19 @@ fn lit_check_fits(s: *EmitterState, e: *Expr, t: i32)
     # A negated one reads positive, below -2^63, which fits no type (AGAST #2138).
     # -2^63 itself negates back to i64::MIN, and fits as before.
     let neg_wrapped: i32 = (e.kind == EXPR_UNARY and v > 0) as i32
+    # 2^64 and past wrap mod 2^64, to anything: their source text says so.
+    let over: *Expr = lit_overflowed(e)
     var fits: i32 = 0
+    if over != null
+        if lit_report(s, e) == 1
+            eprint_char('`')
+            if e.kind == EXPR_UNARY
+                eprint_char('-')
+            lit_eprint_overflowed(over)
+            eprints_cstr(c"` does not fit in `")
+            eprints_cstr(narrow_type_name(t))
+            eprints_cstr(c"`\n")
+        return
     if neg_wrapped == 1
         fits = 0
     else if width < 64
