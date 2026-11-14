@@ -301,12 +301,9 @@ def test_an_instance_runs_as_ritz0_runs_it(tmp_path, need_ritz1, compiler, name)
 
 # AGAST #2437: `match Full(x)`, x a u8, builds a `Slot<u8>` even beside a
 # `Slot<i64>` the module names after it; ritz0's emitter took the last instance
-# declaring `Full`.  Only the binding's size tells them apart, and ritz1 sizes
-# every payload binding as an i64 (#3116), though it builds `Slot$u8`.
-@pytest.mark.parametrize("compiler", [
-    "ritz0",
-    *(pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="AGAST #3116"))
-      for c in ("ritz1", "ritz1_selfhosted"))])
+# declaring `Full`.  Only the binding's size tells them apart; ritz1 sized every
+# payload binding as an i64 until #3116.
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_ritz0_builds_the_scrutinees_own_instance(tmp_path, need_ritz1, compiler):
     need_ritz1(compiler)
     src = (SLOT + "fn main() -> i32\n    let s: Slot<u8> = Full(200 as u8)\n"
