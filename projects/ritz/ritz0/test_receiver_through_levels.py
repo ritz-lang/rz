@@ -11,7 +11,7 @@ read returned what lay past it.
 Each row says what the program must exit with, worked out from what it means.
 No compiler is the oracle: `GAPS` lists who's wrong or refuses, and each is a
 strict xfail citing its ticket. Levels past one extra (`***C`, `@**C`) are
-#2398's, in test_member_through_levels.py.
+in test_member_through_levels.py (#2398).
 """
 
 import pytest

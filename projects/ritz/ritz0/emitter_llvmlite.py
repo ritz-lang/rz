@@ -6390,7 +6390,9 @@ class LLVMEmitter:
                     struct_val = self._emit_expr(stmt.target.expr)
 
                 if isinstance(struct_val.type, ir.PointerType):
-                    # Expression evaluates to a pointer - use it directly
+                    # Expression evaluates to a pointer: through every level
+                    # of it to the struct (§5.4, #2398).
+                    struct_val = self._through_pointers(struct_val)
                     pointee_type = struct_val.type.pointee
                     if isinstance(pointee_type, ir.BaseStructType):
                         struct_name = self._get_struct_name_from_type(pointee_type)
@@ -6400,21 +6402,6 @@ class LLVMEmitter:
                             field_llvm_type = self._ritz_type_to_llvm(field_type)
                             field_ptr = self.builder.gep(struct_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
                             val = self._convert_type(val, field_llvm_type, stmt.value)
-                            self._drop_old_field(stmt.target, field_ptr, field_type)
-                            self.builder.store(val, field_ptr)
-                        else:
-                            raise ValueError(f"Cannot determine struct type for field assignment")
-                    elif isinstance(pointee_type, ir.PointerType) and isinstance(pointee_type.pointee, ir.BaseStructType):
-                        # Double pointer (**Struct) - load once to get *Struct, then GEP
-                        inner_ptr = self.builder.load(struct_val)
-                        inner_pointee = pointee_type.pointee
-                        struct_name = self._get_struct_name_from_type(inner_pointee)
-                        if struct_name:
-                            idx = self._get_struct_field_index(struct_name, stmt.target.field)
-                            _, field_type = self.struct_fields[struct_name][idx]
-                            field_llvm_type = self._ritz_type_to_llvm(field_type)
-                            field_ptr = self.builder.gep(inner_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                            val = self._convert_type(val, field_llvm_type)
                             self._drop_old_field(stmt.target, field_ptr, field_type)
                             self.builder.store(val, field_ptr)
                         else:
@@ -10004,15 +9991,14 @@ class LLVMEmitter:
         up to `loads` pointers on the way (lex.defs.defs, where lex.defs is
         *TokenDefs).
 
-        A place a `for` reads goes as far as a read does in _emit_field_access:
-        a level further, and a tuple behind a pointer. A store or `@` doesn't:
-        how far those go is #2398's question. A field through `Deref` is
-        rewritten before it gets here (_deref_field).
+        It goes through every pointer level (§5.4, #2398): `@p.c.y` with
+        `p: ***W` is `W.c`'s `y`; a field is never a pointer's. `loads` only
+        says whether a tuple's element may be reached from `ptr` as given; a
+        place a `for` reads also reaches a tuple behind a pointer. A field through `Deref` is rewritten before it
+        gets here (_deref_field): this only goes through pointers.
         """
         given = ptr
-        for _ in range(loads + self._reading_place):
-            if isinstance(ptr.type, ir.PointerType) and isinstance(ptr.type.pointee, ir.PointerType):
-                ptr = self.builder.load(ptr)
+        ptr = self._through_pointers(ptr)
         zero = ir.Constant(self.i32, 0)
         pointee = ptr.type.pointee if isinstance(ptr.type, ir.PointerType) else None
         if (isinstance(pointee, ir.LiteralStructType) and field.isdigit()
@@ -11208,7 +11194,10 @@ class LLVMEmitter:
 
         # Determine if we're accessing through a pointer or value
         if isinstance(struct_val.type, ir.PointerType):
-            # Pointer to struct: load the struct first
+            # Through every level of pointer to the struct (§5.4, #2398).
+            levels, end = self._pointer_levels(struct_val.type)
+            if levels > 1 and isinstance(end, ir.BaseStructType):
+                struct_val = self._through_pointers(struct_val)
             pointee_type = struct_val.type.pointee
             if isinstance(pointee_type, ir.BaseStructType):
                 # This is a pointer to a struct type - we need to GEP to the field, then load
@@ -11222,17 +11211,7 @@ class LLVMEmitter:
                 else:
                     raise ValueError(f"Cannot determine struct type for pointer")
             elif isinstance(pointee_type, ir.PointerType):
-                # Pointer to pointer - this means we have a RefType that needs one more deref
-                # struct_val is **T, we need to load once to get *T, then GEP into the struct
-                inner_pointee = pointee_type.pointee
-                if isinstance(inner_pointee, ir.BaseStructType):
-                    # Load to get *T from **T
-                    struct_ptr = self.builder.load(struct_val)
-                    struct_name = self._get_struct_name_from_type(inner_pointee)
-                    if struct_name:
-                        idx = self._get_struct_field_index(struct_name, expr.field)
-                        field_ptr = self.builder.gep(struct_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                        return self.builder.load(field_ptr)
+                # Pointers that don't end at a struct (taken off above).
                 raise ValueError(f"Cannot access field on double pointer: {pointee_type}")
             else:
                 # LLVM type doesn't tell us the struct type - try Ritz type info
@@ -12534,8 +12513,10 @@ class LLVMEmitter:
             return None
 
         receiver = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
-        if isinstance(receiver.type, ir.PointerType) and receiver.type.pointee == enum_type:
-            receiver = self.builder.load(receiver)
+        # Through every level of pointer to the enum (§5.4, #2398).
+        levels, end = self._pointer_levels(receiver.type)
+        if levels and end == enum_type:
+            receiver = self.builder.load(self._through_pointers(receiver))
         receiver = self._convert_type(receiver, enum_type)
 
         enum_alloca = self.builder.alloca(enum_type, name="enum.pred")
@@ -12981,11 +12962,14 @@ class LLVMEmitter:
             self._evaluated_once[id(expr.expr)] = receiver_probe
             receiver_type = receiver_probe.type
             if isinstance(receiver_type, ir.PointerType):
-                type_name = self._get_struct_name_from_type(receiver_type.pointee)
+                # The type at the end of every pointer level (§5.4, #2398);
+                # _load_to_self takes the levels off.
+                _, pointee = self._pointer_levels(receiver_type)
+                type_name = self._get_struct_name_from_type(pointee)
                 if type_name is None:
                     # Pointer-to-enum receiver (e.g. *Result<T,E>)
                     for enum_name, (enum_ty, _) in self.enum_types.items():
-                        if receiver_type.pointee == enum_ty:
+                        if pointee == enum_ty:
                             type_name = enum_name
                             break
             else:
@@ -13256,6 +13240,14 @@ class LLVMEmitter:
         while isinstance(ty, ir.PointerType):
             levels, ty = levels + 1, ty.pointee
         return levels, ty
+
+    def _through_pointers(self, ptr: ir.Value) -> ir.Value:
+        """`ptr` loaded until it points at what isn't a pointer: `.` goes
+        through every pointer level to the struct (§5.4, #2398), so a `C***`
+        becomes the `C*` a GEP wants. Pointers only, never `Deref` (§7.7)."""
+        while isinstance(ptr.type, ir.PointerType) and isinstance(ptr.type.pointee, ir.PointerType):
+            ptr = self.builder.load(ptr)
+        return ptr
 
     def _load_to_self(self, receiver: ir.Value, self_type: ir.Type) -> ir.Value:
         """Load through the pointers a receiver has beyond what `self` takes.

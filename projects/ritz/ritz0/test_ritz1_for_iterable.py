@@ -531,23 +531,25 @@ def test_a_field_two_levels_down_is_live(run_with, compiler):
     assert run_with(compiler, "levels_field", program) == 53
 
 
-# A third level is #2398's: ritz0 refuses it, as it did before a `for` was live.
+# `.` goes through every level (§5.4, #2398), so the loop and the store in its
+# body both reach `h.a` through `**H` and `***H`.  ritz0 refused both.
+_HOLD = "    var q: *H = @h\n    var r: **H = @q\n"
+THROUGH_LEVELS = {"two": ("p: **H", "f(@q)"), "three": ("p: ***H", "f(@r)")}
+
+
 @pytest.mark.integration
-def test_ritz0_a_third_level_stays_refused(compile_with):
-    program = (_H3 + "fn f(p: ***H) -> i32\n    var t: i32 = 0\n    for v in p.a\n"
-               "        t = t + v\n    return t\n\n" + MAIN + "    return 0\n")
-    comp, ll, _ = compile_with("ritz0", "third", program)
-    assert comp.returncode != 0
-    assert not ll.exists()
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("levels", sorted(THROUGH_LEVELS))
+def test_a_write_through_the_walked_pointers_is_seen(run_with, compiler, levels):
+    sig, call = THROUGH_LEVELS[levels]
+    program = _writes_in(sig, "p.a", call, fill=_FILL3 + _HOLD)
+    assert run_with(compiler, f"through_{levels}", program) == 53
 
 
-# `@` and a store stay as far as they went: only a `for`'s read goes further.  Each
-# of these is what ritz0 raised before a `for` was live.
+# `@` of a tuple's element behind a pointer stays refused: only a `for`'s read
+# reaches a tuple there.  Each of these is what ritz0 raised before a `for` was live.
 _TUPLE_PTR = "fn f(p: *(i32, [3]i32)) -> i32\n"
 NO_FURTHER = {
-    "store_through_two_levels": (_H3 + "fn f(p: **H) -> i32\n    var t: i32 = 0\n    for v in p.a\n"
-                                 "        t = t + v\n    p.a[2] = 50\n    return t\n\n" + MAIN
-                                 + "    return 0\n"),
     "address_behind_a_pointer_to_a_tuple": (_TUPLE_PTR + "    let q: @i32 = @p.0\n    return *q\n\n"
                                             + MAIN + "    return 0\n"),
     "address_behind_a_reference_to_a_tuple": ("fn f(p: @(i32, [3]i32)) -> i32\n"

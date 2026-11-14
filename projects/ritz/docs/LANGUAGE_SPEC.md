@@ -1286,6 +1286,31 @@ A call evaluates its receiver exactly once, before its arguments, however the
 method takes `self`. That includes the operands of a place: `arr[next()].m()`
 runs `next` once.
 
+`.` goes through every level of pointer and reference to the receiver's type, as
+it does for a field (§7.7): `p.m()` with `p: @*C`, `**C` or `***C` is `C.m`, and
+`self` is the `C`, not a pointer to it. A method whose `self` is itself a pointer
+(`self: **C`) takes the levels it asks for.
+
+```ritz
+struct Tally
+    n: i32
+
+impl Tally
+    fn bump(self: @&Tally)
+        self.n = self.n + 1
+
+fn bump_twice(p: ***Tally)
+    p.bump()
+    p.bump()
+
+fn demo_levels() -> i32
+    var t = Tally { n: 1 }
+    var a: *Tally = @&t
+    var b: **Tally = @&a
+    bump_twice(@&b)
+    t.n                     # 3
+```
+
 ```ritz
 struct Point
     x: i32
@@ -1900,8 +1925,27 @@ fn main() -> i32
     p.x + p.get_x()
 ```
 
-`.` on a pointer or reference to a struct reaches the struct, as above. It reaches
-through a struct itself only when the struct opts in (LARB R17), through two
+`.` on a pointer or reference to a struct reaches the struct, as above, **through
+every level**: with `p: @*W`, `**W` or `***W`, `p.f` is `W`'s field `f` for a read,
+a store, `op=` and `@`/`@&`, and so is each step of a chain like `p.c.x` or
+`p.a[1]`. `*` takes off one level and `.` the rest, so `(*p).f` means `p.f`.
+
+```ritz
+struct Inner
+    x: i32
+
+struct Outer
+    c: Inner
+    a: [2]i32
+
+fn poke(p: ***Outer) -> i32
+    p.c.x = 3
+    p.a[1] += 7
+    let e: @i32 = @p.a[1]
+    p.c.x * 10 + *e
+```
+
+It reaches through a struct itself only when the struct opts in (LARB R17), through two
 compiler-known traits, resolved statically like `Drop` and `Index` (§7.8):
 
 ```text

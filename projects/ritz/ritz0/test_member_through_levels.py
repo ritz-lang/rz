@@ -206,6 +206,9 @@ HOLDERS = {
                              "    if p.is_none()\n        return 1\n    3\n\n"
                              "pub fn main() -> i32\n    var o: Option<i32> = Some(9)\n"
                              "    var q: *Option<i32> = @&o\n    g(@&q)\n", 3),
+    # No level at all: a value isn't loaded through (#2398's control).
+    "tag_of_a_value": ("import ritzlib.option\n\npub fn main() -> i32\n    var o: Option<i32> = Some(9)\n"
+                       "    if o.is_some()\n        return 3\n    1\n", 3),
 }
 
 # `*` takes one level off; `.` takes the rest.
@@ -270,17 +273,9 @@ for _name, (_fn, _body, _make, _want) in FIELD_REFS.items():
     HOLDERS[f"field_ref.{_name}"] = (_main(_body, _fn + "\n", _make), _want)
 
 
-# ritz0 refuses these (#2398).
-ONE_EXTRA_LEVEL = ("nested_store", "nested_compound", "nested_address", "nested_method_read",
-                   "nested_method_store", "array_read", "array_store", "array_compound",
-                   "element_address", "address_read", "address_store")
-DEPTH_GAPS = {f"{level}.{shape}" for level in ("shared_ptr", "mut_ptr", "ptr_ptr", "lent_ptr_ptr")
-              for shape in ONE_EXTRA_LEVEL}
-DEPTH_GAPS |= {row for row in ROWS if row.split(".")[0] in ("ptr_ptr_ptr", "shared_ptr_ptr", "mut_ptr_ptr",
-                                                            "shared_ptr_ptr_ptr")}
-DEPTH_GAPS |= {"let_shared_ptr_ptr_store", "inferred_from_ptr_ptr", "tag_through_reference",
-               "tag_through_pointers", "global_ptr_ptr_ptr_read", "inferred_from_ptr_ptr_ptr",
-               "let_annotated_deep", "copy_deep", "field_borrowed_through_levels"}
+# ritz0 refused 189 of these with a raw ValueError past one extra level, on
+# the store, address and method paths and through `***S` / `@**S` (#2398).
+# It goes through every level now (§5.4), so every row runs on ritz0.
 
 # ritz1 refuses these (#2399).
 # `lent_ptr.copy_*` (`let r = p` of a `*S`) closed by #2596.
@@ -292,7 +287,7 @@ LOWERING_GAPS = {"returned_read", "returned_store",
 
 def _gap(row, compiler):
     if compiler == "ritz0":
-        return 2398 if row in DEPTH_GAPS else None
+        return None
     return 2399 if row in LOWERING_GAPS else None
 
 
