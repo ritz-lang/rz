@@ -166,6 +166,17 @@ OTHER_SHAPES = {
                                      REF_TO_OTHER_POINTER),
     "other_scalar_pointer_generic_whole": ("fn g<T>(p: @&T) -> i32\n    0\n\nfn f(h:& *i32) -> i32\n"
                                            "    g<*i64>(^@&h)\n", REF_TO_OTHER_POINTER),
+    # #3151: an `@&*U` field is a slot too, with a struct U or a scalar one.
+    "field_slot_other_pointer_assign": ("struct C\n    x: i32\n\nstruct D\n    a: i32\n\nstruct W\n    r: @&*D\n\n"
+                                        "fn f(h:& *C, d: @&*D) -> i32\n    var w = W { r: d }\n    w.r = ^@&h\n    0\n",
+                                        REF_TO_OTHER_POINTER),
+    "field_slot_other_pointer_literal": ("struct C\n    x: i32\n\nstruct D\n    a: i32\n\nstruct W\n    r: @&*D\n\n"
+                                         "fn f(h:& *C) -> i32\n    let w = W { r: ^@&h }\n    0\n", REF_TO_OTHER_POINTER),
+    "field_slot_other_scalar_assign": ("struct W\n    r: @&*i64\n\n"
+                                       "fn f(h:& *i32, d: @&*i64) -> i32\n    var w = W { r: d }\n    w.r = ^@&h\n    0\n",
+                                       REF_TO_OTHER_POINTER),
+    "field_slot_other_scalar_literal": ("struct W\n    r: @*i64\n\n"
+                                        "fn f(h:& *i32) -> i32\n    let w = W { r: ^@h }\n    0\n", REF_TO_OTHER_POINTER),
     "struct_pointer_into_scalar": ("struct C\n    x: i32\n\nfn f(h:& *C) -> i32\n    let p: @&*i32 = ^@&h\n    0\n",
                                    REF_TO_OTHER_POINTER),
     # A temporary has nothing to borrow, whatever its drop would have been.
@@ -228,6 +239,18 @@ EXPLICIT = {
     "scalar_pointer_param_borrowed": ("fn go(h:& *i32, d: *i32)\n    let p: @&*i32 = @&h\n    *p = d\n",
                                       "    var n: i32 = 3\n    var m: i32 = 1\n    var p: *i32 = @m\n"
                                       "    go(p, @n)\n    *p\n", 3),
+    # #3151: an `@&*U` field of a scalar U is emitted, and its own U fits.
+    "scalar_pointer_field": ("struct V\n    r: @&*i32\n\nfn go(h:& *i32, d: *i32)\n    let v = V { r: @&h }\n    *v.r = d\n",
+                             "    var n: i32 = 3\n    var m: i32 = 1\n    var p: *i32 = @m\n"
+                             "    go(p, @n)\n    *p\n", 3),
+    "scalar_pointer_field_generic": ("struct V<T>\n    r: @&*i32\n    t: T\n\nfn go(h:& *i32, d: *i32)\n"
+                                     "    let v = V<i64> { r: @&h, t: 0 }\n    *v.r = d\n",
+                                     "    var n: i32 = 3\n    var m: i32 = 1\n    var p: *i32 = @m\n"
+                                     "    go(p, @n)\n    *p\n", 3),
+    "struct_pointer_field": ("struct V\n    r: @&*C\n\nfn go(h:& *C, d: *C)\n    var v = V { r: null }\n"
+                             "    v.r = @&h\n    *v.r = d\n",
+                             "    var c = C { x: 3 }\n    var d = C { x: 1 }\n    var p: *C = @d\n"
+                             "    go(p, @c)\n    p.x\n", 3),
     # #3160: `@&q` of a reference to the same U still fits.
     "reference_pointee_borrowed": ("fn go(q: @&i32)\n    let p: @&*i32 = @&q\n    **p = 3\n",
                                    "    var n: i32 = 1\n    go(@&n)\n    n\n", 3),
