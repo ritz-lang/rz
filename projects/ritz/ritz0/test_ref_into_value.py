@@ -253,7 +253,23 @@ CAST_CONTROLS = {
 }
 
 # A copy type reads through the cast; only a move-only one is this rule.
-COPY_CAST = COPY + "fn f(r: @C) -> i32\n    let d: C = r as C\n    d.x\n\npub fn main() -> i32\n    0\n"
+# `r as C` with C copy reads the referent (AGAST #3004): `d` is a copy, so a
+# later write through `r` leaves it at 4.  ritz1 stored the reference's i64 as
+# the `%C` and clang refused the IR.  `{W}` writes through `r` where it can.
+COPY_CASTS = {
+    "shared": ("@C", "", "@c"),
+    "mutable": ("@&C", "    r.x = 9\n", "@&c"),
+    "pointer": ("*C", "    *r = C { x: 9 }\n", "@c"),
+}
+COPY_CAST = ("fn f(r: {R}) -> i32\n    let d: C = r as C\n{W}    d.x\n\n"
+             "pub fn main() -> i32\n    var c = C { x: 4 }\n    f({A})\n")
+# Where else the cast's `C` lands, and the by-value cast it shares a path with.
+COPY_CAST_SITES = {
+    "untyped_let": "fn f(r: @C) -> i32\n    let d = r as C\n    d.x\n",
+    "argument": "fn f(r: @C) -> i32\n    val(r as C)\n",
+    "return": "fn g(r: @C) -> C\n    return r as C\n\nfn f(r: @C) -> i32\n    g(r).x\n",
+    "by_value": "fn f(r: @C) -> i32\n    let c: C = *r\n    let d: C = c as C\n    d.x\n",
+}
 
 MATCHES = {
     "deref": "fn f(e: {E}) -> i32\n    match *e\n        V(t) => 4\n        N => 0\n",
@@ -489,9 +505,18 @@ def test_casts_that_copy_nothing_out(tmp_path, compiler, name):
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_copy_type_cast_from_a_reference_is_not_this_rule(tmp_path, compiler):
-    comp, _, _ = _compile(compiler, tmp_path, "copy_cast", COPY_CAST)
-    assert comp.returncode == 0, (comp.stdout + comp.stderr)[-2000:]
+@pytest.mark.parametrize("ref", _ids(COPY_CASTS))
+def test_a_copy_type_cast_from_a_reference_is_not_this_rule(tmp_path, compiler, ref):
+    r, write, arg = COPY_CASTS[ref]
+    src = COPY + COPY_CAST.replace("{R}", r).replace("{W}", write).replace("{A}", arg)
+    assert _run(compiler, tmp_path, f"copy_cast_{ref}", src) == 4
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("site", _ids(COPY_CAST_SITES))
+def test_a_copy_type_cast_lands_as_the_referent(tmp_path, compiler, site):
+    entry = "    var c = C { x: 4 }\n    f(@c)\n"
+    assert _run(compiler, tmp_path, f"copy_cast_{site}", COPY + _main(COPY_CAST_SITES[site], entry)) == 4
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
