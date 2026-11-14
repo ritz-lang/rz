@@ -761,8 +761,44 @@ run_test_script() {
         linked+=("$n")
     done < <(resolve_bin_names "$example_dir")
 
-    timeout --signal=KILL 30s bash "$test_script" >/dev/null 2>&1
-    local result=$?
+    # Run test.sh in a session of its own and kill that whole session once it
+    # returns -- AGAST #3139.  59_async_net and 60_echo_server fork a server
+    # and a client; when the parent bails out early its test.sh exits while
+    # the children sit in accept/connect, reparented to init, holding ports
+    # and memory on a shared gate host.  timeout's own group KILL only covers
+    # the timed-out case, and only for processes still in timeout's group; the
+    # session survives both a normal exit and a child that set its own group.
+    #
+    # `&` + `wait`, not a plain foreground call, to learn the session id: a
+    # background job of this non-interactive shell is not a group leader, so
+    # setsid execs in place (no fork) and $! is the session leader's pid,
+    # i.e. the sid.  `{ ...; } 2>/dev/null` swallows bash's "Killed" report.
+    #
+    # The budget is enforced here, not by timeout(1), whose behaviour depends
+    # on which one is installed: GNU `timeout --signal=KILL` exits 137, uutils
+    # 0.10 exits 124 for the same KILL, and uutils 0.2.2 never delivers the KILL
+    # at all.  A watchdog `sleep` races test.sh under `wait -n`; if the
+    # watchdog wins, the whole session is KILLed and the result is 137 on every
+    # host.  Either way the loser is killed and reaped, so neither outlives us.
+    # `wait -n -p` (bash >= 5.1) names the job that finished and consumes its
+    # status, so only the other one is waited for afterwards.
+    local sid wd first result
+    { setsid bash "$test_script" >/dev/null 2>&1 </dev/null &
+      sid=$!
+      sleep "${TEST_SCRIPT_TIMEOUT:-30}" &
+      wd=$!
+      wait -n -p first "$sid" "$wd"
+      result=$?
+      if [[ "$first" == "$wd" ]]; then
+          # Watchdog fired with test.sh still running: timed out.
+          pkill -KILL -s "$sid" 2>/dev/null
+          wait "$sid"
+          result=137
+      else
+          kill "$wd" 2>/dev/null
+          wait "$wd"
+      fi; } 2>/dev/null
+    pkill -KILL -s "$sid" 2>/dev/null || true
 
     for n in "${linked[@]}"; do rm -f "./$n"; done
     cd "$orig_dir"
