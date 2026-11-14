@@ -267,7 +267,8 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum
 # returns the binding's var_type (TYPE_PTR, or TYPE_REF / TYPE_MUT_REF for a
 # user enum's `@T` / `@&T`).  Otherwise returns 0 and the caller keeps the
 # i64 binding.  That i64 had no pointee, so `v.a` and `(*v).a` were
-# "unhandled EXPR_MEMBER".  Only one level: a `**T` payload stays an i64.
+# "unhandled EXPR_MEMBER".  AGAST #3047: a `**T` payload (`Option<**Pair>`,
+# a user enum's `P(**Pair)`) returns TYPE_PTR_PTR, still naming the struct.
 fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
@@ -277,7 +278,7 @@ fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, 
         let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, user_arm_variant(enum_name, enum_name_len, arm))
         if uf == null or uf.array_size != 0 or uf.field_type_name_len <= 0
             return 0
-        if uf.field_type != TYPE_PTR and uf.field_type != TYPE_REF and uf.field_type != TYPE_MUT_REF
+        if uf.field_type != TYPE_PTR and uf.field_type != TYPE_PTR_PTR and uf.field_type != TYPE_REF and uf.field_type != TYPE_MUT_REF
             return 0
         if is_concrete_payload_type(s, uf.field_type_name, uf.field_type_name_len, 0) == 0
             return 0
@@ -293,6 +294,14 @@ fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, 
     let k: i32 = mangled_ref_prefix(decl, decl_len)
     if k == 0
         return 0
+    # AGAST #3047: `**Pair` spells "ptr_ptr_Pair" (`@*Pair`, "ref_ptr_Pair",
+    # stays unbound).
+    if decl_len > 8 and memcmp(decl, c"ptr_ptr_", 8) == 0
+        if is_concrete_payload_type(s, decl + 8, decl_len - 8, 0) == 0
+            return 0
+        *out_name = decl + 8
+        *out_len = decl_len - 8
+        return TYPE_PTR_PTR
     if is_concrete_payload_type(s, decl + k, decl_len - k, 0) == 0
         return 0
     *out_name = decl + k
@@ -322,6 +331,12 @@ fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_n
     emit_str(s, c", ptr ")
     emit_reg(s, alloca_reg)
     emit_str(s, c"\n")
+    if var_type == TYPE_PTR_PTR
+        # AGAST #3047: as `let pp: **Pair` registers (emitter_stmt.ritz,
+        # #1933): pointee `*`, then the struct one level further in.
+        add_local_full(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, var_type, st_name, st_name_len, TYPE_PTR, 0, 0)
+        set_local_inner_pointee(s, arm.pattern_inner_name, arm.pattern_inner_name_len, TYPE_STRUCT)
+        return
     add_local_full(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, var_type, st_name, st_name_len, TYPE_STRUCT, 0, 0)
 
 # AGAST #1515: bind `Some(p)` / `Ok(s)` to a copy of a struct payload.  The

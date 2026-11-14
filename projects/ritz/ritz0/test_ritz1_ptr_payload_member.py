@@ -4,7 +4,8 @@
 `Some(v)` over a typed local `o: Option<*Pair>` bound `v` as a bare i64, so
 `v.a` and `(*v).a` were "unhandled EXPR_MEMBER" on ritz1.  ritz0 ran them.  The
 binding now records the struct it points to, for Option, Result and a user
-enum's `*T` / `@T` / `@&T` variant, reads and stores alike.
+enum's `*T` / `@T` / `@&T` variant, reads and stores alike.  #3047 adds
+`**T`, which binds as a `let pp: **Pair` does.
 
 Each row's exit code is worked out from the program: p is Pair { a: 2, b: 3 }.
 """
@@ -28,11 +29,13 @@ enum E
     P(*Pair)
     S(@Pair)
     M(@&Pair)
+    PP(**Pair)
     N
 
 pub fn main() -> i32
     var p = Pair { a: 2, b: 3 }
     let q: *Pair = @&p
+    var r: *Pair = q
 """
 
 # name: (the rest of main, exit code).
@@ -107,6 +110,45 @@ ROWS = {
     "option_mut_store": (
         "let o: Option<@&Pair> = Some(@&p)\nmatch o\n    Some(v) => v.a = 4\n    _ => 0\np.a",
         4,
+    ),
+    # AGAST #3047: two levels.  `v` is a `**Pair`; `(*v)` is the `*Pair`.
+    "option_ptr_ptr_read": (
+        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) => (*v).b\n    _ => 50",
+        3,
+    ),
+    "option_ptr_ptr_local": (
+        "let pp: **Pair = @&r\nlet o: Option<**Pair> = Some(pp)\nmatch o\n    Some(v) => (**v).a\n    _ => 50",
+        2,
+    ),
+    "option_ptr_ptr_store": (
+        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) => (*v).a = 7\n    _ => 0\np.a",
+        7,
+    ),
+    "result_ptr_ptr_ok": (
+        "let o: Result<**Pair, i32> = Ok(@&r)\nmatch o\n    Ok(v) => (**v).b\n    Err(e) => 50",
+        3,
+    ),
+    "result_ptr_ptr_err": (
+        "let o: Result<i32, **Pair> = Err(@&r)\nmatch o\n    Ok(v) => 50\n    Err(e) => (*e).a",
+        2,
+    ),
+    "enum_ptr_ptr_read": (
+        "let e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => (*v).a + (**v).b\n    _ => 50",
+        5,
+    ),
+    # The binding's pointee is the `*Pair`, not the Pair: `**v` copies a Pair
+    # and `*v = ...` retargets r.
+    "option_ptr_ptr_copy": (
+        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) =>\n        let x: Pair = **v\n        x.a * 10 + x.b\n    _ => 50",
+        23,
+    ),
+    "enum_ptr_ptr_retarget": (
+        "var p2 = Pair { a: 6, b: 7 }\nlet e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => *v = @&p2\n    _ => 0\nr.a",
+        6,
+    ),
+    "enum_ptr_ptr_store": (
+        "let e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => (**v).b = 8\n    _ => 0\np.b",
+        8,
     ),
 }
 
