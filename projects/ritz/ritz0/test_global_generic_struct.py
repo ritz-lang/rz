@@ -81,6 +81,20 @@ PROGRAMS = {
                        "    lb[1][2].v = 1099511627776\n    lb[0][1].v = 5\n"
                        "    if lb[1][2].v != 1099511627776\n        return 1\n"
                        "    if lb[0][1].v != 5\n        return 2\n    return 0\n"),
+    # AGAST #3119: the same 2-D array as a struct field.  The concrete-struct
+    # field walk read only `array_elem_type_name`, so P$i64 was never
+    # instantiated and `w.a[1][2].v` was "unhandled EXPR_MEMBER".
+    "field_array_2d": (_P + "struct W\n    a: [2][3]P<i64>\n\n" + _MAIN
+                       + "    var w: W\n"
+                       "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                       "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                       "    if w.a[0][1].v != 5\n        return 2\n    return 0\n"),
+    # ... and a generic struct's `[2][3]P<T>` field, specialised as W$i64.
+    "generic_field_array_2d": (_P + "struct W<T>\n    a: [2][3]P<T>\n\n" + _MAIN
+                               + "    var w: W<i64>\n"
+                               "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                               "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                               "    if w.a[0][1].v != 5\n        return 2\n    return 0\n"),
 }
 
 

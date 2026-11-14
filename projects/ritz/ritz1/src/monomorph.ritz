@@ -895,6 +895,7 @@ fn collect_struct_types_from_fields(m: *Module, f: *StructField)
         # (#3099) `[2]*Box$i32`.
         if cur.field_type == TYPE_ARRAY and array_elem_names_struct(cur) == 1
             add_struct_from_mangled_name(m, cur.array_elem_type_name, cur.array_elem_type_name_len)
+        add_struct_from_array_shape(m, cur.array_shape)   # AGAST #3119: `[2][3]Box$i32`
         cur = cur.next
 
 fn collect_struct_types_from_stmts(m: *Module, body: *Stmt)
@@ -994,6 +995,8 @@ fn collect_instantiations_from_module(m: *Module)
                     add_struct_from_mangled_name(m, fld.field_type_name, fld.field_type_name_len)
                 if fld.array_elem_type_name != null
                     add_struct_from_mangled_name(m, fld.array_elem_type_name, fld.array_elem_type_name_len)
+                # AGAST #3119: `a: [2][3]P<i64>` keeps P$i64 only in its shape.
+                add_struct_from_array_shape(m, fld.array_shape)
                 fld = fld.next
         st = st.next
 
@@ -2452,6 +2455,19 @@ fn array_shape_subst(sh: *ArrayShape, type_param: *u8, type_param_len: i32, subs
     out.leaf_name_len = subst_len
     return out
 
+# AGAST #3119: `sh` with a generic leaf's `$T` rewritten, `[2][3]P<T>` (leaf
+# `P$T`) at T = i64 is leaf `P$i64`.  Shared as it stood, `W$i64.a` named the
+# `%P$T` no struct is, and `w.a[1][2].v` fell to "unhandled EXPR_MEMBER".
+fn array_shape_mangled_subst(sh: *ArrayShape, type_param: *u8, type_param_len: i32, suffix: *u8, suffix_len: i32) -> *ArrayShape
+    if sh == null or sh.leaf_name == null or find_dollar_sign(sh.leaf_name, sh.leaf_name_len) <= 0
+        return sh
+    let out: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
+    *out = *sh
+    var n: i32 = 0
+    substitute_type_param_in_name(sh.leaf_name, sh.leaf_name_len, type_param, type_param_len, suffix, suffix_len, @out.leaf_name, @n)
+    out.leaf_name_len = n
+    return out
+
 # A reference param that holds a pointer records what that pointer points at,
 # and a `:&` one reads as the pointer, so it needs it twice.
 fn set_ref_ptr_pointee(param: *Param, pointee: i32)
@@ -3320,7 +3336,7 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
     cloned.name_len = fields.name_len
     cloned.inner_pointee_type = fields.inner_pointee_type  # AGAST #1924
     cloned.fn_sig = fields.fn_sig  # AGAST #2120
-    cloned.array_shape = fields.array_shape  # AGAST #2097
+    cloned.array_shape = array_shape_mangled_subst(fields.array_shape, type_param, type_param_len, suffix, suffix_len)  # AGAST #2097, #3119
     cloned.ptr_array = ptr_array_unless_generic(fields.ptr_array)  # AGAST #2329
 
     # Copy array info first: substituting `v: T` at an array T writes it
