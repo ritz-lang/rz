@@ -711,7 +711,34 @@ pub fn main() -> i32
     let p: *W<i32> = w.g()
     return p.v
 """,
-    "generic_by_value": TYPES + GENERIC + """\
+    # AGAST #3179: `.v` straight off a specialised call's `*W$i32` return.
+    "generic_bare_returns_pointer_field": TYPES + GENERIC + """\
+impl<T> W<T>
+    fn g(self:&) -> *W<T>
+        return @self
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 3 }
+    return w.g().v
+""",
+    "generic_typed_returns_pointer_field": TYPES + GENERIC + """\
+impl<T> W<T>
+    fn g(self:& W<T>) -> *W<T>
+        return @self
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 3 }
+    return w.g().v
+""",
+    "generic_fn_returns_pointer_field": TYPES + GENERIC + """\
+fn g<T>(p: *W<T>) -> *W<T>
+    return p
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 3 }
+    return g(@w).v
+""",
+    "generic_by_value":TYPES + GENERIC + """\
 fn k(p: *W<i32>) -> i32
     return p.v
 
