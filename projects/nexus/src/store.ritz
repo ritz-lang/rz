@@ -32,6 +32,8 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.string { String, string_drop, string_push_cstr, string_push_i64 }
+import ritzlib.strview { StrView }
+import ritzlib.os.env { env_get_or }
 
 import spire.repo.mausoleum { Db, DbField }
 import spire.repo.mausoleum { db_init, db_set_encryption, db_connect, db_close, db_is_connected }
@@ -69,6 +71,8 @@ var g_port: i32 = 7777
 var g_encrypted: i32 = 1     # mausoleum's default serve mode
 var g_workers: i32 = 1       # how many workers zeus runs (argv[3])
 
+var g_config_error: i32 = 0  # MAUSOLEUM_HOST / _PORT unusable: refuse to serve
+
 var g_db: Db
 var g_mode: i32 = -1       # STORE_UNAVAILABLE until wiki_store_init
 var g_db_down_logged: i32 = 0
@@ -85,6 +89,68 @@ pub fn wiki_store_set_connection(host: *u8, host_len: i32, port: i32)
         g_host[i] = *(host + i)
     g_host[g_host_len] = 0  # Null terminate
     g_port = port
+
+
+# Where mausoleum is, from MAUSOLEUM_HOST / MAUSOLEUM_PORT's values (AGAST
+# #3065). "" means unset: keep what is configured (127.0.0.1:7777 by
+# default). Before this nexus always dialed 127.0.0.1:7777, so a test stack
+# talked to whatever mausoleum another process had up there.
+#
+# A value that is set but unusable (port not 1..65535, host over 63 bytes)
+# returns -1 and makes wiki_store_init refuse (STORE_UNAVAILABLE): falling
+# back to the default address would reach the wrong store, silently.
+pub fn wiki_store_configure(host: StrView, port: StrView) -> i32
+    if host.len > 63
+        log_config_error(c"MAUSOLEUM_HOST is longer than 63 bytes")
+        return -1
+    var p: i64 = g_port as i64
+    if port.len > 0
+        p = 0
+        for i in 0..port.len
+            let c: u8 = *(port.ptr + i)
+            if c < '0' or c > '9' or p > 65535
+                p = 0
+                break
+            p = p * 10 + (c - 48) as i64
+        if p < 1 or p > 65535
+            log_config_error(c"MAUSOLEUM_PORT is not a port number (1..65535)")
+            return -1
+    if host.len > 0
+        wiki_store_set_connection(host.ptr, host.len as i32, p as i32)
+    else
+        if g_host_len == 0
+            wiki_store_set_connection(c"127.0.0.1", 9, p as i32)
+        else
+            g_port = p as i32
+    0
+
+
+# wiki_store_configure with this process's MAUSOLEUM_HOST / MAUSOLEUM_PORT.
+pub fn wiki_store_configure_from_env() -> i32
+    wiki_store_configure(env_get_or("MAUSOLEUM_HOST", ""), env_get_or("MAUSOLEUM_PORT", ""))
+
+
+fn log_config_error(why: *u8)
+    g_config_error = 1
+    var line: String = log_begin()
+    string_push_cstr(@&line, c"[STORE] ")
+    string_push_cstr(@&line, why)
+    string_push_cstr(@&line, c"; REFUSING to serve pages until it is fixed")
+    log_end(@&line)
+
+
+# For tests: forget a rejected configuration.
+pub fn wiki_store_clear_config_error()
+    g_config_error = 0
+
+
+# The configured mausoleum address (NUL-terminated host).
+pub fn wiki_store_host() -> *u8
+    @g_host[0]
+
+
+pub fn wiki_store_port() -> i32
+    g_port
 
 
 # 1 = encrypted transport (the default, as mausoleum serves), 0 = plaintext
@@ -163,7 +229,12 @@ pub fn wiki_store_init() -> i32
 
     # Set default connection if not configured
     if g_host_len == 0
-        wiki_store_set_connection(c"127.0.0.1", 9, 7777)
+        wiki_store_set_connection(c"127.0.0.1", 9, g_port)
+
+    if g_config_error != 0
+        log_cstr(c"[STORE] Not connecting: the mausoleum address is misconfigured (see above)")
+        g_mode = STORE_UNAVAILABLE
+        return g_mode
 
     var line: String = log_begin()
     string_push_cstr(@&line, c"[STORE] Connecting to mausoleum via Spire at ")

@@ -35,8 +35,8 @@ breakage that happens to make the same check red.
 Every process is started in its own session and killed by process group
 (zeus's nexus workers included) on exit, on failure and on SIGTERM/SIGINT.
 The run checks afterwards that nothing it started survived. Ports come from
-the kernel (bind to 0) except mausoleum's 7777, which nexus's store dials
-unconditionally (#2466); if 7777 is taken the stack suite is SKIPPED, loudly.
+the kernel (bind to 0), mausoleum's too: nexus dials the port zeus passes
+on as MAUSOLEUM_PORT (#3065), so a stack never shares mausoleum's default.
 
 Run from anywhere, after `./rz build --all`:
     python3 projects/ritz/tools/smoke_stack.py            # everything
@@ -200,12 +200,14 @@ class Procs:
         self.started_pgids: set[int] = set()
         self._n = 0
 
-    def start(self, name: str, argv: list[str], cwd: Path, stdin=subprocess.DEVNULL) -> subprocess.Popen:
+    def start(self, name: str, argv: list[str], cwd: Path, stdin=subprocess.DEVNULL,
+              env: dict[str, str] | None = None) -> subprocess.Popen:
+        """Start `argv` in its own session; `env` is added to ours."""
         self._n += 1
         log = self.logdir / f"{self._n:02d}-{name}.log"
         fh = open(log, "wb")
         p = subprocess.Popen(argv, cwd=cwd, stdin=stdin, stdout=fh, stderr=subprocess.STDOUT,
-                             start_new_session=True)
+                             start_new_session=True, env={**os.environ, **env} if env else None)
         fh.close()
         p.log = log  # type: ignore[attr-defined]
         p.label = name  # type: ignore[attr-defined]
@@ -902,10 +904,8 @@ def check_clean_exit(p: subprocess.Popen, code: int, data: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# stack: valet -> zeus -> nexus (+ encrypted mausoleum on 7777)
+# stack: valet -> zeus -> nexus (+ encrypted mausoleum of its own)
 # --------------------------------------------------------------------------
-
-NEXUS_STORE_PORT = 7777  # hardcoded in nexus src/store.ritz (#2466)
 
 
 def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
@@ -917,26 +917,27 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
     except Broken as e:
         r.broken("stack.start", str(e))
         return
-    if port_in_use(NEXUS_STORE_PORT):
-        r.skip("stack.*", f"127.0.0.1:{NEXUS_STORE_PORT} is taken; nexus can only dial mausoleum "
-                          f"there (#2466), so the stack cannot run on this host now")
-        return
     work = tmp / "stack"
     data = work / "m7m"
     data.mkdir(parents=True)
     sock = work / "zeus.sock"
     port = free_port()
+    # nexus's store: zeus passes MAUSOLEUM_PORT on to its workers (#3065).
+    # Every zeus here gets it, or its nexus dials 127.0.0.1:7777: some other
+    # stack's mausoleum.
+    store_port = free_port()
+    store_env = {"MAUSOLEUM_HOST": "127.0.0.1", "MAUSOLEUM_PORT": str(store_port)}
 
     def up(with_store: bool = True) -> list[subprocess.Popen]:
         if sock.exists():
             sock.unlink()
-        # 7777 is fixed, so a restart can race the old socket's teardown;
-        # retry a bind failure briefly rather than flake.
+        # A restart reuses store_port, so it can race the old socket's
+        # teardown; retry a bind failure briefly rather than flake.
         m = None
         for attempt in range(6 if with_store else 0):
-            m = procs.start("stack-mausoleum", [str(m7m), "serve", "-p", str(NEXUS_STORE_PORT), "-d", str(data)], work)
+            m = procs.start("stack-mausoleum", [str(m7m), "serve", "-p", str(store_port), "-d", str(data)], work)
             try:
-                wait_listening(m, NEXUS_STORE_PORT)
+                wait_listening(m, store_port)
                 break
             except Broken:
                 procs.stop(m)
@@ -944,7 +945,8 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
                     raise
                 time.sleep(0.5)
         z = procs.start("stack-zeus", [str(zeus), "-f", "-w", "2", "-s", str(sock),
-                                       "-p", str(work / "zeus.pid"), str(nexus)], work)
+                                       "-p", str(work / "zeus.pid"), str(nexus)], work,
+                             env=store_env)
         wait_path(z, sock)
         v = procs.start("stack-valet", [str(valet), "-p", str(port), "-z", str(sock)], work)
         wait_listening(v, port)
@@ -1054,7 +1056,7 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
         # other worker's ("...Spire at 7127.0.0.11:87777", #2459).
         log = Path(zeus_proc.log).read_text(errors="replace")  # type: ignore[attr-defined]
         lines = [ln for ln in log.splitlines() if "Connecting to mausoleum" in ln]
-        want = re.compile(rf"\[nexus \d+\] \[STORE\] Connecting to mausoleum via Spire at 127\.0\.0\.1:{NEXUS_STORE_PORT}")
+        want = re.compile(rf"\[nexus \d+\] \[STORE\] Connecting to mausoleum via Spire at 127\.0\.0\.1:{store_port}")
         bad = [ln for ln in lines if not want.fullmatch(ln)]
         if len(lines) < 2 or bad:
             raise CheckFailed(f"{len(lines)} connect lines, malformed: {short(' | '.join(bad), 160)}")
@@ -1129,7 +1131,7 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
         if sock.exists():
             sock.unlink()
         z = procs.start("stack-zeus-alone", [str(zeus), "-f", "-w", "2", "-s", str(sock),
-                                             "-p", str(work / "zeus.pid"), str(nexus)], work)
+                                             "-p", str(work / "zeus.pid"), str(nexus)], work, env=store_env)
         wait_path(z, sock)
         deadline = time.monotonic() + START_TIMEOUT
         while True:

@@ -14,6 +14,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.string { String, string_from_cstr, string_push_i64, string_push, string_as_ptr, string_drop }
+import ritzlib.os.env { env_raw_envp }
 import zeus.main_helpers
 
 # ============================================================================
@@ -311,3 +312,91 @@ fn test_spawn_worker_passes_worker_count() -> i32
         if out[i] != *(want + i)
             return 3
     0
+
+
+# ============================================================================
+# Test: Worker environment (AGAST #3065)
+#
+# zeus used to exec workers with an empty environment, so a worker could not
+# be configured: nexus's MAUSOLEUM_HOST / MAUSOLEUM_PORT never arrived, and
+# a test stack's nexus dialed whatever mausoleum held 127.0.0.1:7777.
+# ============================================================================
+
+fn has_prefix(s: *u8, p: *u8) -> bool
+    var i: i64 = 0
+    while *(p + i) != 0
+        if *(s + i) != *(p + i)
+            return false
+        i += 1
+    true
+
+
+# An entry of our environment that /bin/sh would not set by itself.
+fn probe_entry() -> *u8
+    let envp: **u8 = env_raw_envp()
+    var i: i64 = 0
+    while envp != null and *(envp + i) != null
+        let e: *u8 = *(envp + i)
+        let skip: bool = has_prefix(e, c"PWD=") or has_prefix(e, c"OLDPWD=") or has_prefix(e, c"SHLVL=") or has_prefix(e, c"_=")
+        if not skip and strchr(e, 10) == null
+            return e
+        i += 1
+    null
+
+
+[[test]]
+fn test_spawn_worker_passes_the_environment() -> i32
+    let want: *u8 = probe_entry()
+    if want == null
+        return 100     # no usable variable to look for
+    var dir: String = string_from_cstr(c"/tmp/zeus-env-")
+    string_push_i64(@&dir, sys_getpid() as i64)
+    string_push(@&dir, 0)
+    let d: *u8 = string_as_ptr(@&dir)
+    sys_mkdir(d, 448)
+    let dl: i64 = strlen(d)
+    var script: [256]u8
+    var record: [256]u8
+    memcpy(@script[0], d, dl)
+    memcpy(@script[dl], c"/w.sh", 6)
+    memcpy(@record[0], d, dl)
+    memcpy(@record[dl], c"/env", 5)
+
+    # #!/bin/sh + `env > <dir>/env`
+    let fd: i32 = sys_open3(@script[0], 577, 493)
+    if fd < 0
+        return 1
+    let head: *u8 = c"#!/bin/sh\nenv > "
+    sys_write(fd, head, strlen(head))
+    sys_write(fd, @record[0], strlen(@record[0]))
+    sys_write(fd, c"\n", 1)
+    sys_close(fd)
+
+    let shm: i32 = sys_open(c"/dev/null", 0)
+    let pid: i32 = spawn_worker(shm, 4096, 0, 1, @script[0])
+    if pid <= 0
+        return 2
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+
+    let cap: i64 = 262144
+    let out: *u8 = malloc(cap + 1)
+    let rfd: i32 = sys_open(@record[0], 0)
+    var n: i64 = 0
+    if rfd >= 0
+        loop
+            let r: i64 = sys_read(rfd, out + n, cap - n)
+            if r <= 0
+                break
+            n += r
+        sys_close(rfd)
+    *(out + n) = 0
+    sys_unlink(@record[0])
+    sys_unlink(@script[0])
+    sys_rmdir(d)
+    string_drop(@&dir)
+    if rfd < 0
+        return 3
+    let found: bool = strstr(out, want) != null
+    free(out)
+    if found then 0 else 4

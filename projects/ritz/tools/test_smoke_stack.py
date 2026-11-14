@@ -166,6 +166,36 @@ def test_help_xfails_name_real_binaries():
     assert not stale, f"help xfails for binaries that are not Linux [[bin]]s: {stale}"
 
 
+# --- the stack's own store (AGAST #3065) ---------------------------------------
+
+@pytest.mark.unit
+def test_start_adds_env_to_the_inherited_environment(tmp_path, monkeypatch):
+    # zeus gets MAUSOLEUM_PORT this way and passes it on to nexus.
+    monkeypatch.setenv("SMOKE_INHERITED", "kept")
+    procs = ss.Procs(tmp_path)
+    p = procs.start("env", ["sh", "-c", 'echo "$SMOKE_INHERITED $SMOKE_ADDED"'], tmp_path,
+                    env={"SMOKE_ADDED": "added"})
+    p.wait(timeout=5)
+    assert Path(p.log).read_text().strip() == "kept added"
+
+
+@pytest.mark.unit
+def test_every_zeus_the_stack_starts_gets_the_store_env():
+    # A zeus started without it runs nexus workers that dial 127.0.0.1:7777,
+    # i.e. some other stack's mausoleum (zeus_alone did, #3065).
+    import ast
+    tree = ast.parse(Path(ss.__file__).read_text())
+    zeus_starts = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "start"
+        and len(n.args) >= 2 and isinstance(n.args[1], ast.List)
+        and any(isinstance(e, ast.Call) and ast.unparse(e) == "str(zeus)" for e in n.args[1].elts)
+    ]
+    assert len(zeus_starts) >= 2
+    missing = [n.lineno for n in zeus_starts if not any(k.arg == "env" for k in n.keywords)]
+    assert not missing, f"zeus started without env= at smoke_stack.py lines {missing}"
+
+
 # --- process hygiene -----------------------------------------------------------
 
 @pytest.mark.unit

@@ -14,6 +14,13 @@
 #   5. A slow reader with a tiny window gets the whole page: valet resumes
 #      a short send instead of dropping the tail (AGAST #2107).
 #
+# nexus runs with no store, deterministically (AGAST #3065): MAUSOLEUM_PORT
+# (passed on by zeus) names a port this script holds bound but never listens
+# on, so the dial is refused and the one worker serves in-memory pages. Before
+# that nexus always dialed 127.0.0.1:7777, so this test used whatever
+# mausoleum another process (another room's smoke stack) had up there, and
+# failed on its inserts: mausoleum can't store a max-size page yet (#2208).
+#
 # Needs debug builds of zeus, valet and nexus:
 #   ./rz build zeus && ./rz build valet && ./rz build nexus
 # Run from anywhere:  bash projects/nexus/test/e2e_large_page.sh
@@ -41,6 +48,15 @@ TMP="$(mktemp -d)"
 SOCK="$TMP/zeus.sock"
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 PIDS=()
+
+# A port that refuses every connection for as long as we run: bound (so
+# nothing else can listen there) but not listening. Its holder exits with us.
+coproc DEAD { exec python3 -c 'import socket, sys
+s = socket.socket(); s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1], flush=True); sys.stdin.read()'; }
+PIDS+=("$DEAD_PID")
+read -r STORE_PORT <&"${DEAD[0]}"
+[[ "$STORE_PORT" =~ ^[0-9]+$ ]] || { echo "FAIL: could not reserve a refused port" >&2; exit 1; }
 cleanup() {
     for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null; done
     wait 2>/dev/null
@@ -52,8 +68,9 @@ FAILS=0
 fail() { echo "FAIL: $*" >&2; FAILS=$((FAILS + 1)); }
 pass() { echo "ok: $*"; }
 
-# zeus execs the worker with cwd = ours; keep nexus's files in $TMP.
-(cd "$TMP" && exec "$ZEUS" -f -w 1 -m 1048576 -s "$SOCK" -p "$TMP/zeus.pid" "$NEXUS") \
+# zeus execs the worker with cwd = ours and passes on its environment;
+# keep nexus's files in $TMP.
+(cd "$TMP" && MAUSOLEUM_HOST=127.0.0.1 MAUSOLEUM_PORT="$STORE_PORT" exec "$ZEUS" -f -w 1 -m 1048576 -s "$SOCK" -p "$TMP/zeus.pid" "$NEXUS") \
     >"$TMP/zeus.log" 2>&1 &
 PIDS+=("$!")
 for _ in $(seq 1 80); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
@@ -68,6 +85,13 @@ for _ in $(seq 1 80); do
 done
 
 BASE="http://127.0.0.1:$PORT"
+
+# --- 0. nexus has no store: it dialed our refused port, not 7777 --------------
+if grep -q "Spire at 127.0.0.1:$STORE_PORT" "$TMP/zeus.log" && grep -q "Falling back to in-memory mode" "$TMP/zeus.log"; then
+    pass "nexus dialed only 127.0.0.1:$STORE_PORT and serves in-memory pages"
+else
+    fail "nexus store not isolated (want a refused dial to $STORE_PORT): $(grep -a '\[STORE\]' "$TMP/zeus.log" | head -3)"
+fi
 
 # --- 1. POST a max-size page --------------------------------------------------
 python3 -c 'import sys; sys.stdout.write("slug=big&content=" + "\"" * 8192)' >"$TMP/post.body"

@@ -10,6 +10,7 @@
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.strview { StrView, strview_from_ptr }
 
 import spire.repo.mausoleum { Db, DbField, db_init, db_set_encryption, db_connect, db_close }
 import spire.repo.mausoleum { db_insert, db_delete, db_scan, db_field, db_serialize_doc, db_extract_field }
@@ -376,3 +377,110 @@ fn test_store_lists_a_slug_with_two_copies_once() -> i32
     db_close(@other)
     live_db_stop(@live)
     if count == 1 then 0 else 3
+
+
+# ============================================================================
+# Where mausoleum is: MAUSOLEUM_HOST / MAUSOLEUM_PORT (AGAST #3065)
+#
+# nexus used to dial a hard-coded 127.0.0.1:7777, so a test stack reached
+# whatever mausoleum another process had up there. wiki_store_configure takes
+# the two variables' values ("" = unset, keep the default).
+# ============================================================================
+
+fn reset_connection()
+    wiki_store_set_connection(c"127.0.0.1", 9, 7777)
+
+
+[[test]]
+fn test_store_configure_unset_keeps_the_default() -> i32
+    reset_connection()
+    if wiki_store_configure("", "") != 0
+        return 1
+    if wiki_store_port() != 7777
+        return 2
+    if strcmp(wiki_store_host(), c"127.0.0.1") == 0 then 0 else 3
+
+
+[[test]]
+fn test_store_configure_sets_host_and_port() -> i32
+    reset_connection()
+    if wiki_store_configure("10.1.2.3", "4242") != 0
+        return 1
+    if wiki_store_port() != 4242
+        return 2
+    if strcmp(wiki_store_host(), c"10.1.2.3") != 0
+        return 3
+    # Port alone keeps the host.
+    reset_connection()
+    if wiki_store_configure("", "65535") != 0
+        return 4
+    if wiki_store_port() != 65535
+        return 5
+    if strcmp(wiki_store_host(), c"127.0.0.1") == 0 then 0 else 6
+
+
+# An unusable value must not quietly become the default store: that is the
+# wrong-mausoleum bug again. The store refuses until it is fixed.
+fn configure_rejects(host: StrView, port: StrView) -> bool
+    reset_connection()
+    if wiki_store_configure(host, port) == 0
+        return false
+    wiki_store_set_encryption(0)
+    wiki_store_set_worker_count(1)
+    let mode: i32 = wiki_store_init()
+    wiki_store_clear_config_error()
+    mode == STORE_UNAVAILABLE
+
+
+[[test]]
+fn test_store_configure_rejects_a_bad_port() -> i32
+    if not configure_rejects("", "77x")
+        return 1
+    if not configure_rejects("", "0")
+        return 2
+    if not configure_rejects("", "65536")
+        return 3
+    if not configure_rejects("", "-1")
+        return 4
+    if not configure_rejects("", "99999999999999999999")
+        return 5
+    0
+
+
+[[test]]
+fn test_store_configure_rejects_a_too_long_host() -> i32
+    let long: StrView = "a234567890123456789012345678901234567890123456789012345678901234"
+    if configure_rejects(long, "") then 0 else 1
+
+
+[[test]]
+fn test_store_configure_reaches_the_configured_database() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    reset_connection()
+    var port: [12]u8
+    let n: i32 = fmt_port(live.port, @port[0])
+    let sv: StrView = strview_from_ptr(@port[0], n as i64)
+    if wiki_store_configure("127.0.0.1", sv) != 0
+        live_db_stop(@live)
+        return 1
+    wiki_store_set_encryption(0)
+    wiki_store_set_worker_count(2)
+    let mode: i32 = wiki_store_init()
+    live_db_stop(@live)
+    if mode == STORE_MAUSOLEUM then 0 else 2
+
+
+# Decimal digits of `v` (> 0) into `out`; returns how many.
+fn fmt_port(v: i32, out: *u8) -> i32
+    var tmp: [12]u8
+    var n: i32 = 0
+    var x: i32 = v
+    while x > 0
+        tmp[n] = (48 + x % 10) as u8
+        x = x / 10
+        n += 1
+    for i in 0..n
+        *(out + i) = tmp[n - 1 - i]
+    n

@@ -119,7 +119,10 @@ fn main() -> i32
 The binary is a Zeus worker (`nexus <shm_size> <worker_id> <worker_count>`),
 there is no `serve` subcommand, and invoking it by hand segfaults — see
 Installation above. It serves pages through `src/store.ritz`, which reaches
-mausoleum (encrypted, 127.0.0.1:7777, #2466) over Spire. Mausoleum is the only
+mausoleum (encrypted, #2466) over Spire at `MAUSOLEUM_HOST`:`MAUSOLEUM_PORT`
+(default 127.0.0.1:7777; Zeus passes its environment on to its workers, #3065;
+a set but unusable value makes every page request fail rather than dial the
+default). Mausoleum is the only
 copy of a page: every request reads it there, so all of Zeus's workers serve
 the same wiki (#2459). Without mausoleum, a single worker (`zeus -w 1`) falls
 back to an in-memory wiki with 3 seeded pages; with several workers every page
