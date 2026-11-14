@@ -68,10 +68,10 @@ def run_with(ritz1_bin, tmp_path):
     return go
 
 
-# ritz1 gaps found here, each "unhandled EXPR_MEMBER": a member of an element of
-# a global array of a generic struct (#3025), and a member through `let p = @g`
-# of any struct global (#3026).  Strict, so each fix flips its row.
-_RITZ1_GAPS = {"array": "AGAST #3025", "address": "AGAST #3026"}
+# ritz1 gap found here, "unhandled EXPR_MEMBER": a member through `let p = @g`
+# of any struct global (#3026).  Strict, so the fix flips its row.  (`array`
+# was #3025: ritz1's monomorphiser never instantiated a global array's element.)
+_RITZ1_GAPS = {"address": "AGAST #3026"}
 
 
 def _row(compiler, name):
