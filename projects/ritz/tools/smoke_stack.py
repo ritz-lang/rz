@@ -7,7 +7,8 @@ nexus served a page on only every other request and several CLIs exited 0
 having done nothing. No gate started a server and made a request. This one
 does, after `./rz build --all`, using the debug binaries that step built:
 
-  help      every [[bin]] that targets Linux runs `--help` and exits 0
+  help      every [[bin]] that targets Linux runs `--help`: exit 0, usage
+            on stdout, nothing written into its cwd
   valet     GET /, a static file, a directory index, traversal -> 403, HTTPS
   tome      PING, SET/GET, INCR, a pipelined SET+GET and tome-cli, in the
             default io_uring mode AND in blocking mode (-b)
@@ -80,13 +81,8 @@ PROJECTS = REPO / "projects"
 # Check id -> the ticket that owns its failure. Delete an entry in the same
 # change that makes its check pass; the run fails (XPASS) until you do.
 XFAILS: dict[str, str] = {
-    # help: these exit non-zero for --help (run in a fresh temp cwd)
-    "help:angelo/hello-world": "#2462 ignores --help and runs its demo: 'Failed to load font', exit 1",
-    "help:angelo/render-demo": "#2462 ignores --help and runs its demo (font relative to cwd), exit 2",
-    "help:larb/tools/ritz-stats/ritz-stats": "#2462 --help is read as a file name: 'Error reading file', exit 1",
-    "help:mausoleum/concurrent_bench": "#2462 'Unknown argument: --help', exit 2",
-    "help:nexus/nexus": "#2462 prints its usage and exits 1",
-    "help:zeus/test_client": "#2462 prints its usage and exits 1",
+    # help: exit 0 on --help, usage on stdout, nothing written into cwd
+    "help:ritz-lsp/ritz-lsp": "#3159 ignores --help: starts the server, logs to stderr only, nothing on stdout",
     # hollow entry points (#2460 made the rest honest; sage still runs nothing)
     "hollow.sage_runs_js": "#2787 sage has no interpreter: `sage t.js` exits 1 'not implemented'",
 }
@@ -313,18 +309,21 @@ def wait_path(p: subprocess.Popen, path: Path, timeout: float = START_TIMEOUT) -
 
 
 def run_cmd(argv: list[str], cwd: Path, stdin: bytes | None = None,
-            timeout: float = CMD_TIMEOUT) -> subprocess.CompletedProcess:
+            timeout: float = CMD_TIMEOUT, split_stderr: bool = False) -> subprocess.CompletedProcess:
     """A short-lived CLI. Own session; its group is killed on timeout AND on
-    any other way out (a SIGTERM to the gate lands here as SystemExit)."""
+    any other way out (a SIGTERM to the gate lands here as SystemExit).
+    stderr is folded into stdout unless split_stderr."""
     p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE if split_stderr else subprocess.STDOUT,
+                         start_new_session=True)
     try:
-        out, _ = p.communicate(stdin, timeout=timeout)
-        return subprocess.CompletedProcess(argv, p.returncode, out or b"", b"")
+        out, err = p.communicate(stdin, timeout=timeout)
+        return subprocess.CompletedProcess(argv, p.returncode, out or b"", err or b"")
     except subprocess.TimeoutExpired:
         _killpg(p.pid)
-        out, _ = p.communicate()
-        return subprocess.CompletedProcess(argv, 124, out or b"", b"")
+        out, err = p.communicate()
+        return subprocess.CompletedProcess(argv, 124, out or b"", err or b"")
     finally:
         _killpg(p.pid)  # background children of a CLI that exited, or an interrupted wait
         if p.poll() is None:
@@ -417,10 +416,17 @@ def suite_help(r: Reporter, tmp: Path) -> None:
             if not b.path.is_file():
                 raise Broken(f"not built: {b.path.relative_to(REPO)}")
             cwd = tmp / "help" / b.project.replace("/", "_") / b.name
-            cwd.mkdir(parents=True, exist_ok=True)  # some write files into cwd
-            res = run_cmd([str(b.path), "--help"], cwd, timeout=5)
+            cwd.mkdir(parents=True, exist_ok=True)
+            res = run_cmd([str(b.path), "--help"], cwd, timeout=5, split_stderr=True)
             if res.returncode != 0:
-                raise CheckFailed(f"exit {res.returncode}: {short(res.stdout, 90)}")
+                raise CheckFailed(f"exit {res.returncode}: {short(res.stdout + res.stderr, 90)}")
+            # #2462: --help answers before doing any work: usage on stdout,
+            # nothing written into cwd (angelo's demos used to render a PGM).
+            if not res.stdout.strip():
+                raise CheckFailed(f"exit 0 but no usage on stdout (stderr: {short(res.stderr, 60)})")
+            left = sorted(x.name for x in cwd.iterdir())
+            if left:
+                raise CheckFailed(f"--help wrote into cwd: {', '.join(left)[:80]}")
         r.run(b.check, one)
 
 
