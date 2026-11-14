@@ -259,6 +259,61 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum
     # %Opt too; it was loaded as an i64.
     *out_name = tagged_enum_payload_named(s, enum_name, enum_name_len, out_len, 1)
 
+# AGAST #2436: when `arm`'s payload is a pointer to a struct (`Some(v)` over
+# `Option<*Pair>` / `Result<*Pair, E>`, `E.P(v)` over a `P(*Pair)`, `P(@Pair)`
+# or `P(@&Pair)` variant), fills (out_name, out_len) with the struct and
+# returns the binding's var_type (TYPE_PTR, or TYPE_REF / TYPE_MUT_REF for a
+# user enum's `@T` / `@&T`).  Otherwise returns 0 and the caller keeps the
+# i64 binding.  That i64 had no pointee, so `v.a` and `(*v).a` were
+# "unhandled EXPR_MEMBER".  Only one level: a `**T` payload stays an i64.
+fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    if enum_name == null or enum_name_len <= 0
+        return 0
+    if is_tagged_enum_type(enum_name, enum_name_len) == 0
+        let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, user_arm_variant(enum_name, enum_name_len, arm))
+        if uf == null or uf.array_size != 0 or uf.field_type_name_len <= 0
+            return 0
+        if uf.field_type != TYPE_PTR and uf.field_type != TYPE_REF and uf.field_type != TYPE_MUT_REF
+            return 0
+        if is_concrete_payload_type(s, uf.field_type_name, uf.field_type_name_len, 0) == 0
+            return 0
+        *out_name = uf.field_type_name
+        *out_len = uf.field_type_name_len
+        return uf.field_type
+    # Option / Result: the mangled argument spells `*Pair` as "ptr_Pair".
+    var decl_len: i32 = 0
+    let decl: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len), @decl_len)
+    if decl == null or decl_len <= 4 or memcmp(decl, c"ptr_", 4) != 0
+        return 0
+    if is_concrete_payload_type(s, decl + 4, decl_len - 4, 0) == 0
+        return 0
+    *out_name = decl + 4
+    *out_len = decl_len - 4
+    TYPE_PTR
+
+# AGAST #2436: bind a pointer-to-struct payload as a pointer local, as `let
+# v: *Pair = ...` registers one, so the member chain finds the struct.  The
+# payload loads as an i64 (emit_variant_payload); the local holds a `ptr`.
+fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32, variant: i32, var_type: i32, st_name: *u8, st_name_len: i32)
+    let raw: i32 = emit_variant_payload(s, slot_reg, enum_name, enum_name_len, variant)
+    let ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, raw)
+    emit_str(s, c" to ptr\n")
+    let alloca_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c" = alloca ptr  ; match pointer payload bind\n  store ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", ptr ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c"\n")
+    add_local_full(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, var_type, st_name, st_name_len, TYPE_STRUCT, 0, 0)
+
 # AGAST #1515: bind `Some(p)` / `Ok(s)` to a copy of a struct payload.  The
 # payload sits at field 2 of the spilled scrutinee (#1898); copy it into its own
 # `alloca %Name` and register a struct local, so `p.x` and by-value passing
@@ -485,9 +540,21 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                         is_wildcard = 1
                 var pay_struct: *u8 = null
                 var pay_struct_len: i32 = 0
+                var ptr_struct: *u8 = null
+                var ptr_struct_len: i32 = 0
+                var ptr_kind: i32 = 0
                 if is_wildcard == 0 and scrut_slot != 0
                     carrier_payload_struct(s, arm, enum_name, enum_name_len, @pay_struct, @pay_struct_len)
-                if is_wildcard == 0 and pay_struct != null
+                    ptr_kind = carrier_payload_ptr_struct(s, arm, enum_name, enum_name_len, @ptr_struct, @ptr_struct_len)
+                if is_wildcard == 0 and ptr_kind != 0
+                    # AGAST #2436: `Some(v)` over `Option<*Pair>`: v is a `*Pair`.
+                    var ptr_variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+                    let puvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+                    if puvi >= 0
+                        ptr_variant = puvi
+                    emit_ptr_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, ptr_variant, ptr_kind, ptr_struct, ptr_struct_len)
+                    bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
+                else if is_wildcard == 0 and pay_struct != null
                     emit_struct_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, pay_struct, pay_struct_len)
                     # AGAST #2174: it owns the payload of a scrutinee the
                     # match owns.

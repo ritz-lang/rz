@@ -36,7 +36,12 @@ from test_ref_into_value import COMPILERS, _assert_refused
 ELEMENT_GAP = "AGAST #2369: `a[0].x` through an `@&C` or `@C` element is `unhandled EXPR_MEMBER` on ritz1"
 IF_VALUE_GAP = "AGAST #2369: ritz1 doesn't parse an `if` value after `=` or in a struct literal"
 # No ticket has these.
-PAYLOAD_GAP = "AGAST #2369: `p.x = 3` on a reference payload is `unhandled EXPR_MEMBER` on ritz1, without a `:&` too"
+# AGAST #2436 made `p.x = 3` on a pointer payload work; what's left is building
+# the value: an `@&C` variant argument (#3046) and `Option<@&C>`'s name (#2384).
+PAYLOAD_GAPS = {
+    "own_enum": "AGAST #3046: ritz1 stores `E.Full(@&c)`'s ptr as `store i64`, clang refuses",
+    "option": "AGAST #2384: `Option<@&C>` mangles to a bare `Option$`, so the payload has no type",
+}
 CAST_GAP = ("AGAST #2370: a value cast to a reference isn't refused: ritz1 runs it, and ritz0 reports "
             "`cannot store` at the later `p.x = 3`")
 
@@ -1016,9 +1021,10 @@ fn go(c:& C)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", [
-    "ritz0", pytest.param("ritz1", marks=pytest.mark.xfail(strict=True, reason=PAYLOAD_GAP))])
-@pytest.mark.parametrize("name", sorted(VARIANTS))
+@pytest.mark.parametrize("name,compiler", [
+    pytest.param(n, c, id=f"{c}-{n}",
+                 marks=[pytest.mark.xfail(strict=True, reason=PAYLOAD_GAPS[n])] if c == "ritz1" else [])
+    for n in sorted(VARIANTS) for c in ("ritz0", "ritz1")])
 def test_variant_payload_holds_the_written_reference(ritz1_bin, tmp_path, compiler, name):
     assert _run(compiler, ritz1_bin, tmp_path, name, VARIANTS[name]) == 3
 
