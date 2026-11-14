@@ -668,7 +668,7 @@ RVALUES = {
     "literal": (MAIN + "    var a: [3]i32 = [1, 2, 4]\n"
                 + _WRITES.format(it="[a[0], a[1], a[2]]", place="a")),
 }
-# ritz1 has no array return value yet: it refuses `return g` (#2302, then #2997).
+# ritz1 returns the array (#2302) but has no slot for `for v in mk()` yet (#2997).
 RVALUES_ON_RITZ0 = {
     "call": ("var g: [3]i32\n\nfn mk() -> [3]i32\n    return g\n\n" + MAIN + _fill("g", _SEED)
              + _WRITES.format(it="mk()", place="g")),

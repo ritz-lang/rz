@@ -1249,6 +1249,19 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         var_type = TYPE_I64
         stmt.var_type = TYPE_I64
 
+    # AGAST #2302: untyped `let b = f()` of a `-> [N]T` is the `[N]T` local
+    # `let b: [N]T = f()` declares, as in ritz0.
+    if stmt.var_declared_type == TYPE_VOID and stmt.var_type_name_len == 0 and stmt.var_init != null
+        let lra: *Param = call_ret_array(s, stmt.var_init)
+        if lra != null
+            var_type = TYPE_ARRAY
+            stmt.var_type = TYPE_ARRAY
+            stmt.var_array_size = lra.param_array_size
+            stmt.var_array_elem_type = lra.param_array_elem_type
+            stmt.var_array_elem_pointee = lra.param_array_elem_pointee
+            stmt.var_type_name = lra.param_type_name
+            stmt.var_type_name_len = lra.param_type_name_len
+
     # AGAST #1666: untyped `let v = match ...`.  The merge phi's type is only
     # known once the arms are emitted (#1645: `%StrView`, `%Point`, or i64),
     # and the slot below is sized before the init is emitted.  So emit the
@@ -3130,6 +3143,8 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         literal_slot(s, stmt.return_value, ret_type, literal_ret_pointee(s.ret_type_name, s.ret_type_name_len))   # AGAST #2341
         if emit_lent_return(s, stmt.return_value, ret_type) == 1   # AGAST #2279
             return
+        if ret_type == TYPE_ARRAY and emit_array_return(s, stmt.return_value, ret_array_of(emitter_current_fn())) == 1
+            return   # AGAST #2302
         # Special handling for struct returns - need to load entire struct
         if ret_type == TYPE_STRUCT
             # Check if return value is a struct literal (e.g., return NFAFragment { start: s0, end: s0 })
@@ -4495,6 +4510,30 @@ fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
         return loc.reg
     return emit_global_array_ptr(s, find_global(s, value.ident_ptr, value.ident_len))
 
+# AGAST #2302: store the `[N x T]` that call `value` returns (`ra` is its
+# return as a param) at `dst_ptr`.
+fn emit_call_array_store(s: *EmitterState, value: *Expr, ra: *Param, dst_ptr: i32)
+    let cv: i32 = emit_expr(s, value)
+    emit_str(s, c"  store ")
+    emit_param_llvm_type(s, ra)
+    emit_str(s, c" ")
+    emit_reg(s, cv)
+    emit_str(s, c", ptr ")
+    emit_reg(s, dst_ptr)
+    emit_str(s, c"\n")
+
+# AGAST #2302: the `[N x T]` call `value` returns, in a fresh temporary whose
+# address is returned.
+fn emit_call_array_temp(s: *EmitterState, value: *Expr, ra: *Param) -> i32
+    let tmp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tmp)
+    emit_str(s, c" = alloca ")
+    emit_param_llvm_type(s, ra)
+    emit_str(s, c"  ; #2302 call result\n")
+    emit_call_array_store(s, value, ra, tmp)
+    tmp
+
 # AGAST #1935: `x.f = <array value>` where the right-hand side is not a
 # literal.  Resolve the source array's storage and copy it over the field
 # at `field_ptr`, after checking it has the field's length and element type
@@ -4534,6 +4573,14 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
             src_et = mr.field.array_elem_type
             src_name = mr.field.array_elem_type_name
             src_name_len = mr.field.array_elem_type_name_len
+    else if call_ret_array(s, value) != null
+        # AGAST #2302: a call's `[N x T]`, through a temporary.
+        let cra: *Param = call_ret_array(s, value)
+        src_ptr = emit_call_array_temp(s, value, cra)
+        src_size = cra.param_array_size
+        src_et = cra.param_array_elem_type
+        src_name = cra.param_type_name
+        src_name_len = cra.param_type_name_len
     if src_ptr < 0
         emit_ir_error(s, c"whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
         return
@@ -4635,6 +4682,16 @@ fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, 
         emit_str(s, c"\n")
         emit_array_lit_into(s, tmp, dst_size, dst_et, dst_name, dst_name_len, value)
         emit_local_array_copy(s, dst_size, dst_et, dst_name, dst_name_len, tmp, dst_ptr)
+        return
+    # AGAST #2302: a call's `[N x T]` value is stored whole.
+    let cra: *Param = call_ret_array(s, value)
+    if cra != null
+        if cra.param_array_size != dst_size
+            emit_ir_error(s, c"array length does not match the local array's length")
+            return
+        if array_store_fits(s, value, cra.param_array_elem_type, cra.param_type_name, cra.param_type_name_len, dst_et, dst_name, dst_name_len) == 0
+            return
+        emit_call_array_store(s, value, cra, dst_ptr)
         return
     var place: ArraySrc
     if nd_row_src(s, value, @place) == 1

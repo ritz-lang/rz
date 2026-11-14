@@ -191,12 +191,13 @@ LITERAL_STORES = {
     "struct_literal": ("struct H\n    b: [4]{T}\n\n"
                        "fn f() -> i32\n    var h: H = H { b: {L} }\n    var b: [4]{T} = h.b\n{CHECK}    0\n"),
     "const": "const b: [4]{T} = {L}\n\nfn f() -> i32\n{CHECK}    0\n",
-}
-
-# ritz0 only: ritz1 doesn't lower these for any array (#2302, #2305).
-LITERAL_STORES_RITZ0 = {
+    # AGAST #2302: a `-> [N]T` fn's `return` and tail are slots too.
     "return": "fn g() -> [4]{T}\n    return {L}\n\nfn f() -> i32\n    var b: [4]{T} = g()\n{CHECK}    0\n",
     "tail": "fn g() -> [4]{T}\n    {L}\n\nfn f() -> i32\n    var b: [4]{T} = g()\n{CHECK}    0\n",
+}
+
+# ritz0 only: ritz1 doesn't lower these for any array (#2305).
+LITERAL_STORES_RITZ0 = {
     "if_value": "fn f() -> i32\n    var n: i32 = 1\n    var b: [4]{T} = if n > 0 then {L} else {L}\n{CHECK}    0\n",
     "if_assign": "fn f() -> i32\n    var n: i32 = 1\n    var b: [4]{T}\n    b = if n > 0 then {L} else {L}\n{CHECK}    0\n",
     "match_value": ("fn f() -> i32\n    var n: i32 = 1\n    var b: [4]{T} = match n\n"

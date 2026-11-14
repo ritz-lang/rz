@@ -3245,6 +3245,21 @@ fn emit_param_llvm_type(s: *EmitterState, p: *Param)
         return
     emit_llvm_type_struct(s, p.param_type, p.param_type_name, p.param_type_name_len)
 
+# AGAST #2302: the `-> [N]T` of `f` as a by-value param would hold it, or null.
+fn ret_array_of(f: *FnDef) -> *Param
+    if f == null or f.return_type != TYPE_ARRAY
+        return null
+    return f.ret_array_param
+
+# The non-sret return type of `f` in a definition, declare or call: a `-> [N]T`
+# is a first-class `[N x T]`, as ritz0 emits it (AGAST #2302).
+fn emit_fn_ret_llvm_type(s: *EmitterState, f: *FnDef)
+    let ra: *Param = ret_array_of(f)
+    if ra != null
+        emit_local_array_llvm_type(s, ra.param_array_size, ra.param_array_elem_type, ra.param_type_name, ra.param_type_name_len)
+        return
+    emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
+
 # Return from an sret fn by copying the %T at register `src_ptr` (a `ptr`).
 fn emit_sret_ret_from_ptr(s: *EmitterState, src_ptr: i32)
     emit_str(s, c"  call void @__ritz_sret_copy(ptr %ret.sret, ptr ")
@@ -3764,6 +3779,19 @@ fn call_callee_def(s: *EmitterState, e: *Expr) -> *FnDef
             if fd == null
                 fd = method_callee_def(s, recv, recv_len, e.ident_ptr, e.ident_len)
     fd
+
+# AGAST #2302: the `-> [N]T` (as a by-value param holds it) of the call `e`,
+# or null.  A call through a `fn() -> [N]T` local is typed by its signature, as
+# emit_expr's EXPR_CALL arm calls it; a direct, method or static call by its
+# FnDef.
+fn call_ret_array(s: *EmitterState, e: *Expr) -> *Param
+    if e == null or (e.kind != EXPR_CALL and e.kind != EXPR_METHOD)
+        return null
+    if e.kind == EXPR_CALL and e.func_name_len > 0 and e.call_type_suffix_len == 0
+        let lv: *LocalVar = find_local_struct_name(s, e.func_name, e.func_name_len)
+        if lv != null
+            return ret_array_of(lv.fn_sig)
+    return ret_array_of(call_callee_def(s, e))
 
 # AGAST #175: type-only resolution of an EXPR_MEMBER chain rooted at an
 # identifier (local or global).  Returns the *StructField for the innermost

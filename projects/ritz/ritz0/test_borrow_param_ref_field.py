@@ -2857,8 +2857,6 @@ RITZ1_GAPS = {
     "by_value_self": "AGAST #2278: ritz1 doesn't know a typed `self:& T` is a borrow",
     "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
-    "array_referent_return": "AGAST #2302: ritz1 has no array return yet",
-    "array_return": "AGAST #2302: ritz1 has no array return yet",
     "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
 }
 

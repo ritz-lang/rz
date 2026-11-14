@@ -686,10 +686,11 @@ pub fn main() -> i32
 """,
 }
 
-# Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
-# but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
-# value would satisfy the xfail just as a refusal does.
-RETURN_GAPS = {
+# AGAST #2302: a fn returning `[N]T` returns a first-class `[N x T]`, as in
+# ritz0: from a local, a param, a literal or a tail; into a typed or untyped
+# local, an assignment, a by-value argument or nowhere; through a direct, fn
+# pointer, static or method call.  These were strict xfails until it did.
+RETURNS = {
     "ret_fnptr": """\
 fn f() -> [4]i32
     [0, 0, 0, 3]
@@ -826,6 +827,148 @@ pub fn main() -> i32
 """,
 }
 
+# AGAST #2302: one per rule the return ABI adds.  Element spellings: a named
+# struct, `i1`, `ptr`.  Sources: a call (`return f()` as a tail).  Instances: a
+# generic fn's `[4]T` at T = i32, and a generic `fn() -> [4]T` param's.  Calls: a method on `self`, a typed local fn
+# pointer.  Targets: a global, a field, `*p`.
+RETURNS.update({
+    "ret_struct_elem": """\
+struct P
+    x: i32
+    y: i64
+
+fn f() -> [3]P
+    var a: [3]P
+    a[2].x = 3
+    a[2].y = 4
+    return a
+
+pub fn main() -> i32
+    let b = f()
+    return b[2].x + b[2].y as i32
+""",
+    "ret_bool_elem": """\
+fn f() -> [3]bool
+    return [false, true, false]
+
+pub fn main() -> i32
+    let b = f()
+    if b[1] and not b[2]
+        return 3
+    return 1
+""",
+    "ret_ptr_elem": """\
+var N: i32 = 3
+
+fn f() -> [2]*i32
+    var a: [2]*i32
+    a[1] = @N
+    return a
+
+pub fn main() -> i32
+    let b = f()
+    return *b[1]
+""",
+    "ret_call_tail": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn g() -> [4]i32
+    f()
+
+pub fn main() -> i32
+    let b = g()
+    return b[3]
+""",
+    "ret_generic": """\
+fn f<T>(v: T) -> [4]T
+    var a: [4]T
+    a[3] = v
+    return a
+
+pub fn main() -> i32
+    let b = f<i32>(3)
+    return b[3]
+""",
+    "ret_generic_fnptr": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn app<T>(h: fn() -> [4]T) -> T
+    let b = h()
+    return b[3]
+
+pub fn main() -> i32
+    return app<i32>(f)
+""",
+    "ret_method_self": """\
+struct S
+    n: i32
+
+impl S
+    fn f(self: *S) -> [4]i32
+        var a: [4]i32 = [0, 0, 0, 0]
+        a[3] = self.n
+        return a
+
+pub fn main() -> i32
+    var s: S = S { n: 3 }
+    var b: [4]i32 = s.f()
+    return b[3]
+""",
+    "ret_fnptr_typed": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn call(h: fn() -> [4]i32) -> i32
+    var b: [4]i32 = h()
+    return b[3]
+
+pub fn main() -> i32
+    return call(f)
+""",
+    "ret_to_global": """\
+var G: [4]i32
+
+fn f() -> [4]i32
+    return [0, 0, 0, 3]
+
+pub fn main() -> i32
+    G = f()
+    return G[3]
+""",
+    "ret_to_field": """\
+struct H
+    a: [4]i32
+
+fn f() -> [4]i32
+    return [0, 0, 0, 3]
+
+pub fn main() -> i32
+    var h: H
+    h.a = f()
+    return h.a[3]
+""",
+    "ret_to_deref": """\
+fn f() -> [4]i32
+    return [0, 0, 0, 3]
+
+fn s(p: *[4]i32)
+    *p = f()
+
+pub fn main() -> i32
+    var b: [4]i32
+    s(@b)
+    return b[3]
+""",
+})
+
+CASES.update(RETURNS)
+
+# Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
+# but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
+# value would satisfy the xfail just as a refusal does.
+
 DEREF_GAPS = {
     "deref_field_ptr": """\
 struct W
@@ -871,6 +1014,35 @@ pub fn main() -> i32
 }
 
 SOURCE_GAPS = {
+    # AGAST #2302 left these: a `-> [N]T` call as an `if` arm.  (Iterated, it's #2997.)
+    "if_call_arms_tail": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn g() -> [4]i32
+    [0, 0, 0, 4]
+
+fn h(c: i32) -> [4]i32
+    if c == 0
+        f()
+    else
+        g()
+
+pub fn main() -> i32
+    let r = h(0)
+    return r[3]
+""",
+    "if_call_arms_let": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn g() -> [4]i32
+    [0, 0, 0, 4]
+
+pub fn main() -> i32
+    let r = if 1 == 1 then f() else g()
+    return r[3]
+""",
     "if_tail_array": """\
 fn g(a: [4]i32) -> i32
     return a[3]
@@ -1018,7 +1190,6 @@ pub fn main() -> i32
 }
 
 GAPS = [
-    (RETURN_GAPS, "AGAST #2302: a fn returning `[N]T` isn't lowered"),
     (DEREF_GAPS, "AGAST #2304: `*p = a` needs a local or param `p: *[N]T`"),
     (SOURCE_GAPS, "AGAST #2305: a whole-array source or target ritz1 doesn't lower"),
     (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
@@ -1032,6 +1203,31 @@ GAPS = [
 # here: ritz0 refuses it only by failing on `(*p)[i]` (#2331), which LARB R9 makes
 # legal, so it's in test_ritz1_array_pointer_index.py now (#2330).
 REJECTED = {
+    # AGAST #2302: a call's `[N]T` is held to the rule a local's is.
+    "ret_wrong_len": """\
+fn f() -> [4]i32
+    return [0, 0, 0, 3]
+
+pub fn main() -> i32
+    var b: [5]i32 = f()
+    return b[3]
+""",
+    "ret_wrong_elem": """\
+fn f() -> [4]i32
+    return [0, 0, 0, 3]
+
+pub fn main() -> i32
+    var b: [4]i64 = f()
+    return b[3] as i32
+""",
+    "ret_local_wrong_elem": """\
+fn f() -> [4]i32
+    var a: [4]i64
+    return a
+
+pub fn main() -> i32
+    return 0
+""",
     "arg_wrong_elem": """\
 fn g(a: [4]i32) -> i32
     return a[3]
@@ -1514,6 +1710,88 @@ def test_ritz1_abi_is_ritz0s(ritz1_bin, tmp_path):
     want = _signature(ll0.read_text())
     assert want[1:3] == ["[4 x i32]", "[3 x %S]"], want
     assert _signature(ll1.read_text())[1:3] == want[1:3]
+
+
+# AGAST #2302: a UFCS helper (`v.head4()` is `strview_head4(@v)`) returning
+# `[N]T`.  ritz0 has no user UFCS, so this one is ritz1's alone.
+UFCS_RETURN = """\
+import ritzlib.strview
+
+fn strview_head4(s: *StrView) -> [4]u8
+    var a: [4]u8 = [0, 0, 0, 0]
+    a[3] = s.len as u8 + 1
+    return a
+
+pub fn main() -> i32
+    let v: StrView = "ab"
+    let b = v.head4()
+    return b[3] as i32
+"""
+
+
+# AGAST #2302: an `if` whose arms are `-> [N]T` calls, as a fn's tail, is a gap
+# (SOURCE_GAPS) that ritz1 itself refuses: clang would too, but only after the
+# .ll is written.
+@pytest.mark.integration
+def test_ritz1_refuses_array_tail_value(ritz1_bin, tmp_path):
+    comp, ll = _compile("ritz1", ritz1_bin, tmp_path, "tail", SOURCE_GAPS["if_call_arms_tail"])
+    assert comp.returncode != 0 and not ll.exists()
+    assert "a `-> [N]T` fn's value here is not lowered by ritz1" in comp.stdout + comp.stderr
+
+
+@pytest.mark.integration
+def test_ritz1_ufcs_array_return(ritz1_bin, tmp_path):
+    assert _run("ritz1", tmp_path, "u", UFCS_RETURN) == 3
+
+
+# AGAST #2302: ritz0's array return, read from its IR: `[4 x i32]` at the
+# definition, the method, the extern declare and every call.
+RET_ABI = """\
+struct S
+    n: i32
+
+impl S
+    fn m(self: *S) -> [4]i32
+        [0, 0, 0, self.n]
+
+extern fn ext() -> [4]i32
+
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn use_ext() -> i32
+    let c = ext()
+    return c[3]
+
+pub fn main() -> i32
+    var s: S = S { n: 3 }
+    let a = f()
+    let b = s.m()
+    return a[3] + b[3]
+"""
+
+
+def _ret_spellings(text):
+    """{(kind, fn): return type} for the define / declare / call of f, S_m, ext."""
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r'\s*(?:%"?[.\w]+"? = )?(define|declare|call)\b(.*?)@"?(f|S_m|ext)"?\(', line)
+        if m:
+            words = [w for w in m.group(2).split() if w not in ("internal", "external", "weak_odr")]
+            out[(m.group(1), m.group(3))] = " ".join(words)
+    return out
+
+
+@pytest.mark.integration
+def test_ritz1_return_abi_is_ritz0s(ritz1_bin, tmp_path):
+    comp0, ll0 = _compile("ritz0", None, tmp_path, "rabi", RET_ABI)
+    comp1, ll1 = _compile("ritz1", ritz1_bin, tmp_path, "rabi", RET_ABI)
+    assert comp0.returncode == 0 and comp1.returncode == 0, comp0.stdout + comp1.stderr
+    want = _ret_spellings(ll0.read_text())
+    assert want == {(k, fn): "[4 x i32]" for k, fn in [
+        ("define", "f"), ("define", "S_m"), ("declare", "ext"),
+        ("call", "f"), ("call", "S_m"), ("call", "ext")]}, want
+    assert _ret_spellings(ll1.read_text()) == want
 
 
 @pytest.mark.integration

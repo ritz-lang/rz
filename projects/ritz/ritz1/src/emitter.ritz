@@ -36,7 +36,9 @@ import deref_field       # df_rewrite_stmt (AGAST #3015)
 # their LLVM primitive, and a TYPE_STRUCT that lost its name keeps
 # emit_llvm_type's i64.
 fn emit_method_ret_type(s: *EmitterState, method: *FnDef)
-    if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
+    if ret_array_of(method) != null
+        emit_fn_ret_llvm_type(s, method)   # AGAST #2302: `[N x T]`
+    else if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
         emit_llvm_type_struct(s, method.return_type, method.return_type_name, method.return_type_name_len)
     else
         emit_llvm_type(s, method.return_type)
@@ -95,7 +97,11 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
             emit_str(s, c" to i64  ; #2950\n")
             ival = q
         if ival > 0
-            if ret_type == TYPE_I32 or ret_type == TYPE_U32
+            if ret_type == TYPE_ARRAY
+                # AGAST #2302: emit_array_return takes a tail statement; this
+                # value (an `if` / `match` arm's, say) is no `[N x T]`.
+                emit_ir_error(s, c"a `-> [N]T` fn's value here is not lowered by ritz1 (return the array from each arm)")
+            else if ret_type == TYPE_I32 or ret_type == TYPE_U32
                 let trunc: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, trunc)
@@ -793,7 +799,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     if s.ret_sret == 1
         emit_str(s, c"void")
     else
-        emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
+        emit_fn_ret_llvm_type(s, f)   # AGAST #2302: `-> [N]T` is `[N x T]`
     emit_str(s, c" @")
     emit_name(s, f.name, f.name_len)
     emit_str(s, c"(")
@@ -905,8 +911,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 must_use_check(s, stmt.expr)   # AGAST #2137: a void fn discards its tail
             own_check_tail(s, stmt.expr)   # AGAST #2158: the tail is moved out
             own_check_lent_value_stmt(s, stmt.expr)   # AGAST #2949
+            if emit_array_return(s, stmt.expr, ret_array_of(f)) == 1
+                has_explicit_return = 1   # AGAST #2302: a `-> [N]T` tail is returned whole
             # Special handling for struct literal returns
-            if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
+            else if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
                 emit_str(s, c"  ")
@@ -1279,8 +1287,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                 must_use_check(s, stmt.expr)   # AGAST #2137: a void fn discards its tail
             own_check_tail(s, stmt.expr)   # AGAST #2158
             own_check_lent_value_stmt(s, stmt.expr)   # AGAST #2949
+            if emit_array_return(s, stmt.expr, ret_array_of(method)) == 1
+                has_explicit_return = 1   # AGAST #2302: a `-> [N]T` tail is returned whole
             # Special handling for struct literal returns
-            if stmt.expr.kind == EXPR_STRUCT_LIT and method.return_type == TYPE_STRUCT
+            else if stmt.expr.kind == EXPR_STRUCT_LIT and method.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
                 emit_str(s, c"  ")
@@ -1803,7 +1813,7 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len
     if sret == 1
         emit_str(s, c"void")
     else
-        emit_llvm_type_struct(s, f.return_type, f.return_type_name, f.return_type_name_len)
+        emit_fn_ret_llvm_type(s, f)   # AGAST #2302
     emit_str(s, c" @")
     emit_name(s, name, name_len)
     emit_str(s, c"(")
@@ -1892,7 +1902,8 @@ fn emit_extern_declarations(s: *EmitterState)
                     fn_def = find_impl_method_by_symbol(s.module, ex_name, ex_len)
                     if fn_def != null
                         is_method = 1
-                if fn_has_byval_param(s, fn_def) == 1
+                # AGAST #2302: a `-> [N]T` is declared `[N x T]`, its signature whole.
+                if fn_has_byval_param(s, fn_def) == 1 or ret_array_of(fn_def) != null
                     emit_concrete_extern_declare(s, fn_def, ex_name, ex_len, is_method)   # AGAST #1739
                 else if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, fn_def.return_type_name, fn_def.return_type_name_len) == 1
                     # AGAST #1730 — the call sites pass `ptr sret(%T)`.
