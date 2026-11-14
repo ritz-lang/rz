@@ -199,6 +199,30 @@ RUNS = {
                                   "        Full(v) => 1\n        Empty => 9\n"
                                   "fn main() -> i32\n    let a: u8 = 3\n    g<i64>(4) * 10 + g<u8>(a)\n",
                                   11),
+    # AGAST #3020: the same literal beside a `g` that names `Option<i32>`
+    # first.  ritz0 built the inner `Some(6)` as whichever Option instance
+    # registered last (`cannot store i64 to %"Option$i32"*`); its slot's type
+    # argument says which.  Then Result around Option, Option around Result,
+    # and three deep.
+    "literal_nested_option_beside_its_inner": (
+        G + "fn f(o: Option<Option<i32>>) -> i32\n    match o\n        Some(x) => g(x)\n"
+        "        None => 4\nfn main() -> i32\n    let a: Option<Option<i32>> = Some(Some(6))\n"
+        "    let b: Option<Option<i32>> = Some(None)\n    f(a) * 10 + f(b)\n", 63),
+    "literal_nested_option_as_an_argument": (
+        G + "fn f(o: Option<Option<i32>>) -> i32\n    match o\n        Some(x) => g(x)\n"
+        "        None => 4\nfn main() -> i32\n    f(Some(Some(6))) * 10 + f(Some(None))\n", 63),
+    "literal_option_as_ok": (G + "fn main() -> i32\n    let c: Result<Option<i32>, i32> = Ok(Some(6))\n"
+                             "    match c\n        Ok(x) => g(x)\n        Err(e) => e\n", 6),
+    "literal_result_as_some": (G + "fn main() -> i32\n    let d: Option<Result<i32, i32>> = Some(Ok(6))\n"
+                               "    match d\n        Some(r) =>\n            match r\n"
+                               "                Ok(v) => v\n                Err(e) => e\n"
+                               "        None => 4\n", 6),
+    "literal_triple_option": (G + "fn t(o: Option<Option<Option<i32>>>) -> i32\n    match o\n"
+                              "        Some(x) =>\n            match x\n                Some(y) => g(y)\n"
+                              "                None => 4\n        None => 5\nfn main() -> i32\n"
+                              "    let e: Option<Option<Option<i32>>> = Some(Some(Some(6)))\n"
+                              "    let z: Option<Option<Option<i32>>> = Some(Some(None))\n"
+                              "    t(e) * 10 + t(z)\n", 63),
     "literal_option_as_err": ("fn main() -> i32\n    let r: Result<i32, Option<i64>> = Err(Some(5))\n"
                               "    match r\n        Ok(v) => 1\n        Err(x) =>\n"
                               "            match x\n                Some(v) => v as i32\n"

@@ -3151,16 +3151,7 @@ class LLVMEmitter:
             # and match binding agree on where each field lives.
             field_offsets, _, _ = self._enum_variant_field_layout(variant)
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
-                # The payload's declared type is the expected type of the
-                # argument (so e.g. a `[u8]` payload asks a Vec range-index for
-                # a view rather than a copy).
-                self._literal_into_slot(field_type, arg)
-                saved_expected = self.expected_ritz_type
-                self.expected_ritz_type = field_type
-                try:
-                    arg_val = self._emit_expr(arg)
-                finally:
-                    self.expected_ritz_type = saved_expected
+                arg_val = self._emit_variant_payload(field_type, arg)
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
                 # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
                 # lower to i8; use the argument's concrete LLVM type instead so the
@@ -3207,6 +3198,24 @@ class LLVMEmitter:
 
         # Load and return the enum value
         return self.builder.load(enum_alloca)
+
+    def _emit_variant_payload(self, field_type: 'rast.Type', arg: rast.Expr) -> ir.Value:
+        """Emit a variant constructor's payload argument into its slot.
+
+        The payload's declared type is the expected type of the argument (so
+        e.g. a `[u8]` payload asks a Vec range-index for a view rather than a
+        copy), and an enum-typed slot is the enum a nested constructor builds:
+        `Some(Some(6))` in an `Option<Option<i32>>` builds `Option$i32`, not
+        whichever Option instance the global variant map registered last
+        (AGAST #3020).
+        """
+        self._literal_into_slot(field_type, arg)
+        saved_expected = self.expected_ritz_type
+        self.expected_ritz_type = field_type
+        try:
+            return self._emit_expr_with_expected_enum(arg, self._let_annotation_enum(field_type))
+        finally:
+            self.expected_ritz_type = saved_expected
 
     def _is_enum_variant_call(self, expr: rast.Expr) -> bool:
         """Check if expression is an enum variant constructor call."""
@@ -3354,16 +3363,7 @@ class LLVMEmitter:
             # and match binding agree on where each field lives.
             field_offsets, _, _ = self._enum_variant_field_layout(variant)
             for i, (field_type, arg) in enumerate(zip(variant.fields, args)):
-                # The payload's declared type is the expected type of the
-                # argument (so e.g. a `[u8]` payload asks a Vec range-index for
-                # a view rather than a copy).
-                self._literal_into_slot(field_type, arg)
-                saved_expected = self.expected_ritz_type
-                self.expected_ritz_type = field_type
-                try:
-                    arg_val = self._emit_expr(arg)
-                finally:
-                    self.expected_ritz_type = saved_expected
+                arg_val = self._emit_variant_payload(field_type, arg)
                 llvm_field_type = self._ritz_type_to_llvm(field_type)
                 # Generic placeholder fields (e.g., T/E in unspecialized Result/Option)
                 # lower to i8; use the argument's concrete LLVM type instead so the
