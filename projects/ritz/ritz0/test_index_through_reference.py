@@ -592,23 +592,31 @@ def test_a_write_through_a_shared_scalar_is_section_3_2s(compile_with, compiler)
     _refused(compile_with, compiler, "shared", program, SHARED_WRITE)
 
 
-# `let p = @x` is an `@T` too.  An annotated `*T` takes the same `@x` and stays raw.
+# `let p = @x` is an `@T` too, and `let p = @&x` an `@&T` (#2445: ritz0 read past
+# it, 20; ritz1 failed at clang, later compiled it silently).  Both are refused
+# at the `p[1]`, and so is a copy of either.  An annotated `*T` takes the same
+# address and stays raw.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_inferred_reference_is_not_a_buffer(compile_with, compiler):
+@pytest.mark.parametrize("addr", ["@", "@&"])
+@pytest.mark.parametrize("copied", [False, True])
+def test_an_inferred_reference_is_not_a_buffer(compile_with, copied, addr, compiler):
     program = (f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
-               "    let p = @a[0]\n    return p[1]\n")
+               f"    let p = {addr}a[0]\n" + ("    let q = p\n    return q[1]\n" if copied
+                                                 else "    return p[1]\n"))
     comp, _, _ = compile_with(compiler, "inferred", program)
     assert comp.returncode != 0
     assert NOT_A_BUFFER in comp.stdout + comp.stderr
-    assert "main.ritz:" in comp.stdout + comp.stderr
+    # At the `p[1]` (or `q[1]`), on the line it's on.
+    assert f"main.ritz:{len(HEADER.splitlines()) + 4 + copied}:12:" in comp.stdout + comp.stderr
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_annotated_pointer_takes_the_same_address_and_is_raw(run_with, compiler):
+@pytest.mark.parametrize("addr", ["@", "@&"])
+def test_an_annotated_pointer_takes_the_same_address_and_is_raw(run_with, addr, compiler):
     program = (f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
-               "    let p: *i32 = @a[0]\n    return p[1]\n")
+               f"    let p: *i32 = {addr}a[0]\n    return p[1]\n")
     assert run_with(compiler, "annotated", program) == 20
 
 
@@ -996,19 +1004,6 @@ def test_a_vec_method_on_an_element_reached_another_way(run_with, form, compiler
                + "\npub fn main" + rest.format(addr="@"))
     assert run_with(compiler, f"vm_{form}", program) == 20
 
-
-# `let p = @&x` isn't recorded as a reference anywhere (#2445): ritz0 reads past it,
-# and ritz1 fails at clang.
-INFERRED_MUT = [pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#2445")) for c in COMPILERS]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", INFERRED_MUT)
-def test_an_inferred_mut_reference_is_not_a_buffer(compile_with, compiler):
-    program = (f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
-               "    let p = @&a[0]\n    return p[1]\n")
-    comp, _, _ = compile_with(compiler, "inferred", program)
-    assert NOT_A_BUFFER in comp.stdout + comp.stderr
 
 
 # Generic code meets its T when it's instantiated.

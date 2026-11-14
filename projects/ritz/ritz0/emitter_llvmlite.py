@@ -1462,7 +1462,8 @@ class LLVMEmitter:
             if expr.op in ('&', '@') and inner_type:
                 return rast.PtrType(expr.span, inner_type, mutable=False, shared=expr.op == '@')
             elif expr.op in ('&mut', '@&') and inner_type:
-                return rast.PtrType(expr.span, inner_type, mutable=True)
+                return rast.PtrType(expr.span, inner_type, mutable=True,
+                                    mut_ref=expr.op == '@&')
             elif expr.op == '*' and inner_type:
                 # `*r` of an `@T` / `@&T` is the T it refers to (LARB R9), as for
                 # a `*T`: without RefType here `let p = *r` with `r: @*[3]S` kept
@@ -8813,8 +8814,9 @@ class LLVMEmitter:
         inner = resolve_alias_in(ty.inner, self.type_aliases)
         path = self._buffer_field_path(inner)
         if path is None:
-            # `let p = @x` is an `@T` too, and PtrType.shared is how that shows.
-            is_ref = isinstance(ty, rast.RefType) or ty.shared
+            # `let p = @x` is an `@T` too, and `let p = @&x` an `@&T`: PtrType's
+            # shared and mut_ref are how that shows (#2335, #2445).
+            is_ref = isinstance(ty, rast.RefType) or ty.shared or ty.mut_ref
             if is_ref and not deref and not isinstance(inner, rast.ArrayType):
                 raise EmitError(array_rules.NOT_A_BUFFER, expr.span)
             # An element that's a `*T` over anything else is a raw buffer (R9):
