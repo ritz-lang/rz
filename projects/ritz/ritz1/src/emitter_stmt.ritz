@@ -2604,9 +2604,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # was swallowed by the struct-field-assignment branch above, storing
         # into the pointer field instead of through it.  The EXPR_IDENT /
         # bare-expression arms below remain for stmt_assign_expr targets.
-        # AGAST #2287: `*p = a` for `p: *[N]T` copies the whole array.  ritz1
-        # knows N only for a local or param `p`, so any other target fails
-        # closed: there is no length to check the value against.
+        # AGAST #2287: `*p = a` for `p: *[N]T` copies the whole array.  #2304:
+        # `p` is any pointer array_ptr_shape knows N for (a local or param, a
+        # field, a global, `p + k`); any other target fails closed: there is
+        # no length to check the value against.
         if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
             if deref_value_refused(s, target_expr) == 1   # AGAST #2885: `*v = x`, v a value
                 return
@@ -2628,14 +2629,12 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             if lent_array_ident(s, target_expr.operand) != null
                 emit_nd_error(s, target_expr.span.line, target_expr.span.col, c"cannot store through `*a` of an `a:& [N]T` param (assign to `a`, it is the array)")
                 return
-            let arr_dst: *LocalVar = array_ptr_local(s, target_expr.operand)
-            if arr_dst != null
-                var dst_en_len: i32 = 0
-                let dst_en: *u8 = array_ptr_elem_name(arr_dst, @dst_en_len)   # #2548
-                emit_array_local_whole_assign(s, emit_load_ptr(s, arr_dst.reg), arr_dst.pointee_array_size, arr_dst.pointee_array_elem_type, dst_en, dst_en_len, stmt.assign_value)
+            var arr_dst: ArraySrc
+            if array_ptr_shape(s, target_expr.operand, @arr_dst) == 1
+                emit_array_local_whole_assign(s, emit_array_ptr_value(s, target_expr.operand), arr_dst.size, arr_dst.elem, arr_dst.name, arr_dst.name_len, stmt.assign_value)
                 return
             if stmt.assign_value.kind == EXPR_ARRAY_LIT or stmt.assign_value.kind == EXPR_ARRAY_FILL
-                emit_ir_error(s, c"whole-array store through this pointer is not supported by ritz1 (only a local or param `p: *[N]T`)")
+                emit_ir_error(s, c"whole-array store through this pointer is not supported by ritz1 (only a `*[N]T` local, param, field or global, or `p + k` over one)")
                 return
         # Determine the store type. For `*ptr = value` we want the POINTEE
         # type of `ptr` (the destination slot's type), not the value's type.
@@ -4446,6 +4445,65 @@ fn emit_array_ptr_base(s: *EmitterState, loc: *LocalVar) -> i32
         return loc.reg
     return emit_load_ptr(s, loc.reg)
 
+# AGAST #2304: fill `out` with N and T when `*e` is a whole `[N]T` place: `e` an
+# array_ptr_local, a `*[N]T` field or global that records them (base_ptr_array),
+# or `x + k` / `x - k` over a `*[N]T` one, which steps whole rows (#2330).  N
+# and T are the pointer's own, never the value's: with no N there is no
+# length to check a store against.  Emits nothing.
+fn array_ptr_shape(s: *EmitterState, e: *Expr, out: *ArraySrc) -> i32
+    if e == null
+        return 0
+    let loc: *LocalVar = array_ptr_local(s, e)
+    if loc != null
+        var en_len: i32 = 0
+        let en: *u8 = array_ptr_elem_name(loc, @en_len)   # #2548
+        return array_src_set(out, loc.pointee_array_size, loc.pointee_array_elem_type, en, en_len)
+    if e.kind == EXPR_BINARY
+        if e.op != OP_ADD and e.op != OP_SUB
+            return 0
+        if array_ptr_steps(s, e.left) == 0 or is_ptr_distance(s, e) == 1
+            return 0
+        return array_ptr_shape(s, e.left, out)
+    let pa: *Param = base_ptr_array(s, e)
+    if pa == null
+        return 0
+    array_src_set(out, pa.param_pointee_array_size, pa.param_pointee_array_elem_type, pa.param_type_name, pa.param_type_name_len)
+
+# 1 when `*e` is a whole `[N]T` (array_ptr_shape), which isn't a value on its own.
+fn deref_names_array(s: *EmitterState, e: *Expr) -> i32
+    var sh: ArraySrc
+    array_ptr_shape(s, e, @sh)
+
+# 1 when `x + k` on `e` steps rows of a `*[N]T`: `e` is a `*[N]T` local or param,
+# field or global, or such a step itself.  `@[N]T` and `a:& [N]T` aren't.
+fn array_ptr_steps(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_BINARY
+        if (e.op == OP_ADD or e.op == OP_SUB) and is_ptr_distance(s, e) == 0
+            return array_ptr_steps(s, e.left)
+        return 0
+    let loc: *LocalVar = array_ptr_local(s, e)
+    if loc != null
+        if loc.var_type == TYPE_PTR
+            return 1
+        return 0
+    if base_ptr_array_row_size(s, e) > 0
+        return 1
+    0
+
+# The address of the array array_ptr_shape recognised behind `e`.
+fn emit_array_ptr_value(s: *EmitterState, e: *Expr) -> i32
+    let loc: *LocalVar = array_ptr_local(s, e)
+    if loc != null
+        return emit_array_ptr_base(s, loc)
+    let val: i32 = emit_expr(s, e)
+    let ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, val)
+    emit_str(s, c" to ptr\n")
+    ptr
+
 # Fill `out` when `value` reads a whole 1-D array out of a place that needs no
 # code to find: a local or by-value param, `a:& [N]T`, a global, `*p`.  Returns
 # 0 for anything else.  Emits nothing, so a check can ask before emitting.
@@ -4461,11 +4519,7 @@ fn array_place_shape(s: *EmitterState, value: *Expr, out: *ArraySrc) -> i32
             return array_src_set(out, g.array_size, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
         return 0
     if value.kind == EXPR_UNARY and value.op == OP_DEREF
-        let ploc: *LocalVar = array_ptr_local(s, value.operand)
-        if ploc != null
-            var en_len: i32 = 0
-            let en: *u8 = array_ptr_elem_name(ploc, @en_len)   # #2548
-            return array_src_set(out, ploc.pointee_array_size, ploc.pointee_array_elem_type, en, en_len)
+        return array_ptr_shape(s, value.operand, out)   # AGAST #2304
     0
 
 # AGAST #2517: fill `out` when `value` is a 1-D row of an N-D array (nd_row_shape:
@@ -4501,7 +4555,7 @@ fn emit_global_array_ptr(s: *EmitterState, g: *GlobalVarDef) -> i32
 fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
     if value.kind == EXPR_UNARY
         lent_array_local(s, value.operand)
-        return emit_array_ptr_base(s, array_ptr_local(s, value.operand))
+        return emit_array_ptr_value(s, value.operand)   # AGAST #2304
     let lent: *LocalVar = lent_array_local(s, value)
     if lent != null
         return lent.reg
