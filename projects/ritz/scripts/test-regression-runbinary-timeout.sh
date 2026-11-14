@@ -56,20 +56,55 @@ TAG="3157$$"
 # stays the script's last (tools/test_gate_tmpdirs.py reads it as the one
 # in force).
 #
-# stress_watchdog DIR -- 40 watchdog_wait calls on an instant job, under an
-# EXIT trap that leaves DIR/PID behind when it runs in any other process.
-# Prints "status" per call not returning the job's 3 and "slow" per call
-# that waited out the 3s budget.
+# stress_watchdog DIR -- 300 watchdog_wait calls on a job that lives a few
+# microseconds, under an EXIT trap that leaves DIR/PID behind when it runs
+# in any other process.  Prints "status" per call not returning the job's 3
+# and "slow" per call that took half the 1s budget.  That short a job often
+# exits just as `wait -n` starts blocking: bash's lost wakeup (AGAST #3228,
+# see watchdog_wait), which lost_wakeup below provokes on purpose.
 stress_watchdog() {
     local dir="$1" main=$BASHPID t0 s r
     # Expanded now: the locals are gone when the $( ) shell itself exits.
     trap "[[ \$BASHPID != $main ]] && : > $(printf %q "$dir")/\$BASHPID" EXIT
-    for _ in $(seq 40); do
+    for _ in $(seq 300); do
         t0=${EPOCHREALTIME//[!0-9]/}
-        { ( exit 3 ) & s=$!; watchdog_wait "$s" 3s; r=$?; } 2>/dev/null
+        { ( for ((j = 0; j < 10; j++)); do :; done; exit 3 ) & s=$!
+          watchdog_wait "$s" 1s; r=$?; } 2>/dev/null
         [[ $r == 3 ]] || echo status
-        (( ${EPOCHREALTIME//[!0-9]/} - t0 < 1500000 )) || echo slow
+        (( ${EPOCHREALTIME//[!0-9]/} - t0 < 500000 )) || echo slow
     done
+}
+# lost_wakeup MODE -- one watchdog_wait call on an instant job, with bash's
+# lost wakeup forced: a child reaped by the SIGCHLD handler between the
+# dead-job check and the blocking waitpid(-1) goes unseen until some other
+# child exits.  MODE "-n": the first `wait -n` loses the job's exit, so
+# waits for the job's siblings alone.  MODE "pid": the first `wait PID...`
+# loses its children's exits, so first waits for any other child still
+# running.  Prints "<status> <ms>"; call inside $( ), as it overrides `wait`.
+lost_wakeup() {
+    local mode="$1" s t0 r lost=
+    wait() {
+        local var p others=()
+        if [[ -z "$lost" && "$mode" == -n && "$1 $2" == "-n -p" ]]; then
+            lost=1
+            var="$3"
+            shift 3
+            for p; do [[ "$p" == "$s" ]] || others+=("$p"); done
+            builtin wait -n -p "$var" "${others[@]}"
+            return
+        fi
+        if [[ -z "$lost" && "$mode" == pid && "$1" != -* ]]; then
+            lost=1
+            for p in $(jobs -pr); do
+                [[ " $* " == *" $p "* ]] || others+=("$p")
+            done
+            (( ${#others[@]} )) && builtin wait -n "${others[@]}"
+        fi
+        builtin wait "$@"
+    }
+    t0=${EPOCHREALTIME//[!0-9]/}
+    { ( exit 3 ) & s=$!; watchdog_wait "$s" 2s; r=$?; } 2>/dev/null
+    echo "$r $(( (${EPOCHREALTIME//[!0-9]/} - t0) / 1000 ))"
 }
 # stress_run_binary BIN DIR -- 20 run_binary calls of BIN (prints out/err,
 # exits 3) writing into DIR, under an EXIT trap that removes DIR, as cleanup
@@ -243,12 +278,27 @@ done
 #    SIGKILL can be neither caught nor lost.  Each loop below did hit it on
 #    an idle host: 40 instant jobs ran the trap 13-24 times and waited out
 #    the budget 8-23 times.
-#    Each loop runs in $( ) under its own EXIT trap (stress_watchdog and
-#    stress_run_binary, defined above cleanup's trap), so a stray run
+#    Each loop runs in $( ) under its own EXIT trap (stress_watchdog
+#    and stress_run_binary, defined above cleanup's trap), so a stray run
 #    cannot be cleanup.
+#    The first check also catches bash's lost wakeup -- AGAST #3228: a job
+#    that exits just as `wait -n` starts blocking is reaped by the SIGCHLD
+#    handler and not seen until another child exits.  With the budget
+#    watchdog the only other child, that call returned the job's status a
+#    whole budget late ("got: slow" on a loaded ubuntu-26.04 runner); on an
+#    idle host ~0.4% of these calls hit it.  watchdog_wait's ticker
+#    bounds it to one tick, and KILLs every sleep before it waits for any,
+#    so a lost wakeup there finds the next exit already due.  lost_wakeup
+#    provokes each case every time.
+for m in -n pid; do
+    read -r lw_status lw_ms <<< "$(lost_wakeup "$m")"
+    check "[$NAME] lost wakeup ($m): watchdog_wait still returns the job's status" 3 "$lw_status"
+    check "[$NAME] lost wakeup ($m): within a tick or so, not the 2s budget" yes \
+        "$( (( lw_ms < 1000 )) && echo yes || echo "no (${lw_ms}ms)")"
+done
 wd_trap="$SCRATCH/wd-trap"
 mkdir -p "$wd_trap"
-check "[$NAME] stress: watchdog_wait x40 returns each job's status at once" "" \
+check "[$NAME] stress: watchdog_wait x300 returns each job's status at once" "" \
     "$(echo $(stress_watchdog "$wd_trap"))"
 check "[$NAME] stress: its killed watchdog never runs the caller's EXIT trap" 0 \
     "$(find "$wd_trap" -type f | wc -l)"

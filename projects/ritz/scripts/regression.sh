@@ -595,28 +595,49 @@ fi
 # fork) and $! is the session leader's pid, i.e. the sid.  Must run in the
 # caller's own shell (not a subshell), which alone can wait for its jobs;
 # wrap the call in `{ ...; } 2>/dev/null` to swallow bash's "Killed" report.
+#
+# The ticker -- AGAST #3228.  bash's `wait -n` can lose a child's exit: it
+# checks its job table for a dead job, unblocks SIGCHLD, and only then
+# blocks in waitpid(-1).  A job that exits in between is reaped by the
+# SIGCHLD handler, so that waitpid sleeps until the *next* child exits and
+# only then is the job reported (bash 5.3 jobs.c, wait_for_any_job ->
+# wait_for(ANY_PID)).  With the budget watchdog the only other child, an
+# instant job came back with its own status but a whole budget late: "slow"
+# on a loaded ubuntu-26.04 CI runner, ~0.4% of calls on an idle host.  So a
+# short `sleep` ticks alongside: whatever wakeup is lost, another child is
+# due within WATCHDOG_TICK, and the next `wait -n` sees the dead job.
+WATCHDOG_TICK=0.1
 watchdog_wait() {
-    local sid="$1" budget="$2" wd first result
+    local sid="$1" budget="$2" wd tick first result
     sleep "$budget" &
     wd=$!
-    wait -n -p first "$sid" "$wd"
-    result=$?
+    while :; do
+        sleep "$WATCHDOG_TICK" &
+        tick=$!
+        wait -n -p first "$sid" "$wd" "$tick"
+        result=$?
+        [[ "$first" == "$tick" ]] || break
+    done
+    # KILL every child still running before waiting for any: a `wait PID`
+    # can lose its wakeup the same way, and must then find the next exit
+    # already on its way, not a budget away.
+    #
+    # KILL, never TERM -- AGAST #3211.  After a fast job a sleep is often
+    # still a fork of this shell that has not exec'd yet.  Sent TERM there,
+    # bash catches it and either runs the EXIT trap it inherited
+    # (regression.sh's cleanup_build_dir; a self-test's `rm -rf $SCRATCH`),
+    # deleting files the caller is about to write or read, or execs sleep
+    # anyway with the TERM lost, so the `wait` below sat out the whole
+    # budget.  KILL can be neither caught nor lost.
+    kill -KILL "$tick" 2>/dev/null
     if [[ "$first" == "$wd" ]]; then
         # Watchdog fired with the job still running: timed out.
         pkill -KILL -s "$sid" 2>/dev/null
-        wait "$sid"
+        wait "$sid" "$tick"
         result=137
     else
-        # KILL, never TERM -- AGAST #3211.  After a fast job the watchdog is
-        # often still a fork of this shell that has not exec'd sleep yet.
-        # Sent TERM there, bash catches it and either runs the EXIT trap it
-        # inherited (regression.sh's cleanup_build_dir; a self-test's
-        # `rm -rf $SCRATCH`), deleting files the caller is about to write
-        # or read, or execs sleep anyway with the TERM lost, so the `wait`
-        # below sat out the whole budget.  KILL can be neither caught nor
-        # lost.
         kill -KILL "$wd" 2>/dev/null
-        wait "$wd"
+        wait "$wd" "$tick"
     fi
     return $result
 }
