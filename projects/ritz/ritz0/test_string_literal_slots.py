@@ -131,6 +131,18 @@ REJECTED = {
     "fit_i64_hex": (_fn("", "let a: i64 = 0xF000000000000000\n0"), 2, 18,
                     _fits(17293822569102704640, "i64")),
     "fit_u64_negative": (_fn("", "let a: u64 = -1\n0"), 2, 18, _fits(-1, "u64")),
+    # AGAST #2138: ritz1 holds a literal as an i64, so 2^63.. reads negative and
+    # -(2^63 + 1).. reads positive. Both are refused, and named as written.
+    "fit_i64_two_63": (_fn("", "let a: i64 = 9223372036854775808\n0"), 2, 18,
+                       _fits(9223372036854775808, "i64")),
+    "fit_i64_u64_max": (_fn("", "let a: i64 = 18446744073709551615\n0"), 2, 18,
+                        _fits(18446744073709551615, "i64")),
+    "fit_i64_below_min": (_fn("", "let a: i64 = -9223372036854775809\n0"), 2, 18,
+                          _fits(-9223372036854775809, "i64")),
+    "fit_u64_below_i64_min": (_fn("", "let a: u64 = -9223372036854775809\n0"), 2, 18,
+                              _fits(-9223372036854775809, "u64")),
+    "fit_i32_below_i64_min": (_fn("", "let a: i32 = -9223372036854775809\n0"), 2, 18,
+                              _fits(-9223372036854775809, "i32")),
     "fit_const": ("const K: u8 = 300\n" + _MAIN, 1, 15, _fits(300, "u8")),
     "fit_const_element": ("const A: [2]u8 = [1, 300]\n" + _MAIN, 1, 22, _fits(300, "u8")),
     "fit_global": ("var G: u8 = 300\n" + _MAIN, 1, 13, _fits(300, "u8")),
@@ -247,6 +259,13 @@ ACCEPTED = {
                     "    (a >> 60) as i32\n", 15),
     "fit_i64_min": ("fn main() -> i32\n    let b: i64 = -9223372036854775808\n    if b < 0\n"
                     "        return 3\n    0\n", 3),
+    # AGAST #2138: the u64 controls, in decimal, and i64's own edge.
+    "fit_u64_two_63": ("fn main() -> i32\n    let a: u64 = 9223372036854775808\n"
+                       "    (a >> 63) as i32\n", 1),
+    "fit_u64_max": ("fn main() -> i32\n    let a: u64 = 18446744073709551615\n"
+                    "    (a >> 60) as i32\n", 15),
+    "fit_i64_max": ("fn main() -> i32\n    let a: i64 = 9223372036854775807\n"
+                    "    (a >> 62) as i32\n", 1),
     "fit_cast_says_so": ("fn main() -> i32\n    let c: i64 = 0xF000000000000000 as i64\n    if c < 0\n"
                          "        return 4\n    0\n", 4),
     "fit_element_edges": ("fn main() -> i32\n    let a: [2]u8 = [0, 255]\n    a[1] as i32\n", 255),
