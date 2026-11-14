@@ -17,7 +17,11 @@ String is #2440's, in test_index_through_reference.py.
 
 #3074: a `p:& *[3]T` borrow is a row kind here.  An array of pointers one level
 out, `p: @*[3]*U`, recorded no U on ritz1: `*(*p)[i]` read a byte and `(*p)[i].f`
-failed to emit.  `p[i]` on the borrow is #3103; a `**[N]*S` `let` local is #3104.
+failed to emit.  A `**[N]*S` `let` local is #3104.
+
+#3103: on that borrow `p` reads as the caller's `*[3]T` (§13.4), so `p[i]` is
+element i too, as on a `p: *[3]T` param.  ritz1 refused it: "a reference is one
+value, not a buffer".
 """
 
 import pytest
@@ -79,6 +83,19 @@ def _program(kind: str, position: str) -> str:
 
 
 ROWS = [(k, p) for k in KINDS for p in POSITIONS if KINDS[k][2] or p not in WRITES]
+
+# #3103: `p[i]`, no `*`, where `p` reads as a `*[3]T`: a plain pointer param (the
+# control) and the `:& *[3]T` borrow.  One level further out `p[i]` is a raw buffer.
+BARE_KINDS = ("pointer", "borrow_ptr")
+BARE_ROWS = [(k, p) for k in BARE_KINDS for p in POSITIONS]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("kind,position", BARE_ROWS)
+def test_a_bare_index_is_element_i(run_with, kind, position, compiler):
+    program = _program(kind, position).replace("(*p)[", "p[")
+    assert run_with(compiler, f"bare_{kind}_{position}", program) == 20
 
 
 @pytest.mark.integration
@@ -161,6 +178,21 @@ def test_a_pointer_element_one_level_out_reads_at_its_width(run_with, kind, posi
     assert run_with(compiler, f"ptr_elem_{kind}_{position}", _ptr_elem_program(kind, position)) == 20
 
 
+# #3103: `p[i]` on a `p:& *[3]*U` borrow (and a `*[3]*U` param, the control).
+BARE_PTR_ELEM_KINDS = {"pointer": ": *", "borrow_ptr": ":& *"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("position", sorted(PTR_ELEM_POSITIONS))
+@pytest.mark.parametrize("kind", sorted(BARE_PTR_ELEM_KINDS))
+def test_a_bare_pointer_element_reads_at_its_width(run_with, kind, position, compiler):
+    arg = "@a" if kind == "pointer" else "q"
+    program = (_ptr_elem_program("ptr_ptr", position).replace("(*p)[", "p[")
+               .replace("p: **[3]", f"p{BARE_PTR_ELEM_KINDS[kind]}[3]").replace("f(@q, 1)", f"f({arg}, 1)"))
+    assert run_with(compiler, f"bare_ptr_elem_{kind}_{position}", program) == 20
+
+
 # #3074: the same through an `@*[3]*U` or `@&*[3]*U` local, named through its type.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
@@ -179,10 +211,12 @@ def test_a_pointer_element_through_a_ref_ptr_local(run_with, around, addr, compi
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("elem", ["W", "*W"])
-@pytest.mark.parametrize("where", ["param", "local"])
+@pytest.mark.parametrize("where", ["param", "local", "borrow"])
 def test_a_field_of_the_array_itself_is_refused(compile_with, where, elem, compiler):
-    if where == "param":
-        program = W + f"fn f(q: @*[3]{elem}) -> i64\n    return (*q).v\n\npub fn main() -> i32\n    return 0\n"
+    if where in ("param", "borrow"):
+        # #3103: the `q:& *[3]T` borrow, bound as a `*[3]T` local, names no S either.
+        around = "q: @*" if where == "param" else "q:& *"
+        program = W + f"fn f({around}[3]{elem}) -> i64\n    return (*q).v\n\npub fn main() -> i32\n    return 0\n"
     else:
         program = (W + f"pub fn main() -> i32\n    var a: [3]{elem}\n    var q: *[3]{elem} = @a\n"
                    + f"    let r: @*[3]{elem} = @q\n    return (*r).v as i32\n")
