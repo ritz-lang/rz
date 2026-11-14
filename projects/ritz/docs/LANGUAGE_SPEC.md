@@ -1591,6 +1591,18 @@ let n = p - s         # 5 elements, not 20 bytes
 let back = s - p      # -5
 ```
 
+A reference is one value, not a buffer (LARB R9, R16): `+`, `-`, `+=`, `-=` and
+`q - p` are errors on an `@T` or `@&T` whose `T` isn't an array, because `p + 1`
+names a value the reference never lent, which the loan check (§13.5) can't see.
+On a reference, cast first: `(p as *T) + n`. The row walk on an `@[N]T` or
+`@&[N]T` stays legal (§7.8).
+
+```ritz expect-error="a reference is one value, not a buffer: `+` needs a `*T`; write `(p as *i32) + 1`"
+fn f(p: @&i32) -> i32
+    let q: *i32 = p + 1
+    *q
+```
+
 For a struct `T` the element is `sizeof(T)`, padding included. Before AGAST #2928
 ritz0 emitted `sub` on two pointers, which clang rejected, and ritz1 gave
 `q - p * sizeof(T)`, except for an element of a `[N]*T` array, which gave bytes.
@@ -1950,7 +1962,8 @@ fn main() -> i32
 An array behind a pointer is the same. `p[i]` on a `*[N]T`, `@[N]T` or `@&[N]T` is
 element `i` of the array, at stride `T`, in every position, and by value it's a
 copy. So for a pointer to an array, `p[i]` is not `*(p + i)`: `p + i` steps by the
-pointee, a whole `[N]T`, and is how to walk rows.
+pointee, a whole `[N]T`, and is how to walk rows. On an `@[N]T` or `@&[N]T` the
+row walk is the only arithmetic a reference allows (§7.1, LARB R16, R18).
 
 ```ritz
 struct Point

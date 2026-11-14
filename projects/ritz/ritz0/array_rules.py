@@ -13,6 +13,15 @@ ELEMENT_MISMATCH = "an array only fits a slot of the same element type: write a 
 NOT_A_BUFFER = ('a reference is one value, not a buffer: '
                 '`[]` needs an array, Vec, Span or String behind it')
 
+
+def ref_arith(op: str, pointee: str) -> str:
+    """`p + i`, `p - i`, `p += i`, `p -= i` or `p - q` with `p` an `@T` / `@&T`
+    and T not an array (AGAST #3037, LARB R16).  `op` is `+` or `-`, `pointee`
+    is T as Ritz spells it.  ritz1 prints the same words, from
+    emitter_expr_arith.ritz."""
+    return ('a reference is one value, not a buffer: '
+            f'`{op}` needs a `*T`; write `(p as *{pointee}) {op} 1`')
+
 # `(*v)[i]` with `v` a Vec, Span, String or struct value, not a pointer to one
 # (AGAST #2452).  ritz0 raised a Python AttributeError, ritz1 failed at clang.
 # ritz1 prints the same words, from index_through.ritz.

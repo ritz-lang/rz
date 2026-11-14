@@ -265,6 +265,8 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # size is never 0, so the sentinel is unambiguous.
     # AGAST #2928 / #2597: `q - p` on two pointers is their distance in
     # elements of the left's pointee: (q - p) / sizeof(T), an i64.
+    if (e.op == OP_ADD or e.op == OP_SUB) and refuse_ref_arith(s, e) == 1
+        return 0   # AGAST #3037, LARB R16
     if is_ptr_distance(s, e) == 1
         return emit_ptr_distance(s, e)
 
@@ -764,6 +766,54 @@ fn ptr_operand_stride(s: *EmitterState, x: *Expr) -> i64
     if ps_len > 0 and find_struct(s, ps_name, ps_len) != null
         return get_struct_size_by_name(s, ps_name, ps_len)
     ptr_arith_elem_size(s, x)
+
+# AGAST #3037, LARB R16: `p + i`, `i + p`, `p - i`, `p += i`, `p -= i` and
+# `p - q` with `p` an `@T` / `@&T` and T not an array.  A reference names one
+# value, so `p + 1` names one that was never lent; `(p as *T) + 1` is the way
+# out.  The row walk on `@[N]T` / `@&[N]T` stays legal (§7.8, #2554, R18).
+# `+=` / `-=` reach here desugared.  The words are ritz0's array_rules.ref_arith.
+fn refuse_ref_arith(s: *EmitterState, e: *Expr) -> i32
+    var t: *u8 = null
+    var tl: i32 = 0
+    if ref_arith_pointee(s, e.left, @t, @tl) == 0 and ref_arith_pointee(s, e.right, @t, @tl) == 0
+        return 0
+    var op: *u8 = c"+"
+    if e.op == OP_SUB
+        op = c"-"
+    var n: i32 = 0
+    let lead: *u8 = c"a reference is one value, not a buffer: `"
+    let a: *u8 = ctor_join(lead, strlen(lead) as i32, op, 1, c"` needs a `*T`; write `(p as *", 30, @n)
+    let b: *u8 = ctor_join(a, n, t, tl, c") ", 2, @n)
+    let msg: *u8 = ctor_join(b, n, op, 1, c" 1`", 3, @n)
+    emit_nd_error(s, e.span.line, e.span.col, msg)
+    1
+
+# 1 when `x` names an `@T` / `@&T` local or param whose T isn't an array, with
+# T as Ritz spells it ("i32", "S", "*u8"; "T" when unknown) in out_name/out_len.
+fn ref_arith_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if x == null or x.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+    if loc == null or (loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF)
+        return 0
+    if loc.pointee_type == TYPE_ARRAY
+        return 0
+    var name: *u8 = primitive_name_from_type(loc.pointee_type)
+    var len: i32 = 0
+    if name != null
+        len = strlen(name) as i32
+    else if loc.pointee_type == TYPE_PTR and primitive_name_from_type(loc.inner_pointee_type) != null
+        let inner: *u8 = primitive_name_from_type(loc.inner_pointee_type)
+        name = ctor_join(c"*", 1, inner, strlen(inner) as i32, c"", 0, @len)
+    else if loc.type_name_len > 0
+        name = loc.type_name
+        len = loc.type_name_len
+    else
+        name = c"T"
+        len = 1
+    *out_name = name
+    *out_len = len
+    1
 
 # AGAST #2928: `q - p` on two pointers, as an i64 count of elements.  Both
 # sides come into the i64 value model (an `@&T` operand is a `ptr`, #1754),

@@ -76,10 +76,11 @@ pub fn main() -> i32
         return 1
     0
 """,
-    # reference parameters, which ritz1 may hold as `ptr`, not i64
+    # reference parameters, which ritz1 may hold as `ptr`, not i64: a
+    # reference has no distance (#3037, LARB R16), so the cast gives one
     "refs": """\
 fn dist(q: @i32, p: @i32) -> i64
-    q - p
+    (q as *i32) - (p as *i32)
 
 pub fn main() -> i32
     var a: [8]i32
@@ -87,10 +88,11 @@ pub fn main() -> i32
         return 1
     0
 """,
-    # an `@&` operand, which ritz1 holds as `ptr`, not i64 (#1754)
+    # an `@&` operand, which ritz1 holds as `ptr`, not i64 (#1754), cast
     "mut_ref": """\
 fn back(q: @&i32) -> i64
-    q - (q - 3)
+    let p: *i32 = q as *i32
+    p - (p - 3)
 
 pub fn main() -> i32
     var a: [8]i32
@@ -150,8 +152,8 @@ def test_pointer_difference_counts_elements(tmp_path, compiler, name):
 
 # Two pointee types have no common element to count in (#2957): ritz0 refuses
 # it, located, and ritz1 counted in the left's elements.  The type is the one
-# LLVM sees, so `*u8 - *i8` above is one type, and a reference operand is
-# refused as its pointer is.
+# LLVM sees, so `*u8 - *i8` above is one type.  A reference operand is refused
+# before the types are compared (#3037, LARB R16; test_ref_arith_refused.py).
 MIXED = {
     "ptr": ("""\
 pub fn main() -> i32
@@ -161,20 +163,6 @@ pub fn main() -> i32
     let d: i64 = ^p - s
     0
 """, "`i32*` and `i8*`"),
-    "refs": ("""\
-fn dist(q: @i32, p: @u8) -> i64
-    ^q - p
-
-pub fn main() -> i32
-    0
-""", "`i32*` and `i8*`"),
-    "mut_ref": ("""\
-fn back(q: @&i32, p: *i64) -> i64
-    ^q + 1 - p
-
-pub fn main() -> i32
-    0
-""", "`i32*` and `i64*`"),
 }
 
 
