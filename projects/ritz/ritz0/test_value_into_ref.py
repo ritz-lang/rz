@@ -80,6 +80,12 @@ OTHER_SHAPES = {
     "scalar_lent_pointer": ("fn f(n:& i32) -> *i32\n    return ^n\n", VALUE_INTO_SHARED_REF),
     "scalar_lent_argument": ("fn g(p: @i32) -> i32\n    0\n\nfn f(n:& i32) -> i32\n    g(^n)\n",
                              VALUE_INTO_SHARED_REF),
+    # #3226: an arm is a value, so it never lends, scalar or not. ritz1 once
+    # made the integer the pointer here and exited -11 (#2309).
+    "scalar_lent_if_arm": ("fn f(n:& i32, k: i32) -> i32\n    let p: @&i32 = if k == 0\n        ^n\n"
+                           "    else\n        n\n    0\n", VALUE_INTO_MUT_REF),
+    "scalar_lent_match_arm": ("fn f(n:& i32, k: i32) -> i32\n    let p: @&i32 = match k\n        0 => ^n\n"
+                              "        _ => n\n    0\n", VALUE_INTO_MUT_REF),
     "scalar_value_argument": ("fn g(p: @i32) -> i32\n    0\n\nfn f(n: i32) -> i32\n    g(^n)\n",
                               VALUE_INTO_SHARED_REF),
     "scalar_value_pointer": ("fn g(p: *i32) -> i32\n    0\n\nfn f(n: i32) -> i32\n    g(^n)\n",
