@@ -180,11 +180,59 @@ check "a real termination change is still reported as one" yes \
 #    creeping back in.  The concurrent end-to-end proof lives in the #1535
 #    commit and in every gate, which now runs them with a per-run port.
 # ---------------------------------------------------------------------------
-for ex in 74_async_tiers 75_tier2_uring 76_tier3_http; do
+for ex in 74_async_tiers 75_tier2_uring 76_tier3_http tier5_async/50_http; do
     src="$RITZ_ROOT/examples/$ex/src/main.ritz"
     check "$ex reads RITZ_EXAMPLE_PORT" yes \
         "$(grep -q 'RITZ_EXAMPLE_PORT' "$src" && echo yes || echo no)"
 done
+
+# ---------------------------------------------------------------------------
+# 5. No example in the corpus binds a hard-coded port it cannot be moved off.
+#
+#    The list in 4 rotted once already: tier5_async_50_http bound a fixed 8080
+#    and was never on it, so a host where anything else held 8080 failed the
+#    gate as an infrastructure error (AGAST #3136).  59_async_net and
+#    60_echo_server bound fixed 9876-9880 for their client/server self-tests and
+#    hung until the timeout when those were taken.  So this is a rule over the
+#    whole corpus, not a list: a literal port (1024-65535) assigned to a
+#    `port` or passed straight to a bind is allowed only in an example that
+#    reads RITZ_EXAMPLE_PORT (keeping it as the default when unset).  A
+#    self-test that needs a port of its own binds port 0 and asks the kernel
+#    which one it got (tcp_getsockname).
+# ---------------------------------------------------------------------------
+# Prints the example's literal-port lines, or nothing.  Args: $1=example dir
+fixed_listen_ports() {
+    grep -rsnE --include='*.ritz' --exclude-dir=build \
+        '\bport\b[^=(]*= *[1-9][0-9]{3,4}\b|bind\([^)]*, *[1-9][0-9]{3,4} *\)' \
+        "$1"/src
+}
+unmovable_port() {
+    [[ -n "$(fixed_listen_ports "$1")" ]] &&
+        ! grep -rqs --include='*.ritz' --exclude-dir=build 'RITZ_EXAMPLE_PORT' "$1"/src
+}
+
+# The detector itself, on fixtures, so a broken regex cannot pass vacuously.
+mkdir -p "$SCRATCH/fx_fixed/src" "$SCRATCH/fx_env/src" "$SCRATCH/fx_zero/src"
+printf 'fn main() -> i32\n    var port: i32 = 8080\n' > "$SCRATCH/fx_fixed/src/main.ritz"
+printf 'fn main() -> i32\n    let x: i32 = tcp_bind(fd, lh, 9876)\n' >> "$SCRATCH/fx_fixed/src/main.ritz"
+printf '# RITZ_EXAMPLE_PORT\nfn main() -> i32\n    var port: i32 = 8080\n' > "$SCRATCH/fx_env/src/main.ritz"
+printf 'fn main() -> i32\n    let port: i32 = 0\n    tcp_bind(fd, lh, port)\n' > "$SCRATCH/fx_zero/src/main.ritz"
+check "the detector finds a literal port and a literal bind" 2 \
+    "$(fixed_listen_ports "$SCRATCH/fx_fixed" | wc -l)"
+check "a literal port with no RITZ_EXAMPLE_PORT is unmovable" yes \
+    "$(unmovable_port "$SCRATCH/fx_fixed" && echo yes || echo no)"
+check "a literal default behind RITZ_EXAMPLE_PORT is fine" no \
+    "$(unmovable_port "$SCRATCH/fx_env" && echo yes || echo no)"
+check "binding port 0 is fine" no \
+    "$(unmovable_port "$SCRATCH/fx_zero" && echo yes || echo no)"
+
+# The corpus regression.sh actually runs.
+unmovable=()
+while read -r ex; do
+    unmovable_port "$ex" && unmovable+=("$(example_key "$ex")")
+done < <(get_examples)
+check "no corpus example binds a fixed port without RITZ_EXAMPLE_PORT" "" \
+    "${unmovable[*]}"
 
 echo ""
 echo "$TESTS_RUN checks, $TESTS_FAILED failed"
