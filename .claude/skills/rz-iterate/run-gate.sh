@@ -8,7 +8,8 @@
 #
 # Env overrides:
 #   RZ_GATE_CMD    command run from <worktree>   (default: clean ci-local)
-#   RZ_GATE_SLOTS  gates allowed at once         (default: 1)
+#   RZ_GATE_SLOTS  gates allowed at once         (default: host.env, else 1)
+#   RZ_HOST_ENV    per-host config file          (default: ~/.config/rz/host.env)
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
 #
 # Why each piece exists (rz-iterate):
@@ -17,6 +18,10 @@
 #   * slots: 12 cores.  ci-local has 180 s timed tests; six concurrent gates
 #     turn them into timeouts that look like regressions and are not.
 #     Default is 1: concurrent gates OOM'd the WSL VM and took it down.
+#     A bigger host raises it in ~/.config/rz/host.env (RZ_GATE_SLOTS=2 on
+#     huburght, AGAST #2998; format in .claude/host-env.sh).  Not above 2 on
+#     12 cores, for the timed tests' sake.  An RZ_GATE_SLOTS in the
+#     environment still wins over the file.
 #   * ritz-gate.slice at CPUWeight=100: the slot protects gates from gates,
 #     not from room builds.  Task rooms run in ritz-rooms.slice at
 #     CPUWeight=20 under a memory cap (.claude/host-budget.sh, AGAST #1811),
@@ -62,7 +67,14 @@ fi
 
 WT="$(cd "$1" && pwd -P)"
 NAME="$2"
-SLOTS="${RZ_GATE_SLOTS:-1}"
+# shellcheck source=../../host-env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../host-env.sh"
+rz_host_env_load || exit 2
+SLOTS="${RZ_GATE_SLOTS:-${HOST_ENV[RZ_GATE_SLOTS]:-1}}"
+if [[ ! "$SLOTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: RZ_GATE_SLOTS must be a whole number >= 1: '$SLOTS'" >&2
+    exit 2
+fi
 # Wipe ritz1/build too: a gate is a verdict on the commit, not on whatever
 # objects an earlier base left behind.  Reusing it is how #1497 got 30 bogus
 # failures from stale struct layouts (AGAST #1659).

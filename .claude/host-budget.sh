@@ -8,7 +8,13 @@
 #
 #   <room> is the adele room / unit instance, e.g. ritz-task-1811.
 #
-# Env override (tests): RZ_SYSTEMD_USER_DIR   (default ~/.config/systemd/user)
+# Env overrides (tests): RZ_SYSTEMD_USER_DIR  (default ~/.config/systemd/user)
+#                        RZ_HOST_ENV          (default ~/.config/rz/host.env)
+#
+# PER HOST (AGAST #2998): ~/.config/rz/host.env may set RZ_ROOMS_MEMORY_HIGH /
+# RZ_ROOMS_MEMORY_MAX (the ritz-rooms.slice caps below) and RZ_GATE_SLOTS
+# (run-gate.sh).  Format and rules: .claude/host-env.sh.  No file = the
+# omegalisk defaults below, byte for byte.  --verify prints what is in effect.
 #
 # ---------------------------------------------------------------------------
 # WHY
@@ -71,6 +77,10 @@ ROOM_MEMORY_HIGH=3500M    # above this a room is throttled and reclaimed to swap
 ROOM_MEMORY_MAX=5G        # hard cap: the kernel OOM-kills inside the room only
 ROOMS_MEMORY_HIGH=7G      # all rooms together: 2 rooms at their soft limit
 ROOMS_MEMORY_MAX=8G       # all rooms together, however many are running
+GATE_SLOTS=1              # run-gate.sh's default; reported by --verify
+# The two ROOMS_ caps (and GATE_SLOTS) are omegalisk's: a host with more RAM
+# overrides them in host.env.  huburght (47 GB, 6 rooms): 28G / 32G and 2
+# gates; 32G rooms + 2 x 3.5G gates leaves ~8G for the host's own agents.
 # 8G rooms + 3.5G gate leaves ~4G for rz, the other agents and page cache;
 # the 4G of swap absorbs the overlap.  Page cache counts against these
 # limits too, but the kernel reclaims it first.
@@ -80,6 +90,8 @@ ROOMS_MEMORY_MAX=8G       # all rooms together, however many are running
 ROOM_CPU_WEIGHT=20
 GATE_CPU_WEIGHT=100
 set -euo pipefail
+# shellcheck source=host-env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/host-env.sh"
 
 UNITS="${RZ_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 MODE=install
@@ -98,6 +110,25 @@ if [[ ! "$ROOM" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
     echo "error: bad room name: '$ROOM'" >&2
     exit 2
 fi
+
+# --remove needs no values: a bad host.env must not block a reap.
+CONFIG_FROM="no host config, defaults"
+if [[ "$MODE" != remove ]]; then
+    rz_host_env_load || exit 2
+    if [[ -e "$RZ_HOST_ENV_FILE" ]]; then
+        CONFIG_FROM="$RZ_HOST_ENV_FILE"
+    fi
+    ROOMS_MEMORY_HIGH="${HOST_ENV[RZ_ROOMS_MEMORY_HIGH]:-$ROOMS_MEMORY_HIGH}"
+    ROOMS_MEMORY_MAX="${HOST_ENV[RZ_ROOMS_MEMORY_MAX]:-$ROOMS_MEMORY_MAX}"
+    GATE_SLOTS="${HOST_ENV[RZ_GATE_SLOTS]:-$GATE_SLOTS}"
+    if (($(rz_size_bytes "$ROOMS_MEMORY_HIGH") > $(rz_size_bytes "$ROOMS_MEMORY_MAX"))); then
+        echo "error: $RZ_HOST_ENV_FILE: rooms MemoryHigh=$ROOMS_MEMORY_HIGH is above" \
+            "MemoryMax=$ROOMS_MEMORY_MAX" >&2
+        exit 2
+    fi
+fi
+IN_EFFECT="ritz-rooms.slice: MemoryHigh=$ROOMS_MEMORY_HIGH MemoryMax=$ROOMS_MEMORY_MAX;\
+ gate slots=$GATE_SLOTS; from $CONFIG_FROM"
 
 DROPIN_DIR="$UNITS/adele-agent@$ROOM.service.d"
 DROPIN="$DROPIN_DIR/50-ritz-host-budget.conf"
@@ -145,7 +176,7 @@ verify)
         echo "run: $0 $ROOM" >&2
         exit 1
     fi
-    echo "host budget OK for $ROOM"
+    echo "host budget OK for $ROOM ($IN_EFFECT)"
     ;;
 remove)
     if [[ -e "$DROPIN" ]]; then
@@ -166,7 +197,7 @@ install)
         fi
     done
     [[ $changed -eq 1 ]] && systemctl --user daemon-reload
-    echo "host budget OK for $ROOM (ritz-rooms.slice: CPUWeight=$ROOM_CPU_WEIGHT," \
-        "MemoryHigh=$ROOM_MEMORY_HIGH MemoryMax=$ROOM_MEMORY_MAX per room)"
+    echo "host budget OK for $ROOM (CPUWeight=$ROOM_CPU_WEIGHT," \
+        "MemoryHigh=$ROOM_MEMORY_HIGH MemoryMax=$ROOM_MEMORY_MAX per room; $IN_EFFECT)"
     ;;
 esac

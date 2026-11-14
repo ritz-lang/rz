@@ -12,6 +12,10 @@ CPUWeight=100 in its own slice. These tests hold the two scripts to that:
   * the memory figures it installs fit 2 rooms + 1 gate in the VM with headroom
   * .claude/skills/rz-iterate/run-gate.sh starts the gate in ritz-gate.slice
     at CPUWeight=100, not in app.slice next to the rooms' parent
+  * per host (AGAST #2998): ~/.config/rz/host.env (.claude/host-env.sh) sets
+    the rooms slice's MemoryHigh/MemoryMax and run-gate.sh's slot count; with
+    no file both scripts behave byte for byte as before.  The slot tests run
+    real gates (a systemd-run fake that executes the unit) against temp dirs
 
 Nothing here touches the real systemd: `systemctl` and `systemd-run` are fakes
 on PATH that record their arguments, and units are written to a temp dir.
@@ -66,6 +70,10 @@ def _env(tmp_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["PATH"] = f"{_fake_bin(tmp_path)}:{env['PATH']}"
     env["RZ_SYSTEMD_USER_DIR"] = str(tmp_path / "units")
+    # Never read the real ~/.config/rz/host.env (huburght has one, AGAST
+    # #2998): every test starts as a host with no config file.
+    env["RZ_HOST_ENV"] = str(tmp_path / "host.env")
+    env.pop("RZ_GATE_SLOTS", None)
     return env
 
 
@@ -242,6 +250,148 @@ def test_budget_fits_two_rooms_and_a_gate(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# per-host config: ~/.config/rz/host.env (AGAST #2998)
+# --------------------------------------------------------------------------
+
+# What host-budget.sh wrote before #2998, byte for byte. omegalisk, toffee,
+# starbux and chungus have no host.env and must keep getting exactly this.
+GOLDEN_ROOMS_SLICE = """\
+# Installed by .claude/host-budget.sh (AGAST #1811). Do not edit by hand.
+[Unit]
+Description=ritz task rooms: deprioritised, memory-capped
+
+[Slice]
+CPUWeight=20
+MemoryHigh=7G
+MemoryMax=8G
+"""
+GOLDEN_GATE_SLICE = """\
+# Installed by .claude/host-budget.sh (AGAST #1811). Do not edit by hand.
+[Unit]
+Description=ritz verification gate (run-gate.sh): full CPU weight, no memory cap
+
+[Slice]
+CPUWeight=100
+"""
+GOLDEN_DROPIN = f"""\
+# Installed by .claude/host-budget.sh (AGAST #1811). Do not edit by hand.
+# Removed on reap with: .claude/host-budget.sh --remove {ROOM}
+[Service]
+Slice=ritz-rooms.slice
+MemoryHigh=3500M
+MemoryMax=5G
+OOMPolicy=continue
+"""
+
+# huburght: 6 rooms on 47 GiB (rz-iterate SKILL.md "Hosts").
+HUBURGHT_ENV = """\
+# rz per-host budget (AGAST #2998)
+RZ_ROOMS_MEMORY_HIGH=28G
+RZ_ROOMS_MEMORY_MAX=32G
+
+RZ_GATE_SLOTS=2
+"""
+
+
+def _host_env(tmp_path: Path, text: str) -> None:
+    (tmp_path / "host.env").write_text(text)
+
+
+@pytest.mark.unit
+def test_no_config_writes_todays_files_byte_for_byte(tmp_path):
+    env = _env(tmp_path)
+    assert not Path(env["RZ_HOST_ENV"]).exists()
+    r = _budget(tmp_path, env, ROOM)
+    assert r.returncode == 0, r.stderr
+    rooms, gate, dropin = _paths(tmp_path)
+    assert rooms.read_bytes() == GOLDEN_ROOMS_SLICE.encode()
+    assert gate.read_bytes() == GOLDEN_GATE_SLICE.encode()
+    assert dropin.read_bytes() == GOLDEN_DROPIN.encode()
+
+
+@pytest.mark.unit
+def test_config_sets_the_rooms_slice_memory(tmp_path):
+    env = _env(tmp_path)
+    _host_env(tmp_path, HUBURGHT_ENV)
+    r = _budget(tmp_path, env, ROOM)
+    assert r.returncode == 0, r.stderr
+    rooms, gate, dropin = _paths(tmp_path)
+    assert rooms.read_text() == GOLDEN_ROOMS_SLICE.replace(
+        "MemoryHigh=7G\nMemoryMax=8G", "MemoryHigh=28G\nMemoryMax=32G"
+    )
+    # Per-room caps and the gate slice are not per-host.
+    assert gate.read_text() == GOLDEN_GATE_SLICE
+    assert dropin.read_text() == GOLDEN_DROPIN
+
+
+@pytest.mark.unit
+def test_config_with_one_key_keeps_the_other_default(tmp_path):
+    env = _env(tmp_path)
+    _host_env(tmp_path, "RZ_ROOMS_MEMORY_MAX=12G\n")
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    rp = _props(_paths(tmp_path)[0])
+    assert (rp["MemoryHigh"], rp["MemoryMax"]) == ("7G", "12G")
+
+
+@pytest.mark.unit
+def test_verify_reports_the_values_in_effect(tmp_path):
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    r = _budget(tmp_path, env, "--verify", ROOM)
+    assert r.returncode == 0, r.stderr
+    assert "MemoryHigh=7G MemoryMax=8G" in r.stdout
+    assert "gate slots=1" in r.stdout
+    assert "no host config" in r.stdout
+
+    _host_env(tmp_path, HUBURGHT_ENV)
+    # The installed slice is now stale against the host's config.
+    r = _budget(tmp_path, env, "--verify", ROOM)
+    assert r.returncode != 0
+    assert "ritz-rooms.slice" in r.stderr
+
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    r = _budget(tmp_path, env, "--verify", ROOM)
+    assert r.returncode == 0, r.stderr
+    assert "MemoryHigh=28G MemoryMax=32G" in r.stdout
+    assert "gate slots=2" in r.stdout
+    assert env["RZ_HOST_ENV"] in r.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "RZ_ROOMS_MEMORY_MAX=lots\n",  # not a size
+        "RZ_ROOMS_MEMORY_MAX=$(touch pwned)\n",  # parsed, never sourced
+        "RZ_ROOM_MEMORY_MAX=32G\n",  # typo'd key: an error, not ignored
+        "RZ_ROOMS_MEMORY_HIGH=40G\nRZ_ROOMS_MEMORY_MAX=32G\n",  # high > max
+        "RZ_ROOMS_MEMORY_HIGH=9G\n",  # high > default max 8G
+        "RZ_GATE_SLOTS=0\n",
+    ],
+)
+def test_bad_config_is_refused_and_writes_nothing(tmp_path, text):
+    env = _env(tmp_path)
+    _host_env(tmp_path, text)
+    r = _budget(tmp_path, env, ROOM)
+    assert r.returncode != 0
+    assert "host.env" in r.stderr
+    assert not (tmp_path / "units").exists()
+    assert not (tmp_path / "pwned").exists()
+    assert _budget(tmp_path, env, "--verify", ROOM).returncode != 0
+
+
+@pytest.mark.unit
+def test_remove_works_despite_a_bad_config(tmp_path):
+    """Reaping a room must not depend on the host's config parsing."""
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    _host_env(tmp_path, "RZ_GATE_SLOTS=many\n")
+    r = _budget(tmp_path, env, "--remove", ROOM)
+    assert r.returncode == 0, r.stderr
+    assert not _paths(tmp_path)[2].exists()
+
+
+# --------------------------------------------------------------------------
 # run-gate.sh
 # --------------------------------------------------------------------------
 
@@ -269,3 +419,134 @@ def test_run_gate_starts_in_the_gate_slice(tmp_path):
     argv = runs[0].split()
     assert "--slice=ritz-gate.slice" in argv
     assert "--property=CPUWeight=100" in argv
+
+
+def _git_worktree(tmp_path: Path) -> Path:
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    git = ["git", "-C", str(wt), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+    return wt
+
+
+# A systemd-run that really starts the unit's command (detached, in its own
+# session), so the slot locks inside run-gate.sh are exercised for real.
+_RUNNING_SYSTEMD_RUN = """\
+#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as f:
+    f.write("systemd-run " + " ".join(args) + "\\n")
+env, cwd, i = dict(os.environ), None, 0
+while args[i].startswith("--"):
+    a = args[i]
+    if a.startswith("--setenv="):
+        k, v = a[len("--setenv="):].split("=", 1)
+        env[k] = v
+    elif a.startswith("--working-directory="):
+        cwd = a.split("=", 1)[1]
+    i += 1
+p = subprocess.Popen(args[i:], cwd=cwd, env=env, start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+with open(os.environ["FAKE_PIDS"], "a") as f:
+    f.write(f"{p.pid}\\n")
+"""
+
+
+def _start_gates(tmp_path: Path, env: dict[str, str], n: int) -> list[Path]:
+    """Start n gates whose command blocks until tmp_path/release exists."""
+    wt = _git_worktree(tmp_path)
+    fake = tmp_path / "bin" / "systemd-run"
+    fake.write_text(_RUNNING_SYSTEMD_RUN)
+    env["FAKE_LOG"] = str(tmp_path / "calls.log")
+    env["FAKE_PIDS"] = str(tmp_path / "pids")
+    env["RZ_GATE_DIR"] = str(tmp_path / "gates")
+    release = tmp_path / "release"
+    env["RZ_GATE_CMD"] = f'while [ ! -e "{release}" ]; do sleep 0.1; done'
+    logs = []
+    for k in range(n):
+        r = subprocess.run(
+            ["bash", str(RUN_GATE), str(wt), f"t2998-{k}"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        logs.append(Path(r.stdout.strip()))
+    return logs
+
+
+def _running(logs: list[Path], want: int) -> int:
+    """Gates holding a slot, once the count has settled (or reached want+1)."""
+    import time
+
+    # Generous for a loaded gate runner; a passing run returns in ~2 s.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        n = sum("SLOT=" in p.read_text() for p in logs)
+        if n > want:
+            return n
+        if n == want:
+            time.sleep(1.5)  # long enough for an extra gate to slip in
+            return sum("SLOT=" in p.read_text() for p in logs)
+        time.sleep(0.1)
+    return sum("SLOT=" in p.read_text() for p in logs)
+
+
+def _kill_gates(tmp_path: Path) -> None:
+    import signal
+
+    (tmp_path / "release").touch()
+    pids = tmp_path / "pids"
+    for pid in pids.read_text().split() if pids.exists() else []:
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "host_env, env_slots, slots",
+    [
+        (None, None, 1),  # no config: one gate per host, as before
+        (HUBURGHT_ENV, None, 2),  # host.env's RZ_GATE_SLOTS
+        (HUBURGHT_ENV, "1", 1),  # an explicit RZ_GATE_SLOTS still wins
+    ],
+    ids=["default", "host-env", "env-wins"],
+)
+def test_run_gate_runs_the_configured_number_of_gates(
+    tmp_path, host_env, env_slots, slots
+):
+    env = _env(tmp_path)
+    if host_env is not None:
+        _host_env(tmp_path, host_env)
+    if env_slots is not None:
+        env["RZ_GATE_SLOTS"] = env_slots
+    try:
+        logs = _start_gates(tmp_path, env, slots + 1)
+        assert _running(logs, slots) == slots
+        waiting = [p for p in logs if "SLOT=" not in p.read_text()]
+        assert len(waiting) == 1 and "WAITING" in waiting[0].read_text()
+    finally:
+        _kill_gates(tmp_path)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text", ["RZ_GATE_SLOTS=0\n", "RZ_GATE_SLOTS=two\n"])
+def test_run_gate_refuses_a_bad_config(tmp_path, text):
+    wt = _git_worktree(tmp_path)
+    env = _env(tmp_path)
+    env["RZ_GATE_DIR"] = str(tmp_path / "gates")
+    _host_env(tmp_path, text)
+    r = subprocess.run(
+        ["bash", str(RUN_GATE), str(wt), "t2998"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode != 0
+    assert "host.env" in r.stderr
+    assert not any(c.startswith("systemd-run ") for c in _calls(tmp_path))

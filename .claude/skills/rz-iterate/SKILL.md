@@ -91,6 +91,20 @@ stays here; remote hosts only run rooms.
 | chungus | `adele-chungus` | 1 | yes (2026-11-12) | 8 cores, 14 GB, ~5-8 GB free (another user's desktop session) and 47 GB disk free (95% used). Smoke passes. `clang`/`lld`/`llvm` 21.1.8; `lld` is a user-local copy (`~/.local/opt/lld-21`). Approved by Aaron 2026-11-12 |
 | huburght | `adele-huburght` | 6 (2 until #2998) | yes (2026-11-11) | 12 cores, 47 GB (~42 GB free), WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. 2 slots from 2026-11-12 (Aaron: "tons of memory free"; #2582 and #2780 merged cleanly). **6 slots from 2026-11-13** (Aaron; omegalisk stays at 2), but only once #2998 has landed and huburght's per-host config gives its rooms ~32 GB together and 2 gate slots: until then `host-budget.sh` caps all rooms on a host at 8 GB and `run-gate.sh` runs one gate per host, so rooms 3-6 would starve. Coarse mtime clock (#2689) |
 
+- **Per-host budget: `~/.config/rz/host.env`** (AGAST #2998), read by
+  `.claude/host-budget.sh` and `run-gate.sh`; format and validation in
+  `.claude/host-env.sh`. Keys, all optional: `RZ_ROOMS_MEMORY_HIGH` and
+  `RZ_ROOMS_MEMORY_MAX` (all of a host's rooms together, the
+  `ritz-rooms.slice` caps) and `RZ_GATE_SLOTS` (gates at once on that host).
+  No file means omegalisk's numbers, 7G / 8G / 1, unchanged: omegalisk,
+  toffee, starbux and chungus have none. **huburght's file:**
+  `RZ_ROOMS_MEMORY_HIGH=28G`, `RZ_ROOMS_MEMORY_MAX=32G`, `RZ_GATE_SLOTS=2`
+  (32G rooms + 2 gates at ~3.5 GiB leaves ~8 GiB of 47 for the host; never
+  more than 2 gates on 12 cores). After writing it, the host runs
+  `.claude/host-budget.sh <room>` for any running room (or spawns one) so the
+  slice is rewritten, and `.claude/host-budget.sh --verify <room>` prints the
+  values in effect and where they came from. An unknown key or bad value is
+  an error in both scripts, never a silent default.
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
   changes its slots. Edit this table and commit it on `main` when they do.
   A host's first room is a small, low-risk ticket.
