@@ -844,6 +844,11 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     let saved_name: *u8 = s.ctx_enum_name
     let saved_len: i32 = s.ctx_enum_name_len
     let saved_arg: i32 = s.ctx_enum_arg
+    var saved_slot: SlotCtx
+    if p != null
+        enter_slot_ctx(s, @saved_slot, p.param_type, p.param_type_name, p.param_type_name_len)
+    else
+        enter_slot_ctx(s, @saved_slot, 0, null, 0)
     s.ctx_enum_name = null
     s.ctx_enum_name_len = 0
     s.ctx_enum_arg = 1
@@ -862,6 +867,7 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     s.ctx_enum_name = saved_name
     s.ctx_enum_name_len = saved_len
     s.ctx_enum_arg = saved_arg
+    leave_slot_ctx(s, @saved_slot)
     if param_uses_byval(s, p) == 1
         return spill_byval_arg(s, arg, reg, p)
     return reg
@@ -885,6 +891,8 @@ fn emit_expr_into_slot(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len:
     s.ctx_enum_name = null
     s.ctx_enum_name_len = 0
     s.ctx_enum_arg = 1
+    var saved_slot: SlotCtx
+    enter_slot_ctx(s, @saved_slot, ty, name, name_len)
     if ty == TYPE_STRUCT and name != null and name_len > 0
         if is_tagged_enum_type(name, name_len) == 1 or is_enum_instance(name, name_len) == 1
             s.ctx_enum_name = name
@@ -893,6 +901,7 @@ fn emit_expr_into_slot(s: *EmitterState, e: *Expr, ty: i32, name: *u8, name_len:
     s.ctx_enum_name = saved_name
     s.ctx_enum_name_len = saved_len
     s.ctx_enum_arg = saved_arg
+    leave_slot_ctx(s, @saved_slot)
     if ty == TYPE_STRUCT
         reg = coerce_array_to_span(s, e, reg, name, name_len)   # AGAST #2502
     return reg
@@ -1620,6 +1629,39 @@ fn method_recv_is_type(s: *EmitterState, recv: *Expr) -> i32
     if find_local_struct_name(s, recv.ident_ptr, recv.ident_len) != null
         return 0
     return (find_global(s, recv.ident_ptr, recv.ident_len) == null) as i32
+
+# AGAST #2296: `Span.empty()`, whose receiver is the type `Span` and whose T
+# is never spelled: the slot it lands in names the `Span$T` (slot_struct_name),
+# and the value is `{ null, 0 }` without ritzlib.span, as in ritz0's
+# _try_emit_associated_builtin_call.  With no `Span$T` slot it is a located
+# refusal, ritz0's text.  -1 when `e` isn't a call on the type `Span`.
+fn try_emit_span_assoc(s: *EmitterState, e: *Expr) -> i32
+    let recv: *Expr = e.left
+    if recv == null or recv.kind != EXPR_IDENT or name_eq(recv.ident_ptr, recv.ident_len, c"Span", 4) == 0
+        return 0 - 1
+    if method_recv_is_type(s, recv) == 0
+        return 0 - 1
+    var tlen: i32 = 0
+    let tname: *u8 = slot_struct_name(s, @tlen)
+    if tname == null or tlen <= 5 or memcmp(tname, c"Span$", 5) != 0
+        return emit_qualified_variant_error(s, e, c"needs its type argument from the slot it lands in: a `-> Span<T>` return, a `let s: Span<T>` or a `Span<T>` parameter")
+    if name_eq(e.ident_ptr, e.ident_len, c"empty", 5) == 0 or e.args != null
+        return 0 - 1
+    let half: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, half)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, tname, tlen)
+    emit_str(s, c" undef, ptr null, 0  ; Span.empty()\n")
+    let out: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, out)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, tname, tlen)
+    emit_str(s, c" ")
+    emit_reg(s, half)
+    emit_str(s, c", i64 0, 1\n")
+    return out
 
 fn method_recv_type(s: *EmitterState, recv: *Expr, out_len: *i32) -> *u8
     *out_len = 0
@@ -5394,6 +5436,11 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     let from_reg: i32 = try_emit_enum_from(s, e)
     if from_reg != 0 - 1
         return from_reg
+
+    # `Span.empty()`: T from the slot, not a receiver (AGAST #2296).
+    let span_assoc: i32 = try_emit_span_assoc(s, e)
+    if span_assoc != 0 - 1
+        return span_assoc
 
     # Static-method dispatch: `Vec2.new(...)`.  When the LHS ident matches
     # a STRUCT or IMPL name (and not a local/global), we don't pass a

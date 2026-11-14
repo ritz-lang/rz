@@ -159,8 +159,7 @@ fn look(p: @P) -> i32
 
 """
 
-# Only the span cases carry this: ritz1 can't type `Span.empty()`, and in the
-# prelude that would fail every program.
+# Only the span cases carry this, so a gap in it can't fail every program.
 SPAN = """\
 fn ms() -> Span<u8>
     MADE = MADE + 1
@@ -171,7 +170,8 @@ fn ms() -> Span<u8>
 # ritz1 evaluates these receivers once too, where it can compile them. What's
 # missing is something else, so each row cites its own ticket.
 BOTH_RITZ1 = ("ritz1", "ritz1_selfhosted")
-NO_SPAN_EMPTY = {c: 2296 for c in BOTH_RITZ1}
+NO_SPAN_INTRINSIC = {c: 3125 for c in BOTH_RITZ1}
+NO_CALL_RANGE_START = {c: 3126 for c in BOTH_RITZ1}
 NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
 NO_DYN_RETURN = {c: 2298 for c in BOTH_RITZ1}
 NO_CALL_ROOTED_PLACE = {c: 2299 for c in BOTH_RITZ1}
@@ -204,10 +204,10 @@ CASES = {
     "bitops": ("mi().clz()", 1, 0, {}),
     "float": ("mf().abs()", 1, 0, {}),
     "user_abs_past_float": ("ma().abs()", 1, 0, {}),
-    "span_len": ("ms().len()", 1, 0, NO_SPAN_EMPTY),
-    "span_ptr": ("ms().ptr()", 1, 0, NO_SPAN_EMPTY),
-    "span_is_empty": ("ms().is_empty()", 1, 0, NO_SPAN_EMPTY),
-    "span_slice": ("ms().slice(0, 0)", 1, 0, NO_SPAN_EMPTY),
+    "span_len": ("ms().len()", 1, 0, {}),
+    "span_ptr": ("ms().ptr()", 1, 0, NO_SPAN_INTRINSIC),
+    "span_is_empty": ("ms().is_empty()", 1, 0, NO_SPAN_INTRINSIC),
+    "span_slice": ("ms().slice(0, 0)", 1, 0, NO_SPAN_INTRINSIC),
     # A place is emitted for its type and again for its address.
     "index_lent": (ARRAY + "arr[idx()].get()", 1, 0, {}),
     "index_mut": (ARRAY + "arr[idx()].bump()", 1, 0, {}),
@@ -220,8 +220,8 @@ CASES = {
     # AGAST #2526: `(*f()).p` names the struct `*f()` loads.
     "field_through_deref": ("var w = W { p: P { x: 1 } }\n    (*pw(@w)).p.get()", 1, 0, {}),
     # `a[lo..hi]` is a slice, not a place, and its range is not a value.
-    "span_range_index": ("var s = ms()\n    s[idx()..0].len()", 2, 0, NO_SPAN_EMPTY),
-    "span_range_end": ("var s = ms()\n    s[0..idx()].len()", 2, 0, NO_SPAN_EMPTY),
+    "span_range_index": ("var s = ms()\n    s[idx()..0].len()", 2, 0, NO_CALL_RANGE_START),
+    "span_range_end": ("var s = ms()\n    s[0..idx()].len()", 2, 0, {}),
     # A field of an rvalue isn't a place, but dispatch treats it as one.
     "field_of_rvalue": ("mw().p.get()", 1, 0, {"ritz0": 2294}),
     # Inside an argument.

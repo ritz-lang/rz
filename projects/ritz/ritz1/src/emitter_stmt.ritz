@@ -1228,12 +1228,17 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             var ptr_phi_len: i32 = 0
             let ptr_phi_name: *u8 = ptr_phi_let_struct(s, stmt.var_init, @ptr_phi_len)   # AGAST #2960
             let arms: i32 = infer_ctor_arms(s, stmt, @arms_enum, @arms_enum_len)
+            # AGAST #2296: an `i64` or untyped let is a slot with no struct
+            # type, so no `Span.empty()` arm takes the fn's T.
+            var pre_slot: SlotCtx
+            enter_slot_ctx(s, @pre_slot, 0, null, 0)
             if arms == 1
                 pre_init_reg = emit_ctor_scrutinee(s, stmt.var_init, arms_enum, arms_enum_len)
             else if arms == 0
                 pre_init_reg = emit_expr(s, stmt.var_init)
             else
                 pre_init_reg = emit_zero_i64(s)   # refused: its arms are not emitted
+            leave_slot_ctx(s, @pre_slot)
             pre_emitted = 1
             if s.last_match_agg_name != null and s.last_match_agg_name_len > 0
                 var_type = TYPE_STRUCT
@@ -2053,10 +2058,18 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                     s.ctx_simd_name_len = stmt.var_type_name_len
         var init_reg: i32 = pre_init_reg
         if pre_emitted == 0
+            # AGAST #2296: the annotation, if any, is the slot `Span.empty()`
+            # takes its T from; an untyped let is a slot with no type.
+            var saved_slot: SlotCtx
+            if stmt.var_type_name_len > 0 and stmt.var_type_name != null
+                enter_slot_ctx(s, @saved_slot, var_type, stmt.var_type_name, stmt.var_type_name_len)
+            else
+                enter_slot_ctx(s, @saved_slot, 0, null, 0)
             set_match_float_hint(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
             init_reg = emit_expr_by_value(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
             if var_type == TYPE_STRUCT
                 init_reg = coerce_array_to_span(s, stmt.var_init, init_reg, stmt.var_type_name, stmt.var_type_name_len)   # AGAST #2502
+            leave_slot_ctx(s, @saved_slot)
         s.ctx_enum_name = _saved_ctx
         s.ctx_enum_name_len = _saved_ctx_len
         s.ctx_simd_name = _saved_simd
@@ -4938,9 +4951,13 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let ret_ctx_len: i32 = s.ctx_enum_name_len
         s.ctx_enum_name = null
         s.ctx_enum_name_len = 0
+        # So does the slot's: a `return` lands in the fn's return type.
+        let ret_slot_set: i32 = s.ctx_slot_set
+        s.ctx_slot_set = 0
         emit_return(s, stmt, ret_type)
         s.ctx_enum_name = ret_ctx_name
         s.ctx_enum_name_len = ret_ctx_len
+        s.ctx_slot_set = ret_slot_set
     else if stmt.kind == STMT_ASSERT
         # AGAST #1869: placement check, operand report, helper call site.
         emit_assert_stmt(s, stmt)

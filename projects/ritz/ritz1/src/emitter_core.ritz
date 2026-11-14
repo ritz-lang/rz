@@ -233,6 +233,15 @@ struct EmitterState
     # the only valid enum context is the callee's parameter type, already in
     # ctx_enum_name; resolve_enum_ctx must NOT fall back to ret_type_name.
     ctx_enum_arg: i32
+    # AGAST #2296: the struct type of the slot the value being emitted lands
+    # in, whatever kind of struct: a typed let's, a parameter's or a store
+    # target's (null when it isn't a struct), so `Span.empty()` can take its
+    # T from it.  ctx_slot_set is 1 inside such a slot; 0 (a `return`, or no
+    # slot yet) falls back to the fn's return type, as ritz0's
+    # expected_ritz_type does.
+    ctx_slot_name: *u8
+    ctx_slot_name_len: i32
+    ctx_slot_set: i32
     # AGAST #2330: the expression being emitted into a struct slot, a copy, or null.
     # emit_expr_index lets a struct element of a pointer to an array be that, and
     # nothing else: a struct value is its address, so an integer context took the
@@ -584,6 +593,41 @@ fn emit_ir_error_kind(s: *EmitterState, msg: *u8, kind: i32)
     eprint_int(kind as i64)
     eprints_cstr(c"\n")
     s.error_count = s.error_count + 1
+
+# AGAST #2296: EmitterState.ctx_slot_*, saved around a slot.
+struct SlotCtx
+    name: *u8
+    name_len: i32
+    set: i32
+
+# Enter the slot of declared type (ty, name) after saving the enclosing one in
+# `saved`.  A non-struct slot is still a slot: it hides the enclosing one and
+# the fn's return type, so neither leaks into an argument.
+fn enter_slot_ctx(s: *EmitterState, saved: *SlotCtx, ty: i32, name: *u8, name_len: i32)
+    saved.name = s.ctx_slot_name
+    saved.name_len = s.ctx_slot_name_len
+    saved.set = s.ctx_slot_set
+    s.ctx_slot_set = 1
+    s.ctx_slot_name = null
+    s.ctx_slot_name_len = 0
+    if ty == TYPE_STRUCT and name != null and name_len > 0
+        s.ctx_slot_name = name
+        s.ctx_slot_name_len = name_len
+
+fn leave_slot_ctx(s: *EmitterState, saved: *SlotCtx)
+    s.ctx_slot_name = saved.name
+    s.ctx_slot_name_len = saved.name_len
+    s.ctx_slot_set = saved.set
+
+# The struct type the value being emitted lands in: the innermost slot's, or
+# outside any slot (a `return`, a tail) the fn's return type.  null when
+# neither is a struct.
+fn slot_struct_name(s: *EmitterState, out_len: *i32) -> *u8
+    if s.ctx_slot_set == 1
+        *out_len = s.ctx_slot_name_len
+        return s.ctx_slot_name
+    *out_len = s.ret_type_name_len
+    return s.ret_type_name
 
 # AGAST #1509: a multi-dimensional array use ritz1 does not lower, as
 # `error: <file>:<line>:<col>: <msg>`.  Counts like emit_ir_error, so the
@@ -3365,7 +3409,8 @@ pub fn qualified_variant_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_le
 
 # AGAST #1466: a qualified variant ritz1 cannot build, as
 # `error: <file>:<line>:<col>: 'E.V' <msg>`.  Counted like emit_ir_error, so
-# no output is written; returns a placeholder register.
+# no output is written; returns a placeholder register.  Also `'Span.empty'`
+# with no slot to type it (AGAST #2296): any `Type.method` call fits.
 pub fn emit_qualified_variant_error(s: *EmitterState, e: *Expr, msg: *u8) -> i32
     emit_str(s, c"  ; ERROR: qualified variant ")
     emit_str(s, msg)

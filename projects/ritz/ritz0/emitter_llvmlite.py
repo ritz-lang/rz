@@ -52,6 +52,13 @@ class EmitError(Exception):
             super().__init__(message)
 
 
+def span_empty_needs_slot(method: str) -> str:
+    """`Span.<method>()` in no slot that spells its T (AGAST #2296); ritz1
+    prints the same text after `'Span.<method>' `."""
+    return (f"'Span.{method}' needs its type argument from the slot it lands in: "
+            f"a `-> Span<T>` return, a `let s: Span<T>` or a `Span<T>` parameter")
+
+
 def qualified_access_removed(expr: rast.QualifiedIdent) -> str:
     """The diagnostic for an `a::b` nothing lowered (AGAST #2591)."""
     q, n = expr.qualifier, expr.name
@@ -3330,7 +3337,14 @@ class LLVMEmitter:
         expected_enum_name = self._resolve_enum_type_name(
             None, self._fn_ret_type(self.current_fn))
         self._literal_into_slot(self.current_fn_def.ret_type, value)
-        return self._emit_expr_with_expected_enum(value, expected_enum_name)
+        # So is the expected type: `return Span.empty()` in a let's arm takes
+        # the fn's T, not the let's (AGAST #2296).
+        saved = self.expected_ritz_type
+        self.expected_ritz_type = self.current_fn_def.ret_type
+        try:
+            return self._emit_expr_with_expected_enum(value, expected_enum_name)
+        finally:
+            self.expected_ritz_type = saved
 
     def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str) -> ir.Value:
         """Emit code to construct an enum variant for a specific enum type.
@@ -11704,9 +11718,12 @@ class LLVMEmitter:
                                 param_def.type)
                     if param_enum is not None:
                         val = self._emit_enum_variant_with_type(arg, param_enum)
-                    elif self._is_range_index(arg):
+                    elif (self._is_range_index(arg)
+                            or self._builtin_type_receiver(arg) is not None):
                         # AGAST #2877: a Vec slice into a `Span<T>` param is
                         # a view (_emit_vec_span_slice), as into a Span let.
+                        # AGAST #2296: `Span.empty()` takes its T from the
+                        # param, not from whatever slot encloses the call.
                         val = self._emit_slice_into(arg, param_def.type)
                     else:
                         val = self._emit_into_array_slot(arg, param_def.type)
@@ -12735,15 +12752,10 @@ class LLVMEmitter:
 
     BUILTIN_GENERIC_TYPES = ('Vec', 'Span', 'Option', 'Result', 'Box')
 
-    def _try_emit_associated_builtin_call(self, expr: rast.MethodCall) -> Optional[ir.Value]:
-        """Emit `Span.empty()` / `Vec.new()` style associated calls.
-
-        `Type.method(args)` parses as a method call whose receiver is the bare
-        type name. For the built-in generics the concrete type argument is not
-        spelled, so take it from the expected type of the surrounding context
-        and dispatch through the usual UFCS mangling (`span_empty$u8`).
-        """
-        if not isinstance(expr.expr, rast.Ident):
+    def _builtin_type_receiver(self, expr: rast.Expr) -> Optional[str]:
+        """`Span` in `Span.empty()`: the built-in generic type a method call's
+        receiver names, or None when the receiver is a value."""
+        if not (isinstance(expr, rast.MethodCall) and isinstance(expr.expr, rast.Ident)):
             return None
         base_name = expr.expr.name
         if base_name not in self.BUILTIN_GENERIC_TYPES:
@@ -12752,19 +12764,35 @@ class LLVMEmitter:
         if (base_name in self.locals or base_name in self.params
                 or base_name in self.ritz_types):
             return None
+        return base_name
+
+    def _try_emit_associated_builtin_call(self, expr: rast.MethodCall) -> Optional[ir.Value]:
+        """Emit `Span.empty()` / `Vec.new()` style associated calls.
+
+        `Type.method(args)` parses as a method call whose receiver is the bare
+        type name. For the built-in generics the concrete type argument is not
+        spelled, so take it from the expected type of the surrounding context
+        and dispatch through the usual UFCS mangling (`span_empty$u8`).
+        """
+        base_name = self._builtin_type_receiver(expr)
+        if base_name is None:
+            return None
 
         expected = self.expected_ritz_type
         while isinstance(expected, (rast.PtrType, rast.RefType)):
             expected = expected.inner
-        if not isinstance(expected, rast.NamedType):
-            return None
-        if expected.args:
-            if expected.name != base_name:
-                return None
-            type_name = self._get_specialized_type_name(expected)
-        elif expected.name.startswith(base_name + '$'):
-            type_name = expected.name
-        else:
+        type_name = None
+        if isinstance(expected, rast.NamedType):
+            if expected.args:
+                if expected.name == base_name:
+                    type_name = self._get_specialized_type_name(expected)
+            elif expected.name.startswith(base_name + '$'):
+                type_name = expected.name
+        if type_name is None:
+            if base_name == 'Span':
+                # AGAST #2296: nothing else can type a bare `Span`; falling
+                # through emitted it as a value ("Unknown identifier: Span").
+                raise EmitError(span_empty_needs_slot(expr.method), expr.span)
             return None
 
         fn_name = self._find_method_fallback(type_name, expr.method)
