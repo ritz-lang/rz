@@ -55,11 +55,8 @@ pub fn main() -> i32
 
 # A field-less struct in every position a struct value travels.  The bodied
 # `After` follows the field-less structs, so a field-less form that ate the
-# next INDENT would break it.  7 + 2 + 0 + 30 + 5 = 44.
-#
-# `v.len` is not summed: gvec's first push of a zero-size element asks
-# realloc for 0 bytes, gets null and fails under both compilers (AGAST
-# #2965).  The push and get still lower a Vec<Unit> element.
+# next INDENT would break it.  7 + 2 + 0 + 30 + 5 + 1 = 45, the last being
+# `v.len` after one push of a zero-size element (AGAST #2965).
 SHAPES = """\
 import ritzlib.gvec
 
@@ -93,7 +90,7 @@ pub fn main() -> i32
     vec_push<Unit>(@&v, make())
     let u: Unit = relay(vec_get<Unit>(@v, 0))
     let a: After = After { x: 30 }
-    return E.k() + take(u, 1) + sizeof(Unit) as i32 + a.x + tagged(Tag<i32> {})
+    return E.k() + take(u, 1) + sizeof(Unit) as i32 + a.x + tagged(Tag<i32> {}) + v.len as i32
 """
 
 
@@ -106,7 +103,7 @@ def test_ticket_program_runs(ritz1_bin, tmp_path, compiler):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 def test_fieldless_struct_values_run(ritz1_bin, tmp_path, compiler):
-    assert _run_pkg(compiler, tmp_path, "fieldless_shapes", SHAPES) == 44
+    assert _run_pkg(compiler, tmp_path, "fieldless_shapes", SHAPES) == 45
 
 
 @pytest.mark.integration

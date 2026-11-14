@@ -411,6 +411,10 @@ struct Vec<T>
 | `vec_clear` | `fn<T>(v: @&Vec<T>)` | Clear (keeps capacity) |
 | `vec_drop` | `fn<T>(v: @&Vec<T>)` | Free the Vec |
 
+A zero-size element (a field-less struct) allocates nothing: `len` and `cap`
+count elements as usual, and `data` is a non-null dangling pointer that
+`vec_drop` never frees.
+
 **Utilities**:
 
 | Function | Signature | Description |
