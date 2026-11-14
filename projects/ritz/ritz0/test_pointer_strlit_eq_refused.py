@@ -9,6 +9,9 @@ Ruling (Aaron, 2026-11-14): refuse, don't lower the literal to `*u8`.  A `*u8`
 is not necessarily a string; strings are compared with string functions, so
 the refusal names streq from ritzlib.str.  The literal may be on either side.
 
+AGAST #3196 extends this to a C-string literal (`p == c"lit"`): it type-checks
+as `*u8 == *u8`, but compares addresses, not text.  Same refusal.
+
 What still compiles: a `*u8` slot taking a literal (`let p: *u8 = "lit"`, an
 argument), and a pointer compared with a pointer or null.
 """
@@ -44,6 +47,11 @@ REFUSED = {
              + _main('f(c"x")'),
     "field": _main('let s: S = S { p: c"x" }', 'if s.p == "x"', "    return 5", "2", pre=_S),
     "call_result": 'fn g() -> *u8\n    c"x"\n' + _main('if g() != "x"', "    return 5", "2"),
+    # AGAST #3196: a C-string literal type-checks as `*u8`, but comparing it
+    # with a pointer compares addresses, not text: the same refusal.
+    "local_eq_clit": _main('let p: *u8 = c"x"', 'if p == c"x"', "    return 5", "2"),
+    "clit_ne_param": 'fn f(p: *u8) -> i32\n    if c"x" != p\n        return 5\n    2\n'
+                     + _main('f(c"x")'),
 }
 
 # Still compiles, and runs to the code the program says.

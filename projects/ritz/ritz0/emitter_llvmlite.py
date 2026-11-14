@@ -16046,11 +16046,16 @@ class LLVMEmitter:
         to refuse rather than lower the literal to `*u8`: a `*u8` is not
         necessarily a string, and strings are compared with string functions.
         A `*u8` slot (`let p: *u8 = "lit"`, an argument) is untouched.
+
+        A C-string literal (`p == c"lit"`) is refused too (AGAST #3196): it
+        type-checks as `*u8 == *u8`, but compares the pointer with the
+        literal's address, not its text.
         """
         if expr.op not in ('==', '!='):
             return
         for lit, other in ((expr.left, right), (expr.right, left)):
-            if isinstance(lit, rast.StringLit) and isinstance(other.type, ir.PointerType):
+            if (isinstance(lit, (rast.StringLit, rast.CStringLit))
+                    and isinstance(other.type, ir.PointerType)):
                 raise EmitError(
                     f"'{expr.op}' is not supported between a pointer and a string"
                     f" literal — a *u8 is not necessarily a string; compare it with"
