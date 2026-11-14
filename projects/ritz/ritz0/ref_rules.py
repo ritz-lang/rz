@@ -32,6 +32,12 @@ MOVE_OUT_OF_REF = "cannot move out of a reference"
 # `fn drop(self)`: its own `self` would drop when it returned, and call it again.
 DROP_BY_VALUE = "`drop` can't take `self` by value: it would drop itself: write `self: @&T`"
 
+# `T.m(x)` where `m` takes `self`: a type isn't a receiver (AGAST #2292).
+# ritz1 prints the same words, with the method's name (emitter_expr_call.ritz).
+def static_call_of_self(method: str) -> str:
+    return f"Static method call Type.method() but method '{method}' expects 'self' parameter"
+
+
 # The receiver of a method whose `self` is a pointer to a pointer (`self: **C`),
 # when it isn't a place one level short of `self` to borrow, or `self`'s type
 # (LANGUAGE_SPEC §5.4, AGAST #2403): a call result, or a `C` for a `**C`.

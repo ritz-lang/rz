@@ -20,8 +20,9 @@ import pytest
 
 import fast_link
 
-from ref_rules import DROP_BY_VALUE
-from test_ref_into_value import COMPILERS, RITZ1_BUILD, RITZ_ROOT, RITZ_START, _compile, _run
+from ref_rules import DROP_BY_VALUE, static_call_of_self
+from test_ref_into_value import (COMPILERS, RITZ1_BUILD, RITZ_ROOT, RITZ_START, _assert_refused,
+                                 _compile, _run)
 
 pytestmark = pytest.mark.integration
 
@@ -330,6 +331,24 @@ def test_drop_is_refused_a_by_value_self(receiver, compiler, tmp_path):
     assert re.search(rf"main\.ritz:5:(\d+: )?(error: )?{re.escape(DROP_BY_VALUE)}|main\.ritz:5: {re.escape(DROP_BY_VALUE)}", out), out
 
 
+# `C.g(c)` of a by-value `self`: a type isn't a receiver, so the struct has no
+# slot to go to (AGAST #2292). ritz1 once passed a struct local's `%C` to the
+# `ptr` and segfaulted. `^` marks where the error lands.
+STATIC_CALLS = {
+    "local": "pub fn main() -> i32\n    var c = C { x: 1, y: 2 }\n    return ^C.g(c)\n",
+    "lent_param": "fn f(c:& C) -> i32\n    return ^C.g(c)\n\npub fn main() -> i32\n"
+                  "    var c = C { x: 1, y: 2 }\n    return f(@&c)\n",
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("receiver", ["self", "self: C"])
+@pytest.mark.parametrize("arg", sorted(STATIC_CALLS))
+def test_a_type_is_not_a_receiver(arg, receiver, compiler, tmp_path):
+    src = f"{TYPES}impl C\n    fn g({receiver}) -> i32\n        self.x\n\n{STATIC_CALLS[arg]}"
+    _assert_refused(compiler, tmp_path, f"static_{arg}", src, static_call_of_self("g"))
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("receiver", ["self:&", "self:& T", "self: @&T", "self: *T"])
 def test_drop_takes_any_lent_self(receiver, compiler, tmp_path):
@@ -347,15 +366,6 @@ GENERIC = ("struct W<T>\n    v: T\n\nimpl<T> W<T>\n    fn rd(self, q: @&W<T>) ->
 def test_a_generic_impl_copies_too(compiler, tmp_path):
     """A generic impl's bare `self` is a copy, as a non-generic one is (#2318)."""
     assert _run(compiler, tmp_path, "generic", GENERIC) == 1
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_type_is_not_a_receiver(compiler, tmp_path):
-    src = f"{TYPES}{METHOD}pub fn main() -> i32\n    {C1}C.g(c)\n"
-    comp, ll, _ = _compile(compiler, tmp_path, "through_a_type", src)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0 and not ll.exists(), f"{compiler} accepted it"
-    assert re.search(r"[Ss]tatic method call Type\.method\(\) but .*expects .*self.* parameter", out), out
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

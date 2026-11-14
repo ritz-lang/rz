@@ -3403,6 +3403,17 @@ pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     return f(@&c)
 """,
+    # Nor a struct local: ritz1 passed its `%C` to the `ptr` and segfaulted
+    # (AGAST #2292). test_by_value_self.py holds the message and place.
+    "static_call_of_self_method_local": TYPES + """
+impl C
+    fn get(self: C) -> i32
+        return self.x
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return C.get(c)
+""",
     # Not a borrow at all: an array local isn't its first element either.
     "array_local_return": TYPES + """
 fn f() -> C

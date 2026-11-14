@@ -13552,7 +13552,7 @@ class LLVMEmitter:
 
         # For static calls (Type.method()), verify there's no self parameter
         if is_static_call and has_self_param:
-            raise ValueError(f"Static method call Type.method() but method '{expr.method}' expects 'self' parameter")
+            raise EmitError(ref_rules.static_call_of_self(expr.method), expr.span)  # AGAST #2292
 
         # Handle static method call - no receiver needed
         if is_static_call or not has_self_param:
