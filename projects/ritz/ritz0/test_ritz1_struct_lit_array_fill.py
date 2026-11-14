@@ -14,11 +14,10 @@ Two emitter paths build struct literals and both are covered:
 Each program returns 42 when correct and a distinct small code naming the
 check that failed otherwise. ritz0 is the oracle.
 
-Zero fills lower to `llvm.memset` in ritz1 (the same lowering `let b: [N]T =
-[0; N]` uses), which clang turns into a call to `memset`. Real builds link
-ritzlib.str's memset (the regression matrix links it into every cell); these
-single-file programs define the same function themselves. ritz1's libcall
-dependency here, which ritz0 does not have, is tracked separately.
+These single-file programs define ritzlib.str's memset themselves, from when
+ritz1 zero-filled with `llvm.memset` (a libc `memset` call). Since AGAST #3218
+it zero-fills through its module-internal @__ritz_sret_zero instead, and
+test_zero_fill_nostdlib.py links a fill with no memset in sight.
 """
 
 import os

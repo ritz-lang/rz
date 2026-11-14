@@ -83,7 +83,7 @@ pub fn scribble(a: [65536]u8) -> i32
     a[0] as i32
 
 pub fn mk(x: u8) -> [65536]u8
-    # Not `[0; N]`: ritz1 zero-fills with llvm.memset, which needs ritzlib.
+    # Not `[0; N]`: a zero fill takes its own path (test_zero_fill_nostdlib.py).
     var b: [65536]u8 = [7; 65536]
     b[0] = x
     b[65535] = x + 1

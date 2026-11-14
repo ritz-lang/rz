@@ -1877,7 +1877,7 @@ fn emit_array_no_slot_error(s: *EmitterState, e: *Expr) -> i32
 # `base_reg` (a `ptr` register: a local alloca or a struct-field GEP).
 #
 # Strategy (mirrors ritz0):
-#   * Zero fill (e.g. `[0; 65536]`)  -> llvm.memset
+#   * Zero fill (e.g. `[0; 65536]`)  -> @__ritz_sret_zero (AGAST #3218)
 #   * Small N (<= 16)                 -> straight-line unrolled stores
 #   * Otherwise                       -> a real LLVM loop
 # Unrolling [0; 65536] would emit 65536 GEP+store pairs — clang -O2
@@ -2128,12 +2128,17 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
     var fill_is_zero_lit: i32 = 0
     if fill_val != null and fill_val.kind == EXPR_INT_LIT and fill_val.int_val == 0
         fill_is_zero_lit = 1
+    # AGAST #3218: through the module-internal @__ritz_sret_zero, never
+    # llvm.memset: codegen lowers a large intrinsic memset to a call to libc
+    # `memset`, and a program that does not import ritzlib then fails to link
+    # -nostdlib.  The helper is "no-builtins", so it stays a byte loop.
     if fill_is_zero_lit == 1
-        emit_str(s, c"  call void @llvm.memset.p0.i64(ptr ")
+        emit_str(s, c"  call void @__ritz_sret_zero(ptr ")
         emit_reg(s, base_reg)
-        emit_str(s, c", i8 0, i64 ")
+        emit_str(s, c", i64 ")
         emit_int(s, (fill_arr_size * fill_elem_bytes) as i64)
-        emit_str(s, c", i1 false)\n")
+        emit_str(s, c")\n")
+        s.sret_helpers_used = 1
         return
     # Evaluate the fill value ONCE — even if it's a function call we
     # only want to invoke it once. Its i64 SSA result is reused for
