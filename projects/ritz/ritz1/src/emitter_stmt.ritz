@@ -3345,47 +3345,6 @@ fn member_reached_through_call(e: *Expr) -> i32
         return 1
     0
 
-# AGAST #2426: `b.f` with `b` a `Box<S>` and `f` S's field, not the Box's own: the
-# field of what `b.ptr` points at, as ritz0's `for` reads it, into *mr.  0,
-# emitting nothing, for any other member.  Only a `for` goes this far: ritz0
-# refuses `@b.f`, and ritz1 has no `b.f` anywhere else yet.
-fn emit_for_box_field(s: *EmitterState, e: *Expr, mr: *MemberPtrResult) -> i32
-    var b: RefTy
-    if e.left == null or ref_ty_of(s, e.left, @b) == 0 or b.kind != TYPE_STRUCT
-        return 0
-    if b.name_len <= 4 or name_eq(b.name, 4, c"Box$", 4) == 0
-        return 0
-    let bst: *StructDef = find_struct(s, b.name, b.name_len)
-    if bst == null or find_field_index(bst, e.ident_ptr, e.ident_len) >= 0
-        return 0
-    let pi: i32 = find_field_index(bst, c"ptr", 3)
-    if pi < 0
-        return 0
-    let pf: *StructField = get_field_type(bst, pi)
-    if pf.field_type != TYPE_PTR or pf.field_type_name_len <= 0
-        return 0
-    let ist: *StructDef = find_struct(s, pf.field_type_name, pf.field_type_name_len)
-    if ist == null
-        return 0
-    let fi: i32 = find_field_index(ist, e.ident_ptr, e.ident_len)
-    if fi < 0
-        return 0
-    let breg: i32 = emit_lvalue_ptr(s, e.left)
-    if breg <= 0
-        return 0
-    let pp: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, pp)
-    emit_str(s, c" = getelementptr %")
-    emit_name(s, bst.name, bst.name_len)
-    emit_str(s, c", ptr ")
-    emit_reg(s, breg)
-    emit_str(s, c", i32 0, i32 ")
-    emit_int(s, pi as i64)
-    emit_str(s, c"\n")
-    emit_member_gep_from_ptr(s, mr, emit_load_ptr(s, pp), ist, fi, get_field_type(ist, fi))
-    1
-
 # AGAST #2426: `*x`, with `x` a call, a field or a global of type `*[N]T` (as
 # base_ptr_array has them): the array it points at, evaluated once.  0, emitting
 # nothing, for anything else.
@@ -3565,12 +3524,12 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         else if arr_ident.kind == EXPR_MEMBER
             # `@mk().a` has no address: ritz0 says "Cannot get address of: Call".
             # Refused before the member is reached, which would run the call.
-            # AGAST #2426: `b.f` reads through a Box; `@b.f` doesn't, as in ritz0.
-            var boxed: i32 = 0
-            if via_addr == 0
-                boxed = emit_for_box_field(s, arr_ident, @mr)
-            if boxed == 0 and (via_addr == 0 or member_reached_through_call(arr_ident) == 0)
+            # AGAST #2426 / #3006: `b.f` reads through a Box; `@b.f` doesn't, as in ritz0.
+            if via_addr == 0 or member_reached_through_call(arr_ident) == 0
+                let box_read: i32 = s.box_read
+                s.box_read = 1 - via_addr
                 emit_member_ptr(s, arr_ident, @mr)
+                s.box_read = box_read
             if mr.success == 1 and mr.field.field_type == TYPE_ARRAY
                 let fld: *StructField = mr.field
                 iter_kind = 1

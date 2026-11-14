@@ -347,6 +347,9 @@ struct EmitterState
     # AGAST #1625: how many `defer`s are registered (OwnState.defer_count),
     # so emit_str can tell cheaply whether a `ret` must run them first.
     defer_live: i32
+    # AGAST #3006: 1 while a member is read as a value or walked by a `for`,
+    # so emit_member_ptr reads `b.f` through a `Box<T>` (box_inner_struct).
+    box_read: i32
 
 # AGAST #2242 — a path a binding's value can be moved out along: a move-only
 # field of it, or of a field of it that can itself be partly moved.  A path's
@@ -3526,8 +3529,33 @@ fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
         return null
     let fidx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
     if fidx < 0
-        return null
+        return box_inner_field(s, st, e)
     return get_field_type(st, fidx)
+
+# AGAST #3006: `b.f`'s field, for `b` a `Box<T>` and `f` T's, not the Box's own
+# (which the caller found first): ritz0 reads it through `b.ptr`.  Type-only;
+# emit_member_ptr reads it only as a value (EmitterState.box_read).
+fn box_inner_field(s: *EmitterState, st: *StructDef, e: *Expr) -> *StructField
+    let ist: *StructDef = box_inner_def(s, st)
+    if ist == null
+        return null
+    let fi: i32 = find_field_index(ist, e.ident_ptr, e.ident_len)
+    if fi < 0
+        return null
+    get_field_type(ist, fi)
+
+# AGAST #3006: the T a `Box<T>` struct `st` (`Box$T`) points at, or null for
+# any other struct.
+fn box_inner_def(s: *EmitterState, st: *StructDef) -> *StructDef
+    if st == null or st.name_len <= 4 or name_eq(st.name, 4, c"Box$", 4) == 0
+        return null
+    let pi: i32 = find_field_index(st, c"ptr", 3)
+    if pi < 0
+        return null
+    let pf: *StructField = get_field_type(st, pi)
+    if pf.field_type != TYPE_PTR or pf.field_type_name_len <= 0
+        return null
+    find_struct(s, pf.field_type_name, pf.field_type_name_len)
 
 # AGAST #2152: the struct an index expression `ie` yields an element of, for
 # a `.field` on it, or null/0.  Type-only; mirrors emit_member_ptr's

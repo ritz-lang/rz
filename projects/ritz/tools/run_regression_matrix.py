@@ -67,9 +67,6 @@ _RITZ1_TWINS = {
     # --- codegen, build failures ---
     "test_native_string":
         "AGAST #1627 — unspecified ritz0-only \"...\"→String coercion",
-    "test_level32":
-        "AGAST #1634 — unspecified ritz0-only `Box<T>` implicit field deref "
-        "(`b.x`); ritz1: unhandled EXPR_MEMBER",
     # --- grammar / missing features ---
     "test_level40":
         "AGAST #1620 — `dyn Trait`",

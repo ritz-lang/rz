@@ -545,7 +545,7 @@ def test_ritz0_a_boxs_own_field_comes_first(run_with):
     assert run_with("ritz0", "box_own", program) == 3
 
 
-# AGAST #2426: and on ritz1, which reads `b.a` through a Box only in a `for`.  `b.ptr`
+# AGAST #2426: and on ritz1, which reads `b.a` through a Box (#3006).  `b.ptr`
 # is the Box's own `*H`, which no `for` walks, not `H`'s array `ptr`.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
