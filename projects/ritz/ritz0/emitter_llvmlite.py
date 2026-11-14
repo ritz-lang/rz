@@ -8275,6 +8275,7 @@ class LLVMEmitter:
             right = self._emit_expr(expr.right)
             self._check_bool_operands(expr, left, right)
             self._reject_struct_operand(expr, left, right)
+            self._reject_pointer_strlit_compare(expr, left, right)
 
             # Ensure same type
             if left.type != right.type:
@@ -16016,6 +16017,26 @@ class LLVMEmitter:
         left_tag = self.builder.extract_value(left_val, 0, name="enum.lhs.tag")
         right_tag = self.builder.extract_value(right_val, 0, name="enum.rhs.tag")
         return self.builder.icmp_unsigned(op, left_tag, right_tag)
+
+    def _reject_pointer_strlit_compare(self, expr: rast.BinOp, left: ir.Value,
+                                       right: ir.Value) -> None:
+        """Refuse `p == "lit"` / `p != "lit"` (either side) with `p` a pointer.
+
+        A bare literal is a StrView, so this was an `icmp` of a pointer
+        against `{i8*, i64}` that clang rejects (AGAST #2514).  The ruling is
+        to refuse rather than lower the literal to `*u8`: a `*u8` is not
+        necessarily a string, and strings are compared with string functions.
+        A `*u8` slot (`let p: *u8 = "lit"`, an argument) is untouched.
+        """
+        if expr.op not in ('==', '!='):
+            return
+        for lit, other in ((expr.left, right), (expr.right, left)):
+            if isinstance(lit, rast.StringLit) and isinstance(other.type, ir.PointerType):
+                raise EmitError(
+                    f"'{expr.op}' is not supported between a pointer and a string"
+                    f" literal — a *u8 is not necessarily a string; compare it with"
+                    f" streq(p, c\"...\") from ritzlib.str",
+                    getattr(expr, 'span', None))
 
     def _reject_aggregate_compare(self, op: str, left_val: ir.Value,
                                   expr: rast.BinOp) -> None:
