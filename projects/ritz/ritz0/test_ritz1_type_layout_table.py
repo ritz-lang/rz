@@ -193,11 +193,8 @@ struct S
 fn put(p: *{t}, v: {t}) -> void
     *p = v
 
-# Widened in the callee: ritz0 sign-extends a narrow unsigned CALL result
-# before comparing (a separate ritz0 bug), which is not what this tests.
-fn get(p: *{t}) -> i64
-    let v: {t} = *p
-    v as i64
+fn get(p: *{t}) -> {t}
+    *p
 
 fn via_param(q: *S) -> i32
     if q.a[1] != {v1}
