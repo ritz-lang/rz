@@ -456,6 +456,31 @@ fn variant_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i
     if is_ctor == 1
         resolve_enum_ctx(s, out_name, out_len)
 
+# AGAST #3117: an arm yielding a bare `Full(..)` / `Empty` of a generic enum
+# builds the instance its slot names (slot_instance_variant, which
+# try_emit_user_variant_ctor and emit_expr_ident asked while emitting the
+# arm), so the merge phi has that type, not i64.  A unit variant counts only
+# where emit_expr_ident reaches it: no const, local, global or fn of its name.
+fn instance_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    var vi: i32 = 0
+    var ei: i32 = 0 - 1
+    if e.kind == EXPR_CALL
+        ei = slot_instance_variant(s, e.func_name, e.func_name_len, @vi)
+        if ei >= 0
+            let kind: i32 = enum_variant_kind(ei, vi)
+            if not ((kind == ENUM_VARIANT_UNIT and e.args == null) or (kind == ENUM_VARIANT_TUPLE and e.args != null and e.args.next == null))
+                return
+    else if e.kind == EXPR_IDENT
+        if is_const(s, e.ident_ptr, e.ident_len) == 1 or find_local(s, e.ident_ptr, e.ident_len) >= 0
+            return
+        if find_global(s, e.ident_ptr, e.ident_len) != null or find_fn(s, e.ident_ptr, e.ident_len) != null
+            return
+        ei = slot_instance_variant(s, e.ident_ptr, e.ident_len, @vi)
+        if ei >= 0 and enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
+            return
+    if ei >= 0
+        *out_name = enum_name_at(ei, out_len)
+
 # Emit a block arm's statements (AGAST #1454).  `return` leaves the block
 # terminated by `ret`, but the arm still records a phi incoming and emits its
 # `br` to the match end.  Without a fresh block the phi would name the block
@@ -783,6 +808,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         let call_arm: i32 = (arm.body.kind == EXPR_CALL and users_variant_wins(s, arm.body) == 0) as i32
         if arm_ty == null and (call_arm == 1 or arm.body.kind == EXPR_IDENT)
             variant_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)
+        if arm_ty == null
+            instance_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)   # AGAST #3117
         if arm_ty == null
             resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
         if arm_ty == null

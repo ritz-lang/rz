@@ -247,6 +247,27 @@ RUNS = {
                               "    let e: Option<Option<Option<i32>>> = Some(Some(Some(6)))\n"
                               "    let z: Option<Option<Option<i32>>> = Some(Some(None))\n"
                               "    t(e) * 10 + t(z)\n", 63),
+    # AGAST #3117: a match whose arms are bare constructors is a value of its
+    # slot's instance, as each arm is: the fn's return type, a typed let's.
+    # ritz1 phied the arms' `%Slot$i32` values as i64, and clang refused.
+    # Any one arm types the phi: the let's are all calls, the last row's all
+    # unit variants.
+    "match_of_constructors_as_tail": (
+        SLOT + F + "fn mk(s: Slot<i64>) -> Slot<i32>\n    match s\n"
+        "        Full(v) => Full((v >> 32) as i32)\n        Empty => Empty\n"
+        "fn main() -> i32\n    f(mk(Full(0x100000009))) * 10 + f(mk(Empty))\n", 12),
+    "match_of_constructors_as_a_let": (
+        SLOT + F + "fn main() -> i32\n    let s: Slot<i64> = Full(0x300000000)\n"
+        "    let t: Slot<i32> = match s\n        Full(v) => Full((v >> 32) as i32)\n"
+        "        Empty => Full(7)\n    f(t)\n", 3),
+    "match_of_constructors_as_a_return": (
+        SLOT + F + "fn mk(s: Slot<i64>) -> Slot<i32>\n    return match s\n"
+        "        Full(v) => Full((v >> 32) as i32)\n        Empty => Empty\n"
+        "fn main() -> i32\n    f(mk(Full(0x400000000))) * 10 + f(mk(Empty))\n", 42),
+    # Every arm a unit variant: no call arm to type the phi.
+    "match_of_unit_variants": (
+        SLOT + F + "fn mk(n: i64) -> Slot<i32>\n    match n\n        0 => Empty\n"
+        "        _ => Empty\nfn main() -> i32\n    f(mk(4))\n", 2),
     "literal_option_as_err": ("fn main() -> i32\n    let r: Result<i32, Option<i64>> = Err(Some(5))\n"
                               "    match r\n        Ok(v) => 1\n        Err(x) =>\n"
                               "            match x\n                Some(v) => v as i32\n"
