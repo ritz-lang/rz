@@ -965,11 +965,10 @@ pub fn main() -> i32
 
 CASES.update(RETURNS)
 
-# Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
-# but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
-# value would satisfy the xfail just as a refusal does.
-
-DEREF_GAPS = {
+# AGAST #2304: `*x = a` and `*x` read whole through any `*[N]T` that records N
+# and T: a field, a global, and `x + k` / `x - k` at stride `[N]T` over one.
+# These were strict xfails.
+DEREF_THROUGH = {
     "deref_field_ptr": """\
 struct W
     p: *[4]i32
@@ -1010,6 +1009,132 @@ pub fn main() -> i32
     var b: [8]i32
     s(@b as *[4]i32)
     return b[7]
+""",
+    "deref_ptr_arith_nested": """\
+fn s(p: *[4]i32)
+    var a: [4]i32 = [0, 0, 0, 3]
+    *((p + 2) - 1) = a
+
+pub fn main() -> i32
+    var b: [8]i32
+    s(@b as *[4]i32)
+    return b[7]
+""",
+    "deref_ptr_arith_read": """\
+fn s(p: *[4]i32) -> i32
+    let c: [4]i32 = *(p + 1)
+    return c[3]
+
+pub fn main() -> i32
+    var b: [8]i32
+    b[7] = 3
+    return s(@b as *[4]i32)
+""",
+    "deref_field_read": """\
+struct W
+    p: *[4]i32
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 3]
+    var w: W = W { p: @b }
+    let c: [4]i32 = *w.p
+    return c[3]
+""",
+    "deref_field_ptr_arith": """\
+struct W
+    p: *[4]i32
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    var b: [8]i32
+    var w: W = W { p: @b as *[4]i32 }
+    *(w.p + 1) = a
+    return b[7]
+""",
+    "deref_global_lit": """\
+var P: *[4]i32
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 0]
+    P = @b
+    *P = [0, 0, 0, 3]
+    return b[3]
+""",
+    "deref_global_read": """\
+var P: *[4]i32
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 3]
+    P = @b
+    var c: [4]i32 = [0, 0, 0, 0]
+    c = *P
+    return c[3]
+""",
+    # `P + 1` stepped one byte on a global and refused on a field.
+    "ptr_arith_field_global_value": """\
+var P: *[4]i32
+
+struct W
+    p: *[4]i32
+
+pub fn main() -> i32
+    var b: [8]i32
+    b[4] = 3
+    b[5] = 4
+    P = @b as *[4]i32
+    var w: W = W { p: @b as *[4]i32 }
+    let q: *i32 = (P + 1) as *i32
+    let r: *i32 = (w.p + 1) as *i32
+    return *q * 10 + *r
+""",
+}
+
+CASES.update(DEREF_THROUGH)
+
+# Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
+# but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
+# value would satisfy the xfail just as a refusal does.
+
+# AGAST #3191: an untyped `let c = *x` of a `*[N]T`.  `*P` on a global read the
+# pointer's own bytes, SILENT, until #2304 refused it with the rest.
+UNTYPED_DEREF_GAPS = {
+    "untyped_deref_local": """\
+fn s(p: *[4]i32) -> i32
+    let c = *p
+    return c[3]
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 3]
+    return s(@b)
+""",
+    "untyped_deref_field": """\
+struct W
+    p: *[4]i32
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 3]
+    var w: W = W { p: @b }
+    let c = *w.p
+    return c[3]
+""",
+    "untyped_deref_global": """\
+var P: *[4]i32
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 3]
+    P = @b
+    let c = *P
+    return c[3]
+""",
+    "untyped_deref_arith": """\
+fn s(p: *[4]i32) -> i32
+    let c = *(p + 1)
+    return c[3]
+
+pub fn main() -> i32
+    var b: [8]i32
+    b[7] = 3
+    return s(@b as *[4]i32)
 """,
 }
 
@@ -1190,7 +1315,7 @@ pub fn main() -> i32
 }
 
 GAPS = [
-    (DEREF_GAPS, "AGAST #2304: `*p = a` needs a local or param `p: *[N]T`"),
+    (UNTYPED_DEREF_GAPS, "AGAST #3191: an untyped `let c = *p` of a `*[N]T`"),
     (SOURCE_GAPS, "AGAST #2305: a whole-array source or target ritz1 doesn't lower"),
     (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
     (PARAM_ND_GAPS, "AGAST #2098: a multi-dimensional array param"),
@@ -1245,6 +1370,48 @@ pub fn main() -> i32
     var b: [4]i32 = [0, 0, 0, 0]
     s(@b)
     return b[3]
+""",
+    # AGAST #2304: through a field, a global or `p + k`, N and T are the pointer's.
+    "deref_field_wrong_len": """\
+struct W
+    p: *[4]i32
+
+pub fn main() -> i32
+    var a: [3]i32 = [0, 0, 3]
+    var b: [4]i32 = [0, 0, 0, 0]
+    var w: W = W { p: @b }
+    *w.p = a
+    return b[3]
+""",
+    "deref_global_wrong_elem": """\
+var P: *[4]i32
+
+pub fn main() -> i32
+    var a: [4]i64 = [0, 0, 0, 3]
+    var b: [4]i32 = [0, 0, 0, 0]
+    P = @b
+    *P = a
+    return b[3]
+""",
+    "deref_arith_wrong_len": """\
+fn s(p: *[4]i32)
+    var a: [5]i32 = [0, 0, 0, 0, 3]
+    *(p + 1) = a
+
+pub fn main() -> i32
+    var b: [8]i32
+    s(@b as *[4]i32)
+    return b[7]
+""",
+    "deref_field_read_wrong_len": """\
+struct W
+    p: *[4]i32
+
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 3]
+    var w: W = W { p: @b }
+    let c: [5]i32 = *w.p
+    return c[3]
 """,
     "wrong_elem_global": """\
 var G: [4]i32
