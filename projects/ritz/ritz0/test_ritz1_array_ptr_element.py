@@ -564,6 +564,34 @@ def test_untyped_let_of_an_element_index_is_a_copy(run_with, compiler):
     assert run_with(compiler, "element_index_copy", program) == 0
 
 
+# AGAST #3058: with `b: [2]**S`, `b[1][0]` is `*(b[1] + 0)`, a `*S`, so `let c`
+# is one, as `let c: *S = b[1][0]`.  ritz1 left it i64 with no pointee:
+# `c[1].q` was "unhandled EXPR_MEMBER".  p0 points at s0[0], so c[1] is s0[1];
+# b[0] points at ps, so `b[0][1]` is ps[1], one pointer on, also at s0[1].
+_PP_MAIN = (_PAIR + "pub fn main() -> i32\n    var s0: [2]S\n    s0[0].q = 1\n    s0[1].q = 2\n"
+            "    var p0: *S = @s0[0]\n    var ps: [2]*S\n    ps[0] = @s0[0]\n    ps[1] = @s0[1]\n"
+            "    var b: [2]**S\n    b[0] = @ps[0]\n    b[1] = @p0\n    let c = b[1][0]\n")
+PTR_PTR_ELEMENT_INDEX = {
+    "index_field": _is("c[1].q", "2"),
+    "deref_field": _is("(*c).q", "1"),
+    "store": "    c[1].q = 7\n" + _is("s0[1].q", "7"),
+    "pointer_stride": "    let d = b[0][1]\n" + _is("d[0].q", "2"),
+    # The load and the stride without the inference: ritz1 read one byte.
+    "annotated": "    let e: *S = b[1][0]\n" + _is("e[1].q", "2"),
+    "sum_stride": _is("(*(b[0] + 1)).q", "2"),
+    # A store to `b[i][j]` is one to ps[1]; ritz1 stored through its value.
+    "element_store": "    b[0][1] = @s0[0]\n" + _is("ps[1].q", "1"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(PTR_PTR_ELEMENT_INDEX))
+def test_ptr_ptr_element_index_is_a_pointer(run_with, name, compiler):
+    program = _PP_MAIN + PTR_PTR_ELEMENT_INDEX[name]
+    assert run_with(compiler, f"pp_{name}", program) == 0
+
+
 # A Drop pointee isn't copied out: each compiler refuses it at the read, as
 # ritz0 does `let c = *p`.  ritz1 copied `*a[0]` silently.
 _DROP_MAIN = (
