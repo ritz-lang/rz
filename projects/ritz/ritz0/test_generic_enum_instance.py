@@ -40,6 +40,8 @@ RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 SLOT = "enum Slot<T>\n    Full(T)\n    Empty\n"
+# `g` reads an Option<i32>'s payload, 3 for None (AGAST #2987).
+G = "fn g(x: Option<i32>) -> i32\n    match x\n        Some(v) => v\n        None => 3\n"
 # `f` reads a Slot<i32>'s payload, 2 for Empty.
 F = "fn f(o: Slot<i32>) -> i32\n    match o\n        Full(v) => v\n        Empty => 2\n"
 
@@ -148,6 +150,29 @@ RUNS = {
                                     "    match s\n        Full(v) => 1\n        Empty => 2\n"
                                     "fn main() -> i32\n    let a: u8 = 3\n    g<i32>(4) * 10 + g<u8>(a)\n",
                                     11),
+    # AGAST #2987: a builtin's payload declared as an enum is that aggregate,
+    # stored and bound so whatever the payload's expression form: a ctor or a
+    # local of `Option<i32>`, or a call or deref yielding a user enum.  ritz1 stored it as an i64
+    # (invalid IR) and bound it as one.
+    "result_carrying_options": (G + "fn f(o: Result<Option<i32>, Option<i32>>) -> i32\n"
+                                "    match o\n        Ok(x) => g(x)\n        Err(x) => g(x) + 1\n"
+                                "fn main() -> i32\n"
+                                "    let a: Result<Option<i32>, Option<i32>> = Ok(Some(6))\n"
+                                "    let b: Result<Option<i32>, Option<i32>> = Ok(None)\n"
+                                "    let c: Result<Option<i32>, Option<i32>> = Err(Some(1))\n"
+                                "    let d: Result<Option<i32>, Option<i32>> = Err(None)\n"
+                                "    f(a) * 1000 + f(b) * 100 + f(c) * 10 + f(d)\n", 6324 % 256),
+    "option_of_option_by_name": (G + "fn wrap(h: Option<i32>) -> Option<Option<i32>>\n    Some(h)\n"
+                                 "fn f(o: Option<Option<i32>>) -> i32\n    match o\n"
+                                 "        Some(x) => g(x)\n        None => 4\n"
+                                 "fn main() -> i32\n    f(wrap(Some(6))) * 10 + f(wrap(None))\n", 63),
+    "option_of_user_enum_by_deref_and_call": ("enum H\n    Has(i32)\n    Lacks\n"
+                                              "fn g(x: H) -> i32\n    match x\n        Has(v) => v\n"
+                                              "        Lacks => 3\nfn pick() -> H\n    Has(6)\n"
+                                              "fn f(o: Option<H>) -> i32\n    match o\n        Some(x) => g(x)\n"
+                                              "        None => 4\nfn main() -> i32\n    let h: H = Lacks\n"
+                                              "    let p: *H = @h\n    let a: Option<H> = Some(pick())\n"
+                                              "    let b: Option<H> = Some(*p)\n    f(a) * 10 + f(b)\n", 63),
 }
 
 
@@ -228,6 +253,19 @@ def test_an_imported_generic_enum_is_instantiated_here(tmp_path, need_ritz1, com
     src = ("import gm\nfn f(o: Box2<i32>) -> i32\n    match o\n        Has(v) => v\n"
            "        Nil => 2\nfn main() -> i32\n    let a: Box2<i32> = Has(8)\n    f(a)\n")
     assert _run(compiler, tmp_path, src, {"gm.ritz": module}) == 8, compiler
+
+
+# AGAST #2987: the literal `Some(Some(6))` / `Some(None)` in an
+# `Option<Option<i32>>`.  ritz0 refuses it (`cannot store i64 to
+# %"Option$i32"*`, AGAST #3020), so ritz1 runs it alone; move it into RUNS when
+# ritz0 lowers it.
+@pytest.mark.parametrize("compiler", COMPILERS[1:])
+def test_a_literal_nested_option_runs_on_ritz1(tmp_path, need_ritz1, compiler):
+    need_ritz1(compiler)
+    src = (G + "fn f(o: Option<Option<i32>>) -> i32\n    match o\n        Some(x) => g(x)\n"
+           "        None => 4\nfn main() -> i32\n    let a: Option<Option<i32>> = Some(Some(6))\n"
+           "    let b: Option<Option<i32>> = Some(None)\n    f(a) * 10 + f(b)\n")
+    assert _run(compiler, tmp_path, src) == 63, compiler
 
 
 # AGAST #2927: an untyped let whose constructor leaves a type parameter
