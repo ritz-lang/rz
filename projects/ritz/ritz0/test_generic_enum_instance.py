@@ -173,6 +173,19 @@ RUNS = {
                                               "        None => 4\nfn main() -> i32\n    let h: H = Lacks\n"
                                               "    let p: *H = @h\n    let a: Option<H> = Some(pick())\n"
                                               "    let b: Option<H> = Some(*p)\n    f(a) * 10 + f(b)\n", 63),
+    # AGAST #2435: a nested literal whose inner enum nothing else names.  ritz1
+    # declared the outer `%Option$Option$i32` only, and its build allocas the
+    # inner `%Option$i32`: unsized, clang refused it.  T's side, then E's.
+    "literal_nested_option": ("fn f(o: Option<Option<i32>>) -> i32\n    match o\n"
+                              "        Some(x) =>\n            match x\n"
+                              "                Some(v) => v\n                None => 3\n"
+                              "        None => 4\nfn main() -> i32\n"
+                              "    let a: Option<Option<i32>> = Some(Some(6))\n"
+                              "    let b: Option<Option<i32>> = Some(None)\n    f(a) * 10 + f(b)\n", 63),
+    "literal_option_as_err": ("fn main() -> i32\n    let r: Result<i32, Option<i64>> = Err(Some(5))\n"
+                              "    match r\n        Ok(v) => 1\n        Err(x) =>\n"
+                              "            match x\n                Some(v) => v as i32\n"
+                              "                None => 3\n", 5),
 }
 
 
@@ -253,19 +266,6 @@ def test_an_imported_generic_enum_is_instantiated_here(tmp_path, need_ritz1, com
     src = ("import gm\nfn f(o: Box2<i32>) -> i32\n    match o\n        Has(v) => v\n"
            "        Nil => 2\nfn main() -> i32\n    let a: Box2<i32> = Has(8)\n    f(a)\n")
     assert _run(compiler, tmp_path, src, {"gm.ritz": module}) == 8, compiler
-
-
-# AGAST #2987: the literal `Some(Some(6))` / `Some(None)` in an
-# `Option<Option<i32>>`.  ritz0 refuses it (`cannot store i64 to
-# %"Option$i32"*`, AGAST #3020), so ritz1 runs it alone; move it into RUNS when
-# ritz0 lowers it.
-@pytest.mark.parametrize("compiler", COMPILERS[1:])
-def test_a_literal_nested_option_runs_on_ritz1(tmp_path, need_ritz1, compiler):
-    need_ritz1(compiler)
-    src = (G + "fn f(o: Option<Option<i32>>) -> i32\n    match o\n        Some(x) => g(x)\n"
-           "        None => 4\nfn main() -> i32\n    let a: Option<Option<i32>> = Some(Some(6))\n"
-           "    let b: Option<Option<i32>> = Some(None)\n    f(a) * 10 + f(b)\n")
-    assert _run(compiler, tmp_path, src) == 63, compiler
 
 
 # AGAST #2927: an untyped let whose constructor leaves a type parameter

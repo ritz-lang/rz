@@ -74,7 +74,7 @@ PROGRAMS = {
     "result_param_two_params": ("fn f<T, E>(r: Result<T, E>) -> i32\n    match r\n"
                                 "        Ok(v) => 5\n        Err(e) => 6\nfn main() -> i32\n"
                                 "    let r: Result<i32, i64> = Err(1)\n    f<i32, i64>(r)\n", 6),
-    # The inner value is built first: `Some(Some(5))` itself is #2435.
+    # The inner value is built first, as before `Some(Some(5))` itself built (#2435).
     "nested_option_param": ("fn f<T>(o: Option<Option<T>>) -> i32\n    match o\n"
                             "        Some(i) => 1\n        _ => 2\nfn main() -> i32\n"
                             "    let i: Option<i32> = Some(5)\n"

@@ -120,6 +120,13 @@ ARMS = {
     "if_returned_as_the_fns_enum": (
         "fn f(c: i32) -> Option<i32>\n    let o = if c == 1 then Some(5) else None\n    o\n"
         + _body(*_match("f(1)", *_SOME)), 5),
+    # A nested constructor in an arm is its own enum's (#2435).
+    "arm_nested_some": (_body("let o = if true then Some(Some(5)) else None",
+                              *_match("o", "Some(v) =>", "    match v",
+                                      "        Some(w) => w as i32", "        _ => 3", "_ => 2")), 5),
+    "err_arm_nested_ok": (_body("let r = if false then Ok(1) else Err(Ok(5))",
+                                *_match("r", "Ok(v) => 1", "Err(e) =>", "    match e",
+                                        "        Ok(w) => w as i32", "        _ => 3")), 5),
 }
 
 # 6: a constructor statement builds the enum its payload names; the value is dropped.
@@ -160,8 +167,8 @@ NO_ENUM = {
     # Arms building an Option and a Result: at the first that differs.
     "arms_of_two_families": (_body("let o = if true then Some(5) else Ok(5)", "0"), "Ok("),
     # An arm's payload ritz1 can't name, as #2430's let.
-    "arm_payload_unnamed": (_body("let o = if true then Some(Some(5)) else None", "0"), "Some("),
-    "err_arm_payload_unnamed": (_body("let r = if true then Ok(1) else Err(Ok(5))", "0"), "Err("),
+    "arm_payload_unnamed": (_body("var x: i32 = 5",
+                                  "let o = if true then Some(@x) else None", "0"), "Some("),
 }
 # A slot that is no enum: the #2142 refusal, now located too.
 NON_ENUM_SLOT = {
@@ -170,7 +177,9 @@ NON_ENUM_SLOT = {
 }
 
 # An Err("abc") needs its own Result registered on ritz0 (#2433).
-RITZ0_OWN_BUGS = {"if_err_names_its_own_payload"}
+RITZ0_OWN_BUGS = {"if_err_names_its_own_payload",
+                  # An untyped nested constructor: an i64 slot on ritz0 (#3045).
+                  "arm_nested_some", "err_arm_nested_ok"}
 ON_RITZ0 = sorted(set(RUNS) - RITZ0_OWN_BUGS)
 
 

@@ -86,6 +86,12 @@ PAYLOADS = {
     "user_variant": (_U + _body("let o = Some(Holds(5))", "match o", "    Some(v) =>",
                                 "        match v", "            Holds(w) => w",
                                 "            Vacant => 3", "    _ => 2"), 5),
+    # A nested constructor is its own enum's (#2435). Not on ritz0 yet (#3045).
+    "nested_some": (_body("let o = Some(Some(5))", "match o", "    Some(v) =>",
+                          "        match v", "            Some(w) => w as i32",
+                          "            _ => 3", "    _ => 2"), 5),
+    "nested_ok": (_body("var o = Ok(Err(5))", "match o", "    Ok(v) =>", "        match v",
+                        "            Err(e) => e as i32", "            _ => 3", "    _ => 2"), 5),
 }
 
 # The bound value outside a match: passed, returned, reassigned, read twice.
@@ -152,8 +158,6 @@ _LOCATED = "this constructor's type can't be inferred here: bind it with a typed
 
 # A payload ritz1 can't name: a located error at the constructor, never the zero.
 UNNAMED = {
-    "nested_some": _body("let o = Some(Some(5))", "0"),
-    "nested_ok": _body("var o = Ok(Err(5))", "0"),
     "pointer_to_pointer": _body("var x: i32 = 5", "var p: *i32 = @x", "let q: **i32 = @p",
                                 "let o = Some(q)", "0"),
     "borrow": _body("var x: i32 = 5", "let o = Some(@x)", "0"),

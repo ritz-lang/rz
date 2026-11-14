@@ -1229,11 +1229,17 @@ fn ctor_pointer_spelling(s: *EmitterState, e: *Expr, out: **u8) -> i32
     n
 
 # The type argument payload `e` gives its enum, spelled as a mangled name; its
-# length, or 0 when ritz1 can't name it.  A nested constructor is one of those:
-# emit_variant_build gives the inner one the outer enum, typed or not.
+# length, or 0 when ritz1 can't name it.  A nested constructor is its own enum's,
+# named by its payload the same way (AGAST #2435): `Some(5)` in `Some(Some(5))`
+# is `Option$i64`.
 fn ctor_payload_spelling(s: *EmitterState, e: *Expr, out: **u8) -> i32
     if is_tagged_ctor(s, e) == 1
-        return 0
+        var len: i32 = 0
+        let name: *u8 = tagged_ctor_enum_name(s, e, @len)
+        if name == null
+            return 0
+        *out = name
+        return len
     if e.kind == EXPR_STRING_LIT
         *out = c"StrView"   # layout-equal to the %Span$u8 it lowers to
         return 7
@@ -1256,6 +1262,23 @@ fn ctor_payload_spelling(s: *EmitterState, e: *Expr, out: **u8) -> i32
         return ctor_pointer_spelling(s, e, out)
     primitive_arg_spelling(ty, out)
 
+# The enum tagged constructor `scr` builds, named by its payload alone: i64 for a
+# type argument nothing gives.  null when its payload can't be named.
+fn tagged_ctor_enum_name(s: *EmitterState, scr: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    var arg: *u8 = c"i64"
+    var arg_len: i32 = 3
+    let is_none: i32 = (scr.kind == EXPR_IDENT or is_ident_none(scr.func_name, scr.func_name_len) == 1) as i32
+    if is_none == 0 and scr.args != null
+        arg_len = ctor_payload_spelling(s, scr.args, @arg)
+        if arg_len <= 0
+            return null
+    if is_none == 1 or name_eq(scr.func_name, scr.func_name_len, c"Some", 4) == 1
+        return ctor_join(c"Option$", 7, arg, arg_len, c"", 0, out_len)
+    if name_eq(scr.func_name, scr.func_name_len, c"Ok", 2) == 1
+        return ctor_join(c"Result$", 7, arg, arg_len, c"$i64", 4, out_len)
+    ctor_join(c"Result$i64$", 11, arg, arg_len, c"", 0, out_len)
+
 # The enum a constructor scrutinee builds, queued for its type decl.  null/0 when
 # `scr` is none, or its payload can't be named.
 fn ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32)
@@ -1263,21 +1286,10 @@ fn ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i
     *out_len = 0
     if is_tagged_ctor(s, scr) == 0
         return
-    var arg: *u8 = c"i64"
-    var arg_len: i32 = 3
-    let is_none: i32 = (scr.kind == EXPR_IDENT or is_ident_none(scr.func_name, scr.func_name_len) == 1) as i32
-    if is_none == 0 and scr.args != null
-        arg_len = ctor_payload_spelling(s, scr.args, @arg)
-        if arg_len <= 0
-            return
     var len: i32 = 0
-    var name: *u8 = null
-    if is_none == 1 or name_eq(scr.func_name, scr.func_name_len, c"Some", 4) == 1
-        name = ctor_join(c"Option$", 7, arg, arg_len, c"", 0, @len)
-    else if name_eq(scr.func_name, scr.func_name_len, c"Ok", 2) == 1
-        name = ctor_join(c"Result$", 7, arg, arg_len, c"$i64", 4, @len)
-    else
-        name = ctor_join(c"Result$i64$", 11, arg, arg_len, c"", 0, @len)
+    let name: *u8 = tagged_ctor_enum_name(s, scr, @len)
+    if name == null
+        return
     if namelist_find(@s.late_enums, name, len) < 0
         namelist_push(@s.late_enums, name, len)
     *out_name = name

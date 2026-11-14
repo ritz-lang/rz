@@ -214,7 +214,19 @@ SHADOWED = {
     "global_none": ("var None: i32\n" + _on("None", "0 => 3", "_ => 1"), 3),
 }
 
-RUNS = {**VARIANTS, **PAYLOADS, **AROUND, **USER, **SHADOWED}
+# A nested constructor is its own enum's, named by its payload as the outer one is
+# (#2435): `Some(Some(5))` is an Option<Option<i64>>, and nothing else in the module
+# names the inner Option<i64>, which ritz1 left undeclared.
+NESTED = {
+    "nested_some": (_on("Some(Some(5))", "Some(v) =>", "    match v",
+                        "        Some(w) => w as i32", "        _ => 3", "_ => 2"), 5),
+    "nested_none": (_on("Some(None)", "Some(v) =>", "    match v",
+                        "        Some(w) => 1", "        _ => 3", "_ => 2"), 3),
+    "nested_ok": (_on("Ok(Err(5))", "Ok(v) =>", "    match v",
+                      "        Err(e) => e as i32", "        _ => 3", "_ => 2"), 5),
+}
+
+RUNS = {**VARIANTS, **PAYLOADS, **AROUND, **USER, **SHADOWED, **NESTED}
 
 # What a scrutinee refuses is what any Option's does: (source, line, col, message).
 _LOCATED = "this constructor's type can't be inferred here: bind it with a typed `let` first"
@@ -230,11 +242,8 @@ REFUSED = {
 }
 
 # A payload ritz1 can't name, or build: never the zero it used to match on. A nested
-# constructor runs once it can be built at all (#2435).
+# constructor runs (NESTED, #2435).
 UNNAMED = {
-    "nested_some": _on("Some(Some(5))", "Some(v) => 1", "_ => 2"),
-    "nested_none": _on("Some(None)", "Some(v) => 1", "_ => 2"),
-    "nested_ok": _on("Ok(Err(5))", "Ok(v) => 1", "_ => 2"),
     "pointer_to_pointer": _on("Some(q)", "Some(v) => 1", "_ => 2",
                               before="var x: i32 = 5\nvar p: *i32 = @x\nlet q: **i32 = @p"),
     "element_struct": _P + _on("Some(a[1])", "Some(v) => 7", "_ => 2", before="var a: [2]Pair"),
