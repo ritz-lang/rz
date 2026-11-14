@@ -893,7 +893,10 @@ fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
             else if ref_of_param(p, @slot) == 1
                 ref_into(s, a, @slot)
             p = p.next
+        let held: *Expr = REF_ARG_EXPR
+        REF_ARG_EXPR = a
         ref_walk(s, a)
+        REF_ARG_EXPR = held
         a = a.next
     REF_IN_ARGS = REF_IN_ARGS - 1
     if REF_LOAN_COUNT > loans
@@ -988,6 +991,79 @@ fn ref_check_fill(s: *EmitterState, e: *Expr)
     eprints_cstr(c": error: `[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`\n")
     s.error_count = s.error_count + 1
 
+# A call's by-value result is a temporary, not a place (Aaron's ruling on
+# AGAST #2518, LARB review 4).  A store into it, a method writing `self` on
+# it, and an `@` of it that outlives its statement are refused; an `@` passed
+# straight to a call is lent until that call returns (#3050, own_lend_temps).
+# ritz0's words are ref_rules.STORE_INTO_TEMP, MUT_SELF_ON_TEMP and
+# ADDR_OF_TEMP; ritz0/test_call_temporary_place.py holds all three compilers.
+
+# The argument ref_args is walking: an `@` that is it is lent to the call.
+var REF_ARG_EXPR: *Expr = null
+
+# The call (EXPR_CALL / EXPR_METHOD) whose by-value struct or array result
+# `e` is, or is a field or element of; null when `e` is a place.  A step
+# through a pointer (`mkp().x`, a `*T` field, `v[i]` of a Vec) reaches one.
+pub fn ref_temp_call(s: *EmitterState, e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r != null and (r.kind == EXPR_MEMBER or r.kind == EXPR_INDEX)
+        if r.kind == EXPR_INDEX
+            if r.right != null and r.right.kind == EXPR_RANGE
+                return null
+            if index_through(s, r) != null
+                return null
+        var t: RefTy
+        if ref_ty_of(s, r.left, @t) == 0
+            return null
+        if t.kind != TYPE_STRUCT and t.kind != TYPE_ARRAY
+            return null
+        r = r.left
+    if r == null or (r.kind != EXPR_CALL and r.kind != EXPR_METHOD)
+        return null
+    var rt: RefTy
+    if ref_ty_of(s, r, @rt) == 0
+        return null
+    if rt.kind != TYPE_STRUCT and rt.kind != TYPE_ARRAY
+        return null
+    r
+
+fn ref_error_temp(s: *EmitterState, line: i32, col: i32, msg: *u8)
+    if ref_first_report(line, col) == 0
+        return
+    ref_eprint_loc(line, col)
+    eprints_cstr(c": error: ")
+    eprints_cstr(msg)
+    eprint_char('\n')
+    s.error_count = s.error_count + 1
+
+# `mk().x = 1`, `mk().n[1] = 3`, `mk().x += 1`: at the place's start.
+fn ref_check_temp_store(s: *EmitterState, stmt: *Stmt)
+    if stmt.kind != STMT_ASSIGN or stmt.assign_target_len != 0
+        return
+    let place: *Expr = stmt.if_cond as *Expr
+    if place == null or (place.kind != EXPR_MEMBER and place.kind != EXPR_INDEX)
+        return
+    if ref_temp_call(s, place) == null
+        return
+    let at: *Expr = own_start_of(place)
+    ref_error_temp(s, at.span.line, at.span.col, c"a store into a call's temporary is lost: bind the call to a local first")
+
+# `mk().bump()` with `self: @&T` / `self:& T` stores into the temporary as
+# R1 exception 4's auto-ref lends it.  `p` is the method's first param.
+fn ref_check_temp_receiver(s: *EmitterState, e: *Expr, p: *Param)
+    if p == null or param_is_self(p) == 0 or p.param_type != TYPE_MUT_REF
+        return
+    if ref_temp_call(s, e.left) == null
+        return
+    let at: *Expr = own_start_of(e.left)
+    ref_error_temp(s, at.span.line, at.span.col, c"a method that writes `self` can't take a call's temporary: bind the call to a local first")
+
+# `@mk()`, `@&mk().n[1]`: only as a call's argument.
+fn ref_check_temp_addr(s: *EmitterState, e: *Expr)
+    if e == REF_ARG_EXPR or ref_temp_call(s, e.operand) == null
+        return
+    ref_error_temp(s, e.span.line, e.span.col, c"`@` of a call's temporary outlives it: bind the call to a local first, or pass it straight to a call")
+
 fn ref_walk(s: *EmitterState, e: *Expr)
     if e == null
         return
@@ -1046,6 +1122,7 @@ fn ref_walk(s: *EmitterState, e: *Expr)
             # takes the receiver as an argument: its params don't line up, so
             # the slots go unjudged, as in ritz0.
             mp = m.params
+            ref_check_temp_receiver(s, e, mp)
             ref_check_receiver(s, e, mp)
             ref_loan_receiver(s, e, mp)
             if mp != null and name_eq(mp.name, mp.name_len, c"self", 4) == 1
@@ -1062,6 +1139,7 @@ fn ref_walk(s: *EmitterState, e: *Expr)
         ref_walk(s, e.left)
     else if k == EXPR_UNARY
         if e.op == OP_ADDR_MUT or e.op == OP_ADDR
+            ref_check_temp_addr(s, e)
             var mutable: i32 = 0
             if e.op == OP_ADDR_MUT
                 mutable = 1
@@ -1216,6 +1294,7 @@ fn ref_walk_target(s: *EmitterState, stmt: *Stmt)
 
 pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
     let k: i32 = stmt.kind
+    ref_check_temp_store(s, stmt)
     ref_check_write(s, stmt)
     ref_walk_target(s, stmt)
     ref_loan_write(s, stmt)

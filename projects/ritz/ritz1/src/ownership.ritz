@@ -1481,6 +1481,65 @@ fn own_drop_temps_from(s: *EmitterState, from: i32)
             i -= 1
     o.temp_count = from
 
+# AGAST #2518 / #3050: `f(@mk())` lends `mk()`'s temporary to f, and it drops
+# when f returns, not when the statement ends: `look(@make(1)) * 10 + DROPS`
+# counts it.  The `@` (emit_expr_unary) marks the temporaries its operand made
+# lent; emit_expr drops those its call's arguments lent once the call is
+# emitted.  A stack of their slots, newest last.
+var OWN_LENT: *i32 = null
+var OWN_LENT_COUNT: i32 = 0
+var OWN_LENT_CAP: i32 = 0
+
+# Where `temps` is now, for own_lend_temps.
+pub fn own_temp_mark(s: *EmitterState) -> i32
+    let o: *OwnState = s.own
+    o.temp_count
+
+# `@op` was just emitted: if op is (a part of) a call's temporary, the
+# temporaries made since `from` are lent to the call `@op` is an argument of.
+pub fn own_lend_temps(s: *EmitterState, op: *Expr, from: i32)
+    let o: *OwnState = s.own
+    if o.temp_count <= from or ref_temp_call(s, op) == null
+        return
+    var i: i32 = from
+    while i < o.temp_count
+        if OWN_LENT_COUNT >= OWN_LENT_CAP
+            var cap: i32 = OWN_LENT_CAP * 2
+            if cap < 16
+                cap = 16
+            OWN_LENT = realloc(OWN_LENT as *u8, (cap as i64) * 4) as *i32
+            OWN_LENT_CAP = cap
+        let lt: *OwnBinding = own_temp_at(o, i)
+        OWN_LENT[OWN_LENT_COUNT] = lt.slot
+        OWN_LENT_COUNT = OWN_LENT_COUNT + 1
+        i += 1
+
+fn own_lent_slot_at(o: *OwnState, i: i32) -> i32
+    let b: *OwnBinding = own_temp_at(o, i)
+    b.slot
+
+# Before a call's arguments: where the lent stack is.
+pub fn own_lent_mark() -> i32
+    OWN_LENT_COUNT
+
+# After the call: drop what its arguments lent (newest first) and forget it.
+pub fn own_drop_lent(s: *EmitterState, from: i32)
+    let o: *OwnState = s.own
+    while OWN_LENT_COUNT > from
+        OWN_LENT_COUNT = OWN_LENT_COUNT - 1
+        let slot: i32 = OWN_LENT[OWN_LENT_COUNT]
+        var i: i32 = o.temp_count - 1
+        while i >= o.stmt_mark and own_lent_slot_at(o, i) != slot
+            i -= 1
+        if i >= o.stmt_mark
+            if own_scope_is_dead(o) == 0
+                own_emit_drop(s, own_temp_at(o, i))
+            var j: i32 = i + 1
+            while j < o.temp_count
+                own_copy_binding(own_temp_at(o, j - 1), own_temp_at(o, j))
+                j += 1
+            o.temp_count = o.temp_count - 1
+
 # Bracket each statement: own_stmt_begin before it, own_stmt_end (with
 # what begin returned) after, which drops the temporaries it made.
 pub fn own_stmt_begin(s: *EmitterState) -> i32
@@ -2242,7 +2301,7 @@ fn own_value_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -
     1
 
 # The line and column an error about `e` points at: where it starts.
-fn own_start_of(e: *Expr) -> *Expr
+pub fn own_start_of(e: *Expr) -> *Expr
     var r: *Expr = e
     while r.left != null and (r.kind == EXPR_MEMBER or r.kind == EXPR_INDEX or r.kind == EXPR_METHOD)
         r = r.left

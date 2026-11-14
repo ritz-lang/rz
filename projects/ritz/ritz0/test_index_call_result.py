@@ -9,7 +9,7 @@
 ritz0's _emit_index took the field's address with _emit_lvalue_addr, which had
 no case for a call. A read now spills the call's value to a slot and indexes
 it there, as if a local held it, and evaluates the call once. A store or `@`
-into a call's value still isn't a place (#2518 wants a located refusal).
+into a call's value isn't a place: test_call_temporary_place.py (#2518).
 
 ritz1 and ritz1_selfhosted read an element of a by-value call's field rows, and
 walk a row with `for` (#2410).  AGAST #2517: they also copy a whole row into a

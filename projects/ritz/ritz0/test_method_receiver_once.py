@@ -180,14 +180,13 @@ NESTED = "var arr: [2]W = [W { p: P { x: 1 } }, W { p: P { x: 2 } }]\n    "
 # name -> (body of `g`, expected MADE, expected DROPS, {compiler: gap ticket})
 CASES = {
     # The ticket's program, and each kind of `self` on a Drop type.
+    # A `self: @&T` / `self:& T` method on a by-value result is a lost store,
+    # refused since AGAST #2518 (test_call_temporary_place.py `mut_self_*`).
     "lent_self": ("make(1).peek()", 1, 1, {}),
-    "mut_self": ("make(1).bump()", 1, 1, {}),
     "value_self": ("make(1).burn()", 1, 1, {}),
     # The same on a type that copies.
     "copy_lent_self": ("mp().get()", 1, 0, {}),
     "copy_value_self": ("mp().val()", 1, 0, {}),
-    "copy_mut_self": ("mp().bump()", 1, 0, {}),
-    "copy_borrow_param_self": ("mp().borrow_mut()", 1, 0, {}),
     "generic": ("mg().get()", 1, 0, {}),
     "trait_impl": ("mp().say()", 1, 0, {}),
     "grouped": ("(mp()).get()", 1, 0, {}),
@@ -257,29 +256,10 @@ pub fn main() -> i32
     return MADE * 10 + r
 """, 17, NO_DYN_RETURN),
 
-    # One value: what `bump` wrote is what `drop` sees.
-    "drop_sees_the_mutation": ("""\
-fn g() -> i32
-    make(1).bump()
-    return 0
-
-pub fn main() -> i32
-    g()
-    return LAST * 10 + DROPS
-""", 61, {}),
-
-    # So on a method's result: `again`'s temporary is the one `bump` writes
-    # and the one dropped first (AGAST #2262).
-    "drop_sees_the_mutation_chain": ("""\
-fn g() -> i32
-    var t = make(2)
-    t.again().bump()
-    return LAST
-
-pub fn main() -> i32
-    let last = g()
-    return last * 10 + DROPS
-""", 72, {}),
+    # `make(1).bump()` and `t.again().bump()` wrote a temporary, and its drop
+    # saw the write (AGAST #2262).  Both are refused since AGAST #2518: the
+    # write is lost.  What a lent temporary's drop sees is
+    # test_ownership_free_count.py's `lent_temp_mut_arg`.
 
     # The receiver is evaluated before the arguments, and each once.
     # A loop body is emitted once: each pass evaluates the receiver once.

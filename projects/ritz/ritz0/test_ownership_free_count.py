@@ -120,6 +120,19 @@ impl Sink
 
 """
 
+# Callees taking a lent `Tracked`, for `@<call>` arguments (AGAST #3050).
+LENT = """\
+fn look(t: @Tracked) -> i32
+    return t.id
+
+fn set(t: @&Tracked)
+    t.id = 7
+
+fn both(t: @Tracked, n: i32) -> i32
+    return DROPS
+
+"""
+
 # Shapes a binding from a field can take (AGAST #2243).
 FIELDS = """\
 struct Pair
@@ -193,10 +206,6 @@ fn make_mixed(a: i32) -> (Tracked, i32)
 TUPLE_PTR_ELEM = {"ritz1": 3024, "ritz1_selfhosted": 3024}
 TUPLE_ALIAS = {"ritz1": 3030, "ritz1_selfhosted": 3030}
 TUPLE_TEMP_GAP = {"ritz1": 3031, "ritz1_selfhosted": 3031}
-
-# `@<call>` lent to a method: ritz0 crashes lowering it, ritz1 can't take
-# its address (AGAST #3050).
-LENT_TEMP_GAP = {"ritz0": 3050, "ritz1": 3050, "ritz1_selfhosted": 3050}
 
 # name -> (program body, expected exit status, {compiler: gap ticket}).
 # Where a helper returns `DROPS * 10`, the tens digit is the count at that
@@ -716,7 +725,67 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, LENT_TEMP_GAP),
+""", 1, {}),
+
+    # `@<call>` passed straight to a call lives until that call returns and
+    # drops then, not at the statement's end (AGAST #2518, #3050): the
+    # `DROPS` after the call already counts it.
+    "lent_temp_fn_arg": (LENT + """\
+fn f() -> i32
+    return look(@make(1)) * 10 + DROPS
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 111, {}),
+
+    "lent_temp_method_arg": (METHODS + LENT + """\
+fn f() -> i32
+    var s = Sink { n: 0 }
+    return s.look(@make(2)) * 10 + DROPS
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 211, {}),
+
+    # `@&`: the callee's write is what the drop sees (ORDER gets 7).
+    "lent_temp_mut_arg": (LENT + """\
+pub fn main() -> i32
+    set(@&make(1))
+    return ORDER * 10 + DROPS
+""", 71, {}),
+
+    # The inner call's temporary drops when the inner call returns, before
+    # the outer call runs (`both` sees DROPS 1); the outer's after it.
+    # The drop after the call adds blocks mid-expression: an `and`'s value,
+    # an `if` expression's arm and a loop condition still join right.
+    "lent_temp_in_and": (LENT + """\
+pub fn main() -> i32
+    let b = DROPS == 0 and look(@make(3)) == 3
+    if b
+        return 10 + DROPS
+    return DROPS
+""", 11, {}),
+
+    "lent_temp_in_if_expr": (LENT + """\
+pub fn main() -> i32
+    let c: i32 = 1
+    let v = if c == 1 then look(@make(3)) else 0
+    return v * 10 + DROPS
+""", 31, {}),
+
+    "lent_temp_in_while_cond": (LENT + """\
+pub fn main() -> i32
+    var i: i32 = 0
+    while i < 3 and look(@make(i)) >= 0
+        i = i + 1
+    return DROPS
+""", 3, {}),
+
+    "lent_temp_nested": (LENT + """\
+pub fn main() -> i32
+    let n = both(@make(1), look(@make(2)))
+    return n * 100 + ORDER
+""", 121, {}),
 
     "scope_end_let": ("""\
 fn f()

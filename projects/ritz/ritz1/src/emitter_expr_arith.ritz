@@ -12,6 +12,8 @@ import emitter_expr_access   # emit_whole_array_error (AGAST #2287)
 import emitter_stmt          # array_ptr_local (AGAST #2287)
 import bool_check   # AGAST #2342
 import emitter_expr_call   # method_call_def (AGAST #1635)
+import ref_check           # ref_temp_call (AGAST #3050)
+import ownership           # own_temp_slot_of, own_lend_temps (AGAST #3050)
 
 
 # The Option / Result `e` is, by its type, or as a constructor naming one; null.
@@ -1323,7 +1325,43 @@ fn slice_base_is_sliceable(s: *EmitterState, base: *Expr) -> i32
         return is_sliceable_name(fld.field_type_name, fld.field_type_name_len)
     return 0
 
+# AGAST #2518 / #3050: `@mk()` / `@&mk()` straight into a call's argument (the
+# only place ref_check lets one be): the struct the call returns, spilled to a
+# slot that lives until that call returns.  A move-only result is already in
+# the slot own_note_temp spilled it to, so the callee and the drop see one
+# value (own_lend_temps drops it when the call returns).  0 if `op` is no such call.
+fn emit_call_temp_ptr(s: *EmitterState, op: *Expr) -> i32
+    if op.kind != EXPR_CALL and op.kind != EXPR_METHOD
+        return 0
+    if ref_temp_call(s, op) != op
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    call_result_struct_name(s, op, @name, @len)
+    if len <= 0
+        return 0
+    let v: i32 = emit_expr(s, op)
+    let held: i32 = own_temp_slot_of(s, v)
+    if held > 0
+        return held
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, name, len)
+    emit_str(s, c"  ; #3050 lent temporary\n  store ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, name, len)
+    emit_str(s, c" ")
+    emit_reg(s, v)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot)
+    emit_str(s, c"\n")
+    slot
+
 fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
+    let call_temp: i32 = emit_call_temp_ptr(s, op)
+    if call_temp > 0
+        return call_temp
     # AGAST #2379: `a[i][j]` with `a: [N]*T` is `*(a[i] + j)` (#2332), so its
     # address is `a[i] + j`.  It was "cannot take address".
     if is_array_elem_index(s, op) == 1
@@ -2002,7 +2040,9 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c"\n")
             return result
     else if e.op == OP_ADDR
+        let lend_from: i32 = own_temp_mark(s)
         let addr_ptr: i32 = emit_lvalue_ptr(s, e.operand)
+        own_lend_temps(s, e.operand, lend_from)   # AGAST #3050
         if addr_ptr >= 0
             # `@expr` is an i64 in ritz1's value model.
             let result: i32 = next_reg(s)
@@ -2016,7 +2056,9 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
         return 0
     else if e.op == OP_ADDR_MUT
         # @&expr - mutable address-of, returns ptr type (not i64)
+        let lend_mut_from: i32 = own_temp_mark(s)
         let addr_mut_ptr: i32 = emit_lvalue_ptr(s, e.operand)
+        own_lend_temps(s, e.operand, lend_mut_from)   # AGAST #3050
         if addr_mut_ptr >= 0
             return addr_mut_ptr
         emit_ir_error(s, c"cannot take mutable address")

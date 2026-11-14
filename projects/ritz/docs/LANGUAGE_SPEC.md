@@ -3716,6 +3716,58 @@ fn main() -> i32
     c.n
 ```
 
+A call's by-value result is a temporary, not a place (LARB R9, AGAST #2518). It
+can be read: `mk().x`, `mk().n[1]`, and a method whose `self` is `@T` or by value.
+A store into it would be lost with it, so `mk().x = 1`, `mk().n[1] = 3`,
+`mk().x += 1`, and a method whose `self` is `@&T` or `:& T` (`mk().bump()`, the
+same store by its auto-borrow), are errors. A call returning `*T` gives the place it
+points at, which may be written.
+
+```ritz expect-error="a store into a call's temporary is lost: bind the call to a local first"
+struct Counter
+    n: i32
+
+fn make() -> Counter
+    Counter { n: 1 }
+
+fn main() -> i32
+    make().n = 2
+    0
+```
+
+`@` or `@&` of a temporary, or of a field or element in it, is allowed in one
+place: passed straight to a call as an argument, `look(@make())`. The temporary
+lives until that call returns and is dropped then (§13.6), so the reference never
+outlives it. Anywhere else (a `let`, a `return`, a field, a struct literal) the
+reference would outlive the statement, so it's an error: bind the call to a local
+first.
+
+```ritz
+struct Counter
+    n: i32
+
+fn make() -> Counter
+    Counter { n: 1 }
+
+fn look(c: @Counter) -> i32
+    c.n
+
+fn main() -> i32
+    look(@make()) - 1
+```
+
+```ritz expect-error="`@` of a call's temporary outlives it: bind the call to a local first, or pass it straight to a call"
+struct Counter
+    n: i32
+
+fn make() -> Counter
+    Counter { n: 1 }
+
+fn main() -> i32
+    let c: @Counter = @make()
+    c.n
+```
+
 ### 13.4 Mutable Borrowing
 
 `@&x` takes a mutable reference. In a parameter list, `name:& T` borrows the
@@ -4272,7 +4324,9 @@ the same way.
 A move-only value that no binding, parameter or field takes ownership of is
 a **temporary**. Examples are a call result used as a statement, one lent to
 an `@T` parameter, or one whose field is read (`make().id`). A temporary is
-dropped at the end of the statement that creates it. A `return` drops it
+dropped at the end of the statement that creates it, except one lent straight to
+a call, `look(@make())` (§13.3): it is dropped as soon as that call returns, so
+`look(@make(1)) + DROPS` already counts it. A `return` drops it
 after the return value has been evaluated. A temporary in an `if` or `while`
 condition is dropped once the condition has been evaluated, before the
 branch is taken.

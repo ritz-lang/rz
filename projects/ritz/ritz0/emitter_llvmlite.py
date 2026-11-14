@@ -52,6 +52,25 @@ class EmitError(Exception):
             super().__init__(message)
 
 
+class TempPlace(ValueError):
+    """A store or `@` reached a call's by-value result, which is no place
+    (AGAST #2518). A ValueError, so a route that only tries for an address
+    (an auto-borrow) still falls back; whoever asked for the place says
+    which error it is, at its own span. `call` is the call."""
+
+    def __init__(self, call: rast.Expr):
+        super().__init__("a call's by-value result is no place")
+        self.call = call
+
+
+def temp_root(expr: rast.Expr) -> Optional[rast.Expr]:
+    """The call at the root of `expr`'s field / index chain (`mk()` of
+    `mk().n[1].x`, or `expr` itself), if there is one. Not through `*`."""
+    while isinstance(expr, (rast.Field, rast.Index)):
+        expr = expr.expr
+    return expr if isinstance(expr, (rast.Call, rast.MethodCall)) else None
+
+
 def span_empty_needs_slot(method: str) -> str:
     """`Span.<method>()` in no slot that spells its T (AGAST #2296); ritz1
     prints the same text after `'Span.<method>' `."""
@@ -721,6 +740,14 @@ class LLVMEmitter:
         # statement being emitted (and per loop / `if` condition), each a
         # list of (slot, drop flag, ritz type). The frame drops at its end.
         self._temp_frames: List[List[Tuple[ir.AllocaInstr, ir.AllocaInstr, rast.Type]]] = []
+        # `@<call>` passed straight to a call (AGAST #3050): while its
+        # address is taken, the call's value is spilled to a slot rather
+        # than refused (TempPlace). One list per call being emitted: the
+        # slots lent to it, which drop as soon as it returns.
+        self._lending_temp = False
+        self._lent_temps: List[List[ir.AllocaInstr]] = []
+        # (id of the expr, slot) of the last temporary _own_temporary kept.
+        self._last_temp: Optional[Tuple[int, ir.AllocaInstr]] = None
         # Per open loop: len(_temp_frames) at the loop (see _loop_drop_depth).
         self._loop_temp_depth: List[int] = []
 
@@ -4498,6 +4525,7 @@ class LLVMEmitter:
         self.builder.store(ir.Constant(self.i1, 1), flag)
         self.drop_flags[id(slot)] = flag
         self._temp_frames[-1].append((slot, flag, ty))
+        self._last_temp = (id(expr), slot)
         return slot
 
     def _drop_temp_frame(self, frame) -> None:
@@ -5773,6 +5801,11 @@ class LLVMEmitter:
             if frame and self.builder.block is not None and not self.builder.block.is_terminated:
                 self._drop_temp_frame(frame)
             return result
+        except TempPlace as exc:
+            # `mk().x = 1`: the store is lost with the temporary (AGAST #2518).
+            if isinstance(stmt, rast.AssignStmt) and exc.call is temp_root(stmt.target):
+                raise EmitError(ref_rules.STORE_INTO_TEMP, stmt.target.span) from None
+            raise
         except TypeError as exc:
             # AGAST #1384. #1366 gave call-argument mismatches a location by
             # wrapping `_emit_call`; stores were never covered, and stores are
@@ -6486,7 +6519,9 @@ class LLVMEmitter:
                             return None
 
                 # Special handling for struct field that is an array (e.g., buf.data[0] = val)
-                if isinstance(stmt.target.expr, rast.Field):
+                # `mk().q[i] = v`, `q` a pointer: stored through, below (#2518).
+                if (isinstance(stmt.target.expr, rast.Field)
+                        and not self._through_temp_pointer(stmt.target.expr)):
                     field_addr = self._emit_lvalue_addr(stmt.target.expr)
                     if isinstance(field_addr.type, ir.PointerType):
                         pointee = field_addr.type.pointee
@@ -6563,7 +6598,11 @@ class LLVMEmitter:
                 # Otherwise, try to get its address. Struct storage (a local,
                 # global or field chain) is addressed directly: evaluating it
                 # as a value loads the whole struct (AGAST #1914).
-                struct_val = self._struct_place_addr(stmt.target.expr)
+                # `mk().p.f = v`, `p` a pointer: stored through it (#2518).
+                # Read `p` once, before any route tries for an address.
+                struct_val = (self._emit_expr(stmt.target.expr)
+                              if self._through_temp_pointer(stmt.target.expr)
+                              else self._struct_place_addr(stmt.target.expr))
                 # `m[k].f = x` on a struct's `[]`: the element `index_mut` gives
                 # (§7.8), never a read of it first.
                 place = (self._struct_index(stmt.target.expr, "m[k].f = x")
@@ -8543,7 +8582,7 @@ class LLVMEmitter:
                 raise ValueError(f"Unknown operator: {op}")
 
         elif isinstance(expr, rast.Call):
-            return self._emit_call(expr)
+            return self._emit_lending_call(expr, self._emit_call)
 
         elif isinstance(expr, rast.Index):
             return self._emit_index(expr)
@@ -8593,7 +8632,7 @@ class LLVMEmitter:
             return self._emit_match(expr)
 
         elif isinstance(expr, rast.MethodCall):
-            return self._emit_method_call(expr)
+            return self._emit_lending_call(expr, self._emit_method_call)
 
         elif isinstance(expr, rast.TryOp):
             return self._emit_try_op(expr)
@@ -10129,7 +10168,10 @@ class LLVMEmitter:
                         zero = ir.Constant(self.i32, 0)
                         return self.builder.gep(gvar, [zero, index])
             # Handle struct field that is an array (e.g., buf.data[0] = x)
-            if isinstance(expr.expr, rast.Field):
+            # `mk().q[i]`, `q` a pointer, is no element of the temporary: it
+            # takes the pointer route below (AGAST #2518).
+            if isinstance(expr.expr, rast.Field) and (
+                    rvalue_root or not self._through_temp_pointer(expr.expr)):
                 field_addr = self._emit_lvalue_addr(expr.expr, rvalue_root)
                 if isinstance(field_addr.type, ir.PointerType):
                     pointee = field_addr.type.pointee
@@ -10184,6 +10226,11 @@ class LLVMEmitter:
                     ptr_val, ptr_ty = self.params[name]
                     if isinstance(ptr_ty, ir.PointerType):
                         return self._field_addr(ptr_val, expr.field, 0)
+            if not rvalue_root and self._through_temp_pointer(expr.expr):
+                # `mk().p.a`, `p` a pointer: the place is what `p` points at,
+                # not in the temporary, so `p` is only read (AGAST #2518).
+                return self._field_addr(self._emit_lvalue_addr(expr.expr, True),
+                                        expr.field, 1)
             if isinstance(expr.expr, rast.Index) and self._index_use is None:
                 # `m[k].f = x` on a struct is a mutable use (§7.8).
                 self._index_use = "m[k].f = x"
@@ -10198,16 +10245,82 @@ class LLVMEmitter:
                 # A struct returned by value has none to store into (#2518).
                 base = self._emit_expr(expr.expr)
                 if not isinstance(base.type, ir.PointerType):
-                    raise ValueError(
-                        f"cannot store into field '{expr.field}' of a call's "
-                        f"by-value result")
+                    if not self._lending_temp:
+                        raise TempPlace(expr.expr)
+                    base = self._lend_temp_slot(expr.expr, base)
                 return self._field_addr(base, expr.field, 1)
             return self._field_addr(self._emit_lvalue_addr(expr.expr, rvalue_root),
                                     expr.field, 1)
         elif rvalue_root and isinstance(expr, (rast.Call, rast.MethodCall)):
             return self._spill_call_root(expr)
+        elif isinstance(expr, (rast.Call, rast.MethodCall)):
+            # A call's value: a store into it is lost, and an `@` of it
+            # outlives it unless it's lent to a call (AGAST #2518, #3050).
+            if not self._lending_temp:
+                raise TempPlace(expr)
+            val = self._emit_expr(expr)
+            if isinstance(val.type, ir.PointerType):
+                return val
+            return self._lend_temp_slot(expr, val)
         else:
             raise ValueError(f"Cannot get address of: {type(expr)}")
+
+    _ADDR_OPS_ALL = ('&', '@', '&mut', '@&')
+
+    def _through_temp_pointer(self, expr: rast.Expr) -> bool:
+        """`expr` is a field or element of a call's value (`mk().p`) that
+        holds a pointer or reference: a place behind it is no part of the
+        temporary, so a store or `@` there is fine (AGAST #2518)."""
+        if not isinstance(expr, (rast.Field, rast.Index)) or temp_root(expr) is None:
+            return False
+        return isinstance(self._infer_ritz_type(expr), (rast.PtrType, rast.RefType))
+
+    def _emit_lending_call(self, expr: rast.Expr, emit) -> ir.Value:
+        """`emit(expr)`, a call. An `@<call>` passed straight to it lends it
+        a temporary that drops as soon as it returns (AGAST #3050)."""
+        lends = False
+        for arg in expr.args:
+            if (isinstance(arg, rast.UnaryOp) and arg.op in self._ADDR_OPS_ALL
+                    and temp_root(arg.operand) is not None):
+                arg.lent_arg = True
+                lends = True
+        if not lends:
+            return emit(expr)
+        self._lent_temps.append([])
+        try:
+            val = emit(expr)
+        finally:
+            slots = self._lent_temps.pop()
+        self._drop_lent_temps(slots)
+        return val
+
+    def _lend_temp_slot(self, call: rast.Expr, val: ir.Value) -> ir.Value:
+        """The slot holding `val`, the value of `call`, for an `@<call>`
+        argument (AGAST #3050). A move-only value is lent from the slot its
+        drop reads, so what an `@&` callee writes is what drops, and that
+        slot drops as soon as the call it's lent to returns."""
+        last = self._last_temp
+        # The same node in another instantiation is another slot.
+        if (last is not None and last[0] == id(call)
+                and last[1].parent.parent is self.builder.function):
+            slot = last[1]
+            if self._lent_temps:
+                self._lent_temps[-1].append(slot)
+            return slot
+        slot = self._alloca_in_entry_block(val.type, "lent.tmp")
+        self.builder.store(val, slot)
+        return slot
+
+    def _drop_lent_temps(self, slots: List[ir.AllocaInstr]) -> None:
+        """Drop the temporaries lent to a call that has just returned, newest
+        first. Their flags clear, so their statement's end won't again."""
+        if not slots or self.builder.block is None or self.builder.block.is_terminated:
+            return
+        entries = {id(slot): (slot, ty) for frame in self._temp_frames
+                   for slot, _flag, ty in frame}
+        for slot in reversed(slots):
+            if id(slot) in entries:
+                self._emit_flagged_drop("tmp", slot, entries[id(slot)][1], clear_flag=True)
 
     def _spill_call_root(self, expr: rast.Expr) -> ir.Value:
         """A slot holding the value of the call `expr`, the root of a read
@@ -10566,6 +10679,15 @@ class LLVMEmitter:
 
         Returns the assigned value.
         """
+        try:
+            return self._emit_assign_expr_core(expr)
+        except TempPlace as exc:
+            if exc.call is temp_root(expr.target):     # AGAST #2518
+                raise EmitError(ref_rules.STORE_INTO_TEMP, expr.target.span) from None
+            raise
+
+    def _emit_assign_expr_core(self, expr: rast.AssignExpr) -> ir.Value:
+        """_emit_assign_expr, which locates a store into a call's value."""
         self._check_let_write(expr.target)
         # `self.field = Some(v)` must build the variant for the *target's*
         # enum, exactly as the AssignStmt path does — variant names are
@@ -11012,6 +11134,34 @@ class LLVMEmitter:
             raise EmitError(f"`{value}` does not fit in `{slot.name}`",
                             self._value_span(tail))
 
+    def _emit_addr_of_temp(self, expr: rast.UnaryOp) -> ir.Value:
+        """`@` / `@&` of a call's value, or of a field or element in it.
+        Passed straight to a call, it lends that call a temporary (AGAST
+        #3050); anywhere else it would outlive it (#2518). A call returning
+        `*R` gives the place it points at, which `@` may take anywhere."""
+        outer = self._lending_temp
+        self._lending_temp = getattr(expr, 'lent_arg', False)
+        try:
+            if isinstance(expr.operand, (rast.Call, rast.MethodCall)):
+                val = self._emit_expr(expr.operand)
+                if isinstance(val.type, ir.PointerType):
+                    return val      # as before: `@` of a pointer call is it
+                if not self._lending_temp:
+                    raise TempPlace(expr.operand)
+                return self._lend_temp_slot(expr.operand, val)
+            mutable = expr.op in ('&mut', '@&')
+            outer_use, outer_deref = self._index_use, self._deref_use_now
+            self._index_use = "@&m[k]" if mutable else "read"
+            self._deref_use_now = "addr_mut" if mutable else None
+            try:
+                return self._emit_lvalue_addr(expr.operand)
+            finally:
+                self._index_use, self._deref_use_now = outer_use, outer_deref
+        except TempPlace:
+            raise EmitError(ref_rules.ADDR_OF_TEMP, expr.span) from None
+        finally:
+            self._lending_temp = outer
+
     def _emit_unary(self, expr: rast.UnaryOp) -> ir.Value:
         """Emit a unary operation: -x, !x, *x, @x, @&x."""
         # Handle address-of operators: @, @&
@@ -11019,6 +11169,8 @@ class LLVMEmitter:
         # Legacy & and &mut are still accepted here for backward compat with existing AST
         # All map to the same LLVM IR: taking a pointer to the operand
         if expr.op in ('&', '@', '&mut', '@&'):
+            if temp_root(expr.operand) is not None:
+                return self._emit_addr_of_temp(expr)
             if expr.op in ('&mut', '@&'):
                 self._check_let_mut_borrow(expr.operand)
             if isinstance(expr.operand, (rast.Index, rast.Field)):
@@ -13372,6 +13524,18 @@ class LLVMEmitter:
             return self.builder.call(fn, converted_args)
 
         first_param_type = self._fn_param_types(fn)[0]
+
+        # `mk().bump()` with `self: @&T` / `self:& T` is a store into the
+        # call's temporary, lost with it (AGAST #2518, R1 exception 4).
+        self_param = fn_def.params[0]
+        if (isinstance(expr.expr, (rast.Call, rast.MethodCall))
+                and (getattr(self_param, 'borrow', None) == rast.Borrow.MUTABLE
+                     or (isinstance(self_param.type, rast.RefType) and self_param.type.mutable))):
+            probe = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
+            if not isinstance(probe.type, ir.PointerType):
+                raise EmitError(ref_rules.MUT_SELF_ON_TEMP, expr.expr.span)
+            if receiver_probe is None:
+                self._evaluated_once[id(expr.expr)] = probe
 
         # Determine whether to pass by value or by pointer (auto-borrow)
         # If method expects pointer and receiver is lvalue, get address

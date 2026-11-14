@@ -23,6 +23,7 @@ import subprocess
 import pytest
 
 import fast_link
+import ref_rules
 
 import test_ritz1_for_iterable as _for_iterable
 from test_ritz1_for_header import RITZ_START, _emit, _objects
@@ -203,18 +204,14 @@ def test_a_write_to_the_field_in_the_body_is_seen(run_with, compiler, op):
     assert run_with(compiler, f"live_field{op == '@&'}", program) == 53
 
 
-# A call's field has no address: ritz0 says "Cannot get address of: Call".
-# ritz1 refuses it before reaching the member, so the call isn't run for nothing.
+# A call's field has no address: `@` of it would outlive the call (AGAST #2518),
+# and ritz0 says so.  ritz1 refuses it before reaching the member, so the call
+# isn't run for nothing.
 _MK = "fn mk() -> O\n    var o: O\n    return o\n\n"
 _O = _h("i32") + "struct O\n    h: H\n\n"
 NOT_A_PLACE = {
     "field_of_a_call": _O + _MK + MAIN + _SUM.format(n="mk().h.a"),
     "field_of_a_call_mut": _O + _MK + MAIN + _SUM.format(n="mk().h.a").replace("@", "@&"),
-    # A pointer field of a call's result is a field of the call too, though it
-    # points at a place (#2870 lowers an index, not this).
-    "pointer_field_of_a_call": ("struct P\n    p: *H\n\n" + _h("i32")
-                                + "fn mk() -> P\n    var o: P\n    return o\n\n" + MAIN
-                                + _SUM.format(n="mk().p.a")),
     "direct_field_of_a_call":(_h("i32") + "fn mk() -> H\n    var h: H\n    return h\n\n" + MAIN
                                + _SUM.format(n="mk().a")),
     "method_field": (_O + "impl O\n    fn mk(self:&) -> O\n        return *self\n\n" + MAIN
@@ -228,10 +225,28 @@ NOT_A_PLACE = {
 @pytest.mark.parametrize("name", sorted(NOT_A_PLACE))
 def test_address_of_a_field_that_isnt_a_place_is_refused(compile_with, compiler, name):
     comp, ll, _ = compile_with(compiler, name, NOT_A_PLACE[name])
+    out = comp.stdout + comp.stderr
     assert comp.returncode != 0
     assert not ll.exists()
+    assert "Traceback" not in out, out[-2000:]
     if compiler != "ritz0":
-        assert "this `for` iterable is not supported in ritz1" in comp.stdout + comp.stderr
+        assert "this `for` iterable is not supported in ritz1" in out
+    elif name != "scalar_field":
+        assert ref_rules.ADDR_OF_TEMP in out, out[-2000:]
+
+
+# A pointer field of a call's result points at a place that isn't the
+# temporary's (AGAST #2518), so its `@` is no `@` of a temporary.  ritz0 walks
+# it; ritz1 refuses the iterable before reaching the member (AGAST #3207).
+POINTER_FIELD_OF_A_CALL = ("struct P\n    p: *H\n\n" + _h("i32")
+                           + "fn mk() -> P\n    var o: P\n    o.p = @g\n    return o\n\n"
+                           + "var g: H\n\n" + MAIN + _fill("g.a", (1, 2, 4))
+                           + _SUM.format(n="mk().p.a"))
+
+
+@pytest.mark.integration
+def test_ritz0_walks_a_pointer_field_of_a_call(run_with):
+    assert run_with("ritz0", "pointer_field_of_a_call", POINTER_FIELD_OF_A_CALL) == 7
 
 
 # ritzlib's Vec, with its real header, borrowed and walked through `@w`.  It links

@@ -60,3 +60,17 @@ def returns_local(name: str) -> str:
 # for `@&x` of one, since both ask for the same thing.
 def let_into_mut(name: str) -> str:
     return f"cannot borrow `let` binding `{name}` as mutable; declare it `var`"
+
+
+# A call's by-value result is no place (LARB R9, Aaron's ruling on AGAST #2518):
+# a store into it is lost when the statement ends. `mk().x = 1`, `mk().n[1] = 3`,
+# `mk().x += 1`.
+STORE_INTO_TEMP = "a store into a call's temporary is lost: bind the call to a local first"
+
+# `mk().bump()` with `self: @&T` or `self:& T`: R1 exception 4's auto-ref makes
+# it the same store. A read-only method (`mk().get()`) is a read and stays.
+MUT_SELF_ON_TEMP = "a method that writes `self` can't take a call's temporary: bind the call to a local first"
+
+# `@mk()`, `@&mk()`, `@mk().f`, `@mk().n[1]` anywhere but directly as a call's
+# argument, where the temporary lives until that call returns (AGAST #2518, #3050).
+ADDR_OF_TEMP = "`@` of a call's temporary outlives it: bind the call to a local first, or pass it straight to a call"
