@@ -196,3 +196,98 @@ def test_mangled_names(compile_with, compiler):
     # ritz0 qualifies a struct by module: `%"struct.ritz_module_1.Box$arr2_i8"`.
     structs = set(re.findall(r'%"?(?:struct\.[\w.]+\.)?(Box\$[^" ]*)"? = type', ir))
     assert structs == {"Box$arr2_i8", "Box$arr4_i64"}
+
+
+# AGAST #3101: a generic call's `-> T` at T = `*[N]E` / `@&[N]E` reaching an
+# un-annotated let.  The let lost the array pointee: `p[1]` silently read 0,
+# `(*p)[1]` failed at clang, and `p` passed into a `:&` T param was refused.
+# Each program returns 5 (a2 returns 3) on success.
+def _let_of_generic(body, extra=""):
+    return (
+        "fn id<T>(v: T) -> T\n    v\n\n"
+        f"{extra}"
+        "pub fn main() -> i32\n"
+        "    var a: [2]i32 = [4, 5]\n"
+        f"{body}"
+    )
+
+
+UNANNOTATED = {
+    # a1: index the un-annotated pointer.
+    "ptr_index": (_let_of_generic("    let p = id<*[2]i32>(@a)\n    return p[1]\n"), 5),
+    "ref_index": (_let_of_generic("    let p = id<@&[2]i32>(@&a)\n    return p[1]\n"), 5),
+    # a6: deref then index.
+    "ptr_deref_index": (
+        _let_of_generic("    let p = id<*[2]i32>(@a)\n    return (*p)[1]\n"),
+        5,
+    ),
+    # Element width other than i32: an i64 read at the i32 stride would be wrong.
+    "ptr_index_i64": (
+        "fn id<T>(v: T) -> T\n    v\n\n"
+        "pub fn main() -> i32\n"
+        "    var a: [3]i64 = [4, 5, 6]\n"
+        "    let p = id<*[3]i64>(@a)\n"
+        "    return p[2] as i32\n",
+        6,
+    ),
+    # A struct element: `p[1].b` is element 1's field at the struct stride.
+    "ptr_index_struct": (
+        "struct P\n    a: i64\n    b: i64\n\n"
+        "fn id<T>(v: T) -> T\n    v\n\n"
+        "pub fn main() -> i32\n"
+        "    var a: [2]P\n"
+        "    a[1].b = 7\n"
+        "    let p = id<*[2]P>(@a)\n"
+        "    return p[1].b as i32\n",
+        7,
+    ),
+    # `@&[2]i32`: a write through `p[0]` lands in `a`; `(*p)[1]` reads it.
+    "ref_store_deref": (
+        _let_of_generic(
+            "    let p = id<@&[2]i32>(@&a)\n    p[0] = 9\n    return (*p)[1] + a[0]\n"
+        ),
+        14,
+    ),
+    # a2: a `*[2]i32` place into a `:&` T param at T = `*[2]i32`.
+    "lent_ptr_param": (
+        "fn w<T>(r:& T, v: T)\n    r = v\n\n"
+        "pub fn main() -> i32\n"
+        "    var a: [2]i32 = [1, 2]\n"
+        "    var b: [2]i32 = [3, 4]\n"
+        "    var p: *[2]i32 = @a\n"
+        "    w<*[2]i32>(p, @b)\n"
+        "    return p[0]\n",
+        3,
+    ),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(UNANNOTATED))
+def test_unannotated_let_of_generic_array_pointer(run_with, compiler, name):
+    """`let p = id<*[2]i32>(@a)` keeps its array pointee for `p[i]` / `(*p)[i]`."""
+    src, want = UNANNOTATED[name]
+    assert run_with(compiler, name, src) == want
+
+
+# The `*[2]i32` a `:&` T param borrows at T = `*[2]i32` is that array pointer:
+# a `*[3]i32` place is refused, as ritz0 refuses `[3 x i32]**`.
+LENT_MISFIT = (
+    "fn w<T>(r:& T, v: T)\n    r = v\n\n"
+    "pub fn main() -> i32\n"
+    "    var a: [3]i32 = [1, 2, 3]\n"
+    "    var b: [2]i32 = [3, 4]\n"
+    "    var p: *[3]i32 = @a\n"
+    "    w<*[2]i32>(p, @b)\n"
+    "    return p[0]\n"
+)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_lent_ptr_param_refuses_another_array(compile_with, compiler):
+    """`w<*[2]i32>(p, @b)` with `p: *[3]i32` is refused on every compiler."""
+    comp, _, _ = compile_with(compiler, "lent_misfit", LENT_MISFIT)
+    assert comp.returncode != 0
+    assert "argument 1 of `w` has the wrong type" in comp.stdout + comp.stderr

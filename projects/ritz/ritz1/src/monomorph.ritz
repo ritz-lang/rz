@@ -2441,7 +2441,48 @@ fn specialize_fn_one_param(m: *Module, template: *FnDef, type_param_name: *u8, t
                 specialized.return_type_name = subst_type_name
                 specialized.return_type_name_len = subst_type_len
 
+    # AGAST #3101: a bare `-> T` at T = `*[N]E` / `@&[N]E` returns that array
+    # pointer, recorded as a written `-> *[N]E` is, so `let p = id<*[2]i32>(@a)`
+    # knows N and E.  It was a `*arr2_i32` struct pointer: `p[1]` read 0, SILENT.
+    if specialized.ret_ptr_array == null and template.return_type == TYPE_STRUCT and subst_type == TYPE_PTR
+        if name_is_type_param(template.return_type_name, template.return_type_name_len, type_param_name, type_param_len) == 1
+            specialized.ret_ptr_array = ptr_array_arg_param(subst_type_name, subst_type_len)
+
     return specialized
+
+# AGAST #3101: `param` points at the array a type argument spelled `arrN_E`
+# names (N, E, E's pointee and name), as a written `*[N]E` would; unchanged
+# when `name` spells no array.
+fn param_take_ptr_array_arg(param: *Param, name: *u8, len: i32)
+    let pa: *Param = ptr_array_arg_param(name, len)
+    if pa == null
+        return
+    param.param_pointee_array_size = pa.param_pointee_array_size
+    param.param_pointee_array_elem_type = pa.param_pointee_array_elem_type
+    param.param_pointee_array_elem_pointee = pa.param_pointee_array_elem_pointee
+    param.param_pointee_array_shape = null
+    param.param_type_name = pa.param_type_name
+    param.param_type_name_len = pa.param_type_name_len
+
+fn name_is_type_param(name: *u8, len: i32, tp: *u8, tp_len: i32) -> i32
+    (name != null and len == tp_len and memcmp(name, tp, tp_len as i64) == 0) as i32
+
+# AGAST #3101: the `*[N]E` a type argument spelled `arrN_E` points at, as a
+# Param ptr_array_of_last would record (N, E, E's pointee and name); null when
+# `name` spells no array.
+fn ptr_array_arg_param(name: *u8, len: i32) -> *Param
+    var arr: ArrayArg
+    if array_arg_decode(name, len, @arr) == 0
+        return null
+    let pa: *Param = calloc(1, sizeof(Param)) as *Param
+    pa.param_type = TYPE_PTR
+    pa.param_pointee_type = TYPE_ARRAY
+    pa.param_pointee_array_size = arr.size
+    pa.param_pointee_array_elem_type = arr.elem
+    pa.param_pointee_array_elem_pointee = arr.pointee
+    pa.param_type_name = arr.name
+    pa.param_type_name_len = arr.name_len
+    pa
 
 # `sh` with a leaf `T` substituted (AGAST #2290).  Shapes are shared, so a change
 # is a copy.
@@ -2480,6 +2521,10 @@ fn set_ref_ptr_pointee(param: *Param, pointee: i32)
 fn ptr_arg_pointee(name: *u8, len: i32) -> i32
     if len > 4 and memcmp(name, c"ptr_", 4) == 0
         return TYPE_PTR
+    # AGAST #3101: `*[N]E` points at an array, not a struct named `arrN_E`.
+    var arr: ArrayArg
+    if array_arg_decode(name, len, @arr) == 1
+        return TYPE_ARRAY
     let prim: i32 = primitive_type_from_name(name, len)
     if prim != 0
         return prim
@@ -2541,6 +2586,7 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
             if subst_type == TYPE_PTR and suffix_is_mut_ref(suffix, suffix_len) == 1 and pointee != TYPE_PTR
                 cloned.param_type = TYPE_MUT_REF
                 cloned.param_pointee_type = pointee
+                param_take_ptr_array_arg(cloned, subst_name, subst_len)   # AGAST #3101: `@&[N]E`
         else
             # AGAST #2418: a by-value `o: Option<T>` / `r: Result<T, E>` /
             # `p: Pair<T>` is named "Option$T" etc.  It kept that name, so
@@ -2581,6 +2627,9 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
                     # bound as its referent, and `r = v` overwrote its own slot.
                     if subst_type == TYPE_PTR
                         set_ref_ptr_pointee(cloned, ptr_arg_pointee(subst_name, subst_len))
+                        # AGAST #3101: and `r:& T` at T = `*[N]E` borrows a
+                        # `*[N]E`, bound as #3103 binds a written `r:& *[N]E`.
+                        param_take_ptr_array_arg(cloned, subst_name, subst_len)
                 cloned.param_type_name = subst_name
                 cloned.param_type_name_len = subst_len
                 # AGAST #2832: a bare `c:& T` / `*T` at T = `[2]f64` points at
