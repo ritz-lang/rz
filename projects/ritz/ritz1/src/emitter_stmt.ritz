@@ -1059,19 +1059,27 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     # AGAST #2266: `var a = [t, u]` of struct T is `[2]T`, as annotated.  It
     # was an i64 slot, and its elements were stored as i64 (invalid IR).
     # AGAST #2976: so is `let a = [c; 3]`, `[3]C` (array_fill_struct_elem).
+    # AGAST #3014: and a scalar element, at ritz0's type for the first one
+    # (array_init_elem): `[5, 6, 7]` is `[3]i64`, `[x; 4]` with `x: u8` is
+    # `[4]u8`.  A scalar kept the i64 slot, which held the address of
+    # emit_expr's shadow `[N x i64]`, so `a[2]` silently read garbage.
     if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_declared_type == TYPE_VOID and stmt.var_init != null and (stmt.var_init.kind == EXPR_ARRAY_LIT or stmt.var_init.kind == EXPR_ARRAY_FILL)
         var ael_name: *u8 = null
         var ael_len: i32 = 0
+        let ael_ty: i32 = array_init_elem(s, stmt.var_init, @ael_name, @ael_len)
         var ael_n: i32 = 0
         if stmt.var_init.kind == EXPR_ARRAY_FILL
-            ael_n = array_fill_struct_elem(s, stmt.var_init, @ael_name, @ael_len)
+            ael_n = stmt.var_init.int_val as i32
         else
-            ael_n = array_lit_struct_elem(s, stmt.var_init, @ael_name, @ael_len)
-        if ael_n > 0
+            var ael_it: *Expr = stmt.var_init.args
+            while ael_it != null
+                ael_n += 1
+                ael_it = ael_it.next
+        if ael_ty != TYPE_VOID and ael_n > 0
             var_type = TYPE_ARRAY
             stmt.var_type = TYPE_ARRAY
             stmt.var_array_size = ael_n
-            stmt.var_array_elem_type = TYPE_STRUCT
+            stmt.var_array_elem_type = ael_ty
             stmt.var_type_name = ael_name
             stmt.var_type_name_len = ael_len
 
@@ -3293,10 +3301,21 @@ fn for_array_ptr(s: *EmitterState, loc: *LocalVar, elem: *i32, size: *i32, name:
 
 # AGAST #2410: the element type of the literal `e`, from its first element as
 # ritz0 has it: a struct, a bool, a float or an integer.  TYPE_VOID for any other.
-fn for_literal_elem(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32) -> i32
+# AGAST #3014: a fill `[v; N]` too, from `v`.  emit_var_decl types an
+# unannotated `let a = [5, 6, 7]` / `[5; 3]` with it.
+fn array_init_elem(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32) -> i32
+    if e.kind == EXPR_ARRAY_FILL
+        if array_fill_struct_elem(s, e, name, name_len) > 0
+            return TYPE_STRUCT
+        return scalar_elem_kind(s, e.left)
     if array_lit_struct_elem(s, e, name, name_len) > 0
         return TYPE_STRUCT
-    let first: *Expr = e.args
+    scalar_elem_kind(s, e.args)
+
+# The scalar type ritz0 gives an array whose first element is `first`: an
+# untyped int literal is i64, a typed value keeps its width.  TYPE_VOID for a
+# pointer, a string or anything else not a bool, float or integer.
+fn scalar_elem_kind(s: *EmitterState, first: *Expr) -> i32
     if first == null
         return TYPE_VOID
     let k: i32 = bool_kind(s, first)
@@ -3317,7 +3336,7 @@ fn for_literal_elem(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32) -> i
 # hoist_entry_allocas takes out of any enclosing loop; 0 for a literal ritz1
 # can't type.
 fn emit_for_literal(s: *EmitterState, e: *Expr, elem: *i32, size: *i32, name: **u8, name_len: *i32) -> i32
-    let t: i32 = for_literal_elem(s, e, name, name_len)
+    let t: i32 = array_init_elem(s, e, name, name_len)
     if t == TYPE_VOID
         return 0
     var n: i32 = 0

@@ -270,13 +270,14 @@ ELEMENTS = {
     "big_fill_field": ("struct H\n    b: [100]u8\n\nfn f() -> i32\n    var h: H = H { b: [3; 100] }\n"
                        "    h.b[99] as i32 - 3\n"),
     "short_literal": "fn f() -> i32\n    var b: [4]u8 = [1, 2]\n    b[1] as i32 - 2\n",
-    "option_payload": "fn f() -> i32\n    var o: Option<[2]u8> = Some([0, 3])\n    0\n",
-    "enum_payload": "enum Pay\n    V([2]u8)\n    N\n\nfn f() -> i32\n    var e: Pay = V([0, 3])\n    0\n",
 }
 
 # The same, on ritz0: ritz1 has no initializer for a multi-dimensional array
-# (#2098) and no tuple type.
+# (#2098) and no tuple type, and refuses an array payload (#3029:
+# test_ritz1_untyped_scalar_array_let.py's NO_SLOT).
 ELEMENTS_RITZ0 = {
+    "option_payload": "fn f() -> i32\n    var o: Option<[2]u8> = Some([0, 3])\n    0\n",
+    "enum_payload": "enum Pay\n    V([2]u8)\n    N\n\nfn f() -> i32\n    var e: Pay = V([0, 3])\n    0\n",
     "nested_literal": "fn f() -> i32\n    var b: [2][2]u8 = [ [1, 2], [0, 3] ]\n    b[1][1] as i32 - 3\n",
     "nested_fill": "fn f() -> i32\n    var b: [2][2]u8 = [ [3; 2]; 2]\n    b[1][1] as i32 - 3\n",
     "nested_assign": "fn f() -> i32\n    var b: [2][2]u8\n    b = [ [1, 2], [0, 3] ]\n    b[1][1] as i32 - 3\n",
