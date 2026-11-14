@@ -29,7 +29,8 @@ class ConstEvaluator:
     - Char and bool literals, `as` casts (the value is kept; the target's
       own type governs its use), parenthesized expressions
 
-    `/` and `%` truncate toward zero, as the generated sdiv/srem do.
+    `/` and `%` truncate toward zero, as the generated sdiv/srem do; they and
+    the ordering compares are unsigned over a u64 operand (`_is_u64`).
     """
 
     def __init__(self, constants: Optional[Dict[str, int]] = None,
@@ -112,6 +113,12 @@ class ConstEvaluator:
             right = self.evaluate(expr.right)
 
             op = expr.op
+            # `/`, `%` and the ordering compares are unsigned when an operand
+            # is a u64, which a fold may hold in its signed form (#3062).
+            if op in ('/', '%', '<', '<=', '>', '>=') and (
+                    self._is_u64(expr.left) or self._is_u64(expr.right)):
+                left &= (1 << 64) - 1
+                right &= (1 << 64) - 1
             if op == '+':
                 return left + right
             elif op == '-':
