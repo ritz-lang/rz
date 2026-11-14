@@ -86,7 +86,7 @@ PAYLOADS = {
     "user_variant": (_U + _body("let o = Some(Holds(5))", "match o", "    Some(v) =>",
                                 "        match v", "            Holds(w) => w",
                                 "            Vacant => 3", "    _ => 2"), 5),
-    # A nested constructor is its own enum's (#2435). Not on ritz0 yet (#3045).
+    # A nested constructor is its own enum's (#2435, ritz0 #3045).
     "nested_some": (_body("let o = Some(Some(5))", "match o", "    Some(v) =>",
                           "        match v", "            Some(w) => w as i32",
                           "            _ => 3", "    _ => 2"), 5),
@@ -306,7 +306,7 @@ USERS.update({
 })
 
 ON_RITZ0 = sorted(BOUND) + ["i32_local", "passed_to_a_fn", "returned_as_the_fns_enum",
-                            "none_returned_as_the_fns_enum"]
+                            "none_returned_as_the_fns_enum", "nested_some", "nested_ok"]
 
 
 def _ritz1(request, compiler, tmp_path, source):

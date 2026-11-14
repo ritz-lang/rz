@@ -177,9 +177,7 @@ NON_ENUM_SLOT = {
 }
 
 # An Err("abc") needs its own Result registered on ritz0 (#2433).
-RITZ0_OWN_BUGS = {"if_err_names_its_own_payload",
-                  # An untyped nested constructor: an i64 slot on ritz0 (#3045).
-                  "arm_nested_some", "err_arm_nested_ok"}
+RITZ0_OWN_BUGS = {"if_err_names_its_own_payload"}
 ON_RITZ0 = sorted(set(RUNS) - RITZ0_OWN_BUGS)
 
 

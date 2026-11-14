@@ -6083,11 +6083,14 @@ class LLVMEmitter:
                 ty = self._ritz_type_to_llvm(stmt.type)
                 self.ritz_types[stmt.name] = stmt.type  # Store Ritz type for signedness
             elif stmt.value:
-                # Infer from value - emit first to get LLVM type
-                val = self._emit_expr(stmt.value)
+                # Infer from value - emit first to get LLVM type. A nested
+                # constructor names its enum, as the untyped let's (#3045).
+                nested_type = self._untyped_nested_ctor_type(stmt.value)
+                val = self._emit_expr_with_expected_enum(
+                    stmt.value, self._let_annotation_enum(nested_type))
                 ty = val.type
                 # Also infer Ritz type for Drop tracking
-                inferred_ritz_type = self._infer_ritz_type(stmt.value, val)
+                inferred_ritz_type = nested_type or self._infer_ritz_type(stmt.value, val)
                 if inferred_ritz_type:
                     ritz_type = inferred_ritz_type
                     self.ritz_types[stmt.name] = ritz_type
@@ -6190,6 +6193,7 @@ class LLVMEmitter:
         elif isinstance(stmt, rast.LetStmt):
             if self._emit_large_let_lit(stmt):
                 return None
+            nested_type = None
             # Handle String literal inference: "hello" -> string_from("hello")
             if (stmt.type and isinstance(stmt.type, rast.NamedType)
                 and stmt.type.name == 'String'
@@ -6217,6 +6221,12 @@ class LLVMEmitter:
                 # to its specialization and emit through the expected-enum
                 # path, which also threads it into if / match / block tails.
                 let_enum = self._let_annotation_enum(stmt.type)
+                # AGAST #3045: an untyped `let o = Some(Some(5))` has no
+                # annotation, so the nesting names the enum.
+                nested_type = (self._untyped_nested_ctor_type(stmt.value)
+                               if stmt.type is None else None)
+                if nested_type is not None:
+                    let_enum = self._let_annotation_enum(nested_type)
                 saved_float = self._enter_float_tails(stmt.type, stmt.value)
                 try:
                     val = self._emit_expr_with_expected_enum(stmt.value, let_enum)
@@ -6240,7 +6250,7 @@ class LLVMEmitter:
                 self._register_let_drop(stmt.name, val, stmt.type)
             else:
                 # Infer Ritz type from expression for signedness tracking
-                inferred_ritz_type = self._infer_ritz_type(stmt.value, val)
+                inferred_ritz_type = nested_type or self._infer_ritz_type(stmt.value, val)
                 self._bind_let(stmt.name, val, val.type)
                 if inferred_ritz_type:
                     self.ritz_types[stmt.name] = inferred_ritz_type
@@ -14640,6 +14650,59 @@ class LLVMEmitter:
                 return None
             type_args[slot] = payload
         return rast.NamedType(span, base, type_args)
+
+    def _builtin_ctor_parts(self, expr: rast.Expr) -> Optional[tuple]:
+        """(name, payload or None) of a bare builtin constructor, else None.
+
+        `Some(x)` -> ('Some', x), `None` -> ('None', None). A name a user enum
+        declares is that enum's (_bare_variant_enum), so it is no builtin here.
+        """
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            name, payload = expr.func.name, (expr.args[0] if len(expr.args) == 1 else None)
+        elif isinstance(expr, rast.Ident):
+            name, payload = expr.name, None
+        else:
+            return None
+        if name not in self._BUILTIN_CTORS or self.variant_declarers.get(name):
+            return None
+        return name, payload
+
+    def _untyped_nested_ctor_type(self, value: rast.Expr) -> Optional[rast.NamedType]:
+        """The enum an untyped `let` / `var` binds when a constructor nests one.
+
+        `let o = Some(Some(5))` is `Option<Option<i64>>`, and the arms of
+        `if c then Ok(1) else Err(Ok(5))` build `Result<i64, Result<i64, i64>>`:
+        each type argument from the first constructor whose payload gives it
+        (_bare_ctor_type, ritz1's #2419 / #2435 rule), i64 where none does.
+        With no enum the outer constructor took whichever Option the module
+        registered last, and its `Option$i64` payload met that enum's i64 slot
+        (AGAST #3045). None, leaving the initialiser as it was, unless some
+        tail is a builtin constructor wrapping another, every tail is a
+        builtin constructor of one family, and each payload is inferable.
+        """
+        tails = list(value_tails(value))
+        parts = [self._builtin_ctor_parts(tail) for tail in tails]
+        if not any(p is not None and p[1] is not None
+                   and self._builtin_ctor_parts(p[1]) is not None for p in parts):
+            return None
+        if any(p is None for p in parts):
+            return None
+        base = self._BUILTIN_CTORS[parts[0][0]][0]
+        type_args: List[Optional[rast.Type]] = [None] * (2 if base == 'Result' else 1)
+        for tail, (name, _) in zip(tails, parts):
+            family, slot = self._BUILTIN_CTORS[name]
+            if family != base:
+                return None
+            ty = self._bare_ctor_type(tail)
+            if ty is None:
+                return None
+            if slot is not None and type_args[slot] is None:
+                type_args[slot] = ty.args[slot]
+        span = getattr(value, 'span', None)
+        return rast.NamedType(span, base, [
+            arg if arg is not None else rast.NamedType(span, 'i64', []) for arg in type_args])
 
     def _emit_bare_ctor_scrutinee(self, expr: rast.Match) -> Optional[tuple]:
         """Build `match Some(5)`'s scrutinee as the enum _bare_ctor_type names.
