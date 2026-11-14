@@ -964,6 +964,11 @@ fn match_scrutinee_type(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *
         if fld != null and fld.field_type == TYPE_STRUCT
             *out_name = fld.field_type_name
             *out_len = fld.field_type_name_len
+    else if scr.kind == EXPR_CAST and scr.op == TYPE_STRUCT and scr.ident_len > 0
+        # AGAST #2503: `x as B` is a B.  Untyped, the arms guessed the enum,
+        # and an `A` declaring the first arm's `V` too judged B's arms as A's.
+        *out_name = scr.ident_ptr
+        *out_len = scr.ident_len
 
 # 1 when `scr` is certainly no enum, so a bare name in an arm is a binding or a
 # const.  Anything this cannot prove stays open: see match_arms_enum.
@@ -999,21 +1004,78 @@ fn enum_declares_variant(ei: i32, name: *u8, len: i32) -> i32
             return 1
     0
 
-# The enum an arm names, for a scrutinee no rule above could type, or -1.  ritz0
-# reads the type off the emitted value and ritz1 cannot, so this is what keeps
-# `R` in `match x as C` from binding: that took the first arm, and looked like a
-# catch-all to coverage.  A scalar scrutinee keeps its bindings.
-fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
+# The first arm that names a user enum's variant, for a scrutinee no rule above
+# could type, or null.  A scalar scrutinee keeps its bindings.
+fn match_arms_enum_arm(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> *MatchArm
     if match_scrutinee_is_scalar(s, scr) == 1
-        return 0 - 1
+        return null
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_VARIANT or arm.pattern_kind == PAT_IDENT
-            for ei in 0..enum_count()
-                if enum_declares_variant(ei, arm.pattern_name, arm.pattern_name_len) == 1
-                    return ei
+            if user_enum_declares(arm.pattern_name, arm.pattern_name_len) == 1
+                return arm
         arm = arm.next
+    null
+
+# 1 when enum `ei` is one the source declares (no `G$i32` instance, whose
+# template is recorded too) and it declares `name`.
+fn declared_enum_has_variant(ei: i32, name: *u8, len: i32) -> i32
+    var nlen: i32 = 0
+    let ename: *u8 = enum_name_at(ei, @nlen)
+    for i in 0..nlen
+        if *(ename + i) == '$'
+            return 0
+    enum_declares_variant(ei, name, len)
+
+# How many enums the source declares `name` in.
+fn user_enums_declaring(name: *u8, len: i32) -> i32
+    var n: i32 = 0
+    for ei in 0..enum_count()
+        n = n + declared_enum_has_variant(ei, name, len)
+    n
+
+# The enum an arm names, for a scrutinee no rule above could type, or -1.  ritz0
+# reads the type off the emitted value and ritz1 cannot, so this is what keeps
+# `R` in `match x as C` from binding: that took the first arm, and looked like a
+# catch-all to coverage.  AGAST #2503: only when one enum declares that name.
+# Of two, the first was taken, and judged the other's arms as its own
+# (match_refuse_ambiguous_arms refuses that match instead).
+fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
+    let arm: *MatchArm = match_arms_enum_arm(s, scr, arms)
+    if arm == null or user_enums_declaring(arm.pattern_name, arm.pattern_name_len) != 1
+        return 0 - 1
+    for ei in 0..enum_count()
+        if enum_declares_variant(ei, arm.pattern_name, arm.pattern_name_len) == 1
+            return ei
     0 - 1
+
+# AGAST #2503: 1, and a located error, when the arms are all that could name
+# the scrutinee's enum and two or more enums declare the name they give.
+fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
+    let arm: *MatchArm = match_arms_enum_arm(s, scr, arms)
+    if arm == null or user_enums_declaring(arm.pattern_name, arm.pattern_name_len) < 2
+        return 0
+    eprints_cstr(fn_source_file(emitter_current_fn()))
+    eprint_char(':')
+    eprint_i64(arm.head_span.line as i64)
+    eprint_char(':')
+    eprint_i64(arm.head_span.col as i64)
+    eprints_cstr(c": error: cannot tell which enum ")
+    eprint_bytes(arm.pattern_name, arm.pattern_name_len)
+    eprints_cstr(c" is of: ")
+    var seen: i32 = 0
+    for ei in 0..enum_count()
+        if declared_enum_has_variant(ei, arm.pattern_name, arm.pattern_name_len) == 1
+            if seen > 0
+                eprints_cstr(c", ")
+            var nlen: i32 = 0
+            let ename: *u8 = enum_name_at(ei, @nlen)
+            eprint_bytes(ename, nlen)
+            seen = seen + 1
+    eprints_cstr(c" declare it, and ritz1 can't type the scrutinee; bind it to a typed local first\n")
+    emit_str(s, c"  ; ERROR: a match's enum is ambiguous\n")
+    s.error_count = s.error_count + 1
+    1
 
 # --- A bare constructor as the scrutinee (AGAST #2419) -----------------------
 #
@@ -1702,6 +1764,9 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     # AGAST #2419: never the zero a constructor with no enum lowers to.
     if is_enum == 0 and is_tagged_ctor(s, typed) == 1
         emit_ctor_type_error(s, typed)
+        return 0
+    # AGAST #2503: no guess between two enums that declare an arm's name.
+    if is_enum == 0 and match_refuse_ambiguous_arms(s, typed, arms) == 1
         return 0
     match_check_coverage(s, typed, arms, enum_name, enum_name_len, (resolved == MATCH_ENUM_FROM_ARMS) as i32, span.line, span.col)
     # AGAST #2344: an enum element or global is a place too.  emit_expr reads

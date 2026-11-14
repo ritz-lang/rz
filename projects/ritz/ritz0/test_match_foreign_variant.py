@@ -40,7 +40,8 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 _MAIN = "fn main() -> i32\n"
 _AB = "enum A\n    X(i32)\n    Y\nenum B\n    Z(i32)\n    W\n"   # 6 lines
-_LET_A = "    let a: A = A.X(5)\n"
+_AB2 = "enum A\n    V\n    P\nenum B\n    V\n    Q(i32)\n"  # both declare V (#2503)
+_LET_A ="    let a: A = A.X(5)\n"
 _LET_O = "    let o: Option<i64> = Some(5)\n"
 
 
@@ -207,14 +208,74 @@ def test_a_name_reuse_comes_first(request, tmp_path, compiler):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
 def test_ritz1_judges_arms_only_by_the_scrutinees_enum(request, tmp_path, compiler):
-    """An enum ritz1 guessed from an arm is no judge of the arms.
+    """`n as B` is a B, so its arms are judged as B's (AGAST #2503).
 
-    ritz1 can't type `n as B`, so it takes the enum the first arm names: `V` is
-    A's too, and A's is found first.  That guess must not call B's `Q` foreign.
-    ritz0 refuses the cast itself, so this one is ritz1's alone.
+    ritz1 couldn't type the cast and took the enum the first arm names: `V` is
+    A's too, and A's was found first, so the match was "missing P".  ritz0
+    crashes on the cast itself, so this one is ritz1's alone.
     """
-    source = ("enum A\n    V\n    P\nenum B\n    V\n    Q(i32)\n" + _MAIN
+    source = (_AB2 + _MAIN
               + "    let n: i32 = 1\n    match n as B\n        V => 1\n        Q(x) => 5\n")
     proc, _ = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert "Unknown variant" not in out, out[-1500:]
+    assert "missing P" not in out, out[-1500:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_ritz1_types_a_cast_scrutinee_by_its_target(request, tmp_path, compiler):
+    """A match on `n as B` that leaves out `Q` is missing B's `Q`, not A's `P`."""
+    source = _AB2 + _MAIN + "    let n: i32 = 1\n    match n as B\n        V => 1\n"
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out[-1500:]
+    message = "non-exhaustive match: missing Q"
+    assert len(_located(compiler, out, 9, 5, message)) == 1, out[-1500:]
+    assert not ll.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_ritz1_refuses_an_arm_two_enums_declare_on_an_untyped_scrutinee(request, tmp_path, compiler):
+    """ritz1 can't type an `if` scrutinee, and `V` is A's and B's: refused, at the arm.
+
+    It took A's, the first declared, and judged B's arms by it.  ritz0 types the
+    value and runs this; ritz1 refused it before too, as "missing P".
+    """
+    source = (_AB2 + _MAIN + "    let b: B = B.Q(4)\n    let c: B = B.V\n"
+              "    match (if true then b else c)\n        V => 1\n        Q(x) => x\n")
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out[-1500:]
+    message = "cannot tell which enum V is of: A, B declare it"
+    assert re.search(rf"unit\.ritz:11:9: error: {re.escape(message)}", out, re.M), out[-1500:]
+    assert message in _first(out), out[-1500:]
+    assert not ll.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_ritz1_counts_a_generic_enum_and_its_instance_as_one(request, tmp_path, compiler):
+    """`G` and the `G$i32` ritz1 records for it are one enum: no ambiguity."""
+    source = ("enum G<T>\n    Hold(T)\n    Gone\n" + _MAIN + "    let b: G<i32> = Hold(4)\n"
+              "    let c: G<i32> = Gone\n    match (if true then b else c)\n"
+              "        Hold(x) => x\n        Gone => 1\n")
+    proc, _ = _compile(request, compiler, tmp_path, source)
+    assert "cannot tell which enum" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_arm_one_enum_declares_still_names_an_untyped_scrutinees_enum(request, tmp_path, compiler):
+    """`Q` is B's alone, so the first arm still names B: the match runs."""
+    source = (_AB2 + _MAIN + "    let b: B = B.Q(4)\n    let c: B = B.V\n"
+              "    match (if true then b else c)\n        Q(x) => x\n        V => 1\n")
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-1500:]
+    exe = tmp_path / "unit"
+    link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
+    if compiler != "ritz0":
+        link.insert(3, str(RITZ_START))
+    fast_link.clang(link, check=True)
+    assert subprocess.run([str(exe)], timeout=60).returncode == 4, compiler
