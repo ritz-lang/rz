@@ -19,8 +19,9 @@ initializer, and gives anything else a located error instead of a zero.
 
 Every runnable program returns 3 when the global held the right value at
 startup and something else otherwise; ritz0 is run as the oracle.  Storage
-width is left as ritz1 already had it (narrow ints, bool and floats live in an
-i64 slot), so the IR-shape tests pin the initializer in that storage type.
+width is left as ritz1 already had it (narrow ints and floats live in an i64
+slot; a bool is an i1 since AGAST #3001), so the IR-shape tests pin the
+initializer in that storage type.
 """
 
 import os
@@ -223,8 +224,9 @@ IR_FORMS = {
     "i32": ("var g: i32 = 5\n", "i32 5"),
     "i64_wide": ("var g: i64 = 7777777777\n", "i64 7777777777"),
     "i32_negative": ("var g: i32 = -1\n", "i32 -1"),
-    "bool_true": ("var g: bool = true\n", "i64 1"),
-    "bool_false": ("var g: bool = false\n", "i64 0"),
+    # A bool is the one i1 byte every access is (AGAST #3001).
+    "bool_true": ("var g: bool = true\n", "i1 1"),
+    "bool_false": ("var g: bool = false\n", "i1 0"),
     "u8": ("var g: u8 = 200\n", "i64 200"),
     "bit_not": ("var g: i32 = ~0\n", "i32 -1"),
     "f64": ("var g: f64 = 1.5\n", "i64 bitcast (double 1.5 to i64)"),

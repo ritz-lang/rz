@@ -286,6 +286,18 @@ ACCEPTED = {
     "bool_array": ("fn main() -> i32\n    var a: [2]bool = [false, true]\n"
                    "    if a[1] and not a[0]\n        return 3\n    0\n", 3),
     "bool_const": ("const C: bool = true\nfn main() -> i32\n    if C\n        return 3\n    0\n", 3),
+    # AGAST #3001: a `bool` global is one i1 byte, as on ritz0, and reads as the
+    # i64 every bool value is; ritz1 stored the i64 as i1 and handed `not`, `and`,
+    # a cast and a by-value arg the raw i1 load.
+    "bool_global": (("var g: bool\nfn main() -> i32\n    g = false\n    g = not g\n"
+                     "    if g\n        return 3\n    0\n"), 3),
+    "bool_global_operands": (("var g: bool\nvar h: bool\nfn main() -> i32\n    g = true\n"
+                              "    h = g and not h\n    if g and h and (h or g) and g == h\n"
+                              "        return 3\n    0\n"), 3),
+    "bool_global_cast": ("var g: bool\nfn main() -> i32\n    g = 2 > 1\n    (g as i32) * 3\n", 3),
+    "bool_global_value": (("var g: bool\nfn f(b: bool) -> i32\n    if b\n        return 3\n    0\n"
+                           "fn y() -> bool\n    g\nfn main() -> i32\n    g = true\n"
+                           "    let b: bool = y()\n    if b\n        return f(g)\n    0\n"), 3),
     "bool_method": (_S + "impl S\n    fn ok(self) -> bool\n        self.b\n"
                     "fn main() -> i32\n    let s: S = S { b: true, n: 1 }\n"
                     "    if s.ok()\n        return 3\n    0\n", 3),
@@ -401,6 +413,20 @@ def _assert_runs(request, compiler, tmp_path, name, source, code, extra=None):
 @pytest.mark.parametrize("name", sorted(ACCEPTED))
 def test_bool_used_as_bool_compiles_and_runs(request, tmp_path, compiler, name):
     _assert_runs(request, compiler, tmp_path, name, *ACCEPTED[name])
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_bool_global_is_one_byte(request, tmp_path, compiler):
+    """AGAST #3001: `@g` is the i1 every access is, as ritz0 lays it out.
+
+    ritz1 declared it an i64 slot; opaque pointers let that run, so only the
+    declaration shows it.
+    """
+    proc, ll = _compile(request, compiler, tmp_path, "var g: bool\n" + _MAIN)
+    assert proc.returncode == 0 and ll.exists(), (proc.stdout + proc.stderr)[-1500:]
+    decl = re.search(r'^@"?g"? = .*$', ll.read_text(), re.MULTILINE)
+    assert decl and re.search(r"\bglobal i1\b", decl.group(0)), decl and decl.group(0)
 
 
 @pytest.mark.integration

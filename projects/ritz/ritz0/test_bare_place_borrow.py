@@ -114,8 +114,8 @@ def _table() -> dict:
 
 
 TABLE = _table()
-# ritz1's own `bool` global, not the borrow: `g = false` is invalid IR there.
-TABLE_GAPS = {"bool_global": "AGAST #3001: ritz1 stores a `bool` global's i64 value as i1"}
+# name -> AGAST ticket, for a row ritz1 can't run yet (strict xfail).
+TABLE_GAPS = {}
 
 # The same borrow through each way of calling.
 INT_WRITER = "fn w(r:& i32)\n    r = 3\n\n"
