@@ -558,6 +558,20 @@ fn infer_struct_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
     stmt.var_type_name_len = len
     1
 
+# AGAST #2525, #3188: `let n: i32 = *q` with `q: *S` declares an integer and
+# loads the `%S`.  ritz1 refused only `i64` (in the inference block above, which
+# no other type reaches): `u8`, `i32` and the rest put the `%S` where clang
+# wanted an integer, unlocated.  Refused at the init for every integer type.
+fn deref_struct_int_let_refused(s: *EmitterState, stmt: *Stmt)
+    let e: *Expr = stmt.var_init
+    if int_prim_bits(stmt.var_declared_type) == 0 or e == null or e.kind != EXPR_UNARY or e.op != OP_DEREF or e.operand == null
+        return
+    var name: *u8 = null
+    var len: i32 = 0
+    deref_pointee_struct_name(s, e.operand, @name, @len)
+    if len > 0 and find_struct(s, name, len) != null
+        emit_nd_error(s, e.span.line, e.span.col, whole_struct_value_message())
+
 # AGAST #2377: `let c = a[i][j]` with `a: [N]*S` is a copy of that S, as
 # `let c: S = a[i][j]` and `let c = *a[i]` (#2542) are.  The slot stayed i64
 # with no name, so `c.q` was "unhandled EXPR_MEMBER".  emit_expr loads the
@@ -568,7 +582,10 @@ fn infer_struct_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
 # AGAST #3053: so is `let n: i64 = a[i][j]` with `a: [N]*S`.  emit_expr put the
 # `%S` load in the i64 slot: a clang error, unlocated.
 fn infer_ptr_index_let(s: *EmitterState, stmt: *Stmt) -> i32
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0
+    # AGAST #3188: a declared `let n: <int> = p[i]` / `a[i][j]` is refused at the
+    # load, as any integer slot is (whole_struct_elem_refused); only an untyped
+    # let is a copy to type here.
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_declared_type != TYPE_VOID
         return 0
     let e: *Expr = stmt.var_init
     if e == null or e.kind != EXPR_INDEX or e.left == null or e.right == null or e.right.kind == EXPR_RANGE
@@ -580,10 +597,6 @@ fn infer_ptr_index_let(s: *EmitterState, stmt: *Stmt) -> i32
     else if e.left.kind == EXPR_INDEX
         deref_pointee_struct_name(s, e.left, @name, @len)
     if name == null or len <= 0
-        return 0
-    if stmt.var_declared_type != TYPE_VOID
-        if find_struct(s, name, len) != null
-            emit_nd_error(s, e.span.line, e.span.col, whole_struct_value_message())
         return 0
     stmt.var_type = TYPE_STRUCT
     stmt.var_type_name = name
@@ -1828,14 +1841,13 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                 var dr_name: *u8 = null
                 var dr_len: i32 = 0
                 deref_pointee_struct_name(s, stmt.var_init.operand, @dr_name, @dr_len)
-                if stmt.var_declared_type != TYPE_VOID and dr_len > 0 and find_struct(s, dr_name, dr_len) != null
-                    emit_nd_error(s, stmt.var_init.span.line, stmt.var_init.span.col, whole_struct_value_message())
-                else if stmt.var_declared_type == TYPE_VOID and dr_name != null and dr_len > 0
+                if stmt.var_declared_type == TYPE_VOID and dr_name != null and dr_len > 0
                     var_type = TYPE_STRUCT
                     stmt.var_type = TYPE_STRUCT
                     stmt.var_type_name = dr_name
                     stmt.var_type_name_len = dr_len
 
+    deref_struct_int_let_refused(s, stmt)   # #2525, #3188: `let n: i32 = *q`
     if infer_ref_to_pointer_let(s, stmt) == 1
         var_type = stmt.var_type
     if infer_ref_to_scalar_let(s, stmt) == 1

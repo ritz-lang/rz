@@ -746,3 +746,53 @@ def test_struct_read_through_a_pointer_is_not_an_integer(compile_with, form, com
     message, col = NOT_AN_INTEGER[compiler.removesuffix("_selfhosted")]
     _refused_at(compile_with, compiler, f"{form}_as_i64", program, message,
                 f"{main.count(chr(10)) + 1}:{col}")
+
+
+# AGAST #3188: nor is it any narrower integer.  ritz1 refused only the i64 lets;
+# `let n: i32 = p[0]` and the other two loaded the `%S` into the i32 and clang
+# refused the IR, unlocated.  ritz0 refuses each at the `let`, ritz1 at the init.
+NARROW_LETS = {
+    "pointer_index": "    let n: i32 = p[0]\n",
+    "deref_element": "    let n: u8 = *a[0]\n",
+    "element_index": "    let n: i32 = a[1][1]\n",
+}
+_COPY_LINE = _COPY_MAIN.count("\n") + 1
+
+
+def _not_an_integer(compile_with, compiler, name, program, col):
+    """Refused, located on `_COPY_LINE`; ritz1 at `col`, in its own words."""
+    comp, _, _ = compile_with(compiler, name, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} took {name}"
+    assert "Traceback" not in out and "expected 'i64'" not in out, out[-1500:]
+    if compiler == "ritz0":
+        assert f"main.ritz:{_COPY_LINE}:" in out, out[-1500:]
+    else:
+        assert "a whole struct is not a value here in ritz1" in out, out[-1500:]
+        assert f"main.ritz:{_COPY_LINE}:{col}:" in out, out[-1500:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NARROW_LETS))
+def test_struct_pointee_is_not_a_narrow_integer(compile_with, name, compiler):
+    program = _COPY_MAIN + NARROW_LETS[name] + "    return 0\n"
+    col = NARROW_LETS[name].index("= ") + 3
+    _not_an_integer(compile_with, compiler, f"narrow_{name}", program, col)
+
+
+# ... nor a number in any other slot: `p[i]` and `a[i][j]` are refused at the
+# load, as a `[N]S` element is, so `return`, `+ 1` and `as i32` are too.  `*a[0]`
+# has its own refusal in each (test_struct_deref_value.py).
+INDEX_SLOTS = {"returned": ("    return {}\n", 12), "added": ("    return {} + 1\n", 12),
+               "cast": ("    return {} as i32\n", 12)}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", ["p[0]", "a[1][1]"])
+@pytest.mark.parametrize("slot", sorted(INDEX_SLOTS))
+def test_struct_pointee_index_is_not_a_number(compile_with, slot, form, compiler):
+    body, col = INDEX_SLOTS[slot]
+    program = _COPY_MAIN + body.format(form)
+    _not_an_integer(compile_with, compiler, f"slot_{slot}_{form[0]}", program, col)
