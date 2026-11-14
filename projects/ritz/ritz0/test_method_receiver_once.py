@@ -172,7 +172,7 @@ fn ms() -> Span<u8>
 # missing is something else, so each row cites its own ticket.
 BOTH_RITZ1 = ("ritz1", "ritz1_selfhosted")
 NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
-NO_DYN_RETURN = {c: 2298 for c in BOTH_RITZ1}
+NO_DYN = {c: 1620 for c in BOTH_RITZ1}  # ritz1 refuses `dyn` (#2298)
 
 ARRAY = "var arr: [2]P = [P { x: 1 }, P { x: 2 }]\n    "
 NESTED = "var arr: [2]W = [W { p: P { x: 1 } }, W { p: P { x: 2 } }]\n    "
@@ -255,7 +255,7 @@ pub fn main() -> i32
     var held = P { x: 7 }
     let r = md(@held).say()
     return MADE * 10 + r
-""", 17, NO_DYN_RETURN),
+""", 17, NO_DYN),
 
     # `make(1).bump()` and `t.again().bump()` wrote a temporary, and its drop
     # saw the write (AGAST #2262).  Both are refused since AGAST #2518: the

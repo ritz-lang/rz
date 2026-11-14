@@ -245,7 +245,8 @@ REJECTED = {
         "            return 1\n", 2),
 }
 
-# ritz1's grammar has no `dyn`, so its differential does not read this table.
+# ritz1 refuses `dyn` at the `dyn` (#2298) until #1620 decides it, so its
+# differential does not read this table.
 REJECTED_RITZ0_ONLY = {
     "dyn_method_call_to_a_procedure": (
         _TRAIT + "fn f(b: *dyn T) -> i64\n"

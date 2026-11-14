@@ -266,7 +266,8 @@ REJECTED = {
         "    return f<C>(c) as i32\n", "t", 9),
 }
 
-# ritz1 has no `dyn` (test_fn_tail_requires_value.py keeps the same split).
+# ritz1 refuses `dyn` at the `dyn` (#2298) until #1620 decides it
+# (test_fn_tail_requires_value.py keeps the same split).
 REJECTED_RITZ0_ONLY = {
     "dyn_method_call": (
         _TRAIT + "fn f(x: *dyn T) -> i64\n"
