@@ -507,6 +507,16 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    remove `~/.config/adele/rooms/ritz-task-<id>`, `.claude/host-budget.sh
    --remove ritz-task-<id>`, `git worktree remove`, `git branch -D`,
    `git push origin --delete ritz-task-<id>`).
+   **Archive every MERGED room on the server** (Aaron, 2026-11-14), local
+   or remote, in one call once the train has landed:
+   ```bash
+   .claude/skills/rz-iterate/archive-rooms.py ritz-task-2593 ritz-task-1844 ...
+   ```
+   It prints `ARCHIVED <room>` per room (history kept; `unarchive_room`
+   reverses it). Do the same for a ticket closed by a REAP `none`. To catch
+   up on rooms that were missed, run `archive-rooms.py --from-git 400`
+   (dry run; add `--apply`). It reads the `ritz-task-<id>:` subjects on
+   `main` and archives only rooms whose ticket is `completed`.
    **Remote room:** send `TEARDOWN ritz-task-<id> merged=<main sha12>` to its
    host room instead of the local steps, and still delete the branch on
    GitHub here. Spell out in the message that the commit was cherry-picked,
