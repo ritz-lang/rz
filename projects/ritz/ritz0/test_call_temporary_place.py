@@ -4,6 +4,7 @@
     mk().n[1] = 3               ritz0: ValueError traceback; ritz1: compiled, write lost
     let p: *i32 = @mk().n[1]    ritz0: the same; ritz1: compiled, a dangling pointer
     look(@mk())                 ritz0: "arg mismatch %R* != %R"; ritz1: "cannot take address"
+    suma(@mka())                ritz0: 6; ritz1: "1 unlowerable expression(s)" (#3214)
 
 Aaron's ruling (#2518, LARB review 4 "The three settled answers"):
 
@@ -85,12 +86,33 @@ fn raw(p: *i32) -> i32
 fn two(a: @R, b: i32) -> i32
     return a.n[2] + b
 
+fn mka() -> [3]i32
+    calls = calls + 1
+    var a: [3]i32 = [1, 2, 3]
+    return a
+
+fn suma(a: @[3]i32) -> i32
+    return a[0] + a[1] + a[2]
+
+# 320 bytes: returned through sret (SRET_MIN_BYTES, #3181).
+fn mkbig() -> [40]i64
+    calls = calls + 1
+    var a: [40]i64
+    a[0] = 5
+    a[39] = 7
+    return a
+
+fn ends(a: @[40]i64) -> i64
+    return a[0] + a[39]
+
 struct Sink
     k: i32
 
 impl Sink
     fn see(self: @Sink, r: @R) -> i32
         return r.x + self.k
+    fn seea(self: @Sink, a: @[3]i32) -> i32
+        return a[2] + self.k
 
 """
 
@@ -167,6 +189,10 @@ RUNS = {
     "arg_with_others": "if two(@mk(), 3) != 33\n    return 1",
     "arg_nested": "if two(@mk(), look(@mk())) != 31\n    return 1",
     "arg_in_let": "let v = look(@mk()) + at(@mk().n[0])\nif v != 11\n    return 1",
+    # An array result is lent the same way (#3214).
+    "arg_array": "if suma(@mka()) != 6\n    return 1",
+    "arg_array_sret": "if ends(@mkbig()) != 12\n    return 1",
+    "arg_array_of_method": "var s = Sink { k: 100 }\nif s.seea(@mka()) != 103\n    return 1",
     # A `*R` result is a place: stores and `@` land in `gr` (#2879).
     "pointer_store": "mkp().x = 7\nif gr.x != 7\n    return 1",
     "pointer_addr": "let p: *i32 = @mkp().n[1]\n*p = 8\nif gr.n[1] != 8\n    return 1",
