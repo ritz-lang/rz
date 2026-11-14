@@ -8205,8 +8205,10 @@ class LLVMEmitter:
                 if (left.type != right.type
                         and isinstance(left.type, ir.IntType)
                         and isinstance(right.type, ir.IntType)):
-                    left_unsigned = self._infer_unsigned_expr(expr.left)
-                    right_unsigned = self._infer_unsigned_expr(expr.right)
+                    # An operator expression has its operands' type, so a u8
+                    # `a ^ z` widens with zext (#2361).
+                    left_unsigned = self._int_shape(expr.left, left.type.width < 64)[1]
+                    right_unsigned = self._int_shape(expr.right, right.type.width < 64)[1]
 
                     if left.type.width < right.type.width:
                         # Use zext for i1 (boolean) or unsigned types
@@ -8285,14 +8287,14 @@ class LLVMEmitter:
                 if is_float:
                     return self.builder.fdiv(left, right)
                 # Use unsigned division for unsigned types
-                if self._infer_unsigned_expr(expr.left) or self._infer_unsigned_expr(expr.right):
+                if self._operands_unsigned(expr, left):
                     return self.builder.udiv(left, right)
                 return self.builder.sdiv(left, right)
             elif op == '%':
                 if is_float:
                     return self.builder.frem(left, right)
                 # Use unsigned remainder for unsigned types
-                if self._infer_unsigned_expr(expr.left) or self._infer_unsigned_expr(expr.right):
+                if self._operands_unsigned(expr, left):
                     return self.builder.urem(left, right)
                 return self.builder.srem(left, right)
             elif op == '==':
@@ -8317,25 +8319,25 @@ class LLVMEmitter:
                 if is_float:
                     return self.builder.fcmp_ordered('<', left, right)
                 # Use unsigned comparison for unsigned types
-                if self._infer_unsigned_expr(expr.left) or self._infer_unsigned_expr(expr.right):
+                if self._operands_unsigned(expr, left):
                     return self.builder.icmp_unsigned('<', left, right)
                 return self.builder.icmp_signed('<', left, right)
             elif op == '<=':
                 if is_float:
                     return self.builder.fcmp_ordered('<=', left, right)
-                if self._infer_unsigned_expr(expr.left) or self._infer_unsigned_expr(expr.right):
+                if self._operands_unsigned(expr, left):
                     return self.builder.icmp_unsigned('<=', left, right)
                 return self.builder.icmp_signed('<=', left, right)
             elif op == '>':
                 if is_float:
                     return self.builder.fcmp_ordered('>', left, right)
-                if self._infer_unsigned_expr(expr.left) or self._infer_unsigned_expr(expr.right):
+                if self._operands_unsigned(expr, left):
                     return self.builder.icmp_unsigned('>', left, right)
                 return self.builder.icmp_signed('>', left, right)
             elif op == '>=':
                 if is_float:
                     return self.builder.fcmp_ordered('>=', left, right)
-                if self._infer_unsigned_expr(expr.left) or self._infer_unsigned_expr(expr.right):
+                if self._operands_unsigned(expr, left):
                     return self.builder.icmp_unsigned('>=', left, right)
                 return self.builder.icmp_signed('>=', left, right)
             elif op == '&':
@@ -14125,7 +14127,8 @@ class LLVMEmitter:
         return False
 
     def _int_shape(self, expr: rast.Expr, narrowed: bool) -> Tuple[int, bool]:
-        """`(bits, unsigned)` of integer expression `expr`, for `>>` (#2356).
+        """`(bits, unsigned)` of integer expression `expr`, for `>>` (#2356) and
+        for `/`, `%` and the ordered compares (#2361).
 
         _infer_unsigned_expr has no arm for an operator, so `(h ^ x) >> 33` on a
         u64 sign-filled. The wider operand wins, at equal width the unsigned one
@@ -14160,6 +14163,16 @@ class LLVMEmitter:
         name = ty.name if isinstance(ty, rast.NamedType) else None
         unsigned = self._is_unsigned_type(ty) or self._infer_unsigned_expr(expr)
         return self._INT_TYPE_WIDTHS.get(name, 64), unsigned
+
+    def _operands_unsigned(self, expr: rast.BinOp, left: ir.Value) -> bool:
+        """Do `/`, `%` and `<` `<=` `>` `>=` take their unsigned form? They do
+        when either operand is unsigned, by _int_shape's rule (#2361), so an
+        operator expression has its operands' type: `(a ^ z) > 1` on a u64 is
+        unsigned. `left` is the operand as emitted, both sides at its width,
+        or a pointer for a pointer compare."""
+        narrowed = isinstance(left.type, ir.IntType) and left.type.width < 64
+        return (self._int_shape(expr.left, narrowed)[1]
+                or self._int_shape(expr.right, narrowed)[1])
 
     def _infer_unsigned_expr(self, expr: rast.Expr) -> bool:
         """Check if an expression produces an unsigned integer type.

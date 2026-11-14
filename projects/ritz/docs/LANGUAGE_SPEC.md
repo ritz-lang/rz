@@ -1647,6 +1647,22 @@ let gt = a > b
 let ge = a >= b
 ```
 
+`/`, `%`, `<`, `<=`, `>` and `>=` are unsigned when either operand is unsigned,
+and signed otherwise. An operand that is itself an expression has the type of its
+operands, by the rule `>>` uses (§7.4): the wider operand wins, and at equal
+width the unsigned one does. A literal is an `i64` unless only a `u64` holds it.
+A narrow operand is a value of its type, so with `s: u8 = 7`, `~s` is `248` here
+too:
+
+```ritz body
+let a: u64 = 0xFFFFFFFFFFFFFFF8
+let z: u64 = 0
+let s: u8 = 7
+let big = (a ^ z) > 1      # true: `a ^ z` is a u64
+let half = (a ^ z) / 2     # 9223372036854775804
+let third = (~s) / 3       # 82
+```
+
 ### 7.3 Logical
 
 ```ritz body

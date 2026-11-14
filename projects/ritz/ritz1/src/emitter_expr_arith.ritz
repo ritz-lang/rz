@@ -363,8 +363,6 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # The float result stays as `float`/`double` (no widening to i64) so
     # the surrounding emit-llvm-type knows what shape to write.  ritz0 uses
     # the same pattern via NamedType("f32")/("f64") string-name dispatch.
-    let lty: i32 = get_expr_type(s, e.left)
-    let rty: i32 = get_expr_type(s, e.right)
     let fty_t: i32 = binop_float_width(s, e)
     if fty_t != 0
         # AGAST #1965: coerce each float operand to the op's width -- fptrunc
@@ -424,17 +422,26 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # integer is held in an i64; u8/u16/u32 are zero-extended into it, so they
     # are never negative there and the signed ops already agree.  A u64 with
     # the top bit set is negative as an i64, so `sgt`/`sdiv`/`srem` got it
-    # wrong.  Like ritz0's _infer_unsigned_expr, either operand being u64 is
-    # enough (`a > 1` with `a: u64`).
+    # wrong.  Like ritz0, either operand being u64 is enough (`a > 1` with
+    # `a: u64`).  AGAST #2361: int_operand_shape says which is, as for `>>`, so
+    # `(a ^ z) > 1`, `K[0] / 2` and `s.get() % 10` are a u64's too, and a narrow
+    # operand is brought back to its type first: `~s` on a u8 is 248, not -8.
     var uns: i32 = 0
-    if lty == TYPE_U64 or rty == TYPE_U64
-        uns = 1
+    if e.op == OP_DIV or e.op == OP_MOD or e.op == OP_LT or e.op == OP_GT or e.op == OP_LE or e.op == OP_GE
+        var lu: i32 = 0
+        var ru: i32 = 0
+        let lb: i32 = int_operand_shape(s, e.left, @lu)
+        let rb: i32 = int_operand_shape(s, e.right, @ru)
+        left_reg = emit_narrow_operand(s, e.left, left_reg, lb, lu)
+        scaled_right = emit_narrow_operand(s, e.right, scaled_right, rb, ru)
+        if (lb == 64 and lu == 1) or (rb == 64 and ru == 1)
+            uns = 1
 
     # AGAST #2356: `>>` follows the left operand alone, never the count.
     var shr_uns: i32 = 0
     if e.op == OP_SHR
         let shr_bits: i32 = int_operand_shape(s, e.left, @shr_uns)
-        left_reg = emit_shr_operand(s, e.left, left_reg, shr_bits, shr_uns)
+        left_reg = emit_narrow_operand(s, e.left, left_reg, shr_bits, shr_uns)
 
     # AGAST #1869: a failing `assert a OP b` prints the two operands, as the
     # i64s this compare reads (not a re-evaluation; see emit_assert_stmt).
@@ -671,9 +678,10 @@ fn is_int_arith_op(op: i32) -> i32
 
 # AGAST #2356: a register holds an i64, so `a + a` or `~a` on a u8 can sit outside
 # the u8's range, and the bits a `>>` brings down would be ones the type does not
-# have.  Bring such a value back to its type.  Only an operator can leave the
+# have.  Bring such a value back to its type.  `/`, `%` and the ordered compares
+# read the whole register too (#2361).  Only an operator can leave the
 # range: a name, load, call or cast is already extended from its width.
-fn emit_shr_operand(s: *EmitterState, e: *Expr, reg: i32, bits: i32, uns: i32) -> i32
+fn emit_narrow_operand(s: *EmitterState, e: *Expr, reg: i32, bits: i32, uns: i32) -> i32
     if bits >= 64
         return reg
     if e.kind != EXPR_BINARY and e.kind != EXPR_UNARY
