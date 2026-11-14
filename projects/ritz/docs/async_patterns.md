@@ -80,21 +80,18 @@ struct IoReadState
 ```
 
 ### Step 2: Poll Function
-**IMPORTANT**: Must check `waker_io_result` BEFORE submitting new I/O!
+`runtime_poll_read` submits the read and returns Pending; once `block_on` has
+seen the completion, the next call returns its result, whatever the value (0 at
+EOF included). Do not read `rt.waker_io_result` yourself: before AGAST #2328 the
+examples did, and a result of 0 looked like "none yet".
 
 ```ritz
 fn poll_io_read(state: *IoReadState) -> i32
     let rt: *Runtime = state.rt
-
-    # Check if we already have a result from io_uring completion
-    if rt.waker_io_result != 0
-        let res: i32 = rt.waker_io_result
-        rt.waker_io_result = 0
-        state.result = res
-        return res
-
-    # Submit async read to io_uring
-    return runtime_poll_read(rt, state.fd, state.buf, state.len, 0)
+    let result: i32 = runtime_poll_read(rt, state.fd, state.buf, state.len, 0)
+    if result != POLL_PENDING or rt.waker_active == 0
+        state.result = result
+    return result
 ```
 
 ### Step 3: Async Wrapper

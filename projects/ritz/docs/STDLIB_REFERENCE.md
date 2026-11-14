@@ -1545,8 +1545,15 @@ struct Runtime
     next_user_data: i64
     waker_user_data: i64
     waker_io_result: i32
+    waker_io_ready: i32
     waker_active: i32
+    took_pending_code: i32
 ```
+
+`waker_io_ready`, not the value of `waker_io_result`, says whether a completion
+is waiting, so a read at EOF returns 0 rather than being resubmitted. A poll
+function that returns an -EPERM result it was handed is Ready(-1): `block_on`
+returns -1 instead of reading it as Pending (AGAST #2328).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|

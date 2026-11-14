@@ -44,8 +44,15 @@ struct Runtime
     next_user_data: i64
     # The operation the current future is suspended on
     waker_user_data: i64
+    # Its result, valid only while waker_io_ready is set.  0 (EOF) and -1
+    # (-EPERM) are results like any other, so the flag says whether there is
+    # one, not the value (AGAST #2328; tasks.ritz's TASK_IO_FRESH is the same).
     waker_io_result: i32
+    waker_io_ready: i32
     waker_active: i32
+    # Set when the result just taken was -1, which a poll function returns
+    # as-is and block_on would otherwise read as POLL_PENDING
+    took_pending_code: i32
 
 # Initialize the runtime with an io_uring instance
 # Returns 0 on success, negative error code on failure
@@ -54,7 +61,9 @@ pub fn runtime_init(rt: *Runtime) -> i32
     rt.next_user_data = 1
     rt.waker_user_data = 0
     rt.waker_io_result = 0
+    rt.waker_io_ready = 0
     rt.waker_active = 0
+    rt.took_pending_code = 0
 
     # Initialize io_uring with 256 entries (good default)
     let ret: i32 = uring_init(@rt.ring, 256)
@@ -170,6 +179,9 @@ pub fn runtime_waker_clear(rt: *Runtime)
 fn runtime_take_io_result(rt: *Runtime) -> i32
     let result: i32 = rt.waker_io_result
     rt.waker_io_result = 0
+    rt.waker_io_ready = 0
+    if result == POLL_PENDING
+        rt.took_pending_code = 1
     return result
 
 # Queue a prepared SQE, suspend the future on it, and return Pending
@@ -184,12 +196,11 @@ fn runtime_suspend_on(rt: *Runtime, user_data: i64) -> i32
 #
 # Call one from a poll function and return what it returns.  The first call
 # submits the operation and returns POLL_PENDING; once block_on has seen the
-# completion, the next call returns the result.
-#
-# A result of 0 cannot be told from "no result yet" (AGAST #2328).
+# completion, the next call returns the result, whatever its value: 0 at EOF,
+# or -1 for -EPERM, which block_on returns rather than read as Pending.
 
 pub fn runtime_poll_read(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32
-    if rt.waker_io_result != 0
+    if rt.waker_io_ready != 0
         return runtime_take_io_result(rt)
 
     let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
@@ -202,7 +213,7 @@ pub fn runtime_poll_read(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64)
     return runtime_suspend_on(rt, user_data)
 
 pub fn runtime_poll_write(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32
-    if rt.waker_io_result != 0
+    if rt.waker_io_ready != 0
         return runtime_take_io_result(rt)
 
     let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
@@ -239,6 +250,7 @@ pub fn runtime_wait_for_io(rt: *Runtime) -> i32
         if rt.waker_active != 0
             if rt.waker_user_data == user_data
                 rt.waker_io_result = io_result
+                rt.waker_io_ready = 1
                 runtime_waker_clear(rt)
 
         uring_cqe_seen(@rt.ring, cqe)
@@ -249,17 +261,22 @@ pub fn runtime_wait_for_io(rt: *Runtime) -> i32
 # Poll a future until it is Ready, waiting on io_uring whenever it is Pending.
 # A future that returns Pending must have suspended on an operation; one that
 # has not could never be woken, so block_on returns -EINVAL rather than spin.
+# A future that returns an -EPERM result it was handed is Ready(-1), not
+# Pending: the runtime knows it handed one over, so block_on returns -1.
 pub fn block_on(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
     var completed: i32 = 0
     var result: i32 = 0
 
     while completed == 0
+        rt.took_pending_code = 0
         result = poll_fn(future_ptr)
 
         if result != POLL_PENDING
             completed = 1
         else
-            if rt.waker_active != 0
+            if rt.took_pending_code != 0 and rt.waker_active == 0
+                completed = 1   # Ready(-EPERM)
+            else if rt.waker_active != 0
                 let wait_result: i32 = runtime_wait_for_io(rt)
                 if wait_result < 0
                     result = wait_result
