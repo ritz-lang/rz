@@ -1689,6 +1689,17 @@ class LLVMEmitter:
 
         return sv
 
+    @staticmethod
+    def _fold_bool_global_init(expr: rast.Expr) -> int | None:
+        """Fold a `bool` global's initializer to 0/1, or None if it is not
+        a `true` / `false` literal under any number of `not` / `!`."""
+        if isinstance(expr, rast.BoolLit):
+            return int(expr.value)
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('!', 'not'):
+            inner = LLVMEmitter._fold_bool_global_init(expr.operand)
+            return None if inner is None else 1 - inner
+        return None
+
     def _emit_global_var(self, var_def: rast.VarDef) -> None:
         """Emit a module-level mutable variable.
 
@@ -1769,6 +1780,10 @@ class LLVMEmitter:
                         gvar.initializer = ir.Constant(ty, None)
                     else:
                         raise ValueError(f"null can only initialize pointer types, not {ty}")
+                elif ty == self.i1 and (bit := self._fold_bool_global_init(var_def.value)) is not None:
+                    # AGAST #3009: `true`, `false`, and `not` of one, as ritz1's
+                    # global_init_fold folds them: the i1 0/1 a bool global is.
+                    gvar.initializer = ir.Constant(ty, bit)
                 else:
                     raise ValueError(f"Unsupported global var initializer: {var_def.value}")
             else:

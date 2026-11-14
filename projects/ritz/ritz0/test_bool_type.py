@@ -294,6 +294,12 @@ ACCEPTED = {
     "bool_global_operands": (("var g: bool\nvar h: bool\nfn main() -> i32\n    g = true\n"
                               "    h = g and not h\n    if g and h and (h or g) and g == h\n"
                               "        return 3\n    0\n"), 3),
+    # AGAST #3009: a literal initializer, and `not` of one, is the i1 0/1 on
+    # every compiler; ritz0 raised "Unsupported global var initializer".  Each
+    # global must hold its own initial value for main to return 3.
+    "bool_global_init": (("var t: bool = true\nvar f: bool = false\nvar n: bool = not true\n"
+                          "var m: bool = not false\nfn main() -> i32\n    t = not t\n"
+                          "    if not t and not f and not n and m\n        return 3\n    0\n"), 3),
     "bool_global_cast": ("var g: bool\nfn main() -> i32\n    g = 2 > 1\n    (g as i32) * 3\n", 3),
     "bool_global_value": (("var g: bool\nfn f(b: bool) -> i32\n    if b\n        return 3\n    0\n"
                            "fn y() -> bool\n    g\nfn main() -> i32\n    g = true\n"
