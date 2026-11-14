@@ -350,6 +350,31 @@ pub fn main() -> i32
     return r * 100 + arr[1].x * 10 + arr[0].x
 """, 231, {}),
 
+    # So is `a[i][j]` with `a: [N]*P`, a local or a global array: it is
+    # `*(a[i] + j)` (#2377), so the reads see element 1 past what a[1] points
+    # at, and `bump` writes it in place (AGAST #3199).  (2 + 2) * 50 + 3 * 10
+    # + 1.
+    "index_of_array_ptr_elem_local": ("""\
+pub fn main() -> i32
+    var arr: [2]P = [P { x: 1 }, P { x: 2 }]
+    var a: [2]*P
+    a[0] = null
+    a[1] = @arr[0]
+    let r = a[1][1].val() + a[1][1].get()
+    a[1][1].bump()
+    return r * 50 + arr[1].x * 10 + arr[0].x
+""", 231, {}),
+    "index_of_array_ptr_elem_global": ("""\
+var GA: [2]*P
+
+pub fn main() -> i32
+    var arr: [2]P = [P { x: 1 }, P { x: 2 }]
+    GA[1] = @arr[0]
+    let r = GA[1][1].val() + GA[1][1].get()
+    GA[1][1].bump()
+    return r * 50 + arr[1].x * 10 + arr[0].x
+""", 231, {}),
+
     # Span's built-in methods on a param, with no ritzlib.span: `{ ptr, len }`
     # struct operations, at u8 and at an 8-byte T (AGAST #3125).  slice(1, 3)
     # of `[1, 2, 3, 4]` is `[2, 3]`, so 2 * 10 + 2 + 0, after 100 * (0 + 1).
