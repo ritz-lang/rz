@@ -150,6 +150,33 @@ ROWS = {
         "let e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => (**v).b = 8\n    _ => 0\np.b",
         8,
     ),
+    # AGAST #3114: a `**Pair` reaches a field through `let w = *v` (w is the
+    # `*Pair`), `(*v)[0]` (index the `*Pair`) and `v[0]` (index the `**Pair`),
+    # for a typed local and for a `Some(v)` payload alike.
+    "ptr_ptr_local_let_deref": (
+        "let v: **Pair = @&r\nlet w = *v\nw.b",
+        3,
+    ),
+    "ptr_ptr_local_deref_index": (
+        "let v: **Pair = @&r\n(*v)[0].a",
+        2,
+    ),
+    "ptr_ptr_local_index": (
+        "let v: **Pair = @&r\nv[0].a + v[0].b",
+        5,
+    ),
+    "option_ptr_ptr_let_deref": (
+        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) =>\n        let w = *v\n        w.b\n    _ => 50",
+        3,
+    ),
+    "option_ptr_ptr_deref_index": (
+        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) => (*v)[0].a\n    _ => 50",
+        2,
+    ),
+    "option_ptr_ptr_index": (
+        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) => v[0].a + v[0].b\n    _ => 50",
+        5,
+    ),
 }
 
 # ritz1 and ritz1_selfhosted only; ritz0 runs every row.

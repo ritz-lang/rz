@@ -892,6 +892,8 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
         else if e.left.left.kind == EXPR_IDENT
             let arr_loc: *LocalVar = find_local_struct_name(s, e.left.left.ident_ptr, e.left.left.ident_len)
             if arr_loc != null
+                var pp_len: i32 = 0
+                let pp_name: *u8 = ptr_ptr_local_struct(s, e.left.left, @pp_len)
                 if arr_loc.var_type == TYPE_ARRAY and arr_loc.array_elem_type == TYPE_STRUCT and arr_loc.type_name_len > 0
                     let elem_st: *StructDef = find_struct(s, arr_loc.type_name, arr_loc.type_name_len)
                     if elem_st != null
@@ -951,6 +953,11 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                 else if arr_loc.var_type == TYPE_PTR and arr_loc.type_name_len > 0
                     if emit_ptr_elem_member_ptr(s, e, result, arr_loc.type_name, arr_loc.type_name_len) == 1
                         return
+                # AGAST #3114: `v[i].field` where v is a `**St` local (or a
+                # `Some(v)` payload over `Option<**St>`): element i is a `*St`.
+                else if pp_name != null
+                    if emit_ptr_ptr_elem_member_ptr(s, e, result, pp_name, pp_len) == 1
+                        return
                 # AGAST #1487: `w[i].field` where w is a Vec<Struct> local.
                 else if emit_vec_elem_member_ptr(s, e, result, arr_loc) == 1
                     return
@@ -990,6 +997,15 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                     if g_arr.var_type == TYPE_PTR and g_arr.pointee_type_name_len > 0
                         if emit_ptr_elem_member_ptr(s, e, result, g_arr.pointee_type_name, g_arr.pointee_type_name_len) == 1
                             return
+
+        # AGAST #3114: `(*v)[i].field` with v a `**St` local: `*v` is the
+        # `*St` emit_ptr_elem_member_ptr strides, as for `p[i].field`.
+        else if e.left.left.kind == EXPR_UNARY and e.left.left.op == OP_DEREF
+            var dpp_len: i32 = 0
+            let dpp_name: *u8 = ptr_ptr_local_struct(s, e.left.left.operand, @dpp_len)
+            if dpp_name != null
+                if emit_ptr_elem_member_ptr(s, e, result, dpp_name, dpp_len) == 1
+                    return
 
         # AGAST #2870: `mkp()[i].field` with `mkp() -> *St`: element i of what
         # the call points at is a place, as ritz0 has it (`mk().a` isn't, and
@@ -1057,6 +1073,50 @@ fn emit_ptr_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
     emit_reg(s, idx_reg)
     emit_str(s, c"\n")
     emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, field)
+    1
+
+# AGAST #3114: St when `e` names a two-level `**St` local -- `let v: **St`
+# (#1933) or a `Some(v)` payload over `Option<**St>` (#3047), both registered
+# pointee `*`, inner pointee St -- else null.  A `***St` is not one.
+fn ptr_ptr_local_struct(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    let lv: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+    if lv == null or lv.var_type != TYPE_PTR_PTR or lv.pointee_type != TYPE_PTR or lv.inner_pointee_type != TYPE_STRUCT
+        return null
+    if lv.type_name_len == 0 or find_struct(s, lv.type_name, lv.type_name_len) == null
+        return null
+    *out_len = lv.type_name_len
+    lv.type_name
+
+# AGAST #3114: address of `v[i].field` with `v` a `**St` local: element i is
+# the `*St` in the i-th pointer slot, so stride by pointers, load it, then
+# GEP into St.  Returns 1 with `result` filled, or 0 if the field is unknown.
+fn emit_ptr_ptr_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult, st_name: *u8, st_name_len: i32) -> i32
+    let st: *StructDef = find_struct(s, st_name, st_name_len)
+    if st == null
+        return 0
+    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if field_idx < 0
+        return 0
+    let base_ptr: i32 = i64_value_to_ptr(s, e.left.left, emit_expr(s, e.left.left))
+    let idx_reg: i32 = emit_expr(s, e.left.right)
+    let slot_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot_ptr)
+    emit_str(s, c" = getelementptr ptr, ptr ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c"\n")
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = load ptr, ptr ")
+    emit_reg(s, slot_ptr)
+    emit_str(s, c"\n")
+    emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
     1
 
 
