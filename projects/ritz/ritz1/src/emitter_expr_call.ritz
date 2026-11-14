@@ -5147,21 +5147,6 @@ fn try_emit_enum_from(s: *EmitterState, e: *Expr) -> i32
     emit_str(s, c" = add i64 0, 0\n")
     z
 
-# AGAST #2403: pointers between a `self` param and its struct, as
-# local_struct_levels counts a local's: 2 for `**S` and `@*S`.
-fn self_struct_levels(p: *Param) -> i32
-    if p.param_type == TYPE_PTR_PTR
-        return ptr_ptr_ident_levels(p.param_inner_pointee_type)
-    if p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF
-        if p.param_pointee_type == TYPE_PTR
-            return 2
-        if p.param_pointee_type == TYPE_PTR_PTR
-            return 3
-        return 1
-    if p.param_type == TYPE_PTR
-        return 1
-    0
-
 # LANGUAGE_SPEC §5.4 (AGAST #2403): a `self` that's a pointer to a pointer
 # takes the levels it asks for, so a place one level short of it is lent, as
 # `@&recv` (`@recv` for `@*S`), the rule `name:& *U` has (§13.3).  Nothing else
@@ -5192,6 +5177,29 @@ fn refuse_receiver_short_of_self(s: *EmitterState, recv: *Expr, mfn: *FnDef, rec
     eprint_int(recv.span.col as i64)
     eprints_cstr(c": a receiver of a pointer `self` must be a place one level short of it, or have its levels\n")
     s.error_count = s.error_count + 1
+    1
+
+# AGAST #3071: 1 for `a[i]` of a local array, which emit_lvalue_ptr places.
+fn recv_elem_is_local_array(s: *EmitterState, recv: *Expr) -> i32
+    if recv.left == null or recv.left.kind != EXPR_IDENT
+        return 0
+    let arr: *LocalVar = find_local_struct_name(s, recv.left.ident_ptr, recv.left.ident_len)
+    (arr != null and arr.var_type == TYPE_ARRAY) as i32
+
+# AGAST #3071: `self: **S` (any `self` two levels or more from its struct) is
+# passed at the levels it declares, from `base`, the receiver's place, which
+# holds `recv_levels` pointers.  1 when it set `*out`.  A receiver with no
+# place is an error here, not a `*S` passed as the `**S`.
+fn pass_self_at_its_levels(s: *EmitterState, recv: *Expr, mfn: *FnDef, recv_levels: i32, base: i32, out: *i32) -> i32
+    if mfn == null or param_is_self(mfn.params) == 0 or recv_levels < 0
+        return 0
+    let want: i32 = self_struct_levels(mfn.params)
+    if want < 2 or recv_levels + 1 < want
+        return 0
+    if base < 0
+        emit_nd_error(s, recv.span.line, recv.span.col, c"this receiver of a `self` two levels from its struct isn't lowered (AGAST #2404)")
+        return 0
+    *out = emit_load_levels(s, base, recv_levels + 1 - want)
     1
 
 fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
@@ -5232,6 +5240,10 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     # Pointers between what the receiver holds and its struct, for a `self: **S`
     # (AGAST #2403); -1 when the arm below didn't say.
     var recv_levels: i32 = 0 - 1
+    # The receiver's place: a register pointing at what it holds, so
+    # `recv_levels + 1` pointers from its struct, or -1 (AGAST #3071).  A
+    # `self: **S` takes it, or what it holds, at the levels `self` declares.
+    var recv_base: i32 = 0 - 1
 
     # Float-primitive receiver: ceil/floor/round/abs (AGAST #1370).  Before
     # any receiver resolution: the call / chain arms below spill the receiver
@@ -5406,6 +5418,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             # AGAST #2372: `**S` and `@*S` are further from it; load down to the
             # slot that holds the `*S`.
             recv_levels = local_struct_levels(loc)
+            recv_base = loc.reg
             if recv_levels > 0
                 receiver_reg = emit_load_levels(s, loc.reg, recv_levels - 1)
                 recv_is_ptr_of_ptr = 1
@@ -5438,6 +5451,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                     receiver_reg = rg_reg
                     recv_is_ptr_of_ptr = rg_ptr_of_ptr
                     recv_levels = rg_ptr_of_ptr
+                    recv_base = rg_reg
     else if recv.kind == EXPR_INDEX and index_through_struct(s, recv, @elem_recv, @elem_recv_len) == 1 and elem_recv != null
         # AGAST #2443: `p[i].m()` through a `*`, `@` or `@&` Vec, Span or String
         # (R9), and `v[i].m()` on one: the element's address is the receiver, so
@@ -5449,13 +5463,20 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         recv_levels = 0
     else if recv.kind == EXPR_INDEX and array_elem_pointee(s, recv, @elem_recv, @elem_recv_len) == TYPE_STRUCT
         # AGAST #2332: `a[i].m()` with `a: [N]*S`: the element IS the receiver.
-        let elem_val: i32 = emit_expr(s, recv)
-        let elem_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, elem_ptr)
-        emit_str(s, c" = inttoptr i64 ")
-        emit_reg(s, elem_val)
-        emit_str(s, c" to ptr\n")
+        var elem_ptr: i32 = 0
+        if recv_elem_is_local_array(s, recv) == 1
+            # AGAST #3071: a local array's element is a place, so a `self: **S`
+            # can take it.  Its index runs once: the element loads from it.
+            recv_base = emit_lvalue_ptr(s, recv)
+            elem_ptr = emit_load_ptr(s, recv_base)
+        else
+            let elem_val: i32 = emit_expr(s, recv)
+            elem_ptr = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, elem_ptr)
+            emit_str(s, c" = inttoptr i64 ")
+            emit_reg(s, elem_val)
+            emit_str(s, c" to ptr\n")
         type_name = elem_recv
         type_name_len = elem_recv_len
         receiver_reg = elem_ptr
@@ -5672,6 +5693,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                     type_name = rf.field_type_name
                     type_name_len = rf.field_type_name_len
                     recv_levels = field_struct_levels(rf)
+                    recv_base = mres.reg
                     receiver_reg = emit_load_levels(s, mres.reg, recv_levels - 1)   # AGAST #2372
                     recv_is_ptr_of_ptr = 1
     else if recv.kind == EXPR_UNARY and recv.op == OP_DEREF
@@ -5691,6 +5713,7 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             receiver_reg = dr_reg
             recv_is_ptr_of_ptr = 1
             recv_levels = 1
+            recv_base = dr_reg
 
     # Tagged-enum intrinsic: Option/Result .unwrap / .unwrap_or. Needs a
     # resolved receiver struct name to know it's a tagged enum; runs
@@ -5778,6 +5801,11 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         return 0
     if refuse_receiver_short_of_self(s, recv, mfn, recv_levels) == 1
         return 0
+    # AGAST #3071: a `self` two levels or more from its struct is the pointer
+    # at those levels: the place of a receiver one short (lent, §5.4), or what
+    # one with the levels holds.  Not the `*S` the dispatch below loads.
+    if pass_self_at_its_levels(s, recv, mfn, recv_levels, recv_base, @receiver_reg) == 1
+        recv_is_ptr_of_ptr = 0
 
     # A pointer-typed receiver (local, param or field `*T`) sits in a slot
     # that holds the pointer: load it and pass that, not the slot (AGAST #1692).
@@ -5841,8 +5869,9 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             else if param_takes_addr_value(s, mbe, mp) == 1
                 # AGAST #2287: as the free-call cascade does for any `@&T`.
                 conv_regs[j] = i64_value_to_ptr(s, mbe, arg_regs[j])
-            else if mp.param_type == TYPE_REF and expr_is_ptr_valued(s, mbe) == 1
+            else if (mp.param_type == TYPE_REF or mp.param_type == TYPE_PTR or mp.param_type == TYPE_PTR_PTR) and expr_is_ptr_valued(s, mbe) == 1
                 # AGAST #2416: `r.get(@&c)` into `c: @C`, as the free call does.
+                # AGAST #3071: and `q.swap(@&e)` into `n: *C` (or `**C`).
                 conv_regs[j] = ptr_value_to_i64(s, mbe, arg_regs[j])
             else if mp.param_type == TYPE_REF and mp.param_type_name_len > 0
                 var mae: *Expr = e.args

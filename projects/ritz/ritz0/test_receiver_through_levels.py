@@ -298,6 +298,8 @@ MOVES = {
 
 
 # ritz0 has none. All of ritz1's refuse, except #2316's and #2401's.
+# (`self_is_a_ptr_ptr` and `self_is_a_shared_ptr` run since #3071 lowered a
+# `self` at the levels it declares.)
 # (`chained_field` ran once #2391 returned a `-> @&T` call result as a `ptr`;
 # `chained_method`, through `mp() -> *C`, once #2883 named a `*S` link's impl;
 # `one_level_returned`, `h(q).set(3)`, once #2946 named a `*S` free call's.)
@@ -307,8 +309,8 @@ MOVES = {
 RITZ1_GAPS = dict.fromkeys(("global_shared_ptr_read", "global_ptr_ptr_read", "global_ptr_ptr_store",
                              "element_ptr_ptr_store",
                              "element_of_a_pointer_store", "index_is_evaluated_once",
-                             "deref_leaves_a_pointer_to_a_pointer", "self_is_a_ptr_ptr",
-                             "self_is_a_shared_ptr", "ufcs_by_value_self_is_a_conversion"), 2404)
+                             "deref_leaves_a_pointer_to_a_pointer",
+                             "ufcs_by_value_self_is_a_conversion"), 2404)
 
 GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}
 

@@ -45,6 +45,10 @@ impl C
 # `*self = n` re-aims the caller's pointer: only a borrow of the place shows it.
 SWAP = "impl C\n    fn swap(self: **C, n: *C)\n        *self = n\n\n"
 
+PASS_ON = ("fn f(s: **C) -> i32\n    s.x\n\n"
+           "impl C\n    fn on(self: **C) -> i32\n        f(self)\n"
+           "    fn top(self: **C) -> i32\n        let p: *C = *self\n        p.x\n\n")
+
 MAKE = "    var c = C { x: 3 }\n    var e = C { x: 5 }\n    var q: *C = @&c\n"
 
 
@@ -79,6 +83,10 @@ RUNS = {
               SWAP + "fn aim(p: **C, e: *C, d: *C) -> *C\n    *p = e\n    d\n\n"), 73),
     # Two levels on each side: nothing to borrow, as before #2403.
     "ptr_ptr": (_main("    var r: **C = @&q\n    r.rd()\n"), 3),
+    # `self` is a `**C` in the body (#3071): passed on as one, from a lent place
+    # and from a receiver with the levels, and `*self` is the `*C` it points at.
+    "self_is_passed_on": (_main("    var r: **C = @&q\n    q.on() * 10 + r.on()\n", PASS_ON), 33),
+    "self_is_dereferenced": (_main("    var r: **C = @&q\n    q.top() * 10 + r.top()\n", PASS_ON), 33),
 }
 
 # name: (source with `^` where the error is, message).
@@ -92,12 +100,8 @@ REFUSED = {
     "let_into_mutable": (_main("    let p: *C = @&c\n    ^p.rd()\n"), let_into_mut("p")),
 }
 
-# ritz1 lowers a `self: **C` as a `*C`, at the call and in the body, so it can't
-# write `*self` (#3071). Its reads come out right only because both sides agree.
-RITZ1_GAPS = dict.fromkeys(("local_swap", "field_swap", "element_swap", "global_swap", "deref_swap",
-                            "argument_reaims_the_receiver"), 3071)
-
-GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}
+# ritz1 lowered a `self: **C` as a `*C` until #3071, at the call and in the body.
+GAPS = {"ritz0": {}, "ritz1": {}, "ritz1_selfhosted": {}}
 
 
 def _params(table):
