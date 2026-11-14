@@ -45,9 +45,11 @@ needle until that is fixed.
 ## Reproducibility notes
 
 - All scenarios run on `127.0.0.1` so kernel TCP doesn't touch a NIC.
-- Each scenario is a separate listener on its own port (9001–9004) and
-  each proxy uses its own Unix socket (`/tmp/zeus_bench_*.sock`).  No
-  scenario leaks load into another.
+- Each scenario is a separate listener on its own port and each proxy
+  uses its own Unix socket.  No scenario leaks load into another.  Ports
+  are free ones picked at start (pin them with `BENCH_PORT_DIRECT`,
+  `BENCH_PORT_STATIC`, `BENCH_PORT_PROXY`, `BENCH_PORT_PROXY_DB`,
+  `BENCH_PORT_MAUSOLEUM`), so rooms benching on one host never collide.
 - The static asset is `bench/static/test.html` — committed at exactly
   1386 bytes so the throughput → MB/sec column is comparable across
   runs.
@@ -55,8 +57,12 @@ needle until that is fixed.
   contains a `BENCH_STATIC_ROOT` placeholder which `run.sh` substitutes
   with the absolute path at runtime; the rendered file is written next
   to the original with a `.rendered.json` suffix so you can inspect it.
-- The script kills any lingering debug binaries from previous runs
-  before starting and on `EXIT` (unless `--keep` is passed).
+- The script refuses to start while this worktree's own valet / nexus /
+  zeus / mausoleum binaries are still running (matched on
+  `/proc/PID/exe`, so other worktrees' servers don't count), and on
+  `EXIT` kills only the processes it started and their children (unless
+  `--keep` is passed).  `--dry-run` prints the ports, the orphan check
+  and what cleanup would kill, and starts nothing.
 - Sockets, the mausoleum data dir and logs live in one `mktemp -d`
   scratch dir, removed on `EXIT`, so concurrent runs on one host never
   share a path.  To inspect logs, pass `--keep`: the dir is left and its

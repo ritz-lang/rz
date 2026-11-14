@@ -13,6 +13,12 @@
 #   bench/run.sh --skip mausoleum      # skip scenarios that need a DB
 #   bench/run.sh --workers 4           # zeus -w N for proxy scenarios
 #   bench/run.sh --json metrics.json   # also emit machine-readable JSON
+#   bench/run.sh --dry-run             # print ports, orphan check and what
+#                                      # cleanup would kill; start nothing
+#
+# Ports default to free ones picked at start, so rooms sharing a host never
+# collide.  Pin any of them with BENCH_PORT_DIRECT, BENCH_PORT_STATIC,
+# BENCH_PORT_PROXY, BENCH_PORT_PROXY_DB or BENCH_PORT_MAUSOLEUM.
 #
 # Requires: wrk, curl, bash, the binaries built via `./rz build PROJECT`.
 
@@ -22,7 +28,7 @@ set -euo pipefail
 # Config
 # ────────────────────────────────────────────────────────────────────
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BENCH_DIR="$REPO_ROOT/bench"
 BUILD_DIR="$REPO_ROOT/projects"
 
@@ -33,12 +39,12 @@ WORKERS=1                # zeus worker count for proxy scenarios
 SKIP=""
 JSON_OUT=""
 KEEP=0                   # if 1, leave servers running on exit
+DRY_RUN=0                # if 1, report ports / orphans / cleanup and exit
 
-PORT_DIRECT=9001
-PORT_STATIC=9002
-PORT_PROXY=9003
-PORT_PROXY_DB=9004
-PORT_MAUSOLEUM=7777
+# Ports are picked after arg parsing (see "Ports" below): BENCH_PORT_* if
+# set, else a free one, never a fixed number another room also uses
+# (AGAST #3201).
+PORT_NAMES=(PORT_DIRECT PORT_STATIC PORT_PROXY PORT_PROXY_DB PORT_MAUSOLEUM)
 
 # Sockets, the mausoleum data dir, logs and wrk output all live in one
 # `mktemp -d`, removed by the EXIT trap (kept with --keep), so two rooms
@@ -65,8 +71,9 @@ while [[ $# -gt 0 ]]; do
         --skip)     SKIP="$2";      shift 2 ;;
         --json)     JSON_OUT="$2";  shift 2 ;;
         --keep)     KEEP=1;         shift   ;;
+        --dry-run)  DRY_RUN=1;      shift   ;;
         -h|--help)
-            sed -n '/^# Usage:/,/^# Requires:/p' "$0" | sed 's/^# \?//'
+            sed -n '/^# Usage:/,/^# Requires:/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -76,8 +83,66 @@ done
 # Utilities
 # ────────────────────────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────────────────────────
+# Ports
+# ────────────────────────────────────────────────────────────────────
+
+# Free loopback ports from the kernel, one per line: all bound at once so
+# they are distinct, then released for the servers to take.
+free_ports() {
+    python3 -c '
+import socket, sys
+socks = [socket.socket() for _ in range(int(sys.argv[1]))]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print("\n".join(str(s.getsockname()[1]) for s in socks))
+' "$1"
+}
+
+mapfile -t _free < <(free_ports "${#PORT_NAMES[@]}")
+for i in "${!PORT_NAMES[@]}"; do
+    name="${PORT_NAMES[$i]}"
+    override="BENCH_$name"
+    port="${!override:-${_free[$i]}}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo "[bench] $override must be a port number 1-65535, got '$port'" >&2
+        exit 2
+    fi
+    printf -v "$name" '%s' "$port"
+done
+
+# ────────────────────────────────────────────────────────────────────
+# Processes: what this run started, and nothing else (AGAST #3201)
+# ────────────────────────────────────────────────────────────────────
+
 PIDS=()
 record_pid() { PIDS+=("$1"); }
+
+# PID and all its descendants (zeus's nexus workers), one per line.
+# Collected before anything is killed, while the tree is still linked.
+pid_tree() {
+    local pid
+    for pid in "$@"; do
+        echo "$pid"
+        pid_tree $(ps -o pid= --ppid "$pid" 2>/dev/null)
+    done
+}
+
+# PIDs whose executable is one of THIS worktree's bench servers.  Matched
+# on /proc/PID/exe, the resolved binary, so it catches absolute and
+# relative spawns alike, and never another worktree's server or a clang
+# writing `-o .../build/...`.  Another user's processes are unreadable
+# and so never listed.
+# One find over /proc, not a readlink per process: hosts run thousands.
+own_bench_pids() {
+    find /proc -mindepth 2 -maxdepth 2 -name exe \( \
+            -lname "$BUILD_DIR/valet/build/*" -o \
+            -lname "$BUILD_DIR/nexus/build/*" -o \
+            -lname "$BUILD_DIR/zeus/build/*" -o \
+            -lname "$BUILD_DIR/mausoleum/build/*" \) \
+            -printf '%h\n' 2>/dev/null \
+        | sed -n 's|^/proc/\([0-9]*\)$|\1|p' || true
+}
 
 cleanup() {
     if [[ "$KEEP" == "1" ]]; then
@@ -85,16 +150,18 @@ cleanup() {
         echo "[bench] --keep: sockets, data and logs left in $T" >&2
         return
     fi
-    for pid in "${PIDS[@]}"; do
-        kill -9 "$pid" 2>/dev/null || true
-    done
-    # Belt and braces: kill any project bench binaries that linger,
-    # using a relative-path regex against the cmdline (matches both
-    # absolute and relative spawns of the binaries — `pkill -f
-    # "$BUILD_DIR/..."` only catches the absolute case and leaves
-    # relative-path orphans behind, which silently steal the bench
-    # ports across runs and produce wildly wrong perf numbers).
-    pkill -9 -f 'projects/(valet|nexus|zeus|mausoleum)/build/' 2>/dev/null || true
+    # Only what this run started: the recorded PIDs and their children.
+    # Never a pattern kill: other rooms on this host run the same
+    # binaries from their own worktrees.
+    local victims
+    victims=$(pid_tree "${PIDS[@]}" | tr '\n' ' ')
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "[bench] dry-run: cleanup would kill:${victims:+ ${victims% }}" >&2
+    else
+        for pid in $victims; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+    fi
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -109,22 +176,23 @@ trap cleanup EXIT
 # notices.
 # ────────────────────────────────────────────────────────────────────
 
-# Note: `|| true` because `grep` exits 1 when there are no matches and
-# `set -e -o pipefail` would abort the whole script on that.
-#
-# Match only when the executable path appears as the *first* token of cmd
-# (i.e. the program being run), not as a -o argument inside a clang
-# invocation.  Without this, parallel agent worktrees rebuilding their
-# own valet with `-o /path/projects/valet/build/...` get false-positive
-# matched as bench orphans.
-orphan_pids=$(ps -eo pid,cmd \
-    | awk '$2 ~ /projects\/(valet|nexus|zeus|mausoleum)\/build\// {print $1}' \
-    | tr '\n' ' ' || true)
+# Scoped to this worktree's binaries (own_bench_pids): another room's
+# servers hold their own ports and never answer ours, so they are not
+# orphans of this run and must not block it.
+orphan_pids=$(own_bench_pids | tr '\n' ' ')
+orphan_pids="${orphan_pids% }"
 if [[ -n "$orphan_pids" ]]; then
-    echo "[bench] ABORT: orphaned bench binaries still running (pids: $orphan_pids)" >&2
-    echo "[bench]        kill them with:  kill -9 $orphan_pids" >&2
-    echo "[bench]        or:              pkill -9 -f 'projects/(valet|nexus|zeus|mausoleum)/build/'" >&2
+    echo "[bench] ABORT: this worktree's bench binaries still running (pids: $orphan_pids)" >&2
+    echo "[bench]        check they are yours, then:  kill -9 $orphan_pids" >&2
     exit 1
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    for name in "${PORT_NAMES[@]}"; do
+        echo "[bench] dry-run: port $name=${!name}" >&2
+    done
+    echo "[bench] dry-run: no orphaned bench binaries under $BUILD_DIR" >&2
+    exit 0
 fi
 
 # Render a config template, replacing BENCH_STATIC_ROOT with the
@@ -220,10 +288,6 @@ build_if_stale mausoleum wiki-seed
 
 cd "$REPO_ROOT"
 
-# Shut down anything left over from a previous run.
-pkill -9 -f "$BUILD_DIR/.*/build/debug/(valet|nexus|zeus|mausoleum)" 2>/dev/null || true
-rm -f "$SOCK_PROXY" "$SOCK_PROXY_DB" 2>/dev/null || true
-sleep 1
 
 # A/B: valet direct (Hello World + JSON, both on the same valet)
 echo "[bench] starting valet-direct on :$PORT_DIRECT" >&2
