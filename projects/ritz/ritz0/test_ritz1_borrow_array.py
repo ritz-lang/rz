@@ -1605,7 +1605,7 @@ def test_ritz1_refuses_a_bare_array_as_an_address(ritz1_bin, tmp_path, name):
     assert comp.returncode != 0
 
 
-# AGAST #2323: a pointer local records nothing the check can use.
+# AGAST #2323: a pointer to no array is refused into `:& [N]T`, as ritz0 refuses it.
 UNCHECKED_POINTER = {
     "pointer_to_scalar": """
 fn f(a:& [2]i32) -> i32
@@ -1640,11 +1640,94 @@ def test_ritz0_refuses_a_pointer_that_is_no_array(tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2323: a pointer local doesn't record its array")
 @pytest.mark.parametrize("name", sorted(UNCHECKED_POINTER))
 def test_ritz1_refuses_a_pointer_that_is_no_array(ritz1_bin, tmp_path, name):
     comp, _, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + UNCHECKED_POINTER[name])
     assert comp.returncode != 0
+    assert "argument 1 of `f` has the wrong type" in comp.stderr
+
+
+# AGAST #2323: a pointer local that does point at the param's `[N]T` passes.
+# The first refusal of UNCHECKED_POINTER was reverted for refusing these.  An
+# `@` local goes to an `@[N]T` param: ritz0 won't borrow `:&` through one.
+SHARED_PARAM = "fn f(a: @[2]i32) -> i32"
+LENT_PARAM = "fn f(a:& [2]i32) -> i32"
+POINTER_LOCAL_TO_ARRAY = {
+    "reference_let": (SHARED_PARAM, """
+    let p: @[2]i32 = @a
+    return f(p)
+"""),
+    "inferred_var": (SHARED_PARAM, """
+    var p = @a
+    return f(p)
+"""),
+    "inferred_let": (SHARED_PARAM, """
+    let p = @a
+    return f(p)
+"""),
+    "pointer_let": (LENT_PARAM, """
+    let p: *[2]i32 = @a
+    return f(p)
+"""),
+    "mut_reference_let": (LENT_PARAM, """
+    let p: @&[2]i32 = @&a
+    return f(p)
+"""),
+    "inferred_mut_var": (LENT_PARAM, """
+    var p = @&a
+    return f(p)
+"""),
+}
+
+
+def _pointer_local_program(param, body):
+    return TYPES + param + """
+    return a[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+""" + body
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(POINTER_LOCAL_TO_ARRAY))
+def test_passes_a_pointer_local_to_the_array(ritz1_bin, tmp_path, name, compiler):
+    program = _pointer_local_program(*POINTER_LOCAL_TO_ARRAY[name])
+    assert _run(compiler, ritz1_bin, tmp_path, name, program) == 3
+
+
+# AGAST #2323: a pointer local to anything but the param's array is refused,
+# as ritz0 refuses it: `a[1]` in the callee reads past what it points at.
+POINTER_LOCAL_TO_NO_ARRAY = {
+    "element_pointer": (LENT_PARAM, """
+    let p: *i32 = @a[0]
+    return f(p)
+"""),
+    "byte_pointer": (LENT_PARAM, """
+    var p: *u8 = @a as *u8
+    return f(p)
+"""),
+    "pointer_to_pointer": (LENT_PARAM, """
+    var q: *i32 = @a[0]
+    let p: **i32 = @q
+    return f(p)
+"""),
+    "element_reference": (SHARED_PARAM, """
+    let p: @i32 = @a[0]
+    return f(p)
+"""),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(POINTER_LOCAL_TO_NO_ARRAY))
+def test_refuses_a_pointer_local_to_no_array(ritz1_bin, tmp_path, name, compiler):
+    program = _pointer_local_program(*POINTER_LOCAL_TO_NO_ARRAY[name])
+    comp, _, _ = _compile(compiler, ritz1_bin, tmp_path, name, program)
+    assert comp.returncode != 0
+    assert "argument 1 of `f` has the wrong type" in comp.stderr + comp.stdout
 
 
 REFERENCE_FIELD = """
