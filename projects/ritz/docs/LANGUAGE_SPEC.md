@@ -1158,9 +1158,11 @@ fn greet(name: *u8)
 ```
 
 Such a function is a *procedure*, and a call to one has no value. Both compilers
-reject a `let`, a `var`, or a `return` from a function that declares a value when
-it would take its value from one. A procedure may still `return` a call to
-another procedure, because nothing uses a value there.
+reject any use of that value: a `let`, a `var`, an assignment, an argument, an
+operand, or a `return` from a function that declares a value. A call through a
+fn pointer typed with no return, such as `fn(i64)`, is judged the same way. A
+procedure may still `return` a call to another procedure, because nothing uses a
+value there.
 
 ### 5.2 Return
 

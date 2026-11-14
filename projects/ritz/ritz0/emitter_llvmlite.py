@@ -564,9 +564,10 @@ class LLVMEmitter:
         # MethodCall nodes in the tail being emitted that resolved to a
         # procedure (AGAST #2237): see _reject_missing_tail_value.
         self._procedure_method_calls: set = set()
-        # The expression a `return`/`let`/`var` takes its value from
-        # (AGAST #2255): see _reject_procedure_value.
-        self._value_source: Optional[rast.Expr] = None
+        # id -> expression whose value its statement or parent uses (AGAST
+        # #2255, #2260): see _reject_procedure_value. Holding the node keeps
+        # its id from being reused by a later one.
+        self._wanted_values: Dict[int, rast.Expr] = {}
         # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
@@ -5895,20 +5896,65 @@ class LLVMEmitter:
         A procedure hands nothing back, so its `return g()` uses no value.
         """
         if self._declares_value(self.current_fn_def):
-            self._value_source = expr
+            self._want_value_of(expr, True)
 
-    def _reject_procedure_value(self, call: rast.Expr, name: str) -> None:
+    def _want_value_of(self, expr: Optional[rast.Expr], consumed: bool) -> None:
+        """AGAST #2260: record which expressions in `expr` have a used value.
+
+        `expr` itself when `consumed`, and its operands always (`_operands`:
+        an argument, an operand, a receiver, a condition). The walk follows
+        `_find_valueless_if`, but a result path (an `if`/`match` arm, a block
+        tail) is never itself marked: a used arm with no value is #2046's
+        diagnostic, and a method call there is #2256's. A block's statements
+        and lambda bodies are left to their own statements. A `return`'s
+        value is wanted only from a fn that declares one.
+        """
+        want = self._want_value_of
+        if expr is None:
+            return
+        if consumed:
+            self._wanted_values[id(expr)] = expr
+        if isinstance(expr, rast.Grouped):
+            want(expr.expr, consumed)
+        elif isinstance(expr, rast.AssignExpr):
+            want(expr.target, False)
+            want(expr.value, True)
+        elif isinstance(expr, rast.ReturnExpr):
+            want(expr.value, self._declares_value(self.current_fn_def))
+            return
+        for operand in LLVMEmitter._operands(expr):
+            want(operand, True)
+        if isinstance(expr, rast.If):
+            want(expr.then_block, False)
+            want(expr.else_block, False)
+        elif isinstance(expr, rast.Block):
+            want(expr.expr, False)
+        elif isinstance(expr, rast.Match):
+            for arm in expr.arms:
+                want(arm.body, False)
+
+    def _want_stmt_values(self, stmt: rast.Stmt) -> None:
+        """The values `stmt` uses (AGAST #2255, #2260); see `_want_value_of`."""
+        if isinstance(stmt, rast.ReturnStmt):
+            self._expect_returned_value_from(stmt.value)
+            return
+        for expr, consumed in self._stmt_value_roots(stmt):
+            self._want_value_of(expr, consumed)
+
+    def _reject_procedure_value(self, call: rast.Expr,
+                                name: Optional[str]) -> None:
         """AGAST #2255: `call` resolved to a procedure; is its value wanted?
 
-        A procedure's dummy `i32 0` is not a value, but `return g(n)` and
-        `let x = g(n)` would bind it. The callers are the places a call
-        resolves, because only those know a method's callee and that a name
-        is not a local fn pointer. An identity test needs no clearing: a
-        stale `_value_source` can only name a node already emitted.
+        A procedure's dummy `i32 0` is not a value, but `return g(n)`,
+        `let x = g(n)`, `x = g(n)`, `h(g(n))` and `g(n) + 1` would use it.
+        The callers are the places a call resolves, because only those know
+        a method's callee and that a name is a local fn pointer. `name` is
+        None for a fn pointer that has none (`fs[i](n)`).
         """
-        if call is self._value_source:
+        if id(call) in self._wanted_values:
+            callee = "this fn pointer" if name is None else f"`{name}`"
             raise EmitError(
-                f"`{name}` returns nothing, so its call has no value to use "
+                f"{callee} returns nothing, so its call has no value to use "
                 f"here",
                 getattr(call, 'span', None),
             )
@@ -5918,11 +5964,9 @@ class LLVMEmitter:
         # Set debug location for source-level debugging
         self._set_debug_loc(stmt)
         self._reject_valueless_if(stmt)
+        self._want_stmt_values(stmt)
         if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
-            self._value_source = stmt.value
             self._literal_into_slot(stmt.type, stmt.value)
-        elif isinstance(stmt, rast.ReturnStmt):
-            self._expect_returned_value_from(stmt.value)
 
         if isinstance(stmt, rast.ReturnStmt):
             ret_type = self._fn_ret_type(self.current_fn)
@@ -11168,6 +11212,8 @@ class LLVMEmitter:
                 # fn pointer too; the alias may carry a [[callconv]] (#1879).
                 ritz_type = resolve_alias_in(self.ritz_types[fname], self.type_aliases)
                 if isinstance(ritz_type, rast.FnType):
+                    if ritz_type.ret is None:   # AGAST #2260
+                        self._reject_procedure_value(call, fname)
                     # This is a function pointer - indirect call
                     # Get the function pointer value
                     if fname in self.locals:
@@ -11208,6 +11254,8 @@ class LLVMEmitter:
             if ritz_type is not None:
                 ritz_type = resolve_alias_in(ritz_type, self.type_aliases)
             if isinstance(ritz_type, rast.FnType):
+                if ritz_type.ret is None:   # AGAST #2260
+                    self._reject_procedure_value(call, None)
                 for arg, param_type in zip(call.args, ritz_type.params):
                     self._literal_into_slot(param_type, arg)
             args = [self._emit_expr(arg) for arg in call.args]

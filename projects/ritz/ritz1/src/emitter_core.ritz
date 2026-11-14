@@ -313,9 +313,11 @@ struct EmitterState
     # and whether check_tail_value already reported this fn.
     proc_method_calls: *ProcMethodCall
     tail_gap_reported: i32
-    # AGAST #2255 — the expression the `return`/`let`/`var` being emitted takes
-    # its value from; see reject_procedure_value.
-    value_source: *Expr
+    # AGAST #2255, #2260 — the expressions whose value the statements being
+    # emitted use, innermost statement last; see want_stmt_values.
+    wanted: **Expr
+    wanted_count: i32
+    wanted_cap: i32
     # AGAST #1521 — 1 once a print interpolation has called one of the
     # @__ritz_print_* helpers; emit_module then defines them.
     print_helpers_used: i32
@@ -1350,21 +1352,116 @@ fn fn_source_file(f: *FnDef) -> *u8
         return file
     c"<input>"
 
-# AGAST #2255: `e` called a procedure named `name`.  Its dummy `i32 0` is not a
-# value, but `return g(n)` and `let x = g(n)` would bind it.  Judged where a call
+# AGAST #2260: is `e`'s value used by a statement being emitted?
+fn value_wanted(s: *EmitterState, e: *Expr) -> i32
+    var i: i32 = 0
+    while i < s.wanted_count
+        if s.wanted[i] == e
+            return 1
+        i += 1
+    0
+
+fn want_push(s: *EmitterState, e: *Expr)
+    if s.wanted_count == s.wanted_cap
+        s.wanted_cap = s.wanted_cap * 2 + 16
+        s.wanted = realloc(s.wanted as *u8, s.wanted_cap as i64 * 8) as **Expr
+    s.wanted[s.wanted_count] = e
+    s.wanted_count += 1
+
+fn want_list(s: *EmitterState, list: *Expr)
+    var cur: *Expr = list
+    while cur != null
+        want_value_of(s, cur, 1)
+        cur = cur.next
+
+# AGAST #2260: record which expressions in `e` have a used value: `e` itself
+# when `consumed`, and always its operands (an argument, an operand, a receiver,
+# a scrutinee).  As ritz0's _want_value_of: an `if`/`match` arm's value is not
+# itself marked (a used arm with no value is #2046's diagnostic), and an arm's
+# statements are judged as they are emitted.
+fn want_value_of(s: *EmitterState, e: *Expr, consumed: i32)
+    if e == null
+        return
+    if consumed == 1
+        want_push(s, e)
+    let k: i32 = e.kind
+    if k == EXPR_CALL
+        if e.func_name_len == 0
+            want_value_of(s, e.left, 1)   # a nameless call's callee
+        want_list(s, e.args)
+    else if k == EXPR_METHOD
+        want_value_of(s, e.left, 1)
+        want_list(s, e.args)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        want_value_of(s, e.left, 1)
+        want_value_of(s, e.right, 1)
+    else if k == EXPR_UNARY
+        want_value_of(s, e.operand, 1)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        want_value_of(s, e.left, 1)
+    else if k == EXPR_ARRAY_LIT
+        want_list(s, e.args)
+    else if k == EXPR_STRUCT_LIT
+        # The field inits are a *FieldInit list recast to *Expr.
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            want_value_of(s, fi.value, 1)
+            fi = fi.next
+    else if k == EXPR_MATCH or k == EXPR_IF
+        want_value_of(s, e.left, 1)
+        var arm: *MatchArm = e.args as *MatchArm
+        while arm != null
+            want_value_of(s, arm.body, 0)
+            arm = arm.next
+
+# AGAST #2255, #2260: push the values `stmt` uses; the caller pops them back to
+# the count it saved once `stmt` is emitted.  A procedure hands nothing back, so
+# its `return g()` uses no value.
+fn want_stmt_values(s: *EmitterState, stmt: *Stmt, ret_type: i32)
+    let k: i32 = stmt.kind
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        want_value_of(s, stmt.var_init, 1)
+    else if k == STMT_RETURN
+        want_value_of(s, stmt.return_value, (ret_type != TYPE_VOID) as i32)
+    else if k == STMT_ASSIGN
+        if stmt.assign_target_len == 0
+            want_value_of(s, stmt.if_cond as *Expr, 0)
+        want_value_of(s, stmt.assign_value, 1)
+    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        want_value_of(s, stmt.while_cond, 1)
+        want_value_of(s, stmt.assign_value, 1)
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        want_value_of(s, stmt.assign_value, 1)
+    else if k == STMT_EXPR
+        want_value_of(s, stmt.expr, 0)
+    else if k == STMT_IF or k == STMT_ASSERT or k == STMT_MATCH
+        want_value_of(s, stmt.if_cond as *Expr, 1)
+    else if k == STMT_WHILE
+        want_value_of(s, stmt.while_cond, 1)
+    else if k == STMT_FOR
+        want_value_of(s, stmt.for_start, 1)
+        want_value_of(s, stmt.for_end, 1)
+
+# AGAST #2255: `e` called a procedure named `name` (a fn pointer when `len` is
+# 0).  Its dummy `i32 0` is not a value, but `return g(n)`, `let x = g(n)`,
+# `x = g(n)`, `h(g(n))` and `g(n) + 1` would use it.  Judged where a call
 # resolves, because only there are a method's callee and a fn-pointer local known.
 fn reject_procedure_value(s: *EmitterState, e: *Expr, name: *u8, len: i32)
-    if e != s.value_source
+    if value_wanted(s, e) == 0
         return
     eprints_cstr(fn_source_file(emitter_current_fn()))
     eprint_char(':')
     eprint_i64(e.span.line as i64)
     eprint_char(':')
     eprint_i64(e.span.col as i64)
-    eprints_cstr(c": error: `")
-    for i in 0..len
-        eprint_char(*(name + i))
-    eprints_cstr(c"` returns nothing, so its call has no value to use here\n")
+    if len == 0
+        eprints_cstr(c": error: this fn pointer")
+    else
+        eprints_cstr(c": error: `")
+        for i in 0..len
+            eprint_char(*(name + i))
+        eprint_char('`')
+    eprints_cstr(c" returns nothing, so its call has no value to use here\n")
     emit_str(s, c"  ; ERROR: a procedure call has no value\n")
     s.error_count = s.error_count + 1
 

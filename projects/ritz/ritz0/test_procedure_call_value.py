@@ -1,8 +1,10 @@
-"""`return`/`let`/`var` must not take a value from a call to a procedure.
+"""Nothing may use a value from a call to a procedure.
 
 AGAST #2255. A procedure returns a dummy `i32 0` at the IR level, and these
 statements used to bind it: `let x: i64 = g(n)` compiled and x was a zero the
-source never wrote. #1429 and #2237 judge the implicit tail only.
+source never wrote. #1429 and #2237 judge the implicit tail only. #2260 extends
+the rule from `return`/`let`/`var` to an assignment, an argument, an operand
+and a call through a fn pointer typed with no return.
 
 One table drives both compilers, so the rule cannot drift between them. Only
 emission knows a method's callee, or whether a name is really a fn pointer in
@@ -11,8 +13,7 @@ pins what that buys: a local fn pointer that shadows a procedure is a value,
 which is the case name lookup gets wrong (#2246).
 
 Out of scope and not pinned here: a method call as a used `if`/`match` arm
-(#2256), and a procedure call as an operand, an argument or an assignment's
-right-hand side (#2260).
+(#2256).
 """
 
 import os
@@ -45,7 +46,8 @@ _TRAIT = ("trait T\n"
           "        var i: i64 = 1\n")
 _POINT = "struct P\n    x: i64\n    y: i64\n"
 
-# name -> (source, callee named in the diagnostic, 1-based line of the call)
+# name -> (source, callee named in the diagnostic (None: a nameless fn
+# pointer), 1-based line of the call)
 REJECTED = {
     "return_of_a_named_call": (
         _G + "fn f(n: i64) -> i64\n"
@@ -168,6 +170,93 @@ REJECTED = {
         "    match n\n"
         "        0 => return b.p()\n"
         "        _ => 1\n", "p", 12),
+    # AGAST #2260: the value is used by something other than the statement.
+    "assignment_of_a_named_call": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    var x: i64 = 0\n"
+        "    x = g(n)\n"
+        "    x\n", "g", 5),
+    "field_assignment_of_a_named_call": (
+        _POINT + _G + "fn f(n: i64) -> i64\n"
+        "    var p: P = P { x: 1, y: 2 }\n"
+        "    p.x = g(n)\n"
+        "    p.x\n", "g", 8),
+    "index_assignment_of_a_named_call": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    var a: [2]i64 = [0, 0]\n"
+        "    a[0] = g(n)\n"
+        "    a[0]\n", "g", 5),
+    "argument_of_a_named_call": (
+        _G + "fn h(n: i64) -> i64\n"
+        "    n\n"
+        "fn f(n: i64) -> i64\n"
+        "    h(g(n))\n"
+        "    7\n", "g", 6),
+    "operand_of_a_named_call": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    g(n) + 1\n"
+        "    7\n", "g", 4),
+    "operand_in_a_condition": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    if g(n) == 0\n"
+        "        return 1\n"
+        "    7\n", "g", 4),
+    "procedure_as_a_condition": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    if g(n)\n"
+        "        return 1\n"
+        "    7\n", "g", 4),
+    "operand_inside_a_let": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    let x: i64 = n * g(n)\n"
+        "    x\n", "g", 4),
+    "argument_of_a_method_call": (
+        _BOX + "fn h(n: i64) -> i64\n"
+        "    n\n"
+        "fn f(b: B) -> i64\n"
+        "    h(b.p())\n"
+        "    7\n", "p", 13),
+    "argument_to_a_method": (
+        _G + "struct D\n"
+        "    v: i64\n"
+        "impl D\n"
+        "    fn w(self, n: i64) -> i64\n"
+        "        n\n"
+        "fn f(d: D, n: i64) -> i64\n"
+        "    d.w(g(n))\n"
+        "    7\n", "g", 9),
+    "operand_of_a_method_call": (
+        _BOX + "fn f(b: B) -> i64\n"
+        "    return b.p() + b.q()\n", "p", 11),
+    "assignment_of_a_method_call": (
+        _BOX + "fn f(b: B) -> i64\n"
+        "    var x: i64 = 0\n"
+        "    x = b.p()\n"
+        "    x\n", "p", 12),
+    "assignment_in_a_used_arm_statement": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    var x: i64 = 0\n"
+        "    let y: i64 = match n\n"
+        "        0 =>\n"
+        "            x = g(n)\n"
+        "            1\n"
+        "        _ => 2\n"
+        "    y\n", "g", 7),
+    "let_through_a_procedure_fn_pointer": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    let p: fn(i64) = g\n"
+        "    let x: i64 = p(n)\n"
+        "    x\n", "p", 5),
+    "argument_through_a_procedure_fn_pointer_param": (
+        "fn h(n: i64) -> i64\n"
+        "    n\n"
+        "fn f(p: fn(i64), n: i64) -> i64\n"
+        "    return h(p(n))\n", "p", 4),
+    "nameless_procedure_fn_pointer": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    let fs: [1]fn(i64) = [g]\n"
+        "    let x: i64 = fs[0](n)\n"
+        "    x\n", None, 5),
     "trait_method_on_a_generic_receiver": (
         _TRAIT + "fn f<X>(x: X) -> i64\n"
         "    let r: i64 = x.t()\n"
@@ -262,6 +351,26 @@ ACCEPTED = {
         "    let a: A = A { v: 1 }\n"
         "    let c: C = C { v: 1 }\n"
         "    return (f<A>(a) + f<C>(c)) as i32\n"),
+    # AGAST #2260: a statement's own value is unused, and so is each of the
+    # statements inside a used arm.
+    "procedure_calls_as_statements": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    let p: fn(i64) = g\n"
+        "    p(n)\n"
+        "    let y: i64 = match n\n"
+        "        0 =>\n"
+        "            g(n)\n"
+        "            1\n"
+        "        _ => 2\n"
+        "    if n > 0\n"
+        "        g(y)\n"
+        "    y\n"),
+    "procedure_fn_pointer_as_an_argument": (
+        _G + "fn call(p: fn(i64), n: i64) -> i64\n"
+        "    p(n)\n"
+        "    n\n"
+        "fn f(n: i64) -> i64\n"
+        "    return call(g, n)\n"),
     # #2246's question: `-> void` is left as the tail check leaves it. That
     # ticket moves this to REJECTED.
     "let_of_a_call_spelled_void": (
@@ -294,7 +403,8 @@ def _ritz1(ritz1_bin, tmp_path, source):
 
 def _assert_rejected(rc, output, name, callee, line):
     assert rc != 0, f"{name} must not compile:\n{output[-1500:]}"
-    assert f"`{callee}` {MESSAGE}" in output, output[-1500:]
+    named = "this fn pointer" if callee is None else f"`{callee}`"
+    assert f"{named} {MESSAGE}" in output, output[-1500:]
     assert f"unit.ritz:{line}:" in output, f"expected line {line}:\n{output[-1500:]}"
 
 
