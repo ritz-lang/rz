@@ -834,25 +834,38 @@ def test_a_reference_to_a_pointer_of_the_other_sign_is_refused(ritz1_bin, tmp_pa
     _refused(comp, ll, REF_TO_OTHER_POINTER)
 
 
-METHOD_DEREF = METHOD_TYPES + """\
+METHOD_GO = METHOD_TYPES + """\
 impl S
     fn go(self: @&S, n:& i8) -> @&i8
         return @&n
 
 pub fn main() -> i32
     var s: S = S { v: 0 }
+"""
+
+# AGAST #2327: `*x.m()` of a `-> @&i8` method is an i8, as `*f()` is (#2308).
+# An i64 store clobbers a[2]; an i64 load reads a[2] (and past it) into the value.
+METHOD_DEREF = {
+    "store": METHOD_GO + """\
     var a: [3]i8 = [1, 1, 1]
     *s.go(@&a[1]) = 3
     if a[2] != 1
         return 42
     return a[1] as i32
-"""
+""",
+    "load": METHOD_GO + """\
+    var a: [3]i8 = [1, 3, 5]
+    if *s.go(@&a[1]) != 3
+        return 42
+    return 3
+""",
+}
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #2327: `*x.m()` has no pointee width")
-def test_ritz1_deref_of_a_method_call_stores_its_width(ritz1_bin, tmp_path):
-    assert _run("ritz1", ritz1_bin, tmp_path, "method_deref", METHOD_DEREF) == 3
+@pytest.mark.parametrize("name", sorted(METHOD_DEREF))
+def test_ritz1_deref_of_a_method_call_has_its_width(ritz1_bin, tmp_path, name):
+    assert _run("ritz1", ritz1_bin, tmp_path, name, METHOD_DEREF[name]) == 3
 
 
 POINTER_VALUE_RETURN = {
