@@ -6,8 +6,8 @@
 emit_expr_method (ritz1/src/emitter_expr_call.ritz) had no EXPR_UNARY arm, so
 `(*p).m()` / `(*pp).m()` / `(**pp).m()` never resolved a receiver type.  The fix
 resolves the deref operand with emit_deref_operand_ptr (as emit_member_ptr does
-for `(*pp).w`): one level left is the struct itself, two levels is a `*S`
-value dispatched ptr-of-ptr.
+for `(*pp).w`): one level left is the struct itself, dispatched in place
+(LARB R9, #3109), two levels is a `*S` value dispatched ptr-of-ptr.
 
 Each program returns 42 when correct and a distinct small code naming the check
 that failed otherwise.  ritz0 is the oracle; every case runs at runtime.
@@ -105,12 +105,8 @@ pub fn main() -> i32
     (*h.pp).bump(2)
     return (*h.pp).peek() as i32
 """,
-}
-
-# A deref that leaves a struct VALUE: ritz0 runs the method on a copy (a
-# mutating method is lost), so ritz1 keeps rejecting it until #2175 settles
-# the semantics.  These pin the fail-closed error.
-FAIL_CLOSED = {
+    # AGAST #3109: a deref that leaves the struct itself runs the method on
+    # the pointee (LARB R9, #2175).  These were pinned fail-closed until then.
     "double_deref_param": RES_DEF
     + """\
 fn via2(pp: **Res) -> u64
@@ -127,7 +123,7 @@ pub fn main() -> i32
     var r: Res = Res { v: 1, w: 42 }
     let p: *Res = @r
     return (*p).peek() as i32
-"""
+""",
 }
 
 
@@ -168,23 +164,6 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
 def test_ritz1_deref_receiver(ritz1_bin, tmp_path, name):
     assert _run("ritz1", tmp_path, name, PROGRAMS[name]) == EXPECTED
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(FAIL_CLOSED))
-def test_ritz1_struct_value_deref_receiver_fails_closed(ritz1_bin, tmp_path, name):
-    src = tmp_path / f"{name}.ritz"
-    src.write_text(FAIL_CLOSED[name])
-    ll = tmp_path / f"{name}.ll"
-    comp = subprocess.run(
-        [str(RITZ1_BIN), str(src), "-o", str(ll), "-I", str(RITZ_ROOT)],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert comp.returncode != 0 and not ll.exists()
-    assert "cannot determine receiver type" in comp.stdout + comp.stderr
 
 
 # The ticket's related issue: a `fn(...) -> T` param is a TYPE_PTR, but type_fn
