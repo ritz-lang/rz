@@ -13281,6 +13281,25 @@ class LLVMEmitter:
         """Evaluate `expr` now; `_emit_expr` returns this value from here on."""
         self._evaluated_once[id(expr)] = self._emit_expr(expr)
 
+    def _field_of_rvalue(self, expr: rast.Expr) -> bool:
+        """Is `expr` a field chain `r.f.g` whose root `r` is a value rather
+        than a place: a call or literal that isn't a pointer to one?
+
+        `pw(@w).p` reaches through the pointer `pw` returns, so it's a place
+        in `*w`; `mw().p` is a part of the value `mw` returned, which has no
+        address. Call after _evaluate_place_operands, which holds the root.
+        """
+        if not isinstance(expr, rast.Field):
+            return False
+        while isinstance(expr, rast.Field):
+            expr = expr.expr
+        if isinstance(expr, (rast.Ident, rast.Index)):
+            return False
+        if isinstance(expr, rast.UnaryOp) and expr.op == '*':
+            return False
+        root = self._evaluated_once.get(id(expr))
+        return root is not None and not isinstance(root.type, ir.PointerType)
+
     def _evaluate_place_operands(self, expr: rast.Expr) -> None:
         """Evaluate what a place depends on, left to right.
 
@@ -13390,6 +13409,7 @@ class LLVMEmitter:
         # Look up the mangled function name (need type_name first)
         receiver_probe = None
         receiver_slot = None  # The temporary holding the receiver, if any
+        rvalue_field = False  # `mw().p`: a field of a value, not a place
         if type_name is None:
             # Fall back to emitting the expression and checking its type.
             # This is the receiver's one evaluation (AGAST #2261).
@@ -13398,6 +13418,11 @@ class LLVMEmitter:
             receiver_probe = self._emit_expr_core(expr.expr)
             receiver_slot = self._own_temporary(expr.expr, receiver_probe)
             self._evaluated_once[id(expr.expr)] = receiver_probe
+            # `mw().p.get()`: a field of an rvalue is a value, not a place,
+            # so it's lent as any rvalue is, from a spill (AGAST #2294).
+            rvalue_field = receiver_is_lvalue and self._field_of_rvalue(expr.expr)
+            if rvalue_field:
+                receiver_is_lvalue = False
             receiver_type = receiver_probe.type
             if isinstance(receiver_type, ir.PointerType):
                 # The type at the end of every pointer level (§5.4, #2398);
@@ -13553,6 +13578,10 @@ class LLVMEmitter:
         # `mk().bump()` with `self: @&T` / `self:& T` is a store into the
         # call's temporary, lost with it (AGAST #2518, R1 exception 4).
         self_param = fn_def.params[0]
+        # A field of one is in it: `mw().p.bump()` loses the store as well.
+        if (rvalue_field and self._mutates_self(fn_def)
+                and not isinstance(receiver_probe.type, ir.PointerType)):
+            raise EmitError(ref_rules.MUT_SELF_ON_TEMP, expr.expr.span)
         if (isinstance(expr.expr, (rast.Call, rast.MethodCall))
                 and (getattr(self_param, 'borrow', None) == rast.Borrow.MUTABLE
                      or (isinstance(self_param.type, rast.RefType) and self_param.type.mutable))):

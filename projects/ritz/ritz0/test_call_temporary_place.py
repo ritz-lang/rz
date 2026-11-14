@@ -114,6 +114,15 @@ impl Sink
     fn seea(self: @Sink, a: @[3]i32) -> i32
         return a[2] + self.k
 
+struct O
+    r: R
+
+fn mo() -> O
+    calls = calls + 1
+    var o: O
+    o.r.x = 1
+    return o
+
 """
 
 # Line 1 of the body is this line of the program.
@@ -138,6 +147,9 @@ REFUSED = {
     "store_method_temp": ("var k: R\n^k.me().x = 4", ref_rules.STORE_INTO_TEMP),
     "mut_self_ref": ("^mk().bump()", ref_rules.MUT_SELF_ON_TEMP),
     "mut_self_borrow": ("^mk().tick()", ref_rules.MUT_SELF_ON_TEMP),
+    # A field of the temporary is in it: the store is as lost (#2294).
+    "mut_self_field_ref": ("^mo().r.bump()", ref_rules.MUT_SELF_ON_TEMP),
+    "mut_self_field_borrow": ("^mo().r.tick()", ref_rules.MUT_SELF_ON_TEMP),
     # `@` that outlives the statement (#2518).
     "addr_let": ("let p: @R = ^@mk()\nif p.x != 1\n    return 1", ref_rules.ADDR_OF_TEMP),
     "addr_mut_let": ("let p: @&R = ^@&mk()\np.x = 2", ref_rules.ADDR_OF_TEMP),
@@ -178,6 +190,8 @@ RUNS = {
     "read_field": "if mk().x != 1\n    return 1",
     "read_elem": "if mk().n[1] != 20\n    return 1",
     "read_method": "if mk().get() != 1\n    return 1",
+    # A read-only method on a field of one lends it from a spill (#2294).
+    "read_method_field": "if mo().r.get() != 1\n    return 1",
     # `@` straight into a call's argument (#3050).
     "arg_whole": "if look(@mk()) != 1\n    return 1",
     "arg_mut": "if poke(@&mk()) != 6\n    return 1",

@@ -223,8 +223,9 @@ CASES = {
     "span_range_index_ptr": ("var s = ms()\n    s[idx()..0].ptr()", 2, 0, {}),
     "span_range_index_is_empty": ("var s = ms()\n    s[idx()..0].is_empty()", 2, 0, {}),
     "span_range_end": ("var s = ms()\n    s[0..idx()].len()", 2, 0, {}),
-    # A field of an rvalue isn't a place, but dispatch treats it as one.
-    "field_of_rvalue": ("mw().p.get()", 1, 0, {"ritz0": 2294}),
+    # A field of an rvalue isn't a place: the rvalue is spilled and the
+    # field lent from the spill (AGAST #2294).
+    "field_of_rvalue": ("mw().p.get()", 1, 0, {}),
     # Inside an argument.
     "in_argument": ("take(mp().get())", 1, 0, {}),
     "in_a_borrowed_local": ("let t = mp().next()\n    look(@t)", 1, 0, {}),
@@ -408,6 +409,61 @@ pub fn main() -> i32
     var a: [2]u8 = [1, 2]
     return c(Span<u8> { ptr: @a[0], len: 0 }) * 100 + MADE
 """, 11, {}),
+
+    # A field lent from a spilled rvalue (AGAST #2294): the rvalue still drops
+    # once, whether the field is what drops or the root is. 100 * MADE +
+    # 10 * DROPS + LAST.
+    "field_of_rvalue_drops": ("""\
+struct H
+    t: T
+
+fn mh() -> H
+    MADE = MADE + 1
+    return H { t: T { id: 3 } }
+
+pub fn main() -> i32
+    let r = mh().t.peek()
+    return MADE * 100 + DROPS * 10 + LAST
+""", 113, {}),
+    "field_of_rvalue_root_drops": ("""\
+struct D
+    p: P
+
+impl Drop for D
+    fn drop(self: @&D)
+        DROPS = DROPS + 1
+        LAST = 7
+
+fn md() -> D
+    MADE = MADE + 1
+    return D { p: P { x: 1 } }
+
+pub fn main() -> i32
+    let r = md().p.get()
+    return MADE * 100 + DROPS * 10 + LAST
+""", 117, {}),
+    # Through a pointer the root returns, the field is a place: the store lands.
+    "field_through_returned_pointer": ("""\
+pub fn main() -> i32
+    var w = W { p: P { x: 4 } }
+    pw(@w).p.bump()
+    return MADE * 10 + w.p.x
+""", 15, {}),
+
+    # A pointer field of an rvalue points at a place: `@&self` writes there.
+    "field_pointer_of_rvalue_mut": ("""\
+struct WP
+    pp: *P
+
+fn mwp(p: *P) -> WP
+    MADE = MADE + 1
+    return WP { pp: p }
+
+pub fn main() -> i32
+    var held = P { x: 4 }
+    mwp(@held).pp.bump()
+    return MADE * 10 + held.x
+""", 15, {c: 3235 for c in BOTH_RITZ1}),
 
     # The value the method returns is the receiver's, not another evaluation's.
     "reads_the_value_it_evaluated": ("""\
