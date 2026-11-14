@@ -378,16 +378,12 @@ def test_a_span_slice_needs_no_import(run_with, row, compiler):
     assert run_with(compiler, row, NO_IMPORT.format(body=body)) == want % 256
 
 
-# There `lo` is read twice, so ritz1 takes a literal or a name only.
+# There `lo` is read twice, for the ptr and the len: a call is evaluated once
+# (AGAST #3126; ritz1 refused it).  Read twice, N is 2 and the len 1 or 2.
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_a_call_in_the_bound_needs_span_slice_on_ritz1(compile_with, compiler):
-    program = NO_IMPORT.format(body="    let t = v[idx()..3]\n    return t.len as i32\n")
-    _refused(compile_with, compiler, "call", program,
-             "this slice of a Vec, Span or String isn't lowered by ritz1")
-
-
-@pytest.mark.integration
-def test_a_call_in_the_bound_is_read_once_on_ritz0(run_with):
-    program = NO_IMPORT.format(body="    let t = v[idx()..3]\n    return t.len as i32\n")
-    assert run_with("ritz0", "call", program) == (200 + 20) % 256
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_call_in_the_bound_is_read_once(run_with, compiler):
+    program = "var N: i64 = 0\n\nfn bump() -> i64\n    N = N + 1\n    return N\n\n" + NO_IMPORT.format(
+        body="    let t = v[bump()..3]\n    return (t[0] as i32) + (t.len * 10 + N) as i32\n")
+    # t is [20, 30]: 20 + 2 * 10 + 1, and a[1] is 20.
+    assert run_with(compiler, "call", program) == (41 * 100 + 20) % 256
