@@ -494,10 +494,61 @@ def test_inferred_copy_of_a_struct_element_deref(run_with, compiler):
     assert run_with(compiler, "struct_inferred_copy", program) == 0
 
 
+# AGAST #2377: an untyped `let` of a struct read through a pointer is that struct,
+# as `let c: S = ...`.  `a[1][1]` stayed i64: "unhandled EXPR_MEMBER".  `p[0]` is
+# KNOWN_GAPS' (#3052).
+# s[1] is the one with q == 2; a[0] and p point at it, a[1] at s[0].
+_COPY_MAIN = (_PAIR + "pub fn main() -> i32\n    var s: [2]S\n    s[1].q = 2\n    var a: [2]*S\n"
+              "    a[0] = @s[1]\n    a[1] = @s[0]\n    let p: *S = @s[1]\n")
+INFERRED_COPIES = {
+    "deref": "*p",
+    "deref_element": "*a[0]",
+    "element_index": "a[1][1]",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(INFERRED_COPIES))
+def test_untyped_let_through_a_pointer_is_the_struct(run_with, name, compiler):
+    program = _COPY_MAIN + f"    let c = {INFERRED_COPIES[name]}\n" + _is("c.q", "2")
+    assert run_with(compiler, name, program) == 0
+
+
+# A copy, not an alias: writing `c` leaves s[1] alone.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_untyped_let_of_an_element_index_is_a_copy(run_with, compiler):
+    program = _COPY_MAIN + "    var c = a[1][1]\n    c.q = 5\n" + _is("s[1].q + c.q", "7")
+    assert run_with(compiler, "element_index_copy", program) == 0
+
+
+# A Drop pointee isn't copied out: each compiler refuses it at the read, as
+# ritz0 does `let c = *p`.  ritz1 copied `*a[0]` silently.
+_DROP_MAIN = (
+    "var DROPS: i32 = 0\n\nstruct T\n    id: i32\n\nimpl Drop for T\n    fn drop(self: @&T)\n"
+    "        DROPS = DROPS + 1\n\npub fn main() -> i32\n    var s: [2]T\n    var a: [2]*T\n"
+    "    a[0] = @s[1]\n    a[1] = @s[0]\n    let p: *T = @s[1]\n")
+_DROP_LINE = _DROP_MAIN.count("\n") + 1
+DROP_READS = {**INFERRED_COPIES, "pointer_index": "p[0]"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(DROP_READS))
+def test_untyped_let_does_not_copy_a_drop_pointee(compile_with, name, compiler):
+    program = _DROP_MAIN + f"    let c = {DROP_READS[name]}\n    return c.id\n"
+    comp, _, _ = compile_with(compiler, f"drop_{name}", program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert "cannot move out of a reference" in out, out
+    assert f":{_DROP_LINE}:13" in out, out
+
+
 # ritz0 has these right, ritz1 doesn't, and each is its own bug.  Strict, so the
 # fix flags the row.
 KNOWN_GAPS = {
-    "struct_index_inferred_copy": (2377, _PAIR + _PAIR_MAIN + "    let c = a[1][1]\n" + _is("c.q", "2")),
+    "pointer_index_inferred_copy": (3052, _COPY_MAIN + "    let c = p[0]\n" + _is("c.q", "2")),
     "generic_element_mut_param": (2378, (
         "fn f<T>(a:& [2]*T, t: T) -> i32\n" + _is("*a[1]") + "\n"
         "pub fn main() -> i32\n" + _X + "    return f<i16>(a, 0 as i16)\n")),
