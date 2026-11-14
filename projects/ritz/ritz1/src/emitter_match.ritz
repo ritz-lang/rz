@@ -55,6 +55,7 @@ import emitter_stmt          # emit_stmt, for block-bodied arms (AGAST #1454)
 import enum_as_int          # enum_as_int_expr (AGAST #2136)
 import ownership            # arm scopes for drops (AGAST #2158)
 import bool_check   # AGAST #2342
+import monomorph     # ArrayArg (AGAST #3029)
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
@@ -350,6 +351,55 @@ fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enu
     emit_str(s, c"\n")
     add_local_struct(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, TYPE_STRUCT, st_name, st_name_len)
 
+# AGAST #3029: bind `V(a)` / `Some(a)` to a copy of an array payload, at the
+# `[N]T` the variant declares (variant_array_type), as a `let a: [N]T` is
+# registered.  It was loaded as an i64 and indexed as a pointer: `a[1]` read
+# through the array's bytes.  0, emitting nothing, for any other payload.
+fn emit_array_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32) -> i32
+    var tag: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+    let uvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+    if uvi >= 0
+        tag = uvi
+    var arr: ArrayArg
+    if variant_array_type(s, enum_name, enum_name_len, tag, @arr) == 0
+        return 0
+    let pay_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, enum_name, enum_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot_reg)
+    emit_str(s, c", i32 0, i32 2\n")
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = load ")
+    emit_local_array_llvm_type(s, arr.size, arr.elem, arr.name, arr.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c"\n")
+    let alloca_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c" = alloca ")
+    emit_local_array_llvm_type(s, arr.size, arr.elem, arr.name, arr.name_len)
+    emit_str(s, c"  ; match array payload bind\n")
+    emit_str(s, c"  store ")
+    emit_local_array_llvm_type(s, arr.size, arr.elem, arr.name, arr.name_len)
+    emit_str(s, c" ")
+    emit_reg(s, val)
+    emit_str(s, c", ptr ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c"\n")
+    if arr.name_len > 0 and (arr.elem == TYPE_STRUCT or arr.elem == TYPE_PTR)
+        add_local_full(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, TYPE_ARRAY, arr.name, arr.name_len, TYPE_I64, arr.size, arr.elem)
+    else
+        add_local_array(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, arr.size, arr.elem)
+    let loc: *LocalVar = local_at(s, s.local_count - 1)
+    loc.array_elem_pointee = arr.pointee
+    1
+
 # AGAST #1667: an arm yielding a bare `Ok(..)` / `Err(..)` / `Some(..)` /
 # `None` builds whichever enum its context dictates (resolve_enum_ctx, the
 # same lookup emit_variant_struct made while emitting the arm), so the merge
@@ -546,6 +596,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                 if is_wildcard == 0 and scrut_slot != 0
                     carrier_payload_struct(s, arm, enum_name, enum_name_len, @pay_struct, @pay_struct_len)
                     ptr_kind = carrier_payload_ptr_struct(s, arm, enum_name, enum_name_len, @ptr_struct, @ptr_struct_len)
+                if is_wildcard == 0 and pay_struct == null and ptr_kind == 0 and scrut_slot != 0 and emit_array_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len) == 1
+                    is_wildcard = 1   # AGAST #3029: bound, as the `[N]T` it is
                 if is_wildcard == 0 and ptr_kind != 0
                     # AGAST #2436: `Some(v)` over `Option<*Pair>`: v is a `*Pair`.
                     var ptr_variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)

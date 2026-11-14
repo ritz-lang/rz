@@ -1110,7 +1110,13 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_declared_type == TYPE_VOID and stmt.var_init != null and (stmt.var_init.kind == EXPR_ARRAY_LIT or stmt.var_init.kind == EXPR_ARRAY_FILL)
         var ael_name: *u8 = null
         var ael_len: i32 = 0
-        let ael_ty: i32 = array_init_elem(s, stmt.var_init, @ael_name, @ael_len)
+        var ael_ty: i32 = array_init_elem(s, stmt.var_init, @ael_name, @ael_len)
+        # AGAST #3029: `[@x, @x]` is `[2]*T`, T recorded.
+        var ael_pointee: i32 = TYPE_VOID
+        if ael_ty == TYPE_VOID
+            ael_pointee = array_init_ptr_pointee(s, stmt.var_init, @ael_name, @ael_len)
+            if ael_pointee != TYPE_VOID
+                ael_ty = TYPE_PTR
         var ael_n: i32 = 0
         if stmt.var_init.kind == EXPR_ARRAY_FILL
             ael_n = stmt.var_init.int_val as i32
@@ -1124,6 +1130,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             stmt.var_type = TYPE_ARRAY
             stmt.var_array_size = ael_n
             stmt.var_array_elem_type = ael_ty
+            stmt.var_array_elem_pointee = ael_pointee
             stmt.var_type_name = ael_name
             stmt.var_type_name_len = ael_len
 
@@ -3357,6 +3364,35 @@ fn array_init_elem(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32) -> i3
     if array_lit_struct_elem(s, e, name, name_len) > 0
         return TYPE_STRUCT
     scalar_elem_kind(s, e.args)
+
+# AGAST #3029: T when the literal or fill `e` is of pointers, as ritz0 has it
+# from its first element: `@x` / `@&x` with `x` a local integer, float or
+# struct (its name in *name / *name_len).  TYPE_VOID for any other, which
+# array_init_elem's caller leaves untyped.  emit_var_decl types an
+# unannotated `let a = [@x, @x]` as `[2]*T` with it, T recorded so `*a[1]`
+# loads T's width.
+fn array_init_ptr_pointee(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32) -> i32
+    *name = null
+    *name_len = 0
+    var first: *Expr = e.args
+    if e.kind == EXPR_ARRAY_FILL
+        first = e.left
+    if first == null or first.kind != EXPR_UNARY or (first.op != OP_ADDR and first.op != OP_ADDR_MUT)
+        return TYPE_VOID
+    let o: *Expr = first.operand
+    if o == null or o.kind != EXPR_IDENT
+        return TYPE_VOID
+    let loc: *LocalVar = find_local_struct_name(s, o.ident_ptr, o.ident_len)
+    if loc == null or loc.is_bool == 1 or loc.bk_unsure == 1
+        return TYPE_VOID
+    let t: i32 = loc.var_type
+    if t == TYPE_STRUCT and loc.type_name_len > 0
+        *name = loc.type_name
+        *name_len = loc.type_name_len
+        return TYPE_STRUCT
+    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64 or t == TYPE_F32 or t == TYPE_F64
+        return t
+    TYPE_VOID
 
 # The scalar type ritz0 gives an array whose first element is `first`: an
 # untyped int literal is i64, a typed value keeps its width.  TYPE_VOID for a

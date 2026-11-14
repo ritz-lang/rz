@@ -13,6 +13,7 @@ import narrowing
 import bool_check   # AGAST #2342
 import literal_slot # AGAST #2341
 import index_through # emit_through_elem_ptr (AGAST #2443)
+import monomorph     # array_arg_decode (AGAST #3029)
 import ritzlib.memory
 
 # AGAST #1813: per-call register arrays, sized from the argument list.  They
@@ -2060,6 +2061,49 @@ fn emit_payload_into_slot(s: *EmitterState, enum_name: *u8, enum_name_len: i32, 
     s.ctx_enum_arg = saved_arg
     reg
 
+# AGAST #3029: 1, and the `[N]T` in *out, when `e` is an array literal or fill
+# and variant `tag` of `enum_name` declares an array payload: a user enum's
+# tuple field (`V([2]u8)`) or a tagged enum's argument (`Option<[2]u8>`, spelt
+# `arr2_u8`).  0 for anything else.
+fn variant_array_payload(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, e: *Expr, out: *ArrayArg) -> i32
+    if e == null or (e.kind != EXPR_ARRAY_LIT and e.kind != EXPR_ARRAY_FILL)
+        return 0
+    variant_array_type(s, enum_name, enum_name_len, tag, out)
+
+# AGAST #3029: 1, and the `[N]T` in *out, when variant `tag` of `enum_name`
+# declares an array payload.  The match binding reads it back at that type
+# (emit_array_payload_bind).
+fn variant_array_type(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, out: *ArrayArg) -> i32
+    if enum_name == null or enum_name_len <= 0
+        return 0
+    let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, tag)
+    if uf != null
+        if uf.field_type != TYPE_ARRAY or uf.array_size <= 0
+            return 0
+        out.size = uf.array_size
+        out.elem = uf.array_elem_type
+        out.pointee = uf.array_elem_pointee
+        out.name = uf.array_elem_type_name
+        out.name_len = uf.array_elem_type_name_len
+        return 1
+    var arg_len: i32 = 0
+    let arg: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, tag, @arg_len)
+    if arg == null or arg_len <= 0
+        return 0
+    array_arg_decode(arg, arg_len, out)
+
+# AGAST #3029: write the array literal or fill `e` into the payload buffer at
+# `pay_ptr`, at its declared `[N]T` (variant_array_payload), as a struct
+# literal's array field is (emit_struct_lit_array_fill_field).  emit_expr has
+# no slot for one: it built a shadow `[N x i64]` and the payload got its
+# ADDRESS (#3014 refused that).
+fn emit_array_payload_into(s: *EmitterState, pay_ptr: i32, arr: *ArrayArg, e: *Expr)
+    literal_array(s, e, arr.elem, arr.pointee)   # AGAST #2341
+    if e.kind == EXPR_ARRAY_LIT
+        emit_array_lit_into(s, pay_ptr, arr.size, arr.elem, arr.name, arr.name_len, e)
+    else
+        emit_array_fill_into(s, pay_ptr, arr.size, arr.elem, arr.name, arr.name_len, e.left)
+
 # Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
 # zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
 # where `tag` 0 / 1 also picks Ok-Some / Err for the payload width) or a
@@ -2069,8 +2113,13 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
     # Emit payload first (may consume registers); keep expr value for store.
     var payload_reg: i32 = 0
     var have_payload: i32 = 0
+    # AGAST #3029: an array literal payload is written in place, below.
+    var arr_pay: ArrayArg
+    let arr_payload: i32 = variant_array_payload(s, enum_name, enum_name_len, tag, payload_expr, @arr_pay)
     # AGAST #2272: `Ok(())` carries a zero-byte payload: nothing to store.
-    if payload_expr != null and is_unit_expr(payload_expr) == 0
+    if arr_payload == 1
+        have_payload = 2
+    else if payload_expr != null and is_unit_expr(payload_expr) == 0
         payload_reg = emit_lent_payload(s, enum_name, enum_name_len, tag, payload_expr)
         if payload_reg == 0
             payload_reg = emit_payload_into_slot(s, enum_name, enum_name_len, tag, payload_expr)
@@ -2106,6 +2155,17 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
     emit_str(s, c", ptr ")
     emit_reg(s, tag_ptr)
     emit_str(s, c"\n")
+
+    if have_payload == 2
+        let arr_ptr: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, arr_ptr)
+        emit_str(s, c" = getelementptr %")
+        emit_name(s, enum_name, enum_name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, slot)
+        emit_str(s, c", i32 0, i32 2\n")
+        emit_array_payload_into(s, arr_ptr, @arr_pay, payload_expr)
 
     if have_payload == 1
         # Payload goes into field 2 (the `[N x i8]` buffer after the pad,
