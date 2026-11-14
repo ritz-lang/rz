@@ -171,7 +171,6 @@ fn ms() -> Span<u8>
 # ritz1 evaluates these receivers once too, where it can compile them. What's
 # missing is something else, so each row cites its own ticket.
 BOTH_RITZ1 = ("ritz1", "ritz1_selfhosted")
-NO_CHAINS = {c: 2295 for c in BOTH_RITZ1}
 NO_SPAN_EMPTY = {c: 2296 for c in BOTH_RITZ1}
 NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
 NO_DYN_RETURN = {c: 2298 for c in BOTH_RITZ1}
@@ -195,9 +194,12 @@ CASES = {
     "trait_impl": ("mp().say()", 1, 0, {}),
     "grouped": ("(mp()).get()", 1, 0, {}),
     # A chain doubled at every link: 2, then 6 calls for two links.
-    "chain": ("make(1).again().peek()", 2, 2, NO_CHAINS),
-    "chain_long": ("make(1).again().again().again().peek()", 4, 4, NO_CHAINS),
-    "chain_copy": ("mp().next().next().next().get()", 1, 0, NO_CHAINS),
+    "chain": ("make(1).again().peek()", 2, 2, {}),
+    "chain_long": ("make(1).again().again().again().peek()", 4, 4, {}),
+    # A by-value struct a call returns names the next link's impl (#2295),
+    # and the field read off the chain's end.
+    "chain_copy": ("mp().next().next().next().get()", 1, 0, {}),
+    "chain_copy_field": ("take(mp().next().next().x)", 1, 0, {}),
     # Built-ins that never reach the impl table.
     "bitops": ("mi().clz()", 1, 0, {}),
     "float": ("mf().abs()", 1, 0, {}),
