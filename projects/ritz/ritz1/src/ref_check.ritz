@@ -61,6 +61,10 @@ pub struct RefTy
     # Param.param_ref_ptr_pointee keeps it; TYPE_VOID if unknown.  A scalar U
     # has no name, so without it `@&*i32` and `@&*i64` were one type.
     ptr_pointee: i32
+    # AGAST #3048: a `**T` slot's T, as ptr_pointee keeps its kind; only
+    # ref_ptr_ptr_slot sets it, and only a struct T has one.
+    held_name: *u8
+    held_name_len: i32
 
 # A tail and the slot it lands in.
 struct RefTail
@@ -116,6 +120,8 @@ fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.ref_elem = TYPE_VOID
     out.name_only = 0
     out.ptr_pointee = TYPE_VOID
+    out.held_name = null
+    out.held_name_len = 0
     1
 
 fn ref_set_array(out: *RefTy, elem: i32, elem_pointee: i32, name: *u8, len: i32, shape: *ArrayShape) -> i32
@@ -625,6 +631,9 @@ fn ref_value_into_ref(s: *EmitterState, e: *Expr, a: *RefTy, slot: *RefTy)
         if ref_is_written(e) == 1 and ref_unsure_referent(s, e) == 0 and ref_other_written(s, e, a, slot) == 1
             ref_error_other_type(s, e)
             return
+        if ref_is_ptr_ptr_referent(a, slot) == 1
+            ref_error_value(s, e, slot)
+            return
         if slot.pointee != TYPE_PTR or slot.kind == TYPE_PTR
             return
         if a.kind == TYPE_PTR and a.pointee != TYPE_PTR
@@ -637,6 +646,22 @@ fn ref_value_into_ref(s: *EmitterState, e: *Expr, a: *RefTy, slot: *RefTy)
         return
     if slot.kind != TYPE_PTR or ref_is_referent(a, slot) == 1 or ref_names_lent(s, e) == 1
         ref_error_value(s, e, slot)
+
+# AGAST #3048: 1 when `a` is a `*T` and `slot` a `**T` of that very T: the
+# `*T` is the value a `**T` refers to, so `@q` is what's meant (Aaron's ruling:
+# no implicit `*T` -> `**T`; `q as **T` says it on purpose).  Exactly T, as
+# ritz0's `same`: a `*U` of another U is a pointer as an integer (#2370).
+fn ref_is_ptr_ptr_referent(a: *RefTy, slot: *RefTy) -> i32
+    if a.kind != TYPE_PTR or slot.kind != TYPE_PTR or slot.pointee != TYPE_PTR
+        return 0
+    let t: i32 = slot.ptr_pointee
+    if t == TYPE_VOID or t == TYPE_UNKNOWN or a.pointee != t
+        return 0
+    if t != TYPE_STRUCT
+        return 1
+    if a.name_len == 0 or slot.held_name_len == 0
+        return 0
+    name_eq(a.name, a.name_len, slot.held_name, slot.held_name_len)
 
 # AGAST #2364: 1 when `a`'s `*U` pointee is known not to be `slot`'s.  A scalar
 # U has no name for the branch above to compare, so the kinds are, exactly, as
@@ -867,33 +892,41 @@ fn ref_walk_list(s: *EmitterState, a0: *Expr)
 # A `**T` slot, at a field, a `let` or an `=` (AGAST #2370, #2528): a pointer
 # whose referent is a pointer, whatever T is.  Nameless, so ref_other_referent
 # judges `@n` of any type the tables name as another type, and a `:&` param
-# bare is a value; `@q` of a `*U` and a `**U` value stay unjudged, and so does a
-# `*U` value, which ritz0 refuses (AGAST #3048).
-fn ref_ptr_ptr_slot(out: *RefTy) -> i32
+# bare is a value; `@q` of a `*U` and a `**U` value stay unjudged.  It keeps T
+# (`inner`, a `**T`'s inner-pointee slot, and a struct T's name) in ptr_pointee
+# and held_name, so a `*T` value is judged as the value it is (AGAST #3048); a
+# `***T` keeps none.
+fn ref_ptr_ptr_slot(out: *RefTy, inner: i32, name: *u8, len: i32) -> i32
     ref_set(out, TYPE_PTR, TYPE_PTR, null, 0)
+    if ptr_ptr_slot_levels(inner) != 2
+        return 1
+    out.ptr_pointee = ptr_ptr_slot_inner(inner)
+    if out.ptr_pointee == TYPE_STRUCT
+        out.held_name = name
+        out.held_name_len = len
+    1
 
 # The slot an `=` to the name `name` writes: what it holds, or a `**T` slot.
 fn ref_slot_of_name(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
     if ref_of_ident(s, name, len, out) == 1
         return 1
     let idx: i32 = find_local_idx(s, name, len)
-    var t: i32 = TYPE_VOID
     if idx >= 0
-        t = local_at(s, idx).var_type
-    else
-        let g: *GlobalVarDef = find_global(s, name, len)
-        if g != null
-            t = g.var_type
-    if t != TYPE_PTR_PTR
+        let loc: *LocalVar = local_at(s, idx)
+        if loc.var_type != TYPE_PTR_PTR
+            return 0
+        return ref_ptr_ptr_slot(out, loc.inner_pointee_type, loc.type_name, loc.type_name_len)
+    let g: *GlobalVarDef = find_global(s, name, len)
+    if g == null or g.var_type != TYPE_PTR_PTR
         return 0
-    ref_ptr_ptr_slot(out)
+    ref_ptr_ptr_slot(out, g.inner_pointee_type, g.pointee_type_name, g.pointee_type_name_len)
 
 # What field `f` takes, as a slot.
 fn ref_field_slot(f: *StructField, out: *RefTy)
     if f.field_type == TYPE_ARRAY
         ref_of_array_field(f, out)
     else if f.field_type == TYPE_PTR_PTR
-        ref_ptr_ptr_slot(out)
+        ref_ptr_ptr_slot(out, f.inner_pointee_type, f.field_type_name, f.field_type_name_len)
     else if f.field_type == TYPE_PTR and f.field_mut_ref == 1
         ref_set(out, TYPE_MUT_REF, f.array_elem_type, f.field_type_name, f.field_type_name_len)
     else
@@ -1126,7 +1159,7 @@ fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
     if stmt.var_declared_type == TYPE_VOID
         return 0
     if stmt.var_type == TYPE_PTR_PTR
-        return ref_ptr_ptr_slot(out)
+        return ref_ptr_ptr_slot(out, stmt.var_inner_pointee_type, stmt.var_type_name, stmt.var_type_name_len)
     if stmt.var_type == TYPE_ARRAY
         return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, stmt.var_type_name, stmt.var_type_name_len, stmt.var_array_shape)
     ref_set(out, stmt.var_type, stmt.var_pointee_type, stmt.var_type_name, stmt.var_type_name_len)

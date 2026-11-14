@@ -1175,6 +1175,100 @@ fn mk(n:& i64) -> PP
 """,
 }
 
+# Nor does a `*i64`: a `**i64` refers to one, so the `*i64` itself is the value
+# and `@q` the reference (AGAST #3048, Aaron's ruling: no implicit `*T` ->
+# `**T`). A `*U` of another U is a pointer as an integer (#2370) and stays.
+POINTER_INTO_POINTER_TO_POINTER = {
+    "let": """\
+fn mk(n:& *i64) -> i32
+    var q: *i64 = n
+    let p: **i64 = ^q
+    return 0
+""",
+    "let_bare_param": """\
+fn mk(n:& *i64) -> i32
+    let p: **i64 = ^n
+    return 0
+""",
+    "assign": """\
+fn mk(q: *i64) -> i32
+    var p: **i64 = null
+    p = ^q
+    return 0
+""",
+    "assign_global": """\
+var G: **i64 = null
+
+fn mk(q: *i64) -> i32
+    G = ^q
+    return 0
+""",
+    "store": """\
+struct PP
+    p: **i64
+
+fn mk(q: *i64) -> PP
+    var w: PP
+    w.p = ^q
+    return w
+""",
+    "struct": """\
+struct S
+    x: i64
+
+fn mk(q: *S) -> i32
+    let p: **S = ^q
+    return 0
+""",
+}
+
+# What a `**i64` does take: the address of a `*i64`, another `**i64`, a `*i64`
+# cast to one on purpose, and a `*u8` (AGAST #3048).
+CONTROLS.update({
+    "pointer_to_pointer_of_address": """\
+fn get(q: *i64) -> i64
+    var r: *i64 = q
+    let p: **i64 = @r
+    return **p
+
+pub fn main() -> i32
+    var x: i64 = 3
+    return get(@x) as i32
+""",
+    "pointer_to_pointer_of_value": """\
+fn get(pp: **i64) -> i64
+    var p: **i64 = null
+    p = pp
+    return **p
+
+pub fn main() -> i32
+    var x: i64 = 3
+    var q: *i64 = @x
+    return get(@q) as i32
+""",
+    "pointer_to_pointer_cast": """\
+fn get(q: *i64) -> i64
+    let p: **i64 = q as **i64
+    return *(*p)
+
+pub fn main() -> i32
+    var x: i64 = 3
+    var q: *i64 = @x
+    return get(@q as *i64) as i32
+""",
+    # A `*U` of another U is a pointer as an integer (#2370): not judged here.
+    "pointer_to_pointer_of_bytes": """\
+fn get(b: *u8) -> i64
+    let p: **i64 = b
+    return **p
+
+pub fn main() -> i32
+    var x: i64 = 3
+    var q: *i64 = @x
+    return get(@q as *u8) as i32
+""",
+})
+
 # AGAST #2250: known gaps next to it, each pinned by its own ticket below.
 CONTROLS.update({
     "by_value_float_field": """\
@@ -3055,6 +3149,14 @@ def test_a_written_reference_into_a_field_of_another_pointee_is_refused(tmp_path
 def test_an_i64_into_a_pointer_to_pointer_slot_is_refused(tmp_path, compiler, name, form, message):
     program = POINTER_TO_POINTER[name].replace("^", "^" + form) + ENTRY
     _assert_refused(compiler, tmp_path, f"{name}_{form or 'bare'}", program, message)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(POINTER_INTO_POINTER_TO_POINTER))
+def test_a_pointer_into_a_pointer_to_pointer_slot_is_refused(tmp_path, compiler, name):
+    program = POINTER_INTO_POINTER_TO_POINTER[name] + ENTRY
+    _assert_refused(compiler, tmp_path, name, program, VALUE_INTO_SHARED_REF)
 
 
 # A by-value slot only copies a referent of its own type. Reading a `C` as a
