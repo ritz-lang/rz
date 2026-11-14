@@ -4062,8 +4062,40 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 # TYPE_UNKNOWN (unresolvable base), which falls back to the legacy i64
 # stride/width.  Index and value are emitted here to preserve the historical
 # evaluation order (index before value, both after the base load).
-fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, base_type: i32, pointee: i32)
+#
+# AGAST #2277: `st_name` names the pointee struct of a `*C` base (len 0 when
+# there's none); the struct arm below strides and stores by it.
+fn emit_index_assign_ptr_store(s: *EmitterState, stmt: *Stmt, base_ptr: i32, base_type: i32, pointee: i32, st_name: *u8, st_name_len: i32)
+    if base_type != TYPE_PTR_PTR and pointee == TYPE_STRUCT and st_name_len > 0 and find_struct(s, st_name, st_name_len) != null
+        emit_ptr_struct_elem_store(s, stmt.while_cond, stmt.assign_value, base_ptr, st_name, st_name_len)
+        return
     emit_ptr_elem_store(s, stmt.while_cond, stmt.assign_value, base_ptr, base_type, pointee)
+
+# AGAST #2277: `p[i] = v` with `p: *C` GEPs and stores a whole `C`.  It fell
+# to the i64 arm of emit_ptr_elem_store (`getelementptr i64` + `store i64` of
+# a `%C` register), which clang refused.  The value is read as a by-value `C`
+# slot (#2250): a `c:& C` param copies its referent, and a move-only one is
+# refused as a move out of a reference.
+fn emit_ptr_struct_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, base_ptr: i32, st_name: *u8, st_name_len: i32)
+    let idx_reg: i32 = emit_expr(s, idx_expr)
+    let val_reg: i32 = emit_expr_by_value(s, value, TYPE_STRUCT, st_name, st_name_len)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, st_name, st_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c"\n")
+    emit_str(s, c"  store ")
+    emit_llvm_type_struct(s, TYPE_STRUCT, st_name, st_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, val_reg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c"\n")
 
 # The body of emit_index_assign_ptr_store, for any index / value pair.  AGAST
 # #2545: `(*r)[i] = v` (an expression-target assign) stores through it too.
@@ -5637,9 +5669,13 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_reg(s, loaded_i64)
                 emit_str(s, c" to ptr\n")
                 var pointee: i32 = TYPE_UNKNOWN
+                var pst_name: *u8 = null
+                var pst_len: i32 = 0
                 if local != null
                     pointee = local.pointee_type
-                emit_index_assign_ptr_store(s, stmt, base_ptr, base_type, pointee)
+                    pst_name = local.type_name
+                    pst_len = local.type_name_len
+                emit_index_assign_ptr_store(s, stmt, base_ptr, base_type, pointee, pst_name, pst_len)
         else
             # AGAST #1332: GLOBAL pointer base.  Previously `base_reg >= 0`
             # had no else, so `g[i] = v` through a global *T / **T emitted
@@ -5742,7 +5778,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_str(s, c" = inttoptr i64 ")
                 emit_reg(s, gloaded)
                 emit_str(s, c" to ptr\n")
-                emit_index_assign_ptr_store(s, stmt, gbase_ptr, glob.var_type, glob.pointee_type)
+                emit_index_assign_ptr_store(s, stmt, gbase_ptr, glob.var_type, glob.pointee_type, glob.pointee_type_name, glob.pointee_type_name_len)
     else if stmt.kind == STMT_MEMBER_ASSIGN
         # `(*X).field = value` (and the desugared `(*X).field op= value`):
         # stmt.if_cond = X, stmt.assign_target = field name,

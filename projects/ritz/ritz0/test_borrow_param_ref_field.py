@@ -890,6 +890,38 @@ pub fn main() -> i32
     c.x = 9
     return a[1].x
 """,
+    # AGAST #2277: no borrow at all. The store strides and writes a whole `C`,
+    # so a[0] is left alone and a[1].y lands 8 bytes into a[1], not in a[0].
+    "plain_pointer_element": BY_VALUE + """
+fn fill(p: *C, d: C)
+    p[1] = d
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 1, y: 0 }
+    var d: C = C { x: 2, y: 7 }
+    fill(@a[0], d)
+    if a[1].y != 7
+        return 0
+    return a[0].x + a[1].x
+""",
+    # The same store through a global `*C`.
+    "plain_global_pointer_element": BY_VALUE + """
+var GP: *C
+
+fn fill(d: C)
+    GP[1] = d
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 1, y: 0 }
+    GP = @a[0]
+    var d: C = C { x: 2, y: 7 }
+    fill(d)
+    if a[1].y != 7
+        return 0
+    return a[0].x + a[1].x
+""",
     "by_value_global_array_element": BY_VALUE + """
 var GA: [2]C
 
@@ -2598,8 +2630,6 @@ for _name in NO_IMPLICIT_DEREF:
 
 # Keyed by program, across STORES, CONTROLS and MOVE_OUT.
 RITZ1_GAPS = {
-    "by_value_pointer_element": "AGAST #2277: `p[i] = v` with a struct value isn't lowered",
-    "pointer_element": "AGAST #2277: `p[i] = v` with a struct value isn't lowered",
     "by_value_self": "AGAST #2278: ritz1 doesn't know a typed `self:& T` is a borrow",
     "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
