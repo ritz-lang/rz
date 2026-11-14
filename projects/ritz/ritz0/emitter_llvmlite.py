@@ -14626,6 +14626,12 @@ class LLVMEmitter:
             scrut = scrut.expr
         if isinstance(scrut, rast.UnaryOp) and scrut.op in ('@', '&', '@&', '&mut'):
             scrut = scrut.operand
+        if expr.ctor_type is not None:
+            # A generic user enum's instance, as monomorph inferred it from
+            # the payload (`match Hold(5)` is a `W$i64`, AGAST #2437).
+            enum_name = self._resolve_enum_type_name(expr.ctor_type)
+            if enum_name is not None:
+                return self._emit_enum_variant_with_type(scrut, enum_name), enum_name
         ty = self._bare_ctor_type(scrut)
         if ty is None:
             return None

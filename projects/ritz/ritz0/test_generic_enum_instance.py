@@ -182,6 +182,23 @@ RUNS = {
                               "        None => 4\nfn main() -> i32\n"
                               "    let a: Option<Option<i32>> = Some(Some(6))\n"
                               "    let b: Option<Option<i32>> = Some(None)\n    f(a) * 10 + f(b)\n", 63),
+    # AGAST #2437: a bare constructor as a match scrutinee has no slot, so the
+    # payload binds T as for an untyped let (LANGUAGE_SPEC section 11.3), and
+    # the fn's return type has no say: the scrutinee isn't its value (#2419).
+    # ritz0 crashed (`Unknown function: Full`), ritz1 linked against `@Full`.
+    "scrutinee": (SLOT + "fn main() -> i32\n    match Full(5)\n"
+                  "        Full(v) => v as i32\n        Empty => 2\n", 5),
+    "scrutinee_literal_is_i64_whatever_the_fn_returns": (
+        SLOT + F + "fn mk() -> Slot<i32>\n    var r: i32 = 0\n    match Full(0x100000009)\n"
+        "        Full(v) =>\n            r = (v >> 32) as i32\n        Empty =>\n            r = 2\n"
+        "    Full(r)\nfn main() -> i32\n    f(mk())\n", 1),
+    "scrutinee_takes_the_payloads_type": (SLOT + "fn main() -> i32\n    let x: u8 = 200\n"
+                                          "    match @Full(x)\n        Full(v) => v as i32 - 190\n"
+                                          "        Empty => 2\n", 10),
+    "scrutinee_in_a_generic_fn": (SLOT + "fn g<T>(x: T) -> i32\n    match Full(x)\n"
+                                  "        Full(v) => 1\n        Empty => 9\n"
+                                  "fn main() -> i32\n    let a: u8 = 3\n    g<i64>(4) * 10 + g<u8>(a)\n",
+                                  11),
     "literal_option_as_err": ("fn main() -> i32\n    let r: Result<i32, Option<i64>> = Err(Some(5))\n"
                               "    match r\n        Ok(v) => 1\n        Err(x) =>\n"
                               "            match x\n                Some(v) => v as i32\n"
@@ -258,6 +275,22 @@ def test_an_instance_runs_as_ritz0_runs_it(tmp_path, need_ritz1, compiler, name)
     assert _run(compiler, tmp_path, src) == code, f"{compiler}, {name}"
 
 
+# AGAST #2437: `match Full(x)`, x a u8, builds a `Slot<u8>` even beside a
+# `Slot<i64>` the module names after it; ritz0's emitter took the last instance
+# declaring `Full`.  Only the binding's size tells them apart, and ritz1 sizes
+# every payload binding as an i64 (#3116), though it builds `Slot$u8`.
+@pytest.mark.parametrize("compiler", [
+    "ritz0",
+    *(pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="AGAST #3116"))
+      for c in ("ritz1", "ritz1_selfhosted"))])
+def test_ritz0_builds_the_scrutinees_own_instance(tmp_path, need_ritz1, compiler):
+    need_ritz1(compiler)
+    src = (SLOT + "fn main() -> i32\n    let s: Slot<u8> = Full(200 as u8)\n"
+           "    let t: Slot<i64> = Full(5)\n    let x: u8 = 200\n    match Full(x)\n"
+           "        Full(v) => sizeof(v) as i32\n        Empty => 2\n")
+    assert _run(compiler, tmp_path, src) == 1, compiler
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_an_imported_generic_enum_is_instantiated_here(tmp_path, need_ritz1, compiler):
     """The template is another module's; its instance is this compile's."""
@@ -275,6 +308,11 @@ UNINFERABLE = {
     "unit_variant": ("    let s = Empty\n    0\n", "8:13", "T", "Empty"),
     "unit_variant_var": ("    var s = Empty\n    0\n", "8:13", "T", "Empty"),
     "a_param_the_payload_leaves": ("    let t = L(4)\n    0\n", "8:13", "B", "L"),
+    # AGAST #2437: a match scrutinee, as `let` above.
+    "unit_variant_scrutinee": ("    match Empty\n        Full(v) => 1\n        Empty => 2\n",
+                               "8:11", "T", "Empty"),
+    "a_param_the_scrutinee_leaves": ("    match L(4)\n        L(a) => 1\n        R(b) => 2\n",
+                                     "8:11", "B", "L"),
 }
 TWO = "enum Two<A, B>\n    L(A)\n    R(B)\n"
 
@@ -303,3 +341,19 @@ def test_an_uninferable_constructor_is_refused_at_it(tmp_path, need_ritz1, compi
     found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
     assert (where, _uninferable_message(tp, variant)) in found, \
         f"{compiler}: {name}, wanted {where}:\n{src}\n{out[-2000:]}"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_refused_unit_scrutinee_is_the_only_error(tmp_path, need_ritz1, compiler):
+    """AGAST #2437: `match Empty` is refused at `Empty`, and that is all: ritz1
+    went on to emit it and trailed an unlocated `unknown identifier 'Empty'`.
+    Unbatched: a batch hands back only the row's located diagnostics."""
+    need_ritz1(compiler)
+    src = SLOT + "fn main() -> i32\n    match Empty\n        Full(v) => 1\n        Empty => 2\n"
+    path, ll = tmp_path / "main.ritz", tmp_path / "main.ll"
+    path.write_text(src)
+    comp = _emit(compiler, path, ll, tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out}"
+    assert "main.ritz:5:11: " in out and _uninferable_message("T", "Empty") in out, out
+    assert "unknown identifier" not in out and "cannot emit" not in out, f"{compiler}:\n{out}"

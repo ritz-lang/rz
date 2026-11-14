@@ -3298,7 +3298,8 @@ parameter's, a field's, the fn's return type. An untyped `let` or `var` has no
 slot. It takes the fn's return type when that is an instance of the variant's
 enum. Otherwise it takes the instance its payload binds, by §4.4's rule for a
 generic call: `Present(5)` is a `Maybe<i64>`, and `Present(x)` with `x: u8`
-is a `Maybe<u8>` (AGAST #2927):
+is a `Maybe<u8>` (AGAST #2927). A `match` scrutinee has no slot either, and
+isn't the fn's value: `match Present(5)` matches a `Maybe<i64>` (AGAST #2437):
 
 ```ritz
 enum Maybe<T>

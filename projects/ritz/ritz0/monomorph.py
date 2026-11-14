@@ -526,6 +526,8 @@ class Monomorphizer:
                     self.var_types[node.name] = inferred
         elif isinstance(node, rast.Call):
             self._infer_one_call(node)
+        elif isinstance(node, rast.Match) and node.ctor_type is None:
+            node.ctor_type = self._infer_variant_scrutinee(node.expr)
 
     def _generic_variant(self, name: str):
         """(enum, variant) when `name` is a variant of a generic user enum and
@@ -543,13 +545,28 @@ class Monomorphizer:
             return None
         return enum_def, variant
 
-    def _infer_variant_let(self, value: rast.Expr) -> Optional[rast.Type]:
+    def _infer_variant_scrutinee(self, value: rast.Expr) -> Optional[rast.Type]:
+        """The instance `match Hold(5)` / `match Gone` builds, `Hold` a
+        variant of a generic `enum W<T>` (AGAST #2437), or None for any other
+        scrutinee.  A scrutinee has no slot and isn't the fn's value (#2419),
+        so only the payload binds T, as for an untyped let in a fn that
+        returns something else; an unbound T is the same located error.
+        ritz0 crashed (`Unknown function: Hold`), ritz1 called `@Hold`."""
+        while isinstance(value, rast.Grouped):
+            value = value.expr
+        if isinstance(value, rast.UnaryOp) and value.op in ('@', '&', '@&', '&mut'):
+            value = value.operand
+        return self._infer_variant_let(value, use_ret=False)
+
+    def _infer_variant_let(self, value: rast.Expr,
+                           use_ret: bool = True) -> Optional[rast.Type]:
         """The type of an untyped `let s = Full(5)` / `var s = Empty`, `Full`
         a variant of a generic `enum Slot<T>` (AGAST #2927), or None for any
         other initialiser.
 
         The fn's return type when it is an instance of that enum, as #2430
-        has it for `let o = Some(5)`; else the instance the payload binds, by
+        has it for `let o = Some(5)` (unless `use_ret` is False); else the
+        instance the payload binds, by
         section 4.4's rule for a generic call: `Full(5)` is a `Slot<i64>`.  A
         type param the payload leaves unbound (any of a unit variant's) is a
         located error: ritz0 crashed unlocated and ritz1 called `@Full`.
@@ -565,7 +582,7 @@ class Monomorphizer:
         if found is None:
             return None
         enum_def, variant = found
-        ret = self._infer_ret_type
+        ret = self._infer_ret_type if use_ret else None
         if isinstance(ret, rast.NamedType) and ret.name == enum_def.name \
                 and len(ret.args) == len(enum_def.type_params):
             return copy.deepcopy(ret)
@@ -910,7 +927,9 @@ class Monomorphizer:
                 self._visit_block(expr.else_block)
         elif isinstance(expr, rast.Match):
             self._visit_expr(expr.expr)
-            scrut_type = self._infer_value_type(expr.expr)
+            if expr.ctor_type is not None:
+                self._visit_type(expr.ctor_type)   # its instance (#2437)
+            scrut_type = expr.ctor_type or self._infer_value_type(expr.expr)
             for arm in expr.arms:
                 # AGAST #2725: `Some(x) => x[1..3]` -- x is the payload's type
                 # in this arm, so its slice/index/method sugar registers
@@ -2172,7 +2191,8 @@ class Monomorphizer:
                               self._rewrite_expr(arm.body))
                 for arm in expr.arms
             ]
-            return rast.Match(expr.span, self._rewrite_expr(expr.expr), new_arms)
+            return rast.Match(expr.span, self._rewrite_expr(expr.expr), new_arms,
+                              self._rewrite_type(expr.ctor_type) if expr.ctor_type else None)
         elif isinstance(expr, rast.SliceExpr):
             return rast.SliceExpr(expr.span,
                                   self._rewrite_expr(expr.expr),

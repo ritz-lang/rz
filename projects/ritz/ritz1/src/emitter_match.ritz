@@ -1262,12 +1262,17 @@ fn match_scrutinee_is_ctor(s: *EmitterState, e: *Expr) -> i32
         return 1
     var vi: i32 = 0
     var other: i32 = 0
+    if generic_ctor_enum(s, e, @vi) >= 0   # AGAST #2437
+        return 1
     (bare_unit_variant_enum(s, e, @vi, @other) >= 0) as i32
 
 # 1 when `e` builds its enum where it stands, payload and all: nothing but the
 # match can own that value (own_scrutinee_moved).
 fn match_scrutinee_builds(s: *EmitterState, e: *Expr) -> i32
     if is_tagged_ctor(s, e) == 1
+        return 1
+    var gvi: i32 = 0
+    if e.kind == EXPR_CALL and generic_ctor_enum(s, e, @gvi) >= 0   # AGAST #2437
         return 1
     var name: *u8 = null
     var len: i32 = 0
@@ -1375,6 +1380,118 @@ fn ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i
     *out_name = name
     *out_len = len
 
+# --- A generic user enum's bare constructor as the scrutinee (AGAST #2437) ----
+#
+# `match Hold(5)` for `enum W<T>`: the template has no struct, so the constructor
+# lowered to a call to an undefined `@Hold`, and `match Gone` was an unknown
+# identifier.  A scrutinee has no slot (§11.3; nor is it the fn's value, #2419),
+# so the payload binds T as it does for an untyped let: `Hold(5)` is a `W$i64`.
+# A T the payload leaves unbound, every one of a unit variant's, is the located
+# error ritz0's Monomorphizer._infer_variant_scrutinee gives.  Here, not in
+# generic_infer: a generic fn's `match Hold(x)` is emitted specialised, x typed.
+
+# The generic enum the bare constructor `e` builds (*out_vi its variant), or -1:
+# not a constructor, a name a local / const / global / fn takes, or a variant
+# another enum declares too.  Option and Result are the tagged constructors'.
+fn generic_ctor_enum(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
+    *out_vi = 0 - 1
+    var name: *u8 = null
+    var len: i32 = 0
+    if e.kind == EXPR_CALL and e.call_type_suffix_len == 0
+        name = e.func_name
+        len = e.func_name_len
+    else if e.kind == EXPR_IDENT
+        name = e.ident_ptr
+        len = e.ident_len
+        if find_local(s, name, len) >= 0 or is_const(s, name, len) == 1 or find_global(s, name, len) != null
+            return 0 - 1
+    if name == null or find_fn(s, name, len) != null
+        return 0 - 1
+    let ei: i32 = generic_enum_of_variant(name, len, out_vi)
+    if ei < 0
+        return 0 - 1
+    var en_len: i32 = 0
+    let en: *u8 = enum_name_at(ei, @en_len)
+    if en_len == 6 and (memcmp(en, c"Option", 6) == 0 or memcmp(en, c"Result", 6) == 0)
+        return 0 - 1
+    ei
+
+var g_gctor_refused: *Expr = null   # the scrutinee generic_ctor_scrutinee_enum refused
+
+# "can't infer `T` for `Gone`: give the binding a type", at the constructor.
+fn generic_ctor_error(s: *EmitterState, e: *Expr, tp: *TypeParam, name: *u8, len: i32)
+    var n: i32 = 0
+    let head: *u8 = ctor_join(c"can't infer `", 13, tp.name, tp.name_len, c"` for `", 7, @n)
+    var m: i32 = 0
+    let msg: *u8 = ctor_join(head, n, name, len, c"`: give the binding a type", 26, @m)
+    emit_nd_error(s, e.span.line, e.span.col, msg)
+    g_gctor_refused = e
+
+# The instance `scr` builds, recorded and queued for its type decl, in *out_name;
+# null when `scr` is no such constructor, or it was refused (g_gctor_refused).
+fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    var vi: i32 = 0
+    let ei: i32 = generic_ctor_enum(s, scr, @vi)
+    if ei < 0
+        return
+    var name: *u8 = scr.ident_ptr
+    var len: i32 = scr.ident_len
+    var args: *Expr = null
+    if scr.kind == EXPR_CALL
+        name = scr.func_name
+        len = scr.func_name_len
+        args = scr.args
+    let tps: *TypeParam = generic_enum_params(ei)
+    let n: i32 = count_type_params(tps)
+    if n == 0
+        return
+    let names: **u8 = malloc((n as i64) * 8) as **u8
+    let lens: *i32 = malloc((n as i64) * 4) as *i32
+    for i in 0..n
+        *(names + i) = null
+        *(lens + i) = 0
+    # A payload field typed exactly `T` binds T to its argument's type, spelled
+    # as a mangled name (ctor_payload_spelling: a literal is i64).  A second
+    # binding that disagrees leaves it unbound, as ritz0's conflict does.
+    var f: *StructField = enum_variant_fields(ei, vi)
+    var arg: *Expr = args
+    while f != null and arg != null
+        if f.field_type == TYPE_STRUCT and f.field_type_name != null
+            let ti: i32 = type_param_index(tps, f.field_type_name, f.field_type_name_len)
+            if ti >= 0 and *(lens + ti) >= 0
+                var sp: *u8 = null
+                let sp_len: i32 = ctor_payload_spelling(s, arg, @sp)
+                if sp_len > 0 and *(names + ti) == null
+                    *(names + ti) = sp
+                    *(lens + ti) = sp_len
+                else if sp_len > 0 and name_eq(*(names + ti), *(lens + ti), sp, sp_len) == 0
+                    *(lens + ti) = 0 - 1
+        f = f.next
+        arg = arg.next
+    var en_len: i32 = 0
+    let en: *u8 = enum_name_at(ei, @en_len)
+    var full: *u8 = ctor_join(en, en_len, c"", 0, c"", 0, out_len)
+    var tp: *TypeParam = tps
+    var i: i32 = 0
+    while tp != null
+        if *(lens + i) <= 0
+            generic_ctor_error(s, scr, tp, name, len)
+            *out_name = null
+            *out_len = 0
+            return
+        full = ctor_join(full, *out_len, c"$", 1, *(names + i), *(lens + i), out_len)
+        tp = tp.next
+        i = i + 1
+    add_enum_instance(s.module, full, *out_len, en_len)
+    if user_enum_index(full, *out_len) < 0
+        *out_len = 0
+        return   # not an instance monomorph could record: no enum to build
+    if namelist_find(@s.late_enums, full, *out_len) < 0
+        namelist_push(@s.late_enums, full, *out_len)
+    *out_name = full
+
 # `scr` under the enum the match named.  What the slot around the match wants (a
 # typed let, the fn's return type) is that match's value, not its scrutinee's.
 fn emit_ctor_scrutinee(s: *EmitterState, scr: *Expr, name: *u8, len: i32) -> i32
@@ -1396,6 +1513,9 @@ fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out_name: *
     if resolve_scrutinee_enum(s, scr, out_name, out_len) == 1
         return 1
     ctor_scrutinee_enum(s, scr, out_name, out_len)   # AGAST #2419
+    if *out_name != null
+        return 1
+    generic_ctor_scrutinee_enum(s, scr, out_name, out_len)   # AGAST #2437
     if *out_name != null
         return 1
     var name: *u8 = null
@@ -1935,6 +2055,8 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     # AGAST #2419: never the zero a constructor with no enum lowers to.
     if is_enum == 0 and is_tagged_ctor(s, typed) == 1
         emit_ctor_type_error(s, typed)
+        return 0
+    if is_enum == 0 and typed == g_gctor_refused   # AGAST #2437, reported
         return 0
     # AGAST #2503: no guess between two enums that declare an arm's name.
     if is_enum == 0 and match_refuse_ambiguous_arms(s, typed, arms) == 1

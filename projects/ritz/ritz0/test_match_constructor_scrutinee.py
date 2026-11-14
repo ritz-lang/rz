@@ -307,6 +307,9 @@ OWNED = {
     "user_ctor_bound": (_dropped(*_arms("Full(make(1))", "Full(v) => v.id", "Empty => 2")), 1),
     "user_ctor_wildcard": (_dropped(*_arms("Full(make(1))", "_ => 2")), 1),
     "qualified_wildcard": (_dropped(*_arms("Full1.Full(make(1))", "_ => 2")), 1),
+    # AGAST #2437: a generic enum's, `W<Tracked>` by its payload.
+    "generic_ctor_wildcard": ("enum W<T>\n    Hold(T)\n    Gone\n"
+                              + _dropped(*_arms("Hold(make(1))", "_ => 2")), 1),
     # What it's held to.
     "a_call": (_dropped(*_arms("mk()", "_ => 2")), 1),
     "a_typed_local": (_dropped("let o: Option<Tracked> = Some(make(1))",

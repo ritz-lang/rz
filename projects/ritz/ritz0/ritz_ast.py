@@ -485,6 +485,10 @@ class Match(Expr):
     """Match expression."""
     expr: Expr
     arms: List['MatchArm']
+    # The instance a bare constructor scrutinee of a generic user enum builds
+    # (`match Hold(5)` is a `W<i64>`), which monomorph infers from its payload
+    # (AGAST #2437); None for any other scrutinee.
+    ctor_type: Optional[Type] = None
 
 
 @dataclass
