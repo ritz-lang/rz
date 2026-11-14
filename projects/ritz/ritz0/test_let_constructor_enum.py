@@ -238,6 +238,59 @@ USERS.update({
         + _body("match g()", "    Ok(v) => v", "    Err(e) => 3"), 5),
 })
 
+_NONE_E = "enum E\n    Some(i32)\n    None\n"
+
+
+def _users_none(*lines, fn=_MAIN):
+    """`enum E` declaring `Some(i32)` and a unit `None`, then `lines`."""
+    return _NONE_E + _body(*lines, fn=fn)
+
+
+_MATCH_NONE = ["match x", "    Some(v) => v", "    None => 7"]
+_H_NONE = "fn h(x: E) -> i32\n" + "".join(f"    {line}\n" for line in _MATCH_NONE)
+
+# A user's unit `None` is its own variant where the slot is that enum, and the
+# Option's where an Option slot names it (#2434).  ritz1 built every `None` as the
+# Option's, so the user's had no Option to build: a located refusal.
+USERS.update({
+    "none_let": (_users_none("let x = None", *_MATCH_NONE), 7),
+    "none_var": (_users_none("var x = None", *_MATCH_NONE), 7),
+    "none_typed_let": (_users_none("let x: E = None", *_MATCH_NONE), 7),
+    "none_argument": (_H_NONE + _users_none("h(None)"), 7),
+    "none_returned": (
+        _users_none("None", fn="fn g() -> E\n") + _body("let x = g()", *_MATCH_NONE), 7),
+    "none_arm_value": (
+        _users_none("match k", "    0 => None", "    _ => Some(5)", fn="fn g(k: i32) -> E\n")
+        + _body("let x = g(0)", *_MATCH_NONE), 7),
+    # The slot is E in an Option-returning fn: the arm's `None` is E's.
+    "none_arm_value_in_an_option_fn": (
+        _users_none("let x: E = match k", "    0 => None", "    _ => Some(5)", "match x",
+                    "    None => Some(7)", "    _ => Some(3)", fn="fn g(k: i32) -> Option<i32>\n")
+        + _body("match g(0)", "    Some(v) => v", "    _ => 2"), 7),
+    "none_assigned": (_users_none("var x: E = Some(5)", "x = None", *_MATCH_NONE), 7),
+    # In an Option-returning fn the let's slot is the user's enum, as `Some(5)`'s.
+    "none_let_in_an_option_fn": (
+        _users_none("let x = None", "var r: i32 = 2", "match x", "    None =>",
+                    "        r = 7", "    _ =>", "        r = 3", "Some(r)",
+                    fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    _ => 2"), 7),
+    # An Option slot keeps the Option's.
+    "builtin_none_beside_a_users": (
+        _users_none("None", fn="fn g() -> Option<i32>\n")
+        + _body("match g()", "    Some(v) => v", "    None => 7"), 7),
+    "builtin_none_let_beside_a_users": (
+        _users_none("let o: Option<i32> = None", "match o", "    Some(v) => v",
+                    "    None => 7"), 7),
+    # An arm's value is the match's slot, as #2512's `Some(v)`: the phi was %E.
+    "builtin_none_arm_value_beside_a_users": (
+        _users_none("match k", "    0 => None", "    _ => Some(5)",
+                    fn="fn g(k: i32) -> Option<i32>\n")
+        + _body("match g(0)", "    Some(v) => v", "    None => 7"), 7),
+    "builtin_none_param_beside_a_users": (
+        "fn h(o: Option<i32>) -> i32\n    match o\n        Some(v) => v\n"
+        "        None => 7\n" + _users_none("h(None)"), 7),
+})
+
 ON_RITZ0 = sorted(BOUND) + ["i32_local", "passed_to_a_fn", "returned_as_the_fns_enum",
                             "none_returned_as_the_fns_enum"]
 

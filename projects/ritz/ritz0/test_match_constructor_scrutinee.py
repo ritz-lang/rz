@@ -205,6 +205,10 @@ USER = {
     "user_payload": (_U + _on("Holds(5)", "Holds(v) => v", "Vacant => 2"), 5),
     "user_qualified": (_U + _on("Slot.Holds(5)", "Holds(v) => v", "Vacant => 2"), 5),
     "user_qualified_unit": (_U + _on("Slot.Vacant", "Holds(v) => 1", "Vacant => 3"), 3),
+    # A user's `None` is that enum's (#2434): read as the Option's it took `Yes(v)`,
+    # on the shared tag; ritz1 refused it, never building a user's `None`.
+    "user_none": ("enum Mine\n    Yes(i32)\n    None\n"
+                  + _on("None", "Yes(v) => 1", "None => 3"), 3),
 }
 
 # `None` is a name first.
@@ -257,10 +261,9 @@ UNNAMED = {
     "array": _on("Some(a)", "Some(v) => 7", "_ => 2", before="var a: [2]i32"),
 }
 
-# A user's `None` is that enum's, which emit_expr_ident can't build (#2434). Refused,
-# as it was: read as the Option's it took `Yes(v)`, on the shared tag.
+# Two enums declaring `None` leave it ambiguous: refused, never read as the Option's
+# (ritz0 names both enums; ritz1's refusal for any ambiguous scrutinee is unlocated).
 USERS_NONE = {
-    "one_enum": "enum Mine\n    Yes(i32)\n    None\n" + _on("None", "Yes(v) => 1", "None => 3"),
     "two_enums": "enum A1\n    Yes(i32)\n    None\nenum B1\n    Nay\n    None\n"
                  + _on("None", "Yes(v) => 1", "_ => 3"),
 }
