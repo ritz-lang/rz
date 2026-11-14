@@ -431,6 +431,19 @@ def nested(lines):
     return NESTED + "pub fn main() -> i32\n" + NEW_V + lines + "    return 0\n"
 
 
+# AGAST #2319: a struct with more movable paths than an i32 has bits.
+WIDE = ("struct Wide\n" + "".join(f"    f{i}: Tracked\n" for i in range(40)) + "\n"
+        + NESTED + "struct WideN\n" + "".join(f"    g{i}: Inner\n" for i in range(12))
+        + "\n")
+NEW_W = ("    var w = Wide { " + ", ".join(f"f{i}: make(1)" for i in range(40)) + " }\n")
+NEW_WN = ("    var w = WideN { " + ", ".join(
+    f"g{i}: Inner {{ t: make(1), u: make(2), n: 3 }}" for i in range(12)) + " }\n")
+
+
+def wide(lines, decl=NEW_W):
+    return WIDE + "pub fn main() -> i32\n" + decl + lines + "    return 0\n"
+
+
 REJECTS = {
     # Moved in both arms (neither returns): moved after the `if`.
     "moved_in_both_arms": """\
@@ -764,6 +777,39 @@ pub fn main() -> i32
         consume(v.w.t)
         i = i + 1
 """),
+
+    # AGAST #2319: past the 31 paths ritz1 used to track, named the same.
+    "wide_moved_twice": wide("""\
+    consume(w.f39)
+    consume(w.f39)
+"""),
+
+    # Named by the first move, in whichever word it is.
+    "wide_binding_after_two_moves": wide("""\
+    consume(w.f39)
+    consume(w.f2)
+    var g = w
+"""),
+
+    "wide_moved_in_loop": wide("""\
+    var i = 0
+    while i < 2
+        consume(w.f39)
+        i = i + 1
+"""),
+
+    # Moved on the way out by `break`: still moved after the loop.
+    "wide_moved_at_break_then_used": wide("""\
+    while true
+        consume(w.f39)
+        break
+    consume(w.f39)
+"""),
+
+    "wide_nested_parent_after_part_move": wide("""\
+    consume(w.g11.u)
+    eat_inner(w.g11)
+""", NEW_WN),
 
     # The sibling read is fine; only the move reaches the head moved.
     "nested_loop_sibling_read_then_move": nested("""\

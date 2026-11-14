@@ -67,9 +67,11 @@
 # ritz0 makes a flag for each path its checker saw moved.  This check runs as
 # code is emitted, so a drop can come before a move that reaches it round a
 # loop: each binding numbers every path its type has up front (OwnBinding's
-# `paths`), and the glue tests them all.  Only OWN_MAX_PATHS paths fit, the
-# shallowest first; a move along a path past them moves its nearest numbered
-# parent, or the whole binding (AGAST #2319).
+# `paths`), and the glue tests them all.  Every path is tracked, with no cap
+# (AGAST #2319): a set of paths is an i32 that is the bitmask itself for
+# paths 0..30 and a handle to an interned word array otherwise (see "Path
+# sets"), and the run-time mask is an integer of as many 32-bit words as
+# the paths need.
 #
 # Match arms (AGAST #2168, ritz0 #2161).  Each arm of a match or an
 # if-expression starts from the move state before it; afterwards a binding
@@ -121,9 +123,258 @@ const OWN_EV_USE: i32 = 2
 # e = fmoved.
 const OWN_EV_HEAD: i32 = 3
 const OWN_EV_BREAK: i32 = 4
-# Paths 0..30 can be moved out (one bit each of `fmask`).
-const OWN_MAX_PATHS: i32 = 31
+# Bits 0..30 of an i32, the paths a set held inline can have.
 const OWN_ALL_PATHS: i32 = 0x7FFFFFFF
+
+# =============================================================================
+# Path sets (AGAST #2319)
+# =============================================================================
+#
+# A set of path numbers, with no cap.  It is an i32, so it lives wherever the
+# i32 bitmasks it replaced did (OwnBinding's fmoved and fshadow, OwnPath's up
+# and down, the snapshots, the loop events) and is copied with them.  A set
+# of paths 0..30 only is that bitmask (>= 0, as before); any other is -(k+1)
+# for entry k of a pool of interned word arrays (32 paths a word, bit i of
+# word w for path 32w + i).  Interning keeps one value per set, so `==`
+# compares sets and 0 is the empty one.  Only a binding with more than 31
+# paths reaches the pool, so other code pays nothing for it.  Sets are never
+# freed: a fn's sets are few, and the pool is shared by all of them.
+
+const OS_OR: i32 = 0
+const OS_AND: i32 = 1
+const OS_MINUS: i32 = 2
+
+var g_os_words: *i32 = null    # the entries' words, back to back
+var g_os_wlen: i32 = 0
+var g_os_wcap: i32 = 0
+var g_os_off: *i32 = null      # entry k's first word in g_os_words
+var g_os_len: *i32 = null      # and its word count (its top word isn't 0)
+var g_os_count: i32 = 0
+var g_os_cap: i32 = 0
+var g_os_tab: *i32 = null      # open addressing: k + 1 per entry, 0 if free
+var g_os_tcap: i32 = 0
+var g_os_buf: *i32 = null      # scratch words for the set being built
+var g_os_bcap: i32 = 0
+
+# `p` with room for `n` i32s (p may be null).
+fn os_grow(p: *i32, n: i32) -> *i32
+    if p == null
+        return malloc((n as i64) * 4) as *i32
+    realloc(p as *u8, (n as i64) * 4) as *i32
+
+# The number of words of set `a` (0 for the empty set).
+fn os_len(a: i32) -> i32
+    if a > 0
+        return 1
+    if a == 0
+        return 0
+    let lens: *i32 = g_os_len
+    lens[0 - a - 1]
+
+# Word `i` of set `a`, 0 past its end.
+fn os_word(a: i32, i: i32) -> i32
+    if a >= 0
+        if i == 0
+            return a
+        return 0
+    let k: i32 = 0 - a - 1
+    let lens: *i32 = g_os_len
+    if i >= lens[k]
+        return 0
+    let offs: *i32 = g_os_off
+    let words: *i32 = g_os_words
+    words[offs[k] + i]
+
+# `n` zeroed scratch words.
+fn os_scratch(n: i32) -> *i32
+    if n > g_os_bcap
+        var cap: i32 = 8
+        while cap < n
+            cap = cap * 2
+        g_os_buf = os_grow(g_os_buf, cap)
+        g_os_bcap = cap
+    let buf: *i32 = g_os_buf
+    var i: i32 = 0
+    while i < n
+        buf[i] = 0
+        i += 1
+    buf
+
+fn os_hash(w: *i32, n: i32) -> i32
+    var h: i64 = n as i64
+    var i: i32 = 0
+    while i < n
+        h = (h * 1000003 + (w[i] as i64)) & 0x7FFFFFFF
+        i += 1
+    h as i32
+
+# 1 when entry k holds the words w[0..n).
+fn os_same(k: i32, w: *i32, n: i32) -> i32
+    let lens: *i32 = g_os_len
+    if lens[k] != n
+        return 0
+    let offs: *i32 = g_os_off
+    let words: *i32 = g_os_words
+    let base: i32 = offs[k]
+    var i: i32 = 0
+    while i < n
+        if words[base + i] != w[i]
+            return 0
+        i += 1
+    1
+
+# Put entry k in the hash table.
+fn os_slot_in(k: i32)
+    let offs: *i32 = g_os_off
+    let lens: *i32 = g_os_len
+    let words: *i32 = g_os_words
+    let tab: *i32 = g_os_tab
+    let mask: i32 = g_os_tcap - 1
+    var at: i32 = os_hash(words + offs[k], lens[k]) & mask
+    while tab[at] != 0
+        at = (at + 1) & mask
+    tab[at] = k + 1
+
+# Double the hash table (64 slots at first) and re-slot every entry.
+fn os_rehash()
+    var cap: i32 = g_os_tcap * 2
+    if cap < 64
+        cap = 64
+    if g_os_tab != null
+        free(g_os_tab as *u8)
+    g_os_tab = malloc((cap as i64) * 4) as *i32
+    g_os_tcap = cap
+    let tab: *i32 = g_os_tab
+    var i: i32 = 0
+    while i < cap
+        tab[i] = 0
+        i += 1
+    var k: i32 = 0
+    while k < g_os_count
+        os_slot_in(k)
+        k += 1
+
+# The set whose words are buf[0..n): the bitmask when it fits, else the
+# pool's entry for it (added if new).
+fn os_make(buf: *i32, n: i32) -> i32
+    var len: i32 = n
+    while len > 0 and buf[len - 1] == 0
+        len -= 1
+    if len == 0
+        return 0
+    if len == 1 and buf[0] > 0
+        return buf[0]
+    if (g_os_count + 1) * 2 > g_os_tcap
+        os_rehash()
+    let tab: *i32 = g_os_tab
+    let mask: i32 = g_os_tcap - 1
+    var at: i32 = os_hash(buf, len) & mask
+    while tab[at] != 0
+        let k: i32 = tab[at] - 1
+        if os_same(k, buf, len) == 1
+            return 0 - k - 1
+        at = (at + 1) & mask
+    if g_os_count >= g_os_cap
+        var cap: i32 = g_os_cap * 2
+        if cap < 16
+            cap = 16
+        g_os_off = os_grow(g_os_off, cap)
+        g_os_len = os_grow(g_os_len, cap)
+        g_os_cap = cap
+    if g_os_wlen + len > g_os_wcap
+        var wcap: i32 = g_os_wcap * 2
+        if wcap < 64
+            wcap = 64
+        while wcap < g_os_wlen + len
+            wcap = wcap * 2
+        g_os_words = os_grow(g_os_words, wcap)
+        g_os_wcap = wcap
+    let k: i32 = g_os_count
+    let offs: *i32 = g_os_off
+    let lens: *i32 = g_os_len
+    let words: *i32 = g_os_words
+    offs[k] = g_os_wlen
+    lens[k] = len
+    var i: i32 = 0
+    while i < len
+        words[g_os_wlen + i] = buf[i]
+        i += 1
+    g_os_wlen = g_os_wlen + len
+    g_os_count = k + 1
+    tab[at] = k + 1
+    0 - k - 1
+
+# `a | b`, `a & b` or `a & ~b` (op OS_OR, OS_AND, OS_MINUS).
+fn os_op(a: i32, b: i32, op: i32) -> i32
+    if a >= 0 and b >= 0
+        if op == OS_OR
+            return a | b
+        if op == OS_AND
+            return a & b
+        return a & (OWN_ALL_PATHS ^ b)
+    var n: i32 = os_len(a)
+    let nb: i32 = os_len(b)
+    if op == OS_OR and nb > n
+        n = nb
+    if op == OS_AND and nb < n
+        n = nb
+    let buf: *i32 = os_scratch(n)
+    var i: i32 = 0
+    while i < n
+        let wa: i32 = os_word(a, i)
+        let wb: i32 = os_word(b, i)
+        if op == OS_OR
+            buf[i] = wa | wb
+        else if op == OS_AND
+            buf[i] = wa & wb
+        else
+            buf[i] = wa & (wb ^ (0 - 1))
+        i += 1
+    os_make(buf, n)
+
+fn own_set_or(a: i32, b: i32) -> i32
+    os_op(a, b, OS_OR)
+
+fn own_set_and(a: i32, b: i32) -> i32
+    os_op(a, b, OS_AND)
+
+# The paths of `a` that aren't in `b`.
+fn own_set_minus(a: i32, b: i32) -> i32
+    os_op(a, b, OS_MINUS)
+
+# {path}.
+fn own_set_bit(path: i32) -> i32
+    if path < 31
+        return 1 << path
+    let buf: *i32 = os_scratch(path / 32 + 1)
+    buf[path / 32] = 1 << (path % 32)
+    os_make(buf, path / 32 + 1)
+
+# {0 .. n-1}.
+fn own_set_range(n: i32) -> i32
+    if n <= 0
+        return 0
+    if n < 32
+        return (OWN_ALL_PATHS >> (31 - n))
+    let words: i32 = (n + 31) / 32
+    let buf: *i32 = os_scratch(words)
+    var i: i32 = 0
+    while i < n / 32
+        buf[i] = 0 - 1
+        i += 1
+    if n % 32 != 0
+        buf[n / 32] = (1 << (n % 32)) - 1
+    os_make(buf, words)
+
+# 1 when `path` is in `a`.
+fn own_set_has(a: i32, path: i32) -> i32
+    if (os_word(a, path / 32) & (1 << (path % 32))) != 0
+        return 1
+    0
+
+# One past the highest path `a` can hold.
+fn own_set_top(a: i32) -> i32
+    os_len(a) * 32
 
 pub fn own_init(s: *EmitterState)
     let o: *OwnState = malloc(sizeof(OwnState)) as *OwnState
@@ -249,9 +500,9 @@ fn own_fm_find(o: *OwnState, slot: i32, path: i32) -> *i32
 fn own_first_moved(o: *OwnState, slot: i32, bits: i32) -> i32
     var best: i32 = 0
     var best_at: i32 = o.fm_count
-    var i: i32 = OWN_MAX_PATHS - 1
+    var i: i32 = own_set_top(bits) - 1
     while i >= 0
-        if (bits & (1 << i)) != 0
+        if own_set_has(bits, i) == 1
             var at: i32 = own_fm_index(o, slot, i)
             if at < 0
                 at = o.fm_count
@@ -472,15 +723,19 @@ fn own_emit_masked_glue(s: *EmitterState, ptr: i32, b: *OwnBinding, path: i32, m
                 let t: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, t)
-                emit_str(s, c" = and i32 ")
+                emit_str(s, c" = and ")
+                own_emit_mask_type(s, b)
+                emit_str(s, c" ")
                 emit_reg(s, mask)
                 emit_str(s, c", ")
-                emit_int(s, (1 << part) as i64)
+                own_emit_set_const(s, b, own_set_bit(part), 0)
                 emit_str(s, c"\n")
                 let c: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, c)
-                emit_str(s, c" = icmp eq i32 ")
+                emit_str(s, c" = icmp eq ")
+                own_emit_mask_type(s, b)
+                emit_str(s, c" ")
                 emit_reg(s, t)
                 emit_str(s, c", 0\n")
                 let do_label: i32 = next_label(s)
@@ -512,6 +767,45 @@ fn own_emit_binding_glue(s: *EmitterState, b: *OwnBinding, ptr: i32, mask: i32)
     else
         own_emit_value_glue(s, ptr, b.type_name, b.type_name_len, b.count)
 
+# AGAST #2319: the run-time mask is an integer of whole 32-bit words, one
+# bit per path (an i32 up to 32 paths, an i64 up to 64, ...).
+fn own_mask_width(b: *OwnBinding) -> i32
+    var words: i32 = (b.path_count + 31) / 32
+    if words < 1
+        words = 1
+    words * 32
+
+fn own_emit_mask_type(s: *EmitterState, b: *OwnBinding)
+    emit_str(s, c"i")
+    emit_int(s, own_mask_width(b) as i64)
+
+# The path set `a` as a constant of the binding's mask type, or with `inv`
+# 1 its complement: in decimal for an i32, else in hex (`u0x` + every word,
+# the top one first), which LLVM reads at any width.
+fn own_emit_set_const(s: *EmitterState, b: *OwnBinding, a: i32, inv: i32)
+    let words: i32 = own_mask_width(b) / 32
+    if words == 1
+        var w: i32 = os_word(a, 0)
+        if inv == 1
+            w = w ^ (0 - 1)
+        emit_int(s, w as i64)
+        return
+    emit_str(s, c"u0x")
+    var i: i32 = words - 1
+    while i >= 0
+        var w: i32 = os_word(a, i)
+        if inv == 1
+            w = w ^ (0 - 1)
+        var k: i32 = 7
+        while k >= 0
+            let nib: i32 = (w >> (k * 4)) & 15
+            if nib < 10
+                vec_push<u8>(s.out, (nib + 48) as u8)    # '0'
+            else
+                vec_push<u8>(s.out, (nib + 87) as u8)    # 'a' - 10
+            k -= 1
+        i -= 1
+
 # Load the binding's moved-path mask (0 when it has none).
 fn own_load_mask(s: *EmitterState, b: *OwnBinding) -> i32
     if b.fmask == 0
@@ -519,12 +813,14 @@ fn own_load_mask(s: *EmitterState, b: *OwnBinding) -> i32
     let m: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, m)
-    emit_str(s, c" = load i32, ptr ")
+    emit_str(s, c" = load ")
+    own_emit_mask_type(s, b)
+    emit_str(s, c", ptr ")
     emit_reg(s, b.fmask)
     emit_str(s, c"\n")
     m
 
-# Set (`set` 1) or clear the run-time moved bits `bits`.
+# Set (`set` 1) or clear the run-time moved bits of the path set `bits`.
 fn own_emit_mask_bits(s: *EmitterState, b: *OwnBinding, bits: i32, set: i32)
     if b.fmask == 0 or bits == 0
         return
@@ -533,27 +829,29 @@ fn own_emit_mask_bits(s: *EmitterState, b: *OwnBinding, bits: i32, set: i32)
     emit_str(s, c"  ")
     emit_reg(s, r)
     if set == 1
-        emit_str(s, c" = or i32 ")
-        emit_reg(s, m)
-        emit_str(s, c", ")
-        emit_int(s, bits as i64)
+        emit_str(s, c" = or ")
     else
-        emit_str(s, c" = and i32 ")
-        emit_reg(s, m)
-        emit_str(s, c", ")
-        emit_int(s, (OWN_ALL_PATHS ^ bits) as i64)
-    emit_str(s, c"\n  store i32 ")
+        emit_str(s, c" = and ")
+    own_emit_mask_type(s, b)
+    emit_str(s, c" ")
+    emit_reg(s, m)
+    emit_str(s, c", ")
+    own_emit_set_const(s, b, bits, 1 - set)
+    emit_str(s, c"\n  store ")
+    own_emit_mask_type(s, b)
+    emit_str(s, c" ")
     emit_reg(s, r)
     emit_str(s, c", ptr ")
     emit_reg(s, b.fmask)
     emit_str(s, c"\n")
 
-fn own_store_mask(s: *EmitterState, b: *OwnBinding, v: i32)
+# Mark no path moved out.
+fn own_clear_mask(s: *EmitterState, b: *OwnBinding)
     if b.fmask == 0
         return
-    emit_str(s, c"  store i32 ")
-    emit_int(s, v as i64)
-    emit_str(s, c", ptr ")
+    emit_str(s, c"  store ")
+    own_emit_mask_type(s, b)
+    emit_str(s, c" 0, ptr ")
     emit_reg(s, b.fmask)
     emit_str(s, c"\n")
 
@@ -875,7 +1173,7 @@ pub fn own_loop_enter(s: *EmitterState) -> i32
         b.shadow = 1 - b.moved
         b.fshadow = 0
         if b.moved == 0
-            b.fshadow = OWN_ALL_PATHS ^ b.fmoved
+            b.fshadow = own_set_minus(own_set_range(b.path_count), b.fmoved)
         i += 1
     old
 
@@ -893,7 +1191,7 @@ fn own_ev_find(o: *OwnState, kind: i32, slot: i32, depth: i32) -> *i32
 # (`head`: [moved, line, col, fmoved]).  Returns 1 if it was an error.
 fn own_report_loop_use(s: *EmitterState, ev: *i32, b: *OwnBinding, head: *i32) -> i32
     let borrow: i32 = ev[3] & 1
-    if ev[4] != 0 and (((ev[3] & 2) != 0 and head[0] == 1) or (head[3] & ev[7]) != 0)
+    if ev[4] != 0 and (((ev[3] & 2) != 0 and head[0] == 1) or own_set_and(head[3], ev[7]) != 0)
         # In a deferred statement: reported at the `defer` (AGAST #2810).
         own_error_defer_at(s, ev[4], ev[8], b)
         return 1
@@ -903,7 +1201,7 @@ fn own_report_loop_use(s: *EmitterState, ev: *i32, b: *OwnBinding, head: *i32) -
         else
             own_error_use_at(s, ev[5], ev[6], b, head[1], head[2])
         return 1
-    let hit: i32 = head[3] & ev[7]
+    let hit: i32 = own_set_and(head[3], ev[7])
     if hit == 0
         return 0
     if borrow == 1
@@ -944,7 +1242,7 @@ pub fn own_loop_exit(s: *EmitterState, old: i32)
                 h[0] = 1
                 h[1] = hv[5]
                 h[2] = hv[6]
-            h[3] = h[3] | hv[7]
+            h[3] = own_set_or(h[3], hv[7])
         i += 1
     # The recorded uses, in order: an error, or (unreported, in an inner
     # loop) a use the enclosing loop's check still has to see.
@@ -969,7 +1267,7 @@ pub fn own_loop_exit(s: *EmitterState, old: i32)
                     var a: i32 = ev[3] & 1
                     if sv[3] == 1
                         a = a | (ev[3] & 2)
-                    let fm: i32 = ev[7] & sv[8]
+                    let fm: i32 = own_set_and(ev[7], sv[8])
                     if (a & 2) != 0 or fm != 0
                         ev[2] = depth - 1
                         ev[3] = a
@@ -999,9 +1297,9 @@ pub fn own_loop_exit(s: *EmitterState, old: i32)
             al = bv[5]
             ac = bv[6]
         if sv != null
-            fm = fm | sv[7]
+            fm = own_set_or(fm, sv[7])
         if bv != null
-            fm = fm | bv[7]
+            fm = own_set_or(fm, bv[7])
         b.moved = am
         if am == 1
             b.move_line = al
@@ -1061,7 +1359,7 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
                     ev[4] = 1
                     ev[5] = b.move_line
                     ev[6] = b.move_col
-                ev[7] = ev[7] | b.fmoved
+                ev[7] = own_set_or(ev[7], b.fmoved)
         i += 1
     if snap != null
         own_restore(s, snap)
@@ -1218,17 +1516,23 @@ fn own_path_at(b: *OwnBinding, i: i32) -> *OwnPath
     return @base[i]
 
 # Add a path for each move-only field of the struct `name`, the parts of
-# path `parent`, while they fit.  Returns the new path count.
-fn own_add_paths(s: *EmitterState, paths: *OwnPath, count: i32, parent: i32, name: *u8, len: i32) -> i32
+# path `parent`, to the array *pp (room for *cap, grown as it fills).
+# Returns the new path count.
+fn own_add_paths(s: *EmitterState, pp: **OwnPath, cap: *i32, count: i32, parent: i32, name: *u8, len: i32) -> i32
     let st: *StructDef = find_struct(s, name, len)
     if st == null
         return count
     var n: i32 = count
     var idx: i32 = 0
     var f: *StructField = st.fields
-    while f != null and n < OWN_MAX_PATHS
+    while f != null
         if own_field_move_only(s, f, 0) == 1
-            let bit: i32 = 1 << n
+            if n >= *cap
+                let nc: i32 = *cap * 2
+                *pp = realloc(*pp as *u8, (nc as i64) * sizeof(OwnPath)) as *OwnPath
+                *cap = nc
+            let paths: *OwnPath = *pp
+            let bit: i32 = own_set_bit(n)
             let p: *OwnPath = @paths[n]
             p.parent = parent
             p.idx = idx
@@ -1238,27 +1542,38 @@ fn own_add_paths(s: *EmitterState, paths: *OwnPath, count: i32, parent: i32, nam
             var a: i32 = parent
             while a >= 0
                 let ap: *OwnPath = @paths[a]
-                p.up = p.up | (1 << a)
-                ap.down = ap.down | bit
+                p.up = own_set_or(p.up, own_set_bit(a))
+                ap.down = own_set_or(ap.down, bit)
                 a = ap.parent
             n += 1
         idx += 1
         f = f.next
     n
 
-# The paths of a partly movable struct `name`, shallowest first, so a type
-# with too many keeps the ones nearest the binding (their count in *out_n).
-# A field stops the walk where it can't be partly moved itself: a type with
-# its own drop, an enum, an array.
+# How many paths path `i` is a part of.
+fn own_path_depth(paths: *OwnPath, i: i32) -> i32
+    var d: i32 = 0
+    var p: *OwnPath = @paths[i]
+    while p.parent >= 0
+        d += 1
+        p = @paths[p.parent]
+    d
+
+# The paths of a partly movable struct `name` (their count in *out_n),
+# shallowest first, so the fields nearest the binding get the paths a set
+# holds inline.  A field stops the walk where it can't be partly moved
+# itself: a type with its own drop, an enum, an array.  Every path is
+# tracked (AGAST #2319); only OWN_MAX_DEPTH bounds a malformed recursive type.
 fn own_build_paths(s: *EmitterState, name: *u8, len: i32, out_n: *i32) -> *OwnPath
-    let paths: *OwnPath = malloc((OWN_MAX_PATHS as i64) * sizeof(OwnPath)) as *OwnPath
-    var n: i32 = own_add_paths(s, paths, 0, 0 - 1, name, len)
+    var cap: i32 = 32
+    var paths: *OwnPath = malloc((cap as i64) * sizeof(OwnPath)) as *OwnPath
+    var n: i32 = own_add_paths(s, @paths, @cap, 0, 0 - 1, name, len)
     var i: i32 = 0
     while i < n
         let p: *OwnPath = @paths[i]
         let f: *StructField = p.fld
-        if f.field_type == TYPE_STRUCT and own_partly_movable(s, f.field_type_name, f.field_type_name_len) == 1
-            n = own_add_paths(s, paths, n, i, f.field_type_name, f.field_type_name_len)
+        if f.field_type == TYPE_STRUCT and own_path_depth(paths, i) < OWN_MAX_DEPTH and own_partly_movable(s, f.field_type_name, f.field_type_name_len) == 1
+            n = own_add_paths(s, @paths, @cap, n, i, f.field_type_name, f.field_type_name_len)
         i += 1
     *out_n = n
     paths
@@ -1285,7 +1600,7 @@ fn own_named_path(b: *OwnBinding, parent: i32, name: *u8, len: i32) -> i32
 
 fn own_has_parts(b: *OwnBinding, path: i32) -> i32
     let p: *OwnPath = own_path_at(b, path)
-    if p.down != (1 << path)
+    if p.down != own_set_bit(path)
         return 1
     0
 
@@ -1321,7 +1636,7 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
             lb.fmoved = 0
             lb.fshadow = 0
             own_store_flag(s, lb, owned)
-            own_store_mask(s, lb, 0)
+            own_clear_mask(s, lb)
             return
         i += 1
     let flag: i32 = next_reg(s)
@@ -1333,11 +1648,14 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
     var paths: *OwnPath = null
     var path_count: i32 = 0
     if count == 0 and own_partly_movable(s, name, len) == 1
+        paths = own_build_paths(s, name, len, @path_count)
+        # One bit per path, in whole 32-bit words (own_mask_width).
         fmask = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, fmask)
-        emit_str(s, c" = alloca i32  ; moved fields\n")
-        paths = own_build_paths(s, name, len, @path_count)
+        emit_str(s, c" = alloca i")
+        emit_int(s, ((path_count + 31) / 32 * 32) as i64)
+        emit_str(s, c"  ; moved fields\n")
     own_grow_live(o)
     let b: *OwnBinding = own_live_at(o, o.live_count)
     b.name = loc.name
@@ -1363,7 +1681,7 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
     own_copy_binding(own_all_at(o, o.all_count), b)
     o.all_count = o.all_count + 1
     own_store_flag(s, b, owned)
-    own_store_mask(s, b, 0)
+    own_clear_mask(s, b)
 
 # Start of a fn body (after its params are bound): the fn's outermost block,
 # holding its by-value move-only params, which the callee owns.
@@ -1598,7 +1916,7 @@ fn own_note_use(s: *EmitterState, b: *OwnBinding, line: i32, col: i32, borrow: i
     let o: *OwnState = s.own
     if o.loop_depth == 0 or b.moved == 1
         return
-    let fs: i32 = b.fshadow & (OWN_ALL_PATHS ^ b.fmoved)
+    let fs: i32 = own_set_minus(b.fshadow, b.fmoved)
     if b.shadow == 1 or fs != 0
         own_note_use_ev(o, b.slot, borrow + b.shadow * 2, line, col, fs)
 
@@ -1607,7 +1925,7 @@ fn own_note_field_use(s: *EmitterState, b: *OwnBinding, bits: i32, line: i32, co
     let o: *OwnState = s.own
     if o.loop_depth == 0 or b.moved == 1
         return
-    let fs: i32 = b.fshadow & bits
+    let fs: i32 = own_set_and(b.fshadow, bits)
     if b.shadow == 1 or fs != 0
         own_note_use_ev(o, b.slot, b.shadow * 2, line, col, fs)
 
@@ -1630,7 +1948,7 @@ fn own_overlap(b: *OwnBinding, path: i32, exact: i32) -> i32
         return 0
     let p: *OwnPath = own_path_at(b, path)
     if exact == 1
-        return p.up | p.down
+        return own_set_or(p.up, p.down)
     p.up
 
 # `b.<path> = v`, once v is checked: b must still hold the parents of what
@@ -1643,17 +1961,17 @@ fn own_store_path(s: *EmitterState, b: *OwnBinding, path: i32, exact: i32, line:
         return
     var parents: i32 = own_overlap(b, path, 0)
     if exact == 1
-        parents = parents ^ (1 << path)
-    if (b.fmoved & parents) != 0
-        own_error_field_use_at(s, line, col, b, b.fmoved & own_overlap(b, path, exact))
+        parents = own_set_minus(parents, own_set_bit(path))
+    if own_set_and(b.fmoved, parents) != 0
+        own_error_field_use_at(s, line, col, b, own_set_and(b.fmoved, own_overlap(b, path, exact)))
         return
     own_note_field_use(s, b, parents, line, col)
     if exact == 0
         return
     let p: *OwnPath = own_path_at(b, path)
     let bits: i32 = p.down
-    b.fshadow = b.fshadow & (OWN_ALL_PATHS ^ bits)
-    b.fmoved = b.fmoved & (OWN_ALL_PATHS ^ bits)
+    b.fshadow = own_set_minus(b.fshadow, bits)
+    b.fmoved = own_set_minus(b.fmoved, bits)
 
 # The leftmost operand of a member path `x.f.g` (x).
 fn own_member_root(e: *Expr) -> *Expr
@@ -1758,8 +2076,8 @@ fn own_walk_member(s: *EmitterState, e: *Expr, mv: i32)
     var exact: i32 = 0
     let path: i32 = own_path_of(b, e, @exact)
     let overlap: i32 = own_overlap(b, path, exact)
-    if (b.fmoved & overlap) != 0
-        own_error_field_use_at(s, line, col, b, b.fmoved & overlap)
+    if own_set_and(b.fmoved, overlap) != 0
+        own_error_field_use_at(s, line, col, b, own_set_and(b.fmoved, overlap))
         return
     own_note_field_use(s, b, overlap, line, col)
     if mv == 0 or own_field_move_only(s, f, 0) == 0
@@ -1774,9 +2092,9 @@ fn own_walk_member(s: *EmitterState, e: *Expr, mv: i32)
         b.move_col = col
         own_store_flag(s, b, 0)
         return
-    b.fmoved = b.fmoved | (1 << path)
+    b.fmoved = own_set_or(b.fmoved, own_set_bit(path))
     own_fm_push(s.own, b.slot, path, line, col)
-    own_emit_mask_bits(s, b, 1 << path, 1)
+    own_emit_mask_bits(s, b, own_set_bit(path), 1)
 
 # The move-only struct type a call or method call returns by value (its length in
 # *out_len), or null.
@@ -2146,15 +2464,19 @@ fn own_field_drop_cond(s: *EmitterState, b: *OwnBinding, bits: i32) -> i32
     let t: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, t)
-    emit_str(s, c" = and i32 ")
+    emit_str(s, c" = and ")
+    own_emit_mask_type(s, b)
+    emit_str(s, c" ")
     emit_reg(s, m)
     emit_str(s, c", ")
-    emit_int(s, bits as i64)
+    own_emit_set_const(s, b, bits, 0)
     emit_str(s, c"\n")
     let c: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, c)
-    emit_str(s, c" = icmp eq i32 ")
+    emit_str(s, c" = icmp eq ")
+    own_emit_mask_type(s, b)
+    emit_str(s, c" ")
     emit_reg(s, t)
     emit_str(s, c", 0\n")
     let r: i32 = next_reg(s)
@@ -2497,7 +2819,7 @@ pub fn own_assign_end(s: *EmitterState, h: *OwnBinding, old: i32, old_flag: i32)
     b.fmoved = 0
     b.fshadow = 0
     own_store_flag(s, b, 1)
-    own_store_mask(s, b, 0)
+    own_clear_mask(s, b)
     let saved: i32 = last_expr_here(s)
     let do_label: i32 = next_label(s)
     let next: i32 = next_label(s)
@@ -2581,8 +2903,8 @@ fn own_join_snap(into: *i32, other: *i32)
             a[1] = b[1]
             a[2] = b[2]
         a[3] = a[3] | b[3]
-        a[4] = a[4] | b[4]
-        a[5] = a[5] | b[5]
+        a[4] = own_set_or(a[4], b[4])
+        a[5] = own_set_or(a[5], b[5])
         i += 1
 
 # Neither arm returned: a binding moved in the then-arm (`after_then`) is

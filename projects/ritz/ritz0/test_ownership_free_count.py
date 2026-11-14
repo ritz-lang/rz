@@ -29,8 +29,8 @@ call; ritz1 drops their temporaries since #2262. AGAST
 #2956 / #3005, except the rows citing their own tickets.
 AGAST #2261 closed ritz0's double evaluation of a method receiver, which
 dropped two values for one call.
-AGAST #2242 closed moves out of a nested field for ritz1, except past the 31
-paths it tracks per binding (#2319).
+AGAST #2242 closed moves out of a nested field for ritz1, and AGAST #2319
+the 31-path cap it had per binding.
 AGAST #2266 closed ritz1's array literals: an element moves in, a literal
 nobody takes drops its elements, and an unannotated literal of a struct is
 `[N]T`.
@@ -254,8 +254,22 @@ fn make_or_err(c: i32) -> Result<Tracked, i32>
 
 """
 
-# ritz1 tracks a binding's moved paths in 31 bits; ritz0 has no such limit.
-WIDE_GAP = {"ritz1": 2319, "ritz1_selfhosted": 2319}
+
+
+# AGAST #2319: more movable paths than an i32 has bits (ritz1 used to track
+# 31 and move the whole binding past them).  `Wide` has `n` Tracked fields;
+# f(c) builds one and runs `lines`, `calls` runs f, and the program exits
+# with DROPS.
+def wide(n, lines, calls="    f(1)\n"):
+    return ("struct Wide\n" + "".join(f"    f{i}: Tracked\n" for i in range(n))
+            + "\nfn f(c: i32)\n    var w = Wide { "
+            + ", ".join(f"f{i}: make(1)" for i in range(n)) + " }\n" + lines
+            + "\npub fn main() -> i32\n" + calls + "    return DROPS\n")
+
+
+WIDE_N = (NESTED3 + "struct WideN\n" + "".join(f"    g{i}: Inner2\n" for i in range(12))
+          + "\nfn f()\n    var w = WideN { "
+          + ", ".join(f"g{i}: mk_w(1, 1)" for i in range(12)) + " }\n")
 
 CASES = {
     # AGAST #2243: a binding from a field has the field's type, so it moves.
@@ -1333,7 +1347,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 33, WIDE_GAP),
+""", 33, {}),
 
     "nested_move_past_the_tracked_paths": (NESTED3 +
         "struct WideN\n" + "".join(f"    g{i}: Inner2\n" for i in range(12)) + """
@@ -1344,7 +1358,52 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 24, WIDE_GAP),
+""", 24, {}),
+
+    # The path an i32's sign bit would hold.
+    "wide_move_of_the_32nd_path": (wide(32, "    consume(w.f31)\n"), 32, {}),
+
+    # Moved on one call's path only: 40 drops each call.
+    "wide_move_in_one_if_arm": (wide(40, """\
+    if c == 1
+        consume(w.f39)
+""", "    f(1)\n    f(0)\n"), 80, {}),
+
+    # Paths in different words, moved apart.
+    "wide_moves_far_apart": (wide(40, """\
+    consume(w.f2)
+    consume(w.f33)
+    consume(w.f38)
+"""), 40, {}),
+
+    "wide_move_assigned_back": (wide(40, """\
+    consume(w.f39)
+    w.f39 = make(2)
+"""), 41, {}),
+
+    "wide_loop_move_and_assign_back": (wide(40, """\
+    var i = 0
+    while i < 2
+        consume(w.f39)
+        w.f39 = make(5)
+        i = i + 1
+"""), 42, {}),
+
+    "wide_loop_move_then_break": (wide(40, """\
+    while true
+        consume(w.f39)
+        break
+"""), 40, {}),
+
+    # The store drops what is left of the old w.g11 (its t), not its u.
+    "wide_nested_parent_assigned_after_move": (WIDE_N + """\
+    consume(w.g11.u)
+    w.g11 = mk_w(1, 1)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 26, {}),
 
     # AGAST #2171 from here on (ritz1's cases from #2168, now shared).  A
     # struct with a field moved out still drops the others: consume drops 1,
