@@ -92,6 +92,9 @@ READS = {
                           + "    var s: S\n    s.b.ptr = @h\n" + _READS.format(b="s.b")),
     "array_element": (_BOX + _H + MAIN + _FILL + "    var bs: [2]Box<H>\n    bs[1].ptr = @h\n"
                       + _READS.format(b="bs[1]")),
+    # A module-level Box (AGAST #3016: ritz0 typed the global `i8`).
+    "global": (_BOX + _H + "var gb: Box<H>\n\n" + MAIN + _FILL + "    gb.ptr = @h\n"
+               + _READS.format(b="gb")),
 }
 
 

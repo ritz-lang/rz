@@ -728,6 +728,11 @@ class Monomorphizer:
             # Visit field types
             for _, field_type in item.fields:
                 self._visit_type(field_type)
+        elif isinstance(item, rast.VarDef):
+            # A module-level `var gb: Box<H>` instantiates Box<H> even when no
+            # fn names it; unvisited, the global fell back to `i8` (AGAST #3016).
+            if item.type is not None:
+                self._visit_type(item.type)
         elif isinstance(item, rast.ImplBlock):
             # Skip generic impl blocks - they're handled during specialization
             if item.type_params:
