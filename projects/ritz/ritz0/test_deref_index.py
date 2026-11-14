@@ -17,7 +17,7 @@ String is #2440's, in test_index_through_reference.py.
 
 #3074: a `p:& *[3]T` borrow is a row kind here.  An array of pointers one level
 out, `p: @*[3]*U`, recorded no U on ritz1: `*(*p)[i]` read a byte and `(*p)[i].f`
-failed to emit.  A `**[N]*S` `let` local is #3104.
+failed to emit.  A `**[N]*S` `let` local named none either (#3104).
 
 #3103: on that borrow `p` reads as the caller's `*[3]T` (§13.4), so `p[i]` is
 element i too, as on a `p: *[3]T` param.  ritz1 refused it: "a reference is one
@@ -194,15 +194,31 @@ def test_a_bare_pointer_element_reads_at_its_width(run_with, kind, position, com
 
 
 # #3074: the same through an `@*[3]*U` or `@&*[3]*U` local, named through its type.
+# #3104: and a `let r: **[3]*U`, which named no U on ritz1: "unhandled EXPR_MEMBER".
+PTR_ELEM_LOCALS = [("@*", "@q"), ("@&*", "@&q"), ("**", "@q")]
+
+
+def _ptr_elem_local(around: str, addr: str, body: str) -> str:
+    fill = "".join(f"    var b{k}: W\n    b{k}.v = {v}\n" for k, v in enumerate((1, 21474836495, 3)))
+    return (W + "pub fn main() -> i32\n" + fill
+            + "    var a: [3]*W = [@b0, @b1, @b2]\n    var q: *[3]*W = @a\n"
+            + f"    let r: {around}[3]*W = {addr}\n" + body)
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("around,addr", [("@*", "@q"), ("@&*", "@&q")])
+@pytest.mark.parametrize("around,addr", PTR_ELEM_LOCALS)
 def test_a_pointer_element_through_a_ref_ptr_local(run_with, around, addr, compiler):
-    fill = "".join(f"    var b{k}: W\n    b{k}.v = {v}\n" for k, v in enumerate((1, 21474836495, 3)))
-    program = (W + "pub fn main() -> i32\n" + fill
-               + "    var a: [3]*W = [@b0, @b1, @b2]\n    var q: *[3]*W = @a\n"
-               + f"    let r: {around}[3]*W = {addr}\n    let x: i64 = (*r)[1].v\n" + SPLIT)
+    program = _ptr_elem_local(around, addr, "    let x: i64 = (*r)[1].v\n" + SPLIT)
     assert run_with(compiler, f"ptr_elem_local_{around}", program) == 20
+
+
+# #3104: a store through the `**[3]*W` local reaches b1, not b0 or the slot.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_pointer_element_store_through_a_ptr_ptr_local(run_with, compiler):
+    program = _ptr_elem_local("**", "@q", "    (*r)[1].v = 7\n    return (b1.v + b0.v + b2.v) as i32 + 9\n")
+    assert run_with(compiler, "ptr_elem_local_store_ptr_ptr", program) == 20
 
 
 # #3074: `*q` is the array, not its first element: `(*q).v` is refused, on a param
@@ -211,14 +227,16 @@ def test_a_pointer_element_through_a_ref_ptr_local(run_with, around, addr, compi
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("elem", ["W", "*W"])
-@pytest.mark.parametrize("where", ["param", "local", "borrow"])
+@pytest.mark.parametrize("where", ["param", "local", "borrow", "ptr_ptr_local"])
 def test_a_field_of_the_array_itself_is_refused(compile_with, where, elem, compiler):
     if where in ("param", "borrow"):
         # #3103: the `q:& *[3]T` borrow, bound as a `*[3]T` local, names no S either.
         around = "q: @*" if where == "param" else "q:& *"
         program = W + f"fn f({around}[3]{elem}) -> i64\n    return (*q).v\n\npub fn main() -> i32\n    return 0\n"
     else:
+        # #3104: a `**[3]*W` local names W off its type_name, as `@*` does.
+        around = "**" if where == "ptr_ptr_local" else "@*"
         program = (W + f"pub fn main() -> i32\n    var a: [3]{elem}\n    var q: *[3]{elem} = @a\n"
-                   + f"    let r: @*[3]{elem} = @q\n    return (*r).v as i32\n")
+                   + f"    let r: {around}[3]{elem} = @q\n    return (*r).v as i32\n")
     comp, _, _ = compile_with(compiler, f"array_field_{where}_{elem.strip('*')}{len(elem)}", program)
     assert comp.returncode != 0
