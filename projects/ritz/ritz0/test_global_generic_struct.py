@@ -95,6 +95,29 @@ PROGRAMS = {
                                "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
                                "    if w.a[1][2].v != 1099511627776\n        return 1\n"
                                "    if w.a[0][1].v != 5\n        return 2\n    return 0\n"),
+    # AGAST #3141: a generic struct's bare `[2][3]T` field.  The field clone
+    # kept the shape's leaf as a struct named `T`, so ritz1 refused
+    # `w.a[1][2] = x` ("assigning a row or a whole struct element").
+    "generic_field_bare_2d": ("struct W<T>\n    a: [2][3]T\n\n" + _MAIN
+                              + "    var w: W<i64>\n"
+                              "    w.a[1][2] = 1099511627776\n    w.a[0][1] = 5\n"
+                              "    if w.a[1][2] != 1099511627776\n        return 1\n"
+                              "    if w.a[0][1] != 5\n        return 2\n    return 0\n"),
+    # ... at a narrower T, beside a following field: an i64-wide leaf would
+    # overrun `a` into `k`, or read a neighbour into the element.
+    "generic_field_bare_2d_i8": ("struct W<T>\n    a: [2][3]T\n    k: i8\n\n" + _MAIN
+                                 + "    var w: W<i8>\n    w.k = 9\n"
+                                 "    w.a[1][1] = 4\n    w.a[1][2] = 7\n"
+                                 "    if w.a[1][2] != 7\n        return 1\n"
+                                 "    if w.a[1][1] != 4\n        return 2\n"
+                                 "    if w.k != 9\n        return 3\n    return 0\n"),
+    # ... and through the multi-parameter clone, each leaf its own argument.
+    "generic2_field_bare_2d": ("struct W<T, U>\n    a: [2][3]T\n    b: [2][3]U\n\n" + _MAIN
+                               + "    var w: W<i64, i8>\n"
+                               "    w.a[1][2] = 1099511627776\n    w.b[1][1] = 4\n    w.b[1][2] = 7\n"
+                               "    if w.a[1][2] != 1099511627776\n        return 1\n"
+                               "    if w.b[1][2] != 7\n        return 2\n"
+                               "    if w.b[1][1] != 4\n        return 3\n    return 0\n"),
 }
 
 
