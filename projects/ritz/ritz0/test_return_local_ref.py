@@ -298,7 +298,7 @@ ALLOWED = {
 }
 
 # ritz1 stores a nested `-> @C` result as a `C`, which clang refuses.
-UNCHECKED_GAPS = {"a_call_of_a_call": 2394}
+UNCHECKED_GAPS = {}
 
 # Compiles, and that's all that's asked: §13.5 says these aren't checked, and most
 # of them dangle. A row here that starts failing means the check has grown past
@@ -311,6 +311,10 @@ NOT_CHECKED = {
     "a_reference_in_a_global": "fn f() -> @C\n" + C1 + "    GR = @c\n    return GR\n",
     "a_call_result_held": "fn f() -> @C\n" + C1 + "    let r = sid(@c)\n    return r\n",
     "a_call_of_a_call": "fn f() -> @C\n" + C1 + "    return sid(sid(@c))\n",
+    # #2394: an `@T` param takes an address-returning call or method as is.
+    "a_call_of_a_method": "fn f() -> @C\n" + C1 + "    return sid(c.me())\n",
+    "a_call_of_a_raw_call": "fn f() -> @C\n" + C1 + "    return sid(rawid(@c))\n",
+    "a_call_of_a_mutable_call":"fn f() -> @C\n" + C1 + "    var d = C { x: 1 }\n    return sid(id(@&d))\n",
     "a_raw_call": "fn f() -> *C\n" + C1 + "    return rawid(@c)\n",
     "a_raw_method": "fn f() -> *C\n" + C1 + "    return c.raw()\n",
     "an_arm_held": "fn f(b: i32, p: @C) -> @C\n" + C1 + "    let r: @C = if b > 0\n        @c\n    else\n        p\n    return r\n",
