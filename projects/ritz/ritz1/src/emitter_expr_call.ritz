@@ -186,6 +186,159 @@ fn try_emit_len_builtin(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     emit_str(s, c"\n")
     return len_val
 
+# AGAST #3125: `Span<T>` is `{ ptr, len }`, so `.ptr()`, `.is_empty()` and
+# `.slice(lo, hi)` are struct operations a module that only receives a span
+# can call without importing ritzlib.span, as ritz0's
+# _try_emit_builtin_span_method lowers them.  As there, a method the module
+# does define (ritzlib.span's `is_empty` / `slice`, a UFCS `span_*` helper)
+# wins: this runs only when method_callee_def finds none.  `receiver_reg` is
+# the receiver the dispatcher already evaluated, read as try_emit_len_builtin
+# reads it.  `.ptr()` is the i64 pointer value, `.is_empty()` the i64 0 / 1 a
+# comparison gives, and `.slice(lo, hi)` a %Span$T view
+# `{ ptr + lo, hi - lo }`.  Returns -1 when not applicable.
+fn try_emit_span_builtin(s: *EmitterState, e: *Expr, type_name: *u8, type_name_len: i32, receiver_reg: i32, recv_is_ptr_of_ptr: i32) -> i32
+    if starts_with(type_name, type_name_len, c"Span$", 5) == 0
+        return -1
+    var op: i32 = 0
+    if e.args == null and name_eq(e.ident_ptr, e.ident_len, c"ptr", 3) == 1
+        op = 1
+    else if e.args == null and name_eq(e.ident_ptr, e.ident_len, c"is_empty", 8) == 1
+        op = 2
+    else if name_eq(e.ident_ptr, e.ident_len, c"slice", 5) == 1
+        if e.args != null and e.args.next != null and e.args.next.next == null
+            op = 3
+    if op == 0
+        return -1
+    if method_callee_def(s, type_name, type_name_len, e.ident_ptr, e.ident_len) != null
+        return -1
+
+    var struct_ptr: i32 = receiver_reg
+    if recv_is_ptr_of_ptr == 1
+        let loaded: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, loaded)
+        emit_str(s, c" = load ptr, ptr ")
+        emit_reg(s, receiver_reg)
+        emit_str(s, c"\n")
+        struct_ptr = loaded
+
+    # The field `.ptr()` reads (0) or the one the others start from (1).
+    var field: i32 = 1
+    if op == 1
+        field = 0
+    let fptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, fptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, type_name, type_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, struct_ptr)
+    emit_str(s, c", i32 0, i32 ")
+    emit_int(s, field as i64)
+    emit_str(s, c"\n")
+
+    if op == 1
+        let p: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, p)
+        emit_str(s, c" = load ptr, ptr ")
+        emit_reg(s, fptr)
+        emit_str(s, c"\n")
+        let pi: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, pi)
+        emit_str(s, c" = ptrtoint ptr ")
+        emit_reg(s, p)
+        emit_str(s, c" to i64\n")
+        return pi
+
+    if op == 2
+        let n: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, n)
+        emit_str(s, c" = load i64, ptr ")
+        emit_reg(s, fptr)
+        emit_str(s, c"\n")
+        let z: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, z)
+        emit_str(s, c" = icmp eq i64 ")
+        emit_reg(s, n)
+        emit_str(s, c", 0\n")
+        let b: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, b)
+        emit_str(s, c" = zext i1 ")
+        emit_reg(s, z)
+        emit_str(s, c" to i64\n")
+        return b
+
+    # slice: the element's size scales `lo` into a byte offset.
+    var align: i64 = 1
+    let elem_size: i64 = mangled_type_size_align(s, type_name + 5, type_name_len - 5, @align)
+    if elem_size <= 0 and is_unit_arg(type_name + 5, type_name_len - 5) == 0
+        emit_ir_error(s, c"Span.slice: can't measure the element type")
+        return 0
+    let lo: i32 = emit_expr(s, e.args)
+    let hi: i32 = emit_expr(s, e.args.next)
+    let base_ptr_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, base_ptr_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, type_name, type_name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, struct_ptr)
+    emit_str(s, c", i32 0, i32 0\n")
+    let base_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c" = load ptr, ptr ")
+    emit_reg(s, base_ptr_ptr)
+    emit_str(s, c"\n")
+    let off: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, off)
+    emit_str(s, c" = mul i64 ")
+    emit_reg(s, lo)
+    emit_str(s, c", ")
+    emit_int(s, elem_size)
+    emit_str(s, c"\n")
+    let at: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, at)
+    emit_str(s, c" = getelementptr i8, ptr ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, off)
+    emit_str(s, c"\n")
+    let len: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, len)
+    emit_str(s, c" = sub i64 ")
+    emit_reg(s, hi)
+    emit_str(s, c", ")
+    emit_reg(s, lo)
+    emit_str(s, c"\n")
+    let v1: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, v1)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, type_name, type_name_len)
+    emit_str(s, c" undef, ptr ")
+    emit_reg(s, at)
+    emit_str(s, c", 0\n")
+    let v2: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, v2)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, type_name, type_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, v1)
+    emit_str(s, c", i64 ")
+    emit_reg(s, len)
+    emit_str(s, c", 1\n")
+    return v2
+
 # A string literal passed to a `StrView` param, rebuilt as a %StrView value.
 # `reg` is emit_expr's result for `arg`. Also rebuilds any other arg whose
 # value is a %Span$u8 (e.g. an un-annotated literal local, #2103). Returns
@@ -6000,6 +6153,11 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     let ufcs: i32 = try_emit_ufcs_method(s, e, type_name, type_name_len, receiver_reg, recv_is_ptr_of_ptr)
     if ufcs >= 0
         return ufcs
+
+    # Span .ptr() / .is_empty() / .slice(lo, hi) with no method defining them
+    let span_val: i32 = try_emit_span_builtin(s, e, type_name, type_name_len, receiver_reg, recv_is_ptr_of_ptr)
+    if span_val >= 0
+        return span_val
 
     # Fallback: Build mangled function name: Type_method
     # Emit: call <rt> @Type_method(ptr %receiver, args...)

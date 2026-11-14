@@ -10,6 +10,7 @@ argument positions.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -170,7 +171,6 @@ fn ms() -> Span<u8>
 # ritz1 evaluates these receivers once too, where it can compile them. What's
 # missing is something else, so each row cites its own ticket.
 BOTH_RITZ1 = ("ritz1", "ritz1_selfhosted")
-NO_SPAN_INTRINSIC = {c: 3125 for c in BOTH_RITZ1}
 NO_CALL_RANGE_START = {c: 3126 for c in BOTH_RITZ1}
 NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
 NO_DYN_RETURN = {c: 2298 for c in BOTH_RITZ1}
@@ -204,9 +204,9 @@ CASES = {
     "float": ("mf().abs()", 1, 0, {}),
     "user_abs_past_float": ("ma().abs()", 1, 0, {}),
     "span_len": ("ms().len()", 1, 0, {}),
-    "span_ptr": ("ms().ptr()", 1, 0, NO_SPAN_INTRINSIC),
-    "span_is_empty": ("ms().is_empty()", 1, 0, NO_SPAN_INTRINSIC),
-    "span_slice": ("ms().slice(0, 0)", 1, 0, NO_SPAN_INTRINSIC),
+    "span_ptr": ("ms().ptr()", 1, 0, {}),
+    "span_is_empty": ("ms().is_empty()", 1, 0, {}),
+    "span_slice": ("ms().slice(0, 0)", 1, 0, {}),
     # A place is emitted for its type and again for its address.
     "index_lent": (ARRAY + "arr[idx()].get()", 1, 0, {}),
     "index_mut": (ARRAY + "arr[idx()].bump()", 1, 0, {}),
@@ -313,6 +313,60 @@ pub fn main() -> i32
     return MADE * 10 + arr[1].x
 """, 13, {}),
 
+    # Span's built-in methods on a param, with no ritzlib.span: `{ ptr, len }`
+    # struct operations, at u8 and at an 8-byte T (AGAST #3125).  slice(1, 3)
+    # of `[1, 2, 3, 4]` is `[2, 3]`, so 2 * 10 + 2 + 0, after 100 * (0 + 1).
+    "span_param_no_import": ("""\
+fn c8(s: Span<u8>) -> i32
+    return s.ptr() as i32 + s.is_empty() as i32
+
+fn c64(s: Span<i64>) -> i64
+    let t: Span<i64> = s.slice(1, 3)
+    return *t.ptr() * 10 + t.len + s.is_empty() as i64
+
+pub fn main() -> i32
+    var a: [4]i64 = [1, 2, 3, 4]
+    return c8(Span.empty()) * 100 + c64(@a) as i32
+""", 122, {}),
+
+    # With ritzlib.span imported, its own `is_empty` and `slice` are called
+    # (and the built-in `ptr`, which it doesn't define): 2 * 10, then 1 + 1.
+    "span_param_ritzlib": ("""\
+import ritzlib.span
+
+fn c(s: Span<u8>) -> i32
+    let t: Span<u8> = s.slice(1, 3)
+    return t.len as i32 * 10 + s.is_empty() as i32 + (s.ptr() == null) as i32
+
+pub fn main() -> i32
+    var a: [4]u8 = [1, 2, 3, 4]
+    return c(Span<u8> { ptr: @a[0], len: 4 }) + c(Span.empty())
+""", 22, {}),
+
+    # A module that declares its own Span and methods gets them, not the
+    # built-ins: each counts, so 1 + 10, after 100 * (0 + 0).
+    "span_own_methods": ("""\
+struct Span<T>
+    ptr: *T
+    len: i64
+
+impl<T> Span<T>
+    fn is_empty(self: *Span<T>) -> bool
+        MADE = MADE + 1
+        return false
+
+    fn ptr(self: *Span<T>) -> *T
+        MADE = MADE + 10
+        return self.ptr
+
+fn c(s: Span<u8>) -> i32
+    return s.is_empty() as i32 + (s.ptr() == null) as i32
+
+pub fn main() -> i32
+    var a: [2]u8 = [1, 2]
+    return c(Span<u8> { ptr: @a[0], len: 0 }) * 100 + MADE
+""", 11, {}),
+
     # The value the method returns is the receiver's, not another evaluation's.
     "reads_the_value_it_evaluated": ("""\
 fn counted() -> P
@@ -343,7 +397,11 @@ def _params(table):
 
 def _run(request, tmp_path, compiler, program):
     src = tmp_path / "main.ritz"
-    src.write_text(PRELUDE + program)
+    # An `import` stays at the top of the module, ahead of the prelude.
+    lines = program.split("\n")
+    imports = "".join(ln + "\n" for ln in lines if ln.startswith("import "))
+    rest = "\n".join(ln for ln in lines if not ln.startswith("import "))
+    src.write_text(imports + PRELUDE + rest)
     ll = tmp_path / "main.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     if compiler == "ritz0":
@@ -378,6 +436,13 @@ def test_receiver_program(request, tmp_path, compiler, name):
     program, expected, _ = PROGRAMS[name]
     rc = _run(request, tmp_path, compiler, program)
     assert rc == expected, f"{compiler} {name}: exit {rc}, expected {expected}"
+    if name == "span_param_ritzlib":
+        # Its `is_empty` and `slice` mean what the built-ins do, so the exit
+        # status can't tell them apart: the calls in the IR can.
+        ir = (tmp_path / "main.ll").read_text()
+        for fn in ("span_is_empty$u8", "span_slice$u8"):
+            assert re.search(rf'call [^\n]*@"?{re.escape(fn)}"?\(', ir), (
+                f"{compiler}: ritzlib.span's {fn} isn't called")
 
 
 def test_nothing_outlives_the_call():
