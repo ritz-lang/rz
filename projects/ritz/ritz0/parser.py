@@ -371,6 +371,43 @@ class Parser:
             self._reset(mark)
             return []
 
+    # Tokens that start an operand.  After a cast's closing `>` one of these
+    # means the `<` ... `>` were comparisons: `f(a as Sz < b, c > d)`.
+    _OPERAND_START = frozenset((
+        TokenType.IDENT, TokenType.INT, TokenType.FLOAT, TokenType.STRING,
+        TokenType.CSTRING, TokenType.CHAR, TokenType.REGEX, TokenType.TRUE,
+        TokenType.FALSE, TokenType.NULL, TokenType.LPAREN, TokenType.LBRACKET,
+        TokenType.AT, TokenType.AT_AMP, TokenType.BANG, TokenType.NOT,
+        TokenType.TILDE))
+
+    def _try_parse_cast_type_args(self) -> List['rast.Type']:
+        """Type arguments of a cast's target type: `x as *Box<i64>` (#3124).
+
+        A cast's type sits in expression context, where `<` may be a
+        comparison (`a as i64 < b`).  The list is kept only when it is a
+        complete `<T, ...>` closed by a plain `>` (not a split `>>`/`>=`,
+        which would be a shift or `>=` in a comparison) and no operand follows
+        the `>`.  Anything else backtracks and leaves the `<` to the
+        expression parser.
+        """
+        if not self._at(TokenType.LT):
+            return []
+        mark = self._mark()
+        try:
+            self._advance()  # consume <
+            type_args = [self.parse_type()]
+            while self._at(TokenType.COMMA):
+                self._advance()
+                type_args.append(self.parse_type())
+            if self._at(TokenType.GT):
+                self._advance()
+                if self._current().type not in self._OPERAND_START:
+                    return type_args
+        except ParseError:
+            pass
+        self._reset(mark)
+        return []
+
     def _interpolate_print_arg(self, callee: rast.Expr,
                                args: List[rast.Expr]) -> List[rast.Expr]:
         """Split `{expr}` placeholders in print / eprint's literal argument.
@@ -523,9 +560,9 @@ class Parser:
         """Parse a type expression, including union types (A | B | C).
 
         Args:
-            allow_type_args: If False, don't parse generic type arguments.
-                This is used in cast expressions (as) to avoid ambiguity
-                with comparison operators.
+            allow_type_args: If False (a cast's target, after `as`), a
+                named type's `<...>` is read speculatively, since `<` may be
+                a comparison there (_try_parse_cast_type_args, #3124).
         """
         first_type = self._parse_type_primary(allow_type_args)
 
@@ -707,9 +744,12 @@ class Parser:
             qualified_name = self._expect(TokenType.IDENT, "Expected type name after '::'").value
             name = f"{name}::{qualified_name}"
 
-        # Generic args: Type<Arg1, Arg2>
-        # Skip type args parsing in cast context to avoid ambiguity with comparisons
-        args = self._parse_type_args() if allow_type_args else []
+        # Generic args: Type<Arg1, Arg2>.  In a cast's target (`as`), `<` may
+        # equally be a comparison, so the list is read speculatively (#3124).
+        if allow_type_args:
+            args = self._parse_type_args()
+        else:
+            args = self._try_parse_cast_type_args()
 
         return rast.NamedType(span, name, args)
 
