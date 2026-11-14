@@ -317,6 +317,39 @@ pub fn main() -> i32
     return MADE * 10 + arr[1].x
 """, 13, {}),
 
+    # So is `q[i]` with `q` a `*P` param, local or global (AGAST #3143): the
+    # read sees element 1, and `bump` writes element 1 in place, not element
+    # 0 or a copy.  2 * 100 + 3 * 10 + 1.
+    "index_of_ptr_param": ("""\
+fn f(q: *P) -> i32
+    let r = q[1].get()
+    q[1].bump()
+    return r
+
+pub fn main() -> i32
+    var arr: [2]P = [P { x: 1 }, P { x: 2 }]
+    let r = f(@arr[0])
+    return r * 100 + arr[1].x * 10 + arr[0].x
+""", 231, {}),
+    "index_of_ptr_local": ("""\
+pub fn main() -> i32
+    var arr: [2]P = [P { x: 1 }, P { x: 2 }]
+    let q: *P = @arr[0]
+    let r = q[1].get()
+    q[1].bump()
+    return r * 100 + arr[1].x * 10 + arr[0].x
+""", 231, {}),
+    "index_of_ptr_global": ("""\
+var GQ: *P = null
+
+pub fn main() -> i32
+    var arr: [2]P = [P { x: 1 }, P { x: 2 }]
+    GQ = @arr[0]
+    let r = GQ[1].get()
+    GQ[1].bump()
+    return r * 100 + arr[1].x * 10 + arr[0].x
+""", 231, {}),
+
     # Span's built-in methods on a param, with no ritzlib.span: `{ ptr, len }`
     # struct operations, at u8 and at an 8-byte T (AGAST #3125).  slice(1, 3)
     # of `[1, 2, 3, 4]` is `[2, 3]`, so 2 * 10 + 2 + 0, after 100 * (0 + 1).
