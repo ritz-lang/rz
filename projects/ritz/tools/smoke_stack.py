@@ -19,7 +19,7 @@ does, after `./rz build --all`, using the debug binaries that step built:
             whole log lines; no mausoleum with 2 workers -> 503, not 404;
             SIGTERM/SIGINT/SIGKILL to zeus alone stops its workers in 2 s;
             kill -9 of one worker: zeus respawns it in 2 s, and a SIGHUP
-            hot reload reaps it
+            hot reload reaps it; zeus logs each line in one write(2)
   hollow    sage, goliath, rzrz and ritz-lsp must not report success for
             work they did not do
   rzsh      the Linux shell: echo, cd, $X, $?, >, |, external commands
@@ -1141,7 +1141,11 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
                 return z, pids
             if time.monotonic() > deadline:
                 procs.stop(z)
-                raise Broken(f"zeus never logged 2 spawned workers: {log_tail(z)}")
+                # The tail alone hid the evidence in #3121: show every line
+                # that mentions a spawn, torn or not.
+                spawn = [ln for ln in log.splitlines() if "spawn" in ln]
+                raise Broken(f"zeus never logged 2 spawned workers in {START_TIMEOUT:.0f} s; "
+                             f"spawn lines: {spawn}; tail: {log_tail(z)}")
             time.sleep(0.1)
 
     def workers_gone_after(sig: int) -> None:
@@ -1236,6 +1240,56 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
             procs.stop(z, signal.SIGKILL)
 
     r.run("stack.zeus_reload_reaps_dead_worker", reload_reaps_dead_worker)
+
+    def zeus_writes_and_lines(z: subprocess.Popen) -> tuple[int, int]:
+        """(write syscalls zeus has made, lines zeus has logged), read consistently."""
+        while True:
+            before = Path(z.log).read_text(errors="replace")  # type: ignore[attr-defined]
+            try:
+                # The thread's own file: /proc/<pid>/io also folds in the
+                # writes of every worker zeus has reaped.
+                io = Path(f"/proc/{z.pid}/task/{z.pid}/io").read_text()
+            except OSError as e:
+                raise Broken(f"/proc/{z.pid}/task/{z.pid}/io unreadable (no task I/O accounting?): {e}")
+            if Path(z.log).read_text(errors="replace") == before:  # type: ignore[attr-defined]
+                syscw = int(re.search(r"^syscw: (\d+)$", io, re.M).group(1))  # type: ignore[union-attr]
+                return syscw, sum(ln.startswith("zeus: ") for ln in before.splitlines())
+            time.sleep(0.05)
+
+    def log_one_write_per_line() -> None:
+        # #3121: zeus printed a line in pieces, one write(2) per fragment and
+        # per digit ("spawned worker " "0" " (pid " "5" "6" ... ")\n"). Its
+        # workers share that stdout, so a worker's line landing between two
+        # pieces tore it and the "spawned worker N (pid P)" regexes above
+        # never matched: zeus_int_stops_workers waited out its 10 s. With no
+        # client connected, zeus's only write(2)s are its log lines, so
+        # syscw (/proc/<pid>/io) must equal its line count: at startup, and
+        # after a kill -9 makes it log a respawn.
+        z, pids = zeus_alone()
+        try:
+            deadline = time.monotonic() + START_TIMEOUT
+            while "zeus: entering event loop" not in Path(z.log).read_text(errors="replace"):  # type: ignore[attr-defined]
+                if time.monotonic() > deadline:
+                    raise Broken(f"zeus never entered its event loop: {log_tail(z)}")
+                time.sleep(0.05)
+            writes, lines = zeus_writes_and_lines(z)
+            if writes != lines:
+                raise CheckFailed(f"startup: zeus made {writes} write(2)s for {lines} log lines "
+                                  f"(want one write per line)")
+            os.kill(pids[0], signal.SIGKILL)
+            deadline = time.monotonic() + 2.0
+            while "zeus: respawned worker" not in Path(z.log).read_text(errors="replace"):  # type: ignore[attr-defined]
+                if time.monotonic() > deadline:
+                    raise CheckFailed(f"kill -9 worker {pids[0]}: no respawn in 2 s: {log_tail(z, 4)}")
+                time.sleep(0.05)
+            writes, lines = zeus_writes_and_lines(z)
+            if writes != lines:
+                raise CheckFailed(f"respawn: zeus made {writes} write(2)s for {lines} log lines "
+                                  f"(want one write per line)")
+        finally:
+            procs.stop(z, signal.SIGKILL)
+
+    r.run("stack.zeus_log_one_write_per_line", log_one_write_per_line)
 
 
 def _pid_alive(pid: int) -> bool:

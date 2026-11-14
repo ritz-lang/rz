@@ -26,31 +26,54 @@ import zeus.control
 # Simple Print Helpers
 # ============================================================================
 
+# One write(2) per line (AGAST #3121). zeus's workers inherit its stdout, so
+# a line printed in pieces ("spawned worker " "0" " (pid " then one write
+# per digit) could take a worker's line between two pieces, and
+# smoke_stack's "zeus: spawned worker N (pid P)" match never saw it.
+# print_str and print_i32 append to g_line; the '\n' that ends a line writes
+# the whole line at once. A write to a shared file description lands whole
+# at the shared offset, and a pipe write up to PIPE_BUF is atomic.
+# smoke_stack's stack.zeus_log_one_write_per_line counts zeus's write(2)s.
+
+const LINE_CAP: i64 = 256
+var g_line: [256]u8
+var g_line_len: i64 = 0
+
+fn line_flush()
+    if g_line_len > 0
+        sys_write(1, @g_line[0], g_line_len)
+        g_line_len = 0
+
+fn line_push(c: u8)
+    if g_line_len == LINE_CAP
+        line_flush()  # an over-long line goes out in pieces rather than lost
+    g_line[g_line_len] = c
+    g_line_len = g_line_len + 1
+    if c == 10
+        line_flush()
+
 fn print_str(s: *u8)
-    var len: i64 = 0
-    while *(s + len) != 0
-        len = len + 1
-    sys_write(1, s, len)
+    var i: i64 = 0
+    while *(s + i) != 0
+        line_push(*(s + i))
+        i = i + 1
 
 fn print_i32(n: i32)
-    if n < 0
-        sys_write(1, c"-", 1)
-        print_i32(-n)
-        return
-    if n == 0
-        sys_write(1, c"0", 1)
-        return
+    var v: i64 = n as i64  # i64: -(-2^31) does not fit an i32
+    if v < 0
+        line_push(0x2D)  # '-'
+        v = -v
     var buf: [12]u8
     var i: i32 = 0
-    var v: i32 = n
-    while v > 0
+    loop
         buf[i] = (0x30 + (v % 10)) as u8
         v = v / 10
         i = i + 1
-    # Reverse
+        if v == 0
+            break
     while i > 0
         i = i - 1
-        sys_write(1, @buf[i], 1)
+        line_push(buf[i])
 
 # ============================================================================
 # Global State
