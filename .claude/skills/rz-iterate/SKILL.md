@@ -490,7 +490,7 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    Run the wait with `run_in_background`, so it wakes this room when the gate
    ends, and keep the usual 1800 s fallback wakeup. Carry on with the loop
    (slots, nudges) meanwhile. On a context reset, `train.sh show` prints the
-   train, and the newest `gate-logs/train-<sha12>.log` holds the gate. The
+   train, and the highest-numbered `gate-logs/train-<sha12>-<n>.log` holds the gate. The
    train gate uses omegalisk's one gate slot, so it may wait behind a local
    room's gate.
 5. **Gate passes (exit 0), or `gate=not-needed`:**

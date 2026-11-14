@@ -4,6 +4,7 @@
 # machine, and always ends in a verdict.
 #
 #   run-gate.sh <worktree> <name>      start the gate, print its log path
+#                                      (<gate dir>/<name>-<sha12>-<n>.log)
 #   run-gate.sh --wait <log>           block until it ends; exit with its code
 #
 # Env overrides:
@@ -31,6 +32,9 @@
 #     No memory cap on the gate: an OOM kill there is a false red.
 #   * SHA in the log name, and the HEAD-moved check: the callback claims a
 #     specific commit passed.  A gate that ran while HEAD moved proves nothing.
+#   * <name>-<sha12>-<n>.log, a new <n> per run: a re-gate never overwrites
+#     an earlier run's log, so a false red's evidence outlives the re-gate
+#     that clears it (AGAST #3182).  Tests: test-run-gate.sh.
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
@@ -99,8 +103,21 @@ fi
 
 SHA="$(git -C "$WT" rev-parse HEAD)"
 mkdir -p "$GATES"
-LOG="$GATES/$NAME-${SHA:0:12}.log"
-printf 'UNIT=%s\nSHA=%s\nCMD=%s\n' "$UNIT" "$SHA" "$CMD" > "$LOG"
+# One log per run, never reused (AGAST #3182): a re-gate of the same SHA once
+# truncated the earlier run's log, and #3178 lost the EXIT=2 evidence it
+# needed.  noclobber makes the create atomic (O_EXCL), so two runs racing for
+# the same <n> can't share a log; the loser takes the next number.
+n=1
+while :; do
+    LOG="$GATES/$NAME-${SHA:0:12}-$n.log"
+    if (set -C; : > "$LOG") 2>/dev/null; then break; fi
+    if [[ ! -e "$LOG" ]]; then
+        echo "error: cannot create $LOG" >&2
+        exit 1
+    fi
+    n=$((n + 1))
+done
+printf 'UNIT=%s\nSHA=%s\nCMD=%s\n' "$UNIT" "$SHA" "$CMD" >> "$LOG"
 
 # The inner script reads everything from the environment, so nothing here
 # needs a second layer of quoting.
