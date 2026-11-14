@@ -37,7 +37,13 @@ That gives us:
 - Multishot `accept` SQE for new connections (kernel ≥ 5.19)
 - Per-connection `Task` slot with `read_buf` / `write_buf` / `handler_state`
 - io_uring CQE → handler dispatch with full state-machine support
-- Idle timeout, max-connection cap, graceful shutdown all already wired
+- Idle timeout and max-connection cap already wired, plus a per-iteration
+  shutdown hook. TaskServer does not watch for signals itself: until AGAST
+  #2463 SIGTERM killed the async server outright (exit 143, no checkpoint).
+  `lib/server_async.ritz` now routes SIGTERM/SIGINT through a signalfd
+  read on the ring and drains through that hook. In-flight requests are
+  answered, new and idle connections are dropped, a second signal or a 5s
+  deadline cuts the drain short. Then `cmd_serve` checkpoints and exits 0.
 
 ### Per-connection state
 

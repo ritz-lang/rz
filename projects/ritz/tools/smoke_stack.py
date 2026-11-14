@@ -714,6 +714,49 @@ def suite_mausoleum(r: Reporter, procs: Procs, tmp: Path) -> None:
 
     r.run("mausoleum.restart_kill9", restart_kill9)
 
+    def term_graceful():
+        # #2463: SIGTERM to the default (io_uring) loop must drain and shut
+        # down cleanly. At the signal one client sits idle on a keep-alive
+        # connection and another is half-way through sending a PING. The
+        # PING is still answered, a connection made after the signal is not
+        # served, and the process exits 0 well inside the 5s drain deadline
+        # (it must not wait on the idle client) with storage checkpointed.
+        portg = free_port()
+        datag = work / "data-graceful"
+        pg = serve(datag, portg)
+        try:
+            res = seed_cmd(portg, "--seed")
+            if res.returncode != 0:
+                raise Broken(f"seeding failed: {short(res.stdout)}")
+            if wal_bytes(datag) <= WAL_CHECKPOINT_ONLY_SIZE:
+                raise Broken(f"seeding left no WAL records to checkpoint ({wal_bytes(datag)} bytes)")
+            idle = socket.create_connection(("127.0.0.1", portg), timeout=IO_TIMEOUT)
+            busy = socket.create_connection(("127.0.0.1", portg), timeout=IO_TIMEOUT)
+            try:
+                ping = m7sp_ping(0x2463)
+                busy.sendall(ping[:6])
+                time.sleep(0.2)  # let the server take both connections and the partial header
+                os.killpg(pg.pid, signal.SIGTERM)
+                time.sleep(0.2)
+                late = m7sp_try_ping(portg)
+                if late:
+                    raise CheckFailed(f"a connection made after SIGTERM was served: {late.hex()}")
+                busy.sendall(ping[6:])
+                reply = recv_exact(busy, 16)
+                if len(reply) != 16 or reply[9] != 0x81:
+                    raise CheckFailed(f"PING in flight at SIGTERM -> {reply.hex() or 'no reply'} (want PONG)")
+                code = pg.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                raise CheckFailed(f"still running 3s after its last request: {log_tail(pg, 3)}") from None
+            finally:
+                idle.close()
+                busy.close()
+        finally:
+            procs.stop(pg)
+        check_clean_exit(pg, code, datag)
+
+    r.run("mausoleum.term_graceful", term_graceful)
+
     def verify_fail_exit():
         porte = free_port()
         pe = serve(work / "data-empty", porte)
@@ -790,7 +833,70 @@ def suite_mausoleum(r: Reporter, procs: Procs, tmp: Path) -> None:
     r.run("mausoleum.shell_ping", shell_ping)
     r.run("mausoleum.shell_commands", shell_commands)
     r.run("mausoleum.shell_crud", shell_crud)
+
+    def term_graceful_encrypted():
+        if wal_bytes(work / "data-enc") <= WAL_CHECKPOINT_ONLY_SIZE:
+            raise Broken("the encrypted server's writes left no WAL records to checkpoint")
+        os.killpg(pe.pid, signal.SIGTERM)
+        try:
+            code = pe.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            raise CheckFailed(f"still running 3s after SIGTERM: {log_tail(pe, 3)}") from None
+        check_clean_exit(pe, code, work / "data-enc")
+
+    r.run("mausoleum.term_graceful_encrypted", term_graceful_encrypted)
     procs.stop(pe)
+
+
+# A checkpointed WAL holds exactly one 32-byte record header of type
+# WAL_REC_CHECKPOINT (7); the type byte sits at offset 28 (lib/wal.ritz).
+WAL_CHECKPOINT_ONLY_SIZE = 32
+
+
+def wal_bytes(data: Path) -> int:
+    wal = data / "wal.wal.000000"
+    return wal.stat().st_size if wal.exists() else 0
+
+
+def m7sp_ping(request_id: int) -> bytes:
+    # 16-byte M7SP header: magic "M7SP", length 16, version 1, MSG_PING, flags 0.
+    return b"M7SP" + (16).to_bytes(4, "big") + bytes([1, 0x01, 0, 0]) + request_id.to_bytes(4, "big")
+
+
+def m7sp_try_ping(port: int) -> bytes:
+    """PING on a new connection; whatever comes back. Refused, reset or
+    closed unanswered all read as b""."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5) as s:
+            s.sendall(m7sp_ping(0x2464))
+            return recv_exact(s, 16)
+    except OSError:
+        return b""
+
+
+def recv_exact(s: socket.socket, n: int) -> bytes:
+    got = b""
+    while len(got) < n:
+        try:
+            chunk = s.recv(n - len(got))
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    return got
+
+
+def check_clean_exit(p: subprocess.Popen, code: int, data: Path) -> None:
+    """After SIGTERM: exit 0, 'Server stopped.', and the WAL cut back to its checkpoint record."""
+    log = p.log.read_text(errors="replace")  # type: ignore[attr-defined]
+    if code != 0:
+        raise CheckFailed(f"exit {code} after SIGTERM (want 0): {log_tail(p, 3)}")
+    if "Server stopped." not in log:
+        raise CheckFailed(f"exit 0 but no 'Server stopped.': {log_tail(p, 3)}")
+    wal = (data / "wal.wal.000000").read_bytes()
+    if len(wal) != WAL_CHECKPOINT_ONLY_SIZE or wal[28] != 7:
+        raise CheckFailed(f"WAL is {len(wal)} bytes after shutdown, not one checkpoint record")
 
 
 # --------------------------------------------------------------------------

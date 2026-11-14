@@ -31,11 +31,13 @@ import ritzlib.async.tasks {
     task_server_run,
     task_server_set_idle_timeout,
     task_server_set_max_connections,
+    task_server_set_shutdown_hook,
     task_submit_recv,
     task_submit_send,
     task_reset_for_recv,
     TASK_BUFFER_SIZE,
-    TASK_WAITING
+    TASK_WAITING,
+    get_current_time
 }
 
 import mausoleum.m7m_types
@@ -193,6 +195,11 @@ fn m7sp_session_destroy(idx: i32)
 
     g_sessions[idx].in_use = 0
     # TODO phase 4-B: if big_send_ptr != 0, munmap it
+
+    # Draining: this may have been the last busy session, and nothing else
+    # would wake the loop to notice — see shutdown_hook.
+    if g_draining != 0
+        shutdown_wake_loop()
 
 
 # Encrypted-mode session init.  Mirrors `m7sp_session_init` for parser
@@ -823,6 +830,146 @@ fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSes
 
 
 # ============================================================================
+# Graceful shutdown (AGAST #2463)
+# ============================================================================
+#
+# SIGTERM/SIGINT are blocked and routed to a signalfd (as the --serial
+# loops do), read by an io_uring READ into `g_sig_buf` so a signal wakes
+# the event loop.  `shutdown_hook` runs at the top of every loop
+# iteration; until a signal arrives it is two loads, no syscall.
+#
+# On the first signal the loop drains:
+#   * new connections are closed unserved (handlers check `g_draining`)
+#   * sessions idle between requests (no bytes of a next request, recv
+#     pending) are not waited for: process exit closes them
+#   * busy sessions — a request partly received, a reply or SCAN in
+#     flight, a handshake mid-way — finish; once their reply is sent they
+#     close instead of waiting for another request
+# When no busy session is left the hook returns 1, task_server_run
+# returns, and cmd_serve checkpoints storage and prints "Server stopped."
+# A second signal, or DRAIN_GRACE_SECS without the busy ones finishing,
+# stops at once.  Signals stay blocked afterwards, so a late SIGTERM
+# cannot kill the process mid-checkpoint.
+
+const SHUTDOWN_SIGNAL_UD: i64 = 0x4D3700000001   # signalfd READ completion
+const SHUTDOWN_TIMER_UD:  i64 = 0x4D3700000002   # drain-deadline timeout
+const SHUTDOWN_WAKE_UD:   i64 = 0x4D3700000003   # "a session closed" NOP
+const DRAIN_GRACE_SECS: i64 = 5
+
+var g_srv: i64 = 0               # *TaskServer while a serve loop runs
+var g_signal_fd: i32 = -1
+var g_sig_buf: [128]u8           # signalfd_siginfo; ssi_signo is byte 0
+var g_draining: i32 = 0
+var g_drain_deadline: i64 = 0
+var g_drain_ts: KernelTimespec
+
+
+fn shutdown_submit_signal_read()
+    if g_signal_fd < 0 or g_srv == 0
+        return
+    let srv: *TaskServer = g_srv as *TaskServer
+    let sqe = uring_get_sqe(@srv.ring)
+    if sqe == null
+        return
+    # Offset -1: read at the file position (a signalfd has none to seek).
+    uring_prep_read(sqe, g_signal_fd, @g_sig_buf[0], 128, -1, SHUTDOWN_SIGNAL_UD)
+    uring_sqe_submit(@srv.ring)
+
+
+fn shutdown_wake_loop()
+    if g_srv == 0
+        return
+    let srv: *TaskServer = g_srv as *TaskServer
+    let sqe = uring_get_sqe(@srv.ring)
+    if sqe == null
+        return
+    uring_prep_nop(sqe, SHUTDOWN_WAKE_UD)
+    uring_sqe_submit(@srv.ring)
+
+
+# Between requests: nothing of a next request received, no SCAN pending,
+# not mid-handshake.  Closing such a session drops no request.
+fn m7sp_session_idle(s: *M7SPSession) -> i32
+    if s.have != 0 or s.scan_active != 0
+        return 0
+    if s.parse_state == PARSE_NEED_HEADER or s.parse_state == PARSE_HANDSHAKE_RECV
+        return 1
+    return 0
+
+
+fn shutdown_begin_drain()
+    g_draining = 1
+    g_drain_deadline = get_current_time() + DRAIN_GRACE_SECS
+    prints("Received shutdown signal, stopping server...\n")
+    # Wake the loop at the deadline even if a busy client stalls.  A kernel
+    # that refuses IORING_OP_TIMEOUT completes it at once with -EINVAL;
+    # then only a second signal cuts a stalled drain short.
+    let srv: *TaskServer = g_srv as *TaskServer
+    let sqe = uring_get_sqe(@srv.ring)
+    if sqe != null
+        g_drain_ts.tv_sec = DRAIN_GRACE_SECS
+        g_drain_ts.tv_nsec = 0
+        uring_prep_timeout(sqe, @g_drain_ts, 0, 0, SHUTDOWN_TIMER_UD)
+        uring_sqe_submit(@srv.ring)
+
+
+# One drain pass: count busy sessions.  Returns 1 when none is (the loop
+# may stop).  A session whose CQE has arrived
+# but not been handled yet (task READY) counts as busy: that CQE may be
+# the request it is about to answer.
+fn shutdown_drain_step() -> i32
+    let srv: *TaskServer = g_srv as *TaskServer
+    var busy: i32 = 0
+    for i in 0..SESSION_MAX
+        if g_sessions[i].in_use != 0
+            let task: *Task = @srv.pool.tasks[i]
+            if m7sp_session_idle(@g_sessions[i]) == 0 or task.state != TASK_WAITING
+                busy += 1
+    if busy == 0
+        return 1
+    return 0
+
+
+# TaskServer shutdown hook: non-zero stops the loop.
+fn shutdown_hook() -> i32
+    let sig: i32 = g_sig_buf[0] as i32
+    if sig != 0
+        g_sig_buf[0] = 0
+        if sig == SIGTERM or sig == SIGINT
+            if g_draining != 0
+                prints("Second shutdown signal: stopping without waiting for in-flight requests.\n")
+                return 1
+            shutdown_begin_drain()
+        shutdown_submit_signal_read()
+    if g_draining == 0
+        return 0
+    if get_current_time() >= g_drain_deadline
+        prints("Drain timed out: stopping with requests still in flight.\n")
+        return 1
+    return shutdown_drain_step()
+
+
+fn shutdown_install(srv: *TaskServer)
+    g_srv = srv as i64
+    g_draining = 0
+    g_sig_buf[0] = 0
+    g_signal_fd = signalfd_create_for_shutdown()
+    if g_signal_fd < 0
+        prints("Warning: Failed to create signalfd, shutdown may not be graceful\n")
+        return
+    task_server_set_shutdown_hook(srv, shutdown_hook)
+    shutdown_submit_signal_read()
+
+
+fn shutdown_uninstall()
+    if g_signal_fd >= 0
+        sys_close(g_signal_fd)
+    g_signal_fd = -1
+    g_srv = 0
+    g_draining = 0
+
+
+# ============================================================================
 # Connection handler — M7SP framing state machine
 # ============================================================================
 #
@@ -852,6 +999,8 @@ fn handle_task_event(task: *Task) -> i32
 
     # ─── First call: session not yet initialized for this slot ───
     if session.in_use == 0
+        if g_draining != 0
+            return 1    # shutting down: close a new connection unserved
         m7sp_session_init(idx)
         let pool: *TaskPool = task.user_data as *TaskPool
         let ret: i32 = task_submit_recv(pool, task)
@@ -917,6 +1066,11 @@ fn handle_task_event(task: *Task) -> i32
             session.scan_max_results = 0
             session.scan_total_emitted = 0
             # Fall through to the normal post-send reset below.
+
+        # Shutting down: the reply is out, take no further request.
+        if g_draining != 0
+            m7sp_session_destroy(idx)
+            return 1
 
         # Reset parser; keep slot/session alive
         session.parse_state = PARSE_NEED_HEADER
@@ -1036,6 +1190,8 @@ fn handle_task_event_encrypted(task: *Task) -> i32
 
     # ─── First call: encrypted-mode session init, then await client pubkey ───
     if session.in_use == 0
+        if g_draining != 0
+            return 1    # shutting down: close a new connection unserved
         m7sp_session_init_encrypted(idx)
         let pool: *TaskPool = task.user_data as *TaskPool
         let ret: i32 = task_submit_recv(pool, task)
@@ -1047,7 +1203,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
     # ─── HANDSHAKE_SEND completed: server pubkey delivered.  Move to
     #     post-handshake encrypted message loop. ───
     if session.parse_state == PARSE_HANDSHAKE_SEND
-        if task.io_result < 0
+        if task.io_result < 0 or g_draining != 0
             m7sp_session_destroy(idx)
             return 1
         session.parse_state = PARSE_NEED_HEADER
@@ -1131,6 +1287,11 @@ fn handle_task_event_encrypted(task: *Task) -> i32
             session.scan_max_results = 0
             session.scan_total_emitted = 0
             # Fall through to the recv reset below.
+
+        # Shutting down: the reply is out, take no further request.
+        if g_draining != 0
+            m7sp_session_destroy(idx)
+            return 1
 
         session.parse_state = PARSE_NEED_HEADER
         session.have = 0
@@ -1273,7 +1434,8 @@ fn handle_task_event_encrypted(task: *Task) -> i32
 # ============================================================================
 
 # Run the async serve loop on the given (already-bound, already-listening)
-# socket.  Returns when the server stops (idle timeout, signal, or error).
+# socket.  Returns when the server stops: SIGTERM/SIGINT (after draining,
+# see "Graceful shutdown"), or an io_uring error.
 # Public — main.ritz calls this when --async is passed.
 #
 # Caller retains ownership of `listen_fd` — this function does NOT close it.
@@ -1302,10 +1464,12 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     # Reasonable defaults; tunable later.
     task_server_set_idle_timeout(srv, 60)
     task_server_set_max_connections(srv, 1000)
+    shutdown_install(srv)
 
     let ret: i32 = task_server_run(srv, handle_task_event)
 
     prints("Mausoleum (async): shutting down\n")
+    shutdown_uninstall()
     task_server_free(srv)
     return ret
 
@@ -1338,9 +1502,11 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
 
     task_server_set_idle_timeout(srv, 60)
     task_server_set_max_connections(srv, 1000)
+    shutdown_install(srv)
 
     let ret: i32 = task_server_run(srv, handle_task_event_encrypted)
 
     prints("Mausoleum (async, encrypted): shutting down\n")
+    shutdown_uninstall()
     task_server_free(srv)
     return ret
