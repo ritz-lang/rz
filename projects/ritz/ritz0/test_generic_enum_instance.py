@@ -173,6 +173,30 @@ RUNS = {
                                               "        None => 4\nfn main() -> i32\n    let h: H = Lacks\n"
                                               "    let p: *H = @h\n    let a: Option<H> = Some(pick())\n"
                                               "    let b: Option<H> = Some(*p)\n    f(a) * 10 + f(b)\n", 63),
+    # AGAST #3021: a builtin's payload a generic enum's instance, built by a
+    # bare constructor in it: `Some(Full(6))`, `Some(Empty)`.  ritz1 could not
+    # split `Option$Slot$i32` (a generic enum's arity was 0), so the inner
+    # constructor had no slot: `Full` linked against an undeclared `@Full`,
+    # `Empty` was an unknown identifier.  Result's T and E split the same way.
+    # Only the builtin names the instance: ritz1 never recorded it, so `Some(s)`
+    # bound an i64 and `match s` was "a variant pattern needs an enum scrutinee".
+    "option_of_an_instance": (SLOT + "fn g(o: Option<Slot<i32>>) -> i32\n    match o\n"
+                              "        Some(s) =>\n            match s\n                Full(v) => v\n"
+                              "                Empty => 2\n        None => 4\n"
+                              "fn main() -> i32\n    let a: Option<Slot<i32>> = Some(Full(6))\n"
+                              "    let b: Option<Slot<i32>> = Some(Empty)\n"
+                              "    let c: Option<Slot<i32>> = None\n    g(a) * 100 + g(b) * 10 + g(c)\n",
+                              624 % 256),
+    "result_of_instances": (SLOT + "enum Two<A, B>\n    L(A)\n    R(B)\n"
+                            "fn f(o: Result<Two<u8, i64>, Slot<i32>>) -> i32\n    match o\n"
+                            "        Ok(t) =>\n            match t\n                L(a) => a as i32\n"
+                            "                R(b) => b as i32 + 10\n"
+                            "        Err(s) =>\n            match s\n                Full(v) => v + 20\n"
+                            "                Empty => 30\n"
+                            "fn main() -> i32\n    let a: Result<Two<u8, i64>, Slot<i32>> = Ok(R(5))\n"
+                            "    let b: Result<Two<u8, i64>, Slot<i32>> = Err(Full(6))\n"
+                            "    let c: Result<Two<u8, i64>, Slot<i32>> = Err(Empty)\n"
+                            "    f(a) + f(b) + f(c)\n", 15 + 26 + 30),
     # AGAST #2435: a nested literal whose inner enum nothing else names.  ritz1
     # declared the outer `%Option$Option$i32` only, and its build allocas the
     # inner `%Option$i32`: unsized, clang refused it.  T's side, then E's.
@@ -362,6 +386,40 @@ def test_an_uninferable_constructor_is_refused_at_it(tmp_path, need_ritz1, compi
     found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
     assert (where, _uninferable_message(tp, variant)) in found, \
         f"{compiler}: {name}, wanted {where}:\n{src}\n{out[-2000:]}"
+
+
+# AGAST #3021: a generic enum's bare constructor whose slot names no instance
+# of it is refused at the constructor.  ritz1 lowered it to a call to an
+# undeclared `@Full`, and the link failed with no location.  ritz0 crashes
+# (`Unknown function: Full`): AGAST #3128.
+# name -> (main's body, line:col of the constructor)
+NO_INSTANCE = {
+    "non_enum_slot": ("    let a: i64 = Full(6)\n    0\n", "5:18"),
+    "another_builtins_payload": ("    let a: Option<i32> = Some(Full(6))\n    0\n", "5:31"),
+    "unit_variant_non_enum_slot": ("    let a: i64 = Empty\n    0\n", "5:18"),
+}
+
+
+def _no_instance_message(variant):
+    return f"can't infer the `Slot` instance `{variant}` builds: give its slot a `Slot<...>` type"
+
+
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("name", sorted(NO_INSTANCE))
+def test_a_constructor_no_slot_names_is_refused_at_it(tmp_path, need_ritz1, compiler, name):
+    need_ritz1(compiler)
+    body, where = NO_INSTANCE[name]
+    variant = "Empty" if "unit" in name else "Full"
+    src = SLOT + "fn main() -> i32\n" + body
+    path, ll = tmp_path / "main.ritz", tmp_path / "main.ll"
+    path.write_text(src)
+    comp = _emit(compiler, path, ll, tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {name}:\n{src}\n{out}"
+    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+    assert (where, _no_instance_message(variant)) in found, \
+        f"{compiler}: {name}, wanted {where}:\n{src}\n{out[-2000:]}"
+    assert "unknown identifier" not in out, f"{compiler}:\n{out}"
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

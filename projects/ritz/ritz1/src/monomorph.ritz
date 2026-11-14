@@ -529,6 +529,33 @@ fn add_struct_from_array_shape(m: *Module, sh: *ArrayShape)
     if sh != null and sh.leaf_name != null
         add_struct_from_mangled_name(m, sh.leaf_name, sh.leaf_name_len)
 
+# AGAST #3021: `Option$Slot$i32` / `Result$Two$u8$i64$Slot$i32` are laid out
+# by the emitter, but the instances their arguments name are this module's to
+# record: with only `Option<Slot<i32>>` naming `Slot<i32>`, a `Some(s)` arm
+# bound `s` as an i64, so `match s` was "a variant pattern needs an enum
+# scrutinee".  The name itself is still add_enum_instance's: ritzlib.option
+# and ritzlib.result declare `enum Option<T>` / `enum Result<T, E>`.
+fn add_builtin_enum_args(m: *Module, name: *u8, len: i32, dollar_pos: i32)
+    if dollar_pos != 6 or len <= 7
+        return
+    let is_option: i32 = (memcmp(name, c"Option", 6) == 0) as i32
+    if is_option == 0 and memcmp(name, c"Result", 6) != 0
+        return
+    let suffix: *u8 = name + dollar_pos
+    let suffix_len: i32 = len - dollar_pos
+    if is_option == 1
+        # One parameter: the whole suffix is its argument.
+        add_struct_from_mangled_name(m, suffix + 1, suffix_len - 1)
+        return
+    let cap: i64 = 4 * mangled_arg_capacity(suffix, suffix_len) as i64
+    let starts: *i32 = malloc(cap) as *i32
+    let lens: *i32 = malloc(cap) as *i32
+    let n: i32 = split_mangled_args(m, suffix, suffix_len, starts, lens)
+    for i in 0..n
+        add_struct_from_mangled_name(m, suffix + *(starts + i) + 1, *(lens + i) - 1)
+    free(starts as *u8)
+    free(lens as *u8)
+
 # Add struct instantiation from a mangled name like "Pair$i32"
 # Splits on '$' to get base name and suffix
 fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
@@ -542,6 +569,7 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
     # Only add if this is actually a generic struct template
     let template: *StructDef = find_generic_struct(m, base_name, base_len)
     if template == null
+        add_builtin_enum_args(m, name, len, dollar_pos)   # AGAST #3021
         add_enum_instance(m, name, len, dollar_pos)   # AGAST #2422
         return  # Not a generic struct we know about
 
@@ -633,39 +661,8 @@ fn mangled_component_arity(m: *Module, name: *u8, len: i32) -> i32
 # fields cloned with every parameter substituted, exactly as a generic struct's
 # are.  From there it is any user enum: ritz0's layout, constructors, match.
 
-# `enum Slot<A, B>`'s parameters, read off the source after its name: the
-# grammar's action records the enum as generic but drops the list
-# (enum_def_header).  null when no `<...>` follows the name.
-fn generic_enum_params(ei: i32) -> *TypeParam
-    var len: i32 = 0
-    let name: *u8 = enum_name_at(ei, @len)
-    var p: *u8 = name + len
-    while *p == 32 or *p == 9
-        p = p + 1
-    if *p != 60   # '<'
-        return null
-    p = p + 1
-    var first: *TypeParam = null
-    var last: *TypeParam = null
-    while *p != 62 and *p != 0 and *p != 10   # '>', NUL, newline
-        if *p == 32 or *p == 9 or *p == 44   # ' ', '\t', ','
-            p = p + 1
-        else
-            let start: *u8 = p
-            var n: i32 = 0
-            while *p != 62 and *p != 0 and *p != 10 and *p != 32 and *p != 9 and *p != 44
-                p = p + 1
-                n = n + 1
-            let tp: *TypeParam = malloc(sizeof(TypeParam)) as *TypeParam
-            tp.name = start
-            tp.name_len = n
-            tp.next = null
-            if last == null
-                first = tp
-            else
-                last.next = tp
-            last = tp
-    first
+# generic_enum_params moved to ast_helpers (AGAST #3021): emitter_core's
+# te_component_arity needs a generic enum's parameter count too.
 
 # Record `name` (`Slot$i32`, its `$` at dollar_pos) as an instance of the
 # generic enum its base names, once, and instantiate what its payloads name

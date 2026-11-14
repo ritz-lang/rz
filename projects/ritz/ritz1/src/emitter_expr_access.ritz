@@ -342,6 +342,10 @@ fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
         return emit_unit_variant_value(s, en, en_len, vi)
     if var_ei == 0 - 2
         return emit_ambiguous_variant_error(s, e.ident_ptr, e.ident_len, e.span, vi, other_ei)
+    # AGAST #3021: `Empty` where the slot names no `Slot` instance.
+    let no_inst: i32 = emit_no_instance_error(s, e.ident_ptr, e.ident_len, e.span)
+    if no_inst != 0
+        return no_inst
 
     emit_ir_error_begin(s, c"unknown identifier '")
     emit_ir_error_end(s, e.ident_ptr, e.ident_len)
@@ -1585,6 +1589,46 @@ pub fn slot_instance_variant(s: *EmitterState, name: *u8, len: i32, out_vi: *i32
         return 0 - 1
     *out_vi = vi
     enum_find(en, en_len)
+
+# AGAST #3021: a generic enum's bare constructor (`Full(6)`, `Empty`) whose
+# slot names no instance of it, refused at the constructor:
+#   file:line:col: can't infer the `Slot` instance `Full` builds: give its
+#   slot a `Slot<...>` type
+# A call lowered to one to an undeclared `@Full`, so the link failed with no
+# location; a unit variant was "unknown identifier".  Returns an i64 zero so
+# the fn still emits (the error stops the output), 0 when `name` is no
+# generic enum's variant.
+pub fn emit_no_instance_error(s: *EmitterState, name: *u8, len: i32, span: SrcSpan) -> i32
+    var vi: i32 = 0
+    let ei: i32 = generic_enum_of_variant(name, len, @vi)
+    if ei < 0
+        return 0
+    var en_len: i32 = 0
+    let en: *u8 = enum_name_at(ei, @en_len)
+    emit_str(s, c"  ; ERROR: generic enum constructor with no instance\n")
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(span.col as i64)
+    eprints_cstr(c": can't infer the `")
+    eprint_bytes(en, en_len)
+    eprints_cstr(c"` instance `")
+    eprint_bytes(name, len)
+    eprints_cstr(c"` builds: give its slot a `")
+    eprint_bytes(en, en_len)
+    eprints_cstr(c"<...>` type\n")
+    s.error_count = s.error_count + 1
+    let z: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, z)
+    emit_str(s, c" = add i64 0, 0  ; constructor with no instance (error)\n")
+    z
 
 fn emit_unit_variant_value(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32) -> i32
     let slot: i32 = next_reg(s)
