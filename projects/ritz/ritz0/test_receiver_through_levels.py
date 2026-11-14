@@ -292,10 +292,12 @@ MOVES = {
     "mut_ptr": ("fn g(p: @&*R) -> i32\n    ^p.burn()\n", "@&q"),
     "ptr_ptr": ("fn g(p: **R) -> i32\n    ^p.burn()\n", "@&q"),
     "ptr": ("fn g(p: *R) -> i32\n    ^p.burn()\n", "q"),
+    "lent_ptr_ptr": ("fn k(p:& **R) -> i32\n    ^p.burn()\n\nfn g(p: **R) -> i32\n    k(p)\n", "@&q"),
+    "ptr_ptr_field": ("struct F\n    pp: **R\n\nfn g(p: **R) -> i32\n    let h = F { pp: p }\n    ^h.pp.burn()\n", "@&q"),
 }
 
 
-# ritz0 has none. All of ritz1's refuse, except #2316's, #2401's and #2402's.
+# ritz0 has none. All of ritz1's refuse, except #2316's and #2401's.
 # (`chained_field` ran once #2391 returned a `-> @&T` call result as a `ptr`;
 # `chained_method`, through `mp() -> *C`, once #2883 named a `*S` link's impl;
 # `one_level_returned`, `h(q).set(3)`, once #2946 named a `*S` free call's.)
@@ -308,7 +310,6 @@ RITZ1_GAPS |= dict.fromkeys(("global_ptr_ptr_read", "global_ptr_ptr_store", "ele
                              "element_of_a_pointer_store", "index_is_evaluated_once",
                              "deref_leaves_a_pointer_to_a_pointer", "self_is_a_ptr_ptr",
                              "self_is_a_shared_ptr", "ufcs_by_value_self_is_a_conversion"), 2404)
-RITZ1_GAPS["ptr_ptr"] = 2402
 
 GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}
 
