@@ -1365,6 +1365,13 @@ class TypeChecker:
                 and self._lookup_var(expr.name) is self.lent_locals[expr.name])
         if same or lent or isinstance(slot, rast.RefType):
             self._report_value_into_ref(expr, slot)
+        elif isinstance(actual, rast.ArrayType):
+            # A whole array into a `*U` of anything but itself (#2392): ritz1's
+            # emitter refuses it at the array, in its words. Into an `@U`, or
+            # from a `:&` param, it's the value-into-reference error above, as
+            # it is in ritz1.
+            self._slot_reported.add(id(expr))
+            self._slot_error(array_rules.WHOLE_ARRAY_NOT_A_VALUE, expr.span)
 
     def _check_other_referent(self, expr: rast.Expr, actual: Optional[rast.Type],
                               slot: Optional[rast.Type]) -> None:

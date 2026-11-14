@@ -8,6 +8,12 @@ ritz0/test_array_store_rule.py holds all three compilers to it.
 # type; anything else has one already, and converting it is a loop you write.
 ELEMENT_MISMATCH = "an array only fits a slot of the same element type: write a loop to convert it"
 
+# A whole `[N]T` where a `*U` goes, `U` not `[N]T` (AGAST #2392). ritz1's own
+# words, from emitter_expr_access.ritz, which refuses it at every slot: ritz0
+# says the same at the same place rather than a second wording for it.
+WHOLE_ARRAY_NOT_A_VALUE = ('a whole array is not a value here in ritz1 (index it, copy it '
+                           'into an array of the same type, or take its address with @)')
+
 # `[]` through a reference to anything else (AGAST #2440, LARB R9).  ritz1 prints
 # the same words, from index_through.ritz.
 NOT_A_BUFFER = ('a reference is one value, not a buffer: '
