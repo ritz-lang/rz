@@ -54,6 +54,18 @@ PROGRAMS = {
               + "    ga[1].v = 1099511627776\n    ga[0].v = 5\n"
               "    if ga[1].v != 1099511627776\n        return 1\n"
               "    if ga[0].v != 5\n        return 2\n    return 0\n"),
+    # AGAST #3110: a 2-D array of a generic struct, global and local.  The
+    # leaf P$i64 lives only in the array's shape, not its 1-D element name,
+    # so a walk of `array_elem_type_name` alone never instantiates it.
+    "array_2d": (_P + "var gb: [2][3]P<i64>\n\n" + _MAIN
+                 + "    gb[1][2].v = 1099511627776\n    gb[0][1].v = 5\n"
+                 "    if gb[1][2].v != 1099511627776\n        return 1\n"
+                 "    if gb[0][1].v != 5\n        return 2\n    return 0\n"),
+    "local_array_2d": (_P + _MAIN
+                       + "    var lb: [2][3]P<i64>\n"
+                       "    lb[1][2].v = 1099511627776\n    lb[0][1].v = 5\n"
+                       "    if lb[1][2].v != 1099511627776\n        return 1\n"
+                       "    if lb[0][1].v != 5\n        return 2\n    return 0\n"),
 }
 
 
