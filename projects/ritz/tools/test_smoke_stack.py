@@ -122,10 +122,10 @@ def test_every_xfail_belongs_to_a_suite():
 def test_child_tickets_each_have_a_check():
     """#2456's acceptance: every child ticket's repro is one of its checks.
     A fixed child drops out of this set in the change that deletes its last
-    XFAILS entry (#2458, #2459, #2460: their checks are plain passing checks
-    now; #2460's one remaining failure, sage running JS, is #2787's)."""
+    XFAILS entry (#2457, #2458, #2459, #2460: their checks are plain passing
+    checks now; #2460's one remaining failure, sage running JS, is #2787's)."""
     cited = {m for reason in ss.XFAILS.values() for m in re.findall(r"#(\d+)", reason)}
-    assert {"2457", "2461", "2787"} <= cited
+    assert {"2461", "2787"} <= cited
 
 
 # --- binaries by target --------------------------------------------------------

@@ -1,0 +1,155 @@
+# lib/session.ritz - Per-connection RESP session (shared by both servers)
+#
+# A Session owns one client's byte stream: an input buffer that collects
+# whatever recv() returned, and an output buffer of queued replies.
+# session_process() runs every *complete* command in the input, in order,
+# and leaves a partial trailing command for the next recv (AGAST #2457:
+# the servers used to parse one command per recv(), so a pipelined
+# "SET ...GET ..." answered only the SET, and a command split across two
+# reads was answered "-ERR incomplete command").
+#
+# The I/O loop around it, for either server:
+#
+#   loop
+#       session_process(s)
+#       if session_pending_len(s) > 0: send pending, session_sent(s, n); continue
+#       if session_should_close(s): close
+#       recv into session_recv_ptr(s) / session_recv_room(s); session_received(s, n)
+#
+# Sending before receiving again matters: when the output buffer fills,
+# process stops with complete commands still unread, and they run once the
+# replies have drained.
+
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.strview
+import lib.tome
+import lib.resp
+import lib.commands
+
+
+pub const SESSION_IN_CAP: i64 = 65536
+pub const SESSION_OUT_CAP: i64 = 65536
+# Room a command may need for its reply.  No handler bounds-checks its
+# writes, so a command only runs while this much output space is free
+# (a GET of the largest SET value, 8 KiB, fits with plenty to spare).
+const SESSION_OUT_RESERVE: i64 = 24576
+
+
+pub struct Session
+    store: *Store
+    password: *u8           # required password (null = no AUTH)
+    is_authenticated: i32
+    closing: i32            # 1 after a protocol error: flush, then close
+    in_len: i64             # bytes of in_buf received, not yet consumed
+    out_len: i64            # bytes of out_buf queued
+    out_pos: i64            # bytes of out_buf already sent
+    in_buf: [65536]u8
+    out_buf: [65536]u8
+
+
+pub fn session_init(s: *Session, store: *Store, password: *u8)
+    s.store = store
+    s.password = password
+    s.is_authenticated = 0
+    s.closing = 0
+    s.in_len = 0
+    s.out_len = 0
+    s.out_pos = 0
+
+
+# Heap-allocate a session (it is ~128 KiB: too big for a task's stack).
+pub fn session_new(store: *Store, password: *u8) -> *Session
+    let s: *Session = malloc(sizeof(Session)) as *Session
+    if s == null
+        return null
+    session_init(s, store, password)
+    return s
+
+
+pub fn session_free(s: *Session)
+    if s != null
+        free(s as *u8)
+
+
+# Where the next recv() should write, and how much it may write.
+pub fn session_recv_ptr(s: *Session) -> *u8
+    return @s.in_buf[0] + s.in_len
+
+pub fn session_recv_room(s: *Session) -> i64
+    return SESSION_IN_CAP - s.in_len
+
+# Record that recv() wrote n bytes at session_recv_ptr().
+pub fn session_received(s: *Session, n: i64)
+    if n > 0
+        s.in_len += n
+
+
+# Queued replies not yet sent.
+pub fn session_pending_ptr(s: *Session) -> *u8
+    return @s.out_buf[0] + s.out_pos
+
+pub fn session_pending_len(s: *Session) -> i64
+    return s.out_len - s.out_pos
+
+# Record that send() took n bytes from session_pending_ptr().
+pub fn session_sent(s: *Session, n: i64)
+    if n > 0
+        s.out_pos += n
+    if s.out_pos >= s.out_len
+        s.out_pos = 0
+        s.out_len = 0
+
+
+# 1 once the connection should close: a protocol error has been answered
+# and the answer has gone out.
+pub fn session_should_close(s: *Session) -> i32
+    if s.closing != 0 and s.out_len == s.out_pos
+        return 1
+    return 0
+
+
+fn session_error(s: *Session, msg: *u8)
+    s.out_len += resp_write_error(@s.out_buf[0] + s.out_len, msg) as i64
+    s.closing = 1
+    s.in_len = 0
+
+
+# Run every complete command in the input buffer while there is room for
+# its reply.  Returns the number of commands run.
+pub fn session_process(s: *Session) -> i32
+    var consumed: i64 = 0
+    var ran: i32 = 0
+    while s.closing == 0 and consumed < s.in_len
+        if s.out_len + SESSION_OUT_RESERVE > SESSION_OUT_CAP
+            break  # flush first; the rest of the input waits
+
+        var parser: RespParser
+        resp_parser_init(@parser, @s.in_buf[0] + consumed, s.in_len - consumed)
+        let r: i32 = resp_parse(@parser)
+        if r == RESP_INCOMPLETE
+            if consumed == 0 and s.in_len == SESSION_IN_CAP
+                # A full buffer and still no complete command: it can
+                # never fit.
+                session_error(s, c"ERR Protocol error: request too large")
+                return ran
+            break
+        if r != RESP_OK
+            session_error(s, c"ERR Protocol error")
+            return ran
+
+        var ctx: CommandContext
+        cmd_ctx_init_auth(@ctx, s.store, @s.out_buf[0] + s.out_len, (SESSION_OUT_CAP - s.out_len) as i32, s.password, s.is_authenticated)
+        cmd_dispatch(@ctx, @parser.command)
+        s.is_authenticated = ctx.is_authenticated
+        s.out_len += ctx.resp_len as i64
+        consumed += parser.pos
+        ran += 1
+
+    # Keep the unconsumed tail (a partial command) at the buffer's start.
+    if consumed > 0
+        let rest: i64 = s.in_len - consumed
+        if rest > 0
+            memmove(@s.in_buf[0], @s.in_buf[0] + consumed, rest)
+        s.in_len = rest
+    return ran

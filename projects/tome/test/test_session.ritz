@@ -1,0 +1,141 @@
+# test/test_session.ritz - Tests for the per-connection RESP session
+#
+# A Session is the byte-stream half of a connection that both servers
+# share: it buffers what the client sent, runs every complete command in
+# it, and queues the replies (AGAST #2457: -b answered only the first of
+# two pipelined commands, and a command split across reads was rejected).
+#
+# Deliberately does not import lib.server (see run_tests.ritz).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import lib.tome
+import lib.session
+
+
+fn feed(s: *Session, data: *u8) -> i64
+    let n: i64 = strlen(data)
+    if n > session_recv_room(s)
+        return -1
+    memcpy(session_recv_ptr(s), data, n)
+    session_received(s, n)
+    return n
+
+
+# The queued output equals `want` exactly.  0 on match.
+fn output_is(s: *Session, want: *u8) -> i32
+    let n: i64 = strlen(want)
+    if session_pending_len(s) != n
+        return 1
+    let got: *u8 = session_pending_ptr(s)
+    for i in 0..n
+        if *(got + i) != *(want + i)
+            return 1
+    return 0
+
+
+[[test]]
+fn test_session_pipeline_answers_every_command() -> i32
+    var store: Store = store_new()
+    let s: *Session = session_new(@store, null)
+    feed(s, c"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\npiped\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+    if session_process(s) != 2
+        return 1
+    if output_is(s, c"+OK\r\n$5\r\npiped\r\n") != 0
+        return 2
+    session_sent(s, session_pending_len(s))
+    if session_pending_len(s) != 0
+        return 3
+    if session_should_close(s) != 0
+        return 4
+    session_free(s)
+    return 0
+
+
+[[test]]
+fn test_session_command_split_across_reads() -> i32
+    var store: Store = store_new()
+    let s: *Session = session_new(@store, null)
+    feed(s, c"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nEC")
+    if session_process(s) != 1
+        return 1
+    if output_is(s, c"+PONG\r\n") != 0
+        return 2
+    session_sent(s, 3)  # a short send: the rest stays queued
+    if output_is(s, c"NG\r\n") != 0
+        return 3
+    feed(s, c"HO\r\n$2\r\nhi\r\n")
+    if session_process(s) != 1
+        return 4
+    if output_is(s, c"NG\r\n$2\r\nhi\r\n") != 0
+        return 5
+    session_free(s)
+    return 0
+
+
+[[test]]
+fn test_session_protocol_error_closes() -> i32
+    var store: Store = store_new()
+    let s: *Session = session_new(@store, null)
+    # The PING before the bad frame is answered; nothing after it runs.
+    feed(s, c"*1\r\n$4\r\nPING\r\n*1\r\n$x\r\n*1\r\n$4\r\nPING\r\n")
+    session_process(s)
+    if output_is(s, c"+PONG\r\n-ERR Protocol error\r\n") != 0
+        return 1
+    if session_should_close(s) != 0
+        return 2  # not until the error reply has been sent
+    session_sent(s, session_pending_len(s))
+    if session_should_close(s) != 1
+        return 3
+    session_free(s)
+    return 0
+
+
+[[test]]
+fn test_session_output_backpressure() -> i32
+    # More replies than the output buffer holds: process stops short,
+    # and resumes from the unread input once the output drains.
+    var store: Store = store_new()
+    let s: *Session = session_new(@store, null)
+    let n: i64 = SESSION_IN_CAP / 6  # "PING\r\n" is 6 bytes
+    for i in 0..n
+        feed(s, c"PING\r\n")
+    var answered: i64 = 0
+    var rounds: i32 = 0
+    while answered < n
+        let done: i32 = session_process(s)
+        if done <= 0
+            return 1
+        if session_pending_len(s) != (done as i64) * 7  # "+PONG\r\n"
+            return 2
+        answered += done as i64
+        session_sent(s, session_pending_len(s))
+        rounds += 1
+    if rounds < 2
+        return 3  # the buffer never filled: this test checks nothing
+    if session_recv_room(s) != SESSION_IN_CAP
+        return 4
+    session_free(s)
+    return 0
+
+
+[[test]]
+fn test_session_oversized_request_closes() -> i32
+    var store: Store = store_new()
+    let s: *Session = session_new(@store, null)
+    # A bulk header promising more than the input buffer can ever hold.
+    feed(s, c"*2\r\n$4\r\nECHO\r\n$999999\r\n")
+    while session_recv_room(s) > 0
+        let room: i64 = session_recv_room(s)
+        memset(session_recv_ptr(s), 97, room)
+        session_received(s, room)
+    session_process(s)
+    if output_is(s, c"-ERR Protocol error: request too large\r\n") != 0
+        return 1
+    session_sent(s, session_pending_len(s))
+    if session_should_close(s) != 1
+        return 2
+    session_free(s)
+    return 0

@@ -4,7 +4,8 @@
 # takes a parsed RespCommand and writes the response to a buffer.
 #
 # Supported commands:
-#   String: GET, SET, SETEX, DEL, EXISTS, TTL, EXPIRE, PERSIST
+#   String: GET, SET, SETEX, DEL, EXISTS, TTL, EXPIRE, PERSIST,
+#           INCR, DECR, INCRBY, DECRBY
 #   List:   LPUSH, RPUSH, LPOP, RPOP, LLEN, LINDEX, LRANGE
 #   Set:    SADD, SREM, SISMEMBER, SCARD, SMEMBERS
 #   Hash:   HSET, HGET, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HGETALL
@@ -12,6 +13,7 @@
 #   Server: PING, ECHO, COMMAND, INFO, DBSIZE, FLUSHDB
 
 import ritzlib.ct
+import ritzlib.fmt
 import ritzlib.memory
 import ritzlib.str
 import ritzlib.string
@@ -157,6 +159,130 @@ fn cmd_set(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let ok: StrView = "OK"
     ctx_write_simple_sv(ctx, @ok)
     return CMD_OK
+
+
+# Parse data[0..len] the way Redis reads a counter: an optional '-' then
+# 1-19 digits, nothing else, and within i64.  Returns 1 and sets *out, or 0.
+# Accumulates negatively so i64's minimum parses without overflowing.
+fn parse_i64_strict(data: *u8, len: i64, out: *i64) -> i32
+    if len <= 0 or len > 20
+        return 0
+    let min: i64 = -9223372036854775807 - 1
+    var negative: i32 = 0
+    var i: i64 = 0
+    if *data == 45  # '-'
+        negative = 1
+        i = 1
+        if len == 1
+            return 0
+    var acc: i64 = 0
+    while i < len
+        let c: u8 = *(data + i)
+        if c < 48 or c > 57
+            return 0
+        let d: i64 = (c - 48) as i64
+        if acc < min / 10
+            return 0
+        acc = acc * 10
+        if acc < min + d
+            return 0
+        acc = acc - d
+        i += 1
+    if negative == 0
+        if acc == min
+            return 0
+        acc = -acc
+    *out = acc
+    return 1
+
+
+# INCR / DECR / INCRBY / DECRBY: add `delta` to the integer stored at
+# args[1].  A missing key counts from 0; the TTL of an existing key stays.
+fn incr_by(ctx: *CommandContext, cmd: *RespCommand, delta: i64) -> i32
+    var key: [256]u8
+    resp_arg_copy(@cmd.args[1], @key[0], 256)
+    var key_sv: StrView = strview_from_cstr(@key[0])
+
+    var cur: i64 = 0
+    let val: *u8 = store_get(ctx.store, @key_sv)
+    if val == null
+        # store_get answers null for a missing key and a non-string alike.
+        if store_exists(ctx.store, @key_sv) == 1
+            let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ctx_write_error_sv(ctx, @wrongtype)
+            return CMD_ERR_TYPE
+    else if parse_i64_strict(val, strlen(val), @cur) == 0
+        let err: StrView = "ERR value is not an integer or out of range"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+
+    let max: i64 = 9223372036854775807
+    let min: i64 = -9223372036854775807 - 1
+    if (delta > 0 and cur > max - delta) or (delta < 0 and cur < min - delta)
+        let err: StrView = "ERR increment or decrement would overflow"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+    let next: i64 = cur + delta
+
+    var digits: [24]u8
+    let n: i64 = fmt_i64_into(@digits[0], next)
+    digits[n] = 0
+    var next_sv: StrView = strview_from_cstr(@digits[0])
+    store_set(ctx.store, @key_sv, @next_sv)
+    ctx_write_int(ctx, next)
+    return CMD_OK
+
+
+# INCR key / DECR key
+fn cmd_incr(ctx: *CommandContext, cmd: *RespCommand, delta: i64, name: *u8) -> i32
+    if cmd.argc != 2
+        var err: [96]u8
+        argc_error(@err[0], name)
+        ctx.resp_len = resp_write_error(ctx.resp_buf, @err[0])
+        return CMD_ERR_ARGC
+    return incr_by(ctx, cmd, delta)
+
+
+# INCRBY key increment / DECRBY key decrement (sign is -1 for DECRBY)
+fn cmd_incrby(ctx: *CommandContext, cmd: *RespCommand, sign: i64, name: *u8) -> i32
+    if cmd.argc != 3
+        var err: [96]u8
+        argc_error(@err[0], name)
+        ctx.resp_len = resp_write_error(ctx.resp_buf, @err[0])
+        return CMD_ERR_ARGC
+    var by: i64 = 0
+    let arg: *RespArg = @cmd.args[2]
+    if parse_i64_strict(arg.data, arg.len, @by) == 0
+        let err: StrView = "ERR value is not an integer or out of range"
+        ctx_write_error_sv(ctx, @err)
+        return CMD_ERR_SYNTAX
+    if sign < 0
+        let min: i64 = -9223372036854775807 - 1
+        if by == min
+            let err: StrView = "ERR decrement would overflow"
+            ctx_write_error_sv(ctx, @err)
+            return CMD_ERR_SYNTAX
+        by = -by
+    return incr_by(ctx, cmd, by)
+
+
+# Write "ERR wrong number of arguments for '<name>' command" (NUL-terminated)
+# into buf (>= 96 bytes; names are short literals).  Returns its length.
+fn argc_error(buf: *u8, name: *u8) -> i32
+    let head: *u8 = c"ERR wrong number of arguments for '"
+    let tail: *u8 = c"' command"
+    var pos: i64 = 0
+    let hl: i64 = strlen(head)
+    memcpy(buf, head, hl)
+    pos += hl
+    let nl: i64 = strlen(name)
+    memcpy(buf + pos, name, nl)
+    pos += nl
+    let tl: i64 = strlen(tail)
+    memcpy(buf + pos, tail, tl)
+    pos += tl
+    *(buf + pos) = 0
+    return pos as i32
 
 
 # SETEX key seconds value
@@ -936,6 +1062,18 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_set_name: StrView = "SET"
     if resp_arg_eq_ci_sv(c, @cmd_set_name) == 1
         return cmd_set(ctx, cmd)
+    let cmd_incr_name: StrView = "INCR"
+    if resp_arg_eq_ci_sv(c, @cmd_incr_name) == 1
+        return cmd_incr(ctx, cmd, 1, c"incr")
+    let cmd_decr_name: StrView = "DECR"
+    if resp_arg_eq_ci_sv(c, @cmd_decr_name) == 1
+        return cmd_incr(ctx, cmd, -1, c"decr")
+    let cmd_incrby_name: StrView = "INCRBY"
+    if resp_arg_eq_ci_sv(c, @cmd_incrby_name) == 1
+        return cmd_incrby(ctx, cmd, 1, c"incrby")
+    let cmd_decrby_name: StrView = "DECRBY"
+    if resp_arg_eq_ci_sv(c, @cmd_decrby_name) == 1
+        return cmd_incrby(ctx, cmd, -1, c"decrby")
     let cmd_setex_name: StrView = "SETEX"
     if resp_arg_eq_ci_sv(c, @cmd_setex_name) == 1
         return cmd_setex(ctx, cmd)

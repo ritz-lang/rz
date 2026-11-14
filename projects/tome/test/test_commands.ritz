@@ -430,3 +430,77 @@ fn test_auth_allows_commands() -> i32
         return 2
 
     return 0
+
+
+# ============================================================================
+# INCR / DECR / INCRBY / DECRBY (AGAST #2457)
+# ============================================================================
+
+# Run `input` and compare the whole reply with `want`.  0 on match.
+fn reply_is(store: *Store, input: *u8, want: *u8) -> i32
+    var buf: [8192]u8
+    let len: i32 = exec_cmd(store, input, @buf[0])
+    if len <= 0
+        return 1
+    buf[len] = 0
+    if strcmp(@buf[0], want) != 0
+        return 1
+    return 0
+
+
+[[test]]
+fn test_cmd_incr_decr_count() -> i32
+    var store: Store = store_new()
+    # A missing key counts from 0; the value is stored as its decimal string.
+    if reply_is(@store, c"INCR n\r\n", c":1\r\n") != 0
+        return 1
+    if reply_is(@store, c"INCR n\r\n", c":2\r\n") != 0
+        return 2
+    if reply_is(@store, c"DECR n\r\n", c":1\r\n") != 0
+        return 3
+    if reply_is(@store, c"INCRBY n 10\r\n", c":11\r\n") != 0
+        return 4
+    if reply_is(@store, c"DECRBY n 20\r\n", c":-9\r\n") != 0
+        return 5
+    if reply_is(@store, c"GET n\r\n", c"$2\r\n-9\r\n") != 0
+        return 6
+    # A SET string that is an integer counts on from its value.
+    if reply_is(@store, c"SET m -5\r\n", c"+OK\r\n") != 0
+        return 7
+    if reply_is(@store, c"INCR m\r\n", c":-4\r\n") != 0
+        return 8
+    return 0
+
+
+[[test]]
+fn test_cmd_incr_rejects() -> i32
+    var store: Store = store_new()
+    let not_int: *u8 = c"-ERR value is not an integer or out of range\r\n"
+    store_set_cstr(@store, c"s", c"abc")
+    if reply_is(@store, c"INCR s\r\n", not_int) != 0
+        return 1
+    store_set_cstr(@store, c"e", c"")
+    if reply_is(@store, c"INCR e\r\n", not_int) != 0
+        return 2
+    # 2^63 does not fit an i64.
+    store_set_cstr(@store, c"big", c"9223372036854775808")
+    if reply_is(@store, c"INCR big\r\n", not_int) != 0
+        return 3
+    if reply_is(@store, c"INCRBY s2 x\r\n", not_int) != 0
+        return 4
+    store_set_cstr(@store, c"max", c"9223372036854775807")
+    if reply_is(@store, c"INCR max\r\n", c"-ERR increment or decrement would overflow\r\n") != 0
+        return 5
+    store_set_cstr(@store, c"min", c"-9223372036854775808")
+    if reply_is(@store, c"DECR min\r\n", c"-ERR increment or decrement would overflow\r\n") != 0
+        return 6
+    # A failed INCR leaves the value alone.
+    if reply_is(@store, c"GET max\r\n", c"$19\r\n9223372036854775807\r\n") != 0
+        return 7
+    if reply_is(@store, c"LPUSH l a\r\n", c":1\r\n") != 0
+        return 8
+    if reply_is(@store, c"INCR l\r\n", c"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n") != 0
+        return 9
+    if reply_is(@store, c"INCR\r\n", c"-ERR wrong number of arguments for 'incr' command\r\n") != 0
+        return 10
+    return 0

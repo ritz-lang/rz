@@ -82,17 +82,6 @@ XFAILS: dict[str, str] = {
     "help:mausoleum/concurrent_bench": "#2462 'Unknown argument: --help', exit 2",
     "help:nexus/nexus": "#2462 prints its usage and exits 1",
     "help:zeus/test_client": "#2462 prints its usage and exits 1",
-    # tome (#2457)
-    "tome.uring.ping": "#2457 the default io_uring server accepts, then never replies (silence or reset)",
-    "tome.uring.set_get": "#2457 the default io_uring server never replies",
-    "tome.uring.incr": "#2457 the default io_uring server never replies",
-    "tome.uring.pipeline": "#2457 the default io_uring server never replies",
-    "tome.uring.cli": "#2457 io_uring server never replies, and tome-cli -c hangs",
-    "tome.uring.cli_stdin": "#2457 io_uring server never replies, and tome-cli ignores stdin",
-    "tome.blocking.incr": "#2457 INCR is '-ERR unknown command'",
-    "tome.blocking.pipeline": "#2457 -b answers only the first of two pipelined commands",
-    "tome.blocking.cli": "#2457 tome-cli -c hangs after 'Connecting to ...'",
-    "tome.blocking.cli_stdin": "#2457 tome-cli prints 'Connecting to ...' and nothing else",
     # hollow entry points (#2460 made the rest honest; sage still runs nothing)
     "hollow.sage_runs_js": "#2787 sage has no interpreter: `sage t.js` exits 1 'not implemented'",
     # rzsh (#2461)

@@ -120,7 +120,10 @@ fn resp_read_crlf(p: *RespParser) -> i32
 
 # Read an integer from text up to \r\n
 # Returns the integer value, advances past \r\n
-# Sets *ok to 1 on success, 0 on failure
+# Sets *ok to 1 on success, 0 when the buffer ends first (incomplete), and
+# -1 on a malformed header (a non-digit, no digits, over 18 digits, or \r
+# without \n).  Telling the last two apart matters: "$x\r\n" used to read
+# as incomplete, so a server waited forever for bytes that fixed nothing.
 fn resp_read_int(p: *RespParser, ok: *i32) -> i64
     *ok = 0
     var val: i64 = 0
@@ -141,17 +144,22 @@ fn resp_read_int(p: *RespParser, ok: *i32) -> i64
         let c: u8 = *ptr
         if c == 13  # \r
             break
-        if c < 48 || c > 57  # Not a digit
-            return 0  # Parse error
+        if c < 48 || c > 57 || digits >= 18  # Not a digit, or would overflow
+            *ok = -1
+            return 0
         val = val * 10 + (c - 48) as i64
         p.pos += 1
         digits += 1
 
     if digits == 0
+        *ok = -1
         return 0  # No digits found
 
     # Expect \r\n
+    if resp_available(p, 2) == 0
+        return 0  # Incomplete
     if resp_read_crlf(p) < 0
+        *ok = -1
         return 0
 
     *ok = 1
@@ -177,8 +185,10 @@ fn resp_parse_bulk(p: *RespParser, arg: *RespArg) -> i32
     # Read length
     var ok: i32 = 0
     let len: i64 = resp_read_int(p, @ok)
-    if ok == 0
+    if ok != 1
         p.pos = start_pos
+        if ok < 0
+            return RESP_ERROR_PARSE
         return RESP_INCOMPLETE
 
     # Null bulk string
@@ -229,8 +239,10 @@ pub fn resp_parse(p: *RespParser) -> i32
     # Read element count
     var ok: i32 = 0
     let count: i64 = resp_read_int(p, @ok)
-    if ok == 0
+    if ok != 1
         p.pos = start_pos
+        if ok < 0
+            return RESP_ERROR_PARSE
         return RESP_INCOMPLETE
 
     # Null array
