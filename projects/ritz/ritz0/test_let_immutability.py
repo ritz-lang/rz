@@ -201,6 +201,8 @@ impl Pt
         return self.x
     fn absorb(self:& Pt, other:& Pt)
         self.x = self.x + other.x
+    fn nudge(self:&)
+        self.x = self.x + 1
 
 impl Big
     fn bump(self:& Big)
@@ -241,6 +243,9 @@ IMPLICIT_REJECTED = [
     # Method receivers.
     ("recv-small", "let p = Pt { x: 1, y: 2 }\np.bump()", "p"),
     ("recv-small-ref", "let p = Pt { x: 1, y: 2 }\np.bump_ref()", "p"),
+    # AGAST #2389: a bare `self:&` is the same borrow as `self:& Pt`.
+    ("recv-small-bare", "let p = Pt { x: 1, y: 2 }\np.nudge()", "p"),
+    ("recv-large-field-bare", "let b: Big = big_new()\nb.pt.nudge()", "b"),
     ("recv-large", "let b: Big = big_new()\nb.bump()", "b"),
     ("recv-large-nested-field", "let b: Big = big_new()\nb.pt.bump()", "b"),
     ("recv-small-field", "let w = Wrap { pt: Pt { x: 1, y: 2 }, pp: null }\nw.pt.bump()", "w"),
@@ -273,14 +278,14 @@ IMPLICIT_ACCEPTED = [
     ("recv-by-value", "let p = Pt { x: 1, y: 2 }\nlet n = p.get()"),
     ("arg-shared", "let p = Pt { x: 1, y: 2 }\nlet n = pt_read(@p)"),
     # `var` receivers and arguments.
-    ("recv-var", "var p = Pt { x: 1, y: 2 }\np.bump()\np.bump_ref()"),
+    ("recv-var", "var p = Pt { x: 1, y: 2 }\np.bump()\np.bump_ref()\np.nudge()"),
     ("recv-var-large", "var b: Big = big_new()\nb.bump()\nb.pt.bump()"),
     ("arg-var", "var p = Pt { x: 1, y: 2 }\nset(p)"),
     ("arg-var-ref", "var p = Pt { x: 1, y: 2 }\nset_ref(@&p)"),
     ("arg-var-large", "var b: Big = big_new()\nset_big(b)"),
     ("arg-var-large-field", "var b: Big = big_new()\nset(b.pt)"),
     # A `let` holding a pointer: the pointee is borrowed, not the binding.
-    ("let-ptr-recv", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\np.bump()\np.bump_ref()"),
+    ("let-ptr-recv", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\np.bump()\np.bump_ref()\np.nudge()"),
     ("let-ptr-arg", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\nset(p)"),
     ("let-ptr-arg-ref", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\nset_ref(p)"),
     ("let-ref-arg", "var v = Pt { x: 1, y: 2 }\nlet p: @&Pt = @&v\np.bump()\nset(p)"),

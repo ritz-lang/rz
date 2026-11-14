@@ -256,13 +256,51 @@ def test_ritz0_refuses_a_mut_method_on_a_struct_binding(compile_with):
     _is_let_error(comp, ll)
 
 
-# As any `let` on ritz1: let_check doesn't see a `self:&` receiver.
+# AGAST #2389: a bare `self:&` receiver is a mutable borrow, as `self:& S` is.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.xfail(strict=True, reason="AGAST #2389: a `self:&` method on a `let` compiles")
 def test_a_mut_method_on_a_struct_binding_is_refused(compile_with, compiler):
     comp, ll, _ = compile_with(compiler, "method", _LET + "    for e in a\n        e.touch()\n    return 0\n")
     _is_let_error(comp, ll)
+
+
+# AGAST #2389: every element binding is a `let` in ritz0 (#1755), not just a
+# struct's.  A store to it would only reach the loop's own copy.
+_BINDING_STORES = {
+    "scalar": ("var a: [2]i32\n\n", "x = 5"),
+    "compound": ("var a: [2]u8\n\n", "x += 1"),
+    "bool": ("var a: [2]bool\n\n", "x = true"),
+    "pointer": ("var a: [2]*i32\n\n", "x = null"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("kind", sorted(_BINDING_STORES))
+def test_a_store_to_an_element_binding_is_refused(compile_with, compiler, kind):
+    pre, store = _BINDING_STORES[kind]
+    comp, ll, _ = compile_with(compiler, kind, pre + MAIN + "    for x in a\n        " + store + "\n    return 0\n")
+    _is_let_error(comp, ll)
+    # Located at the store (line 5), in ritz0's words.
+    assert re.search(r":5:9: (error: )?cannot assign to `let` binding `x`; declare it `var`",
+                     comp.stdout + comp.stderr), comp.stdout + comp.stderr
+
+
+# The controls: a range variable is a `var`, and a pointer element's binding
+# writes its pointee, not itself.
+_BINDING_WRITES = {
+    "range": "    var t: i32 = 0\n    for x in 0..3\n        x = 2\n        t = t + 1\n    return t - 1\n",
+    # Through `p`: ritz1 can't store `@&n` into an element yet (#3036).
+    "pointee": ("    var n: i32 = 1\n    var p: *i32 = @&n\n    var a: [2]*i32\n    a[0] = p\n    a[1] = p\n"
+                "    for x in a\n        *x = *x + 1\n    return n - 3\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("kind", sorted(_BINDING_WRITES))
+def test_a_non_binding_write_in_a_for_runs(run_with, compiler, kind):
+    assert run_with(compiler, kind, MAIN + _BINDING_WRITES[kind]) == 0
 
 
 _DROPS = """\
