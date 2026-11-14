@@ -14,6 +14,10 @@ and the same over a Vec, `q: @*Vec<i32>` or `**Vec<i32>` (ritz0 failed at clang,
 ritz1 and selfhosted read the wrong word).  One row per base kind and position:
 each can go wrong on its own path.  `(*p)[i]` through one level of Vec, Span and
 String is #2440's, in test_index_through_reference.py.
+
+#3074: a `p:& *[3]T` borrow is a row kind here.  An array of pointers one level
+out, `p: @*[3]*U`, recorded no U on ritz1: `*(*p)[i]` read a byte and `(*p)[i].f`
+failed to emit.  `p[i]` on the borrow is #3103; a `**[N]*S` `let` local is #3104.
 """
 
 import pytest
@@ -32,12 +36,14 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 # The parameter's type around `[3]T`, how main passes `a`, and whether a write
 # reaches the array.  The `*`-out kinds hold `q: *[3]T = @a` and pass that.
 KINDS = {
-    "pointer": ("*", "@a", True),
-    "reference": ("@", "@a", False),
-    "mut_reference": ("@&", "@&a", True),
-    "ptr_ptr": ("**", "@q", True),
-    "ref_ptr": ("@*", "@q", True),
-    "mut_ref_ptr": ("@&*", "@&q", True),
+    "pointer": (": *", "@a", True),
+    "reference": (": @", "@a", False),
+    "mut_reference": (": @&", "@&a", True),
+    "ptr_ptr": (": **", "@q", True),
+    "ref_ptr": (": @*", "@q", True),
+    "mut_ref_ptr": (": @&*", "@&q", True),
+    # #3074: a `:& *[3]T` borrow param, given `q` bare: `p` is the caller's pointer.
+    "borrow_ptr": (":& *", "q", True),
 }
 
 S = "struct S\n    x: i32\n    y: i32\n\n"
@@ -68,7 +74,7 @@ def _program(kind: str, position: str) -> str:
         fill = "    var a: [3]i32 = [10, 20, 30]\n"
     if arg.endswith("q"):
         fill += f"    var q: *[3]{elem} = @a\n"
-    return (S + f"fn f(p: {around}[3]{elem}, i: i32) -> i32\n{body}\n"
+    return (S + f"fn f(p{around}[3]{elem}, i: i32) -> i32\n{body}\n"
             + f"pub fn main() -> i32\n{fill}    return {ret.replace('ARG', arg + ', 1')}\n")
 
 
@@ -117,3 +123,68 @@ def test_a_deref_index_one_level_out_over_a_vec(run_with, kind, position, compil
                "    v.push(10)\n    v.push(20)\n    v.push(30)\n    var p: *Vec<i32> = @v\n"
                f"    return {ret.replace('ARG', arg)}\n")
     assert run_with(compiler, f"vec_{kind}_{position}", program) == 20
+
+
+# #3074: an array of pointers one level out, `p: @*[3]*U`.  `(*p)[i]` is a `*U`, so
+# `*(*p)[i]` and `(*p)[i].f` read at U's width.  U is an i64 and a struct whose
+# i64 sits after a u8: element 1 holds (5 << 32) + 15, and the high and low words
+# sum to 20, so a read at the array's or the pointer's width comes back wrong.
+PTR_ELEM_KINDS = {"ptr_ptr": ("**", "@q"), "ref_ptr": ("@*", "@q"), "mut_ref_ptr": ("@&*", "@&q")}
+W = "struct W\n    b: u8\n    v: i64\n\n"
+SPLIT = "    return ((x >> 32) + (x & 4294967295)) as i32\n"
+PTR_ELEM_POSITIONS = {
+    "deref": ("i64", "    let x: i64 = *(*p)[i]\n" + SPLIT, "f(ARG)"),
+    "field": ("W", "    let x: i64 = (*p)[i].v\n" + SPLIT, "f(ARG)"),
+    "deref_store": ("i64", "    *(*p)[i] = 7\n    return 0\n", "f(ARG) + (b1 as i32) + 13"),
+    "field_store": ("W", "    (*p)[i].v = 7\n    return 0\n", "f(ARG) + (b1.v as i32) + 13"),
+}
+
+
+def _ptr_elem_program(kind: str, position: str) -> str:
+    around, arg = PTR_ELEM_KINDS[kind]
+    elem, body, ret = PTR_ELEM_POSITIONS[position]
+    if elem == "W":
+        fill = "".join(f"    var b{k}: W\n    b{k}.b = 9\n    b{k}.v = {v}\n"
+                       for k, v in enumerate((1, 21474836495, 3)))
+    else:
+        fill = "".join(f"    var b{k}: i64 = {v}\n" for k, v in enumerate((1, 21474836495, 3)))
+    fill += f"    var a: [3]*{elem} = [@b0, @b1, @b2]\n    var q: *[3]*{elem} = @a\n"
+    return (W + f"fn f(p: {around}[3]*{elem}, i: i32) -> i32\n{body}\n"
+            + f"pub fn main() -> i32\n{fill}    return {ret.replace('ARG', arg + ', 1')}\n")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("position", sorted(PTR_ELEM_POSITIONS))
+@pytest.mark.parametrize("kind", sorted(PTR_ELEM_KINDS))
+def test_a_pointer_element_one_level_out_reads_at_its_width(run_with, kind, position, compiler):
+    assert run_with(compiler, f"ptr_elem_{kind}_{position}", _ptr_elem_program(kind, position)) == 20
+
+
+# #3074: the same through an `@*[3]*U` or `@&*[3]*U` local, named through its type.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("around,addr", [("@*", "@q"), ("@&*", "@&q")])
+def test_a_pointer_element_through_a_ref_ptr_local(run_with, around, addr, compiler):
+    fill = "".join(f"    var b{k}: W\n    b{k}.v = {v}\n" for k, v in enumerate((1, 21474836495, 3)))
+    program = (W + "pub fn main() -> i32\n" + fill
+               + "    var a: [3]*W = [@b0, @b1, @b2]\n    var q: *[3]*W = @a\n"
+               + f"    let r: {around}[3]*W = {addr}\n    let x: i64 = (*r)[1].v\n" + SPLIT)
+    assert run_with(compiler, f"ptr_elem_local_{around}", program) == 20
+
+
+# #3074: `*q` is the array, not its first element: `(*q).v` is refused, on a param
+# and on a local, whether the array holds W or `*W`.  ritz1 read element 0's v
+# through an `@*[3]W` local, and naming `*W` above would have done it for `[3]*W`.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("elem", ["W", "*W"])
+@pytest.mark.parametrize("where", ["param", "local"])
+def test_a_field_of_the_array_itself_is_refused(compile_with, where, elem, compiler):
+    if where == "param":
+        program = W + f"fn f(q: @*[3]{elem}) -> i64\n    return (*q).v\n\npub fn main() -> i32\n    return 0\n"
+    else:
+        program = (W + f"pub fn main() -> i32\n    var a: [3]{elem}\n    var q: *[3]{elem} = @a\n"
+                   + f"    let r: @*[3]{elem} = @q\n    return (*r).v as i32\n")
+    comp, _, _ = compile_with(compiler, f"array_field_{where}_{elem.strip('*')}{len(elem)}", program)
+    assert comp.returncode != 0
