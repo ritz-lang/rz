@@ -384,97 +384,11 @@ fn ptr_ptr_ident_levels(slot: i32) -> i32
         return 2
     return lv
 
-# AGAST #3006: s.box_read is 1 while a member is read as a value
-# (emit_expr_member) or walked by a `for` (#2426).  Only then does `b.f`, with `b`
-# a `Box<T>`, read T's field `f` through `b.ptr`, as ritz0 reads it.  ritz0 takes
-# no Box's field as a place: `b.a[1]`, `b.a[1] = 7` and `@b.a` are "Unknown field
-# 'a' in struct 'Box$H'" there, so emit_member_ptr's other callers leave it 0.
-#
-# The T whose field `e` (`b.f`) names, `b` being a `Box<T>` and `f`
-# not the Box's own field (that comes first: `b.ptr` is the Box's `*T`), or null.
-fn box_inner_struct(s: *EmitterState, e: *Expr) -> *StructDef
-    let bst: *StructDef = box_struct_of(s, e)
-    if bst == null
-        return null
-    let ist: *StructDef = box_inner_def(s, bst)
-    if ist == null or find_field_index(ist, e.ident_ptr, e.ident_len) < 0
-        return null
-    ist
-
-# AGAST #3006: the struct `e.left` is, when `e`'s field isn't one of its own: a
-# Box only matters then.  A struct, a `*` / `@` / `@&` to one (ritz0 reads a
-# field through either), or an element `vv[i]` of a Vec local (as
-# emit_vec_elem_member_ptr types it).  Null otherwise.
-fn box_struct_of(s: *EmitterState, e: *Expr) -> *StructDef
-    if e.left == null
-        return null
-    var st: *StructDef = null
-    var b: RefTy
-    if ref_ty_of(s, e.left, @b) == 1
-        if b.kind == TYPE_STRUCT or (ref_is_pointer(b.kind) == 1 and b.pointee == TYPE_STRUCT)
-            st = find_struct(s, b.name, b.name_len)
-    else if e.left.kind == EXPR_INDEX and e.left.left != null and e.left.left.kind == EXPR_IDENT
-        let vl: *LocalVar = find_local_struct_name(s, e.left.left.ident_ptr, e.left.left.ident_len)
-        if vl != null and vl.var_type == TYPE_STRUCT and vl.type_name_len > 4 and name_eq(vl.type_name, 4, c"Vec$", 4) == 1
-            let vst: *StructDef = find_struct(s, vl.type_name, vl.type_name_len)
-            if vst != null and find_field_index(vst, c"data", 4) >= 0
-                let df: *StructField = get_field_type(vst, find_field_index(vst, c"data", 4))
-                if df.field_type == TYPE_PTR and df.field_type_name_len > 0
-                    st = find_struct(s, df.field_type_name, df.field_type_name_len)
-    if st == null or find_field_index(st, e.ident_ptr, e.ident_len) >= 0
-        return null
-    st
-
-# AGAST #3006: `b.a[i]` indexes `b.a` as a place, which ritz0 doesn't reach
-# through a Box: "Unknown field 'a' in struct 'Box$H'", as it says.  1 once
-# refused.  Without this the value read of `b.a` took the index's base.
-fn box_index_refused(s: *EmitterState, e: *Expr) -> i32
-    if e == null or e.kind != EXPR_INDEX or e.left == null or e.left.kind != EXPR_MEMBER
-        return 0
-    let m: *Expr = e.left
-    if box_inner_struct(s, m) == null
-        return 0
-    let bst: *StructDef = box_struct_of(s, m)
-    let msg: *u8 = malloc((m.ident_len + bst.name_len + 40) as i64) as *u8
-    var w: *u8 = put_bytes(msg, c"Unknown field '", 15)
-    w = put_bytes(w, m.ident_ptr, m.ident_len)
-    w = put_bytes(w, c"' in struct '", 13)
-    w = put_bytes(w, bst.name, bst.name_len)
-    w = put_bytes(w, c"'", 1)
-    *w = 0
-    emit_nd_error(s, m.span.line, m.span.col, msg)
-    1
-
 fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     result.reg = 0
     result.field = null
     result.success = 0
-
-    # AGAST #3006: `b.f` read through a Box is `b.ptr`'s pointee's `f`.  The
-    # Box is reached as `b.ptr` is, wherever `b` lives (local, param, field,
-    # global, element).  Any expression evaluated on the way is no read of
-    # `b.f`, so the flag is off for it.
-    if s.box_read == 1 and e.left != null
-        let ist: *StructDef = box_inner_struct(s, e)
-        if ist != null
-            var pe: Expr = *e
-            pe.ident_ptr = c"ptr"
-            pe.ident_len = 3
-            var pr: MemberPtrResult
-            emit_member_ptr(s, @pe, @pr)
-            if pr.success == 0
-                return
-            let fi: i32 = find_field_index(ist, e.ident_ptr, e.ident_len)
-            emit_member_gep_from_ptr(s, result, emit_load_ptr(s, pr.reg), ist, fi, get_field_type(ist, fi))
-            return
-    # The read goes on through a member chain (`b.q.x`), not through anything
-    # else on the way: ritz0 reads `b.ps[1].x`'s `b.ps` as a place, not
-    # through the Box.
-    let box_read: i32 = s.box_read
-    if e.left == null or e.left.kind != EXPR_MEMBER
-        s.box_read = 0
     emit_member_ptr_at(s, e, result)
-    s.box_read = box_read
 
 fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     # Base case: e.left is an identifier (var.field)

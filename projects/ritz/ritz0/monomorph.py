@@ -1790,12 +1790,13 @@ class Monomorphizer:
         elif isinstance(expr, rast.Field):
             return rast.Field(expr.span,
                              self._specialize_expr(expr.expr, subst),
-                             expr.field)
+                             expr.field, expr.name_span)
         elif isinstance(expr, rast.MethodCall):
             return rast.MethodCall(expr.span,
                                    self._specialize_expr(expr.expr, subst),
                                    expr.method,
-                                   [self._specialize_expr(arg, subst) for arg in expr.args])
+                                   [self._specialize_expr(arg, subst) for arg in expr.args],
+                                   expr.name_span)
         elif isinstance(expr, rast.If):
             return rast.If(expr.span,
                           self._specialize_expr(expr.cond, subst),
@@ -2095,12 +2096,13 @@ class Monomorphizer:
         elif isinstance(expr, rast.Field):
             return rast.Field(expr.span,
                              self._rewrite_expr(expr.expr),
-                             expr.field)
+                             expr.field, expr.name_span)
         elif isinstance(expr, rast.MethodCall):
             return rast.MethodCall(expr.span,
                                    self._rewrite_expr(expr.expr),
                                    expr.method,
-                                   [self._rewrite_expr(arg) for arg in expr.args])
+                                   [self._rewrite_expr(arg) for arg in expr.args],
+                                   expr.name_span)
         elif isinstance(expr, rast.If):
             return rast.If(expr.span,
                           self._rewrite_expr(expr.cond),

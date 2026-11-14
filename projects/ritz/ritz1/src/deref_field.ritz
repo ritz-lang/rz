@@ -1,0 +1,844 @@
+# deref_field.ritz - `.` through a struct's `Deref` / `DerefMut` (LANGUAGE_SPEC
+# §7.7, LARB ruling R17, AGAST #3015).
+#
+# A struct opts into `.` reaching through it with two compiler-known traits,
+# resolved statically by name like `Drop` and R15's `Index`:
+#
+#   impl Deref for S        fn deref(self: @S) -> @T
+#   impl DerefMut for S     fn deref_mut(self: @&S) -> @&T
+#
+# `s.f` is S's own field or method first; otherwise, when S implements `Deref`,
+# T's, one step only.  Each statement is rewritten here as the emitter reaches
+# it, when every local it names is typed (the R15 rewrite in monomorph.ritz
+# only knows locals): a field reached through the trait, `s.f`, becomes
+# `(*S_deref(@s)).f` for a shared use and `(*S_deref_mut(@&s)).f` for a mutable
+# one, and a method of T, `s.m()`, takes the reference the call returns as its
+# receiver.  The emitter then lowers ordinary places.
+#
+#   shared   a read, `s.f.g`, `s.f[i]`, `@s.f`, `for x in s.f`, `s.m()` (self: @T)
+#   mutable  `s.f = v`, `s.f op= v`, `s.f[i] = v`, `s.f.g = v`, `@&s.f`, a `:&`
+#            argument, `s.m()` with `self: @&T`
+#
+# `s.f op= v` calls `deref_mut` once: its read and store share the call
+# (struct_index.ritz's si_once, AGAST #2529).
+#
+# The errors are ritz0's words (ritz0/deref_rules.py), located at the field
+# name; ritz0/test_ritz1_box_field.py holds all three compilers to them.  The
+# calls made here are steps of their receiver's place for the loan check
+# (ref_check.ritz, R11a): df_step_recv.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.str
+
+import ast
+import ast_helpers
+import struct_index
+import emitter_core
+import emitter_expr_call
+import ref_check
+
+# Which traits a struct implements, as a mask.
+const DF_DEREF: i32 = 1
+const DF_DEREF_MUT: i32 = 2
+
+# How a place is used, which picks the method (and spells a refusal).
+const DF_READ: i32 = 0
+const DF_STORE: i32 = 1       # `s.f = v`, `s.f[i] = v`, `s.f.g = v`
+const DF_COMPOUND: i32 = 2    # `s.f op= v`
+const DF_ADDR_MUT: i32 = 3    # `@&s.f`, a `:&` argument
+const DF_MUT_CALL: i32 = 4    # `s.f.m()` with a mutating `m` (g_df_call)
+
+var g_df_call: *u8 = null
+var g_df_call_len: i32 = 0
+var g_df_once: i32 = 0      # 1 while walking the place of `x op= v`
+var g_df_changed: i32 = 0   # the steps made, so a statement form knows to convert
+
+# ----------------------------------------------------------------------------
+# The steps: each call made here, with the place it lends (null when its
+# receiver is already a pointer or reference, which is no place of a local).
+# ----------------------------------------------------------------------------
+
+var g_df_steps: **Expr = null
+var g_df_recvs: **Expr = null
+var g_df_fns: **FnDef = null
+var g_df_count: i32 = 0
+var g_df_cap: i32 = 0
+
+fn df_step_add(call: *Expr, recv: *Expr, fd: *FnDef)
+    if g_df_count == g_df_cap
+        var cap: i32 = 16
+        if g_df_cap > 0
+            cap = g_df_cap * 2
+        let steps: **Expr = malloc((cap as i64) * 8) as **Expr
+        let recvs: **Expr = malloc((cap as i64) * 8) as **Expr
+        let fns: **FnDef = malloc((cap as i64) * 8) as **FnDef
+        var i: i32 = 0
+        while i < g_df_count
+            *(steps + i) = *(g_df_steps + i)
+            *(recvs + i) = *(g_df_recvs + i)
+            *(fns + i) = *(g_df_fns + i)
+            i += 1
+        g_df_steps = steps
+        g_df_recvs = recvs
+        g_df_fns = fns
+        g_df_cap = cap
+    *(g_df_steps + g_df_count) = call
+    *(g_df_recvs + g_df_count) = recv
+    *(g_df_fns + g_df_count) = fd
+    g_df_count += 1
+
+fn df_step_index(e: *Expr) -> i32
+    if e == null or e.kind != EXPR_CALL
+        return -1
+    var i: i32 = 0
+    while i < g_df_count
+        if *(g_df_steps + i) == e
+            return i
+        i += 1
+    -1
+
+# 1 when `e` is a `deref` / `deref_mut` call made here.
+pub fn df_is_step(e: *Expr) -> i32
+    (df_step_index(e) >= 0) as i32
+
+# The method a step calls: a non-generic impl's `W_deref` is in no fn table, so
+# find_call_fn asks here first.  Null for any other call.
+pub fn df_step_fn(e: *Expr) -> *FnDef
+    if g_df_count == 0
+        return null
+    let i: i32 = df_step_index(e)
+    if i < 0
+        return null
+    *(g_df_fns + i)
+
+# The place `x` whose step the call `e` is, when `x` is held by value; else null.
+pub fn df_step_recv(e: *Expr) -> *Expr
+    let i: i32 = df_step_index(e)
+    if i < 0
+        return null
+    *(g_df_recvs + i)
+
+# `*e` with `e` a step on a place held by value: that place, else null.  A step
+# `*` is a path step of it (R17 rule 6).
+pub fn df_deref_step_recv(e: *Expr) -> *Expr
+    if e == null or e.kind != EXPR_UNARY or e.op != OP_DEREF
+        return null
+    df_step_recv(e.operand)
+
+# ----------------------------------------------------------------------------
+# Messages
+# ----------------------------------------------------------------------------
+
+struct DfBuf
+    data: *u8
+    len: i32
+    cap: i32
+
+fn df_buf_init(b: *DfBuf)
+    b.cap = 128
+    b.len = 0
+    b.data = malloc(b.cap as i64)
+    *b.data = 0
+
+fn df_put(b: *DfBuf, p: *u8, n: i32)
+    if b.len + n + 1 > b.cap
+        var cap: i32 = b.cap * 2
+        while b.len + n + 1 > cap
+            cap = cap * 2
+        let d: *u8 = malloc(cap as i64)
+        memcpy(d, b.data, b.len as i64)
+        b.data = d
+        b.cap = cap
+    if n > 0
+        memcpy(b.data + b.len, p, n as i64)
+    b.len += n
+    *(b.data + b.len) = 0
+
+fn df_puts(b: *DfBuf, p: *u8)
+    df_put(b, p, strlen(p) as i32)
+
+fn df_putc(b: *DfBuf, c: u8)
+    if b.len + 2 > b.cap
+        let d: *u8 = malloc((b.cap * 2) as i64)
+        memcpy(d, b.data, b.len as i64)
+        b.data = d
+        b.cap = b.cap * 2
+    *(b.data + b.len) = c
+    b.len += 1
+    *(b.data + b.len) = 0
+
+# `…` (U+2026).
+fn df_put_ellipsis(b: *DfBuf)
+    df_putc(b, 0xE2 as u8)
+    df_putc(b, 0x80 as u8)
+    df_putc(b, 0xA6 as u8)
+
+# How many type parameters the generic struct `head` declares, 0 for any other name.
+fn df_arity(s: *EmitterState, head: *u8, len: i32) -> i32
+    var st: *StructDef = s.module.structs
+    while st != null
+        if st.type_params != null and name_eq(st.name, st.name_len, head, len) == 1
+            var n: i32 = 0
+            var tp: *TypeParam = st.type_params
+            while tp != null
+                n += 1
+                tp = tp.next
+            return n
+        st = st.next
+    0
+
+# One type at `*pos` of the mangled `name`, as the source spells it.  0 when
+# the arities can't account for the name.
+fn df_display_take(s: *EmitterState, name: *u8, len: i32, pos: *i32, out: *DfBuf) -> i32
+    let start: i32 = *pos
+    var end: i32 = start
+    while end < len and *(name + end) != '$'
+        end += 1
+    if end == start
+        return 0
+    df_put(out, name + start, end - start)
+    *pos = end
+    let n: i32 = df_arity(s, name + start, end - start)
+    if n == 0
+        return 1
+    df_putc(out, '<')
+    var k: i32 = 0
+    while k < n
+        if *pos >= len
+            return 0
+        *pos = *pos + 1   # the `$`
+        if k > 0
+            df_puts(out, c", ")
+        if df_display_take(s, name, len, pos, out) == 0
+            return 0
+        k += 1
+    df_putc(out, '>')
+    1
+
+# A monomorphised type name as the source spells it: `Box$H` is `Box<H>`,
+# `Pair$i64$i32` is `Pair<i64, i32>` (ritz0: deref_rules.display).
+fn df_display(s: *EmitterState, name: *u8, len: i32, out: *DfBuf)
+    var tmp: DfBuf
+    df_buf_init(@tmp)
+    var pos: i32 = 0
+    if df_display_take(s, name, len, @pos, @tmp) == 1 and pos == len
+        df_put(out, tmp.data, tmp.len)
+    else
+        df_put(out, name, len)
+
+# 1 for a receiver spelled as written: an ident, or a member chain of idents.
+fn df_plain(x: *Expr) -> i32
+    if x == null
+        return 0
+    if x.kind == EXPR_IDENT
+        return 1
+    if x.kind == EXPR_MEMBER
+        return df_plain(x.left)
+    0
+
+fn df_spell_plain(x: *Expr, out: *DfBuf)
+    if x.kind == EXPR_MEMBER
+        df_spell_plain(x.left, out)
+        df_putc(out, '.')
+    df_put(out, x.ident_ptr, x.ident_len)
+
+# The receiver `x` as the source writes it, or `s`.
+fn df_spell(x: *Expr, out: *DfBuf)
+    if df_plain(x) == 1
+        df_spell_plain(x, out)
+    else
+        df_putc(out, 's')
+
+# Each place reported once: a statement can be walked again (a `defer` body
+# at every exit, a tail both by the fn loop and emit_stmt).
+var g_df_err_at: *i64 = null
+var g_df_err_count: i32 = 0
+var g_df_err_cap: i32 = 0
+
+fn df_report(s: *EmitterState, line: i32, col: i32, msg: *u8)
+    let key: i64 = ((line as i64) << 20) | (col as i64)
+    var i: i32 = 0
+    while i < g_df_err_count
+        if *(g_df_err_at + i) == key
+            return
+        i += 1
+    if g_df_err_count == g_df_err_cap
+        var cap: i32 = 16
+        if g_df_err_cap > 0
+            cap = g_df_err_cap * 2
+        let grown: *i64 = malloc((cap as i64) * 8) as *i64
+        var j: i32 = 0
+        while j < g_df_err_count
+            *(grown + j) = *(g_df_err_at + j)
+            j += 1
+        g_df_err_at = grown
+        g_df_err_cap = cap
+    *(g_df_err_at + g_df_err_count) = key
+    g_df_err_count += 1
+    emit_nd_error(s, line, col, msg)
+
+# Where the field (or method) name of the member `e` is.
+fn df_line(e: *Expr) -> i32
+    if e.bracket.line > 0
+        return e.bracket.line
+    e.span.line
+
+fn df_col(e: *Expr) -> i32
+    if e.bracket.line > 0
+        return e.bracket.col
+    e.span.col
+
+# ----------------------------------------------------------------------------
+# Lookup
+# ----------------------------------------------------------------------------
+
+# The struct `x.f` looks in, through `*` / `@` / `@&` (§7.7's auto-deref), or an
+# element `vv[i]` of a Vec local; null otherwise.
+fn df_struct_of(s: *EmitterState, x: *Expr) -> *StructDef
+    if x == null
+        return null
+    # An element as emit_member_ptr types it (through a `@Vec<T>` too, which
+    # ref_ty_of takes for the Vec itself).
+    if x.kind == EXPR_INDEX
+        var en: *u8 = null
+        var el: i32 = 0
+        index_elem_struct_name(s, x, @en, @el)
+        if en != null and el > 0
+            return find_struct(s, en, el)
+    var b: RefTy
+    if ref_ty_of(s, x, @b) == 1
+        if b.kind == TYPE_STRUCT or (ref_is_pointer(b.kind) == 1 and b.pointee == TYPE_STRUCT)
+            if b.name_len > 0
+                # A container is no element's type: unknown, left alone.
+                if x.kind == EXPR_INDEX and si_built_in(b.name, b.name_len) == 1
+                    return null
+                return find_struct(s, b.name, b.name_len)
+        return null
+    if x.kind == EXPR_INDEX and x.left != null and x.left.kind == EXPR_IDENT
+        let vl: *LocalVar = find_local_struct_name(s, x.left.ident_ptr, x.left.ident_len)
+        if vl != null and vl.var_type == TYPE_STRUCT and vl.type_name_len > 4 and name_eq(vl.type_name, 4, c"Vec$", 4) == 1
+            let vst: *StructDef = find_struct(s, vl.type_name, vl.type_name_len)
+            if vst != null
+                let di: i32 = find_field_index(vst, c"data", 4)
+                if di >= 0
+                    let df: *StructField = get_field_type(vst, di)
+                    if df.field_type == TYPE_PTR and df.field_type_name_len > 0
+                        return find_struct(s, df.field_type_name, df.field_type_name_len)
+    null
+
+fn df_base_len(name: *u8, len: i32) -> i32
+    var i: i32 = 0
+    while i < len and *(name + i) != '$'
+        i += 1
+    i
+
+# The traits `st` implements: a non-generic impl names it, a generic one its base
+# (`impl<T> Deref for Box<T>` is `Box$H`'s).
+fn df_traits(s: *EmitterState, st: *StructDef) -> i32
+    var mask: i32 = 0
+    let bl: i32 = df_base_len(st.name, st.name_len)
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if ib.trait_name != null
+            var hit: i32 = 0
+            if ib.type_params == null
+                hit = name_eq(ib.type_name, ib.type_name_len, st.name, st.name_len)
+            else if bl < st.name_len
+                hit = name_eq(ib.type_name, ib.type_name_len, st.name, bl)
+            if hit == 1
+                if name_eq(ib.trait_name, ib.trait_name_len, c"Deref", 5) == 1
+                    mask = mask | DF_DEREF
+                else if name_eq(ib.trait_name, ib.trait_name_len, c"DerefMut", 8) == 1
+                    mask = mask | DF_DEREF_MUT
+        ib = ib.next
+    mask
+
+# `st`'s `deref`, whose `-> @T` names the T it reaches; null when there's none.
+fn df_deref_fn(s: *EmitterState, st: *StructDef) -> *FnDef
+    let fd: *FnDef = method_callee_def(s, st.name, st.name_len, c"deref", 5)
+    if fd == null or fd.return_type_name == null or fd.return_type_name_len <= 0
+        return null
+    fd
+
+fn df_field(st: *StructDef, name: *u8, len: i32) -> *StructField
+    if st == null
+        return null
+    let fi: i32 = find_field_index(st, name, len)
+    if fi < 0
+        return null
+    get_field_type(st, fi)
+
+# The struct a field of that type is, by value or behind a pointer or reference.
+fn df_field_struct(s: *EmitterState, f: *StructField) -> *StructDef
+    if f == null or f.field_type_name_len <= 0
+        return null
+    if f.field_type == TYPE_STRUCT or f.field_type == TYPE_PTR or f.field_type == TYPE_REF or f.field_type == TYPE_MUT_REF
+        return find_struct(s, f.field_type_name, f.field_type_name_len)
+    null
+
+# The struct `x` will be once its members are rewritten (a receiver's type,
+# known before the receiver is walked).
+fn df_peek_struct(s: *EmitterState, x: *Expr) -> *StructDef
+    if x == null
+        return null
+    if x.kind == EXPR_MEMBER and x.left != null
+        let bst: *StructDef = df_peek_struct(s, x.left)
+        if bst != null
+            var f: *StructField = df_field(bst, x.ident_ptr, x.ident_len)
+            if f == null and (df_traits(s, bst) & DF_DEREF) != 0
+                let dfd: *FnDef = df_deref_fn(s, bst)
+                if dfd != null
+                    f = df_field(find_struct(s, dfd.return_type_name, dfd.return_type_name_len), x.ident_ptr, x.ident_len)
+            return df_field_struct(s, f)
+    df_struct_of(s, x)
+
+# 1 when the method `fd` may write its receiver: `self: @&T`, `self:& T`, or a
+# `*T` one (a UFCS helper's `v: *Vec<T>`).
+fn df_fn_mutates(fd: *FnDef) -> i32
+    if fd == null or fd.params == null
+        return 0
+    let p: *Param = fd.params
+    if p.param_type == TYPE_MUT_REF or p.param_type == TYPE_PTR or p.is_self_borrow == 1
+        return 1
+    0
+
+# ----------------------------------------------------------------------------
+# Refusals (R17 rule 5; ritz0: deref_rules.no_field / neither_has / needs_deref_mut)
+# ----------------------------------------------------------------------------
+
+pub fn df_no_field(s: *EmitterState, e: *Expr, st: *StructDef)
+    var m: DfBuf
+    df_buf_init(@m)
+    df_putc(@m, '`')
+    df_display(s, st.name, st.name_len, @m)
+    df_puts(@m, c"` has no field `")
+    df_put(@m, e.ident_ptr, e.ident_len)
+    df_putc(@m, '`')
+    # A `*T` field whose T has it: the hint names the step.
+    var f: *StructField = st.fields
+    while f != null
+        if f.field_type == TYPE_PTR and f.field_type_name_len > 0
+            if df_field(find_struct(s, f.field_type_name, f.field_type_name_len), e.ident_ptr, e.ident_len) != null
+                df_puts(@m, c": it points at one: `")
+                df_spell(e.left, @m)
+                df_putc(@m, '.')
+                df_put(@m, f.name, f.name_len)
+                df_putc(@m, '.')
+                df_put(@m, e.ident_ptr, e.ident_len)
+                df_puts(@m, c"`, or implement `Deref`")
+                f = null
+        if f != null
+            f = f.next
+    df_report(s, df_line(e), df_col(e), m.data)
+
+fn df_neither(s: *EmitterState, e: *Expr, st: *StructDef, t: *u8, t_len: i32)
+    var m: DfBuf
+    df_buf_init(@m)
+    df_puts(@m, c"neither `")
+    df_display(s, st.name, st.name_len, @m)
+    df_puts(@m, c"` nor `")
+    df_display(s, t, t_len, @m)
+    df_puts(@m, c"` has a field `")
+    df_put(@m, e.ident_ptr, e.ident_len)
+    df_putc(@m, '`')
+    df_report(s, df_line(e), df_col(e), m.data)
+
+# 5(c): the use is spelled with the place stopping at the field reached through
+# the trait (`r.a = …` for `r.a[1] = 7`); `is_method` for `r.m()` itself.
+fn df_needs_mut(s: *EmitterState, e: *Expr, st: *StructDef, ctx: i32, is_method: i32)
+    var m: DfBuf
+    df_buf_init(@m)
+    df_putc(@m, '`')
+    if ctx == DF_ADDR_MUT
+        df_puts(@m, c"@&")
+    df_spell(e.left, @m)
+    df_putc(@m, '.')
+    df_put(@m, e.ident_ptr, e.ident_len)
+    if is_method == 1
+        df_puts(@m, c"()")
+    else if ctx == DF_STORE
+        df_puts(@m, c" = ")
+        df_put_ellipsis(@m)
+    else if ctx == DF_COMPOUND
+        df_puts(@m, c" op= ")
+        df_put_ellipsis(@m)
+    else if ctx == DF_MUT_CALL
+        df_putc(@m, '.')
+        df_put(@m, g_df_call, g_df_call_len)
+        df_puts(@m, c"()")
+    df_puts(@m, c"` needs `DerefMut`, and `")
+    df_display(s, st.name, st.name_len, @m)
+    df_puts(@m, c"` implements only `Deref`")
+    df_report(s, df_line(e), df_col(e), m.data)
+
+# ----------------------------------------------------------------------------
+# The rewrite
+# ----------------------------------------------------------------------------
+
+# `S_deref(@x)` / `S_deref_mut(@&x)`, or with `x` itself when it's a pointer or
+# a reference to S already.
+fn df_step(s: *EmitterState, x: *Expr, st: *StructDef, mutable: i32) -> *Expr
+    var meth: *u8 = c"deref"
+    var meth_len: i32 = 5
+    if mutable == 1
+        meth = c"deref_mut"
+        meth_len = 9
+    let n: i32 = st.name_len + 1 + meth_len
+    let name: *u8 = malloc((n + 1) as i64)
+    memcpy(name, st.name, st.name_len as i64)
+    *(name + st.name_len) = '_'
+    memcpy(name + st.name_len + 1, meth, meth_len as i64)
+    *(name + n) = 0
+    let call: *Expr = si_new_expr(EXPR_CALL, x.span.line, x.span.col)
+    call.func_name = name
+    call.func_name_len = n
+    call.call_type_suffix = null
+    call.call_type_suffix_len = 0
+    var recv: *Expr = null
+    var arg: *Expr = x
+    var t: RefTy
+    if ref_ty_of(s, x, @t) == 1 and ref_is_pointer(t.kind) == 1
+        # `self: @&S` from an `@S`: §3.2's refusal, which ref_check can't say
+        # once the write is a call.
+        if mutable == 1 and t.kind == TYPE_REF
+            emit_nd_error(s, x.span.line, x.span.col, c"cannot write through an `@T`: make it `@&T`")
+    else
+        arg = si_new_expr(EXPR_UNARY, x.span.line, x.span.col)
+        if mutable == 1
+            arg.op = OP_ADDR_MUT
+        else
+            arg.op = OP_ADDR
+        arg.operand = x
+        recv = x
+    call.args = arg
+    df_step_add(call, recv, method_callee_def(s, st.name, st.name_len, meth, meth_len))
+    if g_df_once == 1
+        si_once_add(call)
+    g_df_changed += 1
+    call
+
+fn df_mutable(ctx: i32) -> i32
+    (ctx != DF_READ) as i32
+
+# `x.f`, its base already walked: through the trait when f isn't S's own.
+fn df_member(s: *EmitterState, e: *Expr, ctx: i32)
+    let x: *Expr = e.left
+    if x == null
+        return
+    let st: *StructDef = df_struct_of(s, x)
+    if st == null or find_field_index(st, e.ident_ptr, e.ident_len) >= 0
+        return
+    let mask: i32 = df_traits(s, st)
+    var dfd: *FnDef = null
+    if (mask & DF_DEREF) != 0
+        dfd = df_deref_fn(s, st)
+    if dfd == null
+        df_no_field(s, e, st)
+        return
+    let tst: *StructDef = find_struct(s, dfd.return_type_name, dfd.return_type_name_len)
+    if df_field(tst, e.ident_ptr, e.ident_len) == null
+        df_neither(s, e, st, dfd.return_type_name, dfd.return_type_name_len)
+        return
+    let mutable: i32 = df_mutable(ctx)
+    if mutable == 1 and (mask & DF_DEREF_MUT) == 0
+        df_needs_mut(s, e, st, ctx, 0)
+        return
+    e.left = si_deref(df_step(s, x, st, mutable), x.span.line, x.span.col)
+
+# The context the base of a place takes: a mutable use mutates what it's in.
+fn df_down(ctx: i32) -> i32
+    ctx
+
+fn df_args(s: *EmitterState, a0: *Expr, p0: *Param)
+    var a: *Expr = a0
+    var p: *Param = p0
+    while a != null
+        if p != null and p.is_borrow == 1
+            df_walk(s, a, DF_ADDR_MUT)
+        else
+            df_walk(s, a, DF_READ)
+        if p != null
+            p = p.next
+        a = a.next
+
+# `x.m(args)`: S's own method, else T's through the trait, whose receiver is
+# then the reference `deref` / `deref_mut` returns.
+fn df_method(s: *EmitterState, e: *Expr)
+    let x: *Expr = e.left
+    if x == null
+        df_args(s, e.args, null)
+        return
+    var fd: *FnDef = null
+    var through: i32 = 0
+    let rst: *StructDef = df_peek_struct(s, x)
+    if rst != null
+        fd = method_callee_def(s, rst.name, rst.name_len, e.ident_ptr, e.ident_len)
+        if fd == null and (df_traits(s, rst) & DF_DEREF) != 0
+            let dfd: *FnDef = df_deref_fn(s, rst)
+            if dfd != null
+                let tst: *StructDef = find_struct(s, dfd.return_type_name, dfd.return_type_name_len)
+                if tst != null
+                    fd = method_callee_def(s, tst.name, tst.name_len, e.ident_ptr, e.ident_len)
+                    if fd != null
+                        through = 1
+    let mutates: i32 = df_fn_mutates(fd)
+    let saved: *u8 = g_df_call
+    let saved_len: i32 = g_df_call_len
+    if mutates == 1
+        g_df_call = e.ident_ptr
+        g_df_call_len = e.ident_len
+        df_walk(s, x, DF_MUT_CALL)
+    else
+        df_walk(s, x, DF_READ)
+    g_df_call = saved
+    g_df_call_len = saved_len
+    if through == 1
+        let xst: *StructDef = df_struct_of(s, e.left)
+        if xst != null
+            if mutates == 1 and (df_traits(s, xst) & DF_DEREF_MUT) == 0
+                df_needs_mut(s, e, xst, DF_MUT_CALL, 1)
+            else
+                e.left = df_step(s, e.left, xst, mutates)
+    var p: *Param = null
+    if fd != null and fd.params != null
+        p = fd.params.next
+    df_args(s, e.args, p)
+
+fn df_walk_list(s: *EmitterState, a0: *Expr)
+    var a: *Expr = a0
+    while a != null
+        df_walk(s, a, DF_READ)
+        a = a.next
+
+fn df_walk(s: *EmitterState, e: *Expr, ctx: i32)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_MEMBER
+        df_walk(s, e.left, df_down(ctx))
+        df_member(s, e, ctx)
+    else if k == EXPR_METHOD
+        df_method(s, e)
+    else if k == EXPR_CALL
+        if df_is_step(e) == 1
+            return
+        if e.func_name_len == 0
+            df_walk(s, e.left, DF_READ)
+            df_args(s, e.args, null)
+            return
+        var p: *Param = null
+        let fd: *FnDef = find_call_fn(s, e)
+        if fd != null
+            p = fd.params
+        df_args(s, e.args, p)
+    else if k == EXPR_UNARY
+        if e.op == OP_ADDR_MUT
+            df_walk(s, e.operand, DF_ADDR_MUT)
+        else
+            df_walk(s, e.operand, DF_READ)
+    else if k == EXPR_INDEX
+        df_walk(s, e.left, df_down(ctx))
+        df_walk(s, e.right, DF_READ)
+    else if k == EXPR_BINARY or k == EXPR_RANGE
+        df_walk(s, e.left, DF_READ)
+        df_walk(s, e.right, DF_READ)
+    else if k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        df_walk(s, e.left, DF_READ)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            df_walk(s, fi.value, DF_READ)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        df_walk_list(s, e.args)
+    else if k == EXPR_IF
+        # An `if`'s arms bind nothing; a `match`'s arms do, and are walked as
+        # they're emitted (df_rewrite_expr).
+        df_walk(s, e.left, DF_READ)
+        var arm: *MatchArm = e.args as *MatchArm
+        while arm != null
+            if arm.is_pass == 0 and arm.body != null
+                df_walk(s, arm.body, DF_READ)
+            arm = arm.next
+    else if k == EXPR_MATCH
+        df_walk(s, e.left, DF_READ)
+
+# An expression the emitter is about to lower outside any statement (a match
+# arm's value, once its bindings are in scope).
+pub fn df_rewrite_expr(s: *EmitterState, e: *Expr)
+    df_walk(s, e, DF_READ)
+
+fn df_ident(name: *u8, len: i32, line: i32, col: i32) -> *Expr
+    let id: *Expr = si_new_expr(EXPR_IDENT, line, col)
+    id.ident_ptr = name
+    id.ident_len = len
+    id
+
+fn df_member_node(base: *Expr, name: *u8, len: i32, at: *Stmt) -> *Expr
+    let m: *Expr = si_new_expr(EXPR_MEMBER, base.span.line, base.span.col)
+    m.left = base
+    m.ident_ptr = name
+    m.ident_len = len
+    m.bracket.line = at.bracket.line
+    m.bracket.col = at.bracket.col
+    m
+
+fn df_index_node(base: *Expr, key: *Expr) -> *Expr
+    let x: *Expr = si_new_expr(EXPR_INDEX, base.span.line, base.span.col)
+    x.left = base
+    x.right = key
+    x.bracket.line = 0
+    x
+
+# The target `t` of a store statement, walked as one: when anything in it went
+# through the trait, the statement becomes `t = v` (STMT_ASSIGN with an
+# expression target), and a compound one's read shares `t`.
+fn df_store(s: *EmitterState, stmt: *Stmt, t: *Expr, compound: i32)
+    g_df_changed = 0
+    g_df_once = compound
+    if compound == 1
+        df_walk(s, t, DF_COMPOUND)
+    else
+        df_walk(s, t, DF_STORE)
+    g_df_once = 0
+    if g_df_changed > 0
+        stmt.kind = STMT_ASSIGN
+        stmt.if_cond = t
+        stmt.assign_target = null
+        stmt.assign_target_len = 0
+        if compound == 1
+            stmt.assign_value.left = t
+    df_walk(s, stmt.assign_value, DF_READ)
+
+fn df_is_compound(v: *Expr) -> i32
+    (v != null and v.kind == EXPR_BINARY and v.left != null) as i32
+
+# Rewrite the expressions statement `stmt` owns (not its nested blocks: they're
+# rewritten as they're emitted, with their own locals in scope).
+pub fn df_rewrite_stmt(s: *EmitterState, stmt: *Stmt)
+    if stmt == null
+        return
+    let k: i32 = stmt.kind
+    let v: *Expr = stmt.assign_value
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        df_walk(s, stmt.var_init, DF_READ)
+    else if k == STMT_ASSIGN
+        if stmt.assign_target_len > 0
+            df_walk(s, v, DF_READ)
+            return
+        let t: *Expr = stmt.if_cond
+        var compound: i32 = 0
+        if df_is_compound(v) == 1 and v.left == t
+            compound = 1
+        g_df_once = compound
+        if compound == 1
+            df_walk(s, t, DF_COMPOUND)
+        else
+            df_walk(s, t, DF_STORE)
+        g_df_once = 0
+        df_walk(s, v, DF_READ)
+    else if k == STMT_LOCAL_FIELD_ASSIGN
+        var t: *Expr = null
+        var compound: i32 = 0
+        if df_is_compound(v) == 1 and v.left.kind == EXPR_MEMBER and v.left.ident_ptr == stmt.assign_target and v.left.left != null and v.left.left.kind == EXPR_IDENT and v.left.left.ident_ptr == stmt.var_name
+            compound = 1
+            t = v.left
+        else
+            t = df_member_node(df_ident(stmt.var_name, stmt.var_name_len, stmt.span.line, stmt.span.col), stmt.assign_target, stmt.assign_target_len, stmt)
+        df_store(s, stmt, t, compound)
+    else if k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        var t: *Expr = null
+        var compound: i32 = 0
+        if df_is_compound(v) == 1 and v.left.kind == EXPR_INDEX and v.left.right == stmt.while_cond
+            compound = 1
+            t = v.left
+        else
+            let fm: *Expr = df_member_node(df_ident(stmt.var_name, stmt.var_name_len, stmt.span.line, stmt.span.col), stmt.assign_target, stmt.assign_target_len, stmt)
+            t = df_index_node(fm, stmt.while_cond)
+        df_store(s, stmt, t, compound)
+    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        if stmt.if_cond == null
+            return
+        # The compound forms read `(*p).f`: the target is built afresh, and
+        # the read takes it when the statement converts.
+        var t: *Expr = df_member_node(stmt.if_cond, stmt.assign_target, stmt.assign_target_len, stmt)
+        var compound: i32 = 0
+        if k == STMT_MEMBER_INDEX_ASSIGN
+            t = df_index_node(t, stmt.while_cond)
+            if df_is_compound(v) == 1 and v.left.kind == EXPR_INDEX and v.left.right == stmt.while_cond
+                compound = 1
+        else if df_is_compound(v) == 1 and v.left.kind == EXPR_MEMBER and v.left.left != null and v.left.left.kind == EXPR_UNARY and v.left.left.operand == stmt.if_cond
+            compound = 1
+        df_store(s, stmt, t, compound)
+    else if k == STMT_INDEX_ASSIGN
+        df_walk(s, stmt.while_cond, DF_READ)
+        df_walk(s, v, DF_READ)
+    else if k == STMT_RETURN
+        df_walk(s, stmt.return_value, DF_READ)
+    else if k == STMT_EXPR
+        df_walk(s, stmt.expr, DF_READ)
+    else if k == STMT_IF or k == STMT_MATCH or k == STMT_ASSERT
+        df_walk(s, stmt.if_cond, DF_READ)
+    else if k == STMT_WHILE
+        df_walk(s, stmt.while_cond, DF_READ)
+    else if k == STMT_FOR
+        df_walk(s, stmt.for_start, DF_READ)
+        df_walk(s, stmt.for_end, DF_READ)
+
+# ----------------------------------------------------------------------------
+# Rule 1: `impl DerefMut for S` needs `impl Deref for S`, reaching the same T.
+# Located at the trait name.  ritz0: deref_rules.deref_mut_alone / targets_differ.
+# ----------------------------------------------------------------------------
+
+fn df_impl_type(ib: *ImplBlock, out: *DfBuf)
+    df_put(out, ib.type_name, ib.type_name_len)
+    if ib.type_params == null
+        return
+    df_putc(out, '<')
+    var tp: *TypeParam = ib.type_params
+    while tp != null
+        df_put(out, tp.name, tp.name_len)
+        if tp.next != null
+            df_puts(out, c", ")
+        tp = tp.next
+    df_putc(out, '>')
+
+fn df_impl_method(ib: *ImplBlock, name: *u8, len: i32) -> *FnDef
+    var f: *FnDef = ib.methods
+    while f != null
+        if name_eq(f.name, f.name_len, name, len) == 1
+            return f
+        f = f.next
+    null
+
+pub fn df_check_impls(s: *EmitterState)
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if ib.trait_name != null and name_eq(ib.trait_name, ib.trait_name_len, c"DerefMut", 8) == 1
+            var d: *ImplBlock = s.module.impls
+            while d != null
+                if d.trait_name != null and name_eq(d.trait_name, d.trait_name_len, c"Deref", 5) == 1 and name_eq(d.type_name, d.type_name_len, ib.type_name, ib.type_name_len) == 1 and (d.type_params == null) == (ib.type_params == null)
+                    break
+                d = d.next
+            var m: DfBuf
+            df_buf_init(@m)
+            if d == null
+                df_putc(@m, '`')
+                df_impl_type(ib, @m)
+                df_puts(@m, c"` implements `DerefMut` without `Deref`")
+                df_report(s, ib.trait_span.line, ib.trait_span.col, m.data)
+            else
+                let fm: *FnDef = df_impl_method(ib, c"deref_mut", 9)
+                let fd: *FnDef = df_impl_method(d, c"deref", 5)
+                if fm != null and fd != null and fm.return_type_name != null and fd.return_type_name != null and name_eq(fm.return_type_name, fm.return_type_name_len, fd.return_type_name, fd.return_type_name_len) == 0
+                    df_puts(@m, c"`DerefMut` for `")
+                    df_impl_type(ib, @m)
+                    df_puts(@m, c"` reaches `")
+                    df_put(@m, fm.return_type_name, fm.return_type_name_len)
+                    df_puts(@m, c"`, but its `Deref` reaches `")
+                    df_put(@m, fd.return_type_name, fd.return_type_name_len)
+                    df_putc(@m, '`')
+                    df_report(s, ib.trait_span.line, ib.trait_span.col, m.data)
+        ib = ib.next

@@ -1006,10 +1006,6 @@ class TypeChecker:
 
         struct_info = self.structs.get(inner_type.name)
         if struct_info is None:
-            # Check for Box<T> implicit deref
-            if inner_type.name.startswith('Box$') or inner_type.name.startswith('Box_'):
-                # Try to get inner type from Box
-                pass
             self._error(f"type {inner_type.name} has no fields", expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
 

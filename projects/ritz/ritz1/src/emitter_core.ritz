@@ -18,6 +18,7 @@ import index_through # index_through (AGAST #2440)
 import tokens_gen
 import ownership     # own_before_ret (AGAST #1625)
 import ref_check     # ref_cast_reads_referent (AGAST #3004)
+import deref_field   # df_step_fn (AGAST #3015)
 
 # =============================================================================
 # Emitter State
@@ -354,9 +355,6 @@ struct EmitterState
     # AGAST #1625: how many `defer`s are registered (OwnState.defer_count),
     # so emit_str can tell cheaply whether a `ret` must run them first.
     defer_live: i32
-    # AGAST #3006: 1 while a member is read as a value or walked by a `for`,
-    # so emit_member_ptr reads `b.f` through a `Box<T>` (box_inner_struct).
-    box_read: i32
 
 # AGAST #2242 — a path a binding's value can be moved out along: a move-only
 # field of it, or of a field of it that can itself be partly moved.  A path's
@@ -1487,6 +1485,10 @@ fn note_method_callee(s: *EmitterState, e: *Expr, fd: *FnDef)
 fn find_call_fn(s: *EmitterState, e: *Expr) -> *FnDef
     if e.func_name_len == 0
         return call_callee_sig(s, e)   # AGAST #1747
+    # AGAST #3015: a `deref` / `deref_mut` call made for `.` through Deref.
+    let step: *FnDef = df_step_fn(e)
+    if step != null
+        return step
     if e.call_type_suffix_len <= 0
         return find_fn(s, e.func_name, e.func_name_len)
     let n: i32 = e.func_name_len + e.call_type_suffix_len
@@ -3513,7 +3515,11 @@ fn call_result_pointee_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_le
 # known, or returns anything but a pointer to a struct.
 fn call_result_ptr_struct(s: *EmitterState, e: *Expr) -> *StructDef
     let fd: *FnDef = call_callee_def(s, e)
-    if fd == null or fd.return_type != TYPE_PTR or fd.return_type_name_len <= 0
+    if fd == null or fd.return_type_name_len <= 0
+        return null
+    # AGAST #3015: an `@S` / `@&S` result is S's address too (`deref`'s, whose
+    # reference is the receiver of a method reached through `Deref`).
+    if fd.return_type != TYPE_PTR and fd.return_type != TYPE_REF and fd.return_type != TYPE_MUT_REF
         return null
     if fd.ret_ptr_array != null
         return null
@@ -3639,40 +3645,16 @@ fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
         return null
     member_field_of(s, find_struct(s, sname, sname_len), e)
 
-# The field of `st` the member `e` names, or of what `st` boxes; null when `st`
-# is null or has no such field.
+# The field of `st` the member `e` names; null when `st` is null or has no such
+# field.  A field reached through `Deref` was rewritten to `(*S_deref(@s)).f`
+# before this is asked (deref_field.ritz, AGAST #3015).
 fn member_field_of(s: *EmitterState, st: *StructDef, e: *Expr) -> *StructField
     if st == null
         return null
     let fidx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
     if fidx < 0
-        return box_inner_field(s, st, e)
+        return null
     return get_field_type(st, fidx)
-
-# AGAST #3006: `b.f`'s field, for `b` a `Box<T>` and `f` T's, not the Box's own
-# (which the caller found first): ritz0 reads it through `b.ptr`.  Type-only;
-# emit_member_ptr reads it only as a value (EmitterState.box_read).
-fn box_inner_field(s: *EmitterState, st: *StructDef, e: *Expr) -> *StructField
-    let ist: *StructDef = box_inner_def(s, st)
-    if ist == null
-        return null
-    let fi: i32 = find_field_index(ist, e.ident_ptr, e.ident_len)
-    if fi < 0
-        return null
-    get_field_type(ist, fi)
-
-# AGAST #3006: the T a `Box<T>` struct `st` (`Box$T`) points at, or null for
-# any other struct.
-fn box_inner_def(s: *EmitterState, st: *StructDef) -> *StructDef
-    if st == null or st.name_len <= 4 or name_eq(st.name, 4, c"Box$", 4) == 0
-        return null
-    let pi: i32 = find_field_index(st, c"ptr", 3)
-    if pi < 0
-        return null
-    let pf: *StructField = get_field_type(st, pi)
-    if pf.field_type != TYPE_PTR or pf.field_type_name_len <= 0
-        return null
-    find_struct(s, pf.field_type_name, pf.field_type_name_len)
 
 # AGAST #2152: the struct an index expression `ie` yields an element of, for
 # a `.field` on it, or null/0.  Type-only; mirrors emit_member_ptr's
@@ -3784,6 +3766,14 @@ fn deref_member_base_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, ou
         if f != null and f.field_type == TYPE_PTR and f.field_type_name_len > 0
             *out_name = f.field_type_name
             *out_len = f.field_type_name_len
+        return
+    # AGAST #3015: `(*S_deref(@b)).f`, a field reached through `Deref` (R17),
+    # and any call returning `*S`, `@S` or `@&S`.
+    if op.kind == EXPR_CALL or op.kind == EXPR_METHOD
+        let cst: *StructDef = call_result_ptr_struct(s, op)
+        if cst != null
+            *out_name = cst.name
+            *out_len = cst.name_len
 
 
 

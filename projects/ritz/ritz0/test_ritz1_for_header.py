@@ -562,7 +562,10 @@ PUSHES = {
                                 + MAIN + _GH_FILL + _body(_TRIPS_AT.format(it="mkp().v", place="gh.v"))),
     "deref_of_a_call": (GVEC + "var g: Vec<i32>\n\nfn mkp() -> *Vec<i32>\n    return @g\n\n" + MAIN
                         + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="*mkp()", place="g"))),
-    "field_behind_a_box": (GVEC + "struct Box<T>\n    ptr: *T\n\n" + VH + MAIN + FILL_H
+    # LARB R17 (#3015): `b.v` reaches through the Box by its `Deref`.
+    "field_behind_a_box": (GVEC + "struct Box<T>\n    ptr: *T\n\n"
+                           "impl<T> Deref for Box<T>\n    fn deref(self: @Box<T>) -> @T\n"
+                           "        @*self.ptr\n\n" + VH + MAIN + FILL_H
                            + "    var b: Box<VH>\n    b.ptr = @h\n"
                            + _body(_TRIPS.format(it="b.v", place="h.v"))),
 }

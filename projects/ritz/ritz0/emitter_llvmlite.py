@@ -14,10 +14,11 @@ from dataclasses import dataclass, field, replace
 from typing import ClassVar, Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
-from monomorph import mangle_type_name, resolve_alias_in
+from monomorph import mangle_generic_name, mangle_type_name, resolve_alias_in
 from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 import index_rules
+import deref_rules
 import bool_rules
 import float_rules
 import binder_names
@@ -627,6 +628,7 @@ class LLVMEmitter:
         # How the `m[k]` an address is being taken of is used (§7.8): "read" for
         # `@`, else a mutable use's spelling. None outside one.
         self._index_use: Optional[str] = None
+        self._deref_use_now: Optional[str] = None   # §7.7's use of a place (#3015)
         self._assert_val_fn: Optional[ir.Function] = None
         self._assert_site_gvars = None
         self._assert_file_consts: Dict[str, ir.Value] = {}
@@ -1548,10 +1550,18 @@ class LLVMEmitter:
                 # Look up field type in struct definition
                 if isinstance(base_type, rast.NamedType):
                     struct_name = base_type.name
+                    if base_type.args and struct_name not in self.struct_fields:
+                        struct_name = mangle_generic_name(base_type.name, base_type.args)
                     if struct_name in self.struct_fields:
                         for fname, ftype in self.struct_fields[struct_name]:
                             if fname == expr.field:
                                 return ftype
+                        # Not S's own: T's, through `Deref` (§7.7, #3015).
+                        target = self._deref_target(struct_name)
+                        if isinstance(target, rast.NamedType) and target.name in self.struct_fields:
+                            for fname, ftype in self.struct_fields[target.name]:
+                                if fname == expr.field:
+                                    return ftype
             return None
         elif isinstance(expr, rast.Index):
             through = self._index_through(expr)
@@ -3688,16 +3698,6 @@ class LLVMEmitter:
                     return field_type
 
         return None
-
-    def _is_box_type(self, struct_name: str) -> bool:
-        """Check if a struct is a monomorphized Box<T> type (e.g., Box$Point)."""
-        return struct_name.startswith('Box$')
-
-    def _get_box_inner_type_name(self, box_struct_name: str) -> Optional[str]:
-        """Get the inner type name from a Box struct (e.g., Box$Point -> Point)."""
-        if not self._is_box_type(box_struct_name):
-            return None
-        return box_struct_name[4:]  # Strip 'Box$' prefix
 
     def _find_method_fallback(self, type_name: str, method_name: str) -> Optional[str]:
         """The standalone function acting as `method_name` on `type_name`."""
@@ -6220,6 +6220,9 @@ class LLVMEmitter:
             # `m[k] = v` / `m[k] op= x` on a struct (§7.8, AGAST #1635).
             if isinstance(stmt.target, rast.Index) and self._emit_struct_index_assign(stmt):
                 return None
+            # A store at or inside a field reached through `DerefMut` (§7.7).
+            if self._emit_deref_assign(stmt):
+                return None
             # `m[k].f = x` needs `IndexMut`: refuse it with the use spelled out.
             root = stmt.target
             while isinstance(root, rast.Field):
@@ -8555,6 +8558,205 @@ class LLVMEmitter:
         self.builder.store(self._convert_type(val, ptr.type.pointee, value), ptr)
         return True
 
+    # -- `.` through `Deref` / `DerefMut` (LANGUAGE_SPEC §7.7, LARB R17, #3015) --
+    #
+    # `s.f` is S's own field first. Otherwise, when S implements `Deref`, it's
+    # T's field through the trait: `(*S_deref(@s)).f` for a shared use and
+    # `(*S_deref_mut(@&s)).f` for a mutable one, a place in every position.
+    # One step only. `use` says which: "read" (a read, `@`, a `self: @T` call),
+    # "assign" (a store at or inside `s.f`), "compound" (`s.f op= v`),
+    # "addr_mut" (`@&s.f`, a `:&` argument) or "method:<m>" (a mutating call).
+
+    def _deref_traits(self, type_name: str) -> Set[str]:
+        """Which of `Deref` and `DerefMut` `type_name` implements."""
+        return {trait for trait, ty in self.impls
+                if ty == type_name and trait in deref_rules.TRAITS}
+
+    def _deref_target(self, type_name: str, trait: str = 'Deref') -> Optional[rast.Type]:
+        """The T `impl Deref for S` (or `DerefMut`) reaches: its method's `@T`."""
+        method = 'deref' if trait == 'Deref' else 'deref_mut'
+        for m in self.impls.get((trait, type_name), []):
+            if m.name == method and isinstance(m.ret_type, (rast.RefType, rast.PtrType)):
+                return resolve_alias_in(m.ret_type.inner, self.type_aliases)
+        return None
+
+    def _show_type(self, ty) -> str:
+        """`ty` (a type, or a monomorphised name) as the source spells it."""
+        if isinstance(ty, rast.Type) and not isinstance(ty, rast.NamedType):
+            return type_to_string(ty)
+        if isinstance(ty, rast.NamedType) and ty.args:
+            return f"{ty.name}<{', '.join(self._show_type(a) for a in ty.args)}>"
+        name = ty.name if isinstance(ty, rast.NamedType) else ty
+
+        arities = getattr(self, '_generic_arity', {})
+        return deref_rules.display(name, lambda head: arities.get(head, 0))
+
+    @staticmethod
+    def _spelled(expr: rast.Expr) -> str:
+        """`expr` as written, when it's a name or a chain of fields of one."""
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        if isinstance(expr, rast.Ident):
+            return expr.name
+        if isinstance(expr, rast.Field):
+            return f"{LLVMEmitter._spelled(expr.expr)}.{expr.field}"
+        return "s"
+
+    def _deref_base(self, expr: rast.Field) -> Optional[tuple]:
+        """`(S, base, through)` when `expr` is `s.f`, s is a struct S (or a
+        pointer or reference to one, which §7.7 sees through first) and S has
+        no own field `f`; else None. `through` is True when `base` is that
+        pointer or reference: it's the receiver itself."""
+        base = expr.expr
+        while isinstance(base, rast.Grouped):
+            base = base.expr
+        if expr.field.isdigit():
+            return None
+        ty = self._infer_ritz_type(base)
+        if ty is None:
+            return None
+        ty = resolve_alias_in(ty, self.type_aliases)
+        through = isinstance(ty, (rast.PtrType, rast.RefType))
+        if through:
+            ty = resolve_alias_in(ty.inner, self.type_aliases)
+        if not isinstance(ty, rast.NamedType):
+            return None
+        # A global keeps its type as written: `Wrap<H>` is `Wrap$H` (#3016).
+        name = mangle_generic_name(ty.name, ty.args) if ty.args else ty.name
+        if name not in self.struct_fields or self._struct_has_field(name, expr.field):
+            return None
+        return name, base, through
+
+    def _deref_hint(self, expr: rast.Field, name: str) -> Optional[str]:
+        """`w.ptr.k` when S has a `*T` field whose T has `k` (rule 5(a)'s hint:
+        chosen by the struct's shape, not its name)."""
+        for fname, ftype in self.struct_fields.get(name, []):
+            ftype = resolve_alias_in(ftype, self.type_aliases)
+            if isinstance(ftype, rast.PtrType):
+                inner = resolve_alias_in(ftype.inner, self.type_aliases)
+                if isinstance(inner, rast.NamedType) and self._struct_has_field(inner.name, expr.field):
+                    return f"{self._spelled(expr.expr)}.{fname}.{expr.field}"
+        return None
+
+    def _deref_use_spelling(self, expr: rast.Field, use: str) -> str:
+        place = f"{self._spelled(expr.expr)}.{expr.field}"
+        if use == "compound":
+            return f"{place} op= …"
+        if use == "addr_mut":
+            return f"@&{place}"
+        if use.startswith("method:"):
+            return f"{place}.{use[len('method:'):]}()"
+        return f"{place} = …"
+
+    def _deref_member_target(self, name: str, member: str, where, is_method: bool):
+        """T, for a member `member` S lacks: rule 5(a) or 5(b) when T (or a
+        struct without `Deref`) has none either."""
+        traits = self._deref_traits(name)
+        target = self._deref_target(name) if 'Deref' in traits else None
+        if target is None:
+            return None, traits
+        if isinstance(target, rast.NamedType):
+            if is_method and (target.name, member) in self.method_lookup:
+                return target, traits
+            if not is_method and self._struct_has_field(target.name, member):
+                return target, traits
+        if is_method:
+            return None, traits
+        raise EmitError(deref_rules.neither_has(self._show_type(name), self._show_type(target),
+                                                member), where)
+
+    def _deref_field(self, expr: rast.Field, use: str = "read") -> Optional[rast.Field]:
+        """`s.f` through S's `Deref` / `DerefMut`, as the place it means; None
+        when `f` is S's own (or s isn't a struct). The located errors of rule 5
+        when neither S nor what it derefs to has `f`."""
+        info = self._deref_base(expr)
+        if info is None:
+            return None
+        name, base, through = info
+        where = expr.name_span or expr.span
+        target, traits = self._deref_member_target(name, expr.field, where, False)
+        if target is None:
+            raise EmitError(deref_rules.no_field(self._show_type(name), expr.field,
+                                                 self._deref_hint(expr, name)), where)
+        return self._through_deref(expr, name, base, through, traits, use, where)
+
+    def _through_deref(self, expr, name, base, through, traits, use, where):
+        """`(*S_deref(@s))` or `(*S_deref_mut(@&s))` for `use`, as `expr`'s new
+        base: a Field of it for a Field, the receiver for a MethodCall."""
+        mutable = use != "read"
+        if mutable and 'DerefMut' not in traits:
+            raise EmitError(deref_rules.needs_deref_mut(
+                self._deref_use_spelling(expr if isinstance(expr, rast.Field)
+                                         else rast.Field(expr.span, expr.expr, expr.method), use),
+                self._show_type(name)), where)
+        method = 'deref_mut' if mutable else 'deref'
+        span = expr.span
+        recv = base if through else rast.UnaryOp(span, '@&' if mutable else '@', base)
+        call = rast.Call(span, rast.Ident(span, f"{name}_{method}"), [recv])
+        inner = rast.UnaryOp(span, '*', call)
+        if isinstance(expr, rast.Field):
+            return rast.Field(span, inner, expr.field, expr.name_span)
+        return inner
+
+    def _has_deref_step(self, place: rast.Expr) -> bool:
+        """Does `place` (fields and indexes) take a step through `Deref`, or
+        name a field neither a struct nor its target has (rule 5)?"""
+        while True:
+            if isinstance(place, rast.Grouped):
+                place = place.expr
+            elif isinstance(place, rast.Field):
+                if self._deref_base(place) is not None:
+                    return True
+                place = place.expr
+            elif isinstance(place, rast.Index):
+                place = place.expr
+            else:
+                return False
+
+    def _emit_deref_assign(self, stmt) -> bool:
+        """`s.f = v`, `s.f[i] = v`, `s.f.g = v` and their `op=` through
+        `deref_mut` (§7.7). False when the target takes no step through `Deref`.
+
+        The parser spells `x op= v` as `x = x op v` and records `op`; the read
+        shares the store's place, so `deref_mut` runs once (AGAST #2529)."""
+        target = stmt.target
+        if not isinstance(target, (rast.Field, rast.Index)) or not self._has_deref_step(target):
+            return False
+        value = stmt.value
+        compound = stmt.op is not None and isinstance(value, rast.BinOp)
+
+        def place():
+            outer = self._deref_use_now
+            self._deref_use_now = "compound" if compound else "assign"
+            try:
+                return self._emit_lvalue_addr(target)
+            finally:
+                self._deref_use_now = outer
+
+        if compound:
+            ptr = place()
+            outer = self._evaluated_once
+            self._evaluated_once = dict(outer)
+            try:
+                self._evaluated_once[id(value.left)] = self.builder.load(ptr)
+                val = self._emit_expr(value)
+            finally:
+                self._evaluated_once = outer
+        else:
+            self._literal_into_slot(self._infer_ritz_type(target), value)
+            val = self._emit_into_array_slot(value, self._assign_slot(stmt))
+            ptr = place()
+        self.builder.store(self._convert_type(val, ptr.type.pointee, value), ptr)
+        return True
+
+    def _deref_use(self, rvalue_root: bool = False) -> str:
+        """The use of a place `_emit_lvalue_addr` is asked for (see above)."""
+        # A `for` walks its place: a read (`for x in s.f`).
+        if (rvalue_root or self._reading_place or self._index_use == "read"
+                or self._deref_use_now == "read"):
+            return "read"
+        return self._deref_use_now or "assign"
+
     def _index_through(self, expr: rast.Index) -> Optional[rast.UnaryOp]:
         """`p[i]` as the place it means, when `p` sees through to a buffer: `p` a
         `*T`, `@T` or `@&T` and T a Vec, Span or String (AGAST #2440, LARB R9).
@@ -9742,6 +9944,10 @@ class LLVMEmitter:
                 return self.builder.gep(base, [index])
             raise ValueError(f"Cannot index type: {base.type}")
         elif isinstance(expr, rast.Field):
+            # A field S doesn't have, through S's `Deref` / `DerefMut` (§7.7).
+            derefed = self._deref_field(expr, self._deref_use(rvalue_root))
+            if derefed is not None:
+                return self._emit_lvalue_addr(derefed, rvalue_root)
             # struct.field -> GEP to field. An `@T` param is the struct's
             # address: it has no slot, and doesn't need one (a loop would
             # repeat it).
@@ -9797,8 +10003,9 @@ class LLVMEmitter:
         *TokenDefs).
 
         A place a `for` reads goes as far as a read does in _emit_field_access:
-        a level further, a tuple behind a pointer, and through a Box. A store
-        or `@` doesn't: how far those go is #2398's question.
+        a level further, and a tuple behind a pointer. A store or `@` doesn't:
+        how far those go is #2398's question. A field through `Deref` is
+        rewritten before it gets here (_deref_field).
         """
         given = ptr
         for _ in range(loads + self._reading_place):
@@ -9814,12 +10021,6 @@ class LLVMEmitter:
                        if isinstance(pointee, ir.BaseStructType) else None)
         if not struct_name:
             raise ValueError(f"Cannot access field on type: {ptr.type}")
-        if (self._reading_place and self._is_box_type(struct_name)
-                and not self._struct_has_field(struct_name, field)):
-            inner = self._get_box_inner_type_name(struct_name)
-            if inner and self._struct_has_field(inner, field):
-                ptr = self.builder.load(self.builder.gep(ptr, [zero, zero]))
-                struct_name = inner
         idx = self._get_struct_field_index(struct_name, field)
         return self.builder.gep(ptr, [zero, ir.Constant(self.i32, idx)])
 
@@ -10598,11 +10799,14 @@ class LLVMEmitter:
                 # `@m[k]` reads a struct through `index`, `@&m[k]` through
                 # `index_mut` (§7.8); a `.f` on it is the same use.
                 outer = self._index_use
+                outer_deref = self._deref_use_now
                 self._index_use = "read" if expr.op in ('&', '@') else "@&m[k]"
+                self._deref_use_now = None if expr.op in ('&', '@') else "addr_mut"
                 try:
                     return self._emit_lvalue_addr(expr.operand)
                 finally:
                     self._index_use = outer
+                    self._deref_use_now = outer_deref
             if isinstance(expr.operand, rast.Ident):
                 name = expr.operand.name
                 if name in self.locals:
@@ -10975,6 +11179,11 @@ class LLVMEmitter:
                 return self.builder.extract_value(struct_val, index)
             raise ValueError(f"Cannot access tuple field {index} on type: {struct_val.type}")
 
+        # A field S doesn't have, read through S's `Deref` (§7.7, #3015).
+        derefed = self._deref_field(expr, "read")
+        if derefed is not None:
+            return self._emit_expr(derefed)
+
         # Optimization: if the inner expression is a local variable, use GEP directly
         # instead of loading the entire struct then extracting a field.
         local_alloca = self._get_local_alloca(expr.expr)
@@ -10983,16 +11192,6 @@ class LLVMEmitter:
             if isinstance(pointee_type, ir.BaseStructType):
                 struct_name = self._get_struct_name_from_type(pointee_type)
                 if struct_name:
-                    # Check for Box implicit deref
-                    if self._is_box_type(struct_name) and not self._struct_has_field(struct_name, expr.field):
-                        inner_type_name = self._get_box_inner_type_name(struct_name)
-                        if inner_type_name and self._struct_has_field(inner_type_name, expr.field):
-                            ptr_field_ptr = self.builder.gep(local_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-                            inner_ptr = self.builder.load(ptr_field_ptr)
-                            idx = self._get_struct_field_index(inner_type_name, expr.field)
-                            field_ptr = self.builder.gep(inner_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                            return self.builder.load(field_ptr)
-
                     idx = self._get_struct_field_index(struct_name, expr.field)
                     field_ptr = self.builder.gep(local_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
                     return self.builder.load(field_ptr)
@@ -11013,18 +11212,6 @@ class LLVMEmitter:
                 # This is a pointer to a struct type - we need to GEP to the field, then load
                 struct_name = self._get_struct_name_from_type(pointee_type)
                 if struct_name:
-                    # Check for Box implicit deref: if field not on Box, deref through ptr
-                    if self._is_box_type(struct_name) and not self._struct_has_field(struct_name, expr.field):
-                        inner_type_name = self._get_box_inner_type_name(struct_name)
-                        if inner_type_name and self._struct_has_field(inner_type_name, expr.field):
-                            # Load the ptr field (index 0 in Box), then access field on pointee
-                            ptr_field_ptr = self.builder.gep(struct_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-                            inner_ptr = self.builder.load(ptr_field_ptr)
-                            # Now access the field on the inner struct
-                            idx = self._get_struct_field_index(inner_type_name, expr.field)
-                            field_ptr = self.builder.gep(inner_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                            return self.builder.load(field_ptr)
-
                     idx = self._get_struct_field_index(struct_name, expr.field)
                     # GEP to field
                     field_ptr = self.builder.gep(struct_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
@@ -11069,17 +11256,6 @@ class LLVMEmitter:
             # Value of struct type: extract the field
             struct_name = self._get_struct_name_from_type(struct_val.type)
             if struct_name:
-                # Check for Box implicit deref: if field not on Box, deref through ptr
-                if self._is_box_type(struct_name) and not self._struct_has_field(struct_name, expr.field):
-                    inner_type_name = self._get_box_inner_type_name(struct_name)
-                    if inner_type_name and self._struct_has_field(inner_type_name, expr.field):
-                        # Extract the ptr field (index 0 in Box)
-                        inner_ptr = self.builder.extract_value(struct_val, 0)
-                        # Now access the field on the inner struct via the pointer
-                        idx = self._get_struct_field_index(inner_type_name, expr.field)
-                        field_ptr = self.builder.gep(inner_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                        return self.builder.load(field_ptr)
-
                 idx = self._get_struct_field_index(struct_name, expr.field)
                 return self.builder.extract_value(struct_val, idx)
             else:
@@ -12603,12 +12779,82 @@ class LLVMEmitter:
         probe. What this call evaluated stays recorded until it has been
         emitted, so `_emit_expr` hands all of them the same value.
         """
+        expr = self._deref_method_call(expr)
         outer = self._evaluated_once
+        outer_use = self._deref_use_now
         self._evaluated_once = dict(outer)
+        # A receiver reached through `Deref` (`b.q.m()`): a `self: @&T` method
+        # needs `deref_mut`, any other `deref` (§7.7).
+        if isinstance(expr.expr, (rast.Field, rast.Index)) and self._has_deref_step(expr.expr):
+            fn = self._receiver_method_def(expr)
+            self._deref_use_now = (f"method:{expr.method}" if fn is not None
+                                   and self._mutates_self(fn) else "read")
         try:
             return self._dispatch_method_call(expr)
         finally:
             self._evaluated_once = outer
+            self._deref_use_now = outer_use
+
+    def _method_def(self, type_name: str, method: str) -> Optional[rast.FnDef]:
+        """`type_name`'s method `method`, from its impls."""
+        for (_, ty), methods in self.impls.items():
+            if ty == type_name:
+                for m in methods:
+                    if m.name == method:
+                        return m
+        return None
+
+    @staticmethod
+    def _mutates_self(fn: rast.FnDef) -> bool:
+        """Does `fn` take `self: @&T` or `self:& T`?"""
+        if not fn.params:
+            return False
+        p = fn.params[0]
+        if isinstance(p.type, rast.RefType):
+            return p.type.mutable
+        return p.borrow == rast.Borrow.MUTABLE
+
+    def _receiver_struct(self, recv: rast.Expr) -> Optional[str]:
+        """The struct `recv` is, or points at (§7.7), by its mangled name."""
+        ty = self._infer_ritz_type(recv)
+        if ty is None:
+            return None
+        ty = resolve_alias_in(ty, self.type_aliases)
+        if isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = resolve_alias_in(ty.inner, self.type_aliases)
+        if not isinstance(ty, rast.NamedType):
+            return None
+        name = mangle_generic_name(ty.name, ty.args) if ty.args else ty.name
+        return name if name in self.struct_fields else None
+
+    def _receiver_method_def(self, expr: rast.MethodCall) -> Optional[rast.FnDef]:
+        name = self._receiver_struct(expr.expr)
+        return self._method_def(name, expr.method) if name else None
+
+    def _deref_method_call(self, expr: rast.MethodCall) -> rast.MethodCall:
+        """`s.m()` with `m` not S's but its `Deref` target's (§7.7 rule 2): the
+        call on `*S_deref(@s)`, or `*S_deref_mut(@&s)` for a `self: @&T` method."""
+        base = expr.expr
+        while isinstance(base, rast.Grouped):
+            base = base.expr
+        name = self._receiver_struct(base)
+        if name is None or (name, expr.method) in self.method_lookup \
+                or self._find_method_fallback(name, expr.method):
+            return expr
+        traits = self._deref_traits(name)
+        target = self._deref_target(name) if 'Deref' in traits else None
+        if not isinstance(target, rast.NamedType):
+            return expr
+        fn = self._method_def(target.name, expr.method)
+        if fn is None:
+            return expr
+        ty = resolve_alias_in(self._infer_ritz_type(base), self.type_aliases)
+        through = isinstance(ty, (rast.PtrType, rast.RefType))
+        use = f"method:{expr.method}" if self._mutates_self(fn) else "read"
+        where = expr.name_span or expr.span
+        inner = self._through_deref(expr, name, base, through, traits, use, where)
+        # The reference itself is the receiver: `self` is the T it refers to.
+        return rast.MethodCall(expr.span, inner.operand, expr.method, expr.args, expr.name_span)
 
     def _evaluate_once(self, expr: rast.Expr) -> None:
         """Evaluate `expr` now; `_emit_expr` returns this value from here on."""
@@ -16181,6 +16427,12 @@ def emit(module: rast.Module, no_runtime: bool = False,
     from monomorph import monomorphize, GenericInferError
     generic_fn_names = {item.name for item in module.items
                         if isinstance(item, rast.FnDef) and item.is_generic()}
+    # §7.7 rule 1: a `DerefMut` needs a `Deref` reaching the same T.
+    for message, where in deref_rules.impl_errors(module.items):
+        raise EmitError(message, where)
+    # And each generic struct's arity: an error spells `Wrap$H` as `Wrap<H>` (§7.7).
+    generic_arity = {item.name: len(item.type_params) for item in module.items
+                     if isinstance(item, rast.StructDef) and item.type_params}
     try:
         module = monomorphize(module)
     except GenericInferError as e:
@@ -16196,6 +16448,7 @@ def emit(module: rast.Module, no_runtime: bool = False,
 
     emitter = LLVMEmitter(source_file=source_file, source_dir=source_dir, target=target,
                           target_os=target_os)
+    emitter._generic_arity = generic_arity
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
     emitter.generic_fn_names = generic_fn_names

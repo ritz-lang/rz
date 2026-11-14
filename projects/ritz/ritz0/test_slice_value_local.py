@@ -34,6 +34,7 @@ import fast_link
 
 import test_ritz1_for_header as for_header
 from test_index_through_reference import HEADER, _refused
+from deref_rules import no_field
 
 compile_with = for_header.compile_with
 
@@ -157,7 +158,7 @@ def test_the_len_field_of_a_string_slice_is_refused(compile_with, rng, compiler)
     spelled, _, _ = RANGES[rng]
     program = _main(setup, spelled, "    return t.len as i32\n")
     _refused(compile_with, compiler, "string_len", program,
-             "Unknown field 'len' in struct 'String'")
+             no_field("String", "len"))  # §7.7 rule 5(a)
 
 
 # `t[0] = 7` lands in t; in v too for a Span, a view, and not for a Vec or a String,

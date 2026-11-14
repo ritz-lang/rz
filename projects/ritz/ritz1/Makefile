@@ -38,6 +38,7 @@ SOURCES = \
 	narrowing \
 	let_check \
 	ref_check \
+	deref_field \
 	ownership \
 	emitter_expr_arith \
 	emitter_expr_access \

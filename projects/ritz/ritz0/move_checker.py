@@ -180,7 +180,10 @@ class MoveTypes:
         self.structs: Dict[str, rast.StructDef] = {}
         self.enums: Dict[str, rast.EnumDef] = {}
         self.aliases: Dict[str, rast.Type] = {}
+        self.derefs: Dict[str, rast.ImplBlock] = {}   # `impl Deref for S` (§7.7)
         for item in module.items:
+            if isinstance(item, rast.ImplBlock) and item.trait_name == 'Deref':
+                self.derefs[item.type_name] = item
             if isinstance(item, rast.ImplBlock) and item.trait_name == 'Drop':
                 self.drop_types.add(item.type_name)
             elif isinstance(item, rast.StructDef):
@@ -251,6 +254,19 @@ class MoveTypes:
         if ed is None or ed.type_params or not any(v.name == name for v in ed.variants):
             return None
         return rast.NamedType(expr.span, ed.name, [])
+
+    def deref_target(self, ty: rast.NamedType) -> Optional[rast.Type]:
+        """The T `impl Deref for S` reaches (its `deref`'s `@T`), at `ty`'s
+        type arguments; None when S doesn't implement `Deref` (§7.7)."""
+        impl = self.derefs.get(ty.name)
+        if impl is None:
+            return None
+        for m in impl.methods:
+            if m.name == 'deref' and isinstance(m.ret_type, (rast.RefType, rast.PtrType)):
+                params = [a.name for a in impl.impl_type.args
+                          if isinstance(a, rast.NamedType)] if impl.impl_type else []
+                return _subst(m.ret_type.inner, dict(zip(params, ty.args)))
+        return None
 
     def struct_fields(self, ty: rast.NamedType) -> List[Tuple[str, rast.Type]]:
         """The struct's fields with its type parameters replaced by `ty`'s args."""
@@ -601,15 +617,17 @@ class MoveChecker:
 
     Place = Tuple[str, Tuple[str, ...]]
 
-    @staticmethod
-    def _steps(place: rast.Expr):
-        """`place`'s root expression and its steps, root first."""
+    def _steps(self, place: rast.Expr):
+        """`place`'s root expression and its steps, root first. A field reached
+        through `Deref` takes a `*` step first (§7.7, R17 rule 6)."""
         steps: List[str] = []
         while True:
             if isinstance(place, rast.Grouped):
                 place = place.expr
             elif isinstance(place, rast.Field):
                 steps.append(place.field)
+                if self._through_deref(place):
+                    steps.append('*')
                 place = place.expr
             elif isinstance(place, rast.Index):
                 steps.append('[]')
@@ -670,12 +688,26 @@ class MoveChecker:
 
     @staticmethod
     def _overlap(a: Tuple[str, ...], b: Tuple[str, ...]) -> bool:
-        """Is one path a prefix of the other?"""
-        return all(x == y for x, y in zip(a, b))
+        """Is one path a prefix of the other? Two `*` steps (through `Deref`)
+        are equal; a `*` step overlaps any own field, which may re-aim it."""
+        for x, y in zip(a, b):
+            if x != y:
+                return '*' in (x, y)
+        return True
 
     @staticmethod
     def _place_str(name: str, path: Tuple[str, ...]) -> str:
-        return name + ''.join('[_]' if s == '[]' else f'.{s}' for s in path)
+        return name + ''.join('[_]' if s == '[]' else '' if s == '*' else f'.{s}'
+                              for s in path)
+
+    def _through_deref(self, place: rast.Field) -> bool:
+        """Is `place` a field its struct reaches through `Deref` (§7.7)?"""
+        owner = self.types.resolve(self._loan_type(place.expr))
+        if not isinstance(owner, rast.NamedType) or owner.name not in self.types.structs:
+            return False
+        if any(n == place.field for n, _ in self.types.struct_fields(owner)):
+            return False
+        return self.types.deref_target(owner) is not None
 
     def _conflict(self, info: VarInfo, path: Tuple[str, ...],
                   mutable: bool) -> Optional[Loan]:
@@ -1195,6 +1227,13 @@ class MoveChecker:
         elif isinstance(expr, rast.Grouped):
             self._check_expr(expr.expr, is_move_context=is_move_context)
 
+        elif isinstance(expr, rast.Field) and is_move_context and self._through_deref(expr) \
+                and self.types.is_move_only(self._part_type(
+                    self.types.resolve(self._loan_type(expr.expr)), expr.field)):
+            # `deref` lends the T: its move-only field can't be taken (§7.7).
+            self._check_expr(expr.expr, is_move_context=False)
+            self._reject_move_out(expr.span)
+
         elif isinstance(expr, rast.Field) and self._field_owner(expr) is not None:
             self._check_owned_field(expr, self._field_owner(expr), is_move_context)
 
@@ -1466,6 +1505,8 @@ class MoveChecker:
         while True:
             if isinstance(expr, rast.Grouped):
                 expr = expr.expr
+            elif isinstance(expr, rast.Field) and self._through_deref(expr):
+                return True     # `deref` lends it (§7.7)
             elif isinstance(expr, (rast.Field, rast.Index)):
                 expr = expr.expr
             elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
@@ -1512,7 +1553,13 @@ class MoveChecker:
             index = int(part) if part.isdigit() else len(owner.elements)
             return owner.elements[index] if index < len(owner.elements) else None
         if isinstance(owner, rast.NamedType):
-            return next((t for n, t in self.types.struct_fields(owner) if n == part), None)
+            own = next((t for n, t in self.types.struct_fields(owner) if n == part), None)
+            if own is not None or owner.name not in self.types.structs:
+                return own
+            # Not S's own: T's, through `Deref` (§7.7).
+            target = self.types.resolve(self.types.deref_target(owner))
+            if isinstance(target, rast.NamedType):
+                return next((t for n, t in self.types.struct_fields(target) if n == part), None)
         return None
 
     def _check_ref_cast(self, cast: rast.Cast) -> None:

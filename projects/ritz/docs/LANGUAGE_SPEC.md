@@ -1900,6 +1900,133 @@ fn main() -> i32
     p.x + p.get_x()
 ```
 
+`.` on a pointer or reference to a struct reaches the struct, as above. It reaches
+through a struct itself only when the struct opts in (LARB R17), through two
+compiler-known traits, resolved statically like `Drop` and `Index` (§7.8):
+
+```text
+impl Deref for S                    fn deref(self: @S) -> @T
+impl DerefMut for S                 fn deref_mut(self: @&S) -> @&T
+```
+
+The impl chooses `T` through its return type. `DerefMut`'s `T` must be `Deref`'s, and
+`DerefMut` without `Deref` is an error at the impl.
+
+For `s.f`, where `s` has struct type `S` (after the auto-deref above):
+
+1. `S`'s own field or method `f`;
+2. otherwise, if `S` implements `Deref`, `T`'s field or method `f`, through the trait;
+3. otherwise, an error at `f`.
+
+This is one step only: on a `Box<Box<H>>`, `b.k` doesn't reach `H`. **The own field
+wins**, and that isn't an error: `b.ptr` on a `Box<T>` is always the Box's own `ptr`,
+even when `T` has one, and `T`'s is `b.ptr.ptr`.
+
+`s.f` reached through the trait is a place, and each use goes through one method:
+
+| Use of `s.f` | Means |
+|---|---|
+| read by value, `s.f.g`, an `s.f[i]` read, `@s.f`, `for x in s.f`, a `self: @T` call | `(*deref(@s)).f` |
+| `s.f = v`, `s.f op= v`, `s.f[i] = v`, `@&s.f`, a `:&` argument, a mutating `self` call | `(*deref_mut(@&s)).f` |
+
+- **A read is a read through a reference.** By value it's a copy, and for a move-only
+  field it's "cannot move out of a reference" (§13.2).
+- **A mutable use needs `s` to be mutable**, as `@&s` does.
+- **`s.f op= v` evaluates `s` once** and calls `deref_mut` once (AGAST #2529).
+- **For §13.5, a step through the trait is a path step `*`.** Two `*` steps on one root
+  are the same step, and the paths are compared on after them, so `@b.a` beside
+  `b.k = 2` is fine and beside `b.a[0] = 2` is refused. A `*` step overlaps every own
+  field of the root, since writing one (`b.ptr = q`) may re-aim it.
+
+`Box<T>` implements both (ritzlib/box.ritz). Here a user wrapper keeps its `T`
+inline:
+
+```ritz
+struct Point
+    x: i32
+    y: i32
+
+impl Point
+    fn bump(self: @&Point)
+        self.x += 1
+
+struct Tagged<T>
+    tag: i32
+    value: T
+
+impl<T> Deref for Tagged<T>
+    fn deref(self: @Tagged<T>) -> @T
+        @self.value
+
+impl<T> DerefMut for Tagged<T>
+    fn deref_mut(self: @&Tagged<T>) -> @&T
+        @&self.value
+
+fn main() -> i32
+    var t: Tagged<Point>
+    t.tag = 7                   # Tagged's own field
+    t.x = 1                     # deref_mut
+    t.y += 2                    # deref_mut, once
+    t.bump()                    # Point's method, through deref_mut
+    let p: @i32 = @t.y          # deref
+    t.x + *p + t.tag - 11       # 2 + 2 + 7 - 11
+```
+
+The errors are located at the field name. A struct with no such field and no `Deref`:
+
+```ritz expect-error="`Wrap<Point>` has no field `x`: it points at one: `w.ptr.x`, or implement `Deref`"
+struct Point
+    x: i32
+
+struct Wrap<T>
+    ptr: *T
+
+fn main() -> i32
+    var p: Point
+    var w: Wrap<Point>
+    w.ptr = @p
+    w.x
+```
+
+A struct with `Deref`, where neither it nor its target has the field:
+
+```ritz expect-error="neither `Tagged<Point>` nor `Point` has a field `z`"
+struct Point
+    x: i32
+
+struct Tagged<T>
+    tag: i32
+    value: T
+
+impl<T> Deref for Tagged<T>
+    fn deref(self: @Tagged<T>) -> @T
+        @self.value
+
+fn main() -> i32
+    var t: Tagged<Point>
+    t.z
+```
+
+A mutable use through a struct with only `Deref`:
+
+```ritz expect-error="`t.x = …` needs `DerefMut`, and `Tagged<Point>` implements only `Deref`"
+struct Point
+    x: i32
+
+struct Tagged<T>
+    tag: i32
+    value: T
+
+impl<T> Deref for Tagged<T>
+    fn deref(self: @Tagged<T>) -> @T
+        @self.value
+
+fn main() -> i32
+    var t: Tagged<Point>
+    t.x = 1
+    0
+```
+
 ### 7.8 Array Indexing
 
 ```ritz body

@@ -20,6 +20,7 @@ import pytest
 from test_index_through_reference import HEADER, KINDS, _refused
 import test_slice_value_local as value_local
 from test_slice_value_local import BOXES, RANGES, WRITES_THROUGH
+from deref_rules import no_field
 
 # AGAST #2806: each test's rows share one compile per compiler (batching.py).
 pytestmark = pytest.mark.batched
@@ -143,7 +144,7 @@ def test_a_slice_of_the_slice(run_with, box, kind, compiler):
 def test_the_len_field_of_a_string_slice_is_refused(compile_with, kind, compiler):
     program = _program("String", kind, "1..3", "    return t.len as i32\n")
     _refused(compile_with, compiler, "string_len", program,
-             "Unknown field 'len' in struct 'String'")
+             no_field("String", "len"))  # §7.7 rule 5(a)
 
 
 # #2440's pin: a Span sliced through a pointer, read through `t[0]`.

@@ -988,9 +988,10 @@ class Parser:
                                 while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
                                     self._advance()
                         self._expect(TokenType.RPAREN)
-                        expr = rast.MethodCall(expr.span, expr, field_tok.value, args)
+                        expr = rast.MethodCall(expr.span, expr, field_tok.value, args,
+                                               field_tok.span)
                     else:
-                        expr = rast.Field(expr.span, expr, field_tok.value)
+                        expr = rast.Field(expr.span, expr, field_tok.value, field_tok.span)
 
             elif self._at(TokenType.STAR) and self._peek(1).type == TokenType.STAR:
                 # Postfix dereference: expr** (followed by . or [ or ()
@@ -2546,7 +2547,8 @@ class Parser:
         # Check for impl<T, U, ...> or impl<T: Bound, U: Bound, ...> type parameters
         type_params, type_param_bounds = self._parse_type_params()
 
-        first_name = self._expect(TokenType.IDENT).value
+        first_tok = self._expect(TokenType.IDENT)
+        first_name = first_tok.value
 
         trait_name = None
         type_name = first_name
@@ -2617,8 +2619,11 @@ class Parser:
         if self._at(TokenType.DEDENT):
             self._advance()
 
-        return rast.ImplBlock(span, trait_name, type_name, methods, type_params, impl_type,
-                              type_param_bounds=type_param_bounds)
+        block = rast.ImplBlock(span, trait_name, type_name, methods, type_params, impl_type,
+                               type_param_bounds=type_param_bounds)
+        if trait_name is not None:
+            block.trait_span = first_tok.span   # §7.7's impl errors are located there
+        return block
 
     def parse_item(self) -> rast.Item:
         """Parse a top-level item."""

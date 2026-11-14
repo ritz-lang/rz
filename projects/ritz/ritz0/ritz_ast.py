@@ -392,17 +392,21 @@ class SliceExpr(Expr):
 
 @dataclass
 class Field(Expr):
-    """Field access: a.b."""
+    """Field access: a.b. `name_span` is where `b` is: the errors for a field
+    neither the struct nor its `Deref` target has are located there (§7.7)."""
     expr: Expr
     field: str
+    name_span: Optional[Span] = None
 
 
 @dataclass
 class MethodCall(Expr):
-    """Method call: a.foo(b) - sugar for Type_foo(a, b)."""
+    """Method call: a.foo(b) - sugar for Type_foo(a, b). `name_span` is where
+    `foo` is (§7.7's errors)."""
     expr: Expr
     method: str
     args: List[Expr]
+    name_span: Optional[Span] = None
 
 
 @dataclass

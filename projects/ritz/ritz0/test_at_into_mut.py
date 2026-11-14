@@ -236,9 +236,9 @@ ALLOWED = {
                               "g(@c)", 1),
 }
 
-# ritz1 can't lower a method on a method's result (#2295).
+# A method on a method's `@C` result: ritz1 lowers it since #3015 (was #2295).
 ALLOWED["receiver_chained"] = ("fn g(r: @C) -> i32\n    r.me().get()\n", "g(@c)", 1)
-ALLOWED_GAPS = {"receiver_chained": 2295}
+ALLOWED_GAPS = {}
 
 # The same, where running would need an allocator: these only have to compile.
 COMPILES = {

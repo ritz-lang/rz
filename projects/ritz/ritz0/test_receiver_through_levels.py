@@ -301,8 +301,8 @@ MOVES = {
 # (`chained_field` ran once #2391 returned a `-> @&T` call result as a `ptr`;
 # `chained_method`, through `mp() -> *C`, once #2883 named a `*S` link's impl;
 # `one_level_returned`, `h(q).set(3)`, once #2946 named a `*S` free call's.)
-RITZ1_GAPS = {f"{level}.chained_store": 2295 for level in LEVELS}
-RITZ1_GAPS |= dict.fromkeys(("field_shared_ptr_read", "field_mut_ptr_store", "global_shared_ptr_read",
+# `chained_store` (#2295) runs since #3015 made an `@S` / `@&S` call result a place.
+RITZ1_GAPS = dict.fromkeys(("field_shared_ptr_read", "field_mut_ptr_store", "global_shared_ptr_read",
                              "returned_shared_ptr_store", "returned_ptr_ptr_read", "returned_ptr_ptr_store",
                              "returned_is_called_once", "shared_to_shared_read", "mut_to_mut_store",
                              "ptr_to_mut_store"), 2399)

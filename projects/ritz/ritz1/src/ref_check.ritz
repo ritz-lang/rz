@@ -38,6 +38,7 @@ import ritzlib.io
 
 import ast
 import ast_helpers
+import deref_field   # df_deref_step_recv (AGAST #3015)
 import emitter_core
 import emitter_expr_call   # method_callee_def
 import let_check           # let_addr_of_own (AGAST #2338)
@@ -873,6 +874,15 @@ fn ref_walk(s: *EmitterState, e: *Expr)
     if k == EXPR_CALL
         if e.func_name_len == 6 and name_eq(e.func_name, e.func_name_len, c"sizeof", 6) == 1
             return
+        # AGAST #3015: `S_deref(@b)` made for `b.f` (R17) is a step of the
+        # place `b.f`, which the borrow it's in is of; it lends nothing itself.
+        if df_is_step(e) == 1
+            let sa: *Expr = e.args
+            if sa != null and sa.kind == EXPR_UNARY and (sa.op == OP_ADDR or sa.op == OP_ADDR_MUT)
+                ref_walk(s, sa.operand)
+            else
+                ref_walk(s, sa)
+            return
         var en: *u8 = null
         var el: i32 = 0
         user_variant_ctor_enum(e, @en, @el)
@@ -1589,6 +1599,12 @@ fn ref_loan_root(s: *EmitterState, e0: *Expr) -> i32
     while e != null
         if e.kind == EXPR_IDENT
             return find_local_idx(s, e.ident_ptr, e.ident_len)
+        # AGAST #3015: a step through `Deref` (R17 rule 6) is a step of its
+        # receiver's place.
+        let through: *Expr = df_deref_step_recv(e)
+        if through != null
+            e = through
+            continue
         if e.kind != EXPR_MEMBER and e.kind != EXPR_INDEX
             return 0 - 1
         var base: RefTy
@@ -1638,17 +1654,27 @@ fn ref_vec_elem(s: *EmitterState, v: *RefTy, out: *RefTy) -> i32
         return 0
     ref_set(out, k, 0, null, 0)
 
-# How many field and index steps place `e` takes below its root.
+# The place one step up from `e`: a field's or index's base, or the receiver of
+# a step `*` through `Deref` (AGAST #3015); null at the root.
+fn ref_place_up(e: *Expr) -> *Expr
+    if e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX
+        return e.left
+    df_deref_step_recv(e)
+
+# How many field, index and `*` steps place `e` takes below its root.
 fn ref_place_depth(e0: *Expr) -> i32
     var n: i32 = 0
     var e: *Expr = e0
-    while e != null and (e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX)
+    while e != null and ref_place_up(e) != null
         n = n + 1
-        e = e.left
+        e = ref_place_up(e)
     n
 
-# Two steps are the same: one field, or any two indexes.
+# Two steps are the same: one field, or any two indexes, or two `*` steps.  A `*`
+# step overlaps any own field of its root, which may re-aim it (R17 rule 6).
 fn ref_step_eq(a: *Expr, b: *Expr) -> i32
+    if df_deref_step_recv(a) != null or df_deref_step_recv(b) != null
+        return 1
     if a.kind != b.kind
         return 0
     if a.kind == EXPR_INDEX
@@ -1663,16 +1689,16 @@ fn ref_places_overlap(a0: *Expr, b0: *Expr) -> i32
     var da: i32 = ref_place_depth(a)
     var db: i32 = ref_place_depth(b)
     while da > db
-        a = a.left
+        a = ref_place_up(a)
         da = da - 1
     while db > da
-        b = b.left
+        b = ref_place_up(b)
         db = db - 1
     while da > 0
         if ref_step_eq(a, b) == 0
             return 0
-        a = a.left
-        b = b.left
+        a = ref_place_up(a)
+        b = ref_place_up(b)
         da = da - 1
     1
 
@@ -1696,6 +1722,11 @@ fn ref_loan_conflict(root: i32, place: *Expr, mutable: i32) -> *RefLoan
 # `c.x`, `vs[_]`: a place as the error names it.
 fn ref_eprint_place(e: *Expr)
     if e == null
+        return
+    # A `*` step through `Deref` isn't spelled: `b.a`, not `(*b).a` (R17).
+    let through: *Expr = df_deref_step_recv(e)
+    if through != null
+        ref_eprint_place(through)
         return
     if e.kind == EXPR_MEMBER
         ref_eprint_place(e.left)

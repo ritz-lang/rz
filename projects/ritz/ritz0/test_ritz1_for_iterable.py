@@ -348,7 +348,11 @@ def _writes_in(sig: str, it: str, call: str, pre: str = _H3, fill: str = _FILL3)
 _POINTER_FN = "fn mkp() -> *H\n    return @gh\n\n"
 _GA = "var ga: [3]i32\n\n"
 _GR = "struct R\n    m: [2][3]i32\n\nvar gr: R\n\nfn mkp() -> *R\n    return @gr\n\n"
-_BOX = "struct Box<T>\n    ptr: *T\n\n"
+# LARB R17 (#3015): `.` reaches through a Box only by its `Deref` / `DerefMut`.
+_BOX = ("struct Box<T>\n    ptr: *T\n\n"
+        "impl<T> Deref for Box<T>\n    fn deref(self: @Box<T>) -> @T\n        @*self.ptr\n\n"
+        "impl<T> DerefMut for Box<T>\n    fn deref_mut(self: @&Box<T>) -> @&T\n"
+        "        @&*self.ptr\n\n")
 
 
 # #2387.  1 + 2 + 50 where the loop walks the array, 1 + 2 + 4 where it walks a
@@ -544,8 +548,6 @@ NO_FURTHER = {
     "store_through_two_levels": (_H3 + "fn f(p: **H) -> i32\n    var t: i32 = 0\n    for v in p.a\n"
                                  "        t = t + v\n    p.a[2] = 50\n    return t\n\n" + MAIN
                                  + "    return 0\n"),
-    "address_through_a_box": (_BOX + _H3 + MAIN + _FILL3 + "    var b: Box<H>\n    b.ptr = @h\n"
-                              "    let q: @[3]i32 = @b.a\n    return 0\n"),
     "address_behind_a_pointer_to_a_tuple": (_TUPLE_PTR + "    let q: @i32 = @p.0\n    return *q\n\n"
                                             + MAIN + "    return 0\n"),
     "address_behind_a_reference_to_a_tuple": ("fn f(p: @(i32, [3]i32)) -> i32\n"
@@ -572,7 +574,18 @@ def test_ritz0_a_tuple_behind_a_pointer_is_live(run_with):
     assert run_with("ritz0", "tuple_pointer", program) == 53
 
 
-# A Box's own field is its own, whatever the inner type has of that name.  `b.ptr`
+# LARB R17 (#3015): `@b.a` through a Box's `Deref` is legal now, and lends the
+# boxed array itself: 4 is h.a[2].
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_address_through_a_box(run_with, compiler):
+    program = (_BOX + _H3 + MAIN + _FILL3 + "    var b: Box<H>\n    b.ptr = @h\n"
+               "    let q: @[3]i32 = @b.a\n    return q[2]\n")
+    assert run_with(compiler, "address_through_a_box", program) == 4
+
+
+# A Box's own field is its own, whatever the inner type has of that name (R17
+# rule 4).  `b.ptr`
 # is the pointer to the header, so the loop walks `s`: 1 + 2.
 @pytest.mark.integration
 def test_ritz0_a_boxs_own_field_comes_first(run_with):
