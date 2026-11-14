@@ -785,6 +785,29 @@ pub fn main() -> i32
     c.x = 9
     return v.c.x
 """,
+    # AGAST #2278: bare `self:&` is the same borrow, and so is a free fn's
+    # `self:& C`, which binds as a `:&` local rather than an impl's `*C`.
+    "by_value_self_bare": BY_VALUE + """
+impl C
+    fn wrap(self:&) -> V
+        return V { c: self }
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: V = c.wrap()
+    c.x = 9
+    return v.c.x
+""",
+    "by_value_self_free": BY_VALUE + """
+fn wrap(self:& C) -> V
+    return V { c: self }
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: V = wrap(@&c)
+    c.x = 9
+    return v.c.x
+""",
     "by_value_method_param": BY_VALUE + """
 impl O
     fn wrap(self: @O, c:& C) -> V
@@ -2492,6 +2515,23 @@ fn mk(t:& Res) -> V
 pub fn main() -> i32
     return 0
 """,
+    # AGAST #2278: a `self:& T` / `self:&` receiver is a borrow too.
+    "self": RES + """
+impl Res
+    fn mk(self:& Res) -> V
+        return V { r: self }
+
+pub fn main() -> i32
+    return 0
+""",
+    "self_bare": RES + """
+impl Res
+    fn mk(self:&) -> V
+        return V { r: self }
+
+pub fn main() -> i32
+    return 0
+""",
     # AGAST #2250: every slot ritz1 now loads a referent for.
     "nested": RES + """
 struct O
@@ -2854,7 +2894,6 @@ for _name in NO_IMPLICIT_DEREF:
 
 # Keyed by program, across STORES, CONTROLS and MOVE_OUT.
 RITZ1_GAPS = {
-    "by_value_self": "AGAST #2278: ritz1 doesn't know a typed `self:& T` is a borrow",
     "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
