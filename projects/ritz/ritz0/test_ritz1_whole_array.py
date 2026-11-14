@@ -1091,13 +1091,10 @@ pub fn main() -> i32
 
 CASES.update(DEREF_THROUGH)
 
-# Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
-# but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
-# value would satisfy the xfail just as a refusal does.
-
-# AGAST #3191: an untyped `let c = *x` of a `*[N]T`.  `*P` on a global read the
-# pointer's own bytes, SILENT, until #2304 refused it with the rest.
-UNTYPED_DEREF_GAPS = {
+# AGAST #3191: an untyped `let c = *x` of a `*[N]T` is the `[N]T` local
+# `let c: [N]T = *x` declares, a copy.  `*P` on a global read the pointer's own
+# bytes, SILENT, until #2304 refused all four; these were strict xfails.
+UNTYPED_DEREF = {
     "untyped_deref_local": """\
 fn s(p: *[4]i32) -> i32
     let c = *p
@@ -1136,7 +1133,34 @@ pub fn main() -> i32
     b[7] = 3
     return s(@b as *[4]i32)
 """,
+    # A copy: a store through `p` after the let doesn't reach `c`, nor `c`'s
+    # store `b`.
+    "untyped_deref_is_copy": """\
+pub fn main() -> i32
+    var b: [4]i32 = [0, 0, 0, 3]
+    let p: *[4]i32 = @b
+    var c = *p
+    b[3] = 9
+    c[0] = 7
+    return c[3] + b[0]
+""",
+    # T is the pointer's: `[4]u8`, so `c[3]` reads one byte.
+    "untyped_deref_u8": """\
+fn s(p: *[4]u8) -> i32
+    let c = *p
+    return c[3] as i32
+
+pub fn main() -> i32
+    var b: [4]u8 = [1, 1, 1, 3]
+    return s(@b)
+""",
 }
+
+CASES.update(UNTYPED_DEREF)
+
+# Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
+# but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
+# value would satisfy the xfail just as a refusal does.
 
 SOURCE_GAPS = {
     # AGAST #2302 left these: a `-> [N]T` call as an `if` arm.  (Iterated, it's #2997.)
@@ -1315,7 +1339,6 @@ pub fn main() -> i32
 }
 
 GAPS = [
-    (UNTYPED_DEREF_GAPS, "AGAST #3191: an untyped `let c = *p` of a `*[N]T`"),
     (SOURCE_GAPS, "AGAST #2305: a whole-array source or target ritz1 doesn't lower"),
     (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
     (PARAM_ND_GAPS, "AGAST #2098: a multi-dimensional array param"),
