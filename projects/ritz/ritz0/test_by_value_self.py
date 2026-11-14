@@ -343,11 +343,9 @@ GENERIC = ("struct W<T>\n    v: T\n\nimpl<T> W<T>\n    fn rd(self, q: @&W<T>) ->
            "        self.v as i32\n\npub fn main() -> i32\n    var a = W<i32> { v: 1 }\n    a.rd(@&a)\n")
 
 
-@pytest.mark.parametrize("compiler", [
-    "ritz0", *(pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#2318: a generic impl's `self`"))
-               for c in COMPILERS[1:])])
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_generic_impl_copies_too(compiler, tmp_path):
-    """ritz1 refuses this outright, so its `self` can't be the caller's place unseen."""
+    """A generic impl's bare `self` is a copy, as a non-generic one is (#2318)."""
     assert _run(compiler, tmp_path, "generic", GENERIC) == 1
 
 

@@ -660,6 +660,57 @@ pub fn main() -> i32
     var w: W<i32> = W<i32> { v: 3 }
     return w.g()
 """,
+    # AGAST #2318: an untyped receiver in a generic impl is its instance, `W$i32`.
+    "generic_bare_field": TYPES + GENERIC + """\
+impl<T> W<T>
+    fn g(self:&) -> T
+        return self.v
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 3 }
+    return w.g()
+""",
+    "generic_bare_value_field": TYPES + GENERIC + """\
+impl<T> W<T>
+    fn g(self) -> T
+        return self.v
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 3 }
+    return w.g()
+""",
+    # `self:&` is the caller's place: its write is the caller's.
+    "generic_bare_writes_through": TYPES + GENERIC + """\
+impl<T> W<T>
+    fn g(self:&, x: T)
+        self.v = x
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 0 }
+    w.g(3)
+    return w.v
+""",
+    # A bare `self` is a copy: the caller's `w` stays 3.
+    "generic_bare_value_is_a_copy": TYPES + GENERIC + """\
+impl<T> W<T>
+    fn g(self, x: T)
+        self.v = x
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 3 }
+    w.g(9)
+    return w.v
+""",
+    "generic_bare_returns_pointer": TYPES + GENERIC + """\
+impl<T> W<T>
+    fn g(self:&) -> *W<T>
+        return @self
+
+pub fn main() -> i32
+    var w: W<i32> = W<i32> { v: 3 }
+    let p: *W<i32> = w.g()
+    return p.v
+""",
     "generic_by_value": TYPES + GENERIC + """\
 fn k(p: *W<i32>) -> i32
     return p.v
@@ -907,7 +958,6 @@ BY_VALUE_REFUSED = {name: ALL.pop(name) for name in (
 # Still open on ritz1, each held to ritz0's answer by a strict xfail.
 RITZ1_GAPS = {
     "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
-    "self_generic_bare": "AGAST #2318: bare `self:&` in a generic impl doesn't compile",
 }
 # control_move_only_deref_field, `(*@t).id`, was here until AGAST #2449.
 
