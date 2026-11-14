@@ -281,10 +281,8 @@ fn check_workers(ctx: *DaemonContext)
             continue
 
         if slot.state == WORKER_SLOT_RUNNING
-            # Check if process is still alive
-            let result: i32 = sys_kill(slot.pid, 0)
-            if result < 0
-                # Process is dead - respawn it
+            if worker_exited(slot)
+                # Process is dead (and now reaped) - respawn it
                 print_str(c"zeus: worker ")
                 print_i32(i)
                 print_str(c" died, respawning...\n")
@@ -334,6 +332,15 @@ fn worker_live(slot: *WorkerSlot) -> bool
     if slot == null || slot.pid <= 0
         return false
     return slot.state == WORKER_SLOT_RUNNING || slot.state == WORKER_SLOT_STOPPING
+
+# Reap the slot's process if it has exited; true once it is gone (AGAST
+# #3075). kill(pid, 0) can't answer this: it succeeds on an unreaped zombie,
+# so a crashed worker looked alive forever and was never respawned. r < 0
+# (ECHILD) means it is not our child any more: gone all the same.
+fn worker_exited(slot: *WorkerSlot) -> bool
+    var status: i32 = 0
+    let r: i32 = sys_wait4(slot.pid, @status, WNOHANG, null)
+    return r == slot.pid || r < 0
 
 # smoke_stack's stack.zeus_{term,int}_stops_workers read this line: it is
 # how they tell zeus's own shutdown from the PDEATHSIG fallback.
@@ -408,9 +415,7 @@ fn initiate_hot_reload(ctx: *DaemonContext)
             # Wait briefly for worker to exit (non-blocking check)
             var attempts: i32 = 0
             while attempts < 50  # ~500ms total
-                let result: i32 = sys_kill(slot.pid, 0)
-                if result < 0
-                    # Worker exited
+                if worker_exited(slot)
                     break
                 # Sleep 10ms
                 var tv: [2]i64

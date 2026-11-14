@@ -17,7 +17,9 @@ does, after `./rz build --all`, using the debug binaries that step built:
             GET it 4 times, edit it, restart the whole stack, GET it again;
             100 keep-alive requests (the last says Connection: close);
             whole log lines; no mausoleum with 2 workers -> 503, not 404;
-            SIGTERM/SIGINT/SIGKILL to zeus alone stops its workers in 2 s
+            SIGTERM/SIGINT/SIGKILL to zeus alone stops its workers in 2 s;
+            kill -9 of one worker: zeus respawns it in 2 s, and a SIGHUP
+            hot reload reaps it
   hollow    sage, goliath, rzrz and ritz-lsp must not report success for
             work they did not do
   rzsh      the Linux shell: echo, cd, $X, $?, >, |, external commands
@@ -1178,6 +1180,60 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
     r.run("stack.zeus_int_stops_workers", lambda: workers_gone_after(signal.SIGINT))
     # SIGKILL can't be handled: the workers' PR_SET_PDEATHSIG must stop them.
     r.run("stack.zeus_kill9_stops_workers", lambda: workers_gone_after(signal.SIGKILL))
+
+    def respawns_killed_worker() -> None:
+        # #3075: check_workers tested liveness with kill(pid, 0), which
+        # succeeds on an unreaped zombie, so a crashed worker was never
+        # respawned and its slot silently served nothing.
+        z, pids = zeus_alone()
+        try:
+            os.kill(pids[0], signal.SIGKILL)
+            pat = r"zeus: respawned worker \d+ \(pid (\d+)\)"
+            deadline = time.monotonic() + 2.0
+            while True:
+                log = Path(z.log).read_text(errors="replace")  # type: ignore[attr-defined]
+                new = [int(m) for m in re.findall(pat, log)]
+                if new or time.monotonic() > deadline:
+                    break
+                time.sleep(0.05)
+            if not new:
+                raise CheckFailed(f"kill -9 worker {pids[0]}: zeus did not respawn it within 2 s: "
+                                  f"{log_tail(z, 4)}")
+            if not _pid_alive(new[0]) or not _pid_alive(pids[1]):
+                raise CheckFailed(f"respawned worker {new[0]} or untouched worker {pids[1]} "
+                                  f"not running")
+            # Respawning means zeus reaped the corpse: no zombie left behind.
+            if Path(f"/proc/{pids[0]}").exists():
+                raise CheckFailed(f"killed worker {pids[0]} left unreaped (zombie)")
+        finally:
+            procs.stop(z, signal.SIGKILL)
+
+    r.run("stack.zeus_respawns_killed_worker", respawns_killed_worker)
+
+    def reload_reaps_dead_worker() -> None:
+        # #3075: SIGHUP's per-worker exit wait used kill(pid, 0) too, so a
+        # worker that had died spun the full 500 ms, then its slot took a
+        # new pid and the corpse stayed a zombie for zeus's lifetime. SIGHUP
+        # straight after the kill, before check_workers' next tick.
+        z, pids = zeus_alone()
+        try:
+            os.kill(pids[0], signal.SIGKILL)
+            os.kill(z.pid, signal.SIGHUP)
+            deadline = time.monotonic() + 3.0
+            while True:
+                log = Path(z.log).read_text(errors="replace")  # type: ignore[attr-defined]
+                if "zeus: hot reload complete" in log:
+                    break
+                if time.monotonic() > deadline:
+                    raise CheckFailed(f"SIGHUP: no 'hot reload complete' in 3 s: {log_tail(z, 4)}")
+                time.sleep(0.05)
+            if Path(f"/proc/{pids[0]}").exists():
+                raise CheckFailed(f"SIGHUP after kill -9 of worker {pids[0]}: hot reload left it "
+                                  f"unreaped (zombie)")
+        finally:
+            procs.stop(z, signal.SIGKILL)
+
+    r.run("stack.zeus_reload_reaps_dead_worker", reload_reaps_dead_worker)
 
 
 def _pid_alive(pid: int) -> bool:
