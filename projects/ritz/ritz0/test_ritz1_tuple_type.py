@@ -29,7 +29,8 @@ struct field or an earlier match arm, else from its elements (AGAST #3005).
 A tuple over a generic parameter (`-> (T, T)`, `(K, V)`) is a template,
 as a generic struct is: each instantiation substitutes it (`tuple_i32_i32`
 at T = i32) and registers that tuple (AGAST #2975), as does one whose
-element points at a parameter (`(*T, i32)` -> `tuple_ptr_i32_i32`, #3173).
+element points at a parameter (`(*T, i32)` -> `tuple_ptr_i32_i32`, #3173;
+`(**T, i32)` -> `tuple_ptr_ptr_i32_i32`, #3184).
 """
 
 import os
@@ -336,6 +337,59 @@ pub fn main() -> i32
     (t.0.a + t.1) * 10 + *u.0 as i32 + u.1
 """
 
+# AGAST #3184: an element `**T`, at T = i32 (the ticket's program,
+# `tuple_ptr_ptr_i32_i32`) and at a struct (`tuple_ptr_ptr_Foo_i32`):
+# (5 + 1) + (9 + 1) = 16.
+GEN_PTR_PTR = """\
+struct Foo
+    a: i32
+
+fn pp<T>(p: **T) -> (**T, i32)
+    (p, 1)
+
+pub fn main() -> i32
+    var x: i32 = 5
+    var px: *i32 = @x
+    var g: Foo = Foo { a: 9 }
+    var pg: *Foo = @g
+    let (q, c) = pp<i32>(@px)
+    let (s, e) = pp<Foo>(@pg)
+    let fs: *Foo = *s
+    **q + c + fs.a + e
+"""
+
+# `**T` at T = i16 binds a `**i16`: `**q` loads 2 bytes.  The i16 is the
+# low half of an i32 0x00050007, so a wider load reads far more than 7;
+# compared in full (an exit status keeps only the low byte).
+GEN_PTR_PTR_I16 = """\
+fn pp<T>(p: **T) -> (**T, i32)
+    (p, 1)
+
+pub fn main() -> i32
+    var h: i32 = 327687
+    var ph: *i16 = @h as *i16
+    let (q, c) = pp<i16>(@ph)
+    if **q as i32 == 7
+        return 10 + c
+    3
+"""
+
+# `**T` at T = *u8 is `***u8` (`tuple_ptr_ptr_ptr_u8_i32`): `***w` loads
+# the u8, the low byte of a u16 0x07C8.
+GEN_PTR_PTR_DEEP = """\
+fn pp<T>(p: **T) -> (**T, i32)
+    (p, 1)
+
+pub fn main() -> i32
+    var h: u16 = 1992
+    var pb: *u8 = @h as *u8
+    var ppb: **u8 = @pb
+    let (w, z) = pp<*u8>(@ppb)
+    let v: u8 = ***w
+    if v == 200
+        return 10 + z
+    3
+"""
 
 # AGAST #3005: a tuple no slot types (the rejections of #2956 / #2974), typed
 # from its elements.  `let x = (a, a)`: f(1) = 1 + 1 + 1 = 3.
@@ -416,6 +470,9 @@ def test_tuple_with_no_slot_runs(ritz1_bin, tmp_path, compiler, name, program, e
         ("tuple_generic_impl_vec", GEN_IMPL_VEC, 69),
         ("tuple_generic_ptr", GEN_PTR, 28),
         ("tuple_generic_ref", GEN_REF, 70),
+        ("tuple_generic_ptr_ptr", GEN_PTR_PTR, 16),
+        ("tuple_generic_ptr_ptr_i16", GEN_PTR_PTR_I16, 11),
+        ("tuple_generic_ptr_ptr_deep", GEN_PTR_PTR_DEEP, 11),
     ],
 )
 def test_tuple_programs_run(ritz1_bin, tmp_path, compiler, name, program, expected):
@@ -506,17 +563,13 @@ def test_ritz1_substitutes_tuple_element_pointing_at_generic_param(ritz1_bin, tm
 
 
 @pytest.mark.integration
-def test_ritz1_rejects_tuple_element_double_pointer_at_generic_param(ritz1_bin, tmp_path):
-    """`(**T, i32)` has no substitution yet (AGAST #3184): a located error at
-    the tuple type, not a `%tuple_ptr_ptr_T_i32` naming no struct."""
-    proc = _ritz1_ir(
-        ritz1_bin,
-        tmp_path,
-        "fn pp<T>(p: **T) -> (**T, i32)\n    (p, 1)\n\n"
-        "pub fn main() -> i32\n    var x: i32 = 5\n    var px: *i32 = @x\n"
-        "    let (q, c) = pp<i32>(@px)\n    **q + c\n",
-    )
-    assert proc.returncode != 0
-    assert re.search(r"t\.ritz:1:\d+: .*tuple element pointing at generic parameter `T`.*#3184", proc.stderr), (
-        proc.stderr[-2000:]
-    )
+def test_ritz1_substitutes_tuple_element_double_pointer_at_generic_param(ritz1_bin, tmp_path):
+    """AGAST #3184: `(**T, i32)` was refused.  At pp<i32> it is ritz0's
+    `tuple_ptr_ptr_i32_i32`, `{ptr, i32}`; the template's
+    `tuple_ptr_ptr_T_i32` is never emitted."""
+    proc = _ritz1_ir(ritz1_bin, tmp_path, GEN_PTR_PTR)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert re.search(r"^%tuple_ptr_ptr_i32_i32 = type \{\s*ptr,\s*i32\s*\}$", proc.ir, re.MULTILINE), proc.ir[:3000]
+    assert re.search(r"^%tuple_ptr_ptr_Foo_i32 = type \{\s*ptr,\s*i32\s*\}$", proc.ir, re.MULTILINE), proc.ir[:3000]
+    assert re.search(r"define\b.*%tuple_ptr_ptr_i32_i32 @\"?pp\$i32", proc.ir), proc.ir[:3000]
+    assert "ptr_T" not in proc.ir, proc.ir[:3000]

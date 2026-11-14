@@ -2443,7 +2443,11 @@ fn tuple_subst(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, s
             var snl: i32 = 0
             get_type_name_from_suffix(suffix, suffix_len, @sn, @snl)
             let st: i32 = parse_type_from_suffix(suffix, suffix_len)
-            subst_pointee_field(nf, st, sn, snl)
+            if f.field_type == TYPE_PTR_PTR
+                # AGAST #3184: `**T` (`tuple_ptr_ptr_i32_i32`).
+                subst_ptr_ptr_field(nf, st, sn, snl)
+            else
+                subst_pointee_field(nf, st, sn, snl)
             # The pointee as field_new records a written `*i32` / `**u8`:
             # tuple_split_decl types the bound local from it.
             if f.field_type == TYPE_PTR
@@ -2512,9 +2516,10 @@ fn tuple_subst(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, s
     *out_len = got.def.name_len
     got.def.name
 
-# 1 when tuple element f is `*T` / `@T` / `@&T`, T = type_param (AGAST #3173).
+# 1 when tuple element f is `*T` / `@T` / `@&T` (AGAST #3173) or `**T`
+# (AGAST #3184), T = type_param.
 fn tuple_elem_points_at(f: *StructField, type_param: *u8, type_param_len: i32) -> i32
-    if f.field_type != TYPE_PTR and f.field_type != TYPE_REF and f.field_type != TYPE_MUT_REF
+    if f.field_type != TYPE_PTR and f.field_type != TYPE_PTR_PTR and f.field_type != TYPE_REF and f.field_type != TYPE_MUT_REF
         return 0
     name_is_type_param(f.field_type_name, f.field_type_name_len, type_param, type_param_len)
 
@@ -3767,6 +3772,26 @@ fn subst_pointee_field(cloned: *StructField, subst_type: i32, subst_name: *u8, s
         cloned.field_type_name = null
         cloned.field_type_name_len = 0
         cloned.array_elem_type = prim
+    else
+        cloned.field_type_name = subst_name
+        cloned.field_type_name_len = subst_len
+
+# AGAST #3184: a `**T` field (any depth) at T = the argument, encoded as
+# field_new records a written `**X`: the innermost pointee in the
+# inner-pointee slot (depth kept), named when it is a struct, unnamed when
+# a primitive.  T = *X is one level deeper: `**T` at T = *u8 is `***u8`.
+fn subst_ptr_ptr_field(cloned: *StructField, subst_type: i32, subst_name: *u8, subst_len: i32)
+    let prim: i32 = primitive_type_from_name(subst_name, subst_len)
+    var inner: i32 = TYPE_STRUCT
+    if prim != 0
+        inner = prim
+    var slot: i32 = ptr_ptr_slot_subst(cloned.inner_pointee_type, inner)
+    if subst_type == TYPE_PTR
+        slot = slot + PTR_DEPTH_UNIT
+    cloned.inner_pointee_type = slot
+    if prim != 0
+        cloned.field_type_name = null
+        cloned.field_type_name_len = 0
     else
         cloned.field_type_name = subst_name
         cloned.field_type_name_len = subst_len
