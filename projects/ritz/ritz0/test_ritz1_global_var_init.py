@@ -166,13 +166,30 @@ pub fn main() -> i32
         return 3
     return 1
 """,
+    # `~` of an int literal, and unary operators nested over one, fold as
+    # ritz1's global_init_fold folds them; ritz0 raised a bare ValueError
+    # (AGAST #3027).
+    "bit_not": """\
+var g: i32 = ~0
+
+pub fn main() -> i32
+    if g == -1
+        return 3
+    return 1
+""",
+    "neg_of_bit_not": """\
+var g: i32 = -~2
+
+pub fn main() -> i32
+    return g
+""",
 }
 
 ALL_RUNNABLE = {**BROKEN_FORMS, **WORKING_FORMS}
 
 # --- ritz1-only forms --------------------------------------------------------
-# ritz0's `_emit_global_var` raises "Unsupported global var initializer" for
-# bool, char and float literals (AGAST #1539), so there is no oracle here: each
+# ritz0's `_emit_global_var` refuses char and float literals (AGAST #1539),
+# and folded bools only from #3009, so there is no oracle here: each
 # program checks its own value and returns 3 when it matches.
 
 RITZ1_ONLY_BROKEN_FORMS = {

@@ -89,6 +89,10 @@ _STR_AS_PTR = {
     'String': "a String is not a `*u8`: write `string_as_ptr(@&s)`",
 }
 
+# A global initializer ritz0 cannot fold (AGAST #3027), in ritz1's words.
+_GLOBAL_NON_CONSTANT = ("has a non-constant initializer; ritz0 lowers only literals, "
+                        "unary -/~/not of one, null and casts of those")
+
 SRET_MIN_BYTES = 256
 
 # ============================================================================
@@ -1700,6 +1704,26 @@ class LLVMEmitter:
             return None if inner is None else 1 - inner
         return None
 
+    @staticmethod
+    def _fold_int_global_init(expr: rast.Expr) -> int | None:
+        """Fold an integer global's initializer, or None if it is not an
+        integer literal under any number of unary `-` / `~` (AGAST #3027),
+        as ritz1's global_init_fold folds them."""
+        if isinstance(expr, rast.IntLit):
+            return expr.value
+        if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
+            inner = LLVMEmitter._fold_int_global_init(expr.operand)
+            if inner is None:
+                return None
+            return -inner if expr.op == '-' else ~inner
+        return None
+
+    @staticmethod
+    def _global_init_error(var_def: rast.VarDef, why: str) -> EmitError:
+        """ritz1's wording for a global initializer it cannot lower, located
+        at the initializer (AGAST #3027)."""
+        return EmitError(f"global '{var_def.name}' {why}", var_def.value.span)
+
     def _emit_global_var(self, var_def: rast.VarDef) -> None:
         """Emit a module-level mutable variable.
 
@@ -1756,12 +1780,16 @@ class LLVMEmitter:
                         gvar.initializer = ir.Constant(ty, None)
                     else:
                         gvar.initializer = ir.Constant(ty, var_def.value.value)
-                elif isinstance(var_def.value, rast.UnaryOp) and var_def.value.op == '-':
-                    # Handle negative integer literals like -1
-                    if isinstance(var_def.value.operand, rast.IntLit):
-                        gvar.initializer = ir.Constant(ty, -var_def.value.operand.value)
-                    else:
-                        raise ValueError(f"Complex unary op initializer not supported: {var_def.value}")
+                elif (n := self._fold_int_global_init(var_def.value)) is not None:
+                    # `-1`, `~0`, `-~2`: unary -/~ over an integer literal
+                    # (AGAST #3027).  Not into a bool or a pointer.
+                    if ty == self.i1:
+                        raise EmitError(bool_rules.value_into_bool(bool_rules.INTEGER),
+                                        var_def.value.span)
+                    if isinstance(ty, ir.PointerType):
+                        raise self._global_init_error(
+                            var_def, "is a pointer but has a non-zero integer initializer")
+                    gvar.initializer = ir.Constant(ty, n)
                 elif isinstance(var_def.value, rast.Cast):
                     # Handle `0 as *i8` style initialization
                     if isinstance(var_def.value.expr, rast.IntLit):
@@ -1771,7 +1799,7 @@ class LLVMEmitter:
                         else:
                             gvar.initializer = ir.Constant(ty, var_def.value.expr.value)
                     else:
-                        raise ValueError(f"Complex cast initializer not supported: {var_def.value}")
+                        raise self._global_init_error(var_def, _GLOBAL_NON_CONSTANT)
                 elif isinstance(var_def.value, rast.StringLit) and var_def.value.as_ptr:
                     gvar.initializer = self._const_str_ptr(var_def.value.value)
                 elif isinstance(var_def.value, rast.NullLit):
@@ -1779,13 +1807,21 @@ class LLVMEmitter:
                     if isinstance(ty, ir.PointerType):
                         gvar.initializer = ir.Constant(ty, None)
                     else:
-                        raise ValueError(f"null can only initialize pointer types, not {ty}")
+                        raise self._global_init_error(
+                            var_def, "is not a pointer but has a null initializer")
                 elif ty == self.i1 and (bit := self._fold_bool_global_init(var_def.value)) is not None:
                     # AGAST #3009: `true`, `false`, and `not` of one, as ritz1's
                     # global_init_fold folds them: the i1 0/1 a bool global is.
                     gvar.initializer = ir.Constant(ty, bit)
+                elif ty != self.i1 and self._fold_bool_global_init(var_def.value) is not None:
+                    # `var g: i32 = true`: bool_rules' message, located at the
+                    # initializer, as ritz1 gives it (AGAST #3027).
+                    kind = (bool_rules.POINTER if isinstance(ty, ir.PointerType)
+                            else bool_rules.FLOAT if isinstance(ty, (ir.FloatType, ir.DoubleType))
+                            else bool_rules.INTEGER)
+                    raise EmitError(bool_rules.bool_into_slot(kind), var_def.value.span)
                 else:
-                    raise ValueError(f"Unsupported global var initializer: {var_def.value}")
+                    raise self._global_init_error(var_def, _GLOBAL_NON_CONSTANT)
             else:
                 # Zero initialize
                 gvar.initializer = ir.Constant(ty, None)  # zeroinitializer
