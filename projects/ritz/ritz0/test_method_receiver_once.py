@@ -174,7 +174,6 @@ NO_SPAN_INTRINSIC = {c: 3125 for c in BOTH_RITZ1}
 NO_CALL_RANGE_START = {c: 3126 for c in BOTH_RITZ1}
 NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
 NO_DYN_RETURN = {c: 2298 for c in BOTH_RITZ1}
-NO_CALL_ROOTED_PLACE = {c: 2299 for c in BOTH_RITZ1}
 
 ARRAY = "var arr: [2]P = [P { x: 1 }, P { x: 2 }]\n    "
 NESTED = "var arr: [2]W = [W { p: P { x: 1 } }, W { p: P { x: 2 } }]\n    "
@@ -215,8 +214,7 @@ CASES = {
     "index_then_field_lent": (NESTED + "arr[idx()].p.get()", 1, 0, {}),
     "index_then_field_value": (NESTED + "arr[idx()].p.val()", 1, 0, {}),
     # The same with the side effect at the root of the place.
-    "index_of_call": ("var p = P { x: 1 }\n    mq(@p)[0].get()", 1, 0,
-                      NO_CALL_ROOTED_PLACE),
+    "index_of_call": ("var p = P { x: 1 }\n    mq(@p)[0].get()", 1, 0, {}),
     # AGAST #2526: `(*f()).p` names the struct `*f()` loads.
     "field_through_deref": ("var w = W { p: P { x: 1 } }\n    (*pw(@w)).p.get()", 1, 0, {}),
     # `a[lo..hi]` is a slice, not a place, and its range is not a value.
@@ -305,6 +303,15 @@ pub fn main() -> i32
     both<i64>(2)
     return MADE
 """, 2, {}),
+
+    # `mq(..)[i]` is a place (AGAST #2299): element 1 sits one P past what
+    # the call returns, and a mutating method writes it there, not a copy.
+    "index_of_call_writes_in_place": ("""\
+pub fn main() -> i32
+    var arr: [2]P = [P { x: 1 }, P { x: 2 }]
+    mq(@arr[0])[1].bump()
+    return MADE * 10 + arr[1].x
+""", 13, {}),
 
     # The value the method returns is the receiver's, not another evaluation's.
     "reads_the_value_it_evaluated": ("""\
