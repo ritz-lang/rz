@@ -6442,6 +6442,11 @@ class LLVMEmitter:
                     self.ritz_types[name] = elem_ritz[i]
                 else:
                     self.ritz_types.pop(name, None)
+                # AGAST #2282: each name owns its element and drops it at
+                # scope end, as a `let` does (§13.6); the source moved into
+                # the names (the move checker marked it, _note_move above).
+                self._register_let_drop(name, elem_val,
+                                        elem_ritz[i] if elem_ritz is not None else None)
             return None
 
         elif isinstance(stmt, rast.AssignStmt):

@@ -2379,7 +2379,40 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz0": 2282}),
+""", 1, {}),
+
+    # AGAST #2282: the bindings own the elements, so each drops once.
+    "tuple_destructure_kept": (TUPLES + SLOT + """\
+fn f()
+    var p = (make(1), make(2))
+    let (a, b) = p
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 2, {"ritz1": 3033, "ritz1_selfhosted": 3033}),
+
+    # A struct source destructures positionally, by field order.
+    "struct_destructure_moved": (TUPLES + SLOT + """\
+fn f()
+    var h = Holder { t: make(1), n: 2 }
+    let (a, b) = h
+    consume(a)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
+    "struct_destructure_kept": (TUPLES + SLOT + """\
+fn f()
+    var h = Holder { t: make(1), n: 2 }
+    let (a, b) = h
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {"ritz1": 3033, "ritz1_selfhosted": 3033}),
 
     "tuple_destructure_call": (TUPLES + SLOT + """\
 fn f()
@@ -2388,7 +2421,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, {"ritz0": 2282, "ritz1": 3033, "ritz1_selfhosted": 3033}),
+""", 2, {"ritz1": 3033, "ritz1_selfhosted": 3033}),
 
     "tuple_element_assigned_back": (TUPLES + SLOT + """\
 fn f()
@@ -2490,6 +2523,21 @@ fn g(r: @(Tracked, i64)) -> i32
 }
 
 USE_AFTER_MOVE = {
+    # AGAST #2282: destructuring moves the source and defines its bindings.
+    "after_destructure_source": (TUPLES + """\
+pub fn main() -> i32
+    var p = (make(1), 2)
+    let (a, b) = p
+    return look(@p.0)
+""", "p", {}),
+
+    "after_destructure_binding": (TUPLES + """\
+pub fn main() -> i32
+    let (a, b) = make_pair(1, 2)
+    consume(a)
+    return a.id
+""", "a", {"ritz1": 3033, "ritz1_selfhosted": 3033}),
+
     "after_move_into_callee": ("""\
 pub fn main() -> i32
     var t = make(1)

@@ -589,6 +589,19 @@ class MoveChecker:
         # Default to unknown
         return rast.NamedType(expr.span, 'unknown', [])
 
+    def _destructured_types(self, value: rast.Expr, n: int) -> List[rast.Type]:
+        """The types `let (x1, ..., xn) = value` gives its n names: the
+        tuple's elements, or a struct's fields in declaration order (as
+        the emitter destructures it). `unknown` where neither fits."""
+        ty = self.types.resolve(self._infer_expr_type(value))
+        if isinstance(ty, rast.TupleType) and len(ty.elements) == n:
+            return list(ty.elements)
+        if isinstance(ty, rast.NamedType):
+            fields = self.types.struct_fields(ty)
+            if len(fields) == n:
+                return [t for _name, t in fields]
+        return [rast.NamedType(value.span, 'unknown', []) for _ in range(n)]
+
     def _push_scope(self):
         """Enter a new scope."""
         self.scope = Scope(parent=self.scope)
@@ -983,6 +996,17 @@ class MoveChecker:
                 var_type = rast.NamedType(stmt.span, 'unknown', [])
             self.scope.define(stmt.name, var_type, stmt.span)
             self._hold_loans(self.scope.vars[stmt.name], stmt.value, stmt.type)
+            return False
+
+        elif isinstance(stmt, rast.LetTupleStmt):
+            # `let (a, b) = v` (§13.6, AGAST #2282): v moves, as into a
+            # `let`, and each name owns its element (a struct's field, by
+            # declaration order), so the emitter drops the names, not v.
+            self._check_expr(stmt.value, is_move_context=True)
+            elems = self._destructured_types(stmt.value, len(stmt.names))
+            for i, name in enumerate(stmt.names):
+                span = stmt.name_spans[i] if i < len(stmt.name_spans) else stmt.span
+                self.scope.define(name, elems[i], span)
             return False
 
         elif isinstance(stmt, rast.ExprStmt):
