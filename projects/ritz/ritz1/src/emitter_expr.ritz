@@ -2390,6 +2390,10 @@ fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: i32,
     let field: *StructField = get_field_type(st, field_idx)
     bool_check_slot(s, value, field.field_type, field.field_type_name, field.field_type_name_len)
     literal_field(s, value, field)   # AGAST #2341
+    # AGAST #3005: a tuple field (`Box<(u32, u32)> { v: (1, 2) }`, a nested
+    # tuple) names a nameless tuple literal.
+    if field.field_type == TYPE_STRUCT
+        tuple_lit_name(s, value, field.field_type_name, field.field_type_name_len)
     # A nested literal (`E { name: V { .. } }`) has no value register:
     # emit_expr rejects a bare EXPR_STRUCT_LIT. Write it in place into the
     # field instead, recursively. (AGAST #1655)
@@ -2489,9 +2493,179 @@ fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: i32,
 # Struct Literal to Alloca Helper
 # =============================================================================
 
+# =============================================================================
+# Tuple literals with no tuple type (AGAST #3005)
+# =============================================================================
+#
+# tuple_resolve_module names a tuple literal from its slot when the parse
+# knows one (a fn's return type, an annotated let, an enclosing tuple).  The
+# rest reach the emitter nameless: `let t = (a, b)`, a call argument, a
+# generic struct's field, an if / match arm that binds a name or runs
+# statements before its tuple.  Each is named where it is emitted, with its
+# arm's bindings in scope: from the slot the emitter knows (a param's or
+# field's tuple type, the phi type an earlier arm fixed), else from its
+# elements' types, as ritz0 builds the struct from its element values.  A
+# struct synthesized here missed emit_struct_types: emit_late_enum_types
+# declares it.
+
+# Is `e` a tuple literal (fields "0", "1", ..) nothing has named yet?
+fn tuple_lit_nameless(e: *Expr) -> i32
+    if e == null or e.kind != EXPR_STRUCT_LIT or e.ident_len != 0
+        return 0
+    let fi: *FieldInit = e.args as *FieldInit
+    if fi == null or fi.name_len != 1 or *fi.name != 48  # '0'
+        return 0
+    1
+
+fn tuple_lit_arity(e: *Expr) -> i32
+    var n: i32 = 0
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        n = n + 1
+        fi = fi.next
+    n
+
+# The tuple struct `name` names when it has `n` elements, or null.
+fn tuple_slot_def(s: *EmitterState, name: *u8, len: i32, n: i32) -> *StructDef
+    if name == null or len < 6 or memcmp(name, c"tuple_", 6) != 0
+        return null
+    let st: *StructDef = find_struct(s, name, len)
+    if st == null
+        return null
+    var k: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        k = k + 1
+        f = f.next
+    if k != n
+        return null
+    st
+
+# Element `v`'s type as a tuple field: its kind in *out_ty, a struct's name in
+# *out_name / *out_len.  Returns its spelling's length (ritz0's
+# mangle_type_name: a struct's name, a primitive's), with the spelling in
+# *spell, or 0 when ritz1 can't type it (a pointer, an array, a struct it
+# can't name).
+fn tuple_elem_type(s: *EmitterState, v: *Expr, out_ty: *i32, out_name: **u8, out_len: *i32, spell: **u8) -> i32
+    *out_name = null
+    *out_len = 0
+    if v.kind == EXPR_STRUCT_LIT
+        *out_ty = TYPE_STRUCT
+        *out_name = v.ident_ptr
+        *out_len = v.ident_len
+    else if bool_kind(s, v) == BK_BOOL
+        *out_ty = TYPE_BOOL
+    else
+        *out_ty = get_expr_type(s, v)
+        let t: i32 = *out_ty
+        if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF or t == TYPE_ARRAY
+            return 0
+        # A struct or enum value names its type even where get_expr_type
+        # says i64 (`Slot.Full(x)`, a variant ctor).
+        tuple_decl_struct_name(s, v, out_name, out_len)
+        if *out_len > 0
+            *out_ty = TYPE_STRUCT
+    if *out_ty == TYPE_STRUCT
+        *spell = *out_name
+        return *out_len
+    primitive_arg_spelling(*out_ty, spell)
+
+# A tuple struct `name` with the given element types, registered as the
+# parse registers a struct, and queued for emit_late_enum_types.
+fn tuple_struct_new(s: *EmitterState, name: *u8, len: i32, tys: *i32, names: **u8, lens: *i32, n: i32) -> *StructDef
+    var fields: *StructField = null
+    var last: *StructField = null
+    for i in 0..n
+        let f: *StructField = calloc(1, sizeof(StructField)) as *StructField
+        let nm: *u8 = malloc(12)
+        let nlen: i32 = write_dec_i32(nm, i)
+        *(nm + nlen) = 0
+        f.name = nm
+        f.name_len = nlen
+        f.field_type = *(tys + i)
+        f.field_type_name = *(names + i)
+        f.field_type_name_len = *(lens + i)
+        f.ptr_pointee = TYPE_VOID
+        f.array_elem_pointee = TYPE_VOID
+        f.inner_pointee_type = TYPE_VOID
+        if last == null
+            fields = f
+        else
+            last.next = f
+        last = f
+    let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
+    st.name = name
+    st.name_len = len
+    st.fields = fields
+    st.next = s.module.structs
+    s.module.structs = st
+    let key: i64 = fnv1a_str(name, len) as i64
+    if hashmap_i64_contains(@s.struct_map, key) == 0
+        hashmap_i64_insert(@&s.struct_map, key, st as i64)
+    namelist_push(@s.late_tuples, name, len)
+    st
+
+# Name the nameless tuple literal `e` from its elements' types (nested
+# nameless tuples first).  Returns 1 once named; 0 after a located error.
+fn tuple_lit_infer(s: *EmitterState, e: *Expr) -> i32
+    let n: i32 = tuple_lit_arity(e)
+    let tys: *i32 = malloc((n as i64) * 4) as *i32
+    let names: **u8 = malloc((n as i64) * 8) as **u8
+    let lens: *i32 = malloc((n as i64) * 4) as *i32
+    let spells: **u8 = malloc((n as i64) * 8) as **u8
+    let spell_lens: *i32 = malloc((n as i64) * 4) as *i32
+    var total: i32 = 5  # "tuple"
+    var i: i32 = 0
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        let v: *Expr = fi.value
+        if tuple_lit_nameless(v) == 1 and tuple_lit_infer(s, v) == 0
+            e.ident_ptr = c"(untyped)"
+            e.ident_len = 9
+            return 0
+        var sp: *u8 = null
+        let sl: i32 = tuple_elem_type(s, v, tys + i, names + i, lens + i, @sp)
+        if sl == 0
+            emit_nd_error(s, v.span.line, v.span.col, c"ritz1 can't infer the type of this tuple element (a pointer, an array, or a value whose struct it can't name): give the tuple a type, as `let t: (A, B) = ..` (AGAST #3024)")
+            e.ident_ptr = c"(untyped)"
+            e.ident_len = 9
+            return 0
+        *(spells + i) = sp
+        *(spell_lens + i) = sl
+        total = total + 1 + sl
+        i = i + 1
+        fi = fi.next
+    let name: *u8 = malloc((total + 1) as i64)
+    memcpy(name, c"tuple", 5)
+    var pos: i32 = 5
+    for j in 0..n
+        *(name + pos) = 95  # '_'
+        memcpy(name + pos + 1, *(spells + j), *(spell_lens + j) as i64)
+        pos = pos + 1 + *(spell_lens + j)
+    *(name + pos) = 0
+    if find_struct(s, name, pos) == null
+        tuple_struct_new(s, name, pos, tys, names, lens, n)
+    e.ident_ptr = name
+    e.ident_len = pos
+    1
+
+# Name `e`, if it is a nameless tuple literal: from the slot struct
+# `slot` / `slot_len` when that is a tuple of as many elements, else from its
+# elements.  Returns 0 after a located error.
+fn tuple_lit_name(s: *EmitterState, e: *Expr, slot: *u8, slot_len: i32) -> i32
+    if tuple_lit_nameless(e) == 0
+        return 1
+    let st: *StructDef = tuple_slot_def(s, slot, slot_len, tuple_lit_arity(e))
+    if st != null
+        e.ident_ptr = st.name
+        e.ident_len = st.name_len
+        return 1
+    tuple_lit_infer(s, e)
+
 # Emit a struct literal into an existing alloca and return the alloca register
 # Used for returning struct literals from functions
 fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
+    tuple_lit_name(s, e, null, 0)   # AGAST #3005
     let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
     if st == null
         emit_ir_error(s, c"struct not found for literal")
@@ -2515,6 +2689,7 @@ fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
 # Unknown struct names are a located error (from emit_struct_lit_to_alloca's
 # lookup), never a silently wrong value. (AGAST #1362)
 fn emit_struct_lit_value(s: *EmitterState, e: *Expr) -> i32
+    tuple_lit_name(s, e, null, 0)   # AGAST #3005
     let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
     if st == null
         emit_ir_error(s, c"struct not found for literal")

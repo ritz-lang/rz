@@ -15,8 +15,9 @@ The first gaps these programs exposed are closed: ritz0's by AGAST #2157,
 ritz1 / ritz1_selfhosted's by AGAST #2158 (ritz1/src/ownership.ritz). AGAST
 #2161 added enum payloads, array and tuple elements, temporaries and moves
 inside loops, closed for ritz0; ritz1's by AGAST #2165, except tuple
-elements (a strict xfail citing #1526, ritz1's missing tuple literals;
-#2956 added tuple types and literals, closing some of those rows).
+elements (#1526, ritz1's missing tuple literals: #2956 added tuple
+types and literals, and #3005 typed a tuple with no tuple type, closing
+most of those rows; the rest cite their own tickets).
 AGAST #2168 added moves out of a field, closed for ritz1; ritz0's by AGAST
 #2171. AGAST #2174 added a match owning its scrutinee, with payload
 bindings owning the payload, closed for ritz1; ritz0's by AGAST #2177.
@@ -24,8 +25,8 @@ AGAST #2173 added assigning a move-only field (the old value drops),
 closed for both. AGAST #2257 added bindings and temporaries from a method
 call, whose temporaries ritz0 drops and ritz1 doesn't yet (#2262). AGAST
 #2243 added bindings from a field, which ritz1 already got right. AGAST
-#2244 added moves out of a tuple element, closed for ritz0; ritz1 has no
-tuples to move out of yet (#1526).
+#2244 added moves out of a tuple element, closed for ritz0; for ritz1 by
+#2956 / #3005, except the rows citing their own tickets.
 AGAST #2261 closed ritz0's double evaluation of a method receiver, which
 dropped two values for one call.
 AGAST #2242 closed moves out of a nested field for ritz1, except past the 31
@@ -186,13 +187,12 @@ fn make_mixed(a: i32) -> (Tracked, i32)
 
 """
 
-# ritz1 has no tuples yet.
-NO_TUPLES = {"ritz1": 1526, "ritz1_selfhosted": 1526}
-
-
-def tuple_gap(ticket):
-    """A ritz0 gap in something ritz1 can't compile either (#1526)."""
-    return {"ritz0": ticket, **NO_TUPLES}
+# Tuple rows ritz1 still misses since it types every tuple (AGAST #3005): a
+# pointer or array element (#3024), a tuple type alias (#3030), a discarded
+# tuple temporary's elements (#3031).
+TUPLE_PTR_ELEM = {"ritz1": 3024, "ritz1_selfhosted": 3024}
+TUPLE_ALIAS = {"ritz1": 3030, "ritz1_selfhosted": 3030}
+TUPLE_TEMP_GAP = {"ritz1": 3031, "ritz1_selfhosted": 3031}
 
 # Method temporaries ritz1 doesn't drop yet.
 METHOD_TEMP_GAP = {"ritz1": 2262, "ritz1_selfhosted": 2262}
@@ -507,7 +507,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz1": 1526, "ritz1_selfhosted": 1526}),
+""", 1, TUPLE_TEMP_GAP),
 
     "field_element_array_binding": (SLOT + FIELDS + """\
 fn f() -> i32
@@ -891,7 +891,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER
-""", 12, {"ritz1": 1526, "ritz1_selfhosted": 1526}),
+""", 12, {}),
 
     # A temporary nobody owns drops at the end of its statement: before
     # the `return`, so the helper already sees it.
@@ -1808,7 +1808,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_moved_let": (TUPLES + SLOT + """\
 fn f()
@@ -1818,7 +1818,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_sibling_still_drops": (TUPLES + SLOT + """\
 fn f()
@@ -1828,7 +1828,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     # The moved element drops in `consume`, then the rest, in order.
     "tuple_element_sibling_order": (TUPLES + SLOT + """\
@@ -1839,7 +1839,7 @@ fn f()
 pub fn main() -> i32
     f()
     return ORDER
-""", 213, NO_TUPLES),
+""", 213, {}),
 
     "tuple_element_both_moved": (TUPLES + SLOT + """\
 fn f()
@@ -1850,7 +1850,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_binding": (TUPLES + SLOT + """\
 fn f()
@@ -1861,7 +1861,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     # The binding owns it now, and drops it.
     "tuple_element_binding_unmoved": (TUPLES + SLOT + """\
@@ -1872,7 +1872,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_param": (TUPLES + SLOT + """\
 fn g(p: (Tracked, Tracked)) -> i32
@@ -1908,7 +1908,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_conditional_not_taken": (TUPLES + SLOT + """\
 fn g(c: i32)
@@ -1922,7 +1922,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_returned": (TUPLES + SLOT + """\
 fn g() -> Tracked
@@ -1935,7 +1935,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_tail": (TUPLES + SLOT + """\
 fn g() -> Tracked
@@ -1948,7 +1948,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     # Reassigning drops what is left of the old value; the new one is whole.
     "tuple_reassigned_after_element_move": (TUPLES + SLOT + """\
@@ -1960,7 +1960,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 4, NO_TUPLES),
+""", 4, {}),
 
     # A path through a tuple.
     "tuple_element_in_field": (TUPLES + SLOT + """\
@@ -1971,7 +1971,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 3, NO_TUPLES),
+""", 3, {}),
 
     "tuple_element_in_field_binding": (TUPLES + SLOT + """\
 fn f()
@@ -1982,7 +1982,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 3, NO_TUPLES),
+""", 3, {}),
 
     "tuple_in_field_whole_after_element_is_part": (TUPLES + SLOT + """\
 fn f()
@@ -1993,7 +1993,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 3, NO_TUPLES),
+""", 3, {}),
 
     # A path through a tuple into a struct.
     "tuple_field_of_an_element": (TUPLES + SLOT + """\
@@ -2004,7 +2004,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_in_tuple": (TUPLES + SLOT + """\
 fn f()
@@ -2014,7 +2014,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 3, NO_TUPLES),
+""", 3, {}),
 
     # What the element's type feeds.
     "tuple_element_by_value_receiver": (TUPLES + SLOT + """\
@@ -2025,7 +2025,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_method_temporary": (TUPLES + SLOT + """\
 fn f() -> i32
@@ -2036,7 +2036,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, METHOD_TEMP_GAP),
 
     "tuple_element_match": (TUPLES + SLOT + """\
 fn f()
@@ -2048,7 +2048,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_match_wildcard": (TUPLES + SLOT + """\
 fn f()
@@ -2059,7 +2059,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_of_temporary": (TUPLES + SLOT + """\
 fn f()
@@ -2087,7 +2087,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_into_literal_temporary": (TUPLES + SLOT + """\
 fn f() -> i32
@@ -2098,7 +2098,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, TUPLE_TEMP_GAP),
 
     # Lending an element takes its address, which moves nothing.
     "tuple_element_lent": (TUPLES + SLOT + """\
@@ -2110,7 +2110,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_lending_receiver": (TUPLES + SLOT + """\
 fn g(p: (Tracked, i32)) -> i32
@@ -2122,7 +2122,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     # A reference element copies, so the value drops once, from `t`.
     "tuple_element_copy_reference": (TUPLES + SLOT + """\
@@ -2135,7 +2135,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, TUPLE_PTR_ELEM),
 
     "tuple_element_try": (TUPLES + SLOT + """\
 fn g(r: (Result<Tracked, i32>, i32)) -> Result<i32, i32>
@@ -2149,7 +2149,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {"ritz1": 3032, "ritz1_selfhosted": 3032}),
 
     "tuple_element_for": (TUPLES + SLOT + """\
 fn f()
@@ -2160,7 +2160,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, TUPLE_PTR_ELEM),
 
     "tuple_element_in_loop": (TUPLES + SLOT + """\
 fn f()
@@ -2173,7 +2173,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 6, NO_TUPLES),
+""", 6, {}),
 
     "tuple_element_before_break": (TUPLES + SLOT + """\
 fn f()
@@ -2185,7 +2185,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 
     "tuple_element_before_return": (TUPLES + SLOT + """\
 fn g() -> i32
@@ -2199,7 +2199,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, NO_TUPLES),
+""", 2, {}),
 
     "tuple_element_alias": (TUPLES + SLOT + """\
 type Mixed = (Tracked, i32)
@@ -2213,7 +2213,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, TUPLE_ALIAS),
 
     # The emitter types the binding through the alias, so `x` drops it.
     "tuple_element_alias_binding": (TUPLES + SLOT + """\
@@ -2226,7 +2226,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, TUPLE_ALIAS),
 
     # Gaps next to #2244.
     "tuple_destructure_moved": (TUPLES + SLOT + """\
@@ -2238,7 +2238,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, tuple_gap(2282)),
+""", 1, {"ritz0": 2282}),
 
     "tuple_destructure_call": (TUPLES + SLOT + """\
 fn f()
@@ -2247,7 +2247,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, tuple_gap(2282)),
+""", 2, {"ritz0": 2282, "ritz1": 3033, "ritz1_selfhosted": 3033}),
 
     "tuple_element_assigned_back": (TUPLES + SLOT + """\
 fn f()
@@ -2258,7 +2258,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, tuple_gap(2283)),
+""", 2, {"ritz0": 2283}),
 
     "tuple_element_assigned_drops_old": (TUPLES + SLOT + """\
 fn f()
@@ -2268,7 +2268,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, tuple_gap(2283)),
+""", 2, {"ritz0": 2283}),
 
     "tuple_element_in_generic_field": (TUPLES + SLOT + """\
 struct GenPair<A>
@@ -2281,7 +2281,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),  # ritz0 fixed by #2741 (was #2285)
+""", 1, {"ritz1": 2975, "ritz1_selfhosted": 2975}),  # ritz0 fixed by #2741 (was #2285)
 
     # A binding from an element has the element's type, signedness included.
     "tuple_element_keeps_its_signedness": ("""\
@@ -2302,7 +2302,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, NO_TUPLES),
+""", 1, {}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -2617,14 +2617,14 @@ pub fn main() -> i32
 pub fn main() -> i32
     var p = (make(1), 2)
     return consume(p.0) + consume(p.0)
-""", "p.0", NO_TUPLES),
+""", "p.0", {}),
 
     "tuple_element_binding_after_move": (TUPLES + """\
 pub fn main() -> i32
     var p = (make(1), 2)
     var x = p.0
     return consume(x) + consume(x)
-""", "x", NO_TUPLES),
+""", "x", {}),
 
     "tuple_after_element_move": (TUPLES + """\
 pub fn main() -> i32
@@ -2632,7 +2632,7 @@ pub fn main() -> i32
     consume(p.0)
     var q = p
     return 0
-""", "p.0", NO_TUPLES),
+""", "p.0", {}),
 
     "tuple_in_field_after_element_move": (TUPLES + """\
 pub fn main() -> i32
@@ -2640,7 +2640,7 @@ pub fn main() -> i32
     consume(v.pair.0)
     var q = v.pair
     return 0
-""", "v.pair.0", NO_TUPLES),
+""", "v.pair.0", {}),
 }
 
 

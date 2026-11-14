@@ -49,7 +49,7 @@ pub fn module_new(p: *Parser) -> *Module
     # One module_new per file parsed, so this is the per-parse reset point
     # for the dropped-item counter checked by module_require_eof.
     parser_reset_diagnostics()
-    g_tuple_lits = null   # AGAST #2956: a failed parse's literals are not this file's
+    g_tuple_lits = 0   # AGAST #2956: a failed parse's literals are not this file's
     let m: *Module = parser_alloc(p, 56) as *Module  # Increased for impls field
     m.imports = null
     m.constants = null
@@ -3111,13 +3111,8 @@ struct TupleReg
 
 var g_tuple_regs: *TupleReg = null
 
-# Every tuple literal the current module's parse built, including those of
-# alternatives it backtracked out of (see tuple_report_unresolved).
-struct TupleLitRec
-    e: *Expr
-    next: *TupleLitRec
-
-var g_tuple_lits: *TupleLitRec = null
+# 1 once the current module's parse built a tuple literal (tuple_lit).
+var g_tuple_lits: i32 = 0
 
 # Called from grammar rule tuple_type_elem right after the element's
 # type_spec parses, while its parse state (struct name, pointee) is fresh.
@@ -3230,10 +3225,7 @@ pub fn tuple_lit(p: *Parser, first: *Expr, rest: *Expr, line: i32, col: i32) -> 
     e.ident_len = 0
     e.args = inits as *Expr   # a struct literal's FieldInit list, recast
     e.next = null
-    let rec: *TupleLitRec = parser_alloc(p, sizeof(TupleLitRec)) as *TupleLitRec
-    rec.e = e
-    rec.next = g_tuple_lits
-    g_tuple_lits = rec
+    g_tuple_lits = 1
     return e
 
 # The synthesized tuple struct a slot of struct type `name` names, or null.
@@ -3290,8 +3282,8 @@ fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
 #
 # `let (x, y) = (a, b)`, or an if / match whose arms are such literals
 # (`let (x0, x1) = if a <= b (a, b) else (b, a)`, angelo raster/fill.ritz),
-# names no tuple type, and ritz1 infers none (AGAST #3005).  None is needed:
-# each name is bound to its element directly.  A literal splits into
+# names no tuple type.  None is needed: each name is bound to its element
+# directly.  A literal splits into
 #
 #     let x = a
 #     let y = b
@@ -3309,8 +3301,9 @@ fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
 #
 # Split only when every arm is a bare literal of two elements, and no match
 # arm binds a name (its elements might read it, and the element `if`s are
-# outside the arm): an arm with statements before its tuple, a `Some(v) =>`
-# or bare `v =>` arm stays the located error of tuple_report_unresolved.
+# outside the arm).  Any other destructure (an arm with statements before
+# its tuple, a `Some(v) =>` or bare `v =>` arm) stays a STMT_TUPLE_DECL: the
+# emitter names each arm's tuple as it emits it (tuple_lit_name, #3005).
 
 var g_tuple_p: *Parser = null      # tuple_resolve_module's, for the AST built here
 var g_tuple_split_n: i32 = 0       # numbers the arm-index locals, unique per compile
@@ -3365,7 +3358,7 @@ fn tuple_split_index(e: *Expr, leaves: **Expr, next_idx: *i32) -> *Expr
         let i: i32 = *next_idx
         *(leaves + i) = e
         *next_idx = i + 1
-        # Consumed: tuple_report_unresolved must not report it.
+        # Consumed: its elements moved into the split `let`s.
         e.ident_ptr = c"(split)"
         e.ident_len = 7
         return expr_int(g_tuple_p, i as i64, e.span.line, e.span.col)
@@ -3474,44 +3467,6 @@ fn tuple_resolve_fn(f: *FnDef)
     tuple_resolve_stmts(f.body, g_tuple_ret_slot)
     g_tuple_ret_slot = null
 
-# A literal still nameless has no tuple slot.  The list also holds literals
-# of alternatives the parser backtracked out of; each was re-parsed at the
-# same place by the alternative that won, so a nameless one is reported only
-# if no literal at its place was named, and each place once.
-fn tuple_report_unresolved()
-    var r: *TupleLitRec = g_tuple_lits
-    while r != null
-        let e: *Expr = r.e
-        if e.ident_len == 0
-            # named: some literal at this place got a type.  seen: an
-            # earlier nameless one at this place already reported it.
-            var named: i32 = 0
-            var seen: i32 = 0
-            var before: i32 = 1
-            var q: *TupleLitRec = g_tuple_lits
-            while q != null
-                if q == r
-                    before = 0
-                else if q.e.span.line == e.span.line and q.e.span.col == e.span.col
-                    if q.e.ident_len != 0
-                        named = 1
-                    else if before == 1
-                        seen = 1
-                q = q.next
-            if named == 0 and seen == 0
-                g_attr_errors = g_attr_errors + 1
-                eprints_cstr(c"error: ")
-                if g_parse_file != null
-                    eprints_cstr(g_parse_file)
-                else
-                    eprints_cstr(c"<input>")
-                eprint_char(':')
-                eprint_i64(e.span.line as i64)
-                eprint_char(':')
-                eprint_i64(e.span.col as i64)
-                eprintln_cstr(c": a tuple expression needs a tuple type with as many elements from where it is used (a fn's return type, an annotated `let` / `var`, or an enclosing tuple), or a `let (x, y) =` that splits it (a tuple, or an if / match whose arms are bare tuples binding nothing); ritz1 does not infer one (AGAST #3005)")
-        r = r.next
-
 fn type_params_name(tp: *TypeParam, name: *u8, len: i32) -> i32
     while tp != null
         if tp.name_len == len and memcmp(tp.name, name, len as i64) == 0
@@ -3573,11 +3528,12 @@ fn tuple_reject_generic(p: *Parser)
                 f = f.next
         r = r.next
 
-# Module end: name every tuple literal of this module from its slot, then
-# report the ones left nameless and any tuple over a generic parameter.
+# Module end: name every tuple literal of this module from its slot, and
+# report any tuple over a generic parameter.  A literal left nameless is
+# named by the emitter (tuple_lit_name, AGAST #3005).
 pub fn tuple_resolve_module(p: *Parser)
     tuple_reject_generic(p)
-    if g_tuple_lits == null
+    if g_tuple_lits == 0
         return
     g_tuple_p = p
     var f: *FnDef = p.module.functions
@@ -3591,8 +3547,7 @@ pub fn tuple_resolve_module(p: *Parser)
             tuple_resolve_fn(mt)
             mt = mt.next
         ib = ib.next
-    tuple_report_unresolved()
-    g_tuple_lits = null
+    g_tuple_lits = 0
 
 # =============================================================================
 # Statement helpers

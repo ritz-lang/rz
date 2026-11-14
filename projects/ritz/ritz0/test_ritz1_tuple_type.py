@@ -24,9 +24,10 @@ generic field, destructure) carries a tuple too.
 A tuple expression `(a, b)` parses as a struct literal whose type is
 resolved from its slot: a fn's return type (tail or `return`), an annotated
 `let` / `var`, or an enclosing tuple literal's element (nested tuples).  One
-with no known slot is a located error rather than a guess, as is a tuple
-over a generic parameter (`-> (T, T)`), which monomorphization would
-leave a `%T` field in.
+with no known slot is typed in the emitter, from a call's parameter, a
+struct field or an earlier match arm, else from its elements (AGAST #3005).
+A tuple over a generic parameter (`-> (T, T)`), which monomorphization
+would leave a `%T` field in, is a located error.
 """
 
 import os
@@ -185,6 +186,64 @@ pub fn main() -> i32
 """
 
 
+# AGAST #3005: a tuple no slot types (the rejections of #2956 / #2974), typed
+# from its elements.  `let x = (a, a)`: f(1) = 1 + 1 + 1 = 3.
+INFER_LET = """\
+fn f(a: i32) -> i32
+    let x = (a, a)
+    let (p, q) = x
+    a + p + q
+
+pub fn main() -> i32
+    f(1)
+"""
+
+# An if arm with statements before its tuple.  f(true) + f(false) = 4 + 0.
+INFER_IF_ARM_STMTS = """\
+fn f(c: bool) -> i32
+    let (x, y) = if c
+        let q = 3
+        (q, 1)
+    else
+        (0, 0)
+    x + y
+
+pub fn main() -> i32
+    f(true) + f(false)
+"""
+
+# A match arm binding a name its tuple reads; ritz0 can't build it (#3022).
+# f(Some(2)) + f(None) = 3 + 0.
+INFER_MATCH_ARM_BINDS = """\
+import ritzlib.option
+
+fn f(o: Option<i32>) -> i32
+    let (x, y) = match o
+        Some(v) => (v, 1)
+        _ => (0, 0)
+    x + y
+
+pub fn main() -> i32
+    f(Some(2)) + f(None)
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "compiler,name,program,expected",
+    [
+        ("ritz0", "tuple_infer_let", INFER_LET, 3),
+        ("ritz1", "tuple_infer_let", INFER_LET, 3),
+        ("ritz0", "tuple_infer_if_arm_stmts", INFER_IF_ARM_STMTS, 4),
+        ("ritz1", "tuple_infer_if_arm_stmts", INFER_IF_ARM_STMTS, 4),
+        ("ritz1", "tuple_infer_match_arm_binds", INFER_MATCH_ARM_BINDS, 3),
+    ],
+)
+def test_tuple_with_no_slot_runs(ritz1_bin, tmp_path, compiler, name, program, expected):
+    """The programs ritz1 refused until AGAST #3005 now run, as on ritz0."""
+    assert _run_pkg(compiler, tmp_path, name, program) == expected
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 @pytest.mark.parametrize(
@@ -243,50 +302,17 @@ def test_ritz1_mangles_and_lays_out_tuples_as_ritz0(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_rejects_tuple_expr_with_no_known_type(ritz1_bin, tmp_path):
-    """A tuple expression whose slot names no tuple type, and that no
-    `let (x, y) =` splits, is a located error, not a struct literal of an
-    unnamed type (AGAST #3005 would infer it)."""
+def test_ritz1_rejects_tuple_element_it_cannot_type(ritz1_bin, tmp_path):
+    """A tuple with no tuple type is typed from its elements (AGAST #3005);
+    an element ritz1 can't spell as a tuple field (a pointer) is a located
+    error at that element, not a struct literal of an unnamed type."""
     proc = _ritz1_ir(
         ritz1_bin,
         tmp_path,
-        "fn f(a: i32) -> i32\n    let x = (a, a)\n    a\n\npub fn main() -> i32\n    f(1)\n",
+        "fn f(p: *u8) -> i32\n    let t = (p, 1)\n    0\n\npub fn main() -> i32\n    f(null)\n",
     )
     assert proc.returncode != 0
-    assert re.search(r"t\.ritz:2:13: .*tuple.*#3005", proc.stderr), proc.stderr[-2000:]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "src,where",
-    [
-        # An arm with statements before its tuple, whose elements may read them.
-        (
-            (
-                "fn f(c: bool) -> i32\n    let (x, y) = if c\n        let q = 3\n        (q, 1)\n"
-                "    else\n        (0, 0)\n    x + y\n\npub fn main() -> i32\n    f(true)\n"
-            ),
-            "4:9",
-        ),
-        # A match arm that binds a name its elements may read.
-        (
-            (
-                "import ritzlib.option\n\nfn f(o: Option<i32>) -> i32\n    let (x, y) = match o\n"
-                "        Some(v) => (v, 1)\n        _ => (0, 0)\n    x + y\n\n"
-                "pub fn main() -> i32\n    f(Some(2))\n"
-            ),
-            "5:20",
-        ),
-    ],
-    ids=["if_arm_stmts", "match_arm_binds"],
-)
-def test_ritz1_rejects_tuple_destructure_it_cannot_split(ritz1_bin, tmp_path, src, where):
-    """`let (x, y) = if / match ..` splits only arms that are bare tuple
-    literals binding nothing; any other arm leaves the tuple a located error
-    (AGAST #3005)."""
-    proc = _ritz1_ir(ritz1_bin, tmp_path, src)
-    assert proc.returncode != 0
-    assert re.search(rf"t\.ritz:{where}: .*tuple.*#3005", proc.stderr), proc.stderr[-2000:]
+    assert re.search(r"t\.ritz:2:14: .*tuple element.*#3024", proc.stderr), proc.stderr[-2000:]
 
 
 @pytest.mark.integration
