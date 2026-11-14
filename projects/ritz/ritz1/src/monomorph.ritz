@@ -842,8 +842,13 @@ fn collect_struct_types_from_fields(m: *Module, f: *StructField)
     while cur != null
         if cur.field_type == TYPE_STRUCT and cur.field_type_name != null
             add_struct_from_mangled_name(m, cur.field_type_name, cur.field_type_name_len)
-        # AGAST #2390: and its array elements', `W$i32.a: [2]Box$i32`.
-        if cur.field_type == TYPE_ARRAY and cur.array_elem_type == TYPE_STRUCT and cur.array_elem_type_name != null
+        # AGAST #3099: and a pointee's, `W$u16.b: *Box$u16`: `w.b.v` reads
+        # Box$u16's layout though no fn names it.
+        if (cur.field_type == TYPE_PTR or cur.field_type == TYPE_REF or cur.field_type == TYPE_MUT_REF) and cur.field_type_name != null
+            add_struct_from_mangled_name(m, cur.field_type_name, cur.field_type_name_len)
+        # AGAST #2390: and its array elements', `W$i32.a: [2]Box$i32`, or
+        # (#3099) `[2]*Box$i32`.
+        if cur.field_type == TYPE_ARRAY and array_elem_names_struct(cur) == 1
             add_struct_from_mangled_name(m, cur.array_elem_type_name, cur.array_elem_type_name_len)
         cur = cur.next
 
@@ -3316,11 +3321,20 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
         if fields.field_type_name != null and fields.field_type_name_len == type_param_len
             if memcmp(fields.field_type_name, type_param, type_param_len as i64) == 0
                 subst_pointee_field(cloned, subst_type, subst_name, subst_len)
+        if fields.field_type_name != null and find_dollar_sign(fields.field_type_name, fields.field_type_name_len) > 0
+            # AGAST #3099: a generic pointee, `b: *Box<T>` is `*Box$T`:
+            # rewrite its `$T`, as the by-value `b: Box<T>` above.  Copied as
+            # it stood, `w.b.v` named the `%Box$T` no struct is, and fell to
+            # "unhandled EXPR_MEMBER".
+            var pt_len: i32 = 0
+            substitute_type_param_in_name(fields.field_type_name, fields.field_type_name_len, type_param, type_param_len, suffix, suffix_len, @cloned.field_type_name, @pt_len)
+            cloned.field_type_name_len = pt_len
     subst_array_ptr_field(cloned, type_param, type_param_len, subst_type, subst_name, subst_len)
     subst_array_elem_field(cloned, type_param, type_param_len, subst_type, subst_name, subst_len)
-    if cloned.field_type == TYPE_ARRAY and cloned.array_elem_type == TYPE_STRUCT and cloned.array_elem_type_name != null
+    if cloned.field_type == TYPE_ARRAY and array_elem_names_struct(cloned) == 1
         if find_dollar_sign(cloned.array_elem_type_name, cloned.array_elem_type_name_len) > 0
-            # AGAST #2390: `a: [2]Box<T>` is `[2]Box$T`: rewrite its `$T`.
+            # AGAST #2390: `a: [2]Box<T>` is `[2]Box$T`: rewrite its `$T`;
+            # and #3099, `a: [2]*Box<T>`'s pointee `Box$T`.
             var ae_len: i32 = 0
             substitute_type_param_in_name(fields.array_elem_type_name, fields.array_elem_type_name_len, type_param, type_param_len, suffix, suffix_len, @cloned.array_elem_type_name, @ae_len)
             cloned.array_elem_type_name_len = ae_len
@@ -3329,6 +3343,16 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
     cloned.next = clone_struct_fields(fields.next, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
 
     return cloned
+
+# An array field's element names a struct: `[N]S` or (AGAST #3099) `[N]*S`.
+fn array_elem_names_struct(f: *StructField) -> i32
+    if f.array_elem_type_name == null
+        return 0
+    if f.array_elem_type == TYPE_STRUCT
+        return 1
+    if f.array_elem_type == TYPE_PTR and f.array_elem_pointee == TYPE_STRUCT
+        return 1
+    0
 
 # AGAST #2332: a field `a: [N]*T`, at T = the argument (subst_type, subst_name).
 fn subst_array_ptr_field(cloned: *StructField, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32)
@@ -3482,6 +3506,11 @@ fn clone_struct_fields_multi(fields: *StructField, tp: *TypeParam, suffix: *u8, 
             let arg_e: *u8 = suffix + *(starts + ai)
             get_type_name_from_suffix(arg_e, *(lens + ai), @ae_name, @ae_len)
             subst_array_ptr_field(cloned, fields.array_elem_type_name, fields.array_elem_type_name_len, parse_type_from_suffix(arg_e, *(lens + ai)), ae_name, ae_len)
+        else if ft == TYPE_ARRAY and find_dollar_sign(fields.array_elem_type_name, fields.array_elem_type_name_len) > 0
+            # AGAST #3099: `a: [N]*Box<V>`, its pointee's parameters rewritten.
+            var ap_len: i32 = 0
+            cloned.array_elem_type_name = substitute_params_in_mangled(tp, suffix, starts, lens, fields.array_elem_type_name, fields.array_elem_type_name_len, @ap_len)
+            cloned.array_elem_type_name_len = ap_len
 
     # AGAST #2390: `a: [N]T` / `a: [N]Box<T>` with T one of several parameters.
     if ft == TYPE_ARRAY and fields.array_elem_type == TYPE_STRUCT and fields.array_elem_type_name != null

@@ -149,7 +149,7 @@ GENERIC_SHAPES = {
     # AGAST #3080: ritz0 left a generic struct named in a field of a generic
     # struct (`Box<T>` -> `Box<i32>`) uninstantiated, so it lowered as i8.
     # Each row's inner instance appears nowhere else in the program, except
-    # ptr_box_elem's, which needs a Box<u16> to point at.
+    # where a pointer field needs a Box to point at.
     # The plain field: it was `i8` as the array was `[2 x i8]`.
     "box_field": (_BOX + "struct W<T>\n    lo: i64\n    b: Box<T>\n    hi: i64\n\n" + MAIN
                   + _ind("var w: W<i64>\nw.lo = 11\nw.hi = 22\nw.b.v = 5000000000\n"
@@ -163,9 +163,36 @@ GENERIC_SHAPES = {
     # Through a pointer: the pointee is the instance, not i8.
     "ptr_box_elem": (_BOX + "struct W<T>\n    lo: i64\n    a: [2]*Box<T>\n    hi: i64\n\n" + MAIN
                      + _ind("var x: Box<u16>\nvar y: Box<u16>\nvar w: W<u16>\nw.lo = 11\nw.hi = 22\n"
-                            "w.a[0] = @x\nw.a[1] = @y\nw.a[0].v = 40000\nw.a[1].v = 40001\n"
+                            "w.a[0] = @x\nw.a[1] = @y\nw.a[0].v = 40000\nlet p = w.a[1]\np.v = 40001\n"
                             "if w.lo != 11 or w.hi != 22\n    return 9\n"
-                            "if x.v != 40000 or y.v != 40001\n    return 1\nreturn 0\n")),
+                            "if x.v != 40000 or y.v != 40001 or w.a[1].v != 40001\n"
+                            "    return 1\nreturn 0\n")),
+    # AGAST #3099: the plain pointer field, written and read through.
+    "ptr_box_field": (_BOX + "struct W<T>\n    lo: i64\n    b: *Box<T>\n    hi: i64\n\n" + MAIN
+                      + _ind("var x: Box<u16>\nvar w: W<u16>\nw.lo = 11\nw.hi = 22\n"
+                             "w.b = @x\nw.b.v = 40000\n"
+                             "if w.lo != 11 or w.hi != 22\n    return 9\n"
+                             "if x.v != 40000 or w.b.v != 40000\n    return 1\nreturn 0\n")),
+    # And Box<i64> named nowhere but through W's pointer, so instantiating
+    # W$i64 must instantiate it.  The address goes in through a `**u8`:
+    # `as *Box<i64>` would name it, and neither compiler takes that (#3124).
+    "ptr_box_unnamed": (_BOX + "struct W<T>\n    lo: i64\n    b: *Box<T>\n    hi: i64\n\n" + MAIN
+                        + _ind("var raw: [2]i64\nvar w: W<i64>\n*((@w.b) as **u8) = (@raw[1]) as *u8\n"
+                               "w.b.v = 5000000000\n"
+                               "if raw[1] != 5000000000 or w.b.v != 5000000000\n    return 1\nreturn 0\n")),
+    "ptr_box_elem_unnamed": (_BOX + "struct W<T>\n    lo: i64\n    a: [2]*Box<T>\n    hi: i64\n\n" + MAIN
+                             + _ind("var raw: [2]i64\nvar w: W<i64>\n*((@w.a[1]) as **u8) = (@raw[1]) as *u8\n"
+                                    "w.a[1].v = 5000000000\n"
+                                    "if raw[1] != 5000000000 or w.a[1].v != 5000000000\n"
+                                    "    return 1\nreturn 0\n")),
+    # #3099 with two parameters: each pointee takes its own argument.
+    "two_param_ptr_elem": (_BOX + "struct KV<K, V>\n    lo: K\n    a: [2]*Box<V>\n    b: *Box<K>\n    hi: i64\n\n"
+                           + MAIN
+                           + _ind("var x: Box<u16>\nvar y: Box<i64>\nvar w: KV<i64, u16>\nw.lo = 11\nw.hi = 22\n"
+                                  "w.a[1] = @x\nw.b = @y\nw.a[1].v = 40000\nw.b.v = 5000000000\n"
+                                  "if w.lo != 11 or w.hi != 22\n    return 9\n"
+                                  "if x.v != 40000 or y.v != 5000000000 or w.a[1].v != 40000\n"
+                                  "    return 1\nreturn 0\n")),
     # Both parameters reach one generic element, in swapped order.
     "two_param_elem": ("struct Pair<A, B>\n    a: A\n    b: B\n\n"
                        "struct KV<K, V>\n    lo: i64\n    a: [2]Pair<V, K>\n    hi: i64\n\n" + MAIN
@@ -180,10 +207,7 @@ GENERIC_SHAPES = {
 def _shape_rows():
     for shape in sorted(GENERIC_SHAPES):
         for compiler in COMPILERS:
-            marks = ()
-            if shape == "ptr_box_elem" and compiler != "ritz0":
-                marks = pytest.mark.xfail(strict=True, reason="AGAST #3099: ritz1 can't reach it")
-            yield pytest.param(shape, compiler, marks=marks, id=f"{shape}-{compiler}")
+            yield pytest.param(shape, compiler, id=f"{shape}-{compiler}")
 
 
 @pytest.mark.parametrize(("shape", "compiler"), list(_shape_rows()))

@@ -971,10 +971,8 @@ ELEMENT = "this `for` element type is not supported in ritz1"
 
 # Refused, not guessed at.  ritz0 runs these.  An element Vec has no struct for
 # is refused as an iterable, and one that it can't name as an element.
+# (`Vec<Option<i32>>` was one until #3099: see the test below.)
 REFUSED_ELEMENTS = {
-    "option": (GVEC + "import ritzlib.option\n\n" + MAIN
-               + "    var v: Vec<Option<i32>> = vec_new<Option<i32>>()\n" + _T.format(it="v"),
-               ELEMENT),
     # `Vec<[2]i32>` is `Vec$arr2_i32` since #2832 (it was a bare `Vec$`, no
     # struct, so refused as an iterable): its element is what's refused now.
     "array": (GVEC + MAIN + "    var v: Vec<[2]i32> = vec_new<[2]i32>()\n" + _T.format(it="v"),
@@ -998,6 +996,17 @@ def test_an_element_ritz1_cant_name_is_refused(compile_with, compiler, name):
     program, message = REFUSED_ELEMENTS[name]
     comp, ll, _ = compile_with(compiler, name, program)
     _is_refused(comp, ll, message, program)
+
+
+# AGAST #3099: an element named by nothing but the Vec, Option$i32 here.  ritz1
+# instantiates a specialised struct's pointee (Vec$Option$i32's `data: *T`),
+# so it can name the element.  Before, it refused this as one it couldn't.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_element_only_its_vec_names(run_with, compiler):
+    program = (GVEC + "import ritzlib.option\n\n" + MAIN
+               + "    var v: Vec<Option<i32>> = vec_new<Option<i32>>()\n" + _T.format(it="v"))
+    assert run_with(compiler, "only_vec", program) == 0
 
 
 # Refused, at the iterable.  `@v` of a reference is on no ticket: ritz0 refuses
