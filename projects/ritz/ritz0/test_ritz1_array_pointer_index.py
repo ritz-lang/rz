@@ -920,8 +920,8 @@ WHOLE_STRUCT_ELEMENT = {
     "let_integer_field": _S + "struct H\n    cs: [3]S\n\npub fn main() -> i32\n    var h: H\n    let n: i64 = h.cs[1]\n    return n as i32\n",
 }
 # AGAST #2996: every other integer use of `a[1]` on a `[3]S` itself.  ritz1 loaded
-# a `%S` and clang refused the IR, unlocated.  ritz0 refuses `+` and `=`, and fails
-# at clang on `as` and `return` (#2999).
+# a `%S` and clang refused the IR, unlocated.  ritz0 refuses `+` and `=`, and since
+# #2999 `as` and `return` too (test_ritz0_refuses_a_struct_as_an_integer).
 _DIRECT_BASES = {
     "local": ("", "    var a: [3]S\n", "a"),
     "global": ("var G: [3]S\n\n", "", "G"),
@@ -947,6 +947,70 @@ def test_ritz1_refuses_a_whole_struct_element(compile_with, name, compiler):
     assert comp.returncode != 0
     assert "a whole struct element is not a value here in ritz1" in comp.stderr
     assert "main.ritz:" in comp.stderr
+
+
+# AGAST #2999: ritz0 typed `a[1] as i32`, and `return a[1]` from an `-> i64` fn, as
+# the struct itself, and clang refused the IR ("value doesn't match function result
+# type").  ritz0 refuses any struct value as an integer, located; ritz1's rows above.
+RITZ0_STRUCT_AS_INTEGER = sorted(n for n in WHOLE_STRUCT_ELEMENT if n.startswith(("cast", "returned")))
+# Not only an element: a struct local, param or call result, cast or returned,
+# and the `return` in a match arm and the tail that stand for one.
+_SMK = "fn mk() -> S\n    var s: S\n    s.x = 5\n    return s\n\n"
+STRUCT_AS_INTEGER = {
+    "cast_struct_local": _S + "pub fn main() -> i32\n    var s: S\n    return s as i32\n",
+    "cast_struct_param": _S + _SMK + "fn f(s: S) -> i32\n    return s as i32\n\npub fn main() -> i32\n    return f(mk())\n",
+    "cast_struct_call": _S + _SMK + "pub fn main() -> i32\n    return mk() as i32\n",
+    "cast_struct_to_alias": "type Word = i64\n\n" + _S + "pub fn main() -> i32\n    var s: S\n    let w = s as Word\n"
+    + "    return w as i32\n",
+    "returned_struct_local": _S + "fn f() -> i64\n    var s: S\n    return s\n\n"
+    + "pub fn main() -> i32\n    return f() as i32\n",
+    "returned_struct_param": _S + _SMK + "fn f(s: S) -> i64\n    return s\n\n"
+    + "pub fn main() -> i32\n    return f(mk()) as i32\n",
+    "returned_struct_call": _S + _SMK + "fn f() -> i64\n    return mk()\n\npub fn main() -> i32\n    return f() as i32\n",
+    "returned_struct_in_match": _S + _SMK + "fn f(k: i32) -> i64\n    let v = match k\n        0 => return mk()\n"
+    + "        _ => 1\n    return v\n\npub fn main() -> i32\n    return f(0) as i32\n",
+    "tail_struct_call": _S + _SMK + "fn f() -> i64\n    mk()\n\npub fn main() -> i32\n    return f() as i32\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", RITZ0_STRUCT_AS_INTEGER + sorted(STRUCT_AS_INTEGER))
+def test_ritz0_refuses_a_struct_as_an_integer(compile_with, name):
+    program = WHOLE_STRUCT_ELEMENT.get(name) or STRUCT_AS_INTEGER[name]
+    comp, _, _ = compile_with("ritz0", name, program)
+    assert comp.returncode != 0
+    assert "a struct is not an integer" in comp.stderr
+    # The cast's own refusal, not the `return` it sits in.
+    assert ("cannot cast struct `S`" if name.startswith("cast") else "the fn returns `i") in comp.stderr
+    assert "main.ritz:" in comp.stderr
+
+
+# What stays legal beside it: the element's address cast to a pointer, an integer
+# field cast, and (STRUCT_COPIES' returned_*) `return a[1]` from an `-> S` fn.
+STRUCT_NEIGHBOURS = {
+    "cast_address": _S + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    let p = @a[1] as *i32\n"
+    + "    return *p\n",
+    "cast_field": _S + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    return a[1].x as i32\n",
+    "cast_field_widened": _S + "fn f() -> i64\n    var a: [3]S\n    a[1].x = 5\n    return a[1].x as i64\n\n"
+    + "pub fn main() -> i32\n    return f() as i32\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(STRUCT_NEIGHBOURS))
+def test_a_struct_field_or_address_still_casts(run_with, name, compiler):
+    assert run_with(compiler, name, STRUCT_NEIGHBOURS[name]) == 5
+
+
+# ritz0 lowers the unresolved `io.StrView` to an i8 placeholder, so its LLVM type
+# says integer; harland's `"..." as serial.StrView` is this.  ritz1 doesn't parse
+# a qualified type after `as`.
+@pytest.mark.integration
+def test_ritz0_casts_a_struct_to_a_qualified_struct(run_with):
+    program = ("import ritzlib.io\n\nfn n(s: StrView) -> i32\n    return s.len as i32\n\n"
+               "pub fn main() -> i32\n    return n(\"hello\" as io.StrView)\n")
+    assert run_with("ritz0", "cast_to_qualified_struct", program) == 5
 
 
 # The ordinary pointer stays pointer arithmetic, and its store stays a store.

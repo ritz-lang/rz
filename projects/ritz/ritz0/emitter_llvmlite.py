@@ -26,7 +26,7 @@ from metadata import type_to_string
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
-from type_checker import check_ref_slots
+from type_checker import TypeChecker, check_ref_slots
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
 
@@ -5216,6 +5216,9 @@ class LLVMEmitter:
                     self._reject_enum_as_int(
                         last_val, ret_type, fn_def.ret_type,
                         getattr(fn_def.body.expr, 'span', None))
+                    self._reject_struct_as_int(
+                        last_val, ret_type, fn_def.ret_type, fn_def.body.expr,
+                        getattr(fn_def.body.expr, 'span', None))
                 last_val = self._convert_type(last_val, ret_type, fn_def.body.expr)
                 # A fn with no declared return type is a procedure: its tail
                 # expression is evaluated for effect only. _convert_type
@@ -5903,10 +5906,10 @@ class LLVMEmitter:
                     val = self._emit_return_operand(stmt.value)
                 self.closure_expected_type = None  # Clear context
                 self.expected_ritz_type = None
-                self._reject_enum_as_int(
-                    val, ret_type,
-                    self.current_fn_def.ret_type if self.current_fn_def else None,
-                    getattr(stmt.value, 'span', None) or getattr(stmt, 'span', None))
+                ret_ritz = self.current_fn_def.ret_type if self.current_fn_def else None
+                ret_span = getattr(stmt.value, 'span', None) or getattr(stmt, 'span', None)
+                self._reject_enum_as_int(val, ret_type, ret_ritz, ret_span)
+                self._reject_struct_as_int(val, ret_type, ret_ritz, stmt.value, ret_span)
                 val = self._convert_type(val, ret_type, stmt.value)
                 # Emit drops for all scopes before return (excluding moved variable)
                 self._emit_drop_for_all_scopes(exclude_var)
@@ -9968,10 +9971,10 @@ class LLVMEmitter:
         if expr.value is not None:
             self._expect_returned_value_from(expr.value)
             ret_val = self._emit_return_operand(expr.value)
-            self._reject_enum_as_int(
-                ret_val, ret_type,
-                self.current_fn_def.ret_type if self.current_fn_def else None,
-                getattr(expr.value, 'span', None) or getattr(expr, 'span', None))
+            ret_ritz = self.current_fn_def.ret_type if self.current_fn_def else None
+            ret_span = getattr(expr.value, 'span', None) or getattr(expr, 'span', None)
+            self._reject_enum_as_int(ret_val, ret_type, ret_ritz, ret_span)
+            self._reject_struct_as_int(ret_val, ret_type, ret_ritz, expr.value, ret_span)
             ret_val = self._convert_type(ret_val, ret_type)
             self._emit_drop_for_all_scopes()
             self.builder.ret(ret_val)
@@ -15406,6 +15409,16 @@ class LLVMEmitter:
             enum_int = self._try_emit_enum_to_int(val, target_type, expr)
             if enum_int is not None:
                 return enum_int
+            # AGAST #2999: `a[1] as i32` on a `[3]S`, or `s as i32`, fell
+            # through to _convert_type, which no-ops on a struct: clang then
+            # refused the IR.  Its address casts (`@a[1] as *u8`), a field does.
+            if (isinstance(val.type, ir.BaseStructType)
+                    and self._names_an_integer(expr.target)):
+                raise EmitError(
+                    f"cannot cast struct `{self._struct_spelling(val, expr.expr)}` to "
+                    f"`{self._format_ritz_type(expr.target)}`: {self.STRUCT_AS_INTEGER} "
+                    f"(read one of its fields, or take its address with @)",
+                    self._value_span(expr))
 
         # Check if source OR target is unsigned for proper extension
         # When casting to unsigned (e.g., i32 as u64), use zext to avoid sign pollution
@@ -15489,6 +15502,43 @@ class LLVMEmitter:
         expected = (self._format_ritz_type(ritz_type) if ritz_type is not None
                     else f"i{target_ty.width}")
         raise EmitError(self._enum_as_int_message(expected, entry[0]), span)
+
+    STRUCT_AS_INTEGER = "a struct is not an integer"
+
+    def _struct_spelling(self, val: ir.Value, expr: Optional[rast.Expr]) -> str:
+        """`S` for a struct value, from its Ritz type, else its LLVM name."""
+        ritz_ty = self._infer_ritz_type(expr) if expr is not None else None
+        if ritz_ty is not None:
+            return self._format_ritz_type(ritz_ty)
+        return getattr(val.type, 'name', None) or str(val.type)
+
+    def _names_an_integer(self, ty: Optional[rast.Type]) -> bool:
+        """`ty`, through aliases, is `i8`..`usize`.  Its LLVM type can't say:
+        an unresolved name such as `serial.StrView` lowers to an `i8`
+        placeholder (_ritz_type_to_llvm), and harland casts to one."""
+        ty = resolve_alias_in(ty, self.type_aliases) if ty is not None else None
+        return (isinstance(ty, rast.NamedType) and not ty.args
+                and ty.name in TypeChecker.INT_TYPES)
+
+    def _reject_struct_as_int(self, val: ir.Value, target_ty: ir.Type,
+                              ritz_type: Optional[rast.Type],
+                              expr: Optional[rast.Expr], span) -> None:
+        """A struct value returned from an integer fn (AGAST #2999).
+
+        _convert_type no-ops on an aggregate, so `return a[1]` (a `[3]S`
+        element), `return s` or a struct-valued tail in an `-> i64` fn was
+        emitted as `ret %S` and clang refused the IR, unlocated.  Enums go
+        through _reject_enum_as_int first, so only a plain struct gets here.
+        """
+        if (val is ir.Undefined or not isinstance(target_ty, ir.IntType)
+                or not isinstance(val.type, ir.BaseStructType)
+                or not self._names_an_integer(ritz_type)):
+            return
+        expected = self._format_ritz_type(ritz_type)
+        raise EmitError(
+            f"the fn returns `{expected}`, but this is struct "
+            f"`{self._struct_spelling(val, expr)}`: {self.STRUCT_AS_INTEGER} "
+            f"(return one of its fields)", span)
 
     def _reject_enum_assign(self, target: rast.Expr, val: ir.Value, span) -> None:
         """`x = St.B` where `x` is an integer: _reject_enum_as_int for the

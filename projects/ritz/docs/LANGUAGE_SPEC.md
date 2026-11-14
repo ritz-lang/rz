@@ -4205,7 +4205,7 @@ async fn fetch(x: i32) -> i32
     x
 
 async fn go(x: i32) -> i32
-    await fetch(x)
+    return await fetch(x)
 
 fn main() -> i32
     0
@@ -4213,11 +4213,13 @@ fn main() -> i32
 
 ### 16.2 Await
 
-`await` is supported in tail position. Binding an awaited value
+`await` is supported as a `return` operand (`return await fetch(x)`) and as a
+statement. A bare tail `await fetch(x)` without `return` is not yet an await
+point: the poll fn would return the `fetch_Future` struct, which ritz0 refuses
+("a struct is not an integer", AGAST #3011). Binding an awaited value
 (`let v = await fetch(x)`) currently fails to lower — the transform does not
 add the temporary to the generated future struct, so it reports `Unknown field
-v in struct go_Future`. Keep `await` as the arm/tail expression until that is
-fixed.
+v in struct go_Future`. Write `return await` until those are fixed.
 
 ### 16.3 Runtime
 
