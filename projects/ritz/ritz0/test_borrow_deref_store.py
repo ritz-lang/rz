@@ -20,8 +20,8 @@ A `h:& *U` borrow keeps the pointer path: `*p = v` stores through the pointer
 already did (ritz0 raised the same ValueError). An `a:& [N]T` is still refused
 (#2290), now located on ritz0 too, and a plain value is still refused (#2885).
 
-Rows that also READ `*h` are strict xfails on ritz1 until #2971 (ritz1's `*h`
-read of an integer borrow segfaults); their stores are right.
+Rows that READ `*h` read the caller's T on all three (#2971): ritz1 loaded
+through the int's value as an address and segfaulted.
 
 Every program returns its expected exit code on success.
 """
@@ -45,9 +45,7 @@ RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
-READ_2971 = "AGAST #2971: ritz1's `*h` read of an integer or bool borrow segfaults"
-
-# name: (program, exit code, reads `*h`)
+# name: (program, exit code)
 PROGRAMS = {
     # The ticket's repro: the caller sees 3, and so does the callee's `*h`.
     "i32_repro": ("""\
@@ -59,7 +57,7 @@ pub fn main() -> i32
     var n: i32 = 2
     let r = f(n)
     return n * 10 + r
-""", 33, True),
+""", 33),
     "i32_store": ("""\
 fn f(h:& i32, v: i32)
     *h = v
@@ -68,7 +66,7 @@ pub fn main() -> i32
     var n: i32 = 2
     f(n, 7)
     return n
-""", 7, False),
+""", 7),
     # One byte, so the store is that wide: the neighbours keep their 9s.
     "u8_store_element": ("""\
 fn f(h:& u8, v: u8)
@@ -78,7 +76,7 @@ pub fn main() -> i32
     var a: [3]u8 = [9, 1, 9]
     f(a[1], 7)
     return (a[0] as i32) * 100 + (a[1] as i32) * 10 + (a[2] as i32) - 900
-""", 79, False),
+""", 79),
     "u8_repro": ("""\
 fn f(h:& u8) -> u8
     *h = *h + 1
@@ -88,7 +86,7 @@ pub fn main() -> i32
     var n: u8 = 2
     let r = f(n)
     return (n as i32) * 10 + (r as i32)
-""", 33, True),
+""", 33),
     "i32_compound": ("""\
 fn f(h:& i32) -> i32
     *h += 1
@@ -98,7 +96,7 @@ pub fn main() -> i32
     var n: i32 = 2
     let r = f(n)
     return n * 10 + r
-""", 33, True),
+""", 33),
     "bool_store": ("""\
 fn f(h:& bool, v: bool)
     *h = v
@@ -109,7 +107,7 @@ pub fn main() -> i32
     if b
         return 33
     return 1
-""", 33, False),
+""", 33),
     "bool_not": ("""\
 fn f(h:& bool)
     *h = not *h
@@ -120,7 +118,7 @@ pub fn main() -> i32
     if b
         return 33
     return 1
-""", 33, True),
+""", 33),
     "struct_store": ("""\
 struct H
     i: i32
@@ -133,7 +131,59 @@ pub fn main() -> i32
     var x: H = H { i: 1, j: 1 }
     f(x)
     return x.i * 10 + (x.j as i32)
-""", 34, False),
+""", 34),
+    # AGAST #2971: `*h` reads the caller's T, whatever its width, and is a
+    # value like any other: an operand, and an argument.
+    "i64_read": ("""\
+fn f(h:& i64) -> i64
+    return *h + 1
+
+pub fn main() -> i32
+    var n: i64 = 5000000000
+    return (f(n) - 4999999970) as i32
+""", 31),
+    "bool_read": ("""\
+fn f(h:& bool) -> i32
+    if *h
+        return 33
+    return 1
+
+pub fn main() -> i32
+    var b: bool = true
+    return f(b)
+""", 33),
+    "read_in_expression": ("""\
+fn f(h:& i32, k:& u16) -> i32
+    return (*h * 3 + (*k as i32)) - *h
+
+pub fn main() -> i32
+    var n: i32 = 5
+    var m: u16 = 7
+    return f(n, m)
+""", 17),
+    "read_as_argument": ("""\
+fn g(v: i32) -> i32
+    return v * 2
+
+fn f(h:& i32) -> i32
+    return g(*h)
+
+pub fn main() -> i32
+    var n: i32 = 6
+    return f(n)
+""", 12),
+    "struct_field_read": ("""\
+struct C
+    x: i32
+    y: i64
+
+fn f(h:& C) -> i32
+    return (*h).x + ((*h).y as i32)
+
+pub fn main() -> i32
+    var c: C = C { x: 30, y: 4 }
+    return f(c)
+""", 34),
     # `h:& *i32`: `*p` is through the pointer p holds, as it was.
     "pointer_borrow": ("""\
 fn f(p:& *i32)
@@ -144,7 +194,7 @@ pub fn main() -> i32
     var p: *i32 = @x
     f(p)
     return x
-""", 3, False),
+""", 3),
 }
 
 
@@ -201,16 +251,13 @@ def _run(compiler, tmp_path, name, src):
 
 def _cases():
     for compiler in COMPILERS:
-        for name, (_, _, reads) in sorted(PROGRAMS.items()):
-            marks = ()
-            if reads and compiler != "ritz0":
-                marks = pytest.mark.xfail(strict=True, reason=READ_2971)
-            yield pytest.param(compiler, name, marks=marks, id=f"{compiler}-{name}")
+        for name in sorted(PROGRAMS):
+            yield pytest.param(compiler, name, id=f"{compiler}-{name}")
 
 
 @pytest.mark.parametrize("compiler,name", list(_cases()))
 def test_store_through_a_borrow_deref(compiler, tmp_path, name):
-    src, want, _ = PROGRAMS[name]
+    src, want = PROGRAMS[name]
     assert _run(compiler, tmp_path, name, src) == want
 
 

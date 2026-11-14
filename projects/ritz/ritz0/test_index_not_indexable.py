@@ -149,14 +149,13 @@ def test_a_bare_deref_of_a_pointer_still_runs(run_with, compiler):
 
 
 # `*h` of an integer borrow reads as the caller's int (#2045): it isn't a value.
-# ritz1 compiles it, then loads through the int (#2971).
+# ritz1 loaded through the int's value as an address, and segfaulted (#2971).
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_bare_deref_of_a_borrow_is_not_refused(compile_with, compiler):
+def test_a_bare_deref_of_a_borrow_is_not_refused(run_with, compiler):
     program = (f"{HEADER}fn f(h:& i32) -> i32\n    return *h + 1\n\n"
                f"pub fn main() -> i32\n{INT}    return f(@&n)\n")
-    comp, _, _ = compile_with(compiler, "int_borrow", program)
-    assert comp.returncode == 0, (comp.stdout + comp.stderr)[-1000:]
+    assert run_with(compiler, "int_borrow", program) == 6
 
 
 # The legal neighbours: an element that is indexable, and a field of a struct element.
