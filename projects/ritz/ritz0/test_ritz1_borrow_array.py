@@ -1556,11 +1556,19 @@ def test_indexes_through_a_pointer_param(ritz1_bin, tmp_path, name, compiler):
     assert _run(compiler, ritz1_bin, tmp_path, name, TYPES + POINTER_INDEX[name]) == 3
 
 
-# AGAST #2322: ritz0 refuses these; the bare array reads as its address.
+# AGAST #2322: ritz0 refuses these.  ritz1 read a bare `a:& [N]T` as its
+# pointer, so the array's address leaked in as an integer.  Only a reborrow
+# (`g(a)` into a `:&`, `@[N]T` or `@&[N]T` param) takes the pointer now.
 LAX = {
     "integer_slot": """
 fn f(a:& [2]i32) -> i32
     var x: i64 = a
+    return 3
+""" + MAIN_13,
+    "integer_assign": """
+fn f(a:& [2]i32) -> i32
+    var x: i64 = 0
+    x = a
     return 3
 """ + MAIN_13,
     "cast_to_pointer": """
@@ -1579,6 +1587,29 @@ fn f(a:& [2]i32) -> i32
         return 0
     return 3
 """ + MAIN_13,
+    "compare_not_null": """
+fn f(a:& [2]i32) -> i32
+    if a != null
+        return 3
+    return 0
+""" + MAIN_13,
+    "nested_integer_slot": """
+fn f(a:& [2][2]i32) -> i32
+    var x: i64 = a
+    return 3
+
+pub fn main() -> i32
+    var a: [2][2]i32
+    return f(@&a)
+""",
+    # Not `:&`: a declared type was overridden by the array's, so this copied
+    # the array into `x` (the same var-decl arm as `integer_slot`).
+    "plain_integer_slot": """
+pub fn main() -> i32
+    var b: [2]i32 = [1, 3]
+    var x: i64 = b
+    return 3
+""",
 }
 
 
@@ -1589,20 +1620,16 @@ def test_ritz0_refuses_a_bare_array_as_an_address(tmp_path, name):
     assert comp.returncode != 0
 
 
-# AGAST #2370 refuses the cast to a pointer on ritz1: a value cast to a
-# reference is the bare form's error.
-LAX_GAPS = sorted(set(LAX) - {"cast_to_pointer"})
+# The cast to a pointer is #2370's refusal too; the bare read is refused as well.
+BARE_ARRAY = r"a (whole|multi-dimensional) array is not a value"
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", [
-    *(pytest.param(n, marks=pytest.mark.xfail(
-        strict=True, reason="AGAST #2322: a bare `:&` array reads as its pointer")) for n in LAX_GAPS),
-    "cast_to_pointer",
-])
+@pytest.mark.parametrize("name", sorted(LAX))
 def test_ritz1_refuses_a_bare_array_as_an_address(ritz1_bin, tmp_path, name):
-    comp, _, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + LAX[name])
-    assert comp.returncode != 0
+    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + LAX[name])
+    assert comp.returncode != 0 and not ll.exists()
+    assert re.search(BARE_ARRAY, comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 
 # AGAST #2323: a pointer to no array is refused into `:& [N]T`, as ritz0 refuses it.
