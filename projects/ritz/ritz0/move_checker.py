@@ -192,7 +192,21 @@ class MoveTypes:
                 self.enums[item.name] = item
             elif isinstance(item, rast.TypeAlias):
                 self.aliases[item.name] = item.target
-        self._cache: Dict[str, bool] = {}
+        # The type parameters of the generic fn or impl being checked. They
+        # shadow any type of the same name (AGAST #2966): in `fn take<T>` the
+        # `T` is the parameter, a copy type here, not a `struct T`.
+        self.params: frozenset = frozenset()
+        self._caches: dict[frozenset, dict[str, bool]] = {}
+        self._cache: dict[str, bool] = self._caches.setdefault(self.params, {})
+
+    def set_params(self, names) -> None:
+        """Check under the type parameters `names` (empty outside a generic).
+        Each set keeps its own cache: `Wrap<T>` differs with `T` shadowed."""
+        self.params = frozenset(names)
+        self._cache = self._caches.setdefault(self.params, {})
+
+    def _is_param(self, ty: rast.Type | None) -> bool:
+        return isinstance(ty, rast.NamedType) and not ty.args and ty.name in self.params
 
     def has_own_drop(self, ty: rast.Type) -> bool:
         return isinstance(ty, rast.NamedType) and ty.name in self.drop_types
@@ -217,6 +231,8 @@ class MoveTypes:
 
     def _compute(self, ty: rast.Type) -> bool:
         if isinstance(ty, rast.NamedType):
+            if self._is_param(ty):
+                return False
             if ty.name in self.drop_types:
                 return True
             if any(self.is_move_only(a) for a in ty.args):
@@ -793,6 +809,15 @@ class MoveChecker:
 
     def _check_fn(self, fn: rast.FnDef):
         """Check a function definition."""
+        impl = self.method_impl.get(id(fn))
+        self.types.set_params(list(fn.type_params or [])
+                              + list((impl.type_params or []) if impl else []))
+        try:
+            self._check_fn_body(fn)
+        finally:
+            self.types.set_params(())
+
+    def _check_fn_body(self, fn: rast.FnDef):
         self.current_fn_name = fn.name
         self._field_moves = set()
         self._push_scope()

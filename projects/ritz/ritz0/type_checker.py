@@ -26,7 +26,7 @@ import bool_rules
 import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
-from monomorph import mangle_generic_name
+from monomorph import mangle_generic_name, TypeSubstitution
 from ufcs import find_ufcs_function
 from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
                            SYSCALL_BUILTINS)
@@ -825,34 +825,26 @@ class TypeChecker:
 
             self._callees[id(expr)] = (fn_sig, 0)
 
-            # Check argument count
-            if len(expr.args) != len(fn_sig.params):
-                self._error(f"function '{fn_name}' expects {len(fn_sig.params)} arguments, "
-                          f"got {len(expr.args)}", expr.span)
-            else:
-                # Check argument types
-                for i, (arg, (param_name, param_type)) in enumerate(zip(expr.args, fn_sig.params)):
-                    if i in fn_sig.lent:
-                        # `name:& T` borrows a `T` place, and takes what
-                        # already points at one (§13.4).
-                        arg_type = self._infer_type(arg)
-                        self._check_addr_into_mut(arg)
-                        self._check_lent_referent(arg, arg_type, param_type)
-                        self._forget_local_ref(arg)
-                        if isinstance(self._resolve_alias(arg_type),
-                                      (rast.PtrType, rast.RefType)):
-                            continue
-                    else:
-                        self._arg_depth += 1
-                        arg_type = self._infer_into(arg, param_type)
-                        self._arg_depth -= 1
-                    if not self._value_fits(arg, arg_type, param_type):
-                        self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
-                                  f"got {self._type_str(arg_type)}", arg.span)
+            # The callee's type parameters are its own, not the caller's types
+            # of the same name (AGAST #2966): `take<T>(p: @T)` beside a
+            # `struct T` takes an `@i32`, and returns no `struct T`.
+            captured = {tp for tp in fn_sig.type_params
+                        if tp not in self.current_type_params
+                        and (tp in self.structs or tp in self.enums
+                             or tp in self.type_aliases)}
+            caller_params = self.current_type_params
+            self.current_type_params = caller_params | captured
+            try:
+                self._check_call_args(expr, fn_name, fn_sig)
+            finally:
+                self.current_type_params = caller_params
 
             if fn_sig.is_async:
                 # The call makes a `<fn>_Future`; only `.await` gives ret_type.
                 return rast.NamedType(expr.span, 'unknown', [])
+            if captured and fn_sig.ret_type is not None:
+                return TypeSubstitution({tp: rast.NamedType(expr.span, 'unknown', [])
+                                         for tp in captured}).apply(fn_sig.ret_type)
             return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
 
         else:
@@ -860,6 +852,32 @@ class TypeChecker:
             for arg in expr.args:
                 self._infer_type(arg)
             return rast.NamedType(expr.span, 'unknown', [])
+
+    def _check_call_args(self, expr: rast.Call, fn_name: str, fn_sig) -> None:
+        """The arity and each argument of a direct call to `fn_sig`."""
+        if len(expr.args) != len(fn_sig.params):
+            self._error(f"function '{fn_name}' expects {len(fn_sig.params)} arguments, "
+                      f"got {len(expr.args)}", expr.span)
+        else:
+            # Check argument types
+            for i, (arg, (param_name, param_type)) in enumerate(zip(expr.args, fn_sig.params)):
+                if i in fn_sig.lent:
+                    # `name:& T` borrows a `T` place, and takes what
+                    # already points at one (§13.4).
+                    arg_type = self._infer_type(arg)
+                    self._check_addr_into_mut(arg)
+                    self._check_lent_referent(arg, arg_type, param_type)
+                    self._forget_local_ref(arg)
+                    if isinstance(self._resolve_alias(arg_type),
+                                  (rast.PtrType, rast.RefType)):
+                        continue
+                else:
+                    self._arg_depth += 1
+                    arg_type = self._infer_into(arg, param_type)
+                    self._arg_depth -= 1
+                if not self._value_fits(arg, arg_type, param_type):
+                    self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
+                              f"got {self._type_str(arg_type)}", arg.span)
 
     def _check_method_call(self, expr: rast.MethodCall) -> rast.Type:
         """Type check method call."""
