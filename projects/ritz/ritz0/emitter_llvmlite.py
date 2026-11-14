@@ -13759,6 +13759,21 @@ class LLVMEmitter:
             return self.builder.uitofp(val, target_type)
         return self.builder.sitofp(val, target_type)
 
+    def _int_source_unsigned(self, val: ir.Value, at: Optional[rast.Expr]) -> bool:
+        """Is integer `val`, about to widen into a wider slot, unsigned (AGAST
+        #3085)? Asked of `at`, the expression it came from, or failing that of
+        the expression _emit_expr recorded for it, as _int_into_float_slot
+        does: a caller converting a value it didn't just emit (an operand, a
+        tuple element) passes no `at`. An unknown source is signed."""
+        src = at
+        if src is None:
+            origin = self._value_origin.get(id(val))
+            if origin is not None and origin[0] is val:
+                src = origin[1]
+        if src is None:
+            return False
+        return self._int_shape(src, val.type.width < 64)[1]
+
     def _convert_type(self, val: ir.Value, target_type: ir.Type,
                       at: Optional[rast.Expr] = None) -> ir.Value:
         """Convert a value to the target type if needed. `at` is the expression
@@ -13784,8 +13799,10 @@ class LLVMEmitter:
         # Integer conversions
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
             if val.type.width < target_type.width:
-                # Use zext for i1 (boolean) to preserve 0/1, sext for other integers
-                if val.type.width == 1:
+                # zext for i1 (boolean) to preserve 0/1 and for an unsigned
+                # source (AGAST #3085: `let w: i64 = x` with x: u8 = 200 was
+                # sext'd to -56); sext for a signed one.
+                if val.type.width == 1 or self._int_source_unsigned(val, at):
                     return self.builder.zext(val, target_type)
                 return self.builder.sext(val, target_type)
             elif val.type.width > target_type.width:
