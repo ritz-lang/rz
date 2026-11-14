@@ -1726,6 +1726,18 @@ fn place_fits_borrow(s: *EmitterState, arg: *Expr, pl: *PlaceType, p: *Param) ->
         return array_dims_match(@got, @want)
     0
 
+# AGAST #2354: 1 when `arg` names a by-value `@&U` param of the fn being emitted.
+fn ident_is_ref_param(arg: *Expr) -> i32
+    let f: *FnDef = emitter_current_fn()
+    if arg.kind != EXPR_IDENT or f == null
+        return 0
+    var q: *Param = f.params
+    while q != null
+        if q.param_type == TYPE_MUT_REF and q.is_borrow == 0 and name_eq(q.name, q.name_len, arg.ident_ptr, arg.ident_len) == 1
+            return 1
+        q = q.next
+    0
+
 # What a pointer place does for `p`: `*U` into `:& *U` is a place of `T`; into
 # `:& U`, or `**U` into `:& *U`, it's the pointer to one, and passes.
 # AGAST #2372: a `**S` as deep as `:& **S` is a place of it too: passing its value
@@ -1741,7 +1753,11 @@ fn pointer_place_kind(s: *EmitterState, arg: *Expr, pl: *PlaceType, p: *Param) -
         return BORROW_PASS
     if pl.kind == TYPE_PTR_PTR or pl.pointee == TYPE_PTR
         return BORROW_PASS
-    if pl.kind != TYPE_PTR
+    # AGAST #2354: an `@&U` place holds a pointer as a `*U` does, so it's the
+    # place `:& *U`, `:& @&U` (and `:& T` at T = `@&U`) borrow, as on ritz0.
+    # An `@U` one never gets here: place_behind_shared_ref refused it.  An
+    # `@&U` param is no place: ritz0 gives it no storage to borrow.
+    if pl.kind != TYPE_PTR and (pl.kind != TYPE_MUT_REF or ident_is_ref_param(arg) == 1)
         return BORROW_MISFIT
     if pointer_place_fits(s, pl, p) == 1
         return BORROW_PLACE
@@ -1819,6 +1835,8 @@ fn check_borrow_arg(s: *EmitterState, fname: *u8, flen: i32, argno: i32, arg: *E
 
 # The address of a place borrowed by `p`, as an i64 like `@x`; every slot
 # converts that to what it is.  0 when `arg` is anything else.
+# AGAST #2354: every slot reads `arg` as expr_is_ptr_valued says it is, and an
+# `@&U` local is a `ptr`, so its place's address stays one.
 fn emit_borrowed_place(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if borrow_arg_kind(s, arg, p) != BORROW_PLACE
         return 0
@@ -1826,6 +1844,8 @@ fn emit_borrowed_place(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if ptr < 0
         emit_ir_error(s, c"cannot take mutable address")
         return 0
+    if expr_is_ptr_valued(s, arg) == 1
+        return ptr
     let addr: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, addr)
