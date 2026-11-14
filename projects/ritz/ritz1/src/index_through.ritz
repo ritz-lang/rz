@@ -92,6 +92,9 @@ pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
     if root == null
         return null
     if root.kind != EXPR_IDENT
+        let ev: *LocalVar = element_array_view(s, root)   # `(*pg[i])[j]` (#2995)
+        if ev != null
+            return ev
         let fv: *LocalVar = vec_field_through(s, e.left)   # `x.vf[i]` (#2564)
         if fv != null
             return fv
@@ -214,6 +217,9 @@ fn array_view_named(s: *EmitterState, name: *u8, len: i32) -> *LocalVar
 # emit_through_member_ptr loads the pointer for `inner.data`.  An element that's a
 # `*S` over any other struct is the view of a raw buffer (#2887).
 fn index_through_element(s: *EmitterState, inner: *Expr) -> *LocalVar
+    let ev: *LocalVar = element_array_view(s, inner)   # `pg[i][j]` (#2995)
+    if ev != null
+        return ev
     let outer: *LocalVar = index_through(s, inner)
     if outer == null
         return null
@@ -234,6 +240,24 @@ fn index_through_element(s: *EmitterState, inner: *Expr) -> *LocalVar
     g_through_elem.type_name = name
     g_through_elem.type_name_len = name_len
     @g_through_elem
+
+# AGAST #2995: `b` = `pg[i]`, an element of a `var pg: [N]*[M]T` local, as the view
+# of the array it points at, or null.  Under R9 the element is a pointer to one
+# array, so `pg[i][j]` and `(*pg[i])[j]` are element j at stride T, as `p[j]` is on
+# a `*[M]T` local (#2330).  They took the raw-buffer path, `*(pg[i] + j)` at stride
+# u8, and read the wrong bytes, SILENT.  through_spill evaluates `pg[i]` once.
+fn element_array_view(s: *EmitterState, b: *Expr) -> *LocalVar
+    if b == null or b.kind != EXPR_INDEX or b.left == null or b.left.kind != EXPR_IDENT
+        return null
+    if b.right == null or b.right.kind == EXPR_RANGE
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, b.left.ident_ptr, b.left.ident_len)
+    if loc == null or loc.var_type != TYPE_ARRAY or loc.array_rec == null
+        return null
+    let pa: *ArrayElem = loc.array_rec.ptr_array
+    if pa == null or loc.array_rec.ptr_array_size <= 0
+        return null
+    unscoped_array_view(s, b, pa.elem, pa.name, pa.name_len, pa.pointee)
 
 fn through_member(m: *Expr, e: *Expr, base: *Expr, name: *u8, len: i32)
     m.kind = EXPR_MEMBER

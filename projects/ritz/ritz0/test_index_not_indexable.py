@@ -215,17 +215,47 @@ def test_an_element_that_is_a_pointer_is_not_refused(compile_with, compiler):
     assert NEEDS_INDEX("S") not in comp.stdout + comp.stderr
 
 
-# ritz1 reads garbage through a `*[N]T` element, silently (#2995).
-def _legal_cases():
-    for name in sorted(LEGAL):
+# A `*[N]T` element is a pointer to one array (R9): `pg[i][j]` is `(*pg[i])[j]`,
+# element j at stride T, not `*(pg[i] + j)`.
+ARRAYS = ("    var g: [2][3]i32\n    g[0][1] = 20\n    var pg: [2]*[3]i32\n"
+          "    pg[1] = @g[0]\n    var r: [2][3]S\n    r[1][2].x = 20\n"
+          "    var pr: [1]*[3]S\n    pr[0] = @r[1]\n")
+
+# AGAST #2995: each place `pg[1][1]` is.  ritz1 indexed `pg[1]` as a raw byte
+# buffer, so `pg[1][1]` read byte 1 of g[0][0], SILENT; `pr[0][2].x` was
+# "unhandled EXPR_MEMBER".  `pg[1]` is evaluated once (`pg[i()][1]` calls `i` once).
+ARRAY_ELEMENTS = {
+    "read": "    return pg[1][1]\n",
+    "deref": "    return (*pg[1])[1]\n",
+    "store": "    pg[1][2] = 20\n    return g[0][2]\n",
+    "add": "    pg[1][1] += 1\n    return g[0][1] - 1\n",
+    "address": "    let q: *i32 = @pg[1][1]\n    return *q\n",
+    "field": "    return pr[0][2].x\n",
+    "index_once": "    return pg[once(@n)][1] + n - 1\n",
+}
+# ritz0 crashes on `(*pg[i])[j]`, takes the wrong address, and calls `i` twice (#3000).
+RITZ0_ARRAY_ELEMENT_BUGS = {"address", "deref", "index_once"}
+
+
+def _array_element_cases():
+    for name in sorted(ARRAY_ELEMENTS):
         for c in COMPILERS:
-            marks = [pytest.mark.xfail(strict=True, reason="#2995")] \
-                if name == "array_pointer_element" and c != "ritz0" else []
+            marks = [pytest.mark.xfail(strict=True, reason="#3000")] \
+                if c == "ritz0" and name in RITZ0_ARRAY_ELEMENT_BUGS else []
             yield pytest.param(name, c, marks=marks, id=f"{name}-{c}")
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_legal_cases()))
+@pytest.mark.parametrize("name,compiler", list(_array_element_cases()))
+def test_an_element_that_points_at_an_array_indexes_it(run_with, name, compiler):
+    program = (f"{HEADER}fn once(n: *i32) -> i64\n    *n = *n + 1\n    1\n\n"
+               f"pub fn main() -> i32\n    var n: i32 = 0\n{ARRAYS}{ARRAY_ELEMENTS[name]}")
+    assert run_with(compiler, name, program) == 20
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(LEGAL))
 def test_the_legal_neighbours_still_run(run_with, name, compiler):
     setup, body, want = LEGAL[name]
     assert run_with(compiler, name, f"{HEADER}pub fn main() -> i32\n{setup}{body}") == want
