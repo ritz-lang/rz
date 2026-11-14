@@ -964,6 +964,7 @@ def test_ritz0_two_pointers_are_refused(compile_with, it, pre):
     assert comp.returncode != 0
     assert not ll.exists()
     assert "for loop iterable not supported" in comp.stdout + comp.stderr
+    assert "Traceback" not in comp.stdout + comp.stderr   # located, not raised (#3007)
 
 
 ELEMENT = "this `for` element type is not supported in ritz1"

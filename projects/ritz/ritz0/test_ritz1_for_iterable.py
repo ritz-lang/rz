@@ -598,18 +598,24 @@ def test_ritz0_a_boxs_own_field_comes_first(run_with):
     assert run_with("ritz0", "box_own", program) == 3
 
 
-# AGAST #2426: and on ritz1, which reads `b.a` through a Box (#3006).  `b.ptr`
-# is the Box's own `*H`, which no `for` walks, not `H`'s array `ptr`.
+# AGAST #2426 / #3007: `b.ptr` is the Box's own `*H`, which no `for` walks, not
+# `H`'s array `ptr` (LANGUAGE_SPEC, LARB R17: "`b.ptr` on a `Box<T>` is always
+# the Box's own `ptr`, even when `T` has one").  Refused at the iterable on all
+# three compilers; ritz0 raised a bare NotImplementedError traceback until #3007.
+_REFUSED_ITERABLE = {"ritz0": "for loop iterable not supported",
+                     "ritz1": "this `for` iterable is not supported",
+                     "ritz1_selfhosted": "this `for` iterable is not supported"}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_boxs_own_field_is_not_the_inner_one(compile_with, compiler):
     program = (_BOX + "struct H\n    k: i64\n    ptr: [3]i32\n\n" + MAIN + "    var h: H\n"
                "    var b: Box<H>\n    b.ptr = @h\n    var t: i32 = 0\n    for x in b.ptr\n"
                "        t = t + x\n    return t\n")
     comp, ll, _ = compile_with(compiler, "box_own_first", program)
-    assert comp.returncode != 0
-    assert not ll.exists()
-    assert "this `for` iterable is not supported" in comp.stdout + comp.stderr
+    assert "Traceback" not in comp.stdout + comp.stderr
+    _is_refused(comp, ll, _REFUSED_ITERABLE[compiler], program)
 
 
 # Whoever writes.  What the loop walks is the array, not a name for it.

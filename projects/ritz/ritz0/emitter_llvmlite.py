@@ -7597,8 +7597,14 @@ class LLVMEmitter:
                                 vec_get_fn = self.functions[get_name][0]
 
         if iter_kind is None or elem_ty is None:
+            # A user error, located at the iterable (AGAST #3007): `b.ptr` on a
+            # `Box<H>` is the Box's own `*H` (LARB R17), and a `*H` is no
+            # iterable.  A bare NotImplementedError escaped as a traceback.
             iter_ty_repr = iter_val.type if iter_val is not None else type(stmt.iter).__name__
-            raise NotImplementedError(f"for loop iterable not supported: {stmt.iter} (llvm={iter_ty_repr})")
+            raise EmitError(
+                f"for loop iterable not supported: a value of LLVM type `{iter_ty_repr}` is not "
+                "an array, a pointer to one, or a `{ptr, len}` header such as a Vec",
+                stmt.iter.span)
 
         idx_var = self._alloca_in_entry_block(self.i64, f"{stmt.var}.idx")
         self.builder.store(ir.Constant(self.i64, 0), idx_var)
