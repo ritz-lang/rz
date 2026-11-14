@@ -4907,6 +4907,19 @@ fn deref_ptr_ptr_elem_type(s: *EmitterState, d: *Expr) -> i32
         return TYPE_VOID
     return inner
 
+# AGAST #3186: the scalar T an element `x[i]` points at when `x` is a `**T`
+# (exactly two levels), or TYPE_VOID: not that shape, or T is a struct
+# (deref_pointee_struct_name names those) or has no known size.
+fn ptr_ptr_index_scalar(s: *EmitterState, x: *Expr) -> i32
+    var inner: i32 = TYPE_VOID
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if ptr_levels_of(s, x, @inner, @name, @name_len) != 2
+        return TYPE_VOID
+    if inner == TYPE_STRUCT or ptr_pointee_size(s, inner, null, 0) == 0
+        return TYPE_VOID
+    return inner
+
 # AGAST #2537: the scalar T that `(*r)[i]` reads when `*r` is a `*T` (`r: **T`,
 # a `let r = @q` or a `**T` param).  emit_expr_index fell to its byte path for
 # it (`getelementptr i8` + `load i8`) whatever T was, while `*(*r + k)` already
@@ -5202,6 +5215,13 @@ fn get_deref_store_type(s: *EmitterState, ptr_expr: *Expr) -> i32
     let el_pt: i32 = array_elem_pointee_kind(s, ptr_expr)
     if el_pt != TYPE_VOID
         return el_pt
+    # AGAST #3186: `*X[i] = v` with `X` a `**T` (a field `h.f`, a local, a
+    # param): `X[i]` is the `*T` `*(X + i)`, so the slot is a T.  Unresolved,
+    # this stored the RHS's whole i64 over a 4- or 1-byte T.
+    if ptr_expr.kind == EXPR_INDEX and ptr_expr.right != null and ptr_expr.right.kind != EXPR_RANGE
+        let ix_pt: i32 = ptr_ptr_index_scalar(s, ptr_expr.left)
+        if ix_pt != TYPE_VOID
+            return ix_pt
     if ptr_expr.kind == EXPR_IDENT
         let lpt: i32 = find_local_pointee_type(s, ptr_expr.ident_ptr, ptr_expr.ident_len)
         if lpt != TYPE_I64
@@ -5751,6 +5771,12 @@ fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             let el_pt: i32 = array_elem_pointee_kind(s, e.operand)
             if el_pt != TYPE_VOID
                 return el_pt
+            # AGAST #3186: `*X[i]` with `X` a `**T` loads a T, as
+            # get_deref_store_type stores one.  It loaded i64.
+            if e.operand.kind == EXPR_INDEX and e.operand.right != null and e.operand.right.kind != EXPR_RANGE
+                let ix_pt: i32 = ptr_ptr_index_scalar(s, e.operand.left)
+                if ix_pt != TYPE_VOID
+                    return ix_pt
             # AGAST #1924: `*(ppp + i)` with `ppp: ***T` is itself a `**T`.
             # The arm below calls every deref of a `**` a `*T`, so the next
             # deref out lost the pointee and `*(*(*(ppp + i) + j) + k)`
