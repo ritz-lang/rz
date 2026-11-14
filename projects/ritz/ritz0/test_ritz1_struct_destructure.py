@@ -423,3 +423,62 @@ def test_ref_field_runs_like_ritz0(request, run_with, compiler):
         request.applymarker(pytest.mark.xfail(
             strict=True, reason="AGAST #2864: ritz1 refuses an `@` field"))
     assert run_with(compiler, "ref_field", REF_FIELD) == 7
+
+
+# #3217: a destructured field widens by its field's type.  ritz0 bound each
+# name at its bare LLVM type, so a u8 (or u16) field widened signed: 200 read
+# as -56.  An i8 must still widen signed (-5, not 251).  Each value has its
+# top bit set, so a wrong extension changes it.  `G<T>` is a generic struct,
+# whose fields live under the specialization's mangled name.
+_WIDEN = """\
+struct P
+    a: {t}
+    n: i32
+
+struct G<T>
+    a: T
+    n: i32
+
+pub fn main() -> i32
+    let p: P = P {{ a: {v}, n: 1 }}
+    let (a, n) = p
+    if a as i32 != {v}
+        return 1
+    if a as i64 != {v}
+        return 2
+    let g: G<{t}> = G<{t}> {{ a: {v}, n: 2 }}
+    let (b, m) = g
+    if b as i32 != {v}
+        return 3
+    return 10 + n + m
+"""
+WIDEN = {"u8": "200", "i8": "-5", "u16": "40000"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(WIDEN))
+def test_destructured_field_widens_by_its_type(run_with, ty, compiler):
+    prog = _WIDEN.format(t=ty, v=WIDEN[ty])
+    assert run_with(compiler, f"widen_{ty}", prog) == 13
+
+
+# The ticket's program, verbatim.
+TICKET_3217 = """\
+struct P
+    a: u8
+    n: i32
+
+pub fn main() -> i32
+    let p: P = P { a: 200, n: 1 }
+    let (a, n) = p
+    if a as i32 == 200
+        return 11
+    3
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_ticket_3217_program(run_with, compiler):
+    assert run_with(compiler, "ticket_3217", TICKET_3217) == 11
