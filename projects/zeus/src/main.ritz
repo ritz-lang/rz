@@ -60,6 +60,9 @@ fn print_i32(n: i32)
 var g_signal_pipe_read: i32 = -1
 var g_signal_pipe_write: i32 = -1
 
+# signalfd for SIGTERM/SIGINT/SIGHUP (blocked; read in the event loop)
+var g_signal_fd: i32 = -1
+
 # Daemon context (global for signal handler access)
 var g_daemon: DaemonContext
 
@@ -80,7 +83,7 @@ fn run_event_loop(ctx: *DaemonContext, opts: *ZeusOptions) -> i32
     # Poll fds: signal pipe + listen socket
     var poll_fds: [2]PollFd
 
-    poll_fds[0].fd = ctx.signal_read_fd
+    poll_fds[0].fd = g_signal_fd
     poll_fds[0].events = 1  # POLLIN
     poll_fds[0].revents = 0
 
@@ -115,14 +118,12 @@ fn run_event_loop(ctx: *DaemonContext, opts: *ZeusOptions) -> i32
     print_str(c"zeus: exiting event loop\n")
     return 0
 
-# Handle signals from pipe
+# Handle every signal queued on the signalfd
 fn handle_signals(ctx: *DaemonContext)
-    var buf: [16]u8
-    let n: i64 = sys_read(ctx.signal_read_fd, @buf[0], 16)
-
-    var i: i64 = 0
-    while i < n
-        let sig: i32 = buf[i] as i32
+    loop
+        let sig: i32 = zeus_read_signal(g_signal_fd)
+        if sig <= 0
+            return
         if sig == SIGTERM || sig == SIGINT
             print_str(c"zeus: received shutdown signal\n")
             g_running = 0
@@ -130,10 +131,6 @@ fn handle_signals(ctx: *DaemonContext)
         else if sig == SIGHUP
             print_str(c"zeus: received reload signal, restarting workers...\n")
             initiate_hot_reload(ctx)
-        else if sig == SIGCHLD
-            # Child exited - will be handled by check_workers
-            let _: i32 = 0  # noop
-        i = i + 1
 
 # Protocol constants (must match lib/zeus_client.ritz)
 const ZEUS_PROTOCOL_VERSION: u8 = 1
@@ -322,6 +319,79 @@ fn initiate_shutdown(ctx: *DaemonContext)
             daemon_request_worker_stop(ctx, i)
         i = i + 1
 
+const WNOHANG: i32 = 1
+const STOP_GRACE_POLLS: i32 = 100   # x 10ms: SIGTERM'd workers get 1s
+
+fn sleep_10ms()
+    var tv: [2]i64
+    tv[0] = 0
+    tv[1] = 10000000
+    syscall2(35, @tv[0] as i64, 0)  # SYS_NANOSLEEP
+
+# A slot whose process has not been reaped yet: running, or asked to stop
+# through its control block (initiate_shutdown) but not yet gone.
+fn worker_live(slot: *WorkerSlot) -> bool
+    if slot == null || slot.pid <= 0
+        return false
+    return slot.state == WORKER_SLOT_RUNNING || slot.state == WORKER_SLOT_STOPPING
+
+# smoke_stack's stack.zeus_{term,int}_stops_workers read this line: it is
+# how they tell zeus's own shutdown from the PDEATHSIG fallback.
+fn mark_reaped(slot: *WorkerSlot, idx: i32)
+    print_str(c"zeus: reaped worker ")
+    print_i32(idx)
+    print_str(c" (pid ")
+    print_i32(slot.pid)
+    print_str(c")\n")
+    slot.state = WORKER_SLOT_DEAD
+    slot.pid = 0
+
+# Stop and reap every worker (AGAST #2465): SIGTERM, up to 1s for them to
+# exit, then SIGKILL whatever is left and wait for it. A supervisor that
+# returns without this leaves its workers running, reparented to init.
+fn stop_workers(ctx: *DaemonContext)
+    var i: i32 = 0
+    while i < MAX_WORKERS
+        let slot: *WorkerSlot = daemon_get_worker_slot(ctx, i)
+        if worker_live(slot)
+            sys_kill(slot.pid, SIGTERM)
+        i = i + 1
+
+    var polls: i32 = 0
+    loop
+        var left: i32 = 0
+        i = 0
+        while i < MAX_WORKERS
+            let slot: *WorkerSlot = daemon_get_worker_slot(ctx, i)
+            if worker_live(slot)
+                var status: i32 = 0
+                let r: i32 = sys_wait4(slot.pid, @status, WNOHANG, null)
+                if r == slot.pid || r < 0
+                    # Reaped, or not our child any more (ECHILD)
+                    mark_reaped(slot, i)
+                else
+                    left = left + 1
+            i = i + 1
+        if left == 0
+            return
+        if polls >= STOP_GRACE_POLLS
+            break
+        sleep_10ms()
+        polls = polls + 1
+
+    i = 0
+    while i < MAX_WORKERS
+        let slot: *WorkerSlot = daemon_get_worker_slot(ctx, i)
+        if worker_live(slot)
+            print_str(c"zeus: worker ")
+            print_i32(i)
+            print_str(c" ignored SIGTERM, killing\n")
+            sys_kill(slot.pid, SIGKILL)
+            var status: i32 = 0
+            sys_wait4(slot.pid, @status, 0, null)
+            mark_reaped(slot, i)
+        i = i + 1
+
 # Initiate hot reload - restart all workers one by one
 fn initiate_hot_reload(ctx: *DaemonContext)
     var i: i32 = 0
@@ -477,6 +547,15 @@ pub fn main(argc: i32, argv: **u8) -> i32
         return 1
     print_str(c"zeus: listening on socket\n")
 
+    # Take SIGTERM/SIGINT/SIGHUP through a signalfd before any worker
+    # exists: their default action would kill zeus and leave the workers
+    # running (AGAST #2465).
+    g_signal_fd = zeus_open_signalfd()
+    if g_signal_fd < 0
+        print_str(c"zeus: failed to create signalfd\n")
+        daemon_destroy(@g_daemon)
+        return 1
+
     # Start daemon
     daemon_start(@g_daemon)
 
@@ -484,6 +563,7 @@ pub fn main(argc: i32, argv: **u8) -> i32
     let spawn_result: i32 = spawn_workers(@g_daemon, @opts)
     if spawn_result < 0
         print_str(c"zeus: failed to spawn workers\n")
+        stop_workers(@g_daemon)
         daemon_destroy(@g_daemon)
         return 1
 
@@ -498,6 +578,7 @@ pub fn main(argc: i32, argv: **u8) -> i32
 
     # Cleanup
     print_str(c"zeus: shutting down\n")
+    stop_workers(@g_daemon)
     daemon_destroy(@g_daemon)
 
     # Remove socket file

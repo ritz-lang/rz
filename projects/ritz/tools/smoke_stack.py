@@ -16,7 +16,8 @@ does, after `./rz build --all`, using the debug binaries that step built:
   stack     valet -> zeus (2 workers) -> nexus + mausoleum: create a page,
             GET it 4 times, edit it, restart the whole stack, GET it again;
             100 keep-alive requests (the last says Connection: close);
-            whole log lines; no mausoleum with 2 workers -> 503, not 404
+            whole log lines; no mausoleum with 2 workers -> 503, not 404;
+            SIGTERM/SIGINT/SIGKILL to zeus alone stops its workers in 2 s
   hollow    sage, goliath, rzrz and ritz-lsp must not report success for
             work they did not do
   rzsh      the Linux shell: echo, cd, $X, $?, >, |, external commands
@@ -1014,6 +1015,72 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
             raise CheckFailed(f"workers did not log why they refuse: {short(log[-200:], 200)}")
 
     r.run("stack.no_store_503", no_store)
+
+    def zeus_alone() -> tuple[subprocess.Popen, list[int]]:
+        """zeus -f -w 2 nexus, no valet or store; returns zeus and its worker pids."""
+        if sock.exists():
+            sock.unlink()
+        z = procs.start("stack-zeus-alone", [str(zeus), "-f", "-w", "2", "-s", str(sock),
+                                             "-p", str(work / "zeus.pid"), str(nexus)], work)
+        wait_path(z, sock)
+        deadline = time.monotonic() + START_TIMEOUT
+        while True:
+            log = Path(z.log).read_text(errors="replace")  # type: ignore[attr-defined]
+            pids = [int(m) for m in re.findall(r"zeus: spawned worker \d+ \(pid (\d+)\)", log)]
+            if len(pids) == 2:
+                return z, pids
+            if time.monotonic() > deadline:
+                procs.stop(z)
+                raise Broken(f"zeus never logged 2 spawned workers: {log_tail(z)}")
+            time.sleep(0.1)
+
+    def workers_gone_after(sig: int) -> None:
+        # Signal zeus alone, not its process group: a supervisor stops its
+        # own workers. Before #2465 both nexus workers outlived a SIGTERM to
+        # zeus (reparented to init, shm and all); only killpg hid it.
+        z, pids = zeus_alone()
+        try:
+            os.kill(z.pid, sig)
+            deadline = time.monotonic() + 2.0
+            while (alive := [p for p in pids if _pid_alive(p)]) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if alive:
+                raise CheckFailed(f"{signal.Signals(sig).name} to zeus: worker(s) {alive} of {pids} "
+                                  f"still running 2 s later")
+            if sig != signal.SIGKILL:
+                # The workers' PDEATHSIG kills them whenever zeus exits, so
+                # "gone" alone can't tell zeus's shutdown from zeus dying
+                # of the signal: zeus must say it reaped each one.
+                try:
+                    z.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    raise CheckFailed(f"{signal.Signals(sig).name}: zeus still running 2 s later")
+                log = Path(z.log).read_text(errors="replace")  # type: ignore[attr-defined]
+                reaped = {int(m) for m in re.findall(r"zeus: reaped worker \d+ \(pid (\d+)\)", log)}
+                if z.returncode != 0 or reaped != set(pids):
+                    raise CheckFailed(f"{signal.Signals(sig).name}: zeus exit {z.returncode}, reaped "
+                                      f"{sorted(reaped)} of {pids} (want exit 0, all reaped)")
+                # nexus dies of SIGTERM; needing SIGKILL means the worker
+                # inherited zeus's blocked signal mask across exec.
+                if "ignored SIGTERM" in log:
+                    raise CheckFailed(f"{signal.Signals(sig).name}: a worker ignored zeus's SIGTERM: "
+                                      f"{log_tail(z, 4)}")
+        finally:
+            procs.stop(z, signal.SIGKILL)
+
+    r.run("stack.zeus_term_stops_workers", lambda: workers_gone_after(signal.SIGTERM))
+    r.run("stack.zeus_int_stops_workers", lambda: workers_gone_after(signal.SIGINT))
+    # SIGKILL can't be handled: the workers' PR_SET_PDEATHSIG must stop them.
+    r.run("stack.zeus_kill9_stops_workers", lambda: workers_gone_after(signal.SIGKILL))
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if pid exists and is not a zombie."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 # --------------------------------------------------------------------------

@@ -209,6 +209,7 @@ pub fn worker_env_set_id(env: *WorkerEnv, id: i32)
 # #2459). A worker that doesn't care ignores argv[3].
 # Returns pid on success (in parent), -1 on error; the child never returns.
 pub fn spawn_worker(shm_fd: i32, shm_size: i64, worker_id: i32, worker_count: i32, app_path: *u8) -> i32
+    let zeus_pid: i32 = sys_getpid()
     let pid: i32 = sys_fork()
     if pid < 0
         return -1
@@ -217,6 +218,8 @@ pub fn spawn_worker(shm_fd: i32, shm_size: i64, worker_id: i32, worker_count: i3
         return pid
 
     # Child process
+    worker_child_signal_setup(zeus_pid)
+
     # The fd is inherited, we just need to pass it via environment or args
     # For now, we'll use a simple approach: fd 3 is always the shm fd
 
@@ -289,6 +292,59 @@ pub const SIGTERM: i32 = 15
 pub const SIGCHLD: i32 = 17
 pub const SIGUSR1: i32 = 10
 pub const SIGUSR2: i32 = 12
+
+pub const SIGKILL: i32 = 9
+
+const SIG_BLOCK: i32 = 0
+const SIG_SETMASK: i32 = 2
+const SFD_NONBLOCK: i32 = 2048     # 0x800
+const SFD_CLOEXEC: i32 = 524288    # 0x80000
+const SYS_PRCTL: i64 = 157
+const PR_SET_PDEATHSIG: i64 = 1
+
+# The signals zeus takes through its signalfd instead of their default
+# action: SIGTERM/SIGINT (stop and reap the workers) and SIGHUP (reload).
+# Bit n-1 is signal n.
+pub fn zeus_signal_mask() -> i64
+    return (1 << 14) | (1 << 1) | (1 << 0)
+
+# Block zeus_signal_mask() and return a nonblocking signalfd that reads
+# them, or a negative errno. Call before spawning workers, so a SIGTERM
+# during startup is queued for the event loop, not fatal with workers out.
+pub fn zeus_open_signalfd() -> i32
+    var mask: i64 = zeus_signal_mask()
+    let rc: i32 = sys_rt_sigprocmask(SIG_BLOCK, @mask, null, 8)
+    if rc < 0
+        return rc
+    return sys_signalfd4(-1, @mask, SFD_NONBLOCK | SFD_CLOEXEC)
+
+# Read one signal number from a signalfd: > 0 a signal, 0 none pending,
+# < 0 an error.
+pub fn zeus_read_signal(fd: i32) -> i32
+    # struct signalfd_siginfo is 128 bytes; ssi_signo is the u32 at 0.
+    var info: [16]i64
+    let n: i64 = sys_read(fd, @info[0] as *u8, 128)
+    if n == 128
+        return (info[0] & 0xFFFFFFFF) as i32
+    if n == -11  # EAGAIN
+        return 0
+    if n < 0
+        return n as i32
+    return 0
+
+# In a forked worker, before exec (AGAST #2465):
+#   - unblock everything: the signal mask survives exec, and a worker with
+#     SIGTERM still blocked from zeus's signalfd setup could not be stopped;
+#   - PR_SET_PDEATHSIG: if zeus dies without stopping us (SIGKILL, crash)
+#     the kernel kills the worker instead of reparenting it to init;
+#   - zeus may already have died between fork and prctl, which arms
+#     nothing: then our parent is no longer zeus, so exit now.
+pub fn worker_child_signal_setup(zeus_pid: i32)
+    var empty: i64 = 0
+    sys_rt_sigprocmask(SIG_SETMASK, @empty, null, 8)
+    syscall2(SYS_PRCTL, PR_SET_PDEATHSIG, SIGKILL as i64)
+    if sys_getppid() != zeus_pid
+        sys_exit(1)
 
 # Write signal to self-pipe (async-signal-safe)
 pub fn signal_self_pipe_write(fd: i32, signum: i32)
