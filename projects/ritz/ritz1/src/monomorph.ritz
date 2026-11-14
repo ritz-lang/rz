@@ -792,7 +792,19 @@ fn type_param_index(tp: *TypeParam, name: *u8, len: i32) -> i32
 # Rewrite a mangled name, replacing every `$`-component that is a type
 # parameter with its argument: `Box$B` at <A=i64, B=i32> is `Box$i32`.
 # Returns `name` itself when no component is a parameter.
-fn substitute_params_in_mangled(tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32, name: *u8, len: i32, out_len: *i32) -> *u8
+fn substitute_params_in_mangled(tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32, name0: *u8, len0: i32, out_len: *i32) -> *u8
+    # AGAST #2975: a tuple component over any of the parameters
+    # (`Vec$tuple_K_V`) is its instantiation, one parameter at a time.
+    var name: *u8 = name0
+    var len: i32 = len0
+    var ti: i32 = 0
+    var tcur: *TypeParam = tp
+    while tcur != null
+        var nl: i32 = len
+        name = subst_components(name, len, tcur.name, tcur.name_len, suffix + *(starts + ti), *(lens + ti), 0, @nl)
+        len = nl
+        tcur = tcur.next
+        ti = ti + 1
     # Pass 1: the rewritten length (0 extra when nothing matches).
     var total: i32 = 0
     var hit: i32 = 0
@@ -2310,28 +2322,44 @@ fn collect_receiver_methods(m: *Module, f: *FnDef)
 
 # Rewrite every `$`-separated component of `name` that equals type_param to
 # the argument of the one-argument suffix "$arg" (new_suffix):
-# `Result$T$E` at T="$i32" is `Result$i32$E`; `T` alone is `i32`.  Returns
+# `Result$T$E` at T="$i32" is `Result$i32$E`; `T` alone is `i32`.  A
+# component that is a tuple over type_param is that tuple's instantiation
+# (AGAST #2975): `Vec$tuple_K_V` at K="$i32" is `Vec$tuple_i32_V`.  Returns
 # `name` itself (and *out_len = name_len) when no component matches.
 fn replace_param_component(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, out_len: *i32) -> *u8
+    return subst_components(name, name_len, type_param, type_param_len, new_suffix, new_suffix_len, 1, out_len)
+
+# replace_param_component, or with plain == 0 only its tuple components.
+fn subst_components(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, plain: i32, out_len: *i32) -> *u8
     *out_len = name_len
     if name == null or type_param == null or new_suffix_len < 1
         return name
     let arg: *u8 = new_suffix + 1
     let arg_len: i32 = new_suffix_len - 1
-    # Pass 1: count matches to size the output.
+    # Pass 1: each component's replacement, to size the output.  A tuple's
+    # is registered once (tuple_subst is idempotent), so pass 2 asks again.
     var hits: i32 = 0
+    var total: i32 = 0
     var pos: i32 = 0
     while pos <= name_len
         var end: i32 = pos
         while end < name_len and *(name + end) != 36   # '$'
             end = end + 1
-        if end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
+        var tl: i32 = 0
+        if plain == 1 and end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
             hits = hits + 1
+            total = total + arg_len
+        else if tuple_subst(name + pos, end - pos, type_param, type_param_len, new_suffix, new_suffix_len, @tl) != null
+            hits = hits + 1
+            total = total + tl
+        else
+            total = total + end - pos
+        if end < name_len
+            total = total + 1
         pos = end + 1
     if hits == 0
         return name
     # Pass 2: build it.
-    let total: i32 = name_len + hits * (arg_len - type_param_len)
     let out: *u8 = malloc(total as i64 + 1) as *u8
     var o: i32 = 0
     pos = 0
@@ -2339,14 +2367,22 @@ fn replace_param_component(name: *u8, name_len: i32, type_param: *u8, type_param
         var end: i32 = pos
         while end < name_len and *(name + end) != 36
             end = end + 1
-        if end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
+        var tl: i32 = 0
+        var tn: *u8 = null
+        if plain == 1 and end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
             for j in 0..arg_len
                 *(out + o) = *(arg + j)
                 o = o + 1
         else
-            for j in pos..end
-                *(out + o) = *(name + j)
-                o = o + 1
+            tn = tuple_subst(name + pos, end - pos, type_param, type_param_len, new_suffix, new_suffix_len, @tl)
+            if tn != null
+                for j in 0..tl
+                    *(out + o) = *(tn + j)
+                    o = o + 1
+            else
+                for j in pos..end
+                    *(out + o) = *(name + j)
+                    o = o + 1
         if end < name_len
             *(out + o) = 36
             o = o + 1
@@ -2354,6 +2390,101 @@ fn replace_param_component(name: *u8, name_len: i32, type_param: *u8, type_param
     *(out + o) = 0
     *out_len = o
     out
+
+# The module being monomorphized (AGAST #2975).  Not g_mono_module, which
+# is set only once a fn is specialised: a struct's `f: (T, i32)` is
+# substituted before any may be, and names_generic_struct reads that one.
+var g_tuple_module: *Module = null
+
+# AGAST #2975: the tuple `name` (a template over type_param, see
+# ast_helpers' tuple_mark_generic) with type_param bound to the one-argument
+# suffix "$arg": `tuple_T_T` at T="$i32" is `tuple_i32_i32`, laid out
+# `{i32, i32}`, registered the first time and put in the module being
+# specialised once no parameter is left in it.  null when `name` is no
+# tuple over type_param.
+fn tuple_subst(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, suffix: *u8, suffix_len: i32, out_len: *i32) -> *u8
+    let r: *TupleReg = tuple_reg_lookup(name, name_len)
+    if r == null or type_param_index(r.def.type_params, type_param, type_param_len) < 0
+        return null
+    var elems: *TupleElem = null
+    var last_e: *TupleElem = null
+    var fields: *StructField = null
+    var last_f: *StructField = null
+    var total: i32 = 5   # "tuple"
+    var e: *TupleElem = r.elems
+    var f: *StructField = r.def.fields
+    while e != null and f != null
+        var sp: *u8 = null
+        var sl: i32 = generic_arg_spelling(e.ga, @sp)
+        let nf: *StructField = malloc(sizeof(StructField)) as *StructField
+        *nf = *f
+        nf.next = null
+        if f.field_type == TYPE_STRUCT and f.field_type_name != null
+            if name_is_type_param(f.field_type_name, f.field_type_name_len, type_param, type_param_len) == 1
+                var sn: *u8 = null
+                var snl: i32 = 0
+                get_type_name_from_suffix(suffix, suffix_len, @sn, @snl)
+                subst_value_field(nf, parse_type_from_suffix(suffix, suffix_len), sn, snl)
+                sp = suffix + 1
+                sl = suffix_len - 1
+            else
+                var nl: i32 = 0
+                let nn: *u8 = replace_param_component(f.field_type_name, f.field_type_name_len, type_param, type_param_len, suffix, suffix_len, @nl)
+                nf.field_type_name = nn
+                nf.field_type_name_len = nl
+                sp = nn
+                sl = nl
+        let ga: *GenericArg = calloc(1, sizeof(GenericArg)) as *GenericArg
+        ga.ty = TYPE_STRUCT   # only its spelling is read again
+        ga.name = sp
+        ga.name_len = sl
+        let ne: *TupleElem = calloc(1, sizeof(TupleElem)) as *TupleElem
+        ne.ga = ga
+        ne.field = nf
+        if last_e == null
+            elems = ne
+            fields = nf
+        else
+            last_e.next = ne
+            last_f.next = nf
+        last_e = ne
+        last_f = nf
+        total = total + 1 + sl
+        e = e.next
+        f = f.next
+    let nm: *u8 = malloc(total as i64 + 1) as *u8
+    memcpy(nm, c"tuple", 5)
+    var pos: i32 = 5
+    e = elems
+    while e != null
+        *(nm + pos) = 95   # '_'
+        pos = pos + 1
+        memcpy(nm + pos, e.ga.name, e.ga.name_len as i64)
+        pos = pos + e.ga.name_len
+        e = e.next
+    *(nm + pos) = 0
+    var got: *TupleReg = tuple_reg_lookup(nm, pos)
+    if got == null
+        # The parameters left: the template's, less type_param.
+        var rest: *TypeParam = null
+        var tp: *TypeParam = r.def.type_params
+        while tp != null
+            if name_is_type_param(tp.name, tp.name_len, type_param, type_param_len) == 0
+                let c: *TypeParam = calloc(1, sizeof(TypeParam)) as *TypeParam
+                c.name = tp.name
+                c.name_len = tp.name_len
+                c.next = rest
+                rest = c
+            tp = tp.next
+        let def: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
+        def.name = nm
+        def.name_len = pos
+        def.fields = fields
+        def.type_params = rest
+        got = tuple_reg_add(def, elems)
+    tuple_reg_place(got, g_tuple_module)
+    *out_len = got.def.name_len
+    got.def.name
 
 # Specialise `template` at ONE type parameter (type_param_name) bound to the
 # one-argument suffix "$arg".  The result's name is template.name + suffix.
@@ -2748,6 +2879,13 @@ fn names_generic_struct(name: *u8, name_len: i32) -> i32
 # Input: name = "Vec$T", type_param = "T", new_suffix = "$u8"
 # Output: "Vec$u8"
 fn substitute_type_param_in_name(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, new_suffix: *u8, new_suffix_len: i32, out_name: **u8, out_len: *i32)
+    # AGAST #2975: `tuple_T_T` at T = i32 is `tuple_i32_i32`.
+    var tl: i32 = 0
+    let tn: *u8 = tuple_subst(name, name_len, type_param, type_param_len, new_suffix, new_suffix_len, @tl)
+    if tn != null
+        *out_name = tn
+        *out_len = tl
+        return
     # AGAST #1612: multi-parameter passes rewrite whole components, anywhere
     # in the name, and never append (see g_mono_component_mode).
     if g_mono_component_mode != 0
@@ -3309,6 +3447,10 @@ fn check_and_substitute_suffix(old_suffix: *u8, old_suffix_len: i32, type_param:
         if rewritten == old_suffix
             return null
         return rewritten
+    # AGAST #2975: `vec_push<(T, i32)>` is "$tuple_T_i32".
+    let tup: *u8 = subst_components(old_suffix, old_suffix_len, type_param, type_param_len, new_suffix, new_suffix_len, 0, out_len)
+    if tup != old_suffix
+        return tup
     # Check if old_suffix is "$T" where T matches type_param
     if old_suffix_len != type_param_len + 1
         return null
@@ -3438,6 +3580,13 @@ fn clone_struct_fields(fields: *StructField, type_param: *u8, type_param_len: i3
                 cloned.field_type = fields.field_type
                 cloned.field_type_name = mangle_struct_name(fields.field_type_name, fields.field_type_name_len, suffix, suffix_len)
                 cloned.field_type_name_len = fields.field_type_name_len + suffix_len
+        else if fields.field_type_name != null and tuple_reg_lookup(fields.field_type_name, fields.field_type_name_len) != null
+            # AGAST #2975: `f: (T, i32)` is `tuple_T_i32`, at T = i64
+            # `tuple_i64_i32`.
+            cloned.field_type = fields.field_type
+            var tu_len: i32 = 0
+            substitute_type_param_in_name(fields.field_type_name, fields.field_type_name_len, type_param, type_param_len, suffix, suffix_len, @cloned.field_type_name, @tu_len)
+            cloned.field_type_name_len = tu_len
         else
             cloned.field_type = fields.field_type
             cloned.field_type_name = fields.field_type_name
@@ -3765,6 +3914,7 @@ fn specialize_impl_method(m: *Module, ib: *ImplBlock, method: *FnDef, type_name:
 # ============================================================================
 
 fn monomorphize_module(m: *Module)
+    g_tuple_module = m   # AGAST #2975: where tuple_subst puts a tuple it makes
     init_instantiation_tracker()
     init_local_var_tracker()
 

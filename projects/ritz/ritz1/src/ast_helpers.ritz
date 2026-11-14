@@ -3267,7 +3267,7 @@ pub fn link_generic_arg(first: *GenericArg, rest: *GenericArg) -> *GenericArg
 # struct/generic/pointer name.  The one speller for generic type annotations,
 # struct literals and generic-call suffixes.  Returns its length and stores
 # the bytes' address in *out.
-fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
+pub fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
     if ga.ty == TYPE_STRUCT or ga.ty == TYPE_PTR or ga.ty == TYPE_PTR_PTR or ga.ty == TYPE_ARRAY or ga.ty == TYPE_VOID or ga.ty == TYPE_REF or ga.ty == TYPE_MUT_REF
         *out = ga.name
         return ga.name_len
@@ -3349,9 +3349,11 @@ struct TupleElem
 struct TupleReg
     def: *StructDef
     line: i32        # where the spelling was first written, for
-    col: i32         # tuple_reject_generic's diagnostic
+    col: i32         # tuple_mark_generic's diagnostic
     fresh: i32       # 1 until the module that registered it ends
     next: *TupleReg
+    elems: *TupleElem   # AGAST #2975: each element's spelling, for tuple_subst
+    placed: i32         # 1 once def is in a module's struct list
 
 var g_tuple_regs: *TupleReg = null
 
@@ -3379,13 +3381,39 @@ fn tuple_index_name(p: *Parser, i: i32, out_len: *i32) -> *u8
     *out_len = n
     return buf
 
-fn tuple_reg_find(name: *u8, len: i32) -> *StructDef
+# The registered tuple spelled (name, len), or null.
+pub fn tuple_reg_lookup(name: *u8, len: i32) -> *TupleReg
     var r: *TupleReg = g_tuple_regs
     while r != null
         if r.def.name_len == len and memcmp(r.def.name, name, len as i64) == 0
-            return r.def
+            return r
         r = r.next
     return null
+
+fn tuple_reg_find(name: *u8, len: i32) -> *StructDef
+    let r: *TupleReg = tuple_reg_lookup(name, len)
+    if r == null
+        return null
+    return r.def
+
+# AGAST #2975: register a tuple monomorphization made (`tuple_i32_i32` from
+# `tuple_T_T`), not yet in any module (tuple_reg_place puts it in one).
+pub fn tuple_reg_add(def: *StructDef, elems: *TupleElem) -> *TupleReg
+    let r: *TupleReg = calloc(1, sizeof(TupleReg)) as *TupleReg
+    r.def = def
+    r.elems = elems
+    r.next = g_tuple_regs
+    g_tuple_regs = r
+    return r
+
+# Add r's struct to m, once, when it is concrete: one still over a
+# generic parameter (`tuple_i32_V` between the passes of <K, V>) is never
+# emitted.
+pub fn tuple_reg_place(r: *TupleReg, m: *Module)
+    if r.placed == 1 or m == null or r.def.type_params != null
+        return
+    r.placed = 1
+    module_add_struct(m, r.def)
 
 # The tuple type `(A, B, ...)`: TYPE_STRUCT named "tuple_A_B..." in
 # p.last_type_name, its StructDef added to p.module the first time.
@@ -3434,6 +3462,8 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> i32
         r.line = parse_pos_line(p)
         r.col = parse_pos_col(p)
         r.fresh = 1
+        r.elems = elems
+        r.placed = 1
         r.next = g_tuple_regs
         g_tuple_regs = r
     p.last_type_name = name
@@ -3742,17 +3772,59 @@ fn module_names_type_param(m: *Module, name: *u8, len: i32) -> i32
         ib = ib.next
     return 0
 
-# A tuple over a generic parameter (`-> (T, T)` in `fn f<T>`) would be a
-# struct with a `%T` field that monomorphization never substitutes, so it
-# is a located error, not wrong IR.  Checks the spellings this module
-# registered, against every generic parameter name it declares.
-fn tuple_reject_generic(p: *Parser)
+# Append (name, len) to the parameter list `acc` unless it is there.
+fn tuple_param_add(acc: *TypeParam, name: *u8, len: i32) -> *TypeParam
+    if type_params_name(acc, name, len) == 1
+        return acc
+    let tp: *TypeParam = calloc(1, sizeof(TypeParam)) as *TypeParam
+    tp.name = name
+    tp.name_len = len
+    tp.next = acc
+    return tp
+
+# The generic parameters of m that the struct-type name (name, len) names:
+# a `$`-component that is one (`T`, `Vec$T`), or one a component that is a
+# tuple names (`tuple_T_T`, `Vec$tuple_K_V`), added to `acc`.
+fn tuple_name_params(m: *Module, name: *u8, len: i32, acc: *TypeParam) -> *TypeParam
+    var out: *TypeParam = acc
+    var pos: i32 = 0
+    while pos < len
+        var end: i32 = pos
+        while end < len and *(name + end) != 36   # '$'
+            end = end + 1
+        if module_names_type_param(m, name + pos, end - pos) == 1
+            out = tuple_param_add(out, name + pos, end - pos)
+        else
+            let inner: *StructDef = tuple_reg_find(name + pos, end - pos)
+            if inner != null
+                var f: *StructField = inner.fields
+                while f != null
+                    if f.field_type == TYPE_STRUCT and f.field_type_name != null
+                        out = tuple_name_params(m, f.field_type_name, f.field_type_name_len, out)
+                    f = f.next
+        pos = end + 1
+    out
+
+# AGAST #2975: a tuple over a generic parameter (`-> (T, T)` in `fn f<T>`,
+# `(K, V)` in `impl<K, V>`) is a template, as a generic struct is: its
+# StructDef takes the parameters it names as type_params, so it is never
+# emitted (a `%tuple_T_T = {%T, %T}` is invalid IR), and each instantiation
+# substitutes it (monomorph's tuple_subst: `tuple_i32_i32` at T = i32).
+# An element that is a pointer or reference to a parameter (`(*T, i32)`)
+# has no substitution; it stays a located error (AGAST #2956, #3173).  Checks the
+# spellings this module registered, against every generic parameter name
+# it declares.
+fn tuple_mark_generic(p: *Parser)
     var r: *TupleReg = g_tuple_regs
     while r != null and r.fresh == 1
         r.fresh = 0
+        var params: *TypeParam = null
         var f: *StructField = r.def.fields
         while f != null
-            if f.field_type_name != null and f.field_type_name_len > 0 and module_names_type_param(p.module, f.field_type_name, f.field_type_name_len) == 1
+            if f.field_type == TYPE_STRUCT and f.field_type_name != null
+                params = tuple_name_params(p.module, f.field_type_name, f.field_type_name_len, params)
+                f = f.next
+            else if f.field_type_name != null and f.field_type_name_len > 0 and module_names_type_param(p.module, f.field_type_name, f.field_type_name_len) == 1
                 g_attr_errors = g_attr_errors + 1
                 eprints_cstr(c"error: ")
                 if g_parse_file != null
@@ -3763,20 +3835,21 @@ fn tuple_reject_generic(p: *Parser)
                 eprint_i64(r.line as i64)
                 eprint_char(':')
                 eprint_i64(r.col as i64)
-                eprints_cstr(c": a tuple type over generic parameter `")
+                eprints_cstr(c": a tuple element pointing at generic parameter `")
                 for i in 0..f.field_type_name_len
                     eprint_char(*(f.field_type_name + i))
-                eprintln_cstr(c"` is not supported by ritz1 (AGAST #2975)")
+                eprintln_cstr(c"` is not supported by ritz1 (AGAST #3173)")
                 f = null
             else
                 f = f.next
+        r.def.type_params = params
         r = r.next
 
 # Module end: name every tuple literal of this module from its slot, and
-# report any tuple over a generic parameter.  A literal left nameless is
+# mark each tuple over a generic parameter a template.  A literal left nameless is
 # named by the emitter (tuple_lit_name, AGAST #3005).
 pub fn tuple_resolve_module(p: *Parser)
-    tuple_reject_generic(p)
+    tuple_mark_generic(p)
     if g_tuple_lits == 0
         return
     g_tuple_p = p

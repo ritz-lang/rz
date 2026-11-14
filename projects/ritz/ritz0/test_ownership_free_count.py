@@ -2353,7 +2353,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz1": 2975, "ritz1_selfhosted": 2975}),  # ritz0 fixed by #2741 (was #2285)
+""", 1, {}),  # ritz0 fixed by #2741 (was #2285); ritz1 by #2975
 
     # A binding from an element has the element's type, signedness included.
     "tuple_element_keeps_its_signedness": ("""\

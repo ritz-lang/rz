@@ -26,8 +26,10 @@ resolved from its slot: a fn's return type (tail or `return`), an annotated
 `let` / `var`, or an enclosing tuple literal's element (nested tuples).  One
 with no known slot is typed in the emitter, from a call's parameter, a
 struct field or an earlier match arm, else from its elements (AGAST #3005).
-A tuple over a generic parameter (`-> (T, T)`), which monomorphization
-would leave a `%T` field in, is a located error.
+A tuple over a generic parameter (`-> (T, T)`, `(K, V)`) is a template,
+as a generic struct is: each instantiation substitutes it (`tuple_i32_i32`
+at T = i32) and registers that tuple (AGAST #2975).  One whose element
+points at a parameter (`(*T, i32)`) is still a located error (#3173).
 """
 
 import os
@@ -186,6 +188,91 @@ pub fn main() -> i32
 """
 
 
+# AGAST #2975: a tuple type over a generic parameter is the tuple over the
+# instantiation's argument, `(T, T)` at T = i32 being `tuple_i32_i32`.
+# The ticket's program: sw<i32>(1, 2) = (2, 1) -> 21.
+GEN_FN = """\
+fn sw<T>(a: T, b: T) -> (T, T)
+    (b, a)
+
+pub fn main() -> i32
+    let (x, y) = sw<i32>(1, 2)
+    x * 10 + y
+"""
+
+# A nested tuple over T: nn<i64>(1, 2) = ((1, 2), 3) -> 123.
+GEN_NESTED = """\
+fn nn<T>(a: T, b: T) -> ((T, T), i32)
+    ((a, b), 3)
+
+pub fn main() -> i32
+    let (p, c) = nn<i64>(1, 2)
+    let (a, b) = p
+    (a * 100 + b * 10) as i32 + c
+"""
+
+# A param, at two instantiations: 5 * 10 + 7 = 57.
+GEN_PARAM = """\
+fn fst<T>(t: (T, i32)) -> T
+    let (a, b) = t
+    a
+
+pub fn main() -> i32
+    let t: (i64, i32) = (5, 2)
+    let u: (u8, i32) = (7, 1)
+    (fst<i64>(t) * 10) as i32 + fst<u8>(u) as i32
+"""
+
+# A generic struct's field: 3 * 10 + 4 = 34.
+GEN_STRUCT = """\
+struct P<T>
+    f: (T, i32)
+
+pub fn main() -> i32
+    var p: P<i64> = P<i64> { f: (3, 4) }
+    let (a, b) = p.f
+    a as i32 * 10 + b
+"""
+
+# `Vec<(T, i32)>` in a one-parameter fn, named in a call's type argument:
+# 4 * 10 + 2 = 42.
+GEN_VEC = """\
+import ritzlib.gvec
+
+fn mk<T>(a: T) -> Vec<(T, i32)>
+    var v: Vec<(T, i32)> = vec_new<(T, i32)>()
+    vec_push<(T, i32)>(@&v, (a, 2))
+    v
+
+pub fn main() -> i32
+    let v: Vec<(i64, i32)> = mk<i64>(4)
+    let (a, b) = vec_get<(i64, i32)>(@v, 0)
+    a as i32 * 10 + b
+"""
+
+# `Vec<(K, V)>` in a two-parameter generic impl: 6 * 10 + 7 + 2 = 69.
+GEN_IMPL_VEC = """\
+import ritzlib.gvec
+
+struct Map<K, V>
+    items: Vec<(K, V)>
+
+impl<K, V> Map<K, V>
+    fn put(self: @&Map<K, V>, k: K, v: V)
+        vec_push<(K, V)>(@&self.items, (k, v))
+
+    fn at(self: @Map<K, V>, i: i64) -> (K, V)
+        vec_get<(K, V)>(@self.items, i)
+
+pub fn main() -> i32
+    var m: Map<i32, i64> = Map<i32, i64> { items: vec_new<(i32, i64)>() }
+    m.put(4, 5)
+    m.put(6, 7)
+    let (k, v) = m.at(1)
+    k * 10 + v as i32 + m.items.len as i32
+"""
+
+
 # AGAST #3005: a tuple no slot types (the rejections of #2956 / #2974), typed
 # from its elements.  `let x = (a, a)`: f(1) = 1 + 1 + 1 = 3.
 INFER_LET = """\
@@ -257,6 +344,12 @@ def test_tuple_with_no_slot_runs(ritz1_bin, tmp_path, compiler, name, program, e
         ("tuple_split_literal", SPLIT_LITERAL, 49),
         ("tuple_split_match", SPLIT_MATCH, 102),
         ("tuple_split_once", SPLIT_ONCE, 123),
+        ("tuple_generic_fn", GEN_FN, 21),
+        ("tuple_generic_nested", GEN_NESTED, 123),
+        ("tuple_generic_param", GEN_PARAM, 57),
+        ("tuple_generic_struct", GEN_STRUCT, 34),
+        ("tuple_generic_vec", GEN_VEC, 42),
+        ("tuple_generic_impl_vec", GEN_IMPL_VEC, 69),
     ],
 )
 def test_tuple_programs_run(ritz1_bin, tmp_path, compiler, name, program, expected):
@@ -316,17 +409,29 @@ def test_ritz1_rejects_tuple_element_it_cannot_type(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_rejects_tuple_over_generic_param(ritz1_bin, tmp_path):
-    """`-> (T, T)` in `fn f<T>` would be a `%tuple_T_T = {%T, %T}` that
-    monomorphization never substitutes (invalid IR); ritz1 refuses it,
-    located, instead of emitting it."""
+def test_ritz1_substitutes_tuple_over_generic_param(ritz1_bin, tmp_path):
+    """AGAST #2975: `-> (T, T)` in `fn sw<T>` was refused (#2956), since the
+    `%tuple_T_T = {%T, %T}` it parsed to was never substituted.  At sw<i32>
+    it is ritz0's `tuple_i32_i32`, `{i32, i32}`, and the template's
+    `tuple_T_T` is never emitted."""
+    proc = _ritz1_ir(ritz1_bin, tmp_path, GEN_FN)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert re.search(r"^%tuple_i32_i32 = type \{\s*i32,\s*i32\s*\}$", proc.ir, re.M), proc.ir[:3000]
+    assert re.search(r"define\b.*%tuple_i32_i32 @\"?sw\$i32", proc.ir), proc.ir[:3000]
+    assert "tuple_T_T" not in proc.ir, proc.ir[:3000]
+
+
+@pytest.mark.integration
+def test_ritz1_rejects_tuple_element_pointing_at_generic_param(ritz1_bin, tmp_path):
+    """`(*T, i32)` has no substitution yet (AGAST #3173): a located error at
+    the tuple type, not a `%tuple_ptr_T_i32` naming no struct."""
     proc = _ritz1_ir(
         ritz1_bin,
         tmp_path,
-        "fn sw<T>(a: T, b: T) -> (T, T)\n    (b, a)\n\n"
-        "pub fn main() -> i32\n    let (x, y) = sw<i32>(1, 2)\n    x * 10 + y\n",
+        "fn pp<T>(p: *T) -> (*T, i32)\n    (p, 1)\n\n"
+        "pub fn main() -> i32\n    var x: i32 = 5\n    let (q, c) = pp<i32>(@x)\n    *q + c\n",
     )
     assert proc.returncode != 0
-    assert re.search(r"t\.ritz:1:\d+: .*tuple type over generic parameter `T`", proc.stderr), (
+    assert re.search(r"t\.ritz:1:\d+: .*tuple element pointing at generic parameter `T`.*#3173", proc.stderr), (
         proc.stderr[-2000:]
     )
