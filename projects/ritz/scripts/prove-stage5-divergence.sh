@@ -33,10 +33,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # reason the sets can diverge is the injection below.
 VICTIM="tier1_basics_01_hello"
 
-TMP_ALLOW="$(mktemp /tmp/stage5-synthetic-allowlist.XXXXXX.txt)"
+T=$(mktemp -d)
+TMP_ALLOW="$T/synthetic-allowlist.txt"
 PATCHED="$SCRIPT_DIR/.stage5-synthetic-regression.sh"
-LOG="$(mktemp /tmp/stage5-synthetic-run.XXXXXX.log)"
-cleanup() { rm -f "$PATCHED" "$TMP_ALLOW"; }
+LOG="$T/synthetic-run.log"
+cleanup() { rm -f "$PATCHED"; rm -rf "$T"; }
 trap cleanup EXIT
 
 # --- 1. synthetic allowlist: the real ritz1 list, plus the victim -----------
@@ -81,7 +82,6 @@ rc=$?
 echo "--- relevant output -------------------------------------------------"
 grep -E "Stage [345]:|$VICTIM|fixed point|allowlist|regression tests" "$LOG" || true
 echo "--- exit code: $rc --------------------------------------------------"
-echo "(full log: $LOG)"
 echo ""
 
 # --- 4. assert ---------------------------------------------------------------
@@ -104,5 +104,7 @@ if [[ $status -eq 0 ]]; then
     echo "PROVEN: an allowlist-silenced self-hosting divergence now exits 1."
 else
     echo "NOT PROVEN -- Stage 5 did not catch the synthetic divergence."
+    echo "--- last 60 lines of the run (its scratch is removed on exit) ---"
+    tail -n 60 "$LOG"
 fi
 exit $status

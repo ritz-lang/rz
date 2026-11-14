@@ -3,6 +3,9 @@
 #
 # A: compile with ritz0, run
 # B: compile ritz1 with ritz0, compile with ritz1, run
+#
+# Run from projects/ritz.  Scratch is a `mktemp -d` removed on exit, so two
+# rooms on one host never share a file (AGAST #3183).
 
 set -e
 
@@ -12,33 +15,39 @@ if [ -z "$TEST_FILE" ]; then
   exit 1
 fi
 
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+
+# Same entry point and link as ritz1/compile.sh (ritz0 --no-runtime output).
+RUNTIME=runtime/ritz_start.x86_64.o
+[ -f "$RUNTIME" ] || clang -c -o "$RUNTIME" runtime/ritz_start.x86_64.ll
+link() { clang "$1" "$RUNTIME" -o "$2" -nostdlib; }
+
 echo "🧪 A/B Testing: $TEST_FILE"
 echo "================================"
 
 # A: Compile with ritz0
 echo "📦 A: Compiling with ritz0..."
-python3 ritz0/ritz0.py "$TEST_FILE" -o /tmp/test_a.ll --no-runtime
-llc /tmp/test_a.ll -o /tmp/test_a.s
-gcc /tmp/test_a.s ritz1/runtime/ritz_crt0.o -o /tmp/test_a -nostartfiles -static
-echo "✅ A binary ready: /tmp/test_a"
+python3 ritz0/ritz0.py "$TEST_FILE" -o "$T/test_a.ll" --no-runtime
+link "$T/test_a.ll" "$T/test_a"
+echo "✅ A binary ready"
 
 # B: Compile ritz1 with ritz0, then compile test with ritz1
 echo ""
 echo "📦 B: Compiling ritz1 with ritz0..."
-./ritz1/compile.sh > /dev/null 2>&1
+./ritz1/compile.sh "$T/ritz1" > /dev/null 2>&1
 echo "✅ ritz1 compiler ready"
 
 echo "📦 B: Compiling test with ritz1..."
-/tmp/ritz1 "$TEST_FILE" -o /tmp/test_b.ll
-llc /tmp/test_b.ll -o /tmp/test_b.s
-gcc /tmp/test_b.s ritz1/runtime/ritz_crt0.o -o /tmp/test_b -nostartfiles -static
-echo "✅ B binary ready: /tmp/test_b"
+"$T/ritz1" "$TEST_FILE" -o "$T/test_b.ll"
+link "$T/test_b.ll" "$T/test_b"
+echo "✅ B binary ready"
 
 # Run both and compare
 echo ""
 echo "🏃 Running A (ritz0)..."
 set +e  # Allow non-zero exit codes
-/tmp/test_a
+"$T/test_a"
 EXIT_A=$?
 set -e  # Re-enable exit on error
 echo "Exit code A: $EXIT_A"
@@ -46,7 +55,7 @@ echo "Exit code A: $EXIT_A"
 echo ""
 echo "🏃 Running B (ritz1)..."
 set +e  # Allow non-zero exit codes
-/tmp/test_b
+"$T/test_b"
 EXIT_B=$?
 set -e  # Re-enable exit on error
 echo "Exit code B: $EXIT_B"

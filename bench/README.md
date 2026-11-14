@@ -57,9 +57,11 @@ needle until that is fixed.
   to the original with a `.rendered.json` suffix so you can inspect it.
 - The script kills any lingering debug binaries from previous runs
   before starting and on `EXIT` (unless `--keep` is passed).
-- Logs land in `/tmp/bench-logs/`.  If a scenario looks wrong, check
-  `v-direct.log`, `v-static.log`, `z-inmem.log`, `z-db.log`,
-  `m-serial.log`, etc.
+- Sockets, the mausoleum data dir and logs live in one `mktemp -d`
+  scratch dir, removed on `EXIT`, so concurrent runs on one host never
+  share a path.  To inspect logs, pass `--keep`: the dir is left and its
+  path printed.  If a scenario looks wrong, check `logs/v-direct.log`,
+  `v-static.log`, `z-inmem.log`, `z-db.log`, `m-serial.log`, etc.
 
 ## Why these scenarios in this order
 

@@ -33,7 +33,10 @@ trap 'rm -rf "$T"' EXIT`. Every gate runs every `test.sh`, and two gates
 share the host's /tmp, so a fixed name like `/tmp/ritz_ls_test` belongs to
 both of them, and a glob cleanup deletes the other gate's files.
 `tools/test_gate_tmpdirs.py` fails on any literal /tmp path in a `test.sh`,
-the regression scripts or the Makefile (AGAST #3178).
+the regression scripts or the Makefile (AGAST #3178), and in the hand-run
+scripts listed in its `SHARED_HOST_SHELL` (ab_test, bootstrap_test,
+bench/run.sh, the ritz1 Makefile and others), since rooms sharing a host
+collide there just the same (AGAST #3183).
 
 A test binary run by hand takes `-j N` to run up to N of its tests at once.
 Each child gets its own output capture, and results are reported in table

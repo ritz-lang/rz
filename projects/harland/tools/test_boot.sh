@@ -11,7 +11,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 ISO="$PROJECT_DIR/build/harland.iso"
-SERIAL_LOG="/tmp/harland_serial_$$.log"
+# Scratch is a `mktemp -d` removed on exit, so concurrent runs on one host
+# never share a path (AGAST #3183).
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+SERIAL_LOG="$T/serial.log"
 
 if [[ ! -f "$ISO" ]]; then
     echo "Error: ISO not found at $ISO"
@@ -71,7 +75,6 @@ if grep -q "virtio-blk.*Read sector 0 OK" "$SERIAL_LOG"; then
     echo "  - Sector read/write operations"
     echo "  - DMA buffer management"
     echo "  - Ready for filesystem!"
-    rm -f "$SERIAL_LOG"
     exit 0
 elif grep -q "\[syscall\] exit" "$SERIAL_LOG"; then
     echo "========================================="
@@ -81,7 +84,6 @@ elif grep -q "\[syscall\] exit" "$SERIAL_LOG"; then
     echo "  - User program execution"
     echo "  - SYSCALL/SYSRET mechanism"
     echo "  - First userspace syscall!"
-    rm -f "$SERIAL_LOG"
     exit 0
 elif grep -q "Task.*done" "$SERIAL_LOG"; then
     echo "========================================="
@@ -93,7 +95,6 @@ elif grep -q "Task.*done" "$SERIAL_LOG"; then
     echo "  - Cooperative multitasking"
     TASK_COUNT=$(grep -c "Task.*done" "$SERIAL_LOG" || echo "0")
     echo "  - $TASK_COUNT tasks completed!"
-    rm -f "$SERIAL_LOG"
     exit 0
 elif grep -q "AP.*started" "$SERIAL_LOG"; then
     echo "========================================="
@@ -104,16 +105,13 @@ elif grep -q "AP.*started" "$SERIAL_LOG"; then
     echo "  - AP bootstrap via INIT/SIPI sequence"
     AP_COUNT=$(grep -c "AP.*started" "$SERIAL_LOG" || echo "0")
     echo "  - $AP_COUNT Application Processor(s) started!"
-    rm -f "$SERIAL_LOG"
     exit 0
 elif grep -q "Hello from Harland" "$SERIAL_LOG"; then
     echo "========================================="
     echo "  Boot successful (single core)"
     echo "========================================="
-    rm -f "$SERIAL_LOG"
     exit 0
 else
     echo "FAIL: Kernel boot failed - expected output not found"
-    rm -f "$SERIAL_LOG"
     exit 1
 fi

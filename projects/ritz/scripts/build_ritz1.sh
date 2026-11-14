@@ -7,4 +7,4 @@ cd "$(dirname "$0")/.."
 echo "🔨 Building ritz1 compiler..."
 ./ritz1/compile.sh
 
-echo "✅ ritz1 built successfully: /tmp/ritz1"
+echo "✅ ritz1 built successfully: ritz1/ritz1"

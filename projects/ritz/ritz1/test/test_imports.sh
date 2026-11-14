@@ -12,7 +12,8 @@ set -e  # Exit on first failure
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LANG_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 RITZ1="$LANG_ROOT/ritz1/build/ritz1"
-TEST_DIR="/tmp/ritz1_test_$$"
+TEST_DIR=$(mktemp -d)
+trap 'rm -rf "$TEST_DIR"' EXIT
 
 # Colors for output
 RED='\033[0;31m'
@@ -316,9 +317,6 @@ echo -e "Passed: ${GREEN}$passed${NC}"
 echo -e "Failed: ${RED}$failed${NC}"
 echo "Skipped: $skipped"
 echo ""
-
-# Cleanup
-rm -rf "$TEST_DIR"
 
 if [ $failed -gt 0 ]; then
     exit 1

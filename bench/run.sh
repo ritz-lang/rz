@@ -40,11 +40,16 @@ PORT_PROXY=9003
 PORT_PROXY_DB=9004
 PORT_MAUSOLEUM=7777
 
-SOCK_PROXY="/tmp/zeus_bench_inmem.sock"
-SOCK_PROXY_DB="/tmp/zeus_bench_db.sock"
+# Sockets, the mausoleum data dir, logs and wrk output all live in one
+# `mktemp -d`, removed by the EXIT trap (kept with --keep), so two rooms
+# benching on one host never share a path (AGAST #3183).
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT     # until cleanup() below takes over
+SOCK_PROXY="$T/zeus_bench_inmem.sock"
+SOCK_PROXY_DB="$T/zeus_bench_db.sock"
 
-DATA_DIR_M7M="/tmp/m7m_bench_data"
-LOG_DIR="/tmp/bench-logs"
+DATA_DIR_M7M="$T/m7m_bench_data"
+LOG_DIR="$T/logs"
 mkdir -p "$LOG_DIR"
 
 # ────────────────────────────────────────────────────────────────────
@@ -77,6 +82,7 @@ record_pid() { PIDS+=("$1"); }
 cleanup() {
     if [[ "$KEEP" == "1" ]]; then
         echo "[bench] --keep: leaving servers running. PIDs: ${PIDS[*]}" >&2
+        echo "[bench] --keep: sockets, data and logs left in $T" >&2
         return
     fi
     for pid in "${PIDS[@]}"; do
@@ -89,7 +95,7 @@ cleanup() {
     # relative-path orphans behind, which silently steal the bench
     # ports across runs and produce wildly wrong perf numbers).
     pkill -9 -f 'projects/(valet|nexus|zeus|mausoleum)/build/' 2>/dev/null || true
-    rm -f "$SOCK_PROXY" "$SOCK_PROXY_DB" 2>/dev/null || true
+    rm -rf "$T"
 }
 trap cleanup EXIT
 
@@ -151,7 +157,7 @@ wait_ready() {
 # Run wrk and emit JSON-ish key=value lines on stdout.  Args: name url
 run_wrk() {
     local id="$1" name="$2" url="$3" log
-    log=$(mktemp /tmp/bench-wrk-XXXXXX.log)
+    log=$(mktemp "$T/wrk.XXXXXX")
     wrk -t"$THREADS" -c"$CONNS" -d"${DURATION}s" --latency "$url" >"$log" 2>&1 || true
 
     local rps p50 p75 p90 p99 errors
@@ -288,7 +294,7 @@ fi
 
 echo "[bench] running wrk: -t$THREADS -c$CONNS -d${DURATION}s, zeus -w $WORKERS" >&2
 
-results_file=$(mktemp /tmp/bench-results-XXXXXX.txt)
+results_file="$T/results.txt"
 {
     run_wrk A "Valet direct, GET /"                       "http://127.0.0.1:$PORT_DIRECT/"
     run_wrk B "Valet direct, GET /json"                   "http://127.0.0.1:$PORT_DIRECT/json"
@@ -347,4 +353,3 @@ if [[ -n "$JSON_OUT" ]]; then
     echo "[bench] JSON written to $JSON_OUT" >&2
 fi
 
-rm -f "$results_file"

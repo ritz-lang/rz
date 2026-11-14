@@ -30,13 +30,35 @@ import pytest
 
 RITZ = Path(__file__).resolve().parent.parent
 SCRIPTS = RITZ / "scripts"
+REPO = RITZ.parent.parent
+
+# Shell the gate does not run, but people and rooms do, by hand, on a host
+# other rooms share -- so a fixed /tmp name collides just the same
+# (AGAST #3183).  Each one that needs scratch takes a `mktemp -d` and removes
+# it in its own EXIT trap; the ritz1 Makefile writes under $(BUILD_DIR).
+SHARED_HOST_SCRATCH_SCRIPTS = [
+    SCRIPTS / "ab_test.sh",
+    SCRIPTS / "bootstrap_test.sh",
+    SCRIPTS / "prove-stage5-divergence.sh",
+    RITZ / "ritz1" / "test" / "test_imports.sh",
+    REPO / "bench" / "run.sh",
+    REPO / "projects" / "mausoleum" / "tools" / "concurrent_test.sh",
+    REPO / "projects" / "harland" / "tools" / "test_boot.sh",
+]
+SHARED_HOST_SHELL = SHARED_HOST_SCRATCH_SCRIPTS + [
+    RITZ / "ritz1" / "Makefile",
+    SCRIPTS / "build_ritz1.sh",
+    REPO / "projects" / "ritz-lsp" / "test.sh",
+    REPO / "projects" / "nexus" / "deploy" / "scripts" / "deploy.sh",
+]
 
 
 def gate_shell_files():
-    """Every file the gate executes as shell, ritz-relative."""
+    """Every shell file the gate executes, plus SHARED_HOST_SHELL."""
     files = [SCRIPTS / "regression.sh", RITZ / "Makefile"]
     files += sorted(SCRIPTS.glob("test-regression-*.sh"))
     files += sorted((RITZ / "examples").rglob("test.sh"))
+    files += SHARED_HOST_SHELL
     return [f for f in files if "/build/" not in str(f)]
 
 
@@ -124,7 +146,7 @@ def test_trap_ownership_detector():
 @pytest.mark.unit
 def test_gate_shell_names_no_tmp_path_and_globs_no_rm():
     offenders = {
-        str(f.relative_to(RITZ)): hits
+        str(f.relative_to(REPO)): hits
         for f in gate_shell_files()
         if (hits := tmp_violations(f.read_text()))
     }
@@ -140,3 +162,23 @@ def test_every_selftest_scratch_is_mktemp_removed_by_its_own_trap():
     assert len(selftests) >= 9, "the self-test glob has rotted"
     offenders = [f.name for f in selftests if not scratch_owned_by_trap(f.read_text())]
     assert offenders == []
+
+
+@pytest.mark.unit
+def test_shared_host_scripts_exist():
+    """A renamed script must not silently drop out of the rule."""
+    missing = [str(f.relative_to(REPO)) for f in SHARED_HOST_SHELL if not f.is_file()]
+    assert missing == []
+
+
+@pytest.mark.unit
+def test_shared_host_script_scratch_is_mktemp_removed_by_its_own_trap():
+    offenders = [
+        str(f.relative_to(REPO))
+        for f in SHARED_HOST_SCRATCH_SCRIPTS
+        if not scratch_owned_by_trap(f.read_text())
+    ]
+    assert offenders == [], (
+        "a script run on a shared host takes scratch from `mktemp -d` and "
+        f"removes it in its own EXIT trap (AGAST #3183): {offenders}"
+    )

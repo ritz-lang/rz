@@ -202,19 +202,19 @@ verify: $(RITZ1) $(RITZ1_SELFHOSTED)
 	@echo "=== Verification ==="
 	@ls -lh $(RITZ1) $(RITZ1_SELFHOSTED)
 	@echo "Testing ritz1..."
-	@echo "fn main() -> i32" > /tmp/test_verify.ritz
-	@echo "  42" >> /tmp/test_verify.ritz
-	$(RITZ1) /tmp/test_verify.ritz -o /tmp/test_verify.ll
+	@echo "fn main() -> i32" > $(BUILD_DIR)/test_verify.ritz
+	@echo "  42" >> $(BUILD_DIR)/test_verify.ritz
+	$(RITZ1) $(BUILD_DIR)/test_verify.ritz -o $(BUILD_DIR)/test_verify.ll
 	@echo "Testing ritz1_selfhosted..."
-	$(RITZ1_SELFHOSTED) /tmp/test_verify.ritz -o /tmp/test_verify_sh.ll
+	$(RITZ1_SELFHOSTED) $(BUILD_DIR)/test_verify.ritz -o $(BUILD_DIR)/test_verify_sh.ll
 	@echo "✓ Both compilers work"
 
 # === Test ===
 test: $(RITZ1)
 	@echo "=== Testing ritz1 ==="
-	@echo "fn main() -> i32" > /tmp/test_bootstrap.ritz
-	@echo "  42" >> /tmp/test_bootstrap.ritz
-	$(RITZ1) /tmp/test_bootstrap.ritz -o $(BUILD_DIR)/test_bootstrap.ll
+	@echo "fn main() -> i32" > $(BUILD_DIR)/test_bootstrap.ritz
+	@echo "  42" >> $(BUILD_DIR)/test_bootstrap.ritz
+	$(RITZ1) $(BUILD_DIR)/test_bootstrap.ritz -o $(BUILD_DIR)/test_bootstrap.ll
 	@echo "✓ Test passed"
 
 # === Statistics ===

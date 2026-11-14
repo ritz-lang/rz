@@ -156,10 +156,9 @@ provision() {
 
     # Copy systemd services
     log "Installing systemd services..."
-    $SCP "$SYSTEMD_DIR/mausoleum.service" ubuntu@"$IP":/tmp/
-    $SCP "$SYSTEMD_DIR/zeus.service" ubuntu@"$IP":/tmp/
-    $SSH "sudo mv /tmp/mausoleum.service /etc/systemd/system/"
-    $SSH "sudo mv /tmp/zeus.service /etc/systemd/system/"
+    # Staged in the remote user's home, not a fixed /tmp name (AGAST #3183).
+    $SCP "$SYSTEMD_DIR/mausoleum.service" "$SYSTEMD_DIR/zeus.service" ubuntu@"$IP":
+    $SSH "sudo mv ~/mausoleum.service ~/zeus.service /etc/systemd/system/"
 
     # Fix permissions for mausoleum data dir
     log "Setting up permissions..."

@@ -43,12 +43,21 @@ if [[ ! -x "$MAUSOLEUM" || ! -x "$WIKISEED" || ! -x "$BENCH" ]]; then
     exit 2
 fi
 
+# Server logs and data dirs live in one `mktemp -d`, removed on exit, so two
+# rooms running this on one host never share a path (AGAST #3183).
+T=$(mktemp -d)
+cleanup() {
+    stop_server
+    rm -rf "$T"
+}
+trap cleanup EXIT
+
 PASS=0
 FAIL=0
 FAILED_TESTS=()
 
 # Pick a high-numbered port range that's unlikely to clash with anything.
-PORT_BASE=17800
+PORT_BASE="${PORT_BASE:-17800}"
 
 # Wait for tcp listener — beats `sleep 1` since it's correct on slow CI.
 wait_for_port() {
@@ -75,7 +84,7 @@ boot_server() {
     rm -rf "$datadir"
     mkdir -p "$datadir"
     "$MAUSOLEUM" serve --port "$port" --no-encryption --data-dir "$datadir" \
-        > "/tmp/m7sp_p5_${port}.log" 2>&1 &
+        > "$T/server_${port}.log" 2>&1 &
     SERVER_PID=$!
     if ! wait_for_port "$port"; then
         kill -9 "$SERVER_PID" 2>/dev/null
@@ -116,15 +125,15 @@ record() {
 test_parallel_wiki_seed() {
     echo "Test 1: parallel wiki-seed"
     local port="$((PORT_BASE + 0))"
-    local dd="/tmp/m7sp_p5_t1_${port}"
+    local dd="$T/data_t1"
     if ! boot_server "$port" "$dd"; then
         record "boot t1 server" 1
         return
     fi
 
-    "$WIKISEED" --port "$port" --no-encryption --seed > "/tmp/m7sp_p5_t1_c1.log" 2>&1 &
+    "$WIKISEED" --port "$port" --no-encryption --seed > "$T/t1_c1.log" 2>&1 &
     local p1=$!
-    "$WIKISEED" --port "$port" --no-encryption --seed > "/tmp/m7sp_p5_t1_c2.log" 2>&1 &
+    "$WIKISEED" --port "$port" --no-encryption --seed > "$T/t1_c2.log" 2>&1 &
     local p2=$!
     wait "$p1"; local rc1=$?
     wait "$p2"; local rc2=$?
@@ -133,7 +142,7 @@ test_parallel_wiki_seed() {
     assert_alive; record "server alive after parallel seed" $?
 
     local inserts
-    inserts=$(grep -c "INSERT doc_id" "/tmp/m7sp_p5_${port}.log" || true)
+    inserts=$(grep -c "INSERT doc_id" "$T/server_${port}.log" || true)
     if [[ "$inserts" -eq 10 ]]; then
         record "10 inserts persisted (5+5)" 0
     else
@@ -146,7 +155,7 @@ test_parallel_wiki_seed() {
 test_slow_client_isolation() {
     echo "Test 2: slow-client isolation"
     local port="$((PORT_BASE + 1))"
-    local dd="/tmp/m7sp_p5_t2_${port}"
+    local dd="$T/data_t2"
     if ! boot_server "$port" "$dd"; then
         record "boot t2 server" 1
         return
@@ -184,7 +193,7 @@ test_slow_client_isolation() {
 test_midscan_starvation() {
     echo "Test 3: mid-scan starvation"
     local port="$((PORT_BASE + 2))"
-    local dd="/tmp/m7sp_p5_t3_${port}"
+    local dd="$T/data_t3"
     if ! boot_server "$port" "$dd"; then
         record "boot t3 server" 1
         return
@@ -196,11 +205,11 @@ test_midscan_starvation() {
     record "bulk-insert 500 docs" $?
 
     # Three BG scan-loops doing 10 iters each = 30 full collection scans.
-    "$BENCH" --port "$port" --scan-loop 10 > /tmp/m7sp_p5_t3_bg1.log 2>&1 &
+    "$BENCH" --port "$port" --scan-loop 10 > "$T/t3_bg1.log" 2>&1 &
     local b1=$!
-    "$BENCH" --port "$port" --scan-loop 10 > /tmp/m7sp_p5_t3_bg2.log 2>&1 &
+    "$BENCH" --port "$port" --scan-loop 10 > "$T/t3_bg2.log" 2>&1 &
     local b2=$!
-    "$BENCH" --port "$port" --scan-loop 10 > /tmp/m7sp_p5_t3_bg3.log 2>&1 &
+    "$BENCH" --port "$port" --scan-loop 10 > "$T/t3_bg3.log" 2>&1 &
     local b3=$!
 
     # 10 sequential ping-loops on parallel connections.  Each must
@@ -232,7 +241,7 @@ test_midscan_starvation() {
 
     # Server should have processed >= 31 SCANs (30 BG + 0 baseline here).
     local scan_count
-    scan_count=$(grep -c "SCAN max_results" "/tmp/m7sp_p5_${port}.log" || true)
+    scan_count=$(grep -c "SCAN max_results" "$T/server_${port}.log" || true)
     if [[ "$scan_count" -ge 30 ]]; then
         record "server processed ${scan_count} SCANs" 0
     else
