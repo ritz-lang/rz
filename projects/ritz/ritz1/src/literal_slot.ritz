@@ -222,10 +222,46 @@ fn lit_tails(s: *EmitterState, e: *Expr, t: i32, pointee: i32, fit: i32)
         return
     if e.kind == EXPR_IF or e.kind == EXPR_MATCH
         lit_tail_arms(s, e.args as *MatchArm, t, pointee, fit)
-    else if t == TYPE_PTR and pointee == TYPE_U8
+        return
+    if t == TYPE_PTR and pointee == TYPE_U8
         lit_into_ptr(s, e)
     else if fit == 1
         lit_check_fits(s, e, t)
+    # A cast (fit 0) isn't a slot: `(m + o) / 2 as i64` divides the u32 sum.
+    if fit == 1
+        lit_slot_arith(e, t)
+
+# AGAST #3225 (Aaron: "silent widening is ok, just not silent wrapping"): an
+# integer operation directly in a WIDER integer slot runs at the slot's type,
+# each operand widened by its own signedness, so `let big: i64 = x * 1000`
+# with `x: u32` can't wrap at 32 bits.  ritz1 already holds every integer in an
+# i64 and computes `+ - * << & | ^` and unary `-` there, which is that answer
+# for an i64 slot and, once a narrower slot's store wraps it, for that slot
+# too.  Only `/` and `%` read their operands back at a type, so each one this
+# reaches records the slot (Expr.slot_type) and divides at it.  Directly means
+# through those operators: a call, index, cast, `>>` or `~` reads its operand
+# at the operand's own type (R21), and stops the walk.  Every node reached is
+# rewritten, TYPE_VOID for a slot that isn't an integer, so none keeps a stale
+# slot from an earlier instance.  ritz0's _register_slot_arith.
+fn lit_slot_arith(e: *Expr, t: i32)
+    if e == null
+        return
+    if e.kind == EXPR_UNARY and e.op == OP_NEG
+        lit_slot_arith(e.operand, t)
+        return
+    if e.kind != EXPR_BINARY
+        return
+    let op: i32 = e.op
+    if op == OP_DIV or op == OP_MOD
+        if narrow_int_width(t) > 1
+            e.slot_type = t
+        else
+            e.slot_type = TYPE_VOID
+    if op == OP_ADD or op == OP_SUB or op == OP_MUL or op == OP_DIV or op == OP_MOD or op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR
+        lit_slot_arith(e.left, t)
+        lit_slot_arith(e.right, t)
+    else if op == OP_SHL
+        lit_slot_arith(e.left, t)         # a shift's count has no say (section 7.4)
 
 # `e` lands in a slot of kind `t`, pointing at `pointee` if it's a pointer.
 pub fn literal_slot(s: *EmitterState, e: *Expr, t: i32, pointee: i32)

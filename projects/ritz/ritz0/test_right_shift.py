@@ -237,18 +237,21 @@ def _main(body):
 def _slot_forms():
     """A literal under a narrow slot, masked so the slot accepts it (#2360).
 
-    The value is the one the expression has anywhere: computed at 64 bits,
-    because the literal is an i64 whatever slot is below it. Narrowed to the
-    slot it was 8, 0, 127 and 120.
+    The value is the one the expression has anywhere: a literal operand is the
+    other operand's type (LARB R21, #3112), so `a << 4` and `a + 1` are a's
+    type and wrap there before the `>>`; the slot below gives them nothing.
+    Before R21 the literal was an i64 and they were computed at 64 bits
+    (248, 128, 127 and 8).
     """
     def form(ty, a, expr, mask, want):
         return ("", f"let a: {ty} = {a}\nlet r: {ty} = ({expr}) & {mask}\nr as i64", want)
     return {
-        "shl_u8": form("u8", 248, "(a << 4) >> 4", 255, _shr(248 << 4, 4, 64, True) & 255),
-        "add_u8": form("u8", 255, "(a + 1) >> 1", 255, _shr(256, 1, 64, True) & 255),
-        "sub_u8": form("u8", 1, "(a - 2) >> 1", 255, _shr(-1, 1, 64, True) & 255),
-        # The sign-extension idiom: no sign bit at 64, so no sign extension.
-        "shl_i8": form("i8", 8, "(a << 4) >> 4", 127, _shr(8 << 4, 4, 64, True) & 127),
+        "shl_u8": form("u8", 248, "(a << 4) >> 4", 255, _shr((248 << 4) & 255, 4, 8, False)),
+        "add_u8": form("u8", 255, "(a + 1) >> 1", 255, _shr(256 & 255, 1, 8, False)),
+        "sub_u8": form("u8", 1, "(a - 2) >> 1", 255, _shr(-1 & 255, 1, 8, False)),
+        # The sign-extension idiom: `8 << 4` is -128 in an i8, so `>> 4` fills
+        # with ones: -8, masked to 120.
+        "shl_i8": form("i8", 8, "(a << 4) >> 4", 127, _shr(-128, 4, 8, True) & 127),
         # A literal count still takes the left operand's width: no narrowing.
         "count": ("", "let a: u8 = 200\nlet r: u8 = a >> 1\nr as i64", 100),
     }
@@ -256,9 +259,10 @@ def _slot_forms():
 
 SLOT = _slot_forms()
 
-# Unmasked under a narrow slot, the shift is an i64 and the narrowing is refused.
+# Unmasked under a narrow slot, an i64 shift is a narrowing and is refused. Since
+# R21 `(a << 4) >> 4` on a u8 is a u8, so the left operand is an i64 here.
 REFUSED = {
-    "ticket": "let a: u8 = 248\nlet r: u8 = (a << 4) >> 4\nr as i32",
+    "i64_operand": "let a: i64 = 248\nlet r: u8 = (a << 4) >> 4\nr as i32",
     "left_literal": "let a: u8 = 3\nlet r: u8 = 64 >> a\nr as i32",
 }
 

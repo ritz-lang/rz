@@ -1665,6 +1665,59 @@ let quot = a / b
 let rem = a % b
 ```
 
+#### Literal operands
+
+An integer literal has no type until its context gives it one (LARB R1). In an
+arithmetic or bitwise operation that context is the other operand (LARB R21):
+with `m: u32`, `m + 1` is a `u32`, exactly as `m + o` is with `o: u32`, so it
+wraps at 32 bits and `var n = m + 1` is a `u32`. Two literals are an `i64`. A
+literal that doesn't fit the other operand's type is an error, as it is in a
+slot. A shift is the exception (§7.4): its count has no say, and a literal on its
+left is an `i64`.
+
+`+`, `-` and `*` wrap on overflow at their type, except in a wider slot.
+
+#### Wider slots
+
+An integer operation used directly in a slot of a *wider* integer type is
+computed in the slot's type (AGAST #3225): each operand is widened first, by its
+own signedness, and the operation runs there. A slot is a typed `let` or `var`,
+an `=` or `op=` target, a return or a function's tail, an argument, a field, an
+element, or an `if`/`match` arm landing in one of those. "Directly" means through
+`+ - * / % << & | ^` and unary `-`, to any depth: in `let w: i64 = x * y + 1`
+both `x` and `y` are widened. `/` and `%` take the slot's signedness. A call,
+index, cast, `>>` or `~` reads its operand at the operand's own type, so the walk
+stops there and R21's type applies below it. Widening is silent; wrapping isn't
+done behind your back. Where there is no wider slot, as in `var n = m + 1`, the
+operation stays at its operands' type.
+
+```ritz body
+let m: u32 = 4294967295
+let big: i64 = m * 1000           # 4294967295000: an i64 multiply
+let sum: i64 = m + 1              # 4294967296
+let neg: i64 = (m - m) - 1        # -1: subtracted in the i64
+let n = m + 1                     # 0: no wider slot, a u32
+let cast = (m + 1) as i64         # 0: a cast isn't a slot
+let x: u8 = 200
+let w: u16 = x * x                # 40000: a u16 multiply
+```
+
+```ritz body
+let m: u32 = 4294967295
+let o: u32 = 1
+let n = m + 1               # 0, a u32
+let p = m + o               # 0
+let wide = (m as i64) + 1   # 4294967296
+let x: u8 = 200
+let y = x * 2               # 144
+let z = 4294967295 + 1      # 4294967296: two literals are an i64
+```
+
+```ritz body expect-error="`300` does not fit in `u8`"
+let x: u8 = 200
+let y = x + 300
+```
+
 #### Pointer difference
 
 `p + n` and `p - n` on a `*T` step by whole elements of `T`. `q - p` on two pointers
@@ -1712,7 +1765,8 @@ let ge = a >= b
 `/`, `%`, `<`, `<=`, `>` and `>=` are unsigned when either operand is unsigned,
 and signed otherwise. An operand that is itself an expression has the type of its
 operands, by the rule `>>` uses (§7.4): the wider operand wins, and at equal
-width the unsigned one does. A literal is an `i64` unless only a `u64` holds it.
+width the unsigned one does. A literal operand is the other operand's type
+(§7.1); a lone one is an `i64` unless only a `u64` holds it.
 A narrow operand is a value of its type, so with `s: u8 = 7`, `~s` is `248` here
 too:
 
@@ -1779,29 +1833,31 @@ let e = a >> n    # -4: `a` is signed, whatever `n` is
 
 An expression on the left has the type of its operands. The wider operand wins,
 at equal width the unsigned one does, and a shift keeps its left operand's
-signedness. So with `h: u64`, `(h ^ 1) >> 33` is logical. A literal is an `i64`,
-unless its value only fits a `u64`: `0xF000000000000000 >> 60` is `15`. A constant
-expression shifts by the same rule.
+signedness. So with `h: u64`, `(h ^ 1) >> 33` is logical. A literal operand is
+the other operand's type (§7.1), and a literal count leaves the left operand's
+type alone: `a >> 1` and `a << 4` keep the type of `a`. A literal on the left of a
+shift is an `i64`, unless its value only fits a `u64`:
+`0xF000000000000000 >> 60` is `15`. A constant expression shifts by the same rule.
 
-The left operand is a value of its type, so with `a: u8` the sum in `(a + a) >> 1`
-wraps at 8 bits first. A declared slot gives no type to a literal through a `>>`,
-so an expression has the same value wherever it is stored. In `(a << 4) >> 4` the
-`4` is an `i64`, so the left operand is too, and at `a = 248` the result is `248`,
-not the `8` an 8-bit `<<` would leave. Below a narrower slot that is a narrowing:
-
-```ritz body expect-error="implicit narrowing: `r` is declared `u8` but its initialiser has type `i64`"
-let a: u8 = 248
-let r: u8 = (a << 4) >> 4
-```
-
-Say which width you mean. A literal count takes no part in this: `a >> 1` keeps
-the type of `a`.
+The left operand is a value of its type, so with `a: u8` the sums in
+`(a + a) >> 1` and `(a + 1) >> 1` wrap at 8 bits first, and in `(a << 4) >> 4`
+the high nibble is gone before the `>>`: at `a = 248` the result is `8`. A wider
+slot (§7.1) widens `<<` but stops at `>>`, which reads its left operand at that
+operand's type, so `let w: i64 = (a << 4) >> 4` is `8` too. Say a wider width
+with a cast:
 
 ```ritz body
 let a: u8 = 248
-let wide: u8 = ((a << 4) >> 4) as u8      # 248: shifted at 64 bits
-let narrow: u8 = ((a << 4) as u8) >> 4    # 8: shifted at 8 bits
-let half: u8 = a >> 1                     # 124
+let narrow: u8 = (a << 4) >> 4                    # 8: shifted at 8 bits
+let wide: u8 = (((a as u16) << 4) >> 4) as u8     # 248: shifted at 16 bits
+let half: u8 = a >> 1                             # 124
+```
+
+An `i64` below a narrower slot is a narrowing, a shift's result included:
+
+```ritz body expect-error="implicit narrowing: `r` is declared `u8` but its initialiser has type `i64`"
+let a: i64 = 248
+let r: u8 = (a << 4) >> 4
 ```
 
 A count that is negative, or not less than the bit width of the left operand's

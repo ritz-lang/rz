@@ -14,6 +14,8 @@ import bool_check   # AGAST #2342
 import emitter_expr_call   # method_call_def (AGAST #1635)
 import ref_check           # ref_temp_call (AGAST #3050)
 import ownership           # own_temp_slot_of, own_lend_temps (AGAST #3050)
+import literal_slot        # lit_check_fits (AGAST #3112)
+import narrowing           # narrow_int_width (AGAST #3225)
 
 
 # The Option / Result `e` is, by its type, or as a constructor naming one; null.
@@ -513,6 +515,13 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
             return ext
         return result_f
 
+    # LARB R21 (AGAST #3112): a literal operand is the other operand's type, so
+    # one that can't be is refused, as in a slot: `x + 300` with `x: u8`.  The
+    # value needs nothing more here: int_operand_shape gives `x + 1` x's shape,
+    # so a compare or a narrow slot reads it back at that width.
+    if is_int_arith_op(e.op) == 1
+        refuse_unfit_literal_operand(s, e)
+
     # AGAST #1604: u64 operands take the unsigned compare / div / rem.  Every
     # integer is held in an i64; u8/u16/u32 are zero-extended into it, so they
     # are never negative there and the signed ops already agree.  A u64 with
@@ -528,10 +537,21 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         var ru: i32 = 0
         let lb: i32 = int_operand_shape(s, e.left, @lu)
         let rb: i32 = int_operand_shape(s, e.right, @ru)
-        left_reg = emit_narrow_operand(s, e.left, left_reg, lb, lu)
-        scaled_right = emit_narrow_operand(s, e.right, scaled_right, rb, ru)
-        if (lb == 64 and lu == 1) or (rb == 64 and ru == 1)
-            uns = 1
+        let wider: i32 = wider_slot_type(s, e)
+        if wider != TYPE_VOID
+            # AGAST #3225: in a wider slot `/` and `%` run at the slot's type,
+            # on operands that didn't wrap below it: read back at that type.
+            let wb: i32 = narrow_int_width(wider)
+            let wu: i32 = narrow_is_unsigned(wider)
+            left_reg = emit_narrow_operand(s, e.left, left_reg, wb, wu)
+            scaled_right = emit_narrow_operand(s, e.right, scaled_right, wb, wu)
+            if wb == 64 and wu == 1
+                uns = 1
+        else
+            left_reg = emit_narrow_operand(s, e.left, left_reg, lb, lu)
+            scaled_right = emit_narrow_operand(s, e.right, scaled_right, rb, ru)
+            if (lb == 64 and lu == 1) or (rb == 64 and ru == 1)
+                uns = 1
 
     # AGAST #2356: `>>` follows the left operand alone, never the count.
     var shr_uns: i32 = 0
@@ -633,7 +653,9 @@ fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
 # is unsigned.  get_expr_type says a binary has its left operand's type, which
 # would make `(1 + a) >> 1` signed for `a: u64`.  Here the wider operand wins, at
 # equal width the unsigned one does (as #1604 has it for `/` and `<`), and a
-# shift keeps its left operand's signedness.  A literal is an i64, unless only a
+# shift keeps its left operand's signedness.  A literal operand is the other
+# operand's type (LARB R21, AGAST #3112), except on the left of a shift: with
+# `m: u32`, `m + 1` is a u32.  A lone literal, or two, is an i64, unless only a
 # u64 can hold it, in which case the lexer has wrapped it negative: `-8` is a
 # negated literal.  This is ritz0's _int_shape.
 pub fn int_operand_shape(s: *EmitterState, e: *Expr, uns: *i32) -> i32
@@ -645,6 +667,12 @@ pub fn int_operand_shape(s: *EmitterState, e: *Expr, uns: *i32) -> i32
     if e.kind == EXPR_UNARY and (e.op == OP_NEG or e.op == OP_BIT_NOT)
         return int_operand_shape(s, e.operand, uns)
     if e.kind == EXPR_BINARY and is_int_arith_op(e.op) == 1
+        let lit_l: i32 = is_untyped_int_lit(e.left)
+        let lit_r: i32 = is_untyped_int_lit(e.right)
+        if lit_r == 1 and lit_l == 0
+            return int_operand_shape(s, e.left, uns)
+        if lit_l == 1 and lit_r == 0 and e.op != OP_SHL and e.op != OP_SHR
+            return int_operand_shape(s, e.right, uns)
         var lu: i32 = 0
         var ru: i32 = 0
         let lb: i32 = int_operand_shape(s, e.left, @lu)
@@ -765,12 +793,55 @@ fn vec_name_elem_type(name: *u8, len: i32) -> i32
         return TYPE_U64
     TYPE_UNKNOWN
 
+# AGAST #3225: the slot `/` or `%` node `e` lands in directly, when it's wider
+# than `e`'s own integer type (literal_slot.ritz, lit_slot_arith); else
+# TYPE_VOID.  ritz0's _wider_slot.
+fn wider_slot_type(s: *EmitterState, e: *Expr) -> i32
+    if e.op != OP_DIV and e.op != OP_MOD
+        return TYPE_VOID
+    let t: i32 = e.slot_type
+    let bits: i32 = narrow_int_width(t)
+    if bits <= 1
+        return TYPE_VOID
+    var uns: i32 = 0
+    if bits <= int_operand_shape(s, e, @uns)
+        return TYPE_VOID
+    t
+
 fn is_int_arith_op(op: i32) -> i32
     if op == OP_ADD or op == OP_SUB or op == OP_MUL or op == OP_DIV or op == OP_MOD
         return 1
     if op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR or op == OP_SHL or op == OP_SHR
         return 1
     0
+
+# 1 when `e` is an untyped integer literal, `-` and all: ritz0's
+# _untyped_int_literal.  `true`, `pass` and `()` are literals of another kind.
+fn is_untyped_int_lit(e: *Expr) -> i32
+    if e == null
+        return 0
+    var v: i64 = 0
+    lit_int_value(e, @v)
+
+# LARB R21 (AGAST #3112): in `x + 300` the literal is x's type, which can't hold
+# it.  Reported as a slot reports it ("`300` does not fit in `u8`").  Only a
+# narrow operand gives its type: a literal already is a 64-bit one.  A shift's
+# count has no say in the type (§7.4), and its left literal stays an i64.
+fn refuse_unfit_literal_operand(s: *EmitterState, e: *Expr)
+    let lit_l: i32 = is_untyped_int_lit(e.left)
+    let lit_r: i32 = is_untyped_int_lit(e.right)
+    if lit_l == lit_r or e.op == OP_SHL or e.op == OP_SHR
+        return
+    var lit: *Expr = e.right
+    var other: *Expr = e.left
+    if lit_l == 1
+        lit = e.left
+        other = e.right
+    var uns: i32 = 0
+    let bits: i32 = int_operand_shape(s, other, @uns)
+    let t: i32 = narrow_int_kind(bits, uns)
+    if t != TYPE_VOID
+        lit_check_fits(s, lit, t)
 
 # AGAST #2356: a register holds an i64, so `a + a` or `~a` on a u8 can sit outside
 # the u8's range, and the bits a `>>` brings down would be ones the type does not
@@ -2077,6 +2148,11 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c" = xor i64 ")
         emit_reg(s, operand)
         emit_str(s, c", -1\n")
-        return result
+        # AGAST #3225: `~m` on a u32 of 0 is 4294967295, not the i64's -1, in
+        # whatever it lands in: a wider slot (`let w: i64 = ~m`) or a sum that
+        # runs there (`~m + 1`) reads it as is, so it's brought back here.
+        var not_uns: i32 = 0
+        let not_bits: i32 = int_operand_shape(s, e.operand, @not_uns)
+        return emit_narrow_operand(s, e, result, not_bits, not_uns)
     return 0
 

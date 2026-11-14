@@ -665,10 +665,11 @@ def test_ritz0_leaves_a_reference_to_what_it_cant_type_unjudged(tmp_path):
 # An un-annotated scalar local is its initialiser's type (#2527), so `@&n` of
 # `var n = m` with `m: u32` fits an `@&u32` and holds the whole u32.  ritz1 kept
 # it an i64 slot: `n - 1` didn't wrap, and `*p` wrote the low half of the i64,
-# so `n == 1` was false (4); `b + 1` didn't wrap to -128 (20).  `k + 1` is an
-# i64 to ritz0's emitter (a literal is), so `c` doesn't wrap (200; AGAST #3112).
+# so `n == 1` was false (4); `b + 1` didn't wrap to -128 (20).  `k + 1` is an i8
+# (LARB R21, AGAST #3112: a literal takes the other operand's type), so `c`
+# wraps to -128 (100); it was an i64 to ritz0's emitter and ritz1 (200).
 # `var x = three()` is an i16 (#1795): `*p = -5` through a `*i16` left the i64's
-# high bytes zero, so `x == -5` was false (30).  3 + 10 + 200 + 0 on ritz0.
+# high bytes zero, so `x == -5` was false (30).  3 + 10 + 100 + 0.
 UNTYPED_SCALAR = """\
 fn three() -> i16
     3
@@ -715,7 +716,7 @@ pub fn main() -> i32
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_an_untyped_scalar_local_is_its_initialisers_type(tmp_path, compiler):
-    assert _run_three(compiler, tmp_path, "untyped_scalar", UNTYPED_SCALAR) == 213
+    assert _run_three(compiler, tmp_path, "untyped_scalar", UNTYPED_SCALAR) == 113
 
 
 # An un-annotated copy of a struct is that struct: `@b` fits `@Rect` (prism's

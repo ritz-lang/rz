@@ -699,6 +699,9 @@ class LLVMEmitter:
         self._value_origin: Dict[int, Tuple[ir.Value, rast.Expr]] = {}
         # Ids of the tails about to land in a `*u8` slot (#2341).
         self._ptr_tails: Set[int] = set()
+        # AGAST #3225: id(arithmetic node) -> (bits, unsigned) of the integer
+        # slot it lands in directly, or None (_register_slot_arith).
+        self._slot_arith: Dict[int, Optional[Tuple[int, bool]]] = {}
         # AGAST #2261: what the method call being emitted has already
         # evaluated, by id(expr): its receiver and the operands of a place.
         self._evaluated_once: Dict[int, ir.Value] = {}
@@ -1445,29 +1448,61 @@ class LLVMEmitter:
             return 0 <= value < (1 << width)
         return -(1 << (width - 1)) <= value < (1 << (width - 1))
 
+    def _literal_takes_operand_type(self, expr: rast.BinOp, left: ir.Value,
+                                    right: ir.Value) -> Tuple[ir.Value, ir.Value]:
+        """LARB R21 (AGAST #3112): in an arithmetic or bitwise operation an
+        untyped integer literal is the other operand's type, as it would be in
+        a slot. So with `m: u32`, `m + 1` adds in 32 bits and wraps exactly as
+        `m + o` does, and `var n = m + 1` is a u32. Two literals stay `i64`.
+
+        A literal that doesn't fit is an error (`x + 300` with `x: u8`). A
+        shift's count has no say in its type (§7.4): a literal count is
+        materialised at the left operand's width when it fits, and a literal
+        on the left of a shift stays an `i64` (`1 << n`).
+
+        Only a narrow operand (8..32 bits) gives its type: at 64 bits the
+        literal already is one, and `_int_shape` reads its signedness.
+        Returns the `(left, right)` pair, re-materialised or as given.
+        """
+        lit_left = self._untyped_int_literal(expr.left)
+        lit_right = self._untyped_int_literal(expr.right)
+        if (lit_left is None) == (lit_right is None):
+            return left, right
+        shift = expr.op in ('<<', '>>')
+        if lit_left is not None and shift:
+            return left, right
+        if lit_left is None:
+            lit_val, lit_expr, other, other_expr = lit_right, expr.right, left, expr.left
+        else:
+            lit_val, lit_expr, other, other_expr = lit_left, expr.left, right, expr.right
+        if not isinstance(other.type, ir.IntType) or not 8 <= other.type.width < 64:
+            return left, right
+        width = other.type.width
+        unsigned = self._int_shape(other_expr, True)[1]
+        if not self._int_literal_fits(lit_val, width, unsigned):
+            if shift:
+                return left, right
+            name = f"{'u' if unsigned else 'i'}{width}"
+            raise EmitError(f"`{lit_val}` does not fit in `{name}`",
+                            self._value_span(lit_expr))
+        const = ir.Constant(ir.IntType(width), lit_val)
+        return (const, right) if lit_left is not None else (left, const)
+
     def _retype_literal_operand(self, expr: rast.BinOp, left: ir.Value,
                                 right: ir.Value):
         """Re-materialise an untyped integer literal at the declared width.
 
-        AGAST #1396. `_emit_expr` types every integer literal as i64, so in
-        `x + 1` (x: u32) the literal dragged its neighbour up to 64 bits and
-        the result was truncated back down — while `x + y` stayed 32-bit. That
-        artifact accounted for 292 of the 309 narrowing sites found across 115
-        packages, all in code that was already correctly annotated.
+        AGAST #1396. Since LARB R21 (#3112) a literal operand takes its sibling's
+        type first (_literal_takes_operand_type), which #1396 had rejected
+        because `let big: i64 = x * 1000` (x: u32) then multiplies in 32 bits;
+        R21 chose that, as `x * k` with `k: u32` always did. What reaches here
+        is what R21 leaves alone: a literal on the left of `<<`, as in
+        `let r: u32 = 1 << n` with `n: u32`, takes the declared width.
 
-        The width comes from the DECLARED type in context, deliberately NOT
-        from the sibling operand. Under a sibling rule
-
-            let big: i64 = x * 1000        # x: u32
-
-        would multiply in 32 bits and silently wrap, where today it cannot
-        overflow. Keying on the declaration fixes `let q: u32 = x + 1` and
-        leaves that case alone, because the declared widths differ (32 vs 64).
-
-        Narrowing is safe where it applies because the existing IR already
-        truncates the result to this exact width, so the high bits it computes
-        are provably discarded: for `+ - * << & | ^`, `trunc(op(zext a, zext
-        b))` is congruent to `op(a, b)` mod 2**width.
+        The width comes from the DECLARED type in context, and only where the
+        sibling is already that width. Narrowing is safe where it applies
+        because the existing IR already truncates the result to this exact
+        width, so the high bits it computes are provably discarded.
 
         Returns the adjusted `(left, right)` pair, or None to leave the
         existing widening path untouched.
@@ -1580,7 +1615,12 @@ class LLVMEmitter:
                 return self._fn_value_type(expr.name, expr.span)
             return None
         elif isinstance(expr, rast.BinOp):
-            # Binary ops inherit type from left operand
+            # Binary ops inherit type from left operand, unless it's a literal
+            # that takes the right one's type (LARB R21, #3112): `2 * x` is x's.
+            if (expr.op in self._INT_ARITH_OPS and expr.op not in ('<<', '>>')
+                    and self._untyped_int_literal(expr.left) is not None
+                    and self._untyped_int_literal(expr.right) is None):
+                return self._infer_ritz_type(expr.right)
             return self._infer_ritz_type(expr.left)
         elif isinstance(expr, rast.UnaryOp):
             inner_type = self._infer_ritz_type(expr.operand)
@@ -8430,11 +8470,28 @@ class LLVMEmitter:
             self._reject_struct_operand(expr, left, right)
             self._reject_pointer_strlit_compare(expr, left, right)
 
+            # LARB R21 (#3112): a literal operand is the other operand's type.
+            if op in self._INT_ARITH_OPS:
+                left, right = self._literal_takes_operand_type(expr, left, right)
+
+            # AGAST #3225: directly in a wider integer slot, the operation runs
+            # in the slot's type, each operand widened by its own signedness.
+            # `/` and `%` take the slot's signedness: `(a - b) / 2` into an i64
+            # is a signed divide of a possibly negative difference.
+            wider_slot = self._wider_slot(expr) if op in self._SLOT_ARITH_OPS else None
+            if (wider_slot is not None and isinstance(left.type, ir.IntType)
+                    and isinstance(right.type, ir.IntType)):
+                left = self._widen_to(expr.left, left, wider_slot[0])
+                right = self._widen_to(expr.right, right, wider_slot[0])
+            else:
+                wider_slot = None
+
             # Ensure same type
             if left.type != right.type:
                 if isinstance(left.type, ir.IntType) and isinstance(right.type, ir.IntType):
-                    # AGAST #1396: prefer re-typing an untyped integer literal
-                    # to the declared width over widening its neighbour to 64
+                    # AGAST #1396: what R21 leaves alone, a shift's left literal
+                    # under a declared type (`let r: u32 = 1 << n`), takes the
+                    # declared width rather than widening its neighbour to 64
                     # bits. Returns None whenever the declaration is absent or
                     # asks for something wider, in which case the original
                     # widening below runs unchanged.
@@ -8528,14 +8585,16 @@ class LLVMEmitter:
                 if is_float:
                     return self.builder.fdiv(left, right)
                 # Use unsigned division for unsigned types
-                if self._operands_unsigned(expr, left):
+                if (wider_slot[1] if wider_slot is not None
+                        else self._operands_unsigned(expr, left)):
                     return self.builder.udiv(left, right)
                 return self.builder.sdiv(left, right)
             elif op == '%':
                 if is_float:
                     return self.builder.frem(left, right)
                 # Use unsigned remainder for unsigned types
-                if self._operands_unsigned(expr, left):
+                if (wider_slot[1] if wider_slot is not None
+                        else self._operands_unsigned(expr, left)):
                     return self.builder.urem(left, right)
                 return self.builder.srem(left, right)
             elif op == '==':
@@ -11142,6 +11201,69 @@ class LLVMEmitter:
                 self._ptr_tails.add(id(tail))
             elif fit:
                 self._check_literal_fits(tail, tail_slot)
+            if fit:
+                # A cast (fit=False) isn't a slot: `(m + 1) as i64` is R21's u32.
+                self._register_slot_arith(tail, tail_slot)
+
+    # AGAST #3225: the operators that run in a wider slot's type. `& | ^` can't
+    # wrap, but are followed so a sum below them doesn't either; `>>` and `~`
+    # read their operand's high bits at its own type, so they stop the walk.
+    _SLOT_ARITH_OPS = ('+', '-', '*', '/', '%', '<<', '&', '|', '^')
+
+    def _register_slot_arith(self, value: rast.Expr, slot: Optional[rast.Type]) -> None:
+        """Record the integer slot each arithmetic node of `value` lands in.
+
+        AGAST #3225 (Aaron: "silent widening is ok, just not silent wrapping").
+        An integer operation used directly in a WIDER integer slot (a typed
+        let/var, `=`, `op=`, return, argument, field, element) is computed in
+        the slot's type: `let big: i64 = x * 1000` with `x: u32` is an i64
+        multiply, each operand widened by its own signedness. Directly means
+        through `_SLOT_ARITH_OPS` and unary `-` only; a call, index, cast,
+        `>>` or `~` consumes its operand at the operand's own type (R21).
+
+        Every node reached is (re)written, `None` for a non-integer slot, so a
+        node emitted again under another slot (a generic's instance) never
+        keeps a stale width. _widen_into_slot reads the map.
+        """
+        slot = resolve_alias_in(slot, self.type_aliases) if slot is not None else None
+        shape = None
+        if isinstance(slot, rast.NamedType) and not slot.args:
+            bits = self._INT_TYPE_WIDTHS.get(slot.name)
+            if bits is not None:
+                shape = (bits, self._is_unsigned_type(slot))
+        stack = [value]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, rast.Grouped):
+                stack.append(node.expr)
+            elif isinstance(node, rast.BinOp) and node.op in self._SLOT_ARITH_OPS:
+                self._slot_arith[id(node)] = shape
+                stack.append(node.left)
+                if node.op != '<<':        # a shift's count has no say (§7.4)
+                    stack.append(node.right)
+            elif isinstance(node, rast.UnaryOp) and node.op == '-':
+                self._slot_arith[id(node)] = shape
+                stack.append(node.operand)
+
+    def _wider_slot(self, expr: rast.Expr) -> Optional[Tuple[int, bool]]:
+        """`(bits, unsigned)` of the slot `expr` runs in, when it's wider than
+        `expr`'s own integer type (AGAST #3225); else None."""
+        shape = self._slot_arith.get(id(expr))
+        if shape is None or shape[0] <= self._int_shape(expr, True)[0]:
+            return None
+        return shape
+
+    def _widen_to(self, operand: rast.Expr, val: ir.Value, bits: int) -> ir.Value:
+        """`val` widened to `bits` by its own signedness. A literal took its
+        sibling's type (R21) and fits it, so it is just its value."""
+        if not isinstance(val.type, ir.IntType) or not 1 < val.type.width < bits:
+            return val
+        lit = self._untyped_int_literal(operand)
+        if lit is not None:
+            return ir.Constant(ir.IntType(bits), lit)
+        if self._int_shape(operand, True)[1]:
+            return self.builder.zext(val, ir.IntType(bits))
+        return self.builder.sext(val, ir.IntType(bits))
 
     @staticmethod
     def _is_u8_ptr(ty: Optional[rast.Type]) -> bool:
@@ -11264,6 +11386,10 @@ class LLVMEmitter:
                                 self._value_span(expr.operand))
             # Negation
             if isinstance(operand.type, ir.IntType):
+                # AGAST #3225: `let w: i64 = -k` (k: i32) negates in the slot.
+                wider_slot = self._wider_slot(expr)
+                if wider_slot is not None:
+                    operand = self._widen_to(expr.operand, operand, wider_slot[0])
                 return self.builder.neg(operand)
             else:
                 return self.builder.fneg(operand)
@@ -14687,8 +14813,10 @@ class LLVMEmitter:
         u64 sign-filled. The wider operand wins, at equal width the unsigned one
         does, and a shift keeps its left operand's signedness. A literal is an
         i64, unless only a u64 can hold it, or `narrowed` says the emitted value
-        is narrower than 64 bits, which means _retype_literal_operand gave the
-        literal its sibling's type. ritz1's int_operand_shape is this.
+        is narrower than 64 bits: then the literal took its sibling's type
+        (LARB R21, _literal_takes_operand_type) or, on a shift's left, the
+        slot's (_retype_literal_operand). ritz1's int_operand_shape is this,
+        with R21's rule spelled out, as ritz1 holds every integer in an i64.
         """
         if isinstance(expr, rast.IntLit):
             return 64, expr.value >= 1 << 63
@@ -16464,7 +16592,12 @@ class LLVMEmitter:
         # Check if source OR target is unsigned for proper extension
         # When casting to unsigned (e.g., i32 as u64), use zext to avoid sign pollution
         # When casting from unsigned (e.g., u8 as u64), also use zext
-        use_zext = self._infer_unsigned_expr(expr.expr) or self._is_unsigned_type(expr.target)
+        # An operator expression is its operands' type (_int_shape): with
+        # `x: u8`, `(x + 1) as i64` zero-extends the u8 sum (LARB R21, #3112).
+        src_unsigned = (self._int_shape(expr.expr, val.type.width < 64)[1]
+                        if isinstance(val.type, ir.IntType)
+                        else self._infer_unsigned_expr(expr.expr))
+        use_zext = src_unsigned or self._is_unsigned_type(expr.target)
 
         # Handle integer widening with proper sign extension
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
@@ -16485,7 +16618,7 @@ class LLVMEmitter:
         # the instruction.  _convert_type can't know it and assumes signed.
         floats = (ir.FloatType, ir.DoubleType)
         if isinstance(val.type, ir.IntType) and isinstance(target_type, floats):
-            if self._infer_unsigned_expr(expr.expr):
+            if src_unsigned:
                 return self.builder.uitofp(val, target_type)
             return self.builder.sitofp(val, target_type)
         if isinstance(val.type, floats) and isinstance(target_type, ir.IntType):

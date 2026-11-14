@@ -64,9 +64,10 @@ def _rows():
                 (f"{tag}.eq_form", decl, f"{x} == (w + d + d)", True),
                 (f"{tag}.ne_form", decl, f"{x} != (w + d + d)", False),
             ]
-        # A literal operand is an i64 and the wider operand wins, so this
-        # form is not brought back: only an all-narrow one is.
-        rows.append((f"{ty}.literal_widens", f"let a: {ty} = {a}\n", f"(a * 3) == {a * 3}", True))
+        # A literal operand is the other operand's type (LARB R21, #3112), so
+        # this form wraps as `a * k` does; it was an i64 and didn't.
+        rows.append((f"{ty}.literal_wraps", f"let a: {ty} = {a}\n",
+                     f"(a * 3) == {_wrap(a * 3, bits, signed)}", True))
     return rows
 
 

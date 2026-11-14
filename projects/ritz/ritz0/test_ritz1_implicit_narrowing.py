@@ -113,15 +113,18 @@ RITZ1_EXTRA_REJECTED = {
                               "        BGR => 2", "x: i32, o: Order, w: i16"),
 }
 # Block-form if-expressions (AGAST #1613), measured against ritz0: inside an
-# `if` arm a literal is i64 and does not adopt the other arm or operand.
+# `if` arm a literal is i64 and does not adopt the other arm.  An operand it
+# does adopt (LARB R21, AGAST #3112): `x + 1` is an i32, so that arm fits.
 _IF = "let n: {t} = if x > 0\n        {a}\n    else\n        {b}"
 RITZ1_EXTRA_REJECTED.update({
     "if_block_literal_arm_is_i64": (_IF.format(t="i32", a="x", b="0"), None),
     "if_block_literal_first":      (_IF.format(t="i32", a="0", b="x"), None),
-    "if_block_literal_operand":    (_IF.format(t="i32", a="x + 1", b="x"), None),
     "if_block_i64_arm":            (_IF.format(t="i32", a="x", b="five()"), None),
 })
 RITZ1_EXTRA_ACCEPTED = {
+    "if_block_literal_operand": (_IF.format(t="i32", a="x + 1", b="x"), None),
+    "if_block_literal_left_operand": (_IF.format(t="i32", a="1 + x", b="x"), None),
+    "shift_count_literal_under_shr": ("let n: u8 = (y << 4) >> 4", "y: u8"),
     # An UNANNOTATED local: ritz1 records it as i64 whatever its initialiser,
     # and ritz0 infers i32 here. A check that trusted ritz1's default would
     # reject valid code -- the false positive this guards against.

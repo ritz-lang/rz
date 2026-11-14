@@ -33,28 +33,29 @@ Landing #1393 first would demand `as u32` on code that is already right, and it
 would land hardest on crypto/hashing/parser code — exactly where explicit widths
 matter most.
 
-THE RULE THESE TESTS PIN, AND THE ONE THEY REJECT
+THE RULE THESE TESTS PIN (LARB R21, AGAST #3112, #3225)
 
-The tempting fix is "an untyped literal adopts the other operand's type". That
-is WRONG, and `test_a_widening_target_keeps_64_bit_arithmetic` is the test that
-says so. Consider:
+This file first pinned "a literal takes the DECLARED type" and rejected the
+sibling-operand rule, because under it
 
     let big: i64 = x * 1000             # x: u32
 
-Today that multiplies in 64 bits and cannot overflow. Under the sibling-operand
-rule it would multiply in 32 bits and silently wrap — a real behaviour change,
-in the direction of data loss, invisible to every existing test.
+multiplies in 32 bits and wraps. R21 (confirmed by Aaron, 2026-11-14) chose the
+sibling-operand rule: a literal operand is the other operand's type, so `x + 1`
+is a u32 as `x + y` always was. Aaron then ruled on the hazard (#3225): "silent
+widening is ok, just not silent wrapping." An operation used directly in a
+WIDER integer slot runs at the slot's type, its operands widened first, so
+`let big: i64 = x * 1000` is an i64 multiply again, and so is `x * k`. Without
+a wider slot (`var n = m + 1`) R21 stands and the u32 wraps; overflow there is
+#3197's question.
 
-The rule pinned here instead is: **an untyped integer literal takes the
-expected (declared/contextual) type.** It fixes `let q: u32 = x + 1` and leaves
-`let big: i64 = x * 1000` alone, because in the first case the declared type is
-u32 and in the second it is i64.
+The declared type still gives a shift's left literal its width
+(`let r: u32 = 1 << n`), which R21 leaves an i64 (see _retype_literal_operand).
 
-Narrowing is safe in the first case for a reason worth stating: for `+ - * <<
-& | ^`, `trunc(op(zext a, zext b))` is congruent to `op(a, b)` mod 2**n, and the
-existing IR *already* truncates — so the high bits it computes are provably
-discarded. The tests assert the IR shape rather than just the exit code,
-because a test that only checked "it compiles" would have passed before the fix.
+Narrowing is congruent for `+ - * << & | ^`: `trunc(op(zext a, zext b))` is
+`op(a, b)` mod 2**n. The tests assert the IR shape rather than just the exit
+code, because a test that only checked "it compiles" would have passed before
+the fix.
 """
 
 import os
@@ -199,18 +200,18 @@ def test_the_cryptosec_shape_is_clean(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# The hazard. This is the test that rejects the obvious-but-wrong fix.
+# The hazard #1396 named: a wider slot. R21 types `x * 1000` as x's, and #3225
+# computes it in the wider slot it lands in, so it can't wrap at 32 bits.
 # --------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_a_widening_target_keeps_64_bit_arithmetic(tmp_path):
-    """`let big: i64 = x * 1000` must NOT be computed in 32 bits.
+    """`let big: i64 = x * 1000` is an i64 multiply (AGAST #3225).
 
-    This is the whole reason the rule keys off the *declared* type and not
-    the sibling operand. Under a sibling-operand rule the literal would
-    become u32, the multiply would happen in 32 bits, and a large `x` would
-    silently wrap before being widened — data loss that no existing test
-    would catch.
+    Aaron: "silent widening is ok, just not silent wrapping." Each operand is
+    widened by its own signedness, so the u32 is zero-extended first. Run on
+    all three compilers (x = 5_000_000 gives 5_000_000_000) by
+    test_wider_slot_widens.py's `let_mul`.
     """
     ir_text = _emit_ir(tmp_path, (
         "fn widen_mul(x: u32) -> i64\n"
@@ -218,48 +219,48 @@ def test_a_widening_target_keeps_64_bit_arithmetic(tmp_path):
         "    return big\n"
     ))
     body = _body(ir_text, "widen_mul")
-    assert any("mul i64" in line for line in body), (
-        f"multiply must happen in 64 bits when the target is i64: {body}"
-    )
-    assert any(re.search(r"\b[zs]ext i32 .* to i64", line) for line in body), (
-        f"the u32 operand must be widened before the multiply: {body}"
+    assert any("mul i64" in line for line in body), f"an i64 slot multiplies in 64 bits: {body}"
+    assert not any("mul i32" in line for line in body), body
+    assert any(re.search(r"\bzext i32 .* to i64", line) for line in body), (
+        f"the u32 operand is zero-extended before the multiply: {body}"
     )
 
 
 @pytest.mark.unit
+def test_without_a_wider_slot_r21_wraps(tmp_path):
+    """The control: `var n = m + 1` has no wider slot, so it is m's u32 (R21)."""
+    ir_text = _emit_ir(tmp_path, (
+        "fn bump(m: u32) -> u32\n"
+        "    var n = m + 1\n"
+        "    return n\n"
+    ))
+    body = _body(ir_text, "bump")
+    assert any("add i32" in line for line in body), f"m + 1 is a u32 add: {body}"
+    assert not any("add i64" in line for line in body), body
+
+
+@pytest.mark.unit
 def test_a_widening_shift_keeps_64_bit_arithmetic(tmp_path):
-    """Same hazard, shift form: `x << 20` into an i64 must not lose bits."""
+    """Shift form: `x << 20` into an i64 shifts in 64 bits; the count has no say."""
     ir_text = _emit_ir(tmp_path, (
         "fn widen_shl(x: u32) -> i64\n"
         "    let big: i64 = x << 20\n"
         "    return big\n"
     ))
     body = _body(ir_text, "widen_shl")
-    assert any("shl i64" in line for line in body), (
-        f"shift must happen in 64 bits when the target is i64: {body}"
-    )
+    assert any("shl i64" in line for line in body), f"an i64 slot shifts in 64 bits: {body}"
 
 
 @pytest.mark.unit
-def test_the_declared_type_does_not_leak_into_a_call_argument(tmp_path):
-    """A nested call argument is consumed at the PARAMETER's type.
-
-    This is a regression test for a defect introduced by the first version of
-    the #1396 fix itself, and found only by probing the positions the ticket
-    listed as unmeasured.
+def test_a_call_argument_is_its_parameters_slot(tmp_path):
+    """The argument's slot is the PARAMETER, never the enclosing declaration.
 
         fn takes64(v: i64) -> u32
         let q: u32 = takes64(x * 1000)      # x: u32
 
-    `self.expected_ritz_type` is ambient across the whole initialiser and does
-    not narrow as emission descends, so `u32` leaked into the argument: the
-    multiply was emitted as `mul i32` and WRAPPED, then the wrapped value was
-    sign-extended to the i64 the parameter wanted. Silent data loss, in code
-    that previously could not overflow.
-
-    The value only adopts the declared width while it is reachable from the
-    declared expression through arithmetic — a Call, Index, Field or Cast
-    boundary stops it.
+    #1396's first version leaked the declared u32 into the argument and
+    multiplied in 32 bits. The i64 parameter is a wider slot (#3225), so the
+    multiply is an i64 one on the zero-extended u32.
     """
     ir_text = _emit_ir(tmp_path, (
         "fn takes64(v: i64) -> u32\n"
@@ -270,12 +271,10 @@ def test_the_declared_type_does_not_leak_into_a_call_argument(tmp_path):
         "    return q\n"
     ))
     body = _body(ir_text, "leak")
-    assert any("mul i64" in line for line in body), (
-        "the multiply feeds an i64 parameter and must happen in 64 bits; "
-        f"the declared u32 leaked into the argument: {body}"
-    )
-    assert not any("mul i32" in line for line in body), (
-        f"argument wrapped at 32 bits before being widened: {body}"
+    assert any("mul i64" in line for line in body), f"the i64 parameter multiplies in 64 bits: {body}"
+    assert not any("mul i32" in line for line in body), f"the declared u32 leaked in: {body}"
+    assert not any(re.search(r"\bsext i32", line) for line in body), (
+        f"a u32 operand is widened unsigned: {body}"
     )
 
 
