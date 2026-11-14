@@ -171,6 +171,12 @@ class FnType(Type):
     # §17.7, AGAST #1879): None is the C convention; "win64" is set by a
     # `[[callconv = "win64"]]` fn-type alias.
     callconv: Optional[str] = None
+    # Indices of `name:& T` params (AGAST #3034): a slot that borrows a bare
+    # place and is physically a `*T`. Only the emitter's type of a fn named
+    # as a value (`let f = lb`) has them; `fn(...)` written as a type has no
+    # way to spell one. Calls through it read them; the value itself keeps
+    # the fn's own LLVM type, so lowering the FnType never sees them.
+    lent: Tuple[int, ...] = ()
 
 
 @dataclass

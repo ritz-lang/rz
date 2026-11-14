@@ -173,7 +173,8 @@ ALLOWED = {
     "pass_on_written": ("fn on(c:& C) -> i32\n    mb(@&c)\n\n",
                         "    var c = C { x: 1 }\n    on(c)\n    c.x\n", 3),
     # #2417: an un-annotated `let f = mb` carries mb's signature, so the call
-    # is typed (it was `call i64 %f(i64 ptr)`). ritz0 can't call it yet: #3034.
+    # is typed (it was `call i64 %f(i64 ptr)`); in ritz0 it was "Unknown
+    # function: f" until #3034.
     "written_through_an_inferred_fn_local": (
         "", "    var c = C { x: 1 }\n    let f = mb\n    f(@&c)\n    c.x\n", 3),
     "mutable_reference_into_shared": ("fn rd(c: @C) -> i32\n    c.x\n\nfn on(m: @&C) -> i32\n    rd(m)\n\n",
@@ -183,7 +184,7 @@ ALLOWED = {
 # Rows ritz1 and ritz1_selfhosted do not meet yet, each with its ticket.
 GAPS = {}
 # Rows ritz0 does not meet yet.
-RITZ0_GAPS = {"written_through_an_inferred_fn_local": 3034, "inferred_lent_fn_pointer": 3035}
+RITZ0_GAPS = {"inferred_lent_fn_pointer": 3035}
 
 
 def _wrap(body):

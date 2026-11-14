@@ -1442,6 +1442,22 @@ class LLVMEmitter:
         const = ir.Constant(ir.IntType(want), lit_val)
         return (const, right) if lit_left is not None else (left, const)
 
+    def _fn_value_type(self, name: str, span) -> Optional[rast.FnType]:
+        """AGAST #3034: the `fn(...) -> R` type of the fn `name` as a value.
+
+        A `:& T` param keeps its `T` and is listed in `lent`: the slot is the
+        `*T` the fn physically takes (_param_llvm_type), and a call through
+        the value borrows a bare place for it as a direct call does. A
+        varargs extern has no fn type to give, so it gets none.
+        """
+        entry = self.functions.get(name)
+        if entry is None or getattr(entry[1], 'varargs', False):
+            return None
+        fn_def = entry[1]
+        lent = tuple(i for i, p in enumerate(fn_def.params) if self._takes_place(p))
+        return rast.FnType(span, [p.type for p in fn_def.params], fn_def.ret_type,
+                           getattr(fn_def, 'callconv', None), lent)
+
     def _infer_ritz_type(self, expr: rast.Expr, llvm_val: ir.Value = None) -> Optional[rast.Type]:
         """Infer a Ritz type from an expression, for signedness tracking.
 
@@ -1480,6 +1496,11 @@ class LLVMEmitter:
                 return self.ritz_types[expr.name]
             if expr.name in self.constants:
                 return self.const_ritz_types.get(expr.name)
+            # AGAST #3034: a fn named as a value. Without this an
+            # un-annotated `let f = inc` recorded no type, so `f(2)` missed
+            # the indirect-call path and was "Unknown function: f".
+            if expr.name not in self.locals and expr.name not in self.params:
+                return self._fn_value_type(expr.name, expr.span)
             return None
         elif isinstance(expr, rast.BinOp):
             # Binary ops inherit type from left operand
@@ -4529,6 +4550,8 @@ class LLVMEmitter:
         type: what _byval_params_of answers for a named fn (AGAST #1739)."""
         byval = {}
         for i, p in enumerate(fn_type.params):
+            if i in fn_type.lent:   # a `:& T` slot is a plain `*T` (#3034)
+                continue
             ty = self._sret_struct_type(self._ritz_type_to_llvm(p))
             if ty is not None:
                 byval[i] = ty
@@ -11503,12 +11526,21 @@ class LLVMEmitter:
                         raise ValueError(f"Function pointer '{fname}' not found in locals or params")
 
                     # Emit and convert arguments
-                    for arg, param_type in zip(call.args, ritz_type.params):
-                        self._literal_into_slot(param_type, arg)
-                    args = [self._emit_expr(arg) for arg in call.args]
+                    for i, (arg, param_type) in enumerate(zip(call.args, ritz_type.params)):
+                        if i not in ritz_type.lent:
+                            self._literal_into_slot(param_type, arg)
                     converted_args = []
-                    for arg, arg_val, param_type in zip(call.args, args, ritz_type.params):
+                    for i, (arg, param_type) in enumerate(zip(call.args, ritz_type.params)):
                         expected_llvm = self._ritz_type_to_llvm(param_type)
+                        if i in ritz_type.lent:
+                            # AGAST #3034: a `:& T` slot borrows a bare
+                            # place, as a direct call to the fn does.
+                            lent = rast.Param(arg.span, f"#{i + 1}", param_type,
+                                              borrow=rast.Borrow.MUTABLE)
+                            converted_args.append(self._emit_place_borrow(
+                                arg, ir.PointerType(expected_llvm), fname, i + 1, lent))
+                            continue
+                        arg_val = self._emit_expr(arg)
                         converted_args.append(self._convert_type(arg_val, expected_llvm, arg))
                     # AGAST #1739 / #1745: large struct args go byval and a
                     # large struct result via sret, as for a direct call.
