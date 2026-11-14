@@ -8525,6 +8525,14 @@ class LLVMEmitter:
                     and not isinstance(expr.index, rast.Range)):
                 return rast.UnaryOp(expr.span, '*',
                                     rast.BinOp(expr.span, '+', root, expr.index))
+            # An element that's a `*[N]T` points at one array (R9): `pg[i][j]`
+            # and `(*pg[i])[j]` are element j of it at stride T, the place
+            # `*((pg[i] as *T) + j)`, with `pg[i]` evaluated once, as above (#3000).
+            if (isinstance(root, rast.Index) and isinstance(inner, rast.ArrayType)
+                    and not isinstance(expr.index, rast.Range)):
+                elem = rast.PtrType(expr.span, inner.inner, mutable=False)
+                return rast.UnaryOp(expr.span, '*', rast.BinOp(
+                    expr.span, '+', rast.Cast(expr.span, root, elem), expr.index))
             return None
         if isinstance(expr.index, rast.Range):
             return None

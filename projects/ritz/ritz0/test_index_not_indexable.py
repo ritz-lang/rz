@@ -233,20 +233,9 @@ ARRAY_ELEMENTS = {
     "field": "    return pr[0][2].x\n",
     "index_once": "    return pg[once(@n)][1] + n - 1\n",
 }
-# ritz0 crashes on `(*pg[i])[j]`, takes the wrong address, and calls `i` twice (#3000).
-RITZ0_ARRAY_ELEMENT_BUGS = {"address", "deref", "index_once"}
-
-
-def _array_element_cases():
-    for name in sorted(ARRAY_ELEMENTS):
-        for c in COMPILERS:
-            marks = [pytest.mark.xfail(strict=True, reason="#3000")] \
-                if c == "ritz0" and name in RITZ0_ARRAY_ELEMENT_BUGS else []
-            yield pytest.param(name, c, marks=marks, id=f"{name}-{c}")
-
-
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_array_element_cases()))
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ARRAY_ELEMENTS))
 def test_an_element_that_points_at_an_array_indexes_it(run_with, name, compiler):
     program = (f"{HEADER}fn once(n: *i32) -> i64\n    *n = *n + 1\n    1\n\n"
                f"pub fn main() -> i32\n    var n: i32 = 0\n{ARRAYS}{ARRAY_ELEMENTS[name]}")
