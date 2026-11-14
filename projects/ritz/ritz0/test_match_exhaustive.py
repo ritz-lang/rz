@@ -473,6 +473,38 @@ NOT_A_BOOL = {
                             "        _ => 2\n" + _MAIN, 4, 9),
 }
 
+# A variant pattern tests an enum's tag (AGAST #2409). On an integer or a bool
+# ritz0 emitted the arm with no case to reach it, so `Some(v)` and `R(v)` never
+# ran, and ritz1 took `R(v)` for every value; a qualified `C.R` was unlocated.
+_R = "enum C\n    R(i64)\n    G\n"
+NOT_AN_ENUM = {
+    "bind_on_an_integer": (_int_fn("    match n\n        Some(v) => 1\n        _ => 2\n"), 3, 9),
+    "wildcard_on_a_bool": ("fn f(b: bool) -> i64\n    match b\n        true => 0\n"
+                           "        Some(_) => 1\n        _ => 2\n" + _MAIN, 4, 9),
+    "user_variant_on_an_integer": (_R + _int_fn("    match n\n        R(v) => v\n        _ => 2\n"),
+                                   6, 9),
+    "qualified_on_an_integer": (_R + _int_fn("    match n\n        0 => 0\n        C.G => 1\n"
+                                             "        _ => 2\n"), 7, 9),
+    "qualified_bind_on_an_integer": (_R + _int_fn("    match n\n        C.R(v) => v\n        _ => 2\n"),
+                                     6, 9),
+}
+# ritz1 parses neither a literal payload nor a type pattern, and has no unions.
+NOT_AN_ENUM_RITZ0_ONLY = {
+    "literal_payload_on_an_integer": (_int_fn("    match n\n        Some(5) => 1\n        _ => 2\n"),
+                                      3, 9),
+    "variant_on_a_union": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
+                           "        i64 => 0\n        Some(v) => 1\n        _ => 2\n" + _MAIN, 5, 9),
+}
+_VARIANT_NEEDS_ENUM = "a variant pattern needs an enum scrutinee"
+
+# `mod.CONST =>` parses as the qualified variant `C.G` does, but names an integer
+# const in a module, so on an integer it compares (angelo's `instructions.POP`).
+# Before #2409 ritz0 dropped the arm like any variant; it must take it.
+_INSTS = {"insts.ritz": "pub const POP: i64 = 3\npub const DUP: i64 = 4\n"}
+_MOD_CONST = ("import insts\nfn f(n: i64) -> i32\n    match n\n        insts.POP => 1\n"
+              "        insts.DUP => 2\n        _ => 9\n"
+              "fn main() -> i32\n    f(3) * 100 + f(4) * 10 + f(5)\n")
+
 
 def _case(entry, arity):
     """Split a table entry into its fixed fields and its extra files."""
@@ -594,6 +626,39 @@ def test_a_bool_pattern_needs_a_bool_scrutinee(request, tmp_path, compiler, name
     proc, ll = _compile(request, compiler, tmp_path, source, {})
     _assert_error(proc, ll, compiler, name, line, col,
                   "a `true` or `false` pattern needs a bool scrutinee")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NOT_AN_ENUM))
+def test_a_variant_pattern_needs_an_enum_scrutinee(request, tmp_path, compiler, name):
+    source, line, col = NOT_AN_ENUM[name]
+    proc, ll = _compile(request, compiler, tmp_path, source, {})
+    _assert_error(proc, ll, compiler, name, line, col, _VARIANT_NEEDS_ENUM)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(NOT_AN_ENUM_RITZ0_ONLY))
+def test_ritz0_only_variant_patterns_need_an_enum_scrutinee(request, tmp_path, name):
+    source, line, col = NOT_AN_ENUM_RITZ0_ONLY[name]
+    proc, ll = _compile(request, "ritz0", tmp_path, source, {})
+    _assert_error(proc, ll, "ritz0", name, line, col, _VARIANT_NEEDS_ENUM)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_module_const_pattern_compares_on_an_integer(request, tmp_path, compiler):
+    # Exit 129 = 1*100 + 2*10 + 9: each arm taken once.
+    _assert_runs(request, compiler, tmp_path, "module_const", (_MOD_CONST, 129, _INSTS))
+
+
+@pytest.mark.integration
+def test_a_type_pattern_needs_a_union_scrutinee(request, tmp_path):
+    """`i64 =>` on an integer had no case either (AGAST #2409); ritz1 can't parse it."""
+    source = _int_fn("    match n\n        0 => 0\n        i64 => 1\n        _ => 2\n")
+    proc, ll = _compile(request, "ritz0", tmp_path, source, {})
+    _assert_error(proc, ll, "ritz0", "type_on_an_integer", 4, 9,
+                  "a type pattern needs a union scrutinee")
 
 
 # Behaviour can't show these: a dead `ret i32 0` and a dead `unreachable` run the

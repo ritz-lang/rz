@@ -1583,8 +1583,29 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     # AGAST #2408: a pattern's fields are its variant's, ahead of coverage.
     if match_refuse_field_counts(s, arms, ei, builtin) > 0
         return
+    # AGAST #2409: on a scalar no enum is in play, so a variant pattern (`Some(v)`,
+    # `R(v)`, a qualified `C.G`, which is the one PAT_IDENT with no
+    # pattern_span) tests nothing: `R(v)` took every value, as ritz0 dropped it.
+    let scalar: bool = ei < 0 and builtin == 0 and match_scrutinee_is_scalar(s, scrutinee) == 1
     var arm: *MatchArm = arms
     while arm != null
+        var qualified: bool = arm.pattern_kind == PAT_IDENT and arm.pattern_span.line == 0
+        # `mod.CONST` (angelo's `instructions.POP`) is qualified too, and names an
+        # integer const: it compares, as the lowering below does and ritz0 does.
+        if qualified
+            let ce: *ConstEntry = find_const_entry(s, arm.pattern_name, arm.pattern_name_len)
+            if ce != null and is_int_const_type(ce.const_type) == 1
+                qualified = false
+        if scalar and (arm.pattern_kind == PAT_VARIANT or qualified)
+            eprints_cstr(fn_source_file(emitter_current_fn()))
+            eprint_char(':')
+            eprint_i64(arm.head_span.line as i64)
+            eprint_char(':')
+            eprint_i64(arm.head_span.col as i64)
+            eprints_cstr(c": error: a variant pattern needs an enum scrutinee\n")
+            emit_str(s, c"  ; ERROR: variant pattern on a non-enum scrutinee\n")
+            s.error_count = s.error_count + 1
+            return
         if arm.pattern_kind == PAT_BOOL and is_bool == 0
             eprints_cstr(fn_source_file(emitter_current_fn()))
             eprint_char(':')

@@ -11,7 +11,7 @@ doesn't include the x86 asm parser.
 
 import re
 from dataclasses import dataclass, field, replace
-from typing import Dict, Optional, Tuple, List, Union, Set
+from typing import ClassVar, Dict, Optional, Tuple, List, Union, Set
 from llvmlite import ir
 import ritz_ast as rast
 from monomorph import mangle_type_name, resolve_alias_in
@@ -14333,6 +14333,7 @@ class LLVMEmitter:
     def _emit_union_match(self, expr: rast.Match, union_val: ir.Value, union_name: str) -> ir.Value:
         """Emit a match on a union type with TypePattern arms."""
         union_type, variants = self.union_types[union_name]
+        self._refuse_pattern_kind(expr, rast.VariantPattern)
         self._refuse_arm_names(expr, lambda name: False)
         self._require_covered(expr, match_coverage.union_gap(
             expr.arms, variants, self._types_equal, type_to_string))
@@ -14686,6 +14687,41 @@ class LLVMEmitter:
                 raise EmitError(binder_names.refusal(kind, pattern.name),
                                 pattern.span or arm.span)
 
+    # What each pattern kind tests, for the error when the scrutinee isn't one.
+    _PATTERN_NEEDS: ClassVar[dict[type, str]] = {
+        rast.VariantPattern: "a variant pattern needs an enum scrutinee",
+        rast.TypePattern: "a type pattern needs a union scrutinee"}
+
+    def _refuse_pattern_kind(self, expr: rast.Match, *kinds: type) -> None:
+        """Refuse an arm whose pattern can't test this scrutinee (AGAST #2409).
+
+        The integer switch has a case only for a literal or a const, and the
+        union one only for a type, so `Some(v)` on an i64 was an arm no value
+        reached and `match n` gave the next one, silently. Like `true` on an
+        integer (#2344), it is the wrong kind of pattern, said at the pattern.
+        """
+        for arm in expr.arms:
+            if isinstance(arm.pattern, kinds):
+                raise EmitError(self._PATTERN_NEEDS[type(arm.pattern)],
+                                arm.pattern.span or arm.span)
+
+    def _resolve_module_consts(self, expr: rast.Match) -> None:
+        """`mod.CONST =>` on an integer compares, as `mod.CONST` does in an
+        expression (_emit_field_access's flat lookup).
+
+        It parses as the qualified variant `C.G` does. When the qualifier names
+        no value or type in scope and the name is an integer const, the arm is
+        that const's IdentPattern; `C.G` with `C` an enum stays a variant, and
+        _refuse_pattern_kind refuses it. Before #2409 both were dropped, so
+        angelo's `instructions.POP` arm was never taken.
+        """
+        for arm in expr.arms:
+            pat = arm.pattern
+            if (isinstance(pat, rast.VariantPattern) and pat.qualifier and not pat.fields
+                    and not self._names_a_value(pat.qualifier)
+                    and self._is_integer_const(pat.name)):
+                arm.pattern = rast.IdentPattern(pat.span, pat.name, False)
+
     def _require_field_count(self, enum_name: str, pattern: rast.Pattern) -> None:
         """A variant pattern lists every field of its variant (AGAST #2408).
 
@@ -14833,6 +14869,8 @@ class LLVMEmitter:
                     and isinstance(arm.pattern.value, bool)):
                 raise EmitError("a `true` or `false` pattern needs a bool scrutinee",
                                 arm.pattern.span)
+        self._resolve_module_consts(expr)
+        self._refuse_pattern_kind(expr, rast.VariantPattern, rast.TypePattern)
         # A name that is an integer `const` compares (§8.2); a float or bool
         # one would bind, and can't (AGAST #2407).
         self._refuse_arm_names(expr, self._is_integer_const)

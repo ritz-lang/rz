@@ -2446,6 +2446,20 @@ fn main() -> i32
     f(Some(5))
 ```
 
+A variant pattern needs an enum scrutinee. On an integer or a `bool` it is a
+compile error at the pattern (AGAST #2409), as `true` and `false` are on an
+integer: no value of the scrutinee is a variant, so the arm could never run.
+
+```ritz expect-error="a variant pattern needs an enum scrutinee"
+fn f(n: i64) -> i64
+    match n
+        Some(v) => v
+        _ => 2
+
+fn main() -> i32
+    0
+```
+
 #### Constant Patterns
 
 A bare identifier pattern that names an integer `const` (declared in the
@@ -2470,7 +2484,9 @@ fn main() -> i32
 ```
 
 A const resolves wherever it is declared in the module, before or after the
-`match`. Constant patterns compare integers only: against an enum
+`match`. Qualified by its module (`instructions.POP =>` after `import
+hinting.instructions`), an integer const compares the same way, as
+`instructions.POP` reads in an expression; it is not a variant pattern. Constant patterns compare integers only: against an enum
 scrutinee, a bare name is a variant (§10.2).
 
 ```ritz expect-error="a local can't take the name of a const: 'NAME' — rename the local"
