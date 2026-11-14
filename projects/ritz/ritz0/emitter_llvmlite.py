@@ -8227,6 +8227,7 @@ class LLVMEmitter:
             left = self._emit_expr(expr.left)
             right = self._emit_expr(expr.right)
             self._check_bool_operands(expr, left, right)
+            self._reject_struct_operand(expr, left, right)
 
             # Ensure same type
             if left.type != right.type:
@@ -16059,6 +16060,31 @@ class LLVMEmitter:
             f"the fn returns `{expected}`, but this is struct "
             f"`{self._struct_spelling(val, expr)}`: {self.STRUCT_AS_INTEGER} "
             f"(return one of its fields)", span)
+
+    def _reject_struct_operand(self, expr: rast.BinOp, left: ir.Value,
+                               right: ir.Value) -> None:
+        """A struct operand to an arithmetic, bitwise or ordering operator
+        (AGAST #2525).
+
+        llvmlite refused `s + 1`, `*(q + 1) + 1` or `a[1] * 2` on a struct
+        with "Operands must be the same type", a traceback with no location,
+        and let `<` through as invalid IR.  `==` / `!=` have their own
+        refusal (_reject_aggregate_compare), after the enum tag comparison.
+        """
+        if expr.op in ('==', '!='):
+            return
+        for val, side in ((left, expr.left), (right, expr.right)):
+            if val is ir.Undefined or not isinstance(val.type, ir.BaseStructType):
+                continue
+            entry = self._enum_entry_of_type(val.type)
+            if entry is not None:
+                raise EmitError(
+                    f"`{expr.op}` on enum `{entry[0]}`: an enum is not an integer "
+                    f"(convert it with `as`)", self._value_span(side))
+            raise EmitError(
+                f"`{expr.op}` on struct `{self._struct_spelling(val, side)}`: "
+                f"{self.STRUCT_AS_INTEGER} (read one of its fields)",
+                self._value_span(side))
 
     def _reject_enum_assign(self, target: rast.Expr, val: ir.Value, span) -> None:
         """`x = St.B` where `x` is an integer: _reject_enum_as_int for the

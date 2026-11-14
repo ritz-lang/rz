@@ -939,7 +939,7 @@ for _db, (_ddecl, _dsetup, _dname) in _DIRECT_BASES.items():
 def test_ritz1_refuses_a_whole_struct_element(compile_with, name, compiler):
     comp, _, _ = compile_with(compiler, name, WHOLE_STRUCT_ELEMENT[name])
     assert comp.returncode != 0
-    assert "a whole struct element is not a value here in ritz1" in comp.stderr
+    assert "a whole struct is not a value here in ritz1" in comp.stderr
     assert "main.ritz:" in comp.stderr
 
 
