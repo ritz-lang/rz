@@ -787,6 +787,26 @@ INFERRED_REFS = {
     "annotated_raw": (CM + "    let p: *C = @c\n    p.x = 2\n    let q = p + 1\n    rp(p)\n    return c.x\n", 3),
 }
 
+# AGAST #3129: `let p = @g` / `@&g` of a module-level global is what it is of a
+# local.  A struct global already was (#3026); a scalar global stayed an i64
+# (`*p = 1` through an `@` compiled, an `@&` stored an i64 over a u8 or i32 and
+# clang refused it), and `@ga[i]` of a global struct array was "unhandled
+# EXPR_MEMBER".  `p + 1` stays ritz0's (#3106).
+GM = CM.replace("pub fn main", "fn wi(r: @&i32)\n    *r = 3\n\nvar gc: C\nvar gn: i32\nvar gb: u8\n"
+                "var ga: [2]C\n\npub fn main", 1)
+INFERRED_REFS.update({
+    "global_struct_write": (GM + "    let p = @gc\n    p.x = 3\n    return 0\n", WRITE_SHARED),
+    "global_struct_into_mut_ref": (GM + "    let p = @gc\n    rm(p)\n    return 0\n", NOT_MUT),
+    "global_struct_mut": (GM + "    let p = @&gc\n    rm(p)\n    let q = p + 1\n    rp(p)\n    return gc.x\n", 3),
+    "global_scalar_store": (GM + "    let p = @gn\n    *p = 3\n    return 0\n", WRITE_SHARED),
+    "global_scalar_into_mut_ref": (GM + "    let p = @gn\n    wi(p)\n    return 0\n", NOT_MUT),
+    "global_scalar_mut": (GM + "    let p = @&gn\n    wi(p)\n    let q = p + 1\n    return gn\n", 3),
+    "global_byte_mut_store": (GM + "    let p = @&gb\n    *p = 3\n    return gb as i32\n", 3),
+    "global_element_write": (GM + "    let p = @ga[1]\n    p.x = 3\n    return 0\n", WRITE_SHARED),
+    "global_element_mut": (GM + "    ga[1].x = 3\n    let p = @&ga[0]\n    let q = p + 1\n    rm(p)\n"
+                           "    return q.x * p.x / 3\n", 3),
+})
+
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(INFERRED_REFS))

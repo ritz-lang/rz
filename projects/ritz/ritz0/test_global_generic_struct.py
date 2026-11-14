@@ -52,6 +52,11 @@ PROGRAMS = {
                     + "    var h: H\n    h.k = 4\n    let p = @&gb\n    p.ptr = @h\n"
                     "    if gb.ptr.k != 4\n        return 1\n"
                     "    if p.ptr.k != 4\n        return 2\n    return 0\n"),
+    # AGAST #3129: `@&` of an element of a global generic-struct array writes
+    # through (ritz1 was "unhandled EXPR_MEMBER in assignment").
+    "address_element": (_BOX + "var ga: [2]Box<H>\n\n" + _MAIN
+                        + "    var h: H\n    h.k = 4\n    let p = @&ga[1]\n    p.ptr = @h\n"
+                        "    if ga[1].ptr.k != 4\n        return 1\n    return 0\n"),
     # Two instances of a user generic struct, each sized by its own T: an i64
     # value that does not fit an i32 shows a shared or wrong layout.
     "two_instances": (_P + "var gi: P<i32>\nvar gl: P<i64>\n\n" + _MAIN

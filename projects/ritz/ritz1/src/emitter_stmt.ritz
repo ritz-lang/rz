@@ -184,10 +184,20 @@ fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt) -> i32
     let o: *Expr = init.operand
     if o.kind != EXPR_IDENT
         return 0
+    var pointee: i32 = TYPE_VOID
     let loc: *LocalVar = find_local_struct_name(s, o.ident_ptr, o.ident_len)
-    if loc == null or loc.is_lent != 0 or loc.type_name_len != 0 or scalar_pointee(loc.var_type) == 0
-        return 0
-    let pointee: i32 = loc.var_type
+    if loc != null
+        if loc.is_lent != 0 or loc.type_name_len != 0 or scalar_pointee(loc.var_type) == 0
+            return 0
+        pointee = loc.var_type
+    # AGAST #3129: `@g` of a scalar module-level global is the same `@T`.  It
+    # stayed an i64: `*p = 1` through an `@` compiled, and through an `@&` of
+    # an i32 / u8 it stored an i64 that clang refused.
+    else
+        let glob: *GlobalVarDef = find_global(s, o.ident_ptr, o.ident_len)
+        if glob == null or glob.type_name_len != 0 or scalar_pointee(glob.var_type) == 0
+            return 0
+        pointee = glob.var_type
     stmt.var_type = TYPE_REF
     if init.op == OP_ADDR_MUT
         stmt.var_type = TYPE_MUT_REF
@@ -1764,6 +1774,14 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                                 if aarr.var_type == TYPE_ARRAY and aarr.array_elem_type == TYPE_STRUCT and aarr.type_name_len > 0
                                     addr_pointee = aarr.type_name
                                     addr_pointee_len = aarr.type_name_len
+                            # AGAST #3129: `@ga[i]` of a global struct array
+                            # is a `*S` too, as #3026 does `@g`.  It stayed i64,
+                            # so `p.x` was "unhandled EXPR_MEMBER".
+                            else
+                                let agarr: *GlobalVarDef = find_global(s, addr_oper.left.ident_ptr, addr_oper.left.ident_len)
+                                if agarr != null and agarr.var_type == TYPE_ARRAY and agarr.array_elem_type == TYPE_STRUCT and agarr.array_elem_type_name_len > 0
+                                    addr_pointee = agarr.array_elem_type_name
+                                    addr_pointee_len = agarr.array_elem_type_name_len
                         else if addr_oper.left.kind == EXPR_MEMBER
                             # Walk arbitrary-depth member chain (`srv.pool.tasks[i]`)
                             # and pick up the array element type from the leaf field.
