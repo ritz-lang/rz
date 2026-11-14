@@ -31,10 +31,8 @@ import pytest
 from ref_rules import REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from test_borrow_param_ref_field import _compile, _run
 from test_ref_into_value import COMPILERS, _assert_refused
+from test_ref_into_value import _run as _run_any
 
-# None of these needs a `:&` to fail. #2309 lists each, and is closing.
-ELEMENT_GAP = "AGAST #2369: `a[0].x` through an `@&C` or `@C` element is `unhandled EXPR_MEMBER` on ritz1"
-IF_VALUE_GAP = "AGAST #2369: ritz1 doesn't parse an `if` value after `=` or in a struct literal"
 # No ticket has these.
 # AGAST #2436 made `p.x = 3` on a pointer payload work; what's left is building
 # the value: an `@&C` variant argument (#3046) and `Option<@&C>`'s name (#2384).
@@ -708,22 +706,9 @@ fn go(c:& C)
 }
 
 
-def _gaps(names, reason):
-    return dict.fromkeys(names, reason)
+RITZ1_GAPS = {}
 
-
-def _both(*shapes):
-    return [f"{shape}_{slot}" for shape in shapes for slot in ("mut", "ptr")]
-
-
-RITZ1_GAPS = {
-    **_gaps(["array_fill_mut", "array_literal_mut", "array_store_mut"], ELEMENT_GAP),
-    **_gaps(_both("assign_from_if") + ["field_from_if", "literal_field_from_if"], IF_VALUE_GAP),
-}
-
-RITZ1_MOVE_ONLY_GAPS = {
-    **_gaps(["array_literal_mut", "array_literal_ref", "array_store_mut", "array_store_ref"], ELEMENT_GAP),
-}
+RITZ1_MOVE_ONLY_GAPS = {}
 
 RITZ1_BY_VALUE_GAPS = {}
 RITZ0_NO_CONFLICT_GAPS = {}
@@ -815,6 +800,25 @@ def test_ritz0_conflicts_only_with_a_borrow(tmp_path, name):
 @pytest.mark.parametrize("name", _params(PROGRAMS, RITZ1_GAPS))
 def test_ritz1_reference_slot_holds_the_written_reference(ritz1_bin, tmp_path, name):
     assert _run("ritz1", ritz1_bin, tmp_path, name, PROGRAMS[name]) == 3
+
+
+# AGAST #2369: rows ritz1 refused with no `:&` involved, on the self-hosted
+# build too. An element of an `[N]@&C` / `[N]@C` (`a[0].x`), an if value after
+# `=` and in a struct literal, and #2369's call-return and block-arm rows that
+# #2950 fixed.
+SELF_HOSTED = {
+    **{name: PROGRAMS[name] for name in (
+        "array_fill_mut", "array_literal_mut", "array_store_mut", "assign_from_if_mut",
+        "field_from_if", "let_match_block_mut", "literal_field_from_if", "return_in_arm_mut",
+        "through_a_chain_mut")},
+    "move_only_array_store_ref": MOVE_ONLY["array_store_ref"],
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(SELF_HOSTED))
+def test_ritz1_selfhosted_runs_the_reference_rows(tmp_path, name):
+    assert _run_any("ritz1_selfhosted", tmp_path, name, SELF_HOSTED[name]) == 3
 
 
 @pytest.mark.integration

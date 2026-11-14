@@ -950,7 +950,9 @@ fn emit_array_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResu
     var name_len: i32 = 0
     if array_elem_pointee(s, e.left.left, @name, @name_len) == TYPE_STRUCT
         return emit_ptr_elem_member_ptr(s, e, result, name, name_len)
-    if array_elem_pointee(s, e.left, @name, @name_len) != TYPE_STRUCT
+    # AGAST #2369: and `a[i].f` with `a: [N]@S` or `[N]@&S`, whose element
+    # refers to an S as a `*S` one points at it.
+    if array_elem_pointee(s, e.left, @name, @name_len) != TYPE_STRUCT and array_elem_referent(s, e.left, @name, @name_len) != TYPE_STRUCT
         return 0
     let st: *StructDef = find_struct(s, name, name_len)
     if st == null
@@ -958,13 +960,8 @@ fn emit_array_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResu
     let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
     if field_idx < 0
         return 0
-    let val: i32 = emit_expr(s, e.left)
-    let elem_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, elem_ptr)
-    emit_str(s, c" = inttoptr i64 ")
-    emit_reg(s, val)
-    emit_str(s, c" to ptr\n")
+    # A reference element may come back a `ptr` rather than an i64.
+    let elem_ptr: i32 = i64_value_to_ptr(s, e.left, emit_expr(s, e.left))
     emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
     1
 
@@ -1992,6 +1989,8 @@ fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty:
         emit_reg(s, fill_val_reg)
         emit_str(s, c" to ptr\n")
         fill_narrow = tp
+    else if fill_elem_ty == TYPE_REF or fill_elem_ty == TYPE_MUT_REF
+        fill_narrow = ptr_value_to_i64(s, fill_val, fill_val_reg)   # AGAST #2369: an `[N]@&T` holds i64s
     if fill_arr_size <= 16
         # Small N: unroll for simple straight-line IR.
         var fi: i32 = 0
@@ -2177,6 +2176,8 @@ fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: 
                 stored = emit_field_elem_narrow(s, val_reg, elem_ty, it)
             else if (elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR) and expr_is_ptr_valued(s, it) == 1
                 stored = val_reg   # AGAST #3029: `@&x` is a `ptr` already
+            else if elem_ty == TYPE_REF or elem_ty == TYPE_MUT_REF
+                stored = ptr_value_to_i64(s, it, val_reg)   # AGAST #2369: an `[N]@&T` holds i64s
             else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
                 stored = next_reg(s)
                 emit_str(s, c"  ")

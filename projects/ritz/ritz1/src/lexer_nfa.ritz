@@ -56,7 +56,22 @@ struct Lexer
   indent_depth: i32        # Current depth in indent_stack
   at_line_start: i32       # 1 if at start of line, 0 otherwise
   pending_dedents: i32     # Number of DEDENT tokens to emit
-  bracket_depth: i32       # Nesting depth of (), [], {} - suppress INDENT/DEDENT when > 0
+  bracket_depth: i32       # Nesting depth of (), [], {} - suppress INDENT/DEDENT when > layout_depth
+  # Layout frame (AGAST #2369).  An if value's blocks need INDENT/DEDENT, but
+  # inside brackets they're suppressed, so `P { x: if c` + an indented block
+  # never reached the grammar as one.  A line that ends, inside brackets, in an
+  # `if` condition or a bare `else` opens a frame: lines at that bracket depth
+  # are laid out again until one is indented no deeper than the line that
+  # opened it, as ritz0's lexer lays out every line.  One frame at a time; an
+  # if value inside a bracket inside a frame stays flat and fails to parse.
+  layout_depth: i32        # bracket depth the frame lays out; 0 = no frame
+  layout_base: i32         # indentation of the line that opened it
+  layout_pushed: i32       # 1 if layout_base was pushed onto indent_stack
+  line_indent: i32         # leading spaces of the current line
+  if_line: i32             # line of an `if` at a suppressed depth, 0 if none
+  if_depth: i32            # the bracket depth it was at
+  last_kind: i32           # the last token returned, and the depth after it
+  last_depth: i32
   # Cooked-string scratch buffer (escapes expanded).  ritz-task-1267.
   #
   # This used to be a fixed `[8192]i8` arena shared by *every* string
@@ -97,10 +112,52 @@ fn lexer_reset(lex: *Lexer, src: *u8, len: i64) -> i32
   lex.at_line_start = 1    # Start at beginning of first line
   lex.pending_dedents = 0
   lex.bracket_depth = 0    # Not inside any brackets
+  lexer_layout_reset(lex)
   # Reset string buffer
   lex.string_pos = 0
   lex.error_msg = null
   0
+
+# No layout frame, and no `if` or `else` seen.
+fn lexer_layout_reset(lex: *Lexer)
+  lex.layout_depth = 0
+  lex.layout_base = 0
+  lex.layout_pushed = 0
+  lex.line_indent = 0
+  lex.if_line = 0
+  lex.if_depth = 0
+  lex.last_kind = 0
+  lex.last_depth = 0
+
+# At a newline inside brackets on `line`: open a layout frame if the line ended
+# in an `if` condition or a bare `else` at this bracket depth, and return 1 so
+# the NEWLINE is emitted.  An inline `if c then a else b` cleared if_line at
+# its THEN.  The opening line's indentation is pushed without an INDENT, so a
+# block indented under it is one INDENT deeper whatever the statement's level.
+fn lexer_layout_open(lex: *Lexer, line: i32) -> i32
+  if lex.layout_depth > 0
+    return 0
+  var opens: i32 = 0
+  if lex.if_line == line and lex.if_depth == lex.bracket_depth
+    opens = 1
+  if lex.last_kind == TOK_ELSE and lex.last_depth == lex.bracket_depth
+    opens = 1
+  if opens == 0
+    return 0
+  let top: i32 = lex.indent_stack[lex.indent_depth - 1]
+  if lex.line_indent < top
+    return 0
+  lex.layout_pushed = 0
+  if lex.line_indent > top
+    if lex.indent_depth >= MAX_INDENT_DEPTH
+      return 0
+    lex.indent_stack[lex.indent_depth] = lex.line_indent
+    lex.indent_depth = lex.indent_depth + 1
+    lex.layout_pushed = 1
+  lex.layout_base = lex.line_indent
+  lex.layout_depth = lex.bracket_depth
+  lex.if_line = 0
+  1
 
 # Return a located, fatal TOK_ERROR at the current position and stop lexing:
 # the next lexer_next returns EOF.  The tab case used to return TOK_ERROR
@@ -178,6 +235,7 @@ fn lexer_init(lex: *Lexer, src: *u8, len: i32, nfa: *NFA, patterns: *TokenPatter
   lex.at_line_start = 1    # Start at beginning of first line
   lex.pending_dedents = 0
   lex.bracket_depth = 0    # Not inside any brackets
+  lexer_layout_reset(lex)
   # Initialize the cooked-string scratch.  Lexers are usually `var lex: Lexer`
   # on the stack, so these MUST be zeroed here — a garbage `string_buf` would
   # be handed straight to realloc.
@@ -417,6 +475,26 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
   # Advance past leading spaces
   lex.pos = lex.pos + indent
   lex.col = lex.col + indent
+  lex.line_indent = indent
+
+  # A line no deeper than the one that opened the layout frame ends it: DEDENT
+  # the frame's blocks only, drop the silently pushed level, and the bracket's
+  # lines are flat again.
+  if lex.layout_depth > 0 and indent <= lex.layout_base
+    var closed: i32 = 0
+    while lex.indent_stack[lex.indent_depth - 1] > lex.layout_base
+      lex.indent_depth = lex.indent_depth - 1
+      closed = closed + 1
+    if lex.layout_pushed == 1
+      lex.indent_depth = lex.indent_depth - 1
+    lex.layout_depth = 0
+    lex.layout_pushed = 0
+    lex.at_line_start = 0
+    if closed == 0
+      return 0
+    lex.pending_dedents = closed - 1
+    *out_tok = token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
+    return 1
 
   # Get current indentation level from stack
   let current: i32 = lex.indent_stack[lex.indent_depth - 1]
@@ -449,9 +527,22 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
   lex.at_line_start = 0
   0
 
-# Get next token from the lexer
-# Returns a Token struct
+# Get next token from the lexer, noting the `if` / `else` that open a layout
+# frame (lexer_layout_open).
 fn lexer_next(lex: *Lexer) -> Token
+  var tok: Token = lexer_next_token(lex)
+  if lex.bracket_depth > lex.layout_depth
+    if tok.kind == TOK_IF
+      lex.if_line = tok.line
+      lex.if_depth = lex.bracket_depth
+    if tok.kind == TOK_THEN
+      lex.if_line = 0
+  lex.last_kind = tok.kind
+  lex.last_depth = lex.bracket_depth
+  tok
+
+# Returns a Token struct
+fn lexer_next_token(lex: *Lexer) -> Token
   # First, emit any pending DEDENTs
   if lex.pending_dedents > 0
     lex.pending_dedents = lex.pending_dedents - 1
@@ -462,13 +553,15 @@ fn lexer_next(lex: *Lexer) -> Token
     # Handle line start (indentation) - but NOT inside brackets
     if lex.at_line_start == 1
       # Inside brackets, just skip leading whitespace, no INDENT/DEDENT
-      if lex.bracket_depth > 0
+      if lex.bracket_depth > lex.layout_depth
         # Skip leading whitespace on this line
+        lex.line_indent = 0
         while lex.pos < lex.len
           let ws: i32 = lexer_peek_at(lex, 0)
           if ws == 32  # space
             lex.pos = lex.pos + 1
             lex.col = lex.col + 1
+            lex.line_indent = lex.line_indent + 1
           else
             break
         lex.at_line_start = 0
@@ -488,9 +581,11 @@ fn lexer_next(lex: *Lexer) -> Token
       lex.line = lex.line + 1
       lex.col = 1
       lex.at_line_start = 1
-      # Inside brackets, skip newline (don't emit token) - allows multi-line struct literals
-      if lex.bracket_depth > 0
-        continue
+      # Inside brackets, skip newline (don't emit token) - allows multi-line
+      # struct literals - unless it opens a layout frame.
+      if lex.bracket_depth > lex.layout_depth
+        if lexer_layout_open(lex, line) == 0
+          continue
       var tok: Token = token_new(TOK_NEWLINE, start, 1, line, col)
       tok.start = lex.src + start
       return tok

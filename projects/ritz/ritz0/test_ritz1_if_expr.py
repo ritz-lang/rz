@@ -373,7 +373,84 @@ fn main() -> i32
     total + 24
 """
 
+# --- an if / match value after `=` and in a struct literal (AGAST #2369) --------
+
+# Every assignment target takes the value `let` does: a name, a field, an
+# element, through a pointer. A `match` value is the same rule.
+ASSIGN_VALUE = """\
+struct P
+    x: i32
+    y: i32
+
+fn f(c: i32) -> i32
+    var n: i32 = 0
+    n = if c == 1
+        19
+    else
+        7
+    var p: P = P { x: 0, y: 0 }
+    p.x = if c == 1
+        10
+    else
+        1
+    p.y = match c
+        1 => 5
+        _ => 2
+    var a: [2]i32 = [0, 0]
+    a[1] = if c == 1
+        6
+    else
+        3
+    let q: *P = @p
+    q.y = if c == 1
+        q.y + 2
+    else
+        q.y
+    n + p.x + p.y + a[1]
+
+fn main() -> i32
+    if f(0) != 13
+        return 1
+    f(1)
+"""
+
+# `if` as a struct-literal field, on the brace's line and on its own line, a
+# call in an arm, an inline `if` beside it, and an `else if` chain.
+STRUCT_LIT_FIELD = """\
+struct P
+    x: i32
+    y: i32
+
+fn twice(v: i32) -> i32
+    v * 2
+
+fn mk(c: i32) -> P
+    let a: P = P { x: if c == 1
+        twice(5)
+    else
+        1
+    , y: 0 }
+    P {
+        y: if c == 1 then 22 else 0,
+        x: if c == 0
+            0
+        else if c == 1
+            twice(a.x)
+        else
+            1
+    }
+
+fn main() -> i32
+    let p: P = mk(1)
+    let q: P = mk(0)
+    if q.x + q.y != 0
+        return 1
+    p.x + p.y
+"""
+
 PROGRAMS = {
+    "assign_value": ASSIGN_VALUE,
+    "struct_lit_field": STRUCT_LIT_FIELD,
     "inline_repro": INLINE_REPRO,
     "inline_untyped": INLINE_UNTYPED,
     "inline_positions": INLINE_POSITIONS,
@@ -492,6 +569,15 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 def test_ritz1_if_expr(ritz1_bin, tmp_path, name):
     """AGAST #1613. Before the fix these died with `cannot parse item`."""
     _check(_run("ritz1", tmp_path, name), name)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", ["assign_value", "struct_lit_field"])
+def test_ritz1_selfhosted_if_value_after_assign_and_in_a_literal(tmp_path, name):
+    """AGAST #2369, on the self-hosted build: its lexer and parser are the ones
+    ritz1 compiled, so the layout frame has to survive the bootstrap."""
+    from test_ref_into_value import _run as _run_any
+    assert _run_any("ritz1_selfhosted", tmp_path, name, PROGRAMS[name]) == 42
 
 
 @pytest.mark.integration
