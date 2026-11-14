@@ -33,6 +33,7 @@ import pytest
 
 import fast_link
 
+from array_rules import ref_arith
 from ref_rules import REF_TO_OTHER_TYPE
 from ritz0_inproc import run_ritz0
 
@@ -750,9 +751,9 @@ def test_a_pointer_passed_on_borrows_nothing(tmp_path, compiler, name):
 # AGAST #3079: an un-annotated `let p = @c` / `@&c` of a struct is an `@C` /
 # `@&C`, and `let r = @q` of a `*T` an `@*T`, by its kind: not a `*C` / `**T`
 # with a side flag.  Every use does what ritz0 does: an int is the exit code, a
-# string the error.  Pointer arithmetic on it is ritz0's too: legal, as on a
-# `*C` (R16 refuses an `@C` from a param or a call; #3106 asks LARB), and so is
-# everything on an annotated `let p: *C = @c`.
+# string the error.  Pointer arithmetic on it is R16's error, as on an `@C` from
+# a param or a call (LARB R20, #3106); `(p as *C) + 1` and an annotated
+# `let p: *C = @c` step.
 CM = C + ("impl C\n    fn get(self: @C) -> i32\n        self.x\n"
           "    fn set(self: @&C)\n        self.x = 3\n\n"
           "fn rd(r: @C) -> i32\n    r.x\n\nfn rm(r: @&C)\n    r.x = 3\n\nfn rp(r: *C)\n    r.x = 3\n\n"
@@ -769,12 +770,23 @@ INFERRED_REFS = {
     "shared_method": (CM + "    let p = @c\n    p.set()\n    return c.x\n", NOT_MUT),
     "shared_into_mut_ref": (CM + "    let p = @c\n    rm(p)\n    return c.x\n", NOT_MUT),
     "shared_into_raw": (CM + "    let p = @c\n    rp(p)\n    return c.x\n", 3),
-    "shared_arith": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q = p + 1\n    return q.x\n", 3),
+    "shared_arith": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q = p + 1\n    return q.x\n",
+                     ref_arith("+", "C")),
+    "shared_cast_arith": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q: *C = (p as *C) + 1\n"
+                          "    return q.x\n", 3),
     "mut_write": (CM + "    let p = @&c\n    p.x = 3\n    return c.x\n", 3),
     "mut_method": (CM + "    let p = @&c\n    let q = p\n    q.set()\n    return c.x\n", 3),
     "mut_into_mut_ref": (CM + "    let p = @&c\n    rm(p)\n    return c.x\n", 3),
-    "mut_arith": (CM + "    var a: [2]C\n    a[0].x = 3\n    let p = @&a[1]\n    let q = p\n    let r = q - 1\n    return r.x\n", 3),
-    "scalar_arith": ("pub fn main() -> i32\n    var n: i32 = 1\n    let p = @n\n    let q = p + 1\n    return 3\n", 3),
+    "mut_arith": (CM + "    var a: [2]C\n    a[0].x = 3\n    let p = @&a[1]\n    let q = p\n    let r = q - 1\n    return r.x\n",
+                  ref_arith("-", "C")),
+    "scalar_arith": ("pub fn main() -> i32\n    var n: i32 = 1\n    let p = @n\n    let q = p + 1\n    return 3\n",
+                     ref_arith("+", "i32")),
+    "scalar_distance": ("pub fn main() -> i32\n    var a: [2]i32 = [1, 3]\n    let p = @a[0]\n    let q = @a[1]\n"
+                        "    let d = q - p\n    return 3\n", ref_arith("-", "i32")),
+    "address_operand_arith": ("pub fn main() -> i32\n    var a: [2]i32 = [1, 3]\n    let q: *i32 = @a[0] + 1\n"
+                              "    return *q\n", 3),
+    "array_cast_arith": ("pub fn main() -> i32\n    var a: [2]i32 = [1, 3]\n    let p = @a\n    let q = (p as *i32) + 1\n"
+                         "    return *q\n", 3),
     # `let r = @q` with `q: *T` is an `@*T`, of a scalar, an enum or an array.
     "pointer_shared_store": (PQ + "    let r = @q\n    *r = @m\n    return *q\n", WRITE_SHARED),
     "pointer_shared_copy_store": (PQ + "    let r = @q\n    let r2 = r\n    *r2 = @m\n    return *q\n", WRITE_SHARED),
@@ -800,19 +812,20 @@ INFERRED_REFS = {
 # local.  A struct global already was (#3026); a scalar global stayed an i64
 # (`*p = 1` through an `@` compiled, an `@&` stored an i64 over a u8 or i32 and
 # clang refused it), and `@ga[i]` of a global struct array was "unhandled
-# EXPR_MEMBER".  `p + 1` stays ritz0's (#3106).
+# EXPR_MEMBER".  `p + 1` is R16's error, as of a local (R20, #3106).
 GM = CM.replace("pub fn main", "fn wi(r: @&i32)\n    *r = 3\n\nvar gc: C\nvar gn: i32\nvar gb: u8\n"
                 "var ga: [2]C\n\npub fn main", 1)
 INFERRED_REFS.update({
     "global_struct_write": (GM + "    let p = @gc\n    p.x = 3\n    return 0\n", WRITE_SHARED),
     "global_struct_into_mut_ref": (GM + "    let p = @gc\n    rm(p)\n    return 0\n", NOT_MUT),
-    "global_struct_mut": (GM + "    let p = @&gc\n    rm(p)\n    let q = p + 1\n    rp(p)\n    return gc.x\n", 3),
+    "global_struct_mut": (GM + "    let p = @&gc\n    rm(p)\n    rp(p)\n    return gc.x\n", 3),
     "global_scalar_store": (GM + "    let p = @gn\n    *p = 3\n    return 0\n", WRITE_SHARED),
     "global_scalar_into_mut_ref": (GM + "    let p = @gn\n    wi(p)\n    return 0\n", NOT_MUT),
-    "global_scalar_mut": (GM + "    let p = @&gn\n    wi(p)\n    let q = p + 1\n    return gn\n", 3),
+    "global_scalar_mut": (GM + "    let p = @&gn\n    wi(p)\n    return gn\n", 3),
+    "global_scalar_arith": (GM + "    let p = @&gn\n    let q = p + 1\n    return 0\n", ref_arith("+", "i32")),
     "global_byte_mut_store": (GM + "    let p = @&gb\n    *p = 3\n    return gb as i32\n", 3),
     "global_element_write": (GM + "    let p = @ga[1]\n    p.x = 3\n    return 0\n", WRITE_SHARED),
-    "global_element_mut": (GM + "    ga[1].x = 3\n    let p = @&ga[0]\n    let q = p + 1\n    rm(p)\n"
+    "global_element_mut": (GM + "    ga[1].x = 3\n    let p = @&ga[0]\n    let q: *C = (p as *C) + 1\n    rm(p)\n"
                            "    return q.x * p.x / 3\n", 3),
 })
 

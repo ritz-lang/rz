@@ -458,7 +458,7 @@ ELEMENT_ADDRESSES = {
     "inferred": _x("    let r = @a[1][1]\n" + _is("*r", "2")),
     "typed_store": _x("    let r: *i16 = @a[1][1]\n    *r = 7\n" + _is("x[1] * 10 + x[2]", "73")),
     "inferred_store": _x("    let r = @&a[1][1]\n    *r = 7\n" + _is("x[1] * 10 + x[2]", "73")),
-    "inferred_stride": _x("    let r = @a[1][1]\n" + _is("*(r + 1)", "3")),
+    "inferred_stride": _x("    let r = @a[1][1]\n" + _is("*((r as *i16) + 1)", "3")),  # R20: `r + 1` is refused
     "deref": _x(_is("*@a[1][1]", "2")),
     "field": _x("    var h: H\n    h.a[1] = @x[0]\n    let r = @&h.a[1][1]\n    *r = 7\n"
                 + _is("x[1]", "7"), _ADDR_H),

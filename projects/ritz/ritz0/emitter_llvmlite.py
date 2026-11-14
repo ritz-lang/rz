@@ -9984,13 +9984,18 @@ class LLVMEmitter:
         """AGAST #3037, LARB R16: `+` / `-` with an `@T` / `@&T` pointer operand
         whose T isn't an array.  A reference names one value, so the next one was
         never lent; `(p as *T) + 1` is the way out.  The row walk on `@[N]T` /
-        `@&[N]T` stays legal (§7.8, R18).  `+=` / `-=` arrive here desugared."""
+        `@&[N]T` stays legal (§7.8, R18).  `+=` / `-=` arrive here desugared.
+        A local of an un-annotated `let p = @x` / `@&x` (or a copy) is an `@T` /
+        `@&T` too, inferred as a PtrType marked shared / mut_ref (LARB R20,
+        AGAST #3106).  An `@a[0] + n` operand itself isn't a let: it steps."""
         for operand, value in ((expr.left, left), (expr.right, right)):
             if not isinstance(value.type, ir.PointerType):
                 continue
             ty = self._infer_ritz_type(operand)
             if (isinstance(ty, rast.RefType)
-                    and not isinstance(resolve_alias_in(ty.inner, self.type_aliases), rast.ArrayType)):
+                    or (isinstance(operand, rast.Ident) and isinstance(ty, rast.PtrType)
+                        and (ty.shared or ty.mut_ref))) and (
+                    not isinstance(resolve_alias_in(ty.inner, self.type_aliases), rast.ArrayType)):
                 raise EmitError(array_rules.ref_arith(expr.op, type_to_string(ty.inner)), expr.span)
 
     def _pointer_difference(self, left: ir.Value, right: ir.Value, expr: rast.Expr) -> ir.Value:

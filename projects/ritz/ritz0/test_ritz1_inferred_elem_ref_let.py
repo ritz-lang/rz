@@ -14,7 +14,8 @@ loaded and `*q = v` would store 8 bytes whatever the element was, and `q + 1`
 strode one byte.  Narrow reads passed only because the load was truncated.
 
 Both now hold what ritz0 gives them: a pointer to the element type, so `*q`
-loads and stores one element and `q + 1` is the next one.  Rows (`@x[i]` one
+loads and stores one element and `(q as *T) + 1` is the next one (`q + 1`
+itself is R16's error since R20, #3106).  Rows (`@x[i]` one
 short of the rank, #2555) and planes (#2558) are pinned elsewhere
 (test_ritz1_inferred_nd_plane_let.py).
 """
@@ -41,10 +42,10 @@ BINDERS = {"let_ref": "let q = @", "let_mut_ref": "let q = @&",
 # What main does with q; `{a}` is the target element, `{n}` its neighbour.
 # Every check returns its own number, so a red cell says which one broke.
 USES = {
-    # Read the element, and the next one through `q + 1` (a stride of one
-    # element, not one byte).
+    # Read the element, and the next one through `(q as *T) + 1` (a stride of
+    # one element, not one byte; `q + 1` on the `@T` is R16's error, R20).
     "read": ("    if *q != {v0}\n        return 1\n"
-             "    let r = q + 1\n    if *r != {v1}\n        return 2\n"),
+             "    let r: *{t} = (q as *{t}) + 1\n    if *r != {v1}\n        return 2\n"),
     # Store through q: one element wide, so the neighbour survives.
     "write": ("    *q = {v3}\n    if {n} != {v1}\n        return 3\n"
               "    if {a} != {v3}\n        return 4\n    if *q != {v3}\n        return 5\n"),
@@ -60,7 +61,7 @@ def _program(rank, base, binder, use, ty):
     lead = ("[1]" + "[0]" * (len(dims) - 2)) if len(dims) > 1 else ""
     a, n = f"{spell}{lead}[1]", f"{spell}{lead}[2]"
     v0, v1, _, v3 = SCALARS[ty]
-    body = USES[use].format(a=a, n=n, v0=v0, v1=v1, v3=v3)
+    body = USES[use].format(a=a, n=n, v0=v0, v1=v1, v3=v3, t=ty)
     return (f"{pre.format(ty=arr)}pub fn main() -> i32\n{top.format(ty=arr)}"
             f"    {a} = {v0}\n    {n} = {v1}\n"
             f"    {BINDERS[binder]}{a}\n{body}    return 9\n")
