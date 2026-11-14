@@ -6,7 +6,8 @@ every invocation (``ImportResolver(use_cache=False)``), so one gate parsed
 ``ritzlib/sys.ritz`` thousands of times. Now each imported module is loaded
 as an *interface*: the parsed module with the bodies it does not export
 stripped, stored in the G7 artifact store (``cas.py``) keyed by the module's
-path, source bytes and the parser's fingerprint.
+identity (repo-relative, AGAST #1916), source bytes and the parser's
+fingerprint.
 
 What the interface keeps, and why:
 
@@ -151,7 +152,7 @@ class TestStrip:
 
 
 # ---------------------------------------------------------------------------
-# Storage: parse once per (path, content, parser)
+# Storage: parse once per (module identity, content, parser)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -200,6 +201,91 @@ class TestStore:
         monkeypatch.setenv(mi.PARSE_LOG_ENV, str(log))
         mi.parse_source(LIB, str(proj / "lib.ritz"))
         assert log.read_text().splitlines() == [str(proj / "lib.ritz")]
+
+
+# ---------------------------------------------------------------------------
+# Worktree independence (AGAST #1916): the key is the module's identity, not
+# its absolute path, so a second worktree -- or test_runner's per-run scratch
+# copy of a helper -- hits the entry another directory stored.
+# ---------------------------------------------------------------------------
+
+def _worktrees(tmp_path):
+    """The same module in two directories, as two worktrees hold it."""
+    libs = []
+    for wt in ("wt1", "wt2"):
+        d = tmp_path / wt / "proj"
+        d.mkdir(parents=True)
+        (d / "lib.ritz").write_text(LIB)
+        libs.append(d / "lib.ritz")
+    return libs
+
+
+def _span_files(module):
+    """Every file name a span of `module` carries."""
+    seen, files = set(), set()
+
+    def walk(obj):
+        if id(obj) in seen or obj is None or isinstance(obj, (str, int, float, bool)):
+            return
+        seen.add(id(obj))
+        if isinstance(obj, mi.Span):
+            files.add(obj.file)
+        elif isinstance(obj, (list, tuple, set)):
+            for x in obj:
+                walk(x)
+        elif isinstance(obj, dict):
+            for x in obj.values():
+                walk(x)
+        elif hasattr(obj, "__dict__"):
+            for x in vars(obj).values():
+                walk(x)
+    walk(module)
+    return files
+
+
+@pytest.mark.unit
+class TestWorktreeIndependence:
+    def test_second_worktree_load_does_not_parse(self, tmp_path, store):
+        a, b = _worktrees(tmp_path)
+        mi.load_interface(str(a))
+        mi.PARSED.clear()
+        mi.load_interface(str(b))
+        assert mi.PARSED == [], "the second worktree re-parsed the interface"
+
+    def test_second_worktree_hash_does_not_parse(self, tmp_path, store):
+        a, b = _worktrees(tmp_path)
+        h = mi.interface_hash(str(a))
+        mi.PARSED.clear()
+        assert mi.interface_hash(str(b)) == h
+        assert mi.PARSED == []
+
+    def test_hit_names_the_loading_worktrees_file(self, tmp_path, store):
+        # Spans reach diagnostics and the debug info of kept bodies: a hit
+        # stored by another worktree must still name this worktree's file.
+        a, b = _worktrees(tmp_path)
+        mi.load_interface(str(a))
+        assert _span_files(mi.load_interface(str(b))) == {str(b)}
+        assert _span_files(mi.load_interface(str(a))) == {str(a)}
+
+    def test_stored_pickle_holds_no_path(self, tmp_path, store):
+        a, _ = _worktrees(tmp_path)
+        mi.load_interface(str(a))
+        [entry] = store.rglob(f"*.{mi.IFACE_EXT}")
+        assert str(tmp_path).encode() not in entry.read_bytes()
+
+    def test_hits_and_misses_counted(self, tmp_path, store, monkeypatch):
+        # Separately from compiled objects: the gate's double-compile report
+        # reads hits/misses as object compiles.
+        monkeypatch.setattr(mi.cas, "STATS", mi.cas.Stats())
+        a, b = _worktrees(tmp_path)
+        mi.load_interface(str(a))
+        mi.load_interface(str(b))
+        mi.interface_hash(str(b))
+        s = mi.cas.STATS
+        assert (s.iface_misses, s.iface_hits) == (1, 2)
+        assert (s.misses, s.hits) == (0, 0)
+        d = s.as_dict()
+        assert (d["iface_misses"], d["iface_hits"]) == (1, 2)
 
 
 # ---------------------------------------------------------------------------

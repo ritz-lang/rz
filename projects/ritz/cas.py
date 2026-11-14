@@ -50,7 +50,8 @@ $RITZ_CACHE_MAX_BYTES (default DEFAULT_GC_BYTES); every ci_local gate ends
 with that trim.
 
 Stats: `RITZ_CAS_STATS=1` prints hits/misses/bytes for the process to stderr
-at exit. `RITZ_CAS_STATS_LOG=<file>` appends one JSON line per process with
+at exit, and apart from them ritz0's module-interface hits/misses (a miss is
+a parse, not a compile; AGAST #1916). `RITZ_CAS_STATS_LOG=<file>` appends one JSON line per process with
 the same counts plus the identity of every miss and every failed build;
 `python3 cas.py summary <file>` aggregates a whole gate and lists any key
 compiled more than once. A build that fails (`get_or_build`'s build_fn
@@ -247,24 +248,31 @@ class Stats:
         # not compile fails on every run; on an unchanged tree these are the
         # only "misses" a warm run used to report (AGAST #1896).
         self.failed: List[List[str]] = []  # [key, ext, identity, store root]
+        # ritz0 module interfaces (module_interface.py), apart from compiled
+        # modules: a miss is a parse, not a compile (AGAST #1916).
+        self.iface_hits = 0
+        self.iface_misses = 0
 
     def as_dict(self) -> dict:
         return {"pid": os.getpid(), "argv0": Path(sys.argv[0]).name if sys.argv else "",
                 "hits": self.hits, "misses": self.misses,
                 "bytes_written": self.bytes_written, "missed": self.missed,
-                "failed": self.failed}
+                "failed": self.failed,
+                "iface_hits": self.iface_hits, "iface_misses": self.iface_misses}
 
 
 STATS = Stats()
 
 
 def _report_stats() -> None:
-    if STATS.hits == 0 and STATS.misses == 0 and not STATS.failed:
+    if (STATS.hits == 0 and STATS.misses == 0 and not STATS.failed
+            and STATS.iface_hits == 0 and STATS.iface_misses == 0):
         return
     if os.environ.get(STATS_ENV, "") not in ("", "0"):
         print(f"[ritz-cas] {Path(sys.argv[0]).name if sys.argv else '?'}: "
               f"hits={STATS.hits} misses={STATS.misses} failed={len(STATS.failed)} "
-              f"bytes_written={STATS.bytes_written}", file=sys.stderr)
+              f"bytes_written={STATS.bytes_written} iface_hits={STATS.iface_hits} "
+              f"iface_misses={STATS.iface_misses}", file=sys.stderr)
     log = os.environ.get(STATS_LOG_ENV)
     if log:
         line = json.dumps(STATS.as_dict()) + "\n"
@@ -487,7 +495,7 @@ class ArtifactStore:
 
 def summarise(log: Path) -> dict:
     """Aggregate a RITZ_CAS_STATS_LOG over a whole gate."""
-    hits = misses = written = procs = 0
+    hits = misses = written = procs = iface_hits = iface_misses = 0
     seen: Dict[tuple, List[str]] = {}
     failed: Dict[str, str] = {}
     for line in Path(log).read_text().splitlines():
@@ -499,6 +507,8 @@ def summarise(log: Path) -> dict:
         hits += rec.get("hits", 0)
         misses += rec.get("misses", 0)
         written += rec.get("bytes_written", 0)
+        iface_hits += rec.get("iface_hits", 0)
+        iface_misses += rec.get("iface_misses", 0)
         for key, ext, ident, *root in rec.get("missed", []):
             # Records from before AGAST #1911 carry no store root.
             seen.setdefault((key, ext, root[0] if root else ""), []).append(ident)
@@ -510,14 +520,17 @@ def summarise(log: Path) -> dict:
            for (k, e, r), ids in seen.items() if len(ids) > 1}
     return {"processes": procs, "hits": hits, "misses": misses,
             "bytes_written": written, "compiled": len(seen),
-            "compiled_more_than_once": dup, "failed_builds": failed}
+            "compiled_more_than_once": dup, "failed_builds": failed,
+            "iface_hits": iface_hits, "iface_misses": iface_misses}
 
 
 def format_summary(res: dict) -> List[str]:
     """The gate's `[ritz-cas]` lines for a `summarise` result."""
     lines = [f"[ritz-cas] gate: processes={res['processes']} hits={res['hits']} "
              f"misses={res['misses']} compiled={res['compiled']} "
-             f"failed={len(res['failed_builds'])} bytes_written={res['bytes_written']}"]
+             f"failed={len(res['failed_builds'])} bytes_written={res['bytes_written']}"
+             f" interfaces: hits={res.get('iface_hits', 0)}"
+             f" misses={res.get('iface_misses', 0)}"]
     lines += [f"  compiled more than once: {ident} ({k})"
               for k, ident in sorted(res["compiled_more_than_once"].items())]
     lines += [f"  failed to build: {ident} ({k})"

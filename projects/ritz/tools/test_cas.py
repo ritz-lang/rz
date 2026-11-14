@@ -292,6 +292,20 @@ def test_stats_log_summary_flags_double_compiles(tmp_path):
     assert list(s["compiled_more_than_once"].values()) == ["ritzlib/io.ritz"]
 
 
+@pytest.mark.unit
+def test_stats_log_summary_counts_interfaces(tmp_path):
+    # AGAST #1916: interface hits/misses are summed apart from objects.
+    # Records from before it carry no interface counts.
+    log = tmp_path / "cas.log"
+    recs = [{"hits": 1, "misses": 0, "iface_hits": 5, "iface_misses": 2},
+            {"hits": 2, "misses": 1, "iface_hits": 1, "iface_misses": 0},
+            {"hits": 1, "misses": 0}]
+    log.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    s = cas.summarise(log)
+    assert (s["hits"], s["misses"], s["iface_hits"], s["iface_misses"]) == (4, 1, 6, 2)
+    assert "interfaces: hits=6 misses=2" in cas.format_summary(s)[0]
+
+
 @pytest.mark.integration
 def test_stats_env_reports_at_exit(tmp_path):
     log = tmp_path / "cas.log"

@@ -23,11 +23,19 @@ Interfaces live in the G7 artifact store (`cas.py`, $RITZ_CACHE_DIR):
     objects/<k[:2]>/<k>.rzih   interface hash, hex text
     objects/<t[:2]>/<t>.rzi.ritz  interface text (ritz1 reads it), t = text_key
 
-`k = sha256(schema, parser fingerprint, absolute path, source sha256)`. The
-absolute path is in the key because spans carry it (diagnostics, assert
-messages in kept bodies). The parser fingerprint hashes the files that
-produce the AST (tokens, lexer, parser, ritz_ast, this file), so a parser
-change can never return an interface from the old one.
+`k = sha256(schema, parser fingerprint, cas.module_identity, source sha256)`.
+The identity is repo-relative (a file outside the repo: `ext/<name>`), as in
+object keys, so every worktree and every test scratch copy of a module
+shares one entry (AGAST #1916; the key held the absolute path before, and a
+second worktree re-parsed every interface). Spans do carry the absolute path
+(diagnostics, assert messages and debug info of kept bodies), so the pickle
+stores the module's own path as a persistent id and the loader binds it to
+the path it is loading (`_Pickler` / `_Unpickler`). The parser fingerprint
+hashes the files that produce the AST (tokens, lexer, parser, ritz_ast, this
+file), so a parser change can never return an interface from the old one.
+
+Hits and misses are counted in `cas.STATS.iface_hits` / `iface_misses`,
+apart from the compiled-object `hits` / `misses`.
 
 Pickle is ritz0-private: the store is the user's own cache directory, and the
 fingerprint pins the exact class definitions. Next to it goes the interface
@@ -62,6 +70,7 @@ from __future__ import annotations
 import copy
 import enum
 import hashlib
+import io
 import os
 import pickle
 import sys
@@ -358,17 +367,50 @@ def hash_interface(iface: rast.Module) -> str:
 # ============================================================================
 
 def _store_key(abs_path: str, source_bytes: bytes) -> str:
+    # The module's identity, not its absolute path (AGAST #1916): the path
+    # is put back into the spans on load (_Pickler / _Unpickler), so every
+    # worktree and every scratch copy of a module shares one entry.
     h = hashlib.sha256()
-    for part in (SCHEMA, parser_fingerprint(), abs_path,
+    for part in (SCHEMA, parser_fingerprint(), cas.module_identity(Path(abs_path)),
                  hashlib.sha256(source_bytes).hexdigest()):
         h.update(part.encode())
         h.update(b"\x00")
     return h.hexdigest()
 
 
+# The persistent id the module's own path is pickled as. Every span the lexer
+# makes for a module carries the path it was given (`Span.file`), and it is
+# the only place the path reaches the interface; the pickle stores this
+# placeholder instead and the loader binds it to the path being loaded.
+_PATH_PID = "path"
+
+
+class _Pickler(pickle.Pickler):
+    def __init__(self, f, abs_path: str) -> None:
+        super().__init__(f, pickle.HIGHEST_PROTOCOL)
+        self._abs_path = abs_path
+
+    def persistent_id(self, obj):
+        if type(obj) is str and obj == self._abs_path:
+            return _PATH_PID
+        return None
+
+
+class _Unpickler(pickle.Unpickler):
+    def __init__(self, f, abs_path: str) -> None:
+        super().__init__(f)
+        self._abs_path = abs_path
+
+    def persistent_load(self, pid):
+        if pid != _PATH_PID:
+            raise pickle.UnpicklingError(f"unknown persistent id {pid!r}")
+        return self._abs_path
+
+
 def _get(store: cas.ArtifactStore, key: str, ext: str) -> Optional[Path]:
-    """Like `ArtifactStore.get`, but not counted in `cas.STATS`: those count
-    compiled modules (the gate's "compiled more than once" report)."""
+    """Like `ArtifactStore.get`, but counted as an interface (`iface_hits`),
+    not in `hits`/`misses`: those count compiled modules (the gate's
+    "compiled more than once" report)."""
     p = store.path(key, ext)
     if not p.is_file():
         return None
@@ -381,6 +423,7 @@ def _get(store: cas.ArtifactStore, key: str, ext: str) -> Optional[Path]:
 
 def _build(abs_path: str, source_bytes: bytes, key: str,
            store: cas.ArtifactStore) -> Tuple[str, rast.Module]:
+    cas.STATS.iface_misses += 1
     source = source_bytes.decode()
     tokens, module = _parse_with_tokens(source, abs_path)
     iface = strip_module(module)
@@ -390,8 +433,9 @@ def _build(abs_path: str, source_bytes: bytes, key: str,
         text = interface_text(source, tokens, module)
         cas._atomic_write(store.path(text_key(source_bytes), TEXT_EXT),
                           text.encode())
-        cas._atomic_write(store.path(key, IFACE_EXT),
-                          pickle.dumps((digest, iface), pickle.HIGHEST_PROTOCOL))
+        buf = io.BytesIO()
+        _Pickler(buf, abs_path).dump((digest, iface))
+        cas._atomic_write(store.path(key, IFACE_EXT), buf.getvalue())
         cas._atomic_write(store.path(key, HASH_EXT), digest.encode())
     except (OSError, pickle.PicklingError, RecursionError, KeyError, ValueError) as e:
         print(f"Warning: module interface not stored for {abs_path}: {e}",
@@ -414,7 +458,8 @@ def _load(path: str) -> Tuple[str, rast.Module]:
     if hit is not None and _text_ok(store, source_bytes):
         try:
             with open(hit, "rb") as f:
-                digest, iface = pickle.load(f)
+                digest, iface = _Unpickler(f, abs_path).load()
+            cas.STATS.iface_hits += 1
             return digest, iface
         except Exception:
             pass  # torn/foreign entry: rebuild over it
@@ -442,6 +487,8 @@ def interface_hash(path: str) -> str:
         hit = _get(store, key, HASH_EXT)
         if hit is not None and _text_ok(store, source_bytes):
             digest = hit.read_text().strip()
+            if digest:
+                cas.STATS.iface_hits += 1
         if not digest:
             digest = _build(str(p), source_bytes, key, store)[0]
         _HASH_MEMO[memo] = digest
