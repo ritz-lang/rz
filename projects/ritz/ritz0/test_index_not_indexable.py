@@ -281,3 +281,67 @@ pub fn main() -> i32
     return lv[0][1] as i32
 """
     assert run_with(compiler, "index_element", program) == 20
+
+
+# AGAST #3038: `return *v` from a `-> S` fn, `v` an S by value.  A bare `self` is
+# one since #2393 (LANGUAGE_SPEC §5.4), so `*self` there has nothing to follow:
+# ritz0 refuses it as every other `*v` (#2885), at the `*`.  ritz1's struct-return
+# path read the loaded S as an address and clang refused its `inttoptr i64 %S`.
+# A tail `*self` and `let v: S = *self` were refused already.  `^` marks the `*`.
+SELF_TYPES = {
+    "small": "struct R\n    x: i32\n",
+    # Big enough to return through a hidden pointer (sret, #1730).
+    "big": "struct R\n    x: i32\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n",
+}
+SELF_MAIN = ("pub fn main() -> i32\n    var k: R\n    k.x = 3\n"
+             "    return k.me().x\n")
+
+
+def _self_program(size, receiver, body):
+    return f"{SELF_TYPES[size]}\nimpl R\n    fn me({receiver}) -> R\n{body}\n{SELF_MAIN}"
+
+
+SELF_VALUE_DEREFS = {
+    "bare_self": _self_program("small", "self", "        return ^*self\n"),
+    "typed_self": _self_program("small", "self: R", "        return ^*self\n"),
+    "bare_self_sret": _self_program("big", "self", "        return ^*self\n"),
+    "free_param": ("struct R\n    x: i32\n\nfn me(r: R) -> R\n    return ^*r\n\n"
+                   "pub fn main() -> i32\n    var k: R\n    k.x = 3\n    return me(k).x\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(SELF_VALUE_DEREFS))
+def test_return_deref_of_a_struct_value_is_not_a_pointer(compile_with, name, compiler):
+    marked = SELF_VALUE_DEREFS[name]
+    before = marked[:marked.index("^")]
+    where = f"main.ritz:{before.count(chr(10)) + 1}:{len(before) - before.rfind(chr(10))}:"
+    program = marked.replace("^", "", 1)
+    batch = getattr(compile_with, "batch_compile", None)
+    got = batching.refused(compiler, program, batch) if batch else None  # AGAST #2806
+    if got is not None:
+        out = got[0]
+    else:
+        comp, _, _ = compile_with(compiler, name, program)
+        assert comp.returncode != 0, f"{compiler} took {name}"
+        out = comp.stdout + comp.stderr
+    assert NOT_A_POINTER in out, out[-1000:]
+    assert where in out, out[-1000:]
+
+
+# The legal neighbours: `self` a reference or the caller's place (§5.4, §13.4),
+# so `*self` is the R it refers to, returned as a copy.
+SELF_REF_DEREFS = {
+    "shared_ref": _self_program("small", "self: @R", "        return *self\n"),
+    "mut_ref": _self_program("small", "self: @&R", "        return *self\n"),
+    "lent": _self_program("small", "self:& R", "        return *self\n"),
+    "shared_ref_sret": _self_program("big", "self: @R", "        return *self\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(SELF_REF_DEREFS))
+def test_return_deref_of_a_reference_self_runs(run_with, name, compiler):
+    assert run_with(compiler, name, SELF_REF_DEREFS[name]) == 3
