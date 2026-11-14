@@ -173,18 +173,26 @@ GENERIC_SHAPES = {
                              "w.b = @x\nw.b.v = 40000\n"
                              "if w.lo != 11 or w.hi != 22\n    return 9\n"
                              "if x.v != 40000 or w.b.v != 40000\n    return 1\nreturn 0\n")),
-    # And Box<i64> named nowhere but through W's pointer, so instantiating
-    # W$i64 must instantiate it.  The address goes in through a `**u8`:
-    # `as *Box<i64>` would name it, and neither compiler takes that (#3124).
+    # And Box<i64> named nowhere but through W's pointer and the cast that
+    # stores into it (#3124: a cast may name a generic type).
     "ptr_box_unnamed": (_BOX + "struct W<T>\n    lo: i64\n    b: *Box<T>\n    hi: i64\n\n" + MAIN
-                        + _ind("var raw: [2]i64\nvar w: W<i64>\n*((@w.b) as **u8) = (@raw[1]) as *u8\n"
+                        + _ind("var raw: [2]i64\nvar w: W<i64>\nw.b = (@raw[1]) as *Box<i64>\n"
                                "w.b.v = 5000000000\n"
                                "if raw[1] != 5000000000 or w.b.v != 5000000000\n    return 1\nreturn 0\n")),
     "ptr_box_elem_unnamed": (_BOX + "struct W<T>\n    lo: i64\n    a: [2]*Box<T>\n    hi: i64\n\n" + MAIN
-                             + _ind("var raw: [2]i64\nvar w: W<i64>\n*((@w.a[1]) as **u8) = (@raw[1]) as *u8\n"
+                             + _ind("var raw: [2]i64\nvar w: W<i64>\nw.a[1] = (@raw[1]) as *Box<i64>\n"
                                     "w.a[1].v = 5000000000\n"
                                     "if raw[1] != 5000000000 or w.a[1].v != 5000000000\n"
                                     "    return 1\nreturn 0\n")),
+    # The cast above names Box<i64> itself, which instantiates it (#3124).
+    # Here the address goes in untyped, so W$i64.a's `[2]*Box$i64` is the
+    # only mention: this row alone pins #3099's `[N]*S` element branch in
+    # monomorph's collect_struct_types_from_fields.
+    "ptr_box_elem_only_field": (_BOX + "struct W<T>\n    lo: i64\n    a: [2]*Box<T>\n    hi: i64\n\n" + MAIN
+                                + _ind("var raw: [2]i64\nvar w: W<i64>\n*((@w.a[1]) as **u8) = (@raw[1]) as *u8\n"
+                                       "w.a[1].v = 5000000000\n"
+                                       "if raw[1] != 5000000000 or w.a[1].v != 5000000000\n"
+                                       "    return 1\nreturn 0\n")),
     # #3099 with two parameters: each pointee takes its own argument.
     "two_param_ptr_elem": (_BOX + "struct KV<K, V>\n    lo: K\n    a: [2]*Box<V>\n    b: *Box<K>\n    hi: i64\n\n"
                            + MAIN
