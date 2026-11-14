@@ -673,6 +673,48 @@ fn eprint_token_desc(p: *Parser, pos: i32)
         eprint_lexeme(tok.start, tok.len)
         eprint_char(39 as u8)
 
+# `::` was removed in RERITZ (LANGUAGE_SPEC §10.2, §15.3) and ritz1.grammar
+# has no `::` token: `aa::f` lexes as IDENT `:` `:` IDENT and the parse fails
+# at the first `:`.  If the furthest token reached is that `:`, return the
+# qualifier's token index so the error names the `a::b` the way ritz0 does
+# (AGAST #2600); otherwise -1.  The two colons must touch: `a: :b` is some
+# other mistake.
+fn qualified_access_at(p: *Parser, fail_at: i32) -> i32
+    let c: i32 = fail_at
+    if c < 1 or c + 2 >= p.token_count
+        return -1
+    let qual: *Token = p.tokens + (c - 1)
+    let c1: *Token = p.tokens + c
+    let c2: *Token = p.tokens + (c + 1)
+    let name: *Token = p.tokens + (c + 2)
+    if qual.kind != TOK_IDENT or name.kind != TOK_IDENT
+        return -1
+    if c1.kind != TOK_COLON or c2.kind != TOK_COLON
+        return -1
+    if c2.line != c1.line or c2.col != c1.col + 1
+        return -1
+    c - 1
+
+# `file:line:col: `q::n`: `::` was removed in RERITZ ...`, worded exactly as
+# ritz0's qualified_access_removed (emitter_llvmlite.py) so both compilers
+# give one diagnostic.  `qual` is the qualifier's token index.
+fn eprint_qualified_access_removed(p: *Parser, qual: i32)
+    let q: *Token = p.tokens + qual
+    let n: *Token = p.tokens + (qual + 3)
+    eprint_location_at(p, qual)
+    eprint_char(96 as u8)
+    eprint_lexeme(q.start, q.len)
+    eprints_cstr(c"::")
+    eprint_lexeme(n.start, n.len)
+    eprints_cstr(c"`: `::` was removed in RERITZ (LANGUAGE_SPEC §15.3). ")
+    eprints_cstr(c"Imported names share one namespace, so write `")
+    eprint_lexeme(n.start, n.len)
+    eprints_cstr(c"`; an enum variant is `")
+    eprint_lexeme(q.start, q.len)
+    eprint_char(46 as u8)
+    eprint_lexeme(n.start, n.len)
+    eprint_char(96 as u8)
+
 # Called by the generated anchor-skip recovery in parse_item BEFORE it
 # skips the construct it could not parse.  p.pos is still at the first
 # token of that construct (every failed alternative rewinds to start_pos).
@@ -694,9 +736,13 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
         g_last_drop_at = fail_at
         g_dropped_items = g_dropped_items + 1
         eprints_cstr(c"error: ")
-        eprint_location_at(p, fail_at)
-        eprints_cstr(c"unexpected ")
-        eprint_token_desc(p, fail_at)
+        let qual: i32 = qualified_access_at(p, fail_at)
+        if qual >= 0
+            eprint_qualified_access_removed(p, qual)
+        else
+            eprint_location_at(p, fail_at)
+            eprints_cstr(c"unexpected ")
+            eprint_token_desc(p, fail_at)
         eprintln_cstr(c"")
         eprints_cstr(c"note: ")
     else

@@ -2,7 +2,8 @@
 
 `::` was removed from Ritz in RERITZ (LANGUAGE_SPEC §10.2, §15.3): imported
 names share one flat namespace, and enum variants are qualified with `.`. ritz1
-has no `::` token, so it already rejects every `a::b`. ritz0 still parses
+has no `::` token, so it already rejected every `a::b`, but as an unparsable
+item; it now names the `a::b` with ritz0's wording (AGAST #2600). ritz0 still parses
 `a::b` into a `QualifiedIdent`, and unless the qualifier was an `import ... as`
 alias nothing lowered it. The emitter then died with
 
@@ -84,14 +85,24 @@ def test_ritz0_reports_qualified_access_at_its_location(tmp_path, name):
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REJECTED))
 def test_every_compiler_refuses_qualified_access(ritz1_bin, tmp_path, compiler, name):
-    main, _, _ = REJECTED[name]
+    main, text, where = REJECTED[name]
     proc, out, ll = _compile(compiler, ritz1_bin, tmp_path, name, main)
     assert proc.returncode != 0, out
     assert not ll.exists(), f"{compiler} left an .ll behind:\n{out}"
     assert "Traceback" not in out, out
-    # Located: names the file with a line and column (ritz1 points at the item
-    # its parser gave up on, not the `::`: AGAST #2600).
-    assert "main.ritz:" in out, out
+    # Every compiler points at the `a::b` itself, not the item holding it, and
+    # says why (AGAST #2600: ritz1 used to report only `cannot parse item
+    # starting at 'fn main'`).
+    assert f"main.ritz:{where}: `{text}`: `::` was removed in RERITZ" in out, out
+
+
+def test_ritz1_spaced_colons_are_not_called_qualified_access(ritz1_bin, tmp_path):
+    """`Color: :Red` is not `::`; ritz1 keeps its plain located parse error."""
+    main = "enum Color\n    Red\n\nfn main() -> i32\n    let c = Color: :Red\n    0\n"
+    proc, out, _ = _compile("ritz1", ritz1_bin, tmp_path, "spaced", main)
+    assert proc.returncode != 0, out
+    assert "removed in RERITZ" not in out, out
+    assert "main.ritz:5:18: unexpected ':'" in out, out
 
 
 def test_ritz0_aliased_qualified_call_is_unchanged(tmp_path):
