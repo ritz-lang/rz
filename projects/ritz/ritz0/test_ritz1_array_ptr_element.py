@@ -580,8 +580,8 @@ def test_inferred_copy_of_a_struct_element_deref(run_with, compiler):
 
 
 # AGAST #2377: an untyped `let` of a struct read through a pointer is that struct,
-# as `let c: S = ...`.  `a[1][1]` stayed i64: "unhandled EXPR_MEMBER".  `p[0]` is
-# KNOWN_GAPS' (#3052).
+# as `let c: S = ...`.  `a[1][1]` stayed i64: "unhandled EXPR_MEMBER".  `p[0]`
+# too (AGAST #3052, once ritz1 loaded it as an S).
 # s[1] is the one with q == 2; a[0] and p point at it, a[1] at s[0].
 _COPY_MAIN = (_PAIR + "pub fn main() -> i32\n    var s: [2]S\n    s[1].q = 2\n    var a: [2]*S\n"
               "    a[0] = @s[1]\n    a[1] = @s[0]\n    let p: *S = @s[1]\n")
@@ -589,6 +589,7 @@ INFERRED_COPIES = {
     "deref": "*p",
     "deref_element": "*a[0]",
     "element_index": "a[1][1]",
+    "pointer_index": "p[0]",
 }
 
 
@@ -643,7 +644,7 @@ _DROP_MAIN = (
     "        DROPS = DROPS + 1\n\npub fn main() -> i32\n    var s: [2]T\n    var a: [2]*T\n"
     "    a[0] = @s[1]\n    a[1] = @s[0]\n    let p: *T = @s[1]\n")
 _DROP_LINE = _DROP_MAIN.count("\n") + 1
-DROP_READS = {**INFERRED_COPIES, "pointer_index": "p[0]"}
+DROP_READS = INFERRED_COPIES
 
 
 @pytest.mark.integration
@@ -701,24 +702,39 @@ def test_generic_pointer_element_refuses_another_array(compile_with, name, compi
         assert "the array isn't the one the parameter points at" in out, out
 
 
-# ritz0 has these right, ritz1 doesn't, and each is its own bug.  Strict, so the
-# fix flags the row.
-KNOWN_GAPS = {
-    "pointer_index_inferred_copy": (3052, _COPY_MAIN + "    let c = p[0]\n" + _is("c.q", "2")),
+# AGAST #3052: `p[i]` with `p: *S` is the S at `p + i`, a copy, as `*(p + i)`
+# (#2542).  ritz1 loaded an i64 from it: `let c: S = p[0]` was a clang error.
+# T is 12 bytes, so an 8-byte stride or load lands on the wrong field.
+_T_MAIN = ("struct T\n    a: i32\n    b: i32\n    c: i32\n\npub fn main() -> i32\n"
+           "    var t: [3]T\n    t[1].b = 5\n    t[2].b = 6\n    t[2].c = 7\n    let p: *T = @t[0]\n")
+POINTER_INDEX_READS = {
+    "typed": "    let c: T = p[1]\n" + _is("c.b", "5"),
+    "inferred": "    let c = p[2]\n" + _is("c.b + c.c", "13"),
+    "assign": "    var c: T\n    c = p[2]\n" + _is("c.c", "7"),
+    "copy": "    var c = p[1]\n    c.b = 9\n" + _is("t[1].b + c.b", "14"),
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(KNOWN_GAPS))
-def test_ritz0_has_the_known_gaps_right(run_with, name):
-    assert run_with("ritz0", name, KNOWN_GAPS[name][1]) == 0
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(POINTER_INDEX_READS))
+def test_pointer_index_reads_the_struct(run_with, name, compiler):
+    assert run_with(compiler, f"ptr_index_{name}", _T_MAIN + POINTER_INDEX_READS[name]) == 0
+
+
+# ... and it isn't an i64: ritz1 took `let n: i64 = p[0]` silently.  Each says so
+# in its own words, ritz0 at the `let` and ritz1 at the init, as each refuses
+# `let n: i64 = *(p + 0)` (test_struct_deref_value.py).
+NOT_AN_INTEGER = {
+    "ritz0": ("`n` is declared `i64` but its initialiser has type", 5),
+    "ritz1": ("a whole struct is not a value here in ritz1", 18),
+}
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize(
-    "name",
-    [pytest.param(n, marks=pytest.mark.xfail(strict=True, reason=f"AGAST #{KNOWN_GAPS[n][0]}"))
-     for n in sorted(KNOWN_GAPS)])
-def test_ritz1_known_gaps(run_with, name, compiler):
-    assert run_with(compiler, name, KNOWN_GAPS[name][1]) == 0
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_pointer_index_struct_is_not_an_integer(compile_with, compiler):
+    program = _T_MAIN + "    let n: i64 = p[0]\n    return 0\n"
+    message, col = NOT_AN_INTEGER[compiler.removesuffix("_selfhosted")]
+    _refused_at(compile_with, compiler, "ptr_index_as_i64", program, message,
+                f"{_T_MAIN.count(chr(10)) + 1}:{col}")

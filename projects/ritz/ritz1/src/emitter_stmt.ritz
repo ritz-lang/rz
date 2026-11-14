@@ -561,19 +561,26 @@ fn infer_struct_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
 # AGAST #2377: `let c = a[i][j]` with `a: [N]*S` is a copy of that S, as
 # `let c: S = a[i][j]` and `let c = *a[i]` (#2542) are.  The slot stayed i64
 # with no name, so `c.q` was "unhandled EXPR_MEMBER".  emit_expr loads the
-# `%S` deref_pointee_struct_name names for `a[i]`.  `p[i]` with `p: *S` is
-# left alone: emit_expr loads it as an i64 (AGAST #3052).
+# `%S` deref_pointee_struct_name names for `a[i]`.
+# AGAST #3052: so is `let c = p[i]` with `p: *S`, now that emit_expr loads it as
+# `*(p + i)`.  `let n: i64 = p[i]` is an i64 and refused at the init, as #2525
+# refuses `let n: i64 = *(p + i)`; ritz1 took it silently.
 fn infer_ptr_index_let(s: *EmitterState, stmt: *Stmt) -> i32
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_declared_type != TYPE_VOID
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0
         return 0
     let e: *Expr = stmt.var_init
     if e == null or e.kind != EXPR_INDEX or e.left == null or e.right == null or e.right.kind == EXPR_RANGE
         return 0
-    if e.left.kind != EXPR_INDEX
-        return 0
     var name: *u8 = null
     var len: i32 = 0
-    deref_pointee_struct_name(s, e.left, @name, @len)
+    if e.left.kind == EXPR_IDENT
+        ptr_local_struct_index(s, e, @name, @len)
+        if len > 0 and stmt.var_declared_type != TYPE_VOID
+            if find_struct(s, name, len) != null
+                emit_nd_error(s, e.span.line, e.span.col, whole_struct_value_message())
+            return 0
+    else if e.left.kind == EXPR_INDEX and stmt.var_declared_type == TYPE_VOID
+        deref_pointee_struct_name(s, e.left, @name, @len)
     if name == null or len <= 0
         return 0
     stmt.var_type = TYPE_STRUCT
