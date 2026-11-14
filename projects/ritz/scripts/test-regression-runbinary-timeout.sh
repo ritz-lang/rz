@@ -50,6 +50,41 @@ SCRATCH=$(mktemp -d "$SCRIPT_DIR/../build/selftest-runbinary.XXXXXX")
 SCRATCH=$(cd "$SCRATCH" && pwd)
 # Unique per run: a concurrent run of this test can never match ours.
 TAG="3157$$"
+
+# Case 6's stress loops (AGAST #3211; see there).  Each sets its own EXIT
+# trap, so call them inside $( ).  Defined above cleanup's trap so that one
+# stays the script's last (tools/test_gate_tmpdirs.py reads it as the one
+# in force).
+#
+# stress_watchdog DIR -- 40 watchdog_wait calls on an instant job, under an
+# EXIT trap that leaves DIR/PID behind when it runs in any other process.
+# Prints "status" per call not returning the job's 3 and "slow" per call
+# that waited out the 3s budget.
+stress_watchdog() {
+    local dir="$1" main=$BASHPID t0 s r
+    # Expanded now: the locals are gone when the $( ) shell itself exits.
+    trap "[[ \$BASHPID != $main ]] && : > $(printf %q "$dir")/\$BASHPID" EXIT
+    for _ in $(seq 40); do
+        t0=${EPOCHREALTIME//[!0-9]/}
+        { ( exit 3 ) & s=$!; watchdog_wait "$s" 3s; r=$?; } 2>/dev/null
+        [[ $r == 3 ]] || echo status
+        (( ${EPOCHREALTIME//[!0-9]/} - t0 < 1500000 )) || echo slow
+    done
+}
+# stress_run_binary BIN DIR -- 20 run_binary calls of BIN (prints out/err,
+# exits 3) writing into DIR, under an EXIT trap that removes DIR, as cleanup
+# removes $SCRATCH.  Prints one "run N: <exit> <output>;" per wrong capture.
+stress_run_binary() {
+    local bin="$1" dir="$2" got i
+    trap "rm -rf $(printf %q "$dir")" EXIT
+    for i in $(seq 20); do
+        mkdir -p "$dir"
+        run_binary "$bin" "$dir/out.stdout" "$dir/out.exit"
+        got="$(cat "$dir/out.exit" 2>&1) $(tr '\n' ' ' < "$dir/out.stdout" 2>&1)"
+        [[ "$got" == "3 out err " ]] || echo "run $i: $got;"
+    done
+}
+
 cleanup() {
     pkill -KILL -fx "sleep 15\.${TAG}[0-9]+" 2>/dev/null
     rm -rf "$SCRATCH"
@@ -194,6 +229,32 @@ for m in "${mechs[@]}"; do
     check "[$NAME] dispositions under an ignoring parent ($m): nothing ignored" \
         "SigIgn:	0000000000000000" "$(cat "$out.stdout" 2>/dev/null)"
 done
+
+# 6. Stress: the watchdog must die without running the caller's EXIT trap
+#    -- AGAST #3211.  watchdog_wait used to end its watchdog `sleep` with a
+#    plain `kill` (SIGTERM).  When the job is fast, that often lands before
+#    the forked child has exec'd sleep, while it is still a copy of this
+#    shell: bash catches the TERM and runs the inherited EXIT trap, then
+#    exits.  Here that trap is cleanup, i.e. `rm -rf $SCRATCH`, racing
+#    run_binary as it writes out.stdout ("[no-op stub] normal exit: stdout
+#    and stderr captured" failed with out.stdout missing on a loaded gate
+#    host); in regression.sh it is cleanup_build_dir.  Or bash catches it
+#    and then execs sleep anyway, and the caller waits out the whole budget.
+#    SIGKILL can be neither caught nor lost.  Each loop below did hit it on
+#    an idle host: 40 instant jobs ran the trap 13-24 times and waited out
+#    the budget 8-23 times.
+#    Each loop runs in $( ) under its own EXIT trap (stress_watchdog and
+#    stress_run_binary, defined above cleanup's trap), so a stray run
+#    cannot be cleanup.
+wd_trap="$SCRATCH/wd-trap"
+mkdir -p "$wd_trap"
+check "[$NAME] stress: watchdog_wait x40 returns each job's status at once" "" \
+    "$(echo $(stress_watchdog "$wd_trap"))"
+check "[$NAME] stress: its killed watchdog never runs the caller's EXIT trap" 0 \
+    "$(find "$wd_trap" -type f | wc -l)"
+bin=$(make_binary exits 'echo out; echo err >&2; exit 3')
+check "[$NAME] stress: run_binary x20 under a cleanup trap: status and output captured" "" \
+    "$(stress_run_binary "$bin" "$SCRATCH/e2e")"
 
 if [[ "${ARGS[0]:-}" == "--as" ]]; then
     [[ $TESTS_FAILED -eq 0 ]]; exit

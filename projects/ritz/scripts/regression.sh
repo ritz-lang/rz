@@ -602,7 +602,15 @@ watchdog_wait() {
         wait "$sid"
         result=137
     else
-        kill "$wd" 2>/dev/null
+        # KILL, never TERM -- AGAST #3211.  After a fast job the watchdog is
+        # often still a fork of this shell that has not exec'd sleep yet.
+        # Sent TERM there, bash catches it and either runs the EXIT trap it
+        # inherited (regression.sh's cleanup_build_dir; a self-test's
+        # `rm -rf $SCRATCH`), deleting files the caller is about to write
+        # or read, or execs sleep anyway with the TERM lost, so the `wait`
+        # below sat out the whole budget.  KILL can be neither caught nor
+        # lost.
+        kill -KILL "$wd" 2>/dev/null
         wait "$wd"
     fi
     return $result
