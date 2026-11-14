@@ -175,7 +175,8 @@ RUNS.update({f"pointer_call_{shape}": _prog(body)
              for shape, body in _reads("mkp()").items() if shape in POINTER_RUNS})
 RITZ0_ONLY.update({f"pointer_call_{shape}": _prog(body)
                    for shape, body in _reads("mkp()").items() if shape not in POINTER_RUNS})
-RITZ0_ONLY["pointer_call_for"] = _prog(_walk("mkp()"))
+# AGAST #2426: a `for` walks a row of a `*R` call's field where it is.
+RUNS["pointer_call_for"] = _prog(_walk("mkp()"))
 # A `*R` result is the struct it points at, not a copy: a write shows.
 RITZ0_ONLY["pointer_call_is_live"] = _prog(
     "gr.m[1][2] = 60\nif mkp().m[1][2] != 60\n    return 1")

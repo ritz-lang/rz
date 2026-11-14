@@ -3115,11 +3115,68 @@ fn emit_for_deref_header(s: *EmitterState, op: *Expr, out: **StructDef) -> i32
     *out = st
     reg
 
+# AGAST #2426: `vv[i]`, a header that is an element of the Vec `vv` names, where
+# it is in `vv`'s buffer: `&data[i]`, with `vv` and `i` evaluated once, before
+# the loop.  `vv` is any place emit_for_header walks in place; a call's result
+# isn't one.  0, emitting nothing, for anything else.
+fn emit_for_vec_elem_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+    let base: *Expr = e.left
+    if base == null or e.right == null or e.right.kind == EXPR_RANGE
+        return 0
+    if base.kind == EXPR_CALL or base.kind == EXPR_METHOD or base.kind == EXPR_ARRAY_LIT or base.kind == EXPR_STRING_LIT
+        return 0
+    var b: RefTy
+    var el: RefTy
+    if ref_ty_of(s, base, @b) == 0 or ref_vec_elem(s, @b, @el) == 0 or el.kind != TYPE_STRUCT
+        return 0
+    let est: *StructDef = for_header_struct(s, el.name, el.name_len)
+    if est == null
+        return 0
+    var mr: MemberPtrResult
+    mr.reg = 0
+    mr.field = null
+    mr.success = 0
+    if base.kind == EXPR_MEMBER
+        emit_member_ptr(s, base, @mr)
+    var vst: *StructDef = null
+    let hdr: i32 = emit_for_header(s, base, @mr, @vst)
+    if vst == null
+        return 0
+    let di: i32 = find_field_index(vst, c"data", 4)
+    if di < 0
+        return 0
+    let dpp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, dpp)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, vst.name, vst.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, hdr)
+    emit_str(s, c", i32 0, i32 ")
+    emit_int(s, di as i64)
+    emit_str(s, c"\n")
+    let dp: i32 = emit_load_ptr(s, dpp)
+    let idx: i32 = emit_expr(s, e.right)
+    let ep: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ep)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, est.name, est.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, dp)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    *out = est
+    ep
+
 # AGAST #2410: `vs[i]`, an element that is a header, at its own address.  The
 # index is evaluated once, before the loop.
 fn emit_for_element_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
     var t: RefTy
-    if ref_ty_of(s, e, @t) == 0 or t.kind != TYPE_STRUCT
+    if ref_ty_of(s, e, @t) == 0
+        return emit_for_vec_elem_header(s, e, out)   # AGAST #2426
+    if t.kind != TYPE_STRUCT
         return 0
     let st: *StructDef = for_header_struct(s, t.name, t.name_len)
     if st == null
@@ -3256,6 +3313,116 @@ fn member_reached_through_call(e: *Expr) -> i32
         return 1
     0
 
+# AGAST #2426: `b.f` with `b` a `Box<S>` and `f` S's field, not the Box's own: the
+# field of what `b.ptr` points at, as ritz0's `for` reads it, into *mr.  0,
+# emitting nothing, for any other member.  Only a `for` goes this far: ritz0
+# refuses `@b.f`, and ritz1 has no `b.f` anywhere else yet.
+fn emit_for_box_field(s: *EmitterState, e: *Expr, mr: *MemberPtrResult) -> i32
+    var b: RefTy
+    if e.left == null or ref_ty_of(s, e.left, @b) == 0 or b.kind != TYPE_STRUCT
+        return 0
+    if b.name_len <= 4 or name_eq(b.name, 4, c"Box$", 4) == 0
+        return 0
+    let bst: *StructDef = find_struct(s, b.name, b.name_len)
+    if bst == null or find_field_index(bst, e.ident_ptr, e.ident_len) >= 0
+        return 0
+    let pi: i32 = find_field_index(bst, c"ptr", 3)
+    if pi < 0
+        return 0
+    let pf: *StructField = get_field_type(bst, pi)
+    if pf.field_type != TYPE_PTR or pf.field_type_name_len <= 0
+        return 0
+    let ist: *StructDef = find_struct(s, pf.field_type_name, pf.field_type_name_len)
+    if ist == null
+        return 0
+    let fi: i32 = find_field_index(ist, e.ident_ptr, e.ident_len)
+    if fi < 0
+        return 0
+    let breg: i32 = emit_lvalue_ptr(s, e.left)
+    if breg <= 0
+        return 0
+    let pp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pp)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, bst.name, bst.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, breg)
+    emit_str(s, c", i32 0, i32 ")
+    emit_int(s, pi as i64)
+    emit_str(s, c"\n")
+    emit_member_gep_from_ptr(s, mr, emit_load_ptr(s, pp), ist, fi, get_field_type(ist, fi))
+    1
+
+# AGAST #2426: `*x`, with `x` a call, a field or a global of type `*[N]T` (as
+# base_ptr_array has them): the array it points at, evaluated once.  0, emitting
+# nothing, for anything else.
+fn emit_for_deref_array(s: *EmitterState, x: *Expr, elem: *i32, size: *i32, name: **u8, name_len: *i32, pointee: *i32, p_name: **u8, p_name_len: *i32) -> i32
+    let pa: *Param = base_ptr_array(s, x)
+    if pa == null or pa.param_pointee_array_shape != null
+        return 0
+    *elem = pa.param_pointee_array_elem_type
+    *size = pa.param_pointee_array_size
+    *name = pa.param_type_name
+    *name_len = pa.param_type_name_len
+    *pointee = elem_recorded_pointee(s, *elem, pa.param_pointee_array_elem_pointee, *name, *name_len, p_name, p_name_len)
+    let val: i32 = emit_expr(s, x)
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, val)
+    emit_str(s, c" to ptr\n")
+    r
+
+# AGAST #2426: the `[N][M]T` field `m` names when it's reached through a call
+# that returns a `*S`, as `mkp().m` or `k.p().m`; null otherwise.  Only a `for`
+# looks: #2517 owns `mkp().m[i]` everywhere else.
+fn for_row_field_through_call(s: *EmitterState, m: *Expr) -> *StructField
+    if m.kind != EXPR_MEMBER or m.left == null
+        return null
+    if m.left.kind != EXPR_CALL and m.left.kind != EXPR_METHOD
+        return null
+    let st: *StructDef = call_result_ptr_struct(s, m.left)
+    if st == null
+        return null
+    let fi: i32 = find_field_index(st, m.ident_ptr, m.ident_len)
+    if fi < 0
+        return null
+    let f: *StructField = get_field_type(st, fi)
+    if f.field_type != TYPE_ARRAY or f.array_shape == null
+        return null
+    f
+
+# AGAST #2426: row `i` of that field, `mkp().m[i]`, where it is: the call and
+# `i` run once, before the loop.  0, emitting nothing, unless `e` is one.
+fn emit_for_row_through_call(s: *EmitterState, e: *Expr, out_shape: **ArrayShape) -> i32
+    if e.left == null or e.right == null or e.right.kind == EXPR_RANGE
+        return 0
+    let f: *StructField = for_row_field_through_call(s, e.left)
+    if f == null
+        return 0
+    var mp: MemberPtrResult
+    mp.reg = 0
+    mp.field = null
+    mp.success = 0
+    emit_member_ptr(s, e.left, @mp)
+    if mp.success != 1
+        return 0
+    let idx: i32 = emit_expr(s, e.right)
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = getelementptr ")
+    emit_array_shape_llvm(s, f.array_shape, 0)
+    emit_str(s, c", ptr ")
+    emit_reg(s, mp.reg)
+    emit_str(s, c", i64 0, i64 ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    *out_shape = f.array_shape
+    r
+
 # Lower `for x in iter { body }` (no `..`) — the iterable form.
 # Supports the shapes ritz1 can express today:
 #   • a local `[N]T` (TYPE_ARRAY), walked in place
@@ -3263,6 +3430,9 @@ fn member_reached_through_call(e: *Expr) -> i32
 #   • an array field, walked in place at its address (AGAST #2387)
 #   • what a `*[N]T` / `@[N]T` / `@&[N]T` local points at, as `p` or `*p`, and a
 #     row `m[i]` of a `[N][M]T`, walked in place (AGAST #2410)
+#   • `*x` for a call, field or global `x` of type `*[N]T`, a row `mkp().m[i]` of
+#     what a `*S` call returns, a field `b.f` read through a Box, and a header
+#     `vv[i]` in a Vec's buffer: places, walked in place (AGAST #2426)
 #   • a literal, walked in a slot of its own: nothing else can reach it
 #   • a `[N][M]T`, whose binding is each row, a copy as an element is
 #   • a Vec, a Span or a StrView, through its header (emit_for_header)
@@ -3363,7 +3533,11 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         else if arr_ident.kind == EXPR_MEMBER
             # `@mk().a` has no address: ritz0 says "Cannot get address of: Call".
             # Refused before the member is reached, which would run the call.
-            if via_addr == 0 or member_reached_through_call(arr_ident) == 0
+            # AGAST #2426: `b.f` reads through a Box; `@b.f` doesn't, as in ritz0.
+            var boxed: i32 = 0
+            if via_addr == 0
+                boxed = emit_for_box_field(s, arr_ident, @mr)
+            if boxed == 0 and (via_addr == 0 or member_reached_through_call(arr_ident) == 0)
                 emit_member_ptr(s, arr_ident, @mr)
             if mr.success == 1 and mr.field.field_type == TYPE_ARRAY
                 let fld: *StructField = mr.field
@@ -3377,12 +3551,19 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 elem_name = fld.array_elem_type_name
                 elem_name_len = fld.array_elem_type_name_len
                 bind_pointee = elem_recorded_pointee(s, elem_type, fld.array_elem_pointee, elem_name, elem_name_len, @bind_name, @bind_name_len)
-        else if iter.kind == EXPR_UNARY and iter.op == OP_DEREF and iter.operand != null and iter.operand.kind == EXPR_IDENT
+        else if iter.kind == EXPR_UNARY and iter.op == OP_DEREF and iter.operand != null
             # AGAST #2410: `*p` is the array `p` points at, not a copy of it.
-            let ap: *LocalVar = array_ptr_named(s, iter.operand.ident_ptr, iter.operand.ident_len)
+            var ap: *LocalVar = null
+            if iter.operand.kind == EXPR_IDENT
+                ap = array_ptr_named(s, iter.operand.ident_ptr, iter.operand.ident_len)
             if ap != null
                 data_reg = for_array_ptr(s, ap, @elem_type, @arr_size, @elem_name, @elem_name_len, @bind_pointee, @bind_name, @bind_name_len)
                 iter_kind = 1
+            else
+                # AGAST #2426: and `*mkp()`, `*h.p`, `*gp`, where they point.
+                data_reg = emit_for_deref_array(s, iter.operand, @elem_type, @arr_size, @elem_name, @elem_name_len, @bind_pointee, @bind_name, @bind_name_len)
+                if data_reg != 0
+                    iter_kind = 1
         else if iter.kind == EXPR_INDEX
             # AGAST #2410: a row `m[i]` of a `[N][M]T`, where it is.
             let sh: *ArrayShape = nd_index_shape(s, iter, @nd_depth)
@@ -3392,6 +3573,14 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     nd_shape = sh
                     iter_kind = 1
                     data_reg = ndp.reg
+            else if sh == null
+                # AGAST #2426: `mkp().m[i]`, a row of what a call points at.
+                var rsh: *ArrayShape = null
+                data_reg = emit_for_row_through_call(s, iter, @rsh)
+                if data_reg != 0
+                    nd_shape = rsh
+                    nd_depth = 1
+                    iter_kind = 1
         else if iter.kind == EXPR_ARRAY_LIT
             # AGAST #2410: a literal is an rvalue: a slot of its own.
             data_reg = emit_for_literal(s, iter, @elem_type, @arr_size, @elem_name, @elem_name_len)

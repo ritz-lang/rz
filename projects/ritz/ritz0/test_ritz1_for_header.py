@@ -555,18 +555,17 @@ PUSHES = {
               + _body(_TRIPS.format(it="*p", place="v"))),
     "array_element": (GVEC + MAIN + FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"
                       + _body(_TRIPS.format(it="vs[1]", place="vs[1]"))),
-}
-# ritz1 refuses each of these (#2426), so it can't get them wrong.
-PUSHES_ON_RITZ0 = {
+    # AGAST #2426: a place reached through a call, a Vec or a Box.
     "vec_element": (GVEC + MAIN + FILL_V + "    var vv: Vec<Vec<i32>> = vec_new<Vec<i32>>()\n"
                     "    vv.push(v)\n" + _body(_TRIPS_AT.format(it="vv[0]", place="vv[0]"))),
     "field_of_a_pointer_call": (GVEC + VH + "var gh: VH\n\nfn mkp() -> *VH\n    return @gh\n\n"
                                 + MAIN + _GH_FILL + _body(_TRIPS_AT.format(it="mkp().v", place="gh.v"))),
     "deref_of_a_call": (GVEC + "var g: Vec<i32>\n\nfn mkp() -> *Vec<i32>\n    return @g\n\n" + MAIN
                         + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="*mkp()", place="g"))),
+    "field_behind_a_box": (GVEC + "struct Box<T>\n    ptr: *T\n\n" + VH + MAIN + FILL_H
+                           + "    var b: Box<VH>\n    b.ptr = @h\n"
+                           + _body(_TRIPS.format(it="b.v", place="h.v"))),
 }
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(PUSHES))
@@ -574,10 +573,22 @@ def test_a_push_in_the_body_is_seen(run_with, compiler, name):
     assert run_with(compiler, name, PUSHES[name]) == 6
 
 
+# AGAST #2426: `vv[i]`'s index, and the call `*mkp()` derefs, run once, before
+# the loop.  The trip count, or 0 when either ran other than once.
+_ONCE = "var calls: i32 = 0\n\nfn at(i: i64) -> i64\n    calls = calls + 1\n    return i\n\n"
+_ONCE_TRIPS = "var n: i32 = 0\nfor x in {it}\n    n = n + 1\nif calls != 1\n    return 0\nreturn n\n"
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(PUSHES_ON_RITZ0))
-def test_ritz0_a_push_in_the_body_is_seen(run_with, name):
-    assert run_with("ritz0", name, PUSHES_ON_RITZ0[name]) == 6
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name,program", [
+    ("vec_element", GVEC + _ONCE + MAIN + FILL_V + "    var vv: Vec<Vec<i32>> = vec_new<Vec<i32>>()\n"
+     "    vv.push(vec_new<i32>())\n    vv.push(v)\n" + _body(_ONCE_TRIPS.format(it="vv[at(1)]"))),
+    ("deref_of_a_call", GVEC + _ONCE + "var g: Vec<i32>\n\nfn mkp() -> *Vec<i32>\n    at(0)\n    return @g\n\n"
+     + MAIN + _GLOBAL_FILL + _body(_ONCE_TRIPS.format(it="*mkp()"))),
+], ids=["vec_element", "deref_of_a_call"])
+def test_what_names_the_header_runs_once(run_with, compiler, name, program):
+    assert run_with(compiler, name, program) == 3
 
 
 # An rvalue's header is its own: `g` growing is no write to it.  The buffer is

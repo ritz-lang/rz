@@ -307,6 +307,12 @@ def _writes_in(sig: str, it: str, call: str, pre: str = _H3, fill: str = _FILL3)
             + f"    return {call}\n")
 
 
+_POINTER_FN = "fn mkp() -> *H\n    return @gh\n\n"
+_GA = "var ga: [3]i32\n\n"
+_GR = "struct R\n    m: [2][3]i32\n\nvar gr: R\n\nfn mkp() -> *R\n    return @gr\n\n"
+_BOX = "struct Box<T>\n    ptr: *T\n\n"
+
+
 # #2387.  1 + 2 + 50 where the loop walks the array, 1 + 2 + 4 where it walks a
 # copy of it.
 LIVE = {
@@ -356,12 +362,7 @@ LIVE = {
                             + "    var a: [3]i32 = [1, 2, 4]\n    return f(@a, @a[2])\n"),
     "mut_reference_to_an_array": ("fn f(a: @&[3]i32) -> i32\n" + _WRITES.format(it="a", place="a")
                                   + "\n" + MAIN + "    var a: [3]i32 = [1, 2, 4]\n    return f(@&a)\n"),
-}
-
-
-# ritz0 alone: ritz1 refuses each of these, so it can't get them wrong (#2426).
-_POINTER_FN = "fn mkp() -> *H\n    return @gh\n\n"
-LIVE_ON_RITZ0 = {
+    # AGAST #2426: a place reached through a call, a cast or a Box.
     "field_of_a_pointer_call": (_GH + _POINTER_FN + MAIN + _FILL_GH
                                 + _WRITES.format(it="mkp().a", place="gh.a")),
     "field_of_a_pointer_method": (_GH + "struct K\n    n: i32\n\nimpl K\n"
@@ -373,13 +374,16 @@ LIVE_ON_RITZ0 = {
                                         + _WRITES.format(it="mkp<i32>(1).a", place="gh.a")),
     "field_of_a_cast": (_H3 + MAIN + _FILL3 + "    var q: *u8 = @h as *u8\n"
                         + _WRITES.format(it="(q as *H).a", place="h.a")),
-    "deref_of_a_call": ("var ga: [3]i32\n\nfn mkp() -> *[3]i32\n    return @ga\n\n" + MAIN
+    "deref_of_a_call": (_GA + "fn mkp() -> *[3]i32\n    return @ga\n\n" + MAIN
                         + _fill("ga", _SEED) + _WRITES.format(it="*mkp()", place="ga")),
-    "row_of_a_pointer_call": ("struct R\n    m: [2][3]i32\n\nvar gr: R\n\n"
-                              "fn mkp() -> *R\n    return @gr\n\n" + MAIN + _fill("gr.m[1]", _SEED)
+    "deref_of_a_global_pointer": (_GA + "var gp: *[3]i32 = null\n\n" + MAIN + _fill("ga", _SEED)
+                                  + "    gp = @ga\n" + _WRITES.format(it="*gp", place="ga")),
+    "row_of_a_pointer_call": (_GR + MAIN + _fill("gr.m[1]", _SEED)
                               + _WRITES.format(it="mkp().m[1]", place="gr.m[1]")),
     "tuple_element": (MAIN + "    var p: (i32, [3]i32) = (0, [1, 2, 4])\n"
                       + _WRITES.format(it="p.1", place="p.1")),
+    "field_behind_a_box": (_BOX + _H3 + MAIN + _FILL3 + "    var b: Box<H>\n    b.ptr = @h\n"
+                           + _WRITES.format(it="b.a", place="h.a")),
 }
 
 
@@ -390,10 +394,32 @@ def test_writes_in_the_body(run_with, compiler, name):
     assert run_with(compiler, name, LIVE[name]) == 53
 
 
+# AGAST #2426: the call a place is reached through runs once, before the loop.
+# 7 + 8 + 9, or 0 when it ran other than once.
+_ONCE = "var calls: i32 = 0\n\n"
+_ONCE_SUM = ("    var t: i32 = 0\n    for v in {it}\n        t = t + v\n"
+             "    if calls != 1\n        return 0\n    return t\n")
+ONCE = {
+    "deref_of_a_call": (_ONCE + _GA + "fn mkp() -> *[3]i32\n    calls = calls + 1\n    return @ga\n\n"
+                        + MAIN + _fill("ga", V) + _ONCE_SUM.format(it="*mkp()")),
+    "row_of_a_pointer_call": (_ONCE + "struct R\n    m: [2][3]i32\n\nvar gr: R\n\n"
+                              "fn mkp() -> *R\n    calls = calls + 1\n    return @gr\n\n" + MAIN
+                              + _fill("gr.m[1]", V) + _ONCE_SUM.format(it="mkp().m[1]")),
+    "row_of_a_pointer_method": (_ONCE + "struct R\n    m: [2][3]i32\n\nvar gr: R\n\nstruct K\n    n: i32\n\n"
+                                "impl K\n    fn p(self: @K) -> *R\n        calls = calls + 1\n"
+                                "        return @gr\n\n" + MAIN + "    var k: K\n" + _fill("gr.m[1]", V)
+                                + _ONCE_SUM.format(it="k.p().m[1]")),
+    "row_index": (_ONCE + "struct R\n    m: [2][3]i32\n\nfn mkp(r: *R) -> *R\n    return r\n\n"
+                  "fn one() -> i64\n    calls = calls + 1\n    return 1\n\n" + MAIN
+                  + "    var r: R\n" + _fill("r.m[1]", V) + _ONCE_SUM.format(it="mkp(@r).m[one()]")),
+}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(LIVE_ON_RITZ0))
-def test_ritz0_writes_in_the_body(run_with, name):
-    assert run_with("ritz0", name, LIVE_ON_RITZ0[name]) == 53
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ONCE))
+def test_a_call_on_the_way_runs_once(run_with, compiler, name):
+    assert run_with(compiler, name, ONCE[name]) == 24
 
 
 # AGAST #2410: each was a located error on ritz1.  4, from 1 and 3.
@@ -475,7 +501,6 @@ def test_ritz0_a_third_level_stays_refused(compile_with):
 
 # `@` and a store stay as far as they went: only a `for`'s read goes further.  Each
 # of these is what ritz0 raised before a `for` was live.
-_BOX = "struct Box<T>\n    ptr: *T\n\n"
 _TUPLE_PTR = "fn f(p: *(i32, [3]i32)) -> i32\n"
 NO_FURTHER = {
     "store_through_two_levels": (_H3 + "fn f(p: **H) -> i32\n    var t: i32 = 0\n    for v in p.a\n"
@@ -509,15 +534,6 @@ def test_ritz0_a_tuple_behind_a_pointer_is_live(run_with):
     assert run_with("ritz0", "tuple_pointer", program) == 53
 
 
-# A Box's fields read through it, and what it holds is on the heap.  ritz1 has no
-# implicit deref of a Box (#2426).
-@pytest.mark.integration
-def test_ritz0_a_field_behind_a_box_is_live(run_with):
-    program = (_BOX + _H3 + MAIN + _FILL3 + "    var b: Box<H>\n    b.ptr = @h\n"
-               + _WRITES.format(it="b.a", place="h.a"))
-    assert run_with("ritz0", "box", program) == 53
-
-
 # A Box's own field is its own, whatever the inner type has of that name.  `b.ptr`
 # is the pointer to the header, so the loop walks `s`: 1 + 2.
 @pytest.mark.integration
@@ -527,6 +543,20 @@ def test_ritz0_a_boxs_own_field_comes_first(run_with):
                "    var b: Box<V>\n    b.ptr = @s\n    var t: i32 = 0\n    for x in b.ptr\n"
                "        t = t + x\n    return t\n")
     assert run_with("ritz0", "box_own", program) == 3
+
+
+# AGAST #2426: and on ritz1, which reads `b.a` through a Box only in a `for`.  `b.ptr`
+# is the Box's own `*H`, which no `for` walks, not `H`'s array `ptr`.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+def test_a_boxs_own_field_is_not_the_inner_one(compile_with, compiler):
+    program = (_BOX + "struct H\n    k: i64\n    ptr: [3]i32\n\n" + MAIN + "    var h: H\n"
+               "    var b: Box<H>\n    b.ptr = @h\n    var t: i32 = 0\n    for x in b.ptr\n"
+               "        t = t + x\n    return t\n")
+    comp, ll, _ = compile_with(compiler, "box_own_first", program)
+    assert comp.returncode != 0
+    assert not ll.exists()
+    assert "this `for` iterable is not supported" in comp.stdout + comp.stderr
 
 
 # Whoever writes.  What the loop walks is the array, not a name for it.
