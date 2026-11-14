@@ -667,6 +667,23 @@ pub fn main() -> i32
     return f(a) as i32
 """,
     # A local can't take a global's name (AGAST #2407): test_local_takes_module_name.py.
+    # AGAST #2517: a 1-D row of an N-D array is a whole-array source.
+    "aoa_row_arg": """\
+fn g(a: [4]i32) -> i32
+    return a[3]
+
+pub fn main() -> i32
+    var m: [2][4]i32
+    m[1][3] = 3
+    return g(m[1])
+""",
+    "aoa_row_read": """\
+pub fn main() -> i32
+    var m: [2][4]i32
+    m[1][3] = 3
+    var r: [4]i32 = m[1]
+    return r[3]
+""",
 }
 
 # Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
@@ -975,22 +992,6 @@ pub fn main() -> i32
 }
 
 ROW_GAPS = {
-    "aoa_row_arg": """\
-fn g(a: [4]i32) -> i32
-    return a[3]
-
-pub fn main() -> i32
-    var m: [2][4]i32
-    m[1][3] = 3
-    return g(m[1])
-""",
-    "aoa_row_read": """\
-pub fn main() -> i32
-    var m: [2][4]i32
-    m[1][3] = 3
-    var r: [4]i32 = m[1]
-    return r[3]
-""",
     "aoa_row_store": """\
 pub fn main() -> i32
     var m: [2][4]i32

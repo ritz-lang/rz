@@ -12,9 +12,10 @@ it there, as if a local held it, and evaluates the call once. A store or `@`
 into a call's value still isn't a place (#2518 wants a located refusal).
 
 ritz1 and ritz1_selfhosted read an element of a by-value call's field rows, and
-walk a row with `for` (#2410).  They refuse a whole row into a `let`, and, through a call
-returning `*R`, all but a one-dimensional row's element (#2517): pinned below as
-refusals, so a change there shows up.
+walk a row with `for` (#2410).  AGAST #2517: they also copy a whole row into a
+`let` (`let row: [3]i32 = mk().m[1]`), from any N-D array a row of which they
+can address, and read any field through a call returning `*R`, which is the
+struct it points at, not a copy.
 
 Each program returns 0, or the number of the first check that failed.
 """
@@ -165,21 +166,31 @@ RUNS["generic_body_twice"] = PRELUDE.replace(
 
 # AGAST #2410: a `for` over a row walks it where it is, here in the call's temporary.
 RUNS.update({f"{root}_for": _prog(_walk(call)) for root, call in BY_VALUE.items()})
-# ritz0 runs these; ritz1 refuses them (#2517).
-RITZ0_ONLY = {f"{root}_whole_row": _prog(_reads(call)["whole_row"])
-              for root, call in BY_VALUE.items()}
-# A one-dimensional field row through `*R` reads on ritz1 since #2879 made a
-# `*S` call's field a place; the rest of #2517 is still refused.
-POINTER_RUNS = ("row_elem", "call_index")
+# AGAST #2517: a whole row into a `let`, from each root.
+RUNS.update({f"{root}_whole_row": _prog(_reads(call)["whole_row"])
+             for root, call in BY_VALUE.items()})
+# Through a call returning `*R`: every read, and the row a `for` walks (#2426).
 RUNS.update({f"pointer_call_{shape}": _prog(body)
-             for shape, body in _reads("mkp()").items() if shape in POINTER_RUNS})
-RITZ0_ONLY.update({f"pointer_call_{shape}": _prog(body)
-                   for shape, body in _reads("mkp()").items() if shape not in POINTER_RUNS})
-# AGAST #2426: a `for` walks a row of a `*R` call's field where it is.
+             for shape, body in _reads("mkp()").items()})
 RUNS["pointer_call_for"] = _prog(_walk("mkp()"))
 # A `*R` result is the struct it points at, not a copy: a write shows.
-RITZ0_ONLY["pointer_call_is_live"] = _prog(
+RUNS["pointer_call_is_live"] = _prog(
     "gr.m[1][2] = 60\nif mkp().m[1][2] != 60\n    return 1")
+# A scalar field through `*R`, each side of the arrays: the offsets are right.
+RUNS["pointer_call_scalar"] = _prog(
+    "if mkp().lo != 77\n    return 1\nif mkp().hi != 88\n    return 2").replace(
+    "    if calls != 1\n", "    if calls != 2\n", 1)
+# The same rule holds for a row of any N-D array: a local, a global's field,
+# and the last row of a rank-3 field.
+RUNS.update({f"{name}_whole_row": _prog(body) for name, body in {
+    "local": "var g: [2][3]i32\ng[1][0] = 4\ng[1][2] = 6\nlet row: [3]i32 = g[1]\nif row[0] != 4\n    return 1\nif row[2] != 6\n    return 2\ncalls = 1",
+    "global_field": "let row: [3]i32 = gr.m[1]\nif row[0] != 4\n    return 1\nif row[2] != 6\n    return 2\ncalls = 1",
+    "rank3_call": "let row: [2]i32 = mk().c[1][1]\nif row[0] != 50\n    return 1\nif row[1] != 51\n    return 2",
+}.items()})
+
+# A row of the wrong length is still refused, as ritz0 refuses it.
+REFUSED = {"call_row_wrong_length": _prog("let row: [2]i32 = mk().m[1]\nif row[0] != 4\n    return 1")}
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
@@ -189,17 +200,10 @@ def test_a_row_of_a_calls_value_reads(run_with, compiler, name):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY))
-def test_ritz0_reads_it(run_with, name):
-    assert run_with("ritz0", name, RITZ0_ONLY[name]) == 0
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY))
-def test_ritz1_refuses_it(compile_with, compiler, name):
-    """#2517: fail closed, no IR. Flip these to runs when it lands."""
-    comp, ll, _ = compile_with(compiler, name, RITZ0_ONLY[name])
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(REFUSED))
+def test_a_row_that_does_not_fit_is_refused(compile_with, compiler, name):
+    """Fail closed, no IR, no traceback."""
+    comp, ll, _ = compile_with(compiler, name, REFUSED[name])
     assert comp.returncode != 0 and not ll.exists(), comp.stdout + comp.stderr
     assert "Traceback" not in comp.stderr
-
