@@ -345,21 +345,29 @@ fn bind_byval_param(s: *EmitterState, param: *Param) -> i32
 # AGAST #2287: bind a by-value `[N]T` param (`[N x T] %a.arg`, as in ritz0) to
 # a slot of its own, registered as an array local: it is the callee's copy, and
 # `a[i]`, `a[i].f`, `h.a = a` and `g(a)` read it as they read any local array.
+# AGAST #2306: a large one arrives `ptr byval([N x T])`, which already IS the
+# callee's copy: a no-op GEP names it as a `%.N` slot, as bind_byval_param does,
+# with no first-class `store [N x T]`.
 fn bind_array_param(s: *EmitterState, param: *Param) -> i32
     if param.param_type != TYPE_ARRAY
         return 0
     let slot: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, slot)
-    emit_str(s, c" = alloca ")
-    emit_param_llvm_type(s, param)
-    emit_str(s, c"\n  store ")
-    emit_param_llvm_type(s, param)
-    emit_str(s, c" %")
-    emit_name(s, param.name, param.name_len)
-    emit_str(s, c".arg, ptr ")
-    emit_reg(s, slot)
-    emit_str(s, c"\n")
+    if array_param_uses_byval(s, param) == 1
+        emit_str(s, c" = getelementptr i8, ptr %")
+        emit_name(s, param.name, param.name_len)
+        emit_str(s, c".arg, i64 0  ; #2306 byval array param\n")
+    else
+        emit_str(s, c" = alloca ")
+        emit_array_value_llvm_type(s, param)
+        emit_str(s, c"\n  store ")
+        emit_array_value_llvm_type(s, param)
+        emit_str(s, c" %")
+        emit_name(s, param.name, param.name_len)
+        emit_str(s, c".arg, ptr ")
+        emit_reg(s, slot)
+        emit_str(s, c"\n")
     add_local_full(s, param.name, param.name_len, slot, TYPE_ARRAY, param.param_type_name, param.param_type_name_len, TYPE_I64, param.param_array_size, param.param_array_elem_type)
     let arr: *LocalVar = find_local_struct_name(s, param.name, param.name_len)
     arr.array_elem_pointee = param.param_array_elem_pointee   # AGAST #2343
@@ -810,6 +818,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         emit_sret_attr(s, f.return_type_name, f.return_type_name_len)
         emit_str(s, c"%ret.sret")
         first2 = 0
+    if fn_sret_array(s, f) != null
+        emit_sret_array_attr(s, fn_sret_array(s, f))   # AGAST #3181
+        emit_str(s, c"%ret.sret")
+        first2 = 0
     while param2 != null
         if first2 == 0
             emit_str(s, c", ")
@@ -1155,6 +1167,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     var first: i32 = 1
     if s.ret_sret == 1
         emit_sret_attr(s, method.return_type_name, method.return_type_name_len)
+        emit_str(s, c"%ret.sret")
+        first = 0
+    if fn_sret_array(s, method) != null
+        emit_sret_array_attr(s, fn_sret_array(s, method))   # AGAST #3181
         emit_str(s, c"%ret.sret")
         first = 0
     while param != null
@@ -1821,6 +1837,11 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: *u8, name_len
     if sret == 1
         emit_str(s, c"ptr sret(%")
         emit_name(s, f.return_type_name, f.return_type_name_len)
+        emit_str(s, c")")
+        first = 0
+    if fn_sret_array(s, f) != null
+        emit_str(s, c"ptr sret(")   # AGAST #3181
+        emit_array_value_llvm_type(s, fn_sret_array(s, f))
         emit_str(s, c")")
         first = 0
     var p: *Param = f.params

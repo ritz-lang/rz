@@ -3246,14 +3246,115 @@ fn emit_local_array_llvm_type(s: *EmitterState, size: i32, et: i32, name: *u8, n
         emit_str(s, local_array_elem_llvm(et))
     emit_str(s, c"]")
 
+# AGAST #2306 / #3181 — large by-value ARRAYS are `ptr byval` / `ptr sret`.
+#
+# #2287 / #2302 made a by-value `[N]T` param and a `-> [N]T` return a
+# first-class `[N x T]`, which LLVM splits into one scalar per element: at
+# N = 16384 u8 clang -O2 hangs, and at 65536 -O0 crashes.  As #1739 / #1730
+# did for large structs, an array of at least SRET_MIN_BYTES is passed
+# `ptr byval([N x T]) align A` and returned through `ptr sret([N x T])`, the
+# same ABI ritz0 emits (both compilers changed together).  A is the
+# ELEMENT's natural alignment, not 8: a byval `align` also promises that the
+# pointer the caller passes is that aligned, and a `[N]u8` local is only
+# 1-aligned.  x86-64 SysV rounds a byval stack slot up to 8 anyway.
+#
+# The `[N]T` is described by a Param: the param itself, or ret_array_of(f)
+# for a return.  Below the threshold nothing changes.
+
+# The byte size of the `[N]T` that `p` holds, with its alignment in *align.
+fn array_param_size_align(s: *EmitterState, p: *Param, align: *i64) -> i64
+    *align = 8
+    if p == null or p.param_type != TYPE_ARRAY
+        return 0
+    let es: i64 = elem_size_align(s, p.param_array_elem_type, p.param_type_name, p.param_type_name_len, align)
+    es * (p.param_array_size as i64)
+
+# 1 when the `[N]T` `p` holds is passed byval / returned sret (AGAST #2306).
+fn array_param_uses_byval(s: *EmitterState, p: *Param) -> i32
+    var align: i64 = 8
+    if array_param_size_align(s, p, @align) < SRET_MIN_BYTES
+        return 0
+    1
+
+# The `[N x T]` value type of the array `p` holds (its allocas and loads).
+fn emit_array_value_llvm_type(s: *EmitterState, p: *Param)
+    emit_local_array_llvm_type(s, p.param_array_size, p.param_array_elem_type, p.param_type_name, p.param_type_name_len)
+
+# `ptr byval([N x T]) align A`, A the element's alignment (AGAST #2306).
+fn emit_byval_array_attr(s: *EmitterState, p: *Param)
+    var align: i64 = 8
+    array_param_size_align(s, p, @align)
+    emit_str(s, c"ptr byval(")
+    emit_array_value_llvm_type(s, p)
+    emit_str(s, c") align ")
+    emit_int(s, align)
+
+# `i64 sizeof([N x T])` as a constant expression, as emit_sret_size spells it.
+fn emit_array_sret_size(s: *EmitterState, p: *Param)
+    emit_str(s, c"i64 ptrtoint (ptr getelementptr (")
+    emit_array_value_llvm_type(s, p)
+    emit_str(s, c", ptr null, i32 1) to i64)")
+
+# `ptr sret([N x T]) ` (AGAST #3181).
+fn emit_sret_array_attr(s: *EmitterState, ra: *Param)
+    emit_str(s, c"ptr sret(")
+    emit_array_value_llvm_type(s, ra)
+    emit_str(s, c") ")
+
+# The `-> [N]T` of `f` when it is returned through sret, or null (AGAST #3181).
+fn fn_sret_array(s: *EmitterState, f: *FnDef) -> *Param
+    let ra: *Param = ret_array_of(f)
+    if ra == null or array_param_uses_byval(s, ra) == 0
+        return null
+    ra
+
+# Caller side of a `-> [N]T` sret call: the fresh `[N x T]` slot it writes,
+# which is also the call's value (a `ptr`; emit_call_array_store copies it).
+fn emit_sret_array_call_slot(s: *EmitterState, ra: *Param) -> i32
+    let slot: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, slot)
+    emit_str(s, c" = alloca ")
+    emit_array_value_llvm_type(s, ra)
+    emit_str(s, c"  ; #3181 sret array\n")
+    slot
+
+# A call's sret slot, when callee `f` returns `[N]T` through one (AGAST #3181);
+# `slot` (a struct's, or 0) otherwise.  Each call site keeps its struct path.
+fn emit_call_sret_array_slot(s: *EmitterState, f: *FnDef, slot: i32) -> i32
+    let ra: *Param = fn_sret_array(s, f)
+    if ra == null
+        return slot
+    emit_sret_array_call_slot(s, ra)
+
+# The `ptr sret(...)` an sret call passes: `[N x T]` or the struct `name`.
+fn emit_call_sret_attr(s: *EmitterState, f: *FnDef, name: *u8, len: i32)
+    let ra: *Param = fn_sret_array(s, f)
+    if ra != null
+        emit_sret_array_attr(s, ra)
+        return
+    emit_sret_attr(s, name, len)
+
+# After an sret call: a struct is loaded into `result` (emit_sret_call_result);
+# an array's value is its slot, which emit_call_array_store copies from.
+fn emit_call_sret_result(s: *EmitterState, f: *FnDef, result: i32, slot: i32, name: *u8, len: i32) -> i32
+    if fn_sret_array(s, f) != null
+        return slot
+    emit_sret_call_result(s, result, slot, name, len)
+    result
+
 # The LLVM type of param `p` in a signature or call argument list.  AGAST #2287:
-# a by-value `[N]T` is a first-class `[N x T]`, as ritz0 emits it.
+# a by-value `[N]T` is a first-class `[N x T]`, as ritz0 emits it; a large one
+# is `ptr byval` (AGAST #2306).
 fn emit_param_llvm_type(s: *EmitterState, p: *Param)
     if param_uses_byval(s, p) == 1
         emit_byval_attr(s, p.param_type_name, p.param_type_name_len)
         return
     if p.param_type == TYPE_ARRAY
-        emit_local_array_llvm_type(s, p.param_array_size, p.param_array_elem_type, p.param_type_name, p.param_type_name_len)
+        if array_param_uses_byval(s, p) == 1
+            emit_byval_array_attr(s, p)
+            return
+        emit_array_value_llvm_type(s, p)
         return
     emit_llvm_type_struct(s, p.param_type, p.param_type_name, p.param_type_name_len)
 
@@ -3264,9 +3365,13 @@ fn ret_array_of(f: *FnDef) -> *Param
     return f.ret_array_param
 
 # The non-sret return type of `f` in a definition, declare or call: a `-> [N]T`
-# is a first-class `[N x T]`, as ritz0 emits it (AGAST #2302).
+# is a first-class `[N x T]`, as ritz0 emits it (AGAST #2302), and `void` when
+# large: it then comes back through `ptr sret([N x T])` (AGAST #3181).
 fn emit_fn_ret_llvm_type(s: *EmitterState, f: *FnDef)
     let ra: *Param = ret_array_of(f)
+    if ra != null and array_param_uses_byval(s, ra) == 1
+        emit_str(s, c"void")
+        return
     if ra != null
         emit_local_array_llvm_type(s, ra.param_array_size, ra.param_array_elem_type, ra.param_type_name, ra.param_type_name_len)
         return

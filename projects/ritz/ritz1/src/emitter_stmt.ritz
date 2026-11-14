@@ -4583,11 +4583,15 @@ fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
     return emit_global_array_ptr(s, find_global(s, value.ident_ptr, value.ident_len))
 
 # AGAST #2302: store the `[N x T]` that call `value` returns (`ra` is its
-# return as a param) at `dst_ptr`.
+# return as a param) at `dst_ptr`.  AGAST #3181: a large one's call value is
+# the sret slot it wrote (emit_sret_array_call_slot), copied pointer-to-pointer.
 fn emit_call_array_store(s: *EmitterState, value: *Expr, ra: *Param, dst_ptr: i32)
     let cv: i32 = emit_expr(s, value)
+    if array_param_uses_byval(s, ra) == 1
+        emit_local_array_copy(s, ra.param_array_size, ra.param_array_elem_type, ra.param_type_name, ra.param_type_name_len, cv, dst_ptr)
+        return
     emit_str(s, c"  store ")
-    emit_param_llvm_type(s, ra)
+    emit_array_value_llvm_type(s, ra)
     emit_str(s, c" ")
     emit_reg(s, cv)
     emit_str(s, c", ptr ")
@@ -4601,7 +4605,7 @@ fn emit_call_array_temp(s: *EmitterState, value: *Expr, ra: *Param) -> i32
     emit_str(s, c"  ")
     emit_reg(s, tmp)
     emit_str(s, c" = alloca ")
-    emit_param_llvm_type(s, ra)
+    emit_array_value_llvm_type(s, ra)
     emit_str(s, c"  ; #2302 call result\n")
     emit_call_array_store(s, value, ra, tmp)
     tmp
@@ -4695,6 +4699,21 @@ fn emit_array_local_copy_from_field(s: *EmitterState, dst_ptr: i32, dst_size: i3
 # Copy a whole local `[N x T]` from `src_ptr` over `dst_ptr` as one aggregate
 # load + store: every element is read before any is written.
 fn emit_local_array_copy(s: *EmitterState, size: i32, et: i32, name: *u8, name_len: i32, src_ptr: i32, dst_ptr: i32)
+    # AGAST #2306: an array of at least SRET_MIN_BYTES is copied pointer-to-
+    # pointer, as #1732 copies a large struct: clang -O2 splits a first-class
+    # `[N x T]` load/store into one scalar per element and hangs at 64 KB.
+    # The two arrays are distinct or the same, never partially overlapping.
+    var align: i64 = 8
+    if elem_size_align(s, et, name, name_len, @align) * (size as i64) >= SRET_MIN_BYTES
+        emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
+        emit_reg(s, dst_ptr)
+        emit_str(s, c", ptr ")
+        emit_reg(s, src_ptr)
+        emit_str(s, c", i64 ptrtoint (ptr getelementptr (")
+        emit_local_array_llvm_type(s, size, et, name, name_len)
+        emit_str(s, c", ptr null, i32 1) to i64))\n")
+        s.sret_helpers_used = 1
+        return
     let agg: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, agg)

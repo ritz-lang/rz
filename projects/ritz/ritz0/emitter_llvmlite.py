@@ -124,6 +124,56 @@ SRET_MIN_BYTES = 256
 #     that copy), so no first-class `store %T %b.arg` is emitted.
 BYVAL_ALIGN = 8
 
+# AGAST #2306: a large by-value `[N]T` param is `ptr byval([N x T]) align A`
+# too, with A the ELEMENT's natural alignment rather than 8.  A byval `align`
+# also promises that the pointer the caller passes is that aligned, and a
+# `[N]u8` local or global is only 1-aligned.  x86-64 SysV rounds a byval
+# stack slot up to 8 regardless, so A changes no stack layout.  ritz1's
+# emit_byval_array_attr writes the same A.
+
+
+def _abi_size_align(ty: ir.Type) -> tuple:
+    """(alloc size, ABI alignment) of `ty` as LLVM lays it out on x86-64.
+
+    Unlike _type_size_bytes this pads struct fields, so an array of structs
+    is measured as ritz1's elem_size_align measures it: both compilers must
+    agree which arrays cross SRET_MIN_BYTES (AGAST #2306).
+    """
+    if isinstance(ty, ir.IntType):
+        size = max(1, (ty.width + 7) // 8)
+        align = 1
+        while align < size and align < 16:
+            align *= 2
+        return size, align
+    if isinstance(ty, ir.FloatType):
+        return 4, 4
+    if isinstance(ty, ir.DoubleType):
+        return 8, 8
+    if isinstance(ty, ir.PointerType):
+        return 8, 8
+    if isinstance(ty, ir.ArrayType):
+        size, align = _abi_size_align(ty.element)
+        return ty.count * size, align
+    if isinstance(ty, ir.BaseStructType) and ty.elements is not None:
+        packed = getattr(ty, 'packed', False)
+        off, max_align = 0, 1
+        for el in ty.elements:
+            size, align = _abi_size_align(el)
+            if packed:
+                align = 1
+            off = (off + align - 1) // align * align + size
+            max_align = max(max_align, align)
+        return (off + max_align - 1) // max_align * max_align, max_align
+    return 8, 8
+
+
+def _byval_align(ty: ir.Type) -> int:
+    """The `align` of a byval param of `ty`: 8 for a struct (#1739), the
+    element's natural alignment for an array (#2306)."""
+    if isinstance(ty, ir.ArrayType):
+        return _abi_size_align(ty)[1]
+    return BYVAL_ALIGN
+
 # An LLVM parameter list, allowing one level of nested parens for typed
 # attributes such as `sret(%T)`. The regexes over `define`/`declare` lines
 # used `\([^)]*\)`, which stops inside `sret(` (AGAST #1736).
@@ -316,10 +366,10 @@ class _SretAwareBuilder(ir.IRBuilder):
 
     @staticmethod
     def _set_byval_align(call, byval, offset):
-        for i in byval:
+        for i, ty in byval.items():
             attrs = call.arg_attributes.get(i + offset)
             if attrs is not None:
-                attrs.align = BYVAL_ALIGN
+                attrs.align = _byval_align(ty)
 
     def _entry_alloca(self, ty, name):
         em = self._emitter
@@ -2589,6 +2639,9 @@ class LLVMEmitter:
         if hasattr(self, '_memset_fn') and not getattr(self, 'no_runtime', False):
             self._emit_memset_function()
 
+        # AGAST #2306: no dead large-aggregate load reaches clang.
+        self._drop_dead_large_loads()
+
         # Generate IR string
         ir_str = str(self.module)
 
@@ -2604,6 +2657,28 @@ class LLVMEmitter:
         lines = ir_str.split('\n')
         lines.insert(0, '; Ritz compiled module')
         return '\n'.join(lines)
+
+    def _drop_dead_large_loads(self) -> None:
+        """Delete every unused `load %T` of a type at the sret threshold.
+
+        #1732's copy, a byval arg (#1739) and an sret result (#1736) each
+        leave the load they replaced behind, dead, for -O2 to delete.  For a
+        struct that was cheap; a dead `load [65536 x i8]` still cost clang
+        -O2 12 s (0.6 s without it), so they are removed here instead.
+        """
+        for fn in self.module.functions:
+            used = set()
+            for block in fn.blocks:
+                for inst in block.instructions:
+                    for op in inst.operands:
+                        used.add(id(op))
+                    for val, _ in getattr(inst, 'incomings', ()):
+                        used.add(id(val))
+            for block in fn.blocks:
+                block.instructions[:] = [
+                    inst for inst in block.instructions
+                    if not (isinstance(inst, ir.LoadInstr) and id(inst) not in used
+                            and self._sret_struct_type(inst.type) is not None)]
 
     def _add_alignstack_to_all_functions(self, ir_str: str) -> str:
         """Add alignstack(16) and "no-builtins" to ALL function definitions.
@@ -4496,12 +4571,17 @@ class LLVMEmitter:
         """`ret_type` if a function returning it should do so via sret.
 
         Named user structs only, as in ritz1 (#1730): enums and builtin
-        aggregates (StrView, Span, Result/Option) keep their ABI.
+        aggregates (StrView, Span, Result/Option) keep their ABI.  AGAST
+        #2306 / #3181: and a `[N]T` array of at least SRET_MIN_BYTES, which
+        is then also a byval param and copied pointer-to-pointer (#1732).
         """
         if (isinstance(ret_type, ir.IdentifiedStructType)
                 and ret_type.name.startswith('struct.')
                 and ret_type.elements is not None
                 and self._type_size_bytes(ret_type) >= SRET_MIN_BYTES):
+            return ret_type
+        if (isinstance(ret_type, ir.ArrayType)
+                and _abi_size_align(ret_type)[0] >= SRET_MIN_BYTES):
             return ret_type
         return None
 
@@ -4535,9 +4615,9 @@ class LLVMEmitter:
             fn.args[0].name = 'ret.sret'
             self._sret_fns[name] = sret_ty
             lead = 1
-        for i in byval:
+        for i, ty in byval.items():
             fn.args[i + lead].add_attribute('byval')
-            fn.args[i + lead].attributes.align = BYVAL_ALIGN
+            fn.args[i + lead].attributes.align = _byval_align(ty)
         if byval:
             self._byval_fns[name] = byval
         cc = _llvm_callconv(callconv)
