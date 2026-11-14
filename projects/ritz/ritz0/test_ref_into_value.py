@@ -141,11 +141,13 @@ READS = {
     # A reference is a value too, in a slot of its own type.
     "reference_binding": ("fn f(r: {R}) -> i32\n    let q = r\n    q.x\n", 3),
     "reference_field_read": ("fn f(r: {R}) -> i32\n    let n: i32 = (*r).x\n    n\n", 3),
+    # A field of the by-value result, read with no `let` between (#2358).
+    "result_field": ("fn g(r: {R}) -> C\n    return *r\n\nfn f(r: {R}) -> i32\n    return g(r).x\n", 3),
 }
 
 # Each fails on ritz1 with no reference in sight, or only behind a `*C`.
 # `reference_binding` through a `*C` (`let q = r`) closed by #2596, a `*r` arm's
-# i64 phi by #2950 (#2288 fixed a `c:& C` arm).
+# i64 phi by #2950 (#2288 fixed a `c:& C` arm). `result_field` ran by #2358.
 READ_GAPS = {}
 
 MOVE = """\
