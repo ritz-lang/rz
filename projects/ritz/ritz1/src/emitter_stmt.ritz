@@ -2241,6 +2241,36 @@ fn emit_lent_whole_store(s: *EmitterState, stmt: *Stmt, slot: i32) -> i32
         return emit_float_field_store(s, emit_load_ptr(s, slot), pt, fval, stmt.assign_value)
     0
 
+# AGAST #3097: 1 when `*ptr = v` stores through a pointer declared `*i64`: a
+# local, global or struct field (as `p` or as the base of `*(p + i)`), or an
+# inline `q as *i64`.  get_deref_store_type can't say so -- TYPE_I64 doubles
+# as "unknown" in the pointee tables -- and emit_assign then fell back to the
+# RHS's own width: an i8 `x` in `*p = x` was `trunc ... to i8; store i8`,
+# writing the low byte of the i64 only.  Each arm checks the declaration, so
+# TYPE_I64 here means `*i64`, never "unknown".
+fn deref_store_into_declared_i64(s: *EmitterState, ptr_expr: *Expr) -> i32
+    if inline_deref_scalar_pointee(s, ptr_expr) == TYPE_I64
+        return 1
+    var base: *Expr = ptr_expr
+    if base.kind == EXPR_BINARY
+        base = find_base_expr(base)
+    if base.kind == EXPR_MEMBER
+        let fld: *StructField = member_field_def(s, base)
+        if fld != null and fld.field_type == TYPE_PTR and fld.array_elem_type == TYPE_I64
+            return 1
+        return 0
+    if base.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+    if loc != null
+        if loc.var_type == TYPE_PTR and loc.pointee_type == TYPE_I64
+            return 1
+        return 0
+    let glob: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
+    if glob != null and glob.var_type == TYPE_PTR and glob.pointee_type == TYPE_I64
+        return 1
+    0
+
 fn emit_assign(s: *EmitterState, stmt: *Stmt)
     # Check for expression assignment: expr = value
     # When assign_target_len == 0, the target is in if_cond as an expression
@@ -2482,6 +2512,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         var value_type: i32 = TYPE_I64
         var struct_name: *u8 = null
         var struct_name_len: i32 = 0
+        var dst_is_i64: i32 = 0   # AGAST #3097
 
         # Prefer the destination's pointee type when available
         if target_expr.kind == EXPR_IDENT
@@ -2518,6 +2549,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             let dst_type: i32 = get_deref_store_type(s, target_expr.operand)
             if dst_type != TYPE_VOID and dst_type != TYPE_I64 and rhs_is_named_type == 0
                 value_type = dst_type
+            # AGAST #3097: a known `*i64` slot stores all 8 bytes; the RHS's
+            # i64 register is already sext/zext'd by its own signedness.
+            if (dst_type == TYPE_VOID or dst_type == TYPE_I64) and rhs_is_named_type == 0
+                dst_is_i64 = deref_store_into_declared_i64(s, target_expr.operand)
             # get_deref_store_type reports TYPE_STRUCT but not which struct,
             # so recover the name from the operand for the aggregate store.
             # AGAST #1505: resolve it exactly as the `*p` load does, so
@@ -2541,7 +2576,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     struct_name_len = dst_loc2.type_name_len
 
         # Fall back to value's type if destination pointee was unknown (TYPE_I64 default)
-        if value_type == TYPE_I64
+        if value_type == TYPE_I64 and dst_is_i64 == 0
             # Check if value is an identifier - look up its type
             if stmt.assign_value.kind == EXPR_IDENT
                 let local: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident_ptr, stmt.assign_value.ident_len)

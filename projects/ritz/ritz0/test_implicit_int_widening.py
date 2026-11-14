@@ -137,25 +137,117 @@ def _program(body: str, pair: str) -> str:
     return f"{body.format(s=s, t=t, w=w)}\npub fn main() -> i32\n    let x: {s} = {v}\n    f(x)\n"
 
 
-# AGAST #3097: ritz1 stores `*p = x` at the source's width, so an i8 -56
-# reaches only the low byte of the i64 (and reads back as 200).
-_DEREF_STORE_NARROW = pytest.mark.xfail(strict=True, reason="AGAST #3097")
-
-
 def _slot_rows():
     for site in sorted(SITES):
         for pair in ("u8_i64", "i8_i64"):
             for compiler in COMPILERS:
-                marks = ()
-                if site == "deref_store" and pair == "i8_i64" and compiler != "ritz0":
-                    marks = (_DEREF_STORE_NARROW,)
-                yield pytest.param(site, pair, compiler, marks=marks,
-                                   id=f"{site}-{pair}-{compiler}")
+                yield pytest.param(site, pair, compiler, id=f"{site}-{pair}-{compiler}")
 
 
 @pytest.mark.parametrize("site,pair,compiler", list(_slot_rows()))
 def test_every_slot_widens_by_the_source_signedness(tmp_path, compiler, site, pair):
     assert _run(compiler, tmp_path, f"{site}_{pair}", _program(SITES[site], pair)) == 0
+
+
+# AGAST #3097: ritz1 stored `*p = x` (p: *i64) at the SOURCE's width -- `trunc
+# ... to i8; store i8` -- so only the low bytes of the i64 were written.  The
+# slot starts with upper bytes opposite to the correct extension, so a partial
+# store can't pass by luck: 0 under a negative signed source (whose extension
+# is all ones), -1 under an unsigned one (whose extension is all zeros).
+# source type -> (value, the i64 slot's starting value)
+DEREF_STORE_SOURCES = {
+    "i8": ("-56", "0"),
+    "i16": ("-20000", "0"),
+    "i32": ("-2000000000", "0"),
+    "u8": ("200", "-1"),
+    "u16": ("60000", "-1"),
+    "u32": ("4000000000", "-1"),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("src", sorted(DEREF_STORE_SOURCES))
+def test_deref_store_writes_the_whole_i64_pointee(tmp_path, compiler, src):
+    v, start = DEREF_STORE_SOURCES[src]
+    prog = f"""\
+fn f(x: {src}) -> i32
+    var d: i64 = {start}
+    let p: *i64 = @&d
+    *p = x
+    if d != {v}
+        return 1
+    0
+
+pub fn main() -> i32
+    let x: {src} = {v}
+    f(x)
+"""
+    assert _run(compiler, tmp_path, f"deref_whole_{src}", prog) == 0
+
+
+# The other `*i64` destinations of the same store: an offset from a `*i64`
+# local, a `*i64` param, global and struct field, and an inline cast.
+DEREF_STORE_SHAPES = {
+    "cast": """\
+fn f(x: u8) -> i32
+    var d: i64 = -1
+    let q: *u8 = @&d as *u8
+    *(q as *i64) = x
+    if d != 200
+        return 1
+    0
+""",
+    "field": """\
+struct H
+    p: *i64
+
+fn f(x: u8) -> i32
+    var d: i64 = -1
+    let h = H { p: @&d }
+    *h.p = x
+    if d != 200
+        return 1
+    0
+""",
+    "global": """\
+var gd: i64 = -1
+var gp: *i64 = null
+
+fn f(x: u8) -> i32
+    gp = @&gd
+    *gp = x
+    if gd != 200
+        return 1
+    0
+""",
+    "offset": """\
+fn f(x: u8) -> i32
+    var a: [2]i64 = [-1, -1]
+    let p: *i64 = @&a[0]
+    *(p + 1) = x
+    if a[1] != 200
+        return 1
+    0
+""",
+    "param": """\
+fn g(p: *i64, x: u8)
+    *p = x
+
+fn f(x: u8) -> i32
+    var d: i64 = -1
+    g(@&d, x)
+    if d != 200
+        return 1
+    0
+""",
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("shape", sorted(DEREF_STORE_SHAPES))
+def test_deref_store_shapes_write_the_whole_i64(tmp_path, compiler, shape):
+    prog = DEREF_STORE_SHAPES[shape] + "\npub fn main() -> i32\n    let x: u8 = 200\n    f(x)\n"
+    assert _run(compiler, tmp_path, f"deref_shape_{shape}", prog) == 0
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
