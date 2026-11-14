@@ -41,6 +41,7 @@ import batching
 import fast_link
 
 from array_rules import ELEMENT_MISMATCH
+from index_rules import needs_index
 from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
 from test_ref_into_value import COMPILERS, _assert_refused
@@ -3434,3 +3435,78 @@ def test_ritz1_array_referent_must_match_its_slot(ritz1_bin, tmp_path, name):
     assert comp.returncode != 0
     assert not ll.exists()
     assert message in comp.stdout + comp.stderr
+
+
+# AGAST #3132: `*r` through a `r:& *T` param is the T the borrowed pointer points
+# at, a value, so `(*r)[i]` indexes a `C` or an `i32`: §7.8's refusal, at the `[`
+# (`^`).  ritz1 read the `C` as an address (invalid IR) and the `i32` as one (a
+# segfault); ritz0 refused the `C` and crashed on the `i32`.  A plain `*T` param
+# binds the same local in ritz1, so one row each holds that to ritz0 too.
+NOT_INDEXED = {
+    "borrow_ptr_struct_store": ("C", TYPES + """
+fn fill(r:& *C, d: C)
+    (*r)^[1] = d
+
+pub fn main() -> i32
+    var a: [2]C
+    var p: *C = @a[0]
+    fill(@&p, C { x: 3, y: 0 })
+    return a[1].x
+"""),
+    "borrow_ptr_struct_read": ("C", TYPES + """
+fn get(r:& *C) -> i32
+    let c: C = (*r)^[1]
+    return c.x
+
+pub fn main() -> i32
+    var a: [2]C
+    var p: *C = @a[0]
+    return get(@&p)
+"""),
+    "borrow_ptr_scalar_store": ("i32", """\
+fn fill(r:& *i32, d: i32)
+    (*r)^[1] = d
+
+pub fn main() -> i32
+    var a: [2]i32
+    var p: *i32 = @a[0]
+    fill(@&p, 3)
+    return a[1]
+"""),
+    "borrow_ptr_scalar_read": ("i32", """\
+fn get(r:& *i32) -> i32
+    (*r)^[1]
+
+pub fn main() -> i32
+    var a: [2]i32
+    a[1] = 3
+    var p: *i32 = @a[0]
+    return get(@&p)
+"""),
+    "pointer_struct_store": ("C", TYPES + """
+fn fill(p: *C, d: C)
+    (*p)^[1] = d
+
+pub fn main() -> i32
+    var a: [2]C
+    fill(@a[0], C { x: 3, y: 0 })
+    return a[1].x
+"""),
+    "pointer_scalar_read": ("i32", """\
+fn get(p: *i32) -> i32
+    (*p)^[1]
+
+pub fn main() -> i32
+    var a: [2]i32
+    a[1] = 3
+    return get(@a[0])
+"""),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NOT_INDEXED))
+def test_deref_of_a_pointer_to_a_value_is_not_indexed(tmp_path, compiler, name):
+    type_name, program = NOT_INDEXED[name]
+    _assert_refused(compiler, tmp_path, name, program, needs_index(type_name))

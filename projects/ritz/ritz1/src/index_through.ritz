@@ -470,7 +470,9 @@ pub fn index_refused(s: *EmitterState, e: *Expr) -> i32
     if e.left.kind == EXPR_INDEX
         return element_refused(s, e)
     if e.left.kind == EXPR_UNARY and e.left.op == OP_DEREF
-        return deref_value_refused(s, e.left)
+        if deref_value_refused(s, e.left) == 1
+            return 1
+        return deref_pointee_refused(s, e)
     if e.left.kind != EXPR_IDENT
         return 0
     let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
@@ -587,6 +589,41 @@ pub fn deref_value_refused(s: *EmitterState, d: *Expr) -> i32
     if loc.var_type != TYPE_STRUCT and sized_scalar(loc.var_type) == 0
         return 0
     emit_nd_error(s, d.span.line, d.span.col, c"`*x` needs `x` to be a pointer or a reference: this one is a value")
+    1
+
+# AGAST #3132: 1 after reporting `e`, `(*p)[i]` with `p` a `*T` local and T a
+# struct without `Index` or a sized scalar: `*p` is one T, with nothing to index.
+# A `p:& *T` param binds as such a local (param_borrow), so `(*r)[i]` there is the
+# same.  ritz1 took `*p`'s value for the element's address: invalid IR for a
+# struct, a segfault for an i32.  §7.8's words, at the `[`, as ritz0's
+# _struct_index and _index_through say them.  A `*[N]T`, `**T` or `*Vec<T>`
+# isn't this shape (#2330, #2537, #2331), and an i64 `*p` may hold a pointer.
+fn deref_pointee_refused(s: *EmitterState, e: *Expr) -> i32
+    if e.right == null or e.right.kind == EXPR_RANGE
+        return 0
+    let v: *Expr = e.left.operand
+    if v == null or v.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, v.ident_ptr, v.ident_len)
+    if loc == null or loc.var_type != TYPE_PTR or loc.array_view != 0
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if loc.pointee_type == TYPE_STRUCT
+        name = loc.type_name
+        len = loc.type_name_len
+        if name == null or len == 0 or name_is_indexable(name, len) == 1
+            return 0
+        if si_is_struct(s.module, name, len) == 0 or (si_traits(s.module, name, len) & SI_INDEX) != 0
+            return 0
+    else
+        if sized_scalar(loc.pointee_type) == 0
+            return 0
+        name = primitive_name_from_type(loc.pointee_type)
+        if name == null
+            return 0
+        len = strlen(name) as i32
+    emit_nd_error(s, index_bracket_line(e), index_bracket_col(e), si_needs_index_msg(name, len))
     1
 
 # AGAST #2330: 1 after reporting `p[i] = b` with `b` a whole array, when `loc` is the

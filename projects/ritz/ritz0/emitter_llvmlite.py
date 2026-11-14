@@ -8857,6 +8857,15 @@ class LLVMEmitter:
         root = base.operand if deref else base
         if deref:
             self._refuse_deref_of_value(base)
+            # AGAST #3132: `(*p)[i]` with `*p` a scalar, `p: *i32` or `p:& *i32`:
+            # nothing to index, as `n[1]` (#2886).  A struct `*p` was _struct_index's.
+            # The emitter raised a bare ValueError ("Cannot index type: i32").
+            pointee = self._infer_ritz_type(base)
+            if pointee is not None:
+                pointee = resolve_alias_in(pointee, self.type_aliases)
+            if (isinstance(pointee, rast.NamedType) and pointee.name in index_rules.SCALARS
+                    and not isinstance(expr.index, rast.Range)):
+                raise EmitError(index_rules.needs_index(pointee.name), expr.bracket or expr.span)
         # A name, or an element that is itself a Vec: `v[i][j]`, `p[i][j]` (#2442).
         if not isinstance(root, (rast.Ident, rast.Index)):
             return None
