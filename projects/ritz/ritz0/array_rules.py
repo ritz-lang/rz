@@ -24,6 +24,12 @@ NOT_A_POINTER = '`*x` needs `x` to be a pointer or a reference: this one is a va
 ELEMENT_NOT_ARRAY = ('`p[i]` is one element of the array behind `p`, '
                      'not the whole array: `*p = a` stores the array')
 
+# `*a = v` on an `a:& [N]T` param (AGAST #2290, #2972): `*a` reads the array,
+# and `a = v` is how to store it.  ritz1 prints the same words, from
+# emitter_stmt.ritz.  ritz0 refused it only by raising a Python ValueError.
+BORROW_DEREF_STORE = ('cannot store through `*a` of an `a:& [N]T` param '
+                      '(assign to `a`, it is the array)')
+
 # `[v; n]` with n > 1 of a move-only `v` (AGAST #2963): one value copied into n
 # elements, each of which would drop it. ritz1 prints the same words, from
 # ref_check.ritz.

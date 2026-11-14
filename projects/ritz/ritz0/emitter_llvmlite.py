@@ -6255,13 +6255,17 @@ class LLVMEmitter:
                     raise ValueError(f"Cannot index type: {base.type}")
             elif isinstance(stmt.target, rast.UnaryOp) and stmt.target.op == '*':
                 # Assignment to dereferenced pointer: *ptr = val
-                ptr = self._emit_expr(stmt.target.operand)
+                # AGAST #2972: on a `h:& T` borrow of a non-pointer T, `h`
+                # reads as the referent, so `*h` is `h` (the read arm, #2045)
+                # and `*h = v` stores to the caller's T, as `h = v` does.
+                # An `a:& [N]T` is the exception, as on ritz1 (#2290).
+                slot = self._borrow_referent_slot(stmt.target.operand)
+                if slot is not None and isinstance(slot.type.pointee, ir.ArrayType):
+                    raise EmitError(array_rules.BORROW_DEREF_STORE, stmt.target.span)
+                ptr = slot if slot is not None else self._emit_expr(stmt.target.operand)
                 if isinstance(ptr.type, ir.PointerType):
                     val = self._convert_type(val, ptr.type.pointee, stmt.value)
                     self.builder.store(val, ptr)
-                elif self._borrow_referent_slot(stmt.target.operand) is not None:
-                    # `*h = v` on an integer borrow: not a value (#2972).
-                    raise ValueError(f"Cannot dereference non-pointer: {ptr.type}")
                 else:
                     raise EmitError(array_rules.NOT_A_POINTER, stmt.target.span)  # AGAST #2885
             elif isinstance(stmt.target, rast.Field):
