@@ -412,6 +412,9 @@ SHARED_PLACES = {
     "inferred_copy_of_a_param": (INT_WRITER + C, "fn go(r: @C)\n    let q = r\n    w(q.x)\n\n"),
     "inferred_copy_of_a_scalar_param": (INT_WRITER, "fn go(r: @i32)\n    let q = r\n    w(q)\n\n"),
     "inferred_deref_of_a_copied_param": (INT_WRITER, "fn go(r: @i32)\n    let q = r\n    w(*q)\n\n"),
+    "inferred_struct_deref": ("fn w(r:& C)\n    r.x = 3\n\n" + C,
+                              "fn go()\n    var c: C = C { x: 1, y: 0 }\n    let p = @c\n    w(*p)\n\n"),
+    "inferred_element": (INT_WRITER + C, "fn go()\n    var a: [2]C\n    let p = @a[1]\n    w(p.x)\n\n"),
 }
 # An un-annotated `@&` local is an `@&T`, a scalar one too (#2352). All legal under R1.
 INFERRED_MUT = {
@@ -742,3 +745,57 @@ def test_a_borrow_is_a_mutable_borrow_for_the_borrow_rules(tmp_path, compiler, n
 @pytest.mark.parametrize("name", sorted(NOT_ALIASED))
 def test_a_pointer_passed_on_borrows_nothing(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, name, NOT_ALIASED[name]) == 3
+
+
+# AGAST #3079: an un-annotated `let p = @c` / `@&c` of a struct is an `@C` /
+# `@&C`, and `let r = @q` of a `*T` an `@*T`, by its kind: not a `*C` / `**T`
+# with a side flag.  Every use does what ritz0 does: an int is the exit code, a
+# string the error.  Pointer arithmetic on it is ritz0's too: legal, as on a
+# `*C` (R16 refuses an `@C` from a param or a call; #3106 asks LARB), and so is
+# everything on an annotated `let p: *C = @c`.
+CM = C + ("impl C\n    fn get(self: @C) -> i32\n        self.x\n"
+          "    fn set(self: @&C)\n        self.x = 3\n\n"
+          "fn rd(r: @C) -> i32\n    r.x\n\nfn rm(r: @&C)\n    r.x = 3\n\nfn rp(r: *C)\n    r.x = 3\n\n"
+          "pub fn main() -> i32\n    var c: C = C { x: 1, y: 0 }\n")
+PQ = ("enum E\n    A\n    B\n\npub fn main() -> i32\n    var n: i32 = 1\n    var m: i32 = 3\n    var q: *i32 = @n\n"
+      "    var e: E = E.A\n    var qe: *E = @e\n    var a: [2]i32 = [1, 3]\n    var qa: *[2]i32 = @a\n")
+WRITE_SHARED = "cannot write through an `@T`: make it `@&T`"
+NOT_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
+INFERRED_REFS = {
+    "shared_read": (CM + "    let p = @c\n    return p.x + p.get() + rd(p)\n", 3),
+    "shared_write": (CM + "    let p = @c\n    p.x = 3\n    return c.x\n", WRITE_SHARED),
+    "shared_copy_write": (CM + "    let p = @c\n    let q = p\n    q.x = 3\n    return c.x\n", WRITE_SHARED),
+    "shared_element_write": (CM + "    var a: [2]C\n    let p = @a[1]\n    p.x = 3\n    return 0\n", WRITE_SHARED),
+    "shared_method": (CM + "    let p = @c\n    p.set()\n    return c.x\n", NOT_MUT),
+    "shared_into_mut_ref": (CM + "    let p = @c\n    rm(p)\n    return c.x\n", NOT_MUT),
+    "shared_into_raw": (CM + "    let p = @c\n    rp(p)\n    return c.x\n", 3),
+    "shared_arith": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q = p + 1\n    return q.x\n", 3),
+    "mut_write": (CM + "    let p = @&c\n    p.x = 3\n    return c.x\n", 3),
+    "mut_method": (CM + "    let p = @&c\n    let q = p\n    q.set()\n    return c.x\n", 3),
+    "mut_into_mut_ref": (CM + "    let p = @&c\n    rm(p)\n    return c.x\n", 3),
+    "mut_arith": (CM + "    var a: [2]C\n    a[0].x = 3\n    let p = @&a[1]\n    let q = p\n    let r = q - 1\n    return r.x\n", 3),
+    "scalar_arith": ("pub fn main() -> i32\n    var n: i32 = 1\n    let p = @n\n    let q = p + 1\n    return 3\n", 3),
+    # `let r = @q` with `q: *T` is an `@*T`, of a scalar, an enum or an array.
+    "pointer_shared_store": (PQ + "    let r = @q\n    *r = @m\n    return *q\n", WRITE_SHARED),
+    "pointer_shared_copy_store": (PQ + "    let r = @q\n    let r2 = r\n    *r2 = @m\n    return *q\n", WRITE_SHARED),
+    "pointer_shared_inner_store": (PQ + "    let r = @q\n    **r = 3\n    return n\n", 3),
+    "pointer_mut_copy_store": (PQ + "    let r = @&q\n    let r2 = r\n    *r2 = @m\n    return *q\n", 3),
+    "enum_pointer_shared_store": (PQ + "    var f: E = E.B\n    let r = @qe\n    *r = @f\n    return 3\n", WRITE_SHARED),
+    "enum_pointer_inner_store": (PQ + "    let r = @qe\n    **r = E.B\n    return e as i32 + 2\n", 3),
+    "array_pointer_shared_store": (PQ + "    var b: [2]i32 = [3, 3]\n    let r = @qa\n    *r = @b\n    return 0\n", WRITE_SHARED),
+    "array_pointer_mut_store": (PQ + "    var b: [2]i32 = [3, 3]\n    let r = @&qa\n    *r = @b\n    return (*qa)[0]\n", 3),
+    "annotated_raw": (CM + "    let p: *C = @c\n    p.x = 2\n    let q = p + 1\n    rp(p)\n    return c.x\n", 3),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(INFERRED_REFS))
+def test_an_inferred_reference_is_its_kind(tmp_path, compiler, name):
+    src, want = INFERRED_REFS[name]
+    if isinstance(want, int):
+        assert _run(compiler, tmp_path, name, src) == want
+        return
+    got = _error(compiler, tmp_path, name, src)
+    assert want in got, got
+    if compiler != "ritz0":
+        assert got == _error("ritz0", tmp_path, name, src), "located where ritz0 says it"

@@ -469,7 +469,9 @@ fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name: *u8, len: i32)
         return
     let t: i32 = loc.var_type
     let one: bool = (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_ARRAY
-    let two: bool = t == TYPE_PTR_PTR and stmt.var_inner_pointee_type == TYPE_ARRAY
+    # AGAST #3079: an `@*[N]S` / `@&*[N]S` (`let r = @q`) is as deep as a `**[N]S`.
+    let deep: bool = t == TYPE_PTR_PTR or ((t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_PTR)
+    let two: bool = deep and stmt.var_inner_pointee_type == TYPE_ARRAY
     if one or two
         loc.pointee_array_elem_name = name
         loc.pointee_array_elem_name_len = len
@@ -626,20 +628,49 @@ fn infer_ptr_ptr_call_let(s: *EmitterState, stmt: *Stmt, fd: *FnDef) -> i32
     stmt.var_inner_pointee_type = inner + extra * PTR_DEPTH_UNIT
     TYPE_PTR_PTR
 
-# AGAST #2335, #2338: 1 when an un-annotated `let` or `var` holds an `@T`:
-# `let p = @x`, or a copy of one from a local, a field or a call.  Ask before the
-# inference in emit_var_decl rewrites var_type, or `let p: *C = @c` looks like it.
-fn let_holds_shared_ref(s: *EmitterState, stmt: *Stmt) -> i32
-    (let_ref_view(s, stmt) == REF_VIEW_SHARED) as i32
-
-# AGAST #2445: the same for an `@&T`, `let p = @&x`.
-fn let_holds_mut_ref(s: *EmitterState, stmt: *Stmt) -> i32
-    (let_ref_view(s, stmt) == REF_VIEW_MUT) as i32
-
+# AGAST #2335, #2338, #2445: what an un-annotated `let` or `var` holds, as far
+# as a write through it goes: `let p = @x` an `@T`, `@&x` an `@&T`, or a copy of
+# one from a local, a field or a call.  Ask before the inference in
+# emit_var_decl rewrites var_type, or `let p: *C = @c` looks like it.
 fn let_ref_view(s: *EmitterState, stmt: *Stmt) -> i32
     if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
         return REF_VIEW_UNKNOWN
     ref_view(s, stmt.var_init)
+
+# AGAST #3079: 1 when an un-annotated `stmt` copies an address-of: its init is
+# `@x` / `@&x` or names a local that is LocalVar.addr_let.  Ask before the local
+# is in scope (`let p = p`).
+fn addr_let_init(s: *EmitterState, stmt: *Stmt) -> i32
+    let init: *Expr = stmt.var_init
+    if stmt.var_declared_type != TYPE_VOID or init == null
+        return 0
+    if init.kind == EXPR_UNARY and (init.op == OP_ADDR or init.op == OP_ADDR_MUT)
+        return 1
+    if init.kind != EXPR_IDENT
+        return 0
+    let src: *LocalVar = find_local_struct_name(s, init.ident_ptr, init.ident_len)
+    if src == null
+        return 0
+    src.addr_let
+
+# AGAST #3079: an un-annotated `let p = @c` / `@&c` (or a copy of one) that the
+# inference typed a `*T` is an `@T` / `@&T`, as if annotated.  It was a `*T`
+# that the side flags LocalVar.holds_shared_ref / holds_mut_ref (since removed)
+# said otherwise of.  An annotated `let p: *C = @c` never gets here
+# (let_ref_view is UNKNOWN for it).
+# A `**T` one (`let r = @q`, q a `*T` of a scalar, an enum or an array) is an
+# `@*T` / `@&*T`: the pointee stays the `*T`, so `**r` and `*r = d` keep working.
+fn type_ref_view_let(stmt: *Stmt, view: i32) -> i32
+    if stmt.var_type != TYPE_PTR and stmt.var_type != TYPE_PTR_PTR
+        return 0
+    if view != REF_VIEW_SHARED and view != REF_VIEW_MUT
+        return 0
+    if stmt.var_type == TYPE_PTR and stmt.var_type_name_len > 0 and stmt.var_pointee_type != TYPE_ARRAY
+        stmt.var_pointee_type = TYPE_STRUCT
+    stmt.var_type = TYPE_REF
+    if view == REF_VIEW_MUT
+        stmt.var_type = TYPE_MUT_REF
+    1
 
 # AGAST #2356: 1 for an unannotated `let x = init` whose init is a u64, which the
 # parser's i64 default would make `x >> n` sign-fill.  A bare literal stays i64,
@@ -1102,8 +1133,8 @@ fn inferred_fn_sig(s: *EmitterState, stmt: *Stmt) -> *FnDef
     f
 
 fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
-    let shared_ref: i32 = let_holds_shared_ref(s, stmt)
-    let mut_ref: i32 = let_holds_mut_ref(s, stmt)
+    let view: i32 = let_ref_view(s, stmt)   # AGAST #3079
+    let addr_init: i32 = addr_let_init(s, stmt)
     # Use the user's explicit type annotation. The parser defaults
     # missing annotations to TYPE_I64, so any TYPE_I32 we see here
     # came from an explicit `: i32` and must NOT be overridden —
@@ -1420,7 +1451,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
             # the same `ptr` / i64 `s` loads as.  (Was i64 with no struct name:
             # "unhandled EXPR_MEMBER".)
             # AGAST #2352: and `p: @&i32` / `@i32`, a scalar pointee and no name.
-            else if src_loc != null and (src_loc.var_type == TYPE_MUT_REF or src_loc.var_type == TYPE_REF) and (src_loc.type_name_len > 0 or scalar_pointee(src_loc.pointee_type) == 1)
+            # AGAST #3079: and `p: @*i32` (`let p = @q`, q: *i32).
+            else if src_loc != null and (src_loc.var_type == TYPE_MUT_REF or src_loc.var_type == TYPE_REF) and (src_loc.type_name_len > 0 or scalar_pointee(src_loc.pointee_type) == 1 or src_loc.pointee_type == TYPE_PTR)
                 var_type = src_loc.var_type
                 stmt.var_type = src_loc.var_type
                 stmt.var_type_name = src_loc.type_name
@@ -1775,6 +1807,9 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
                                     stmt.var_type_name = fa.array_elem_type_name
                                     stmt.var_type_name_len = fa.array_elem_type_name_len
 
+    if type_ref_view_let(stmt, view) == 1   # AGAST #3079
+        var_type = stmt.var_type
+
     # AGAST #2047: a float-valued initializer no arm above typed -- a binary
     # (`x + 0.5`, binop_float_width #1965), a cast `n as f32`, a float field
     # `p.a`, a negation `-x`, `x.floor() + 0.5` -- is a float / double slot,
@@ -1871,8 +1906,7 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
     set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, fn_sig)  # AGAST #1671, #2417
     let declared: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
-    declared.holds_shared_ref = shared_ref
-    declared.holds_mut_ref = mut_ref
+    declared.addr_let = (addr_init == 1 and (var_type == TYPE_REF or var_type == TYPE_MUT_REF)) as i32   # AGAST #3079
     if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
         declared.inner_ref = stmt.var_inner_ref   # AGAST #2399
         set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308, #2539 (`**[N]T`)
