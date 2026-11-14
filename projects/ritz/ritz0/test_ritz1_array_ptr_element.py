@@ -586,13 +586,53 @@ def test_untyped_let_does_not_copy_a_drop_pointee(compile_with, name, compiler):
     assert f":{_DROP_LINE}:13" in out, out
 
 
+# AGAST #2378: the clone of a generic `a:& [N]*T` took T for the element, so
+# ritz1 read `[2]*i16` as `[2]i16` and refused its own array at the call.  The
+# element is a `*T`: T is what it points at.
+_GENERIC_PTR_FN = (
+    "struct P\n    m: i64\n    q: i16\n\n"
+    "fn f<T>(a:& [2]*T, t: T) -> i32\n    *a[0] = t\n    return 0\n\n")
+GENERIC_PTR_ELEMENT = {
+    "scalar_read": "fn g<T>(a:& [2]*T, t: T) -> i32\n" + _is("*a[1]") + "\n"
+    + "pub fn main() -> i32\n" + _X + "    return g<i16>(a, 0 as i16)\n",
+    "scalar_write": _GENERIC_PTR_FN + "pub fn main() -> i32\n" + _X
+    + "    f<i16>(a, 9 as i16)\n" + _is("x[1]", "9"),
+    "struct_write": _GENERIC_PTR_FN + "pub fn main() -> i32\n    var s: [2]P\n    s[1].q = 4\n"
+    + "    var a: [2]*P\n    a[0] = @s[1]\n    a[1] = @s[0]\n    var t: P\n    t.m = 0\n    t.q = 6\n"
+    + "    f<P>(a, t)\n" + _is("s[1].q", "6"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(GENERIC_PTR_ELEMENT))
+def test_generic_pointer_element_mut_param(run_with, name, compiler):
+    assert run_with(compiler, f"generic_ptr_{name}", GENERIC_PTR_ELEMENT[name]) == 0
+
+
+# What it still refuses: another length, or an element that isn't a `*T`.
+GENERIC_PTR_WRONG = {
+    "wrong_len": "    var b: [3]*i16\n    b[0] = @x[0]\n    return f<i16>(b, 0 as i16)\n",
+    "value_element": "    var y: [2]i16\n    return f<i16>(y, 0 as i16)\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(GENERIC_PTR_WRONG))
+def test_generic_pointer_element_refuses_another_array(compile_with, name, compiler):
+    program = _GENERIC_PTR_FN + "pub fn main() -> i32\n" + _X + GENERIC_PTR_WRONG[name]
+    comp, _, _ = compile_with(compiler, f"generic_ptr_wrong_{name}", program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    if compiler != "ritz0":
+        assert "the array isn't the one the parameter points at" in out, out
+
+
 # ritz0 has these right, ritz1 doesn't, and each is its own bug.  Strict, so the
 # fix flags the row.
 KNOWN_GAPS = {
     "pointer_index_inferred_copy": (3052, _COPY_MAIN + "    let c = p[0]\n" + _is("c.q", "2")),
-    "generic_element_mut_param": (2378, (
-        "fn f<T>(a:& [2]*T, t: T) -> i32\n" + _is("*a[1]") + "\n"
-        "pub fn main() -> i32\n" + _X + "    return f<i16>(a, 0 as i16)\n")),
 }
 
 
