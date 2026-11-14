@@ -138,6 +138,30 @@ OTHER_SHAPES = {
     "other_pointer_argument": ("struct C\n    x: i32\n\nstruct D\n    a: i32\n\nfn g(p: @&*D) -> i32\n    0\n\n"
                                "fn f(h:& *C) -> i32\n    g(^@&h)\n", REF_TO_OTHER_POINTER),
     "other_scalar_pointer": ("fn f(h:& *i32) -> i32\n    let p: @&*i64 = ^@&h\n    0\n", REF_TO_OTHER_POINTER),
+    # #2364: a scalar pointee has no name to compare, so each place that keeps
+    # the pointee of a pointee is a row: the slot (a param, a return, an
+    # assigned local) and the referent (a plain local, a field, a reference).
+    "other_scalar_pointer_argument": ("fn g(p: @&*i64) -> i32\n    0\n\nfn f(h:& *i32) -> i32\n    g(^@&h)\n",
+                                      REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_sign": ("fn f(h:& *u32) -> @&*i32\n    return ^@&h\n", REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_assign": ("fn f(h:& *i32, d: @&*i64) -> i32\n    var p: @&*i64 = d\n    p = ^@&h\n    0\n",
+                                    REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_local": ("fn f() -> i32\n    var q: *i32 = null\n    let p: @&*i64 = ^@&q\n    0\n",
+                                   REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_field": ("struct V\n    q: *i32\n\nfn f(v:& V) -> i32\n    let p: @&*i64 = ^@&v.q\n    0\n",
+                                   REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_reference": ("fn f(h: @&*i32) -> i32\n    let p: @&*i64 = ^h\n    0\n",
+                                       REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_declared": ("fn f(h:& *i32) -> i32\n    let q: @&*i32 = @&h\n    let p: @&*i64 = ^q\n    0\n",
+                                      REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_shared": ("fn f(h:& *i32) -> i32\n    let p: @*i64 = ^@h\n    0\n", REF_TO_OTHER_POINTER),
+    # A generic instance keeps U's name, scalar or not, and its kind.
+    "other_scalar_pointer_generic": ("fn g<T>(p: @&*T) -> i32\n    0\n\nfn f(h:& *i32) -> i32\n    g<i64>(^@&h)\n",
+                                     REF_TO_OTHER_POINTER),
+    "other_scalar_pointer_generic_whole": ("fn g<T>(p: @&T) -> i32\n    0\n\nfn f(h:& *i32) -> i32\n"
+                                           "    g<*i64>(^@&h)\n", REF_TO_OTHER_POINTER),
+    "struct_pointer_into_scalar": ("struct C\n    x: i32\n\nfn f(h:& *C) -> i32\n    let p: @&*i32 = ^@&h\n    0\n",
+                                   REF_TO_OTHER_POINTER),
     # A temporary has nothing to borrow, whatever its drop would have been.
     "move_only_temporary": ("struct R\n    h: i32\n\nimpl Drop for R\n    fn drop(self: @&R)\n        self.h = 0\n\n"
                             "fn mk() -> R\n    R { h: 1 }\n\nfn g(p: @R) -> i32\n    0\n\n"
@@ -194,6 +218,14 @@ EXPLICIT = {
     "pointer_param_borrowed": ("fn go(h:& *C, d: *C)\n    let p: @&*C = @&h\n    *p = d\n",
                                "    var c = C { x: 3 }\n    var d = C { x: 1 }\n    var p: *C = @d\n"
                                "    go(p, @c)\n    p.x\n", 3),
+    # #2364: the same `*U`, with a scalar U, still fits.
+    "scalar_pointer_param_borrowed": ("fn go(h:& *i32, d: *i32)\n    let p: @&*i32 = @&h\n    *p = d\n",
+                                      "    var n: i32 = 3\n    var m: i32 = 1\n    var p: *i32 = @m\n"
+                                      "    go(p, @n)\n    *p\n", 3),
+    # An un-annotated copy records no U, and isn't judged for it.
+    "scalar_pointer_untyped_copy": ("fn go(h:& *i32, d: *i32)\n    let r = @&h\n    let p: @&*i32 = r\n    *p = d\n",
+                                    "    var n: i32 = 3\n    var m: i32 = 1\n    var p: *i32 = @m\n"
+                                    "    go(p, @n)\n    *p\n", 3),
     "plain_pointer_lent": ("fn wr(h:& *C, d: *C)\n    h = d\n",
                            "    var c = C { x: 3 }\n    var d = C { x: 1 }\n    var p: *C = @d\n"
                            "    wr(p, @c)\n    p.x\n", 3),
@@ -215,7 +247,7 @@ EXPLICIT_HEAD = "import ritzlib.span\n\nstruct C\n    x: i32\n\n"
 # Each of these is a slot this rule reaches and ritz1 can't compile for a reason
 # with no reference in it. The row is refused, just not at this location.
 SITE_GAPS = {}
-SHAPE_GAPS = {"other_scalar_pointer": 2364}
+SHAPE_GAPS = {}
 EXPLICIT_GAPS = {}
 
 

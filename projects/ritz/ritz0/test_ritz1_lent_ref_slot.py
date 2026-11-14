@@ -828,10 +828,7 @@ def test_a_written_reference_to_something_else_is_refused(tmp_path, compiler, na
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", [
-    "ritz0",
-    pytest.param("ritz1", marks=pytest.mark.xfail(
-        strict=True, reason="AGAST #2364: ritz1 runs an `@&*u32` as an `@&*i32`; ritz0 refuses it"))])
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 def test_a_reference_to_a_pointer_of_the_other_sign_is_refused(ritz1_bin, tmp_path, compiler):
     comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, "sign_blind", SIGN_BLIND_POINTER)
     _refused(comp, ll, REF_TO_OTHER_POINTER)

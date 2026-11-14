@@ -57,6 +57,10 @@ pub struct RefTy
     ref_size: i32         # N for a pointer kind to `[N]T`; 0 if unknown
     ref_elem: i32         # its T's kind (a struct T is `name`); TYPE_VOID if unknown
     name_only: i32        # 1 for a `-> *X` return: only a name, maybe a stale one
+    # AGAST #2364: U when the pointee is a `*U` (pointee == TYPE_PTR), as
+    # Param.param_ref_ptr_pointee keeps it; TYPE_VOID if unknown.  A scalar U
+    # has no name, so without it `@&*i32` and `@&*i64` were one type.
+    ptr_pointee: i32
 
 # A tail and the slot it lands in.
 struct RefTail
@@ -111,6 +115,7 @@ fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.ref_size = 0
     out.ref_elem = TYPE_VOID
     out.name_only = 0
+    out.ptr_pointee = TYPE_VOID
     1
 
 fn ref_set_array(out: *RefTy, elem: i32, elem_pointee: i32, name: *u8, len: i32, shape: *ArrayShape) -> i32
@@ -142,7 +147,9 @@ fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
         # `c:& C` reads as a `C` (§13.4), and so does a by-value `self`.
         if loc.is_lent == 1 or loc.holds_lent_ptr == 1
             return ref_set(out, loc.pointee_type, 0, loc.type_name, loc.type_name_len)
-        return ref_set(out, t, loc.pointee_type, loc.type_name, loc.type_name_len)
+        ref_set(out, t, loc.pointee_type, loc.type_name, loc.type_name_len)
+        out.ptr_pointee = loc.ref_ptr_pointee
+        return 1
     if t == TYPE_ARRAY
         return ref_set_array(out, loc.array_elem_type, loc.array_elem_pointee, loc.type_name, loc.type_name_len, loc.array_shape)
     if t == TYPE_PTR_PTR
@@ -189,6 +196,8 @@ fn ref_of_param(p: *Param, out: *RefTy) -> i32
     if p.param_pointee_type == TYPE_ARRAY
         out.ref_size = p.param_pointee_array_size
         out.ref_elem = p.param_pointee_array_elem_type
+    if p.param_pointee_type == TYPE_PTR
+        out.ptr_pointee = p.param_ref_ptr_pointee
     1
 
 fn ref_of_field(s: *EmitterState, e: *Expr, f: *StructField, out: *RefTy) -> i32
@@ -246,7 +255,9 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
             if ref_ty_of(s, e.operand, @t) == 0
                 return 0
             if ref_is_pointer(t.kind) == 1
-                return ref_set(out, TYPE_PTR, TYPE_PTR, t.name, t.name_len)
+                ref_set(out, TYPE_PTR, TYPE_PTR, t.name, t.name_len)
+                out.ptr_pointee = ref_addr_ptr_pointee(@t)
+                return 1
             ref_set(out, TYPE_PTR, t.kind, t.name, t.name_len)
             if t.kind == TYPE_ARRAY
                 ref_array_referent(s, e.operand, out)
@@ -301,6 +312,15 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
     if k == EXPR_CAST and e.op == TYPE_PTR
         return ref_set(out, TYPE_PTR, e.int_val as i32, e.ident_ptr, e.ident_len)
     0
+
+# AGAST #2364: U for `@x` of an x of type `t`, when x is a `*U`: a local, a
+# field, or a `:& *U` param, which binds as the caller's `*U` (#2075).
+# TYPE_VOID otherwise: `@q` of a reference `q: @&U` isn't an `@*U` to ritz0,
+# whose refusal of another U there is "a reference to one type" (#3160).
+fn ref_addr_ptr_pointee(t: *RefTy) -> i32
+    if t.kind != TYPE_PTR
+        return TYPE_VOID
+    t.pointee
 
 # `out` is `@a`: its `[N]T`'s N and T, for an `a` that is a local array or a
 # `:&` one.  Unknown for anything else.
@@ -612,9 +632,23 @@ fn ref_value_into_ref(s: *EmitterState, e: *Expr, a: *RefTy, slot: *RefTy)
         else if a.pointee == TYPE_PTR and a.name_len > 0 and slot.name_len > 0
             if name_eq(a.name, a.name_len, slot.name, slot.name_len) == 0
                 ref_error_other_pointer(s, e)
+        else if a.pointee == TYPE_PTR and ref_other_ptr_pointee(a, slot) == 1
+            ref_error_other_pointer(s, e)
         return
     if slot.kind != TYPE_PTR or ref_is_referent(a, slot) == 1 or ref_names_lent(s, e) == 1
         ref_error_value(s, e, slot)
+
+# AGAST #2364: 1 when `a`'s `*U` pointee is known not to be `slot`'s.  A scalar
+# U has no name for the branch above to compare, so the kinds are, exactly, as
+# ritz0's TypeChecker does (`*u32` isn't `*i32`); so is a struct U against a
+# scalar one.  A U either side didn't record stays unjudged.  A generic's
+# instance keeps U's name even when it's a scalar (`g<i64>`), and its kind with it.
+fn ref_other_ptr_pointee(a: *RefTy, slot: *RefTy) -> i32
+    let x: i32 = a.ptr_pointee
+    let want: i32 = slot.ptr_pointee
+    if x == TYPE_VOID or x == TYPE_UNKNOWN or want == TYPE_VOID or want == TYPE_UNKNOWN
+        return 0
+    (x != want) as i32
 
 fn ref_is_span(slot: *RefTy) -> i32
     if slot.kind != TYPE_STRUCT or slot.name_len <= 5
@@ -1099,7 +1133,14 @@ fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
     if stmt.var_pointee_type == TYPE_ARRAY
         out.ref_size = stmt.var_pointee_array_size
         out.ref_elem = stmt.var_pointee_array_elem_type
+    out.ptr_pointee = ref_decl_ptr_pointee(stmt)
     1
+
+# AGAST #2364: U for a local declared `@*U` / `@&*U`; TYPE_VOID otherwise.
+fn ref_decl_ptr_pointee(stmt: *Stmt) -> i32
+    if stmt.var_ref == null or stmt.var_pointee_type != TYPE_PTR
+        return TYPE_VOID
+    stmt.var_ref.param_ref_ptr_pointee
 
 # `x.f = v` and `p.f = v`: the field is named by assign_target, on `owner`.
 fn ref_into_field(s: *EmitterState, stmt: *Stmt, owner: *RefTy)
@@ -1481,6 +1522,8 @@ fn ref_mark_params(s: *EmitterState, p0: *Param)
             let loc: *LocalVar = local_at(s, idx)
             if p.is_borrow == 1 or loc.holds_lent_ptr == 1
                 loc.is_caller_place = 1
+            if p.param_pointee_type == TYPE_PTR
+                loc.ref_ptr_pointee = p.param_ref_ptr_pointee   # AGAST #2364
         p = p.next
 
 # The local `name` is bound to.  A name is bound once per scope in its fn
@@ -1565,6 +1608,8 @@ pub fn ref_after_stmt(s: *EmitterState, stmt: *Stmt)
     # conflicted with the loans of its own `@&c` arms as they were emitted.
     if k == STMT_VAR_DECL and stmt.var_declared_type != TYPE_PTR
         ref_hold(s, stmt.var_init)
+    if k == STMT_VAR_DECL and stmt.var_ref != null
+        ref_keep_ptr_pointee(s, stmt)
     if k != STMT_VAR_DECL or REF_DECL_ROOT == null
         return
     let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
@@ -1581,6 +1626,12 @@ pub fn ref_after_stmt(s: *EmitterState, stmt: *Stmt)
             loc.ref_root_name = REF_DECL_TY.name
             loc.ref_root_name_len = REF_DECL_TY.name_len
     REF_DECL_ROOT = null
+
+# AGAST #2364: the local `stmt` declares keeps its `@&*U`'s U.
+fn ref_keep_ptr_pointee(s: *EmitterState, stmt: *Stmt)
+    let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
+    if idx >= 0
+        local_at(s, idx).ref_ptr_pointee = ref_decl_ptr_pointee(stmt)
 
 # `a` and `ret` point at the same type.
 fn ref_same_referent(a: *RefTy, ret: *RefTy) -> i32
