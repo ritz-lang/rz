@@ -323,6 +323,10 @@ fn track_address_of_local(name: *u8, name_len: i32, of: *Expr)
     *(g_lv_type_name_lens + g_lv_count - 1) = *(g_lv_type_name_lens + idx)
     *(g_lv_by_value + g_lv_count - 1) = 2
 
+# A field holding an `@T` or `@&T`: one level, like a `*T` (AGAST #2383).
+fn field_is_ref(f: *StructField) -> i32
+    (f.field_type == TYPE_REF or f.field_type == TYPE_MUT_REF) as i32
+
 # Resolve the type of the field named by an EXPR_MEMBER chain rooted at a
 # tracked local: `r.raw` → "Vec$u8", `o.q.a` → "A".  Emits nothing.  Returns
 # the *StructField, or null when any link is unknown.  (AGAST #1512)
@@ -339,7 +343,8 @@ fn resolve_member_field(m: *Module, e: *Expr) -> *StructField
     else if e.left.kind == EXPR_MEMBER
         let parent: *StructField = resolve_member_field(m, e.left)
         if parent != null
-            if parent.field_type == TYPE_STRUCT or parent.field_type == TYPE_PTR
+            # Through a held `@T` / `@&T` as through a `*T` (AGAST #2383).
+            if parent.field_type == TYPE_STRUCT or parent.field_type == TYPE_PTR or field_is_ref(parent) == 1
                 sname = parent.field_type_name
                 sname_len = parent.field_type_name_len
     if sname == null or sname_len <= 0
@@ -1836,10 +1841,12 @@ fn register_receiver_method(m: *Module, recv: *Expr, method: *u8, method_len: i3
         if lv_idx >= 0
             register_ufcs_instantiation(m, *(g_lv_prefix_kind + lv_idx), *(g_lv_suffixes + lv_idx), *(g_lv_suffix_lens + lv_idx), method, method_len)
     else if r.kind == EXPR_MEMBER
-        # A `*Vec<T>` field dispatches to the same `vec_<method>$T` as a
-        # by-value one (the emitter passes the pointer it holds).
+        # A `*Vec<T>`, `@Vec<T>` or `@&Vec<T>` field dispatches to the same
+        # `vec_<method>$T` as a by-value one (the emitter passes the pointer
+        # it holds).  A held reference was missed, so a helper whose only
+        # use was `s.v.push(3)` on `v: @&Vec<u8>` never got a define (#2383).
         let rf: *StructField = resolve_member_field(m, r)
-        if rf != null and (rf.field_type == TYPE_STRUCT or rf.field_type == TYPE_PTR)
+        if rf != null and (rf.field_type == TYPE_STRUCT or rf.field_type == TYPE_PTR or field_is_ref(rf) == 1)
             var fsuf: *u8 = null
             var fsuf_len: i32 = 0
             let fkind: i32 = classify_collection_type(rf.field_type_name, rf.field_type_name_len, @fsuf, @fsuf_len)

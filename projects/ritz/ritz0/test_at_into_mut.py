@@ -22,10 +22,13 @@ counts as a borrow is #2371's, and a reference to another type is #2367's and
 out of it.
 """
 
+import subprocess
+
 import pytest
 
 from ref_rules import BORROW_THROUGH_SHARED, SHARED_INTO_MUT
 from test_ref_into_value import COMPILERS, _assert_refused, _compile, _ids, _main, _run
+from test_ritz1_for_header import _emit as _emit_alloc, _link as _link_alloc
 from test_value_into_ref import SITES
 
 pytestmark = pytest.mark.integration
@@ -151,9 +154,8 @@ RECEIVERS = {
                         "fn f(s: @S)\n    ^s.v.push(3 as u8)\n",
     "standalone_self": "import ritzlib.gvec\n\nstruct S\n    v: Vec<u8>\n\nimpl S\n"
                        "    fn add(self: @S)\n        ^self.v.push(3 as u8)\n",
+    # Its only use: the helper is found through the held field (#2383).
     "standalone_held": "import ritzlib.gvec\n\nstruct S\n    v: @Vec<u8>\n\n"
-                       # #2383: only a tracked use instantiates `vec_push$u8`.
-                       "fn k()\n    var v = vec_new<u8>()\n    v.push(3 as u8)\n\n"
                        "fn f(s: S)\n    ^s.v.push(3 as u8)\n",
 }
 
@@ -318,6 +320,39 @@ def test_what_r1_keeps_still_runs(tmp_path, compiler, site):
 def test_what_r1_keeps_still_compiles(tmp_path, compiler, site):
     comp, _, _ = _compile(compiler, tmp_path, site, _wrap(COMPILES[site]))
     assert comp.returncode == 0, comp.stdout + comp.stderr
+
+
+# A Vec method whose only use is through a field holding a reference to the Vec,
+# or a chain through one (#2383): it's instantiated, so the program links and
+# runs. Each is `fn g` and `main`'s body after `var v = vec_new<u8>()`, which must
+# return 2. Linked with the real allocator, which push needs.
+HELD = {
+    "mutable_field": ("struct S\n    v: @&Vec<u8>\n\nfn g(s: S)\n    s.v.push(3 as u8)\n",
+                      "    g(S { v: @&v })\n    g(S { v: @&v })\n    v.len() as i32\n"),
+    "shared_field": ("struct S\n    v: @Vec<u8>\n\nfn g(s: S) -> u8\n    s.v.last()\n",
+                     "    v.push(1 as u8)\n    v.push(2 as u8)\n    g(S { v: @v }) as i32\n"),
+    "mutable_link": ("struct Q\n    v: Vec<u8>\n\nstruct O\n    q: @&Q\n\nfn g(o: O)\n"
+                     "    o.q.v.push(3 as u8)\n",
+                     "    var q = Q { v: v }\n    g(O { q: @&q })\n    g(O { q: @&q })\n"
+                     "    q.v.len() as i32\n"),
+    "shared_link": ("struct Q\n    v: Vec<u8>\n\nstruct O\n    q: @Q\n\nfn g(o: O) -> u8\n"
+                    "    o.q.v.last()\n",
+                    "    v.push(1 as u8)\n    v.push(2 as u8)\n    let q = Q { v: v }\n"
+                    "    g(O { q: @q }) as i32\n"),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("site", _ids(HELD))
+def test_a_method_used_only_through_a_held_reference_links(ritz1_bin, tmp_path, compiler, site):
+    fn, body = HELD[site]
+    src, ll = tmp_path / "main.ritz", tmp_path / "main.ll"
+    src.write_text(_main("import ritzlib.gvec\n\n" + fn, "    var v = vec_new<u8>()\n" + body))
+    comp = _emit_alloc(compiler, ritz1_bin, src, ll)
+    assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
+    link, exe = _link_alloc(compiler, ritz1_bin, ll, tmp_path)
+    assert link.returncode == 0, link.stderr
+    assert subprocess.run([str(exe)], capture_output=True, timeout=60).returncode == 2
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
