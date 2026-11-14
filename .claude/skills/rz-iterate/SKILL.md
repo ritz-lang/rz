@@ -152,7 +152,12 @@ stays here; remote hosts only run rooms.
   - the fast-forward of the host's `~/dev/ritz-lang/rz` to `origin/main`
     (first step of every `SPAWN`; refuse with `SPAWN-FAILED` if it won't
     fast-forward);
-  - what `PAUSE` / `RESUME` do, if you send them.
+  - what `PAUSE` / `RESUME` do, if you send them;
+  - that `adele room spawn` takes `--repo ~/dev/ritz-lang/rz`. Without it
+    spawn branches from the host's adele checkout, leaves a stray
+    `ritz-task-<id>` branch there and fails with `fatal: '…/rz-task-<id>'
+    already exists` (huburght, 6 stray branches, 2026-11-14). `repo=rz` on
+    the verb line isn't enough.
   Every `SPAWN` still tells the host to **save the briefing with a Bash
   here-doc, never the `Write` tool**: `Write` outside the host's workspace
   waits on an approval nobody gives, and the host room stalls for up to 30
