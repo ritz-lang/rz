@@ -221,6 +221,14 @@ pub fn main() -> i32
     # literal inside an expression is a separate ritz1 bug, AGAST #1541.)
     return ((g * 4.0) as i32) + 6
 """,
+    # ritz0 lowers only a `"..."` here, not `c"..."` (#2357; ritz1 points both
+    # at the literal's `@.str`).
+    "cstring": """\
+var g: *u8 = c"A"
+
+pub fn main() -> i32
+    return (*g as i32) - 62
+""",
 }
 
 # Worked before the fix only because false == 0; pinned so it keeps working.
@@ -307,6 +315,16 @@ pub fn main() -> i32
     "f32_nonzero": (
         """\
 var g: f32 = 1.1
+
+pub fn main() -> i32
+    return 3
+""",
+        1,
+    ),
+    # A string fits only a pointer global (#2357).
+    "string_not_pointer": (
+        """\
+var g: i64 = c"A"
 
 pub fn main() -> i32
     return 3

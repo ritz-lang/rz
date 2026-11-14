@@ -282,6 +282,24 @@ def test_ritz1_emits_fill_global(ritz1_bin: Path, tmp_path: Path) -> None:
     assert "inttoptr i64 0" not in ir, ir
 
 
+# AGAST #2357: `[N]*u8` elements point at their literals' `@.str`, or are null.
+# ritz0 lowers `"..."` here but not `c"..."` (test_string_literal_slots.py).
+PTR_ELEMENTS = """\
+const T: [3]*u8 = [c"A", c"BC", null]
+
+pub fn main() -> i32
+    if T[2] != null
+        return 1
+    return (*T[1] as i32) - 63
+"""
+
+
+@pytest.mark.integration
+def test_ritz1_pointer_elements(ritz1_bin: Path, tmp_path: Path) -> None:
+    rc = _run("ritz1", tmp_path, "ptr_elems", PTR_ELEMENTS)
+    assert rc == 3, f"ritz1 build of ptr_elems exited {rc}, expected 3"
+
+
 # --- unfoldable elements are errors, not a silent 0 ---------------------------
 
 UNFOLDABLE_CALL = """\
@@ -301,6 +319,14 @@ pub fn main() -> i32
     return T[0]
 """
 
+# AGAST #2357: a pointer element is a string or null; an integer is refused.
+UNFOLDABLE_PTR = """\
+const T: [2]*u8 = [c"A", 5]
+
+pub fn main() -> i32
+    return 3
+"""
+
 UNFOLDABLE_FILL = """\
 const T: [4]i32 = [NOPE; 4]
 
@@ -316,6 +342,7 @@ pub fn main() -> i32
         ("call", UNFOLDABLE_CALL, 0),
         ("unknown_name", UNFOLDABLE_UNKNOWN, 1),
         ("fill", UNFOLDABLE_FILL, 0),
+        ("pointer", UNFOLDABLE_PTR, 1),
     ],
 )
 def test_ritz1_rejects_unfoldable_element(

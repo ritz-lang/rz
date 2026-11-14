@@ -2343,6 +2343,7 @@ const GINIT_BAD: i32 = 0     # not a constant ritz1 can lower
 const GINIT_INT: i32 = 1     # integer/bool/char value in int_val
 const GINIT_FLOAT: i32 = 2   # float literal text in text/text_len, sign in neg
 const GINIT_NULL: i32 = 3    # null / nil
+const GINIT_STR: i32 = 4     # c"..." (or a "..." literal_slot retyped): text/text_len
 
 struct GlobalInit
     kind: i32
@@ -2370,6 +2371,12 @@ fn global_init_fold(e: *Expr, out: *GlobalInit)
         return
     if e.kind == EXPR_NIL_LIT
         out.kind = GINIT_NULL
+        return
+    # AGAST #2357: a string in a pointer slot points at its own @.str.
+    if e.kind == EXPR_CSTRING_LIT
+        out.kind = GINIT_STR
+        out.text = e.string_ptr
+        out.text_len = e.string_len
         return
     if e.kind == EXPR_CAST
         global_init_fold(e.left, out)
@@ -2434,6 +2441,13 @@ fn global_init_error(s: *EmitterState, g: *GlobalVarDef, line: i32, col: i32, wh
     emit_str(s, c"\n")
     s.error_count = s.error_count + 1
 
+# AGAST #2357: `@.str.N`, a string constant as a constant `ptr` operand.
+# The pool is written after every global and fn (emit_string_constants), so a
+# global may name an entry before its definition.
+fn emit_cstring_const(s: *EmitterState, text: *u8, len: i32)
+    emit_str(s, c"@.str.")
+    emit_int(s, add_string(s, text, len) as i64)
+
 # Write " <initializer>" for g, whose storage type has just been emitted.
 fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
     if gi.kind == GINIT_BAD
@@ -2441,7 +2455,10 @@ fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
         return
     # Storage `ptr`.
     if g.var_type == TYPE_PTR
-        if gi.kind == GINIT_NULL or (gi.kind == GINIT_INT and gi.int_val == 0)
+        if gi.kind == GINIT_STR
+            emit_str(s, c" ")
+            emit_cstring_const(s, gi.text, gi.text_len)
+        else if gi.kind == GINIT_NULL or (gi.kind == GINIT_INT and gi.int_val == 0)
             emit_str(s, c" null")
         else
             emit_str(s, c" inttoptr (i64 ")
@@ -2484,6 +2501,10 @@ fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
     global_init_fold(g.init_expr, gi)
     if gi.kind == GINIT_BAD
         global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"has a non-constant initializer; ritz1 lowers only literals, unary -/~/! of one, null and casts of those")
+        return
+    if gi.kind == GINIT_STR and g.var_type != TYPE_PTR
+        global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a pointer but has a string initializer")
+        gi.kind = GINIT_BAD
         return
     let is_float: i32 = is_float_type(g.var_type, g.type_name, g.type_name_len)
     if gi.kind == GINIT_FLOAT and is_float == 0
@@ -2819,6 +2840,53 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
         i = i + 1
     emit_str(s, c"]\n")
 
+# AGAST #2357: one element of a `const A: [N]*T` literal: a string (literal_array
+# retyped "..." already), null, or an integer folding to 0 (`[c"A", 0]`).
+# 1 if it is one of those.
+fn const_ptr_elem_ok(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_CSTRING_LIT or e.kind == EXPR_NIL_LIT
+        return 1
+    var v: i64 = 1
+    if const_fold_int(s.module.constants, e, 1, @v) == 1 and v == 0
+        return 1
+    0
+
+# `const A: [N]*T = [...]` as `@A = internal constant [N x ptr] [ptr @.str.K, ...]`.
+# An element that is not a string or null is a located error.
+fn emit_const_ptr_array(s: *EmitterState, c: *ConstEntry)
+    if was_global_emitted(s, c.name, c.name_len) == 1
+        return
+    mark_global_emitted(s, c.name, c.name_len)
+    var bad: i32 = 0
+    var fe: *Expr = c.value_expr.args
+    var fi: i32 = 0
+    while fe != null
+        if const_ptr_elem_ok(s, fe) == 0
+            const_array_elem_error(s, c, fi)
+            bad = 1
+        fi = fi + 1
+        fe = fe.next
+    if bad == 1
+        return
+    emit_str(s, c"@")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" = internal constant [")
+    emit_int(s, c.array_size as i64)
+    emit_str(s, c" x ptr] [")
+    var pe: *Expr = c.value_expr.args
+    var pi: i32 = 0
+    while pe != null
+        if pi > 0
+            emit_str(s, c", ")
+        emit_str(s, c"ptr ")
+        if pe.kind == EXPR_CSTRING_LIT
+            emit_cstring_const(s, pe.string_ptr, pe.string_len)
+        else
+            emit_str(s, c"null")
+        pi = pi + 1
+        pe = pe.next
+    emit_str(s, c"]\n")
+
 # Emit a single ConstEntry as an LLVM global constant (if applicable).
 fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     if c.const_type != TYPE_ARRAY
@@ -2841,6 +2909,9 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     # Required so `for v in VALUES` (iterable form) can reference the
     # global by name.  Integer consts of non-array shape stay inlined
     # via find_const; this path is purely for the [N]T iterable case.
+    if c.array_elem_type == TYPE_PTR
+        emit_const_ptr_array(s, c)
+        return
     if c.array_elem_type != TYPE_STRUCT
         if was_global_emitted(s, c.name, c.name_len) == 1
             return

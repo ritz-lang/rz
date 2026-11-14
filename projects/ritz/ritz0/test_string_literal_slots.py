@@ -261,12 +261,15 @@ ACCEPTED = {
                       "    a[0] as i32\n", 8),
     "element_widens": ("fn main() -> i32\n    let k: u8 = 7\n    let a: [1]i64 = [k as i64]\n"
                        "    a[0] as i32\n", 7),
+    # A global and a const array element are slots too: ritz1 points them at the
+    # literal's own `@.str` (#2357).
+    "global": ('var G: *u8 = "A"\nfn main() -> i32\n    *G as i32\n', 65),
+    "const_element": ('const A: [2]*u8 = ["A", "B"]\nfn main() -> i32\n    *A[1] as i32\n', 66),
 }
 
 
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
-# no N-D initializer, no tuple type, no `dyn`, no `await`, and no string in a
-# global or a const array, `c"..."` included (#2357).
+# no N-D initializer, no tuple type, no `dyn` and no `await`.
 RITZ0_REJECTED = {
     "fit_element_nested": (_fn("", "let a: [1][2]u8 = [ [1, 300] ]\n0"), 2, 29, _fits(300, "u8")),
 }
@@ -275,8 +278,6 @@ RITZ0_ACCEPTED = {
                 '    fn take(self, p: *u8) -> i32\n        *p as i32\n'
                 'fn go(t: dyn T) -> i32\n    t.take("A")\n'
                 "fn main() -> i32\n    var s = S { n: 0 }\n    go(@s as dyn T)\n", 65),
-    "const_element": ('const A: [2]*u8 = ["A", "B"]\nfn main() -> i32\n    *A[1] as i32\n', 66),
-    "global": ('var G: *u8 = "A"\nfn main() -> i32\n    *G as i32\n', 65),
     "tuple_element": ('fn main() -> i32\n    let t: (i32, *u8) = (1, "A")\n    *t.1 as i32\n', 65),
     "element_nested": ('fn main() -> i32\n    var a: [1][2]*u8 = [ ["A", "B"] ]\n'
                        "    *a[0][1] as i32\n", 66),
