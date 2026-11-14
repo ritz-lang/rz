@@ -772,8 +772,11 @@ INFERRED_REFS = {
     "shared_into_raw": (CM + "    let p = @c\n    rp(p)\n    return c.x\n", 3),
     "shared_arith": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q = p + 1\n    return q.x\n",
                      ref_arith("+", "C")),
-    "shared_cast_arith": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q: *C = (p as *C) + 1\n"
+    "shared_cast_arith": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q = (p as *C) + 1\n"
                           "    return q.x\n", 3),
+    # AGAST #3204: `+ 2 - 1` reads its pointee down the chain to the cast.
+    "shared_cast_arith_chain": (CM + "    var a: [2]C\n    a[1].x = 3\n    let p = @a[0]\n    let q = (p as *C) + 2 - 1\n"
+                                "    return q.x\n", 3),
     "mut_write": (CM + "    let p = @&c\n    p.x = 3\n    return c.x\n", 3),
     "mut_method": (CM + "    let p = @&c\n    let q = p\n    q.set()\n    return c.x\n", 3),
     "mut_into_mut_ref": (CM + "    let p = @&c\n    rm(p)\n    return c.x\n", 3),
@@ -825,7 +828,7 @@ INFERRED_REFS.update({
     "global_scalar_arith": (GM + "    let p = @&gn\n    let q = p + 1\n    return 0\n", ref_arith("+", "i32")),
     "global_byte_mut_store": (GM + "    let p = @&gb\n    *p = 3\n    return gb as i32\n", 3),
     "global_element_write": (GM + "    let p = @ga[1]\n    p.x = 3\n    return 0\n", WRITE_SHARED),
-    "global_element_mut": (GM + "    ga[1].x = 3\n    let p = @&ga[0]\n    let q: *C = (p as *C) + 1\n    rm(p)\n"
+    "global_element_mut": (GM + "    ga[1].x = 3\n    let p = @&ga[0]\n    let q = (p as *C) + 1\n    rm(p)\n"
                            "    return q.x * p.x / 3\n", 3),
 })
 

@@ -45,7 +45,7 @@ USES = {
     # Read the element, and the next one through `(q as *T) + 1` (a stride of
     # one element, not one byte; `q + 1` on the `@T` is R16's error, R20).
     "read": ("    if *q != {v0}\n        return 1\n"
-             "    let r: *{t} = (q as *{t}) + 1\n    if *r != {v1}\n        return 2\n"),
+             "    let r = (q as *{t}) + 1\n    if *r != {v1}\n        return 2\n"),
     # Store through q: one element wide, so the neighbour survives.
     "write": ("    *q = {v3}\n    if {n} != {v1}\n        return 3\n"
               "    if {a} != {v3}\n        return 4\n    if *q != {v3}\n        return 5\n"),
