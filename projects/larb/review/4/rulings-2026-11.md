@@ -842,3 +842,212 @@ it's flagged for confirmation before #1635 starts. The alternative is that any s
 with methods named `index`/`index_mut`/`index_set` gets `[]` automatically. That's
 less to type and the same work for the compilers, but it makes `[]` appear on a type
 without anyone asking for it.
+
+---
+
+# Fourth batch, 2026-11-14: Box fields and reference arithmetic
+
+Aaron asked LARB to decide #3015 and #3037 (2026-11-14). Both are about what an
+operator may see through, and both get the same answer as R1 and R9: an operator works
+on the type its operand has, and nothing is reached by a name the compiler recognises.
+Seeing through a struct is opt-in, through a trait (R17 as amended).
+
+**Measured** at `e0886b68`, with ritz1 and ritz1_selfhosted built from that commit:
+- a 20-row probe table on ritz0, ritz1 and ritz1_selfhosted (tables below);
+- a corpus walk over every tracked `.ritz` outside archives, for Box bindings and their
+  field uses, and for `+`/`-` on a param or annotated `let` of type `@T`/`@&T`. A
+  control run over the probe programs found all 5 planted shapes and skipped the 3
+  legal ones;
+- how ritz0 and ritz1 find a Box (`emitter_llvmlite.py:3691`,
+  `emitter_core.ritz:3552`).
+
+**Not measured:** a reference held in a field, or bound by an untyped `let`, then
+stepped. The walk doesn't follow those, so its 0 is a lower bound. Nothing in the
+standard gate was run.
+
+## R16: arithmetic on a reference (#3037)
+
+**Rule.**
+1. **A reference isn't a buffer, for `+` and `-` either.** `p + i`, `p - i`, `p += i`,
+   `p -= i` and `p - q` are errors when `p` is an `@T` or `@&T` and `T` isn't an array.
+   The error is located at the operator: "a reference is one value, not a buffer: `+`
+   needs a `*T`; write `(p as *i32) + 1`", with the real `T`.
+2. **The way out is a cast.** `(p as *T) + i` is legal, as now. Raw pointer arithmetic
+   on a `*T` is unchanged.
+3. **The row walk on `@[N]T` and `@&[N]T` stays legal** (§7.8, #2554; Aaron, R18).
+4. Comparison of references (`p == q`) isn't arithmetic and isn't affected.
+
+**Why it fits.** R9 rule 4 says a reference names one value. `p + 1` names the value
+after it, which the reference never lent, so it breaks the same rule `p[1]` does. It
+also breaks R11a: §13.5's overlap check assumes a loan covers the place it was taken
+from (`@&a[0]`), and `p + 1` reaches `a[1]` without the checker seeing it. The cast
+keeps the operation available, and makes "this is now unchecked memory" visible in
+the source, as R1 wants of every conversion.
+
+**Measured:**
+
+| Shape | ritz0 | ritz1 | selfhosted | Rule |
+|---|---|---|---|---|
+| `p + 1`, `p: @&i32` | 9 | 9 | 9 | error |
+| `p - 1`, `p: @&i32` | 9 | 9 | 9 | error |
+| `p + 1`, `p: @i32` | 9 | 9 | 9 | error |
+| `s + 1`, `s: @&S` | 9 | 9 | 9 | error |
+| `let q = p + 1` (untyped) | 9 | 9 | 9 | error |
+| `(p as *i32) + 1` | 9 | 9 | 9 | 9 |
+| `p + 1`, `p: *i32` | 9 | 9 | 9 | 9 |
+| `q + 1`, `q: @&[3]i32` (row walk) | refused at `(*q)[1]`, #2331 | 9 | 9 | 9 (R18) |
+
+All three compilers agree today, and silently.
+
+**Cost.** 0 corpus sites: 1212 reference params, none stepped. Two test rows flip:
+`ritz0/test_pointer_difference.py` "refs" (`q - p` on two `@i32`) and "mut_ref"
+(`q - (q - 3)` on an `@&i32`), both from #2928. §7.1's "Pointer difference" already
+speaks only of `*T`, so no spec text is reversed.
+
+**The row walk through a reference.** I recommended refusing it as well. Aaron kept it
+legal (R18).
+
+## R17: a Box's field (#3015), as amended by Aaron
+
+**Aaron's answer (2026-11-14).** Of the options in my first R17, Aaron chose the opt-in
+trait pair. Its first draft (no deref at all, `b.ptr.f` only) is replaced by the rule
+below. The parts it shared with that draft still hold: no struct is special by its name,
+and a user's own `struct Box<T>` is an ordinary struct.
+
+**Rule.**
+1. **Two compiler-known traits, resolved statically like `Drop` and R15's `Index`.** An
+   impl picks the target type `T` through its return type:
+   - `Deref`: `deref(self: @S) -> @T`
+   - `DerefMut`: `deref_mut(self: @&S) -> @&T`. Its `T` must be `Deref`'s `T`, and
+     `DerefMut` without `Deref` is an error at the impl.
+2. **What `.` looks up.** For `s.f`, where `s` has struct type `S`:
+   1. `S`'s own field `f`, or own method `f`;
+   2. otherwise, if `S` implements `Deref`, the field or method `f` of `T`, through the
+      trait;
+   3. otherwise, the error in rule 5.
+
+   This is one step only. On a `Box<Box<H>>`, `b.k` doesn't reach `H`; write `b.ptr.k`
+   or deref twice explicitly. Pointers and references keep §7.7's auto-deref, which
+   happens before step 1, as today.
+3. **Which method each use goes through.** This is the same table as R15's `m[k]`. `s.f`
+   reached through the trait is a place:
+
+   | Use of `s.f` | Means |
+   |---|---|
+   | read by value, `s.f.g`, `s.f[i]` read, `@s.f`, `for x in s.f`, a non-mutating `.m()` | `deref(@s).f` |
+   | `s.f = v`, `s.f += v`, `s.f[i] = v`, `@&s.f`, a `:&` argument, a mutating `self` call | `deref_mut(@&s).f` |
+
+   - A by-value read of a move-only field is "cannot move out of a reference" (§13.2),
+     as with `m[k]`.
+   - A mutable use needs `s` to be mutable, just as `@&s` does.
+   - `s.f op= v` evaluates `s` once and calls `deref_mut` once (#2529's rule).
+4. **A name clash: the own field wins.** `S`'s own fields and methods are found first,
+   so `b.ptr` on a `Box<T>` is always Box's own `ptr`, even when `T` has a `ptr` field.
+   `T`'s `ptr` is `b.ptr.ptr`. The ruling is deliberate; this isn't an error. `T` is
+   chosen by whoever uses the Box, not by whoever wrote it, so an error would make
+   `Box<T>` unusable for any `T` that happens to have a `ptr` field. The rule is fixed
+   by `S`'s declaration and needs no pin to decide it (this replaces #2426's special case).
+5. **Errors, located at the field name:**
+   - `S` has no `f` and no `Deref`: "`Wrap<H>` has no field `k`". If `S` has a `*T`
+     field whose `T` has `f`, add the hint "it points at one: `w.ptr.k`, or implement
+     `Deref`". The hint is chosen by the struct's shape, not its name.
+   - `S` implements `Deref` and neither `S` nor `T` has `f`: "neither `Box<H>` nor `H`
+     has a field `k`".
+   - A mutable use without `DerefMut`: "`b.k = …` needs `DerefMut`, and `Ro<H>`
+     implements only `Deref`", worded like R15's `IndexSet` error.
+6. **Borrows (R11a).** A step through the trait is a path step `*`:
+   - any two `*` steps on the same root overlap, and comparison continues after them,
+     so `@b.a` with `b.k = 2` is legal and `@b.a` with `b.a[0] = 2` isn't;
+   - a `*` step overlaps every own field of the root, because writing `b.ptr` re-aims
+     it. `@b.a` then `b.ptr = q` is an error.
+7. **ritzlib.** `ritzlib/box.ritz` adds:
+   ```text
+   impl<T> Deref for Box<T>
+       fn deref(self: @Box<T>) -> @T
+           @*self.ptr
+   impl<T> DerefMut for Box<T>
+       fn deref_mut(self: @&Box<T>) -> @&T
+           @&*self.ptr
+   ```
+   (`*p` is a place under R9, so `@*self.ptr` lends the boxed value.) No other ritzlib
+   type implements `Deref` in this step.
+
+**Why it fits.**
+- **Opt-in, like R15.** `.` sees through a struct only when the struct asked for it.
+  The compilers decide that from an impl, not from the name `Box`, so a user's `Box`
+  with a `value` field is an ordinary struct.
+- **Reads and places arrive together.** Every row of the table works or none does. That
+  ends today's half-feature, where `b.k` is readable but `b.k = 11` isn't.
+- **References, not values.** `deref` returns `@T`, so R9's "every binding has one
+  address" holds: `@b.a` and `b.a[1] = 7` reach the boxed value, not a copy of it.
+
+**What changes:**
+- **`test_level32`:** keeps its meaning. Its 9 reads (`b.x`, `b.width`, `b.origin.x`, …)
+  go through `Deref` and give the same values. Add a store (`b.x = 5`, read back), a
+  `b.a[1] = 7` and an `@&b.q` case, so the file covers places as well.
+- **`ritz0/test_ritz1_box_field.py`:**
+  - the READS rows are unchanged;
+  - the PLACES rows (`test_a_box_field_is_no_place`) flip from refusal to run. The
+    values follow the `b.ptr.` probes in the table below: `b.k = 11` → 11,
+    `b.a[1] = 7` → 7, `let x = b.a[1]` → 2, `b.ps[1].x` → 5, `@b.a` then `r[2]` → 4;
+  - add `bump(@&b.q)` → 9 and `b.a[2] += 3` → 7;
+  - add a refusal row for each error in rule 5, on all three compilers.
+- **`test_ritz1_for_iterable.py`:**
+  - `LIVE["field_behind_a_box"]` stays live, now through `Deref`;
+  - `NO_FURTHER["address_through_a_box"]` (`@b.a`) becomes legal and moves to a run row;
+  - the `box_own` tests keep `b.ptr` as Box's own field, now from rule 4 rather than a
+    special case.
+- **The ritz0 crash** on a user `struct Box<T>` with `value: T` and `b.x` goes away,
+  because the `Box$` name check is deleted. Without a `Deref` impl, it gets rule 5's
+  "`Box<H>` has no field `x`" on all three compilers. Add that as a test row.
+- **#3017:** `let arr = b.a` is a copy through `deref`, once the array-copy `let` is
+  fixed.
+
+**Measured** (first draft, at `e0886b68`, all three compilers). The explicit `b.ptr.`
+form works for every use, which is the code `deref`/`deref_mut` generate:
+
+| Shape, `b: Box<H>` holding `@h` | ritz0 | ritz1 | selfhosted | Rule |
+|---|---|---|---|---|
+| `b.k` (read, want 9) | 9 | 9 | 9 | 9, through `Deref` |
+| `b.k = 11` | refused | refused, unlocated | refused, unlocated | 11, through `DerefMut` |
+| `b.ptr.k = 11` | 11 | 11 | 11 | 11 |
+| `b.ptr.a[1] = 7` | 7 | 7 | 7 | 7 |
+| `let x = b.ptr.a[1]` | 2 | 2 | 2 | 2 |
+| `b.ptr.ps[1].x` | 5 | 5 | 5 | 5 |
+| `@b.ptr.a`, then `r[2]` | 4 | 4 | 4 | 4 |
+| `bump(@&b.ptr.q)` | 9 | 9 | 9 | 9 |
+| `b.ptr.a[2] += 3` | 7 | 7 | 7 | 7 |
+| user `struct Box<T>` `value: T`, `b.x` | **crash** | refused, unlocated | refused, unlocated | "no field `x`" |
+
+I didn't re-probe for the amendment; it reuses these measurements.
+
+**Cost.** 0 sites to migrate. Every existing `b.f` read keeps its value, and no
+production code uses a Box field as a place, because none is accepted today.
+
+**Compilers.** All three need the same work:
+- delete the `Box$` name checks: ritz0's `_is_box_type` arms in `emitter_llvmlite.py`,
+  and ritz1's `box_read`/`box_index_refused` and the `for` arm's Box path;
+- add rule 2's lookup through the `Deref`/`DerefMut` impl, rule 3's table, and rule 6's
+  `*` step in the R11a checker;
+- add `Deref`/`DerefMut` to ritzlib's Box.
+
+The spec entry (§7.7) goes to #3015: rules 1–6, the R15-style table, and
+`expect-error` blocks for rule 5's three errors.
+
+## R18: the row walk through a reference (#3044)
+
+**Aaron's answer (2026-11-14): keep it legal.** `q + i` on `q: @[N]T` or `@&[N]T` steps
+whole rows, as §7.8 and #2554 say. §7.8 and `ritz0/test_ritz1_ref_array_arith.py` are
+unchanged.
+
+**R16 is unaffected.** Its rule 1 refuses arithmetic only "when `T` isn't an array",
+and rule 3 already keeps the row walk. The only change is that rule 3's "for now" and
+the recommendation to refuse it are withdrawn. The text above is amended to say so.
+
+**Cost.** None. No compiler change, no test change. #3044 is closed.
+
+## Suggested order
+
+1. **#3037** (R16): 0 sites and an error on all three compilers. Any room can take it.
+2. **#3015** (R17, `Deref`/`DerefMut`): independent of #1635, but both add a
+   compiler-known-trait lookup, so whichever lands second should reuse the first's.
