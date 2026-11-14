@@ -2195,6 +2195,40 @@ fn main() -> i32
     0
 ```
 
+`*p` is a place, so `(*p)[i]` is element `i` of the array in every position, and
+means exactly `p[i]` (LARB R9). It's the only spelling one pointer level further
+out: for `pp: **[3]i32` or `q: @*[3]i32` it's `(*pp)[i]` and `(*q)[i]`, since
+`pp[i]` is a raw buffer of `*[3]i32` and `q[i]` a located error (a reference is one
+value). The same holds one level out from a Vec, Span or String: `(*q)[i]` for
+`q: **Vec<T>` or `@*Vec<T>`.
+
+```ritz
+import ritzlib.gvec
+
+fn fill(p: *[3]i32)
+    (*p)[0] = 1
+    (*p)[1] += 2
+    let e: *i32 = @(*p)[2]
+    *e = 3
+
+fn second(q: @*[3]i32) -> i32
+    (*q)[1]
+
+fn last(q: **Vec<i32>) -> i32
+    (*q)[2]
+
+fn main() -> i32
+    var a: [3]i32 = [0, 0, 0]
+    fill(@a)
+    var p: *[3]i32 = @a
+    var v: Vec<i32> = vec_new<i32>()
+    v.push(4)
+    v.push(5)
+    v.push(6)
+    var pv: *Vec<i32> = @v
+    second(@p) + last(@pv) + a[0] + a[2] - 12
+```
+
 The base can be any expression of that type, not only a name: a field, a global or a
 call's result. It's evaluated once each time it's used.
 

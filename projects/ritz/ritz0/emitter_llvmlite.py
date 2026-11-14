@@ -6286,6 +6286,16 @@ class LLVMEmitter:
                 through = self._index_through(stmt.target)
                 if through is not None:
                     ptr = self._emit_expr(through.operand)
+                    # `(*p)[i] = b` over an array is `p[i] = b`: element i, not the
+                    # whole array, as the general case below says (#2331).  Located
+                    # at the `*`, as `(*p).f = v` is.
+                    if (isinstance(val.type, ir.ArrayType)
+                            and not isinstance(ptr.type.pointee, ir.ArrayType)
+                            and isinstance(self._infer_ritz_type(stmt.target.expr), rast.ArrayType)):
+                        base = stmt.target.expr
+                        while isinstance(base, rast.Grouped):
+                            base = base.expr
+                        raise EmitError(array_rules.ELEMENT_NOT_ARRAY, base.span)
                     self.builder.store(self._convert_type(val, ptr.type.pointee, stmt.value), ptr)
                     return None
                 index = self._emit_index_value(stmt.target.index)
@@ -8818,6 +8828,13 @@ class LLVMEmitter:
             return None
         inner = resolve_alias_in(ty.inner, self.type_aliases)
         path = self._buffer_field_path(inner)
+        # One level out, `(*q)[i]` with `q` a `**Vec<T>`, `@*Vec<T>` or `@&*Vec<T>`:
+        # `*q` is the pointer to the Vec, so the place is `*((*q).data + i)` (#2331).
+        if (path is None and deref and isinstance(inner, (rast.PtrType, rast.RefType))
+                and not isinstance(expr.index, rast.Range)):
+            outer = self._buffer_field_path(resolve_alias_in(inner.inner, self.type_aliases))
+            if outer is not None:
+                return self._buffer_element(expr, base, outer)
         if path is None:
             # `let p = @x` is an `@T` too, and `let p = @&x` an `@&T`: PtrType's
             # shared and mut_ref are how that shows (#2335, #2445).
@@ -8835,7 +8852,9 @@ class LLVMEmitter:
             # An element that's a `*[N]T` points at one array (R9): `pg[i][j]`
             # and `(*pg[i])[j]` are element j of it at stride T, the place
             # `*((pg[i] as *T) + j)`, with `pg[i]` evaluated once, as above (#3000).
-            if (isinstance(root, rast.Index) and isinstance(inner, rast.ArrayType)
+            # `*p` is a place, so `(*p)[i]` over a `*[N]T`, `@[N]T` or `@&[N]T` is
+            # `p[i]`, the same place `*((p as *T) + i)` (LARB R9, #2331).
+            if ((deref or isinstance(root, rast.Index)) and isinstance(inner, rast.ArrayType)
                     and not isinstance(expr.index, rast.Range)):
                 elem = rast.PtrType(expr.span, inner.inner, mutable=False)
                 return rast.UnaryOp(expr.span, '*', rast.BinOp(

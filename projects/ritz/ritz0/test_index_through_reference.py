@@ -17,7 +17,7 @@ Around that rule, the two forms it isn't:
 
 Arrays behind a pointer are #2330 and other bases (`h.r[i]`, `g[i]`, `f()[i]`) are
 #2329.  A pointer as the pointee isn't indexable: one level, so `q: @*[3]i32` wants
-`(*q)[1]`, and that form is #2331's.
+`(*q)[1]`, which #2331 lowers.
 """
 
 import pytest
@@ -760,13 +760,9 @@ def test_a_slice_through_a_pointer(run_with, kind, compiler):
     assert run_with(compiler, "slice", HEADER + SLICE.format(spelled=spelled, addr=addr)) == 20
 
 
-# One level out, `(*q)[1]` is the form R9 points at: not this error, and #2331's to lower.
-ONE_LEVEL_OUT = [pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#2331"))
-                 for c in ("ritz1", "ritz1_selfhosted")]
-
-
+# One level out, `(*q)[1]` is the form R9 points at: not this error (#2331).
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", *ONE_LEVEL_OUT])
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_one_level_out_is_the_deref_form(run_with, compiler):
     program = """\
 fn f(q: @*[3]i32) -> i32

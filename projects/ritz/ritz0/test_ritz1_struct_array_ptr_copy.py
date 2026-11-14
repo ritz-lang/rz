@@ -347,10 +347,7 @@ def _ptr_ptr_program(pty: str, body: str) -> str:
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("pty", sorted(PTR_PTR_PARAMS))
 @pytest.mark.parametrize("via", ["deref", "copy", "copy_annotated"])
-def test_struct_array_pointer_pointer_param_elements(request, run_with, via, pty, compiler):
-    if pty != "ptr_ptr" and compiler != "ritz0":
-        # A reference to a `*[N]T` param records no N or T in ritz1 (scalars: SILENT).
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2331: `@*[N]T` param"))
+def test_struct_array_pointer_pointer_param_elements(run_with, via, pty, compiler):
     # `p` is `(*r)` itself (deref) or `let p = *r` / `let p: *[3]S = *r` (copy).
     if via == "deref":
         # `p2` annotated: an inferred `let p2 = *r` is the copy rows' business.

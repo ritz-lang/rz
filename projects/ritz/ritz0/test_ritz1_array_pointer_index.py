@@ -431,9 +431,7 @@ def test_an_inferred_shared_array_refuses_a_store(compile_with, compiler):
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", WRITABLE)
 @pytest.mark.parametrize("form", ["p[1] = b", "p[i] = b", "(*p)[1] = b", "p[1] = [1, 2, 3]", "p[1] = [0; 3]"])
-def test_a_whole_array_is_not_an_element(request, compile_with, form, kind, compiler):
-    if form.startswith("(*p)") and compiler == "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2331: ritz0 can't index `(*p)`"))
+def test_a_whole_array_is_not_an_element(compile_with, form, kind, compiler):
     spelled, addr = KINDS[kind]
     program = (f"fn f(p: {spelled}[3]i32, i: i32)\n    var b: [3]i32 = [1, 2, 3]\n    {form}\n\n"
                + _a(f"    f({addr}a, 1)\n    return 0\n"))
@@ -689,12 +687,10 @@ def test_a_struct_element_is_returned_and_held(run_with, kind, compiler):
 
 
 # A whole-array store built from `(*p)[i]` reads, from test_ritz1_whole_array.py's
-# REJECTED, where it sat because ritz0 can't index `(*p)` (#2331).
+# REJECTED, where it sat because ritz0 couldn't index `(*p)` until #2331.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_deref_index_reads_into_a_whole_array_store(request, run_with, compiler):
-    if compiler == "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2331: ritz0 can't index `(*p)`"))
+def test_a_deref_index_reads_into_a_whole_array_store(run_with, compiler):
     program = """\
 fn s(p: *[4]i32)
     *p = [(*p)[3], (*p)[2], (*p)[1], (*p)[0]]
@@ -720,13 +716,11 @@ def test_a_method_on_an_element(run_with, kind, compiler):
     assert run_with(compiler, "method", program) == (61 if kind == "reference" else 61)
 
 
-# `(*p)[i]` is `p[i]` (R9).  It falls out of #2330 on ritz1; ritz0 is #2331's.
+# `(*p)[i]` is `p[i]` (R9).  It falls out of #2330 on ritz1, and #2331 on ritz0.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("kind", WRITABLE)
-def test_a_deref_index_is_the_same_place(request, run_with, kind, compiler):
-    if compiler == "ritz0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="AGAST #2331: ritz0 can't index `(*p)`"))
+def test_a_deref_index_is_the_same_place(run_with, kind, compiler):
     spelled, addr = KINDS[kind]
     program = (f"fn f(p: {spelled}[3]i32) -> i32\n    (*p)[1] = 7\n    return (*p)[1] + (*p)[2]\n\n"
                + _a(f"    return f({addr}a) - 17\n"))

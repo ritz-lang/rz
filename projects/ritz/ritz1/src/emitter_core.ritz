@@ -1081,14 +1081,28 @@ fn set_local_inner_pointee(s: *EmitterState, name: *u8, len: i32, inner: i32)
 
 # AGAST #1953: record N and T on the just-registered `*[N]T` local `name`
 # (from Param / Stmt pointee_array_*).  A no-op when size is 0 (not `*[N]T`).
-# AGAST #2539: a `**[N]T` holds them too, for the `*[N]T` that `*r` reads.
+# AGAST #2539: a `**[N]T` holds them too, for the `*[N]T` that `*r` reads, and
+# (#2331) an `@*[N]T` or `@&*[N]T` (ref_to_ptr).
 fn set_local_pointee_array(s: *EmitterState, name: *u8, len: i32, size: i32, elem: i32)
     if size <= 0
         return
     let loc: *LocalVar = find_local_struct_name(s, name, len)
-    if loc != null and (loc.pointee_type == TYPE_ARRAY or loc.var_type == TYPE_PTR_PTR)
+    if loc != null and (loc.pointee_type == TYPE_ARRAY or loc.var_type == TYPE_PTR_PTR or ref_to_ptr(loc) == 1)
         loc.pointee_array_size = size
         loc.pointee_array_elem_type = elem
+
+# AGAST #2331: 1 for an `@*T` or `@&*T` local.  It records N and U when T is
+# `[N]U`: `*r` reads that `*[N]U`, as it does through a `**[N]U`.
+fn ref_to_ptr(loc: *LocalVar) -> i32
+    if loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+        return 0
+    (loc.pointee_type == TYPE_PTR) as i32
+
+# AGAST #2331: 1 for a `**S`, `@*S` or `@&*S` local: `*q` is a `*S`.
+fn ptr_to_struct_ptr(loc: *LocalVar) -> i32
+    if loc.var_type == TYPE_PTR_PTR
+        return (loc.inner_pointee_type == TYPE_STRUCT) as i32
+    ref_to_ptr(loc)
 
 # AGAST #2343: U, on the same local, for `*[N]*U`.
 # AGAST #2522: and on its `p#` view, which add_array_view bound before U was known.
@@ -1193,8 +1207,12 @@ pub fn base_array_view(s: *EmitterState, root: *Expr) -> *LocalVar
 # the `*[N]T` that `let p = *r` copies (#2539).  It took the byte path: a scalar
 # `(*r)[i]` read and stored the wrong bytes, SILENT, and `(*r)[i].f` was
 # "unhandled EXPR_MEMBER".  null when `loc` isn't one.
+#
+# AGAST #2331: and `r: @*[N]T` or `@&*[N]T`, which read the wrong bytes the same way.
 pub fn deref_array_view(s: *EmitterState, d: *Expr, loc: *LocalVar) -> *LocalVar
-    if loc.var_type != TYPE_PTR_PTR or loc.inner_pointee_type != TYPE_ARRAY or loc.pointee_array_size <= 0
+    if loc.pointee_array_size <= 0
+        return null
+    if ref_to_ptr(loc) == 0 and (loc.var_type != TYPE_PTR_PTR or loc.inner_pointee_type != TYPE_ARRAY)
         return null
     var en_len: i32 = 0
     let en: *u8 = array_ptr_elem_name(loc, @en_len)
@@ -4192,6 +4210,13 @@ fn member_field_def(s: *EmitterState, e: *Expr) -> *StructField
     # loads.  Unresolved, `(*hp).q + 1` on a `q: *i32` stepped one byte.
     else if e.left.kind == EXPR_UNARY and e.left.op == OP_DEREF and e.left.operand != null
         deref_pointee_struct_name(s, e.left.operand, @recv, @recv_len)
+        # AGAST #2331: `(*q).f` with `q: **S`, `@*S` or `@&*S`: `*q` is a `*S`,
+        # and `.` sees through it.  Untyped, `(*q).data + i` stepped one byte.
+        if recv == null and e.left.operand.kind == EXPR_IDENT
+            let dq: *LocalVar = find_local_struct_name(s, e.left.operand.ident_ptr, e.left.operand.ident_len)
+            if dq != null and ptr_to_struct_ptr(dq) == 1
+                recv = dq.type_name
+                recv_len = dq.type_name_len
     if recv == null or recv_len <= 0
         return null
     let st: *StructDef = find_struct(s, recv, recv_len)
