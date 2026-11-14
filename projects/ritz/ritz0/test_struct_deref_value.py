@@ -154,3 +154,50 @@ STRUCT_DEREF_COPIES = {
 @pytest.mark.parametrize("name", sorted(STRUCT_DEREF_COPIES))
 def test_a_whole_struct_deref_copies(run_with, name, compiler):
     assert run_with(compiler, name, STRUCT_DEREF_COPIES[name]) == 6
+
+
+# AGAST #3198: a struct local, param or call result is no integer either.  With
+# `let n: i32 = l` (or `= mk()`, `= l.dup()`) ritz1 loaded the `%S` into the i32
+# and clang refused the IR, unlocated; `let n: i64 = l` was worse, a silent copy
+# of the struct into `n`.  ritz0 refuses each at the `let`, ritz1 at the init,
+# for every integer width (#3188 did `*q`, `p[i]` and `a[i][j]`).
+_VALUE_LET = (_S + "impl S\n    fn dup(self: @S) -> S\n        return *self\n\n"
+              "fn mk() -> S\n    var s: S\n    s.y = 6\n    return s\n\n"
+              "pub fn main() -> i32\n    var l: S\n    l.y = 6\n")
+_VALUE_LET_LINE = _VALUE_LET.count("\n") + 1
+STRUCT_VALUE_FORMS = {"local": "l", "call": "mk()", "method": "l.dup()"}
+INT_WIDTHS = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(STRUCT_VALUE_FORMS))
+@pytest.mark.parametrize("width", INT_WIDTHS)
+def test_a_struct_value_is_not_an_integer_let(compile_with, width, form, compiler):
+    program = _VALUE_LET + f"    let n: {width} = {STRUCT_VALUE_FORMS[form]}\n    return 0\n"
+    comp, _, _ = compile_with(compiler, f"value_let_{form}_{width}", program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} took `let n: {width} = {STRUCT_VALUE_FORMS[form]}`"
+    assert "Traceback" not in out and "expected 'i" not in out, out[-1500:]
+    if compiler == "ritz0":
+        assert f"main.ritz:{_VALUE_LET_LINE}:5:" in out, out[-1500:]
+    else:
+        assert "a whole struct is not a value here in ritz1" in out, out[-1500:]
+        col = len(f"    let n: {width} = ") + 1
+        assert f"main.ritz:{_VALUE_LET_LINE}:{col}:" in out, out[-1500:]
+
+
+# ... and the copies stay legal: into a struct slot, annotated or not.
+STRUCT_VALUE_COPIES = {
+    "local_annotated": "    let c: S = l\n", "local_inferred": "    let c = l\n",
+    "call_annotated": "    let c: S = mk()\n", "call_inferred": "    let c = mk()\n",
+    "method_inferred": "    let c = l.dup()\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(STRUCT_VALUE_COPIES))
+def test_a_struct_value_copies_into_a_struct_let(run_with, name, compiler):
+    program = _VALUE_LET + STRUCT_VALUE_COPIES[name] + "    return c.y as i32\n"
+    assert run_with(compiler, f"value_copy_{name}", program) == 6
