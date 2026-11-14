@@ -541,6 +541,36 @@ RUN_SANDBOX=""
 RUN_PORT=""
 RUN_TIMEOUT=""
 
+# SIGDFL -- a command prefix that execs its arguments with every signal
+# disposition reset to SIG_DFL.  run_binary and run_test_script put it in
+# front of the program, so it sees the dispositions it would see run by hand
+# from a shell -- AGAST #3180, #3171.
+#
+# The harness's own parent can hand it ignored signals: a GitHub Actions job
+# starts with SIGPIPE ignored (SigIgn 0x1000), and an `&` job of a
+# non-interactive bash gets SIGINT and SIGQUIT ignored on top.  SIG_IGN
+# survives exec, so the program inherited it: a generator writing into a
+# closed pipe got EPIPE instead of dying of SIGPIPE, and `kill -INT` did
+# nothing.  No bash builtin can undo it either: `trap - SIG` leaves a signal
+# alone that was ignored when the shell started (POSIX).  It takes a
+# separate exec: GNU `env --default-signal` (coreutils >= 8.31), else perl.
+# uutils env (0.2.2 at least) has only --ignore-signal.  Probed once, here;
+# the self-tests check each mechanism the host has, not just the one chosen.
+SIGDFL_ENV=(env --default-signal)
+# KILL and STOP cannot be caught, so cannot be ignored either.
+# shellcheck disable=SC2016  # $SIG and @ARGV are perl's
+SIGDFL_PERL=(perl -e '$SIG{$_} = "DEFAULT" for grep { !/^(KILL|STOP|__\w+__)$/ } keys %SIG;
+    exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"')
+SIGDFL=()
+if env --default-signal true 2>/dev/null; then
+    SIGDFL=("${SIGDFL_ENV[@]}")
+elif command -v perl >/dev/null 2>&1; then
+    SIGDFL=("${SIGDFL_PERL[@]}")
+else
+    echo "regression.sh: warning: neither 'env --default-signal' nor perl:" \
+         "examples inherit the harness's ignored signals" >&2
+fi
+
 # watchdog_wait SID BUDGET -- wait for background job SID, a session leader
 # started by the caller, for at most BUDGET (a sleep(1) duration).  Returns
 # its status, or 137 after KILLing its whole session if the budget ran out.
@@ -686,12 +716,13 @@ run_binary() {
     # under uutils 0.2.2 `timeout --signal=KILL` never KILLed, so a hung
     # example ran unbounded.  The program runs as its own session leader
     # (`&` + exec setsid, which execs in place), so on timeout the whole
-    # session is KILLed and recorded as 137.  `trap - INT QUIT` undoes the
-    # SIG_IGN bash gives an `&` job without job control: the program must see
-    # the default dispositions it saw when run in the foreground.
+    # session is KILLed and recorded as 137.  "${SIGDFL[@]}" resets every
+    # signal to its default (see SIGDFL): the program must not inherit the
+    # SIG_IGN on SIGINT/SIGQUIT bash gives an `&` job, nor any its own parent
+    # gave the harness (SIGPIPE, on a CI runner -- AGAST #3180).
     local sid exit_code
-    { ( cd "$sandbox" && ulimit -f 1024 && trap - INT QUIT && \
-      exec setsid env -i \
+    { ( cd "$sandbox" && ulimit -f 1024 && \
+      exec setsid "${SIGDFL[@]}" env -i \
         PATH=/usr/local/bin:/usr/bin:/bin \
         HOME=/nonexistent \
         LANG=C \
@@ -818,9 +849,10 @@ run_test_script() {
     # session survives both a normal exit and a child that set its own group.
     #
     # Bounded by watchdog_wait (see there), not timeout(1): a timeout is
-    # reported as 137 whichever timeout is installed.
+    # reported as 137 whichever timeout is installed.  "${SIGDFL[@]}": test.sh
+    # starts with default dispositions, as it would by hand -- AGAST #3171.
     local sid result
-    { setsid bash "$test_script" >/dev/null 2>&1 </dev/null &
+    { setsid "${SIGDFL[@]}" bash "$test_script" >/dev/null 2>&1 </dev/null &
       sid=$!
       watchdog_wait "$sid" "${TEST_SCRIPT_TIMEOUT:-30}"
       result=$?; } 2>/dev/null

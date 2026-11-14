@@ -41,6 +41,8 @@ set --
 export RITZ_REGRESSION_LIB_ONLY=1
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/regression.sh"
+# shellcheck source=selftest-ignoring-parent.sh
+source "$SCRIPT_DIR/selftest-ignoring-parent.sh"
 
 trap - EXIT
 mkdir -p "$SCRIPT_DIR/../build"
@@ -172,6 +174,26 @@ check "[$NAME] signalled: 139 (SIGSEGV) recorded" 139 "$(cat "$out.exit" 2>/dev/
 bin=$(make_binary dispositions 'grep SigIgn /proc/self/status')
 run_binary "$bin" "$out.stdout" "$out.exit"
 check "[$NAME] dispositions: nothing ignored" "SigIgn:	0000000000000000" "$(cat "$out.stdout")"
+
+# 5. ...even when the harness itself started with signals ignored, as a
+#    GitHub Actions job does with SIGPIPE -- AGAST #3180.  bash cannot undo
+#    an ignore it inherited (`trap -` is a no-op on it), so only the exec'd
+#    reset (SIGDFL) passes this.  Once per reset mechanism this host has.
+#    First prove the parent really does ignore them: with no reset, they leak.
+call_ignoring none run_binary "$bin" "$out.stdout" "$out.exit"
+check "[$NAME] dispositions under an ignoring parent, no reset: inherited" yes \
+    "$(grep -q 'SigIgn:.0000000000000000' "$out.stdout" 2>/dev/null && echo "no ($(cat "$out.stdout"))" || echo yes)"
+mechs=(default)
+if [[ "${ARGS[0]:-}" != "--as" ]]; then
+    env --default-signal true 2>/dev/null && mechs+=(env)
+    command -v perl >/dev/null && mechs+=(perl)
+fi
+for m in "${mechs[@]}"; do
+    rm -f "$out.stdout"
+    call_ignoring "$m" run_binary "$bin" "$out.stdout" "$out.exit"
+    check "[$NAME] dispositions under an ignoring parent ($m): nothing ignored" \
+        "SigIgn:	0000000000000000" "$(cat "$out.stdout" 2>/dev/null)"
+done
 
 if [[ "${ARGS[0]:-}" == "--as" ]]; then
     [[ $TESTS_FAILED -eq 0 ]]; exit

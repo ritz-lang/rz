@@ -35,6 +35,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export RITZ_REGRESSION_LIB_ONLY=1
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/regression.sh"
+# shellcheck source=selftest-ignoring-parent.sh
+source "$SCRIPT_DIR/selftest-ignoring-parent.sh"
 
 trap - EXIT
 SCRATCH=$(mktemp -d)
@@ -159,6 +161,26 @@ for impl in "${IMPLS[@]}"; do
     check "[$NAME] own process group: timeout still reported as 137" 137 "$rc"
     check "[$NAME] own process group: the child is killed anyway" gone "$(alive ${IMPL}4)"
     PATH=$ORIG_PATH
+done
+
+# 5. test.sh sees default signal dispositions, as it would run by hand --
+#    AGAST #3171, #3180.  Not the SIG_IGN on SIGINT/SIGQUIT that bash gives
+#    an `&` job, nor what the harness's own parent ignored (a CI job starts
+#    with SIGPIPE ignored).  Its exit status is the check: 0 only if nothing
+#    is ignored.  Once per reset mechanism this host has, all under an
+#    ignoring parent; first proving that parent's ignores do leak without one.
+echo "--- test.sh signal dispositions"
+d=$(make_example dispositions "grep -q 'SigIgn:.0000000000000000' /proc/self/status")
+run_test_script "$d" "$BIN"
+check "dispositions: nothing ignored" 0 $?
+call_ignoring none run_test_script "$d" "$BIN"
+check "dispositions under an ignoring parent, no reset: inherited" 1 $?
+mechs=(default)
+env --default-signal true 2>/dev/null && mechs+=(env)
+command -v perl >/dev/null && mechs+=(perl)
+for m in "${mechs[@]}"; do
+    call_ignoring "$m" run_test_script "$d" "$BIN"
+    check "dispositions under an ignoring parent ($m): nothing ignored" 0 $?
 done
 
 echo "===================================="
