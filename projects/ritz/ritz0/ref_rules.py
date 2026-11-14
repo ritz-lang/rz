@@ -32,6 +32,11 @@ MOVE_OUT_OF_REF = "cannot move out of a reference"
 # `fn drop(self)`: its own `self` would drop when it returned, and call it again.
 DROP_BY_VALUE = "`drop` can't take `self` by value: it would drop itself: write `self: @&T`"
 
+# The receiver of a method whose `self` is a pointer to a pointer (`self: **C`),
+# when it isn't a place one level short of `self` to borrow, or `self`'s type
+# (LANGUAGE_SPEC §5.4, AGAST #2403): a call result, or a `C` for a `**C`.
+RECEIVER_SHORT_OF_SELF = "a receiver of a pointer `self` must be a place one level short of it, or have its levels"
+
 # `p.f = v`, `p[i] = v` or `*p = v` through an `@T`, or a chain of fields from one.
 WRITE_THROUGH_SHARED = "cannot write through an `@T`: make it `@&T`"
 

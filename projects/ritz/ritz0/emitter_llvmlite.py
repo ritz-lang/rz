@@ -19,6 +19,7 @@ from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 import index_rules
 import deref_rules
+import ref_rules
 import bool_rules
 import float_rules
 import binder_names
@@ -13152,7 +13153,9 @@ class LLVMEmitter:
         # Determine whether to pass by value or by pointer (auto-borrow)
         # If method expects pointer and receiver is lvalue, get address
         receiver_val = None
-        if receiver_is_lvalue and isinstance(first_param_type, ir.PointerType):
+        if self._receiver_short_of_self(expr.expr, first_param_type, receiver_probe):
+            receiver_val = self._borrow_receiver(expr.expr, fn_def.params[0], receiver_probe)
+        elif receiver_is_lvalue and isinstance(first_param_type, ir.PointerType):
             self._check_let_implicit_mut_borrow(expr.expr, fn_def.params[0])
             # Try to get address of the receiver
             # For `var` bindings, this is the alloca
@@ -13285,6 +13288,55 @@ class LLVMEmitter:
         while isinstance(ptr.type, ir.PointerType) and isinstance(ptr.type.pointee, ir.PointerType):
             ptr = self.builder.load(ptr)
         return ptr
+
+    def _receiver_value_type(self, recv: rast.Expr, probe: Optional[ir.Value]) -> Optional[ir.Type]:
+        """The type of what `recv` holds, without emitting it: a receiver is
+        either an Ident, whose binding says, or was probed already."""
+        if probe is not None:
+            return probe.type
+        if isinstance(recv, rast.Ident):
+            for table in (self.locals, self.globals, self.params):
+                if recv.name in table:
+                    return table[recv.name][1]
+        return None
+
+    def _receiver_short_of_self(self, recv: rast.Expr, self_type: ir.Type,
+                                probe: Optional[ir.Value]) -> bool:
+        """Is `recv` a place one pointer level short of a `self: **C`?
+
+        §5.4: a `self` that's a pointer to a pointer takes the levels it asks
+        for, so `q.rd()` with `q: *C` lends `q`, as `name:& *U` lends a `*U`
+        place (§13.3, AGAST #2403). Nothing else is borrowed for it: a call
+        result, or a receiver two levels short, is refused. A `self` of one
+        level keeps what it's always done, including an rvalue spilled.
+        """
+        self_levels, _ = self._pointer_levels(self_type)
+        if self_levels < 2:
+            return False
+        held = self._receiver_value_type(recv, probe)
+        if held is None:
+            return False
+        levels, _ = self._pointer_levels(held)
+        if levels >= self_levels:
+            return False    # _load_to_self takes off what it has to spare
+        is_place = (isinstance(recv, (rast.Ident, rast.Field, rast.Index))
+                    or (isinstance(recv, rast.UnaryOp) and recv.op == '*'
+                        and isinstance(probe, ir.LoadInstr)))
+        if levels + 1 == self_levels and is_place:
+            return True
+        raise EmitError(ref_rules.RECEIVER_SHORT_OF_SELF, recv.span)
+
+    def _borrow_receiver(self, recv: rast.Expr, param: rast.Param,
+                         probe: Optional[ir.Value]) -> ir.Value:
+        """`recv`'s address, as `@&recv` would give it (`@recv` for an `@*C`
+        `self`): a `let` lends its storage to a shared `self` only."""
+        if not (isinstance(param.type, rast.RefType) and not param.type.mutable):
+            self._check_let_mut_borrow(recv)
+        if isinstance(recv, rast.UnaryOp):
+            # `(*pp).m()`: the probe loaded `*pp` from `pp`, which is its place.
+            # Emitting `pp` again would run its operands twice.
+            return probe.operands[0]
+        return self._emit_lvalue_addr(recv)
 
     def _load_to_self(self, receiver: ir.Value, self_type: ir.Type) -> ir.Value:
         """Load through the pointers a receiver has beyond what `self` takes.

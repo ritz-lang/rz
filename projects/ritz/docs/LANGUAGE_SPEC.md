@@ -1289,7 +1289,39 @@ runs `next` once.
 `.` goes through every level of pointer and reference to the receiver's type, as
 it does for a field (§7.7): `p.m()` with `p: @*C`, `**C` or `***C` is `C.m`, and
 `self` is the `C`, not a pointer to it. A method whose `self` is itself a pointer
-(`self: **C`) takes the levels it asks for.
+(`self: **C`) takes the levels it asks for. A place one level short of it is lent,
+as `@&q` (`@q` for `self: @*C`), the way a `*U` place is lent to `name:& *U`
+(§13.4), so `*self = n` re-aims the caller's pointer. Nothing else is borrowed for
+it: a call result, or a `C` where `self` is a `**C`, is refused.
+
+```ritz
+struct Node
+    v: i32
+
+impl Node
+    fn aim(self: **Node, to: *Node)
+        *self = to
+
+fn demo_aim() -> i32
+    var a = Node { v: 1 }
+    var b = Node { v: 2 }
+    var cur: *Node = @&a
+    cur.aim(@&b)            # lends `cur`, as `@&cur`
+    cur.v                   # 2
+```
+
+```ritz expect-error="a receiver of a pointer `self` must be a place one level short of it, or have its levels"
+struct Node
+    v: i32
+
+impl Node
+    fn read(self: **Node) -> i32
+        self.v
+
+fn main() -> i32
+    var a = Node { v: 1 }
+    a.read()
+```
 
 ```ritz
 struct Tally
