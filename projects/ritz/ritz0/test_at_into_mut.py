@@ -114,13 +114,17 @@ VALUES = {
     "nested_call": "fn f(r: @C) -> i32\n    sb(same(r)) + mb(^r)\n",
     "condition": "fn f(r: @C) -> i32\n    if mb(^r) > 0\n        return 1\n    0\n",
     "some_payload": "fn f(r: @C) -> Option<@&C>\n    return Some(^r)\n",
+    # #2384: Result's two arguments, and a scalar referent, which no struct names.
+    "ok_payload": "fn f(r: @C) -> Result<@&C, i32>\n    Ok(^r)\n",
+    "err_payload": "fn f(r: @C) -> Result<i32, @&C>\n    Err(^r)\n",
+    "some_scalar_payload": "fn f(r: @i32) -> Option<@&i32>\n    Some(^r)\n",
     "in_a_field_target": "fn f(r: @C)\n    pc(^r).x = 3\n",
     "in_a_deref_target": "fn f(r: @i32)\n    *pi(^r) = 3\n",
     "in_an_index": "fn f(r: @C, a: @&[2]i32)\n    var b: [2]i32 = [0, 0]\n    b[mb(^r)] = 3\n",
 }
 
-# ritz1 keeps no payload for `Option<@&C>` (#2384), so the slot goes unjudged.
-VALUE_GAPS = {"some_payload": 2384}
+# ritz1 spells `Option<@&C>` as `Option$refmut_C` (#2384), so the payload is judged.
+VALUE_GAPS = {}
 
 # Rule 2. `^` as above.
 RECEIVERS = {

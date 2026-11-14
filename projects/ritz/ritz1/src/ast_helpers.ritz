@@ -2969,6 +2969,13 @@ pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
         var n: i32 = 0
         ga.name = spell_last_array(p, @n)
         ga.name_len = n
+    else if ty == TYPE_REF or ty == TYPE_MUT_REF
+        # AGAST #2384: `@C` is "ref_C", `@&C` "refmut_C".  Both spelled as
+        # nothing, so `Option<@&A>` and `Option<@&B>` were one `%Option$`
+        # with no payload to measure or judge.
+        var n: i32 = 0
+        ga.name = spell_ref_generic_arg(p, ty, @n)
+        ga.name_len = n
     else if ty == TYPE_VOID
         # AGAST #2272: `()`.  Only the unit type parses to TYPE_VOID here.
         ga.name = c"unit"
@@ -3034,6 +3041,53 @@ fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
         let arr: *u8 = spell_last_array(p, @n)
         return spell_ptr_parts(p, ty, p.last_pointee_type, TYPE_STRUCT, arr, n, out_len)
     return spell_ptr_parts(p, ty, p.last_pointee_type, p.last_inner_pointee_type, p.last_type_name, p.last_type_name_len, out_len)
+
+# AGAST #2384: the reference type that just parsed, spelled as ritz0's
+# mangle_type_name spells a RefType: "ref_" (`@T`) or "refmut_" (`@&T`), then
+# the referent's spelling — a primitive's name, a struct's, a pointer's
+# ("ptr_C") or an array's ("arr2_i8").  type_ref leaves the referent's parse
+# state in p, so it reads as if the referent alone had just parsed.  A
+# referent that has no spelling (a reference to a reference, whose state the
+# outer one overwrote; a fn type) spells as "" (out_len 0), as before.
+fn spell_ref_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
+    let inner: i32 = p.last_ref_inner_type
+    var base: *u8 = null
+    var base_len: i32 = 0
+    if inner == TYPE_STRUCT
+        base = p.last_type_name
+        base_len = p.last_type_name_len
+    else if inner == TYPE_PTR or inner == TYPE_PTR_PTR
+        base = spell_ptr_generic_arg(p, inner, @base_len)
+    else if inner == TYPE_ARRAY
+        base = spell_last_array(p, @base_len)
+    else
+        base_len = primitive_arg_spelling(inner, @base)
+    if base == null or base_len <= 0
+        *out_len = 0
+        return null
+    var prefix: *u8 = c"ref_"
+    var prefix_len: i32 = 4
+    if ty == TYPE_MUT_REF
+        prefix = c"refmut_"
+        prefix_len = 7
+    let name: *u8 = parser_alloc(p, (prefix_len + base_len + 1) as i64)
+    for i in 0..prefix_len
+        *(name + i) = *(prefix + i)
+    for i in 0..base_len
+        *(name + prefix_len + i) = *(base + i)
+    *(name + prefix_len + base_len) = 0
+    *out_len = prefix_len + base_len
+    return name
+
+# Length of the pointer-like prefix a mangled argument starts with: 4 for
+# "ptr_" and "ref_" (`@T`), 7 for "refmut_" (`@&T`, AGAST #2384); 0 if none,
+# or if nothing follows it.
+pub fn mangled_ref_prefix(name: *u8, len: i32) -> i32
+    if len > 4 and (memcmp(name, c"ptr_", 4) == 0 or memcmp(name, c"ref_", 4) == 0)
+        return 4
+    if len > 7 and memcmp(name, c"refmut_", 7) == 0
+        return 7
+    0
 
 # AGAST #2832: the `[N]E` that just parsed, spelled as ritz0's
 # mangle_type_name means it: "arr" N "_" E, E being a primitive's name, a
@@ -3184,7 +3238,7 @@ pub fn link_generic_arg(first: *GenericArg, rest: *GenericArg) -> *GenericArg
 # struct literals and generic-call suffixes.  Returns its length and stores
 # the bytes' address in *out.
 fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
-    if ga.ty == TYPE_STRUCT or ga.ty == TYPE_PTR or ga.ty == TYPE_PTR_PTR or ga.ty == TYPE_ARRAY or ga.ty == TYPE_VOID
+    if ga.ty == TYPE_STRUCT or ga.ty == TYPE_PTR or ga.ty == TYPE_PTR_PTR or ga.ty == TYPE_ARRAY or ga.ty == TYPE_VOID or ga.ty == TYPE_REF or ga.ty == TYPE_MUT_REF
         *out = ga.name
         return ga.name_len
     return primitive_arg_spelling(ga.ty, out)

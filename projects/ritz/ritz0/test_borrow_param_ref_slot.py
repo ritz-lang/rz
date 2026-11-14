@@ -33,13 +33,9 @@ from test_borrow_param_ref_field import _compile, _run
 from test_ref_into_value import COMPILERS, _assert_refused
 from test_ref_into_value import _run as _run_any
 
-# No ticket has these.
-# AGAST #2436 made `p.x = 3` on a pointer payload work; what's left is building
-# the value: an `@&C` variant argument (#3046) and `Option<@&C>`'s name (#2384).
-PAYLOAD_GAPS = {
-    "own_enum": "AGAST #3046: ritz1 stores `E.Full(@&c)`'s ptr as `store i64`, clang refuses",
-    "option": "AGAST #2384: `Option<@&C>` mangles to a bare `Option$`, so the payload has no type",
-}
+# AGAST #2436 made `p.x = 3` on a pointer payload work, and #2384 built the value:
+# an `@&C` variant argument (was #3046) and `Option<@&C>`'s name.
+PAYLOAD_GAPS = {}
 
 TYPES = """\
 struct C
@@ -1025,7 +1021,8 @@ fn go(c:& C)
 @pytest.mark.integration
 @pytest.mark.parametrize("name,compiler", [
     pytest.param(n, c, id=f"{c}-{n}",
-                 marks=[pytest.mark.xfail(strict=True, reason=PAYLOAD_GAPS[n])] if c == "ritz1" else [])
+                 marks=[pytest.mark.xfail(strict=True, reason=PAYLOAD_GAPS[n])]
+                 if c == "ritz1" and n in PAYLOAD_GAPS else [])
     for n in sorted(VARIANTS) for c in ("ritz0", "ritz1")])
 def test_variant_payload_holds_the_written_reference(ritz1_bin, tmp_path, compiler, name):
     assert _run(compiler, ritz1_bin, tmp_path, name, VARIANTS[name]) == 3

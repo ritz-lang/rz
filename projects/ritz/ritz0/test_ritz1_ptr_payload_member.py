@@ -89,12 +89,13 @@ ROWS = {
         "let e: E = E.S(@p)\nmatch e\n    E.S(v) => v.b\n    _ => 50",
         3,
     ),
-    # Built from `q`: building it from an `@&Pair` value is #3046 (GAPS).
+    # Built from `q`; enum_mut_ref_value builds it from an `@&Pair` value.
     "enum_mut_store": (
         "let e: E = E.M(q)\nmatch e\n    E.M(v) => v.a = 6\n    _ => 0\np.a",
         6,
     ),
-    # Rows ritz1 still can't build: GAPS.
+    # Built from an `@&Pair` / `@Pair` value: ritz1 stored the ptr as an i64 (#3046)
+    # and gave `Option<@&Pair>` no payload type (#2384) until #2384.
     "enum_mut_ref_value": (
         "let e: E = E.M(@&p)\nmatch e\n    E.M(v) => v.a = 6\n    _ => 0\np.a",
         6,
@@ -110,11 +111,7 @@ ROWS = {
 }
 
 # ritz1 and ritz1_selfhosted only; ritz0 runs every row.
-GAPS = {
-    "enum_mut_ref_value": "AGAST #3046: `E.M(@&p)` stores the ptr as `store i64`, clang refuses",
-    "option_shared_read": "AGAST #2384: `Option<@Pair>` mangles to a bare `Option$`, so the payload has no type",
-    "option_mut_store": "AGAST #2384: `Option<@&Pair>` mangles to a bare `Option$`, so the payload has no type",
-}
+GAPS = {}
 
 
 def _program(rest):

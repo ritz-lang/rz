@@ -748,11 +748,65 @@ fn ref_into_variant(s: *EmitterState, e: *Expr, slot: *RefTy)
         return
     var len: i32 = 0
     let name: *u8 = tagged_enum_arg(s, slot.name, slot.name_len, variant, @len)
-    if name == null or find_struct(s, name, len) == null
+    if name == null
         return
     var part: RefTy
-    ref_set(@part, TYPE_STRUCT, 0, name, len)
+    if ref_of_mangled_ref(s, name, len, @part) == 0
+        if find_struct(s, name, len) == null
+            return
+        ref_set(@part, TYPE_STRUCT, 0, name, len)
     ref_into(s, e.args, @part)
+
+# AGAST #2384: the slot a reference type argument spells, as ref_of_param
+# makes one for a parameter of that type: "refmut_C" is `@&C`, "ref_i32"
+# `@i32`, "refmut_ptr_C" `@&*C`, "ref_arr2_i8" `@[2]i8`.  0 for anything
+# else, or a referent this can't read back (it goes unjudged, as before).
+fn ref_of_mangled_ref(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
+    var kind: i32 = TYPE_REF
+    var k: i32 = 4
+    if len > 7 and memcmp(name, c"refmut_", 7) == 0
+        kind = TYPE_MUT_REF
+        k = 7
+    else if len <= 4 or memcmp(name, c"ref_", 4) != 0
+        return 0
+    let r: *u8 = name + k
+    let n: i32 = len - k
+    let prim: i32 = primitive_type_from_name(r, n)
+    if prim != 0
+        return ref_set(out, kind, prim, null, 0)
+    if n > 4 and memcmp(r, c"ptr_", 4) == 0
+        # The pointer's own pointee is only a name here, as for a struct one.
+        if primitive_type_from_name(r + 4, n - 4) != 0
+            return ref_set(out, kind, TYPE_PTR, null, 0)
+        return ref_set(out, kind, TYPE_PTR, r + 4, n - 4)
+    var size: i32 = 0
+    var elem: i32 = 0
+    if ref_mangled_array(r, n, @size, @elem) == 1
+        ref_set(out, kind, TYPE_ARRAY, null, 0)
+        out.ref_size = size
+        out.ref_elem = elem
+        return 1
+    if find_struct(s, r, n) == null
+        return 0
+    ref_set(out, kind, TYPE_STRUCT, r, n)
+
+# "arr" N "_" E with E a primitive: N to *size, E's TYPE_* to *elem.  1 if so.
+fn ref_mangled_array(r: *u8, n: i32, size: *i32, elem: *i32) -> i32
+    if n < 6 or memcmp(r, c"arr", 3) != 0
+        return 0
+    var pos: i32 = 3
+    var v: i32 = 0
+    while pos < n and *(r + pos) >= 48 and *(r + pos) <= 57
+        v = v * 10 + (*(r + pos) - 48) as i32
+        pos = pos + 1
+    if pos == 3 or pos + 1 >= n or *(r + pos) != 95   # '_'
+        return 0
+    let t: i32 = primitive_type_from_name(r + pos + 1, n - pos - 1)
+    if t == 0
+        return 0
+    *size = v
+    *elem = t
+    1
 
 fn ref_payload(s: *EmitterState, a0: *Expr, ei: i32, vi: i32)
     var a: *Expr = a0
