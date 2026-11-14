@@ -500,6 +500,18 @@ NOT_AN_ENUM_RITZ0_ONLY = {
 }
 _VARIANT_NEEDS_ENUM = "a variant pattern needs an enum scrutinee"
 
+# A bare name on a scalar binds, and a binding can't take a variant's name
+# (AGAST #3003; LANGUAGE_SPEC §4.3): ritz1's match_refuse_arm_names, ritz0's
+# binder_names. The builtin variants count with no Option or Result in scope.
+NAMES_A_VARIANT = {
+    "builtin_on_an_integer": ("fn main() -> i32\n    let n: i64 = 5\n    match n\n"
+                              "        Some => 1\n        _ => 2\n", 4, 9, "Some"),
+    "builtin_on_a_bool": ("fn f(b: bool) -> i64\n    match b\n        None => 1\n"
+                          "        _ => 2\n" + _MAIN, 3, 9, "None"),
+    "user_variant_on_an_integer": (_R + _int_fn("    match n\n        G => 1\n        _ => 2\n"),
+                                   6, 9, "G"),
+}
+
 # A literal pattern compares an integer (AGAST #3002). On an enum or a union
 # ritz0 raised an unlocated NotImplementedError, and ritz1 compared the `%C`
 # aggregate to an i64, IR clang rejected. A `true` there is NOT_A_BOOL's error.
@@ -656,6 +668,16 @@ def test_a_variant_pattern_needs_an_enum_scrutinee(request, tmp_path, compiler, 
     source, line, col = NOT_AN_ENUM[name]
     proc, ll = _compile(request, compiler, tmp_path, source, {})
     _assert_error(proc, ll, compiler, name, line, col, _VARIANT_NEEDS_ENUM)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NAMES_A_VARIANT))
+def test_a_bare_arm_on_a_scalar_cannot_take_a_variants_name(request, tmp_path, compiler, name):
+    source, line, col, variant = NAMES_A_VARIANT[name]
+    proc, ll = _compile(request, compiler, tmp_path, source, {})
+    _assert_error(proc, ll, compiler, name, line, col,
+                  f"a local can't take the name of a variant: '{variant}' — rename the local")
 
 
 @pytest.mark.integration
