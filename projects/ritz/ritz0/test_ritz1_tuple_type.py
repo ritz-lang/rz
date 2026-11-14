@@ -581,3 +581,37 @@ def test_ritz1_substitutes_tuple_element_double_pointer_at_generic_param(ritz1_b
     assert re.search(r"^%tuple_ptr_ptr_Foo_i32 = type \{\s*ptr,\s*i32\s*\}$", proc.ir, re.MULTILINE), proc.ir[:3000]
     assert re.search(r"define\b.*%tuple_ptr_ptr_i32_i32 @\"?pp\$i32", proc.ir), proc.ir[:3000]
     assert "ptr_T" not in proc.ir, proc.ir[:3000]
+
+
+# AGAST #3232: a number straight after `.` is a tuple field index, never a
+# float.  The lexer's `[0-9]+\.[0-9]+` took `0.1` in `p.0.1` as one FLOAT
+# (ritz1: "unexpected '0.1'"); ritz0 had the same defect until #2284.
+# (3, 4), 5 -> p.0.1 + p.1 = 4 + 5 = 9.  `q.1.0` checks the other order, and
+# `2.5` after a `+` (not a `.`) must still lex as a float: 9 + 0 + 2 = 11.
+NESTED_INDEX = """\
+fn main() -> i32
+    let p: ((i32, i32), i32) = ((3, 4), 5)
+    p.0.1 + p.1
+"""
+
+NESTED_INDEX_MIXED = """\
+fn main() -> i32
+    let p: ((i32, i32), i32) = ((3, 4), 5)
+    let q: (i32, (i32, i32)) = (1, (0, 7))
+    let f: f64 = 0.0 + 2.5
+    p.0.1 + p.1 + q.1.0 + (f as i32)
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize(
+    "name,program,expected",
+    [
+        ("tuple_nested_index", NESTED_INDEX, 9),
+        ("tuple_nested_index_mixed", NESTED_INDEX_MIXED, 11),
+    ],
+)
+def test_nested_tuple_index_lexes_as_ints(ritz1_bin, tmp_path, compiler, name, program, expected):
+    """AGAST #3232: `p.0.1` is p . 0 . 1, not p . <float 0.1>."""
+    assert _run_pkg(compiler, tmp_path, name, program) == expected
