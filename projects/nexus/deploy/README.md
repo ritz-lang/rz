@@ -125,6 +125,7 @@ ssh ubuntu@<IP> 'sudo systemctl restart mausoleum nexus'
 |----------|---------|-------------|
 | MAUSOLEUM_HOST | 127.0.0.1 | Mausoleum server host |
 | MAUSOLEUM_PORT | 7777 | Mausoleum server port |
+| MAUSOLEUM_PLAINTEXT | 0 | `1` for a mausoleum started with `--no-encryption`; any value but `0`/`1` refuses to serve |
 | NEXUS_PORT | 80 | HTTP listen port |
 
 ### Terraform Variables

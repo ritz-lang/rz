@@ -17,6 +17,8 @@ does, after `./rz build --all`, using the debug binaries that step built:
             GET it 4 times, edit it, restart the whole stack, GET it again;
             100 keep-alive requests (the last says Connection: close);
             whole log lines; no mausoleum with 2 workers -> 503, not 404;
+            MAUSOLEUM_PLAINTEXT=1 against a --no-encryption mausoleum, the
+            handshake hint without it, a bad value -> refuse;
             SIGTERM/SIGINT/SIGKILL to zeus alone stops its workers in 2 s;
             kill -9 of one worker: zeus respawns it in 2 s, and a SIGHUP
             hot reload reaps it; zeus logs each line in one write(2)
@@ -928,16 +930,32 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
     store_port = free_port()
     store_env = {"MAUSOLEUM_HOST": "127.0.0.1", "MAUSOLEUM_PORT": str(store_port)}
 
-    def up(with_store: bool = True) -> list[subprocess.Popen]:
+    # A second mausoleum, --no-encryption, for MAUSOLEUM_PLAINTEXT (#2466).
+    plain_port = free_port()
+    plain_data = work / "m7m-plain"
+    plain_data.mkdir()
+
+    def up(with_store: bool = True, plaintext: bool = False,
+           env: dict[str, str] | None = None) -> list[subprocess.Popen]:
+        """valet -> zeus -> nexus, plus a mausoleum unless with_store is False.
+
+        plaintext: that mausoleum runs --no-encryption on plain_port, and zeus
+        is pointed there; env: extra variables for zeus (and so nexus).
+        """
         if sock.exists():
             sock.unlink()
-        # A restart reuses store_port, so it can race the old socket's
+        m_port, m_data = (plain_port, plain_data) if plaintext else (store_port, data)
+        m_argv = [str(m7m), "serve", "-p", str(m_port), "-d", str(m_data)]
+        if plaintext:
+            m_argv.append("--no-encryption")
+        zeus_env = {**store_env, "MAUSOLEUM_PORT": str(m_port), **(env or {})}
+        # A restart reuses the port, so it can race the old socket's
         # teardown; retry a bind failure briefly rather than flake.
         m = None
         for attempt in range(6 if with_store else 0):
-            m = procs.start("stack-mausoleum", [str(m7m), "serve", "-p", str(store_port), "-d", str(data)], work)
+            m = procs.start("stack-mausoleum", m_argv, work)
             try:
-                wait_listening(m, store_port)
+                wait_listening(m, m_port)
                 break
             except Broken:
                 procs.stop(m)
@@ -946,7 +964,7 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
                 time.sleep(0.5)
         z = procs.start("stack-zeus", [str(zeus), "-f", "-w", "2", "-s", str(sock),
                                        "-p", str(work / "zeus.pid"), str(nexus)], work,
-                             env=store_env)
+                             env=zeus_env)
         wait_path(z, sock)
         v = procs.start("stack-valet", [str(valet), "-p", str(port), "-z", str(sock)], work)
         wait_listening(v, port)
@@ -1125,6 +1143,63 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
             raise CheckFailed(f"workers did not log why they refuse: {short(log[-200:], 200)}")
 
     r.run("stack.no_store_503", no_store)
+
+    def zeus_log(ps: list[subprocess.Popen]) -> str:
+        return Path(ps[1].log).read_text(errors="replace")  # type: ignore[attr-defined]
+
+    def plaintext_store():
+        # MAUSOLEUM_PLAINTEXT=1: nexus speaks plaintext Spire to a mausoleum
+        # running --no-encryption (#2466). Before, nothing could switch it.
+        ps4 = up(plaintext=True, env={"MAUSOLEUM_PLAINTEXT": "1"})
+        try:
+            page = f"{slug}-plain"
+            post = http_req(port, "POST", "/wiki", body=f"slug={page}&content=plain-{slug}".encode(),
+                            headers=form)[0]
+            seen = []
+            for _ in range(4):
+                st, _, body, _ = http_req(port, "GET", f"/wiki/{page}")
+                seen.append(str(st) if st != 200 or f"plain-{slug}".encode() in body else "200(stale)")
+            log = zeus_log(ps4)
+        finally:
+            down(ps4)
+        want = f"Spire at 127.0.0.1:{plain_port} (plaintext)"
+        if log.count(want) < 2 or log.count("Connected to mausoleum") < 2:
+            raise CheckFailed(f"workers did not connect in plaintext ({want!r}): {short(log[-240:], 240)}")
+        if post != 303 or seen != ["200"] * 4:
+            raise CheckFailed(f"POST /wiki -> {post}, 4 GETs -> {', '.join(seen)} (want 303, 200s)")
+
+    def encrypted_vs_plaintext_hint():
+        # Without the switch, nexus's encrypted handshake gets no reply from a
+        # --no-encryption mausoleum: every page request fails, and the log
+        # says why (wiki_store_connect_hint), not just "error -6".
+        ps5 = up(plaintext=True)
+        try:
+            st = http_req(port, "GET", "/wiki/welcome")[0]
+            log = zeus_log(ps5)
+        finally:
+            down(ps5)
+        if "is it running with --no-encryption?" not in log:
+            raise CheckFailed(f"no handshake hint in the log: {short(log[-240:], 240)}")
+        if st != 503:
+            raise CheckFailed(f"GET /wiki/welcome -> {st} (want 503)")
+
+    def plaintext_bad_value():
+        # An unknown MAUSOLEUM_PLAINTEXT refuses to serve, never ignored: the
+        # (encrypted) store is up and would otherwise be reached.
+        ps6 = up(env={"MAUSOLEUM_PLAINTEXT": "yes"})
+        try:
+            st = http_req(port, "GET", "/wiki/welcome")[0]
+            log = zeus_log(ps6)
+        finally:
+            down(ps6)
+        if log.count("MAUSOLEUM_PLAINTEXT is not 1") < 2 or "Connected to mausoleum" in log:
+            raise CheckFailed(f"workers did not refuse MAUSOLEUM_PLAINTEXT=yes: {short(log[-240:], 240)}")
+        if st != 503:
+            raise CheckFailed(f"GET /wiki/welcome -> {st} (want 503)")
+
+    r.run("stack.plaintext_store", plaintext_store)
+    r.run("stack.plaintext_hint", encrypted_vs_plaintext_hint)
+    r.run("stack.plaintext_bad_value", plaintext_bad_value)
 
     def zeus_alone() -> tuple[subprocess.Popen, list[int]]:
         """zeus -f -w 2 nexus, no valet or store; returns zeus and its worker pids."""
