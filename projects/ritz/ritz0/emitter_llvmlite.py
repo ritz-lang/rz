@@ -10841,71 +10841,75 @@ class LLVMEmitter:
         saved_temp_frames = self._temp_frames
         self._temp_frames = []
 
-        # Set up new function context
-        self.current_fn = fn
-        self.locals = {}
-        self.params = {}
-        self.has_returned = False
+        # Restored on every exit, a raise in the body included: a leaked
+        # empty `_temp_frames` made the enclosing `_emit_stmt`'s pop raise an
+        # IndexError over the body's own diagnostic (AGAST #2276).
+        try:
+            # Set up new function context
+            self.current_fn = fn
+            self.locals = {}
+            self.params = {}
+            self.has_returned = False
 
-        # Create entry block
-        block = fn.append_basic_block(name="entry")
-        self.builder = _SretAwareBuilder(block, self)
+            # Create entry block
+            block = fn.append_basic_block(name="entry")
+            self.builder = _SretAwareBuilder(block, self)
 
-        # Set up regular parameters
-        num_regular_params = len(closure.params)
-        for i, (arg, param) in enumerate(zip(closure_args[:num_regular_params], closure.params)):
-            param_name = param.name
-            arg.name = f"{param_name}.arg"
+            # Set up regular parameters
+            num_regular_params = len(closure.params)
+            for i, (arg, param) in enumerate(zip(closure_args[:num_regular_params], closure.params)):
+                param_name = param.name
+                arg.name = f"{param_name}.arg"
 
-            if i in closure_byval:
-                # A byval arg points at the callee's own copy: it IS the slot.
-                self.locals[param_name] = (arg, closure_byval[i])
+                if i in closure_byval:
+                    # A byval arg points at the callee's own copy: it IS the slot.
+                    self.locals[param_name] = (arg, closure_byval[i])
+                else:
+                    # Allocate storage for the parameter (so it can be used like a local)
+                    alloca = self.builder.alloca(arg.type, name=param_name)
+                    self.builder.store(arg, alloca)
+                    self.locals[param_name] = (alloca, arg.type)
+
+                # Store Ritz type
+                if i < len(expected_type.params):
+                    self.ritz_types[param_name] = expected_type.params[i]
+
+            # Set up captured variables as parameters
+            for i, (cap_name, cap_ritz_type) in enumerate(zip(captures, capture_ritz_types)):
+                arg = closure_args[num_regular_params + i]
+                arg.name = f"{cap_name}.cap"
+
+                if num_regular_params + i in closure_byval:
+                    self.locals[cap_name] = (arg, closure_byval[num_regular_params + i])
+                else:
+                    # Allocate storage for the captured value
+                    alloca = self.builder.alloca(arg.type, name=cap_name)
+                    self.builder.store(arg, alloca)
+                    self.locals[cap_name] = (alloca, arg.type)
+
+                # Store Ritz type
+                if cap_ritz_type:
+                    self.ritz_types[cap_name] = cap_ritz_type
+
+            # Emit closure body expression
+            result = self._emit_expr(closure.body)
+
+            # Emit return
+            if ret_type == self.void:
+                self.builder.ret_void()
             else:
-                # Allocate storage for the parameter (so it can be used like a local)
-                alloca = self.builder.alloca(arg.type, name=param_name)
-                self.builder.store(arg, alloca)
-                self.locals[param_name] = (alloca, arg.type)
-
-            # Store Ritz type
-            if i < len(expected_type.params):
-                self.ritz_types[param_name] = expected_type.params[i]
-
-        # Set up captured variables as parameters
-        for i, (cap_name, cap_ritz_type) in enumerate(zip(captures, capture_ritz_types)):
-            arg = closure_args[num_regular_params + i]
-            arg.name = f"{cap_name}.cap"
-
-            if num_regular_params + i in closure_byval:
-                self.locals[cap_name] = (arg, closure_byval[num_regular_params + i])
-            else:
-                # Allocate storage for the captured value
-                alloca = self.builder.alloca(arg.type, name=cap_name)
-                self.builder.store(arg, alloca)
-                self.locals[cap_name] = (alloca, arg.type)
-
-            # Store Ritz type
-            if cap_ritz_type:
-                self.ritz_types[cap_name] = cap_ritz_type
-
-        # Emit closure body expression
-        result = self._emit_expr(closure.body)
-
-        # Emit return
-        if ret_type == self.void:
-            self.builder.ret_void()
-        else:
-            # Convert result type if needed
-            result = self._convert_type(result, ret_type)
-            self.builder.ret(result)
-
-        # Restore previous state
-        self.builder = saved_builder
-        self.current_fn = saved_fn
-        self.locals = saved_locals
-        self.params = saved_params
-        self.ritz_types = saved_ritz_types
-        self.has_returned = saved_has_returned
-        self._temp_frames = saved_temp_frames
+                # Convert result type if needed
+                result = self._convert_type(result, ret_type)
+                self.builder.ret(result)
+        finally:
+            # Restore previous state
+            self.builder = saved_builder
+            self.current_fn = saved_fn
+            self.locals = saved_locals
+            self.params = saved_params
+            self.ritz_types = saved_ritz_types
+            self.has_returned = saved_has_returned
+            self._temp_frames = saved_temp_frames
 
         # If there are no captures, return the function pointer directly
         if not captures:

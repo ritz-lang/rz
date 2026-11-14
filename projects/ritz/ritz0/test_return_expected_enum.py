@@ -787,7 +787,8 @@ def test_ritz1_generic_enum_signature(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "generic_sig", GENERIC_ENUM_SIGNATURE) == 7
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #2276: IndexError hides the error")
+# AGAST #2276: an IndexError replaced it; test_closure_error_state.py has the
+# state rows.
 def test_ritz0_closure_error_keeps_its_diagnostic(tmp_path):
     src = tmp_path / "closure_error.ritz"
     src.write_text(
