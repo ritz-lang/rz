@@ -782,6 +782,15 @@ INFERRED_REFS = {
     "pointer_mut_copy_store": (PQ + "    let r = @&q\n    let r2 = r\n    *r2 = @m\n    return *q\n", 3),
     "enum_pointer_shared_store": (PQ + "    var f: E = E.B\n    let r = @qe\n    *r = @f\n    return 3\n", WRITE_SHARED),
     "enum_pointer_inner_store": (PQ + "    let r = @qe\n    **r = E.B\n    return e as i32 + 2\n", 3),
+    # AGAST #3108: an annotated `@*T` / `@&*T` records T as a `**T` does.  It
+    # recorded none: `**r = E.B` stored an i64 and `**r` of an enum or a struct
+    # loaded one, which clang refused.
+    "annotated_enum_pointer_inner_store": (PQ + "    let r: @*E = @qe\n    **r = E.B\n    return e as i32 + 2\n", 3),
+    "annotated_mut_enum_pointer_inner_store": (PQ + "    let r: @&*E = @&qe\n    **r = E.B\n    return e as i32 + 2\n", 3),
+    "annotated_mut_enum_pointer_inner_read": (PQ + "    e = E.B\n    let r: @&*E = @&qe\n    let v: E = **r\n"
+                                              "    return v as i32 + 2\n", 3),
+    "annotated_struct_pointer_inner_read": (CM + "    c.x = 3\n    var qc: *C = @c\n    let r: @*C = @qc\n"
+                                            "    let v: C = **r\n    return v.x\n", 3),
     "array_pointer_shared_store": (PQ + "    var b: [2]i32 = [3, 3]\n    let r = @qa\n    *r = @b\n    return 0\n", WRITE_SHARED),
     "array_pointer_mut_store": (PQ + "    var b: [2]i32 = [3, 3]\n    let r = @&qa\n    *r = @b\n    return (*qa)[0]\n", 3),
     "annotated_raw": (CM + "    let p: *C = @c\n    p.x = 2\n    let q = p + 1\n    rp(p)\n    return c.x\n", 3),
