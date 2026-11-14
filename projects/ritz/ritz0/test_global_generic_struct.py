@@ -42,6 +42,16 @@ PROGRAMS = {
     "address": (_BOX + "var gb: Box<H>\n\n"
                 + _MAIN + "    var h: H\n    h.k = 9\n    gb.ptr = @h\n"
                 "    let p = @gb\n    if p.ptr.k != 9\n        return 1\n    return 0\n"),
+    # AGAST #3026: the same through a plain (non-generic) struct global, and
+    # an index through the pointer field (ritz1 was "unhandled EXPR_MEMBER").
+    "address_plain": ("struct W\n    ptr: *i64\n\nvar gw: W\n\n" + _MAIN
+                      + "    var x: i64 = 5\n    gw.ptr = @x\n    let p = @gw\n"
+                      "    if p.ptr[0] != 5\n        return 1\n    return 0\n"),
+    # AGAST #3026: `@&g` writes through to the global.
+    "address_mut": (_BOX + "var gb: Box<H>\n\n" + _MAIN
+                    + "    var h: H\n    h.k = 4\n    let p = @&gb\n    p.ptr = @h\n"
+                    "    if gb.ptr.k != 4\n        return 1\n"
+                    "    if p.ptr.k != 4\n        return 2\n    return 0\n"),
     # Two instances of a user generic struct, each sized by its own T: an i64
     # value that does not fit an i32 shows a shared or wrong layout.
     "two_instances": (_P + "var gi: P<i32>\nvar gl: P<i64>\n\n" + _MAIN
@@ -80,10 +90,10 @@ def run_with(ritz1_bin, tmp_path):
     return go
 
 
-# ritz1 gap found here, "unhandled EXPR_MEMBER": a member through `let p = @g`
-# of any struct global (#3026).  Strict, so the fix flips its row.  (`array`
-# was #3025: ritz1's monomorphiser never instantiated a global array's element.)
-_RITZ1_GAPS = {"address": "AGAST #3026"}
+# ritz1 gaps: none open.  (`address*` was #3026: ritz1 typed `let p = @g` of a
+# struct global as an i64, so `p.ptr` was "unhandled EXPR_MEMBER"; `array` was
+# #3025: ritz1's monomorphiser never instantiated a global array's element.)
+_RITZ1_GAPS = {}
 
 
 def _row(compiler, name):
