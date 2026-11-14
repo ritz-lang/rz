@@ -169,19 +169,10 @@ CALLS = {
     "mangled": ("C_g(c)", 19),
     "in_a_method": ("c.h()", 19),
 }
-MANGLED_GAP = 2447
 
 
-def _calls():
-    for name in sorted(CALLS):
-        for compiler in COMPILERS:
-            marks = []
-            if name == "mangled" and compiler != "ritz0":
-                marks = [pytest.mark.xfail(strict=True, reason=f"#{MANGLED_GAP}: ritz1 can't name a method so")]
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
-
-
-@pytest.mark.parametrize("name,compiler", list(_calls()))
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(CALLS))
 def test_every_spelling_of_the_call(name, compiler, tmp_path):
     call, want = CALLS[name]
     src = (TYPES + METHOD.replace("impl C\n", "impl C\n    fn h(self) -> i32\n        self.g()\n\n")
@@ -417,3 +408,26 @@ def test_an_imported_method_is_declared_as_it_is_defined(compiler, tmp_path):
     assert subprocess.run([str(tmp_path / "m")]).returncode == 21
     # A `ptr` here links and runs too: the call's own attributes decide. It's still wrong.
     assert re.search(r"declare i32 @L_w\(ptr byval\(%L\)", (tmp_path / "main.ll").read_text())
+
+
+# `let p = C_mk(c, 4)` takes the method's struct type, as `let p = c.mk(4)` does (R10).
+MANGLED_STRUCT = """\
+struct C
+    x: i32
+    y: i64
+
+impl C
+    fn mk(self, d: i32) -> C
+        C { x: self.x + d, y: self.y * 2 }
+
+pub fn main() -> i32
+    var c = C { x: 1, y: 3 }
+    let p = C_mk(c, 4)
+    let q: C = C_mk(p, 1)
+    (q.x as i64 * 10 + q.y) as i32
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_mangled_call_infers_the_methods_type(compiler, tmp_path):
+    assert _run(compiler, tmp_path, "mangled_struct", MANGLED_STRUCT) == 72

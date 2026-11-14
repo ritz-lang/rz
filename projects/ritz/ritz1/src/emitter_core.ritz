@@ -1364,6 +1364,39 @@ fn find_fn(s: *EmitterState, name: *u8, len: i32) -> *FnDef
         cur = cur.next
     return null
 
+# 1 if `name` is the mangled symbol `<ib.type_name>_<method.name>`.
+fn impl_method_symbol_eq(ib: *ImplBlock, method: *FnDef, name: *u8, len: i32) -> i32
+    let type_len: i32 = ib.type_name_len
+    if type_len + 1 + method.name_len != len
+        return 0
+    for mj in 0..type_len
+        if *(ib.type_name + mj) != *(name + mj)
+            return 0
+    if *(name + type_len) != 95  # '_'
+        return 0
+    for mk in 0..method.name_len
+        if *(method.name + mk) != *(name + type_len + 1 + mk)
+            return 0
+    1
+
+# The impl method (with a body) whose mangled `Type_method` symbol is `name`,
+# or null.  R10: `C_g(c)` names the method `c.g()` calls (AGAST #2447). A method defined by this .ll (is_local == 1) is preferred over an
+# imported copy of the same symbol.
+fn find_impl_method_by_symbol(m: *Module, name: *u8, len: i32) -> *FnDef
+    var found: *FnDef = null
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            if method.body != null and impl_method_symbol_eq(ib, method, name, len) == 1
+                if method.is_local == 1
+                    return method
+                if found == null
+                    found = method
+            method = method.next
+        ib = ib.next
+    found
+
 # A fn declared with no return type.  `-> void` does not count, as in ritz0's
 # _is_void_call (AGAST #2246).
 fn fn_is_procedure(fd: *FnDef) -> i32
@@ -1515,7 +1548,11 @@ fn find_call_fn(s: *EmitterState, e: *Expr) -> *FnDef
     if step != null
         return step
     if e.call_type_suffix_len <= 0
-        return find_fn(s, e.func_name, e.func_name_len)
+        let f: *FnDef = find_fn(s, e.func_name, e.func_name_len)
+        if f != null
+            return f
+        # R10: `let p = C_mk(c)` takes the method's type (AGAST #2447).
+        return find_impl_method_by_symbol(s.module, e.func_name, e.func_name_len)
     let n: i32 = e.func_name_len + e.call_type_suffix_len
     let buf: *u8 = malloc(n as i64 + 1)
     for i in 0..e.func_name_len

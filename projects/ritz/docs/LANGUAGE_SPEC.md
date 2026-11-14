@@ -1311,6 +1311,8 @@ fn demo_levels() -> i32
     t.n                     # 3
 ```
 
+A method's mangled name `Type_method` is a name a program may call, with the receiver as its first argument: `c.after()` and `Counter_after(c)` mean the same thing (LARB R10).
+
 ```ritz
 struct Point
     x: i32
