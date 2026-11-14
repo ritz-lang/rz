@@ -248,6 +248,27 @@ for _table, _prefix in ((DEREFS, "deref"), (CONTROLS, "control")):
         _make = MAKE_C if _prefix == "deref" else "    var c = C { x: 1, y: 7 }\n"
         HOLDERS[f"{_prefix}.{_name}"] = (_main(_body, _fn + "\n", _make), _want)
 
+# AGAST #2400: an un-annotated `let a = @p.f` / `@&p.f` of a scalar field holds
+# what `let a: @T = @p.f` does, a pointer to the field's type.  ritz1 kept an
+# i64 with no pointee: `*a = 3` stored the `ptr` as an i64 (clang refused the
+# IR), and `*a` loaded 8 bytes of an i32.  `*(a + 1)` pins the pointee's width
+# by its stride.  name: (g, main's body after `make`, make, exit code).
+FIELD_REFS = {
+    "store": ("fn g(p: *C)\n    let a = @&p.x\n    *a = 3\n", "    g(q)\n    c.x * 10 + c.y\n", MAKE_C, 37),
+    "read": ("fn g(p: *C) -> i32\n    let a = @p.y\n    *a\n", "    g(q)\n", MAKE_C, 7),
+    "stride": ("fn g(p: *C) -> i32\n    let a = @p.x\n    *(a + 1)\n", "    g(q)\n", MAKE_C, 7),
+    "nested_store": ("fn g(p: *W)\n    let a = @&p.c.x\n    *a = 3\n", "    g(q)\n    w.c.x * 10 + w.c.y\n",
+                     MAKE_W, 37),
+    "i8_store": ("fn g(p: *K)\n    let a = @&p.b\n    *a = 3\n", "    g(q)\n    k.b as i32 + k.l as i32\n",
+                 MAKE_K, 8),
+    "bool_store": ("fn g(p: *K)\n    let a = @&p.f\n    *a = false\n", "    g(q)\n    if k.f\n        return 1\n    3\n",
+                   MAKE_K, 3),
+    "f64_read": ("fn g(p: *K) -> f64\n    let a = @p.d\n    *a\n", "    g(q) as i32\n", MAKE_K, 2),
+    "of_a_local": ("fn g()\n    pass\n", "    let a = @&c.x\n    *a = 3\n    c.x * 10 + c.y\n", MAKE_C, 37),
+}
+for _name, (_fn, _body, _make, _want) in FIELD_REFS.items():
+    HOLDERS[f"field_ref.{_name}"] = (_main(_body, _fn + "\n", _make), _want)
+
 
 # ritz0 refuses these (#2398).
 ONE_EXTRA_LEVEL = ("nested_store", "nested_compound", "nested_address", "nested_method_read",

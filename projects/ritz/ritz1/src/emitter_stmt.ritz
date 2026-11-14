@@ -334,6 +334,31 @@ fn infer_full_elem_ref_let(s: *EmitterState, stmt: *Stmt) -> i32
     stmt.var_pointee_type = leaf
     1
 
+# AGAST #2400: `let a = @p.f` and `let a = @&p.f`, f a scalar field, hold what
+# `let a: @T = @p.f` does: a `*T`, T the field's type, as #2571 types `@x[i]`.
+# The slot stayed i64 with no pointee: `@&` stored its ptr there and clang
+# rejected the IR; `@` went through ptrtoint, then `*a` loaded and stored 8
+# bytes of an i32 and `a + 1` strode one.  Struct fields are the #175 arm's;
+# pointer, array and enum fields aren't scalars here.  Returns 1 when it typed
+# the local.
+fn infer_field_ref_let(s: *EmitterState, stmt: *Stmt) -> i32
+    let init: *Expr = stmt.var_init
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or init == null
+        return 0
+    if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT)
+        return 0
+    if init.operand == null or init.operand.kind != EXPR_MEMBER
+        return 0
+    let f: *StructField = resolve_member_chain_field(s, init.operand)
+    if f == null or f.field_type_name_len != 0
+        return 0
+    let t: i32 = f.field_type
+    if t < TYPE_I32 or t > TYPE_F64 or t == TYPE_PTR or t == TYPE_PTR_PTR
+        return 0
+    stmt.var_type = TYPE_PTR
+    stmt.var_pointee_type = t
+    1
+
 # AGAST #2330: the struct an un-annotated `let p = @a`, `let q = p` or `let q = p + k`
 # holds an array of, for add_array_view: infer_array_ptr_let records N and T but
 # no name, since a name would register `p` as a `*S`.  null for scalars.
@@ -1566,6 +1591,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     if infer_struct_elem_let(s, stmt) == 1
         var_type = stmt.var_type
     if infer_full_elem_ref_let(s, stmt) == 1   # #2571: `@&x[i]`, an element
+        var_type = stmt.var_type
+    if infer_field_ref_let(s, stmt) == 1   # #2400: `@&p.f`, a scalar field
         var_type = stmt.var_type
 
     # `let task = @member.field[i]` — when the indexed field is an array
