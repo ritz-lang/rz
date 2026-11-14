@@ -844,7 +844,7 @@ class Parser:
                 # Don't allow type args to avoid ambiguity: `x as i64 < y`
                 # should parse as (x as i64) < y, not x as i64<y>
                 target_type = self.parse_type(allow_type_args=False)
-                left = rast.Cast(left.span, left, target_type)
+                left = rast.Cast(left.span, left, target_type, op_tok.span)
             elif op_tok.type == TokenType.DOTDOT:
                 right = self.parse_expr(prec)
                 left = rast.Range(left.span, left, right, False)

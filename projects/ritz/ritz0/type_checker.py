@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 import array_rules
 import bool_rules
+import enum_rules
 import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
@@ -560,6 +561,7 @@ class TypeChecker:
             self._check_array_slot(expr.expr, source, expr.target)
             self._check_array_into_scalar(expr.expr, source, expr.target)
             self._check_cast_to_ref(expr, source)
+            self._check_int_as_enum(expr, source)
             if self._is_bool_type(expr.target):
                 self._error(bool_rules.AS_BOOL_REMOVED, expr.span)
             return expr.target
@@ -1427,6 +1429,20 @@ class TypeChecker:
             return
         if isinstance(source, rast.ArrayType) or self._is_struct(source):
             self._report_value_into_ref(operand, target)
+
+    def _check_int_as_enum(self, cast: rast.Cast, source: Optional[rast.Type]) -> None:
+        """`n as E` with `n` an integer, for any enum `E`: fieldless, with a
+        representation type, or carrying data (LARB R19, AGAST #3040). An
+        integer may name no variant, so it's refused at the `as`; the way in
+        is a `match`. A slot error, so it's reported on every compile and
+        stops emission, which crashed on a data enum. `e as U` is §10.4's
+        enum-to-integer and isn't judged here."""
+        if source is None or not self._is_integer_type(source):
+            return
+        target = self._resolve_alias(cast.target)
+        if not isinstance(target, rast.NamedType) or target.name not in self.enums:
+            return
+        self._slot_error(enum_rules.int_as_enum(target.name), cast.as_span or cast.span)
 
     def _check_other_referent(self, expr: rast.Expr, actual: Optional[rast.Type],
                               slot: Optional[rast.Type]) -> None:

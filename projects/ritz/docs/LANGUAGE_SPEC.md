@@ -3223,6 +3223,22 @@ fn main() -> i32
     Shape.Empty as i32
 ```
 
+**`n as E`**, an integer to an enum, is an error for every enum, fieldless,
+with a representation type or carrying data, located at the `as`: an
+integer may name no variant (LARB R19, AGAST #3040). `match` on the integer
+instead, or use `E.from(n)` below for an enum with a representation type:
+
+```ritz expect-error="an integer can't be converted to enum `Dir` with `as`: it may name no variant; `match` on it"
+enum Dir
+    North
+    South
+
+fn main() -> i32
+    let n: i32 = 1
+    let d: Dir = n as Dir
+    0
+```
+
 **`E.from(v)`** converts back: given a value of the representation type, it
 returns `Some(variant)` for the variant with that discriminant, otherwise
 `None`. It is generated for each enum with a representation type in a

@@ -152,8 +152,7 @@ REJECTED = {
                               "    match c\n        R => 1\n" + _MAIN, 9, 5, "G, B"),
     # Shapes ritz1 has no type for. ritz0 reads the emitted value; ritz1 goes by
     # the arm, or `R` binds and the match reads as covered (match_arms_enum).
-    "untyped_scrutinee_cast": (_C + "fn f(x: i64) -> i64\n    match x as C\n        R => 1\n"
-                               "        G => 2\n" + _MAIN, 6, 5, "B"),
+    # `match x as C` was a row here: `n as E` is now an error (LARB R19, #3040).
     "untyped_scrutinee_deref_of_field": (
         _C + "struct H\n    p: *C\nfn f(h: H) -> i64\n    match *h.p\n        R => 1\n"
         "        G => 2\n" + _MAIN, 8, 5, "B"),
@@ -191,8 +190,7 @@ REJECTED = {
 # A scrutinee ritz1 can't type must still not bind a variant: with every variant
 # named it compiles and takes the right arm, or it fails. name -> (source, code).
 UNTYPED_BUT_COVERED = {
-    "cast": (_C + "fn main() -> i32\n    let x: i64 = 2\n    match x as C\n"
-             "        R => 1\n        G => 2\n        B => 3\n", 3),
+    # `match x as C` was a row here: `n as E` is now an error (LARB R19, #3040).
     "deref_of_field": (_C + "struct H\n    p: *C\nfn main() -> i32\n    var c: C = C.B\n"
                        "    let h = H { p: @c }\n    match *h.p\n"
                        "        R => 1\n        G => 2\n        B => 3\n", 3),

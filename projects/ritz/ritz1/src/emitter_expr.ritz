@@ -1454,6 +1454,32 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     emit_str(s, c"  ; try: unwrap struct payload\n")
     return payload
 
+# AGAST #3040 (LARB R19): `n as E` with `n` an integer, for any enum `E`, is
+# ritz0's located refusal at the `as`.  An integer may name no variant; the
+# way in is a `match`.  ritz1 stored the i64 as the `%E` and only llc refused
+# the IR.  An unannotated local reads as TYPE_I64 whatever it holds, so an
+# operand that resolves to an enum is `e as E`, not judged here.  1 when refused.
+fn int_as_enum_refused(s: *EmitterState, e: *Expr) -> i32
+    if e.op != TYPE_STRUCT or e.ident_len <= 0 or enum_find(e.ident_ptr, e.ident_len) < 0
+        return 0
+    if int_prim_bits(get_expr_type(s, e.left)) == 0
+        return 0
+    var en: *u8 = null
+    var en_len: i32 = 0
+    if resolve_scrutinee_enum(s, e.left, @en, @en_len) != 0
+        return 0
+    var n: i32 = 0
+    let head: *u8 = c"an integer can't be converted to enum `"
+    let tail: *u8 = c"` with `as`: it may name no variant; `match` on it"
+    let msg: *u8 = ctor_join(head, strlen(head) as i32, e.ident_ptr, e.ident_len, tail, strlen(tail) as i32, @n)
+    var line: i32 = e.bracket.line
+    var col: i32 = e.bracket.col
+    if line == 0
+        line = e.span.line
+        col = e.span.col
+    emit_nd_error(s, line, col, msg)
+    return 1
+
 # =============================================================================
 # Expression Emission - Single function to avoid mutual recursion
 # =============================================================================
@@ -1531,6 +1557,8 @@ fn emit_expr(s: *EmitterState, e: *Expr) -> i32
         # (the unified value model already keeps narrow ints in i64).
         let target_ty: i32 = e.op
         if struct_cast_to_int_refused(s, e) == 1   # AGAST #3008
+            return 0
+        if int_as_enum_refused(s, e) == 1          # AGAST #3040
             return 0
         # AGAST #2288: `c as C` with `c:& C` is the referent, as in ritz0.
         # It read as the pointer and ptrtoint'd it.

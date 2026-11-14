@@ -1869,7 +1869,7 @@ class Monomorphizer:
         elif isinstance(expr, rast.Cast):
             return rast.Cast(expr.span,
                             self._specialize_expr(expr.expr, subst),
-                            subst.apply(expr.target))
+                            subst.apply(expr.target), expr.as_span)
         elif isinstance(expr, rast.TryOp):
             # `operand?`: the operand can mention T (AGAST #1928).
             return rast.TryOp(expr.span, self._specialize_expr(expr.expr, subst))
@@ -2175,7 +2175,7 @@ class Monomorphizer:
         elif isinstance(expr, rast.Cast):
             return rast.Cast(expr.span,
                             self._rewrite_expr(expr.expr),
-                            self._rewrite_type(expr.target))
+                            self._rewrite_type(expr.target), expr.as_span)
         elif isinstance(expr, rast.Range):
             return rast.Range(expr.span,
                              self._rewrite_expr(expr.start) if expr.start else None,

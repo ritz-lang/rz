@@ -524,6 +524,9 @@ class Cast(Expr):
     """Type cast: expr as Type."""
     expr: Expr
     target: Type
+    # Where the `as` is, for an error about the conversion itself (`n as E`,
+    # AGAST #3040); None for a cast the compiler built.
+    as_span: Optional[Span] = None
 
 
 @dataclass

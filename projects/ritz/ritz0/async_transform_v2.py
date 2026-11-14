@@ -703,7 +703,8 @@ class SimpleBodyTransformer:
             return rast.Cast(
                 span=expr.span,
                 expr=self._transform_expr(expr.expr),
-                target=expr.target
+                target=expr.target,
+                as_span=expr.as_span
             )
 
         return expr
