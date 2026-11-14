@@ -1056,6 +1056,18 @@ class Monomorphizer:
             return rast.PtrType(expr.span, inner, mutable=expr.op in ('@&', '&mut'),
                                 shared=expr.op == '@')
 
+        # `D { .. }` is a D, and `Box<i32> { .. }` a Box<i32>, so an
+        # un-annotated `let t = D { .. }` binds T in `take(@t)` (AGAST #3064).
+        # A generic struct's literal without args (`Cell { v: 3 }`) names no
+        # instance: it stays untyped, and such a call the can't-infer error.
+        if isinstance(expr, rast.StructLit):
+            struct_def = self.struct_defs.get(expr.name)
+            if struct_def is None:
+                return None
+            if len(struct_def.type_params or []) != len(expr.type_args):
+                return None
+            return rast.NamedType(expr.span, expr.name, list(expr.type_args))
+
         # Field access: resolve the base struct and look the field up. This is
         # what makes `self.edges.push(x)` register vec_push<Edge>.
         if isinstance(expr, rast.Field):

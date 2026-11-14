@@ -37,11 +37,19 @@ impl Drop for T
         self.id = 0
 """
 
-# The ticket's program in one module: `let t = T {...}` gives inference no
-# type for `t`, so the call is the can't-infer error, as it is with `D`.
+# A generic struct's literal without args names no instance (#3064), so
+# inference has no type for `t` and the call is the can't-infer error: the
+# struct `T` doesn't bind the parameter `T`.
 UNINFERRED = ("fn take<T>(p: @T) -> T\n    *p\n" + STRUCT_T
-              + "pub fn main() -> i32\n    let t = T { id: 1 }\n"
-                "    let u: T = take(@t)\n    0\n")
+              + "struct Cell<T>\n    v: T\n"
+              + "pub fn main() -> i32\n    let t = Cell { v: 1 }\n"
+                "    let u = take(@t)\n    0\n")
+
+# The ticket's program in one module.  `let t = T {...}` is a `T`-the-struct,
+# as `let t: T` is (#3064), so the call binds the parameter to it.
+TICKET = ("fn take<T>(p: @T) -> T\n    *p\n" + STRUCT_T
+          + "pub fn main() -> i32\n    let t = T { id: 1 }\n"
+            "    let u: T = take(@t)\n    0\n")
 
 # The parameter `T` is a copy type in the generic body, and `@n` fits `@T`.
 # The `i32` instance is the only one, and `*p` copies there.
@@ -59,8 +67,10 @@ BESIDE_A_MOVE = OPAQUE.replace("    let n: i32 = 3\n",
                                "    let a = T { id: 1 }\n    let b = a\n    let c = a\n"
                                "    let n: i32 = 3\n")
 
-# Bound to the move-only struct, the instance moves out of a reference.
-INSTANCE = UNINFERRED.replace("let t = T {", "let t: T = T {")
+# Bound to the move-only struct, the instance moves out of a reference,
+# whether `t` is annotated or typed by its literal.
+INSTANCES = {"annotated": TICKET.replace("let t = T {", "let t: T = T {"),
+             "literal": TICKET}
 
 
 @pytest.fixture
@@ -78,7 +88,7 @@ def compile_with(ritz1_bin, tmp_path):
 def test_struct_named_like_the_param_does_not_bind_it(compile_with, compiler):
     comp, ll, _ = compile_with(compiler, "uninferred", UNINFERRED)
     assert _refusal(comp, ll, UNINFERRED) == (
-        "10:16", "can't infer `T` for `take`: write `take<T>(...)`")
+        "12:13", "can't infer `T` for `take`: write `take<T>(...)`")
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
@@ -90,9 +100,10 @@ def test_generic_body_and_call_see_the_param_not_the_struct(compile_with, compil
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_instance_at_the_move_only_struct_still_refused(compile_with, compiler):
-    comp, ll, _ = compile_with(compiler, "instance", INSTANCE)
-    assert _refusal(comp, ll, INSTANCE) == ("2:5", "cannot move out of a reference")
+@pytest.mark.parametrize("name", sorted(INSTANCES))
+def test_instance_at_the_move_only_struct_still_refused(compile_with, compiler, name):
+    comp, ll, _ = compile_with(compiler, name, INSTANCES[name])
+    assert _refusal(comp, ll, INSTANCES[name]) == ("2:5", "cannot move out of a reference")
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
