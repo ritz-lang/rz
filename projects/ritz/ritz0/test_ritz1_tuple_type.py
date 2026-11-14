@@ -28,8 +28,8 @@ with no known slot is typed in the emitter, from a call's parameter, a
 struct field or an earlier match arm, else from its elements (AGAST #3005).
 A tuple over a generic parameter (`-> (T, T)`, `(K, V)`) is a template,
 as a generic struct is: each instantiation substitutes it (`tuple_i32_i32`
-at T = i32) and registers that tuple (AGAST #2975).  One whose element
-points at a parameter (`(*T, i32)`) is still a located error (#3173).
+at T = i32) and registers that tuple (AGAST #2975), as does one whose
+element points at a parameter (`(*T, i32)` -> `tuple_ptr_i32_i32`, #3173).
 """
 
 import os
@@ -272,6 +272,70 @@ pub fn main() -> i32
     k * 10 + v as i32 + m.items.len as i32
 """
 
+# AGAST #3173: an element pointing at the parameter, at T = i32, at a
+# struct and at T = *u8 (`tuple_ptr_ptr_u8_i32`):
+# (5 + 1) + (9 + 1) + (11 + 1) = 28.
+GEN_PTR = """\
+struct Foo
+    a: i32
+
+fn pp<T>(p: *T) -> (*T, i32)
+    (p, 1)
+
+pub fn main() -> i32
+    var x: i32 = 5
+    var g: Foo = Foo { a: 9 }
+    var b: u8 = 200
+    var pb: *u8 = @b
+    let (q, c) = pp<i32>(@x)
+    let (s, e) = pp<Foo>(@g)
+    let (w, z) = pp<*u8>(@pb)
+    var k: i32 = 0
+    let bv: u8 = **w   # ritz0 reads a bare `**w` wide (AGAST #3192)
+    if bv == 200
+        k = 11
+    *q + c + s.a + e + k + z
+"""
+
+# `*T` at T = *u8 is `**u8`: `**w` loads a u8.  The u8 is the low byte of
+# a u16 0x07C8, so a wider load reads 1992 or more, compared in full (an
+# exit status keeps only the low byte).  ritz1 only: ritz0 loads it wide
+# (AGAST #3192).
+GEN_PTR_U8 = """\
+fn pp<T>(p: *T) -> (*T, i32)
+    (p, 1)
+
+pub fn main() -> i32
+    var h: u16 = 1992
+    var pb: *u8 = @h as *u8
+    let (w, z) = pp<*u8>(@pb)
+    if **w as i32 == 200
+        return 10 + z
+    3
+"""
+
+# `@T` at a struct and `@&T` at i64 (`tuple_ref_Foo_i32`,
+# `tuple_refmut_i64_i32`), read by index: ritz1 can't destructure a `@`
+# element, generic or not.  Unannotated, so the instantiation alone types
+# them.  (4 + 2) * 10 + (7 + 3) = 70.
+GEN_REF = """\
+struct Foo
+    a: i32
+
+fn rp<T>(p: @T) -> (@T, i32)
+    (p, 2)
+
+fn mp<T>(p: @&T) -> (@&T, i32)
+    (p, 3)
+
+pub fn main() -> i32
+    let f: Foo = Foo { a: 4 }
+    let t = rp<Foo>(@f)
+    var n: i64 = 7
+    let u = mp<i64>(@&n)
+    (t.0.a + t.1) * 10 + *u.0 as i32 + u.1
+"""
+
 
 # AGAST #3005: a tuple no slot types (the rejections of #2956 / #2974), typed
 # from its elements.  `let x = (a, a)`: f(1) = 1 + 1 + 1 = 3.
@@ -350,6 +414,8 @@ def test_tuple_with_no_slot_runs(ritz1_bin, tmp_path, compiler, name, program, e
         ("tuple_generic_struct", GEN_STRUCT, 34),
         ("tuple_generic_vec", GEN_VEC, 42),
         ("tuple_generic_impl_vec", GEN_IMPL_VEC, 69),
+        ("tuple_generic_ptr", GEN_PTR, 28),
+        ("tuple_generic_ref", GEN_REF, 70),
     ],
 )
 def test_tuple_programs_run(ritz1_bin, tmp_path, compiler, name, program, expected):
@@ -422,16 +488,35 @@ def test_ritz1_substitutes_tuple_over_generic_param(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_rejects_tuple_element_pointing_at_generic_param(ritz1_bin, tmp_path):
-    """`(*T, i32)` has no substitution yet (AGAST #3173): a located error at
-    the tuple type, not a `%tuple_ptr_T_i32` naming no struct."""
+def test_ritz1_tuple_element_pointing_at_pointer_arg_loads_its_width(ritz1_bin, tmp_path):
+    """AGAST #3173: `(*T, i32)` at T = *u8 binds a `**u8` (ritz1 only, #3192)."""
+    assert _run_pkg("ritz1", tmp_path, "tuple_generic_ptr_u8", GEN_PTR_U8) == 11
+
+
+@pytest.mark.integration
+def test_ritz1_substitutes_tuple_element_pointing_at_generic_param(ritz1_bin, tmp_path):
+    """AGAST #3173: `(*T, i32)` was refused.  At pp<i32> it is ritz0's
+    `tuple_ptr_i32_i32`, `{ptr, i32}`; the template's `tuple_ptr_T_i32` is
+    never emitted."""
+    proc = _ritz1_ir(ritz1_bin, tmp_path, GEN_PTR)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert re.search(r"^%tuple_ptr_i32_i32 = type \{\s*ptr,\s*i32\s*\}$", proc.ir, re.MULTILINE), proc.ir[:3000]
+    assert re.search(r"define\b.*%tuple_ptr_i32_i32 @\"?pp\$i32", proc.ir), proc.ir[:3000]
+    assert "ptr_T" not in proc.ir, proc.ir[:3000]
+
+
+@pytest.mark.integration
+def test_ritz1_rejects_tuple_element_double_pointer_at_generic_param(ritz1_bin, tmp_path):
+    """`(**T, i32)` has no substitution yet (AGAST #3184): a located error at
+    the tuple type, not a `%tuple_ptr_ptr_T_i32` naming no struct."""
     proc = _ritz1_ir(
         ritz1_bin,
         tmp_path,
-        "fn pp<T>(p: *T) -> (*T, i32)\n    (p, 1)\n\n"
-        "pub fn main() -> i32\n    var x: i32 = 5\n    let (q, c) = pp<i32>(@x)\n    *q + c\n",
+        "fn pp<T>(p: **T) -> (**T, i32)\n    (p, 1)\n\n"
+        "pub fn main() -> i32\n    var x: i32 = 5\n    var px: *i32 = @x\n"
+        "    let (q, c) = pp<i32>(@px)\n    **q + c\n",
     )
     assert proc.returncode != 0
-    assert re.search(r"t\.ritz:1:\d+: .*tuple element pointing at generic parameter `T`.*#3173", proc.stderr), (
+    assert re.search(r"t\.ritz:1:\d+: .*tuple element pointing at generic parameter `T`.*#3184", proc.stderr), (
         proc.stderr[-2000:]
     )

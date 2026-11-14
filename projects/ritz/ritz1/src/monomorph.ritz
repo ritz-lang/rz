@@ -2434,6 +2434,32 @@ fn tuple_subst(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, s
                 nf.field_type_name_len = nl
                 sp = nn
                 sl = nl
+        else if tuple_elem_points_at(f, type_param, type_param_len) == 1
+            # AGAST #3173: `*T` / `@T` / `@&T` at T = the argument, spelt as
+            # ritz0 mangles it: the template's `ptr_T` / `ref_T` / `refmut_T`
+            # with its trailing T replaced, so `(*T, i32)` at T = i32 is
+            # `tuple_ptr_i32_i32` (and at T = *u8, `tuple_ptr_ptr_u8_i32`).
+            var sn: *u8 = null
+            var snl: i32 = 0
+            get_type_name_from_suffix(suffix, suffix_len, @sn, @snl)
+            let st: i32 = parse_type_from_suffix(suffix, suffix_len)
+            subst_pointee_field(nf, st, sn, snl)
+            # The pointee as field_new records a written `*i32` / `**u8`:
+            # tuple_split_decl types the bound local from it.
+            if f.field_type == TYPE_PTR
+                if nf.field_type == TYPE_PTR_PTR
+                    nf.ptr_pointee = TYPE_VOID
+                    nf.inner_pointee_type = primitive_type_from_name(sn, snl)
+                    if nf.inner_pointee_type == 0
+                        nf.inner_pointee_type = TYPE_STRUCT
+                else
+                    nf.ptr_pointee = st
+            let keep: i32 = sl - type_param_len
+            let ps: *u8 = malloc((keep + suffix_len) as i64) as *u8
+            memcpy(ps, sp, keep as i64)
+            memcpy(ps + keep, suffix + 1, (suffix_len - 1) as i64)
+            sp = ps
+            sl = keep + suffix_len - 1
         let ga: *GenericArg = calloc(1, sizeof(GenericArg)) as *GenericArg
         ga.ty = TYPE_STRUCT   # only its spelling is read again
         ga.name = sp
@@ -2485,6 +2511,12 @@ fn tuple_subst(name: *u8, name_len: i32, type_param: *u8, type_param_len: i32, s
     tuple_reg_place(got, g_tuple_module)
     *out_len = got.def.name_len
     got.def.name
+
+# 1 when tuple element f is `*T` / `@T` / `@&T`, T = type_param (AGAST #3173).
+fn tuple_elem_points_at(f: *StructField, type_param: *u8, type_param_len: i32) -> i32
+    if f.field_type != TYPE_PTR and f.field_type != TYPE_REF and f.field_type != TYPE_MUT_REF
+        return 0
+    name_is_type_param(f.field_type_name, f.field_type_name_len, type_param, type_param_len)
 
 # Specialise `template` at ONE type parameter (type_param_name) bound to the
 # one-argument suffix "$arg".  The result's name is template.name + suffix.
