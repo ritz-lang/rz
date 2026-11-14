@@ -770,6 +770,8 @@ fn ptr_operand_stride(s: *EmitterState, x: *Expr) -> i64
 # and the byte distance divides by the left's stride (plain sdiv, as ritz0:
 # `exact` would make an unaligned pair poison).
 fn emit_ptr_distance(s: *EmitterState, e: *Expr) -> i32
+    if refuse_mixed_ptr_distance(s, e) == 1
+        return 0   # AGAST #2957
     var stride: i64 = ptr_operand_stride(s, e.left)
     if stride <= 0
         stride = 1
@@ -794,6 +796,88 @@ fn emit_ptr_distance(s: *EmitterState, e: *Expr) -> i32
     emit_int(s, stride)
     emit_str(s, c"\n")
     count
+
+# AGAST #2957: LANGUAGE_SPEC §7.1 — only two pointers to the same T have a
+# distance; `*i32 - *u8` has no common element to count in.  ritz1 divided the
+# byte distance by the left's stride.  Refuse it, located, in ritz0's words,
+# which name the pointer types as LLVM spells them (`*u8` is `i8*`, so `*u8`
+# and `*i8` are the same type, as in ritz0).  An operand whose pointee isn't
+# statically known keeps the old behaviour: never refuse on a guess.
+fn refuse_mixed_ptr_distance(s: *EmitterState, e: *Expr) -> i32
+    var ln: *u8 = null
+    var ll: i32 = 0
+    var rn: *u8 = null
+    var rl: i32 = 0
+    if ptr_distance_pointee(s, e.left, @ln, @ll) == 0 or ptr_distance_pointee(s, e.right, @rn, @rl) == 0
+        return 0
+    if name_eq(ln, ll, rn, rl) == 1
+        return 0
+    var n: i32 = 0
+    let lead: *u8 = c"pointer difference needs two pointers to the same type, got `"
+    let head: *u8 = ctor_join(lead, strlen(lead) as i32, ln, ll, c"*` and `", 8, @n)
+    let msg: *u8 = ctor_join(head, n, rn, rl, c"*`", 2, @n)
+    emit_nd_error(s, e.span.line, e.span.col, msg)
+    1
+
+# The pointee of the pointer operand `x` of `q - p`, as LLVM names it ("i32",
+# "%struct.E"), into out_name/out_len; returns 1, or 0 when it isn't
+# statically known.  `p + k` / `p - k` keep p's type, so a chain is read down
+# its left spine.
+fn ptr_distance_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+    var base: *Expr = x
+    while base != null and base.kind == EXPR_BINARY and (base.op == OP_ADD or base.op == OP_SUB) and is_ptr_distance(s, base) == 0
+        base = base.left
+    if base == null
+        return 0
+    var kind: i32 = 0
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if base.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+        if loc != null
+            if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+                return 0
+            kind = loc.pointee_type
+            name = loc.type_name
+            name_len = loc.type_name_len
+        else
+            let glob: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
+            if glob == null or glob.var_type != TYPE_PTR
+                return 0
+            kind = glob.pointee_type
+            name = glob.pointee_type_name
+            name_len = glob.pointee_type_name_len
+    else
+        kind = ptr_root_pointee(s, base, @name, @name_len)
+    let prim: *u8 = scalar_llvm_name(kind)
+    if prim != null
+        *out_name = prim
+        *out_len = strlen(prim) as i32
+        return 1
+    if kind != TYPE_STRUCT or name_len == 0 or find_struct(s, name, name_len) == null
+        return 0
+    var n: i32 = 0
+    *out_name = ctor_join(c"%struct.", 8, name, name_len, c"", 0, @n)
+    *out_len = n
+    1
+
+# A scalar kind's LLVM type, as emit_llvm_type spells it; null for any other.
+fn scalar_llvm_name(t: i32) -> *u8
+    if t == TYPE_U8 or t == TYPE_I8
+        return c"i8"
+    if t == TYPE_U16 or t == TYPE_I16
+        return c"i16"
+    if t == TYPE_U32 or t == TYPE_I32
+        return c"i32"
+    if t == TYPE_U64 or t == TYPE_I64
+        return c"i64"
+    if t == TYPE_F32
+        return c"float"
+    if t == TYPE_F64
+        return c"double"
+    if t == TYPE_BOOL
+        return c"i1"
+    null
 
 fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null

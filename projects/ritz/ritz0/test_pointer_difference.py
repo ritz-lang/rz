@@ -98,6 +98,17 @@ pub fn main() -> i32
         return 1
     0
 """,
+    # `*u8` and `*i8` are one LLVM type, `i8*`: ritz0 gives their distance
+    "signedness": """\
+pub fn main() -> i32
+    let p: *u8 = c"abcd"
+    let s: *i8 = p as *i8
+    if (p + 3) - s != 3
+        return 1
+    if s - (p + 1) != -1
+        return 2
+    0
+""",
     # the distance used in place: `+ 1` adds one, and it indexes as a count
     "in_place": """\
 pub fn main() -> i32
@@ -137,21 +148,44 @@ def test_pointer_difference_counts_elements(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, f"ptrdiff_{name}", PROGRAMS[name]) == 0
 
 
-# Two pointee types have no common element to count in.  ritz0 refuses it,
-# located; ritz1 counting in the left's elements is #2957.
-def test_pointer_difference_of_two_types_is_refused(tmp_path):
-    src = """\
+# Two pointee types have no common element to count in (#2957): ritz0 refuses
+# it, located, and ritz1 counted in the left's elements.  The type is the one
+# LLVM sees, so `*u8 - *i8` above is one type, and a reference operand is
+# refused as its pointer is.
+MIXED = {
+    "ptr": ("""\
 pub fn main() -> i32
     var a: [8]i32
     let s: *u8 = c"abcd"
     let p: *i32 = @a[0]
     let d: i64 = ^p - s
     0
-"""
+""", "`i32*` and `i8*`"),
+    "refs": ("""\
+fn dist(q: @i32, p: @u8) -> i64
+    ^q - p
+
+pub fn main() -> i32
+    0
+""", "`i32*` and `i8*`"),
+    "mut_ref": ("""\
+fn back(q: @&i32, p: *i64) -> i64
+    ^q + 1 - p
+
+pub fn main() -> i32
+    0
+""", "`i32*` and `i64*`"),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(MIXED))
+def test_pointer_difference_of_two_types_is_refused(tmp_path, compiler, name):
+    src, types = MIXED[name]
     _assert_refused(
-        "ritz0",
+        compiler,
         tmp_path,
-        "ptrdiff_mixed",
+        f"ptrdiff_mixed_{name}",
         src,
-        "pointer difference needs two pointers to the same type, got `i32*` and `i8*`",
+        f"pointer difference needs two pointers to the same type, got {types}",
     )
