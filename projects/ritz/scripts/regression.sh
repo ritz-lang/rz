@@ -342,9 +342,14 @@ get_examples() {
 # Consequently, do not "fix" a red Stage 5 by editing an allowlist — adding the
 # example to the list, or removing it, cannot change the Stage 5 verdict by
 # construction.  A red Stage 5 is a self-hosting bug in the compiler.
+#
+# RITZ_REGRESSION_RITZ1_ALLOWLIST replaces the ritz1 / ritz1_selfhosted list
+# with another file.  It exists for scripts/prove-stage5-divergence.sh only
+# (see "Stage 5 proof hooks" below); the gate never sets it.
 known_failures_file() {
     case "$1" in
-        ritz1|ritz1_selfhosted) echo "$SCRIPT_DIR/regression-known-failures-ritz1.txt" ;;
+        ritz1|ritz1_selfhosted)
+            echo "${RITZ_REGRESSION_RITZ1_ALLOWLIST:-$SCRIPT_DIR/regression-known-failures-ritz1.txt}" ;;
         *)                      echo "$SCRIPT_DIR/regression-known-failures.txt" ;;
     esac
 }
@@ -1419,6 +1424,26 @@ run_stage2() {
 # compile, record the raw accept/reject for Stage 5 (before any allowlist),
 # run the example's test.sh, run it and compare with the Stage 1 baseline.
 
+# Stage 5 proof hooks (AGAST #3200).  scripts/prove-stage5-divergence.sh
+# synthesises a ritz1 vs ritz1_selfhosted divergence that the allowlist
+# silences in Stage 4, and asserts Stage 5 still fails the suite.  It used to
+# text-patch a copy of this file at Stage 4's compile line, and rotted when
+# that line moved here.  Two env vars replace the patch:
+#
+#   RITZ_REGRESSION_RITZ1_ALLOWLIST           see known_failures_file
+#   RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT  an example key; ritz1_selfhosted
+#                                             rejects it without compiling
+#
+# Both are unset in the gate, where neither changes anything.
+# scripts/test-regression-inject.sh tests them.
+#
+# Args: $1=compiler, $2=example key.  True when the hook rejects this one.
+injected_selfhosted_reject() {
+    [[ "$1" == "ritz1_selfhosted" &&
+       -n "${RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT:-}" &&
+       "$2" == "$RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT" ]]
+}
+
 # Set by run_differential for its workers.
 DIFF_COMPILER=""
 DIFF_PREFIX=""
@@ -1440,7 +1465,8 @@ differential_worker() {
         return 0
     fi
 
-    if ! compile_with "$DIFF_COMPILER" "$example_dir" "$bin" 2>/dev/null; then
+    if injected_selfhosted_reject "$DIFF_COMPILER" "$name" ||
+       ! compile_with "$DIFF_COMPILER" "$example_dir" "$bin" 2>/dev/null; then
         record_compile_outcome "$DIFF_COMPILER" "$name" rejected
         if is_known_failure "$DIFF_COMPILER" "$name"; then
             warn "$name: $DIFF_LABEL compile failed (known, allowlisted)"
@@ -1722,6 +1748,11 @@ echo ""
 echo "🎭 Ritz Regression Test Suite"
 echo "======================================"
 echo ""
+# A proof hook left set would quietly change what this run measures.
+for _hook in RITZ_REGRESSION_RITZ1_ALLOWLIST RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT; do
+    [[ -n "${!_hook:-}" ]] && warn "$_hook=${!_hook} is set: a Stage 5 proof run, not a real one"
+done
+unset _hook
 
 # Run selected stages.  Every stage goes through run_timed so the Summary can
 # say where the time went (scripts/test-regression-stage4.sh checks this).
