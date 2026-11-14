@@ -15,7 +15,8 @@ silently reseated `r` onto `v`: the caller's struct was never written.
 
 ritz1 now loads the borrow's pointer and stores the value at T.  The f32 / f64
 store (#1668's) goes through the same arm and is pinned here too; READING a
-`:&` float or a `:& bool` at all is still #1668, pinned in KNOWN_GAPS.
+`:&` float at all is still #1668, pinned in KNOWN_GAPS.  A `:& bool` binds as
+the `bool` itself, as an integer does (AGAST #2994).
 
 Every program returns 3 only if the caller sees the whole new value, and the
 neighbouring rows check the store is exactly T wide.
@@ -196,10 +197,22 @@ pub fn main() -> i32
         return 9
     p.x as i32
 """,
+    # AGAST #2994, once #1668's.
+    "bool_literal": """\
+fn w(r:& bool)
+    r = true
+
+pub fn main() -> i32
+    var x: bool = false
+    w(@&x)
+    if x
+        return 3
+    1
+""",
 }
 
-# ritz0 is right; ritz1 refuses or miscompiles.  All READ a `:&` float or
-# bool, which #1668 hasn't lowered: the store above is not the problem.
+# ritz0 is right; ritz1 refuses or miscompiles.  All READ a `:&` float, which
+# #1668 hasn't lowered: the store above is not the problem.
 KNOWN_GAPS = {
     "f32_from_borrow": (1668, """\
 fn w(r:& f32, v:& f32)
@@ -219,17 +232,6 @@ pub fn main() -> i32
     var x: f64 = 1.0
     w(@&x)
     x as i32
-"""),
-    "bool_literal": (1668, """\
-fn w(r:& bool)
-    r = true
-
-pub fn main() -> i32
-    var x: bool = false
-    w(@&x)
-    if x
-        return 3
-    1
 """),
 }
 

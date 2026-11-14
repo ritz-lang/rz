@@ -2433,8 +2433,6 @@ RITZ1_GAPS = {
     "by_value_self": "AGAST #2278: ritz1 doesn't know a typed `self:& T` is a borrow",
     "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
-    "by_value_bool_field": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
-    "by_value_bool_literal": "AGAST #1668: a `:&` bool isn't auto-dereferenced",
     "match_borrow_scrutinee": "AGAST #2289: `match` on a `:&` enum spills the pointer",
     "match_borrow_scrutinee_value": "AGAST #2289: `match` on a `:&` enum spills the pointer",
     "array_referent_return": "AGAST #2302: ritz1 has no array return yet",

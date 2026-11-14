@@ -55,6 +55,9 @@ REFERENTS = {
     "struct": ("C", "fn w(r:& C)\n    r.x = 3\n", "C { x: 1, y: 0 }", "{}.x", "", "", "a[1].x = 1"),
     "array": ("[2]i32", "fn w(r:& [2]i32)\n    r[1] = 3\n", "[1, 1]", "{}[1]", "", "", "a[1][1] = 1"),
     "pointer": ("*C", "fn w(r:& *C, d: *C)\n    r = d\n", "@c1", "{}.x", ", @c3", GOOD, "a[1] = @c1"),
+    # AGAST #2994: the callee reads and writes it, and a `bool` local's slot is
+    # wider than the `bool` it holds.
+    "bool": ("bool", "fn w(r:& bool)\n    r = not r\n", "false", "({} as i32) * 3", "", "", "a[1] = false"),
 }
 
 
@@ -111,6 +114,8 @@ def _table() -> dict:
 
 
 TABLE = _table()
+# ritz1's own `bool` global, not the borrow: `g = false` is invalid IR there.
+TABLE_GAPS = {"bool_global": "AGAST #3001: ritz1 stores a `bool` global's i64 value as i1"}
 
 # The same borrow through each way of calling.
 INT_WRITER = "fn w(r:& i32)\n    r = 3\n\n"
@@ -250,6 +255,14 @@ ROUTES = {
     "generic_struct_type": "struct B<T>\n    v: T\n\nfn w(r:& B<i32>)\n    r.v = 3\n\n"
                            "pub fn main() -> i32\n    var b: B<i32> = B<i32> { v: 1 }\n    w(b)\n"
                            "    return b.v\n",
+    # AGAST #2994: the callee's `b` is a `bool` in a condition, a loop, an
+    # operand and a by-value argument.
+    "bool_conditions": "fn id(x: bool) -> bool\n    return x\n\n"
+                       "fn w(b:& bool) -> i32\n    var n: i32 = 0\n    while not b\n"
+                       "        b = true\n    if b\n        n = n + 1\n    if b and id(b)\n"
+                       "        n = n + 1\n    return n\n\n"
+                       "pub fn main() -> i32\n    var b: bool = false\n    let n: i32 = w(b)\n"
+                       "    return n + (b as i32)\n",
     "aliased_type": "type N = i32\n\nfn w(r:& N)\n    r = 3\n\n"
                     "pub fn main() -> i32\n    var n: i32 = 1\n    w(n)\n    return n\n",
 }
@@ -279,6 +292,19 @@ pub fn main() -> i32
 
 WIDTHS = {t: _neighbours(t, f"fn w(r:& {t})\n    r = 3\n")
           for t in ("i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64")}
+# A `bool` is no integer, so it gets its own neighbours (AGAST #2994).
+WIDTHS["bool"] = """fn w(r:& bool)
+    r = not r
+
+pub fn main() -> i32
+    var a: [3]bool = [true, false, true]
+    w(a[1])
+    if not a[0]
+        return 41
+    if not a[2]
+        return 42
+    return (a[1] as i32) * 3
+"""
 
 # The ruling's `:&` row: what isn't a place of `T` passes as the pointer it is.
 POINTER_FAMILY = {
@@ -307,6 +333,9 @@ POINTER_FAMILY = {
     "pointer_to_pointer": C + "fn w(r:& *C, d: *C)\n    r = d\n\n"
                           "pub fn main() -> i32\n" + GOOD +
                           "    var p: *C = @c1\n    let pp: **C = @p\n    w(pp, @c3)\n    return p.x\n",
+    "bool_pointer": "fn w(r:& bool)\n    r = true\n\npub fn main() -> i32\n"
+                    "    var b: bool = false\n    let p: *bool = @b\n    w(p)\n"
+                    "    return (b as i32) * 3\n",
     "explicit_mut": INT_WRITER + "pub fn main() -> i32\n    var n: i32 = 1\n    w(@&n)\n    return n\n",
     "explicit_pointer_referent": C + "fn w(r:& *C, d: *C)\n    r = d\n\n"
                                  "pub fn main() -> i32\n" + GOOD +
@@ -337,6 +366,7 @@ RVALUES = {
     "pointer_call": (C + "fn g(p: *C) -> *C\n    return p\n\nfn w(r:& *C)\n    r = null\n\n",
                      "w(g(null))"),
     "null": (INT_WRITER, "w(null)"),
+    "bool_literal": ("fn w(r:& bool)\n    r = true\n\n", "w(true)"),
     "c_string": ("fn w(r:& u8)\n    r = 3\n\n", 'w(c"x")'),
     "const": ("const K: i32 = 1\n\n" + INT_WRITER, "w(K)"),
     # A slice makes a value, so nothing reached through one is a place.
@@ -455,6 +485,12 @@ MISFITS = {
     "element_sign": (INT_WRITER, "var a: [2]u32 = [1, 1]\n    w(a[1])"),
     "pointee_sign": ("fn w(r:& *i32)\n    r = null\n\n", "var p: *u32 = null\n    w(p)"),
     "generic_sign": (GENERIC_WRITER, "var n: u32 = 1\n    w<i32>(n, 3)"),
+    # AGAST #2994: a `bool` local fits `:& bool`, and still no byte, either
+    # sign, nor the `i64` its slot is kept as.
+    "u8_for_bool": ("fn w(r:& bool)\n    r = true\n\n", "var n: u8 = 1\n    w(n)"),
+    "i8_for_bool": ("fn w(r:& bool)\n    r = true\n\n", "var n: i8 = 1\n    w(n)"),
+    "bool_for_u8": ("fn w(r:& u8)\n    r = 3\n\n", "var b: bool = false\n    w(b)"),
+    "bool_for_i64": (INT_WRITER.replace("i32", "i64"), "var b: bool = false\n    w(b)"),
 }
 # ritz0's method paths convert what they're given, so these need their own check.
 METHOD_MISFITS = {
@@ -558,8 +594,15 @@ def _main(setup, body):
     return setup + "pub fn main() -> i32\n    var v: i32 = 1\n    " + body + "\n    return 0\n"
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(TABLE))
+def _table_params():
+    for name in sorted(TABLE):
+        for compiler in COMPILERS:
+            reason = TABLE_GAPS.get(name) if compiler != "ritz0" else None
+            marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
+            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
+
+
+@pytest.mark.parametrize("name,compiler", list(_table_params()))
 def test_a_place_is_borrowed(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, name, TABLE[name]) == 3
 
