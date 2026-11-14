@@ -667,11 +667,13 @@ RVALUES = {
                         + _FILL_GH + _WRITES.format(it="mk().a", place="gh.a")),
     "literal": (MAIN + "    var a: [3]i32 = [1, 2, 4]\n"
                 + _WRITES.format(it="[a[0], a[1], a[2]]", place="a")),
-}
-# ritz1 returns the array (#2302) but has no slot for `for v in mk()` yet (#2997).
-RVALUES_ON_RITZ0 = {
+    # AGAST #2997: an `-> [N]T` call's `[N x T]`, in a slot of its own.
     "call": ("var g: [3]i32\n\nfn mk() -> [3]i32\n    return g\n\n" + MAIN + _fill("g", _SEED)
              + _WRITES.format(it="mk()", place="g")),
+    "method_call": ("var g: [3]i32\n\nstruct K\n    x: i64\n\nimpl K\n"
+                    "    fn mk(self: @K) -> [3]i32\n        return g\n\n" + MAIN
+                    + _fill("g", _SEED) + "    var k: K\n    k.x = 0\n"
+                    + _WRITES.format(it="k.mk()", place="g")),
 }
 
 
@@ -682,10 +684,24 @@ def test_an_rvalue_keeps_its_temporary(run_with, compiler, name):
     assert run_with(compiler, name, RVALUES[name]) == 7
 
 
+# AGAST #2997: the call is made once, before the loop, not once per pass.
+_ARR_CALLS = "var g: [3]i32\nvar calls: i32 = 0\n\n"
+_ARR_ONCE = ("    var t: i32 = 0\n    for v in {it}\n        t = t + v\n    if t != 7\n        return 1\n"
+             "    if calls != 1\n        return 2\n    return 0\n")
+ARRAY_CALLS_ONCE = {
+    "call": (_ARR_CALLS + "fn mk() -> [3]i32\n    calls = calls + 1\n    return g\n\n" + MAIN
+             + _fill("g", _SEED) + _ARR_ONCE.format(it="mk()")),
+    "method_call": (_ARR_CALLS + "struct K\n    x: i64\n\nimpl K\n    fn mk(self: @K) -> [3]i32\n"
+                    "        calls = calls + 1\n        return g\n\n" + MAIN + _fill("g", _SEED)
+                    + "    var k: K\n    k.x = 0\n" + _ARR_ONCE.format(it="k.mk()")),
+}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RVALUES_ON_RITZ0))
-def test_ritz0_an_rvalue_keeps_its_temporary(run_with, name):
-    assert run_with("ritz0", name, RVALUES_ON_RITZ0[name]) == 7
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ARRAY_CALLS_ONCE))
+def test_an_array_call_runs_once(run_with, compiler, name):
+    assert run_with(compiler, name, ARRAY_CALLS_ONCE[name]) == 0
 
 
 # What `h.a` is reached through is evaluated once.
