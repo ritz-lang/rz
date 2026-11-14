@@ -7,10 +7,8 @@ initializer not supported", ...): a traceback, no file:line:col, for
 located error.
 
 Every case runs through ritz0, ritz1 and ritz1_selfhosted.  The message is
-ritz1's.  ritz1 locates "non-constant initializer" at the global's declaration
-(column 1); ritz0 points at the initializer itself, so that column is pinned
-per compiler.  The bool-into-int case is located at the initializer on all
-three.  Accepted forms (`~0`, `-~2`) are run in test_ritz1_global_var_init.py.
+ritz1's, and all three locate it at the initializer, not at the global's
+declaration (AGAST #3043: ritz1 said column 1).  Accepted forms (`~0`, `-~2`) are run in test_ritz1_global_var_init.py.
 """
 
 import os
@@ -31,14 +29,14 @@ _MAIN = "fn main() -> i32\n    0\n"
 _NON_CONST = "global 'g' has a non-constant initializer"
 _B2I = "cannot use bool as an integer: write `b as i32`"
 
-# name -> (source, line, ritz0 column, ritz1 column, message prefix)
+# name -> (source, line, column, message prefix)
 REJECTED = {
-    "binary": ("var g: i32 = 1 + 2\n" + _MAIN, 1, 14, 1, _NON_CONST),
-    "bool_into_int": ("var g: i32 = true\n" + _MAIN, 1, 14, 14, _B2I),
-    "not_of_a_global": ("var x: bool\nvar g: bool = not x\n" + _MAIN, 2, 15, 1, _NON_CONST),
-    "neg_of_a_global": ("var x: i32\nvar g: i32 = -x\n" + _MAIN, 2, 14, 1, _NON_CONST),
-    "bit_not_of_a_global": ("var x: i32\nvar g: i32 = ~x\n" + _MAIN, 2, 14, 1, _NON_CONST),
-    "cast_of_binary": ("var g: i64 = (1 + 2) as i64\n" + _MAIN, 1, 15, 1, _NON_CONST),
+    "binary": ("var g: i32 = 1 + 2\n" + _MAIN, 1, 14, _NON_CONST),
+    "bool_into_int": ("var g: i32 = true\n" + _MAIN, 1, 14, _B2I),
+    "not_of_a_global": ("var x: bool\nvar g: bool = not x\n" + _MAIN, 2, 15, _NON_CONST),
+    "neg_of_a_global": ("var x: i32\nvar g: i32 = -x\n" + _MAIN, 2, 14, _NON_CONST),
+    "bit_not_of_a_global": ("var x: i32\nvar g: i32 = ~x\n" + _MAIN, 2, 14, _NON_CONST),
+    "cast_of_binary": ("var g: i64 = (1 + 2) as i64\n" + _MAIN, 1, 15, _NON_CONST),
 }
 
 
@@ -63,8 +61,7 @@ def _compile(request, compiler, tmp_path, source):
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REJECTED))
 def test_an_unlowerable_global_initializer_is_a_located_error(request, tmp_path, compiler, name):
-    source, line, col0, col1, message = REJECTED[name]
-    col = col0 if compiler == "ritz0" else col1
+    source, line, col, message = REJECTED[name]
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
