@@ -54,6 +54,10 @@ class Loan:
     # The place's steps below the root: a field's name, or '[]' for an index
     # (R11a: any two indexes count as equal). `@c.x` is ('x',).
     path: Tuple[str, ...] = ()
+    # A `for`'s loan on the place its iterable indexes into (AGAST #2439): only
+    # a use of that place, or of one holding it, can move the buffer, so only
+    # those conflict. `vs[0].a[2] = 50` is inside `vs` and stays legal.
+    outer: bool = False
 
 
 @dataclass
@@ -730,7 +734,8 @@ class MoveChecker:
         """The loan on `info` a new borrow of `path` (`mutable` or not)
         conflicts with: an overlapping mutable loan first, else, for a mutable
         borrow, an overlapping shared one."""
-        near = [b for b in info.borrows if self._overlap(b.path, path)]
+        near = [b for b in info.borrows if self._overlap(b.path, path)
+                and (not b.outer or len(path) <= len(b.path))]
         for b in near:
             if b.mutable:
                 return b
@@ -800,6 +805,30 @@ class MoveChecker:
             info = self.scope.lookup(place[0]) if place is not None else None
             if info is not None and info is not holder:
                 info.borrows.append(Loan(e.span, e.op in ('&mut', '@&'), holder, place[1]))
+
+    def _for_loan(self, it: rast.Expr) -> Optional[Tuple[VarInfo, Loan]]:
+        """The loan a `for` over `it` holds for its body (LARB R11, AGAST
+        #2439): a `for` walks a place in place (§6.3), so when the place's path
+        crosses an index into anything but an array (a Vec, a Span, a pointer),
+        a push may move the storage it walks. The loan is an `@` of the base of
+        the last such index, `vs` in `vs[0].a`, `s.vs` in `s.vs[0].a`."""
+        while isinstance(it, rast.Grouped) or (
+                isinstance(it, rast.UnaryOp) and it.op in ('&', '@')):
+            it = it.expr if isinstance(it, rast.Grouped) else it.operand
+        e, base = it, None
+        while isinstance(e, (rast.Grouped, rast.Field, rast.Index)):
+            inner = e.expr
+            if isinstance(e, rast.Index) and base is None:
+                held = self.types.resolve(self._loan_type(inner))
+                if held is not None and not isinstance(held, rast.ArrayType) and not (
+                        isinstance(held, rast.NamedType) and held.name == 'unknown'):
+                    base = inner
+            e = inner
+        place = self._loan_place(base) if base is not None else None
+        info = self.scope.lookup(place[0]) if place is not None else None
+        if info is None:
+            return None
+        return info, Loan(base.span, False, None, place[1], outer=True)
 
     def _release_arg_loans(self, mark: int) -> None:
         """End the argument loans made since `mark`."""
@@ -1018,6 +1047,9 @@ class MoveChecker:
             # reaches stays its owner's, so the loop only reads it.
             self._check_expr(stmt.iter,
                              is_move_context=not self._through_reference(stmt.iter))
+            held = self._for_loan(stmt.iter)
+            if held is not None:
+                held[0].borrows.append(held[1])
 
             def iteration():
                 self._push_scope()
@@ -1028,6 +1060,8 @@ class MoveChecker:
                 self._pop_scope()
                 return done
             self._check_loop(iteration)
+            if held is not None:
+                held[0].borrows = [b for b in held[0].borrows if b is not held[1]]
             return False
 
         elif isinstance(stmt, rast.BreakStmt):

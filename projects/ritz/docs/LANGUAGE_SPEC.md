@@ -1595,8 +1595,36 @@ the trips, and is safe when it moves the buffer.
 - Only an rvalue gets a temporary: a call's by-value result (`for x in mk()`, or
   `mk().a`), or a literal. Nothing else can reach it, so nothing can write to it.
 - A place reached *through* a `Vec`'s element, such as `vs[0].a`, is an address
-  into that `Vec`'s buffer, as `@vs[0]` is. If the body moves that buffer, the
-  address is no longer valid.
+  into that `Vec`'s buffer, as `@vs[0]` is. So when the iterable's path crosses an
+  index into anything but an array (a `Vec`, a `Span` or a pointer), the loop holds
+  an `@` of the place that index is into, the last one on the path (`vs` in
+  `vs[0].a`, `s.vs` in `s.vs[0].a`), for its whole body (LARB R11). A mutable
+  borrow of that place, or of one holding it, is §13.5's located error in the
+  body: `vs.push(h)`, `@&vs`, `vs` bare into a `:&` param, `vs = w`. A use
+  *inside* it can't move the buffer and stays legal, and the loop sees it:
+  `vs[0].a[2] = 50`, `@&vs[1]`. `for x in vs` walks the `Vec` itself and holds
+  nothing (a push is safe, above), nor does a path through arrays alone
+  (`h.a`, `hs[0].a`), whose storage can't move.
+
+  ```ritz expect-error="cannot borrow `vs` as mutable - `vs` is already borrowed as immutable"
+  import ritzlib.gvec
+
+  struct H
+      a: [3]i32
+
+  fn main() -> i32
+      var vs: Vec<H> = vec_new<H>()
+      var h: H
+      vs.push(h)
+      for x in vs[0].a
+          vs[0].a[2] = 50     # fine: inside `vs`, and seen
+          vs.push(h)          # refused: may move the buffer the loop walks
+      0
+  ```
+- That's a definite-case check, as §13.5's are. A push through another path,
+  such as a pointer to `vs` or a callee that reaches it, isn't seen, and nor is
+  `let p: *H = @vs[0]` (a `*T` isn't a borrow). If such a push moves the buffer,
+  the address the loop walks is no longer valid.
 
 ### 6.4 Loop (Infinite)
 
@@ -3843,7 +3871,9 @@ a[2] = 5
 
 So a push can't move a Vec's buffer out from under a reference to its element:
 `let p: @H = @vs[0]` is a loan of `vs[_]`, which overlaps `vs`, so `vs.push(h)`
-is refused. A write through a field or element that's itself overlapped
+is refused. A `for` over a place reached through a Vec's element (`for x in
+vs[0].a`) holds an `@` of `vs` for its body in the same way (§6.3). A write
+through a field or element that's itself overlapped
 (`let e = @c.x` then `c.x.k = 2`, or `c.up()`) is refused just the same.
 
 The arguments of one call are live together, so a read of `x` can't sit beside

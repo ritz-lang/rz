@@ -85,6 +85,10 @@ struct RefLoan
     mutable: i32
     depth: i32
     place: *Expr
+    # A `for`'s loan on the place its iterable indexes into (AGAST #2439): only a
+    # use of that place, or of one holding it, conflicts.  `vs[0].a[2] = 50` is
+    # inside `vs`: it can't move the buffer, and stays legal.
+    outer: i32
 
 var REF_LOANS: *RefLoan = null
 var REF_LOAN_COUNT: i32 = 0
@@ -1091,6 +1095,8 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
     ref_check_write(s, stmt)
     ref_walk_target(s, stmt)
     ref_loan_write(s, stmt)
+    if k == STMT_FOR
+        ref_for_hold(s, stmt)
     var slot: RefTy
     if k == STMT_VAR_DECL
         if stmt.var_init != null and ref_decl_slot(stmt, @slot) == 1
@@ -1612,6 +1618,7 @@ pub fn ref_loans_end(depth: i32)
             to.mutable = l.mutable
             to.depth = l.depth
             to.place = l.place
+            to.outer = l.outer
             kept = kept + 1
     REF_LOAN_COUNT = kept
 
@@ -1735,7 +1742,7 @@ fn ref_loan_conflict(root: i32, place: *Expr, mutable: i32) -> *RefLoan
     var shared: *RefLoan = null
     for i in 0..REF_LOAN_COUNT
         let l: *RefLoan = loans + i
-        if l.root == root and ref_places_overlap(l.place, place) == 1
+        if l.root == root and ref_places_overlap(l.place, place) == 1 and (l.outer == 0 or ref_place_depth(place) <= ref_place_depth(l.place))
             if l.mutable == 1
                 return l
             if shared == null
@@ -1869,6 +1876,7 @@ fn ref_loan_add(root: i32, place: *Expr, mutable: i32, depth: i32)
             to.mutable = from.mutable
             to.depth = from.depth
             to.place = from.place
+            to.outer = from.outer
         if REF_LOANS != null
             free(REF_LOANS as *u8)
         REF_LOANS = grown
@@ -1878,7 +1886,36 @@ fn ref_loan_add(root: i32, place: *Expr, mutable: i32, depth: i32)
     l.mutable = mutable
     l.depth = depth
     l.place = place
+    l.outer = 0
     REF_LOAN_COUNT = REF_LOAN_COUNT + 1
+
+# The loan a `for` over a place holds for its body (LARB R11, AGAST #2439).  A
+# `for` walks a place in place (§6.3), so when the place's path crosses an index
+# into anything but an array (a Vec, a Span, a pointer), a push may move the
+# storage it walks.  The loan is an `@` of the base of the last such index: `vs`
+# in `vs[0].a`, `s.vs` in `s.vs[0].a`.  It lasts as the body's scope does.  As
+# ritz0's MoveChecker._for_loan.
+fn ref_for_hold(s: *EmitterState, stmt: *Stmt)
+    if stmt.for_end != null or stmt.for_start == null
+        return
+    var e: *Expr = stmt.for_start
+    while e.kind == EXPR_UNARY and e.op == OP_ADDR
+        e = e.operand
+    var base: *Expr = null
+    while base == null and (e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX)
+        if e.kind == EXPR_INDEX
+            var t: RefTy
+            if ref_loan_ty(s, e.left, @t) == 1 and t.kind != TYPE_ARRAY
+                base = e.left
+        e = e.left
+    if base == null
+        return
+    let root: i32 = ref_loan_root(s, base)
+    if root < 0
+        return
+    ref_loan_add(root, base, 0, REF_DEPTH + 1)
+    let l: *RefLoan = REF_LOANS + (REF_LOAN_COUNT - 1)
+    l.outer = 1
 
 # The `@place` and `@&place` a declaration's binding holds: its value, or an arm's
 # tail of an `if` or `match` value.
