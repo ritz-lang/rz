@@ -13285,6 +13285,11 @@ class LLVMEmitter:
         receiver_val = None
         if self._receiver_short_of_self(expr.expr, first_param_type, receiver_probe):
             receiver_val = self._borrow_receiver(expr.expr, fn_def.params[0], receiver_probe)
+        elif self._deref_place_receiver(expr.expr, first_param_type, receiver_probe):
+            # LARB R9: `*p` is a place, so `(*p).m()` is `p.m()`. The probe
+            # loaded the struct from the pointee; lend that address, not a
+            # copy of what it loaded (AGAST #2175).
+            receiver_val = receiver_probe.operands[0]
         elif receiver_is_lvalue and isinstance(first_param_type, ir.PointerType):
             self._check_let_implicit_mut_borrow(expr.expr, fn_def.params[0])
             # Try to get address of the receiver
@@ -13455,6 +13460,20 @@ class LLVMEmitter:
         if levels + 1 == self_levels and is_place:
             return True
         raise EmitError(ref_rules.RECEIVER_SHORT_OF_SELF, recv.span)
+
+    @staticmethod
+    def _deref_place_receiver(recv: rast.Expr, self_type: ir.Type,
+                              probe: Optional[ir.Value]) -> bool:
+        """Is `recv` a `*p` whose pointee is what a pointer `self` points at?
+
+        `*p` is a place (LARB R9), so a `self: *T`, `@T` or `@&T` method runs
+        on the pointee. The probe is the load of `*p`; its operand is `p`'s
+        value, already evaluated once. A by-value `self` still takes a copy.
+        """
+        return (isinstance(recv, rast.UnaryOp) and recv.op == '*'
+                and isinstance(self_type, ir.PointerType)
+                and isinstance(probe, ir.LoadInstr)
+                and probe.type == self_type.pointee)
 
     def _borrow_receiver(self, recv: rast.Expr, param: rast.Param,
                          probe: Optional[ir.Value]) -> ir.Value:

@@ -1994,6 +1994,49 @@ let q = @&y             # Mutable reference to y
 
 `@` binds tighter than `as`, so `@x as i64` parses as `(@x) as i64`.
 
+**`*p` is a place** (LARB R9): it names the pointee itself, not a copy of it.
+`(*p).f = v`, `*p = v`, `@*p`, `@(*p).f` and `(*p)` passed to a `:&` param all
+act on the pointee. A method call on it is the call on `p`: `(*p).m()` means
+`p.m()`, so a `self: *T`, `@T`, `@&T` or `:&` method runs on the pointee, and
+mutability follows §3.2 (an `@&T` method through an `@T` is refused).
+
+```ritz
+struct Res
+    w: u64
+
+impl Res
+    fn bump(self: *Res, n: u64)
+        self.w = self.w + n
+
+pub fn main() -> i32
+    var r: Res = Res { w: 40 }
+    let p: *Res = @r
+    (*p).bump(2)            # r.w is now 42: the method ran on r
+    var c = *p              # a by-value read copies
+    c.bump(100)             # ... so this leaves r alone
+    return r.w as i32       # 42
+```
+
+Only a by-value use of `*p` copies: `var c = *p`, `f(*p)`, or a method whose
+`self` is by value. For a move-only type that copy is "cannot move out of a
+reference" (§13.2), as `r.m()` would be:
+
+```ritz expect-error="cannot move out of a reference"
+struct T
+    id: i32
+
+impl Drop for T
+    fn drop(self: @&T)
+        pass
+
+impl T
+    fn burn(self: T) -> i32
+        self.id
+
+fn f(r: *T) -> i32
+    (*r).burn()
+```
+
 **Removed in RERITZ:** `&x` address-of.
 
 ```ritz body expect-error="Legacy `&x` syntax is no longer supported"

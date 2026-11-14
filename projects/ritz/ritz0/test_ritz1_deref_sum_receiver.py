@@ -9,9 +9,10 @@ struct itself, `(*(q + k))` or `(*q)`, named no receiver type.  LARB R9 (#2175)
 rules `*p` a place, so the method runs on the pointee: the operand's pointer is
 the receiver, the sum evaluated once.
 
-Each program returns 42 when correct.  ritz0 is the oracle for what a method
-reads; for what an `@&` method writes it still mutates a copy (#2175's ritz0
-half), so that row is a strict xfail there.
+Each program returns 42 when correct, on all three compilers.  ritz0 ran a
+mutating method on a copy of `*p`, so the write was lost (#2175): the
+`*_in_place` rows read the pointee back after the call.  A by-value `self`
+still copies, and `@T` is still no `@&T` (§3.2).
 """
 
 import os
@@ -44,10 +45,18 @@ impl S
     fn bump(self: @&S) -> i64
         self.y = self.y + 1
         return self.y
+    fn poke(self: *S, n: i64)
+        self.y = self.y + n
+    fn peek(self: @S) -> i64
+        return self.y
 
 fn one() -> i64
     MADE = MADE + 1
     return 1
+
+fn at(q: *S) -> *S
+    MADE = MADE + 1
+    return q
 
 """
 
@@ -115,7 +124,64 @@ pub fn main() -> i32
     (*(q + 1)).bump()
     (*(q + 1)).bump()
     return a[1].y as i32
-""", {"ritz0": 2175}),
+""", {}),
+    # LARB R9 (#2175): `(*p).m()` is `p.m()`.  A `self: *S` method on a `*S`.
+    "ptr_self_in_place": ("""\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 40 }
+    let p: *S = @s
+    (*p).poke(2)
+    return s.y as i32
+""", {}),
+    # An `@&S` method, `p` a `*S` and an `@&S`.
+    "mut_ref_self_bare_deref_in_place": ("""\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 40 }
+    let p: *S = @s
+    (*p).bump()
+    (*p).bump()
+    return s.y as i32
+""", {}),
+    "mut_ref_through_mut_ref_in_place": ("""\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 40 }
+    let p: @&S = @&s
+    (*p).bump()
+    (*p).bump()
+    return s.y as i32
+""", {}),
+    # Two levels: `(**pp)` is the struct.
+    "double_deref_in_place": ("""\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 40 }
+    var p: *S = @s
+    let pp: **S = @p
+    (**pp).poke(2)
+    return s.y as i32
+""", {}),
+    # A call's pointer: the pointee changes and the call runs once.
+    "call_result_in_place": ("""\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 40 }
+    (*at(@s)).poke(1)
+    return (s.y as i32) + MADE
+""", {}),
+    # Reads: an `@S` self, and `var c = *p`, which is a copy.
+    "shared_self_read": ("""\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 42 }
+    let p: *S = @s
+    return (*p).peek() as i32
+""", {}),
+    "let_deref_is_a_copy": ("""\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 42 }
+    let p: *S = @s
+    var c = *p
+    c.y = 1
+    c.poke(1)
+    return (s.y as i32) + (c.y as i32) - 2
+""", {}),
     # `(*q).m()` takes the same arm: it works like `(*(q + k)).m()`.
     "bare_deref_param": ("""\
 fn f(q: *S) -> i64
@@ -143,18 +209,22 @@ def _params():
     return out
 
 
-def _run(request, tmp_path, compiler, program):
+def _compile(request, tmp_path, compiler, program):
+    """Compile PRELUDE + `program` to main.ll: (completed process, ll path)."""
     src = tmp_path / "main.ritz"
     src.write_text(PRELUDE + program)
     ll = tmp_path / "main.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     if compiler == "ritz0":
-        comp = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
-    else:
-        request.getfixturevalue("ritz1_bin")
-        comp = subprocess.run([str(RITZ1_BUILD / compiler), str(src), "-o", str(ll)],
-                              cwd=tmp_path, env=env, capture_output=True, text=True,
-                              timeout=300)
+        return run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300), ll
+    request.getfixturevalue("ritz1_bin")
+    return subprocess.run([str(RITZ1_BUILD / compiler), str(src), "-o", str(ll)],
+                          cwd=tmp_path, env=env, capture_output=True, text=True,
+                          timeout=300), ll
+
+
+def _run(request, tmp_path, compiler, program):
+    comp, ll = _compile(request, tmp_path, compiler, program)
     assert comp.returncode == 0 and ll.exists(), (
         f"{compiler} failed to compile:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}")
     exe = tmp_path / "main"
@@ -170,3 +240,22 @@ def _run(request, tmp_path, compiler, program):
 def test_deref_sum_receiver(request, tmp_path, compiler, name):
     rc = _run(request, tmp_path, compiler, PROGRAMS[name][0])
     assert rc == 42, f"{compiler} {name}: exit {rc}, expected 42"
+
+
+# §3.2: `(*p).m()` is `p.m()`, so an `@&S` method on an `@S` is refused, in
+# the same words and place on all three.
+SHARED_INTO_MUT = """\
+pub fn main() -> i32
+    var s: S = S { x: 1, y: 40 }
+    let p: @S = @s
+    return (*p).bump() as i32
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_mut_ref_self_on_shared_deref_refused(request, tmp_path, compiler):
+    comp, _ = _compile(request, tmp_path, compiler, SHARED_INTO_MUT)
+    out = comp.stdout + comp.stderr
+    line = PRELUDE.count("\n") + 4
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out}"
+    assert f"main.ritz:{line}:13: " in out and "doesn't fit an `@&T` slot" in out, out

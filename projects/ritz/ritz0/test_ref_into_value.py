@@ -200,6 +200,8 @@ MOVES = {
     "field_binding": "fn f(h: {H}) -> i32\n    var x = ^h.t\n    0\n",
     "field_return": "fn f(h: {H}) -> T\n    return ^h.t\n",
     "receiver": "fn f(r: {T}) -> i32\n    ^r.burn()\n",
+    # LARB R9: `(*r).burn()` is `r.burn()`, a by-value `self` copying `*r`.
+    "deref_receiver": "fn f(r: {T}) -> i32\n    (^*r).burn()\n",
     "field_receiver": "fn f(h: {H}) -> i32\n    ^h.t.burn()\n",
 }
 
@@ -227,6 +229,8 @@ NOT_MOVES = {
     "copy_field": "fn f(h: {H}) -> i32\n    h.n\n",
     "field_of_the_field": "fn f(h: {H}) -> i32\n    h.t.id\n",
     "lent_receiver": "fn f(r: {T}) -> i32\n    r.look()\n",
+    # ... and `(*r).look()` lends the pointee: nothing is copied (LARB R9).
+    "deref_lent_receiver": "fn f(r: {T}) -> i32\n    (*r).look()\n",
     "field_lent_receiver": "fn f(h: {H}) -> i32\n    h.t.look()\n",
     "borrow_the_field": "fn g(t: @T) -> i32\n    t.id\n\nfn f(h: {H}) -> i32\n    g(@h.t)\n",
     "deref_read": "fn f(r: {T}) -> i32\n    (*r).id\n",
