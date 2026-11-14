@@ -952,6 +952,71 @@ pub fn main() -> i32
         return 0
     return a[0].x + a[1].x
 """,
+    # AGAST #3131: an `@*T` / `@&*T` PARAM is two levels deep, as a `**T` param
+    # and an `@&*T` local (#3079, #3108) are.  ritz1 recorded no inner pointee
+    # for one, so `(*r)[i]` loaded `*r`, read a byte there and used it as the
+    # element's address: a segfault for a store and a byte for a load.
+    "plain_deref_mut_ref_pointer_scalar_element": BY_VALUE + """
+fn fill(r: @&*i32, d: i32)
+    (*r)[1] = d
+
+pub fn main() -> i32
+    var a: [2]i32
+    a[0] = 1
+    var p: *i32 = @a[0]
+    fill(@&p, 2)
+    return a[0] + a[1]
+""",
+    "plain_deref_ref_pointer_scalar_element": BY_VALUE + """
+fn fill(r: @*i32, d: i32)
+    (*r)[1] = d
+
+pub fn main() -> i32
+    var a: [2]i32
+    a[0] = 1
+    var p: *i32 = @a[0]
+    fill(@p, 2)
+    return a[0] + a[1]
+""",
+    "read_deref_ref_pointer_scalar_element": BY_VALUE + """
+fn get(r: @*i32) -> i32
+    (*r)[1]
+
+pub fn main() -> i32
+    var a: [2]i32
+    a[0] = 1
+    a[1] = 258
+    var p: *i32 = @a[0]
+    return get(@p) - 255
+""",
+    "read_deref_mut_ref_pointer_scalar_element": BY_VALUE + """
+fn get(r: @&*i16) -> i16
+    (*r)[1]
+
+pub fn main() -> i32
+    var a: [2]i16
+    a[0] = 1
+    a[1] = 258
+    var p: *i16 = @a[0]
+    return get(@&p) as i32 - 255
+""",
+    # The same param on a method, which binds its params apart (emitter.ritz).
+    "plain_deref_mut_ref_pointer_scalar_element_method": BY_VALUE + """
+struct F
+    k: i32
+
+impl F
+    fn fill(self: @F, r: @&*i32, d: i32)
+        (*r)[1] = d
+
+pub fn main() -> i32
+    var a: [2]i32
+    a[0] = 1
+    var p: *i32 = @a[0]
+    let f = F { k: 2 }
+    f.fill(@&p, f.k)
+    return a[0] + a[1]
+""",
     # Through a `*[2]C` it's #2440's `(*p)[i]`, which already stored a `C`.
     "plain_deref_array_pointer_element": BY_VALUE + """
 fn fill(r: *[2]C, d: C)
@@ -2700,7 +2765,6 @@ RITZ1_GAPS = {
     "array_referent_return": "AGAST #2302: ritz1 has no array return yet",
     "array_return": "AGAST #2302: ritz1 has no array return yet",
     "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
-    "plain_deref_mut_ref_pointer_element": "AGAST #3131: an `@&*T` param isn't #2545's `**T` path",
 }
 
 # `@n` into a `*i32` that isn't a field: the caller's address, so the write
