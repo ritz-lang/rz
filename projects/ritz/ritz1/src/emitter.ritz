@@ -211,12 +211,14 @@ fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) ->
             return 0
         let pslot: i32 = emit_borrow_slot_load(s, alloca_reg)
         add_local_full(s, param.name, param.name_len, pslot, TYPE_PTR, param.param_type_name, param.param_type_name_len, ipt, 0, 0)
+        set_local_inner_ref(s, param.name, param.name_len, param.param_inner_ref)   # AGAST #2399: `p:& @S`
         return 1
     # AGAST #2372: `p:& **S` the same way, as a `**S` local.
     if param_borrows_struct_ptr_ptr(param) == 1
         let ppslot: i32 = emit_borrow_slot_load(s, alloca_reg)
         add_local_full(s, param.name, param.name_len, ppslot, TYPE_PTR_PTR, param.param_type_name, param.param_type_name_len, TYPE_PTR, 0, 0)
         set_local_inner_pointee(s, param.name, param.name_len, param.param_inner_pointee_type)
+        set_local_inner_ref(s, param.name, param.name_len, param.param_inner_ref)
         return 1
     # AGAST #2994: `b:& bool` the same way, as a `bool` local whose slot is
     # the caller's: i1, the one byte every `bool` place holds its value in
@@ -838,6 +840,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             add_array_view(s, param3.name, param3.name_len, alloca_reg, param3.param_type, param3.param_pointee_type, param3.param_pointee_array_size, param3.param_pointee_array_elem_type, param3.param_type_name, param3.param_type_name_len)   # AGAST #2330
             add_local_full(s, param3.name, param3.name_len, alloca_reg, param3.param_type, param3.param_type_name, param3.param_type_name_len, param3.param_pointee_type, 0, 0)
             set_local_inner_pointee(s, param3.name, param3.name_len, param3.param_inner_pointee_type)
+            set_local_inner_ref(s, param3.name, param3.name_len, param3.param_inner_ref)   # AGAST #2399
             set_local_pointee_array(s, param3.name, param3.name_len, param3.param_pointee_array_size, param3.param_pointee_array_elem_type)  # AGAST #1953
             set_local_pointee_elem(s, param3.name, param3.name_len, param3.param_pointee_array_elem_pointee)
             name_array_ptr_param(s, param3)   # AGAST #2548
@@ -1208,6 +1211,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             add_array_view(s, param2.name, param2.name_len, alloca_reg, param2.param_type, param2.param_pointee_type, param2.param_pointee_array_size, param2.param_pointee_array_elem_type, param2.param_type_name, param2.param_type_name_len)   # AGAST #2330
             add_local_full(s, param2.name, param2.name_len, alloca_reg, param2.param_type, param2.param_type_name, param2.param_type_name_len, param2.param_pointee_type, 0, 0)
             set_local_inner_pointee(s, param2.name, param2.name_len, param2.param_inner_pointee_type)
+            set_local_inner_ref(s, param2.name, param2.name_len, param2.param_inner_ref)   # AGAST #2399
             set_local_pointee_array(s, param2.name, param2.name_len, param2.param_pointee_array_size, param2.param_pointee_array_elem_type)  # AGAST #1953
             set_local_pointee_elem(s, param2.name, param2.name_len, param2.param_pointee_array_elem_pointee)
             name_array_ptr_param(s, param2)   # AGAST #2548
@@ -3078,6 +3082,7 @@ fn string_literal_field(name: *u8, len: i32, ty: i32) -> *StructField
     let f: *StructField = malloc(sizeof(StructField)) as *StructField
     f.field_mut_ref = 0
     f.field_shared_ref = 0
+    f.field_inner_ref = 0
     f.name = name
     f.inner_pointee_type = TYPE_VOID  # AGAST #1924
     f.name_len = len
@@ -3355,7 +3360,10 @@ fn lower_ref_fields(m: *Module)
         var f: *StructField = st.fields
         while f != null
             if f.field_type == TYPE_REF or f.field_type == TYPE_MUT_REF
-                if f.field_type_name_len > 0 or f.array_elem_type != 0
+                # AGAST #2399: `@*S` names S and a `**S` slot (field_new): a `**S`.
+                if f.field_type_name_len > 0 and ptr_ptr_slot_inner(f.inner_pointee_type) == TYPE_STRUCT
+                    f.field_type = TYPE_PTR_PTR
+                else if f.field_type_name_len > 0 or f.array_elem_type != 0
                     f.field_type = TYPE_PTR
             f = f.next
         st = st.next

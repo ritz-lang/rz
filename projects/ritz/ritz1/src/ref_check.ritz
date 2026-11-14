@@ -1231,6 +1231,16 @@ pub fn ref_view(s: *EmitterState, e: *Expr) -> i32
         let through: *LocalVar = index_through(s, e)
         if through != null
             return ref_view_of_kind(through_elem_kind(s, through))
+    # AGAST #2399: `*r` with `r: @@S` or `*@&S` (held as an `@*S` / `**S`) is the
+    # `@S` / `@&S` it was.
+    if k == EXPR_UNARY and e.op == OP_DEREF and e.operand != null and e.operand.kind == EXPR_IDENT
+        let dl: i32 = find_local_idx(s, e.operand.ident_ptr, e.operand.ident_len)
+        if dl >= 0 and local_struct_levels(local_at(s, dl)) == 2
+            let nearest: i32 = local_at(s, dl).inner_ref
+            if nearest == INNER_REF_SHARED
+                return REF_VIEW_SHARED
+            if nearest == INNER_REF_MUT
+                return REF_VIEW_MUT
     var t: RefTy
     if k == EXPR_INDEX or k == EXPR_UNARY and e.op == OP_DEREF
         # What holds a pointer keeps its kind, where ref_ty_of has no pointee to give.
@@ -1242,6 +1252,33 @@ pub fn ref_view(s: *EmitterState, e: *Expr) -> i32
     if ref_ty_of(s, e, @t) == 1
         return ref_view_of_kind(t.kind)
     REF_VIEW_UNKNOWN
+
+# AGAST #2399: the reference `.` on `e` reaches the struct through last
+# (INNER_REF_*): `p: @@S` or `*@S` is held as an `@*S` / `**S`, whose kind says
+# the nearest level is a `*`.
+fn ref_inner_ref(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_IDENT
+        let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+        if idx >= 0
+            return local_at(s, idx).inner_ref
+        let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+        if g != null
+            return g.inner_ref
+        return 0
+    if e.kind == EXPR_MEMBER
+        let f: *StructField = resolve_member_chain_field(s, e)
+        if f != null
+            return f.field_inner_ref
+    0
+
+# The kind of the field `e` names, or TYPE_VOID.
+fn ref_field_kind(s: *EmitterState, e: *Expr) -> i32
+    if e.kind != EXPR_MEMBER
+        return TYPE_VOID
+    let f: *StructField = resolve_member_chain_field(s, e)
+    if f == null
+        return TYPE_VOID
+    f.field_type
 
 # 1 when writing the place `e` goes through an `@T`.  Walk it from the place to
 # its root: a `*T` ends the walk, since what it points at is the pointer's
@@ -1256,12 +1293,17 @@ fn ref_write_is_shared(s: *EmitterState, e0: *Expr) -> i32
             base = e.operand
         else
             return 0
+        if e.kind == EXPR_MEMBER and ref_inner_ref(s, base) == INNER_REF_SHARED
+            return 1
         let view: i32 = ref_view(s, base)
         var t: RefTy
         let known: i32 = ref_ty_of(s, base, @t)
         if view == REF_VIEW_SHARED
             # `.` reads through every level, so the one nearest the place counts.
             if e.kind == EXPR_MEMBER and known == 1 and (t.pointee == TYPE_PTR or t.pointee == TYPE_PTR_PTR)
+                return 0
+            # AGAST #2399: an `@*S` field is a `**S` by now (lower_ref_fields).
+            if e.kind == EXPR_MEMBER and ref_field_kind(s, base) == TYPE_PTR_PTR
                 return 0
             return 1
         if view == REF_VIEW_RAW or view == REF_VIEW_UNKNOWN

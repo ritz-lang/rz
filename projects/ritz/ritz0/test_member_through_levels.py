@@ -12,7 +12,7 @@ strict xfail citing its ticket.
 
 import pytest
 
-from test_ref_into_value import COMPILERS, _run
+from test_ref_into_value import COMPILERS, _assert_refused, _run
 
 # AGAST #2806: each test's rows share one compile per compiler (batching.py).
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
@@ -273,30 +273,52 @@ for _name, (_fn, _body, _make, _want) in FIELD_REFS.items():
     HOLDERS[f"field_ref.{_name}"] = (_main(_body, _fn + "\n", _make), _want)
 
 
-# ritz0 refused 189 of these with a raw ValueError past one extra level, on
-# the store, address and method paths and through `***S` / `@**S` (#2398).
-# It goes through every level now (§5.4), so every row runs on ritz0.
+# AGAST #2399: what ritz1 refused, or handed clang IR it rejected, until it
+# lowered `.` through these too.  A reference is a pointer: `@@C` is held as an
+# `@*C` and `*@C` as a `**C`, but a write is judged by the level nearest the
+# place (§13.3), so `@@&C` writes and `@@C` doesn't.
+SHARED_F = "struct F\n    p: @*C\n\n"
+MB = "fn mb(c: @&C) -> i32\n    c.x = 3\n    0\n\n"
+MUT_F = "struct F\n    p: @&*C\n\n"
+HOLDERS.update({
+    "global_ptr_ptr_from_address": (_main("    G = @&q\n    G.y\n", "var G: **C = null\n\n"), 7),
+    "global_shared_ptr_store": (_main("    G = @q\n    G.x = 3\n    c.x\n", "var G: @*C = null\n\n"), 3),
+    "global_mut_ptr_store": (_main("    G = @&q\n    G.x = 3\n    c.x\n", "var G: @&*C = null\n\n"), 3),
+    "field_shared_ptr_store": (_main("    var h = F { p: @q }\n    h.p.x = 3\n    c.x\n", SHARED_F), 3),
+    "field_mut_ptr_read": (_main("    var h = F { p: @&q }\n    h.p.y\n", MUT_F), 7),
+    "field_shared_ptr_method": (_main("    var h = F { p: @q }\n    h.p.get()\n", SHARED_F), 1),
+    "returned_ptr_ptr_store": (_main("    h(@&q).x = 3\n    c.x\n", "fn h(p: **C) -> **C\n    p\n\n"), 3),
+    "returned_method": (_main("    h(@q).get()\n", "fn h(p: @*C) -> @*C\n    p\n\n"), 1),
+    "shared_to_mut_store": (_main("    var r: @&C = q\n    g(@r)\n    c.x\n", "fn g(p: @@&C)\n    p.x = 3\n\n"), 3),
+    "ptr_to_mut_read": (_main("    var r: @&C = q\n    g(@&r)\n", "fn g(p: *@&C) -> i32\n    p.y\n\n"), 7),
+    "mut_to_shared_read": (_main("    var r: @C = q\n    g(@&r)\n", "fn g(p: @&@C) -> i32\n    p.y\n\n"), 7),
+    "ptr_to_shared_method": (_main("    var r: @C = q\n    g(@&r)\n", "fn g(p: *@C) -> i32\n    p.get()\n\n"), 1),
+    "mut_to_mut_method": (_main("    var r: @&C = q\n    g(@&r)\n    c.x\n", "fn g(p: @&@&C)\n    p.set(3)\n\n"), 3),
+    "let_shared_to_mut_store": (_main("    var r: @&C = q\n    let p: @@&C = @r\n    p.x = 3\n    c.x\n"), 3),
+    # `*r` is the reference it was, so an `@&C` one fits an `@&C` slot.
+    "deref_ptr_to_mut_into_mut": (_main("    var r: @&C = q\n    g(@&r)\n    c.x\n",
+                                        MB + "fn g(r: *@&C) -> i32\n    mb(*r)\n\n"), 3),
+    "deref_mut_to_mut_into_mut": (_main("    var r: @&C = q\n    g(@&r)\n    c.x\n",
+                                        MB + "fn g(r: @&@&C) -> i32\n    mb(*r)\n\n"), 3),
+    "deref_shared_to_shared_read": (_main("    var r: @C = q\n    g(@r)\n",
+                                          "fn g(r: @@C) -> i32\n    let v: @C = *r\n    v.y\n\n"), 7),
+})
 
-# ritz1 refuses these (#2399).
-# `lent_ptr.copy_*` (`let r = p` of a `*S`) closed by #2596.
-LOWERING_GAPS = {"returned_read", "returned_store",
-                 "returned_ptr_ptr_read", "global_shared_ptr_read", "field_shared_ptr_read",
-                 "field_mut_ptr_store", "ptr_to_shared_read", "ptr_to_mut_store",
-                 "shared_to_shared_read", "shared_to_mut_read", "mut_to_mut_store"}
-
-
-def _gap(row, compiler):
-    if compiler == "ritz0":
-        return None
-    return 2399 if row in LOWERING_GAPS else None
+# Writes the nearest level refuses.  `^` marks the place.
+WRITE_THROUGH_SHARED = "cannot write through an `@T`: make it `@&T`"
+SHARED_NEAREST = {
+    "ptr_to_shared": "fn g(p: *@C)\n    ^p.x = 3\n\n",
+    "shared_to_shared": "fn g(p: @@C)\n    ^p.x = 3\n\n",
+    "mut_to_shared": "fn g(p: @&@C)\n    ^p.x = 3\n\n",
+    "let_shared_to_shared": "fn g(r: @C)\n    let p: @@C = @r\n    ^p.x = 3\n\n",
+    "field_ptr_to_shared": "struct F\n    p: *@C\n\nfn g(h: F)\n    ^h.p.x = 3\n\n",
+}
 
 
 def _params(table):
     for row in table:
         for compiler in COMPILERS:
-            gap = _gap(row, compiler)
-            marks = [pytest.mark.xfail(strict=True, reason=f"AGAST #{gap}")] if gap else []
-            yield pytest.param(row, compiler, marks=marks, id=f"{row}-{compiler}")
+            yield pytest.param(row, compiler, id=f"{row}-{compiler}")
 
 
 @pytest.mark.parametrize("row,compiler", list(_params(ROWS)))
@@ -309,3 +331,20 @@ def test_member_through_levels(tmp_path, compiler, row):
 def test_member_through_what_holds_it(tmp_path, compiler, row):
     src, want = HOLDERS[row]
     assert _run(compiler, tmp_path, row.replace(".", "_"), src) == want
+
+
+# `*r` of a `*@C` is an `@C` (test_at_into_mut.py has `@@C` and `@@&C`).
+SHARED_INTO_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_shared_reference_behind_a_pointer_stays_shared(tmp_path, compiler):
+    _assert_refused(compiler, tmp_path, "deref_ptr_to_shared",
+                    f"{TYPES}{MB}fn g(r: *@C) -> i32\n    mb(^*r)\n\npub fn main() -> i32\n    0\n",
+                    SHARED_INTO_MUT)
+
+
+@pytest.mark.parametrize("row,compiler", list(_params(SHARED_NEAREST)))
+def test_write_refused_by_the_nearest_level(tmp_path, compiler, row):
+    _assert_refused(compiler, tmp_path, row, f"{TYPES}{SHARED_NEAREST[row]}pub fn main() -> i32\n    0\n",
+                    WRITE_THROUGH_SHARED)

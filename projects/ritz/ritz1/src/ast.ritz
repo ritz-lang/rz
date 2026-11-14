@@ -173,6 +173,14 @@ const TYPE_MUT_REF: i32 = 103 # Mutable reference @@T (emits as pointer)
 # with ptr_ptr_slot_levels / ptr_ptr_slot_inner below.
 const PTR_DEPTH_UNIT: i32 = 1024
 
+# AGAST #2399: the indirection nearest a pointee (Param.param_inner_ref and the
+# like).  A reference is a pointer, so `@@S` is held as an `@*S` and `*@&S` as a
+# `**S`; this says that level was an `@T` or `@&T`, which decides a write
+# through it (§13.3) and what `*p` is.
+const INNER_REF_NONE: i32 = 0     # a `*T`, or no level
+const INNER_REF_SHARED: i32 = 1   # an `@T`
+const INNER_REF_MUT: i32 = 2      # an `@&T`, or a `:&` borrow
+
 # AGAST #1924: decode an inner-pointee slot (see PTR_DEPTH_UNIT).  Levels
 # of the whole pointer type: 2 for `**T`, 3 for `***T`; 0 when the slot
 # records nothing.
@@ -334,6 +342,9 @@ struct Stmt
   # TYPE_PTR for every **T, so without this `*(*(pp + i) + k)` cannot
   # know its element width or stride.
   var_inner_pointee_type: i32
+  # AGAST #2399: the reference nearest the pointee, INNER_REF_*: `@@S` and `*@S`
+  # are held as an `@*S` / `**S`, and this keeps what that level was.
+  var_inner_ref: i32
   # AGAST #2028: 1 for a STMT_VAR_DECL written `let` (stmt_let_decl), 0 for
   # `var`.  emit_stmt copies it to LocalVar.is_let; let_check.ritz rejects
   # writes and `@&` into that binding's own storage.
@@ -394,6 +405,9 @@ struct Param
   fn_sig: *FnDef
   # AGAST #1815: innermost pointee of a `**T` param, as Stmt.var_inner_pointee_type.
   param_inner_pointee_type: i32
+  # AGAST #2399: the reference nearest the pointee, INNER_REF_*: `@@S` and `*@S`
+  # are held as an `@*S` / `**S`, and this keeps what that level was.
+  param_inner_ref: i32
   # AGAST #1953: for a `*[N]T` param (param_pointee_type == TYPE_ARRAY), N
   # and T; 0 / TYPE_VOID otherwise.  A struct T is named by param_type_name.
   # Both allocators (param_new, monomorph's clone) use sizeof(Param).
@@ -521,6 +535,9 @@ struct StructField
   ptr_pointee: i32             # AGAST #2341: T for `p: *T`; TYPE_VOID otherwise
   field_mut_ref: i32           # AGAST #2337: 1 for `r: @&T`, which lower_ref_fields leaves a `*T`
   field_shared_ref: i32        # AGAST #2338: 1 for `r: @T`, likewise
+  # AGAST #2399: the reference nearest the pointee, INNER_REF_*: `@@S` and `*@S`
+  # are held as an `@*S` / `**S`, and this keeps what that level was.
+  field_inner_ref: i32
   next: *StructField
   # AGAST #1924: for a `**T` field, T (packed with any deeper levels, see
   # PTR_DEPTH_UNIT); TYPE_VOID otherwise.  `*(*(s.rows + i) + k)` reads it.
@@ -597,6 +614,7 @@ struct GlobalVarDef
   pointee_type_name_len: i32
   # AGAST #1815: innermost pointee of a `var g: **T`, as Stmt.var_inner_pointee_type.
   inner_pointee_type: i32
+  inner_ref: i32   # AGAST #2399: as Stmt.var_inner_ref
   # AGAST #1879: 1 for `extern var NAME: T` -- a data symbol defined in
   # another object, emitted as `@NAME = external global T`.
   is_extern: i32
@@ -787,6 +805,10 @@ struct Parser
   last_call_type_suffix_len: i32
   # For reference types - stores the inner type
   last_ref_inner_type: i32         # Inner type for @T or @@T (e.g., TYPE_STRUCT)
+  # AGAST #2399: the indirection nearest the pointee of the type just parsed,
+  # INNER_REF_*.  var_inner_ref latches it across a `let` initializer.
+  last_inner_ref: i32
+  var_inner_ref: i32
   # Conditional compilation: set to 1 by parse_attr when it sees
   # [[target_os = "xxx"]] where xxx != the target OS. Consumed (and reset) by
   # parse_item's module_add_* calls to skip adding that item to the module.

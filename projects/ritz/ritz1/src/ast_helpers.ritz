@@ -1050,6 +1050,7 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
     else
         g.pointee_type = TYPE_I64
     g.inner_pointee_type = ptr_ptr_inner_pointee(p, var_type)
+    g.inner_ref = inner_ref_of(p, var_type)   # AGAST #2399
     g.ptr_array = ptr_array_of_last(p, var_type)   # AGAST #2329
     # AGAST #190: capture array dimensions for `var g: [N]T` so the global
     # gets emitted as `[N x %T] zeroinitializer` and indexing GEPs can
@@ -1081,6 +1082,16 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
     else
         g.pointee_type_name = null
         g.pointee_type_name_len = 0
+    # AGAST #2399: `var g: @*S` is the `**S` it is at runtime, as a field is
+    # (lower_ref_fields).  It was recorded as an `@S`, `*S`'s pointee taken for
+    # its own: `g = @q` was refused and `g.f` "unhandled EXPR_MEMBER".
+    let ref_slot: i32 = ref_field_ptr_ptr_slot(p, var_type)
+    if ref_slot != TYPE_VOID
+        g.var_type = TYPE_PTR_PTR
+        g.pointee_type = TYPE_I64
+        g.inner_pointee_type = ref_slot
+        g.pointee_type_name = p.last_type_name
+        g.pointee_type_name_len = p.last_type_name_len
     g.init_expr = init_expr
     g.src_file = parse_file_copy(p)
     g.line = line
@@ -1385,6 +1396,7 @@ fn param_of_type(p: *Parser, name: *u8, len: i32, ty: i32) -> *Param
     else
         param.param_pointee_type = TYPE_I64  # Default
     param.param_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
+    param.param_inner_ref = inner_ref_of(p, ty)   # AGAST #2399
     param.param_pointee_array_size = ptr_array_pointee_size(p, ty)
     param.param_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
     param.param_pointee_array_elem_pointee = ptr_array_elem_pointee(p, ty)
@@ -1538,6 +1550,22 @@ pub fn struct_def_new(p: *Parser, name: *u8, len: i32, fields: *StructField, lin
     s.type_params = null  # Non-generic struct (field at end to preserve layout)
     return s
 
+# AGAST #2399: the inner pointee slot of the `**S` (or deeper) that a just-parsed
+# reference field to a pointer to a struct is at runtime; TYPE_VOID for any other.
+fn ref_field_ptr_ptr_slot(p: *Parser, ty: i32) -> i32
+    if ty != TYPE_REF and ty != TYPE_MUT_REF
+        return TYPE_VOID
+    if p.last_ref_inner_type == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
+        return TYPE_STRUCT
+    if p.last_ref_inner_type != TYPE_PTR_PTR
+        return TYPE_VOID
+    let slot: i32 = ptr_ptr_inner_pointee(p, ty)
+    if ptr_ptr_slot_inner(slot) != TYPE_STRUCT
+        return TYPE_VOID
+    if slot < PTR_DEPTH_UNIT
+        return TYPE_STRUCT + PTR_DEPTH_UNIT
+    slot + PTR_DEPTH_UNIT
+
 pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *StructField
     let f: *StructField = parser_alloc(p, sizeof(StructField)) as *StructField
     f.field_mut_ref = 0
@@ -1550,6 +1578,7 @@ pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
     f.name = name as *u8
     # AGAST #1924: `rows: **i32` -> `*(*(s.rows + i) + k)` loads an i32.
     f.inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
+    f.field_inner_ref = inner_ref_of(p, ty)   # AGAST #2399
     f.name_len = len
     f.field_type = ty
     f.ptr_pointee = TYPE_VOID
@@ -1596,6 +1625,12 @@ pub fn field_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) 
         if p.last_ref_inner_type == TYPE_STRUCT
             f.field_type_name = p.last_type_name as *u8
             f.field_type_name_len = p.last_type_name_len
+        else if ref_field_ptr_ptr_slot(p, ty) != TYPE_VOID
+            # AGAST #2399: `@*S`, `@&*S`, `@**S`: lower_ref_fields makes it the
+            # `**S` / `***S` it is at runtime, so `.` goes through each level.
+            f.field_type_name = p.last_type_name as *u8
+            f.field_type_name_len = p.last_type_name_len
+            f.inner_pointee_type = ref_field_ptr_ptr_slot(p, ty)
         else
             f.field_type_name = null
             f.field_type_name_len = 0
@@ -2204,6 +2239,7 @@ struct VarLatch
     type_name_len: i32
     pointee: i32
     inner_pointee: i32
+    inner_ref: i32   # AGAST #2399
     fn_sig: *FnDef
     ref: *Param
     array: *ArrayElem
@@ -2235,6 +2271,7 @@ fn push_var_latch(p: *Parser)
     r.type_name_len = p.var_type_name_len
     r.pointee = p.var_pointee
     r.inner_pointee = p.var_inner_pointee
+    r.inner_ref = p.var_inner_ref
     r.fn_sig = p.var_fn_sig
     r.ref = g_var_ref
     r.array = g_var_array
@@ -2258,6 +2295,7 @@ fn pop_var_latch(p: *Parser, line: i32, col: i32)
     p.var_type_name_len = mine.type_name_len
     p.var_pointee = mine.pointee
     p.var_inner_pointee = mine.inner_pointee
+    p.var_inner_ref = mine.inner_ref
     p.var_fn_sig = mine.fn_sig
     g_var_ref = mine.ref
     g_var_array = mine.array
@@ -2306,6 +2344,7 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     # EXPR_MEMBER".  `let p: *i32 = f<*u8>(..)` strode one byte the same way.
     p.var_pointee = p.last_pointee_type
     p.var_inner_pointee = ptr_ptr_inner_pointee(p, ty)
+    p.var_inner_ref = inner_ref_of(p, ty)   # AGAST #2399
     # AGAST #1671: latch a `let f: fn(...) -> T` signature before the
     # initializer is parsed (it may contain fn types of its own).
     # AGAST #1747: on a `[N]fn(...) -> T` array it is the ELEMENT signature
@@ -2626,7 +2665,10 @@ pub fn ptr_array_pointee_elem(p: *Parser, ty: i32) -> i32
 
 # Handle pointer type *T
 # Stores the pointee type and preserves type name if pointing to struct/generic
-pub fn type_ptr(p: *Parser, inner_type: i32) -> i32
+pub fn type_ptr(p: *Parser, written: i32) -> i32
+    let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
+    if is_indirection(inner_type) == 0
+        p.last_inner_ref = INNER_REF_NONE
     nd_array_reject(p, inner_type, parse_pos_line(p), parse_pos_col(p), c"a pointee")  # AGAST #1509
     # Store pointee type for emitter
     p.last_pointee_type = inner_type
@@ -2684,6 +2726,7 @@ struct AliasEntry
     array_elem_type_name: *u8
     array_elem_type_name_len: i32
     ref_inner_type: i32
+    inner_ref: i32  # AGAST #2399
     ptr_depth: i32         # AGAST #1924
     array_shape: *ArrayShape  # AGAST #1509
     fn_sig: *FnDef         # AGAST #1879: a fn type's signature (type_fn)
@@ -2752,6 +2795,7 @@ pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
     e.array_elem_type_name_len = p.last_array_elem_type_name_len
     e.array_shape = p.last_array_shape
     e.ref_inner_type = p.last_ref_inner_type
+    e.inner_ref = p.last_inner_ref   # AGAST #2399
     # AGAST #1879: a fn-type alias keeps its signature, so a value typed
     # with the alias calls typed (and with the alias's [[callconv]]).
     e.fn_sig = g_alias_fn_sig
@@ -2817,6 +2861,7 @@ pub fn type_alias_resolve(p: *Parser, name: *u8, len: i32) -> i32
         p.last_array_elem_type_name_len = e.array_elem_type_name_len
         p.last_array_shape = e.array_shape
         p.last_ref_inner_type = e.ref_inner_type
+        p.last_inner_ref = e.inner_ref
     if e.fn_sig != null
         # As type_fn leaves it: fresh at the token after the alias name.
         p.last_fn_sig = e.fn_sig
@@ -2832,17 +2877,56 @@ pub fn item_dispatch_alias(p: *Parser) -> i32
 
 # Handle immutable reference type @T
 # References are semantically pointers for now - store the inner type info
-pub fn type_ref(p: *Parser, inner_type: i32) -> i32
+pub fn type_ref(p: *Parser, written: i32) -> i32
+    let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
+    if is_indirection(inner_type) == 0
+        p.last_inner_ref = INNER_REF_SHARED
     # Store inner type information for emitter
     p.last_ref_inner_type = inner_type
     return TYPE_REF
 
 # Handle mutable reference type @@T
 # References are semantically pointers for now - store the inner type info
-pub fn type_mut_ref(p: *Parser, inner_type: i32) -> i32
+pub fn type_mut_ref(p: *Parser, written: i32) -> i32
+    let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
+    if is_indirection(inner_type) == 0
+        p.last_inner_ref = INNER_REF_MUT
     # Store inner type information for emitter
     p.last_ref_inner_type = inner_type
     return TYPE_MUT_REF
+
+fn is_indirection(ty: i32) -> i32
+    (ty == TYPE_PTR or ty == TYPE_PTR_PTR or ty == TYPE_REF or ty == TYPE_MUT_REF) as i32
+
+# AGAST #2399: last_inner_ref, for a just-parsed `ty` that has a level.
+pub fn inner_ref_of(p: *Parser, ty: i32) -> i32
+    if is_indirection(ty) == 0
+        return 0
+    p.last_inner_ref
+
+# AGAST #2399: a reference is a pointer, so one to a reference to a struct is
+# held as one to a pointer: `@@S` as `@*S`, `*@&S` as `**S`, `@&@*S` as `@&**S`.
+# `.` then goes through each level as it does for those, and the struct's name
+# stays in last_type_name.  `inner_type` is what the `@` / `*` wraps; the kind
+# returned is what it wraps now.  What the nearest level was stays in
+# last_inner_ref, which decides a write (§13.3) and what `*p` is.
+fn ref_as_pointer(p: *Parser, inner_type: i32) -> i32
+    if inner_type != TYPE_REF and inner_type != TYPE_MUT_REF
+        return inner_type
+    let x: i32 = p.last_ref_inner_type
+    var named: i32 = 0
+    if x == TYPE_STRUCT
+        named = 1
+    else if x == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
+        named = 1
+    else if x == TYPE_PTR_PTR and ptr_ptr_slot_inner(ptr_ptr_inner_pointee(p, TYPE_PTR_PTR)) == TYPE_STRUCT
+        named = 1
+    if named == 0
+        return inner_type
+    let nearest: i32 = p.last_inner_ref
+    let k: i32 = type_ptr(p, x)
+    p.last_inner_ref = nearest
+    k
 
 # Saved identity of ONE generic type argument, captured right after it
 # parses.  Without it, mangling `Result<Vec<u8>, StrView>` would read StrView
@@ -3757,8 +3841,10 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     # parsed.  Without one (`var x: **S`) the parser state is still current.
     if init != null and ty != 0
         s.var_inner_pointee_type = p.var_inner_pointee
+        s.var_inner_ref = p.var_inner_ref   # AGAST #2399
     else
         s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
+        s.var_inner_ref = inner_ref_of(p, ty)
     # AGAST #2822: a `*[N]T`'s pointee array, latched by capture_var_type.
     s.var_pointee_array_size = 0
     s.var_pointee_array_elem_type = TYPE_VOID

@@ -400,6 +400,8 @@ class RitzGenerator:
         self._emit('    p.last_call_type_suffix = null')
         self._emit('    p.last_call_type_suffix_len = 0')
         self._emit('    p.last_ref_inner_type = 0')
+        self._emit('    p.last_inner_ref = 0')  # AGAST #2399
+        self._emit('    p.var_inner_ref = 0')
         self._emit('    # Conditional-compilation skip flag. MUST be zeroed — if left')
         self._emit('    # garbage we drop every parsed item and produce an empty module.')
         self._emit('    # Symptom: with RITZ_PATH set (different heap layout), the first')
