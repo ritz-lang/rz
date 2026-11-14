@@ -92,6 +92,12 @@ struct LocalVar
     # AGAST #1509: every dimension of a `var g: [N][M]..T` local (array_size
     # and array_elem_type then hold N and TYPE_ARRAY); null otherwise.
     array_shape: *ArrayShape
+    # AGAST #2570: for a pointer to a plane of an N-D array (an inferred
+    # `let q = @x[i]` leaving `[M][N]..T`, or a copy of one), that
+    # `[M][N]..T`; null otherwise.  pointee_array_size holds the flat count
+    # M*N.., so `q + k` strides whole planes; nd_index_shape reads this one,
+    # so `q[i][j]` is one GEP over it from q's value (emit_nd_index_ptr).
+    pointee_array_shape: *ArrayShape
     # AGAST #2995: what a `var a: [N]T` local's element is (Stmt.var_array); null
     # otherwise.  Its ptr_array says what a `*[M]T` element points at.
     array_rec: *ArrayElem
@@ -1343,6 +1349,7 @@ fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type: i32
     loc.pointee_array_elem_name = null
     loc.pointee_array_elem_name_len = 0
     loc.array_shape = null
+    loc.pointee_array_shape = null
     loc.array_rec = null
     loc.is_lent = 0
     loc.holds_lent_ptr = 0
@@ -3956,11 +3963,53 @@ fn nd_index_shape(s: *EmitterState, e: *Expr, out_depth: *i32) -> *ArrayShape
     while base.kind == EXPR_INDEX
         depth = depth + 1
         base = base.left
-    let sh: *ArrayShape = nd_array_base_shape(s, base)
+    var sh: *ArrayShape = nd_array_base_shape(s, base)
+    if sh == null
+        sh = plane_ptr_shape(s, base)   # AGAST #2570: `q[i][j]`, q a plane pointer
     if sh == null or depth > sh.rank
         return null
     *out_depth = depth
     return sh
+
+# AGAST #2570: the plane `[M][N]..T` that the local `e` points at, when `e`
+# is a plane pointer (LocalVar.pointee_array_shape); null otherwise.  Not in
+# nd_array_name_shape: that one says the name IS an array (whole-array
+# assignment, argument dims), which a pointer isn't.
+fn plane_ptr_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    let lv: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+    if lv == null
+        return null
+    lv.pointee_array_shape
+
+# AGAST #2570: the plane `e`, an index chain two or more short of its N-D
+# array's rank, names: the dims after the chain, and the leaf.  `@x[i]` with
+# `x: [L][M][N]T` is `[M][N]T`.  null for anything else (a row or an element
+# is one or no dimension: other arms type those).
+fn nd_plane_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, e, @depth)
+    if sh == null or depth > sh.rank - 2
+        return null
+    let out: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
+    *out = *sh
+    out.rank = sh.rank - depth
+    var i: i32 = 0
+    while i < out.rank
+        out.dims[i] = sh.dims[depth + i]
+        i = i + 1
+    out
+
+# AGAST #2570: how many leaves a `[M][N]..T` holds, M*N..: the size of the flat
+# `[M*N..]T` a plane pointer is, so `q + k` strides k whole planes.
+fn shape_leaf_count(sh: *ArrayShape) -> i32
+    var n: i32 = 1
+    var i: i32 = 0
+    while i < sh.rank
+        n = n * sh.dims[i]
+        i = i + 1
+    n
 
 # The ArrayShape of the local / global N-D array named `name`, or null.
 fn nd_array_name_shape(s: *EmitterState, name: *u8, len: i32) -> *ArrayShape

@@ -1140,6 +1140,26 @@ struct NdIndexPtr
 # nd_index_shape and the nd_array_*_shape helpers live in emitter_core
 # (AGAST #2152): resolve_member_chain_field needs them for an indexed base.
 
+# AGAST #2570: `q[i][j][k]` with more indices than q's plane has dimensions.
+# index_through leaves a plane pointer to the N-D path, which can't take it,
+# and the rest read past q (it crashed): refused, located, as ritz0 refuses it.
+# Returns 1 with a full-depth *out over %0 when it refused (the error fails the
+# build; callers then don't report again), 0 when `e` isn't such a chain.
+fn nd_plane_overindex(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
+    if e == null or e.kind != EXPR_INDEX
+        return 0
+    var base: *Expr = e
+    while base.kind == EXPR_INDEX
+        base = base.left
+    let sh: *ArrayShape = plane_ptr_shape(s, base)
+    if sh == null
+        return 0
+    emit_nd_error(s, e.span.line, e.span.col, c"this indexes more dimensions than the plane of the multi-dimensional array it points at has")
+    out.reg = 0
+    out.depth = sh.rank
+    out.shape = sh
+    return 1
+
 # Emit the GEP for an N-D index chain `e` into *out.  Returns 0 (emitting
 # nothing) when nd_index_shape does not recognise `e`.  The indices are
 # evaluated in source order, outermost dimension first.
@@ -1147,7 +1167,7 @@ fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
     var depth: i32 = 0
     let sh: *ArrayShape = nd_index_shape(s, e, @depth)
     if sh == null
-        return 0
+        return nd_plane_overindex(s, e, out)
     var base: *Expr = e
     while base.kind == EXPR_INDEX
         base = base.left
@@ -1162,6 +1182,18 @@ fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
         if mp.success != 1
             emit_nd_error(s, e.span.line, e.span.col, c"cannot address the multi-dimensional array field this index chain starts from in ritz1")
         base_reg = mp.reg
+    # AGAST #2570: a plane pointer `q` is GEP'd from its value, not its slot.
+    # Loaded before the indices, as a field base is addressed before them.
+    var plane: i32 = 0
+    if base.kind == EXPR_IDENT and plane_ptr_shape(s, base) != null
+        let pl: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)
+        plane = 1
+        base_reg = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, base_reg)
+        emit_str(s, c" = load ptr, ptr ")
+        emit_reg(s, pl.reg)
+        emit_str(s, c"\n")
     var regs: [8]i32
     var j: i32 = 0
     while j < depth
@@ -1179,7 +1211,7 @@ fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
     emit_str(s, c" = getelementptr ")
     emit_array_shape_llvm(s, sh, 0)
     emit_str(s, c", ptr ")
-    if base.kind == EXPR_MEMBER
+    if base.kind == EXPR_MEMBER or plane == 1
         emit_reg(s, base_reg)
     else
         let lv: *LocalVar = find_local_struct_name(s, base.ident_ptr, base.ident_len)

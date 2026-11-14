@@ -51,6 +51,11 @@ fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt) -> i32
     if init.operand == null or init.operand.kind != EXPR_IDENT
         return 0
     let src: *LocalVar = find_local_struct_name(s, init.operand.ident_ptr, init.operand.ident_len)
+    if src != null and src.pointee_array_shape != null
+        # AGAST #2570: `let rr = @q`, q a plane pointer.  A `**` keeps N and T
+        # only, so `(*rr)[i]` would read a flat element where ritz0 reads a row.
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"a multi-dimensional array type is not supported as the pointee of an inferred binding in ritz1 (this `@` takes the address of a pointer to a plane of an N-D array: index it, `q[i][j]`, or copy it, `let r = q`)")
+        return 0
     if src == null or (src.var_type != TYPE_PTR and src.var_type != TYPE_PTR_PTR)
         return 0
     if src.var_type == TYPE_PTR and src.pointee_type == TYPE_ARRAY
@@ -260,19 +265,6 @@ fn nd_row_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
         return null
     sh
 
-# AGAST #2558: refuse, located at the binding, an inferred `let q = @x[i]` whose
-# index chain is two or more short of the N-D array's rank: a plane, an
-# `@[M][N]T`.  ritz1 can't hold an N-D pointee (nd_array_reject, #1509), so q
-# stayed an untyped i64: `q + 1` strode one byte (SILENT for `@`; an `@&` gave
-# IR clang rejected, unlocated).  Returns 1 when it refused.
-fn nd_plane_reject(s: *EmitterState, stmt: *Stmt, e: *Expr) -> i32
-    var depth: i32 = 0
-    let sh: *ArrayShape = nd_index_shape(s, e, @depth)
-    if sh == null or depth > sh.rank - 2
-        return 0
-    emit_nd_error(s, stmt.span.line, stmt.span.col, c"a multi-dimensional array type is not supported as the pointee of an inferred binding in ritz1 (this `@` leaves two or more dimensions: index down to a row or an element, or annotate an element pointer, `let q: *T = @x[i][j][k]`)")
-    1
-
 fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     if stmt.var_declared_type == TYPE_VOID and stmt.var_init != null
         # AGAST #2329: `let q = h(p)`, `let q = h.r` and `let q = g` hold what they
@@ -289,6 +281,7 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
         return 0
     let init: *Expr = stmt.var_init
+    stmt.var_pointee_array_shape = null
     var kind: i32 = TYPE_UNKNOWN
     var size: i32 = 0
     var elem: i32 = TYPE_VOID
@@ -301,6 +294,7 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
         kind = src.var_type
         size = src.pointee_array_size
         elem = src.pointee_array_elem_type
+        stmt.var_pointee_array_shape = src.pointee_array_shape   # #2570: a plane's copy
     else if pp != null
         kind = TYPE_PTR
         size = pp.pointee_array_size
@@ -315,8 +309,15 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
             size = row.dims[row.rank - 1]
             elem = row.leaf_type
             stmt.var_pointee_array_elem_pointee = row.leaf_pointee
-        else if nd_plane_reject(s, stmt, oper) == 1   # #2558: a plane `@x[i]`
-            return 0
+        else if nd_plane_shape(s, oper) != null
+            # AGAST #2570: a plane `@x[i]`, `[M][N]..T` (#2558 refused it): the
+            # flat `@[M*N..]T`, so `q + k` strides planes and `q as *T` is
+            # element 0, keeping `[M][N]..T` for `q[i][j]`.
+            let plane: *ArrayShape = nd_plane_shape(s, oper)
+            size = shape_leaf_count(plane)
+            elem = plane.leaf_type
+            stmt.var_pointee_array_elem_pointee = plane.leaf_pointee
+            stmt.var_pointee_array_shape = plane
         else if oper.kind == EXPR_MEMBER
             let fld: *StructField = resolve_member_chain_field(s, oper)
             if fld != null and fld.field_type == TYPE_ARRAY
@@ -446,7 +447,9 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, out_len: *i32) -> *u8
     if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT) or init.operand == null
         return null
     let oper: *Expr = init.operand
-    let row: *ArrayShape = nd_row_shape(s, oper)   # #2555: `@x[i]`
+    var row: *ArrayShape = nd_row_shape(s, oper)   # #2555: `@x[i]`
+    if row == null
+        row = nd_plane_shape(s, oper)   # #2570: a plane, `@x[i]` of `[L][M][N]S`
     if row != null
         *out_len = row.leaf_name_len
         return row.leaf_name
@@ -2008,6 +2011,8 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
         declared.inner_ref = stmt.var_inner_ref   # AGAST #2399
         set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308, #2539 (`**[N]T`)
         set_local_pointee_elem(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_elem_pointee)
+        if declared.pointee_type == TYPE_ARRAY
+            declared.pointee_array_shape = stmt.var_pointee_array_shape   # AGAST #2570
         name_array_ptr_local(declared, stmt, view_name, view_name_len)   # AGAST #2543
     # An unannotated local takes its initialiser's kind; var_type can't say.
     var inferred_bool: i32 = 0
