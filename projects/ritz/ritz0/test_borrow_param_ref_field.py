@@ -42,6 +42,7 @@ import fast_link
 
 from array_rules import ELEMENT_MISMATCH
 from index_rules import needs_index
+from let_rules import another_struct
 from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
 from test_ref_into_value import COMPILERS, _assert_refused
@@ -3419,15 +3420,6 @@ pub fn main() -> i32
     var d: D = f(@&c)
     return d.a as i32
 """,
-    "another_struct_let": ANOTHER_D + """
-fn f(c:& C) -> i32
-    let d: D = c
-    return d.a as i32
-
-pub fn main() -> i32
-    var c: C = C { x: 3, y: 0 }
-    return f(@&c)
-""",
     "another_struct_argument": ANOTHER_D + """
 fn g(d: D) -> i32
     return 3
@@ -3647,6 +3639,54 @@ def test_by_value_slot_of_another_type_is_refused(ritz1_bin, tmp_path, compiler,
                            str(RITZ_START)], cwd=work, capture_output=True, text=True)
     assert link.returncode != 0
     assert re.search(r"defined with type|doesn't match function result type", link.stderr), link.stderr
+
+
+# AGAST #2293: a typed `let` or `var` of a struct of another type is refused at
+# the binding, on all three compilers.  ritz0 used to keep `d` a `C` (so only a
+# later `d.a` failed, as "Unknown field 'a' in struct 'C'", and a body that read
+# no `D` field ran), and ritz1 left it to clang.  None of these reads `d`, so
+# nothing later in the body can be the error.  `^` marks where it's reported.
+ANOTHER_STRUCT_BINDING = {
+    # The alias of the caller's place: ritz0 loads it, ritz1 reads the pointer.
+    "borrow_let": """
+fn f(c:& C) -> i32
+    ^let d: D = c
+    return 3
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@&c)
+""",
+    "local_let": """
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    ^let d: D = c
+    return 3
+""",
+    # ritz0's `var` refused this already, naming LLVM types.
+    "local_var": """
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    ^var d: D = c
+    return 3
+""",
+    "call_let": """
+fn mk() -> C
+    return C { x: 3, y: 0 }
+
+pub fn main() -> i32
+    ^let d: D = mk()
+    return 3
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ANOTHER_STRUCT_BINDING))
+def test_a_binding_of_another_struct_is_refused_at_the_binding(tmp_path, compiler, name):
+    _assert_refused(compiler, tmp_path, f"binding_{name}", ANOTHER_D + ANOTHER_STRUCT_BINDING[name],
+                    another_struct("d", "D", "C"))
 
 
 # A written reference returned is the caller's address.

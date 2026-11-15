@@ -22,6 +22,7 @@ from builtin_types import BUILTIN_TYPES
 import index_rules
 import deref_rules
 import ref_rules
+import let_rules
 import bool_rules
 import float_rules
 import binder_names
@@ -6291,6 +6292,7 @@ class LLVMEmitter:
                         self._check_initialiser_has_value(stmt, val)
                         self._reject_enum_as_int(val, ty, stmt.type,
                                                  getattr(stmt, 'span', None))
+                        self._reject_another_struct(stmt, val, ty)
                     if stmt.type:
                         self._check_implicit_narrowing(stmt, val.type, ty)
                     # AGAST #1736: an sret call writes the new var in place
@@ -6362,6 +6364,7 @@ class LLVMEmitter:
                 src_ty = val.type  # before _convert_type hides any narrowing
                 self._reject_enum_as_int(val, declared_ty, stmt.type,
                                          getattr(stmt, 'span', None))
+                self._reject_another_struct(stmt, val, declared_ty)
                 val = self._convert_type(val, declared_ty, stmt.value)
                 self._check_implicit_narrowing(stmt, src_ty, declared_ty)
                 self._check_let_annotation(stmt, val, declared_ty)
@@ -14648,6 +14651,31 @@ class LLVMEmitter:
             f"but its initialiser has type `{actual}`",
             getattr(stmt, "span", None),
         )
+
+    def _reject_another_struct(self, stmt, val: ir.Value, declared_ty: ir.Type) -> None:
+        """Refuse `let d: D = c` / `var d: D = c` where `c` is a struct of another type.
+
+        AGAST #2293.  _convert_type hands a struct of another type back
+        unchanged, so a `let` kept `d` a `C` under its `D` annotation: only a
+        later `d.a` failed ("Unknown field 'a' in struct 'C'"), and a body that
+        read no `D` field ran.  A `c:& C` parameter reads as its pointer here,
+        so a pointer to a struct counts as the struct it points at.  Checked
+        before conversion, at the binding, with the message ritz1 gives
+        (ritz1/src/let_check.ritz).
+        """
+        if not isinstance(declared_ty, ir.IdentifiedStructType):
+            return
+        actual = val.type
+        if isinstance(actual, ir.PointerType) and isinstance(actual.pointee, ir.IdentifiedStructType):
+            actual = actual.pointee
+        if not isinstance(actual, ir.IdentifiedStructType) or actual == declared_ty:
+            return
+        declared = self._get_struct_name_from_type(declared_ty)
+        found = self._get_struct_name_from_type(actual)
+        if declared is None or found is None or declared == found:
+            return
+        raise EmitError(let_rules.another_struct(stmt.name, declared, found),
+                        getattr(stmt, "span", None))
 
     def _format_ritz_type(self, ty: rast.Type) -> str:
         """Best-effort source spelling of a declared type, for diagnostics."""

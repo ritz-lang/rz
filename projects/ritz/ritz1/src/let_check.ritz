@@ -274,6 +274,41 @@ fn let_check_write(s: *EmitterState, stmt: *Stmt)
     # STMT_MEMBER_ASSIGN / STMT_MEMBER_INDEX_ASSIGN are `(*p).f = v`: through
     # a pointer, always legal.
 
+# AGAST #2293: `let d: D = c` / `var d: D = c` with `c` a struct of another
+# type.  It used to reach clang as `store %C ..., %D` (or the `ptr` a `c:& C`
+# reads as).  ritz0's _reject_another_struct gives the same message at the
+# same place (ritz0/let_rules.py).  Only two known structs that differ by name
+# are refused: a cast names its operand's type here, the StrView / Span$u8
+# pair converts (#168), and an enum or a name find_struct doesn't know (an
+# alias) is left to the store.
+fn let_check_another_struct(s: *EmitterState, stmt: *Stmt)
+    let init: *Expr = stmt.var_init
+    if init == null or init.kind == EXPR_CAST
+        return
+    if stmt.var_declared_type != TYPE_STRUCT or stmt.var_type_name == null or stmt.var_type_name_len <= 0
+        return
+    var src: *u8 = null
+    var src_len: i32 = 0
+    resolve_expr_struct_name(s, init, @src, @src_len)
+    # A `c:& C` param is a TYPE_MUT_REF local naming its referent (#2250).
+    let lent: *LocalVar = lent_local(s, init)
+    if src == null and lent != null and lent.var_type == TYPE_MUT_REF
+        src = lent.type_name
+        src_len = lent.type_name_len
+    if src == null or src_len <= 0
+        return
+    if name_eq(src, src_len, stmt.var_type_name, stmt.var_type_name_len) == 1
+        return
+    if is_layout_equiv_pair(src, src_len, stmt.var_type_name, stmt.var_type_name_len) == 1
+        return
+    if find_struct(s, src, src_len) == null or find_struct(s, stmt.var_type_name, stmt.var_type_name_len) == null
+        return
+    let_error(s, stmt.span.line, stmt.span.col, c"`", stmt.var_name, stmt.var_name_len, c"` is declared `")
+    let_eprint_name(stmt.var_type_name, stmt.var_type_name_len)
+    eprints_cstr(c"` but its initialiser is a `")
+    let_eprint_name(src, src_len)
+    eprints_cstr(c"`\n")
+
 # Check one statement before it is emitted: its own write target, and every
 # `@&` in the expressions it evaluates.  Nested statement lists (if / while /
 # for bodies, match arms) are checked as emit_stmt reaches them, when the
@@ -282,6 +317,8 @@ pub fn let_check_stmt(s: *EmitterState, stmt: *Stmt)
     let k: i32 = stmt.kind
     if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
         let_check_expr(s, stmt.var_init)
+        if k == STMT_VAR_DECL
+            let_check_another_struct(s, stmt)
         return
     if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
         let_check_write(s, stmt)
