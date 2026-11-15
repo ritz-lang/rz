@@ -669,6 +669,11 @@ a payload over an outer local 0.
 per fn. It costs 9 renames. A `for` variable reusing a local raises the scope question
 just as a nested `let` does. It's his, because he set that ruling's limits.
 
+**CONFIRMED by Aaron, 2026-11-08** ("Yeah", recorded on #2455). The ruling is extended
+to every position above, with `_` exempt. It was built by `ritz-task-2395` and merged:
+LANGUAGE_SPEC §4.3 "No shadowing", the same located error on all three compilers, and 14
+sites renamed. He gave the same answer again on 2026-11-15.
+
 ## R13: `match` arm order (#2349)
 
 **Rule.** Arms are tried top to bottom and the first match wins, and every arm must be
@@ -1341,3 +1346,50 @@ Then IR-diff the corpus.
    commit. Independent of the overflow question, though if Aaron wants overflow
    trapped, deciding that first would turn sites like prism's into loud failures
    instead of silent ones.
+
+## Interactive session with Aaron, 2026-11-15 (R22-R32)
+
+`rz` sent the open decision queue so Aaron could decide it here, one ticket at a
+time. Each item was read in full in AGAST and checked against the code and the
+corpus on `ec68e598`. Aaron chose an option for every item and deferred none. Each
+ticket now carries `DECISION — AARON 2026-11-15 (rz-larb)` at the top of its
+description, with the implementation spec, and is `ready`. Counts are text scans
+of `projects/` unless stated, so they are lower bounds. Nothing was compiled for
+this session. ritz1's behaviour was read from source or taken from the tickets.
+
+| R | Ticket | Rule | Sites |
+|---|---|---|---|
+| R22 | #1620 | `dyn Trait` is removed from ritz0. `dyn` stays a reserved keyword, and any use of it is a located error at the token on all three (ritz1's #2298 wording). Traits stay compile-time only (§12.2) | 0 production; 2 test files |
+| R23 | #3243 | The named syscall builtins `open`/`read`/`write`/`close`/`nanosleep` are removed from both compilers. The names resolve like any fn; syscalls go through `ritzlib.sys` `sys_*` | 26 calls (56_async_runtime 18, spire 6, lexis 1, squeeze 1) |
+| R24 | #3244 | `x.m()` on a user type reaches only impl and trait methods. A free `foo_cmp` is not a method: it's a located "no method `cmp` on `Foo`". ritz0's lowercase checker fallback goes | 0 |
+| R25 | #3189 | A whole array alone as a statement or void tail is the located "a whole array is not a value here" on all three (#3054's wording fix included) | 0 expected |
+| R26 | #3233 | `.N` is tuple-only. `h.0` on a named struct is "`Holder` has no field `0`" on all three, which ends ritz0's double drop | 0 (all 8 `.N` reads are on tuples) |
+| R27 | #3234 | An element of a call's by-value array (`mka()[1].x`) is a value, the same rule as fields (#2294). Writes, `@&` and mutating methods get #2518's error | 0 |
+| R28 | #3236 | `Type.m(...)` is only for methods without `self`. Calling a `self` method that way is #2292's located error for every receiver kind, with a hint to write `c.get()` / `C_get(@&c)` | 0 (the 9 hits are `Reader.new`) |
+| R29 | #3162 | An `impl` on a compiler built-in type (the #3127 Span) is a located error at the `impl`. A declared or imported `struct Span<T>` is unaffected | 0 |
+| R30 | #3203 | Delete `ab_test.sh`, `bootstrap_test.sh`, `test_ritz1.sh`, `test_tier1.sh` and `ritz.toml`'s `ab-test`. `regression.sh` is the A/B comparison | tooling |
+| R31 | #2520 | Unreachable code is a located error at the first dead statement. That covers code after `return`, `break`, `continue`, an `if`/`else` or `match` whose every arm diverges, and a `loop` with no `break`: R13 extended to statements. The room measures the corpus first | unmeasured; room reports if more than ~10 |
+| R32 | #3215 | A call returning `@T`/`@&T`/`*T` (or anything containing one) with an argument that lends a temporary is a located "bind it to a local first". #2518's drop-at-call-return stays the only lifetime for a lent temporary | 0 |
+
+**Three things the session found that rz's summaries didn't say:**
+- **#3243:** ritz1 does NOT let a user fn shadow these names. #1791 copied ritz0's
+  builtin-first order (`ritz1/src/emitter_expr_call.ritz:4086`), so both compilers
+  had the bug.
+- **#3244:** the emitters use a fixed UFCS table, but ritz0's checker applies
+  `<lowercased type>_<method>` to every type. That mismatch is the crash.
+- **#3215:** the refusal costs some safe calls. Without lifetime annotations a
+  compiler can't tell that `find(@make_key(), @table) -> @Entry` points into
+  `table`. Aaron accepted that cost, and the fix is always one `let`.
+
+**What ties these together.** R22, R23, R24 and R29 continue the removal of name
+magic and implicit extension begun by R15 and R17: behaviour comes from what a
+program declares, not from what something happens to be called. R26 applies R19's
+reason (inserting a declaration must not renumber anything) to fields. R25, R31
+and R32 follow Aaron's "only if it can be done safely, otherwise error it" (#2518).
+
+**Follow-ups filed (LARB measure or design; each goes back to Aaron):**
+- #3251: design runtime polymorphism (a designed replacement for `dyn`). `pending`, after trait bounds (#1621).
+- #3252: retire the ritzlib UFCS name table in favour of impl blocks.
+- #3253: should any no-effect statement (`x`, `5`, `x == 1`) be an error?
+- #3254: positional `let (a, b) = struct`: keep it, refuse it, or add a named form?
+- #3256: may an `impl` target a type from another module, or one instantiation (`impl G<u8>`)? #3252 depends on it.
