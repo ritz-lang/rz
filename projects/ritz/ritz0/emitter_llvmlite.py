@@ -14692,14 +14692,9 @@ class LLVMEmitter:
                     result = self.builder.insert_value(result, converted_elem, i)
                 return result
 
-        # Scalar-to-newtype wrap: i32 -> struct { i32 }.
-        # Allows passing raw integers into single-field struct params (newtype wrappers).
-        if isinstance(target_type, ir.BaseStructType):
-            elems = target_type.elements
-            if len(elems) == 1 and isinstance(elems[0], ir.IntType) and isinstance(val.type, ir.IntType):
-                inner = self._convert_type(val, elems[0])
-                wrapped = self.builder.insert_value(ir.Constant(target_type, ir.Undefined), inner, 0)
-                return wrapped
+        # No int -> single-field struct wrap: nothing converts to a struct
+        # (LARB R47, LANGUAGE_SPEC §9.2, AGAST #3389). The int reaches the
+        # call unconverted and is "argument N of `f` has the wrong type".
 
         # Span-shape conversions: target is `{ *T, i64 }` and source is an
         # array value, a pointer-to-array, or a pointer-to-Vec-like struct.

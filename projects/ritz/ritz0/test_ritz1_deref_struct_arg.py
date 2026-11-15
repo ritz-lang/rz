@@ -146,6 +146,8 @@ def test_deref_struct_ptr_as_by_value_arg(
 # Control: `*q` of an `@i64` into a single-field struct (`Vec<M>.push`, M a
 # newtype over i64) must still take the newtype box. Only a struct pointee
 # skips it, so a guard that skipped every deref fails this and not the matrix.
+# ritz1 only: ritz0 has no box since LARB R47 (#3389) and refuses this call
+# (test_int_arg_for_struct_param.py "deref_i64"); #3390 does the same on ritz1.
 NEWTYPE = """\
 import ritzlib.gvec
 
@@ -166,6 +168,6 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("compiler", ["ritz1"])
 def test_deref_scalar_ptr_into_newtype_still_boxed(tmp_path, compiler):
     assert _run_pkg(compiler, tmp_path, "dsa_newtype", NEWTYPE) == 6

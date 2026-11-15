@@ -151,6 +151,8 @@ def test_struct_result_as_by_value_arg(tmp_path, compiler, size, producer, consu
 # Control: a scalar-returning method (`q.get()`, i64) into a single-field
 # struct param is still boxed. Scalar only, so a guard that is off fails the
 # matrix rows and not this one.
+# ritz1 only: ritz0 has no box since LARB R47 (#3389) and refuses this call
+# (test_int_arg_for_struct_param.py "method_result"); #3390 does the same on ritz1.
 NEWTYPE = """\
 struct M
     v: i64
@@ -178,6 +180,6 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("compiler", ["ritz1"])
 def test_scalar_method_result_still_boxed_into_newtype(tmp_path, compiler):
     assert _run(compiler, tmp_path, "sra_newtype", NEWTYPE) == 5
