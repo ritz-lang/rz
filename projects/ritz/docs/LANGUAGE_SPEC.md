@@ -1513,10 +1513,10 @@ A struct field of function type is called like a method (LARB R41, AGAST #2218):
 it is a `fn(...)`. `h` isn't passed; the arguments are exactly those written. If
 the type has both a method and a fn field named `f`, `h.f(1)` is an error,
 "`f` is both a method and a field of `H`: write `(h.f)(1)` for the field".
-`(h.f)(1)` always calls the field. ritz0 implements this (#3380); ritz1 accepts
-only the parenthesised form until #3381 lands:
+`(h.f)(1)` always calls the field. ritz0 (#3380), ritz1 and ritz1_selfhosted
+(#3381) implement this:
 
-```text
+```ritz
 struct H
     f: fn(i32) -> i32
 

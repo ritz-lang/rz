@@ -1,8 +1,8 @@
-"""`h.f(args)` calls a `fn(...)` field `f` (LARB R41, AGAST #3380, LANGUAGE_SPEC §5.5).
+"""`h.f(args)` calls a `fn(...)` field `f` (LARB R41, AGAST #3380/#3381, LANGUAGE_SPEC §5.5).
 
 THE DEFECT
 
-ritz0 refused `h.f(1)` on a struct whose field `f` is a function pointer,
+ritz0 and ritz1 refused `h.f(1)` on a struct whose field `f` is a function pointer,
 "no method `f` on `H`", and accepted only `(h.f)(1)`. lexis calls
 `element.get_attribute(attr_name)` through such a field
 (lib/style/matching.ritz).
@@ -12,13 +12,13 @@ THE RULE (LARB R41)
 A method `f` wins; otherwise a `fn(...)` field `f` is called with exactly the
 written arguments (`h` isn't passed). A type with both a method and a fn field
 named `f` refuses `h.f(...)` at `f`, naming `(h.f)(...)`, which always calls
-the field. ritz0 only: ritz1's side is #3381.
+the field. Each row runs on ritz0, ritz1 and ritz1_selfhosted (#3381).
 """
 
 import pytest
 
 from ref_rules import method_and_field, no_method
-from test_ref_into_value import _assert_refused, _run
+from test_ref_into_value import COMPILERS, _assert_refused, _run
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
@@ -107,12 +107,14 @@ pub fn main() -> i32
 }
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(RUNS))
-def test_fn_field_called_like_a_method(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, RUNS[name]) == WANT[name]
+def test_fn_field_called_like_a_method(tmp_path, compiler, name):
+    assert _run(compiler, tmp_path, name, RUNS[name]) == WANT[name]
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REFUSED))
-def test_fn_field_call_refused(tmp_path, name):
+def test_fn_field_call_refused(tmp_path, compiler, name):
     program, message = REFUSED[name]
-    _assert_refused("ritz0", tmp_path, name, program, message)
+    _assert_refused(compiler, tmp_path, name, program, message)

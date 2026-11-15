@@ -563,6 +563,83 @@ fn df_args(s: *EmitterState, a0: *Expr, p0: *Param)
             p = p.next
         a = a.next
 
+# ----------------------------------------------------------------------------
+# A fn field called like a method (LARB R41, LANGUAGE_SPEC §5.5, AGAST #3381;
+# ritz0's side is #3380).  With no method `f`, `h.f(args)` on a struct with a
+# `fn(...)` field `f` is `(h.f)(args)`: `h` isn't passed.  It's rewritten here,
+# before any check, into the nameless call the emitter already lowers.  A
+# method and a fn field both named `f` refuse `h.f(args)` at `f`, in ritz0's
+# words (ref_rules.method_and_field).  `(h.f)(args)` never reaches here.
+# ----------------------------------------------------------------------------
+
+# `x` as ritz0's _field_call_text spells it: a name, an integer, else `...`.
+fn df_put_call_part(x: *Expr, out: *DfBuf)
+    if x != null and x.kind == EXPR_IDENT
+        df_put(out, x.ident_ptr, x.ident_len)
+    else if x != null and x.kind == EXPR_INT_LIT and x.ident_ptr == null
+        var v: i64 = x.int_val
+        if v < 0
+            df_putc(out, '-')
+            v = 0 - v
+        var digits: [20]u8
+        var n: i32 = 0
+        while n == 0 or v > 0
+            digits[n] = ('0' as i64 + v % 10) as u8
+            v = v / 10
+            n += 1
+        while n > 0
+            n -= 1
+            df_putc(out, digits[n])
+    else
+        df_puts(out, c"...")
+
+fn df_method_and_field(s: *EmitterState, e: *Expr, st: *StructDef)
+    var m: DfBuf
+    df_buf_init(@m)
+    df_putc(@m, '`')
+    df_put(@m, e.ident_ptr, e.ident_len)
+    df_puts(@m, c"` is both a method and a field of `")
+    df_display(s, st.name, st.name_len, @m)
+    df_puts(@m, c"`: write `(")
+    df_put_call_part(e.left, @m)
+    df_putc(@m, '.')
+    df_put(@m, e.ident_ptr, e.ident_len)
+    df_puts(@m, c")(")
+    var a: *Expr = e.args
+    while a != null
+        df_put_call_part(a, @m)
+        if a.next != null
+            df_puts(@m, c", ")
+        a = a.next
+    df_puts(@m, c")` for the field")
+    df_report(s, df_line(e), df_col(e), m.data)
+
+# 1 when `e`, a method call `x.f(args)`, became the field call `(x.f)(args)`.
+fn df_fn_field_call(s: *EmitterState, e: *Expr) -> i32
+    let st: *StructDef = df_peek_struct(s, e.left)
+    if st == null
+        return 0
+    let f: *StructField = df_field(st, e.ident_ptr, e.ident_len)
+    if f == null or f.fn_sig == null
+        return 0
+    if method_callee_def(s, st.name, st.name_len, e.ident_ptr, e.ident_len) != null
+        df_method_and_field(s, e, st)
+        return 0
+    let callee: *Expr = si_new_expr(EXPR_MEMBER, e.left.span.line, e.left.span.col)
+    callee.left = e.left
+    callee.ident_ptr = e.ident_ptr
+    callee.ident_len = e.ident_len
+    callee.bracket = e.bracket
+    e.kind = EXPR_CALL
+    e.left = callee
+    e.ident_ptr = null
+    e.ident_len = 0
+    e.func_name = null
+    e.func_name_len = 0
+    e.call_type_suffix = null
+    e.call_type_suffix_len = 0
+    1
+
 # `x.m(args)`: S's own method, else T's through the trait, whose receiver is
 # then the reference `deref` / `deref_mut` returns.
 fn df_method(s: *EmitterState, e: *Expr)
@@ -620,6 +697,9 @@ fn df_walk(s: *EmitterState, e: *Expr, ctx: i32)
         df_walk(s, e.left, df_down(ctx))
         df_member(s, e, ctx)
     else if k == EXPR_METHOD
+        if df_fn_field_call(s, e) == 1
+            df_walk(s, e, ctx)   # now `(h.f)(args)`
+            return
         df_method(s, e)
     else if k == EXPR_CALL
         if df_is_step(e) == 1
