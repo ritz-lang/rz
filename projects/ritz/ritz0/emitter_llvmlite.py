@@ -7681,18 +7681,17 @@ class LLVMEmitter:
         self.builder.position_at_end(cond_block)
         current_val = self.builder.load(loop_var)
 
-        # Compare: x < end (or x <= end for inclusive)
-        if range_expr.inclusive:
-            cmp_op = '<=' if self._is_signed_type(loop_ty) else '<='
-            if self._is_signed_type(loop_ty):
-                cond = self.builder.icmp_signed('<=', current_val, end_val)
-            else:
-                cond = self.builder.icmp_unsigned('<=', current_val, end_val)
+        # Compare: x < end (or x <= end for inclusive). AGAST #1636: unsigned
+        # when a bound is, by binary `<`'s rule (_operands_unsigned, #2361), so
+        # `for j in 0..big` with `big: u64 = 1 << 63` runs; `-3..2` stays signed.
+        narrowed = isinstance(loop_ty, ir.IntType) and loop_ty.width < 64
+        unsigned = (self._int_shape(range_expr.start, narrowed)[1]
+                    or self._int_shape(range_expr.end, narrowed)[1])
+        cmp_op = '<=' if range_expr.inclusive else '<'
+        if unsigned:
+            cond = self.builder.icmp_unsigned(cmp_op, current_val, end_val)
         else:
-            if self._is_signed_type(loop_ty):
-                cond = self.builder.icmp_signed('<', current_val, end_val)
-            else:
-                cond = self.builder.icmp_unsigned('<', current_val, end_val)
+            cond = self.builder.icmp_signed(cmp_op, current_val, end_val)
 
         self.builder.cbranch(cond, body_block, end_block)
 
