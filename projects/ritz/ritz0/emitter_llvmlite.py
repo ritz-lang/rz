@@ -7668,8 +7668,22 @@ class LLVMEmitter:
         loop_var = self._alloca_in_entry_block(loop_ty, stmt.var)
         self.builder.store(start_val, loop_var)
 
+        # AGAST #1636 / #3328: the range compares unsigned when a bound is
+        # unsigned, and the loop variable has that same type in the body, so
+        # `j / 2` with `j = 1 << 63` is a udiv. Decided once, from the bounds
+        # as they read before `j` is bound, so the two can't disagree.
+        unsigned = self._for_range_unsigned(range_expr, loop_ty)
+
         # Add to local vars scope
         self.locals[stmt.var] = (loop_var, loop_ty)
+        # Always set, signed too: a stale entry from an earlier `for j` over
+        # u64 bounds would otherwise make this `j` unsigned.
+        if isinstance(loop_ty, ir.IntType):
+            prefix = 'u' if unsigned else 'i'
+            self.ritz_types[stmt.var] = rast.NamedType(
+                None, f"{prefix}{loop_ty.width}", [])
+        else:
+            self.ritz_types.pop(stmt.var, None)
 
         # Create basic blocks
         cond_block = self.current_fn.append_basic_block("for.cond")
@@ -7690,12 +7704,7 @@ class LLVMEmitter:
         self.builder.position_at_end(cond_block)
         current_val = self.builder.load(loop_var)
 
-        # Compare: x < end (or x <= end for inclusive). AGAST #1636: unsigned
-        # when a bound is, by binary `<`'s rule (_operands_unsigned, #2361), so
-        # `for j in 0..big` with `big: u64 = 1 << 63` runs; `-3..2` stays signed.
-        narrowed = isinstance(loop_ty, ir.IntType) and loop_ty.width < 64
-        unsigned = (self._int_shape(range_expr.start, narrowed)[1]
-                    or self._int_shape(range_expr.end, narrowed)[1])
+        # Compare: x < end (or x <= end for inclusive), signed by `unsigned`.
         cmp_op = '<=' if range_expr.inclusive else '<'
         if unsigned:
             cond = self.builder.icmp_unsigned(cmp_op, current_val, end_val)
@@ -7962,6 +7971,15 @@ class LLVMEmitter:
 
         self.builder.position_at_end(end_block)
         return None
+
+    def _for_range_unsigned(self, range_expr: rast.Range, loop_ty: ir.Type) -> bool:
+        """Is `for j in a..b` unsigned? It is when a bound is, by binary `<`'s
+        rule (_operands_unsigned, #2361), so `for j in 0..big` with
+        `big: u64 = 1 << 63` runs (#1636) and `-3..2` stays signed. This one
+        answer picks the compare and `j`'s type in the body (#3328)."""
+        narrowed = isinstance(loop_ty, ir.IntType) and loop_ty.width < 64
+        return (self._int_shape(range_expr.start, narrowed)[1]
+                or self._int_shape(range_expr.end, narrowed)[1])
 
     def _for_elem_ritz_type(self, it: rast.Expr, iter_kind: str, vec_ptr,
                             elem_ty: ir.Type) -> Optional[rast.Type]:

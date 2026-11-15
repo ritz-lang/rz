@@ -8,6 +8,12 @@ compare now follows binary `<`'s rule (#2361): unsigned when a bound is a u64,
 directly or through an operator expression. A signed range keeps its signed
 compare, which is what lets `-3..2` cross 0.
 
+The loop variable takes the same type (AGAST #3328): a u64 when the range
+compares unsigned, so `j / 2`, `j % 3`, `j >> 62` and `j < 1` in the body are
+unsigned for `j = 1 << 63`. They were sdiv, srem, ashr and slt on ritz0 and
+ritz1. One rule decides both, so the compare and `j`'s type can't drift apart. A
+signed range's `j` stays signed, even after a u64 loop over the same name.
+
 `usize` is not here: whether it is unsigned is AGAST #2363's call, and until
 then a usize range compares like a usize `<`, signed.
 
@@ -153,6 +159,73 @@ ROWS = {
             return 1
         0
     """),
+    # AGAST #3328: j is a u64 in the body. Signed, 1 << 63 is -2^63, and
+    # these are -2^62, -2, -2 and true.
+    "body_ops_top_bit": _row(f"""
+        {BIG}
+        var n: i64 = 0
+        for j in big..=big
+            n = n + 1
+            if j / 2 != 4611686018427387904
+                return 1
+            if j % 3 != 2
+                return 2
+            if j >> 62 != 2
+                return 3
+            if j < 1
+                return 4
+        if n != 1
+            return 5
+        0
+    """),
+    # The end alone is a u64: j is one too, as the compare is unsigned.
+    "body_ops_end_only_u64": _row(f"""
+        {BIG}
+        let s: i64 = 9223372036854775807
+        var n: i64 = 0
+        for j in s..=big
+            n = n + 1
+            if n == 2
+                if j / 2 != 4611686018427387904
+                    return 1
+                if j >> 62 != 2
+                    return 2
+        if n != 2
+            return 3
+        0
+    """),
+    # A signed range's j stays signed.
+    "body_ops_signed": _row("""
+        let a: i64 = -4
+        var n: i64 = 0
+        for j in a..=a
+            n = n + 1
+            if j / 2 != -2
+                return 1
+            if j % 3 != -1
+                return 2
+            if j >> 1 != -2
+                return 3
+            if j > 0
+                return 4
+        if n != 1
+            return 5
+        0
+    """),
+    # ... even after a u64 loop that bound the same name.
+    "body_ops_signed_after_u64": _row(f"""
+        {BIG}
+        for j in big..=big
+            if j / 2 != 4611686018427387904
+                return 1
+        let a: i64 = -4
+        for j in a..=a
+            if j / 2 != -2
+                return 2
+            if j >> 1 != -2
+                return 3
+        0
+    """),
 }
 
 
@@ -166,7 +239,7 @@ def _program():
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_for_range_compare_follows_bound_signedness(request, compiler, tmp_path):
+def test_for_range_follows_bound_signedness(request, compiler, tmp_path):
     code = _run(request, compiler, tmp_path, _program())
     names = list(ROWS)
     wrong = names[code - 1] if 0 < code <= len(names) else code

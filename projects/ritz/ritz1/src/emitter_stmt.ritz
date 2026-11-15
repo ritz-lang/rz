@@ -5560,6 +5560,19 @@ fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     own_after_stmt(s, stmt)
     own_stmt_end(s, own_mark)
 
+# 1 if range `for j in a..b` is unsigned: a bound is a u64, by binary `<`'s
+# rule (emit_expr_binary, #2361), so `for j in 0..big` with `big: u64 = 1 << 63`
+# runs (#1636) and `-3..2` stays signed.  This one answer picks both the
+# compare and j's type in the body (#3328).  ritz0's _for_range_unsigned.
+fn for_range_unsigned(s: *EmitterState, stmt: *Stmt) -> i32
+    var start_uns: i32 = 0
+    var end_uns: i32 = 0
+    let start_bits: i32 = int_operand_shape(s, stmt.for_start, @start_uns)
+    let end_bits: i32 = int_operand_shape(s, stmt.for_end, @end_uns)
+    if (start_bits == 64 and start_uns == 1) or (end_bits == 64 and end_uns == 1)
+        return 1
+    0
+
 fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # AGAST #2028: reject writes / `@&` into a `let` before emitting them.
     let_check_stmt(s, stmt)
@@ -5929,8 +5942,17 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_reg(s, var_reg)
         emit_str(s, c" = alloca i64\n")
 
+        # AGAST #1636 / #3328: the range compares unsigned when a bound is a
+        # u64, and the loop variable is then a u64 in the body, so `j / 2`
+        # with `j = 1 << 63` is a udiv.  Decided once, from the bounds as they
+        # read before `j` is bound, so the compare and the type can't disagree.
+        let range_uns: i32 = for_range_unsigned(s, stmt)
+        var var_type: i32 = TYPE_I64
+        if range_uns == 1
+            var_type = TYPE_U64
+
         # Register the loop variable
-        add_local(s, stmt.for_var, stmt.for_var_len, var_reg, TYPE_I64)
+        add_local(s, stmt.for_var, stmt.for_var_len, var_reg, var_type)
 
         # Emit start expression and store it
         let start_reg: i32 = emit_expr(s, stmt.for_start)
@@ -5958,17 +5980,8 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let cmp_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, cmp_reg)
-        # `start..=end` (AGAST #1530) keeps iterating while i <= end.
-        # AGAST #1636: unsigned when a bound is a u64, by binary `<`'s rule
-        # (emit_expr_binary, #2361), so `for j in 0..big` with
-        # `big: u64 = 1 << 63` runs; `-3..2` stays signed.
-        var start_uns: i32 = 0
-        var end_uns: i32 = 0
-        let start_bits: i32 = int_operand_shape(s, stmt.for_start, @start_uns)
-        let end_bits: i32 = int_operand_shape(s, stmt.for_end, @end_uns)
-        var range_uns: i32 = 0
-        if (start_bits == 64 and start_uns == 1) or (end_bits == 64 and end_uns == 1)
-            range_uns = 1
+        # `start..=end` (AGAST #1530) keeps iterating while i <= end; signed
+        # or not by range_uns.
         if stmt.for_inclusive != 0
             if range_uns == 1
                 emit_str(s, c" = icmp ule i64 ")
