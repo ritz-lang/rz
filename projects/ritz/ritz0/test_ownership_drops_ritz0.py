@@ -24,6 +24,8 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
     drops once, in the method (AGAST #2239).
   * a binding from a method call has the method's return type, so a by-value
     receiver moves it (AGAST #2257).
+  * a void fn's tail value goes nowhere: a temporary drops once, a bare
+    binding stays owned (AGAST #2253).
 
 Exit statuses encode what the program observed, as in the free-count test.
 """
@@ -987,6 +989,61 @@ pub fn main() -> i32
     return DROPS
 """)
     assert rc == expected, f"{name}: {rc} drops, spec says {expected}"
+
+
+# A void fn's tail value goes nowhere (AGAST #2253): a temporary drops once, a
+# bare binding stays owned and drops once at scope end.
+VOID_TAIL_RUNS = {
+    "call": """
+fn f()
+    make(1)
+""",
+    "struct_literal": """
+fn f()
+    Holder { t: make(1), n: 1 }
+""",
+    "binding": """
+fn f()
+    var t = make(1)
+    t
+""",
+    "array": """
+fn f()
+    var t = make(1)
+    [t]
+""",
+    "tuple": """
+fn f()
+    var t = make(1)
+    (t, 1)
+""",
+    # An if arm's tail in a void fn goes nowhere either.
+    "if_arm": """
+fn f()
+    var t = make(1)
+    if DROPS == 0
+        [t]
+""",
+    "match_arm": """
+fn f()
+    var t = make(1)
+    match DROPS
+        0 =>
+            let z: i32 = 1
+            [t]
+        _ => pass
+""",
+}
+
+
+@pytest.mark.parametrize("name", sorted(VOID_TAIL_RUNS))
+def test_ritz0_void_fn_tail_value_drops_once(tmp_path, name):
+    rc = _run(tmp_path, VOID_TAIL_RUNS[name] + """
+pub fn main() -> i32
+    f()
+    return DROPS
+""")
+    assert rc == 1, f"{name}: {rc} drops, spec says 1"
 
 
 @pytest.mark.parametrize("name", sorted(LITERAL_REJECTS))

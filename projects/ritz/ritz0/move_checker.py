@@ -872,14 +872,19 @@ class MoveChecker:
 
         # Check function body (which is a Block)
         self.current_ret_type = fn.ret_type
-        self._check_block(fn.body)
+        # A procedure's tail value goes nowhere (AGAST #2253).
+        self._check_block(fn.body, value_used=fn.ret_type is not None)
 
         self._pop_scope()
         fn.field_moves = self._field_moves
         self.current_fn_name = None
 
-    def _check_block(self, block: rast.Block) -> bool:
+    def _check_block(self, block: rast.Block, value_used: bool = True) -> bool:
         """Check a block expression.
+
+        `value_used` is False when nothing receives the block's value (a
+        procedure body, an `if` arm in statement position): its tail is then
+        a temporary, or a binding that stays owned, not a move (AGAST #2253).
 
         Returns True if block definitely returns (via ReturnStmt).
         """
@@ -896,7 +901,11 @@ class MoveChecker:
                 # A block's value is a statement of its own for loans: an arm's
                 # `@&c` doesn't meet the next arm's.
                 mark = len(self._arg_loans)
-                self._check_expr(block.expr, is_move_context=True)
+                # A bare `t:& T` tail still reads the referent by value, used
+                # or not, as on ritz1 (AGAST #2949).
+                lent = (isinstance(block.expr, rast.Ident)
+                        and self._lent_param(block.expr) is not None)
+                self._check_expr(block.expr, is_move_context=value_used or lent)
                 self._release_arg_loans(mark)
             # Falling off the end, after the tail value.
             self._run_defers(len(self._defers) - 1)
@@ -1384,7 +1393,7 @@ class MoveChecker:
                 if owned is not None:
                     self._own_payload(arm, owned)
                 if isinstance(arm.body, rast.Block):
-                    left = self._check_block(arm.body)
+                    left = self._check_block(arm.body, value_used=is_move_context)
                 else:
                     self._check_expr(arm.body, is_move_context=is_move_context)
                     left = isinstance(arm.body, (rast.BreakExpr, rast.ContinueExpr,
@@ -1436,7 +1445,7 @@ class MoveChecker:
 
             # Check then branch
             self._push_scope()
-            then_returns = self._check_block(expr.then_block)
+            then_returns = self._check_block(expr.then_block, value_used=is_move_context)
             self._pop_scope()
 
             # Save state after then branch (captures moves in then)
@@ -1448,7 +1457,7 @@ class MoveChecker:
                 self.scope.restore_states(saved_states)
 
                 self._push_scope()
-                else_returns = self._check_block(expr.else_block)
+                else_returns = self._check_block(expr.else_block, value_used=is_move_context)
                 self._pop_scope()
 
                 # After if/else, merge states:

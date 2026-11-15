@@ -5469,7 +5469,9 @@ class LLVMEmitter:
                 self._reject_void_arms(fn_def.body.expr, False, fn_def.body.expr)
                 # Check if we're returning a local variable - it should be moved, not dropped
                 exclude_var = None
-                if isinstance(fn_def.body.expr, rast.Ident):
+                # A procedure's tail binding isn't returned: it stays owned
+                # and drops with its scope (AGAST #2253).
+                if fn_def.ret_type is not None and isinstance(fn_def.body.expr, rast.Ident):
                     var_name = fn_def.body.expr.name
                     if var_name in self.locals:
                         # This is a local variable being returned - treat as move
@@ -5486,6 +5488,10 @@ class LLVMEmitter:
                 # specialization instead of an arbitrary one from variant_to_enum.
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
                 self._procedure_method_calls = set()
+                # A procedure's tail value goes nowhere: a temporary, dropped
+                # with the scopes by _emit_drop_for_all_scopes (AGAST #2253).
+                if fn_def.ret_type is None:
+                    self._temp_frames.append([])
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
                 if self._is_range_index(fn_def.body.expr):
                     # AGAST #2877: a Vec slice as a `-> Span<T>` tail is a
