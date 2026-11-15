@@ -1392,6 +1392,52 @@ pub fn main() -> i32
 }
 
 
+# A wrong-length array at a method call, through a fn value, or into a `*[N]T`
+# param.  ritz0 took the first two, and both compilers the third, until #2368's
+# rule (LANGUAGE_SPEC §3.2: `@x` fits `@U`, `@&U` or `*U` only when `x` is a `U`)
+# refused them (AGAST #2324).  The callee indexes by the N it declares, so the
+# alternative is an out-of-bounds access.  ritz0 must say where, too.
+REF_MISFIT = r"main\.ritz:\d+:\d+: (error: )?a reference to one type doesn't fit a reference to another"
+OTHER_CALLS = {
+    "method_argument": (NOT_THAT_ARRAY, """
+impl W
+    fn g(self:& W, b:& [5]i32) -> i32
+        return b[4]
+
+pub fn main() -> i32
+    var w: W = W { n: 1 }
+    var b: [2]i32 = [1, 1]
+    return w.g(@&b)
+"""),
+    "fn_value_argument": (NOT_THAT_ARRAY, """
+fn f(a:& [5]i32) -> i32
+    return a[4]
+
+pub fn main() -> i32
+    let h: fn(@[5]i32) -> i32 = f
+    var b: [2]i32 = [1, 1]
+    return h(@b)
+"""),
+    "pointer_param_argument": (REF_MISFIT, """
+fn f(p: *[5]i32) -> i32
+    return p[4]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 1]
+    return f(@a)
+"""),
+}
+REFUSED.update(OTHER_CALLS)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(OTHER_CALLS))
+def test_ritz0_refuses_another_call_at_the_line(tmp_path, name):
+    comp, ll, _ = _compile("ritz0", None, tmp_path, name, TYPES + OTHER_CALLS[name][1])
+    assert comp.returncode != 0 and not ll.exists()
+    assert re.search(REF_MISFIT, comp.stdout + comp.stderr), comp.stdout + comp.stderr
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_ritz0_refuses(tmp_path, name):
@@ -1407,39 +1453,6 @@ def test_ritz1_refuses_at_the_line(ritz1_bin, tmp_path, name):
     assert comp.returncode != 0
     assert not ll.exists()
     assert re.search(pattern, comp.stdout + comp.stderr), comp.stdout + comp.stderr
-
-
-# ritz0 takes these and ritz1 refuses, because the alternative is a wrong-sized
-# access in the callee.  AGAST #2324: ritz0 doesn't check these arguments.
-RITZ1_STRICTER = {
-    "method_argument": """
-impl W
-    fn g(self:& W, b:& [5]i32) -> i32
-        return 3
-
-pub fn main() -> i32
-    var w: W = W { n: 1 }
-    var b: [2]i32 = [1, 1]
-    return w.g(@&b)
-""",
-    "fn_value_argument": """
-fn f(a:& [5]i32) -> i32
-    return 3
-
-pub fn main() -> i32
-    let h: fn(@[5]i32) -> i32 = f
-    var b: [2]i32 = [1, 1]
-    return h(@b)
-""",
-}
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_STRICTER))
-def test_ritz1_is_stricter_than_ritz0_here(ritz1_bin, tmp_path, name):
-    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + RITZ1_STRICTER[name])
-    assert comp.returncode != 0 and not ll.exists()
-    assert re.search(NOT_THAT_ARRAY, comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 
 # ritz0 gives 3 for these; ritz1 refuses them, located.  A nested array has no
