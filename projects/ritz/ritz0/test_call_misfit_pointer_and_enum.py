@@ -139,6 +139,11 @@ LEGAL = {
     "receiver_borrowed": "    p.n = 6\n    return p.sz(1) as i32",
     "free_pointer_arg": "    q.m = 7\n    return ftake(@q) as i32",
     "enum_as_converted": "    return (p.sz(Lv.Hi as u64) + fsz(Lv.Lo as u64) + 5) as i32",
+    # AGAST #3351: a bare unit variant cast, the form the refusal above
+    # tells the user to write.  ritz1 passed the `%Lv` aggregate as the int.
+    "bare_enum_as_call_arg": "    return (p.sz(Hi as u64) + fsz(Lo as u64) + 5) as i32",
+    "bare_enum_as_let": "    let n: u64 = Hi as u64\n    let z = Lo as u64\n    return (n + z + 6) as i32",
+    "bare_enum_as_compare": "    if Hi as u64 > Lo as u64\n        return 7\n    return 0",
     "static": "    let m = P.mk(7)\n    return m.n as i32",
 }
 
