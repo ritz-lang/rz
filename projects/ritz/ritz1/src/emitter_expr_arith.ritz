@@ -1519,6 +1519,23 @@ fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
         if array_ptr_index_base(s, op.left) != null
             emit_nd_error(s, op.span.line, op.span.col, c"the address of an element through a pointer to an array is refused (cast the pointer to `*T` and index that)")
             return 0
+        # AGAST #2204: `@b.f[i]` with a `f: *T` field, whatever `b` is (a struct
+        # value, a `*S`, a member chain), is `b.f + i`: the sum the read
+        # `*(b.f + i)` steps by one T.  A struct value's field was "cannot take
+        # address"; through a `*S` it stepped a byte, so a `*u32` read garbage.
+        let pf_field: *StructField = resolve_member_chain_field(s, op.left)
+        if pf_field != null and pf_field.field_type == TYPE_PTR
+            var pf_sum: Expr
+            var pf_deref: Expr
+            elem_index_as_deref(op, @pf_sum, @pf_deref)
+            let pf_val: i32 = emit_expr(s, @pf_sum)
+            let pf_ptr: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, pf_ptr)
+            emit_str(s, c" = inttoptr i64 ")
+            emit_reg(s, pf_val)
+            emit_str(s, c" to ptr\n")
+            return pf_ptr
         # Handle @arr[i] - address of array element
         if op.left.kind == EXPR_IDENT
             let local: *LocalVar = find_local_struct_name(s, op.left.ident_ptr, op.left.ident_len)
@@ -1707,43 +1724,7 @@ fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                                     emit_str(s, c"\n")
                                     # Convert to i64
                                     return elem_ptr
-                                else if field.field_type == TYPE_PTR
-                                    # @ptr_to_struct.ptr_field[i] — the field
-                                    # is a raw pointer (e.g. *u8 buffer in
-                                    # cryptosec's DerElement.content).  Load
-                                    # the parent ptr, GEP to the field, load
-                                    # the field-pointer, then GEP into that
-                                    # buffer by index.  Element type defaults
-                                    # to i8 since the common case is *u8 and
-                                    # GlobalVarDef-style element-type info
-                                    # isn't tracked on StructField.
-                                    let parent_ptr: i32 = emit_load_ptr(s, local.reg)
-                                    let fld_addr: i32 = next_reg(s)
-                                    emit_str(s, c"  ")
-                                    emit_reg(s, fld_addr)
-                                    emit_str(s, c" = getelementptr %")
-                                    emit_name(s, st.name, st.name_len)
-                                    emit_str(s, c", ptr ")
-                                    emit_reg(s, parent_ptr)
-                                    emit_str(s, c", i32 0, i32 ")
-                                    emit_int(s, field_idx as i64)
-                                    emit_str(s, c"\n")
-                                    let buf_ptr: i32 = next_reg(s)
-                                    emit_str(s, c"  ")
-                                    emit_reg(s, buf_ptr)
-                                    emit_str(s, c" = load ptr, ptr ")
-                                    emit_reg(s, fld_addr)
-                                    emit_str(s, c"\n")
-                                    let pf_idx: i32 = emit_expr(s, op.right)
-                                    let pf_elem: i32 = next_reg(s)
-                                    emit_str(s, c"  ")
-                                    emit_reg(s, pf_elem)
-                                    emit_str(s, c" = getelementptr i8, ptr ")
-                                    emit_reg(s, buf_ptr)
-                                    emit_str(s, c", i64 ")
-                                    emit_reg(s, pf_idx)
-                                    emit_str(s, c"\n")
-                                    return pf_elem
+                                # A `*T` field is the #2204 sum above.
                     # task-170: @local_struct.array_field[i] — local stack-
                     # allocated struct (TYPE_STRUCT, not PTR). e.g.
                     # `var addr: SockAddrIn` then `memset(@addr.zero[0],...)`
@@ -2004,8 +1985,11 @@ fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             let sresult: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, sresult)
-            emit_str(s, c" = load %")
-            emit_name(s, sname, sname_len)
+            emit_str(s, c" = load ")
+            # AGAST #2204: a `*v4i32` pointee is the vector `<4 x i32>`, not a
+            # struct `%v4i32` (clang: "load operand must be a pointer to a
+            # first class type").  emit_llvm_type_struct maps SIMD names.
+            emit_llvm_type_struct(s, TYPE_STRUCT, sname, sname_len)
             emit_str(s, c", ptr ")
             emit_reg(s, ptr)
             emit_str(s, c"\n")
