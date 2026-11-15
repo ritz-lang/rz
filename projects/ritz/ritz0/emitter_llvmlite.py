@@ -1256,6 +1256,11 @@ class LLVMEmitter:
         ]
         return strview_ty
 
+    def _is_builtin_strview(self, expr: rast.Expr) -> bool:
+        """Whether `expr` is a StrView by its Ritz type (AGAST #3326)."""
+        ty = self._infer_ritz_type(expr)
+        return isinstance(ty, rast.NamedType) and ty.name == 'StrView' and not ty.args
+
     def _ensure_builtin_generic_struct_specialization(self, ty: rast.NamedType) -> Optional[str]:
         """Synthesize lightweight generic structs used by built-ins (Span<T>).
 
@@ -11543,6 +11548,10 @@ class LLVMEmitter:
 
     def _struct_lit_layout(self, expr: rast.StructLit):
         """(%T, [(field name, Ritz type)]) for a struct literal's struct."""
+        if expr.name == 'StrView':
+            # Built-in, so `StrView { ptr, len }` needs no import (AGAST
+            # #3326); a declared or imported `struct StrView` is kept.
+            self._ensure_strview_type()
         if expr.name not in self.struct_types:
             raise ValueError(f"Unknown struct: {expr.name}")
         return self.struct_types[expr.name], self.struct_fields[expr.name]
@@ -11868,6 +11877,11 @@ class LLVMEmitter:
         elif isinstance(struct_val.type, ir.BaseStructType):
             # Value of struct type: extract the field
             struct_name = self._get_struct_name_from_type(struct_val.type)
+            if struct_name is None and self._is_builtin_strview(expr.expr):
+                # A "..." literal with no StrView registered is a bare
+                # `{ i8*, i64 }`: name it from its Ritz type (AGAST #3326).
+                self._ensure_strview_type()
+                struct_name = 'StrView'
             if struct_name:
                 idx = self._get_struct_field_index(struct_name, expr.field)
                 return self.builder.extract_value(struct_val, idx)
