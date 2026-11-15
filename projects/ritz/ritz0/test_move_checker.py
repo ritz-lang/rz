@@ -1824,6 +1824,24 @@ fn f(d: D) -> i32
         self.assert_moved(
             self.body("var p = (T { id: 1 }, 2)\nvar x = p.0\neat(x)\neat(x)"), "x")
 
+    # ---- a module-level `var` (AGAST #2269) ----
+
+    def global_body(self, text: str, params: str = "h: H") -> list:
+        """`text` in `fn f`, with `var G: H` declared at module level."""
+        lines = "".join(f"    {l}\n" for l in text.splitlines())
+        return check(self.DEFS + f"\nvar G: H\n\nfn f({params}) -> i32\n{lines}    return 0\n")
+
+    def test_field_of_global_binding_moves(self):
+        self.assert_moved(self.global_body("var x = G.t\neat(x)\neat(x)"), "x")
+
+    def test_whole_global_binding_moves(self):
+        self.assert_moved(self.global_body("var x = G\nvar y = x\nvar z = x"), "x")
+
+    def test_moving_out_of_a_global_is_allowed(self):
+        """As on ritz1: a global is never dropped, so nothing tracks what
+        moves out of it, and a second move out isn't refused (AGAST #3280)."""
+        assert self.global_body("var x = G.t\nvar y = G.t\nvar z = G") == []
+
     # ---- inference itself ----
 
     def test_qualified_variant_is_the_enums_value(self):

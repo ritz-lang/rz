@@ -3702,6 +3702,11 @@ fn main() -> i32
     consume(a[0])                   # error: `a` still drops a[0]
 ```
 
+A global `var` is never dropped, so moving its value, or a move-only field of
+it, out is allowed: a binding from it is its owner, and drops it once. Nothing
+tracks what moved out of a global, so moving the same value out of it twice
+isn't refused yet, and drops it twice (AGAST #3280).
+
 A reference isn't its referent. An `@T`, `@&T` or `*T` doesn't fit a by-value
 `T` slot: an argument, a `let` or `var` of type `T`, `=`, `return`, a function's
 tail, a field, an element, a variant's payload, or an `if` or `match` arm of any

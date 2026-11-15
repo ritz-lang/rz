@@ -401,6 +401,9 @@ class MoveChecker:
         # id(method FnDef) -> its impl block, for the impl's type parameters.
         self.method_impl: Dict[int, rast.ImplBlock] = {}
         self.types: Optional[MoveTypes] = None
+        # Module-level `var` name -> its declared type (AGAST #2269). Scope
+        # sees only locals and parameters; a local of the same name shadows.
+        self.globals: Dict[str, rast.Type] = {}
         # Per enclosing loop: the binding states at each `break` and
         # `continue` (AGAST #2161, _check_loop).
         self._loops: List[Dict[str, list]] = []
@@ -481,6 +484,8 @@ class MoveChecker:
         for item in module.items:
             if isinstance(item, rast.TypeAlias):
                 self.type_aliases[item.name] = item.target
+            elif isinstance(item, rast.VarDef) and item.type is not None:
+                self.globals[item.name] = item.type
             elif isinstance(item, (rast.FnDef, rast.ExternFn)):
                 # Collect function return type for call inference
                 if item.ret_type:
@@ -541,6 +546,11 @@ class MoveChecker:
             info = self.scope.lookup(expr.name)
             if info:
                 return info.ritz_type
+            # A module-level `var` (AGAST #2269): a binding from it, or from
+            # a field of it, then moves. Nothing tracks the global itself:
+            # it is never dropped, as on ritz1.
+            if expr.name in self.globals:
+                return self.globals[expr.name]
             return rast.NamedType(expr.span, 'unknown', [])
         elif isinstance(expr, rast.UnaryOp):
             if expr.op in ('&', '@'):

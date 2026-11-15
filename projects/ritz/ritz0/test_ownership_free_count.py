@@ -757,8 +757,11 @@ pub fn main() -> i32
     return DROPS
 """, 1, {}),
 
-    # A neighbour #2243 doesn't reach: `x` stays unknown, so a copy. (`var x =
-    # a[0]` of a move-only element is refused: test_array_element_move_out.py.)
+    # AGAST #2269: a binding from a module-level `var`, or a field of one, has
+    # its declared type, so it moves. ritz0 saw only locals, so `x` was a
+    # copy and dropped twice. Moving out of a global is allowed, as on ritz1:
+    # a global is never dropped. (`var x = a[0]` of a move-only element is
+    # refused: test_array_element_move_out.py.)
     "field_binding_of_global": (SLOT + FIELDS + """\
 var GLOBAL: Holder
 
@@ -771,7 +774,36 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz0": 2269}),
+""", 1, {}),
+
+    "whole_binding_of_global": (SLOT + FIELDS + """\
+var GLOBAL: Holder
+
+fn f() -> i32
+    GLOBAL = make_holder(1)
+    var x = GLOBAL
+    var y = x
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {"ritz1": 3275, "ritz1_selfhosted": 3275}),
+
+    "global_reassigned_after_field_move": (SLOT + FIELDS + """\
+var GLOBAL: Holder
+
+fn f() -> i32
+    GLOBAL = make_holder(1)
+    var x = GLOBAL.t
+    consume(x)
+    GLOBAL = make_holder(2)
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
 
     # AGAST #2257: a binding from a method call has the method's return type,
     # so it moves. Each of these dropped one value twice on ritz0.
