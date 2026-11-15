@@ -3008,6 +3008,27 @@ fn main() -> i32
     point_pick<i32>(@p, 0, 1)
 ```
 
+Method syntax reaches only methods: `x.m(...)` on a user type calls an `m`
+declared in an `impl` for that type, or in a trait impl for it. A free function
+whose name happens to be `<type>_<m>` is not a method. Without an `m`, the
+call is a compile error located at the method name (AGAST #3244). The ritzlib
+types in the UFCS table (`String`, `GrowBuf`, `Buffer`, `ArgParser`, and the
+`Vec`/`Span`/`Option`/`Result`/`Box` helpers) are the exception: `s.len()` on
+a `String` calls `string_len(@s)`, until AGAST #3252 decides the table's future.
+
+```ritz expect-error="no method `cmp` on `Foo`: declare it in `impl Foo`, or call `foo_cmp(a, b)`"
+struct Foo
+    x: i32
+
+fn foo_cmp(a: Foo, b: Foo) -> i32
+    a.x - b.x
+
+fn main() -> i32
+    let a = Foo { x: 1 }
+    let b = Foo { x: 2 }
+    a.cmp(b)
+```
+
 ---
 
 ## 10. Enums

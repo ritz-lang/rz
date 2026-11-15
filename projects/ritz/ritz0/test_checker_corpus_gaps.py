@@ -9,6 +9,7 @@ import pytest
 from parser import parse
 from name_resolver import resolve_names
 from type_checker import TypeChecker
+from ref_rules import no_method
 
 
 def names(source: str) -> list:
@@ -236,7 +237,8 @@ class TestEmitterBuiltins:
 
     def test_method_missing_on_a_user_struct_is_still_an_error(self):
         errs = types("struct S\n    n: i32\n\nfn f(s: S) -> i32\n    s.nope()\n    0\n")
-        assert any("no method 'nope'" in e for e in errs)
+        # Method syntax reaches only impl methods (AGAST #3244).
+        assert any(no_method("nope", "S") in e for e in errs)
 
 
 class TestModuleQualifiers:

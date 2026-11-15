@@ -943,11 +943,25 @@ class TypeChecker:
             self._check_receiver(expr, receiver_sig)
 
         if fn_sig is None:
-            # Try as free function (common for string_len, vec_push, etc.)
-            # Convention: type_method for String -> string_method
-            lower_name = f"{type_name.lower()}_{expr.method}"
-            tried_names.append(lower_name)
-            fn_sig = self.functions.get(lower_name)
+            # A ritzlib type's free fn in the UFCS table (`s.len()` on a
+            # String is `string_len(@s)`): the emitter's one fallback. Not
+            # `<lowercased type>_<method>`: the emitter never dispatched to
+            # that, and died on it (AGAST #3244). Unmonomorphised, a
+            # `Vec<u8>` is still `Vec`: the table knows it as `Vec$u8`.
+            fn_sig = receiver_sig
+            if fn_sig is None and isinstance(receiver, rast.NamedType) and receiver.args:
+                fn_sig = self.functions.get(find_ufcs_function(
+                    self.functions, mangle_generic_name(receiver.name, receiver.args),
+                    expr.method))
+
+        if fn_sig is None and self._is_user_type_without(receiver, type_name, expr.method):
+            # Method syntax reaches only impl methods (§9, AGAST #3244).
+            for arg in expr.args:
+                self._infer_type(arg)
+            self._slot_error(ref_rules.no_method(expr.method, type_name,
+                                       self._free_call(expr, type_name)),
+                             expr.name_span or expr.span)
+            return rast.NamedType(expr.span, 'unknown', [])
 
         if fn_sig is None:
             # Try just the method name
@@ -982,6 +996,35 @@ class TypeChecker:
             self._check_value_args(expr, receiver)
 
         return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
+
+    def _is_user_type_without(self, receiver: rast.Type, type_name: str, method: str) -> bool:
+        """Is `receiver` a non-generic struct or enum the emitter would find
+        no `method` on? Its impl methods (`Foo_cmp`) and table fns were looked
+        up already; a `Deref` type's target's methods are §7.7's, which the
+        emitter reaches through `Foo_deref`, so one is never refused here."""
+        if not isinstance(receiver, rast.NamedType) or receiver.args:
+            return False
+        # Monomorphised, `Option<P>` is the struct `Option$P`: its builtins
+        # (`unwrap`, `len`, `ptr`) are the emitter's, not an impl's.
+        if '$' in type_name:
+            return False
+        if type_name not in self.structs and type_name not in self.enums:
+            return False
+        if type_name == 'StrView':
+            return False
+        return f"{type_name}_deref" not in self.functions
+
+    def _free_call(self, expr: rast.MethodCall, type_name: str) -> str | None:
+        """The free call `a.cmp(b)` may have meant, `foo_cmp(a, b)`, when
+        there is a `foo_cmp`: the receiver and arguments spelled by name, or
+        `...` when one isn't a plain name."""
+        name = f"{type_name.lower()}_{expr.method}"
+        if name not in self.functions:
+            return None
+        parts = [expr.expr, *expr.args]
+        if all(isinstance(p, rast.Ident) for p in parts):
+            return f"{name}({', '.join(p.name for p in parts)})"
+        return f"{name}(...)"
 
     def _check_value_args(self, expr: rast.MethodCall, receiver: rast.Type) -> None:
         """The by-value slots of the fn the emitter dispatches `expr` to when

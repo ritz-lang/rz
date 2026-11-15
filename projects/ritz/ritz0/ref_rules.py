@@ -80,3 +80,16 @@ MUT_SELF_ON_TEMP = "a method that writes `self` can't take a call's temporary: b
 # `@mk()`, `@&mk()`, `@mk().f`, `@mk().n[1]` anywhere but directly as a call's
 # argument, where the temporary lives until that call returns (AGAST #2518, #3050).
 ADDR_OF_TEMP = "`@` of a call's temporary outlives it: bind the call to a local first, or pass it straight to a call"
+
+
+# `x.m(...)` on a user type with no `m` in an `impl` for it (or a trait impl):
+# method syntax reaches only impl methods, and the ritzlib types in the UFCS
+# table (ufcs.py) until #3252. A free `foo_m` is not a method (Aaron's ruling
+# on AGAST #3244). `free_call` is the call to write instead, when there is a
+# free fn `<lowercased type>_<m>` to call. ritz1 prints the same words
+# (emitter_expr_call.ritz, refuse_no_method).
+def no_method(method: str, type_name: str, free_call: str | None = None) -> str:
+    hint = f"declare it in `impl {type_name}`"
+    if free_call:
+        hint += f", or call `{free_call}`"
+    return f"no method `{method}` on `{type_name}`: {hint}"
