@@ -2621,6 +2621,67 @@ pub fn main() -> i32
     f()
     return DROPS
 """, 1, {}),
+
+    # AGAST #2240: what a `name:& T` param may still do with its referent.
+    # The caller owns it, so it drops once, in the caller; each read here
+    # that became a move would be a second drop. The rejected moves are in
+    # THROUGH_REFERENCE.
+    "borrowed_param_relent": (LENT + """\
+fn g(t:& Tracked) -> i32
+    set(@&t)
+    let r: @Tracked = @t
+    return look(@t) + r.id
+
+fn f() -> i32
+    var t = make(1)
+    return g(@&t)
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 141, {}),
+
+    "borrowed_param_field_reads": (LENT + """\
+fn g(p:& Holder) -> i32
+    set(@&p.t)
+    let r: @Tracked = @p.t
+    return look(@p.t) + r.id + p.t.id + p.n
+
+fn f() -> i32
+    var h = Holder { t: make(1), n: 1 }
+    return g(@&h)
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 221, {}),
+
+    "borrowed_param_match": (SLOT + """\
+fn g(s:& Slot) -> i32
+    match s
+        Full(t) => return t.id
+        Empty => return 0
+
+fn f() -> i32
+    var s = Slot.Full(make(4))
+    return g(@&s)
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 41, {}),
+
+    "borrowed_param_for": ("""\
+fn g(a:& [2]Tracked) -> i32
+    var n: i32 = 0
+    for t in a
+        n = n + t.id
+    return n
+
+fn f() -> i32
+    var a: [2]Tracked = [make(1), make(2)]
+    return g(@&a)
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 32, {}),
 }
 
 # name -> (program body, binding named in the diagnostic, {compiler: gap}).
@@ -2664,6 +2725,33 @@ fn g(r: @(Tracked, i64)) -> i32
                            REF_INTO_VALUE, {}),
     "by_value_self": (BURN + "fn g(p: @Tracked) -> i32\n    return p.burn()\n" + TAIL,
                       MOVE_OUT_OF_REF, {}),
+    # AGAST #2240: a `name:& T` param is lent too, bare or through a field.
+    # ritz1 used to hand these to clang as invalid IR, and #2243's field
+    # binding compiled and dropped the caller's value twice.
+    "borrowed_param_into_call": ("fn g(t:& Tracked) -> i32\n    return consume(t)\n" + TAIL,
+                                 MOVE_OUT_OF_REF, {}),
+    "borrowed_param_binding": ("fn g(t:& Tracked) -> i32\n    var x = t\n    return consume(x)\n"
+                               + TAIL, MOVE_OUT_OF_REF, {}),
+    "borrowed_param_returned": ("fn g(t:& Tracked) -> Tracked\n    return t\n" + TAIL,
+                                MOVE_OUT_OF_REF, {}),
+    "borrowed_param_by_value_self": (BURN + "fn g(t:& Tracked) -> i32\n    return t.burn()\n"
+                                     + TAIL, MOVE_OUT_OF_REF, {}),
+    "borrowed_param_field_binding": ("""\
+fn g(p:& Holder) -> i32
+    var x = p.t
+    return consume(x)
+
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 0 }
+    g(@&h)
+    return DROPS
+""", MOVE_OUT_OF_REF, {}),
+    "borrowed_param_field_into_call": ("fn g(p:& Holder) -> i32\n    return consume(p.t)\n"
+                                       + TAIL, MOVE_OUT_OF_REF, {}),
+    "borrowed_param_nested_field": (SLOT + FIELDS + """\
+fn g(d:& Deep) -> Tracked
+    return d.p.t
+""" + TAIL, MOVE_OUT_OF_REF, {}),
 }
 
 # A call returning a reference (or a value holding one) can't take a lent
