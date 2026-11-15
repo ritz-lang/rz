@@ -716,6 +716,51 @@ fn eprint_qualified_access_removed(p: *Parser, qual: i32)
     eprint_lexeme(n.start, n.len)
     eprint_char(96 as u8)
 
+# `m.S` as a type: there is no `module.item` access (LANGUAGE_SPEC §15.3,
+# AGAST #2215).  The grammar's type is a bare name, so the parse fails at the
+# first `.`.  If the furthest token reached is a `.` between two IDENTs, and
+# the token before the qualifier starts a type (`:` `->` `as` `*` `@` `&` `<`
+# `,` `]` `=` `(`), return the qualifier's token index; otherwise -1.
+fn dotted_type_at(p: *Parser, fail_at: i32) -> i32
+    let c: i32 = fail_at
+    if c < 2 or c + 1 >= p.token_count
+        return -1
+    let qual: *Token = p.tokens + (c - 1)
+    let dot: *Token = p.tokens + c
+    let name: *Token = p.tokens + (c + 1)
+    if dot.kind != TOK_DOT or qual.kind != TOK_IDENT or name.kind != TOK_IDENT
+        return -1
+    let k: i32 = (p.tokens + (c - 2)).kind
+    if k == TOK_COLON or k == TOK_ARROW or k == TOK_AS or k == TOK_STAR or k == TOK_AT
+        return c - 1
+    if k == TOK_AMP or k == TOK_LT or k == TOK_COMMA or k == TOK_RBRACKET or k == TOK_EQ
+        return c - 1
+    if k == TOK_LPAREN
+        return c - 1
+    -1
+
+# `file:line:col: `a.b.S`: there is no `module.item` access ...`, worded as
+# ritz0's module_item_access_removed (ritz0/qualified_access.py).  `qual` is
+# the first qualifier's token index; the path runs while `.` IDENT follows.
+fn eprint_dotted_type_removed(p: *Parser, qual: i32)
+    var last: i32 = qual
+    while last + 2 < p.token_count and (p.tokens + (last + 1)).kind == TOK_DOT and (p.tokens + (last + 2)).kind == TOK_IDENT
+        last = last + 2
+    eprint_location_at(p, qual)
+    eprint_char(96 as u8)
+    var i: i32 = qual
+    while i <= last
+        let t: *Token = p.tokens + i
+        eprint_lexeme(t.start, t.len)
+        if i < last
+            eprint_char(46 as u8)
+        i = i + 2
+    let n: *Token = p.tokens + last
+    eprints_cstr(c"`: there is no `module.item` access (LANGUAGE_SPEC §15.3). ")
+    eprints_cstr(c"Imported names share one namespace, so write `")
+    eprint_lexeme(n.start, n.len)
+    eprint_char(96 as u8)
+
 # Called by the generated anchor-skip recovery in parse_item BEFORE it
 # skips the construct it could not parse.  p.pos is still at the first
 # token of that construct (every failed alternative rewinds to start_pos).
@@ -738,8 +783,11 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
         g_dropped_items = g_dropped_items + 1
         eprints_cstr(c"error: ")
         let qual: i32 = qualified_access_at(p, fail_at)
+        let dotted: i32 = dotted_type_at(p, fail_at)
         if qual >= 0
             eprint_qualified_access_removed(p, qual)
+        else if dotted >= 0
+            eprint_dotted_type_removed(p, dotted)
         else
             eprint_location_at(p, fail_at)
             eprints_cstr(c"unexpected ")
@@ -5727,6 +5775,8 @@ pub fn match_arm_ident(p: *Parser, name: *u8, name_len: i32) -> *MatchArm
     a.pass_span.col = 0
     a.pattern_span.line = 0
     a.pattern_span.col = 0
+    a.qualifier = null
+    a.qualifier_len = 0
     return a
 
 # Allocate a new MatchArm with variant pattern Name(inner).
@@ -5895,6 +5945,12 @@ pub fn pattern_ident_at(p: *Parser, name: *u8, name_len: i32, line: i32, col: i3
 pub fn pattern_head_at(arm: *MatchArm, line: i32, col: i32) -> *MatchArm
     arm.head_span.line = line
     arm.head_span.col = col
+    return arm
+
+# `Q.N =>`: record Q (AGAST #2215), so emitter_match can tell `E.V` from `m.K`.
+pub fn pattern_qualified_by(arm: *MatchArm, start: *u8, len: i32) -> *MatchArm
+    arm.qualifier = start
+    arm.qualifier_len = len
     return arm
 
 # pattern : IDENT '(' IDENT ')'  →  PAT_VARIANT with inner = wildcard or bind.

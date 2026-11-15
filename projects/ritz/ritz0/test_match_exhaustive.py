@@ -528,12 +528,13 @@ NOT_AN_INTEGER_RITZ0_ONLY = {
 }
 _LITERAL_NEEDS_INTEGER = "a literal pattern needs an integer scrutinee"
 
-# `mod.CONST =>` parses as the qualified variant `C.G` does, but names an integer
-# const in a module, so on an integer it compares (angelo's `instructions.POP`).
-# Before #2409 ritz0 dropped the arm like any variant; it must take it.
+# An imported const's bare name in an arm compares; it is not a fresh binding
+# (angelo's `POP =>`).  Before #2409 ritz0 dropped such an arm (then spelled
+# `insts.POP =>`, which §15.3 now refuses: test_qualified_access_refused.py,
+# AGAST #2215); it must take it, and a catch-all binding would take every arm.
 _INSTS = {"insts.ritz": "pub const POP: i64 = 3\npub const DUP: i64 = 4\n"}
-_MOD_CONST = ("import insts\nfn f(n: i64) -> i32\n    match n\n        insts.POP => 1\n"
-              "        insts.DUP => 2\n        _ => 9\n"
+_MOD_CONST = ("import insts\nfn f(n: i64) -> i32\n    match n\n        POP => 1\n"
+              "        DUP => 2\n        _ => 9\n"
               "fn main() -> i32\n    f(3) * 100 + f(4) * 10 + f(5)\n")
 
 
@@ -705,7 +706,7 @@ def test_ritz0_only_literal_patterns_need_an_integer_scrutinee(request, tmp_path
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_module_const_pattern_compares_on_an_integer(request, tmp_path, compiler):
+def test_an_imported_const_pattern_compares_on_an_integer(request, tmp_path, compiler):
     # Exit 129 = 1*100 + 2*10 + 9: each arm taken once.
     _assert_runs(request, compiler, tmp_path, "module_const", (_MOD_CONST, 129, _INSTS))
 

@@ -4768,6 +4768,17 @@ library uses long, prefixed free-function names (`strview_find`,
 let n = sys::write(1, c"hi\n", 3)
 ```
 
+The `.` form is refused the same way, as a type at the type and as a value,
+call or `match` arm at the use (AGAST #2215). An imported const's bare name
+in an arm compares against it; it doesn't bind a fresh name.
+
+```ritz expect-error="`m.K`: there is no `module.item` access (LANGUAGE_SPEC §15.3). Imported names share one namespace, so write `K`"
+const K: i32 = 7
+
+fn main() -> i32
+    m.K
+```
+
 Privacy does not give a fn its own namespace either: a fn name may be defined
 at most once across a file and everything it imports, transitively, whether
 the definitions are `pub` or private, and even if they are identical. A second

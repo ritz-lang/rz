@@ -17,6 +17,8 @@ import ritz_ast as rast
 from monomorph import mangle_generic_name, mangle_type_name, resolve_alias_in
 from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
+from qualified_access import module_item_access_removed
+from builtin_types import BUILTIN_TYPES
 import index_rules
 import deref_rules
 import ref_rules
@@ -11619,6 +11621,22 @@ class LLVMEmitter:
             or name in self.union_types
         )
 
+    def _is_module_item(self, qualifier: str, name: str) -> bool:
+        """Is `qualifier.name` module access: a qualifier naming no value or
+        type in scope (nor a built-in type, nor one with an impl), before a
+        name the program's items define?"""
+        if (self._names_a_value(qualifier) or qualifier in BUILTIN_TYPES
+                or qualifier in self.type_aliases
+                or any(ty == qualifier for (_, ty) in self.impls)):
+            return False
+        return (name in self.constants or name in self.const_arrays
+                or name in getattr(self, 'const_strviews', {})
+                or name in self.globals or name in self.functions)
+
+    def _refuse_module_item(self, qualifier: str, name: str, span) -> None:
+        if self._is_module_item(qualifier, name):
+            raise EmitError(module_item_access_removed(qualifier, name), span)
+
     def _emit_field_access(self, expr: rast.Field) -> ir.Value:
         """Emit field access: struct_val.field or struct_ptr->field.
 
@@ -11633,27 +11651,10 @@ class LLVMEmitter:
         if getattr(expr, 'moves_field', False):
             # Moved out (AGAST #2171): the binding's drop must skip it.
             self._set_field_flag(expr, 0)
-        # Namespace-qualified symbol fallback (e.g. `instructions.NPUSHB`,
-        # `Module.CONST`). When the qualifier is not a value/type in scope, treat
-        # the access as a flat lookup of the field name against module-level
-        # constants/globals/functions. This lets imported modules' constants be
-        # accessed via a `module.NAME` style without a real namespace value.
+        # `m.K` / `m.f`: no `module.item` access (§15.3, AGAST #2215).  Was a
+        # flat lookup of K, so it compiled while `m.f()` did not.
         if isinstance(expr.expr, rast.Ident):
-            if not self._names_a_value(expr.expr.name):
-                if expr.field in self.constants:
-                    val, ty = self.constants[expr.field]
-                    return ir.Constant(ty, val)
-                if hasattr(self, 'const_strviews') and expr.field in self.const_strviews:
-                    return self.builder.load(self.const_strviews[expr.field])
-                if expr.field in self.const_arrays:
-                    gvar, _ = self.const_arrays[expr.field]
-                    return self.builder.load(gvar)
-                if expr.field in self.globals:
-                    gvar, _ = self.globals[expr.field]
-                    return self.builder.load(gvar)
-                if expr.field in self.functions:
-                    fn, _ = self.functions[expr.field]
-                    return fn
+            self._refuse_module_item(expr.expr.name, expr.field, expr.span)
 
         # Qualified enum variant access: EnumName.Variant (or EnumName::Variant
         # if the parser lowers `::` to a Field node). Resolve to the variant
@@ -13305,6 +13306,10 @@ class LLVMEmitter:
         probe. What this call evaluated stays recorded until it has been
         emitted, so `_emit_expr` hands all of them the same value.
         """
+        # `m.f()`: no `module.item` access (§15.3, AGAST #2215); was
+        # "Unknown identifier: m", unlocated.
+        if isinstance(expr.expr, rast.Ident):
+            self._refuse_module_item(expr.expr.name, expr.method, expr.span)
         expr = self._deref_method_call(expr)
         outer = self._evaluated_once
         outer_use = self._deref_use_now
@@ -15729,21 +15734,17 @@ class LLVMEmitter:
             raise EmitError(message, pattern.span or arm.span)
 
     def _resolve_module_consts(self, expr: rast.Match) -> None:
-        """`mod.CONST =>` on an integer compares, as `mod.CONST` does in an
-        expression (_emit_field_access's flat lookup).
+        """`mod.CONST =>` is refused, at the arm (§15.3, AGAST #2215).
 
-        It parses as the qualified variant `C.G` does. When the qualifier names
-        no value or type in scope and the name is an integer const, the arm is
-        that const's IdentPattern; `C.G` with `C` an enum stays a variant, and
-        _refuse_pattern_kind refuses it. Before #2409 both were dropped, so
-        angelo's `instructions.POP` arm was never taken.
+        It parses as the qualified variant `C.G` does.  #2409 rewrote it to
+        the const's IdentPattern; module access is gone, so the arm is now
+        the bare `CONST =>`, which compares against the const (it is not a
+        fresh binding).  `C.G` with `C` an enum stays a variant.
         """
         for arm in expr.arms:
             pat = arm.pattern
-            if (isinstance(pat, rast.VariantPattern) and pat.qualifier and not pat.fields
-                    and not self._names_a_value(pat.qualifier)
-                    and self._is_integer_const(pat.name)):
-                arm.pattern = rast.IdentPattern(pat.span, pat.name, False)
+            if isinstance(pat, rast.VariantPattern) and pat.qualifier and not pat.fields:
+                self._refuse_module_item(pat.qualifier, pat.name, pat.span)
 
     def _require_field_count(self, enum_name: str, pattern: rast.Pattern) -> None:
         """A variant pattern lists every field of its variant (AGAST #2408).

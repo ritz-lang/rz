@@ -10,8 +10,8 @@ a block with no tail expression, which `_emit_block_expr` reports as
 `ir.Undefined`::
 
     match opcode
-        instructions.POP => self.pop()?
-        instructions.SRP0 =>
+        POP => self.pop()?
+        SRP0 =>
             let p = self.pop()? as u16
             self.gs.rp0 = p
 

@@ -18,6 +18,7 @@ from tokens import Token, TokenType, Span, KEYWORDS
 from lexer import Lexer, LexerError
 import ritz_ast as rast
 import index_rules
+from qualified_access import module_item_access_removed
 from monomorph import TypeSubstitution
 
 
@@ -748,13 +749,16 @@ class Parser:
         name_tok = self._expect(TokenType.IDENT, "Expected type name")
         name = name_tok.value
 
-        # Handle qualified names:
-        #   ritzlib.fmt.print  - module path (dots)
-        #   sys::SomeType      - namespace access (::)
-        while self._at(TokenType.DOT):
-            self._advance()
-            next_tok = self._expect(TokenType.IDENT)
-            name = f"{name}.{next_tok.value}"
+        # `m.S`: there is no `module.item` access (LANGUAGE_SPEC §15.3,
+        # AGAST #2215).  It used to be joined into a type name nothing
+        # declares, which lowered to i8 and failed at the use, unlocated.
+        if self._at(TokenType.DOT):
+            parts = [name]
+            while self._at(TokenType.DOT):
+                self._advance()
+                parts.append(self._expect(TokenType.IDENT).value)
+            raise ParseError(module_item_access_removed(".".join(parts[:-1]), parts[-1]),
+                             name_tok.span)
 
         # Handle namespace qualifier: alias::Type
         if self._at(TokenType.COLONCOLON):

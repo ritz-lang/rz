@@ -6,7 +6,7 @@ must not start accepting.
 """
 
 import pytest
-from parser import parse
+from parser import parse, ParseError
 from name_resolver import resolve_names
 from type_checker import TypeChecker
 from ref_rules import no_method
@@ -242,10 +242,15 @@ class TestEmitterBuiltins:
 
 
 class TestModuleQualifiers:
-    """`import lib.css.token` makes `token.X` a name."""
+    """`import lib.css.token` makes `token.X` a name to the checkers.
+
+    The emitter refuses it, located (LANGUAGE_SPEC §15.3, AGAST #2215:
+    test_qualified_access_refused.py); the checkers leave it to that refusal
+    rather than reporting `token` as undefined first.  A qualified *type*
+    (`token.Tok`) no longer parses."""
 
     SRC = ("struct Tok\n    kind: i32\n\nconst K: i32 = 1\n\n"
-           "fn f(t: token.Tok) -> i32\n"
+           "fn f(t: Tok) -> i32\n"
            "    if t.kind == token.K\n        return 1\n    0\n")
 
     def test_names(self):
@@ -283,10 +288,11 @@ class TestRoundThree:
         src = "fn f() -> i64\n    sizeof(i32) + sizeof(u8)\n"
         assert names(src) == [] and types(src) == []
 
-    def test_multi_segment_qualifier(self):
+    def test_multi_segment_qualifier_is_refused_at_parse(self):
+        # Was accepted by both checkers; §15.3 has no `module.item` (#2215).
         src = "struct K\n    n: i32\n\nfn f(k: fs.kblob.K) -> i32\n    k.n\n"
-        assert resolve_names(parse(src), {"kblob"}) == []
-        assert TypeChecker({"kblob"}).check(parse(src)) == []
+        with pytest.raises(ParseError, match=r"`fs\.kblob\.K`: there is no `module\.item` access"):
+            parse(src)
 
     def test_async_fn_future_type(self):
         src = "async fn get() -> i32\n    1\n\nfn f(p: get_Future) -> i32\n    0\n"
@@ -350,6 +356,10 @@ class TestThroughCompileFile:
         assert "main.ritz:5:7: argument 1 ('s'): expected StrView, got *u8" in r.stderr
 
     def test_import_is_a_qualifier_for_both_checkers(self, tmp_path):
+        # Neither checker calls `token` undefined; the emitter refuses the
+        # module access, located (§15.3, AGAST #2215).
         r = self.run(tmp_path, "import token\n\nfn f() -> i32\n    token.KIND\n",
                      "--check-types", "--check-names")
-        assert r.returncode == 0, r.stderr
+        assert r.returncode != 0
+        assert "main.ritz:4:5: `token.KIND`: there is no `module.item` access" in r.stderr, r.stderr
+        assert "undefined" not in r.stderr, r.stderr

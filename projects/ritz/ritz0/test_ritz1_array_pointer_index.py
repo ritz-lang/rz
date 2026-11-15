@@ -1018,14 +1018,8 @@ def test_a_struct_field_or_address_still_casts(run_with, name, compiler):
     assert run_with(compiler, name, STRUCT_NEIGHBOURS[name]) == 5
 
 
-# ritz0 lowers the unresolved `io.StrView` to an i8 placeholder, so its LLVM type
-# says integer; harland's `"..." as serial.StrView` is this.  ritz1 doesn't parse
-# a qualified type after `as`.
-@pytest.mark.integration
-def test_ritz0_casts_a_struct_to_a_qualified_struct(run_with):
-    program = ("import ritzlib.io\n\nfn n(s: StrView) -> i32\n    return s.len as i32\n\n"
-               "pub fn main() -> i32\n    return n(\"hello\" as io.StrView)\n")
-    assert run_with("ritz0", "cast_to_qualified_struct", program) == 5
+# `"..." as io.StrView` (harland's `as serial.StrView`) is refused now: there is
+# no `module.item` access (§15.3, AGAST #2215; test_qualified_access_refused.py).
 
 
 # The ordinary pointer stays pointer arithmetic, and its store stays a store.

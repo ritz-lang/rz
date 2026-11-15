@@ -278,7 +278,7 @@ ACCEPTED = {
     "bool_try": ("import ritzlib.result\nfn r() -> Result<bool, i32>\n    Ok(true)\n"
                  "fn g() -> Result<i32, i32>\n    if r()?\n        return Ok(3)\n    Ok(0)\n"
                  "fn main() -> i32\n    match g()\n        Ok(v) => v\n        Err(e) => e\n", 3),
-    "bool_module_const": ("import colors\nfn main() -> i32\n    if colors.ON\n        return 3\n"
+    "bool_module_const": ("import colors\nfn main() -> i32\n    if ON\n        return 3\n"
                           "    0\n", 3, {"colors.ritz": "pub const ON: bool = true\n"}),
     "bool_element_of_array_pointer": ("fn f(p: *[3]bool) -> i32\n    if p[1]\n        return 3\n    0\n"
                                       "fn main() -> i32\n    var a: [3]bool\n    a[1] = true\n"
