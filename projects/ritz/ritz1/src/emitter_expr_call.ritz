@@ -1584,7 +1584,7 @@ fn array_arg_error(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: 
 
 # 1 when `p` is a `Span<T>`: emit_expr_call builds one from a local array.
 fn param_is_span(p: *Param) -> i32
-    if p.param_type != TYPE_STRUCT or p.param_type_name == null or p.param_type_name_len <= 5
+    if p.param_type != TYPE_STRUCT or p.param_type_name == null or p.param_type_name_len <= 4
         return 0
     return (memcmp(p.param_type_name, c"Span$", 5) == 0) as i32
 
@@ -4453,102 +4453,13 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                 else
                     # Integer source: exact only, by its signedness (#2945).
                     converted_regs[j] = int_into_float_slot(s, arg_regs[j], f_arg_expr, param_ptr.param_type)
-            else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name != null and param_ptr.param_type_name_len > 4 and *(param_ptr.param_type_name + 0) == 'S' and *(param_ptr.param_type_name + 1) == 'p' and *(param_ptr.param_type_name + 2) == 'a' and *(param_ptr.param_type_name + 3) == 'n' and *(param_ptr.param_type_name + 4) == '$'
-                # Port of ritz0 bedc85b: `@vec` -> Span<T> coercion at call site.
-                # When the parameter is `Span<T>` and the argument is `@v` where
-                # v is a Vec<T> local, materialize a Span struct from
-                # { v.data, v.len } so the callee receives a proper slice view.
+            else if is_span_param(param_ptr) == 1
                 var span_arg_expr: *Expr = e.args
                 var sak: i32 = 0
                 while sak < j and span_arg_expr != null
                     span_arg_expr = span_arg_expr.next
                     sak = sak + 1
-                var coerced: i32 = 0
-                # Array-value -> Span<T> coerce: when the actual is an
-                # identifier bound to a TYPE_ARRAY local, construct
-                # Span { &arr[0], N } using the declared array type.
-                # (ritz-task-102)
-                if span_arg_expr != null and span_arg_expr.kind == EXPR_IDENT
-                    let arr_loc: *LocalVar = find_local_struct_name(s, span_arg_expr.ident_ptr, span_arg_expr.ident_len)
-                    if arr_loc != null and arr_loc.var_type == TYPE_ARRAY
-                        converted_regs[j] = emit_span_of_array(s, arr_loc, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                        coerced = 1
-                if coerced == 0 and span_arg_expr != null and span_arg_expr.kind == EXPR_UNARY
-                    if span_arg_expr.op == OP_ADDR and span_arg_expr.operand.kind == EXPR_IDENT
-                        let src_loc: *LocalVar = find_local_struct_name(s, span_arg_expr.operand.ident_ptr, span_arg_expr.operand.ident_len)
-                        if src_loc != null and src_loc.type_name_len > 4
-                            if *(src_loc.type_name + 0) == 'V' and *(src_loc.type_name + 1) == 'e' and *(src_loc.type_name + 2) == 'c' and *(src_loc.type_name + 3) == '$'
-                                # Convert the i64 arg (ptrtoint of alloca) back to ptr
-                                let span_vec_ptr: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, span_vec_ptr)
-                                emit_str(s, c" = inttoptr i64 ")
-                                emit_reg(s, arg_regs[j])
-                                emit_str(s, c" to ptr\n")
-                                # GEP to data field (offset 0)
-                                let sp_data_pp: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, sp_data_pp)
-                                emit_str(s, c" = getelementptr %")
-                                emit_name(s, src_loc.type_name, src_loc.type_name_len)
-                                emit_str(s, c", ptr ")
-                                emit_reg(s, span_vec_ptr)
-                                emit_str(s, c", i32 0, i32 0\n")
-                                let sp_data: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, sp_data)
-                                emit_str(s, c" = load ptr, ptr ")
-                                emit_reg(s, sp_data_pp)
-                                emit_str(s, c"\n")
-                                # GEP to len field (offset 1)
-                                let sp_len_p: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, sp_len_p)
-                                emit_str(s, c" = getelementptr %")
-                                emit_name(s, src_loc.type_name, src_loc.type_name_len)
-                                emit_str(s, c", ptr ")
-                                emit_reg(s, span_vec_ptr)
-                                emit_str(s, c", i32 0, i32 1\n")
-                                let sp_len: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, sp_len)
-                                emit_str(s, c" = load i64, ptr ")
-                                emit_reg(s, sp_len_p)
-                                emit_str(s, c"\n")
-                                # Build Span { data, len }
-                                let sp1: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, sp1)
-                                emit_str(s, c" = insertvalue %")
-                                emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                                emit_str(s, c" undef, ptr ")
-                                emit_reg(s, sp_data)
-                                emit_str(s, c", 0\n")
-                                let sp2: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, sp2)
-                                emit_str(s, c" = insertvalue %")
-                                emit_name(s, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                                emit_str(s, c" ")
-                                emit_reg(s, sp1)
-                                emit_str(s, c", i64 ")
-                                emit_reg(s, sp_len)
-                                emit_str(s, c", 1\n")
-                                converted_regs[j] = sp2
-                                coerced = 1
-                    # @array_ident -> Span<T>: construct Span { &arr[0], N }.
-                    # (test_issue_span_slice_range: `tail_sum(@buf)` where
-                    # buf is [4]u8.)  The inner-ident branch above already
-                    # handles the bare `arr` case; this handles `@arr`
-                    # which is EXPR_UNARY OP_ADDR wrapping EXPR_IDENT.
-                    if coerced == 0 and span_arg_expr.operand.kind == EXPR_IDENT
-                        let arr_loc2: *LocalVar = find_local_struct_name(s, span_arg_expr.operand.ident_ptr, span_arg_expr.operand.ident_len)
-                        if arr_loc2 != null and arr_loc2.var_type == TYPE_ARRAY
-                            span_array_elem_fits(s, span_arg_expr, arr_loc2, param_ptr.param_type_name, param_ptr.param_type_name_len)   # AGAST #2366
-                            converted_regs[j] = emit_span_of_array(s, arr_loc2, param_ptr.param_type_name, param_ptr.param_type_name_len)
-                            coerced = 1
-                if coerced == 0
-                    converted_regs[j] = arg_regs[j]
+                converted_regs[j] = span_param_arg(s, span_arg_expr, param_ptr, arg_regs[j])
             else if param_ptr.param_type == TYPE_STRUCT and param_ptr.param_type_name_len == 7
                 # Check if this is StrView (7 chars)
                 var is_strview: i32 = 0
@@ -5683,6 +5594,111 @@ fn index_elem_ptr_struct(s: *EmitterState, ie: *Expr) -> *StructDef
         return null
     find_struct(s, name, name_len)
 
+# Is `p` a `Span<T>` parameter (`Span$...`)?
+fn is_span_param(p: *Param) -> i32
+    if p.param_type != TYPE_STRUCT or p.param_type_name == null or p.param_type_name_len <= 4
+        return 0
+    if *(p.param_type_name + 0) == 'S' and *(p.param_type_name + 1) == 'p' and *(p.param_type_name + 2) == 'a' and *(p.param_type_name + 3) == 'n' and *(p.param_type_name + 4) == '$'
+        return 1
+    0
+
+# `x`, `@a` (a: [N]T) or `@v` (v: Vec<T>) into a `Span<T>` parameter `p`:
+# build the Span from the array, or from `{ v.data, v.len }`.  `reg` is the
+# argument as emit_expr left it (`@v` is the ptrtoint of v's slot); any other
+# argument comes back as `reg`.  Shared by free calls and the static method
+# arm, which lacked it (AGAST #3246: `R.new(@data)` passed the Vec's address).
+fn span_param_arg(s: *EmitterState, arg: *Expr, p: *Param, reg: i32) -> i32
+    var res: i32 = reg
+    # Port of ritz0 bedc85b: `@vec` -> Span<T> coercion at call site.
+    # When the parameter is `Span<T>` and the argument is `@v` where
+    # v is a Vec<T> local, materialize a Span struct from
+    # { v.data, v.len } so the callee receives a proper slice view.
+    var coerced: i32 = 0
+    # Array-value -> Span<T> coerce: when the actual is an
+    # identifier bound to a TYPE_ARRAY local, construct
+    # Span { &arr[0], N } using the declared array type.
+    # (ritz-task-102)
+    if arg != null and arg.kind == EXPR_IDENT
+        let arr_loc: *LocalVar = find_local_struct_name(s, arg.ident_ptr, arg.ident_len)
+        if arr_loc != null and arr_loc.var_type == TYPE_ARRAY
+            res = emit_span_of_array(s, arr_loc, p.param_type_name, p.param_type_name_len)
+            coerced = 1
+    if coerced == 0 and arg != null and arg.kind == EXPR_UNARY
+        if arg.op == OP_ADDR and arg.operand.kind == EXPR_IDENT
+            let src_loc: *LocalVar = find_local_struct_name(s, arg.operand.ident_ptr, arg.operand.ident_len)
+            if src_loc != null and src_loc.type_name_len > 4
+                if *(src_loc.type_name + 0) == 'V' and *(src_loc.type_name + 1) == 'e' and *(src_loc.type_name + 2) == 'c' and *(src_loc.type_name + 3) == '$'
+                    # Convert the i64 arg (ptrtoint of alloca) back to ptr
+                    let span_vec_ptr: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, span_vec_ptr)
+                    emit_str(s, c" = inttoptr i64 ")
+                    emit_reg(s, reg)
+                    emit_str(s, c" to ptr\n")
+                    # GEP to data field (offset 0)
+                    let sp_data_pp: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, sp_data_pp)
+                    emit_str(s, c" = getelementptr %")
+                    emit_name(s, src_loc.type_name, src_loc.type_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, span_vec_ptr)
+                    emit_str(s, c", i32 0, i32 0\n")
+                    let sp_data: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, sp_data)
+                    emit_str(s, c" = load ptr, ptr ")
+                    emit_reg(s, sp_data_pp)
+                    emit_str(s, c"\n")
+                    # GEP to len field (offset 1)
+                    let sp_len_p: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, sp_len_p)
+                    emit_str(s, c" = getelementptr %")
+                    emit_name(s, src_loc.type_name, src_loc.type_name_len)
+                    emit_str(s, c", ptr ")
+                    emit_reg(s, span_vec_ptr)
+                    emit_str(s, c", i32 0, i32 1\n")
+                    let sp_len: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, sp_len)
+                    emit_str(s, c" = load i64, ptr ")
+                    emit_reg(s, sp_len_p)
+                    emit_str(s, c"\n")
+                    # Build Span { data, len }
+                    let sp1: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, sp1)
+                    emit_str(s, c" = insertvalue %")
+                    emit_name(s, p.param_type_name, p.param_type_name_len)
+                    emit_str(s, c" undef, ptr ")
+                    emit_reg(s, sp_data)
+                    emit_str(s, c", 0\n")
+                    let sp2: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, sp2)
+                    emit_str(s, c" = insertvalue %")
+                    emit_name(s, p.param_type_name, p.param_type_name_len)
+                    emit_str(s, c" ")
+                    emit_reg(s, sp1)
+                    emit_str(s, c", i64 ")
+                    emit_reg(s, sp_len)
+                    emit_str(s, c", 1\n")
+                    res = sp2
+                    coerced = 1
+        # @array_ident -> Span<T>: construct Span { &arr[0], N }.
+        # (test_issue_span_slice_range: `tail_sum(@buf)` where
+        # buf is [4]u8.)  The inner-ident branch above already
+        # handles the bare `arr` case; this handles `@arr`
+        # which is EXPR_UNARY OP_ADDR wrapping EXPR_IDENT.
+        if coerced == 0 and arg.operand.kind == EXPR_IDENT
+            let arr_loc2: *LocalVar = find_local_struct_name(s, arg.operand.ident_ptr, arg.operand.ident_len)
+            if arr_loc2 != null and arr_loc2.var_type == TYPE_ARRAY
+                span_array_elem_fits(s, arg, arr_loc2, p.param_type_name, p.param_type_name_len)   # AGAST #2366
+                res = emit_span_of_array(s, arr_loc2, p.param_type_name, p.param_type_name_len)
+                coerced = 1
+    res
+
 fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     record_assert_site(s, e)   # AGAST #1869: in a [[test]] fn only
     bool_check_method(s, e)    # AGAST #2342
@@ -5824,6 +5840,8 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                         let sm_nrw: *u8 = method_arg_narrow_suffix(s, sm_p, sm_arg_e)
                         if sm_nrw != null
                             sm_conv[k] = emit_method_arg_trunc(s, sm_arg_regs[k], sm_nrw)
+                        else if is_span_param(sm_p) == 1
+                            sm_conv[k] = span_param_arg(s, sm_arg_e, sm_p, sm_arg_regs[k])   # AGAST #3246
                         else if param_takes_addr_value(s, sm_arg_e, sm_p) == 1
                             sm_conv[k] = i64_value_to_ptr(s, sm_arg_e, sm_arg_regs[k])   # AGAST #2287
                         else if sm_p.param_type == TYPE_F32 or sm_p.param_type == TYPE_F64
