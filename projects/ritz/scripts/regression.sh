@@ -606,6 +606,18 @@ fi
 # on a loaded ubuntu-26.04 CI runner, ~0.4% of calls on an idle host.  So a
 # short `sleep` ticks alongside: whatever wakeup is lost, another child is
 # due within WATCHDOG_TICK, and the next `wait -n` sees the dead job.
+#
+# On bash 5.2 it does not -- AGAST #3242.  There, every wait_for() ends in
+# a bare notify_and_cleanup() (5.2 jobs.c:3203; 5.3 retires only the job
+# it waited for), and inside a command substitution that retires every
+# dead job but the newest async one: deleted from the job table, its
+# status kept only in the saved-pid list (bgpids).  `wait -n PID` looks in
+# the job table alone (set_waitlist), so it reports "no such job" and
+# drops SID for good: the job came back 137, a whole budget late.  So each
+# tick also asks whether SID is gone; if so, plain `wait SID`, which does
+# fall back to bgpids, collects its status on 5.2 and 5.3 alike.  A job
+# that has exited but not been reaped still answers `kill -0`: the next
+# `wait -n` reaps and reports it as usual.
 WATCHDOG_TICK=0.1
 watchdog_wait() {
     local sid="$1" budget="$2" wd tick first result
@@ -617,6 +629,12 @@ watchdog_wait() {
         wait -n -p first "$sid" "$wd" "$tick"
         result=$?
         [[ "$first" == "$tick" ]] || break
+        kill -0 "$sid" 2>/dev/null && continue
+        # SID was reaped but `wait -n` missed it.  The tick is already
+        # collected; KILL the watchdog before any `wait PID` (see below).
+        kill -KILL "$wd" 2>/dev/null
+        wait "$wd" "$sid"   # status of the last PID: the job's
+        return
     done
     # KILL every child still running before waiting for any: a `wait PID`
     # can lose its wakeup the same way, and must then find the next exit
