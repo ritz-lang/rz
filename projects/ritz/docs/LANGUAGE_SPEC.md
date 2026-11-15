@@ -5612,7 +5612,8 @@ can't be pinned or clobbered.
 
 **Clobbers.** Every x86_64 general register named in the text (`%rax`, `%eax`,
 `%ax`, `%al`, `%r8d`, …) is clobbered, counted as its 64-bit register. `clobber
-r11` adds one the text doesn't name, such as those `syscall` overwrites. Memory
+r11` adds one the text doesn't name, such as those `syscall` overwrites. A
+register pinned to an output isn't also clobbered. Memory
 and flags are always clobbered, and the block always counts as having side
 effects: it is never removed, merged with another, or moved across a memory
 access. A block with no outputs is still kept.

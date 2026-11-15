@@ -20,7 +20,9 @@ import re
 
 import pytest
 
-from test_cryptosec_ritz1_shapes import _emit, _run
+import subprocess
+
+from test_cryptosec_ritz1_shapes import RITZ_START, _emit, _run
 from test_ref_into_value import _assert_refused
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
@@ -61,6 +63,20 @@ pub fn main() -> i32
     asm x86_64 (inout x):
         addl $5, {x}
     x
+""", 42),
+    # An inout pinned to a register the text names (#3425): the register is
+    # the output, not a clobber, so its tie (the input value) survives.
+    # Out of line at -O2 (test_asm_block_runs_o2) is where the tie was lost.
+    "inout_pinned_text_named": ("""\
+[[noinline]]
+fn bump(x: i64) -> i64
+    var r: i64 = x
+    asm x86_64 (inout r: rax):
+        addq $1, %rax
+    r
+
+pub fn main() -> i32
+    bump(41) as i32
 """, 42),
     # Two outputs: a literal struct, each field stored to its own place.
     "two_outputs": ("""\
@@ -181,6 +197,22 @@ pub fn main() -> i32
       r'\(i64 %[.\w]+, i64 %[.\w]+, i32 %[.\w]+\)',
       r'extractvalue \{ i64, i32 \} %[.\w]+, 0',
       r'extractvalue \{ i64, i32 \} %[.\w]+, 1']),
+    # A register pinned to an output is not also clobbered, though the text
+    # names it (#3425): `={rax},0,~{rax}` lets LLVM drop the tie.  One pinned
+    # to an input only is still clobbered.
+    "pinned_output_not_clobbered": ("""\
+fn f(x: i64, y: i64) -> i64
+    var r: i64 = x
+    var o: i64 = 0
+    asm x86_64 (inout r: rax, out o: rdx, in y: rdi):
+        addq %rdi, %rax
+        movq %rax, %rdx
+        movl %ecx, %ecx
+    r + o
+
+pub fn main() -> i32
+    0
+""", [r'"=\{rax\},=\{rdx\},0,\{rdi\},~\{rcx\},~\{rdi\},~\{memory\},~\{dirflag\},~\{fpsr\},~\{flags\}"']),
     # [[naked]]: no prologue, no frame, the blocks then `unreachable`.
     "naked": ("""\
 [[naked]]
@@ -249,6 +281,26 @@ def _run_params():
 def test_asm_block_runs(compiler, tmp_path, name):
     src, want = RUN[name]
     assert _run(compiler, tmp_path, name, src) == want
+
+
+# Rows whose miscompile only shows once LLVM optimises: also linked at -O2.
+RUN_O2 = ["inout_pinned_text_named"]
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", RUN_O2)
+def test_asm_block_runs_o2(compiler, tmp_path, name):
+    src, want = RUN[name]
+    path = tmp_path / "main.ritz"
+    path.write_text(src)
+    ll = tmp_path / "main.ll"
+    comp = _emit(compiler, path, ll, tmp_path)
+    assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
+    exe = tmp_path / "main"
+    link = subprocess.run(["clang", "-O2", "-Wno-override-module", str(RITZ_START), str(ll), "-o", str(exe),
+                           "-nostdlib", "-no-pie"], check=False, capture_output=True, text=True, timeout=300)
+    assert link.returncode == 0, link.stderr[-2000:]
+    assert subprocess.run([str(exe)], check=False, timeout=60).returncode == want
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
