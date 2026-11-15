@@ -19,7 +19,9 @@
 #   * `return e` and a tail `e` against the fn's integer return type
 #   * `let x: T = e` / `var x: T = e` against a written integer T
 #   * `x = e`, `x.f = e`, `p.f = e` against an integer target
-#   * each call argument against an integer parameter
+#   * each call argument against an integer parameter, as ritz0 says it:
+#     "argument N of `f`: expected .." (#3340), the receiver of a method
+#     call argument 1
 #
 # Like narrowing.ritz it is one-sided: an expression is an enum only when
 # resolve_scrutinee_enum names a non-generic user enum, and a target is an
@@ -43,9 +45,18 @@ import let_check
 fn eai_enum_of(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
     if e == null
         return 0
-    if resolve_scrutinee_enum(s, e, out_name, out_len) == 0
-        return 0
-    let ei: i32 = enum_find(*out_name, *out_len)
+    var ei: i32 = 0 - 1
+    if resolve_scrutinee_enum(s, e, out_name, out_len) == 1
+        ei = enum_find(*out_name, *out_len)
+    else
+        # A bare unit variant, `Lo` (#3340): resolve_scrutinee_enum knows
+        # `Lv.Lo` and enum locals only.  A name two enums declare is the
+        # bare-variant emitter's "ambiguous" error, not this one.
+        var vi: i32 = 0
+        var other: i32 = 0
+        ei = bare_unit_variant_enum(s, e, @vi, @other)
+        if ei >= 0
+            *out_name = enum_name_at(ei, out_len)
     if ei < 0 or enum_is_generic(ei) == 1
         return 0
     1
@@ -53,6 +64,11 @@ fn eai_enum_of(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
 # `e` where an integer of type kind `want` is expected: report it at
 # line:col if `e` is an enum.  `want` that is no integer kind is no check.
 fn eai_check(s: *EmitterState, e: *Expr, want: i32, line: i32, col: i32)
+    eai_check_arg(s, e, want, line, col, null, 0, 0)
+
+# eai_check, for argument `argno` of `fname` when `fname` isn't null: ritz0
+# says "argument N of `f`: " first (#3340).
+fn eai_check_arg(s: *EmitterState, e: *Expr, want: i32, line: i32, col: i32, fname: *u8, flen: i32, argno: i32)
     if narrow_int_width(want) == 0
         return
     var en: *u8 = null
@@ -69,7 +85,14 @@ fn eai_check(s: *EmitterState, e: *Expr, want: i32, line: i32, col: i32)
     eprint_int(line as i64)
     eprints_cstr(c":")
     eprint_int(col as i64)
-    eprints_cstr(c": expected ")
+    eprints_cstr(c": ")
+    if fname != null
+        eprints_cstr(c"argument ")
+        eprint_int(argno as i64)
+        eprints_cstr(c" of `")
+        eprint_bytes(fname, flen)
+        eprints_cstr(c"`: ")
+    eprints_cstr(c"expected ")
     eprints_cstr(narrow_type_name(want))
     eprints_cstr(c", found enum '")
     narrow_eprint_name(en, en_len)
@@ -114,6 +137,19 @@ fn eai_target_type(s: *EmitterState, t: *Expr) -> i32
         return narrow_member_type(s, t)
     NARROW_UNKNOWN
 
+# 1 for `T.m(..)`, a static call of `m`: the receiver names a type, no value,
+# and `m` takes no `self` (a UFCS helper's first param isn't named self, but
+# its receiver is a value).
+fn eai_static_call(s: *EmitterState, e: *Expr, m: *FnDef) -> i32
+    let r: *Expr = e.left
+    if r == null or r.kind != EXPR_IDENT or param_is_self(m.params) == 1
+        return 0
+    if find_local_struct_name(s, r.ident_ptr, r.ident_len) != null
+        return 0
+    if find_global(s, r.ident_ptr, r.ident_len) != null
+        return 0
+    1
+
 # Each argument of a call / method call against its parameter, then every
 # sub-expression (the same walk as let_check_expr).
 pub fn enum_as_int_expr(s: *EmitterState, e: *Expr)
@@ -128,14 +164,22 @@ pub fn enum_as_int_expr(s: *EmitterState, e: *Expr)
     else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY
         enum_as_int_expr(s, e.left)
     else if k == EXPR_CALL or k == EXPR_METHOD
+        # Numbered as call_check_method numbers them (#3319): a method call
+        # is `m(r, ..)`, its receiver argument 1; a static call has none.
         var p: *Param = null
+        var fname: *u8 = e.func_name
+        var flen: i32 = e.func_name_len
+        var argno: i32 = 1
         if k == EXPR_METHOD
             enum_as_int_expr(s, e.left)
+            fname = e.ident_ptr
+            flen = e.ident_len
             let m: *FnDef = method_call_def(s, e)
             if m != null
                 p = m.params
-                if p != null
+                if p != null and eai_static_call(s, e, m) == 0
                     p = p.next   # the receiver
+                    argno = 2
         else
             let f: *FnDef = find_call_fn(s, e)
             if f != null
@@ -144,9 +188,10 @@ pub fn enum_as_int_expr(s: *EmitterState, e: *Expr)
         while a != null
             enum_as_int_expr(s, a)
             if p != null
-                eai_check_at(s, a, p.param_type)
+                eai_check_arg(s, a, p.param_type, a.span.line, a.span.col, fname, flen, argno)
                 p = p.next
             a = a.next
+            argno = argno + 1
 
 # A fn / method's trailing expression, returned as `ret_type`.
 pub fn enum_as_int_tail(s: *EmitterState, e: *Expr, ret_type: i32)
