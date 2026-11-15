@@ -37,8 +37,6 @@ REPO = RITZ.parent.parent
 # (AGAST #3183).  Each one that needs scratch takes a `mktemp -d` and removes
 # it in its own EXIT trap; the ritz1 Makefile writes under $(BUILD_DIR).
 SHARED_HOST_SCRATCH_SCRIPTS = [
-    SCRIPTS / "ab_test.sh",
-    SCRIPTS / "bootstrap_test.sh",
     SCRIPTS / "prove-stage5-divergence.sh",
     RITZ / "ritz1" / "test" / "test_imports.sh",
     REPO / "bench" / "run.sh",
