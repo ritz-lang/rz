@@ -100,6 +100,12 @@ fn pick() -> fn(i32) -> i32
 fn span_len(sp: Span<i32>) -> i64
     sp.len as i64
 
+struct B
+    pb: *[7]u8
+
+fn sv_of(pb: *[7]u8) -> i64
+    sv(pb)
+
 pub fn main() -> i32
     var s = S { x: 3 }
     var t = T { y: 4 }
@@ -220,18 +226,12 @@ LEGAL = {
     "array_into_span": "    var a: [7]i32\n    return span_len(@a) as i32",
     "array_into_strview": "    var b: [7]u8\n    return sv(b) as i32",
     "array_addr_into_strview": "    var b: [7]u8\n    return sv(@b) as i32",
+    # ritz0 makes a StrView of a `*[N]u8` local, param or field (AGAST #3335):
+    # ritz1 passed the pointer's i64 where the %StrView goes, and clang refused.
+    "array_pointer_into_strview": "    var b: [7]u8\n    let pb: *[7]u8 = @b\n    return sv(pb) as i32",
+    "array_pointer_param_into_strview": "    var b: [7]u8\n    return sv_of(@b) as i32",
+    "array_pointer_field_into_strview": "    var b: [7]u8\n    let h = B { pb: @b }\n    return sv(h.pb) as i32",
 }
-
-
-# ritz0 makes a StrView of a `*[N]u8`; ritz1 doesn't yet (it emits an i64 where
-# the StrView goes, which clang refuses: AGAST #3335).  Whatever ritz1 makes of
-# it, it isn't this check's refusal.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_a_pointer_to_an_array_into_a_strview_is_not_judged(compile_with, compiler):
-    program = HEADER + "    var b: [7]u8\n    let pb: *[7]u8 = @b\n    return sv(pb) as i32\n"
-    comp, _, _ = compile_with(compiler, "array_pointer_strview", program)
-    assert "has the wrong type" not in comp.stdout + comp.stderr
 
 
 # A `:&` local reads as the struct it borrows: into an i64 it's the wrong type
