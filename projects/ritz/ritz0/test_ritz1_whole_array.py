@@ -1439,8 +1439,12 @@ pub fn main() -> i32
 """,
 }
 
-# AGAST #3276: a `match` value of array type.
-MATCH_GAPS = {
+# AGAST #3276: a `match` value of array type, as #2305 lowered `if`: each arm
+# stores its own array into the destination, dispatched by emit_match's own
+# pattern tests (no `[N x T]` phi).  A fn tail, a method tail, `return match`,
+# every store target, an untyped `let`, an enum payload arm, a block arm, a
+# nested `match`, an `if` inside an arm, and an arm that returns early.
+MATCHES = {
     "match_call_arms_tail": """\
 fn f() -> [4]i32
     [0, 0, 0, 3]
@@ -1455,9 +1459,137 @@ fn h(c: i32) -> [4]i32
 
 pub fn main() -> i32
     let r = h(0)
-    return r[3]
+    let s = h(1)
+    return r[3] * 10 + s[3] - 31
+""",
+    "match_targets": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn g() -> [4]i32
+    [0, 0, 0, 4]
+
+var G: [4]i32
+
+fn put(p: *[4]i32, c: i32)
+    *p = match c
+        0 => f()
+        _ => g()
+
+fn ret(c: i32) -> [4]i32
+    return match c
+        1 => [0, 0, 0, 6]
+        _ => f()
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 1]
+    let c: i32 = 2
+    let r: [4]i32 = match c
+        2 => f()
+        _ => g()
+    var q: [4]i32 = match c
+        0 => a
+        _ => g()
+    let u = match c
+        2 => a
+        _ => q
+    G = match c
+        2 => q
+        _ => a
+    var w: [4]i32
+    put(@w, 1)
+    var z: [4]i32
+    z = match c
+        0 => a
+        _ =>
+            let t: [4]i32 = [0, 0, 0, 5]
+            t
+    let v = ret(1)
+    return r[3] * 100000 + q[3] * 10000 + u[3] * 1000 + G[3] * 100 + w[3] * 10 + z[3] + v[3] - 341448
+""",
+    "match_enum_arms": """\
+enum Shape
+    Dot
+    Bar(i32)
+
+fn pick(o: Option<i32>, b: [3]i64) -> [3]i64
+    match o
+        Some(n) =>
+            if n == 9
+                return [0, 0, 9]
+            [0, 0, n as i64]
+        None => b
+
+fn shape(s: Shape) -> [2]i32
+    match s
+        Dot => [0, 1]
+        Bar(k) => match k
+            0 => [0, 2]
+            _ => [0, k]
+
+struct S
+    n: i32
+
+impl S
+    fn row(self: *S, c: i32) -> [2]i32
+        match c
+            0 => [0, self.n]
+            _ =>
+                if c == 1
+                    [0, 7]
+                else
+                    [0, 8]
+
+pub fn main() -> i32
+    var b: [3]i64 = [0, 0, 4]
+    let x = pick(Some(2), b)
+    let y = pick(Some(9), b)
+    let z = pick(None, b)
+    let p = shape(Dot)
+    let q = shape(Bar(0))
+    let r = shape(Bar(5))
+    var s: S = S { n: 6 }
+    let m0 = s.row(0)
+    let m1 = s.row(1)
+    let m2 = s.row(2)
+    let lhs: i64 = x[2] + y[2] * 10 + z[2] * 100
+    let rhs: i32 = p[1] + q[1] * 10 + r[1] * 100 + m0[1] * 1000 + m1[1] * 10000 + m2[1] * 100000
+    return ((lhs - 492) as i32) + rhs - 876521 + 3
+""",
+    # An untyped `let` whose every arm is a nested `match` (its shape is read
+    # through them), and a statement-`if` tail whose block ends in a `match`.
+    "match_nested_shapes": """\
+fn f() -> [2]i32
+    [0, 1]
+
+fn h(c: i32, d: i32) -> [2]i32
+    if c == 0
+        [0, 2]
+    else
+        let e: i32 = d + 1
+        match e
+            1 => f()
+            _ => [0, e]
+
+pub fn main() -> i32
+    var a: [2]i32 = [0, 4]
+    var b: [2]i32 = [0, 5]
+    let c: i32 = 1
+    let k = match c
+        0 => match c
+            0 => a
+            _ => b
+        _ => match c
+            1 => b
+            _ => a
+    let x = h(0, 0)
+    let y = h(1, 0)
+    let z = h(1, 6)
+    return k[1] * 1000 + x[1] * 100 + y[1] * 10 + z[1] - 5210 - 7 + 3
 """,
 }
+
+CASES.update(MATCHES)
 
 STRUCT_LITERAL_GAPS = {
     "struct_lit_local": """\
@@ -1523,7 +1655,6 @@ pub fn main() -> i32
 
 GAPS = [
     (GENERIC_INFER_GAPS, "AGAST #3277: a generic `T = [N]U` inferred from an array argument"),
-    (MATCH_GAPS, "AGAST #3276: a `match` value of array type"),
     (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
     (PARAM_ND_GAPS, "AGAST #2098: a multi-dimensional array param"),
     (ROW_GAPS, "AGAST #2099: a whole row of a multi-dimensional array"),
@@ -1587,6 +1718,15 @@ fn g(s: Span<i32>) -> i64
 
 pub fn main() -> i32
     return g(@G) as i32
+""",
+    # AGAST #3276: a `pass` arm of a `match` stored into a whole array.
+    "match_pass_arm": """\
+pub fn main() -> i32
+    let c: i32 = 0
+    var q: [2]i32 = match c
+        0 => [0, 3]
+        _ => pass
+    return q[1]
 """,
     # AGAST #2302: a call's `[N]T` is held to the rule a local's is.
     "ret_wrong_len": """\
@@ -2158,19 +2298,36 @@ pub fn main() -> i32
 """
 
 
-# AGAST #3276: a `match` whose arms are `-> [N]T` calls, as a fn's tail, is a
-# gap (MATCH_GAPS) that ritz1 itself refuses: clang would too, but only after
-# the .ll is written.  The `if` form is lowered since #2305.
-@pytest.mark.integration
-def test_ritz1_refuses_array_tail_value(ritz1_bin, tmp_path):
-    comp, ll = _compile("ritz1", ritz1_bin, tmp_path, "tail", MATCH_GAPS["match_call_arms_tail"])
-    assert comp.returncode != 0 and not ll.exists()
-    assert "a `-> [N]T` fn's value here is not lowered by ritz1" in comp.stdout + comp.stderr
+# AGAST #3276: test_ritz1_refuses_array_tail_value pinned ritz1's refusal of
+# a `match` of `-> [N]T` calls as a fn's tail.  It's lowered now, and
+# MATCHES["match_call_arms_tail"] compares it with ritz0 above.
 
 
 # AGAST #2305: an `if` arm of another length than the array it's stored in.
 # ritz0 writes a `phi [4 x i32]` of a `[3 x i32]`, which only clang refuses.
+# AGAST #3276: a `match` arm is held to the destination the same way.
 IF_WRONG_LEN = {
+    "match_let": """\
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 1]
+    var b: [3]i32
+    let c: i32 = 1
+    var q: [4]i32 = match c
+        0 => a
+        _ => b
+    return q[3]
+""",
+    "match_tail": """\
+fn h(c: i32) -> [4]i32
+    var b: [3]i32
+    match c
+        0 => [0, 0, 0, 3]
+        _ => b
+
+pub fn main() -> i32
+    let r = h(0)
+    return r[3]
+""",
     "let": """\
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 1]

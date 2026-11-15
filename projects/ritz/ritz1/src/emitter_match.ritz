@@ -90,6 +90,18 @@ struct MatchResult
     # AGAST #2950: 1 when every value arm yields a `ptr` (`@&x`), so the phi
     # is a `ptr` (arms_ptr_valued, asked before the arms are emitted).
     ptr_ty: i32
+    # AGAST #3276: the whole `[N]T` each arm stores its value into, or null
+    # (the arms meet in a phi).  See emit_match_into.
+    into: *ArrayInto
+
+# AGAST #3276: where a `match` of whole arrays stores each arm's array: the
+# `[N x T]` at `ptr`, held to N (`size`) and T (`et`; a struct's `name`).
+struct ArrayInto
+    ptr: i32
+    size: i32
+    et: i32
+    name: *u8
+    name_len: i32
 
 # AGAST #1946: a `values[]` entry for an arm with no value (`pass`, or a body
 # with no trailing expression): the phi gets the zero constant of its type
@@ -527,6 +539,7 @@ fn match_result_init(r: *MatchResult, n_arms: i32)
     r.void_line = 0
     r.void_col = 0
     r.ptr_ty = 0
+    r.into = null
 
 # AGAST #2046: take the caller's "value discarded" flag (match_no_value) and
 # clear it so no nested match / if sees it.  Returns 1 if the value is wanted.
@@ -767,7 +780,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     # zero of its type (AGAST #1946).
     var body_reg: i32 = MATCH_ZERO_VALUE
     var lent_arm: *LocalVar = null
-    if arm.is_pass == 1
+    if result.into != null
+        match_arm_array_into(s, arm, result.into)   # AGAST #3276
+    else if arm.is_pass == 1
         body_reg = MATCH_ZERO_VALUE
     else if arm.body != null
         # AGAST #3015: `.` through Deref, with the arm's binding in scope.
@@ -792,7 +807,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
             body_reg = emit_lent_referent(s, arm.body, lent_arm.type_name, lent_arm.type_name_len)
         else
             body_reg = emit_expr(s, arm.body)
-    if arm.is_pass == 0 and arm.body != null and body_reg == 0
+    if result.into != null
+        body_reg = MATCH_ZERO_VALUE   # stored; no phi reads it
+    else if arm.is_pass == 0 and arm.body != null and body_reg == 0
         # AGAST #1654: a void call (`Some(e) => say(e)`), or a nested
         # valueless match.  Register 0 is never defined; record a zero so
         # nothing ever names %.0, and mark the whole match valueless.
@@ -883,6 +900,23 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     emit_str(s, c"  br label %")
     emit_label(s, end_label)
     emit_str(s, c"\n")
+
+# AGAST #3276: an arm of a `match` of whole arrays stores its value at `into`,
+# with its pattern binding in scope, as emit_array_arm_into does an `if` arm's
+# (#2305).  The arm's array is held to N and T as any whole-array source is.
+# An arm that leaves (`return`) has no value and stores nothing; a `pass` arm
+# would leave the array unwritten, and is refused.
+fn match_arm_array_into(s: *EmitterState, arm: *MatchArm, into: *ArrayInto)
+    if arm.is_pass == 1
+        emit_ir_error(s, c"a `match` arm stored into a whole array has no value (`pass`); give it an `[N]T`")
+        return
+    if arm.body == null
+        return
+    df_rewrite_expr(s, arm.body)   # as emit_match_arm_body's value path does
+    let_check_expr(s, arm.body)
+    enum_as_int_expr(s, arm.body)
+    own_check_arm(s, arm.body)
+    emit_array_local_whole_assign(s, into.ptr, into.size, into.et, into.name, into.name_len, arm.body)
 
 # Emit one arm's condition + body.  `scrut_slot` is an alloca holding the
 # scrutinee struct (when enum_name is non-null), or 0 for scalar scrutinees.
@@ -2094,14 +2128,23 @@ fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name: *u8, enum_name_
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
 fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
+    emit_match_into(s, scrutinee, arms, span, null)
+
+# AGAST #3276: a `match` whose value is a whole `[N]T` (a `-> [N]T` tail,
+# `let r = match ...`, `*p = match ...`): with `into` set, each arm stores its
+# own array there and the arms join with no phi (0 is returned), as #2305 does
+# for `if`.  The dispatch is the usual one: the same scrutinee spill, pattern
+# tests, payload bindings, coverage and move checks.  Before this the arms'
+# i64s met in a phi: a refusal, or 8 bytes of the array.
+fn emit_match_into(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan, into: *ArrayInto) -> i32
     # AGAST #2342: a catch-all name binds the scrutinee, so it is the same kind.
     let outer_kind: i32 = s.match_scrut_kind
     s.match_scrut_kind = bool_kind(s, scrutinee)
-    let result: i32 = emit_match_arms(s, scrutinee, arms, span)
+    let result: i32 = emit_match_arms(s, scrutinee, arms, span, into)
     s.match_scrut_kind = outer_kind
     result
 
-fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
+fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan, into: *ArrayInto) -> i32
     let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
     # AGAST #3205: taken before the scrutinee, so a match there can't see it.
     let agg_hint: *u8 = s.match_agg_hint
@@ -2204,6 +2247,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     match_result_init(@result, n_arms)
     result.float_ty = take_match_float_hint(s)   # AGAST #1946
     result.ptr_ty = arms_ptr_valued(s, arms)   # AGAST #2950
+    result.into = into   # AGAST #3276
 
     # AGAST #2168: each arm's move check starts from the state before the
     # match; after it, the arms that fall through are merged (own_arms_*).
@@ -2218,6 +2262,17 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         arm = arm.next
         idx = idx + 1
     own_arms_end(s, own_before, own_acc)
+
+    if into != null
+        # AGAST #3276: every arm stored its array; nothing to merge.  No arm
+        # type leaks to an enclosing untyped `let` (it is the `[N]T` local).
+        s.last_match_agg_name = null
+        s.last_match_agg_name_len = 0
+        s.last_match_float_ty = 0
+        emit_str(s, c"  unreachable\n")
+        begin_block(s, end_label)
+        own_match_end(s, own_old)
+        return 0
 
     # Current block is the last "next" block: no arm matched, and coverage has
     # ruled that out (AGAST #2344), so it ends in `unreachable`.

@@ -1289,7 +1289,8 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 stmt.var_type_name = dsh.name
                 stmt.var_type_name_len = dsh.name_len
         # AGAST #2305: and `let r = if c then f() else g()`: an arm's array.
-        else if stmt.var_init.kind == EXPR_IF
+        # AGAST #3276: and `let r = match c` + arms of arrays.
+        else if stmt.var_init.kind == EXPR_IF or stmt.var_init.kind == EXPR_MATCH
             var ish: ArraySrc
             var ipt: i32 = stmt.var_array_elem_pointee
             if if_array_shape(s, stmt.var_init, @ish, @ipt) == 1
@@ -4893,6 +4894,9 @@ fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, 
     if value.kind == EXPR_IF
         emit_array_if_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value)
         return
+    if value.kind == EXPR_MATCH
+        emit_array_match_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value.left, value.args as *MatchArm, value.span)
+        return
     if emit_array_local_copy_from_field(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value) == 1
         return
     if value.kind == EXPR_ARRAY_FILL or value.kind == EXPR_ARRAY_LIT
@@ -4992,16 +4996,31 @@ fn emit_array_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32
     own_arms_end(s, own_before, own_acc)
     begin_block(s, end_label)
 
+# AGAST #3276: a `match` of whole arrays (an EXPR_MATCH value or a STMT_MATCH
+# tail) stored at `dst_ptr`: emit_match's own dispatch, each arm storing its
+# array there (emit_match_into).
+fn emit_array_match_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan)
+    var into: ArrayInto
+    into.ptr = dst_ptr
+    into.size = dst_size
+    into.et = dst_et
+    into.name = dst_name
+    into.name_len = dst_name_len
+    emit_match_into(s, scrutinee, arms, span, @into)
+
 # AGAST #2305: N and T of the whole `[N]T` an `if` value's first telling arm
 # gives: a `-> [N]T` call (its element pointee to `*pointee`), a 1-D array
 # place, an inline field, or a nested `if`.  1 if one does.  Each arm is still
 # held to that shape when emit_array_if_into stores it.  Emits nothing.
+# AGAST #3276: a `match` value's arms too (its `args` are MatchArms as an
+# `if`'s are), and a nested `match`.  An arm reading its own pattern binding
+# can't tell here (the binding isn't in scope); a later arm may.
 fn if_array_shape(s: *EmitterState, e: *Expr, out: *ArraySrc, pointee: *i32) -> i32
     var arm: *MatchArm = e.args as *MatchArm
     while arm != null
         let v: *Expr = arm.body
         if arm.is_pass == 0 and v != null
-            if v.kind == EXPR_IF
+            if v.kind == EXPR_IF or v.kind == EXPR_MATCH
                 if if_array_shape(s, v, out, pointee) == 1
                     return 1
             else
@@ -5050,7 +5069,8 @@ fn emit_array_stmt_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et
     own_arms_end(s, own_before, own_acc)
     begin_block(s, end_label)
 
-# A block whose last statement is the array: an expression, or an `if` / `else`.
+# A block whose last statement is the array: an expression, an `if` / `else`,
+# or a `match` (AGAST #3276).
 # Any other last statement (a `return`) is emitted as it is.
 fn emit_array_block_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, stmts: *Stmt, end_label: i32)
     var st: *Stmt = stmts
@@ -5060,6 +5080,8 @@ fn emit_array_block_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: 
             emit_array_local_whole_assign(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.expr)
         else if st.next == null and st.kind == STMT_IF and st.if_else != null
             emit_array_stmt_if_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st)
+        else if st.next == null and st.kind == STMT_MATCH
+            emit_array_match_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.if_cond, st.if_then as *MatchArm, st.span)   # AGAST #3276
         else
             emit_stmt(s, st, s.fn_ret_type)
             if st.kind == STMT_RETURN
