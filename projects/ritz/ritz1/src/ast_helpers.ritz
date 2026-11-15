@@ -2782,14 +2782,42 @@ pub fn type_array(p: *Parser, size_str: *u8, size_len: i32, elem_type: i32) -> i
     type_array_sized(p, size, elem_type)
 
 # AGAST #2153: `[N]T` / `[N * 2]T` — the length is a constant integer
-# expression, folded now against the consts parsed so far.  Imports are merged
-# only after parsing, so a const from an import, or one declared later in this
-# file, does not fold here: that is a located error (the item still parses, so
-# the message is the one the user sees), not a silently wrong length.
+# expression, folded now against the consts parsed so far.
+#
+# AGAST #2167: imports are merged only after parsing, so a const from an
+# import, or one declared later in this file, does not fold on the first
+# pass.  That pass records the length as pending (size 0, no diagnostic) and
+# main.ritz parses the program again, as it does for a type alias (#1475),
+# with array_len_seed() holding every const the first pass merged.  So every
+# reader of the length (layout, shapes, mangled names, sizeof) sees the
+# folded value: nothing downstream knows a length was ever pending.  What
+# still doesn't fold on the second pass is a located error, never a silently
+# wrong length.
+var g_array_len_pending: i32 = 0
+var g_array_len_reparse: i32 = 0
+var g_array_len_seed: *ConstEntry = null
+
+# 1 when the first pass left a length to the second.
+pub fn array_len_pending() -> i32
+    g_array_len_pending
+
+# Before the second pass: fold a length the file's own consts can't against
+# `consts` (the first pass's merged list), and report what still doesn't.
+pub fn array_len_seed(consts: *ConstEntry)
+    g_array_len_seed = consts
+    g_array_len_reparse = 1
+    g_array_len_pending = 0
+
 pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem_type: i32) -> i32
     var v: i64 = 0
-    if const_fold_int(p.module.constants, len_expr, 0, @v) == 0
-        array_len_report(line, col, c"is not a constant integer expression ritz1 can fold here (only literals and consts declared earlier in this file)")
+    var folded: i32 = const_fold_int(p.module.constants, len_expr, 0, @v)
+    if folded == 0 and g_array_len_seed != null
+        folded = const_fold_int(g_array_len_seed, len_expr, 1, @v)
+    if folded == 0
+        if g_array_len_reparse == 0
+            g_array_len_pending = 1
+        else
+            array_len_report(line, col, c"is not a constant integer expression")
         v = 0
     else if v < 0 or v > 2147483647
         array_len_report(line, col, c"is out of range (it must be 0 to 2147483647)")
@@ -5093,11 +5121,12 @@ pub fn expr_type_operand(p: *Parser, count: i64, t: i32, name: *u8, name_len: i3
 # rejects (p.error) — `f([8]u8)` is not a program.  type_array runs for the
 # outer dimension, so p.last_array_* / last_array_shape describe the whole
 # type, exactly as for a declaration.
-pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, num_tok: Token, elem_type: i32) -> *Expr
+pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, lbracket: Token, len_expr: *Expr, elem_type: i32) -> *Expr
     if name_tok.len != 6 or memcmp(name_tok.start, c"sizeof", 6) != 0
         p.error = 1
         return null
-    type_array(p, num_tok.start, num_tok.len, elem_type)
+    # AGAST #2167: any constant length, folded as a declaration's is.
+    type_array_expr(p, len_expr, lbracket.line, lbracket.col, elem_type)
     var count: i64 = p.last_array_size as i64
     var leaf: i32 = p.last_array_elem_type
     var leaf_name: *u8 = p.last_array_elem_type_name
@@ -5112,7 +5141,7 @@ pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, num_tok: Token, elem_
         leaf = sh.leaf_type
         leaf_name = sh.leaf_name
         leaf_len = sh.leaf_name_len
-    let arg: *Expr = expr_type_operand(p, count, leaf, leaf_name, leaf_len, num_tok.line, num_tok.col)
+    let arg: *Expr = expr_type_operand(p, count, leaf, leaf_name, leaf_len, lbracket.line, lbracket.col)
     return expr_call(p, name_tok.start, name_tok.len, arg, name_tok.line, name_tok.col)
 
 # `sizeof(Box<i64>)` (AGAST #3268): a generic instance as sizeof's operand.
