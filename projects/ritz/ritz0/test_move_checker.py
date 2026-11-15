@@ -2319,10 +2319,16 @@ fn mk() -> (T, i32)
         """The emitter reports it; here it just isn't a move."""
         assert self.body("var x = p.5\nvar y = x\nvar z = x") == []
 
-    def test_numeric_field_of_a_struct_is_not_an_element(self):
-        """`h.0` reads a struct positionally. It stays a use of `h`, so what
-        moved out of `h` still counts."""
-        self.assert_moved(self.body("eat(h.t)\nvar x = h.0", "h: H"), "h.t")
+    @pytest.mark.parametrize("use", ["var x = h.0", "h.0 = T { id: 2 }", "look(@h.0)",
+                                     "eat(h.0)", "eat(h.t)\nvar x = h.0"])
+    def test_numeric_field_of_a_struct_is_not_an_element(self, use):
+        """`.N` is a tuple's accessor only: a struct has no field `0`, in any
+        position, and the error is at the `0` (AGAST #3233). It read `h`
+        positionally, so `var x = h.0` copied `h.t` out and both dropped it."""
+        errors = self.body(use, "h: H")
+        assert [e.reason for e in errors] == ["`H` has no field `0`"], errors
+        line = use.split("\n")[-1]
+        assert errors[0].span.column - 4 == line.index("h.0") + 3, errors[0]
 
     # ---- paths through a tuple ----
 

@@ -1000,7 +1000,8 @@ class Parser:
                 if self._at(TokenType.INT):
                     field_tok = self._advance()
                     field_name = str(field_tok.value)
-                    expr = rast.Field(expr.span, expr, field_name)
+                    # At the number: `h.0` of a struct is refused there (#3233).
+                    expr = rast.Field(expr.span, expr, field_name, field_tok.span)
                 else:
                     field_tok = self._expect(TokenType.IDENT)
                     if self._at(TokenType.LPAREN):

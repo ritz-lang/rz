@@ -17,7 +17,9 @@ from typing import Dict, Set, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import array_rules
+import deref_rules
 import ref_rules
+from metadata import type_to_string
 import ritz_ast as rast
 from ufcs import UFCS_NON_GENERIC_PREFIXES
 
@@ -1326,6 +1328,14 @@ class MoveChecker:
             self._check_expr(expr.expr, is_move_context=False)
             self._reject_move_out(expr.span)
 
+        elif isinstance(expr, rast.Field) and self._numbered_struct_field(expr) is not None:
+            # `h.0` of a struct: no such field, in any position (AGAST #3233).
+            # The one error: it's no use of `h`, so what moved out of `h`
+            # doesn't add a second.
+            self.errors.append(OwnershipError(
+                deref_rules.no_field(self._numbered_struct_field(expr), expr.field),
+                expr.name_span or expr.span))
+
         elif isinstance(expr, rast.Field) and self._field_owner(expr) is not None:
             self._check_owned_field(expr, self._field_owner(expr), is_move_context)
 
@@ -1697,10 +1707,24 @@ class MoveChecker:
             return owners + [ty]
         return None
 
+    def _numbered_struct_field(self, expr: rast.Field) -> Optional[str]:
+        """The struct `S`, as the source spells it, when `expr` is `s.N` and
+        s is an S, or a pointer or reference to one. `.N` is a tuple's
+        accessor only: a struct has no field `0`, and reading it by position
+        would renumber when a field is inserted above it (AGAST #3233)."""
+        if not expr.field.isdigit():
+            return None
+        owner = self.types.resolve(self._loan_type(expr.expr))
+        while isinstance(owner, (rast.PtrType, rast.RefType)):
+            owner = self.types.resolve(owner.inner)
+        if not isinstance(owner, rast.NamedType) or owner.name not in self.types.structs:
+            return None
+        return type_to_string(owner)
+
     def _field_owner(self, expr: rast.Field) -> Optional[VarInfo]:
         """The binding `expr` (`b.f`, `b.f.g`) is a field of, when the binding
-        holds that field by value (_path_owners). None otherwise, as for
-        `h.0` of a struct: a positional read, so a use of all of `h`."""
+        holds that field by value (_path_owners). None otherwise; `h.0` of a
+        struct is refused before it gets here (_numbered_struct_field)."""
         owners = self._path_owners(expr)
         if owners is None or expr.field.isdigit() != isinstance(owners[-1], rast.TupleType):
             return None

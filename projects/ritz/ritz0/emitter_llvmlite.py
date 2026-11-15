@@ -8820,12 +8820,12 @@ class LLVMEmitter:
         """`(S, base, through)` when `expr` is `s.f`, s is a struct S (or a
         pointer or reference to one, which §7.7 sees through first) and S has
         no own field `f`; else None. `through` is True when `base` is that
-        pointer or reference: it's the receiver itself."""
+        pointer or reference: it's the receiver itself. A numbered field is
+        a tuple's element only: `h.0` of a struct S is S's lack of a field `0`,
+        refused as any other (AGAST #3233), never a positional read."""
         base = expr.expr
         while isinstance(base, rast.Grouped):
             base = base.expr
-        if expr.field.isdigit():
-            return None
         ty = self._infer_ritz_type(base)
         if ty is None:
             return None
@@ -11600,6 +11600,13 @@ class LLVMEmitter:
                     )
                 return self._emit_enum_variant_constructor_for_type(expr.field, [], enum_name)
 
+        # A field S doesn't have, read through S's `Deref` (§7.7, #3015). First,
+        # so `h.0` of a struct is S's lack of a field `0`, and not read by
+        # position below (AGAST #3233).
+        derefed = self._deref_field(expr, "read")
+        if derefed is not None:
+            return self._emit_expr(derefed)
+
         # Check for tuple field access (numeric field names)
         if expr.field.isdigit():
             index = int(expr.field)
@@ -11620,11 +11627,6 @@ class LLVMEmitter:
             if isinstance(struct_val.type, ir.BaseStructType):
                 return self.builder.extract_value(struct_val, index)
             raise ValueError(f"Cannot access tuple field {index} on type: {struct_val.type}")
-
-        # A field S doesn't have, read through S's `Deref` (§7.7, #3015).
-        derefed = self._deref_field(expr, "read")
-        if derefed is not None:
-            return self._emit_expr(derefed)
 
         # Optimization: if the inner expression is a local variable, use GEP directly
         # instead of loading the entire struct then extracting a field.
