@@ -28,6 +28,11 @@
 #   RZ_MAIN_WT     main checkout       (default ~/dev/ritz-lang/rz)
 #   RZ_TRAIN_NAME  gate name           (default train)
 #   RZ_GATE_SCRIPT run-gate.sh to use  (default: beside this script)
+#   RZ_GATE_DIR    gate logs/slots     (default ~/dev/ritz-lang/gate-logs)
+#
+# Slot reservation (AGAST #3365): `land` writes <gate dir>/.train-reserved so
+# a room gate can't take the gate slot before the next train's gate starts;
+# run-gate.sh honours it for RZ_GATE_TRAIN_HOLD seconds (default 600).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -35,6 +40,7 @@ MAIN_WT="${RZ_MAIN_WT:-$HOME/dev/ritz-lang/rz}"
 TRAIN_WT="${RZ_TRAIN_WT:-$HOME/dev/ritz-lang/rz-train}"
 NAME="${RZ_TRAIN_NAME:-train}"
 GATE="${RZ_GATE_SCRIPT:-$HERE/run-gate.sh}"
+RESERVED="${RZ_GATE_DIR:-$HOME/dev/ritz-lang/gate-logs}/.train-reserved"
 
 die() { echo "error: $*" >&2; exit 1; }
 g() { git -C "$TRAIN_WT" "$@"; }
@@ -99,6 +105,8 @@ cmd_build() {
     # Nothing new to test: either nothing applied, or one commit kept as-is
     # (its room's gate ran on exactly this tree).
     [[ $picked -eq 0 ]] && need=not-needed
+    # No train gate is coming to take over the reservation: let rooms in.
+    [[ $need == not-needed ]] && rm -f "$RESERVED"
     printf 'TIP=%s\nGATE=%s\n' "$(g rev-parse HEAD)" "$need" >> "$st"
     echo "TRAIN base=${base:0:12} tip=$(g rev-parse --short=12 HEAD) n=$n gate=$need"
 }
@@ -248,6 +256,11 @@ cmd_land() {
         || die "main moved since the train was built (${base:0:12} -> $(g rev-parse --short=12 origin/main)); rebuild and re-gate"
     # Not forced: GitHub refuses it if main moved in the meantime.
     g push -q origin "$tip:refs/heads/main"
+    # Hold the gate slot for the next train's gate (run-gate.sh).  Best
+    # effort: main has moved already, so a failure here only warns.
+    { mkdir -p "$(dirname "$RESERVED")" && date +%s > "$RESERVED.tmp" \
+        && mv -f "$RESERVED.tmp" "$RESERVED"; } 2>/dev/null \
+        || echo "warning: could not reserve the gate slot ($RESERVED)" >&2
     git -C "$MAIN_WT" fetch -q origin
     git -C "$MAIN_WT" merge -q --ff-only origin/main
     local b room merged

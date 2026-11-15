@@ -16,6 +16,7 @@
 #   RZ_GATE_TRAIN  1 = a merge-train gate        (train.sh gate sets it)
 #   RZ_GATE_AFTER  run after the command passes  (train.sh gate: its package
 #                  tests, AGAST #3363)
+#   RZ_GATE_TRAIN_HOLD  seconds a .train-reserved holds room gates (default 600)
 #
 # Why each piece exists (rz-iterate):
 #   * systemd-run: a Bash background job dies when the agent's next turn
@@ -46,6 +47,16 @@
 #     room gates take no slot while that unit is active.  The train removes
 #     the marker on taking its slot or on exit (trap); a marker whose unit is
 #     no longer active (a crash, a reboot) is stale and ignored.
+#   * train reservation (AGAST #3365): between `train.sh land` and the next
+#     `train.sh gate` (a minute or two: closing tickets, building the next
+#     train) no train unit exists, so .train-waiting can't hold the slot,
+#     and a room gate took it once and delayed a train ~15 min.  `land`
+#     writes <gate dir>/.train-reserved (epoch seconds); room gates take no
+#     slot while it is under RZ_GATE_TRAIN_HOLD seconds old (default 600, so
+#     a coordinator that never gates again can't starve rooms).  A train gate
+#     removes it once its .train-waiting is written, and `train.sh build`
+#     removes it for a train that needs no gate.  Fails open: an old,
+#     future-dated or unreadable marker is ignored.
 #   * FIFO queue (AGAST #3364): the same poll race reordered room gates too
 #     (huburght, 2 slots: ~13 min waits, not in the order asked).  A waiter
 #     appends "<unit> <pid> <train>" to <gate dir>/.gate-queue (under flock
@@ -150,9 +161,21 @@ MARK="$RZ_DIR/.train-waiting"
 unmark() {
     if [ "$(cat "$MARK" 2>/dev/null)" = "$RZ_UNIT" ]; then rm -f "$MARK"; fi
 }
+RES="$RZ_DIR/.train-reserved"
 if [ "$RZ_TRAIN" = 1 ]; then
     echo "$RZ_UNIT" > "$MARK" 2>/dev/null
+    # .train-waiting now holds the slot for us; the reservation is done.
+    rm -f "$RES"
 fi
+# Train reservation (AGAST #3365; see the header).  Fails open: anything but
+# a time from the last RZ_HOLD seconds is ignored.
+train_reserved() {
+    [ "$RZ_TRAIN" = 1 ] && return 1
+    local t now
+    t="$(cat "$RES" 2>/dev/null)" || return 1
+    now="$(date +%s)"
+    [ "$t" -le "$now" ] 2>/dev/null && [ $((now - t)) -lt "$RZ_HOLD" ] 2>/dev/null
+}
 # A room gate yields while a train gate is waiting and its unit is alive.
 train_waiting() {
     [ "$RZ_TRAIN" = 1 ] && return 1
@@ -209,7 +232,14 @@ while :; do
         pos=$now_pos
         echo "WAITING queue position $pos $(date -Is)" >> "$RZ_LOG"
     fi
-    if [ "$pos" = 1 ] && ! train_waiting; then
+    # Reservation before marker: the train writes .train-waiting before it
+    # removes .train-reserved, so checking in this order never sees neither.
+    if [ "$pos" = 1 ] && train_reserved; then
+        if [ -z "${said_res:-}" ]; then
+            said_res=1
+            echo "WAITING: slot reserved for the merge train since $(date -Is -d "@$(cat "$RES")" 2>/dev/null) $(date -Is)" >> "$RZ_LOG"
+        fi
+    elif [ "$pos" = 1 ] && ! train_waiting; then
         for s in $(seq 0 $((RZ_SLOTS - 1))); do
             exec 9>"$RZ_DIR/.gate-slot-$s"
             if flock -n 9; then break 2; fi
@@ -237,6 +267,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_SLOTS="$SLOTS" --setenv=RZ_DIR="$GATES" \
     --setenv=RZ_POLL="${RZ_GATE_POLL:-20}" --setenv=RZ_UNIT="$UNIT" \
     --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
+    --setenv=RZ_HOLD="${RZ_GATE_TRAIN_HOLD:-600}" \
     /bin/bash -c "$INNER"
 
 echo "$LOG"

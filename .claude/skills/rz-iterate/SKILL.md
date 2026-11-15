@@ -503,8 +503,9 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    ends, and keep the usual 1800 s fallback wakeup. Carry on with the loop
    (slots, nudges) meanwhile. On a context reset, `train.sh show` prints the
    train, and the highest-numbered `gate-logs/train-<sha12>-<n>.log` holds the gate. The
-   train gate uses omegalisk's one gate slot, so it may wait behind a local
-   room's gate.
+   train gate uses omegalisk's one gate slot. It may wait for a room gate
+   that already holds the slot, but it takes the next free one ahead of any
+   waiting room gate (`.train-waiting`, #3317; FIFO otherwise, #3364).
    **It also tests the packages the train touches** (AGAST #3363). #3290's
    bug got through a green train because build-all + bootstrap don't run
    the workspace projects' own tests. `train.sh gate` prints `PKGS <dirs>`
@@ -529,7 +530,12 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    It refuses if the log isn't for the train's tip, didn't pass, or `main`
    moved since the build; then rebuild and re-gate. It pushes the tip to
    `main` (never forced), fast-forwards `~/dev/ritz-lang/rz`, and prints
-   `MERGED <branch> <room sha12> as <main sha12>` per commit. For each:
+   `MERGED <branch> <room sha12> as <main sha12>` per commit. It also
+   reserves the gate slot for the next train (`gate-logs/.train-reserved`,
+   #3365): room gates queue but take no slot until the next `train.sh gate`
+   starts, or for 10 minutes at most (`RZ_GATE_TRAIN_HOLD`), so build and
+   gate the next train promptly. A `build` with `gate=not-needed` drops the
+   reservation; if nothing else is queued, just let it expire. For each:
    `complete_task` (`Merged to main as <main sha8> (train <tip sha8>). <REAP
    line>`; if refused, see "Who owns the ticket"), `check_scratchpad_item`,
    and clean up (`systemctl --user stop/disable adele-agent@ritz-task-<id>`,

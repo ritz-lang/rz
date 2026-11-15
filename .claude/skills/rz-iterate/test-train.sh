@@ -33,6 +33,9 @@ echo "$log"
 EOF
 chmod +x "$T/gate.sh"
 export RZ_TEST_DIR="$T" RZ_MAIN_WT="$M" RZ_TRAIN_WT="$T/train" RZ_GATE_SCRIPT="$T/gate.sh"
+# Never the real gate-logs: `land` reserves the slot there (AGAST #3365).
+export RZ_GATE_DIR="$T/gates" RZ_HOST_ENV="$T/no-host.env" RZ_GATE_SLOTS=1
+RES="$RZ_GATE_DIR/.train-reserved"
 TR="$HERE/train.sh"
 fetch() { git -C "$M" fetch -q origin; }
 
@@ -96,7 +99,105 @@ out="$(bash "$TR" land "$log" 2>&1)"; has "$out" "main moved" "land refuses when
 # The train's gate asks run-gate.sh for train priority (AGAST #3317).
 has "$(cat "$log")" "^TRAIN=1$" "train.sh gate sets RZ_GATE_TRAIN=1"
 
-# 6. Package tests (AGAST #3363): the train gate also tests the workspace
+# 6. The slot is reserved between `land` and the next `gate` (AGAST #3365).
+# Real run-gate.sh from here on, with systemd-run/systemctl stubbed as in
+# test-run-gate.sh: the stub runs the unit in the foreground and marks it
+# active in $RZ_TEST_ACTIVE while it runs.
+mkdir -p "$T/bin" "$T/active" "$RZ_GATE_DIR"
+export RZ_TEST_ACTIVE="$T/active" PATH="$T/bin:$PATH"
+cat > "$T/bin/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+envs=(); wd=.; unit=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --setenv=*) envs+=("${1#--setenv=}") ;;
+        --working-directory=*) wd="${1#*=}" ;;
+        --unit=*) unit="${1#*=}" ;;
+        --*) ;;
+        *) break ;;
+    esac
+    shift
+done
+touch "$RZ_TEST_ACTIVE/$unit"
+(cd "$wd" && env "${envs[@]}" "$@"); rc=$?
+rm -f "$RZ_TEST_ACTIVE/$unit"
+exit $rc
+STUB
+cat > "$T/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+[[ -n "${!#}" && -e "$RZ_TEST_ACTIVE/${!#}" ]] && exit 0
+exit 3
+STUB
+chmod +x "$T/bin/systemd-run" "$T/bin/systemctl"
+RG="$HERE/run-gate.sh"
+until_() { local i; for i in $(seq 1 100); do eval "$1" && return 0; sleep 0.1; done; return 1; }
+logof() { ls "$RZ_GATE_DIR"/"$1"-*.log 2>/dev/null | head -1; }
+ORDER="$T/order"
+rec='echo $RZ_TEST_NAME >> "$RZ_TEST_ORDER"'
+export RZ_TEST_ORDER="$ORDER" RZ_GATE_POLL=0.1
+R="$T/room"; git clone -q "$T/origin.git" "$R" 2>/dev/null
+
+# 6a. A successful land reserves the slot, stamped with the time.
+fetch; s9="$(room r9 d D9)"; git -C "$M" checkout -q main
+rm -f "$RES"; bash "$TR" build "r9:$s9" >/dev/null 2>&1
+before="$(date +%s)"; out="$(bash "$TR" land 2>&1)"
+has "$out" "^MAIN " "r9 lands"
+t="$(cat "$RES" 2>/dev/null)"
+[[ "$t" =~ ^[0-9]+$ ]] && (( t >= before && t <= $(date +%s) )) \
+    && ok "land writes .train-reserved with the time" || bad "land writes .train-reserved with the time (got '$t')"
+# A refused land reserves nothing.
+rm -f "$RES"; out="$(bash "$TR" land 2>&1)"
+[[ ! -e "$RES" ]] && ok "a refused land reserves nothing" || bad "a refused land reserves nothing"
+
+# 6b. A room gate started after land waits; the train's gate takes the slot
+# first, and the reservation is gone once the train's gate has started.
+fetch; s10="$(room r10 a A10)"; s11="$(room r11 b B11 origin/main)"
+fetch; git -C "$M" checkout -q main
+date +%s > "$RES"; : > "$ORDER"
+RZ_TEST_NAME=R RZ_GATE_CMD="$rec" timeout 30 bash "$RG" "$R" rroom >/dev/null &
+until_ '[[ -n "$(logof rroom)" ]] && grep -q "^WAITING" "$(logof rroom)"'
+sleep 1
+! grep -q "^SLOT=" "$(logof rroom)" && ok "a room gate waits on a fresh reservation" \
+    || bad "a room gate waits on a fresh reservation"
+grep -q "reserved for the merge train" "$(logof rroom)" && ok "the room gate's log says why it waits" \
+    || bad "the room gate's log says why it waits"
+bash "$TR" build "r10:$s10" "r11:$s11" >/dev/null 2>&1
+log="$(RZ_GATE_SCRIPT="$RG" RZ_TEST_NAME=T RZ_GATE_CMD="$rec; ls -A \"\$RZ_DIR\" > \"\$RZ_TEST_ORDER.during-t\"" \
+    timeout 30 bash "$TR" gate)"
+wait
+[[ "$(tr '\n' ' ' < "$ORDER")" == "T R " ]] && ok "the train's gate goes before the waiting room gate" \
+    || bad "the train's gate goes before the waiting room gate (order: $(tr '\n' ' ' < "$ORDER"))"
+grep -qx EXIT=0 "$log" && grep -qx EXIT=0 "$(logof rroom)" && ok "both gates reach a verdict" \
+    || bad "both gates reach a verdict"
+! grep -qx .train-reserved "$ORDER.during-t" && ok "the train's gate clears the reservation" \
+    || bad "the train's gate clears the reservation"
+[[ ! -e "$RES" ]] && ok "no reservation left after the train's gate" || bad "no reservation left after the train's gate"
+
+# 6c. Fail open: a reservation expires (RZ_GATE_TRAIN_HOLD), and a stale,
+# future-dated or garbled one is ignored.
+date +%s > "$RES"; : > "$ORDER"
+start=$SECONDS
+RZ_GATE_TRAIN_HOLD=2 RZ_TEST_NAME=E RZ_GATE_CMD="$rec" timeout 15 bash "$RG" "$R" rexp >/dev/null; rc=$?
+[[ $rc -eq 0 ]] && grep -qx EXIT=0 "$(logof rexp)" && (( SECONDS - start >= 1 )) \
+    && ok "a room gate takes the slot once the reservation expires" \
+    || bad "a room gate takes the slot once the reservation expires (rc=$rc, $((SECONDS - start))s)"
+i=0
+for v in "$(( $(date +%s) - 601 ))" "$(( $(date +%s) + 3600 ))" garbage ""; do
+    echo "$v" > "$RES"; i=$((i + 1)); n="rs$i"
+    RZ_GATE_CMD=true timeout 5 bash "$RG" "$R" "$n" >/dev/null; rc=$?
+    [[ $rc -eq 0 ]] && grep -qx EXIT=0 "$(logof "$n")" && ok "a reservation of '$v' doesn't block a room gate" \
+        || bad "a reservation of '$v' doesn't block a room gate (rc=$rc)"
+done
+
+# 6d. A train that needs no gate drops the reservation: no train gate is coming.
+date +%s > "$RES"
+fetch; s12="$(room r12 c C12)"; git -C "$M" checkout -q main
+out="$(bash "$TR" build "r12:$s12" 2>&1)"
+has "$out" "gate=not-needed" "a lone KEPT train needs no gate"
+[[ ! -e "$RES" ]] && ok "building a gate=not-needed train drops the reservation" \
+    || bad "building a gate=not-needed train drops the reservation"
+
+# 7. Package tests (AGAST #3363): the train gate also tests the workspace
 # packages the train touches, and a failure blocks only if the base passes.
 # Fake packages; RZ_PKG_TEST stands in for `./rz test <dir>` and fails when
 # the package has a FAIL file.
