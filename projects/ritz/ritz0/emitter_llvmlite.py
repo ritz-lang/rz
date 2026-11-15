@@ -35,6 +35,12 @@ from type_checker import TypeChecker, check_ref_slots
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
 
+# AGAST #3347: `let s: String = "abc"` with no `import ritzlib.string`. ritz1's
+# let_check_string_lit_no_import (ritz1/src/let_check.ritz) prints these words.
+STRING_LIT_NO_IMPORT = ("`String` is not built in: `import ritzlib.string` "
+                        "to make one from a string literal")
+
+
 class EmitError(Exception):
     """A user-facing error detected during emission, with a source location.
 
@@ -1889,8 +1895,9 @@ class LLVMEmitter:
         This avoids the runtime strlen() that string_from() would do.
         """
         if "string_from_bytes" not in self.functions:
-            raise ValueError("String literal to String conversion requires string_from_bytes() to be defined. "
-                             "Import ritzlib.string to use String type.")
+            # AGAST #3347: a located user error, not a ValueError traceback.
+            # ritz1's let_check_string_lit_no_import gives the same words.
+            raise EmitError(STRING_LIT_NO_IMPORT, expr.span)
 
         fn, _ = self.functions["string_from_bytes"]
 
