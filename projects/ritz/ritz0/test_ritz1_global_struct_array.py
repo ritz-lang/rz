@@ -352,7 +352,7 @@ def test_ritz1_struct_elem_ir_is_typed(ritz1_bin, tmp_path):
     comp, ll = _compile("ritz1", tmp_path, "swap_ir", SWAP)
     assert comp.returncode == 0, comp.stderr[-2000:]
     ir = ll.read_text()
-    swap_body = ir[ir.index("define weak_odr void @swap") :]
+    swap_body = ir[ir.index("define internal void @swap") :]
     swap_body = swap_body[: swap_body.index("\n}\n")]
     assert "getelementptr [4 x %P], ptr @g, i64 0, i64 " in swap_body
     assert "= load %P, ptr " in swap_body

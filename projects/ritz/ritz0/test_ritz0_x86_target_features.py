@@ -58,7 +58,7 @@ CLANG_TIMEOUT_S = 120
 CLANG_MEM_BYTES = 2 * 1024 * 1024 * 1024
 
 PROGRAM = """\
-fn use_sha(a: *i32, b: *i32, c: *i32) -> i32
+pub fn use_sha(a: *i32, b: *i32, c: *i32) -> i32
     let x: v4i32 = simd_loadu(a)
     let y: v4i32 = simd_loadu(b)
     let z: v4i32 = simd_loadu(c)
@@ -68,14 +68,14 @@ fn use_sha(a: *i32, b: *i32, c: *i32) -> i32
     simd_storeu(a, r3)
     0
 
-fn use_aes(a: *i32, b: *i32) -> i32
+pub fn use_aes(a: *i32, b: *i32) -> i32
     let s: v4i32 = simd_loadu(a)
     let k: v4i32 = simd_loadu(b)
     let r: v4i32 = aesenc(s, k)
     simd_storeu(a, aesenclast(r, k))
     0
 
-fn use_clmul(a: *i64, b: *i64) -> i32
+pub fn use_clmul(a: *i64, b: *i64) -> i32
     let x: v2i64 = simd_loadu(a)
     let y: v2i64 = simd_loadu(b)
     let r: v2i64 = simd_clmul(x, y, 0)
