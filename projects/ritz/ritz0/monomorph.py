@@ -562,11 +562,21 @@ class Monomorphizer:
         leaves open, so the literal is a located error wherever it is written,
         generic templates and impl<T> methods too.  ritz1's
         gi_check_struct_lit_args gives the same message.
+
+        The built-in `Span<T>` counts too when nothing declares or imports a
+        `Span` (AGAST #3357): with no `import ritzlib.span` it isn't in
+        generic_structs, and the emitter raised a ValueError.
         """
-        struct_def = self.generic_structs.get(lit.name)
-        if struct_def is None or lit.type_args:
+        if lit.type_args:
             return
-        args = ", ".join(struct_def.type_params)
+        struct_def = self.generic_structs.get(lit.name)
+        if struct_def is not None:
+            params = struct_def.type_params
+        elif lit.name == 'Span' and 'Span' not in self.struct_defs:
+            params = ['T']
+        else:
+            return
+        args = ", ".join(params)
         raise GenericInferError(
             f"`{lit.name}` is generic: write its type arguments, "
             f"`{lit.name}<{args}> {{ .. }}`", lit.span)

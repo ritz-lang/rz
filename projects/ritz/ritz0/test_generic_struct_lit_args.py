@@ -69,12 +69,22 @@ REFUSED = {
     "impl_method": ("impl<X> Box2<X>\n    fn again(self: @Box2<X>) -> Box2<X>\n"
                     "        Box2 { v: self.v }\nfn main() -> i32\n    0\n",
                     "10:9", "Box2", "X"),
+    # The built-in Span<T>, with no `import ritzlib.span` (AGAST #3357):
+    # ritz0 raised a Python ValueError ("Unknown struct: Span").  #3346
+    # built the spelled-out `Span<u8> { .. }`, test_span_builtin_no_import.
+    "builtin_span": ("fn main() -> i32\n    var a: [3]u8 = [1, 2, 3]\n"
+                     "    let s: Span<u8> = Span { ptr: @a[0], len: 3 }\n    0\n",
+                     "10:23", "Span", "T"),
 }
 
 # name -> (source after HEAD, exit code): the controls.
 RUNS = {
     # A plain struct's literal needs no args, beside generic ones.
     "plain_struct": ("fn main() -> i32\n    let t = T { id: 4 }\n    t.id\n", 4),
+    # A program's own non-generic `struct Span` replaces the built-in one
+    # (builtin_types.py), so its literal needs no args (AGAST #3357).
+    "own_span": ("struct Span\n    n: i32\n"
+                 "fn main() -> i32\n    let s = Span { n: 6 }\n    s.n\n", 6),
     # The spelled-out literal, in a fn and in a generic fn's template.
     "spelled_out": ("fn g<U>(x: U) -> Box2<U>\n    Box2<U> { v: x }\nfn main() -> i32\n"
                     "    let b = Box2<T> { v: T { id: 5 } }\n"
