@@ -777,6 +777,48 @@ pub fn main() -> i32
         i = i + 1
 """),
 
+    # AGAST #2320: moved in every arm, a nested path reports the first
+    # arm's move, as ritz0 does.
+    "nested_moved_in_both_if_arms": nested("""\
+    if DROPS == 0
+        consume(v.w.t)
+    else
+        consume(v.w.t)
+    consume(v.w.t)
+"""),
+
+    "nested_moved_in_every_match_arm": nested("""\
+    match DROPS
+        0 =>
+            consume(v.w.t)
+        1 =>
+            consume(v.w.t)
+        _ =>
+            consume(v.w.t)
+    consume(v.w.t)
+"""),
+
+    # Two paths, moved in the opposite order in each arm.
+    "nested_two_paths_in_both_arms": nested("""\
+    if DROPS == 0
+        consume(v.w.u)
+        consume(v.w.t)
+    else
+        consume(v.w.t)
+        consume(v.w.u)
+    eat_inner(v.w)
+"""),
+
+    # A different path in each arm: the then arm's is named, as ritz0's
+    # merge lists it first.
+    "nested_different_path_per_arm": nested("""\
+    if DROPS == 0
+        consume(v.w.t)
+    else
+        consume(v.w.u)
+    eat_inner(v.w)
+"""),
+
     # AGAST #2319: past the 31 paths ritz1 used to track, named the same.
     "wide_moved_twice": wide("""\
     consume(w.f39)
@@ -940,6 +982,67 @@ pub fn main() -> i32
         h.n = 3
     return h.t.id
 """, "main.ritz:38:12: error: use of moved value: `h.t` (moved at main.ritz:35:17)"),
+
+    # AGAST #2320: moved in both arms, it reports the then arm's move, as
+    # it does for a whole binding (ritz1 reported the else arm's).
+    "field_moved_in_both_if_arms": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    if DROPS == 0
+        consume(h.t)
+    else
+        consume(h.t)
+    return h.t.id
+""", "main.ritz:38:12: error: use of moved value: `h.t` (moved at main.ritz:35:17)"),
+
+    # ...and in every arm of a match: the first arm's.
+    "field_moved_in_every_match_arm": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    match DROPS
+        0 =>
+            consume(h.t)
+        1 =>
+            consume(h.t)
+        _ =>
+            consume(h.t)
+    return h.t.id
+""", "main.ritz:41:12: error: use of moved value: `h.t` (moved at main.ritz:36:21)"),
+
+    # The else arm moves it too but returns: the then arm's state stands.
+    "field_moved_in_both_else_returns": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    if DROPS == 0
+        consume(h.t)
+    else
+        consume(h.t)
+        return 1
+    return h.t.id
+""", "main.ritz:39:12: error: use of moved value: `h.t` (moved at main.ritz:35:17)"),
+
+    # Moved in the else arm only: that arm's move.
+    "field_moved_in_else_only": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    if DROPS == 0
+        h.n = 3
+    else
+        consume(h.t)
+    return h.t.id
+""", "main.ritz:38:12: error: use of moved value: `h.t` (moved at main.ritz:37:17)"),
+
+    # Moved before the `if` and re-assigned in the then arm, which then
+    # moves it again; the else arm leaves the first move: the then arm's.
+    "field_reassigned_and_moved_in_then": ("""\
+pub fn main() -> i32
+    var h = Holder { t: make(1), n: 2 }
+    consume(h.t)
+    if DROPS == 0
+        h.t = make(2)
+        consume(h.t)
+    return h.t.id
+""", "main.ritz:38:12: error: use of moved value: `h.t` (moved at main.ritz:37:17)"),
 
     # Moving a field out of a type with its own drop would leave that drop
     # a half-moved value (as in Rust, E0509).

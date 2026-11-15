@@ -478,8 +478,12 @@ fn own_fm_push(o: *OwnState, slot: i32, path: i32, line: i32, col: i32)
 
 # The index of the latest recorded move of that path, or -1.
 fn own_fm_index(o: *OwnState, slot: i32, path: i32) -> i32
+    own_fm_latest_below(o, slot, path, o.fm_count)
+
+# The latest record of that path below index `bound`, or -1.
+fn own_fm_latest_below(o: *OwnState, slot: i32, path: i32, bound: i32) -> i32
     let base: *i32 = o.fm_loc
-    var i: i32 = o.fm_count - 1
+    var i: i32 = bound - 1
     while i >= 0
         let r: *i32 = base + i * 4
         if r[0] == slot and r[1] == path
@@ -2994,20 +2998,27 @@ pub fn own_assign_end(s: *EmitterState, h: *OwnBinding, old: i32, old_flag: i32)
 # =============================================================================
 
 # The moved state of every live binding: OWN_SNAP_INTS i32s each (moved,
-# its line and column, shadow, fmoved, fshadow) after a count.  null when
+# its line and column, shadow, fmoved, fshadow) after a header of
+# OWN_SNAP_HDR: the count, and the length of the field-move log then
+# (AGAST #2320: the log's records below it are this state's).  null when
 # nothing is tracked.
 const OWN_SNAP_INTS: i32 = 6
+const OWN_SNAP_HDR: i32 = 2
+
+fn own_snap_rec(snap: *i32, i: i32) -> *i32
+    snap + OWN_SNAP_HDR + i * OWN_SNAP_INTS
 
 pub fn own_snapshot(s: *EmitterState) -> *i32
     let o: *OwnState = s.own
     if o.live_count == 0
         return null
-    let snap: *i32 = malloc(((o.live_count * OWN_SNAP_INTS + 1) * 4) as i64) as *i32
+    let snap: *i32 = malloc(((o.live_count * OWN_SNAP_INTS + OWN_SNAP_HDR) * 4) as i64) as *i32
     snap[0] = o.live_count
+    snap[1] = o.fm_count
     var i: i32 = 0
     while i < o.live_count
         let b: *OwnBinding = own_live_at(o, i)
-        let r: *i32 = snap + 1 + i * OWN_SNAP_INTS
+        let r: *i32 = own_snap_rec(snap, i)
         r[0] = b.moved
         r[1] = b.move_line
         r[2] = b.move_col
@@ -3016,6 +3027,33 @@ pub fn own_snapshot(s: *EmitterState) -> *i32
         r[5] = b.fshadow
         i += 1
     snap
+
+# AGAST #2320: own_fm_find answers with the latest record of a path, so a
+# state taken from a snapshot re-records the snapshot's own moves (the
+# latest record below `bound` of each path in `bits`), oldest first so
+# own_first_moved still names the one that moved first.  With `force` 0
+# only when another record of one of them is later (a path that moved
+# past the snapshot, in an arm that didn't reach here).
+fn own_fm_repush(o: *OwnState, slot: i32, bits: i32, bound: i32, force: i32)
+    if bits == 0
+        return
+    let base: *i32 = o.fm_loc
+    var stale: i32 = force
+    var i: i32 = 0
+    while stale == 0 and i < bound
+        let r: *i32 = base + i * 4
+        if r[0] == slot and own_set_has(bits, r[1]) == 1 and own_fm_latest_below(o, slot, r[1], bound) == i
+            if own_fm_index(o, slot, r[1]) != i
+                stale = 1
+        i += 1
+    if stale == 0
+        return
+    i = 0
+    while i < bound
+        let r: *i32 = o.fm_loc + i * 4
+        if r[0] == slot and own_set_has(bits, r[1]) == 1 and own_fm_latest_below(o, slot, r[1], bound) == i
+            own_fm_push(o, slot, r[1], r[2], r[3])
+        i += 1
 
 pub fn own_restore(s: *EmitterState, snap: *i32)
     if snap == null
@@ -3027,26 +3065,35 @@ pub fn own_restore(s: *EmitterState, snap: *i32)
     var i: i32 = 0
     while i < n
         let b: *OwnBinding = own_live_at(o, i)
-        let r: *i32 = snap + 1 + i * OWN_SNAP_INTS
+        let r: *i32 = own_snap_rec(snap, i)
         b.moved = r[0]
         b.move_line = r[1]
         b.move_col = r[2]
         b.shadow = r[3]
         b.fmoved = r[4]
         b.fshadow = r[5]
+        own_fm_repush(o, b.slot, b.fmoved, snap[1], 0)
         i += 1
 
 # Paths meet: what `into` holds is moved (shadowed) if it is on either
 # path; a binding moved on both keeps `into`'s move, as ritz0's _join keeps
-# the first path's.
-fn own_join_snap(into: *i32, other: *i32)
+# the first path's.  So does a field (AGAST #2320): `into`'s moves are
+# re-recorded first, then the ones only `other` made, as ritz0's merged
+# dict lists them.
+fn own_join_snap(o: *OwnState, into: *i32, other: *i32)
     var n: i32 = into[0]
     if other[0] < n
         n = other[0]
+    if o.live_count < n
+        n = o.live_count
     var i: i32 = 0
     while i < n
-        let a: *i32 = into + 1 + i * OWN_SNAP_INTS
-        let b: *i32 = other + 1 + i * OWN_SNAP_INTS
+        let a: *i32 = own_snap_rec(into, i)
+        let b: *i32 = own_snap_rec(other, i)
+        if a[4] != 0 or b[4] != 0
+            let slot: i32 = own_live_at(o, i).slot
+            own_fm_repush(o, slot, a[4], into[1], 1)
+            own_fm_repush(o, slot, own_set_minus(b[4], a[4]), other[1], 1)
         if a[0] == 0 and b[0] == 1
             a[0] = 1
             a[1] = b[1]
@@ -3055,6 +3102,7 @@ fn own_join_snap(into: *i32, other: *i32)
         a[4] = own_set_or(a[4], b[4])
         a[5] = own_set_or(a[5], b[5])
         i += 1
+    into[1] = o.fm_count
 
 # Neither arm returned: a binding moved in the then-arm (`after_then`) is
 # moved after the `if` too (the else-arm's state is current).  Moved in
@@ -3066,7 +3114,7 @@ pub fn own_merge_moved(s: *EmitterState, after_then: *i32)
     let now: *i32 = own_snapshot(s)
     if now == null
         return
-    own_join_snap(after_then, now)
+    own_join_snap(s.own, after_then, now)
     own_restore(s, after_then)
     free(now as *u8)
 
@@ -3091,7 +3139,7 @@ pub fn own_arm_end(s: *EmitterState, acc: **i32)
     if *acc == null
         *acc = now
         return
-    own_join_snap(*acc, now)
+    own_join_snap(o, *acc, now)
     free(now as *u8)
 
 pub fn own_arms_end(s: *EmitterState, before: *i32, acc: *i32)
