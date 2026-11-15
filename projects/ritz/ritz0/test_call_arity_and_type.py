@@ -103,6 +103,9 @@ fn span_len(sp: Span<i32>) -> i64
 struct B
     pb: *[7]u8
 
+struct C
+    pi: *[7]i32
+
 fn sv_of(pb: *[7]u8) -> i64
     sv(pb)
 
@@ -145,6 +148,12 @@ REFUSED = {
     "fn_param_too_many": ("    return @h(1, 2)", ARITY.format(f="h", n=2, m=1),
                           "fn via(h: fn(i32) -> i32) -> i32\n"),
     "nameless_too_many": ("    return @pick()(1, 2)", NAMELESS.format(n=2, m=1)),
+    # A `*[N]T` local or field of another element than u8 / i8 (AGAST #3349):
+    # ritz1 passed the pointer's i64 where the %StrView goes, and clang refused.
+    "array_pointer_wrong_elem_into_strview": ("    let pa: *[7]i32 = pi\n    return sv(@pa)", WRONG.format(n=1, f="sv"),
+                                              "fn sv_i32(pi: *[7]i32) -> i64\n"),
+    "array_pointer_field_wrong_elem_into_strview": ("    return sv(@c.pi)", WRONG.format(n=1, f="sv"),
+                                                    "fn sv_field(c: C) -> i64\n"),
 }
 
 # ritz0 raises IndexError on these (#3319).
