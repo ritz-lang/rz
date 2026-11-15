@@ -341,7 +341,8 @@ PTR_READ = MOVE + """\
 import ritzlib.ptr
 
 fn f() -> i32
-    var a: [1]T
+    # Raw storage for one T: an array of T needs an initialiser (LARB R39).
+    var a: [1]i32
     var t = T { id: 5 }
     write_slot(@a as *T, @t)
     let n = eat(ptr_read<T>(@a as *T))

@@ -4594,9 +4594,9 @@ element's old value in the same order: after `v` and the index have been
 evaluated, before `v` is stored (LARB R39, AGAST #3305). That is why an array of
 a type with drop glue must be initialised where it's declared (§3.3): every
 element always holds a value. An array of any rank is dropped element by element
-in index order (`g[0][0]`, `g[0][1]`, … `g[1][0]`), as a rank-1 array is. Until
-#3305's tickets land, neither compiler drops a stored-over element or a rank-2+
-local.
+in index order (`g[0][0]`, `g[0][1]`, … `g[1][0]`), as a rank-1 array is. ritz0
+does all of this (AGAST #3376); ritz1 doesn't yet drop a stored-over element or
+take an initialiser on a rank-2+ local (AGAST #3377).
 
 A move out of a nested field moves that field only, at any depth, as in Rust.
 After `v.w.t` moves, `v` and `v.w` are **partly moved**:

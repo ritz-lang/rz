@@ -64,3 +64,10 @@ FILL_MOVE_ONLY = ('`[v; n]` copies `v` into every element: '
 # words, from ownership.ritz.
 MOVE_OUT_OF_ELEMENT = ('cannot move out of an array element: '
                        'the array still drops it; borrow it with `@a[i]`')
+
+
+def uninitialised_drop_array(name: str) -> str:
+    """`var a: [2]S` with no `=`, S with drop glue (LARB R39, AGAST #3376):
+    an element store drops the old element, so every one must hold a value.
+    ritz1 prints the same words (#3377)."""
+    return f"`{name}` must be initialised: its elements have `drop`"

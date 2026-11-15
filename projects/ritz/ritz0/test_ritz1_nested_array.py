@@ -729,10 +729,10 @@ pub fn main() -> i32
         return 1
     return (w.a[1][2].k as i32) + 2
 """,
-    # ... of a Drop struct.  As a 1-D `a[i] = v` store on every compiler, the
-    # element's old value is not dropped and the stored one is moved, not
-    # dropped: 30 + 7 + 5 + D (0).  The missing drop of the old value is
-    # filed against all three compilers, not fixed here.
+    # ... of a Drop struct (LARB R39, AGAST #3376): a store drops the old
+    # element and the stored one is moved, not dropped.  g must be
+    # initialised (§3.3).  g[1][1] = q drops x=2, g[0][1] = .. drops x=0:
+    # 30 + 7 + 3 + D (2).  Without the drop it is 40.
     "struct_elem_store_drop": """\
 var D: i32 = 0
 
@@ -744,9 +744,9 @@ impl Drop for S
         D = D + self.x
 
 pub fn main() -> i32
-    var g: [2][2]S
+    var g: [2][2]S = [ [S { x: 0 }, S { x: 0 }], [S { x: 0 }, S { x: 0 }] ]
     g[1][1].x = 2
-    g[1][0].x = 5
+    g[1][0].x = 3
     var q: S = S { x: 30 }
     g[1][1] = q
     g[0][1] = S { x: 7 }
@@ -883,9 +883,10 @@ pub fn main() -> i32
     return (q.k as i32) + 2 + 0 * (r.k as i32)
 """,
     # ... of a Drop struct, through borrowing receivers: no read drops the
-    # element (D is still 0 in the scope: 3 + 5 + 0).  An N-D array of a Drop
-    # struct is not dropped at scope end either, on any compiler (#3305), so
-    # D stays 0 after it.  Moving one out by value is refused (FAIL_CLOSED).
+    # element (D is still 0 in the scope: 3 + 5 + 0).  g must be initialised
+    # (§3.3) and drops at scope end in index order (LARB R39, AGAST #3376):
+    # D = 0 + 5 + 0 + 3 after it, so 8 + 8 + 26.  Moving one out by value is
+    # refused (FAIL_CLOSED).
     "struct_elem_load_drop": """\
 var D: i32 = 0
 
@@ -905,14 +906,12 @@ impl Drop for S
 pub fn main() -> i32
     var w: i32 = 0
     if true
-        var g: [2][2]S
-        g[0][0].x = 0
-        g[1][0].x = 0
+        var g: [2][2]S = [ [S { x: 0 }, S { x: 0 }], [S { x: 0 }, S { x: 0 }] ]
         g[1][1].x = 2
         g[1][1].bump()
         g[0][1].x = 5
         w = g[1][1].peek() + g[0][1].peek() + D * 100
-    return w + D + 34
+    return w + D + 26
 """,
 }
 
@@ -957,8 +956,21 @@ def test_ritz0_is_the_oracle(tmp_path, name):
     assert _run("ritz0", tmp_path, name, RUNNABLE[name]) == EXPECTED
 
 
+# ritz1 gaps against the oracle, as strict xfails: the room that closes one
+# flips it.
+RITZ1_GAPS = {
+    # R39 needs an initialiser on these, and ritz1 has no N-D initialiser.
+    "struct_elem_load_drop": 3377,   # N-D Drop array drops at scope end
+    "struct_elem_store_drop": 3377,  # element store drops the old element
+}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RUNNABLE))
+@pytest.mark.parametrize("name", [
+    pytest.param(n, marks=[pytest.mark.xfail(
+        strict=True, reason=f"AGAST #{RITZ1_GAPS[n]}: ritz1 does not do this yet")]
+        if n in RITZ1_GAPS else [])
+    for n in sorted(RUNNABLE)])
 def test_ritz1_nested_array(ritz1_bin, tmp_path, name):
     """ritz1 must agree with ritz0 on every multi-dimensional array program."""
     assert _run("ritz1", tmp_path, name, RUNNABLE[name]) == EXPECTED

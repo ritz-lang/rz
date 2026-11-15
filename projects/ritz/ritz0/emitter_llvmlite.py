@@ -4399,6 +4399,45 @@ class LLVMEmitter:
         self.builder.branch(cont_block)
         self.builder.position_at_end(cont_block)
 
+    def _drop_old_element(self, target: rast.Index, elem_ptr: ir.Value) -> None:
+        """`a[i] = v`, `g[i][j] = v`, `h.a[i] = v`, once v and the index are
+        evaluated and before v is stored: drop the element's old value
+        (§13.6, LARB R39, AGAST #3376). As for a field (_drop_old_field),
+        only an element of an array a binding owns: its drop flag is set
+        and, for `h.a[i]`, `h.a` hasn't been moved out. A store through a
+        pointer drops nothing (AGAST #2179). Every element of an owned Drop
+        array holds a value, as such an array must be initialised (§3.3)."""
+        if self.builder.block.is_terminated:
+            return
+        elem_type = self._infer_ritz_type(target)
+        if not self.move_types.is_move_only(elem_type):
+            return
+        base = target
+        while isinstance(base, (rast.Index, rast.Grouped)):
+            base = base.expr
+        if isinstance(base, rast.Ident):
+            name, fpath = base.name, None
+        else:
+            path = field_path(base)
+            if path is None:
+                return
+            name, fpath = path
+        slot = self._drop_slot_of(name)
+        flag = self.drop_flags.get(id(slot)) if slot is not None else None
+        if flag is None:
+            return
+        cond = self.builder.load(flag)
+        fflag = self._field_flags_of(name).get(fpath) if fpath else None
+        if fflag is not None:
+            cond = self.builder.and_(cond, self.builder.load(fflag))
+        drop_block = self.current_fn.append_basic_block("drop.old_elem")
+        cont_block = self.current_fn.append_basic_block("drop.old_elem.cont")
+        self.builder.cbranch(cond, drop_block, cont_block)
+        self.builder.position_at_end(drop_block)
+        self._emit_drop_glue(elem_ptr, elem_type)
+        self.builder.branch(cont_block)
+        self.builder.position_at_end(cont_block)
+
     def _assign_tuple_element(self, stmt: rast.AssignStmt, tuple_ptr: ir.Value,
                               val: ir.Value) -> bool:
         """`p.0 = v`, `tuple_ptr` addressing the tuple `p`: store v as element
@@ -6616,6 +6655,7 @@ class LLVMEmitter:
                             zero = ir.Constant(self.i32, 0)
                             ptr = self.builder.gep(alloca, [zero, index])
                             val = self._convert_type(val, ty.element)
+                            self._drop_old_element(stmt.target, ptr)
                             self.builder.store(val, ptr)
                             return None
                     elif name in self.globals:
@@ -6639,6 +6679,7 @@ class LLVMEmitter:
                             zero = ir.Constant(self.i32, 0)
                             ptr = self.builder.gep(field_addr, [zero, index])
                             val = self._convert_type(val, pointee.element)
+                            self._drop_old_element(stmt.target, ptr)
                             self.builder.store(val, ptr)
                             return None
 
@@ -6651,6 +6692,7 @@ class LLVMEmitter:
                             zero = ir.Constant(self.i32, 0)
                             ptr = self.builder.gep(inner_addr, [zero, index])
                             val = self._convert_type(val, pointee.element)
+                            self._drop_old_element(stmt.target, ptr)
                             self.builder.store(val, ptr)
                             return None
 

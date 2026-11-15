@@ -1024,6 +1024,13 @@ class MoveChecker:
             # Variable declaration
             if stmt.value:
                 self._check_expr(stmt.value, is_move_context=True)
+            elif (isinstance(self.types.resolve(stmt.type), rast.ArrayType)
+                    and self.types.is_move_only(stmt.type)):
+                # §3.3 (LARB R39): storing an element drops the old one, so
+                # every element of a Drop array must hold a value.
+                self.errors.append(OwnershipError(
+                    array_rules.uninitialised_drop_array(stmt.name),
+                    stmt.name_span or stmt.span))
             # Use explicit type if present, otherwise infer from initializer
             if stmt.type:
                 var_type = stmt.type
