@@ -970,6 +970,29 @@ An `impl` can't target an alias. `type Id = Foo` then `impl Id` is an error at
 `Id`: "`Id` is a type alias for `Foo`: write `impl Foo`" (LARB R35, AGAST
 #3287). A type's methods live under the one name it was declared with.
 
+An alias names one type. `A | B` isn't a type, and a type name isn't a pattern
+(LARB R52, AGAST #1622). ritz0 accepted an untagged-looking `type V = i64 | bool`
+whose members were read out with an unchecked `v as i64`. For a value that is
+one of several kinds, write an enum with payloads and `match` it; each variant
+names its kind, so two kinds of the same type stay apart:
+
+```ritz
+enum Value
+    Int(i64)
+    Flag(bool)
+    Ref(i64)
+
+fn weight(v: Value) -> i64
+    match v
+        Int(n) => n
+        Flag(b) => if b then 1 else 0
+        Ref(id) => id * 10
+
+fn main() -> i32
+    let r = weight(Ref(4)) + weight(Flag(true))
+    (r - 41) as i32
+```
+
 ---
 
 ## 4. Variables
@@ -3097,8 +3120,44 @@ even one with a single field: `f(1)` for `fn f(s: S)` with `struct S { x: i32 }`
 is "argument 1 of `f` has the wrong type", and you write `f(S { x: 1 })` (LARB
 R47, AGAST #3336; ritz0 wraps the integer today).
 
-A generic struct's literal names its type arguments, `Box2<T> { v: x }`; they
-aren't inferred from the fields (LARB R44, AGAST #3314, #3311).
+A generic struct's literal may leave out its type arguments, as a bare enum
+constructor does (§11.3). They come from the slot the literal fills: a typed
+`let` or `var`, a parameter, a field, the fn's return type. With no slot (an
+untyped `let`, a `match` scrutinee), they come from the field values, by §4.4's
+rule for a generic call. The slot wins: in a `Box2<u8>` slot, `Box2 { v: 1 }`
+is a `Box2<u8>` and its `1` is a `u8`, and a field value of another type is
+that field's type error. A type parameter that neither the slot nor any field
+binds is an error at the literal. Writing the arguments out, `Box2<u8> { .. }`,
+is always allowed (LARB R51, AGAST #3314):
+
+```text
+struct Box2<T>
+    v: T
+
+fn wrap(x: u8) -> Box2<u8>
+    Box2 { v: x }                  # the return type: Box2<u8>
+
+fn main() -> i32
+    let x: u16 = 7
+    let a = Box2 { v: x }          # the field: Box2<u16>
+    let b = Box2 { v: 1 }          # the literal rule: Box2<i64>, as Present(1)
+    let c: Box2<u8> = Box2 { v: 1 }   # the slot: Box2<u8>
+    0
+```
+
+```text
+struct Tagged<T>
+    n: i32
+
+fn main() -> i32
+    let t = Tagged { n: 1 }    # error: can't infer `T` for `Tagged`: write its type arguments, `Tagged<T> { .. }`
+    0
+```
+
+Unlike a bare constructor, an untyped `let` doesn't look at the fn's return
+type: it has no slot, so its literal takes the field values' types. Until the
+implementing tickets land, all three compilers refuse an args-less literal
+(#3311).
 
 ### 9.3 Field Access
 

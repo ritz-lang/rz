@@ -1527,6 +1527,7 @@ constructors), so this is a question of taste for Aaron, not a ruling against it
 **Q: should `Box2 { v: x }` infer `Box2<T>` from its fields and slot?** If yes, a
 ticket follows (ritz0 `_check_struct_lit_args`, ritz1 `gi_check_struct_lit_args`,
 fill `StructLit.type_args`). No implementation tickets until he answers.
+**Superseded by R51** (Aaron delegated it back to LARB).
 
 ### R45: ritz1 `weak_odr` (#1640): ALIGN LINKAGE WITH VISIBILITY
 Not a spec matter, but it is observable: `weak_odr` tells the linker that
@@ -1617,3 +1618,59 @@ walkers) → #3395 ritz1 lowering, `[[naked]]`, test_asm and cryptosec's barrier
 (parallel with ritz1) ; #3397 syscall shims into `ritzlib.sys` (after both;
 finishes #1825). Until #3396 lands, ritz1 compiles harland's 11 sniffed blocks
 without their outputs, so harland must not be built with ritz1 before then.
+
+### R51: inferring a generic struct literal's args (#3314): INFER, SLOT FIRST, THEN FIELDS
+Aaron, verbatim: *"Do the most ritz-y thing. Balancing unambiguity with
+syntactical sugar & future proofing."* LARB's call; it supersedes R44.
+
+**Rule (§9.2).** `Box2 { v: x }` may leave out its type args. (1) The slot it
+fills decides: typed `let`/`var`, parameter, field, the fn's return type. The
+slot wins, and a literal field value adopts the slot's type. (2) With no slot,
+the field values bind them by §4.4's call rule, so `Box2 { v: 1 }` is
+`Box2<i64>`, as `Present(1)` is. (3) A param neither binds is an error at the
+literal. (4) Explicit args are always allowed. An untyped `let` doesn't borrow
+the fn's return type, unlike §11.3's constructor rule.
+
+- **Unambiguity.** One answer in every case, and each comes from a rule that
+  already exists: the §11.3 slot, the §4.4 call rule, R21's literal default.
+  rz's worry, `Box2 { v: 1 }` being i64, is the answer `Present(1)` and `f(1)`
+  already give. The §11.3 step that looks at the return type from an untyped
+  `let` is left out, because there the answer depends on code far from the
+  literal.
+- **Sugar.** A struct literal is a constructor, like an enum variant. Refusing
+  would leave `Present(x)` inferring while `Box2 { v: x }` doesn't.
+- **Future-proofing.** Closes nothing: defaults and trait bounds (#1621) still
+  get a slot or explicit args.
+- **Why not slot-only** (rz's option, as #2185's no-`self` static method): that
+  method's arguments needn't mention `T`, so the slot is all it has. A literal's
+  fields are `T`, and ignoring them refuses cases with one obvious answer.
+
+Cost 0 (a loosening; #3311 counted 0 args-less literals). Tickets #3407 (ritz0),
+#3408 (ritz1).
+
+### R52: union type aliases (#1622): REMOVE
+Aaron: *"Is there actually a case where this would be reasonable in a
+statically typed language?"* No, in Ritz. §3.8 now says an alias names one
+type, `A | B` isn't a type, and a type name isn't a pattern: use an enum with
+payloads.
+
+- **Corpus:** 3 aliases, all in `test_level24.ritz`. 0 inline unions, 0
+  anywhere else (one hypothetical `T | null` in `LANGUAGE_REVIEW.md`).
+- **ritz0's representation:** `{ i8 tag, [max x i8] }`, so it is tagged, but the
+  members are keyed by LLVM type. Probed: a `u64` put into `i64 | u64` gets the
+  `i64` tag, and `match` takes the wrong arm. Reading a member out, `v as T`
+  (what `bool => v as bool` depends on), never reads the tag:
+  `(true as IntOrBool) as i64` gives 1, after loading 7 bytes the bool never wrote.
+- **Where unions earn their keep** (TypeScript, Python typing, Scala 3): the
+  runtime already tags every value, and flow analysis narrows. Ritz has neither,
+  so a union is a type-keyed anonymous enum (weaker than `enum`) or an untagged
+  reinterpretation (unsafe). The corpus's real "one of several kinds" values,
+  mausoleum's `Field`, lexis's Token and harland's BackendHandle, have kinds that
+  share a type (INT/BOOL/DOCREF are all i64; STRING/BYTES are both ptr+len).
+  A type-keyed union can't express them, and an enum with named payloads can.
+- A C-style untagged `union` for FFI layouts (io_uring's SQE) is a different
+  feature, and would get its own design if ever needed.
+
+Tickets #3409 (ritz0 removal, test_level24's union tests and #1622's
+EXPECTED_FAILURES entry go with it) and #3411 (ritz1: a located error in place of
+the unlocated parse failure). No migration ticket: nothing else uses it.
