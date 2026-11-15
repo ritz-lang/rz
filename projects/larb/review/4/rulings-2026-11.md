@@ -1413,3 +1413,22 @@ the implementing commit. Clarifications:
 - `60_echo_server`'s dead cleanup `sys_close` is deleted, with a comment that the
   server runs until it's killed. A shutdown path would be a feature, not a migration.
 - The stale `harland/docs/old_designs` site is deleted rather than excluded.
+
+Aaron confirmed R31a on 2026-11-15 04:48Z ("you can delete them as you want").
+
+### R33: `tools/ab_test.py` (#3259): DELETE (2026-11-15)
+
+#3203 (R30) deleted the four A/B shell scripts but not the Python harness
+`projects/ritz/tools/ab_test.py`. It goes too, with its `"ab_test"` entry in
+`LOCAL_MODULES` (`tools/test_tools_requirements.py`). The reasons are R30's:
+
+- Unchanged since the repo was imported, and nothing in the repo calls it. The
+  only other mentions are in `projects/ritz/docs/archive/`, which stays as history.
+- It compiles one file and links the single `.s` with `gcc` and no ritzlib or
+  runtime, so it can't build anything that imports ritzlib.
+- Its second path describes the bootstrap-era ritz1 (compiled by ritz0).
+- `scripts/regression.sh` stages 1-5 already compare ritz0 with ritz1 on the
+  real build, and a one-off IR diff is two compiles and `diff`.
+
+The ticket is `ready` with the scope: delete the file and the entry, leave the
+archive, and `git grep ab_test` outside the archive and LARB prints nothing.
