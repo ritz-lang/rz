@@ -468,13 +468,15 @@ struct Pair<T>
     tag: u8
     val: T
 
-# sizeof(Pair<u64>) parses in neither compiler, so measure the array stride.
+# The array stride and sizeof (which parses since AGAST #3268) agree.
 fn main() -> i32
     var arr: [2]Pair<u64>
     arr[1].tag = 1
     arr[1].val = 41
     if @arr[1] as i64 - @arr[0] as i64 != 9
         return 1
+    if sizeof(Pair<u64>) != 9
+        return 2
     (arr[1].tag as u64 + arr[1].val) as i32
 """
 

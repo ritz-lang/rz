@@ -374,6 +374,25 @@ class Parser:
             self._reset(mark)
             return []
 
+    def _try_parse_sizeof_generic_type(self) -> Optional[rast.TypeExpr]:
+        """`Box<i64>` as sizeof's whole operand (AGAST #3268), else None.
+
+        Only a type that runs right up to sizeof's `)` counts: `sizeof(n < m)`
+        fails to parse as a type (or leaves tokens before the `)`), so the
+        parser backs up and reads it as the comparison it is.
+        """
+        mark = self._mark()
+        start = self._peek().span
+        try:
+            ty = self.parse_type()
+        except ParseError:
+            self._reset(mark)
+            return None
+        if not self._at(TokenType.RPAREN):
+            self._reset(mark)
+            return None
+        return rast.TypeExpr(start, ty)
+
     # Tokens that start an operand.  After a cast's closing `>` one of these
     # means the `<` ... `>` were comparisons: `f(a as Sz < b, c > d)`.
     _OPERAND_START = frozenset((
@@ -936,6 +955,13 @@ class Parser:
                     # expression (AGAST #2124), so read it as a type.
                     ty_start = self._peek().span
                     args.append(rast.TypeExpr(ty_start, self.parse_type()))
+                elif (isinstance(expr, rast.Ident) and expr.name == 'sizeof'
+                        and self._at(TokenType.IDENT)
+                        and self._peek(1).type == TokenType.LT
+                        and (sized := self._try_parse_sizeof_generic_type()) is not None):
+                    # `sizeof(Box<i64>)` (AGAST #3268): a generic instance
+                    # is a type, not `Box < i64 >` comparisons.
+                    args.append(sized)
                 elif not self._at(TokenType.RPAREN):
                     args.append(self.parse_expr())
                     # Skip any newlines after argument

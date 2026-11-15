@@ -943,6 +943,11 @@ class Monomorphizer:
         elif isinstance(expr, rast.Cast):
             self._visit_expr(expr.expr)
             self._visit_type(expr.target)
+        elif isinstance(expr, rast.TypeExpr):
+            # `sizeof(Box<i64>)` (AGAST #3268) may be Box<i64>'s only use:
+            # unvisited, it was never instantiated and the rewrite left a
+            # bare `Box`, which sized as the unspecialized template.
+            self._visit_type(expr.ty)
         elif isinstance(expr, rast.Range):
             if expr.start:
                 self._visit_expr(expr.start)

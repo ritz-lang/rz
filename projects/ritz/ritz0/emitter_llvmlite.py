@@ -907,7 +907,9 @@ class LLVMEmitter:
             # be materialized yet. Resolve it rather than guessing 8 bytes.
             if ty.args:
                 specialized = self._get_specialized_type_name(ty)
-                layout = self.struct_registry.get_layout(specialized)
+                # On demand: `Box$Box_i32` is defined before `Box$i32`, so its
+                # field `Box<i32>` sized as 8 by the fallback below (#3268).
+                layout = self._struct_layout_on_demand(specialized)
                 if layout:
                     return (layout.size, layout.alignment)
                 # Option<T> / Result<T, E> / generic user enums (#1923).
