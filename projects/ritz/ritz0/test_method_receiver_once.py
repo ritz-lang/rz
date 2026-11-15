@@ -185,11 +185,6 @@ fn ms() -> Span<u8>
 
 """
 
-# ritz1 evaluates these receivers once too, where it can compile them. What's
-# missing is something else, so each row cites its own ticket.
-BOTH_RITZ1 = ("ritz1", "ritz1_selfhosted")
-NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
-
 ARRAY = "var arr: [2]P = [P { x: 1 }, P { x: 2 }]\n    "
 NESTED = "var arr: [2]W = [W { p: P { x: 1 } }, W { p: P { x: 2 } }]\n    "
 
