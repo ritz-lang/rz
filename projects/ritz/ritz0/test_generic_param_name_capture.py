@@ -37,12 +37,12 @@ impl Drop for T
         self.id = 0
 """
 
-# A generic struct's literal without args names no instance (#3064), so
-# inference has no type for `t` and the call is the can't-infer error: the
-# struct `T` doesn't bind the parameter `T`.
+# A tuple literal is untyped to inference (#3064), so it has no type for `t`
+# and the call is the can't-infer error: the struct `T` doesn't bind the
+# parameter `T`.  (This used a generic struct's args-less literal, which is
+# refused itself since #3311.)
 UNINFERRED = ("fn take<T>(p: @T) -> T\n    *p\n" + STRUCT_T
-              + "struct Cell<T>\n    v: T\n"
-              + "pub fn main() -> i32\n    let t = Cell { v: 1 }\n"
+              + "pub fn main() -> i32\n    let t = (1, 2)\n"
                 "    let u = take(@t)\n    0\n")
 
 # The ticket's program in one module.  `let t = T {...}` is a `T`-the-struct,
@@ -88,7 +88,7 @@ def compile_with(ritz1_bin, tmp_path):
 def test_struct_named_like_the_param_does_not_bind_it(compile_with, compiler):
     comp, ll, _ = compile_with(compiler, "uninferred", UNINFERRED)
     assert _refusal(comp, ll, UNINFERRED) == (
-        "12:13", "can't infer `T` for `take`: write `take<T>(...)`")
+        "10:13", "can't infer `T` for `take`: write `take<T>(...)`")
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

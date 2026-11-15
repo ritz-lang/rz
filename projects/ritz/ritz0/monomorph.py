@@ -521,8 +521,28 @@ class Monomorphizer:
                     self.var_types[node.name] = inferred
         elif isinstance(node, rast.Call):
             self._infer_one_call(node)
+        elif isinstance(node, rast.StructLit):
+            self._check_struct_lit_args(node)
         elif isinstance(node, rast.Match) and node.ctor_type is None:
             node.ctor_type = self._infer_variant_scrutinee(node.expr)
+
+    def _check_struct_lit_args(self, lit: rast.StructLit) -> None:
+        """A generic struct's literal names its type args (AGAST #3311).
+
+        `Box2 { v: x }` for `struct Box2<X>` names no instance: the emitter
+        crashed on it (`Unknown struct: Box2`).  Inferring the args from the
+        fields, as a generic call's are, is a language question LANGUAGE_SPEC
+        leaves open, so the literal is a located error wherever it is written,
+        generic templates and impl<T> methods too.  ritz1's
+        gi_check_struct_lit_args gives the same message.
+        """
+        struct_def = self.generic_structs.get(lit.name)
+        if struct_def is None or lit.type_args:
+            return
+        args = ", ".join(struct_def.type_params)
+        raise GenericInferError(
+            f"`{lit.name}` is generic: write its type arguments, "
+            f"`{lit.name}<{args}> {{ .. }}`", lit.span)
 
     def _generic_variant(self, name: str):
         """(enum, variant) when `name` is a variant of a generic user enum and
@@ -1080,7 +1100,7 @@ class Monomorphizer:
         # `D { .. }` is a D, and `Box<i32> { .. }` a Box<i32>, so an
         # un-annotated `let t = D { .. }` binds T in `take(@t)` (AGAST #3064).
         # A generic struct's literal without args (`Cell { v: 3 }`) names no
-        # instance: it stays untyped, and such a call the can't-infer error.
+        # instance, and _check_struct_lit_args refuses it (#3311).
         if isinstance(expr, rast.StructLit):
             struct_def = self.struct_defs.get(expr.name)
             if struct_def is None:

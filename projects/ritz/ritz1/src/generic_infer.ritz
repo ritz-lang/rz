@@ -345,9 +345,9 @@ fn gi_type_of(m: *Module, e: *Expr, out: *GiType) -> i32
 
 # AGAST #3064: `D { .. }` is a D, and `Box<i32> { .. }` (parsed as `Box$i32`)
 # a Box$i32, so an un-annotated `let t = D { .. }` binds T in `take(@t)`.  A
-# generic struct's literal without args (`Cell { v: 3 }`) names no instance:
-# it stays untyped, and such a call the can't-infer error.  A tuple literal
-# (no name) is untyped too.  Mirrors ritz0's _infer_value_type.
+# generic struct's literal without args (`Cell { v: 3 }`) names no instance,
+# and gi_check_struct_lit_args refuses it (#3311).  A tuple literal (no name)
+# is untyped.  Mirrors ritz0's _infer_value_type.
 fn gi_struct_lit_type(m: *Module, e: *Expr, out: *GiType) -> i32
     if e.ident_ptr == null or e.ident_len <= 0
         return 0
@@ -775,6 +775,44 @@ fn gi_walk_stmt(m: *Module, s: *Stmt)
         gi_walk_expr(m, s.if_cond)
         gi_walk_arms(m, s.if_then as *MatchArm)
 
+# AGAST #3311: a generic struct's literal names its type args.  `Box2 { v: x }`
+# for `struct Box2<X>` names no instance (`Box2<T> { .. }` parses as the name
+# `Box2$T`), and ritz1 wrote `alloca %Box2`, unsized, or an unrelated error.
+# Inferring the args from the fields is a language question LANGUAGE_SPEC
+# leaves open, so it's a located error, as ritz0's _check_struct_lit_args:
+#     file:line:col: `Box2` is generic: write its type arguments, `Box2<X> { .. }`
+fn gi_check_struct_lit_args(m: *Module, e: *Expr)
+    if e.ident_ptr == null or e.ident_len <= 0
+        return
+    if find_concrete_struct(m, e.ident_ptr, e.ident_len) != null
+        return
+    # A tuple over a generic parameter (`tuple_T_T`, #2975) is a template
+    # struct the compiler names and substitutes itself, not a written literal.
+    if tuple_reg_lookup(e.ident_ptr, e.ident_len) != null
+        return
+    let st: *StructDef = find_generic_struct(m, e.ident_ptr, e.ident_len)
+    if st == null
+        return
+    eprints_cstr(c"error: ")
+    eprints_cstr(g_gi_file)
+    eprint_char(':')
+    eprint_i64(e.span.line as i64)
+    eprint_char(':')
+    eprint_i64(e.span.col as i64)
+    eprints_cstr(c": `")
+    gi_eprint_n(e.ident_ptr, e.ident_len)
+    eprints_cstr(c"` is generic: write its type arguments, `")
+    gi_eprint_n(e.ident_ptr, e.ident_len)
+    eprint_char('<')
+    var tp: *TypeParam = st.type_params
+    while tp != null
+        gi_eprint_n(tp.name, tp.name_len)
+        if tp.next != null
+            eprints_cstr(c", ")
+        tp = tp.next
+    eprints_cstr(c"> { .. }`\n")
+    g_gi_errors = g_gi_errors + 1
+
 fn gi_walk_list(m: *Module, list: *Expr)
     var cur: *Expr = list
     while cur != null
@@ -789,6 +827,7 @@ fn gi_walk_expr(m: *Module, e: *Expr)
         gi_walk_list(m, e.args)
         gi_infer_call(m, e)
     else if k == EXPR_STRUCT_LIT
+        gi_check_struct_lit_args(m, e)
         # The field inits are a *FieldInit list recast to *Expr.
         var fi: *FieldInit = e.args as *FieldInit
         while fi != null
