@@ -13,10 +13,14 @@ those types don't exist without a declaration.  The impl is now a located
 "unknown type `Foo`" at the impl's type name (after `for` in a trait impl)
 on ritz0, ritz1 and ritz1_selfhosted.
 
-A type the module declares (before or after the impl) or imports, a
-primitive, or a type alias is known, and its impl is unaffected: the
-controls below, and every ritzlib/corpus impl, which all target a type their
-own file declares (measured 2026-11-15: 0 sites refused).
+A type the module declares (before or after the impl) or imports, or a
+primitive, is known, and its impl is unaffected: the controls below, and
+every ritzlib/corpus impl, which all target a type their own file declares
+(measured 2026-11-15: 0 sites refused).
+
+A type alias is known but can't be an impl target (LARB R35, #3368): `type
+Id = Foo` then `impl Id` is "`Id` is a type alias for `Foo`: write `impl
+Foo`", at `Id`.
 """
 
 import pytest
@@ -131,23 +135,48 @@ def test_impl_on_known_type_accepted(request, tmp_path, compiler, row):
     assert _run(compiler, tmp_path, row, PRELUDE + KNOWN[row]) == 7
 
 
-# Known, and only compiled: whether an alias's impl methods are reachable is
-# #3287 (unreachable on all three today; ritz1 can't lower `self.x` in its
-# body), and a blanket impl's is R15/R17's.
-COMPILES = {
-    "alias": """\
+# An impl on a type alias (LARB R35, #3368), inherent or trait: located at
+# the alias name, both spelled "write `impl Foo`".  ritz0 only until ritz1
+# applies R35 (#3369), which adds ritz1 and ritz1_selfhosted here.
+ALIAS_ROWS = {
+    "inherent": """\
 struct Foo
     x: i32
 
 type Id = Foo
 
-impl Id
+impl ^Id
     fn zz(self: @Foo) -> i32
         return 7
 
 pub fn main() -> i32
-    return 7
+    return 0
 """,
+    "trait": """\
+struct Foo
+    x: i32
+
+type Id = Foo
+
+impl Speak for ^Id
+    fn say(self: @Foo) -> i32
+        return 7
+
+pub fn main() -> i32
+    return 0
+""",
+}
+
+
+@pytest.mark.parametrize("row", sorted(ALIAS_ROWS))
+def test_impl_on_alias_refused(tmp_path, row):
+    _assert_refused("ritz0", tmp_path, f"alias_{row}", PRELUDE + ALIAS_ROWS[row],
+                    "`Id` is a type alias for `Foo`: write `impl Foo`")
+
+
+# Known, and only compiled: a blanket impl's methods' reachability is
+# R15/R17's.
+COMPILES = {
     "simd": """\
 impl Speak for v4i32
     fn say(self: @v4i32) -> i32

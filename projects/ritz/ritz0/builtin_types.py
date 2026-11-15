@@ -16,6 +16,7 @@ rule (main.ritz, refuse_impls_on_builtin_types).
 """
 
 import ritz_ast as rast
+from metadata import type_to_string
 from name_resolver import NameResolver
 
 # Built-in type -> the ritzlib module that declares it as an ordinary type.
@@ -51,21 +52,35 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
 
     `impl Foo` with no `struct Foo` / `enum Foo` in scope compiled, and its
     methods were unreachable; so did `impl Vec<u8>` without ritzlib.vec.
-    Located at the impl's type name.  Known: a struct, enum or type alias of
-    the merged module (an import counts), a name the resolver has built in
+    Located at the impl's type name.  Known: a struct or enum of the merged
+    module (an import counts), a name the resolver has built in
     (a primitive, a SIMD vector, a built-in type: an impl on one of the last
     is check_builtin_impls's error), or one of the impl's own type
     parameters.  Only parsed impls carry `type_span`; one loaded from a module
-    interface was checked when its own module compiled.  ritz1 says the same
-    (monomorph.ritz, refuse_impls_on_unknown_types)."""
+    interface was checked when its own module compiled.  An impl on a type
+    alias of the merged module is "`Id` is a type alias for `Foo`: write
+    `impl Foo`" at the same place (LARB R35).  ritz1 says the same for an
+    unknown type (monomorph.ritz, refuse_impls_on_unknown_types); its alias
+    refusal is #3369."""
     known = {item.name for item in module.items
-             if isinstance(item, (rast.StructDef, rast.EnumDef, rast.TypeAlias))}
+             if isinstance(item, (rast.StructDef, rast.EnumDef))}
+    # A type alias is known, but not an impl target (LARB R35, #3368): a
+    # type's methods live under the name it was declared with, and an alias
+    # of an imported type would be a way around #3256.
+    aliases = {item.name: item.target for item in module.items
+               if isinstance(item, rast.TypeAlias)}
     # Scalars, SIMD vectors and the built-ins.  Not `Self` (it names no type
     # outside an impl) or `void`: ritz1 knows neither as an impl target.
     known |= NameResolver.BUILTIN_TYPES - {'Self', 'void'}
-    return [f"{item.type_span}: unknown type `{item.type_name}`"
-            for item in module.items
-            if isinstance(item, rast.ImplBlock)
-            and hasattr(item, 'type_span')
-            and item.type_name not in known
-            and item.type_name not in item.type_params]
+    errors = []
+    for item in module.items:
+        if (not isinstance(item, rast.ImplBlock) or not hasattr(item, 'type_span')
+                or item.type_name in item.type_params):
+            continue
+        if item.type_name in aliases:
+            target = type_to_string(aliases[item.type_name])
+            errors.append(f"{item.type_span}: `{item.type_name}` is a type alias "
+                          f"for `{target}`: write `impl {target}`")
+        elif item.type_name not in known:
+            errors.append(f"{item.type_span}: unknown type `{item.type_name}`")
+    return errors
