@@ -2815,9 +2815,17 @@ def _declared_test_source_files(pkg_dir: Path, config: dict) -> list[Path]:
     Dirs are searched recursively; a module with no `[[test]]` line is not
     taken, since it would report "ran 0 tests" and fail. Until AGAST #3279
     build.py read no key for this and angelo's tests ran under no gate.
+
+    Only the `[test]` table counts. `[[test]]` in ritz.toml (goliath, spire)
+    parses as a list of entry-point test binaries whose `sources` feed their
+    builds, not this discovery; reading it as the table crashed `rz test`
+    for both (AGAST #3290).
     """
+    test_cfg = config.get("test")
+    if not isinstance(test_cfg, dict):
+        return []
     found = []
-    for rel in config.get("test", {}).get("sources", []):
+    for rel in test_cfg.get("sources", []):
         d = pkg_dir / rel
         if not d.is_dir():
             continue

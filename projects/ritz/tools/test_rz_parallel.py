@@ -491,6 +491,43 @@ class TestBuildPyUnits:
         (pkg / "src" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
         assert buildpy.discover_test_files(pkg, {"package": {"name": "p"}}) == []
 
+    def test_test_table_without_sources_adds_nothing(self, buildpy, tmp_path):
+        pkg = _pkg(tmp_path, test_only=False, files=[("t.ritz", "")])
+        (pkg / "src").mkdir()
+        (pkg / "src" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
+        cfg = {"package": {"name": "p"}, "test": {"timeout": 5}}
+        got = [p.relative_to(pkg).as_posix()
+               for p in buildpy.discover_test_files(pkg, cfg)]
+        assert got == ["test/t.ritz"]
+
+    def test_test_array_entries_add_nothing(self, buildpy, tmp_path):
+        # AGAST #3290: `[[test]]` in ritz.toml (goliath, spire) parses as a
+        # list of entry-point test binaries, not the `[test]` table; #3279
+        # called .get() on it and `rz test` crashed before running anything.
+        # Their `sources` feed those binaries' builds, not file discovery,
+        # which is what they did before #3279.
+        pkg = _pkg(tmp_path, test_only=False, files=[("t.ritz", "")])
+        (pkg / "src").mkdir()
+        (pkg / "src" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
+        cfg = buildpy.tomllib.loads(
+            '[package]\nname = "p"\n\n'
+            '[[test]]\nname = "a"\nentry = "test_a"\n\n'
+            '[[test]]\nname = "b"\nsources = ["src"]\nentry = "test::main"\n')
+        assert isinstance(cfg["test"], list)
+        got = [p.relative_to(pkg).as_posix()
+               for p in buildpy.discover_test_files(pkg, cfg)]
+        assert got == ["test/t.ritz"]
+
+    @pytest.mark.parametrize("name", ["goliath", "spire"])
+    def test_test_array_packages_discover_as_before_3279(self, buildpy, name):
+        # The two packages CI's test-all went red on: discovery must not
+        # raise, and must find exactly test/*.ritz as it did on e800f872.
+        pkg = PKG_DIR.parent / name
+        cfg = buildpy.tomllib.loads((pkg / "ritz.toml").read_text())
+        assert isinstance(cfg["test"], list)
+        got = buildpy.discover_test_files(pkg, cfg)
+        assert got == sorted((pkg / "test").glob("*.ritz"))
+
     def test_angelo_declares_its_in_source_tests(self, buildpy):
         # The package this was found in: its tests must stay discoverable.
         angelo = PKG_DIR.parent / "angelo"
