@@ -282,11 +282,25 @@ fn let_check_write(s: *EmitterState, stmt: *Stmt)
 # pair converts (#168), and an enum or a name find_struct doesn't know (an
 # alias) is left to the store.
 fn let_check_another_struct(s: *EmitterState, stmt: *Stmt)
-    let init: *Expr = stmt.var_init
+    if stmt.var_declared_type != TYPE_STRUCT
+        return
+    var src: *u8 = null
+    var src_len: i32 = 0
+    if another_struct_source(s, stmt.var_init, stmt.var_type_name, stmt.var_type_name_len, @src, @src_len) == 0
+        return
+    let_error(s, stmt.span.line, stmt.span.col, c"`", stmt.var_name, stmt.var_name_len, c"` is declared `")
+    let_eprint_name(stmt.var_type_name, stmt.var_type_name_len)
+    eprints_cstr(c"` but its initialiser is a `")
+    let_eprint_name(src, src_len)
+    eprints_cstr(c"`\n")
+
+# 1 when `init` is a known struct of another type than the known struct `want`,
+# with its name in `*out` / `*out_len` (AGAST #2293, #3293).
+fn another_struct_source(s: *EmitterState, init: *Expr, want: *u8, want_len: i32, out: **u8, out_len: *i32) -> i32
     if init == null or init.kind == EXPR_CAST
-        return
-    if stmt.var_declared_type != TYPE_STRUCT or stmt.var_type_name == null or stmt.var_type_name_len <= 0
-        return
+        return 0
+    if want == null or want_len <= 0
+        return 0
     var src: *u8 = null
     var src_len: i32 = 0
     resolve_expr_struct_name(s, init, @src, @src_len)
@@ -296,18 +310,33 @@ fn let_check_another_struct(s: *EmitterState, stmt: *Stmt)
         src = lent.type_name
         src_len = lent.type_name_len
     if src == null or src_len <= 0
-        return
-    if name_eq(src, src_len, stmt.var_type_name, stmt.var_type_name_len) == 1
-        return
-    if is_layout_equiv_pair(src, src_len, stmt.var_type_name, stmt.var_type_name_len) == 1
-        return
-    if find_struct(s, src, src_len) == null or find_struct(s, stmt.var_type_name, stmt.var_type_name_len) == null
-        return
-    let_error(s, stmt.span.line, stmt.span.col, c"`", stmt.var_name, stmt.var_name_len, c"` is declared `")
-    let_eprint_name(stmt.var_type_name, stmt.var_type_name_len)
-    eprints_cstr(c"` but its initialiser is a `")
+        return 0
+    if name_eq(src, src_len, want, want_len) == 1
+        return 0
+    if is_layout_equiv_pair(src, src_len, want, want_len) == 1
+        return 0
+    if find_struct(s, src, src_len) == null or find_struct(s, want, want_len) == null
+        return 0
+    *out = src
+    *out_len = src_len
+    return 1
+
+# AGAST #3293: `return c` or a tail `c`, with `c` a struct of another type than
+# the fn's `-> D`.  ritz1 loaded the `C` local's slot as a `%D` and returned it:
+# the bytes of a `C`, read as a `D`, with no error.  ritz0's
+# _reject_another_struct_return gives the same message (ritz0/let_rules.py).
+# (line, col) is the `return`, or the tail value.  1 when refused.
+pub fn return_check_another_struct(s: *EmitterState, e: *Expr, ret_type: i32, line: i32, col: i32) -> i32
+    if ret_type != TYPE_STRUCT
+        return 0
+    var src: *u8 = null
+    var src_len: i32 = 0
+    if another_struct_source(s, e, s.ret_type_name, s.ret_type_name_len, @src, @src_len) == 0
+        return 0
+    let_error(s, line, col, c"the fn is declared `-> ", s.ret_type_name, s.ret_type_name_len, c"` but its return value is a `")
     let_eprint_name(src, src_len)
     eprints_cstr(c"`\n")
+    return 1
 
 # Check one statement before it is emitted: its own write target, and every
 # `@&` in the expressions it evaluates.  Nested statement lists (if / while /

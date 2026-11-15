@@ -11,3 +11,11 @@ def another_struct(name: str, declared: str, actual: str) -> str:
     and reading one as the other would reinterpret its bytes.
     """
     return f"`{name}` is declared `{declared}` but its initialiser is a `{actual}`"
+
+
+def another_struct_return(declared: str, actual: str) -> str:
+    """`return c` / a tail `c` of a struct of type actual from a `-> declared` fn (AGAST #3293).
+
+    The same rule as another_struct, at the return slot.
+    """
+    return f"the fn is declared `-> {declared}` but its return value is a `{actual}`"

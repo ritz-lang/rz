@@ -42,7 +42,7 @@ import fast_link
 
 from array_rules import ELEMENT_MISMATCH
 from index_rules import needs_index
-from let_rules import another_struct
+from let_rules import another_struct, another_struct_return
 from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
 from test_ref_into_value import COMPILERS, _assert_refused
@@ -3402,24 +3402,6 @@ struct D
 """
 
 REFUSED_READS = {
-    "another_struct_return": ANOTHER_D + """
-fn f(c:& C) -> D
-    return c
-
-pub fn main() -> i32
-    var c: C = C { x: 3, y: 0 }
-    var d: D = f(@&c)
-    return d.a as i32
-""",
-    "another_struct_tail": ANOTHER_D + """
-fn f(c:& C) -> D
-    c
-
-pub fn main() -> i32
-    var c: C = C { x: 3, y: 0 }
-    var d: D = f(@&c)
-    return d.a as i32
-""",
     "another_struct_argument": ANOTHER_D + """
 fn g(d: D) -> i32
     return 3
@@ -3687,6 +3669,65 @@ pub fn main() -> i32
 def test_a_binding_of_another_struct_is_refused_at_the_binding(tmp_path, compiler, name):
     _assert_refused(compiler, tmp_path, f"binding_{name}", ANOTHER_D + ANOTHER_STRUCT_BINDING[name],
                     another_struct("d", "D", "C"))
+
+
+# AGAST #3293: a struct of another type returned, by `return` or as the tail, is
+# refused there, on all three compilers, in #2293's words.  ritz1 loaded a `C`
+# local's slot as the `D` and ran (rc 3); ritz0 and a borrow left it to clang.
+# `^` marks where it's reported: the `return`, or the tail value.
+ANOTHER_STRUCT_RETURN = {
+    "local_return": """
+fn f() -> D
+    var c: C = C { x: 3, y: 0 }
+    ^return c
+""",
+    "local_tail": """
+fn f() -> D
+    var c: C = C { x: 3, y: 0 }
+    ^c
+""",
+    "borrow_return": """
+fn f(c:& C) -> D
+    ^return c
+""",
+    "borrow_tail": """
+fn f(c:& C) -> D
+    ^c
+""",
+    "call_return": """
+fn mk() -> C
+    return C { x: 3, y: 0 }
+
+fn f() -> D
+    ^return mk()
+""",
+    # A `return` inside a match arm, and a method's tail.
+    "arm_return": """
+fn f(n: i32) -> D
+    var c: C = C { x: 3, y: 0 }
+    match n
+        0 => ^return c
+        _ => return D { a: 1, b: 2 }
+""",
+    "method_tail": """
+impl C
+    fn as_d(self: C) -> D
+        let c: C = self
+        ^c
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ANOTHER_STRUCT_RETURN))
+def test_a_struct_of_another_type_returned_is_refused_at_the_return(tmp_path, compiler, name):
+    program = ANOTHER_D + ANOTHER_STRUCT_RETURN[name] + """
+pub fn main() -> i32
+    return 3
+"""
+    _assert_refused(compiler, tmp_path, f"return_{name}", program,
+                    another_struct_return("D", "C"))
 
 
 # A written reference returned is the caller's address.

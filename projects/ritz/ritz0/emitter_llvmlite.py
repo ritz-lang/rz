@@ -5424,6 +5424,8 @@ class LLVMEmitter:
                     self._reject_struct_as_int(
                         last_val, ret_type, fn_def.ret_type, fn_def.body.expr,
                         getattr(fn_def.body.expr, 'span', None))
+                    self._reject_another_struct_return(
+                        last_val, ret_type, getattr(fn_def.body.expr, 'span', None))
                 last_val = self._convert_type(last_val, ret_type, fn_def.body.expr)
                 # A fn with no declared return type is a procedure: its tail
                 # expression is evaluated for effect only. _convert_type
@@ -6188,6 +6190,7 @@ class LLVMEmitter:
                 ret_span = getattr(stmt.value, 'span', None) or getattr(stmt, 'span', None)
                 self._reject_enum_as_int(val, ret_type, ret_ritz, ret_span)
                 self._reject_struct_as_int(val, ret_type, ret_ritz, stmt.value, ret_span)
+                self._reject_another_struct_return(val, ret_type, getattr(stmt, 'span', None) or ret_span)
                 val = self._convert_type(val, ret_type, stmt.value)
                 # Emit drops for all scopes before return (excluding moved variable)
                 self._emit_drop_for_all_scopes(exclude_var)
@@ -10714,6 +10717,7 @@ class LLVMEmitter:
             ret_span = getattr(expr.value, 'span', None) or getattr(expr, 'span', None)
             self._reject_enum_as_int(ret_val, ret_type, ret_ritz, ret_span)
             self._reject_struct_as_int(ret_val, ret_type, ret_ritz, expr.value, ret_span)
+            self._reject_another_struct_return(ret_val, ret_type, getattr(expr, 'span', None) or ret_span)
             ret_val = self._convert_type(ret_val, ret_type)
             self._emit_drop_for_all_scopes()
             self.builder.ret(ret_val)
@@ -14671,19 +14675,37 @@ class LLVMEmitter:
         before conversion, at the binding, with the message ritz1 gives
         (ritz1/src/let_check.ritz).
         """
-        if not isinstance(declared_ty, ir.IdentifiedStructType):
-            return
+        pair = self._another_struct_pair(val, declared_ty)
+        if pair is not None:
+            raise EmitError(let_rules.another_struct(stmt.name, *pair),
+                            getattr(stmt, "span", None))
+
+    def _another_struct_pair(self, val: ir.Value, declared_ty: ir.Type):
+        """(declared, actual) struct names when `val` is a struct of another type
+        than `declared_ty`, else None (AGAST #2293, #3293)."""
+        if val is ir.Undefined or not isinstance(declared_ty, ir.IdentifiedStructType):
+            return None
         actual = val.type
         if isinstance(actual, ir.PointerType) and isinstance(actual.pointee, ir.IdentifiedStructType):
             actual = actual.pointee
         if not isinstance(actual, ir.IdentifiedStructType) or actual == declared_ty:
-            return
+            return None
         declared = self._get_struct_name_from_type(declared_ty)
         found = self._get_struct_name_from_type(actual)
         if declared is None or found is None or declared == found:
-            return
-        raise EmitError(let_rules.another_struct(stmt.name, declared, found),
-                        getattr(stmt, "span", None))
+            return None
+        return declared, found
+
+    def _reject_another_struct_return(self, val: ir.Value, ret_type: ir.Type, span) -> None:
+        """Refuse `return c` / a tail `c` of a struct of another type (AGAST #3293).
+
+        _convert_type hands it back unchanged, so `ret %C` in a `-> D` fn
+        reached clang, unlocated.  `span` is the `return`, or the tail value.
+        Same rule and wording as _reject_another_struct (ritz1/src/let_check.ritz).
+        """
+        pair = self._another_struct_pair(val, ret_type)
+        if pair is not None:
+            raise EmitError(let_rules.another_struct_return(*pair), span)
 
     def _format_ritz_type(self, ty: rast.Type) -> str:
         """Best-effort source spelling of a declared type, for diagnostics."""
