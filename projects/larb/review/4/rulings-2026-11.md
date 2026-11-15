@@ -1432,3 +1432,188 @@ Aaron confirmed R31a on 2026-11-15 04:48Z ("you can delete them as you want").
 
 The ticket is `ready` with the scope: delete the file and the entry, leave the
 archive, and `git grep ab_test` outside the archive and LARB prints nothing.
+
+## Batch of 2026-11-15 (afternoon): R34–R49
+
+Asked by rz for Aaron (15:38 UTC). Each ruling is on its ticket as a "LARB
+ruling:" paragraph, with ritz0 and ritz1 implementation tickets that depend on
+it. Corpus counts are text searches of `projects/` (archive excluded) at
+`d4da30ff` unless the ticket already had a measurement; ritz0 probes only, no
+ritz1 build. Spec sections are edited in the same commit; examples that can't
+compile yet are `text`.
+
+**Theme.** Most of these close a gap where one compiler quietly does something
+the spec never said: wrapping an int into a struct, zero-filling a short
+literal, converting a literal to `String`, an impl on an alias or a primitive.
+Following R15–R33, the answer is a located error unless the behaviour is both
+safe and something a reader would expect from the source.
+
+### R34: moving out of a global (#3280): REFUSE
+A move-only value can't be moved out of a global or a field of one: "cannot move
+out of global `G`: borrow it with `@G.t`". A global is never dropped and any
+function can read it, so moves out of it can't be tracked; per-function tracking
+would miss other functions and later calls. Rust's E0507. Cost: 0 of 1020 global
+references are move-only (#2269's measurement). Reverses #2269's "allowed"
+(§13.2 edited).
+
+### R35: `impl` on a type alias (#3287): REFUSE
+"`Id` is a type alias for `Foo`: write `impl Foo`", at the alias name. Aliases
+aren't even resolved at use sites yet (§3.8), and an alias of an imported type
+would be a back door around #3256 (impls on other modules' types). Cost: 0.
+
+### R36: `impl` on a primitive (#3288): REFUSE, revisit with #1621/#3256
+`impl u8` and `impl Speak for i32` are errors at the type. Primitives are
+built-ins, closed like `Span` (R26). An inherent impl on `i32` is extension of a
+type the module didn't declare, which is #3256's open question; a trait impl is
+only useful once trait bounds exist (#1621), when it should come back as part of
+that design. Cost: 0. ritz1 must parse a primitive in the impl target so it can
+give the located error instead of "Parse error at pos 64".
+
+### R37: free name of a generic instance method (#3285): NONE; `$` is not source
+R10's `Type_method` free spelling covers non-generic impls only. `W_bump(w)` for
+`impl<T> W<T>` is an error telling you to write `w.bump()`, and `$` is never an
+identifier character, so `W$i32_bump` (ritz1's internal mangling) is a located
+lexer error. Inferring `W_bump(w)` like a generic call is possible later, but
+nothing asks for it. Cost: 0 source uses of `$` outside comments. §2.5 and §5.4
+edited.
+
+### R38: untyped global (#3039): REQUIRE THE TYPE
+`var g = true` at module level is an error at `=`. Consts already require a
+type (§4.3); a global is an interface shared by every function, and R21 would
+make `var g = 5` silently `i64`. ritz1 already refuses (with a parse error);
+ritz0 refuses with the same located message. Cost: 0 unannotated globals.
+
+### R39: element store and N-D drop (#3305): DROP THE OLD ELEMENT; INITIALISE DROP ARRAYS
+`a[i] = v` drops the old element after `v` and `i` are evaluated, as R-era
+field stores already do (§13.6). Rank-2+ arrays drop in index order at scope
+end, like rank 1. The init story: an array whose element type has drop glue
+must be initialised at its declaration (`var a: [2]S` alone is an error), so an
+element always holds a value to drop; elements can't be moved out (§13.2).
+Cost: 0 uninitialised Drop arrays (13 uninitialised Drop *struct* locals, the
+`var b: Box<T>` constructor idiom, are untouched). Note: a fill of a move-only
+value fills at most one (§3.3), so an `[N]S` of a Drop type needs a full
+literal; a fill helper can come later if anyone needs one.
+
+### R40: `for plane in g` over rank 3+ (#3307): THE ELEMENT IS ONE RANK DOWN
+Same rule as rank 2, with no special case: the binding is a `[M][K]T` copy, and
+indexes and iterates as a local of that type. ritz0's `plane[1][2]` crash is a
+bug; ritz1 replaces its located refusal with an N-D loop local.
+
+### R41: calling a fn-pointer field (#2218): `h.f(1)` CALLS THE FIELD
+A method `f` wins; otherwise a `fn(...)` field `f` is called with exactly the
+written arguments. If both exist the call is an error asking for `(h.f)(1)`,
+which always calls the field (ritz0 already accepts that form). Not a fallback
+in R24's sense: R24 refused reaching a *free* fn by name; here the struct
+declares the field. Fixes lexis `matching.ritz:225` with no source change.
+
+### R42: short array literal (#3315): REFUSE
+The literal's length must equal `N`, list or fill. No zero-filling: that's the
+C behaviour Aaron called a footgun (R20), and `[0; N]` says it explicitly.
+Cost: 1 site, `ritz0/test/test_issue_slice_generic_siblings.ritz:137`
+(`test_array_literal_shorter_than_declared`), which pins the zero-fill and flips.
+
+### R43: mixed int/float arms (#3312): ritz0'S RULE, ORDER-FREE, ALL SLOTS
+Without a float slot, an int arm next to a float arm is an error in either
+order. A float slot (annotated `let`/`var`, a `return` or tail in a `-> f64`
+fn, an `f64` parameter) converts integer *literal* arms; a non-literal int arm
+needs `as f64` (ritz0 already says "implicit conversion ... can lose
+precision"). ritz1 stops letting the first float arm decide; ritz0 adds the
+return and parameter slots, matching §3.3's list of slots.
+
+### R44: inferring a generic struct literal's args (#3314): NOT NOW (status quo)
+`Box2 { v: x }` stays #3311's located error. 0 uses, and the refusal is already
+built on all three. Inference has real precedent (§4.4 calls, #2927 enum
+constructors), so this is a question of taste for Aaron, not a ruling against it:
+**Q: should `Box2 { v: x }` infer `Box2<T>` from its fields and slot?** If yes, a
+ticket follows (ritz0 `_check_struct_lit_args`, ritz1 `gi_check_struct_lit_args`,
+fill `StructLit.type_args`). No implementation tickets until he answers.
+
+### R45: ritz1 `weak_odr` (#1640): ALIGN LINKAGE WITH VISIBILITY
+Not a spec matter, but it is observable: `weak_odr` tells the linker that
+every definition of a name is the same, so two modules' *private* `fn helper()`
+with different bodies would be silently merged into one. ritz0 gives private fns
+internal linkage. Rule for ritz1: a private fn is `internal`, a `pub` fn
+`define` (external), `main` external, a monomorph `linkonce_odr`. An impl method
+is emitted only by the module that declares the impl; if ritz1 emits it from
+several `.ll` files today (#194's comment), that is the bug to fix, not a
+reason for `weak_odr`. ritz1 only; gates matrix-full and regression.sh, as #1640
+says.
+
+### R46: deeper-indented continuation (#2193): ACCEPT
+After a line ending in a binary operator or `as`, the next line opens and closes
+no block; it must be indented at least as far as the statement. Shallower is an
+error at that line. ritz0 must also ignore indentation inside brackets, which
+the spec already said (that part is a bug, not a ruling). Lets a continuation
+line up under its operand, the usual style, and the two prism sites #1696
+rewrote can go back if anyone wants.
+
+### R47: an int argument for a single-field struct (#3336): REFUSE
+Nothing converts to a struct; a literal is the only way to make one (§9.2):
+"argument 1 of `f` has the wrong type". ritz1's call_check drops its int
+exemption. The ticket asked for a corpus measurement; a text search can't see
+this, so the ritz0 ticket runs `./rz build --all` with the new error first and
+migrates each site to `S { x: n }`, reporting the count in its REAP.
+
+### R48: `@A[i]` of a const array (#3359): LEGAL, AS `@T`
+`@A[i]` is `@T` and `@A` is `@[N]T`, pointing into the read-only global. `@x`
+means a shared borrow everywhere else, and a shared borrow can't write, so this
+is safe by the type system; `@&A[i]` stays an error. Writing would need an
+explicit cast to `*T`, the same as for a string literal's bytes. A const scalar
+has no storage, so `@N` stays an error. Reverses #3337's interim refusal.
+Useful for `const KS: [N]StrView` tables passed to `@StrView` params without a
+copy.
+
+### R49: `let s: String = "abc"` (#3361): REFUSE (§3.5 and ritz1 are right)
+A literal is a `StrView`, or a `*u8` in a `*u8` slot, and nothing else converts
+(§3.5). A `String` allocates, and that should be visible: write
+`string_from("abc")`. ritz0's conversion predates §3.5. Cost: 4 lines in
+`ritz0/test/test_native_string.ritz` (with the pin in `test_utf8_literal_len`
+and #3347's `test_string_literal_no_import.py`).
+
+**Implementation tickets** (each `pending`, depending on its ruling ticket; rz
+completes the ruling tickets when this commit merges): R34 #3366/#3367, R35
+#3368/#3369, R36 #3370/#3371, R37 #3372/#3373, R38 #3374/#3375, R39 #3376 then
+#3377, R40 #3378/#3379, R41 #3380/#3381, R42 #3382/#3383, R43 #3384/#3385, R45
+#3386 (ritz1 only), R46 #3387/#3388, R47 #3389/#3390, R48 #3391/#3392, R49 #3393
+(ritz0; ritz1 already refuses). R44 has none until Aaron answers.
+
+### R50: inline assembly design (#1619): spec §18.6
+
+R7 (#1825) settled the shape: `asm ARCH (clauses):` with raw-text lines, AT&T,
+declared direction, textual clobbers plus memory and flags. #1619 is now the
+only thing stopping ritz1 from building cryptosec, so §18.6 writes the whole
+design down and settles what R7 left open:
+
+- **Text handling.** Only three rewrites: `{name}` to its register, `{{`/`}}`,
+  and `#`-to-end-of-line comments dropped. `$` and `%` are literal; ritz0's
+  reading of `$$42` as `$42` goes (1 site, `test_packed_naked.ritz:74`).
+- **Labels.** Numeric local labels only; a named label is an error, since an
+  inlined function would define it twice (#1371). 0 named labels in the 76 blocks.
+- **Operands.** Integers and pointers (`*T`, `@T`, `@&T`); `bool` is out, because
+  an `i1` fits no register constraint. Width from the Ritz type. `out`/`inout`
+  need an assignable place and count as an assignment for §13.5. A pinned
+  operand needn't appear in the text; an unpinned clause operand must.
+  `rsp`/`rbp` can't be pinned or clobbered.
+- **Lowering**, identical on both compilers: `asm sideeffect`, AT&T; outputs
+  `=&r` (early-clobber, since a block may write an output before reading every
+  input) or `={reg}`; inputs `r`/`{reg}`; `inout` tied by index; clobbers
+  `~{reg}` for every GPR in the text and each `clobber`, then
+  `~{memory},~{dirflag},~{fpsr},~{flags}`; void, one type, or a literal struct.
+- **Control** is assumed to fall out of the block's end; a block that never
+  comes back is followed by `loop`.
+- **Errors**: the located list at the end of §18.6.
+
+**What cryptosec needs** is the smallest part: one input pointer in a memory
+operand (`nopl ({ptr})`), side effects and the memory clobber, no outputs and no
+`$`. That is why ritz1 goes first, and why its first lowering ticket can land
+without ritz0's migration.
+
+**Cost.** 76 non-doc blocks in 26 files (R7 counted 67 in 20). 11 rely on
+output sniffing (harland 9, indium 2) and get `(out x)`; 1 `$$`. None in ritzlib.
+
+**Tickets, in order:** #3394 ritz1 lex/parse (raw lines, clauses, STMT_ASM, the
+walkers) → #3395 ritz1 lowering, `[[naked]]`, test_asm and cryptosec's barrier
+(unblocks #3265) ; #3396 ritz0 conformance and the harland/indium migration
+(parallel with ritz1) ; #3397 syscall shims into `ritzlib.sys` (after both;
+finishes #1825). Until #3396 lands, ritz1 compiles harland's 11 sniffed blocks
+without their outputs, so harland must not be built with ritz1 before then.

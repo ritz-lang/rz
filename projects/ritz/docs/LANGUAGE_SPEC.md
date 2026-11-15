@@ -138,10 +138,24 @@ fn pack(r: u8, g: u8) -> u32
 
 A line that does not end in an operator ends the statement, even when the
 next line could carry on the expression: `x = x + 1` followed by `-x` is two
-statements. A continuation indented *deeper* than its first line is not
-accepted: the indent opens a block, and the operator is left without a right
-operand. Whether it should be is AGAST #2193, undecided. Inside `(`, `[` or
-`{` line breaks and indentation are ignored altogether.
+statements. Inside `(`, `[` or `{` line breaks and indentation are ignored
+altogether.
+
+A continuation may also be indented *deeper* than the statement's first line,
+so it can line up under what it continues (LARB R46, AGAST #2193). After a
+line that ends in an operator, the next line opens no block and closes none:
+its indent only has to be at least the statement's own. A continuation
+indented *less* than the statement is an error at that line. The line after
+the expression ends is measured against the statement's first line as usual.
+ritz0 and ritz1 don't accept this yet (#2193's implementation tickets), so the
+example is text:
+
+```text
+fn mixed(a: bool, b: bool, c: bool, d: bool) -> bool
+    let h = (a or b) and
+            c and d          # deeper continuation: one expression
+    h
+```
 
 ### 2.3 Comments
 
@@ -170,9 +184,8 @@ special meaning by convention (`self` as a method receiver name, `pass` as a
 no-op expression that evaluates to `0`). `mut` is reserved but only valid in
 `*mut T`; `let mut` was removed by RERITZ (see [§4.2](#42-mutable-bindings-var)).
 
-`asm` is reserved but has no syntax behind it yet; it is listed here because
-using it as an identifier is an error, which is the only thing a reader needs
-from this table:
+`asm` starts an inline assembly block ([§18.6](#186-inline-assembly)), so it
+can't be used as an identifier:
 
 ```ritz body expect-error="Expected IDENT, got ASM"
 let asm = 1
@@ -185,6 +198,10 @@ Identifiers begin with a letter or underscore, followed by letters, digits, or u
 ```
 identifier := [a-zA-Z_][a-zA-Z0-9_]*
 ```
+
+`$` is never part of an identifier. Compilers use it inside generated names
+(`W$i32_bump`, a monomorph), and those names can't be written in source; a `$`
+outside an `asm` body is a located error (LARB R37, AGAST #3285).
 
 ### 2.6 Literals
 
@@ -751,6 +768,22 @@ var bytes: [4]u8 = [1, 2, 3, 200]
 var words: [4]i32 = [0; 4]
 ```
 
+The literal's length must be the slot's `N` exactly, for a list and a fill
+alike. A shorter or longer one is an error at the literal; nothing is
+zero-filled (LARB R42, AGAST #3315). Write `[0; N]` and then store the
+elements you mean. ritz0 still zero-fills a short literal until #3315's
+implementation tickets land:
+
+```text
+let a: [3]i64 = [1, 2]       # error: an array literal of 2 elements for a `[3]i64`
+let b: [3]i64 = [7; 2]       # error: the same
+```
+
+An array whose element type has drop glue (§13.6) must be initialised where it is
+declared: `var a: [2]S` with no `=` is an error at the name (LARB R39, AGAST
+#3305). Storing an element drops the old one, so every element must always hold
+a value.
+
 Anything else already has its type, and fits an `[N]T2` only if it is an `[N]T2`.
 That holds at every store: an argument, `let`, `var`, `=`, `*p =`, a global, a
 field, a `return`, and under `as`. There's no widening, narrowing or sign change
@@ -872,6 +905,10 @@ fn main() -> i32
     n as i32
 ```
 
+A literal doesn't fit a `String` slot either: `let s: String = "abc"` is an
+error at the literal, and you write `string_from("abc")` (LARB R49, AGAST #3361;
+ritz1 already refuses it, and ritz0 still converts it until #3361's ticket lands).
+
 A string literal fits a `*u8` slot ([§2.6](#26-literals)). Nothing else converts,
 because a `StrView` may be a slice with no terminator and a `String` has to be
 asked for one. `sv as *u8` is refused too. Write `.ptr` if you know the view is
@@ -928,6 +965,10 @@ Two limitations in ritz0 today, both worth knowing before you reach for `type`:
 - An alias is accepted at its declaration but is not resolved at use sites, so
   a variable annotated `IntPtr` does not behave as `*i32`. Prefer spelling the
   underlying type until this is fixed.
+
+An `impl` can't target an alias. `type Id = Foo` then `impl Id` is an error at
+`Id`: "`Id` is a type alias for `Foo`: write `impl Foo`" (LARB R35, AGAST
+#3287). A type's methods live under the one name it was declared with.
 
 ---
 
@@ -1020,6 +1061,17 @@ const PI: f64 = 3.14159265358979
 ```
 
 Constants must have explicit types and compile-time values.
+
+So must a global `var` or `let`: `var g = true` at module level is an error at
+`=`, "a global needs a type: write `var g: bool = ...`" (LARB R38, AGAST #3039).
+A global is shared by every function, so its type is written where it is
+declared rather than read off a literal (§7.4 would make `var g = 5` an `i64`).
+
+`@A[i]` and `@A` of a `const` array are shared references, `@T` and `@[N]T`,
+into its read-only data (LARB R48, AGAST #3359). `@&A[i]` stays an error, since
+a const is never a place you can write. A `const` scalar has no storage, so
+`@N` of one is an error. Until #3359's tickets land, both compilers refuse
+`@A[i]` as well (#3337).
 
 #### One meaning per name
 
@@ -1348,6 +1400,8 @@ fn demo_levels() -> i32
 
 A method's mangled name `Type_method` is a name a program may call, with the receiver as its first argument: `c.after()` and `Counter_after(c)` mean the same thing (LARB R10).
 
+That holds for a non-generic `impl` only. A method of a generic `impl<T> W<T>` has no free name: `W_bump(w)` is an error, "`bump` is a method of generic `W<T>`: call it as `w.bump()`", and the compiler's internal instance name (`W$i32_bump`) can't be written, since `$` isn't an identifier character (§2.5; LARB R37, AGAST #3285).
+
 `Type.m()` is for a method without `self`, such as a constructor `Reader.new(@data)`. A type isn't a receiver, so `Type.m(...)` of a method with `self` is an error however `self` is spelled. Write `c.m()` or `Type_m(@&c)` instead (`Type_m(c)` for a by-value `self`).
 
 ```ritz expect-error="Static method call Type.method() but method 'get' expects 'self' parameter: write `c.get()` or `C_get(@&c)`"
@@ -1430,6 +1484,22 @@ Two spellings do *not* work, both failing with `Unknown function: f`:
 
 Until those are fixed, spell the `fn(...)` type out at the parameter, or
 dispatch through an `impl` method or a `match`.
+
+A struct field of function type is called like a method (LARB R41, AGAST #2218):
+`h.f(1)` calls the method `f` if the type has one, and otherwise the field `f` if
+it is a `fn(...)`. `h` isn't passed; the arguments are exactly those written. If
+the type has both a method and a fn field named `f`, `h.f(1)` is an error,
+"`f` is both a method and a field of `H`: write `(h.f)(1)` for the field".
+`(h.f)(1)` always calls the field. ritz0 accepts only the parenthesised form
+until #2218's tickets land:
+
+```text
+struct H
+    f: fn(i32) -> i32
+
+fn call(h: H) -> i32
+    h.f(1)                  # calls the field
+```
 
 ### 5.6 Closures
 
@@ -1556,6 +1626,14 @@ let a = if c then 0.0 else 1.5
 let b: f64 = if c then 0 else 1.5
 ```
 
+The rule is the same whichever arm comes first (LARB R43, AGAST #3312). Every
+typed slot gives the merge its type, not only an annotated binding: a
+`return` or tail in a `-> f64` function, and an argument for an `f64`
+parameter. In a float slot an integer *literal* arm converts. An integer arm
+that isn't a literal never converts implicitly: write `n as f64`. (ritz1 today
+accepts an unannotated merge when a float arm comes first, and ritz0 ignores the
+return type; #3312's tickets fix both.)
+
 As with the else-less `if`, an `if` or `match` used as a statement has no
 merged value, so its arms may end in values of any types.
 
@@ -1647,7 +1725,11 @@ the trips, and is safe when it moves the buffer.
   pointed at to begin with, whatever `p` is assigned in the body, and a call or an
   index on the way to it runs once.
 - The binding is a copy of its element, taken before the body runs. A write to that
-  element doesn't change the binding.
+  element doesn't change the binding. Over an array of any rank the element is the
+  array one rank down: `for plane in g` with `g: [2][2][3]u8` binds a `[2][3]u8`,
+  which indexes (`plane[1][2]`) and iterates like any local of that type (LARB R40,
+  AGAST #3307; ritz1 refuses rank 3 and ritz0 can't index the plane until #3307's
+  tickets land).
 - Only an rvalue gets a temporary: a call's by-value result (`for x in mk()`, or
   `mk().a`), or a literal. Nothing else can reach it, so nothing can write to it.
 - A place reached *through* a `Vec`'s element, such as `vs[0].a`, is an address
@@ -3010,6 +3092,14 @@ fn main() -> i32
     p.x + p.y
 ```
 
+A literal is the only way to make a struct value. Nothing converts to a struct,
+even one with a single field: `f(1)` for `fn f(s: S)` with `struct S { x: i32 }`
+is "argument 1 of `f` has the wrong type", and you write `f(S { x: 1 })` (LARB
+R47, AGAST #3336; ritz0 wraps the integer today).
+
+A generic struct's literal names its type arguments, `Box2<T> { v: x }`; they
+aren't inferred from the fields (LARB R44, AGAST #3314, #3311).
+
 ### 9.3 Field Access
 
 ```ritz
@@ -3618,6 +3708,12 @@ shape and its methods are emitted, but there is no dynamic dispatch, no trait
 bound on a generic parameter, and no `dyn Trait`. Methods are resolved
 statically from the receiver's concrete type.
 
+An `impl` targets a struct or enum declared in Ritz source. A primitive is a
+built-in type, closed like `Span` (LARB R26), so `impl u8` and `impl Speak for
+i32` are errors at the type: "`i32` is a built-in type; it can't have an
+`impl`" (LARB R36, AGAST #3288). Trait impls on primitives come back with
+trait bounds (#1621) and cross-module impls (#3256).
+
 `dyn` stays a reserved keyword (§2.4). Every use of it, in any type position
 or after `as`, is an error located at the `dyn` token, from ritz0, ritz1 and
 ritz1_selfhosted alike (AGAST #1620; runtime polymorphism is AGAST #3251):
@@ -3760,10 +3856,13 @@ fn main() -> i32
     consume(a[0])                   # error: `a` still drops a[0]
 ```
 
-A global `var` is never dropped, so moving its value, or a move-only field of
-it, out is allowed: a binding from it is its owner, and drops it once. Nothing
-tracks what moved out of a global, so moving the same value out of it twice
-isn't refused yet, and drops it twice (AGAST #3280).
+A global `var` is never dropped, and nothing can track what moved out of it,
+since any function may read it. So a move-only value can't be moved out of a
+global, or out of a field of one: `var x = G.t` is an error at `G.t`, "cannot
+move out of global `G`: borrow it with `@G.t`" (LARB R34, AGAST #3280). Reads
+of copyable values, borrows and stores into the global are unaffected. Until
+#3280's tickets land, both compilers allow the move, and a second one drops the
+value twice.
 
 A reference isn't its referent. An `@T`, `@&T` or `*T` doesn't fit a by-value
 `T` slot: an argument, a `let` or `var` of type `T`, `=`, `return`, a function's
@@ -4427,6 +4526,15 @@ Nothing is dropped if the binding doesn't own a value, or if `h.t` has been
 moved out. Assigning a moved-out field drops nothing and makes the binding
 own the field again. A field of a moved-out field can't be assigned:
 `h.a.t = v` with `h.a` moved out is a use of the moved `h.a`, as in Rust.
+
+Storing an array element (`a[i] = v`, `g[i][j] = v`, `h.a[i] = v`) drops the
+element's old value in the same order: after `v` and the index have been
+evaluated, before `v` is stored (LARB R39, AGAST #3305). That is why an array of
+a type with drop glue must be initialised where it's declared (§3.3): every
+element always holds a value. An array of any rank is dropped element by element
+in index order (`g[0][0]`, `g[0][1]`, … `g[1][0]`), as a rank-1 array is. Until
+#3305's tickets land, neither compiler drops a stored-over element or a rank-2+
+local.
 
 A move out of a nested field moves that field only, at any depth, as in Rust.
 After `v.w.t` moves, `v` and `v.w` are **partly moved**:
@@ -5096,7 +5204,8 @@ fn not_asm() -> i32
     x
 ```
 
-ritz1 has no inline `asm` yet (AGAST #1619), so it rejects `[[naked]]`.
+ritz1 has no inline `asm` yet (§18.6; AGAST #1619's implementation tickets), so
+it rejects `[[naked]]`.
 
 ### 17.6 Inlining Attributes
 
@@ -5358,6 +5467,118 @@ pointer computed from a base address, and the same lock word is read plainly
 during setup. Builtins express that and need no change to the type
 system. Sequential consistency is the one ordering that is always correct.
 Weaker orderings can be added when a measured need appears.
+
+### 18.6 Inline Assembly
+
+An `asm` block is a statement that places machine instructions in a function
+(LARB R7, AGAST #1825; this section is LARB R50, AGAST #1619). It is the escape
+hatch for what Ritz has no builtin for: port I/O, control registers, `syscall`,
+a compiler barrier.
+
+```text
+asm_stmt    := 'asm' ARCH asm_clauses? ':' NEWLINE INDENT asm_line+ DEDENT
+asm_clauses := '(' asm_clause (',' asm_clause)* ')'
+asm_clause  := ('in' | 'out' | 'inout') IDENT (':' REGISTER)?
+             | 'clobber' REGISTER
+```
+
+```text
+fn inb(port: u16) -> u8
+    var result: u8 = 0
+    asm x86_64 (out result):
+        movw {port}, %dx
+        inb %dx, %al
+        movb %al, {result}
+    return result
+
+fn write1(fd: i64, buf: *u8, n: i64) -> i64
+    var ret: i64 = 1                     # syscall number in, result out
+    asm x86_64 (inout ret: rax, in fd: rdi, in buf: rsi, in n: rdx, clobber rcx, clobber r11):
+        syscall
+    return ret
+```
+
+A block with no clauses, whose operands are all inputs, is already accepted by
+ritz0; the clause forms above wait on #1619's implementation tickets. The
+compiler barrier cryptosec uses to keep a zeroing loop from being removed:
+
+```ritz
+fn wipe(ptr: *u8, len: i64)
+    for i in 0..len
+        *(ptr + i) = 0
+    asm x86_64:
+        nopl ({ptr})
+```
+
+**Architecture.** `ARCH` names the instruction set, and only `x86_64` is
+defined. A block whose `ARCH` isn't the target's is an error at the name. A
+function that needs several architectures uses `[[target(...)]]` (§17.2) to pick
+one.
+
+**Lines are text.** Each indented line is passed to the assembler as written,
+not tokenised as Ritz. x86_64 is AT&T syntax. The compiler changes the text in
+only three ways:
+- `{name}` is replaced by the operand's register (below). `{{` and `}}` are a
+  literal `{` and `}`.
+- From `#` to the end of the line is a comment and is dropped, as in Ritz and
+  the GNU assembler. So no `{name}` is substituted inside a comment.
+- Lines are joined with newlines. Indentation beyond the block's is dropped.
+`$` and `%` are literal: `movq $3, %rcx` means what it says, and the compiler
+escapes them for LLVM. (ritz0 today also reads `$$42` as `$42`; that goes, and
+its one site, `test/test_packed_naked.ritz:74`, becomes `$42`.)
+
+**Labels.** Only numeric local labels (`1:`, jumped to as `1b` or `1f`). A named
+label is an error at the line: the function may be inlined into several callers,
+and each copy would define the label again (#1371).
+
+**Operands.** `{name}` names a local, a parameter or a global; an expression is
+an error. Its type must be an integer or a pointer (`*T`, `@T`, `@&T`; `bool` is
+an `i1`, which no register constraint takes), and the type sets the register width (`{port}` of a `u16` is `%dx`, not
+`%rdx`). Every operand is an **input** unless a clause says otherwise:
+- `out x`: the block writes `x` and doesn't read it. Its value afterwards is
+  what the block left in the register.
+- `inout x`: the block reads and writes `x`.
+- `x: rax` pins the operand to a register; otherwise the compiler picks a
+  general register. A pinned operand needn't appear in the text (`syscall` reads
+  `rax` and `rdi` itself); an unpinned one in a clause must.
+Direction is declared, never guessed from mnemonics. `out` and `inout` need a
+place you can assign (a `var`, a field of one, or a global `var`), and count
+as an assignment of it for the borrow rules (§13.5). A name may appear in at
+most one clause. A register may be pinned at most once, and `rsp` and `rbp`
+can't be pinned or clobbered.
+
+**Clobbers.** Every x86_64 general register named in the text (`%rax`, `%eax`,
+`%ax`, `%al`, `%r8d`, …) is clobbered, counted as its 64-bit register. `clobber
+r11` adds one the text doesn't name, such as those `syscall` overwrites. Memory
+and flags are always clobbered, and the block always counts as having side
+effects: it is never removed, merged with another, or moved across a memory
+access. A block with no outputs is still kept.
+
+**Control.** Control is assumed to leave the block at its end. A block that
+jumps away for good (into a kernel, say) should be followed by a `loop` so the
+function's end isn't reachable (§6.1).
+
+**`[[naked]]`.** In a naked function (§17.5) an `asm` block takes no clauses and
+no `{name}`: there is no frame, so parameters are found in the calling
+convention's registers.
+
+**Lowering.** Both compilers emit one LLVM `call asm sideeffect` per block, in
+AT&T dialect:
+- the template is the text with each `{name}` replaced by `${N}` and every
+  literal `$` written as `$$`;
+- constraints list the outputs first, `=&r` (early-clobber: the block may write
+  one before it has read every input) or `={reg}` when pinned; then the inputs,
+  `r` or `{reg}`, with each `inout` tied to its output by number (`0`); then
+  `~{reg}` for every clobber, and `~{memory},~{dirflag},~{fpsr},~{flags}`;
+- no outputs gives a `void` call, one output that type, several a literal
+  struct; each output is stored back to its place after the call.
+
+**Errors**, each located: unknown or wrong `ARCH`; `{name}` not in scope, or not
+an integer or pointer; `{` not closed or followed by a non-name; `out`
+or `inout` on something that isn't an assignable place; a name in two clauses;
+an unpinned clause operand missing from the text; a register pinned twice or not
+a general register; `rsp`/`rbp` pinned or clobbered; a named label; a clause or
+`{name}` in a `[[naked]]` function.
 
 ---
 
