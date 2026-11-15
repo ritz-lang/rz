@@ -2153,10 +2153,15 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         declared.var_type = TYPE_U64
 
     if stmt.var_init != null and stmt.var_array_shape != null
-        # AGAST #1509: no initializer form of a multi-dimensional array is
-        # lowered (the 1-D literal / fill / copy paths would write it as a
-        # flat [N x i64]).  Fail closed: the error count stops the driver
-        # writing any output.
+        # AGAST #3299: a whole N-D place (`h.m`, `p.m`, a local or global
+        # `[N][M]T`) is copied into the slot.  #2169's `var b = a` and
+        # #3017's `let g = h.m` reach here typed N-D.
+        if emit_nd_array_init_copy(s, alloca_reg, stmt.var_array_shape, stmt.var_init) == 1
+            return
+        # AGAST #1509: no other initializer form of a multi-dimensional array
+        # is lowered (the 1-D literal / fill paths would write it as a flat
+        # [N x i64]).  Fail closed: the error count stops the driver writing
+        # any output.
         emit_nd_error(s, stmt.span.line, stmt.span.col, c"an initializer on a multi-dimensional array is not supported in ritz1")
         return
     if stmt.var_init != null
@@ -4877,6 +4882,71 @@ fn emit_array_local_copy_from_field(s: *EmitterState, dst_ptr: i32, dst_size: i3
     if array_store_fits(s, value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, dst_et, dst_name, dst_name_len) == 0
         return 1
     emit_array_field_copy(s, field, mr.reg, dst_ptr)
+    1
+
+# 1 when two N-D shapes are the same type: rank, every dim and the leaf.
+fn array_shapes_match(a: *ArrayShape, b: *ArrayShape) -> i32
+    if a.rank != b.rank or a.leaf_pointee != b.leaf_pointee
+        return 0
+    var d: i32 = 0
+    while d < a.rank
+        if a.dims[d] != b.dims[d]
+            return 0
+        d = d + 1
+    array_elem_types_match(a.leaf_type, a.leaf_name, a.leaf_name_len, b.leaf_type, b.leaf_name, b.leaf_name_len)
+
+# AGAST #3299: initialise the N-D slot at `dst_ptr` (shape `sh`) from `value`
+# when it is a whole N-D place: a field (`h.m`, `p.m` through `p: *H`, a
+# chain), or a local or global `[N][M]..T` (#2169's `var b = a`).  Copied as
+# one aggregate, or pointer-to-pointer when large (as emit_local_array_copy),
+# so the slot is a copy, never a view.  Returns 1 once handled (copied, or a
+# shape mismatch diagnosed) and 0, having emitted nothing, for any other value.
+fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *Expr) -> i32
+    let src_sh: *ArrayShape = nd_array_base_shape(s, value)
+    if src_sh == null
+        return 0
+    if array_shapes_match(src_sh, sh) == 0
+        emit_ir_error(s, c"multi-dimensional array initializer's shape does not match the local array's")
+        return 1
+    var src_ptr: i32 = -1
+    if value.kind == EXPR_MEMBER
+        var mr: MemberPtrResult
+        emit_member_ptr(s, value, @mr)
+        if mr.success != 1
+            emit_ir_error(s, c"whole-array read into a local array from this member is not supported by ritz1 (only an inline array field)")
+            return 1
+        src_ptr = mr.reg
+    else
+        let loc: *LocalVar = find_local_struct_name(s, value.ident_ptr, value.ident_len)
+        if loc != null
+            src_ptr = loc.reg
+        else
+            src_ptr = emit_global_array_ptr(s, find_global(s, value.ident_ptr, value.ident_len))
+    var align: i64 = 8
+    if elem_size_align(s, sh.leaf_type, sh.leaf_name, sh.leaf_name_len, @align) * (shape_leaf_count(sh) as i64) >= SRET_MIN_BYTES
+        emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
+        emit_reg(s, dst_ptr)
+        emit_str(s, c", ptr ")
+        emit_reg(s, src_ptr)
+        emit_str(s, c", i64 ptrtoint (ptr getelementptr (")
+        emit_array_shape_llvm(s, sh, 0)
+        emit_str(s, c", ptr null, i32 1) to i64))\n")
+        s.sret_helpers_used = 1
+        return 1
+    let agg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, agg)
+    emit_str(s, c" = load ")
+    emit_array_shape_llvm(s, sh, 0)
+    emit_str(s, c", ptr ")
+    emit_reg(s, src_ptr)
+    emit_str(s, c"\n  store ")
+    emit_array_shape_llvm(s, sh, 0)
+    emit_str(s, c" ")
+    emit_reg(s, agg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, dst_ptr)
+    emit_str(s, c"\n")
     1
 
 # Copy a whole local `[N x T]` from `src_ptr` over `dst_ptr` as one aggregate

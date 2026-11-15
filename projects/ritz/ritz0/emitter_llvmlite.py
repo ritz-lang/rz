@@ -10242,6 +10242,17 @@ class LLVMEmitter:
                         # Global array - use two-level GEP [0, index] on the global
                         zero = ir.Constant(self.i32, 0)
                         return self.builder.gep(gvar, [zero, index])
+                elif name in self.params and rvalue_root:
+                    # AGAST #3299: a let-bound array is an SSA value (`let g =
+                    # h.m`, `m: [2][3]i32`).  The row `g[i]` of `g[i][j]` is
+                    # read through a spilled copy, as _emit_index_core reads
+                    # a 1-D `g[i]`; "Cannot index type" was raised here.
+                    val, ty = self.params[name]
+                    if isinstance(ty, ir.ArrayType):
+                        slot = self._alloca_in_entry_block(ty, f"{name}.tmp")
+                        self.builder.store(val, slot)
+                        zero = ir.Constant(self.i32, 0)
+                        return self.builder.gep(slot, [zero, index])
             # Handle struct field that is an array (e.g., buf.data[0] = x)
             # `mk().q[i]`, `q` a pointer, is no element of the temporary: it
             # takes the pointer route below (AGAST #2518).

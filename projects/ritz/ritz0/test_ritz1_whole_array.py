@@ -1687,13 +1687,8 @@ pub fn main() -> i32
     m[1] = r
     return m[1][3]
 """,
-    "aoa_whole": """\
-pub fn main() -> i32
-    var m: [2][4]i32
-    m[1][3] = 3
-    var n: [2][4]i32 = m
-    return n[1][3]
-""",
+    # `aoa_whole`, `var n: [2][4]i32 = m`, is lowered since #3299:
+    # test_nd_array_field_copy.py's annotated_local_copy.
     "nd_global_store": """\
 var G: [2][2]i32
 var H: [2][2]i32

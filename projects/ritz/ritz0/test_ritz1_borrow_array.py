@@ -1457,17 +1457,8 @@ def test_ritz1_refuses_at_the_line(ritz1_bin, tmp_path, name):
 
 # ritz0 gives 3 for these; ritz1 refuses them, located.  A nested array has no
 # whole value in ritz1: that's #2098 and #2099, and these are what's left of it.
+# (`var b = a` of `a:& [2][3]i32` is lowered since #3299: test_nd_array_field_copy.)
 NESTED_LOCATED = {
-    "nested_untyped_copy": ("an initializer on a multi-dimensional array", """
-fn f(a:& [2][3]i32) -> i32
-    var b = a
-    return b[1][2] - 2
-
-pub fn main() -> i32
-    var a: [2][3]i32
-    a[1][2] = 5
-    return f(@&a)
-"""),
     "nested_whole_assign": ("assigning a whole multi-dimensional array", """
 fn f(a:& [2][3]i32, b:& [2][3]i32)
     a = b
