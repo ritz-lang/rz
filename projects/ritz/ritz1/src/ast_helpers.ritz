@@ -928,10 +928,70 @@ pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u
             decl_refused(mt.line, c"method", mt.name, mt.name_len, type_name, type_len, c"importers instantiate its body")
         if trait_len == 4 and name_is_drop(trait_name) == 1 and mt.name_len == 4 and name_is_drop_fn(mt.name) == 1
             drop_by_value_error(mt)
+        impl_spell_self(p, mt, type_name, type_len, type_params)   # AGAST #3249
         if type_params == null
             impl_name_bare_self(mt, type_name, type_len)
         mt = mt.next
     return ib
+
+# AGAST #3249: `Self` in a method's params and return type is the impl's
+# type, as ritz0's parse_impl spells it (#2258).  type_named left it a struct
+# named "Self", which nothing resolves, so a by-value `self: Self`, a `by:
+# @Self`, a `-> Self` and anything in a generic impl lowered to `unhandled
+# EXPR_MEMBER`.  In `impl<T> Box<T>` it is `Box<T>`, spelled `Box$T` as
+# type_generic_with_saved spells it, so monomorph substitutes T in it like
+# a written `@Box<T>`.  (The grammar drops the impl's own type args, so this
+# assumes they are its type params in order, as ritz1's impls already do.)
+fn impl_spell_self(p: *Parser, mt: *FnDef, type_name: *u8, type_len: i32, type_params: *TypeParam)
+    var self_len: i32 = 0
+    let self_name: *u8 = impl_self_spelling(p, type_name, type_len, type_params, @self_len)
+    var prm: *Param = mt.params
+    while prm != null
+        param_spell_self(prm, self_name, self_len)
+        prm = prm.next
+    if name_is_self_type(mt.return_type_name, mt.return_type_name_len) == 1
+        mt.return_type_name = self_name
+        mt.return_type_name_len = self_len
+    param_spell_self(mt.ret_ref, self_name, self_len)
+    param_spell_self(mt.ret_ptr_array, self_name, self_len)
+    param_spell_self(mt.ret_array_param, self_name, self_len)
+
+fn param_spell_self(prm: *Param, self_name: *u8, self_len: i32)
+    if prm != null and name_is_self_type(prm.param_type_name, prm.param_type_name_len) == 1
+        prm.param_type_name = self_name
+        prm.param_type_name_len = self_len
+
+fn name_is_self_type(name: *u8, len: i32) -> i32
+    if len != 4 or name == null
+        return 0
+    buf_eq(name, len, c"Self", 4)
+
+# `Box` for `impl Box`, `Box$K$V` for `impl<K, V> Box<K, V>`.
+fn impl_self_spelling(p: *Parser, type_name: *u8, type_len: i32, type_params: *TypeParam, out_len: *i32) -> *u8
+    if type_params == null
+        *out_len = type_len
+        return type_name
+    var total: i32 = type_len
+    var tp: *TypeParam = type_params
+    while tp != null
+        total = total + 1 + tp.name_len
+        tp = tp.next
+    let out: *u8 = parser_alloc(p, (total + 1) as i64)
+    var pos: i32 = 0
+    for i in 0..type_len
+        *(out + pos) = *(type_name + i)
+        pos = pos + 1
+    tp = type_params
+    while tp != null
+        *(out + pos) = 36  # '$'
+        pos = pos + 1
+        for j in 0..tp.name_len
+            *(out + pos) = *(tp.name + j)
+            pos = pos + 1
+        tp = tp.next
+    *(out + pos) = 0
+    *out_len = pos
+    out
 
 # AGAST #1902: a method's own `<...>` (`impl Box` / `fn conv<T>`) is a
 # located error.  Monomorph never specialises a method's type params, so the

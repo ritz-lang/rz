@@ -21,12 +21,11 @@ from test_ref_into_value import COMPILERS, _run
 
 pytestmark = pytest.mark.integration
 
-# ritz1 can't parse `self:= T` at all, and resolves `Self` only as a lent
-# receiver in a non-generic impl: the rest is `unhandled EXPR_MEMBER`.
-RITZ1_GAP = "AGAST #3249"
-RITZ1 = {"ritz1", "ritz1_selfhosted"}
+# ritz1 spells `Self` as the impl's type too, and parses `self:= T` (AGAST
+# #3249): before, a `self:= T` dropped the whole impl ("unexpected '='"), and
+# all but a lent receiver in a non-generic impl was `unhandled EXPR_MEMBER`.
 
-# name -> (program, exit status, compilers that can't run it yet)
+# name -> (program, exit status)
 CASES = {
     # The ticket's program.
     "move": ("""\
@@ -40,7 +39,7 @@ impl P
 pub fn main() -> i32
     var p = P { x: 3 }
     return p.get()
-""", 3, RITZ1),
+""", 3),
     "value": ("""\
 struct P
     x: i32
@@ -52,7 +51,7 @@ impl P
 pub fn main() -> i32
     var p = P { x: 3 }
     return p.get()
-""", 3, RITZ1),
+""", 3),
     # Lent receivers, a `Self` argument and a `Self` return.
     "lent": ("""\
 struct P
@@ -71,7 +70,7 @@ pub fn main() -> i32
     let q = P { x: 1 }
     let r = p.bump(@q)
     return p.get() + r.x
-""", 44, RITZ1),
+""", 44),
     "generic": ("""\
 struct Box<T>
     v: T
@@ -83,7 +82,24 @@ impl<T> Box<T>
 pub fn main() -> i32
     let b = Box<i32> { v: 3 }
     return b.get()
-""", 3, RITZ1),
+""", 3),
+    # Two type params: `Self` is `Pair<K, V>`, both substituted.
+    "generic2": ("""\
+struct Pair<K, V>
+    k: K
+    v: V
+
+impl<K, V> Pair<K, V>
+    fn swap_v(self: @Self, v: V) -> Self
+        return Pair<K, V> { k: self.k, v: v }
+
+    fn sum(self:= Self) -> i32
+        return self.k as i32 + self.v as i32
+
+pub fn main() -> i32
+    let a = Pair<u8, i64> { k: 3, v: 1 }
+    return a.swap_v(40).sum()
+""", 43),
     "trait": ("""\
 trait Get
     fn get(self: @Self) -> i32
@@ -98,7 +114,7 @@ impl Get for P
 pub fn main() -> i32
     let p = P { x: 3 }
     return p.get()
-""", 3, set()),
+""", 3),
     # The ticket's second symptom: a Drop type, other methods in the impl. The
     # receiver moves into `burn` and is dropped once, there.
     "drop": ("""\
@@ -125,23 +141,12 @@ fn run() -> i32
 pub fn main() -> i32
     let r = run()
     return drops * 10 + r
-""", 13, RITZ1),
+""", 13),
 }
 
 
-def _params():
-    out = []
-    for name in sorted(CASES):
-        for compiler in COMPILERS:
-            marks = []
-            if compiler in CASES[name][2]:
-                marks.append(pytest.mark.xfail(
-                    strict=True, reason=f"{RITZ1_GAP}: {compiler} can't compile this yet"))
-            out.append(pytest.param(compiler, name, marks=marks, id=f"{compiler}-{name}"))
-    return out
-
-
-@pytest.mark.parametrize("compiler,name", _params())
+@pytest.mark.parametrize("name", sorted(CASES))
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_self_is_the_impls_type(compiler, name, tmp_path):
-    program, want, _ = CASES[name]
+    program, want = CASES[name]
     assert _run(compiler, tmp_path, name, program) == want
