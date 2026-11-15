@@ -365,16 +365,51 @@ def test_a_type_is_not_a_lent_receiver(receiver, compiler, tmp_path):
 
 
 # What the hint says to write runs, with the self-less `C.new()` beside it.
-# ritz1's free `C_get(@&c)` of a bare `self:&` has no arg type yet (AGAST #3260).
-HINT_ROWS = [pytest.param(r, c, marks=pytest.mark.xfail(strict=True, reason="AGAST #3260"))
-             if r == "self:&" and c != "ritz0" else (r, c) for r in LENT_SELVES for c in COMPILERS]
-
-
-@pytest.mark.parametrize("receiver,compiler", HINT_ROWS)
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("receiver", LENT_SELVES)
 def test_the_hints_spellings_of_a_lent_self_run(receiver, compiler, tmp_path):
     src = LENT_IMPL.replace("{R}", receiver) + \
         "pub fn main() -> i32\n    var c: C = C.new()\n    return c.get() * 10 + C_get(@&c)\n"
     assert _run(compiler, tmp_path, "static_lent_hint", src) == 33
+
+
+# AGAST #3260: R10's `C_m(c)` of a bare `self:&` is the free call of a `self:& C`,
+# whose C is the impl's.  ritz1 named no type for the receiver, `call @C_bump(% ..)`,
+# and clang refused it.  It's lent as a `c:& C` param is: a place, named or written
+# `@&`, or a reference or pointer to one.  `C_bump` writes, so a copy would leave 3.
+# A typed `self:& C` doesn't lend `C_bump(c)` on ritz1 yet (AGAST #3278).
+BARE_LENT = "struct C\n    x: i32\n    y: i32\n\nimpl C\n    fn new() -> C\n        C { x: 3, y: 0 }\n" \
+            "    fn bump(self:&)\n        self.x = self.x + 1\n\n"
+BARE_LENT_RUNS = {
+    "addr": "    var c: C = C.new()\n    C_bump(@&c)\n",
+    "place": "    var c: C = C.new()\n    C_bump(c)\n",
+    "ref_local": "    var c: C = C.new()\n    let p: @&C = @&c\n    C_bump(p)\n",
+    "ptr_local": "    var c: C = C.new()\n    let p: *C = @&c\n    C_bump(p)\n",
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("arg", sorted(BARE_LENT_RUNS))
+def test_a_free_call_lends_a_bare_lent_self(arg, compiler, tmp_path):
+    src = BARE_LENT + f"pub fn main() -> i32\n{BARE_LENT_RUNS[arg]}    c.x\n"
+    assert _run(compiler, tmp_path, f"bare_lent_{arg}", src) == 4
+
+
+# What a `:&` param refuses, the bare receiver refuses, with ritz0's words.
+BARE_LENT_REFUSED = {
+    "temporary": ("    C_bump(^C.new())\n    0\n",
+                  "argument 1 of `C_bump` has the wrong type: a `:&` parameter needs a place to borrow, "
+                  "and this is a temporary"),
+    "let": ("    let c: C = C.new()\n    C_bump(^c)\n    0\n",
+            "cannot borrow `let` binding `c` as mutable; declare it `var`"),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("arg", sorted(BARE_LENT_REFUSED))
+def test_a_free_call_of_a_bare_lent_self_needs_a_place(arg, compiler, tmp_path):
+    body, message = BARE_LENT_REFUSED[arg]
+    _assert_refused(compiler, tmp_path, f"bare_lent_{arg}", BARE_LENT + f"pub fn main() -> i32\n{body}", message)
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

@@ -1108,6 +1108,46 @@ fn resolve_enum_ctx(s: *EmitterState, out_name: **u8, out_len: *i32) -> i32
     *out_len = 0
     return 0
 
+# The ImplBlock whose methods hold `f`, or null.
+fn impl_of_method(m: *Module, f: *FnDef) -> *ImplBlock
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            if method == f
+                return ib
+            method = method.next
+        ib = ib.next
+    null
+
+# AGAST #3260: R10's free call `C_get(c)` of a method whose receiver is a bare
+# `self:&`.  That receiver names no type: the method path and emit_impl_method
+# take it from the ImplBlock, so the free call had none to give its argument,
+# and emitted `call @C_get(% ..)`.  Here it's `f` with that receiver spelled
+# `self:& C`, C the impl's, and lent as a `c:& C` param is, as ritz0 reads it:
+# `C_get(c)` borrows c, and a temporary or a `let` is refused.  Any other `f`
+# is itself.  A generic impl's instance is already named (name_untyped_self).
+fn lent_self_call_view(s: *EmitterState, f: *FnDef) -> *FnDef
+    if f == null or f.params == null
+        return f
+    let p: *Param = f.params
+    if param_is_self(p) == 0 or p.is_self_borrow == 0 or p.param_type != TYPE_STRUCT or p.param_type_name_len > 0
+        return f
+    let ib: *ImplBlock = impl_of_method(s.module, f)
+    if ib == null
+        return f
+    let lent: *Param = malloc(sizeof(Param)) as *Param
+    memcpy(lent as *u8, p as *u8, sizeof(Param))
+    lent.param_type = TYPE_MUT_REF
+    lent.param_pointee_type = TYPE_STRUCT
+    lent.param_type_name = ib.type_name
+    lent.param_type_name_len = ib.type_name_len
+    lent.is_borrow = 1
+    let view: *FnDef = malloc(sizeof(FnDef)) as *FnDef
+    memcpy(view as *u8, f as *u8, sizeof(FnDef))
+    view.params = lent
+    view
+
 # Emit one call argument with the enum context its parameter dictates
 # (AGAST #1498).  `p` is the matching callee Param, or null when unknown.
 # A tagged-enum param makes a bare `Some(x)` / `None` / `Ok(x)` / `Err(x)`
@@ -1116,6 +1156,11 @@ fn resolve_enum_ctx(s: *EmitterState, out_name: **u8, out_len: *i32) -> i32
 # return type leaks into the argument.  Saved and restored like
 # emit_var_decl does.
 fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
+    # AGAST #3260: a receiver lent as a `:&` param passes a place's address.
+    if p != null and param_is_self(p) == 1 and p.is_borrow == 1
+        let lent: i32 = emit_borrowed_place(s, arg, p)
+        if lent != 0
+            return lent
     # AGAST #3005: a tuple param names a nameless tuple literal argument.
     if p != null and p.param_type == TYPE_STRUCT
         tuple_lit_name(s, arg, p.param_type_name, p.param_type_name_len)
@@ -1832,9 +1877,10 @@ fn arg_array_shape(s: *EmitterState, arg: *Expr, out: *ArraySrc) -> i32
 # checks the element); `a:& [N]T`, `@[N]T` and `@&[N]T` the same array, since an
 # address can't convert; a Span<T> any length.  Everything else refuses it:
 # `*i32` and `*[N]T` included, where this used to pass the first 8 bytes.  That
-# goes for `a:& [N]T` too, which ritz0 reads as the array here.
+# goes for `a:& [N]T` too, which ritz0 reads as the array here.  A receiver
+# isn't judged, except the one lent_self_call_view lends as a `:&` param.
 fn check_array_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
-    if p == null or name_eq(p.name, p.name_len, c"self", 4) == 1
+    if p == null or (name_eq(p.name, p.name_len, c"self", 4) == 1 and p.is_borrow == 0)
         return
     if check_borrow_arg(s, fname, flen, argno, arg, p) == 1
         return
@@ -4280,6 +4326,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         # clang refused it, unlocated (AGAST #2447).
         if fn_def == null
             fn_def = find_impl_method_by_symbol(s.module, full_name, full_len)
+        fn_def = lent_self_call_view(s, fn_def)
 
     # Sized from the argument list (AGAST #1813): a fixed [16] dropped every
     # argument past the 16th.
