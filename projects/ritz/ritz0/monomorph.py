@@ -2036,6 +2036,10 @@ class Monomorphizer:
         # Preserve source_file for separate compilation
         if hasattr(fn, 'source_file'):
             new_fn.source_file = fn.source_file
+        # A generated `E.from` returns Option<E>, so it is always rewritten;
+        # the emitter gives it weak_odr linkage by this mark (#2160).
+        if getattr(fn, 'generated', False):
+            new_fn.generated = True
         return new_fn
 
     def _rewrite_type(self, ty: rast.Type) -> rast.Type:

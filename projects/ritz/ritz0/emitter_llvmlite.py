@@ -5243,6 +5243,14 @@ class LLVMEmitter:
         # linkonce_odr means: keep one copy, merge duplicates (One Definition Rule)
         if getattr(fn_def, 'is_monomorphized', False):
             fn.linkage = 'linkonce_odr'
+        # A compiler-generated fn (`E.from`, LANGUAGE_SPEC §10.4) is defined
+        # in every module that declares or imports E, so two objects may each
+        # carry an identical copy (#2160).  weak_odr (as ritz1 emits) merges
+        # them; unlike linkonce_odr it is never dropped as unused, since an
+        # object that only declares `E__from` may rely on this definition.
+        # An internal (non-pub, runtime-linked) copy has no symbol to clash.
+        elif getattr(fn_def, 'generated', False) and fn.linkage in ('', 'external'):
+            fn.linkage = 'weak_odr'
 
         self.current_fn = fn
 

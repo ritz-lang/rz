@@ -26,6 +26,7 @@ generates `E__from`; the enums are already checked identical).
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -237,19 +238,37 @@ def test_gated_vs_ungated_not_compared(compiler, tmp_path):
 def test_identical_enum_from_in_two_modules_runs(compiler, tmp_path):
     """Both modules generate `Color__from`; identical enums, so no conflict.
 
-    ritz0 emits each generated `Color__from` as a strong symbol, so its two
-    objects do not link (ritz1's are weak_odr): #2160.  For ritz0 only the
-    resolver's verdict is pinned.
+    Each object defines `Color__from`, so it must be a mergeable `weak_odr`
+    definition, not a strong one: ritz0's used to be strong, and the two
+    objects failed to link with a duplicate symbol (#2160).
     """
     _write(tmp_path, {
         "ma": ENUM + "pub fn fa() -> i32\n    Color.Red as i32\n",
         "mb": ENUM + "pub fn fb() -> i32\n    Color.Blue as i32\n",
         "t": MAIN_AB})
-    if compiler == "ritz0":
-        proc, _ = _compile(compiler, tmp_path, "t")
-        assert proc.returncode == 0, proc.stderr + proc.stdout
-        return
     assert _run(compiler, tmp_path, ["t", "ma", "mb"]) == 12
+
+
+@pytest.mark.integration
+def test_ritz0_generated_from_weak_user_fn_strong(tmp_path):
+    """ritz0 (#2160): only the generated fn is weak_odr; user fns stay strong.
+
+    weak_odr, not linkonce_odr: an importer may only declare `E__from`, so
+    the definition must survive even where its own module does not call it.
+    """
+    _write(tmp_path, {"ma": ENUM + "pub fn fa() -> i32\n    Color.Red as i32\n"})
+    proc, ll = _compile("ritz0", tmp_path, "ma")
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    defs = [l for l in ll.read_text().splitlines() if l.startswith("define ")]
+
+    def define(name):
+        hits = [l for l in defs if re.search(r'@"?%s"?\(' % name, l)]
+        assert len(hits) == 1, (name, defs)
+        return hits[0]
+
+    assert define("Color__from").startswith("define weak_odr "), defs
+    fa = define("fa")
+    assert not any(w in fa for w in ("weak", "linkonce", "internal")), fa
 
 
 @pytest.mark.integration
