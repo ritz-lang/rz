@@ -14,10 +14,9 @@ Two emitter paths build struct literals and both are covered:
 Each program returns 42 when correct and a distinct small code naming the
 check that failed otherwise. ritz0 is the oracle.
 
-These single-file programs define ritzlib.str's memset themselves, from when
-ritz1 zero-filled with `llvm.memset` (a libc `memset` call). Since AGAST #3218
-it zero-fills through its module-internal @__ritz_sret_zero instead, and
-test_zero_fill_nostdlib.py links a fill with no memset in sight.
+The programs link with -nostdlib and define no memset: since AGAST #3218 ritz1
+zero-fills through its module-internal @__ritz_sret_zero rather than a libc
+`memset` call, so a zero fill must link on its own.
 """
 
 import os
@@ -38,20 +37,10 @@ RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 EXPECTED = 42
 
 
-# ritzlib.str's memset, for the zero-fill programs (see module docstring).
-MEMSET = """\
-pub fn memset(dest: *u8, c: u8, n: i64) -> *u8
-    for i in 0..n
-        *(dest + i) = c
-    return dest
-
-"""
-
 PROGRAMS = {
     # The ticket's repro (test_level9::test_indent_stack_struct shape), with
     # every slot checked rather than just a[0].
-    "repro_i64_zero": MEMSET
-    + """\
+    "repro_i64_zero": """\
 struct S
     a: [4]i64
 
@@ -108,8 +97,7 @@ pub fn main() -> i32
     return 42
 """,
     # i32 elements, non-zero and zero fill side by side.
-    "i32_elements": MEMSET
-    + """\
+    "i32_elements": """\
 struct S
     a: [3]i32
     z: [3]i32
@@ -177,8 +165,7 @@ pub fn main() -> i32
 """,
     # emit_struct_lit_to_alloca: reassignment over dirty slots — a zero fill
     # that writes nothing would leave the 9s in place.
-    "assign_over_dirty": MEMSET
-    + """\
+    "assign_over_dirty": """\
 struct S
     a: [4]u8
     b: i32
