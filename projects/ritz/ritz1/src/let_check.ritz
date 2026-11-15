@@ -338,6 +338,68 @@ pub fn return_check_another_struct(s: *EmitterState, e: *Expr, ret_type: i32, li
     eprints_cstr(c"`\n")
     return 1
 
+# AGAST #3294: the same rule at a store, `d = c` / `v.d = c`, with `c` a struct
+# of another type than the local or field.  It reached clang as `store %C ...`
+# into the `%D`.  ritz0 reads it back from llvmlite's store complaint
+# (_store_mismatch_message) and gives the same message.
+fn let_check_another_struct_store(s: *EmitterState, stmt: *Stmt)
+    var want: *u8 = null
+    var want_len: i32 = 0
+    if stmt.kind == STMT_ASSIGN
+        if stmt.assign_target_len <= 0
+            return
+        let loc: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+        if loc == null or loc.var_type != TYPE_STRUCT
+            return
+        want = loc.type_name
+        want_len = loc.type_name_len
+    else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
+        let base: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
+        if base == null
+            return
+        let st: *StructDef = find_struct(s, base.type_name, base.type_name_len)
+        if st == null
+            return
+        let idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+        if idx < 0
+            return
+        let f: *StructField = get_field_type(st, idx)
+        if f.field_type != TYPE_STRUCT
+            return
+        want = f.field_type_name
+        want_len = f.field_type_name_len
+    else
+        return
+    var src: *u8 = null
+    var src_len: i32 = 0
+    if another_struct_source(s, stmt.assign_value, want, want_len, @src, @src_len) == 0
+        return
+    if stmt.kind == STMT_ASSIGN
+        let_error(s, stmt.span.line, stmt.span.col, c"`", stmt.assign_target, stmt.assign_target_len, c"` is declared `")
+    else
+        let_error(s, stmt.span.line, stmt.span.col, c"field `", stmt.assign_target, stmt.assign_target_len, c"` is declared `")
+    let_eprint_name(want, want_len)
+    eprints_cstr(c"` but the value assigned is a `")
+    let_eprint_name(src, src_len)
+    eprints_cstr(c"`\n")
+
+# AGAST #3294: argument `a` for by-value param `p`, a struct of another type.
+# It reached clang as a `%C` passed to the `%D`.  bool_check_args pairs them,
+# for a call, a fn-pointer call and a method; ritz0's
+# _another_struct_arg_message gives the same message, at the argument.
+pub fn let_check_another_struct_arg(s: *EmitterState, p: *Param, a: *Expr)
+    if p.param_type != TYPE_STRUCT or p.is_borrow == 1
+        return
+    var src: *u8 = null
+    var src_len: i32 = 0
+    if another_struct_source(s, a, p.param_type_name, p.param_type_name_len, @src, @src_len) == 0
+        return
+    let_error(s, a.span.line, a.span.col, c"parameter `", p.name, p.name_len, c"` is declared `")
+    let_eprint_name(p.param_type_name, p.param_type_name_len)
+    eprints_cstr(c"` but its argument is a `")
+    let_eprint_name(src, src_len)
+    eprints_cstr(c"`\n")
+
 # Check one statement before it is emitted: its own write target, and every
 # `@&` in the expressions it evaluates.  Nested statement lists (if / while /
 # for bodies, match arms) are checked as emit_stmt reaches them, when the
@@ -352,6 +414,7 @@ pub fn let_check_stmt(s: *EmitterState, stmt: *Stmt)
     if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
         let_check_write(s, stmt)
         let_check_expr(s, stmt.assign_value)
+        let_check_another_struct_store(s, stmt)   # AGAST #3294
         if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
             let_check_expr(s, stmt.while_cond)
         return

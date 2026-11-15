@@ -42,7 +42,8 @@ import fast_link
 
 from array_rules import ELEMENT_MISMATCH
 from index_rules import needs_index
-from let_rules import another_struct, another_struct_return
+from let_rules import (another_struct, another_struct_argument, another_struct_assign,
+                       another_struct_field, another_struct_return)
 from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
 from test_ref_into_value import COMPILERS, _assert_refused
@@ -3336,29 +3337,10 @@ def test_a_pointer_into_a_pointer_to_pointer_slot_is_refused(tmp_path, compiler,
     _assert_refused(compiler, tmp_path, name, program, VALUE_INTO_SHARED_REF)
 
 
-# A by-value slot only copies a referent of its own type. Reading a `C` as a
-# `D` would be a silent reinterpretation, so neither compiler may produce a
-# program. ritz1 leaves the refusal to clang.
-ANOTHER_STRUCT = TYPES + """
-struct D
-    a: i64
-    b: i64
-
-struct VD
-    d: D
-
-fn mk(c:& C) -> VD
-    var v: VD
-    v.d = c
-    return v
-
-pub fn main() -> i32
-    var c: C = C { x: 3, y: 0 }
-    var v: VD = mk(@&c)
-    return v.d.a as i32
-"""
-
-# Nor does a `:&` of a pointer to pointer hold a `C`.
+# A by-value slot only copies a referent of its own type: reading one as
+# another would be a silent reinterpretation, so neither compiler may produce
+# a program.  A `C` into a `D` slot is located (ANOTHER_STRUCT_SLOT, #3294),
+# and a `:&` of a pointer to pointer doesn't hold a `C` either.
 POINTER_REFERENT = TYPES + """
 struct V
     c: C
@@ -3402,17 +3384,6 @@ struct D
 """
 
 REFUSED_READS = {
-    "another_struct_argument": ANOTHER_D + """
-fn g(d: D) -> i32
-    return 3
-
-fn f(c:& C) -> i32
-    return g(c)
-
-pub fn main() -> i32
-    var c: C = C { x: 3, y: 0 }
-    return f(@&c)
-""",
     "pointer_referent_return": TYPES + """
 fn f(c:& **C) -> C
     return c
@@ -3603,7 +3574,6 @@ pub fn main() -> i32
 
 
 REFUSED = {
-    "another_struct": ANOTHER_STRUCT,
     "array_referent": ARRAY_REFERENT,
     "pointer_referent": POINTER_REFERENT,
     **REFUSED_READS,
@@ -3728,6 +3698,92 @@ pub fn main() -> i32
 """
     _assert_refused(compiler, tmp_path, f"return_{name}", program,
                     another_struct_return("D", "C"))
+
+
+# AGAST #3294: the same rule at the other slots a value is copied into.  ritz0
+# refused `d = c` and `g(c)` naming LLVM types, and `v.d = c` and ritz1's
+# three were left to clang.  `^` marks where it's reported: the statement for a
+# store, the argument for a call.
+ANOTHER_STRUCT_SLOT = {
+    "local_assign": ("""
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var d: D = D { a: 1, b: 2 }
+    ^d = c
+    return 3
+""", another_struct_assign("d", "D", "C")),
+    "borrow_assign": ("""
+fn f(c:& C) -> i32
+    var d: D = D { a: 1, b: 2 }
+    ^d = c
+    return 3
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@&c)
+""", another_struct_assign("d", "D", "C")),
+    "local_argument": ("""
+fn g(d: D) -> i32
+    return 3
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return g(^c)
+""", another_struct_argument("d", "D", "C")),
+    "borrow_argument": ("""
+fn g(d: D) -> i32
+    return 3
+
+fn f(c:& C) -> i32
+    return g(^c)
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    return f(@&c)
+""", another_struct_argument("d", "D", "C")),
+    "call_argument": ("""
+fn mk() -> C
+    return C { x: 3, y: 0 }
+
+fn g(n: i32, d: D) -> i32
+    return n
+
+pub fn main() -> i32
+    return g(3, ^mk())
+""", another_struct_argument("d", "D", "C")),
+    "local_field": ("""
+struct VD
+    d: D
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: VD = VD { d: D { a: 1, b: 2 } }
+    ^v.d = c
+    return 3
+""", another_struct_field("d", "D", "C")),
+    "borrow_field": ("""
+struct VD
+    d: D
+
+fn mk(c:& C) -> VD
+    var v: VD = VD { d: D { a: 1, b: 2 } }
+    ^v.d = c
+    return v
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var v: VD = mk(@&c)
+    return 3
+""", another_struct_field("d", "D", "C")),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(ANOTHER_STRUCT_SLOT))
+def test_a_struct_of_another_type_in_a_by_value_slot_is_refused_at_the_slot(tmp_path, compiler, name):
+    program, message = ANOTHER_STRUCT_SLOT[name]
+    _assert_refused(compiler, tmp_path, f"slot_{name}", ANOTHER_D + program, message)
 
 
 # A written reference returned is the caller's address.

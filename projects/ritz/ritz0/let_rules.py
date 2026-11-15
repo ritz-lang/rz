@@ -19,3 +19,18 @@ def another_struct_return(declared: str, actual: str) -> str:
     The same rule as another_struct, at the return slot.
     """
     return f"the fn is declared `-> {declared}` but its return value is a `{actual}`"
+
+
+def another_struct_assign(name: str, declared: str, actual: str) -> str:
+    """`name = <a struct of type actual>` into a `declared` local (AGAST #3294)."""
+    return f"`{name}` is declared `{declared}` but the value assigned is a `{actual}`"
+
+
+def another_struct_field(field: str, declared: str, actual: str) -> str:
+    """`v.field = <a struct of type actual>` into a `declared` field (AGAST #3294)."""
+    return f"field `{field}` is declared `{declared}` but the value assigned is a `{actual}`"
+
+
+def another_struct_argument(param: str, declared: str, actual: str) -> str:
+    """`g(<a struct of type actual>)` for a `param: declared` parameter (AGAST #3294)."""
+    return f"parameter `{param}` is declared `{declared}` but its argument is a `{actual}`"

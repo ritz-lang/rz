@@ -5831,21 +5831,37 @@ class LLVMEmitter:
     # value's type does not match the destination pointer's pointee.
     _LLVMLITE_STORE_MISMATCH = ("cannot store",)
 
-    @staticmethod
-    def _store_mismatch_message(stmt: rast.Stmt, llvm_msg: str) -> str:
+    def _store_mismatch_message(self, stmt: rast.Stmt, llvm_msg: str) -> str:
         """Name the assignment target in front of llvmlite's message.
 
         The LLVM type spellings are the only useful part of the original and
         are kept verbatim; this adds who was being assigned to, which is what
-        `cannot store {i8*, i64} to i8**` on its own does not say.
+        `cannot store {i8*, i64} to i8**` on its own does not say.  A struct
+        of another type gets #2293's words instead (AGAST #3294).
         """
         if isinstance(stmt, rast.AssignStmt):
             target = stmt.target
+            m = re.fullmatch(r"cannot store (.+) to (.+)\*: mismatching types", llvm_msg.strip())
+            pair = m and self._another_struct_names(m.group(2), m.group(1))
             if isinstance(target, rast.Ident):
+                if pair:
+                    return let_rules.another_struct_assign(target.name, *pair)
                 return f"cannot assign to `{target.name}`: {llvm_msg}"
             if isinstance(target, rast.Field):
+                if pair:
+                    return let_rules.another_struct_field(target.field, *pair)
                 return f"cannot assign to field `{target.field}`: {llvm_msg}"
         return llvm_msg
+
+    def _another_struct_names(self, declared: str, actual: str):
+        """(declared, actual) struct names for two LLVM type spellings that are
+        known structs of different names, else None (AGAST #3294).  llvmlite's
+        store and call complaints are the only record of the two types."""
+        by_llvm = {str(ty): name for name, ty in self.struct_types.items()}
+        want, got = by_llvm.get(declared.strip()), by_llvm.get(actual.strip())
+        if want is None or got is None or want == got:
+            return None
+        return want, got
 
     def _reject_discarded_must_use(self, expr: Optional[rast.Expr]) -> None:
         """Reject `expr`, whose value is discarded, if it calls a
@@ -11858,6 +11874,9 @@ class LLVMEmitter:
             as_int = self._enum_arg_message(call, fname, n, llvm_msg)
             if as_int is not None:
                 return as_int
+            another = self._another_struct_arg_message(call, fname, n, llvm_msg)
+            if another is not None:
+                return another
             return (
                 f"argument {n} of `{fname}` has the wrong type: {llvm_msg}"
             )
@@ -11889,6 +11908,23 @@ class LLVMEmitter:
                 expected = self._format_ritz_type(params[n - 1].type)
         return (f"argument {n} of `{fname}`: "
                 + self._enum_as_int_message(expected, enum_name))
+
+    def _another_struct_arg_message(self, call: rast.Call, fname: str, n: int,
+                                    llvm_msg: str) -> Optional[str]:
+        """AGAST #3294: argument `n` is a struct of another type than its
+        parameter's, read back from llvmlite's `%D != %C`.  #2293's words,
+        naming the parameter when the callee's def is known."""
+        m = re.search(r"arg mismatch: (.+) != (.+)$", llvm_msg.strip())
+        pair = m and self._another_struct_names(m.group(1), m.group(2))
+        if not pair:
+            return None
+        param = f"#{n}"
+        fn_entry = self.functions.get(fname)
+        if fn_entry is not None:
+            params = fn_entry[1].params
+            if len(params) == len(call.args) and 0 < n <= len(params):
+                param = params[n - 1].name
+        return let_rules.another_struct_argument(param, *pair)
 
     def _local_holds_no_fn(self, name: str) -> bool:
         """True when `name` is a local or param whose value is no fn pointer."""
