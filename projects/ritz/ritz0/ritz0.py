@@ -29,6 +29,7 @@ from import_resolver import ImportResolver, ImportError as RitzImportError
 import module_interface
 from name_resolver import resolve_names, NameError as RitzNameError
 from binder_names import check_binders
+from builtin_types import check_builtin_impls
 from move_checker import MoveChecker, OwnershipError
 from type_checker import TypeChecker, TypeError as RitzTypeError, check_ref_slots
 from const_eval import evaluate_array_sizes, ConstEvalError
@@ -232,6 +233,15 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # This must happen after import resolution but before name resolution
         # so that name resolution doesn't see excluded items
         module = _filter_by_target_os(module, target_os)
+
+        # An `impl` on a built-in type (Span, StrView, Option, Result) no
+        # module declares (AGAST #3162).  After the merge, so an imported
+        # `struct Span<T>` makes Span an ordinary struct.
+        builtin_impl_errors = check_builtin_impls(module)
+        if builtin_impl_errors:
+            for err in builtin_impl_errors:
+                print(f"Error: {err}", file=sys.stderr)
+            return False
 
         # `E.from(v)` -> the generated `E__from(v)` (LANGUAGE_SPEC §10.4)
         from_errors = rewrite_enum_from(module)
