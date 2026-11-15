@@ -367,23 +367,54 @@ fn another_struct_source(s: *EmitterState, init: *Expr, want: *u8, want_len: i32
     *out_len = src_len
     return 1
 
-# AGAST #3347: `let s: String = "abc"` with no `import ritzlib.string`.
-# `String` isn't built in, so the literal has nothing to become: ritz1 stored
-# the literal's `{ ptr, len }` into an undeclared `%String` (or, with a `.len`
-# after it, refused with only the unlocated "unlowerable expression(s)").
-# ritz0's _emit_string_from_literal gives the same words, at the literal.
-fn let_check_string_lit_no_import(s: *EmitterState, stmt: *Stmt)
+# `let s: String = "abc"`: 1 when it reported one.  With no `String` in scope
+# (no `import ritzlib.string`, AGAST #3347) the literal has nothing to become:
+# ritz1 stored its `{ ptr, len }` into an undeclared `%String`.  With one, LARB
+# R49 (AGAST #3361, #3393) refuses it anyway: a literal is a `StrView`, or a
+# `*u8` in a `*u8` slot, and nothing else converts (LANGUAGE_SPEC 3.5).  ritz1
+# used to say "`s` is declared `String` but its initialiser is a `Span$u8`", at
+# the `let`.  ritz0's _refuse_string_literal gives the same words, at the literal.
+fn let_check_string_lit(s: *EmitterState, stmt: *Stmt) -> i32
     let init: *Expr = stmt.var_init
     if init == null or init.kind != EXPR_STRING_LIT
-        return
+        return 0
     if name_eq(stmt.var_type_name, stmt.var_type_name_len, c"String", 6) == 0
-        return
+        return 0
     if find_struct(s, c"String", 6) != null
-        return
+        let_error(s, init.span.line, init.span.col, c"", null, 0, c"a string literal is not a `String`: write `string_from(")
+        let_eprint_source_quote(init.string_ptr, init.string_len)
+        eprints_cstr(c")`\n")
+        return 1
     let_error(s, init.span.line, init.span.col, c"", null, 0, c"`String` is not built in: `import ritzlib.string` to make one from a string literal\n")
     # AGAST #3362: that names the mistake; a later `s.len` doesn't say it again.
     s.unknown_struct_name = c"String"
     s.unknown_struct_name_len = 6
+    return 1
+
+# A literal's bytes as the "..." that writes them: `"`, `\\`, newline, tab, CR
+# and NUL escaped, every other byte (UTF-8 included) as itself.  ritz0's
+# _source_quote matches.
+fn let_eprint_source_quote(p: *u8, n: i32)
+    eprint_char('"')
+    var i: i32 = 0
+    while i < n
+        let c: u8 = p[i]
+        if c == '"'
+            eprints_cstr(c"\\\"")
+        else if c == '\\'
+            eprints_cstr(c"\\\\")
+        else if c == '\n'
+            eprints_cstr(c"\\n")
+        else if c == '\t'
+            eprints_cstr(c"\\t")
+        else if c == '\r'
+            eprints_cstr(c"\\r")
+        else if c == 0
+            eprints_cstr(c"\\0")
+        else
+            eprint_char(c)
+        i = i + 1
+    eprint_char('"')
 
 # AGAST #3293: `return c` or a tail `c`, with `c` a struct of another type than
 # the fn's `-> D`.  ritz1 loaded the `C` local's slot as a `%D` and returned it:
@@ -473,8 +504,8 @@ pub fn let_check_stmt(s: *EmitterState, stmt: *Stmt)
     if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
         let_check_expr(s, stmt.var_init)
         if k == STMT_VAR_DECL
-            let_check_another_struct(s, stmt)
-            let_check_string_lit_no_import(s, stmt)   # AGAST #3347
+            if let_check_string_lit(s, stmt) == 0   # AGAST #3347, LARB R49
+                let_check_another_struct(s, stmt)
         return
     if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
         let_check_write(s, stmt)

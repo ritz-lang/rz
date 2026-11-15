@@ -64,9 +64,6 @@ EXPECTED_FAILURES = {}
 # excuse the other: each is still its own key, and if the twins ever diverge
 # the passing one turns xpass and the gate goes red.
 _RITZ1_TWINS = {
-    # --- codegen, build failures ---
-    "test_native_string":
-        "AGAST #1627 — unspecified ritz0-only \"...\"→String coercion",
     # --- grammar / missing features ---
     "test_trait_bounds":
         "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "

@@ -906,8 +906,16 @@ fn main() -> i32
 ```
 
 A literal doesn't fit a `String` slot either: `let s: String = "abc"` is an
-error at the literal, and you write `string_from("abc")` (LARB R49, AGAST #3361;
-ritz1 already refuses it, and ritz0 still converts it until #3361's ticket lands).
+error at the literal, and you write `string_from("abc")` (LARB R49, AGAST #3361,
+#3393). A `String` allocates, and that should be visible in the source:
+
+```ritz expect-error='a string literal is not a `String`: write `string_from("abc")`'
+import ritzlib.string
+
+fn main() -> i32
+    let s: String = "abc"
+    0
+```
 
 A string literal fits a `*u8` slot ([§2.6](#26-literals)). Nothing else converts,
 because a `StrView` may be a slice with no terminator and a `String` has to be

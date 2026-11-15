@@ -8,13 +8,18 @@ a bare ValueError (a Python traceback) and ritz1 stored the literal's
 refused with only the unlocated "emitted 1 unlowerable expression(s)".
 
 The rule: all three compilers refuse it at the literal, `file:line:col`, with
-the same words, naming the fix.  With the import ritz0 still builds the
-String; ritz1 refuses that one for its own reason (a literal is a StrView,
-LANGUAGE_SPEC section 3.5), which this rule leaves alone.
+the same words, naming the fix.
+
+With the import it is refused too (LARB R49, AGAST #3361, #3393): a literal
+is a `StrView`, or a `*u8` in a `*u8` slot, and nothing else converts
+(LANGUAGE_SPEC section 3.5).  A `String` allocates, so the source says so:
+`string_from("abc")`.  ritz0 used to lower the literal to
+`string_from_bytes(ptr, 3)`; ritz1 refused it as "`s` is declared `String`
+but its initialiser is a `Span$u8`", at the `let`.  All three now give one
+message, at the literal, quoting it back as source.
 """
 
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -38,8 +43,17 @@ REJECTED = {
                '    let n: i64 = s.len\n    print("{n}\\n")\n' + _TAIL),
 }
 
-_WITH_IMPORT = ('import ritzlib.string\n\nfn main() -> i32\n'
-                '    let s: String = "abc"\n    string_len(@s) as i32\n')
+# LARB R49: with the import, each row is refused at line 4, column 21, and
+# the fix quotes the literal back as it is written: `"` and `\\` escaped, a
+# non-ASCII character as itself.
+_IMPORT = "import ritzlib.string\n\nfn main() -> i32\n"
+_NOT_STRING = "a string literal is not a `String`: write `string_from({})`"
+WITH_IMPORT = {
+    "let": (_IMPORT + '    let s: String = "abc"\n' + _TAIL, '"abc"'),
+    "var": (_IMPORT + '    var s: String = "abc"\n' + _TAIL, '"abc"'),
+    "escapes": (_IMPORT + '    let s: String = "q\\"\\\\\\n\\t\\0\U0001F600"\n' + _TAIL,
+                '"q\\"\\\\\\n\\t\\0\U0001F600"'),
+}
 
 
 def _compile(request, compiler, tmp_path, source):
@@ -75,16 +89,17 @@ def test_string_literal_without_the_import_is_a_located_error(request, tmp_path,
 
 
 @pytest.mark.integration
-def test_ritz0_with_the_import_still_builds_the_string(request, tmp_path):
-    # Compiled, not linked: ritzlib.string's bodies are another module's.
-    proc, ll = _compile(request, "ritz0", tmp_path, _WITH_IMPORT)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    ir = ll.read_text()
-    assert re.search(r'call %"[^"]*String" @"string_from_bytes"\(i8\* %"[^"]*", i64 3\)', ir), ir[-2000:]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_with_the_import_is_not_this_error(request, tmp_path, compiler):
-    proc, _ = _compile(request, compiler, tmp_path, _WITH_IMPORT)
-    assert STRING_LIT_NO_IMPORT not in proc.stdout + proc.stderr
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(WITH_IMPORT))
+def test_string_literal_with_the_import_is_refused(request, tmp_path, compiler, name):
+    source, quoted = WITH_IMPORT[name]
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
+    assert "Traceback" not in out, out
+    errors = [ln for ln in out.splitlines() if "error" in ln.lower()]
+    # One error, ours: not ritz1's old "is declared `String`" as well.
+    assert len(errors) == 1, f"{compiler}, {name}:\n{out[-1500:]}"
+    assert "unit.ritz:4:21:" in errors[0], f"{compiler}, {name}:\n{out[-1500:]}"
+    assert errors[0].endswith(_NOT_STRING.format(quoted)), f"{compiler}, {name}:\n{out[-1500:]}"

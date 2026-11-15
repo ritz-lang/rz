@@ -13,8 +13,7 @@ filled with the bytes.
 THE FIX
 
 Every place ritz0 sizes literal text counts ``value.encode('utf-8')``:
-StrView literals, a String let's ``string_from_bytes`` length, print/eprint
-interpolation segments, const StrView globals and const StrView array
+StrView literals, print/eprint interpolation segments, const StrView globals and const StrView array
 elements.  ``c"..."`` literals were already right (the backing global is
 built from the bytes, and nothing reads a length).
 
@@ -22,11 +21,14 @@ ORACLE
 
 One row per sizing site, so breaking one site turns only its own row red.
 Each literal ends with a 4-byte character (the widest loss), and the program
-prints it followed by ``|``: a short ``len`` drops the bytes before the bar.  ritz1 runs the
-rows it accepts; it refuses ``var s: String = "..."``, so that row is
-ritz0-only.  It reads a const ``[N]StrView`` element since #3325.  The 2-, 3- and
+prints it followed by ``|``: a short ``len`` drops the bytes before the bar.  ritz1 runs every
+row.  It reads a const ``[N]StrView`` element since #3325.  The 2-, 3- and
 4-byte cases on all three compilers live in the matrix file
 ``ritz0/test/test_utf8_literal_len.ritz``.
+
+A String let's ``string_from_bytes`` length was a sizing site until LARB R49
+(AGAST #3393): ``var s: String = "..."`` is now refused on both compilers,
+and its row pins that instead, with the literal quoted back whole.
 """
 
 import pytest
@@ -101,25 +103,6 @@ pub fn main() -> i32
 """,
         "5|",
     ),
-    # The two names ritz0's String-let lowering needs, without ritzlib.
-    "string_let": (
-        RITZ0,
-        """\
-struct String
-    ptr: *u8
-    len: i64
-
-fn string_from_bytes(p: *u8, n: i64) -> String
-    String { ptr: p, len: n }
-
-pub fn main() -> i32
-    var s: String = "S😀"
-    let n: i64 = s.len
-    print("{n}|")
-    0
-""",
-        "5|",
-    ),
 }
 
 ROWS = [(name, c) for name, (cs, _, _) in CASES.items() for c in cs]
@@ -148,3 +131,32 @@ def test_non_ascii_char_literal_refused(tmp_path, compiler):
     assert f"char_{compiler}.ritz:2:" in out, out[-1500:]
     if compiler == "ritz0":
         assert "'€' is 3 bytes in UTF-8" in out, out[-1500:]
+
+
+# LARB R49: the String let that ritz0 used to size is refused, on both, even
+# with the two names its old lowering needed declared.  The message quotes the
+# literal back with its 4-byte character whole.
+STRING_LET_PROGRAM = """\
+struct String
+    ptr: *u8
+    len: i64
+
+fn string_from_bytes(p: *u8, n: i64) -> String
+    String { ptr: p, len: n }
+
+pub fn main() -> i32
+    var s: String = "S😀"
+    let n: i64 = s.len
+    print("{n}|")
+    0
+"""
+
+
+@pytest.mark.parametrize("compiler", BOTH)
+def test_string_let_refused(tmp_path, compiler):
+    proc, ll = _compile(compiler, tmp_path, "string_let", STRING_LET_PROGRAM)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"{compiler} accepted it:\n{out[-1500:]}"
+    assert not ll.exists()
+    line = next(ln for ln in out.splitlines() if f"string_let_{compiler}.ritz:9:21:" in ln)
+    assert line.endswith('a string literal is not a `String`: write `string_from("S😀")`'), out[-1500:]

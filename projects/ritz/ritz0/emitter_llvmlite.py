@@ -38,9 +38,26 @@ from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
 
 # AGAST #3347: `let s: String = "abc"` with no `import ritzlib.string`. ritz1's
-# let_check_string_lit_no_import (ritz1/src/let_check.ritz) prints these words.
+# let_check_string_lit (ritz1/src/let_check.ritz) prints these words.
 STRING_LIT_NO_IMPORT = ("`String` is not built in: `import ritzlib.string` "
                         "to make one from a string literal")
+
+
+def _source_quote(value: str) -> str:
+    """`value` as the "..." literal that writes it: the inverse of the lexer's
+    escapes for `"`, `\\`, newline, tab, CR and NUL; every other character,
+    non-ASCII included, as itself.  ritz1's let_eprint_source_quote matches."""
+    esc = {'"': '\\"', '\\': '\\\\', '\n': '\\n', '\t': '\\t', '\r': '\\r', '\0': '\\0'}
+    return '"' + ''.join(esc.get(c, c) for c in value) + '"'
+
+
+def string_lit_not_string(value: str) -> str:
+    """LARB R49 (AGAST #3361, #3393): a "..." literal in a `String` slot.
+
+    A literal is a `StrView`, or a `*u8` in a `*u8` slot, and nothing else
+    converts (LANGUAGE_SPEC section 3.5): a `String` allocates, so the source
+    asks for one.  ritz1's let_check_string_lit gives the same words."""
+    return f"a string literal is not a `String`: write `string_from({_source_quote(value)})`"
 
 
 class EmitError(Exception):
@@ -1872,29 +1889,18 @@ class LLVMEmitter:
 
         return gvar
 
-    def _emit_string_from_literal(self, expr: rast.StringLit) -> ir.Value:
-        """Emit a String from a string literal via string_from_bytes().
+    def _refuse_string_literal(self, expr: rast.StringLit):
+        """`let` / `var` of type `String` initialised by a "..." literal.
 
-        Converts "hello" -> string_from_bytes(ptr, 5), using compile-time known length.
-        This avoids the runtime strlen() that string_from() would do.
+        Refused at the literal (LARB R49).  Until #3393 ritz0 lowered it to
+        `string_from_bytes(ptr, len)`, which LANGUAGE_SPEC section 3.5 never
+        allowed.  With no `String` in scope the missing import is the first
+        mistake, and #3347's words name it.
         """
-        if "string_from_bytes" not in self.functions:
-            # AGAST #3347: a located user error, not a ValueError traceback.
-            # ritz1's let_check_string_lit_no_import gives the same words.
+        if 'String' not in self.struct_types:
+            # AGAST #3347: ritz1's let_check_string_lit gives the same words.
             raise EmitError(STRING_LIT_NO_IMPORT, expr.span)
-
-        fn, _ = self.functions["string_from_bytes"]
-
-        # Get the C string pointer
-        gvar = self._get_string_constant(expr.value)
-        zero = ir.Constant(self.i64, 0)
-        cstr_ptr = self.builder.gep(gvar, [zero, zero])
-
-        # Use compile-time known length instead of runtime strlen
-        length = ir.Constant(self.i64, self._utf8_len(expr.value))
-
-        # Call string_from_bytes(cstr_ptr, length)
-        return self.builder.call(fn, [cstr_ptr, length])
+        raise EmitError(string_lit_not_string(expr.value), expr.span)
 
     # Note: _emit_span_string_literal (s"...") was removed in AGAST #98 —
     # bare StringLit now emits a StrView (same { ptr, len } shape) via
@@ -6370,13 +6376,11 @@ class LLVMEmitter:
             alloca = self._alloca_in_entry_block(ty, f"{stmt.name}.addr")
 
             if stmt.value:
-                # Handle String literal inference: "hello" -> string_from("hello")
+                # LARB R49: a literal is not a `String`.
                 if (stmt.type and isinstance(stmt.type, rast.NamedType)
                     and stmt.type.name == 'String'
                     and isinstance(stmt.value, rast.StringLit)):
-                    val = self._emit_string_from_literal(stmt.value)
-                    val = self._convert_type(val, ty)
-                    self.builder.store(val, alloca)
+                    self._refuse_string_literal(stmt.value)
                 # Special case: large array fill - initialize alloca directly with memset
                 # This avoids loading/storing huge arrays which crashes LLVM SelectionDAG
                 elif isinstance(stmt.value, rast.ArrayFill) and stmt.value.count > 64:
@@ -6452,12 +6456,11 @@ class LLVMEmitter:
             if self._emit_large_let_lit(stmt):
                 return None
             nested_type = None
-            # Handle String literal inference: "hello" -> string_from("hello")
+            # LARB R49: a literal is not a `String`.
             if (stmt.type and isinstance(stmt.type, rast.NamedType)
                 and stmt.type.name == 'String'
                 and isinstance(stmt.value, rast.StringLit)):
-                # Convert string literal to String via string_from
-                val = self._emit_string_from_literal(stmt.value)
+                self._refuse_string_literal(stmt.value)
             else:
                 # Set expected type context for closure type inference
                 if stmt.type and isinstance(stmt.type, rast.FnType):
