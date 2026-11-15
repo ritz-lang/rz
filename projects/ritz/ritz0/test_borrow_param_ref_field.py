@@ -1089,6 +1089,71 @@ pub fn main() -> i32
     let r: @&*C = @&p
     return (*r)[1].y as i32
 """,
+    # AGAST #3248: #3148 fixed the store `(*r)[i].f = v` too (emit_assign's
+    # EXPR_MEMBER arm reaches deref_ptr_local_struct through emit_member_ptr).
+    # Each writes element 0 as well as element 1, so a wrong stride lands
+    # `.y = 2` in a[0] and the sum is not 3.  `**C` is the control.
+    "plain_deref_pointer_element_field": BY_VALUE + """
+fn set(r: **C)
+    (*r)[0].x = 1
+    (*r)[1].y = 2
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 0, y: 0 }
+    a[1] = C { x: 0, y: 0 }
+    var p: *C = @a[0]
+    set(@p)
+    return a[0].x + a[1].y as i32
+""",
+    "plain_deref_ref_pointer_element_field": BY_VALUE + """
+fn set(r: @*C)
+    (*r)[0].x = 1
+    (*r)[1].y = 2
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 0, y: 0 }
+    a[1] = C { x: 0, y: 0 }
+    var p: *C = @a[0]
+    set(@p)
+    return a[0].x + a[1].y as i32
+""",
+    "plain_deref_mut_ref_pointer_element_field": BY_VALUE + """
+fn set(r: @&*C)
+    (*r)[0].x = 1
+    (*r)[1].y = 2
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 0, y: 0 }
+    a[1] = C { x: 0, y: 0 }
+    var p: *C = @a[0]
+    set(@&p)
+    return a[0].x + a[1].y as i32
+""",
+    "plain_local_deref_ref_pointer_element_field": BY_VALUE + """
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 0, y: 0 }
+    a[1] = C { x: 0, y: 0 }
+    var p: *C = @a[0]
+    let r: @*C = @p
+    (*r)[0].x = 1
+    (*r)[1].y = 2
+    return a[0].x + a[1].y as i32
+""",
+    "plain_local_deref_mut_ref_pointer_element_field": BY_VALUE + """
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 0, y: 0 }
+    a[1] = C { x: 0, y: 0 }
+    var p: *C = @a[0]
+    let r: @&*C = @&p
+    (*r)[0].x = 1
+    (*r)[1].y = 2
+    return a[0].x + a[1].y as i32
+""",
     # Through a `*[2]C` it's #2440's `(*p)[i]`, which already stored a `C`.
     "plain_deref_array_pointer_element": BY_VALUE + """
 fn fill(r: *[2]C, d: C)
