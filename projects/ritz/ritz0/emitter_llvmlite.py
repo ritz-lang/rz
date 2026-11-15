@@ -3752,6 +3752,10 @@ class LLVMEmitter:
                 # Preserve is_monomorphized for weak linkage
                 if getattr(method, 'is_monomorphized', False):
                     mangled_method.is_monomorphized = True
+                # The field paths the move checker saw it move out of a
+                # binding: without them no field gets a drop flag, and
+                # `return self.v` leaves `self` dropping `v` (AGAST #2263).
+                mangled_method.field_moves = getattr(method, 'field_moves', set())
                 self._emit_function_body(mangled_method)
 
     def _get_struct_field_index(self, struct_name: str, field_name: str) -> int:

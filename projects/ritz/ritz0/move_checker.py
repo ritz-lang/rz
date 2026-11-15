@@ -460,8 +460,10 @@ class MoveChecker:
         with `T` a copy type (AGAST #2263), so an instance at a move-only `T`
         is where `*p` turns into a move and where `let b: T = x` after
         `let a: T = x` uses a moved `x` (AGAST #2921, as ritz1 refuses it).
-        Each is checked on a copy: the emitter reads the marks `check` leaves,
-        and giving an instance its own is #2263's change, not this one."""
+        Each is checked on a copy, for its errors only. The marks the emitter
+        reads come from its own `check` of the monomorphised module (that
+        module is new, so not yet `moves_annotated`), which sees each
+        instance at its concrete `T` (AGAST #2263)."""
         self.errors = []
         self._collect(module)
         fns = [item for item in module.items if isinstance(item, rast.FnDef)]
@@ -570,7 +572,9 @@ class MoveChecker:
         elif isinstance(expr, rast.Cast):
             return expr.target
         elif isinstance(expr, rast.StructLit):
-            return rast.NamedType(expr.span, expr.name, [])
+            # With its type arguments (AGAST #2263): `Box<T> { .. }` holds a
+            # T, and a method on it returns `T`, not an unsubstituted `X`.
+            return rast.NamedType(expr.span, expr.name, list(expr.type_args or []))
         elif isinstance(expr, rast.ArrayLit):
             if expr.elements:
                 inner = self._infer_expr_type(expr.elements[0])

@@ -24,6 +24,9 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
     drops once, in the method (AGAST #2239).
   * a binding from a method call has the method's return type, so a by-value
     receiver moves it (AGAST #2257).
+  * a method returning a field of its by-value receiver moves the field out,
+    generic or not, and a generic literal `Box<T> { .. }` keeps its type
+    arguments, so a binding from it moves (AGAST #2263).
   * a void fn's tail value goes nowhere: a temporary drops once, a bare
     binding stays owned (AGAST #2253).
 
@@ -1277,6 +1280,85 @@ def test_ritz0_drops(tmp_path, name):
 def test_ritz0_use_after_move_rejected(tmp_path, name):
     body, var = REJECTS[name]
     comp, _ = _compile(tmp_path, body)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"accepted a use after move:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert f"use of moved value: `{var}`" in out, out[-2000:]
+
+
+# AGAST #2263: a by-value receiver's method returns a field of it. The field
+# moves out, so `self` skips it and the value drops once, at the caller.
+FIELD_RETURN = """\
+struct Plain
+    v: Tracked
+
+impl Plain
+    fn take(self: Plain) -> Tracked
+        return self.v
+
+struct Box2<X>
+    v: X
+
+impl<X> Box2<X>
+    fn take(self: Box2<X>) -> X
+        return self.v
+
+"""
+
+# name: (the body of `g`, expected DROPS)
+FIELD_RETURN_RUNS = {
+    # The emitter's mangled copy of a method kept no field drop flags.
+    "plain": ("""
+    var b = Plain { v: make(1) }
+    var t: Tracked = b.take()
+    return consume(t)
+""", 1),
+    # Checked as generic, `X` copies: the instance at Tracked moves the field.
+    "generic": ("""
+    var b = Box2<Tracked> { v: make(1) }
+    var t: Tracked = b.take()
+    return consume(t)
+""", 1),
+    # The literal keeps its type args, so `t` is a Tracked and moves.
+    "generic_untyped": ("""
+    var b = Box2<Tracked> { v: make(1) }
+    var t = b.take()
+    return consume(t)
+""", 1),
+}
+
+# name: (the body of `g`, the name used after it moved)
+FIELD_RETURN_REJECTS = {
+    "result_used_twice": ("""
+    var b = Box2<Tracked> { v: make(1) }
+    var t = b.take()
+    consume(t)
+    return consume(t)
+""", "t"),
+    "receiver_used_after": ("""
+    var b = Box2<Tracked> { v: make(1) }
+    b.take()
+    return b.v.id
+""", "b"),
+}
+
+
+def _field_return_program(body):
+    return (FIELD_RETURN + "fn g() -> i32" + body
+            + "\npub fn main() -> i32\n    g()\n    return DROPS\n")
+
+
+@pytest.mark.parametrize("name", sorted(FIELD_RETURN_RUNS))
+def test_ritz0_returned_receiver_field_drops_once(tmp_path, name):
+    body, expected = FIELD_RETURN_RUNS[name]
+    rc = _run(tmp_path, _field_return_program(body))
+    assert rc == expected, f"{name}: {rc} drops, spec says {expected}"
+
+
+@pytest.mark.parametrize("name", sorted(FIELD_RETURN_REJECTS))
+def test_ritz0_generic_literal_binding_moves(tmp_path, name):
+    body, var = FIELD_RETURN_REJECTS[name]
+    comp, _ = _compile(tmp_path, _field_return_program(body))
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"accepted a use after move:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
