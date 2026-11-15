@@ -13,7 +13,9 @@ for `v:& Vec<T>`, whose slot holds the borrow's pointer: `@v` is that pointer
 `@h.a` walks the array field `h.a` in place, as `h.a` does (#2533).
 
 `@` of a pointer or a reference, of a const, and of a call's field isn't an
-iterable to ritz0, and ritz1 refuses each of them too.
+iterable to ritz0, and ritz1 refuses each of them too.  A field reached through
+a pointer field of a call's result, `@mk().p.a`, is no field of the call's
+temporary, and each compiler walks it (#3207).
 
 Each program returns 0, or the number of the first check that failed.
 """
@@ -236,17 +238,39 @@ def test_address_of_a_field_that_isnt_a_place_is_refused(compile_with, compiler,
 
 
 # A pointer field of a call's result points at a place that isn't the
-# temporary's (AGAST #2518), so its `@` is no `@` of a temporary.  ritz0 walks
-# it; ritz1 refuses the iterable before reaching the member (AGAST #3207).
-POINTER_FIELD_OF_A_CALL = ("struct P\n    p: *H\n\n" + _h("i32")
-                           + "fn mk() -> P\n    var o: P\n    o.p = @g\n    return o\n\n"
-                           + "var g: H\n\n" + MAIN + _fill("g.a", (1, 2, 4))
-                           + _SUM.format(n="mk().p.a"))
+# temporary's (AGAST #2518), so its `@` is no `@` of a temporary: each compiler
+# walks it, in place, calling `mk()` once (AGAST #3207).  `n` counts the calls,
+# so a second call shows as 107 rather than 7.  `@mk().h.a` stays refused above:
+# `h` is by value, so `h.a` is in the temporary.
+_P = "struct P\n    k: i8\n    p: *H\n\n" + _h("i32")
+_MK_P = "var n: i32 = 0\n\nfn mk() -> P\n    n = n + 1\n    var o: P\n    o.p = @g\n    return o\n\n"
+
+
+def _pointer_field(it, extra="", after=""):
+    return (_P + extra + _MK_P + after + "var g: H\n\n" + MAIN + _fill("g.a", (1, 2, 4))
+            + "    var t: i32 = 0\n" + f"    for x in {it}\n        t = t + x\n"
+            + "    return t + (n - 1) * 100\n")
+
+
+POINTER_FIELDS = {
+    "pointer_field_of_a_call": _pointer_field("@mk().p.a"),
+    "pointer_field_of_a_call_mut": _pointer_field("@&mk().p.a"),
+    # By value inside the call's struct, then through a pointer: still not the
+    # temporary's.
+    "nested_pointer_field_of_a_call": _pointer_field(
+        "@mkq().q.p.a", "struct Q\n    q: P\n\nfn mkq() -> Q\n    var o: Q\n    o.q = mk()\n"
+        "    return o\n\n"),
+    # A `*H` call's field is where the call points, not in a temporary.
+    "field_of_a_pointer_call": _pointer_field("@mkp().a", after="fn mkp() -> *H\n    n = n + 1\n"
+                                              "    return @g\n\n"),
+}
 
 
 @pytest.mark.integration
-def test_ritz0_walks_a_pointer_field_of_a_call(run_with):
-    assert run_with("ritz0", "pointer_field_of_a_call", POINTER_FIELD_OF_A_CALL) == 7
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(POINTER_FIELDS))
+def test_a_pointer_field_of_a_call_walks_it(run_with, compiler, name):
+    assert run_with(compiler, name, POINTER_FIELDS[name]) == 7
 
 
 # ritzlib's Vec, with its real header, borrowed and walked through `@w`.  It links

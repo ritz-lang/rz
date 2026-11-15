@@ -3799,15 +3799,31 @@ fn emit_for_literal(s: *EmitterState, e: *Expr, elem: *i32, size: *i32, name: **
     *size = n
     slot
 
-# AGAST #2533: whether the field `e` names is a field of a call's result, as in
-# `mk().a` or `mk().p.a`.  ritz0 takes no address of one.  `mkp()[0].a` is a
-# place, and ritz0 walks it: an index stops the search.
-fn member_reached_through_call(e: *Expr) -> i32
-    var base: *Expr = e
-    while base != null and base.kind == EXPR_MEMBER
-        base = base.left
-    if base != null and (base.kind == EXPR_CALL or base.kind == EXPR_METHOD)
-        return 1
+# AGAST #2533: whether the field `e` names is in a call's temporary, as `mk().a`
+# and `mk().h.a` are with `h` by value.  ritz0 takes no address of one (#2518).
+# AGAST #3207: a link through a pointer leaves the temporary, so `mk().p.a`
+# with `p: *H` is the place `p` points at, as `mkp().a` is with `mkp() -> *H`.
+# `mkp()[0].a` is a place too: an index stops the search.
+fn member_in_call_temp(s: *EmitterState, e: *Expr) -> i32
+    var m: *Expr = e
+    while m != null and m.kind == EXPR_MEMBER and m.left != null
+        let l: *Expr = m.left
+        if l.kind == EXPR_CALL or l.kind == EXPR_METHOD
+            # By value only: a `*S` call's field is where the call points.
+            if call_result_ptr_struct(s, l) != null
+                return 0
+            return 1
+        if l.kind != EXPR_MEMBER
+            return 0
+        # `m` reaches into the field `l` names.  A by-value struct is part of
+        # whatever holds `l`: look further.  A pointer leads elsewhere.  A link
+        # that won't resolve stays refused, as every call's field was.
+        let lf: *StructField = resolve_member_chain_field(s, l)
+        if lf == null
+            return 1
+        if lf.field_type == TYPE_PTR or lf.field_type == TYPE_REF or lf.field_type == TYPE_MUT_REF
+            return 0
+        m = l
     0
 
 # AGAST #2426: `*x`, with `x` a call, a field or a global of type `*[N]T` (as
@@ -3944,7 +3960,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # Refused before the member is reached, which would run the call.
             # A field reached through `Deref` is `(*S_deref(@b)).f` by now
             # (deref_field.ritz, AGAST #3015): a place, walked in place.
-            if via_addr == 0 or member_reached_through_call(arr_ident) == 0
+            if via_addr == 0 or member_in_call_temp(s, arr_ident) == 0
                 emit_member_ptr(s, arr_ident, @mr)
             if mr.success == 1 and mr.field.field_type == TYPE_ARRAY
                 let fld: *StructField = mr.field
