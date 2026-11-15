@@ -5,6 +5,7 @@
 # first silently and turned the second into IR clang refused, pointing at the
 # generated .ll.  The shared table is ritz0/test_call_arity_and_type.py.
 #
+#   known   "Unknown function: f", at the call (AGAST #3255)
 #   arity   "`f` called with N argument(s) but defined with M", at the call
 #   kind    "argument N of `f` has the wrong type: ...", at the argument
 #
@@ -40,6 +41,7 @@ import ast_helpers
 import emitter_core
 import emitter_expr_call   # lent_local, arg_pointee_struct
 import bool_check          # bool_kind, bk_of_type, BK_*
+import emitter             # is_cpuid_raw_function (AGAST #3255)
 
 # The last place reported, so a call emitted twice is said once.
 var g_cc_fn: *FnDef = null
@@ -89,6 +91,37 @@ fn cc_count_args(a: *Expr) -> i32
         n = n + 1
         x = x.next
     n
+
+# `syscallN` / `__syscallN` (N in 0..6): ritz1 gives these a body (emit_extern_
+# declarations), so with no declaration in scope they're known, not unknown.
+# Counted against a declaration when there is one (#3334); a bare one isn't
+# counted yet (#3352).
+fn cc_is_syscall_name(name: *u8, len: i32) -> i32
+    var at: i32 = 0
+    if len == 10 and memcmp(name, c"__syscall", 9) == 0
+        at = 9
+    else if len == 8 and memcmp(name, c"syscall", 7) == 0
+        at = 7
+    else
+        return 0
+    let d: u8 = *(name + at)
+    return (d >= '0' and d <= '6') as i32
+
+# A call to `name` that no declared, imported or `extern` fn answers (the
+# caller found no FnDef), refused at the call as ritz0 says it; 1 when refused.
+# ritz1 used to declare `@name(...)` and leave it to the no-libc link, whose
+# "undefined reference" names no line.  The names ritz1 gives a body itself
+# are not unknown: the `syscallN` builtins and `cpuid_raw` (emit_extern_
+# declarations).  A generic call (`f$T`) whose instance is missing is another
+# failure and isn't said here.
+pub fn call_check_known(s: *EmitterState, line: i32, col: i32, name: *u8, len: i32) -> i32
+    if cc_is_syscall_name(name, len) == 1 or is_cpuid_raw_function(name, len) == 1
+        return 0
+    if cc_report(s, line, col) == 1
+        eprints_cstr(c"Unknown function: ")
+        eprint_bytes(name, len)
+        eprint_char('\n')
+    1
 
 # `name(args)` against `params`, reported at line:col in ritz0's words.  1 when
 # the counts differ (refused), so the caller doesn't pair the arguments up.

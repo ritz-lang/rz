@@ -10,9 +10,9 @@ compiled to a raw `open(2)` syscall instead.
 
 The rule now (LANGUAGE_SPEC §4, AGAST #3243): a call to one of the five
 resolves exactly like any other call, to a declared, imported or `extern` fn of
-that name. With nothing of that name it is an unknown function: ritz0 refuses
-it at the call, located; ritz1 has no compile-time unknown-function check and
-leaves an undeclared callee to the linker, for `write` as for any other name.
+that name. With nothing of that name it is an unknown function, for `write` as
+for any other name: every compiler refuses it at the call, located, in ritz0's
+words (AGAST #3255; ritz1 used to leave it to the no-libc link).
 Syscalls are reached through ritzlib.sys (`sys_write`, `sys_read`, `sys_open`,
 `sys_open3`, `sys_close`, `sys_nanosleep`) or `syscallN`.
 
@@ -89,7 +89,7 @@ pub fn main() -> i32
 
 PROGRAMS = {"repro_3243": REPRO, "user_fns_of_each_name": USER_FNS}
 
-# Nothing named `write` anywhere: an unknown function like any other.
+# Nothing named `write` anywhere: an unknown function like any other (`frob`).
 UNDECLARED = """\
 pub fn main() -> i32
     var b: [3]u8
@@ -164,28 +164,41 @@ def test_user_fn_of_a_former_builtin_name_is_called(request, tmp_path, compiler,
     assert got == EXPECTED, f"{compiler}, {name}: exit {got}"
 
 
-def test_ritz0_refuses_undeclared_write_at_the_call(tmp_path):
-    """No builtin to fall back on: the located unknown-function error."""
-    proc, ll = _compile(None, "ritz0", tmp_path, UNDECLARED)
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", ["write", "frob"])
+def test_undeclared_fn_is_refused_at_the_call(request, tmp_path, compiler, name):
+    """AGAST #3255: ritz1 accepted the call, declared `@write(...)` and left
+    it to the link, whose "undefined reference" names no line."""
+    proc, ll = _compile(request, compiler, tmp_path, UNDECLARED.replace("write(", f"{name}("))
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out[-2000:]
-    assert re.search(r"unit\.ritz:4:5: Unknown function: write$", out, re.M), out[-2000:]
+    assert re.search(rf"unit\.ritz:4:5: Unknown function: {name}$", out, re.M), out[-2000:]
     assert "Traceback" not in out, out[-2000:]
     assert not ll.exists()
 
 
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_leaves_undeclared_write_to_the_linker(request, tmp_path, compiler):
-    """ritz1 treats `write` as it does any undeclared callee: an extern the
-    no-libc link cannot resolve. No syscall body is emitted for it."""
-    proc, ll = _compile(request, compiler, tmp_path, UNDECLARED)
+# The undeclared names every compiler answers itself, which #3255's refusal
+# must not reach: the syscallN builtins and cpuid_raw.  pid 39 is getpid.
+INTRINSICS = """\
+pub fn main() -> i32
+    var a: i32 = 0
+    var b: i32 = 0
+    var c: i32 = 0
+    var d: i32 = 0
+    cpuid_raw(0, 0, @a, @b, @c, @d)
+    if syscall0(39) <= 0 or __syscall0(39) <= 0
+        return 1
+    42
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_builtin_names_need_no_declaration(request, tmp_path, compiler):
+    proc, ll = _compile(request, compiler, tmp_path, INTRINSICS)
     assert proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
-    ir = ll.read_text()
-    assert re.search(r"^declare i64 @write\(", ir, re.M), ir[-2000:]
-    assert "__ritz_builtin_" not in ir and "asm sideeffect" not in ir.split("@main(")[1], ir
-    link, _ = _link(compiler, tmp_path, ll)
-    assert link.returncode != 0
-    assert "undefined reference to `write'" in link.stderr, link.stderr[-2000:]
+    link, exe = _link(compiler, tmp_path, ll)
+    assert link.returncode == 0, link.stderr[-2000:]
+    assert subprocess.run([str(exe)], capture_output=True, timeout=60).returncode == EXPECTED
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

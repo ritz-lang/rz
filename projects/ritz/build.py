@@ -1466,17 +1466,22 @@ def ritz1_env(namespaces: dict | None = None) -> dict:
     minimal CLI can't take as --deps: for each namespace whose directory is
     named after it, the directory's parent is appended, so ritz1's
     `<entry>/<pkg>/{lib,src}/...` probe finds it — including a package
-    importing itself by name from outside projects/ (AGAST #1538). Appended
-    last, so it only affects imports that would otherwise fail.
+    importing itself by name from outside projects/ (AGAST #1538). They go
+    ahead of projects/, so a declared dependency outranks a workspace project
+    of its name: examples/test_deps/app's `squeeze` is not projects/squeeze,
+    and ritz1 compiled its `import squeeze.gzip` against the latter, leaving
+    the calls it lacked to the link (AGAST #3255, which refuses them now).
+    Every workspace package's dependencies live in projects/ already, so this
+    reorders nothing for them.
     """
     env = os.environ.copy()
-    entries = [str(ROOT), str(ROOT.parent)]
-    for e in env.get("RITZ_PATH", "").split(os.pathsep):
-        if e and e not in entries:
-            entries.append(e)
+    entries = [str(ROOT)]
     for name, spec in (namespaces or {}).items():
         if spec.path.name == name and str(spec.path.parent) not in entries:
             entries.append(str(spec.path.parent))
+    for e in [str(ROOT.parent), *env.get("RITZ_PATH", "").split(os.pathsep)]:
+        if e and e not in entries:
+            entries.append(e)
     env["RITZ_PATH"] = os.pathsep.join(entries)
     return env
 

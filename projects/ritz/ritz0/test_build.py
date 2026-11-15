@@ -1136,6 +1136,23 @@ class TestSelfNamespace:
         assert ns["me"].sources == ["x"]
 
     @pytest.mark.unit
+    def test_ritz1_env_declared_namespace_outranks_a_workspace_project(self, tmp_path, monkeypatch):
+        """AGAST #3255: examples/test_deps/app depends on its own `squeeze`, and
+        projects/squeeze is another.  With the namespace's parent after
+        projects/, ritz1 compiled `import squeeze.gzip` against the workspace
+        one, which has no `compress_level`, and only the link found the real
+        callee; now that ritz1 refuses an unknown function it must see the
+        declared one."""
+        monkeypatch.setenv("RITZ_PATH", "")
+        squeeze = tmp_path / "squeeze"
+        squeeze.mkdir()
+        spec = _build_module.DependencySpec
+        entries = _build_module.ritz1_env({
+            "squeeze": spec(name="squeeze", path=squeeze, sources=["src"]),
+        })["RITZ_PATH"].split(os.pathsep)
+        assert entries.index(str(tmp_path)) < entries.index(str(_build_module.ROOT.parent)), entries
+
+    @pytest.mark.unit
     def test_ritz1_env_appends_parent_of_self_named_namespace_dirs(self, tmp_path, monkeypatch):
         """ritz1 takes no --deps: a namespace reaches it as <parent>/<name> on RITZ_PATH."""
         monkeypatch.setenv("RITZ_PATH", "")
@@ -1149,10 +1166,11 @@ class TestSelfNamespace:
             "odd": spec(name="odd", path=odd, sources=["lib"]),  # dir name != ns: not probe-able
         })
         entries = env["RITZ_PATH"].split(os.pathsep)
-        assert entries[:2] == [str(_build_module.ROOT), str(_build_module.ROOT.parent)]
-        assert str(tmp_path) in entries[2:]
+        assert entries[0] == str(_build_module.ROOT)
+        assert str(tmp_path) in entries[1:]
         assert str(odd.parent) not in entries
-        assert _build_module.ritz1_env()["RITZ_PATH"].split(os.pathsep)[:2] == entries[:2]
+        bare = _build_module.ritz1_env()["RITZ_PATH"].split(os.pathsep)
+        assert bare[:2] == [str(_build_module.ROOT), str(_build_module.ROOT.parent)]
 
     # Real build.py without --no-cache: shared .ritz-cache (#1804, conftest.py).
     @pytest.mark.xdist_group("tree")
