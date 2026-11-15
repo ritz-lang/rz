@@ -2388,6 +2388,39 @@ fn own_moves_element(s: *EmitterState, e: *Expr) -> i32
         return 0
     own_type_is_move_only(s, name, len)
 
+# LARB R34 (AGAST #3367, §13.2): the `G` of a by-value read of `e` (`G`,
+# `G.f.g`) that moves a move-only value out of the module-level `var G` or a
+# field of it, else null.  A global is never dropped and any fn may read it,
+# so nothing could track the move: two moves out of one dropped it twice
+# (#3280).  A path through a pointer field is own_moves_out's, checked first.
+# ritz0's MoveChecker._check_global_move_out.
+fn own_moves_global(s: *EmitterState, e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r != null and r.kind == EXPR_MEMBER
+        r = r.left
+    if r == null or r.kind != EXPR_IDENT
+        return null
+    if find_local_idx(s, r.ident_ptr, r.ident_len) >= 0 or find_global(s, r.ident_ptr, r.ident_len) == null
+        return null
+    var name: *u8 = null
+    var len: i32 = 0
+    if own_value_struct(s, e, @name, @len) == 0 or own_type_is_move_only(s, name, len) == 0
+        return null
+    r
+
+# "cannot move out of global `G`: borrow it with `@G.t`", at `G`: ritz0's
+# words, from ref_rules.move_out_of_global.
+fn own_error_move_out_of_global(s: *EmitterState, g: *Expr, e: *Expr)
+    if ref_first_report(g.span.line, g.span.col) == 0
+        return
+    own_eprint_loc(g.span.line, g.span.col)
+    eprints_cstr(c": error: cannot move out of global `")
+    own_eprint_name(g.ident_ptr, g.ident_len)
+    eprints_cstr(c"`: borrow it with `@")
+    own_eprint_path(e)
+    eprints_cstr(c"`\n")
+    s.error_count = s.error_count + 1
+
 # The struct `e` holds by value: 1 and its name, or 0.  `p[i]` and `(*p)[i]` through
 # a Vec or Span hold its element (AGAST #2444, R9), which ref_ty_of doesn't name.
 fn own_value_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
@@ -2466,6 +2499,11 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
         let eat: *Expr = own_start_of(e)
         ref_error_move_out_of_element(s, eat.span.line, eat.span.col)
         return
+    if mv == 1
+        let g: *Expr = own_moves_global(s, e)
+        if g != null
+            own_error_move_out_of_global(s, g, e)
+            return
     if k == EXPR_IDENT
         if mv == 1 and own_lent_payload(s, e) == 1
             ref_error_move_out(s, e.span.line, e.span.col)

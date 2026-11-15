@@ -809,6 +809,36 @@ pub fn main() -> i32
     return DROPS
 """, 0, {}),
 
+    # LARB R34 refuses only a move-only value: a copyable struct global copies
+    # out by value as often as it's read (#3367).
+    "copy_of_global_struct": (SLOT + FIELDS + """\
+var PL: Plain
+
+fn f() -> i32
+    PL = Plain { x: 1, y: 2 }
+    var a = PL
+    var b = PL
+    return a.x + b.y
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 30, {}),
+
+    # LARB R34b: a by-value `match G.t` moves (GLOBAL_MOVE_OUT); `match @G.t`
+    # lends it, reads the payload in place and drops nothing.
+    "match_on_borrowed_global_field": (SLOT + FIELDS + """\
+var SL: Slotted
+
+fn f() -> i32
+    SL = Slotted { e: Slot.Full(make(4)), s: make(5) }
+    match @SL.e
+        Full(x) => x.id
+        _ => 0
+
+pub fn main() -> i32
+    return f() * 10 + DROPS
+""", 40, {}),
+
     # AGAST #2257: a binding from a method call has the method's return type,
     # so it moves. Each of these dropped one value twice on ritz0.
     "method_binding_moves_into_call": (METHODS + """\
@@ -2842,25 +2872,57 @@ fn f() -> i32
     GLOBAL = make_holder(1)
 """
 
-RITZ1_GLOBAL_GAP = {"ritz1": 3367, "ritz1_selfhosted": 3367}
+# ritz0 refuses it since #3366, ritz1 and ritz1_selfhosted since #3367.
+GLOBAL_GAP = {}
 
 GLOBAL_MOVE_OUT = {
     "two_moves_of_global_field": (GLOBAL_HEAD + """\
     var x = GLOBAL.t
     var y = GLOBAL.t
     return 0
-""" + TAIL, "GLOBAL.t", "    var x = GLOBAL.t", RITZ1_GLOBAL_GAP),
+""" + TAIL, "GLOBAL.t", "    var x = GLOBAL.t", GLOBAL_GAP),
     "one_move_of_global_field": (GLOBAL_HEAD + """\
     var x = GLOBAL.t
     return consume(x)
-""" + TAIL, "GLOBAL.t", "    var x = GLOBAL.t", RITZ1_GLOBAL_GAP),
+""" + TAIL, "GLOBAL.t", "    var x = GLOBAL.t", GLOBAL_GAP),
     "whole_global_binding": (GLOBAL_HEAD + """\
     var x = GLOBAL
     return 0
-""" + TAIL, "GLOBAL", "    var x = GLOBAL", RITZ1_GLOBAL_GAP),
+""" + TAIL, "GLOBAL", "    var x = GLOBAL", GLOBAL_GAP),
     "global_field_into_call": (GLOBAL_HEAD + """\
     return consume(GLOBAL.t)
-""" + TAIL, "GLOBAL.t", "    return consume(GLOBAL.t)", RITZ1_GLOBAL_GAP),
+""" + TAIL, "GLOBAL.t", "    return consume(GLOBAL.t)", GLOBAL_GAP),
+    # #3367: the other by-value uses of §13.2, each its own path in ritz1's
+    # ownership.ritz: a by-value `self`, `return`, a struct literal's field,
+    # and a field two deep.
+    "by_value_self_on_global_field": (GLOBAL_HEAD + """\
+    return GLOBAL.t.burn()
+""" + TAIL, "GLOBAL.t", "    return GLOBAL.t.burn()", GLOBAL_GAP),
+    "global_field_returned": (GLOBAL_HEAD + """\
+    return 0
+
+fn g() -> Tracked
+    return GLOBAL.t
+""" + TAIL, "GLOBAL.t", "    return GLOBAL.t", GLOBAL_GAP),
+    "global_field_into_struct_literal": (GLOBAL_HEAD + """\
+    var h = Holder { t: GLOBAL.t, n: 0 }
+    return 0
+""" + TAIL, "GLOBAL.t", "    var h = Holder { t: GLOBAL.t, n: 0 }", GLOBAL_GAP),
+    "nested_field_of_global": (SLOT + FIELDS + """\
+var DEEP: Deep
+
+fn f() -> Tracked
+    return DEEP.p.t
+""" + TAIL, "DEEP.p.t", "    return DEEP.p.t", GLOBAL_GAP),
+    # A match by value owns its scrutinee, as ritz0's does: `match @SL.e` lends it.
+    "match_on_global_field": (SLOT + FIELDS + """\
+var SL: Slotted
+
+fn f() -> i32
+    match SL.e
+        Full(x) => consume(x)
+        _ => 0
+""" + TAIL, "SL.e", "    match SL.e", GLOBAL_GAP),
 }
 
 # AGAST #2178: a match that owns nothing (`match @s`, a `name:& T` param, a
@@ -3446,7 +3508,7 @@ def test_move_out_of_a_global_refused(request, tmp_path, compiler, name):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
-    assert move_out_of_global("GLOBAL", path) in out, out[-2000:]
+    assert move_out_of_global(path.split(".")[0], path) in out, out[-2000:]
     # Located at the path: its line and column in the body, after the prelude.
     lines = body.splitlines()
     at = PRELUDE.count("\n") + lines.index(use) + 1
