@@ -242,6 +242,7 @@ def test_struct_from_a_field_global_or_pointer(run_with, compiler):
 # was refused, located ("can't tell which struct"), or for the block forms did
 # not parse at all (#2594); ritz0 gives 7 for each.
 #   unwrap          an Option<P>'s payload, read at %P, not as an i64
+#   unwrap_or       a None's default: the select is on %P, not i64 (#2863)
 #   chained_method  `c.me()` names the C `.tp(3)` is dispatched on
 #   match / if      a block init (angelo raster/fill.ritz:59): the arms' phi
 #                   names it; the grammar took a one-line init only
@@ -268,6 +269,8 @@ pub fn main() -> i32
 NAMED = {
     "unwrap": "    let r: Option<P> = Some(P { x: 1, y: 6 })\n"
               "    let (a, b) = r.unwrap()\n",
+    "unwrap_or": "    let r: Option<P> = None\n"
+                 "    let (a, b) = r.unwrap_or(P { x: 1, y: 6 })\n",
     "chained_method": "    let c = C { k: 1 }\n    let (a, b) = c.me().tp(3)\n",
     "match": "    let (a, b) = match t\n        1 => P { x: 1, y: 6 }\n"
              "        _ => P { x: 3, y: 5 }\n",
@@ -282,44 +285,6 @@ NAMED = {
 def test_named_struct_runs_like_ritz0(run_with, name, compiler):
     prog = _NAMED_PRE + NAMED[name] + "    return a + b\n"
     assert run_with(compiler, f"named_{name}", prog) == 7
-
-
-# Shapes ritz1 still can't name the struct of.  Each is refused, located at
-# the `let`, instead of binding nothing and failing at every later use with
-# an unlocated "unknown identifier".  ritz0 runs each (7): a known gap.
-_REFUSED_PRE = _NAMED_PRE
-REFUSED = {
-    # #2863: unwrap_or still selects an i64, so its struct isn't named.
-    "unwrap_or": ("    let r: Option<P> = None\n"
-                  "    let (a, b) = r.unwrap_or(P { x: 1, y: 6 })\n", 2863),
-}
-
-
-def _refused(name: str) -> str:
-    return _REFUSED_PRE + REFUSED[name][0] + "    return a + b\n"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(REFUSED))
-def test_unnamed_struct_is_a_located_error(compile_with, name, compiler):
-    comp, _ll, _work = compile_with(compiler, name, _refused(name))
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, out
-    assert "unknown identifier" not in out, out
-    line = _refused(name).splitlines().index(
-        next(x for x in _refused(name).splitlines() if "let (a, b)" in x)) + 1
-    assert f":{line}:5: ritz1 can't tell which struct this `let (a, b) = ...` destructures" in out, out
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(REFUSED))
-def test_unnamed_struct_runs_like_ritz0(request, run_with, name, compiler):
-    if compiler != "ritz0":
-        request.applymarker(pytest.mark.xfail(
-            strict=True, reason=f"AGAST #{REFUSED[name][1]}: ritz1 refuses this shape"))
-    assert run_with(compiler, name, _refused(name)) == 7
 
 
 # #2592: an element of a `[N]P` local, field or global is a `%P`, so it

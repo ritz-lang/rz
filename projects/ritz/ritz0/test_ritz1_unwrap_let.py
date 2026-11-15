@@ -151,16 +151,10 @@ def test_unwrap_let_borrowed_receiver(run_with, carrier, source, compiler):
 
 
 # `.unwrap_or(d)` is the same intrinsic and takes the same payload type.
-# ritz1 leaves that let untyped (#3250).
+# ritz1 left that let untyped ("cannot determine receiver type") and selected
+# the payload against the default as i64s (#3250).
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    "compiler",
-    [
-        c if c == "ritz0"
-        else pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#3250"))
-        for c in COMPILERS
-    ],
-)
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_unwrap_or_let_borrowed_receiver(run_with, compiler):
     program = _program("vec", "res", "call", recv="self: @Tag").replace(
         ".unwrap()", ".unwrap_or(vec_of(9))")

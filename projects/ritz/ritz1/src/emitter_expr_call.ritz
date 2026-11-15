@@ -4923,22 +4923,46 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     emit_str(s, c", ptr ")
     emit_reg(s, scrut_slot)
     emit_str(s, c", i32 0, i32 2\n")
-    if is_unwrap == 1
-        # AGAST #2594: a struct payload (`Option<P>`) loads as its `%P`, as
-        # `?` does (emit_try's aggregate arm); an i64 load gave clang
-        # `store %P <i64>`.  unwrap_or's select is still i64 (#2863).
-        var pay_name_len: i32 = 0
-        let pay_name: *u8 = tagged_enum_payload_named(s, type_name, type_name_len, @pay_name_len, 0)
-        if pay_name != null
-            let agg: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, agg)
-            emit_str(s, c" = load %")
-            emit_name(s, pay_name, pay_name_len)
-            emit_str(s, c", ptr ")
-            emit_reg(s, pay_ptr)
-            emit_str(s, c"  ; unwrap struct payload\n")
+    # AGAST #2594: a struct payload (`Option<P>`) loads as its `%P`, as `?`
+    # does (emit_try's aggregate arm); an i64 load gave clang `store %P <i64>`.
+    # AGAST #3250 / #2863: `unwrap_or(d)` selects between that `%P` and the
+    # default's `%P`; it selected i64s, so a struct (`Vec$E`) default was an
+    # aggregate where clang wanted an i64.
+    var pay_name_len: i32 = 0
+    let pay_name: *u8 = tagged_enum_payload_named(s, type_name, type_name_len, @pay_name_len, 0)
+    if pay_name != null
+        let agg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, agg)
+        emit_str(s, c" = load %")
+        emit_name(s, pay_name, pay_name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, pay_ptr)
+        emit_str(s, c"  ; unwrap struct payload\n")
+        if is_unwrap == 1
             return agg
+        let ok_agg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, ok_agg)
+        emit_str(s, c" = icmp eq i8 ")
+        emit_reg(s, tag_reg)
+        emit_str(s, c", 0  ; unwrap_or tag check (Ok/Some == 0)\n")
+        let def_agg: i32 = emit_expr(s, e.args)
+        let sel_agg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sel_agg)
+        emit_str(s, c" = select i1 ")
+        emit_reg(s, ok_agg)
+        emit_str(s, c", %")
+        emit_name(s, pay_name, pay_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, agg)
+        emit_str(s, c", %")
+        emit_name(s, pay_name, pay_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, def_agg)
+        emit_str(s, c"\n")
+        return sel_agg
     let payload: i32 = emit_tagged_payload_load(s, pay_ptr, type_name, type_name_len, 0)
 
     if is_unwrap == 1
