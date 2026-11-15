@@ -67,6 +67,31 @@ fn main() -> i32
     let d = mk<Cell<Cell<i32>>>(Cell<Cell<i32>> { v: Cell<i32> { v: 2 } })
     c.v.v.v + d.v.v.v
 """, 17),
+    # The same call as a `let` initialiser: ritz1 typed `mk<Cell<T>>(..)` by
+    # its unsubstituted type args, `Cell$Cell$T`, and refused the annotation
+    # `Cell<Cell<T>>` = `Cell$Cell$Cell$i32` (AGAST #3355).
+    "generic_call_let": (CELL + """\
+fn mk<T>(x: T) -> Cell<T>
+    Cell<T> { v: x }
+fn wrap<T>(x: T) -> Cell<Cell<T>>
+    let r: Cell<Cell<T>> = mk<Cell<T>>(mk<T>(x))
+    r
+fn main() -> i32
+    let c = wrap<Cell<i32>>(Cell<i32> { v: 15 })
+    let d = mk<Cell<Cell<i32>>>(Cell<Cell<i32>> { v: Cell<i32> { v: 2 } })
+    c.v.v.v + d.v.v.v
+""", 17),
+    # T a scalar: `mk<Cell<T>>` must still be `Cell$Cell$i32`, not `Cell$Cell$T`.
+    "generic_call_i32": (CELL + """\
+fn mk<T>(x: T) -> Cell<T>
+    Cell<T> { v: x }
+fn wrap<T>(x: T) -> Cell<Cell<T>>
+    let r: Cell<Cell<T>> = mk<Cell<T>>(mk<T>(x))
+    r
+fn main() -> i32
+    let c = wrap<i32>(19)
+    c.v.v
+""", 19),
 }
 
 
