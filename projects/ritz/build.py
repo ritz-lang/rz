@@ -3416,28 +3416,34 @@ def cmd_run(args):
 
 
 def cmd_clean(args):
-    """Remove build artifacts."""
-    packages = find_packages()
+    """Remove build artifacts.
 
-    for pkg_dir, config in packages:
-        binaries = get_binaries(pkg_dir, config)
-        for bin_name, _, _ in binaries:
-            bin_path = pkg_dir / bin_name
-            if bin_path.exists():
-                bin_path.unlink()
-                print(f"  🗑 {bin_path.relative_to(ROOT)}")
+    build_package writes every binary, `lib<name>.a` and manifest into
+    `<pkg>/build/<profile>/` (get_output_dir), so removing those directories
+    removes the build. Anything else under `<pkg>/build/` is left alone.
+    """
+    import shutil
+
+    def shown(path: Path) -> Path:
+        # RITZ_BUILD_CACHE_DIR (#2793) can put the cache outside ROOT.
+        return path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+
+    for pkg_dir, config in find_packages():
+        for profile_name in ("debug", "release"):
+            out_dir = get_output_dir(pkg_dir, get_build_profile(config, profile_name))
+            if out_dir.is_dir():
+                shutil.rmtree(out_dir)
+                print(f"  🗑 {shown(out_dir)}")
 
     # Clean pycache
     for pycache in ROOT.rglob("__pycache__"):
-        import shutil
         shutil.rmtree(pycache)
 
     # Clean build cache
     cache = get_build_cache()
     if cache.cache_dir.exists():
-        import shutil
         shutil.rmtree(cache.cache_dir)
-        print(f"  🗑 {cache.cache_dir.relative_to(ROOT)}")
+        print(f"  🗑 {shown(cache.cache_dir)}")
 
     print("✓ Cleaned")
 
