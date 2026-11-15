@@ -15843,10 +15843,14 @@ class LLVMEmitter:
             if not self.builder.block.is_terminated:
                 self._note_match_result_type(expr, arm.body)
 
-            # Remember which block we're in after emitting the body
+            # Remember which block we're in after emitting the body. One value
+            # per arm, terminated or not: _enum_match_result zips the values
+            # with the exit blocks, so appending a value only for live arms
+            # paired a `return` arm's `None` block with the next arm's value
+            # and the tail yielded a dummy 0 (AGAST #3318).
+            arm_values.append(arm_val)
             if not self.builder.block.is_terminated:
                 arm_exit_blocks.append(self.builder.block)
-                arm_values.append(arm_val)
                 self.builder.branch(merge_block)
             else:
                 arm_exit_blocks.append(None)
