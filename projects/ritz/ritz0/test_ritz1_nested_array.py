@@ -294,8 +294,10 @@ pub fn main() -> i32
             if b.g[r][c] as i32 != r * 4 + c
                 return 1
             sum = sum + (b.g[r][c] as i32)
-    # sizeof(B) is not checked: ritz0 says 24 through the alias (AGAST
-    # #2151); the IR layout { i8, [4 x [4 x i8]], i8 } is 18.
+    # The IR layout { i8, [4 x [4 x i8]], i8 } is 18 (ritz0 said 24
+    # through the alias until AGAST #2151).
+    if sizeof(B) != 18
+        return 5
     if b.pre != 7 or b.post != 9
         return 2
     let row: *u8 = @b.g[2][0]

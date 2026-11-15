@@ -861,6 +861,10 @@ class LLVMEmitter:
         Returns:
             (size_bytes, alignment_bytes)
         """
+        # AGAST #2151: a field spelled through an alias (`g: Grid`,
+        # `type Grid = [4][4]u8`) hit the unknown-type fallback of (8, 8)
+        # below, so sizeof disagreed with the alias-resolved LLVM layout.
+        ty = resolve_alias_in(ty, self.type_aliases)
         if isinstance(ty, rast.NamedType):
             # Primitive types
             primitives = {
