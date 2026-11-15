@@ -8,6 +8,12 @@ ritz0/test_array_store_rule.py holds all three compilers to it.
 # type; anything else has one already, and converting it is a loop you write.
 ELEMENT_MISMATCH = "an array only fits a slot of the same element type: write a loop to convert it"
 
+# A non-literal `[M]T` let, var or assigned into a local `[N]T`, M not N (AGAST
+# #2090). ritz1's own words, from emitter_stmt.ritz. ritz0 accepted the `let`
+# form and bound the `[M x T]` value under the `[N]T` name; the `var` and assign
+# forms it refused only in llvmlite's words.
+LENGTH_MISMATCH = "array length does not match the local array's length"
+
 # A whole `[N]T` where a `*U` goes, `U` not `[N]T` (AGAST #2392), or alone as a
 # statement (#3189). ritz1's own words, from emitter_expr_access.ritz, which
 # refuses it at every slot: ritz0 says the same at the same place rather than a

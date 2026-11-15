@@ -327,6 +327,7 @@ class TypeChecker:
         if isinstance(stmt, rast.VarStmt):
             if stmt.value:
                 init_type = self._infer_into(stmt.value, stmt.type)
+                self._check_local_array_length(stmt, stmt.value, init_type, stmt.type)
                 root = self._referent(stmt.value)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
@@ -345,6 +346,7 @@ class TypeChecker:
         elif isinstance(stmt, rast.LetStmt):
             if stmt.value:
                 init_type = self._infer_into(stmt.value, stmt.type)
+                self._check_local_array_length(stmt, stmt.value, init_type, stmt.type)
                 root = self._referent(stmt.value)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
@@ -386,6 +388,8 @@ class TypeChecker:
             target_type = self._infer_type(stmt.target)
             self._check_write(stmt.target)
             value_type = self._infer_into(stmt.value, target_type)
+            if isinstance(stmt.target, rast.Ident) and stmt.target.name in self.locals:
+                self._check_local_array_length(stmt, stmt.value, value_type, target_type)
             if not self._value_fits(stmt.value, value_type, target_type):
                 self._error(f"cannot assign {self._type_str(value_type)} "
                           f"to {self._type_str(target_type)}", stmt.span)
@@ -1846,6 +1850,25 @@ class TypeChecker:
             return
         self._slot_reported.add(id(expr))
         self._slot_error(array_rules.ELEMENT_MISMATCH, expr.span)
+
+    def _check_local_array_length(self, stmt: rast.Stmt, value: rast.Expr,
+                                  actual: Optional[rast.Type],
+                                  slot: Optional[rast.Type]) -> None:
+        """A non-literal `[M]T` into a local `[N]T`, M not N (AGAST #2090): a
+        `let` bound the `[M x T]` value under the `[N]T` name. Refused at the
+        statement, in ritz1's words. A literal's length is judged elsewhere."""
+        if (slot is None or actual is None or id(value) in self._slot_reported
+                or isinstance(value, (rast.ArrayLit, rast.ArrayFill))):
+            return
+        actual = self._resolve_alias(actual)
+        slot = self._resolve_alias(slot)
+        if not (isinstance(actual, rast.ArrayType) and isinstance(slot, rast.ArrayType)):
+            return
+        have = getattr(actual.size, 'value', actual.size)
+        want = getattr(slot.size, 'value', slot.size)
+        if isinstance(have, int) and isinstance(want, int) and have != want:
+            self._slot_reported.add(id(value))
+            self._slot_error(array_rules.LENGTH_MISMATCH, stmt.span)
 
     def _arrays_fit(self, actual: rast.Type, slot: rast.Type) -> bool:
         """False if an array in `actual` lands on another element type in `slot`.

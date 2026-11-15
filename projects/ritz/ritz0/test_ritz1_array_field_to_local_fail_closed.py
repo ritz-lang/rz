@@ -5,8 +5,11 @@ through the matrix.
 
 Anything else must fail closed with a diagnostic.  Before #2035 every shape here
 compiled with exit 0 and emitted `store i64 <[N x T]>` (or a scalar into an
-array slot), which only clang caught.  None of these programs is valid Ritz;
-ritz0 rejects five and wrongly accepts one (KNOWN_RITZ0_GAPS, AGAST #2090).
+array slot), which only clang caught.  None of these programs is valid Ritz,
+and ritz0 rejects them all.  Until AGAST #2090 ritz0 accepted
+`let a: [3]i64 = <a [2]i64>` from any source: a field, a local, `p.f`, `(*p).f`.
+It now refuses a whole-array `let`, `var` or assign of another length at the
+statement, in ritz1's words.
 """
 
 import os
@@ -51,6 +54,27 @@ CASES = {
         "    var a: [2]i64 = [0, 0]\n    a = w.small\n",
         ELEM,
     ),
+    # AGAST #2090: the length rule doesn't depend on where the array comes from.
+    "let_local_len_mismatch": (
+        "    let a: [3]i64 = loc\n",
+        LEN,
+    ),
+    "let_local_shorter": (
+        "    let a: [1]i64 = loc\n",
+        LEN,
+    ),
+    "let_ptr_field_len_mismatch": (
+        "    let a: [3]i64 = p.vals\n",
+        LEN,
+    ),
+    "let_deref_field_len_mismatch": (
+        "    let a: [3]i64 = (*p).vals\n",
+        LEN,
+    ),
+    "var_len_mismatch": (
+        "    var a: [3]i64 = w.vals\n",
+        LEN,
+    ),
     "let_scalar_field": (
         "    let a: [2]i64 = w.tail\n",
         NOT_ARRAY,
@@ -61,9 +85,9 @@ CASES = {
     ),
 }
 
-# ritz0 accepts these without a type error (AGAST #2090).  Strict xfail: once
-# ritz0 rejects one, its entry must be removed here.
-KNOWN_RITZ0_GAPS = {"let_len_mismatch"}
+# ritz0 accepts these without a type error.  Strict xfail: once ritz0 rejects
+# one, its entry must be removed here.  Empty since AGAST #2090.
+KNOWN_RITZ0_GAPS = set()
 
 
 def _program(body: str) -> str:
@@ -71,6 +95,8 @@ def _program(body: str) -> str:
         PRELUDE
         + "pub fn main() -> i32\n"
         + "    var w: Wide = Wide { vals: [1, 2], small: [3, 4], tail: 5 }\n"
+        + "    var loc: [2]i64 = [1, 2]\n"
+        + "    let p: *Wide = @w\n"
         + body
         + "    0\n"
     )
@@ -125,3 +151,17 @@ def test_ritz1_fails_closed(ritz1_bin, tmp_path, name):
     assert proc.returncode != 0, f"ritz1 accepted {name}:\n{out[-2000:]}"
     assert diagnostic in out, f"missing diagnostic {diagnostic!r}:\n{out[-2000:]}"
     assert not ll.exists(), "ritz1 must refuse to write output on an emit error"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(n for n in CASES if CASES[n][1] == LEN))
+def test_ritz0_refuses_length_at_the_statement(tmp_path, name):
+    """AGAST #2090: ritz0 refuses a whole-array let / var / assign of another
+    length in ritz1's words, located at the statement (its last line, column 5)
+    rather than with llvmlite's `cannot store [2 x i64] to [3 x i64]*`."""
+    proc, _ = _compile("ritz0", tmp_path, name)
+    out = proc.stdout + proc.stderr
+    line = _program(CASES[name][0]).count("\n") - 1
+    assert proc.returncode != 0, f"ritz0 accepted {name}"
+    assert f":{line}:5: {LEN}" in out or f":{line}:5: error: {LEN}" in out, out[-2000:]
+    assert "mismatching types" not in out, out[-2000:]
