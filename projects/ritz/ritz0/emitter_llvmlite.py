@@ -1784,6 +1784,15 @@ class LLVMEmitter:
             if expr.elements and all(e is not None for e in elems):
                 return rast.TupleType(expr.span, elems)
             return None
+        elif isinstance(expr, rast.TryOp):
+            # `x?` is the Ok / Some payload, as the move checker types it.
+            # Without this `var t = try_make(1)?` recorded no type, so the
+            # binding was never registered for a scope-end drop (AGAST #2264).
+            inner = self._infer_ritz_type(expr.expr)
+            if (isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option')
+                    and inner.args):
+                return inner.args[0]
+            return None
         elif isinstance(expr, rast.Match):
             # A move-only arm value (_note_match_result_type, AGAST #2177).
             return getattr(expr, 'result_ritz_type', None)

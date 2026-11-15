@@ -263,6 +263,22 @@ fn make_or_err(c: i32) -> Result<Tracked, i32>
 
 """
 
+# Bindings initialised from `?` (AGAST #2264). Not `open`: a user fn of that
+# name is ritz0's builtin syscall (#3243).
+TRY_MAKE = """\
+fn try_make(id: i32) -> Result<Tracked, i32>
+    if id == 0
+        return Err(9)
+    return Ok(make(id))
+
+fn try_some(id: i32) -> Option<Tracked>
+    return Some(make(id))
+
+impl Tracked
+    fn try_new(id: i32) -> Result<Tracked, i32>
+        return Ok(make(id))
+
+"""
 
 
 # AGAST #2319: more movable paths than an i32 has bits (ritz1 used to track
@@ -620,6 +636,83 @@ pub fn main() -> i32
     f()
     return DROPS
 """, 1, BINDING_TYPE_GAP),
+
+    # AGAST #2264: a binding from `?` owns the unwrapped value. ritz0
+    # dropped none of these: it typed no `?` initialiser, so leaked them.
+    "try_binding_drops_at_scope_end": (TRY_MAKE + """\
+fn g() -> Result<i32, i32>
+    var t = try_make(1)?
+    return Ok(0)
+
+pub fn main() -> i32
+    g()
+    return DROPS
+""", 1, {}),
+
+    "try_binding_let": (TRY_MAKE + """\
+fn g() -> Result<i32, i32>
+    let t = try_make(1)?
+    return Ok(0)
+
+pub fn main() -> i32
+    g()
+    return DROPS
+""", 1, {}),
+
+    "try_binding_moves_to_binding": (TRY_MAKE + """\
+fn g() -> Result<i32, i32>
+    var t = try_make(1)?
+    var u = t
+    return Ok(0)
+
+pub fn main() -> i32
+    g()
+    return DROPS
+""", 1, {}),
+
+    "try_binding_moves_into_call": (TRY_MAKE + """\
+fn g() -> Result<i32, i32>
+    var t = try_make(1)?
+    return Ok(consume(t))
+
+pub fn main() -> i32
+    g()
+    return DROPS
+""", 1, {}),
+
+    # Reverse declaration order on success (21); on `Err` only `a` exists (1).
+    "try_binding_order_and_early_return": (TRY_MAKE + """\
+fn g(c: i32) -> Result<i32, i32>
+    var a = make(1)
+    var t = try_make(c)?
+    return Ok(0)
+
+pub fn main() -> i32
+    g(2)
+    g(0)
+    return ORDER
+""", 211, {}),
+
+    "try_binding_from_option": (TRY_MAKE + """\
+fn g() -> Option<i32>
+    var t = try_some(1)?
+    return Some(0)
+
+pub fn main() -> i32
+    g()
+    return DROPS
+""", 1, {}),
+
+    "try_binding_from_method": (TRY_MAKE + """\
+fn g() -> Result<i32, i32>
+    var t = Tracked.try_new(1)?
+    var u = t
+    return Ok(0)
+
+pub fn main() -> i32
+    g()
+    return DROPS
+""", 1, {}),
 
     # Neighbours #2243 doesn't reach: `x` stays unknown, so a copy.
     "field_binding_of_array_element": (SLOT + FIELDS + """\
