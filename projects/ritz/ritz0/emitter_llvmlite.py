@@ -12347,11 +12347,13 @@ class LLVMEmitter:
                     if param_enum is not None:
                         val = self._emit_enum_variant_with_type(arg, param_enum)
                     elif (self._is_range_index(arg)
-                            or self._builtin_type_receiver(arg) is not None):
+                            or self._builtin_type_receiver(arg) is not None
+                            or self._is_generic_static_call(arg)):
                         # AGAST #2877: a Vec slice into a `Span<T>` param is
                         # a view (_emit_vec_span_slice), as into a Span let.
                         # AGAST #2296: `Span.empty()` takes its T from the
-                        # param, not from whatever slot encloses the call.
+                        # param, not from whatever slot encloses the call;
+                        # so does `Slot.mk(5)` (AGAST #2185).
                         val = self._emit_slice_into(arg, param_def.type)
                     else:
                         val = self._emit_into_array_slot(arg, param_def.type)
@@ -13394,6 +13396,47 @@ class LLVMEmitter:
             return None
         return base_name
 
+    def _generic_type_receiver(self, name: str, method: str) -> bool:
+        """Is `name` in `name.method(..)` a generic struct or enum, not a value?
+
+        A variant of a generic enum (`Slot.Full(5)`) isn't a method call, so
+        it's left to the paths that build variants.
+        """
+        if name in self.locals or name in self.params or name in self.globals:
+            return False
+        variants = getattr(self, 'generic_types', {}).get(name)
+        return variants is not None and method not in variants
+
+    def _is_generic_static_call(self, expr: rast.Expr) -> bool:
+        """Is `expr` a `Slot.mk(..)` that takes its instance from its slot?"""
+        return (isinstance(expr, rast.MethodCall) and isinstance(expr.expr, rast.Ident)
+                and self._generic_type_receiver(expr.expr.name, expr.method))
+
+    def _generic_static_instance(self, expr: rast.MethodCall) -> str:
+        """The instance `Slot.mk(5)` calls `mk` on: the slot's (AGAST #2185).
+
+        The receiver spells no type argument, so it takes them from the slot
+        the call fills, as a bare variant constructor does (§11.3): a typed
+        `let`'s, a parameter's, the fn's return type.  Nothing else supplies
+        them: with no slot, or one that isn't an instance of this type, it's
+        an error at the call.
+        """
+        name = expr.expr.name
+        expected = self.expected_ritz_type
+        if expected is not None:
+            expected = resolve_alias_in(expected, self.type_aliases)
+        if isinstance(expected, rast.NamedType):
+            # Monomorph spells a slot's `Slot<i32>` as its instance, `Slot$i32`;
+            # an alias's target (`type S = Slot<i32>`) it leaves as written.
+            inst = expected.name
+            if expected.name == name and expected.args:
+                inst = self._get_specialized_type_name(expected)
+            if inst.startswith(name + '$') and (inst in self.struct_types
+                                                 or inst in self.enum_types):
+                return inst
+        raise EmitError(f"can't infer the type arguments of `{name}` for "
+                        f"`{name}.{expr.method}`: give the binding a type", expr.span)
+
     def _try_emit_associated_builtin_call(self, expr: rast.MethodCall) -> Optional[ir.Value]:
         """Emit `Span.empty()` / `Vec.new()` style associated calls.
 
@@ -13674,6 +13717,11 @@ class LLVMEmitter:
             elif (name in self.enum_types and name not in self.locals
                     and name not in self.params and name not in self.globals):
                 type_name = name
+                is_static_call = True
+            # `Slot.mk(5)` on `impl<T> Slot<T>`: the instance is the slot's
+            # (AGAST #2185); the bare template was emitted as a value.
+            elif self._generic_type_receiver(name, expr.method):
+                type_name = self._generic_static_instance(expr)
                 is_static_call = True
             # First check ritz_types for the original Ritz type (preserves signedness)
             elif name in self.ritz_types:
@@ -17392,6 +17440,11 @@ def emit(module: rast.Module, no_runtime: bool = False,
     # And each generic struct's arity: an error spells `Wrap$H` as `Wrap<H>` (§7.7).
     generic_arity = {item.name: len(item.type_params) for item in module.items
                      if isinstance(item, rast.StructDef) and item.type_params}
+    # Each generic struct and enum, by its variants (none for a struct): monomorph
+    # drops the templates, and `Slot.mk(5)` names one (AGAST #2185).
+    generic_types = {item.name: frozenset(v.name for v in getattr(item, 'variants', ()))
+                     for item in module.items
+                     if isinstance(item, (rast.StructDef, rast.EnumDef)) and item.type_params}
     try:
         module = monomorphize(module)
     except GenericInferError as e:
@@ -17408,6 +17461,7 @@ def emit(module: rast.Module, no_runtime: bool = False,
     emitter = LLVMEmitter(source_file=source_file, source_dir=source_dir, target=target,
                           target_os=target_os)
     emitter._generic_arity = generic_arity
+    emitter.generic_types = generic_types
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
     emitter.generic_fn_names = generic_fn_names

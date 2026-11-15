@@ -3519,6 +3519,43 @@ fn main() -> i32
     0
 ```
 
+A method without `self` on a generic type's impl, `Type.m(..)` (§5.4), spells
+no type argument either. It takes the instance of the slot the call fills, as
+a bare constructor does: a typed `let`'s, a parameter's, the fn's return type.
+That holds for a generic struct's impl too. Its arguments don't supply one, so
+with no such slot, or a slot of another type, it's an error at the call
+(AGAST #2185; ritz1 is AGAST #3309):
+
+```ritz
+enum Maybe<T>
+    Present(T)
+    Absent
+
+impl<T> Maybe<T>
+    fn of(x: T) -> Maybe<T>
+        Present(x)
+
+fn main() -> i32
+    let a: Maybe<i32> = Maybe.of(5)  # Maybe<i32>.of
+    match a
+        Present(v) => v - 5
+        Absent => 1
+```
+
+```ritz expect-error="can't infer the type arguments of `Maybe` for `Maybe.of`: give the binding a type"
+enum Maybe<T>
+    Present(T)
+    Absent
+
+impl<T> Maybe<T>
+    fn of(x: T) -> Maybe<T>
+        Present(x)
+
+fn main() -> i32
+    let a = Maybe.of(5)
+    0
+```
+
 ### 11.4 Monomorphization
 
 Generics are monomorphized at compile time; each instantiation generates
