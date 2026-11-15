@@ -116,6 +116,12 @@ HAND_WRITTEN_TOKEN_IDS = {
 }
 
 
+# Rules whose parse_<rule>() other ritz1 files call (parser_api, main, ...).
+# They're `pub`; every other parse_<rule>() is private to the generated parser
+# (AGAST #3414, LARB R45a: a fn called from another file must be `pub`).
+PUBLIC_RULES = frozenset({'module', 'expr'})
+
+
 def unmapped_tokens(grammar: Grammar) -> List[str]:
     """Grammar tokens that have no ritz1 token ID (and so can't be lexed)."""
     return [t.name for t in grammar.tokens if t.name not in HAND_WRITTEN_TOKEN_IDS]
@@ -218,7 +224,7 @@ class RitzGenerator:
 
         # token_new function
         self._emit('# Helper function to create a Token')
-        self._emit('fn token_new(kind: i32, pos: i64, len: i32, line: i64, col: i64) -> Token')
+        self._emit('pub fn token_new(kind: i32, pos: i64, len: i32, line: i64, col: i64) -> Token')
         self._emit('    Token {')
         self._emit('        kind: kind,')
         self._emit('        start: null,')
@@ -382,7 +388,7 @@ class RitzGenerator:
         return self._get_output()
 
     def _generate_parser_init(self):
-        self._emit('fn parser_init(p: *Parser, tokens: *Token, count: i32, arena_ptr: *u8)')
+        self._emit('pub fn parser_init(p: *Parser, tokens: *Token, count: i32, arena_ptr: *u8)')
         self._emit('    p.tokens = tokens')
         self._emit('    p.token_count = count')
         self._emit('    p.pos = 0')
@@ -420,12 +426,12 @@ class RitzGenerator:
         self._emit('    p.max_pos = 0')
 
     def _generate_parser_helpers(self):
-        self._emit('fn p_peek(p: *Parser) -> i32')
+        self._emit('pub fn p_peek(p: *Parser) -> i32')
         self._emit('    if p.pos >= p.token_count')
         self._emit('        return TOK_EOF')
         self._emit('    return (p.tokens + p.pos).kind')
         self._emit('')
-        self._emit('fn p_advance(p: *Parser) -> i32')
+        self._emit('pub fn p_advance(p: *Parser) -> i32')
         self._emit('    let k: i32 = p_peek(p)')
         self._emit('    if p.pos < p.token_count')
         self._emit('        p.pos = p.pos + 1')
@@ -509,7 +515,8 @@ class RitzGenerator:
         rt = self._get_return_type(rule)
         default_ret = self._get_default_return(rule)
 
-        self._emit(f'fn parse_{rule.name}(p: *Parser) -> {rt}')
+        vis = 'pub ' if rule.name in PUBLIC_RULES else ''
+        self._emit(f'{vis}fn parse_{rule.name}(p: *Parser) -> {rt}')
         self._emit(f'    let start_pos: i32 = p.pos')
         self._emit('')
 
@@ -833,7 +840,7 @@ class RitzGenerator:
         self._emit('import lexer_nfa')
         self._emit('')
         self._emit('# Initialize lexer with token patterns from grammar')
-        self._emit('fn setup_lexer(lex: *Lexer, nfa_storage: *NFA, patterns_storage: *TokenPattern, states_storage: *NFAState, trans_storage: *Transition, sto_storage: *i32, stc_storage: *i32, ti_storage: *i32, max_states: i32, max_trans: i32) -> i32')
+        self._emit('pub fn setup_lexer(lex: *Lexer, nfa_storage: *NFA, patterns_storage: *TokenPattern, states_storage: *NFAState, trans_storage: *Transition, sto_storage: *i32, stc_storage: *i32, ti_storage: *i32, max_states: i32, max_trans: i32) -> i32')
         self._emit('    # Initialize NFA storage (Tier 1 NFA opt: index buffers for state-indexed lookup)')
         self._emit('    nfa_init(nfa_storage, states_storage, trans_storage, sto_storage, stc_storage, ti_storage, max_states, max_trans)')
         self._emit('')
