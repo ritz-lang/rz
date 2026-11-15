@@ -11,7 +11,7 @@ doesn't include the x86 asm parser.
 
 import re
 from dataclasses import dataclass, field, replace
-from typing import ClassVar, Dict, Optional, Tuple, List, Union, Set
+from typing import ClassVar, Dict, Optional, Tuple, List, Union, Set, Iterator
 from llvmlite import ir
 import ritz_ast as rast
 from monomorph import mangle_generic_name, mangle_type_name, resolve_alias_in
@@ -646,6 +646,9 @@ class LLVMEmitter:
         # #2255, #2260): see _reject_procedure_value. Holding the node keeps
         # its id from being reused by a later one.
         self._wanted_values: Dict[int, rast.Expr] = {}
+        # AGAST #2256: every used `match`/`if` arm, for `_emit_method_call`
+        # (a method call's callee is known only as it is emitted).
+        self._used_arms: Dict[int, rast.Expr] = {}
         # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
@@ -5463,9 +5466,7 @@ class LLVMEmitter:
                 offender = self._find_valueless_if(fn_def.body.expr, consumed=False)
                 if offender is not None:
                     self._raise_valueless_if(offender, fn_def.body.expr)
-                void_arm = self._find_void_arm(fn_def.body.expr, consumed=False)
-                if void_arm is not None:
-                    self._raise_void_arm(void_arm, fn_def.body.expr)
+                self._reject_void_arms(fn_def.body.expr, False, fn_def.body.expr)
                 # Check if we're returning a local variable - it should be moved, not dropped
                 exclude_var = None
                 if isinstance(fn_def.body.expr, rast.Ident):
@@ -6089,46 +6090,66 @@ class LLVMEmitter:
         fn_def = entry[1]
         return fn_def is not None and fn_def.ret_type is None
 
-    def _find_void_arm(self, expr: Optional[rast.Expr], consumed: bool = True,
-                       in_arm: bool = False) -> Optional[rast.Expr]:
-        """AGAST #2046: the first void call that is a used `match`/`if` arm.
+    def _used_arm_values(self, expr: Optional[rast.Expr], consumed: bool = True,
+                         in_arm: bool = False) -> Iterator[rast.Expr]:
+        """AGAST #2046: each `match`/`if` arm whose value is used, in order.
 
         The same walk as `_find_valueless_if`: operands are always consumed,
         and the result paths (`if` arms, block tails, `match` arm bodies)
-        inherit `consumed`. `in_arm` is True on a result path, so a void call
-        there is an arm with no value. A nested match/if arm is walked with
-        the same flags, so its own void arm is the offender (the innermost
-        call). A diverging arm (`return`) is a statement, never a call, and a
-        bare `let x = say(1)` (no arm) is `_reject_procedure_value`'s.
+        inherit `consumed`. `in_arm` is True on a result path, so a node there
+        is an arm's value. A nested match/if arm is walked with the same flags,
+        so the innermost arm comes too. A diverging arm (`return`) is a
+        statement, never a value, and a bare `let x = say(1)` (no arm) is
+        `_reject_procedure_value`'s.
         """
-        find = self._find_void_arm
+        walk = self._used_arm_values
         if expr is None:
-            return None
-        if consumed and in_arm and self._is_void_call(expr):
-            return expr
+            return
+        if consumed and in_arm:
+            yield expr
         if isinstance(expr, rast.Grouped):
-            return find(expr.expr, consumed, in_arm)
+            yield from walk(expr.expr, consumed, in_arm)
+            return
         if isinstance(expr, rast.AssignExpr):
-            return find(expr.target, False) or find(expr.value, True)
+            yield from walk(expr.target, False)
+            yield from walk(expr.value, True)
+            return
         for operand in LLVMEmitter._operands(expr):
-            found = find(operand, True)
-            if found is not None:
-                return found
+            yield from walk(operand, True)
         if isinstance(expr, rast.If):
-            return (find(expr.then_block, consumed, True)
-                    or find(expr.else_block, consumed, True))
-        if isinstance(expr, rast.Block):
-            return find(expr.expr, consumed, in_arm)
-        if isinstance(expr, rast.Match):
+            yield from walk(expr.then_block, consumed, True)
+            yield from walk(expr.else_block, consumed, True)
+        elif isinstance(expr, rast.Block):
+            yield from walk(expr.expr, consumed, in_arm)
+        elif isinstance(expr, rast.Match):
             for arm in expr.arms:
-                found = find(arm.body, consumed, True)
-                if found is not None:
-                    return found
-        return None
+                yield from walk(arm.body, consumed, True)
+
+    def _reject_void_arms(self, expr: Optional[rast.Expr], consumed: bool,
+                          fallback: object) -> None:
+        """AGAST #2046: refuse a used arm that calls a procedure.
+
+        A named call is judged here, before emission. A method call's callee
+        is known only once its receiver is typed as it is emitted (it may be
+        a local of the arm, a generic or a `dyn`), so each used arm is
+        recorded for `_reject_void_method_arm` (AGAST #2256).
+        """
+        for arm in self._used_arm_values(expr, consumed):
+            if self._is_void_call(arm):
+                self._raise_void_arm(arm, fallback)
+            self._used_arms[id(arm)] = arm
+
+    def _reject_void_method_arm(self, call: rast.MethodCall) -> None:
+        """AGAST #2256: `call` resolved to a procedure; is it a used arm?"""
+        if id(call) in self._used_arms:
+            self._raise_void_arm(call, call)
 
     @staticmethod
     def _raise_void_arm(offender: rast.Expr, fallback: object) -> None:
-        name = offender.func.name
+        if isinstance(offender, rast.MethodCall):
+            name = offender.method
+        else:
+            name = offender.func.name
         raise EmitError(
             f"this arm calls `{name}`, which returns nothing, so it has no "
             f"value; the `match`/`if` it belongs to is used as a value here",
@@ -6147,15 +6168,13 @@ class LLVMEmitter:
         is reached from here.
 
         AGAST #2046: the same roots reject a used `match`/`if` with a
-        void-call arm (`_find_void_arm`).
+        void-call arm (`_reject_void_arms`).
         """
         for expr, consumed in self._stmt_value_roots(stmt):
             offender = self._find_valueless_if(expr, consumed)
             if offender is not None:
                 self._raise_valueless_if(offender, stmt)
-            void_arm = self._find_void_arm(expr, consumed)
-            if void_arm is not None:
-                self._raise_void_arm(void_arm, stmt)
+            self._reject_void_arms(expr, consumed, stmt)
 
     def _expect_returned_value_from(self, expr: Optional[rast.Expr]) -> None:
         """A `return` wants `expr`'s value, unless the fn declares none.
@@ -13697,6 +13716,7 @@ class LLVMEmitter:
         if fn_def.ret_type is None:
             self._procedure_method_calls.add(id(expr))
             self._reject_procedure_value(expr, expr.method)
+            self._reject_void_method_arm(expr)
 
         # Check if this is a static method (no self parameter)
         # Static methods are called as Type.method() with no receiver instance
@@ -14007,6 +14027,7 @@ class LLVMEmitter:
         if self.traits[trait_name][method_index - 1].ret_type is None:
             self._procedure_method_calls.add(id(expr))
             self._reject_procedure_value(expr, expr.method)
+            self._reject_void_method_arm(expr)
 
         # Get vtable type for GEP
         vtable_type = self.vtable_types[trait_name]

@@ -48,8 +48,22 @@ fn say(x: i32)
 fn take(x: i32) -> i32
     x
 
+struct B
+    v: i32
+
+impl B
+    fn p(self)
+        pass
+
+trait T
+    fn t(self)
+
+impl T for B
+    fn t(self)
+        pass
+
 """
-# Line numbers below are 1-based within the whole file; HEADER is 8 lines.
+# Line numbers below are 1-based within the whole file, offset by HEADER.
 H = HEADER.count("\n")
 
 # name -> (body, line of the offending arm, col of the offending arm,
@@ -162,6 +176,57 @@ pub fn main() -> i32
         None => 1
     x
 """, H + 5, 20, ("ritz0",)),
+    # AGAST #2256: a method call to a procedure resolves only as it is
+    # emitted, so the check before emission cannot see it; these reach the
+    # one after. The diagnostic names the method (`_raise_void_arm`).
+    "let_if_method": ("""\
+fn f(b: B, c: i32) -> i32
+    let x: i32 = if c > 0
+        b.p()
+    else
+        7
+    x
+
+pub fn main() -> i32
+    f(B { v: 1 }, 1)
+""", H + 3, 9, BOTH),
+    "argument_inline_if_method": ("""\
+pub fn main() -> i32
+    let b: B = B { v: 1 }
+    let c: i32 = 1
+    take(if c == 1 then 2 else b.p())
+""", H + 4, 32, BOTH),
+    # The receiver is a local of the arm: no walk before emission types it.
+    "let_match_method_on_arm_local": ("""\
+pub fn main() -> i32
+    let o: Option<i32> = None
+    let x: i32 = match o
+        Some(e) =>
+            let b: B = B { v: e }
+            b.p()
+        None => 1
+    x
+""", H + 6, 13, BOTH),
+    # A `dyn` receiver: ritz1 refuses `dyn` itself (#2298).
+    "let_if_dyn_method": ("""\
+fn f(b: *dyn T, c: i32) -> i32
+    let x: i32 = if c > 0
+        b.t()
+    else
+        7
+    x
+
+pub fn main() -> i32
+    0
+""", H + 3, 9, ("ritz0",)),
+}
+
+# The method each REJECTED case's arm calls, for ritz0's diagnostic to name.
+METHOD_ARMS = {
+    "let_if_method": "p",
+    "argument_inline_if_method": "p",
+    "let_match_method_on_arm_local": "p",
+    "let_if_dyn_method": "t",
 }
 
 LEGAL = {
@@ -230,6 +295,18 @@ pub fn main() -> i32
     g(1)
     0
 """,
+    # AGAST #2256: a statement-position `if` whose arms call methods that
+    # return nothing uses no value.
+    "stmt_if_method_arms": """\
+pub fn main() -> i32
+    let b: B = B { v: 1 }
+    let c: i32 = 1
+    if c == 1
+        b.p()
+    else
+        b.t()
+    0
+""",
 }
 
 
@@ -278,6 +355,9 @@ def test_valueless_arm_in_value_position_is_a_located_error(
     m = re.search(r"unit\.ritz:(\d+):(\d+): .*has no value", output)
     assert m, f"diagnostic is not located at <line>:<col>:\n{output}"
     assert (int(m.group(1)), int(m.group(2))) == (line, col), output
+    # ritz1's message names no callee, a free call's included.
+    if compiler == "ritz0" and name in METHOD_ARMS:
+        assert f"`{METHOD_ARMS[name]}`" in m.group(0), output
 
 
 @pytest.mark.integration
