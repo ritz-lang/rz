@@ -29,6 +29,9 @@ class FnSignature:
     is_extern: bool
     is_generic: bool
     type_params: List[str]
+    # §15.2 visibility (AGAST #3416). True for metadata cached before it was
+    # recorded, so an old entry never makes a call warn.
+    is_pub: bool = True
 
 
 @dataclass
@@ -213,7 +216,8 @@ def extract_metadata(module: rast.Module, source_path: str) -> ModuleMetadata:
                 ret_type=type_to_string(item.ret_type),
                 is_extern=item.is_extern,
                 is_generic=item.is_generic(),
-                type_params=item.type_params or []
+                type_params=item.type_params or [],
+                is_pub=item.is_pub
             ))
 
         elif isinstance(item, rast.ExternFn):
@@ -303,7 +307,8 @@ def extract_metadata(module: rast.Module, source_path: str) -> ModuleMetadata:
                 methods.append({
                     "name": m.name,
                     "params": params,
-                    "ret_type": type_to_string(m.ret_type)
+                    "ret_type": type_to_string(m.ret_type),
+                    "is_pub": m.is_pub
                 })
             impls.append(ImplMeta(
                 trait_name=item.trait_name,

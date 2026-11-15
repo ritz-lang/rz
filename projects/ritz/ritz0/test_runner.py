@@ -485,6 +485,7 @@ def _ritz0_compile_dependency(ritz0_py: Path, src: str, ll_path: str,
     result = subprocess.run(compile_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return f"ritz0 failed for {Path(src).name}: {result.stderr}"
+    _build_module().relay_compiler_warnings(result.stderr)
     return None
 
 
@@ -605,6 +606,9 @@ def _compile_harness(
     result = subprocess.run(compile_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return f"ritz0 failed for harness: {result.stderr}"
+    # A test file's call to its package's private fn (AGAST #3416): shown
+    # by build.py's run_test_file, which relays this run's warning lines.
+    _build_module().relay_compiler_warnings(result.stderr)
     return None
 
 

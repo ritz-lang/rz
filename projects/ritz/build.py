@@ -242,6 +242,20 @@ _CLANG_CRASH_CAUSE = re.compile(
 CLANG_OBJ_CRASH_HEAD = 8  # most cause lines kept from before the tail
 
 
+def relay_compiler_warnings(stderr: str) -> None:
+    """Show a successful compile's `file:line:col: warning: ...` lines and
+    the `note:` lines that go with them.
+
+    The compile's stderr is captured and only shown on failure, so without
+    this a warning (AGAST #3416: a call to another file's private fn) would
+    never reach a `./rz build`. Only those lines: the rest of a successful
+    compile's stderr stays quiet as before. (cas_object, the regression
+    matrix's compile, doesn't relay: its programs aren't packages.)"""
+    for line in (stderr or "").splitlines():
+        if ": warning: " in line or ": note: " in line:
+            print(line, file=sys.stderr)
+
+
 def _stderr_tail(stderr: str, lines: int = CLANG_OBJ_STDERR_TAIL) -> str:
     all_lines = (stderr or "").rstrip().splitlines()
     tail = all_lines[-lines:]
@@ -1637,6 +1651,7 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
             result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
             if result.returncode != 0:
                 return ("compile", result.stderr)
+            relay_compiler_warnings(result.stderr)
 
             # AGAST #1308: verify before clang, and before the .ll is cached.
             # Caching invalid IR would make the bug survive a rebuild and then
@@ -2242,6 +2257,7 @@ def compile_freestanding_binary(
                 result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
                 if result.returncode != 0:
                     return ("compile", result.stderr)
+                relay_compiler_warnings(result.stderr)
                 # AGAST #1308: see verify_ir. No-op unless RITZ_VERIFY_IR is set.
                 ir_error = verify_ir(ll_path, src)
                 if ir_error is not None:
@@ -2981,6 +2997,7 @@ def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
         print(f"    ⏱  {tfile.name} — TIMEOUT after {timeout}s")
         return {"status": "timeout", "passed": 0, "failed": 0}
 
+    relay_compiler_warnings(result.stderr)
     status, file_passed, file_failed = classify_test_file(
         result.returncode, result.stdout)
     outcome = {"status": status, "passed": file_passed, "failed": file_failed}

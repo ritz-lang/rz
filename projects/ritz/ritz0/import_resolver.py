@@ -1110,7 +1110,8 @@ class ImportResolver:
                     ret_type=parse_type_string(fn_sig.ret_type),
                     body=rast.Block(dummy_span, [], None),  # Empty body - import only needs signature
                     is_extern=False,
-                    type_params=fn_sig.type_params if fn_sig.is_generic else None
+                    type_params=fn_sig.type_params if fn_sig.is_generic else None,
+                    is_pub=fn_sig.is_pub
                 )
                 fn_def.source_file = source_file
                 if fn_sig.name not in self.functions:
@@ -1229,7 +1230,8 @@ class ImportResolver:
                     ret_type=parse_type_string(m['ret_type']),
                     body=rast.Block(dummy_span, [], None),
                     is_extern=False,
-                    type_params=None
+                    type_params=None,
+                    is_pub=m.get('is_pub', True)
                 )
                 method.source_file = source_file
                 methods.append(method)

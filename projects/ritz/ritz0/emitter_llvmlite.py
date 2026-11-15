@@ -9,7 +9,9 @@ This requires external `llc` to compile since llvmlite's bundled LLVM
 doesn't include the x86 asm parser.
 """
 
+import os
 import re
+import sys
 from dataclasses import dataclass, field, replace
 from typing import ClassVar, Dict, Optional, Tuple, List, Union, Set, Iterator
 from llvmlite import ir
@@ -659,6 +661,9 @@ class LLVMEmitter:
         self.module: Optional[ir.Module] = None
         self.builder: Optional[ir.IRBuilder] = None
         self.current_fn: Optional[ir.Function] = None
+        # Call sites already warned about (AGAST #3416): a call emitted twice
+        # (a `defer` runs at every exit) warns once.
+        self._private_call_warned: Set[Tuple[str, int, int, str]] = set()
 
         # Symbol tables
         self.locals: Dict[str, Tuple[ir.AllocaInstr, ir.Type]] = {}  # name -> (alloca, type)
@@ -3769,6 +3774,9 @@ class LLVMEmitter:
             # Preserve source_file for separate compilation
             if hasattr(method, 'source_file'):
                 mangled_method.source_file = method.source_file
+            # The method as declared, for its visibility (AGAST #3416). The
+            # copy itself stays non-`pub`: its linkage is what it always was.
+            mangled_method.declared_method = method
             # Declare the mangled function
             self._declare_function(mangled_method)
 
@@ -5161,6 +5169,54 @@ class LLVMEmitter:
 
         # Emit body only if item is from the current source file
         return item_source == self._current_source_file
+
+    def _check_private_call(self, callee_def, display: str, span) -> None:
+        """AGAST #3416 (LARB R45a, #3413): warn at a call to a fn or method
+        declared without `pub` in another file (§15.1/§15.2: an import
+        brings in only `pub` items).
+
+        A WARNING, not an error, while ~650 such sites are migrated: the
+        output is unchanged, and the warnings over a corpus build are the
+        migration list. #3418 turns it into an error.
+
+        The caller's file is the call's own span, not the fn being emitted:
+        a monomorph instance of another file's generic is emitted here but
+        its calls are that file's. Not checked: `extern fn` (an ExternFn,
+        not a FnDef) and `fn .. = extern` (declarations of a symbol defined
+        elsewhere), monomorph instances and compiler-generated fns (no
+        declaration of their own to mark), and a callee whose file isn't
+        known. A note line gives the declaration, so the corpus list can name
+        the file to edit, not only its basename."""
+        callee_def = getattr(callee_def, 'declared_method', callee_def)
+        if (callee_def is None or span is None
+                or not isinstance(callee_def, rast.FnDef)
+                or callee_def.is_pub
+                or getattr(callee_def, 'is_decl', False)
+                or getattr(callee_def, 'is_monomorphized', False)
+                or getattr(callee_def, 'generated', False)):
+            return
+        # An import carries `source_file`; this file's own fns don't, and
+        # their span names the file.
+        callee_file = (getattr(callee_def, 'source_file', None)
+                       or getattr(callee_def.span, 'file', None))
+        if (not callee_file or callee_file.startswith('<')
+                or not span.file or span.file.startswith('<')):
+            return
+        if os.path.realpath(callee_file) == os.path.realpath(span.file):
+            return
+        key = (span.file, span.line, span.column, display)
+        if key in self._private_call_warned:
+            return
+        self._private_call_warned.add(key)
+        print(f"{span.file}:{span.line}:{span.column}: warning: `{display}` "
+              f"is private to {os.path.basename(callee_file)}; "
+              f"mark it `pub` (#3413)", file=sys.stderr)
+        decl = callee_def.span
+        if decl is not None and not decl.file.startswith('<'):
+            # A body emitted more than once (a `defer` at each exit) warns
+            # once, above; so does its note.
+            print(f"{callee_file}:{decl.line}:{decl.column}: note: "
+                  f"`{display}` is declared here", file=sys.stderr)
 
     def _param_to_llvm_type(self, param: rast.Param) -> 'ir.Type':
         """Convert a Ritz parameter to LLVM type, considering Borrow semantics.
@@ -12329,6 +12385,7 @@ class LLVMEmitter:
         # Look up user-defined function
         if fname in self.functions:
             fn, fn_def = self.functions[fname]
+            self._check_private_call(fn_def, fname, call.func.span)
             if self._is_procedure(fn_def):
                 self._resolved_to_procedure(call, fname.partition('$')[0])
 
@@ -13989,6 +14046,8 @@ class LLVMEmitter:
             raise ValueError(f"Method function '{mangled_name}' not found")
 
         fn, fn_def = self.functions[mangled_name]
+        self._check_private_call(fn_def, f"{type_name}.{expr.method}",
+                                 expr.name_span or expr.span)
         if self._is_procedure(fn_def):
             self._resolved_to_procedure(expr, expr.method)
 
