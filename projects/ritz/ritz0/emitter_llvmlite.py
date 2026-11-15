@@ -11603,6 +11603,14 @@ class LLVMEmitter:
             # Built-in, so `StrView { ptr, len }` needs no import (AGAST
             # #3326); a declared or imported `struct StrView` is kept.
             self._ensure_strview_type()
+        if expr.name == 'Span' and expr.type_args:
+            # Built-in, so `Span<u8> { ptr, len }` needs no import (AGAST
+            # #3346): with `ritzlib.span` the monomorphizer has already
+            # renamed the literal to `Span$u8`; without it, build that struct
+            # as a `Span<u8>` parameter would.
+            ty = rast.NamedType(expr.span, 'Span', list(expr.type_args))
+            name = self._ensure_builtin_generic_struct_specialization(ty)
+            return self.struct_types[name], self.struct_fields[name]
         if expr.name not in self.struct_types:
             raise ValueError(f"Unknown struct: {expr.name}")
         return self.struct_types[expr.name], self.struct_fields[expr.name]
