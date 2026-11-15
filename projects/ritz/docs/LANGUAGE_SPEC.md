@@ -1542,9 +1542,26 @@ A function that declares a return type is different. It is an error for such
 a function to be able to reach its end without producing a value, whether its
 last statement is an `if`, a loop, an assignment, a `pass` arm or a call to a
 procedure. There is no implicit `0`. An `if`/`else` whose arms all return, or a
-`loop` with no `break`, never reaches the end and needs nothing after it. The
+`loop` with no `break`, never reaches the end and needs nothing after it, and
+may have nothing after it. The
 condition of a `while` counts as always true only when it is the literal
 `true`. `-> void` declares no value, so it follows the rules for a procedure.
+
+A statement that can never run is an error, "unreachable code", located at the
+first such statement of its block (LARB, AGAST #2520). That is any statement
+that follows, in the same block, a `return`, `break` or `continue`; an
+`if`/`else` or a `match` whose every arm diverges; or a `loop` (or `while
+true`) with no `break` that leaves it. It extends R13, which requires every
+`match` arm to be reachable, to statements:
+
+```ritz expect-error="unreachable code"
+fn sign(b: i32) -> i32
+    if b > 0
+        return 1
+    else
+        return -1
+    0
+```
 
 ### 6.2 While Loop
 

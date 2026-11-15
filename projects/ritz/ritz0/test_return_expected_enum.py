@@ -558,21 +558,6 @@ fn main() -> i32
         Err(e) => 50
 """
 
-DEAD_TAIL = """\
-enum E
-    A
-    B
-
-fn f(e: E) -> i32
-    match e
-        A => return 1
-        B => return 2
-    3
-
-fn main() -> i32
-    f(A)
-"""
-
 UNIT_TYPE_ARG = """\
 fn f(n: i32) -> Result<(), i32>
     if n < 0
@@ -711,10 +696,6 @@ fn main() -> i32
 # AGAST #2270: every tuple mangled as `unknown`, so both `wrap`s collided.
 def test_ritz0_tuple_args_do_not_collide(tmp_path):
     assert _run("ritz0", tmp_path, "tuple_args", TUPLE_ARGS) == 3
-
-
-def test_ritz0_dead_code_after_all_arms_return(tmp_path):
-    assert _run("ritz0", tmp_path, "dead_tail", DEAD_TAIL) == 1
 
 
 # AGAST #2272: ritz1 refused the whole module, `()` was no type argument.

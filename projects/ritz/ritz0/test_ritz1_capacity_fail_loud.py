@@ -151,8 +151,7 @@ def _many_arms(n: int) -> str:
     """Block-bodied arms that return."""
     arms = "".join(f"        {i} =>\n            return {i % 100}\n" for i in range(n))
     return (
-        f"fn pick(x: i64) -> i32\n    match x\n{arms}        _ =>\n            return 101\n"
-        "    return 102\n\n"
+        f"fn pick(x: i64) -> i32\n    match x\n{arms}        _ =>\n            return 101\n\n"
         f"pub fn main() -> i32\n    return pick({n - 1})\n"
     )
 

@@ -95,7 +95,6 @@ pub fn main() -> i32
     match o
         Some(a) => return a[1] as i32
         None => return 9
-    0
 """, 3),
     "option_payload_fill": ("""\
 pub fn main() -> i32
@@ -103,7 +102,6 @@ pub fn main() -> i32
     match o
         Some(a) => return (a[2] + 303) as i32
         None => return 9
-    0
 """, 3),
     # The ticket's program, and Err's payload (tag 1) at its `[2]i32`.
     "enum_payload": ("""\
@@ -116,7 +114,6 @@ pub fn main() -> i32
     match e
         V(a) => return a[1] as i32
         N => return 9
-    0
 """, 3),
     "enum_payload_fill": ("""\
 enum Pay
@@ -128,7 +125,6 @@ pub fn main() -> i32
     match e
         V(a) => return a[1] as i32
         N => return 9
-    0
 """, 3),
     "result_err_payload": ("""\
 pub fn main() -> i32
@@ -136,7 +132,6 @@ pub fn main() -> i32
     match r
         Ok(v) => return 9
         Err(a) => return a[0] + a[1] + 2
-    0
 """, 3),
     # A struct element: emit_expr's #2266 branch returned the literal's address.
     "struct_element_payload": ("""\
@@ -153,7 +148,6 @@ pub fn main() -> i32
     match e
         V(a) => return a[1].x
         N => return 9
-    0
 """, 3),
     # A payload returned, matched on the call, and passed as an argument.
     "payload_return_and_arg": ("""\

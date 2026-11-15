@@ -283,7 +283,7 @@ ALLOWED = {
     "var_returned_before_a_loops_write": ("fn g(n: *Node) -> *Node\n    var head = Node { next: n, x: 0 }\n"
                                           "    var cur: *Node = @head\n    while true\n"
                                           "        if cur.x > 0\n            return cur\n"
-                                          "        cur = cur.next\n    null\n",
+                                          "        cur = cur.next\n",
                                           "var n = Node { next: null, x: 6 }\n    let r = g(@n)\n    c.x = r.x", 6),
     "var_address_taken": ("fn s(q: *@C, to: @C)\n    *q = to\n\nfn g(p: @C) -> @C\n    var d = C { x: 1 }\n"
                           "    var r = @d\n    s(@r, p)\n    return r\n", "let r = g(@c)\n    c.x = r.x + 5", 6),

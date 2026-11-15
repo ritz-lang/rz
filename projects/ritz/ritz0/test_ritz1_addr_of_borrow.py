@@ -322,7 +322,6 @@ fn f(e:& E) -> i32
     match @e
         E.One(v) => return v
         E.Nope => return 0
-    return 0
 
 pub fn main() -> i32
     var e: E = E.One(3)

@@ -54,7 +54,7 @@ REFUSED = {
     "try": ("fn go() -> Result<i32, i32>\n    defer fails()?\n    Ok(0)\n\n"
             "pub fn main() -> i32\n    0\n",
             f"{L}:5", "`?` can't leave a deferred statement"),
-    "break": ("pub fn main() -> i32\n    while true\n        defer break\n    0\n",
+    "break": ("pub fn main() -> i32\n    for i in 0..3\n        defer break\n    0\n",
               f"{L + 1}:9", "`break` can't leave a deferred statement"),
     "continue": ("pub fn main() -> i32\n    for i in 0..3\n        defer\n"
                  "            if i == 1\n                continue\n    0\n",

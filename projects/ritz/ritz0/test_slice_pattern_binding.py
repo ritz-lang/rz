@@ -90,8 +90,7 @@ def _let_in_arm(box, pat, scrut, spelled, length):
             f"        {pat}(x) =>\n"
             f"            let t = x[{spelled}]\n"
             f"            return {_answer(box, length)}\n"
-            f"        _ => return 1\n"
-            f"    return 2\n")
+            f"        _ => return 1\n")
 
 
 POSITIONS = {"arm_value": _arm_value, "let_in_arm": _let_in_arm}
@@ -135,8 +134,7 @@ def test_a_slice_of_a_pattern_binding_returned(run_with, box, ctor, compiler):
                f"    match wrap(v)\n"
                f"        {pat}(x) =>\n"
                f"            return x[1..3].len as i32 + x[1..3][1] as i32\n"
-               f"        _ => return 1\n"
-               f"    return 2\n")
+               f"        _ => return 1\n")
     assert run_with(compiler, "ret", program) == 32
 
 
@@ -166,8 +164,7 @@ def test_a_binding_is_its_own_arms(run_with, first, second, compiler):
                "            return t.len as i32 + t[2] as i32\n"
                "        B(x) =>\n"
                "            let t = x[1..2]\n"
-               "            return t.len as i32 + t[0] as i32\n"
-               "    return 0\n\n"
+               "            return t.len as i32 + t[0] as i32\n\n"
                "pub fn main() -> i32\n"
                "    var v: Vec<i32> = vec_new<i32>()\n"
                "    v.push(10)\n    v.push(20)\n    v.push(30)\n    v.push(40)\n"
@@ -221,8 +218,7 @@ def test_a_result_payload_after_a_nested_type(run_with, nested, compiler):
                f"        {ctor}(x) =>\n"
                f"            let t = x[1..3]\n"
                f"            return t.len as i32 * 10 + t[1] as i32\n"
-               f"        _ => return 1\n"
-               f"    return 2\n")
+               f"        _ => return 1\n")
     assert run_with(compiler, "nested", program) == 23
 
 
@@ -242,6 +238,5 @@ def test_an_open_ended_slice_of_a_pattern_binding(run_with, ctor, compiler):
                f"        {pat}(x) =>\n"
                f"            let t = x[1:]\n"
                f"            return t.len as i32 + t[2] as i32\n"
-               f"        _ => return 1\n"
-               f"    return 2\n")
+               f"        _ => return 1\n")
     assert run_with(compiler, "open", program) == 43

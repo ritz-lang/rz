@@ -37,7 +37,6 @@ pub fn main() -> i32
     match t.o()
         Some(x) => return 1
         None => return 3
-    return 2
 """
 
 # `self` borrowed.
@@ -56,7 +55,6 @@ pub fn main() -> i32
     match t.o()
         Some(x) => return 1
         None => return 3
-    return 2
 """
 
 STATIC = """\
@@ -73,7 +71,6 @@ pub fn main() -> i32
     match T.none()
         Some(x) => return 1
         None => return 3
-    return 2
 """
 
 # A payload too large to return in registers: the sret path.
@@ -98,7 +95,6 @@ pub fn main() -> i32
     match t.o()
         Some(x) => return 1
         None => return 3
-    return 2
 """
 
 # Controls: `Some` as the method tail, and a free fn's bare `None` tail.
@@ -117,7 +113,6 @@ pub fn main() -> i32
     match t.o()
         Some(x) => return x
         None => return 1
-    return 2
 """
 
 FREE_FN_CONTROL = """\
@@ -130,7 +125,6 @@ pub fn main() -> i32
     match o()
         Some(x) => return 1
         None => return 3
-    return 2
 """
 
 CASES = {

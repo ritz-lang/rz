@@ -99,7 +99,7 @@ def test_human_report_is_in_table_order(package, tmp_path):
 def test_timeouts_run_concurrently(package, tmp_path):
     """Each test's deadline is its own: 3 hangs under -j 3 time out together."""
     exe = _binary(package(HEADER + "".join(
-        f"[[test]]\nfn hang_{i}() -> i32\n    loop\n        let x: i32 = 0\n    0\n\n"
+        f"[[test]]\nfn hang_{i}() -> i32\n    loop\n        let x: i32 = 0\n\n"
         for i in range(3)) + "[[test]]\nfn ok() -> i32\n    0\n"), tmp_path)
     proc, wall = run(exe, "--json", "-j", "3", "-t", "500")
     report = json.loads(proc.stdout)
@@ -111,7 +111,7 @@ def test_timeouts_run_concurrently(package, tmp_path):
 def test_a_long_test_does_not_delay_another_tests_timeout(package, tmp_path):
     """The wait ends at the earliest deadline, not when some child exits."""
     exe = _binary(package(sleepers(("sleeps", 1500, 0)) + (
-        "[[test]]\nfn hangs() -> i32\n    loop\n        let x: i32 = 0\n    0\n")), tmp_path)
+        "[[test]]\nfn hangs() -> i32\n    loop\n        let x: i32 = 0\n")), tmp_path)
     proc, wall = run(exe, "--json", "-j", "2", "-t", "1000")
     report = json.loads(proc.stdout)
     statuses = {t["name"]: t["status"] for t in report["tests"]}

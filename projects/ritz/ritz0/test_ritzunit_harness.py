@@ -213,7 +213,6 @@ def test_crash_assert_and_timeout_are_attributed(package, tmp_path, monkeypatch)
         fn hangs() -> i32
             loop
                 let x: i32 = 0
-            0
 
         [[test]]
         fn passes() -> i32

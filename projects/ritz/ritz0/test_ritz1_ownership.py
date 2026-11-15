@@ -302,7 +302,6 @@ fn f() -> i32
     var t = make(1)
     while true
         return consume(t)
-    return 0
 
 pub fn main() -> i32
     f()

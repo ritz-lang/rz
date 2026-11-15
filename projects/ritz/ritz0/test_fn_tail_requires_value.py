@@ -301,6 +301,9 @@ ACCEPTED = {
         "        loop\n"
         "            if n > 0\n"
         "                return 1\n"),
+    # Code after this is unreachable, and refused (AGAST #2520,
+    # test_dead_tail_after_diverging_if.py). Its match twin, an arm that is an
+    # endless loop with nothing after the match, is #3270.
     "if_arm_is_an_endless_loop": (
         "fn f(n: i64) -> i64\n"
         "    if n > 0\n"
@@ -309,25 +312,6 @@ ACCEPTED = {
         "                return 1\n"
         "    else\n"
         "        return 2\n"),
-    # Nothing reaches the `var`, so nothing reaches the end.
-    "dead_code_after_an_if_whose_arms_all_leave": (
-        "fn f(n: i64) -> i64\n"
-        "    if n > 0\n"
-        "        loop\n"
-        "            if n > 1\n"
-        "                return 1\n"
-        "    else\n"
-        "        return 2\n"
-        "    var z: i64 = n\n"),
-    "dead_code_after_a_match_whose_arms_all_leave": (
-        "fn f(n: i64) -> i64\n"
-        "    match n\n"
-        "        0 => return 1\n"
-        "        _ =>\n"
-        "            loop\n"
-        "                if n > 1\n"
-        "                    return 2\n"
-        "    var z: i64 = n\n"),
     "void_return_type": (
         "fn f(n: i64) -> void\n"
         "    var i: i64 = n\n"),

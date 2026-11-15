@@ -277,22 +277,14 @@ RITZ1_EXTRA_ACCEPTED = {
     "zero_tail_is_a_value": (
         "fn f(n: i64) -> i64\n"
         "    0\n"),
-    # Dead code after a `return` in an arm does not need a value either.
-    "procedure_call_after_a_return_in_a_block_arm": (
-        _PROC + "fn f(n: i64) -> i64\n"
-        "    match n\n"
-        "        0 =>\n"
-        "            return 1\n"
-        "            g(n)\n"
-        "        _ => 2\n"),
-    "dead_code_after_a_match_with_a_match_arm": (
+    # Code after it is unreachable, and refused (AGAST #2520).
+    "match_with_a_match_arm_ends_fn": (
         "fn f(n: i64) -> i64\n"
         "    match n\n"
         "        0 => match n\n"
         "            1 => return 1\n"
         "            _ => return 2\n"
-        "        _ => return 3\n"
-        "    var z: i64 = n\n"),
+        "        _ => return 3\n"),
     # A nameless callee is not an identifier, so ritz0 does not judge it even
     # though ritz1 knows its signature.
     "tail_call_through_a_fn_field": (
@@ -355,11 +347,6 @@ def test_ritz1_extra_shapes_accepted_by_both(ritz1_bin, tmp_path, name):
 
 # Verdict only: ritz1 accepts these, and the IR it writes is not this ticket's.
 RITZ1_EXTRA_ACCEPTED_VERDICT_ONLY = {
-    # ritz1 writes a second `ret` into the block, which clang tolerates.
-    "dead_code_after_a_return": (
-        "fn f(n: i64) -> i64\n"
-        "    return 1\n"
-        "    return 2\n"),
     # AGAST #2246: `-> void` is not a procedure to ritz0's `_is_void_call`.
     # ritz1's IR for these was already invalid (`ret i64 %.0`) before #2236.
     "tail_call_to_a_fn_spelled_void": (
