@@ -32,6 +32,7 @@ from binder_names import check_binders
 from builtin_types import check_builtin_impls, check_unknown_impl_targets
 from reachability import check_reachable
 from move_checker import MoveChecker, OwnershipError
+from monomorph import infer_struct_lit_args
 from type_checker import TypeChecker, TypeError as RitzTypeError, check_ref_slots
 from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
@@ -287,6 +288,11 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                 for err in name_errors:
                     print(f"Name error: {err}", file=sys.stderr)
                 return False
+
+        # A generic struct literal's left-out type args (§9.2, AGAST #3407):
+        # before the checkers, so the move checker sees `Box2 { v: d }` as
+        # the Box2<D> it is.
+        infer_struct_lit_args(module)
 
         # Type check (verifies type compatibility)
         if check_types:

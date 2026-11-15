@@ -351,6 +351,10 @@ class Monomorphizer:
         self.expected_type: Optional[rast.Type] = None
         self.current_ret_type: Optional[rast.Type] = None
 
+        # The slot of each args-less generic struct literal, by id (§9.2).
+        self._lit_slots: Dict[int, rast.Type] = {}
+        self._infer_ret_type: Optional[rast.Type] = None
+
     def _type_to_key(self, ty: rast.Type) -> str:
         """Convert a type to a string key for deduplication."""
         key = mangle_type_name(ty)
@@ -499,6 +503,11 @@ class Monomorphizer:
             return
         self.var_types = {}
         self._infer_ret_type = fn.ret_type
+        # The slot each args-less generic struct literal fills, by id (§9.2):
+        # filled top-down here and by _mark_lit_slots, read by
+        # _infer_struct_lit_args.  The fn's tail is the return type's slot.
+        self._lit_slots: Dict[int, rast.Type] = {}
+        self._mark_lit_slot(fn.body, fn.ret_type)
         for param in fn.params:
             param_type = param.type
             if param_type is None and param.name == 'self' and impl_type_name:
@@ -511,8 +520,10 @@ class Monomorphizer:
 
     def _infer_walk(self, node) -> None:
         """Visit `node` in source order: a let's value before its name is
-        typed, a call's arguments before the call."""
-        if isinstance(node, list):
+        typed, a call's arguments before the call.  A struct literal's
+        fields are `(name, value)` tuples: walked too, so `S { v: id(3) }`
+        infers id<i64> and a nested literal its args (§9.2, #3407)."""
+        if isinstance(node, (list, tuple)):
             for child in node:
                 self._infer_walk(child)
             return
@@ -525,6 +536,13 @@ class Monomorphizer:
             for param in node.params:
                 if getattr(param, 'type', None) is not None:
                     self.var_types[param.name] = param.type
+        # Slots before the values that fill them (§9.2): a literal's slot
+        # decides its args before its fields are walked, so a nested literal
+        # in one of its fields has a slot too.
+        self._mark_lit_slots(node)
+        if isinstance(node, rast.StructLit):
+            self._struct_lit_from_slot(node)
+            self._mark_field_slots(node)
         for f in dataclasses.fields(node):
             if f.name == 'span':
                 continue
@@ -541,37 +559,148 @@ class Monomorphizer:
         elif isinstance(node, rast.Call):
             self._infer_one_call(node)
         elif isinstance(node, rast.StructLit):
-            self._check_struct_lit_args(node)
+            self._infer_struct_lit_args(node)
         elif isinstance(node, rast.Match) and node.ctor_type is None:
             node.ctor_type = self._infer_variant_scrutinee(node.expr)
 
-    def _check_struct_lit_args(self, lit: rast.StructLit) -> None:
-        """A generic struct's literal names its type args (AGAST #3311).
+    def _argless_struct(self, lit: rast.StructLit):
+        """(type params, [(field, type)]) of the generic struct an args-less
+        literal names, or None when it names a plain struct or has its args.
 
-        `Box2 { v: x }` for `struct Box2<X>` names no instance: the emitter
-        crashed on it (`Unknown struct: Box2`).  Inferring the args from the
-        fields, as a generic call's are, is a language question LANGUAGE_SPEC
-        leaves open, so the literal is a located error wherever it is written,
-        generic templates and impl<T> methods too.  ritz1's
-        gi_check_struct_lit_args gives the same message.
-
-        The built-in `Span<T>` counts too when nothing declares or imports a
+        The built-in `Span<T>` counts when nothing declares or imports a
         `Span` (AGAST #3357): with no `import ritzlib.span` it isn't in
-        generic_structs, and the emitter raised a ValueError.
-        """
+        generic_structs, and the emitter raised a ValueError."""
         if lit.type_args:
-            return
+            return None
         struct_def = self.generic_structs.get(lit.name)
         if struct_def is not None:
-            params = struct_def.type_params
-        elif lit.name == 'Span' and 'Span' not in self.struct_defs:
-            params = ['T']
-        else:
+            return struct_def.type_params, struct_def.fields
+        if lit.name == 'Span' and 'Span' not in self.struct_defs:
+            # ritzlib/span.ritz's fields.
+            t = rast.NamedType(lit.span, 'T', [])
+            return ['T'], [('ptr', rast.PtrType(lit.span, t, False)),
+                           ('len', rast.NamedType(lit.span, 'i64', []))]
+        return None
+
+    def _mark_lit_slot(self, expr, ty: Optional[rast.Type]) -> None:
+        """Record `ty` as the slot of the literal `expr` is, or ends in: a
+        block's tail, each branch of an `if` / `match` (§9.2)."""
+        if expr is None or ty is None:
             return
-        args = ", ".join(params)
-        raise GenericInferError(
-            f"`{lit.name}` is generic: write its type arguments, "
-            f"`{lit.name}<{args}> {{ .. }}`", lit.span)
+        if isinstance(expr, (rast.Grouped, rast.Block)):
+            self._mark_lit_slot(expr.expr, ty)
+        elif isinstance(expr, rast.If):
+            self._mark_lit_slot(expr.then_block, ty)
+            self._mark_lit_slot(expr.else_block, ty)
+        elif isinstance(expr, rast.Match):
+            for arm in expr.arms:
+                self._mark_lit_slot(arm.body, ty)
+        elif isinstance(expr, rast.StructLit):
+            self._lit_slots[id(expr)] = ty
+
+    def _mark_lit_slots(self, node) -> None:
+        """The slots `node` gives its values (§9.2): a typed let / var's, a
+        `return`'s (the fn's return type), a call's parameters."""
+        if isinstance(node, (rast.LetStmt, rast.VarStmt)) and node.type is not None:
+            self._mark_lit_slot(node.value, node.type)
+        elif isinstance(node, rast.ReturnStmt):
+            self._mark_lit_slot(node.value, self._infer_ret_type)
+        elif isinstance(node, rast.Call) and isinstance(node.func, rast.Ident) \
+                and node.func.name not in self.var_types:
+            fn_def = self.fn_signatures.get(node.func.name)
+            params = list(fn_def.params) if fn_def is not None else []
+            subst = None
+            generic = self.generic_functions.get(node.func.name)
+            if generic is not None and node.type_args \
+                    and len(node.type_args) == len(generic.type_params):
+                params = list(generic.params)
+                subst = TypeSubstitution(dict(zip(generic.type_params, node.type_args)))
+            for param, arg in zip(params, node.args):
+                if param.type is not None:
+                    self._mark_lit_slot(arg, subst.apply(param.type) if subst else param.type)
+        elif isinstance(node, rast.MethodCall):
+            # A plain impl's method: its params after `self`.
+            recv = self._infer_value_type(node.expr)
+            while isinstance(recv, (rast.PtrType, rast.RefType)):
+                recv = recv.inner
+            if isinstance(recv, rast.NamedType):
+                method = self.impl_methods.get(recv.name, {}).get(node.method)
+                if method is not None and method.params \
+                        and method.params[0].name == 'self':
+                    for param, arg in zip(method.params[1:], node.args):
+                        self._mark_lit_slot(arg, param.type)
+
+    def _mark_field_slots(self, lit: rast.StructLit) -> None:
+        """A literal whose struct is known gives each field value that
+        field's type as its slot: `Outer { b: Box2 { v: 8 } }` (§9.2)."""
+        struct_def = self.struct_defs.get(lit.name)
+        if struct_def is None:
+            return
+        fields = dict(struct_def.fields)
+        subst = None
+        if struct_def.type_params:
+            if len(lit.type_args) != len(struct_def.type_params):
+                return
+            subst = TypeSubstitution(dict(zip(struct_def.type_params, lit.type_args)))
+        for name, value in lit.fields:
+            field_type = fields.get(name)
+            if field_type is not None:
+                self._mark_lit_slot(value, subst.apply(field_type) if subst else field_type)
+
+    def _struct_lit_from_slot(self, lit: rast.StructLit) -> None:
+        """An args-less generic literal in a slot of its struct's instance
+        takes that instance's args (§9.2 rule 1, LARB R51): `Box2 { v: 1 }` in
+        a `Box2<u8>` slot is `Box2<u8> { v: 1 }`, as if written.  A slot of
+        any other type leaves the args to the fields."""
+        found = self._argless_struct(lit)
+        slot = self._lit_slots.get(id(lit))
+        if found is None or slot is None:
+            return
+        slot = resolve_alias(slot)
+        if isinstance(slot, rast.NamedType) and slot.name == lit.name \
+                and len(slot.args) == len(found[0]):
+            lit.type_args = [copy.deepcopy(a) for a in slot.args]
+
+    def _infer_struct_lit_args(self, lit: rast.StructLit) -> None:
+        """An args-less generic literal with no slot binds its args from
+        its field values, by section 4.4's rule for a generic call (§9.2
+        rule 2, LARB R51): `Box2 { v: 1 }` is `Box2<i64>`, as `Present(1)` is,
+        and an integer literal binds a bare `X` only when no other field does.
+        A param no field binds, or two bind differently, is a located error
+        (rule 3).  The args are written into `lit.type_args`, as if spelled
+        out, so every later pass sees `Box2<i64> { .. }`.
+
+        #3311 refused the literal; ritz1 still does until #3408."""
+        found = self._argless_struct(lit)
+        if found is None:
+            return
+        params, fields = found
+        field_types = dict(fields)
+        bound: Dict[str, rast.Type] = {}
+        conflict: Set[str] = set()
+        literal: Dict[str, rast.Type] = {}
+        for name, value in lit.fields:
+            field_type = field_types.get(name)
+            if field_type is None:
+                continue
+            if (isinstance(value, rast.IntLit)
+                    or (isinstance(value, rast.UnaryOp) and value.op == '-'
+                        and isinstance(value.operand, rast.IntLit))):
+                p = resolve_alias(field_type)
+                if isinstance(p, rast.NamedType) and p.name in params and not p.args:
+                    literal.setdefault(p.name, self._infer_arg_type(value))
+                continue
+            value_type = self._infer_arg_type(value)
+            if value_type is not None:
+                self._unify(field_type, value_type, params, bound, conflict)
+        for tp, ty in literal.items():
+            bound.setdefault(tp, ty)
+        for tp in params:
+            if tp not in bound or tp in conflict:
+                raise GenericInferError(
+                    f"can't infer `{tp}` for `{lit.name}`: write its type arguments, "
+                    f"`{lit.name}<{', '.join(params)}> {{ .. }}`", lit.span)
+        lit.type_args = [copy.deepcopy(bound[tp]) for tp in params]
 
     def _generic_variant(self, name: str):
         """(enum, variant) when `name` is a variant of a generic user enum and
@@ -1128,8 +1257,8 @@ class Monomorphizer:
 
         # `D { .. }` is a D, and `Box<i32> { .. }` a Box<i32>, so an
         # un-annotated `let t = D { .. }` binds T in `take(@t)` (AGAST #3064).
-        # A generic struct's literal without args (`Cell { v: 3 }`) names no
-        # instance, and _check_struct_lit_args refuses it (#3311).
+        # A generic struct's literal without args (`Cell { v: 3 }`) has them
+        # by now: _infer_struct_lit_args filled them in (§9.2, #3407).
         if isinstance(expr, rast.StructLit):
             struct_def = self.struct_defs.get(expr.name)
             if struct_def is None:
@@ -2329,5 +2458,63 @@ def monomorphize(module: rast.Module) -> rast.Module:
     try:
         monomorphizer = Monomorphizer()
         return monomorphizer.monomorphize(module)
+    finally:
+        _TYPE_ALIASES = saved
+
+
+def _struct_lits(node):
+    """Every StructLit under `node`, outermost first."""
+    if isinstance(node, (list, tuple)):
+        for child in node:
+            yield from _struct_lits(child)
+        return
+    if not dataclasses.is_dataclass(node) or isinstance(node, (type, rast.Type)):
+        return
+    if isinstance(node, rast.StructLit):
+        yield node
+    for f in dataclasses.fields(node):
+        if f.name != 'span':
+            yield from _struct_lits(getattr(node, f.name))
+
+
+def infer_struct_lit_args(module: rast.Module) -> None:
+    """Fill in an args-less generic struct literal's type args before the
+    checkers run (LANGUAGE_SPEC §9.2, LARB R51, AGAST #3407).
+
+    monomorphize() infers them too, but it runs at emission, after the move
+    checker, which reads `StructLit.type_args` (#2263): `Box2 { v: <a Drop
+    T> }` must be a Box2<T> there, so a binding from it moves.  Only fns with
+    such a literal are inferred, each on a copy so nothing else (call args,
+    let types) changes before the checkers; the copy's literal args are moved
+    onto the originals.  An inference error is left for monomorphize() to
+    report, located, as before."""
+    global _TYPE_ALIASES
+    saved = _TYPE_ALIASES
+    _TYPE_ALIASES = {item.name: item.target for item in module.items
+                     if isinstance(item, rast.TypeAlias)}
+    try:
+        mono = Monomorphizer()
+        mono._collect_generics(module)
+        fns = []
+        for item in module.items:
+            if isinstance(item, rast.FnDef):
+                fns.append((item, None, None))
+            elif isinstance(item, rast.ImplBlock):
+                fns.extend((m, item.type_name, item.type_params) for m in item.methods)
+        for fn, impl_name, impl_params in fns:
+            lits = [lit for lit in _struct_lits(fn.body)
+                    if mono._argless_struct(lit) is not None]
+            if not lits:
+                continue
+            memo: dict = {}
+            twin = copy.deepcopy(fn, memo)
+            try:
+                mono._infer_in_fn(twin, impl_name, impl_params)
+            except GenericInferError:
+                pass
+            for lit in lits:
+                inferred = memo.get(id(lit))
+                if inferred is not None and inferred.type_args:
+                    lit.type_args = inferred.type_args
     finally:
         _TYPE_ALIASES = saved

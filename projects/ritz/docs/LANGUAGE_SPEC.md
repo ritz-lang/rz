@@ -3134,7 +3134,7 @@ that field's type error. A type parameter that neither the slot nor any field
 binds is an error at the literal. Writing the arguments out, `Box2<u8> { .. }`,
 is always allowed (LARB R51, AGAST #3314):
 
-```text
+```ritz
 struct Box2<T>
     v: T
 
@@ -3149,7 +3149,7 @@ fn main() -> i32
     0
 ```
 
-```text
+```ritz expect-error="can't infer `T` for `Tagged`: write its type arguments, `Tagged<T> { .. }`"
 struct Tagged<T>
     n: i32
 
@@ -3159,8 +3159,8 @@ fn main() -> i32
 ```
 
 Unlike a bare constructor, an untyped `let` doesn't look at the fn's return
-type: it has no slot, so its literal takes the field values' types. Until the
-implementing tickets land, all three compilers refuse an args-less literal
+type: it has no slot, so its literal takes the field values' types. ritz0
+implements this (#3407); ritz1 refuses an args-less literal until #3408
 (#3311).
 
 ### 9.3 Field Access

@@ -26,7 +26,8 @@ These pin the ritz0-specific edges #2157 had to get right on the way:
     receiver moves it (AGAST #2257).
   * a method returning a field of its by-value receiver moves the field out,
     generic or not, and a generic literal `Box<T> { .. }` keeps its type
-    arguments, so a binding from it moves (AGAST #2263).
+    arguments, so a binding from it moves (AGAST #2263), inferred ones too
+    (`Box { v: .. }`, LARB R51, #3407).
   * a void fn's tail value goes nowhere: a temporary drops once, a bare
     binding stays owned (AGAST #2253).
 
@@ -1325,6 +1326,12 @@ FIELD_RETURN_RUNS = {
     var t = b.take()
     return consume(t)
 """, 1),
+    # Args left out (LARB R51, #3407): the field infers Box2<Tracked>.
+    "generic_inferred": ("""
+    var b = Box2 { v: make(1) }
+    var t = b.take()
+    return consume(t)
+""", 1),
 }
 
 # name: (the body of `g`, the name used after it moved)
@@ -1340,6 +1347,13 @@ FIELD_RETURN_REJECTS = {
     b.take()
     return b.v.id
 """, "b"),
+    # The inferred args are the literal's, as if written (LARB R51, #3407).
+    "inferred_result_used_twice": ("""
+    var b = Box2 { v: make(1) }
+    var t = b.take()
+    consume(t)
+    return consume(t)
+""", "t"),
 }
 
 
