@@ -880,6 +880,12 @@ STRUCT_COPIES = {
     + "pub fn main() -> i32\n    G[1].x = 5\n    let s = f()\n    return s.x\n",
     "returned_field": _S + "struct H\n    cs: [3]S\n\nfn f() -> S\n    var h: H\n    h.cs[1].x = 5\n    return h.cs[1]\n\n"
     + "pub fn main() -> i32\n    let s = f()\n    return s.x\n",
+    # AGAST #3147: a `-> S` tail is a copy into the return slot, as `return` is.
+    # ritz1 refused `p[1]` there, fn or method, as a struct in an integer slot.
+    "tail_pointer_element": _S + "fn f(q: *S) -> S\n    q[1]\n\n"
+    + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    let s = f(@a[0])\n    return s.x\n",
+    "tail_pointer_element_method": _S + "struct H\n    k: i32\n\nimpl H\n    fn f(self: @H, q: *S) -> S\n        q[1]\n\n"
+    + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    var h: H\n    let s = h.f(@a[0])\n    return s.x\n",
 }
 
 
@@ -912,6 +918,9 @@ WHOLE_STRUCT_ELEMENT = {
     "let_integer_local": _S + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    let n: i64 = a[1]\n    return n as i32\n",
     "let_integer_global": _S + "var G: [3]S\n\npub fn main() -> i32\n    let n: i64 = G[1]\n    return n as i32\n",
     "let_integer_field": _S + "struct H\n    cs: [3]S\n\npub fn main() -> i32\n    var h: H\n    let n: i64 = h.cs[1]\n    return n as i32\n",
+    # AGAST #3147: `(*r)[1]` through a `**S` loads the `%S`, a copy only.
+    "returned_deref_pointer": _S + "fn f(r: **S) -> i64\n    return (*r)[1]\n\n"
+    + "pub fn main() -> i32\n    var a: [3]S\n    var p: *S = @a[0]\n    return f(@p) as i32\n",
 }
 # AGAST #2996: every other integer use of `a[1]` on a `[3]S` itself.  ritz1 loaded
 # a `%S` and clang refused the IR, unlocated.  ritz0 refuses `+` and `=`, and since

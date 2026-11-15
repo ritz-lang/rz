@@ -1024,6 +1024,32 @@ pub fn main() -> i32
     var p: *i16 = @a[0]
     return get(@&p) as i32 - 255
 """,
+    # AGAST #3147: a whole struct read `(*r)[i]`, as #3122 stores one.  ritz1
+    # took the byte path (`load i8` + zext) and handed clang an i64 for a `%C`.
+    "read_deref_pointer_struct_element": BY_VALUE + """
+fn get(r: **C) -> i64
+    let c: C = (*r)[1]
+    c.y
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 1, y: 0 }
+    a[1] = C { x: 2, y: 258 }
+    var p: *C = @a[0]
+    return (get(@p) - 255) as i32
+""",
+    "read_deref_mut_ref_pointer_struct_element": BY_VALUE + """
+fn get(r: @&*C) -> C
+    (*r)[1]
+
+pub fn main() -> i32
+    var a: [2]C
+    a[0] = C { x: 1, y: 0 }
+    a[1] = C { x: 2, y: 258 }
+    var p: *C = @a[0]
+    let c: C = get(@&p)
+    return (c.y - 255) as i32 + c.x - 2
+""",
     # The same param on a method, which binds its params apart (emitter.ritz).
     "plain_deref_mut_ref_pointer_scalar_element_method": BY_VALUE + """
 struct F

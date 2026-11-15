@@ -53,6 +53,14 @@ fn method_returns_named_struct(method: *FnDef) -> i32
         return 0
     1
 
+# AGAST #3147: a tail in a `-> S` method is a copy into the return slot, as
+# `return e` is (#2996), so a whole struct element (`p[i]`, `(*r)[i]`) is
+# loaded rather than refused.  emit_struct_copy's `ty` for that tail.
+fn method_tail_copy_type(method: *FnDef) -> i32
+    if method_returns_named_struct(method) == 1
+        return TYPE_STRUCT
+    TYPE_VOID
+
 # The implicit-return tail shared by emit_fn and emit_impl_method (AGAST #1573).
 #
 # Called after the body loop. `has_explicit_return` is 1 when the body's last
@@ -963,6 +971,8 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 # Struct return — handle ident (load from alloca) or call result.
                 # Use emit_llvm_type_struct so tagged-enum types (Result$/Option$)
                 # auto-route to `i64` instead of `%<name>` (task-99 cluster #3).
+                # AGAST #3147: the tail is a copy into the return slot, as
+                # `return e` is, so `p[i]` / `(*r)[i]` of a `C` loads it.
                 if stmt.expr.kind == EXPR_IDENT
                     let local: *LocalVar = struct_value_local(s, stmt.expr)
                     if local != null and s.ret_sret == 1
@@ -983,21 +993,21 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                         emit_reg(s, val)
                         emit_str(s, c"\n")
                     else if s.ret_sret == 1
-                        emit_sret_ret_value(s, emit_expr(s, stmt.expr))   # AGAST #1730
+                        emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TYPE_STRUCT))   # AGAST #1730
                     else
-                        let val: i32 = emit_expr(s, stmt.expr)
+                        let val: i32 = emit_struct_copy(s, stmt.expr, TYPE_STRUCT)
                         emit_str(s, c"  ret ")
                         emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
                         emit_str(s, c" ")
                         emit_reg(s, val)
                         emit_str(s, c"\n")
                 else if s.ret_sret == 1
-                    emit_sret_ret_value(s, emit_expr(s, stmt.expr))   # AGAST #1730
+                    emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TYPE_STRUCT))   # AGAST #1730
                 else
                     # Function call or other expression returning struct.
                     # AGAST #1643: a tail `"..."` is a %Span$u8; coerce it to a
                     # %StrView return the way `return "..."` does (#168).
-                    let val: i32 = emit_expr(s, stmt.expr)
+                    let val: i32 = emit_struct_copy(s, stmt.expr, TYPE_STRUCT)
                     let ret_reg: i32 = coerce_struct_ret_value(s, stmt.expr, val, s.ret_type_name, s.ret_type_name_len)
                     emit_str(s, c"  ret ")
                     emit_llvm_type_struct(s, TYPE_STRUCT, s.ret_type_name, s.ret_type_name_len)
@@ -1352,7 +1362,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                 # shares its name with a sibling branch's `let`, #1755.)
                 bool_check_slot(s, stmt.expr, method.return_type, method.return_type_name, method.return_type_name_len)
                 literal_slot(s, stmt.expr, method.return_type, literal_ret_pointee(method.return_type_name, method.return_type_name_len))   # AGAST #2341
-                let tail_raw: i32 = emit_expr(s, stmt.expr)
+                let tail_raw: i32 = emit_struct_copy(s, stmt.expr, method_tail_copy_type(method))
                 let tail_i64: i32 = ptr_slot_value(s, method.return_type, stmt.expr, tail_raw)
                 let tail_ptr: i32 = mut_ref_slot_value(s, method.return_type, stmt.expr, tail_i64)   # AGAST #2391
                 # AGAST #2074: a `1.0` tail in an `-> f32` method is fptrunc'd.
