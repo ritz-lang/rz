@@ -771,8 +771,8 @@ var words: [4]i32 = [0; 4]
 The literal's length must be the slot's `N` exactly, for a list and a fill
 alike. A shorter or longer one is an error at the literal; nothing is
 zero-filled (LARB R42, AGAST #3315). Write `[0; N]` and then store the
-elements you mean. ritz0 still zero-fills a short literal until #3315's
-implementation tickets land:
+elements you mean. ritz0 refuses it; ritz1 still zero-fills a short literal
+until AGAST #3383 lands:
 
 ```text
 let a: [3]i64 = [1, 2]       # error: an array literal of 2 elements for a `[3]i64`

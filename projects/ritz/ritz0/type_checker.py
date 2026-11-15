@@ -186,6 +186,11 @@ class TypeChecker:
                 for method in item.methods:
                     self._register_method(item, method)
 
+        # A global's or const's literal initialiser is a slot too (LARB R42).
+        for item in module.items:
+            if isinstance(item, (rast.VarDef, rast.ConstDef)) and item.value is not None:
+                self._check_global_literal(item.value, item.type)
+
         # Third pass: check function bodies
         wanted = emits_body or (lambda _fn: True)
         for item in module.items:
@@ -1390,6 +1395,7 @@ class TypeChecker:
         """The elements of a literal or the payload of a variant landing in
         `slot`, which says what each part is."""
         slot = self._resolve_alias(slot) if slot is not None else None
+        self._check_literal_length(expr, slot)
         if isinstance(expr, rast.ArrayLit) and isinstance(slot, rast.ArrayType):
             for element in expr.elements:
                 self._infer_into(element, slot.inner)
@@ -1878,7 +1884,8 @@ class TypeChecker:
     def _check_array_slot(self, expr: rast.Expr, actual: Optional[rast.Type],
                           slot: Optional[rast.Type]) -> None:
         """A non-literal `[N]T1` fits `[N]T2` only if T1 is T2 (LARB R5). A
-        literal takes the slot's element type, and its parts land one by one."""
+        literal takes the slot's element type, and its parts land one by one; its
+        length is `_check_literal_length`'s."""
         if (slot is None or actual is None or id(expr) in self._slot_reported
                 or isinstance(expr, (rast.ArrayLit, rast.ArrayFill, rast.TupleLit))
                 or self._arrays_fit(actual, slot)):
@@ -1886,12 +1893,42 @@ class TypeChecker:
         self._slot_reported.add(id(expr))
         self._slot_error(array_rules.ELEMENT_MISMATCH, expr.span)
 
+    def _check_literal_length(self, expr: rast.Expr, slot: Optional[rast.Type]) -> bool:
+        """An array literal or fill must be its `[N]T` slot's N long (LARB R42,
+        AGAST #3315): nothing is zero-filled, and a longer one is refused the
+        same. Refused at the literal. True if it was. `slot` is resolved."""
+        if not (isinstance(expr, (rast.ArrayLit, rast.ArrayFill))
+                and isinstance(slot, rast.ArrayType)) or id(expr) in self._slot_reported:
+            return False
+        have = len(expr.elements) if isinstance(expr, rast.ArrayLit) else expr.count
+        have = getattr(have, 'value', have)
+        want = getattr(slot.size, 'value', slot.size)
+        if not (isinstance(have, int) and isinstance(want, int)) or have == want:
+            return False
+        self._slot_reported.add(id(expr))
+        self._slot_error(array_rules.literal_length(have, self._type_str(slot)), expr.span)
+        return True
+
+    def _check_global_literal(self, expr: rast.Expr, slot: Optional[rast.Type]) -> None:
+        """A global's initialiser and the literals inside it, against its type:
+        the only check a global's value gets here."""
+        slot = self._resolve_alias(slot) if slot is not None else None
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        if self._check_literal_length(expr, slot) or not isinstance(slot, rast.ArrayType):
+            return
+        parts = (expr.elements if isinstance(expr, rast.ArrayLit)
+                 else [expr.value] if isinstance(expr, rast.ArrayFill) else [])
+        for part in parts:
+            self._check_global_literal(part, slot.inner)
+
     def _check_local_array_length(self, stmt: rast.Stmt, value: rast.Expr,
                                   actual: Optional[rast.Type],
                                   slot: Optional[rast.Type]) -> None:
         """A non-literal `[M]T` into a local `[N]T`, M not N (AGAST #2090): a
         `let` bound the `[M x T]` value under the `[N]T` name. Refused at the
-        statement, in ritz1's words. A literal's length is judged elsewhere."""
+        statement, in ritz1's words. A literal's length is `_check_literal_length`'s,
+        at the literal (LARB R42)."""
         if (slot is None or actual is None or id(value) in self._slot_reported
                 or isinstance(value, (rast.ArrayLit, rast.ArrayFill))):
             return

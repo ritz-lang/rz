@@ -270,6 +270,8 @@ ELEMENTS = {
     "big_fill_global": "var G: [100]u8\n\nfn f() -> i32\n    G = [3; 100]\n    G[99] as i32 - 3\n",
     "big_fill_field": ("struct H\n    b: [100]u8\n\nfn f() -> i32\n    var h: H = H { b: [3; 100] }\n"
                        "    h.b[99] as i32 - 3\n"),
+    # ritz1 zero-fills it until AGAST #3383; ritz0 refuses it (LARB R42,
+    # test_array_literal_length.py), so the row is skipped there.
     "short_literal": "fn f() -> i32\n    var b: [4]u8 = [1, 2]\n    b[1] as i32 - 2\n",
     # AGAST #3029: a payload's `[N]T` is the slot.
     "option_payload": "fn f() -> i32\n    var o: Option<[2]u8> = Some([0, 3])\n    0\n",
@@ -288,8 +290,18 @@ ELEMENTS_RITZ0 = {
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", _ids(ELEMENTS))
+# Rows a compiler now refuses, by LARB ruling: their refusal is tested elsewhere.
+ELEMENTS_REFUSED = {("short_literal", "ritz0"): "LARB R42: test_array_literal_length.py"}
+
+
+def _element_params():
+    for name in _ids(ELEMENTS):
+        for compiler in COMPILERS:
+            why = ELEMENTS_REFUSED.get((name, compiler))
+            yield pytest.param(name, compiler, marks=[pytest.mark.skip(reason=why)] if why else [])
+
+
+@pytest.mark.parametrize("name,compiler", list(_element_params()))
 def test_literal_elements(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, name, _main(PRELUDE + ELEMENTS[name], "    f()\n")) == 0
 

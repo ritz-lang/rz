@@ -14,6 +14,13 @@ ELEMENT_MISMATCH = "an array only fits a slot of the same element type: write a 
 # forms it refused only in llvmlite's words.
 LENGTH_MISMATCH = "array length does not match the local array's length"
 
+
+def literal_length(count: int, slot: str) -> str:
+    """An array literal or fill of `count` elements landing in `slot`, an `[N]T`
+    with N not `count` (LARB R42, AGAST #3315). Nothing is zero-filled, and a
+    longer one is refused the same. ritz1's half is AGAST #3383."""
+    return f"an array literal of {count} element{'' if count == 1 else 's'} for a `{slot}`"
+
 # A whole `[N]T` where a `*U` goes, `U` not `[N]T` (AGAST #2392), or alone as a
 # statement (#3189). ritz1's own words, from emitter_expr_access.ritz, which
 # refuses it at every slot: ritz0 says the same at the same place rather than a
