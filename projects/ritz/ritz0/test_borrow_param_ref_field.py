@@ -1041,6 +1041,54 @@ pub fn main() -> i32
     f.fill(@&p, f.k)
     return a[0] + a[1]
 """,
+    # AGAST #3148: a field of that element, `(*r)[i].f`.  ritz1 read it through
+    # a `**C` but not an `@*C` / `@&*C` param or local: "unhandled EXPR_MEMBER".
+    "read_deref_pointer_element_field": BY_VALUE + """
+fn get(r: **C) -> i64
+    (*r)[1].y
+
+pub fn main() -> i32
+    var a: [2]C
+    a[1] = C { x: 1, y: 3 }
+    var p: *C = @a[0]
+    return get(@p) as i32
+""",
+    "read_deref_ref_pointer_element_field": BY_VALUE + """
+fn get(r: @*C) -> i64
+    (*r)[1].y
+
+pub fn main() -> i32
+    var a: [2]C
+    a[1] = C { x: 1, y: 3 }
+    var p: *C = @a[0]
+    return get(@p) as i32
+""",
+    "read_deref_mut_ref_pointer_element_field": BY_VALUE + """
+fn get(r: @&*C) -> i64
+    (*r)[1].y
+
+pub fn main() -> i32
+    var a: [2]C
+    a[1] = C { x: 1, y: 3 }
+    var p: *C = @a[0]
+    return get(@&p) as i32
+""",
+    "read_local_deref_ref_pointer_element_field": BY_VALUE + """
+pub fn main() -> i32
+    var a: [2]C
+    a[1] = C { x: 1, y: 3 }
+    var p: *C = @a[0]
+    let r: @*C = @p
+    return (*r)[1].y as i32
+""",
+    "read_local_deref_mut_ref_pointer_element_field": BY_VALUE + """
+pub fn main() -> i32
+    var a: [2]C
+    a[1] = C { x: 1, y: 3 }
+    var p: *C = @a[0]
+    let r: @&*C = @&p
+    return (*r)[1].y as i32
+""",
     # Through a `*[2]C` it's #2440's `(*p)[i]`, which already stored a `C`.
     "plain_deref_array_pointer_element": BY_VALUE + """
 fn fill(r: *[2]C, d: C)
