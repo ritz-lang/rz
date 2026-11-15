@@ -774,6 +774,82 @@ fn eprint_dotted_type_removed(p: *Parser, qual: i32)
     eprint_lexeme(n.start, n.len)
     eprint_char(96 as u8)
 
+# LARB R52 (AGAST #3411, #1622): an alias names one type; `A | B` isn't a
+# type and a type name isn't a pattern (LANGUAGE_SPEC §3.8).  ritz1 never had
+# either, so both already fail to parse, at the `|` and at the pattern; these
+# give that failure ritz0's words (#3409).
+
+fn is_prim_type_tok(k: i32) -> i32
+    if k >= TOK_I8 and k <= TOK_BOOL
+        return 1
+    0
+
+# A token a type is spelled with: `*[N]Vec<fn(i64) -> @&T>` and the like.
+fn is_type_tok(k: i32) -> i32
+    if is_prim_type_tok(k) == 1 or k == TOK_IDENT or k == TOK_NUMBER or k == TOK_DOT
+        return 1
+    if k == TOK_STAR or k == TOK_AT or k == TOK_AMP or k == TOK_MUT or k == TOK_FN
+        return 1
+    if k == TOK_LBRACKET or k == TOK_RBRACKET or k == TOK_LPAREN or k == TOK_RPAREN
+        return 1
+    if k == TOK_LT or k == TOK_GT or k == TOK_SHR or k == TOK_COMMA or k == TOK_ARROW
+        return 1
+    0
+
+# 1 if the furthest token reached is a `|` that follows a type in a type
+# position: after a `:`, an alias's `=`, or a return type's `->`.  The scan
+# back crosses the type's own tokens; anything else (an `as`, an operand's
+# `=`) means the `|` was not after a type, and it stays "unexpected '|'".
+# A `|` can't fail after a cast's type: there it's a bitwise or (R52a).
+fn union_type_at(p: *Parser, fail_at: i32) -> i32
+    if fail_at < 2 or fail_at >= p.token_count
+        return 0
+    if (p.tokens + fail_at).kind != TOK_PIPE
+        return 0
+    let last: i32 = (p.tokens + (fail_at - 1)).kind
+    if is_prim_type_tok(last) == 0 and last != TOK_IDENT and last != TOK_GT and last != TOK_SHR and last != TOK_RBRACKET and last != TOK_RPAREN
+        return 0
+    var seen_arrow: i32 = 0
+    var c: i32 = fail_at - 1
+    while c >= 0 and is_type_tok((p.tokens + c).kind) == 1
+        if (p.tokens + c).kind == TOK_ARROW
+            seen_arrow = 1
+        c = c - 1
+    if c < 0
+        return seen_arrow
+    let k: i32 = (p.tokens + c).kind
+    if k == TOK_COLON
+        return 1
+    if k == TOK_ASSIGN and c >= 2 and (p.tokens + (c - 1)).kind == TOK_IDENT and (p.tokens + (c - 2)).kind == TOK_TYPE
+        return 1
+    seen_arrow
+
+# 1 if the furthest token reached begins a type used as a match pattern
+# (`i64 =>`, `*u8 =>`, `&i32 =>`, or `A(i64) =>`'s payload): a primitive type
+# name, `*` or `&`, at an arm's start or as a payload, whose line reaches
+# `=>` across type tokens.  A bare IDENT pattern is a binding, so a user
+# type's name (`Point =>`) can't be told apart and is not refused.
+fn type_pattern_at(p: *Parser, fail_at: i32) -> i32
+    if fail_at < 1 or fail_at >= p.token_count
+        return 0
+    let k: i32 = (p.tokens + fail_at).kind
+    if is_prim_type_tok(k) == 0 and k != TOK_STAR and k != TOK_AMP
+        return 0
+    let before: i32 = (p.tokens + (fail_at - 1)).kind
+    var at_pattern: i32 = 0
+    if before == TOK_NEWLINE or before == TOK_INDENT or before == TOK_DEDENT
+        at_pattern = 1
+    if before == TOK_LPAREN and fail_at >= 2 and (p.tokens + (fail_at - 2)).kind == TOK_IDENT
+        at_pattern = 1
+    if at_pattern == 0
+        return 0
+    var c: i32 = fail_at
+    while c < p.token_count and is_type_tok((p.tokens + c).kind) == 1
+        c = c + 1
+    if c < p.token_count and (p.tokens + c).kind == TOK_FAT_ARROW
+        return 1
+    0
+
 # Called by the generated anchor-skip recovery in parse_item BEFORE it
 # skips the construct it could not parse.  p.pos is still at the first
 # token of that construct (every failed alternative rewinds to start_pos).
@@ -801,6 +877,12 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
             eprint_qualified_access_removed(p, qual)
         else if dotted >= 0
             eprint_dotted_type_removed(p, dotted)
+        else if union_type_at(p, fail_at) == 1
+            eprint_location_at(p, fail_at)
+            eprints_cstr(c"`A | B` isn't a type: declare an enum with a payload per kind (LANGUAGE_SPEC §3.8)")
+        else if type_pattern_at(p, fail_at) == 1
+            eprint_location_at(p, fail_at)
+            eprints_cstr(c"a type isn't a pattern")
         else
             eprint_location_at(p, fail_at)
             eprints_cstr(c"unexpected ")
