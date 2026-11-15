@@ -46,7 +46,7 @@ import pytest
 
 import fast_link
 
-from ref_rules import ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE
+from ref_rules import ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE, lent_temp_escapes
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -130,6 +130,27 @@ fn set(t: @&Tracked)
 
 fn both(t: @Tracked, n: i32) -> i32
     return DROPS
+
+"""
+
+# Callees that hand back what they were lent (AGAST #3215).
+LENT_ESCAPE = """\
+fn id(t: @Tracked) -> @Tracked
+    return t
+
+struct Pick
+    n: i32
+
+impl Pick
+    fn pick(self: @Pick, t: @Tracked) -> @Tracked
+        return t
+
+struct Wrap
+    p: *Tracked
+
+impl Wrap
+    fn of(t: @&Tracked) -> Wrap
+        return Wrap { p: t }
 
 """
 
@@ -901,6 +922,14 @@ pub fn main() -> i32
     let n = both(@make(1), look(@make(2)))
     return n * 100 + ORDER
 """, 121, {}),
+
+    # Lent from a local, the reference `id` returns outlives the call
+    # (AGAST #3215's control): the local drops at the block's end.
+    "lent_temp_bound_then_id": (LENT_ESCAPE + """\
+pub fn main() -> i32
+    let t = make(5)
+    return id(@t).id * 10 + DROPS
+""", 50, {}),
 
     "scope_end_let": ("""\
 fn f()
@@ -2637,6 +2666,34 @@ fn g(r: @(Tracked, i64)) -> i32
                       MOVE_OUT_OF_REF, {}),
 }
 
+# A call returning a reference (or a value holding one) can't take a lent
+# temporary: the temporary drops as the call returns, so the result would
+# point at a dropped value (Aaron's ruling on AGAST #3215). Located at the
+# lent argument, on all three compilers.
+LENT_ESCAPE_ROWS = {
+    "lent_temp_returned_ref_read": ("""\
+pub fn main() -> i32
+    return id(@make(5)).id
+""", "@make(5)", 2, 15),
+    "lent_temp_returned_ref_let": ("""\
+pub fn main() -> i32
+    let r = id(@make(5))
+    return 0
+""", "@make(5)", 2, 16),
+    "lent_temp_returned_ref_method": ("""\
+pub fn main() -> i32
+    var s = Pick { n: 0 }
+    return s.pick(@make(1)).id
+""", "@make(1)", 3, 19),
+    # A static call, and a struct holding a pointer: `Wrap.of` returns one.
+    "lent_temp_returned_ptr_struct": ("""\
+pub fn main() -> i32
+    let w = Wrap.of(@&make(2))
+    return 0
+""", "@&make(2)", 2, 21),
+}
+
+
 USE_AFTER_MOVE = {
     # AGAST #2282: destructuring moves the source and defines its bindings.
     "after_destructure_source": (TUPLES + """\
@@ -3031,3 +3088,21 @@ def test_use_after_move_rejected(request, tmp_path, compiler, name):
     assert comp.returncode != 0, f"{compiler} accepted a use after move:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
     assert f"use of moved value: `{var}`" in out, out[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,name", [
+    pytest.param(c, n, id=f"{c}-{n}") for n in sorted(LENT_ESCAPE_ROWS) for c in COMPILERS])
+def test_lent_temp_into_returned_reference_refused(request, tmp_path, compiler, name):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    body, arg, line, col = LENT_ESCAPE_ROWS[name]
+    src = _write(tmp_path, LENT_ESCAPE + body)
+    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert lent_temp_escapes(arg) in out, out[-2000:]
+    # Located at the lent argument: its line in the body, after the prelude.
+    at = PRELUDE.count("\n") + LENT_ESCAPE.count("\n") + line
+    assert f":{at}:{col}:" in out, out[-2000:]

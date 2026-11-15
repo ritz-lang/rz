@@ -1098,6 +1098,121 @@ fn ref_check_temp_addr(s: *EmitterState, e: *Expr)
         return
     ref_error_temp(s, e.span.line, e.span.col, c"`@` of a call's temporary outlives it: bind the call to a local first, or pass it straight to a call")
 
+# A call whose result is or holds a reference can't take a lent temporary:
+# the temporary drops as the call returns, so `id(@make(5)).id` would read a
+# dropped value (Aaron's ruling on AGAST #3215).  ritz0's words are
+# ref_rules.lent_temp_escapes; ritz0/test_ownership_free_count.py holds all
+# three compilers.
+
+# 1 when the struct or enum `name` holds a pointer or reference.
+fn ref_named_holds_ptr(s: *EmitterState, name: *u8, len: i32, depth: i32) -> i32
+    if name == null or len <= 0 or depth > 16
+        return 0
+    let st: *StructDef = find_struct(s, name, len)
+    if st != null
+        return ref_fields_hold_ptr(s, st.fields, depth + 1)
+    let ei: i32 = user_enum_index(name, len)
+    if ei < 0
+        return 0
+    var vi: i32 = 0
+    while vi < enum_variant_count(ei)
+        if ref_fields_hold_ptr(s, enum_variant_fields(ei, vi), depth + 1) == 1
+            return 1
+        vi += 1
+    0
+
+fn ref_fields_hold_ptr(s: *EmitterState, fields: *StructField, depth: i32) -> i32
+    var f: *StructField = fields
+    while f != null
+        let t: i32 = f.field_type
+        if f.fn_sig == null and (ref_is_pointer(t) == 1 or t == TYPE_PTR_PTR)
+            return 1
+        if t == TYPE_STRUCT and ref_named_holds_ptr(s, f.field_type_name, f.field_type_name_len, depth) == 1
+            return 1
+        if t == TYPE_ARRAY
+            if ref_is_pointer(f.array_elem_type) == 1 or f.array_elem_type == TYPE_PTR_PTR
+                return 1
+            if f.array_elem_type == TYPE_STRUCT and ref_named_holds_ptr(s, f.array_elem_type_name, f.array_elem_type_name_len, depth) == 1
+                return 1
+        f = f.next
+    0
+
+# 1 when `f` returns a pointer or reference, or a value holding one.
+fn ref_returns_ptr(s: *EmitterState, f: *FnDef) -> i32
+    if f == null or f.ret_fn_sig != null
+        return 0
+    let t: i32 = f.return_type
+    if ref_is_pointer(t) == 1 or t == TYPE_PTR_PTR or f.ret_ref != null
+        return 1
+    if f.ret_array != null
+        let a: *ArrayElem = f.ret_array
+        if ref_is_pointer(a.elem) == 1 or a.elem == TYPE_PTR_PTR
+            return 1
+        if a.elem == TYPE_STRUCT
+            return ref_named_holds_ptr(s, a.name, a.name_len, 0)
+        return 0
+    if t == TYPE_STRUCT
+        return ref_named_holds_ptr(s, f.return_type_name, f.return_type_name_len, 0)
+    0
+
+# `e` as written, for naming a lent argument: ritz0's _render_lent.
+fn ref_eprint_lent(e: *Expr)
+    if e == null
+        eprints_cstr(c"..")
+        return
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        eprint_bytes(e.ident_ptr, e.ident_len)
+    else if k == EXPR_INT_LIT
+        eprint_int(e.int_val)
+    else if k == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        if e.op == OP_ADDR_MUT
+            eprints_cstr(c"@&")
+        else
+            eprint_char('@')
+        ref_eprint_lent(e.operand)
+    else if k == EXPR_CALL or k == EXPR_METHOD
+        if k == EXPR_CALL
+            eprint_bytes(e.func_name, e.func_name_len)
+        else
+            ref_eprint_lent(e.left)
+            eprint_char('.')
+            eprint_bytes(e.ident_ptr, e.ident_len)
+        eprint_char('(')
+        var a: *Expr = e.args
+        while a != null
+            ref_eprint_lent(a)
+            if a.next != null
+                eprints_cstr(c", ")
+            a = a.next
+        eprint_char(')')
+    else if k == EXPR_MEMBER
+        ref_eprint_lent(e.left)
+        eprint_char('.')
+        eprint_bytes(e.ident_ptr, e.ident_len)
+    else if k == EXPR_INDEX
+        ref_eprint_lent(e.left)
+        eprint_char('[')
+        ref_eprint_lent(e.right)
+        eprint_char(']')
+    else
+        eprints_cstr(c"..")
+
+# At the first argument of `call` that lends a temporary, when `f` returns one.
+fn ref_check_lent_escape(s: *EmitterState, args: *Expr, f: *FnDef)
+    var a: *Expr = args
+    while a != null
+        if a.kind == EXPR_UNARY and (a.op == OP_ADDR or a.op == OP_ADDR_MUT) and ref_temp_call(s, a.operand) != null
+            if ref_returns_ptr(s, f) == 0 or ref_first_report(a.span.line, a.span.col) == 0
+                return
+            ref_eprint_loc(a.span.line, a.span.col)
+            eprints_cstr(c": error: this call returns a reference, and `")
+            ref_eprint_lent(a)
+            eprints_cstr(c"` lends a temporary that's dropped when the call returns: bind it to a local first\n")
+            s.error_count = s.error_count + 1
+            return
+        a = a.next
+
 fn ref_walk(s: *EmitterState, e: *Expr)
     if e == null
         return
@@ -1140,6 +1255,7 @@ fn ref_walk(s: *EmitterState, e: *Expr)
             f = find_call_fn(s, e)
         if f != null
             p = f.params
+        ref_check_lent_escape(s, e.args, f)
         ref_args(s, e.args, p)
     else if k == EXPR_METHOD
         var qv: i32 = 0
@@ -1165,6 +1281,7 @@ fn ref_walk(s: *EmitterState, e: *Expr)
                 if mp != null
                     ref_value_args(s, e.args, mp.next)
                 mp = null
+        ref_check_lent_escape(s, e.args, m)
         ref_args(s, e.args, mp)
     else if k == EXPR_STRUCT_LIT
         ref_walk_struct(s, e)

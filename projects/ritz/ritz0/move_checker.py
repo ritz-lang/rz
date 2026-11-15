@@ -260,6 +260,34 @@ class MoveTypes:
         # Pointers, references, fn types, SIMD vectors: copies.
         return False
 
+    def holds_reference(self, ty: Optional[rast.Type], seen: Optional[Set[str]] = None) -> bool:
+        """`ty` is a pointer or reference, or a struct, enum, tuple or array
+        holding one (AGAST #3215). A type parameter holds none."""
+        ty = self.resolve(ty)
+        if isinstance(ty, (rast.PtrType, rast.RefType, rast.SliceType)):
+            return True
+        if isinstance(ty, rast.ArrayType):
+            return self.holds_reference(ty.inner, seen)
+        if isinstance(ty, rast.TupleType):
+            return any(self.holds_reference(t, seen) for t in ty.elements)
+        if isinstance(ty, rast.UnionType):
+            return any(self.holds_reference(t, seen) for t in ty.variants)
+        if not isinstance(ty, rast.NamedType) or self._is_param(ty):
+            return False
+        seen = set() if seen is None else seen
+        key = _type_key(ty)
+        if key in seen:
+            return False      # a recursive type: its other fields decide
+        seen.add(key)
+        if ty.name in self.structs:
+            return any(self.holds_reference(t, seen) for _n, t in self.struct_fields(ty))
+        ed = self.enums.get(ty.name)
+        if ed is not None:
+            subst = dict(zip(ed.type_params or [], ty.args))
+            return any(self.holds_reference(_subst(t, subst), seen)
+                       for v in ed.variants for t in v.fields)
+        return False
+
     def variant_value_type(self, expr: rast.Expr, is_binding) -> Optional[rast.Type]:
         """The enum type of a qualified variant value, `E.V` or `E.V(...)`,
         when `E` is a non-generic enum declaring `V` and not a binding

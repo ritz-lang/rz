@@ -100,3 +100,12 @@ def no_method(method: str, type_name: str, free_call: str | None = None) -> str:
     if free_call:
         hint += f", or call `{free_call}`"
     return f"no method `{method}` on `{type_name}`: {hint}"
+
+
+# A call whose result is or holds a reference can't take a lent temporary:
+# the temporary drops as the call returns, so the result would point at a
+# dropped value (Aaron's ruling on AGAST #3215). `arg` is the argument as
+# written, `@make(5)`.
+def lent_temp_escapes(arg: str) -> str:
+    return (f"this call returns a reference, and `{arg}` lends a temporary "
+            f"that's dropped when the call returns: bind it to a local first")

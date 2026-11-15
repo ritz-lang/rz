@@ -78,6 +78,29 @@ def temp_root(expr: rast.Expr) -> Optional[rast.Expr]:
     return expr if isinstance(expr, (rast.Call, rast.MethodCall)) else None
 
 
+def _render_lent(expr: rast.Expr) -> str:
+    """`expr` as written, for naming a lent argument (`@make(5)`, AGAST
+    #3215). Names, integers, calls, fields, elements and `@` / `@&` print
+    as themselves, anything else as `..`. ritz1's ref_eprint_lent agrees."""
+    if isinstance(expr, rast.Ident):
+        return expr.name
+    if isinstance(expr, rast.IntLit):
+        return str(expr.value)
+    if isinstance(expr, rast.UnaryOp) and expr.op in ('@', '@&', '&', '&mut'):
+        op = {'&': '@', '&mut': '@&'}.get(expr.op, expr.op)
+        return op + _render_lent(expr.operand)
+    if isinstance(expr, rast.Call):
+        return f"{_render_lent(expr.func)}({', '.join(_render_lent(a) for a in expr.args)})"
+    if isinstance(expr, rast.MethodCall):
+        args = ', '.join(_render_lent(a) for a in expr.args)
+        return f"{_render_lent(expr.expr)}.{expr.method}({args})"
+    if isinstance(expr, rast.Field):
+        return f"{_render_lent(expr.expr)}.{expr.field}"
+    if isinstance(expr, rast.Index):
+        return f"{_render_lent(expr.expr)}[{_render_lent(expr.index)}]"
+    return ".."
+
+
 def span_empty_needs_slot(method: str) -> str:
     """`Span.<method>()` in no slot that spells its T (AGAST #2296); ritz1
     prints the same text after `'Span.<method>' `."""
@@ -10308,6 +10331,7 @@ class LLVMEmitter:
                 lends = True
         if not lends:
             return emit(expr)
+        self._refuse_lent_into_reference(expr)
         self._lent_temps.append([])
         try:
             val = emit(expr)
@@ -10315,6 +10339,19 @@ class LLVMEmitter:
             slots = self._lent_temps.pop()
         self._drop_lent_temps(slots)
         return val
+
+    def _refuse_lent_into_reference(self, call: rast.Expr) -> None:
+        """A call whose result is or holds a reference can't take a lent
+        temporary: it drops as the call returns, so `id(@make(5)).id` would
+        read a dropped value (Aaron's ruling on AGAST #3215). Refused at the
+        first lent argument, even when the result points elsewhere."""
+        if not self.move_types.holds_reference(self._infer_ritz_type(call)):
+            return
+        for arg in call.args:
+            # `@mkp()` of a `*R` call is the place it points at: no temporary.
+            if getattr(arg, 'lent_arg', False) and not isinstance(
+                    self._infer_ritz_type(temp_root(arg.operand)), (rast.PtrType, rast.RefType)):
+                raise EmitError(ref_rules.lent_temp_escapes(_render_lent(arg)), arg.span)
 
     def _lend_temp_slot(self, call: rast.Expr, val: ir.Value) -> ir.Value:
         """The slot holding `val`, the value of `call`, for an `@<call>`

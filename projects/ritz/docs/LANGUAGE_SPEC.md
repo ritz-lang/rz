@@ -3878,6 +3878,26 @@ fn main() -> i32
     c.n
 ```
 
+A call whose result is a reference or pointer (`@T`, `@&T`, `*T`, or a struct,
+tuple or enum holding one) can't take a lent temporary at all: the temporary is
+dropped as the call returns, so the result would point at a dropped value. This
+holds even when the result points into a different argument (`find(@make_key(),
+@table) -> @Entry`); binding the temporary to a local first is always the fix.
+
+```ritz expect-error="this call returns a reference, and `@make()` lends a temporary that's dropped when the call returns: bind it to a local first"
+struct Counter
+    n: i32
+
+fn make() -> Counter
+    Counter { n: 1 }
+
+fn id(c: @Counter) -> @Counter
+    c
+
+fn main() -> i32
+    id(@make()).n
+```
+
 ### 13.4 Mutable Borrowing
 
 `@&x` takes a mutable reference. In a parameter list, `name:& T` borrows the
