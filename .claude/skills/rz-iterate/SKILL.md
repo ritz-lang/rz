@@ -119,7 +119,9 @@ stays here; remote hosts only run rooms.
   the room says so in place of a REAP, and nothing merges ungated.
 - **One gate per host.** `run-gate.sh` locks slots under the host's own
   `~/dev/ritz-lang/gate-logs`, so a remote gate never waits on omegalisk's
-  gate.
+  gate. Waiting gates get a free slot first come, first served (#3364); the
+  train gate goes ahead of room gates (#3317). A gate log's `WAITING` lines
+  show its queue position.
 - **Which host a room is on is recorded in AGAST, in the claim's agent
   name:** `ritz-task-<id>` on omegalisk, `ritz-task-<id>@<host>` on a remote
   host. To see what's running where, list `executing` tickets and read

@@ -155,6 +155,74 @@ check '[[ ! -e "$MARK" ]]' "a train gate stopped while waiting removes its marke
 touch "$RZ_TEST_RELEASE"
 wait
 
+# 9. FIFO (AGAST #3364): with the one slot held by H, room gates A, B, C ask
+# for it in that order.  C polls 10x as often as A and B, so whichever-polls-
+# first would hand it to C; the queue hands it out A, B, C.
+Q="$RZ_GATE_DIR/.gate-queue"
+rm -f "$RZ_TEST_RELEASE"; : > "$RZ_TEST_ORDER"
+RZ_TEST_NAME=H RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" fh >/dev/null &
+until_ '[[ -n "$(logof fh)" ]] && grep -q "^SLOT=" "$(logof fh)"'
+fifo='echo $RZ_TEST_NAME >> "$RZ_TEST_ORDER"; sleep 0.3'
+for x in a b; do
+    RZ_TEST_NAME=${x^^} RZ_GATE_POLL=1 RZ_GATE_CMD="$fifo" gate "$W" f$x >/dev/null &
+    until_ "[[ -n \"\$(logof f$x)\" ]] && grep -q '^WAITING' \"\$(logof f$x)\""
+done
+RZ_TEST_NAME=C RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" fc >/dev/null &
+until_ '[[ -n "$(logof fc)" ]] && grep -q "^WAITING" "$(logof fc)"'
+check '[[ "$(wc -l < "$Q" 2>/dev/null)" -eq 3 ]]' "three waiters, three queue entries"
+check 'grep -q "^WAITING.*position 3" "$(logof fc)"' "the WAITING line logs the queue position"
+sleep 0.5
+touch "$RZ_TEST_RELEASE"
+wait
+check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "H A B C " ]]' "a freed slot goes to the longest waiter (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+check '[[ -e "$Q" && ! -s "$Q" ]]' "the queue is empty once every gate has its slot"
+
+# 10. A waiter killed outright (SIGKILL: no trap runs) is skipped, not waited on.
+rm -f "$RZ_TEST_RELEASE"; : > "$RZ_TEST_ORDER"
+RZ_TEST_NAME=H RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" kh >/dev/null &
+until_ '[[ -n "$(logof kh)" ]] && grep -q "^SLOT=" "$(logof kh)"'
+RZ_TEST_NAME=A RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" ka >/dev/null 2>&1 &
+until_ '[[ -n "$(logof ka)" ]] && grep -q "^WAITING" "$(logof ka)"'
+RZ_TEST_NAME=B RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" kb >/dev/null &
+until_ '[[ -n "$(logof kb)" ]] && grep -q "^WAITING" "$(logof kb)"'
+check 'grep -q "^ritz-gate-ka " "$Q"' "the waiter to be killed is queued"
+for p in $(pgrep -u "$(id -u)" -x bash); do
+    tr '\0' '\n' 2>/dev/null < "/proc/$p/environ" | grep -qx "RZ_LOG=$(logof ka)" && kill -KILL "$p"
+done
+until_ '[[ ! -e "$RZ_TEST_ACTIVE/ritz-gate-ka" ]]'
+touch "$RZ_TEST_RELEASE"
+until_ 'grep -q "^EXIT=" "$(logof kb)"'
+check 'grep -qx EXIT=0 "$(logof kb)" && [[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "H B " ]]' "a killed waiter's entry is skipped (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+check '! grep -q "^ritz-gate-ka " "$Q"' "the dead waiter's entry is pruned"
+wait
+
+# 11. A waiter stopped normally (SIGTERM) removes its own entry.
+rm -f "$RZ_TEST_RELEASE"
+RZ_TEST_NAME=H RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" sh >/dev/null &
+until_ '[[ -n "$(logof sh)" ]] && grep -q "^SLOT=" "$(logof sh)"'
+RZ_GATE_POLL=0.1 RZ_GATE_CMD='exit 0' gate "$W" sw >/dev/null 2>&1 &
+until_ 'grep -q "^ritz-gate-sw " "$Q"'
+check 'grep -q "^ritz-gate-sw " "$Q"' "a waiting gate is queued"
+stop "$(logof sw)"
+until_ '! grep -q "^ritz-gate-sw " "$Q"'
+check '! grep -q "^ritz-gate-sw " "$Q"' "a waiter stopped by SIGTERM removes its queue entry"
+touch "$RZ_TEST_RELEASE"
+wait
+
+# 12. The queue keeps #3317's train priority: a train gate queued after room
+# gate R still takes the freed slot first.
+rm -f "$RZ_TEST_RELEASE"; : > "$RZ_TEST_ORDER"
+RZ_TEST_NAME=H RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" th >/dev/null &
+until_ '[[ -n "$(logof th)" ]] && grep -q "^SLOT=" "$(logof th)"'
+RZ_TEST_NAME=R RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" tr >/dev/null &
+until_ '[[ -n "$(logof tr)" ]] && grep -q "^WAITING" "$(logof tr)"'
+RZ_TEST_NAME=T RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" tt >/dev/null &
+until_ '[[ -n "$(logof tt)" ]] && grep -q "^WAITING" "$(logof tt)"'
+check 'grep -q "^WAITING.*position 1 " "$(logof tt)"' "a train gate is first in line though a room gate queued before it"
+touch "$RZ_TEST_RELEASE"
+wait
+check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "H T R " ]]' "a train gate queued after a room gate goes first (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

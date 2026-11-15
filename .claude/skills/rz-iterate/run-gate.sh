@@ -44,6 +44,15 @@
 #     room gates take no slot while that unit is active.  The train removes
 #     the marker on taking its slot or on exit (trap); a marker whose unit is
 #     no longer active (a crash, a reboot) is stale and ignored.
+#   * FIFO queue (AGAST #3364): the same poll race reordered room gates too
+#     (huburght, 2 slots: ~13 min waits, not in the order asked).  A waiter
+#     appends "<unit> <pid> <train>" to <gate dir>/.gate-queue (under flock
+#     on .gate-queue.lock) and tries the slots only while no live waiter is
+#     ahead of it; a train gate counts only trains ahead (priority above).
+#     It leaves the queue on taking a slot or on exit (trap).  An entry whose
+#     pid is gone or whose unit is inactive (SIGKILL, reboot) is pruned, so a
+#     dead waiter never blocks the queue.  The log's WAITING lines give the
+#     position (1 = next).
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
@@ -139,7 +148,6 @@ unmark() {
 }
 if [ "$RZ_TRAIN" = 1 ]; then
     echo "$RZ_UNIT" > "$MARK" 2>/dev/null
-    trap unmark EXIT
 fi
 # A room gate yields while a train gate is waiting and its unit is alive.
 train_waiting() {
@@ -148,12 +156,56 @@ train_waiting() {
     u="$(cat "$MARK" 2>/dev/null)" || return 1
     [ -n "$u" ] && systemctl --user is-active -q "$u"
 }
+# FIFO queue (AGAST #3364; see the header).  One line per waiter,
+# "<unit> <pid> <train>", edited only under flock on .gate-queue.lock.
+Q="$RZ_DIR/.gate-queue"
+ME="$RZ_UNIT $$ $RZ_TRAIN"
+qlock() { exec 8>>"$Q.lock" && flock 8; }
+qunlock() { exec 8>&-; }
+dequeue() {
+    qlock || return
+    grep -vxF "$ME" "$Q" > "$Q.tmp" 2>/dev/null; mv -f "$Q.tmp" "$Q"
+    qunlock
+}
+# ahead: print how many live waiters are ahead of this one, pruning dead
+# entries (pid gone or unit inactive: a SIGKILL or reboot skips the trap).  A
+# train gate counts only trains ahead of it: room gates already yield to it.
+ahead() {
+    local u p t n=0 seen= keep=
+    qlock || { echo 0; return; }
+    while read -r u p t; do
+        [ -n "$u" ] || continue
+        if [ "$u $p $t" = "$ME" ]; then
+            seen=1
+        elif kill -0 "$p" 2>/dev/null && systemctl --user is-active -q "$u"; then
+            if [ -z "$seen" ] && { [ "$RZ_TRAIN" != 1 ] || [ "$t" = 1 ]; }; then
+                n=$((n + 1))
+            fi
+        else
+            continue
+        fi
+        keep+="$u $p $t"$'\n'
+    done < "$Q"
+    # Lost our line (the file was removed by hand)?  Rejoin at the back.
+    [ -n "$seen" ] || keep+="$ME"$'\n'
+    printf '%s' "$keep" > "$Q.tmp" && mv -f "$Q.tmp" "$Q"
+    qunlock
+    echo "$n"
+}
+trap 'dequeue; unmark' EXIT
 # Fail fast if the unit can't write: otherwise the slot loop below spins
 # forever and never writes a verdict.  (Seen: an agent sandbox's /tmp is not
 # the /tmp systemd units see.)  The unit ends with no EXIT line; --wait -> 98.
-echo "WAITING for a gate slot $(date -Is)" >> "$RZ_LOG" || exit 97
+{ qlock && echo "$ME" >> "$Q" && qunlock; } 2>/dev/null || exit 97
+pos=$(( $(ahead) + 1 ))
+echo "WAITING for a gate slot, queue position $pos $(date -Is)" >> "$RZ_LOG" || exit 97
 while :; do
-    if ! train_waiting; then
+    now_pos=$(( $(ahead) + 1 ))
+    if [ "$now_pos" != "$pos" ]; then
+        pos=$now_pos
+        echo "WAITING queue position $pos $(date -Is)" >> "$RZ_LOG"
+    fi
+    if [ "$pos" = 1 ] && ! train_waiting; then
         for s in $(seq 0 $((RZ_SLOTS - 1))); do
             exec 9>"$RZ_DIR/.gate-slot-$s"
             if flock -n 9; then break 2; fi
@@ -161,6 +213,7 @@ while :; do
     fi
     sleep "$RZ_POLL"
 done
+dequeue
 unmark
 echo "SLOT=$s START $(date -Is)" >> "$RZ_LOG"
 bash -c "$RZ_CMD" >> "$RZ_LOG" 2>&1
