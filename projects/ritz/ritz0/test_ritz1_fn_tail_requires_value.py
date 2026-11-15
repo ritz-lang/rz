@@ -36,12 +36,6 @@ _spec = importlib.util.spec_from_file_location(
 RULE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(RULE)
 
-# ritz1's grammar has no `unsafe` block (AGAST #2248), so this case fails at the
-# parser and never reaches the check. test_ritz1_still_cannot_parse_the_held_back_cases
-# goes red when that changes, so the case cannot stay held back by accident.
-RITZ1_CANNOT_PARSE = {"endless_loop_in_an_unsafe_block"}
-
-
 def _ritz1(ritz1_bin, tmp_path, source):
     src = tmp_path / "unit.ritz"
     src.write_text(source)
@@ -82,19 +76,10 @@ def test_ritz1_rejects_what_ritz0_rejects(ritz1_bin, tmp_path, name):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(set(RULE.ACCEPTED) - RITZ1_CANNOT_PARSE))
+@pytest.mark.parametrize("name", sorted(RULE.ACCEPTED))
 def test_ritz1_accepts_what_ritz0_accepts(ritz1_bin, tmp_path, name):
     """The load-bearing controls: without them, rejecting everything passes."""
     _assert_accepted(_ritz1(ritz1_bin, tmp_path, RULE.ACCEPTED[name]), name, tmp_path)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_CANNOT_PARSE))
-def test_ritz1_still_cannot_parse_the_held_back_cases(ritz1_bin, tmp_path, name):
-    r = _ritz1(ritz1_bin, tmp_path, RULE.ACCEPTED[name])
-    assert r.returncode != 0 and "Parse error" in r.stderr + r.stdout, (
-        f"{name}: ritz1 parses this now; drop it from RITZ1_CANNOT_PARSE:\n"
-        f"{r.stderr[-800:]}")
 
 
 @pytest.mark.integration

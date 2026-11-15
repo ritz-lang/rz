@@ -61,6 +61,13 @@ REJECTED = {
         "    loop\n"
         "        if n > 0\n"
         "            break\n", 2),
+    # An `unsafe` block is not a loop: its `break` leaves the enclosing one.
+    "break_nested_in_an_unsafe_block": (
+        "fn f(n: i64) -> i64\n"
+        "    loop\n"
+        "        unsafe\n"
+        "            if n > 0\n"
+        "                break\n", 2),
     "break_nested_in_a_match_arm": (
         "fn f(n: i64) -> i64\n"
         "    while true\n"

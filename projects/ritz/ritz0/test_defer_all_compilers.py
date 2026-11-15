@@ -59,6 +59,10 @@ REFUSED = {
     "continue": ("pub fn main() -> i32\n    for i in 0..3\n        defer\n"
                  "            if i == 1\n                continue\n    0\n",
                  f"{L + 1}:9", "`continue` can't leave a deferred statement"),
+    # An `unsafe` block is not a loop: its `break` would leave the defer (#2248).
+    "break_in_unsafe": ("pub fn main() -> i32\n    for i in 0..3\n        defer\n"
+                        "            unsafe\n                break\n    0\n",
+                        f"{L + 1}:9", "`break` can't leave a deferred statement"),
     "let": ("pub fn main() -> i32\n    defer let x = 1\n    0\n",
             f"{L}:5", "a deferred `let` or `var` would die at once"),
     "bare": ("pub fn main() -> i32\n    defer\n    0\n",

@@ -281,6 +281,23 @@ fn main() -> i32
         ^i = 4
     i
 """,
+    # An `unsafe` block diverges when its body does (AGAST #2248).
+    "after_unsafe_block_that_returns": """\
+fn g(b: i32) -> i32
+    unsafe
+        return b
+    ^b + 1
+fn main() -> i32
+    g(2)
+""",
+    "in_unsafe_block": """\
+fn main() -> i32
+    var i = 0
+    unsafe
+        return 3
+        ^i = 4
+    i
+""",
 }
 
 # name: (source, exit code). Each must still compile and run.
@@ -325,6 +342,17 @@ fn main() -> i32
             break
     i + 1
 """, 5),
+    # A `break` in an `unsafe` block leaves the loop around it.
+    "loop_left_from_an_unsafe_block_then_code": ("""\
+fn main() -> i32
+    var i = 0
+    loop
+        i = i + 1
+        unsafe
+            if i == 4
+                break
+    i + 2
+""", 6),
     # Only the literal `true` makes a `while` infinite.
     "while_cond_then_code": ("""\
 fn main() -> i32

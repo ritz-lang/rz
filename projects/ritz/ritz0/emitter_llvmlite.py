@@ -7064,6 +7064,14 @@ class LLVMEmitter:
             for body_stmt in stmt.body.stmts:
                 if self._emit_stmt(body_stmt):
                     break  # Block terminated (return/break/continue)
+            # The body's trailing expression, as _emit_while's. It was
+            # dropped, so `unsafe` + `if c` + `break` never ran (AGAST #2248).
+            tail = stmt.body.expr
+            if tail is not None and not self.builder.block.is_terminated:
+                if isinstance(tail, rast.If):
+                    self._emit_if(tail)
+                else:
+                    self._emit_expr(tail)
         finally:
             # Restore previous state
             self.in_unsafe = prev_unsafe

@@ -852,7 +852,9 @@ class Monomorphizer:
         elif isinstance(stmt, rast.WhileStmt):
             self._visit_expr(stmt.cond)
             self._visit_block(stmt.body)
-        elif isinstance(stmt, rast.DeferStmt):
+        elif isinstance(stmt, (rast.DeferStmt, rast.UnsafeBlock)):
+            # An `unsafe` body's generic calls were never registered, so
+            # one called only there was never specialised (AGAST #2248).
             self._visit_block(stmt.body)
         elif isinstance(stmt, rast.ForStmt):
             self._visit_expr(stmt.iter)

@@ -142,6 +142,10 @@ REFUSED["arm_over_a_bool_const_on_a_bool"] = (
 REFUSED["arm_over_a_variant_on_an_integer"] = (
     "enum C\n    R\n    S\nfn f(x: i32) -> i32\n    match x\n        0 => 1\n"
     "        R => 2\nfn main() -> i32\n    f(5)\n", 7, 9, "variant", "R")
+# An `unsafe` block's bindings are judged too (AGAST #2248).
+REFUSED["let_in_an_unsafe_block"] = (
+    "const K: i32 = 7\nfn main() -> i32\n    unsafe\n        let K: i32 = 3\n    0\n",
+    4, 13, "const", "K")
 # Never called: the rule is about names, so it needs no instance.
 REFUSED["generic_fn_never_called"] = (
     "const K: i32 = 7\nfn g<T>(x: T) -> i32\n    let K: i32 = 3\n    0\n"
