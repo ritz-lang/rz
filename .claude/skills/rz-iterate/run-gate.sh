@@ -12,6 +12,8 @@
 #   RZ_GATE_SLOTS  gates allowed at once         (default: host.env, else 1)
 #   RZ_HOST_ENV    per-host config file          (default: ~/.config/rz/host.env)
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
+#   RZ_GATE_POLL   seconds between slot polls    (default: 20; tests use less)
+#   RZ_GATE_TRAIN  1 = a merge-train gate        (train.sh gate sets it)
 #
 # Why each piece exists (rz-iterate):
 #   * systemd-run: a Bash background job dies when the agent's next turn
@@ -35,6 +37,13 @@
 #   * <name>-<sha12>-<n>.log, a new <n> per run: a re-gate never overwrites
 #     an earlier run's log, so a false red's evidence outlives the re-gate
 #     that clears it (AGAST #3182).  Tests: test-run-gate.sh.
+#   * train priority (AGAST #3317): waiting units poll `flock -n` every 20 s,
+#     so a freed slot went to whichever poll landed first, and room gates
+#     queued later twice beat the train (which carries every REAP behind it).
+#     A waiting train gate writes <gate dir>/.train-waiting (its unit name);
+#     room gates take no slot while that unit is active.  The train removes
+#     the marker on taking its slot or on exit (trap); a marker whose unit is
+#     no longer active (a crash, a reboot) is stale and ignored.
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
@@ -123,17 +132,36 @@ printf 'UNIT=%s\nSHA=%s\nCMD=%s\n' "$UNIT" "$SHA" "$CMD" >> "$LOG"
 # needs a second layer of quoting.
 read -r -d '' INNER <<'EOF' || true
 set -u
+# Train priority (AGAST #3317; see the header).
+MARK="$RZ_DIR/.train-waiting"
+unmark() {
+    if [ "$(cat "$MARK" 2>/dev/null)" = "$RZ_UNIT" ]; then rm -f "$MARK"; fi
+}
+if [ "$RZ_TRAIN" = 1 ]; then
+    echo "$RZ_UNIT" > "$MARK" 2>/dev/null
+    trap unmark EXIT
+fi
+# A room gate yields while a train gate is waiting and its unit is alive.
+train_waiting() {
+    [ "$RZ_TRAIN" = 1 ] && return 1
+    local u
+    u="$(cat "$MARK" 2>/dev/null)" || return 1
+    [ -n "$u" ] && systemctl --user is-active -q "$u"
+}
 # Fail fast if the unit can't write: otherwise the slot loop below spins
 # forever and never writes a verdict.  (Seen: an agent sandbox's /tmp is not
 # the /tmp systemd units see.)  The unit ends with no EXIT line; --wait -> 98.
 echo "WAITING for a gate slot $(date -Is)" >> "$RZ_LOG" || exit 97
 while :; do
-    for s in $(seq 0 $((RZ_SLOTS - 1))); do
-        exec 9>"$RZ_DIR/.gate-slot-$s"
-        if flock -n 9; then break 2; fi
-    done
-    sleep 20
+    if ! train_waiting; then
+        for s in $(seq 0 $((RZ_SLOTS - 1))); do
+            exec 9>"$RZ_DIR/.gate-slot-$s"
+            if flock -n 9; then break 2; fi
+        done
+    fi
+    sleep "$RZ_POLL"
 done
+unmark
 echo "SLOT=$s START $(date -Is)" >> "$RZ_LOG"
 bash -c "$RZ_CMD" >> "$RZ_LOG" 2>&1
 rc=$?
@@ -150,6 +178,8 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
     --setenv=RZ_LOG="$LOG" --setenv=RZ_SHA="$SHA" --setenv=RZ_CMD="$CMD" \
     --setenv=RZ_SLOTS="$SLOTS" --setenv=RZ_DIR="$GATES" \
+    --setenv=RZ_POLL="${RZ_GATE_POLL:-20}" --setenv=RZ_UNIT="$UNIT" \
+    --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
     /bin/bash -c "$INNER"
 
 echo "$LOG"

@@ -27,7 +27,7 @@ room() {
 cat > "$T/gate.sh" <<'EOF'
 #!/usr/bin/env bash
 log="$RZ_TEST_DIR/gate-$(git -C "$1" rev-parse --short=12 HEAD).log"
-printf 'SHA=%s\nEXIT=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" > "$log"
+printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" > "$log"
 echo "$log"
 EOF
 chmod +x "$T/gate.sh"
@@ -92,5 +92,7 @@ fetch; s7="$(room r7 d D7 origin/main~1)"; fetch; git -C "$M" checkout -q main
 bash "$TR" build "r7:$s7" >/dev/null 2>&1; log="$(bash "$TR" gate)"
 s8="$(room r8 c C8)"; git -C "$M" push -q origin "$s8:refs/heads/main"; git -C "$M" checkout -q main
 out="$(bash "$TR" land "$log" 2>&1)"; has "$out" "main moved" "land refuses when main moved"
+# The train's gate asks run-gate.sh for train priority (AGAST #3317).
+has "$(cat "$log")" "^TRAIN=1$" "train.sh gate sets RZ_GATE_TRAIN=1"
 
 echo; [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

@@ -112,7 +112,9 @@ cmd_gate() {
     [[ -f "$st" ]] || die "no train built"
     [[ "$(sed -n 's/^TIP=//p' "$st")" == "$(g rev-parse HEAD)" ]] \
         || die "train worktree moved since build; rebuild"
-    "$GATE" "$TRAIN_WT" "$NAME"
+    # Train priority: the next free slot goes to this gate ahead of room
+    # gates (run-gate.sh, AGAST #3317).
+    RZ_GATE_TRAIN=1 "$GATE" "$TRAIN_WT" "$NAME"
 }
 
 cmd_land() {

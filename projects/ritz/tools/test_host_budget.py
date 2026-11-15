@@ -56,11 +56,13 @@ def _fake_bin(tmp_path: Path) -> Path:
     for name in ("systemctl", "systemd-run"):
         script = bin_dir / name
         # `systemctl --user is-active` must say "not running" for run-gate.sh.
+        # Only systemctl's own verb: systemd-run's argv carries the gate's
+        # script, which itself calls `systemctl is-active` (AGAST #3317).
+        is_active = (
+            'case "$*" in *is-active*) exit 3;; esac\n' if name == "systemctl" else ""
+        )
         script.write_text(
-            "#!/bin/sh\n"
-            f'echo "{name} $*" >> "{log}"\n'
-            'case "$*" in *is-active*) exit 3;; esac\n'
-            "exit 0\n"
+            f'#!/bin/sh\necho "{name} $*" >> "{log}"\n' + is_active + "exit 0\n"
         )
         script.chmod(0o755)
     return bin_dir

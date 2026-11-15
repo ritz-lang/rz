@@ -10,23 +10,33 @@ bad() { echo "FAIL - $1"; fails=$((fails + 1)); }
 check() { if eval "$1"; then ok "$2"; else bad "$2"; fi; }
 
 # Stubs.  systemd-run runs the unit's command synchronously with its --setenv
-# and --working-directory; systemctl says no unit is active.
-mkdir -p "$T/bin"
+# and --working-directory, and marks the unit active ($RZ_TEST_ACTIVE/<unit>)
+# while it runs; systemctl is-active reads that mark.
+mkdir -p "$T/bin" "$T/active"
+export RZ_TEST_ACTIVE="$T/active"
 cat > "$T/bin/systemd-run" <<'STUB'
 #!/usr/bin/env bash
-envs=(); wd=.
+envs=(); wd=.; unit=
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --setenv=*) envs+=("${1#--setenv=}") ;;
         --working-directory=*) wd="${1#*=}" ;;
+        --unit=*) unit="${1#*=}" ;;
         --*) ;;
         *) break ;;
     esac
     shift
 done
-cd "$wd" && env "${envs[@]}" "$@"
+touch "$RZ_TEST_ACTIVE/$unit"
+(cd "$wd" && env "${envs[@]}" "$@"); rc=$?
+rm -f "$RZ_TEST_ACTIVE/$unit"
+exit $rc
 STUB
-printf '#!/usr/bin/env bash\nexit 3\n' > "$T/bin/systemctl"
+cat > "$T/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+[[ -n "${!#}" && -e "$RZ_TEST_ACTIVE/${!#}" ]] && exit 0
+exit 3
+STUB
 chmod +x "$T/bin/systemd-run" "$T/bin/systemctl"
 export PATH="$T/bin:$PATH"
 export RZ_GATE_DIR="$T/gates" RZ_HOST_ENV="$T/no-host.env" RZ_GATE_SLOTS=1
@@ -84,6 +94,66 @@ if [[ "$(id -u)" -ne 0 ]]; then
 else
     echo "skip - unwritable gate dir (running as root)"
 fi
+
+# 6. Train priority (AGAST #3317): a waiting train gate gets the next free
+# slot ahead of a room gate, whichever polls first.  RZ_GATE_POLL makes the
+# slot loop fast; B polls 10x as often as T, so without the priority B wins.
+git -C "$W" reset -q --hard "$SHA"
+export RZ_TEST_ORDER="$T/order" RZ_TEST_RELEASE="$T/release-a"
+: > "$RZ_TEST_ORDER"
+MARK="$RZ_GATE_DIR/.train-waiting"
+# until <cond>: poll up to 10 s.
+until_() { local i; for i in $(seq 1 100); do eval "$1" && return 0; sleep 0.1; done; return 1; }
+logof() { ls "$RZ_GATE_DIR"/"$1"-*.log 2>/dev/null | head -1; }
+# stop <log>: SIGTERM a unit's inner script and its children, as systemd's
+# stop would.  A gate killed by `timeout` leaves its stubbed unit running.
+stop() {
+    local p
+    for p in $(pgrep -u "$(id -u)" -x bash); do
+        if tr '\0' '\n' 2>/dev/null < "/proc/$p/environ" | grep -qx "RZ_LOG=$1"; then
+            pkill -TERM -P "$p"; kill -TERM "$p"
+        fi
+    done
+}
+hold='echo $RZ_TEST_NAME >> "$RZ_TEST_ORDER"; until [ -e "$RZ_TEST_RELEASE" ]; do sleep 0.1; done'
+RZ_TEST_NAME=A RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" pa >/dev/null &
+until_ '[[ -n "$(logof pa)" ]] && grep -q "^SLOT=" "$(logof pa)"'
+RZ_GATE_TRAIN=1 RZ_GATE_POLL=1 RZ_GATE_CMD='echo T >> "$RZ_TEST_ORDER"; ls -A "$RZ_DIR" > "$RZ_TEST_ORDER.during-t"' gate "$W" pt >/dev/null &
+until_ '[[ -n "$(logof pt)" ]] && grep -q "^WAITING" "$(logof pt)"'
+check '[[ "$(cat "$MARK" 2>/dev/null)" == ritz-gate-pt ]]' "a waiting train gate leaves a .train-waiting marker naming its unit"
+RZ_GATE_POLL=0.1 RZ_GATE_CMD='echo B >> "$RZ_TEST_ORDER"' gate "$W" pb >/dev/null &
+until_ '[[ -n "$(logof pb)" ]] && grep -q "^WAITING" "$(logof pb)"'
+sleep 0.5
+touch "$RZ_TEST_RELEASE"
+wait
+check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "A T B " ]]' "train gate T takes the freed slot before room gate B (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+check 'grep -qx EXIT=0 "$(logof pt)" && grep -qx EXIT=0 "$(logof pb)"' "both queued gates still reach a verdict"
+check '[[ -s "$RZ_TEST_ORDER.during-t" ]] && ! grep -qx .train-waiting "$RZ_TEST_ORDER.during-t"' "the train's marker is gone once it has its slot (not only at exit)"
+check '[[ ! -e "$MARK" ]]' "no marker is left after the train gate ends"
+
+# 7. A marker from a train unit that is still active holds room gates off...
+echo ritz-gate-livetrain > "$MARK"; touch "$RZ_TEST_ACTIVE/ritz-gate-livetrain"
+RZ_GATE_POLL=0.1 RZ_GATE_CMD='exit 0' timeout 3 bash "$G" "$W" pl >/dev/null; rc=$?
+check '[[ $rc -eq 124 ]] && ! grep -q "^SLOT=" "$(logof pl)"' "a live train's marker keeps a room gate off a free slot (rc=$rc)"
+stop "$(logof pl)"; until_ '[[ ! -e "$RZ_TEST_ACTIVE/ritz-gate-pl" ]]'
+# ...but one left by a dead train unit does not.
+rm -f "$RZ_TEST_ACTIVE/ritz-gate-livetrain"; echo ritz-gate-deadtrain > "$MARK"
+RZ_GATE_POLL=0.1 RZ_GATE_CMD='exit 0' timeout 5 bash "$G" "$W" ps >/dev/null; rc=$?
+check '[[ $rc -eq 0 ]] && grep -qx EXIT=0 "$(logof ps)"' "a stale marker from a dead train unit doesn't block a room gate (rc=$rc)"
+rm -f "$MARK"
+
+# 8. A train gate stopped while it waits removes its marker (systemd stop
+# sends SIGTERM to the unit's processes).
+rm -f "$RZ_TEST_RELEASE"
+RZ_TEST_NAME=A RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" qa >/dev/null &
+until_ '[[ -n "$(logof qa)" ]] && grep -q "^SLOT=" "$(logof qa)"'
+RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD='exit 0' gate "$W" qt >/dev/null 2>&1 &
+until_ '[[ -e "$MARK" ]]'
+stop "$(logof qt)"
+until_ '[[ ! -e "$MARK" ]]'
+check '[[ ! -e "$MARK" ]]' "a train gate stopped while waiting removes its marker"
+touch "$RZ_TEST_RELEASE"
+wait
 
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
