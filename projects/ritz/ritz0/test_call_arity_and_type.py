@@ -31,8 +31,8 @@ A call through a fn pointer is counted against its `fn(..)` type: a local, a
 param, or a nameless callee (`pick()(1, 2)`), which ritz0 accepted until #3333.
 ritz0 calls a nameless one `<expression>`; ritz1 doesn't name it yet (#3348), so
 its rows match the rest of the message.
-ritz0's `syscallN` builtins take any count (#3334), and wrap an integer into a
-single-field struct param (#3336): neither is judged here.
+`syscallN` takes N+1 arguments on every compiler (#3334).  ritz0 wraps an
+integer into a single-field struct param (#3336): that isn't judged here.
 """
 
 import pytest
@@ -275,15 +275,25 @@ def test_a_pointer_to_the_same_struct_is_not_a_wrong_type(compile_with, compiler
     assert "has the wrong type" not in out, out[-1000:]
 
 
-# ritz0's `syscallN(num, args...)` is a builtin that takes the arguments it's
-# given, so it isn't counted against ritzlib.sys's extern (prism passes four).
+# `syscallN(num, a1..aN)` takes N+1, counted like any call (#3334): ritz0's
+# builtin used to pass whatever it got, and ritz1 skipped the count to match.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_syscall_builtin_is_not_counted(compile_with, compiler):
-    program = HEADER + "    syscall2(39, 0, 0, 0)\n    return 0\n"
-    comp, _, _ = compile_with(compiler, "syscall", program)
-    out = comp.stdout + comp.stderr
-    assert "called with" not in out and comp.returncode == 0, out[-1000:]
+def test_a_syscall_builtin_is_counted(compile_with, compiler):
+    _refused(compile_with, compiler, "syscall", "    @syscall2(39, 0, 0, 0)",
+             "`syscall2` called with 4 argument(s) but defined with 3")
+
+
+# ritz0's builtin counts on its own, with no extern to count against: too few,
+# and the `__syscallN` spelling ritzlib doesn't declare (ritz1 can't count that
+# one yet: #3352).
+@pytest.mark.integration
+@pytest.mark.parametrize("marked, message", [
+    ("    @syscall3(39, 0)", "`syscall3` called with 2 argument(s) but defined with 4"),
+    ("    @__syscall1(39, 0, 0)", "`__syscall1` called with 3 argument(s) but defined with 2"),
+], ids=["too_few", "underscored"])
+def test_ritz0s_syscall_builtin_counts_without_an_extern(compile_with, marked, message):
+    _refused(compile_with, "ritz0", "syscall_builtin", marked, message)
 
 
 @pytest.mark.integration

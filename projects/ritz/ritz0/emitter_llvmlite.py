@@ -12215,6 +12215,15 @@ class LLVMEmitter:
         syscall_builtins = {'syscall0', 'syscall1', 'syscall2', 'syscall3', 'syscall4', 'syscall5', 'syscall6',
                            '__syscall0', '__syscall1', '__syscall2', '__syscall3', '__syscall4', '__syscall5', '__syscall6'}
         if fname in syscall_builtins:
+            # syscallN(num, a1..aN): N+1, counted like any call (AGAST #3334).
+            # It used to pass whatever it was given, so prism's 3-arg write
+            # through syscall2 compiled.
+            want = int(fname[-1]) + 1
+            if len(call.args) != want:
+                raise EmitError(
+                    f"`{fname}` called with {len(call.args)} argument(s) but "
+                    f"defined with {want}",
+                    self._call_span(call))
             return self._emit_generic_syscall(fname, call.args)
 
         # Look up user-defined function
