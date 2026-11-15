@@ -469,7 +469,8 @@ class MoveChecker:
             if any(self.types.is_move_only(a) for a in getattr(fn, 'instance_args', ())):
                 self._check_fn(copy.deepcopy(fn))
         self.errors = [e for e in self.errors
-                       if e.reason in (ref_rules.MOVE_OUT_OF_REF, array_rules.FILL_MOVE_ONLY)
+                       if e.reason in (ref_rules.MOVE_OUT_OF_REF, array_rules.FILL_MOVE_ONLY,
+                                       array_rules.MOVE_OUT_OF_ELEMENT)
                        or e.after_move]
         self._drop_repeats()
         return self.errors
@@ -1374,6 +1375,8 @@ class MoveChecker:
                 # `p[i].f`: _field_path_type doesn't type an element (#2444).
                 if self.types.is_move_only(self._field_path_type(expr) or self._place_type(expr)):
                     self._reject_move_out(expr.span)
+            elif is_move_context and self._moves_out_of_element(expr):
+                self.errors.append(OwnershipError(array_rules.MOVE_OUT_OF_ELEMENT, expr.span))
             elif is_move_context and self.types.is_move_only(self._field_path_type(expr)):
                 # Moving a move-only field out of a temporary: the rest of
                 # the temporary isn't dropped either (no partial drops).
@@ -1387,6 +1390,8 @@ class MoveChecker:
             if is_move_context and self._through_reference(expr) \
                     and self.types.is_move_only(self._place_type(expr)):
                 self._reject_move_out(expr.span)
+            elif is_move_context and self._moves_out_of_element(expr):
+                self.errors.append(OwnershipError(array_rules.MOVE_OUT_OF_ELEMENT, expr.span))
 
         elif isinstance(expr, rast.StructLit):
             for _, value in expr.fields:
@@ -1410,9 +1415,11 @@ class MoveChecker:
                 self.errors.append(OwnershipError(array_rules.FILL_MOVE_ONLY, expr.span))
 
         elif isinstance(expr, rast.Match):
-            # What a reference reaches stays its owner's: matching it only reads.
+            # What a reference reaches stays its owner's, and an element its
+            # array's (#2268): matching it only reads.
             self._check_expr(expr.expr,
-                             is_move_context=not self._through_reference(expr.expr))
+                             is_move_context=not self._through_reference(expr.expr)
+                             and self._element_root(expr.expr) is None)
             # The match owns a scrutinee it moved (AGAST #2177, ritz1 #2174).
             owned = self._owned_scrutinee_type(expr.expr)
             expr.owns_scrutinee = owned
@@ -1597,7 +1604,8 @@ class MoveChecker:
     def _place_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of a place: a binding, `*p`, `p.f`, `p[i]` or a pointer
         expression. Only the checks below read it: `_infer_expr_type` types
-        bindings, and `var x = a[0]` staying unknown there is #2268."""
+        bindings. `var x = a[0]` stays unknown there: a move-only element
+        can't be moved out (#2268), and a copy one copies either way."""
         if isinstance(expr, rast.Grouped):
             return self._place_type(expr.expr)
         if isinstance(expr, rast.UnaryOp) and expr.op == '*':
@@ -1628,6 +1636,25 @@ class MoveChecker:
                 base = self.types.resolve(base.inner)
             return self._part_type(base, expr.field)
         return self._infer_expr_type(expr)
+
+    def _element_root(self, expr: rast.Expr) -> Optional[rast.Index]:
+        """The `a[i]` that the place `expr` (`a[i]`, `a[i].f.g`) is, or is a
+        field of, when `a` is an array held by value: a local, a by-value
+        parameter, a field of one or a call's result. None otherwise; `p[i]`
+        through a reference has its own error, and `a[i..j]` is a slice."""
+        while isinstance(expr, (rast.Field, rast.Grouped)):
+            expr = expr.expr
+        if not isinstance(expr, rast.Index) or isinstance(expr.index, rast.Range):
+            return None
+        held = self.types.resolve(self._place_type(expr.expr))
+        return expr if isinstance(held, rast.ArrayType) else None
+
+    def _moves_out_of_element(self, expr: rast.Expr) -> bool:
+        """Does a by-value read of `expr` move a move-only value out of an
+        array element (AGAST #2268)? The array has no flag for one moved
+        element: it drops all of them, so the value would have two owners."""
+        return (self._element_root(expr) is not None
+                and self.types.is_move_only(self._place_type(expr)))
 
     def _through_reference(self, expr: rast.Expr) -> bool:
         """Does the place `expr` lie behind an `@T`, `@&T`, `*T` or `:&`? Its

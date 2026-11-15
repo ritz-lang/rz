@@ -2288,6 +2288,34 @@ fn own_moves_out(s: *EmitterState, e: *Expr) -> i32
         return 0
     ref_through(s, e)
 
+# The `a[i]` that the place `e` (`a[i]`, `a[i].f.g`) is, or is a field of, when
+# `a` is an array held by value: a local, a by-value param, a field of one or a
+# call's result.  null otherwise: `p[i]` through a reference is own_moves_out's.
+# A slice `a[i..j]` is no element, and ref_ty_of doesn't type one as a struct,
+# so own_moves_element can't take it for one.  ritz0's MoveChecker._element_root.
+fn own_element_root(s: *EmitterState, e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r != null and r.kind == EXPR_MEMBER
+        r = r.left
+    if r == null or r.kind != EXPR_INDEX
+        return null
+    var b: RefTy
+    if ref_ty_of(s, r.left, @b) == 0 or b.kind != TYPE_ARRAY
+        return null
+    r
+
+# 1 when a by-value read of `e` moves a move-only value out of an array
+# element (AGAST #2268): the array drops every element, so it would have two
+# owners.
+fn own_moves_element(s: *EmitterState, e: *Expr) -> i32
+    if own_element_root(s, e) == null
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if own_value_struct(s, e, @name, @len) == 0
+        return 0
+    own_type_is_move_only(s, name, len)
+
 # The struct `e` holds by value: 1 and its name, or 0.  `p[i]` and `(*p)[i]` through
 # a Vec or Span hold its element (AGAST #2444, R9), which ref_ty_of doesn't name.
 fn own_value_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
@@ -2343,9 +2371,10 @@ fn own_check_ref_receiver(s: *EmitterState, e: *Expr)
         let at: *Expr = own_start_of(e)
         ref_error_move_out(s, at.span.line, at.span.col)
 
-# A scrutinee moves into its match, unless a reference holds it: that's a read.
+# A scrutinee moves into its match, unless a reference holds it, or it is an
+# array's element (#2268): that's a read.
 fn own_scrutinee_mv(s: *EmitterState, e: *Expr) -> i32
-    if ref_through(s, e) == 1
+    if ref_through(s, e) == 1 or own_element_root(s, e) != null
         return 0
     1
 
@@ -2360,6 +2389,10 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
     if mv == 1 and own_moves_out(s, e) == 1
         let at: *Expr = own_start_of(e)
         ref_error_move_out(s, at.span.line, at.span.col)
+        return
+    if mv == 1 and own_moves_element(s, e) == 1
+        let eat: *Expr = own_start_of(e)
+        ref_error_move_out_of_element(s, eat.span.line, eat.span.col)
         return
     if k == EXPR_IDENT
         let b: *OwnBinding = own_lookup(s, e.ident_ptr, e.ident_len)

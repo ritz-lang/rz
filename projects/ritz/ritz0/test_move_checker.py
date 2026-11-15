@@ -8,7 +8,7 @@ import pytest
 from parser import parse
 from monomorph import monomorphize
 from move_checker import MoveChecker, OwnershipError
-from array_rules import FILL_MOVE_ONLY
+from array_rules import FILL_MOVE_ONLY, MOVE_OUT_OF_ELEMENT
 from ref_rules import MOVE_OUT_OF_REF
 import ritz_ast as rast
 
@@ -2501,3 +2501,91 @@ fn f(t: T) -> T
 """)
         MoveChecker().check_instances(module)
         assert fns and all(not hasattr(fn, 'field_moves') for fn in fns)
+
+
+class TestMoveOutOfArrayElement:
+    """A by-value read of a move-only `a[i]`, or of a move-only field of one,
+    with `a` an array held by value, is refused (AGAST #2268): the array still
+    drops every element. test_array_element_move_out.py holds all three
+    compilers to it; these are the edges only ritz0's checker separates."""
+
+    DEFS = drop_impl("T") + """
+struct T
+    id: i32
+
+struct H
+    t: T
+    n: i32
+
+enum Slot
+    Full(T)
+    Empty
+
+fn eat(t: T) -> i32
+    return t.id
+"""
+
+    def reasons(self, body):
+        return [e.reason for e in check(self.DEFS + body)]
+
+    def test_the_ticket_program(self):
+        assert self.reasons("""
+fn f() -> i32
+    var a: [1]T = [T { id: 1 }]
+    var x = a[0]
+    return eat(x)
+""") == [MOVE_OUT_OF_ELEMENT]
+
+    def test_it_is_located_at_the_place(self):
+        src = self.DEFS + """
+fn f(hs: [2]H) -> i32
+    return eat(hs[1].t)
+"""
+        line = src.splitlines().index("    return eat(hs[1].t)") + 1
+        assert [(e.span.line, e.span.column) for e in check(src)] == [(line, 16)]
+
+    def test_through_a_reference_it_stays_the_reference_error(self):
+        """`p[i]` and `(*p)[i]`: the value is the caller's, which says more."""
+        assert self.reasons("""
+fn f(p: @[2]T) -> i32
+    return eat(p[0]) + eat((*p)[1])
+""") == [MOVE_OUT_OF_REF, MOVE_OUT_OF_REF]
+
+    def test_a_field_through_a_reference_stays_the_reference_error(self):
+        assert self.reasons("""
+fn f(p: @[2]H) -> i32
+    return eat(p[0].t)
+""") == [MOVE_OUT_OF_REF]
+
+    @pytest.mark.parametrize("body", [
+        # A copy field of a move-only element is read, not moved.
+        "fn f(a: [2]H) -> i32\n    let n = a[0].n\n    return n + a[1].t.id\n",
+        # A borrow of an element, and a slice of the array, move nothing.
+        "fn g(t: @T) -> i32\n    return t.id\n\nfn f(a: [2]T) -> i32\n    return g(@a[0])\n",
+        "fn f(a: [2]T) -> i32\n    let s = a[0..1]\n    return 0\n",
+        # A match reads its scrutinee, a field of an element too.
+        "fn f(a: [1]Slot) -> i32\n    match a[0]\n        Slot.Empty => return 0\n        _ => return 1\n",
+        "struct W\n    s: Slot\n\nfn f(a: [1]W) -> i32\n    match a[0].s\n        Slot.Empty => return 0\n        _ => return 1\n",
+        # A store into an element doesn't read it.
+        "fn f(a: [1]T) -> i32\n    var b = a\n    b[0] = T { id: 2 }\n    return 0\n",
+        # A Vec doesn't drop its elements (gvec.ritz has no `impl Drop`), so
+        # `v[i]` leaves it nothing to drop twice: only an array is refused.
+        "struct Vec<X>\n    data: *X\n    len: i64\n\nfn f(v: Vec<T>) -> i32\n    return eat(v[0])\n",
+    ], ids=["copy_field", "borrow", "slice", "match", "match_field", "store", "vec"])
+    def test_a_read_that_moves_nothing_is_accepted(self, body):
+        assert self.reasons(body) == []
+
+    def test_it_is_reported_in_a_generic_instance_at_a_move_only_type(self):
+        """`check` sees `a[0]` of an `[2]X` as a copy; the instance at `T` is
+        the move."""
+        module = monomorphize(parse(self.DEFS + """
+fn first<X>(a: [2]X) -> X
+    return a[0]
+
+fn f(a: [2]T) -> T
+    return first<T>(a)
+
+fn g(a: [2]i32) -> i32
+    return first<i32>(a)
+"""))
+        assert [e.reason for e in MoveChecker().check_instances(module)] == [MOVE_OUT_OF_ELEMENT]

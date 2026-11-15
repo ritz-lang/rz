@@ -51,3 +51,10 @@ BORROW_DEREF_STORE = ('cannot store through `*a` of an `a:& [N]T` param '
 # ref_check.ritz.
 FILL_MOVE_ONLY = ('`[v; n]` copies `v` into every element: '
                   'a move-only value fills one, `[v; 1]`')
+
+# A by-value read of a move-only `a[i]`, or of a move-only field of one, with
+# `a` an array held by value (AGAST #2268, Rust's E0508): the array still drops
+# every element, so the value would have two owners. ritz1 prints the same
+# words, from ownership.ritz.
+MOVE_OUT_OF_ELEMENT = ('cannot move out of an array element: '
+                       'the array still drops it; borrow it with `@a[i]`')

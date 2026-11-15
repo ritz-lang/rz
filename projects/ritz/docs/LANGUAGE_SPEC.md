@@ -3661,6 +3661,30 @@ fn main() -> i32
     0
 ```
 
+An array owns its elements and drops every one of them: it can't track one that
+moved out. So using a move-only `a[i]`, or a move-only field of one such as
+`a[i].r`, by value is an error, whether `a` is a local, a by-value parameter, a
+field or a call's result. Reading a copy field of an element, borrowing it with
+`@a[i]`, calling a method that lends it, `match`ing it and storing into it are
+fine. A generic body is judged at each type it's instantiated with, as for a
+reference below.
+
+```ritz expect-error="cannot move out of an array element: the array still drops it; borrow it with `@a[i]`"
+struct Resource
+    handle: i32
+
+impl Drop for Resource
+    fn drop(self: @&Resource)
+        self.handle = 0
+
+fn consume(r: Resource) -> i32
+    r.handle
+
+fn main() -> i32
+    var a: [2]Resource = [Resource { handle: 3 }, Resource { handle: 4 }]
+    consume(a[0])                   # error: `a` still drops a[0]
+```
+
 A reference isn't its referent. An `@T`, `@&T` or `*T` doesn't fit a by-value
 `T` slot: an argument, a `let` or `var` of type `T`, `=`, `return`, a function's
 tail, a field, an element, a variant's payload, or an `if` or `match` arm of any

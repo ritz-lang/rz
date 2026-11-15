@@ -757,19 +757,8 @@ pub fn main() -> i32
     return DROPS
 """, 1, {}),
 
-    # Neighbours #2243 doesn't reach: `x` stays unknown, so a copy.
-    "field_binding_of_array_element": (SLOT + FIELDS + """\
-fn f() -> i32
-    var a: [1]Tracked = [make(1)]
-    var x = a[0]
-    consume(x)
-    return 0
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, {"ritz0": 2268, "ritz1": 2268, "ritz1_selfhosted": 2268}),
-
+    # A neighbour #2243 doesn't reach: `x` stays unknown, so a copy. (`var x =
+    # a[0]` of a move-only element is refused: test_array_element_move_out.py.)
     "field_binding_of_global": (SLOT + FIELDS + """\
 var GLOBAL: Holder
 
