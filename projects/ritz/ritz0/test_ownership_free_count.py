@@ -2525,7 +2525,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, {"ritz0": 2283}),
+""", 2, {}),  # ritz0 fixed by #2283
 
     "tuple_element_assigned_drops_old": (TUPLES + SLOT + """\
 fn f()
@@ -2535,7 +2535,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, {"ritz0": 2283}),
+""", 2, {}),  # ritz0 fixed by #2283
 
     "tuple_element_in_generic_field": (TUPLES + SLOT + """\
 struct GenPair<A>

@@ -4488,6 +4488,26 @@ class LLVMEmitter:
         self.builder.branch(cont_block)
         self.builder.position_at_end(cont_block)
 
+    def _assign_tuple_element(self, stmt: rast.AssignStmt, tuple_ptr: ir.Value,
+                              val: ir.Value) -> bool:
+        """`p.0 = v`, `tuple_ptr` addressing the tuple `p`: store v as element
+        0, dropping the old element first, as a struct field is (AGAST #2283).
+        False when the target isn't a tuple's element."""
+        field = stmt.target.field
+        pointee = tuple_ptr.type.pointee
+        if not (field.isdigit() and isinstance(pointee, ir.LiteralStructType)
+                and int(field) < len(pointee.elements)):
+            return False
+        idx = int(field)
+        elem_ptr = self.builder.gep(tuple_ptr, [ir.Constant(self.i32, 0),
+                                                ir.Constant(self.i32, idx)])
+        val = self._convert_type(val, pointee.elements[idx], stmt.value)
+        elem_type = self._infer_ritz_type(stmt.target)
+        if elem_type is not None:
+            self._drop_old_field(stmt.target, elem_ptr, elem_type)
+        self.builder.store(val, elem_ptr)
+        return True
+
     @staticmethod
     def _flags_below(flags: Dict[str, ir.AllocaInstr],
                      field: str) -> Dict[str, ir.AllocaInstr]:
@@ -6692,7 +6712,9 @@ class LLVMEmitter:
                     # of it to the struct (§5.4, #2398).
                     struct_val = self._through_pointers(struct_val)
                     pointee_type = struct_val.type.pointee
-                    if isinstance(pointee_type, ir.BaseStructType):
+                    if self._assign_tuple_element(stmt, struct_val, val):
+                        pass
+                    elif isinstance(pointee_type, ir.BaseStructType):
                         struct_name = self._get_struct_name_from_type(pointee_type)
                         if struct_name:
                             idx = self._get_struct_field_index(struct_name, stmt.target.field)
@@ -6710,7 +6732,9 @@ class LLVMEmitter:
                     # Value-type struct - need to get address from lvalue
                     struct_ptr = self._emit_lvalue_addr(stmt.target.expr)
                     struct_name = self._get_struct_name_from_type(struct_val.type)
-                    if struct_name:
+                    if self._assign_tuple_element(stmt, struct_ptr, val):
+                        pass
+                    elif struct_name:
                         idx = self._get_struct_field_index(struct_name, stmt.target.field)
                         _, field_type = self.struct_fields[struct_name][idx]
                         field_llvm_type = self._ritz_type_to_llvm(field_type)

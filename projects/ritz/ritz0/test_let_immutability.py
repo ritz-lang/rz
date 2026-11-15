@@ -75,6 +75,8 @@ REJECTED = [
     ("small-field", "let p = Pt { x: 1, y: 2 }\np.x = 3", "p", "assign"),
     ("small-field-compound", "let p = Pt { x: 1, y: 2 }\np.x += 3", "p", "assign"),
     ("small-array-elem", "let a: [4]i64 = [1, 2, 3, 4]\na[0] = 9", "a", "assign"),
+    # A tuple's element, as a field (AGAST #2283).
+    ("small-tuple-elem", "let p = (1, 2)\np.0 = 3", "p", "assign"),
     # A match-arm assignment is an AssignExpr, not an AssignStmt.
     ("small-field-match-arm",
      "let p = Pt { x: 1, y: 2 }\nlet o: Option<i64> = Some(3)\n"
@@ -112,6 +114,7 @@ ACCEPTED = [
      "var p = Pt { x: 1, y: 2 }\nlet o: Option<i64> = Some(3)\n"
      "match o\n    Some(v) => p.x = v\n    None => p.y = 0"),
     ("var-array-elem", "var a: [4]i64 = [1, 2, 3, 4]\na[0] = 9"),
+    ("var-tuple-elem", "var p = (1, 2)\np.0 = 3"),  # AGAST #2283
     ("var-mut-borrow", "var p = Pt { x: 1, y: 2 }\nlet q: *Pt = @&p\nq.x = 5"),
     ("var-large", "var b: Big = big_new()\nb.n = 3\nb.data[1] = 2\nlet q: *Big = @&b"),
     # Through a pointer held in a `let`: the pointee is written.
