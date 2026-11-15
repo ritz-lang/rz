@@ -102,6 +102,14 @@ def no_method(method: str, type_name: str, free_call: str | None = None) -> str:
     return f"no method `{method}` on `{type_name}`: {hint}"
 
 
+# `h.f(1)` where `H` has both a method `f` and a `fn(...)` field `f` (LARB R41,
+# LANGUAGE_SPEC §5.5): neither is preferred silently. `call` is the
+# parenthesised call that reaches the field, `(h.f)(1)`.
+def method_and_field(method: str, type_name: str, call: str) -> str:
+    return (f"`{method}` is both a method and a field of `{type_name}`: "
+            f"write `{call}` for the field")
+
+
 # A call whose result is or holds a reference can't take a lent temporary:
 # the temporary drops as the call returns, so the result would point at a
 # dropped value (Aaron's ruling on AGAST #3215). `arg` is the argument as

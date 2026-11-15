@@ -943,6 +943,20 @@ class TypeChecker:
         # What the emitter dispatches to: a looser name below doesn't reach it.
         receiver_sig = fn_sig if own_method else self.functions.get(
             find_ufcs_function(self.functions, type_name, expr.method))
+
+        # LARB R41 (§5.5): with no method `f`, `h.f(1)` is `(h.f)(1)` through
+        # a `fn(...)` field `f`; with both, neither is picked silently.
+        if self._has_fn_field(type_name, expr.method):
+            if fn_sig is None and receiver_sig is None:
+                callee = rast.Field(expr.span, expr.expr, expr.method, expr.name_span)
+                return self._check_call(rast.Call(expr.span, callee, expr.args))
+            for arg in expr.args:
+                self._infer_type(arg)
+            self._slot_error(ref_rules.method_and_field(
+                expr.method, type_name, self._field_call_text(expr)),
+                expr.name_span or expr.span)
+            return rast.NamedType(expr.span, 'unknown', [])
+
         if receiver_sig is not None:
             self._check_receiver(expr, receiver_sig)
 
@@ -1017,6 +1031,27 @@ class TypeChecker:
         if type_name == 'StrView':
             return False
         return f"{type_name}_deref" not in self.functions
+
+    def _has_fn_field(self, type_name: str, name: str) -> bool:
+        """Does struct `type_name` have a field `name` of a `fn(...)` type?"""
+        info = self.structs.get(type_name)
+        if info is None:
+            return False
+        return any(f == name and isinstance(self._resolve_alias(ty), rast.FnType)
+                   for f, ty in info.fields)
+
+    @staticmethod
+    def _field_call_text(expr: rast.MethodCall) -> str:
+        """`h.f(1)` as the parenthesised field call `(h.f)(1)`: the receiver
+        and each argument spelled when it's a name or an integer, else `...`."""
+        def text(e: rast.Expr) -> str:
+            if isinstance(e, rast.Ident):
+                return e.name
+            if isinstance(e, rast.IntLit):
+                return str(e.value)
+            return "..."
+        args = ", ".join(text(a) for a in expr.args)
+        return f"({text(expr.expr)}.{expr.method})({args})"
 
     def _free_call(self, expr: rast.MethodCall, type_name: str) -> str | None:
         """The free call `a.cmp(b)` may have meant, `foo_cmp(a, b)`, when

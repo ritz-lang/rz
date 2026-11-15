@@ -13633,6 +13633,9 @@ class LLVMEmitter:
         # "Unknown identifier: m", unlocated.
         if isinstance(expr.expr, rast.Ident):
             self._refuse_module_item(expr.expr.name, expr.method, expr.span)
+        field_call = self._fn_field_call(expr)
+        if field_call is not None:
+            return self._emit_call(field_call)
         expr = self._deref_method_call(expr)
         outer = self._evaluated_once
         outer_use = self._deref_use_now
@@ -13680,6 +13683,27 @@ class LLVMEmitter:
             return None
         name = mangle_generic_name(ty.name, ty.args) if ty.args else ty.name
         return name if name in self.struct_fields else None
+
+    def _fn_field_call(self, expr: rast.MethodCall) -> Optional[rast.Call]:
+        """`h.f(1)` on a struct with no method `f` and a `fn(...)` field `f`:
+        the call `(h.f)(1)`, with exactly the written arguments (LARB R41,
+        §5.5). A method wins (`s.len()` beside a `len: i64` field), and so
+        does a built-in one (`v.len()` on a `Span`, dispatched below), which
+        is why the field must be a fn here too: the checker refuses a fn
+        field beside a method, but returns early on built-in receivers."""
+        base = expr.expr
+        while isinstance(base, rast.Grouped):
+            base = base.expr
+        name = self._receiver_struct(base)
+        if name is None or (name, expr.method) in self.method_lookup \
+                or self._find_method_fallback(name, expr.method):
+            return None
+        if not any(field_name == expr.method
+                   and isinstance(resolve_alias_in(ty, self.type_aliases), rast.FnType)
+                   for field_name, ty in self.struct_fields[name]):
+            return None
+        callee = rast.Field(expr.span, expr.expr, expr.method, expr.name_span)
+        return rast.Call(expr.span, callee, expr.args)
 
     def _receiver_method_def(self, expr: rast.MethodCall) -> Optional[rast.FnDef]:
         name = self._receiver_struct(expr.expr)
