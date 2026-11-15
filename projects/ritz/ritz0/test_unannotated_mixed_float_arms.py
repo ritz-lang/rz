@@ -201,10 +201,105 @@ fn main() -> i32
     return 42
 """
 
+# --- LARB R43 (#3384): a return type or parameter type is a float slot -------
+#
+# `-> f64` and an `f64` parameter fix the merge type as an annotated let does:
+# an integer *literal* arm converts. Each row checks the values, so a merge at
+# i64 (1.5 truncated to 1) fails too.
+
+# `return <if>` and `return <match>` in a `-> f64` fn.
+RETURN_HINT = """\
+fn f(c: i32) -> f64
+    return if c > 0 then 1.5 else 0
+
+fn g(c: i32) -> f64
+    return match c
+        0 => 0
+        _ => 1.5
+
+fn main() -> i32
+    if f(0) != 0.0 or f(1) != 1.5
+        return 1
+    if g(0) != 0.0 or g(1) != 1.5
+        return 2
+    return 42
+"""
+
+# The tail of a `-> f64` fn, integer arm first: FN_TAIL above refuses the
+# same arms under `-> i64`.
+TAIL_HINT = """\
+fn f(c: i32) -> f64
+    if c > 0 then 0 else 1.5
+
+fn main() -> i32
+    if f(1) != 0.0 or f(0) != 1.5
+        return 1
+    return 42
+"""
+
+# An argument for an `f64` parameter: IF_AS_OPERAND above refuses the same
+# arms for an `i64` parameter. A direct call, a fn-pointer local and an
+# expression callee each find the parameter type on their own path.
+PARAM_HINT = """\
+fn g(x: f64) -> f64
+    x
+
+fn f(c: i32) -> f64
+    g(if c > 0 then 0 else 1.5)
+
+fn fp(c: i32) -> f64
+    let h: fn(f64) -> f64 = g
+    h(if c > 0 then 0 else 1.5)
+
+fn fe(c: i32) -> f64
+    let hs: [1]fn(f64) -> f64 = [g]
+    hs[0](if c > 0 then 0 else 1.5)
+
+fn main() -> i32
+    if f(1) != 0.0 or f(0) != 1.5
+        return 1
+    if fp(1) != 0.0 or fp(0) != 1.5
+        return 2
+    if fe(1) != 0.0 or fe(0) != 1.5
+        return 3
+    return 42
+"""
+
+# An argument for an `f64` parameter of a method and of a static method.
+METHOD_PARAM_HINT = """\
+struct Acc
+    total: f64
+
+impl Acc
+    fn make(x: f64) -> Acc
+        Acc { total: x }
+
+    fn add(self: @Acc, x: f64) -> f64
+        self.total + x
+
+fn f(c: i32) -> f64
+    let a = Acc { total: 0.5 }
+    a.add(if c == 0 then 2 else 1.5)
+
+fn fs(c: i32) -> f64
+    Acc.make(if c > 0 then 0 else 1.5).total
+
+fn main() -> i32
+    if f(0) != 2.5 or f(1) != 2.0
+        return 1
+    if fs(1) != 0.0 or fs(0) != 1.5
+        return 2
+    return 42
+"""
+
 ACCEPTED = [
     pytest.param(STATEMENT_POSITION, id="statement-position"),
     pytest.param(PROCEDURE_TAIL, id="procedure-tail"),
     pytest.param(UNION_MATCH_ANNOTATED, id="union-match-annotated"),
+    pytest.param(RETURN_HINT, id="return-hint"),
+    pytest.param(TAIL_HINT, id="tail-hint"),
+    pytest.param(PARAM_HINT, id="param-hint"),
+    pytest.param(METHOD_PARAM_HINT, id="method-param-hint"),
 ]
 
 
@@ -233,3 +328,46 @@ def test_ritz0_accepts(ritz0_oracle, program):
     res = ritz0_oracle(program)
     assert res.ir_ok, res.diagnostics[-3000:]
     assert res.rc == 42
+
+
+# --- a float slot converts integer *literal* arms only (LARB R43) -------------
+#
+# An `i64` arm that is not a literal is not exact in f64 (§7.5): the slot
+# gives the merge its type, then refuses that arm as a typed let does.
+
+LOSSY = "implicit conversion from `i64` to `f64` can lose precision"
+
+RETURN_NON_LITERAL = """\
+fn f(c: i32, n: i64) -> f64
+    return if c > 0 then n else 1.5
+
+fn main() -> i32
+    return f(0, 3) as i32
+"""
+
+PARAM_NON_LITERAL = """\
+fn g(x: f64) -> f64
+    x
+
+fn f(c: i32, n: i64) -> f64
+    g(if c == 0 then 1.5 else n)
+
+fn main() -> i32
+    return f(0, 3) as i32
+"""
+
+NON_LITERAL = [
+    pytest.param(RETURN_NON_LITERAL, id="return-non-literal"),
+    pytest.param(PARAM_NON_LITERAL, id="param-non-literal"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("program", NON_LITERAL)
+def test_ritz0_float_slot_refuses_non_literal_int_arm(run_ritz0, tmp_path, program):
+    comp = _ritz0_compile(run_ritz0, tmp_path, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert "Traceback" not in out, out
+    assert LOSSY in out, out
+    assert MESSAGE not in out, out

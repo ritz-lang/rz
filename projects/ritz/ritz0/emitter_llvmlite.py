@@ -689,6 +689,10 @@ class LLVMEmitter:
         # their merge is returned, so it is used. Nodes are kept alive by the
         # AST, so their ids are not reused.
         self._tail_merge_ids: set = set()
+        # LARB R43 (#3384): the match / if nodes on the tails of a `return`,
+        # a fn tail or an argument whose slot is f32 / f64 -> that float
+        # type. They merge there as an annotated let's do (#2027).
+        self._float_slot_ids: Dict[int, ir.Type] = {}
         # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
@@ -3574,6 +3578,11 @@ class LLVMEmitter:
         expected_enum_name = self._resolve_enum_type_name(
             None, self._fn_ret_type(self.current_fn))
         self._literal_into_slot(self.current_fn_def.ret_type, value)
+        # LARB R43: the LLVM fn's own return type, so a closure's `return`
+        # is not given its enclosing fn's float slot.
+        ret_ll = self._fn_ret_type(self.current_fn)
+        if isinstance(ret_ll, (ir.FloatType, ir.DoubleType)):
+            self._mark_float_tails(ret_ll, value)
         # So is the expected type: `return Span.empty()` in a let's arm takes
         # the fn's T, not the let's (AGAST #2296).
         saved = self.expected_ritz_type
@@ -5469,6 +5478,7 @@ class LLVMEmitter:
                 if fn_def.ret_type is None:
                     self._temp_frames.append([])
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
+                self._float_slot(fn_def.ret_type, fn_def.body.expr)
                 if self._is_range_index(fn_def.body.expr):
                     # AGAST #2877: a Vec slice as a `-> Span<T>` tail is a
                     # view, as after `return`.
@@ -12167,6 +12177,7 @@ class LLVMEmitter:
                     for i, (arg, param_type) in enumerate(zip(call.args, ritz_type.params)):
                         if i not in ritz_type.lent:
                             self._literal_into_slot(param_type, arg)
+                            self._float_slot(param_type, arg)
                     converted_args = []
                     for i, (arg, param_type) in enumerate(zip(call.args, ritz_type.params)):
                         expected_llvm = self._ritz_type_to_llvm(param_type)
@@ -12207,6 +12218,7 @@ class LLVMEmitter:
                 self._check_fn_type_arity(call, "<expression>", ritz_type)
                 for arg, param_type in zip(call.args, ritz_type.params):
                     self._literal_into_slot(param_type, arg)
+                    self._float_slot(param_type, arg)
             args = [self._emit_expr(arg) for arg in call.args]
             if isinstance(ritz_type, rast.FnType):
                 args = [self._convert_type(a, self._ritz_type_to_llvm(p), arg)
@@ -12339,6 +12351,7 @@ class LLVMEmitter:
                 param_def = fn_def.params[i]
                 expected_type = self._fn_param_types(fn)[i]
                 self._literal_into_slot(param_def.type, arg)
+                self._float_slot(param_def.type, arg)
 
                 # Check if this parameter is a reference type (@T or @&T in RERITZ, or :& borrow)
                 # References pass by pointer - we need to pass the address of the argument
@@ -13981,6 +13994,7 @@ class LLVMEmitter:
             for i, arg in enumerate(expr.args):
                 if i < len(fn_def.params):
                     self._literal_into_slot(fn_def.params[i].type, arg)
+                    self._float_slot(fn_def.params[i].type, arg)
                 if i < len(fn_def.params) and self._takes_place(fn_def.params[i]):
                     all_args.append(self._emit_place_borrow(
                         arg, self._fn_param_types(fn)[i], expr.method, i + 1,
@@ -14094,6 +14108,7 @@ class LLVMEmitter:
             expected_type = self._fn_param_types(fn)[j] if j < len(self._fn_param_types(fn)) else None
             if j < len(fn_def.params):
                 self._literal_into_slot(fn_def.params[j].type, arg)
+                self._float_slot(fn_def.params[j].type, arg)
             if j < len(fn_def.params) and self._takes_place(fn_def.params[j]):
                 all_args.append(self._emit_place_borrow(arg, expected_type, expr.method, j + 1,
                                                          fn_def.params[j]))
@@ -15655,7 +15670,27 @@ class LLVMEmitter:
         """The float type `node`'s arms must merge at, or None."""
         if id(node) in getattr(self, '_float_tail_set', frozenset()):
             return self._float_tail_ty
-        return None
+        return self._float_slot_ids.get(id(node))
+
+    def _float_slot(self, ty: Optional[rast.Type], value) -> None:
+        """LARB R43 (#3384): `value` lands in a slot of Ritz type `ty`.
+
+        A `-> f64` return or tail, or an `f64` parameter, is a float slot as
+        an annotated let is: the match / if tails of `value` merge at it, so
+        an integer literal arm converts, and a non-literal integer arm meets
+        §7.5's exactness rule (_int_into_float_slot) instead of #2094's
+        refusal.
+        """
+        float_ty = self._float_annotation_llvm(
+            resolve_alias_in(ty, self.type_aliases) if ty is not None else None)
+        if float_ty is not None:
+            self._mark_float_tails(float_ty, value)
+
+    def _mark_float_tails(self, float_ty: ir.Type, value) -> None:
+        """Merge `value`'s match / if tails at `float_ty` (see _float_slot)."""
+        if value is not None:
+            for node_id in self._float_tail_ids(value):
+                self._float_slot_ids[node_id] = float_ty
 
     @staticmethod
     def _is_float_arm_convertible(ty: ir.Type) -> bool:
