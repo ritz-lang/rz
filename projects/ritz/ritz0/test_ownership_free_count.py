@@ -166,8 +166,6 @@ fn make_holder(id: i32) -> Holder
 
 """
 
-# Unannotated bindings ritz1 can't type yet.
-BINDING_TYPE_GAP = {"ritz1": 2267, "ritz1_selfhosted": 2267}
 
 # Shapes a move out of a tuple element can take (AGAST #2244).
 TUPLES = """\
@@ -635,7 +633,31 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, BINDING_TYPE_GAP),
+""", 1, {}),
+
+    # AGAST #2267: the carrier is a field down a chain, and an Option.
+    "field_binding_from_try_nested_option": (SLOT + FIELDS + """\
+struct ResOpt
+    r: Option<Tracked>
+
+struct Outer
+    h: ResOpt
+    n: i32
+
+fn g() -> Option<i32>
+    var o = Outer { h: ResOpt { r: Some(make(1)) }, n: 0 }
+    var x = o.h.r?
+    consume(x)
+    return Some(0)
+
+fn f() -> i32
+    g()
+    return 0
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
 
     # AGAST #2264: a binding from `?` owns the unwrapped value. ritz0
     # dropped none of these: it typed no `?` initialiser, so leaked them.
@@ -2383,7 +2405,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz1": 3032, "ritz1_selfhosted": 3032}),
+""", 1, {}),
 
     "tuple_element_for": (TUPLES + SLOT + """\
 fn f()
