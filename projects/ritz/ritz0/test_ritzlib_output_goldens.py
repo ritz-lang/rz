@@ -196,14 +196,10 @@ def _printers_program() -> str:
     )
 
 
-# ritz0 sizes a plain "..." literal by code points, so "µs" prints as "µ"
-# (#1694); ritz1 sizes it by bytes.  When #1694 is fixed, both are "µs".
-MICRO = {"ritz0": "µ", "ritz1": "µs"}
-
-
 def _printers_cases(compiler: str) -> dict:
     """case -> stdout (every case exits 0 with empty stderr)."""
-    us = MICRO[compiler]
+    # Both compilers size "...µs" by its UTF-8 bytes (#1694).
+    us = "µs"
     return {
         "1": (
             f"0ns\n999ns\n-5ns\n1.0{us}\n1.9{us}\n999.9{us}\n"

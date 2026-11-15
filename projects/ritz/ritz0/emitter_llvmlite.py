@@ -1847,6 +1847,15 @@ class LLVMEmitter:
             return rast.NamedType(expr.span, 'void', [])
         return None
 
+    @staticmethod
+    def _utf8_len(value: str) -> int:
+        """The byte length of literal text: what a StrView `len` holds.
+
+        Never Python `len(value)`, which counts code points: "µs" is 3 bytes,
+        and sizing it as 2 dropped its last byte (AGAST #1694).
+        """
+        return len(value.encode('utf-8'))
+
     def _get_string_constant(self, value: str) -> ir.GlobalVariable:
         """Create a global string constant."""
         name = f".str.{self.string_counter}"
@@ -1882,7 +1891,7 @@ class LLVMEmitter:
         cstr_ptr = self.builder.gep(gvar, [zero, zero])
 
         # Use compile-time known length instead of runtime strlen
-        length = ir.Constant(self.i64, len(expr.value))
+        length = ir.Constant(self.i64, self._utf8_len(expr.value))
 
         # Call string_from_bytes(cstr_ptr, length)
         return self.builder.call(fn, [cstr_ptr, length])
@@ -1906,7 +1915,7 @@ class LLVMEmitter:
         ptr = self.builder.gep(gvar, [zero, zero])
 
         # Compile-time length
-        length = ir.Constant(self.i64, len(expr.value))
+        length = ir.Constant(self.i64, self._utf8_len(expr.value))
 
         # Get the StrView struct type
         # StrView is: { ptr: *u8, len: i64 }
@@ -2188,8 +2197,8 @@ class LLVMEmitter:
 
     def _make_const_strview_value(self, value: str, name_hint: str, target_type: Optional[ir.Type] = None) -> ir.Constant:
         """Create a constant StrView value and backing static string global."""
-        str_type = ir.ArrayType(self.i8, len(value) + 1)
         str_bytes = bytearray(value, 'utf-8') + b'\x00'
+        str_type = ir.ArrayType(self.i8, len(str_bytes))
         str_const = ir.Constant(str_type, str_bytes)
         gname = f".str.{name_hint}.{self.string_counter}"
         self.string_counter += 1
@@ -2205,7 +2214,7 @@ class LLVMEmitter:
             strview_ty = self.struct_types["StrView"]
         else:
             strview_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
-        length_const = ir.Constant(self.i64, len(value))
+        length_const = ir.Constant(self.i64, len(str_bytes) - 1)
         return ir.Constant(strview_ty, [str_ptr, length_const])
 
     def _fold_const_array_elem(self, name: str, index: int, expr: rast.Expr,
@@ -2311,8 +2320,8 @@ class LLVMEmitter:
         StrView is { ptr: *u8, len: u64 }
         """
         # First, emit the string data as a global constant
-        str_type = ir.ArrayType(self.i8, len(value) + 1)
         str_bytes = bytearray(value, 'utf-8') + b'\x00'
+        str_type = ir.ArrayType(self.i8, len(str_bytes))
         str_const = ir.Constant(str_type, str_bytes)
 
         str_gvar = ir.GlobalVariable(self.module, str_type, name=f".str.{name}")
@@ -2334,7 +2343,7 @@ class LLVMEmitter:
 
         # Create the StrView constant value
         # Note: For global initializers, we need to use constant expressions
-        length_const = ir.Constant(self.i64, len(value))
+        length_const = ir.Constant(self.i64, len(str_bytes) - 1)
         strview_const = ir.Constant(strview_type, [str_ptr, length_const])
 
         # Create global variable for the StrView
@@ -6981,7 +6990,7 @@ class LLVMEmitter:
             if part:
                 str_const = self._get_string_constant(part)
                 ptr = self.builder.gep(str_const, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
-                self._emit_write_syscall(ir.Constant(self.i64, fd), ptr, ir.Constant(self.i64, len(part)))
+                self._emit_write_syscall(ir.Constant(self.i64, fd), ptr, ir.Constant(self.i64, self._utf8_len(part)))
 
             # Print expression (if not past the last part)
             if i < len(expr.exprs):

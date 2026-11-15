@@ -297,6 +297,17 @@ class Lexer:
 
         # Single-quoted single character = char literal (u8)
         if quote == "'" and len(chars) == 1:
+            # No escape yields a code point above 0x7F, so one here is a
+            # non-ASCII source character: more than one UTF-8 byte, which no
+            # u8 holds. ord() would have emitted 'µ' as 181 and '€' as an
+            # out-of-range 8364 (AGAST #1694). ritz1 refuses these too.
+            if ord(chars[0]) > 0x7F:
+                width = len(chars[0].encode('utf-8'))
+                raise LexerError(
+                    f"character literal '{chars[0]}' is {width} bytes in UTF-8; "
+                    f"a character literal is one byte (u8): use a \"...\" "
+                    f"string for non-ASCII text",
+                    start_span)
             return Token(TokenType.CHAR, ord(chars[0]), start_span)
 
         # Single-quoted but not exactly one char = error

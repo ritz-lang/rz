@@ -1,0 +1,129 @@
+# AGAST #1694: a plain "..." literal is sized by its UTF-8 bytes, not its
+# code points, under every compiler.
+#
+# ritz0 used Python len(str), so each non-ASCII character dropped one byte
+# per extra byte from the END of the literal: "Dµs".len was 3 (ritz1: 4) and
+# prints("Aµs|") printed "Aµs". Every case here ends its literal with a 2-byte
+# (µ U+00B5), 3-byte (€ U+20AC) and 4-byte (😀 U+1F600) character, so the
+# lost bytes are exactly the ones checked.
+#
+# Each literal path ritz0 sizes separately has its own test: a local StrView,
+# print/eprint interpolation segments and a const StrView.  Two more are
+# ritz0-only (ritz1 refuses `var s: String = "..."` and cannot index a const
+# [N]StrView, #3325), so they are pinned in ritz0/test_utf8_literal_len.py.
+# Expectations are c"..." literals, which are sized by their NUL and so hold
+# the real bytes.
+#
+# The matrix runs this file under ritz0, ritz1 and ritz1_selfhosted.
+
+import ritzlib.sys
+
+var g_rd: i32 = 0
+var g_saved: i32 = 0
+var g_fd: i32 = 0
+
+fn capture_begin(fd: i32) -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) != 0
+        return 1
+    g_fd = fd
+    g_rd = fds[0]
+    g_saved = sys_dup(fd)
+    sys_dup2(fds[1], fd)
+    sys_close(fds[1])
+    0
+
+# Restore the captured fd, read what was written, compare it with `want`.
+# Returns 0 on an exact byte match.
+fn capture_end_expect(want: *u8) -> i32
+    sys_dup2(g_saved, g_fd)
+    sys_close(g_saved)
+    var buf: [256]u8
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < 256
+        n = sys_read(g_rd, @buf[got], 256 - got)
+        if n > 0
+            got = got + n
+    sys_close(g_rd)
+    var i: i64 = 0
+    while *(want + i) != 0
+        if i >= got
+            return 2
+        if buf[i] != *(want + i)
+            return 3
+        i = i + 1
+    if i != got
+        return 4
+    0
+
+# 0 when `v` holds exactly the bytes of the C string `want`.
+fn view_is(v: StrView, want: *u8) -> i32
+    var i: i64 = 0
+    while *(want + i) != 0
+        if i >= v.len
+            return 1
+        if *(v.ptr + i) != *(want + i)
+            return 2
+        i = i + 1
+    if i != v.len
+        return 3
+    0
+
+const K2: StrView = "Kµ"
+const K3: StrView = "K€"
+const K4: StrView = "K😀"
+
+[[test]]
+fn test_local_strview_len_counts_bytes() -> i32
+    let v2: StrView = "Dµ"
+    let v3: StrView = "D€"
+    let v4: StrView = "D😀"
+    assert v2.len == 3
+    assert v3.len == 4
+    assert v4.len == 5
+    assert view_is(v2, c"Dµ") == 0
+    assert view_is(v3, c"D€") == 0
+    assert view_is(v4, c"D😀") == 0
+    0
+
+[[test]]
+fn test_strview_literal_prints_every_byte() -> i32
+    assert capture_begin(1) == 0
+    let v: StrView = "Aµs|µ€😀"
+    print("{v}")
+    assert capture_end_expect(c"Aµs|µ€😀") == 0
+    0
+
+[[test]]
+fn test_print_segments_count_bytes() -> i32
+    let x: i32 = 7
+    assert capture_begin(1) == 0
+    print("C{x}µ")
+    assert capture_end_expect(c"C7µ") == 0
+    assert capture_begin(1) == 0
+    print("€{x}€")
+    assert capture_end_expect(c"€7€") == 0
+    assert capture_begin(1) == 0
+    print("😀{x}😀")
+    assert capture_end_expect(c"😀7😀") == 0
+    0
+
+[[test]]
+fn test_eprint_segments_count_bytes() -> i32
+    let x: i32 = 7
+    assert capture_begin(2) == 0
+    eprint("E{x}µs|€😀")
+    assert capture_end_expect(c"E7µs|€😀") == 0
+    0
+
+[[test]]
+fn test_const_strview_counts_bytes() -> i32
+    let k2: StrView = K2
+    let k3: StrView = K3
+    let k4: StrView = K4
+    assert k2.len == 3
+    assert k3.len == 4
+    assert k4.len == 5
+    assert view_is(k4, c"K😀") == 0
+    0
