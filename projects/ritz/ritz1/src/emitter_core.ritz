@@ -159,10 +159,10 @@ struct NarrowDecl
     declared: i32
     init: *Expr
 
-# One method call that resolved to a procedure; see note_method_callee.
-struct ProcMethodCall
+# One call that resolved to a procedure; see note_callee.
+struct ProcCall
     call: *Expr
-    next: *ProcMethodCall
+    next: *ProcCall
 
 struct EmitterState
     out: *Vec<u8>
@@ -338,9 +338,9 @@ struct EmitterState
     bool_err_line: i32
     bool_err_col: i32
     match_scrut_kind: i32   # BK_* of the scrutinee of the match being emitted
-    # AGAST #2237 — the current fn's method calls that resolved to a procedure,
-    # and whether check_tail_value already reported this fn.
-    proc_method_calls: *ProcMethodCall
+    # AGAST #2237, #2246 — the current fn's calls that resolved to a
+    # procedure, and whether check_tail_value already reported this fn.
+    proc_calls: *ProcCall
     tail_gap_reported: i32
     # AGAST #2255, #2260 — the expressions whose value the statements being
     # emitted use, innermost statement last; see want_stmt_values.
@@ -1476,10 +1476,9 @@ fn find_impl_method_by_symbol(m: *Module, name: *u8, len: i32) -> *FnDef
         ib = ib.next
     found
 
-# A fn declared with no return type.  `-> void` does not count, as in ritz0's
-# _is_void_call (AGAST #2246).
+# A fn that yields no value: no return type, or `-> void` (AGAST #2246).
 fn fn_is_procedure(fd: *FnDef) -> i32
-    if fd == null or fd.return_type != TYPE_VOID or fd.ret_written_void == 1
+    if fd == null or fd.return_type != TYPE_VOID
         return 0
     1
 
@@ -1605,16 +1604,20 @@ fn reject_procedure_value(s: *EmitterState, e: *Expr, name: *u8, len: i32)
     emit_str(s, c"  ; ERROR: a procedure call has no value\n")
     s.error_count = s.error_count + 1
 
-# AGAST #2237: remember that method call `e` dispatched to `fd`.  Only emission
-# knows a receiver's type, so check_tail_method_calls reads this after the body.
-fn note_method_callee(s: *EmitterState, e: *Expr, fd: *FnDef)
+# Remember that call `e`, to `name`, resolved to `fd`.  Only emission knows a
+# method's receiver type (AGAST #2237), or that a name is a local fn pointer
+# shadowing the fn (#2246), so check_tail_calls reads this after the body.
+fn note_callee(s: *EmitterState, e: *Expr, fd: *FnDef, name: *u8, len: i32)
     if fn_is_procedure(fd) == 0
         return
-    reject_procedure_value(s, e, e.ident_ptr, e.ident_len)   # AGAST #2255
-    let n: *ProcMethodCall = malloc(sizeof(ProcMethodCall)) as *ProcMethodCall
+    reject_procedure_value(s, e, name, len)   # AGAST #2255
+    let n: *ProcCall = malloc(sizeof(ProcCall)) as *ProcCall
     n.call = e
-    n.next = s.proc_method_calls
-    s.proc_method_calls = n
+    n.next = s.proc_calls
+    s.proc_calls = n
+
+fn note_method_callee(s: *EmitterState, e: *Expr, fd: *FnDef)
+    note_callee(s, e, fd, e.ident_ptr, e.ident_len)
 
 # The FnDef a call expression names: `func_name` plus its generic suffix
 # (`vec_new` + `$u8`).  Replaces nine copies of a loop that built the name in

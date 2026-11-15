@@ -7,13 +7,14 @@ single source of truth for the rule) goes through ritz1 and must get the same
 verdict, at the same line. Taking the tables from that file, rather than
 copying them, means a change to the rule cannot silently skip ritz1.
 
-ritz1's AST lost three things ritz0's keeps, and each needed marking at parse
+ritz1's AST lost two things ritz0's keeps, and each needed marking at parse
 time, so each has cases in the extra tables below:
 
 * `true` and `1` are the same int literal, but only `while true` is endless;
-* `pass` and `0` are the same int literal, but only `0` is a value;
-* `fn g()` and `fn g() -> void` are both TYPE_VOID, but only the first counts
-  as a procedure call in a tail. ritz0 lets the second through.
+* `pass` and `0` are the same int literal, but only `0` is a value.
+
+`fn g()` and `fn g() -> void` are both TYPE_VOID, and both are procedures in a
+tail (AGAST #2246), so their cases are in ritz0's tables like any other.
 """
 
 import importlib.util
@@ -343,44 +344,6 @@ def test_ritz1_extra_shapes_accepted_by_both(ritz1_bin, tmp_path, name):
     rc, output = _ritz0(tmp_path, source)
     assert rc == 0, f"{name}: ritz0 is the oracle and rejected it:\n{output[-800:]}"
     _assert_accepted(_ritz1(ritz1_bin, tmp_path, source), name, tmp_path)
-
-
-# Verdict only: ritz1 accepts these, and the IR it writes is not this ticket's.
-RITZ1_EXTRA_ACCEPTED_VERDICT_ONLY = {
-    # AGAST #2246: `-> void` is not a procedure to ritz0's `_is_void_call`.
-    # ritz1's IR for these was already invalid (`ret i64 %.0`) before #2236.
-    "tail_call_to_a_fn_spelled_void": (
-        "fn g(n: i64) -> void\n"
-        "    var i: i64 = n\n"
-        "fn f(n: i64) -> i64\n"
-        "    g(n)\n"),
-    "tail_method_call_to_a_method_spelled_void": (
-        "struct B\n"
-        "    v: i64\n"
-        "impl B\n"
-        "    fn p(self) -> void\n"
-        "        var i: i64 = 1\n"
-        "fn f(b: B) -> i64\n"
-        "    b.p()\n"),
-    # The `-> void` mark has to reach the clone the call resolves to.
-    "tail_call_to_a_generic_spelled_void": (
-        "fn g<T>(n: T) -> void\n"
-        "    var i: T = n\n"
-        "fn f(n: i64) -> i64\n"
-        "    g<i64>(n)\n"
-        "fn main() -> i32\n"
-        "    return 0\n"),
-}
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_EXTRA_ACCEPTED_VERDICT_ONLY))
-def test_ritz1_extra_verdicts_accepted_by_both(ritz1_bin, tmp_path, name):
-    source = RITZ1_EXTRA_ACCEPTED_VERDICT_ONLY[name]
-    rc, output = _ritz0(tmp_path, source)
-    assert rc == 0, f"{name}: ritz0 is the oracle and rejected it:\n{output[-800:]}"
-    r = _ritz1(ritz1_bin, tmp_path, source)
-    assert r.returncode == 0, f"{name}: ritz1 rejected it:\n{r.stderr[-1500:]}"
 
 
 @pytest.mark.integration

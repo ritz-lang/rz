@@ -257,6 +257,22 @@ REJECTED = {
         "    let fs: [1]fn(i64) = [g]\n"
         "    let x: i64 = fs[0](n)\n"
         "    x\n", None, 5),
+    # AGAST #2246: `-> void` declares no value either.
+    "let_of_a_call_spelled_void": (
+        "fn g(n: i64) -> void\n"
+        "    var i: i64 = n\n"
+        "fn f(n: i64) -> i64\n"
+        "    let x: i64 = g(n)\n"
+        "    7\n", "g", 4),
+    "let_of_a_method_call_spelled_void": (
+        "struct B\n"
+        "    v: i64\n"
+        "impl B\n"
+        "    fn p(self) -> void\n"
+        "        var i: i64 = 1\n"
+        "fn f(b: B) -> i64\n"
+        "    let x: i64 = b.p()\n"
+        "    x\n", "p", 7),
     "trait_method_on_a_generic_receiver": (
         _TRAIT + "fn f<X>(x: X) -> i64\n"
         "    let r: i64 = x.t()\n"
@@ -364,14 +380,6 @@ ACCEPTED = {
         "    n\n"
         "fn f(n: i64) -> i64\n"
         "    return call(g, n)\n"),
-    # #2246's question: `-> void` is left as the tail check leaves it. That
-    # ticket moves this to REJECTED.
-    "let_of_a_call_spelled_void": (
-        "fn g(n: i64) -> void\n"
-        "    var i: i64 = n\n"
-        "fn f(n: i64) -> i64\n"
-        "    let x: i64 = g(n)\n"
-        "    7\n"),
 }
 
 

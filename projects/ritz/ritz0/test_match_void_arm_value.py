@@ -211,6 +211,19 @@ pub fn main() -> i32
 }
 
 # The method each REJECTED case's arm calls, for ritz0's diagnostic to name.
+# AGAST #2246: `-> void` declares no value either.
+REJECTED["let_if_spelled_void"] = ("""\
+fn v(x: i32) -> void
+    pass
+
+pub fn main() -> i32
+    let x: i32 = if 1 > 0
+        v(1)
+    else
+        1
+    x
+""", H + 6, 9, BOTH)
+
 METHOD_ARMS = {
     "let_if_method": "p",
     "argument_inline_if_method": "p",
@@ -218,6 +231,19 @@ METHOD_ARMS = {
 }
 
 LEGAL = {
+    # AGAST #2246: a local fn pointer is called, not the procedure it shadows.
+    "let_if_through_a_local_that_shadows_a_procedure": """\
+fn h(x: i64) -> i64
+    x
+
+pub fn main() -> i32
+    let say: fn(i64) -> i64 = h
+    let x: i64 = if 1 > 0
+        say(0)
+    else
+        1
+    x as i32
+""",
     # A diverging arm has no value either, but never reaches the binding.
     "let_match_return_arm": """\
 fn f(o: Option<i32>) -> i32

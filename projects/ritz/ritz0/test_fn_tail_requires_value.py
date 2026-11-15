@@ -100,6 +100,37 @@ REJECTED = {
         "    var i: i64 = n\n"
         "fn f(n: i64) -> i64\n"
         "    g(n)\n", 4),
+    # AGAST #2246: `-> void` declares no value either, so a call to it is a
+    # procedure call. ritz0 returned garbage here and ritz1 wrote invalid IR.
+    "tail_call_to_a_fn_spelled_void": (
+        "fn g(n: i64) -> void\n"
+        "    var i: i64 = n\n"
+        "fn f(n: i64) -> i64\n"
+        "    g(n)\n", 4),
+    "tail_call_to_a_procedure_in_an_else_arm_spelled_void": (
+        "fn g(n: i64) -> void\n"
+        "    var i: i64 = n\n"
+        "fn f(n: i64) -> i64\n"
+        "    if n > 0\n"
+        "        1\n"
+        "    else\n"
+        "        g(n)\n", 7),
+    # The `-> void` has to reach the clone the call resolves to.
+    "tail_call_to_a_generic_spelled_void": (
+        "fn g<T>(n: T) -> void\n"
+        "    var i: T = n\n"
+        "fn f(n: i64) -> i64\n"
+        "    g<i64>(n)\n"
+        "fn main() -> i32\n"
+        "    return 0\n", 4),
+    "tail_method_call_to_a_method_spelled_void": (
+        "struct B\n"
+        "    v: i64\n"
+        "impl B\n"
+        "    fn p(self) -> void\n"
+        "        var i: i64 = 1\n"
+        "fn f(b: B) -> i64\n"
+        "    b.p()\n", 7),
     # AGAST #2237: a method call resolves only as it is emitted, so these reach
     # the check by every route `_emit_method_call` has to a procedure.
     "tail_method_call_to_a_procedure": (
@@ -245,7 +276,29 @@ REJECTED = {
         "            return 1\n", 2),
 }
 
+# AGAST #2246: a local fn pointer is called, not the procedure it shadows.
+_SHADOWED = ("fn g(n: i64)\n"
+             "    var i: i64 = n\n"
+             "fn h(n: i64) -> i64\n"
+             "    n\n")
+
 ACCEPTED = {
+    "tail_call_through_a_local_that_shadows_a_procedure": (
+        _SHADOWED + "fn f(n: i64) -> i64\n"
+        "    let g: fn(i64) -> i64 = h\n"
+        "    g(n)\n"),
+    "tail_call_through_a_param_that_shadows_a_procedure": (
+        _SHADOWED + "fn f(g: fn(i64) -> i64, n: i64) -> i64\n"
+        "    g(n)\n"),
+    # The local is the arm's own, so it is not bound yet when the tail is
+    # first judged.
+    "tail_call_through_an_arm_local_that_shadows_a_procedure": (
+        _SHADOWED + "fn f(n: i64) -> i64\n"
+        "    if n > 0\n"
+        "        let g: fn(i64) -> i64 = h\n"
+        "        g(n)\n"
+        "    else\n"
+        "        0\n"),
     "if_else_every_arm_returns": (
         "fn f(n: i64) -> i64\n"
         "    if n > 0\n"

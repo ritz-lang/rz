@@ -667,9 +667,9 @@ class LLVMEmitter:
         # A name is a borrow only while `locals[name]` still holds this
         # pointer (a shadowing `let`/`var` rebinds it to an alloca).
         self._mut_borrow_args: Dict[str, ir.Value] = {}
-        # MethodCall nodes in the tail being emitted that resolved to a
-        # procedure (AGAST #2237): see _reject_missing_tail_value.
-        self._procedure_method_calls: set = set()
+        # Calls in the tail being emitted that resolved to a procedure
+        # (AGAST #2237, #2246): see _reject_missing_tail_value.
+        self._procedure_calls: set = set()
         # id -> expression whose value its statement or parent uses (AGAST
         # #2255, #2260): see _reject_procedure_value. Holding the node keeps
         # its id from being reused by a later one.
@@ -5346,7 +5346,7 @@ class LLVMEmitter:
                 offender = self._find_valueless_if(fn_def.body.expr, consumed=False)
                 if offender is not None:
                     self._raise_valueless_if(offender, fn_def.body.expr)
-                self._reject_void_arms(fn_def.body.expr, False, fn_def.body.expr)
+                self._record_used_arms(fn_def.body.expr, False)
                 # Check if we're returning a local variable - it should be moved, not dropped
                 exclude_var = None
                 # A procedure's tail binding isn't returned: it stays owned
@@ -5367,7 +5367,7 @@ class LLVMEmitter:
                 # function's return type refers to, so we use the right
                 # specialization instead of an arbitrary one from variant_to_enum.
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
-                self._procedure_method_calls = set()
+                self._procedure_calls = set()
                 # A procedure's tail value goes nowhere: a temporary, dropped
                 # with the scopes by _emit_drop_for_all_scopes (AGAST #2253).
                 if fn_def.ret_type is None:
@@ -5382,7 +5382,7 @@ class LLVMEmitter:
                         fn_def.body.expr, fn_def.ret_type,
                         lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
                 self._reject_missing_tail_value(
-                    fn_def, lambda e: id(e) in self._procedure_method_calls)
+                    fn_def, lambda e: id(e) in self._procedure_calls)
                 self.closure_expected_type = None  # Clear context
                 # AGAST #3205: every arm of the tail left by `return` (`0 =>
                 # return A.V(7)`), so we sit in its dead merge block and the
@@ -5456,8 +5456,27 @@ class LLVMEmitter:
         return not (isinstance(declared, rast.NamedType)
                     and declared.name == 'void')
 
+    @staticmethod
+    def _is_procedure(fn_def: Optional[rast.FnDef]) -> bool:
+        """A fn that yields no value: no return type, or `-> void` (#2246)."""
+        return fn_def is not None and not LLVMEmitter._declares_value(fn_def)
+
+    def _resolved_to_procedure(self, call: rast.Expr, name: Optional[str]) -> None:
+        """`call` resolved to a procedure, as only its emission can tell.
+
+        Before emission a callee is a name, and the name may be a local fn
+        pointer that shadows the fn (AGAST #2246), or a receiver's method
+        (#2237). So every check of a procedure call is made here: its value
+        used (#2255), a used `match`/`if` arm (#2046, #2256), and a tail,
+        through `_procedure_calls` (#1429).
+        """
+        self._procedure_calls.add(id(call))
+        self._reject_procedure_value(call, name)
+        if id(call) in self._used_arms:
+            self._raise_void_arm(call)
+
     def _reject_missing_tail_value(self, fn_def: rast.FnDef,
-                                   yields_nothing=None) -> None:
+                                   yields_nothing=lambda expr: False) -> None:
         """A fn with a declared return type must not reach its end valueless.
 
         AGAST #1429. This keys off the declared type and not off the absence
@@ -5467,14 +5486,16 @@ class LLVMEmitter:
         source never wrote.
 
         This runs twice (AGAST #2237). The first pass is before the tail is
-        emitted, when a method call's receiver cannot be typed yet: it may be
-        a local of an arm, or a generic value. `_emit_method_call`
-        records each call it resolves to a procedure, and the second pass,
-        after the tail is emitted, passes those as `yields_nothing`.
+        emitted and judges its shape only: no call's callee is known yet. A
+        method's receiver may be a local of an arm or a generic value, and a
+        name may be a local fn pointer that shadows a procedure (#2246).
+        `_resolved_to_procedure` records each call that resolves to a
+        procedure, and the second pass, after the tail is emitted, passes
+        those as `yields_nothing`.
         """
         if not self._declares_value(fn_def):
             return
-        gap = value_gap(fn_def.body, yields_nothing or self._is_void_call)
+        gap = value_gap(fn_def.body, yields_nothing)
         if gap is not None:
             raise EmitError(
                 f"function '{fn_def.name}' declares a return type but can "
@@ -5966,16 +5987,6 @@ class LLVMEmitter:
             getattr(offender, 'span', None) or getattr(fallback, 'span', None),
         )
 
-    def _is_void_call(self, expr: rast.Expr) -> bool:
-        """A call to a fn declared with no return type (it yields no value)."""
-        if not isinstance(expr, rast.Call) or not isinstance(expr.func, rast.Ident):
-            return False
-        entry = self.functions.get(expr.func.name)
-        if entry is None:
-            return False
-        fn_def = entry[1]
-        return fn_def is not None and fn_def.ret_type is None
-
     def _used_arm_values(self, expr: Optional[rast.Expr], consumed: bool = True,
                          in_arm: bool = False) -> Iterator[rast.Expr]:
         """AGAST #2046: each `match`/`if` arm whose value is used, in order.
@@ -6011,27 +6022,18 @@ class LLVMEmitter:
             for arm in expr.arms:
                 yield from walk(arm.body, consumed, True)
 
-    def _reject_void_arms(self, expr: Optional[rast.Expr], consumed: bool,
-                          fallback: object) -> None:
-        """AGAST #2046: refuse a used arm that calls a procedure.
-
-        A named call is judged here, before emission. A method call's callee
-        is known only once its receiver is typed as it is emitted (it may be
-        a local of the arm or a generic), so each used arm is
-        recorded for `_reject_void_method_arm` (AGAST #2256).
+    def _record_used_arms(self, expr: Optional[rast.Expr], consumed: bool) -> None:
+        """AGAST #2046: note each used arm, so one that calls a procedure is
+        refused. Its callee is known only once it is emitted: a method's receiver may
+        be a local of the arm or a generic (AGAST #2256), and a name may be a
+        local fn pointer (#2246). So each used arm is recorded here, for
+        `_resolved_to_procedure`.
         """
         for arm in self._used_arm_values(expr, consumed):
-            if self._is_void_call(arm):
-                self._raise_void_arm(arm, fallback)
             self._used_arms[id(arm)] = arm
 
-    def _reject_void_method_arm(self, call: rast.MethodCall) -> None:
-        """AGAST #2256: `call` resolved to a procedure; is it a used arm?"""
-        if id(call) in self._used_arms:
-            self._raise_void_arm(call, call)
-
     @staticmethod
-    def _raise_void_arm(offender: rast.Expr, fallback: object) -> None:
+    def _raise_void_arm(offender: rast.Expr) -> None:
         if isinstance(offender, rast.MethodCall):
             name = offender.method
         else:
@@ -6039,7 +6041,7 @@ class LLVMEmitter:
         raise EmitError(
             f"this arm calls `{name}`, which returns nothing, so it has no "
             f"value; the `match`/`if` it belongs to is used as a value here",
-            getattr(offender, 'span', None) or getattr(fallback, 'span', None),
+            getattr(offender, 'span', None),
         )
 
     def _reject_valueless_if(self, stmt: rast.Stmt) -> None:
@@ -6060,7 +6062,7 @@ class LLVMEmitter:
             offender = self._find_valueless_if(expr, consumed)
             if offender is not None:
                 self._raise_valueless_if(offender, stmt)
-            self._reject_void_arms(expr, consumed, stmt)
+            self._record_used_arms(expr, consumed)
 
     def _expect_returned_value_from(self, expr: Optional[rast.Expr]) -> None:
         """A `return` wants `expr`'s value, unless the fn declares none.
@@ -12050,8 +12052,8 @@ class LLVMEmitter:
         # Look up user-defined function
         if fname in self.functions:
             fn, fn_def = self.functions[fname]
-            if fn_def is not None and fn_def.ret_type is None:
-                self._reject_procedure_value(call, fname.partition('$')[0])
+            if self._is_procedure(fn_def):
+                self._resolved_to_procedure(call, fname.partition('$')[0])
 
             # Check argument count BEFORE processing
             if len(call.args) != len(self._fn_param_types(fn)):
@@ -13637,10 +13639,8 @@ class LLVMEmitter:
             raise ValueError(f"Method function '{mangled_name}' not found")
 
         fn, fn_def = self.functions[mangled_name]
-        if fn_def.ret_type is None:
-            self._procedure_method_calls.add(id(expr))
-            self._reject_procedure_value(expr, expr.method)
-            self._reject_void_method_arm(expr)
+        if self._is_procedure(fn_def):
+            self._resolved_to_procedure(expr, expr.method)
 
         # Check if this is a static method (no self parameter)
         # Static methods are called as Type.method() with no receiver instance
