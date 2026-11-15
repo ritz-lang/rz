@@ -15,9 +15,9 @@ written, saying what to write:
     file:line:col: `Box2` is generic: write its type arguments, `Box2<X> { .. }`
 
 That holds wherever the literal is: a fn, a generic fn's template, an
-`impl<T>` method (#3310's args-less spelling; its `Cell<T> { .. }` one is that
-ticket's).  A non-generic struct's literal and a spelled-out `Box2<T> { .. }`
-still build.
+`impl<T>` method (#3310's args-less spelling).  A non-generic struct's literal
+and a spelled-out `Box2<T> { .. }` still build, the latter in an `impl<X>`
+method too (#3310's `Cell<T> { .. }` form, which takes the impl's instance).
 
 Each row separates a path (docs/TESTING.md, "What a ritz0 pytest case costs").
 """
@@ -80,6 +80,17 @@ RUNS = {
                     "    let b = Box2<T> { v: T { id: 5 } }\n"
                     "    let t = Two<i32, i64> { a: 1, b: 2 }\n"
                     "    b.v.id + g<i32>(t.a).v + t.b as i32\n", 8),
+    # In an `impl<X>` method (#3310): `Box2<X>` is the impl's instance, a
+    # value through a tail and a typed let.  `size` is 1 only on Box2$u8.
+    "impl_method_spelled_out": ("impl<X> Box2<X>\n"
+                                "    fn again(self: @Box2<X>) -> Box2<X>\n"
+                                "        Box2<X> { v: self.v }\n"
+                                "    fn size(self: @Box2<X>) -> i32\n"
+                                "        let n: Box2<X> = Box2<X> { v: self.v }\n"
+                                "        sizeof(n.v) as i32\n"
+                                "fn main() -> i32\n    let b = Box2<i32> { v: 3 }\n"
+                                "    let u = Box2<u8> { v: 9 }\n"
+                                "    b.again().v * 10 + u.size()\n", 31),
 }
 
 
