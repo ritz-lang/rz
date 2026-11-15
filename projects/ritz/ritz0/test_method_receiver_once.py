@@ -480,7 +480,7 @@ pub fn main() -> i32
     var held = P { x: 4 }
     mwp(@held).pp.bump()
     return MADE * 10 + held.x
-""", 15, {c: 3235 for c in BOTH_RITZ1}),
+""", 15, {}),
 
     # The value the method returns is the receiver's, not another evaluation's.
     "reads_the_value_it_evaluated": ("""\
