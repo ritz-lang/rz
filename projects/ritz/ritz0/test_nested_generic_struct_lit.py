@@ -70,8 +70,9 @@ fn main() -> i32
 }
 
 
-# ritz1 types `mk<Cell<T>>(..)` in a generic body as `Cell$Cell$T` (AGAST #3355).
-GAPS = {("generic_call", "ritz1"): 3355, ("generic_call", "ritz1_selfhosted"): 3355}
+# ritz1 typed `mk<Cell<T>>(..)` in a generic body as `Cell$Cell$T` until
+# #3343 substituted T inside a nested call type arg (AGAST #3355).
+GAPS = {}
 
 
 def _cases():

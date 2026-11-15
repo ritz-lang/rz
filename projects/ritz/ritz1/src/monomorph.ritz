@@ -3682,7 +3682,14 @@ fn check_and_substitute_suffix(old_suffix: *u8, old_suffix_len: i32, type_param:
         return tup
     # Check if old_suffix is "$T" where T matches type_param
     if old_suffix_len != type_param_len + 1
-        return null
+        # AGAST #3343: T inside a nested argument, `deep<Cell<T>>` ("$Cell$T")
+        # at T = i32 is "$Cell$i32".  Left alone, every instance called the
+        # unspecialised `deep$Cell$T` (invalid IR), so polymorphic recursion
+        # never got deeper than one level and #3330's cap never fired.
+        let inner: *u8 = replace_param_component(old_suffix, old_suffix_len, type_param, type_param_len, new_suffix, new_suffix_len, out_len)
+        if inner == old_suffix
+            return null
+        return inner
     if *old_suffix != 36  # $
         return null
     if memcmp(old_suffix + 1, type_param, type_param_len as i64) != 0
@@ -4211,13 +4218,18 @@ pub fn monomorph_errors() -> i32
 
 # AGAST #3330: `name` is still being instantiated MAX_INSTANCE_DEPTH
 # generations deep.  Located at its first generic impl, whose methods are what
-# name the deeper instance.  Without one (a generic fn `f<T>` calling
-# `f<Cell<T>>`) there is no column to report, so it is reported at the file;
-# ritz0 reports that case at the definition (monomorph.py, _recursion_error).
+# name the deeper instance.  Without one, a generic fn `f<T>` calling
+# `f<Cell<T>>` (AGAST #3343) is located at the fn's definition, as ritz0 does
+# (monomorph.py, _recursion_error): a top-level fn starts at column 1.
 fn refuse_recursive_instance(m: *Module, name: *u8, name_len: i32)
     let ib: *ImplBlock = find_generic_impl(m.impls, name, name_len)
+    var fd: *FnDef = null
+    if ib == null
+        fd = find_generic_function(m, name, name_len)
     if ib != null and ib.def_file != null
         eprints_cstr(ib.def_file)
+    else if fd != null and fd.def_file != null
+        eprints_cstr(fd.def_file)
     else if struct_index_file() != null
         eprints_cstr(struct_index_file())
     else
@@ -4227,6 +4239,10 @@ fn refuse_recursive_instance(m: *Module, name: *u8, name_len: i32)
         eprint_i64(ib.impl_span.line as i64)
         eprint_char(':')
         eprint_i64(ib.impl_span.col as i64)
+    else if fd != null and fd.line > 0
+        eprint_char(':')
+        eprint_i64(fd.line as i64)
+        eprints_cstr(c":1")
     eprints_cstr(c": error: instantiating `")
     sys_write(2, name, name_len as i64)
     eprints_cstr(c"` recurses: ")
