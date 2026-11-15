@@ -1436,7 +1436,7 @@ dispatch through an `impl` method or a `match`.
 **Not implemented.** There is no closure or lambda syntax; the `|...|` form the
 0.2.0 spec described never existed in the compiler:
 
-```ritz body expect-error="Expected type name"
+```ritz body expect-error="Expected expression, got ARROW"
 let add_one = |x: i32| -> i32
     x + 1
 ```
