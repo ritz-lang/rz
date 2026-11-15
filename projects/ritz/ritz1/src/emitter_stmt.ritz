@@ -2363,11 +2363,30 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
 
 # AGAST #1509: store stmt.assign_value into the N-D element `dst` points
 # at, at the leaf's width (as a 1-D local array element store does).  A row
-# or a whole struct element is a located error.
+# is a located error.
+#
+# AGAST #2099: a whole struct element `g[i][j] = q` stores the `%P` at the
+# element's address, as the 1-D `[N]P` element store does (#190).  Like that
+# store, the element's old value is not dropped.  A leaf naming no struct (a
+# generic clone that kept `T`, #3141) stays the located error: `store %T`
+# would be invalid IR.
 fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
     let sh: *ArrayShape = dst.shape
-    if dst.depth < sh.rank or sh.leaf_type == TYPE_STRUCT
+    var leaf_st: *StructDef = null
+    if sh.leaf_type == TYPE_STRUCT and sh.leaf_name_len > 0
+        leaf_st = find_struct(s, sh.leaf_name, sh.leaf_name_len)
+    if dst.depth < sh.rank or (sh.leaf_type == TYPE_STRUCT and leaf_st == null)
         emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
+        return
+    if sh.leaf_type == TYPE_STRUCT
+        let sval: i32 = emit_store_into_slot(s, stmt.assign_value, TYPE_STRUCT, sh.leaf_name, sh.leaf_name_len)   # AGAST #2454, #2390
+        emit_str(s, c"  store ")
+        emit_llvm_type_struct(s, TYPE_STRUCT, sh.leaf_name, sh.leaf_name_len)
+        emit_str(s, c" ")
+        emit_reg(s, sval)
+        emit_str(s, c", ptr ")
+        emit_reg(s, dst.reg)
+        emit_str(s, c"\n")
         return
     let ty: *u8 = local_array_elem_llvm(sh.leaf_type)
     let val: i32 = emit_expr(s, stmt.assign_value)

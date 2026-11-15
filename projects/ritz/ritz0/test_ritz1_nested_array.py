@@ -621,6 +621,136 @@ pub fn main() -> i32
         return 1
     return (sizeof(s.m[0][1]) + sizeof(s.m[1]) + sizeof(arr[1].m[0][2]) + sizeof((*p).m[1][2]) + sizeof(arr[0].m[1]) + 6) as i32
 """,
+    # AGAST #2099: a whole struct element `g[i][j] = q` stores the `%P` at the
+    # element's address, as a 1-D `[N]P` element store does (#190). P's fields
+    # differ in width, so a store at the wrong width or stride shows up in a
+    # neighbour; a 3-D leaf takes the same path.
+    "struct_elem_store": """\
+struct P
+    a: u8
+    b: i64
+    c: i16
+
+pub fn main() -> i32
+    var g: [2][2]P
+    var h: [2][2][2]P
+    for i in 0..2
+        for j in 0..2
+            g[i][j].a = 1
+            g[i][j].b = 2
+            g[i][j].c = 3
+            h[i][j][1].c = 4
+    var q: P
+    q.a = 10
+    q.b = 1099511627776
+    q.c = 7
+    g[1][0] = q
+    h[1][0][0] = q
+    if g[0][1].a != 1 or g[1][1].b != 2 or g[0][0].c != 3 or g[1][1].a != 1
+        return 1
+    if g[1][0].b != 1099511627776 or h[1][0][0].b != 1099511627776 or h[1][0][1].c != 4
+        return 2
+    return (g[1][0].a as i32) + (g[1][0].c as i32) + (h[1][0][0].c as i32) + 18
+""",
+    # ... into a global, from a call's result.  (An element read as a whole
+    # value, `g[0][0] = g[2][1]`, is still refused: a separate gap.)
+    "struct_elem_store_global": """\
+struct P
+    a: i32
+    b: u8
+
+var g: [3][2]P
+var after: i32 = 5
+
+fn mk(a: i32) -> P
+    return P { a: a, b: 2 }
+
+pub fn main() -> i32
+    for i in 0..3
+        for j in 0..2
+            g[i][j].a = 1
+            g[i][j].b = 1
+    g[2][1] = mk(30)
+    g[0][0] = mk(30)
+    if g[2][0].a != 1 or g[1][1].b != 1 or after != 5
+        return 1
+    return g[2][1].a + (g[2][1].b as i32) + g[0][0].a / 3
+""",
+    # ... into an N-D field, of a local and through a pointer.
+    "struct_elem_store_field": """\
+struct P
+    a: i16
+    b: i64
+
+struct M
+    t: i32
+    m: [2][3]P
+    u: i8
+
+fn put(p: *M, q: P)
+    (*p).m[0][2] = q
+
+pub fn main() -> i32
+    var s: M
+    s.t = 1
+    s.u = 2
+    for i in 0..2
+        for j in 0..3
+            s.m[i][j].a = 0
+            s.m[i][j].b = 0
+    var q: P
+    q.a = 20
+    q.b = 10
+    s.m[1][2] = q
+    q.a = 3
+    put(@s, q)
+    if s.m[1][1].a != 0 or s.m[0][1].b != 0 or s.t != 1 or s.u != 2
+        return 1
+    return (s.m[1][2].a as i32) + (s.m[1][2].b as i32) + (s.m[0][2].a as i32) + (s.m[0][2].b as i32) - 1
+""",
+    # ... with a generic leaf, `P$i64`.
+    "struct_elem_store_generic": """\
+struct P<T>
+    v: T
+    k: u8
+
+struct W<T>
+    a: [2][3]P<T>
+
+pub fn main() -> i32
+    var w: W<i64>
+    w.a[1][1].v = 5
+    var q: P<i64>
+    q.v = 1099511627776
+    q.k = 40
+    w.a[1][2] = q
+    if w.a[1][2].v != 1099511627776 or w.a[1][1].v != 5
+        return 1
+    return (w.a[1][2].k as i32) + 2
+""",
+    # ... of a Drop struct.  As a 1-D `a[i] = v` store on every compiler, the
+    # element's old value is not dropped and the stored one is moved, not
+    # dropped: 30 + 7 + 5 + D (0).  The missing drop of the old value is
+    # filed against all three compilers, not fixed here.
+    "struct_elem_store_drop": """\
+var D: i32 = 0
+
+struct S
+    x: i32
+
+impl Drop for S
+    fn drop(self:& S)
+        D = D + self.x
+
+pub fn main() -> i32
+    var g: [2][2]S
+    g[1][1].x = 2
+    g[1][0].x = 5
+    var q: S = S { x: 30 }
+    g[1][1] = q
+    g[0][1] = S { x: 7 }
+    return g[1][1].x + g[0][1].x + g[1][0].x + D
+""",
 }
 
 
@@ -806,17 +936,6 @@ pub fn main() -> i32
     g[1] = 0
     return 0
 """, ":3:", "assigning a row or a whole struct element"),
-    "struct_elem_assign": ("""\
-struct P
-    x: i32
-
-pub fn main() -> i32
-    var g: [2][2]P
-    var q: P
-    q.x = 1
-    g[1][1] = q
-    return 0
-""", ":8:", "assigning a row or a whole struct element"),
     "whole_array_use": ("""\
 fn take(a: i64) -> i32
     return 0
