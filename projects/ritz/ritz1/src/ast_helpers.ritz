@@ -1508,6 +1508,7 @@ fn ptr_names_array_of_struct_ptrs(p: *Parser, ty: i32) -> i32
 
 pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
     nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
+    note_pass_binding(name, len)   # AGAST #3320
     let param: *Param = param_of_type(p, name, len, ty)
     param.name_span.line = line   # AGAST #2407
     param.name_span.col = col
@@ -1860,6 +1861,7 @@ pub fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
 
 # Generic function definition (with type parameters)
 pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
+    g_pass_bound = 0   # AGAST #3320: this fn's `pass` bindings end with it
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
     f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
     f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
@@ -4181,6 +4183,7 @@ pub fn stmt_let_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
     return s
 
 pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line: i32, col: i32) -> *Stmt
+    note_pass_binding(name, len)   # AGAST #3320
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = STMT_VAR_DECL
     s.var_is_let = 0
@@ -4945,6 +4948,39 @@ pub fn expr_false(p: *Parser, line: i32, col: i32) -> *Expr
 
 # `pass` in expression position is the integer 0 to everything but
 # tail_value.ritz, where it is the absence of a value (AGAST #2236).
+# AGAST #3320: `pass` is an identifier (LANGUAGE_SPEC §2), so it lexes as
+# IDENT and names fns, params, locals and fields like any other.  As ritz0
+# reads it, a bare `pass` is the binding of that name when one is in scope,
+# and otherwise the no-op.  g_pass_bound is "the fn being parsed binds `pass`"
+# (a param or a let/var/for), set as each binding is parsed and cleared at
+# the fn's end, so it covers the reads after the binding.  It is per fn, not
+# per block: a no-op `pass` after an inner block's `let pass` reads as the
+# out-of-scope name.
+var g_pass_bound: i32 = 0
+
+fn is_pass_name(name: *u8, len: i32) -> i32
+    if len == 4 and name != null and *name == 112 and *(name + 1) == 97 and *(name + 2) == 115 and *(name + 3) == 115
+        return 1
+    return 0
+
+pub fn note_pass_binding(name: *u8, len: i32)
+    if is_pass_name(name, len) == 1
+        g_pass_bound = 1
+
+# Grammar action for a `for` variable: noted before the body is parsed, which
+# stmt_for's action (after the body) would be too late for.
+pub fn for_var_name(tok: Token) -> Token
+    note_pass_binding(tok.start, tok.len)
+    return tok
+
+# A primary with no postfix ops (apply_postfix_p): a bare `pass` with no
+# binding of that name in the fn is the no-op.  `pass(2)`, `s.pass` and a
+# bound `pass` stay identifiers.
+fn pass_or_ident(p: *Parser, e: *Expr) -> *Expr
+    if e.kind == EXPR_IDENT and g_pass_bound == 0 and is_pass_name(e.ident_ptr, e.ident_len) == 1
+        return expr_pass(p, e.span.line, e.span.col)
+    return e
+
 pub fn expr_pass(p: *Parser, line: i32, col: i32) -> *Expr
     let e: *Expr = expr_int(p, 0, line, col)
     e.lit_kind = LIT_PASS
@@ -5502,7 +5538,7 @@ pub fn apply_postfix(base: *Expr, ops: *PostfixOp) -> *Expr
 # Apply postfix operations with parser for allocation
 pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
     if ops == null
-        return base
+        return pass_or_ident(p, base)
 
     # Apply each postfix operation, creating new expression nodes
     var result: *Expr = base

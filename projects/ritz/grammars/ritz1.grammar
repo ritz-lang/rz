@@ -44,7 +44,6 @@ IN          = "in"
 AND         = "and"
 OR          = "or"
 NOT         = "not"
-PASS        = "pass"
 ASSERT      = "assert"
 TYPE        = "type"
 # Inline if-expression `if c then a else b` (LANGUAGE_SPEC §7.5, AGAST #1753).
@@ -872,12 +871,18 @@ while_stmt -> *Stmt
     ;
 
 for_stmt -> *Stmt
-    : FOR IDENT IN expr DOTDOT expr block
+    : FOR for_var IN expr DOTDOT expr block
       { stmt_named(stmt_for(p, $2.start, $2.len, $4, $6, $7, $1.line, $1.col), $2.line, $2.col) }
-    | FOR IDENT IN expr DOTDOTEQ expr block
+    | FOR for_var IN expr DOTDOTEQ expr block
       { stmt_named(stmt_for_inclusive(p, $2.start, $2.len, $4, $6, $7, $1.line, $1.col), $2.line, $2.col) }
-    | FOR IDENT IN expr block
+    | FOR for_var IN expr block
       { stmt_named(stmt_for_iter(p, $2.start, $2.len, $4, $5, $1.line, $1.col), $2.line, $2.col) }
+    ;
+
+# The loop variable, noted as a binding before the body is parsed: a bare
+# `pass` in the body of `for pass in ..` reads the variable (AGAST #3320).
+for_var -> Token
+    : IDENT { for_var_name($1) }
     ;
 
 # Infinite loop:  loop\n  body
@@ -900,7 +905,7 @@ loop_stmt -> *Stmt
 #              | pattern FAT_ARROW (return_stmt | break_stmt | continue_stmt)
 #   pattern   : NUMBER | TRUE | FALSE | IDENT | IDENT '(' inner ')'
 #   inner      : IDENT  (single binding or `_` wildcard, treated as IDENT here)
-#   arm_body   : expr | PASS
+#   arm_body   : expr   (a bare `pass` is the no-op arm)
 match_stmt -> *Stmt
     : MATCH expr NEWLINE INDENT match_arms DEDENT
       { stmt_match(p, $2, $5, $1.line, $1.col) }
@@ -958,12 +963,11 @@ pattern -> *MatchArm
     | IDENT { pattern_head_at(pattern_ident_at(p, $1.start, $1.len, $1.line, $1.col), $1.line, $1.col) }
     ;
 
-# arm_body is either an expression or the explicit `pass` keyword (no-op arm).
-# `pass` comes back as an expr_pass: the match_arm action sets is_pass=1 and
-# keeps its position (AGAST #2236); otherwise body is the expression.
+# arm_body is an expression; a bare `pass` (no-op arm) comes back as an
+# expr_pass (apply_postfix_p, AGAST #3320): the match_arm action sets is_pass=1
+# and keeps its position (AGAST #2236); otherwise body is the expression.
 arm_body -> *Expr
-    : PASS { expr_pass(p, $1.line, $1.col) }
-    | expr { $1 }
+    : expr { $1 }
     ;
 
 break_stmt -> *Stmt
@@ -1289,13 +1293,6 @@ primary_expr -> *Expr
     | NIL { expr_nil(p, $1.line, $1.col) }
     | NULL { expr_nil(p, $1.line, $1.col) }
     | SELF { expr_ident(p, $1.start, $1.len, $1.line, $1.col) }
-    # `pass` in expression position lowers to integer 0 — ritz0 parity
-    # (ritz0/emitter_llvmlite.py treats the IDENT "pass" as a no-op / 0).
-    # arm_body's first alternative still matches PASS directly (to drive
-    # is_pass=1 in match_arm_set_body_or_pass); this rule
-    # only fires when PASS appears inside expression contexts like
-    # `if flag\n    pass` or a function body's tail expression.
-    | PASS { expr_pass(p, $1.line, $1.col) }
     # The unit value `()` (AGAST #2272), as in `Ok(())`.  `( expr )` is tried
     # first (postfix_expr) and fails at the RPAREN, so this sees only `()`.
     | LPAREN RPAREN { expr_unit(p, $1.line, $1.col) }
