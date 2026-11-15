@@ -678,6 +678,11 @@ class LLVMEmitter:
         # AGAST #2256: every used `match`/`if` arm, for `_emit_method_call`
         # (a method call's callee is known only as it is emitted).
         self._used_arms: Dict[int, rast.Expr] = {}
+        # AGAST #2094: the match / if nodes on the tail of a fn that declares
+        # a value. Its arms are not in _used_arms (#1429's carve-out), but
+        # their merge is returned, so it is used. Nodes are kept alive by the
+        # AST, so their ids are not reused.
+        self._tail_merge_ids: set = set()
         # AGAST #2026: name -> SSA value of a small `let` (see _let_place).
         self._let_values: Dict[str, ir.Value] = {}
         self.functions: Dict[str, Tuple[ir.Function, rast.FnDef]] = {}
@@ -5359,6 +5364,8 @@ class LLVMEmitter:
                 if offender is not None:
                     self._raise_valueless_if(offender, fn_def.body.expr)
                 self._record_used_arms(fn_def.body.expr, False)
+                if self._declares_value(fn_def):
+                    self._tail_merge_ids |= self._float_tail_ids(fn_def.body.expr)
                 # Check if we're returning a local variable - it should be moved, not dropped
                 exclude_var = None
                 # A procedure's tail binding isn't returned: it stays owned
@@ -7471,6 +7478,11 @@ class LLVMEmitter:
                 # 0 else 1.5` truncated 1.5 to 1.
                 float_ty = self._float_merge_type(if_expr)
                 arm_types = (then_value.type, else_value.type)
+                # Unannotated, an int arm next to a float arm has no merge
+                # type: by size, i64 vs f64 kept the THEN type and truncated
+                # 1.5 to 1 (#2094).
+                if float_ty is None:
+                    self._reject_mixed_int_float_arms(if_expr, arm_types)
                 if (float_ty is not None
                         and any(isinstance(t, (ir.FloatType, ir.DoubleType))
                                 for t in arm_types)
@@ -15404,6 +15416,49 @@ class LLVMEmitter:
             phi.add_incoming(val, block)
         return phi
 
+    # --- AGAST #2094: the same arms with no float annotation -----------------
+    #
+    # With nothing to fix the merge type, an integer arm next to a float arm
+    # is a located error, worded as ritz1's (#1946). It applies only when the
+    # merge's value is used: a statement-position if / match whose arm tails
+    # are an int call and a float call has no merge to type.
+
+    MIXED_INT_FLOAT_ARMS = (
+        "match arms yield both an integer and a float value; write the "
+        "integer arm as a float (`0.0`) or annotate the binding")
+
+    def _merge_value_used(self, node) -> bool:
+        """Whether the value of match / if `node` is used (#2046, #2094)."""
+        if id(node) in self._tail_merge_ids:
+            return True
+        if isinstance(node, rast.If):
+            bodies = [node.then_block, node.else_block]
+        else:
+            bodies = [arm.body for arm in node.arms]
+        return any(id(b) in self._used_arms for b in bodies if b is not None)
+
+    def _reject_mixed_int_float_arms(self, node, types) -> None:
+        """Refuse a used, unannotated merge of integer and float arms.
+
+        bool (i1) is not an integer here: next to a float it is #2093's.
+        """
+        has_float = any(isinstance(t, (ir.FloatType, ir.DoubleType))
+                        for t in types)
+        has_int = any(isinstance(t, ir.IntType) and t.width > 1
+                      for t in types)
+        if has_float and has_int and self._merge_value_used(node):
+            raise EmitError(self.MIXED_INT_FLOAT_ARMS,
+                            getattr(node, 'span', None))
+
+    def _merge_float_arms(self, expr: rast.Match,
+                          incoming: list) -> Optional[ir.Value]:
+        """A match's float merge (#2027), or None; refuses #2094's arms."""
+        float_ty = self._float_merge_type(expr)
+        if float_ty is None:
+            self._reject_mixed_int_float_arms(expr, [v.type for v, _ in incoming])
+            return None
+        return self._merge_arms_at_float(incoming, float_ty)
+
     def _merge_match_arms(self, incoming: list) -> ir.Value:
         """Build the merge phi for a value-producing match.
 
@@ -15571,6 +15626,12 @@ class LLVMEmitter:
             # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
             if any(val is ir.Undefined for val, _ in incoming):
                 return ir.Undefined
+            # A float-annotated initialiser fixes the merge type, as in the
+            # enum and integer matches (#2027); unannotated int + float arms
+            # are refused if used (#2094).
+            merged = self._merge_float_arms(expr, incoming) if incoming else None
+            if merged is not None:
+                return merged
             # Irreconcilable arm types (e.g. an assignment arm yielding its
             # enum value next to a `pass` arm's dummy i32 0) mean nobody can
             # consume this match as a value: it is a statement. Building a
@@ -15975,11 +16036,10 @@ class LLVMEmitter:
             if not all(hasattr(val, 'type') for val, _ in incoming):
                 incoming = []
             # A float-annotated initialiser fixes the merge type (#2027).
-            float_ty = self._float_merge_type(expr)
-            if incoming and float_ty is not None:
-                merged = self._merge_arms_at_float(incoming, float_ty)
-                if merged is not None:
-                    return merged
+            # #2094: unannotated int + float arms are refused if used.
+            merged = self._merge_float_arms(expr, incoming) if incoming else None
+            if merged is not None:
+                return merged
             # Irreconcilable arm types (assignment arm yielding its enum
             # value next to a `pass` arm's dummy i32 0) also make this a
             # statement match — a phi would mix an integer constant into an
@@ -16161,11 +16221,10 @@ class LLVMEmitter:
             if any(val is ir.Undefined for val, _ in incoming):
                 return ir.Undefined
             # A float-annotated initialiser fixes the merge type (#2027).
-            float_ty = self._float_merge_type(expr)
-            if incoming and float_ty is not None:
-                merged = self._merge_arms_at_float(incoming, float_ty)
-                if merged is not None:
-                    return merged
+            # #2094: unannotated int + float arms are refused if used.
+            merged = self._merge_float_arms(expr, incoming) if incoming else None
+            if merged is not None:
+                return merged
             # Irreconcilable arm types (e.g. an assignment arm yielding its
             # enum value next to a `pass` arm's dummy i32 0) mean nobody can
             # consume this match as a value: it is a statement. Building a

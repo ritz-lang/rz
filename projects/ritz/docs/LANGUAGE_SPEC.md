@@ -1538,6 +1538,27 @@ if c
     r = 1
 ```
 
+The arms of an `if`/`else` or `match` whose value is used must agree on
+integer versus float. With no float annotation to give the merge its type, an
+arm that yields an integer next to one that yields a float is an error, in
+either order (AGAST #2094; before it ritz0 merged `if c then 0 else 1.5` at
+`i64` and truncated `1.5` to `1`). Write the integer arm as a float, or
+annotate the binding, and the integer arm converts:
+
+```ritz body expect-error="match arms yield both an integer and a float value"
+let c = true
+let a = if c then 0 else 1.5
+```
+
+```ritz body
+let c = true
+let a = if c then 0.0 else 1.5
+let b: f64 = if c then 0 else 1.5
+```
+
+As with the else-less `if`, an `if` or `match` used as a statement has no
+merged value, so its arms may end in values of any types.
+
 A function that declares a return type is different. It is an error for such
 a function to be able to reach its end without producing a value, whether its
 last statement is an `if`, a loop, an assignment, a `pass` arm or a call to a
