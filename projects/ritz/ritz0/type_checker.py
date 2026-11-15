@@ -39,8 +39,12 @@ class FloatLitType(rast.NamedType):
 
 class TypeError(Exception):
     """Type checking error with source location."""
-    def __init__(self, message: str, span: Optional[rast.Span] = None):
+    def __init__(self, message: str, span: Optional[rast.Span] = None,
+                 after_moves: bool = False):
         self.span = span
+        # Doesn't explain a move error, so it's printed after one (ritz0.py):
+        # a discarded whole array (#3189) beside #2949's move out of `a:&`.
+        self.after_moves = after_moves
         if span:
             super().__init__(f"{span.file}:{span.line}:{span.column}: {message}")
         else:
@@ -312,6 +316,8 @@ class TypeChecker:
         # Check trailing expression matches expected return type
         if block.expr:
             expr_type = self._infer_into(block.expr, expected_ret)
+            if expected_ret is None or self._is_void(expected_ret):
+                self._check_discarded(block.expr, expr_type)   # #3189: a void tail
             if expected_ret and not self._value_fits(block.expr, expr_type, expected_ret):
                 self._error(f"block expression has type {self._type_str(expr_type)}, "
                           f"expected {self._type_str(expected_ret)}", block.expr.span)
@@ -366,7 +372,7 @@ class TypeChecker:
             self._pop_scope()
 
         elif isinstance(stmt, rast.ExprStmt):
-            self._infer_type(stmt.expr)
+            self._check_discarded(stmt.expr, self._infer_type(stmt.expr))
 
         elif isinstance(stmt, rast.ReturnStmt):
             if stmt.value:
@@ -1416,6 +1422,25 @@ class TypeChecker:
             self._slot_reported.add(id(expr))
             self._slot_error(array_rules.WHOLE_ARRAY_NOT_A_VALUE, expr.span)
 
+    @staticmethod
+    def _is_void(ty: rast.Type) -> bool:
+        return isinstance(ty, rast.NamedType) and ty.name == 'void' and not ty.args
+
+    def _check_discarded(self, expr: rast.Expr, actual: Optional[rast.Type]) -> None:
+        """A whole array alone as a statement, or a void fn's tail: a `[N]T`
+        local, an `a:& [N]T` param, an array field or `*p` of a `*[N]T`
+        (AGAST #3189). It does nothing; ritz1 refuses it at the array in
+        #2287's words, and so does ritz0. A call returning an array is a
+        call, and its value may be dropped."""
+        place = expr
+        while isinstance(place, rast.Grouped):
+            place = place.expr
+        if not (isinstance(place, (rast.Ident, rast.Field))
+                or (isinstance(place, rast.UnaryOp) and place.op == '*')):
+            return
+        if actual is not None and isinstance(self._resolve_alias(actual), rast.ArrayType):
+            self._slot_error(array_rules.WHOLE_ARRAY_NOT_A_VALUE, place.span, after_moves=True)
+
     def _check_array_into_scalar(self, expr: rast.Expr, actual: Optional[rast.Type],
                                  slot: Optional[rast.Type]) -> None:
         """A whole array, literal or named, returned from a number or bool fn
@@ -2054,8 +2079,9 @@ class TypeChecker:
         if not self.slots_only:
             self.errors.append(TypeError(message, span))
 
-    def _slot_error(self, message: str, span: Optional[rast.Span]):
-        self.errors.append(TypeError(message, span))
+    def _slot_error(self, message: str, span: Optional[rast.Span],
+                    after_moves: bool = False):
+        self.errors.append(TypeError(message, span, after_moves))
 
 
 def check_ref_slots(module: rast.Module, emits_body,

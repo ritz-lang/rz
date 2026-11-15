@@ -280,12 +280,16 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
             if ownership_errors:
                 # `c` in a reference slot wants `@c`, not "cannot move out".
                 slot_errors = check_ref_slots(module, lambda fn: True, module_names)
-                for err in slot_errors:
+                explains = [err for err in slot_errors if not err.after_moves]
+                for err in explains:
                     print(f"Type error: {err}", file=sys.stderr)
-                if slot_errors:
+                if explains:
                     return False
                 for err in ownership_errors:
                     print(f"Ownership error: {err}", file=sys.stderr)
+                # The rest after it, as ritz1 prints them (#3189).
+                for err in slot_errors:
+                    print(f"Type error: {err}", file=sys.stderr)
                 return False
 
         # --- Incremental compilation: per-fn IR reuse ---
