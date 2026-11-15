@@ -15,7 +15,7 @@ Syntax features:
 
 from typing import List, Optional, Callable
 from tokens import Token, TokenType, Span, KEYWORDS
-from lexer import Lexer, LexerError
+from lexer import Lexer, LexerError, UNMATCHED_INDENT, relayout
 import ritz_ast as rast
 import index_rules
 from qualified_access import module_item_access_removed
@@ -107,9 +107,14 @@ class Parser:
     def __init__(self, tokens: List[Token]):
         self.tokens = tokens
         self.pos = 0
-        # Undo log for `>>`/`>=` splits performed in type-argument context.
-        # See _split_leading_gt(); entries are (index, original_token).
+        # Undo log for token-list rewrites made while parsing speculatively:
+        # `>>`/`>=` splits in type-argument context, (index, original_token)
+        # (see _split_leading_gt), and continuation relayouts, (None,
+        # previous_token_list) (see _continue_after_operator).
         self._angle_splits: List[tuple] = []
+        # Lines that continue an expression after a binary operator or `as`
+        # (LARB R46, AGAST #3387): they open and close no block.
+        self._continuations: set = set()
 
     def _current(self) -> Token:
         """Get the current token."""
@@ -179,7 +184,11 @@ class Parser:
         pos, split_depth = mark
         while len(self._angle_splits) > split_depth:
             index, original = self._angle_splits.pop()
-            self.tokens[index:index + 2] = [original]
+            if index is None:      # a continuation relayout
+                self.tokens, line = original
+                self._continuations.discard(line)
+            else:
+                self.tokens[index:index + 2] = [original]
         self.pos = pos
 
     def _split_leading_gt(self) -> bool:
@@ -864,6 +873,7 @@ class Parser:
             # Skip newlines after binary operator for multi-line expressions
             # e.g., `(a >= 1) or\n  (b <= 2)` continues on the next line
             self._skip_newlines()
+            self._continue_after_operator(op_tok)
 
             if op_tok.type == TokenType.AS:
                 # Cast expression: expr as Type
@@ -883,6 +893,52 @@ class Parser:
                 left = rast.BinOp(left.span, op_tok.value, left, right)
 
         return left
+
+    def _check_unmatched_indent(self, up_to_line: int | None) -> None:
+        """Raise the lexer's deferred unindent error, if any is left.
+
+        The lexer marks a line indented between two levels instead of
+        refusing it, because it may be a continuation (R46, #3387).  Once
+        parsing is done (or has failed at `up_to_line`), any marker still in
+        the tokens is a real error.
+        """
+        for tok in self.tokens:
+            if (tok.type == TokenType.INDENT and tok.value == UNMATCHED_INDENT
+                    and (up_to_line is None or tok.span.line <= up_to_line)):
+                raise LexerError(UNMATCHED_INDENT, tok.span)
+
+    def _continue_after_operator(self, op_tok: Token) -> None:
+        """Make the line after a line-ending operator a continuation (R46).
+
+        LARB R46 (spec §2.2, AGAST #3387): after a line ending in a binary
+        operator or `as`, the next line opens and closes no block, and must
+        be indented at least as far as the statement's first line.  The
+        lexer laid that line out as a block (an INDENT if deeper, DEDENTs if
+        shallower); only here is it known that `op_tok` was an operator, so
+        the layout is re-derived with the line marked as a continuation.  A
+        same-indent line (#2954) has no layout token and needs nothing.
+        """
+        if not self._at(TokenType.INDENT, TokenType.DEDENT):
+            return
+        if self.pos == 0 or self.tokens[self.pos - 1].type != TokenType.NEWLINE:
+            return
+        k = self.pos
+        while k < len(self.tokens) and self.tokens[k].type in (
+                TokenType.INDENT, TokenType.DEDENT):
+            k += 1
+        if k >= len(self.tokens) or self.tokens[k].type == TokenType.EOF:
+            return
+        line = self.tokens[k].span.line
+        if line == op_tok.span.line:
+            return
+        previous = self.tokens
+        self._continuations.add(line)
+        try:
+            self.tokens = relayout(previous, self._continuations)
+        except LexerError as e:
+            self._continuations.discard(line)
+            raise ParseError(e.message, e.span)
+        self._angle_splits.append((None, (previous, line)))
 
     def parse_prefix(self) -> rast.Expr:
         """Parse a prefix expression."""
@@ -2789,9 +2845,15 @@ class Parser:
         items = []
 
         self._skip_newlines()  # Skip leading newlines
-        while not self._at(TokenType.EOF):
-            items.append(self.parse_item())
-            self._skip_newlines()  # Skip newlines between items
+        try:
+            while not self._at(TokenType.EOF):
+                items.append(self.parse_item())
+                self._skip_newlines()  # Skip newlines between items
+        except ParseError as e:
+            # A bad unindent before the error is its cause.
+            self._check_unmatched_indent(e.span.line)
+            raise
+        self._check_unmatched_indent(None)
 
         items.extend(_enum_from_fns(items, span.file))
         return rast.Module(span, items)

@@ -20,6 +20,12 @@ from tokens import Token, TokenType, Span, KEYWORDS
 # RERITZ mode is now the ONLY mode - legacy mode has been removed
 
 
+# The value of the INDENT the lexer emits for a line indented less than its
+# block but not as far as any outer one.  An error unless the parser finds
+# the line continues an expression (R46, AGAST #3387).
+UNMATCHED_INDENT = "Unindent does not match any outer indentation level"
+
+
 class LexerError(Exception):
     """Lexer error with source location."""
     def __init__(self, message: str, span: Span):
@@ -126,7 +132,13 @@ class Lexer:
                 self.indent_stack.pop()
                 tokens.append(Token(TokenType.DEDENT, None, start_span))
             if self.indent_stack[-1] != indent:
-                raise LexerError(f"Unindent does not match any outer indentation level", start_span)
+                # Not an error yet: the line may continue an expression after
+                # a binary operator (R46, #3387), which only the parser can
+                # tell.  It gets a marked INDENT; the parser raises
+                # UNMATCHED_INDENT at it unless a relayout made it a
+                # continuation (Parser._check_unmatched_indent).
+                self.indent_stack.append(indent)
+                tokens.append(Token(TokenType.INDENT, UNMATCHED_INDENT, start_span))
 
         return tokens
 
@@ -723,6 +735,63 @@ class Lexer:
             if tok.type == TokenType.EOF:
                 break
         return tokens
+
+
+def relayout(tokens: list[Token], continuations: set[int]) -> list[Token]:
+    """Re-derive INDENT / DEDENT for `tokens`, given its continuation lines.
+
+    LARB R46 (spec §2.2, AGAST #3387): a line after one ending in a binary
+    operator or `as` opens and closes no block, and must be indented at
+    least as far as the statement's first line.  The lexer can't tell a
+    binary `>` / `>>` from a generic list's close (`fn f() -> Vec<T>` then
+    its body), so the parser, which can, names each continuation line (by
+    line number) and asks for the layout again.
+
+    Every non-layout token is kept as is; INDENT / DEDENT are dropped and
+    recomputed exactly as `Lexer._handle_indentation` does (same spans,
+    same UNMATCHED_INDENT marker), except that a
+    continuation line emits none, and one shallower than its statement is
+    an error.  With no continuations the result equals the lexer's own output
+    (pinned by test_deeper_continuation.py).
+    """
+    out: list[Token] = []
+    stack = [0]
+    at_line_start = True
+    for tok in tokens:
+        tt = tok.type
+        if tt in (TokenType.INDENT, TokenType.DEDENT):
+            continue
+        if tt == TokenType.EOF:
+            for _ in range(len(stack) - 1):
+                out.append(Token(TokenType.DEDENT, None, tok.span))
+            out.append(tok)
+            break
+        if tt == TokenType.NEWLINE:
+            at_line_start = True
+            out.append(tok)
+            continue
+        if at_line_start:
+            at_line_start = False
+            indent = tok.span.column - 1
+            start = Span(tok.span.file, tok.span.line, 1, 1)
+            if tok.span.line in continuations:
+                if indent < stack[-1]:
+                    raise LexerError(
+                        "continuation line is indented less than the "
+                        "statement it continues; indent it at least as "
+                        "far as the statement's first line", start)
+            elif indent > stack[-1]:
+                stack.append(indent)
+                out.append(Token(TokenType.INDENT, None, start))
+            elif indent < stack[-1]:
+                while stack[-1] > indent:
+                    stack.pop()
+                    out.append(Token(TokenType.DEDENT, None, start))
+                if stack[-1] != indent:
+                    stack.append(indent)
+                    out.append(Token(TokenType.INDENT, UNMATCHED_INDENT, start))
+        out.append(tok)
+    return out
 
 
 def tokenize(source: str, filename: str = "<stdin>") -> List[Token]:
