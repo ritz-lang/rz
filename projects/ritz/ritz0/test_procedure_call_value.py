@@ -257,6 +257,17 @@ REJECTED = {
         "    let fs: [1]fn(i64) = [g]\n"
         "    let x: i64 = fs[0](n)\n"
         "    x\n", None, 5),
+    # AGAST #3286: a fn pointer type spelled `-> void` returns nothing too.
+    "let_through_a_fn_pointer_spelled_void": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    let p: fn(i64) -> void = g\n"
+        "    let x: i64 = p(n)\n"
+        "    x\n", "p", 5),
+    "nameless_fn_pointer_spelled_void": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    let fs: [1]fn(i64) -> void = [g]\n"
+        "    let x: i64 = fs[0](n)\n"
+        "    x\n", None, 5),
     # AGAST #2246: `-> void` declares no value either.
     "let_of_a_call_spelled_void": (
         "fn g(n: i64) -> void\n"
@@ -283,6 +294,14 @@ REJECTED = {
 }
 
 ACCEPTED = {
+    # AGAST #3286: a call through `fn(..) -> void` is still a statement.
+    "statement_through_a_fn_pointer_spelled_void": (
+        _G + "fn f(n: i64) -> i64\n"
+        "    let p: fn(i64) -> void = g\n"
+        "    p(n)\n"
+        "    let fs: [1]fn(i64) -> void = [g]\n"
+        "    fs[0](n)\n"
+        "    n\n"),
     "let_of_a_call_with_a_value": (
         "fn h(n: i64) -> i64\n"
         "    n\n"
@@ -480,3 +499,15 @@ def test_ritz1_blames_a_generic_from_another_file_on_that_file(ritz1_bin, tmp_pa
     rc, output = _ritz1(ritz1_bin, tmp_path, _USES_LIB_GENERIC)
     assert rc != 0 and f"`lp` {MESSAGE}" in output, output[-1500:]
     assert "lib.ritz:4:" in output, output[-1500:]
+
+
+@pytest.mark.integration
+def test_ritz0_lowers_a_fn_pointer_spelled_void_as_one_with_no_return(tmp_path):
+    """AGAST #3286: `fn(i64) -> void` is `fn(i64)`, not a fn returning `i8`."""
+    rc, output = _ritz0(tmp_path, _G + "fn k(q: fn(i64), r: fn(i64) -> void)\n"
+                                       "    q(1)\n"
+                                       "    r(2)\n")
+    assert rc == 0, output[-1500:]
+    ir_text = (tmp_path / "unit.ll").read_text()
+    assert 'void (i64)* %"q.arg", void (i64)* %"r.arg"' in ir_text, ir_text[-1500:]
+    assert "call i8" not in ir_text, ir_text[-1500:]

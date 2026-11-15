@@ -1204,7 +1204,10 @@ class LLVMEmitter:
             # attribute itself goes on each indirect call (_fn_type_byval).
             param_types = [ir.PointerType(t) if self._sret_struct_type(t) is not None else t
                            for t in param_types]
-            ret_type = self._ritz_type_to_llvm(ty.ret) if ty.ret else self.void
+            # AGAST #3286: `-> void` is no return, not the `i8` a bare
+            # `void` names elsewhere, so `fn(T) -> void` is `fn(T)`.
+            ret_type = (self._ritz_type_to_llvm(ty.ret) if self._ret_is_a_value(ty.ret)
+                        else self.void)
             # AGAST #1745: a large struct return is an sret pointer, again as
             # in _new_function: `fn(i32) -> Big` is `void (%Big*, i32)*`.
             # The sret attribute and result slot come from each indirect call
@@ -5451,11 +5454,16 @@ class LLVMEmitter:
     @staticmethod
     def _declares_value(fn_def: Optional[rast.FnDef]) -> bool:
         """`fn_def` has a return type, and it is not spelled `-> void`."""
-        if fn_def is None or fn_def.ret_type is None:
-            return False
-        declared = fn_def.ret_type
-        return not (isinstance(declared, rast.NamedType)
-                    and declared.name == 'void')
+        return fn_def is not None and LLVMEmitter._ret_is_a_value(fn_def.ret_type)
+
+    @staticmethod
+    def _ret_is_a_value(declared: rast.Type | None) -> bool:
+        """A return type that yields a value: present, and not `void`.
+
+        Shared by a fn's declaration and a fn-pointer type (AGAST #3286),
+        so `fn(i64) -> void` is a procedure exactly as `fn(i64)` is."""
+        return declared is not None and not (
+            isinstance(declared, rast.NamedType) and declared.name == 'void')
 
     @staticmethod
     def _is_procedure(fn_def: Optional[rast.FnDef]) -> bool:
@@ -11899,7 +11907,7 @@ class LLVMEmitter:
                 # fn pointer too; the alias may carry a [[callconv]] (#1879).
                 ritz_type = resolve_alias_in(self.ritz_types[fname], self.type_aliases)
                 if isinstance(ritz_type, rast.FnType):
-                    if ritz_type.ret is None:   # AGAST #2260
+                    if not self._ret_is_a_value(ritz_type.ret):   # AGAST #2260, #3286
                         self._reject_procedure_value(call, fname)
                     # This is a function pointer - indirect call
                     # Get the function pointer value
@@ -11950,7 +11958,7 @@ class LLVMEmitter:
             if ritz_type is not None:
                 ritz_type = resolve_alias_in(ritz_type, self.type_aliases)
             if isinstance(ritz_type, rast.FnType):
-                if ritz_type.ret is None:   # AGAST #2260
+                if not self._ret_is_a_value(ritz_type.ret):   # AGAST #2260, #3286
                     self._reject_procedure_value(call, None)
                 for arg, param_type in zip(call.args, ritz_type.params):
                     self._literal_into_slot(param_type, arg)
