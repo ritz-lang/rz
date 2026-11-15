@@ -37,7 +37,7 @@ pub struct Sq
     a: i64
 
 impl Sq
-    fn area(self: *Sq) -> i64
+    pub fn area(self: *Sq) -> i64
         return 9
 """
 
@@ -68,31 +68,31 @@ pub struct Huge
     tag: i64
 
 impl Pt
-    fn sum(self: *Pt) -> i64
+    pub fn sum(self: *Pt) -> i64
         return self.x + self.y
 
-    fn narrow(self: *Pt, k: i32) -> i32
+    pub fn narrow(self: *Pt, k: i32) -> i32
         return self.x as i32 * k
 
-    fn is_origin(self: *Pt) -> bool
+    pub fn is_origin(self: *Pt) -> bool
         return self.x == 0 and self.y == 0
 
-    fn bump(self: *Pt, by: i64)
+    pub fn bump(self: *Pt, by: i64)
         self.x = self.x + by
 
-    fn swapped(self: *Pt) -> Pt
+    pub fn swapped(self: *Pt) -> Pt
         return Pt { x: self.y, y: self.x }
 
-    fn big(self: *Pt) -> Big
+    pub fn big(self: *Pt) -> Big
         return Big { a: self.x, b: self.y, c: 1, d: 2, e: 3 }
 
-    fn huge(self: *Pt) -> Huge
+    pub fn huge(self: *Pt) -> Huge
         var h: Huge
         h.pad[39] = self.y
         h.tag = 4
         return h
 
-    fn weigh(self: *Pt, h: Huge) -> i64
+    pub fn weigh(self: *Pt, h: Huge) -> i64
         return h.tag + h.pad[39] + self.x
 """
 

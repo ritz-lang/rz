@@ -101,7 +101,7 @@ def test_predicate_family_returns_bool(fname, fn):
 )
 def test_predicate_methods_return_bool(fname, method):
     src = (RITZLIB / fname).read_text()
-    m = re.search(rf"^\s+fn {method}\([^)]*\)\s*->\s*(\w+)", src, re.M)
+    m = re.search(rf"^\s+(?:pub )?fn {method}\([^)]*\)\s*->\s*(\w+)", src, re.M)
     assert m, f"method {method} not found in {fname}"
     assert m.group(1) == "bool", f"{fname} {method} returns {m.group(1)}"
 

@@ -77,10 +77,10 @@ pub fn add(a: i64, b: i32) -> i64
     a + b as i64
 
 impl Pt
-    fn sum(self: *Pt) -> i64
+    pub fn sum(self: *Pt) -> i64
         self.x + self.y
 
-    fn swapped(self: *Pt) -> Pt
+    pub fn swapped(self: *Pt) -> Pt
         Pt { x: self.y, y: self.x }
 
     pub fn bump(self: *Pt, by: i64)
@@ -105,9 +105,9 @@ pub struct Pt
 pub fn add(a: i64, b: i32) -> i64 = extern
 
 impl Pt
-    fn sum(self: *Pt) -> i64 = extern
+    pub fn sum(self: *Pt) -> i64 = extern
 
-    fn swapped(self: *Pt) -> Pt = extern
+    pub fn swapped(self: *Pt) -> Pt = extern
 
     pub fn bump(self: *Pt, by: i64) = extern
 """
