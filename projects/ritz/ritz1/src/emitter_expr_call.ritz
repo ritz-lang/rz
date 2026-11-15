@@ -12,6 +12,7 @@ import emitter_expr_access   # emit_whole_array_error (AGAST #2287)
 import emitter_expr_arith    # emit_nd_index_ptr (AGAST #3306)
 import narrowing
 import bool_check   # AGAST #2342
+import call_check   # call_check_arity, call_check_kind, call_check_method (AGAST #1629)
 import literal_slot # AGAST #2341
 import index_through # emit_through_elem_ptr (AGAST #2443)
 import monomorph     # array_arg_decode (AGAST #3029)
@@ -558,6 +559,7 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     if fn_def == null
         return -1
     note_method_callee(s, e, fn_def)   # AGAST #2237
+    call_check_method(s, e, fn_def, 1)   # AGAST #1629: the receiver fills the first param
     return emit_ufcs_call(s, e, fn_def, receiver_reg, recv_is_ptr_of_ptr, type_name, type_name_len)
 
 # The monomorphized UFCS helper `type_name.method` dispatches to
@@ -4496,6 +4498,10 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         if fn_def == null
             fn_def = find_impl_method_by_symbol(s.module, full_name, full_len)
         fn_def = lent_self_call_view(s, fn_def)
+    # AGAST #1629: the argument count, then each argument's kind, as ritz0 says them.
+    var args_fit: i32 = 0
+    if fn_def != null and call_is_syscall_builtin(full_name, full_len) == 0 and call_check_arity(s, e.span.line, e.span.col, full_name, full_len, fn_def.params, e.args) == 0
+        args_fit = 1
 
     # Sized from the argument list (AGAST #1813): a fixed [16] dropped every
     # argument past the 16th.
@@ -4508,6 +4514,8 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     while arg2 != null
         check_struct_ptr_arg(s, e, e.func_name, e.func_name_len, arg_count + 1, arg2, ap)
         check_array_arg(s, e, e.func_name, e.func_name_len, arg_count + 1, arg2, ap)
+        if args_fit == 1
+            call_check_kind(s, full_name, full_len, arg_count + 1, arg2, ap)   # AGAST #1629
         arg_regs[arg_count] = emit_call_arg(s, arg2, ap)
         arg_count += 1
         if ap != null
@@ -6191,6 +6199,8 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 sib = sib.next
             if sm_method != null
                 note_method_callee(s, e, sm_method)   # AGAST #2237
+                if param_is_self(sm_method.params) == 0
+                    call_check_method(s, e, sm_method, 0)   # AGAST #1629: a static call
                 if refuse_array_return(s, e, sm_method) == 1
                     return 0
                 # A receiver is what `self` takes, and a type isn't one, as in
@@ -6838,6 +6848,8 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     if mfn == null and refuse_no_method(s, e, type_name, type_name_len) == 1
         return 0
     note_method_callee(s, e, mfn)   # AGAST #2237
+    if mfn != null
+        call_check_method(s, e, mfn, param_is_self(mfn.params))   # AGAST #1629
     if refuse_array_return(s, e, mfn) == 1
         return 0
     if refuse_receiver_short_of_self(s, recv, mfn, recv_levels) == 1

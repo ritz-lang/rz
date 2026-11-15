@@ -49,6 +49,7 @@ SOURCES = \
 	enum_as_int \
 	must_use \
 	bool_check \
+	call_check \
 	literal_slot \
 	float_slot \
 	tail_value \
