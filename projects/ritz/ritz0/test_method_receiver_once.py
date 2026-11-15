@@ -372,6 +372,23 @@ pub fn main() -> i32
     return c8(Span.empty()) * 100 + c64(@a) as i32
 """, 122, {}),
 
+    # A built-in slice's result is the receiver's own Span<T> where no slot
+    # names it (AGAST #3161): chained, a slice of a slice, and through an
+    # untyped let.  slice(1, 3) of `[1, 2, 3, 4]` is `[2, 3]` and slice(2, 3)
+    # of all four `[3]`: (2 + 3 * 1) * 40, then 2 * 10 + 2.
+    "span_slice_untyped": ("""\
+fn c(s: Span<i64>) -> i64
+    return s.slice(1, 3).len() + s.slice(0, 4).slice(2, 3).len() * 3
+
+fn d(s: Span<i64>) -> i64
+    let t = s.slice(1, 3)
+    return *t.ptr() * 10 + t.len
+
+pub fn main() -> i32
+    var a: [4]i64 = [1, 2, 3, 4]
+    return (c(@a) * 40 + d(@a)) as i32
+""", 222, {}),
+
     # With ritzlib.span imported, its own `is_empty` and `slice` are called
     # (and the built-in `ptr`, which it doesn't define): 2 * 10, then 1 + 1.
     "span_param_ritzlib": ("""\
