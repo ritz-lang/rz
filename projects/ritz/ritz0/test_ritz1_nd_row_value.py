@@ -15,9 +15,12 @@ annotation would declare.
 Each program copies a row, writes the copy and the source, and checks that
 neither write reached the other: a binding that aliased the row, or a copy
 of the wrong row / stride, returns a small code instead of 42.  ritz0 is the
-oracle.  A row of a rank-3 array (`g[1]` of `[2][2][3]T`) is itself N-D and
-stays ritz1's refusal, as any N-D local initializer is; a Drop leaf's row is
-refused by both, as moving out of an array element.
+oracle.  A Drop leaf's row is refused by both, as moving out of an array
+element.
+
+AGAST #3350: a row that is itself N-D, a plane (`g[1]` of `[2][2][3]T` is a
+`[2][3]T`), is copied the same way, unannotated or annotated: ritz1 had no
+N-D local initializer from an index chain, so it was the "not a value" error.
 """
 
 import pytest
@@ -170,6 +173,137 @@ def test_drop_row_is_not_moved_out(compile_with, form, compiler):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, (
         f"{compiler} moved a Drop row out of its array ({form})"
+    )
+    assert not ll.exists()
+    assert where in out and MOVE_OUT_OF_ELEMENT in out, out
+
+
+# AGAST #3350: a plane, a row that is itself N-D.  Where the rank-3 array
+# lives and how a plane of it is spelled, as BASES.
+PLANE_BASES = {
+    "local": ("", "    var g: [2][2][3]{t}\n", "g[{i}]"),
+    "global": ("var g: [2][2][3]{t}\n\n", "", "g[{i}]"),
+    "field": (
+        "struct H\n    n: i32\n    m: [2][2][3]{t}\n\n",
+        "    var h: H\n    h.n = 5\n",
+        "h.m[{i}]",
+    ),
+    # The inner plane of a rank-4 array: `x[1][0]` of `[2][2][2][3]T`.
+    "inner_4d": ("", "    var x: [2][2][2][3]{t}\n", "x[1][{i}]"),
+}
+
+PLANE_FORMS = {
+    "let": "    let c = {row}\n",
+    "var": "    var c = {row}\n",
+    "let_annotated": "    let c: [2][3]{t} = {row}\n",
+    "var_annotated": "    var c: [2][3]{t} = {row}\n",
+}
+
+
+def _plane_program(elem: str, base: str, form: str) -> str:
+    """Fill planes 0 and 1, copy plane 1 into `c`, write both sides.
+
+    Cell (p, i, j) holds 20*p + 5*i + j + 1 (in `.b` for a struct): every
+    plane, row and column differs, so a wrong plane, row stride or leaf
+    stride reads a wrong value.
+    """
+    pre, top, spell = PLANE_BASES[base]
+    t = "S" if elem == "struct" else "i32"
+    f = ".b" if elem == "struct" else ""
+    src = spell.format(i=1)
+    out = (_S if elem == "struct" else "") + pre.format(t=t)
+    out += "pub fn main() -> i32\n" + top.format(t=t)
+    for p in range(2):
+        for i in range(2):
+            for j in range(3):
+                cell = spell.format(i=p) + f"[{i}][{j}]"
+                if elem == "struct":
+                    out += f"    {cell}.a = 1\n"
+                out += f"    {cell}{f} = {20 * p + 5 * i + j + 1}\n"
+    out += PLANE_FORMS[form].format(row=src, t=t)
+    # The copy holds plane 1, every row of it ...
+    out += f"    if c[0][0]{f} != 21 or c[0][2]{f} != 23 or c[1][0]{f} != 26 or c[1][2]{f} != 28\n        return 3\n"
+    # ... and a write to the source plane doesn't reach it ...
+    out += f"    {src}[1][2]{f} = 50\n"
+    out += f"    if c[1][2]{f} != 28\n        return 4\n"
+    if form.startswith("var"):
+        # ... nor a write to a `var` copy the source.
+        out += f"    c[1][1]{f} = 99\n"
+        out += f"    if {src}[1][1]{f} != 27 or c[1][1]{f} != 99\n        return 5\n"
+    # Plane 0 is untouched by all of it.
+    p0 = spell.format(i=0)
+    out += f"    if {p0}[0][0]{f} != 1 or {p0}[1][2]{f} != 8\n        return 6\n"
+    return out + f"    return c[0][0]{f} + 21\n"
+
+
+# Every form on a local, scalar and struct leaf: the binding paths.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(PLANE_FORMS))
+@pytest.mark.parametrize("elem", ["scalar", "struct"])
+def test_plane_copy_forms(run_with, elem, form, compiler):
+    program = _plane_program(elem, "local", form)
+    assert run_with(compiler, f"plane_copy_{elem}_{form}", program) == 42
+
+
+# The unannotated `var` over every other base the plane is spelled on.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("base", ["field", "global", "inner_4d"])
+@pytest.mark.parametrize("elem", ["scalar", "struct"])
+def test_plane_copy_bases(run_with, elem, base, compiler):
+    program = _plane_program(elem, base, "var")
+    assert run_with(compiler, f"plane_base_{elem}_{base}", program) == 42
+
+
+# A plane whose shape doesn't match the annotation is refused by both.
+_PLANE_MISMATCH = """\
+pub fn main() -> i32
+    var g: [2][2][3]i32
+    let c: [3][2]i32 = g[1]
+    return c[0][0]
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_plane_shape_mismatch_refused(compile_with, compiler):
+    comp, ll, _ = compile_with(compiler, "plane_mismatch", _PLANE_MISMATCH)
+    assert comp.returncode != 0, f"{compiler} copied a [2][3] plane into a [3][2]"
+    assert not ll.exists()
+
+
+# A Drop leaf's plane is move-only, as its row is: refused at the plane.
+_DROP_PLANE = """\
+struct S
+    x: i32
+
+impl Drop for S
+    fn drop(self:& S)
+        self.x = 0
+
+pub fn main() -> i32
+    var g: [2][2][2]S
+    g[1][1][1].x = 2
+BIND"""
+
+DROP_PLANE_FORMS = {
+    "let": "    let t = ^g[1]\n    return t[1][1].x\n",
+    "let_annotated": "    let t: [2][2]S = ^g[1]\n    return t[1][1].x\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(DROP_PLANE_FORMS))
+def test_drop_plane_is_not_moved_out(compile_with, form, compiler):
+    marked = _DROP_PLANE.replace("BIND", DROP_PLANE_FORMS[form])
+    before = marked[: marked.index("^")]
+    where = f":{before.count(chr(10)) + 1}:{len(before) - before.rfind(chr(10))}:"
+    comp, ll, _ = compile_with(compiler, f"drop_plane_{form}", marked.replace("^", ""))
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, (
+        f"{compiler} moved a Drop plane out of its array ({form})"
     )
     assert not ll.exists()
     assert where in out and MOVE_OUT_OF_ELEMENT in out, out

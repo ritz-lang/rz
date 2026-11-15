@@ -1321,8 +1321,10 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         # global, field, plane pointer; the inner row of a deeper one): the
         # `[M]T` local `let r: [M]T = g[i]` declares, copied, as ritz0 binds
         # it.  The slot was i64 and the row the located "not a value" error.
-        # A row that is itself N-D, or a leaf naming no struct (#3141), keeps
-        # that error: no N-D local takes an initializer.
+        # A leaf naming no struct (#3141) keeps that error.
+        # AGAST #3350: a row that is itself N-D, a plane (`g[1]` of
+        # `[2][2][3]T`), is the `[2][3]T` local `let p: [2][3]T = g[1]`
+        # declares; emit_nd_array_init_copy copies it.
         else if stmt.var_init.kind == EXPR_INDEX
             var row_depth: i32 = 0
             let row_sh: *ArrayShape = nd_index_shape(s, stmt.var_init, @row_depth)
@@ -1334,6 +1336,16 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 stmt.var_array_elem_pointee = row_sh.leaf_pointee
                 stmt.var_type_name = row_sh.leaf_name
                 stmt.var_type_name_len = row_sh.leaf_name_len
+            else if row_sh != null and row_depth <= row_sh.rank - 2 and (row_sh.leaf_type != TYPE_STRUCT or row_sh.leaf_name_len > 0)
+                let plane_sh: *ArrayShape = nd_plane_shape(s, stmt.var_init)
+                var_type = TYPE_ARRAY
+                stmt.var_type = TYPE_ARRAY
+                stmt.var_array_size = plane_sh.dims[0]
+                stmt.var_array_elem_type = TYPE_ARRAY
+                stmt.var_array_elem_pointee = TYPE_VOID
+                stmt.var_array_shape = plane_sh
+                stmt.var_type_name = null
+                stmt.var_type_name_len = 0
 
     # AGAST #1666: untyped `let v = match ...`.  The merge phi's type is only
     # known once the arms are emitted (#1645: `%StrView`, `%Point`, or i64),
@@ -4897,15 +4909,23 @@ fn array_shapes_match(a: *ArrayShape, b: *ArrayShape) -> i32
 # one aggregate, or pointer-to-pointer when large (as emit_local_array_copy),
 # so the slot is a copy, never a view.  Returns 1 once handled (copied, or a
 # shape mismatch diagnosed) and 0, having emitted nothing, for any other value.
+# AGAST #3350: or a plane of a deeper one (`g[1]` of `[2][2][3]T`, any base
+# emit_nd_index_ptr takes), copied from the address that GEP gives.
 fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *Expr) -> i32
-    let src_sh: *ArrayShape = nd_array_base_shape(s, value)
+    var src_sh: *ArrayShape = nd_array_base_shape(s, value)
+    if src_sh == null
+        src_sh = nd_plane_shape(s, value)
     if src_sh == null
         return 0
     if array_shapes_match(src_sh, sh) == 0
         emit_ir_error(s, c"multi-dimensional array initializer's shape does not match the local array's")
         return 1
     var src_ptr: i32 = -1
-    if value.kind == EXPR_MEMBER
+    if value.kind == EXPR_INDEX
+        var pp: NdIndexPtr
+        emit_nd_index_ptr(s, value, @pp)
+        src_ptr = pp.reg
+    else if value.kind == EXPR_MEMBER
         var mr: MemberPtrResult
         emit_member_ptr(s, value, @mr)
         if mr.success != 1
