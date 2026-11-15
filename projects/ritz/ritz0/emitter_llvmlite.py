@@ -10353,6 +10353,14 @@ class LLVMEmitter:
                         # Global array - use two-level GEP [0, index] on the global
                         zero = ir.Constant(self.i32, 0)
                         return self.builder.gep(gvar, [zero, index])
+                elif self._is_const_array_name(name):
+                    # AGAST #3360: `PS[1].get()` lends the element read-only
+                    # (`self: @P`). Every mutable use of a const element is
+                    # refused before emission (#3337), so this address is
+                    # only ever read through.
+                    gvar, ty = self.const_arrays[name]
+                    zero = ir.Constant(self.i32, 0)
+                    return self.builder.gep(gvar, [zero, index])
                 elif name in self.params and rvalue_root:
                     # AGAST #3299: a let-bound array is an SSA value (`let g =
                     # h.m`, `m: [2][3]i32`).  The row `g[i]` of `g[i][j]` is

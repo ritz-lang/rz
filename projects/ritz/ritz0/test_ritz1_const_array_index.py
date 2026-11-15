@@ -165,9 +165,31 @@ pub fn main() -> i32
     return q.a
 """
 
+# AGAST #3360: a method on a const element.  A shared `self: @P` reads the
+# element in place, a by-value `self` a copy of it; ritz0 died with "Unknown
+# identifier: PS" and ritz1 said an unlocated "cannot determine receiver type".
+# 1 + 3 - 1 == 3 only when each call read its own element.
+STRUCT_ELEM_METHOD = """\
+struct P
+    a: i32
+
+const PS: [3]P = [P { a: 7 }, P { a: 1 }, P { a: 3 }]
+
+impl P
+    fn get(self: @P) -> i32
+        self.a
+    fn val(self) -> i32
+        self.a
+
+pub fn main() -> i32
+    var i: i64 = 2
+    PS[1].get() + PS[i].val() - PS[1].val()
+"""
+
 FORMS = {
     "i32_repro": I32_REPRO,
     "struct_elem": STRUCT_ELEM,
+    "struct_elem_method": STRUCT_ELEM_METHOD,
     "u8_repro": U8_REPRO,
     "multi_row_sum": MULTI_ROW_SUM,
     "u8_high_bit": U8_HIGH_BIT,
@@ -233,6 +255,14 @@ _CONST_HEAD = (
     "fn w(x:& i32)\n    x = 1\n\n"
     "pub fn main() -> i32\n    var i: i64 = 1\n"
 )
+# After main, so the statement stays on line 9.  A `self:&` or `self: @&P`
+# receiver lends the element mutably (AGAST #3360).
+_CONST_TAIL = (
+    "\nstruct P\n    a: i32\n\n"
+    "const PS: [2]P = [P { a: 1 }, P { a: 2 }]\n\n"
+    "impl P\n    fn bump(self:& P)\n        self.a = 5\n"
+    "    fn bump_ref(self: @&P)\n        self.a = 5\n"
+)
 _THROUGH = "cannot assign through const `{}`; it is read-only data"
 _BORROW = "cannot borrow const `{}` as mutable; it is read-only data"
 _ADDR = "cannot take the address of an element of const `{}`; it is read-only data"
@@ -246,6 +276,8 @@ CONST_PLACE_ERRORS = {
     "borrow_param": ("w(NS[0])", 7, _BORROW.format("NS")),
     "addr_elem": ("let q: *i32 = @NS[i]", 19, _ADDR.format("NS")),
     "addr_struct_elem": ("let p: *StrView = @KS[i]", 23, _ADDR.format("KS")),
+    "mut_receiver": ("PS[0].bump()", 5, _BORROW.format("PS")),
+    "mut_ref_receiver": ("PS[i].bump_ref()", 5, _BORROW.format("PS")),
 }
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
@@ -257,7 +289,7 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 def test_const_array_place_refused(request, compiler: str, name: str, tmp_path: Path) -> None:
     stmt, col, message = CONST_PLACE_ERRORS[name]
     src = tmp_path / "unit.ritz"
-    src.write_text(_CONST_HEAD + f"    {stmt}\n    0\n")
+    src.write_text(_CONST_HEAD + f"    {stmt}\n    0\n" + _CONST_TAIL)
     ll = tmp_path / "unit.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     if compiler == "ritz0":
@@ -275,28 +307,6 @@ def test_const_array_place_refused(request, compiler: str, name: str, tmp_path: 
     hits = re.findall(rf"unit\.ritz:9:{col}: (?:error: )?{re.escape(message)}", out)
     assert len(hits) == 1, f"{compiler}, {name}: want one {message!r} at 9:{col}:\n{out[-1500:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
-
-
-# A `self:&` receiver lends the element mutably (_check_let_implicit_mut_borrow).
-# ritz0-only: ritz1 can't type a const element's receiver yet, read or write,
-# and says so unlocated (#3360).
-MUT_RECEIVER = (
-    "struct P\n    a: i32\n\n"
-    "const PS: [2]P = [P { a: 1 }, P { a: 2 }]\n\n"
-    "impl P\n    fn bump(self:& P)\n        self.a = 5\n\n"
-    "pub fn main() -> i32\n    PS[0].bump()\n    0\n"
-)
-
-
-@pytest.mark.integration
-def test_ritz0_const_elem_mut_receiver_refused(tmp_path: Path) -> None:
-    src = tmp_path / "unit.ritz"
-    src.write_text(MUT_RECEIVER)
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = run_ritz0([str(src), "-o", str(tmp_path / "unit.ll")], cwd=tmp_path, env=env, timeout=300)
-    out = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "Traceback" not in out, out[-1500:]
-    assert "unit.ritz:11:5: cannot borrow const `PS` as mutable; it is read-only data" in out, out[-1500:]
 
 
 @pytest.mark.integration
