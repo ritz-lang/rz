@@ -41,6 +41,11 @@ FIELD = (f"{HEADER}struct H\n    a: [4]i32\n\npub fn main() -> i32\n"
          "    var h = H { a: [10, 20, 30, 40] }\n    let t = h.a[1..3]\n    return t[0]\n")
 CALL = (f"{HEADER}fn g() -> *i32\n    return null\n\npub fn main() -> i32\n"
         "    let t = g()[1..3]\n    return t[0]\n")
+# AGAST #2536: the raw-pointer range typed as an element pointer (#1975) is gone,
+# so a dereferenced or compared one is the same single refusal as a bare one.
+RAW_DEREF = RAW_POINTER.replace("let t = p[1..3]\n    return t[0]", "let t = *(p[1..3])\n    return t")
+RAW_COMPARE = RAW_POINTER.replace("let t = p[1..3]\n    return t[0]",
+                                  "let t = p[1..3] != p + 1\n    return 0")
 
 CASES = {
     "array": (ARRAY_LOCAL, "an array can't be sliced"),
@@ -48,6 +53,8 @@ CASES = {
     "field": (FIELD, "an array can't be sliced"),
     "call": (CALL, "a pointer can't be sliced"),
     "raw_pointer": (RAW_POINTER, "a pointer can't be sliced"),
+    "raw_pointer_deref": (RAW_DEREF, "a pointer can't be sliced"),
+    "raw_pointer_compare": (RAW_COMPARE, "a pointer can't be sliced"),
     "pointer_to_pointer": (POINTER_TO_POINTER, "a pointer to a pointer can't be sliced"),
     "pointer_to_array": (POINTER_TO_ARRAY, "a pointer to an array can't be sliced"),
 }
@@ -56,7 +63,7 @@ CASES = {
 def _where(program):
     """main.ritz line:col of the slice's base, as all three locate an index."""
     for n, line in enumerate(program.splitlines(), 1):
-        m = re.search(r"let t = ([\w.()]+)\[", line)
+        m = re.search(r"let t = [*(]*([\w.()]+)\[", line)
         if m:
             return n, m.start(1) + 1
     raise AssertionError("no slice in the program")
