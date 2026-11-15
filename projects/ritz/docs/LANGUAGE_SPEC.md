@@ -3160,8 +3160,8 @@ fn main() -> i32
 
 Unlike a bare constructor, an untyped `let` doesn't look at the fn's return
 type: it has no slot, so its literal takes the field values' types. ritz0
-implements this (#3407); ritz1 refuses an args-less literal until #3408
-(#3311).
+(#3407) and ritz1 (#3408) implement this; before them, each refused an
+args-less literal (#3311).
 
 ### 9.3 Field Access
 

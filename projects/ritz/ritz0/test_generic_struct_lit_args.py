@@ -23,7 +23,11 @@ LARB R51 (AGAST #3314) rules that the literal infers them, and ritz0 does
 
 The inferred args are the literal's `type_args`, as if written, so the move
 checker sees `Box2 { v: <a Drop T> }` move (test_ownership_drops_ritz0).
-ritz1 still refuses until #3408, so REFUSED runs on the two ritz1 binaries.
+ritz1 and ritz1_selfhosted infer them the same way (#3408): generic_infer's
+gi_struct_lit_args renames the literal to the instance, `Box2$u8`, before
+monomorph, as if spelled out.  #3311's refused rows (an untyped let, a typed
+let, a tail, an argument, two params, a generic fn, an `impl<X>` method, the
+built-in Span) are each an INFERS row now.
 
 Each row separates a path (docs/TESTING.md, "What a ritz0 pytest case costs").
 """
@@ -45,47 +49,13 @@ RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
-RITZ1S = ["ritz1", "ritz1_selfhosted"]  # still refuse: #3408
 
 # Lines 1-7: a plain struct, a one- and a two-parameter generic struct.
 HEAD = ("struct T\n    id: i32\n"
         "struct Box2<X>\n    v: X\n"
         "struct Two<A, B>\n    a: A\n    b: B\n")
 
-# ritz1's refusal (#3311) until #3408.
-# name -> (source after HEAD, line:col of the literal, struct, its args)
-REFUSED = {
-    # The ticket's: an untyped let.
-    "untyped_let": ("fn main() -> i32\n    var b = Box2 { v: T { id: 1 } }\n    b.v.id\n",
-                    "9:13", "Box2", "X"),
-    # A typed let, a fn's tail, a call's argument: each slot names the
-    # instance, and still the literal doesn't.  ritz1 wrote `alloca %Box2`
-    # for the argument.
-    "typed_let": ("fn main() -> i32\n    let b: Box2<i32> = Box2 { v: 3 }\n    b.v\n",
-                  "9:24", "Box2", "X"),
-    "tail": ("fn mk() -> Box2<i32>\n    Box2 { v: 3 }\nfn main() -> i32\n    mk().v\n",
-             "9:5", "Box2", "X"),
-    "argument": ("fn f(b: Box2<i32>) -> i32\n    b.v\nfn main() -> i32\n"
-                 "    f(Box2 { v: 3 })\n", "11:7", "Box2", "X"),
-    # Every parameter is named in the advice.
-    "two_parameters": ("fn main() -> i32\n    let t = Two { a: 1, b: 2 }\n    t.a\n",
-                       "9:13", "Two", "A, B"),
-    # A generic fn's template: refused even with no instance of g.
-    "generic_fn": ("fn g<U>(x: U) -> Box2<U>\n    Box2 { v: x }\nfn main() -> i32\n    0\n",
-                   "9:5", "Box2", "X"),
-    # An `impl<X>` method (#3310's args-less spelling).
-    "impl_method": ("impl<X> Box2<X>\n    fn again(self: @Box2<X>) -> Box2<X>\n"
-                    "        Box2 { v: self.v }\nfn main() -> i32\n    0\n",
-                    "10:9", "Box2", "X"),
-    # The built-in Span<T>, with no `import ritzlib.span` (AGAST #3357):
-    # ritz0 raised a Python ValueError ("Unknown struct: Span").  #3346
-    # built the spelled-out `Span<u8> { .. }`, test_span_builtin_no_import.
-    "builtin_span": ("fn main() -> i32\n    var a: [3]u8 = [1, 2, 3]\n"
-                     "    let s: Span<u8> = Span { ptr: @a[0], len: 3 }\n    0\n",
-                     "10:23", "Span", "T"),
-}
-
-# ritz0 infers (LARB R51).  `sizeof(b.v)` tells the instance: 1 for u8, 2 for
+# Each compiler infers (LARB R51).  `sizeof(b.v)` tells the instance: 1 for u8, 2 for
 # u16, 8 for i64.  name -> (source after HEAD, exit code)
 INFERS = {
     # Rule 1, each slot.  A literal `3` alone is an i64 (83); the slot makes it a u8.
@@ -113,6 +83,13 @@ INFERS = {
                    "    let w = Box2<Box2<u16>> { v: Box2 { v: 1 } }\n"
                    "    sizeof(o.b.v) as i32 * 10 + o.b.v as i32 + sizeof(w.v.v) as i32 * 100\n",
                    218),
+    # ...where only the field names it: `Tagged`'s fields don't mention X, so
+    # without the slot each literal is rule 3's error.  (slot_field's sizeof
+    # reads the outer field's type, so it can't see an inner Box2<i64>.)
+    "slot_field_only": ("struct Tagged<X>\n    n: i32\nstruct Holder\n    t: Tagged<u8>\n"
+                        "fn main() -> i32\n    let h = Holder { t: Tagged { n: 1 } }\n"
+                        "    let b = Box2<Tagged<u16>> { v: Tagged { n: 2 } }\n"
+                        "    h.t.n + b.v.n * 10\n", 21),
     # Rule 2: an untyped let, from a typed value and a struct value.
     "untyped_from_field": ("fn main() -> i32\n    let x: u16 = 7\n    let a = Box2 { v: x }\n"
                            "    var b = Box2 { v: T { id: 1 } }\n"
@@ -157,6 +134,10 @@ INFER_ERRORS = {
     "unbound": ("struct Tagged<X>\n    n: i32\n"
                 "fn main() -> i32\n    let t = Tagged { n: 1 }\n    t.n\n", "11:13",
                 "can't infer `X` for `Tagged`: write its type arguments, `Tagged<X> { .. }`"),
+    # ...and the advice spells every param, the unbound one second.
+    "unbound_second": ("struct Tag2<A, B>\n    a: A\n    n: i32\n"
+                       "fn main() -> i32\n    let t = Tag2 { a: 1, n: 2 }\n    t.n\n", "12:13",
+                       "can't infer `B` for `Tag2`: write its type arguments, `Tag2<A, B> { .. }`"),
     # ...or two fields bind it differently.
     "conflict": ("struct Pair<X>\n    a: X\n    b: X\n"
                  "fn main() -> i32\n    let x: u8 = 1\n    let y: u16 = 2\n"
@@ -189,10 +170,6 @@ RUNS = {
                                 "    let u = Box2<u8> { v: 9 }\n"
                                 "    b.again().v * 10 + u.size()\n", 31),
 }
-
-
-def _message(name, args):
-    return f"`{name}` is generic: write its type arguments, `{name}<{args}> {{ .. }}`"
 
 
 def _emit(compiler, path, ll, work):
@@ -271,24 +248,20 @@ def _refused(compiler, tmp_path, src, where, message, name):
         f"{compiler}: {name}, wanted {where}: {message}:\n{src}\n{out[-2000:]}"
 
 
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(REFUSED))
-def test_an_argless_generic_literal_is_refused_at_it(tmp_path, need_ritz1, compiler, name):
-    need_ritz1(compiler)
-    body, where, struct, args = REFUSED[name]
-    _refused(compiler, tmp_path, HEAD + body, where, _message(struct, args), name)
-
-
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(INFERS))
-def test_ritz0_infers_an_argless_generic_literal(tmp_path, name):
+def test_an_argless_generic_literal_infers(tmp_path, need_ritz1, compiler, name):
+    need_ritz1(compiler)
     body, code = INFERS[name]
-    assert _run("ritz0", tmp_path, HEAD + body) == code, f"ritz0, {name}"
+    assert _run(compiler, tmp_path, HEAD + body) == code, f"{compiler}, {name}"
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(INFER_ERRORS))
-def test_ritz0_an_argless_literal_error_is_located(tmp_path, name):
+def test_an_argless_literal_error_is_located(tmp_path, need_ritz1, compiler, name):
+    need_ritz1(compiler)
     body, where, message = INFER_ERRORS[name]
-    _refused("ritz0", tmp_path, HEAD + body, where, message, name)
+    _refused(compiler, tmp_path, HEAD + body, where, message, name)
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

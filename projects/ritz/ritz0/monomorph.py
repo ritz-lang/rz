@@ -670,7 +670,7 @@ class Monomorphizer:
         (rule 3).  The args are written into `lit.type_args`, as if spelled
         out, so every later pass sees `Box2<i64> { .. }`.
 
-        #3311 refused the literal; ritz1 still does until #3408."""
+        #3311 refused the literal; ritz1's generic_infer infers it too (#3408)."""
         found = self._argless_struct(lit)
         if found is None:
             return
