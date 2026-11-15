@@ -51,7 +51,6 @@ LOCAL_MODULES = {
     "run_regression_matrix",
     "smoke",
     "smoke_stack",
-    "ab_test",
     "ritzgen_py",
 }
 
