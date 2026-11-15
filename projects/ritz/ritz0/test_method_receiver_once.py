@@ -279,8 +279,11 @@ CASES = {
     "array_rvalue_lent_drops_each": ("if lk(@mkt()) != 1\n        MADE = 50", 1, 2, {}),
     "array_rvalue_sret_drops_each": ("mkb()", 1, 2, {}),
     "elem_of_rvalue_sret_drops_each": ("if mkb()[1].peek() != 2\n        MADE = 50", 1, 2, {}),
-    # ritz0 drops none of an iterated one (AGAST #3284); ritz1 matches it.
-    "array_rvalue_iterated": ("for x in mkt()\n        x.peek()", 1, 0, {}),
+    # So does one a `for` walks, after the loop, however it's left (AGAST
+    # #3284). `x` is a copy of its element and drops nothing, as over a local.
+    "array_rvalue_iterated": ("for x in mkt()\n        x.peek()", 1, 2, {}),
+    "array_rvalue_iterated_break": (
+        "for x in mkt()\n        if x.peek() == 1\n            break", 1, 2, {}),
     # Inside an argument.
     "in_argument": ("take(mp().get())", 1, 0, {}),
     "in_a_borrowed_local": ("let t = mp().next()\n    look(@t)", 1, 0, {}),
