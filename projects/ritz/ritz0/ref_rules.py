@@ -88,6 +88,10 @@ MUT_SELF_ON_TEMP = "a method that writes `self` can't take a call's temporary: b
 # argument, where the temporary lives until that call returns (AGAST #2518, #3050).
 ADDR_OF_TEMP = "`@` of a call's temporary outlives it: bind the call to a local first, or pass it straight to a call"
 
+# `@N` of a `const N: i32`: a const scalar is inlined at every use, so it has
+# no storage to point at (LARB R48, spec §4.3).  A const array's `@A` is fine.
+CONST_SCALAR_ADDR = "cannot take the address of const `{}`; a const scalar has no storage"
+
 
 # `x.m(...)` on a user type with no `m` in an `impl` for it (or a trait impl):
 # method syntax reaches only impl methods, and the ritzlib types in the UFCS

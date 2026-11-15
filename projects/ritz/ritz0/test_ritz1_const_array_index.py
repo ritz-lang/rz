@@ -202,6 +202,61 @@ FORMS = {
     "scalar_const_index": SCALAR_CONST_INDEX,
 }
 
+# LARB R48 (AGAST #3391): `@A[i]` of a const array is a shared `@T` into its
+# read-only data, and `@A` is `@[N]T`.  #3337 refused both; these were the
+# `addr_*` rows of CONST_PLACE_ERRORS.  ritz0 only until #3392 (ritz1 still
+# refuses), which moves them into FORMS.  Each reads a different element or
+# field, so the wrong slot, a copy's garbage or a null base gives another code.
+ADDR_ELEM = """\
+const NS: [3]i32 = [10, 3, 30]
+
+fn rd(p: @i32) -> i32
+    *p
+
+pub fn main() -> i32
+    var i: i64 = 1
+    rd(@NS[i])
+"""
+
+ADDR_STRUCT_ELEM = """\
+const KS: [2]StrView = ["a", "abc"]
+
+fn ln(s: @StrView) -> i64
+    s.len
+
+pub fn main() -> i32
+    var i: i64 = 1
+    ln(@KS[i]) as i32
+"""
+
+# `@KS[i].len`: the field's place inside the element, an `@i64`.
+ADDR_ELEM_FIELD = """\
+const KS: [2]StrView = ["a", "abc"]
+
+pub fn main() -> i32
+    var i: i64 = 1
+    let p: @i64 = @KS[i].len
+    *p as i32
+"""
+
+# `@NS` of the whole table is `@[3]i32`: 10 - 30 + 23 == 3.
+ADDR_WHOLE = """\
+const NS: [3]i32 = [10, 23, 30]
+
+fn mix(a: @[3]i32) -> i32
+    a[0] - a[2] + a[1]
+
+pub fn main() -> i32
+    mix(@NS)
+"""
+
+ADDR_FORMS = {
+    "addr_elem": ADDR_ELEM,
+    "addr_struct_elem": ADDR_STRUCT_ELEM,
+    "addr_elem_field": ADDR_ELEM_FIELD,
+    "addr_whole": ADDR_WHOLE,
+}
+
 
 def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     """Compile `program` with `compiler`, link it, run it, return the exit code."""
@@ -233,10 +288,10 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(FORMS))
+@pytest.mark.parametrize("name", sorted(FORMS) + sorted(ADDR_FORMS))
 def test_ritz0_oracle(name: str, tmp_path: Path) -> None:
     """ritz0 is the reference: every program is written to exit 3."""
-    assert _run("ritz0", tmp_path, name, FORMS[name]) == 3
+    assert _run("ritz0", tmp_path, name, {**FORMS, **ADDR_FORMS}[name]) == 3
 
 
 # AGAST #3325: a const array is `internal constant` data, so a write into it
@@ -246,9 +301,8 @@ def test_ritz0_oracle(name: str, tmp_path: Path) -> None:
 # "Unknown identifier" traceback until #3337.  Each case is a located error on
 # all three compilers, in ritz1's words.
 #
-# `@NS[i]` (#3337) is refused too, for now: ritz1 said an unlocated "cannot
-# take address" and ritz0 had the same traceback.  Whether it should be a `*T`
-# into the read-only data is LARB's call (#3359); until then it's a located error.
+# `@NS[i]` is legal, a shared `@T` (LARB R48): ADDR_FORMS above.  `@&` of an
+# element stays refused here.
 _CONST_HEAD = (
     "const NS: [3]i32 = [10, 20, 30]\n"
     'const KS: [2]StrView = ["a", "c"]\n\n'
@@ -265,7 +319,6 @@ _CONST_TAIL = (
 )
 _THROUGH = "cannot assign through const `{}`; it is read-only data"
 _BORROW = "cannot borrow const `{}` as mutable; it is read-only data"
-_ADDR = "cannot take the address of an element of const `{}`; it is read-only data"
 
 # name -> (statement in main, line 9, column, message)
 CONST_PLACE_ERRORS = {
@@ -274,8 +327,6 @@ CONST_PLACE_ERRORS = {
     "compound": ("NS[1] += 1", 5, _THROUGH.format("NS")),
     "mut_borrow": ("let r: @&StrView = @&KS[0]", 24, _BORROW.format("KS")),
     "borrow_param": ("w(NS[0])", 7, _BORROW.format("NS")),
-    "addr_elem": ("let q: *i32 = @NS[i]", 19, _ADDR.format("NS")),
-    "addr_struct_elem": ("let p: *StrView = @KS[i]", 23, _ADDR.format("KS")),
     "mut_receiver": ("PS[0].bump()", 5, _BORROW.format("PS")),
     "mut_ref_receiver": ("PS[i].bump_ref()", 5, _BORROW.format("PS")),
 }
@@ -307,6 +358,34 @@ def test_const_array_place_refused(request, compiler: str, name: str, tmp_path: 
     hits = re.findall(rf"unit\.ritz:9:{col}: (?:error: )?{re.escape(message)}", out)
     assert len(hits) == 1, f"{compiler}, {name}: want one {message!r} at 9:{col}:\n{out[-1500:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
+
+
+# LARB R48: a const scalar is inlined, so `@N` has nothing to point at, unlike
+# a const array's `@A`.  ritz0 died with "Unknown variable: N".  ritz0 only:
+# ritz1's "cannot take address" has no location yet (#3392).
+SCALAR_ADDR = """\
+const N: i32 = 3
+
+fn rd(p: @i32) -> i32
+    *p
+
+pub fn main() -> i32
+    rd(@N)
+"""
+
+
+@pytest.mark.integration
+def test_ritz0_const_scalar_addr_refused(tmp_path: Path) -> None:
+    src = tmp_path / "unit.ritz"
+    src.write_text(SCALAR_ADDR)
+    ll = tmp_path / "unit.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Traceback" not in out, out[-1500:]
+    message = "cannot take the address of const `N`; a const scalar has no storage"
+    assert f"unit.ritz:7:8: {message}" in out, out[-1500:]
+    assert not ll.exists()
 
 
 @pytest.mark.integration

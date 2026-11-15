@@ -4042,19 +4042,6 @@ class LLVMEmitter:
                 f"cannot borrow `let` binding `{place[0]}` as mutable; declare it `var`",
                 operand.span)
 
-    def _check_const_elem_addr(self, expr: rast.UnaryOp) -> None:
-        """AGAST #3337: refuse `@A[i]` (or `@A[i].f`) of a const array.
-
-        Its element is `internal constant` data.  Whether `@` of it should be
-        a `*T` into that data is open (LARB); until then it's refused at the
-        `@`, in ritz1's words (let_check.ritz let_error_const_addr).
-        """
-        place = self._let_place(expr.operand, consts=True)
-        if place is not None and self._is_const_array_name(place[0]):
-            raise EmitError(
-                f"cannot take the address of an element of const `{place[0]}`; "
-                "it is read-only data", expr.span)
-
     @staticmethod
     def _is_mut_borrow_param(param: rast.Param) -> bool:
         """AGAST #2029: does `param` borrow its argument mutably?
@@ -10344,6 +10331,11 @@ class LLVMEmitter:
                 temp_alloca = self.builder.alloca(ty, name=f"{name}.addr")
                 self.builder.store(val, temp_alloca)
                 return temp_alloca
+            elif self._is_const_array_name(name):
+                # LARB R48: a const array's place is its read-only global.
+                # Every write and `@&` of it is refused before emission
+                # (#3337), so this address is only ever read through.
+                return self.const_arrays[name][0]
             else:
                 raise ValueError(f"Unknown variable: {name}")
         elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
@@ -10388,9 +10380,10 @@ class LLVMEmitter:
                         return self.builder.gep(gvar, [zero, index])
                 elif self._is_const_array_name(name):
                     # AGAST #3360: `PS[1].get()` lends the element read-only
-                    # (`self: @P`). Every mutable use of a const element is
-                    # refused before emission (#3337), so this address is
-                    # only ever read through.
+                    # (`self: @P`), and `@PS[i]` is an `@P` (LARB R48). Every
+                    # mutable use of a const element is refused before
+                    # emission (#3337), so this address is only ever read
+                    # through.
                     gvar, ty = self.const_arrays[name]
                     zero = ir.Constant(self.i32, 0)
                     return self.builder.gep(gvar, [zero, index])
@@ -11530,7 +11523,6 @@ class LLVMEmitter:
             if expr.op in ('&mut', '@&'):
                 self._check_let_mut_borrow(expr.operand, expr.span)
             if isinstance(expr.operand, (rast.Index, rast.Field)):
-                self._check_const_elem_addr(expr)
                 # `@m[k]` reads a struct through `index`, `@&m[k]` through
                 # `index_mut` (§7.8); a `.f` on it is the same use.
                 outer = self._index_use
@@ -11557,6 +11549,12 @@ class LLVMEmitter:
                     temp_alloca = self.builder.alloca(ty, name=f"{name}.addr")
                     self.builder.store(val, temp_alloca)
                     return temp_alloca
+                elif self._is_const_array_name(name):
+                    # LARB R48: `@A` is `@[N]T` into the read-only table.
+                    return self._emit_lvalue_addr(expr.operand)
+                elif name in self.constants:
+                    # LARB R48: a const scalar is inlined; it has no storage.
+                    raise EmitError(ref_rules.CONST_SCALAR_ADDR.format(name), expr.span)
                 else:
                     raise ValueError(f"Unknown variable: {name}")
             elif isinstance(expr.operand, rast.Index):
