@@ -654,8 +654,7 @@ pub fn main() -> i32
         return 2
     return (g[1][0].a as i32) + (g[1][0].c as i32) + (h[1][0][0].c as i32) + 18
 """,
-    # ... into a global, from a call's result.  (An element read as a whole
-    # value, `g[0][0] = g[2][1]`, is still refused: a separate gap.)
+    # ... into a global, from a call's result.
     "struct_elem_store_global": """\
 struct P
     a: i32
@@ -752,6 +751,168 @@ pub fn main() -> i32
     g[1][1] = q
     g[0][1] = S { x: 7 }
     return g[1][1].x + g[0][1].x + g[1][0].x + D
+""",
+    # AGAST #3306: a whole struct element read as a value loads the `%P` at
+    # the element's address, as #2099 stores one: element to element, into an
+    # annotated and an unannotated `let`, and a 3-D leaf.  P's fields differ
+    # in width, so a load at the wrong width or stride shows in a neighbour.
+    "struct_elem_load": """\
+struct P
+    a: u8
+    b: i64
+    c: i16
+
+pub fn main() -> i32
+    var g: [3][2]P
+    var h: [2][2][2]P
+    for i in 0..3
+        for j in 0..2
+            g[i][j].a = (i * 2 + j) as u8
+            g[i][j].b = 1099511627776
+            g[i][j].c = 1
+    g[2][1].c = 9
+    g[0][0] = g[2][1]
+    h[1][0][1] = g[1][1]
+    let i: i32 = 1
+    let p: P = g[i][0]
+    let q = h[1][0][1]
+    var r: P = g[0][0]
+    r.c = 2
+    if g[0][0].b != 1099511627776 or g[0][1].a != 1 or g[2][1].a != 5 or g[0][0].c != 9
+        return 1
+    if p.b != 1099511627776 or q.b != 1099511627776 or r.b != 1099511627776
+        return 2
+    return (g[0][0].a as i32) + (g[0][0].c as i32) + (p.a as i32) + (q.a as i32) + (r.c as i32) + 21
+""",
+    # ... of a global.
+    "struct_elem_load_global": """\
+struct P
+    a: i32
+    b: u8
+
+var g: [3][2]P
+var after: i32 = 10
+
+pub fn main() -> i32
+    g[2][1].a = 15
+    g[2][1].b = 2
+    g[0][0] = g[2][1]
+    let p: P = g[0][0]
+    let q = g[2][1]
+    return p.a + q.a + (p.b as i32) + after
+""",
+    # ... of an N-D field, of a local and through a pointer, and returned.
+    "struct_elem_load_field": """\
+struct P
+    a: i64
+    b: u8
+
+struct M
+    t: i32
+    m: [2][3]P
+    u: i8
+
+fn get(p: *M) -> P
+    return (*p).m[1][2]
+
+pub fn main() -> i32
+    var s: M
+    s.t = 1
+    s.u = 2
+    s.m[1][2].a = 11
+    s.m[1][2].b = 4
+    s.m[0][1] = s.m[1][2]
+    s.m[1][2].b = 7
+    let y: P = get(@s)
+    let z = s.m[0][1]
+    let pm: *M = @s
+    let w: P = (*pm).m[0][1]
+    return (y.a as i32) + (y.b as i32) + (z.b as i32) + (w.a as i32) + s.t + (s.u as i32) + 6
+""",
+    # ... as a by-value argument and a method receiver: by value (`self`) and
+    # mutating (`self:&`), which writes the element in place.
+    "struct_elem_load_call": """\
+struct P
+    a: i32
+    b: i16
+
+impl P
+    fn sum(self) -> i32
+        return self.a + (self.b as i32)
+    fn bump(self:& P, k: i32)
+        self.a = self.a + k
+
+struct M
+    m: [2][3]P
+
+fn take(p: P, k: i32) -> i32
+    return p.a * k + (p.b as i32)
+
+pub fn main() -> i32
+    var g: [2][2]P
+    g[1][0].a = 10
+    g[1][0].b = 2
+    g[0][1].a = 1
+    g[0][1].b = 3
+    g[0][1].bump(1)
+    var s: M
+    s.m[1][2].a = 1
+    s.m[1][2].b = 0
+    let pm: *M = @s
+    (*pm).m[1][2].bump(2)
+    return take(g[1][0], 3) + g[0][1].sum() + s.m[1][2].sum() + 2
+""",
+    # ... with a generic leaf, `P$i64`.
+    "struct_elem_load_generic": """\
+struct P<T>
+    v: T
+    k: u8
+
+struct W<T>
+    a: [2][3]P<T>
+
+pub fn main() -> i32
+    var w: W<i64>
+    w.a[1][1].v = 1099511627776
+    w.a[1][1].k = 40
+    w.a[0][2] = w.a[1][1]
+    let q: P<i64> = w.a[0][2]
+    let r = w.a[1][1]
+    if q.v != 1099511627776 or r.v != 1099511627776
+        return 1
+    return (q.k as i32) + 2 + 0 * (r.k as i32)
+""",
+    # ... of a Drop struct, through borrowing receivers: no read drops the
+    # element (D is still 0 in the scope: 3 + 5 + 0).  An N-D array of a Drop
+    # struct is not dropped at scope end either, on any compiler (#3305), so
+    # D stays 0 after it.  Moving one out by value is refused (FAIL_CLOSED).
+    "struct_elem_load_drop": """\
+var D: i32 = 0
+
+struct S
+    x: i32
+
+impl S
+    fn peek(self:@ S) -> i32
+        return self.x
+    fn bump(self:& S)
+        self.x = self.x + 1
+
+impl Drop for S
+    fn drop(self:& S)
+        D = D + self.x
+
+pub fn main() -> i32
+    var w: i32 = 0
+    if true
+        var g: [2][2]S
+        g[0][0].x = 0
+        g[1][0].x = 0
+        g[1][1].x = 2
+        g[1][1].bump()
+        g[0][1].x = 5
+        w = g[1][1].peek() + g[0][1].peek() + D * 100
+    return w + D + 34
 """,
 }
 
@@ -938,6 +1099,31 @@ pub fn main() -> i32
     g[1] = 0
     return 0
 """, ":3:", "assigning a row or a whole struct element"),
+    # AGAST #3306: a struct element is a value only where a struct goes.
+    "struct_elem_int_slot": ("""\
+struct P
+    a: i32
+
+pub fn main() -> i32
+    var g: [2][2]P
+    g[1][1].a = 3
+    return g[1][1]
+""", ":7:", "a whole struct is not a value here"),
+    # ... and a Drop one isn't moved out of the array that still drops it.
+    "struct_elem_drop_move": ("""\
+struct S
+    x: i32
+
+impl Drop for S
+    fn drop(self:& S)
+        self.x = 0
+
+pub fn main() -> i32
+    var g: [2][2]S
+    g[1][1].x = 2
+    let t: S = g[1][1]
+    return t.x
+""", ":11:", "cannot move out of an array element"),
     "whole_array_use": ("""\
 fn take(a: i64) -> i32
     return 0

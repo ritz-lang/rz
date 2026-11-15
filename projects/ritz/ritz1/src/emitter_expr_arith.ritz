@@ -1336,17 +1336,40 @@ fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
     return 1
 
 # The value of `e` = `g[i]..[k]` over an N-D array, in *out_reg.  Returns 0
-# when `e` is not an N-D index chain.  Only a full-depth chain to a scalar
-# leaf is a value; a row (`g[i]` of `[N][M]T`) or a struct leaf by value is
-# a located error rather than a guess at an aggregate load.
+# when `e` is not an N-D index chain.  Only a full-depth chain to a leaf is a
+# value; a row (`g[i]` of `[N][M]T`) is a located error rather than a guess
+# at an aggregate load (ritz0 refuses one too).
+#
+# AGAST #3306: a full-depth chain to a struct leaf loads the `%P` at the
+# element's address, as #2099 stores one: a copy only (`let p: P = g[i][j]`,
+# `g[0][0] = g[2][1]`, `f(g[i][j])`), as a 1-D `[N]S` element is (#2330).
+# A leaf naming no struct (a generic clone that kept `T`, #3141) stays the
+# located error: `load %T` would be invalid IR.
 fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
     var ndp: NdIndexPtr
     if emit_nd_index_ptr(s, e, @ndp) == 0
         return 0
     let sh: *ArrayShape = ndp.shape
-    if ndp.depth < sh.rank or sh.leaf_type == TYPE_STRUCT
+    var leaf_st: *StructDef = null
+    if sh.leaf_type == TYPE_STRUCT and sh.leaf_name_len > 0
+        leaf_st = find_struct(s, sh.leaf_name, sh.leaf_name_len)
+    if ndp.depth < sh.rank or (sh.leaf_type == TYPE_STRUCT and leaf_st == null)
         emit_nd_error(s, e.span.line, e.span.col, c"a row or a struct element of a multi-dimensional array is not a value in ritz1 (index every dimension, use .field, or take its address with @)")
         *out_reg = 0
+        return 1
+    if sh.leaf_type == TYPE_STRUCT
+        *out_reg = 0
+        if whole_struct_elem_refused(s, e) == 1
+            return 1
+        let sv: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sv)
+        emit_str(s, c" = load ")
+        emit_llvm_type_struct(s, TYPE_STRUCT, sh.leaf_name, sh.leaf_name_len)
+        emit_str(s, c", ptr ")
+        emit_reg(s, ndp.reg)
+        emit_str(s, c"\n")
+        *out_reg = sv
         return 1
     let ty: *u8 = local_array_elem_llvm(sh.leaf_type)
     let v: i32 = next_reg(s)
