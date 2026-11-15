@@ -2703,6 +2703,8 @@ class Parser:
                                type_param_bounds=type_param_bounds)
         if trait_name is not None:
             block.trait_span = first_tok.span   # §7.7's impl errors are located there
+        # Where the target's name is: "unknown type" is located there (#3264).
+        block.type_span = type_tok.span if trait_name is not None else first_tok.span
         return block
 
     def parse_item(self) -> rast.Item:

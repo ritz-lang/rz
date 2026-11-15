@@ -14,6 +14,7 @@
 import ast
 import ast_helpers
 import struct_index   # AGAST #1635
+import emitter_core   # is_simd_vector_type_name (AGAST #3264)
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
@@ -229,6 +230,55 @@ pub fn refuse_impls_on_builtin_types(m: *Module, path: *u8) -> i32
             eprints_cstr(c"` is a built-in type and can't be extended here: import ")
             sys_write(2, module, mod_len as i64)
             eprints_cstr(c" or declare your own type\n")
+            errors += 1
+        ib = ib.next
+    errors
+
+# AGAST #3264: an `impl` on a type nothing declares or imports is "unknown
+# type `Foo`", at the impl's type name.  `impl Foo` with no `struct Foo` /
+# `enum Foo` compiled and its methods were unreachable; so did `impl Vec<u8>`
+# without ritzlib.vec.  Known: a struct or enum of the merged module, a
+# `type` alias, a SIMD vector, or one of the impl's own type parameters.
+# `impl Self` is unknown: Self names no type outside an impl.  Two targets
+# never get here: an undeclared built-in (refuse_impls_on_builtin_types runs
+# first, and main stops on its errors) and a primitive (the grammar takes
+# only an IDENT as the target, and `i32` is a keyword: #3288).  ritz0 says
+# the same (ritz0/builtin_types.py, check_unknown_impl_targets).
+
+fn impl_has_type_param(ib: *ImplBlock, name: *u8, len: i32) -> i32
+    var tp: *TypeParam = ib.type_params
+    while tp != null
+        if tp.name_len == len and memcmp(tp.name, name, len as i64) == 0
+            return 1
+        tp = tp.next
+    0
+
+fn impl_target_known(m: *Module, ib: *ImplBlock) -> i32
+    let name: *u8 = ib.type_name
+    let len: i32 = ib.type_name_len
+    if module_declares_type(m, name, len) == 1 or type_alias_declared(name, len) == 1
+        return 1
+    if is_simd_vector_type_name(name, len) == 1
+        return 1
+    impl_has_type_param(ib, name, len)
+
+# Errors reported; `path` is the main file, for blocks it parsed.
+pub fn refuse_impls_on_unknown_types(m: *Module, path: *u8) -> i32
+    var errors: i32 = 0
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if impl_target_known(m, ib) == 0
+            if ib.def_file != null
+                eprints_cstr(ib.def_file)
+            else
+                eprints_cstr(path)
+            eprint_char(':')
+            eprint_i64(ib.type_span.line as i64)
+            eprint_char(':')
+            eprint_i64(ib.type_span.col as i64)
+            eprints_cstr(c": error: unknown type `")
+            sys_write(2, ib.type_name, ib.type_name_len as i64)
+            eprints_cstr(c"`\n")
             errors += 1
         ib = ib.next
     errors

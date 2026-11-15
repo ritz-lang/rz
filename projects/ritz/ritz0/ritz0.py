@@ -29,7 +29,7 @@ from import_resolver import ImportResolver, ImportError as RitzImportError
 import module_interface
 from name_resolver import resolve_names, NameError as RitzNameError
 from binder_names import check_binders
-from builtin_types import check_builtin_impls
+from builtin_types import check_builtin_impls, check_unknown_impl_targets
 from reachability import check_reachable
 from move_checker import MoveChecker, OwnershipError
 from type_checker import TypeChecker, TypeError as RitzTypeError, check_ref_slots
@@ -239,6 +239,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         # module declares (AGAST #3162).  After the merge, so an imported
         # `struct Span<T>` makes Span an ordinary struct.
         builtin_impl_errors = check_builtin_impls(module)
+        # ...and on a type nothing declares or imports (AGAST #3264).
+        builtin_impl_errors += check_unknown_impl_targets(module)
         if builtin_impl_errors:
             for err in builtin_impl_errors:
                 print(f"Error: {err}", file=sys.stderr)
