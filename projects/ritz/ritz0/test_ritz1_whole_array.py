@@ -961,6 +961,16 @@ pub fn main() -> i32
     s(@b)
     return b[3]
 """,
+    # An element of the array a call returns is a value, read from a spill
+    # (AGAST #3234); it was refused on both.
+    "ret_index": """\
+fn f() -> [4]i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    return a
+
+pub fn main() -> i32
+    return f()[3]
+""",
 })
 
 CASES.update(RETURNS)
@@ -1775,14 +1785,6 @@ fn g(a: [4]i32) -> i32
 
 pub fn main() -> i32
     return g([1, 2])
-""",
-    "ret_index": """\
-fn f() -> [4]i32
-    var a: [4]i32 = [0, 0, 0, 3]
-    return a
-
-pub fn main() -> i32
-    return f()[3]
 """,
 }
 

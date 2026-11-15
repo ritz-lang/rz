@@ -1519,11 +1519,81 @@ fn int_as_enum_refused(s: *EmitterState, e: *Expr) -> i32
 # Expression Emission - Single function to avoid mutual recursion
 # =============================================================================
 
+# AGAST #3234: the `f()[i]` of `e`'s field / index chain (or a method's
+# receiver's), `f` a call returning an array by value: `mka()[1].x`.  null if
+# there is none.  (`mv().a[1]` has none: emit_member_ptr spills `mv()`.)
+pub fn call_array_index_root(s: *EmitterState, e: *Expr) -> *Expr
+    if e.kind != EXPR_MEMBER and e.kind != EXPR_METHOD and e.kind != EXPR_INDEX
+        return null
+    var x: *Expr = e
+    if x.kind == EXPR_METHOD
+        x = x.left   # the receiver
+    while x != null and (x.kind == EXPR_INDEX or x.kind == EXPR_MEMBER)
+        let c: *Expr = x.left
+        if x.kind == EXPR_INDEX and c != null and (c.kind == EXPR_CALL or c.kind == EXPR_METHOD)
+            if x.right == null or x.right.kind == EXPR_RANGE or call_ret_array(s, c) == null
+                return null
+            return x
+        x = c
+    null
+
+var g_call_array_spills: i32 = 0
+
+# A fresh name `#aK` for the local emit_call_array_index spills to.
+fn call_array_local_name() -> *u8
+    g_call_array_spills = g_call_array_spills + 1
+    let name: *u8 = malloc(24)
+    *name = 35   # '#': no identifier has one
+    *(name + 1) = 97   # 'a'
+    let len: i32 = 2 + fmt_i64_into(name + 2, g_call_array_spills as i64) as i32
+    *(name + len) = 0
+    name
+
+# AGAST #3234: an element of a call's by-value array is a value, read from a
+# spill as a field of a call's struct is (#2294).  The call is evaluated once,
+# into a hidden `[N]T` local `#aK`, and `e` is emitted with `#aK[i]` in place of
+# `f()[i]`, so every route a local array's element takes (a field, a method
+# whose `self` is shared, a copy) is this one's.  The node is put back after:
+# a generic body is emitted once per instantiation.  A store or `@&` into it,
+# and a mutating `self`, are refused before emission (ref_check, #2518).
+#
+# call_array_spill does the first half: it emits the call and puts the local
+# in `root.left`, returning the call for call_array_unspill to put back.
+pub fn call_array_spill(s: *EmitterState, root: *Expr) -> *Expr
+    let call: *Expr = root.left
+    let name: *u8 = call_array_local_name()
+    let len: i32 = strlen(name) as i32
+    let ra: *Param = call_ret_array(s, call)
+    let slot: i32 = emit_call_array_temp(s, call, ra)
+    add_local_full(s, name, len, slot, TYPE_ARRAY, ra.param_type_name, ra.param_type_name_len, TYPE_I64, ra.param_array_size, ra.param_array_elem_type)
+    let loc: *LocalVar = local_at(s, s.local_count - 1)
+    loc.array_elem_pointee = ra.param_array_elem_pointee
+    let id: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(id as *u8, 0, sizeof(Expr))
+    id.kind = EXPR_IDENT
+    id.span = call.span
+    id.ident_ptr = name
+    id.ident_len = len
+    root.left = id
+    call
+
+pub fn call_array_unspill(root: *Expr, call: *Expr)
+    root.left = call
+
+fn emit_call_array_index(s: *EmitterState, e: *Expr, root: *Expr) -> i32
+    let call: *Expr = call_array_spill(s, root)
+    let r: i32 = emit_expr(s, e)
+    call_array_unspill(root, call)
+    r
+
 fn emit_expr(s: *EmitterState, e: *Expr) -> i32
     # Safety check for null expression
     if e == null
         eprints_cstr(c"ERROR: emit_expr called with null expression!\n")
         return 0
+    let ca_root: *Expr = call_array_index_root(s, e)
+    if ca_root != null
+        return emit_call_array_index(s, e, ca_root)
     if e.kind == EXPR_INT_LIT
         let result: i32 = next_reg(s)
         emit_str(s, c"  ")

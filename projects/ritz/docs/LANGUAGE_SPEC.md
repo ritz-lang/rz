@@ -3825,7 +3825,10 @@ can be read: `mk().x`, `mk().n[1]`, and a method whose `self` is `@T` or by valu
 A store into it would be lost with it, so `mk().x = 1`, `mk().n[1] = 3`,
 `mk().x += 1`, and a method whose `self` is `@&T` or `:& T` (`mk().bump()`, the
 same store by its auto-borrow), are errors. A call returning `*T` gives the place it
-points at, which may be written.
+points at, which may be written. An element of a call's array result reads like a
+field of a call's struct result (AGAST #3234): `mka()[1].x`, `mka()[1].get()` and
+`mv().a[1].get()` read it, and `mka()[1].x = 3` or a `self: @&T` method on it is
+the same error.
 
 ```ritz expect-error="a store into a call's temporary is lost: bind the call to a local first"
 struct Counter

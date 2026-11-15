@@ -6539,6 +6539,10 @@ class LLVMEmitter:
                     ptr = self.builder.gep(base, [index])
                     val = self._convert_type(val, base.type.pointee)
                     self.builder.store(val, ptr)
+                elif (isinstance(base.type, ir.ArrayType)
+                        and isinstance(stmt.target.expr, (rast.Call, rast.MethodCall))):
+                    # `mka()[1] = v`: an element of a call's array (AGAST #3234).
+                    raise EmitError(ref_rules.STORE_INTO_TEMP, stmt.target.span)
                 else:
                     raise ValueError(f"Cannot index type: {base.type}")
             elif isinstance(stmt.target, rast.UnaryOp) and stmt.target.op == '*':
@@ -9368,6 +9372,14 @@ class LLVMEmitter:
                 elem_ptr = self.builder.gep(data_ptr, [index])
                 return self.builder.load(elem_ptr)
 
+        # The array a call returns (`mka()[1]`, AGAST #3234): read from a
+        # spill, as a `let` array is above.
+        if isinstance(base.type, ir.ArrayType) and isinstance(
+                expr.expr, (rast.Call, rast.MethodCall)):
+            slot = self._alloca_in_entry_block(base.type, "arr.val")
+            self.builder.store(base, slot)
+            base = slot
+
         # Get element type
         if isinstance(base.type, ir.PointerType):
             pointee = base.type.pointee
@@ -10196,6 +10208,20 @@ class LLVMEmitter:
                 return self.builder.gep(data_ptr, [index])
 
             base = self._emit_expr(expr.expr)
+            if isinstance(base.type, ir.ArrayType) and isinstance(
+                    expr.expr, (rast.Call, rast.MethodCall)):
+                # `mka()[1]`, an array returned by value: a read spills it,
+                # as `mk().n[1]` does (AGAST #3234); a store or `@` is into a
+                # temporary, as for a field of one (#2518, #3050).
+                if rvalue_root:
+                    self._evaluated_once[id(expr.expr)] = base
+                    slot = self._alloca_in_entry_block(base.type, "call.val")
+                    self.builder.store(base, slot)
+                    base = slot
+                elif self._lending_temp:
+                    base = self._lend_temp_slot(expr.expr, base)
+                else:
+                    raise TempPlace(expr.expr)
             if isinstance(base.type, ir.PointerType):
                 if isinstance(base.type.pointee, ir.ArrayType):
                     # AGAST #2330, LARB R9: `p[i]` on a `*[N]T`, `@[N]T` or `@&[N]T`
@@ -13329,12 +13355,20 @@ class LLVMEmitter:
         `pw(@w).p` reaches through the pointer `pw` returns, so it's a place
         in `*w`; `mw().p` is a part of the value `mw` returned, which has no
         address. Call after _evaluate_place_operands, which holds the root.
+
+        An element of an array in the value is as much a part of it as a
+        field (`mka()[1]`, `mv().a[1].p`, AGAST #3234); one behind a pointer
+        (`mq(@p)[1]`, `mwp().pp[1]`) is a place, and so are a name's elements.
         """
-        if not isinstance(expr, rast.Field):
+        if not isinstance(expr, (rast.Field, rast.Index)):
             return False
-        while isinstance(expr, rast.Field):
+        while isinstance(expr, (rast.Field, rast.Index)):
+            if isinstance(expr, rast.Index) and (
+                    isinstance(expr.index, rast.Range)
+                    or not isinstance(self._infer_ritz_type(expr.expr), rast.ArrayType)):
+                return False
             expr = expr.expr
-        if isinstance(expr, (rast.Ident, rast.Index)):
+        if isinstance(expr, rast.Ident):
             return False
         if isinstance(expr, rast.UnaryOp) and expr.op == '*':
             return False

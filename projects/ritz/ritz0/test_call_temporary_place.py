@@ -123,6 +123,13 @@ fn mo() -> O
     o.r.x = 1
     return o
 
+fn mra() -> [2]R
+    calls = calls + 1
+    var a: [2]R
+    a[1].x = 1
+    a[1].n[2] = 30
+    return a
+
 """
 
 # Line 1 of the body is this line of the program.
@@ -150,6 +157,11 @@ REFUSED = {
     # A field of the temporary is in it: the store is as lost (#2294).
     "mut_self_field_ref": ("^mo().r.bump()", ref_rules.MUT_SELF_ON_TEMP),
     "mut_self_field_borrow": ("^mo().r.tick()", ref_rules.MUT_SELF_ON_TEMP),
+    # So is an element of an array temporary (#3234): it reads as a field
+    # does, and a store into it is as lost.
+    "store_array_elem_field": ("^mra()[1].x = 3", ref_rules.STORE_INTO_TEMP),
+    "store_array_elem": ("var k: R\n^mra()[1] = k", ref_rules.STORE_INTO_TEMP),
+    "mut_self_array_elem": ("^mra()[1].bump()", ref_rules.MUT_SELF_ON_TEMP),
     # `@` that outlives the statement (#2518).
     "addr_let": ("let p: @R = ^@mk()\nif p.x != 1\n    return 1", ref_rules.ADDR_OF_TEMP),
     "addr_mut_let": ("let p: @&R = ^@&mk()\np.x = 2", ref_rules.ADDR_OF_TEMP),
@@ -192,6 +204,11 @@ RUNS = {
     "read_method": "if mk().get() != 1\n    return 1",
     # A read-only method on a field of one lends it from a spill (#2294).
     "read_method_field": "if mo().r.get() != 1\n    return 1",
+    # ...and so does one on an element of an array one (#3234).
+    "read_method_array_elem": "if mra()[1].get() != 1\n    return 1",
+    "read_array_elem_array": "if mra()[1].n[2] != 30\n    return 1",
+    "read_array_elem_copy": "let q = mra()[1]\nif q.x != 1\n    return 1",
+    "arg_array_elem": "if look(@mra()[1]) != 1\n    return 1",
     # `@` straight into a call's argument (#3050).
     "arg_whole": "if look(@mk()) != 1\n    return 1",
     "arg_mut": "if poke(@&mk()) != 6\n    return 1",

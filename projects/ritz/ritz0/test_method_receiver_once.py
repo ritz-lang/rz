@@ -143,6 +143,23 @@ fn idx() -> i64
     MADE = MADE + 1
     return 0
 
+# A by-value array result, alone and as a field (AGAST #3234).
+struct V
+    a: [2]P
+
+fn mka() -> [2]P
+    MADE = MADE + 1
+    return [P { x: 1 }, P { x: 2 }]
+
+fn mv() -> V
+    MADE = MADE + 1
+    return V { a: [P { x: 1 }, P { x: 2 }] }
+
+# The index 1, counted: MADE goes up by 10 per evaluation.
+fn one() -> i64
+    MADE = MADE + 10
+    return 1
+
 # Hand back what they were given, as a side effect in a place's root.
 fn mq(p: *P) -> *P
     MADE = MADE + 1
@@ -225,6 +242,16 @@ CASES = {
     # A field of an rvalue isn't a place: the rvalue is spilled and the
     # field lent from the spill (AGAST #2294).
     "field_of_rvalue": ("mw().p.get()", 1, 0, {}),
+    # So is an element of an array rvalue, alone or a field's (AGAST #3234):
+    # it's read from a spill, the call made once and the index taken once.
+    # A wrong element sets MADE to 50.
+    "elem_of_rvalue_field": ("if mka()[1].x != 2\n        MADE = 50", 1, 0, {}),
+    "elem_of_rvalue_lent": ("if mka()[1].get() != 2\n        MADE = 50", 1, 0, {}),
+    "elem_of_rvalue_value": ("if mka()[1].val() != 2\n        MADE = 50", 1, 0, {}),
+    "elem_of_rvalue_index_once": ("if mka()[one()].get() != 2\n        MADE = 50", 11, 0, {}),
+    "elem_of_rvalue_field_array": ("if mv().a[1].get() != 2\n        MADE = 50", 1, 0, {}),
+    "elem_of_rvalue_field_array_index_once": (
+        "if mv().a[one()].get() != 2\n        MADE = 50", 11, 0, {}),
     # Inside an argument.
     "in_argument": ("take(mp().get())", 1, 0, {}),
     "in_a_borrowed_local": ("let t = mp().next()\n    look(@t)", 1, 0, {}),
