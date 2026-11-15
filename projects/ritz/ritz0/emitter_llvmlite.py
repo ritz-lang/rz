@@ -7500,9 +7500,10 @@ class LLVMEmitter:
                 # 1.5 to 1 (#2094).
                 if float_ty is None:
                     self._reject_mixed_int_float_arms(if_expr, arm_types)
+                # All-int arms convert too, each on its own (#3313): merged
+                # at i64 first, `if c then k else 1` (k: i32) was refused
+                # as a lossy i64 -> f64.
                 if (float_ty is not None
-                        and any(isinstance(t, (ir.FloatType, ir.DoubleType))
-                                for t in arm_types)
                         and all(self._is_float_arm_convertible(t)
                                 for t in arm_types)):
                     target_type = float_ty
@@ -15407,16 +15408,15 @@ class LLVMEmitter:
     def _merge_arms_at_float(self, incoming: list, float_ty: ir.Type) -> Optional[ir.Value]:
         """Merge (value, exit_block) arms at `float_ty`, or None.
 
-        Only applies when some arm is already a float and every arm converts
-        the way the plain-form let does (_is_float_arm_convertible). All-int
-        arms keep the integer merge (LetStmt converts the result once), and
-        a non-numeric arm returns None so the caller's irreconcilable path
+        Applies when every arm converts the way the plain-form let does
+        (_is_float_arm_convertible), all-int arms included (#3313): each
+        converts as its own type, so an i32 arm next to an i64 literal is
+        not first widened to an i64 the annotation refuses as lossy. A
+        non-numeric arm returns None so the caller's irreconcilable path
         runs. Each conversion goes in the arm's own exit block, before its
         branch, so it dominates the phi.
         """
         types = [v.type for v, _ in incoming]
-        if not any(isinstance(t, (ir.FloatType, ir.DoubleType)) for t in types):
-            return None
         if not all(self._is_float_arm_convertible(t) for t in types):
             return None
         merge_block = self.builder.block

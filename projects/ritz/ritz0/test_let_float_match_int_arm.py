@@ -403,6 +403,106 @@ fn main() -> i32
     return 42
 """
 
+# AGAST #3313: every arm an integer, of differing types. ritz0 merged
+# `k` (i32) and `1` (i64) at i64, and the annotation then refused i64 -> f64
+# as lossy. Under the annotation each arm converts on its own (ritz1's rule),
+# so `k` converts as the exact i32 it is and the literal is exempt.
+ALL_INT_ARMS_IF = """\
+fn h(k: i32) -> f64
+    let a: f64 = if k > 3 then k else 1
+    return a
+
+fn g(k: i32) -> f64
+    let a: f64 = if k > 3 then 2 else k
+    return a
+
+fn s(k: i16) -> f32
+    let a: f32 = if k > 3 then k else 1
+    return a
+
+fn u(x: u32) -> f64
+    let a: f64 = if x > 3 then x else 1
+    return a
+
+fn main() -> i32
+    if h(5) != 5.0
+        return 1
+    if h(0) != 1.0
+        return 2
+    if g(5) != 2.0
+        return 3
+    if g(-7) != -7.0
+        return 4
+    if s(9) != 9.0
+        return 5
+    if s(-2) != 1.0
+        return 6
+    if u(4000000000) != 4000000000.0
+        return 7
+    return 42
+"""
+
+# The ticket's nested form: an all-int if as a match arm's tail.
+ALL_INT_ARMS_NESTED = """\
+import ritzlib.option
+
+fn f(o: Option<i32>) -> f64
+    let a: f64 = match o
+        None => 2
+        Some(k) => if k > 3 then k else 1
+    return a
+
+fn main() -> i32
+    if f(None) != 2.0
+        return 1
+    if f(Some(5)) != 5.0
+        return 2
+    if f(Some(0)) != 1.0
+        return 3
+    return 42
+"""
+
+# The match form, all integer arms of differing types. Each arm converts by
+# its own type: merged first, u32 and i16 widened to an i32 phi and 4e9 came
+# out negative. (A u32 *payload* binding still converts signed in ritz0: its
+# type is out of scope at the merge: AGAST #3332.)
+ALL_INT_ARMS_MATCH = """\
+import ritzlib.option
+
+fn f(o: Option<i16>) -> f64
+    let a: f64 = match o
+        None => 1
+        Some(x) => x
+    return a
+
+fn g(k: i64, x: u32, w: i16) -> f64
+    let a: f64 = match k
+        0 => x
+        1 => w
+        _ => 3
+    return a
+
+fn main() -> i32
+    let m: i16 = -9
+    if f(Some(m)) != -9.0
+        return 1
+    if f(None) != 1.0
+        return 2
+    if g(0, 4000000000, 5) != 4000000000.0
+        return 3
+    if g(1, 1, -5) != -5.0
+        return 4
+    if g(2, 1, 1) != 3.0
+        return 5
+    return 42
+"""
+
+ALL_INT_CASES = [
+    pytest.param(ALL_INT_ARMS_IF, 42, id="all-int-arms-if"),
+    pytest.param(ALL_INT_ARMS_NESTED, 42, id="all-int-arms-nested-match"),
+    pytest.param(ALL_INT_ARMS_MATCH, 42, id="all-int-arms-match"),
+]
+
 NESTED_CASES = [
     pytest.param(ELSE_IF_CHAIN, 42, id="else-if-chain"),
     pytest.param(NESTED_MATCH, 42, id="nested-match"),
@@ -478,7 +578,7 @@ def _ritz1_run(ritz1_bin: Path, tmp_path: Path, program: str):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("program,want", RUN_CASES + NESTED_CASES)
+@pytest.mark.parametrize("program,want", RUN_CASES + NESTED_CASES + ALL_INT_CASES)
 def test_ritz0_merges_arms_at_annotation_float(ritz0_oracle, program, want):
     res = ritz0_oracle(program)
     assert res.ir_ok, res.diagnostics[-3000:]
@@ -494,7 +594,7 @@ def test_ritz1_agrees(ritz1_bin, tmp_path, program, want):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("program,want", NESTED_CASES)
+@pytest.mark.parametrize("program,want", NESTED_CASES + ALL_INT_CASES)
 def test_ritz1_agrees_nested_tails(ritz1_bin, tmp_path, program, want):
     rc, diag = _ritz1_run(ritz1_bin, tmp_path, program)
     assert rc is not None, diag[-3000:]
@@ -529,3 +629,67 @@ def test_ritz1_rejects_pointer_arm(ritz1_bin, tmp_path):
     rc, diag = _ritz1_run(ritz1_bin, tmp_path, POINTER_ARM)
     assert rc is None
     assert "match arm yields a non-numeric value" in diag
+
+
+# --- AGAST #3313: an arm that really is lossy --------------------------------
+#
+# Converting per arm does not exempt a non-literal i64 arm: it is refused just
+# as `let a: f64 = x` is, in both compilers, whether its sibling is an i32
+# value, a literal, or the same match nested.
+
+LOSSY_I64_NEXT_TO_I32 = """\
+fn f(x: i64, k: i32) -> f64
+    let a: f64 = if k > 3 then k else x
+    return a
+
+fn main() -> i32
+    return f(1, 2) as i32
+"""
+
+LOSSY_I64_NEXT_TO_LITERAL = """\
+fn f(x: i64, k: i32) -> f64
+    let a: f64 = if k > 3 then x else 1
+    return a
+
+fn main() -> i32
+    return f(1, 2) as i32
+"""
+
+LOSSY_I64_NESTED = """\
+import ritzlib.option
+
+fn f(o: Option<i32>, x: i64) -> f64
+    let a: f64 = match o
+        None => 2
+        Some(k) => if k > 3 then k else x
+    return a
+
+fn main() -> i32
+    return f(None, 1) as i32
+"""
+
+LOSSY_CASES = [
+    pytest.param(LOSSY_I64_NEXT_TO_I32, id="i64-next-to-i32"),
+    pytest.param(LOSSY_I64_NEXT_TO_LITERAL, id="i64-next-to-literal"),
+    pytest.param(LOSSY_I64_NESTED, id="i64-nested-match"),
+]
+
+LOSSY_WORDS = "implicit conversion from `i64` to `f64` can lose precision"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("program", LOSSY_CASES)
+def test_ritz0_refuses_lossy_int_arm(run_ritz0, tmp_path, program):
+    comp = _ritz0_compile(run_ritz0, tmp_path, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert "Traceback" not in out, out
+    assert LOSSY_WORDS in out, out
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("program", LOSSY_CASES)
+def test_ritz1_refuses_lossy_int_arm(ritz1_bin, tmp_path, program):
+    rc, diag = _ritz1_run(ritz1_bin, tmp_path, program)
+    assert rc is None, "ritz1 accepted a lossy i64 arm"
+    assert LOSSY_WORDS in diag, diag
