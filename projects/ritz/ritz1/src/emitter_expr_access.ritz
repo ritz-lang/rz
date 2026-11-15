@@ -1796,6 +1796,43 @@ fn unknown_field_refused(s: *EmitterState, e: *Expr) -> i32
     df_no_field(s, e, st)
     return 1
 
+# AGAST #3362: `s.f` with `s` a local or param whose struct type is declared
+# nowhere (`var s: Foo`, or `String` with no `import ritzlib.string`).  It fell
+# to the unlocated "unhandled EXPR_MEMBER".  One located error at `s`, naming
+# the type, once per name in a row: a second access, or a `String` that #3347
+# already refused at its literal, is the same mistake and says nothing more.
+# Returns 1 when `e` is that case (reported now or before).
+fn unknown_struct_member_refused(s: *EmitterState, e: *Expr) -> i32
+    if e.left == null or e.left.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+    if loc == null or loc.var_type != TYPE_STRUCT or loc.type_name == null or loc.type_name_len <= 0
+        return 0
+    if find_struct(s, loc.type_name, loc.type_name_len) != null
+        return 0
+    if s.error_count > 0 and buf_eq(s.unknown_struct_name, s.unknown_struct_name_len, loc.type_name, loc.type_name_len) == 1
+        return 1
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(e.left.span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(e.left.span.col as i64)
+    eprints_cstr(c": error: `")
+    eprint_bytes(e.left.ident_ptr, e.left.ident_len)
+    eprints_cstr(c"` is a `")
+    eprint_bytes(loc.type_name, loc.type_name_len)
+    eprints_cstr(c"`, which names no declared struct: it has no field `")
+    eprint_bytes(e.ident_ptr, e.ident_len)
+    eprints_cstr(c"` (is an import missing?)\n")
+    s.error_count = s.error_count + 1
+    s.unknown_struct_name = loc.type_name
+    s.unknown_struct_name_len = loc.type_name_len
+    return 1
+
 fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
     # expr.field - member access on struct.
     #
@@ -1909,6 +1946,8 @@ fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
         else
             return val_reg
     if unknown_field_refused(s, e) == 1
+        return 0
+    if unknown_struct_member_refused(s, e) == 1   # AGAST #3362
         return 0
     emit_ir_error(s, c"unhandled EXPR_MEMBER")
 
