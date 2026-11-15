@@ -244,21 +244,11 @@ pub fn main() -> i32
 """,
 }
 
-# ritz0 cannot store into a 3+-deep nested generic field (AGAST #1575).
-# strict: the day ritz0 is fixed these XPASS and fail, so the mark gets removed.
-RITZ0_BROKEN = {"depth3", "depth4"}
-
-
-def _oracle_params():
-    for name in sorted(RUNNABLE):
-        marks = []
-        if name in RITZ0_BROKEN:
-            marks.append(pytest.mark.xfail(strict=True, reason="AGAST #1575"))
-        yield pytest.param(name, marks=marks)
+# ritz0 stores into a 3+-deep nested generic field since AGAST #3342 (#1575).
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", list(_oracle_params()))
+@pytest.mark.parametrize("name", sorted(RUNNABLE))
 def test_ritz0_is_the_oracle(tmp_path, name):
     """The reference answer. If this changes, the oracle moved, not ritz1."""
     assert _run("ritz0", tmp_path, name, RUNNABLE[name]) == EXPECTED

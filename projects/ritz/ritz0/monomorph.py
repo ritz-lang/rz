@@ -122,22 +122,34 @@ class TypeSubstitution:
     # Optional: generic struct names -> mangled names after substitution
     struct_manglings: Dict[str, Dict[Tuple[str, ...], str]] = None
 
+    def bare(self, ty: rast.Type) -> rast.Type:
+        """`ty` with the type parameters substituted, and no instance renamed.
+
+        This is the type an instance is keyed by: Box<Box<i32>> is keyed
+        `Box_i32`, as _type_args_to_key spells it, not by its renamed
+        argument `Box$i32` (AGAST #3080, #3342).
+        """
+        return TypeSubstitution(self.mapping).apply(ty)
+
     def apply(self, ty: rast.Type) -> rast.Type:
         """Apply substitution to a type, returning a new type."""
         if isinstance(ty, rast.NamedType):
             # Check if this is a type parameter
             if ty.name in self.mapping and not ty.args:
-                return copy.deepcopy(self.mapping[ty.name])
+                concrete = copy.deepcopy(self.mapping[ty.name])
+                # A parameter bound to an instance (T = Cell<Cell<i32>>) is
+                # renamed to it like a spelled-out one, or the generic type
+                # reaches the emitter, which finds no struct for it and lowers
+                # the field as i8 (AGAST #3342).
+                if self.struct_manglings:
+                    return TypeSubstitution({}, self.struct_manglings).apply(concrete)
+                return concrete
             # Otherwise, apply to any type arguments
             new_args = [self.apply(arg) for arg in ty.args]
 
             # If this is a generic struct with type args, mangle the name
             if new_args and self.struct_manglings and ty.name in self.struct_manglings:
-                # Create a key from the substituted type args, before their
-                # own mangling: Box<Box<i32>> is keyed `Box_i32`, as
-                # _type_args_to_key spells it, not `Box$i32` (AGAST #3080).
-                bare = TypeSubstitution(self.mapping)
-                args_key = tuple(mangle_type_name(bare.apply(arg)) for arg in ty.args)
+                args_key = tuple(mangle_type_name(self.bare(arg)) for arg in ty.args)
                 mangled = self.struct_manglings[ty.name].get(args_key)
                 if mangled:
                     return rast.NamedType(ty.span, mangled, [])
@@ -1862,8 +1874,8 @@ class Monomorphizer:
             if expr.type_args and isinstance(expr.func, rast.Ident):
                 fn_name = expr.func.name
                 if fn_name in self.generic_functions:
-                    # Apply substitution to type args first (e.g., T -> i32)
-                    substituted_type_args = [subst.apply(arg) for arg in expr.type_args]
+                    # Key on the bare substituted args (T -> i32), as every path does (#3342)
+                    substituted_type_args = [subst.bare(arg) for arg in expr.type_args]
                     key = (fn_name, self._type_args_to_key(substituted_type_args))
                     # If this instantiation doesn't exist yet, add it
                     # This handles transitive generic calls discovered during specialization
@@ -1884,8 +1896,8 @@ class Monomorphizer:
             # If this is a generic struct, rewrite to use mangled name
             struct_name = expr.name
             if expr.type_args and struct_name in self.generic_structs:
-                # Apply substitution to type args first (e.g., T -> i32)
-                substituted_type_args = [subst.apply(arg) for arg in expr.type_args]
+                # Key on the bare substituted args (T -> i32), as every path does (#3342)
+                substituted_type_args = [subst.bare(arg) for arg in expr.type_args]
                 key = (struct_name, self._type_args_to_key(substituted_type_args))
                 # If this instantiation doesn't exist yet, add it
                 if key not in self.struct_instantiations:
