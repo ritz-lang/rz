@@ -2796,6 +2796,8 @@ fn is_aesni_builtin(name: *u8, len: i32) -> i32
         return 1
     if name_eq(name, len, c"aesimc", 6) == 1
         return 1
+    if name_eq(name, len, c"aeskeygenassist", 15) == 1
+        return 1
     0
 
 # The simd_* builtins whose emitters (emit_simd_clmul, emit_simd_sad) always
@@ -3343,13 +3345,16 @@ fn emit_x86_intrinsic_v4i32(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_nam
 # bitcast to <2 x i64> on the way in, and the result is bitcast back to the
 # state operand's (first arg's) type.  An operand whose type cannot be
 # resolved is taken as v2i64, which is what this path emitted before.
-fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name_len: i32, arity: i32) -> i32
+# `imm8` >= 0 appends a trailing `i8 <imm8>` immediate after the `arity`
+# vector args (aeskeygenassist's rcon, AGAST #3266); -1 means none.  The
+# caller has already consumed that arg, so it is not walked here.
+fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_name_len: i32, arity: i32, imm8: i64) -> i32
     var arg_regs: [4]i32
     var arg_count: i32 = 0
     var res_name: *u8 = c"v2i64"
     var res_name_len: i32 = 5
     var arg_it: *Expr = e.args
-    while arg_it != null and arg_count < 4
+    while arg_it != null and arg_count < 4 and (imm8 < 0 or arg_count < arity)
         var reg: i32 = emit_expr(s, arg_it)
         var a_name: *u8 = null
         var a_len: i32 = 0
@@ -3391,6 +3396,9 @@ fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_nam
         emit_str(s, c"<2 x i64> ")
         emit_reg(s, arg_regs[k])
         k = k + 1
+    if imm8 >= 0
+        emit_str(s, c", i8 ")
+        emit_int(s, imm8)
     emit_str(s, c")\n")
     if name_eq(res_name, res_name_len, c"v2i64", 5) == 1
         return result
@@ -3403,6 +3411,25 @@ fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: *u8, llvm_nam
     emit_simd_vector_type(s, res_name, res_name_len)
     emit_str(s, c"\n")
     return cast_out
+
+# `aeskeygenassist(key, rcon)` (AGAST #3266) -> the key's vector type.  LLVM
+# declares rcon `immarg`: it must be a constant i8 in the call itself, so as
+# in ritz0 it has to be an integer literal (optionally cast), masked to a
+# byte.  Anything else is a compile error, not IR clang would refuse.
+fn emit_aeskeygenassist(s: *EmitterState, e: *Expr) -> i32
+    if e.args == null or e.args.next == null or e.args.next.next != null
+        emit_ir_error(s, c"aeskeygenassist() requires 2 arguments (key, rcon)")
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aeskeygenassist", 30, 2, -1)
+    let rcon: *Expr = e.args.next
+    var imm: i64 = -1
+    if rcon.kind == EXPR_INT_LIT
+        imm = rcon.int_val & 255
+    else if rcon.kind == EXPR_CAST and rcon.left != null and rcon.left.kind == EXPR_INT_LIT
+        imm = rcon.left.int_val & 255
+    if imm < 0
+        emit_ir_error(s, c"aeskeygenassist() second arg (rcon) must be an integer literal (LLVM i8 immediate)")
+        imm = 0
+    emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aeskeygenassist", 30, 1, imm)
 
 fn emit_mem_int_ty(s: *EmitterState, bits: i32)
     emit_str(s, c"i")
@@ -4100,15 +4127,17 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     if name_eq(e.func_name, e.func_name_len, c"sha256msg2", 10) == 1
         return emit_x86_intrinsic_v4i32(s, e, c"llvm.x86.sha256msg2", 19, 2)
     if name_eq(e.func_name, e.func_name_len, c"aesenc", 6) == 1
-        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesenc", 21, 2)
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesenc", 21, 2, -1)
     if name_eq(e.func_name, e.func_name_len, c"aesenclast", 10) == 1
-        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesenclast", 25, 2)
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesenclast", 25, 2, -1)
     if name_eq(e.func_name, e.func_name_len, c"aesdec", 6) == 1
-        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesdec", 21, 2)
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesdec", 21, 2, -1)
     if name_eq(e.func_name, e.func_name_len, c"aesdeclast", 10) == 1
-        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesdeclast", 25, 2)
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesdeclast", 25, 2, -1)
     if name_eq(e.func_name, e.func_name_len, c"aesimc", 6) == 1
-        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesimc", 21, 1)
+        return emit_x86_intrinsic_v2i64(s, e, c"llvm.x86.aesni.aesimc", 21, 1, -1)
+    if name_eq(e.func_name, e.func_name_len, c"aeskeygenassist", 15) == 1
+        return emit_aeskeygenassist(s, e)
     # AGAST #1879: volatile / atomic memory builtins.  Reserved names, as in
     # ritz0: checked before user fns, so they never become an extern.
     let mem_id: i32 = mem_builtin_id(e.func_name, e.func_name_len)
