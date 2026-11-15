@@ -52,6 +52,13 @@ class EmitError(Exception):
             super().__init__(message)
 
 
+class UnknownFunction(EmitError, ValueError):
+    """A call to a name nothing declares (AGAST #3243: that includes `write`,
+    `read`, `open`, `close` and `nanosleep`, no longer builtins). Located like
+    any EmitError; still a ValueError, so a route that only tries a call for
+    an address falls back as it did before the location was added."""
+
+
 class TempPlace(ValueError):
     """A store or `@` reached a call's by-value result, which is no place
     (AGAST #2518). A ValueError, so a route that only tries for an address
@@ -585,11 +592,7 @@ class StructRegistry:
 
 # Linux x86_64 syscall numbers (used for ritzlib intrinsics)
 # Note: For _start exit, see _emit_start_function which handles OS-specific syscall numbers
-SYSCALL_READ = 0
 SYSCALL_WRITE = 1
-SYSCALL_OPEN = 2
-SYSCALL_CLOSE = 3
-SYSCALL_NANOSLEEP = 35
 SYSCALL_EXIT_LINUX = 60
 SYSCALL_EXIT_HARLAND = 20
 
@@ -11996,10 +11999,6 @@ class LLVMEmitter:
         if fname == 'format_into':
             return self._emit_format_into(call)
 
-        # Handle named syscalls
-        if fname in ('write', 'read', 'open', 'close', 'nanosleep'):
-            return self._emit_syscall(fname, call.args)
-
         # Handle generic syscallN(num, args...) builtins
         # ONLY match exact builtin names: syscall0-syscall6, __syscall0-__syscall6
         # Don't match other functions that happen to start with "syscall" (e.g., syscall_init)
@@ -12183,7 +12182,7 @@ class LLVMEmitter:
             raise ValueError(
                 f"generic function `{fname}` needs explicit type arguments here: "
                 f"write `{fname}<T>(...)`")
-        raise ValueError(f"Unknown function: {fname}")
+        raise UnknownFunction(f"Unknown function: {fname}", self._call_span(call))
 
     def _try_emit_simd_builtin(self, fname: str, args: list) -> Optional[ir.Value]:
         """Try to emit a SIMD builtin function.
@@ -13882,53 +13881,6 @@ class LLVMEmitter:
             for _ in range(levels - self_levels):
                 receiver = self.builder.load(receiver)
         return receiver
-
-    def _emit_syscall(self, name: str, args: List[rast.Expr]) -> ir.Value:
-        """Emit an inline syscall."""
-        syscall_nums = {
-            'read': SYSCALL_READ,
-            'write': SYSCALL_WRITE,
-            'open': SYSCALL_OPEN,
-            'close': SYSCALL_CLOSE,
-            'nanosleep': SYSCALL_NANOSLEEP,
-        }
-        syscall_num = syscall_nums[name]
-
-        # Emit arguments
-        arg_vals = [self._emit_expr(arg) for arg in args]
-
-        # Convert all args to i64
-        arg_vals_64 = []
-        for val in arg_vals:
-            arg_vals_64.append(self._to_i64(val))
-
-        # Build inline asm based on arg count
-        if len(arg_vals_64) == 1:
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64])
-            asm_args = [ir.Constant(self.i64, syscall_num), arg_vals_64[0]]
-        elif len(arg_vals_64) == 2:
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},{rsi},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64, self.i64])
-            asm_args = [ir.Constant(self.i64, syscall_num), arg_vals_64[0], arg_vals_64[1]]
-        elif len(arg_vals_64) == 3:
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64, self.i64, self.i64])
-            asm_args = [ir.Constant(self.i64, syscall_num)] + arg_vals_64
-        else:
-            raise ValueError(f"Syscall with {len(arg_vals_64)} args not supported")
-
-        asm_ir = ir.InlineAsm(asm_func_ty, asm_str, constraints, side_effect=True)
-        result = self.builder.call(asm_ir, asm_args)
-
-        # Truncate result if needed (e.g., open returns i32)
-        if name in ('open', 'close'):
-            result = self.builder.trunc(result, self.i32)
-
-        return result
 
     def _emit_generic_syscall(self, fname: str, args: List[rast.Expr]) -> ir.Value:
         """Emit a generic syscallN(num, arg1, ...) call.

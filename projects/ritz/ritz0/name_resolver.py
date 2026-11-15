@@ -48,11 +48,10 @@ INTRINSICS = frozenset({
     'cpuid_raw', 'xgetbv',
 })
 
-# Syscalls the emitter lowers by name (`write` and friends unless a program
-# defines its own), and the variants of the generics it instantiates itself.
-SYSCALL_BUILTINS = frozenset(
-    {'write', 'read', 'open', 'close', 'nanosleep'}
-    | {f'syscall{n}' for n in range(7)})
+# Syscalls the emitter lowers by name, and the variants of the generics it
+# instantiates itself. `write`, `read`, `open`, `close` and `nanosleep` are
+# ordinary identifiers (AGAST #3243): ritzlib.sys has `sys_write` and friends.
+SYSCALL_BUILTINS = frozenset(f'syscall{n}' for n in range(7))
 BUILTIN_VARIANTS = frozenset({'Some', 'None', 'Ok', 'Err'})
 BUILTIN_GENERICS = frozenset({'Option', 'Result', 'Span'})
 

@@ -478,10 +478,13 @@ placeholder of a type with no formatted form.
 
 **Why `format_into`.** AGAST #1824 weighed three spellings:
 
-- `write(buf, "...")` reads well, but `write` is already taken. ritz0 lowers
-  `write(fd, ptr, len)` as a syscall builtin, and the workspace defines
-  `write` as an `extern fn` and as methods. A builtin of that name would
-  change the meaning of existing calls.
+- `write(buf, "...")` reads well, but `write` belongs to programs: the
+  workspace defines it as an `extern fn` and as methods. A builtin of that
+  name would take the call away from them. That is why `write`, `read`,
+  `open`, `close` and `nanosleep` are ordinary identifiers with no built-in
+  meaning (AGAST #3243): a call to one resolves like any other call, and
+  the syscalls are ritzlib.sys's `sys_write`, `sys_read`, `sys_open`,
+  `sys_close` and `sys_nanosleep`.
 - `String.fmt(...)` would tie formatting to one type and need an
   associated-builtin form neither compiler has. ritz1's own emitter, the
   motivating user, writes into a `Vec<u8>`, not a `String`.

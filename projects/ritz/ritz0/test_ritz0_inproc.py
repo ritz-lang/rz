@@ -32,10 +32,10 @@ pub fn main() -> i32
 """
 
 # The oracle links one module, like the test_ritz1_* files it serves: no
-# ritzlib import, output through ritz0's `write` syscall builtin.
+# ritzlib import, output through the `syscall3` builtin (write(2) is 1).
 PRINTING_PROGRAM = """\
 pub fn main() -> i32
-    write(1, c"hello oracle\\n", 13)
+    syscall3(1, 1, c"hello oracle\\n" as i64, 13)
     5
 """
 

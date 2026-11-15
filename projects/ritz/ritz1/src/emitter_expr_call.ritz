@@ -4225,9 +4225,9 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
 
     # Regular function call - register as external if not defined in this module
     # Build the full function name with type suffix (e.g., "vec_new$u8" for vec_new<u8>())
-    # Heap, sized for the longer of name+suffix and "__ritz_builtin_"+name: a
-    # fixed [128]u8 was overrun by a long name (AGAST #1813).
-    let full_name: *u8 = malloc((e.func_name_len + e.call_type_suffix_len + 16) as i64)
+    # Heap, sized from name+suffix: a fixed [128]u8 was overrun by a long name
+    # (AGAST #1813).
+    let full_name: *u8 = malloc((e.func_name_len + e.call_type_suffix_len + 1) as i64)
     var full_len: i32 = 0
     # Copy base function name
     for i in 0..e.func_name_len
@@ -4243,23 +4243,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # indirect call (AGAST #1671) uses the fn type's signature instead and
     # names no symbol, so it registers no extern.
     var fn_def: *FnDef = icall_sig
-    # AGAST #1791: ritz0's named syscall builtins (`write`, `open`, ..).  The
-    # call goes to the reserved weak_odr body @__ritz_builtin_<name>, never
-    # to a user fn of that name (ritz0 tests builtins first).  fn_def stays
-    # null, so the args take the extern path's i64 conversions.
-    var sys_builtin: i32 = 0
-    if call_is_named_syscall_builtin(s, e) == 1   # no local of that name
-        sys_builtin = 1
-        let prefix: *u8 = c"__ritz_builtin_"
-        full_len = 0
-        for i in 0..15
-            full_name[full_len] = *(prefix + i)
-            full_len += 1
-        for i in 0..e.func_name_len
-            full_name[full_len] = *(e.func_name + i)
-            full_len += 1
-        add_extern(s, full_name, full_len)
-    else if icall_sig == null
+    if icall_sig == null
         add_extern(s, full_name, full_len)
         fn_def = find_fn(s, full_name, full_len)
         # R10: `C_g(c)` is the method `c.g()` calls; impl methods aren't in
@@ -4269,8 +4253,8 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             fn_def = find_impl_method_by_symbol(s.module, full_name, full_len)
 
     # Sized from the argument list (AGAST #1813): a fixed [16] dropped every
-    # argument past the 16th.  Room for the 3 a syscall builtin is padded to.
-    let arg_regs: *i32 = call_reg_slots(e.args, 3)
+    # argument past the 16th.
+    let arg_regs: *i32 = call_reg_slots(e.args, 0)
     var arg_count: i32 = 0
     var arg2: *Expr = e.args
     var ap: *Param = null
@@ -4285,21 +4269,6 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             ap = ap.next
         arg2 = arg2.next
 
-    # AGAST #1791: ritz0 takes 1 to 3 arguments for any named syscall builtin
-    # and leaves the unused argument registers unset.  Every body takes three,
-    # so pad with zeros (the kernel ignores them).
-    if sys_builtin == 1
-        if arg_count < 1 or arg_count > 3
-            emit_ir_error_begin(s, c"named syscall builtin takes 1 to 3 arguments: '")
-            emit_ir_error_end(s, e.func_name, e.func_name_len)
-        while arg_count < 3
-            let pad: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, pad)
-            emit_str(s, c" = add i64 0, 0\n")
-            arg_regs[arg_count] = pad
-            arg_count += 1
-
     # fn_def is a direct callee or the signature of a fn value.
     if refuse_array_return(s, e, fn_def) == 1
         return 0
@@ -4313,8 +4282,8 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             ret_struct_name_len = fn_def.return_type_name_len
 
     # Convert argument values to match parameter types BEFORE emitting call
-    let converted_regs: *i32 = call_reg_slots(e.args, 3)
-    let param_types: *i32 = call_reg_slots(e.args, 3)
+    let converted_regs: *i32 = call_reg_slots(e.args, 0)
+    let param_types: *i32 = call_reg_slots(e.args, 0)
     var param_ptr: *Param = null
     if fn_def != null
         param_ptr = fn_def.params
