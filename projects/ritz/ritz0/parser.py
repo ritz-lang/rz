@@ -2614,15 +2614,16 @@ class Parser:
             var_type = self.parse_type()
 
         value = None
+        eq_span = None
         if self._at(TokenType.EQ):
+            eq_span = self._current().span
             self._advance()
             value = self.parse_expr()
 
-        # Module-level vars must have a type or initializer for type inference
         if var_type is None and value is None:
             raise ParseError("Module-level variable must have a type annotation or initializer", span)
 
-        return rast.VarDef(span, name, var_type, value, is_pub=is_pub)
+        return rast.VarDef(span, name, var_type, value, is_pub=is_pub, eq_span=eq_span)
 
     def parse_extern_var(self, is_pub: bool = False) -> rast.VarDef:
         """`extern var NAME: T` (LANGUAGE_SPEC §5.3, AGAST #1879).

@@ -646,20 +646,9 @@ def test_a_generic_struct_fits_a_reference_to_its_instance(tmp_path, compiler):
     assert _run_three(compiler, tmp_path, "generic_own_type", GENERIC_OWN_TYPE) == 3
 
 
-# What ritz0's checker can't type stays unjudged: an un-annotated global is
-# `unknown` to it. ritz1 doesn't parse one, so this row is ritz0's alone.
-UNTYPED_REFERENT = """\
-var G = 3
-
-pub fn main() -> i32
-    let p: @i32 = @G
-    return *p
-"""
-
-
-@pytest.mark.integration
-def test_ritz0_leaves_a_reference_to_what_it_cant_type_unjudged(tmp_path):
-    assert _run_three("ritz0", tmp_path, "untyped_referent", UNTYPED_REFERENT) == 3
+# An un-annotated global (`var G = 3`), which ritz0's checker couldn't type,
+# had a row here; LARB R38 (#3374) makes it an error, in
+# test_global_init_rejected.py.
 
 
 # An un-annotated scalar local is its initialiser's type (#2527), so `@&n` of

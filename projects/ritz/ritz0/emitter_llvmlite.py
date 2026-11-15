@@ -1972,6 +1972,16 @@ class LLVMEmitter:
         at the initializer (AGAST #3027)."""
         return EmitError(f"global '{var_def.name}' {why}", var_def.value.span)
 
+    def _untyped_global_error(self, var_def: rast.VarDef) -> EmitError:
+        """`var g = true`: "a global needs a type", at the `=`, naming the
+        initializer's type when it has one a declaration could spell."""
+        ty = self._infer_ritz_type(var_def.value)
+        shown = "T"
+        if ty is not None and not (isinstance(ty, rast.NamedType) and ty.name == 'null'):
+            shown = self._show_type(ty)
+        return EmitError(f"a global needs a type: write `var {var_def.name}: {shown} = ...`",
+                         var_def.eq_span or var_def.value.span)
+
     def _emit_global_var(self, var_def: rast.VarDef) -> None:
         """Emit a module-level mutable variable.
 
@@ -1990,11 +2000,9 @@ class LLVMEmitter:
             ty = self._ritz_type_to_llvm(var_def.type)
             ritz_ty = var_def.type
         elif var_def.value is not None:
-            # Infer type from initializer
-            ritz_ty = self._infer_ritz_type(var_def.value)
-            if ritz_ty is None:
-                raise ValueError(f"Cannot infer type for module-level var '{var_def.name}'")
-            ty = self._ritz_type_to_llvm(ritz_ty)
+            # LARB R38 (AGAST #3374): a global's type is written where it is
+            # declared, never read off its initializer (§4.3).
+            raise self._untyped_global_error(var_def)
         else:
             raise ValueError(f"Module-level var '{var_def.name}' needs type or initializer")
 

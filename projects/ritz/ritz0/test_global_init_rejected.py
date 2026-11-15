@@ -80,3 +80,41 @@ def test_ritz0_null_into_an_integer_global_is_a_located_error(request, tmp_path)
     assert proc.returncode != 0 and "ValueError" not in out, out[-1500:]
     assert re.search(r"unit\.ritz:1:14: (?:error: )?global 'g' .*null", out), out[-1500:]
     assert not ll.exists()
+
+
+# LARB R38 (#3374): a global's type is written, never read off its initializer.
+# name -> (source, line, column, message)
+_UNTYPED = {
+    "bool": ("var g = true\n" + _MAIN, 1, 7, "a global needs a type: write `var g: bool = ...`"),
+    "int": ("var counter = 5\n" + _MAIN, 1, 13,
+            "a global needs a type: write `var counter: i64 = ...`"),
+    "unknown": ("var g = null\n" + _MAIN, 1, 7, "a global needs a type: write `var g: T = ...`"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(_UNTYPED))
+def test_ritz0_an_untyped_global_var_is_an_error_at_the_eq(request, tmp_path, name):
+    """ritz0-only until #3375 gives ritz1 (which already refuses, with a
+    parse error) the same message; then this joins COMPILERS."""
+    source, line, col, message = _UNTYPED[name]
+    proc, ll = _compile(request, "ritz0", tmp_path, source)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"ritz0 accepted {name}:\n{out[-1500:]}"
+    assert "Traceback" not in out and "ValueError" not in out, out[-1500:]
+    hits = re.findall(rf"unit\.ritz:{line}:{col}: (?:error: )?{re.escape(message)}", out)
+    assert len(hits) == 1, f"{name}: want one {message!r} at {line}:{col}:\n{out[-1500:]}"
+    assert not ll.exists(), f"ritz0 wrote IR for {name}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("source", ["let g = true\n", "let g: bool = true\n"])
+def test_ritz0_a_module_level_let_is_refused(request, tmp_path, source):
+    """No compiler has a module-level `let` (R38 names one; it isn't an item),
+    so typed or not it stays a located refusal at the `let`."""
+    proc, ll = _compile(request, "ritz0", tmp_path, source + _MAIN)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out[-1500:]
+    assert "Traceback" not in out, out[-1500:]
+    assert re.search(r"unit\.ritz:1:1: ", out), out[-1500:]
+    assert not ll.exists()

@@ -1109,6 +1109,8 @@ class VarDef(Item):
     # defined in another object (a linker symbol, say); `value` is None and
     # the module emits only `@NAME = external global T`.
     is_extern: bool = False
+    # Where the `=` is, for R38's "a global needs a type" (AGAST #3374).
+    eq_span: Optional[Span] = None
 
 
 @dataclass
