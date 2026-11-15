@@ -49,6 +49,21 @@ class GenericInferError(Exception):
         super().__init__(message)
 
 
+class InstantiationRecursionError(GenericInferError):
+    """Instantiation that never reaches a fixpoint (AGAST #3330).
+
+    `impl<T> Cell<T>  fn wrap(..) -> Cell<Cell<T>>`: every method of a
+    generic impl is specialised for each instance, so each instance names a
+    deeper one.  Located at the generic impl, as ritz1's is."""
+
+
+# How many generations of instances one instantiation may discover before it
+# is refused as recursive (AGAST #3330).  An instance named in the program is
+# generation 0; one first named while specialising a generation-g instance is
+# g + 1.  ritz1 uses the same cap (monomorph.ritz, MAX_INSTANCE_DEPTH).
+MAX_INSTANCE_DEPTH = 64
+
+
 def map_child_nodes(node, on_expr, on_stmt, on_type):
     """Rebuild `node` with on_expr / on_stmt / on_type applied to its children.
 
@@ -1364,9 +1379,13 @@ class Monomorphizer:
         processed_enums: set = set()
         processed_functions: set = set()
 
-        # Iterate until no new instantiations are found
-        max_iterations = 100  # Safety limit
-        for iteration in range(max_iterations):
+        # Iterate until no new instantiations are found.  Everything found in
+        # round g is specialised in round g + 1, so the round is the
+        # generation (MAX_INSTANCE_DEPTH).  This loop used to stop silently
+        # after 100 rounds and leave the emitter to die on an instance nobody
+        # had specialised (AGAST #3330).
+        generation = 0
+        while True:
             # Find new instantiations.
             #
             # These MUST be lists, not sets (AGAST #1286). The keys are
@@ -1389,6 +1408,9 @@ class Monomorphizer:
             if not new_structs and not new_enums and not new_functions:
                 # Fixpoint reached
                 break
+            if generation == MAX_INSTANCE_DEPTH:
+                raise self._recursion_error(new_structs + new_enums + new_functions)
+            generation += 1
 
             # Build struct_manglings lookup for substitution (includes both structs and enums)
             struct_manglings: Dict[str, Dict[Tuple[str, ...], str]] = {}
@@ -1497,6 +1519,32 @@ class Monomorphizer:
                 # CRITICAL: Scan the specialized function body for new instantiations
                 # This discovers transitive generic calls like vec_ensure_cap<i32>
                 self._scan_for_new_instantiations(specialized)
+
+    def _recursion_error(self, pending: List[Tuple[str, Tuple[str, ...]]]) -> InstantiationRecursionError:
+        """The error for instances still pending after MAX_INSTANCE_DEPTH rounds.
+
+        Names the first pending type with a generic impl, at that impl: its
+        methods are what name the deeper instance.  Pending lists are in
+        discovery order, structs first, as ritz1 walks them.  Without such an
+        impl, a pending generic fn is the likelier culprit (`f<T>` calling
+        `f<Cell<T>>`); failing that, the first pending item.  Either is
+        reported at its definition."""
+        names = [name for name, _ in pending]
+        base = next((n for n in names if self.generic_impls.get(n)), None)
+        if base is not None:
+            where = self.generic_impls[base][0].span
+            shape = f"{base}<{base}<...>> names a deeper instance at every level"
+        else:
+            base = next((n for n in names if n in self.generic_functions), names[0])
+            if base in self.generic_functions:
+                where = self.generic_functions[base].span
+            else:
+                where = (self.generic_structs.get(base) or self.generic_enums.get(base)).span
+            shape = "each instance names a deeper one"
+        return InstantiationRecursionError(
+            f"instantiating `{base}` recurses: {shape} "
+            f"(stopped after {MAX_INSTANCE_DEPTH})",
+            where)
 
     def _register_field_instances(self, generic_def: rast.StructDef,
                                   mapping: Dict[str, rast.Type],

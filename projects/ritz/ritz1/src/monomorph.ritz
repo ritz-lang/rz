@@ -47,6 +47,19 @@ var g_struct_suffix_lens: *i32 = null
 var g_struct_count: i32 = 0
 var g_struct_cap: i32 = 0
 
+# AGAST #3330: each instance's generation.  One named in the program is 0; one
+# first named while specialising a generation-g instance (its fields, its impl
+# methods, its body) is g + 1.  `impl<T> Cell<T>  fn wrap(..) -> Cell<Cell<T>>`
+# names a deeper instance at every generation, so instantiation never ended
+# (ritz1 hung).  Past MAX_INSTANCE_DEPTH generations it stops with a located
+# error instead; ritz0 uses the same cap (monomorph.py, MAX_INSTANCE_DEPTH).
+# Real code peaks at 4.
+const MAX_INSTANCE_DEPTH: i32 = 64
+var g_inst_gens: *i32 = null
+var g_struct_gens: *i32 = null
+var g_cur_gen: i32 = -1          # generation being specialised; -1 outside
+var g_mono_errors: i32 = 0
+
 fn init_instantiation_tracker()
     # Initialize function tracking
     g_inst_cap = INST_INIT_CAP
@@ -54,6 +67,7 @@ fn init_instantiation_tracker()
     g_inst_name_lens = malloc((g_inst_cap as i64) * 4) as *i32
     g_inst_suffixes = malloc((g_inst_cap as i64) * 8) as **u8
     g_inst_suffix_lens = malloc((g_inst_cap as i64) * 4) as *i32
+    g_inst_gens = malloc((g_inst_cap as i64) * 4) as *i32
     g_inst_count = 0
     # Initialize struct tracking
     g_struct_cap = INST_INIT_CAP
@@ -61,7 +75,10 @@ fn init_instantiation_tracker()
     g_struct_name_lens = malloc((g_struct_cap as i64) * 4) as *i32
     g_struct_suffixes = malloc((g_struct_cap as i64) * 8) as **u8
     g_struct_suffix_lens = malloc((g_struct_cap as i64) * 4) as *i32
+    g_struct_gens = malloc((g_struct_cap as i64) * 4) as *i32
     g_struct_count = 0
+    g_cur_gen = -1
+    g_mono_errors = 0
 
 fn add_instantiation(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) -> i32
     # Check if already tracked
@@ -78,12 +95,14 @@ fn add_instantiation(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) -> 
         g_inst_name_lens = realloc(g_inst_name_lens as *u8, cap * 4) as *i32
         g_inst_suffixes = realloc(g_inst_suffixes as *u8, cap * 8) as **u8
         g_inst_suffix_lens = realloc(g_inst_suffix_lens as *u8, cap * 4) as *i32
+        g_inst_gens = realloc(g_inst_gens as *u8, cap * 4) as *i32
         g_inst_cap = cap as i32
 
     *(g_inst_names + g_inst_count) = name
     *(g_inst_name_lens + g_inst_count) = name_len
     *(g_inst_suffixes + g_inst_count) = suffix
     *(g_inst_suffix_lens + g_inst_count) = suffix_len
+    *(g_inst_gens + g_inst_count) = g_cur_gen + 1
     g_inst_count = g_inst_count + 1
     return 1  # Added new
 
@@ -129,12 +148,14 @@ fn add_struct_instantiation(name: *u8, name_len: i32, suffix: *u8, suffix_len: i
         g_struct_name_lens = realloc(g_struct_name_lens as *u8, cap * 4) as *i32
         g_struct_suffixes = realloc(g_struct_suffixes as *u8, cap * 8) as **u8
         g_struct_suffix_lens = realloc(g_struct_suffix_lens as *u8, cap * 4) as *i32
+        g_struct_gens = realloc(g_struct_gens as *u8, cap * 4) as *i32
         g_struct_cap = cap as i32
 
     *(g_struct_names + g_struct_count) = name
     *(g_struct_name_lens + g_struct_count) = name_len
     *(g_struct_suffixes + g_struct_count) = suffix
     *(g_struct_suffix_lens + g_struct_count) = suffix_len
+    *(g_struct_gens + g_struct_count) = g_cur_gen + 1
     g_struct_count = g_struct_count + 1
     return 1  # Added new
 
@@ -4179,9 +4200,46 @@ fn monomorphize_module(m: *Module)
     # specialises its impl methods, which may name further instantiations.
     var s_done: i32 = 0
     var i: i32 = 0
-    while s_done < g_struct_count or i < g_inst_count
+    while g_mono_errors == 0 and (s_done < g_struct_count or i < g_inst_count)
         s_done = specialize_pending_structs(m, s_done)
         i = specialize_pending_fns(m, i)
+    g_cur_gen = -1
+
+# Errors monomorphize_module reported (AGAST #3330); main stops on any.
+pub fn monomorph_errors() -> i32
+    g_mono_errors
+
+# AGAST #3330: `name` is still being instantiated MAX_INSTANCE_DEPTH
+# generations deep.  Located at its first generic impl, whose methods are what
+# name the deeper instance.  Without one (a generic fn `f<T>` calling
+# `f<Cell<T>>`) there is no column to report, so it is reported at the file;
+# ritz0 reports that case at the definition (monomorph.py, _recursion_error).
+fn refuse_recursive_instance(m: *Module, name: *u8, name_len: i32)
+    let ib: *ImplBlock = find_generic_impl(m.impls, name, name_len)
+    if ib != null and ib.def_file != null
+        eprints_cstr(ib.def_file)
+    else if struct_index_file() != null
+        eprints_cstr(struct_index_file())
+    else
+        eprints_cstr(c"<input>")
+    if ib != null
+        eprint_char(':')
+        eprint_i64(ib.impl_span.line as i64)
+        eprint_char(':')
+        eprint_i64(ib.impl_span.col as i64)
+    eprints_cstr(c": error: instantiating `")
+    sys_write(2, name, name_len as i64)
+    eprints_cstr(c"` recurses: ")
+    if ib != null
+        sys_write(2, name, name_len as i64)
+        eprint_char('<')
+        sys_write(2, name, name_len as i64)
+        eprints_cstr(c"<...>> names a deeper instance at every level (stopped after ")
+    else
+        eprints_cstr(c"each instance names a deeper one (stopped after ")
+    eprint_i64(MAX_INSTANCE_DEPTH as i64)
+    eprints_cstr(c")\n")
+    g_mono_errors += 1
 
 # Specialise struct instantiations [start, g_struct_count); returns the new
 # high-water mark.
@@ -4192,7 +4250,11 @@ fn specialize_pending_structs(m: *Module, start: i32) -> i32
         let name_len: i32 = get_struct_instantiation_name_len(si)
         let suffix: *u8 = get_struct_instantiation_suffix(si)
         let suffix_len: i32 = get_struct_instantiation_suffix_len(si)
+        g_cur_gen = *(g_struct_gens + si)
         si = si + 1
+        if g_cur_gen >= MAX_INSTANCE_DEPTH
+            refuse_recursive_instance(m, name, name_len)
+            return g_struct_count
 
         # Find the generic template
         let template: *StructDef = find_generic_struct(m, name, name_len)
@@ -4215,12 +4277,18 @@ fn specialize_pending_structs(m: *Module, start: i32) -> i32
 # high-water mark.  Index-based because cloning adds instantiations as it goes
 # (e.g., vec_push<T> calls vec_ensure_cap<T> which calls vec_grow<T>).
 fn specialize_pending_fns(m: *Module, start: i32) -> i32
+    if g_mono_errors > 0   # a struct was refused this round: report it alone
+        return g_inst_count
     var i: i32 = start
     while i < g_inst_count
         let name: *u8 = get_instantiation_name(i)
         let name_len: i32 = get_instantiation_name_len(i)
         let suffix: *u8 = get_instantiation_suffix(i)
         let suffix_len: i32 = get_instantiation_suffix_len(i)
+        g_cur_gen = *(g_inst_gens + i)
+        if g_cur_gen >= MAX_INSTANCE_DEPTH
+            refuse_recursive_instance(m, name, name_len)
+            return g_inst_count
 
         # Find the generic template
         let template: *FnDef = find_generic_function(m, name, name_len)
