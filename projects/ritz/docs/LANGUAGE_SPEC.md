@@ -1101,8 +1101,7 @@ declared rather than read off a literal (§7.4 would make `var g = 5` an `i64`).
 `@A[i]` and `@A` of a `const` array are shared references, `@T` and `@[N]T`,
 into its read-only data (LARB R48, AGAST #3359). `@&A[i]` stays an error, since
 a const is never a place you can write. A `const` scalar has no storage, so
-`@N` of one is an error. Until #3392 lands, ritz1 refuses `@A[i]` as well
-(#3337); ritz0 implements R48 (#3391).
+`@N` of one is an error.
 
 #### One meaning per name
 

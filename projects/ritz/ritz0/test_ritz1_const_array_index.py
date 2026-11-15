@@ -204,9 +204,10 @@ FORMS = {
 
 # LARB R48 (AGAST #3391): `@A[i]` of a const array is a shared `@T` into its
 # read-only data, and `@A` is `@[N]T`.  #3337 refused both; these were the
-# `addr_*` rows of CONST_PLACE_ERRORS.  ritz0 only until #3392 (ritz1 still
-# refuses), which moves them into FORMS.  Each reads a different element or
-# field, so the wrong slot, a copy's garbage or a null base gives another code.
+# `addr_*` rows of CONST_PLACE_ERRORS.  ritz0 since #3391, ritz1 and
+# ritz1_selfhosted since #3392 (test_addr_of_const_array).  Each reads a
+# different element or field, so the wrong slot, a copy's garbage or a null
+# base gives another code.
 ADDR_ELEM = """\
 const NS: [3]i32 = [10, 3, 30]
 
@@ -267,7 +268,10 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     if compiler == "ritz0":
         comp = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
-        cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
+        binary = RITZ1_BIN.parent / compiler
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+        cmd = [str(binary), str(src), "-o", str(ll)]
         comp = subprocess.run(
             cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
         )
@@ -278,7 +282,7 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
 
     exe = tmp_path / f"{name}_{compiler}"
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
-    if compiler == "ritz1":
+    if compiler != "ritz0":
         link_cmd.insert(2, str(RITZ_START))
     link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, (
@@ -360,9 +364,20 @@ def test_const_array_place_refused(request, compiler: str, name: str, tmp_path: 
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
+# LARB R48 (AGAST #3392): ritz1 and ritz1_selfhosted read `@NS[i]`, `@KS[i]`,
+# `@KS[i].len` and `@NS` from the const's global, as ritz0 does.  ritz1 refused
+# each (#3337) until R48.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("name", sorted(ADDR_FORMS))
+def test_addr_of_const_array(request, compiler: str, name: str, tmp_path: Path) -> None:
+    request.getfixturevalue("ritz1_bin")
+    assert _run(compiler, tmp_path, name, ADDR_FORMS[name]) == 3
+
+
 # LARB R48: a const scalar is inlined, so `@N` has nothing to point at, unlike
-# a const array's `@A`.  ritz0 died with "Unknown variable: N".  ritz0 only:
-# ritz1's "cannot take address" has no location yet (#3392).
+# a const array's `@A`.  ritz0 died with "Unknown variable: N", ritz1 said an
+# unlocated "cannot take address" (#3392).  A located error on all three.
 SCALAR_ADDR = """\
 const N: i32 = 3
 
@@ -370,21 +385,31 @@ fn rd(p: @i32) -> i32
     *p
 
 pub fn main() -> i32
-    rd(@N)
+    rd({}N)
 """
 
 
 @pytest.mark.integration
-def test_ritz0_const_scalar_addr_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("op", ["@", "@&"])
+def test_const_scalar_addr_refused(request, compiler: str, op: str, tmp_path: Path) -> None:
     src = tmp_path / "unit.ritz"
-    src.write_text(SCALAR_ADDR)
+    src.write_text(SCALAR_ADDR.format(op))
     ll = tmp_path / "unit.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    if compiler == "ritz0":
+        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    else:
+        request.getfixturevalue("ritz1_bin")
+        binary = RITZ1_BIN.parent / compiler
+        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+        proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path,
+                              env=env, capture_output=True, text=True, timeout=300)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0 and "Traceback" not in out, out[-1500:]
     message = "cannot take the address of const `N`; a const scalar has no storage"
-    assert f"unit.ritz:7:8: {message}" in out, out[-1500:]
+    hits = re.findall(rf"unit\.ritz:7:8: (?:error: )?{re.escape(message)}", out)
+    assert len(hits) == 1, f"{compiler}: want one {message!r} at 7:8:\n{out[-1500:]}"
     assert not ll.exists()
 
 

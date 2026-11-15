@@ -14,8 +14,8 @@ for `v:& Vec<T>`, whose slot holds the borrow's pointer: `@v` is that pointer
 
 `@` of a pointer or a reference, and of a call's field isn't an iterable to
 ritz0, and ritz1 refuses each of them too.  `@K` of a const array is `@[N]T`
-into its read-only data (LARB R48), so ritz0 walks it; ritz1 refuses it until
-#3392.  A field reached through
+into its read-only data (LARB R48), so each compiler walks it (#3391, #3392).
+A field reached through
 a pointer field of a call's result, `@mk().p.a`, is no field of the call's
 temporary, and each compiler walks it (#3207).
 
@@ -137,21 +137,21 @@ REFUSED = {
     "pointer_param": "fn f(a: *[3]i32) -> i32\n" + _SUM.format(n="a") + "\n" + _MAIN_A,
     "reference_param": "fn f(a: @[3]i32) -> i32\n" + _SUM.format(n="a") + "\n" + _MAIN_A,
     "pointer_to_vec": VEC + "fn f(v: *Vec<i32>) -> i32\n" + _SUM.format(n="v") + "\n" + _MAIN_V,
-    "const": "const K: [3]i32 = [1, 2, 4]\n\n" + MAIN + _SUM.format(n="K"),
 }
-# ritz0 walks `@K` (LARB R48, AGAST #3391): test_const_array_walks_in_ritz0.
-_RITZ0_WALKS = {"const"}
+# `@K` of a const array is `@[3]i32` into its read-only data (LARB R48): ritz0
+# walks it since #3391, ritz1 since #3392.
+CONST_WALK = "const K: [3]i32 = [1, 2, 4]\n\n" + MAIN + _SUM.format(n="K")
 
 
 @pytest.mark.integration
-def test_const_array_walks_in_ritz0(run_with):
-    assert run_with("ritz0", "const", REFUSED["const"]) == 7
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_const_array_walks(run_with, compiler):
+    assert run_with(compiler, "const", CONST_WALK) == 7
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", [
-    (n, c) for n in sorted(REFUSED) for c in COMPILERS
-    if not (c == "ritz0" and n in _RITZ0_WALKS)])
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(REFUSED))
 def test_address_of_a_non_iterable_is_refused(compile_with, compiler, name):
     comp, ll, _ = compile_with(compiler, name, REFUSED[name])
     assert comp.returncode != 0

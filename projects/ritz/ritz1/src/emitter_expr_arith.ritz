@@ -1460,6 +1460,100 @@ fn emit_call_temp_ptr(s: *EmitterState, op: *Expr) -> i32
     emit_str(s, c"\n")
     slot
 
+# LARB R48 (AGAST #3392): `name` is a module const that no local or global of
+# the name shadows: its ConstEntry, else null.
+fn unshadowed_const(s: *EmitterState, name: *u8, len: i32) -> *ConstEntry
+    if find_local_idx(s, name, len) >= 0 or find_global(s, name, len) != null
+        return null
+    find_const_entry(s, name, len)
+
+# A const array emit_const_array_entry lowers to `@A = internal constant`.
+fn const_array_global(ce: *ConstEntry) -> i32
+    if ce == null or ce.const_type != TYPE_ARRAY or ce.value_expr == null
+        return 0
+    if ce.value_expr.kind != EXPR_ARRAY_LIT and ce.value_expr.kind != EXPR_ARRAY_FILL
+        return 0
+    1
+
+# LARB R48 (AGAST #3392): `@A` and `@A[i]` of a const array are shared
+# references into its read-only global, `@[N]T` and `@T` (ritz0 #3391).  `@A`
+# is the global itself; `@A[i]` GEPs it as the read `A[i]` does, a struct
+# element as `[N x %S]` and a primitive at its stored width.  `@A[i].f` reaches
+# the element through here too (emit_member_ptr).  -1 when `op` is neither.
+# let_check still refuses `@&` of either: a const is never writable.
+pub fn emit_const_array_ptr(s: *EmitterState, op: *Expr) -> i32
+    if op.kind == EXPR_IDENT
+        let ce: *ConstEntry = unshadowed_const(s, op.ident_ptr, op.ident_len)
+        if const_array_global(ce) == 0
+            return -1
+        let whole: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, whole)
+        emit_str(s, c" = getelementptr i8, ptr @")
+        emit_name(s, ce.name, ce.name_len)
+        emit_str(s, c", i64 0\n")
+        return whole
+    if op.kind != EXPR_INDEX or op.left == null or op.left.kind != EXPR_IDENT
+        return -1
+    if op.right == null or op.right.kind == EXPR_RANGE
+        return -1
+    let carr: *ConstEntry = unshadowed_const(s, op.left.ident_ptr, op.left.ident_len)
+    if const_array_global(carr) == 0
+        return -1
+    if carr.array_elem_type == TYPE_STRUCT
+        # emit_const_array_entry declares `[N x %S]` for a literal only.
+        if carr.array_elem_type_name_len <= 0 or carr.value_expr.kind != EXPR_ARRAY_LIT
+            return -1
+        return emit_struct_array_elem_ptr(s, carr.name, carr.name_len, carr.array_size, carr.array_elem_type_name, carr.array_elem_type_name_len, op.right)
+    let cty: *u8 = const_array_elem_llvm(carr.array_elem_type)
+    if cty == null
+        return -1
+    let cidx: i32 = emit_expr(s, op.right)
+    let cptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cptr)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, carr.array_size as i64)
+    emit_str(s, c" x ")
+    emit_str(s, cty)
+    emit_str(s, c"], ptr @")
+    emit_name(s, carr.name, carr.name_len)
+    emit_str(s, c", i64 0, i64 ")
+    emit_reg(s, cidx)
+    emit_str(s, c"\n")
+    cptr
+
+# LARB R48: a const scalar is inlined, so `@N` has no storage to point at.  A
+# located error at the `@`, in ritz0's words; it was an unlocated "cannot take
+# address" (`@&N`: "cannot take mutable address").  1 when `e` (`@op` or
+# `@&op`) was refused.
+fn const_scalar_addr_refused(s: *EmitterState, e: *Expr) -> i32
+    let op: *Expr = e.operand
+    if op == null or op.kind != EXPR_IDENT
+        return 0
+    let ce: *ConstEntry = unshadowed_const(s, op.ident_ptr, op.ident_len)
+    if ce == null or ce.const_type == TYPE_ARRAY
+        return 0
+    emit_str(s, c"  ; ERROR: address of a const scalar\n")
+    eprints_cstr(c"error: ")
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(e.span.line as i64)
+    eprints_cstr(c":")
+    eprint_int(e.span.col as i64)
+    eprints_cstr(c": cannot take the address of const `")
+    var i: i32 = 0
+    while i < op.ident_len
+        eprint_char(*(op.ident_ptr + i))
+        i += 1
+    eprints_cstr(c"`; a const scalar has no storage\n")
+    s.error_count = s.error_count + 1
+    1
+
 pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     # AGAST #3234: `look(@mka()[1])`, an element of a call's array lent to a
     # call (#3050; ref_check refuses any other `@` of it): the element's
@@ -1494,6 +1588,9 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     if op.kind == EXPR_INDEX and op.right != null and op.right.kind == EXPR_RANGE
         addr_of_slice_refused(s, op)
         return 0
+    let const_ptr: i32 = emit_const_array_ptr(s, op)   # LARB R48
+    if const_ptr >= 0
+        return const_ptr
     # AGAST #1509: `@g[i][j]` / `@g[i]` over a multi-dimensional array.
     var nd_addr: NdIndexPtr
     if emit_nd_index_ptr(s, op, @nd_addr) == 1
@@ -2135,6 +2232,8 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c"\n")
             return result
     else if e.op == OP_ADDR
+        if const_scalar_addr_refused(s, e) == 1
+            return 0
         let lend_from: i32 = own_temp_mark(s)
         let addr_ptr: i32 = emit_lvalue_ptr(s, e.operand)
         own_lend_temps(s, e.operand, lend_from)   # AGAST #3050
@@ -2151,6 +2250,8 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
         return 0
     else if e.op == OP_ADDR_MUT
         # @&expr - mutable address-of, returns ptr type (not i64)
+        if const_scalar_addr_refused(s, e) == 1   # LARB R48: `@&N`
+            return 0
         let lend_mut_from: i32 = own_temp_mark(s)
         let addr_mut_ptr: i32 = emit_lvalue_ptr(s, e.operand)
         own_lend_temps(s, e.operand, lend_mut_from)   # AGAST #3050
