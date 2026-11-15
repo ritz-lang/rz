@@ -1376,8 +1376,12 @@ pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     if reg == 0 or own_take_temp_mark(o, e) == 0
         return
     var len: i32 = 0
-    let name: *u8 = own_call_ret_type(s, e, @len)
+    var count: i32 = 0
+    let name: *u8 = own_temp_type(s, e, @len, @count)
     if name == null
+        return
+    if count > 0
+        own_note_array_call_temp(s, e, reg, name, len, count)
         return
     let slot: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -1395,6 +1399,30 @@ pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     o.temp_last_reg = reg
     o.temp_last_slot = slot
 
+# AGAST #3258: own_note_temp of a `-> [N]T` call's result `reg`, T needing a
+# drop: a `[N x T]` value spilled to a slot, or the sret slot `reg` already is
+# (#3181), queued to drop per element as a `[N]T` binding is.
+fn own_note_array_call_temp(s: *EmitterState, e: *Expr, reg: i32, name: *u8, len: i32, count: i32)
+    let o: *OwnState = s.own
+    let ra: *Param = call_ret_array(s, e)
+    var slot: i32 = reg
+    if array_param_uses_byval(s, ra) == 0
+        slot = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, slot)
+        emit_str(s, c" = alloca ")
+        emit_array_value_llvm_type(s, ra)
+        emit_str(s, c"  ; temporary\n  store ")
+        emit_array_value_llvm_type(s, ra)
+        emit_str(s, c" ")
+        emit_reg(s, reg)
+        emit_str(s, c", ptr ")
+        emit_reg(s, slot)
+        emit_str(s, c"\n")
+    own_push_temp(s, slot, name, len, count)
+    o.temp_last_reg = reg
+    o.temp_last_slot = slot
+
 # AGAST #2262: the slot own_note_temp just spilled `reg` to, or 0.  A method
 # receiver that is a temporary is passed as that slot, not a copy of it.
 pub fn own_temp_slot_of(s: *EmitterState, reg: i32) -> i32
@@ -1402,6 +1430,18 @@ pub fn own_temp_slot_of(s: *EmitterState, reg: i32) -> i32
     if reg == 0 or o.temp_last_reg != reg
         return 0
     o.temp_last_slot
+
+# AGAST #3258: 1 when the move check marked `e` a temporary, which emitting it
+# will spill (own_note_temp); keeps the mark.
+pub fn own_temp_marked(s: *EmitterState, e: *Expr) -> i32
+    let o: *OwnState = s.own
+    let te: **Expr = o.temp_exprs
+    var i: i32 = 0
+    while i < o.temp_expr_count
+        if te[i] == e
+            return 1
+        i += 1
+    0
 
 # 1 when the move check marked `e` a temporary; forgets the mark.
 fn own_take_temp_mark(o: *OwnState, e: *Expr) -> i32
@@ -2215,10 +2255,27 @@ pub fn array_fill_struct_elem(s: *EmitterState, e: *Expr, out_name: **u8, out_le
         return 0
     e.int_val as i32
 
+# AGAST #3258: the move-only struct T of a call's `-> [N]T` result: returns T's
+# name (its length in *out_len, N in *out_count), or null.
+fn own_call_ret_array_type(s: *EmitterState, e: *Expr, out_len: *i32, out_count: *i32) -> *u8
+    let ra: *Param = call_ret_array(s, e)
+    if ra == null or ra.param_array_elem_type != TYPE_STRUCT or ra.param_type_name_len <= 0 or ra.param_array_size <= 0
+        return null
+    if own_type_is_move_only(s, ra.param_type_name, ra.param_type_name_len) == 0
+        return null
+    *out_len = ra.param_type_name_len
+    *out_count = ra.param_array_size
+    ra.param_type_name
+
 # The move-only type a temporary `e` holds, or null: a call's result (count
-# 0), or an array literal's elements (count N, AGAST #2266).
+# 0), its `[N]T` result's elements (count N, AGAST #3258), or an array
+# literal's elements (count N, AGAST #2266).
 fn own_temp_type(s: *EmitterState, e: *Expr, out_len: *i32, out_count: *i32) -> *u8
     *out_count = 0
+    if e.kind == EXPR_CALL or e.kind == EXPR_METHOD
+        let rn: *u8 = own_call_ret_array_type(s, e, out_len, out_count)
+        if rn != null
+            return rn
     if e.kind != EXPR_ARRAY_LIT
         return own_call_ret_type(s, e, out_len)
     var name: *u8 = null
@@ -2680,6 +2737,10 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
     else if k == STMT_FOR
         own_walk(s, stmt.for_start, 0)
         own_walk(s, stmt.for_end, 0)
+        # `for x in mka()` drops none of a `[N]T` result's elements on ritz0
+        # (AGAST #3284): not a temporary here, as it wasn't before #3258.
+        if stmt.for_start != null and call_ret_array(s, stmt.for_start) != null
+            own_take_temp_mark(s.own, stmt.for_start)
 
 # After a statement is emitted: a `return` ends its block for the check,
 # and so does a `break` / `continue` in a loop (their moves reach the loop

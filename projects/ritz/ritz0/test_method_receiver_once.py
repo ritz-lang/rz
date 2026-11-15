@@ -155,6 +155,31 @@ fn mv() -> V
     MADE = MADE + 1
     return V { a: [P { x: 1 }, P { x: 2 }] }
 
+# The same of a Drop type: a temporary, dropped per element (AGAST #3258).
+fn mkt() -> [2]T
+    MADE = MADE + 1
+    return [T { id: 1 }, T { id: 2 }]
+
+# Large enough (520 bytes) to come back through an sret slot (AGAST #3181).
+struct TB
+    id: i32
+    pad: [64]i32
+
+impl Drop for TB
+    fn drop(self: @&TB)
+        DROPS = DROPS + 1
+
+impl TB
+    fn peek(self: @TB) -> i32
+        return self.id
+
+fn mkb() -> [2]TB
+    MADE = MADE + 1
+    return [TB { id: 1, pad: [0; 64] }, TB { id: 2, pad: [0; 64] }]
+
+fn lk(a: @[2]T) -> i32
+    return a[0].id
+
 # The index 1, counted: MADE goes up by 10 per evaluation.
 fn one() -> i64
     MADE = MADE + 10
@@ -247,6 +272,15 @@ CASES = {
     "elem_of_rvalue_field_array": ("if mv().a[1].get() != 2\n        MADE = 50", 1, 0, {}),
     "elem_of_rvalue_field_array_index_once": (
         "if mv().a[one()].get() != 2\n        MADE = 50", 11, 0, {}),
+    # A `[N]T` result of a Drop T nobody takes drops each element, as a
+    # statement and as the spill its element is read from (AGAST #3258).
+    "array_rvalue_drops_each": ("mkt()", 1, 2, {}),
+    "elem_of_rvalue_drops_each": ("if mkt()[1].peek() != 2\n        MADE = 50", 1, 2, {}),
+    "array_rvalue_lent_drops_each": ("if lk(@mkt()) != 1\n        MADE = 50", 1, 2, {}),
+    "array_rvalue_sret_drops_each": ("mkb()", 1, 2, {}),
+    "elem_of_rvalue_sret_drops_each": ("if mkb()[1].peek() != 2\n        MADE = 50", 1, 2, {}),
+    # ritz0 drops none of an iterated one (AGAST #3284); ritz1 matches it.
+    "array_rvalue_iterated": ("for x in mkt()\n        x.peek()", 1, 0, {}),
     # Inside an argument.
     "in_argument": ("take(mp().get())", 1, 0, {}),
     "in_a_borrowed_local": ("let t = mp().next()\n    look(@t)", 1, 0, {}),
@@ -553,6 +587,18 @@ def test_receiver_evaluated_once(request, tmp_path, compiler, name):
     rc = _run(request, tmp_path, compiler, prefix + TEMPLATE.format(body=body))
     assert rc == made * 10 + drops, (
         f"{compiler} {name}: exit {rc}, expected MADE={made} DROPS={drops}")
+
+
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_array_temporary_spilled_once(request, tmp_path, compiler):
+    """ritz1's `mkt()[1].peek()` reads the element from the slot its drop is
+    queued on, as a struct temporary's receiver is (AGAST #3258): one
+    `[2 x %T]` in `g`, not a second copy to read from."""
+    body = "if mkt()[1].peek() != 2\n        MADE = 50"
+    assert _run(request, tmp_path, compiler, TEMPLATE.format(body=body)) == 12
+    ir = (tmp_path / "main.ll").read_text()
+    g = re.search(r"define [^\n]*@g\(\)[^\n]*\{\n(.*?)\n\}", ir, re.S).group(1)
+    assert len(re.findall(r"= alloca \[2 x %T\]", g)) == 1, g
 
 
 @pytest.mark.parametrize("compiler,name", _params(PROGRAMS))
