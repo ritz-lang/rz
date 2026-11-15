@@ -339,11 +339,6 @@ pub fn main() -> i32
         Vacant => r = 42
     return r
 """,
-}
-
-# ritz1 emits IR clang rejects for this scrutinee: the enum aggregate is
-# compared as an i64 (#2184).  Move it to RUNNABLE when that lands.
-RITZ0_ONLY = {
     # A static method's result as a scrutinee.
     "impl_static_method_as_scrutinee": OPT
     + """
@@ -526,12 +521,6 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
 @pytest.mark.parametrize("name", sorted(RUNNABLE))
 def test_ritz0_is_the_oracle(tmp_path, name):
     assert _run("ritz0", tmp_path, name, RUNNABLE[name]) == EXPECTED
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY))
-def test_ritz0_only(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, RITZ0_ONLY[name]) == EXPECTED
 
 
 @pytest.mark.integration
