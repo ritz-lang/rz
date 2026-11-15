@@ -1,4 +1,4 @@
-"""ritz0: an element store drops the old element; arrays of any rank drop;
+"""An element store drops the old element; arrays of any rank drop;
 a Drop array must be initialised (LARB R39, AGAST #3305, #3376).
 
 LANGUAGE_SPEC §13.6: `a[i] = v`, `g[i][j] = v` and `h.a[i] = v` drop the
@@ -11,20 +11,15 @@ whose element type has drop glue must have an initialiser.
 so `D` spells out both which elements dropped and in what order. Each program
 exits 42 when `D` is what the spec says, otherwise `D % 200` (never 42).
 
-ritz1 does the same in #3377; until then these run on ritz0 only.
+Every row runs on ritz0, ritz1 and ritz1_selfhosted (ritz1: AGAST #3377).
 """
 
-import os
-import subprocess
-from pathlib import Path
+import re
 
-import fast_link
 import pytest
-from ritz0_inproc import run_ritz0
+from test_ref_into_value import COMPILERS, _compile, _run
 
 pytestmark = pytest.mark.integration
-
-RITZ_ROOT = Path(__file__).resolve().parent.parent
 
 PRELUDE = """\
 var D: i64 = 0
@@ -66,12 +61,26 @@ fn one()
     var a: [2]S = [S { x: 1 }, S { x: 2 }]
     a[1] = S { x: 30 }
 """, "one()", (2 * 10 + 1) * 10 + 30),
-    # v (8), then the index (7), then the old element (2); 1 and 3 at the end.
-    "store_order": ("""\
+    # The old element (2) drops after the index (7) is evaluated, and after
+    # v (8) is; 1 and 3 drop at the end.  Which of v and the index goes first
+    # is not pinned: ritz0 evaluates v first, ritz1 the index (AGAST #3432).
+    "store_after_index": ("""\
 fn f()
     var a: [2]S = [S { x: 1 }, S { x: 2 }]
-    a[idx(1)] = mk(3)
-""", "f()", 87213),
+    a[idx(1)] = S { x: 3 }
+""", "f()", 7213),
+    "store_after_value": ("""\
+fn f()
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    a[1] = mk(3)
+""", "f()", 8213),
+    # As g[i][j] = v.
+    "rank2_store_after_index_and_value": ("""\
+fn f()
+    var g: [1][2]S = [ [S { x: 1 }, S { x: 2 }] ]
+    g[0][idx(1)] = S { x: 3 }
+    g[0][0] = mk(4)
+""", "f()", 72814 * 10 + 3),
     # Rank 2 at scope end: index order, g[0][0] .. g[1][1].
     "rank2_scope_end": ("""\
 fn f()
@@ -124,27 +133,12 @@ def _source(body, call, want):
             + f"\n    return verdict({want})\n")
 
 
-def _compile(tmp_path, src_text):
-    src = tmp_path / "main.ritz"
-    src.write_text(src_text)
-    ll = tmp_path / "main.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    comp = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
-    return comp, ll
-
-
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(RUNS))
-def test_ritz0_element_store_and_nd_drops(tmp_path, name):
+def test_element_store_and_nd_drops(tmp_path, compiler, name):
     body, call, want = RUNS[name]
-    comp, ll = _compile(tmp_path, _source(body, call, want))
-    assert comp.returncode == 0 and ll.exists(), (
-        f"ritz0 failed to compile:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}")
-    exe = tmp_path / "main"
-    link = fast_link.clang(["clang", str(ll), "-o", str(exe), "-nostdlib"],
-                           cwd=tmp_path, capture_output=True, text=True)
-    assert link.returncode == 0, link.stderr[-2000:]
-    rc = subprocess.run([str(exe)], check=False, capture_output=True, timeout=60).returncode
-    assert rc == 42, f"{name}: D % 200 == {rc}, spec says D == {want}"
+    rc = _run(compiler, tmp_path, name, _source(body, call, want))
+    assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
 
 
 # §3.3: a Drop array local needs an initialiser; the error is at the name.
@@ -155,21 +149,26 @@ UNINIT = {
 }
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(UNINIT))
-def test_ritz0_uninitialised_drop_array_refused(tmp_path, name):
+def test_uninitialised_drop_array_refused(tmp_path, compiler, name):
     body = "fn f()\n    let k = 1\n" + UNINIT[name]
-    comp, _ = _compile(tmp_path, _source(body, "f()", 0))
+    comp, ll, _ = _compile(compiler, tmp_path, name, _source(body, "f()", 0))
     out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"accepted an uninitialised Drop array:\n{out[-1000:]}"
+    assert comp.returncode != 0, f"{compiler} accepted an uninitialised Drop array:\n{out[-1000:]}"
+    assert not ll.exists()
     assert "Traceback" not in out, out[-2000:]
-    assert "main.ritz:" + str(PRELUDE.count("\n") + 3) + ":9: " in out, out[-2000:]
-    assert "`a` must be initialised: its elements have `drop`" in out, out[-2000:]
+    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+    where = f"{PRELUDE.count(chr(10)) + 3}:9"
+    assert (where, "`a` must be initialised: its elements have `drop`") in found, \
+        f"{compiler}: wanted the error at {where}:\n{out[-2000:]}"
 
 
-def test_ritz0_uninitialised_copy_array_and_drop_struct_accepted(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_uninitialised_copy_array_and_drop_struct_accepted(tmp_path, compiler):
     """Only an array of a drop-glue type needs one: a `[2]i32`, and a plain
     `var b: S` (the constructor idiom, 13 in the corpus), stay as they were."""
     body = "fn f()\n    var a: [2]i32\n    a[0] = 1\n    var b: S\n    b.x = 4\n"
-    comp, ll = _compile(tmp_path, _source(body, "f()", 4))
+    comp, ll, _ = _compile(compiler, tmp_path, "uninit_ok", _source(body, "f()", 4))
     out = comp.stdout + comp.stderr
-    assert comp.returncode == 0 and ll.exists(), out[-2000:]
+    assert comp.returncode == 0 and ll.exists(), f"{compiler}:\n{out[-2000:]}"

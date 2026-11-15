@@ -2167,9 +2167,12 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         # #3017's `let g = h.m` reach here typed N-D.
         if emit_nd_array_init_copy(s, alloca_reg, stmt.var_array_shape, stmt.var_init) == 1
             return
+        # AGAST #3377: a nested literal / fill, level by level.
+        if stmt.var_init.kind == EXPR_ARRAY_LIT or stmt.var_init.kind == EXPR_ARRAY_FILL
+            emit_nd_array_init_into(s, stmt.var_array_shape, 0, alloca_reg, stmt.var_init)
+            return
         # AGAST #1509: no other initializer form of a multi-dimensional array
-        # is lowered (the 1-D literal / fill paths would write it as a flat
-        # [N x i64]).  Fail closed: the error count stops the driver writing
+        # is lowered.  Fail closed: the error count stops the driver writing
         # any output.
         emit_nd_error(s, stmt.span.line, stmt.span.col, c"an initializer on a multi-dimensional array is not supported in ritz1")
         return
@@ -2380,8 +2383,8 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
 # is a located error.
 #
 # AGAST #2099: a whole struct element `g[i][j] = q` stores the `%P` at the
-# element's address, as the 1-D `[N]P` element store does (#190).  Like that
-# store, the element's old value is not dropped.  A leaf naming no struct (a
+# element's address, as the 1-D `[N]P` element store does (#190), dropping
+# the old element first (#3377).  A leaf naming no struct (a
 # generic clone that kept `T`, #3141) stays the located error: `store %T`
 # would be invalid IR.
 fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
@@ -2394,6 +2397,12 @@ fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
         return
     if sh.leaf_type == TYPE_STRUCT
         let sval: i32 = emit_store_into_slot(s, stmt.assign_value, TYPE_STRUCT, sh.leaf_name, sh.leaf_name_len)   # AGAST #2454, #2390
+        # AGAST #3377 (LARB R39): the old element drops after v, before the
+        # store, when a binding owns the array (`g`, `h.m`).
+        var arr: *Expr = stmt.if_cond as *Expr
+        while arr != null and arr.kind == EXPR_INDEX
+            arr = arr.left
+        own_drop_old_elem(s, arr, dst.reg, sh.leaf_name, sh.leaf_name_len)
         emit_str(s, c"  store ")
         emit_llvm_type_struct(s, TYPE_STRUCT, sh.leaf_name, sh.leaf_name_len)
         emit_str(s, c" ")
@@ -2717,7 +2726,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                         # Array field in struct - GEP to element, then store
                         let idx: i32 = emit_expr(s, target_expr.right)
                         let val: i32 = emit_store_into_slot(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)   # AGAST #2454, #2390
-                        emit_field_array_elem_store(s, member_result.reg, field, idx, val, stmt.assign_value)
+                        emit_field_array_elem_store(s, member_result.reg, field, idx, val, stmt.assign_value, target_expr.left)
                         return
                     # AGAST #1596: `x.f[i] = v` with `f: *T` / `**T` —
                     # store THROUGH the pointer held in the field.
@@ -4943,31 +4952,120 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
             src_ptr = loc.reg
         else
             src_ptr = emit_global_array_ptr(s, find_global(s, value.ident_ptr, value.ident_len))
+    emit_nd_plane_copy(s, sh, 0, dst_ptr, src_ptr)
+    1
+
+# Copy the dimension-`from` plane of `sh` (the whole array at 0) from
+# `src_ptr` over `dst_ptr`: one aggregate load + store, or pointer-to-pointer
+# when large (as emit_local_array_copy).
+fn emit_nd_plane_copy(s: *EmitterState, sh: *ArrayShape, from: i32, dst_ptr: i32, src_ptr: i32)
+    var leaves: i64 = 1
+    var d: i32 = from
+    while d < sh.rank
+        leaves = leaves * (sh.dims[d] as i64)
+        d = d + 1
     var align: i64 = 8
-    if elem_size_align(s, sh.leaf_type, sh.leaf_name, sh.leaf_name_len, @align) * (shape_leaf_count(sh) as i64) >= SRET_MIN_BYTES
+    if elem_size_align(s, sh.leaf_type, sh.leaf_name, sh.leaf_name_len, @align) * leaves >= SRET_MIN_BYTES
         emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
         emit_reg(s, dst_ptr)
         emit_str(s, c", ptr ")
         emit_reg(s, src_ptr)
         emit_str(s, c", i64 ptrtoint (ptr getelementptr (")
-        emit_array_shape_llvm(s, sh, 0)
+        emit_array_shape_llvm(s, sh, from)
         emit_str(s, c", ptr null, i32 1) to i64))\n")
         s.sret_helpers_used = 1
-        return 1
+        return
     let agg: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, agg)
     emit_str(s, c" = load ")
-    emit_array_shape_llvm(s, sh, 0)
+    emit_array_shape_llvm(s, sh, from)
     emit_str(s, c", ptr ")
     emit_reg(s, src_ptr)
     emit_str(s, c"\n  store ")
-    emit_array_shape_llvm(s, sh, 0)
+    emit_array_shape_llvm(s, sh, from)
     emit_str(s, c" ")
     emit_reg(s, agg)
     emit_str(s, c", ptr ")
     emit_reg(s, dst_ptr)
     emit_str(s, c"\n")
+
+# The address of row `idx` of the dimension-`d` plane of `sh` at `ptr`.
+fn emit_nd_row_gep(s: *EmitterState, sh: *ArrayShape, d: i32, ptr: i32, idx: i32) -> i32
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = getelementptr ")
+    emit_array_shape_llvm(s, sh, d)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", i64 0, i64 ")
+    emit_int(s, idx as i64)
+    emit_str(s, c"\n")
+    r
+
+# The number of elements an array literal `[a, b, ..]` lists.
+fn array_lit_count(e: *Expr) -> i32
+    var n: i32 = 0
+    var it: *Expr = e.args
+    while it != null
+        n = n + 1
+        it = it.next
+    n
+
+# AGAST #3377 (LARB R39): write the initialiser `e` into the dimension-`d`
+# plane of `sh` at `ptr`, the whole N-D local at d == 0.  Each level is a
+# literal `[a, b, ..]` or a fill `[v; n]` with exactly that dimension's
+# count: every element gets a value, which an array of a Drop type must have
+# (§3.3).  The innermost rows are written as a 1-D local's are
+# (emit_array_lit_into / emit_array_fill_into), after the leaf slot checks;
+# an outer `[row; n]` writes
+# row 0 and copies it into the rest, so a move-only leaf can fill only one
+# row (as `[v; n]` itself, ref_check_fill).  Any other row (a named `[M]T`
+# local, a call) is refused, located.  Returns 1 when it wrote `e`.
+fn emit_nd_array_init_into(s: *EmitterState, sh: *ArrayShape, d: i32, ptr: i32, e: *Expr) -> i32
+    var count: i32 = -1
+    if e.kind == EXPR_ARRAY_LIT
+        count = array_lit_count(e)
+    else if e.kind == EXPR_ARRAY_FILL
+        count = e.int_val as i32
+    else
+        emit_nd_error(s, e.span.line, e.span.col, c"a row of a multi-dimensional array initializer must be `[a, b, ..]` or `[v; n]` in ritz1")
+        return 0
+    if count != sh.dims[d]
+        emit_nd_error(s, e.span.line, e.span.col, c"multi-dimensional array initializer's shape does not match the local array's")
+        return 0
+    if d == sh.rank - 1
+        # The leaf slot checks emit_var_decl runs on a 1-D initialiser, which
+        # see only rows of `[N][M]T`: `300` into a u8, a `"A"` into a `*u8`
+        # (the literal's own `@.str`, #2357), a bool (#2342).
+        bool_check_array_lit(s, e, sh.leaf_type, sh.leaf_name, sh.leaf_name_len)
+        literal_array(s, e, sh.leaf_type, sh.leaf_pointee)
+        if e.kind == EXPR_ARRAY_LIT
+            emit_array_lit_into(s, ptr, sh.dims[d], sh.leaf_type, sh.leaf_name, sh.leaf_name_len, e)
+        else
+            emit_array_fill_into(s, ptr, sh.dims[d], sh.leaf_type, sh.leaf_name, sh.leaf_name_len, e.left)
+        return 1
+    if e.kind == EXPR_ARRAY_LIT
+        var idx: i32 = 0
+        var it: *Expr = e.args
+        while it != null
+            let row: i32 = emit_nd_row_gep(s, sh, d, ptr, idx)
+            if emit_nd_array_init_into(s, sh, d + 1, row, it) == 0
+                return 0
+            idx = idx + 1
+            it = it.next
+        return 1
+    if count > 1 and sh.leaf_type == TYPE_STRUCT and own_type_is_move_only(s, sh.leaf_name, sh.leaf_name_len) == 1
+        emit_nd_error(s, e.span.line, e.span.col, c"`[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`")
+        return 0
+    let row0: i32 = emit_nd_row_gep(s, sh, d, ptr, 0)
+    if emit_nd_array_init_into(s, sh, d + 1, row0, e.left) == 0
+        return 0
+    var i: i32 = 1
+    while i < count
+        emit_nd_plane_copy(s, sh, d + 1, emit_nd_row_gep(s, sh, d, ptr, i), row0)
+        i = i + 1
     1
 
 # Copy a whole local `[N x T]` from `src_ptr` over `dst_ptr` as one aggregate
@@ -5304,7 +5402,9 @@ fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *Struc
 # (field_array_elem_llvm, ritz0's layout) and store `val` at that width.
 # Shared by both member-index store paths, which used to carry their own
 # i8/i32/i64/ptr ladders and stored u16/u32/bool elements as 8-byte i64.
-fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructField, idx: i32, val: i32, val_expr: *Expr)
+# `place` is the array field stored into (`h.a` of `h.a[i] = v`), whose old
+# element is dropped when a binding owns it (own_drop_old_elem, AGAST #3377).
+fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructField, idx: i32, val: i32, val_expr: *Expr, place: *Expr)
     let et: i32 = field.array_elem_type
     var is_struct: i32 = 0
     if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
@@ -5329,6 +5429,7 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
     var sty: *u8 = c"i64"
     var sval: i32 = val
     if is_struct == 1
+        own_drop_old_elem(s, place, elem_ptr, field.array_elem_type_name, field.array_elem_type_name_len)
         # AGAST #188: `store %T %val` matches the `load %T` of the RHS.
         emit_str(s, c"  store ")
         emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
@@ -6385,7 +6486,20 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     let idx_reg: i32 = emit_expr(s, stmt.while_cond)
                     # Emit value expression
                     let val_reg: i32 = emit_store_into_slot(s, stmt.assign_value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len)   # AGAST #2454, #2390
-                    emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value)
+                    var lfia_base: Expr
+                    memset(@lfia_base as *u8, 0, sizeof(Expr))
+                    lfia_base.kind = EXPR_IDENT
+                    lfia_base.span = stmt.span
+                    lfia_base.ident_ptr = stmt.var_name
+                    lfia_base.ident_len = stmt.var_name_len
+                    var lfia_place: Expr
+                    memset(@lfia_place as *u8, 0, sizeof(Expr))
+                    lfia_place.kind = EXPR_MEMBER
+                    lfia_place.span = stmt.span
+                    lfia_place.left = @lfia_base
+                    lfia_place.ident_ptr = stmt.assign_target
+                    lfia_place.ident_len = stmt.assign_target_len
+                    emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value, @lfia_place)
         # AGAST #1439: unresolved here -> shared member-store path.
         if lfia_done == 0
             emit_local_field_store_fallback(s, stmt, 1)
@@ -6442,6 +6556,14 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_reg(s, idx_reg)
                 emit_str(s, c"\n")
                 if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+                    # AGAST #3377 (LARB R39): the old element drops first.
+                    var ia_place: Expr
+                    memset(@ia_place as *u8, 0, sizeof(Expr))
+                    ia_place.kind = EXPR_IDENT
+                    ia_place.span = stmt.span
+                    ia_place.ident_ptr = stmt.assign_target
+                    ia_place.ident_len = stmt.assign_target_len
+                    own_drop_old_elem(s, @ia_place, elem_ptr, local.type_name, local.type_name_len)
                     # AGAST #190: struct-array element store — `store %T %val`
                     # matches the value loaded/returned as the element struct
                     # type (e.g. `%DbField` from `call %DbField @db_field(..)`).

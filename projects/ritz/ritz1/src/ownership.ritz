@@ -1828,7 +1828,40 @@ pub fn own_decl(s: *EmitterState, stmt: *Stmt, before: i32)
     var owned: i32 = 0
     if stmt.var_init != null
         owned = 1
+    else
+        own_check_uninit_array(s, stmt, idx)
     own_register(s, idx, owned)
+
+# §3.3 (LARB R39, AGAST #3377): `var a: [N]S` with no `=`, S with drop glue,
+# is refused at the name: an element store drops the old element, so every
+# one must hold a value.  ritz0's words (array_rules.uninitialised_drop_array).
+fn own_check_uninit_array(s: *EmitterState, stmt: *Stmt, idx: i32)
+    let loc: *LocalVar = local_at(s, idx)
+    if loc.var_type != TYPE_ARRAY
+        return
+    var count: i32 = 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if loc.array_shape != null
+        if own_shape_elems(loc.array_shape, @count, @name, @len) == 0
+            return
+    else if loc.array_elem_type == TYPE_STRUCT and loc.array_size > 0
+        name = loc.type_name
+        len = loc.type_name_len
+    else
+        return
+    if own_type_is_move_only(s, name, len) == 0
+        return
+    var line: i32 = stmt.name_span.line
+    var col: i32 = stmt.name_span.col
+    if line == 0
+        line = stmt.span.line
+        col = stmt.span.col
+    own_eprint_loc(line, col)
+    eprints_cstr(c": error: `")
+    own_eprint_name(stmt.var_name, stmt.var_name_len)
+    eprints_cstr(c"` must be initialised: its elements have `drop`\n")
+    s.error_count = s.error_count + 1
 
 # The registered binding `name` currently resolves to, or null.
 fn own_lookup(s: *EmitterState, name: *u8, len: i32) -> *OwnBinding
@@ -2723,6 +2756,61 @@ fn own_local_field_path(s: *EmitterState, b: *OwnBinding, stmt: *Stmt, out_exact
         if f != null
             own_field_store_cond(s, b, f, path, *out_exact)
     path
+
+# Element stores (LARB R39, AGAST #3377; ritz0's _drop_old_element, #3376).
+# `a[i] = v`, `g[i][j] = v`, `h.a[i] = v`, once v and the index are evaluated
+# and before v is stored: drop the old element at `elem_ptr`, of type `name`,
+# when a binding owns the array `arr` (the store's target without its
+# indexes): an array local's drop flag, or for a field path `h.a` h's flag
+# with `a` not moved out.  Through a pointer or reference, or into a global,
+# nothing owns the old element (AGAST #2179).  Every element of an owned Drop
+# array holds a value: such an array must be initialised (§3.3).
+pub fn own_drop_old_elem(s: *EmitterState, arr: *Expr, elem_ptr: i32, name: *u8, len: i32)
+    if arr == null or name == null or len <= 0
+        return
+    if own_type_is_move_only(s, name, len) == 0
+        return
+    var cond: i32 = 0
+    if arr.kind == EXPR_IDENT
+        let b: *OwnBinding = own_lookup(s, arr.ident_ptr, arr.ident_len)
+        if b == null or b.count == 0
+            return
+        cond = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, cond)
+        emit_str(s, c" = load i1, ptr ")
+        emit_reg(s, b.flag)
+        emit_str(s, c"\n")
+    else if arr.kind == EXPR_MEMBER
+        var b: *OwnBinding = null
+        var dn: *u8 = null
+        var dl: i32 = 0
+        let f: *StructField = own_member_path(s, arr, @b, @dn, @dl)
+        if f == null or b == null or f.field_type != TYPE_ARRAY
+            return
+        var exact: i32 = 0
+        let path: i32 = own_path_of(b, arr, @exact)
+        cond = own_field_drop_cond(s, b, own_overlap(b, path, 0))
+    if cond == 0
+        return
+    let saved: i32 = last_expr_here(s)
+    let do_label: i32 = next_label(s)
+    let next: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond)
+    emit_str(s, c", label %")
+    emit_label(s, do_label)
+    emit_str(s, c", label %")
+    emit_label(s, next)
+    emit_str(s, c"\n")
+    begin_block(s, do_label)
+    own_emit_glue(s, elem_ptr, name, len, 0)
+    emit_str(s, c"  br label %")
+    emit_label(s, next)
+    emit_str(s, c"\n")
+    begin_block(s, next)
+    if saved != 0
+        set_last_expr(s, saved)
 
 # Check one statement before it is emitted (emit_stmt).  Nested statement
 # lists are checked as emit_stmt reaches them.  Mirrors ritz0's _check_stmt.

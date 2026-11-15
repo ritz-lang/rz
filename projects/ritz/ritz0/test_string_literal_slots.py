@@ -304,15 +304,15 @@ ACCEPTED = {
 }
 
 
+# An N-D initialiser's leaves are slots too (ritz1: AGAST #3377).
+REJECTED["fit_element_nested"] = (_fn("", "let a: [1][2]u8 = [ [1, 300] ]\n0"), 2, 29, _fits(300, "u8"))
+ACCEPTED["element_nested"] = ('fn main() -> i32\n    var a: [1][2]*u8 = [ ["A", "B"] ]\n'
+                              "    *a[0][1] as i32\n", 66)
+
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
-# no N-D initializer, no tuple type and no `await`.
-RITZ0_REJECTED = {
-    "fit_element_nested": (_fn("", "let a: [1][2]u8 = [ [1, 300] ]\n0"), 2, 29, _fits(300, "u8")),
-}
+# no tuple type and no `await`.
 RITZ0_ACCEPTED = {
     "tuple_element": ('fn main() -> i32\n    let t: (i32, *u8) = (1, "A")\n    *t.1 as i32\n', 65),
-    "element_nested": ('fn main() -> i32\n    var a: [1][2]*u8 = [ ["A", "B"] ]\n'
-                       "    *a[0][1] as i32\n", 66),
 }
 
 # Compiled, not run: nothing to link `take` against, and a one-file link has no
@@ -414,15 +414,6 @@ def test_what_does_not_fit_is_a_located_error(request, tmp_path, compiler, name)
 def test_what_fits_compiles_and_runs(request, tmp_path, compiler, name):
     source, code = ACCEPTED[name]
     _assert_runs(request, compiler, tmp_path, name, source, code)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_REJECTED))
-def test_ritz0_only_rejected(request, tmp_path, name):
-    source, line, col, message = RITZ0_REJECTED[name]
-    code, output, where = _refusal(request, "ritz0", tmp_path, source, line, col)
-    assert code != 0 and message in output, output
-    assert re.search(rf"unit\.ritz:{where}\b", output), output
 
 
 @pytest.mark.integration

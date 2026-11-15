@@ -729,6 +729,24 @@ pub fn main() -> i32
         return 1
     return (w.a[1][2].k as i32) + 2
 """,
+    # AGAST #3377: N-D local initialisers, list and fill at every level
+    # (an outer `[row; n]` copies the row), scalar and struct leaves.
+    "local_initializers": """\
+struct P
+    a: i32
+    b: u8
+
+pub fn main() -> i32
+    var g: [2][3]i32 = [ [1, 2, 3], [4, 5, 6] ]
+    var h: [3][2]u8 = [ [7; 2]; 3]
+    var k: [2][2][2]P = [ [ [P { a: 1, b: 2 }, P { a: 3, b: 4 }], [P { a: 5, b: 6 }; 2] ], [ [P { a: 9, b: 8 }; 2]; 2] ]
+    h[2][1] = 9
+    if g[0][0] != 1 or g[0][2] != 3 or g[1][0] != 4 or h[0][0] != 7 or h[2][0] != 7 or h[1][1] != 7
+        return 1
+    if k[0][0][1].a != 3 or k[0][1][0].b != 6 or k[0][1][1].a != 5 or k[1][1][1].a != 9 or k[1][0][0].b != 8
+        return 2
+    return g[1][2] + (h[2][1] as i32) + (k[0][0][0].b as i32) + 25
+""",
     # ... of a Drop struct (LARB R39, AGAST #3376): a store drops the old
     # element and the stored one is moved, not dropped.  g must be
     # initialised (§3.3).  g[1][1] = q drops x=2, g[0][1] = .. drops x=0:
@@ -958,11 +976,7 @@ def test_ritz0_is_the_oracle(tmp_path, name):
 
 # ritz1 gaps against the oracle, as strict xfails: the room that closes one
 # flips it.
-RITZ1_GAPS = {
-    # R39 needs an initialiser on these, and ritz1 has no N-D initialiser.
-    "struct_elem_load_drop": 3377,   # N-D Drop array drops at scope end
-    "struct_elem_store_drop": 3377,  # element store drops the old element
-}
+RITZ1_GAPS: dict[str, int] = {}
 
 
 @pytest.mark.integration
@@ -1048,12 +1062,42 @@ pub fn main() -> i32
     var g: [2][2]i32 = [[1, 2], [3, 4]]
     return g[1][1]
 """, ":1:", "cannot parse item"),
-    # Any initializer that does parse reaches emit_var_decl's guard.
+    # AGAST #3377: an N-D local initialiser is `[a, b, ..]` / `[v; n]` at
+    # every level, with each level's count: a scalar row, a short literal, a
+    # named row and a move-only row copied by `[row; n]` are refused.
     "local_initializer": ("""\
 pub fn main() -> i32
     var g: [2][2]i32 = [0; 2]
     return g[1][1]
-""", ":2:", "an initializer on a multi-dimensional array is not supported"),
+""", ":2:", "a row of a multi-dimensional array initializer must be"),
+    "local_initializer_short": ("""\
+pub fn main() -> i32
+    var g: [2][2]i32 = [ [1, 2] ]
+    return g[1][1]
+""", ":2:", "initializer's shape does not match the local array's"),
+    "local_initializer_short_row": ("""\
+pub fn main() -> i32
+    var g: [2][2]i32 = [ [1, 2], [3] ]
+    return g[1][1]
+""", ":2:", "initializer's shape does not match the local array's"),
+    "local_initializer_named_row": ("""\
+pub fn main() -> i32
+    var r: [2]i32 = [1, 2]
+    var g: [2][2]i32 = [ r, [3, 4] ]
+    return g[1][1]
+""", ":3:", "a row of a multi-dimensional array initializer must be"),
+    "local_initializer_move_only_rows": ("""\
+struct S
+    x: i32
+
+impl Drop for S
+    fn drop(self:& S)
+        let k = self.x
+
+pub fn main() -> i32
+    var g: [2][1]S = [ [S { x: 1 }; 1]; 2]
+    return 0
+""", ":9:", "`[v; n]` copies `v` into every element"),
     "global_initializer": ("""\
 var gg: [2][2]i32 = [0; 2]
 
