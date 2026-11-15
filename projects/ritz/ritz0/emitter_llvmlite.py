@@ -11916,13 +11916,21 @@ class LLVMEmitter:
     def _call_mismatch_message(self, call: rast.Call, llvm_msg: str) -> str:
         """Rewrite llvmlite's message with the callee's name in front of it."""
         fname = call.func.name if isinstance(call.func, rast.Ident) else "<expression>"
+        return self._arg_mismatch_message(fname, fname, len(call.args), llvm_msg)
+
+    def _arg_mismatch_message(self, fname: str, key: str, nargs: int,
+                              llvm_msg: str) -> str:
+        """llvmlite's call complaint `llvm_msg` in Ritz's words, naming the
+        callee `fname`.  `key` is its `self.functions` entry, whose def spells
+        the parameter types; `nargs` the arguments the call passes, counted
+        as llvmlite counts them (a method's receiver is argument 1)."""
         m = re.search(r"#(\d+) arg mismatch", llvm_msg)
         if m:
             n = int(m.group(1))
-            as_int = self._enum_arg_message(call, fname, n, llvm_msg)
+            as_int = self._enum_arg_message(key, nargs, fname, n, llvm_msg)
             if as_int is not None:
                 return as_int
-            another = self._another_struct_arg_message(call, fname, n, llvm_msg)
+            another = self._another_struct_arg_message(key, nargs, fname, n, llvm_msg)
             if another is not None:
                 return another
             return (
@@ -11930,7 +11938,7 @@ class LLVMEmitter:
             )
         return f"call to `{fname}`: {llvm_msg}"
 
-    def _enum_arg_message(self, call: rast.Call, fname: str, n: int,
+    def _enum_arg_message(self, key: str, nargs: int, fname: str, n: int,
                           llvm_msg: str) -> Optional[str]:
         """AGAST #2136: argument `n` is an enum value where the callee takes
         an integer.  llvmlite's message is the only record of the two types
@@ -11949,15 +11957,15 @@ class LLVMEmitter:
         if enum_name is None:
             return None
         expected = m.group(1)
-        fn_entry = self.functions.get(fname)
+        fn_entry = self.functions.get(key)
         if fn_entry is not None:
             params = fn_entry[1].params
-            if len(params) == len(call.args) and 0 < n <= len(params):
+            if len(params) == nargs and 0 < n <= len(params):
                 expected = self._format_ritz_type(params[n - 1].type)
         return (f"argument {n} of `{fname}`: "
                 + self._enum_as_int_message(expected, enum_name))
 
-    def _another_struct_arg_message(self, call: rast.Call, fname: str, n: int,
+    def _another_struct_arg_message(self, key: str, nargs: int, fname: str, n: int,
                                     llvm_msg: str) -> Optional[str]:
         """AGAST #3294: argument `n` is a struct of another type than its
         parameter's, read back from llvmlite's `%D != %C`.  #2293's words,
@@ -11967,10 +11975,10 @@ class LLVMEmitter:
         if not pair:
             return None
         param = f"#{n}"
-        fn_entry = self.functions.get(fname)
+        fn_entry = self.functions.get(key)
         if fn_entry is not None:
             params = fn_entry[1].params
-            if len(params) == len(call.args) and 0 < n <= len(params):
+            if len(params) == nargs and 0 < n <= len(params):
                 param = params[n - 1].name
         return let_rules.another_struct_argument(param, *pair)
 
@@ -13769,6 +13777,7 @@ class LLVMEmitter:
 
         # Handle static method call - no receiver needed
         if is_static_call or not has_self_param:
+            self._check_method_arity(expr, fn, len(expr.args))
             # Static method - just emit the arguments, no receiver
             all_args = []
             for i, arg in enumerate(expr.args):
@@ -13789,8 +13798,10 @@ class LLVMEmitter:
                 converted = self._convert_type(arg, expected_type, expr.args[i])
                 converted_args.append(converted)
 
-            return self.builder.call(fn, converted_args)
+            return self._emit_method_call_insn(expr, fn, mangled_name, converted_args, 0)
 
+        # The receiver is argument 1, as `get(p, 1, 2)` would have it.
+        self._check_method_arity(expr, fn, len(expr.args) + 1)
         first_param_type = self._fn_param_types(fn)[0]
 
         # `mk().bump()` with `self: @&T` / `self:& T` is a store into the
@@ -13935,7 +13946,41 @@ class LLVMEmitter:
             converted = self._convert_type(arg, expected_type, expr.args[i - 1] if i else None)
             converted_args.append(converted)
 
-        return self.builder.call(fn, converted_args)
+        return self._emit_method_call_insn(expr, fn, mangled_name, converted_args, 1)
+
+    def _check_method_arity(self, expr: rast.MethodCall, fn: ir.Function,
+                            given: int) -> None:
+        """AGAST #3319: a method call passes as many arguments as its method
+        takes, in _emit_call's words.  `given` counts a receiver as argument
+        1, as the method's `:&` and type diagnostics number them."""
+        want = len(self._fn_param_types(fn))
+        if given != want:
+            raise EmitError(
+                f"`{expr.method}` called with {given} argument(s) but "
+                f"defined with {want}", expr.span)
+
+    def _emit_method_call_insn(self, expr: rast.MethodCall, fn: ir.Function,
+                               key: str, args: list, lead: int) -> ir.Value:
+        """AGAST #3319: the call to a method's fn, `args` led by `lead`
+        receivers, with llvmlite's signature complaint made _emit_call's
+        located one.  The argument named is the first whose logical type
+        isn't its parameter's; llvmlite's `#N` counts an sret slot, so it's
+        not read.  A complaint no argument explains is the emitter's own and
+        re-raises, as _emit_call's does."""
+        try:
+            return self.builder.call(fn, args)
+        except TypeError as exc:
+            if not any(k in str(exc) for k in self._LLVMLITE_CALL_MISMATCH):
+                raise
+            for i, (arg, want) in enumerate(zip(args, self._fn_param_types(fn))):
+                if arg.type == want:
+                    continue
+                at = expr.args[i - lead] if i >= lead else expr.expr
+                msg = f"Type of #{i + 1} arg mismatch: {want} != {arg.type}"
+                raise EmitError(
+                    self._arg_mismatch_message(expr.method, key, len(args), msg),
+                    getattr(at, 'span', None) or expr.span) from None
+            raise
 
     @staticmethod
     def _pointer_levels(ty: ir.Type) -> Tuple[int, ir.Type]:
