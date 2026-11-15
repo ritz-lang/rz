@@ -162,6 +162,16 @@ stays here; remote hosts only run rooms.
   here-doc, never the `Write` tool**: `Write` outside the host's workspace
   waits on an approval nobody gives, and the host room stalls for up to 30
   minutes (starbux 2026-11-10, toffee 2026-11-11).
+- **ssh from this room: always `ssh -F ~/.ssh/rz_hosts <host>`.** The
+  sandbox maps only uid 1000 into its user namespace, so root-owned
+  `/etc/ssh/ssh_config.d/*.conf` shows up as owned by `nobody` and plain
+  `ssh` dies with "Bad owner or permissions". It will keep coming back
+  (Aaron, 2026-11-15), so don't try to fix the files. `-F` skips the system
+  config entirely. `~/.ssh/rz_hosts` also maps huburght, starbux, toffee and
+  chungus to their LAN IPs, which don't resolve by name here, and sets
+  `BatchMode yes`. If a host's DHCP lease moves, update the IP there. Use
+  ssh only to look (`uptime`, `systemctl --user status`, logs); changes on
+  a host still go through its host room's verbs.
 - **Push by refspec on remote hosts.** Plain `git fetch` / `git push` work
   on every host (the `ssh -F /dev/null` workaround from toffee 2026-11-11 is
   no longer needed; don't put it in briefings). Remote rooms push with the
