@@ -133,18 +133,35 @@ def test_unwrap_let_takes_payload_type(run_with, payload, carrier, source, compi
     assert run_with(compiler, name, _program(payload, carrier, source)) == 0
 
 
-# `self: @Tag` borrows `t[0].tag`, so its address is taken.  ritz0 can't index
-# the inferred `%Vec$E` local on that lvalue path (#3237); ritz1 runs it.
+# `self: @Tag` borrows `t[0].tag`, so its address is taken: the lvalue path
+# must know `t` is a Vec<E> to index its heap buffer.  ritz0 recorded no Ritz
+# type for `let t = x.unwrap()` (an intrinsic, with no FnDef to read a return
+# type off), and crashed "Cannot index type: %Vec$E" (#3237).  Every source
+# and carrier the ticket names; the payload is the Vec one that indexes.
+BORROWED_ROWS = [("res", s) for s in SOURCES] + [("opt", "call")]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("carrier,source", BORROWED_ROWS)
+def test_unwrap_let_borrowed_receiver(run_with, carrier, source, compiler):
+    program = _program("vec", carrier, source, recv="self: @Tag")
+    name = f"unwrap_borrowed_{carrier}_{source}"
+    assert run_with(compiler, name, program) == 0
+
+
+# `.unwrap_or(d)` is the same intrinsic and takes the same payload type.
+# ritz1 leaves that let untyped (#3250).
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "compiler",
     [
-        pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#3237"))
-        if c == "ritz0"
-        else c
+        c if c == "ritz0"
+        else pytest.param(c, marks=pytest.mark.xfail(strict=True, reason="#3250"))
         for c in COMPILERS
     ],
 )
-def test_unwrap_let_borrowed_receiver(run_with, compiler):
-    program = _program("vec", "res", "call", recv="self: @Tag")
-    assert run_with(compiler, "unwrap_borrowed_receiver", program) == 0
+def test_unwrap_or_let_borrowed_receiver(run_with, compiler):
+    program = _program("vec", "res", "call", recv="self: @Tag").replace(
+        ".unwrap()", ".unwrap_or(vec_of(9))")
+    assert run_with(compiler, "unwrap_or_borrowed", program) == 0

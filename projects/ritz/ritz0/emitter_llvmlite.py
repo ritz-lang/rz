@@ -1704,6 +1704,17 @@ class LLVMEmitter:
                         fn_def = self.functions[mangled][1]
                         if fn_def is not None and fn_def.ret_type is not None:
                             return fn_def.ret_type
+                # `.unwrap()` / `.unwrap_or(d)` on an Option<T> / Result<T, E>
+                # is _try_emit_enum_unwrap_method's intrinsic, with no FnDef to
+                # read a return type off: it's the payload T, as monomorph's
+                # _infer_value_type says.  Without it `let t = r.unwrap()` had
+                # no Ritz type, so `t[0].tag.m()` with `m(self: @Tag)` couldn't
+                # see `t` as a Vec on the lvalue path: "Cannot index type:
+                # %Vec$E" (AGAST #3237).
+                if (expr.method in ('unwrap', 'unwrap_or')
+                        and recv_type.name in ('Option', 'Result')
+                        and recv_type.args):
+                    return recv_type.args[0]
             return None  # Complex - would need full type resolution
         elif isinstance(expr, rast.Field):
             # Field access - resolve struct type and return field type
