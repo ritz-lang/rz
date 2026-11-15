@@ -3157,6 +3157,34 @@ fn main() -> i32
     0
 ```
 
+A field whose declared type is fully known is a slot even in an args-less
+literal, as a generic fn's concrete parameter is for its argument: fully known
+means it names none of the outer struct's parameters (or the outer literal has
+its arguments, from its slot or written out); a field naming one still being
+inferred, even in part (`Pair<u8, A>`), is no slot, and its value infers on its
+own and then binds the outer parameter (LARB R51a, AGAST #3430):
+
+```ritz
+struct Box2<T>
+    v: T
+
+struct Tagged<T>
+    n: i32
+
+struct W<A>
+    a: A
+    t: Tagged<u8>
+    b: Box2<A>
+
+fn g<U>(x: U, t: Tagged<u8>) -> i32
+    t.n
+
+fn main() -> i32
+    let x: u16 = 2
+    let w = W { a: x, t: Tagged { n: 4 }, b: Box2 { v: x } }   # t: Tagged<u8>; W<u16>
+    g(1, Tagged { n: 3 }) + w.t.n           # the param: Tagged<u8>
+```
+
 ```ritz expect-error="can't infer `T` for `Tagged`: write its type arguments, `Tagged<T> { .. }`"
 struct Tagged<T>
     n: i32

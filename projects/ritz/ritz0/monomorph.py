@@ -615,8 +615,13 @@ class Monomorphizer:
                     and len(node.type_args) == len(generic.type_params):
                 params = list(generic.params)
                 subst = TypeSubstitution(dict(zip(generic.type_params, node.type_args)))
+            elif generic is not None and not node.type_args:
+                # Args still being inferred: only a param whose type names
+                # none of the fn's type params is a slot (LARB R51a).
+                params = [None if _names_type_param(p.type, generic.type_params) else p
+                          for p in generic.params]
             for param, arg in zip(params, node.args):
-                if param.type is not None:
+                if param is not None and param.type is not None:
                     self._mark_lit_slot(arg, subst.apply(param.type) if subst else param.type)
         elif isinstance(node, rast.MethodCall):
             # A plain impl's method: its params after `self`.
@@ -638,14 +643,22 @@ class Monomorphizer:
             return
         fields = dict(struct_def.fields)
         subst = None
-        if struct_def.type_params:
-            if len(lit.type_args) != len(struct_def.type_params):
-                return
-            subst = TypeSubstitution(dict(zip(struct_def.type_params, lit.type_args)))
+        params = struct_def.type_params or []
+        if params and len(lit.type_args) == len(params):
+            subst = TypeSubstitution(dict(zip(params, lit.type_args)))
+        elif params and lit.type_args:
+            return
         for name, value in lit.fields:
             field_type = fields.get(name)
-            if field_type is not None:
-                self._mark_lit_slot(value, subst.apply(field_type) if subst else field_type)
+            if field_type is None:
+                continue
+            if subst is not None:
+                self._mark_lit_slot(value, subst.apply(field_type))
+            elif not _names_type_param(field_type, params):
+                # Args-less with no slot: a field whose type is fully known
+                # is still a slot (LARB R51a); one naming a param is not, and
+                # its value binds that param after it infers (§4.4).
+                self._mark_lit_slot(value, field_type)
 
     def _struct_lit_from_slot(self, lit: rast.StructLit) -> None:
         """An args-less generic literal in a slot of its struct's instance
@@ -2460,6 +2473,27 @@ def monomorphize(module: rast.Module) -> rast.Module:
         return monomorphizer.monomorphize(module)
     finally:
         _TYPE_ALIASES = saved
+
+
+def _names_type_param(ty, params) -> bool:
+    """Whether type `ty` names any of `params` anywhere inside it: a field or
+    parameter type that names none is fully known, a slot even while the
+    params are being inferred (LARB R51a).  `Pair<u8, A>` names A: partly
+    known counts as not known.  An alias is resolved first."""
+    if not params or ty is None:
+        return False
+    if isinstance(ty, (list, tuple)):
+        return any(_names_type_param(t, params) for t in ty)
+    if not dataclasses.is_dataclass(ty) or isinstance(ty, type):
+        return False
+    if isinstance(ty, rast.NamedType):
+        if ty.name in params and not ty.args:
+            return True
+        resolved = resolve_alias(ty)
+        if resolved is not ty:
+            return _names_type_param(resolved, params)
+    return any(_names_type_param(getattr(ty, f.name), params)
+               for f in dataclasses.fields(ty) if f.name != 'span')
 
 
 def _struct_lits(node):

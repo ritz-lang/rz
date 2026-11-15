@@ -55,6 +55,9 @@ HEAD = ("struct T\n    id: i32\n"
         "struct Box2<X>\n    v: X\n"
         "struct Two<A, B>\n    a: A\n    b: B\n")
 
+# A generic struct no field binds: only a slot or written-out args can.
+TAGGED = "struct Tagged<X>\n    n: i32\n"
+
 # Each compiler infers (LARB R51).  `sizeof(b.v)` tells the instance: 1 for u8, 2 for
 # u16, 8 for i64.  name -> (source after HEAD, exit code)
 INFERS = {
@@ -172,6 +175,51 @@ RUNS = {
 }
 
 
+RITZ0, ALL = ("ritz0",), tuple(COMPILERS)
+
+# LARB R51a (#3430): ritz0 only until ritz1 follows (#3431); a row ritz1
+# already gets right (#3408) runs on ALL.  name -> (compilers, source, exit code)
+R51A_INFERS = {
+    # LARB R51a (#3430): a field whose type names none of the outer's
+    # params is a slot though the outer literal is args-less.  `Tagged`'s
+    # X only the slot binds (it was "can't infer `X`"), and `b`'s `5` is a
+    # u8, not a Box2<i64>.
+    "known_field": (RITZ0, TAGGED + "struct W<A>\n    a: A\n    t: Tagged<u8>\n    b: Box2<u8>\n"
+                    "fn main() -> i32\n    let w = W { a: 3, t: Tagged { n: 4 }, b: Box2 { v: 5 } }\n"
+                    "    w.t.n + w.b.v as i32 * 10 + sizeof(w.b.v) as i32 * 100\n", 154),
+    # Two deep: `t`'s slot makes the middle literal a V<u16> (its `2` a u16,
+    # not an i64), and its own field the inner one a Tagged<u8>.
+    "known_field_nested": (RITZ0, TAGGED + "struct V<B>\n    b: B\n    u: Tagged<u8>\n"
+                           "struct W<A>\n    a: A\n    t: V<u16>\n"
+                           "fn main() -> i32\n"
+                           "    let w = W { a: 1, t: V { b: 2, u: Tagged { n: 3 } } }\n"
+                           "    w.t.u.n + w.t.b as i32 * 10 + sizeof(w.t.b) as i32 * 100\n", 223),
+    # A field naming a still-unbound outer param is no slot: the inner
+    # literal infers from its fields (Box2<u8>), and that binds A.
+    "outer_param_field": (ALL, "struct W2<A>\n    t: Box2<A>\n"
+                          "fn main() -> i32\n    let x: u8 = 5\n    let w = W2 { t: Box2 { v: x } }\n"
+                          "    sizeof(w.t.v) as i32 * 10 + w.t.v as i32\n", 15),
+    # The same principle: a generic fn's concrete param is its argument's
+    # slot, its `6` a u8.
+    "generic_fn_known_param": (RITZ0, TAGGED + "fn g<U>(x: U, t: Tagged<u8>, b: Box2<u8>) -> i32\n"
+                               "    t.n + b.v as i32 * 10 + sizeof(b.v) as i32 * 100\n"
+                               "fn main() -> i32\n    g(1, Tagged { n: 4 }, Box2 { v: 6 })\n", 164),
+}
+
+# name -> (compilers, source after HEAD, line:col, the error)
+R51A_ERRORS = {
+    # LARB R51a: a partially known field type (`Tag2<u8, A>`, A bound only
+    # by another field) is no slot and binds nothing, so the inner literal's
+    # X is unbound, the error at the inner literal.
+    "partially_known_field": (ALL, "struct Tag2<X, Y>\n    n: i32\n"
+                              "struct W<A>\n    a: A\n    t: Tag2<u8, A>\n"
+                              "fn main() -> i32\n    let w = W { a: 1, t: Tag2 { n: 1 } }\n"
+                              "    w.t.n\n", "14:26",
+                              "can't infer `X` for `Tag2`: write its type arguments, "
+                              "`Tag2<X, Y> { .. }`"),
+}
+
+
 def _emit(compiler, path, ll, work):
     env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{work}")
     if compiler == "ritz0":
@@ -270,3 +318,19 @@ def test_a_literal_that_names_its_struct_builds(tmp_path, need_ritz1, compiler, 
     need_ritz1(compiler)
     body, code = RUNS[name]
     assert _run(compiler, tmp_path, HEAD + body) == code, f"{compiler}, {name}"
+
+
+@pytest.mark.parametrize("compiler,name", [(c, n) for n, row in sorted(R51A_INFERS.items())
+                                           for c in row[0]])
+def test_a_known_field_is_a_slot(tmp_path, need_ritz1, compiler, name):
+    need_ritz1(compiler)
+    _, body, code = R51A_INFERS[name]
+    assert _run(compiler, tmp_path, HEAD + body) == code, f"{compiler}, {name}"
+
+
+@pytest.mark.parametrize("compiler,name", [(c, n) for n, row in sorted(R51A_ERRORS.items())
+                                           for c in row[0]])
+def test_a_partly_known_field_error_is_located(tmp_path, need_ritz1, compiler, name):
+    need_ritz1(compiler)
+    _, body, where, message = R51A_ERRORS[name]
+    _refused(compiler, tmp_path, HEAD + body, where, message, name)
