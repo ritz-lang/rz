@@ -12000,6 +12000,23 @@ class LLVMEmitter:
                 param = params[n - 1].name
         return let_rules.another_struct_argument(param, *pair)
 
+    def _check_fn_type_arity(self, call: rast.Call, fname: str,
+                             fn_type: rast.FnType) -> None:
+        """AGAST #3333: a call through a fn pointer passes as many arguments
+        as its `fn(..)` type takes, in a direct call's words and place.
+
+        The emit loops below zip the arguments with the params, so an extra
+        argument was dropped without a word and a missing one died in
+        llvmlite's IndexError. `fname` is the callee as the message names it:
+        the local or param, or `<expression>` for a nameless one, as
+        _call_mismatch_message names it. Argument *kinds* need nothing here:
+        llvmlite's mismatch reaches _emit_call as a direct call's does."""
+        if len(call.args) != len(fn_type.params):
+            raise EmitError(
+                f"`{fname}` called with {len(call.args)} argument(s) but "
+                f"defined with {len(fn_type.params)}",
+                self._call_span(call))
+
     def _local_holds_no_fn(self, name: str) -> bool:
         """True when `name` is a local or param whose value is no fn pointer."""
         if name in self.locals:
@@ -12031,6 +12048,7 @@ class LLVMEmitter:
                 if isinstance(ritz_type, rast.FnType):
                     if not self._ret_is_a_value(ritz_type.ret):   # AGAST #2260, #3286
                         self._reject_procedure_value(call, fname)
+                    self._check_fn_type_arity(call, fname, ritz_type)
                     # This is a function pointer - indirect call
                     # Get the function pointer value
                     if fname in self.locals:
@@ -12082,6 +12100,7 @@ class LLVMEmitter:
             if isinstance(ritz_type, rast.FnType):
                 if not self._ret_is_a_value(ritz_type.ret):   # AGAST #2260, #3286
                     self._reject_procedure_value(call, None)
+                self._check_fn_type_arity(call, "<expression>", ritz_type)
                 for arg, param_type in zip(call.args, ritz_type.params):
                     self._literal_into_slot(param_type, arg)
             args = [self._emit_expr(arg) for arg in call.args]

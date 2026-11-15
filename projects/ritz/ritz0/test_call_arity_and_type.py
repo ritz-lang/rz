@@ -25,7 +25,12 @@ struct place auto-borrowed by a `:&` param, an array into a Span.
 
 ritz0 raises a Python IndexError for a method, static method or UFCS call of
 the wrong arity until #3319 lands, so those rows run on ritz1 and
-ritz1_selfhosted only; so does a call through a fn pointer, which ritz0 accepts (#3333).
+ritz1_selfhosted only.
+
+A call through a fn pointer is counted against its `fn(..)` type: a local, a
+param, or a nameless callee (`pick()(1, 2)`), which ritz0 accepted until #3333.
+ritz0 calls a nameless one `<expression>`; ritz1 doesn't name it yet (#3348), so
+its rows match the rest of the message.
 ritz0's `syscallN` builtins take any count (#3334), and wrap an integer into a
 single-field struct param (#3336): neither is judged here.
 """
@@ -89,6 +94,9 @@ fn pass_on(s:& S) -> i32
 fn inc(a: i32) -> i32
     a + 1
 
+fn pick() -> fn(i32) -> i32
+    inc
+
 fn span_len(sp: Span<i32>) -> i64
     sp.len as i64
 
@@ -103,10 +111,12 @@ pub fn main() -> i32
 """
 
 ARITY = "`{f}` called with {n} argument(s) but defined with {m}"
+NAMELESS = "` called with {n} argument(s) but defined with {m}"
 WRONG = "argument {n} of `{f}` has the wrong type: "
 
-# name -> (line with `@` at the column the error names, message).
-# Each line is main's next statement; main then returns 0.
+# name -> (line with `@` at the column the error names, message[, extra]).
+# Each line is main's next statement; main then returns 0.  With `extra`, it's
+# the body of the fn `extra` declares (see _refused).
 REFUSED = {
     "free_too_many": ("    return @add(1, 2, 3)", ARITY.format(f="add", n=3, m=2)),
     "free_too_few": ("    return @add(1)", ARITY.format(f="add", n=1, m=2)),
@@ -122,9 +132,16 @@ REFUSED = {
     "struct_into_int": ("    g(@s)", WRONG.format(n=1, f="g")),
     "struct_into_float": ("    fl(@s)", WRONG.format(n=1, f="fl")),
     "second_argument": ("    add(1, @s)", WRONG.format(n=2, f="add")),
+    # Through a fn pointer (#3333): counted and kinded as a direct call is.
+    "fn_pointer_too_many": ("    let f: fn(i32) -> i32 = inc\n    return @f(1, 2)", ARITY.format(f="f", n=2, m=1)),
+    "fn_pointer_too_few": ("    let f: fn(i32) -> i32 = inc\n    return @f()", ARITY.format(f="f", n=0, m=1)),
+    "fn_pointer_struct_into_int": ("    let f: fn(i32) -> i32 = inc\n    return f(@s)", WRONG.format(n=1, f="f")),
+    "fn_param_too_many": ("    return @h(1, 2)", ARITY.format(f="h", n=2, m=1),
+                          "fn via(h: fn(i32) -> i32) -> i32\n"),
+    "nameless_too_many": ("    return @pick()(1, 2)", NAMELESS.format(n=2, m=1)),
 }
 
-# ritz0 raises IndexError on these (#3319) or accepts them (a fn pointer).
+# ritz0 raises IndexError on these (#3319).
 REFUSED_RITZ1 = {
     "method_too_many": ("    return @s.get(1, 2)", ARITY.format(f="get", n=3, m=2)),
     "method_too_few": ("    return @s.get()", ARITY.format(f="get", n=1, m=2)),
@@ -135,7 +152,6 @@ REFUSED_RITZ1 = {
     # The receiver is an element of a Vec field: the method is E's, not Vec's.
     "element_receiver_too_many": ("    var w: W = W { es: vec_new<S>() }\n    w.es.push(s)\n    return @w.es[0].get(1, 2)",
                                   ARITY.format(f="get", n=3, m=2)),
-    "fn_pointer_too_many": ("    let f: fn(i32) -> i32 = inc\n    return @f(1, 2)", ARITY.format(f="f", n=2, m=1)),
 }
 
 
@@ -177,7 +193,7 @@ def test_a_call_that_does_not_fit_its_callee_is_refused(compile_with, name, comp
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("name", sorted(REFUSED_RITZ1))
-def test_a_method_or_pointer_call_that_does_not_fit_is_refused(compile_with, name, compiler):
+def test_a_method_call_that_does_not_fit_is_refused(compile_with, name, compiler):
     _refused(compile_with, compiler, name, *REFUSED_RITZ1[name])
 
 
