@@ -1172,8 +1172,12 @@ CASES.update(UNTYPED_DEREF)
 # but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
 # value would satisfy the xfail just as a refusal does.
 
-SOURCE_GAPS = {
-    # AGAST #2302 left these: a `-> [N]T` call as an `if` arm.  (Iterated, it's #2997.)
+# AGAST #2305: whole-array sources and targets ritz1 refused or failed closed on
+# (they were SOURCE_GAPS).  ritz0 is the oracle for each.  The Span programs
+# take `@`: a bare array into a `Span<T>` is ritz0's "write `@x` to borrow it",
+# so the bare forms the ticket listed were xfailing on ritz0's refusal.
+SOURCES = {
+    # An `if` value of array type: each arm stores its own array (no phi).
     "if_call_arms_tail": """\
 fn f() -> [4]i32
     [0, 0, 0, 3]
@@ -1211,6 +1215,69 @@ pub fn main() -> i32
     var b: [4]i32 = [0, 0, 0, 4]
     return g(if a[0] == 0 then a else b)
 """,
+    "if_untyped_locals": """\
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    var b: [4]i32 = [0, 0, 0, 4]
+    let r = if a[0] == 0 then a else b
+    return r[3]
+""",
+    # Every target: a typed let, a global, `*p`, an assignment with a block arm.
+    "if_targets": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn g() -> [4]i32
+    [0, 0, 0, 4]
+
+var G: [4]i32
+
+fn put(p: *[4]i32, c: i32)
+    *p = if c == 0 then f() else g()
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 1]
+    let r: [4]i32 = if 1 == 1 then f() else g()
+    var q: [4]i32 = if 1 == 2 then a else g()
+    G = if 1 == 1 then a else q
+    var w: [4]i32
+    put(@w, 1)
+    var z: [4]i32
+    z = if 1 == 2
+        a
+    else
+        let t: [4]i32 = [0, 0, 0, 5]
+        t
+    return r[3] * 1000 + q[3] * 100 + G[3] * 10 + w[3] + z[3] - 4 - 5
+""",
+    # A method's tail, an `else if` chain, and an arm that returns early.
+    "if_method_tail_chain": """\
+struct S
+    n: i32
+
+impl S
+    fn pick(self: *S, c: i32) -> [3]i64
+        var a: [3]i64 = [0, 0, 1]
+        var b: [3]i64 = [0, 0, 2]
+        if c == 0
+            a
+        else if c == 1
+            b
+        else
+            if self.n == 9
+                return [0, 0, 9]
+            [0, 0, 4]
+
+pub fn main() -> i32
+    var s: S = S { n: 9 }
+    let x = s.pick(0)
+    let y = s.pick(1)
+    let z = s.pick(2)
+    s.n = 0
+    let w = s.pick(2)
+    return (x[2] + y[2] * 10 + z[2] * 100 + w[2] * 1000) as i32
+""",
+    # `[N]u8` / `[N]i8` into a StrView, bare or `@`: `{ &a[0], N }`.
     "strview_arg": """\
 fn g(s: StrView) -> i32
     return 3
@@ -1219,6 +1286,24 @@ pub fn main() -> i32
     var a: [3]u8 = [0, 0, 3]
     return g(a)
 """,
+    "strview_reads": """\
+struct H
+    a: [3]u8
+
+var G: [3]u8
+
+fn g(s: StrView) -> i32
+    return (s.len as i32) * 10 + (s.ptr[2] as i32)
+
+pub fn main() -> i32
+    var a: [3]u8 = [0, 0, 4]
+    var b: [3]i8 = [0, 0, 2]
+    var h: H
+    h.a[2] = 4
+    G[2] = 1
+    return g(a) + g(@a) + g(b) + g(h.a) + g(G) + g(@G) - 160
+""",
+    # A Span from a global, a field, and on a method's param.
     "span_global": """\
 import ritzlib.span
 
@@ -1228,7 +1313,7 @@ fn g(s: Span<i32>) -> i64
     return s.len
 
 pub fn main() -> i32
-    return g(G) as i32
+    return g(@G) as i32
 """,
     "span_field": """\
 import ritzlib.span
@@ -1237,11 +1322,27 @@ struct H
     a: [3]i32
 
 fn g(s: Span<i32>) -> i64
-    return s.len
+    return s.len + (s.ptr[2] as i64)
 
 pub fn main() -> i32
     var h: H
-    return g(h.a) as i32
+    h.a[2] = 4
+    return g(@h.a) as i32
+""",
+    "span_let_global_field": """\
+import ritzlib.span
+
+struct H
+    a: [3]i32
+
+var G: [3]i32
+
+pub fn main() -> i32
+    var h: H
+    h.a[2] = 4
+    let s: Span<i32> = @G
+    var t: Span<i32> = @h.a
+    return (s.len + t.len * 10 + (t.ptr[2] as i64) * 100) as i32
 """,
     "method_span": """\
 import ritzlib.span
@@ -1256,8 +1357,9 @@ impl S
 pub fn main() -> i32
     var r: S = S { n: 0 }
     var a: [3]i32 = [0, 0, 3]
-    return r.len(a) as i32
+    return r.len(@a) as i32
 """,
+    # Generic `T = [N]U`: a param, a return, a local, and a struct element.
     "generic_whole": """\
 fn g<T>(a: T) -> T
     return a
@@ -1275,6 +1377,29 @@ pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
     return g<[4]i32>(a)
 """,
+    "generic_local_and_struct": """\
+struct C
+    x: i32
+    y: i64
+
+fn g<T>(a: T) -> T
+    var x: T = a
+    return x
+
+fn h<T>(a: T) -> T
+    a
+
+pub fn main() -> i32
+    var a: [3]u8 = [0, 0, 3]
+    var b: [3]u8 = g<[3]u8>(a)
+    var c: [2]C
+    c[1].y = 4
+    var d: [2]C = h<[2]C>(c)
+    var e: [5]i64 = [0, 0, 0, 0, 7]
+    let f = g<[5]i64>(e)
+    return (b[2] as i32) + (d[1].y as i32) * 10 + (f[4] as i32) * 100 - 700
+""",
+    # `fn g<T>(a: @[4]T)` with `var b: [4]T = *a`, given `@a`.
     "generic_ref": """\
 fn g<T>(a: @[4]T) -> i32
     var b: [4]T = *a
@@ -1282,7 +1407,55 @@ fn g<T>(a: @[4]T) -> i32
 
 pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
-    return g<i32>(a)
+    return g<i32>(@a)
+""",
+    # `*@a` is the array `a`: a local, a `:&` param, a global.
+    "deref_addr": """\
+var G: [2]i32
+
+fn f(a:& [2]i32) -> i32
+    let b: [2]i32 = *@a
+    return b[1]
+
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    var c: [2]i32 = *@a
+    G = *@&a
+    return f(@&a) + c[1] + G[1] - 6
+""",
+}
+
+CASES.update(SOURCES)
+
+# AGAST #3277: `T = [N]U` inferred from the argument.  `g<[4]i32>(a)` is above.
+GENERIC_INFER_GAPS = {
+    "generic_infer_array": """\
+fn g<T>(a: T) -> i32
+    return 3
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    return g(a)
+""",
+}
+
+# AGAST #3276: a `match` value of array type.
+MATCH_GAPS = {
+    "match_call_arms_tail": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn g() -> [4]i32
+    [0, 0, 0, 4]
+
+fn h(c: i32) -> [4]i32
+    match c
+        0 => f()
+        _ => g()
+
+pub fn main() -> i32
+    let r = h(0)
+    return r[3]
 """,
 }
 
@@ -1349,7 +1522,8 @@ pub fn main() -> i32
 }
 
 GAPS = [
-    (SOURCE_GAPS, "AGAST #2305: a whole-array source or target ritz1 doesn't lower"),
+    (GENERIC_INFER_GAPS, "AGAST #3277: a generic `T = [N]U` inferred from an array argument"),
+    (MATCH_GAPS, "AGAST #3276: a `match` value of array type"),
     (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
     (PARAM_ND_GAPS, "AGAST #2098: a multi-dimensional array param"),
     (ROW_GAPS, "AGAST #2099: a whole row of a multi-dimensional array"),
@@ -1361,6 +1535,59 @@ GAPS = [
 # here: ritz0 refuses it only by failing on `(*p)[i]` (#2331), which LARB R9 makes
 # legal, so it's in test_ritz1_array_pointer_index.py now (#2330).
 REJECTED = {
+    # AGAST #2305: a StrView takes only an `[N]u8` / `[N]i8`, bare or `@`.
+    "strview_wrong_elem": """\
+fn g(s: StrView) -> i32
+    return 3
+
+pub fn main() -> i32
+    var a: [3]i32 = [0, 0, 3]
+    return g(a)
+""",
+    "strview_addr_wrong_elem": """\
+fn g(s: StrView) -> i32
+    return 3
+
+pub fn main() -> i32
+    var a: [3]i32 = [0, 0, 3]
+    return g(@a)
+""",
+    # AGAST #2305: `T = [4]i32` is held to its length; `*@a` to `a`'s; a Span
+    # of a global to its element.
+    "generic_wrong_len": """\
+fn g<T>(a: T) -> i32
+    return 3
+
+pub fn main() -> i32
+    var a: [3]i32 = [0, 0, 3]
+    return g<[4]i32>(a)
+""",
+    "deref_addr_wrong_len": """\
+pub fn main() -> i32
+    var a: [2]i32 = [1, 3]
+    let b: [3]i32 = *@a
+    return b[1]
+""",
+    # An `if` arm is judged as the store it is: `*i64` isn't `*i32`.
+    "if_arm_wrong_elem": """\
+fn f(a: [4]*i64, c: [4]*i32, n: i32) -> i32
+    let r: [4]*i32 = if n > 0 then a else c
+    return 0
+
+pub fn main() -> i32
+    0
+""",
+    "span_global_wrong_elem": """\
+import ritzlib.span
+
+var G: [3]i64
+
+fn g(s: Span<i32>) -> i64
+    return s.len
+
+pub fn main() -> i32
+    return g(@G) as i32
+""",
     # AGAST #2302: a call's `[N]T` is held to the rule a local's is.
     "ret_wrong_len": """\
 fn f() -> [4]i32
@@ -1823,6 +2050,16 @@ def test_ritz1_gap(ritz1_bin, tmp_path, program):
     assert _run("ritz1", tmp_path, "gap", program) == want
 
 
+# AGAST #2305: a gap is ritz0's answer that ritz1 doesn't give.  The xfail above
+# can't tell ritz0 refusing from ritz1 refusing: four of #2305's gaps had gone
+# stale that way (a bare array into a Span is "write `@x`" on ritz0 now).
+@pytest.mark.integration
+@pytest.mark.parametrize("program", [pytest.param(p, id=n) for programs, _ in GAPS
+                                     for n, p in sorted(programs.items())])
+def test_ritz0_answers_every_gap(tmp_path, program):
+    assert _run("ritz0", tmp_path, "gap", program) == 3
+
+
 def _refused_not_wrong():
     return [pytest.param(p, id=n) for programs, _ in GAPS for n, p in sorted(programs.items())]
 
@@ -1921,14 +2158,50 @@ pub fn main() -> i32
 """
 
 
-# AGAST #2302: an `if` whose arms are `-> [N]T` calls, as a fn's tail, is a gap
-# (SOURCE_GAPS) that ritz1 itself refuses: clang would too, but only after the
-# .ll is written.
+# AGAST #3276: a `match` whose arms are `-> [N]T` calls, as a fn's tail, is a
+# gap (MATCH_GAPS) that ritz1 itself refuses: clang would too, but only after
+# the .ll is written.  The `if` form is lowered since #2305.
 @pytest.mark.integration
 def test_ritz1_refuses_array_tail_value(ritz1_bin, tmp_path):
-    comp, ll = _compile("ritz1", ritz1_bin, tmp_path, "tail", SOURCE_GAPS["if_call_arms_tail"])
+    comp, ll = _compile("ritz1", ritz1_bin, tmp_path, "tail", MATCH_GAPS["match_call_arms_tail"])
     assert comp.returncode != 0 and not ll.exists()
     assert "a `-> [N]T` fn's value here is not lowered by ritz1" in comp.stdout + comp.stderr
+
+
+# AGAST #2305: an `if` arm of another length than the array it's stored in.
+# ritz0 writes a `phi [4 x i32]` of a `[3 x i32]`, which only clang refuses.
+IF_WRONG_LEN = {
+    "let": """\
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 1]
+    var b: [3]i32
+    var q: [4]i32 = if 1 == 2 then a else b
+    return q[3]
+""",
+    "tail": """\
+fn f() -> [4]i32
+    [0, 0, 0, 3]
+
+fn h(c: i32) -> [4]i32
+    var b: [3]i32
+    if c == 0
+        f()
+    else
+        b
+
+pub fn main() -> i32
+    let r = h(0)
+    return r[3]
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(IF_WRONG_LEN))
+def test_ritz1_refuses_if_arm_of_another_length(ritz1_bin, tmp_path, name):
+    comp, ll = _compile("ritz1", ritz1_bin, tmp_path, name, IF_WRONG_LEN[name])
+    assert comp.returncode != 0 and not ll.exists()
+    assert "array length does not match the local array's length" in comp.stdout + comp.stderr
 
 
 @pytest.mark.integration
@@ -1996,6 +2269,9 @@ def test_ritz0_refuses(tmp_path, name):
 # A later check would refuse most of these too, without saying where or why.
 # The argument check names the call, as ritz0 does.
 LOCATED = {
+    "strview_wrong_elem": "the parameter doesn't take a whole array",
+    "strview_addr_wrong_elem": "the parameter doesn't take a whole array",
+    "generic_wrong_len": "the array's length isn't the parameter's",
     "arg_wrong_len": "the array's length isn't the parameter's",
     "arg_ptr_i32": "the parameter doesn't take a whole array",
     "arg_ptr_array": "the parameter doesn't take a whole array",

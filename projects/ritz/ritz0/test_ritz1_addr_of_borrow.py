@@ -982,9 +982,8 @@ BY_VALUE_REFUSED = {name: ALL.pop(name) for name in (
 )}
 
 # Still open on ritz1, each held to ritz0's answer by a strict xfail.
-RITZ1_GAPS = {
-    "array_deref": "AGAST #2305: `*@a` isn't a whole-array source, for a local either",
-}
+RITZ1_GAPS: dict = {}
+# array_deref, `*@a` of an array, was here until AGAST #2305.
 # control_move_only_deref_field, `(*@t).id`, was here until AGAST #2449.
 
 

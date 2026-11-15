@@ -1020,6 +1020,10 @@ fn collect_instantiations_from_module(m: *Module)
         if ib.type_params == null
             var method: *FnDef = ib.methods
             while method != null
+                # AGAST #2305: a method's own `s: Span<i32>` instantiates
+                # Span$i32 as a free fn's does; left opaque, `s.len` was
+                # "unhandled EXPR_MEMBER".
+                collect_struct_types_from_signature(m, method)
                 reset_local_var_tracker()
                 var ipp: *Param = method.params
                 while ipp != null
@@ -2656,6 +2660,13 @@ fn specialize_fn_one_param(m: *Module, template: *FnDef, type_param_name: *u8, t
                     specialized.return_type = subst_type
                     specialized.return_type_name = subst_type_name
                     specialized.return_type_name_len = subst_type_len
+                    # AGAST #2305: `-> T` at T = `[N]E` returns the `[N x E]`.
+                    if subst_type == TYPE_ARRAY and specialized.ret_array_param == null
+                        let rap: *Param = calloc(1, sizeof(Param)) as *Param
+                        if param_take_array_arg(rap, subst_type_name, subst_type_len) == 1
+                            specialized.ret_array_param = rap
+                            specialized.return_type_name = rap.param_type_name
+                            specialized.return_type_name_len = rap.param_type_name_len
             # Otherwise it might be a generic struct like "Vec$T" -> "Vec$u8"
             else
                 var new_name: *u8 = null
@@ -2719,6 +2730,22 @@ fn param_take_ptr_array_arg(param: *Param, name: *u8, len: i32)
     param.param_pointee_array_shape = null
     param.param_type_name = pa.param_type_name
     param.param_type_name_len = pa.param_type_name_len
+
+# AGAST #2305: a by-value `a: T` (or `-> T`) at T = `[N]E` is the `a: [N]E` it
+# says: N, E, E's pointee and struct name from the `arrN_E` type argument, as
+# a written `[N]E` param records them.  It stayed TYPE_ARRAY with no N, so the
+# call refused `g<[4]i32>(a)` as the wrong length.  0 when `name` spells no array.
+fn param_take_array_arg(param: *Param, name: *u8, len: i32) -> i32
+    var arr: ArrayArg
+    if array_arg_decode(name, len, @arr) == 0
+        return 0
+    param.param_type = TYPE_ARRAY
+    param.param_array_size = arr.size
+    param.param_array_elem_type = arr.elem
+    param.param_array_elem_pointee = arr.pointee
+    param.param_type_name = arr.name
+    param.param_type_name_len = arr.name_len
+    1
 
 fn name_is_type_param(name: *u8, len: i32, tp: *u8, tp_len: i32) -> i32
     (name != null and len == tp_len and memcmp(name, tp, tp_len as i64) == 0) as i32
@@ -2836,6 +2863,8 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
             cloned.param_type = subst_type
             cloned.param_type_name = subst_name
             cloned.param_type_name_len = subst_len
+            if subst_type == TYPE_ARRAY
+                param_take_array_arg(cloned, subst_name, subst_len)   # AGAST #2305
             # AGAST #2354: `v: T` at T = `@&U` is the `v: @&U` it says, not a
             # `*U`, so `@x` into it is refused as shared (#2339), as on ritz0.
             let pointee: i32 = ptr_arg_pointee(subst_name, subst_len)
@@ -3144,6 +3173,14 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
             cloned.var_declared_type = subst_type
             cloned.var_type_name = subst_name
             cloned.var_type_name_len = subst_len
+            # AGAST #2305: `var x: T` at T = `[N]E` is the `[N]E` local.
+            var vaa: ArrayArg
+            if subst_type == TYPE_ARRAY and array_arg_decode(subst_name, subst_len, @vaa) == 1
+                cloned.var_array_size = vaa.size
+                cloned.var_array_elem_type = vaa.elem
+                cloned.var_array_elem_pointee = vaa.pointee
+                cloned.var_type_name = vaa.name
+                cloned.var_type_name_len = vaa.name_len
         else if s.var_type == TYPE_STRUCT and s.var_type_name != null
             var new_name_ptr: *u8 = null
             var new_name_len: i32 = 0

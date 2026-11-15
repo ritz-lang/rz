@@ -1180,6 +1180,9 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
         let array_addr: i32 = emit_array_arg_addr(s, arg, p)
         if array_addr != 0
             return array_addr
+        let sv_arr: *Expr = strview_array_src(s, arg, p)   # AGAST #2305
+        if sv_arr != null
+            return emit_strview_of_array(s, sv_arr)
         let place_addr: i32 = emit_borrowed_place(s, arg, p)   # AGAST #2335
         if place_addr != 0
             return place_addr
@@ -1291,9 +1294,120 @@ fn span_array_source(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> *L
 fn coerce_array_to_span(s: *EmitterState, e: *Expr, reg: i32, name: *u8, name_len: i32) -> i32
     let loc: *LocalVar = span_array_source(s, e, name, name_len)
     if loc == null
+        let placed: i32 = emit_span_of_addr_place(s, e, name, name_len)   # AGAST #2305
+        if placed != 0
+            return placed
         return reg
     span_array_elem_fits(s, e, loc, name, name_len)   # AGAST #2781
     return emit_span_of_array(s, loc, name, name_len)
+
+# AGAST #2305: `Span { &x[0], N }` for `@x` into the `Span$T` slot (name,
+# name_len), where `x` is a whole 1-D array that isn't a local: a global, an
+# inline field, `*p` for `p: *[N]T`.  ritz0 takes each (`g(@G)`, `g(@h.a)`);
+# they passed `@x`'s i64 where the %Span$T goes, and clang refused it.  The
+# element is held to the Span's as for a local (#2781); an element this can't
+# spell isn't judged.  0 when `e` is anything else; emits nothing then.
+fn emit_span_of_addr_place(s: *EmitterState, e: *Expr, name: *u8, name_len: i32) -> i32
+    if e == null or name == null or name_len <= 5 or memcmp(name, c"Span$", 5) != 0
+        return 0
+    if e.kind != EXPR_UNARY or (e.op != OP_ADDR and e.op != OP_ADDR_MUT) or e.operand == null
+        return 0
+    let x: *Expr = e.operand
+    var src: ArraySrc
+    if arg_array_shape(s, x, @src) == 0
+        return 0
+    if src.elem != TYPE_PTR and src.elem != TYPE_PTR_PTR
+        span_elem_fits(s, e, src.elem, src.name, src.name_len, name, name_len)
+    var ptr: i32 = 0
+    if array_place_shape(s, x, @src) == 1
+        ptr = emit_array_place_ptr(s, x)
+    else
+        var mr: MemberPtrResult
+        emit_member_ptr(s, x, @mr)
+        ptr = mr.reg
+    emit_span_value(s, ptr, src.size, name, name_len)
+
+# `Span$T` (name, name_len) against an `[N]T` of element `et` (`et_name` a
+# struct's): 1 when T is that element, else the located array-store error.
+fn span_elem_fits(s: *EmitterState, e: *Expr, et: i32, et_name: *u8, et_name_len: i32, name: *u8, name_len: i32) -> i32
+    var elem: *u8 = null
+    var elem_len: i32 = 0
+    if et == TYPE_STRUCT
+        elem = et_name
+        elem_len = et_name_len
+    else
+        elem_len = primitive_arg_spelling(et, @elem)
+    if elem == null or elem_len <= 0
+        return 1
+    if name_len == 5 + elem_len and memcmp(name + 5, elem, elem_len as i64) == 0
+        return 1
+    ref_array_error(s, e)
+    0
+
+# AGAST #2305: the whole `[N]u8` / `[N]i8` array `arg` passes to the StrView
+# param `p`, bare (`g(a)`) or as `@a`, or null.  ritz0 makes it the StrView
+# `{ &a[0], N }` for a local, a global or an inline field; any other element is
+# its "Type of #1 arg mismatch".  Emits nothing.
+fn strview_array_src(s: *EmitterState, arg: *Expr, p: *Param) -> *Expr
+    if p == null or p.param_type != TYPE_STRUCT or name_eq(p.param_type_name, p.param_type_name_len, c"StrView", 7) == 0
+        return null
+    var x: *Expr = arg
+    if x.kind == EXPR_UNARY and (x.op == OP_ADDR or x.op == OP_ADDR_MUT) and x.operand != null
+        x = x.operand
+    var src: ArraySrc
+    if arg_array_shape(s, x, @src) == 0
+        return null
+    if src.elem != TYPE_U8 and src.elem != TYPE_I8
+        return null
+    x
+
+# 1 when `arg` is `@x` of a whole array of another element than u8 / i8, into
+# the StrView param `p`: ritz0's "Type of #1 arg mismatch".  It passed `@x`'s
+# i64 where the %StrView goes, which only clang refused.
+fn strview_wrong_array(s: *EmitterState, arg: *Expr, p: *Param) -> i32
+    if p == null or p.param_type != TYPE_STRUCT or name_eq(p.param_type_name, p.param_type_name_len, c"StrView", 7) == 0
+        return 0
+    if arg.kind != EXPR_UNARY or (arg.op != OP_ADDR and arg.op != OP_ADDR_MUT) or arg.operand == null
+        return 0
+    var src: ArraySrc
+    if arg_array_shape(s, arg.operand, @src) == 0
+        return 0
+    (src.elem != TYPE_U8 and src.elem != TYPE_I8) as i32
+
+# `StrView { &x[0], N }` of strview_array_src's array `x`.
+fn emit_strview_of_array(s: *EmitterState, x: *Expr) -> i32
+    var src: ArraySrc
+    arg_array_shape(s, x, @src)
+    var ptr: i32 = 0
+    if array_place_shape(s, x, @src) == 1
+        ptr = emit_array_place_ptr(s, x)
+    else
+        var mr: MemberPtrResult
+        emit_member_ptr(s, x, @mr)
+        ptr = mr.reg
+    emit_span_value(s, ptr, src.size, c"StrView", 7)
+
+# `{ ptr, n }` as a `%<span_name>` register.
+fn emit_span_value(s: *EmitterState, ptr: i32, n: i32, span_name: *u8, span_name_len: i32) -> i32
+    let sp1: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, sp1)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, span_name, span_name_len)
+    emit_str(s, c" undef, ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", 0\n")
+    let sp2: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, sp2)
+    emit_str(s, c" = insertvalue %")
+    emit_name(s, span_name, span_name_len)
+    emit_str(s, c" ")
+    emit_reg(s, sp1)
+    emit_str(s, c", i64 ")
+    emit_int(s, n as i64)
+    emit_str(s, c", 1\n")
+    sp2
 
 # AGAST #2781, #2366: `@a` with `a: [N]T1` fits the `Span$T2` slot (name,
 # name_len) only when T1 is T2, or the Span views the array at T2's stride.  The
@@ -1554,13 +1668,32 @@ fn lent_referent_local(s: *EmitterState, e: *Expr) -> *LocalVar
 fn emit_array_return(s: *EmitterState, e: *Expr, ra: *Param) -> i32
     if ra == null
         return 0
+    let slot: i32 = emit_array_return_slot(s, ra)
+    emit_array_local_whole_assign(s, slot, ra.param_array_size, ra.param_array_elem_type, ra.param_type_name, ra.param_type_name_len, e)
+    emit_array_return_from(s, ra, slot)
+
+# AGAST #2305: a `-> [N]T` fn whose last statement is an `if` / `else`: each
+# arm's tail is the array returned, as `if c then a else b` is.  Before this the
+# arms' i64 value met emit_implicit_return_tail's refusal.  0 when `st` is no
+# such tail, or the fn returns no array.
+fn emit_array_return_if_stmt(s: *EmitterState, st: *Stmt, ra: *Param) -> i32
+    if ra == null or st == null or st.kind != STMT_IF or st.if_else == null
+        return 0
+    let slot: i32 = emit_array_return_slot(s, ra)
+    emit_array_stmt_if_into(s, slot, ra.param_array_size, ra.param_array_elem_type, ra.param_type_name, ra.param_type_name_len, st)
+    emit_array_return_from(s, ra, slot)
+
+fn emit_array_return_slot(s: *EmitterState, ra: *Param) -> i32
     let slot: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, slot)
     emit_str(s, c" = alloca ")
     emit_array_value_llvm_type(s, ra)
     emit_str(s, c"  ; #2302 array return\n")
-    emit_array_local_whole_assign(s, slot, ra.param_array_size, ra.param_array_elem_type, ra.param_type_name, ra.param_type_name_len, e)
+    slot
+
+# `ret` the `[N x T]` at `slot`: by value, or through the sret pointer.
+fn emit_array_return_from(s: *EmitterState, ra: *Param, slot: i32) -> i32
     if array_param_uses_byval(s, ra) == 1
         emit_str(s, c"  call void @__ritz_sret_copy(ptr %ret.sret, ptr ")
         emit_reg(s, slot)
@@ -1893,6 +2026,11 @@ fn check_array_arg(s: *EmitterState, call: *Expr, fname: *u8, flen: i32, argno: 
     if p == null or (name_eq(p.name, p.name_len, c"self", 4) == 1 and p.is_borrow == 0)
         return
     if check_borrow_arg(s, fname, flen, argno, arg, p) == 1
+        return
+    if strview_array_src(s, arg, p) != null   # AGAST #2305: `[N]u8` into a StrView
+        return
+    if strview_wrong_array(s, arg, p) == 1
+        array_arg_error(s, call, fname, flen, argno, c"the parameter doesn't take a whole array")
         return
     let literal: i32 = (arg.kind == EXPR_ARRAY_LIT or arg.kind == EXPR_ARRAY_FILL) as i32
     if literal == 0 and param_takes_array_ref(p) == 1
@@ -5915,6 +6053,12 @@ fn span_param_arg(s: *EmitterState, arg: *Expr, p: *Param, reg: i32) -> i32
                 span_array_elem_fits(s, arg, arr_loc2, p.param_type_name, p.param_type_name_len)   # AGAST #2366
                 res = emit_span_of_array(s, arr_loc2, p.param_type_name, p.param_type_name_len)
                 coerced = 1
+        if coerced == 0
+            # AGAST #2305: `@G`, `@h.a`, `@*p`.
+            let placed: i32 = emit_span_of_addr_place(s, arg, p.param_type_name, p.param_type_name_len)
+            if placed != 0
+                res = placed
+                coerced = 1
     res
 
 fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
@@ -6728,6 +6872,9 @@ fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             let narrow_to: *u8 = method_arg_narrow_suffix(s, mp, mbe)
             if narrow_to != null
                 conv_regs[j] = emit_method_arg_trunc(s, arg_regs[j], narrow_to)
+            else if is_span_param(mp) == 1 and mbe != null
+                # AGAST #2305: `r.len(@a)` builds its Span as `len(@a)` does.
+                conv_regs[j] = span_param_arg(s, mbe, mp, arg_regs[j])
             else if mp.param_type == TYPE_F32 or mp.param_type == TYPE_F64
                 conv_regs[j] = method_float_arg(s, mp, mbe, arg_regs[j])   # AGAST #2561
             else if param_takes_addr_value(s, mbe, mp) == 1

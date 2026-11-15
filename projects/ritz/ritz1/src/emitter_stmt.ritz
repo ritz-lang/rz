@@ -1288,6 +1288,18 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 stmt.var_array_elem_type = dsh.elem
                 stmt.var_type_name = dsh.name
                 stmt.var_type_name_len = dsh.name_len
+        # AGAST #2305: and `let r = if c then f() else g()`: an arm's array.
+        else if stmt.var_init.kind == EXPR_IF
+            var ish: ArraySrc
+            var ipt: i32 = stmt.var_array_elem_pointee
+            if if_array_shape(s, stmt.var_init, @ish, @ipt) == 1
+                var_type = TYPE_ARRAY
+                stmt.var_type = TYPE_ARRAY
+                stmt.var_array_size = ish.size
+                stmt.var_array_elem_type = ish.elem
+                stmt.var_array_elem_pointee = ipt
+                stmt.var_type_name = ish.name
+                stmt.var_type_name_len = ish.name_len
 
     # AGAST #1666: untyped `let v = match ...`.  The merge phi's type is only
     # known once the arms are emitted (#1645: `%StrView`, `%Point`, or i64),
@@ -4623,8 +4635,25 @@ fn array_place_shape(s: *EmitterState, value: *Expr, out: *ArraySrc) -> i32
             return array_src_set(out, g.array_size, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
         return 0
     if value.kind == EXPR_UNARY and value.op == OP_DEREF
+        # AGAST #2305: `*@a` / `*@&a` reads the array `a` is, as ritz0 has it.
+        let inner: *Expr = addr_of_array_place(s, value.operand)
+        if inner != null
+            return array_place_shape(s, inner, out)
         return array_ptr_shape(s, value.operand, out)   # AGAST #2304
     0
+
+# AGAST #2305: `x` when `e` is `@x` or `@&x` over a whole 1-D array place, so
+# `*e` is that place; null otherwise.  Emits nothing.
+fn addr_of_array_place(s: *EmitterState, e: *Expr) -> *Expr
+    if e == null or e.kind != EXPR_UNARY or (e.op != OP_ADDR and e.op != OP_ADDR_MUT)
+        return null
+    let x: *Expr = e.operand
+    if x == null or (x.kind != EXPR_IDENT and x.kind != EXPR_UNARY)
+        return null
+    var sh: ArraySrc
+    if array_place_shape(s, x, @sh) == 0
+        return null
+    x
 
 # AGAST #2517: fill `out` when `value` is a 1-D row of an N-D array (nd_row_shape:
 # `g[i]` of `[N][M]T`, `c[i][j]` of `[N][M][K]T`).  The base is any
@@ -4658,6 +4687,9 @@ fn emit_global_array_ptr(s: *EmitterState, g: *GlobalVarDef) -> i32
 # The address of the place array_place_shape recognised in `value`.
 fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
     if value.kind == EXPR_UNARY
+        let inner: *Expr = addr_of_array_place(s, value.operand)
+        if inner != null
+            return emit_array_place_ptr(s, inner)   # AGAST #2305: `*@a`
         lent_array_local(s, value.operand)
         return emit_array_ptr_value(s, value.operand)   # AGAST #2304
     let lent: *LocalVar = lent_array_local(s, value)
@@ -4834,6 +4866,9 @@ fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, 
     if value == null
         emit_ir_error(s, c"whole-array assignment has no value")
         return
+    if value.kind == EXPR_IF
+        emit_array_if_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value)
+        return
     if emit_array_local_copy_from_field(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value) == 1
         return
     if value.kind == EXPR_ARRAY_FILL or value.kind == EXPR_ARRAY_LIT
@@ -4891,6 +4926,134 @@ fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, 
     if array_store_fits(s, value, place.elem, place.name, place.name_len, dst_et, dst_name, dst_name_len) == 0
         return
     emit_local_array_copy(s, dst_size, dst_et, dst_name, dst_name_len, emit_array_place_ptr(s, value), dst_ptr)
+
+# AGAST #2305: `if c then a else b` (or the block form) as a whole `[N]T` value.
+# Each arm stores its own array at `dst_ptr`, held to N and T as any source is,
+# so no `[N x T]` phi is needed.  Before this the arms' i64s met in a phi: 8
+# bytes, or a type clang refused.  An arm that leaves (`return`) stores nothing.
+fn emit_array_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, value: *Expr)
+    let then_arm: *MatchArm = value.args as *MatchArm
+    let else_arm: *MatchArm = then_arm.next
+    if_arm_check_value(s, then_arm)
+    if_arm_check_value(s, else_arm)
+    bool_check_cond(s, value.left, c"if condition")
+    let cond: i32 = emit_expr(s, value.left)
+    var cond_i1: i32 = cond
+    if bool_reg_is_i1(s, value.left) == 0
+        cond_i1 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, cond_i1)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, cond)
+        emit_str(s, c", 0\n")
+    let then_label: i32 = next_label(s)
+    let else_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond_i1)
+    emit_str(s, c", label %")
+    emit_label(s, then_label)
+    emit_str(s, c", label %")
+    emit_label(s, else_label)
+    emit_str(s, c"\n")
+    let own_before: *i32 = own_arms_begin(s)
+    var own_acc: *i32 = null
+    begin_block(s, then_label)
+    emit_array_arm_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, then_arm, end_label)
+    own_arm_end(s, @own_acc)
+    own_arm_begin(s, own_before)
+    begin_block(s, else_label)
+    emit_array_arm_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, else_arm, end_label)
+    own_arm_end(s, @own_acc)
+    own_arms_end(s, own_before, own_acc)
+    begin_block(s, end_label)
+
+# AGAST #2305: N and T of the whole `[N]T` an `if` value's first telling arm
+# gives: a `-> [N]T` call (its element pointee to `*pointee`), a 1-D array
+# place, an inline field, or a nested `if`.  1 if one does.  Each arm is still
+# held to that shape when emit_array_if_into stores it.  Emits nothing.
+fn if_array_shape(s: *EmitterState, e: *Expr, out: *ArraySrc, pointee: *i32) -> i32
+    var arm: *MatchArm = e.args as *MatchArm
+    while arm != null
+        let v: *Expr = arm.body
+        if arm.is_pass == 0 and v != null
+            if v.kind == EXPR_IF
+                if if_array_shape(s, v, out, pointee) == 1
+                    return 1
+            else
+                let cra: *Param = call_ret_array(s, v)
+                if cra != null
+                    *pointee = cra.param_array_elem_pointee
+                    return array_src_set(out, cra.param_array_size, cra.param_array_elem_type, cra.param_type_name, cra.param_type_name_len)
+                if arm.body_stmts == null and arg_array_shape(s, v, out) == 1
+                    return 1
+        arm = arm.next
+    0
+
+# AGAST #2305: an `if` / `else` STATEMENT whose arms end in a whole `[N]T`, the
+# tail of a `-> [N]T` fn: as emit_array_if_into, with each block's last
+# statement its value.  A nested `if` / `else` there is a value too.
+fn emit_array_stmt_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, st: *Stmt)
+    bool_check_cond(s, st.if_cond, c"if condition")
+    let cond: i32 = emit_expr(s, st.if_cond)
+    var cond_i1: i32 = cond
+    if bool_reg_is_i1(s, st.if_cond) == 0
+        cond_i1 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, cond_i1)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, cond)
+        emit_str(s, c", 0\n")
+    let then_label: i32 = next_label(s)
+    let else_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond_i1)
+    emit_str(s, c", label %")
+    emit_label(s, then_label)
+    emit_str(s, c", label %")
+    emit_label(s, else_label)
+    emit_str(s, c"\n")
+    let own_before: *i32 = own_arms_begin(s)
+    var own_acc: *i32 = null
+    begin_block(s, then_label)
+    emit_array_block_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.if_then, end_label)
+    own_arm_end(s, @own_acc)
+    own_arm_begin(s, own_before)
+    begin_block(s, else_label)
+    emit_array_block_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.if_else, end_label)
+    own_arm_end(s, @own_acc)
+    own_arms_end(s, own_before, own_acc)
+    begin_block(s, end_label)
+
+# A block whose last statement is the array: an expression, or an `if` / `else`.
+# Any other last statement (a `return`) is emitted as it is.
+fn emit_array_block_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, stmts: *Stmt, end_label: i32)
+    var st: *Stmt = stmts
+    while st != null
+        if st.next == null and st.kind == STMT_EXPR
+            own_check_arm(s, st.expr)   # ref_check judges the noted tail; the value moves
+            emit_array_local_whole_assign(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.expr)
+        else if st.next == null and st.kind == STMT_IF and st.if_else != null
+            emit_array_stmt_if_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st)
+        else
+            emit_stmt(s, st, s.fn_ret_type)
+            if st.kind == STMT_RETURN
+                begin_block(s, next_label(s))
+                clear_last_expr(s)
+        st = st.next
+    emit_str(s, c"  br label %")
+    emit_label(s, end_label)
+    emit_str(s, c"\n")
+
+fn emit_array_arm_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, arm: *MatchArm, end_label: i32)
+    emit_match_arm_stmts(s, arm.body_stmts)
+    if arm.is_pass == 0 and arm.body != null
+        own_check_arm(s, arm.body)   # as emit_match_arm_body does
+        emit_array_local_whole_assign(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, arm.body)
+    emit_str(s, c"  br label %")
+    emit_label(s, end_label)
+    emit_str(s, c"\n")
 
 # AGAST #2048: `x.f = v` / `pp.f = v` / `o.p.f = v` where `f` is an f32 /
 # f64 field at `field_ptr` and `val_reg` is emit_expr(value).  Stores
