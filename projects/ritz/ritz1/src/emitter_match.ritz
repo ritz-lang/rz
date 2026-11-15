@@ -58,6 +58,7 @@ import bool_check   # AGAST #2342
 import float_slot   # int_into_float_slot (AGAST #3313)
 import monomorph     # ArrayArg (AGAST #3029)
 import deref_field  # df_rewrite_expr (AGAST #3015)
+import narrowing    # narrow_note_binding (AGAST #3345)
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
@@ -673,6 +674,8 @@ fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name
 fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: *u8, enum_name_len: i32, result: *MatchResult, arm_index: i32, end_label: i32)
     # Save local_count so arm-scoped bindings get popped after the body.
     let saved_local_count: i32 = s.local_count
+    # AGAST #3345: the arm's bindings (and lets) leave the narrowing table too.
+    let saved_narrow_count: i32 = s.narrow_decl_count
     own_push_scope(s)   # AGAST #2158: the arm is a block for drops
 
     # Bind variant payload to inner pattern name on `Constructor(binding)`.
@@ -713,6 +716,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                     # AGAST #3116: a narrow integer payload binds as its own
                     # type (an `i<bits>` local), as a typed `let` does.
                     var bind_nt: i32 = 0
+                    # AGAST #3345: its integer type, i64 / u64 too, for
+                    # the lossy-conversion check (narrow_note_binding).
+                    var bind_it: i32 = 0
                     if scrut_slot != 0 and enum_name != null and enum_name_len > 0
                         # Result/Option: 0 Ok-Some, 1 Err; a user enum: the
                         # variant's own tag (AGAST #1797), for its width.
@@ -723,6 +729,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                         payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len, pay_variant)
                         bind_ft = tagged_enum_float_type(s, enum_name, enum_name_len, pay_variant)
                         bind_nt = tagged_enum_narrow_int_type(s, enum_name, enum_name_len, pay_variant)
+                        bind_it = tagged_enum_int_type(s, enum_name, enum_name_len, pay_variant)
                     else
                         # Non-enum scrutinee (shouldn't reach here in practice).
                         payload_reg = scrut_reg
@@ -759,6 +766,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                     emit_reg(s, alloca_reg)
                     emit_str(s, c"\n")
                     add_local(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, bind_type)
+                    narrow_note_binding(s, arm.pattern_inner_name, arm.pattern_inner_name_len, bind_it)   # AGAST #3345
                     if bind_ft == 0
                         bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
 
@@ -778,6 +786,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
             emit_str(s, c"\n")
             add_local(s, arm.pattern_name, arm.pattern_name_len, bind_reg, TYPE_I64)
             bool_note_binding(s, s.match_scrut_kind)   # AGAST #2342
+            narrow_note_binding(s, arm.pattern_name, arm.pattern_name_len, s.match_scrut_int)   # AGAST #3358
 
     # Block-bodied / statement arm (AGAST #1454, #1617): run the leading
     # statements in the arm's own scope (they are popped with the payload
@@ -900,6 +909,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     # AGAST #2158: drop the arm's bindings once its value is computed.
     own_pop_scope(s)
     s.local_count = saved_local_count
+    if s.narrow_decl_count > saved_narrow_count
+        s.narrow_decl_count = saved_narrow_count
     # ritz-task-193 — drop the inner-arm binding from local_map so the next
     # find_local on the shadowed name returns the outer binding via the map
     # fast-path (the find fallback would otherwise carry the cost).
@@ -2173,8 +2184,12 @@ fn emit_match_into(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     # AGAST #2342: a catch-all name binds the scrutinee, so it is the same kind.
     let outer_kind: i32 = s.match_scrut_kind
     s.match_scrut_kind = bool_kind(s, scrutinee)
+    # AGAST #3358: ... and the same integer type.
+    let outer_int: i32 = s.match_scrut_int
+    s.match_scrut_int = narrow_known(narrow_src_type(s, scrutinee))
     let result: i32 = emit_match_arms(s, scrutinee, arms, span, into)
     s.match_scrut_kind = outer_kind
+    s.match_scrut_int = outer_int
     result
 
 fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan, into: *ArrayInto) -> i32

@@ -719,8 +719,9 @@ def test_ritz1_refuses_lossy_int_arm(ritz1_bin, tmp_path, program):
 
 
 # AGAST #3332: a u64 payload arm is refused as `u64`, not `i64`: its
-# signedness is read in the arm, where `x` is still bound. ritz1 accepts this
-# arm with a silent sitofp (AGAST #3345), so the row is ritz0's alone.
+# signedness is read in the arm, where `x` is still bound. ritz1 accepted this
+# arm with a silent sitofp until AGAST #3345: the payload binding never reached
+# its narrowing table, so its type was unknown and nothing was refused.
 LOSSY_U64_PAYLOAD = """\
 import ritzlib.option
 
@@ -743,6 +744,19 @@ def test_ritz0_refuses_u64_payload_arm_as_u64(run_ritz0, tmp_path):
     assert "bad.ritz:6:20:" in out, out
     assert ("implicit conversion from `u64` to `f64` can lose precision"
             in out), out
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("ty", ["u64", "i64"])
+def test_ritz1_refuses_64bit_payload_arm(ritz1_bin, tmp_path, compiler, ty):
+    binary = ritz1_bin if compiler == "ritz1" else SELFHOSTED_BIN
+    program = LOSSY_U64_PAYLOAD.replace("u64", ty)
+    rc, diag = _ritz1_run(binary, tmp_path, program)
+    assert rc is None, f"{compiler} accepted a lossy {ty} payload arm"
+    assert "prog.ritz:6:20: error: " in diag, diag
+    assert (f"implicit conversion from `{ty}` to `f64` can lose precision"
+            in diag), diag
 
 
 # --- AGAST #3344: an integer match's ident binding has the scrutinee's type ---
@@ -818,9 +832,9 @@ def test_int_match_binding_converts_by_scrutinee_type(
     assert rc == 42
 
 
-# A u64 `n` is refused as `u64` (it was `i64`), at `n`. ritz1 accepts it in
-# both forms (AGAST #3358), as it does a u64 payload (#3345), so the rows are
-# ritz0's alone, as #3332's u64 row is.
+# A u64 `n` is refused as `u64` (it was `i64`), at `n`, by every compiler.
+# ritz1 accepted it in both forms until AGAST #3358 (with #3345): `n` never
+# reached its narrowing table, so it had no type.
 INT_MATCH_U64_AT = {"in-arm-let": "bad.ritz:5:26:", "annotated-arm": "bad.ritz:4:14:"}
 
 
@@ -835,3 +849,67 @@ def test_ritz0_refuses_int_match_u64_binding_as_u64(run_ritz0, tmp_path, form):
     assert INT_MATCH_U64_AT[form] in out, out
     assert ("implicit conversion from `u64` to `f64` can lose precision"
             in out), out
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("form", sorted(INT_MATCH_FORMS))
+def test_ritz1_refuses_int_match_u64_binding_as_u64(
+        ritz1_bin, tmp_path, compiler, form):
+    binary = ritz1_bin if compiler == "ritz1" else SELFHOSTED_BIN
+    program = (INT_MATCH_FORMS[form].replace("TY", "u64")
+               .replace("VAL", "4000000000"))
+    rc, diag = _ritz1_run(binary, tmp_path, program)
+    assert rc is None, f"{compiler} accepted a u64 `n` in a float slot"
+    at = INT_MATCH_U64_AT[form].replace("bad.ritz", "prog.ritz")
+    assert at + " error: " in diag, diag
+    assert ("implicit conversion from `u64` to `f64` can lose precision"
+            in diag), diag
+
+
+
+# The arm's binding is the arm's alone. Left in ritz1's table after its arm, an
+# earlier match's u32 `x` / `n` disagrees with the later u64 one, the name's
+# type becomes unknown, and the u64 arm is let through.
+ARM_BINDING_SCOPE = {
+    "payload": ("""\
+import ritzlib.option
+
+fn f(p: Option<u32>, o: Option<u64>) -> f64
+    let c: u32 = match p
+        None => 0
+        Some(x) => x
+    let a: f64 = match o
+        None => 1
+        Some(x) => x
+    return a
+
+fn main() -> i32
+    return f(None, None) as i32
+""", "prog.ritz:9:20:"),
+    "int-match": ("""\
+fn g(j: u32, k: u64) -> f64
+    let c: u32 = match j
+        0 => 1
+        n => n
+    let a: f64 = match k
+        0 => 1
+        n => n
+    return a
+
+fn main() -> i32
+    return g(0, 0) as i32
+""", "prog.ritz:7:14:"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("form", sorted(ARM_BINDING_SCOPE))
+def test_ritz1_arm_binding_type_ends_with_the_arm(
+        ritz1_bin, tmp_path, compiler, form):
+    binary = ritz1_bin if compiler == "ritz1" else SELFHOSTED_BIN
+    program, at = ARM_BINDING_SCOPE[form]
+    rc, diag = _ritz1_run(binary, tmp_path, program)
+    assert rc is None, f"{compiler} accepted the later u64 binding"
+    assert at + " error: implicit conversion from `u64`" in diag, diag
