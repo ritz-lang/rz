@@ -1119,12 +1119,12 @@ class MoveChecker:
         elif isinstance(stmt, rast.ForStmt):
             # The iterator is moved into the loop, once. What a reference
             # reaches stays its owner's, so the loop only reads it.  A call's
-            # `[N]T` result is a temporary, dropped per element after the loop
-            # however it's left: `x` is a copy of its element, as over a
-            # local, and drops nothing (AGAST #3284).
+            # `[N]T` result, or an array literal, is a temporary, dropped per
+            # element after the loop however it's left: `x` is a copy of its
+            # element, as over a local, and drops nothing (AGAST #3284, #3297).
             self._check_expr(stmt.iter,
                              is_move_context=not (self._through_reference(stmt.iter)
-                                                  or self._array_call_temporary(stmt.iter)))
+                                                  or self._array_temporary(stmt.iter)))
             held = self._for_loan(stmt.iter)
             if held is not None:
                 held[0].borrows.append(held[1])
@@ -1590,11 +1590,14 @@ class MoveChecker:
             return self._place_type(value)
         return ty
 
-    def _array_call_temporary(self, expr: rast.Expr) -> bool:
-        """Is `expr` a call whose by-value `[N]T` result a `for` walks? Nothing
-        else can reach it, so nothing takes it (AGAST #3284)."""
+    def _array_temporary(self, expr: rast.Expr) -> bool:
+        """Is `expr` an array literal, or a call whose by-value `[N]T` result,
+        a `for` walks? Nothing else can reach it, so nothing takes it (AGAST
+        #3284, #3297)."""
         while isinstance(expr, rast.Grouped):
             expr = expr.expr
+        if isinstance(expr, rast.ArrayLit):
+            return True
         return (isinstance(expr, (rast.Call, rast.MethodCall))
                 and isinstance(self.types.resolve(self._infer_expr_type(expr)),
                                rast.ArrayType))

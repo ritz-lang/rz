@@ -284,6 +284,14 @@ CASES = {
     "array_rvalue_iterated": ("for x in mkt()\n        x.peek()", 1, 2, {}),
     "array_rvalue_iterated_break": (
         "for x in mkt()\n        if x.peek() == 1\n            break", 1, 2, {}),
+    # And an array literal it walks, the same way (AGAST #3297). One of a
+    # type with no drop drops nothing.
+    "array_lit_iterated": (
+        "for x in [T { id: 1 }, T { id: 2 }]\n        x.peek()", 0, 2, {}),
+    "array_lit_iterated_break": (
+        "for x in [T { id: 1 }, T { id: 2 }]\n        if x.peek() == 1\n            break", 0, 2, {}),
+    "array_lit_iterated_no_drop": (
+        "for x in [P { x: 1 }, P { x: 2 }]\n        x.get()", 0, 0, {}),
     # Inside an argument.
     "in_argument": ("take(mp().get())", 1, 0, {}),
     "in_a_borrowed_local": ("let t = mp().next()\n    look(@t)", 1, 0, {}),
