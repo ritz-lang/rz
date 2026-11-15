@@ -32,10 +32,17 @@ MOVE_OUT_OF_REF = "cannot move out of a reference"
 # `fn drop(self)`: its own `self` would drop when it returned, and call it again.
 DROP_BY_VALUE = "`drop` can't take `self` by value: it would drop itself: write `self: @&T`"
 
-# `T.m(x)` where `m` takes `self`: a type isn't a receiver (AGAST #2292).
-# ritz1 prints the same words, with the method's name (emitter_expr_call.ritz).
-def static_call_of_self(method: str) -> str:
-    return f"Static method call Type.method() but method '{method}' expects 'self' parameter"
+# `T.m(x)` where `m` takes `self`, however it's spelled: a type isn't a receiver,
+# and `T.m()` is only for a method without `self` (AGAST #2292, #3236). The hint
+# names the two spellings the language has (LANGUAGE_SPEC §5.4, LARB R10), with
+# the type's name in lower case for the receiver: `c` for a `C`. A by-value
+# `self` takes `c`, any other `self` `@&c`. ritz1 prints the same words
+# (emitter_expr_call.ritz, static_call_of_self_error).
+def static_call_of_self(method: str, type_name: str, by_value: bool) -> str:
+    recv = type_name.lower()
+    arg = recv if by_value else f"@&{recv}"
+    return (f"Static method call Type.method() but method '{method}' expects 'self' parameter: "
+            f"write `{recv}.{method}()` or `{type_name}_{method}({arg})`")
 
 
 # The receiver of a method whose `self` is a pointer to a pointer (`self: **C`),

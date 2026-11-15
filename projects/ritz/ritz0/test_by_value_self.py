@@ -346,7 +346,35 @@ STATIC_CALLS = {
 @pytest.mark.parametrize("arg", sorted(STATIC_CALLS))
 def test_a_type_is_not_a_receiver(arg, receiver, compiler, tmp_path):
     src = f"{TYPES}impl C\n    fn g({receiver}) -> i32\n        self.x\n\n{STATIC_CALLS[arg]}"
-    _assert_refused(compiler, tmp_path, f"static_{arg}", src, static_call_of_self("g"))
+    _assert_refused(compiler, tmp_path, f"static_{arg}", src, static_call_of_self("g", "C", True))
+
+
+# `T.m()` is only for a method without `self`, a lent one too (AGAST #3236):
+# ritz1 refused only a by-value `self`, and ran `C.get(@&c)` of the rest.
+LENT_SELVES = ["self: @C", "self: @&C", "self: *C", "self:& C", "self:&"]
+LENT_IMPL = "struct C\n    x: i32\n    y: i32\n\nimpl C\n    fn new() -> C\n        C { x: 3, y: 0 }\n" \
+            "    fn get({R}) -> i32\n        return self.x\n\n"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("receiver", LENT_SELVES)
+def test_a_type_is_not_a_lent_receiver(receiver, compiler, tmp_path):
+    src = LENT_IMPL.replace("{R}", receiver) + \
+        "pub fn main() -> i32\n    var c: C = C { x: 3, y: 0 }\n    return ^C.get(@&c)\n"
+    _assert_refused(compiler, tmp_path, "static_lent", src, static_call_of_self("get", "C", False))
+
+
+# What the hint says to write runs, with the self-less `C.new()` beside it.
+# ritz1's free `C_get(@&c)` of a bare `self:&` has no arg type yet (AGAST #3260).
+HINT_ROWS = [pytest.param(r, c, marks=pytest.mark.xfail(strict=True, reason="AGAST #3260"))
+             if r == "self:&" and c != "ritz0" else (r, c) for r in LENT_SELVES for c in COMPILERS]
+
+
+@pytest.mark.parametrize("receiver,compiler", HINT_ROWS)
+def test_the_hints_spellings_of_a_lent_self_run(receiver, compiler, tmp_path):
+    src = LENT_IMPL.replace("{R}", receiver) + \
+        "pub fn main() -> i32\n    var c: C = C.new()\n    return c.get() * 10 + C_get(@&c)\n"
+    assert _run(compiler, tmp_path, "static_lent_hint", src) == 33
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

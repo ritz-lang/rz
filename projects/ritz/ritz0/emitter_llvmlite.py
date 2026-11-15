@@ -13577,8 +13577,11 @@ class LLVMEmitter:
             or (used_ufcs_fallback and not is_static_call))
 
         # For static calls (Type.method()), verify there's no self parameter
+        # A lent `self` too, `@T`, `@&T`, `*T` or `:&` (AGAST #2292, #3236).
         if is_static_call and has_self_param:
-            raise EmitError(ref_rules.static_call_of_self(expr.method), expr.span)  # AGAST #2292
+            p0 = fn_def.params[0]
+            by_value = not (p0.borrow == rast.Borrow.MUTABLE or isinstance(p0.type, (rast.RefType, rast.PtrType)))
+            raise EmitError(ref_rules.static_call_of_self(expr.method, expr.expr.name, by_value), expr.span)
 
         # Handle static method call - no receiver needed
         if is_static_call or not has_self_param:

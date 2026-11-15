@@ -1345,6 +1345,21 @@ fn demo_levels() -> i32
 
 A method's mangled name `Type_method` is a name a program may call, with the receiver as its first argument: `c.after()` and `Counter_after(c)` mean the same thing (LARB R10).
 
+`Type.m()` is for a method without `self`, such as a constructor `Reader.new(@data)`. A type isn't a receiver, so `Type.m(...)` of a method with `self` is an error however `self` is spelled. Write `c.m()` or `Type_m(@&c)` instead (`Type_m(c)` for a by-value `self`).
+
+```ritz expect-error="Static method call Type.method() but method 'get' expects 'self' parameter: write `c.get()` or `C_get(@&c)`"
+struct C
+    x: i32
+
+impl C
+    fn get(self: @&C) -> i32
+        self.x
+
+fn main() -> i32
+    var c = C { x: 3 }
+    C.get(@&c)
+```
+
 ```ritz
 struct Point
     x: i32
