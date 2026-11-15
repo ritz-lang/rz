@@ -9,6 +9,8 @@
 #   train.sh gate                       gate the stack's tip (prints the log)
 #   train.sh land [<log>]               push the gated tip to main
 #   train.sh show                       print the current train
+#   train.sh pkgs list|test <base>      the touched packages' tests (#3363;
+#                                       the gate runs `test` after its jobs)
 #
 # `build` prints one line per item, then a summary:
 #   APPLIED  <branch> <sha12> as <new12>   (cherry-picked; same patch)
@@ -112,9 +114,116 @@ cmd_gate() {
     [[ -f "$st" ]] || die "no train built"
     [[ "$(sed -n 's/^TIP=//p' "$st")" == "$(g rev-parse HEAD)" ]] \
         || die "train worktree moved since build; rebuild"
+    # Package tests for what the train touches (AGAST #3363); none, and so no
+    # extra step, for a compiler-only train.  stdout is only the log path.
+    local base pkgs after=""
+    base="$(sed -n 's/^BASE=//p' "$st")"
+    pkgs="$(cd "$TRAIN_WT" && bash "$HERE/train.sh" pkgs list "$base")"
+    if [[ -n "$pkgs" ]]; then
+        echo "PKGS $(tr '\n' ' ' <<<"$pkgs")" >&2
+        after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
+    fi
     # Train priority: the next free slot goes to this gate ahead of room
     # gates (run-gate.sh, AGAST #3317).
-    RZ_GATE_TRAIN=1 "$GATE" "$TRAIN_WT" "$NAME"
+    RZ_GATE_TRAIN=1 RZ_GATE_AFTER="$after" "$GATE" "$TRAIN_WT" "$NAME"
+}
+
+# --- Package tests (AGAST #3363) ------------------------------------------
+# The gate's build-all + bootstrap jobs cover the compiler, not the workspace
+# projects' own tests: #3290's bug landed through a green train and only CI's
+# test-all caught it.  So once those jobs pass, the train gate also runs
+# `train.sh pkgs test <base>` from the train worktree (the tip is HEAD):
+#
+#   pkgs list <base>   the package dirs the train touches, one per line
+#   pkgs test <base>   test each; exit 1 on a failure the base doesn't have
+#
+# A touched file belongs to the deepest directory above it with a ritz.toml,
+# so a nested package (projects/ritzunit/inventory) is tested on its own.
+# Skipped: projects/ritz and everything in it (build-all + bootstrap is its
+# gate, so a compiler-only train costs exactly what it did), and rz.toml
+# [workspace.exclude] dirs, which resolve to the package above them.
+#
+# One verdict line per package:
+#   PKG PASS <id>
+#   PKG KNOWN <id>: ...         fails, excused in [ci.known_failing.build] as
+#                               `rz test --all` excuses it: advisory
+#   PKG PRE-EXISTING <id>: ...  fails on the base too: not this train's doing
+#   PKG FAIL <id>: ...          fails here, passes on the base (or is new)
+#
+# Not the whole test-all: see SKILL.md "Merge trains" for the timing.
+# Env: RZ_PKG_TEST, the command that tests one package dir (default ./rz test).
+
+# toml_keys <python expr over the parsed rz.toml `c`>: one key per line.
+toml_keys() {
+    [[ -f rz.toml ]] || return 0
+    python3 -c 'import sys, tomllib
+c = tomllib.load(open("rz.toml", "rb"))
+for k in eval(sys.argv[1]): print(k)' "$1"
+}
+
+in_list() {
+    local x="$1" k; shift
+    for k in "$@"; do [[ "$x" == "$k" || "$x" == "$k"/* ]] && return 0; done
+    return 1
+}
+
+pkgs_list() {
+    local base="$1" f d excl
+    mapfile -t excl < <(toml_keys 'c.get("workspace", {}).get("exclude", {})')
+    git diff --name-only "$base" HEAD -- projects/ | while IFS= read -r f; do
+        d="$(dirname "$f")"
+        while [[ "$d" == projects/* ]]; do
+            if [[ -f "$d/ritz.toml" ]] && ! in_list "$d" ${excl[@]+"${excl[@]}"}; then
+                in_list "$d" projects/ritz || echo "$d"
+                break
+            fi
+            d="$(dirname "$d")"
+        done
+    done | sort -u
+}
+
+pkgs_test() {
+    local base="$1" test="${RZ_PKG_TEST:-./rz test}" p id rc brc rc_all=0 pkgs known
+    mapfile -t pkgs < <(pkgs_list "$base")
+    mapfile -t known < <(toml_keys 'c.get("ci", {}).get("known_failing", {}).get("build", {})')
+    BASE_WT=""
+    trap '[[ -z "$BASE_WT" ]] || { git worktree remove --force "$BASE_WT/tree" >/dev/null 2>&1; rm -rf "$BASE_WT"; git worktree prune; }' EXIT
+    echo "=== Train package tests (AGAST #3363): ${#pkgs[@]} package(s) vs base ${base:0:12}"
+    for p in ${pkgs[@]+"${pkgs[@]}"}; do
+        id="${p#projects/}"
+        echo "--- $id (train tip)"
+        # The exit code comes straight from the command, never through a pipe.
+        rc=0; $test "$p" || rc=$?
+        if [[ $rc -eq 0 ]]; then echo "PKG PASS $id"; continue; fi
+        # Exact id match: a nested package isn't excused by its parent's entry.
+        if printf '%s\n' ${known[@]+"${known[@]}"} | grep -qxF -- "$id"; then
+            echo "PKG KNOWN $id: exit $rc, excused in rz.toml [ci.known_failing.build] (advisory)"
+            continue
+        fi
+        if ! git cat-file -e "$base:$p/ritz.toml" 2>/dev/null; then
+            echo "PKG FAIL $id: exit $rc, and not on the base, so nothing to compare"
+            rc_all=1; continue
+        fi
+        if [[ -z "$BASE_WT" ]]; then
+            BASE_WT="$(mktemp -d)"
+            git worktree add -q --detach "$BASE_WT/tree" "$base"
+        fi
+        echo "--- $id (base ${base:0:12})"
+        brc=0; (cd "$BASE_WT/tree" && $test "$p") || brc=$?
+        if [[ $brc -ne 0 ]]; then
+            echo "PKG PRE-EXISTING $id: exit $rc, and exit $brc on base ${base:0:12} too (not this train's)"
+        else
+            echo "PKG FAIL $id: exit $rc, passes on base ${base:0:12}"
+            rc_all=1
+        fi
+    done
+    return $rc_all
+}
+
+cmd_pkgs() {
+    [[ $# -eq 2 && ( "$1" == list || "$1" == test ) ]] || die "usage: $0 pkgs list|test <base>"
+    git rev-parse -q --verify "$2^{commit}" >/dev/null || die "no such commit: $2"
+    "pkgs_$1" "$2"
 }
 
 cmd_land() {
@@ -153,6 +262,7 @@ case "${1:-}" in
     build) shift; cmd_build "$@" ;;
     gate)  shift; cmd_gate ;;
     land)  shift; cmd_land "$@" ;;
+    pkgs)  shift; cmd_pkgs "$@" ;;
     show)  cmd_show ;;
-    *) echo "usage: $0 build <branch>:<sha> ... | gate | land [<log>] | show" >&2; exit 2 ;;
+    *) echo "usage: $0 build <branch>:<sha> ... | gate | land [<log>] | show | pkgs list|test <base>" >&2; exit 2 ;;
 esac

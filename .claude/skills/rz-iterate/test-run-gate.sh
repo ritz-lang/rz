@@ -223,6 +223,17 @@ touch "$RZ_TEST_RELEASE"
 wait
 check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "H T R " ]]' "a train gate queued after a room gate goes first (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
 
+# 13. RZ_GATE_AFTER (AGAST #3363: a train's package tests) runs after the gate
+# command, only if it passed, and its failure is the gate's verdict.
+la="$(RZ_GATE_CMD='echo main step' RZ_GATE_AFTER='echo after step; exit 5' gate "$W" t13a)"
+check 'grep -qx "main step" "$la" && grep -qx "after step" "$la" && grep -qx EXIT=5 "$la"' "RZ_GATE_AFTER runs after a passing gate command and its exit is the verdict"
+check 'grep -q "^CMD=.*after step" "$la"' "the logged CMD includes the RZ_GATE_AFTER step"
+lb="$(RZ_GATE_CMD='echo main step; exit 2' RZ_GATE_AFTER='echo after step' gate "$W" t13b)"
+check 'grep -qx EXIT=2 "$lb" && ! grep -qx "after step" "$lb"' "RZ_GATE_AFTER is skipped when the gate command fails"
+lc="$(RZ_GATE_CMD='echo "PKG FAIL prism: exit 1, passes on base abc"; exit 1' gate "$W" t13c)"
+gate --wait "$lc" > "$T/wait13" 2>&1
+check 'grep -q "^PKG FAIL prism" "$T/wait13"' "--wait prints the PKG verdict lines"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

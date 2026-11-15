@@ -14,6 +14,8 @@
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
 #   RZ_GATE_POLL   seconds between slot polls    (default: 20; tests use less)
 #   RZ_GATE_TRAIN  1 = a merge-train gate        (train.sh gate sets it)
+#   RZ_GATE_AFTER  run after the command passes  (train.sh gate: its package
+#                  tests, AGAST #3363)
 #
 # Why each piece exists (rz-iterate):
 #   * systemd-run: a Bash background job dies when the agent's next turn
@@ -78,7 +80,7 @@ if [[ "${1:-}" == "--wait" ]]; then
         sleep 15
     done
     rc="$(sed -n 's/^EXIT=//p' "$LOG" | tail -1)"
-    grep -E '^(SHA|SLOT|EXIT)=|Stage [0-9]:|passed|FATAL|Failed build|SETUP ERROR|step\(s\) failed' "$LOG" | tail -20
+    grep -E '^(SHA|SLOT|EXIT)=|Stage [0-9]:|passed|FATAL|Failed build|SETUP ERROR|step\(s\) failed|^PKG ' "$LOG" | tail -20
     exit "$rc"
 fi
 
@@ -107,6 +109,8 @@ fi
 # build-all runs first (main.yml order): ~30 s on a warm CAS, so a broken
 # ecosystem package fails before the long bootstrap job (AGAST #2141).
 CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke --job build-all --job bootstrap\"}"
+# A merge train's package tests (AGAST #3363), only once CMD has passed.
+if [[ -n "${RZ_GATE_AFTER:-}" ]]; then CMD="($CMD) && $RZ_GATE_AFTER"; fi
 UNIT="ritz-gate-$NAME"
 
 # Uncommitted tracked changes would be tested but not merged.

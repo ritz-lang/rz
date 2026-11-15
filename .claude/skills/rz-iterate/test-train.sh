@@ -18,7 +18,8 @@ git -C "$M" add . && git -C "$M" commit -qm init && git -C "$M" push -q origin H
 # room <name> <file> <content> [base]: one commit on its own branch, pushed.
 room() {
     git -C "$M" checkout -q --detach "${4:-origin/main}"
-    echo "$3" > "$M/$2"; git -C "$M" commit -qam "$1: change $2"
+    mkdir -p "$M/$(dirname "$2")"; echo "$3" > "$M/$2"
+    git -C "$M" add -A; git -C "$M" commit -qm "$1: change $2"
     git -C "$M" push -q -f origin "HEAD:refs/heads/$1"
     git -C "$M" rev-parse HEAD
 }
@@ -27,7 +28,7 @@ room() {
 cat > "$T/gate.sh" <<'EOF'
 #!/usr/bin/env bash
 log="$RZ_TEST_DIR/gate-$(git -C "$1" rev-parse --short=12 HEAD).log"
-printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" > "$log"
+printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\nAFTER=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" "${RZ_GATE_AFTER:-}" > "$log"
 echo "$log"
 EOF
 chmod +x "$T/gate.sh"
@@ -94,5 +95,78 @@ s8="$(room r8 c C8)"; git -C "$M" push -q origin "$s8:refs/heads/main"; git -C "
 out="$(bash "$TR" land "$log" 2>&1)"; has "$out" "main moved" "land refuses when main moved"
 # The train's gate asks run-gate.sh for train priority (AGAST #3317).
 has "$(cat "$log")" "^TRAIN=1$" "train.sh gate sets RZ_GATE_TRAIN=1"
+
+# 6. Package tests (AGAST #3363): the train gate also tests the workspace
+# packages the train touches, and a failure blocks only if the base passes.
+# Fake packages; RZ_PKG_TEST stands in for `./rz test <dir>` and fails when
+# the package has a FAIL file.
+fetch; git -C "$M" checkout -q --detach origin/main
+for d in projects/ritz projects/harland projects/harland/boot projects/ritzunit/inventory \
+         projects/oldbad projects/lexis projects/ritz-lsp projects/prism; do
+    mkdir -p "$M/$d"; echo "[package]" > "$M/$d/ritz.toml"
+done
+mkdir -p "$M/projects/prism/src"; echo x > "$M/projects/prism/src/main.ritz"
+touch "$M/projects/oldbad/FAIL" "$M/projects/lexis/FAIL"
+printf '%s\n' '[workspace.exclude]' '"projects/harland/boot" = "built by harland"' \
+    '[ci.known_failing.build]' 'lexis = "AGAST #1 - fake"' > "$M/rz.toml"
+git -C "$M" add -A; git -C "$M" commit -qm packages; git -C "$M" push -q origin HEAD:main
+printf '%s\n' '#!/usr/bin/env bash' 'echo "testing $1 in $PWD"; [[ ! -e "$1/FAIL" ]]' > "$T/pkgtest.sh"
+chmod +x "$T/pkgtest.sh"; export RZ_PKG_TEST="$T/pkgtest.sh"
+PK="$TR"
+# train <files...>: a fresh one-room train whose commit touches <files>, on a
+# base one commit behind main (so it is APPLIED and needs a gate).  Sets $tb.
+train() {
+    fetch; git -C "$M" checkout -q --detach origin/main
+    local f s
+    for f in "$@"; do mkdir -p "$M/$(dirname "$f")"; echo "$RANDOM $f" >> "$M/$f"; done
+    git -C "$M" add -A; git -C "$M" commit -qm "pk: change"
+    git -C "$M" push -q -f origin HEAD:refs/heads/pk; s="$(git -C "$M" rev-parse HEAD)"
+    git -C "$M" checkout -q --detach origin/main; echo "$RANDOM" > "$M/d"
+    git -C "$M" commit -qam bump; git -C "$M" push -q origin HEAD:main; fetch
+    tb="$(git -C "$M" rev-parse origin/main)"
+    bash "$TR" build "pk:$s" >/dev/null 2>&1
+}
+pt() { (cd "$T/train" && bash "$PK" pkgs test "$tb" 2>&1); }
+
+train projects/prism/src/main.ritz projects/ritz/x projects/harland/boot/y \
+      projects/ritzunit/inventory/z projects/README projects/ritz-lsp/w
+out="$(cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1)"
+want="projects/harland projects/prism projects/ritz-lsp projects/ritzunit/inventory "
+[[ "$(tr '\n' ' ' <<<"$out")" == "$want" ]] \
+    && ok "list: each touched file's owning package, minus projects/ritz and excluded dirs" \
+    || { bad "list: touched packages"; echo "$out" | sed 's/^/     | /'; }
+log="$(bash "$TR" gate 2>/dev/null)"
+has "$(cat "$log")" "^AFTER=.*train.sh.* pkgs test $tb" "a train touching packages adds their tests to its gate"
+out="$(pt)"; rc=$?
+[[ $rc -eq 0 ]] && ok "passing package tests pass (rc=$rc)" || bad "passing package tests pass (rc=$rc)"
+has "$out" "^PKG PASS +prism" "each touched package is tested"
+has "$out" "^PKG PASS +ritzunit/inventory" "a nested package is tested by its own dir"
+
+train projects/ritz/only
+log="$(bash "$TR" gate 2>/dev/null)"
+has "$(cat "$log")" "^AFTER=$" "a train touching only projects/ritz adds nothing to its gate"
+
+train projects/prism/FAIL
+out="$(pt)"; rc=$?
+[[ $rc -ne 0 ]] && ok "a new package failure fails (rc=$rc)" || bad "a new package failure fails (rc=$rc)"
+has "$out" "^PKG FAIL +prism.*passes on base" "the new failure is named, against the base"
+has "$out" "^--- prism \(base " "the base was tested too"
+[[ "$(git -C "$T/train" worktree list | wc -l)" -eq 2 ]] && ok "the base worktree is removed" \
+    || { bad "the base worktree is removed"; git -C "$T/train" worktree list; }
+
+train projects/oldbad/src.ritz
+out="$(pt)"; rc=$?
+[[ $rc -eq 0 ]] && ok "a failure the base has too doesn't block (rc=$rc)" || bad "a failure the base has too doesn't block (rc=$rc)"
+has "$out" "^PKG PRE-EXISTING +oldbad" "a pre-existing failure is reported"
+
+train projects/lexis/src.ritz
+out="$(pt)"; rc=$?
+[[ $rc -eq 0 ]] && ok "a known-failing package is advisory (rc=$rc)" || bad "a known-failing package is advisory (rc=$rc)"
+has "$out" "^PKG KNOWN +lexis" "a known-failing package is reported"
+
+train projects/newpkg/ritz.toml projects/newpkg/FAIL
+out="$(pt)"; rc=$?
+[[ $rc -ne 0 ]] && ok "a new package that fails blocks (rc=$rc)" || bad "a new package that fails blocks (rc=$rc)"
+has "$out" "^PKG FAIL +newpkg.*not on the base" "a new package's failure needs no base run"
 
 echo; [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

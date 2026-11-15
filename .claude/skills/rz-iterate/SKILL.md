@@ -505,6 +505,23 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    train, and the highest-numbered `gate-logs/train-<sha12>-<n>.log` holds the gate. The
    train gate uses omegalisk's one gate slot, so it may wait behind a local
    room's gate.
+   **It also tests the packages the train touches** (AGAST #3363). #3290's
+   bug got through a green train because build-all + bootstrap don't run
+   the workspace projects' own tests. `train.sh gate` prints `PKGS <dirs>`
+   on stderr. Once build-all and bootstrap pass, the gate runs
+   `train.sh pkgs test <base>`: `./rz test` on each touched package (the
+   deepest `ritz.toml` above each changed file under `projects/`). It skips
+   `projects/ritz/**` and `[workspace.exclude]` dirs, so a compiler-only
+   train costs what it did before. Each package gets one line, and
+   `--wait` shows them:
+   `PKG PASS`, `PKG KNOWN` (in `[ci.known_failing.build]`: advisory, as in
+   `rz test --all`), `PKG PRE-EXISTING` (fails on the base too, so it was
+   re-run in a temp worktree of the base: not this train's) or `PKG FAIL`
+   (passes on the base, or a new package): the gate fails. Treat a
+   `PKG FAIL` like any other red gate. Not the whole `test-all`: it took
+   142 s on omegalisk (`-j 6`, room CPU weight, with a gate running), which
+   would add about 10% to every train, compiler-only ones too.
+   `train.sh pkgs list <base>` (run in the train worktree) previews the set.
 5. **Gate passes (exit 0), or `gate=not-needed`:**
    ```bash
    .claude/skills/rz-iterate/train.sh land "$LOG"      # no log when not needed
