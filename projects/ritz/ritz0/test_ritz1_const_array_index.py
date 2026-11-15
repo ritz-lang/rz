@@ -147,8 +147,26 @@ pub fn main() -> i32
     return T[IDX]
 """
 
+# AGAST #3325: a whole struct element is a struct value, `load %P` from the
+# `[N x %P]` GEP, as for a global `var g: [N]P` (#1553).  ritz1 refused it with
+# "a whole array is not a value here".  Element 0 holds 3 in `b`, element 1 in
+# `a`, so reading the wrong element or the wrong field gives something else.
+STRUCT_ELEM = """\
+struct P
+    a: i32
+    b: i64
+
+const PS: [2]P = [P { a: 9, b: 3 }, P { a: 3, b: 9 }]
+
+pub fn main() -> i32
+    var i: i64 = 1
+    let q: P = PS[i]
+    return q.a
+"""
+
 FORMS = {
     "i32_repro": I32_REPRO,
+    "struct_elem": STRUCT_ELEM,
     "u8_repro": U8_REPRO,
     "multi_row_sum": MULTI_ROW_SUM,
     "u8_high_bit": U8_HIGH_BIT,
@@ -196,6 +214,35 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
 def test_ritz0_oracle(name: str, tmp_path: Path) -> None:
     """ritz0 is the reference: every program is written to exit 3."""
     assert _run("ritz0", tmp_path, name, FORMS[name]) == 3
+
+
+# AGAST #3325: a const array is `internal constant` data, so a write into it
+# faulted at run time (or was dropped).  Reading `KS[i].len` gave the field a
+# pointer, which made `KS[0].len = 7` compile to that fault; both writes are a
+# located error now.  ritz0 has no oracle here: it fails on the const's name
+# with an internal "Unknown identifier" (#3337).
+WRITES = {
+    "elem": ("const NS: [2]i32 = [1, 2]\n\npub fn main() -> i32\n    NS[0] = 5\n    0\n", "NS"),
+    "field": (
+        'const KS: [2]StrView = ["a", "c"]\n\npub fn main() -> i32\n    KS[0].len = 7\n    0\n',
+        "KS",
+    ),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(WRITES))
+def test_ritz1_const_array_write_refused(name: str, ritz1_bin: Path, tmp_path: Path) -> None:
+    program, const = WRITES[name]
+    src = tmp_path / f"{name}.ritz"
+    src.write_text(program)
+    proc = subprocess.run(
+        [str(RITZ1_BIN), str(src), "-o", str(tmp_path / f"{name}.ll")],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"ritz1 accepted a write into const {const}:\n{out[-1500:]}"
+    assert f"{name}.ritz:4:5: error: cannot assign through const `{const}`" in out, out[-1500:]
 
 
 @pytest.mark.integration

@@ -23,8 +23,8 @@ ORACLE
 One row per sizing site, so breaking one site turns only its own row red.
 Each literal ends with a 4-byte character (the widest loss), and the program
 prints it followed by ``|``: a short ``len`` drops the bytes before the bar.  ritz1 runs the
-rows it accepts; it refuses ``var s: String = "..."`` and cannot index a
-const ``[N]StrView`` (#3325), so those two rows are ritz0-only.  The 2-, 3- and
+rows it accepts; it refuses ``var s: String = "..."``, so that row is
+ritz0-only.  It reads a const ``[N]StrView`` element since #3325.  The 2-, 3- and
 4-byte cases on all three compilers live in the matrix file
 ``ritz0/test/test_utf8_literal_len.ritz``.
 """
@@ -72,8 +72,10 @@ pub fn main() -> i32
 """,
         "K😀|",
     ),
+    # #3325: ritz1 emitted each "..." element as `%StrView zeroinitializer`
+    # and refused `KS[1]` as a whole array.
     "const_strview_array": (
-        RITZ0,
+        BOTH,
         """\
 const KS: [2]StrView = ["a", "c😀"]
 
@@ -83,6 +85,21 @@ pub fn main() -> i32
     0
 """,
         "c😀|",
+    ),
+    # A field of an element, at a runtime index: ritz1's member path had no
+    # const arm ("unhandled EXPR_MEMBER").  "c😀" is 5 bytes.
+    "const_strview_array_field": (
+        BOTH,
+        """\
+const KS: [2]StrView = ["a", "c😀"]
+
+pub fn main() -> i32
+    var i: i64 = 1
+    let n: i64 = KS[i].len
+    print("{n}|")
+    0
+""",
+        "5|",
     ),
     # The two names ritz0's String-let lowering needs, without ritzlib.
     "string_let": (

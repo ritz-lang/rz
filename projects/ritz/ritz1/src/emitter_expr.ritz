@@ -439,6 +439,33 @@ fn ptr_ptr_ident_levels(slot: i32) -> i32
         return 2
     return lv
 
+# AGAST #190 / #3325: `name[i].field` (e) over a module-level `[size x %P]`
+# global, a `var` global or a const struct array: GEP the element, then the
+# field.  1 when it resolved the field.
+fn emit_named_struct_array_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult, name: *u8, name_len: i32, size: i32, tn: *u8, tl: i32) -> i32
+    let st: *StructDef = find_struct(s, tn, tl)
+    if st == null
+        return 0
+    let fidx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if fidx < 0
+        return 0
+    let field: *StructField = get_field_type(st, fidx)
+    let idx_reg: i32 = emit_expr(s, e.left.right)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr [")
+    emit_int(s, size as i64)
+    emit_str(s, c" x %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c"], ptr @")
+    emit_name(s, name, name_len)
+    emit_str(s, c", i64 0, i64 ")
+    emit_reg(s, idx_reg)
+    emit_str(s, c"\n")
+    emit_member_gep_from_ptr(s, result, elem_ptr, st, fidx, field)
+    1
+
 fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     result.reg = 0
     result.field = null
@@ -972,30 +999,19 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                 let g_arr: *GlobalVarDef = find_global(s, e.left.left.ident_ptr, e.left.left.ident_len)
                 if g_arr != null
                     if g_arr.var_type == TYPE_ARRAY and g_arr.array_elem_type == TYPE_STRUCT and g_arr.array_elem_type_name_len > 0
-                        let g_elem_st: *StructDef = find_struct(s, g_arr.array_elem_type_name, g_arr.array_elem_type_name_len)
-                        if g_elem_st != null
-                            let g_field_idx: i32 = find_field_index(g_elem_st, e.ident_ptr, e.ident_len)
-                            if g_field_idx >= 0
-                                let g_field: *StructField = get_field_type(g_elem_st, g_field_idx)
-                                let g_idx_reg: i32 = emit_expr(s, e.left.right)
-                                let g_elem_ptr: i32 = next_reg(s)
-                                emit_str(s, c"  ")
-                                emit_reg(s, g_elem_ptr)
-                                emit_str(s, c" = getelementptr [")
-                                emit_int(s, g_arr.array_size as i64)
-                                emit_str(s, c" x %")
-                                emit_name(s, g_elem_st.name, g_elem_st.name_len)
-                                emit_str(s, c"], ptr @")
-                                emit_name(s, g_arr.name, g_arr.name_len)
-                                emit_str(s, c", i64 0, i64 ")
-                                emit_reg(s, g_idx_reg)
-                                emit_str(s, c"\n")
-                                emit_member_gep_from_ptr(s, result, g_elem_ptr, g_elem_st, g_field_idx, g_field)
-                                return
+                        if emit_named_struct_array_member_ptr(s, e, result, g_arr.name, g_arr.name_len, g_arr.array_size, g_arr.array_elem_type_name, g_arr.array_elem_type_name_len) == 1
+                            return
                     # AGAST #1908: `g[i].field` where g is a `*St` global
                     # (ritzunit's `g_junit_results[i].name`).
                     if g_arr.var_type == TYPE_PTR and g_arr.pointee_type_name_len > 0
                         if emit_ptr_elem_member_ptr(s, e, result, g_arr.pointee_type_name, g_arr.pointee_type_name_len) == 1
+                            return
+                # AGAST #3325: `KS[i].len` over a `const KS: [N]P = [...]`,
+                # declared `[N x %P]` by emit_const_array_entry.
+                else
+                    let c_arr: *ConstEntry = find_const_entry(s, e.left.left.ident_ptr, e.left.left.ident_len)
+                    if c_arr != null and c_arr.const_type == TYPE_ARRAY and c_arr.array_elem_type == TYPE_STRUCT and c_arr.array_elem_type_name_len > 0 and c_arr.value_expr != null and c_arr.value_expr.kind == EXPR_ARRAY_LIT
+                        if emit_named_struct_array_member_ptr(s, e, result, c_arr.name, c_arr.name_len, c_arr.array_size, c_arr.array_elem_type_name, c_arr.array_elem_type_name_len) == 1
                             return
 
         # AGAST #3114: `(*v)[i].field` with v a `**St` local: `*v` is the
