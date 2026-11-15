@@ -233,6 +233,10 @@ pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
             if fn_is_decl(fn_def) == 1
                 decl_refused(fn_def.line, c"[[test]] fn", fn_def.name, fn_def.name_len, null, 0, c"a test needs its body")
             test_fn_record(fn_def)
+        if (g_attr_bits & ATTR_NAKED) != 0
+            if fn_is_decl(fn_def) == 1
+                decl_refused(fn_def.line, c"[[naked]] fn", fn_def.name, fn_def.name_len, null, 0, c"a naked fn is its asm body")
+            asm_check_naked(fn_def)
         let fn_bits: i32 = g_attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE)
         if fn_bits != 0
             item_attr_record(fn_def as *u8, fn_bits)
@@ -313,6 +317,7 @@ pub fn parser_reset_diagnostics()
     g_last_drop_at = -1
     g_attr_errors = 0
     g_attr_last_err = null
+    g_asm_last_block = null   # AGAST #3394
     g_dyn_last = null   # AGAST #2298
     g_array_len_line = -1
     g_array_len_col = -1
@@ -388,8 +393,9 @@ fn eprint_construct(p: *Parser)
 #   noinline       fn      LLVM noinline
 #   callconv=".."  fn, extern fn, fn-type alias   "win64" -> win64cc on the
 #                          define / declare / call ("c" is the default)
-#   naked          fn      rejected: the body must be asm and ritz1 has no
-#                          inline asm yet (AGAST #1619)
+#   naked          fn      the body must be asm blocks with no clause and no
+#                          {name} (asm_check_naked); asm itself is not lowered
+#                          yet (AGAST #3395), so it still can't compile
 #
 # The grammar runs these actions before it knows which item follows, and it
 # backtracks: `attrs` is re-parsed for every `item` alternative tried.  So
@@ -408,6 +414,7 @@ const ATTR_WIN64: i32 = 32       # [[callconv = "win64"]] (AGAST #1879)
 const ATTR_TEST_HELPER: i32 = 64 # [[test_helper]]: may `assert` (AGAST #1869)
 const ATTR_TARGET_OS: i32 = 128  # any [[target_os = ..]] (AGAST #2149)
 const ATTR_MUST_USE: i32 = 256   # [[must_use]]: result may not be discarded (AGAST #2137)
+const ATTR_NAKED: i32 = 512      # [[naked]]: body is asm only (§17.5, AGAST #3394)
 
 const ATTR_ITEM_OTHER: i32 = 0
 const ATTR_ITEM_FN: i32 = 1
@@ -524,8 +531,7 @@ pub fn attr_flag(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> i32
     else if buf_eq(name, len, c"noinline", 8) == 1
         bit = ATTR_NOINLINE
     else if buf_eq(name, len, c"naked", 5) == 1
-        attr_error(name, len, line, col, c"is not supported by ritz1: a [[naked]] fn body may contain only asm, and ritz1 has no inline asm yet (AGAST #1619)")
-        return 0
+        bit = ATTR_NAKED
     else if buf_eq(name, len, c"target_os", 9) == 1
         attr_error(name, len, line, col, c"needs a value: [[target_os = <os name string>]]")
         return 0
@@ -4035,6 +4041,8 @@ fn tuple_resolve_stmts(first: *Stmt, tail: *StructDef)
             tuple_resolve_arms(s.if_then as *MatchArm, here)
         else if k == STMT_WHILE or k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
             tuple_resolve_stmts(s.while_body, null)
+        else if k == STMT_ASM
+            0   # STMT_ASM holds no statement, expression or type (AGAST #3394).
         else if k == STMT_FOR
             tuple_resolve_stmts(s.for_body, null)
         s = s.next
@@ -4364,6 +4372,330 @@ pub fn stmt_unsafe(p: *Parser, body: *Stmt, line: i32, col: i32) -> *Stmt
     s.while_body = body
     s.next = null
     return s
+
+# =============================================================================
+# Inline assembly (LANGUAGE_SPEC §18.6, LARB R50, AGAST #3394)
+# =============================================================================
+#
+# The grammar builds the clause list (asm_clause_new) and the line list
+# (asm_line_new); stmt_asm puts them in an AsmBlock, adds an ASM_IN operand
+# for each `{name}` no clause names, and reports, located, every §18.6 error
+# that needs no types:
+#   unknown ARCH; a clause word other than in/out/inout/clobber; `{` not
+#   closed or not followed by a name; a name in two clauses; an unpinned
+#   clause operand missing from the text; a register pinned twice, not a
+#   general register, or rsp/rbp pinned or clobbered; a named label.
+# The [[naked]] rules (no clause, no `{name}`, nothing but asm) are checked
+# when the fn is dispatched (asm_check_naked).  `{name}` not in scope or not
+# an integer or pointer, and `out` on a non-place, need types: AGAST #3395.
+
+# The arch name of the last block reported on, so a block the parser
+# backtracks over and builds again is reported once.  Blocks are built in
+# source order; reset per file by parser_reset_diagnostics.
+var g_asm_last_block: *u8 = null
+
+# `error: <file>:<line>:<col>: <pre><name><post>`, counted as a parse error.
+fn asm_error(line: i32, col: i32, pre: *u8, name: *u8, len: i32, post: *u8)
+    g_attr_errors = g_attr_errors + 1
+    eprints_cstr(c"error: ")
+    if g_parse_file != null
+        eprints_cstr(g_parse_file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": ")
+    eprints_cstr(pre)
+    eprint_lexeme(name, len)
+    eprintln_cstr(post)
+
+# The x86_64 general register `name` names by its 64-bit name, as an index
+# (the order of the hardware encoding), or ASM_REG_NONE.
+pub fn asm_reg_index(name: *u8, len: i32) -> i32
+    if buf_eq(name, len, c"rax", 3) == 1
+        return 0
+    if buf_eq(name, len, c"rcx", 3) == 1
+        return 1
+    if buf_eq(name, len, c"rdx", 3) == 1
+        return 2
+    if buf_eq(name, len, c"rbx", 3) == 1
+        return 3
+    if buf_eq(name, len, c"rsp", 3) == 1
+        return ASM_REG_RSP
+    if buf_eq(name, len, c"rbp", 3) == 1
+        return ASM_REG_RBP
+    if buf_eq(name, len, c"rsi", 3) == 1
+        return 6
+    if buf_eq(name, len, c"rdi", 3) == 1
+        return 7
+    # r8 .. r15
+    if len >= 2 and len <= 3 and *name == 114
+        var n: i32 = 0
+        var i: i32 = 1
+        while i < len
+            let c: i32 = (*(name + i)) as i32
+            if c < 48 or c > 57
+                return ASM_REG_NONE
+            n = n * 10 + (c - 48)
+            i = i + 1
+        if *(name + 1) != 48 and n >= 8 and n <= 15
+            return n
+    ASM_REG_NONE
+
+fn asm_is_name_start(c: i32) -> i32
+    ((c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95) as i32
+
+fn asm_is_name_char(c: i32) -> i32
+    (asm_is_name_start(c) == 1 or (c >= 48 and c <= 57)) as i32
+
+# Grammar action for one clause, `<kind> <name> (: <reg>)?`; `reg` is null
+# without `: reg`.  The kind word is judged in stmt_asm: `in` is a keyword,
+# the others are IDENTs.  For `clobber r11` the register is the "name".
+pub fn asm_clause_new(p: *Parser, kind: *u8, kind_len: i32, kline: i32, kcol: i32, name: *u8, name_len: i32, line: i32, col: i32, reg: *u8, reg_len: i32, rline: i32, rcol: i32) -> *AsmOperand
+    let o: *AsmOperand = parser_alloc(p, sizeof(AsmOperand)) as *AsmOperand
+    o.name = name
+    o.name_len = name_len
+    o.span.line = line
+    o.span.col = col
+    o.kind = kind
+    o.kind_len = kind_len
+    o.kind_span.line = kline
+    o.kind_span.col = kcol
+    o.dir = ASM_UNKNOWN
+    if buf_eq(kind, kind_len, c"in", 2) == 1
+        o.dir = ASM_IN
+    else if buf_eq(kind, kind_len, c"out", 3) == 1
+        o.dir = ASM_OUT
+    else if buf_eq(kind, kind_len, c"inout", 5) == 1
+        o.dir = ASM_INOUT
+    else if buf_eq(kind, kind_len, c"clobber", 7) == 1
+        o.dir = ASM_CLOBBER
+    o.reg = ASM_REG_NONE
+    o.reg_name = reg
+    o.reg_name_len = reg_len
+    o.reg_span.line = rline
+    o.reg_span.col = rcol
+    if reg != null
+        o.reg = asm_reg_index(reg, reg_len)
+    o.in_clause = 1
+    o.text_span.line = 0
+    o.text_span.col = 0
+    o.next = null
+    o
+
+pub fn asm_operand_link(first: *AsmOperand, rest: *AsmOperand) -> *AsmOperand
+    first.next = rest
+    first
+
+pub fn asm_line_new(p: *Parser, text: *u8, len: i32, line: i32, col: i32) -> *AsmLine
+    let l: *AsmLine = parser_alloc(p, sizeof(AsmLine)) as *AsmLine
+    l.text = text
+    l.len = len
+    l.span.line = line
+    l.span.col = col
+    l.next = null
+    l
+
+pub fn asm_line_link(first: *AsmLine, rest: *AsmLine) -> *AsmLine
+    first.next = rest
+    first
+
+# The operand of `b` named `name`, or null.
+fn asm_find_operand(b: *AsmBlock, name: *u8, len: i32) -> *AsmOperand
+    var o: *AsmOperand = b.operands
+    while o != null
+        if buf_eq(o.name, o.name_len, name, len) == 1
+            return o
+        o = o.next
+    null
+
+# Append `o` to b.operands.
+fn asm_append_operand(b: *AsmBlock, o: *AsmOperand)
+    o.next = null
+    if b.operands == null
+        b.operands = o
+        return
+    var t: *AsmOperand = b.operands
+    while t.next != null
+        t = t.next
+    t.next = o
+
+# 1 if register `reg`, written `text` at `at`, may be pinned or clobbered;
+# reports it (when `report` is 1) if not.
+fn asm_reg_ok(reg: i32, text: *u8, len: i32, at: SrcSpan, report: i32) -> i32
+    if reg == ASM_REG_NONE
+        if report == 1
+            asm_error(at.line, at.col, c"'", text, len, c"' is not a general register (rax, rbx, rcx, rdx, rsi, rdi, r8-r15)")
+        return 0
+    if reg == ASM_REG_RSP or reg == ASM_REG_RBP
+        if report == 1
+            asm_error(at.line, at.col, c"asm can't pin or clobber '", text, len, c"'")
+        return 0
+    1
+
+# Sort a block's clauses, in order: a clobber sets its bit in b.clobbers,
+# any other is appended to b.operands.  Reports what is wrong with each.
+fn asm_take_clauses(b: *AsmBlock, clauses: *AsmOperand, report: i32)
+    var pinned: i32 = 0
+    var o: *AsmOperand = clauses
+    while o != null
+        let nxt: *AsmOperand = o.next
+        b.clause_count = b.clause_count + 1
+        if b.first_clause.line == 0
+            b.first_clause = o.kind_span
+        if o.dir == ASM_UNKNOWN
+            if report == 1
+                asm_error(o.kind_span.line, o.kind_span.col, c"unknown asm clause '", o.kind, o.kind_len, c"' (in, out, inout or clobber)")
+        else if o.dir == ASM_CLOBBER
+            if o.reg_name != null
+                if report == 1
+                    asm_error(o.reg_span.line, o.reg_span.col, c"'clobber' takes one register, not '", o.name, o.name_len, c": ...'")
+            else
+                let reg: i32 = asm_reg_index(o.name, o.name_len)
+                if asm_reg_ok(reg, o.name, o.name_len, o.span, report) == 1
+                    b.clobbers = b.clobbers | (1 << reg)
+        else if asm_find_operand(b, o.name, o.name_len) != null
+            if report == 1
+                asm_error(o.span.line, o.span.col, c"'", o.name, o.name_len, c"' is named in two asm clauses")
+        else
+            if o.reg_name != null
+                if asm_reg_ok(o.reg, o.reg_name, o.reg_name_len, o.reg_span, report) == 0
+                    o.reg = ASM_REG_NONE
+                else if (pinned & (1 << o.reg)) != 0
+                    if report == 1
+                        asm_error(o.reg_span.line, o.reg_span.col, c"asm register '", o.reg_name, o.reg_name_len, c"' is pinned twice")
+                else
+                    pinned = pinned | (1 << o.reg)
+            asm_append_operand(b, o)
+        o = nxt
+
+# A named label at the start of line `l` (`loop:`, `.L1:`), reported; only
+# numeric local labels (`1:`) are allowed (§18.6, #1371).
+fn asm_check_label(l: *AsmLine, report: i32)
+    if l.len == 0
+        return
+    let c0: i32 = (*l.text) as i32
+    if asm_is_name_start(c0) == 0 and c0 != 46   # '.'
+        return
+    var i: i32 = 1
+    while i < l.len and (asm_is_name_char((*(l.text + i)) as i32) == 1 or *(l.text + i) == 46 or *(l.text + i) == 36)
+        i = i + 1
+    if i < l.len and *(l.text + i) == 58   # ':'
+        if report == 1
+            asm_error(l.span.line, l.span.col, c"named label '", l.text, i, c"' in asm: use a numeric local label (1:, jumped to as 1b or 1f)")
+
+# The `{name}`s of line `l`: each name no operand has yet becomes an ASM_IN
+# operand; each operand found is marked as in the text.  `{{` and `}}` are a
+# literal brace.  A `{` that isn't closed, or isn't a name, is reported.
+fn asm_scan_line(p: *Parser, b: *AsmBlock, l: *AsmLine, report: i32)
+    var i: i32 = 0
+    while i < l.len
+        let c: i32 = (*(l.text + i)) as i32
+        if c == 123 and i + 1 < l.len and *(l.text + i + 1) == 123   # `{{`
+            i = i + 2
+        else if c == 125 and i + 1 < l.len and *(l.text + i + 1) == 125   # `}}`
+            i = i + 2
+        else if c == 123
+            var j: i32 = i + 1
+            if j < l.len and asm_is_name_start((*(l.text + j)) as i32) == 1
+                while j < l.len and asm_is_name_char((*(l.text + j)) as i32) == 1
+                    j = j + 1
+            if j < l.len and j > i + 1 and *(l.text + j) == 125
+                let name: *u8 = l.text + i + 1
+                let len: i32 = j - i - 1
+                var o: *AsmOperand = asm_find_operand(b, name, len)
+                if o == null
+                    o = parser_alloc(p, sizeof(AsmOperand)) as *AsmOperand
+                    o.name = name
+                    o.name_len = len
+                    o.span.line = l.span.line
+                    o.span.col = l.span.col + i + 1
+                    o.dir = ASM_IN
+                    o.reg = ASM_REG_NONE
+                    o.reg_name = null
+                    o.reg_name_len = 0
+                    o.in_clause = 0
+                    o.text_span.line = 0
+                    o.kind = null
+                    o.kind_len = 0
+                    asm_append_operand(b, o)
+                if o.text_span.line == 0
+                    o.text_span.line = l.span.line
+                    o.text_span.col = l.span.col + i
+                i = j + 1
+            else
+                if report == 1
+                    var closed: i32 = 0
+                    var k: i32 = i + 1
+                    while k < l.len
+                        if *(l.text + k) == 125
+                            closed = 1
+                        k = k + 1
+                    if closed == 0
+                        asm_error(l.span.line, l.span.col + i, c"'{' in asm is not closed", null, 0, c" (write '{{' for a literal '{')")
+                    else
+                        asm_error(l.span.line, l.span.col + i, c"'{' in asm must be followed by a name and '}'", null, 0, c" (write '{{' for a literal '{')")
+                i = l.len
+        else
+            i = i + 1
+
+# Grammar action for an asm block (LANGUAGE_SPEC §18.6, AGAST #3394).
+pub fn stmt_asm(p: *Parser, arch: *u8, arch_len: i32, aline: i32, acol: i32, clauses: *AsmOperand, lines: *AsmLine, line: i32, col: i32) -> *Stmt
+    # A block the parser backtracked over and builds again is not re-reported.
+    var report: i32 = 0
+    if g_asm_last_block == null or (arch as i64) > (g_asm_last_block as i64)
+        report = 1
+        g_asm_last_block = arch
+    let b: *AsmBlock = parser_alloc(p, sizeof(AsmBlock)) as *AsmBlock
+    b.arch = arch
+    b.arch_len = arch_len
+    b.lines = lines
+    b.operands = null
+    b.clobbers = 0
+    b.clause_count = 0
+    b.first_clause.line = 0
+    b.first_clause.col = 0
+    if buf_eq(arch, arch_len, c"x86_64", 6) == 0 and report == 1
+        asm_error(aline, acol, c"unknown asm architecture '", arch, arch_len, c"' (known: x86_64)")
+    asm_take_clauses(b, clauses, report)
+    var l: *AsmLine = lines
+    while l != null
+        asm_check_label(l, report)
+        asm_scan_line(p, b, l, report)
+        l = l.next
+    # An unpinned clause operand has no register but the one {name} picks.
+    var o: *AsmOperand = b.operands
+    while o != null
+        if o.in_clause == 1 and o.reg_name == null and o.text_span.line == 0 and report == 1
+            asm_error(o.span.line, o.span.col, c"asm operand '", o.name, o.name_len, c"' is in a clause but not in the text: write {name} or pin it to a register")
+        o = o.next
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = STMT_ASM
+    s.span.line = line
+    s.span.col = col
+    s.asm_block = b
+    s.next = null
+    return s
+
+# The [[naked]] rules for fn `f` (§18.6, §17.5): its body holds only asm
+# blocks, and they take no clause and no `{name}`: there is no frame.
+fn asm_check_naked(f: *FnDef)
+    var st: *Stmt = f.body
+    while st != null
+        if st.kind != STMT_ASM
+            asm_error(st.span.line, st.span.col, c"a [[naked]] fn body may contain only asm blocks", null, 0, c"")
+        else
+            let b: *AsmBlock = st.asm_block
+            if b.clause_count > 0
+                asm_error(b.first_clause.line, b.first_clause.col, c"an asm block in a [[naked]] fn takes no clauses", null, 0, c"")
+            var o: *AsmOperand = b.operands
+            while o != null
+                if o.text_span.line != 0
+                    asm_error(o.text_span.line, o.text_span.col, c"an asm block in a [[naked]] fn takes no {name}: '", o.name, o.name_len, c"' has no frame to live in")
+                o = o.next
+        st = st.next
 
 pub fn stmt_continue(p: *Parser, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt

@@ -49,6 +49,8 @@ TYPE        = "type"
 # Inline if-expression `if c then a else b` (LANGUAGE_SPEC §7.5, AGAST #1753).
 # Token ID 47 (HAND_WRITTEN_TOKEN_IDS in tools/ritzgen_py/ritz_generator.py).
 THEN        = "then"
+# Inline assembly (LANGUAGE_SPEC §18.6, AGAST #3394).  Token ID 48.
+ASM         = "asm"
 
 # Type keywords
 I8          = "i8"
@@ -129,6 +131,9 @@ FLOAT       = /[0-9]+\.[0-9]+/
 STRING      = /"([^"\\]|\\.)*"/
 CHAR        = /'([^'\\]|\\.)'/
 CSTRING     = /c"([^"\\]|\\.)*"/
+# One line of an asm block's body, as text (AGAST #3394).  No pattern: the
+# lexer makes it in asm body mode (lexer_nfa.ritz lexer_asm_text).
+ASM_LINE    = ""
 
 %skip
 WHITESPACE  = /[ \t\r]+/
@@ -725,7 +730,54 @@ stmt -> *Stmt
     | assign_stmt
     | defer_stmt
     | unsafe_stmt
+    | asm_stmt
     | expr_stmt
+    ;
+
+# Inline assembly (LANGUAGE_SPEC §18.6, LARB R50, AGAST #3394):
+#   asm ARCH (clause, ...)?:
+#       <lines of text>
+# The lexer hands each body line over whole, as one ASM_LINE (lexer_nfa.ritz
+# asm body mode), so `$`, `%` and `(%rax)` survive.  stmt_asm checks
+# everything that needs no types; lowering is AGAST #3395.
+asm_stmt -> *Stmt
+    : ASM IDENT asm_clauses COLON NEWLINE INDENT asm_lines DEDENT
+      { stmt_asm(p, $2.start, $2.len, $2.line, $2.col, $3, $7, $1.line, $1.col) }
+    | ASM IDENT COLON NEWLINE INDENT asm_lines DEDENT
+      { stmt_asm(p, $2.start, $2.len, $2.line, $2.col, 0 as *AsmOperand, $6, $1.line, $1.col) }
+    ;
+
+asm_clauses -> *AsmOperand
+    : LPAREN asm_clause_list RPAREN { $2 }
+    ;
+
+asm_clause_list -> *AsmOperand
+    : asm_clause COMMA asm_clause_list { asm_operand_link($1, $3) }
+    | asm_clause { $1 }
+    ;
+
+# `in` is a keyword; `out`, `inout` and `clobber` are not, so they come as an
+# IDENT and asm_clause_new reads the word.  `clobber REG` is `IDENT IDENT`.
+asm_clause -> *AsmOperand
+    : IN IDENT COLON IDENT
+      { asm_clause_new(p, $1.start, $1.len, $1.line, $1.col, $2.start, $2.len, $2.line, $2.col, $4.start, $4.len, $4.line, $4.col) }
+    | IN IDENT
+      { asm_clause_new(p, $1.start, $1.len, $1.line, $1.col, $2.start, $2.len, $2.line, $2.col, null, 0, 0, 0) }
+    | IDENT IDENT COLON IDENT
+      { asm_clause_new(p, $1.start, $1.len, $1.line, $1.col, $2.start, $2.len, $2.line, $2.col, $4.start, $4.len, $4.line, $4.col) }
+    | IDENT IDENT
+      { asm_clause_new(p, $1.start, $1.len, $1.line, $1.col, $2.start, $2.len, $2.line, $2.col, null, 0, 0, 0) }
+    ;
+
+asm_lines -> *AsmLine
+    : asm_line asm_lines { asm_line_link($1, $2) }
+    | asm_line { $1 }
+    ;
+
+# The last line of a file may have no NEWLINE.
+asm_line -> *AsmLine
+    : ASM_LINE NEWLINE { asm_line_new(p, $1.start, $1.len, $1.line, $1.col) }
+    | ASM_LINE { asm_line_new(p, $1.start, $1.len, $1.line, $1.col) }
     ;
 
 # `unsafe` + a block (AGAST #2248), as ritz0's parse_unsafe.  ritz1 enforces nothing inside it, so it lowers as a plain

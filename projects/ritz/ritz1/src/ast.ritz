@@ -142,6 +142,26 @@ const STMT_DEFER: i32 = 20
 # A block for scope and drops, never a loop: a `break` in it leaves the loop
 # around it, and it diverges exactly when its body does (ritz0 UnsafeBlock).
 const STMT_UNSAFE: i32 = 21
+# `asm ARCH (clauses): <raw lines>` (LANGUAGE_SPEC §18.6, LARB R50, AGAST
+# #3394).  Everything is in asm_block; the statement holds no expressions or
+# statements, so a walker has nothing to descend into.  ritz1 parses and checks
+# it (stmt_asm, ast_helpers.ritz) but does not lower it yet (AGAST #3395).
+const STMT_ASM: i32 = 22
+
+# asm operand directions (AsmOperand.dir).  ASM_CLOBBER marks a `clobber REG`
+# clause while the grammar builds the clause list; stmt_asm moves it to
+# AsmBlock.clobbers, so no operand in a finished block has it.
+const ASM_IN: i32 = 0
+const ASM_OUT: i32 = 1
+const ASM_INOUT: i32 = 2
+const ASM_CLOBBER: i32 = 3
+const ASM_UNKNOWN: i32 = 4   # a clause word that is none of the above
+
+# x86_64 general registers, by their 64-bit names: the index is the bit in
+# AsmBlock.clobbers.  ASM_REG_NONE is an operand that isn't pinned.
+const ASM_REG_NONE: i32 = -1
+const ASM_REG_RSP: i32 = 4
+const ASM_REG_RBP: i32 = 5
 
 # Type kinds
 const TYPE_VOID: i32 = 0       # No return type (void)
@@ -388,11 +408,51 @@ struct Stmt
   # AGAST #1625: for STMT_DEFER, 1 for the block form (`defer` + an indented
   # block), 0 for `defer <stmt>`.  Set by stmt_defer only.
   defer_is_block: i32
+  # AGAST #3394: for STMT_ASM, the block.  Set by stmt_asm only.
+  asm_block: *AsmBlock
   # AGAST #2886: for STMT_INDEX_ASSIGN, `n[i] = v` / `n[i] op= v`, where its `[`
   # is.  Set by stmt_assign_index only (parser_alloc does not zero).
   # AGAST #3015: for STMT_LOCAL_FIELD_ASSIGN, STMT_LOCAL_FIELD_INDEX_ASSIGN,
   # STMT_MEMBER_ASSIGN and STMT_MEMBER_INDEX_ASSIGN, where the field name is.
   bracket: SrcSpan
+
+# One line of an asm block, as written (AGAST #3394): leading indentation and
+# a `#` comment are already gone (the lexer's asm body mode, lexer_nfa.ritz),
+# and `{{` / `}}` are still doubled, for the emitter.  `text` points into the
+# source; `span` is where its first character is.
+struct AsmLine
+  text: *u8
+  len: i32
+  span: SrcSpan
+  next: *AsmLine
+
+# An asm operand (AGAST #3394): a clause `in|out|inout name (: reg)?`, or a
+# `{name}` in the text that no clause names (then an ASM_IN, unpinned).
+struct AsmOperand
+  name: *u8
+  name_len: i32
+  span: SrcSpan        # the name in its clause, else its first `{name}`
+  dir: i32             # ASM_IN / ASM_OUT / ASM_INOUT
+  reg: i32             # pinned register, ASM_REG_* index; ASM_REG_NONE if not
+  reg_name: *u8        # the register as written (`rax`); null if not pinned
+  reg_name_len: i32
+  reg_span: SrcSpan    # where reg_name is
+  in_clause: i32       # 1 if a clause names it
+  text_span: SrcSpan   # its first `{name}` in the text; line 0 if none
+  kind: *u8            # the clause's first word (`in`, `out`, ...); null if none
+  kind_len: i32
+  kind_span: SrcSpan
+  next: *AsmOperand
+
+# The body of a STMT_ASM (AGAST #3394).
+struct AsmBlock
+  arch: *u8
+  arch_len: i32
+  lines: *AsmLine
+  operands: *AsmOperand   # clause operands in clause order, then text-only inputs
+  clobbers: i32           # bit (1 << ASM_REG_*) per `clobber` clause
+  clause_count: i32       # every clause, `clobber` ones included
+  first_clause: SrcSpan   # the first clause's first word; line 0 if none
 
 # Generic type parameter (e.g., T in fn vec_new<T>())
 struct TypeParam

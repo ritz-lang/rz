@@ -97,6 +97,18 @@ struct Lexer
   # AGAST #1813: the message for the TOK_ERROR just returned, or null for an
   # unrecognised character.  Set by lexer_fail, which also stops the lexer.
   error_msg: *u8
+  # asm body mode (LANGUAGE_SPEC §18.6, AGAST #3394).  An `asm` block's body is
+  # text, not Ritz: `movq $3, %rcx` and `nopl (%rax)` must reach the parser
+  # whole.  A line that starts with `asm` (outside brackets) and ends in `:`
+  # puts the lexer in this mode for the lines indented under it: each becomes
+  # one TOK_ASM_LINE (lexer_asm_line), then NEWLINE.  The first gets the
+  # block's INDENT; a deeper one gets no INDENT of its own (its extra
+  # indentation is dropped).  The first line no deeper than the `asm` line
+  # leaves the mode and is laid out as usual, DEDENTing the body.
+  asm_line: i32            # 1 from an `asm` at bracket depth 0 to its NEWLINE
+  asm_base: i32            # that line's indentation
+  asm_raw: i32             # 1 while lexing an asm body
+  asm_body: i32            # 1 once the body's INDENT has been pushed
 
 # Reset lexer for new source (preserves NFA and patterns, resets state)
 # Use this when reusing a lexer for multiple files to avoid stack overflow
@@ -113,6 +125,7 @@ fn lexer_reset(lex: *Lexer, src: *u8, len: i64) -> i32
   lex.pending_dedents = 0
   lex.bracket_depth = 0    # Not inside any brackets
   lexer_layout_reset(lex)
+  lexer_asm_reset(lex)
   # Reset string buffer
   lex.string_pos = 0
   lex.error_msg = null
@@ -128,6 +141,64 @@ fn lexer_layout_reset(lex: *Lexer)
   lex.if_depth = 0
   lex.last_kind = 0
   lex.last_depth = 0
+
+# Not in, or about to enter, an asm body.
+fn lexer_asm_reset(lex: *Lexer)
+  lex.asm_line = 0
+  lex.asm_base = 0
+  lex.asm_raw = 0
+  lex.asm_body = 0
+
+# At the start of a line in asm body mode (AGAST #3394), with lex.pos at its
+# first byte.  Returns 1 with a token in out_tok (the body's INDENT, or a tab
+# error), 0 to go on scanning: a blank or comment-only line was skipped, the
+# line's text is next (at_line_start is 0), or the line ends the body (the
+# mode is off and at_line_start still 1, so it is laid out as usual).
+fn lexer_asm_line_start(lex: *Lexer, out_tok: *Token) -> i32
+  var indent: i32 = 0
+  while lexer_peek_at(lex, indent) == 32  # space
+    indent = indent + 1
+  let c: i32 = lexer_peek_at(lex, indent)
+  # A blank or comment-only line, a tab, or the end of input: as anywhere.
+  if c == 10 or c == 35 or c == 9 or lex.pos + indent >= lex.len
+    return lexer_handle_indent(lex, out_tok)
+  if indent <= lex.asm_base
+    lex.asm_raw = 0
+    return 0
+  lex.pos = lex.pos + indent
+  lex.col = lex.col + indent
+  lex.line_indent = indent
+  lex.at_line_start = 0
+  if lex.asm_body == 1
+    return 0
+  if lex.indent_depth >= MAX_INDENT_DEPTH
+    return lexer_fail(lex, out_tok, c"blocks nested more than 64 levels deep")
+  lex.asm_body = 1
+  lex.indent_stack[lex.indent_depth] = indent
+  lex.indent_depth = lex.indent_depth + 1
+  *out_tok = token_new(TOK_INDENT, lex.pos, 0, lex.line, lex.col)
+  1
+
+# One line of an asm body, from lex.pos (past its indentation) to the end of
+# the line, as TOK_ASM_LINE.  A `#` and what follows it is a comment and is
+# left out, as is trailing whitespace; the newline is lexed next, as usual.
+fn lexer_asm_text(lex: *Lexer) -> Token
+  let start: i64 = lex.pos
+  let line: i32 = lex.line
+  let col: i32 = lex.col
+  var end: i64 = start
+  while end < lex.len and *(lex.src + end) != 10 and *(lex.src + end) != 35
+    end = end + 1
+  var stop: i64 = end
+  while end < lex.len and *(lex.src + end) != 10
+    end = end + 1
+  while stop > start and (*(lex.src + stop - 1) == 32 or *(lex.src + stop - 1) == 9 or *(lex.src + stop - 1) == 13)
+    stop = stop - 1
+  lex.col = lex.col + (end - start) as i32
+  lex.pos = end
+  var tok: Token = token_new(TOK_ASM_LINE, start, (stop - start) as i32, line, col)
+  tok.start = lex.src + start
+  tok
 
 # At a newline inside brackets on `line`: open a layout frame if the line ended
 # in an `if` condition or a bare `else` at this bracket depth, and return 1 so
@@ -236,6 +307,8 @@ fn lexer_init(lex: *Lexer, src: *u8, len: i32, nfa: *NFA, patterns: *TokenPatter
   lex.pending_dedents = 0
   lex.bracket_depth = 0    # Not inside any brackets
   lexer_layout_reset(lex)
+  lexer_asm_reset(lex)
+  lex.error_msg = null
   # Initialize the cooked-string scratch.  Lexers are usually `var lex: Lexer`
   # on the stack, so these MUST be zeroed here — a garbage `string_buf` would
   # be handed straight to realloc.
@@ -531,6 +604,15 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
 # frame (lexer_layout_open).
 fn lexer_next(lex: *Lexer) -> Token
   var tok: Token = lexer_next_token(lex)
+  # AGAST #3394: `asm ... :` NEWLINE starts an asm body.
+  if tok.kind == TOK_ASM and lex.bracket_depth == 0
+    lex.asm_line = 1
+    lex.asm_base = lex.line_indent
+  if tok.kind == TOK_NEWLINE and lex.asm_line == 1
+    lex.asm_line = 0
+    if lex.last_kind == TOK_COLON and lex.bracket_depth == 0
+      lex.asm_raw = 1
+      lex.asm_body = 0
   if lex.bracket_depth > lex.layout_depth
     if tok.kind == TOK_IF
       lex.if_line = tok.line
@@ -567,6 +649,10 @@ fn lexer_next_token(lex: *Lexer) -> Token
         lex.at_line_start = 0
         continue
       var indent_tok: Token = token_new(TOK_ERROR, 0, 0, 0, 0)
+      if lex.asm_raw == 1
+        if lexer_asm_line_start(lex, @indent_tok) == 1
+          return indent_tok
+        continue
       if lexer_handle_indent(lex, @indent_tok) == 1
         return indent_tok
       continue  # Line was blank or comment-only, try again
@@ -589,6 +675,10 @@ fn lexer_next_token(lex: *Lexer) -> Token
       var tok: Token = token_new(TOK_NEWLINE, start, 1, line, col)
       tok.start = lex.src + start
       return tok
+
+    # An asm body line is text (AGAST #3394).
+    if lex.asm_raw == 1
+      return lexer_asm_text(lex)
 
     # Check for inline comment - skip to end of line
     if ch == 35  # '#'

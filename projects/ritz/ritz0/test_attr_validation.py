@@ -562,5 +562,13 @@ fn main() -> i32
 """
 
 
-def test_ritz1_rejects_naked_until_it_has_asm(ritz1_bin, tmp_path):
-    _assert_located_error("ritz1", tmp_path, NAKED_RITZ1, 1, 3, "naked", "asm", "#1619")
+def test_ritz1_naked_body_must_be_asm(ritz1_bin, tmp_path):
+    # ritz1 parses asm (AGAST #3394), so `[[naked]]` is judged as ritz0 judges
+    # it: at the statement that isn't asm.
+    _assert_located_error("ritz1", tmp_path, NAKED_RITZ1, 3, 5, "naked", "only asm")
+
+
+def test_ritz1_refuses_naked_until_asm_is_lowered(ritz1_bin, tmp_path):
+    # A well-formed naked fn reaches the emitter, which can't lower asm yet
+    # (AGAST #3395): refused at the block, never emitted with a prologue.
+    _assert_located_error("ritz1", tmp_path, NAKED, 3, 5, "asm is not lowered", "#3395")

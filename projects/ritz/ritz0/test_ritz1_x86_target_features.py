@@ -258,12 +258,8 @@ def test_intrinsic_fns_honour_masked_native_features(program_ll, tmp_path):
 
 
 # aes and aes_gcm import cryptosec.mem, whose mem_zero holds an `asm x86_64:`
-# block that ritz1 cannot parse yet (AGAST #1455). Strict, so the test turns
-# red once ritz1 has asm and it must be un-xfailed.
-_NEEDS_RITZ1_ASM = pytest.mark.xfail(
-    strict=True,
-    reason="ritz1 cannot parse cryptosec/lib/mem.ritz's asm block (AGAST #1455)",
-)
+# block.  ritz1 parses it since AGAST #3394; an imported fn is declared, not
+# emitted, so the block needn't be lowered (#3395) for these to compile.
 
 
 @pytest.mark.skipif(not CRYPTOSEC.is_dir(), reason="cryptosec not checked out")
@@ -271,15 +267,15 @@ _NEEDS_RITZ1_ASM = pytest.mark.xfail(
     "name",
     [
         "sha256",
-        pytest.param("aes", marks=_NEEDS_RITZ1_ASM),
-        pytest.param("aes_gcm", marks=_NEEDS_RITZ1_ASM),
+        "aes",
+        "aes_gcm",
     ],
 )
 def test_cryptosec_source_compiles_at_O2_without_march_flags(ritz1_bin, tmp_path, name,
                                                            monkeypatch):
     # A private, empty store (AGAST #1901): with mem.ritz's interface text
     # stored, ritz1 parses that -- mem_zero's asm body emptied -- and never
-    # meets the asm, so the xfail would depend on what the cache holds.
+    # meets the asm, so the result would depend on what the cache holds.
     monkeypatch.setenv("RITZ_CACHE_DIR", str(tmp_path / "cas"))
     ll = tmp_path / f"{name}.ll"
     _ritz1(CRYPTOSEC / "lib" / f"{name}.ritz", ll)

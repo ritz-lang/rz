@@ -5262,8 +5262,8 @@ fn not_asm() -> i32
     x
 ```
 
-ritz1 has no inline `asm` yet (§18.6; AGAST #1619's implementation tickets), so
-it rejects `[[naked]]`.
+ritz1 parses and checks `asm` (§18.6) but doesn't lower it yet (AGAST #3395), so
+it refuses a `[[naked]]` fn at its first `asm` block.
 
 ### 17.6 Inlining Attributes
 

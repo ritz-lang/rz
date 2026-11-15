@@ -83,6 +83,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'AND': 35, 'OR': 36, 'NOT': 37, 'TRUE': 38, 'FALSE': 39,
     'NULL': 40, 'SELF': 41, 'MUT': 42, 'ASSERT': 44, 'FLOAT': 45,  # 43 was PASS: an IDENT now (#3320)
     'TYPE': 46, 'THEN': 47,
+    'ASM': 48,  # inline assembly, LANGUAGE_SPEC §18.6 (AGAST #3394)
     # Type keywords
     'I8': 50, 'I16': 51, 'I32': 52, 'I64': 53,
     'U8': 54, 'U16': 55, 'U32': 56, 'U64': 57,
@@ -107,6 +108,9 @@ HAND_WRITTEN_TOKEN_IDS = {
     # Literals
     'IDENT': 130, 'NUMBER': 131, 'STRING': 132, 'CSTRING': 133,
     'SSTRING': 134, 'CHAR': 135,
+    # One raw line of an `asm` block's body (AGAST #3394).  No pattern: the
+    # lexer makes it in its asm body mode (lexer_nfa.ritz lexer_asm_line).
+    'ASM_LINE': 136,
     # Whitespace
     'WHITESPACE': 140, 'COMMENT': 141,
 }
@@ -175,7 +179,7 @@ class RitzGenerator:
             (95, 109, 'Assignment, arrows and ranges'),
             (110, 115, 'Delimiters'),
             (120, 126, 'Punctuation'),
-            (130, 135, 'Identifiers and literals'),
+            (130, 136, 'Identifiers and literals'),
             (140, 141, 'Whitespace'),
         ]
 
