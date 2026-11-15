@@ -109,3 +109,11 @@ def no_method(method: str, type_name: str, free_call: str | None = None) -> str:
 def lent_temp_escapes(arg: str) -> str:
     return (f"this call returns a reference, and `{arg}` lends a temporary "
             f"that's dropped when the call returns: bind it to a local first")
+
+
+# A by-value read of a move-only global, or of a move-only field of one (LARB
+# R34, AGAST #3366, spec §13.2; Rust's E0507). A global is never dropped and any
+# function may read it, so nothing can track what moved out. `path` is the place
+# as written, `G` or `G.t`: the borrow to write instead.
+def move_out_of_global(name: str, path: str) -> str:
+    return f"cannot move out of global `{name}`: borrow it with `@{path}`"

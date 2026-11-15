@@ -548,9 +548,9 @@ class MoveChecker:
             info = self.scope.lookup(expr.name)
             if info:
                 return info.ritz_type
-            # A module-level `var` (AGAST #2269): a binding from it, or from
-            # a field of it, then moves. Nothing tracks the global itself:
-            # it is never dropped, as on ritz1.
+            # A module-level `var` (AGAST #2269) has its declared type. Nothing
+            # tracks the global itself: it is never dropped, so a move-only
+            # value can't be moved out of it (LARB R34, _check_global_move_out).
             if expr.name in self.globals:
                 return self.globals[expr.name]
             return rast.NamedType(expr.span, 'unknown', [])
@@ -1130,9 +1130,12 @@ class MoveChecker:
             # `[N]T` result, or an array literal, is a temporary, dropped per
             # element after the loop however it's left: `x` is a copy of its
             # element, as over a local, and drops nothing (AGAST #3284, #3297).
+            # A global, or a field of one, is walked in place (§6.3): it is
+            # never dropped, so nothing moves out of it (LARB R34, #3366).
             self._check_expr(stmt.iter,
                              is_move_context=not (self._through_reference(stmt.iter)
-                                                  or self._array_temporary(stmt.iter)))
+                                                  or self._array_temporary(stmt.iter)
+                                                  or self._global_place(stmt.iter)))
             held = self._for_loan(stmt.iter)
             if held is not None:
                 held[0].borrows.append(held[1])
@@ -1290,6 +1293,8 @@ class MoveChecker:
                     var_info.move_span = expr.span
                     # The emitter clears the binding's drop flag here.
                     expr.moves_binding = True
+            elif is_move_context:
+                self._check_global_move_out(expr)
 
         elif isinstance(expr, rast.BinOp):
             # Binary ops don't move their operands (they borrow or copy)
@@ -1399,6 +1404,8 @@ class MoveChecker:
                     self._reject_move_out(expr.span)
             elif is_move_context and self._moves_out_of_element(expr):
                 self.errors.append(OwnershipError(array_rules.MOVE_OUT_OF_ELEMENT, expr.span))
+            elif is_move_context and self._check_global_move_out(expr):
+                pass
             elif is_move_context and self.types.is_move_only(self._field_path_type(expr)):
                 # Moving a move-only field out of a temporary: the rest of
                 # the temporary isn't dropped either (no partial drops).
@@ -1770,6 +1777,32 @@ class MoveChecker:
             return
         if _type_key(self.types.resolve(held.inner)) == _type_key(target):
             self.errors.append(OwnershipError(ref_rules.REF_INTO_VALUE, cast.expr.span))
+
+    def _check_global_move_out(self, expr: rast.Expr) -> bool:
+        """`G` or `G.f.g` read by value, with `G` a module-level `var` and the
+        value move-only (LARB R34, AGAST #3366, §13.2): refused at the path. A
+        global is never dropped and any function may read it, so nothing could
+        track the move. True if it refused. A path through a pointer field is
+        "cannot move out of a reference" first (_through_reference)."""
+        place = self._global_place(expr)
+        if place is None or not self.types.is_move_only(self._field_path_type(expr)):
+            return False
+        self.errors.append(OwnershipError(ref_rules.move_out_of_global(*place), expr.span))
+        return True
+
+    def _global_place(self, expr: rast.Expr) -> Optional[Tuple[str, str]]:
+        """`G` or `G.f.g`, with `G` a module-level `var` no local shadows: the
+        global's name and the path as written. None for anything else."""
+        if isinstance(expr, rast.Ident):
+            root, path = expr.name, expr.name
+        else:
+            parts = field_path(expr)
+            if parts is None:
+                return None
+            root, path = parts[0], f"{parts[0]}.{parts[1]}"
+        if self.scope.lookup(root) is not None or root not in self.globals:
+            return None
+        return root, path
 
     def _reject_move_out(self, span: Optional[rast.Span]) -> None:
         self.errors.append(OwnershipError(ref_rules.MOVE_OUT_OF_REF, span))

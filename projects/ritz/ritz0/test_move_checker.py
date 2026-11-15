@@ -9,7 +9,7 @@ from parser import parse
 from monomorph import monomorphize
 from move_checker import MoveChecker, OwnershipError
 from array_rules import FILL_MOVE_ONLY, MOVE_OUT_OF_ELEMENT
-from ref_rules import MOVE_OUT_OF_REF
+from ref_rules import MOVE_OUT_OF_REF, move_out_of_global
 import ritz_ast as rast
 
 
@@ -1956,16 +1956,39 @@ fn f(d: D) -> i32
         lines = "".join(f"    {l}\n" for l in text.splitlines())
         return check(self.DEFS + f"\nvar G: H\n\nfn f({params}) -> i32\n{lines}    return 0\n")
 
-    def test_field_of_global_binding_moves(self):
-        self.assert_moved(self.global_body("var x = G.t\neat(x)\neat(x)"), "x")
+    def assert_global_move_out(self, errors: list, path: str) -> None:
+        reasons = [e.reason for e in errors]
+        assert move_out_of_global("G", path) in reasons, reasons
 
-    def test_whole_global_binding_moves(self):
-        self.assert_moved(self.global_body("var x = G\nvar y = x\nvar z = x"), "x")
+    def test_field_of_global_moved_out_refused(self):
+        """LARB R34 (#3366): reverses #2269's "allowed"."""
+        self.assert_global_move_out(self.global_body("var x = G.t"), "G.t")
 
-    def test_moving_out_of_a_global_is_allowed(self):
-        """As on ritz1: a global is never dropped, so nothing tracks what
-        moves out of it, and a second move out isn't refused (AGAST #3280)."""
-        assert self.global_body("var x = G.t\nvar y = G.t\nvar z = G") == []
+    def test_whole_global_moved_out_refused(self):
+        self.assert_global_move_out(self.global_body("var x = G"), "G")
+
+    def test_global_field_into_call_refused(self):
+        self.assert_global_move_out(self.global_body("eat(G.t)"), "G.t")
+
+    def test_two_moves_out_of_a_global_both_refused(self):
+        """#3280's repro: each move is its own error."""
+        errors = self.global_body("var x = G.t\nvar y = G.t")
+        assert [e.reason for e in errors] == [move_out_of_global("G", "G.t")] * 2
+
+    def test_copyable_read_of_a_global_allowed(self):
+        assert self.global_body("var n = G.n\nvar m = G.n") == []
+
+    def test_borrow_and_store_of_a_global_allowed(self):
+        assert self.global_body("var r = @G.t\nvar m = @&G\nG.t = T { id: 1 }") == []
+
+    def test_for_over_a_global_walks_it_in_place(self):
+        """§6.3: a `for` iterates in place, a global included; no move out."""
+        assert check(self.DEFS + "\nvar GA: [2]H\n\nfn f() -> i32\n"
+                     "    for x in GA\n        var n = 1\n    return 0\n") == []
+
+    def test_local_shadowing_a_global_moves(self):
+        """A local of the global's name is the local: no global error."""
+        self.assert_moved(self.global_body("var G = h\nvar x = G\nvar y = G"), "G")
 
     # ---- inference itself ----
 

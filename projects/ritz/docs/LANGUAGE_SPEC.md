@@ -3918,9 +3918,9 @@ A global `var` is never dropped, and nothing can track what moved out of it,
 since any function may read it. So a move-only value can't be moved out of a
 global, or out of a field of one: `var x = G.t` is an error at `G.t`, "cannot
 move out of global `G`: borrow it with `@G.t`" (LARB R34, AGAST #3280). Reads
-of copyable values, borrows and stores into the global are unaffected. Until
-#3280's tickets land, both compilers allow the move, and a second one drops the
-value twice.
+of copyable values, borrows and stores into the global are unaffected. ritz0
+refuses it (#3366); until #3367 lands, ritz1 allows the move, and a second one
+drops the value twice.
 
 A reference isn't its referent. An `@T`, `@&T` or `*T` doesn't fit a by-value
 `T` slot: an argument, a `let` or `var` of type `T`, `=`, `return`, a function's

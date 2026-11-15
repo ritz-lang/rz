@@ -46,7 +46,8 @@ import pytest
 
 import fast_link
 
-from ref_rules import ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE, lent_temp_escapes
+from ref_rules import (ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE, lent_temp_escapes,
+                       move_out_of_global)
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -787,53 +788,26 @@ pub fn main() -> i32
     return DROPS
 """, 1, {}),
 
-    # AGAST #2269: a binding from a module-level `var`, or a field of one, has
-    # its declared type, so it moves. ritz0 saw only locals, so `x` was a
-    # copy and dropped twice. Moving out of a global is allowed, as on ritz1:
-    # a global is never dropped. (`var x = a[0]` of a move-only element is
-    # refused: test_array_element_move_out.py.)
-    "field_binding_of_global": (SLOT + FIELDS + """\
+    # AGAST #2269 typed a binding from a module-level `var` (ritz0 saw only
+    # locals, so `x` was a copy and dropped twice); LARB R34 (#3366) then
+    # refused moving a move-only value out of one: GLOBAL_MOVE_OUT. A borrow
+    # of the global's field is unaffected, and nothing drops.
+    "borrow_of_global_field": (SLOT + FIELDS + """\
 var GLOBAL: Holder
+
+fn see(t: @Tracked) -> i32
+    return t.id
 
 fn f() -> i32
     GLOBAL = make_holder(1)
-    var x = GLOBAL.t
-    consume(x)
-    return 0
+    var r = @GLOBAL.t
+    see(@GLOBAL.t)
+    return see(r)
 
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {}),
-
-    "whole_binding_of_global": (SLOT + FIELDS + """\
-var GLOBAL: Holder
-
-fn f() -> i32
-    GLOBAL = make_holder(1)
-    var x = GLOBAL
-    var y = x
-    return 0
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, {}),  # ritz1 types `x` as Holder since #3275
-
-    "global_reassigned_after_field_move": (SLOT + FIELDS + """\
-var GLOBAL: Holder
-
-fn f() -> i32
-    GLOBAL = make_holder(1)
-    var x = GLOBAL.t
-    consume(x)
-    GLOBAL = make_holder(2)
-    return 0
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, {}),
+""", 0, {}),
 
     # AGAST #2257: a binding from a method call has the method's return type,
     # so it moves. Each of these dropped one value twice on ritz0.
@@ -2855,6 +2829,40 @@ fn g(d:& Deep) -> Tracked
 """ + TAIL, MOVE_OUT_OF_REF, {}),
 }
 
+# LARB R34 (#3366, spec §13.2): a move-only value can't be moved out of a
+# global or a field of one. The global is never dropped and any function can
+# read it, so nothing could track the move: #3280's two moves out of
+# `GLOBAL.t` dropped one value twice. Refused at the path, with the borrow to
+# write instead. #2269 had pinned the single moves as allowed.
+# name -> (body, the moved path, the line of the first move, {compiler: gap}).
+GLOBAL_HEAD = SLOT + FIELDS + """\
+var GLOBAL: Holder
+
+fn f() -> i32
+    GLOBAL = make_holder(1)
+"""
+
+RITZ1_GLOBAL_GAP = {"ritz1": 3367, "ritz1_selfhosted": 3367}
+
+GLOBAL_MOVE_OUT = {
+    "two_moves_of_global_field": (GLOBAL_HEAD + """\
+    var x = GLOBAL.t
+    var y = GLOBAL.t
+    return 0
+""" + TAIL, "GLOBAL.t", "    var x = GLOBAL.t", RITZ1_GLOBAL_GAP),
+    "one_move_of_global_field": (GLOBAL_HEAD + """\
+    var x = GLOBAL.t
+    return consume(x)
+""" + TAIL, "GLOBAL.t", "    var x = GLOBAL.t", RITZ1_GLOBAL_GAP),
+    "whole_global_binding": (GLOBAL_HEAD + """\
+    var x = GLOBAL
+    return 0
+""" + TAIL, "GLOBAL", "    var x = GLOBAL", RITZ1_GLOBAL_GAP),
+    "global_field_into_call": (GLOBAL_HEAD + """\
+    return consume(GLOBAL.t)
+""" + TAIL, "GLOBAL.t", "    return consume(GLOBAL.t)", RITZ1_GLOBAL_GAP),
+}
+
 # AGAST #2178: a match that owns nothing (`match @s`, a `name:& T` param, a
 # place behind a pointer) binds a copy of the payload, which the scrutinee's
 # owner still drops. Moving the copy out dropped it twice; it's refused now,
@@ -3424,4 +3432,23 @@ def test_lent_temp_into_returned_reference_refused(request, tmp_path, compiler, 
     assert lent_temp_escapes(arg) in out, out[-2000:]
     # Located at the lent argument: its line in the body, after the prelude.
     at = PRELUDE.count("\n") + LENT_ESCAPE.count("\n") + line
+    assert f":{at}:{col}:" in out, out[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,name", _params(GLOBAL_MOVE_OUT))
+def test_move_out_of_a_global_refused(request, tmp_path, compiler, name):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    body, path, use, _ = GLOBAL_MOVE_OUT[name]
+    src = _write(tmp_path, body)
+    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert move_out_of_global("GLOBAL", path) in out, out[-2000:]
+    # Located at the path: its line and column in the body, after the prelude.
+    lines = body.splitlines()
+    at = PRELUDE.count("\n") + lines.index(use) + 1
+    col = use.index(path) + 1
     assert f":{at}:{col}:" in out, out[-2000:]
