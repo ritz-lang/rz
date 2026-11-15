@@ -8,6 +8,8 @@ ritz1 loaded every global it read as a value at `emit_llvm_type(var_type)`,
 which is i64 for a struct, so each site that takes the whole value got an i64
 where it expected `%H`.  ritz0 compiled all of them.  Each site is here, for a
 plain struct and for a monomorphised one (`Vec<i32>`, whose name is mangled).
+AGAST #3275 added `var h = gh` / `let h = gh`: an unannotated local takes the
+global's type, for an enum global too.
 
 The read is a copy: a later write to the global doesn't reach it.  The canaries
 `k` and `z` either side of the array show up a wrong size or offset.
@@ -53,6 +55,10 @@ SITES = {
              + CLOBBER + _check("h") + "    return 0\n"),
     "var": MAIN + FILL + "    var h: H = gh\n" + CLOBBER + _check("h") + "    return 0\n",
     "let": MAIN + FILL + "    let h: H = gh\n" + CLOBBER + _check("h") + "    return 0\n",
+    # AGAST #3275: unannotated, the local takes the global's type (it was an
+    # i64 slot, so clang rejected `store i64 %<%H>`).
+    "var_unannotated": MAIN + FILL + "    var h = gh\n" + CLOBBER + _check("h") + "    return 0\n",
+    "let_unannotated": MAIN + FILL + "    let h = gh\n" + CLOBBER + _check("h") + "    return 0\n",
     "argument": ("fn f(h: H) -> i32\n" + _check("h") + "    return 0\n\n" + MAIN + FILL
                  + "    return f(gh)\n"),
     "field_init": (MAIN + FILL + "    var w: W = W { n: 5, h: gh }\n" + CLOBBER + _check("w.h")
@@ -72,10 +78,32 @@ VCHECK = ("    if v.len != 3\n        return 1\n    if v.cap != 9\n        retur
           "    if v.data != null\n        return 3\n    return 0\n")
 GENERIC_SITES = {
     "var": GVEC + MAIN + VFILL + "    var v: Vec<i32> = g\n    g.len = 0\n" + VCHECK,
+    "var_unannotated": GVEC + MAIN + VFILL + "    var v = g\n    g.len = 0\n" + VCHECK,
     "return": (GVEC + "fn mk() -> Vec<i32>\n    return g\n\n" + MAIN + VFILL
                + "    let v: Vec<i32> = mk()\n    g.len = 0\n" + VCHECK),
     "argument": GVEC + "fn f(v: Vec<i32>) -> i32\n" + VCHECK + "\n" + MAIN + VFILL + "    return f(g)\n",
 }
+
+# AGAST #3275: an unannotated local from a whole enum global is that enum
+# (ritz1 gave it an i64 slot, so `match x` refused its variant patterns).
+ENUM_SITES = {
+    "payload": ("enum E\n    A\n    B(i32)\n\nvar ge: E\n\n" + MAIN + "    ge = E.B(4)\n"
+                "    var x = ge\n    ge = E.A\n    match x\n        E.A => return 1\n"
+                "        E.B(n) => return n - 4\n"),
+    "unit": ("enum C\n    Red\n    Green\n\nvar gc: C\n\n" + MAIN + "    gc = C.Green\n"
+             "    let x = gc\n    gc = C.Red\n    match x\n        C.Red => return 1\n"
+             "        C.Green => return 0\n"),
+    "option": ("var go: Option<i32>\n\n" + MAIN + "    go = Some(6)\n    var x = go\n"
+               "    go = None\n    match x\n        Some(n) => return n - 6\n"
+               "        None => return 1\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("site", sorted(ENUM_SITES))
+def test_an_enum_global_read_whole_types_its_local(run_with, compiler, site):
+    assert run_with(compiler, f"ewhole_{site}", ENUM_SITES[site]) == 0
 
 
 @pytest.mark.integration

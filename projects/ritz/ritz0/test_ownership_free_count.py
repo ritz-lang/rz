@@ -788,7 +788,7 @@ fn f() -> i32
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, {"ritz1": 3275, "ritz1_selfhosted": 3275}),
+""", 1, {}),  # ritz1 types `x` as Holder since #3275
 
     "global_reassigned_after_field_move": (SLOT + FIELDS + """\
 var GLOBAL: Holder
