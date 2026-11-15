@@ -42,6 +42,8 @@ import itertools
 
 import pytest
 
+import test_ritz1_for_header as for_header
+
 from test_ritz1_builtin_struct_shadow import _run
 
 # 8 bytes: classified as an integer-sized aggregate.
@@ -148,11 +150,13 @@ def test_struct_result_as_by_value_arg(tmp_path, compiler, size, producer, consu
     assert _run(compiler, tmp_path, name, _program(size, producer, consumer)) == 6
 
 
+compile_with = for_header.compile_with
+
+
 # Control: a scalar-returning method (`q.get()`, i64) into a single-field
-# struct param is still boxed. Scalar only, so a guard that is off fails the
-# matrix rows and not this one.
-# ritz1 only: ritz0 has no box since LARB R47 (#3389) and refuses this call
-# (test_int_arg_for_struct_param.py "method_result"); #3390 does the same on ritz1.
+# struct param is an integer, refused since LARB R47 (#3389, #3390): it used to
+# be boxed.  Only a struct-returning call is a struct value, so a guard that
+# passed every call through fails this and not the matrix.
 NEWTYPE = """\
 struct M
     v: i64
@@ -180,6 +184,9 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1"])
-def test_scalar_method_result_still_boxed_into_newtype(tmp_path, compiler):
-    assert _run(compiler, tmp_path, "sra_newtype", NEWTYPE) == 5
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+def test_scalar_method_result_into_newtype_is_refused(compile_with, compiler):
+    comp, _, _ = compile_with(compiler, "sra_newtype", NEWTYPE)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out[-1000:]
+    assert "main.ritz:21:11:" in out and "argument 2 of `add` has the wrong type" in out, out[-1000:]

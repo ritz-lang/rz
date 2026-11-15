@@ -9,8 +9,10 @@ a single-field struct.  ritz0 used to wrap the int (`insertvalue %S undef,
 (#3336).  Now it's "argument N of `f` has the wrong type", and you write
 `f(S { x: n })`.
 
-#3390 runs these rows on ritz1 and ritz1_selfhosted (call_check.ritz rule A):
-it extends COMPILERS.
+ritz1 and ritz1_selfhosted refuse them too (#3390, call_check.ritz rule A), in
+ritz0's words followed by ritz1's own ("parameter `s` is declared `S` but its
+argument is an integer").  On a method or UFCS call ritz1 used to box the
+integer as the struct (`; newtype arg box`).
 """
 
 import pytest
@@ -23,9 +25,11 @@ pytestmark = pytest.mark.batched
 compile_with = for_header.compile_with
 run_with = for_header.run_with
 
-COMPILERS = ["ritz0"]
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 HEADER = """\
+import ritzlib.gvec
+
 struct S
     x: i32
 
@@ -54,6 +58,8 @@ REFUSED = {
     # test_ritz1_struct_result_arg): a scalar deref and a scalar method result.
     "deref_i64": ("    let p: @i64 = @n\n    return f($*p)", WRONG.format(n=1, f="f")),
     "method_result": ("    return f($s.add(s))", WRONG.format(n=1, f="f")),
+    # A UFCS call: ritz1 boxed the literal as an `S`.
+    "ufcs_literal": ("    var v: Vec<S> = vec_new<S>()\n    v.push($5)\n    return 0", WRONG.format(n=2, f="push")),
 }
 
 

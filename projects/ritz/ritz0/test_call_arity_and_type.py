@@ -31,8 +31,9 @@ A call through a fn pointer is counted against its `fn(..)` type: a local, a
 param, or a nameless callee (`pick()(1, 2)`), which ritz0 accepted until #3333.
 ritz0 calls a nameless one `<expression>`; ritz1 doesn't name it yet (#3348), so
 its rows match the rest of the message.
-`syscallN` takes N+1 arguments on every compiler (#3334).  ritz0 wraps an
-integer into a single-field struct param (#3336): that isn't judged here.
+`syscallN` takes N+1 arguments on every compiler (#3334).  An integer into a
+single-field struct param is refused (LARB R47, spec §9.2): its rows are
+test_int_arg_for_struct_param.py's.
 """
 
 import pytest

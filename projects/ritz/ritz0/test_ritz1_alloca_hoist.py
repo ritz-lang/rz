@@ -156,7 +156,9 @@ CASES = {
 
 # The newtype arg box and the struct-literal method receiver are lowered in
 # ritz1 only (ritz0 rejects both forms), so they get the structural check but
-# no ritz0 oracle.
+# no ritz0 oracle.  An integer name or literal into a newtype is refused since
+# LARB R47 (#3390); an arithmetic arg still reaches the box until #3420
+# decides the box itself.
 NEWTYPE_BOX = """\
 struct Meters
     v: i64
@@ -173,7 +175,7 @@ pub fn main() -> i32
     var t: i64 = 0
     var i: i64 = 0
     while i < 10
-        t = t + a.add(i)
+        t = t + a.add(i * 1)
         i = i + 1
     return t as i32
 """

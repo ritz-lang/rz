@@ -45,6 +45,8 @@ import itertools
 
 import pytest
 
+import test_ritz1_for_header as for_header
+
 from test_ritz1_builtin_struct_shadow import _run_pkg
 
 SIZES = {
@@ -143,11 +145,13 @@ def test_deref_struct_ptr_as_by_value_arg(
     )
 
 
+compile_with = for_header.compile_with
+
+
 # Control: `*q` of an `@i64` into a single-field struct (`Vec<M>.push`, M a
-# newtype over i64) must still take the newtype box. Only a struct pointee
-# skips it, so a guard that skipped every deref fails this and not the matrix.
-# ritz1 only: ritz0 has no box since LARB R47 (#3389) and refuses this call
-# (test_int_arg_for_struct_param.py "deref_i64"); #3390 does the same on ritz1.
+# newtype over i64) is an integer, refused since LARB R47 (#3389, #3390): it
+# used to take the newtype box.  Only a struct pointee is a struct value, so a
+# guard that passed every deref through fails this and not the matrix.
 NEWTYPE = """\
 import ritzlib.gvec
 
@@ -157,7 +161,7 @@ struct M
 fn go(q: @i64) -> i32
     var v: Vec<M> = vec_new<M>()
     v.push(*q)
-    v.push(5)
+    v.push(M { v: 5 })
     let r: *M = v.get_ptr(0)
     return r.v as i32 + v.len() as i32
 
@@ -168,6 +172,9 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1"])
-def test_deref_scalar_ptr_into_newtype_still_boxed(tmp_path, compiler):
-    assert _run_pkg(compiler, tmp_path, "dsa_newtype", NEWTYPE) == 6
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+def test_deref_scalar_ptr_into_newtype_is_refused(compile_with, compiler):
+    comp, _, _ = compile_with(compiler, "dsa_newtype", NEWTYPE)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out[-1000:]
+    assert "main.ritz:8:12:" in out and "argument 2 of `push` has the wrong type" in out, out[-1000:]
