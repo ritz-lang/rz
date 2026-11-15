@@ -119,6 +119,29 @@ ADDR_SLOTS = {
     "method_argument": "fn f(d: C) -> i32\n    d.plus(^@d)\n",
 }
 
+# A method of a ritzlib type, dispatched to a free fn that takes the receiver
+# as its first param (`a.cmp(b)`, `strview_cmp(a, b)` on ritz1, `StrView_cmp`
+# on ritz0), judges its arguments as that free fn's call does (AGAST #3154).
+# One row per receiver kind each compiler resolves its own way.
+UFCS = "import ritzlib.strview\nimport ritzlib.string\nimport ritzlib.gvec\n\n" + COPY
+UFCS_SLOTS = {
+    "strview_addr": ("fn f(a: StrView, b: StrView) -> i32\n    a.cmp(^@b)\n", ADDR_INTO_VALUE),
+    "strview_ref": ("fn f(r: @StrView, a: StrView) -> i32\n    a.cmp(^r)\n", REF_INTO_VALUE),
+    "string_addr": ("fn f(s: @&String, sv: StrView) -> i32\n    s.push_str(^@sv)\n", ADDR_INTO_VALUE),
+    "vec_addr": ("fn f(v: @&Vec<C>, c: C) -> i32\n    v.push(^@c)\n", ADDR_INTO_VALUE),
+    "vec_ref": ("fn f(v: @&Vec<C>, r: *C) -> i32\n    v.push(^r)\n", REF_INTO_VALUE),
+}
+
+# The same calls written right, and their receivers, behind a reference too,
+# left alone: no error, and IR clang takes.
+UFCS_READS = """\
+fn f(r: @StrView, a: StrView, sv: StrView, s: @&String, v: @&Vec<C>, c: C, p: *C) -> i32
+    s.push_str(sv)
+    v.push(c)
+    v.push(*p)
+    r.cmp(sv) + a.cmp(*r) + a.cmp(sv)
+"""
+
 # The same reads, written out: what rule 1's error tells you to do.
 READS = {
     "argument": ("fn f(r: {R}) -> i32\n    val(*r)\n", 3),
@@ -452,6 +475,24 @@ def test_every_shape_of_reference_is_refused(tmp_path, compiler, shape):
 @pytest.mark.parametrize("site", _ids(ADDR_SLOTS))
 def test_address_of_into_a_by_value_slot(tmp_path, compiler, site):
     _assert_refused(compiler, tmp_path, site, COPY + _main(ADDR_SLOTS[site], CALL_F), ADDR_INTO_VALUE)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("site", _ids(UFCS_SLOTS))
+def test_a_ritzlib_method_argument_is_a_by_value_slot(tmp_path, compiler, site):
+    body, message = UFCS_SLOTS[site]
+    _assert_refused(compiler, tmp_path, f"ufcs_{site}", UFCS + _main(body, CALL_F), message)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_ritzlib_method_argument_read_right_compiles(tmp_path, compiler):
+    """The rows above, with `*r` and no `@`. Compiled, not linked: gvec and
+    string need ritzlib.memory's objects, which only build.py links."""
+    comp, ll, work = _compile(compiler, tmp_path, "ufcs_reads", UFCS + _main(UFCS_READS, CALL_F))
+    assert comp.returncode == 0 and ll.exists(), (comp.stdout + comp.stderr)[-2000:]
+    cc = subprocess.run(["clang", "-c", "-Wno-override-module", str(ll), "-o", str(work / "main.o")],
+                        capture_output=True, text=True)
+    assert cc.returncode == 0, cc.stderr[-2000:]
 
 
 def _read_params():

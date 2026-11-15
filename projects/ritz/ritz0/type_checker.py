@@ -913,6 +913,8 @@ class TypeChecker:
                 or receiver.name in ('bool', 'StrView'))):
             for arg in expr.args:
                 self._infer_type(arg)
+            # ritzlib's own `impl StrView` declares some (AGAST #3154).
+            self._check_value_args(expr, receiver)
             return rast.NamedType(expr.span, 'unknown', [])
         type_name = self._get_type_name(receiver)
 
@@ -955,6 +957,9 @@ class TypeChecker:
             fn_sig = self.functions.get(expr.method)
 
         if fn_sig is None:
+            # A monomorphised helper (`vec_push$C`) has no name the lookups
+            # above try: the emitter still dispatches to it.
+            self._check_value_args(expr, receiver)
             self._error(f"no method '{expr.method}' on type {self._type_str(receiver_type)}",
                       expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
@@ -975,8 +980,34 @@ class TypeChecker:
             if at in fn_sig.lent and own_method:
                 self._check_addr_into_mut(arg)
                 self._check_lent_referent(arg, self._quiet_type(arg), fn_sig.params[at][1])
+        if not own_method:
+            self._check_value_args(expr, receiver)
 
         return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
+
+    def _check_value_args(self, expr: rast.MethodCall, receiver: rast.Type) -> None:
+        """The by-value slots of the fn the emitter dispatches `expr` to when
+        the loop above leaves its slots unjudged: a ritzlib type's free fn
+        that takes the receiver as its first param (`v.push(x)`,
+        `vec_push(v, x)`), or a built-in receiver's source method
+        (`a.cmp(b)`, `StrView_cmp`). Its param 0 is the receiver, so the
+        arguments line up from param 1, and `@x` or a reference into one is
+        refused as in the free call (AGAST #3154). Only the by-value slots:
+        the receiver, and what a reference slot takes, stay as they were."""
+        if not isinstance(receiver, rast.NamedType):
+            return
+        type_name = self._get_type_name(receiver)
+        sig = self.functions.get(f"{type_name}_{expr.method}") or self.functions.get(
+            find_ufcs_function(self.functions, type_name, expr.method))
+        if sig is None or len(sig.params) != len(expr.args) + 1:
+            return
+        for i, arg in enumerate(expr.args):
+            if i + 1 in sig.lent:
+                continue
+            slot = self._resolve_alias(sig.params[i + 1][1])
+            if isinstance(slot, (rast.PtrType, rast.RefType)) or self._is_span(slot):
+                continue
+            self._check_ref_slot(arg, self._quiet_type(arg), slot)
 
     def _check_field_access(self, expr: rast.Field) -> rast.Type:
         """Type check field access."""
