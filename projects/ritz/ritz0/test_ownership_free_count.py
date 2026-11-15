@@ -99,6 +99,36 @@ enum Slot
 
 """
 
+# A move-only enum carrying a move-only enum (AGAST #3329).
+NESTED_SLOT = """\
+enum Nest
+    Has(Slot)
+    Nil
+
+fn take_slot(s: Slot) -> i32
+    return 0
+
+"""
+
+# A tag-only enum that is move-only by its Drop impl, as a payload (#3329).
+DROP_FLAG = """\
+enum Flag
+    A
+    B
+
+impl Drop for Flag
+    fn drop(self: @&Flag)
+        DROPS = DROPS + 1
+
+enum Flagged
+    Has(Flag)
+    Nil
+
+fn take_flag(f: Flag) -> i32
+    return 0
+
+"""
+
 # Methods that build a value, for the method-call cases (AGAST #2257).
 METHODS = """\
 impl Tracked
@@ -2120,6 +2150,25 @@ pub fn main() -> i32
     return inner + DROPS
 """, 1, {}),
 
+    # AGAST #3329: a lent move-only enum payload reads and borrows; only s
+    # drops it.
+    "match_borrowed_scrutinee_reads_enum_payload": (SLOT + NESTED_SLOT + """\
+fn peek(s: @Slot) -> i32
+    return 5
+
+fn f() -> i32
+    var s = Nest.Has(Slot.Full(make(1)))
+    var r = 0
+    match @s
+        Has(x) => r = peek(@x)
+        _ => r = 0
+    return DROPS * 10 + r
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 6, {}),
+
     # AGAST #2178: a `let` from a match moves into consume, which drops it;
     # u's own drop is skipped.
     "let_from_match_moved": (SLOT + """\
@@ -2857,7 +2906,39 @@ fn g(s:& Slot) -> i32
         Full(t) => return t.burn()
         _ => return 0
 """ + TAIL, 11, 27),
+    # AGAST #3329: a move-only *enum* payload is lent too, on ritz1 as well
+    # (it binds through emit_struct_payload_bind like a struct one).
+    "borrowed_match_enum_payload_into_call": (SLOT + NESTED_SLOT + """\
+pub fn main() -> i32
+    var s = Nest.Has(Slot.Full(make(1)))
+    match @s
+        Has(x) => take_slot(x)
+        _ => 0
+    return DROPS
+""", 15, 29),
+    # A tag-only enum with a Drop impl: move-only, but no aggregate payload.
+    "lent_param_match_drop_enum_payload_into_call": (DROP_FLAG + """\
+fn g(s:& Flagged) -> i32
+    match s
+        Has(f) => return take_flag(f)
+        _ => return 0
+""" + TAIL, 18, 36),
 }
+
+# AGAST #3329: a nested payload pattern (`Has(Full(x))`) binds nothing yet:
+# ritz0 refuses it ("Nested variant patterns are not supported", #1291) and
+# ritz1 can't parse it. Under a match that owns nothing, x would be a copy
+# the owner still drops, so this goes red when nested patterns compile: lend
+# the nested bindings then, as _lend_payload / own_match_payload lend the
+# direct ones, and move this row into LENT_PAYLOAD_ROWS (AGAST #3339).
+NESTED_LENT_PAYLOAD = SLOT + NESTED_SLOT + """\
+pub fn main() -> i32
+    var s = Nest.Has(Slot.Full(make(1)))
+    match @s
+        Has(Full(x)) => consume(x)
+        _ => 0
+    return DROPS
+"""
 
 # A call returning a reference (or a value holding one) can't take a lent
 # temporary: the temporary drops as the call returns, so the result would
@@ -3295,6 +3376,22 @@ def test_move_out_of_a_non_owning_match_payload_rejected(request, tmp_path, comp
     # Located at the use: its line in the body, after the prelude.
     at = PRELUDE.count("\n") + line
     assert f":{at}:{col}:" in out, out[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_nested_payload_of_a_non_owning_match_still_refused(request, tmp_path, compiler):
+    """Goes red when nested patterns compile: see NESTED_LENT_PAYLOAD."""
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    src = _write(tmp_path, NESTED_LENT_PAYLOAD)
+    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    # Refused at the nested pattern (line 15 of the body), not elsewhere.
+    at = PRELUDE.count("\n") + 15
+    assert f":{at}:" in out, out[-2000:]
 
 
 @pytest.mark.integration
