@@ -113,8 +113,7 @@ def test_O2_keeps_the_wipe_of_a_dead_local_in_ir(linked):
         r"call void @llvm\.memset[^\n]*i8 0, i64 32", main)
     assert zeroing, main
     # ...and kept alive by the asm barrier that reads the buffer through ptr.
-    # ritz1 adds §18.6's ~{dirflag},~{fpsr},~{flags} after ~{memory}.
-    assert re.search(r'call void asm sideeffect "nopl[^"]*", "r,~\{memory\}[^"]*"', main), main
+    assert re.search(r'call void asm sideeffect "nopl[^"]*", "r,~\{memory\},~\{dirflag\},~\{fpsr\},~\{flags\}"', main), main
 
 
 @needs_tools

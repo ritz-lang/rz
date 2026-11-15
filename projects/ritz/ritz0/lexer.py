@@ -55,6 +55,22 @@ class Lexer:
         self.pending_tokens: List[Token] = []
         self.at_line_start = True
         self.last_token_type: TokenType = None  # Track last token for regex detection
+        # The current line's indentation.
+        self.line_indent = 0
+        # asm body mode (LANGUAGE_SPEC §18.6, AGAST #3396; ritz1's lexer_nfa
+        # has the same).  An `asm` block's body is text, not Ritz:
+        # `movq $3, %rcx` must reach the parser whole.  From an `asm` token
+        # to the end of its line the lexer is in 'header' (newlines inside
+        # the clause list's parentheses are spaces); a header ending in `:`
+        # puts it in 'raw' for the lines indented deeper than the `asm`
+        # line: each is one ASM_LINE, then NEWLINE.  The first gets the
+        # block's INDENT; a deeper one none of its own (its extra indentation
+        # is dropped).  The first line no deeper than the `asm` line leaves
+        # the mode and is laid out as usual, DEDENTing the body.
+        self.asm_state = None       # None, 'header' or 'raw'
+        self.asm_base = 0           # the `asm` line's indentation
+        self.asm_parens = 0         # open parentheses in the header
+        self.asm_body = False       # the body's INDENT has been pushed
 
     def _span(self, length: int = 1) -> Span:
         """Create a span at the current position."""
@@ -107,6 +123,7 @@ class Lexer:
         while self._peek() == ' ':
             self._advance()
             indent += 1
+        self.line_indent = indent
 
         # Tabs are an error
         if self._peek() == '\t':
@@ -644,11 +661,81 @@ class Lexer:
 
         raise LexerError(f"Unexpected character: '{ch}'", start_span)
 
+    def _asm_line_start(self) -> Optional[List[Token]]:
+        """At the start of a line in asm body mode: the tokens for the line
+        (the body's INDENT, if not yet pushed, and its ASM_LINE), [] for a
+        blank or comment-only line (skipped), or None if the line ends the
+        body (the mode is off; it is laid out as usual)."""
+        indent = 0
+        while self._peek(indent) == ' ':
+            indent += 1
+        ch = self._peek(indent)
+        if ch in ('\n', '#', '\t', '\0'):
+            return None if ch == '\0' else self._handle_indentation()
+        if indent <= self.asm_base:
+            self.asm_state = None
+            return None
+        tokens = []
+        if not self.asm_body:
+            self.asm_body = True
+            self.indent_stack.append(indent)
+            tokens.append(Token(TokenType.INDENT, None, self._span()))
+        for _ in range(indent):
+            self._advance()
+        self.line_indent = indent
+        tokens.append(self._lex_asm_text())
+        return tokens
+
+    def _lex_asm_text(self) -> Token:
+        """The rest of the line as one ASM_LINE: a `#` and what follows it is
+        a comment and is left out, as is trailing whitespace.  The newline
+        is lexed next, as usual."""
+        span = self._span()
+        start = self.pos
+        while self._peek() not in ('\n', '\0'):
+            self._advance()
+        text = self.source[start:self.pos].split('#', 1)[0].rstrip(' \t\r')
+        return Token(TokenType.ASM_LINE, text, Span(span.file, span.line, span.column, len(text)))
+
     def next_token(self) -> Token:
         """Get the next token."""
+        tok = self._next_token()
+        # AGAST #3396: track an asm header (see __init__).
+        if tok.type == TokenType.ASM:
+            self.asm_state = 'header'
+            self.asm_base = self.line_indent
+            self.asm_parens = 0
+            self.asm_body = False
+        elif self.asm_state == 'header':
+            if tok.type == TokenType.LPAREN:
+                self.asm_parens += 1
+            elif tok.type == TokenType.RPAREN:
+                self.asm_parens -= 1
+        return tok
+
+    def _next_token(self) -> Token:
         # Return pending tokens first (from indentation handling)
         if self.pending_tokens:
             tok = self.pending_tokens.pop(0)
+            self.last_token_type = tok.type
+            return tok
+
+        # An asm body's line is text (AGAST #3396).
+        while self.at_line_start and self.asm_state == 'raw':
+            line_tokens = self._asm_line_start()
+            if line_tokens is None:
+                break
+            if not line_tokens:
+                # A blank or comment-only line: skip it.
+                while self._peek() not in ('\n', '\0'):
+                    self._advance()
+                if self._peek() == '\0':
+                    break
+                self._advance()
+                continue
+            self.at_line_start = False
+            self.pending_tokens.extend(line_tokens[1:])
+            tok = line_tokens[0]
             self.last_token_type = tok.type
             return tok
 
@@ -665,8 +752,16 @@ class Lexer:
         # Skip horizontal whitespace and comments
         self._skip_whitespace_and_comments()
 
+        # A newline inside an asm header's parentheses is a space: the
+        # clause list may span lines (AGAST #3396).
+        while self._peek() == '\n' and self.asm_state == 'header' and self.asm_parens > 0:
+            self._advance()
+            self._skip_whitespace_and_comments()
+
         # Check for newline - emit NEWLINE token and prepare for indentation on next call
         if self._peek() == '\n':
+            if self.asm_state == 'header':
+                self.asm_state = 'raw' if self.last_token_type == TokenType.COLON else None
             span = self._span()
             self._advance()
             self.at_line_start = True

@@ -112,8 +112,8 @@ EXPR_KINDS = {
 
 STMT_KINDS = {
     "unsafe_block": lambda p: rast.UnsafeBlock(SP, rast.Block(SP, [as_stmt(p)], None)),
-    "asm_operand": lambda p: rast.AsmStmt(
-        SP, "x86_64", "nop", [rast.AsmOperand("a", "r", p)]),
+    # (An asm operand was a row until AGAST #3396: it is a name now, never
+    # an expression, LANGUAGE_SPEC §18.6.)
 }
 
 

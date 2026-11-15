@@ -13,7 +13,8 @@ Lowering is step 2 (#3395, test_ritz1_asm_lower.py): each ACCEPT row now
 compiles to IR, so a block that failed to parse, or a check that fired on a
 good block, fails the row.
 
-ritz0 is not a column here: #3396 brings its `asm` into line with §18.6.
+ritz0 is a column of both (AGAST #3396); the errors that need types are in
+test_ritz1_asm_lower.py.
 """
 
 import pytest
@@ -147,7 +148,7 @@ ERRORS = {
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", ["ritz0"] + COMPILERS)
 @pytest.mark.parametrize("case", sorted(ACCEPT))
 def test_asm_block_parses(tmp_path, compiler, case):
     path = tmp_path / "main.ritz"
@@ -156,7 +157,7 @@ def test_asm_block_parses(tmp_path, compiler, case):
     assert comp.returncode == 0, f"{compiler} refused {case}:\n{comp.stdout + comp.stderr}"
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", ["ritz0"] + COMPILERS)
 @pytest.mark.parametrize("case", sorted(ERRORS))
 def test_asm_front_end_error(tmp_path, compiler, case):
     marked, message = ERRORS[case]

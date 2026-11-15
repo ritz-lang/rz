@@ -4,9 +4,8 @@ Step 2 of #1619 for ritz1; #3394 parsed and checked the blocks.
 
 * RUN: each program's exit code is what its block computes, so an operand
   that reaches the wrong register, the wrong width, the wrong number or the
-  wrong place afterwards changes the answer, or doesn't assemble.  These
-  are the clause forms ritz0 can't build yet (#3396), so ritz1 is the
-  oracle here and the expected code is written out.
+  wrong place afterwards changes the answer, or doesn't assemble.  The
+  expected code is written out; ritz0 runs every row too (AGAST #3396).
 * IR: the shapes §18.6 fixes: the template's escaping, the constraint list
   and the clobbers, `[[naked]]`'s define.
 * ERRORS: the typed errors §18.6 lists, each located at the operand.
@@ -27,7 +26,13 @@ from test_ref_into_value import _assert_refused
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
-COMPILERS = ["ritz1", "ritz1_selfhosted"]
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+
+# Rows a compiler doesn't pass yet: (row, compiler) -> AGAST ticket.
+GAPS = {
+    # ritz0 emits its naked fns its own way (emitter_llvmlite.py).
+    ("naked", "ritz0"): None,
+}
 
 # name: (program, exit code)
 RUN = {
@@ -135,6 +140,15 @@ pub fn main() -> i32
         jnz 1b
     n as i32
 """, 6),
+    # No clause: `{r}` is an input whatever the mnemonic says.  ritz0 used to
+    # guess that `movq ..., {r}` writes `r` (#3396); direction is declared.
+    "unsniffed": ("""\
+pub fn main() -> i32
+    var r: i64 = 7
+    asm x86_64:
+        movq $42, {r}
+    r as i32
+""", 7),
     # [[naked]]: no frame, the args in the convention's registers, its own ret.
     "naked": ("""\
 [[naked]]
@@ -213,6 +227,15 @@ fn f(x: i64, y: i64) -> i64
 pub fn main() -> i32
     0
 """, [r'"=\{rax\},=\{rdx\},0,\{rdi\},~\{rcx\},~\{rdi\},~\{memory\},~\{dirflag\},~\{fpsr\},~\{flags\}"']),
+    # The stack registers the text names are never clobbers.
+    "stack_regs": ("""\
+pub fn main() -> i32
+    asm x86_64:
+        movq %rsp, %rax
+        movl %ebp, %ecx
+    0
+""", [r'"movq %rsp, %rax\\0Amovl %ebp, %ecx", "~\{rax\},~\{rcx\},~\{memory\},'
+      r'~\{dirflag\},~\{fpsr\},~\{flags\}"']),
     # [[naked]]: no prologue, no frame, the blocks then `unreachable`.
     "naked": ("""\
 [[naked]]
@@ -271,13 +294,26 @@ ERRORS = {
 }
 
 
-def _run_params():
+def _as_ritz1_prints(text):
+    """ritz0's IR as ritz1 prints the same thing: llvmlite quotes value
+    names (`%".5"`), writes `{i64, i32}` without inner spaces and keeps
+    typed pointers (`i8*`)."""
+    text = re.sub(r'%"([.\w]+)"', r'%\1', text)
+    text = re.sub(r'\{((?:i\d+|ptr)(?:, (?:i\d+|ptr))*)\}', r'{ \1 }', text)
+    return re.sub(r'\bi\d+\*', 'ptr', text)
+
+
+def _params(table):
     for compiler in COMPILERS:
-        for name in sorted(RUN):
-            yield pytest.param(compiler, name, id=f"{compiler}-{name}")
+        for name in sorted(table):
+            gap = GAPS.get((name, compiler), 0)
+            if gap is None and table is IR:
+                continue
+            marks = [pytest.mark.xfail(strict=True, reason=f"AGAST #{gap}")] if gap else []
+            yield pytest.param(compiler, name, id=f"{compiler}-{name}", marks=marks)
 
 
-@pytest.mark.parametrize("compiler,name", list(_run_params()))
+@pytest.mark.parametrize("compiler,name", list(_params(RUN)))
 def test_asm_block_runs(compiler, tmp_path, name):
     src, want = RUN[name]
     assert _run(compiler, tmp_path, name, src) == want
@@ -297,14 +333,15 @@ def test_asm_block_runs_o2(compiler, tmp_path, name):
     comp = _emit(compiler, path, ll, tmp_path)
     assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
     exe = tmp_path / "main"
-    link = subprocess.run(["clang", "-O2", "-Wno-override-module", str(RITZ_START), str(ll), "-o", str(exe),
+    # ritz0's IR defines its own `_start`; ritz1's links the runtime's.
+    start = [] if compiler == "ritz0" else [str(RITZ_START)]
+    link = subprocess.run(["clang", "-O2", "-Wno-override-module", *start, str(ll), "-o", str(exe),
                            "-nostdlib", "-no-pie"], check=False, capture_output=True, text=True, timeout=300)
     assert link.returncode == 0, link.stderr[-2000:]
     assert subprocess.run([str(exe)], check=False, timeout=60).returncode == want
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(IR))
+@pytest.mark.parametrize("compiler,name", list(_params(IR)))
 def test_asm_block_ir(compiler, tmp_path, name):
     src, patterns = IR[name]
     path = tmp_path / "main.ritz"
@@ -313,6 +350,8 @@ def test_asm_block_ir(compiler, tmp_path, name):
     comp = _emit(compiler, path, ll, tmp_path)
     assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
     text = ll.read_text()
+    if compiler == "ritz0":
+        text = _as_ritz1_prints(text)
     for pat in patterns:
         assert re.search(pat, text), f"{compiler}: {name}: no /{pat}/ in\n{text}"
 

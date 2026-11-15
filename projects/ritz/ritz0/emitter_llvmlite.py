@@ -7209,214 +7209,148 @@ class LLVMEmitter:
 
         return False  # Unsafe block doesn't terminate control flow
 
+    # x86_64 register names an asm block's text may use (`%eax`, `%r8d`,
+    # ...), by the 64-bit register they are part of (LANGUAGE_SPEC §18.6).
+    _ASM_REG_PARTS = {
+        'rax': ('rax', 'eax', 'ax', 'al', 'ah'),
+        'rcx': ('rcx', 'ecx', 'cx', 'cl', 'ch'),
+        'rdx': ('rdx', 'edx', 'dx', 'dl', 'dh'),
+        'rbx': ('rbx', 'ebx', 'bx', 'bl', 'bh'),
+        'rsp': ('rsp', 'esp', 'sp', 'spl'),
+        'rbp': ('rbp', 'ebp', 'bp', 'bpl'),
+        'rsi': ('rsi', 'esi', 'si', 'sil'),
+        'rdi': ('rdi', 'edi', 'di', 'dil'),
+        **{f'r{n}': (f'r{n}', f'r{n}d', f'r{n}w', f'r{n}b') for n in range(8, 16)},
+    }
+    _ASM_REG_OF = {part: reg for reg, parts in _ASM_REG_PARTS.items() for part in parts}
+    _ASM_TEXT_REG = re.compile(r'%([a-z][a-z0-9]*)\b')
+    _ASM_OPERAND = re.compile(r'\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}(?=([0-9])?)')
+
     def _emit_asm(self, stmt: rast.AsmStmt):
-        """Emit inline assembly using LLVM inline asm.
+        """Emit an `asm` block as one LLVM `call asm sideeffect`, in AT&T
+        dialect (LANGUAGE_SPEC §18.6 "Lowering", LARB R50, AGAST #3396).
 
-        Converts Ritz inline assembly syntax to LLVM IR inline asm.
-
-        Supports both input and output operands. Output operands are detected
-        by analyzing the assembly template for write patterns (e.g., mov to operand).
-
-        Example Ritz (input only):
-            asm x86_64:
-                movw {port}, %dx
-                outb %al, %dx
-
-        Example Ritz (with output):
-            asm x86_64:
-                movw {port}, %dx
-                inb %dx, %al
-                movb %al, {result}
-
-        For outputs, the value is returned from the asm and stored back.
+        Direction is what the clauses declare: an operand only the text names
+        is an input.  Constraints are the outputs, `=&r` or `={reg}` when
+        pinned; then the inputs, `r` or `{reg}`, each `inout` tied to its
+        output by number; then `~{reg}` for each register the text names or
+        a `clobber` clause adds (never rsp or rbp, nor one pinned to an
+        output: LLVM would drop an inout's tie), and memory, dirflag, fpsr and flags.  The
+        template is the text, each `{name}` as `$N` (`${N}` when a digit
+        follows) and `$` as `$$`.
+        ritz1 emits the same (#3395).  The parser has checked everything
+        that needs no types; the operands' scope, type and place are checked
+        here.
         """
-        import re
+        target_arch = self.target.split('-', 1)[0]
+        if target_arch != stmt.arch:
+            raise EmitError(f"asm block is for {stmt.arch}, but the target is {self.target}",
+                            stmt.arch_span)
 
-        template = stmt.template
+        outputs = [o for o in stmt.operands if o.direction in ('out', 'inout')]
+        inputs = [o for o in stmt.operands if o.direction in ('in', 'inout')]
+        number = {o.name: i for i, o in enumerate(outputs)}
+        for i, o in enumerate(inputs):
+            number.setdefault(o.name, len(outputs) + i)
 
-        # Detect which operands are outputs by analyzing the template.
-        # In AT&T syntax, the destination is the LAST operand of mov/store instructions.
-        # Pattern: movX <src>, {operand} means {operand} is an output
-        output_operands = set()
-        for operand in stmt.operands:
-            # Check for patterns where this operand is a destination
-            # AT&T syntax: instruction source, destination
-            patterns = [
-                rf'mov[bwlq]?\s+[^,]+,\s*\{{{operand.name}\}}',  # movb %al, {result}
-                rf'xchg[bwlq]?\s+[^,]+,\s*\{{{operand.name}\}}',  # xchg
-                rf'lea[bwlq]?\s+[^,]+,\s*\{{{operand.name}\}}',  # lea
-                rf'pop[bwlq]?\s+\{{{operand.name}\}}',  # pop {result}
-                rf'in[bwl]?\s+[^,]*,?\s*\{{{operand.name}\}}',  # in %dx, {result}
-            ]
-            for pattern in patterns:
-                if re.search(pattern, template, re.IGNORECASE):
-                    output_operands.add(operand.name)
-                    break
-
-        # Separate outputs and inputs for LLVM constraint ordering
-        # LLVM requires outputs first, then inputs, in the constraint string
-        outputs = []
-        inputs = []
-        output_addrs = {}  # Map operand name -> LLVM address to store result
-
-        for operand in stmt.operands:
-            if operand.name in output_operands:
-                outputs.append(operand)
-                # For outputs, we need the address to store to, not the value
-                # The operand.expr should be an Ident referencing a variable
-                if isinstance(operand.expr, rast.Ident):
-                    var_name = operand.expr.name
-                    if var_name in self.locals:
-                        output_addrs[operand.name], _ = self.locals[var_name]
-                    elif var_name in self.globals:
-                        output_addrs[operand.name], _ = self.globals[var_name]
-                    else:
-                        raise ValueError(f"Unknown variable for asm output: {var_name}")
-                else:
-                    raise ValueError(f"Asm output operand must be a variable, got: {type(operand.expr)}")
-            else:
-                inputs.append(operand)
-
-        # Build constraint string and operand lists
-        # Outputs come first in both the constraint string and operand lists
         constraints = []
-        input_values = []
+        output_addrs = []
         output_types = []
-        operand_map = {}  # Maps {name} -> $N
-
-        # Add output constraints first (=r for each output)
-        for i, operand in enumerate(outputs):
-            operand_map[operand.name] = f"${i}"
-            constraints.append("=r")
-            # Get the type for the output
-            addr = output_addrs[operand.name]
-            if isinstance(addr.type, ir.PointerType):
-                output_types.append(addr.type.pointee)
+        for o in outputs:
+            addr = self._asm_output_place(o)
+            ty = addr.type.pointee
+            self._check_asm_operand_type(o, ty)
+            output_addrs.append(addr)
+            output_types.append(ty)
+            constraints.append(f"={{{o.reg}}}" if o.reg else "=&r")
+        input_values = []
+        for o in inputs:
+            value = self._asm_input_value(o)
+            self._check_asm_operand_type(o, value.type)
+            input_values.append(value)
+            if o.direction == 'inout':
+                constraints.append(str(number[o.name]))
             else:
-                output_types.append(addr.type)
+                constraints.append(f"{{{o.reg}}}" if o.reg else "r")
 
-        # Then add input constraints
-        for i, operand in enumerate(inputs):
-            operand_map[operand.name] = f"${len(outputs) + i}"
-            # Emit the operand expression to get its value
-            val = self._emit_expr(operand.expr)
-            input_values.append(val)
-            # Input constraint based on type
-            ty = val.type
-            if ty in (self.i8, self.i16, self.i32, self.i64):
-                constraints.append("r")
-            elif isinstance(ty, ir.PointerType):
-                constraints.append("r")
-            else:
-                constraints.append("r")
+        # Clobbers: registers the text names, then `clobber` clauses, in the
+        # registers' encoding order.
+        clobbered = set(stmt.clobbers)
+        for line, _ in stmt.lines:
+            for m in self._ASM_TEXT_REG.finditer(line):
+                reg = self._ASM_REG_OF.get(m.group(1))
+                if reg:
+                    clobbered.add(reg)
+        # Never rsp / rbp (as ritz1); nor a register pinned to an output:
+        # LLVM would drop an `inout`'s tie to its input (AGAST #3425).
+        clobbered -= {'rsp', 'rbp'} | {o.reg for o in outputs if o.reg}
+        constraints += [f"~{{{reg}}}" for reg in self._ASM_REG_PARTS if reg in clobbered]
+        constraints += ["~{memory}", "~{dirflag}", "~{fpsr}", "~{flags}"]
 
-        # Replace {name} with $N in template
-        # First, escape literal $ for LLVM inline asm ($ -> $$)
-        # BUT: preserve existing $$ (which means literal $ in AT&T syntax)
-        # Use regex to escape only single $ (not part of $$)
-        import re
-        template_escaped = re.sub(r'(?<!\$)\$(?!\$)', '$$', template)
+        def operand(m):
+            if m.group(1) is None:
+                return m.group(0)[0]      # `{{` / `}}`: a literal brace
+            n = number[m.group(1)]
+            return f"${{{n}}}" if m.group(2) else f"${n}"     # `${N}` before a digit
+        template = '\n'.join(self._ASM_OPERAND.sub(operand, line.replace('$', '$$'))
+                              for line, _ in stmt.lines)
+        # llvmlite writes the string as given: escape it for LLVM IR.
+        template = ''.join(chr(b) if 32 <= b < 127 and b not in (34, 92) else f"\\{b:02X}"
+                           for b in template.encode('utf-8'))
 
-        # Now replace {name} with temporary markers
-        operand_markers = {}
-        def replace_with_marker(match):
-            name = match.group(1)
-            if name in operand_map:
-                idx = operand_map[name]
-                marker = f'\x00{idx[1:]}\x00'
-                operand_markers[marker] = idx
-                return marker
-            else:
-                raise ValueError(f"Unknown asm operand: {{{name}}}")
-
-        llvm_template = re.sub(r'\{(\w+)\}', replace_with_marker, template_escaped)
-
-        # Replace markers back to $N
-        for marker, idx in operand_markers.items():
-            llvm_template = llvm_template.replace(marker, idx)
-
-        llvm_template = llvm_template.replace('\n', '\\0A')
-
-        # Auto-detect register clobbers from the template
-        x86_64_regs = {
-            'rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp',
-            'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15',
-            'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp', 'esp',
-            'ax', 'bx', 'cx', 'dx', 'si', 'di', 'bp', 'sp',
-            'al', 'ah', 'bl', 'bh', 'cl', 'ch', 'dl', 'dh',
-            'sil', 'dil', 'bpl', 'spl',
-        }
-
-        detected_clobbers = set()
-        template_lower = template.lower()
-        for reg in x86_64_regs:
-            if re.search(rf'\b{reg}\b', template_lower):
-                reg_map = {
-                    'eax': 'rax', 'ax': 'rax', 'al': 'rax', 'ah': 'rax',
-                    'ebx': 'rbx', 'bx': 'rbx', 'bl': 'rbx', 'bh': 'rbx',
-                    'ecx': 'rcx', 'cx': 'rcx', 'cl': 'rcx', 'ch': 'rcx',
-                    'edx': 'rdx', 'dx': 'rdx', 'dl': 'rdx', 'dh': 'rdx',
-                    'esi': 'rsi', 'si': 'rsi', 'sil': 'rsi',
-                    'edi': 'rdi', 'di': 'rdi', 'dil': 'rdi',
-                    'ebp': 'rbp', 'bp': 'rbp', 'bpl': 'rbp',
-                    'esp': 'rsp', 'sp': 'rsp', 'spl': 'rsp',
-                }
-                canonical = reg_map.get(reg, reg)
-                detected_clobbers.add(canonical)
-
-        if stmt.clobbers:
-            for clobber in stmt.clobbers:
-                detected_clobbers.add(clobber)
-
-        for clobber in sorted(detected_clobbers):
-            constraints.append(f"~{{{clobber}}}")
-
-        if stmt.volatile:
-            constraints.append("~{memory}")
-
-        constraint_str = ','.join(constraints) if constraints else ""
-
-        # Determine return type based on outputs
-        if len(outputs) == 0:
+        if not outputs:
             ret_type = self.void
         elif len(outputs) == 1:
             ret_type = output_types[0]
         else:
-            # Multiple outputs -> return a struct
             ret_type = ir.LiteralStructType(output_types)
+        asm_fn_type = ir.FunctionType(ret_type, [v.type for v in input_values])
+        asm_val = ir.InlineAsm(asm_fn_type, template, ','.join(constraints), side_effect=True)
+        result = self.builder.call(asm_val, input_values)
 
-        # Build function type
-        if input_values:
-            param_types = [v.type for v in input_values]
-            asm_fn_type = ir.FunctionType(ret_type, param_types)
-        else:
-            asm_fn_type = ir.FunctionType(ret_type, [])
-
-        # Create inline asm value
-        asm_val = ir.InlineAsm(
-            asm_fn_type,
-            llvm_template,
-            constraint_str,
-            side_effect=stmt.volatile
-        )
-
-        # Call the inline asm
-        if input_values:
-            result = self.builder.call(asm_val, input_values)
-        else:
-            result = self.builder.call(asm_val, [])
-
-        # Store output values back to variables
+        # Each output is stored back to its place.
         if len(outputs) == 1:
-            addr = output_addrs[outputs[0].name]
-            self.builder.store(result, addr)
-        elif len(outputs) > 1:
-            for i, operand in enumerate(outputs):
-                val = self.builder.extract_value(result, i)
-                addr = output_addrs[operand.name]
-                self.builder.store(val, addr)
-
+            self.builder.store(result, output_addrs[0])
+        else:
+            for i, addr in enumerate(output_addrs):
+                self.builder.store(self.builder.extract_value(result, i), addr)
         return None
+
+    def _asm_operand_unknown(self, o: rast.AsmOperand) -> EmitError:
+        return EmitError(f"asm operand '{o.name}' is not a local, a parameter or a global", o.span)
+
+    def _asm_output_place(self, o: rast.AsmOperand) -> ir.Value:
+        """The address `out`/`inout` operand `o` is stored back to: a local
+        other than a `let`, a parameter, or a global `var` (§18.6).  In
+        ritz1's words (emitter_asm.ritz)."""
+        name = o.name
+        word = f"asm '{o.direction}' operand '{name}'"
+        if name in self.locals and not self._is_let_slot(name):
+            return self.locals[name][0]
+        if name in self.locals or name in self.params:
+            raise EmitError(f"{word} is a `let` binding, not an assignable place: "
+                            "declare it `var`", o.span)
+        if name in self.constants or self._is_const_array_name(name):
+            raise EmitError(f"{word} is a const, not an assignable place", o.span)
+        if name in self.globals:
+            return self.globals[name][0]
+        raise self._asm_operand_unknown(o)
+
+    def _asm_input_value(self, o: rast.AsmOperand) -> ir.Value:
+        """The value of input (or `inout`) operand `o`: a local, a
+        parameter, a global or a constant, not a fn or an enum variant."""
+        name = o.name
+        if not (name in self.locals or name in self.params or name in self.globals
+                or name in self.constants):
+            raise self._asm_operand_unknown(o)
+        return self._emit_expr(rast.Ident(o.span, name))
+
+    def _check_asm_operand_type(self, o: rast.AsmOperand, ty: ir.Type) -> None:
+        """An operand is an integer or a pointer; `bool` is an `i1`, which no
+        register constraint takes (§18.6)."""
+        if isinstance(ty, ir.PointerType) or (isinstance(ty, ir.IntType) and ty.width > 1):
+            return
+        raise EmitError(f"asm operand '{o.name}' must be an integer or a pointer", o.span)
 
     def _emit_short_circuit_and(self, expr: rast.BinOp):
         """Emit short-circuit AND: left && right.

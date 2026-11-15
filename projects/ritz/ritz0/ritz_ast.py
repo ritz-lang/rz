@@ -767,56 +767,64 @@ class AssertStmt(Stmt):
 
 @dataclass
 class AsmOperand:
-    """An operand in an inline assembly block.
+    """An operand of an `asm` block (LANGUAGE_SPEC §18.6).
 
-    Operands are referenced in assembly code as {name}.
-
-    Examples:
-        asm x86_64:
-            mov dx, {port}     # input operand
-            mov {result}, al   # output operand
+    Either named in a clause, `(in|out|inout) name (: reg)?`, or only in the
+    text as `{name}`, which makes it an input.  Direction is declared, never
+    guessed from the instructions.
 
     Attributes:
-        name: Variable name referenced in assembly
-        constraint: LLVM constraint string (e.g., "r", "m", "=r")
-        expr: The Ritz expression for the operand value
-        is_output: True if this operand is written to (output)
+        name: The local, parameter or global it names
+        direction: 'in', 'out' or 'inout'
+        span: Where it is named: the clause's name, else the text's `{`
+        reg: The x86_64 register it is pinned to (64-bit name), or None
+        in_clause: True if a clause names it
+        text_span: Where the text first names it (its `{`), or None
     """
     name: str
-    constraint: str
-    expr: 'Expr'
-    is_output: bool = False
+    direction: str
+    span: 'Span'
+    reg: Optional[str] = None
+    in_clause: bool = False
+    text_span: Optional['Span'] = None
 
 
 @dataclass
 class AsmStmt(Stmt):
-    """Inline assembly statement.
+    """Inline assembly statement (LANGUAGE_SPEC §18.6, LARB R50).
 
     Syntax:
-        asm <arch>:
-            <assembly instructions>
+        asm <arch> (<clause>, ...)?:
+            <assembly text lines>
 
     Example:
-        asm x86_64:
-            mov dx, {port}
-            mov al, {value}
-            out dx, al
-
-    Operands are referenced as {name} in the assembly code.
-    The compiler infers inputs and outputs from usage.
+        asm x86_64 (out result):
+            movw {port}, %dx
+            inb %dx, %al
+            movb %al, {result}
 
     Attributes:
-        arch: Target architecture (e.g., "x86_64", "aarch64")
-        template: The raw assembly template string with {operand} placeholders
-        operands: List of operands (inputs and outputs)
-        clobbers: List of registers clobbered by the assembly
-        volatile: If True, assembly has side effects (default True for safety)
+        arch: Target architecture (only x86_64 is defined)
+        arch_span: Where the architecture is named
+        lines: The body's lines, as written (comments dropped), with spans
+        operands: Clause operands in clause order, then text-only inputs in
+            the order the text first names them
+        clobbers: Registers named by `clobber` clauses (64-bit names)
+        first_clause: The first clause's span, or None without clauses
+        volatile: Always True: a block has side effects
     """
     arch: str
-    template: str
+    arch_span: Optional['Span'] = None
+    lines: List[tuple] = field(default_factory=list)
     operands: List[AsmOperand] = field(default_factory=list)
     clobbers: List[str] = field(default_factory=list)
+    first_clause: Optional['Span'] = None
     volatile: bool = True
+
+    @property
+    def template(self) -> str:
+        """The body's text, its lines joined with newlines."""
+        return '\n'.join(text for text, _ in self.lines)
 
 
 @dataclass

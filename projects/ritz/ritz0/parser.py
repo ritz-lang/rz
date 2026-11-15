@@ -13,6 +13,7 @@ Syntax features:
     See RERITZ.md for full specification.
 """
 
+import re
 from typing import List, Optional, Callable
 from tokens import Token, TokenType, Span, KEYWORDS
 from lexer import Lexer, LexerError, UNMATCHED_INDENT, relayout
@@ -97,6 +98,28 @@ CALLCONVS = ("c", "win64")
 DECL_REFUSED = "cannot be declaration-only (= extern)"
 
 
+# Inline assembly (LANGUAGE_SPEC §18.6, AGAST #3396).  The architectures an
+# `asm` block may name, and the x86_64 general registers a clause may pin or
+# clobber, by their 64-bit names (ritz1: ast_helpers.ritz asm_reg_index).
+ASM_ARCHES = ("x86_64",)
+ASM_GPRS = ("rax", "rcx", "rdx", "rbx", "rsi", "rdi",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
+# `{name}` at a `{`, and a named label at the start of an asm line.
+ASM_OPERAND = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+ASM_NAMED_LABEL = re.compile(r"([A-Za-z_.][A-Za-z0-9_.$]*):")
+
+
+def _asm_reg(tok) -> str:
+    """The register `tok` names, refused unless a clause may pin or clobber it."""
+    if tok.value in ("rsp", "rbp"):
+        raise ParseError(f"asm can't pin or clobber '{tok.value}'", tok.span)
+    if tok.value not in ASM_GPRS:
+        raise ParseError(
+            f"'{tok.value}' is not a general register (rax, rbx, rcx, rdx, rsi, rdi, r8-r15)",
+            tok.span)
+    return tok.value
+
+
 class Parser:
     """
     Parser for Ritz source code.
@@ -148,6 +171,9 @@ class Parser:
         """Consume a token of the expected type or raise an error."""
         tok = self._current()
         if tok.type != type:
+            if type == TokenType.IDENT and tok.type == TokenType.ASM:
+                # `asm` is a keyword (§18.6), in ritz1's words.
+                msg = "unexpected 'asm'"
             if msg is None:
                 msg = f"Expected {type.name}, got {tok.type.name}"
             raise ParseError(msg, tok.span)
@@ -1858,136 +1884,154 @@ class Parser:
         return rast.VarStmt(span, name_tok.value, type_ann, value, name_tok.span)
 
     def parse_asm(self) -> rast.AsmStmt:
-        """Parse an inline assembly statement.
+        """Parse an inline assembly block (LANGUAGE_SPEC §18.6, AGAST #3396).
 
         Syntax:
-            asm <arch>:
-                <assembly line 1>
-                <assembly line 2>
+            asm <arch> (<clause>, ...)?:
+                <assembly text line>
                 ...
+            clause := (in | out | inout) NAME (: REG)? | clobber REG
 
-        Example:
-            asm x86_64:
-                mov dx, {port}
-                out dx, al
-
-        Operands are referenced as {name} in the assembly template.
+        The lexer hands over each body line whole, as an ASM_LINE.  Every
+        §18.6 error that needs no types is reported here, located, in
+        ritz1's words (ritz1/src/ast_helpers.ritz stmt_asm); the [[naked]]
+        rules are checked with the fn (_check_naked_asm), and the ones that
+        need types by the emitter (_emit_asm).
         """
-        import re
-
         span = self._current().span
         self._expect(TokenType.ASM)
-
-        # Expect architecture identifier (e.g., x86_64, aarch64)
         arch_tok = self._expect(TokenType.IDENT)
-        arch = arch_tok.value
+        if arch_tok.value not in ASM_ARCHES:
+            raise ParseError(
+                f"unknown asm architecture '{arch_tok.value}' (known: x86_64)", arch_tok.span)
+        stmt = rast.AsmStmt(span, arch=arch_tok.value, arch_span=arch_tok.span)
 
-        # Expect colon after architecture
+        if self._at(TokenType.LPAREN):
+            self._advance()
+            pinned = set()
+            while True:
+                self._parse_asm_clause(stmt, pinned)
+                if not self._at(TokenType.COMMA):
+                    break
+                self._advance()
+            self._expect(TokenType.RPAREN, "expected ',' or ')' in an asm clause list")
+
         self._expect(TokenType.COLON)
-
-        # Now we need to parse the indented block of assembly lines
-        # The assembly is raw text, not Ritz expressions
         self._expect(TokenType.NEWLINE)
         self._expect(TokenType.INDENT)
-
-        # Collect assembly lines until DEDENT
-        asm_lines = []
-        while not self._at(TokenType.DEDENT, TokenType.EOF):
-            # Read tokens until NEWLINE, reconstructing the line
-            line_parts = []
-            while not self._at(TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF):
-                tok = self._advance()
-                # Preserve the token's text representation
-                if tok.type == TokenType.IDENT:
-                    line_parts.append(tok.value)
-                elif tok.type == TokenType.INT:
-                    line_parts.append(str(tok.value))
-                elif tok.type == TokenType.STRING:
-                    line_parts.append(f'"{tok.value}"')
-                elif tok.type == TokenType.LBRACE:
-                    line_parts.append('{')
-                elif tok.type == TokenType.RBRACE:
-                    line_parts.append('}')
-                elif tok.type == TokenType.COMMA:
-                    line_parts.append(',')
-                elif tok.type == TokenType.COLON:
-                    line_parts.append(':')
-                elif tok.type == TokenType.LBRACKET:
-                    line_parts.append('[')
-                elif tok.type == TokenType.RBRACKET:
-                    line_parts.append(']')
-                elif tok.type == TokenType.PLUS:
-                    line_parts.append('+')
-                elif tok.type == TokenType.MINUS:
-                    line_parts.append('-')
-                elif tok.type == TokenType.STAR:
-                    line_parts.append('*')
-                elif tok.type == TokenType.AT:
-                    line_parts.append('@')
-                elif tok.type == TokenType.PERCENT:
-                    line_parts.append('%')
-                elif tok.type == TokenType.DOLLAR:
-                    line_parts.append('$')
-                elif tok.type == TokenType.DOT:
-                    line_parts.append('.')
-                else:
-                    # For other tokens, use the value or type name
-                    if tok.value is not None:
-                        line_parts.append(str(tok.value))
-
-            if line_parts:
-                # Join with spaces, but handle special cases
-                line = ' '.join(line_parts)
-                # Clean up spacing around punctuation
-                line = re.sub(r'\s*,\s*', ', ', line)
-                line = re.sub(r'\s*:\s*', ':', line)
-                line = re.sub(r'\{\s*', '{', line)
-                line = re.sub(r'\s*\}', '}', line)
-                line = re.sub(r'\[\s*', '[', line)
-                line = re.sub(r'\s*\]', ']', line)
-                # Remove space after dot for assembly labels (e.g., .spin, .Llabel)
-                line = re.sub(r'\.\s+', '.', line)
-                # Remove space after $ for AT&T immediate values (e.g., $3, $0xFF)
-                line = re.sub(r'\$\s+', '$', line)
-                # Remove space after % for AT&T registers (e.g., %rax)
-                line = re.sub(r'%\s+', '%', line)
-                asm_lines.append(line)
-
-            # Consume newline if present
+        while self._at(TokenType.ASM_LINE):
+            tok = self._advance()
+            stmt.lines.append((tok.value, tok.span))
+            self._check_asm_label(tok)
+            self._scan_asm_line(stmt, tok)
             if self._at(TokenType.NEWLINE):
                 self._advance()
-
-        # Consume DEDENT
         if self._at(TokenType.DEDENT):
             self._advance()
 
-        # Join lines into template
-        template = '\n'.join(asm_lines)
+        # An unpinned clause operand has no register but the one {name} picks.
+        for o in stmt.operands:
+            if o.in_clause and o.reg is None and o.text_span is None:
+                raise ParseError(
+                    f"asm operand '{o.name}' is in a clause but not in the text: "
+                    "write {name} or pin it to a register", o.span)
+        return stmt
 
-        # Extract operands from {name} placeholders
-        operand_names = re.findall(r'\{(\w+)\}', template)
-        operands = []
-        seen = set()
-        for name in operand_names:
-            if name not in seen:
-                seen.add(name)
-                # Create operand - we'll resolve the actual expressions later
-                # For now, create a placeholder that references the variable
-                operands.append(rast.AsmOperand(
-                    name=name,
-                    constraint="r",  # Default to register constraint
-                    expr=rast.Ident(span, name),
-                    is_output=False  # Will be determined by emitter
-                ))
+    def _parse_asm_clause(self, stmt: rast.AsmStmt, pinned: set) -> None:
+        """One clause of `stmt`'s list; `pinned` holds the registers pinned so far."""
+        kind_tok = self._current()
+        if kind_tok.type == TokenType.IN:
+            kind = 'in'
+        elif kind_tok.type == TokenType.IDENT:
+            kind = kind_tok.value
+        else:
+            raise ParseError("expected an asm clause (in, out, inout or clobber)", kind_tok.span)
+        if kind not in ('in', 'out', 'inout', 'clobber'):
+            raise ParseError(
+                f"unknown asm clause '{kind}' (in, out, inout or clobber)", kind_tok.span)
+        self._advance()
+        if stmt.first_clause is None:
+            stmt.first_clause = kind_tok.span
+        name_tok = self._expect(TokenType.IDENT, f"expected a name after '{kind}'")
+        reg_tok = None
+        if self._at(TokenType.COLON):
+            self._advance()
+            reg_tok = self._expect(TokenType.IDENT, "expected a register after ':'")
+        if kind == 'clobber':
+            if reg_tok is not None:
+                raise ParseError(
+                    f"'clobber' takes one register, not '{name_tok.value}: ...'", reg_tok.span)
+            stmt.clobbers.append(_asm_reg(name_tok))
+            return
+        if any(o.name == name_tok.value for o in stmt.operands):
+            raise ParseError(f"'{name_tok.value}' is named in two asm clauses", name_tok.span)
+        reg = None
+        if reg_tok is not None:
+            reg = _asm_reg(reg_tok)
+            if reg in pinned:
+                raise ParseError(f"asm register '{reg_tok.value}' is pinned twice", reg_tok.span)
+            pinned.add(reg)
+        stmt.operands.append(rast.AsmOperand(
+            name_tok.value, kind, name_tok.span, reg=reg, in_clause=True))
 
-        return rast.AsmStmt(
-            span=span,
-            arch=arch,
-            template=template,
-            operands=operands,
-            clobbers=[],  # TODO: parse clobber list syntax
-            volatile=True
-        )
+    @staticmethod
+    def _check_asm_label(tok) -> None:
+        """A named label at the start of an asm line (`loop:`, `.L1:`) is an
+        error: only numeric local labels (`1:`) are allowed (§18.6, #1371)."""
+        m = ASM_NAMED_LABEL.match(tok.value)
+        if m:
+            raise ParseError(
+                f"named label '{m.group(1)}' in asm: use a numeric local label "
+                "(1:, jumped to as 1b or 1f)", tok.span)
+
+    @staticmethod
+    def _scan_asm_line(stmt: rast.AsmStmt, tok) -> None:
+        """The `{name}`s of an asm line: each name no operand has yet becomes
+        an input (its span the name's, its text_span the `{`); each operand found is marked as in the text.  `{{` and `}}`
+        are a literal brace.  A `{` that isn't closed, or isn't a name, is an
+        error."""
+        text, span = tok.value, tok.span
+        i = 0
+        while i < len(text):
+            if text.startswith('{{', i) or text.startswith('}}', i):
+                i += 2
+                continue
+            if text[i] != '{':
+                i += 1
+                continue
+            at = Span(span.file, span.line, span.column + i, 1)
+            m = ASM_OPERAND.match(text, i)
+            if m is None:
+                what = "is not closed" if '}' not in text[i + 1:] else "must be followed by a name and '}'"
+                raise ParseError(f"'{{' in asm {what} (write '{{{{' for a literal '{{')", at)
+            name = m.group(1)
+            o = next((o for o in stmt.operands if o.name == name), None)
+            if o is None:
+                # Located at its name, as ritz1 locates the typed errors.
+                o = rast.AsmOperand(name, 'in', Span(span.file, span.line, span.column + i + 1, len(name)))
+                stmt.operands.append(o)
+            if o.text_span is None:
+                o.text_span = at
+            i = m.end()
+
+    def _check_naked_asm(self, body: rast.Block) -> None:
+        """The [[naked]] rules (§18.6, §17.5): the body holds only asm
+        blocks, and they take no clause and no `{name}`: there is no frame."""
+        for stmt in body.stmts:
+            if not isinstance(stmt, rast.AsmStmt):
+                raise ParseError(
+                    "a [[naked]] fn body may contain only asm blocks", stmt.span)
+            if stmt.first_clause is not None:
+                raise ParseError(
+                    "an asm block in a [[naked]] fn takes no clauses", stmt.first_clause)
+            for o in stmt.operands:
+                if o.text_span is not None:
+                    raise ParseError(
+                        f"an asm block in a [[naked]] fn takes no {{name}}: '{o.name}' "
+                        "has no frame to live in", o.text_span)
+        if body.expr is not None:
+            raise ParseError(
+                "a [[naked]] fn body may contain only asm blocks", body.expr.span)
 
     def parse_unsafe(self) -> rast.UnsafeBlock:
         """Parse an unsafe block.
@@ -2213,13 +2257,7 @@ class Parser:
             # No prologue means no frame: the body is asm that returns by
             # itself. Anything else used to be dropped by the emitter in
             # silence (#1847).
-            for stmt in body.stmts:
-                if not isinstance(stmt, rast.AsmStmt):
-                    raise ParseError(
-                        "a [[naked]] fn body may contain only asm blocks", stmt.span)
-            if body.expr is not None:
-                raise ParseError(
-                    "a [[naked]] fn body may contain only asm blocks", body.expr.span)
+            self._check_naked_asm(body)
         return rast.FnDef(span, name_tok.value, params, ret_type, body, attrs,
                           is_async=is_async, is_pub=is_pub,
                           type_params=type_params, type_param_bounds=type_param_bounds)

@@ -187,7 +187,7 @@ no-op expression that evaluates to `0`). `mut` is reserved but only valid in
 `asm` starts an inline assembly block ([§18.6](#186-inline-assembly)), so it
 can't be used as an identifier:
 
-```ritz body expect-error="Expected IDENT, got ASM"
+```ritz body expect-error="unexpected 'asm'"
 let asm = 1
 ```
 
@@ -5580,7 +5580,7 @@ asm_clause  := ('in' | 'out' | 'inout') IDENT (':' REGISTER)?
              | 'clobber' REGISTER
 ```
 
-```text
+```ritz
 fn inb(port: u16) -> u8
     var result: u8 = 0
     asm x86_64 (out result):
@@ -5596,8 +5596,7 @@ fn write1(fd: i64, buf: *u8, n: i64) -> i64
     return ret
 ```
 
-ritz1 lowers every form here (AGAST #3395). ritz0 accepts a block with no
-clauses, whose operands are all inputs; its clause forms wait on #3396. The
+Both compilers accept every form here (ritz1: AGAST #3395, ritz0: #3396). The
 compiler barrier cryptosec uses to keep a zeroing loop from being removed:
 
 ```ritz
@@ -5622,8 +5621,7 @@ only three ways:
   the GNU assembler. So no `{name}` is substituted inside a comment.
 - Lines are joined with newlines. Indentation beyond the block's is dropped.
 `$` and `%` are literal: `movq $3, %rcx` means what it says, and the compiler
-escapes them for LLVM. (ritz0 today also reads `$$42` as `$42`; that goes, and
-its one site, `test/test_packed_naked.ritz:74`, becomes `$42`.)
+escapes them for LLVM.
 
 **Labels.** Only numeric local labels (`1:`, jumped to as `1b` or `1f`). A named
 label is an error at the line: the function may be inlined into several callers,
@@ -5668,7 +5666,9 @@ AT&T dialect:
 - constraints list the outputs first, `=&r` (early-clobber: the block may write
   one before it has read every input) or `={reg}` when pinned; then the inputs,
   `r` or `{reg}`, with each `inout` tied to its output by number (`0`); then
-  `~{reg}` for every clobber, and `~{memory},~{dirflag},~{fpsr},~{flags}`;
+  `~{reg}` for every clobber, and `~{memory},~{dirflag},~{fpsr},~{flags}`.
+  `rsp` and `rbp` are never listed, nor is a register pinned to an output:
+  LLVM would drop an `inout`'s tie to its input (AGAST #3425);
 - no outputs gives a `void` call, one output that type, several a literal
   struct; each output is stored back to its place after the call.
 

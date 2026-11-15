@@ -1114,6 +1114,15 @@ class MoveChecker:
                     var_info.moved_fields = {}
             return False
 
+        elif isinstance(stmt, rast.AsmStmt):
+            # §18.6: an `out` or `inout` operand is an assignment of its
+            # place for the borrow rules (§13.5); ritz1: ref_check_asm.
+            for o in stmt.operands:
+                if o.direction in ('out', 'inout'):
+                    target = rast.Ident(o.span, o.name)
+                    self._check_mut_use(self._loan_place(target), o.span, "assign")
+            return False
+
         elif isinstance(stmt, rast.WhileStmt):
             def iteration():
                 # The condition runs at the loop head, on every iteration.

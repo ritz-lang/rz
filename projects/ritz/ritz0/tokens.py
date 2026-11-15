@@ -66,6 +66,7 @@ class TokenType(Enum):
 
     # RERITZ: Issue #118 - Kernel/freestanding support
     ASM = auto()           # asm keyword for inline assembly blocks
+    ASM_LINE = auto()      # one raw line of an asm body (LANGUAGE_SPEC §18.6)
 
     # Operators
     PLUS = auto()          # +

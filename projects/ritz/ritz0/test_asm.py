@@ -20,227 +20,117 @@ class TestAsmLexer:
         assert tokens[2].type == TokenType.COLON
 
 
+def _asm(source):
+    """The first statement of the first fn in `source`, an AsmStmt."""
+    module = Parser(tokenize(source)).parse_module()
+    stmt = module.items[0].body.stmts[0]
+    assert isinstance(stmt, rast.AsmStmt)
+    return stmt
+
+
 class TestAsmParser:
-    """Test asm statement parsing."""
+    """An asm body is raw text (LANGUAGE_SPEC §18.6, AGAST #3396)."""
 
-    def test_simple_asm(self):
-        """Test parsing a simple asm block."""
-        source = """
-fn test()
+    def test_lines_are_text(self):
+        """Each line reaches the template as written: `$`, `%`, parentheses
+        and spacing are not re-tokenised, and `$` stays `$`."""
+        stmt = _asm("""
+fn f(ptr: *u8)
     asm x86_64:
-        nop
-"""
-        tokens = tokenize(source)
-        parser = Parser(tokens)
-        module = parser.parse_module()
+        movq   $3, %rcx
+        nopl ({ptr})
+        movb $'"', %al
+""")
+        assert stmt.arch == "x86_64"
+        assert stmt.template == "movq   $3, %rcx\nnopl ({ptr})\nmovb $'\"', %al"
 
-        fn = module.items[0]
-        assert isinstance(fn, rast.FnDef)
-        assert len(fn.body.stmts) == 1
-
-        asm_stmt = fn.body.stmts[0]
-        assert isinstance(asm_stmt, rast.AsmStmt)
-        assert asm_stmt.arch == "x86_64"
-        assert "nop" in asm_stmt.template
-
-    def test_asm_with_operands(self):
-        """Test parsing asm with {operand} placeholders."""
-        source = """
-fn outb(port: u16, value: u8)
+    def test_comments_and_indentation_dropped(self):
+        """`#` to the end of the line is a comment; deeper indentation and
+        blank lines are dropped; the block ends at the enclosing depth."""
+        stmt = _asm("""
+fn f()
     asm x86_64:
-        mov dx, {port}
-        mov al, {value}
-        out dx, al
-"""
-        tokens = tokenize(source)
-        parser = Parser(tokens)
-        module = parser.parse_module()
+        nop      # a comment with {braces}
 
-        fn = module.items[0]
-        asm_stmt = fn.body.stmts[0]
-        assert isinstance(asm_stmt, rast.AsmStmt)
-        assert asm_stmt.arch == "x86_64"
-        assert "{port}" in asm_stmt.template
-        assert "{value}" in asm_stmt.template
-        assert len(asm_stmt.operands) == 2
+            1: decq %rcx
+        jnz 1b
+    let k: i64 = 1
+""")
+        assert stmt.template == "nop\n1: decq %rcx\njnz 1b"
+        assert stmt.operands == []
 
-        # Check operands
-        op_names = [op.name for op in asm_stmt.operands]
-        assert "port" in op_names
-        assert "value" in op_names
-
-    def test_asm_multiline(self):
-        """Test parsing multiline asm blocks."""
-        source = """
-fn cpuid()
+    def test_text_operands_are_inputs(self):
+        """Every `{name}` no clause names is an input: nothing is guessed
+        from mnemonics, and `{{`/`}}` are not operands."""
+        stmt = _asm("""
+fn f(port: u16, result: u8)
     asm x86_64:
-        push rbx
-        mov eax, 0
-        cpuid
-        pop rbx
-"""
-        tokens = tokenize(source)
-        parser = Parser(tokens)
-        module = parser.parse_module()
+        movw {port}, %dx
+        movb %al, {result}
+        movq {{literal}}, %rax
+""")
+        assert [(o.name, o.direction) for o in stmt.operands] == [("port", "in"), ("result", "in")]
 
-        fn = module.items[0]
-        asm_stmt = fn.body.stmts[0]
-        assert isinstance(asm_stmt, rast.AsmStmt)
+    def test_clauses(self):
+        """§18.6's syscall example, its clause list over two lines."""
+        stmt = _asm("""
+fn write1(ret: i64, fd: i64, buf: *u8, n: i64)
+    asm x86_64 (inout ret: rax, in fd: rdi,
+                in buf: rsi, in n: rdx, clobber rcx, clobber r11):
+        syscall
+""")
+        assert [(o.name, o.direction, o.reg) for o in stmt.operands] == [
+            ("ret", "inout", "rax"), ("fd", "in", "rdi"), ("buf", "in", "rsi"), ("n", "in", "rdx")]
+        assert stmt.clobbers == ["rcx", "r11"]
 
-        # Template should contain all instructions
-        assert "push" in asm_stmt.template
-        assert "cpuid" in asm_stmt.template
-        assert "pop" in asm_stmt.template
+    def test_volatile_default(self):
+        assert _asm("fn f()\n    asm x86_64:\n        hlt\n").volatile is True
 
-    def test_asm_aarch64(self):
-        """Test parsing ARM64 asm."""
-        source = """
-fn nop()
-    asm aarch64:
-        nop
-"""
-        tokens = tokenize(source)
-        parser = Parser(tokens)
-        module = parser.parse_module()
 
-        fn = module.items[0]
-        asm_stmt = fn.body.stmts[0]
-        assert asm_stmt.arch == "aarch64"
-
-    def test_asm_volatile_default(self):
-        """Test that asm is volatile by default."""
-        source = """
-fn test()
-    asm x86_64:
-        hlt
-"""
-        tokens = tokenize(source)
-        parser = Parser(tokens)
-        module = parser.parse_module()
-
-        fn = module.items[0]
-        asm_stmt = fn.body.stmts[0]
-        assert asm_stmt.volatile == True
-
-    def test_asm_local_labels(self):
-        """Test parsing asm with local labels (e.g., .spin, .loop)."""
-        source = """
-fn halt()
-    asm x86_64:
-        cli
-        .spin:
-        hlt
-        jmp .spin
-"""
-        tokens = tokenize(source)
-        parser = Parser(tokens)
-        module = parser.parse_module()
-
-        fn = module.items[0]
-        asm_stmt = fn.body.stmts[0]
-        assert isinstance(asm_stmt, rast.AsmStmt)
-
-        # Labels should be preserved without extra spaces
-        assert ".spin:" in asm_stmt.template
-        assert "jmp .spin" in asm_stmt.template
-        # Should NOT have "jmp . spin" (with space after dot)
-        assert ". spin" not in asm_stmt.template
+def _ir(tmp_path, source):
+    """ritz0's IR for `source`."""
+    src = tmp_path / "main.ritz"
+    src.write_text(source + "\npub fn main() -> i32\n    0\n")
+    ll = tmp_path / "main.ll"
+    result = run_ritz0([str(src), "-o", str(ll)], cwd=str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    return ll.read_text()
 
 
 @pytest.mark.integration
-class TestAsmIntegration:
-    """Integration tests for asm compilation."""
+class TestAsmLowering:
+    """§18.6 "Lowering" for ritz0 alone; the shapes both compilers share are
+    test_ritz1_asm_lower.py's IR rows."""
 
-    def test_asm_compiles_to_llvm(self):
-        """Test that asm statements produce valid LLVM IR."""
-        import tempfile
-        import os
+    TAIL = "~{memory},~{dirflag},~{fpsr},~{flags}"
 
-        source = """
-fn outb(port: u16, value: u8)
-    asm x86_64:
-        mov dx, {port}
-        out dx, al
-
-fn main() -> i32
-    outb(0x3F8, 65)
-    0
-"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.ritz', delete=False) as f:
-            f.write(source)
-            src_path = f.name
-
-        try:
-            ll_path = src_path.replace('.ritz', '.ll')
-            # Get the directory containing this test file (ritz0/)
-            ritz0_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(ritz0_dir)
-            result = run_ritz0([src_path, '-o', ll_path], cwd=project_root)
-            assert result.returncode == 0, f"Compilation failed: {result.stderr}"
-
-            # Check the generated IR contains inline asm
-            with open(ll_path) as f:
-                ir = f.read()
-            assert 'asm sideeffect' in ir
-            assert 'mov dx' in ir
-
-        finally:
-            os.unlink(src_path)
-            if os.path.exists(ll_path):
-                os.unlink(ll_path)
-
-
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
-
-
-@pytest.mark.integration
-class TestAsmOutputOperands:
-    """Test asm output operand detection and code generation."""
-
-    def test_asm_output_operand(self):
-        """Test that asm output operands are properly detected and stored back."""
-        import tempfile
-        import os
-
-        source = """
+    def test_out_template_and_text_clobbers(self, tmp_path):
+        """`out` is `=&r` and returns its type; `{name}` is `${N}` (outputs
+        numbered first; `${N}` only before a digit), `$` is `$$`; registers the text names are
+        clobbered as their 64-bit register, in encoding order."""
+        ir = _ir(tmp_path, """
 fn inb(port: u16) -> u8
     var result: u8 = 0
-    asm x86_64:
+    asm x86_64 (out result):
         movw {port}, %dx
         inb %dx, %al
         movb %al, {result}
+        movq $1, %r11
     return result
+""")
+        assert ('call i8 asm sideeffect "movw $1, %dx\\0Ainb %dx, %al\\0Amovb %al, $0'
+                '\\0Amovq $$1, %r11", "=&r,r,~{rax},~{rdx},~{r11},' + self.TAIL + '"') in ir
+        assert "store i8" in ir
 
-fn main() -> i32
-    let x: u8 = inb(0x3F8)
-    0
-"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.ritz', delete=False) as f:
-            f.write(source)
-            src_path = f.name
-
-        try:
-            ll_path = src_path.replace('.ritz', '.ll')
-            ritz0_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(ritz0_dir)
-            result = run_ritz0([src_path, '-o', ll_path], cwd=project_root)
-            assert result.returncode == 0, f"Compilation failed: {result.stderr}"
-
-            # Check the generated IR
-            with open(ll_path) as f:
-                ir = f.read()
-            # Should have an output constraint (=r)
-            assert '=r' in ir, "Missing output constraint"
-            # The asm should return a value (call i8 asm)
-            assert 'call i8 asm' in ir, "Asm should return i8 for output operand"
-            # Should store the result back
-            assert 'store i8' in ir, "Missing store of output value"
-
-        finally:
-            os.unlink(src_path)
-            if os.path.exists(ll_path):
-                os.unlink(ll_path)
+    def test_wrong_target(self, tmp_path):
+        """An `asm x86_64` block on another target is refused at the name."""
+        src = tmp_path / "main.ritz"
+        src.write_text("fn f()\n    asm x86_64:\n        nop\n")
+        result = run_ritz0([str(src), "--target", "aarch64-unknown-linux-gnu",
+                            "-o", str(tmp_path / "main.ll")], cwd=str(tmp_path))
+        assert result.returncode != 0
+        assert ("main.ritz:2:9: asm block is for x86_64, but the target is "
+                "aarch64-unknown-linux-gnu") in result.stdout + result.stderr
 
 
 @pytest.mark.integration

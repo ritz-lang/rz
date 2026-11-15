@@ -421,6 +421,14 @@ class TypeChecker:
             self._loop_depth -= 1
             self._pop_scope()
 
+        elif isinstance(stmt, rast.AsmStmt):
+            # §18.6: an `out` or `inout` operand is an assignment of its
+            # place.  Scope, type and place are the emitter's (_emit_asm),
+            # which runs whether or not --check-types does.
+            for o in stmt.operands:
+                if o.direction in ('out', 'inout') and o.name in self.locals:
+                    self._check_write(rast.Ident(o.span, o.name))
+
         elif isinstance(stmt, rast.AssertStmt):
             cond_type = self._infer_type(stmt.condition)
             if not self._is_bool_or_opaque(cond_type):
