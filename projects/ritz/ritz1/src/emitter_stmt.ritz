@@ -30,6 +30,7 @@ import bool_check   # AGAST #2342
 import literal_slot # AGAST #2341
 import ref_check    # ref_array_error (AGAST #2343)
 import deref_field  # df_rewrite_stmt (AGAST #3015)
+import tail_value   # tail_stmts_diverge (AGAST #3323)
 
 # resolve_member_chain_field moved to emitter_core (AGAST #1660) so the
 # binary-op emitter can type enum-valued member operands too.
@@ -5469,6 +5470,11 @@ fn if_stmt_arm_ptr_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8) -> 
 # reports a move-only C there).  It read as the pointer, so a tail `if` typed
 # its phi i64 over `ptr`s.  if_stmt_arm_agg types it C.  It still goes through
 # emit_stmt, whose checks refuse it in a `-> @&C` fn.
+#
+# AGAST #3323: a `return` leaves its block terminated by `ret`, so a fresh
+# (unreachable) block is opened after it, as emit_match_arm_stmts does
+# (#1454): the arm's `br` to the merge and its phi incoming then name a block
+# that really branches there.
 fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32)
     let saved: *Stmt = s.if_arm_value
     var st: *Stmt = list
@@ -5477,7 +5483,32 @@ fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32)
             s.if_arm_value = st
         emit_stmt(s, st, ret_type)
         s.if_arm_value = saved
+        if st.kind == STMT_RETURN
+            begin_block(s, next_label(s))
+            clear_last_expr(s)
         st = st.next
+
+# AGAST #3323: an arm's phi incoming.  An arm that never reaches the merge (a
+# `return`, a `while true` with no `break`) has no value, but the phi still
+# names its block, so it gets IF_ARM_DIVERGES and the zero constant of the
+# phi's type: `if c / return a / else / b` as a fn tail.  Its merge was
+# `unreachable` with no phi, dropping the else value (a SIGSEGV).
+const IF_ARM_DIVERGES: i32 = -1
+
+fn if_stmt_arm_incoming(result: i32, list: *Stmt) -> i32
+    if result > 0
+        return result
+    if tail_stmts_diverge(list) == 1
+        return IF_ARM_DIVERGES
+    0
+
+fn emit_if_phi_incoming(s: *EmitterState, reg: i32, agg: *u8)
+    if reg != IF_ARM_DIVERGES
+        emit_reg(s, reg)
+    else if agg != null
+        emit_str(s, c"zeroinitializer")
+    else
+        emit_str(s, c"0")
 
 # AGAST #2563: the phi type a statement-`if` arm of struct type `agg` asks
 # for.  The Span$u8 / StrView pair (layout-equal, #168) takes the fn's return
@@ -5695,7 +5726,14 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # over `%B` locals, params, literals and calls.
         var phi_agg: *u8 = null
         var phi_agg_len: i32 = 0
-        if stmt.if_else != null and then_result > 0 and else_result > 0
+        # AGAST #3323: one arm may diverge; the other is the if's value.
+        if stmt.if_else != null
+            then_result = if_stmt_arm_incoming(then_result, stmt.if_then)
+            else_result = if_stmt_arm_incoming(else_result, stmt.if_else)
+            if then_result == IF_ARM_DIVERGES and else_result == IF_ARM_DIVERGES
+                then_result = 0   # both leave: no value reaches the merge
+                else_result = 0
+        if stmt.if_else != null and then_result != 0 and else_result != 0
             if ret_type == TYPE_STRUCT and s.ret_type_name_len > 0 and is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1
                 phi_agg = s.ret_type_name
                 phi_agg_len = s.ret_type_name_len
@@ -5708,7 +5746,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # AGAST #2559: publish it for an enclosing `if` ending in this one.
         s.last_if_stmt_agg_name = phi_agg
         s.last_if_stmt_agg_name_len = phi_agg_len
-        if stmt.if_else != null and then_result > 0 and else_result > 0
+        if stmt.if_else != null and then_result != 0 and else_result != 0
             let phi_reg: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, phi_reg)
@@ -5718,11 +5756,11 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             else
                 emit_str(s, c"i64")
             emit_str(s, c" [ ")
-            emit_reg(s, then_result)
+            emit_if_phi_incoming(s, then_result, phi_agg)
             emit_str(s, c", %")
             emit_label(s, then_exit_label)
             emit_str(s, c" ], [ ")
-            emit_reg(s, else_result)
+            emit_if_phi_incoming(s, else_result, phi_agg)
             emit_str(s, c", %")
             emit_label(s, else_exit_label)
             emit_str(s, c" ]\n")

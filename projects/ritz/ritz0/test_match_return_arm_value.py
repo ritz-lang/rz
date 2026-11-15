@@ -13,9 +13,10 @@ paired `Err`'s value with `Ok`'s `None` block, dropped it, and the tail
 returned a dummy 0. ritz1 got it right.
 
 Rows: Result and a plain enum, i64 and a struct result, in a fn tail and as
-a `let` initialiser, plus the same shape for `if`/`else` (already right in
-ritz0; ritz1's tail if/else is a gap, #3323). Each `main` runs both the returning and the
-yielding path, and every check exits with its own code.
+a `let` initialiser, plus the same shape for `if`/`else`: a returning then- or
+else-branch, an `else if` chain, a struct result (ritz1's tail if/else lost the
+value until #3323). Each `main` runs both the returning and the yielding path,
+and every check exits with its own code.
 """
 
 import pytest
@@ -107,6 +108,75 @@ PROGRAMS = {
         "        return 5\n"
         "    0\n"
     ),
+    # The value branch is the then-branch; the else returns.
+    "if_else_returning_else_tail": (
+        "fn g(c: bool, v: i64) -> i64\n"
+        "    if c\n"
+        "        v + 20\n"
+        "    else\n"
+        "        return v + 100\n"
+        "fn main() -> i32\n"
+        "    if g(true, 1) != 21\n"
+        "        return 4\n"
+        "    if g(false, 1) != 101\n"
+        "        return 5\n"
+        "    0\n"
+    ),
+    # An `else if` chain: the first branch returns, the rest yield.
+    "if_else_if_tail": (
+        "fn g(a: i32, v: i64) -> i64\n"
+        "    if a == 0\n"
+        "        return v + 100\n"
+        "    else if a == 1\n"
+        "        v + 20\n"
+        "    else\n"
+        "        v + 30\n"
+        "fn main() -> i32\n"
+        "    if g(0, 1) != 101\n"
+        "        return 4\n"
+        "    if g(1, 1) != 21\n"
+        "        return 5\n"
+        "    if g(2, 1) != 31\n"
+        "        return 6\n"
+        "    0\n"
+    ),
+    # An `else if` chain whose middle branch returns.
+    "if_else_if_middle_return_tail": (
+        "fn g(a: i32, v: i64) -> i64\n"
+        "    if a == 0\n"
+        "        v + 10\n"
+        "    else if a == 1\n"
+        "        return v + 100\n"
+        "    else\n"
+        "        v + 30\n"
+        "fn main() -> i32\n"
+        "    if g(0, 1) != 11\n"
+        "        return 4\n"
+        "    if g(1, 1) != 101\n"
+        "        return 5\n"
+        "    if g(2, 1) != 31\n"
+        "        return 6\n"
+        "    0\n"
+    ),
+    # A struct phi: the returning branch feeds it `zeroinitializer`.
+    "if_else_struct_tail": (
+        "struct P\n"
+        "    x: i64\n"
+        "    y: i64\n"
+        "fn g(c: bool, v: i64) -> P\n"
+        "    if c\n"
+        "        return P { x: v, y: 1 }\n"
+        "    else\n"
+        "        P { x: v + 20, y: 2 }\n"
+        "fn main() -> i32\n"
+        "    let a: P = g(true, 1)\n"
+        "    if a.x != 1 or a.y != 1\n"
+        "        return 4\n"
+        "    let b: P = g(false, 1)\n"
+        "    if b.x != 21 or b.y != 2\n"
+        "        return 5\n"
+        "    0\n"
+    ),
     "if_else_let_initialiser": (
         "fn g(c: bool, v: i64) -> i64\n"
         "    let n: i64 = if c\n"
@@ -124,12 +194,9 @@ PROGRAMS = {
 }
 
 
-# (name, compiler) -> ticket. ritz1's tail if/else ends its merge block in
-# `unreachable`, dropping the else value (SIGSEGV at runtime).
-GAPS = {
-    ("if_else_tail", "ritz1"): "#3323",
-    ("if_else_tail", "ritz1_selfhosted"): "#3323",
-}
+# (name, compiler) -> ticket. Empty: ritz1's tail if/else ended its merge
+# block in `unreachable`, dropping the else value, until #3323.
+GAPS = {}
 
 
 def _cases():
