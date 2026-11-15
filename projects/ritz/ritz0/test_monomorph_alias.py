@@ -95,22 +95,6 @@ fn main() -> i32
     assert "Box$Pair_Id" not in names
 
 
-def test_union_alias_keeps_its_name():
-    """A union alias is nominal in ritz0 (its own LLVM struct), not a spelling."""
-    names = _names("""
-type IU = i32 | i64
-
-fn one<T>(x: T) -> T
-    x
-
-fn main() -> i32
-    let v: IU = 1 as i32
-    one<IU>(v)
-    0
-""")
-    assert "one$IU" in names
-
-
 def test_alias_table_does_not_outlive_the_pass():
     monomorphize(parse("type Id = u32\n\nfn main() -> i32\n    0\n"))
     assert mangle_type_name(rast.NamedType(None, "Id", [])) == "Id"

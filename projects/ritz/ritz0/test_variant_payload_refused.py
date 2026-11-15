@@ -9,8 +9,9 @@ every value of that variant:
         Some(0) => 1
         _ => 2          # f(Some(5)) gave 1
 
-Compiling the test is #1291's decision tree. Until then ritz0 refuses a literal or
-a type there, at the pattern. The expected exit codes below come from what each
+Compiling the test is #1291's decision tree. Until then ritz0 refuses a literal
+there, at the pattern. A type there is no pattern at all since LARB R52 (#3409):
+ritz0's parser refuses it at the pattern. The expected exit codes below come from what each
 program says, not from a compiler.
 
 ritz1's grammar takes only a name there, so it refuses every literal with a parse
@@ -130,6 +131,7 @@ LITERALS = {
 }
 
 # A type names no value here: `Some(bool)` took an `Option<i32>`'s every `Some`.
+# Since LARB R52 (#3409) a type isn't a pattern: ritz0's parser says so there.
 TYPES = {
     "matching_type": (_opt("i32", "Some(i32)", "5"), 3, 14, "i32", "Some"),
     "other_type": (_opt("i32", "Some(bool)", "5"), 3, 14, "bool", "Some"),
@@ -258,7 +260,7 @@ NAMES_ON_BOTH = {
                         6, 14, "K", "Some"),
 }
 
-REFUSED = {**LITERALS, **TYPES}
+REFUSED = dict(LITERALS)
 
 # name -> (source, exit code). Each is a binding or `_`, so each must still run.
 KEPT = {
@@ -413,6 +415,17 @@ def test_ritz0_refuses_a_payload_that_tests(tmp_path, name):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(TYPES))
+def test_ritz0_refuses_a_type_in_a_payload(tmp_path, name):
+    source, line, col, _, _ = TYPES[name]
+    proc, ll = _ritz0(tmp_path, source)
+    out = proc.stdout + proc.stderr
+    hits = re.findall(rf"unit\.ritz:{line}:{col}: a type isn't a pattern$", out, re.M)
+    assert proc.returncode != 0 and len(hits) == 1, f"{name}:\n{out[-1500:]}"
+    assert not ll.exists(), f"ritz0 wrote IR for {name}"
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(KEPT))
 def test_ritz0_still_runs_a_payload_that_binds(tmp_path, name):
     source, code = KEPT[name]
@@ -436,7 +449,7 @@ def test_a_nested_variant_keeps_its_own_message(tmp_path):
 @pytest.mark.parametrize("name", sorted({**LITERALS, **TYPES}))
 def test_ritz1_cannot_parse_a_payload_that_tests(request, tmp_path, compiler, name):
     """Goes red when ritz1 learns one, which must then refuse it or compile it."""
-    proc, ll = _ritz1(request, compiler, tmp_path, REFUSED[name][0])
+    proc, ll = _ritz1(request, compiler, tmp_path, {**LITERALS, **TYPES}[name][0])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0 and "Parse error" in out, f"{compiler}, {name}:\n{out[-800:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name}"

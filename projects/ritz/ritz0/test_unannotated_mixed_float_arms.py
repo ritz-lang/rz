@@ -116,21 +116,6 @@ fn main() -> i32
     return f(0)
 """
 
-# _emit_union_match.
-UNION_MATCH = """\
-type IntOrStr = i32 | *u8
-
-fn f(v: IntOrStr) -> i32
-    let a = match v
-        *u8 => 1.5
-        i32 => 2
-    return a as i32
-
-fn main() -> i32
-    let x: i32 = 5
-    return f(x as IntOrStr)
-"""
-
 REFUSED = [
     # (program, line of the offending if / match)
     pytest.param(IF_INT_THEN_FLOAT, 2, id="if-int-then-float"),
@@ -140,7 +125,6 @@ REFUSED = [
     pytest.param(FN_TAIL, 2, id="fn-tail"),
     pytest.param(ENUM_MATCH, 4, id="enum-match"),
     pytest.param(INTEGER_MATCH, 2, id="integer-match"),
-    pytest.param(UNION_MATCH, 4, id="union-match"),
 ]
 
 # --- accepted ----------------------------------------------------------------
@@ -183,24 +167,6 @@ fn g(c: i32)
 
 fn main() -> i32
     g(0)
-    return 42
-"""
-
-# The union match under a float annotation merges at it, as the enum and
-# integer matches already do (#2027): the refusal's advice must hold there.
-UNION_MATCH_ANNOTATED = """\
-type IntOrStr = i32 | *u8
-
-fn f(v: IntOrStr) -> f64
-    let a: f64 = match v
-        *u8 => 1.5
-        i32 => 2
-    return a
-
-fn main() -> i32
-    let x: i32 = 5
-    if f(x as IntOrStr) != 2.0
-        return 1
     return 42
 """
 
@@ -298,7 +264,6 @@ fn main() -> i32
 ACCEPTED = [
     pytest.param(STATEMENT_POSITION, id="statement-position"),
     pytest.param(PROCEDURE_TAIL, id="procedure-tail"),
-    pytest.param(UNION_MATCH_ANNOTATED, id="union-match-annotated"),
     pytest.param(RETURN_HINT, id="return-hint"),
     pytest.param(TAIL_HINT, id="tail-hint"),
     pytest.param(PARAM_HINT, id="param-hint"),

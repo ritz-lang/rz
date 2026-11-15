@@ -277,10 +277,6 @@ class TestRoundThree:
         src = "fn f() -> i32\n    let g = |x| x + 1\n    0\n"
         assert names(src) == [] and types(src) == []
 
-    def test_union_alias_accepts_itself(self):
-        src = "type N = i32 | bool\n\nfn f(a: N) -> i32\n    let b: N = a\n    0\n"
-        assert types(src) == []
-
     def test_variant_constructor_through_enum_name(self):
         assert types(ENUM + "fn f() -> Color\n    Color.Green(1)\n") == []
 
@@ -308,10 +304,6 @@ class TestRoundThree:
         src = ("async fn get() -> i32\n    1\n\n"
                "fn f() -> i32\n    var p: get_Future = get()\n    0\n")
         assert types(src) == []
-
-    def test_union_type_members_are_resolved(self):
-        module = parse("fn f(a: i32 | Nope) -> i32\n    0\n")
-        assert any("Nope" in str(e) for e in resolve_names(module))
 
 
 class TestMutationSurvivors:

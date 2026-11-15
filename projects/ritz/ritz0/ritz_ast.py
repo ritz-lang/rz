@@ -143,12 +143,6 @@ def make_slice_type(span: 'Span', inner: Type) -> 'NamedType':
 
 
 @dataclass
-class UnionType(Type):
-    """A union type: A | B | C (tagged union)."""
-    variants: List[Type]
-
-
-@dataclass
 class ArrayType(Type):
     """A fixed-size array type: [N]T.
 
@@ -656,12 +650,6 @@ class StructPattern(Pattern):
     """Struct pattern: Point { x, y }."""
     name: str
     fields: List[tuple[str, Pattern]]
-
-
-@dataclass
-class TypePattern(Pattern):
-    """Type pattern for matching union variants: i32, *u8, etc."""
-    type: Type
 
 
 # ============================================================================

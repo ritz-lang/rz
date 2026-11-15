@@ -810,15 +810,11 @@ class LLVMEmitter:
         # Per open loop: len(_temp_frames) at the loop (see _loop_drop_depth).
         self._loop_temp_depth: List[int] = []
 
-        # Type aliases: name -> Ritz type (for resolving union types)
+        # Type aliases: name -> Ritz type
         self.type_aliases: Dict[str, rast.Type] = {}
-        # Union types: name -> (LLVM struct type, list of variant types)
-        # Union layout: { i8 tag, [max_size x i8] data }
-        self.union_types: Dict[str, Tuple[ir.BaseStructType, List[rast.Type]]] = {}
 
         # Enum types: name -> (LLVM struct type, list of Variant objects)
         # Enum layout: { i8 tag, [max_size x i8] data }
-        # Unlike union_types, enums have named variants with optional payloads
         self.enum_types: Dict[str, Tuple[ir.BaseStructType, List[rast.Variant]]] = {}
         # Variant to enum mapping: variant_name -> enum_name
         # Used to resolve variant constructors like Some(x) -> Option_i32
@@ -1086,8 +1082,6 @@ class LLVMEmitter:
         """Size of `ty`, or None if it names a type that doesn't exist."""
         ty = resolve_alias_in(ty, self.type_aliases)
         if isinstance(ty, rast.NamedType):
-            if ty.name in self.union_types and not ty.args:
-                return self._type_size_bytes(self.union_types[ty.name][0])
             known = (ty.name in self._SIZEOF_PRIMITIVES
                      or ty.args
                      or self._struct_layout_on_demand(ty.name) is not None
@@ -1112,8 +1106,6 @@ class LLVMEmitter:
             # access.
             if ty.args:
                 specialized_name = self._get_specialized_type_name(ty)
-                if specialized_name in self.union_types:
-                    return self.union_types[specialized_name][0]
                 if specialized_name in self.enum_types:
                     return self.enum_types[specialized_name][0]
                 if specialized_name in self.struct_types:
@@ -1164,9 +1156,6 @@ class LLVMEmitter:
                 if self.current_fn_def:
                     self.simd_functions.add(self.current_fn_def.name)
                 return simd_types[ty.name]
-            # Check for union types (type aliases to UnionType)
-            if ty.name in self.union_types:
-                return self.union_types[ty.name][0]
             # Check for enum types
             if ty.name in self.enum_types:
                 return self.enum_types[ty.name][0]
@@ -1178,8 +1167,6 @@ class LLVMEmitter:
             # struct registry uses '$' (Vec$u8). Try the dollar-form variant.
             if '_' in ty.name and '$' not in ty.name:
                 legacy_name = ty.name.replace('_', '$', 1)
-                if legacy_name in self.union_types:
-                    return self.union_types[legacy_name][0]
                 if legacy_name in self.enum_types:
                     return self.enum_types[legacy_name][0]
                 if legacy_name in self.struct_types:
@@ -1191,7 +1178,7 @@ class LLVMEmitter:
             # enum payload at 1 byte instead of 16 and corrupt the ABI.
             if ty.name == 'StrView':
                 return self._ensure_strview_type()
-            # A non-union alias is its target: `type Handler = fn(..)` lowers
+            # An alias is its target: `type Handler = fn(..)` lowers
             # to the fn pointer, not to the i8 placeholder (AGAST #1879 -- a
             # `let f: Handler` slot was one byte wide).
             if ty.name in self.type_aliases and not ty.args:
@@ -1210,18 +1197,6 @@ class LLVMEmitter:
         elif isinstance(ty, rast.ArrayType):
             inner = self._ritz_type_to_llvm(ty.inner)
             return ir.ArrayType(inner, ty.size)
-        elif isinstance(ty, rast.UnionType):
-            # Anonymous union type - compute layout
-            # Union layout: { i8 tag, [max_size x i8] data }
-            max_size = 0
-            for variant in ty.variants:
-                llvm_ty = self._ritz_type_to_llvm(variant)
-                size = self._type_size_bytes(llvm_ty)
-                if size > max_size:
-                    max_size = size
-            # Create struct with tag (i8) and data buffer
-            data_array = ir.ArrayType(self.i8, max_size)
-            return ir.LiteralStructType([self.i8, data_array])
         elif isinstance(ty, rast.FnType):
             # Function pointer type: fn(T1, T2, ...) -> R
             # Compiles to LLVM function pointer
@@ -2674,10 +2649,9 @@ class LLVMEmitter:
         # Alias targets are needed by the struct bodies below: a field typed
         # `*Pair<Id>` (a specialization substituting T = Pair<Id>) must lower
         # to Pair$u32, so the generic-name suffix must already see `Id`
-        # (AGAST #2049).  Union aliases get their LLVM type further down.
+        # (AGAST #2049).
         for item in module.items:
-            if (isinstance(item, rast.TypeAlias)
-                    and not isinstance(item.target, rast.UnionType)):
+            if isinstance(item, rast.TypeAlias):
                 self.type_aliases[item.name] = item.target
 
         # Second pass: define struct bodies, then enum bodies.
@@ -3677,57 +3651,8 @@ class LLVMEmitter:
         return self.builder.load(enum_alloca)
 
     def _process_type_alias(self, type_alias: rast.TypeAlias):
-        """Process a type alias, creating union types as needed.
-
-        For union types (A | B | C), creates:
-        - Named LLVM struct type with layout: { i8 tag, [max_size x i8] data }
-        - Stores variant information for later cast/match operations
-        """
+        """Record a type alias: it names its target (LANGUAGE_SPEC §3.8)."""
         self.type_aliases[type_alias.name] = type_alias.target
-
-        if isinstance(type_alias.target, rast.UnionType):
-            # Calculate max size of all variants
-            max_size = 0
-            variants = type_alias.target.variants
-            for variant in variants:
-                llvm_ty = self._ritz_type_to_llvm(variant)
-                size = self._type_size_bytes(llvm_ty)
-                if size > max_size:
-                    max_size = size
-
-            # Create named struct type for this union
-            unique_name = f"union.{self.module.name}.{type_alias.name}"
-            union_type = self.module.context.get_identified_type(unique_name)
-            # Layout: { i8 tag, [max_size x i8] data }
-            data_array = ir.ArrayType(self.i8, max_size)
-            union_type.set_body(self.i8, data_array)
-
-            # Store union info
-            self.union_types[type_alias.name] = (union_type, variants)
-
-    def _get_union_tag_for_type(self, union_name: str, variant_type: rast.Type) -> int:
-        """Get the tag index for a variant type in a union."""
-        if union_name not in self.union_types:
-            raise ValueError(f"Unknown union type: {union_name}")
-        _, variants = self.union_types[union_name]
-        for i, variant in enumerate(variants):
-            if self._types_equal(variant, variant_type):
-                return i
-        raise ValueError(f"Type {variant_type} is not a variant of union {union_name}")
-
-    def _types_equal(self, a: rast.Type, b: rast.Type) -> bool:
-        """Check if two Ritz types are equal."""
-        if type(a) != type(b):
-            return False
-        if isinstance(a, rast.NamedType):
-            return a.name == b.name
-        if isinstance(a, rast.PtrType):
-            return a.mutable == b.mutable and self._types_equal(a.inner, b.inner)
-        if isinstance(a, rast.RefType):
-            return a.mutable == b.mutable and self._types_equal(a.inner, b.inner)
-        if isinstance(a, rast.ArrayType):
-            return a.size == b.size and self._types_equal(a.inner, b.inner)
-        return False
 
     def _process_trait(self, trait_def: rast.TraitDef):
         """Process a trait definition.
@@ -11890,7 +11815,6 @@ class LLVMEmitter:
             or name in self.functions
             or name in self.struct_types
             or name in self.enum_types
-            or name in self.union_types
         )
 
     def _is_module_item(self, qualifier: str, name: str) -> bool:
@@ -15465,9 +15389,8 @@ class LLVMEmitter:
     def _emit_match(self, expr: rast.Match) -> ir.Value:
         """Emit a match expression.
 
-        For union types with TypePattern arms, generates a switch on the tag.
         For enum types with VariantPattern arms, generates a switch on the tag.
-        Each arm extracts the appropriate type from the union/enum data.
+        Each arm extracts the appropriate type from the enum data.
         """
         # A bare constructor names its enum by its payload alone (#2433).
         built = self._emit_bare_ctor_scrutinee(expr)
@@ -15476,11 +15399,6 @@ class LLVMEmitter:
 
         # Emit the match expression
         match_val = self._emit_expr(expr.expr)
-
-        # Check if matching on a union type
-        union_name = self._get_union_name_from_expr(expr.expr)
-        if union_name and union_name in self.union_types:
-            return self._emit_union_match(expr, match_val, union_name)
 
         # Check if matching on an enum type. `match @place` (angelo's
         # `match @self.cmap`) matches the enum the borrow addresses:
@@ -15918,130 +15836,6 @@ class LLVMEmitter:
             phi.add_incoming(val, block)
         return phi
 
-    def _emit_union_match(self, expr: rast.Match, union_val: ir.Value, union_name: str) -> ir.Value:
-        """Emit a match on a union type with TypePattern arms."""
-        union_type, variants = self.union_types[union_name]
-        self._refuse_pattern_kind(expr, rast.VariantPattern, rast.LitPattern)
-        self._refuse_arm_names(expr, lambda name: False)
-        self._require_covered(expr, match_coverage.union_gap(
-            expr.arms, variants, self._types_equal, type_to_string))
-        self._require_reachable(
-            expr, lambda arms: match_coverage.union_gap(
-                arms, variants, self._types_equal, type_to_string),
-            match_coverage.union_test(type_to_string))
-
-        # Store union to memory so we can extract tag and data
-        union_alloca = self.builder.alloca(union_type, name="match.union")
-        self.builder.store(union_val, union_alloca)
-
-        # Load the tag
-        tag_ptr = self.builder.gep(union_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-        tag = self.builder.load(tag_ptr)
-
-        # Create blocks for each arm and the merge block
-        arm_blocks = []
-        for i, arm in enumerate(expr.arms):
-            block = self.current_fn.append_basic_block(f"match.arm.{i}")
-            arm_blocks.append(block)
-
-        merge_block = self.current_fn.append_basic_block("match.merge")
-
-        # Create an unreachable default block (should never be reached in well-typed code)
-        unreachable_block = self.current_fn.append_basic_block("match.unreachable")
-        default_block = unreachable_block
-
-        # Build switch instruction
-        switch = self.builder.switch(tag, default_block)
-
-        # Add cases for each TypePattern arm
-        arm_values = []
-        arm_exit_blocks = []
-
-        for i, (arm, arm_block) in enumerate(zip(expr.arms, arm_blocks)):
-            pattern = arm.pattern
-
-            if isinstance(pattern, rast.TypePattern):
-                # Find the tag for this type
-                tag_val = self._get_union_tag_for_type(union_name, pattern.type)
-                switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
-            elif isinstance(pattern, rast.WildcardPattern):
-                # Wildcard matches any remaining - becomes default
-                switch.default = arm_block
-            else:
-                raise NotImplementedError(f"Pattern type {type(pattern)} not supported in union match")
-
-        # Emit the unreachable block
-        self.builder.position_at_end(unreachable_block)
-        self.builder.unreachable()
-
-        # Emit each arm body
-        for i, (arm, arm_block) in enumerate(zip(expr.arms, arm_blocks)):
-            self.builder.position_at_end(arm_block)
-
-            # Emit the arm body (which may include casts like `x as i32`)
-            # A `return` inside one arm must not leak has_returned past
-            # the match — _emit_if saves/restores per branch; matches must
-            # too, or the function's trailing expression is skipped and the
-            # merge block is left empty and unterminated (AGAST #1321,
-            # angelo loader/ttf.ritz). Reset per arm, recombined at merge.
-            _saved_arm_returned = self.has_returned
-            self.has_returned = False
-            arm_val = self._emit_expr_with_expected_enum(
-                arm.body, getattr(self, '_expected_enum_name', None))
-            self.has_returned = _saved_arm_returned
-            self._end_diverging_arm(arm.body)
-            arm_values.append(arm_val)
-
-            # Remember which block we're in after emitting the body
-            if not self.builder.block.is_terminated:
-                arm_exit_blocks.append(self.builder.block)
-                self.builder.branch(merge_block)
-            else:
-                arm_exit_blocks.append(None)
-
-        # Position at merge block
-        self.builder.position_at_end(merge_block)
-        # The function has definitively returned only if *every* arm
-        # terminated (nothing reaches the merge block). Otherwise control
-        # continues here and later statements/tail must still be emitted.
-        if arm_exit_blocks and all(b is None for b in arm_exit_blocks):
-            self.has_returned = True
-
-        # Create phi node for the result if arms have values
-        if arm_values and arm_exit_blocks:
-            # Filter out terminated blocks (those that returned)
-            incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
-            # A live arm yielding ir.Undefined (a block ending in a statement,
-            # or a unit-typed `?`) makes the match a statement, not a value —
-            # ir.Undefined cannot be a phi incoming, it has no reference.
-            # AGAST #1321 (angelo hinting interpreter: opcode-dispatch match
-            # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
-            if any(val is ir.Undefined for val, _ in incoming):
-                return ir.Undefined
-            # A float-annotated initialiser fixes the merge type, as in the
-            # enum and integer matches (#2027); unannotated int + float arms
-            # are refused if used (#2094).
-            merged = self._merge_float_arms(expr, incoming) if incoming else None
-            if merged is not None:
-                return merged
-            # Irreconcilable arm types (e.g. an assignment arm yielding its
-            # enum value next to a `pass` arm's dummy i32 0) mean nobody can
-            # consume this match as a value: it is a statement. Building a
-            # phi would put an integer constant into an enum-typed phi —
-            # invalid IR (AGAST #1321, angelo font.ritz ensure_cmap).
-            # All-integer mixes are fine: they widen below / convert.
-            if incoming and not all(
-                    v.type == incoming[0][0].type
-                    or (isinstance(v.type, ir.IntType)
-                        and isinstance(incoming[0][0].type, ir.IntType))
-                    for v, _ in incoming):
-                return ir.Undefined
-            if incoming:
-                return self._merge_match_arms(incoming)
-
-        # Return a dummy value if no arms produce values
-        return ir.Constant(self.i32, 0)
-
     def _emit_enum_match(self, expr: rast.Match, enum_val: ir.Value, enum_name: str) -> ir.Value:
         """Emit a match on an enum type with VariantPattern arms.
 
@@ -16292,17 +16086,15 @@ class LLVMEmitter:
     # What each pattern kind tests, for the error when the scrutinee isn't one.
     _PATTERN_NEEDS: ClassVar[dict[type, str]] = {
         rast.VariantPattern: "a variant pattern needs an enum scrutinee",
-        rast.TypePattern: "a type pattern needs a union scrutinee",
         rast.LitPattern: "a literal pattern needs an integer scrutinee"}
 
     def _refuse_pattern_kind(self, expr: rast.Match, *kinds: type) -> None:
         """Refuse an arm whose pattern can't test this scrutinee (AGAST #2409).
 
-        The integer switch has a case only for a literal or a const, and the
-        union one only for a type, so `Some(v)` on an i64 was an arm no value
-        reached and `match n` gave the next one, silently. Like `true` on an
-        integer (#2344), it is the wrong kind of pattern, said at the pattern.
-        A literal on an enum or a union raised an unlocated NotImplementedError
+        The integer switch has a case only for a literal or a const, so
+        `Some(v)` on an i64 was an arm no value reached and `match n` gave the
+        next one, silently. Like `true` on an integer (#2344), it is the wrong
+        kind of pattern, said at the pattern. A literal on an enum raised an unlocated NotImplementedError
         (#3002); a `true` there says what #2344 says, as ritz1 does.
         """
         for arm in expr.arms:
@@ -16367,8 +16159,6 @@ class LLVMEmitter:
         # variant before anything was emitted (AGAST #2407).
         if isinstance(field_pattern, (rast.WildcardPattern, rast.IdentPattern)):
             return None
-        if isinstance(field_pattern, rast.TypePattern):
-            return self._type_to_str(field_pattern.type)
         value = getattr(field_pattern, 'value', None)
         if isinstance(value, bool):
             return 'true' if value else 'false'
@@ -16486,7 +16276,7 @@ class LLVMEmitter:
                 raise EmitError("a `true` or `false` pattern needs a bool scrutinee",
                                 arm.pattern.span)
         self._resolve_module_consts(expr)
-        self._refuse_pattern_kind(expr, rast.VariantPattern, rast.TypePattern)
+        self._refuse_pattern_kind(expr, rast.VariantPattern)
         # A name that is an integer `const` compares (§8.2); a float or bool
         # one would bind, and can't (AGAST #2407).
         self._refuse_arm_names(expr, self._is_integer_const)
@@ -16877,7 +16667,7 @@ class LLVMEmitter:
         nested generic NamedType, which keeps the `Base$args` name its struct
         is registered under. There is no `str(ty)` fallback: it embeds the
         source span, so one type written at two places got two names
-        (AGAST #1321 for tuples, #2742 for fn/ref/array/vector/union).
+        (AGAST #1321 for tuples, #2742 for fn/ref/array/vector).
         """
         ty = resolve_alias_in(ty, self.type_aliases)
         suffix = self._type_to_name_suffix
@@ -16904,9 +16694,6 @@ class LLVMEmitter:
             return f"fn{len(ty.params)}{params}_ret_{ret}"
         elif isinstance(ty, rast.VectorType):
             return f"vec{ty.count}_{suffix(ty.inner)}"
-        elif isinstance(ty, rast.UnionType):
-            variants = "_".join(suffix(v) for v in ty.variants)
-            return f"union{len(ty.variants)}_{variants}"
         raise TypeError(
             f"_type_to_name_suffix: no spelling for {type(ty).__name__}")
 
@@ -17019,19 +16806,8 @@ class LLVMEmitter:
         type information for subsequent operations (e.g., field access
         on cast pointers).
         """
-        # Check if casting TO a union type
-        if isinstance(expr.target, rast.NamedType) and expr.target.name in self.union_types:
-            return self._emit_cast_to_union(expr)
-
-        # Check if casting FROM a union type to a variant type
-        # This happens in match arms: x as i32, x as *u8, etc.
         self._literal_into_slot(expr.target, expr.expr, fit=False)
         val = self._emit_into_array_slot(expr.expr, expr.target)
-
-        # Check if the source expression's type is a union
-        src_union_name = self._get_union_name_from_expr(expr.expr)
-        if src_union_name and src_union_name in self.union_types:
-            return self._emit_cast_from_union(val, src_union_name, expr.target)
 
         target_type = self._ritz_type_to_llvm(expr.target)
 
@@ -17257,31 +17033,6 @@ class LLVMEmitter:
                                          result)
         return result
 
-    def _get_union_name_from_expr(self, expr: rast.Expr) -> Optional[str]:
-        """Get the union type name if the expression has a union type."""
-        if isinstance(expr, rast.Ident):
-            name = expr.name
-            # Check locals (var bindings)
-            if name in self.locals:
-                alloca, ty = self.locals[name]
-                # Check if ty is a union type
-                for union_name, (union_ty, _) in self.union_types.items():
-                    if ty == union_ty:
-                        return union_name
-            # Check params (let bindings and function parameters)
-            if name in self.params:
-                val, ty = self.params[name]
-                # Check if ty is a union type
-                for union_name, (union_ty, _) in self.union_types.items():
-                    if ty == union_ty:
-                        return union_name
-            # Check ritz_types for declared type
-            if name in self.ritz_types:
-                ritz_ty = self.ritz_types[name]
-                if isinstance(ritz_ty, rast.NamedType) and ritz_ty.name in self.union_types:
-                    return ritz_ty.name
-        return None
-
     def _get_enum_name_from_expr(self, expr: rast.Expr) -> Optional[str]:
         """Get the enum type name if the expression has an enum type."""
         if isinstance(expr, rast.Ident):
@@ -17363,60 +17114,6 @@ class LLVMEmitter:
                 return inferred.name
         return None
 
-    def _emit_cast_to_union(self, expr: rast.Cast) -> ir.Value:
-        """Emit a cast from a value to a union type: 42 as IntOrStr."""
-        union_name = expr.target.name
-        union_type, variants = self.union_types[union_name]
-
-        # Emit the source value
-        val = self._emit_expr(expr.expr)
-        val_type = val.type
-
-        # Find which variant this value matches (by looking at the LLVM type)
-        tag = -1
-        matched_variant = None
-        for i, variant in enumerate(variants):
-            llvm_variant_ty = self._ritz_type_to_llvm(variant)
-            if val_type == llvm_variant_ty:
-                tag = i
-                matched_variant = variant
-                break
-
-        if tag == -1:
-            raise ValueError(f"Cannot cast value of type {val_type} to union {union_name}")
-
-        # Create the union value on stack
-        # Allocate space for the union
-        union_alloca = self.builder.alloca(union_type, name="union.tmp")
-
-        # Store the tag
-        tag_ptr = self.builder.gep(union_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-        self.builder.store(ir.Constant(self.i8, tag), tag_ptr)
-
-        # Store the data - bitcast the data pointer to the variant type
-        data_ptr = self.builder.gep(union_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)])
-        # Cast data buffer to pointer to variant type
-        variant_ptr = self.builder.bitcast(data_ptr, ir.PointerType(val_type))
-        self.builder.store(val, variant_ptr)
-
-        # Load and return the union value
-        return self.builder.load(union_alloca)
-
-    def _emit_cast_from_union(self, union_val: ir.Value, union_name: str, target_type: rast.Type) -> ir.Value:
-        """Emit a cast from a union value to a variant type: x as i32."""
-        union_type, variants = self.union_types[union_name]
-        target_llvm_type = self._ritz_type_to_llvm(target_type)
-
-        # Store union to memory so we can extract from it
-        union_alloca = self.builder.alloca(union_type, name="union.extract")
-        self.builder.store(union_val, union_alloca)
-
-        # Get pointer to data buffer and bitcast to target type
-        data_ptr = self.builder.gep(union_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 1)])
-        variant_ptr = self.builder.bitcast(data_ptr, ir.PointerType(target_llvm_type))
-
-        # Load and return the value
-        return self.builder.load(variant_ptr)
 
 def filter_by_target_os(module: rast.Module, target_os: str) -> rast.Module:
     """Filter out items that don't match the target OS.

@@ -616,13 +616,12 @@ class TestStubIREquivalence:
         """Test a level that imports structs (not just functions)."""
         from import_resolver import resolve_imports
 
-        test_dir = Path(__file__).parent / "test"
-        for level_name in ["test_level24.ritz", "test_level30.ritz"]:
-            test_file = test_dir / level_name
-            if test_file.exists():
-                break
-        else:
-            pytest.skip("No struct-importing test level found")
+        # test_level32 imports ritzlib.box's Box struct.  This used to try
+        # test_level24 first, which imports nothing, so the check was vacuous;
+        # it went with union types (#3409).  Most other levels with imports
+        # differ in debug-metadata numbering (AGAST #3422).
+        level_name = "test_level32.ritz"
+        test_file = Path(__file__).parent / "test" / level_name
 
         source = test_file.read_text()
         source_path = str(test_file)

@@ -6,11 +6,12 @@ with no value, which made the match read as a statement:
 
 * an integer match in a `-> T` tail was refused as "trailing expression
   produces no value" (test_fn_tail_requires_value.py has those rows), and
-* an enum or union match next to an arm with a value fell back to a dummy
+* an enum match next to an arm with a value fell back to a dummy
   `i32 0`, so `f(E.A)` below silently returned 0 instead of 7.
 
-One row per match emitter (integer, enum, union), each run so the value is
-the one checked, not just that it compiles. ritz1 has no unions.
+One row per match emitter (integer, enum), each run so the value is the one
+checked, not just that it compiles. The union row went with union types
+(LARB R52, AGAST #3409).
 """
 
 import os
@@ -68,19 +69,6 @@ PROGRAMS = {
         "    f(E.A, 0) as i32\n", 7),
 }
 
-RITZ0_ONLY = {
-    "union_match": (
-        "type U = i64 | bool\n"
-        "fn f(x: U, n: i64) -> i64\n"
-        "    match x\n"
-        "        i64 => 7\n"
-        "        bool =>\n" + _LOOP_ARM
-        + "fn main() -> i32\n"
-        "    let x: U = 42 as U\n"
-        "    f(x, 0) as i32\n", 7),
-}
-
-
 def _run(compiler, tmp_path, src):
     path = tmp_path / "t.ritz"
     path.write_text(src)
@@ -110,9 +98,3 @@ def _run(compiler, tmp_path, src):
 def test_the_value_arm_of_a_match_with_an_endless_loop_arm(tmp_path, compiler, name):
     src, want = PROGRAMS[name]
     assert _run(compiler, tmp_path, src) == want
-
-
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY))
-def test_the_value_arm_of_a_union_match_with_an_endless_loop_arm(tmp_path, name):
-    src, want = RITZ0_ONLY[name]
-    assert _run("ritz0", tmp_path, src) == want

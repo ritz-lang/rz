@@ -2050,12 +2050,6 @@ class TypeChecker:
                     and other.name in ('f32', 'f64'):
                 return True
 
-        # A union takes itself and each of its members
-        if isinstance(expected, rast.UnionType):
-            if isinstance(actual, rast.UnionType):
-                return all(self._types_compatible(m, expected) for m in actual.variants)
-            return any(self._types_compatible(actual, m) for m in expected.variants)
-
         # Null is compatible with any pointer type
         if isinstance(actual, rast.NamedType) and actual.name == 'null':
             return isinstance(expected, (rast.PtrType, rast.RefType)) or \
@@ -2165,8 +2159,6 @@ class TypeChecker:
             return f"@{self._type_str(ty.inner)}"
         elif isinstance(ty, rast.ArrayType):
             return f"[{ty.size}]{self._type_str(ty.inner)}"
-        elif isinstance(ty, rast.UnionType):
-            return ' | '.join(self._type_str(v) for v in ty.variants)
         elif isinstance(ty, rast.FnType):
             params = ', '.join(self._type_str(p) for p in ty.params)
             return f"fn({params}) -> {self._type_str(ty.ret)}"

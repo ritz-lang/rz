@@ -255,8 +255,6 @@ class MoveTypes:
             return self.is_move_only(ty.inner)
         if isinstance(ty, rast.TupleType):
             return any(self.is_move_only(t) for t in ty.elements)
-        if isinstance(ty, rast.UnionType):
-            return any(self.is_move_only(t) for t in ty.variants)
         # Pointers, references, fn types, SIMD vectors: copies.
         return False
 
@@ -270,8 +268,6 @@ class MoveTypes:
             return self.holds_reference(ty.inner, seen)
         if isinstance(ty, rast.TupleType):
             return any(self.holds_reference(t, seen) for t in ty.elements)
-        if isinstance(ty, rast.UnionType):
-            return any(self.holds_reference(t, seen) for t in ty.variants)
         if not isinstance(ty, rast.NamedType) or self._is_param(ty):
             return False
         seen = set() if seen is None else seen
@@ -336,8 +332,6 @@ def _type_key(ty: rast.Type) -> str:
         return f"[{ty.size}]{_type_key(ty.inner)}"
     if isinstance(ty, rast.TupleType):
         return f"({','.join(_type_key(t) for t in ty.elements)})"
-    if isinstance(ty, rast.UnionType):
-        return '|'.join(_type_key(t) for t in ty.variants)
     if isinstance(ty, (rast.PtrType, rast.RefType)):
         return f"*{_type_key(ty.inner)}"
     return type(ty).__name__

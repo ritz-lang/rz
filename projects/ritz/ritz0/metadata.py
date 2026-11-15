@@ -144,9 +144,6 @@ def type_to_string(t: rast.Type) -> str:
         ret = type_to_string(t.ret) if t.ret else "void"
         return f"fn({params}) -> {ret}"
 
-    elif isinstance(t, rast.UnionType):
-        return " | ".join(type_to_string(v) for v in t.variants)
-
     return str(t)
 
 

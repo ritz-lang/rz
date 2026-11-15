@@ -5,7 +5,7 @@ Before this, `f(5)` matching no arm gave 2 on ritz0 (LLVM folded the unreachable
 switch default into the last arm) and 0 on ritz1 (a zero fallthrough), silently.
 
 Covered means an unguarded `_` or binding; every variant of an enum; `true` and
-`false`; or every member of a union. An integer needs a catch-all. Every table
+`false`. An integer needs a catch-all. Every table
 here goes through ritz0, ritz1 and ritz1_selfhosted, which must give the same
 located error, naming what is missing.
 
@@ -206,12 +206,10 @@ UNTYPED_BUT_COVERED = {
             "        None => 9\n", 3),
 }
 
-# ritz1 parses none of these patterns or types; RITZ1_CANNOT_PARSE pins that.
+# ritz1 parses none of these; RITZ1_CANNOT_PARSE pins that.
 REJECTED_RITZ0_ONLY = {
     "value_call_argument": ("fn id(v: i64) -> i64\n    v\n" + _int_fn(
         "    id(match n\n        0 => 1\n    )\n"), 4, 8, _CATCH_ALL),
-    "union_member_missing": ("type U = i64 | *u8 | bool\nfn f(x: U) -> i64\n    match x\n"
-                             "        i64 => 1\n" + _MAIN, 3, 5, "*u8, bool"),
     # `Some(0)` covers one value of `Some`, so it does not cover `Some`.
     "literal_payload": (_OPT + "fn f(o: Option<i32>) -> i32\n    match o\n"
                         "        Some(0) => 1\n        None => 2\n" + _MAIN, 3, 5, "Some"),
@@ -313,10 +311,6 @@ ACCEPTED = {
 }
 
 ACCEPTED_RITZ0_ONLY = {
-    "union": ("type U = i64 | bool\nfn main() -> i32\n    let x: U = 42 as U\n    match x\n"
-              "        i64 => 1\n        bool => 2\n", 1),
-    "union_wildcard": ("type U = i64 | bool\nfn main() -> i32\n    let x: U = true as U\n"
-                       "    match x\n        i64 => 1\n        _ => 2\n", 2),
     "two_field_variant": ("enum P\n    Two(i64, i64)\n    Z\nfn main() -> i32\n"
                           "    let p = P.Two(1, 2)\n    match p\n"
                           "        Two(a, b) => (a + b) as i32\n        Z => 0\n", 3),
@@ -326,8 +320,7 @@ ACCEPTED_RITZ0_ONLY = {
                           "        Bb => 9\nfn main() -> i32\n    f(mk())\n", 7),
 }
 
-RITZ1_CANNOT_PARSE = ("union_member_missing", "literal_payload", "two_field_variant",
-                      "value_call_argument")
+RITZ1_CANNOT_PARSE = ("literal_payload", "two_field_variant", "value_call_argument")
 
 # --- Every arm must be reachable (LARB R13, AGAST #2349) ------------------------
 #
@@ -403,12 +396,6 @@ UNREACHABLE = {
 
 # ritz1 parses none of these patterns or types.
 UNREACHABLE_RITZ0_ONLY = {
-    "union_full_then_wildcard": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
-                                 "        i64 => 1\n        bool => 2\n        _ => 3\n" + _MAIN,
-                                 6, 9, 5),
-    "union_duplicate_member": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
-                               "        i64 => 1\n        i64 => 2\n        bool => 3\n" + _MAIN,
-                               5, 9, 4),
     "two_field_variant_duplicate": ("enum P\n    Two(i64, i64)\n    Z\nfn f(p: P) -> i64\n"
                                     "    match p\n        Two(a, b) => a\n        Z => 0\n"
                                     "        Two(_, d) => d\n" + _MAIN, 8, 9, 6),
@@ -489,12 +476,10 @@ NOT_AN_ENUM = {
     "qualified_bind_on_an_integer": (_R + _int_fn("    match n\n        C.R(v) => v\n        _ => 2\n"),
                                      6, 9),
 }
-# ritz1 parses neither a literal payload nor a type pattern, and has no unions.
+# ritz1 parses no literal payload.
 NOT_AN_ENUM_RITZ0_ONLY = {
     "literal_payload_on_an_integer": (_int_fn("    match n\n        Some(5) => 1\n        _ => 2\n"),
                                       3, 9),
-    "variant_on_a_union": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
-                           "        i64 => 0\n        Some(v) => 1\n        _ => 2\n" + _MAIN, 5, 9),
 }
 _VARIANT_NEEDS_ENUM = "a variant pattern needs an enum scrutinee"
 
@@ -510,8 +495,7 @@ NAMES_A_VARIANT = {
                                    6, 9, "G"),
 }
 
-# A literal pattern compares an integer (AGAST #3002). On an enum or a union
-# ritz0 raised an unlocated NotImplementedError, and ritz1 compared the `%C`
+# A literal pattern compares an integer (AGAST #3002). On an enum ritz0 raised an unlocated NotImplementedError, and ritz1 compared the `%C`
 # aggregate to an i64, IR clang rejected. A `true` there is NOT_A_BOOL's error.
 NOT_AN_INTEGER = {
     "integer_on_an_enum": (_C + "fn f(c: C) -> i64\n    match c\n        R => 0\n"
@@ -519,12 +503,10 @@ NOT_AN_INTEGER = {
     "integer_on_an_option": (_OPT + "fn f(o: Option<i64>) -> i64\n    match o\n        5 => 1\n"
                              "        _ => 2\n" + _MAIN, 4, 9),
 }
-# ritz1 parses no string pattern, and has no unions.
+# ritz1 parses no string pattern.
 NOT_AN_INTEGER_RITZ0_ONLY = {
     "string_on_an_enum": (_C + "fn f(c: C) -> i64\n    match c\n        \"hi\" => 1\n"
                           "        _ => 2\n" + _MAIN, 7, 9),
-    "integer_on_a_union": ("type U = i64 | bool\nfn f(x: U) -> i64\n    match x\n"
-                           "        i64 => 0\n        5 => 1\n        _ => 2\n" + _MAIN, 5, 9),
 }
 _LITERAL_NEEDS_INTEGER = "a literal pattern needs an integer scrutinee"
 
@@ -712,12 +694,12 @@ def test_an_imported_const_pattern_compares_on_an_integer(request, tmp_path, com
 
 
 @pytest.mark.integration
-def test_a_type_pattern_needs_a_union_scrutinee(request, tmp_path):
-    """`i64 =>` on an integer had no case either (AGAST #2409); ritz1 can't parse it."""
+def test_a_type_is_not_a_pattern(request, tmp_path):
+    """`i64 =>` on an integer had no case (AGAST #2409); since LARB R52 a type
+    isn't a pattern at all (#3409), refused at the pattern by the parser."""
     source = _int_fn("    match n\n        0 => 0\n        i64 => 1\n        _ => 2\n")
     proc, ll = _compile(request, "ritz0", tmp_path, source, {})
-    _assert_error(proc, ll, "ritz0", "type_on_an_integer", 4, 9,
-                  "a type pattern needs a union scrutinee")
+    _assert_error(proc, ll, "ritz0", "type_on_an_integer", 4, 9, "a type isn't a pattern")
 
 
 # Behaviour can't show these: a dead `ret i32 0` and a dead `unreachable` run the

@@ -74,8 +74,6 @@ _RITZ1_TWINS = {
     "test_issue_struct_enum_variants":
         "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "
         "patterns",
-    "test_level24":
-        "AGAST #1622 — union type aliases + type-name patterns",
     "test_level39":
         "AGAST #1623 — closures / anonymous fns (spec says not implemented)",
     "test_issue99":

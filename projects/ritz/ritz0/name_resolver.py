@@ -492,9 +492,6 @@ class NameResolver:
                 self._check_type(param_type)
             if type_node.ret:
                 self._check_type(type_node.ret)
-        elif isinstance(type_node, rast.UnionType):
-            for member in type_node.variants:
-                self._check_type(member)
 
     def _check_type_name(self, name: str, span: Optional[rast.Span]):
         """Check that a type name is defined."""

@@ -190,15 +190,10 @@ def resolve_alias(ty: rast.Type) -> rast.Type:
 
 
 def resolve_alias_in(ty: rast.Type, aliases: Dict[str, rast.Type]) -> rast.Type:
-    """Follow a bare alias name through `aliases` (chains included).
-
-    A union alias (`type X = A | B`) is a nominal type in ritz0 -- it gets its
-    own named LLVM struct -- so it keeps its name.
-    """
+    """Follow a bare alias name through `aliases` (chains included)."""
     seen = set()
     while (isinstance(ty, rast.NamedType) and not ty.args
-           and ty.name in aliases and ty.name not in seen
-           and not isinstance(aliases[ty.name], rast.UnionType)):
+           and ty.name in aliases and ty.name not in seen):
         seen.add(ty.name)
         ty = aliases[ty.name]
     return ty
@@ -250,9 +245,6 @@ def mangle_type_name(ty: rast.Type) -> str:
         return f"fn{len(ty.params)}{params}_ret_{ret}"
     elif isinstance(ty, rast.VectorType):
         return f"vec{ty.count}_{mangle_type_name(ty.inner)}"
-    elif isinstance(ty, rast.UnionType):
-        variants = "_".join(mangle_type_name(v) for v in ty.variants)
-        return f"union{len(ty.variants)}_{variants}"
     # A shared fallback name is what made distinct types collide: a new Type
     # node must be given a spelling here.
     raise TypeError(f"mangle_type_name: no spelling for {type(ty).__name__}")

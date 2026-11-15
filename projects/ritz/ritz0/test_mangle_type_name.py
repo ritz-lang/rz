@@ -70,10 +70,6 @@ class TestOtherTypes:
     def test_vector(self):
         assert mangle_type_name(rast.VectorType(None, 4, I32)) == "vec4_i32"
 
-    def test_union(self):
-        ty = rast.UnionType(None, [I32, named("Er")])
-        assert mangle_type_name(ty) == "union2_i32_Er"
-
 
 class TestArray:
     """AGAST #2843: the size is the folded integer, not its AST node.
@@ -112,7 +108,6 @@ def test_distinct_types_never_share_a_name():
         tup(), tup(I64, I64), tup(I32),
         fn([], None), fn([I32], I32), fn([I64], I32),
         rast.VectorType(None, 4, I32), rast.VectorType(None, 2, I64),
-        rast.UnionType(None, [I32, I64]), rast.UnionType(None, [I64, I32]),
     ]
     names = [mangle_type_name(t) for t in types]
     assert "unknown" not in names

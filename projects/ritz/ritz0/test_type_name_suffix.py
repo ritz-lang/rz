@@ -49,7 +49,6 @@ AGREE = [
     pytest.param(rast.FnType(None, [I32], I32), id="fn"),
     pytest.param(rast.FnType(None, [I32, U8], None), id="fn-unit-ret"),
     pytest.param(rast.VectorType(None, 4, I32), id="vector"),
-    pytest.param(rast.UnionType(None, [I32, U8]), id="union"),
     pytest.param(rast.FnType(None, [rast.PtrType(None, U8, True)],
                              rast.TupleType(None, [])), id="fn-nested"),
 ]

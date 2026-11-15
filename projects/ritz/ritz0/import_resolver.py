@@ -123,10 +123,6 @@ def parse_type_string(type_str: str) -> rast.Type:
         except Exception:
             # On any parse error, fall back to NamedType
             return rast.NamedType(_CACHED_SPAN, type_str, [])
-    if ' | ' in type_str:
-        # Union type
-        variants = [parse_type_string(v.strip()) for v in type_str.split(' | ')]
-        return rast.UnionType(_CACHED_SPAN, variants)
     if '<' in type_str and type_str.endswith('>'):
         # Generic type: Name<Args>
         bracket_pos = type_str.index('<')
@@ -1484,10 +1480,6 @@ class ImportResolver:
             return a.size == b.size and self._types_equal(a.inner, b.inner)
         if isinstance(a, rast.SliceType):
             return self._types_equal(a.inner, b.inner)
-        if isinstance(a, rast.UnionType):
-            if len(a.variants) != len(b.variants):
-                return False
-            return all(self._types_equal(av, bv) for av, bv in zip(a.variants, b.variants))
         return True
 
     def _type_aliases_equal(self, a: rast.TypeAlias, b: rast.TypeAlias) -> bool:

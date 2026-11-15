@@ -53,6 +53,12 @@ def _defer_escape(node, in_loop: bool) -> Optional[str]:
     return None
 
 
+# LARB R52 (AGAST #3409): the old union type and type-name pattern.
+UNION_TYPE_REFUSED = ("`A | B` isn't a type: declare an enum with a payload "
+                      "per kind (LANGUAGE_SPEC §3.8)")
+TYPE_PATTERN_REFUSED = "a type isn't a pattern"
+
+
 class ParseError(Exception):
     """Parser error with source location."""
     def __init__(self, message: str, span: Span):
@@ -579,47 +585,39 @@ class Parser:
 
         raise ParseError(f"Expected constant expression, got {self._current().type}", span)
 
-    def parse_type(self, allow_type_args: bool = True,
-                   allow_union: bool = True) -> rast.Type:
-        """Parse a type expression, including union types (A | B | C).
+    def parse_type(self, allow_type_args: bool = True) -> rast.Type:
+        """Parse a type expression.
 
         Args:
             allow_type_args: If False (a cast's target, after `as`), a
                 named type's `<...>` is read speculatively, since `<` may be
                 a comparison there (_try_parse_cast_type_args, #3124).
-            allow_union: If False (a closure param's type, before the
-                closing `|`), `|` ends the type instead of joining a union,
-                here and in an undelimited `fn(...) -> T` return (#2230).
+
+        `|` always ends a type.  Where nothing may follow it but a type's end
+        (here), a `|` is the old union syntax: LARB R52 removed it
+        (LANGUAGE_SPEC §3.8, AGAST #3409).  A cast's target and a closure
+        param's type, which `|` may legitimately follow, read the primary.
         """
-        first_type = self._parse_type_primary(allow_type_args, allow_union)
+        ty = self._parse_type_primary(allow_type_args)
+        if self._at(TokenType.PIPE):
+            raise ParseError(UNION_TYPE_REFUSED, self._current().span)
+        return ty
 
-        # Check for union: T | U | V
-        if allow_union and self._at(TokenType.PIPE):
-            span = first_type.span
-            variants = [first_type]
-            while self._at(TokenType.PIPE):
-                self._advance()
-                variants.append(self._parse_type_primary(allow_type_args, allow_union))
-            return rast.UnionType(span, variants)
-
-        return first_type
-
-    def _parse_type_primary(self, allow_type_args: bool = True,
-                            allow_union: bool = True) -> rast.Type:
-        """Parse a primary type (non-union)."""
+    def _parse_type_primary(self, allow_type_args: bool = True) -> rast.Type:
+        """Parse a type; a `|` after it is left for the caller."""
         span = self._current().span
 
         # @&T (mutable reference) - works in both legacy and RERITZ modes
         # Must check before @T
         if self._at(TokenType.AT_AMP):
             self._advance()
-            inner = self._parse_type_primary(allow_type_args, allow_union)
+            inner = self._parse_type_primary(allow_type_args)
             return rast.RefType(span, inner, mutable=True)
 
         # @T (immutable reference) - works in both legacy and RERITZ modes
         if self._at(TokenType.AT):
             self._advance()
-            inner = self._parse_type_primary(allow_type_args, allow_union)
+            inner = self._parse_type_primary(allow_type_args)
             return rast.RefType(span, inner, mutable=False)
 
         # Legacy reference types: &T, &mut T - REMOVED, emit helpful error
@@ -645,7 +643,7 @@ class Parser:
         # *&T (mutable raw pointer) - must check before *T
         if self._at(TokenType.STAR_AMP):
             self._advance()
-            inner = self._parse_type_primary(allow_type_args, allow_union)
+            inner = self._parse_type_primary(allow_type_args)
             return rast.PtrType(span, inner, mutable=True)
 
         # Pointer types: *T (immutable by default), *mut T (mutable)
@@ -655,7 +653,7 @@ class Parser:
             if self._at(TokenType.MUT):
                 self._advance()
                 mutable = True
-            inner = self._parse_type_primary(allow_type_args, allow_union)
+            inner = self._parse_type_primary(allow_type_args)
             return rast.PtrType(span, inner, mutable)
 
         # Array type: [N]T or [EXPR]T, or Slice type: [T]
@@ -668,7 +666,7 @@ class Parser:
                 # Definitely an array size expression
                 size_expr = self._parse_array_size_expr()
                 self._expect(TokenType.RBRACKET)
-                inner = self._parse_type_primary(allow_type_args, allow_union)
+                inner = self._parse_type_primary(allow_type_args)
                 return rast.ArrayType(span, size_expr, inner)
             elif self._at(TokenType.IDENT):
                 # Could be array size (constant) or slice type
@@ -681,7 +679,7 @@ class Parser:
                     self._advance()  # consume ]
                     if self._at_type_start():
                         # Array with constant size
-                        inner = self._parse_type_primary(allow_type_args, allow_union)
+                        inner = self._parse_type_primary(allow_type_args)
                         return rast.ArrayType(span, rast.Ident(ident.span, ident.value), inner)
                     else:
                         # Slice type [T] where T was an identifier.
@@ -692,7 +690,7 @@ class Parser:
                     self.pos = saved_pos
                     size_expr = self._parse_array_size_expr()
                     self._expect(TokenType.RBRACKET)
-                    inner = self._parse_type_primary(allow_type_args, allow_union)
+                    inner = self._parse_type_primary(allow_type_args)
                     return rast.ArrayType(span, size_expr, inner)
             else:
                 # Slice type: [T] — sugar for `Span<T>` (see make_slice_type).
@@ -742,7 +740,8 @@ class Parser:
             ret = None
             if self._at(TokenType.ARROW):
                 self._advance()
-                ret = self.parse_type(allow_union=allow_union)
+                # Undelimited: a `|` after it is the caller's (#2230).
+                ret = self._parse_type_primary()
             return rast.FnType(span, params, ret)
 
         # `dyn` is reserved: the language has no trait objects (LANGUAGE_SPEC
@@ -869,8 +868,9 @@ class Parser:
             if op_tok.type == TokenType.AS:
                 # Cast expression: expr as Type
                 # Don't allow type args to avoid ambiguity: `x as i64 < y`
-                # should parse as (x as i64) < y, not x as i64<y>
-                target_type = self.parse_type(allow_type_args=False)
+                # should parse as (x as i64) < y, not x as i64<y>.  A `|`
+                # after the type is a bitwise or (#3409).
+                target_type = self._parse_type_primary(allow_type_args=False)
                 left = rast.Cast(left.span, left, target_type, op_tok.span)
             elif op_tok.type == TokenType.DOTDOT:
                 right = self.parse_expr(prec)
@@ -1458,25 +1458,18 @@ class Parser:
             self._advance()
             return rast.LitPattern(span, False)
 
-        # Type pattern for pointer types: *T, *mut T, **u8, etc.
-        if self._at(TokenType.STAR):
-            ty = self._parse_type_primary()
-            return rast.TypePattern(span, ty)
-
-        # Type pattern for reference types: &T, &mut T
-        if self._at(TokenType.AMP):
-            ty = self._parse_type_primary()
-            return rast.TypePattern(span, ty)
+        # A type isn't a pattern (LARB R52, AGAST #3409): `*T`, `&T` and a
+        # primitive type name were the union arms of `match v` on a removed
+        # `A | B` type.  Refused at the pattern.
+        if self._at(TokenType.STAR, TokenType.AMP):
+            raise ParseError(TYPE_PATTERN_REFUSED, span)
 
         # Identifier or variant pattern
         if self._at(TokenType.IDENT):
             name = self._current().value
 
-            # Check if this looks like a primitive type name for type pattern
-            # Primitive types: i8, i16, i32, i64, u8, u16, u32, u64, bool
             if name in ('i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'bool'):
-                ty = self._parse_type_primary()
-                return rast.TypePattern(span, ty)
+                raise ParseError(TYPE_PATTERN_REFUSED, span)
 
             # Otherwise consume as identifier
             self._advance()
@@ -1579,8 +1572,8 @@ class Parser:
         param_type = None
         if self._at(TokenType.COLON):
             self._advance()
-            # `|` closes the param list here, not a union (#2230).
-            param_type = self.parse_type(allow_union=False)
+            # `|` closes the param list here (#2230).
+            param_type = self._parse_type_primary()
         return rast.ClosureParam(name_tok.value, param_type, name_tok.span)
 
     # ========================================================================

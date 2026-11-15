@@ -185,31 +185,3 @@ def test_integer_match_literal_arm_first_is_valid_ir(tmp_path):
     code = _run(tmp_path)
     if code is not None:
         assert code == 9
-
-
-# --- union match ---------------------------------------------------------------
-
-UNION_LITERAL_ARM = """\
-type IntOrStr = i32 | *u8
-
-fn get(v: IntOrStr) -> i32
-    match v
-        *u8 => 0
-        i32 => v as i32
-
-fn main() -> i32
-    let x: i32 = 5
-    let v: IntOrStr = x as IntOrStr
-    get(v)
-"""
-
-
-@pytest.mark.unit
-def test_union_match_literal_arm_is_valid_ir(tmp_path):
-    """Union match used to widen in the merge block: invalid dominance."""
-    _assert_valid(tmp_path, UNION_LITERAL_ARM)
-    body = _fn_ir(tmp_path, "get")
-    assert _has_phi(body, "i32"), body
-    code = _run(tmp_path)
-    if code is not None:
-        assert code == 5

@@ -5,9 +5,9 @@ the param's type was parsed with the full `parse_type`, whose union rule
 (`A | B`) read the closing `|` as a union operator: `i32 | x` became a
 `UnionType` and the parse then failed with "Expected PIPE, got PLUS".
 
-A closure param's type is now parsed without the union operator, at the top
-level and in a `fn(...) -> T` return type (the only undelimited place a
-type nests).  Rows are parser-only and in-process, one per code path.
+A closure param's type now stops at the `|`, at the top level and in a
+`fn(...) -> T` return type (the only undelimited place a type nests).  Since
+LARB R52 removed union types (#3409), `|` always ends a type.  Rows are parser-only and in-process, one per code path.
 Past the parser the annotation is still ignored (AGAST #3301).
 """
 
@@ -43,7 +43,7 @@ def test_typed_closure_param_stops_at_pipe(src, param_types, body_op):
     assert isinstance(closure.body, rast.BinOp) and closure.body.op == body_op
 
 
-def test_fn_typed_param_return_type_is_not_a_union():
+def test_fn_typed_param_return_type_stops_at_pipe():
     (param,) = _closure("|f: fn(i32) -> i32| f(1) + 1").params
     assert isinstance(param.type.ret, rast.NamedType)
 
@@ -53,8 +53,3 @@ def test_untyped_closure_body_keeps_bitwise_or():
     assert closure.params[0].type is None
     assert isinstance(closure.body, rast.BinOp) and closure.body.op == "|"
 
-
-def test_union_type_alias_still_parses():
-    (alias,) = parse("type X = i64 | bool\n").items
-    assert isinstance(alias.target, rast.UnionType)
-    assert [v.name for v in alias.target.variants] == ["i64", "bool"]
