@@ -4070,19 +4070,45 @@ class LLVMEmitter:
                     f"cannot assign to `let` binding `{target.name}`; declare it `var`",
                     target.span)
         elif isinstance(target, (rast.Field, rast.Index)):
-            place = self._let_place(target)
+            place = self._let_place(target, consts=True)
+            if place is not None and self._is_const_array_name(place[0]):
+                raise EmitError(
+                    f"cannot assign through const `{place[0]}`; it is read-only data",
+                    target.span)
             if place is not None:
                 raise EmitError(
                     f"cannot assign through `let` binding `{place[0]}`; declare it `var`",
                     target.span)
 
-    def _check_let_mut_borrow(self, operand: rast.Expr) -> None:
-        """AGAST #2026: reject `@&` of a `let` or of a place inside it."""
-        place = self._let_place(operand)
+    def _check_let_mut_borrow(self, operand: rast.Expr, at: Optional[rast.Span] = None) -> None:
+        """AGAST #2026: reject `@&` of a `let` or of a place inside it.
+
+        AGAST #3337: or of a const array, or a place inside it (ritz1's
+        let_place_const): it is `internal constant` data.  `at` is an
+        explicit `@&`'s own span, where ritz1 locates the const's message.
+        """
+        place = self._let_place(operand, consts=True)
+        if place is not None and self._is_const_array_name(place[0]):
+            raise EmitError(
+                f"cannot borrow const `{place[0]}` as mutable; it is read-only data",
+                at or operand.span)
         if place is not None:
             raise EmitError(
                 f"cannot borrow `let` binding `{place[0]}` as mutable; declare it `var`",
                 operand.span)
+
+    def _check_const_elem_addr(self, expr: rast.UnaryOp) -> None:
+        """AGAST #3337: refuse `@A[i]` (or `@A[i].f`) of a const array.
+
+        Its element is `internal constant` data.  Whether `@` of it should be
+        a `*T` into that data is open (LARB); until then it's refused at the
+        `@`, in ritz1's words (let_check.ritz let_error_const_addr).
+        """
+        place = self._let_place(expr.operand, consts=True)
+        if place is not None and self._is_const_array_name(place[0]):
+            raise EmitError(
+                f"cannot take the address of an element of const `{place[0]}`; "
+                "it is read-only data", expr.span)
 
     @staticmethod
     def _is_mut_borrow_param(param: rast.Param) -> bool:
@@ -4106,7 +4132,7 @@ class LLVMEmitter:
         """
         if not self._is_mut_borrow_param(param):
             return
-        place = self._let_place(arg)
+        place = self._let_place(arg, consts=True)
         if place is not None and not isinstance(place[1], ir.PointerType):
             self._check_let_mut_borrow(arg)
 
@@ -4252,7 +4278,7 @@ class LLVMEmitter:
         if not (isinstance(value, (rast.Ident, rast.Field, rast.Index))
                 or (isinstance(value, rast.UnaryOp) and value.op == '*')):
             return None
-        let_place = self._let_place(value)
+        let_place = self._let_place(value, consts=True)
         if let_place is not None and let_place[1] == expected_type.pointee:
             self._check_let_mut_borrow(value)
         if (isinstance(value, rast.Ident) and value.name not in self.locals
@@ -4268,18 +4294,33 @@ class LLVMEmitter:
             return self.builder.load(addr)
         return addr
 
-    def _let_place(self, expr: rast.Expr) -> Optional[Tuple[str, ir.Type]]:
+    def _is_const_array_name(self, name: str) -> bool:
+        """AGAST #3337: does `name` name a module `const A: [N]T` here?
+
+        A local, param or global of the name is what it names, as in ritz1's
+        let_place_const.
+        """
+        return (name in self.const_arrays and name not in self.locals
+                and name not in self.params and name not in self.globals)
+
+    def _let_place(self, expr: rast.Expr,
+                   consts: bool = False) -> Optional[Tuple[str, ir.Type]]:
         """AGAST #2026: (let name, LLVM type) if `expr` is a `let`'s storage.
 
         The binding itself, a by-value field of it or an element of a
         by-value array in it, to any depth. None as soon as the path leaves
         the binding's own storage through a pointer (`let p: *T` then
         `p.x`), since that writes the pointee, not the `let`.
+
+        With `consts`, a const array's read-only data is such a place too
+        (AGAST #3337); `_is_const_array_name(name)` tells the two apart.
         """
         if isinstance(expr, rast.Ident):
             # By identity, as _is_let_slot: a fn param, `var` or match
             # binding that replaced the `let` of this name is not one.
             name = expr.name
+            if consts and self._is_const_array_name(name):
+                return name, self.const_arrays[name][1]
             if self._is_let_slot(name):
                 return name, self.locals[name][1]
             val = self._let_values.get(name)
@@ -4288,7 +4329,7 @@ class LLVMEmitter:
                 return name, bound[1]
             return None
         if isinstance(expr, rast.Field):
-            base = self._let_place(expr.expr)
+            base = self._let_place(expr.expr, consts)
             if base is None or not isinstance(base[1], ir.BaseStructType):
                 return None
             name, ty = base
@@ -4303,7 +4344,7 @@ class LLVMEmitter:
                 return None
             return name, ty.elements[idx]
         if isinstance(expr, rast.Index):
-            base = self._let_place(expr.expr)
+            base = self._let_place(expr.expr, consts)
             if base is None or not isinstance(base[1], ir.ArrayType):
                 return None
             return base[0], base[1].element
@@ -11423,8 +11464,9 @@ class LLVMEmitter:
             if temp_root(expr.operand) is not None:
                 return self._emit_addr_of_temp(expr)
             if expr.op in ('&mut', '@&'):
-                self._check_let_mut_borrow(expr.operand)
+                self._check_let_mut_borrow(expr.operand, expr.span)
             if isinstance(expr.operand, (rast.Index, rast.Field)):
+                self._check_const_elem_addr(expr)
                 # `@m[k]` reads a struct through `index`, `@&m[k]` through
                 # `index_mut` (§7.8); a `.f` on it is the same use.
                 outer = self._index_use

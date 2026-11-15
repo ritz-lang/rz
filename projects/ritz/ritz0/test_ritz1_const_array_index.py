@@ -15,6 +15,7 @@ assertion is on the runtime exit code, with ritz0 run as the oracle.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -218,31 +219,84 @@ def test_ritz0_oracle(name: str, tmp_path: Path) -> None:
 
 # AGAST #3325: a const array is `internal constant` data, so a write into it
 # faulted at run time (or was dropped).  Reading `KS[i].len` gave the field a
-# pointer, which made `KS[0].len = 7` compile to that fault; both writes are a
-# located error now.  ritz0 has no oracle here: it fails on the const's name
-# with an internal "Unknown identifier" (#3337).
-WRITES = {
-    "elem": ("const NS: [2]i32 = [1, 2]\n\npub fn main() -> i32\n    NS[0] = 5\n    0\n", "NS"),
-    "field": (
-        'const KS: [2]StrView = ["a", "c"]\n\npub fn main() -> i32\n    KS[0].len = 7\n    0\n',
-        "KS",
-    ),
+# pointer, which made `KS[0].len = 7` compile to that fault.  ritz1 refused the
+# writes from #3325 on; ritz0 died on the const's name with an internal
+# "Unknown identifier" traceback until #3337.  Each case is a located error on
+# all three compilers, in ritz1's words.
+#
+# `@NS[i]` (#3337) is refused too, for now: ritz1 said an unlocated "cannot
+# take address" and ritz0 had the same traceback.  Whether it should be a `*T`
+# into the read-only data is LARB's call (#3359); until then it's a located error.
+_CONST_HEAD = (
+    "const NS: [3]i32 = [10, 20, 30]\n"
+    'const KS: [2]StrView = ["a", "c"]\n\n'
+    "fn w(x:& i32)\n    x = 1\n\n"
+    "pub fn main() -> i32\n    var i: i64 = 1\n"
+)
+_THROUGH = "cannot assign through const `{}`; it is read-only data"
+_BORROW = "cannot borrow const `{}` as mutable; it is read-only data"
+_ADDR = "cannot take the address of an element of const `{}`; it is read-only data"
+
+# name -> (statement in main, line 9, column, message)
+CONST_PLACE_ERRORS = {
+    "elem": ("NS[0] = 5", 5, _THROUGH.format("NS")),
+    "field": ("KS[0].len = 7", 5, _THROUGH.format("KS")),
+    "compound": ("NS[1] += 1", 5, _THROUGH.format("NS")),
+    "mut_borrow": ("let r: @&StrView = @&KS[0]", 24, _BORROW.format("KS")),
+    "borrow_param": ("w(NS[0])", 7, _BORROW.format("NS")),
+    "addr_elem": ("let q: *i32 = @NS[i]", 19, _ADDR.format("NS")),
+    "addr_struct_elem": ("let p: *StrView = @KS[i]", 23, _ADDR.format("KS")),
 }
+
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(WRITES))
-def test_ritz1_const_array_write_refused(name: str, ritz1_bin: Path, tmp_path: Path) -> None:
-    program, const = WRITES[name]
-    src = tmp_path / f"{name}.ritz"
-    src.write_text(program)
-    proc = subprocess.run(
-        [str(RITZ1_BIN), str(src), "-o", str(tmp_path / f"{name}.ll")],
-        cwd=tmp_path, capture_output=True, text=True, timeout=300,
-    )
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(CONST_PLACE_ERRORS))
+def test_const_array_place_refused(request, compiler: str, name: str, tmp_path: Path) -> None:
+    stmt, col, message = CONST_PLACE_ERRORS[name]
+    src = tmp_path / "unit.ritz"
+    src.write_text(_CONST_HEAD + f"    {stmt}\n    0\n")
+    ll = tmp_path / "unit.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    if compiler == "ritz0":
+        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    else:
+        request.getfixturevalue("ritz1_bin")
+        binary = RITZ1_BIN.parent / compiler
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+        proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path,
+                              env=env, capture_output=True, text=True, timeout=300)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"ritz1 accepted a write into const {const}:\n{out[-1500:]}"
-    assert f"{name}.ritz:4:5: error: cannot assign through const `{const}`" in out, out[-1500:]
+    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
+    assert "Traceback" not in out, f"{compiler}, {name}:\n{out[-1500:]}"
+    hits = re.findall(rf"unit\.ritz:9:{col}: (?:error: )?{re.escape(message)}", out)
+    assert len(hits) == 1, f"{compiler}, {name}: want one {message!r} at 9:{col}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
+
+
+# A `self:&` receiver lends the element mutably (_check_let_implicit_mut_borrow).
+# ritz0-only: ritz1 can't type a const element's receiver yet, read or write,
+# and says so unlocated (#3360).
+MUT_RECEIVER = (
+    "struct P\n    a: i32\n\n"
+    "const PS: [2]P = [P { a: 1 }, P { a: 2 }]\n\n"
+    "impl P\n    fn bump(self:& P)\n        self.a = 5\n\n"
+    "pub fn main() -> i32\n    PS[0].bump()\n    0\n"
+)
+
+
+@pytest.mark.integration
+def test_ritz0_const_elem_mut_receiver_refused(tmp_path: Path) -> None:
+    src = tmp_path / "unit.ritz"
+    src.write_text(MUT_RECEIVER)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = run_ritz0([str(src), "-o", str(tmp_path / "unit.ll")], cwd=tmp_path, env=env, timeout=300)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Traceback" not in out, out[-1500:]
+    assert "unit.ritz:11:5: cannot borrow const `PS` as mutable; it is read-only data" in out, out[-1500:]
 
 
 @pytest.mark.integration
