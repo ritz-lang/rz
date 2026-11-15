@@ -10,7 +10,10 @@ Before the fix ritz1 passed the Vec's address as the argument:
 and clang refused the IR ("'%.3' defined with type 'i64' but expected
 '%Span$u8'").  Found in angelo loader/ttf.ritz:181, `Reader.new(@data)`.
 
-`@&v` into a `Span<T>` slot is #3247's, on the free call and here alike.
+AGAST #3247: `@&v` builds the same Span, on the free call and here alike.
+`@&` yields the slot's `ptr` where `@` yields its ptrtoint, so ritz1 passed
+the borrow's `ptr` as the argument and clang refused the IR ("'%.1' defined
+with type 'ptr' but expected '%Span$u8'").
 
 ritz0 is the oracle: each expected exit status is checked against it too.
 """
@@ -78,6 +81,24 @@ fn go(data:= Vec<u8>) -> i32
     let r = R.with(40, @data)
     r.k + r.d[1] as i32
 """, 42),
+    # AGAST #3247: `@&v` into a `Span<T>` param, free and static alike.
+    "free_fn_mut": ("""\
+fn go(data:= Vec<u8>) -> i32
+    let r = mk(@&data)
+    r.d.len as i32 + 1
+""", 3),
+    "static_mut_param": ("""\
+fn go(data:= Vec<u8>) -> i32
+    R.sum(@&data) + 10
+""", 13),
+    "static_mut_local_second_arg": ("""\
+fn go(data:= Vec<u8>) -> i32
+    var w = vec_with_cap<u8>(4)
+    w.push(5)
+    w.push(6)
+    let r = R.with(40, @&w)
+    r.k + r.d[1] as i32 + data.len as i32
+""", 48),
     # Controls: the free call always converted; `@array` on the static arm.
     "free_fn": ("""\
 fn go(data:= Vec<u8>) -> i32
