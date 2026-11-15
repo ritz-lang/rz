@@ -16303,15 +16303,23 @@ class LLVMEmitter:
         # Emit each arm body
         arm_values = []
         arm_exit_blocks = []
+        scrut_ritz = self._infer_ritz_type(expr.expr)
 
         for i, (arm, arm_block) in enumerate(zip(expr.arms, arm_blocks)):
             self.builder.position_at_end(arm_block)
             pattern = arm.pattern
 
             # Bind identifier pattern to the match value
-            if isinstance(pattern, rast.IdentPattern) and pattern.name not in self.constants:
+            binds = (isinstance(pattern, rast.IdentPattern)
+                     and pattern.name not in self.constants)
+            if binds:
                 # Bind the match value to the pattern name for use in the arm body
                 self.params[pattern.name] = (match_val, int_type)
+                # The binding has the scrutinee's Ritz type, so a u32 `n`
+                # reads unsigned in the arm (AGAST #3344). No outer name can
+                # share it: a local can't rebind one, nor take a global's.
+                if scrut_ritz is not None:
+                    self.ritz_types[pattern.name] = scrut_ritz
 
             # Emit the arm body
             # A `return` inside one arm must not leak has_returned past
@@ -16325,6 +16333,7 @@ class LLVMEmitter:
                 arm.body, getattr(self, '_expected_enum_name', None))
             self.has_returned = _saved_arm_returned
             self._end_diverging_arm(arm.body)
+            self._pin_arm_unsigned(arm_val)  # `n` still bound (AGAST #3344)
             arm_values.append(arm_val)
 
             # Check if the arm already terminated (e.g., with return)
@@ -16335,8 +16344,9 @@ class LLVMEmitter:
                 arm_exit_blocks.append(None)
 
             # Clean up bound pattern variable
-            if isinstance(pattern, rast.IdentPattern) and pattern.name not in self.constants:
+            if binds:
                 del self.params[pattern.name]
+                self.ritz_types.pop(pattern.name, None)
 
         # Position at merge block
         self.builder.position_at_end(merge_block)

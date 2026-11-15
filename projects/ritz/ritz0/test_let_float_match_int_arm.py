@@ -743,3 +743,95 @@ def test_ritz0_refuses_u64_payload_arm_as_u64(run_ritz0, tmp_path):
     assert "bad.ritz:6:20:" in out, out
     assert ("implicit conversion from `u64` to `f64` can lose precision"
             in out), out
+
+
+# --- AGAST #3344: an integer match's ident binding has the scrutinee's type ---
+#
+# `n => ...` in a match on a u32 bound `n` to the bare LLVM value, so ritz0
+# read it as signed: `let b: f64 = n` in the arm, and the float-annotated
+# `let a: f64 = match k / ... / n => n`, both gave sitofp, and 4e9 came out
+# negative. ritz1 gives 4e9. Each form, u32 and an i32 control, on all three
+# compilers; a u64 `n` is refused as `u64` in both forms.
+
+SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+
+INT_MATCH_BINDING_IN_ARM_LET = """\
+fn g(k: TY) -> f64
+    match k
+        0 => 1.0
+        n =>
+            let b: f64 = n
+            b
+
+fn main() -> i32
+    if g(0) != 1.0
+        return 1
+    let x: TY = VAL
+    if g(x) != VAL.0
+        return 2
+    return 42
+"""
+
+INT_MATCH_BINDING_ANNOTATED_ARM = """\
+fn g(k: TY) -> f64
+    let a: f64 = match k
+        0 => 1
+        n => n
+    return a
+
+fn main() -> i32
+    if g(0) != 1.0
+        return 1
+    let x: TY = VAL
+    if g(x) != VAL.0
+        return 2
+    return 42
+"""
+
+INT_MATCH_FORMS = {
+    "in-arm-let": INT_MATCH_BINDING_IN_ARM_LET,
+    "annotated-arm": INT_MATCH_BINDING_ANNOTATED_ARM,
+}
+INT_MATCH_TYPES = {"u32": "4000000000", "i32": "-5"}
+
+
+def _run_with(compiler, ritz1_bin, ritz0_oracle, tmp_path, program):
+    """(rc or None, diagnostics) of `program` under `compiler`."""
+    if compiler == "ritz0":
+        res = ritz0_oracle(program)
+        return (res.rc if res.ir_ok else None), res.diagnostics
+    binary = ritz1_bin if compiler == "ritz1" else SELFHOSTED_BIN
+    return _ritz1_run(binary, tmp_path, program)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("ty", sorted(INT_MATCH_TYPES))
+@pytest.mark.parametrize("form", sorted(INT_MATCH_FORMS))
+def test_int_match_binding_converts_by_scrutinee_type(
+        ritz1_bin, ritz0_oracle, tmp_path, compiler, ty, form):
+    program = (INT_MATCH_FORMS[form].replace("TY", ty)
+               .replace("VAL", INT_MATCH_TYPES[ty]))
+    rc, diag = _run_with(compiler, ritz1_bin, ritz0_oracle, tmp_path, program)
+    assert rc is not None, diag[-3000:]
+    assert rc == 42
+
+
+# A u64 `n` is refused as `u64` (it was `i64`), at `n`. ritz1 accepts it in
+# both forms (AGAST #3358), as it does a u64 payload (#3345), so the rows are
+# ritz0's alone, as #3332's u64 row is.
+INT_MATCH_U64_AT = {"in-arm-let": "bad.ritz:5:26:", "annotated-arm": "bad.ritz:4:14:"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("form", sorted(INT_MATCH_FORMS))
+def test_ritz0_refuses_int_match_u64_binding_as_u64(run_ritz0, tmp_path, form):
+    program = (INT_MATCH_FORMS[form].replace("TY", "u64")
+               .replace("VAL", "4000000000"))
+    comp = _ritz0_compile(run_ritz0, tmp_path, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert INT_MATCH_U64_AT[form] in out, out
+    assert ("implicit conversion from `u64` to `f64` can lose precision"
+            in out), out
