@@ -472,9 +472,9 @@ pub fn main() -> i32
     return r as i32
 """
 
-# AGAST #2247: ritz0 writes `ret i32 0` into the dead merge block of a
-# multi-field struct return, which clang refuses, so this shape has no oracle
-# and ritz1 is pinned to its own value.
+# AGAST #2247: ritz0 used to write `ret i32 0` into the dead merge block of a
+# multi-field struct return, which clang refuses, so ritz1 was pinned to its
+# own value. #3205's `unreachable` in that block fixed ritz0; both now run it.
 STRUCT_IF_ELSE_RETURNS = """\
 struct Pair
     a: i64
@@ -503,7 +503,8 @@ def test_diverging_tails_run_the_same_on_both(ritz1_bin, tmp_path):
 
 @pytest.mark.integration
 def test_struct_return_from_every_arm_of_an_if_else(ritz1_bin, tmp_path):
+    expected = _run("ritz0", tmp_path, "struct_arms", STRUCT_IF_ELSE_RETURNS)
     got = _run("ritz1", tmp_path, "struct_arms", STRUCT_IF_ELSE_RETURNS)
     shape = _block_shape_errors((tmp_path / "struct_arms_ritz1.ll").read_text())
     assert not shape, "malformed blocks in ritz1 IR:\n" + "\n".join(shape)
-    assert got == 42, f"ritz1 exit {got}"
+    assert got == expected == 42, f"ritz1 exit {got}, ritz0 exit {expected}"
