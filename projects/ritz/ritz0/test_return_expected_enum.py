@@ -459,8 +459,9 @@ def _run(compiler: str, tmp_path: Path, name: str, source: str) -> int:
     if compiler == "ritz0":
         comp = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
+        binary = RITZ1_BIN.parent / compiler  # ritz1_selfhosted is beside ritz1
         comp = subprocess.run(
-            [str(RITZ1_BIN), str(src), "-o", str(ll), "-I", str(RITZ_ROOT)],
+            [str(binary), str(src), "-o", str(ll), "-I", str(RITZ_ROOT)],
             cwd=tmp_path,
             env=env,
             capture_output=True,
@@ -473,7 +474,7 @@ def _run(compiler: str, tmp_path: Path, name: str, source: str) -> int:
     )
     exe = tmp_path / f"{name}_{compiler}"
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
-    if compiler == "ritz1":
+    if compiler != "ritz0":
         link_cmd.insert(1, str(RITZ_START))
     link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, (
@@ -775,6 +776,52 @@ def test_ritz1_unit_only_payloads(tmp_path, ritz1_bin, ritz_start):
 
 def test_ritz1_payload_member_from_call_scrutinee(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "payload_member", PAYLOAD_MEMBER) == 52
+
+
+# AGAST #2273 case 2: the scrutinee is a generic call, and the struct payload's
+# type exists only as the call's type argument. No `let` names `Result<Page, Er>`
+# (GENERIC_FN above binds one first, which always worked), so `p.id` resolves
+# only if the match takes the payload type from `first<Page>`'s return type.
+GENERIC_CALL_SCRUTINEE = """\
+import ritzlib.option
+import ritzlib.result
+
+struct Page
+    id: i64
+
+struct Er
+    code: i32
+
+fn first<T>(o: Option<T>) -> Result<T, Er>
+    match o
+        Some(v) => return Ok(v)
+        None => 0
+    Err(Er { code: 4 })
+
+fn get(n: i64) -> Option<Page>
+    if n > 0
+        return Some(Page { id: n })
+    None
+
+fn main() -> i32
+    let o = get(%s)
+    match first<Page>(o)
+        Ok(p) => p.id as i32
+        Err(e) => 50 + e.code
+"""
+
+
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("arg,want", [(8, 8), (0, 54)], ids=["ok", "err"])
+def test_payload_member_from_generic_call_scrutinee(
+    request, tmp_path, compiler, arg, want
+):
+    if compiler != "ritz0":
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        request.getfixturevalue("ritz1_bin")
+        request.getfixturevalue("ritz_start")
+    source = GENERIC_CALL_SCRUTINEE % arg
+    assert _run(compiler, tmp_path, "generic_scrutinee", source) == want
 
 
 # AGAST #2274, fixed by #2432: `Option$A` is no template when `struct A` exists.
