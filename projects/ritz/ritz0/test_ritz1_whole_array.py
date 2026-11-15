@@ -1427,8 +1427,10 @@ pub fn main() -> i32
 
 CASES.update(SOURCES)
 
-# AGAST #3277: `T = [N]U` inferred from the argument.  `g<[4]i32>(a)` is above.
-GENERIC_INFER_GAPS = {
+# AGAST #3277: `T = [N]U` inferred from the argument, as `g<[4]i32>(a)` above
+# spells it: from an array local, a by-value array param, and a generic call's
+# `-> T` result; with a primitive, a struct and a pointer element.
+GENERIC_INFER = {
     "generic_infer_array": """\
 fn g<T>(a: T) -> i32
     return 3
@@ -1437,7 +1439,57 @@ pub fn main() -> i32
     var a: [4]i32 = [0, 0, 0, 3]
     return g(a)
 """,
+    "generic_infer_array_param": """\
+fn g<T>(a: T) -> T
+    var x: T = a
+    return x
+
+fn h(a: [4]i32) -> i32
+    var b: [4]i32 = g(a)
+    return b[3]
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    return h(a)
+""",
+    "generic_infer_array_struct": """\
+struct C
+    x: i32
+    y: i64
+
+fn g<T>(a: T) -> T
+    a
+
+pub fn main() -> i32
+    var c: [2]C
+    c[1].y = 3
+    var d: [2]C = g(c)
+    return d[1].y as i32
+""",
+    "generic_infer_array_ptr": """\
+fn g<T>(a: T) -> T
+    a
+
+pub fn main() -> i32
+    var x: i32 = 3
+    var p: [2]*i32
+    p[1] = @x
+    var q: [2]*i32 = g(p)
+    return *q[1]
+""",
+    "generic_infer_array_result": """\
+fn g<T>(a: T) -> T
+    a
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    let b = g(a)
+    var c: [4]i32 = g(b)
+    return c[3]
+""",
 }
+
+CASES.update(GENERIC_INFER)
 
 # AGAST #3276: a `match` value of array type, as #2305 lowered `if`: each arm
 # stores its own array into the destination, dispatched by emit_match's own
@@ -1654,7 +1706,6 @@ pub fn main() -> i32
 }
 
 GAPS = [
-    (GENERIC_INFER_GAPS, "AGAST #3277: a generic `T = [N]U` inferred from an array argument"),
     (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
     (PARAM_ND_GAPS, "AGAST #2098: a multi-dimensional array param"),
     (ROW_GAPS, "AGAST #2099: a whole row of a multi-dimensional array"),
@@ -1666,6 +1717,16 @@ GAPS = [
 # here: ritz0 refuses it only by failing on `(*p)[i]` (#2331), which LARB R9 makes
 # legal, so it's in test_ritz1_array_pointer_index.py now (#2330).
 REJECTED = {
+    # AGAST #3277: two arrays of different lengths bind T two ways.
+    "generic_infer_array_conflict": """\
+fn g<T>(a: T, b: T) -> i32
+    return 3
+
+pub fn main() -> i32
+    var a: [4]i32 = [0, 0, 0, 3]
+    var b: [3]i32 = [0, 0, 3]
+    return g(a, b)
+""",
     # AGAST #2305: a StrView takes only an `[N]u8` / `[N]i8`, bare or `@`.
     "strview_wrong_elem": """\
 fn g(s: StrView) -> i32
@@ -2456,3 +2517,12 @@ def test_ritz1_refuses(ritz1_bin, tmp_path, name):
     assert comp.returncode != 0, comp.stdout + comp.stderr
     assert not ll.exists()
     assert "error" in comp.stdout + comp.stderr
+
+
+@pytest.mark.integration
+def test_ritz1_array_conflict_cant_infer(ritz1_bin, tmp_path):
+    """AGAST #3277: `[4]i32` and `[3]i32` for one T is ritz0's located refusal."""
+    name = "generic_infer_array_conflict"
+    comp, _ = _compile("ritz1", ritz1_bin, tmp_path, name, REJECTED[name])
+    assert re.search(r"\.ritz:7:12: can't infer `T` for `g`: write `g<T>\(\.\.\.\)`",
+                     comp.stdout + comp.stderr), comp.stdout + comp.stderr

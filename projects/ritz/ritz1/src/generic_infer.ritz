@@ -33,6 +33,8 @@ import monomorph
 # The type of an expression, as far as this pass can tell.  kind is a TYPE_*;
 # name is the struct's mangled name for TYPE_STRUCT, and the pointee struct's
 # for a TYPE_PTR / TYPE_REF / TYPE_MUT_REF whose pointee is TYPE_STRUCT.
+# AGAST #3277: for a TYPE_ARRAY, name is the whole `[N]E` already spelled as a
+# type argument, "arr" N "_" E (gi_array_spell), and a T binds to it as is.
 struct GiType
     kind: i32
     name: *u8
@@ -96,6 +98,44 @@ fn gi_is_ptr_kind(k: i32) -> i32
         return 1
     0
 
+# AGAST #3277: a 1-D `[size]elem` as a type argument, spelled as ast_helpers'
+# spell_last_array spells `g<[4]i32>`'s, so monomorph's array_arg_decode reads
+# it back: "arr" size "_" E, E a primitive's name, a struct's (elem_name), or
+# "ptr_" + either for a `*U` element (U elem_pointee).  Sets *out to
+# TYPE_ARRAY and returns 1, or 0 for an element a suffix can't spell.
+fn gi_array_spell(size: i32, elem: i32, elem_name: *u8, elem_name_len: i32, elem_pointee: i32, out: *GiType) -> i32
+    var e: *u8 = null
+    var el: i32 = 0
+    var ptr: i32 = 0
+    if elem == TYPE_STRUCT
+        e = elem_name
+        el = elem_name_len
+    else if elem == TYPE_PTR
+        ptr = 1
+        if elem_pointee == TYPE_STRUCT
+            e = elem_name
+            el = elem_name_len
+        else
+            el = primitive_arg_spelling(elem_pointee, @e)
+    else
+        el = primitive_arg_spelling(elem, @e)
+    if e == null or el <= 0 or size <= 0
+        return 0
+    # "arr" + up to 10 digits + "_" + "ptr_" + E + NUL
+    let buf: *u8 = malloc((el + 19) as i64)
+    memcpy(buf, c"arr", 3)
+    var pos: i32 = 3
+    pos = pos + write_dec_i32(buf + pos, size)
+    *(buf + pos) = 95   # '_'
+    pos = pos + 1
+    if ptr == 1
+        memcpy(buf + pos, c"ptr_", 4)
+        pos = pos + 4
+    memcpy(buf + pos, e, el as i64)
+    pos = pos + el
+    *(buf + pos) = 0
+    gi_set(out, TYPE_ARRAY, buf, pos, TYPE_VOID)
+
 # 1 for a primitive TYPE_* that a suffix can spell.
 fn gi_is_prim(k: i32) -> i32
     var s: *u8 = null
@@ -118,7 +158,13 @@ fn gi_is_int_literal(e: *Expr) -> i32
 # The type a one-argument suffix ("$u8", "$Vec$u8", "$ptr_u8") names.
 fn gi_type_from_suffix(suffix: *u8, suffix_len: i32, out: *GiType) -> i32
     let k: i32 = parse_type_from_suffix(suffix, suffix_len)
-    if k == TYPE_VOID or k == TYPE_ARRAY
+    if k == TYPE_ARRAY
+        # AGAST #3277: "$arr4_i32" is the array gi_array_spell spelled.
+        var arr: ArrayArg
+        if suffix_len < 2 or array_arg_decode(suffix + 1, suffix_len - 1, @arr) == 0
+            return 0
+        return gi_set(out, TYPE_ARRAY, suffix + 1, suffix_len - 1, TYPE_VOID)
+    if k == TYPE_VOID
         return 0
     var n: *u8 = null
     var nl: i32 = 0
@@ -319,7 +365,7 @@ fn gi_struct_lit_type(m: *Module, e: *Expr, out: *GiType) -> i32
 fn gi_spell(t: *GiType, out_len: *i32) -> *u8
     var s: *u8 = null
     var n: i32 = 0
-    if t.kind == TYPE_STRUCT
+    if t.kind == TYPE_STRUCT or (t.kind == TYPE_ARRAY and t.name != null)
         *out_len = t.name_len
         return t.name
     if gi_is_ptr_kind(t.kind) == 1
@@ -531,6 +577,14 @@ fn gi_note_decl(m: *Module, s: *Stmt)
     var t: GiType
     if s.var_declared_type != TYPE_VOID
         if s.var_type == TYPE_STRUCT and s.var_type_name == null
+            return
+        if s.var_type == TYPE_ARRAY
+            # A 1-D `var a: [N]E`; `[N][M]E` spells as no type argument, so
+            # binds nothing (TYPE_VOID), but `a` is still a local.
+            gi_set(@t, TYPE_VOID, null, 0, TYPE_VOID)
+            if s.var_array_shape == null
+                gi_array_spell(s.var_array_size, s.var_array_elem_type, s.var_type_name, s.var_type_name_len, s.var_array_elem_pointee, @t)
+            gi_add_local(s.var_name, s.var_name_len, @t)
             return
         gi_set(@t, s.var_type, s.var_type_name, s.var_type_name_len, s.var_pointee_type)
         gi_add_local(s.var_name, s.var_name_len, @t)
@@ -769,7 +823,12 @@ fn gi_walk_fn(m: *Module, f: *FnDef, impl_name: *u8, impl_len: i32)
     var p: *Param = f.params
     while p != null
         var t: GiType
-        if p.is_self_borrow == 1 and p.param_type_name_len == 0
+        # Not typed, a param still shadows: gi_infer_call skips a call through it.
+        gi_set(@t, TYPE_VOID, null, 0, TYPE_VOID)
+        if p.param_type == TYPE_ARRAY
+            # AGAST #3277: a by-value `a: [N]E`.
+            gi_array_spell(p.param_array_size, p.param_array_elem_type, p.param_type_name, p.param_type_name_len, p.param_array_elem_pointee, @t)
+        else if p.is_self_borrow == 1 and p.param_type_name_len == 0
             gi_set(@t, TYPE_STRUCT, impl_name, impl_len, TYPE_VOID)
         else if p.is_borrow == 1 and p.param_pointee_type == TYPE_STRUCT
             gi_set(@t, TYPE_STRUCT, p.param_type_name, p.param_type_name_len, TYPE_VOID)
