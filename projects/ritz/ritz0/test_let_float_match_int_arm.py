@@ -424,6 +424,14 @@ fn u(x: u32) -> f64
     let a: f64 = if x > 3 then x else 1
     return a
 
+fn ub(x: u32) -> f64
+    let a: f64 = if x > 3
+        let y: u32 = x
+        y
+    else
+        1
+    return a
+
 fn main() -> i32
     if h(5) != 5.0
         return 1
@@ -439,6 +447,10 @@ fn main() -> i32
         return 6
     if u(4000000000) != 4000000000.0
         return 7
+    if ub(4000000000) != 4000000000.0
+        return 8
+    if ub(2) != 1.0
+        return 9
     return 42
 """
 
@@ -464,12 +476,18 @@ fn main() -> i32
 
 # The match form, all integer arms of differing types. Each arm converts by
 # its own type: merged first, u32 and i16 widened to an i32 phi and 4e9 came
-# out negative. (A u32 *payload* binding still converts signed in ritz0: its
-# type is out of scope at the merge: AGAST #3332.)
+# out negative. A u32 *payload* binding `x` converted signed in ritz0 too: the
+# merge converts after the arm's scope closed, so x's type was gone (#3332).
 ALL_INT_ARMS_MATCH = """\
 import ritzlib.option
 
 fn f(o: Option<i16>) -> f64
+    let a: f64 = match o
+        None => 1
+        Some(x) => x
+    return a
+
+fn p(o: Option<u32>) -> f64
     let a: f64 = match o
         None => 1
         Some(x) => x
@@ -494,6 +512,11 @@ fn main() -> i32
         return 4
     if g(2, 1, 1) != 3.0
         return 5
+    let big: u32 = 4000000000
+    if p(Some(big)) != 4000000000.0
+        return 6
+    if p(None) != 1.0
+        return 7
     return 42
 """
 
@@ -693,3 +716,30 @@ def test_ritz1_refuses_lossy_int_arm(ritz1_bin, tmp_path, program):
     rc, diag = _ritz1_run(ritz1_bin, tmp_path, program)
     assert rc is None, "ritz1 accepted a lossy i64 arm"
     assert LOSSY_WORDS in diag, diag
+
+
+# AGAST #3332: a u64 payload arm is refused as `u64`, not `i64`: its
+# signedness is read in the arm, where `x` is still bound. ritz1 accepts this
+# arm with a silent sitofp (AGAST #3345), so the row is ritz0's alone.
+LOSSY_U64_PAYLOAD = """\
+import ritzlib.option
+
+fn f(o: Option<u64>) -> f64
+    let a: f64 = match o
+        None => 1
+        Some(x) => x
+    return a
+
+fn main() -> i32
+    return f(None) as i32
+"""
+
+
+@pytest.mark.integration
+def test_ritz0_refuses_u64_payload_arm_as_u64(run_ritz0, tmp_path):
+    comp = _ritz0_compile(run_ritz0, tmp_path, LOSSY_U64_PAYLOAD)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert "bad.ritz:6:20:" in out, out
+    assert ("implicit conversion from `u64` to `f64` can lose precision"
+            in out), out

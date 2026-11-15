@@ -734,6 +734,10 @@ class LLVMEmitter:
         # id(value) -> (value, the expression it last came from): `_convert_type`
         # reports where a value was written, and most of its callers don't say.
         self._value_origin: Dict[int, Tuple[ir.Value, rast.Expr]] = {}
+        # AGAST #3332: id(match arm value) -> (value, unsigned), read while the
+        # arm's bindings are in scope. The float merge converts the arm after
+        # they are gone, and a u32 payload `x` then read as signed.
+        self._arm_unsigned: Dict[int, Tuple[ir.Value, bool]] = {}
         # Ids of the tails about to land in a `*u8` slot (#2341).
         self._ptr_tails: Set[int] = set()
         # AGAST #3225: id(arithmetic node) -> (bits, unsigned) of the integer
@@ -14402,7 +14406,7 @@ class LLVMEmitter:
         if src is None or self._int_literal_only(src):
             return self.builder.sitofp(val, target_type)
         width = val.type.width
-        unsigned = self._int_shape(src, width < 64)[1]
+        unsigned = self._origin_unsigned(val, src)
         dst = 'f32' if isinstance(target_type, ir.FloatType) else 'f64'
         if not float_rules.is_exact(width, dst):
             src_name = f"{'u' if unsigned else 'i'}{width}"
@@ -14411,6 +14415,26 @@ class LLVMEmitter:
         if unsigned:
             return self.builder.uitofp(val, target_type)
         return self.builder.sitofp(val, target_type)
+
+    def _pin_arm_unsigned(self, val) -> None:
+        """Record match arm value `val`'s signedness while its bindings are
+        in scope (AGAST #3332), for _merge_arms_at_float to convert it by."""
+        if not isinstance(getattr(val, 'type', None), ir.IntType):
+            return
+        origin = self._value_origin.get(id(val))
+        if origin is None or origin[0] is not val:
+            return
+        unsigned = self._int_shape(origin[1], val.type.width < 64)[1]
+        self._arm_unsigned[id(val)] = (val, unsigned)
+
+    def _origin_unsigned(self, val: ir.Value, src: rast.Expr) -> bool:
+        """Is integer `val`, from expression `src`, unsigned? A match arm's
+        value takes what _pin_arm_unsigned read in the arm: by the merge, a
+        payload binding's type has gone out of scope."""
+        pinned = self._arm_unsigned.get(id(val))
+        if pinned is not None and pinned[0] is val:
+            return pinned[1]
+        return self._int_shape(src, val.type.width < 64)[1]
 
     def _int_source_unsigned(self, val: ir.Value, at: Optional[rast.Expr]) -> bool:
         """Is integer `val`, about to widen into a wider slot, unsigned (AGAST
@@ -15949,6 +15973,7 @@ class LLVMEmitter:
                 arm.body, getattr(self, '_expected_enum_name', None))
             self.has_returned = _saved_arm_returned
             self._end_diverging_arm(arm.body)
+            self._pin_arm_unsigned(arm_val)  # payload bindings still in scope
             if scrut_flag is not None:
                 # Falling off the arm drops what its bindings still own.
                 self._leave_drop_scope()
