@@ -1935,7 +1935,10 @@ class LLVMEmitter:
 
         # Get the StrView struct type
         # StrView is: { ptr: *u8, len: i64 }
-        if "StrView" in self.struct_types:
+        if expr.as_span:
+            # A `Span<u8>` slot (AGAST #3353), registered StrView or not.
+            strview_type = self._u8_span_struct(expr.span)
+        elif "StrView" in self.struct_types:
             strview_type = self.struct_types["StrView"]
         else:
             # Create inline literal struct type if StrView not defined
@@ -11337,6 +11340,9 @@ class LLVMEmitter:
             wants_ptr = self._is_u8_ptr(tail_slot)
             if isinstance(tail, rast.StringLit):
                 tail.as_ptr = wants_ptr
+                # AGAST #3353: and a `Span<u8>` in a `Span<u8>` slot, so the
+                # answer no longer hangs on whether StrView is registered.
+                tail.as_span = self._is_u8_span(tail_slot)
             if wants_ptr:
                 self._ptr_tails.add(id(tail))
             elif fit:
@@ -11409,6 +11415,23 @@ class LLVMEmitter:
     def _is_u8_ptr(ty: Optional[rast.Type]) -> bool:
         return (isinstance(ty, rast.PtrType) and isinstance(ty.inner, rast.NamedType)
                 and ty.inner.name == 'u8')
+
+    @staticmethod
+    def _is_u8_span(ty: Optional[rast.Type]) -> bool:
+        """`Span<u8>`, or the `Span$u8` the monomorphizer renamed it to."""
+        if not isinstance(ty, rast.NamedType):
+            return False
+        if ty.name == 'Span$u8' and not ty.args:
+            return True
+        return (ty.name == 'Span' and len(ty.args) == 1
+                and isinstance(ty.args[0], rast.NamedType)
+                and ty.args[0].name == 'u8' and not ty.args[0].args)
+
+    def _u8_span_struct(self, span) -> ir.Type:
+        """The `Span$u8` struct: ritzlib.span's instance, else the built-in."""
+        name = self._ensure_builtin_generic_struct_specialization(
+            rast.NamedType(span, 'Span', [rast.NamedType(span, 'u8', [])]))
+        return self.struct_types[name]
 
     def _check_literal_fits(self, tail: rast.Expr, slot: rast.Type) -> None:
         """A literal that can't be `slot` is an error wherever it is (#2341)."""

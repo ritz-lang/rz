@@ -255,6 +255,10 @@ class StringLit(Expr):
     # default is StrView (LARB R3, AGAST #2341). A slot visit always rewrites
     # it, so a body shared between two instantiations can't keep a stale type.
     as_ptr: bool = field(default=False, compare=False, repr=False)
+    # Set the same way when the slot is `Span<u8>`: the literal is then a
+    # `Span$u8` over its bytes, whether or not a StrView struct is registered
+    # (AGAST #3353).
+    as_span: bool = field(default=False, compare=False, repr=False)
 
 
 @dataclass
