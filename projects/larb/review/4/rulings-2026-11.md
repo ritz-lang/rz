@@ -1677,7 +1677,7 @@ Tickets #3409 (ritz0 removal, test_level24's union tests and #1622's
 EXPECTED_FAILURES entry go with it) and #3411 (ritz1: a located error in place of
 the unlocated parse failure). No migration ticket: nothing else uses it.
 
-## Follow-up rulings, 2026-11-15 (evening): R34b, R43a, R45a, R47a, R52a
+## Follow-up rulings, 2026-11-15 (evening): R34b, R43a, R45a, R46a, R47a, R47b, R51a, R52a
 
 Questions the implementing rooms raised. Each ruling is also on its ticket.
 
@@ -1715,6 +1715,18 @@ linkage. Order:
    a located error.
 4. #3386: private fns become `internal`, as R45 ruled.
 
+### R46a: a block inside brackets (#3387, #3388): R46 AS WRITTEN
+Inside `(`, `[` or `{` indentation is ignored, so no indented block can open
+there. A multi-line `if`/`match` inside brackets is a located error at the
+`if`/`match` on both compilers; a one-line `if c then a else b` stays legal.
+No `.ritz` code in the corpus opens a block inside brackets (only Python test
+cases and the spec example at #1435 do), and ritz1 already refuses it.
+Allowing it would make layout depend on context, and would block #3426's
+natural fix (no NEWLINE inside brackets). The rewrite is one line: bind the
+`if`/`match` with `let` and pass the name. #3429 (ritz0) adds the error,
+rewrites the pinned tests and the spec example, and adds the rule to §2.2.
+#3388 makes ritz1's refusal point at the `if`/`match` with the same message.
+
 ### R47a: angelo's 16 sites (#3389): MIGRATE AS IS
 Over R47's ~10 limit, but there's one cause in one package: `TAG_*: u32` consts
 passed where `Tag { value: u32 }` goes, because a const can't have a struct
@@ -1722,6 +1734,29 @@ type. The limit was there to catch an unexpected kind of site, and this isn't
 one. Each site becomes `Tag { value: TAG_X }`. Changing angelo's API to take
 `u32` would remove the type check R47 protects. Struct consts are a separate
 question, filed as #3412 (`pending`, blocks nothing).
+
+### R47b: every non-struct arg for a by-value struct param (#3420)
+§9.2's "nothing converts to a struct" covers every argument that isn't the
+struct itself: arithmetic (`a.add(i * 1)`), index and field reads, `bool`,
+floats, through free, method, static and UFCS calls. R47 named ints only
+because #3336 measured ints. ritz0 already refuses all of these (probed with
+`f(true)` and `g(a * 2)`). ritz1 refuses in the newtype box itself, so no form
+can be missed, then deletes the box's newtype path; narrowing a generic `T`
+that turns out to be a struct isn't a conversion and stays. R47's ~10 site
+limit applies.
+
+### R51a: a concrete field type is a slot (#3314, #3408): YES
+In a generic struct literal written without type args, a field whose declared
+type is fully known is a slot for its value: `W { a: 3, t: Tagged { n: 4 } }`
+with `t: Tagged<u8>` gives the inner literal `Tagged<u8>`. Fully known means
+the type uses none of the outer struct's params, or only ones already fixed by
+the outer literal's slot or written args. A field mentioning a still-unknown
+param (`Tagged<A>`) isn't a slot: the inner literal infers itself and that
+decides `A`, inside out. Partly known (`Pair<u8, A>`) counts as not known, with
+no partial matching. Likewise a generic fn's concretely typed param is a slot
+for its argument. This only accepts code refused today. #3430 (ritz0, with
+§9.2's sentence and example) and #3431 (ritz1) implement it; #3408 correctly
+matched ritz0 at the time.
 
 ### R52a: what removing unions leaves (#3409): THE ROOM'S CALLS STAND
 - `|` always ends a type, so `x as u64 | 1` is `(x as u64) | 1`. `as` binds
