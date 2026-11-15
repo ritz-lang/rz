@@ -144,9 +144,6 @@ class TypeChecker:
         # shares its variants' names with every other instance.
         self.variant_owners: Dict[str, int] = {}
 
-        # Trait implementations: trait_name -> set of type names that implement it
-        self.trait_impls: Dict[str, Set[str]] = {}
-
         # Current context
         self.locals: Dict[str, rast.Type] = {}  # local variables
         self.current_fn: Optional[FnSig] = None
@@ -178,14 +175,9 @@ class TypeChecker:
             elif isinstance(item, rast.ExternFn):
                 self._register_extern(item)
 
-        # Also collect impl block methods and trait implementations
+        # Also collect impl block methods
         for item in module.items:
             if isinstance(item, rast.ImplBlock):
-                # Track trait implementations
-                if item.trait_name:
-                    if item.trait_name not in self.trait_impls:
-                        self.trait_impls[item.trait_name] = set()
-                    self.trait_impls[item.trait_name].add(item.type_name)
                 # Register methods
                 for method in item.methods:
                     self._register_method(item, method)
@@ -2002,37 +1994,6 @@ class TypeChecker:
                     return False
             return self._types_compatible(actual.ret, expected.ret)
 
-        # Trait objects (dyn Trait)
-        if isinstance(actual, rast.DynType) and isinstance(expected, rast.DynType):
-            # Same trait name = compatible (ignore args for now)
-            return actual.trait_name == expected.trait_name
-
-        # Coercion to dyn Trait: &T -> &dyn Trait when T implements Trait
-        if isinstance(expected, rast.DynType):
-            # Reference/pointer to dyn Trait
-            if isinstance(actual, (rast.RefType, rast.PtrType)):
-                inner = actual.inner
-                if isinstance(inner, rast.NamedType):
-                    # Check if the concrete type implements the trait
-                    if self._type_implements_trait(inner.name, expected.trait_name):
-                        return True
-
-        # Reference/pointer wrapping dyn Trait
-        if isinstance(expected, (rast.RefType, rast.PtrType)):
-            if isinstance(expected.inner, rast.DynType):
-                if isinstance(actual, (rast.RefType, rast.PtrType)):
-                    inner = actual.inner
-                    if isinstance(inner, rast.NamedType):
-                        # &T -> &dyn Trait coercion
-                        if self._type_implements_trait(inner.name, expected.inner.trait_name):
-                            return True
-
-        return False
-
-    def _type_implements_trait(self, type_name: str, trait_name: str) -> bool:
-        """Check if a type implements a given trait."""
-        if trait_name in self.trait_impls:
-            return type_name in self.trait_impls[trait_name]
         return False
 
     def _promote_numeric_types(self, t1: rast.Type, t2: rast.Type) -> rast.Type:

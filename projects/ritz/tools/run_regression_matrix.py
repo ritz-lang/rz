@@ -68,8 +68,6 @@ _RITZ1_TWINS = {
     "test_native_string":
         "AGAST #1627 — unspecified ritz0-only \"...\"→String coercion",
     # --- grammar / missing features ---
-    "test_level40":
-        "AGAST #1620 — `dyn Trait`",
     "test_trait_bounds":
         "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "
         "(multi-arg generic calls)",

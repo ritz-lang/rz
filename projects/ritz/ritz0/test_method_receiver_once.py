@@ -4,7 +4,7 @@
 and again to pass it, so `make(1).peek()` ran `make` twice and a chain doubled
 at every link. Each program counts its side effects in `MADE`, and the exit
 status is `MADE * 10 + DROPS`. Every route a receiver can take has a case:
-each kind of `self`, generics, traits, `dyn`, the built-in methods that bypass
+each kind of `self`, generics, traits, the built-in methods that bypass
 the impl table, places whose operands have side effects, and receivers inside
 argument positions.
 """
@@ -172,7 +172,6 @@ fn ms() -> Span<u8>
 # missing is something else, so each row cites its own ticket.
 BOTH_RITZ1 = ("ritz1", "ritz1_selfhosted")
 NO_RVALUE_ARGS = {c: 2297 for c in BOTH_RITZ1}
-NO_DYN = {c: 1620 for c in BOTH_RITZ1}  # ritz1 refuses `dyn` (#2298)
 
 ARRAY = "var arr: [2]P = [P { x: 1 }, P { x: 2 }]\n    "
 NESTED = "var arr: [2]W = [W { p: P { x: 1 } }, W { p: P { x: 2 } }]\n    "
@@ -245,18 +244,6 @@ pub fn main() -> i32
 
 # name -> (whole program after the prelude, expected exit status, gaps)
 PROGRAMS = {
-    # A trait object goes through the vtable, not the impl table.
-    "dyn_receiver": ("""\
-fn md(p: @P) -> dyn Speak
-    MADE = MADE + 1
-    return p as dyn Speak
-
-pub fn main() -> i32
-    var held = P { x: 7 }
-    let r = md(@held).say()
-    return MADE * 10 + r
-""", 17, NO_DYN),
-
     # `make(1).bump()` and `t.again().bump()` wrote a temporary, and its drop
     # saw the write (AGAST #2262).  Both are refused since AGAST #2518: the
     # write is lost.  What a lent temporary's drop sees is

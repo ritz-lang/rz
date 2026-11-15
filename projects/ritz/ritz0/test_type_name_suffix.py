@@ -48,8 +48,6 @@ AGREE = [
     pytest.param(rast.TupleType(None, [I32, U8]), id="tuple"),
     pytest.param(rast.FnType(None, [I32], I32), id="fn"),
     pytest.param(rast.FnType(None, [I32, U8], None), id="fn-unit-ret"),
-    pytest.param(rast.DynType(None, "Show", []), id="dyn"),
-    pytest.param(rast.DynType(None, "Iter", [I32]), id="dyn-args"),
     pytest.param(rast.VectorType(None, 4, I32), id="vector"),
     pytest.param(rast.UnionType(None, [I32, U8]), id="union"),
     pytest.param(rast.FnType(None, [rast.PtrType(None, U8, True)],

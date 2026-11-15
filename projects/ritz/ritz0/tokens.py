@@ -49,7 +49,7 @@ class TokenType(Enum):
     TYPE = auto()
     TRAIT = auto()
     IMPL = auto()
-    DYN = auto()           # dyn keyword for trait objects
+    DYN = auto()           # reserved: refused wherever it appears (AGAST #1620)
     MUT = auto()
     ASYNC = auto()
     AWAIT = auto()

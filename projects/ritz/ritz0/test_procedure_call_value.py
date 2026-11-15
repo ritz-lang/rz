@@ -266,14 +266,6 @@ REJECTED = {
         "    return f<C>(c) as i32\n", "t", 9),
 }
 
-# ritz1 refuses `dyn` at the `dyn` (#2298) until #1620 decides it
-# (test_fn_tail_requires_value.py keeps the same split).
-REJECTED_RITZ0_ONLY = {
-    "dyn_method_call": (
-        _TRAIT + "fn f(x: *dyn T) -> i64\n"
-        "    return x.t()\n", "t", 9),
-}
-
 ACCEPTED = {
     "let_of_a_call_with_a_value": (
         "fn h(n: i64) -> i64\n"
@@ -410,9 +402,9 @@ def _assert_rejected(rc, output, name, callee, line):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted({**REJECTED, **REJECTED_RITZ0_ONLY}))
+@pytest.mark.parametrize("name", sorted(REJECTED))
 def test_ritz0_rejects_a_value_from_a_procedure(tmp_path, name):
-    source, callee, line = {**REJECTED, **REJECTED_RITZ0_ONLY}[name]
+    source, callee, line = REJECTED[name]
     _assert_rejected(*_ritz0(tmp_path, source), name, callee, line)
 
 

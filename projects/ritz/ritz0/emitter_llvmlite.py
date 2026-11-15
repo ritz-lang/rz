@@ -785,15 +785,6 @@ class LLVMEmitter:
         # Method lookup: (type_name, method_name) -> mangled_fn_name
         self.method_lookup: Dict[Tuple[str, str], str] = {}
 
-        # Trait objects (dyn Trait) support
-        # vtable_types: trait_name -> LLVM struct type for vtable
-        # Each vtable is a struct of function pointers for trait methods
-        self.vtable_types: Dict[str, ir.BaseStructType] = {}
-        # vtable_instances: (trait_name, impl_type) -> global vtable instance
-        self.vtable_instances: Dict[Tuple[str, str], ir.GlobalVariable] = {}
-        # dyn_types: trait_name -> LLVM struct type for fat pointer {*data, *vtable}
-        self.dyn_types: Dict[str, ir.BaseStructType] = {}
-
         # Debug info state
         self.source_file = source_file
         self.source_dir = source_dir
@@ -1198,13 +1189,6 @@ class LLVMEmitter:
             # Maps to LLVM vector types for SSE2/AVX operations
             inner = self._ritz_type_to_llvm(ty.inner)
             return ir.VectorType(inner, ty.count)
-        elif isinstance(ty, rast.DynType):
-            # Trait object: dyn Trait -> { *void data, *vtable }
-            # Fat pointer for runtime polymorphism
-            if ty.trait_name in self.dyn_types:
-                return self.dyn_types[ty.trait_name]
-            # If vtable not yet created, create a placeholder fat pointer
-            return ir.LiteralStructType([self.i8_ptr, self.i8_ptr])
         elif isinstance(ty, rast.TupleType):
             # Tuple type: (T1, T2, ...) -> { T1, T2, ... }
             # Maps to LLVM literal struct type
@@ -2689,10 +2673,6 @@ class LLVMEmitter:
             elif isinstance(item, rast.ImplBlock):
                 self._process_impl(item)
 
-        # Fourth-and-a-half pass: create vtable instances for trait impls
-        # This must happen after all functions are declared but we create stubs first
-        self._create_vtable_instances()
-
         # Fifth pass: declare all functions (signatures only)
         # This enables forward references - functions can call each other
         # regardless of source order
@@ -3668,40 +3648,9 @@ class LLVMEmitter:
         """Process a trait definition.
 
         Stores method signatures for validation when checking impl blocks.
-        Also creates vtable type for dyn Trait support.
+        Traits are compile-time only (LANGUAGE_SPEC §12.2): no vtables.
         """
         self.traits[trait_def.name] = trait_def.methods
-
-        # Create vtable type for dyn Trait
-        # Vtable layout: { fn_ptr_drop, fn_ptr_method1, fn_ptr_method2, ... }
-        vtable_fields = []
-
-        # First slot: drop function (for destructor)
-        # void (*drop)(void* self)
-        drop_fn_type = ir.FunctionType(self.void, [self.i8_ptr])
-        vtable_fields.append(ir.PointerType(drop_fn_type))
-
-        # Add slots for each trait method
-        for method in trait_def.methods:
-            # Method signature: ret_type (*method)(void* self, args...)
-            # First param is self as opaque pointer
-            param_types = [self.i8_ptr]  # self as opaque ptr
-            # Add other parameters (skip self param from method signature)
-            for param in method.params[1:]:  # Skip self
-                param_types.append(self._ritz_type_to_llvm(param.type))
-            ret_type = self._ritz_type_to_llvm(method.ret_type) if method.ret_type else self.void
-            fn_type = ir.FunctionType(ret_type, param_types)
-            vtable_fields.append(ir.PointerType(fn_type))
-
-        # Create vtable struct type
-        vtable_type = self.module.context.get_identified_type(f"vtable.{trait_def.name}")
-        vtable_type.set_body(*vtable_fields)
-        self.vtable_types[trait_def.name] = vtable_type
-
-        # Create dyn type: { *void data, *vtable }
-        dyn_type = self.module.context.get_identified_type(f"dyn.{trait_def.name}")
-        dyn_type.set_body(self.i8_ptr, ir.PointerType(vtable_type))
-        self.dyn_types[trait_def.name] = dyn_type
 
     def _process_impl(self, impl_block: rast.ImplBlock):
         """Process an impl block.
@@ -3770,116 +3719,6 @@ class LLVMEmitter:
                 if getattr(method, 'is_monomorphized', False):
                     mangled_method.is_monomorphized = True
                 self._emit_function_body(mangled_method)
-
-    def _create_vtable_instances(self):
-        """Create vtable instances for all trait implementations.
-
-        For each (trait_name, impl_type) pair, creates a global constant
-        vtable struct containing function pointers to the impl methods.
-        """
-        for (trait_name, type_name), methods in self.impls.items():
-            # Skip inherent impls (no trait)
-            if trait_name is None:
-                continue
-
-            # Skip if trait doesn't have a vtable type (shouldn't happen)
-            if trait_name not in self.vtable_types:
-                continue
-
-            vtable_type = self.vtable_types[trait_name]
-            trait_methods = self.traits.get(trait_name, [])
-
-            # Build vtable values
-            vtable_values = []
-
-            # First slot: drop function
-            # Look for a drop method, or use a no-op
-            drop_mangled = f"{type_name}_drop"
-            if drop_mangled in self.functions:
-                fn, _ = self.functions[drop_mangled]
-                # Cast to void(*)(void*) signature
-                drop_fn_type = ir.FunctionType(self.void, [self.i8_ptr])
-                vtable_values.append(fn.bitcast(ir.PointerType(drop_fn_type)))
-            else:
-                # No drop method - use null pointer
-                drop_fn_type = ir.FunctionType(self.void, [self.i8_ptr])
-                vtable_values.append(ir.Constant(ir.PointerType(drop_fn_type), None))
-
-            # Add slots for each trait method
-            for trait_method in trait_methods:
-                mangled_name = f"{type_name}_{trait_method.name}"
-                if mangled_name in self.functions:
-                    fn, _ = self.functions[mangled_name]
-                    # Get expected type from vtable
-                    slot_index = len(vtable_values)
-                    expected_fn_type = vtable_type.elements[slot_index].pointee
-                    # Cast function pointer to opaque self version
-                    vtable_values.append(fn.bitcast(ir.PointerType(expected_fn_type)))
-                else:
-                    # Method not found - this is an error but we'll use null for now
-                    slot_index = len(vtable_values)
-                    expected_fn_type = vtable_type.elements[slot_index].pointee
-                    vtable_values.append(ir.Constant(ir.PointerType(expected_fn_type), None))
-
-            # Create global vtable constant
-            vtable_name = f"vtable.{trait_name}.{type_name}"
-            vtable_const = ir.Constant(vtable_type, vtable_values)
-            vtable_global = ir.GlobalVariable(self.module, vtable_type, name=vtable_name)
-            vtable_global.global_constant = True
-            vtable_global.initializer = vtable_const
-            vtable_global.linkage = 'private'
-
-            self.vtable_instances[(trait_name, type_name)] = vtable_global
-
-    # ================================================================
-    # Fat Pointer Operations (dyn Trait support)
-    # ================================================================
-
-    def _pack_fat_pointer(self, trait_name: str, data_ptr: ir.Value, vtable_ptr: ir.Value) -> ir.Value:
-        """Create a fat pointer { data_ptr, vtable_ptr } for dyn Trait.
-
-        Args:
-            trait_name: Name of the trait
-            data_ptr: Pointer to concrete type data (will be cast to i8*)
-            vtable_ptr: Pointer to vtable global
-
-        Returns:
-            Fat pointer struct value
-        """
-        dyn_type = self.dyn_types[trait_name]
-
-        # Cast data pointer to i8* if needed
-        if data_ptr.type != self.i8_ptr:
-            data_ptr = self.builder.bitcast(data_ptr, self.i8_ptr, name='dyn.data')
-
-        # Build fat pointer struct
-        fat_ptr = ir.Constant(dyn_type, ir.Undefined)
-        fat_ptr = self.builder.insert_value(fat_ptr, data_ptr, 0, name='dyn.with_data')
-        fat_ptr = self.builder.insert_value(fat_ptr, vtable_ptr, 1, name='dyn.fat_ptr')
-        return fat_ptr
-
-    def _extract_data_ptr(self, fat_pointer: ir.Value) -> ir.Value:
-        """Extract data pointer from fat pointer (index 0)."""
-        return self.builder.extract_value(fat_pointer, 0, name='dyn.data_ptr')
-
-    def _extract_vtable_ptr(self, fat_pointer: ir.Value) -> ir.Value:
-        """Extract vtable pointer from fat pointer (index 1)."""
-        return self.builder.extract_value(fat_pointer, 1, name='dyn.vtable_ptr')
-
-    def _get_vtable_for_type(self, trait_name: str, impl_type: str) -> Optional[ir.GlobalVariable]:
-        """Look up vtable instance for (trait, type) pair."""
-        return self.vtable_instances.get((trait_name, impl_type))
-
-    def _get_trait_method_index(self, trait_name: str, method_name: str) -> int:
-        """Get the index of a method in a trait's vtable.
-
-        Index 0 is always the drop function, so methods start at index 1.
-        """
-        trait_methods = self.traits.get(trait_name, [])
-        for i, method in enumerate(trait_methods):
-            if method.name == method_name:
-                return i + 1  # +1 because drop is at index 0
-        raise ValueError(f"Method {method_name} not found in trait {trait_name}")
 
     def _get_struct_field_index(self, struct_name: str, field_name: str) -> int:
         """Get the index of a field in a struct.
@@ -5599,7 +5438,7 @@ class LLVMEmitter:
 
         This runs twice (AGAST #2237). The first pass is before the tail is
         emitted, when a method call's receiver cannot be typed yet: it may be
-        a local of an arm, or a generic or `dyn` value. `_emit_method_call`
+        a local of an arm, or a generic value. `_emit_method_call`
         records each call it resolves to a procedure, and the second pass,
         after the tail is emitted, passes those as `yields_nothing`.
         """
@@ -6148,7 +5987,7 @@ class LLVMEmitter:
 
         A named call is judged here, before emission. A method call's callee
         is known only once its receiver is typed as it is emitted (it may be
-        a local of the arm, a generic or a `dyn`), so each used arm is
+        a local of the arm or a generic), so each used arm is
         recorded for `_reject_void_method_arm` (AGAST #2256).
         """
         for arm in self._used_arm_values(expr, consumed):
@@ -13530,8 +13369,6 @@ class LLVMEmitter:
         and call the appropriate mangled function.
 
         If the method expects *Self and receiver is a value, we auto-borrow.
-
-        For dyn Trait, we use dynamic dispatch through the vtable.
         """
         # Associated function on a built-in generic type: `Span.empty()`,
         # `Vec.new()`, ... The receiver is a *type*, not a value, so there is
@@ -13557,15 +13394,6 @@ class LLVMEmitter:
                     and self._has_enum_variant(enum_name, expr.method)):
                 return self._emit_enum_variant_constructor_for_type(
                     expr.method, expr.args, enum_name)
-
-        # Check if this is a method call on a dyn Trait (dynamic dispatch)
-        receiver_type = self._infer_ritz_type(expr.expr)
-        if isinstance(receiver_type, rast.DynType):
-            return self._emit_dyn_method_call(expr, receiver_type)
-        # Also handle reference to dyn Trait
-        if isinstance(receiver_type, (rast.RefType, rast.PtrType)):
-            if isinstance(receiver_type.inner, rast.DynType):
-                return self._emit_dyn_method_call(expr, receiver_type.inner)
 
         # First, check if the receiver is an lvalue (identifier, field, index)
         # If so, get its address for auto-borrowing when method expects *Self
@@ -14015,59 +13843,6 @@ class LLVMEmitter:
             for _ in range(levels - self_levels):
                 receiver = self.builder.load(receiver)
         return receiver
-
-    def _emit_dyn_method_call(self, expr: rast.MethodCall, dyn_type: rast.DynType) -> ir.Value:
-        """Emit a method call on a dyn Trait using dynamic dispatch.
-
-        Dynamic dispatch works through the vtable:
-        1. Extract data pointer and vtable pointer from fat pointer
-        2. Look up method function pointer in vtable
-        3. Call through function pointer with data as self
-        """
-        trait_name = dyn_type.trait_name
-
-        # Emit receiver (the fat pointer)
-        fat_ptr = self._emit_expr(expr.expr)
-
-        # If fat_ptr is a pointer to dyn struct, load it
-        dyn_struct_type = self.dyn_types.get(trait_name)
-        if dyn_struct_type and isinstance(fat_ptr.type, ir.PointerType):
-            if fat_ptr.type.pointee == dyn_struct_type:
-                fat_ptr = self.builder.load(fat_ptr, name='dyn.loaded')
-
-        # Extract data and vtable pointers
-        data_ptr = self._extract_data_ptr(fat_ptr)
-        vtable_ptr = self._extract_vtable_ptr(fat_ptr)
-
-        # Get method index in vtable
-        method_index = self._get_trait_method_index(trait_name, expr.method)
-        if self.traits[trait_name][method_index - 1].ret_type is None:
-            self._procedure_method_calls.add(id(expr))
-            self._reject_procedure_value(expr, expr.method)
-            self._reject_void_method_arm(expr)
-
-        # Get vtable type for GEP
-        vtable_type = self.vtable_types[trait_name]
-
-        # Load method function pointer from vtable
-        # vtable_ptr is *vtable.Trait, we need to GEP to get the method slot
-        method_ptr_ptr = self.builder.gep(
-            vtable_ptr,
-            [ir.Constant(self.i32, 0), ir.Constant(self.i32, method_index)],
-            name=f'dyn.method.{expr.method}.ptr_ptr'
-        )
-        method_ptr = self.builder.load(method_ptr_ptr, name=f'dyn.method.{expr.method}.ptr')
-
-        # Build arguments: data_ptr as opaque self, then explicit args
-        all_args = [data_ptr]
-        trait_params = self.traits[trait_name][method_index - 1].params
-        for arg, param in zip(expr.args, trait_params[-len(expr.args):]):
-            self._literal_into_slot(param.type, arg)
-        for arg in expr.args:
-            all_args.append(self._emit_expr(arg))
-
-        # Call through function pointer
-        return self.builder.call(method_ptr, all_args, name=f'dyn.call.{expr.method}')
 
     def _emit_syscall(self, name: str, args: List[rast.Expr]) -> ir.Value:
         """Emit an inline syscall."""
@@ -16469,7 +16244,7 @@ class LLVMEmitter:
         nested generic NamedType, which keeps the `Base$args` name its struct
         is registered under. There is no `str(ty)` fallback: it embeds the
         source span, so one type written at two places got two names
-        (AGAST #1321 for tuples, #2742 for fn/dyn/ref/array/vector/union).
+        (AGAST #1321 for tuples, #2742 for fn/ref/array/vector/union).
         """
         ty = resolve_alias_in(ty, self.type_aliases)
         suffix = self._type_to_name_suffix
@@ -16494,9 +16269,6 @@ class LLVMEmitter:
             params = "".join(f"_{suffix(p)}" for p in ty.params)
             ret = suffix(ty.ret) if ty.ret is not None else "unit"
             return f"fn{len(ty.params)}{params}_ret_{ret}"
-        elif isinstance(ty, rast.DynType):
-            args = "".join(f"_{suffix(a)}" for a in ty.args)
-            return f"dyn_{ty.trait_name}{args}"
         elif isinstance(ty, rast.VectorType):
             return f"vec{ty.count}_{suffix(ty.inner)}"
         elif isinstance(ty, rast.UnionType):
@@ -16617,15 +16389,6 @@ class LLVMEmitter:
         # Check if casting TO a union type
         if isinstance(expr.target, rast.NamedType) and expr.target.name in self.union_types:
             return self._emit_cast_to_union(expr)
-
-        # Check if casting TO a dyn Trait type
-        if isinstance(expr.target, rast.DynType):
-            return self._emit_cast_to_dyn(expr)
-
-        # Check if casting TO a reference/pointer to dyn Trait (e.g., &dyn Animal)
-        if isinstance(expr.target, (rast.RefType, rast.PtrType)):
-            if isinstance(expr.target.inner, rast.DynType):
-                return self._emit_cast_to_dyn_ref(expr)
 
         # Check if casting FROM a union type to a variant type
         # This happens in match arms: x as i32, x as *u8, etc.
@@ -17021,83 +16784,6 @@ class LLVMEmitter:
 
         # Load and return the value
         return self.builder.load(variant_ptr)
-
-    def _emit_cast_to_dyn(self, expr: rast.Cast) -> ir.Value:
-        """Emit a cast to dyn Trait: expr as dyn Trait.
-
-        This creates a fat pointer { data_ptr, vtable_ptr }.
-        """
-        dyn_type = expr.target  # rast.DynType
-        trait_name = dyn_type.trait_name
-
-        # Get the concrete type being cast
-        concrete_type_name = self._get_type_name_from_expr(expr.expr)
-        if not concrete_type_name:
-            raise ValueError(f"Cannot determine concrete type for dyn cast at {expr.span}")
-
-        # Get the vtable for this (trait, type) pair
-        vtable = self._get_vtable_for_type(trait_name, concrete_type_name)
-        if vtable is None:
-            raise ValueError(f"No vtable found for {concrete_type_name} implementing {trait_name} at {expr.span}")
-
-        # Emit the expression value
-        val = self._emit_expr(expr.expr)
-
-        # Get a pointer to the data
-        # If val is already a pointer, use it directly; otherwise allocate
-        if isinstance(val.type, ir.PointerType):
-            data_ptr = val
-        else:
-            # Allocate storage for the value
-            data_alloca = self.builder.alloca(val.type, name='dyn.storage')
-            self.builder.store(val, data_alloca)
-            data_ptr = data_alloca
-
-        # Create fat pointer
-        return self._pack_fat_pointer(trait_name, data_ptr, vtable)
-
-    def _emit_cast_to_dyn_ref(self, expr: rast.Cast) -> ir.Value:
-        """Emit a cast to &dyn Trait or *dyn Trait.
-
-        This is the most common case: &concrete_val as &dyn Trait.
-        """
-        dyn_type = expr.target.inner  # rast.DynType (inside the RefType/PtrType)
-        trait_name = dyn_type.trait_name
-
-        # Get the concrete type being cast
-        # For &T -> &dyn Trait, we need the T
-        concrete_type_name = self._get_type_name_from_expr(expr.expr)
-        if not concrete_type_name:
-            # Try to infer from the inner type if expr is a reference
-            inner_type = self._infer_ritz_type(expr.expr)
-            if isinstance(inner_type, (rast.RefType, rast.PtrType)):
-                if isinstance(inner_type.inner, rast.NamedType):
-                    concrete_type_name = inner_type.inner.name
-
-        if not concrete_type_name:
-            raise ValueError(f"Cannot determine concrete type for dyn cast at {expr.span}")
-
-        # Get the vtable for this (trait, type) pair
-        vtable = self._get_vtable_for_type(trait_name, concrete_type_name)
-        if vtable is None:
-            raise ValueError(f"No vtable found for {concrete_type_name} implementing {trait_name} at {expr.span}")
-
-        # Emit the expression (should be a reference/pointer)
-        data_ptr = self._emit_expr(expr.expr)
-
-        # Create fat pointer
-        return self._pack_fat_pointer(trait_name, data_ptr, vtable)
-
-    def _get_type_name_from_expr(self, expr: rast.Expr) -> Optional[str]:
-        """Get the concrete type name from an expression."""
-        ritz_type = self._infer_ritz_type(expr)
-        if isinstance(ritz_type, rast.NamedType):
-            return ritz_type.name
-        elif isinstance(ritz_type, (rast.RefType, rast.PtrType)):
-            if isinstance(ritz_type.inner, rast.NamedType):
-                return ritz_type.inner.name
-        return None
-
 
 def filter_by_target_os(module: rast.Module, target_os: str) -> rast.Module:
     """Filter out items that don't match the target OS.

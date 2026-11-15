@@ -180,22 +180,6 @@ class FnType(Type):
 
 
 @dataclass
-class DynType(Type):
-    """A trait object type: dyn Trait.
-
-    Trait objects enable runtime polymorphism through vtables.
-    A dyn Trait value is a fat pointer: (data_ptr, vtable_ptr).
-
-    Example:
-        let animal: @dyn Animal = @dog  # Reference to trait object
-        let boxed: Box<dyn Animal> = Box.new(dog)  # Owned trait object
-    """
-    trait_name: str
-    # Generic args for the trait, e.g., dyn Iterator<Item=i32>
-    args: List['Type'] = field(default_factory=list)
-
-
-@dataclass
 class VectorType(Type):
     """A SIMD vector type: vec<N, T>.
 

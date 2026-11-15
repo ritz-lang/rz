@@ -305,15 +305,11 @@ ACCEPTED = {
 
 
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
-# no N-D initializer, no tuple type, no `dyn` and no `await`.
+# no N-D initializer, no tuple type and no `await`.
 RITZ0_REJECTED = {
     "fit_element_nested": (_fn("", "let a: [1][2]u8 = [ [1, 300] ]\n0"), 2, 29, _fits(300, "u8")),
 }
 RITZ0_ACCEPTED = {
-    "dyn_arg": ('trait T\n    fn take(self, p: *u8) -> i32\nstruct S\n    n: i64\nimpl T for S\n'
-                '    fn take(self, p: *u8) -> i32\n        *p as i32\n'
-                'fn go(t: dyn T) -> i32\n    t.take("A")\n'
-                "fn main() -> i32\n    var s = S { n: 0 }\n    go(@s as dyn T)\n", 65),
     "tuple_element": ('fn main() -> i32\n    let t: (i32, *u8) = (1, "A")\n    *t.1 as i32\n', 65),
     "element_nested": ('fn main() -> i32\n    var a: [1][2]*u8 = [ ["A", "B"] ]\n'
                        "    *a[0][1] as i32\n", 66),

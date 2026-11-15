@@ -2,8 +2,8 @@
 
 `TypeSubstitution.apply`, `Monomorphizer._visit_type` and
 `Monomorphizer._rewrite_type` named NamedType, PtrType, RefType, ArrayType,
-SliceType and FnType, and returned a TupleType (and DynType args, VectorType
-inner) unchanged. A type parameter inside a tuple was never substituted:
+SliceType and FnType, and returned a TupleType (and VectorType inner)
+unchanged. A type parameter inside a tuple was never substituted:
 
     fn first<T>(p: (T, i32)) -> T
 
@@ -61,12 +61,6 @@ class TestApply:
             None, [rast.TupleType(None, [T])]), False))
         assert is_i64(out.inner.elements[0].elements[0])
 
-    def test_dyn_args_substituted(self):
-        out = SUB.apply(rast.DynType(None, "Iter", [T]))
-        assert isinstance(out, rast.DynType)
-        assert out.trait_name == "Iter"
-        assert is_i64(out.args[0])
-
     def test_vector_inner_substituted(self):
         out = SUB.apply(rast.VectorType(None, 4, T))
         assert isinstance(out, rast.VectorType)
@@ -97,9 +91,8 @@ BOX_I32 = named("Box", I32)
 class TestVisitType:
     @pytest.mark.parametrize("wrap", [
         lambda t: rast.TupleType(None, [t, I32]),
-        lambda t: rast.DynType(None, "Iter", [t]),
         lambda t: rast.VectorType(None, 4, t),
-    ], ids=["tuple", "dyn", "vector"])
+    ], ids=["tuple", "vector"])
     def test_generic_struct_inside_compound_is_found(self, wrap):
         m = _mono_with_box()
         m._visit_type(wrap(BOX_I32))
@@ -117,11 +110,6 @@ class TestRewriteType:
         out = self._rewriter()._rewrite_type(rast.TupleType(None, [BOX_I32, I32]))
         assert isinstance(out, rast.TupleType)
         assert out.elements[0].name == "Box$i32" and not out.elements[0].args
-
-    def test_dyn_args_rewritten(self):
-        out = self._rewriter()._rewrite_type(rast.DynType(None, "Iter", [BOX_I32]))
-        assert isinstance(out, rast.DynType)
-        assert out.args[0].name == "Box$i32"
 
     def test_vector_inner_rewritten(self):
         out = self._rewriter()._rewrite_type(rast.VectorType(None, 4, BOX_I32))

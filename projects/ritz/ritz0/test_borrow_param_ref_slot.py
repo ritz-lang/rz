@@ -1028,34 +1028,6 @@ def test_variant_payload_holds_the_written_reference(ritz1_bin, tmp_path, compil
     assert _run(compiler, ritz1_bin, tmp_path, name, VARIANTS[name]) == 3
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("slot", ["let a: @dyn Animal = c", "var a: @dyn Animal = c"])
-def test_ritz0_value_into_a_trait_object_reference_is_located_and_refused(tmp_path, slot):
-    """`@dyn Animal` is a reference, so a `Dog` doesn't fit it. `let` used to bind
-    a `Dog` there, and a call through it raised a raw TypeError. What `dyn` should
-    do at all is #1620's."""
-    program = f"""\
-trait Animal
-    fn speak(self: *Self) -> i32
-
-struct Dog
-    age: i32
-
-impl Animal for Dog
-    fn speak(self: *Self) -> i32
-        return 3
-
-fn go(c:& Dog) -> i32
-    {slot}
-    return 0
-
-pub fn main() -> i32
-    return 0
-"""
-    comp, ll, _ = _compile("ritz0", None, tmp_path, "dyn_slot", program)
-    _refused(comp, ll, VALUE_INTO_SHARED_REF)
-
-
 # AGAST #2311: ritz0 refused this ("cannot store i64 to [2 x i32]*") until #2330
 # made its store stride T, as its read does (LARB R9).
 @pytest.mark.integration

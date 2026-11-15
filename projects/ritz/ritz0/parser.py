@@ -307,9 +307,11 @@ class Parser:
             # Lookahead: check if this looks like type args or a comparison
             # Type args: <T>, <*u8>, <&T>, <[T]>, <fn()>, <@T>, <@&T>
             # Comparison: < 0, < x + y, etc.
+            # `<dyn` is no comparison: parse_type refuses the `dyn` (#1620).
             if not self._peek_at(1, TokenType.IDENT, TokenType.STAR, TokenType.AMP,
                                   TokenType.LBRACKET, TokenType.FN, TokenType.GT,
-                                  TokenType.AT, TokenType.AT_AMP, TokenType.LPAREN):
+                                  TokenType.AT, TokenType.AT_AMP, TokenType.LPAREN,
+                                  TokenType.DYN):
                 return type_args  # Not type args, leave < for expression parser
 
             self._advance()  # consume <
@@ -718,14 +720,10 @@ class Parser:
                 ret = self.parse_type()
             return rast.FnType(span, params, ret)
 
-        # Trait object type: dyn Trait or dyn Trait<Args>
+        # `dyn` is reserved: the language has no trait objects (LANGUAGE_SPEC
+        # §12.2, AGAST #1620). Refused at the token, in ritz1's words (#2298).
         if self._at(TokenType.DYN):
-            self._advance()
-            trait_name_tok = self._expect(TokenType.IDENT, "Expected trait name after 'dyn'")
-            trait_name = trait_name_tok.value
-            # Generic args: dyn Iterator<Item=i32>
-            args = self._parse_type_args() if allow_type_args else []
-            return rast.DynType(span, trait_name, args)
+            raise ParseError("`dyn Trait` is not supported (AGAST #1620)", self._current().span)
 
         # Named type (possibly with generics)
         name_tok = self._expect(TokenType.IDENT, "Expected type name")

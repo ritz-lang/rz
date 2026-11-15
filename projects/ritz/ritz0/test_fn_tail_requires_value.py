@@ -245,14 +245,6 @@ REJECTED = {
         "            return 1\n", 2),
 }
 
-# ritz1 refuses `dyn` at the `dyn` (#2298) until #1620 decides it, so its
-# differential does not read this table.
-REJECTED_RITZ0_ONLY = {
-    "dyn_method_call_to_a_procedure": (
-        _TRAIT + "fn f(b: *dyn T) -> i64\n"
-        "    b.t()\n", 9),
-}
-
 ACCEPTED = {
     "if_else_every_arm_returns": (
         "fn f(n: i64) -> i64\n"
@@ -418,9 +410,9 @@ ACCEPTED = {
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted({**REJECTED, **REJECTED_RITZ0_ONLY}))
+@pytest.mark.parametrize("name", sorted(REJECTED))
 def test_reaching_the_end_without_a_value_is_rejected(tmp_path, name):
-    source, line = {**REJECTED, **REJECTED_RITZ0_ONLY}[name]
+    source, line = REJECTED[name]
     rc, output = _compile(tmp_path, source)
     assert rc != 0, f"{name} must not compile:\n{output}"
     assert MESSAGE in output, output

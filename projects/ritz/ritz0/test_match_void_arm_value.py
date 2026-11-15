@@ -207,18 +207,7 @@ pub fn main() -> i32
         None => 1
     x
 """, H + 6, 13, BOTH),
-    # A `dyn` receiver: ritz1 refuses `dyn` itself (#2298).
-    "let_if_dyn_method": ("""\
-fn f(b: *dyn T, c: i32) -> i32
-    let x: i32 = if c > 0
-        b.t()
-    else
-        7
-    x
-
-pub fn main() -> i32
-    0
-""", H + 3, 9, ("ritz0",)),
+    # A `dyn` receiver is refused at the `dyn` by all three (test_dyn_refused.py).
 }
 
 # The method each REJECTED case's arm calls, for ritz0's diagnostic to name.
@@ -226,7 +215,6 @@ METHOD_ARMS = {
     "let_if_method": "p",
     "argument_inline_if_method": "p",
     "let_match_method_on_arm_local": "p",
-    "let_if_dyn_method": "t",
 }
 
 LEGAL = {

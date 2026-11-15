@@ -1,8 +1,8 @@
 """Every type spells a distinct name in `mangle_type_name` (AGAST #2270).
 
 `mangle_type_name` named NamedType, PtrType, RefType, ArrayType and SliceType
-and returned "unknown" for everything else. Every tuple, fn type, `dyn` trait,
-SIMD vector and union therefore mangled the same, so `wrap<Result<(), Er>>`
+and returned "unknown" for everything else. Every tuple, fn type, `dyn` trait
+(since removed, AGAST #1620), SIMD vector and union therefore mangled the same, so `wrap<Result<(), Er>>`
 and `wrap<Result<(i64, i64), Er>>` were both `wrap$Result_unknown_Er`. The
 second instantiation reused the first, and ritz0 rejected a valid program:
 
@@ -67,13 +67,6 @@ class TestFn:
 
 
 class TestOtherTypes:
-    def test_dyn(self):
-        assert mangle_type_name(rast.DynType(None, "Animal")) == "dyn_Animal"
-
-    def test_dyn_with_args(self):
-        ty = rast.DynType(None, "Iterator", [I32])
-        assert mangle_type_name(ty) == "dyn_Iterator_i32"
-
     def test_vector(self):
         assert mangle_type_name(rast.VectorType(None, 4, I32)) == "vec4_i32"
 
@@ -118,7 +111,6 @@ def test_distinct_types_never_share_a_name():
     types = [
         tup(), tup(I64, I64), tup(I32),
         fn([], None), fn([I32], I32), fn([I64], I32),
-        rast.DynType(None, "A"), rast.DynType(None, "B"),
         rast.VectorType(None, 4, I32), rast.VectorType(None, 2, I64),
         rast.UnionType(None, [I32, I64]), rast.UnionType(None, [I64, I32]),
     ]

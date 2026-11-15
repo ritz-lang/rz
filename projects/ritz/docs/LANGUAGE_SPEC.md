@@ -3504,6 +3504,18 @@ shape and its methods are emitted, but there is no dynamic dispatch, no trait
 bound on a generic parameter, and no `dyn Trait`. Methods are resolved
 statically from the receiver's concrete type.
 
+`dyn` stays a reserved keyword (§2.4). Every use of it, in any type position
+or after `as`, is an error located at the `dyn` token, from ritz0, ritz1 and
+ritz1_selfhosted alike (AGAST #1620; runtime polymorphism is AGAST #3251):
+
+```ritz expect-error=".ritz:4:13: `dyn Trait` is not supported (AGAST #1620)"
+trait Speak
+    fn say(self: @Self) -> i32
+
+fn loud(s: @dyn Speak) -> i32
+    return s.say()
+```
+
 ---
 
 ## 13. Ownership and References
