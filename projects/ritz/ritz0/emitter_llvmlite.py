@@ -10931,9 +10931,11 @@ class LLVMEmitter:
         expected_type = self.closure_expected_type
 
         if expected_type is None:
-            raise ValueError(
-                f"Cannot infer closure type - must be assigned to a typed variable. "
-                f"Use: let f: fn(T) -> R = |x| ..."
+            # A user error, so located and no traceback (AGAST #3302).
+            raise EmitError(
+                "Cannot infer closure type - must be assigned to a typed variable. "
+                "Use: let f: fn(T) -> R = |x| ...",
+                closure.span,
             )
 
         # Find captured variables
