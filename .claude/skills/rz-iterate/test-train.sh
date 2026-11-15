@@ -162,8 +162,17 @@ sleep 1
 grep -q "reserved for the merge train" "$(logof rroom)" && ok "the room gate's log says why it waits" \
     || bad "the room gate's log says why it waits"
 bash "$TR" build "r10:$s10" "r11:$s11" >/dev/null 2>&1
+gstart="$(date +%s)"
 log="$(RZ_GATE_SCRIPT="$RG" RZ_TEST_NAME=T RZ_GATE_CMD="$rec; ls -A \"\$RZ_DIR\" > \"\$RZ_TEST_ORDER.during-t\"" \
     timeout 30 bash "$TR" gate)"
+# The train's gate reserves the slot again as it ends (AGAST #3427): the room
+# gate keeps waiting through the gap before `land`.
+sleep 0.5
+t="$(cat "$RES" 2>/dev/null)"
+[[ "$t" =~ ^[0-9]+$ ]] && (( t >= gstart )) && ! grep -q "^SLOT=" "$(logof rroom)" \
+    && ok "the train's gate re-reserves the slot as it ends; the room gate still waits" \
+    || bad "the train's gate re-reserves the slot as it ends; the room gate still waits (got '$t')"
+rm -f "$RES"   # as the next train's gate would
 wait
 [[ "$(tr '\n' ' ' < "$ORDER")" == "T R " ]] && ok "the train's gate goes before the waiting room gate" \
     || bad "the train's gate goes before the waiting room gate (order: $(tr '\n' ' ' < "$ORDER"))"
@@ -171,7 +180,6 @@ grep -qx EXIT=0 "$log" && grep -qx EXIT=0 "$(logof rroom)" && ok "both gates rea
     || bad "both gates reach a verdict"
 ! grep -qx .train-reserved "$ORDER.during-t" && ok "the train's gate clears the reservation" \
     || bad "the train's gate clears the reservation"
-[[ ! -e "$RES" ]] && ok "no reservation left after the train's gate" || bad "no reservation left after the train's gate"
 
 # 6c. Fail open: a reservation expires (RZ_GATE_TRAIN_HOLD), and a stale,
 # future-dated or garbled one is ignored.

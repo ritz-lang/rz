@@ -523,6 +523,14 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    142 s on omegalisk (`-j 6`, room CPU weight, with a gate running), which
    would add about 10% to every train, compiler-only ones too.
    `train.sh pkgs list <base>` (run in the train worktree) previews the set.
+   **When the train gate ends, pass or fail, it reserves the slot for the
+   next train** (`gate-logs/.train-reserved`, #3427), before it lets go of
+   it. Reading the verdict and running `land` takes 30-60 s, and a room
+   gate first in the FIFO used to take the slot in that gap: five times on
+   2026-11-15, ~20 min of train time each. A failed gate reserves too,
+   because the halved train (step 6) gates next. Room gates queue but take
+   no slot until the next `train.sh gate` starts, or for 10 minutes at most
+   (`RZ_GATE_TRAIN_HOLD`), so read the verdict and act on it promptly.
 5. **Gate passes (exit 0), or `gate=not-needed`:**
    ```bash
    .claude/skills/rz-iterate/train.sh land "$LOG"      # no log when not needed
@@ -531,11 +539,10 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    moved since the build; then rebuild and re-gate. It pushes the tip to
    `main` (never forced), fast-forwards `~/dev/ritz-lang/rz`, and prints
    `MERGED <branch> <room sha12> as <main sha12>` per commit. It also
-   reserves the gate slot for the next train (`gate-logs/.train-reserved`,
-   #3365): room gates queue but take no slot until the next `train.sh gate`
-   starts, or for 10 minutes at most (`RZ_GATE_TRAIN_HOLD`), so build and
-   gate the next train promptly. A `build` with `gate=not-needed` drops the
-   reservation; if nothing else is queued, just let it expire. For each:
+   renews the gate's reservation (#3365), so the 10 minutes count from the
+   push: build and gate the next train promptly. A `build` with
+   `gate=not-needed` drops the reservation; if nothing else is queued, just
+   let it expire. For each:
    `complete_task` (`Merged to main as <main sha8> (train <tip sha8>). <REAP
    line>`; if refused, see "Who owns the ticket"), `check_scratchpad_item`,
    and clean up (`systemctl --user stop/disable adele-agent@ritz-task-<id>`,

@@ -30,9 +30,10 @@
 #   RZ_GATE_SCRIPT run-gate.sh to use  (default: beside this script)
 #   RZ_GATE_DIR    gate logs/slots     (default ~/dev/ritz-lang/gate-logs)
 #
-# Slot reservation (AGAST #3365): `land` writes <gate dir>/.train-reserved so
-# a room gate can't take the gate slot before the next train's gate starts;
-# run-gate.sh honours it for RZ_GATE_TRAIN_HOLD seconds (default 600).
+# Slot reservation (AGAST #3365, #3427): the train's gate writes <gate
+# dir>/.train-reserved as it ends, and `land` renews it, so a room gate can't
+# take the gate slot before the next train's gate starts; run-gate.sh honours
+# it for RZ_GATE_TRAIN_HOLD seconds (default 600).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

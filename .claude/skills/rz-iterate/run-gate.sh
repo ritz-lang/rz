@@ -57,6 +57,17 @@
 #     removes it once its .train-waiting is written, and `train.sh build`
 #     removes it for a train that needs no gate.  Fails open: an old,
 #     future-dated or unreadable marker is ignored.
+#   * reservation from the train gate's end (AGAST #3427): the slot frees
+#     when the train's gate ends, 30-60 s before `land` (the coordinator
+#     reads the verdict first), and a room gate first in the FIFO took it
+#     in that window five times in one day, ~20 min of train time each.  So
+#     a train gate writes .train-reserved itself once its command is done,
+#     while it still holds the slot and before its EXIT line; `land`
+#     re-stamps it.  On a failed gate too: the coordinator re-gates a halved
+#     train next, and that gate is worth more than any one room's.  A train
+#     gate stopped or killed before its command ends reserves nothing.  A
+#     room gate that wins the flock re-checks the reservation, in case the
+#     train wrote it and released the slot between the check and the flock.
 #   * FIFO queue (AGAST #3364): the same poll race reordered room gates too
 #     (huburght, 2 slots: ~13 min waits, not in the order asked).  A waiter
 #     appends "<unit> <pid> <train>" to <gate dir>/.gate-queue (under flock
@@ -242,7 +253,13 @@ while :; do
     elif [ "$pos" = 1 ] && ! train_waiting; then
         for s in $(seq 0 $((RZ_SLOTS - 1))); do
             exec 9>"$RZ_DIR/.gate-slot-$s"
-            if flock -n 9; then break 2; fi
+            if flock -n 9; then
+                # A train gate may have reserved the slot and released it
+                # between our check above and this flock: look again.
+                train_reserved || break 2
+                exec 9>&-
+                break
+            fi
         done
     fi
     sleep "$RZ_POLL"
@@ -256,6 +273,13 @@ now="$(git rev-parse HEAD)"
 if [ "$now" != "$RZ_SHA" ]; then
     echo "HEAD MOVED during the gate: $RZ_SHA -> $now; result void" >> "$RZ_LOG"
     rc=99
+fi
+# A train gate reserves the slot for the next train before it releases it
+# (AGAST #3427; see the header).  Pass or fail, before the EXIT line, so the
+# reservation exists by the time anyone reads the verdict.
+if [ "$RZ_TRAIN" = 1 ]; then
+    { date +%s > "$RES.$$" && mv -f "$RES.$$" "$RES"; } 2>/dev/null \
+        || echo "warning: could not reserve the gate slot ($RES)" >> "$RZ_LOG"
 fi
 echo "EXIT=$rc" >> "$RZ_LOG"
 EOF

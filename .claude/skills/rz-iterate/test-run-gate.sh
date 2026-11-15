@@ -121,7 +121,9 @@ until_ '[[ -n "$(logof pa)" ]] && grep -q "^SLOT=" "$(logof pa)"'
 RZ_GATE_TRAIN=1 RZ_GATE_POLL=1 RZ_GATE_CMD='echo T >> "$RZ_TEST_ORDER"; ls -A "$RZ_DIR" > "$RZ_TEST_ORDER.during-t"' gate "$W" pt >/dev/null &
 until_ '[[ -n "$(logof pt)" ]] && grep -q "^WAITING" "$(logof pt)"'
 check '[[ "$(cat "$MARK" 2>/dev/null)" == ritz-gate-pt ]]' "a waiting train gate leaves a .train-waiting marker naming its unit"
-RZ_GATE_POLL=0.1 RZ_GATE_CMD='echo B >> "$RZ_TEST_ORDER"' gate "$W" pb >/dev/null &
+# B ignores the reservation T leaves when it ends (AGAST #3427, section 14):
+# this section is about who gets the slot first, not about how long B waits.
+RZ_GATE_TRAIN_HOLD=0 RZ_GATE_POLL=0.1 RZ_GATE_CMD='echo B >> "$RZ_TEST_ORDER"' gate "$W" pb >/dev/null &
 until_ '[[ -n "$(logof pb)" ]] && grep -q "^WAITING" "$(logof pb)"'
 sleep 0.5
 touch "$RZ_TEST_RELEASE"
@@ -130,6 +132,7 @@ check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "A T B " ]]' "train gate T take
 check 'grep -qx EXIT=0 "$(logof pt)" && grep -qx EXIT=0 "$(logof pb)"' "both queued gates still reach a verdict"
 check '[[ -s "$RZ_TEST_ORDER.during-t" ]] && ! grep -qx .train-waiting "$RZ_TEST_ORDER.during-t"' "the train's marker is gone once it has its slot (not only at exit)"
 check '[[ ! -e "$MARK" ]]' "no marker is left after the train gate ends"
+rm -f "$RZ_GATE_DIR/.train-reserved"
 
 # 7. A marker from a train unit that is still active holds room gates off...
 echo ritz-gate-livetrain > "$MARK"; touch "$RZ_TEST_ACTIVE/ritz-gate-livetrain"
@@ -214,7 +217,7 @@ wait
 rm -f "$RZ_TEST_RELEASE"; : > "$RZ_TEST_ORDER"
 RZ_TEST_NAME=H RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" th >/dev/null &
 until_ '[[ -n "$(logof th)" ]] && grep -q "^SLOT=" "$(logof th)"'
-RZ_TEST_NAME=R RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" tr >/dev/null &
+RZ_TEST_NAME=R RZ_GATE_TRAIN_HOLD=0 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" tr >/dev/null &
 until_ '[[ -n "$(logof tr)" ]] && grep -q "^WAITING" "$(logof tr)"'
 RZ_TEST_NAME=T RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" tt >/dev/null &
 until_ '[[ -n "$(logof tt)" ]] && grep -q "^WAITING" "$(logof tt)"'
@@ -222,6 +225,7 @@ check 'grep -q "^WAITING.*position 1 " "$(logof tt)"' "a train gate is first in 
 touch "$RZ_TEST_RELEASE"
 wait
 check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "H T R " ]]' "a train gate queued after a room gate goes first (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+rm -f "$RZ_GATE_DIR/.train-reserved"
 
 # 13. RZ_GATE_AFTER (AGAST #3363: a train's package tests) runs after the gate
 # command, only if it passed, and its failure is the gate's verdict.
@@ -233,6 +237,44 @@ check 'grep -qx EXIT=2 "$lb" && ! grep -qx "after step" "$lb"' "RZ_GATE_AFTER is
 lc="$(RZ_GATE_CMD='echo "PKG FAIL prism: exit 1, passes on base abc"; exit 1' gate "$W" t13c)"
 gate --wait "$lc" > "$T/wait13" 2>&1
 check 'grep -q "^PKG FAIL prism" "$T/wait13"' "--wait prints the PKG verdict lines"
+
+# 14. AGAST #3427: the train's reservation starts when its gate ENDS, not at
+# `train.sh land` (30-60 s later: the coordinator reads the verdict first).
+# Room gate R queues while train gate T1 holds the slot.  When T1 ends, R must
+# not take the freed slot.  Two runs, one for each way out of the reservation:
+# T1 passes and the next train gate T2 takes the slot, or T1 fails and the
+# reservation expires (R's RZ_GATE_TRAIN_HOLD=2; no T2 comes).
+RES="$RZ_GATE_DIR/.train-reserved"
+for v in 0 1; do
+    rm -f "$RZ_TEST_RELEASE" "$RES"; : > "$RZ_TEST_ORDER"
+    RZ_TEST_NAME=T1 RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold; exit $v" gate "$W" r${v}t1 >/dev/null &
+    until_ "[[ -n \"\$(logof r${v}t1)\" ]] && grep -q '^SLOT=' \"\$(logof r${v}t1)\""
+    hold_s=600; [[ $v -eq 1 ]] && hold_s=2
+    RZ_TEST_NAME=R RZ_GATE_TRAIN_HOLD=$hold_s RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" r${v}r >/dev/null &
+    until_ "[[ -n \"\$(logof r${v}r)\" ]] && grep -q '^WAITING' \"\$(logof r${v}r)\""
+    before="$(date +%s)"; touch "$RZ_TEST_RELEASE"
+    until_ "grep -q '^EXIT=' \"\$(logof r${v}t1)\""
+    sleep 0.5
+    t="$(cat "$RES" 2>/dev/null)"
+    check '[[ "$t" =~ ^[0-9]+$ ]] && (( t >= before && t <= $(date +%s) ))' "a train gate ending with EXIT=$v reserves the slot, stamped with the time (got '$t')"
+    check '! grep -q "^SLOT=" "$(logof r${v}r)"' "after an EXIT=$v train gate, a room gate queued before it ended doesn't take the freed slot"
+    check 'grep -q "reserved for the merge train" "$(logof r${v}r)"' "the room gate's log says the slot is reserved (EXIT=$v)"
+    if [[ $v -eq 0 ]]; then
+        RZ_TEST_NAME=T2 RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" r${v}t2 >/dev/null
+        # T2 reserves the slot in turn as it ends; let R in, as expiry would.
+        rm -f "$RES"
+        want="T1 T2 R "
+    else
+        want="T1 R "
+    fi
+    wait
+    check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "$want" ]]' "the room gate runs only after the next train gate or the reservation's expiry (EXIT=$v; order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+    check 'grep -qx EXIT=0 "$(logof r${v}r)"' "the held room gate still reaches a verdict (EXIT=$v)"
+done
+# A room gate's end reserves nothing: only trains have a next train.
+rm -f "$RES"
+RZ_GATE_CMD='exit 1' gate "$W" r2room >/dev/null
+check '[[ ! -e "$RES" ]]' "a room gate's end doesn't reserve the slot"
 
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
