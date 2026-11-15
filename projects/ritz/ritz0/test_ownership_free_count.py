@@ -2105,6 +2105,37 @@ pub fn main() -> i32
     return inner + DROPS
 """, 1, {}),
 
+    # AGAST #2178: the payload of a borrowed scrutinee reads and borrows;
+    # only s drops it.
+    "match_borrowed_scrutinee_reads_payload": (SLOT + LENT + """\
+fn f() -> i32
+    var s = Slot.Full(make(3))
+    match @s
+        Full(t) => t.id + look(@t) - 6
+        _ => 0
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 1, {}),
+
+    # AGAST #2178: a `let` from a match moves into consume, which drops it;
+    # u's own drop is skipped.
+    "let_from_match_moved": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    let u = match s
+        Full(t) => t
+        _ => make(2)
+    consume(u)
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
     # AGAST #2244: the ticket's program. The tuple's drop skips the element.
     "tuple_element_moved": (TUPLES + SLOT + """\
 fn f()
@@ -2775,6 +2806,59 @@ fn g(d:& Deep) -> Tracked
 """ + TAIL, MOVE_OUT_OF_REF, {}),
 }
 
+# AGAST #2178: a match that owns nothing (`match @s`, a `name:& T` param, a
+# place behind a pointer) binds a copy of the payload, which the scrutinee's
+# owner still drops. Moving the copy out dropped it twice; it's refused now,
+# at the use, on all three compilers (Rust's E0507).
+# name -> (body, line of the use in the body, its column).
+LENT_PAYLOAD_ROWS = {
+    "borrowed_match_payload_into_call": (SLOT + """\
+pub fn main() -> i32
+    var s = Slot.Full(make(1))
+    match @s
+        Full(t) => consume(t)
+        _ => 0
+    return DROPS
+""", 8, 28),
+    "lent_param_match_payload_returned": (SLOT + """\
+fn g(s:& Slot) -> Tracked
+    match s
+        Full(t) => return t
+        _ => return make(0)
+""" + TAIL, 7, 27),
+    "lent_param_match_payload_into_let": (SLOT + """\
+fn g(s:& Slot) -> i32
+    match s
+        Full(t) =>
+            let y = t
+            return y.id
+        _ => return 0
+""" + TAIL, 8, 21),
+    "pointer_match_payload_into_call": (SLOT + """\
+fn g(p: *Slot) -> i32
+    match *p
+        Full(t) => return consume(t)
+        _ => return 0
+""" + TAIL, 7, 35),
+    # A field of the payload copy is the owner's too (ritz1's ref_through).
+    "lent_param_match_payload_field_into_call": ("""\
+enum Boxed
+    Has(Holder)
+    Nil
+
+fn g(b:& Boxed) -> i32
+    match b
+        Has(h) => return consume(h.t)
+        _ => return 0
+""" + TAIL, 7, 34),
+    "lent_param_match_payload_by_value_self": (SLOT + BURN + """\
+fn g(s:& Slot) -> i32
+    match s
+        Full(t) => return t.burn()
+        _ => return 0
+""" + TAIL, 11, 27),
+}
+
 # A call returning a reference (or a value holding one) can't take a lent
 # temporary: the temporary drops as the call returns, so the result would
 # point at a dropped value (Aaron's ruling on AGAST #3215). Located at the
@@ -3083,6 +3167,17 @@ pub fn main() -> i32
     return 0
 """, "t", {}),
 
+    # AGAST #2178: a `let` from a match is typed by its arms, so it moves.
+    "after_move_of_a_let_from_match": (SLOT + """\
+pub fn main() -> i32
+    var s = Slot.Full(make(1))
+    let u = match s
+        Full(t) => t
+        _ => make(2)
+    consume(u)
+    return u.id
+""", "u", {}),
+
     "tuple_element_after_move": (TUPLES + """\
 pub fn main() -> i32
     var p = (make(1), 2)
@@ -3182,6 +3277,24 @@ def test_second_owner_through_a_reference_rejected(request, tmp_path, compiler, 
     assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
     assert "Traceback" not in out, out[-2000:]
     assert message in out, out[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,name", [
+    pytest.param(c, n, id=f"{c}-{n}") for n in sorted(LENT_PAYLOAD_ROWS) for c in COMPILERS])
+def test_move_out_of_a_non_owning_match_payload_rejected(request, tmp_path, compiler, name):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    body, line, col = LENT_PAYLOAD_ROWS[name]
+    src = _write(tmp_path, body)
+    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
+    assert "Traceback" not in out, out[-2000:]
+    assert MOVE_OUT_OF_REF in out, out[-2000:]
+    # Located at the use: its line in the body, after the prelude.
+    at = PRELUDE.count("\n") + line
+    assert f":{at}:{col}:" in out, out[-2000:]
 
 
 @pytest.mark.integration

@@ -599,6 +599,10 @@ class MoveChecker:
                     return self.fn_return_types[fn_name]
             # Unknown function or no return type
             return rast.NamedType(expr.span, 'unknown', [])
+        elif isinstance(expr, rast.Match):
+            # What its arms give, typed as they were checked (AGAST #2178).
+            return (getattr(expr, 'value_type', None)
+                    or rast.NamedType(expr.span, 'unknown', []))
         elif isinstance(expr, rast.TryOp):
             # TryOp (?) unwraps Result<T, E> to T or Option<T> to T
             # Infer the inner type from the expression's Result/Option
@@ -1441,6 +1445,7 @@ class MoveChecker:
             # The match owns a scrutinee it moved (AGAST #2177, ritz1 #2174).
             owned = self._owned_scrutinee_type(expr.expr)
             expr.owns_scrutinee = owned
+            lent = None if owned is not None else self._lent_scrutinee_type(expr.expr)
             # Each arm starts from the state before the match. After it, a
             # binding is moved if an arm that falls through moved it; an arm
             # that leaves (`break`, `return`, ...) took its moves with it.
@@ -1455,12 +1460,15 @@ class MoveChecker:
                 self._check_pattern(arm.pattern)
                 if owned is not None:
                     self._own_payload(arm, owned)
+                elif lent is not None:
+                    self._lend_payload(arm, lent)
                 if isinstance(arm.body, rast.Block):
                     left = self._check_block(arm.body, value_used=is_move_context)
                 else:
                     self._check_expr(arm.body, is_move_context=is_move_context)
                     left = isinstance(arm.body, (rast.BreakExpr, rast.ContinueExpr,
                                                  rast.ReturnExpr))
+                self._note_arm_type(expr, arm)
                 self._pop_scope()
                 if not left:
                     outs.append(self._snapshot())
@@ -2146,6 +2154,56 @@ class MoveChecker:
                 if info is not None:
                     info.ritz_type = fty
                     arm.takes_payload = True
+
+    def _note_arm_type(self, match: rast.Match, arm: rast.MatchArm) -> None:
+        """While `arm`'s bindings are in scope, type its value: the first arm
+        that types gives `match.value_type`, so `let u = match s ...` is
+        move-checked like any binding (AGAST #2178)."""
+        if getattr(match, 'value_type', None) is not None:
+            return
+        value = arm.body
+        while isinstance(value, rast.Block):
+            value = value.expr
+        if value is None:
+            return
+        ty = self._infer_expr_type(value)
+        if not (isinstance(ty, rast.NamedType) and ty.name == 'unknown'):
+            match.value_type = ty
+
+    def _lent_scrutinee_type(self, scrut: rast.Expr) -> Optional[rast.Type]:
+        """The type of a match scrutinee that something else owns, or None:
+        `@s` / `@&s`, a place behind a reference or pointer (`*p`, `p.f`), a
+        `name:& T` parameter or an array element (AGAST #2178)."""
+        while isinstance(scrut, rast.Grouped):
+            scrut = scrut.expr
+        if isinstance(scrut, rast.UnaryOp) and scrut.op in ('@', '&', '@&', '&mut'):
+            place = scrut.operand
+        elif self._through_reference(scrut) or self._element_root(scrut) is not None:
+            place = scrut
+        else:
+            return None
+        ty = self.types.resolve(self._place_type(place))
+        while isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = self.types.resolve(ty.inner)
+        return ty if self.types.is_move_only(ty) else None
+
+    def _lend_payload(self, arm: rast.MatchArm, scrut_ty: rast.Type) -> None:
+        """An arm of a match that owns nothing: its payload bindings are
+        copies of a value the scrutinee's owner still drops, so a move-only
+        one is lent like a `name:& T` parameter: it reads, and a by-value
+        move out of it is refused (AGAST #2178, Rust's E0507)."""
+        pattern = arm.pattern
+        if not isinstance(pattern, rast.VariantPattern):
+            return
+        fields = self._variant_fields(scrut_ty, pattern.name)
+        if fields is None:
+            return
+        for sub, fty in zip(pattern.fields, fields):
+            if isinstance(sub, rast.IdentPattern) and self.types.is_move_only(fty):
+                info = self.scope.vars.get(sub.name)
+                if info is not None:
+                    info.ritz_type = fty
+                    info.borrow = rast.Borrow.MUTABLE
 
     def _check_pattern(self, pattern: rast.Pattern):
         """Check a pattern and register any bindings."""

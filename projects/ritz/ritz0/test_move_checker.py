@@ -1241,6 +1241,131 @@ impl Wrap
         assert len(errs) == 1, errs
         assert f"cannot move out of a reference" in str(errs[0])
 
+    # AGAST #2178: a match that owns nothing (`match t` of a `:&` param,
+    # `match @s`, a scrutinee read through a pointer) binds a copy of the
+    # payload. Its owner still drops the original, so moving the copy out
+    # would drop it twice.
+    @pytest.mark.parametrize("body", [
+        pytest.param("""
+fn f(s:& Slot) -> i32
+    match s
+        Full(r) => return eat(r)
+        Empty => return 0
+""", id="lent_param_into_call"),
+        pytest.param("""
+fn f(s:& Slot) -> i32
+    match s
+        Full(r) =>
+            let y = r
+            return y.h
+        Empty => return 0
+""", id="lent_param_into_let"),
+        pytest.param("""
+fn f(b:& Box1) -> i32
+    match b.s
+        Full(r) => return eat(r)
+        Empty => return 0
+""", id="lent_param_field"),
+        pytest.param("""
+fn f() -> i32
+    var s = Slot.Full(Res { h: 1 })
+    match @s
+        Full(r) => return eat(r)
+        Empty => return 0
+""", id="shared_borrow"),
+        pytest.param("""
+fn f() -> i32
+    var s = Slot.Full(Res { h: 1 })
+    match @&s
+        Full(r) => return eat(r)
+        Empty => return 0
+""", id="mutable_borrow"),
+        pytest.param("""
+fn f(p: *Slot) -> i32
+    match *p
+        Full(r) => return eat(r)
+        Empty => return 0
+""", id="deref_of_a_pointer"),
+        pytest.param("""
+fn f(b: @Box1) -> i32
+    match b.s
+        Full(r) => return eat(r)
+        Empty => return 0
+""", id="field_through_a_reference"),
+        pytest.param("""
+fn f(s:& Slot) -> Res
+    match s
+        Full(r) => return r
+        Empty => return Res { h: 0 }
+""", id="returned"),
+        pytest.param("""
+fn f(s:& Slot) -> i32
+    match s
+        Full(r) => return r.burn()
+        Empty => return 0
+""", id="by_value_receiver"),
+    ])
+    def test_payload_of_a_non_owning_match_does_not_move(self, body):
+        errs = check(self.DEFS + body)
+        assert len(errs) == 1, errs
+        assert errs[0].reason == MOVE_OUT_OF_REF, errs
+
+    def test_payload_move_points_at_the_use(self):
+        errs = check(self.DEFS + """
+fn f(s:& Slot) -> i32
+    match s
+        Full(r) => return eat(r)
+        Empty => return 0
+""")
+        assert len(errs) == 1 and errs[0].span.column == 31, errs
+
+    @pytest.mark.parametrize("body", [
+        pytest.param("""
+fn f() -> i32
+    var s = Slot.Full(Res { h: 1 })
+    match @s
+        Full(r) => return r.h + see(@r) + r.look()
+        Empty => return 0
+""", id="read_and_borrow"),
+        pytest.param("""
+enum Num
+    Has(i32)
+    Nil
+
+fn f(n:& Num) -> i32
+    var k = 0
+    match n
+        Has(v) =>
+            k = v
+            return v + k
+        Nil => return 0
+""", id="copy_payload"),
+        pytest.param("""
+fn f(s:= Slot) -> i32
+    match s
+        Full(r) => return eat(r)
+        Empty => return 0
+""", id="owned_scrutinee_moves"),
+    ])
+    def test_payload_of_a_non_owning_match_reads(self, body):
+        assert check(self.DEFS + body) == []
+
+    @pytest.mark.parametrize("arms", [
+        pytest.param("        Full(r) => r\n        Empty => Res { h: 2 }\n", id="binding_first"),
+        pytest.param("        Empty => Res { h: 2 }\n        Full(r) => r\n", id="literal_first"),
+        pytest.param("        Full(r) =>\n            let k = 1\n            r\n"
+                     "        Empty => Res { h: 2 }\n", id="block_arm"),
+    ])
+    def test_let_from_a_match_is_move_checked(self, arms):
+        """`let u = match s ...` takes its arms' type, so `u` moves."""
+        errs = check(self.DEFS + """
+fn f(s:= Slot) -> i32
+    let u = match s
+""" + arms + """    eat(u)
+    return u.h
+""")
+        assert len(errs) == 1 and "use of moved value: `u`" in str(errs[0]), errs
+
     def test_lending_receivers_are_accepted(self):
         """Control: a method that borrows its receiver only reads it."""
         assert check(self.DEFS + """

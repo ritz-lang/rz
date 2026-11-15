@@ -107,6 +107,8 @@ import emitter_stmt        # emit_stmt, for a deferred statement (AGAST #1625)
 const OWN_INIT_CAP: i32 = 16
 # Deeper than any real struct nesting; stops a malformed recursive type.
 const OWN_MAX_DEPTH: i32 = 32
+# OwnState.match_scrut for a match that owns nothing (AGAST #2178).
+const OWN_MATCH_LENT: i32 = 0 - 2
 
 # Loop move-check events (OwnState.loop_ev): [kind, slot, depth, a, b, c, d,
 # e, f] with `slot` the binding's storage register (its identity) and
@@ -2456,6 +2458,9 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
         ref_error_move_out_of_element(s, eat.span.line, eat.span.col)
         return
     if k == EXPR_IDENT
+        if mv == 1 and own_lent_payload(s, e) == 1
+            ref_error_move_out(s, e.span.line, e.span.col)
+            return
         let b: *OwnBinding = own_lookup(s, e.ident_ptr, e.ident_len)
         if b == null
             return
@@ -3157,7 +3162,8 @@ pub fn own_arms_end(s: *EmitterState, before: *i32, acc: *i32)
 # drops at the arm's end unless moved; the scrutinee's flag is cleared on
 # that path); any other arm leaves it to the scrutinee, which
 # own_match_end drops after the arms meet.  A borrowed scrutinee (`match
-# @s`), or one read through a pointer, moves nothing and owns nothing.
+# @s`), or one read through a pointer, moves nothing and owns nothing; its
+# move-only payload bindings are lent and can't move (AGAST #2178).
 
 # 1 when the move check just moved `e`, a match scrutinee, by value.
 fn own_scrutinee_moved(s: *EmitterState, e: *Expr) -> i32
@@ -3193,7 +3199,11 @@ pub fn own_match_begin(s: *EmitterState, e: *Expr, slot: i32, name: *u8, len: i3
     o.match_scrut = 0 - 1
     if e == null or slot == 0 or name == null or len <= 0
         return old
-    if own_type_is_move_only(s, name, len) == 0 or own_scrutinee_moved(s, e) == 0
+    if own_type_is_move_only(s, name, len) == 0
+        return old
+    if own_scrutinee_moved(s, e) == 0
+        if own_match_lent(s, e) == 1
+            o.match_scrut = OWN_MATCH_LENT
         return old
     own_push_scope(s)
     let flag: i32 = next_reg(s)
@@ -3229,14 +3239,51 @@ pub fn own_match_begin(s: *EmitterState, e: *Expr, slot: i32, name: *u8, len: i3
     own_store_flag(s, b, 1)
     old
 
+# AGAST #2178: does a match on `e` own nothing because something else owns
+# the value: `@s` / `@&s`, a place behind a reference or pointer, an array's
+# element, or a `name:& T` param (or a payload copy, below)?  ritz0's
+# MoveChecker._lent_scrutinee_type.
+fn own_match_lent(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        return 1
+    if ref_through(s, e) == 1 or own_element_root(s, e) != null
+        return 1
+    var r: *Expr = e
+    while r != null and (r.kind == EXPR_MEMBER or (r.kind == EXPR_UNARY and r.op == OP_DEREF))
+        if r.kind == EXPR_MEMBER
+            r = r.left
+        else
+            r = r.operand
+    if r == null or r.kind != EXPR_IDENT
+        return 0
+    let idx: i32 = find_local_idx(s, r.ident_ptr, r.ident_len)
+    if idx < 0
+        return 0
+    local_at(s, idx).is_caller_place
+
+# 1 when `e` names a payload copy own_match_payload lent (AGAST #2178).
+fn own_lent_payload(s: *EmitterState, e: *Expr) -> i32
+    let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return 0
+    local_at(s, idx).lent_payload
+
 # An arm bound the local `name` to a copy of the payload: when the match
 # owns its scrutinee and the payload is move-only, the binding owns it now.
+# When the match owns nothing (OWN_MATCH_LENT), the binding is lent: the
+# scrutinee's owner still drops the payload, so moving the copy out would
+# drop it twice (AGAST #2178, Rust's E0507).
 pub fn own_match_payload(s: *EmitterState, name: *u8, len: i32)
     let o: *OwnState = s.own
-    if o.match_scrut < 0
+    if o.match_scrut < 0 and o.match_scrut != OWN_MATCH_LENT
         return
     let idx: i32 = find_local_idx(s, name, len)
     if idx < 0
+        return
+    if o.match_scrut == OWN_MATCH_LENT
+        let loc: *LocalVar = local_at(s, idx)
+        if own_type_is_move_only(s, loc.type_name, loc.type_name_len) == 1
+            loc.lent_payload = 1
         return
     let n: i32 = o.live_count
     own_register(s, idx, 1)
