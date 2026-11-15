@@ -34,10 +34,12 @@ fn main() -> i32
     deep<i32>(1, 3)
 """
 
-# mid<T> names the deeper leaf<Cell<T>> once, at two types: mid<i32> ->
-# leaf<Cell<i32>>, mid<i64> -> leaf<Cell<i64>>.  Exits 0 only if each kept
-# its value.  (mid<Cell<i32>>, a T that is itself generic, is left out: ritz0
-# mangles its leaf<Cell<T>> two ways and refuses it; AGAST #3356.)
+# mid<T> names the deeper leaf<Cell<T>> once, at three types: mid<i32> ->
+# leaf<Cell<i32>>, mid<i64> -> leaf<Cell<i64>>, and mid<Cell<i32>> ->
+# leaf<Cell<Cell<i32>>>, where T is itself generic.  ritz0 used to name that
+# last Cell<Cell<i32>> two ways (`Cell$Cell$i32` for the let annotation,
+# `Cell$Cell_i32` for leaf's argument) and refuse the program (AGAST #3356).
+# Exits 0 only if each kept its value.
 FINITE = """\
 struct Cell<T>
     v: T
@@ -49,7 +51,8 @@ fn mid<T>(x: T) -> T
 fn main() -> i32
     let a: i32 = mid<i32>(7)
     let b: i64 = mid<i64>(5)
-    a - 7 + (b - 5) as i32
+    let d: i32 = mid<Cell<i32>>(Cell<i32> { v: 9 }).v
+    a - 7 + (b - 5) as i32 + (d - 9)
 """
 
 
@@ -69,3 +72,26 @@ def test_recursive_fn_is_refused_at_the_fn(request, compiler, tmp_path):
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_fixed_depth_deeper_instance_compiles(request, compiler, tmp_path):
     assert _run(request, compiler, tmp_path, FINITE) == 0
+
+# A generic impl's method body is substituted the same way: get() at
+# T = Cell<i32> first names Cell<Cell<i32>> in its own body.  ritz0 declared
+# `c` a bare `Cell` while its initialiser was a `Cell$Cell_i32` (AGAST #3356).
+IMPL_BODY = """\
+struct Cell<T>
+    v: T
+struct Box<T>
+    v: T
+impl<T> Box<T>
+    fn get(self: @Box<T>) -> T
+        let c: Cell<T> = Cell<T> { v: self.v }
+        c.v
+fn main() -> i32
+    let b: Box<Cell<i32>> = Box<Cell<i32>> { v: Cell<i32> { v: 7 } }
+    b.get().v - 7
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_impl_method_names_a_deeper_instance(request, compiler, tmp_path):
+    assert _run(request, compiler, tmp_path, IMPL_BODY) == 0

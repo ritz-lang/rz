@@ -1582,6 +1582,35 @@ class Monomorphizer:
         for (base_name, type_args_key), mangled in self.struct_instantiations.items():
             struct_manglings.setdefault(base_name, {}).setdefault(type_args_key, mangled)
 
+    def _register_body_instances(self, fn: rast.FnDef, subst: TypeSubstitution) -> None:
+        """Register each generic instance a type in `fn` names under `subst`.
+
+        `subst.struct_manglings` is the generation's snapshot, and a body can
+        be the first to name an instance: mid<Cell<i32>>'s
+        `let c: Cell<T> = leaf<Cell<T>>(Cell<T> { .. })` names Cell<Cell<i32>>.
+        Its struct literal registered it as `Cell$Cell_i32` mid-walk, but the
+        annotation had missed the snapshot and kept `Cell<Cell$i32>`, which the
+        emitter spells `Cell$Cell$i32` (AGAST #3356).  Registering every
+        instance first gives both one name, as _register_field_instances does
+        for a struct's fields.
+        """
+        if subst.struct_manglings is None:
+            return
+        bare = TypeSubstitution(subst.mapping)
+
+        def walk(node):
+            return map_child_nodes(node, walk, walk, visit)
+
+        def visit(ty):
+            self._visit_type(bare.apply(ty))
+            return ty
+
+        walk(fn)
+        for instances in (self.struct_instantiations, self.enum_instantiations):
+            for (base_name, type_args_key), mangled in instances.items():
+                subst.struct_manglings.setdefault(base_name, {}).setdefault(
+                    type_args_key, mangled)
+
     def _scan_for_new_instantiations(self, fn: rast.FnDef) -> None:
         """Scan a specialized function for new generic instantiations.
 
@@ -1711,6 +1740,7 @@ class Monomorphizer:
     def _specialize_function(self, generic_def: rast.FnDef, new_name: str,
                              subst: TypeSubstitution) -> rast.FnDef:
         """Generate a specialized function definition."""
+        self._register_body_instances(generic_def, subst)
         # Specialize parameters
         new_params = []
         for param in generic_def.params:
@@ -1774,6 +1804,7 @@ class Monomorphizer:
         Like monomorphized generic functions, these are emitted locally
         in each compilation unit. Don't preserve source_file.
         """
+        self._register_body_instances(fn, subst)
         # Specialize parameters
         new_params = []
         for param in fn.params:
