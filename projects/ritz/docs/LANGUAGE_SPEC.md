@@ -1652,9 +1652,10 @@ let b: f64 = if c then 0 else 1.5
 The rule is the same whichever arm comes first (LARB R43, AGAST #3312). Every
 typed slot gives the merge its type, not only an annotated binding: a
 `return` or tail in a `-> f64` function, and an argument for an `f64`
-parameter. In a float slot an integer *literal* arm converts. An integer arm
-that isn't a literal never converts implicitly: write `n as f64`. (ritz1 today
-accepts an unannotated merge when a float arm comes first; #3385 fixes it.)
+parameter. In a float slot an integer arm converts as it would into a typed
+`let` (§7.5, LARB R43a): a literal always, a non-literal only when its type is
+exact in the slot (`i32` or `u32` into `f64`, by its own signedness). Any other
+integer arm (`i64`, `u64`) is refused as lossy: write `n as f64`.
 
 As with the else-less `if`, an `if` or `match` used as a statement has no
 merged value, so its arms may end in values of any types.

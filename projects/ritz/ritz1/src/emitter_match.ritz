@@ -593,10 +593,11 @@ fn take_match_float_hint(s: *EmitterState) -> i32
     s.match_float_hint = 0
     h
 
-# AGAST #1946: settle a scalar arm's value against the phi's float type.  The
-# first float arm fixes it (an earlier i64 arm cannot be converted any more:
-# an error, not a mistyped phi); once fixed, a float of the other width or an
-# integer is converted in the arm's own block before its `br`.  Called while
+# AGAST #1946: settle a scalar arm's value against the phi's float type.  A
+# float slot (result.hint_ty) fixes it up front; otherwise the first float arm
+# does, and an integer arm on either side of it is an error (LARB R43).  Once
+# fixed, a float of the other width, or in a slot an integer, is converted in
+# the arm's own block before its `br`.  Called while
 # the arm's pattern binding is in scope.  Returns the register to record.
 fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, result: *MatchResult) -> i32
     let aft: i32 = match_arm_float_ty(s, arm_body)
@@ -612,9 +613,18 @@ fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, resu
         return body_reg
     if aft != 0
         return emit_float_coerce(s, body_reg, aft, result.float_ty)
-    # AGAST #3313: an integer arm lands in the float slot as `let a: f64 = x`
-    # does, so a non-literal i64 arm is refused (ritz0 does the same).
-    if is_int_const_type(get_expr_type(s, arm_body)) == 1
+    let is_int: bool = is_int_const_type(get_expr_type(s, arm_body)) == 1
+    # LARB R43 (#3385): with no float slot (hint_ty 0) the float type came
+    # from an earlier arm, and an integer arm next to it is refused, as one
+    # BEFORE the first float arm is above: the rule doesn't depend on order.
+    # The slot is known before any arm is emitted, so no pre-pass is needed.
+    if is_int and result.hint_ty == 0
+        emit_ir_error(s, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        return body_reg
+    # AGAST #3313, LARB R43a: an integer arm lands in the float slot as
+    # `let a: f64 = x` does (§7.5): a literal or an exact type (i32 into
+    # f64) converts, a lossy one (i64) is refused (ritz0 does the same).
+    if is_int
         return int_into_float_slot(s, body_reg, arm_body, result.float_ty)
     emit_ir_error(s, c"match arm yields a non-numeric value where the other arms yield a float")
     body_reg

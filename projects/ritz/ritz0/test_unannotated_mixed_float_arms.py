@@ -13,21 +13,24 @@ float is a located error, worded as ritz1 words it. Two deliberate limits:
 * Only a used value is refused. A statement-position if / match whose arm
   tails happen to be an int call and a float call has no merge to type,
   so it stays legal (`_used_arms`, AGAST #2046, decides "used").
-* ritz0 refuses both arm orders. ritz1 refuses only an integer arm BEFORE
-  the first float arm (its single pass can no longer convert it); a float
-  arm first fixes its phi type and later integer arms are converted. That
-  order dependence is ritz1's, ticketed separately, not copied here.
+* Both compilers refuse both arm orders (LARB R43; ritz1 let a float arm
+  that came first fix the phi and converted later integer arms until #3385).
 
 The annotated form (`let a: f64 = if ...`) is #2027's and is covered by
 test_let_float_match_int_arm.py.
 """
 
 import os
+import subprocess
 from pathlib import Path
 
+import fast_link
 import pytest
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
+RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
+RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
+RITZ1S = ["ritz1", "ritz1_selfhosted"]
 
 MESSAGE = "match arms yield both an integer and a float value"
 
@@ -330,12 +333,11 @@ def test_ritz0_accepts(ritz0_oracle, program):
     assert res.rc == 42
 
 
-# --- a float slot converts integer *literal* arms only (LARB R43) -------------
+# --- a float slot refuses an arm §7.5 calls lossy (LARB R43a) ----------------
 #
-# An `i64` arm that is not a literal is not exact in f64 (§7.5): the slot
-# gives the merge its type, then refuses that arm as a typed let does.
-
-LOSSY = "implicit conversion from `i64` to `f64` can lose precision"
+# An `i64` arm is not exact in f64 (§7.5): the slot gives the merge its type,
+# then refuses that arm as a typed let does. LOSSY_ARMS below runs these on
+# all three compilers.
 
 RETURN_NON_LITERAL = """\
 fn f(c: i32, n: i64) -> f64
@@ -356,18 +358,238 @@ fn main() -> i32
     return f(0, 3) as i32
 """
 
-NON_LITERAL = [
-    pytest.param(RETURN_NON_LITERAL, id="return-non-literal"),
-    pytest.param(PARAM_NON_LITERAL, id="param-non-literal"),
+
+
+# --- the R43a slot rows, on all three compilers (#3384, #3385) ---------------
+#
+# The rule is order-free: with no float slot an integer arm is refused on
+# either side of a float arm. A float slot is a typed let / var, a `return` or
+# tail in a `-> f64` fn and an `f64` / `f32` parameter; it is known before the
+# first arm is emitted, so the merge takes its type up front and each integer
+# arm converts as `let a: f64 = n` would (§7.5): a literal, or a type exact in
+# the slot (f64: i8..i32, u8..u32; f32: i8, i16, u8, u16), by its own
+# signedness. Any other integer arm is refused with §7.5's message.
+
+RITZ1_REFUSED = [
+    pytest.param(IF_INT_THEN_FLOAT, id="if-int-then-float"),
+    pytest.param(IF_FLOAT_THEN_INT, id="if-float-then-int"),
+    pytest.param(INTEGER_MATCH, id="integer-match"),
+]
+
+# Each slot, integer arm on both sides, literal and exact non-literal arms.
+# Every value is checked: a merge at i64 (1.5 truncated) fails too.
+
+# `return <if / match>` in a `-> f64` fn; the R43a i32 row.
+RETURN_SLOT = """\
+fn f(c: i32, k: i32) -> f64
+    return if c > 0 then 2.5 else k
+
+fn g(c: i32, k: i32) -> f64
+    return if c > 0 then k else 2.5
+
+fn h(c: i32) -> f64
+    return match c
+        0 => 0
+        _ => 1.5
+
+fn main() -> i32
+    if f(1, 3) != 2.5 or f(0, 3) != 3.0 or f(0, -3) != -3.0
+        return 1
+    if g(1, 3) != 3.0 or g(0, 3) != 2.5
+        return 2
+    if h(0) != 0.0 or h(1) != 1.5
+        return 3
+    return 42
+"""
+
+# The tail of a `-> f64` fn and of a method: an expression tail and a
+# statement-form `match` tail. A u32 arm converts by uitofp.
+TAIL_SLOT = """\
+struct P
+    x: f64
+
+impl P
+    fn pick(self: @P, c: i32, k: i32) -> f64
+        if c > 0 then k else self.x
+
+fn f(c: i32, k: u32) -> f64
+    if c > 0 then k else 2.5
+
+fn g(c: i32) -> f64
+    match c
+        0 => 1.5
+        _ => 7
+
+fn main() -> i32
+    if f(1, 4000000000) != 4000000000.0 or f(0, 9) != 2.5
+        return 1
+    if g(0) != 1.5 or g(1) != 7.0
+        return 2
+    let p = P { x: 0.5 }
+    if p.pick(1, 6) != 6.0 or p.pick(0, 6) != 0.5
+        return 3
+    return 42
+"""
+
+# An argument for an `f64` parameter of a fn, a method and a static method,
+# and for an `f32` one (a u16 arm is exact there).
+PARAM_SLOT = """\
+struct Acc
+    total: f64
+
+impl Acc
+    fn make(x: f64) -> Acc
+        Acc { total: x }
+
+    fn add(self: @Acc, x: f64) -> f64
+        self.total + x
+
+fn g(x: f64) -> f64
+    x
+
+fn h(x: f32) -> f32
+    x
+
+fn main() -> i32
+    let c: i32 = 0
+    let k: i32 = 3
+    let u: u16 = 9
+    if g(if c > 0 then 1.5 else k) != 3.0 or g(if c == 0 then 1.5 else k) != 1.5
+        return 1
+    let a = Acc { total: 0.5 }
+    if a.add(if c == 0 then k else 1.5) != 3.5
+        return 2
+    if Acc.make(if c > 0 then 1.5 else 2).total != 2.0
+        return 3
+    if h(if c == 0 then u else 0.5) != 9.0
+        return 4
+    return 42
+"""
+
+SLOTS = [
+    pytest.param(RETURN_SLOT, id="return-slot"),
+    pytest.param(TAIL_SLOT, id="tail-slot"),
+    pytest.param(PARAM_SLOT, id="param-slot"),
+]
+
+# R43a: an arm whose type is not exact in the slot is refused as lossy, in
+# either order, where the slot comes from.
+RETURN_I64_ARM = """\
+fn f(c: i32, n: i64) -> f64
+    return if c > 0 then 2.5 else n
+
+fn main() -> i32
+    return f(0, 3) as i32
+"""
+
+TAIL_I64_ARM_FIRST = """\
+fn f(c: i32, n: i64) -> f64
+    if c > 0 then n else 2.5
+
+fn main() -> i32
+    return f(0, 3) as i32
+"""
+
+PARAM_U64_ARM = """\
+fn g(x: f64) -> f64
+    x
+
+fn f(c: i32, n: u64) -> f64
+    g(if c == 0 then 1.5 else n)
+
+fn main() -> i32
+    return f(0, 3) as i32
+"""
+
+F32_I32_ARM = """\
+fn f(c: i32, n: i32) -> f32
+    return if c > 0 then 0.5 else n
+
+fn main() -> i32
+    return f(0, 3) as i32
+"""
+
+LOSSY_ARMS = [
+    pytest.param(RETURN_NON_LITERAL, "i64", "f64", id="return-non-literal"),
+    pytest.param(PARAM_NON_LITERAL, "i64", "f64", id="param-non-literal"),
+    pytest.param(RETURN_I64_ARM, "i64", "f64", id="return-i64-arm"),
+    pytest.param(TAIL_I64_ARM_FIRST, "i64", "f64", id="tail-i64-arm-first"),
+    pytest.param(PARAM_U64_ARM, "u64", "f64", id="param-u64-arm"),
+    pytest.param(F32_I32_ARM, "i32", "f32", id="f32-i32-arm"),
 ]
 
 
+def _lossy(src, dst):
+    return f"implicit conversion from `{src}` to `{dst}` can lose precision: write `<expr> as {dst}`"
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("program", NON_LITERAL)
-def test_ritz0_float_slot_refuses_non_literal_int_arm(run_ritz0, tmp_path, program):
+@pytest.mark.parametrize("program", SLOTS)
+def test_ritz0_float_slot_converts_int_arms(ritz0_oracle, program):
+    res = ritz0_oracle(program)
+    assert res.ir_ok, res.diagnostics[-3000:]
+    assert res.rc == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("program,src,dst", LOSSY_ARMS)
+def test_ritz0_float_slot_refuses_lossy_int_arm(run_ritz0, tmp_path, program, src, dst):
     comp = _ritz0_compile(run_ritz0, tmp_path, program)
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, out
     assert "Traceback" not in out, out
-    assert LOSSY in out, out
+    assert _lossy(src, dst) in out, out
     assert MESSAGE not in out, out
+
+
+# ritz1 runs #3384's literal-arm rows too: each slot path again, plus the
+# fn-pointer and expression callees.
+ACCEPTED_SLOTS = SLOTS + [p for p in ACCEPTED if p.id.endswith("-hint")]
+
+
+def _ritz1(request, compiler, tmp_path, program):
+    request.getfixturevalue("ritz1_bin")
+    binary = RITZ1_BUILD / compiler
+    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    src = tmp_path / "prog.ritz"
+    src.write_text(program)
+    ll = tmp_path / "prog.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path,
+                          env=env, capture_output=True, text=True, timeout=300)
+    return proc, ll
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("program", RITZ1_REFUSED)
+def test_ritz1_refuses_unannotated_mixed_arms(request, tmp_path, compiler, program):
+    proc, ll = _ritz1(request, compiler, tmp_path, program)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"{compiler}:\n{out[-800:]}"
+    assert MESSAGE in out, f"{compiler}:\n{out[-800:]}"
+    assert not ll.exists(), f"{compiler} wrote IR"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("program", ACCEPTED_SLOTS)
+def test_ritz1_float_slot_converts_int_arms(request, tmp_path, compiler, program):
+    proc, ll = _ritz1(request, compiler, tmp_path, program)
+    assert proc.returncode == 0, f"{compiler}:\n{(proc.stdout + proc.stderr)[-800:]}"
+    exe = tmp_path / "prog"
+    fast_link.clang(["clang", "-w", str(ll), str(RITZ_START), "-o", str(exe), "-nostdlib"],
+                    check=True)
+    assert subprocess.run([str(exe)], timeout=60).returncode == 42, compiler
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("program,src,dst", LOSSY_ARMS)
+def test_ritz1_float_slot_refuses_lossy_int_arm(request, tmp_path, compiler, program, src, dst):
+    proc, ll = _ritz1(request, compiler, tmp_path, program)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"{compiler}:\n{out[-800:]}"
+    assert _lossy(src, dst) in out, out[-800:]
+    assert MESSAGE not in out, out[-800:]

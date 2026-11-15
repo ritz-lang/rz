@@ -1227,6 +1227,10 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     # AGAST #2279: a `c:& C` argument copies into a by-value `C` param.  A lent
     # `self` param is a `ptr` (emit_impl_method).
     var reg: i32 = 0
+    # LARB R43 (#3385): an f32 / f64 param is a float slot for an if / match
+    # argument; emit_match_arms / emit_if_expr take the hint on entry.
+    if p != null and (arg.kind == EXPR_IF or arg.kind == EXPR_MATCH)
+        s.match_float_hint = param_float_type(p)
     if p != null and param_self_is_ptr(p) == 0
         reg = emit_expr_by_value(s, arg, p.param_type, p.param_type_name, p.param_type_name_len)
     else
@@ -4785,7 +4789,7 @@ fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                     fk = fk + 1
                 var src_ty: i32 = TYPE_I64
                 if f_arg_expr != null
-                    src_ty = get_expr_type(s, f_arg_expr)
+                    src_ty = float_arg_src_type(s, f_arg_expr, param_ptr.param_type)
                 if src_ty == TYPE_F32 and param_ptr.param_type == TYPE_F32
                     converted_regs[j] = arg_regs[j]
                 else if src_ty == TYPE_F64 and param_ptr.param_type == TYPE_F64
@@ -7170,10 +7174,18 @@ fn method_float_arg(s: *EmitterState, p: *Param, arg: *Expr, reg: i32) -> i32
         return reg
     var src_ty: i32 = TYPE_I64
     if arg != null
-        src_ty = get_expr_type(s, arg)
+        src_ty = float_arg_src_type(s, arg, p.param_type)
     if src_ty != TYPE_F32 and src_ty != TYPE_F64
         return int_into_float_slot(s, reg, arg, p.param_type)
     emit_float_coerce(s, reg, src_ty, p.param_type)
+
+# The type of argument `arg`'s register for a float param of type `pft`.  An
+# if / match there merged at `pft` (emit_call_arg's hint, LARB R43), while
+# get_expr_type falls back to i64 for it: a phi double was sitofp'd again.
+fn float_arg_src_type(s: *EmitterState, arg: *Expr, pft: i32) -> i32
+    if pft != 0 and (arg.kind == EXPR_IF or arg.kind == EXPR_MATCH)
+        return pft
+    get_expr_type(s, arg)
 
 # TYPE_F32 / TYPE_F64 when param `p` is a float: declared so, or a generic
 # `T` monomorph substituted with f32 / f64 and left TYPE_STRUCT.  Else 0.
@@ -7193,7 +7205,7 @@ fn param_float_type(p: *Param) -> i32
 fn ufcs_float_arg(s: *EmitterState, p: *Param, arg: *Expr, reg: i32) -> i32
     var src_ty: i32 = TYPE_I64
     if arg != null
-        src_ty = get_expr_type(s, arg)
+        src_ty = float_arg_src_type(s, arg, param_float_type(p))
     if src_ty != TYPE_F32 and src_ty != TYPE_F64
         return int_into_float_slot(s, reg, arg, param_float_type(p))
     emit_float_coerce(s, reg, src_ty, param_float_type(p))
