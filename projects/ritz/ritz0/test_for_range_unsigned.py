@@ -226,6 +226,72 @@ ROWS = {
                 return 3
         0
     """),
+    # AGAST #3327: mixed widths. The narrower bound widens by its own type,
+    # zext for unsigned: sign-extended, 3000000000 became 0xFFFFFFFFB2D05E00
+    # and the loop ran 0 times on ritz0.
+    "mixed_u32_start_u64_end": _row("""
+        let a: u32 = 3000000000
+        let b: u64 = 3000000003
+        var n: i64 = 0
+        var last: u64 = 0
+        for j in a..b
+            n = n + 1
+            last = j
+        if n != 3
+            return 1
+        if last != 3000000002
+            return 2
+        0
+    """),
+    # The narrower end: sign-extended, it is 2^64 - 1 and the loop doesn't
+    # stop at 3. `break` bounds the wrong case.
+    "mixed_u64_start_u32_end": _row("""
+        let a: u64 = 4294967292
+        let b: u32 = 4294967295
+        var n: i64 = 0
+        for j in a..b
+            n = n + 1
+            if n == 10
+                break
+        if n != 3
+            return 1
+        0
+    """),
+    "mixed_u8_start_u64_end": _row("""
+        let a: u8 = 250
+        let b: u64 = 253
+        var n: i64 = 0
+        for j in a..b
+            n = n + 1
+        if n != 3
+            return 1
+        0
+    """),
+    # Signed controls: a negative narrower bound still sign-extends.
+    "mixed_i32_start_i64_end": _row("""
+        let a: i32 = -3
+        let b: i64 = 2
+        var n: i64 = 0
+        var sum: i64 = 0
+        for j in a..b
+            n = n + 1
+            sum = sum + j
+        if n != 5
+            return 1
+        if sum != -5
+            return 2
+        0
+    """),
+    "mixed_i64_start_i32_end": _row("""
+        let a: i64 = -5
+        let b: i32 = -2
+        var n: i64 = 0
+        for j in a..b
+            n = n + 1
+        if n != 3
+            return 1
+        0
+    """),
 }
 
 

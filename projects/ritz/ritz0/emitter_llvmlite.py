@@ -7659,19 +7659,16 @@ class LLVMEmitter:
                 loop_ty = end_val.type
                 start_val = ir.Constant(loop_ty, 0)
             else:
-                # Otherwise, widen to the larger type
+                # Otherwise widen the narrower bound to the larger type, by its
+                # own Ritz type as binary operators do (AGAST #3327): a u32
+                # start of 3000000000 zero-extends; an i32 of -3 sign-extends.
+                # The narrower bound is under 64 bits, hence `narrowed`.
                 if self._type_size(start_val.type) > self._type_size(end_val.type):
                     loop_ty = start_val.type
-                    if self._is_signed_type(end_val.type):
-                        end_val = self.builder.sext(end_val, loop_ty)
-                    else:
-                        end_val = self.builder.zext(end_val, loop_ty)
+                    end_val = self._widen_for_bound(range_expr.end, end_val, loop_ty)
                 else:
                     loop_ty = end_val.type
-                    if self._is_signed_type(start_val.type):
-                        start_val = self.builder.sext(start_val, loop_ty)
-                    else:
-                        start_val = self.builder.zext(start_val, loop_ty)
+                    start_val = self._widen_for_bound(range_expr.start, start_val, loop_ty)
 
         # Create the loop variable (allocate in entry block to prevent stack leaks in nested loops)
         loop_var = self._alloca_in_entry_block(loop_ty, stmt.var)
@@ -7990,6 +7987,13 @@ class LLVMEmitter:
         return (self._int_shape(range_expr.start, narrowed)[1]
                 or self._int_shape(range_expr.end, narrowed)[1])
 
+    def _widen_for_bound(self, bound: rast.Expr, val: ir.Value, ty: ir.Type) -> ir.Value:
+        """The narrower bound `val` of a mixed-width range, widened to `ty` by
+        its Ritz type: zext when unsigned, sext otherwise (AGAST #3327)."""
+        if self._int_shape(bound, True)[1]:
+            return self.builder.zext(val, ty)
+        return self.builder.sext(val, ty)
+
     def _for_elem_ritz_type(self, it: rast.Expr, iter_kind: str, vec_ptr,
                             elem_ty: ir.Type) -> Optional[rast.Type]:
         """The Ritz type of what `for x in it` binds x to, if known (AGAST #2406).
@@ -8081,14 +8085,6 @@ class LLVMEmitter:
         if isinstance(addr.type.pointee, (ir.ArrayType, ir.BaseStructType)):
             return addr
         return self.builder.load(addr)
-
-    def _is_signed_type(self, ty) -> bool:
-        """Check if an LLVM integer type should be treated as signed."""
-        # i8, i16, i32, i64 are signed by convention in Ritz
-        # u8, u16, u32, u64 would be unsigned, but in LLVM they're all just IntType
-        # We need to track this from the source type, but for now assume i* types are signed
-        # This is a simplification - proper tracking would require carrying type info
-        return True  # Default to signed comparisons for now
 
     # AGAST #1869: comparison operators a failing assert reports both sides of.
     _ASSERT_CMP_OPS = ('==', '!=', '<', '<=', '>', '>=')
