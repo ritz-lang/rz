@@ -2802,7 +2802,30 @@ def discover_test_files(pkg_dir: Path, config: dict) -> list[Path]:
         ritz_tests.extend(test_dir.glob("*.ritz"))
     if config.get("build", {}).get("test_only", False):
         ritz_tests.extend(pkg_dir.glob("test_*.ritz"))
+    ritz_tests.extend(_declared_test_source_files(pkg_dir, config))
     return sorted(set(ritz_tests))  # Dedupe and sort
+
+
+def _declared_test_source_files(pkg_dir: Path, config: dict) -> list[Path]:
+    """Files under `[test] sources` dirs that define a `[[test]]` fn.
+
+    For packages that keep [[test]] fns inside their modules rather than in
+    test/ (angelo: `[test] sources = ["src"]`). `ritz0 --test` runs only the
+    given file's own [[test]] fns, so each such module is its own test file.
+    Dirs are searched recursively; a module with no `[[test]]` line is not
+    taken, since it would report "ran 0 tests" and fail. Until AGAST #3279
+    build.py read no key for this and angelo's tests ran under no gate.
+    """
+    found = []
+    for rel in config.get("test", {}).get("sources", []):
+        d = pkg_dir / rel
+        if not d.is_dir():
+            continue
+        for f in d.rglob("*.ritz"):
+            text = f.read_text(encoding="utf-8", errors="replace")
+            if any(line.strip() == "[[test]]" for line in text.splitlines()):
+                found.append(f)
+    return found
 
 
 def test_env_for_files() -> dict:

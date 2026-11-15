@@ -463,6 +463,42 @@ class TestBuildPyUnits:
         got = [p.name for p in buildpy.discover_test_files(pkg, cfg)]
         assert got == sorted(names)
 
+    def test_declared_test_sources_add_files_defining_test_fns(
+            self, buildpy, tmp_path):
+        # AGAST #3279: angelo keeps its [[test]] fns in src/ modules and
+        # declares nothing build.py read, so `rz test angelo` said "No tests
+        # found". `[test] sources` dirs are searched recursively; only files
+        # that define a [[test]] fn are taken (a module without one would
+        # be an "empty" test file, which fails).
+        pkg = _pkg(tmp_path, test_only=False, files=[("t.ritz", "")])
+        src = pkg / "src"
+        (src / "deep").mkdir(parents=True)
+        (src / "has.ritz").write_text("[[test]]\nfn test_a() -> i32\n    0\n")
+        (src / "deep" / "nested.ritz").write_text(
+            "fn f() -> i32\n    0\n\n[[test]]\nfn test_b() -> i32\n    0\n")
+        (src / "none.ritz").write_text("fn f() -> i32\n    0\n")
+        (src / "commented.ritz").write_text("# [[test]]\nfn f() -> i32\n    0\n")
+        (src / "notes.txt").write_text("[[test]]\n")
+        cfg = {"package": {"name": "pkg"},
+               "test": {"sources": ["src", "missing", "test"]}}
+        got = [p.relative_to(pkg).as_posix()
+               for p in buildpy.discover_test_files(pkg, cfg)]
+        assert got == ["src/deep/nested.ritz", "src/has.ritz", "test/t.ritz"]
+
+    def test_undeclared_sources_are_not_searched(self, buildpy, tmp_path):
+        pkg = _pkg(tmp_path, test_only=False)
+        (pkg / "src").mkdir()
+        (pkg / "src" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
+        assert buildpy.discover_test_files(pkg, {"package": {"name": "p"}}) == []
+
+    def test_angelo_declares_its_in_source_tests(self, buildpy):
+        # The package this was found in: its tests must stay discoverable.
+        angelo = PKG_DIR.parent / "angelo"
+        cfg = buildpy.tomllib.loads((angelo / "ritz.toml").read_text())
+        got = {p.relative_to(angelo).as_posix()
+               for p in buildpy.discover_test_files(angelo, cfg)}
+        assert {"src/tests.ritz", "src/raster/bezier.ritz"} <= got
+
     def test_summary_counts_like_the_serial_loop(self, buildpy):
         line = buildpy.summarize_file_outcomes([
             {"status": "pass", "passed": 3, "failed": 0},
