@@ -66,24 +66,34 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _copy_sources(src: Path, dst: Path) -> None:
+    """Copy the ritz1/, ritzlib/ and runtime/ sources of `src` into `dst`."""
+    shutil.copytree(
+        src / "ritz1",
+        dst / "ritz1",
+        ignore=shutil.ignore_patterns("build", "__pycache__"),
+        # Copy links as links (AGAST #2241): a dangling build.py convenience
+        # link would otherwise raise shutil.Error. Tracked links are relative
+        # into ritzlib/, so they resolve inside the scratch copy.
+        symlinks=True,
+    )
+    shutil.copytree(
+        src / "ritzlib",
+        dst / "ritzlib",
+        ignore=shutil.ignore_patterns("*.o", "*.ll", "__pycache__"),
+        symlinks=True,
+    )
+    (dst / "runtime").mkdir()
+    for f in [src / "runtime" / "Makefile", *(src / "runtime").glob("*.ll")]:
+        shutil.copy(f, dst / "runtime")
+
+
 @pytest.fixture(scope="module")
 def built_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A scratch projects/ritz with ritz1 fully built by the fake compiler."""
     tmp_path = tmp_path_factory.mktemp("ritz") / "projects_ritz"
     tmp_path.mkdir()
-    shutil.copytree(
-        ROOT / "ritz1",
-        tmp_path / "ritz1",
-        ignore=shutil.ignore_patterns("build", "__pycache__"),
-    )
-    shutil.copytree(
-        ROOT / "ritzlib",
-        tmp_path / "ritzlib",
-        ignore=shutil.ignore_patterns("*.o", "*.ll", "__pycache__"),
-    )
-    (tmp_path / "runtime").mkdir()
-    for f in [ROOT / "runtime" / "Makefile", *(ROOT / "runtime").glob("*.ll")]:
-        shutil.copy(f, tmp_path / "runtime")
+    _copy_sources(ROOT, tmp_path)
     (tmp_path / "fake_ritz0.py").write_text(FAKE_RITZ0)
     (tmp_path / "fake_cas_obj.py").write_text(FAKE_CAS_OBJ)
     _make(tmp_path)
@@ -187,3 +197,39 @@ def test_clean_removes_dep_files(tree: Path) -> None:
         ["make", "-C", str(tree / "ritz1"), "clean"], check=True, capture_output=True
     )
     assert not list((tree / "ritz1" / "build").glob("*.d"))
+
+
+# AGAST #2241: `build.py build --all` leaves a convenience link at
+# <pkg>/<bin> -> build/debug/<bin> (ritz1/ritz1 among ~60 others). The gate
+# deletes ritz1/build/ but not the ignored link, so it dangles; a copytree that
+# follows links then raised shutil.Error and all five tests above ERRORed at
+# setup, which read like a regression in the commit under test.
+def _scratch_src(root: Path) -> Path:
+    """A minimal source tree shaped like projects/ritz for `_copy_sources`."""
+    src = root / "src"
+    for d in ("ritz1", "ritzlib", "runtime"):
+        (src / d).mkdir(parents=True)
+    (src / "runtime" / "Makefile").write_text("")
+    (src / "ritzlib" / "io.ritz").write_text("")
+    return src
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pkg", ["ritz1", "ritzlib"])
+def test_copy_sources_tolerates_dangling_link(tmp_path: Path, pkg: str) -> None:
+    src = _scratch_src(tmp_path)
+    (src / pkg / "dangling").symlink_to("build/debug/dangling")
+    _copy_sources(src, tmp_path / "dst")
+    assert (tmp_path / "dst" / pkg / "dangling").is_symlink()
+
+
+@pytest.mark.unit
+def test_copy_sources_keeps_tracked_links_inside_the_copy(tmp_path: Path) -> None:
+    # Tracked links (ritz1/bootstrap_ritzlib/*, bootstrap_env/ritzlib) are
+    # relative into ritzlib/; copied as links they resolve in the scratch tree.
+    src = _scratch_src(tmp_path)
+    (src / "ritz1" / "io.ritz").symlink_to("../ritzlib/io.ritz")
+    _copy_sources(src, tmp_path / "dst")
+    copied = tmp_path / "dst" / "ritz1" / "io.ritz"
+    assert copied.is_symlink()
+    assert copied.resolve() == (tmp_path / "dst" / "ritzlib" / "io.ritz").resolve()
