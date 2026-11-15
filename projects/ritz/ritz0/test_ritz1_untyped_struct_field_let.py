@@ -151,6 +151,80 @@ pub fn main() -> i32
     ),
 }
 
+# AGAST #3017: an array-typed field (`let arr = h.a`, `a: [3]i32`) is the `[N]T`
+# slot an annotated `let arr: [3]i32 = h.a` declares.  The slot was i64, so the
+# init emitted `store i64 %<[3 x i32]>`, which clang rejects.
+ARRAYS = TYPES + """\
+struct H
+    k: i64
+    a: [3]i32
+    ps: [2]In
+
+fn fill(h: *H)
+    h.k = 9
+    h.a[0] = 1
+    h.a[1] = 2
+    h.a[2] = 4
+    h.ps[1].x = 5
+
+"""
+
+CASES.update({
+    # The ticket's repro: a scalar element, read back by index.
+    "array_field": (ARRAYS + """\
+pub fn main() -> i32
+    var h: H
+    fill(@h)
+    let arr = h.a
+    return arr[0] + arr[1] * 10 + arr[2] * 50
+""", 221),
+    # A struct element: `ps[1].x` indexes the copy as `[2]In`.
+    "struct_array_field": (ARRAYS + """\
+pub fn main() -> i32
+    var h: H
+    fill(@h)
+    let ps = h.ps
+    return ps[1].x
+""", 5),
+    # Through a pointer root, as resolve_member_chain_field resolves it.
+    "array_field_ptr_root": (ARRAYS + """\
+fn get(p: *H) -> i32
+    let a = p.a
+    return a[2]
+
+pub fn main() -> i32
+    var h: H
+    fill(@h)
+    return get(@h)
+""", 4),
+    # `[N]*T`: each element still reaches its pointee.
+    "pointer_array_field": (ARRAYS + """\
+struct Q
+    ps: [2]*In
+    ns: [2]*u8
+
+pub fn main() -> i32
+    var i = In { x: 7 }
+    var b: [2]u8
+    b[1] = 30
+    var h: Q
+    h.ps[1] = @i
+    h.ns[1] = @b[1]
+    let q = h.ps
+    let n = h.ns
+    return q[1].x + (*n[1] as i32)
+""", 37),
+    # A copy: writing it leaves the field alone.
+    "array_field_copy_not_alias": (ARRAYS + """\
+pub fn main() -> i32
+    var h: H
+    fill(@h)
+    var a = h.a
+    a[0] = 40
+    return a[0] + h.a[0]
+""", 41),
+})
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))

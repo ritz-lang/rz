@@ -70,13 +70,15 @@ _FILL = ("    var h: H\n    h.k = 9\n    h.a[0] = 1\n    h.a[1] = 2\n    h.a[2] 
          "    h.ps[1].x = 5\n    h.q.x = 8\n    h.q.y = 3\n    h.p = @h.q\n")
 # Every value read ritz0 takes through a Box: a scalar, as an operand and a call
 # argument; a member chain through a struct field and through a pointer field; a
-# copy of a struct field.
+# copy of a struct field and of an array field.
 _READS = ("    if {b}.k != 9\n        return 1\n"
           "    if {b}.k + 1 != 10\n        return 2\n"
           "    if id({b}.k) != 9\n        return 3\n"
           "    if {b}.q.x != 8\n        return 4\n"
           "    if {b}.p.y != 3\n        return 5\n"
           "    let c = {b}.q\n    if c.x + c.y != 11\n        return 6\n"
+          # AGAST #3017: a copy of an array field, an `[3]i32` slot.
+          "    let arr = {b}.a\n    if arr[1] != 2\n        return 7\n"
           "    return 0\n")
 _HELD = _BOX + _H + MAIN + _FILL + "    var b: Box<H>\n    b.ptr = @h\n"
 
