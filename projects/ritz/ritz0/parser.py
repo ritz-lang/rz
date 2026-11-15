@@ -18,6 +18,7 @@ from tokens import Token, TokenType, Span, KEYWORDS
 from lexer import Lexer, LexerError
 import ritz_ast as rast
 import index_rules
+from monomorph import TypeSubstitution
 
 
 def _defer_escape(node, in_loop: bool) -> Optional[str]:
@@ -2638,6 +2639,16 @@ class Parser:
                 self._advance()
                 is_async = True
             method = self.parse_fn(attrs, is_async=is_async, is_pub=method_is_pub, impl_type=self_type)
+            # AGAST #2258: `Self` in an impl method's signature is the impl's
+            # type. Nothing downstream resolved the name, so `self:= Self`
+            # lowered as i8 and crashed the emitter, and MoveTypes didn't see
+            # a `self: Self` as move-only. Spelled out here, every pass sees
+            # `P` (or `Box<T>`), exactly as if the method had written it.
+            spell_self = TypeSubstitution({'Self': self_type})
+            for param in method.params:
+                param.type = spell_self.apply(param.type)
+            if method.ret_type is not None:
+                method.ret_type = spell_self.apply(method.ret_type)
             # AGAST #1902: a method's own `<...>` is never instantiated (the
             # emitter erased T, e.g. to i8, and `b.m<i32>(x)` crashed), and
             # LANGUAGE_SPEC does not specify them. ritz1 rejects them too

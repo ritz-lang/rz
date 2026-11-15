@@ -1275,6 +1275,12 @@ impl T
     fn bare(self) -> i32
         return self.id
 
+    fn moved_self(self:= Self) -> i32
+        return self.id
+
+    fn typed_self(self: Self) -> i32
+        return self.id
+
     fn look(self: @T) -> i32
         return self.id
 
@@ -1292,7 +1298,7 @@ fn eat(t:= T) -> i32
 
 """
 
-    @pytest.mark.parametrize("method", ["burn", "typed", "bare"])
+    @pytest.mark.parametrize("method", ["burn", "typed", "bare", "moved_self", "typed_self"])
     def test_use_after_receiver_moved(self, method):
         errs = check(self.DEFS + f"""
 fn f(t:= T) -> i32
@@ -1300,6 +1306,18 @@ fn f(t:= T) -> i32
     return t.id
 """)
         assert len(errs) == 1 and "use of moved value: `t`" in str(errs[0])
+
+    @pytest.mark.parametrize("receiver", ["self:= Self", "self: Self"])
+    def test_a_self_typed_self_moves_when_passed_on(self, receiver):
+        """`Self` in an impl is the impl's type (AGAST #2258), so a `self`
+        typed `Self` is move-only like one typed `T`: passing it on moves it."""
+        errs = check(self.DEFS + f"""
+impl T
+    fn pass_on({receiver}) -> i32
+        eat(self)
+        return self.id
+""")
+        assert len(errs) == 1 and "use of moved value: `self`" in str(errs[0])
 
     @pytest.mark.parametrize("method", ["look", "poke", "keep"])
     def test_lending_method_keeps_the_receiver(self, method):
