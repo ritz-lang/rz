@@ -225,8 +225,11 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
 
         # Hash every transitive import now, before emission, so the sig vouches
         # for the sources this .ll was actually built from (AGAST #1674).
+        # The ritz.toml files that registered an imported namespace count too:
+        # their `sources` decide what `<name>.*` resolves to (AGAST #2087).
         import_hashes = build_import_hashes(
-            f for f in resolver.processed_files if f != source_abs_path)
+            [f for f in resolver.processed_files if f != source_abs_path]
+            + sorted(resolver.config_files))
         # ...and the candidates it probed and missed on the way (AGAST #2030).
         import_misses = sorted(resolver.missed_candidates)
 

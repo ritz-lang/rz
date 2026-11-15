@@ -292,6 +292,16 @@ class ImportResolver:
         # is first match, so a new file at one changes what an import
         # resolves to while every import hash still matches (AGAST #2030).
         self.missed_candidates: Set[str] = set()
+        # Every ritz.toml that shaped resolution of an imported namespace
+        # (it registered the namespace, or was read on the way).  The fast
+        # path hashes these with the imports: editing `sources` changes what
+        # `<name>.*` resolves to (AGAST #2087).  Ones probed and absent go in
+        # missed_candidates.
+        self.config_files: set[str] = set()
+        self._namespaces_recorded: set[str] = set()
+        # Namespaces the caller passed in: they are in the compile mode key
+        # and win over any ritz.toml, so no toml can change them.
+        self._explicit_dependencies: set[str] = set(dependencies or {})
         # Metadata cache for incremental compilation
         self.use_cache = use_cache
         self.metadata_cache = MetadataCache() if use_cache else None
@@ -940,6 +950,35 @@ class ImportResolver:
             current = current.parent
         return None
 
+    def _record_namespace_tomls(self, name: str) -> None:
+        """Record the ritz.toml files that decide whether `name` is a
+        dependency namespace, and with which `sources` (AGAST #2087).
+
+        _auto_detect_dependencies_from_ritz_path registers `name` from the
+        first of, per RITZ_PATH entry in order, `<entry>/ritz.toml` (when the
+        entry is itself named `name`) and `<entry>/<name>/ritz.toml`.  Each
+        candidate up to the one that registered `name` is recorded: present
+        ones in config_files (hashed), absent ones in missed_candidates.
+        Entries that do not exist yet are probed too, as in #2030.
+        """
+        if name in self._namespaces_recorded or name in self._explicit_dependencies:
+            return
+        self._namespaces_recorded.add(name)
+        winner = self.dependencies.get(name)
+        for root in self._ritz_path_roots:
+            pkg_dirs = [root] if root.name == name else []
+            pkg_dirs.append(root / name)
+            for pkg_dir in pkg_dirs:
+                toml = os.path.abspath(str(pkg_dir / "ritz.toml"))
+                if not os.path.exists(toml):
+                    self.missed_candidates.add(toml)
+                    continue
+                self.config_files.add(toml)
+                # A toml that failed to parse registered nothing: the next
+                # candidate still could.
+                if winner is not None and winner.path == pkg_dir:
+                    return
+
     def _resolve_import_path(self, path_parts: List[str], from_file: str) -> Optional[str]:
         """Resolve an import path to an actual file path.
 
@@ -950,6 +989,9 @@ class ImportResolver:
         4. From RITZ_PATH directories
         """
         base_dir = Path(from_file).parent
+
+        if path_parts:
+            self._record_namespace_tomls(path_parts[0])
 
         # RFC #109 Phase 2: Check if first part is a dependency namespace
         # e.g., "squeeze.gzip" → check if "squeeze" is a dependency

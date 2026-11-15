@@ -308,3 +308,124 @@ class TestCheckImportMisses:
         data = build_sig_data(source="fn main() -> i32\n    0\n", fn_hashes={},
                               import_misses=["/x/b.ritz", "/x/a.ritz"])
         assert data["import_misses"] == ["/x/a.ritz", "/x/b.ritz"]
+
+
+# ---------------------------------------------------------------------------
+# A ritz.toml that registers a dependency namespace (AGAST #2087)
+# ---------------------------------------------------------------------------
+#
+# The resolver registers a dependency namespace for every RITZ_PATH entry, and
+# every subdir of one, that holds a ritz.toml, with that toml's `sources`.  A
+# namespace takes over `<name>.*` resolution entirely.  So the ritz.toml files
+# that could register the imported namespace are inputs too: the sig hashes
+# the one that registered it and records the ones probed before it as misses.
+
+def _toml(pkg: Path, *sources: str) -> None:
+    pkg.mkdir(parents=True, exist_ok=True)
+    listed = ", ".join(f'"{s}"' for s in sources)
+    (pkg / "ritz.toml").write_text(f'[package]\nname = "{pkg.name}"\nsources = [{listed}]\n')
+
+
+def _assert_recompiles_after(tmp_path, main, ritz_path, change):
+    """Compile, apply `change`, recompile: must match a cold compile tagged 101."""
+    out = main.parent / "a.ll"
+    cache = tmp_path / "cache"
+    _compile_env(main, out, ritz_path, cache)
+    assert "202" in out.read_text()
+    change()
+    second = _compile_env(main, out, ritz_path, cache)
+    assert "Skipped" not in second.stdout, (
+        "fast path kept IR for the import's OLD resolution: " + second.stdout)
+    cold = tmp_path / "cold.ll"
+    _compile_env(main, cold, ritz_path, tmp_path / "cold-cache")
+    assert "101" in cold.read_text(), "test is vacuous: cold IR lacks the new tag"
+    assert out.read_text() == cold.read_text()
+
+
+@pytest.mark.integration
+class TestFastPathSeesRitzToml:
+    def test_ticket_repro_new_toml_redirects_package(self, tmp_path):
+        """rootB/shared/ tag.ritz resolved directly; a ritz.toml there redirects it."""
+        main, root_b = _tag_tree(tmp_path)
+
+        def change():
+            _toml(root_b / "shared", "alt")
+            _place(root_b / "shared" / "alt" / "tag.ritz", 101)
+        _assert_recompiles_after(tmp_path, main, str(root_b), change)
+
+    def test_edited_toml_sources(self, tmp_path):
+        """The namespace's ritz.toml switches `sources` from v1 to v2."""
+        main, root_b = _tag_tree(tmp_path)
+        pkg = root_b / "shared"
+        _toml(pkg, "v1")
+        _place(pkg / "v1" / "tag.ritz", 202)
+        _place(pkg / "v2" / "tag.ritz", 101)
+        _assert_recompiles_after(tmp_path, main, str(root_b), lambda: _toml(pkg, "v2"))
+
+    def test_new_package_dir_in_earlier_entry(self, tmp_path):
+        """rootA gains shared/ritz.toml + shared/src/tag.ritz: rootA's namespace wins."""
+        main, root_b = _tag_tree(tmp_path)
+        root_a = tmp_path / "rootA"
+        root_a.mkdir()
+
+        def change():
+            _toml(root_a / "shared", "src")
+            _place(root_a / "shared" / "src" / "tag.ritz", 101)
+        _assert_recompiles_after(tmp_path, main, f"{root_a}:{root_b}", change)
+
+    def test_entry_itself_becomes_the_package(self, tmp_path):
+        """A RITZ_PATH entry named `shared`, created later with a ritz.toml."""
+        main, root_b = _tag_tree(tmp_path)
+        entry = tmp_path / "pkgs" / "shared"
+
+        def change():
+            _toml(entry, "src")
+            _place(entry / "src" / "tag.ritz", 101)
+        _assert_recompiles_after(tmp_path, main, f"{entry}:{root_b}", change)
+
+    def test_irrelevant_tomls_keep_the_fast_path(self, tmp_path):
+        """Guard: a toml for another namespace, or one shadowed by the winner."""
+        main, root_b = _tag_tree(tmp_path)
+        root_a = tmp_path / "rootA"
+        _toml(root_a / "shared", "src")
+        _place(root_a / "shared" / "src" / "tag.ritz", 202)
+        ritz_path = f"{root_a}:{root_b}"
+        out = main.parent / "a.ll"
+        cache = tmp_path / "cache"
+        _compile_env(main, out, ritz_path, cache)
+        _toml(root_a / "other", "src")
+        _toml(root_b / "shared", "alt")
+        _place(root_b / "shared" / "alt" / "tag.ritz", 101)
+        second = _compile_env(main, out, ritz_path, cache)
+        assert "Skipped" in second.stdout, second.stdout
+
+    def test_sig_records_namespace_tomls(self, tmp_path):
+        """The registering toml is hashed; the toml probed before it is a miss."""
+        main, root_b = _tag_tree(tmp_path)
+        root_a = tmp_path / "rootA"
+        root_a.mkdir()
+        _toml(root_b / "shared", ".")
+        _place(root_b / "shared" / "tag.ritz", 202)
+        out = main.parent / "a.ll"
+        cache = tmp_path / "cache"
+        _compile_env(main, out, f"{root_a}:{root_b}", cache)
+        sig = cache / "ritz0" / (os.path.realpath(main).lstrip("/") + ".sig")
+        data = json.loads(sig.read_text())
+        assert str(root_b / "shared" / "ritz.toml") in data["import_hashes"]
+        assert str(root_a / "shared" / "ritz.toml") in data["import_misses"]
+
+
+@pytest.mark.unit
+def test_explicit_dependency_records_no_tomls(tmp_path, monkeypatch):
+    """A namespace the caller passed in wins over every ritz.toml (and is in
+    the mode key), so no toml is an input for it."""
+    from import_resolver import DependencyMapping, ImportResolver
+    root = tmp_path / "root"
+    _toml(root / "shared", "src")
+    monkeypatch.setenv("RITZ_PATH", str(root))
+    dep = DependencyMapping("shared", tmp_path / "explicit", ["src"])
+    resolver = ImportResolver(str(tmp_path), use_cache=False, dependencies={"shared": dep})
+    resolver._resolve_import_path(["shared", "tag"], str(tmp_path / "main.ritz"))
+    tomls = [p for p in resolver.missed_candidates | resolver.config_files
+             if p.endswith("ritz.toml")]
+    assert tomls == []

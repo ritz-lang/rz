@@ -42,6 +42,10 @@ file at one of them would change what an import resolves to while every
 `import_hashes` entry still matched; the fast path requires each to still be
 missing.
 
+Both also cover the RITZ_PATH `ritz.toml` files that decide whether an
+imported namespace is a dependency, and its `sources` (AGAST #2087): the one
+that registered the namespace is hashed, the ones probed before it are misses.
+
 `outputs` (AGAST #2020) records which output files this sig vouches for, in
 which compile mode, with which content.  The sig is keyed by source alone, so
 without it a recompile in another mode (--no-runtime, test mode, --target,
