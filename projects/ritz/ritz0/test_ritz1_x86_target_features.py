@@ -258,8 +258,8 @@ def test_intrinsic_fns_honour_masked_native_features(program_ll, tmp_path):
 
 
 # aes and aes_gcm import cryptosec.mem, whose mem_zero holds an `asm x86_64:`
-# block.  ritz1 parses it since AGAST #3394; an imported fn is declared, not
-# emitted, so the block needn't be lowered (#3395) for these to compile.
+# block.  ritz1 parses it (AGAST #3394) and lowers it (#3395); an imported fn
+# is declared, not emitted, so these compile without it either way.
 
 
 @pytest.mark.skipif(not CRYPTOSEC.is_dir(), reason="cryptosec not checked out")

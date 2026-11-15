@@ -1,0 +1,521 @@
+# emitter_asm.ritz - lower `asm` blocks to LLVM inline asm (AGAST #3395)
+#
+# LANGUAGE_SPEC §18.6 "Lowering", LARB R50.  The parser built and checked
+# the block (stmt_asm, ast_helpers.ritz, AGAST #3394); every check that needs
+# types is here.  Each block becomes one call:
+#
+#   %r = call <ret> asm sideeffect "<template>", "<constraints>"(<inputs>)
+#
+# * The operands are numbered outputs first (`out` and `inout`, in clause
+#   order), then inputs (`in` and `inout`, clause operands then text-only
+#   ones, in the order the parser listed them).
+# * The template is the lines joined by `\0A`, with `{name}` -> `$N` (`${N}`
+#   when a digit follows), `$` -> `$$`, `{{` / `}}` -> a brace, and `"`, `\`
+#   and any unprintable byte as LLVM's `\XX`.
+# * The constraints: per output `={reg}` if pinned, else `=&r` (the block may
+#   write it before reading every input); per input the output number of an
+#   `inout`, else `{reg}` if pinned, else `r`; then `~{reg}` for every
+#   `clobber` clause and every general register the text names (as its
+#   64-bit register; never rsp / rbp), then the fixed
+#   `~{memory},~{dirflag},~{fpsr},~{flags}`.
+# * The result: void with no output, the output's type with one, a literal
+#   struct with several; each output is stored back to its place.
+#
+# An operand's LLVM type is its Ritz type's: i8 / i16 / i32 / i64 for the
+# integers, which is what sets the register's width (`{port}` of a u16 is
+# `%dx`), and `ptr` for `*T`, `@T`, `@&T`, `**T`.  It is loaded from and
+# stored to its place at that type: a local's slot (a pointer local's is an
+# i64 slot; LLVM's pointers are opaque, so a `ptr` load of it is the same 8
+# bytes), or a global's (a narrow global lives in an i64 slot whose low bytes
+# are the value, as every access reads it).  A const is an input only: its
+# value.
+#
+# The errors (each at the operand: its clause name, else its first `{name}`):
+# a name that is not a local, a parameter, a global or a const; a type that
+# is not an integer or a pointer (a bool is an i1, which no register takes);
+# `out` / `inout` on a `let` or a const.  `out` / `inout` are assignments for
+# the borrow rules (§13.5): ref_check_asm, ref_check.ritz.
+#
+# [[naked]] (emit_naked_fn_body): the blocks, which take no operand
+# (asm_check_naked), then `unreachable`.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+
+import ast
+import ast_helpers
+import emitter_core
+
+# One operand of the block being lowered.
+struct AsmOp
+    op: *AsmOperand
+    ty: *u8               # its LLVM type: "i8" .. "i64" or "ptr"
+    addr: i32             # a local's slot register; -1 if not a local
+    glob: *GlobalVarDef   # a global's definition; null if not a global
+    is_const: i32         # 1 for a const (input only)
+    const_value: i64
+    out_idx: i32          # its output number; -1 for an `in`
+    in_idx: i32           # its input's operand number; -1 for an `out`
+    val: i32              # the register its input value was loaded into
+
+# The 64-bit name of general register `i` (the ASM_REG_* index).
+fn asm_reg_name(i: i32) -> *u8
+    if i == 0
+        return c"rax"
+    if i == 1
+        return c"rcx"
+    if i == 2
+        return c"rdx"
+    if i == 3
+        return c"rbx"
+    if i == 4
+        return c"rsp"
+    if i == 5
+        return c"rbp"
+    if i == 6
+        return c"rsi"
+    if i == 7
+        return c"rdi"
+    if i == 8
+        return c"r8"
+    if i == 9
+        return c"r9"
+    if i == 10
+        return c"r10"
+    if i == 11
+        return c"r11"
+    if i == 12
+        return c"r12"
+    if i == 13
+        return c"r13"
+    if i == 14
+        return c"r14"
+    c"r15"
+
+# The register a two-letter `ax` / `cx` / `dx` / `bx` / `sp` / `bp` / `si` /
+# `di` names, or ASM_REG_NONE.
+fn asm_reg2(c0: u8, c1: u8) -> i32
+    if c1 == 120   # 'x'
+        if c0 == 97
+            return 0
+        if c0 == 99
+            return 1
+        if c0 == 100
+            return 2
+        if c0 == 98
+            return 3
+        return ASM_REG_NONE
+    if c0 == 115 and c1 == 112   # sp
+        return ASM_REG_RSP
+    if c0 == 98 and c1 == 112    # bp
+        return ASM_REG_RBP
+    if c0 == 115 and c1 == 105   # si
+        return 6
+    if c0 == 100 and c1 == 105   # di
+        return 7
+    ASM_REG_NONE
+
+# The general register `name` (after a `%`) is part of, as its ASM_REG_*
+# index, or ASM_REG_NONE: `rax`, `eax`, `ax`, `al`, `ah`, `sil`, `r8d`,
+# `r8w`, `r8b`, `r8l` ...
+pub fn asm_text_reg(name: *u8, len: i32) -> i32
+    let r64: i32 = asm_reg_index(name, len)
+    if r64 != ASM_REG_NONE
+        return r64
+    if len == 2
+        let r16: i32 = asm_reg2(*name, *(name + 1))
+        if r16 != ASM_REG_NONE
+            return r16
+        # al / ah, cl / ch, dl / dh, bl / bh
+        let c1: u8 = *(name + 1)
+        if c1 == 108 or c1 == 104
+            let byte_of: i32 = asm_reg2(*name, 120)
+            if byte_of >= 0 and byte_of <= 3
+                return byte_of
+        return ASM_REG_NONE
+    if len == 3 and *name == 101   # eax, esp, esi ...
+        return asm_reg2(*(name + 1), *(name + 2))
+    if len == 3 and *(name + 2) == 108   # spl, bpl, sil, dil
+        let low: i32 = asm_reg2(*name, *(name + 1))
+        if low >= ASM_REG_RSP
+            return low
+        return ASM_REG_NONE
+    # r8d .. r15b: an r-register with a width suffix
+    if len >= 3 and *name == 114
+        let suffix: u8 = *(name + len - 1)
+        if suffix == 100 or suffix == 119 or suffix == 98 or suffix == 108
+            let r: i32 = asm_reg_index(name, len - 1)
+            if r >= 8
+                return r
+    ASM_REG_NONE
+
+fn asm_is_reg_char(c: u8) -> i32
+    ((c >= 97 and c <= 122) or (c >= 48 and c <= 57)) as i32
+
+# The bit (1 << ASM_REG_*) of every general register the text names, other
+# than rsp and rbp: the stack pointers are never clobbers (§18.6).
+fn asm_text_clobbers(b: *AsmBlock) -> i32
+    var mask: i32 = 0
+    var l: *AsmLine = b.lines
+    while l != null
+        var i: i32 = 0
+        while i < l.len
+            if *(l.text + i) == 37   # '%'
+                var j: i32 = i + 1
+                while j < l.len and asm_is_reg_char(*(l.text + j)) == 1
+                    j = j + 1
+                let r: i32 = asm_text_reg(l.text + i + 1, j - i - 1)
+                if r != ASM_REG_NONE and r != ASM_REG_RSP and r != ASM_REG_RBP
+                    mask = mask | (1 << r)
+                i = j
+            else
+                i = i + 1
+        l = l.next
+    mask
+
+# `<file>:<line>:<col>: error: <pre><name><post>`, counted.
+fn asm_emit_error(s: *EmitterState, at: SrcSpan, pre: *u8, name: *u8, len: i32, post: *u8)
+    let file: *u8 = emitter_source_file()
+    if file != null
+        eprints_cstr(file)
+    else
+        eprints_cstr(c"<input>")
+    eprint_char(':')
+    eprint_i64(at.line as i64)
+    eprint_char(':')
+    eprint_i64(at.col as i64)
+    eprints_cstr(c": error: ")
+    eprints_cstr(pre)
+    var i: i32 = 0
+    while i < len
+        eprint_char(*(name + i))
+        i = i + 1
+    eprintln_cstr(post)
+    s.error_count = s.error_count + 1
+
+# The LLVM type an operand of Ritz type `t` has, or null if `t` is not an
+# integer or a pointer.
+fn asm_llvm_type(t: i32) -> *u8
+    if t == TYPE_I8 or t == TYPE_U8
+        return c"i8"
+    if t == TYPE_I16 or t == TYPE_U16
+        return c"i16"
+    if t == TYPE_I32 or t == TYPE_U32
+        return c"i32"
+    if t == TYPE_I64 or t == TYPE_U64
+        return c"i64"
+    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
+        return c"ptr"
+    null
+
+fn asm_dir_word(dir: i32) -> *u8
+    if dir == ASM_INOUT
+        return c"asm 'inout' operand '"
+    c"asm 'out' operand '"
+
+# Find what `o` names and fill `out`; 1 if it can be the operand it is,
+# else 0 with the error reported.
+fn asm_resolve(s: *EmitterState, o: *AsmOperand, out: *AsmOp) -> i32
+    out.op = o
+    out.ty = null
+    out.addr = 0 - 1
+    out.glob = null
+    out.is_const = 0
+    out.const_value = 0
+    out.out_idx = 0 - 1
+    out.in_idx = 0 - 1
+    out.val = 0
+    let writes: i32 = (o.dir == ASM_OUT or o.dir == ASM_INOUT) as i32
+    var t: i32 = TYPE_VOID
+    var is_let: i32 = 0
+    let idx: i32 = find_local_idx(s, o.name, o.name_len)
+    if idx >= 0
+        let loc: *LocalVar = local_at(s, idx)
+        t = loc.var_type
+        if loc.is_bool == 1
+            t = TYPE_BOOL   # an i64 slot that holds a bool (AGAST #1521)
+        out.addr = loc.reg
+        is_let = loc.is_let
+    else
+        let g: *GlobalVarDef = find_global(s, o.name, o.name_len)
+        if g != null
+            t = g.var_type
+            out.glob = g
+        else
+            let ce: *ConstEntry = find_const_entry(s, o.name, o.name_len)
+            if ce == null
+                asm_emit_error(s, o.span, c"asm operand '", o.name, o.name_len, c"' is not a local, a parameter or a global")
+                return 0
+            t = ce.const_type
+            out.is_const = 1
+            out.const_value = ce.value
+    out.ty = asm_llvm_type(t)
+    if out.ty == null
+        asm_emit_error(s, o.span, c"asm operand '", o.name, o.name_len, c"' must be an integer or a pointer")
+        return 0
+    if writes == 1 and is_let == 1
+        asm_emit_error(s, o.span, asm_dir_word(o.dir), o.name, o.name_len, c"' is a `let` binding, not an assignable place: declare it `var`")
+        return 0
+    if writes == 1 and out.is_const == 1
+        asm_emit_error(s, o.span, asm_dir_word(o.dir), o.name, o.name_len, c"' is a const, not an assignable place")
+        return 0
+    1
+
+# The place `op` is: `%.N` (a local's slot) or `@name` (a global).
+fn asm_emit_place(s: *EmitterState, op: *AsmOp)
+    if op.glob != null
+        emit_str(s, c"@")
+        emit_name(s, op.glob.name, op.glob.name_len)
+    else
+        emit_reg(s, op.addr)
+
+# Load `op`'s input value into a new register.
+fn asm_load_input(s: *EmitterState, op: *AsmOp) -> i32
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    if op.is_const == 1
+        if buf_eq(op.ty, 3, c"ptr", 3) == 1
+            emit_str(s, c" = inttoptr i64 ")
+        else if buf_eq(op.ty, 3, c"i64", 3) == 1
+            emit_str(s, c" = add i64 0, ")
+        else
+            emit_str(s, c" = trunc i64 ")
+        emit_int(s, op.const_value)
+        if buf_eq(op.ty, 3, c"i64", 3) == 0
+            emit_str(s, c" to ")
+            emit_str(s, op.ty)
+        emit_str(s, c"\n")
+        return r
+    emit_str(s, c" = load ")
+    emit_str(s, op.ty)
+    emit_str(s, c", ptr ")
+    asm_emit_place(s, op)
+    emit_str(s, c"\n")
+    r
+
+# The operand of `ops` named `name`, or null.
+fn asm_op_named(ops: *AsmOp, n: i32, name: *u8, len: i32) -> *AsmOp
+    for i in 0..n
+        let op: *AsmOp = ops + i
+        if buf_eq(op.op.name, op.op.name_len, name, len) == 1
+            return op
+    null
+
+fn emit_hex_digit(s: *EmitterState, d: i32)
+    if d < 10
+        vec_push<u8>(s.out, (48 + d) as u8)
+    else
+        vec_push<u8>(s.out, (55 + d) as u8)
+
+# One template byte, escaped for an LLVM string.
+fn asm_emit_template_byte(s: *EmitterState, c: u8)
+    if c == 34 or c == 92 or c < 32 or c > 126
+        vec_push<u8>(s.out, 92)
+        emit_hex_digit(s, (c >> 4) as i32)
+        emit_hex_digit(s, (c & 15) as i32)
+    else
+        vec_push<u8>(s.out, c)
+
+# The block's template (see the top of the file).
+fn asm_emit_template(s: *EmitterState, b: *AsmBlock, ops: *AsmOp, n: i32)
+    var l: *AsmLine = b.lines
+    var first: i32 = 1
+    while l != null
+        if first == 0
+            emit_str(s, c"\\0A")
+        first = 0
+        var i: i32 = 0
+        while i < l.len
+            let c: u8 = *(l.text + i)
+            if (c == 123 or c == 125) and i + 1 < l.len and *(l.text + i + 1) == c
+                vec_push<u8>(s.out, c)   # `{{` / `}}`
+                i = i + 2
+            else if c == 123
+                var j: i32 = i + 1
+                while j < l.len and *(l.text + j) != 125
+                    j = j + 1
+                let op: *AsmOp = asm_op_named(ops, n, l.text + i + 1, j - i - 1)
+                if op == null or j >= l.len
+                    vec_push<u8>(s.out, c)   # never reached: stmt_asm checked the braces
+                    i = i + 1
+                else
+                    var num: i32 = op.out_idx
+                    if num < 0
+                        num = op.in_idx
+                    let digit_next: i32 = (j + 1 < l.len and *(l.text + j + 1) >= 48 and *(l.text + j + 1) <= 57) as i32
+                    emit_str(s, c"$")
+                    if digit_next == 1
+                        emit_str(s, c"{")
+                    emit_int(s, num as i64)
+                    if digit_next == 1
+                        emit_str(s, c"}")
+                    i = j + 1
+            else if c == 36   # `$` is literal: `$$` to LLVM
+                emit_str(s, c"$$")
+                i = i + 1
+            else
+                asm_emit_template_byte(s, c)
+                i = i + 1
+        l = l.next
+
+# The block's constraint string (see the top of the file).
+fn asm_emit_constraints(s: *EmitterState, b: *AsmBlock, ops: *AsmOp, n: i32, n_out: i32)
+    var first: i32 = 1
+    for k in 0..n_out
+        for i in 0..n
+            let op: *AsmOp = ops + i
+            if op.out_idx == k
+                if first == 0
+                    emit_str(s, c",")
+                first = 0
+                if op.op.reg != ASM_REG_NONE
+                    emit_str(s, c"={")
+                    emit_str(s, asm_reg_name(op.op.reg))
+                    emit_str(s, c"}")
+                else
+                    emit_str(s, c"=&r")
+    for i in 0..n
+        let op: *AsmOp = ops + i
+        if op.in_idx >= 0
+            if first == 0
+                emit_str(s, c",")
+            first = 0
+            if op.out_idx >= 0
+                emit_int(s, op.out_idx as i64)   # an inout: tied to its output
+            else if op.op.reg != ASM_REG_NONE
+                emit_str(s, c"{")
+                emit_str(s, asm_reg_name(op.op.reg))
+                emit_str(s, c"}")
+            else
+                emit_str(s, c"r")
+    let clobbers: i32 = b.clobbers | asm_text_clobbers(b)
+    for r in 0..16
+        if (clobbers & (1 << r)) != 0
+            if first == 0
+                emit_str(s, c",")
+            first = 0
+            emit_str(s, c"~{")
+            emit_str(s, asm_reg_name(r))
+            emit_str(s, c"}")
+    if first == 0
+        emit_str(s, c",")
+    emit_str(s, c"~{memory},~{dirflag},~{fpsr},~{flags}")
+
+# The call's result type: void, the one output's type, or a literal struct.
+fn asm_emit_ret_type(s: *EmitterState, ops: *AsmOp, n: i32, n_out: i32)
+    if n_out == 0
+        emit_str(s, c"void")
+        return
+    if n_out > 1
+        emit_str(s, c"{ ")
+    for k in 0..n_out
+        for i in 0..n
+            let op: *AsmOp = ops + i
+            if op.out_idx == k
+                if k > 0
+                    emit_str(s, c", ")
+                emit_str(s, op.ty)
+    if n_out > 1
+        emit_str(s, c" }")
+
+# Lower the STMT_ASM `stmt` (LANGUAGE_SPEC §18.6, AGAST #3395).
+pub fn emit_asm_block(s: *EmitterState, stmt: *Stmt)
+    let b: *AsmBlock = stmt.asm_block
+    var n: i32 = 0
+    var o: *AsmOperand = b.operands
+    while o != null
+        n = n + 1
+        o = o.next
+    var ops: *AsmOp = null
+    if n > 0
+        ops = malloc((n as i64) * sizeof(AsmOp)) as *AsmOp
+    # Resolve every operand; report every one that is wrong.
+    var ok: i32 = 1
+    o = b.operands
+    var i: i32 = 0
+    while o != null
+        if asm_resolve(s, o, ops + i) == 0
+            ok = 0
+        i = i + 1
+        o = o.next
+    if ok == 0
+        free(ops as *u8)
+        return
+    # Number them: outputs first, then inputs.
+    var n_out: i32 = 0
+    for k in 0..n
+        let op: *AsmOp = ops + k
+        if op.op.dir == ASM_OUT or op.op.dir == ASM_INOUT
+            op.out_idx = n_out
+            n_out = n_out + 1
+    var next_in: i32 = n_out
+    for k in 0..n
+        let op: *AsmOp = ops + k
+        if op.op.dir == ASM_IN or op.op.dir == ASM_INOUT
+            op.in_idx = next_in
+            next_in = next_in + 1
+            op.val = asm_load_input(s, op)
+    # The call.
+    var res: i32 = 0
+    emit_str(s, c"  ")
+    if n_out > 0
+        res = next_reg(s)
+        emit_reg(s, res)
+        emit_str(s, c" = ")
+    emit_str(s, c"call ")
+    asm_emit_ret_type(s, ops, n, n_out)
+    emit_str(s, c" asm sideeffect \"")
+    asm_emit_template(s, b, ops, n)
+    emit_str(s, c"\", \"")
+    asm_emit_constraints(s, b, ops, n, n_out)
+    emit_str(s, c"\"(")
+    var first: i32 = 1
+    for k in 0..n
+        let op: *AsmOp = ops + k
+        if op.in_idx >= 0
+            if first == 0
+                emit_str(s, c", ")
+            first = 0
+            emit_str(s, op.ty)
+            emit_str(s, c" ")
+            emit_reg(s, op.val)
+    emit_str(s, c")\n")
+    # Each output back to its place.
+    for k in 0..n_out
+        for j in 0..n
+            let op: *AsmOp = ops + j
+            if op.out_idx == k
+                var v: i32 = res
+                if n_out > 1
+                    v = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, v)
+                    emit_str(s, c" = extractvalue ")
+                    asm_emit_ret_type(s, ops, n, n_out)
+                    emit_str(s, c" ")
+                    emit_reg(s, res)
+                    emit_str(s, c", ")
+                    emit_int(s, k as i64)
+                    emit_str(s, c"\n")
+                emit_str(s, c"  store ")
+                emit_str(s, op.ty)
+                emit_str(s, c" ")
+                emit_reg(s, v)
+                emit_str(s, c", ptr ")
+                asm_emit_place(s, op)
+                emit_str(s, c"\n")
+    if ops != null
+        free(ops as *u8)
+
+# The body of a [[naked]] fn (§17.5, §18.6): its asm blocks, then
+# `unreachable`: the asm returns by itself.  No parameter is spilled, no
+# frame is made.
+pub fn emit_naked_fn_body(s: *EmitterState, f: *FnDef)
+    var st: *Stmt = f.body
+    while st != null
+        if st.kind == STMT_ASM
+            emit_asm_block(s, st)
+        st = st.next
+    emit_str(s, c"  unreachable\n")

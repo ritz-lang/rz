@@ -54,6 +54,7 @@ SOURCES = \
 	float_slot \
 	tail_value \
 	reachability \
+	emitter_asm \
 	emitter_stmt \
 	emitter \
 	fn_cache \

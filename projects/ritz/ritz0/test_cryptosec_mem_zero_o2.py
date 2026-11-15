@@ -7,7 +7,7 @@ module or LTO), -O2 deleted the wipe, and the buffer with it. Before the fix,
 the linked program below optimised to `ret i32 0`.
 
 The test links the caller with the real cryptosec/lib/mem.ritz the way LTO
-would, runs -O2, and checks that the zeroing stores, and the barrier that
+would, built by ritz0 and by ritz1 (which lowers the asm since #3395), runs -O2, and checks that the zeroing stores, and the barrier that
 keeps them, are still in `main` (IR) and in the machine code (object).
 """
 
@@ -24,6 +24,7 @@ from ritz0_inproc import run_ritz0
 pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
+RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 PROJECTS = RITZ_ROOT.parent
 MEM_RITZ = PROJECTS / "cryptosec" / "lib" / "mem.ritz"
 
@@ -66,19 +67,25 @@ needs_tools = pytest.mark.skipif(
     reason="clang / llvm-link not on PATH")
 
 
-def _compile(src: Path, out: Path, cwd: Path):
+def _compile(compiler: str, src: Path, out: Path, cwd: Path):
     env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}{os.pathsep}{PROJECTS}")
-    proc = run_ritz0([str(src), "-o", str(out)], cwd=cwd, env=env, timeout=300)
+    if compiler == "ritz0":
+        proc = run_ritz0([str(src), "-o", str(out)], cwd=cwd, env=env, timeout=300)
+    else:
+        # Never skip (#1327): the gate builds ritz1 before pytest.
+        assert RITZ1_BIN.exists(), f"{RITZ1_BIN} missing; run `make -C ritz1`"
+        proc = subprocess.run([str(RITZ1_BIN), str(src), "-o", str(out)], cwd=cwd, env=env,
+                              capture_output=True, text=True, timeout=300)
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-@pytest.fixture
-def linked(tmp_path):
+@pytest.fixture(params=["ritz0", "ritz1"])
+def linked(request, tmp_path):
     """caller + cryptosec mem.ritz in one IR module (what LTO sees)."""
     caller = tmp_path / "t.ritz"
     caller.write_text(CALLER)
-    _compile(caller, tmp_path / "t.ll", tmp_path)
-    _compile(MEM_RITZ, tmp_path / "mem.ll", tmp_path)
+    _compile(request.param, caller, tmp_path / "t.ll", tmp_path)
+    _compile(request.param, MEM_RITZ, tmp_path / "mem.ll", tmp_path)
     out = tmp_path / "linked.ll"
     proc = subprocess.run(
         [LLVM_LINK, "-S", str(tmp_path / "t.ll"), str(tmp_path / "mem.ll"),
@@ -106,7 +113,8 @@ def test_O2_keeps_the_wipe_of_a_dead_local_in_ir(linked):
         r"call void @llvm\.memset[^\n]*i8 0, i64 32", main)
     assert zeroing, main
     # ...and kept alive by the asm barrier that reads the buffer through ptr.
-    assert re.search(r'call void asm sideeffect "nopl[^"]*", "r,~\{memory\}"', main), main
+    # ritz1 adds §18.6's ~{dirflag},~{fpsr},~{flags} after ~{memory}.
+    assert re.search(r'call void asm sideeffect "nopl[^"]*", "r,~\{memory\}[^"]*"', main), main
 
 
 @needs_tools

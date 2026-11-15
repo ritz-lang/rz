@@ -10,7 +10,9 @@ chain.  ritz1 refused a struct value's ("cannot take address") and, through a
 operand must be a pointer to a first class type").
 
 ritz0 is the oracle: every row's exit code is what ritz0's build returns.
-mem.ritz's inline `asm` is the third failure, and #1619's.
+mem.ritz's inline `asm` was the third failure, and #1619's: ritz1 lowers it
+since #3395 (test_cryptosec_mem_compiles here; test_cryptosec_mem_zero_o2.py
+runs the wipe).
 """
 
 import os
@@ -28,6 +30,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.batched]
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
+MEM_RITZ = RITZ_ROOT.parent / "cryptosec" / "lib" / "mem.ritz"
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
@@ -171,3 +174,12 @@ def _cases():
 @pytest.mark.parametrize("compiler,name", list(_cases()))
 def test_cryptosec_shape_runs_as_ritz0_runs_it(compiler, tmp_path, name):
     assert _run(compiler, tmp_path, name, _src(name)) == PROGRAMS[name][3]
+
+
+@pytest.mark.skipif(not MEM_RITZ.is_file(), reason="cryptosec not checked out")
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_cryptosec_mem_compiles(compiler, tmp_path):
+    # mem_zero's `nopl ({ptr})` barrier (#1986): ritz1 refused it until #3395.
+    comp = _emit(compiler, MEM_RITZ, tmp_path / "mem.ll", tmp_path)
+    assert comp.returncode == 0, comp.stdout + comp.stderr
+    assert "nopl" in (tmp_path / "mem.ll").read_text()

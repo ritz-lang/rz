@@ -78,8 +78,6 @@ _RITZ1_TWINS = {
         "AGAST #1623 — closures / anonymous fns (spec says not implemented)",
     "test_issue99":
         "AGAST #1624 — `alias::item` calls, removed from the spec; ritz0 is the outlier",
-    "test_asm":
-        "AGAST #1619 — inline `asm x86_64:` blocks unsupported in ritz1",
     # --- codegen, runtime failures ---
 }
 

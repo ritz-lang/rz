@@ -5262,8 +5262,9 @@ fn not_asm() -> i32
     x
 ```
 
-ritz1 parses and checks `asm` (§18.6) but doesn't lower it yet (AGAST #3395), so
-it refuses a `[[naked]]` fn at its first `asm` block.
+Both compilers emit a naked function as LLVM `naked noinline`: its `asm`
+blocks, then `unreachable`. It is never inlined, because the block's own `ret`
+would return from the caller.
 
 ### 17.6 Inlining Attributes
 
@@ -5556,8 +5557,8 @@ fn write1(fd: i64, buf: *u8, n: i64) -> i64
     return ret
 ```
 
-A block with no clauses, whose operands are all inputs, is already accepted by
-ritz0; the clause forms above wait on #1619's implementation tickets. The
+ritz1 lowers every form here (AGAST #3395). ritz0 accepts a block with no
+clauses, whose operands are all inputs; its clause forms wait on #3396. The
 compiler barrier cryptosec uses to keep a zeroing loop from being removed:
 
 ```ritz

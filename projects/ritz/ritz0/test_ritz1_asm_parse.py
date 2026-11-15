@@ -9,27 +9,25 @@ Step 1 of #1619 for ritz1: the front end only.
 * The clauses, `(in|out|inout NAME (: REG)? | clobber REG, ...)`, parse.
 * Every §18.6 error that needs no types is reported, located (ERRORS).
 
-Lowering is step 2 (#3395).  Until then a block that passes every check is
-refused at its `asm` with "asm is not lowered by ritz1 yet", which is how the
-ACCEPT rows tell a parsed block from one that failed to parse.
+Lowering is step 2 (#3395, test_ritz1_asm_lower.py): each ACCEPT row now
+compiles to IR, so a block that failed to parse, or a check that fired on a
+good block, fails the row.
 
 ritz0 is not a column here: #3396 brings its `asm` into line with §18.6.
 """
 
 import pytest
 
+from test_cryptosec_ritz1_shapes import _emit
 from test_ref_into_value import _assert_refused
 
 pytestmark = pytest.mark.integration
 
 COMPILERS = ["ritz1", "ritz1_selfhosted"]
 
-NOT_LOWERED = "asm is not lowered by ritz1 yet (AGAST #3395)"
-
 MAIN = "\npub fn main() -> i32\n    0\n"
 
-# Blocks that parse and pass every front-end check.  `^` marks the `asm`
-# each is refused at, for not being lowered.
+# Blocks that parse and pass every front-end check, and so compile.
 ACCEPT = {
     # Every kind of text the Ritz lexer would refuse or mangle, a comment,
     # a blank line, a deeper line, a numeric label, and statements after
@@ -37,7 +35,7 @@ ACCEPT = {
     "text": """\
 fn wipe(ptr: *u8, len: i64, c: bool) -> i64
     if c
-        ^asm x86_64:
+        asm x86_64:
             nopl ({ptr})      # a compiler barrier: { is not an operand here
             movq $3, %rcx
 
@@ -55,7 +53,7 @@ fn wipe(ptr: *u8, len: i64, c: bool) -> i64
     "clauses": """\
 fn write1(fd: i64, buf: *u8, n: i64) -> i64
     var ret: i64 = 1
-    ^asm x86_64 (inout ret: rax, in fd: rdi, in buf: rsi, in n: rdx, clobber rcx, clobber r11):
+    asm x86_64 (inout ret: rax, in fd: rdi, in buf: rsi, in n: rdx, clobber rcx, clobber r11):
         syscall
     return ret
 """
@@ -64,7 +62,7 @@ fn write1(fd: i64, buf: *u8, n: i64) -> i64
     "unpinned": """\
 fn inb(port: u16) -> u8
     var result: u8 = 0
-    ^asm x86_64 (out result,
+    asm x86_64 (out result,
                  in port: rdx):
         inb %dx, %al
         movb %al, {result}
@@ -76,7 +74,7 @@ fn inb(port: u16) -> u8
     + """
 [[naked]]
 fn naked_add(a: i32, b: i32) -> i32
-    ^asm x86_64:
+    asm x86_64:
         movl %edi, %eax
         addl %esi, %eax
         retq""",
@@ -152,7 +150,10 @@ ERRORS = {
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(ACCEPT))
 def test_asm_block_parses(tmp_path, compiler, case):
-    _assert_refused(compiler, tmp_path, case, ACCEPT[case], NOT_LOWERED)
+    path = tmp_path / "main.ritz"
+    path.write_text(ACCEPT[case])
+    comp = _emit(compiler, path, tmp_path / "main.ll", tmp_path)
+    assert comp.returncode == 0, f"{compiler} refused {case}:\n{comp.stdout + comp.stderr}"
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
