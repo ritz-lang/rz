@@ -11,7 +11,8 @@ segfaults; ritz0, which hoists, exits normally.
 
 Every in-place temp had the same shape: the local itself, the rvalue
 struct-literal temp (#1362), the method-receiver literal slot, the
-variant-ctor slot, the newtype arg box and emit_array_fill_into's counter.
+variant-ctor slot, the newtype arg box (gone since LARB R47b, #3420: its
+argument is refused) and emit_array_fill_into's counter.
 
 THE FIX
 
@@ -154,32 +155,10 @@ CASES = {
     "array_fill": (ARRAY_FILL, 50),
 }
 
-# The newtype arg box and the struct-literal method receiver are lowered in
-# ritz1 only (ritz0 rejects both forms), so they get the structural check but
-# no ritz0 oracle.  An integer name or literal into a newtype is refused since
-# LARB R47 (#3390); an arithmetic arg still reaches the box until #3420
-# decides the box itself.
-NEWTYPE_BOX = """\
-struct Meters
-    v: i64
-
-struct Acc
-    base: i64
-
-impl Acc
-    fn add(self: @Acc, m: Meters) -> i64
-        return self.base + m.v
-
-pub fn main() -> i32
-    let a: Acc = Acc { base: 0 }
-    var t: i64 = 0
-    var i: i64 = 0
-    while i < 10
-        t = t + a.add(i * 1)
-        i = i + 1
-    return t as i32
-"""
-
+# The struct-literal method receiver is lowered in ritz1 only (ritz0 rejects
+# the form), so it gets the structural check but no ritz0 oracle.  The newtype
+# arg box's case (`a.add(i * 1)`) went with the box: since LARB R47b (#3420) its
+# argument is refused, test_nonstruct_arg_for_struct_param.py.
 RECV_LIT = """\
 struct P
     x: i64
@@ -199,7 +178,6 @@ pub fn main() -> i32
 """
 
 STRUCTURAL_CASES = {name: prog for name, (prog, _) in CASES.items()}
-STRUCTURAL_CASES["newtype_box"] = NEWTYPE_BOX
 STRUCTURAL_CASES["recv_lit"] = RECV_LIT
 
 # A runtime-sized __builtin_alloca must stay put.

@@ -18,8 +18,10 @@
 #
 #   a by-value struct param   gets an integer (LARB R47, §9.2: even into a
 #                             single-field struct, where a method or UFCS
-#                             call used to box it; cc_sure_int), a float,
-#                             `null`, a c-string, or a pointer to something
+#                             call used to box it; cc_sure_int, and
+#                             call_check_boxed for what it can't vouch for,
+#                             R47b), a `bool`, a float, `null`, a
+#                             c-string, or a pointer to something
 #                             else (one to the same struct is ref_check's
 #                             "doesn't fit a by-value slot")
 #   an int, float or bool     gets a struct value
@@ -142,25 +144,52 @@ pub fn call_check_arity(s: *EmitterState, line: i32, col: i32, name: *u8, len: i
         eprint_char('\n')
     1
 
+fn cc_int_type(t: i32) -> i32
+    return (t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64) as i32
+
+# 1 if `p` surely points at an integer: a pointer or borrow local to one, a
+# `*i64` field, or either plus an offset (`p + i`).
+fn cc_int_pointer(s: *EmitterState, p: *Expr) -> i32
+    if p.kind == EXPR_IDENT
+        if lent_scalar_ident(s, p) != null
+            return 1
+        let loc: *LocalVar = find_local_struct_name(s, p.ident_ptr, p.ident_len)
+        if loc != null and loc.var_type != TYPE_ARRAY
+            return cc_int_type(loc.pointee_type)
+        return 0
+    if p.kind == EXPR_MEMBER
+        return cc_int_type(get_member_pointee_type_exact(s, p))
+    if p.kind == EXPR_BINARY and (p.op == OP_ADD or p.op == OP_SUB)
+        return cc_int_pointer(s, p.left)
+    0
+
 # 1 if `a`, which bool_kind calls BK_INT, surely is an integer.  bool_kind
 # guesses BK_INT for what get_expr_type can't type (a `*p` of a struct
 # pointer), so only these forms are taken at its word: a literal, a cast, a
-# name, a call or method whose callee it resolved, and `*p` of an integer
-# pointer or borrow local.
+# name, a call or method whose callee it resolved, `*p` of an integer pointer
+# or borrow, a member read (bk_member resolved the field), an element of a
+# name or field whose element type is known, and arithmetic or `-` / `~` of
+# these (LARB R47b, #3420).
 fn cc_sure_int(s: *EmitterState, a: *Expr) -> i32
     let k: i32 = a.kind
     if k == EXPR_INT_LIT or k == EXPR_CHAR_LIT or k == EXPR_CAST or k == EXPR_IDENT
         return 1
-    if k == EXPR_CALL or k == EXPR_METHOD
+    if k == EXPR_CALL or k == EXPR_METHOD or k == EXPR_MEMBER
         return 1
-    if k == EXPR_UNARY and a.op == OP_DEREF and a.operand != null and a.operand.kind == EXPR_IDENT
-        if lent_scalar_ident(s, a.operand) != null
-            return 1
-        let loc: *LocalVar = find_local_struct_name(s, a.operand.ident_ptr, a.operand.ident_len)
-        if loc != null
-            let t: i32 = loc.pointee_type
-            if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64
-                return 1
+    if k == EXPR_BINARY
+        return (bool_kind(s, a.left) == BK_INT and cc_sure_int(s, a.left) == 1 and bool_kind(s, a.right) == BK_INT and cc_sure_int(s, a.right) == 1) as i32
+    if k == EXPR_UNARY and (a.op == OP_NEG or a.op == OP_BIT_NOT)
+        return cc_sure_int(s, a.operand)
+    if k == EXPR_UNARY and a.op == OP_DEREF and a.operand != null
+        return cc_int_pointer(s, a.operand)
+    if k == EXPR_INDEX and a.left != null
+        let base: *Expr = a.left
+        if base.kind == EXPR_IDENT
+            return (bk_element(s, base.ident_ptr, base.ident_len) == BK_INT) as i32
+        if base.kind == EXPR_MEMBER
+            let f: *StructField = member_field_def(s, base)
+            if f != null and f.field_type == TYPE_ARRAY
+                return cc_int_type(f.array_elem_type)
     0
 
 # What `a` is when it can't be the by-value struct `want`, in words; null when
@@ -177,6 +206,9 @@ fn cc_not_a_struct(s: *EmitterState, a: *Expr, want: *u8, want_len: i32) -> *u8
     # §9.2, #3390).
     if k == BK_INT and cc_sure_int(s, a) == 1
         return c"an integer"
+    # Nor any other scalar (LARB R47b, #3420): a bool says so whatever its form.
+    if k == BK_BOOL
+        return c"a `bool`"
     if k != BK_PTR
         return null
     # A Span is built from `@a` / `@v` (coerce_array_to_span, emit_vec_as_span).
@@ -279,6 +311,17 @@ pub fn call_check_kind(s: *EmitterState, fname: *u8, flen: i32, argno: i32, a: *
         eprints_cstr(c"a `")
         eprint_bytes(got, len)
         eprints_cstr(c"`\n")
+
+# The newtype box (emitter_expr_call's method and UFCS arg cascades) found an
+# integer, by get_expr_type, for by-value struct param `p` of method call `e`:
+# it used to store the i64 into the struct.  Nothing converts to a struct
+# (LARB R47b, §9.2, #3420), so whatever form cc_sure_int didn't vouch for is
+# refused here, at the argument.  Said once: rule A at the same place wins.
+pub fn call_check_boxed(s: *EmitterState, e: *Expr, argno: i32, a: *Expr, p: *Param)
+    if a == null or p == null
+        return
+    if cc_kind_error(s, a, e.ident_ptr, e.ident_len, argno, p) == 1
+        eprints_cstr(c"an integer\n")
 
 # Method call `e` (`r.m(..)`, `T.m(..)`, or a UFCS helper's `v.push(..)`),
 # against `fd`, the callee emit_expr_method dispatches it to (where it calls
