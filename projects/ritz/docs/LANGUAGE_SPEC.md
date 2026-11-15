@@ -2047,6 +2047,11 @@ let p: *u8 = null as *u8
 let addr: i64 = p as i64
 ```
 
+`as` binds tighter than every binary operator, and its type ends at the first
+token that can't continue a type. `|` never continues one (§3.8), so
+`x as u64 | 1` is `(x as u64) | 1`, and `a + b as i64` is `a + (b as i64)`.
+Parenthesise to cast a whole expression: `(a + b) as i64` (LARB R52a).
+
 #### `bool` converts to nothing
 
 `bool` is its own type. No `let`, `var`, `return`, tail, argument, field, element
@@ -2811,8 +2816,7 @@ error naming what is missing. A `match` covers its scrutinee when it has:
 
 - an unguarded `_` or binding arm; or
 - for an enum, generic enums included, an arm for every variant; or
-- for a `bool`, both `true` and `false`; or
-- for a union, an arm for every member.
+- for a `bool`, both `true` and `false`.
 
 An integer or string scrutinee needs a catch-all. A guarded arm never counts
 towards coverage, though no guard parses yet.

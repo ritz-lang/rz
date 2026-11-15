@@ -1519,6 +1519,8 @@ fn, an `f64` parameter) converts integer *literal* arms; a non-literal int arm
 needs `as f64` (ritz0 already says "implicit conversion ... can lose
 precision"). ritz1 stops letting the first float arm decide; ritz0 adds the
 return and parameter slots, matching §3.3's list of slots.
+**Narrowed by R43a:** a non-literal int arm follows §7.5's exact rule, so an
+`i32` arm converts into an `f64` slot, and only lossy ones need `as f64`.
 
 ### R44: inferring a generic struct literal's args (#3314): NOT NOW (status quo)
 `Box2 { v: x }` stays #3311's located error. 0 uses, and the refusal is already
@@ -1674,3 +1676,61 @@ payloads.
 Tickets #3409 (ritz0 removal, test_level24's union tests and #1622's
 EXPECTED_FAILURES entry go with it) and #3411 (ritz1: a located error in place of
 the unlocated parse failure). No migration ticket: nothing else uses it.
+
+## Follow-up rulings, 2026-11-15 (evening): R34b, R43a, R45a, R47a, R52a
+
+Questions the implementing rooms raised. Each ruling is also on its ticket.
+
+### R34b: `for` and `match` over a global (#3366): BOTH OF THE ROOM'S CALLS STAND
+- `for e in G` and `for e in w.a` stay legal. A `for` moves nothing out of
+  what it walks (§6.3), and its binding owns nothing: probed on ritz0 with a
+  `Drop` element type, the binding isn't dropped, whether the array is local
+  or global. So a global is walked the same way as a local.
+- A by-value `match G.t` is refused, even with only a `_` arm. A by-value
+  match owns its scrutinee and drops it after the arms, so for a global that
+  would be the double drop R34 exists to stop. Write `match @G.t`.
+
+### R43a: a non-literal int arm in a float slot (#3384, #3385): §7.5 APPLIES
+§6.1's "a non-literal int arm never converts implicitly" was worded too
+broadly (my own wording in R43, taken from a probe with an `i64` arm). An arm
+in a float slot converts exactly as it would if assigned to that slot directly.
+A literal always converts. A non-literal int converts when every value of its
+type fits exactly: `i8`–`i32` and `u8`–`u32` into `f64`, and `i8`, `i16`,
+`u8`, `u16` into `f32`. Others (`i64`, `u64` into `f64`) get §7.5's "can lose
+precision" error. Wrapping a value in an `if` mustn't change whether it fits.
+The §6.1 wording is updated by #3385's commit.
+
+### R45a: cross-module private fns (#3386, #3413): ENFORCE §15.2, THEN `internal`
+#3386 found 146 private fns that ritz1's own sources call across modules,
+and a scan estimated about 650 corpus-wide, so `internal` linkage can't land
+yet. Aaron (17:23Z): *"Cross module functions *should* be public, so it seems like
+we need to tackle that towards the *right* direction."* No temporary external
+linkage. Order:
+1. #3416: ritz0 warns at each call to another module's private fn. The
+   warning's output is the exact list, and it catches new calls during the migration.
+2. Add `pub`. #3414 covers ritz1's sources (#3386's room, which already has the
+   list), #3417 the rest of `projects/ritz`, and #3415 the other packages. Rooms only
+   add `pub`. A fn that looks like it belongs elsewhere is reported, not moved.
+3. #3418 (ritz0, with §15.2's sentence) and #3419 (ritz1): the call becomes
+   a located error.
+4. #3386: private fns become `internal`, as R45 ruled.
+
+### R47a: angelo's 16 sites (#3389): MIGRATE AS IS
+Over R47's ~10 limit, but there's one cause in one package: `TAG_*: u32` consts
+passed where `Tag { value: u32 }` goes, because a const can't have a struct
+type. The limit was there to catch an unexpected kind of site, and this isn't
+one. Each site becomes `Tag { value: TAG_X }`. Changing angelo's API to take
+`u32` would remove the type check R47 protects. Struct consts are a separate
+question, filed as #3412 (`pending`, blocks nothing).
+
+### R52a: what removing unions leaves (#3409): THE ROOM'S CALLS STAND
+- `|` always ends a type, so `x as u64 | 1` is `(x as u64) | 1`. `as` binds
+  tighter than every binary operator on both compilers (ritz0 ranks it 12,
+  above `*` at 10; ritz1's grammar is `unary as Type`). The spec never said so,
+  and §7.5 now does.
+- `*T =>` and `&T =>` are refused like `i64 =>`. They were type patterns, which
+  existed only to test a union's member. §8.2 has no pointer or reference
+  pattern, and adding one would be a new feature with its own ticket.
+- `Some(i32)` getting "a type isn't a pattern" from the parser is R52's
+  wording. Which stage reports it isn't a language question.
+- §8.1's "for a union, an arm for every member" coverage bullet is removed.
