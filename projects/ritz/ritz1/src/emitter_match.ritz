@@ -76,6 +76,11 @@ struct MatchResult
     # Fixed by the enclosing let / return's hint (match_float_hint) or by
     # the first float-valued arm; later arms are coerced to it.
     float_ty: i32
+    # AGAST #2092: the enclosing let / return's float hint itself (0 if
+    # none), handed on to a match / if that is an arm's value tail so the
+    # annotation reaches every nested tail, as in ritz0.  Unlike float_ty it
+    # is never set by an arm: an unannotated match passes nothing down.
+    hint_ty: i32
     # Arms recorded as i64 values before float_ty was fixed: they cannot be
     # coerced after the fact (their `br` is already emitted).
     int_arms: i32
@@ -534,6 +539,7 @@ fn match_result_init(r: *MatchResult, n_arms: i32)
     r.agg_name = null
     r.agg_name_len = 0
     r.float_ty = 0
+    r.hint_ty = 0
     r.int_arms = 0
     r.void_arms = 0
     r.void_line = 0
@@ -806,6 +812,11 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         if lent_arm != null
             body_reg = emit_lent_referent(s, arm.body, lent_arm.type_name, lent_arm.type_name_len)
         else
+            # AGAST #2092: a nested match / if (an `else if`, a match in an
+            # arm, a block's tail) merges at the enclosing annotation too.
+            # Set last, so nothing emitted before the tail can take it.
+            if nested
+                s.match_float_hint = result.hint_ty
             body_reg = emit_expr(s, arm.body)
     if result.into != null
         body_reg = MATCH_ZERO_VALUE   # stored; no phi reads it
@@ -2146,6 +2157,9 @@ fn emit_match_into(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
 
 fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan, into: *ArrayInto) -> i32
     let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
+    # AGAST #1946 / #2092: taken before the scrutinee, so a match there
+    # can't see it.
+    let float_hint: i32 = take_match_float_hint(s)
     # AGAST #3205: taken before the scrutinee, so a match there can't see it.
     let agg_hint: *u8 = s.match_agg_hint
     let agg_hint_len: i32 = s.match_agg_hint_len
@@ -2245,7 +2259,8 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         counted = counted.next
     var result: MatchResult
     match_result_init(@result, n_arms)
-    result.float_ty = take_match_float_hint(s)   # AGAST #1946
+    result.float_ty = float_hint   # AGAST #1946
+    result.hint_ty = float_hint   # AGAST #2092
     result.ptr_ty = arms_ptr_valued(s, arms)   # AGAST #2950
     result.into = into   # AGAST #3276
 
@@ -2369,6 +2384,9 @@ fn if_arm_check_value(s: *EmitterState, arm: *MatchArm)
 # `%StrView` / `%Point` rather than i64.  Returns the phi register.
 fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
     let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
+    # AGAST #1946 / #2092: taken before the condition, so a match there
+    # can't see it.
+    let float_hint: i32 = take_match_float_hint(s)
     let then_arm: *MatchArm = e.args as *MatchArm
     let else_arm: *MatchArm = then_arm.next
     if_arm_check_value(s, then_arm)
@@ -2401,7 +2419,8 @@ fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
 
     var result: MatchResult
     match_result_init(@result, 2)
-    result.float_ty = take_match_float_hint(s)   # AGAST #1946
+    result.float_ty = float_hint   # AGAST #1946
+    result.hint_ty = float_hint   # AGAST #2092
     result.ptr_ty = arms_ptr_valued(s, then_arm)   # AGAST #2950
     # AGAST #2168: the arms' move checks merge as a match's do.
     let own_before: *i32 = own_arms_begin(s)

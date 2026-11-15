@@ -262,8 +262,8 @@ fn main() -> i32
 """
 
 # Nested value tails: an else-if chain and a match inside a match arm. The
-# annotation reaches every tail of the initialiser in ritz0. ritz1 only
-# annotates the outermost match/if and rejects these cleanly (#2092).
+# annotation reaches every tail of the initialiser, recursively, in both
+# compilers (ritz1 since #2092).
 ELSE_IF_CHAIN = """\
 fn f(n: i32) -> f64
     let a: f64 = if n > 5 then 1.5 else if n > 2 then 2 else 0.25
@@ -300,9 +300,115 @@ fn main() -> i32
     return 42
 """
 
+# A nested tail reached through a block: an else-if branch that is a
+# multi-line block ending in an integer, and a block-bodied match arm whose
+# tail is an if.
+NESTED_BLOCK_TAIL = """\
+import ritzlib.option
+
+fn f(n: i32) -> f64
+    let a: f64 = if n > 5
+        0.5
+    else if n > 2
+        let m = n + n
+        m
+    else
+        0.25
+    return a
+
+fn g(o: Option<i32>) -> f64
+    let a: f64 = match o
+        None => 0.5
+        Some(k) =>
+            let d: i32 = k + 1
+            if d > 3 then d else 0.5
+    return a
+
+fn main() -> i32
+    if f(9) != 0.5
+        return 1
+    if f(3) != 6.0
+        return 2
+    if f(0) != 0.25
+        return 3
+    if g(None) != 0.5
+        return 4
+    if g(Some(5)) != 6.0
+        return 5
+    if g(Some(1)) != 0.5
+        return 6
+    return 42
+"""
+
+# Three levels, at f32: match -> if -> else-if chain, every tail an integer
+# except one f32 leaf.
+THREE_LEVELS_F32 = """\
+import ritzlib.option
+
+fn f(o: Option<i32>) -> f32
+    let a: f32 = match o
+        None => 7
+        Some(k) => if k > 10 then 1 else if k > 5 then 2 else if k > 0 then 0.5 else 3
+    return a
+
+fn main() -> i32
+    if f(None) != 7.0
+        return 1
+    if f(Some(11)) != 1.0
+        return 2
+    if f(Some(6)) != 2.0
+        return 3
+    if f(Some(1)) != 0.5
+        return 4
+    if f(Some(0)) != 3.0
+        return 5
+    return 42
+"""
+
+# Only tails take the annotation: a match / if in a nested match's scrutinee
+# or a nested if's condition yields an integer there, not an f64.
+NESTED_NON_TAIL = """\
+import ritzlib.option
+
+fn big(v: i32) -> bool
+    return v > 2
+
+fn f(n: i32) -> f64
+    let a: f64 = if n > 5 then 0.5 else if big(if n > 0 then n else 0) then 2 else 0.25
+    return a
+
+fn g(o: Option<i32>, n: i32) -> f64
+    let a: f64 = match o
+        None => 0.5
+        Some(k) => match (if n > 0 then k else 0)
+            0 => 1
+            _ => 0.25
+    return a
+
+fn main() -> i32
+    if f(9) != 0.5
+        return 1
+    if f(3) != 2.0
+        return 2
+    if f(1) != 0.25
+        return 3
+    if g(None, 1) != 0.5
+        return 4
+    if g(Some(0), 1) != 1.0
+        return 5
+    if g(Some(3), 1) != 0.25
+        return 6
+    if g(Some(3), -1) != 1.0
+        return 7
+    return 42
+"""
+
 NESTED_CASES = [
     pytest.param(ELSE_IF_CHAIN, 42, id="else-if-chain"),
     pytest.param(NESTED_MATCH, 42, id="nested-match"),
+    pytest.param(NESTED_BLOCK_TAIL, 42, id="nested-block-tail"),
+    pytest.param(THREE_LEVELS_F32, 42, id="three-levels-f32"),
+    pytest.param(NESTED_NON_TAIL, 42, id="nested-non-tail"),
 ]
 
 RUN_CASES = [
@@ -388,7 +494,6 @@ def test_ritz1_agrees(ritz1_bin, tmp_path, program, want):
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="#2092: ritz1 annotates only the outermost match/if")
 @pytest.mark.parametrize("program,want", NESTED_CASES)
 def test_ritz1_agrees_nested_tails(ritz1_bin, tmp_path, program, want):
     rc, diag = _ritz1_run(ritz1_bin, tmp_path, program)
