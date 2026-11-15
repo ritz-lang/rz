@@ -5046,6 +5046,13 @@ pub struct PublicStruct
 pub const LIMIT: i64 = 16
 ```
 
+A fn or method declared without `pub` may be called only from the file that
+declares it. A call from another file is an error at the call. Make it `pub`
+to export it. The error names the declaring file, for example "`helper` is
+private to a.ritz; mark it `pub`", and a note gives the declaration's
+location. An `extern fn`, a `fn ... = extern` declaration and a generic's
+instances are not checked (AGAST #3418).
+
 ### 15.3 Qualified Access
 
 **Removed in RERITZ.** There is no `module::item` or `module.item` access

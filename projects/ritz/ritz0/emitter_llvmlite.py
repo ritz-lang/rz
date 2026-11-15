@@ -678,9 +678,6 @@ class LLVMEmitter:
         self.module: Optional[ir.Module] = None
         self.builder: Optional[ir.IRBuilder] = None
         self.current_fn: Optional[ir.Function] = None
-        # Call sites already warned about (AGAST #3416): a call emitted twice
-        # (a `defer` runs at every exit) warns once.
-        self._private_call_warned: Set[Tuple[str, int, int, str]] = set()
 
         # Symbol tables
         self.locals: Dict[str, Tuple[ir.AllocaInstr, ir.Type]] = {}  # name -> (alloca, type)
@@ -5136,13 +5133,10 @@ class LLVMEmitter:
         return item_source == self._current_source_file
 
     def _check_private_call(self, callee_def, display: str, span) -> None:
-        """AGAST #3416 (LARB R45a, #3413): warn at a call to a fn or method
-        declared without `pub` in another file (§15.1/§15.2: an import
-        brings in only `pub` items).
-
-        A WARNING, not an error, while ~650 such sites are migrated: the
-        output is unchanged, and the warnings over a corpus build are the
-        migration list. #3418 turns it into an error.
+        """AGAST #3418 (LARB R45a, #3413): a call to a fn or method declared
+        without `pub` in another file is an error at the call (§15.2: an
+        import brings in only `pub` items). #3416 made it a warning while
+        the corpus was migrated (#3414, #3415, #3417).
 
         The caller's file is the call's own span, not the fn being emitted:
         a monomorph instance of another file's generic is emitted here but
@@ -5150,8 +5144,8 @@ class LLVMEmitter:
         not a FnDef) and `fn .. = extern` (declarations of a symbol defined
         elsewhere), monomorph instances and compiler-generated fns (no
         declaration of their own to mark), and a callee whose file isn't
-        known. A note line gives the declaration, so the corpus list can name
-        the file to edit, not only its basename."""
+        known. A note line gives the declaration: a basename alone is
+        ambiguous across packages."""
         callee_def = getattr(callee_def, 'declared_method', callee_def)
         if (callee_def is None or span is None
                 or not isinstance(callee_def, rast.FnDef)
@@ -5169,19 +5163,13 @@ class LLVMEmitter:
             return
         if os.path.realpath(callee_file) == os.path.realpath(span.file):
             return
-        key = (span.file, span.line, span.column, display)
-        if key in self._private_call_warned:
-            return
-        self._private_call_warned.add(key)
-        print(f"{span.file}:{span.line}:{span.column}: warning: `{display}` "
-              f"is private to {os.path.basename(callee_file)}; "
-              f"mark it `pub` (#3413)", file=sys.stderr)
+        message = (f"`{display}` is private to "
+                   f"{os.path.basename(callee_file)}; mark it `pub` (#3413)")
         decl = callee_def.span
         if decl is not None and not decl.file.startswith('<'):
-            # A body emitted more than once (a `defer` at each exit) warns
-            # once, above; so does its note.
-            print(f"{callee_file}:{decl.line}:{decl.column}: note: "
-                  f"`{display}` is declared here", file=sys.stderr)
+            message += (f"\n{callee_file}:{decl.line}:{decl.column}: note: "
+                        f"`{display}` is declared here")
+        raise EmitError(message, span)
 
     def _param_to_llvm_type(self, param: rast.Param) -> 'ir.Type':
         """Convert a Ritz parameter to LLVM type, considering Borrow semantics.

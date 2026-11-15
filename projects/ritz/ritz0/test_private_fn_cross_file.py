@@ -1,17 +1,16 @@
-"""AGAST #3416 (LARB R45a, #3413 step 1): ritz0 warns at each call to a fn
-or method declared without `pub` in another file.
+"""AGAST #3418 (LARB R45a, #3413 step 3a): a call to a fn or method
+declared without `pub` in another file is an error, located at the call
+(#3416 made it a warning while #3414/#3415/#3417 marked the corpus `pub`).
 
 Spec §15.1/§15.2: an import brings in only a module's `pub` items, so
 
     # a.ritz                    # main.ritz
     fn helper() -> i32          import a
         7                       pub fn main() -> i32
-                                    helper()        # <- warning here
+                                    helper()        # <- error here
 
-is a call ritz0 must eventually refuse (#3418). ~650 such sites exist, so
-for now it is a located WARNING and nothing else: the build still succeeds,
-and the IR is byte-identical to the IR without the check. Its output over
-the corpus is the migration list for #3415/#3417.
+is refused with "`helper` is private to a.ritz; mark it `pub`", and a note
+at the declaration naming the file to edit.
 
 Covered: free fns, method calls `p.get()`, and the mangled form
 `P_get(p)`. Not covered, by the ticket: `extern fn`, monomorph instances,
@@ -19,12 +18,10 @@ and calls within one file.
 """
 
 import os
-import re
 from pathlib import Path
 
 import pytest
 
-import emitter_llvmlite
 from ritz0_inproc import run_ritz0
 
 pytestmark = pytest.mark.integration
@@ -53,34 +50,65 @@ pub fn main() -> i32
 """
 
 
-def _compile(tmp_path, a_src, main_src, *extra):
+def _run(tmp_path, a_src, main_src, *extra):
     (tmp_path / "a.ritz").write_text(a_src)
     (tmp_path / "main.ritz").write_text(main_src)
     ll = tmp_path / "main.ll"
     env = dict(os.environ, RITZ_PATH=f"{tmp_path}:{RITZ_ROOT}")
-    comp = run_ritz0(["main.ritz", "-o", str(ll), *extra],
+    return run_ritz0(["main.ritz", "-o", str(ll), *extra],
                      cwd=tmp_path, env=env, timeout=300)
+
+
+def _compile(tmp_path, a_src, main_src, *extra):
+    comp = _run(tmp_path, a_src, main_src, *extra)
     assert comp.returncode == 0, comp.stderr
-    return comp, ll.read_text()
+    return comp, (tmp_path / "main.ll").read_text()
 
 
-def _warnings(comp):
-    return [l for l in comp.stderr.splitlines() if ": warning: " in l]
+def _refused(tmp_path, a_src, main_src):
+    """The compile fails; its stderr's diagnostic lines (error and note)."""
+    comp = _run(tmp_path, a_src, main_src)
+    assert comp.returncode != 0, comp.stderr
+    assert not (tmp_path / "main.ll").exists()
+    return [l for l in comp.stderr.splitlines()
+            if "private to" in l or ": note: " in l]
 
 
-def test_cross_file_private_calls_warn_located(tmp_path):
-    comp, _ = _compile(tmp_path, A_PRIVATE, MAIN_CALLS)
-    assert _warnings(comp) == [
-        "main.ritz:5:5: warning: `helper` is private to a.ritz; "
-        "mark it `pub` (#3413)",
-        "main.ritz:5:18: warning: `P.get` is private to a.ritz; "
-        "mark it `pub` (#3413)",
-        "main.ritz:5:26: warning: `P_get` is private to a.ritz; "
-        "mark it `pub` (#3413)",
+ONE_CALL = """\
+import a
+
+pub fn main() -> i32
+    let p = P {{ v: 3 }}
+    {call}
+"""
+
+
+# One call per compile: the first refused call ends the compile. Column 5 is
+# the call, 7 a method's name after `p.`.
+@pytest.mark.parametrize("call,display,col,decl", [
+    pytest.param("helper()", "helper", 5, "8:1", id="free_fn"),
+    pytest.param("p.get()", "P.get", 7, "5:5", id="method"),
+    pytest.param("P_get(p)", "P_get", 5, "5:5", id="mangled_method"),
+])
+def test_cross_file_private_call_is_a_located_error(tmp_path, call, display,
+                                                    col, decl):
+    """AGAST #3418: the error, at the call, with a note at the declaration
+    (a basename alone is ambiguous across packages)."""
+    lines = _refused(tmp_path, A_PRIVATE, ONE_CALL.format(call=call))
+    assert lines == [
+        (f"Compiler error: main.ritz:5:{col}: `{display}` is private to "
+         f"a.ritz; mark it `pub` (#3413)"),
+        f"{tmp_path / 'a.ritz'}:{decl}: note: `{display}` is declared here",
     ]
 
 
-def test_a_deferred_call_emitted_at_each_exit_warns_once(tmp_path):
+def test_first_of_several_private_calls_is_the_error(tmp_path):
+    lines = _refused(tmp_path, A_PRIVATE, MAIN_CALLS)
+    assert lines[0] == ("Compiler error: main.ritz:5:5: `helper` is private "
+                        "to a.ritz; mark it `pub` (#3413)")
+
+
+def test_a_deferred_private_call_is_an_error(tmp_path):
     a = "fn helper()\n    return\n"
     main = """\
 import a
@@ -91,54 +119,12 @@ pub fn main() -> i32
         return 1
     0
 """
-    comp, ir = _compile(tmp_path, a, main)
-    assert ir.count('call i32 @"helper"') == 2  # once per exit
-    assert _warnings(comp) == [
-        "main.ritz:4:11: warning: `helper` is private to a.ritz; "
-        "mark it `pub` (#3413)"]
-    assert len([l for l in comp.stderr.splitlines() if ": note: " in l]) == 1
-
-
-def test_each_warning_notes_the_declaration(tmp_path):
-    """The note names the file to edit: a basename alone is ambiguous across
-    packages, and the corpus list (#3415, #3417) is keyed by it."""
-    comp, _ = _compile(tmp_path, A_PRIVATE, MAIN_CALLS)
-    a = tmp_path / "a.ritz"
-    notes = [l for l in comp.stderr.splitlines() if ": note: " in l]
-    assert notes == [
-        f"{a}:8:1: note: `helper` is declared here",
-        f"{a}:5:5: note: `P.get` is declared here",
-        f"{a}:5:5: note: `P_get` is declared here",
+    lines = _refused(tmp_path, a, main)
+    assert lines == [
+        ("Compiler error: main.ritz:4:11: `helper` is private to a.ritz; "
+         "mark it `pub` (#3413)"),
+        f"{tmp_path / 'a.ritz'}:1:1: note: `helper` is declared here",
     ]
-
-
-def test_warning_leaves_ir_unchanged(tmp_path, monkeypatch, capsys):
-    """In-process, so the stub reaches the emitter: the IR with the check
-    is byte-identical to the IR with it stubbed out. Fresh sources each
-    time, so neither compile is served from the fn cache."""
-    import ritz0
-
-    monkeypatch.setenv("RITZ_PATH", f"{tmp_path / 'warned'}:{RITZ_ROOT}")
-
-    def compile_in(sub):
-        d = tmp_path / sub
-        d.mkdir()
-        (d / "a.ritz").write_text(A_PRIVATE)
-        (d / "main.ritz").write_text(MAIN_CALLS)
-        monkeypatch.setenv("RITZ_PATH", f"{d}:{RITZ_ROOT}")
-        assert ritz0.compile_file(str(d / "main.ritz"), str(d / "main.ll"))
-        ir = (d / "main.ll").read_text().replace(str(d), "<dir>")
-        # The emitter numbers modules per process: a second compile in this
-        # one is `ritz_module_2`.
-        return re.sub(r"ritz_module_\d+", "ritz_module_N", ir)
-
-    warned = compile_in("warned")
-    assert capsys.readouterr().err.count(": warning: ") == 3
-    monkeypatch.setattr(emitter_llvmlite.LLVMEmitter,
-                        "_check_private_call", lambda *a, **k: None)
-    silent = compile_in("silent")
-    assert capsys.readouterr().err.count(": warning: ") == 0
-    assert warned == silent
 
 
 A_PUB = A_PRIVATE.replace("    fn get", "    pub fn get").replace(
@@ -254,9 +240,9 @@ pub fn main() -> i32
     pytest.param(A_INTERNAL, MAIN_API, id="callee_file_own_helper"),
     pytest.param(A_GENERIC_CALLER, MAIN_TWICE, id="instance_calls_own_helper"),
 ])
-def test_no_warning(tmp_path, a_src, main_src):
+def test_allowed(tmp_path, a_src, main_src):
     comp, _ = _compile(tmp_path, a_src, main_src)
-    assert _warnings(comp) == []
+    assert "private to" not in comp.stderr
 
 
 def test_module_calling_its_own_private_fn_is_silent(tmp_path):
@@ -266,15 +252,16 @@ def test_module_calling_its_own_private_fn_is_silent(tmp_path):
     comp = run_ritz0(["a.ritz", "-o", str(tmp_path / "a.ll"), "--no-runtime"],
                      cwd=tmp_path, env=env, timeout=300)
     assert comp.returncode == 0, comp.stderr
-    assert _warnings(comp) == []
+    assert "private to" not in comp.stderr
 
 
 def test_cached_metadata_keeps_visibility(tmp_path):
     """An import served from cached metadata (`_register_items_from_metadata`)
     rebuilds its fns and methods with the visibility they were declared
     with; metadata cached before `is_pub` was recorded reads as `pub`, so it
-    never makes a call warn."""
+    never refuses a call."""
     import json
+
     import metadata
     from import_resolver import ImportResolver
     from parser import parse
@@ -382,6 +369,7 @@ def test_test_runner_relays_its_compiles_warnings(tmp_path, capsys, monkeypatch,
     modules in subprocesses of its own; their warnings reach the stderr that
     run_test_file relays."""
     import subprocess
+
     import test_runner
     stderr = "t.ritz:3:5: warning: stub (#3416)\nquiet\n"
     monkeypatch.setattr(test_runner.subprocess, "run", lambda *a, **k:
