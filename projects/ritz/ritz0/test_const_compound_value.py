@@ -322,6 +322,37 @@ pub fn main() -> i32
         return 3
     return 1
 """,
+    # A float-literal initializer is the literal itself (AGAST #2176): ritz1
+    # materialised it as `add i64 0, 0` (the integer fold it doesn't have)
+    # and compared that i64 as a double, which clang rejected.
+    "float_literal": """\
+const G: f64 = 1.5
+
+pub fn main() -> i32
+    if G > 1.0 and G < 2.0
+        return 3
+    return 1
+""",
+    # Negated, and through an inferred local, which takes the const's type.
+    "negative_float_literal": """\
+const G: f64 = -1.5
+
+pub fn main() -> i32
+    let x = G
+    if x < -1.0 and x > -2.0 and (x * 2.0) as i32 == -3
+        return 3
+    return 1
+""",
+    # f32 narrows the double literal.
+    "f32_float_literal": """\
+const G: f32 = 2.5
+
+pub fn main() -> i32
+    let x = G
+    if x > 2.0 and x < 3.0 and (x * 2.0) as i32 == 5
+        return 3
+    return 1
+""",
 }
 
 # A const in the main file built from an imported one: resolvable only once the
