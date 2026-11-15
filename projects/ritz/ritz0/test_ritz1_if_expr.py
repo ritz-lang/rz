@@ -577,7 +577,8 @@ def test_ritz1_if_expr(ritz1_bin, tmp_path, name):
 @pytest.mark.parametrize("name", ["assign_value", "struct_lit_field"])
 def test_ritz1_selfhosted_if_value_after_assign_and_in_a_literal(tmp_path, name):
     """AGAST #2369, on the self-hosted build: its lexer and parser are the ones
-    ritz1 compiled, so the layout frame has to survive the bootstrap."""
+    ritz1 compiled.  (#2369's lexer layout frame, which let a block `if` open
+    inside a literal's `{`, went with LARB R46a, #3388.)"""
     from test_ref_into_value import _run as _run_any
     assert _run_any("ritz1_selfhosted", tmp_path, name, PROGRAMS[name]) == 42
 

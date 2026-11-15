@@ -17,9 +17,9 @@ THE FIX
 
 Each binary operator in ritz1's grammar may be followed by one NEWLINE
 (`op_nl`) before its right operand; its lexer already folds blank and
-comment-only lines, so one is all there can be.  INDENT / DEDENT are left
-alone: a DEEPER-indented continuation is #2193, undecided, and refused by
-both compilers alike.
+comment-only lines, so one is all there can be.  A DEEPER-indented
+continuation (LARB R46) is the lexer's: it emits no INDENT / DEDENT for one
+(#3387 on ritz0, #3388 on ritz1, test_deeper_continuation_ritz1.py).
 
 THE TESTS
 

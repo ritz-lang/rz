@@ -56,22 +56,31 @@ struct Lexer
   indent_depth: i32        # Current depth in indent_stack
   at_line_start: i32       # 1 if at start of line, 0 otherwise
   pending_dedents: i32     # Number of DEDENT tokens to emit
-  bracket_depth: i32       # Nesting depth of (), [], {} - suppress INDENT/DEDENT when > layout_depth
-  # Layout frame (AGAST #2369).  An if value's blocks need INDENT/DEDENT, but
-  # inside brackets they're suppressed, so `P { x: if c` + an indented block
-  # never reached the grammar as one.  A line that ends, inside brackets, in an
-  # `if` condition or a bare `else` opens a frame: lines at that bracket depth
-  # are laid out again until one is indented no deeper than the line that
-  # opened it, as ritz0's lexer lays out every line.  One frame at a time; an
-  # if value inside a bracket inside a frame stays flat and fails to parse.
-  layout_depth: i32        # bracket depth the frame lays out; 0 = no frame
-  layout_base: i32         # indentation of the line that opened it
-  layout_pushed: i32       # 1 if layout_base was pushed onto indent_stack
+  bracket_depth: i32       # Nesting depth of (), [], {} - no NEWLINE/INDENT/DEDENT when > 0
+  # The innermost brackets' kinds (`(`, `[` or `{`), for the error below.
+  # Deeper than 64 the message names `(`.
+  bracket_kinds: [64]u8
+  # No block opens inside brackets (LARB R46a, AGAST #3388): their line
+  # breaks and indentation are ignored, so a `match` there, or an `if` whose
+  # line ends before its `then`, is refused at the keyword.  #2369's "layout
+  # frame", which laid a bracket's lines out again after an `if` condition,
+  # is gone.  if_line is the line of an `if` inside brackets still waiting
+  # for its `then`, 0 if none.
+  if_line: i32
+  if_col: i32
+  if_start: *u8
+  if_depth: i32            # the bracket depth it is at
   line_indent: i32         # leading spaces of the current line
-  if_line: i32             # line of an `if` at a suppressed depth, 0 if none
-  if_depth: i32            # the bracket depth it was at
-  last_kind: i32           # the last token returned, and the depth after it
-  last_depth: i32
+  last_kind: i32           # the last token returned
+  # Continuation lines (LARB R46, AGAST #3388).  The line after one that
+  # ends, outside brackets, in a binary operator or `as` opens and closes no
+  # block, and must be indented at least as far as its statement.  A trailing
+  # `>` / `>>` may close a generic list instead: on a line holding a
+  # declaration keyword (decl_line), as in `fn f() -> Vec<T>`, it opens the
+  # body's block; elsewhere (a field `data: Vec<u8>`) the next line is a
+  # continuation only if it is deeper (cont_line 2).
+  cont_line: i32           # 1 if the next line is a continuation, 2 if it is when deeper
+  decl_line: i32           # 1 once this line has `fn`, `struct`, ... outside brackets
   # Cooked-string scratch buffer (escapes expanded).  ritz-task-1267.
   #
   # This used to be a fixed `[8192]i8` arena shared by *every* string
@@ -131,16 +140,16 @@ pub fn lexer_reset(lex: *Lexer, src: *u8, len: i64) -> i32
   lex.error_msg = null
   0
 
-# No layout frame, and no `if` or `else` seen.
+# No pending `if`, no continuation, no token seen.
 fn lexer_layout_reset(lex: *Lexer)
-  lex.layout_depth = 0
-  lex.layout_base = 0
-  lex.layout_pushed = 0
   lex.line_indent = 0
   lex.if_line = 0
+  lex.if_col = 0
+  lex.if_start = null
   lex.if_depth = 0
   lex.last_kind = 0
-  lex.last_depth = 0
+  lex.cont_line = 0
+  lex.decl_line = 0
 
 # Not in, or about to enter, an asm body.
 fn lexer_asm_reset(lex: *Lexer)
@@ -200,35 +209,55 @@ fn lexer_asm_text(lex: *Lexer) -> Token
   tok.start = lex.src + start
   tok
 
-# At a newline inside brackets on `line`: open a layout frame if the line ended
-# in an `if` condition or a bare `else` at this bracket depth, and return 1 so
-# the NEWLINE is emitted.  An inline `if c then a else b` cleared if_line at
-# its THEN.  The opening line's indentation is pushed without an INDENT, so a
-# block indented under it is one INDENT deeper whatever the statement's level.
-fn lexer_layout_open(lex: *Lexer, line: i32) -> i32
-  if lex.layout_depth > 0
+# 1 if `kind` is an infix operator, one a line can end in with the expression
+# going on: ritz0's Parser.PRECEDENCE less the ranges, which ritz1's grammar
+# takes in `for` headers and slices only.
+fn lexer_is_infix(kind: i32) -> i32
+  if kind == TOK_OR or kind == TOK_OROR or kind == TOK_AND or kind == TOK_ANDAND
+    return 1
+  if kind == TOK_PIPE or kind == TOK_CARET or kind == TOK_AMP
+    return 1
+  if kind == TOK_EQ or kind == TOK_NE or kind == TOK_LT or kind == TOK_LE
+    return 1
+  if kind == TOK_GT or kind == TOK_GE or kind == TOK_SHL or kind == TOK_SHR
+    return 1
+  if kind == TOK_PLUS or kind == TOK_MINUS or kind == TOK_STAR or kind == TOK_SLASH
+    return 1
+  if kind == TOK_PERCENT or kind == TOK_AS
+    return 1
+  0
+
+# The line just ended (outside brackets) makes the next a continuation (LARB
+# R46) if it ends in an infix operator: 1, or 2 for a `>` / `>>`, which may
+# close a generic list (`data: Vec<u8>`), so only a deeper line continues it.
+# On a declaration's line (`fn f() -> Vec<T>`) a `>` / `>>` is that close: 0.
+fn lexer_ends_in_operator(lex: *Lexer) -> i32
+  if lexer_is_infix(lex.last_kind) == 0
     return 0
-  var opens: i32 = 0
-  if lex.if_line == line and lex.if_depth == lex.bracket_depth
-    opens = 1
-  if lex.last_kind == TOK_ELSE and lex.last_depth == lex.bracket_depth
-    opens = 1
-  if opens == 0
-    return 0
-  let top: i32 = lex.indent_stack[lex.indent_depth - 1]
-  if lex.line_indent < top
-    return 0
-  lex.layout_pushed = 0
-  if lex.line_indent > top
-    if lex.indent_depth >= MAX_INDENT_DEPTH
+  if lex.last_kind == TOK_GT or lex.last_kind == TOK_SHR
+    if lex.decl_line == 1
       return 0
-    lex.indent_stack[lex.indent_depth] = lex.line_indent
-    lex.indent_depth = lex.indent_depth + 1
-    lex.layout_pushed = 1
-  lex.layout_base = lex.line_indent
-  lex.layout_depth = lex.bracket_depth
-  lex.if_line = 0
+    return 2
   1
+
+# Fatal TOK_ERROR at an `if` / `match` keyword (start, line, col) that would open
+# a block inside brackets (LARB R46a), naming the innermost bracket.  ritz0's
+# message (#3429).
+fn lexer_fail_block(lex: *Lexer, start: *u8, line: i32, col: i32) -> Token
+  var bracket: u8 = 40
+  if lex.bracket_depth >= 1 and lex.bracket_depth <= 64
+    bracket = lex.bracket_kinds[lex.bracket_depth - 1]
+  lex.error_msg = c"a block can't open inside `(`: bind the `if`/`match` to a `let` first"
+  if bracket == 91
+    lex.error_msg = c"a block can't open inside `[`: bind the `if`/`match` to a `let` first"
+  if bracket == 123
+    lex.error_msg = c"a block can't open inside `{`: bind the `if`/`match` to a `let` first"
+  lex.pos = lex.len
+  lex.pending_dedents = 0
+  lex.cont_line = 0
+  var tok: Token = token_new(TOK_ERROR, 0, 1, line, col)
+  tok.start = start
+  tok
 
 # Return a located, fatal TOK_ERROR at the current position and stop lexing:
 # the next lexer_next returns EOF.  The tab case used to return TOK_ERROR
@@ -550,27 +579,21 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
   lex.col = lex.col + indent
   lex.line_indent = indent
 
-  # A line no deeper than the one that opened the layout frame ends it: DEDENT
-  # the frame's blocks only, drop the silently pushed level, and the bracket's
-  # lines are flat again.
-  if lex.layout_depth > 0 and indent <= lex.layout_base
-    var closed: i32 = 0
-    while lex.indent_stack[lex.indent_depth - 1] > lex.layout_base
-      lex.indent_depth = lex.indent_depth - 1
-      closed = closed + 1
-    if lex.layout_pushed == 1
-      lex.indent_depth = lex.indent_depth - 1
-    lex.layout_depth = 0
-    lex.layout_pushed = 0
-    lex.at_line_start = 0
-    if closed == 0
-      return 0
-    lex.pending_dedents = closed - 1
-    *out_tok = token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
-    return 1
-
   # Get current indentation level from stack
   let current: i32 = lex.indent_stack[lex.indent_depth - 1]
+
+  # A continuation (LARB R46) opens and closes no block.  `current` is its
+  # statement's indentation: continuation lines push none.  ritz0's message,
+  # at column 1.  After a `>` / `>>` (cont_line 2) only a deeper line is one.
+  if lex.cont_line == 2 and indent <= current
+    lex.cont_line = 0
+  if lex.cont_line != 0
+    lex.cont_line = 0
+    lex.at_line_start = 0
+    if indent < current
+      lex.col = 1
+      return lexer_fail(lex, out_tok, c"continuation line is indented less than the statement it continues; indent it at least as far as the statement's first line")
+    return 0
 
   if indent > current
     # Deeper indentation - push and emit INDENT
@@ -600,8 +623,8 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
   lex.at_line_start = 0
   0
 
-# Get next token from the lexer, noting the `if` / `else` that open a layout
-# frame (lexer_layout_open).
+# Get next token from the lexer, noting the `if` / `match` inside brackets
+# (LARB R46a) and the declaration keywords (LARB R46).
 pub fn lexer_next(lex: *Lexer) -> Token
   var tok: Token = lexer_next_token(lex)
   # AGAST #3394: `asm ... :` NEWLINE starts an asm body.
@@ -613,14 +636,24 @@ pub fn lexer_next(lex: *Lexer) -> Token
     if lex.last_kind == TOK_COLON and lex.bracket_depth == 0
       lex.asm_raw = 1
       lex.asm_body = 0
-  if lex.bracket_depth > lex.layout_depth
+  # LARB R46a: a `match` always opens a block; an `if` inside brackets waits
+  # for its `then` (the newline check in lexer_next_token).
+  if lex.bracket_depth > 0
+    if tok.kind == TOK_MATCH
+      return lexer_fail_block(lex, tok.start, tok.line, tok.col)
     if tok.kind == TOK_IF
       lex.if_line = tok.line
+      lex.if_col = tok.col
+      lex.if_start = tok.start
       lex.if_depth = lex.bracket_depth
     if tok.kind == TOK_THEN
       lex.if_line = 0
+  if lex.bracket_depth == 0
+    if tok.kind == TOK_FN or tok.kind == TOK_STRUCT or tok.kind == TOK_ENUM
+      lex.decl_line = 1
+    if tok.kind == TOK_IMPL or tok.kind == TOK_TRAIT or tok.kind == TOK_TYPE or tok.kind == TOK_EXTERN
+      lex.decl_line = 1
   lex.last_kind = tok.kind
-  lex.last_depth = lex.bracket_depth
   tok
 
 # Returns a Token struct
@@ -635,7 +668,7 @@ fn lexer_next_token(lex: *Lexer) -> Token
     # Handle line start (indentation) - but NOT inside brackets
     if lex.at_line_start == 1
       # Inside brackets, just skip leading whitespace, no INDENT/DEDENT
-      if lex.bracket_depth > lex.layout_depth
+      if lex.bracket_depth > 0
         # Skip leading whitespace on this line
         lex.line_indent = 0
         while lex.pos < lex.len
@@ -668,10 +701,17 @@ fn lexer_next_token(lex: *Lexer) -> Token
       lex.col = 1
       lex.at_line_start = 1
       # Inside brackets, skip newline (don't emit token) - allows multi-line
-      # struct literals - unless it opens a layout frame.
-      if lex.bracket_depth > lex.layout_depth
-        if lexer_layout_open(lex, line) == 0
-          continue
+      # struct literals.  An `if` here whose line ended before its `then`,
+      # other than after an operator (its condition goes on), would open a
+      # block (LARB R46a).
+      if lex.bracket_depth > 0
+        if lex.if_line != 0 and lex.if_depth == lex.bracket_depth and lexer_is_infix(lex.last_kind) == 0
+          return lexer_fail_block(lex, lex.if_start, lex.if_line, lex.if_col)
+        continue
+      # Outside them, a line ending in an operator makes the next one a
+      # continuation (LARB R46).
+      lex.cont_line = lexer_ends_in_operator(lex)
+      lex.decl_line = 0
       var tok: Token = token_new(TOK_NEWLINE, start, 1, line, col)
       tok.start = lex.src + start
       return tok
@@ -911,6 +951,8 @@ fn lexer_next_token(lex: *Lexer) -> Token
     # Track bracket depth for suppressing INDENT/DEDENT inside brackets
     if best_type == TOK_LPAREN or best_type == TOK_LBRACKET or best_type == TOK_LBRACE
       lex.bracket_depth = lex.bracket_depth + 1
+      if lex.bracket_depth <= 64
+        lex.bracket_kinds[lex.bracket_depth - 1] = *(lex.src + start)
     if best_type == TOK_RPAREN or best_type == TOK_RBRACKET or best_type == TOK_RBRACE
       if lex.bracket_depth > 0
         lex.bracket_depth = lex.bracket_depth - 1

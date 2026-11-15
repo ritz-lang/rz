@@ -172,10 +172,8 @@ line that ends in an operator, the next line opens no block and closes none:
 its indent only has to be at least the statement's own. A continuation
 indented *less* than the statement is an error at that line. The line after
 the expression ends is measured against the statement's first line as usual.
-ritz0 accepts it (#3387); ritz1 doesn't yet (#3388), so the example is
-text:
 
-```text
+```ritz
 fn mixed(a: bool, b: bool, c: bool, d: bool) -> bool
     let h = (a or b) and
             c and d          # deeper continuation: one expression
