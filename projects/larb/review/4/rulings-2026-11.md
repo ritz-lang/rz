@@ -1393,3 +1393,23 @@ and R32 follow Aaron's "only if it can be done safely, otherwise error it" (#251
 - #3253: should any no-effect statement (`x`, `5`, `x == 1`) be an error?
 - #3254: positional `let (a, b) = struct`: keep it, refuse it, or add a named form?
 - #3256: may an `impl` target a type from another module, or one instantiation (`impl G<u8>`)? #3252 depends on it.
+
+### R31a: #2520 step 1, measured over the threshold, PROCEED (2026-11-15)
+
+`ritz-task-2520` measured **13 sites** with a ritz0 AST walk over 1251 parseable
+files in `projects/`. None is in ritz0, ritz1, ritzlib or the runtime. 12 are a dead
+tail after a break-less `loop`/`while true`, and 1 follows an all-returning `if`.
+R31's ~10 threshold was there to catch an unexpected class of dead code or a site
+that is hard to change. Neither turned up: every site is a one-line delete of
+code that never runs. So R31 stands unnarrowed, and all 13 sites are migrated in
+the implementing commit. Clarifications:
+
+- A `while` whose condition is the literal `true` counts as `loop`, since ritz0
+  parses `loop` that way. No other condition counts, including a const that
+  equals true.
+- A `-> T` fn ending in a break-less `loop`/`while true` must compile with nothing
+  after it on all three compilers (§6.1). The room checks ritz1 and
+  ritz1_selfhosted before deleting the dead `return`s.
+- `60_echo_server`'s dead cleanup `sys_close` is deleted, with a comment that the
+  server runs until it's killed. A shutdown path would be a feature, not a migration.
+- The stale `harland/docs/old_designs` site is deleted rather than excluded.
