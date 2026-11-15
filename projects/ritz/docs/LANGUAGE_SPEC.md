@@ -139,7 +139,32 @@ fn pack(r: u8, g: u8) -> u32
 A line that does not end in an operator ends the statement, even when the
 next line could carry on the expression: `x = x + 1` followed by `-x` is two
 statements. Inside `(`, `[` or `{` line breaks and indentation are ignored
-altogether.
+altogether. So no block can open there: a multi-line `if` or `match` inside
+brackets is an error; bind it to a `let` first (LARB R46a). The error names
+the bracket and points at the `if` or `match`. A one-line
+`if c then a else b` is not a block, and stays legal inside brackets:
+
+```ritz expect-error="a block can't open inside `(`"
+fn id(v: i32) -> i32
+    v
+
+fn pick(n: i32) -> i32
+    id(match n
+        1 => 10
+        _ => 20
+    )
+```
+
+```ritz
+fn id(v: i32) -> i32
+    v
+
+fn pick(n: i32) -> i32
+    let t = match n
+        1 => 10
+        _ => 20
+    id(t) + id(if n == 1 then 1 else 2)
+```
 
 A continuation may also be indented *deeper* than the statement's first line,
 so it can line up under what it continues (LARB R46, AGAST #2193). After a
@@ -1612,19 +1637,16 @@ last line of a block, or the arm of a `match` that is itself being bound. The
 diagnostic points at the `if` that lacks the `else`, which in an
 `if`/`else if` chain is the innermost one.
 
-It applies equally to an operand: the operand of an operator, a call or method
-argument, an index, a cast, a field of a struct literal, a loop condition. An
+It applies equally to an operand, such as the operand of an operator. An
 operand's value is always used, so this is rejected even when the enclosing
-call is itself a statement (AGAST #1435; before it, the `if` evaluated to `0`):
+expression is itself a statement (AGAST #1435; before it, the `if` evaluated to
+`0`). A block `if` can't be a call argument, an index or a struct-literal
+field, because no block opens inside brackets (§2.2):
 
 ```ritz expect-error="an `if` with no `else` has no value"
-fn id(v: i32) -> i32
-    return v
-
 fn pick(c: i32) -> i32
-    return 5 + id(if c == 1
+    return 5 + if c == 1
         1
-    )
 ```
 
 An else-less `if` used as a *statement* is ordinary code and is unaffected —

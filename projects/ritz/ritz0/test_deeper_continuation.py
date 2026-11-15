@@ -29,10 +29,9 @@ break, it re-derives the layout with that line marked as a continuation
 its "Unindent does not match" (a marked INDENT) for the same reason.
 
 NOT DONE HERE: R46's "inside ( [ { indentation is ignored altogether".
-ritz0 parses a block `if` / `match` inside call parens and pins it
-(test_return_expected_enum.py `call_arg_arm`, LANGUAGE_SPEC's #1435
-example), which needs layout there; R46 doesn't say which wins, so it is
-asked rather than decided.  The #2193 paren repro is an operator
+ritz0 parsed a block `if` / `match` inside call parens, which needs layout
+there.  LARB R46a decided it: no block opens inside brackets (AGAST #3429,
+test_block_in_brackets.py).  The #2193 paren repro is an operator
 continuation and works through the rule above.
 
 THE TESTS

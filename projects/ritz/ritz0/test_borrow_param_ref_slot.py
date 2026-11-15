@@ -303,11 +303,11 @@ struct A
     ch: @&C
 
 fn go(c:& C, k: i32)
-    let a: A = A { ch: if k == 0
+    let ch: @&C = if k == 0
         @&c
     else
         @&c
-    }
+    let a: A = A { ch: ch }
     a.ch.x = 3
 """ + GO_K,
     "global": TYPES + "var G: *C\n\nfn go(c:& C)\n    G = @c\n    G.x = 3\n" + GO,

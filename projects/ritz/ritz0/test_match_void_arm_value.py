@@ -158,15 +158,17 @@ pub fn main() -> i32
     let r: i32 = 1 + (if c == 1 then say(1) else 2)
     r
 """, H + 3, 38, BOTH),
-    # ritz1 has no multi-line match argument or `x = match` assignment.
+    # A match whose value becomes a call argument. LARB R46a (AGAST #3429):
+    # a block can't open inside `(`, so it is bound to a `let`, then passed.
     "argument_match": ("""\
 pub fn main() -> i32
     let o: Option<i32> = None
-    take(match o
+    let m: i32 = match o
         Some(e) => say(e)
         None => 1
-    )
-""", H + 4, 20, ("ritz0",)),
+    take(m)
+""", H + 4, 20, BOTH),
+    # ritz1 has no `x = match` assignment.
     "assign_match": ("""\
 pub fn main() -> i32
     let o: Option<i32> = None

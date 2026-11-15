@@ -414,8 +414,9 @@ fn main() -> i32
     f(1)
 """
 
-# `if` as a struct-literal field, on the brace's line and on its own line, a
-# call in an arm, an inline `if` beside it, and an `else if` chain.
+# `if` values feeding a struct literal: a block `if` bound by a `let` and then
+# used as a field (LARB R46a: no block opens inside `{`), a call in an arm, an
+# inline `if` as a field, and an `else if` chain.
 STRUCT_LIT_FIELD = """\
 struct P
     x: i32
@@ -425,19 +426,20 @@ fn twice(v: i32) -> i32
     v * 2
 
 fn mk(c: i32) -> P
-    let a: P = P { x: if c == 1
+    let ax = if c == 1
         twice(5)
     else
         1
-    , y: 0 }
+    let a: P = P { x: ax, y: 0 }
+    let bx = if c == 0
+        0
+    else if c == 1
+        twice(a.x)
+    else
+        1
     P {
         y: if c == 1 then 22 else 0,
-        x: if c == 0
-            0
-        else if c == 1
-            twice(a.x)
-        else
-            1
+        x: bx
     }
 
 fn main() -> i32

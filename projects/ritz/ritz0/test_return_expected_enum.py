@@ -362,7 +362,7 @@ fn main() -> i32
 """
 )
 
-# ritz1 parses neither form: no closures here, no match as a call argument.
+# ritz1 has no closures here, so these two run on ritz0 only.
 #
 # A closure body changes the fn being emitted but not `current_fn_def`, so the
 # `return` must take the closure's type, not the enclosing `Result`.
@@ -388,6 +388,9 @@ CLOSURE_BLOCK_ARM_RETURN = CLOSURE_RETURN.replace(
     "        4 => return Some(x)\n", "        4 =>\n            return Some(x)\n"
 )
 
+# An early `return` from the arm of a `match` whose value feeds a call. The
+# match was the call's argument until LARB R46a (AGAST #3429) made a block
+# inside `(` an error; it is bound to a `let` first, then passed.
 CALL_ARG_ARM = (
     PRELUDE
     + """\
@@ -395,10 +398,10 @@ fn take(o: Option<i64>) -> i64
     7
 
 fn both(n: i64) -> Result<Page, Er>
-    let t: i64 = take(match n
+    let m: Option<i64> = match n
         5 => return Ok(Page { id: 12 })
         _ => Some(n)
-    )
+    let t: i64 = take(m)
     Ok(Page { id: t })
 
 """

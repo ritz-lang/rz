@@ -207,9 +207,9 @@ UNTYPED_BUT_COVERED = {
 }
 
 # ritz1 parses none of these; RITZ1_CANNOT_PARSE pins that.
+# (`value_call_argument`, `id(match n` ..., left with LARB R46a, AGAST #3429:
+# a block can't open inside `(`. Bound to a `let` first it is `value_let`.)
 REJECTED_RITZ0_ONLY = {
-    "value_call_argument": ("fn id(v: i64) -> i64\n    v\n" + _int_fn(
-        "    id(match n\n        0 => 1\n    )\n"), 4, 8, _CATCH_ALL),
     # `Some(0)` covers one value of `Some`, so it does not cover `Some`.
     "literal_payload": (_OPT + "fn f(o: Option<i32>) -> i32\n    match o\n"
                         "        Some(0) => 1\n        None => 2\n" + _MAIN, 3, 5, "Some"),
@@ -320,7 +320,7 @@ ACCEPTED_RITZ0_ONLY = {
                           "        Bb => 9\nfn main() -> i32\n    f(mk())\n", 7),
 }
 
-RITZ1_CANNOT_PARSE = ("literal_payload", "two_field_variant", "value_call_argument")
+RITZ1_CANNOT_PARSE = ("literal_payload", "two_field_variant")
 
 # --- Every arm must be reachable (LARB R13, AGAST #2349) ------------------------
 #

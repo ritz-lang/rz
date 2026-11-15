@@ -97,6 +97,41 @@ CALLCONVS = ("c", "win64")
 # prints the same words (ritz1/src/ast_helpers.ritz decl_refused).
 DECL_REFUSED = "cannot be declaration-only (= extern)"
 
+# LARB R46a (AGAST #3429, spec §2.2): inside ( [ { there is no layout, so no
+# block can open there.  ritz1 prints the same words (#3388).
+_OPENERS = {
+    TokenType.LPAREN: "(",
+    TokenType.LBRACKET: "[",
+    TokenType.LBRACKET2: "[[",
+    TokenType.LBRACE: "{",
+}
+_CLOSERS = (TokenType.RPAREN, TokenType.RBRACKET, TokenType.RBRACKET2, TokenType.RBRACE)
+
+
+def block_in_brackets_message(bracket: str) -> str:
+    return f"a block can't open inside `{bracket}`: bind the `if`/`match` to a `let` first"
+
+
+def _enclosing_brackets(tokens: List[Token]) -> dict:
+    """Map each `if` / `match` token inside brackets to its innermost bracket.
+
+    Keyed by (line, column): the parser rewrites its token list (`>>` splits,
+    continuation relayouts) but never moves a bracket or a keyword.  A close
+    with nothing open is left to the parser to report.
+    """
+    found = {}
+    stack = []
+    for tok in tokens:
+        tt = tok.type
+        if tt in _OPENERS:
+            stack.append(_OPENERS[tt])
+        elif tt in _CLOSERS:
+            if stack:
+                stack.pop()
+        elif stack and tt in (TokenType.IF, TokenType.MATCH):
+            found[(tok.span.line, tok.span.column)] = stack[-1]
+    return found
+
 
 # Inline assembly (LANGUAGE_SPEC §18.6, AGAST #3396).  The architectures an
 # `asm` block may name, and the x86_64 general registers a clause may pin or
@@ -138,6 +173,8 @@ class Parser:
         # Lines that continue an expression after a binary operator or `as`
         # (LARB R46, AGAST #3387): they open and close no block.
         self._continuations: set = set()
+        # `if` / `match` tokens inside ( [ { -> the innermost bracket (R46a).
+        self._in_brackets = _enclosing_brackets(tokens)
 
     def _current(self) -> Token:
         """Get the current token."""
@@ -1399,6 +1436,7 @@ class Parser:
             return rast.If(span, cond, then_block, else_block)
 
         # Block style
+        self._refuse_block_in_brackets(span)
         then_block = self.parse_block()
 
         else_block = None
@@ -1413,9 +1451,16 @@ class Parser:
 
         return rast.If(span, cond, then_block, else_block)
 
+    def _refuse_block_in_brackets(self, keyword: Span) -> None:
+        """LARB R46a: a block `if` / `match` can't open inside ( [ {."""
+        bracket = self._in_brackets.get((keyword.line, keyword.column))
+        if bracket is not None:
+            raise ParseError(block_in_brackets_message(bracket), keyword)
+
     def parse_match(self) -> rast.Match:
         """Parse a match expression."""
         span = self._current().span
+        self._refuse_block_in_brackets(span)
         self._expect(TokenType.MATCH)
         expr = self.parse_expr()
         # Skip newline before expecting indent (match x\n    ...)

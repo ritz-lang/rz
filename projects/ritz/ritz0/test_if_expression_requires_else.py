@@ -272,9 +272,6 @@ def test_the_value_was_really_zero_before_and_is_one_after_adding_else(tmp_path)
 # Every entry compiled at exit 0 before the fix and used 0 for the `if`.
 # ---------------------------------------------------------------------------
 
-_ID = "fn id(v: i32) -> i32\n    return v\n"
-_ID_P = "fn idp(p: *i32, v: i32)\n    *p = v\n"
-
 OPERAND_POSITIONS = {
     "binop_right": (
         "fn pick(c: i32) -> i32\n"
@@ -282,106 +279,44 @@ OPERAND_POSITIONS = {
         "        1\n"
         "    return x\n"
     ),
-    # `(if ...) + 5` does not parse; a unary wrapper puts the `if` on the
-    # left operand's side regardless.
-    "binop_left_in_return": (
+    "binop_right_in_return": (
         "fn pick(c: i32) -> i32\n"
-        "    return (-(if c == 1\n"
+        "    return 5 + if c == 1\n"
         "        1\n"
-        "    )) + 5\n"
     ),
     "unary_operand": (
         "fn pick(c: i32) -> i32\n"
-        "    let x = -(if c == 1\n"
+        "    let x = -if c == 1\n"
         "        1\n"
-        "    )\n"
         "    return x\n"
     ),
-    "call_argument": _ID + (
-        "fn pick(c: i32) -> i32\n"
-        "    return id(if c == 1\n"
+    # The expression is a statement, but its operand is still consumed.
+    "operand_of_an_expr_stmt": (
+        "fn g(p: *i32, c: i32)\n"
+        "    *p + if c == 1\n"
         "        1\n"
-        "    )\n"
-    ),
-    # The call is a statement, but its argument is still consumed.
-    "call_argument_of_an_expr_stmt": _ID_P + (
-        "fn pick(c: i32) -> i32\n"
-        "    var r: i32 = 7\n"
-        "    idp(@r, if c == 1\n"
-        "        1\n"
-        "    )\n"
-        "    return r\n"
+        "    p[0] = 3\n"
     ),
     # A procedure's tail is not a consuming statement (#1429's carve-out),
-    # but an argument inside it is consumed.
-    "call_argument_in_a_procedure_tail": _ID_P + (
+    # but an operand inside it is consumed.
+    "operand_in_a_procedure_tail": (
         "fn g(p: *i32, c: i32)\n"
-        "    idp(p, if c == 1\n"
+        "    *p + if c == 1\n"
         "        1\n"
-        "    )\n"
     ),
     # Tail of a statement `if`'s arm: reached through the arm's block tail.
-    "call_argument_in_a_statement_if_arm": _ID_P + (
+    "operand_in_a_statement_if_arm": (
         "fn g(p: *i32, c: i32, d: i32)\n"
         "    if d == 1\n"
-        "        idp(p, if c == 1\n"
+        "        *p + if c == 1\n"
         "            1\n"
-        "        )\n"
-        "    *p = 3\n"
+        "    p[0] = 3\n"
     ),
-    "call_argument_in_a_while_body_tail": _ID_P + (
+    "operand_in_a_while_body_tail": (
         "fn g(p: *i32, c: i32)\n"
         "    while *p < 10\n"
-        "        idp(p, if c == 1\n"
+        "        *p + if c == 1\n"
         "            1\n"
-        "        )\n"
-    ),
-    "method_call_argument": (
-        "struct S\n"
-        "    v: i32\n"
-        "impl S\n"
-        "    fn add(self:&, n: i32) -> i32\n"
-        "        return self.v + n\n"
-        "fn pick(s: *S, c: i32) -> i32\n"
-        "    return s.add(if c == 1\n"
-        "        1\n"
-        "    )\n"
-    ),
-    "index": (
-        "fn pick(a: *i32, c: i32) -> i32\n"
-        "    return a[if c == 1\n"
-        "        1\n"
-        "    ]\n"
-    ),
-    "assignment_target_index": (
-        "fn g(a: *i32, c: i32)\n"
-        "    a[if c == 1\n"
-        "        1\n"
-        "    ] = 3\n"
-    ),
-    # `(if ...) as T` does not parse; the cast's operand is a BinOp holding
-    # the `if`, so the walk must pass through Cast to reach it.
-    "cast": (
-        "fn pick(c: i32) -> i64\n"
-        "    return (2 * if c == 1\n"
-        "        1\n"
-        "    ) as i64\n"
-    ),
-    "struct_literal_field": (
-        "struct S\n"
-        "    v: i32\n"
-        "fn pick(c: i32) -> i32\n"
-        "    let s = S { v: if c == 1\n"
-        "        1\n"
-        "    }\n"
-        "    return s.v\n"
-    ),
-    "while_condition": (
-        "fn g(c: i32)\n"
-        "    while (if c == 1\n"
-        "        true\n"
-        "    )\n"
-        "        pass\n"
     ),
     # Result path and operand compose: the `if` is an operand inside the
     # value arm of a total if/else.
@@ -395,6 +330,35 @@ OPERAND_POSITIONS = {
         "    return x\n"
     ),
 }
+
+
+# LARB R46a (AGAST #3429): a block can't open inside ( [ {, so the bracketed
+# operand positions #1435 pinned (call and method arguments, an index, a
+# parenthesised operand or cast, a struct-literal field, a parenthesised loop
+# condition) no longer reach the missing-else check: they are refused at the
+# `if` when parsed. test_walker_reaches_every_operand_node keeps the walk's
+# reach into those nodes. Parse-level, so no compile per row.
+BRACKETED_POSITIONS = {
+    "paren_operand": "    return (-(if c == 1\n        1\n    )) + 5\n",
+    "call_argument": "    return id(if c == 1\n        1\n    )\n",
+    "method_call_argument": "    return s.add(if c == 1\n        1\n    )\n",
+    "index": "    return a[if c == 1\n        1\n    ]\n",
+    "assignment_target_index": "    a[if c == 1\n        1\n    ] = 3\n",
+    "cast": "    return (2 * if c == 1\n        1\n    ) as i64\n",
+    "struct_literal_field": "    let s = S { v: if c == 1\n        1\n    }\n",
+    "while_condition": "    while (if c == 1\n        true\n    )\n        pass\n",
+}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("position", sorted(BRACKETED_POSITIONS))
+def test_else_less_if_in_brackets_is_refused_as_a_block(position):
+    from parser import ParseError, parse
+
+    body = BRACKETED_POSITIONS[position]
+    with pytest.raises(ParseError) as info:
+        parse("fn pick(c: i32) -> i32\n" + body)
+    assert "a block can't open inside" in info.value.message, info.value.message
 
 
 @pytest.mark.integration
@@ -536,34 +500,28 @@ def test_else_ful_if_as_operand_and_argument_still_runs(tmp_path):
         "        1\n"
         "    else\n"
         "        0\n"
-        "    return x + id(if c == 1\n"
-        "        10\n"
-        "    else\n"
-        "        0\n"
-        "    )\n"
+        "    return x + id(if c == 1 then 10 else 0)\n"
     )) == 16
 
 
 @pytest.mark.integration
 @pytest.mark.unit
-def test_else_less_if_statement_inside_an_argument_arm_compiles(tmp_path):
+def test_else_less_if_statement_inside_an_operand_arm_compiles(tmp_path):
     """#1435 control: the operand walk never enters `Block.stmts`.
 
-    The argument is a total if/else; inside its then-arm an else-less `if`
-    is a statement, and the arm's value is the tail `1`.
+    The operand is a total if/else; inside its then-arm an else-less `if`
+    is a statement, and the arm's value is the tail `1`. (It was a call
+    argument until LARB R46a made a block inside `(` an error.)
     """
     rc, output, _ = _compile(tmp_path, (
-        "fn id(v: i32) -> i32\n"
-        "    return v\n"
         "fn pick(c: i32, d: i32) -> i32\n"
         "    var r: i32 = 0\n"
-        "    return id(if c == 1\n"
+        "    return 5 + if c == 1\n"
         "        if d == 1\n"
         "            r = 5\n"
         "        1\n"
         "    else\n"
         "        2\n"
-        "    )\n"
     ))
     assert rc == 0, f"walked into a block's statements:\n{output}"
 
