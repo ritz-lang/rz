@@ -15487,6 +15487,7 @@ class LLVMEmitter:
             arm_val = self._emit_expr_with_expected_enum(
                 arm.body, getattr(self, '_expected_enum_name', None))
             self.has_returned = _saved_arm_returned
+            self._end_diverging_arm(arm.body)
             arm_values.append(arm_val)
 
             # Remember which block we're in after emitting the body
@@ -15719,6 +15720,7 @@ class LLVMEmitter:
             arm_val = self._emit_expr_with_expected_enum(
                 arm.body, getattr(self, '_expected_enum_name', None))
             self.has_returned = _saved_arm_returned
+            self._end_diverging_arm(arm.body)
             if scrut_flag is not None:
                 # Falling off the arm drops what its bindings still own.
                 self._leave_drop_scope()
@@ -15891,6 +15893,18 @@ class LLVMEmitter:
         self._mark_drop_variable_initialized(slot)
         return self.drop_flags[id(slot)]
 
+    def _end_diverging_arm(self, body) -> None:
+        """End a match arm that never yields a value but left its block open.
+
+        AGAST #3270: an arm that is an endless `loop` (left only by `return`)
+        falls into the loop's dead exit block, which is unterminated. Branching
+        it to the merge made the arm a live incoming with no value, so the
+        match read as a statement and a `-> T` fn ending in it was refused.
+        Like a `return` arm, it contributes no type: the block is unreachable.
+        """
+        if not self.builder.block.is_terminated and arm_diverges(body):
+            self.builder.unreachable()
+
     def _enum_match_result(self, expr: rast.Match, arm_values: list,
                            arm_exit_blocks: list) -> ir.Value:
         """The value of an enum match, built in its merge block."""
@@ -16058,6 +16072,7 @@ class LLVMEmitter:
             arm_val = self._emit_expr_with_expected_enum(
                 arm.body, getattr(self, '_expected_enum_name', None))
             self.has_returned = _saved_arm_returned
+            self._end_diverging_arm(arm.body)
             arm_values.append(arm_val)
 
             # Check if the arm already terminated (e.g., with return)

@@ -361,9 +361,28 @@ ACCEPTED = {
         "        loop\n"
         "            if n > 0\n"
         "                return 1\n"),
+    # AGAST #3270: an arm that never leaves but by `return` contributes no
+    # type, so the match is a value-less tail that never reaches its end.
+    # test_match_endless_loop_arm.py runs the value-arm shapes.
+    "match_arm_is_an_endless_loop": (
+        "fn f(n: i64) -> i64\n"
+        "    match n\n"
+        "        0 => return 1\n"
+        "        _ =>\n"
+        "            loop\n"
+        "                if n > 1\n"
+        "                    return 2\n"),
+    "match_arm_is_an_endless_loop_in_an_unsafe_block": (
+        "fn f(n: i64) -> i64\n"
+        "    match n\n"
+        "        0 => return 1\n"
+        "        _ =>\n"
+        "            unsafe\n"
+        "                loop\n"
+        "                    if n > 1\n"
+        "                        return 2\n"),
     # Code after this is unreachable, and refused (AGAST #2520,
-    # test_dead_tail_after_diverging_if.py). Its match twin, an arm that is an
-    # endless loop with nothing after the match, is #3270.
+    # test_dead_tail_after_diverging_if.py).
     "if_arm_is_an_endless_loop": (
         "fn f(n: i64) -> i64\n"
         "    if n > 0\n"
