@@ -12060,6 +12060,11 @@ class LLVMEmitter:
             raise ValueError(
                 f"generic function `{fname}` needs explicit type arguments here: "
                 f"write `{fname}<T>(...)`")
+        # `W_bump(w)` of a method of `impl<T> W<T>`: only a non-generic
+        # impl's methods have R10's free name (§5.4, LARB R37, #3372).
+        generic_method = getattr(self, 'generic_method_names', {}).get(fname)
+        if generic_method is not None:
+            raise UnknownFunction(ref_rules.generic_method_free_call(*generic_method), self._call_span(call))
         raise UnknownFunction(f"Unknown function: {fname}", self._call_span(call))
 
     def _try_emit_simd_builtin(self, fname: str, args: list) -> Optional[ir.Value]:
@@ -16913,6 +16918,12 @@ def emit(module: rast.Module, no_runtime: bool = False,
     # And each generic struct's arity: an error spells `Wrap$H` as `Wrap<H>` (§7.7).
     generic_arity = {item.name: len(item.type_params) for item in module.items
                      if isinstance(item, rast.StructDef) and item.type_params}
+    # Each generic impl's methods by the free name R10 would give them, which
+    # they don't have (§5.4, LARB R37, AGAST #3372): `W_bump` -> its words.
+    generic_method_names = {f"{item.type_name}_{m.name}": (m.name, item.type_name, item.type_params)
+                            for item in module.items
+                            if isinstance(item, rast.ImplBlock) and item.type_params
+                            for m in item.methods}
     # Each generic struct and enum, by its variants (none for a struct): monomorph
     # drops the templates, and `Slot.mk(5)` names one (AGAST #2185).
     generic_types = {item.name: frozenset(v.name for v in getattr(item, 'variants', ()))
@@ -16938,6 +16949,7 @@ def emit(module: rast.Module, no_runtime: bool = False,
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
     emitter.generic_fn_names = generic_fn_names
+    emitter.generic_method_names = generic_method_names
 
     # Configure per-fn cache: tells emitter which functions to skip
     cached_fn_ir = {}

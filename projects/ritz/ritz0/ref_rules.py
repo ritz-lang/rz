@@ -45,6 +45,19 @@ def static_call_of_self(method: str, type_name: str, by_value: bool) -> str:
             f"write `{recv}.{method}()` or `{type_name}_{method}({arg})`")
 
 
+# `W_bump(w)` of a method of `impl<T> W<T>`: only a non-generic impl's methods
+# have R10's free name (LANGUAGE_SPEC §5.4, LARB R37, AGAST #3285, #3372).
+# `params` is the impl's `T, U`; the receiver is the type's name in lower case.
+def generic_method_free_call(method: str, type_name: str, params) -> str:
+    return (f"`{method}` is a method of generic `{type_name}<{', '.join(params)}>`: "
+            f"call it as `{type_name.lower()}.{method}()`")
+
+
+# A `$` in source outside an `asm` body: it's no identifier character, so a
+# monomorph's `W$i32_bump` can't be written (LANGUAGE_SPEC §2.5, LARB R37).
+DOLLAR_OUTSIDE_ASM = "`$` isn't part of a name: it's written only in an `asm` body"
+
+
 # The receiver of a method whose `self` is a pointer to a pointer (`self: **C`),
 # when it isn't a place one level short of `self` to borrow, or `self`'s type
 # (LANGUAGE_SPEC §5.4, AGAST #2403): a call result, or a `C` for a `**C`.

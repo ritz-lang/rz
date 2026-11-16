@@ -16,6 +16,7 @@ Syntax features:
 from dataclasses import dataclass
 from typing import Iterator, List, Optional
 from tokens import Token, TokenType, Span, KEYWORDS
+from ref_rules import DOLLAR_OUTSIDE_ASM
 
 # RERITZ mode is now the ONLY mode - legacy mode has been removed
 
@@ -643,7 +644,6 @@ class Lexer:
             '^': TokenType.CARET,
             '~': TokenType.TILDE,
             '!': TokenType.BANG,
-            '$': TokenType.DOLLAR,
             '<': TokenType.LT,
             '>': TokenType.GT,
             '=': TokenType.EQ,
@@ -660,6 +660,12 @@ class Lexer:
             ';': TokenType.SEMI,
             '@': TokenType.AT,
         }
+
+        # `$` is no identifier character: a monomorph's `W$i32_bump` can't be
+        # written (§2.5, LARB R37, AGAST #3372).  An asm body's lines are text
+        # and never get here; DOLLAR stays for an asm header until #1619.
+        if ch == '$' and self.asm_state is None:
+            raise LexerError(DOLLAR_OUTSIDE_ASM, start_span)
 
         if ch in single_char:
             return Token(single_char[ch], ch, start_span)

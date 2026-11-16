@@ -20,7 +20,7 @@ import pytest
 
 import fast_link
 
-from ref_rules import DROP_BY_VALUE, static_call_of_self
+from ref_rules import DOLLAR_OUTSIDE_ASM, DROP_BY_VALUE, generic_method_free_call, static_call_of_self
 from test_ref_into_value import (COMPILERS, RITZ1_BUILD, RITZ_ROOT, RITZ_START, _assert_refused,
                                  _compile, _run)
 
@@ -379,17 +379,13 @@ def test_the_hints_spellings_of_a_lent_self_run(receiver, compiler, tmp_path):
 # ritz1 named no type for a bare `self:&` (#3260: `call @C_bump(% ..)`), and
 # refused `C_bump(c)` of a typed one, or of a generic instance's bare one, which
 # monomorph names typed, as "a value doesn't fit a reference slot" (#3278).
-# `{T}` is the receiver's type and `{F}` the method's free name.  ritz0 has no
-# free name for a generic instance's method (`W$i32_bump` doesn't parse), so
-# that impl is ritz1's and ritz1_selfhosted's alone (AGAST #3285).
+# `{T}` is the receiver's type and `{F}` the method's free name.  A generic
+# impl's method has none: see test_a_generic_method_has_no_free_name.
 FREE_LENT = "struct C\n    x: i32\n    y: i32\n\nimpl C\n    fn bump({R})\n        self.x = self.x + 1\n\n" \
             "fn mk() -> C\n    C { x: 3, y: 0 }\n\n"
-FREE_LENT_GENERIC = "struct W<T>\n    x: T\n    y: T\n\nimpl<T> W<T>\n    fn bump(self:&)\n        self.x = self.x + 1\n\n" \
-                    "fn mk() -> W<i32>\n    W<i32> { x: 3, y: 0 }\n\n"
 FREE_LENT_IMPLS = {
     "bare": (FREE_LENT.replace("{R}", "self:&"), "C", "C_bump"),
     "typed": (FREE_LENT.replace("{R}", "self:& C"), "C", "C_bump"),
-    "generic": (FREE_LENT_GENERIC, "W<i32>", "W$i32_bump"),
 }
 FREE_LENT_RUNS = {
     "addr": "    var c: {T} = mk()\n    {F}(@&c)\n",
@@ -399,8 +395,36 @@ FREE_LENT_RUNS = {
 }
 
 
-FREE_LENT_ROWS = [(impl, c) for impl in sorted(FREE_LENT_IMPLS) for c in COMPILERS
-                  if not (impl == "generic" and c == "ritz0")]
+FREE_LENT_ROWS = [(impl, c) for impl in sorted(FREE_LENT_IMPLS) for c in COMPILERS]
+
+
+# LARB R37 (spec §5.4, §2.5; AGAST #3285): a method of `impl<T> W<T>` has no
+# free name.  `W_bump(c)`, with or without its type args, is refused at the
+# callee; `W$i32_bump`, a monomorph's internal name, at its `$`, which is no
+# identifier character outside an `asm` body.  `^` marks where it lands.
+FREE_LENT_GENERIC = "struct W<T>\n    x: T\n    y: T\n\nimpl<T> W<T>\n    fn bump(self:&)\n        self.x = self.x + 1\n\n" \
+                    "pub fn main() -> i32\n    var c: W<i32> = W<i32> { x: 3, y: 0 }\n    {CALL}\n    c.x\n"
+GENERIC_FREE_CALLS = {
+    "plain": ("^W_bump(c)", generic_method_free_call("bump", "W", ["T"])),
+    "type_args": ("^W_bump<i32>(c)", generic_method_free_call("bump", "W", ["T"])),
+    "instance": ("W^$i32_bump(c)", DOLLAR_OUTSIDE_ASM),
+}
+# ritz1's side is AGAST #3373.
+RITZ1_GENERIC_FREE_CALL = "#3373"
+
+
+def _generic_free_call_rows():
+    for call in sorted(GENERIC_FREE_CALLS):
+        for compiler in COMPILERS:
+            marks = [] if compiler == "ritz0" else \
+                [pytest.mark.xfail(strict=True, reason=RITZ1_GENERIC_FREE_CALL)]
+            yield pytest.param(call, compiler, id=f"{call}-{compiler}", marks=marks)
+
+
+@pytest.mark.parametrize("call,compiler", list(_generic_free_call_rows()))
+def test_a_generic_method_has_no_free_name(call, compiler, tmp_path):
+    marked, message = GENERIC_FREE_CALLS[call]
+    _assert_refused(compiler, tmp_path, f"generic_free_{call}", FREE_LENT_GENERIC.replace("{CALL}", marked), message)
 
 
 def _free_lent(impl, body):
