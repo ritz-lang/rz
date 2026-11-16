@@ -2586,6 +2586,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_ptr_elem_store(s, target_expr.right, stmt.assign_value, dptr, TYPE_PTR, dix)
             return
 
+        # AGAST #3442: `f()[i] = v` with `f` returning `*T` stores through the
+        # pointer `f()` returns, as `p[i] = v` does.  It fell to the generic
+        # path below, which read `f()[i]` as a byte VALUE and stored through
+        # it: a SIGSEGV.  Base, index, then value (LARB R61).
+        if emit_call_base_index_store(s, target_expr, stmt.assign_value) == 1
+            return
+
         # AGAST #1509: `g[i][j] = v` over a multi-dimensional array.  It fell
         # to the generic path below, which evaluated `g[i][j]` as a VALUE
         # (over a flattened [N x i64]) and stored through it.
@@ -4460,6 +4467,40 @@ fn emit_ptr_struct_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, b
     emit_str(s, c", ptr ")
     emit_reg(s, elem_ptr)
     emit_str(s, c"\n")
+
+# AGAST #3442: `f()[i] = v` where `f` returns a `*T` (ptr_root_pointee: a
+# scalar T, or a struct named by the return type) or a `**T`.  Emits the call, then
+# emit_ptr_*_elem_store's index and value, and returns 1; 0 (nothing
+# emitted) for any other target.
+fn emit_call_base_index_store(s: *EmitterState, target: *Expr, value: *Expr) -> i32
+    if target.kind != EXPR_INDEX or target.left == null or target.left.kind != EXPR_CALL
+        return 0
+    if target.right == null or target.right.kind == EXPR_RANGE
+        return 0
+    var st_name: *u8 = null
+    var st_len: i32 = 0
+    let pointee: i32 = ptr_root_pointee(s, target.left, @st_name, @st_len)
+    var base_type: i32 = TYPE_PTR
+    if pointee == 0
+        # A `**T` return: the element is a pointer.
+        let fd: *FnDef = find_call_fn(s, target.left)
+        if fd == null or fd.return_type != TYPE_PTR_PTR
+            return 0
+        base_type = TYPE_PTR_PTR
+    if pointee == TYPE_STRUCT and (st_len == 0 or find_struct(s, st_name, st_len) == null)
+        return 0
+    let base: i32 = emit_expr(s, target.left)
+    let bptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, bptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, base)
+    emit_str(s, c" to ptr\n")
+    if pointee == TYPE_STRUCT
+        emit_ptr_struct_elem_store(s, target.right, value, bptr, st_name, st_len)
+    else
+        emit_ptr_elem_store(s, target.right, value, bptr, base_type, pointee)
+    return 1
 
 # The body of emit_index_assign_ptr_store, for any index / value pair.  AGAST
 # #2545: `(*r)[i] = v` (an expression-target assign) stores through it too.

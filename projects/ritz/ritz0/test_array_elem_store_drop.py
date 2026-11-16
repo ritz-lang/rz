@@ -141,6 +141,76 @@ def test_element_store_and_nd_drops(tmp_path, compiler, name):
     assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
 
 
+# `f()[i] = v`, `f` returning a `*T`: the store goes through the pointer
+# `f()` returns, and (LARB R61) evaluates `f()` (6), then the index (7), then
+# `v` (8).  ritz1 evaluated `f()[i]` as a value and stored through it: a
+# SIGSEGV (AGAST #3442).  Through a raw pointer nothing owns the old element,
+# so it doesn't drop (as `p[i] = v`); the local's own 1 and 3 drop at the end.
+CALL_BASE = {
+    # A `*i32`: a 4-byte stride and store, the next element untouched.
+    "scalar": ("""\
+var P: *i32 = null
+
+fn arr() -> *i32
+    D = D * 10 + 6
+    return P
+
+fn val(x: i32) -> i32
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var a: [3]i32 = [1, 2, 4]
+    P = @a[0]
+    arr()[idx(1)] = val(3)
+    D = ((D * 10 + a[0] as i64) * 10 + a[1] as i64) * 10 + a[2] as i64
+""", "f()", 678134),
+    "struct": ("""\
+var P: *S = null
+
+fn arr() -> *S
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    P = @a[0]
+    arr()[idx(1)] = mk(3)
+""", "f()", 67813),
+    # A `**i32`: the element stored is a pointer.
+    "pointer": ("""\
+var Q: **i32 = null
+
+fn arr() -> **i32
+    D = D * 10 + 6
+    return Q
+
+fn val(p: *i32) -> *i32
+    D = D * 10 + 8
+    return p
+
+fn f()
+    var x: i32 = 1
+    var y: i32 = 3
+    var ps: [2]*i32 = [@x, @x]
+    Q = @ps[0]
+    arr()[idx(1)] = val(@y)
+    D = (D * 10 + *ps[0] as i64) * 10 + *ps[1] as i64
+""", "f()", 67813),
+}
+
+
+@pytest.mark.parametrize("compiler", [
+    pytest.param(c, marks=pytest.mark.xfail(
+        strict=True, reason="AGAST #3482: ritz0 evaluates v before the place"))
+    if c == "ritz0" else c for c in COMPILERS])
+@pytest.mark.parametrize("name", sorted(CALL_BASE))
+def test_store_into_call_result(tmp_path, compiler, name):
+    body, call, want = CALL_BASE[name]
+    rc = _run(compiler, tmp_path, f"call_base_{name}", _source(body, call, want))
+    assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
+
+
 # §3.3: a Drop array local needs an initialiser; the error is at the name.
 UNINIT = {
     "rank1": "    var a: [2]S\n",
