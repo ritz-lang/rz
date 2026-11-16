@@ -12,6 +12,10 @@ the field's value, not a silent 0.
 Every program exits 3 when the fields hold the right values, on all three
 compilers.  ritz0 folds each integer field through its ConstEvaluator and
 reports an unfoldable one with ritz1's wording (AGAST #3650).
+
+AGAST #3669: a struct-typed field (`i: I { v: 3 }`) is a nested literal, not
+`i64 0`; #3651's recursion in emit_const_field_value fixed it, and the nested
+rows pin it, including a nested field holding a const expression.
 """
 
 import pytest
@@ -105,11 +109,62 @@ pub fn main() -> i32
     return (T[0].a + 6) as i32
 """
 
+# AGAST #3669: a struct-typed field of an element.  ritz1 emitted the nested
+# literal as `i64 0`, which clang rejects.
+NESTED = """\
+struct I
+    v: i32
+
+struct P
+    x: i32
+    i: I
+
+const T: [1]P = [P { x: 1, i: I { v: 3 } }]
+
+pub fn main() -> i32
+    if T[0].x != 1
+        return 10
+    return T[0].i.v
+"""
+
+# The nested struct's field is a const expression, and the struct nests two
+# deep beside a scalar after it, so every field keeps its own slot.
+NESTED_CONST_EXPR = """\
+struct I
+    v: i32
+
+struct M
+    i: I
+    w: i64
+
+struct P
+    x: i32
+    m: M
+    z: i8
+
+const A: i32 = 2
+
+const T: [2]P = [P { x: 1, m: M { i: I { v: A + 1 }, w: -A }, z: 5 }, P { x: -A, m: M { i: I { v: A * 4 }, w: 9 }, z: -1 }]
+
+pub fn main() -> i32
+    if T[0].m.w != -2
+        return 10
+    if T[0].z != 5 or T[1].z != -1
+        return 11
+    if T[1].x != -2 or T[1].m.i.v != 8 or T[1].m.w != 9
+        return 12
+    if T[0].x != 1
+        return 13
+    return T[0].m.i.v
+"""
+
 FORMS = {
+    "nested": NESTED,
     "neg_repro": NEG_REPRO,
     "widths": WIDTHS,
     "const_name": CONST_NAME,
     "const_expr": CONST_EXPR,
+    "nested_const_expr": NESTED_CONST_EXPR,
 }
 
 
