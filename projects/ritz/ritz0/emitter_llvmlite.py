@@ -12903,7 +12903,7 @@ class LLVMEmitter:
             receiver = self.builder.load(self._through_pointers(receiver))
         receiver = self._convert_type(receiver, enum_type)
 
-        enum_alloca = self.builder.alloca(enum_type, name="enum.pred")
+        enum_alloca = self.builder._entry_alloca(enum_type, "enum.pred")
         self.builder.store(receiver, enum_alloca)
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
         tag_val = self.builder.load(tag_ptr)
@@ -13009,7 +13009,7 @@ class LLVMEmitter:
             recv = self.builder.load(recv)
         recv = self._convert_type(recv, enum_type)
 
-        enum_alloca = self.builder.alloca(enum_type, name="unwrap.enum")
+        enum_alloca = self.builder._entry_alloca(enum_type, "unwrap.enum")
         self.builder.store(recv, enum_alloca)
 
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
@@ -15430,7 +15430,7 @@ class LLVMEmitter:
         if (isinstance(enum_val.type, ir.PointerType)
                 and enum_val.type.pointee == enum_type):
             enum_val = self.builder.load(enum_val)
-        enum_alloca = self.builder.alloca(enum_type, name="match.enum")
+        enum_alloca = self.builder._entry_alloca(enum_type, "match.enum")
         self.builder.store(enum_val, enum_alloca)
         # A match owns a scrutinee it moved (AGAST #2177, set by the move
         # checker): the spill is a nameless binding in a drop scope of its
@@ -16022,7 +16022,7 @@ class LLVMEmitter:
         enum_type, variants = self.enum_types[enum_name]
 
         # Store result to memory so we can extract tag and data
-        result_alloca = self.builder.alloca(enum_type, name="try.result")
+        result_alloca = self.builder._entry_alloca(enum_type, "try.result")
         self.builder.store(result_val, result_alloca)
 
         # Load the tag
@@ -16078,7 +16078,7 @@ class LLVMEmitter:
         fn_ret_enum_type, _ = self.enum_types[fn_ret_type_name]
 
         # Create a new Result with Err variant
-        ret_alloca = self.builder.alloca(fn_ret_enum_type, name="try.ret")
+        ret_alloca = self.builder._entry_alloca(fn_ret_enum_type, "try.ret")
 
         # Set tag to 1 (Err)
         ret_tag_ptr = self.builder.gep(ret_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
@@ -16150,7 +16150,7 @@ class LLVMEmitter:
                 and opt_val.type.pointee == enum_type):
             opt_val = self.builder.load(opt_val)
 
-        opt_alloca = self.builder.alloca(enum_type, name="try.opt")
+        opt_alloca = self.builder._entry_alloca(enum_type, "try.opt")
         self.builder.store(opt_val, opt_alloca)
 
         zero = ir.Constant(self.i32, 0)
@@ -16174,7 +16174,7 @@ class LLVMEmitter:
                 "Try operator on an Option used in a function that does not "
                 f"return an Option (got {fn_ret_enum})")
         ret_enum_type, _ = self.enum_types[fn_ret_enum]
-        ret_alloca = self.builder.alloca(ret_enum_type, name="try.ret")
+        ret_alloca = self.builder._entry_alloca(ret_enum_type, "try.ret")
         self.builder.store(
             ir.Constant(self.i8, self._get_enum_variant_tag(fn_ret_enum, 'None')),
             self.builder.gep(ret_alloca, [zero, zero]))

@@ -359,11 +359,92 @@ pub fn main() -> i32
     return (t / 1000000) as i32
 """
 
+# The scrutinee spills of #3658 (`match.enum`), #3659 (`enum.pred`,
+# `unwrap.enum`) and #3660 (`try.result`, `try.opt`, `try.ret`): each one
+# stores an enum value to a slot to read its tag, inside the loop body.
+# `try.ret` sits on the early-return path, so it runs at most once and only
+# the structural test sees it; the other spills also overflow the oracle.
+MATCH_SCRUTINEE = f"""\
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        match Some(2)
+            Some(v) => t = t + v
+            None => t = 0
+        i = i + 1
+    return (t / 1000000) as i32
+"""
+
+ENUM_PREDICATE = f"""\
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        let o: Option<i64> = Some(2)
+        if o.is_some()
+            t = t + 2
+        i = i + 1
+    return (t / 1000000) as i32
+"""
+
+ENUM_UNWRAP = f"""\
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        let o: Option<i64> = Some(2)
+        t = t + o.unwrap()
+        i = i + 1
+    return (t / 1000000) as i32
+"""
+
+TRY_RESULT = f"""\
+fn two() -> Result<i64, i32>
+    return Ok(2)
+
+fn sum() -> Result<i64, i32>
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        t = t + two()?
+        i = i + 1
+    return Ok(t)
+
+pub fn main() -> i32
+    match sum()
+        Ok(t) => return (t / 1000000) as i32
+        Err(e) => return e
+"""
+
+TRY_OPTION = f"""\
+fn two() -> Option<i64>
+    return Some(2)
+
+fn sum() -> Option<i64>
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        t = t + two()?
+        i = i + 1
+    return Some(t)
+
+pub fn main() -> i32
+    match sum()
+        Some(t) => return (t / 1000000) as i32
+        None => return 1
+"""
+
 RITZ0_CASES = dict(
     CASES,
     variant_untyped=(VARIANT_UNTYPED, 40),
     variant_typed=(VARIANT_TYPED, 40),
     addr_of_payload=(ADDR_OF_PAYLOAD, 20),
+    match_scrutinee=(MATCH_SCRUTINEE, 20),
+    enum_predicate=(ENUM_PREDICATE, 20),
+    enum_unwrap=(ENUM_UNWRAP, 20),
+    try_result=(TRY_RESULT, 20),
+    try_option=(TRY_OPTION, 20),
 )
 
 
