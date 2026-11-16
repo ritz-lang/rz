@@ -3311,6 +3311,42 @@ fn clone_unknown_kind(what: *u8, kind: i32)
     eprints_cstr(c"\n")
     sys_exit(1)
 
+# AGAST #1551: a pointer/reference local's pointee at T = the argument.  A
+# bare `*T` (pointee parsed as struct "T") points at the argument type
+# itself; `*Vec<T>` keeps its pointee and has T substituted in its name.
+fn clone_ptr_local_type(s: *Stmt, cloned: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32)
+    if s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+        # `*[N]T` and other non-struct pointees naming T are not this path
+        # (AGAST #3663).
+        if s.var_pointee_type != TYPE_STRUCT
+            cloned.var_type_name = s.var_type_name
+            cloned.var_type_name_len = s.var_type_name_len
+            return
+        # T = `*U` is still a `*` to a `*`, not the `**U` local a param's
+        # path makes of it (AGAST #3662).
+        cloned.var_pointee_type = subst_type
+        cloned.var_type_name = subst_name
+        cloned.var_type_name_len = subst_len
+        # A written `*u8` carries no name: a named pointer local is taken to
+        # point at a struct, and `*p` was typed i64 while it loaded an i8.
+        if subst_type < TYPE_STRUCT and subst_type != TYPE_PTR and subst_type != TYPE_PTR_PTR
+            cloned.var_type_name = null
+            cloned.var_type_name_len = 0
+        # `*T` at T = `[N]E` points at that array, as a param does (#2832).
+        var arr: ArrayArg
+        if subst_type == TYPE_ARRAY and array_arg_decode(subst_name, subst_len, @arr) == 1
+            cloned.var_pointee_array_size = arr.size
+            cloned.var_pointee_array_elem_type = arr.elem
+            cloned.var_pointee_array_elem_pointee = arr.pointee
+            cloned.var_type_name = arr.name
+            cloned.var_type_name_len = arr.name_len
+        return
+    var new_name: *u8 = null
+    var new_len: i32 = 0
+    substitute_type_param_in_name(s.var_type_name, s.var_type_name_len, type_param, type_param_len, suffix, suffix_len, @new_name, @new_len)
+    cloned.var_type_name = new_name
+    cloned.var_type_name_len = new_len
+
 fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, subst_name: *u8, subst_len: i32, suffix: *u8, suffix_len: i32) -> *Stmt
     let cloned: *Stmt = malloc(sizeof(Stmt)) as *Stmt
     memcpy(cloned as *u8, s as *u8, sizeof(Stmt))  # AGAST #1925
@@ -3373,6 +3409,12 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         else if pp_local_subst == 1
             cloned.var_type_name = subst_name
             cloned.var_type_name_len = subst_len
+        else if (s.var_type == TYPE_PTR or s.var_type == TYPE_REF or s.var_type == TYPE_MUT_REF) and s.var_type_name != null
+            # AGAST #1551: `let p: *T` / `*Vec<T>` concretizes T as the same
+            # param does (clone_params_with_suffix).  It kept the name "T" and
+            # a TYPE_STRUCT pointee, a struct that does not exist, so `p + 1`
+            # had no element size and was refused.
+            clone_ptr_local_type(s, cloned, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         else
             cloned.var_type_name = s.var_type_name
             cloned.var_type_name_len = s.var_type_name_len

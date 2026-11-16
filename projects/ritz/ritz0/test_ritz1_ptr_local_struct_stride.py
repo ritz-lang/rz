@@ -186,43 +186,9 @@ def test_param_struct_ptr_still_scaled(ritz1_bin, tmp_path, compiler):
     assert _compile_and_run(compiler, tmp_path, PARAM_PROGRAM) == 10
 
 
-# Fail-closed.  Inside a generic fn, monomorph does not substitute the type
-# name of a `let p: *T` local, so after instantiation with T=u8 the local
-# still says "pointer to struct T" — a struct that does not exist.
-# get_ptr_elem_size used to answer 8 for that (get_struct_size_by_name's
-# miss value): `p + 1` stepped 8 bytes into a [3]u8 and read past the end.
-# It must now refuse, naming the operand, and write no output.  (ritz0 gets
-# 10; teaching monomorph to substitute the name is a separate ticket — this
-# pins that ritz1 errors rather than guessing.)
-UNKNOWN_POINTEE_PROGRAM = """\
-fn second<T>(x: *T) -> T
-    let p: *T = x
-    let q: *T = p + 1
-    return *q
-
-fn main() -> i32
-    var arr: [3]u8
-    arr[0] = 1
-    arr[1] = 10
-    arr[2] = 20
-    return second<u8>(@arr[0]) as i32
-"""
-
-
-@pytest.mark.integration
-def test_ritz1_unknown_pointee_is_an_error_not_a_guess(ritz1_bin, tmp_path):
-    src = tmp_path / "unknown_pointee.ritz"
-    src.write_text(UNKNOWN_POINTEE_PROGRAM)
-    ll = tmp_path / "unknown_pointee.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    comp = subprocess.run(
-        [str(RITZ1_BIN), str(src), "-o", str(ll)],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert comp.returncode != 0, "ritz1 guessed an element size instead of failing"
-    assert "element size of pointee unknown for 'p'" in comp.stderr, comp.stderr
-    assert not ll.exists(), "ritz1 wrote output despite an emitter error"
+# The `let p: *T` program that pinned the fail-closed path here (ritz1
+# refused `p + 1` rather than guess a stride for the never-substituted
+# pointee "T") compiles now that monomorph concretizes the local (AGAST
+# #1551).  It is a parity row in test_generic_ptr_local.py; the refusal
+# keeps its witnesses in test_ritz1_ptr_arith_generic_call.py and
+# test_ritz1_deref_struct.py.
