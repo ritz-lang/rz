@@ -44,8 +44,9 @@ make -C projects/harland kernel
 ```
 kernel          Build the kernel (default)
 iso             Create test ISO with GRUB
-test            Run kernel boot test
-test-boot       Run kernel boot test (GRUB/BIOS)
+test            Run kernel boot test (= test-boot)
+test-boot       Boot the ISO (BIOS/GRUB) with the initramfs; needs ALL TESTS PASSED
+test-tier1      Boot with indium, check init Tier-1 suite (OVMF)
 test-uefi-boot  Test UEFI bootloader (headless)
 test-uefi-gui   Test UEFI bootloader with display
 run-gui         Interactive run (no timeout, kill QEMU manually)

@@ -61,7 +61,9 @@ iso: kernel
 
 test: test-boot
 
-# Boot test via GRUB (BIOS mode)
+# Boot the GRUB ISO under legacy BIOS with the real initramfs. Fails on a
+# KERNEL PANIC or EXCEPTION and needs init's Tier-1 suite to report ALL TESTS
+# PASSED (#3437: it used to boot a blank disk and pass on the banner alone).
 test-boot: iso
 	@echo "=== Testing Kernel Boot (GRUB) ==="
 	./tools/test_boot.sh
@@ -107,8 +109,8 @@ help:
 	@echo "Targets:"
 	@echo "  kernel       - Build the kernel (default)"
 	@echo "  iso          - Create test ISO with GRUB"
-	@echo "  test         - Run kernel boot test"
-	@echo "  test-boot    - Run kernel boot test (GRUB/BIOS)"
+	@echo "  test         - Run kernel boot test (= test-boot)"
+	@echo "  test-boot    - Boot the ISO (BIOS/GRUB) with the initramfs; needs ALL TESTS PASSED"
 	@echo "  test-tier1   - Boot with indium, check init Tier-1 suite (OVMF)"
 	@echo "  test-uefi-boot - Test UEFI bootloader (headless)"
 	@echo "  test-uefi-gui  - Test UEFI bootloader with display"

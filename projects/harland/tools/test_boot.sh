@@ -1,117 +1,127 @@
 #!/bin/bash
-# Test kernel boot with QEMU (BIOS mode via GRUB)
-# Captures serial output and checks for expected messages
+# Boot Harland's GRUB ISO under legacy BIOS (SeaBIOS -> GRUB multiboot2) with
+# the real initramfs, and check init's Tier-1 suite. `make test-boot` (and so
+# `make test`) runs this; the Makefile builds the ISO first.
 #
-# This test uses legacy BIOS boot with GRUB multiboot2.
-# For UEFI testing, use: make test-uefi-boot
+# This is the one boot path tools/test_tier1_boot.sh (OVMF only) does not
+# cover. It also boots with -smp 4 and the virtio net/input devices attached.
+#
+# Until AGAST #3437 this attached a blank `qemu-img create` disk as the
+# initramfs, so the kernel panicked right after its banner ("Failed to load
+# initramfs") and the script still passed, because it only grepped for
+# "Hello from Harland". The verdict is now test_tier1_boot.sh's: any
+# KERNEL PANIC or EXCEPTION fails, and the suite must report ALL TESTS PASSED.
+#
+# Usage: tools/test_boot.sh
+#        SKIP_BUILD=1   use the existing userspace build/debug outputs
+#        BOOT_TIMEOUT=N seconds for the boot (default 120: TCG boots took
+#                       16-39s at load average 26, and a pass stops early)
+#        KEEP_WORK=DIR  copy the serial log (bios.log) into DIR
+#
+# Exit: 0 = pass; 1 = the boot failed (panic, exception, failed suite, no
+#       verdict before the timeout, or a failed build); 3 = a required tool
+#       is missing: a SETUP ERROR (rz's and ci_local.py's EXIT_SETUP), not a
+#       regression.
 
-set -e
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECTS_DIR="$(dirname "$HARLAND_DIR")"
+ROOT_DIR="$(dirname "$PROJECTS_DIR")"
+TIMEOUT="${BOOT_TIMEOUT:-120}"
+ISO="$HARLAND_DIR/build/harland.iso"
+# Same packages as test_tier1_boot.sh and indium/tools/mkiso.sh: init's suite
+# spawns rzsh and prism's hello_gfx as well as indium's binaries.
+USER_PKGS="indium rzsh ritzutils prism"
 
-ISO="$PROJECT_DIR/build/harland.iso"
-# Scratch is a `mktemp -d` removed on exit, so concurrent runs on one host
-# never share a path (AGAST #3183).
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
-SERIAL_LOG="$T/serial.log"
+EXIT_SETUP=3
+setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
 
-if [[ ! -f "$ISO" ]]; then
-    echo "Error: ISO not found at $ISO"
-    echo "Run: ./tools/mkiso.sh"
-    exit 1
+command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found"
+command -v qemu-img >/dev/null || setup_error "qemu-img not found (qemu-utils)"
+
+[ -f "$ISO" ] || { echo "FAIL: ISO not found at $ISO (run: make -C projects/harland iso)"; exit 1; }
+
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    for pkg in $USER_PKGS; do
+        (cd "$ROOT_DIR" && ./rz build "$pkg")
+        brc=$?
+        [ "$brc" -eq "$EXIT_SETUP" ] && setup_error "build of $pkg: a toolchain binary is missing"
+        [ "$brc" -eq 0 ] || { echo "FAIL: build of $pkg failed"; exit 1; }
+    done
 fi
+INIT_ELF="$PROJECTS_DIR/indium/build/debug/init.elf"
+[ -f "$INIT_ELF" ] || { echo "FAIL: not built: $INIT_ELF"; exit 1; }
 
-echo "Testing kernel boot (BIOS/GRUB mode)..."
+# Scratch is a `mktemp -d` removed on exit, so concurrent runs on one host
+# never share a path (AGAST #3183), and no disk outlives the run to be booted
+# by a later one (the blank initramfs lived in build/ for good, #3437).
+T=$(mktemp -d)
+trap '[ -n "${KEEP_WORK:-}" ] && cp "$T/bios.log" "$KEEP_WORK"/ 2>/dev/null; rm -rf "$T"' EXIT
+SERIAL_LOG="$T/bios.log"
+
+mkdir -p "$T/bin"
+for pkg in $USER_PKGS; do
+    cp "$PROJECTS_DIR/$pkg"/build/debug/*.elf "$T/bin/" 2>/dev/null || true
+done
+python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$T/bin" \
+    --output "$T/initramfs-base.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
+# The boot writes to its disks; an overlay keeps the built image pristine.
+qemu-img create -q -f qcow2 -F qcow2 -b "$T/initramfs-base.qcow2" "$T/initramfs.qcow2" \
+    || { echo "FAIL: qemu-img overlay failed"; exit 1; }
+# A blank scratch disk for the virtio-blk storage driver.
+qemu-img create -q -f qcow2 "$T/storage.qcow2" 512M \
+    || { echo "FAIL: qemu-img create failed"; exit 1; }
+
+echo "Testing kernel boot (BIOS/GRUB, real initramfs)..."
 echo "ISO: $ISO"
 
-# Create test disks if they don't exist (for VirtIO testing)
-INITRAMFS="$PROJECT_DIR/build/initramfs.qcow2"
-STORAGE="$PROJECT_DIR/build/storage.qcow2"
-
-if [[ ! -f "$INITRAMFS" ]]; then
-    echo "Creating initramfs disk (64MB)..."
-    qemu-img create -f qcow2 "$INITRAMFS" 64M >/dev/null
-fi
-
-if [[ ! -f "$STORAGE" ]]; then
-    echo "Creating storage disk (512MB)..."
-    qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
-fi
-
-# Run QEMU in BIOS mode (no OVMF) with GRUB ISO
-# -smp 4 for multi-core testing, -m 2G for full memory tests
-# VirtIO block, network, and input devices for driver testing
-# -cpu Haswell-v1 enables BMI1/BMI2 instructions (bextr, etc.)
-timeout 45 qemu-system-x86_64 \
+# -cpu Haswell-v1 enables BMI1/BMI2 (bextr etc.); -smp 4 starts the APs.
+: > "$SERIAL_LOG"
+timeout "$TIMEOUT" qemu-system-x86_64 \
     -cpu Haswell-v1 \
     -cdrom "$ISO" \
     -device virtio-blk-pci,drive=initramfs \
-    -drive file="$INITRAMFS",format=qcow2,if=none,id=initramfs \
+    -drive file="$T/initramfs.qcow2",format=qcow2,if=none,id=initramfs \
     -device virtio-blk-pci,drive=storage \
-    -drive file="$STORAGE",format=qcow2,if=none,id=storage \
+    -drive file="$T/storage.qcow2",format=qcow2,if=none,id=storage \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0 \
     -device virtio-keyboard-pci \
     -device virtio-mouse-pci \
     -serial file:"$SERIAL_LOG" \
     -display none \
+    -monitor none \
     -smp 4 \
     -m 2G \
-    -no-reboot 2>&1 || true
+    -no-reboot >/dev/null 2>&1 &
+pid=$!
+# init halts after the suite, so stop QEMU once a verdict line appears.
+timed_out=1
+for _ in $(seq 1 "$TIMEOUT"); do
+    sleep 1
+    grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$SERIAL_LOG" && { sleep 1; timed_out=0; break; }
+    kill -0 "$pid" 2>/dev/null || { timed_out=0; break; }
+done
+kill "$pid" 2>/dev/null
+wait "$pid" 2>/dev/null
+# 124: `timeout` stopped QEMU just as the loop saw it gone.
+[ $? -eq 124 ] && timed_out=1
 
-echo ""
-echo "=== Serial Output ==="
-cat "$SERIAL_LOG"
-echo ""
+echo "----- BIOS boot: serial output (tail) -----"
+tail -40 "$SERIAL_LOG"
+echo "-------------------------------------------"
 
-# Check for expected output - most advanced first
-if grep -q "virtio-blk.*Read sector 0 OK" "$SERIAL_LOG"; then
-    echo "========================================="
-    echo "  MILESTONE 9 COMPLETE: VirtIO Block Device!"
-    echo "========================================="
-    echo "  - VirtIO-blk driver initialization"
-    echo "  - Sector read/write operations"
-    echo "  - DMA buffer management"
-    echo "  - Ready for filesystem!"
-    exit 0
-elif grep -q "\[syscall\] exit" "$SERIAL_LOG"; then
-    echo "========================================="
-    echo "  MILESTONE 8 COMPLETE: Userspace + Syscalls!"
-    echo "========================================="
-    echo "  - Ring 0 -> Ring 3 transition"
-    echo "  - User program execution"
-    echo "  - SYSCALL/SYSRET mechanism"
-    echo "  - First userspace syscall!"
-    exit 0
-elif grep -q "Task.*done" "$SERIAL_LOG"; then
-    echo "========================================="
-    echo "  MILESTONE 7 COMPLETE: Scheduler!"
-    echo "========================================="
-    echo "  - Task Control Blocks (TCB)"
-    echo "  - Context switching"
-    echo "  - Per-CPU ready queues"
-    echo "  - Cooperative multitasking"
-    TASK_COUNT=$(grep -c "Task.*done" "$SERIAL_LOG" || echo "0")
-    echo "  - $TASK_COUNT tasks completed!"
-    exit 0
-elif grep -q "AP.*started" "$SERIAL_LOG"; then
-    echo "========================================="
-    echo "  MILESTONE 6 COMPLETE: APIC & Multi-core!"
-    echo "========================================="
-    echo "  - ACPI/MADT parsing for APIC discovery"
-    echo "  - Local APIC and I/O APIC initialization"
-    echo "  - AP bootstrap via INIT/SIPI sequence"
-    AP_COUNT=$(grep -c "AP.*started" "$SERIAL_LOG" || echo "0")
-    echo "  - $AP_COUNT Application Processor(s) started!"
-    exit 0
-elif grep -q "Hello from Harland" "$SERIAL_LOG"; then
-    echo "========================================="
-    echo "  Boot successful (single core)"
-    echo "========================================="
-    exit 0
-else
-    echo "FAIL: Kernel boot failed - expected output not found"
+if grep -aqE "EXCEPTION|KERNEL PANIC" "$SERIAL_LOG"; then
+    grep -aE "EXCEPTION|KERNEL PANIC" "$SERIAL_LOG" | head -5
+    echo "FAIL (bios): kernel panic or exception during boot"
     exit 1
 fi
+if ! grep -aq "ALL TESTS PASSED" "$SERIAL_LOG"; then
+    [ "$timed_out" = 1 ] && echo "FAIL (bios): no verdict within ${TIMEOUT}s (BOOT_TIMEOUT)"
+    echo "FAIL (bios): init's Tier-1 suite did not report ALL TESTS PASSED"
+    exit 1
+fi
+echo "PASS (bios): init Tier-1 suite: ALL TESTS PASSED"
+exit 0
