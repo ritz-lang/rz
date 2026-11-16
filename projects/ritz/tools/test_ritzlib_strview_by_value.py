@@ -69,6 +69,48 @@ def test_allowlist_has_no_stale_entries():
     assert not stale, f"allowlisted params no longer exist; drop them: {stale}"
 
 
+# tome and spire took the same rewrite (#3155): their lib/ and test/ trees.
+PROJECTS = RITZLIB.parent.parent
+PACKAGES = ("tome", "spire")
+
+# (package-relative file, function, param) -> why it is not by value
+PACKAGE_ALLOWED = {
+    ("spire", "test/support/test_utils.ritz", "response_find_header", "out"): (
+        "output param: the header value is written through it"
+    ),
+}
+
+
+def package_pointer_params():
+    """Yield (pkg, relpath, fn, param, sigil, lineno) over tome's and spire's sources."""
+    for pkg in PACKAGES:
+        root = PROJECTS / pkg
+        for sub in ("lib", "test"):
+            for rel, fn, p, sig, ln in strview_pointer_params(root / sub):
+                yield pkg, f"{sub}/{rel}", fn, p, sig, ln
+
+
+@pytest.mark.unit
+def test_packages_have_no_pointer_strview_param_outside_allowlist():
+    # A moved package would otherwise scan nothing and pass.
+    for pkg in PACKAGES:
+        assert (PROJECTS / pkg / "lib").is_dir(), f"projects/{pkg}/lib is gone"
+    found = list(package_pointer_params())
+    bad = [
+        f"projects/{pkg}/{rel}:{ln}: {fn}({p}: {sig}StrView)"
+        for pkg, rel, fn, p, sig, ln in found
+        if (pkg, rel, fn, p) not in PACKAGE_ALLOWED
+    ]
+    assert not bad, "read-only StrView params must be by value (#3155):\n" + "\n".join(bad)
+
+
+@pytest.mark.unit
+def test_package_allowlist_has_no_stale_entries():
+    present = {(pkg, rel, fn, p) for pkg, rel, fn, p, _, _ in package_pointer_params()}
+    stale = sorted(set(PACKAGE_ALLOWED) - present)
+    assert not stale, f"allowlisted params no longer exist; drop them: {stale}"
+
+
 @pytest.mark.unit
 def test_scanner_sees_each_pointer_spelling(tmp_path):
     (tmp_path / "m.ritz").write_text(
