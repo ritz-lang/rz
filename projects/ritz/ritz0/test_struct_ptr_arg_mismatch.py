@@ -175,18 +175,9 @@ REJECTS = {
 }
 
 
-# ritz0's #1366 check is llvmlite's LLVM-type comparison, so two user structs
-# with identical field types pass it, and a method, UFCS or static-method call
-# (whatever the layout) is not checked at all.  Strict: these go red when #1960 lands.
-RITZ0_SAME_LAYOUT_GAP = {"addr_of_local", "ptr_local", "method", "ufcs", "static"}
-
-
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(REJECTS))
-def test_struct_ptr_arg_mismatch_rejected(compiler, case, tmp_path, request):
-    if compiler == "ritz0" and case in RITZ0_SAME_LAYOUT_GAP:
-        request.applymarker(pytest.mark.xfail(
-            strict=True, reason="AGAST #1960 — ritz0 compares LLVM layout, not struct identity"))
+def test_struct_ptr_arg_mismatch_rejected(compiler, case, tmp_path):
     src, line, callee, argno = REJECTS[case]
     proc, ll = _compile(compiler, tmp_path, src)
     out = proc.stdout + proc.stderr

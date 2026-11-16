@@ -4122,6 +4122,46 @@ class LLVMEmitter:
             self._check_place_sign(arg, param.type, fname, argno)
         return val
 
+    def _pointee_struct(self, ty: Optional[rast.Type]) -> Optional[str]:
+        """The user struct a `*S` / `@S` / `@&S` points at, or None when `ty`
+        isn't a pointer to a plain (non-generic) struct after aliases."""
+        if ty is None:
+            return None
+        ty = resolve_alias_in(ty, self.type_aliases)
+        if not isinstance(ty, (rast.PtrType, rast.RefType)):
+            return None
+        inner = resolve_alias_in(ty.inner, self.type_aliases)
+        if (isinstance(inner, rast.NamedType) and not inner.args
+                and inner.name in self.struct_types):
+            return inner.name
+        return None
+
+    def _check_struct_ptr_arg(self, arg: rast.Expr, param: rast.Param,
+                              fname: str, argno: int) -> None:
+        """AGAST #1960: a pointer to struct A is no pointer to struct B.
+
+        llvmlite's CallInstr check (#1366) compares LLVM types, so two
+        structs with the same fields passed it, and a method, UFCS or static
+        call's argument wasn't compared at all. Here the Ritz struct the
+        argument points at is compared with the parameter's, by name, as
+        ritz1 does (#1948). Only the shapes whose pointee is certain are
+        judged: `@x` / `@&x` of a struct place, and a local holding a
+        pointer to a struct. A cast (`@a as *B`) is the programmer's call.
+        """
+        want = self._pointee_struct(param.type)
+        if want is None:
+            return
+        if isinstance(arg, rast.UnaryOp) and arg.op in self._ADDR_OPS:
+            got = self._pointee_struct(self._infer_ritz_type(arg))
+        elif isinstance(arg, rast.Ident) and arg.name in self.ritz_types:
+            got = self._pointee_struct(self.ritz_types[arg.name])
+        else:
+            return
+        if got is not None and got != want:
+            raise EmitError(
+                f"argument {argno} of `{fname.partition('$')[0]}` has the wrong "
+                f"type: *{got} != *{want}", arg.span)
+
     _UNSIGNED = frozenset(('u8', 'u16', 'u32', 'u64'))
 
     def _check_place_sign(self, arg: rast.Expr, want: rast.Type,
@@ -11889,6 +11929,7 @@ class LLVMEmitter:
             for i, arg in enumerate(call.args):
                 param_def = fn_def.params[i]
                 expected_type = self._fn_param_types(fn)[i]
+                self._check_struct_ptr_arg(arg, param_def, fname, i + 1)
                 self._literal_into_slot(param_def.type, arg)
                 self._float_slot(param_def.type, arg)
 
@@ -13513,6 +13554,7 @@ class LLVMEmitter:
             all_args = []
             for i, arg in enumerate(expr.args):
                 if i < len(fn_def.params):
+                    self._check_struct_ptr_arg(arg, fn_def.params[i], expr.method, i + 1)
                     self._literal_into_slot(fn_def.params[i].type, arg)
                     self._float_slot(fn_def.params[i].type, arg)
                 if i < len(fn_def.params) and self._takes_place(fn_def.params[i]):
@@ -13627,6 +13669,7 @@ class LLVMEmitter:
         for j, arg in enumerate(expr.args, start=1):
             expected_type = self._fn_param_types(fn)[j] if j < len(self._fn_param_types(fn)) else None
             if j < len(fn_def.params):
+                self._check_struct_ptr_arg(arg, fn_def.params[j], expr.method, j + 1)
                 self._literal_into_slot(fn_def.params[j].type, arg)
                 self._float_slot(fn_def.params[j].type, arg)
             if j < len(fn_def.params) and self._takes_place(fn_def.params[j]):
