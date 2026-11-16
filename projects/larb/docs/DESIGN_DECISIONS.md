@@ -24,9 +24,17 @@ This document captures the finalized design decisions for Ritz, prioritizing **s
 
 ## 1. Ownership & Borrowing (Finalized)
 
-> **Superseded in part.** `x: T` as a const borrow was overtaken by #1854: a by-value
-> parameter of a move-only type takes ownership. The bare `:&` call in §1.2 stands. See
-> [rulings-2026-11.md](../review/4/rulings-2026-11.md), R1.
+> **Superseded in part.** `x: T` isn't a const borrow for any type. #1854 overtook it:
+> a by-value parameter of a move-only type takes ownership, and every other type is
+> copied. A write to the parameter inside the callee doesn't reach the caller, and a
+> write to the caller's value during the call doesn't reach the parameter. #2415
+> measured this on ritz0, ritz1 and ritz1_selfhosted at `ac59800` for a scalar, a
+> struct, an array, a global passed whole and a by-value `self`, with a `:&` control
+> that does see the write. [test_by_value_param_copies.ritz](../../ritz/ritz0/test/test_by_value_param_copies.ritz)
+> and [test_by_value_self.py](../../ritz/ritz0/test_by_value_self.py) pin it. By-value
+> `self` was the one exception, because ritz1 passed it as the caller's place. R10
+> ruled it a by-value parameter, and #2393 fixed ritz1. The bare `:&` call in §1.2
+> stands. See [rulings-2026-11.md](../review/4/rulings-2026-11.md), R1 and R10.
 
 ### 1.1 Colon-Modifier Syntax
 
