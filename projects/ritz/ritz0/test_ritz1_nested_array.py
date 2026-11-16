@@ -931,6 +931,27 @@ pub fn main() -> i32
         w = g[1][1].peek() + g[0][1].peek() + D * 100
     return w + D + 26
 """,
+    # AGAST #3379 (LARB R40): a row of a `[2][3][2]u8` is a `[3][2]u8`, walked
+    # in turn.  Cell (i, j, k) holds 6i + 2j + k: row[2][1] is 5 then 11, each
+    # r[0] 6i + 2j (0 + 2 + 4 + 6 + 8 + 10): 46 over 6 inner trips.
+    "for_in": """\
+pub fn main() -> i32
+    var g: [2][3][2]u8
+    for i in 0..2
+        for j in 0..3
+            for k in 0..2
+                g[i][j][k] = (6 * i + 2 * j + k) as u8
+    var t: i32 = 0
+    var n: i32 = 0
+    for row in g
+        t = t + (row[2][1] as i32)
+        for r in row
+            n = n + 1
+            t = t + (r[0] as i32)
+    if n != 6
+        return 1
+    return t - 4
+""",
 }
 
 
@@ -1120,14 +1141,6 @@ pub fn main() -> i32
     var g: [2][3]i32
     return take(g[1] as i64)
 """, ":6:", "a row or a struct element of a multi-dimensional array is not a value"),
-    # A `[N][M]T` is walked by rows since #2410; a row of this is itself 2-D.
-    "for_in": ("""\
-pub fn main() -> i32
-    var g: [2][3][2]u8
-    for row in g
-        return 1
-    return 0
-""", ":3:", "iterating a multi-dimensional array is not supported"),
     "generic_arg": ("""\
 struct Box<T>
     v: T

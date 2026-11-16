@@ -15,6 +15,7 @@ gets a temporary, which nothing else can reach.  test_writes_in_the_body pins it
 Each program returns 0, or the number of the first check that failed.
 """
 
+import itertools
 import os
 import re
 import subprocess
@@ -927,9 +928,6 @@ def test_a_large_field_is_walked_to_its_end(run_with, compiler):
     assert run_with(compiler, "big_run", program) == 0
 
 
-_ND = "    var t: i32 = 3\n    for r in {it}\n        t = t + 0\n    return t\n"
-ND_MESSAGE = "iterating a multi-dimensional array is not supported in ritz1"
-
 # AGAST #2410: `for r in m` over a `[N][M]T` binds each row, itself a `[M]T`.  A
 # write to a later row shows when the loop gets there: 1 + 2 + 4 + 50 + 16 + 32.
 _ROWS = ("    var t: i32 = 0\n    var k: i32 = 0\n    for r in {it}\n"
@@ -979,15 +977,12 @@ RANK3 = {
     "rank3_global": ("var g: [2][3][4]i32\n\n" + MAIN + _PLANES, 42),
 }
 
-# ritz1 refuses rank-3+ iteration (NOT_LOWERED_ND below) until #3379 lowers it.
-RANK3_GAPS = {name: 3379 for name in RANK3}
-
 
 # One table per compiler (test_row_table.py), not a parametrised matrix.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_plane_binding_walks_a_rank3_array(tmp_path, compiler):
-    assert_runs(compiler, tmp_path, RANK3, {} if compiler == "ritz0" else RANK3_GAPS)
+    assert_runs(compiler, tmp_path, RANK3)
 
 
 # A row is a copy of its row, as an element is, taken before the body runs.
@@ -1035,11 +1030,85 @@ def test_a_row_binding_is_a_let(compile_with, compiler):
     assert "4:9:" in out and "cannot assign through `let` binding `r`; declare it `var`" in out, out
 
 
-# A row of a 3-D array is itself 2-D, and stays refused (#1509).
-NOT_LOWERED_ND = {
-    "local": (MAIN + "    var m: [2][2][2]i32\n" + _ND.format(it="m")),
-    "global": ("var m: [2][2][2]i32\n\n" + MAIN + _ND.format(it="m")),
+# AGAST #3379 (LARB R40, spec §6.3): a row of a rank-3+ array is itself N-D, a
+# plane, and binds as the `[M][N]..T` local `let p: [M][N]T = g[i]` declares.
+# Cell values are distinct, so a wrong stride, a flattened walk or a short trip
+# count lands on a check (1-4) rather than 42.  Rows: rank 4 (a plane of a
+# plane), a sub-plane `g[1]` (the index path), a field, a global `u8` array, a
+# struct leaf, a bool leaf, and a plane taken as a copy before the body writes the array.
+def _cells(place: str, dims: tuple) -> str:
+    cells = itertools.product(*(range(d) for d in dims))
+    return "".join(f"    {place}{''.join(f'[{i}]' for i in idx)} = {n}\n"
+                   for n, idx in enumerate(cells, 1))
+
+
+_SUMS = ("    if n != {n}\n        return 1\n    if t != {t}\n        return 2\n"
+         "    if k != {k}\n        return 3\n    return 42\n")
+_TNK = "    var t: i32 = 0\n    var n: i32 = 0\n    var k: i32 = 0\n"
+
+# Cell (a, b, c, d) of `[2][2][2][3]i32` holds 12a + 6b + 3c + d + 1: 1..24.
+_RANK4 = (_TNK + "    for cube in g\n        k = k + cube[1][1][2]\n"
+          "        for plane in cube\n            for row in plane\n"
+          "                for x in row\n                    t = t + x\n"
+          "                    n = n + 1\n" + _SUMS.format(n=24, t=300, k=36))
+# g[1] holds 13..24; plane[1][2] is 18 then 24.
+_SUBPLANE = (_TNK + "    for plane in g[1]\n        k = k + plane[1][2]\n"
+             "        for row in plane\n            for x in row\n"
+             "                t = t + x\n                n = n + 1\n"
+             + _SUMS.format(n=12, t=222, k=42))
+
+
+def _rank3(place: str, ty: str = "i32") -> str:
+    """Over a `[2][3][4]` at `place`, cells 1..24: plane[2][3] is 12 then 24."""
+    cast = " as i32" if ty != "i32" else ""
+    return (_cells(place, (2, 3, 4)) + _TNK + f"    for plane in {place}\n"
+            f"        k = k + (plane[2][3]{cast})\n        for row in plane\n"
+            f"            for x in row\n                t = t + (x{cast})\n"
+            "                n = n + 1\n" + _SUMS.format(n=24, t=300, k=36))
+
+
+PLANES = {
+    "rank4": (MAIN + "    var g: [2][2][2][3]i32\n" + _cells("g", (2, 2, 2, 3)) + _RANK4, 42),
+    "rank4_subplane": (MAIN + "    var g: [2][2][2][3]i32\n" + _cells("g", (2, 2, 2, 3))
+                       + _SUBPLANE, 42),
+    "rank3_field": ("struct W\n    lo: i64\n    m: [2][3][4]i32\n    hi: i64\n\n" + MAIN
+                    + "    var w: W\n    w.lo = 7\n    w.hi = 9\n" + _rank3("w.m")
+                    .replace("    return 42\n", "    if w.lo != 7 or w.hi != 9\n        return 4\n"
+                             "    return 42\n"), 42),
+    "rank3_global_u8": ("var g: [2][3][4]u8\n\n" + MAIN + _rank3("g", "u8"), 42),
+    # Cell (i, j, l) of `[2][2][2]P` has a = 4i + 2j + l and b = 1: t is
+    # 0..7 + 8 = 36, k is plane[1][1].a, 3 then 7.
+    "rank3_struct_leaf": ("struct P\n    a: i32\n    b: u8\n\n" + MAIN
+                          + "    var g: [2][2][2]P\n    for i in 0..2\n        for j in 0..2\n"
+                          "            for l in 0..2\n"
+                          "                g[i][j][l].a = (4 * i + 2 * j + l) as i32\n"
+                          "                g[i][j][l].b = 1\n" + _TNK
+                          + "    for plane in g\n        k = k + plane[1][1].a\n"
+                          "        for row in plane\n            for p in row\n"
+                          "                t = t + p.a + (p.b as i32)\n                n = n + 1\n"
+                          + _SUMS.format(n=8, t=36, k=10), 42),
+    # A bool plane is `i1`s, as a `[M][N]bool` local is, not the `i64` a bool
+    # element binds: 3 of 8 cells true, plane[1][1] true in the second plane.
+    "rank3_bool": (MAIN + "    var g: [2][2][2]bool\n    g[0][0][1] = true\n"
+                   "    g[1][0][0] = true\n    g[1][1][1] = true\n" + _TNK
+                   + "    for plane in g\n        if plane[1][1]\n            k = k + 1\n"
+                   "        for row in plane\n            for b in row\n"
+                   "                n = n + 1\n                if b\n                    t = t + 1\n"
+                   + _SUMS.format(n=8, t=3, k=1), 42),
+    # A plane is a copy of its plane, taken before the body runs: the body's
+    # write to the current plane is not seen (4 + 1), the one to the next is (8 + 20).
+    "rank3_copy": (MAIN + "    var g: [2][2][2]i32\n" + _cells("g", (2, 2, 2))
+                   + "    var t: i32 = 0\n    for plane in g\n        g[0][1][1] = 100\n"
+                   "        g[1][0][0] = 20\n        t = t + plane[1][1] + plane[0][0]\n"
+                   "    if t != 4 + 1 + 8 + 20\n        return 1\n    return 42\n", 42),
 }
+
+
+# One table per compiler (test_row_table.py), not a parametrised matrix.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_plane_binding_is_an_nd_array(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, PLANES)
 
 
 def _is_refused(comp, ll, message, program):
@@ -1051,14 +1120,6 @@ def _is_refused(comp, ll, message, program):
     assert comp.returncode != 0, out
     assert not ll.exists()
     assert f"main.ritz:{line}:{col}: {message}" in out, out
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(NOT_LOWERED_ND))
-def test_a_multi_dimensional_array_is_refused(compile_with, compiler, name):
-    comp, ll, _ = compile_with(compiler, name, NOT_LOWERED_ND[name])
-    _is_refused(comp, ll, ND_MESSAGE, NOT_LOWERED_ND[name])
 
 
 UNSUPPORTED = "this `for` iterable is not supported in ritz1"

@@ -1879,8 +1879,7 @@ the trips, and is safe when it moves the buffer.
   element doesn't change the binding. Over an array of any rank the element is the
   array one rank down: `for plane in g` with `g: [2][2][3]u8` binds a `[2][3]u8`,
   which indexes (`plane[1][2]`) and iterates like any local of that type (LARB R40,
-  AGAST #3307; ritz1 refuses rank 3 and ritz0 can't index the plane until #3307's
-  tickets land).
+  AGAST #3307, #3379).
 - Only an rvalue gets a temporary: a call's by-value result (`for x in mk()`, or
   `mk().a`), or a literal. Nothing else can reach it, so nothing can write to it.
 - A place reached *through* a `Vec`'s element, such as `vs[0].a`, is an address
