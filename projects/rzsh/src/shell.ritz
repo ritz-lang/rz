@@ -17,11 +17,11 @@ import common {
 }
 
 import parse {
-    tokenize, g_tok_kind, g_tok_word, g_tok_count, g_last_status,
-    g_tok_next, TOK_WORD, TOK_PIPE, TOK_OUT, TOK_APPEND, TOK_IN,
-    PARSE_UNTERMINATED,
+    TokKind, Tokens, tokenize, tokens_len, tokens_kind, tokens_word,
+    tokens_is_word, tokens_drop, g_last_status, PARSE_UNTERMINATED,
     var_set, var_lookup, var_unset, var_export, assignment_pos, is_valid_name,
-    var_exported_name, var_value, vars_build_envp, MAX_VARS
+    vars_count, var_exported_name, var_value,
+    Envp, vars_build_envp, envp_ptr, envp_drop
 }
 
 import os {
@@ -78,8 +78,8 @@ fn cmd_pwd() -> i32
 
 fn cmd_export(argc: i32) -> i32
     if argc == 1
-        var idx: i32 = 0
-        while idx < MAX_VARS
+        var idx: i64 = 0
+        while idx < vars_count()
             let name: *u8 = var_exported_name(idx)
             if name != null
                 puts(c"export ")
@@ -138,12 +138,13 @@ pub fn cmd_ls(argc: i32) -> i32
 
 fn exec_external(argc: i32) -> i32
     g_argv[argc] = null
-    var envp: [128]*u8
-    vars_build_envp(@envp[0], 128)
+    var envp: Envp = vars_build_envp()
     var search: *u8 = var_lookup(c"PATH", 4)
     if search == null
         search = os_default_path()
-    return os_spawn_search(g_argv[0], search, @g_argv[0], @envp[0])
+    let status: i32 = os_spawn_search(g_argv[0], search, @g_argv[0], envp_ptr(@envp))
+    envp_drop(@&envp)
+    return status
 
 # The builtin `ls` takes only `ls [DIR]`; with options, the system's ls runs.
 fn has_option(argc: i32) -> bool
@@ -184,30 +185,30 @@ fn dispatch(argc: i32) -> i32
 # Simple command: words + redirections over tokens [start, end)
 # ============================================================================
 
-fn run_command(start: i32, end: i32) -> i32
+fn run_command(tk: @Tokens, start: i64, end: i64) -> i32
     var argc: i32 = 0
     var out_path: *u8 = null
     var out_append: bool = false
     var in_path: *u8 = null
 
-    var t: i32 = start
+    var t: i64 = start
     while t < end
-        let kind: i32 = g_tok_kind[t]
-        if kind == TOK_WORD
+        let kind: TokKind = tokens_kind(tk, t)
+        if kind == TokKind.Word
             if argc >= MAX_ARGS - 1
                 eputs(c"rzsh: too many arguments\n")
                 return 2
-            g_argv[argc] = g_tok_word[t]
+            g_argv[argc] = tokens_word(tk, t)
             argc = argc + 1
         else
-            if t + 1 >= end or g_tok_kind[t + 1] != TOK_WORD
+            if t + 1 >= end or not tokens_is_word(tk, t + 1)
                 eputs(c"rzsh: syntax error: redirection needs a file name\n")
                 return 2
-            if kind == TOK_IN
-                in_path = g_tok_word[t + 1]
+            if kind == TokKind.In
+                in_path = tokens_word(tk, t + 1)
             else
-                out_path = g_tok_word[t + 1]
-                out_append = kind == TOK_APPEND
+                out_path = tokens_word(tk, t + 1)
+                out_append = kind == TokKind.Append
             t = t + 1
         t = t + 1
 
@@ -277,14 +278,14 @@ fn run_command(start: i32, end: i32) -> i32
 # Pipeline over tokens [start, end)
 # ============================================================================
 
-fn run_pipeline(start: i32, end: i32) -> i32
+fn run_pipeline(tk: @Tokens, start: i64, end: i64) -> i32
     # Stage boundaries; an empty stage is a syntax error.
-    var bounds: [17]i32
+    var bounds: [17]i64
     var stages: i32 = 0
     bounds[0] = start
-    var t: i32 = start
+    var t: i64 = start
     while t <= end
-        if t == end or g_tok_kind[t] == TOK_PIPE
+        if t == end or tokens_kind(tk, t) == TokKind.Pipe
             if t == bounds[stages]
                 eputs(c"rzsh: syntax error near '|'\n")
                 return 2
@@ -296,7 +297,7 @@ fn run_pipeline(start: i32, end: i32) -> i32
         t = t + 1
 
     if stages == 1
-        return run_command(start, end)
+        return run_command(tk, start, end)
 
     if not os_has_fd_control()
         eputs(c"rzsh: pipes are not supported on this system\n")
@@ -321,7 +322,7 @@ fn run_pipeline(start: i32, end: i32) -> i32
                 os_dup2(fds[1], 1)
                 os_close(fds[1])
                 os_close(fds[0])
-            sys_exit(run_command(bounds[s], bounds[s + 1] - 1))
+            sys_exit(run_command(tk, bounds[s], bounds[s + 1] - 1))
         if prev_read >= 0
             os_close(prev_read)
             prev_read = -1
@@ -349,15 +350,15 @@ fn run_pipeline(start: i32, end: i32) -> i32
 pub fn run_line(line: *u8) -> i32
     var pos: i64 = 0
     while pos >= 0
-        let n: i32 = tokenize(line, pos)
-        if n < 0
-            if n == PARSE_UNTERMINATED
-                eputs(c"rzsh: syntax error: unterminated quote\n")
-            else
-                eputs(c"rzsh: line too long\n")
+        var tk: Tokens = tokenize(line, pos)
+        if tk.err == PARSE_UNTERMINATED
+            eputs(c"rzsh: syntax error: unterminated quote\n")
+            tokens_drop(@&tk)
             g_last_status = 2
             return 2
+        let n: i64 = tokens_len(@tk)
         if n > 0
-            g_last_status = run_pipeline(0, n)
-        pos = g_tok_next
+            g_last_status = run_pipeline(@tk, 0, n)
+        pos = tk.next
+        tokens_drop(@&tk)
     return g_last_status
