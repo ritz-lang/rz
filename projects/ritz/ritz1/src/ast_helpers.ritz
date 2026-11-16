@@ -2412,22 +2412,26 @@ fn is_word_type_name(name: *u8, len: i32) -> i32
         return 1
     0
 
+# AGAST #3464 (LARB R53): the type a word type name is, given
+# is_word_type_name(name, ..) == 1: `usize` is u64, `isize` is i64.
+fn word_type(name: *u8) -> i32
+    if *name == 117  # 'u'
+        return TYPE_U64
+    TYPE_I64
+
 pub fn type_named(p: *Parser, name: *u8, len: i32) -> i32
     # AGAST #1475: a type alias resolves to its target's parse state.
     if g_alias_count > 0
         let alias_ty: i32 = type_alias_resolve(p, name, len)
         if alias_ty != TYPE_VOID
             return alias_ty
-    # AGAST #2198: `usize` / `isize` are TYPE_I64, not a TYPE_STRUCT named
-    # "usize".  Every path that branches on the type code (a struct field's
-    # store, a pointee's load, an array element) took its struct arm and wrote
-    # `%usize`, which clang rejects as an opaque type.  Both are TYPE_I64, not
-    # usize TYPE_U64: ritz1 has always lowered a usize as a signed i64 (ashr,
-    # sdiv, icmp slt, sext), and whether usize is unsigned is #2363's call —
-    # this is the one line to change if it is.  A generic argument keeps its
-    # source spelling (`Vec$usize`, capture_first_generic_arg).
+    # AGAST #2198: `usize` / `isize` are primitives, not a TYPE_STRUCT named
+    # "usize" (which wrote `%usize`, an opaque type clang rejects).  AGAST
+    # #3464 (LARB R53): `usize` is another name for `u64` and `isize` for
+    # `i64`, so a usize is unsigned (lshr, udiv, icmp ult, uitofp).  A generic
+    # argument keeps its source spelling (`Vec$usize`, capture_first_generic_arg).
     if is_word_type_name(name, len) == 1
-        return TYPE_I64
+        return word_type(name)
     # Float types: f32 / f64 are first-class type kinds, not TYPE_STRUCT+name.
     # Detect by exact name and return the proper kind so downstream type-
     # tracking (get_expr_type, param_type, etc.) doesn't fall through to
@@ -3426,7 +3430,7 @@ pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
         ga.name = c"unit"
         ga.name_len = 4
     else if p.pos > 0 and is_word_type_name((p.tokens + p.pos - 1).start, (p.tokens + p.pos - 1).len) == 1
-        # AGAST #2198: `usize` parses to TYPE_I64 but mangles as written,
+        # AGAST #2198: `usize` parses to TYPE_U64 (#3464) but mangles as written,
         # `Vec$usize`, as ritz0 spells it and as for_word_elem reads it back.
         # Read off the token just consumed, so no parse state can go stale.
         let tok: *Token = p.tokens + p.pos - 1
@@ -3693,8 +3697,10 @@ pub fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
     if ga.ty == TYPE_STRUCT or ga.ty == TYPE_PTR or ga.ty == TYPE_PTR_PTR or ga.ty == TYPE_ARRAY or ga.ty == TYPE_VOID or ga.ty == TYPE_REF or ga.ty == TYPE_MUT_REF
         *out = ga.name
         return ga.name_len
-    if ga.ty == TYPE_I64 and ga.name != null and ga.name_len > 0
-        *out = ga.name   # AGAST #2198: `usize` / `isize`, as written
+    # AGAST #2198: `usize` / `isize`, as written (`Vec$usize`).  AGAST #3464:
+    # `usize` is TYPE_U64 now; its spelling is unchanged.
+    if (ga.ty == TYPE_I64 or ga.ty == TYPE_U64) and ga.name != null and ga.name_len > 0
+        *out = ga.name
         return ga.name_len
     return primitive_arg_spelling(ga.ty, out)
 
@@ -7441,9 +7447,9 @@ pub fn primitive_type_from_name(name: *u8, len: i32) -> i32
         if memcmp(name, c"bool", 4) == 0
             return TYPE_BOOL
     # AGAST #2198: as type_named parses them, so a monomorph's `v: T` at
-    # T = usize (`Box$usize`) is the i64 field a written `v: usize` is.
+    # T = usize (`Box$usize`) is the u64 field a written `v: usize` is.
     if is_word_type_name(name, len) == 1
-        return TYPE_I64
+        return word_type(name)
     0
 
 # `enum Slot<A, B>`'s parameters, read off the source after its name: the
