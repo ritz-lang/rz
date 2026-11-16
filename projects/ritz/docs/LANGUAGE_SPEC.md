@@ -5359,10 +5359,26 @@ fn main() -> i32
 Keeping the future is still allowed.  `var p: f_Future = f(args)` hands it to
 an executor that polls it with `f_poll(@p)` (see `examples/tier5_async/64_async_io`).
 
-Binding an untyped awaited value (`let v = await fetch(x)`) currently fails to
-lower — the transform does not add the temporary to the generated future
-struct, so it reports `Unknown field v in struct go_Future`. Give the binding a
-type (`let v: i32 = await fetch(x)`).
+An awaited value may be bound without a type (AGAST #1318).  Inside an
+`async fn` the binding lives in the fn's future, as an `i32`, the type its
+poll returns:
+
+```ritz
+async fn fetch(x: i32) -> i32
+    x
+
+async fn go(x: i32) -> i32
+    let v = await fetch(x)
+    v + 1
+
+fn main() -> i32
+    let r: i32 = await go(4)
+    r - 5
+```
+
+Any other untyped local in an `async fn` that awaits (`let y = x + 1`, or
+`let v = (await fetch(x)) + 1`) currently fails to lower, with `Unknown field y
+in struct go_Future`.  Give such a local a type (AGAST #3762).
 
 ### 16.3 Runtime
 

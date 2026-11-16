@@ -124,12 +124,18 @@ class AsyncAnalyzer:
     def _analyze_stmt(self, stmt: rast.Stmt):
         """Analyze a statement."""
         if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
+            # An untyped binding of an await (`let v = await f(x)`) holds the
+            # poll's value, an i32 (AGAST #1318).  Left as None, `v` got no
+            # field in the future struct while the constructor still set it.
+            local_type = stmt.type
+            if local_type is None and isinstance(stmt.value, rast.Await):
+                local_type = rast.NamedType(span=stmt.span, name='i32')
             # Track the let target for await point association
-            self.current_let_target = (stmt.name, stmt.type)
+            self.current_let_target = (stmt.name, local_type)
             if stmt.value:
                 self._analyze_expr(stmt.value)
             self.current_let_target = None
-            self.current_locals[stmt.name] = stmt.type
+            self.current_locals[stmt.name] = local_type
         elif isinstance(stmt, rast.ExprStmt):
             self._analyze_expr(stmt.expr)
         elif isinstance(stmt, rast.AssignStmt):

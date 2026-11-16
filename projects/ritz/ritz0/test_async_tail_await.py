@@ -40,6 +40,9 @@ ROWS = {
     # the final state read only the body's tail, and it had none.
     "return_await": ("    return await fetch(x)\n", 7),
     "statement": ("    await fetch(x)\n    x + 2\n", 9),
+    # AGAST #1318: an untyped binding takes the poll's i32.  Its None type kept
+    # `v` out of go_Future while the constructor still set it: "Unknown field v".
+    "untyped_let": ("    let v = await fetch(x)\n    v + 1\n", 8),
 }
 
 
