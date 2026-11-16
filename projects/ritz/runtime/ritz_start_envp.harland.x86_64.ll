@@ -15,6 +15,10 @@
 target triple = "x86_64-unknown-none"
 target datalayout = ""
 
+; AGAST #3737: the kernel's envp, for ritzlib.os.env. Weak: ritzlib/os/env.ritz
+; defines it too (one storage after linking); without os/env this one stands.
+@__ritz_envp = weak global i8** null
+
 declare i32 @main(i32 %argc, i8** %argv, i8** %envp)
 
 define void @_start() naked {
@@ -23,6 +27,7 @@ entry:
     # argc is already in RDI, argv is already in RSI
     # envp would be in RDX (currently NULL on Harland)
     # Just align the stack and call main
+    movq %rdx, __ritz_envp(%rip)
     andq $$-16, %rsp
     subq $$8, %rsp
     call main

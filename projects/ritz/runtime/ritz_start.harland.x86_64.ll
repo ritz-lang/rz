@@ -14,6 +14,10 @@
 target triple = "x86_64-unknown-none"
 target datalayout = ""
 
+; AGAST #3737: the kernel's envp, for ritzlib.os.env. Weak: ritzlib/os/env.ritz
+; defines it too (one storage after linking); without os/env this one stands.
+@__ritz_envp = weak global i8** null
+
 declare i32 @main(i32 %argc, i8** %argv)
 
 define void @_start() naked {
@@ -21,12 +25,13 @@ entry:
   call void asm sideeffect "
     # argc is already in RDI, argv is already in RSI
     # Just align the stack and call main
+    movq %rdx, __ritz_envp(%rip)
     andq $$-16, %rsp
     subq $$8, %rsp
     call main
     movq %rax, %rdi
     movq $$20, %rax
     syscall
-  ", "~{rax},~{rdi},~{rsi},~{rsp},~{rcx},~{r11},~{memory}"()
+  ", "~{rax},~{rdi},~{rsi},~{rdx},~{rsp},~{rcx},~{r11},~{memory}"()
   unreachable
 }

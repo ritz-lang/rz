@@ -27,6 +27,10 @@
 target triple = "x86_64-pc-linux-gnu"
 target datalayout = ""
 
+; AGAST #3737: the kernel's envp, for ritzlib.os.env. Weak: ritzlib/os/env.ritz
+; defines it too (one storage after linking); without os/env this one stands.
+@__ritz_envp = weak global i8** null
+
 declare i32 @ritz_start(i32 %argc, i8** %argv, i8** %envp)
 
 define void @_start() naked {
@@ -38,6 +42,7 @@ entry:
     addq $$1, %rax
     shlq $$3, %rax
     leaq 8(%rsp,%rax), %rdx
+    movq %rdx, __ritz_envp(%rip)
     andq $$-16, %rsp
     call ritz_start
     movq %rax, %rdi

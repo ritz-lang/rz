@@ -11,12 +11,17 @@
 target triple = "x86_64-unknown-none"
 target datalayout = ""
 
+; AGAST #3737: the kernel's envp, for ritzlib.os.env. Weak: ritzlib/os/env.ritz
+; defines it too (one storage after linking); without os/env this one stands.
+@__ritz_envp = weak global i8** null
+
 declare i32 @ritz_start(i32 %argc, i8** %argv, i8** %envp)
 
 define void @_start() naked {
 entry:
   call void asm sideeffect "
     xorq %rdx, %rdx
+    movq %rdx, __ritz_envp(%rip)
     andq $$-16, %rsp
     subq $$8, %rsp
     call ritz_start

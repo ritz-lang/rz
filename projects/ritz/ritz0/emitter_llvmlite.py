@@ -6040,9 +6040,22 @@ class LLVMEmitter:
         #   ...          envp[0], envp[1], ..., NULL
         #
         # For 3-arg main: envp = &argv[argc+1] = argv + (argc+1)*8
+        #
+        # Every shape also stores envp in `__ritz_envp` (AGAST #3737), which
+        # ritzlib.os.env reads first: /proc/self/environ is closed to a
+        # process that isn't dumpable.  Same as the runtime/*.ll shims.
+        self._define_ritz_envp()
+        store_envp = "    movq %rdx, __ritz_envp(%rip)"
+        if self.target_os == 'harland':
+            # Harland passes argc/argv in RDI/RSI and envp in RDX (NULL today).
+            envp_asm = store_envp
+        else:
+            envp_asm = ("    movq (%rsp), %rdi\n"
+                        "    leaq 16(%rsp,%rdi,8), %rdx\n" + store_envp)
         if main_takes_envp:
             # 3-argument main(argc, argv, envp)
             asm_str = f"""
+{envp_asm}
     movq (%rsp), %rdi
     leaq 8(%rsp), %rsi
     leaq 8(%rsi,%rdi,8), %rdx
@@ -6055,6 +6068,7 @@ class LLVMEmitter:
         elif main_takes_args:
             # 2-argument main(argc, argv)
             asm_str = f"""
+{envp_asm}
     movq (%rsp), %rdi
     leaq 8(%rsp), %rsi
     andq $$-16, %rsp
@@ -6066,6 +6080,7 @@ class LLVMEmitter:
         else:
             # 0-argument main()
             asm_str = f"""
+{envp_asm}
     andq $$-16, %rsp
     call main
     movq %rax, %rdi
@@ -6080,6 +6095,22 @@ class LLVMEmitter:
                               side_effect=True)
         builder.call(asm_ir, [])
         builder.unreachable()
+
+    def _define_ritz_envp(self) -> None:
+        """Give `__ritz_envp` (AGAST #3737) a weak null definition here.
+
+        `_start` stores the kernel's envp in it.  ritzlib/os/env.ritz defines
+        it too, in its own object or, imported, as a declaration in this
+        module: a declaration becomes the weak definition and the linker
+        keeps os/env's.  A module that already defines it is left alone.
+        """
+        g = self.module.globals.get("__ritz_envp")
+        if g is None:
+            g = ir.GlobalVariable(self.module, self.i8_ptr.as_pointer(), name="__ritz_envp")
+        elif g.initializer is not None:
+            return
+        g.linkage = "weak"
+        g.initializer = ir.Constant(g.value_type, None)
 
     def _emit_memset_function(self) -> None:
         """Emit a memset implementation for -nostdlib linking.
