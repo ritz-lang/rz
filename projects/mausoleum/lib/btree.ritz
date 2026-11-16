@@ -450,7 +450,7 @@ pub fn btree_get(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: *i
 # ============================================================================
 
 # Drop slot `pos` from a leaf. Its bytes stay where they are until
-# leaf_compact reclaims them.
+# node_compact reclaims them.
 fn leaf_remove_slot(page: *Page, pos: i32)
     let header: *BTreeNodeHeader = get_node_header(page)
     var i: i32 = pos
@@ -463,9 +463,10 @@ fn leaf_remove_slot(page: *Page, pos: i32)
         i += 1
     header.num_keys -= 1
 
-# Repack a leaf's live entries against the end of the page, so the space
-# left by replaced, deleted or split-off entries is free again.
-fn leaf_compact(page: *Page)
+# Repack a node's live entries (leaf or internal) against the end of the
+# page, so the space left by replaced, deleted or split-off entries is free
+# again.
+fn node_compact(page: *Page)
     let header: *BTreeNodeHeader = get_node_header(page)
     var copy: [4032]u8
     memcpy(@copy[0], page_data(page), PAGE_DATA_SIZE)
@@ -542,8 +543,9 @@ fn leaf_insert_entry(page: *Page, key: *u8, key_len: i32, val: *u8, val_len: i32
         return 0  # Was update
     return 1  # Was insert
 
-# Insert into internal node
-fn internal_insert_entry(page: *Page, key: *u8, key_len: i32, child_id: i64)
+# Insert into internal node. The caller makes room first; with none this
+# returns -1 and writes nothing (AGAST #3640), else 0.
+fn internal_insert_entry(page: *Page, key: *u8, key_len: i32, child_id: i64) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
     let pos: i32 = find_child_position(page, key, key_len)
     let entry_size: i32 = internal_entry_size(key_len)
@@ -558,6 +560,10 @@ fn internal_insert_entry(page: *Page, key: *u8, key_len: i32, child_id: i64)
             data_start = offset
 
     let new_offset: i32 = data_start - entry_size
+
+    # Never write over the slot directory (it grows by one slot here).
+    if new_offset < BTREE_NODE_HEADER_SIZE + (header.num_keys + 1) * BTREE_SLOT_SIZE
+        return -1
 
     # Write entry: key_len(2) + child(8) + key
     let entry: *u8 = get_entry_ptr(page, new_offset)
@@ -579,6 +585,7 @@ fn internal_insert_entry(page: *Page, key: *u8, key_len: i32, child_id: i64)
 
     write_slot(page, pos, new_offset, entry_size)
     header.num_keys += 1
+    return 0
 
 # Put key -> val into leaf `page` (pinned; this unpins it). A leaf too full
 # for it is split in two, by bytes rather than by count: the entries, old
@@ -608,7 +615,7 @@ fn leaf_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, val
         if found != 0
             leaf_remove_slot(page, pos)
         if node_free_space(page) < entry_size + BTREE_SLOT_SIZE
-            leaf_compact(page)
+            node_compact(page)
         leaf_insert_entry(page, key, key_len, val, val_len)
         *did_insert = 1 - found
         buffer_pool_unpin(tree.pool, page_id, 1)
@@ -700,60 +707,124 @@ fn leaf_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, val
     buffer_pool_unpin(tree.pool, page_id, 1)
     return 1
 
-# Split an internal node
-fn split_internal(tree: *BTree, page: *Page, page_id: i64, sep_key: *u8, sep_key_len: *i32) -> i64
+# Add separator `key` -> `child_id` to internal node `page` (pinned; this
+# unpins it), the way leaf_put adds to a leaf (AGAST #3640). A node too full
+# for it is split by bytes: of the entries, old ones in key order with the
+# new one in place, one is promoted to the parent and the rest are cut
+# around it where both halves fit and are closest to equal. Both halves are
+# rebuilt, so neither keeps the moved entries' bytes. An internal entry is at
+# most 1034 bytes plus its slot, so a full node plus one more is at most
+# 5054 bytes and such a cut always exists.
+#
+# Returns ERR_OK, 1 (split: *new_child_id is the new right node and sep_key
+# the promoted key), or < 0. On error the node is unchanged.
+fn internal_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, child_id: i64, sep_key: *u8, sep_key_len: *i32, new_child_id: *i64) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
-    let mid: i32 = header.num_keys / 2
+    let pos: i32 = find_child_position(page, key, key_len)
+    let entry_size: i32 = internal_entry_size(key_len)
+    *new_child_id = INVALID_PAGE_ID
 
-    # Allocate new internal node
-    let new_page_opt = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
-    if option_is_none<*Page>(@new_page_opt) == 1
-        return INVALID_PAGE_ID
-    let new_page: *Page = option_unwrap_or<*Page>(@new_page_opt, null)
-
-    let new_page_id: i64 = buffer_pool_page_id(tree.pool, new_page)
-    # Internal node: no LEAF flag
-
-    let new_header: *BTreeNodeHeader = get_node_header(new_page)
-    new_header.num_keys = 0
-    new_header.reserved = 0
-
-    tree.node_count += 1
-
-    # Get the middle key - this becomes the separator
-    var mid_offset: i32 = 0
-    var mid_length: i32 = 0
-    read_slot(page, mid, @mid_offset, @mid_length)
-    let mid_entry: *u8 = get_entry_ptr(page, mid_offset)
-    let mid_key_len: i32 = read_key_len(mid_entry)
-    let mid_child: i64 = read_entry_child(mid_entry)
-    *sep_key_len = mid_key_len
-    memcpy(sep_key, get_internal_entry_key(mid_entry), mid_key_len as i64)
-
-    # The child of the middle entry becomes first_child of new node
-    new_header.next_leaf = mid_child
-
-    # Move entries after mid to new page
-    var i: i32 = mid + 1
-    let num: i32 = header.num_keys
-    while i < num
+    # Bytes the node would hold after this put.
+    var used: i32 = entry_size + BTREE_SLOT_SIZE
+    for i in 0..header.num_keys
         var offset: i32 = 0
         var length: i32 = 0
         read_slot(page, i, @offset, @length)
+        used += length + BTREE_SLOT_SIZE
 
-        let entry: *u8 = get_entry_ptr(page, offset)
-        let ek_len: i32 = read_key_len(entry)
-        let ek: *u8 = get_internal_entry_key(entry)
-        let child: i64 = read_entry_child(entry)
+    if used <= BTREE_NODE_CAPACITY
+        if node_free_space(page) < entry_size + BTREE_SLOT_SIZE
+            node_compact(page)
+        internal_insert_entry(page, key, key_len, child_id)
+        buffer_pool_unpin(tree.pool, page_id, 1)
+        return ERR_OK
 
-        internal_insert_entry(new_page, ek, ek_len, child)
-        i += 1
+    # Split. Lay out the entries first, so a failure changes nothing.
+    var copy: [4032]u8
+    memcpy(@copy[0], page_data(page), PAGE_DATA_SIZE)
+    # A node holds at most 267 entries (10-byte entry header, 1-byte key and a
+    # slot each in 4016 bytes), plus the new one.
+    var offs: [512]i32      # offset of each entry in `copy`; -1 = the new one
+    var lens: [512]i32
+    var m: i32 = 0
+    for i in 0..header.num_keys
+        if i == pos
+            offs[m] = -1
+            lens[m] = entry_size
+            m += 1
+        var offset: i32 = 0
+        var length: i32 = 0
+        read_slot(page, i, @offset, @length)
+        offs[m] = offset
+        lens[m] = length
+        m += 1
+    if pos == header.num_keys
+        offs[m] = -1
+        lens[m] = entry_size
+        m += 1
 
-    # Update old page - keep only entries before mid
-    header.num_keys = mid
+    # Left keeps entries [0, up), entry `up` goes to the parent, right gets
+    # (up, m) with up's child as its first child.
+    var up: i32 = -1
+    var best_diff: i32 = BTREE_NODE_CAPACITY * 2
+    var left: i32 = 0
+    for kk in 0..m
+        let k: i32 = kk as i32
+        let right: i32 = used - left - (lens[k] + BTREE_SLOT_SIZE)
+        if left <= BTREE_NODE_CAPACITY and right <= BTREE_NODE_CAPACITY
+            var diff: i32 = left - right
+            if diff < 0
+                diff = 0 - diff
+            if diff < best_diff
+                best_diff = diff
+                up = k
+        left += lens[k] + BTREE_SLOT_SIZE
+    if up < 0
+        buffer_pool_unpin(tree.pool, page_id, 0)
+        return ERR_FULL
 
+    let new_page_opt = buffer_pool_alloc(tree.pool, PAGE_MAGIC_BTREE)
+    if option_is_none<*Page>(@new_page_opt) == 1
+        buffer_pool_unpin(tree.pool, page_id, 0)
+        return ERR_NO_MEMORY
+    let new_page: *Page = option_unwrap_or<*Page>(@new_page_opt, null)
+    let new_page_id: i64 = buffer_pool_page_id(tree.pool, new_page)
+    # Internal node: no LEAF flag
+    tree.node_count += 1
+
+    # The promoted entry: its key is the separator, its child the right
+    # node's first child.
+    let new_header: *BTreeNodeHeader = get_node_header(new_page)
+    new_header.num_keys = 0
+    new_header.reserved = 0
+    if offs[up] < 0
+        *sep_key_len = key_len
+        memcpy(sep_key, key, key_len as i64)
+        new_header.next_leaf = child_id
+    else
+        let up_entry: *u8 = @copy[offs[up]]
+        *sep_key_len = read_key_len(up_entry)
+        memcpy(sep_key, get_internal_entry_key(up_entry), *sep_key_len as i64)
+        new_header.next_leaf = read_entry_child(up_entry)
+
+    # Rebuild both halves from the copy; the old node keeps its first child.
+    header.num_keys = 0
+    for v in 0..m
+        let w: i32 = v as i32
+        if w != up
+            var target: *Page = page
+            if w > up
+                target = new_page
+            if offs[w] < 0
+                internal_insert_entry(target, key, key_len, child_id)
+            else
+                let entry: *u8 = @copy[offs[w]]
+                internal_insert_entry(target, get_internal_entry_key(entry), read_key_len(entry), read_entry_child(entry))
+
+    *new_child_id = new_page_id
     buffer_pool_unpin(tree.pool, new_page_id, 1)
-    return new_page_id
+    buffer_pool_unpin(tree.pool, page_id, 1)
+    return 1
 
 # ============================================================================
 # B-tree Insert (PUT) - Recursive implementation
@@ -798,44 +869,7 @@ fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_
             return ERR_IO
         let page2: *Page = option_unwrap_or<*Page>(@page2_opt, null)
 
-        let header: *BTreeNodeHeader = get_node_header(page2)
-        let entry_size: i32 = internal_entry_size(child_sep_len)
-        let free: i32 = node_free_space(page2)
-
-        if free >= entry_size + BTREE_SLOT_SIZE
-            # Fits without split
-            internal_insert_entry(page2, @child_sep_key[0], child_sep_len, child_new_id)
-            *new_child_id = INVALID_PAGE_ID
-            buffer_pool_unpin(tree.pool, page_id, 1)
-            return ERR_OK
-        else
-            # Need to split internal node
-            let split_id: i64 = split_internal(tree, page2, page_id, sep_key, sep_key_len)
-            if split_id == INVALID_PAGE_ID
-                buffer_pool_unpin(tree.pool, page_id, 0)
-                return ERR_NO_MEMORY
-
-            buffer_pool_unpin(tree.pool, page_id, 1)
-
-            # Insert the child separator into appropriate node
-            let cmp: i32 = key_compare(@child_sep_key[0], child_sep_len, sep_key, *sep_key_len)
-            if cmp < 0
-                let orig_opt = buffer_pool_fetch(tree.pool, page_id)
-                if option_is_none<*Page>(@orig_opt) == 1
-                    return ERR_IO
-                let orig: *Page = option_unwrap_or<*Page>(@orig_opt, null)
-                internal_insert_entry(orig, @child_sep_key[0], child_sep_len, child_new_id)
-                buffer_pool_unpin(tree.pool, page_id, 1)
-            else
-                let new_pg_opt = buffer_pool_fetch(tree.pool, split_id)
-                if option_is_none<*Page>(@new_pg_opt) == 1
-                    return ERR_IO
-                let new_pg: *Page = option_unwrap_or<*Page>(@new_pg_opt, null)
-                internal_insert_entry(new_pg, @child_sep_key[0], child_sep_len, child_new_id)
-                buffer_pool_unpin(tree.pool, split_id, 1)
-
-            *new_child_id = split_id
-            return 1  # Signal split
+        return internal_put(tree, page2, page_id, @child_sep_key[0], child_sep_len, child_new_id, sep_key, sep_key_len, new_child_id)
 
 # The longest value btree_put accepts under a key of `key_len` bytes.
 pub fn btree_max_value_len(key_len: i32) -> i32
@@ -882,7 +916,8 @@ pub fn btree_put(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: i3
         header.next_leaf = tree.root_page_id  # first_child = old root
         header.reserved = 0
 
-        # Insert separator pointing to new child
+        # Insert separator pointing to new child (always fits: the root is
+        # empty)
         internal_insert_entry(new_root, @sep_key[0], sep_key_len, new_child_id)
 
         # Clear ROOT flag from old root

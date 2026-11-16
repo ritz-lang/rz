@@ -1389,3 +1389,133 @@ fn test_btree_large_values_among_many_small_ones() -> i32
     btree_destroy(tree)
     buffer_pool_destroy(pool)
     0
+
+# ============================================================================
+# Long keys in internal nodes (AGAST #3640)
+# ============================================================================
+#
+# split_internal split by count and never compacted, and internal_insert_entry
+# wrote wherever the data area ended: with keys near BTREE_MAX_KEY_SIZE an
+# internal node could be left with too little room, and the next separator
+# overran its slot directory.
+
+# Key `n` (make_key's 12 bytes, so keys order by n), padded with 'x' to
+# `len` bytes.
+fn long_key(n: i32, len: i32, buf: *u8) -> i32
+    make_key(n, buf)
+    if len > 12
+        memset(buf + 12, 120, (len - 12) as i64)
+    return len
+
+# The n make_key wrote into the first 12 bytes of `key`.
+fn key_number(key: *u8) -> i32
+    var n: i32 = 0
+    for j in 4..12
+        n = n * 10 + (key[j] - 48) as i32
+    return n
+
+# 0 if a full scan visits exactly `expect` keys in strictly increasing order.
+fn scan_is_ordered(tree: *BTree, expect: i64) -> i32
+    var iter_opt = btree_scan(tree, null, 0, null, 0)
+    if option_is_none<*BTreeIter>(@iter_opt) == 1
+        return 1
+    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var seen: i64 = 0
+    var prev: i32 = -1
+    var rc: i32 = 0
+    while btree_iter_valid(iter) != 0 and rc == 0
+        var key: [1024]u8
+        var key_len: i32 = 0
+        btree_iter_key(iter, @key[0], @key_len)
+        let n: i32 = key_number(@key[0])
+        if key_len < 12 or n <= prev
+            rc = 2
+        prev = n
+        seen += 1
+        btree_iter_next(iter)
+    btree_iter_destroy(iter)
+    if rc != 0
+        return rc
+    if seen != expect
+        return 3
+    0
+
+# Mixed key lengths up to the maximum, inserted in scrambled order: enough
+# separators to split internal nodes several times over.
+[[test]]
+fn test_btree_long_keys_split_internal_nodes() -> i32
+    var pool: *BufferPool = big_test_pool()
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return 10
+    var key: [1024]u8
+    var val: [16]u8
+    for ii in 0..400
+        let i: i32 = ii as i32
+        let n: i32 = (i * 7919) % 100003
+        let kl: i32 = long_key(n, 1024 - (i % 4) * 300, @key[0])
+        fill_value(@val[0], 8, 65 + i % 26)
+        if btree_put(tree, @key[0], kl, @val[0], 8) != ERR_OK
+            return 1
+    if btree_count(tree) != 400
+        return 2
+    # Internal nodes split, and so did their parents.
+    if btree_height(tree) < 4
+        return 3
+    for ii in 0..400
+        let i: i32 = ii as i32
+        let n: i32 = (i * 7919) % 100003
+        let kl: i32 = long_key(n, 1024 - (i % 4) * 300, @key[0])
+        if value_is(tree, @key[0], kl, 8, 65 + i % 26) != 0
+            return 100 + i
+    let s: i32 = scan_is_ordered(tree, 400)
+    if s != 0
+        return 20 + s
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    0
+
+# Internal nodes packed with short separators (one leaf per one or two
+# max-size values), then maximum-size keys landing among them: each node
+# near full must take one more 1034-byte entry.
+[[test]]
+fn test_btree_max_size_keys_into_full_internal_nodes() -> i32
+    var pool: *BufferPool = big_test_pool()
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return 10
+    var key: [1024]u8
+    var val: [4096]u8
+    let max: i32 = btree_max_value_len(12)
+    for ii in 0..300
+        let i: i32 = ii as i32
+        let kl: i32 = make_key(((i * 7919) % 300) * 10, @key[0])
+        fill_value(@val[0], max, 48 + i % 10)
+        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+            return 1
+    for ii in 0..60
+        let i: i32 = ii as i32
+        let kl: i32 = long_key(((i * 37) % 60) * 50 + 5, 1024, @key[0])
+        fill_value(@val[0], 8, 65 + i % 26)
+        if btree_put(tree, @key[0], kl, @val[0], 8) != ERR_OK
+            return 2
+    if btree_count(tree) != 360
+        return 3
+    for ii in 0..300
+        let i: i32 = ii as i32
+        let kl: i32 = make_key(((i * 7919) % 300) * 10, @key[0])
+        if value_is(tree, @key[0], kl, max, 48 + i % 10) != 0
+            return 4
+    for ii in 0..60
+        let i: i32 = ii as i32
+        let kl: i32 = long_key(((i * 37) % 60) * 50 + 5, 1024, @key[0])
+        if value_is(tree, @key[0], kl, 8, 65 + i % 26) != 0
+            return 5
+    let s: i32 = scan_is_ordered(tree, 360)
+    if s != 0
+        return 20 + s
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    0
