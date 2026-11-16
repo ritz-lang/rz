@@ -15,6 +15,9 @@ concretizes a bare `*T` and substitutes `*Box<T>`'s name.  The local now
 gets the same treatment.  `@T` / `@&T` locals go through `var_ref` (#2308)
 and were already right; they are pinned here so both paths stay in step.
 
+AGAST #3662: at T = `*U` a `let p: *T` is a `**U` local (the `ptr_arg_*`,
+`ptr_store_ptr_*`, `ptr_field_*` and `ptr_second_ptr_*` rows).
+
 Every row runs on ritz0, ritz1 and ritz1_selfhosted, and all three must exit
 with the row's value: ritz0's answer, by running the linked binary.
 """
@@ -140,7 +143,77 @@ fn main() -> i32
 """
 )
 
+
+# AGAST #3662: `*T` at T = `*U` is a `**U` local, recorded as a written one
+# is (TYPE_PTR_PTR, U's depth-packed inner slot), as `x: *T` is for a param.
+# It was a `*` with a TYPE_PTR pointee, which ref_check refused at `return *p`
+# ("a value doesn't fit a reference slot").  Both elements point at n, so a
+# stride or width error reads a pointer's other half, not 9.
+def _ptr_arg(decl, t, setup, ret):
+    return (
+        f"fn first<T>(x: *T) -> T\n    let p: {decl} = x\n    return *p\n\n"
+        "fn main() -> i32\n" + setup + f"    var arr: [2]{t}\n"
+        "    arr[0] = @n\n    arr[1] = @n\n"
+        f"    let q: {t} = first<{t}>(@arr[0])\n    return {ret}\n"
+    )
+
+
+S = "struct S\n    a: i32\n    b: i32\n\n"
+N_I32 = "    var n: i32 = 9\n"
+N_S = "    var n: S\n    n.a = 4\n    n.b = 9\n"
+N_PU8 = "    var c: u8 = 9\n    var n: *u8 = @c\n"
+
+# A store through the local writes the whole pointer, not a T-wide part of it.
+# `(*p).b` reads S's field through the `*S` the local points at.
+PTR_ARG_FIELD = (
+    S
+    + """\
+fn getb<T>(x: *T) -> i32
+    let p: *T = x
+    return (*p).b
+
+fn main() -> i32
+    var n: S
+    n.a = 4
+    n.b = 9
+    var arr: [2]*S
+    arr[0] = @n
+    arr[1] = @n
+    return getb<*S>(@arr[0])
+"""
+)
+
+PTR_ARG_STORE = """\
+fn put<T>(x: *T, v: T)
+    let p: *T = x
+    *p = v
+
+fn main() -> i32
+    var a: i32 = 2
+    var b: i32 = 9
+    var arr: [2]*i32
+    arr[0] = @a
+    arr[1] = @a
+    put<*i32>(@arr[0], @b)
+    return *arr[0] * 10 + *arr[1]
+"""
+
 ROWS = {
+    "ptr_arg_ptr_i32": (S + _ptr_arg("*T", "*i32", N_I32, "*q"), 9),
+    "ptr_arg_ptr_struct": (S + _ptr_arg("*T", "*S", N_S, "q.b"), 9),
+    "ptr_arg_ptr_ptr_u8": (_ptr_arg("*T", "**u8", N_PU8, "**q as i32"), 9),
+    "ref_ptr_i32": (_ptr_arg("@T", "*i32", N_I32, "*q"), 9),
+    "mut_ref_ptr_i32": (_ptr_arg("@&T", "*i32", N_I32, "*q"), 9),
+    "ref_ptr_struct": (S + _ptr_arg("@T", "*S", N_S, "q.b"), 9),
+    "ptr_store_ptr_i32": (PTR_ARG_STORE, 92),
+    "ptr_field_ptr_struct": (PTR_ARG_FIELD, 9),
+    # `p + 1` strides one pointer: element 1 is the only one pointing at 9.
+    "ptr_second_ptr_i32": (
+        SECOND + "fn main() -> i32\n    var a: i32 = 2\n    var n: i32 = 9\n"
+        "    var arr: [3]*i32\n    arr[0] = @a\n    arr[1] = @n\n    arr[2] = @a\n"
+        "    return *second<*i32>(@arr[0])\n",
+        9,
+    ),
     "ptr_u8": (
         SECOND
         + "fn main() -> i32\n"

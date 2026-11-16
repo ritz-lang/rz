@@ -3311,6 +3311,38 @@ fn clone_unknown_kind(what: *u8, kind: i32)
     eprints_cstr(c"\n")
     sys_exit(1)
 
+# AGAST #3662: `let p: *T` at T = `*U` (any depth) is the `**U` local it says,
+# recorded as a written one is: TYPE_PTR_PTR, pointee TYPE_PTR, U's
+# depth-packed inner slot and U's name (none for a primitive).  It was a `*`
+# with a TYPE_PTR pointee, so ref_check refused `return *p` ("a value doesn't
+# fit a reference slot") and `*p = v` stored a U-wide part of the pointer.
+# `name` is T less its first `ptr_`, as borrow_take_ptr_ptr_arg reads it.
+# 1 when it retyped the local.  `@T` / `@&T` locals bind through var_ref
+# (#2308) and stay as they are.
+fn ptr_local_take_ptr_arg(s: *Stmt, cloned: *Stmt, subst_type: i32, name: *u8, len: i32) -> i32
+    if s.var_type != TYPE_PTR or subst_type != TYPE_PTR
+        return 0
+    var rest: *u8 = name
+    var rest_len: i32 = len
+    var extra: i32 = 0
+    while rest_len > 4 and memcmp(rest, c"ptr_", 4) == 0
+        rest = rest + 4
+        rest_len = rest_len - 4
+        extra = extra + 1
+    let inner: i32 = ptr_arg_pointee(rest, rest_len)
+    if inner == TYPE_ARRAY
+        return 0
+    cloned.var_type = TYPE_PTR_PTR
+    cloned.var_declared_type = TYPE_PTR_PTR
+    cloned.var_pointee_type = TYPE_PTR
+    cloned.var_inner_pointee_type = inner + extra * PTR_DEPTH_UNIT
+    cloned.var_type_name = rest
+    cloned.var_type_name_len = rest_len
+    if inner != TYPE_STRUCT
+        cloned.var_type_name = null
+        cloned.var_type_name_len = 0
+    return 1
+
 # AGAST #1551: a pointer/reference local's pointee at T = the argument.  A
 # bare `*T` (pointee parsed as struct "T") points at the argument type
 # itself; `*Vec<T>` keeps its pointee and has T substituted in its name.
@@ -3322,8 +3354,8 @@ fn clone_ptr_local_type(s: *Stmt, cloned: *Stmt, type_param: *u8, type_param_len
             cloned.var_type_name = s.var_type_name
             cloned.var_type_name_len = s.var_type_name_len
             return
-        # T = `*U` is still a `*` to a `*`, not the `**U` local a param's
-        # path makes of it (AGAST #3662).
+        if ptr_local_take_ptr_arg(s, cloned, subst_type, subst_name, subst_len) == 1
+            return
         cloned.var_pointee_type = subst_type
         cloned.var_type_name = subst_name
         cloned.var_type_name_len = subst_len
