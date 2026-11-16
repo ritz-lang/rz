@@ -1769,3 +1769,313 @@ matched ritz0 at the time.
 - `Some(i32)` getting "a type isn't a pattern" from the parser is R52's
   wording. Which stage reports it isn't a language question.
 - §8.1's "for a union, an arm for every member" coverage bullet is removed.
+
+## Ticket-scrub batch, 2026-11-16: R53–R67 (RECOMMENDED, awaiting Aaron)
+
+From the rz room's scrub of all 190 open Ritz tickets against `main` @ 6f245b93
+(Nexus "Ritz retrospective 2026-11"). Every row was measured on ritz0 and ritz1
+at 6f245b93; repros were kept in `/tmp/larb-{a..f}/` on the LARB host.
+ritz1_selfhosted wasn't probed (its build was stale). These are
+recommendations: each ticket is `blocked` until Aaron confirms, and the
+implementation tickets are filed then. Bugs found along the way are filed now
+regardless (listed at the end).
+
+### R53: `usize` / `isize` (#2363): KEEP, AS `u64` / `i64`
+**Measured.** The spec never names either type. Both compilers treat `usize` as
+*signed*: with `b = 0xFFFF_FFFF_FFFF_FFF8 as usize`, `b >> 60` is an
+arithmetic shift, `b > 1` is false, `/` `%` are signed, `b as f64` is negative.
+ritz0 is inconsistent (`_UNSIGNED` at emitter_llvmlite.py:4134 and
+type_checker.py:94 include it; `_is_unsigned_type` at :15089 doesn't); ritz1
+parses both as TYPE_I64 (#2198). The largest `u64` literal is refused for
+`usize`. Corpus: 162 uses in 35 non-test files (angelo 20, ritz1 7, prism 5,
+tempest 1), all sizes and indices; none relies on signedness. `isize` is used
+only inside ritz1. Every target (x86_64, aarch64) is 64-bit.
+
+**Recommend.** §3.1: "`usize` is another name for `u64`, and `isize` for `i64`:
+the same types, not new ones. Every Ritz target is 64-bit." Fixes the silent
+signed lowering with 0 source changes. Removing the names would rewrite 162
+uses for nothing. Tickets on confirm: ritz0 (unsigned everywhere, literal range,
+`Vec<usize>` and `Vec<u64>` are one instance; spec text), then ritz1.
+
+### R54: a selective import of a name the module doesn't define (#3439): LOCATED ERROR
+**Measured.** §15.1 says the `{ }` list "is recognised but does not currently
+filter". Both compilers accept `import ritzlib.hashmap { HashMap }`; the error
+comes later, at a call. 50 names in 16 import lines exist nowhere (tempest,
+spire, iris ×31, lexis, goliath, harland, nexus); 54 more in 19 files resolve
+only through the named module's own plain `import` (libharland, rzsh `common`,
+spectree). 183 imported names lack `pub`: all types or consts, 0 fns. ritz0
+already refuses a *call* to another module's private fn (#3418's message).
+
+**Recommend.** Each name in `{ }` must be declared at the top level of that
+module, or re-exported by its `pub import`; otherwise "`x` is not defined in m",
+at the name. Names reachable only through the module's plain imports don't
+count. Private types and consts count (type privacy isn't enforced, and 131
+sites import them). A private fn in the list gets §15.2's error at the import (0
+sites). The list is checked but still doesn't filter. Order on confirm: corpus
+migration (~35 files), ritz0, ritz1. #1388 is an older duplicate and folds in.
+
+### R55: trait bounds (#1621): KEEP, AS A CHECK ONLY
+**Measured.** ritz0 parses `<T: A>` and `<T: A + B>` on fn, struct, enum and
+impl (no `where`) and checks at instantiation (monomorph.py:421). The check
+doesn't steer method lookup: `x.area()` on an unbounded `T` compiles on both.
+ritz0 defects: a failed bound is an unlocated Python TypeError; generic impls
+never satisfy a bound (`impl<T> Drop for Box<T>` fails `Box<i64>: Drop`); an
+unknown trait reads "does not implement". ritz1's `type_param_list` takes
+IDENTs only. Corpus: 5 bounds, all in test_trait_bounds.ritz; 226 unbounded
+generic fns.
+
+**Recommend.** New §11.5: a type parameter may name the traits it needs,
+`<K: Hash + Eq>`, no `where`. Checked when the generic is instantiated: each
+argument needs an impl of the trait, exact or through a generic impl, or it's an
+error at the type argument (or the call, when inferred): "`Nope` doesn't
+implement `Area`, which `T` of `total` requires". An unknown trait is an error at
+the bound. A bound doesn't change resolution (methods on `T` are found after
+substitution, §11.4), so all 226 generics stay legal. §12.2's "no trait bound"
+sentence goes. Why keep: it moves the error from inside the generic to the use,
+and it's the contract `HashMap<K: Hash + Eq>` (#1858) and #3251 build on.
+Dropping them saves only 5 test lines. **For Aaron:** "check only" is
+deliberate. Requiring a bound before calling a trait method on `T` (Rust) would
+touch the 226 generics; it can come later. Tickets on confirm: ritz0 (the three
+defects, located tests), then ritz1 (parse, impl table, check; clears the
+EXPECTED_FAILURES entry; with #1612). Unblocks R36's revisit, #3251, #3256.
+
+### R56: closures (#1623): REMOVE
+**Measured.** ritz0 parses `|x| e`, `|| e`, `|x: T| e` and anonymous
+`fn(a: i32) -> i32 e`. Captures are copied into a private global ring of 16
+environment slots ("This is a hack"): 17 closures from `make_adder`, then call
+the first, returns 100, not 1, with no error. ritz1 refuses at the parse.
+Corpus: no package uses them; users are example 58_closures, test_level39, 3
+unrun feature tests and 4 ritz0 tests. Named fns passed as `fn(...)` values
+work on all three compilers (§5.5); state goes in a struct with a fn field
+(R41's `h.f(x)`).
+
+**Recommend.** §5.6, replacing the false "never existed": "Ritz has no closures
+or anonymous functions. `|x| e`, `|| e` and `fn(…) e` as expressions are errors
+at the `|` or `fn`: closures aren't supported: write a named fn and pass it by
+name (§5.5)." Why: the implementation is wrong, nothing uses it, and a closure
+(code plus captured environment) is the runtime-polymorphism question, which
+belongs to #3251. Non-capturing closures alone add little over a named fn.
+Tickets on confirm: ritz0 refusal and test conversions (clears test_level39's
+EXPECTED_FAILURES entry), 58_closures rewrite, ritz1 test. #1531 and #3301 close
+as superseded. (#1624, #1626: implementation, no ruling.)
+
+### R57: a view is a borrow; a move conflicts with a borrow (#1292)
+**Measured.** Both compilers refuse `let p = @v[0]` then `v.push`, but accept
+`let s: Span<u8> = v[0..2]` held across `v.push`, returning `v[0..3]` of a local
+Vec, and returning a Span of `@arr` of a local array. Both also accept moving a
+binding while an `@` of it is live. Harmless while Vec copies; once #2159 makes
+Vec own its buffer, `let w = v` with a live view frees memory under the view.
+
+**Recommend.** §13.5: "A `Span<T>` made from a local root, `v[a..b]` or `@x` in
+a `Span` slot, is an `@` of that root for both rules": a loan to the end of the
+block, and R2's "cannot return a reference to local". Add "moving the place" to
+what conflicts with a live `@` of an overlapping place (R11a). A Span of a Span
+parameter stays legal; a call's result held in a binding stays unchecked (R2's
+definite-case limit). Remove Span from §13.5's "can still dangle" list except in
+a field or global. Cost: 2 Span-annotated view lets found by regex, 0 outside
+tests; the room counts returns with the checker and stops at ~10. Tickets on
+confirm: ritz0, then ritz1; #2159 then depends on both, not #1292.
+
+### R58: a store through a reference drops the old value; through `*T` it doesn't (#2179)
+**Measured.** Every store through a pointer or reference leaks the old value on
+both compilers: `p.t = v` through `*Holder`, `@&Holder`, `:&`, a local `@&`
+binding; `*p = v` through `@&T` and `*T`. A whole store to an owned binding
+drops (1 drop). The skip is deliberate (emitter_llvmlite.py:4374,
+ownership.ritz:2686 cite #2179). The array-element half is R39.
+
+**Recommend.** §13.6: "A store through an `@&T`, a `:&` parameter, or a place
+reached through one, drops the old value, in the same order (after the value,
+before the store). A store through a `*T` is a raw write and drops nothing." A
+mutable borrow guarantees a live owned value (Rust's `&mut`). A raw pointer may
+point at uninitialised memory: `box_new` writes `*b.ptr = value` into fresh
+`malloc` (box.ritz:86). To replace a live value through a `*T`, lend it as
+`@&T`. Risk: code that drops by hand and then stores becomes a double drop; the
+room measures with an instrumented build and stops at ~10. Tickets on confirm:
+ritz0, ritz1; before #2159.
+
+### R59: an uninitialised move-only `var` starts moved (#2180)
+**Measured.** `var h: Holder; h.t = make(1)` is never dropped on either
+compiler. Reading `h.t` before any store compiles and reads garbage (exit 48 on
+ritz0, 32 on ritz1); returning a partly built Holder hands garbage to the
+caller's drop. A field store into a binding that was moved whole is already
+refused. §4.2 doesn't say what a `var` without an initialiser holds.
+
+**Recommend.** A `var x: T` with no initialiser, T move-only, starts as moved.
+A whole assignment makes it an owner. A field store, read, borrow, move or
+return before that is an error: "`h` is not initialised: assign the whole
+value". It reuses the moved-binding check both compilers have, needs no
+per-field state, and is Rust's E0381. §4.2 gets the sentence; §13.6's "nothing
+is dropped if the binding doesn't own a value" becomes the refusal. Cost: 7
+library constructors (box.ritz:81, hashmap.ritz:59, heap.ritz:73,
+buf.ritz:428/436, tome.ritz:267, spectree store.ritz:104) and 1 test become
+struct literals; the room recounts with the checker. #2173's runtime root-flag
+guard becomes unreachable. Not covered: an uninitialised *copy* struct read,
+which is a general definite-initialisation question. Tickets on confirm: ritz0
+with the migration, then ritz1; before #2159.
+
+### R60: module-level values (#3338, #3412, #3436, ROADMAP GH #95): `const` AND `var`, ONE CONSTANT-INITIALISER RULE
+**Measured.**
+
+| initialiser | ritz0 | ritz1 |
+|---|---|---|
+| int, bool, `*u8` literal, none (zeroed) | yes | yes |
+| `var g: f64 = 2.5` | refused | wrong type: `global i64 bitcast (double …)` |
+| `var g: i64 = K * 2 + 1` (K a const) | refused | refused |
+| array, fill, struct literal, `StrView` | refused | refused |
+| `const C: [2]P = [P{…}, …]` | yes | yes |
+| `const C: P = P { a: 5 }` | refused | refused |
+| module `let` | parse error | parse error |
+
+An array of structs can be a const but a struct can't; nothing explains it.
+Corpus: 590 top-level `var`, 0 top-level `let`. 58 sites fill globals in by hand
+(harland `net/eth.ritz:116` sets `broadcast_mac` on every call; 15 struct fields
+in harland boot). GH #95 in this repo is an unrelated closed PR; the ROADMAP row
+is #3412's question.
+
+**Recommend.** §4.3: "Module-level values are `const` and `var`; there is no
+module-level `let`. A global `var` needs its type (R38), and its initialiser,
+like a const's, is a *constant initialiser*: a literal (int, float, bool, char,
+`"…"`), a const, arithmetic or a cast of constant initialisers, or an array or
+struct literal of them (R51 slots apply). No call runs before `main`. A const or
+global of a type with `Drop` is an error." A struct const is read-only data like
+a const array (R48): `@C` is `@S`, `@&C` is an error, and it isn't a pattern.
+Only refused code becomes legal: migration 0. Tickets on confirm: ritz0 (one
+evaluator shared by const and var, spec), ritz1 (reuse `emit_const_array_entry`,
+covers #3398, f64 globals typed `double`), optional cleanup (angelo TAG_*,
+harland eth/dhcp, the ROADMAP row).
+
+### R61: `a[i] = v` order (#3432): LEFT TO RIGHT
+**Measured.** ritz0's plain store evaluates `v` before the place (`a[idx()] =
+val()` gives 87; `g[i][j] = v` gives 877). ritz1 goes place first (78, 778).
+ritz0's own `a[i] += v` is place first, and so are both compilers everywhere
+else.
+
+**Recommend.** §13.6: "`a[i] = v` evaluates `a`, then `i`, then `v`, left to
+right as everywhere else; `g[i][j]` evaluates `i` before `j`." Then the old
+element drops and the store happens (R39 unchanged). Only ritz0 changes; its
+split rows in test_array_elem_store_drop.py go back to one. Visible only when
+the index and value both have side effects: none found in the corpus (not a full
+sweep).
+
+### R62: a `"…"` literal in a `Span<u8>` slot (#3402): ACCEPT
+**Measured.** Both compilers already accept it in let, argument and return
+slots, with a NUL after the bytes. The library doesn't use it: 415
+`span_from_cstr(c"…")` (a strlen at run time) and 106 `span_literal(c"…", N)`
+with a hand-counted N (87 checked, none wrong yet).
+
+**Recommend.** §3.5: "In a `Span<u8>` slot a `"…"` literal is a `Span<u8>` of
+its bytes; a `StrView` value, a `c"…"` literal and a `String` don't convert."
+R49's line holds: `String` owns heap memory and a literal can't be one, but a
+`Span<u8>` is a view and a literal is bytes of a known length. Cost 0;
+optional library cleanup. Tickets on confirm: spec plus tests on both compilers;
+the two bugs below.
+
+### R63: integer overflow (#3197): TRAP, IN EVERY PROFILE; `+%` WRAPS
+**Measured.** A build profile reaches only clang's link flags (build.py:1904);
+neither compiler gets one, so "trap in debug" would add a compiler mode, a cache
+key and matrix rows. ritzlib has no `wrapping_*`. Code that relies on wrapping
+(static count): about 18 files, 300–450 lines, nearly all cryptosec (p256, p384,
+x25519, ed25519, u128, bigint carries; sha256/512, chacha20, poly1305 rounds),
+plus FNV (ritzlib/hash.ritz:25), djb2, a murmur finaliser, tome's PCG and LCG.
+crc32 and adler32 don't overflow. Slowdown not measured (Rust and Swift report
+low single digits).
+
+**Recommend.** §7.1: "`+`, `-` and `*` stop the program on overflow at their
+type, with a located message (`f.ritz:L:C: integer overflow in `+``); `+%`,
+`-%` and `*%` wrap. Signed `/` and `%` of the minimum by −1, division by zero,
+and a shift count outside 0..width−1 stop it too. Overflow in a constant
+expression is a compile error." `op=` forms follow. `as` still truncates.
+Bits shifted out by `<<` don't trap. §7.4's "no defined result" for shift
+counts goes. Why every profile: if release wrapped, an overflow tests catch
+becomes a silent wrong value in production, which is the silent wrapping Aaron
+rejected in R21, and "only if it can be done safely, otherwise error it"
+(#2518). Why operators: crypto rounds read badly as nested `wrapping_add(…)`.
+**For Aaron:** if the measured slowdown (ritz1 self-compile, a cryptosec bench)
+exceeds ~5%, it comes back. Order on confirm: `+%` on ritz0, then ritz1; migrate
+crypto function by function (not test-driven: untested carry paths would trap
+in production); then the checks with timing on ritz0, then ritz1.
+
+### R64: a statement with no effect (#3253): LOCATED ERROR
+**Measured.** Both compilers accept `x`, `5`, `x == 1`, `x + 1`, `p.x`, `@x` as
+statements silently. An AST walk of 1221 files found 277: **259 bare
+`"FAIL: …\n"` strings in 15 zeus test files** (every failure message is lost),
+11 bare `c"…{x}"` lines in examples 70 and 71 (they print nothing), and 7
+deliberate `555` lines in codegen regressions 93/94. 0 `==`-for-`=` slips.
+
+**Recommend.** New §6.6: an expression statement that isn't its block's value is
+an error when its outermost node is a literal, name, field, index, borrow,
+`*p`, cast, aggregate literal or operator: "statement has no effect: the value
+of `<expr>` is discarded"; for a string, add "a string on its own line prints
+nothing: call print". Calls, assignments and `if`/`match`/blocks are allowed. A
+call's result may be discarded unless the fn is `[[must_use]]` (§17.8). Error,
+not warning: Ritz has no warning tier, and 270 of 277 hits are real bugs. Order
+on confirm: fix the 277 (the `555` lines become a call so the regressions still
+test what they did), ritz0, ritz1.
+
+### R65: where an `impl` may live (#3256): THE TYPE'S FILE (OR THE TRAIT'S); EVERY INSTANTIATION
+**Measured.** An inherent impl of another file's type, and trait impls of it,
+run on both. Two files adding `Foo.tag`: ritz0 fails at link with no location;
+ritz1 silently keeps one body per module. A method added in `b` is callable from
+`main` that only imports `d` (which imports `b`): methods leak through the whole
+import closure. `impl G<u8>` alone: ritz0 unlocated ValueError, ritz1 invalid
+IR. `impl<T> G<T>` plus `impl G<u8>`: ritz0 silently runs the generic body,
+ritz1 invalid IR. Corpus: 171 impls, 0 on another file's type, 0 on one
+instantiation, 0 on a primitive. Two tests pin the one-instantiation shape
+without calling it.
+
+**Recommend.** §12.2: an inherent `impl T` must be in the file that declares
+`T`. A trait impl must be in the type's file or the trait's file; compiler-known
+traits (Drop, Index…) count as the type's file. An impl covers every
+instantiation: `impl<T> G<T>`, never `impl G<u8>`. Errors: "`Foo` is declared in
+a.ritz: its `impl` must be there (§12.2)"; "an impl covers every instantiation of
+`G`: write `impl<T> G<T>`". Why: one flat namespace (§15.3) gives no way to say
+which file's method a call means, and adding an import could change it. The
+specialised shape is wrong on both compilers and unused. With R55, the trait's
+file is where R36's `impl Hash for i64` becomes legal: R36's revisit is then a
+narrow question for Aaron (trait impls on primitives, in the trait's file only).
+Cost 0 plus 2 test rows. Tickets on confirm: ritz0, then ritz1.
+
+### R66: the ritzlib UFCS name table (#3252): REPLACE WITH IMPL BLOCKS
+**Measured.** ritz0 `ufcs.py:14` (String, GrowBuf, Buffer, ArgParser prefixes,
+plus `Vec$ Span$ Option$ Result$ Box$`), ritz1 `ast_helpers.ritz:124`; a parity
+test keeps them equal. Lookups over `rz build --all` plus examples: Vec 1125 (15
+methods), String 458 (~30), Option 24 (3). The other six types: 0 hits. Every
+table type is declared in one ritzlib file, so R65 allows its impl there:
+`span.ritz:172` already does this. ritz1 handles imported generic impls.
+
+**Recommend.** Add `impl<T> Vec<T>`, `impl String` and `impl<T> Option<T>` as
+one-line `pub` wrappers of the free fns (~48 methods; `v.push(x)` is unchanged),
+then delete the table on both compilers, its parity test and §9.4's exception
+sentence. `option_is_some`/`_is_none`/`_unwrap_or` are private yet reached
+cross-module through the table: the wrappers must be `pub` (#3418). Tickets on
+confirm: ritzlib impls (with `rz test --all` before and after), then one per
+compiler.
+
+### R67: positional `let (a, b) = s` of a named struct (#3254): REFUSE
+**Measured.** 21 `let (…)` sites; 16 are tuples, 5 named structs (angelo
+font.ritz:112, raster/fill.ritz:85 and :136, two ritz0 tests). Both bind in
+declaration order. 3 fields, 2 names: ritz0 unlocated ValueError, ritz1
+silently binds the first two. There are no tuple structs, and `let P { x, y } =
+p` doesn't parse.
+
+**Recommend.** `(…)` patterns destructure tuples only: "`Bounds` is a struct,
+not a tuple: read its fields". It is R19's renumbering hazard: add a field to
+`Bounds` and fill.ritz's `_, y_min, _, y_max` silently rebinds; ritz1 already
+does that today. No named form now: it would cost a parser and binder on both
+compilers for 3 real sites; it can come later. §4.1 gets the sentence and an
+expect-error block. Migration: 5 sites. Tickets on confirm: ritz0 with the
+migration, then ritz1 (test_ritz1_struct_destructure.py becomes refusal rows).
+#2864 closes as superseded. Not measured: §10.3 says named-field enum variants
+also bind positionally, which is the same hazard; a separate question.
+
+### #3251 (runtime polymorphism): NO RULING YET
+Waits on R55. With R56, closures (code plus environment) fold into it: the one
+design covers callbacks with state and mixed-type collections.
+
+### Bugs found while measuring (filed now, no ruling needed)
+- #3440 ritz0: `let s: Span<u8> = c"abc"` silently has length 120; ritz1 emits
+  invalid IR.
+- #3441 ritz1: a `StrView` value into a `Span<u8>` slot is accepted (ritz0 refuses).
+- #3442 ritz1: `arr()[idx(1)] = val(3)` crashes with SIGSEGV.
+- #3443 ritz1: `(p as @&Holder).t = …` fails with "unhandled EXPR_MEMBER in
+  assignment".
