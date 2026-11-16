@@ -33,6 +33,7 @@ SOURCES = \
 	monomorph \
 	generic_infer \
 	emitter_core \
+	frame_limit \
 	binder_check \
 	index_through \
 	ll_copy_scan \

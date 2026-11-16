@@ -162,6 +162,7 @@ to Sema is #1816's work.
 | `emitter_print` | The `print` builtin, byte-identical to ritz0's output. |
 | `emitter_asm` | `asm` blocks to LLVM inline asm. |
 | `ll_copy_scan` | Text scan of emitted IR for large-struct copies (used by `emitter`'s rewrite pass). |
+| `frame_limit` | Text scan of a fn's allocas: refuses a stack frame over 8 MiB at its largest local or temporary (#3739). |
 
 ### Generated vs hand-written
 

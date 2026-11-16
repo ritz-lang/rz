@@ -1,0 +1,292 @@
+# frame_limit.ritz - refuse a fn whose stack frame exceeds the stack (AGAST #3739)
+#
+# ritz0's frame_too_large (#3738), with the same rule and words.  lexis's
+# `main` held its stylesheet and selector map by value and compiled to a
+# ~191 GiB frame; ritz1 accepted it in silence and the binary SIGSEGV'd on
+# entry (#3700).
+#
+# THE RULE.  A fn's frame is the sum of its allocas' sizes: its locals, its
+# by-value params' copies and its by-value temporaries (an sret slot, a lent
+# copy), each its type's padded size (elem_size_align's layout) times its
+# constant count.  An alloca with a runtime count is no fixed frame and is
+# skipped.  Over FRAME_LIMIT_BYTES (8 MiB, the default `ulimit -s`) the fn
+# is refused, at its largest alloca (the first emitted wins a tie): a local
+# at its `let` / `var`, a temporary at the innermost expression being
+# emitted when its slot was made.  Exactly the limit compiles.  There is no
+# opt-out: a deliberately big frame goes on the heap or in a static.
+#
+# ritz1 writes IR as text, so this reads the finished body the way
+# hoist_entry_allocas does: each `  %r = alloca <type>[, i64 <n>]` line is
+# sized from its type text.  Where it came from is EmitterState.fm, the
+# (offset, span) marks emit_stmt / emit_expr leave as they go; whose slot it
+# is, EmitterState.fs, every (reg, name) add_local_full registered.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.string
+
+import ast
+import diag
+import emitter_core
+
+const FRAME_LIMIT_BYTES: i64 = 8388608
+
+fn fl_skip_spaces(p: *u8, end: i64, i: *i64)
+    while *i < end and *(p + *i) == ' '
+        *i = *i + 1
+
+# 1 if the bytes at p[i..] spell `word` (wlen bytes).
+fn fl_at(p: *u8, end: i64, i: i64, word: *u8, wlen: i64) -> i32
+    if i + wlen > end
+        return 0
+    var k: i64 = 0
+    while k < wlen
+        if *(p + i + k) != *(word + k)
+            return 0
+        k += 1
+    1
+
+fn fl_is_digit(c: u8) -> i32
+    if c >= '0' and c <= '9'
+        return 1
+    0
+
+# The decimal number at p[*i..], *i moved past it.
+fn fl_number(p: *u8, end: i64, i: *i64) -> i64
+    var n: i64 = 0
+    while *i < end and fl_is_digit(*(p + *i)) == 1
+        n = n * 10 + ((*(p + *i) - '0') as i64)
+        *i = *i + 1
+    n
+
+fn fl_round_up(n: i64, align: i64) -> i64
+    if align <= 1
+        return n
+    let rem: i64 = n % align
+    if rem == 0
+        return n
+    n + (align - rem)
+
+# 1 for a byte that ends a `%Name` type in IR text.
+fn fl_name_end(c: u8) -> i32
+    if c == ' ' or c == ',' or c == ']' or c == '}' or c == '>' or c == ';' or c == '\n' or c == '\t'
+        return 1
+    0
+
+# The padded size of the LLVM type spelled at p[*i..end), *i moved past it
+# and *align its alignment: `iN`, `ptr`, `float`, `double`, `%Name` (sized by
+# elem_size_align, the layout its `= type` declaration is written with),
+# `[N x T]`, `<N x T>`, `{ T, .. }` and packed `<{ T, .. }>`.
+fn fl_type_size(s: *EmitterState, p: *u8, end: i64, i: *i64, align: *i64) -> i64
+    fl_skip_spaces(p, end, i)
+    *align = 1
+    if *i >= end
+        return 0
+    let c: u8 = *(p + *i)
+    let packed: i32 = fl_at(p, end, *i, c"<{", 2)
+    if c == '{' or packed == 1
+        *i = *i + 1 + (packed as i64)
+        var off: i64 = 0
+        var max_align: i64 = 1
+        while *i < end
+            fl_skip_spaces(p, end, i)
+            if *i >= end or *(p + *i) == '}'
+                break
+            var fa: i64 = 1
+            let fs: i64 = fl_type_size(s, p, end, i, @fa)
+            if packed == 1
+                fa = 1
+            off = fl_round_up(off, fa) + fs
+            if fa > max_align
+                max_align = fa
+            fl_skip_spaces(p, end, i)
+            if *i < end and *(p + *i) == ','
+                *i = *i + 1
+        *i = *i + 1 + (packed as i64)   # `}` / `}>`
+        *align = max_align
+        return fl_round_up(off, max_align)
+    if c == '[' or c == '<'
+        *i = *i + 1
+        fl_skip_spaces(p, end, i)
+        let n: i64 = fl_number(p, end, i)
+        fl_skip_spaces(p, end, i)
+        *i = *i + 1   # `x`
+        var ea: i64 = 1
+        let es: i64 = fl_type_size(s, p, end, i, @ea)
+        fl_skip_spaces(p, end, i)
+        *i = *i + 1   # `]` / `>`
+        *align = ea
+        return n * es
+    if c == '%'
+        *i = *i + 1
+        var start: i64 = *i
+        if *i < end and *(p + *i) == '"'
+            start = *i + 1
+            *i = start
+            while *i < end and *(p + *i) != '"'
+                *i = *i + 1
+            let qlen: i64 = *i - start
+            *i = *i + 1
+            return elem_size_align(s, TYPE_STRUCT, p + start, qlen as i32, align)
+        while *i < end and fl_name_end(*(p + *i)) == 0
+            *i = *i + 1
+        return elem_size_align(s, TYPE_STRUCT, p + start, (*i - start) as i32, align)
+    if c == 'i' and *i + 1 < end and fl_is_digit(*(p + *i + 1)) == 1
+        *i = *i + 1
+        let bits: i64 = fl_number(p, end, i)
+        var bytes: i64 = 1
+        while bytes * 8 < bits
+            bytes = bytes * 2
+        *align = bytes
+        if bytes > 16
+            *align = 16
+        return bytes
+    if fl_at(p, end, *i, c"ptr", 3) == 1
+        *i = *i + 3
+        *align = 8
+        return 8
+    if fl_at(p, end, *i, c"double", 6) == 1
+        *i = *i + 6
+        *align = 8
+        return 8
+    if fl_at(p, end, *i, c"float", 5) == 1
+        *i = *i + 5
+        *align = 4
+        return 4
+    if fl_at(p, end, *i, c"half", 4) == 1
+        *i = *i + 4
+        *align = 2
+        return 2
+    # fp128, x86_fp80 and anything else: 16, as LLVM lays out the first two.
+    while *i < end and fl_name_end(*(p + *i)) == 0
+        *i = *i + 1
+    *align = 16
+    16
+
+# The bytes the alloca on line p[0..len) takes in the frame: its type's size
+# times its constant count.  -1 for a line that is no alloca, or one whose
+# count is a register (a runtime size is no fixed frame).  *reg is its
+# `%.N` register, -1 for a named one.
+fn fl_alloca_bytes(s: *EmitterState, p: *u8, len: i64, reg: *i32) -> i64
+    *reg = -1
+    if len < 4 or *p != ' ' or *(p + 1) != ' ' or *(p + 2) != '%'
+        return -1
+    var i: i64 = 3
+    if *(p + i) == '.'
+        var j: i64 = i + 1
+        if j < len and fl_is_digit(*(p + j)) == 1
+            *reg = fl_number(p, len, @j) as i32
+    while i < len and *(p + i) != ' '
+        i += 1
+    if fl_at(p, len, i, c" = alloca ", 10) == 0
+        return -1
+    i += 10
+    var align: i64 = 1
+    let size: i64 = fl_type_size(s, p, len, @i, @align)
+    fl_skip_spaces(p, len, @i)
+    if i < len and *(p + i) == ','
+        i += 1
+        fl_skip_spaces(p, len, @i)
+        if fl_at(p, len, i, c"align", 5) == 1
+            return size
+        while i < len and *(p + i) != ' '   # the count's type
+            i += 1
+        fl_skip_spaces(p, len, @i)
+        if i < len and fl_is_digit(*(p + i)) == 1
+            return size * fl_number(p, len, @i)
+        return -1   # `, i64 %.N`: a runtime count
+    size
+
+# `16777216 bytes (16 MiB)`: exact, then readable.  ritz0's _fmt_bytes:
+# whole numbers without decimals, others to 1 place (Python's `.1f`, so a
+# tie rounds to even).
+fn fl_push_bytes(m: @&String, n: i64)
+    string_push_i64(m, n)
+    string_push_cstr(m, c" bytes")
+    var unit: *u8 = c"GiB"
+    var size: i64 = 1073741824
+    if n < size
+        unit = c"MiB"
+        size = 1048576
+    if n < size
+        unit = c"KiB"
+        size = 1024
+    if n < size
+        return
+    string_push_cstr(m, c" (")
+    if n % size == 0
+        string_push_i64(m, n / size)
+    else
+        var tenths: i64 = (n * 10) / size
+        let rem: i64 = (n * 10) % size
+        if rem * 2 > size or (rem * 2 == size and tenths % 2 == 1)
+            tenths += 1
+        string_push_i64(m, tenths / 10)
+        string_push_cstr(m, c".")
+        string_push_i64(m, tenths % 10)
+    string_push_cstr(m, c" ")
+    string_push_cstr(m, unit)
+    string_push_cstr(m, c")")
+
+# Refuse `f` if the allocas in s.out from body_start on sum past the limit.
+# Called once the body is complete, before the passes that rewrite it
+# (own_end_fn and on), so the fm marks' offsets still hold.
+pub fn refuse_huge_frame(s: *EmitterState, f: *FnDef, body_start: i64)
+    let base: *u8 = s.out.data
+    let end: i64 = s.out.len
+    var total: i64 = 0
+    var big: i64 = -1
+    var big_reg: i32 = -1
+    var big_line: i32 = 0
+    var big_col: i32 = 0
+    var mi: i32 = 0
+    var o: i64 = body_start
+    while o < end
+        var ll: i64 = 0
+        while o + ll < end and *(base + o + ll) != '\n'
+            ll += 1
+        var reg: i32 = -1
+        let bytes: i64 = fl_alloca_bytes(s, base + o, ll, @reg)
+        if bytes >= 0
+            total = total + bytes
+            if bytes > big
+                while mi + 1 < s.fm_count
+                    let next_mark: *FrameMark = s.fm + ((mi + 1) as i64)
+                    if next_mark.off > o
+                        break
+                    mi += 1
+                let mark: *FrameMark = s.fm + (mi as i64)
+                big = bytes
+                big_reg = reg
+                big_line = mark.line
+                big_col = mark.col
+        o = o + ll + 1
+    if total <= FRAME_LIMIT_BYTES
+        return
+    var m: String = string_new()
+    string_push_cstr(@&m, c"fn `")
+    string_push_bytes(@&m, f.name, f.name_len as i64)
+    string_push_cstr(@&m, c"` needs a ")
+    fl_push_bytes(@&m, total)
+    string_push_cstr(@&m, c" stack frame, over the ")
+    fl_push_bytes(@&m, FRAME_LIMIT_BYTES)
+    string_push_cstr(@&m, c" stack; ")
+    var named: i32 = 0
+    if big_reg >= 0
+        var k: i32 = 0
+        while k < s.fs_count and named == 0
+            let slot: *FrameSlot = s.fs + (k as i64)
+            if slot.reg == big_reg and slot.name_len > 0
+                string_push_cstr(@&m, c"`")
+                string_push_bytes(@&m, slot.name, slot.name_len as i64)
+                string_push_cstr(@&m, c"`")
+                named = 1
+            k += 1
+    if named == 0
+        string_push_cstr(@&m, c"a by-value temporary")
+    string_push_cstr(@&m, c" here takes ")
+    fl_push_bytes(@&m, big)
+    string_push_cstr(@&m, c": put it on the heap or in a static")
+    diag_error_buf(emitter_source_file(), diag_span(big_line, big_col), @m)
+    string_drop(@&m)
+    s.error_count = s.error_count + 1

@@ -401,6 +401,31 @@ struct EmitterState
     # AGAST #1625: how many `defer`s are registered (OwnState.defer_count),
     # so emit_str can tell cheaply whether a `ret` must run them first.
     defer_live: i32
+    # AGAST #3739 — what frame_limit.ritz needs to locate a fn's allocas.
+    # fm: (offset in out, span) marks, appended as emit_stmt / emit_expr
+    # enter and leave; an alloca line belongs to the last mark at or before
+    # it.  fm_line / fm_col: the span now in force.  fs: (alloca reg, name)
+    # of every local add_local_full registered this fn, never rolled back.
+    fm: *FrameMark
+    fm_count: i32
+    fm_cap: i32
+    fm_line: i32
+    fm_col: i32
+    fs: *FrameSlot
+    fs_count: i32
+    fs_cap: i32
+
+# AGAST #3739 — from `off` in s.out on, the emitter was at `line`:`col`.
+struct FrameMark
+    off: i64
+    line: i32
+    col: i32
+
+# AGAST #3739 — register `reg` holds the local `name` (len bytes).
+struct FrameSlot
+    reg: i32
+    name_len: i32
+    name: *u8
 
 # AGAST #2242 — a path a binding's value can be moved out along: a move-only
 # field of it, or of a field of it that can itself be partly moved.  A path's
@@ -896,6 +921,41 @@ pub fn locals_init(s: *EmitterState, cap: i32)
     s.locals = malloc((cap as i64) * sizeof(LocalVar)) as *LocalVar
     s.locals_cap = cap
     s.local_count = 0
+    s.fm_cap = 256   # AGAST #3739: frame_limit's marks and slots
+    s.fm = malloc((s.fm_cap as i64) * sizeof(FrameMark)) as *FrameMark
+    s.fs_cap = cap
+    s.fs = malloc((s.fs_cap as i64) * sizeof(FrameSlot)) as *FrameSlot
+    frame_begin_fn(s, 0, 0)
+
+# AGAST #3739: forget the last fn's marks and slots; until a statement or
+# expression says otherwise, the fn's allocas are at line:col (its `fn`).
+pub fn frame_begin_fn(s: *EmitterState, line: i32, col: i32)
+    s.fm_count = 0
+    s.fs_count = 0
+    s.fm_line = 0
+    s.fm_col = 0
+    frame_mark(s, line, col)
+
+# AGAST #3739: the emitter is at line:col from here on in s.out.  A mark at
+# the offset of the previous one replaces it: nothing was emitted under it.
+pub fn frame_mark(s: *EmitterState, line: i32, col: i32)
+    s.fm_line = line
+    s.fm_col = col
+    let off: i64 = s.out.len
+    if s.fm_count > 0
+        let last: *FrameMark = s.fm + ((s.fm_count - 1) as i64)
+        if last.off == off
+            last.line = line
+            last.col = col
+            return
+    if s.fm_count >= s.fm_cap
+        s.fm_cap = s.fm_cap * 2
+        s.fm = realloc(s.fm as *u8, (s.fm_cap as i64) * sizeof(FrameMark)) as *FrameMark
+    let m: *FrameMark = s.fm + (s.fm_count as i64)
+    m.off = off
+    m.line = line
+    m.col = col
+    s.fm_count = s.fm_count + 1
 
 # ritz-task-193 — Resolve `name` to an index into `s.locals[]` using the
 # per-fn HashMap (fnv1a hash of name bytes).  Falls back to a from-end
@@ -1409,6 +1469,14 @@ pub fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type:
         let cap: i64 = (s.locals_cap as i64) * 2
         s.locals = realloc(s.locals as *u8, cap * sizeof(LocalVar)) as *LocalVar
         s.locals_cap = cap as i32
+    if s.fs_count >= s.fs_cap   # AGAST #3739: frame_limit names reg's slot
+        s.fs_cap = s.fs_cap * 2
+        s.fs = realloc(s.fs as *u8, (s.fs_cap as i64) * sizeof(FrameSlot)) as *FrameSlot
+    let fslot: *FrameSlot = s.fs + (s.fs_count as i64)
+    fslot.reg = reg
+    fslot.name = name
+    fslot.name_len = len
+    s.fs_count = s.fs_count + 1
     let idx: i32 = s.local_count
     let loc: *LocalVar = local_at(s, idx)
     loc.name = name
