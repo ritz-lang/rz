@@ -106,7 +106,10 @@ into `nexus_pages` by itself (#3681, see nexus's README).
 the server; pass `--no-encryption` to both for a `serve --no-encryption` server.
 The shell takes `put key=value ...`, `get <id>`, `delete <id>`, `list`, `ping`
 and `help`, reads commands from a pipe as well as a terminal, and exits 1 if any
-command failed.
+command failed. It works in one collection: `--collection NAME` (`-c NAME`), or
+by default the default collection, where a pre-#3637 store's documents are
+(AGAST #3682). Before this flag the shell always CONNECTed as `shell`, so rows
+it wrote then are under `--collection shell`; `-c nexus_pages` browses the wiki.
 
 Not yet proven: it does **not** build with the self-hosted compiler.
 `./rz clean mausoleum && ./rz build mausoleum --compiler ritz1` fails at exit 1

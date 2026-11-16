@@ -116,9 +116,9 @@ def verified(res: subprocess.CompletedProcess) -> bool:
     return res.returncode == 0 and b"[OK]" in res.stdout and b"[FAIL]" not in res.stdout
 
 
-def shell(ctx: MausCtx, stdin: bytes) -> subprocess.CompletedProcess:
+def shell(ctx: MausCtx, stdin: bytes, *flags: str) -> subprocess.CompletedProcess:
     """`mausoleum shell` against the encrypted server."""
-    return run_cmd([str(ctx.m7m), "shell", "-p", str(ctx.porte)], ctx.work, stdin=stdin)
+    return run_cmd([str(ctx.m7m), "shell", "-p", str(ctx.porte), *flags], ctx.work, stdin=stdin)
 
 
 # --------------------------------------------------------------------------
@@ -285,6 +285,30 @@ def shell_crud(ctx: MausCtx) -> None:
         raise CheckFailed(f"shell get after delete -> exit {res.returncode}: {short(res.stdout[-90:], 90)}")
 
 
+def shell_collection(ctx: MausCtx) -> None:
+    # #3682: `--collection a` CONNECTs to "a"; without it the shell is on the
+    # default collection, so a row put into "a" shows up only under "a".
+    res = shell(ctx, b'put slug=only-in-a\nquit\n', "--collection", "a")
+    m = re.search(r"inserted (\d+)", res.stdout.decode(errors="replace"))
+    if res.returncode != 0 or not m:
+        raise CheckFailed(f"shell --collection a put -> exit {res.returncode}: {short(res.stdout[-120:], 120)}")
+    res = shell(ctx, b"list\nquit\n", "--collection", "a")
+    if res.returncode != 0 or b'slug="only-in-a"' not in res.stdout:
+        raise CheckFailed(f"shell --collection a list -> exit {res.returncode}: {short(res.stdout[-120:], 120)}")
+    res = shell(ctx, b"list\nquit\n")
+    if res.returncode != 0 or b"only-in-a" in res.stdout:
+        raise CheckFailed(f"default shell sees collection a -> exit {res.returncode}: {short(res.stdout[-120:], 120)}")
+    # The default is the store's default collection (not one named "shell"):
+    # a row put with no flag is listed under `--collection default`.
+    res = shell(ctx, b"put slug=in-default\nquit\n")
+    if res.returncode != 0:
+        raise CheckFailed(f"default shell put -> exit {res.returncode}: {short(res.stdout[-120:], 120)}")
+    res = shell(ctx, b"list\nquit\n", "--collection", "default")
+    if res.returncode != 0 or b'slug="in-default"' not in res.stdout:
+        raise CheckFailed(f"shell --collection default misses the default shell's row -> exit {res.returncode}: "
+                          f"{short(res.stdout[-120:], 120)}")
+
+
 def term_graceful_encrypted(ctx: MausCtx) -> None:
     if wal_bytes(ctx.work / "data-enc") <= WAL_CHECKPOINT_ONLY_SIZE:
         raise Broken("the encrypted server's writes left no WAL records to checkpoint")
@@ -301,7 +325,8 @@ AFTER_RESTART = (("restart_term", restart_term), ("restart_kill9", restart_kill9
                  ("seed_unreachable_exit", unreachable_exit))
 ENCRYPTED = (("seed_encrypted", seed_encrypted), ("shell_handshake", shell_handshake),
              ("shell_ping", shell_ping), ("shell_commands", shell_commands),
-             ("shell_crud", shell_crud), ("term_graceful_encrypted", term_graceful_encrypted))
+             ("shell_crud", shell_crud), ("shell_collection", shell_collection),
+             ("term_graceful_encrypted", term_graceful_encrypted))
 
 
 def suite_mausoleum(r: Reporter, procs: Procs, tmp: Path) -> None:
