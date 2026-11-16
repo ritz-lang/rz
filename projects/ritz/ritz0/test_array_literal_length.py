@@ -6,13 +6,17 @@ ruling R42, AGAST #3315 / #3382).
 did the same: C's footgun (R20). Both are now an error at the literal, and so is
 a longer one. `[0; N]` says the zero-fill out loud.
 
-ritz0 only: ritz1's half is AGAST #3383.
+Every row runs on ritz0, ritz1 and ritz1_selfhosted (AGAST #3383). Before
+#3383, ritz1 zero-filled or truncated a literal in a `let`, `var`, `const` or
+struct literal, and refused one in the other slots only by accident ("unlowerable
+expression", unlocated). ritz1 has no aggregate global initializer and no N-D
+`const`, so it refuses those rows twice: this error, then that one.
 """
 
 import pytest
 
 from array_rules import literal_length
-from test_ref_into_value import _assert_refused, _ids, _main, _run
+from test_ref_into_value import COMPILERS, _assert_refused, _ids, _main, _run
 
 # AGAST #2806: each test's rows share one compile (batching.py).
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
@@ -61,44 +65,51 @@ LITERALS = {
 
 
 @pytest.mark.parametrize("slot", _ids(SLOTS))
-def test_every_slot_refuses_a_short_literal(tmp_path, slot):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_every_slot_refuses_a_short_literal(tmp_path, compiler, slot):
     src = PRELUDE + SLOTS[slot].replace("{L}", "[1, 2]")
-    _assert_refused("ritz0", tmp_path, slot, _main(src, "    0\n"), literal_length(2, "[3]i64"))
+    _assert_refused(compiler, tmp_path, slot, _main(src, "    0\n"), literal_length(2, "[3]i64"))
 
 
 @pytest.mark.parametrize("literal", _ids(LITERALS))
-def test_every_literal_of_the_wrong_length_is_refused(tmp_path, literal):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_every_literal_of_the_wrong_length_is_refused(tmp_path, compiler, literal):
     text, n = LITERALS[literal]
     src = PRELUDE + SLOTS["let"].replace("{L}", text)
-    _assert_refused("ritz0", tmp_path, literal, _main(src, "    0\n"), literal_length(n, "[3]i64"))
+    _assert_refused(compiler, tmp_path, literal, _main(src, "    0\n"), literal_length(n, "[3]i64"))
 
 
-def test_an_inner_literal_is_judged_against_its_row(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_inner_literal_is_judged_against_its_row(tmp_path, compiler):
     src = PRELUDE + "fn f() -> i32\n    var m: [2][3]i64 = [ [1, 2, 3], ^[4, 5]]\n    0\n"
-    _assert_refused("ritz0", tmp_path, "inner", _main(src, "    0\n"), literal_length(2, "[3]i64"))
+    _assert_refused(compiler, tmp_path, "inner", _main(src, "    0\n"), literal_length(2, "[3]i64"))
 
 
-def test_an_inner_literal_of_a_const_is_judged_against_its_row(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_inner_literal_of_a_const_is_judged_against_its_row(tmp_path, compiler):
     src = PRELUDE + "const M: [2][3]i64 = [ [1, 2, 3], ^[4, 5]]\n\nfn f() -> i32\n    0\n"
-    _assert_refused("ritz0", tmp_path, "const_inner", _main(src, "    0\n"), literal_length(2, "[3]i64"))
+    _assert_refused(compiler, tmp_path, "const_inner", _main(src, "    0\n"), literal_length(2, "[3]i64"))
 
 
-def test_the_slots_alias_is_named_as_its_array(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_the_slots_alias_is_named_as_its_array(tmp_path, compiler):
     src = PRELUDE + "type Row = [3]i64\n\nfn f() -> i32\n    let b: Row = ^[1, 2]\n    0\n"
-    _assert_refused("ritz0", tmp_path, "alias", _main(src, "    0\n"), literal_length(2, "[3]i64"))
+    _assert_refused(compiler, tmp_path, "alias", _main(src, "    0\n"), literal_length(2, "[3]i64"))
 
 
-def test_one_element_is_singular(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_one_element_is_singular(tmp_path, compiler):
     src = PRELUDE + "fn f() -> i32\n    let b: [3]u8 = ^[1]\n    0\n"
-    _assert_refused("ritz0", tmp_path, "one", _main(src, "    0\n"), literal_length(1, "[3]u8"))
+    _assert_refused(compiler, tmp_path, "one", _main(src, "    0\n"), literal_length(1, "[3]u8"))
     assert literal_length(1, "[3]u8") == "an array literal of 1 element for a `[3]u8`"
 
 
 # Was `test_array_literal_shorter_than_declared` in
 # test/test_issue_slice_generic_siblings.ritz, which pinned the zero-fill.
-def test_the_old_zero_fill_corpus_row_is_refused(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_the_old_zero_fill_corpus_row_is_refused(tmp_path, compiler):
     src = PRELUDE + "fn f() -> i32\n    let buf: [4]u8 = ^[1, 2]\n    0\n"
-    _assert_refused("ritz0", tmp_path, "corpus", _main(src, "    0\n"),
+    _assert_refused(compiler, tmp_path, "corpus", _main(src, "    0\n"),
                     "an array literal of 2 elements for a `[4]u8`")
 
 
@@ -113,5 +124,6 @@ FITS = {
 
 
 @pytest.mark.parametrize("name", _ids(FITS))
-def test_a_literal_of_the_slots_length_fits(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, _main(PRELUDE + FITS[name], "    f()\n")) == 3
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_literal_of_the_slots_length_fits(tmp_path, compiler, name):
+    assert _run(compiler, tmp_path, name, _main(PRELUDE + FITS[name], "    f()\n")) == 3

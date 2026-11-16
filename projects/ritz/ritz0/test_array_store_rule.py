@@ -210,9 +210,6 @@ ELEMENTS = {
     "big_fill_global": "var G: [100]u8\n\nfn f() -> i32\n    G = [3; 100]\n    G[99] as i32 - 3\n",
     "big_fill_field": ("struct H\n    b: [100]u8\n\nfn f() -> i32\n    var h: H = H { b: [3; 100] }\n"
                        "    h.b[99] as i32 - 3\n"),
-    # ritz1 zero-fills it until AGAST #3383; ritz0 refuses it (LARB R42,
-    # test_array_literal_length.py), so the row is skipped there.
-    "short_literal": "fn f() -> i32\n    var b: [4]u8 = [1, 2]\n    b[1] as i32 - 2\n",
     # AGAST #3029: a payload's `[N]T` is the slot.
     "option_payload": "fn f() -> i32\n    var o: Option<[2]u8> = Some([0, 3])\n    0\n",
     "enum_payload": "enum Pay\n    V([2]u8)\n    N\n\nfn f() -> i32\n    var e: Pay = V([0, 3])\n    0\n",
@@ -230,8 +227,9 @@ ELEMENTS_RITZ0 = {
 }
 
 
-# Rows a compiler now refuses, by LARB ruling: their refusal is tested elsewhere.
-ELEMENTS_REFUSED = {("short_literal", "ritz0"): "LARB R42: test_array_literal_length.py"}
+# A short literal (`[1, 2]` into a `[4]u8`) was a row here, pinning ritz1's
+# zero-fill. Every compiler refuses it now (LARB R42, AGAST #3383):
+# test_array_literal_length.py's corpus row.
 
 
 # What can sit behind a store.  ritz0 finds the slot from the target, so each way
@@ -373,7 +371,7 @@ TABLE = [
     *(Row(f"a_literal_tail_takes_the_slots_element_type[{store}-{literal}]", RITZ0,
           Run(_literal_program(LITERAL_STORES_RITZ0[store], literal), 0))
       for store in sorted(LITERAL_STORES_RITZ0) for literal in sorted(LITERALS)),
-    *(Row(f"literal_elements[{name}]", tuple(c for c in ALL if (name, c) not in ELEMENTS_REFUSED),
+    *(Row(f"literal_elements[{name}]", ALL,
           _runs_f(ELEMENTS[name], 0)) for name in sorted(ELEMENTS)),
     *(Row(f"literal_elements_ritz0[{name}]", RITZ0, _runs_f(ELEMENTS_RITZ0[name], 0))
       for name in sorted(ELEMENTS_RITZ0)),

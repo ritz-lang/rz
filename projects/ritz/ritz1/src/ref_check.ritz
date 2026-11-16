@@ -65,6 +65,9 @@ pub struct RefTy
     # ref_ptr_ptr_slot sets it, and only a struct T has one.
     held_name: *u8
     held_name_len: i32
+    # AGAST #3383 (LARB R42): N for an array kind, d0 for `[d0][d1]..T`, which
+    # a literal landing here must be as long as; 0 if unknown.
+    array_len: i32
 
 # A tail and the slot it lands in.
 struct RefTail
@@ -122,23 +125,29 @@ fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.ptr_pointee = TYPE_VOID
     out.held_name = null
     out.held_name_len = 0
+    out.array_len = 0
     1
 
-fn ref_set_array(out: *RefTy, elem: i32, elem_pointee: i32, name: *u8, len: i32, shape: *ArrayShape) -> i32
+# `n` is the array's N (its d0 for a `shape`), 0 if unknown.
+fn ref_set_array(out: *RefTy, elem: i32, elem_pointee: i32, name: *u8, len: i32, shape: *ArrayShape, n: i32) -> i32
     ref_set(out, TYPE_ARRAY, elem, name, len)
     out.elem_pointee = elem_pointee
     out.shape = shape
+    out.array_len = n
+    if shape != null
+        out.array_len = shape.dims[0]
     1
 
+# An ArrayElem keeps no N: a fn's `-> [N]T` has it on ret_array_param.
 fn ref_set_elem(out: *RefTy, a: *ArrayElem) -> i32
-    ref_set_array(out, a.elem, a.pointee, a.name, a.name_len, a.shape)
+    ref_set_array(out, a.elem, a.pointee, a.name, a.name_len, a.shape, 0)
 
 # `out` is what `a[i]` holds for `[N][M]T`: 0 past two dimensions, or for a
 # one-dimensional `a`.
 fn ref_row(a: *RefTy, out: *RefTy) -> i32
     if a.shape == null or a.shape.rank != 2
         return 0
-    ref_set_array(out, a.shape.leaf_type, a.shape.leaf_pointee, a.shape.leaf_name, a.shape.leaf_name_len, null)
+    ref_set_array(out, a.shape.leaf_type, a.shape.leaf_pointee, a.shape.leaf_name, a.shape.leaf_name_len, null, a.shape.dims[1])
 
 pub fn ref_is_pointer(kind: i32) -> i32
     if kind == TYPE_PTR or kind == TYPE_REF or kind == TYPE_MUT_REF
@@ -157,7 +166,7 @@ fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
         out.ptr_pointee = loc.ref_ptr_pointee
         return 1
     if t == TYPE_ARRAY
-        return ref_set_array(out, loc.array_elem_type, loc.array_elem_pointee, loc.type_name, loc.type_name_len, loc.array_shape)
+        return ref_set_array(out, loc.array_elem_type, loc.array_elem_pointee, loc.type_name, loc.type_name_len, loc.array_shape, loc.array_size)
     if t == TYPE_PTR_PTR
         return 0
     ref_set(out, t, 0, loc.type_name, loc.type_name_len)
@@ -174,7 +183,7 @@ fn ref_of_ident(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
     if g.var_type == TYPE_PTR_PTR
         return 0
     if g.var_type == TYPE_ARRAY
-        return ref_set_array(out, g.array_elem_type, g.array_elem_pointee, g.array_elem_type_name, g.array_elem_type_name_len, g.array_shape)
+        return ref_set_array(out, g.array_elem_type, g.array_elem_pointee, g.array_elem_type_name, g.array_elem_type_name_len, g.array_shape, g.array_size)
     ref_set(out, g.var_type, 0, g.type_name, g.type_name_len)
 
 fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
@@ -183,7 +192,10 @@ fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
     if f.ret_ref != null
         return ref_of_param(f.ret_ref, out)
     if f.ret_array != null
-        return ref_set_elem(out, f.ret_array)
+        ref_set_elem(out, f.ret_array)
+        if f.ret_array_param != null
+            out.array_len = f.ret_array_param.param_array_size   # AGAST #3383
+        return 1
     if f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR
         # FnDef keeps no pointee, only a struct's name.
         if f.return_type_name_len > 0 and f.return_type == TYPE_PTR
@@ -197,7 +209,7 @@ fn ref_of_param(p: *Param, out: *RefTy) -> i32
     if p.param_type == TYPE_PTR_PTR
         return 0
     if p.param_type == TYPE_ARRAY
-        return ref_set_array(out, p.param_array_elem_type, p.param_array_elem_pointee, p.param_type_name, p.param_type_name_len, null)
+        return ref_set_array(out, p.param_array_elem_type, p.param_array_elem_pointee, p.param_type_name, p.param_type_name_len, null, p.param_array_size)
     ref_set(out, p.param_type, p.param_pointee_type, p.param_type_name, p.param_type_name_len)
     if p.param_pointee_type == TYPE_ARRAY
         out.ref_size = p.param_pointee_array_size
@@ -225,7 +237,7 @@ fn ref_of_field(s: *EmitterState, e: *Expr, f: *StructField, out: *RefTy) -> i32
     ref_set(out, t, 0, f.field_type_name, f.field_type_name_len)
 
 fn ref_of_array_field(f: *StructField, out: *RefTy) -> i32
-    ref_set_array(out, f.array_elem_type, f.array_elem_pointee, f.array_elem_type_name, f.array_elem_type_name_len, f.array_shape)
+    ref_set_array(out, f.array_elem_type, f.array_elem_pointee, f.array_elem_type_name, f.array_elem_type_name_len, f.array_shape, f.array_size)
 
 # The method `e` (EXPR_METHOD) calls, on the receiver's own type.
 pub fn ref_method_def(s: *EmitterState, e: *Expr) -> *FnDef
@@ -353,7 +365,11 @@ fn ref_behind(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
     let loc: *LocalVar = local_at(s, idx)
     var en_len: i32 = 0
     let en: *u8 = array_ptr_elem_name(loc, @en_len)   # #2548
-    ref_set_array(out, loc.pointee_array_elem_type, loc.pointee_array_elem_pointee, en, en_len, null)
+    # A plane's pointee_array_size is its flat count, not N: unknown here.
+    var n: i32 = loc.pointee_array_size
+    if loc.pointee_array_shape != null
+        n = 0
+    ref_set_array(out, loc.pointee_array_elem_type, loc.pointee_array_elem_pointee, en, en_len, null, n)
 
 # Does the place `e` lie behind an `@T`, `@&T`, `*T` or `:&`?  ritz0's
 # MoveChecker._through_reference.
@@ -757,6 +773,25 @@ fn ref_note_stmts(list: *Stmt, slot: *RefTy)
     else if st.kind == STMT_MATCH
         ref_note_arms(st.if_then as *MatchArm, slot)
 
+# AGAST #3383 (LANGUAGE_SPEC §3.3, LARB R42): an array literal or fill is its
+# array slot's N long, at every slot.  ast_helpers has the rule and its words;
+# ref_into reaches each nested literal with its row as the slot.
+fn ref_literal_length(s: *EmitterState, e: *Expr, slot: *RefTy)
+    var one: ArrayShape
+    var shape: *ArrayShape = slot.shape
+    if shape == null
+        one.rank = 1
+        one.dims[0] = slot.array_len
+        one.leaf_type = slot.pointee
+        one.leaf_name = slot.name
+        one.leaf_name_len = slot.name_len
+        one.leaf_pointee = slot.elem_pointee
+        shape = @one
+    if array_lit_wrong_length(e, shape, 0) == 0 or ref_first_report(e.span.line, e.span.col) == 0
+        return
+    array_lit_length_report(fn_source_file(emitter_current_fn()), e, shape, 0)
+    s.error_count = s.error_count + 1
+
 # `e`'s value lands in `slot`.
 fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
     if e == null or slot.kind == TYPE_VOID and slot.returned == 0
@@ -771,6 +806,8 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
         ref_check_return(s, e)
     if slot.kind == TYPE_VOID
         return
+    if slot.kind == TYPE_ARRAY
+        ref_literal_length(s, e, slot)
     if e.kind == EXPR_ARRAY_LIT and slot.kind == TYPE_ARRAY
         var part: RefTy
         ref_element(slot, @part)
@@ -1420,7 +1457,7 @@ fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
     if stmt.var_type == TYPE_PTR_PTR
         return ref_ptr_ptr_slot(out, stmt.var_inner_pointee_type, stmt.var_type_name, stmt.var_type_name_len)
     if stmt.var_type == TYPE_ARRAY
-        return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, stmt.var_type_name, stmt.var_type_name_len, stmt.var_array_shape)
+        return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, stmt.var_type_name, stmt.var_type_name_len, stmt.var_array_shape, stmt.var_array_size)
     ref_set(out, stmt.var_type, stmt.var_pointee_type, stmt.var_type_name, stmt.var_type_name_len)
     if stmt.var_pointee_type == TYPE_ARRAY
         out.ref_size = stmt.var_pointee_array_size

@@ -1206,6 +1206,7 @@ pub fn trait_decl_refused(name: *u8, len: i32, line: i32) -> i32
 
 # Grammar signature: global_var_new(p, name, len, var_type, init_expr, line, col)
 pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr: *Expr, line: i32, col: i32) -> *GlobalVarDef
+    array_lit_length_decl(p, var_type, init_expr)   # AGAST #3383 (LARB R42)
     # AGAST #190: bumped from 64 → 96 to fit the array_* fields below.
     # Without the extra slack, parser_alloc handed back 64 bytes and the
     # `array_*` writes scribbled past the end of the allocation into the
@@ -1979,6 +1980,7 @@ pub fn field_link(first: *StructField, rest: *StructField) -> *StructField
 
 pub fn const_new(p: *Parser, name: *u8, len: i32, ty: i32, val: *Expr, line: i32, col: i32) -> *ConstEntry
     nd_array_reject(p, ty, line, col, c"a const")  # AGAST #1509
+    array_lit_length_decl(p, ty, val)   # AGAST #3383 (LARB R42)
     # Bumped from 40 → 128 to fit the extra metadata fields appended to
     # ConstEntry for non-integer constants (value_expr, array_size, etc.).
     let c: *ConstEntry = parser_alloc(p, sizeof(ConstEntry)) as *ConstEntry
@@ -2767,6 +2769,137 @@ fn nd_array_report(line: i32, col: i32, what: *u8) -> i32
     eprints_cstr(what)
     eprintln_cstr(c" in ritz1 (only a local or global `var` or a struct field can be one)")
     return 1
+
+# =============================================================================
+# An array literal's length is its slot's N (LANGUAGE_SPEC §3.3, LARB R42)
+# =============================================================================
+#
+# AGAST #3383.  A list or fill must be exactly as long as the `[N]T` it fills:
+# nothing is zero-filled, and a longer one is refused the same, at the literal.
+# ritz0's twin is TypeChecker._check_literal_length; ritz0/array_rules.py has the
+# wording, and ritz0/test_array_literal_length.py holds all three compilers to it.
+#
+# A slot is an ArrayShape read from depth `at`: dims[at..rank) around a leaf
+# (rank 1 for a `[N]T`).  ref_check judges the slots inside a fn (ref_into); a
+# const's and a global's initialiser is judged here as it is parsed, every
+# nested literal against its row.  A length of 0 is one the caller doesn't know,
+# and a leaf this can't spell goes unjudged: wrongly refusing is worse.
+
+# How many elements the array literal or fill `e` has; -1 for anything else.
+pub fn array_lit_elements(e: *Expr) -> i64
+    if e == null
+        return -1
+    if e.kind == EXPR_ARRAY_FILL
+        return e.int_val
+    if e.kind != EXPR_ARRAY_LIT
+        return -1
+    var n: i64 = 0
+    var el: *Expr = e.args
+    while el != null
+        n += 1
+        el = el.next
+    n
+
+# `T` as Ritz spells it, for a primitive or struct T; null for anything else.
+fn array_leaf_spell(kind: i32, name: *u8, name_len: i32, out_len: *i32) -> *u8
+    let prim: *u8 = primitive_name_from_type(kind)
+    if prim != null
+        *out_len = primitive_name_len(kind)
+        return prim
+    if kind == TYPE_STRUCT and name_len > 0
+        *out_len = name_len
+        return name
+    null
+
+# 1 if `e` is an array literal or fill of another length than the slot
+# `shape` from `at`, which this can spell.  Only `e` itself is judged.
+pub fn array_lit_wrong_length(e: *Expr, shape: *ArrayShape, at: i32) -> i32
+    if at >= shape.rank or shape.dims[at] <= 0
+        return 0
+    let have: i64 = array_lit_elements(e)
+    if have < 0 or have == shape.dims[at] as i64
+        return 0
+    var i: i32 = at
+    while i < shape.rank
+        if shape.dims[i] <= 0
+            return 0
+        i += 1
+    var kind: i32 = shape.leaf_type
+    if kind == TYPE_PTR
+        kind = shape.leaf_pointee
+    var len: i32 = 0
+    if array_leaf_spell(kind, shape.leaf_name, shape.leaf_name_len, @len) == null
+        return 0
+    1
+
+# The error itself, at `e`, in `file`; array_lit_wrong_length(e, shape, at) is 1.
+pub fn array_lit_length_report(file: *u8, e: *Expr, shape: *ArrayShape, at: i32)
+    diag_error_at(file, e.span)
+    let have: i64 = array_lit_elements(e)
+    eprints_cstr(c"an array literal of ")
+    eprint_i64(have)
+    if have == 1
+        eprints_cstr(c" element for a `")
+    else
+        eprints_cstr(c" elements for a `")
+    var i: i32 = at
+    while i < shape.rank
+        eprint_char('[')
+        eprint_i64(shape.dims[i] as i64)
+        eprint_char(']')
+        i += 1
+    var kind: i32 = shape.leaf_type
+    if kind == TYPE_PTR
+        eprint_char('*')
+        kind = shape.leaf_pointee
+    var len: i32 = 0
+    let leaf: *u8 = array_leaf_spell(kind, shape.leaf_name, shape.leaf_name_len, @len)
+    for j in 0..len
+        eprint_char(*(leaf + j))
+    eprintln_cstr(c"`")
+
+# The last place a const or global literal was reported: the grammar can re-run
+# an action while backtracking.
+var g_lit_len_line: i32 = -1
+var g_lit_len_col: i32 = -1
+
+# `e` and every literal nested in it, row by row, against `shape` from `at`: a
+# const's or a global's initialiser.  Each is a parse error.
+fn array_lit_length_walk(e: *Expr, shape: *ArrayShape, at: i32)
+    if e == null or at >= shape.rank
+        return
+    if array_lit_wrong_length(e, shape, at) == 1
+        if e.span.line == g_lit_len_line and e.span.col == g_lit_len_col
+            return
+        g_lit_len_line = e.span.line
+        g_lit_len_col = e.span.col
+        g_attr_errors = g_attr_errors + 1
+        array_lit_length_report(g_parse_file, e, shape, at)
+        return
+    if e.kind == EXPR_ARRAY_FILL
+        array_lit_length_walk(e.left, shape, at + 1)
+    else if e.kind == EXPR_ARRAY_LIT
+        var el: *Expr = e.args
+        while el != null
+            array_lit_length_walk(el, shape, at + 1)
+            el = el.next
+
+# A const's or global's `[N]..T` initialiser, as the parser has just latched
+# the type: the N-D shape if there is one, else `[N]T` from p.last_array_*.
+pub fn array_lit_length_decl(p: *Parser, ty: i32, init: *Expr)
+    if ty != TYPE_ARRAY or init == null
+        return
+    if p.last_array_shape != null
+        array_lit_length_walk(init, p.last_array_shape, 0)
+        return
+    var one: ArrayShape
+    one.rank = 1
+    one.dims[0] = p.last_array_size
+    one.leaf_type = p.last_array_elem_type
+    one.leaf_name = p.last_array_elem_type_name
+    one.leaf_name_len = p.last_array_elem_type_name_len
+    one.leaf_pointee = p.last_array_elem_pointee
+    array_lit_length_walk(init, @one, 0)
 
 # AGAST #2298: the furthest `dyn` reported in this file, null for none.  The
 # grammar re-runs dyn_kw's action each time it backtracks over a `dyn`, and a
