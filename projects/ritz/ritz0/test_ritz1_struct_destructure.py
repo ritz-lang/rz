@@ -378,7 +378,7 @@ def test_ref_field_is_a_located_error(compile_with, compiler):
     comp, _ll, _work = compile_with(compiler, "ref_field", REF_FIELD)
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, out
-    assert ":8:5: ritz1 can't destructure a field of this type" in out, out
+    assert ":8:5: error: ritz1 can't destructure a field of this type" in out, out
 
 
 @pytest.mark.integration

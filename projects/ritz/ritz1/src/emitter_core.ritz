@@ -597,8 +597,10 @@ pub fn emit_name(s: *EmitterState, name: *u8, len: i32)
 
 # AGAST #3257: how many counted errors were printed WITHOUT a file:line:col,
 # out of s.error_count.  Since #3445 the emit_ir_error family is located, so
-# only the errors that have no source construct to point at count here (the
-# multi-dimensional global leak tally in emitter.ritz).  main prints its
+# only the errors that have no source construct to point at count here (in
+# emitter.ritz: the multi-dimensional global leak tally, and a source
+# `struct StrView` / `Span$u8` of the wrong layout, since a StructDef
+# records no position).  main prints its
 # "emitted N unlowerable expression(s)" summary only when this is non-zero:
 # after a located error it is noise.  emit_module runs once per process.
 var g_emit_unlocated: i32 = 0
@@ -707,24 +709,13 @@ pub fn slot_struct_name(s: *EmitterState, out_len: *i32) -> *u8
     return s.ret_type_name
 
 # AGAST #1509: a multi-dimensional array use ritz1 does not lower, as
-# `error: <file>:<line>:<col>: <msg>`.  Counts like emit_ir_error, so the
+# `<file>:<line>:<col>: error: <msg>`.  Counts like emit_ir_error, so the
 # driver refuses to write the output.
 pub fn emit_nd_error(s: *EmitterState, line: i32, col: i32, msg: *u8)
     emit_str(s, c"  ; ERROR: ")
     emit_str(s, msg)
     emit_str(s, c"\n")
-    eprints_cstr(c"error: ")
-    if g_emit_file != null
-        eprints_cstr(g_emit_file)
-    else
-        eprints_cstr(c"<input>")
-    eprints_cstr(c":")
-    eprint_int(line as i64)
-    eprints_cstr(c":")
-    eprint_int(col as i64)
-    eprints_cstr(c": ")
-    eprints_cstr(msg)
-    eprints_cstr(c"\n")
+    diag_error(g_emit_file, diag_span(line, col), msg)
     s.error_count = s.error_count + 1
 
 # AGAST #1813 — where the emitter is, for fatal capacity errors: the input
@@ -752,8 +743,11 @@ const ASSERT_FN_HELPER: i32 = 2   # [[test_helper]]: reports the test's call sit
 # A fixed ritz1 table is full.  Print a located error and exit: carrying on
 # without the entry is exactly the silent miscompile this replaces, and the
 # driver has not written the output yet.
+#
+# `<file>:<line>: error: in fn 'f': <what> ...`.  A FnDef records its line
+# but no column, so this is the one emitter error diag_loc can't print
+# (#3445): it would have to invent the column.
 fn emit_fatal_limit(what: *u8, limit: i32)
-    eprints_cstr(c"error: ")
     if g_emit_file != null
         eprints_cstr(g_emit_file)
     else
@@ -761,13 +755,14 @@ fn emit_fatal_limit(what: *u8, limit: i32)
     # Through a local: ritz1 cannot lower a member read on a global pointer.
     let f: *FnDef = g_emit_fn
     if f != null
-        eprints_cstr(c":")
+        eprint_char(':')
         eprint_int(f.line as i64)
-        eprints_cstr(c": in fn '")
+        eprints_cstr(c": error: in fn '")
         for i in 0..f.name_len
             eprint_char(*(f.name + i))
-        eprints_cstr(c"'")
-    eprints_cstr(c": ")
+        eprints_cstr(c"': ")
+    else
+        eprints_cstr(c": error: ")
     eprints_cstr(what)
     eprints_cstr(c" (ritz1's limit is ")
     eprint_int(limit as i64)
@@ -3638,24 +3633,15 @@ pub fn qualified_variant_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_le
     *out_name = enum_name_at(ei, out_len)
 
 # AGAST #1466: a qualified variant ritz1 cannot build, as
-# `error: <file>:<line>:<col>: 'E.V' <msg>`.  Counted like emit_ir_error, so
+# `<file>:<line>:<col>: error: 'E.V' <msg>`.  Counted like emit_ir_error, so
 # no output is written; returns a placeholder register.  Also `'Span.empty'`
 # with no slot to type it (AGAST #2296): any `Type.method` call fits.
 pub fn emit_qualified_variant_error(s: *EmitterState, e: *Expr, msg: *u8) -> i32
     emit_str(s, c"  ; ERROR: qualified variant ")
     emit_str(s, msg)
     emit_str(s, c"\n")
-    eprints_cstr(c"error: ")
-    let file: *u8 = emitter_source_file()
-    if file != null
-        eprints_cstr(file)
-    else
-        eprints_cstr(c"<input>")
-    eprints_cstr(c":")
-    eprint_int(e.span.line as i64)
-    eprints_cstr(c":")
-    eprint_int(e.span.col as i64)
-    eprints_cstr(c": '")
+    diag_error_at(emitter_source_file(), e.span)
+    eprints_cstr(c"'")
     eprint_bytes(e.left.ident_ptr, e.left.ident_len)
     eprints_cstr(c".")
     eprint_bytes(e.ident_ptr, e.ident_len)
@@ -3698,17 +3684,8 @@ pub fn is_module_item(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32) -> i32
 # emit_ir_error, so no output is written.  Returns a dummy register.
 pub fn emit_module_item_error(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32, line: i32, col: i32) -> i32
     emit_str(s, c"  ; ERROR: module.item access\n")
-    eprints_cstr(c"error: ")
-    let file: *u8 = emitter_source_file()
-    if file != null
-        eprints_cstr(file)
-    else
-        eprints_cstr(c"<input>")
-    eprints_cstr(c":")
-    eprint_int(line as i64)
-    eprints_cstr(c":")
-    eprint_int(col as i64)
-    eprints_cstr(c": `")
+    diag_error_at(emitter_source_file(), diag_span(line, col))
+    eprint_char('`')
     eprint_bytes(q, ql)
     eprints_cstr(c".")
     eprint_bytes(n, nl)
@@ -3736,17 +3713,8 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name: *u8, len: i32, span:
     emit_str(s, c"  ; ERROR: ambiguous enum variant '")
     emit_name(s, name, len)
     emit_str(s, c"'\n")
-    eprints_cstr(c"error: ")
-    let file: *u8 = emitter_source_file()
-    if file != null
-        eprints_cstr(file)
-    else
-        eprints_cstr(c"<input>")
-    eprints_cstr(c":")
-    eprint_int(span.line as i64)
-    eprints_cstr(c":")
-    eprint_int(span.col as i64)
-    eprints_cstr(c": ambiguous enum variant '")
+    diag_error_at(emitter_source_file(), span)
+    eprints_cstr(c"ambiguous enum variant '")
     eprint_bytes(name, len)
     eprints_cstr(c"': declared by enum '")
     eprint_bytes(a, a_len)
@@ -4658,9 +4626,9 @@ pub fn ptr_pointee_size(s: *EmitterState, pointee: i32, name: *u8, name_len: i32
 # "pointer arithmetic on '<name>': element size unknown" — a counted error,
 # so main refuses to write the output.  Returns 1 only so the caller can
 # finish emitting a syntactically complete instruction; the result is never
-# linked because the error count is non-zero.
-fn ptr_elem_size_unknown(s: *EmitterState, name: *u8, name_len: i32) -> i64
-    emit_ir_error_begin(s, c"pointer arithmetic: element size of pointee unknown for '")
+# linked because the error count is non-zero.  `span` is the operand's.
+fn ptr_elem_size_unknown(s: *EmitterState, span: SrcSpan, name: *u8, name_len: i32) -> i64
+    emit_ir_error_begin(s, span, c"pointer arithmetic: element size of pointee unknown for '")
     emit_ir_error_end(s, name, name_len)
     return 1
 
@@ -4735,7 +4703,7 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
     if e.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
         if loc == null
-            return ptr_elem_size_unknown(s, e.ident_ptr, e.ident_len)
+            return ptr_elem_size_unknown(s, e.span, e.ident_ptr, e.ident_len)
         # For TYPE_PTR_PTR the element is a pointer (8 bytes)
         if loc.var_type == TYPE_PTR_PTR
             return 8
@@ -4750,7 +4718,7 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
             let size: i64 = ptr_pointee_size(s, loc.pointee_type, loc.type_name, loc.type_name_len)
             if size > 0
                 return size
-        return ptr_elem_size_unknown(s, e.ident_ptr, e.ident_len)
+        return ptr_elem_size_unknown(s, e.span, e.ident_ptr, e.ident_len)
     if e.kind == EXPR_MEMBER
         # AGAST #1673: any member chain (`o.inner.buf.p`), not just `local.f`.
         let field: *StructField = member_field_def(s, e)
@@ -4768,8 +4736,8 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
                     fsize = ptr_pointee_size(s, field.array_elem_type, null, 0)
                 if fsize > 0
                     return fsize
-        return ptr_elem_size_unknown(s, e.ident_ptr, e.ident_len)
-    emit_ir_error(s, c"pointer arithmetic: element size of pointee unknown for a non-name operand")
+        return ptr_elem_size_unknown(s, e.span, e.ident_ptr, e.ident_len)
+    emit_ir_error(s, e.span, c"pointer arithmetic: element size of pointee unknown for a non-name operand")
     return 1
 
 # AGAST #2332: U when `x` is an element of a `[N]*U` array (local, param, global,
@@ -5377,11 +5345,7 @@ pub fn ptr_arith_elem_size(s: *EmitterState, e: *Expr) -> i64
         # be a raw byte add.  Fail closed (#1451), as a local's stride does.
         if csz > 0
             return csz
-        eprint_i64(e.span.line as i64)
-        eprint_char(':')
-        eprint_i64(e.span.col as i64)
-        eprints_cstr(c": ")
-        return ptr_elem_size_unknown(s, fd.name, fd.name_len)
+        return ptr_elem_size_unknown(s, e.span, fd.name, fd.name_len)
     if e.kind == EXPR_CAST and e.op == TYPE_PTR
         # AGAST #2540: `(x as *T) + k`.  apply_cast_tail records the pointee
         # kind on int_val and a struct pointee's name on ident_ptr (#1453).
@@ -5403,14 +5367,14 @@ fn index_elem_size(s: *EmitterState, idx: *Expr) -> i64
             let lsize: i64 = ptr_pointee_size(s, loc.array_elem_type, loc.type_name, loc.type_name_len)
             if lsize > 0
                 return lsize
-            return ptr_elem_size_unknown(s, base.ident_ptr, base.ident_len)
+            return ptr_elem_size_unknown(s, base.span, base.ident_ptr, base.ident_len)
         if loc == null
             let glob: *GlobalVarDef = find_global(s, base.ident_ptr, base.ident_len)
             if glob != null and glob.var_type == TYPE_ARRAY
                 let gsize: i64 = ptr_pointee_size(s, glob.array_elem_type, glob.array_elem_type_name, glob.array_elem_type_name_len)
                 if gsize > 0
                     return gsize
-                return ptr_elem_size_unknown(s, base.ident_ptr, base.ident_len)
+                return ptr_elem_size_unknown(s, base.span, base.ident_ptr, base.ident_len)
     # AGAST #2440: through a reference or pointer it's the buffer's element.
     let through: *LocalVar = index_through(s, idx)
     if through != null and through.array_base != null
@@ -5851,19 +5815,10 @@ pub fn mem_builtin_pointee(s: *EmitterState, arg: *Expr) -> i32
     d.span = arg.span
     get_expr_type(s, d)
 
-# `error: <file>:<line>:<col>: <builtin name> <msg>` (AGAST #1879).
+# `<file>:<line>:<col>: error: <builtin name> <msg>` (AGAST #1879).
 pub fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: *u8)
     emit_str(s, c"  ; ERROR: memory builtin\n")
-    eprints_cstr(c"error: ")
-    if g_emit_file != null
-        eprints_cstr(g_emit_file)
-    else
-        eprints_cstr(c"<input>")
-    eprints_cstr(c":")
-    eprint_int(e.span.line as i64)
-    eprints_cstr(c":")
-    eprint_int(e.span.col as i64)
-    eprints_cstr(c": ")
+    diag_error_at(g_emit_file, e.span)
     var i: i32 = 0
     while i < e.func_name_len
         eprint_char(*(e.func_name + i))

@@ -601,7 +601,8 @@ def test_a_bare_place_of_another_sign_is_refused(tmp_path, compiler):
     comp, ll, _ = _compile_three(compiler, tmp_path, "bare_sign", BARE_SIGN)
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0 and not ll.exists(), out
-    assert "main.ritz:6:7: argument 1 of `w` has the wrong type" in out, out
+    # ritz1 prints `error: ` after the location (diag, AGAST #3445); ritz0 doesn't.
+    assert re.search(r"main\.ritz:6:7: (error: )?argument 1 of `w` has the wrong type", out), out
 
 
 @pytest.mark.integration

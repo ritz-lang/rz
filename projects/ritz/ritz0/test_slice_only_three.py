@@ -78,7 +78,8 @@ def test_only_string_vec_and_span_slice(compile_with, case, compiler):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} took {case}"
     line, col = _where(program)
-    assert f"main.ritz:{line}:{col}: {what} {ONLY_THREE}" in out, out[-1000:]
+    sep = "" if compiler == "ritz0" else "error: "   # ritz1: diag (AGAST #3445)
+    assert f"main.ritz:{line}:{col}: {sep}{what} {ONLY_THREE}" in out, out[-1000:]
     # One refusal, not a cascade, and no Python traceback from ritz0.
     assert out.count(ONLY_THREE) == 1, out[-1000:]
     assert "Traceback" not in out, out[-1000:]

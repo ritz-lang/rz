@@ -67,20 +67,23 @@ fn main() -> i32
     return no_such_name
 """
 
-_HAS_NO_FIELD = "unit.ritz:6:7: `Holder` has no field `0`"
-_UNKNOWN = "cannot emit: unknown identifier"
+_HAS_NO_FIELD = "unit.ritz:6:7: error: `Holder` has no field `0`"
+# AGAST #3445: the emit_ir_error family is located now, so these earn no
+# summary either.
+_UNKNOWN = "unit.ritz:2:12: error: ritz1 cannot emit: unknown identifier"
+_UNKNOWN_BOTH = "unit.ritz:9:12: error: ritz1 cannot emit: unknown identifier"
 
 # name -> (source, messages that must appear, expected summary line or None)
 CASES = {
     "located_only": (_LOCATED, [_HAS_NO_FIELD], None),
-    "unlocated_only": (_UNLOCATED, [_UNKNOWN], f"error: ritz1 emitted 1 {SUMMARY}"),
+    "unlocated_only": (_UNLOCATED, [_UNKNOWN], None),
     "unlocated_plain": (
         _UNLOCATED_PLAIN,
-        ["cannot emit: wrong number of arguments to integer BitOps method"],
-        f"error: ritz1 emitted 1 {SUMMARY}",
+        ["unit.ritz:3:5: error: ritz1 cannot emit: wrong number of arguments to integer BitOps method"],
+        None,
     ),
     "located_and_unlocated": (
-        _BOTH, [_HAS_NO_FIELD, _UNKNOWN], f"error: ritz1 emitted 1 {SUMMARY}"
+        _BOTH, [_HAS_NO_FIELD, _UNKNOWN_BOTH], None
     ),
 }
 

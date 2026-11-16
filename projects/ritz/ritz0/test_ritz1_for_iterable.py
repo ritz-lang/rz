@@ -603,8 +603,8 @@ def test_ritz0_a_boxs_own_field_comes_first(run_with):
 # the Box's own `ptr`, even when `T` has one").  Refused at the iterable on all
 # three compilers; ritz0 raised a bare NotImplementedError traceback until #3007.
 _REFUSED_ITERABLE = {"ritz0": "for loop iterable not supported",
-                     "ritz1": "this `for` iterable is not supported",
-                     "ritz1_selfhosted": "this `for` iterable is not supported"}
+                     "ritz1": "error: this `for` iterable is not supported",
+                     "ritz1_selfhosted": "error: this `for` iterable is not supported"}
 
 
 @pytest.mark.integration
@@ -1026,7 +1026,7 @@ def _is_refused(comp, ll, message, program):
 @pytest.mark.parametrize("name", sorted(NOT_LOWERED_ND))
 def test_a_multi_dimensional_array_is_refused(compile_with, compiler, name):
     comp, ll, _ = compile_with(compiler, name, NOT_LOWERED_ND[name])
-    _is_refused(comp, ll, ND_MESSAGE, NOT_LOWERED_ND[name])
+    _is_refused(comp, ll, "error: " + ND_MESSAGE, NOT_LOWERED_ND[name])
 
 
 UNSUPPORTED = "this `for` iterable is not supported in ritz1"
@@ -1055,7 +1055,7 @@ BOTH_REFUSE = {
 def test_anything_else_is_a_located_error(compile_with, compiler, name):
     program = BOTH_REFUSE[name]
     comp, ll, _ = compile_with(compiler, name, program)
-    _is_refused(comp, ll, UNSUPPORTED, program)
+    _is_refused(comp, ll, "error: " + UNSUPPORTED, program)
 
 
 @pytest.mark.integration

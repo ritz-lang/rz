@@ -46,6 +46,7 @@ import ast
 import ast_helpers
 import tokens_gen
 import emitter_core
+import diag                 # diag_error_at (AGAST #3445)
 import let_check           # let_check_expr (AGAST #2028)
 import emitter_expr
 import emitter_expr_call     # is_variant_carrier, is_variant_null, resolve_enum_ctx
@@ -606,7 +607,7 @@ fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, resu
             result.int_arms = result.int_arms + 1
             return body_reg
         if result.int_arms > 0
-            emit_ir_error(s, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+            emit_ir_error(s, arm_body.span, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
         result.float_ty = aft
         return body_reg
     if aft == result.float_ty
@@ -619,14 +620,14 @@ fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, resu
     # BEFORE the first float arm is above: the rule doesn't depend on order.
     # The slot is known before any arm is emitted, so no pre-pass is needed.
     if is_int and result.hint_ty == 0
-        emit_ir_error(s, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        emit_ir_error(s, arm_body.span, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
         return body_reg
     # AGAST #3313, LARB R43a: an integer arm lands in the float slot as
     # `let a: f64 = x` does (§7.5): a literal or an exact type (i32 into
     # f64) converts, a lossy one (i64) is refused (ritz0 does the same).
     if is_int
         return int_into_float_slot(s, body_reg, arm_body, result.float_ty)
-    emit_ir_error(s, c"match arm yields a non-numeric value where the other arms yield a float")
+    emit_ir_error(s, arm_body.span, c"match arm yields a non-numeric value where the other arms yield a float")
     body_reg
 
 # AGAST #1946: the merge phi's type: the arms' struct, their float, or i64.
@@ -943,7 +944,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
 # would leave the array unwritten, and is refused.
 fn match_arm_array_into(s: *EmitterState, arm: *MatchArm, into: *ArrayInto)
     if arm.is_pass == 1
-        emit_ir_error(s, c"a `match` arm stored into a whole array has no value (`pass`); give it an `[N]T`")
+        emit_ir_error(s, arm.pass_span, c"a `match` arm stored into a whole array has no value (`pass`); give it an `[N]T`")
         return
     if arm.body == null
         return
@@ -1065,17 +1066,8 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
     for vi in 0..n
         if enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
             var vf: *StructField = enum_variant_fields(ei, vi)
-            eprints_cstr(c"error: ")
-            let file: *u8 = emitter_source_file()
-            if file != null
-                eprints_cstr(file)
-            else
-                eprints_cstr(c"<input>")
-            eprints_cstr(c":")
-            eprint_int(cast.span.line as i64)
-            eprints_cstr(c":")
-            eprint_int(cast.span.col as i64)
-            eprints_cstr(c": cannot convert enum '")
+            diag_error_at(emitter_source_file(), cast.span)
+            eprints_cstr(c"cannot convert enum '")
             eprint_bytes(en, en_len)
             eprints_cstr(c"' to an integer: variant '")
             eprint_bytes(vf.name, vf.name_len)
@@ -2269,7 +2261,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     else if is_enum == 1 and from_place == 1
         scrut_slot = emit_lvalue_ptr(s, typed)
         if scrut_slot < 0
-            emit_ir_error(s, c"cannot take address of match scrutinee")
+            emit_ir_error(s, scrutinee.span, c"cannot take address of match scrutinee")
             return 0
         scrut_reg = emit_match_place_load(s, scrut_slot, enum_name, enum_name_len)
     else if is_ctor == 1
@@ -2418,10 +2410,15 @@ pub fn if_arm_check_value(s: *EmitterState, arm: *MatchArm)
     var last: *Stmt = arm.body_stmts
     while last != null and last.next != null
         last = last.next
+    # Reported at that last statement; a block always has one, so pass_span
+    # (an arm with no statements) is only a fallback.
+    var at: SrcSpan = arm.pass_span
+    if last != null
+        at = last.span
     if last != null and last.kind == STMT_IF
-        emit_ir_error(s, c"an `if` with no `else` has no value when its condition is false, so it cannot be used as a value here; add an `else` arm")
+        emit_ir_error(s, at, c"an `if` with no `else` has no value when its condition is false, so it cannot be used as a value here; add an `else` arm")
     else
-        emit_ir_error(s, c"an `if` expression arm does not end in a value")
+        emit_ir_error(s, at, c"an `if` expression arm does not end in a value")
 
 # Emit an if/else expression (AGAST #1613): `left` is the condition, `args`
 # the then-arm and its `next` the else-arm (see expr_if).  Lowered like a

@@ -283,4 +283,5 @@ def test_store_through_an_array_borrow_deref_is_refused(compiler, tmp_path):
     comp = _emit(compiler, path, work / "main.ll", work)
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, out
-    assert f"main.ritz:2:5: {BORROW_DEREF_STORE}" in out, out
+    sep = "" if compiler == "ritz0" else "error: "   # ritz1: diag (AGAST #3445)
+    assert f"main.ritz:2:5: {sep}{BORROW_DEREF_STORE}" in out, out
