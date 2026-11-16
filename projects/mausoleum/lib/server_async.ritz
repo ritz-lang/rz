@@ -46,6 +46,7 @@ import mausoleum.collection
 import mausoleum.document
 import mausoleum.buffer_pool
 import mausoleum.storage
+import mausoleum.registry
 import mausoleum.btree {
     btree_iter_valid,
     btree_iter_next,
@@ -115,6 +116,9 @@ struct M7SPSession
     msg_len: i32               # parsed from header — total bytes for current msg
     have: i32                  # bytes accumulated so far in read_buf
     active_txn: i64            # -1 = none, else txn id
+    # *Collection this session's CONNECT bound it to (AGAST #3637); the
+    # default collection until then.  0 = none (no registry: get_collection).
+    collection: i64
 
     # Vestigial — phase 2 used this for stub INSERT IDs.  Phase 3
     # uses the real collection sequencer; field is kept (initialized
@@ -166,6 +170,7 @@ fn m7sp_session_init(idx: i32)
     g_sessions[idx].msg_len = 0
     g_sessions[idx].have = 0
     g_sessions[idx].active_txn = -1
+    g_sessions[idx].collection = registry_default(@g_registry) as i64
     g_sessions[idx].next_doc_id = 1
     g_sessions[idx].scan_active = 0
     g_sessions[idx].scan_iter = 0
@@ -212,6 +217,7 @@ pub fn m7sp_session_init_encrypted(idx: i32)
     g_sessions[idx].msg_len = 0
     g_sessions[idx].have = 0
     g_sessions[idx].active_txn = -1
+    g_sessions[idx].collection = registry_default(@g_registry) as i64
     g_sessions[idx].next_doc_id = 1
     g_sessions[idx].scan_iter = 0
     g_sessions[idx].scan_request_id = 0
@@ -388,7 +394,9 @@ fn task_to_session_idx(task: *Task) -> i32
 
 var g_pool: i64 = 0          # *BufferPool — for collection access
 var g_storage: i64 = 0       # *Storage — for txn + flush
-var g_collection: i64 = 0    # *Collection — for inserts/gets/etc.
+var g_collection: i64 = 0    # *Collection — the default collection
+# Every collection a CONNECT has named, the default one first (AGAST #3637).
+var g_registry: CollectionRegistry
 
 
 fn get_collection() -> *Collection
@@ -698,11 +706,24 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
 # state (e.g., active_txn).  Behavior matches handle_plain_session in
 # src/main.ritz one-for-one (less SCAN, deferred to phase 4).
 fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, msg_type: i32, request_id: i32)
-    let collection: *Collection = get_collection()
+    var collection: *Collection = session.collection as *Collection
+    if collection == null
+        collection = get_collection()
     let storage: *Storage = get_storage()
 
     if msg_type == MSG_CONNECT
-        # Single-tenant — session_id = 1 matches the serial loop.
+        # Bind the session to the collection it names (AGAST #3637); an
+        # unknown name is created (see lib/registry.ritz).
+        var name_len: i32 = 0
+        let name: *u8 = msgreader_read_bytes(reader, @name_len)
+        if name == null and name_len != 0
+            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
+            return
+        let bound: *Collection = registry_bind(@g_registry, name, name_len)
+        if bound == null
+            build_error(resp, request_id, PROTO_ERR_COLLECTION_REFUSED, "Collection name too long, or too many collections")
+            return
+        session.collection = bound as i64
         build_connected(resp, request_id, 1)
         return
 
@@ -1435,6 +1456,7 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     g_pool = pool as i64
     g_storage = storage as i64
     g_collection = collection as i64
+    registry_init(@g_registry, pool, storage, collection)
 
     # Initialize session table — every slot starts free.
     for i in 0..SESSION_MAX
@@ -1448,6 +1470,7 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     let srv: *TaskServer = task_server_create(listen_fd)
     if srv == null
         prints("serve_async: task_server_create failed\n")
+        registry_destroy(@g_registry)
         return 1
 
     srv.pool.ring = @srv.ring
@@ -1462,6 +1485,7 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     prints("Mausoleum (async): shutting down\n")
     shutdown_uninstall()
     task_server_free(srv)
+    registry_destroy(@g_registry)
     return ret
 
 
@@ -1476,6 +1500,7 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
     g_pool = pool as i64
     g_storage = storage as i64
     g_collection = collection as i64
+    registry_init(@g_registry, pool, storage, collection)
 
     for i in 0..SESSION_MAX
         g_sessions[i].in_use = 0
@@ -1487,6 +1512,7 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
     let srv: *TaskServer = task_server_create(listen_fd)
     if srv == null
         prints("serve_async_encrypted: task_server_create failed\n")
+        registry_destroy(@g_registry)
         return 1
 
     srv.pool.ring = @srv.ring
@@ -1500,4 +1526,5 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
     prints("Mausoleum (async, encrypted): shutting down\n")
     shutdown_uninstall()
     task_server_free(srv)
+    registry_destroy(@g_registry)
     return ret

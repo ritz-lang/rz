@@ -24,7 +24,10 @@ import lib.collection
 # ============================================================================
 
 const DEFAULT_PORT: i32 = 7777
-const COLLECTION_LEN: i32 = 10
+# nexus's collection (src/repos/wiki_page_repo.ritz).  This seeded
+# "wiki_pages" until #3637, which reached nexus only because the server put
+# every name in one collection.
+const COLLECTION_NAME: StrView = "nexus_pages"
 
 # ============================================================================
 # Helpers
@@ -146,38 +149,53 @@ fn seed_wiki_pages(client: *Client) -> i32
 # Verify Pages
 # ============================================================================
 
+# What verify_wiki_pages looks for: the page with slug "welcome".
+struct WelcomeHunt
+    found: i32
+    doc_id: i64
+    len: i32
+
+fn welcome_hunt_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+    let hunt: *WelcomeHunt = user as *WelcomeHunt
+    var doc: Document
+    if doc_deserialize(data, len as i64, @doc) != ERR_OK
+        return 0
+    var slug: Field
+    if doc_get_field(@doc, "slug", @slug) != ERR_OK or slug.ftype != FIELD_STRING
+        return 0
+    let want: StrView = "welcome"
+    if slug.len_val != want.len or memcmp(slug.ptr_val, want.ptr, want.len) != 0
+        return 0
+    hunt.found = 1
+    hunt.doc_id = doc_id
+    hunt.len = len
+    return 1   # stop the scan
+
+# The seeded welcome page is in the collection, found by its slug.  (This
+# used to GET id 4294967297, the first document of collection 1, which only
+# held while every CONNECT name shared one collection; AGAST #3637.)
 fn verify_wiki_pages(client: *Client) -> i32
     prints("\nVerifying wiki pages...\n")
 
-    # The document IDs are predictable: 4294967297, 4294967298, etc.
-    # But we should really query by slug. For now, just test that we can GET docs.
-
-    var out_data: *u8 = null
-    var out_len: i32 = 0
-
-    # Check doc ID 4294967297 (first wiki page)
-    let doc_id: i64 = 4294967297
-    let get_result: i32 = client_get(client, doc_id, @out_data, @out_len)
-
-    if get_result == 1
-        prints("  [OK] Document ")
-        print_i64(doc_id)
-        prints(" found (")
-        print_i32(out_len)
-        prints(" bytes)\n")
-    else if get_result == 0
-        prints("  [FAIL] Document ")
-        print_i64(doc_id)
-        prints(" not found\n")
-        return 1
-    else
-        prints("  [FAIL] Error getting document ")
-        print_i64(doc_id)
-        prints(": ")
-        print_i32(get_result)
+    var hunt: WelcomeHunt
+    hunt.found = 0
+    hunt.doc_id = 0
+    hunt.len = 0
+    let scanned: i32 = client_scan(client, welcome_hunt_step as *u8, @hunt as *u8)
+    if scanned < 0
+        prints("  [FAIL] Error scanning the collection: ")
+        print_i32(scanned)
         prints("\n")
         return 1
+    if hunt.found == 0
+        prints("  [FAIL] Page welcome not found\n")
+        return 1
 
+    prints("  [OK] Page welcome found (id=")
+    print_i64(hunt.doc_id)
+    prints(", ")
+    print_i32(hunt.len)
+    prints(" bytes)\n")
     prints("\nVerification complete!\n")
     return 0
 
@@ -259,9 +277,9 @@ pub fn main(argc: i32, argv: **u8) -> i32
 
     var connect_result: i32 = 0
     if no_encryption != 0
-        connect_result = client_connect(client, host, port, "wiki_pages", COLLECTION_LEN)
+        connect_result = client_connect(client, host, port, COLLECTION_NAME.ptr, COLLECTION_NAME.len as i32)
     else
-        connect_result = client_connect_encrypted(client, host, port, "wiki_pages", COLLECTION_LEN)
+        connect_result = client_connect_encrypted(client, host, port, COLLECTION_NAME.ptr, COLLECTION_NAME.len as i32)
     if connect_result < 0
         print_error("Failed to connect to mausoleum")
         prints("  Error code: ")

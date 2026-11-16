@@ -81,21 +81,38 @@ pub fn collection_meta(col: *Collection, out: *CollectionMeta)
     out.next_sequence = col.next_sequence as i64
     out.doc_count = col.doc_count
 
-# Open collection `collection_id` on a data directory: the one recorded
-# there if any, else a new one that is committed straight away so even an
-# empty store remembers its root.
+# Open collection `collection_id` on a data directory: its recorded tree if
+# it has one, else a new tree that is committed straight away so even an
+# empty collection remembers its root.  ERR_NOT_FOUND if the directory has
+# no collection with that id (see collection_open_named).
 pub fn collection_open_storage(col: *Collection, storage: *Storage, collection_id: i32) -> i32
     if storage == null
         return ERR_INVALID
     let pool: *BufferPool = storage_pool(storage)
     var meta: CollectionMeta
-    if storage_collection_meta(storage, @meta) == 1
+    let found: i32 = storage_collection_meta_of(storage, collection_id, @meta)
+    if found < 0
+        return ERR_NOT_FOUND
+    if found == 1
         return collection_open(col, pool, collection_id, @meta)
 
     let init_result: i32 = collection_init(col, pool, collection_id)
     if init_result != ERR_OK
         return init_result
     return collection_commit(col, storage)
+
+# Open the collection called name[0..len) on a data directory, creating it
+# if there is none (AGAST #3637).  Errors: ERR_INVALID for a bad name,
+# ERR_FULL once the directory holds MAX_COLLECTIONS.
+pub fn collection_open_named(col: *Collection, storage: *Storage, name: *u8, len: i32) -> i32
+    if storage == null
+        return ERR_INVALID
+    var id: i32 = storage_collection_find(storage, name, len)
+    if id == 0
+        id = storage_collection_create(storage, name, len)
+        if id < 0
+            return id
+    return collection_open_storage(col, storage, id)
 
 # Make every change to the collection durable (WAL, data file, meta file).
 # The server calls this after each INSERT / UPDATE / DELETE.
@@ -104,7 +121,9 @@ pub fn collection_commit(col: *Collection, storage: *Storage) -> i32
         return ERR_INVALID
     var meta: CollectionMeta
     collection_meta(col, @meta)
-    storage_set_collection_meta(storage, @meta)
+    let set_result: i32 = storage_set_collection_meta_of(storage, col.collection_id, @meta)
+    if set_result != ERR_OK
+        return set_result
     return storage_flush(storage)
 
 # Destroy a collection (frees the B-tree, not the buffer pool)

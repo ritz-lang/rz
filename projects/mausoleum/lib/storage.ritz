@@ -39,7 +39,11 @@ import mausoleum.recovery
 # ============================================================================
 
 const STORAGE_MAGIC: i32 = 0x4D374D53    # "M7MS" - Mausoleum Storage
-const STORAGE_VERSION: i32 = 1
+# v1: one collection (a 48-byte header, or that plus one CollectionMeta).
+# v2: a table of named collections (AGAST #3637).  v1 files are read as a
+# table holding only the default collection and rewritten as v2.
+const STORAGE_VERSION: i32 = 2
+const STORAGE_VERSION_V1: i32 = 1
 
 const DATA_FILE_NAME: StrView = "/data.m7m"
 const WAL_FILE_NAME: StrView = "/wal"
@@ -47,8 +51,8 @@ const META_FILE_NAME: StrView = "/meta.m7m"
 
 const DEFAULT_BUFFER_SIZE: i32 = 256    # 256 pages = 1MB cache
 
-# meta.m7m written before the collection fields existed: magic..last_open.
-const STORAGE_META_LEGACY_SIZE: i64 = 48
+# The v1 header (magic..last_open); a v1 file's CollectionMeta follows it.
+const STORAGE_META_V1_HEADER: i64 = 48
 
 # A checkpoint cuts the WAL back once it grows past this (every committed
 # write is also in data.m7m by then, so the records are only crash insurance
@@ -58,7 +62,9 @@ const WAL_CHECKPOINT_BYTES: i64 = 4194304   # 4 MiB
 # ============================================================================
 # Storage Metadata
 # ============================================================================
-# Stored in meta.m7m file for persistence across restarts
+# Stored in meta.m7m file for persistence across restarts.  v2 layout:
+#   StorageMeta, then coll_count NamedCollectionMeta entries (the first is
+#   always the default collection).
 
 struct StorageMeta
     magic: i32
@@ -68,14 +74,7 @@ struct StorageMeta
     next_txn_id: i64        # Next transaction ID
     created_at: i64         # Creation timestamp (nanos)
     last_open: i64          # Last open timestamp (nanos)
-    # The collection's B-tree root and counters (AGAST #2458).  Absent from
-    # legacy 48-byte files; root_page_id == INVALID_PAGE_ID then.
-    coll_root_page_id: i64
-    coll_tree_height: i64
-    coll_tree_count: i64
-    coll_tree_node_count: i64
-    coll_next_sequence: i64
-    coll_doc_count: i64
+    coll_count: i64         # Entries in the collection table (v2)
 
 # ============================================================================
 # Storage Engine Structure
@@ -92,8 +91,13 @@ struct Storage
     meta: StorageMeta
     meta_fd: i32            # File descriptor for meta file
 
+    # The collection table: meta.coll_count entries of MAX_COLLECTIONS, and
+    # per entry 1 if it changed since the last commit (AGAST #3637).
+    colls: *NamedCollectionMeta
+    coll_dirty: *u8
+
     current_txn: i64        # Current active transaction ID (0 = none)
-    meta_dirty: i32         # Collection meta changed since the last commit
+    meta_dirty: i32         # Some collection's meta changed since the last commit
     current_lsn: i64        # Current LSN for the active transaction
 
     is_open: i32
@@ -113,7 +117,7 @@ fn build_path(base: *u8, base_len: i32, suffix: StrView, buf: *u8) -> i32
 # Metadata Operations
 # ============================================================================
 
-fn meta_init(meta: *StorageMeta)
+fn meta_init(meta: *StorageMeta, colls: *NamedCollectionMeta)
     meta.magic = STORAGE_MAGIC
     meta.version = STORAGE_VERSION
     meta.checkpoint_lsn = 0
@@ -122,61 +126,115 @@ fn meta_init(meta: *StorageMeta)
     let now: Timestamp = timestamp_now()
     meta.created_at = now.nanos
     meta.last_open = now.nanos
-    meta_clear_collection(meta)
+    meta_only_default(meta, colls)
 
-fn meta_clear_collection(meta: *StorageMeta)
-    var none: CollectionMeta
-    collection_meta_clear(@none)
-    meta_put_collection(meta, @none)
+# A table holding just the default collection, with no tree yet.
+fn meta_only_default(meta: *StorageMeta, colls: *NamedCollectionMeta)
+    meta.coll_count = 1
+    named_collection_meta_init(colls, DEFAULT_COLLECTION_ID, DEFAULT_COLLECTION_NAME.ptr, DEFAULT_COLLECTION_NAME.len as i32)
 
-fn meta_put_collection(meta: *StorageMeta, c: *CollectionMeta)
-    meta.coll_root_page_id = c.root_page_id
-    meta.coll_tree_height = c.tree_height
-    meta.coll_tree_count = c.tree_count
-    meta.coll_tree_node_count = c.tree_node_count
-    meta.coll_next_sequence = c.next_sequence
-    meta.coll_doc_count = c.doc_count
-
-fn meta_get_collection(meta: *StorageMeta, c: *CollectionMeta)
-    c.root_page_id = meta.coll_root_page_id
-    c.tree_height = meta.coll_tree_height
-    c.tree_count = meta.coll_tree_count
-    c.tree_node_count = meta.coll_tree_node_count
-    c.next_sequence = meta.coll_next_sequence
-    c.doc_count = meta.coll_doc_count
-
-fn meta_read(fd: i32, meta: *StorageMeta) -> i32
-    let result: i64 = sys_lseek(fd, 0, 0)  # SEEK_SET
-    if result < 0
+# Read meta.m7m into *meta and the collection table `colls` (room for
+# MAX_COLLECTIONS).  A v1 file comes back as a v2 table holding only the
+# default collection, its tree (if the file recorded one) included.
+fn meta_read(fd: i32, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
+    if sys_lseek(fd, 0, 0) < 0  # SEEK_SET
         return ERR_IO
 
     let bytes_read: i64 = sys_read(fd, meta as *u8, sizeof(StorageMeta))
-    if bytes_read == STORAGE_META_LEGACY_SIZE
-        # Written before collections were persisted: no collection recorded.
-        meta_clear_collection(meta)
-    else if bytes_read != sizeof(StorageMeta)
+    if bytes_read < STORAGE_META_V1_HEADER
         return ERR_CORRUPT
-
     if meta.magic != STORAGE_MAGIC
         return ERR_CORRUPT
 
+    if meta.version == STORAGE_VERSION_V1
+        meta_only_default(meta, colls)
+        if sys_lseek(fd, STORAGE_META_V1_HEADER, 0) < 0
+            return ERR_IO
+        let n: i64 = sys_read(fd, @colls.meta as *u8, sizeof(CollectionMeta))
+        if n == 0
+            # Written before collections were persisted: no tree recorded.
+            collection_meta_clear(@colls.meta)
+        else if n != sizeof(CollectionMeta)
+            return ERR_CORRUPT
+        meta.version = STORAGE_VERSION
+        return ERR_OK
+
     if meta.version != STORAGE_VERSION
         return ERR_VERSION
-
+    if bytes_read != sizeof(StorageMeta)
+        return ERR_CORRUPT
+    if meta.coll_count < 1 or meta.coll_count > MAX_COLLECTIONS as i64
+        return ERR_CORRUPT
+    let table_len: i64 = meta.coll_count * sizeof(NamedCollectionMeta)
+    if sys_read(fd, colls as *u8, table_len) != table_len
+        return ERR_CORRUPT
+    if colls.id != DEFAULT_COLLECTION_ID as i64
+        return ERR_CORRUPT
     return ERR_OK
 
-fn meta_write(fd: i32, meta: *StorageMeta) -> i32
-    let result: i64 = sys_lseek(fd, 0, 0)  # SEEK_SET
-    if result < 0
+fn meta_write(fd: i32, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
+    if sys_lseek(fd, 0, 0) < 0  # SEEK_SET
         return ERR_IO
 
-    let bytes_written: i64 = sys_write(fd, meta as *u8, sizeof(StorageMeta))
-    if bytes_written != sizeof(StorageMeta)
+    if sys_write(fd, meta as *u8, sizeof(StorageMeta)) != sizeof(StorageMeta)
+        return ERR_IO
+    let table_len: i64 = meta.coll_count * sizeof(NamedCollectionMeta)
+    if sys_write(fd, colls as *u8, table_len) != table_len
         return ERR_IO
 
     # NOTE: Would call fsync here for durability, but syscall not yet in ritzlib
     # TODO: Add sys_fsync to ritzlib.sys
     return ERR_OK
+
+fn storage_meta_write(storage: *Storage) -> i32
+    return meta_write(storage.meta_fd, @storage.meta, storage.colls)
+
+# Every collection's meta is now on disk: nothing is dirty.
+fn storage_meta_clean(storage: *Storage)
+    storage.meta_dirty = 0
+    memset(storage.coll_dirty, 0, MAX_COLLECTIONS as i64)
+
+# The table entry of collection `id`, or null.
+fn storage_entry(storage: *Storage, id: i32) -> *NamedCollectionMeta
+    var i: i64 = 0
+    while i < storage.meta.coll_count
+        let e: *NamedCollectionMeta = storage.colls + i
+        if e.id == id as i64
+            return e
+        i += 1
+    return null
+
+fn storage_entry_index(storage: *Storage, id: i32) -> i64
+    var i: i64 = 0
+    while i < storage.meta.coll_count
+        let e: *NamedCollectionMeta = storage.colls + i
+        if e.id == id as i64
+            return i
+        i += 1
+    return -1
+
+# Take a collection's meta as recovered from the WAL: update its entry, or
+# add it (a collection created after the last meta.m7m write).
+fn storage_apply_recovered(storage: *Storage, rec: *NamedCollectionMeta) -> i32
+    let e: *NamedCollectionMeta = storage_entry(storage, rec.id as i32)
+    if e != null
+        memcpy(@e.meta as *u8, @rec.meta as *u8, sizeof(CollectionMeta))
+        return ERR_OK
+    if storage.meta.coll_count >= MAX_COLLECTIONS as i64
+        return ERR_FULL
+    memcpy((storage.colls + storage.meta.coll_count) as *u8, rec as *u8, sizeof(NamedCollectionMeta))
+    storage.meta.coll_count += 1
+    return ERR_OK
+
+# Free what storage_open allocated, after a failure part-way through it.
+fn storage_open_fail(storage: *Storage)
+    if storage.colls != null
+        free(storage.colls as *u8)
+    if storage.coll_dirty != null
+        free(storage.coll_dirty)
+    if storage.base_path != null
+        free(storage.base_path)
+    free(storage as *u8)
 
 # ============================================================================
 # Storage Creation/Opening
@@ -195,23 +253,33 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     let storage: *Storage = malloc(sizeof(Storage)) as *Storage
     if storage == null
         return None
+    storage.base_path = null
+    storage.colls = null
+    storage.coll_dirty = null
 
     # Copy base path
     let base_copy: *u8 = malloc(path_len + 1)
     if base_copy == null
-        free(storage as *u8)
+        storage_open_fail(storage)
         return None
     memcpy(base_copy, path, path_len + 1)
-
     storage.base_path = base_copy
     storage.base_path_len = path_len as i32
+
+    # The collection table (AGAST #3637).
+    storage.colls = malloc(MAX_COLLECTIONS as i64 * sizeof(NamedCollectionMeta)) as *NamedCollectionMeta
+    storage.coll_dirty = malloc(MAX_COLLECTIONS as i64)
+    if storage.colls == null or storage.coll_dirty == null
+        storage_open_fail(storage)
+        return None
+
     storage.pool = null
     storage.wal_writer = null
     storage.recovery_mgr = null
     storage.meta_fd = -1
     storage.current_txn = 0
     storage.current_lsn = 0
-    storage.meta_dirty = 0
+    storage_meta_clean(storage)
     storage.is_open = 0
 
     # Try to create directory (may already exist)
@@ -233,8 +301,7 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
         # Create new meta file
         meta_fd = sys_open3(@meta_path[0], O_RDWR | O_CREAT, 420)
         if meta_fd < 0
-            free(base_copy)
-            free(storage as *u8)
+            storage_open_fail(storage)
             return None
         is_new = 1
 
@@ -242,27 +309,22 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
 
     # Read or initialize metadata
     if is_new != 0
-        meta_init(@storage.meta)
-        let write_result: i32 = meta_write(meta_fd, @storage.meta)
-        if write_result != ERR_OK
+        meta_init(@storage.meta, storage.colls)
+        if storage_meta_write(storage) != ERR_OK
             sys_close(meta_fd)
-            free(base_copy)
-            free(storage as *u8)
+            storage_open_fail(storage)
             return None
     else
-        let read_result: i32 = meta_read(meta_fd, @storage.meta)
-        if read_result != ERR_OK
+        if meta_read(meta_fd, @storage.meta, storage.colls) != ERR_OK
             sys_close(meta_fd)
-            free(base_copy)
-            free(storage as *u8)
+            storage_open_fail(storage)
             return None
 
     # Create buffer pool
     let pool_opt: Option<*BufferPool> = buffer_pool_new(DEFAULT_BUFFER_SIZE)
     if option_is_none<*BufferPool>(@pool_opt) == 1
         sys_close(meta_fd)
-        free(base_copy)
-        free(storage as *u8)
+        storage_open_fail(storage)
         return None
     storage.pool = option_unwrap_or<*BufferPool>(@pool_opt, null)
 
@@ -271,25 +333,28 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     if open_result != ERR_OK
         buffer_pool_destroy(storage.pool)
         sys_close(meta_fd)
-        free(base_copy)
-        free(storage as *u8)
+        storage_open_fail(storage)
         return None
 
     # Recovery first: redo every committed WAL transaction onto its pages
-    # and take the collection meta from the last one that logged it.  A WAL
-    # that cannot be read is not discarded: refuse to open instead.
+    # and take each collection's meta from the last one that logged it.  A
+    # WAL that cannot be read is not discarded: refuse to open instead.
     storage.recovery_mgr = recovery_mgr_new(storage.pool, @wal_path[0])
     if is_new == 0 and storage.recovery_mgr != null
-        if recovery_recover(storage.recovery_mgr) != ERR_OK
+        var rc: i32 = recovery_recover(storage.recovery_mgr)
+        let n: i32 = recovery_collection_meta_count(storage.recovery_mgr)
+        var i: i32 = 0
+        while rc == ERR_OK and i < n
+            var recovered: NamedCollectionMeta
+            recovery_collection_meta_at(storage.recovery_mgr, i, @recovered)
+            rc = storage_apply_recovered(storage, @recovered)
+            i += 1
+        if rc != ERR_OK
             recovery_mgr_destroy(storage.recovery_mgr)
             buffer_pool_destroy(storage.pool)
             sys_close(meta_fd)
-            free(base_copy)
-            free(storage as *u8)
+            storage_open_fail(storage)
             return None
-        var recovered: CollectionMeta
-        if recovery_collection_meta(storage.recovery_mgr, @recovered) == 1
-            meta_put_collection(@storage.meta, @recovered)
 
     # Create WAL writer
     storage.wal_writer = wal_writer_new(@wal_path[0])
@@ -336,7 +401,7 @@ pub fn storage_close(storage: *Storage) -> i32
 
     # Write final metadata
     if storage.meta_fd >= 0
-        meta_write(storage.meta_fd, @storage.meta)
+        storage_meta_write(storage)
         sys_close(storage.meta_fd)
         storage.meta_fd = -1
 
@@ -356,6 +421,12 @@ pub fn storage_destroy(storage: *Storage)
     if storage.is_open != 0
         storage_close(storage)
 
+    if storage.colls != null
+        free(storage.colls as *u8)
+        storage.colls = null
+    if storage.coll_dirty != null
+        free(storage.coll_dirty)
+        storage.coll_dirty = null
     free(storage as *u8)
 
 # ============================================================================
@@ -511,12 +582,14 @@ pub fn storage_wal_commit(storage: *Storage) -> i32
             if lsn < 0
                 return ERR_IO
         i += 1
-    if storage.meta_dirty != 0
-        var cm: CollectionMeta
-        meta_get_collection(@storage.meta, @cm)
-        lsn = wal_write_meta(w, txn_id, lsn, @cm)
-        if lsn < 0
-            return ERR_IO
+    # One META record per collection that changed (AGAST #3637).
+    var c: i64 = 0
+    while c < storage.meta.coll_count
+        if *(storage.coll_dirty + c) != 0
+            lsn = wal_write_named_meta(w, txn_id, lsn, storage.colls + c)
+            if lsn < 0
+                return ERR_IO
+        c += 1
     # COMMIT flushes the WAL buffer.
     if wal_write_commit(w, txn_id, lsn) < 0
         return ERR_IO
@@ -537,10 +610,10 @@ pub fn storage_flush(storage: *Storage) -> i32
     if pool_result != ERR_OK
         return pool_result
 
-    let meta_result: i32 = meta_write(storage.meta_fd, @storage.meta)
+    let meta_result: i32 = storage_meta_write(storage)
     if meta_result != ERR_OK
         return meta_result
-    storage.meta_dirty = 0
+    storage_meta_clean(storage)
 
     # Everything logged so far is now in data.m7m; keep the WAL bounded.
     if storage.wal_writer != null and wal_writer_size(storage.wal_writer) > WAL_CHECKPOINT_BYTES
@@ -557,10 +630,10 @@ pub fn storage_checkpoint(storage: *Storage) -> i32
     let flush_result: i32 = buffer_pool_flush_all(storage.pool)
     if flush_result != ERR_OK
         return flush_result
-    let meta_result: i32 = meta_write(storage.meta_fd, @storage.meta)
+    let meta_result: i32 = storage_meta_write(storage)
     if meta_result != ERR_OK
         return meta_result
-    storage.meta_dirty = 0
+    storage_meta_clean(storage)
 
     # Data and meta are on disk: drop the redo records, mark the checkpoint.
     if storage.wal_writer != null
@@ -570,7 +643,7 @@ pub fn storage_checkpoint(storage: *Storage) -> i32
             storage.meta.checkpoint_lsn = lsn
 
     # Update and persist metadata
-    return meta_write(storage.meta_fd, @storage.meta)
+    return storage_meta_write(storage)
 
 # ============================================================================
 # Statistics
@@ -600,25 +673,88 @@ pub fn storage_wal_size(storage: *Storage) -> i64
 # ============================================================================
 # Collection Metadata Persistence
 # ============================================================================
-# Where the collection's B-tree root is and its counters.  These used to be
-# no-op stubs, so a restart never found the tree it had written (#2458).
+# Where each collection's B-tree root is and its counters (#2458), in a
+# table of named collections (#3637).  Collection DEFAULT_COLLECTION_ID,
+# "default", is always there; it is the one a pre-#3637 store held.
 
-# Record the collection's meta; the next storage_flush logs and persists it.
-pub fn storage_set_collection_meta(storage: *Storage, meta: *CollectionMeta)
-    if storage == null or meta == null
-        return
-    var cur: CollectionMeta
-    meta_get_collection(@storage.meta, @cur)
-    if memcmp(@cur as *u8, meta as *u8, sizeof(CollectionMeta)) != 0
-        meta_put_collection(@storage.meta, meta)
-        storage.meta_dirty = 1
-
-# Fill *out with the recorded collection meta.  Returns 1 if a collection
-# has been recorded on this data directory, 0 if not.
-pub fn storage_collection_meta(storage: *Storage, out: *CollectionMeta) -> i32
-    if storage == null or out == null
+# The id of the collection called name[0..len), or 0 if there is none.
+pub fn storage_collection_find(storage: *Storage, name: *u8, len: i32) -> i32
+    if storage == null or name == null or len <= 0
         return 0
-    meta_get_collection(@storage.meta, out)
+    var i: i64 = 0
+    while i < storage.meta.coll_count
+        let e: *NamedCollectionMeta = storage.colls + i
+        if named_collection_meta_is(e, name, len) == 1
+            return e.id as i32
+        i += 1
+    return 0
+
+# Add a collection called name[0..len), with no tree yet; the next
+# storage_flush persists it.  Returns its id (> 0), or ERR_INVALID (bad
+# name: empty or over MAX_COLLECTION_NAME), ERR_EXISTS or ERR_FULL.
+pub fn storage_collection_create(storage: *Storage, name: *u8, len: i32) -> i32
+    if storage == null or name == null or len <= 0 or len > MAX_COLLECTION_NAME
+        return ERR_INVALID
+    if storage_collection_find(storage, name, len) != 0
+        return ERR_EXISTS
+    let count: i64 = storage.meta.coll_count
+    if count >= MAX_COLLECTIONS as i64
+        return ERR_FULL
+    # Ids are never reused: one past the highest.
+    var max_id: i64 = 0
+    var i: i64 = 0
+    while i < count
+        let e: *NamedCollectionMeta = storage.colls + i
+        if e.id > max_id
+            max_id = e.id
+        i += 1
+    let id: i32 = (max_id + 1) as i32
+    named_collection_meta_init(storage.colls + count, id, name, len)
+    storage.meta.coll_count = count + 1
+    *(storage.coll_dirty + count) = 1
+    storage.meta_dirty = 1
+    return id
+
+# How many collections the table holds (the default one included).
+pub fn storage_collection_count(storage: *Storage) -> i32
+    if storage == null
+        return 0
+    return storage.meta.coll_count as i32
+
+# Record collection `id`'s meta; the next storage_flush logs and persists
+# it.  ERR_NOT_FOUND if there is no such collection.
+pub fn storage_set_collection_meta_of(storage: *Storage, id: i32, meta: *CollectionMeta) -> i32
+    if storage == null or meta == null
+        return ERR_INVALID
+    let idx: i64 = storage_entry_index(storage, id)
+    if idx < 0
+        return ERR_NOT_FOUND
+    let e: *NamedCollectionMeta = storage.colls + idx
+    if memcmp(@e.meta as *u8, meta as *u8, sizeof(CollectionMeta)) != 0
+        memcpy(@e.meta as *u8, meta as *u8, sizeof(CollectionMeta))
+        *(storage.coll_dirty + idx) = 1
+        storage.meta_dirty = 1
+    return ERR_OK
+
+# Fill *out with collection `id`'s recorded meta.  Returns 1 if it has a
+# tree, 0 if it has none yet, -1 if there is no such collection.
+pub fn storage_collection_meta_of(storage: *Storage, id: i32, out: *CollectionMeta) -> i32
+    if storage == null or out == null
+        return -1
+    collection_meta_clear(out)
+    let e: *NamedCollectionMeta = storage_entry(storage, id)
+    if e == null
+        return -1
+    memcpy(out as *u8, @e.meta as *u8, sizeof(CollectionMeta))
     if out.root_page_id == INVALID_PAGE_ID
         return 0
     return 1
+
+# The default collection's meta (what these did before #3637).
+pub fn storage_set_collection_meta(storage: *Storage, meta: *CollectionMeta)
+    storage_set_collection_meta_of(storage, DEFAULT_COLLECTION_ID, meta)
+
+pub fn storage_collection_meta(storage: *Storage, out: *CollectionMeta) -> i32
+    if storage_collection_meta_of(storage, DEFAULT_COLLECTION_ID, out) == 1
+        return 1
+    return 0

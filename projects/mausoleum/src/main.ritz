@@ -29,6 +29,7 @@ import mausoleum.page
 import mausoleum.buffer_pool
 import mausoleum.storage
 import mausoleum.collection
+import mausoleum.registry
 import mausoleum.btree {
     btree_iter_valid,
     btree_iter_next,
@@ -264,6 +265,21 @@ fn commit_write(storage: *Storage, col: *Collection)
         return
     collection_commit(col, storage)
 
+# CONNECT on the serial loops: answer it, and return the collection it names
+# (AGAST #3637; see lib/registry.ritz), or `current` if it was refused.
+fn serial_connect(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, reg: *CollectionRegistry, current: *Collection) -> *Collection
+    var name_len: i32 = 0
+    let name: *u8 = msgreader_read_bytes(reader, @name_len)
+    if name == null and name_len != 0
+        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
+        return current
+    let bound: *Collection = registry_bind(reg, name, name_len)
+    if bound == null
+        build_error(resp, request_id, PROTO_ERR_COLLECTION_REFUSED, "Collection name too long, or too many collections")
+        return current
+    build_connected(resp, request_id, 1)
+    return bound
+
 # ============================================================================
 # Serve Command - Encrypted Database Server
 # ============================================================================
@@ -324,13 +340,13 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
 
     if storage != null
         # Reopen the collection this data directory holds (or start one).
-        col_result = collection_open_storage(@collection, storage, 1)
+        col_result = collection_open_storage(@collection, storage, DEFAULT_COLLECTION_ID)
         if col_result >= 0
             prints("Loaded ")
             print_i64(collection_count(@collection))
             prints(" document(s).\n")
     else
-        col_result = collection_init(@collection, pool, 1)
+        col_result = collection_init(@collection, pool, DEFAULT_COLLECTION_ID)
 
     if col_result < 0
         prints("Error: Failed to create/load collection\n")
@@ -393,14 +409,20 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
     #                                                           bisect baseline)
     #   --serial [--encrypted]      → serve_loop               (encrypted serial,
     #                                                           bisect baseline)
+    # Every loop binds each session to the collection its CONNECT names; the
+    # async ones keep their own registry, the serial ones share this one.
     if serial_mode == 0 and no_encryption != 0
         serve_async(sock.fd, pool, storage, @collection)
     else if serial_mode == 0
         serve_async_encrypted(sock.fd, pool, storage, @collection)
-    else if no_encryption != 0
-        serve_loop_plain(sock.fd, pool, storage, @collection)
     else
-        serve_loop(sock.fd, pool, storage, @collection)
+        var reg: CollectionRegistry
+        registry_init(@reg, pool, storage, @collection)
+        if no_encryption != 0
+            serve_loop_plain(sock.fd, pool, storage, @reg)
+        else
+            serve_loop(sock.fd, pool, storage, @reg)
+        registry_destroy(@reg)
 
     # Cleanup
     socket_close(@sock)
@@ -416,7 +438,7 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
     return 0
 
 # Server main loop - handles encrypted connections
-fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection)
+fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     # Create signalfd for SIGTERM/SIGINT
     let signal_fd: i32 = signalfd_create_for_shutdown()
     if signal_fd < 0
@@ -495,7 +517,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: 
             prints("  Encrypted session established.\n")
 
             # Handle commands
-            handle_encrypted_session(@channel, pool, storage, collection)
+            handle_encrypted_session(@channel, pool, storage, reg)
 
             # Cleanup
             channel_free(@channel)
@@ -511,9 +533,10 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: 
         sys_close(signal_fd)
 
 # Handle a single encrypted session
-fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *Storage, collection: *Collection)
+fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     var buf: [8192]u8
     var active_txn: i64 = -1  # Track active transaction (-1 = none)
+    var collection: *Collection = registry_default(reg)
 
     loop
         # Receive encrypted message
@@ -534,7 +557,10 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
         var resp: MessageBuffer
         msgbuf_init(@resp, @buf[0] + 4096, 4096)
 
-        if msg_type == MSG_PING
+        if msg_type == MSG_CONNECT
+            collection = serial_connect(@reader, @resp, request_id, reg, collection)
+
+        else if msg_type == MSG_PING
             build_pong(@resp, request_id)
 
         else if msg_type == MSG_DISCONNECT
@@ -888,7 +914,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
 # ============================================================================
 
 # Server main loop - handles plain TCP connections (no encryption)
-fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection)
+fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     # Create signalfd for SIGTERM/SIGINT for graceful shutdown
     let signal_fd: i32 = signalfd_create_for_shutdown()
     if signal_fd < 0
@@ -941,7 +967,7 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, collec
             prints("New connection (plain TCP).\n")
 
             # Handle session using plain TCP
-            handle_plain_session(client_fd, pool, storage, collection)
+            handle_plain_session(client_fd, pool, storage, reg)
 
             # Cleanup
             sys_close(client_fd)
@@ -956,9 +982,10 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, collec
         sys_close(signal_fd)
 
 # Handle a single plain (unencrypted) session
-fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, collection: *Collection)
+fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     var buf: [8192]u8
     var active_txn: i64 = -1  # Track active transaction (-1 = none)
+    var collection: *Collection = registry_default(reg)
 
     loop
         # Receive message (plain TCP read)
@@ -980,10 +1007,8 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, collectio
         msgbuf_init(@resp, @buf[0] + 4096, 4096)
 
         if msg_type == MSG_CONNECT
-            # Client sends MSG_CONNECT first (normally this triggers handshake)
-            # In plain mode, we just acknowledge with session_id = 1
-            prints("  CONNECT received, sending OK\n")
-            build_connected(@resp, request_id, 1)
+            prints("  CONNECT received\n")
+            collection = serial_connect(@reader, @resp, request_id, reg, collection)
 
         else if msg_type == MSG_PING
             build_pong(@resp, request_id)

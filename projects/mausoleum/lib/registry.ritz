@@ -1,0 +1,136 @@
+# lib/registry.ritz - The server's open collections, by name (AGAST #3637)
+#
+# CONNECT carries a collection name; the server binds the session to the
+# collection of that name through this registry, so clients on different
+# names never see each other's documents.
+#
+#   - The empty name and "default" are the default collection, the one the
+#     server was started with (on a data directory: DEFAULT_COLLECTION_ID,
+#     which holds a pre-#3637 store's documents).
+#   - An unknown name is created, not refused: every client so far CONNECTs
+#     with the name it means to use and none relies on refusal, and the
+#     serve command has no other way to make a collection.  On a data
+#     directory it is persisted (collection_open_named), so a restart finds it.
+#   - A name longer than MAX_COLLECTION_NAME, or a new one once
+#     MAX_COLLECTIONS are open, is refused (registry_bind returns null).
+#
+# Collections the registry opened are freed by registry_destroy; the default
+# one belongs to the caller.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.memory
+
+import mausoleum.m7m_types
+import mausoleum.buffer_pool
+import mausoleum.storage
+import mausoleum.collection
+
+struct RegistryEntry
+    name_len: i32
+    name: [64]u8
+    col: *Collection
+    owned: i32              # 1 if the registry allocated `col`
+
+pub struct CollectionRegistry
+    pool: *BufferPool
+    storage: *Storage       # null in --in-memory mode
+    entries: *RegistryEntry # MAX_COLLECTIONS of them
+    count: i32
+
+fn entry_at(reg: *CollectionRegistry, i: i32) -> *RegistryEntry
+    return reg.entries + i
+
+fn entry_is(e: *RegistryEntry, name: *u8, len: i32) -> i32
+    if e.name_len != len
+        return 0
+    var i: i32 = 0
+    while i < len
+        if e.name[i] != *(name + i)
+            return 0
+        i += 1
+    return 1
+
+fn entry_set(e: *RegistryEntry, name: *u8, len: i32, col: *Collection, owned: i32)
+    e.name_len = len
+    var i: i32 = 0
+    while i < 64
+        if i < len
+            e.name[i] = *(name + i)
+        else
+            e.name[i] = 0
+        i += 1
+    e.col = col
+    e.owned = owned
+
+# Start a registry whose default collection is `default_col` (already open).
+pub fn registry_init(reg: *CollectionRegistry, pool: *BufferPool, storage: *Storage, default_col: *Collection) -> i32
+    if reg == null or pool == null or default_col == null
+        return ERR_INVALID
+    reg.entries = malloc(MAX_COLLECTIONS as i64 * sizeof(RegistryEntry)) as *RegistryEntry
+    if reg.entries == null
+        return ERR_NO_MEMORY
+    reg.pool = pool
+    reg.storage = storage
+    entry_set(entry_at(reg, 0), DEFAULT_COLLECTION_NAME.ptr, DEFAULT_COLLECTION_NAME.len as i32, default_col, 0)
+    reg.count = 1
+    return ERR_OK
+
+pub fn registry_default(reg: *CollectionRegistry) -> *Collection
+    if reg == null or reg.count < 1
+        return null
+    return entry_at(reg, 0).col
+
+pub fn registry_count(reg: *CollectionRegistry) -> i32
+    if reg == null
+        return 0
+    return reg.count
+
+# The collection called name[0..len), opened (or created) on first use.
+# null if the name is too long or no more collections fit.
+pub fn registry_bind(reg: *CollectionRegistry, name: *u8, len: i32) -> *Collection
+    if reg == null or len < 0 or len > MAX_COLLECTION_NAME
+        return null
+    if len == 0 or name == null
+        return registry_default(reg)
+
+    var i: i32 = 0
+    while i < reg.count
+        let e: *RegistryEntry = entry_at(reg, i)
+        if entry_is(e, name, len) == 1
+            return e.col
+        i += 1
+    if reg.count >= MAX_COLLECTIONS
+        return null
+
+    let col: *Collection = malloc(sizeof(Collection)) as *Collection
+    if col == null
+        return null
+    var rc: i32 = ERR_OK
+    if reg.storage != null
+        rc = collection_open_named(col, reg.storage, name, len)
+    else
+        # In memory: ids follow the default collection's.
+        rc = collection_init(col, reg.pool, DEFAULT_COLLECTION_ID + reg.count)
+    if rc != ERR_OK
+        free(col as *u8)
+        return null
+    entry_set(entry_at(reg, reg.count), name, len, col, 1)
+    reg.count += 1
+    return col
+
+# Close every collection the registry opened (not the default one).
+pub fn registry_destroy(reg: *CollectionRegistry)
+    if reg == null or reg.entries == null
+        return
+    var i: i32 = 0
+    while i < reg.count
+        let e: *RegistryEntry = entry_at(reg, i)
+        if e.owned == 1
+            collection_destroy(e.col)
+            free(e.col as *u8)
+        i += 1
+    free(reg.entries as *u8)
+    reg.entries = null
+    reg.count = 0

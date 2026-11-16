@@ -73,9 +73,10 @@ struct RecoveryManager
     # Recovery stats
     stats: RecoveryStats
 
-    # Last committed WAL_REC_META seen by redo (has_meta == 1 if any)
-    has_meta: i32
-    meta: CollectionMeta
+    # The last committed WAL_REC_META of each collection seen by redo:
+    # meta_count entries of a MAX_COLLECTIONS table (AGAST #3637).
+    metas: *NamedCollectionMeta
+    meta_count: i32
 
 # ============================================================================
 # Recovery Manager Creation/Destruction
@@ -104,6 +105,13 @@ pub fn recovery_mgr_new(pool: *BufferPool, wal_path: *u8) -> *RecoveryManager
         free(mgr as *u8)
         return null
 
+    let metas: *NamedCollectionMeta = malloc(MAX_COLLECTIONS as i64 * sizeof(NamedCollectionMeta)) as *NamedCollectionMeta
+    if metas == null
+        free(txn_table as *u8)
+        free(path_copy)
+        free(mgr as *u8)
+        return null
+
     # Initialize
     mgr.pool = pool
     mgr.wal_writer = null
@@ -119,8 +127,8 @@ pub fn recovery_mgr_new(pool: *BufferPool, wal_path: *u8) -> *RecoveryManager
     mgr.stats.pages_recovered = 0
     mgr.stats.checkpoint_lsn = 0
     mgr.stats.recovery_lsn = 0
-    mgr.has_meta = 0
-    collection_meta_clear(@mgr.meta)
+    mgr.metas = metas
+    mgr.meta_count = 0
 
     return mgr
 
@@ -133,6 +141,9 @@ pub fn recovery_mgr_destroy(mgr: *RecoveryManager)
 
     if mgr.txn_table != null
         free(mgr.txn_table as *u8)
+
+    if mgr.metas != null
+        free(mgr.metas as *u8)
 
     if mgr.wal_path != null
         free(mgr.wal_path)
@@ -188,8 +199,7 @@ pub fn recovery_recover(mgr: *RecoveryManager) -> i32
     mgr.stats.txns_aborted = 0
     mgr.stats.pages_recovered = 0
     mgr.txn_count = 0
-    mgr.has_meta = 0
-    collection_meta_clear(@mgr.meta)
+    mgr.meta_count = 0
 
     # Build WAL file path
     var path_buf: [256]u8
@@ -345,16 +355,24 @@ fn recovery_redo_pass(mgr: *RecoveryManager, reader: *WalReader) -> i32
                     mgr.stats.pages_recovered += 1
 
         else if header.rec_type == WAL_REC_META and is_committed
-            var meta: CollectionMeta
-            let meta_len: i64 = sizeof(CollectionMeta)
-            if (header.len as i64) - WAL_HEADER_SIZE != meta_len
+            # A NamedCollectionMeta, or (written before #3637) a bare
+            # CollectionMeta, which is the default collection's.
+            var rec_meta: NamedCollectionMeta
+            let payload_len: i64 = (header.len as i64) - WAL_HEADER_SIZE
+            if payload_len == sizeof(NamedCollectionMeta)
+                if sys_read(reader.fd, @rec_meta as *u8, payload_len) != payload_len
+                    return ERR_IO
+                if rec_meta.id <= 0 or rec_meta.name_len <= 0 or rec_meta.name_len > MAX_COLLECTION_NAME as i64
+                    return ERR_CORRUPT
+            else if payload_len == sizeof(CollectionMeta)
+                named_collection_meta_init(@rec_meta, DEFAULT_COLLECTION_ID, DEFAULT_COLLECTION_NAME.ptr, DEFAULT_COLLECTION_NAME.len as i32)
+                if sys_read(reader.fd, @rec_meta.meta as *u8, payload_len) != payload_len
+                    return ERR_IO
+            else
                 return ERR_CORRUPT
-            let meta_read: i64 = sys_read(reader.fd, @meta as *u8, meta_len)
-            if meta_read != meta_len
-                return ERR_IO
-            # Records are in commit order: the last one wins.
-            memcpy(@mgr.meta as *u8, @meta as *u8, meta_len)
-            mgr.has_meta = 1
+            # Records are in commit order: the last one of each id wins.
+            if recovery_put_meta(mgr, @rec_meta) != ERR_OK
+                return ERR_CORRUPT
 
         else
             # Skip payload for non-redo records or uncommitted transactions
@@ -435,12 +453,33 @@ pub fn recovery_checkpoint(mgr: *RecoveryManager) -> i32
 # Stats Access
 # ============================================================================
 
-# The collection meta of the last committed transaction that logged one.
-# Returns 1 and fills *out if recovery found one, else 0.
-pub fn recovery_collection_meta(mgr: *RecoveryManager, out: *CollectionMeta) -> i32
-    if mgr == null or out == null or mgr.has_meta == 0
+# Record `entry` as the latest meta of its collection id.
+fn recovery_put_meta(mgr: *RecoveryManager, entry: *NamedCollectionMeta) -> i32
+    var i: i32 = 0
+    while i < mgr.meta_count
+        let cur: *NamedCollectionMeta = mgr.metas + i
+        if cur.id == entry.id
+            memcpy(cur as *u8, entry as *u8, sizeof(NamedCollectionMeta))
+            return ERR_OK
+        i += 1
+    if mgr.meta_count >= MAX_COLLECTIONS
+        return ERR_FULL
+    memcpy((mgr.metas + mgr.meta_count) as *u8, entry as *u8, sizeof(NamedCollectionMeta))
+    mgr.meta_count += 1
+    return ERR_OK
+
+# How many collections redo found a committed meta record for.
+pub fn recovery_collection_meta_count(mgr: *RecoveryManager) -> i32
+    if mgr == null
         return 0
-    memcpy(out as *u8, @mgr.meta as *u8, sizeof(CollectionMeta))
+    return mgr.meta_count
+
+# The i-th of those (0 <= i < recovery_collection_meta_count) into *out:
+# the last committed meta logged for that collection.  1 = filled, else 0.
+pub fn recovery_collection_meta_at(mgr: *RecoveryManager, i: i32, out: *NamedCollectionMeta) -> i32
+    if mgr == null or out == null or i < 0 or i >= mgr.meta_count
+        return 0
+    memcpy(out as *u8, (mgr.metas + i) as *u8, sizeof(NamedCollectionMeta))
     return 1
 
 pub fn recovery_stats(mgr: *RecoveryManager) -> *RecoveryStats

@@ -88,6 +88,19 @@ or past 4 MiB) cuts the WAL back. `test/test_restart.ritz` restarts a store
 those ways; `projects/ritz/tools/smoke_stack mausoleum` does it with the
 real binaries.
 
+Collections (AGAST #3637): CONNECT names a collection, and the server binds the
+session to it (`lib/registry.ritz`), so clients on different names never see
+each other's documents. An unknown name is created, and on a data directory it
+is persisted. The empty name and `default` both mean the default collection.
+Names are 1-63 bytes, and a directory holds up to 64 collections; past either
+limit, CONNECT is refused with `PROTO_ERR_COLLECTION_REFUSED`. `meta.m7m` (v2)
+holds the table of collections, and each committed write logs a WAL META record
+for every collection it changed. A store written before #3637 (v1 `meta.m7m`)
+opens with its documents in the default collection
+(`test/test_collections.ritz` checks this against fixtures in `test/fixtures/`).
+`wiki-seed` seeds nexus's `nexus_pages`, and `concurrent_bench` uses
+`wiki_pages`.
+
 `mausoleum shell` and `wiki-seed` speak the encrypted protocol by default, like
 the server; pass `--no-encryption` to both for a `serve --no-encryption` server.
 The shell takes `put key=value ...`, `get <id>`, `delete <id>`, `list`, `ping`
