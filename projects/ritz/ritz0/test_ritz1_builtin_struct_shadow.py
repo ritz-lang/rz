@@ -124,12 +124,17 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 
 
-def _run_pkg(compiler: str, tmp_path: Path, name: str, program: str) -> int:
+def _run_pkg(compiler: str, tmp_path: Path, name: str, program: str,
+             extra: dict[str, str] | None = None) -> int:
     """Build `program` as a package via build.py (which compiles and links
-    every transitively imported module), run it, return the exit code."""
+    every transitively imported module), run it, return the exit code.
+
+    `extra` maps more `src/` file names to their text (a second module)."""
     pkg = tmp_path / f"{name}_{compiler}"
     (pkg / "src").mkdir(parents=True)
     (pkg / "src" / "main.ritz").write_text(program)
+    for fname, text in (extra or {}).items():
+        (pkg / "src" / fname).write_text(text)
     (pkg / "ritz.toml").write_text(
         f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n'
         '[build]\ntarget = "x86_64-linux"\n'
