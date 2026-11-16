@@ -19,11 +19,12 @@ The supported set:
 Everything else is an error at the field's value naming the const, element and
 field (a dotted path inside a nested literal), worded like #1569's.
 
-Every program exits 3 when the fields hold the right values.  Pointer and f32
-fields are read through a typed local: a direct `*(T[0].s + 1)` or f32
-`T[0].a != x` read is mistyped by ritz1 (AGAST #3671).  ritz0 refuses
-lowers the same set and raises the same located errors (AGAST #3670), but
-rounds every f32 literal exactly, so it has no f32_too_precise rows.
+Every program exits 3 when the fields hold the right values.  Fields are read
+directly: ritz1 typed `T[0].s` as an i64 and `T[0].a` as an f64, so
+`*(T[0].s + 1)` loaded 8 bytes and an f32 compare was `fcmp double` on a
+`float` (AGAST #3671).  ritz0 lowers the same set and raises the same located
+errors (AGAST #3670), but rounds every f32 literal exactly, so it has no
+f32_too_precise rows.
 """
 
 import pytest
@@ -62,22 +63,17 @@ struct P
 const T: [2]P = [P { s: "hey", c: c"cs", n: null, q: null }, P { s: "", c: c"x\\ty", n: "z", q: null }]
 
 pub fn main() -> i32
-    let s0: *u8 = T[0].s
-    let c0: *u8 = T[0].c
-    let s1: *u8 = T[1].s
-    let c1: *u8 = T[1].c
-    let n1: *u8 = T[1].n
-    if *(s0 + 1) != 'e' or *(s0 + 3) != 0
+    if *(T[0].s + 1) != 'e' or *(T[0].s + 3) != 0
         return 10
-    if *(c0 + 0) != 'c' or *(c0 + 2) != 0
+    if *T[0].c != 'c' or *(T[0].c + 2) != 0
         return 11
     if T[0].n != null or T[0].q != null or T[1].q != null
         return 12
-    if *(s1 + 0) != 0
+    if *(T[1].s + 0) != 0
         return 13
-    if *(c1 + 1) != 9 or *(c1 + 3) != 0
+    if *(T[1].c + 1) != 9 or *(T[1].c + 3) != 0
         return 14
-    if *(n1 + 0) != 'z'
+    if *T[1].n != 'z'
         return 15
     return 3
 """
@@ -118,14 +114,11 @@ pub fn main() -> i32
     let a: f32 = 1.3
     let b: f32 = -0.1
     let c: f32 = 2.5
-    let ta: f32 = T[0].a
-    let tb: f32 = T[0].b
-    let tc: f32 = T[0].c
-    if ta != a
+    if T[0].a != a
         return 10
-    if tb != b
+    if T[0].b != b
         return 11
-    if tc != c
+    if T[0].c != c
         return 12
     if T[0].w != 0.7
         return 13
@@ -222,13 +215,11 @@ pub fn main() -> i32
         return 10
     if T[0].inn.leaf.v != 12 or T[1].inn.leaf.v != -1
         return 11
-    let name: StrView = T[0].inn.leaf.name
-    if name.len != 2 or *(name.ptr + 1) != 'b'
+    if T[0].inn.leaf.name.len != 2 or *(T[0].inn.leaf.name.ptr + 1) != 'b'
         return 12
     if T[1].inn.leaf.name.len != 0
         return 13
-    let p0: *u8 = T[0].inn.p
-    if *(p0 + 1) != 'q' or T[1].inn.p != null
+    if *(T[0].inn.p + 1) != 'q' or T[1].inn.p != null
         return 14
     if T[0].inn.f != -0.5 or T[1].inn.f != 2.0
         return 15
