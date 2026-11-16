@@ -25,12 +25,13 @@
 #     (AGAST #2197 item 5)
 #
 # Usage: bash projects/valet/test/test_tls_socket.sh  (after ./rz build valet)
+# PORT and SPORT pin the two servers' ports; by default each run picks its own
+# (see "Ports" below; projects/ritz/tools/test_tls_socket_ports.py).
 #
 # A step in main.yml's build-all job. Exit only 0 or 1: ci_local reads 3 as
 # SETUP ERROR, a verdict-free missing tool, and a red run here must stay red.
 
 VALET="${VALET:-$(dirname "$0")/../build/debug/valet}"
-PORT="${PORT:-9143}"
 # Bounds every client so a server that stalls fails the test, not the run.
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-5}"
 
@@ -73,6 +74,34 @@ if [ ! -x "$VALET" ]; then
     echo "FAIL: no valet binary at $VALET (run ./rz build valet)"
     exit 1
 fi
+
+# Ports. valet sets SO_REUSEPORT, so a second valet on the same port binds
+# without error and the kernel splits connections between the two. With fixed
+# ports, a gate's client once finished its handshake with a room's mutated
+# valet on the same port (AGAST #3685). Two copies of this script at once, in
+# two gate slots or a gate and a room, must never share a port, so each picks
+# random unused ones below the kernel's ephemeral range (32768 on), where no
+# client socket's local port can be. PORT and SPORT can still be given by hand,
+# but a port that already has a listener is refused, not shared.
+port_taken() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+pick_port() {
+    local p
+    while :; do
+        p=$((10000 + RANDOM % 22000))
+        [ "$p" != "$1" ] && ! port_taken "$p" && break
+    done
+    echo "$p"
+}
+PORT="${PORT:-$(pick_port)}"
+SPORT="${SPORT:-$(pick_port "$PORT")}"
+for p in "$PORT" "$SPORT"; do
+    if port_taken "$p"; then
+        echo "FAIL: port $p already has a listener; valet's SO_REUSEPORT would share it"
+        exit 1
+    fi
+done
 
 openssl genpkey -algorithm ed25519 -out "$WORK/key.pem" 2>/dev/null
 openssl req -new -x509 -key "$WORK/key.pem" -out "$WORK/cert.pem" -days 2 \
@@ -390,7 +419,6 @@ fi
 # pieces. The TLS SEND state took the first piece for the whole record and
 # moved on, so the rest of the record never followed (AGAST #2197 item 5).
 echo "=== Test 13: short sends under a small SO_SNDBUF ==="
-SPORT=$((PORT + 1))
 cat > "$WORK/valet_sndbuf.json" <<EOF2
 {"server":{"port":$SPORT,"sndbuf":1024},"tls":{"enabled":true,"cert":"$WORK/cert.pem","key":"$WORK/key.pem"}}
 EOF2
