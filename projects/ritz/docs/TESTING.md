@@ -400,6 +400,17 @@ Rules:
    Vec$i32_get`, `leans on %Option$i32`).  It costs: the 12 batched files
    went from 605 to 1078 test-seconds (unbatched: 1600), almost all of it
    ritz0's ~120 ms emit for rows that touch a generic.
+
+   **Or make the table one test (AGAST #3518).**  Batching still collects,
+   dispatches and reports every row as a case.  `ritz0/test_row_table.py`'s
+   `assert_runs(compiler, tmp_path, {name: (program, exit)}, gaps)` and
+   `assert_refusals(compiler, tmp_path, {name: (marked, message)}, gaps)`
+   assert a whole table in one test per compiler: batched compiles, each
+   row run in its own process, and a row the batch gets wrong compiled
+   again on its own.  The failure names every failing row (`row: wanted
+   exit 5, got exit 4`), and a `gaps` row (a strict xfail) that passes
+   fails the table.  `test_member_through_levels.py` and
+   `test_receiver_through_levels.py` went from 1,749 cases to 18.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

@@ -12,10 +12,10 @@ strict xfail citing its ticket.
 
 import pytest
 
-from test_ref_into_value import COMPILERS, _assert_refused, _run
+from test_row_table import assert_refusals, assert_runs
+from test_ref_into_value import COMPILERS
 
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = [pytest.mark.integration, pytest.mark.batched]
+pytestmark = pytest.mark.integration
 
 TYPES = """\
 struct C
@@ -315,36 +315,29 @@ SHARED_NEAREST = {
 }
 
 
-def _params(table):
-    for row in table:
-        for compiler in COMPILERS:
-            yield pytest.param(row, compiler, id=f"{row}-{compiler}")
+# AGAST #3518: each table is one test per compiler, a row per case (test_row_table.py).
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_member_through_levels(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, ROWS)
 
 
-@pytest.mark.parametrize("row,compiler", list(_params(ROWS)))
-def test_member_through_levels(tmp_path, compiler, row):
-    src, want = ROWS[row]
-    assert _run(compiler, tmp_path, row.replace(".", "_"), src) == want
-
-
-@pytest.mark.parametrize("row,compiler", list(_params(HOLDERS)))
-def test_member_through_what_holds_it(tmp_path, compiler, row):
-    src, want = HOLDERS[row]
-    assert _run(compiler, tmp_path, row.replace(".", "_"), src) == want
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_member_through_what_holds_it(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, HOLDERS)
 
 
 # `*r` of a `*@C` is an `@C` (test_at_into_mut.py has `@@C` and `@@&C`).
 SHARED_INTO_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
 
 
+# Each is refused, at its `^`.  name: (program, message).
+REFUSALS = {
+    "deref_ptr_to_shared": (f"{TYPES}{MB}fn g(r: *@C) -> i32\n    mb(^*r)\n\npub fn main() -> i32\n    0\n",
+                            SHARED_INTO_MUT),
+} | {name: (f"{TYPES}{fn}pub fn main() -> i32\n    0\n", WRITE_THROUGH_SHARED)
+     for name, fn in SHARED_NEAREST.items()}
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_shared_reference_behind_a_pointer_stays_shared(tmp_path, compiler):
-    _assert_refused(compiler, tmp_path, "deref_ptr_to_shared",
-                    f"{TYPES}{MB}fn g(r: *@C) -> i32\n    mb(^*r)\n\npub fn main() -> i32\n    0\n",
-                    SHARED_INTO_MUT)
-
-
-@pytest.mark.parametrize("row,compiler", list(_params(SHARED_NEAREST)))
-def test_write_refused_by_the_nearest_level(tmp_path, compiler, row):
-    _assert_refused(compiler, tmp_path, row, f"{TYPES}{SHARED_NEAREST[row]}pub fn main() -> i32\n    0\n",
-                    WRITE_THROUGH_SHARED)
+def test_refused_through_levels(tmp_path, compiler):
+    assert_refusals(compiler, tmp_path, REFUSALS)

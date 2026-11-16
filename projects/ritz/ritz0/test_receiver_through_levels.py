@@ -17,7 +17,8 @@ in test_member_through_levels.py (#2398).
 import pytest
 
 from ref_rules import MOVE_OUT_OF_REF
-from test_ref_into_value import COMPILERS, _assert_refused, _run
+from test_row_table import assert_refusals, assert_runs
+from test_ref_into_value import COMPILERS
 
 pytestmark = pytest.mark.integration
 
@@ -319,29 +320,26 @@ RITZ1_GAPS = {}
 GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}
 
 
-def _params(table):
-    for row in table:
-        for compiler in COMPILERS:
-            gap = GAPS[compiler].get(row)
-            marks = [pytest.mark.xfail(strict=True, reason=f"AGAST #{gap}")] if gap else []
-            yield pytest.param(row, compiler, marks=marks, id=f"{row}-{compiler}")
+# AGAST #3518: each table is one test per compiler, a row per case (test_row_table.py).
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_receiver_through_levels(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, ROWS, GAPS[compiler])
 
 
-@pytest.mark.parametrize("row,compiler", list(_params(ROWS)))
-def test_receiver_through_levels(tmp_path, compiler, row):
-    src, want = ROWS[row]
-    assert _run(compiler, tmp_path, row.replace(".", "_"), src) == want
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_receiver_through_what_holds_it(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, HOLDERS, GAPS[compiler])
 
 
-@pytest.mark.parametrize("row,compiler", list(_params(HOLDERS)))
-def test_receiver_through_what_holds_it(tmp_path, compiler, row):
-    src, want = HOLDERS[row]
-    assert _run(compiler, tmp_path, row, src) == want
+# A by-value `self` copies through a level, so a move-only one can't.
+# name: (program, message).
+REFUSALS = {
+    row: ((f"{RESOURCE}{fn}\npub fn main() -> i32\n    var r = R {{ id: 1 }}\n"
+           f"    var q: *R = @&r\n    g({arg})\n"), MOVE_OUT_OF_REF)
+    for row, (fn, arg) in MOVES.items()
+}
 
 
-@pytest.mark.parametrize("row,compiler", list(_params(MOVES)))
-def test_a_move_only_self_stays_behind_the_level(tmp_path, compiler, row):
-    fn, arg = MOVES[row]
-    src = (f"{RESOURCE}{fn}\npub fn main() -> i32\n    var r = R {{ id: 1 }}\n"
-           f"    var q: *R = @&r\n    g({arg})\n")
-    _assert_refused(compiler, tmp_path, row, src, MOVE_OUT_OF_REF)
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_move_only_self_stays_behind_the_level(tmp_path, compiler):
+    assert_refusals(compiler, tmp_path, REFUSALS, GAPS[compiler])
