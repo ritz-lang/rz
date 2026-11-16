@@ -6,6 +6,10 @@
 # ClientHello is not the trace's, so the test injects that message and the
 # trace's private key, then feeds the server's records to tls_client_process
 # unchanged.
+#
+# After the handshake, section 3's ticket, data and close_notify records go
+# through tls_client_read; the post-handshake tests below also play the server
+# to send what the trace does not (KeyUpdate, split tickets, fatal alerts).
 
 import ritzlib.strview
 
@@ -82,6 +86,21 @@ fn client_app_record() -> StrView
 const SERVER_APP_RECORD_LEN: i64 = 72
 fn server_app_record() -> StrView
     return "17030300432e937e11ef4ac740e538ad36005fc4a46932fc3225d05f82aa1b36e30efaf97d90e6dffc602dcb501a59a8fcc49c4bf2e5f0a21c0047c2abf332540dd032e167c2955d"
+
+# The server's first record after the handshake: a NewSessionTicket, sequence 0.
+const SERVER_TICKET_RECORD_LEN: i64 = 227
+fn server_ticket_record() -> StrView
+    return "17030300de3a6b8f90414a97d6959c3487680de5134a2b240e6cffac116e95d41d6af8f6b580dcf3d11d63c758db289a015940252f55713e061dc13e078891a38efbcf5753ad8ef170ad3c7353d16d9da773b9ca7f2b9fa1b6c0d4a3d03f75e09c30ba1e62972ac46f75f7b981be63439b2999ce13064615139891d5e4c5b406f16e3fc181a77ca475840025db2f0a77f81b5ab05b94c01346755f69232c86519d86cbeeac87aac347d143f9605d64f650db4d023e70e952ca49fe5137121c74bc2697687e248746d6df353005f3bce18696129c8153556b3b6c6779b37bf15985684f"
+
+# Each side's close_notify, after one application record (client sequence 1,
+# server sequence 2).
+const CLIENT_CLOSE_NOTIFY_RECORD_LEN: i64 = 24
+fn client_close_notify_record() -> StrView
+    return "1703030013c9872760655666b74d7ff1153efd6db6d0b0e3"
+
+const SERVER_CLOSE_NOTIFY_RECORD_LEN: i64 = 24
+fn server_close_notify_record() -> StrView
+    return "1703030013b58fd67166ebf599d24720cfbe7efa7a8864a9"
 
 # ============================================================================
 # RFC 8448 section 5 vectors
@@ -327,13 +346,82 @@ fn test_rfc8448_client_reads_application_record() -> i32
     if r != 0
         return r
     # The trace's server sends a NewSessionTicket first, as record 0.
-    client.read_state.server_seq = 1
+    var ticket: [SERVER_TICKET_RECORD_LEN]u8
+    from_hex(@ticket[0], server_ticket_record(), SERVER_TICKET_RECORD_LEN)
+    if tls_client_read(@client, @ticket[0], SERVER_TICKET_RECORD_LEN, @out[0], 256) != 0
+        return 10
     var rec: [SERVER_APP_RECORD_LEN]u8
     from_hex(@rec[0], server_app_record(), SERVER_APP_RECORD_LEN)
     if tls_client_read(@client, @rec[0], SERVER_APP_RECORD_LEN, @out[0], 256) != CLIENT_APP_PAYLOAD_LEN
-        return 10
-    if eq_hex(@out[0], client_app_payload(), CLIENT_APP_PAYLOAD_LEN) != 1
         return 11
+    if eq_hex(@out[0], client_app_payload(), CLIENT_APP_PAYLOAD_LEN) != 1
+        return 12
+    return 0
+
+# RFC 8446 4.6.1: the ticket is accepted and dropped. It stays out of the
+# transcript, and no resumption state is kept.
+[[test]]
+fn test_rfc8448_client_skips_new_session_ticket() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var out: [256]u8
+    var out_len: i64 = 0
+    let r: i32 = run_trace(@client, @cfg, @out[0], @out_len)
+    if r != 0
+        return r
+    var ticket: [SERVER_TICKET_RECORD_LEN]u8
+    from_hex(@ticket[0], server_ticket_record(), SERVER_TICKET_RECORD_LEN)
+    if tls_client_read(@client, @ticket[0], SERVER_TICKET_RECORD_LEN, @out[0], 256) != 0
+        return 10
+    if tls_client_state(@client) != TLS_STATE_CONNECTED
+        return 11
+    if client.read_state.server_seq != 1
+        return 12
+    if client.hs_len != 0
+        return 13
+    var th: [32]u8
+    transcript_hash(@client.transcript, @th[0])
+    if eq_hex(@th[0], hash_through_client_finished(), 32) != 1
+        return 14
+    return 0
+
+# The trace's last server record is close_notify: a clean end of stream.
+# Anything after it is ignored (RFC 8446 6.1), and our own close_notify then
+# closes the connection.
+[[test]]
+fn test_rfc8448_client_reads_close_notify() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var out: [256]u8
+    var out_len: i64 = 0
+    let r: i32 = run_trace(@client, @cfg, @out[0], @out_len)
+    if r != 0
+        return r
+    var ticket: [SERVER_TICKET_RECORD_LEN]u8
+    from_hex(@ticket[0], server_ticket_record(), SERVER_TICKET_RECORD_LEN)
+    if tls_client_read(@client, @ticket[0], SERVER_TICKET_RECORD_LEN, @out[0], 256) != 0
+        return 10
+    var rec: [SERVER_APP_RECORD_LEN]u8
+    from_hex(@rec[0], server_app_record(), SERVER_APP_RECORD_LEN)
+    if tls_client_read(@client, @rec[0], SERVER_APP_RECORD_LEN, @out[0], 256) != CLIENT_APP_PAYLOAD_LEN
+        return 11
+    var alert: [SERVER_CLOSE_NOTIFY_RECORD_LEN]u8
+    from_hex(@alert[0], server_close_notify_record(), SERVER_CLOSE_NOTIFY_RECORD_LEN)
+    if tls_client_read(@client, @alert[0], SERVER_CLOSE_NOTIFY_RECORD_LEN, @out[0], 256) != TLS_READ_CLOSED
+        return 12
+    if tls_client_read(@client, @rec[0], SERVER_APP_RECORD_LEN, @out[0], 256) != TLS_READ_CLOSED
+        return 13
+    # Half-closed: the client may still write (its record 0, as in the trace).
+    var payload: [CLIENT_APP_PAYLOAD_LEN]u8
+    from_hex(@payload[0], client_app_payload(), CLIENT_APP_PAYLOAD_LEN)
+    if tls_client_write(@client, @payload[0], CLIENT_APP_PAYLOAD_LEN, @out[0], 256) != CLIENT_APP_RECORD_LEN
+        return 17
+    if tls_client_close(@client, @out[0], 256) != CLIENT_CLOSE_NOTIFY_RECORD_LEN
+        return 14
+    if eq_hex(@out[0], client_close_notify_record(), CLIENT_CLOSE_NOTIFY_RECORD_LEN) != 1
+        return 15
+    if tls_client_state(@client) != TLS_STATE_CLOSED
+        return 16
     return 0
 
 # resumption_master_secret does hash the client Finished: it must still reach
@@ -417,4 +505,529 @@ fn test_rfc8448_retry_transcript_ends_with_client_finished() -> i32
     transcript_hash(@client.transcript, @th[0])
     if eq_hex(@th[0], retry_hash_through_client_finished(), 32) != 1
         return 10
+    return 0
+
+# ============================================================================
+# Post-handshake messages (RFC 8446 4.6), alerts (RFC 8446 6)
+# ============================================================================
+#
+# After the section 3 trace the test plays the server: it encrypts records
+# under the client's own application keys, so it can send what the trace
+# does not (a KeyUpdate, a split ticket, a fatal alert).
+
+# A record state that writes as the server and reads what the client writes.
+fn server_writer(client: *TlsClient, srv: *TlsRecordState)
+    tls_record_state_init(srv)
+    tls_record_state_set_keys(srv, @client.write_state.client_key[0], @client.write_state.client_iv[0], @client.read_state.server_key[0], @client.read_state.server_iv[0], 16)
+    srv.server_seq = client.read_state.server_seq
+    srv.client_seq = client.write_state.client_seq
+
+# Server -> client: one record of `content_type` holding msg[0..len].
+# Returns tls_client_read's result.
+fn server_send(client: *TlsClient, srv: *TlsRecordState, content_type: u8, msg: *u8, len: i64) -> i64
+    var rec: [1024]u8
+    let n: i32 = tls_record_state_server_encrypt(srv, msg, len as i32, content_type, @rec[0], 1024)
+    if n < 0
+        return -100
+    var out: [256]u8
+    return tls_client_read(client, @rec[0], n as i64, @out[0], 256)
+
+# A well-formed NewSessionTicket: lifetime, age_add, a 1-byte nonce, a 3-byte
+# ticket, no extensions. Writes TICKET_LEN bytes to `out`.
+const TICKET_LEN: i64 = 21
+fn make_ticket(out: *u8)
+    from_hex(out, "04000011000070800102030401aa0003bbccdd0000", TICKET_LEN)
+
+# Connected through the section 3 trace, with the server's writer alongside.
+fn connected(client: *TlsClient, cfg: *TlsConfig, srv: *TlsRecordState) -> i32
+    var out: [256]u8
+    var out_len: i64 = 0
+    let r: i32 = run_trace(client, cfg, @out[0], @out_len)
+    if r != 0
+        return r
+    server_writer(client, srv)
+    return 0
+
+# RFC 8446 7.2: application_traffic_secret_N+1 =
+#     HKDF-Expand-Label(application_traffic_secret_N, "traffic upd", "", 32)
+fn next_secret(secret: *u8, out: *u8) -> i32
+    match hkdf_expand_label(secret, "traffic upd", 11, null, 0, out, 32)
+        Ok(_) => return 0
+        Err(_) => return -1
+
+# Server -> client application data; 0 if the client reads it back intact.
+fn data_from_server(client: *TlsClient, srv: *TlsRecordState, msg: StrView) -> i32
+    let n: i64 = strview_len(msg)
+    var rec: [1024]u8
+    let rec_len: i32 = tls_record_state_server_encrypt(srv, strview_as_ptr(msg), n as i32, 23, @rec[0], 1024)
+    if rec_len < 0
+        return -100
+    var out: [256]u8
+    if tls_client_read(client, @rec[0], rec_len as i64, @out[0], 256) != n
+        return -1
+    if mem_eq(@out[0], strview_as_ptr(msg), n as u64) != 1
+        return -2
+    return 0
+
+# OpenSSL sends two tickets, each in its own record, before any data.
+[[test]]
+fn test_post_handshake_tickets_then_application_data() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ticket: [TICKET_LEN]u8
+    make_ticket(@ticket[0])
+    if server_send(@client, @srv, 22, @ticket[0], TICKET_LEN) != 0
+        return 10
+    if server_send(@client, @srv, 22, @ticket[0], TICKET_LEN) != 0
+        return 11
+    if data_from_server(@client, @srv, "HTTP/1.1 200 OK\r\n") != 0
+        return 12
+    return 0
+
+[[test]]
+fn test_post_handshake_two_tickets_in_one_record() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var two: [42]u8
+    make_ticket(@two[0])
+    make_ticket(@two[TICKET_LEN])
+    if server_send(@client, @srv, 22, @two[0], 2 * TICKET_LEN) != 0
+        return 10
+    if data_from_server(@client, @srv, "hello") != 0
+        return 11
+    return 0
+
+# A handshake message may span records (RFC 8446 5.1).
+[[test]]
+fn test_post_handshake_ticket_split_across_records() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ticket: [TICKET_LEN]u8
+    make_ticket(@ticket[0])
+    if server_send(@client, @srv, 22, @ticket[0], 7) != 0
+        return 10
+    if client.hs_len != 7
+        return 11
+    if server_send(@client, @srv, 22, @ticket[7], TICKET_LEN - 7) != 0
+        return 12
+    if client.hs_len != 0
+        return 13
+    if data_from_server(@client, @srv, "hello") != 0
+        return 14
+    return 0
+
+# ...but must not be interleaved with other content (RFC 8446 5.1).
+[[test]]
+fn test_post_handshake_refuses_data_inside_split_message() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ticket: [TICKET_LEN]u8
+    make_ticket(@ticket[0])
+    if server_send(@client, @srv, 22, @ticket[0], 7) != 0
+        return 10
+    if data_from_server(@client, @srv, "hello") == 0
+        return 11
+    if tls_client_error(@client) != TLS_ERR_UNEXPECTED_MESSAGE
+        return 12
+    return 0
+
+[[test]]
+fn test_post_handshake_refuses_malformed_ticket() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ticket: [TICKET_LEN]u8
+    make_ticket(@ticket[0])
+    ticket[15] = 4  # ticket length 4: runs over the extensions length
+    if server_send(@client, @srv, 22, @ticket[0], TICKET_LEN) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_PARSE_ERROR
+        return 11
+    return 0
+
+[[test]]
+fn test_post_handshake_refuses_empty_ticket() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    # ticket<1..2^16-1>: a zero-length ticket is malformed.
+    var ticket: [18]u8
+    from_hex(@ticket[0], "0400000e000070800102030401aa00000000", 18)
+    if server_send(@client, @srv, 22, @ticket[0], 18) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_PARSE_ERROR
+        return 11
+    return 0
+
+# The fields must fill the body exactly: a trailing byte is malformed.
+[[test]]
+fn test_post_handshake_refuses_ticket_with_trailing_byte() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ticket: [22]u8
+    from_hex(@ticket[0], "04000012000070800102030401aa0003bbccdd000000", 22)
+    if server_send(@client, @srv, 22, @ticket[0], 22) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_PARSE_ERROR
+        return 11
+    return 0
+
+# Anything but NewSessionTicket and KeyUpdate is unexpected after the
+# handshake (no post_handshake_auth was offered), and the failure sticks.
+[[test]]
+fn test_post_handshake_refuses_unknown_handshake_type() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var msg: [5]u8
+    from_hex(@msg[0], "6300000100", 5)
+    if server_send(@client, @srv, 22, @msg[0], 5) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_UNEXPECTED_MESSAGE
+        return 11
+    if tls_client_state(@client) != TLS_STATE_ERROR
+        return 12
+    if data_from_server(@client, @srv, "hello") == 0
+        return 13
+    return 0
+
+[[test]]
+fn test_post_handshake_refuses_certificate_request() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var msg: [10]u8
+    from_hex(@msg[0], "0d00000601aa00020000", 10)
+    if server_send(@client, @srv, 22, @msg[0], 10) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_UNEXPECTED_MESSAGE
+        return 11
+    return 0
+
+[[test]]
+fn test_post_handshake_refuses_empty_handshake_record() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var none: [1]u8
+    if server_send(@client, @srv, 22, @none[0], 0) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_UNEXPECTED_MESSAGE
+        return 11
+    return 0
+
+# An empty application record carries no data; it is not an error or EOF.
+[[test]]
+fn test_post_handshake_empty_application_record() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var none: [1]u8
+    if server_send(@client, @srv, 23, @none[0], 0) != 0
+        return 10
+    if data_from_server(@client, @srv, "hello") != 0
+        return 11
+    return 0
+
+[[test]]
+fn test_alert_fatal_is_an_error() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var alert: [2]u8
+    alert[0] = 2
+    alert[1] = 40  # handshake_failure
+    if server_send(@client, @srv, 21, @alert[0], 2) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_PEER_ALERT
+        return 11
+    if tls_client_peer_alert(@client) != 40
+        return 12
+    if tls_client_state(@client) != TLS_STATE_ERROR
+        return 13
+    return 0
+
+# Only close_notify ends the stream cleanly; user_canceled is an error too.
+[[test]]
+fn test_alert_warning_other_than_close_notify_is_an_error() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var alert: [2]u8
+    alert[0] = 1
+    alert[1] = 90  # user_canceled
+    if server_send(@client, @srv, 21, @alert[0], 2) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_PEER_ALERT
+        return 11
+    if tls_client_peer_alert(@client) != 90
+        return 12
+    return 0
+
+[[test]]
+fn test_alert_refuses_malformed_alert() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var alert: [3]u8
+    alert[0] = 1
+    alert[1] = 0
+    alert[2] = 0
+    if server_send(@client, @srv, 21, @alert[0], 3) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_PARSE_ERROR
+        return 11
+    return 0
+
+# Our close_notify first, then the server's: reads still work in between.
+[[test]]
+fn test_alert_close_notify_after_our_close() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var out: [64]u8
+    if tls_client_close(@client, @out[0], 64) <= 0
+        return 10
+    if tls_client_state(@client) != TLS_STATE_CLOSING
+        return 11
+    if data_from_server(@client, @srv, "late data") != 0
+        return 12
+    var alert: [2]u8
+    alert[0] = 1
+    alert[1] = 0
+    if server_send(@client, @srv, 21, @alert[0], 2) != TLS_READ_CLOSED
+        return 13
+    if tls_client_state(@client) != TLS_STATE_CLOSED
+        return 14
+    return 0
+
+# KeyUpdate(update_not_requested): reads move to the next server secret at
+# sequence 0; writes keep their keys.
+[[test]]
+fn test_key_update_rekeys_reads() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ku: [5]u8
+    from_hex(@ku[0], "1800000100", 5)
+    if server_send(@client, @srv, 22, @ku[0], 5) != 0
+        return 10
+    if client.read_state.server_seq != 0
+        return 11
+
+    var secret: [32]u8
+    from_hex(@secret[0], server_ap_secret(), 32)
+    var next: [32]u8
+    if next_secret(@secret[0], @next[0]) != 0
+        return 12
+    match tls13_derive_traffic_keys(@next[0], @srv.server_key[0], 16, @srv.server_iv[0], 12)
+        Ok(_) => 0
+        Err(_) => return 13
+    srv.server_seq = 0
+    if data_from_server(@client, @srv, "after update") != 0
+        return 14
+
+    # No update was requested: the client's next record is under its old keys.
+    var out: [64]u8
+    let n: i64 = tls_client_write(@client, "hi", 2, @out[0], 64)
+    if n != 5 + 2 + 1 + 16
+        return 15
+    var got: [64]u8
+    var inner_type: u8 = 0
+    if tls_record_state_client_decrypt(@srv, @out[0], n as i32, @got[0], 64, @inner_type) != 2
+        return 16
+    return 0
+
+# Records under the old server keys fail once the keys have moved on.
+[[test]]
+fn test_key_update_refuses_old_keys() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ku: [5]u8
+    from_hex(@ku[0], "1800000100", 5)
+    if server_send(@client, @srv, 22, @ku[0], 5) != 0
+        return 10
+    if data_from_server(@client, @srv, "stale") == 0
+        return 11
+    if tls_client_error(@client) != TLS_ERR_DECRYPT_FAILED
+        return 12
+    return 0
+
+# KeyUpdate(update_requested): the client's next write sends its own
+# KeyUpdate(update_not_requested) under the old keys, then the data under the
+# next client secret's keys (RFC 8446 4.6.3).
+[[test]]
+fn test_key_update_requested_updates_writes() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ku: [5]u8
+    from_hex(@ku[0], "1800000101", 5)
+    if server_send(@client, @srv, 22, @ku[0], 5) != 0
+        return 10
+
+    var out: [128]u8
+    let n: i64 = tls_client_write(@client, "hi", 2, @out[0], 128)
+    let ku_rec: i64 = 5 + 5 + 1 + 16
+    let data_rec: i64 = 5 + 2 + 1 + 16
+    if n != ku_rec + data_rec
+        return 11
+    var got: [64]u8
+    var inner_type: u8 = 0
+    if tls_record_state_client_decrypt(@srv, @out[0], ku_rec as i32, @got[0], 64, @inner_type) != 5
+        return 12
+    if inner_type != 22 || eq_hex(@got[0], "1800000100", 5) != 1
+        return 13
+
+    var secret: [32]u8
+    from_hex(@secret[0], client_ap_secret(), 32)
+    var next: [32]u8
+    if next_secret(@secret[0], @next[0]) != 0
+        return 14
+    match tls13_derive_traffic_keys(@next[0], @srv.client_key[0], 16, @srv.client_iv[0], 12)
+        Ok(_) => 0
+        Err(_) => return 15
+    srv.client_seq = 0
+    if tls_record_state_client_decrypt(@srv, @out[ku_rec], data_rec as i32, @got[0], 64, @inner_type) != 2
+        return 16
+    if inner_type != 23 || got[0] != 104 || got[1] != 105
+        return 17
+
+    # Sent once: the next write is a single record under the new keys.
+    if tls_client_write(@client, "hi", 2, @out[0], 128) != data_rec
+        return 18
+    if tls_record_state_client_decrypt(@srv, @out[0], data_rec as i32, @got[0], 64, @inner_type) != 2
+        return 19
+    return 0
+
+# A write too small for both records changes nothing: the update stays queued.
+[[test]]
+fn test_key_update_requested_write_too_small() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ku: [5]u8
+    from_hex(@ku[0], "1800000101", 5)
+    if server_send(@client, @srv, 22, @ku[0], 5) != 0
+        return 10
+    var out: [128]u8
+    if tls_client_write(@client, "hi", 2, @out[0], 40) != -1
+        return 11
+    if client.write_state.client_seq != 0
+        return 12
+    if tls_client_write(@client, "hi", 2, @out[0], 128) != 51
+        return 13
+    return 0
+
+[[test]]
+fn test_key_update_refuses_bad_request_value() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ku: [5]u8
+    from_hex(@ku[0], "1800000102", 5)
+    if server_send(@client, @srv, 22, @ku[0], 5) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_ILLEGAL_PARAMETER
+        return 11
+    return 0
+
+[[test]]
+fn test_key_update_refuses_bad_length() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var ku: [6]u8
+    from_hex(@ku[0], "180000020000", 6)
+    if server_send(@client, @srv, 22, @ku[0], 6) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_PARSE_ERROR
+        return 11
+    return 0
+
+# The keys change after a KeyUpdate: nothing may follow it in its record.
+[[test]]
+fn test_key_update_must_end_its_record() -> i32
+    var cfg: TlsConfig
+    var client: TlsClient
+    var srv: TlsRecordState
+    let r: i32 = connected(@client, @cfg, @srv)
+    if r != 0
+        return r
+    var msg: [26]u8
+    from_hex(@msg[0], "1800000100", 5)
+    make_ticket(@msg[5])
+    if server_send(@client, @srv, 22, @msg[0], 26) != -1
+        return 10
+    if tls_client_error(@client) != TLS_ERR_UNEXPECTED_MESSAGE
+        return 11
     return 0
