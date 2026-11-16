@@ -2778,6 +2778,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             if lent_array_ident(s, target_expr.operand) != null
                 emit_nd_error(s, target_expr.span.line, target_expr.span.col, c"cannot store through `*a` of an `a:& [N]T` param (assign to `a`, it is the array)")
                 return
+            # AGAST #3642: `*q = v` through a plane pointer `q = @&x[i]` (#2570)
+            # stores a whole `[M][N]..T`; array_ptr_shape sees only its flat
+            # `[M*N..]T` and held a nested literal to M*N.
+            let plane: *ArrayShape = plane_ptr_shape(s, target_expr.operand)
+            if plane != null
+                emit_nd_plane_store(s, emit_array_ptr_value(s, target_expr.operand), plane, stmt.assign_value)
+                return
             var arr_dst: ArraySrc
             if array_ptr_shape(s, target_expr.operand, @arr_dst) == 1
                 emit_array_local_whole_assign(s, emit_array_ptr_value(s, target_expr.operand), arr_dst.size, arr_dst.elem, arr_dst.name, arr_dst.name_len, stmt.assign_value)
@@ -5146,6 +5153,28 @@ fn array_lit_count(e: *Expr) -> i32
         n = n + 1
         it = it.next
     n
+
+# AGAST #3642: `*q = value` for a plane pointer `q` (#2570) whose plane is
+# `sh`, at `dst_ptr`.  A whole N-D place is copied as one aggregate
+# (emit_nd_array_init_copy); a nested literal or fill is built in a temporary
+# and copied over, so `*q = [ [q[1][0], ..], ..]` reads the old plane, as a
+# 1-D `*p = [..]` does (emit_array_local_whole_assign).  A wrong length was
+# refused, located, by R42 (ref_literal_length); emit_nd_array_init_into
+# refuses it again rather than store a short row.
+fn emit_nd_plane_store(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *Expr)
+    if emit_nd_array_init_copy(s, dst_ptr, sh, value) == 1
+        return
+    if value.kind != EXPR_ARRAY_LIT and value.kind != EXPR_ARRAY_FILL
+        emit_nd_error(s, value.span.line, value.span.col, c"whole-plane store through a pointer to a plane of a multi-dimensional array is not supported by ritz1 from this value (only a nested literal or fill, or a whole N-D array or plane)")
+        return
+    let tmp: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, tmp)
+    emit_str(s, c" = alloca ")
+    emit_array_shape_llvm(s, sh, 0)
+    emit_str(s, c"\n")
+    if emit_nd_array_init_into(s, sh, 0, tmp, value) == 1
+        emit_nd_plane_copy(s, sh, 0, dst_ptr, tmp)
 
 # AGAST #3377 (LARB R39): write the initialiser `e` into the dimension-`d`
 # plane of `sh` at `ptr`, the whole N-D local at d == 0.  Each level is a

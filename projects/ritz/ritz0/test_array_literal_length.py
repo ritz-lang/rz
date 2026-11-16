@@ -127,3 +127,55 @@ FITS = {
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_literal_of_the_slots_length_fits(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, name, _main(PRELUDE + FITS[name], "    f()\n")) == 3
+
+
+# AGAST #3642: `*q = [..]` through a plane pointer `q = @&x[0]` (#2570) is
+# judged against the plane's shape `[2][3]i64`, not its flat count 6. ritz1
+# refused the good store, unlocated, and R42 never saw a wrong one.
+PLANE = ("fn f() -> i32\n    var x: [2][2][3]i64 = [ [ [0; 3]; 2]; 2]\n    let q = @&x[0]\n"
+         "    *q = {L}\n    x[0][1][2] as i32 - x[1][1][2] as i32\n")
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_plane_store_through_a_pointer_fits(tmp_path, compiler):
+    src = PRELUDE + PLANE.replace("{L}", "[ [1, 2, 3], [4, 5, 6]]")
+    assert _run(compiler, tmp_path, "plane", _main(src, "    f()\n")) == 6
+
+
+
+# The literal is built whole before it lands, so it reads the old plane; and a
+# whole `[2][3]i64` local is copied through a plane pointer too.
+PLANE_ALIAS = """\
+fn swap(x: *[2][2][3]i64)
+    let q = @&x[0]
+    *q = [ [q[1][0], q[1][1], q[1][2]], [q[0][0], q[0][1], q[0][2]]]
+
+fn fill(x: *[2][2][3]i64)
+    var y: [2][3]i64 = [ [7; 3], [8; 3]]
+    let r = @&x[1]
+    *r = y
+
+fn f() -> i32
+    var x: [2][2][3]i64 = [ [ [1, 2, 3], [4, 5, 6]], [ [0; 3]; 2]]
+    swap(@&x)
+    fill(@&x)
+    (x[0][1][2] * 10 + x[0][0][0] + x[1][1][0]) as i32
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_plane_store_reads_the_old_plane(tmp_path, compiler):
+    assert _run(compiler, tmp_path, "plane_alias", _main(PRELUDE + PLANE_ALIAS, "    f()\n")) == 42
+
+PLANE_WRONG = {
+    "outer": ("^[ [1, 2, 3]]", 1, "[2][3]i64"),
+    "inner": ("[ [1, 2, 3], ^[4, 5]]", 2, "[3]i64"),
+}
+
+
+@pytest.mark.parametrize("which", _ids(PLANE_WRONG))
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_plane_store_of_the_wrong_length_is_refused(tmp_path, compiler, which):
+    text, n, slot = PLANE_WRONG[which]
+    src = PRELUDE + PLANE.replace("{L}", text)
+    _assert_refused(compiler, tmp_path, which, _main(src, "    0\n"), literal_length(n, slot))
