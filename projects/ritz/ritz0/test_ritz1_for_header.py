@@ -393,6 +393,11 @@ UNIT_ENUM = "enum U\n    A\n    Bb\n    Cc\n\n"
 PAYLOAD_ENUM = "enum C\n    R(i64)\n    B\n\n"
 _FILL_U = "    var v: Vec<U> = vec_new<U>()\n" + _pushes("v", ("U.A", "U.Cc", "U.Bb"))
 _FILL_C = "    var v: Vec<C> = vec_new<C>()\n" + _pushes("v", ("C.R(5)", "C.B", "C.R(7)"))
+
+
+# Weights each element by its position; `{{it}}` survives the first format.
+_TE_WALK = ("var t: i64 = 0\nvar i: i64 = 1\nfor x in {{it}}\n    match x\n{arms}"
+            "    i = i + 1\nif t != {want}\n    return 1\nreturn 0\n")
 ENUM_WALKS = {
     # 1 + 30 + 200
     "unit": (UNIT_ENUM, _FILL_U, "var t: i64 = 0\nvar i: i64 = 1\nfor x in {it}\n    match x\n"
@@ -411,6 +416,22 @@ ENUM_WALKS = {
               "var t: i32 = 0\nvar i: i32 = 1\nfor x in {it}\n    match x\n"
               "        Event.Key(k) => t = t + k * i\n        Event.Quit => t = t + 100 * i\n"
               "    i = i + 1\nif t != 226\n    return 1\nreturn 0\n"),
+    # AGAST #3647: a Vec of an Option / Result, walked at the tagged enum's own
+    # stride (2 bytes for Option<u8>, 16 for Option<i64> and Result<i64, i32>).
+    # ritz1 refused the element: a tagged enum is no struct find_struct knows.
+    # 200 + 200 + 21
+    "option_u8": ("", _new("Option<u8>", ("Some(200)", "None", "Some(7)")),
+                  _TE_WALK.format(arms="        Some(n) => t = t + n as i64 * i\n"
+                                  "        None => t = t + 100 * i\n", want=421)),
+    # 12 + 200 - 15000000000
+    "option_i64": ("", _new("Option<i64>", ("Some(12)", "None", "Some(-5000000000)")),
+                   _TE_WALK.format(arms="        Some(n) => t = t + n * i\n"
+                                   "        None => t = t + 100 * i\n", want=-14999999788)),
+    # 5000000000 - 6000 + 21
+    "result": ("", _new("Result<i64, i32>", ("Ok(5000000000)", "Err(-3)", "Ok(7)")),
+               _TE_WALK.format(arms="        Ok(n) => t = t + n * i\n"
+                               "        Err(e) => t = t + e as i64 * 1000 * i\n",
+                               want=4999994021)),
 }
 
 
