@@ -448,7 +448,7 @@ class TestCacheCompilerHash:
 
     def test_compiler_hash_computed(self, tmp_path):
         """Compiler hash is computed from critical files."""
-        from cache import compute_compiler_hash, COMPILER_CRITICAL_FILES
+        from cache import compute_compiler_hash
 
         # Create a fake project root with some compiler files
         ritz0_dir = tmp_path / "ritz0"
@@ -479,29 +479,19 @@ class TestCacheCompilerHash:
         assert h1 != h2
 
     def test_cache_invalidated_on_compiler_change(self, tmp_path):
-        """Cache is invalidated when compiler hash changes."""
+        """No record, or a different compiler, invalidates; a match does not."""
         from cache import BuildCache
 
-        # Setup project
         ritz0_dir = tmp_path / "ritz0"
         ritz0_dir.mkdir()
         emitter = ritz0_dir / "emitter_llvmlite.py"
         emitter.write_text("# version 1")
 
-        cache = BuildCache(project_root=tmp_path)
+        assert BuildCache(project_root=tmp_path).invalidate_if_compiler_changed() is True
+        assert BuildCache(project_root=tmp_path).invalidate_if_compiler_changed() is False
 
-        # Initially invalid (no compiler_hash file)
-        assert cache._check_compiler_hash() is False
-
-        # Update hash
-        cache._update_compiler_hash()
-        assert cache._check_compiler_hash() is True
-
-        # Change compiler - should invalidate
         emitter.write_text("# version 2")
-        cache._compiler_hash = None  # Reset cached value
-        cache._compiler_hash_valid = None
-        assert cache._check_compiler_hash() is False
+        assert BuildCache(project_root=tmp_path).invalidate_if_compiler_changed() is True
 
 
 if __name__ == "__main__":
@@ -509,70 +499,52 @@ if __name__ == "__main__":
 
 
 # =============================================================================
-# Cache wholesale-invalidation regression (May 2026)
+# Cache wholesale invalidation
 # =============================================================================
 #
-# The cache used to silently return stale objects for every source past the
-# first one when the compiler changed: `update_cache` flipped the in-memory
-# "compiler-hash valid" flag mid-build, so subsequent `needs_rebuild` calls
-# returned False and handed back .o files produced by the old compiler.
-#
-# Burned a debugging session. Now: if the compiler hash mismatches what's on
-# disk, `invalidate_if_compiler_changed` wipes the entire artifact store
-# before any per-source decisions are made.
+# A compiler change can change how imports parse or resolve, so it discards
+# every persisted import scan. It also sweeps away what the deleted per-module
+# artifact cache (AGAST #3454) left in old cache directories.
 
 class TestCacheWholesaleInvalidation:
     """invalidate_if_compiler_changed wipes everything when compiler differs."""
 
-    def test_invalidate_wipes_all_objects_on_compiler_change(self, tmp_path):
+    @staticmethod
+    def _seeded(tmp_path):
         from cache import BuildCache
 
         ritz0_dir = tmp_path / "ritz0"
         ritz0_dir.mkdir()
-        emitter = ritz0_dir / "emitter_llvmlite.py"
-        emitter.write_text("# v1")
-
+        (ritz0_dir / "emitter_llvmlite.py").write_text("# v1")
+        (tmp_path / "main.ritz").write_text("fn main() -> i32\n    0\n")
         cache = BuildCache(project_root=tmp_path)
-        # Seed cache with two fake artifacts and the v1 hash.
-        cache._update_compiler_hash()
-        cache.objects_dir.mkdir(parents=True, exist_ok=True)
-        (cache.objects_dir / "a.ll").write_text("ir-from-v1")
-        (cache.objects_dir / "b.o").write_bytes(b"obj-from-v1")
-        assert (cache.objects_dir / "a.ll").exists()
-        assert (cache.objects_dir / "b.o").exists()
+        cache.invalidate_if_compiler_changed()
+        cache.get_transitive_dependencies(tmp_path / "main.ritz")
+        cache.save()
+        legacy = cache.cache_dir / "objects"
+        legacy.mkdir()
+        (legacy / "a.ll").write_text("ir-from-v1")
+        (cache.cache_dir / "deps.json").write_text("{}")
+        assert (cache.cache_dir / "imports.json").exists()
+        return cache
 
-        # Compiler change → wholesale invalidation.
-        emitter.write_text("# v2")
-        cache._compiler_hash = None
-        cache._compiler_hash_valid = None
-        invalidated = cache.invalidate_if_compiler_changed()
+    def test_invalidate_wipes_scans_on_compiler_change(self, tmp_path):
+        from cache import BuildCache
 
-        assert invalidated is True
-        assert not (cache.objects_dir / "a.ll").exists(), "stale .ll survived"
-        assert not (cache.objects_dir / "b.o").exists(), "stale .o survived"
-        # Hash file is refreshed so artifacts produced *during* this build
-        # are recorded as produced by the new compiler.
-        assert cache._check_compiler_hash() is True
+        cache = self._seeded(tmp_path)
+        (tmp_path / "ritz0" / "emitter_llvmlite.py").write_text("# v2")
+        fresh = BuildCache(project_root=tmp_path)
+        assert fresh.invalidate_if_compiler_changed() is True
+        left = sorted(p.name for p in cache.cache_dir.iterdir())
+        assert left == [".lock", "compiler_hash"], left
+        assert fresh.invalidate_if_compiler_changed() is False
 
     def test_invalidate_noop_when_compiler_unchanged(self, tmp_path):
         from cache import BuildCache
 
-        ritz0_dir = tmp_path / "ritz0"
-        ritz0_dir.mkdir()
-        (ritz0_dir / "ritz0.py").write_text("# stable")
-
-        cache = BuildCache(project_root=tmp_path)
-        cache._update_compiler_hash()
-        cache.objects_dir.mkdir(parents=True, exist_ok=True)
-        (cache.objects_dir / "x.ll").write_text("warm-ir")
-
-        # No compiler change between builds.
-        cache._compiler_hash = None
-        cache._compiler_hash_valid = None
-        invalidated = cache.invalidate_if_compiler_changed()
-
-        assert invalidated is False
-        assert (cache.objects_dir / "x.ll").exists(), "warm cache wrongly nuked"
+        cache = self._seeded(tmp_path)
+        assert BuildCache(project_root=tmp_path).invalidate_if_compiler_changed() is False
+        assert (cache.cache_dir / "imports.json").exists(), "warm scans wrongly nuked"
 
     def test_ritz0_walk_finds_emitter_subpackage(self, tmp_path):
         """The pre-fix bug: hand-curated list missed `emitter/*.py`. Adding

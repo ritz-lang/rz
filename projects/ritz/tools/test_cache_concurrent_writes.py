@@ -3,16 +3,16 @@
 regression.sh now builds up to REGRESSION_JOBS examples at once, and every
 build.py process shares one `.ritz-cache` under projects/ritz. Before this:
 
-* `deps.json` was rewritten wholesale from each process's in-memory copy, so
-  the last process to save dropped every entry the others had added.
-* `deps.json`, `compiler_hash`, cached `.ll` and `.o` files were written in
-  place (`open(..., 'w')`, `write_text`, `shutil.copy2`). A concurrent reader
-  could see a truncated file: a JSON error, or a half-written object linked
-  into an example.
+* the shared index was rewritten wholesale from each process's in-memory
+  copy, so the last process to save dropped every entry the others had added.
+* index files and `compiler_hash` were written in place. A concurrent reader
+  could see a truncated file.
 * `imports.json` went through one fixed `imports.json.tmp`, which two writers
   shared.
 
-The tests below pin each of those.
+The tests below pin each of those for what the cache holds today, the import
+scans (`imports.json`) and `compiler_hash`. (The per-module .ll/.o store they
+also covered was deleted by AGAST #3454; artifacts live in cas.py.)
 """
 
 import importlib.util
@@ -50,36 +50,32 @@ def _cache(root: Path) -> BuildCache:
     return c
 
 
-def _deps_on_disk(root: Path) -> dict:
-    return json.loads((root / ".ritz-cache" / "deps.json").read_text())
+def _scanned(root: Path) -> set:
+    """Source paths with a persisted import scan."""
+    db = json.loads((root / ".ritz-cache" / "imports.json").read_text())
+    return {k.rsplit("\0", 1)[-1] for k in db}
+
+
+def _scan(root: Path, src: Path, cache=None) -> None:
+    """What one build.py process does for one module: closure, then save."""
+    c = cache or _cache(root)
+    c.get_transitive_dependencies(src)
+    c.save()
 
 
 @pytest.mark.unit
 def test_two_processes_saving_keep_each_others_entries(tmp_path):
-    """Last writer must not drop the other process's deps.json entries."""
+    """Last writer must not drop the other process's imports.json entries."""
     a, b = _project(tmp_path, ["a", "b"])
     ca, cb = _cache(tmp_path), _cache(tmp_path)
-    # Both load the (empty) state before either saves: two build.py processes
+    # Both load the (empty) store before either saves: two build.py processes
     # started at the same time.
-    assert ca.state.deps == {} and cb.state.deps == {}
-    ca.update_cache(a, "; a\n")
-    cb.update_cache(b, "; b\n")
-    deps = _deps_on_disk(tmp_path)
-    assert str(a.resolve()) in deps, "process B's save dropped A's entry"
-    assert str(b.resolve()) in deps
-
-
-@pytest.mark.unit
-def test_a_fresh_cache_sees_other_processes_entries(tmp_path):
-    """A merged save is visible to the next process, and still a cache hit."""
-    a, b = _project(tmp_path, ["a", "b"])
-    ca, cb = _cache(tmp_path), _cache(tmp_path)
-    ca.state, cb.state
-    ca.update_cache(a, "; a\n")
-    cb.update_cache(b, "; b\n")
-    c = _cache(tmp_path)
-    assert c.needs_rebuild(a) == (False, "cache is valid")
-    assert c.needs_rebuild(b) == (False, "cache is valid")
+    assert ca._load_imports_db() == {} and cb._load_imports_db() == {}
+    _scan(tmp_path, a, ca)
+    _scan(tmp_path, b, cb)
+    scanned = _scanned(tmp_path)
+    assert str(a.resolve()) in scanned, "process B's save dropped A's entry"
+    assert str(b.resolve()) in scanned
 
 
 def _reader_sees_old_content(path: Path, write) -> bool:
@@ -96,45 +92,20 @@ def _reader_sees_old_content(path: Path, write) -> bool:
 
 
 @pytest.mark.unit
-def test_deps_json_is_replaced_atomically(tmp_path):
+def test_imports_json_is_replaced_atomically(tmp_path):
     a, b = _project(tmp_path, ["a", "b"])
-    _cache(tmp_path).update_cache(a, "; a\n")
-    deps = tmp_path / ".ritz-cache" / "deps.json"
-    assert _reader_sees_old_content(deps, lambda: _cache(tmp_path).update_cache(b, "; b\n"))
-
-
-@pytest.mark.unit
-def test_cached_ll_is_replaced_atomically(tmp_path):
-    (a,) = _project(tmp_path, ["a"])
-    c = _cache(tmp_path)
-    c.update_cache(a, "; old\n" * 100)
-    ll = c.get_cached_ll_path(a.resolve())
-    assert _reader_sees_old_content(ll, lambda: _cache(tmp_path).update_cache(a, "; new\n"))
+    _scan(tmp_path, a)
+    db = tmp_path / ".ritz-cache" / "imports.json"
+    assert _reader_sees_old_content(db, lambda: _scan(tmp_path, b))
 
 
 @pytest.mark.unit
 def test_compiler_hash_is_replaced_atomically(tmp_path):
-    (a,) = _project(tmp_path, ["a"])
-    _cache(tmp_path).update_cache(a, "; a\n")
+    _project(tmp_path, ["a"])
+    _cache(tmp_path).invalidate_if_compiler_changed()
     h = tmp_path / ".ritz-cache" / "compiler_hash"
     (tmp_path / "ritz0" / "ritz0.py").write_text("# changed compiler\n")
     assert _reader_sees_old_content(h, lambda: _cache(tmp_path).invalidate_if_compiler_changed())
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("kind", ["obj", "bc"])
-def test_cached_object_is_replaced_atomically(tmp_path, kind):
-    (a,) = _project(tmp_path, ["a"])
-    c = _cache(tmp_path)
-    produced = tmp_path / f"out.{kind}"
-    produced.write_bytes(b"OLD" * 1000)
-    update = c.update_obj_cache if kind == "obj" else c.update_bc_cache
-    path_of = c.get_cached_obj_path if kind == "obj" else c.get_cached_bc_path
-    update(a, produced)
-    cached = path_of(a.resolve())
-    produced.write_bytes(b"NEW")
-    assert _reader_sees_old_content(cached, lambda: update(a, produced))
-    assert cached.read_bytes() == b"NEW"
 
 
 @pytest.mark.unit
@@ -149,7 +120,7 @@ def test_imports_db_has_no_shared_tmp_file(tmp_path, monkeypatch):
         return real_replace(src, dst)
 
     monkeypatch.setattr(_cache_mod.os, "replace", spy)
-    _cache(tmp_path).update_cache(a, "; a\n")
+    _scan(tmp_path, a)
     tmps = [s for s, d in seen if d.endswith("imports.json")]
     assert tmps, "imports.json is not written through os.replace"
     assert all(not s.endswith("imports.json.tmp") for s in tmps), tmps
@@ -167,10 +138,8 @@ c.set_import_context(project_root=root)
 while not go.exists():  # start together, like a pool's first wave
     time.sleep(0.005)
 c.invalidate_if_compiler_changed()
-c.update_cache(src, f"; {name}\\n")
-produced = root / f"{name}.o.out"
-produced.write_bytes(name.encode() * 64)
-c.update_obj_cache(src, produced)
+c.get_transitive_dependencies(src)
+c.save()
 """
 
 
@@ -188,9 +157,6 @@ def test_concurrent_processes_all_land(tmp_path):
     go.write_text("")
     for p in procs:
         assert p.wait(60) == 0
-    deps = _deps_on_disk(tmp_path)
-    c = _cache(tmp_path)
+    scanned = _scanned(tmp_path)
     for n, s in zip(names, srcs):
-        assert str(s.resolve()) in deps, f"{n} lost from deps.json"
-        assert c.get_cached_obj_path(s.resolve()).read_bytes() == n.encode() * 64
-        assert c.needs_rebuild(s) == (False, "cache is valid")
+        assert str(s.resolve()) in scanned, f"{n} lost from imports.json"

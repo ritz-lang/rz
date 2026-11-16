@@ -1,5 +1,11 @@
 # Stale `.ritz-cache/objects/*.ll` for orphan modules
 
+**Status (2026-11-16)**: historical. The per-source `.ll` layer described
+here no longer exists: compiled modules go through the CAS (`cas.py`,
+AGAST #1808), keyed on the full import closure and the compiler fingerprint,
+and `cache.py`'s own `objects/` store was deleted (AGAST #3454). The
+workarounds below no longer apply.
+
 **Status (2026-04-26)**: known trap, easy workaround (`rm -rf .ritz-cache`).
 The previously-filed "ritz0 bug" turned out to be cache hygiene; the
 compiler's per-source emission is correct.
@@ -34,7 +40,7 @@ correctly via per-function token hashing).
 ## Why it gets stale
 
 The .ll cache is correctly invalidated when its **own source file or any
-transitive dep changes** (cache.py:`needs_rebuild`).  But it stays warm
+transitive dep changes** (cache.py's per-source rebuild check).  But it stays warm
 forever otherwise.  If a module is "orphaned" — nobody in the regularly-
 built dep graph imports it — its cache entry never gets re-evaluated.
 
@@ -44,7 +50,7 @@ In our case:
   - `ritz1/src/main.ritz` — but ritz1 builds via `make`, not `build.py`,
     so it never touches `.ritz-cache/`.
   - Four `tier5_async` examples — not in `make matrix`.
-- Nothing in tier 1-4 matrix triggered `cache.needs_rebuild(string.ritz)`.
+- Nothing in tier 1-4 matrix triggered a rebuild check of `string.ritz`.
 - The April 23 `.ll` cache for `string.ritz` (predating
   `string_push_strview`) sat unrefreshed.
 - My tier-3 cp refactor on April 26 was the first matrix-path import of

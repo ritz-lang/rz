@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Build Cache for Ritz
+Build cache for Ritz: import closures and the compiler fingerprint.
 
-Implements incremental build support through:
-1. Dependency tracking - parsing imports to build a DAG
-2. Hash computation - SHA256 of source file contents
-3. Cache management - storing compiled artifacts and metadata
+Compiled artifacts do not live here. Every module's .ll/.o goes through
+`cas.ArtifactStore`, keyed on the content of the module's transitive import
+closure and on the compiler fingerprint. This module provides those two
+inputs:
+
+1. `BuildCache.get_transitive_dependencies`: the import closure, resolved by
+   ritz0's own `ImportResolver`, with each file's direct-import scan persisted
+   by content hash so a new build process re-parses only edited files.
+2. `compute_compiler_hash`: the fingerprint of the compiler (and build.py).
+
+AGAST #3454: BuildCache used to keep its own per-module .ll/.bc/.o store
+(`objects/`, `deps.json` and its rebuild checks). It lost its last caller when
+the CAS took over and was deleted; do not reintroduce a second artifact cache.
 
 Cache directory structure:
-    .ritz-cache/
-    ├── deps.json         # Dependency graph
-    ├── hashes.json       # Source file hashes
-    └── objects/
-        ├── main.ritz.ll  # Generated IR
-        └── main.ritz.o   # Compiled object
+    .ritz-cache[-<compiler>]/
+    ├── compiler_hash     # Fingerprint of the compiler the scans belong to
+    └── imports.json      # Persisted direct-import scans
 """
 
 import fcntl
@@ -25,65 +31,19 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
-from dataclasses import dataclass, field, asdict
 
-
-# ============================================================================
-# Cache directory constants
-# ============================================================================
 
 CACHE_DIR_NAME = ".ritz-cache"
-DEPS_FILE = "deps.json"
 # Persisted direct-import scans (AGAST #1832): "<context>\0<path>" ->
 # {"hash": content hash, "imports": [resolved paths]}.
 IMPORTS_FILE = "imports.json"
-HASHES_FILE = "hashes.json"
-OBJECTS_DIR = "objects"
 COMPILER_HASH_FILE = "compiler_hash"
+# Left behind in old cache directories by the deleted artifact cache (AGAST
+# #3454). Nothing writes them now; a compiler change sweeps them away.
+LEGACY_ENTRIES = ("objects", "deps.json", "hashes.json")
 
-# Compiler fingerprint inputs — used by `compute_compiler_hash()` to invalidate
-# every cached artifact when the compiler that produced them changes.
-#
-# History: this used to be a hand-curated list of ten ritz0 paths, which was
-# fragile in two ways: (a) any new compiler file (like the post-#192 split-out
-# `ritz0/emitter/*.py`) silently slipped past it, returning stale `.o` files
-# from the cache after legitimate compiler edits; (b) it didn't cover ritz1 at
-# all, even though ritz1 is now the default compiler for the stack. Today's
-# debugging session burned hours chasing "codegen regressions" that turned out
-# to be stale-cache placebos — that's the second time this hole has cost us.
-#
-# New shape: discover compiler inputs by walking the relevant tree, so adding
-# a new file Just Works. Two compilers, two strategies:
-#
-#   ritz0 (Python source tree): walk `ritz0/`, hash every `.py` file except
-#       tests and bytecode caches. Source is the artifact — no separate binary.
-#
-#   ritz1 (self-hosted, single binary): hash the `ritz1` binary directly. The
-#       binary is the artifact; whatever produced it (ritz1/src/*.ritz at
-#       whatever revision) is captured by the binary's content hash. If the
-#       binary is missing, return a sentinel so any cache built without it is
-#       invalidated when it appears.
-#
-# The legacy constant below is retained for the existing `test_build.py`
-# tests, but is no longer used by `compute_compiler_hash()`.
-COMPILER_CRITICAL_FILES = [
-    "ritz0/emitter_llvmlite.py",
-    "ritz0/parser.py",
-    "ritz0/async_transform_v2.py",
-    "ritz0/monomorph.py",
-    "ritz0/name_resolver.py",
-    "ritz0/import_resolver.py",
-    "ritz0/ritz0.py",
-    "ritz0/ritz_ast.py",
-    "ritz0/type_checker.py",
-]
-
-# Directory- and filename-pattern excludes for the ritz0 fingerprint walk.
-# These do not affect codegen, so we leave them out of the fingerprint:
-#   - __pycache__/        : .pyc bytecode (regenerated on every run)
-#   - .pytest_cache/      : pytest run state
-#   - test/               : test fixtures and runner scaffolding
-#   - test_*.py           : individual test modules
+# The ritz0 fingerprint walk skips what cannot affect codegen: bytecode and
+# pytest caches, the test/ tree and test_*.py modules.
 RITZ0_EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "test"}
 RITZ0_EXCLUDE_FILE_PREFIXES = ("test_",)
 
@@ -93,17 +53,16 @@ RITZ0_EXCLUDE_FILE_PREFIXES = ("test_",)
 # ============================================================================
 #
 # Several build.py processes share one cache directory: regression.sh builds
-# up to REGRESSION_JOBS examples at once, and they all compile ritzlib. So:
+# up to REGRESSION_JOBS examples at once, and they all scan ritzlib. So:
 #
 # * Every file is written to a private temp file in the same directory and
 #   renamed over the target. A reader sees the old file or the new one, never
-#   a truncated one. (In place, a reader could link half an object or fail to
-#   parse half a deps.json.) The temp name is unique per writer: one fixed
+#   a truncated one. The temp name is unique per writer: one fixed
 #   `<name>.tmp` shared by two writers is the same race one level down.
-# * Read-modify-write of a shared index (deps.json, imports.json) happens
-#   under an flock, and a save merges only the entries this process changed
-#   into what is on disk. Rewriting the whole file from memory let the last
-#   process to save drop every entry the others had added.
+# * Read-modify-write of the shared imports.json happens under an flock, and
+#   a save merges this process's entries into what is on disk. Rewriting the
+#   whole file from memory let the last process to save drop every entry the
+#   others had added.
 
 LOCK_FILE = ".lock"
 
@@ -125,21 +84,6 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     _atomic_write_bytes(path, text.encode())
-
-
-def _atomic_copy(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
-    os.close(fd)
-    try:
-        shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 @contextmanager
@@ -173,88 +117,6 @@ def _merge_json(path: Path, updates: dict, indent: int = 2, sort_keys: bool = Fa
     return merged
 
 
-# ============================================================================
-# Data structures
-# ============================================================================
-
-@dataclass
-class FileInfo:
-    """Information about a source file for caching purposes."""
-    hash: str                    # SHA256 of file content
-    imports: List[str]           # Resolved paths of direct imports
-    mtime: float                 # Last modification time
-    # Transitive import closure (excluding self) -> content hash of each file
-    # when THIS file's .ll was cached. AGAST #1832: dependency hashes must be
-    # recorded per dependent. With one shared hash per file, compiling b
-    # refreshed b's entry, so main (compiled later in the same build) saw b
-    # as unchanged and reused an object built against b's old layout.
-    # None = no snapshot (scanned only, or an old-format deps.json): rebuild.
-    built_against: Optional[Dict[str, str]] = None
-
-    def to_dict(self) -> dict:
-        d = {
-            "hash": self.hash,
-            "imports": self.imports,
-            "mtime": self.mtime
-        }
-        if self.built_against is not None:
-            d["built_against"] = self.built_against
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "FileInfo":
-        return cls(
-            hash=data["hash"],
-            imports=data["imports"],
-            mtime=data["mtime"],
-            built_against=data.get("built_against"),
-        )
-
-
-@dataclass
-class CacheState:
-    """The complete cache state."""
-    deps: Dict[str, FileInfo] = field(default_factory=dict)  # path -> FileInfo
-    # Entries this process changed; only these are written (AGAST #1806).
-    dirty: Set[str] = field(default_factory=set)
-
-    def save(self, cache_dir: Path):
-        """Merge this process's changed entries into deps.json."""
-        if not self.dirty:
-            return
-        with _cache_lock(cache_dir):
-            merged = _merge_json(
-                cache_dir / DEPS_FILE,
-                {p: self.deps[p].to_dict() for p in self.dirty if p in self.deps},
-            )
-        # Pick up what other processes recorded meanwhile.
-        for path, info in merged.items():
-            if path not in self.dirty:
-                self.deps[path] = FileInfo.from_dict(info)
-        self.dirty.clear()
-
-    @classmethod
-    def load(cls, cache_dir: Path) -> "CacheState":
-        """Load cache state from disk."""
-        state = cls()
-
-        deps_file = cache_dir / DEPS_FILE
-        if deps_file.exists():
-            # Torn reads are impossible now (atomic replace); a corrupt file
-            # from an older writer is just a cold cache.
-            deps_data = _read_json(deps_file)
-            state.deps = {
-                path: FileInfo.from_dict(info)
-                for path, info in deps_data.items()
-            }
-
-        return state
-
-
-# ============================================================================
-# Dependency Scanner
-# ============================================================================
-
 # AGAST #1832: there is deliberately no import scanner in this file. A regex
 # that used to live here matched only bare `import a.b` lines and missed
 # `import a.b { X }`, `pub import` and `import a as b`: 30% of the imports in
@@ -287,19 +149,6 @@ def find_project_root(start_dir: Path) -> Optional[Path]:
     return None
 
 
-# ============================================================================
-# Hash Computation
-# ============================================================================
-
-def compute_file_hash(file_path: Path) -> str:
-    """Compute SHA256 hash of a file's contents."""
-    h = hashlib.sha256()
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _hash_file_into(h: "hashlib._Hash", file_path: Path) -> None:
     """Stream `file_path` into the hash context `h`."""
     with open(file_path, 'rb') as f:
@@ -307,18 +156,19 @@ def _hash_file_into(h: "hashlib._Hash", file_path: Path) -> None:
             h.update(chunk)
 
 
+def compute_file_hash(file_path: Path) -> str:
+    """Compute SHA256 hash of a file's contents."""
+    h = hashlib.sha256()
+    _hash_file_into(h, file_path)
+    return h.hexdigest()
+
+
 def _collect_ritz0_sources(ritz0_root: Path) -> List[Path]:
-    """Walk the ritz0 Python tree and return every `.py` file that affects
-    code generation, sorted by relative path for deterministic hashing.
+    """Every codegen-relevant `.py` under ritz0/, sorted by relative path.
 
-    Excludes:
-      - directories listed in `RITZ0_EXCLUDE_DIRS` (bytecode caches, test trees)
-      - filenames starting with any prefix in `RITZ0_EXCLUDE_FILE_PREFIXES`
-        (i.e. `test_*.py` test modules)
-
-    Everything else under `ritz0/` is considered codegen-critical. This is
-    the *correct* default: a hand-curated allowlist will silently miss new
-    files (it has, twice).
+    Everything not excluded counts: a hand-curated allowlist used to be here,
+    and it silently missed new files (`ritz0/emitter/*.py`) twice, so edits
+    to them reused stale objects.
     """
     sources: List[Path] = []
     for dirpath, dirnames, filenames in os.walk(ritz0_root):
@@ -335,49 +185,20 @@ def _collect_ritz0_sources(ritz0_root: Path) -> List[Path]:
 
 
 def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
-    """Compute a fingerprint of the compiler that produced cached artifacts.
+    """Fingerprint the compiler; part of every CAS key and import-scan store.
 
-    The fingerprint is what gates cache validity: if the compiler that
-    produced the cached `.ll`/`.bc`/`.o` files differs from the compiler
-    about to be invoked, the cache is invalidated wholesale.
-
-    Strategies are per-compiler:
-
-    ``ritz0`` (Python bootstrap)
-        Walk ``ritz0/`` and hash every ``.py`` file except tests and
-        bytecode caches. The source tree *is* the artifact — there is no
-        separate compiled binary.
-
-    ``ritz1`` (self-hosted, single binary)
-        Hash the ``ritz1`` binary at ``ritz1/build/ritz1``. The binary is
-        the artifact; whatever ritz1/src/*.ritz revision produced it is
-        captured by the binary's content hash. If the binary does not
-        exist, return a sentinel so cache built before the binary was
-        produced is invalidated when it appears.
-
-    Args:
-        project_root: directory containing ``ritz0/`` and ``ritz1/``.
-        compiler: "ritz0", "ritz1", or "ritz1_selfhosted".
-
-    Returns:
-        Hex-encoded SHA256 digest, or the sentinel ``"ritz1-missing"`` when
-        ``compiler == "ritz1"`` and the binary does not exist (likewise
-        ``"ritz1_selfhosted-missing"`` for the self-hosted binary).
+    ``ritz0``: build.py plus every ``.py`` under ``ritz0/`` except tests and
+    bytecode caches (the source tree is the artifact). ``ritz1`` /
+    ``ritz1_selfhosted``: build.py plus the binary under ``ritz1/build/``; a
+    missing binary returns the sentinel ``"<compiler>-missing"`` so state
+    recorded without it is invalidated once it appears.
     """
     h = hashlib.sha256()
     h.update(f"compiler={compiler}\n".encode())  # namespace the digest
 
-    # build.py is codegen-critical for BOTH compilers: it owns the clang flag
-    # list (notably -ffreestanding/-fno-builtin), the runtime shim selection and
-    # the link order. Changing any of those changes the emitted objects just as
-    # surely as changing a file inside ritz0/ does.
-    #
-    # It was previously omitted, so the fingerprint could not see a codegen
-    # change that lived outside ritz0/. Adding -ffreestanding to the clang
-    # invocation left the fingerprint identical, every cached .o was reused
-    # verbatim, and the build kept failing with the exact same link error the
-    # flag was added to fix — including the same object hash, which is what
-    # gave it away.
+    # build.py is codegen-critical for both compilers: it owns the clang flags
+    # (-ffreestanding/-fno-builtin), the runtime shims and the link order.
+    # Leaving it out once let a new clang flag reuse every stale object.
     build_driver = project_root / "build.py"
     if build_driver.is_file():
         h.update(b"build-driver\x00")
@@ -386,9 +207,6 @@ def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
     if compiler == "ritz0":
         ritz0_root = project_root / "ritz0"
         if not ritz0_root.is_dir():
-            # No ritz0 tree at all — fall through to an empty digest under
-            # the namespace prefix above. Any future ritz0 install will
-            # produce a different hash and invalidate.
             return h.hexdigest()
         for src in _collect_ritz0_sources(ritz0_root):
             rel = src.relative_to(ritz0_root).as_posix()
@@ -397,49 +215,30 @@ def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
             _hash_file_into(h, src)
         return h.hexdigest()
 
-    if compiler == "ritz1":
-        ritz1_bin = project_root / "ritz1" / "build" / "ritz1"
-        if not ritz1_bin.is_file():
-            return "ritz1-missing"
-        h.update(b"ritz1-binary\x00")
-        _hash_file_into(h, ritz1_bin)
-        return h.hexdigest()
-
-    if compiler == "ritz1_selfhosted":
-        sh_bin = project_root / "ritz1" / "build" / "ritz1_selfhosted"
-        if not sh_bin.is_file():
-            return "ritz1_selfhosted-missing"
-        h.update(b"ritz1_selfhosted-binary\x00")
-        _hash_file_into(h, sh_bin)
+    if compiler in ("ritz1", "ritz1_selfhosted"):
+        binary = project_root / "ritz1" / "build" / compiler
+        if not binary.is_file():
+            return f"{compiler}-missing"
+        h.update(f"{compiler}-binary\x00".encode())
+        _hash_file_into(h, binary)
         return h.hexdigest()
 
     raise ValueError(f"unknown compiler: {compiler!r}")
 
 
-# ============================================================================
-# Build Cache
-# ============================================================================
-
 class BuildCache:
-    """Manages the build cache for incremental compilation."""
+    """Import closures of Ritz sources, plus the compiler fingerprint.
+
+    `project_root` is the ritz project (auto-detected when None); `compiler`
+    ("ritz0", "ritz1", "ritz1_selfhosted") selects the fingerprint and
+    namespaces the cache directory.
+    """
 
     def __init__(self, project_root: Optional[Path] = None, compiler: str = "ritz0"):
-        """Initialize the build cache.
-
-        Args:
-            project_root: Root directory of the project. If not provided,
-                         will be auto-detected when needed.
-            compiler: Name of the compiler producing artifacts ("ritz0" or
-                     "ritz1"). The cache directory is namespaced by compiler
-                     so warm rebuilds across compilers don't pick up the
-                     wrong artifact (different IR, different ABI assumptions).
-        """
         self.project_root = project_root
         self.compiler = compiler
-        self._state: Optional[CacheState] = None
         self._cache_dir: Optional[Path] = None
         self._compiler_hash: Optional[str] = None
-        self._compiler_hash_valid: Optional[bool] = None
         # Import resolution context (AGAST #1832). See `set_import_context`.
         self._import_root: Optional[Path] = None
         self._import_deps: Dict[str, Tuple[Path, List[str]]] = {}
@@ -549,13 +348,7 @@ class BuildCache:
 
     @property
     def cache_dir(self) -> Path:
-        """Get the cache directory path.
-
-        ritz0 uses ``.ritz-cache`` (legacy); ritz1 uses ``.ritz-cache-ritz1``
-        so its incremental .ll/.bc/.o store is partitioned from ritz0's. The
-        suffix is intentionally short — these directories live next to source
-        and end up in `.gitignore` patterns.
-        """
+        """``.ritz-cache`` for ritz0, ``.ritz-cache-<compiler>`` otherwise."""
         if self._cache_dir is None:
             # RITZ_BUILD_CACHE_DIR (AGAST #2793) moves it out of the project:
             # the ritz0 suite's throwaway package builds keep their index
@@ -571,493 +364,82 @@ class BuildCache:
                 self._cache_dir = base / f"{CACHE_DIR_NAME}-{self.compiler}"
         return self._cache_dir
 
-    @property
-    def objects_dir(self) -> Path:
-        """Get the objects subdirectory path."""
-        return self.cache_dir / OBJECTS_DIR
-
-    @property
-    def compiler_hash_file(self) -> Path:
-        """Get the compiler hash file path."""
-        return self.cache_dir / COMPILER_HASH_FILE
-
     def _get_current_compiler_hash(self) -> str:
-        """Get the current compiler hash, computing if needed.
-
-        The fingerprint is computed for `self.compiler` — ritz0 walks the
-        Python tree, ritz1 hashes the binary. See `compute_compiler_hash`.
-        """
+        """`compute_compiler_hash` for `self.compiler`, computed once."""
         if self._compiler_hash is None:
             root = self.project_root or find_project_root(Path.cwd())
-            if root:
-                self._compiler_hash = compute_compiler_hash(root, self.compiler)
-            else:
-                self._compiler_hash = "unknown"
+            self._compiler_hash = compute_compiler_hash(root, self.compiler) if root else "unknown"
         return self._compiler_hash
 
-    def _check_compiler_hash(self) -> bool:
-        """Check if the cached compiler hash matches current compiler.
-
-        Returns True if cache is valid, False if compiler changed.
-        """
-        if self._compiler_hash_valid is not None:
-            return self._compiler_hash_valid
-
-        current_hash = self._get_current_compiler_hash()
-
-        if not self.compiler_hash_file.exists():
-            # No cached hash - cache is invalid
-            self._compiler_hash_valid = False
-            return False
-
-        cached_hash = self.compiler_hash_file.read_text().strip()
-        self._compiler_hash_valid = (cached_hash == current_hash)
-        return self._compiler_hash_valid
-
-    def _update_compiler_hash(self):
-        """Update the stored compiler hash."""
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        current_hash = self._get_current_compiler_hash()
-        if (self.compiler_hash_file.exists()
-                and self.compiler_hash_file.read_text().strip() == current_hash):
-            self._compiler_hash_valid = True
-            return
-        _atomic_write_text(self.compiler_hash_file, current_hash)
-        self._compiler_hash_valid = True
-
     def invalidate_if_compiler_changed(self) -> bool:
-        """One-shot wholesale invalidation when the compiler has changed.
+        """Call once at the top of a build; True if the compiler changed.
 
-        Call this *once* at the top of a build, before any per-source
-        decisions are made. If the on-disk compiler hash exists and
-        mismatches the current compiler's fingerprint, every cached
-        ``.ll``/``.bc``/``.o`` is stale (it was emitted by a different
-        compiler) and must be discarded. This wipes the objects directory,
-        the dependency graph, and the per-file hashes, then refreshes the
-        compiler hash file so that artifacts produced *by this build* are
-        treated as fresh.
-
-        Why this is necessary: ``needs_rebuild()`` checks the compiler hash
-        per-source. After the first source is recompiled, ``update_cache``
-        runs and refreshes the compiler-hash file as a side effect — which
-        flips ``_compiler_hash_valid`` to True. Every subsequent source
-        then sees a "fresh" compiler hash and returns the cached
-        (compiler-stale) ``.o``. So without this method the cache only
-        actually rebuilds the *first* source after a compiler change; the
-        rest are silently mismatched.
-
-        Returns:
-            True if invalidation actually happened (compiler changed),
-            False if cache was already up-to-date.
+        If the recorded fingerprint is missing or differs from the current
+        compiler's, the persisted import scans are discarded (a ritz0 change
+        can change how imports parse or resolve), along with anything the
+        deleted artifact cache left behind, and the current fingerprint is
+        recorded. build.py also uses the verdict: a binary linked by the
+        previous compiler must not be reused by the project-level fast path.
         """
-        # Under the lock, re-reading the hash file: with several builds
-        # starting at once, the first wipes and records the new compiler, the
-        # rest then see a match and keep what it is building (AGAST #1806).
+        current = self._get_current_compiler_hash()
+        hash_file = self.cache_dir / COMPILER_HASH_FILE
+        # Under the lock: with several builds starting at once, the first
+        # wipes and records the new compiler, the rest then see a match and
+        # keep what it is building (AGAST #1806).
         with _cache_lock(self.cache_dir):
-            self._compiler_hash_valid = None
-            return self._invalidate_if_compiler_changed_locked()
-
-    def _invalidate_if_compiler_changed_locked(self) -> bool:
-        if self._check_compiler_hash():
-            # Compiler hash matches what produced the cached artifacts;
-            # nothing to invalidate. Each source still goes through
-            # `needs_rebuild()` for its own per-file freshness check.
-            return False
-
-        # Mismatch (or no record at all). Wipe the artifact store so
-        # every per-source cache lookup misses and triggers a fresh
-        # compile, then write the fingerprint of the *current* compiler
-        # so that artifacts emitted during this build are recorded as
-        # produced by it.
-        if self.objects_dir.exists():
-            shutil.rmtree(self.objects_dir)
-        # Forget the dep graph and import scans too, on disk as well: a ritz0
-        # change can change how imports parse or resolve.
-        for name in (DEPS_FILE, IMPORTS_FILE):
             try:
-                (self.cache_dir / name).unlink()
-            except FileNotFoundError:
-                pass
-        self._state = CacheState()
-        self._imports_db = {}
-        self._imports_db_dirty = False
-        self._direct_imports.clear()
-        self._update_compiler_hash()
-        return True
-
-    @property
-    def state(self) -> CacheState:
-        """Get the current cache state, loading from disk if needed."""
-        if self._state is None:
-            self._state = CacheState.load(self.cache_dir)
-        return self._state
+                if hash_file.read_text().strip() == current:
+                    return False
+            except OSError:
+                pass  # no record yet
+            for name in (IMPORTS_FILE, *LEGACY_ENTRIES):
+                path = self.cache_dir / name
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            self._imports_db = {}
+            self._imports_db_dirty = False
+            self._direct_imports.clear()
+            _atomic_write_text(hash_file, current)
+            return True
 
     def save(self):
-        """Save the cache state to disk."""
-        if self._state is not None:
-            self._state.save(self.cache_dir)
+        """Persist this process's new import scans."""
         self._save_imports_db()
 
     def clear(self):
         """Clear the entire cache."""
         if self.cache_dir.exists():
             shutil.rmtree(self.cache_dir)
-        self._state = CacheState()
         self._imports_db = {}
         self._imports_db_dirty = False
         self._direct_imports.clear()
 
-    def _get_safe_cache_name(self, source_path: Path) -> str:
-        """Get a safe filename for caching based on source path."""
-        # Use the source file's relative path (from project root) as the cache key
-        if self.project_root and source_path.is_absolute():
-            try:
-                rel_path = source_path.relative_to(self.project_root)
-            except ValueError:
-                rel_path = source_path
-        else:
-            rel_path = source_path
-
-        # Create a safe filename by replacing path separators
-        return str(rel_path).replace('/', '_').replace('\\', '_')
-
-    def get_cached_ll_path(self, source_path: Path) -> Path:
-        """Get the path where cached .ll file would be stored."""
-        safe_name = self._get_safe_cache_name(source_path)
-        return self.objects_dir / f"{safe_name}.ll"
-
-    def get_cached_bc_path(self, source_path: Path) -> Path:
-        """Get the path where cached .bc (LLVM bitcode) file would be stored.
-
-        RFC #109 Phase 3: LLVM BC caching for faster rebuilds.
-        Bitcode is faster to load than text IR and enables better LTO.
-        """
-        safe_name = self._get_safe_cache_name(source_path)
-        return self.objects_dir / f"{safe_name}.bc"
-
-    def get_cached_obj_path(self, source_path: Path) -> Path:
-        """Path of the cached native ``.o`` produced by ``clang -c``.
-
-        AGAST #192: Caching .o (rather than re-running ``clang -c`` each
-        warm rebuild) is what makes the touched-source case meet the <3s
-        gate.  Without this, even though ritz1 itself short-circuits via
-        fn_cache.ritz, clang would still re-lower every cached .ll on each
-        invocation — ~3s for an 8-source project like zeus.
-        """
-        safe_name = self._get_safe_cache_name(source_path)
-        return self.objects_dir / f"{safe_name}.o"
-
-    def scan_file(self, source_path: Path) -> FileInfo:
-        """Scan a source file and return its FileInfo."""
-        source_path = source_path.resolve()
-        file_hash = compute_file_hash(source_path)
-
-        # Every import form, resolved by ritz0's resolver (AGAST #1832).
-        imports = self._scan_direct_imports(str(source_path), file_hash)
-
-        return FileInfo(
-            hash=file_hash,
-            imports=list(imports),
-            mtime=source_path.stat().st_mtime,
-        )
+    def import_scan_count(self) -> int:
+        """Number of persisted direct-import scans (for `build.py cache-status`)."""
+        return len(self._load_imports_db())
 
     def get_transitive_dependencies(self, source_path: Path, visited: Optional[Set[str]] = None) -> Set[str]:
         """Get all transitive dependencies of a source file.
 
-        Returns a set of absolute file paths that the source file depends on.
+        Returns a set of absolute file paths that the source file depends on,
+        including the file itself.
         """
         if visited is None:
             visited = set()
 
-        source_str = str(source_path.resolve())
+        source_path = source_path.resolve()
+        source_str = str(source_path)
         if source_str in visited:
             return visited
         visited.add(source_str)
 
-        # Scan the file for its direct imports
-        info = self.scan_file(source_path)
-
-        # Recursively get dependencies
-        for imp_path in info.imports:
+        # Every import form, resolved by ritz0's resolver (AGAST #1832).
+        imports = self._scan_direct_imports(source_str, compute_file_hash(source_path))
+        for imp_path in imports:
             imp_path_obj = Path(imp_path)
             if imp_path_obj.exists():
                 self.get_transitive_dependencies(imp_path_obj, visited)
 
         return visited
-
-    def needs_rebuild(self, source_path: Path) -> Tuple[bool, str]:
-        """Check if a source file needs to be rebuilt.
-
-        Returns:
-            (needs_rebuild, reason) tuple
-        """
-        source_path = source_path.resolve()
-        source_str = str(source_path)
-
-        # Check if compiler itself changed (invalidates entire cache)
-        if not self._check_compiler_hash():
-            return True, "compiler changed"
-
-        # Check if cached .ll exists
-        cached_ll = self.get_cached_ll_path(source_path)
-        if not cached_ll.exists():
-            return True, "no cached .ll file"
-
-        # Check if we have cached info for this file
-        if source_str not in self.state.deps:
-            return True, "not in cache"
-
-        cached_info = self.state.deps[source_str]
-
-        # Check if source file changed
-        current_hash = compute_file_hash(source_path)
-        if current_hash != cached_info.hash:
-            return True, "source file changed"
-
-        # Check if any transitive dependency changed
-        # Sorted (AGAST #1286): `get_transitive_dependencies` returns a set, so
-        # iterating it raw picks a hash-seed-dependent order. The rebuild
-        # *decision* is order-independent, but the reason string is not — with
-        # several changed deps this named a different one each run, which is the
-        # same "reports a different thing every time" symptom that made build
-        # failures impossible to diagnose.
-        try:
-            all_deps = sorted(self.get_transitive_dependencies(source_path))
-        except Exception as e:  # lex/parse error in some module of the closure
-            # The import graph is unknown, so the cached artifact cannot be
-            # trusted. Recompiling reports the real error.
-            return True, f"import scan failed: {e}"
-        # Persist any fresh scans now: a fully cached build never reaches
-        # update_cache (which is what calls save()).
-        self._save_imports_db()
-        # Compare against the hashes THIS file was built against, never the
-        # shared per-file entries (AGAST #1832, see FileInfo.built_against).
-        built_against = cached_info.built_against
-        if built_against is None:
-            return True, "no dependency snapshot"
-        for dep_path in all_deps:
-            if dep_path == source_str:
-                continue  # Skip self
-
-            if dep_path not in built_against:
-                return True, f"new dependency: {dep_path}"
-
-            current_dep_hash = compute_file_hash(Path(dep_path))
-            if current_dep_hash != built_against[dep_path]:
-                return True, f"dependency changed: {dep_path}"
-
-        # A dropped import changes the closure too; the cached object may
-        # still reference symbols from it, so recompile.
-        dropped = sorted(set(built_against) - set(all_deps))
-        if dropped:
-            return True, f"dependency removed: {dropped[0]}"
-
-        return False, "cache is valid"
-
-    def update_cache(self, source_path: Path, ll_content: str):
-        """Update the cache after a successful compilation.
-
-        Args:
-            source_path: The source file that was compiled
-            ll_content: The generated LLVM IR content
-        """
-        source_path = source_path.resolve()
-
-        # Ensure objects directory exists
-        self.objects_dir.mkdir(parents=True, exist_ok=True)
-
-        # Update compiler hash (ensures cache matches current compiler)
-        self._update_compiler_hash()
-
-        # Write the .ll file to cache
-        cached_ll = self.get_cached_ll_path(source_path)
-        _atomic_write_text(cached_ll, ll_content)
-
-        # Record this file's entry with a snapshot of every transitive
-        # dependency's hash (AGAST #1832). Only the compiled file's entry is
-        # written: overwriting a dependency's entry would wipe its own
-        # snapshot.
-        # Sorted (AGAST #1286): `deps.json` is serialised in insertion order;
-        # set iteration order made it differ run to run, which left the cache
-        # non-reproducible and noisy to diff.
-        source_str = str(source_path)
-        all_deps = sorted(self.get_transitive_dependencies(source_path))
-        info = self.scan_file(source_path)
-        info.built_against = {
-            dep: compute_file_hash(Path(dep)) for dep in all_deps if dep != source_str
-        }
-        self.state.deps[source_str] = info
-        self.state.dirty.add(source_str)
-
-        # Save state to disk
-        self.save()
-
-    def get_cached_ll(self, source_path: Path) -> Optional[str]:
-        """Get the cached .ll content if valid, or None if rebuild is needed."""
-        source_path = source_path.resolve()
-
-        needs_rebuild, reason = self.needs_rebuild(source_path)
-        if needs_rebuild:
-            return None
-
-        cached_ll = self.get_cached_ll_path(source_path)
-        if cached_ll.exists():
-            return cached_ll.read_text()
-
-        return None
-
-    def has_valid_bc(self, source_path: Path) -> bool:
-        """Check if a valid .bc (bitcode) file exists in cache.
-
-        RFC #109 Phase 3: LLVM BC caching.
-        Returns True if .bc exists and source hasn't changed.
-        """
-        source_path = source_path.resolve()
-
-        needs_rebuild, _ = self.needs_rebuild(source_path)
-        if needs_rebuild:
-            return False
-
-        cached_bc = self.get_cached_bc_path(source_path)
-        return cached_bc.exists()
-
-    def get_cached_bc(self, source_path: Path) -> Optional[Path]:
-        """Get the path to cached .bc file if valid, or None if rebuild needed.
-
-        RFC #109 Phase 3: Returns the path (not content) since .bc is binary.
-        """
-        source_path = source_path.resolve()
-
-        needs_rebuild, reason = self.needs_rebuild(source_path)
-        if needs_rebuild:
-            return None
-
-        cached_bc = self.get_cached_bc_path(source_path)
-        if cached_bc.exists():
-            return cached_bc
-
-        return None
-
-    def update_bc_cache(self, source_path: Path, bc_path: Path):
-        """Copy a .bc file to the cache.
-
-        RFC #109 Phase 3: Store compiled bitcode for faster rebuilds.
-        """
-        source_path = source_path.resolve()
-
-        # Ensure objects directory exists
-        self.objects_dir.mkdir(parents=True, exist_ok=True)
-
-        # Copy the .bc file to cache
-        cached_bc = self.get_cached_bc_path(source_path)
-        _atomic_copy(bc_path, cached_bc)
-
-    def get_cached_obj(self, source_path: Path) -> Optional[Path]:
-        """Path of a valid cached .o, or None if a rebuild is needed."""
-        source_path = source_path.resolve()
-        needs_rebuild, _ = self.needs_rebuild(source_path)
-        if needs_rebuild:
-            return None
-        cached_obj = self.get_cached_obj_path(source_path)
-        if cached_obj.exists():
-            return cached_obj
-        return None
-
-    def update_obj_cache(self, source_path: Path, obj_path: Path):
-        """Copy a freshly produced .o into the cache."""
-        source_path = source_path.resolve()
-        self.objects_dir.mkdir(parents=True, exist_ok=True)
-        cached_obj = self.get_cached_obj_path(source_path)
-        _atomic_copy(obj_path, cached_obj)
-
-
-# ============================================================================
-# CLI for testing
-# ============================================================================
-
-def main():
-    """CLI for testing the cache module."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Ritz Build Cache")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # scan command
-    scan_parser = subparsers.add_parser("scan", help="Scan a file for imports")
-    scan_parser.add_argument("file", help="Source file to scan")
-
-    # deps command
-    deps_parser = subparsers.add_parser("deps", help="Show transitive dependencies")
-    deps_parser.add_argument("file", help="Source file to analyze")
-
-    # status command
-    status_parser = subparsers.add_parser("status", help="Check if file needs rebuild")
-    status_parser.add_argument("file", help="Source file to check")
-
-    # clear command
-    subparsers.add_parser("clear", help="Clear the cache")
-
-    # show command
-    subparsers.add_parser("show", help="Show cache contents")
-
-    args = parser.parse_args()
-
-    cache = BuildCache()
-
-    if args.command == "scan":
-        file_path = Path(args.file).resolve()
-        if not file_path.exists():
-            print(f"Error: File not found: {file_path}")
-            return 1
-
-        info = cache.scan_file(file_path)
-        print(f"File: {file_path}")
-        print(f"Hash: {info.hash[:16]}...")
-        print(f"Imports: {info.imports}")
-        print(f"Mtime: {info.mtime}")
-
-    elif args.command == "deps":
-        file_path = Path(args.file).resolve()
-        if not file_path.exists():
-            print(f"Error: File not found: {file_path}")
-            return 1
-
-        deps = cache.get_transitive_dependencies(file_path)
-        print(f"Transitive dependencies of {file_path}:")
-        for dep in sorted(deps):
-            print(f"  {dep}")
-
-    elif args.command == "status":
-        file_path = Path(args.file).resolve()
-        if not file_path.exists():
-            print(f"Error: File not found: {file_path}")
-            return 1
-
-        needs_rebuild, reason = cache.needs_rebuild(file_path)
-        if needs_rebuild:
-            print(f"Needs rebuild: {reason}")
-        else:
-            print("Cache is valid, no rebuild needed")
-
-    elif args.command == "clear":
-        cache.clear()
-        print("Cache cleared")
-
-    elif args.command == "show":
-        if not cache.cache_dir.exists():
-            print("No cache exists")
-            return 0
-
-        print(f"Cache directory: {cache.cache_dir}")
-        print(f"\nDependency entries: {len(cache.state.deps)}")
-        for path, info in sorted(cache.state.deps.items()):
-            print(f"  {path}")
-            print(f"    hash: {info.hash[:16]}...")
-            print(f"    imports: {len(info.imports)}")
-
-    return 0
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(main() or 0)

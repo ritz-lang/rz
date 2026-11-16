@@ -1753,24 +1753,17 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         profile = {"name": "debug", "opt_level": 0, "debug": True, "lto": False}
     bin_path = out_dir / name
 
-    # AGAST #192: The build cache is now namespaced per-compiler (cache.py
-    # appends `-ritz1` to the cache dir for ritz1). That makes it safe to
-    # leave use_cache enabled for ritz1 — warm rebuilds reuse cached .ll/.bc
-    # artifacts produced by the same compiler, dropping no-op rebuild time
-    # by ~10× without risking cross-compiler contamination.
+    # The build cache (namespaced per compiler) holds the import scans that
+    # key each module in the CAS, and the compiler fingerprint.
     cache = get_build_cache(compiler)
 
-    # If the compiler that produced the existing cache differs from the
-    # one we're about to invoke (ritz0 source edited, ritz1 binary
-    # rebuilt, etc.), every cached `.ll`/`.bc`/`.o` is stale. Invalidate
-    # the whole artifact store before any per-source decisions are made,
-    # otherwise `needs_rebuild()` will refresh the compiler-hash file
-    # mid-build and silently return stale artifacts for every source
-    # past the first one. See `BuildCache.invalidate_if_compiler_changed`.
+    # If the compiler differs from the one the cache last recorded (ritz0
+    # source edited, ritz1 binary rebuilt, etc.), drop the import scans.
+    # See `BuildCache.invalidate_if_compiler_changed`.
     #
     # We also remember the verdict locally: if the compiler changed, the
-    # already-linked `bin_path` is stale too (it was linked from the
-    # now-discarded `.o` files), so the project-level fast path below
+    # already-linked `bin_path` is stale too (it was linked from objects
+    # the previous compiler produced), so the project-level fast path below
     # must NOT return it. The fast path only re-uses `bin_path` when the
     # compiler is unchanged.
     compiler_changed = cache.invalidate_if_compiler_changed() if use_cache else False
@@ -3471,7 +3464,11 @@ def cmd_clean(args):
 
 
 def cmd_cache_status(args):
-    """Show cache status."""
+    """Show cache status.
+
+    The build cache holds the compiler fingerprint and persisted import scans;
+    compiled modules live in the CAS (`python3 cas.py path`).
+    """
     cache = get_build_cache()
 
     if not cache.cache_dir.exists():
@@ -3479,26 +3476,16 @@ def cmd_cache_status(args):
         return 0
 
     print(f"Cache directory: {cache.cache_dir}")
-    print(f"Dependency entries: {len(cache.state.deps)}")
+    print(f"Import scans: {cache.import_scan_count()}")
 
     if args.verbose:
-        print("\nCached files:")
-        for path, info in sorted(cache.state.deps.items()):
+        print("\nScanned files:")
+        for key in sorted(cache._load_imports_db()):
+            path = key.rsplit("\0", 1)[-1]
             try:
-                rel_path = Path(path).relative_to(ROOT)
+                print(f"  {Path(path).relative_to(ROOT)}")
             except ValueError:
-                rel_path = path
-            print(f"  {rel_path}")
-            print(f"    hash: {info.hash[:16]}...")
-            print(f"    imports: {len(info.imports)}")
-
-    # Show objects directory size
-    objects_dir = cache.objects_dir
-    if objects_dir.exists():
-        ll_files = list(objects_dir.glob('*.ll'))
-        bc_files = list(objects_dir.glob('*.bc'))
-        total_size = sum(f.stat().st_size for f in objects_dir.rglob("*") if f.is_file())
-        print(f"\nCached objects: {len(ll_files)} .ll, {len(bc_files)} .bc files, {total_size / 1024:.1f} KB")
+                print(f"  {path}")
 
     return 0
 

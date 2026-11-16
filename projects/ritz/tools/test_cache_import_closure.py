@@ -2,14 +2,15 @@
 
 `cache.py` used to find a module's imports with a regex that matched only a
 bare `import a.b` line. `import b { S }`, `pub import b`, `pub import b { S }`
-and `import b as bb` (30% of the imports in the tree) were invisible to
-`needs_rebuild`. So after a struct change in `b`, the dependent's cached
-.ll/.o was reused and the binary linked two different layouts of `S`.
+and `import b as bb` (30% of the imports in the tree) were invisible to the
+cache. So after a struct change in `b`, the dependent's cached .ll/.o was
+reused and the binary linked two different layouts of `S`.
 
 The fix derives the import graph from ritz0's own import resolver, the same
-code `list_deps.py` and the compiler use. These tests pin that:
+code `list_deps.py` and the compiler use. That closure now keys every module
+in the CAS (cas.py). These tests pin that:
 
-* unit: for every import form, changing `b` invalidates the dependent.
+* unit: for every import form, `b` is in the dependent's closure.
 * end to end: build, change a field's type in `b`, rebuild, run. The binary
   must see the new layout.
 """
@@ -73,24 +74,6 @@ def _write_tree(root: Path, form: str) -> tuple[Path, Path]:
 
 @pytest.mark.unit
 @pytest.mark.parametrize("form", sorted(IMPORT_FORMS))
-def test_dependency_change_invalidates_dependent(tmp_path, form):
-    src = tmp_path / "src"
-    src.mkdir()
-    main, b = _write_tree(src, form)
-
-    cache = BuildCache(project_root=tmp_path)
-    cache.update_cache(main, "; main v1\n")
-    stale, reason = cache.needs_rebuild(main)
-    assert not stale, f"fresh cache should be valid, got: {reason}"
-
-    b.write_text(B_V2)
-    stale, reason = cache.needs_rebuild(main)
-    assert stale, f"`{form}` import of b: struct change in b left main's cache valid"
-    assert str(b.resolve()) in reason
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("form", sorted(IMPORT_FORMS))
 def test_transitive_dependencies_include_b(tmp_path, form):
     src = tmp_path / "src"
     src.mkdir()
@@ -116,13 +99,9 @@ def test_import_via_source_root_is_tracked(tmp_path):
     b.write_text(B_V1)
 
     cache = BuildCache(project_root=tmp_path)
+    assert str(b.resolve()) not in cache.get_transitive_dependencies(main)
     cache.set_import_context(project_root=pkg, source_roots=["lib"])
-    cache.update_cache(main, "; main v1\n")
-    assert not cache.needs_rebuild(main)[0]
-
-    b.write_text(B_V2)
-    stale, reason = cache.needs_rebuild(main)
-    assert stale and str(b.resolve()) in reason
+    assert str(b.resolve()) in cache.get_transitive_dependencies(main)
 
 
 class _CountingResolver:
@@ -154,18 +133,18 @@ def test_warm_process_parses_only_changed_files(tmp_path):
     main, b = _write_tree(src, "reexport_via_mod")
 
     first = BuildCache(project_root=tmp_path)
-    first.update_cache(main, "; main v1\n")
+    closure = first.get_transitive_dependencies(main)
+    first.save()
 
     second = BuildCache(project_root=tmp_path)
     counter = _counting(second)
-    assert not second.needs_rebuild(main)[0]
+    assert second.get_transitive_dependencies(main) == closure
     assert counter.parsed == [], "unchanged files were re-parsed"
 
     b.write_text(B_V2)
     third = BuildCache(project_root=tmp_path)
     counter = _counting(third)
-    stale, reason = third.needs_rebuild(main)
-    assert stale and str(b.resolve()) in reason
+    assert third.get_transitive_dependencies(main) == closure
     assert counter.parsed == ["b.ritz"]
 
 
@@ -198,14 +177,30 @@ def test_persisted_imports_rescanned_when_target_vanishes(tmp_path):
     (src / "lib").mkdir()
     (src / "lib" / "b.ritz").write_text(B_V1)
     first = BuildCache(project_root=tmp_path)
-    first.update_cache(main, "; v1\n")
+    assert str((src / "lib" / "b.ritz").resolve()) in first.get_transitive_dependencies(main)
+    first.save()
 
     # Move b to a flat name: same import, different file, main unchanged.
     (src / "lib" / "b.ritz").rename(src / "lib.b.ritz")
     second = BuildCache(project_root=tmp_path)
     deps = second.get_transitive_dependencies(main)
     assert str((src / "lib.b.ritz").resolve()) in deps
-    assert second.needs_rebuild(main)[0]
+
+
+# AGAST #3454: every compiled artifact goes through cas.ArtifactStore, keyed
+# on this closure. BuildCache's own per-module .ll/.bc/.o store lost its last
+# caller and was deleted. Pin the public API so a second artifact cache cannot
+# grow back unnoticed: a new method here needs a production caller first.
+BUILD_CACHE_API = {
+    "cache_dir", "clear", "get_transitive_dependencies", "import_scan_count",
+    "invalidate_if_compiler_changed", "save", "set_import_context",
+}
+
+
+@pytest.mark.unit
+def test_build_cache_is_only_an_import_closure():
+    public = {n for n in dir(BuildCache) if not n.startswith("_")}
+    assert public == BUILD_CACHE_API
 
 
 @pytest.mark.unit
@@ -277,3 +272,21 @@ def test_rebuild_tracks_module_found_via_package_source_root(buildpy, tmp_path):
     b.write_text(B_V1)
     _assert_rebuild_sees_new_layout(
         buildpy, tmp_path, pkg, main, b, ["src", "lib"], "source-root import")
+
+
+@pytest.mark.unit
+def test_cache_status_reports_import_scans(buildpy, tmp_path, capsys, monkeypatch):
+    """`build.py cache-status` describes what the cache holds now: import
+    scans, not the deleted per-module objects (AGAST #3454)."""
+    monkeypatch.setenv("RITZ_BUILD_CACHE_DIR", str(tmp_path / "bc"))
+    src = tmp_path / "src"
+    src.mkdir()
+    main, _ = _write_tree(src, "reexport_via_mod")
+    cache = BuildCache(project_root=tmp_path)
+    cache.get_transitive_dependencies(main)
+    cache.save()
+    buildpy._build_cache["ritz0"] = BuildCache(project_root=tmp_path)
+    assert buildpy.cmd_cache_status(type("A", (), {"verbose": False})()) == 0
+    out = capsys.readouterr().out
+    assert "Import scans: 3" in out
+    assert "Cached objects" not in out
