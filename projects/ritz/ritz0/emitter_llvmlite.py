@@ -3214,6 +3214,16 @@ class LLVMEmitter:
                     # Pass async_functions so await can recognize calls to async fns
                     sm = generate_state_machine(item, self.async_functions)
 
+                    # AGAST #3726: the generated items belong to the async
+                    # fn's own file.  Without its `source_file` an imported
+                    # async fn's constructor and poll fn read as this file's
+                    # and were defined in every importer (duplicate symbols
+                    # at link); with it they are declared, as any imported fn.
+                    for gen in (sm.future_struct, sm.constructor_fn, sm.poll_fn):
+                        if hasattr(item, 'source_file'):
+                            gen.source_file = item.source_file
+                        gen.is_pub = getattr(item, 'is_pub', False)
+
                     # Add the generated items
                     new_items.append(sm.future_struct)     # The Future struct
 

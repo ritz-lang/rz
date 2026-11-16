@@ -74,7 +74,8 @@ def test_awaited_async_call_runs(tmp_path, name):
 # (rz.toml).  The state machine runs each await once, in its own state, and
 # its final state evaluates only the body's TAIL: `sum += await` in a loop is
 # never re-run and the `+=` never executes, so this answers 0, not 20.  When
-# #3727 passes this row, restore test_loop_await in 55 and delete this.
+# #3727 passes this row, restore test_loop_await in 55 and
+# test_async_write_read in 54 (removed by #3726), and delete this.
 _LOOP_AWAIT = ("async fn dbl(x: i32) -> i32\n    x * 2\n\n"
                "async fn loop_await(n: i32) -> i32\n    var sum: i32 = 0\n    var i: i32 = 0\n"
                "    while i < n\n        sum += await dbl(i)\n        i += 1\n    sum\n\n"
