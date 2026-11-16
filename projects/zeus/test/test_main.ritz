@@ -13,8 +13,9 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
-import ritzlib.string { String, string_from_cstr, string_push_i64, string_push, string_as_ptr, string_drop }
-import ritzlib.os.env { env_raw_envp }
+import ritzlib.string { String, string_from, string_from_cstr, string_push_i64, string_push, string_push_cstr, string_as_ptr, string_drop }
+import ritzlib.os.env { env_raw_envp, env_get_or }
+import ritzlib.strview
 import zeus.main_helpers
 
 # ============================================================================
@@ -255,6 +256,26 @@ fn test_pid_file_path() -> i32
 # requests land on different workers. zeus passes the count as argv[3].
 # ============================================================================
 
+# A scratch dir for a test that execs a script from it: `<base>/<tag><pid>`,
+# NUL-terminated. An empty `base` means /tmp. (AGAST #3710)
+fn scratch_dir_in(base: StrView, tag: *u8) -> String
+    var b: StrView = base
+    if b.len == 0
+        b = "/tmp"
+    var dir: String = string_from(b)
+    string_push(@&dir, '/')
+    string_push_cstr(@&dir, tag)
+    string_push_i64(@&dir, sys_getpid() as i64)
+    string_push(@&dir, 0)
+    dir
+
+
+# scratch_dir_in under $TMPDIR, not a literal /tmp: a host may mount /tmp
+# noexec (a CIS policy does), and then execve of the script fails with EACCES.
+fn scratch_dir(tag: *u8) -> String
+    scratch_dir_in(env_get_or("TMPDIR", ""), tag)
+
+
 # Exec a script that writes its arguments to `out`, wait, read them back.
 fn spawn_and_capture(dir: *u8, worker_count: i32, out: *u8, out_cap: i64) -> i64
     var script: [256]u8
@@ -292,11 +313,75 @@ fn spawn_and_capture(dir: *u8, worker_count: i32, out: *u8, out_cap: i64) -> i64
     got
 
 
+# ============================================================================
+# Test: scratch dirs follow $TMPDIR (AGAST #3710)
+#
+# The spawn tests exec a script from their scratch dir. A literal /tmp broke
+# them on hosts that mount /tmp noexec (EACCES from execve), so the dir is
+# built from $TMPDIR, falling back to /tmp only when it is unset or empty.
+# ============================================================================
+
+# `<base>/<tag><pid>` as a C string, for comparing against a scratch dir.
+fn expected_scratch(base: *u8, tag: *u8) -> String
+    var want: String = string_from_cstr(base)
+    string_push_cstr(@&want, c"/")
+    string_push_cstr(@&want, tag)
+    string_push_i64(@&want, sys_getpid() as i64)
+    string_push(@&want, 0)
+    want
+
+
+[[test]]
+fn test_scratch_dir_in_puts_the_dir_under_the_base() -> i32
+    var dir: String = scratch_dir_in("/srv/scratch", c"zeus-argv-")
+    var want: String = expected_scratch(c"/srv/scratch", c"zeus-argv-")
+    let ok: i32 = streq(string_as_ptr(@&dir), string_as_ptr(@&want))
+    string_drop(@&dir)
+    string_drop(@&want)
+    if ok == 0
+        return 1
+    0
+
+
+[[test]]
+fn test_scratch_dir_in_falls_back_to_tmp_for_an_empty_base() -> i32
+    var dir: String = scratch_dir_in("", c"zeus-env-")
+    var want: String = expected_scratch(c"/tmp", c"zeus-env-")
+    let ok: i32 = streq(string_as_ptr(@&dir), string_as_ptr(@&want))
+    string_drop(@&dir)
+    string_drop(@&want)
+    if ok == 0
+        return 1
+    0
+
+
+# Whatever TMPDIR this test runs under, scratch_dir honours it, and a script
+# written there is the one that runs. Run under TMPDIR=<exec-able dir> this is
+# the noexec-/tmp case; with TMPDIR unset it checks the /tmp fallback.
+[[test]]
+fn test_scratch_dir_follows_tmpdir() -> i32
+    var base: StrView = env_get_or("TMPDIR", "")
+    var dir: String = scratch_dir(c"zeus-tmpdir-")
+    var want: String = scratch_dir_in(base, c"zeus-tmpdir-")
+    let ok: i32 = streq(string_as_ptr(@&dir), string_as_ptr(@&want))
+    string_drop(@&want)
+    if ok == 0
+        string_drop(@&dir)
+        return 1
+    let d: *u8 = string_as_ptr(@&dir)
+    sys_mkdir(d, 448)
+    var out: [64]u8
+    let n: i64 = spawn_and_capture(d, 2, @out[0], 64)
+    sys_rmdir(d)
+    string_drop(@&dir)
+    if n <= 0
+        return 2
+    0
+
+
 [[test]]
 fn test_spawn_worker_passes_worker_count() -> i32
-    var dir: String = string_from_cstr(c"/tmp/zeus-argv-")
-    string_push_i64(@&dir, sys_getpid() as i64)
-    string_push(@&dir, 0)
+    var dir: String = scratch_dir(c"zeus-argv-")
     sys_mkdir(string_as_ptr(@&dir), 448)
     var out: [64]u8
     let n: i64 = spawn_and_capture(string_as_ptr(@&dir), 3, @out[0], 64)
@@ -349,9 +434,7 @@ fn test_spawn_worker_passes_the_environment() -> i32
     let want: *u8 = probe_entry()
     if want == null
         return 100     # no usable variable to look for
-    var dir: String = string_from_cstr(c"/tmp/zeus-env-")
-    string_push_i64(@&dir, sys_getpid() as i64)
-    string_push(@&dir, 0)
+    var dir: String = scratch_dir(c"zeus-env-")
     let d: *u8 = string_as_ptr(@&dir)
     sys_mkdir(d, 448)
     let dl: i64 = strlen(d)
