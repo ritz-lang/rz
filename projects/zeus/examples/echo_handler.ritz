@@ -1,0 +1,72 @@
+# zeus/examples/echo_handler.ritz - Per-request step of the echo worker
+#
+# Split out of echo_worker.ritz (which owns main) so test/test_echo_worker.ritz
+# can drive one request through the exact code the example runs.
+
+import zeus.worker { WorkerContext }
+import zeus.worker { worker_set_running, worker_set_busy, worker_ack_request }
+import zeus.worker { worker_begin_response, worker_commit_response, worker_wait_response_slot }
+import zeus.worker { worker_get_request_path }
+import zeus.worker { worker_alloc_response_data, worker_ptr_to_offset }
+import zeus.ring { RequestSlot, ResponseSlot }
+import zeus.ring { response_slot_set_status, response_slot_set_flags }
+import zeus.ring { response_slot_set_body }
+import zeus.ring { RESP_FLAG_COMPLETE }
+
+pub const ECHO_PREFIX_LEN: i32 = 6     # "Echo: "
+pub const ECHO_MAX_BODY: i32 = 1024
+
+fn copy_bytes(dst: *u8, src: *u8, len: i32)
+    for i in 0..len
+        *(dst + i) = *(src + i)
+
+# Answer `req` (the request worker_poll_request just returned) with
+# "Echo: <path>", then ack it.
+#
+# Returns 1 if the request was answered and acked, 0 if the response ring
+# stayed full for `wait_ms` and the request was left unacked: the caller
+# polls again and gets the same request back.  Same shape as nexus
+# (AGAST #2464, #2467): an unanswered ack breaks valet's request/response
+# pairing.
+#
+# Order matters: worker_begin_response is what attaches ctx.response_arena
+# to this request's arena slot, so response data is allocated after it.
+# That slot also holds the request's path, so the path is copied to the
+# stack before the allocation can overwrite it.
+pub fn echo_serve_request(ctx: *WorkerContext, req: *RequestSlot, wait_ms: i64) -> i32
+    if worker_wait_response_slot(ctx, wait_ms) == 0
+        return 0
+
+    worker_set_busy(ctx)
+
+    var body: [1024]u8
+    let path: *u8 = worker_get_request_path(ctx, req)
+    var path_len: i32 = req.path_len as i32
+    if path_len > ECHO_MAX_BODY - ECHO_PREFIX_LEN
+        path_len = ECHO_MAX_BODY - ECHO_PREFIX_LEN
+    copy_bytes(@body[0], c"Echo: ", ECHO_PREFIX_LEN)
+    copy_bytes(@body[ECHO_PREFIX_LEN], path, path_len)
+    let body_len: i32 = ECHO_PREFIX_LEN + path_len
+
+    let resp: *ResponseSlot = worker_begin_response(ctx, req.id)
+    if resp == null
+        # Cannot happen: this worker is the response ring's only producer
+        # and a slot was free above.  Still never ack unanswered.
+        worker_set_running(ctx)
+        return 0
+
+    let body_ptr: *u8 = worker_alloc_response_data(ctx, body_len as i64)
+    if body_ptr != null
+        copy_bytes(body_ptr, @body[0], body_len)
+        response_slot_set_status(resp, 200)
+        let body_offset: i64 = worker_ptr_to_offset(ctx, body_ptr)
+        response_slot_set_body(resp, body_offset as u32, body_len as u32)
+    else
+        # Arena slot too small: still answer, so the pairing holds
+        response_slot_set_status(resp, 500)
+    response_slot_set_flags(resp, RESP_FLAG_COMPLETE)
+
+    worker_commit_response(ctx)
+    worker_ack_request(ctx)
+    worker_set_running(ctx)
+    return 1
