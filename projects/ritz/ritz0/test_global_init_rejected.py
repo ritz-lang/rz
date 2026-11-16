@@ -123,22 +123,30 @@ _UNTYPED = {
     "int": ("var counter = 5\n" + _MAIN, 1, 13,
             "a global needs a type: write `var counter: i64 = ...`"),
     "unknown": ("var g = null\n" + _MAIN, 1, 7, "a global needs a type: write `var g: T = ...`"),
+    "float": ("var g = 1.5\n" + _MAIN, 1, 7, "a global needs a type: write `var g: f64 = ...`"),
+    "str": ('var g = "hi"\n' + _MAIN, 1, 7, "a global needs a type: write `var g: StrView = ...`"),
+    "cstr": ('var g = c"hi"\n' + _MAIN, 1, 7, "a global needs a type: write `var g: *u8 = ...`"),
+    "char": ("var g = 'A'\n" + _MAIN, 1, 7, "a global needs a type: write `var g: u8 = ...`"),
+    "pub_neg_int": ("pub var g = -5\n" + _MAIN, 1, 11, "a global needs a type: write `var g: i64 = ...`"),
 }
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(_UNTYPED))
-def test_ritz0_an_untyped_global_var_is_an_error_at_the_eq(request, tmp_path, name):
-    """ritz0-only until #3375 gives ritz1 (which already refuses, with a
-    parse error) the same message; then this joins COMPILERS."""
+def test_an_untyped_global_var_is_an_error_at_the_eq(request, tmp_path, compiler, name):
+    """Every compiler, one message at the `=`.  ritz1 used to stop with a parse
+    error ("unexpected '='", "cannot parse item starting at 'var g'"); its
+    grammar now takes the untyped form and refuses it (#3375)."""
     source, line, col, message = _UNTYPED[name]
-    proc, ll = _compile(request, "ritz0", tmp_path, source)
+    proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"ritz0 accepted {name}:\n{out[-1500:]}"
+    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
     assert "Traceback" not in out and "ValueError" not in out, out[-1500:]
+    assert "cannot parse item" not in out and "unexpected" not in out, f"{compiler}, {name}:\n{out[-1500:]}"
     hits = re.findall(rf"unit\.ritz:{line}:{col}: (?:error: )?{re.escape(message)}", out)
-    assert len(hits) == 1, f"{name}: want one {message!r} at {line}:{col}:\n{out[-1500:]}"
-    assert not ll.exists(), f"ritz0 wrote IR for {name}"
+    assert len(hits) == 1, f"{compiler}, {name}: want one {message!r} at {line}:{col}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
 @pytest.mark.integration
