@@ -1,0 +1,273 @@
+# test/test_static_keepalive.ritz - static responses advertise valet's
+# keep-alive decision (AGAST #2117)
+#
+# Since #2106 valet closes the connection after an HTTP/1.0 request without
+# keep-alive, a "Connection: close" request, and the keepalive_requests-th
+# request.  The ctx_* helpers say so (test_keepalive.ritz), but lib/static.ritz
+# hand-built "Connection: keep-alive" into every file, directory, 304 and 404
+# response, promising reuse valet then refused.
+#
+# Each test drives valet_try_static the way the connection handler does
+# (parse, bump request_count, saturate it when valet_keep_alive says close)
+# and reads the response back from a pipe.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.memory
+import ritzlib.async.tasks
+
+import lib.request
+import lib.static
+import lib.valet
+
+fn static_root() -> *u8
+    c"/tmp/valet_test_static_ka"
+
+fn contains(hay: *u8, len: i32, needle: StrView) -> i32
+    var i: i32 = 0
+    while i + needle.len as i32 <= len
+        var j: i64 = 0
+        while j < needle.len and *(hay + i + j) == *(needle.ptr + j)
+            j += 1
+        if j == needle.len
+            return 1
+        i += 1
+    0
+
+# Create the fixture tree: static_root()/<name> holding "hello\n", and
+# static_root()/dir/ for the directory listing.  0 on success.
+fn fixture(name: *u8) -> i32
+    sys_mkdir(static_root(), 493)                     # 0755; EEXIST is fine
+    sys_mkdir(c"/tmp/valet_test_static_ka/dir", 493)
+    var path: [256]u8
+    let root_len: i64 = strlen(static_root())
+    memcpy(@path[0], static_root(), root_len)
+    path[root_len] = '/'
+    let name_len: i64 = strlen(name)
+    memcpy(@path[0] + root_len + 1, name, name_len)
+    path[root_len + 1 + name_len] = 0
+    # O_WRONLY | O_CREAT | O_TRUNC = 577, mode 0644 = 420
+    let fd: i32 = sys_open3(@path[0], 577, 420)
+    if fd < 0
+        return 1
+    let n: i64 = sys_write(fd, c"hello\n", 6)
+    sys_close(fd)
+    if n != 6
+        return 2
+    0
+
+# Drain `fd` into out[0..cap); returns bytes read.
+fn drain(fd: i32, out: *u8, cap: i32) -> i32
+    var total: i32 = 0
+    while total < cap
+        let n: i64 = sys_read(fd, out + total, (cap - total) as i64)
+        if n <= 0
+            break
+        total += n as i32
+    total
+
+# Serve `raw` as the `count`-th request on a connection through
+# valet_try_static; the response lands in out[0..cap).  Returns its length,
+# or negative on setup failure.
+fn static_reply(raw: StrView, count: i32, out: *u8, cap: i32) -> i32
+    var app: Valet
+    valet_init(@app, 0)
+    valet_static(@app, c"/s/*", static_root())
+    set_g_app(@app)
+
+    var task: Task
+    memcpy(@task.read_buf[0], raw.ptr, raw.len)
+    task.read_len = raw.len as i32
+
+    var req: Request
+    request_init(@req)
+    if request_parse(@req, @task.read_buf[0], task.read_len) < 0
+        return -1
+
+    # Exactly what valet's connection handler does before valet_try_static.
+    task.request_count = count
+    if valet_keep_alive(@req, task.request_count, app.keepalive_requests) == 0
+        task.request_count = app.keepalive_requests
+
+    var p: [2]i32
+    if sys_pipe(@p[0]) != 0
+        return -2
+    task.fd = p[1]
+    let handled: i32 = valet_try_static(@app, @task, req.path_ptr, req.path_len)
+    sys_close(p[1])
+    let n: i32 = drain(p[0], out, cap)
+    sys_close(p[0])
+    set_g_app(null)
+    if handled != 1
+        return -3
+    n
+
+# 0 when the response says close and never keep-alive; 1/2 otherwise.
+fn says_close(out: *u8, n: i32) -> i32
+    if contains(out, n, "Connection: close\r\n") != 1
+        return 1
+    if contains(out, n, "keep-alive") != 0
+        return 2
+    0
+
+# ----------------------------------------------------------------------------
+# Static file (static_serve_file_full)
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_static_file_http10_client_gets_close() -> i32
+    if fixture(c"a.txt") != 0
+        return 90
+    var buf: [2048]u8
+    let n: i32 = static_reply("GET /s/a.txt HTTP/1.0\r\nHost: x\r\n\r\n", 1, @buf[0], 2048)
+    if n <= 0
+        return 91
+    if contains(@buf[0], n, "200 OK") != 1
+        return 92
+    says_close(@buf[0], n)
+
+[[test]]
+fn test_static_file_connection_close_gets_close() -> i32
+    if fixture(c"b.txt") != 0
+        return 90
+    var buf: [2048]u8
+    let n: i32 = static_reply("GET /s/b.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 1, @buf[0], 2048)
+    if n <= 0
+        return 91
+    says_close(@buf[0], n)
+
+[[test]]
+fn test_static_file_last_keepalive_request_gets_close() -> i32
+    if fixture(c"c.txt") != 0
+        return 90
+    var buf: [2048]u8
+    # keepalive_requests defaults to 100: the 100th response is the last.
+    let n: i32 = static_reply("GET /s/c.txt HTTP/1.1\r\nHost: x\r\n\r\n", 100, @buf[0], 2048)
+    if n <= 0
+        return 91
+    says_close(@buf[0], n)
+
+[[test]]
+fn test_static_file_http11_keeps_alive() -> i32
+    if fixture(c"d.txt") != 0
+        return 90
+    var buf: [2048]u8
+    let n: i32 = static_reply("GET /s/d.txt HTTP/1.1\r\nHost: x\r\n\r\n", 1, @buf[0], 2048)
+    if n <= 0
+        return 91
+    if contains(@buf[0], n, "Connection: keep-alive\r\n") != 1
+        return 1
+    if contains(@buf[0], n, "close") != 0
+        return 2
+    # Body follows the headers intact.
+    if contains(@buf[0], n, "\r\n\r\nhello\n") != 1
+        return 3
+    0
+
+# ----------------------------------------------------------------------------
+# 304, directory listing, 404
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_static_304_connection_close_gets_close() -> i32
+    var buf: [512]u8
+    var p: [2]i32
+    if sys_pipe(@p[0]) != 0
+        return 90
+    static_send_304(p[1], c"\"abc\"", 5, 0)
+    sys_close(p[1])
+    let n: i32 = drain(p[0], @buf[0], 512)
+    sys_close(p[0])
+    if contains(@buf[0], n, "304 Not Modified") != 1
+        return 91
+    says_close(@buf[0], n)
+
+[[test]]
+fn test_static_304_keeps_alive() -> i32
+    var buf: [512]u8
+    var p: [2]i32
+    if sys_pipe(@p[0]) != 0
+        return 90
+    static_send_304(p[1], c"\"abc\"", 5, 1)
+    sys_close(p[1])
+    let n: i32 = drain(p[0], @buf[0], 512)
+    sys_close(p[0])
+    if contains(@buf[0], n, "Connection: keep-alive\r\n\r\n") != 1
+        return 1
+    0
+
+[[test]]
+fn test_static_directory_http10_client_gets_close() -> i32
+    if fixture(c"dir/e.txt") != 0
+        return 90
+    var buf: [8192]u8
+    let n: i32 = static_reply("GET /s/dir HTTP/1.0\r\n\r\n", 1, @buf[0], 8192)
+    if n <= 0
+        return 91
+    if contains(@buf[0], n, "Index of") != 1
+        return 92
+    says_close(@buf[0], n)
+
+[[test]]
+fn test_static_404_connection_close_gets_close() -> i32
+    var buf: [512]u8
+    let n: i32 = static_reply("GET /s/missing.txt HTTP/1.1\r\nConnection: close\r\n\r\n", 1, @buf[0], 512)
+    if n <= 0
+        return 91
+    if contains(@buf[0], n, "404 Not Found") != 1
+        return 92
+    says_close(@buf[0], n)
+
+# The 404 is exactly its headers and 14-byte body: nothing after "Found\n".
+[[test]]
+fn test_static_404_keeps_alive_and_ends_at_body() -> i32
+    var buf: [512]u8
+    let n: i32 = static_reply("GET /s/missing.txt HTTP/1.1\r\n\r\n", 1, @buf[0], 512)
+    if n <= 0
+        return 91
+    if contains(@buf[0], n, "Connection: keep-alive\r\n") != 1
+        return 1
+    if contains(@buf[0], n, "\r\n\r\n404 Not Found\n") != 1
+        return 2
+    if buf[n - 1] != '\n' or buf[n - 2] != 'd'
+        return 3
+    0
+
+# static_serve_file: the plain (no Range/ETag) variant.
+[[test]]
+fn test_static_serve_file_close_and_keep_alive() -> i32
+    if fixture(c"f.txt") != 0
+        return 90
+    var buf: [1024]u8
+    var p: [2]i32
+    if sys_pipe(@p[0]) != 0
+        return 91
+    static_serve_file(p[1], c"/tmp/valet_test_static_ka/f.txt", 0)
+    sys_close(p[1])
+    var n: i32 = drain(p[0], @buf[0], 1024)
+    sys_close(p[0])
+    if says_close(@buf[0], n) != 0
+        return 1
+    if sys_pipe(@p[0]) != 0
+        return 92
+    static_serve_file(p[1], c"/tmp/valet_test_static_ka/f.txt", 1)
+    sys_close(p[1])
+    n = drain(p[0], @buf[0], 1024)
+    sys_close(p[0])
+    if contains(@buf[0], n, "Connection: keep-alive\r\n\r\nhello\n") != 1
+        return 2
+    0
+
+# A conditional GET that matches answers 304 through static_serve_file_full.
+[[test]]
+fn test_static_304_via_if_none_match_connection_close_gets_close() -> i32
+    if fixture(c"g.txt") != 0
+        return 90
+    var buf: [1024]u8
+    let n: i32 = static_reply("GET /s/g.txt HTTP/1.1\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n", 1, @buf[0], 1024)
+    if n <= 0
+        return 91
+    if contains(@buf[0], n, "304 Not Modified") != 1
+        return 92
+    says_close(@buf[0], n)

@@ -365,11 +365,25 @@ pub fn static_build_path(buf: *u8, buf_len: i32, root: *u8, url_path: *u8, url_p
     return pos
 
 
+# Write the Connection header line for valet's keep-alive decision into
+# `buf` (needs 24 bytes); returns the bytes written.  `keep_alive` is 0 when
+# valet closes the connection after this response (HTTP/1.0 without
+# keep-alive, "Connection: close", or the keepalive_requests-th request),
+# so the header never promises reuse valet won't honour (AGAST #2117).
+pub fn static_connection_header(buf: *u8, keep_alive: i32) -> i32
+    if keep_alive != 0
+        memcpy(buf, c"Connection: keep-alive\r\n", 24)
+        return 24
+    memcpy(buf, c"Connection: close\r\n", 19)
+    return 19
+
+
 # Serve a static file
 # fd: socket to write to
 # path: full filesystem path to file
+# keep_alive: 0 when valet closes the connection after this response
 # Returns: bytes sent on success, negative on error
-pub fn static_serve_file(fd: i32, path: *u8) -> i64
+pub fn static_serve_file(fd: i32, path: *u8, keep_alive: i32) -> i64
     # Open the file
     let file_fd: i32 = sys_open(path, O_RDONLY)
     if file_fd < 0
@@ -432,11 +446,7 @@ pub fn static_serve_file(fd: i32, path: *u8) -> i64
     headers[pos] = '\n'
     pos += 1
 
-    # Connection header: "Connection: keep-alive\r\n" (24 bytes)
-    let conn = c"Connection: keep-alive\r\n"
-    for i in 0..24
-        headers[pos] = *(conn + i)
-        pos += 1
+    pos += static_connection_header(@headers[pos], keep_alive)
 
     # End of headers
     headers[pos] = '\r'
@@ -489,8 +499,9 @@ pub fn format_int64(buf: *u8, buf_size: i32, value: i64) -> i32
 # range_len: Length of range header
 # if_none_match: If-None-Match header value (can be null)
 # if_none_match_len: Length of If-None-Match header
+# keep_alive: 0 when valet closes the connection after this response
 # Returns: bytes sent on success, negative on error
-pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32, if_none_match: *u8, if_none_match_len: i32) -> i64
+pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32, if_none_match: *u8, if_none_match_len: i32, keep_alive: i32) -> i64
     # Open the file
     let file_fd: i32 = sys_open(path, O_RDONLY)
     if file_fd < 0
@@ -518,7 +529,7 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
         if etag_matches(if_none_match, if_none_match_len, @etag_buf[0], etag_len) != 0
             sys_close(file_fd)
             # Return 304 Not Modified
-            return static_send_304(fd, @etag_buf[0], etag_len)
+            return static_send_304(fd, @etag_buf[0], etag_len, keep_alive)
 
     # Parse range if provided
     var send_start: i64 = 0
@@ -629,11 +640,7 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
         headers[pos] = *(ar + i)
         pos += 1
 
-    # Connection header
-    let conn = c"Connection: keep-alive\r\n"
-    for i in 0..24
-        headers[pos] = *(conn + i)
-        pos += 1
+    pos += static_connection_header(@headers[pos], keep_alive)
 
     # End of headers
     headers[pos] = '\r'
@@ -666,7 +673,7 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
 
 
 # Send a 304 Not Modified response with ETag
-pub fn static_send_304(fd: i32, etag: *u8, etag_len: i32) -> i64
+pub fn static_send_304(fd: i32, etag: *u8, etag_len: i32, keep_alive: i32) -> i64
     var resp: [256]u8
     var pos: i32 = 0
 
@@ -681,18 +688,21 @@ pub fn static_send_304(fd: i32, etag: *u8, etag_len: i32) -> i64
         resp[pos] = *(etag + i)
         pos += 1
 
-    # End headers (304 has no body)
-    let end = c"\r\nConnection: keep-alive\r\n\r\n"
-    for i in 0..28
-        resp[pos] = *(end + i)
-        pos += 1
+    # End the ETag line, then Connection and the blank line (304 has no body)
+    resp[pos] = '\r'
+    resp[pos + 1] = '\n'
+    pos += 2
+    pos += static_connection_header(@resp[pos], keep_alive)
+    resp[pos] = '\r'
+    resp[pos + 1] = '\n'
+    pos += 2
 
     return sys_write(fd, @resp[0], pos as i64)
 
 
 # Backward-compatible wrapper that calls full version
-pub fn static_serve_file_range(fd: i32, path: *u8, range_hdr: *u8, range_len: i32) -> i64
-    return static_serve_file_full(fd, path, range_hdr, range_len, null, 0)
+pub fn static_serve_file_range(fd: i32, path: *u8, range_hdr: *u8, range_len: i32, keep_alive: i32) -> i64
+    return static_serve_file_full(fd, path, range_hdr, range_len, null, 0, keep_alive)
 
 
 # Send a 416 Range Not Satisfiable response
@@ -717,10 +727,16 @@ pub fn static_send_416(fd: i32, file_size: i64) -> i64
 
 
 # Send a 404 Not Found response
-# Response is 114 bytes total
-pub fn static_send_404(fd: i32) -> i64
-    let resp = c"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: keep-alive\r\n\r\n404 Not Found\n"
-    return sys_write(fd, resp, 114)
+# keep_alive: 0 when valet closes the connection after this response
+pub fn static_send_404(fd: i32, keep_alive: i32) -> i64
+    var resp: [128]u8
+    let head = c"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\n"
+    memcpy(@resp[0], head, 70)
+    var pos: i32 = 70
+    pos += static_connection_header(@resp[pos], keep_alive)
+    memcpy(@resp[pos], c"\r\n404 Not Found\n", 16)
+    pos += 16
+    return sys_write(fd, @resp[0], pos as i64)
 
 
 # Send a 403 Forbidden response
@@ -746,8 +762,9 @@ pub fn static_is_directory(path: *u8) -> i32
 # fd: socket to write to
 # path: full filesystem path to directory
 # url_path: URL path (for display and links)
+# keep_alive: 0 when valet closes the connection after this response
 # Returns: bytes sent on success, negative on error
-pub fn static_serve_directory(fd: i32, path: *u8, url_path: *u8, url_path_len: i32) -> i64
+pub fn static_serve_directory(fd: i32, path: *u8, url_path: *u8, url_path_len: i32, keep_alive: i32) -> i64
     # Open directory
     let dir_fd: i32 = sys_open(path, O_RDONLY | O_DIRECTORY)
     if dir_fd < 0
@@ -890,11 +907,7 @@ pub fn static_serve_directory(fd: i32, path: *u8, url_path: *u8, url_path_len: i
     headers[hpos] = '\n'
     hpos += 1
 
-    # Connection header
-    let conn = c"Connection: keep-alive\r\n"
-    for i in 0..24
-        headers[hpos] = *(conn + i)
-        hpos += 1
+    hpos += static_connection_header(@headers[hpos], keep_alive)
 
     # End of headers
     headers[hpos] = '\r'
