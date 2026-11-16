@@ -3552,6 +3552,28 @@ class LLVMEmitter:
         finally:
             self._expected_enum_name = saved
 
+    def _emit_value_arg(self, arg: rast.Expr, param_type: Optional['rast.Type'],
+                        emit) -> ir.Value:
+        """Emit a by-value call argument expecting its PARAMETER's enum.
+
+        AGAST #1577: the expectation is replaced, not inherited. Inside
+        `let v: Option<i64> = Some(g(Some(20 as i32)))` the let expects
+        `Option$i64`, but g's argument is an `Option<i32>`; a ctor that is the
+        argument, or sits in one of its `if`/`match` tails, must be built at
+        that. A non-enum parameter expects no enum at all. The outer
+        expectation is restored for the argument after this one. `emit(arg)`
+        is how the path emits the argument otherwise.
+        """
+        param_enum = self._let_annotation_enum(param_type)
+        if param_enum is not None and self._is_enum_variant_call(arg):
+            return self._emit_enum_variant_with_type(arg, param_enum)
+        saved = getattr(self, '_expected_enum_name', None)
+        self._expected_enum_name = param_enum
+        try:
+            return emit(arg)
+        finally:
+            self._expected_enum_name = saved
+
     def _emit_return_operand(self, value: rast.Expr) -> ir.Value:
         """Emit a `return` operand, expecting the enum the fn returns.
 
@@ -12030,27 +12052,20 @@ class LLVMEmitter:
                     # Moved/value parameter: emit value normally.
                     # `f(Some(x))` must build the variant for the *parameter's*
                     # enum - variant names are global, so otherwise `Some`
-                    # resolves to whichever Option was specialized last.
-                    param_enum = None
-                    if (self._is_enum_variant_call(arg)
-                            and isinstance(param_def.type, rast.NamedType)):
-                        param_enum = self._resolve_enum_type_name(param_def.type)
-                        if param_enum is None and param_def.type.args:
-                            param_enum = self._ensure_builtin_generic_specialization(
-                                param_def.type)
-                    if param_enum is not None:
-                        val = self._emit_enum_variant_with_type(arg, param_enum)
-                    elif (self._is_range_index(arg)
-                            or self._builtin_type_receiver(arg) is not None
-                            or self._is_generic_static_call(arg)):
-                        # AGAST #2877: a Vec slice into a `Span<T>` param is
-                        # a view (_emit_vec_span_slice), as into a Span let.
-                        # AGAST #2296: `Span.empty()` takes its T from the
-                        # param, not from whatever slot encloses the call;
-                        # so does `Slot.mk(5)` (AGAST #2185).
-                        val = self._emit_slice_into(arg, param_def.type)
-                    else:
-                        val = self._emit_into_array_slot(arg, param_def.type)
+                    # resolves to whichever Option was specialized last, or
+                    # to an enclosing let's enum (AGAST #1577).
+                    def emit_plain(a, slot=param_def.type):
+                        if (self._is_range_index(a)
+                                or self._builtin_type_receiver(a) is not None
+                                or self._is_generic_static_call(a)):
+                            # AGAST #2877: a Vec slice into a `Span<T>` param is
+                            # a view (_emit_vec_span_slice), as into a Span let.
+                            # AGAST #2296: `Span.empty()` takes its T from the
+                            # param, not from whatever slot encloses the call;
+                            # so does `Slot.mk(5)` (AGAST #2185).
+                            return self._emit_slice_into(a, slot)
+                        return self._emit_into_array_slot(a, slot)
+                    val = self._emit_value_arg(arg, param_def.type, emit_plain)
 
                     val = self._convert_type(val, expected_type, arg)
                 args.append(val)
@@ -13576,7 +13591,9 @@ class LLVMEmitter:
                         fn_def.params[i]))
                 else:
                     slot = fn_def.params[i].type if i < len(fn_def.params) else None
-                    all_args.append(self._emit_into_array_slot(arg, slot))
+                    # AGAST #1577: at the param's enum, not an outer let's.
+                    all_args.append(self._emit_value_arg(
+                        arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
 
             # Convert argument types as needed
             converted_args = []
@@ -13725,7 +13742,9 @@ class LLVMEmitter:
                 all_args.append(val)
             else:
                 slot = fn_def.params[j].type if j < len(fn_def.params) else None
-                all_args.append(self._emit_into_array_slot(arg, slot))
+                # AGAST #1577: at the param's enum, not an outer let's.
+                all_args.append(self._emit_value_arg(
+                    arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
 
         # Convert argument types as needed
         converted_args = []

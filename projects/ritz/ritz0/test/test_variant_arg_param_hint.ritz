@@ -1,0 +1,126 @@
+# AGAST #1577: a variant constructor passed as a call argument is built at the
+# CALLEE's parameter type, never at the enum an enclosing typed `let` or
+# `return` expects.
+#
+# `let v: Option<i64> = Some(g(Some(20 as i32)) + g(None))` with
+# `g(o: Option<i32>)`: ritz0 built the inner `Some`/`None` as the let's
+# `Option$i64` on every path that didn't special-case a bare ctor argument:
+# impl-method and static `Type.method` arguments, and a ctor in an `if` tail
+# of a plain call's argument. ritz1's side is #1498. The regression matrix runs
+# these on ritz0, ritz1 and ritz1_selfhosted; ritz0/test_variant_arg_param_hint.py
+# runs each path as its own program so a broken path names itself.
+
+enum Crate1577<T>
+    Packed(T)
+    Bare
+
+struct Acc1577
+    base: i64
+
+impl Acc1577
+    fn m(self: @Acc1577, o: Option<i32>) -> i64
+        let r: i64 = match o
+            Some(v) => self.base + v as i64
+            None => 1
+        return r
+
+    fn mk(o: Option<i32>) -> i64
+        let b: i64 = match o
+            Some(v) => v as i64 * 2
+            None => 1
+        return b
+
+fn g1577(o: Option<i32>) -> i64
+    let r: i64 = match o
+        Some(v) => v as i64 * 2
+        None => 1
+    return r
+
+fn k1577(o: Option<i64>) -> i32
+    let r: i32 = match o
+        Some(v) => v as i32
+        None => 0
+    return r
+
+fn crate_g1577(b: Crate1577<i32>) -> i64
+    let r: i64 = match b
+        Packed(v) => v as i64 * 2
+        Bare => 1
+    return r
+
+fn opt1577(v: Option<i64>) -> i32
+    let r: i32 = match v
+        Some(x) => x as i32
+        None => 99
+    return r
+
+fn ret_hint1577() -> Option<i64>
+    return Some(g1577(Some(20 as i32)) + g1577(None))
+
+fn method_ret_hint1577(a: @Acc1577) -> Option<i64>
+    return Some(a.m(Some(40 as i32)) + a.m(None))
+
+# The ticket repro: a plain call's ctor args inside a typed let.
+[[test]]
+fn test_let_plain_call_arg() -> i32
+    let v: Option<i64> = Some(g1577(Some(20 as i32)) + g1577(None))
+    assert opt1577(v) == 41
+    0
+
+# The same under a `return` type hint.
+[[test]]
+fn test_return_plain_call_arg() -> i32
+    assert opt1577(ret_hint1577()) == 41
+    0
+
+# A ctor in an `if` tail of the argument, not the argument itself.
+[[test]]
+fn test_let_plain_call_if_tail_arg() -> i32
+    let c: i32 = 1
+    let v: Option<i64> = Some(g1577(if c == 1 then Some(20 as i32) else None) + g1577(None))
+    assert opt1577(v) == 41
+    0
+
+[[test]]
+fn test_let_method_call_arg() -> i32
+    let a: Acc1577 = Acc1577 { base: 0 }
+    let v: Option<i64> = Some(a.m(Some(40 as i32)) + a.m(None))
+    assert opt1577(v) == 41
+    0
+
+[[test]]
+fn test_return_method_call_arg() -> i32
+    let a: Acc1577 = Acc1577 { base: 0 }
+    assert opt1577(method_ret_hint1577(@a)) == 41
+    0
+
+[[test]]
+fn test_let_static_method_arg() -> i32
+    let v: Option<i64> = Some(Acc1577.mk(Some(20 as i32)) + Acc1577.mk(None))
+    assert opt1577(v) == 41
+    0
+
+# The let's expectation is back for the tails after the condition's call
+# argument.
+[[test]]
+fn test_let_restored_after_arg() -> i32
+    let c: i32 = 1
+    let v: Option<i64> = if g1577(if c == 1 then Some(20 as i32) else None) == 40 then Some(41) else None
+    assert opt1577(v) == 41
+    0
+
+[[test]]
+fn test_let_user_enum_arg() -> i32
+    let v: Crate1577<i64> = Packed(crate_g1577(Packed(20 as i32)) + crate_g1577(Bare))
+    let r: i32 = match v
+        Packed(x) => x as i32
+        Bare => 99
+    assert r == 41
+    0
+
+# Two calls deep: Option<i64> let -> Option<i32> param -> Option<i64> param.
+[[test]]
+fn test_let_nested_two_deep() -> i32
+    let v: Option<i64> = Some(g1577(Some(k1577(Some(20 as i64)))) + g1577(None))
+    assert opt1577(v) == 41
+    0

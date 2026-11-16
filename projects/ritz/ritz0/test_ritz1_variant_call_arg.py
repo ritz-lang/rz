@@ -83,8 +83,8 @@ pub fn main() -> i32
 
 # A typed let's context must not leak into a call argument inside its
 # initialiser: `let v: Option<i64> = wrap(g(Some(..)))` with g taking
-# Option<i32>. (The `Some(g(Some(..)))` spelling is avoided: ritz0 itself
-# leaks the let's type there — AGAST #1577.)
+# Option<i32>. The `Some(g(Some(..)))` spelling, and its method-call forms,
+# are in test_variant_arg_param_hint.py (AGAST #1577).
 LET_CTX_LEAK = """\
 fn g(o: Option<i32>) -> i64
     let r: i64 = match o
