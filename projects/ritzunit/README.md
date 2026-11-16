@@ -112,6 +112,12 @@ SIGKILL then interrupts the dump, and the crash is reported as a timeout. With
 both settings off, a crash is reported as a crash at once, and no core files
 or crash reports are left behind (AGAST #2072).
 
+A non-dumpable process cannot read its own `/proc/self/environ`, which is
+where `ritzlib.os.env` loads the environment from. So the runner loads that
+cache before it forks, and every child inherits it (AGAST #3725). Outside
+ritzunit, a program that drops dumpable before its first environment read
+still sees an empty environment; AGAST #3737 tracks that.
+
 To debug a crash from its core file, pass `--core`. Children then keep the
 runner's own dumpable flag and core limit, so raise the limit first:
 

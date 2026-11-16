@@ -12,6 +12,7 @@ on any core_pattern. The core-file tests need a plain (non-pipe) pattern.
 """
 
 import json
+import os
 import resource
 import subprocess
 import sys
@@ -59,6 +60,27 @@ fn crashes() -> i32
 """
 
 
+# AGAST #3725: a non-dumpable child cannot read /proc/self/environ (the kernel
+# makes /proc/self/* root-owned), which is where ritzlib.os.env loads from.
+# Exit codes: 30 empty environment, 31 the variable is missing or wrong,
+# 32 env_raw_envp() is empty, 0 the child sees its environment.
+ENV_PROBE = """\
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.os.env
+
+[[test]]
+fn probe_env() -> i32
+    if env_iter().len == 0
+        return 30
+    if not strview_eq(env_get_or("RITZUNIT_ENV_PROBE", ""), "seen")
+        return 31
+    if *env_raw_envp() == null
+        return 32
+    0
+"""
+
+
 def _core_pattern() -> str:
     try:
         return Path("/proc/sys/kernel/core_pattern").read_text().strip()
@@ -77,14 +99,15 @@ def _cores_possible() -> bool:
     return hard != 0
 
 
-def _run(exe: str, cwd: Path, *args: str) -> dict:
+def _run(exe: str, cwd: Path, *args: str, env: dict | None = None) -> dict:
     proc = subprocess.run([exe, "--json", *args], check=False, capture_output=True, timeout=60,
-                          cwd=cwd, preexec_fn=_allow_cores)
+                          cwd=cwd, preexec_fn=_allow_cores, env=env)
     return json.loads(proc.stdout)
 
 
 def _exit_codes(report: dict) -> dict:
-    return {t["name"]: t["exit_code"] for t in report["tests"]}
+    # A passing test's record has no exit_code: it returned 0.
+    return {t["name"]: t.get("exit_code", 0) for t in report["tests"]}
 
 
 @pytest.mark.skipif(not _cores_possible(), reason="hard RLIMIT_CORE is 0")
@@ -101,6 +124,15 @@ def test_core_flag_keeps_the_runners_settings(package, tmp_path):
     exe = _binary(package(PROBES), tmp_path)
     codes = _exit_codes(_run(exe, tmp_path, "--core"))
     assert codes == {"probe_dumpable": 11, "probe_core_limit": 21}
+
+
+@pytest.mark.parametrize("args", [["-j", "1"], ["-j", "2"], ["--core"], ["--no-fork"]],
+                         ids=["j1", "j2", "core", "no-fork"])
+def test_child_reads_its_environment(package, tmp_path, args):
+    """AGAST #3725: the test sees its environment though it cannot dump core."""
+    exe = _binary(package(ENV_PROBE), tmp_path)
+    env = dict(os.environ, RITZUNIT_ENV_PROBE="seen")
+    assert _exit_codes(_run(exe, tmp_path, *args, env=env)) == {"probe_env": 0}
 
 
 def test_crash_under_a_short_timeout_is_a_crash(package, tmp_path):
