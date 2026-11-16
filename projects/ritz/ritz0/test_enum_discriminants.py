@@ -644,6 +644,45 @@ def test_deref_enum_ptr(compiler, tmp_path):
     assert _run(compiler, tmp_path, DEREF_ENUM_PTR) == 42
 
 
+# AGAST #3041: `x as E` with `x` already an `E` is `x` itself, for a fieldless
+# enum and one that carries data alike.  ritz1 lowered it as enum → int and
+# refused the data-carrying one ("cannot convert enum 'B' to an integer").
+ENUM_IDENTITY_CAST = """\
+enum B
+    V
+    Q(i32)
+
+enum St: u8
+    Ok
+    Bad = 5
+
+fn same(b: B) -> B
+    b as B
+
+fn pick(b: B) -> i32
+    match b as B
+        V => 1
+        Q(x) => x
+
+fn main() -> i32
+    let b: B = B.Q(4)
+    let c: B = b as B
+    var r: i32 = match c
+        V => 100
+        Q(x) => x                   # 4
+    r = r + pick(b) * 10            # 44
+    r = r + pick(same(B.V)) * 100   # 144
+    let s: St = St.Bad
+    let t: St = s as St
+    r + (t as i32) - 102            # 47
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_enum_identity_cast(compiler, tmp_path):
+    assert _run(compiler, tmp_path, ENUM_IDENTITY_CAST) == 47
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(REJECTS))
 def test_rejected(compiler, case, tmp_path):

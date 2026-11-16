@@ -3688,6 +3688,21 @@ fn main() -> i32
     Shape.Empty as i32
 ```
 
+**`e as E`**, with `e` already an `E`, is `e` itself, for every enum,
+including one that carries data (AGAST #3041):
+
+```ritz
+enum B
+    V
+    Q(i32)
+
+fn main() -> i32
+    let b: B = B.Q(4)
+    match b as B
+        V => 1
+        Q(x) => x
+```
+
 **`n as E`**, an integer to an enum, is an error for every enum, fieldless,
 with a representation type or carrying data, located at the `as`: an
 integer may name no variant (LARB R19, AGAST #3040). `match` on the integer
