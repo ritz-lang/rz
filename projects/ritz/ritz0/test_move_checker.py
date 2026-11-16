@@ -2755,3 +2755,64 @@ fn g(a: [2]i32) -> i32
     return first<i32>(a)
 """))
         assert [e.reason for e in MoveChecker().check_instances(module)] == [MOVE_OUT_OF_ELEMENT]
+
+
+class TestIfElseJoinAndSizeof:
+    """Paths no other case here reached, found by AGAST #3449's mutation
+    check of the per-kind dispatch (move_walk.py): the if/else join when
+    neither branch returns, and `sizeof`'s unevaluated operand (#2124)."""
+
+    RES = """
+struct Res
+    fd: i32
+
+struct Pair
+    a: Res
+    b: Res
+
+fn consume(r: Res)
+    pass
+
+fn consume_pair(p: Pair)
+    pass
+""" + drop_impl("Res")
+
+    def test_moved_in_one_branch_is_moved_after_the_if_else(self):
+        errors = check(self.RES + """
+fn main() -> i32
+    var r: Res = Res { fd: 1 }
+    var c: i32 = 1
+    if c > 0
+        consume(r)
+    else
+        c = 2
+    consume(r)
+    0
+""")
+        assert [e.reason for e in errors if "use of moved value: `r`" in e.reason], errors
+
+    def test_field_moved_in_one_branch_is_moved_after_the_if_else(self):
+        """The then branch's: the else branch starts from the state before
+        the `if`, so only the join brings the then branch's move back."""
+        errors = check(self.RES + """
+fn main() -> i32
+    var p: Pair = Pair { a: Res { fd: 1 }, b: Res { fd: 2 } }
+    var c: i32 = 1
+    if c > 0
+        let t: Res = p.a
+    else
+        c = 2
+    consume_pair(p)
+    0
+""")
+        assert [e.reason for e in errors if "use of moved value: `p.a`" in e.reason], errors
+
+    def test_sizeof_does_not_move_its_operand(self):
+        errors = check(self.RES + """
+fn main() -> i32
+    var r: Res = Res { fd: 1 }
+    let n: i64 = sizeof(r)
+    consume(r)
+    0
+""")
+        assert errors == []

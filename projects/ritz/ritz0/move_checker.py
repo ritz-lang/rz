@@ -14,346 +14,21 @@ This runs after parsing/name resolution, before code generation.
 
 import copy
 from typing import Dict, Set, List, Optional, Tuple
-from dataclasses import dataclass, field
-from enum import Enum, auto
 import array_rules
-import deref_rules
 import ref_rules
 from metadata import type_to_string
 import ritz_ast as rast
 from ufcs import UFCS_NON_GENERIC_PREFIXES
+# The state lives in move_state.py, the per-node-kind walk in move_walk.py
+# (AGAST #3449); every name move_state defines is still importable from here.
+from move_state import (  # noqa: F401 (re-exported)
+    OwnershipError, VarState, Loan, VarInfo, Scope, field_path, path_within,
+    _is_lending_param, _element_of, _lends_mut, MoveTypes, _type_key, _subst,
+)
+from move_walk import MoveWalk
 
 
-class OwnershipError(Exception):
-    """Error for ownership/borrowing violations. `after_move` marks a use or
-    a borrow of a value that already moved: at a move-only `T` a generic
-    instance can do that where its generic body doesn't (AGAST #2921)."""
-    def __init__(self, message: str, span = None, after_move: bool = False):
-        self.span = span
-        self.reason = message
-        self.after_move = after_move
-        if span:
-            super().__init__(f"{span.file}:{span.line}:{span.column}: {message}")
-        else:
-            super().__init__(message)
-
-
-class VarState(Enum):
-    """State of a variable in the ownership system. Whether it's borrowed is
-    in VarInfo.borrows."""
-    OWNED = auto()       # Variable owns its value
-    MOVED = auto()       # Value has been moved out
-
-
-@dataclass(eq=False)
-class Loan:
-    """An `@` or `@&` of a place, on the place's root (AGAST #2438). One made
-    inside a statement ends with it; `holder` is the binding a declaration gave
-    it to, and it ends with that binding's block (_pop_scope)."""
-    span: Optional[rast.Span]
-    mutable: bool
-    holder: Optional['VarInfo'] = field(default=None, repr=False)
-    # The place's steps below the root: a field's name, or '[]' for an index
-    # (R11a: any two indexes count as equal). `@c.x` is ('x',).
-    path: Tuple[str, ...] = ()
-    # A `for`'s loan on the place its iterable indexes into (AGAST #2439): only
-    # a use of that place, or of one holding it, can move the buffer, so only
-    # those conflict. `vs[0].a[2] = 50` is inside `vs` and stays legal.
-    outer: bool = False
-
-
-@dataclass
-class VarInfo:
-    """Information about a variable's ownership state."""
-    name: str
-    ritz_type: rast.Type
-    state: VarState = VarState.OWNED
-    # Where the variable was defined
-    def_span: Optional[rast.Span] = None
-    # Where the variable was moved (if moved)
-    move_span: Optional[rast.Span] = None
-    # The loans of this binding, or of a place in it, still active.
-    borrows: List[Loan] = field(default_factory=list)
-    # Borrow semantics for parameters (CONST/MUTABLE/MOVE)
-    # If set, this parameter is a borrow and is effectively Copy
-    borrow: Optional[rast.Borrow] = None
-    # Move-only fields moved out of the binding (a partial move, §13.6,
-    # AGAST #2171, #2232): dotted path below the binding (`f`, `f.g`) ->
-    # where. The binding stays usable through its other fields; using it
-    # whole, the moved field, a parent of it or a part of it is an error.
-    moved_fields: Dict[str, rast.Span] = field(default_factory=dict)
-
-
-@dataclass
-class Scope:
-    """A lexical scope for tracking variable ownership."""
-    parent: Optional['Scope'] = None
-    vars: Dict[str, VarInfo] = field(default_factory=dict)
-
-    def lookup(self, name: str) -> Optional[VarInfo]:
-        """Look up a variable in this scope or parents."""
-        if name in self.vars:
-            return self.vars[name]
-        if self.parent:
-            return self.parent.lookup(name)
-        return None
-
-    def define(self, name: str, ritz_type: rast.Type, span: Optional[rast.Span] = None, borrow: Optional[rast.Borrow] = None):
-        """Define a new variable in this scope."""
-        self.vars[name] = VarInfo(name, ritz_type, VarState.OWNED, span, borrow=borrow)
-
-    def save_states(self) -> Dict[str, Tuple[VarState, Optional[rast.Span], Dict[str, rast.Span]]]:
-        """Save variable states (for control flow analysis)."""
-        states = {}
-        for name, info in self.vars.items():
-            states[name] = (info.state, info.move_span, dict(info.moved_fields))
-        if self.parent:
-            states.update(self.parent.save_states())
-        return states
-
-    def restore_states(self, states: Dict[str, Tuple[VarState, Optional[rast.Span], Dict[str, rast.Span]]]):
-        """Restore variable states."""
-        for name, (state, move_span, fields) in states.items():
-            info = self.lookup(name)
-            if info:
-                info.state = state
-                info.move_span = move_span
-                info.moved_fields = dict(fields)
-
-
-def field_path(expr: rast.Expr) -> Optional[Tuple[str, str]]:
-    """`b.f.g` as the binding name and the dotted path below it, ("b", "f.g").
-    None for anything else. Move tracking and drop flags are keyed on these
-    paths, so the checker and the emitter share this."""
-    parts: List[str] = []
-    while isinstance(expr, rast.Field):
-        parts.append(expr.field)
-        expr = expr.expr
-    if not parts or not isinstance(expr, rast.Ident):
-        return None
-    return expr.name, '.'.join(reversed(parts))
-
-
-def path_within(path: str, parent: str) -> bool:
-    """Is the dotted field path `path` the field `parent` or a part of it?"""
-    return path == parent or path.startswith(parent + '.')
-
-
-def _is_lending_param(param: Optional[rast.Param]) -> bool:
-    """A parameter that borrows its argument rather than taking ownership:
-    `@T`, `@&T`, `*T` (auto-borrow, AGAST #1290) or `name:& T`."""
-    if param is None:
-        return False
-    if getattr(param, 'borrow', None) == rast.Borrow.MUTABLE:
-        return True
-    return isinstance(param.type, (rast.RefType, rast.PtrType))
-
-
-
-def _element_of(ty: Optional[rast.Type]) -> Optional[rast.Type]:
-    """What `[]` reads from a Vec<T> or Span<T> (T) or a String (u8), else
-    None. The emitter's twin is Emitter._buffer_field_path."""
-    if not isinstance(ty, rast.NamedType):
-        return None
-    if ty.name in ('Vec', 'Span') and len(ty.args) == 1:
-        return ty.args[0]
-    if ty.name == 'String' and not ty.args:
-        return rast.NamedType(ty.span, 'u8', [])
-    return None
-
-
-def _lends_mut(param: rast.Param) -> bool:
-    """`name:& T` or `name: @&T`: a mutable borrow of the argument's place.
-    Not `*T` (#2371) or `@T`."""
-    if getattr(param, 'borrow', None) == rast.Borrow.MUTABLE:
-        return True
-    return isinstance(param.type, rast.RefType) and param.type.mutable
-
-class MoveTypes:
-    """Which types are move-only (LANGUAGE_SPEC §13.1, AGAST #1854/#2157).
-
-    A type is move-only iff it implements `Drop`, or it has a field, an
-    enum-variant payload or a generic argument that is move-only, checked
-    transitively. Every other type copies. A name this module doesn't
-    define (a type parameter, a type inference couldn't name) is a copy
-    type: a wrong "copy" only skips a use-after-move error, while a wrong
-    "move" rejects valid programs, which is what #1489 and #1548 were.
-    Shared by the move checker and the emitter's drop glue.
-    """
-
-    def __init__(self, module: rast.Module):
-        self.drop_types: Set[str] = set()
-        self.structs: Dict[str, rast.StructDef] = {}
-        self.enums: Dict[str, rast.EnumDef] = {}
-        self.aliases: Dict[str, rast.Type] = {}
-        self.derefs: Dict[str, rast.ImplBlock] = {}   # `impl Deref for S` (§7.7)
-        for item in module.items:
-            if isinstance(item, rast.ImplBlock) and item.trait_name == 'Deref':
-                self.derefs[item.type_name] = item
-            if isinstance(item, rast.ImplBlock) and item.trait_name == 'Drop':
-                self.drop_types.add(item.type_name)
-            elif isinstance(item, rast.StructDef):
-                self.structs[item.name] = item
-            elif isinstance(item, rast.EnumDef):
-                self.enums[item.name] = item
-            elif isinstance(item, rast.TypeAlias):
-                self.aliases[item.name] = item.target
-        # The type parameters of the generic fn or impl being checked. They
-        # shadow any type of the same name (AGAST #2966): in `fn take<T>` the
-        # `T` is the parameter, a copy type here, not a `struct T`.
-        self.params: frozenset = frozenset()
-        self._caches: dict[frozenset, dict[str, bool]] = {}
-        self._cache: dict[str, bool] = self._caches.setdefault(self.params, {})
-
-    def set_params(self, names) -> None:
-        """Check under the type parameters `names` (empty outside a generic).
-        Each set keeps its own cache: `Wrap<T>` differs with `T` shadowed."""
-        self.params = frozenset(names)
-        self._cache = self._caches.setdefault(self.params, {})
-
-    def _is_param(self, ty: rast.Type | None) -> bool:
-        return isinstance(ty, rast.NamedType) and not ty.args and ty.name in self.params
-
-    def has_own_drop(self, ty: rast.Type) -> bool:
-        return isinstance(ty, rast.NamedType) and ty.name in self.drop_types
-
-    def resolve(self, ty: Optional[rast.Type]) -> Optional[rast.Type]:
-        """`ty` with type aliases followed."""
-        seen: Set[str] = set()
-        while (isinstance(ty, rast.NamedType) and not ty.args
-               and ty.name in self.aliases and ty.name not in seen):
-            seen.add(ty.name)
-            ty = self.aliases[ty.name]
-        return ty
-
-    def is_move_only(self, ty: Optional[rast.Type]) -> bool:
-        if ty is None:
-            return False
-        key = _type_key(ty)
-        if key not in self._cache:
-            self._cache[key] = False      # cycle guard: a recursive type
-            self._cache[key] = self._compute(ty)
-        return self._cache[key]
-
-    def _compute(self, ty: rast.Type) -> bool:
-        if isinstance(ty, rast.NamedType):
-            if self._is_param(ty):
-                return False
-            if ty.name in self.drop_types:
-                return True
-            if any(self.is_move_only(a) for a in ty.args):
-                return True
-            if ty.name in self.aliases and not ty.args:
-                return self.is_move_only(self.aliases[ty.name])
-            if ty.name in self.structs:
-                return any(self.is_move_only(t) for _n, t in self.struct_fields(ty))
-            if ty.name in self.enums:
-                return any(self.is_move_only(t)
-                           for v in self.enums[ty.name].variants for t in v.fields)
-            return False
-        if isinstance(ty, rast.ArrayType):
-            return self.is_move_only(ty.inner)
-        if isinstance(ty, rast.TupleType):
-            return any(self.is_move_only(t) for t in ty.elements)
-        # Pointers, references, fn types, SIMD vectors: copies.
-        return False
-
-    def holds_reference(self, ty: Optional[rast.Type], seen: Optional[Set[str]] = None) -> bool:
-        """`ty` is a pointer or reference, or a struct, enum, tuple or array
-        holding one (AGAST #3215). A type parameter holds none."""
-        ty = self.resolve(ty)
-        if isinstance(ty, (rast.PtrType, rast.RefType, rast.SliceType)):
-            return True
-        if isinstance(ty, rast.ArrayType):
-            return self.holds_reference(ty.inner, seen)
-        if isinstance(ty, rast.TupleType):
-            return any(self.holds_reference(t, seen) for t in ty.elements)
-        if not isinstance(ty, rast.NamedType) or self._is_param(ty):
-            return False
-        seen = set() if seen is None else seen
-        key = _type_key(ty)
-        if key in seen:
-            return False      # a recursive type: its other fields decide
-        seen.add(key)
-        if ty.name in self.structs:
-            return any(self.holds_reference(t, seen) for _n, t in self.struct_fields(ty))
-        ed = self.enums.get(ty.name)
-        if ed is not None:
-            subst = dict(zip(ed.type_params or [], ty.args))
-            return any(self.holds_reference(_subst(t, subst), seen)
-                       for v in ed.variants for t in v.fields)
-        return False
-
-    def variant_value_type(self, expr: rast.Expr, is_binding) -> Optional[rast.Type]:
-        """The enum type of a qualified variant value, `E.V` or `E.V(...)`,
-        when `E` is a non-generic enum declaring `V` and not a binding
-        (`is_binding(name)`). None for anything else."""
-        if isinstance(expr, rast.Field):
-            base, name = expr.expr, expr.field
-        elif isinstance(expr, rast.MethodCall):
-            base, name = expr.expr, expr.method
-        else:
-            return None
-        if not isinstance(base, rast.Ident) or is_binding(base.name):
-            return None
-        ed = self.enums.get(base.name)
-        if ed is None or ed.type_params or not any(v.name == name for v in ed.variants):
-            return None
-        return rast.NamedType(expr.span, ed.name, [])
-
-    def deref_target(self, ty: rast.NamedType) -> Optional[rast.Type]:
-        """The T `impl Deref for S` reaches (its `deref`'s `@T`), at `ty`'s
-        type arguments; None when S doesn't implement `Deref` (§7.7)."""
-        impl = self.derefs.get(ty.name)
-        if impl is None:
-            return None
-        for m in impl.methods:
-            if m.name == 'deref' and isinstance(m.ret_type, (rast.RefType, rast.PtrType)):
-                params = [a.name for a in impl.impl_type.args
-                          if isinstance(a, rast.NamedType)] if impl.impl_type else []
-                return _subst(m.ret_type.inner, dict(zip(params, ty.args)))
-        return None
-
-    def struct_fields(self, ty: rast.NamedType) -> List[Tuple[str, rast.Type]]:
-        """The struct's fields with its type parameters replaced by `ty`'s args."""
-        sd = self.structs.get(ty.name)
-        if sd is None:
-            return []
-        subst = dict(zip(sd.type_params or [], ty.args))
-        return [(n, _subst(t, subst)) for n, t in sd.fields]
-
-
-def _type_key(ty: rast.Type) -> str:
-    if isinstance(ty, rast.NamedType):
-        if ty.args:
-            return f"{ty.name}<{','.join(_type_key(a) for a in ty.args)}>"
-        return ty.name
-    if isinstance(ty, rast.ArrayType):
-        return f"[{ty.size}]{_type_key(ty.inner)}"
-    if isinstance(ty, rast.TupleType):
-        return f"({','.join(_type_key(t) for t in ty.elements)})"
-    if isinstance(ty, (rast.PtrType, rast.RefType)):
-        return f"*{_type_key(ty.inner)}"
-    return type(ty).__name__
-
-
-def _subst(ty: rast.Type, subst: Dict[str, rast.Type]) -> rast.Type:
-    if not subst:
-        return ty
-    if isinstance(ty, rast.NamedType):
-        if not ty.args and ty.name in subst:
-            return subst[ty.name]
-        if ty.args:
-            return rast.NamedType(ty.span, ty.name, [_subst(a, subst) for a in ty.args])
-        return ty
-    if isinstance(ty, rast.ArrayType):
-        return rast.ArrayType(ty.span, ty.size, _subst(ty.inner, subst))
-    if isinstance(ty, rast.TupleType):
-        return rast.TupleType(ty.span, [_subst(t, subst) for t in ty.elements])
-    return ty
-
-
-class MoveChecker:
+class MoveChecker(MoveWalk):
     """
     Checks ownership and borrowing rules.
 
@@ -467,10 +142,9 @@ class MoveChecker:
         for fn in fns:
             if any(self.types.is_move_only(a) for a in getattr(fn, 'instance_args', ())):
                 self._check_fn(copy.deepcopy(fn))
-        self.errors = [e for e in self.errors
-                       if e.reason in (ref_rules.MOVE_OUT_OF_REF, array_rules.FILL_MOVE_ONLY,
-                                       array_rules.MOVE_OUT_OF_ELEMENT)
-                       or e.after_move]
+        kept = (ref_rules.MOVE_OUT_OF_REF, array_rules.FILL_MOVE_ONLY,
+                array_rules.MOVE_OUT_OF_ELEMENT)
+        self.errors = [e for e in self.errors if e.reason in kept or e.after_move]
         self._drop_repeats()
         return self.errors
 
@@ -489,12 +163,16 @@ class MoveChecker:
                 self.fn_params[item.name] = list(item.params)
             elif isinstance(item, rast.ImplBlock):
                 for m in item.methods:
-                    self.methods.setdefault(m.name, []).append(m)
-                    self.type_methods.setdefault((item.type_name, m.name), []).append(m)
-                    self.method_impl[id(m)] = item
-                    if item.trait_name == 'Drop' and m.name == 'drop' and m.params \
-                            and m.params[0].name == 'self' and not _is_lending_param(m.params[0]):
-                        self.errors.append(OwnershipError(ref_rules.DROP_BY_VALUE, m.params[0].span))
+                    self._collect_method(item, m)
+
+    def _collect_method(self, impl: rast.ImplBlock, m: rast.FnDef) -> None:
+        """An impl's method, for _collect; `Drop.drop` must lend `self`."""
+        self.methods.setdefault(m.name, []).append(m)
+        self.type_methods.setdefault((impl.type_name, m.name), []).append(m)
+        self.method_impl[id(m)] = impl
+        if impl.trait_name == 'Drop' and m.name == 'drop' and m.params \
+                and m.params[0].name == 'self' and not _is_lending_param(m.params[0]):
+            self.errors.append(OwnershipError(ref_rules.DROP_BY_VALUE, m.params[0].span))
 
     def _drop_repeats(self) -> None:
         """A loop body checked twice (_check_loop) reports its errors twice,
@@ -512,125 +190,157 @@ class MoveChecker:
         return not self.types.is_move_only(ty)
 
     def _infer_expr_type(self, expr: rast.Expr) -> rast.Type:
-        """Infer the type of an expression for ownership checking.
+        """Infer the type of an expression for ownership checking, by its
+        kind (EXPR_TYPES); `unknown` for a kind with no entry.
 
         Returns a basic type so we can determine if it's Copy.
         This doesn't need to be as complete as the type checker - just enough
         to identify Copy types like pointers and primitives.
         """
-        if isinstance(expr, rast.IntLit):
-            return rast.NamedType(expr.span, 'i64', [])
-        elif isinstance(expr, rast.FloatLit):
-            return rast.NamedType(expr.span, 'f64', [])
-        elif isinstance(expr, rast.BoolLit):
-            return rast.NamedType(expr.span, 'bool', [])
-        elif isinstance(expr, rast.CharLit):
-            return rast.NamedType(expr.span, 'u8', [])
-        elif isinstance(expr, rast.StringLit):
-            # Bare string literals produce StrView (AGAST #98).
-            # StrView is Copy (ptr + len view, no ownership).
-            return rast.NamedType(expr.span, 'StrView', [])
-        elif isinstance(expr, rast.CStringLit):
-            # C-string literals: c"hello" -> *u8 (Copy)
-            return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
-        # Note: SpanStringLit (s"...") was removed in AGAST #98 — bare
-        # StringLit now produces StrView of the same { ptr, len } shape.
-        elif isinstance(expr, rast.NullLit):
-            # Null is a special pointer type (Copy)
-            return rast.PtrType(expr.span, rast.NamedType(expr.span, 'void', []), mutable=False)
-        elif isinstance(expr, rast.Ident):
-            info = self.scope.lookup(expr.name)
-            if info:
-                return info.ritz_type
-            # A module-level `var` (AGAST #2269) has its declared type. Nothing
-            # tracks the global itself: it is never dropped, so a move-only
-            # value can't be moved out of it (LARB R34, _check_global_move_out).
-            if expr.name in self.globals:
-                return self.globals[expr.name]
+        infer = self.EXPR_TYPES.get(type(expr))
+        if infer is None:
             return rast.NamedType(expr.span, 'unknown', [])
-        elif isinstance(expr, rast.UnaryOp):
-            if expr.op in ('&', '@'):
-                inner = self._infer_expr_type(expr.operand)
-                return rast.PtrType(expr.span, inner, mutable=False)
-            elif expr.op in ('&mut', '@&'):
-                inner = self._infer_expr_type(expr.operand)
-                return rast.PtrType(expr.span, inner, mutable=True)
-            elif expr.op == '*':
-                inner = self._infer_expr_type(expr.operand)
-                if isinstance(inner, rast.PtrType):
-                    return inner.inner
-                return rast.NamedType(expr.span, 'unknown', [])
-            return self._infer_expr_type(expr.operand)
-        elif isinstance(expr, rast.BinOp):
-            return self._infer_expr_type(expr.left)
-        elif isinstance(expr, rast.Cast):
-            return expr.target
-        elif isinstance(expr, rast.StructLit):
-            # With its type arguments (AGAST #2263): `Box<T> { .. }` holds a
-            # T, and a method on it returns `T`, not an unsubstituted `X`.
-            return rast.NamedType(expr.span, expr.name, list(expr.type_args or []))
-        elif isinstance(expr, rast.ArrayLit):
-            if expr.elements:
-                inner = self._infer_expr_type(expr.elements[0])
-                return rast.ArrayType(expr.span, len(expr.elements), inner)
-            return rast.NamedType(expr.span, 'unknown', [])
-        elif self.types.variant_value_type(
-                expr, lambda n: self.scope.lookup(n) is not None) is not None:
-            return self.types.variant_value_type(
-                expr, lambda n: self.scope.lookup(n) is not None)
-        elif isinstance(expr, rast.TupleLit):
-            return rast.TupleType(expr.span, [self._infer_expr_type(e) for e in expr.elements])
-        elif isinstance(expr, rast.Field):
-            # What the field declares (AGAST #2243): the emitter types the
-            # binding from that too. A qualified variant is handled above.
-            return (self._field_path_type(expr)
-                    or rast.NamedType(expr.span, 'unknown', []))
-        elif isinstance(expr, rast.Call):
-            # Look up function return type
-            if isinstance(expr.func, rast.Ident):
-                fn_name = expr.func.name
-                if fn_name in self.fn_return_types:
-                    return self.fn_return_types[fn_name]
-            # Unknown function or no return type
-            return rast.NamedType(expr.span, 'unknown', [])
-        elif isinstance(expr, rast.Match):
-            # What its arms give, typed as they were checked (AGAST #2178).
-            return (getattr(expr, 'value_type', None)
-                    or rast.NamedType(expr.span, 'unknown', []))
-        elif isinstance(expr, rast.TryOp):
-            # TryOp (?) unwraps Result<T, E> to T or Option<T> to T
-            # Infer the inner type from the expression's Result/Option
-            inner = self._infer_expr_type(expr.expr)
-            if isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option'):
-                # The ok/some type is the first type argument
-                if inner.args:
-                    return inner.args[0]
-            # Fallback: return unknown (could be any type)
-            return rast.NamedType(expr.span, 'unknown', [])
-        elif isinstance(expr, rast.MethodCall):
-            # What the method declares, on the receiver's own type (AGAST
-            # #2257): the emitter types the binding from that too.
-            declared = self._method_return_type(expr)
-            if declared is not None:
-                return declared
-            # Otherwise (a builtin, a UFCS fallback), go by the method's name.
-            method = expr.method
-            # Common methods that return Copy types
-            if method in ('len', 'cap', 'count', 'size', 'is_empty', 'is_some', 'is_none',
-                          'is_ok', 'is_err', 'contains', 'unwrap_or'):
-                # These typically return usize, i64, or bool - all Copy
-                return rast.NamedType(expr.span, 'i64', [])
-            # read_* methods return Result<primitive>
-            if method.startswith('read_'):
-                type_suffix = method[5:]  # e.g., "u16", "u32", "i8", etc.
-                if type_suffix in self.PRIMITIVES:
-                    return rast.NamedType(expr.span, 'Result', [
-                        rast.NamedType(expr.span, type_suffix, [])
-                    ])
-            # Fallback to unknown
-            return rast.NamedType(expr.span, 'unknown', [])
-        # Default to unknown
+        return infer(self, expr)
+
+    def _type_of_ident(self, expr: rast.Ident) -> rast.Type:
+        info = self.scope.lookup(expr.name)
+        if info:
+            return info.ritz_type
+        # A module-level `var` (AGAST #2269) has its declared type. Nothing
+        # tracks the global itself: it is never dropped, so a move-only
+        # value can't be moved out of it (LARB R34, _check_global_move_out).
+        if expr.name in self.globals:
+            return self.globals[expr.name]
         return rast.NamedType(expr.span, 'unknown', [])
+
+    def _type_of_unary(self, expr: rast.UnaryOp) -> rast.Type:
+        if expr.op in ('&', '@'):
+            inner = self._infer_expr_type(expr.operand)
+            return rast.PtrType(expr.span, inner, mutable=False)
+        elif expr.op in ('&mut', '@&'):
+            inner = self._infer_expr_type(expr.operand)
+            return rast.PtrType(expr.span, inner, mutable=True)
+        elif expr.op == '*':
+            inner = self._infer_expr_type(expr.operand)
+            if isinstance(inner, rast.PtrType):
+                return inner.inner
+            return rast.NamedType(expr.span, 'unknown', [])
+        return self._infer_expr_type(expr.operand)
+
+    def _type_of_binop(self, expr: rast.BinOp) -> rast.Type:
+        return self._infer_expr_type(expr.left)
+
+    def _type_of_cast(self, expr: rast.Cast) -> rast.Type:
+        return expr.target
+
+    def _type_of_struct_lit(self, expr: rast.StructLit) -> rast.Type:
+        # With its type arguments (AGAST #2263): `Box<T> { .. }` holds a
+        # T, and a method on it returns `T`, not an unsubstituted `X`.
+        return rast.NamedType(expr.span, expr.name, list(expr.type_args or []))
+
+    def _type_of_array_lit(self, expr: rast.ArrayLit) -> rast.Type:
+        if expr.elements:
+            inner = self._infer_expr_type(expr.elements[0])
+            return rast.ArrayType(expr.span, len(expr.elements), inner)
+        return rast.NamedType(expr.span, 'unknown', [])
+
+    def _type_of_tuple_lit(self, expr: rast.TupleLit) -> rast.Type:
+        return rast.TupleType(expr.span, [self._infer_expr_type(e) for e in expr.elements])
+
+    def _variant_value_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """`E.V` or `E.V(...)`'s enum type, unless `E` is a binding."""
+        return self.types.variant_value_type(
+            expr, lambda n: self.scope.lookup(n) is not None)
+
+    def _type_of_field(self, expr: rast.Field) -> rast.Type:
+        variant = self._variant_value_type(expr)
+        if variant is not None:
+            return variant
+        # What the field declares (AGAST #2243): the emitter types the
+        # binding from that too.
+        return (self._field_path_type(expr)
+                or rast.NamedType(expr.span, 'unknown', []))
+
+    def _type_of_call(self, expr: rast.Call) -> rast.Type:
+        # Look up function return type
+        if isinstance(expr.func, rast.Ident):
+            fn_name = expr.func.name
+            if fn_name in self.fn_return_types:
+                return self.fn_return_types[fn_name]
+        # Unknown function or no return type
+        return rast.NamedType(expr.span, 'unknown', [])
+
+    def _type_of_match(self, expr: rast.Match) -> rast.Type:
+        # What its arms give, typed as they were checked (AGAST #2178).
+        return (getattr(expr, 'value_type', None)
+                or rast.NamedType(expr.span, 'unknown', []))
+
+    def _type_of_try(self, expr: rast.TryOp) -> rast.Type:
+        # TryOp (?) unwraps Result<T, E> to T or Option<T> to T
+        # Infer the inner type from the expression's Result/Option
+        inner = self._infer_expr_type(expr.expr)
+        if isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option'):
+            # The ok/some type is the first type argument
+            if inner.args:
+                return inner.args[0]
+        # Fallback: return unknown (could be any type)
+        return rast.NamedType(expr.span, 'unknown', [])
+
+    def _type_of_method_call(self, expr: rast.MethodCall) -> rast.Type:
+        variant = self._variant_value_type(expr)
+        if variant is not None:
+            return variant
+        # What the method declares, on the receiver's own type (AGAST
+        # #2257): the emitter types the binding from that too.
+        declared = self._method_return_type(expr)
+        if declared is not None:
+            return declared
+        # Otherwise (a builtin, a UFCS fallback), go by the method's name.
+        method = expr.method
+        # Common methods that return Copy types
+        if method in ('len', 'cap', 'count', 'size', 'is_empty', 'is_some', 'is_none',
+                      'is_ok', 'is_err', 'contains', 'unwrap_or'):
+            # These typically return usize, i64, or bool - all Copy
+            return rast.NamedType(expr.span, 'i64', [])
+        # read_* methods return Result<primitive>
+        if method.startswith('read_'):
+            type_suffix = method[5:]  # e.g., "u16", "u32", "i8", etc.
+            if type_suffix in self.PRIMITIVES:
+                return rast.NamedType(expr.span, 'Result', [
+                    rast.NamedType(expr.span, type_suffix, [])
+                ])
+        # Fallback to unknown
+        return rast.NamedType(expr.span, 'unknown', [])
+
+    # Every kind _infer_expr_type types, by class (see move_walk.py's
+    # EXPR_CHECKS on why `type(expr)` is enough).  Literals first.
+    EXPR_TYPES = {
+        rast.IntLit: lambda self, e: rast.NamedType(e.span, 'i64', []),
+        rast.FloatLit: lambda self, e: rast.NamedType(e.span, 'f64', []),
+        rast.BoolLit: lambda self, e: rast.NamedType(e.span, 'bool', []),
+        rast.CharLit: lambda self, e: rast.NamedType(e.span, 'u8', []),
+        # Bare string literals produce StrView (AGAST #98).
+        # StrView is Copy (ptr + len view, no ownership).
+        rast.StringLit: lambda self, e: rast.NamedType(e.span, 'StrView', []),
+        # C-string literals: c"hello" -> *u8 (Copy)
+        rast.CStringLit: lambda self, e: rast.PtrType(
+            e.span, rast.NamedType(e.span, 'u8', []), mutable=False),
+        # Null is a special pointer type (Copy)
+        rast.NullLit: lambda self, e: rast.PtrType(
+            e.span, rast.NamedType(e.span, 'void', []), mutable=False),
+        rast.Ident: _type_of_ident,
+        rast.UnaryOp: _type_of_unary,
+        rast.BinOp: _type_of_binop,
+        rast.Cast: _type_of_cast,
+        rast.StructLit: _type_of_struct_lit,
+        rast.ArrayLit: _type_of_array_lit,
+        rast.TupleLit: _type_of_tuple_lit,
+        rast.Field: _type_of_field,
+        rast.Call: _type_of_call,
+        rast.Match: _type_of_match,
+        rast.TryOp: _type_of_try,
+        rast.MethodCall: _type_of_method_call,
+    }
 
     def _destructured_types(self, value: rast.Expr, n: int) -> List[rast.Type]:
         """The types `let (x1, ..., xn) = value` gives its n names: the
@@ -656,8 +366,8 @@ class MoveChecker:
         scope = self.scope.parent
         while scope:
             for info in scope.vars.values():
-                info.borrows = [b for b in info.borrows
-                                if b.holder is None or id(b.holder) not in gone]
+                info.borrows = [
+                    b for b in info.borrows if b.holder is None or id(b.holder) not in gone]
             scope = scope.parent
         if self.scope.parent:
             self.scope = self.scope.parent
@@ -773,8 +483,8 @@ class MoveChecker:
 
     @staticmethod
     def _place_str(name: str, path: Tuple[str, ...]) -> str:
-        return name + ''.join('[_]' if s == '[]' else '' if s == '*' else f'.{s}'
-                              for s in path)
+        return name + ''.join(
+            '[_]' if s == '[]' else '' if s == '*' else f'.{s}' for s in path)
 
     def _through_deref(self, place: rast.Field) -> bool:
         """Is `place` a field its struct reaches through `Deref` (§7.7)?"""
@@ -895,8 +605,8 @@ class MoveChecker:
     def _check_fn(self, fn: rast.FnDef):
         """Check a function definition."""
         impl = self.method_impl.get(id(fn))
-        self.types.set_params(list(fn.type_params or [])
-                              + list((impl.type_params or []) if impl else []))
+        self.types.set_params(
+            list(fn.type_params or []) + list((impl.type_params or []) if impl else []))
         try:
             self._check_fn_body(fn)
         finally:
@@ -921,683 +631,6 @@ class MoveChecker:
         self._pop_scope()
         fn.field_moves = self._field_moves
         self.current_fn_name = None
-
-    def _check_block(self, block: rast.Block, value_used: bool = True) -> bool:
-        """Check a block expression.
-
-        `value_used` is False when nothing receives the block's value (a
-        procedure body, an `if` arm in statement position): its tail is then
-        a temporary, or a binding that stays owned, not a move (AGAST #2253).
-
-        Returns True if block definitely returns (via ReturnStmt).
-        """
-        self._defers.append([])
-        try:
-            for stmt in block.stmts:
-                returned = self._check_stmt(stmt)
-                if returned:
-                    # Rest of block is dead code - skip checking it
-                    # This prevents false positives like "use after move" when the
-                    # move is in a return and the "use" is after the return
-                    return True
-            if block.expr:
-                # A block's value is a statement of its own for loans: an arm's
-                # `@&c` doesn't meet the next arm's.
-                mark = len(self._arg_loans)
-                # A bare `t:& T` tail still reads the referent by value, used
-                # or not, as on ritz1 (AGAST #2949).
-                lent = (isinstance(block.expr, rast.Ident)
-                        and self._lent_param(block.expr) is not None)
-                self._check_expr(block.expr, is_move_context=value_used or lent)
-                self._release_arg_loans(mark)
-            # Falling off the end, after the tail value.
-            self._run_defers(len(self._defers) - 1)
-            return False
-        finally:
-            self._defers.pop()
-
-    def _run_defers(self, depth: int) -> None:
-        """Check the deferred statements of the blocks from `depth` up, innermost
-        first and LIFO, as if written here (an exit of those blocks). Each is
-        checked in the scope it was written in. A name it uses that is moved
-        here is an error at the `defer`; otherwise its own moves count, so a
-        deferred move is the binding's last use (LANGUAGE_SPEC §13.7)."""
-        for frame in reversed(self._defers[depth:]):
-            for stmt, scope in reversed(frame):
-                moved = self._moved_in_defer(stmt, scope)
-                if moved is not None:
-                    if id(stmt) not in self._refused_defers:
-                        self._refused_defers.add(id(stmt))
-                        self.errors.append(OwnershipError(
-                            f"`{moved}` may be moved before the deferred statement runs",
-                            stmt.span))
-                    continue
-                saved = self.scope
-                self.scope = scope
-                try:
-                    self._push_scope()
-                    self._check_block(stmt.body)
-                    self._pop_scope()
-                finally:
-                    self.scope = saved
-
-    def _moved_in_defer(self, stmt: rast.DeferStmt, scope: Scope) -> Optional[str]:
-        """The first name the deferred statement uses that is moved (or has a
-        field moved out) now, or None."""
-        found: List[str] = []
-
-        def walk(node):
-            if found:
-                return
-            if isinstance(node, rast.Ident):
-                info = scope.lookup(node.name)
-                if info is not None and (info.state == VarState.MOVED or info.moved_fields):
-                    found.append(node.name)
-                return
-            if isinstance(node, (rast.Lambda, rast.Closure)):
-                return
-            if isinstance(node, list):
-                for child in node:
-                    walk(child)
-            elif isinstance(node, rast.Node):
-                for f in node.__dataclass_fields__:
-                    child = getattr(node, f)
-                    if isinstance(child, (list, rast.Node)):
-                        walk(child)
-        walk(stmt.body)
-        return found[0] if found else None
-
-    def _check_stmt(self, stmt: rast.Stmt) -> bool:
-        """Check a statement for ownership violations. The loans it makes
-        that no binding holds end with it (AGAST #2438).
-
-        Returns True if statement definitely returns (terminates control flow).
-        """
-        mark = len(self._arg_loans)
-        try:
-            return self._check_one_stmt(stmt)
-        finally:
-            self._release_arg_loans(mark)
-
-    def _check_one_stmt(self, stmt: rast.Stmt) -> bool:
-        if isinstance(stmt, rast.VarStmt):
-            # Variable declaration
-            if stmt.value:
-                self._check_expr(stmt.value, is_move_context=True)
-            elif (isinstance(self.types.resolve(stmt.type), rast.ArrayType)
-                    and self.types.is_move_only(stmt.type)):
-                # §3.3 (LARB R39): storing an element drops the old one, so
-                # every element of a Drop array must hold a value.
-                self.errors.append(OwnershipError(
-                    array_rules.uninitialised_drop_array(stmt.name),
-                    stmt.name_span or stmt.span))
-            # Use explicit type if present, otherwise infer from initializer
-            if stmt.type:
-                var_type = stmt.type
-            elif stmt.value:
-                var_type = self._infer_expr_type(stmt.value)
-            else:
-                var_type = rast.NamedType(stmt.span, 'unknown', [])
-            self.scope.define(stmt.name, var_type, stmt.span)
-            self._hold_loans(self.scope.vars[stmt.name], stmt.value, stmt.type)
-            return False
-
-        elif isinstance(stmt, rast.LetStmt):
-            # Let binding.
-            if stmt.value:
-                self._check_expr(stmt.value, is_move_context=True)
-            # Use explicit type if present, otherwise infer from initializer
-            if stmt.type:
-                var_type = stmt.type
-            elif stmt.value:
-                var_type = self._infer_expr_type(stmt.value)
-            else:
-                var_type = rast.NamedType(stmt.span, 'unknown', [])
-            self.scope.define(stmt.name, var_type, stmt.span)
-            self._hold_loans(self.scope.vars[stmt.name], stmt.value, stmt.type)
-            return False
-
-        elif isinstance(stmt, rast.LetTupleStmt):
-            # `let (a, b) = v` (§13.6, AGAST #2282): v moves, as into a
-            # `let`, and each name owns its element (a struct's field, by
-            # declaration order), so the emitter drops the names, not v.
-            self._check_expr(stmt.value, is_move_context=True)
-            elems = self._destructured_types(stmt.value, len(stmt.names))
-            for i, name in enumerate(stmt.names):
-                span = stmt.name_spans[i] if i < len(stmt.name_spans) else stmt.span
-                self.scope.define(name, elems[i], span)
-            return False
-
-        elif isinstance(stmt, rast.ExprStmt):
-            self._check_expr(stmt.expr, is_move_context=False)
-            return False
-
-        elif isinstance(stmt, rast.AssertStmt):
-            # Its condition is checked like any expression, as on ritz1: a
-            # call's `@&s, @s` is the same conflict there (AGAST #2438).
-            self._check_expr(stmt.condition, is_move_context=False)
-            return False
-
-        elif isinstance(stmt, rast.ReturnStmt):
-            if stmt.value:
-                self._check_expr(stmt.value, is_move_context=True)
-            self._run_defers(0)
-            # Return terminates this control flow path
-            return True
-
-        elif isinstance(stmt, rast.DeferStmt):
-            # Nothing runs here: it's checked at each exit (_run_defers).
-            if self._defers:
-                self._defers[-1].append((stmt, self.scope))
-            return False
-
-        elif isinstance(stmt, rast.AssignStmt):
-            # Check the value first - this is a move. `t = f(t)` reads the
-            # old t before the assignment makes t an owner again.
-            self._check_expr(stmt.value, is_move_context=True)
-            # The target (lvalue) is not a move, and assigning to a bare
-            # moved-from binding is not a use of it (§13.6). Nor is assigning
-            # to a field moved out of a binding: that field is owned again.
-            if self._reown_field(stmt.target):
-                # The emitter sets the field's drop flags again.
-                stmt.target.reowns_field = True
-            elif not isinstance(stmt.target, rast.Ident):
-                self._check_expr(stmt.target, is_move_context=False)
-            # A write inside a borrowed place (AGAST #2438, R11a).
-            self._check_mut_use(self._loan_place(stmt.target), stmt.target.span, "assign")
-            # After assignment, the target variable becomes owned again
-            if isinstance(stmt.target, rast.Ident):
-                var_info = self.scope.lookup(stmt.target.name)
-                if var_info:
-                    var_info.state = VarState.OWNED
-                    var_info.move_span = None
-                    var_info.moved_fields = {}
-            return False
-
-        elif isinstance(stmt, rast.AsmStmt):
-            # §18.6: an `out` or `inout` operand is an assignment of its
-            # place for the borrow rules (§13.5); ritz1: ref_check_asm.
-            for o in stmt.operands:
-                if o.direction in ('out', 'inout'):
-                    target = rast.Ident(o.span, o.name)
-                    self._check_mut_use(self._loan_place(target), o.span, "assign")
-            return False
-
-        elif isinstance(stmt, rast.WhileStmt):
-            def iteration():
-                # The condition runs at the loop head, on every iteration.
-                self._check_expr(stmt.cond, is_move_context=False)
-                self._push_scope()
-                done = self._check_block(stmt.body)
-                self._pop_scope()
-                return done
-            self._check_loop(iteration)
-            return False
-
-        elif isinstance(stmt, rast.ForStmt):
-            # The iterator is moved into the loop, once. What a reference
-            # reaches stays its owner's, so the loop only reads it.  A call's
-            # `[N]T` result, or an array literal, is a temporary, dropped per
-            # element after the loop however it's left: `x` is a copy of its
-            # element, as over a local, and drops nothing (AGAST #3284, #3297).
-            # A global, or a field of one, is walked in place (§6.3): it is
-            # never dropped, so nothing moves out of it (LARB R34, #3366).
-            self._check_expr(stmt.iter,
-                             is_move_context=not (self._through_reference(stmt.iter)
-                                                  or self._array_temporary(stmt.iter)
-                                                  or self._global_place(stmt.iter)))
-            held = self._for_loan(stmt.iter)
-            if held is not None:
-                held[0].borrows.append(held[1])
-
-            def iteration():
-                self._push_scope()
-                # Loop variable is defined fresh each iteration
-                # For range-based for loops, the variable is i64 (Copy type)
-                self.scope.define(stmt.var, rast.NamedType(stmt.span, 'i64', []), stmt.span)
-                done = self._check_block(stmt.body)
-                self._pop_scope()
-                return done
-            self._check_loop(iteration)
-            if held is not None:
-                held[0].borrows = [b for b in held[0].borrows if b is not held[1]]
-            return False
-
-        elif isinstance(stmt, rast.BreakStmt):
-            self._run_loop_defers()
-            self._note_loop_exit('breaks')
-            return True
-
-        elif isinstance(stmt, rast.ContinueStmt):
-            self._run_loop_defers()
-            self._note_loop_exit('continues')
-            return True
-
-        return False
-
-    # ---- loops (AGAST #2161) ------------------------------------------------
-    #
-    # A loop body runs again with whatever the previous iteration left, so a
-    # binding declared outside the loop and moved inside it is moved at the
-    # loop head unless every path back there assigned it again. The body is
-    # checked once with the entry state and, while that grows the set of
-    # moved bindings at the head, again with the merged head state. Paths
-    # that `break` don't reach the head; they join the state after the loop.
-
-    def _snapshot(self) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span], Dict[str, rast.Span]]]:
-        """Every visible binding's state (and its moved-out fields), keyed by
-        binding (not name, so a shadowing binding in an inner scope can't
-        stand in for an outer one)."""
-        out: Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span], Dict[str, rast.Span]]] = {}
-        scope = self.scope
-        while scope:
-            for info in scope.vars.values():
-                out.setdefault(id(info), (info, info.state, info.move_span,
-                                          dict(info.moved_fields)))
-            scope = scope.parent
-        return out
-
-    def _restore(self, snap) -> None:
-        for info, state, span, fields in snap.values():
-            info.state = state
-            info.move_span = span
-            info.moved_fields = dict(fields)
-
-    @staticmethod
-    def _join(paths) -> Dict[int, Tuple[VarInfo, VarState, Optional[rast.Span], Dict[str, rast.Span]]]:
-        """Where `paths` meet: each binding of the first path, moved if it is
-        moved on any of them, else in the first path's state; a field is
-        moved out if it is on any of them."""
-        out = dict(paths[0])
-        for key, (info, state, span, fields) in paths[0].items():
-            merged = dict(fields)
-            for p in paths:
-                got = p.get(key)
-                if got is None:
-                    continue
-                for fname, fspan in got[3].items():
-                    merged.setdefault(fname, fspan)
-            for p in paths:
-                got = p.get(key)
-                if got is not None and got[1] == VarState.MOVED:
-                    state, span = VarState.MOVED, got[2]
-                    break
-            out[key] = (info, state, span, merged)
-        return out
-
-    @staticmethod
-    def _moved_keys(snap) -> Set:
-        out: Set = {k for k, (_i, st, _s, _f) in snap.items() if st == VarState.MOVED}
-        out |= {(k, f) for k, (_i, _st, _s, fields) in snap.items() for f in fields}
-        return out
-
-    def _run_loop_defers(self) -> None:
-        """break / continue: the defers of the blocks inside the loop."""
-        if self._loop_defer_depth:
-            self._run_defers(self._loop_defer_depth[-1])
-
-    def _note_loop_exit(self, kind: str) -> None:
-        if self._loops:
-            self._loops[-1][kind].append(self._snapshot())
-
-    def _check_loop(self, iteration) -> None:
-        """Check a loop whose one iteration `iteration()` checks (returning
-        True if the body never falls through to the loop head)."""
-        head = self._snapshot()
-        for _ in range(8):           # moves only grow; 8 passes is plenty
-            self._restore(head)
-            frame = {'breaks': [], 'continues': []}
-            self._loops.append(frame)
-            self._loop_defer_depth.append(len(self._defers))
-            try:
-                done = iteration()
-            finally:
-                self._loop_defer_depth.pop()
-            self._loops.pop()
-            back = list(frame['continues'])
-            if not done:
-                back.append(self._snapshot())
-            new_head = self._join([head] + back)
-            if self._moved_keys(new_head) == self._moved_keys(head):
-                break
-            head = new_head
-        # Leaving: the condition failed at the head, or a `break`.
-        self._restore(self._join([head] + frame['breaks']))
-
-    def _check_expr(self, expr: rast.Expr, is_move_context: bool = False):
-        """Check an expression for ownership violations.
-
-        Args:
-            expr: The expression to check
-            is_move_context: True if this expression's value will be moved
-        """
-        if isinstance(expr, rast.Ident):
-            var_info = self.scope.lookup(expr.name)
-            if var_info:
-                # Check if variable has been moved
-                if var_info.state == VarState.MOVED:
-                    self.errors.append(OwnershipError(
-                        f"use of moved value: `{expr.name}` (moved at {var_info.move_span})",
-                        expr.span, after_move=True
-                    ))
-                    return
-                # Used whole after a field was moved out (AGAST #2171).
-                if var_info.moved_fields:
-                    fname, fspan = next(iter(var_info.moved_fields.items()))
-                    self.errors.append(OwnershipError(
-                        f"use of moved value: `{expr.name}.{fname}` (moved at {fspan})",
-                        expr.span, after_move=True
-                    ))
-                    return
-
-                # If this is a move context and type is not Copy, mark as moved.
-                # A by-value `name: T` parameter (Borrow.CONST) owns its value
-                # (§13.2) and moves like any binding (AGAST #2157). A `name:& T`
-                # parameter's value stays the caller's, so it can't move
-                # (AGAST #2231).
-                if is_move_context and not self._is_copy_type(var_info.ritz_type):
-                    if var_info.borrow == rast.Borrow.MUTABLE:
-                        self._reject_move_out(expr.span)
-                        return
-                    var_info.state = VarState.MOVED
-                    var_info.move_span = expr.span
-                    # The emitter clears the binding's drop flag here.
-                    expr.moves_binding = True
-            elif is_move_context:
-                self._check_global_move_out(expr)
-
-        elif isinstance(expr, rast.BinOp):
-            # Binary ops don't move their operands (they borrow or copy)
-            self._check_expr(expr.left, is_move_context=False)
-            self._check_expr(expr.right, is_move_context=False)
-
-        elif isinstance(expr, rast.UnaryOp):
-            if expr.op in ('&', '@'):
-                # Shared borrow - check the operand exists and isn't moved
-                # Both legacy & and RERITZ @ are immutable borrows
-                self._check_borrow(expr.operand, mutable=False, span=expr.span)
-            elif expr.op in ('&mut', '@&'):
-                # Mutable borrow - check no other borrows exist
-                # Both legacy &mut and RERITZ @& are mutable borrows
-                self._check_borrow(expr.operand, mutable=True, span=expr.span)
-            elif expr.op == '*':
-                # Dereference - check the pointer expression
-                self._check_expr(expr.operand, is_move_context=False)
-                if is_move_context and self._through_reference(expr) \
-                        and self.types.is_move_only(self._place_type(expr)):
-                    self._reject_move_out(expr.span)
-            else:
-                self._check_expr(expr.operand, is_move_context=False)
-
-        elif (isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident)
-                and expr.func.name == 'sizeof'):
-            # sizeof's operand is never evaluated: it neither moves nor
-            # uses its operand (AGAST #2124; `sizeof(key)` used to move key).
-            pass
-
-        elif isinstance(expr, rast.Call):
-            # Function arguments are moved (unless Copy)
-            # Borrows created for arguments are released after the call completes
-            # (unless the reference escapes, which we don't track yet)
-            self._check_expr(expr.func, is_move_context=False)
-
-            # Save borrow states before processing arguments
-            borrow_states_before = self._save_borrow_states()
-
-            params = (self.fn_params.get(expr.func.name)
-                      if isinstance(expr.func, rast.Ident) else None)
-            self._in_args += 1
-            for i, arg in enumerate(expr.args):
-                param = params[i] if params and i < len(params) else None
-                self._check_expr(arg, is_move_context=not _is_lending_param(param))
-                self._check_place_borrow(arg, param)
-            self._in_args -= 1
-
-            # Release borrows that were created for this call
-            # (borrows don't outlive the call unless stored somewhere)
-            self._restore_borrow_states(borrow_states_before)
-            self._mark_temporary(expr, is_move_context)
-
-        elif isinstance(expr, rast.MethodCall):
-            # The receiver is borrowed (auto-ref) unless the method takes it
-            # by value (AGAST #2239). An argument moves when every method of
-            # that name takes it by value.
-            self._check_expr(expr.expr, is_move_context=self._method_takes_self(expr)
-                             or self._takes_place_behind(expr))
-            self._check_ref_receiver(expr)
-            # A receiver taken `self: @&T` or `self:& T` is a mutable borrow of
-            # its place.
-            if self._lends_self_mut(expr) and self._holds_by_value(expr.expr):
-                self._check_mut_use(self._loan_place(expr.expr), expr.expr.span, "borrow")
-            if not self._method_lends_self(expr):
-                # A temporary receiver taken by value is moved, not dropped.
-                self._unmark_temporary(expr.expr)
-            borrow_states_before = self._save_borrow_states()
-            # `E.V(args)` builds a variant, which owns its payload.
-            is_variant = self.types.variant_value_type(
-                expr, lambda n: self.scope.lookup(n) is not None) is not None
-            self._in_args += 1
-            for i, arg in enumerate(expr.args):
-                self._check_expr(arg, is_move_context=is_variant or self._method_arg_moves(expr, i))
-                self._check_place_borrow(arg, self._method_param(expr, i))
-            self._in_args -= 1
-            self._restore_borrow_states(borrow_states_before)
-            self._mark_temporary(expr, is_move_context)
-
-        elif isinstance(expr, rast.Grouped):
-            self._check_expr(expr.expr, is_move_context=is_move_context)
-
-        elif isinstance(expr, rast.Field) and is_move_context and self._through_deref(expr) \
-                and self.types.is_move_only(self._part_type(
-                    self.types.resolve(self._loan_type(expr.expr)), expr.field)):
-            # `deref` lends the T: its move-only field can't be taken (§7.7).
-            self._check_expr(expr.expr, is_move_context=False)
-            self._reject_move_out(expr.span)
-
-        elif isinstance(expr, rast.Field) and self._numbered_struct_field(expr) is not None:
-            # `h.0` of a struct: no such field, in any position (AGAST #3233).
-            # The one error: it's no use of `h`, so what moved out of `h`
-            # doesn't add a second.
-            self.errors.append(OwnershipError(
-                deref_rules.no_field(self._numbered_struct_field(expr), expr.field),
-                expr.name_span or expr.span))
-
-        elif isinstance(expr, rast.Field) and self._field_owner(expr) is not None:
-            self._check_owned_field(expr, self._field_owner(expr), is_move_context)
-
-        elif isinstance(expr, rast.Field):
-            # Field access doesn't move the struct (unless the result is moved)
-            self._check_expr(expr.expr, is_move_context=False)
-            if is_move_context and self._through_reference(expr):
-                # `p[i].f`: _field_path_type doesn't type an element (#2444).
-                if self.types.is_move_only(self._field_path_type(expr) or self._place_type(expr)):
-                    self._reject_move_out(expr.span)
-            elif is_move_context and self._moves_out_of_element(expr):
-                self.errors.append(OwnershipError(array_rules.MOVE_OUT_OF_ELEMENT, expr.span))
-            elif is_move_context and self._check_global_move_out(expr):
-                pass
-            elif is_move_context and self.types.is_move_only(self._field_path_type(expr)):
-                # Moving a move-only field out of a temporary: the rest of
-                # the temporary isn't dropped either (no partial drops).
-                while isinstance(expr, rast.Field):
-                    expr = expr.expr
-                self._unmark_temporary(expr)
-
-        elif isinstance(expr, rast.Index):
-            self._check_expr(expr.expr, is_move_context=False)
-            self._check_expr(expr.index, is_move_context=False)
-            if is_move_context and self._through_reference(expr) \
-                    and self.types.is_move_only(self._place_type(expr)):
-                self._reject_move_out(expr.span)
-            elif is_move_context and self._moves_out_of_element(expr):
-                self.errors.append(OwnershipError(array_rules.MOVE_OUT_OF_ELEMENT, expr.span))
-
-        elif isinstance(expr, rast.StructLit):
-            for _, value in expr.fields:
-                self._check_expr(value, is_move_context=True)
-            self._mark_temporary(expr, is_move_context)
-
-        elif isinstance(expr, (rast.ArrayLit, rast.TupleLit)):
-            # The literal owns its elements, wherever the literal itself
-            # goes (AGAST #2238).
-            for element in expr.elements:
-                self._check_expr(element, is_move_context=True)
-            self._mark_temporary(expr, is_move_context)
-
-        elif isinstance(expr, rast.ArrayFill):
-            # `[v; n]` owns its value like a literal owns its elements, so
-            # `[t; 2]` with `t:& Res` moves out of the reference (AGAST #2948).
-            self._check_expr(expr.value, is_move_context=True)
-            # It copies that one value into each element: n > 1 of a
-            # move-only one would drop it n times (AGAST #2963).
-            if expr.count > 1 and self.types.is_move_only(self._fill_value_type(expr.value)):
-                self.errors.append(OwnershipError(array_rules.FILL_MOVE_ONLY, expr.span))
-
-        elif isinstance(expr, rast.Match):
-            # What a reference reaches stays its owner's, and an element its
-            # array's (#2268): matching it only reads.
-            self._check_expr(expr.expr,
-                             is_move_context=not self._through_reference(expr.expr)
-                             and self._element_root(expr.expr) is None)
-            # The match owns a scrutinee it moved (AGAST #2177, ritz1 #2174).
-            owned = self._owned_scrutinee_type(expr.expr)
-            expr.owns_scrutinee = owned
-            lent = None if owned is not None else self._lent_scrutinee_type(expr.expr)
-            # Each arm starts from the state before the match. After it, a
-            # binding is moved if an arm that falls through moved it; an arm
-            # that leaves (`break`, `return`, ...) took its moves with it.
-            before = self._snapshot()
-            outs = []
-            mark = len(self._arg_loans)
-            for arm in expr.arms:
-                self._restore(before)
-                self._release_arg_loans(mark)
-                self._push_scope()
-                # Pattern bindings
-                self._check_pattern(arm.pattern)
-                if owned is not None:
-                    self._own_payload(arm, owned)
-                elif lent is not None:
-                    self._lend_payload(arm, lent)
-                if isinstance(arm.body, rast.Block):
-                    left = self._check_block(arm.body, value_used=is_move_context)
-                else:
-                    self._check_expr(arm.body, is_move_context=is_move_context)
-                    left = isinstance(arm.body, (rast.BreakExpr, rast.ContinueExpr,
-                                                 rast.ReturnExpr))
-                self._note_arm_type(expr, arm)
-                self._pop_scope()
-                if not left:
-                    outs.append(self._snapshot())
-            if outs:
-                self._restore(self._join(outs))
-
-        elif isinstance(expr, rast.BreakExpr):
-            self._run_loop_defers()
-            self._note_loop_exit('breaks')
-
-        elif isinstance(expr, rast.ContinueExpr):
-            self._run_loop_defers()
-            self._note_loop_exit('continues')
-
-        elif isinstance(expr, rast.ReturnExpr):
-            if expr.value is not None:
-                self._check_expr(expr.value, is_move_context=True)
-            self._run_defers(0)
-
-        elif isinstance(expr, rast.TryOp):
-            self._check_expr(expr.expr, is_move_context=is_move_context)
-            # The Err path returns through every block's defers; the Ok path
-            # goes on, so their moves don't carry past the `?`.
-            if self._defers and any(self._defers):
-                snap = self._snapshot()
-                self._run_defers(0)
-                self._restore(snap)
-
-        elif isinstance(expr, rast.Cast):
-            # `v as T` hands its operand's value on: it moves wherever the
-            # cast does (AGAST #2948; `t as Res` with `t:& Res` copied out).
-            self._check_ref_cast(expr)
-            self._check_expr(expr.expr, is_move_context=is_move_context)
-
-        elif isinstance(expr, rast.If):
-            # If expression with proper control flow handling:
-            # - Save state before branches
-            # - If a branch returns, its moves don't affect code after the if
-            # - If both branches return, code after if is dead
-            # - For if/else where neither returns, each branch checks independently
-            self._check_expr(expr.cond, is_move_context=False)
-
-            # Save state before entering branches
-            saved_states = self.scope.save_states()
-
-            # Check then branch
-            self._push_scope()
-            then_returns = self._check_block(expr.then_block, value_used=is_move_context)
-            self._pop_scope()
-
-            # Save state after then branch (captures moves in then)
-            states_after_then = self.scope.save_states()
-
-            if expr.else_block:
-                # Always restore to pre-if state for else branch
-                # (else branch doesn't see moves from then branch)
-                self.scope.restore_states(saved_states)
-
-                self._push_scope()
-                else_returns = self._check_block(expr.else_block, value_used=is_move_context)
-                self._pop_scope()
-
-                # After if/else, merge states:
-                # - If both return, code after is dead
-                # - If only then returns, keep state from else
-                # - If only else returns, keep state from then (restore after_then)
-                # - If neither returns, conservatively mark moved in EITHER branch as moved
-                if then_returns and else_returns:
-                    # Both return - subsequent code is dead, state doesn't matter
-                    pass
-                elif then_returns:
-                    # Then returned, else didn't - keep current state (from else)
-                    pass
-                elif else_returns:
-                    # Else returned, then didn't - restore state from after then
-                    self.scope.restore_states(states_after_then)
-                else:
-                    # Neither returned - merge: if moved in either branch, mark as moved
-                    states_after_else = self.scope.save_states()
-                    for name, (then_state, then_move_span, then_fields) in states_after_then.items():
-                        else_info = states_after_else.get(name)
-                        if else_info:
-                            else_state, else_move_span, else_fields = else_info
-                            var_info = self.scope.lookup(name)
-                            # If moved in either branch, mark as moved
-                            if then_state == VarState.MOVED or else_state == VarState.MOVED:
-                                if var_info:
-                                    var_info.state = VarState.MOVED
-                                    var_info.move_span = then_move_span or else_move_span
-                            # Likewise a field moved out in either (AGAST #2171).
-                            if var_info:
-                                merged = dict(then_fields)
-                                for fname, fspan in else_fields.items():
-                                    merged.setdefault(fname, fspan)
-                                var_info.moved_fields = merged
-            else:
-                # No else branch - if then returns, restore pre-if state
-                # (the non-return path is when condition is false)
-                if then_returns:
-                    self.scope.restore_states(saved_states)
-                # If then doesn't return, merge: either then path moved or condition was false
-                # Conservative: if moved in then, mark as potentially moved
-
-        elif isinstance(expr, rast.Block):
-            self._push_scope()
-            self._check_block(expr)
-            self._pop_scope()
-
-        # Literals don't have ownership concerns
-        elif isinstance(expr, (rast.IntLit, rast.FloatLit, rast.StringLit,
-                               rast.CStringLit, rast.BoolLit, rast.CharLit)):
-            pass
 
     # ---- temporaries (AGAST #2161) -------------------------------------------
 
@@ -1628,8 +661,8 @@ class MoveChecker:
         if isinstance(expr, rast.ArrayLit):
             return True
         return (isinstance(expr, (rast.Call, rast.MethodCall))
-                and isinstance(self.types.resolve(self._infer_expr_type(expr)),
-                               rast.ArrayType))
+                and isinstance(
+                    self.types.resolve(self._infer_expr_type(expr)), rast.ArrayType))
 
     @staticmethod
     def _unmark_temporary(expr: rast.Expr) -> None:
@@ -1746,8 +779,8 @@ class MoveChecker:
         through a deref, so this asks the place's own type. The place then reads
         as a move: behind a reference that's the "cannot move out" error, and an
         owned element or deref has nothing else a move would change."""
-        return self._takes_self_by_value(self.types.resolve(self._place_type(call.expr)),
-                                         call.method)
+        return self._takes_self_by_value(
+            self.types.resolve(self._place_type(call.expr)), call.method)
 
     def _field_path_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of a field path `b.f.g`, at any depth, or None."""

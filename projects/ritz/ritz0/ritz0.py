@@ -18,8 +18,9 @@ Compilation Model:
 import os
 import sys
 import argparse
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Set
 
 from lexer import Lexer, LexerError
 from parser import Parser, ParseError
@@ -114,306 +115,365 @@ def _filter_by_target_os(module: rast.Module, target_os: str) -> rast.Module:
     return rast.Module(module.span, filtered_items)
 
 
+@dataclass
+class _Compile:
+    """One compile_file call: its inputs, and what each pass leaves for the
+    passes after it.  A pass is a function over this, run in PASSES order; it
+    returns False after printing why the compile fails, else True."""
+    source_path: str
+    output_path: str
+    no_runtime: bool = False
+    check_names: bool = False
+    check_ownership: bool = False
+    check_types: bool = False
+    dependencies: Optional[dict] = None
+    source_roots: Optional[list] = None
+    project_root: Optional[str] = None
+    target: str = 'x86_64-unknown-linux-gnu'
+    target_os: str = 'linux'
+    test_mode: bool = False
+    # Set up by compile_file before the passes run.
+    source: str = ''
+    source_abs_path: str = ''
+    mode_key: str = ''
+    # _parse
+    module: Optional[rast.Module] = None
+    source_hashes: Optional[tuple] = None
+    original_import_paths: List[str] = field(default_factory=list)
+    # _resolve
+    module_names: Set[str] = field(default_factory=set)
+    import_hashes: dict = field(default_factory=dict)
+    import_misses: List[str] = field(default_factory=list)
+
+
+def _report(errors, prefix: str = '') -> bool:
+    """Print each error to stderr, after `prefix`; True if there were none."""
+    for err in errors:
+        print(f"{prefix}{err}", file=sys.stderr)
+    return not errors
+
+
+def _up_to_date(ctx: _Compile) -> bool:
+    """The source-file-level fast path: may this compile be skipped?
+
+    Only if the .ll output exists, is newer than the source, the source hash
+    matches the cached hash in .ritz.sig, AND every transitive import
+    still hashes as recorded. The import check matters:
+    the .ll bakes in imported struct layouts (field offsets), constants
+    and signatures, so an unchanged module over a changed import is
+    still stale (AGAST #1674). The sig must also vouch for THIS output
+    in THIS mode: it is keyed by source alone, so another flag set or
+    another output path must not count as "unchanged" (AGAST #2020).
+    And every candidate import resolution probed and missed must still
+    be missing: a new file there would change what an import resolves
+    to, behind import hashes that all still match (AGAST #2030).
+    And the sig must come from THIS ritz0: read_current_sig drops one
+    another ritz0 wrote, so editing ritz0 recompiles (AGAST #3086).
+    """
+    output_file = Path(ctx.output_path)
+    if not output_file.exists():
+        return False
+    source_mtime = Path(ctx.source_path).stat().st_mtime
+    output_mtime = output_file.stat().st_mtime
+    prior_sig = read_current_sig(ctx.source_abs_path)
+    return (output_mtime >= source_mtime
+            and check_source_hash(ctx.source, ctx.source_abs_path)
+            and check_import_hashes(prior_sig)
+            and check_import_misses(prior_sig)
+            and check_output_entry(prior_sig, ctx.output_path, ctx.mode_key))
+
+
+def _parse(ctx: _Compile) -> bool:
+    """Lex and parse (counted: RITZ0_PARSE_LOG, module_interface.PARSED)."""
+    tokens, module = module_interface.parse_source_tokens(ctx.source, ctx.source_path)
+
+    # The fn cache's token hashes, from this one lex and parse (AGAST
+    # #2807: it used to lex the source four more times). Now, while
+    # `module.items` are still this file's: _resolve replaces them.
+    try:
+        ctx.source_hashes = hash_maps(tokens, module.items)
+    except Exception:
+        ctx.source_hashes = None
+    del tokens
+
+    # Capture import paths BEFORE _resolve — that pass replaces
+    # `module.items` with merged items from all transitive imports and
+    # strips the original Import nodes.  Without this snapshot, the
+    # `import_paths` written by _emit would be an empty list,
+    # which causes every `.ritz.sig` to be written with `imports: []`,
+    # which causes `invalidate_dependents` to never propagate signature
+    # changes to importers — the per-function caching layer silently
+    # never invalidates anyone, manifesting as "I edited a lib and the
+    # binary still has stale code" until you `rm -rf .ritz-cache`.
+    ctx.original_import_paths = [
+        '.'.join(item.path) for item in module.items if isinstance(item, rast.Import)]
+    ctx.module = module
+    return True
+
+
+def _resolve(ctx: _Compile) -> bool:
+    """Resolve imports and merge them into one module. Imported modules
+    come from their interfaces (G9, AGAST #1810: module_interface.py),
+    so only this file is parsed; only its bodies are emitted anyway.
+    use_cache=False: the older .ritz-meta stubs lose generic bodies."""
+    resolver = ImportResolver(
+        ctx.project_root, use_cache=False, dependencies=ctx.dependencies,
+        source_roots=ctx.source_roots, use_interfaces=module_interface.enabled())
+    module = resolver.resolve(ctx.module, ctx.source_path)
+
+    # What `token.Kind` may be qualified by: every module this compile saw.
+    ctx.module_names = {Path(f).stem for f in resolver.processed_files}
+    for aliases in resolver.import_aliases.values():
+        ctx.module_names.update(aliases)
+
+    # Hash every transitive import now, before emission, so the sig vouches
+    # for the sources this .ll was actually built from (AGAST #1674).
+    # The ritz.toml files that registered an imported namespace count too:
+    # their `sources` decide what `<name>.*` resolves to (AGAST #2087).
+    ctx.import_hashes = build_import_hashes(
+        [f for f in resolver.processed_files if f != ctx.source_abs_path]
+        + sorted(resolver.config_files))
+    # ...and the candidates it probed and missed on the way (AGAST #2030).
+    ctx.import_misses = sorted(resolver.missed_candidates)
+
+    # Filter out items that don't match target_os
+    # This must happen after import resolution but before name resolution
+    # so that name resolution doesn't see excluded items
+    ctx.module = _filter_by_target_os(module, ctx.target_os)
+    return True
+
+
+def _check_impl_targets(ctx: _Compile) -> bool:
+    """An `impl` on a built-in type (Span, StrView, Option, Result) no
+    module declares (AGAST #3162).  After the merge, so an imported
+    `struct Span<T>` makes Span an ordinary struct.  ...and on a type
+    nothing declares or imports (AGAST #3264)."""
+    errors = check_builtin_impls(ctx.module)
+    errors += check_unknown_impl_targets(ctx.module)
+    return _report(errors, "Error: ")
+
+
+def _rewrite_enum_from(ctx: _Compile) -> bool:
+    """`E.from(v)` -> the generated `E__from(v)` (LANGUAGE_SPEC §10.4)."""
+    return _report(rewrite_enum_from(ctx.module), "Error: ")
+
+
+def _eval_array_sizes(ctx: _Compile) -> bool:
+    """Evaluate constant expressions in array sizes.  This must happen
+    before name resolution since it transforms the AST."""
+    return _report(evaluate_array_sizes(ctx.module), "Const eval error: ")
+
+
+def _check_binders(ctx: _Compile) -> bool:
+    """A local named like a const, global or variant (AGAST #2407). Before
+    monomorphisation, so a generic fn is judged whether or not it's used."""
+    return _report(check_binders(ctx.module, ctx.source_abs_path), "Name error: ")
+
+
+def _check_reachable(ctx: _Compile) -> bool:
+    """A statement that can never run (AGAST #2520, LARB): before
+    monomorphisation, so a generic fn is judged whether or not it's used."""
+    return _report(check_reachable(ctx.module, ctx.source_abs_path))
+
+
+def _check_names(ctx: _Compile) -> bool:
+    """`--check-names`: every referenced name is defined."""
+    if not ctx.check_names:
+        return True
+    return _report(resolve_names(ctx.module, ctx.module_names), "Name error: ")
+
+
+def _infer_struct_lit_args(ctx: _Compile) -> bool:
+    """A generic struct literal's left-out type args (§9.2, AGAST #3407):
+    before the checkers, so the move checker sees `Box2 { v: d }` as
+    the Box2<D> it is.  The rest of monomorphisation runs in _emit."""
+    infer_struct_lit_args(ctx.module)
+    return True
+
+
+def _check_types(ctx: _Compile) -> bool:
+    """`--check-types`: type compatibility."""
+    if not ctx.check_types:
+        return True
+    errors = TypeChecker(ctx.module_names).check(ctx.module)
+    return _report(errors, "Type error: ")
+
+
+def _check_ownership(ctx: _Compile) -> bool:
+    """Move and borrow rules (on unless --no-check-ownership)."""
+    if not ctx.check_ownership:
+        return True
+    ownership_errors = MoveChecker().check(ctx.module)
+    if not ownership_errors:
+        return True
+    # `c` in a reference slot wants `@c`, not "cannot move out".
+    slot_errors = check_ref_slots(ctx.module, lambda fn: True, ctx.module_names)
+    explains = [err for err in slot_errors if not err.after_moves]
+    if not _report(explains, "Type error: "):
+        return False
+    _report(ownership_errors, "Ownership error: ")
+    # The rest after it, as ritz1 prints them (#3189).
+    _report(slot_errors, "Type error: ")
+    return False
+
+
+def _fn_cache(ctx: _Compile) -> tuple:
+    """Per-fn cache state for _emit: (fn_cache_data, fn_hashes, sig_hashes,
+    old_sig_data).  Detects signature changes and invalidates the modules
+    that depend on them, before emission."""
+    try:
+        if ctx.source_hashes is None:
+            raise ValueError("fn hashes unavailable")
+        fn_hashes, sig_hashes = ctx.source_hashes
+        # Another ritz0's sig carries no outputs or fn IR forward (#3086).
+        old_sig_data = read_current_sig(ctx.source_abs_path)
+
+        # Detect signature changes and invalidate dependent modules
+        changed_sigs = detect_sig_changes(ctx.source_abs_path, sig_hashes)
+        if changed_sigs:
+            _invalidate_dependents(ctx, changed_sigs)
+
+        # Per-fn IR reuse is OFF: every fn is emitted fresh (AGAST #2019).
+        #
+        # The only "hits" the emitter ever honoured were fns the async
+        # transform synthesizes: an `async fn f` yields a constructor
+        # also named `f`, with no `source_file`, so `_should_emit_body`
+        # consulted the cache for it (source fns carry `source_file` and
+        # are always emitted).  Its body was skipped, `_splice_cached_ir`
+        # failed to match the `... "no-builtins"` declare, and a warm
+        # recompile shipped `f_poll` with `f` only declared — a link
+        # failure that build.py's shared CAS then kept for every worktree.
+        # Splicing can't be byte-identical to a cold compile in any case:
+        # a cached block's `!dbg !N` ids belong to the compile that wrote
+        # it.  The sig is still written (source-hash fast path, sig-change
+        # invalidation); its stored IR is just never spliced back in.
+        fn_cache_data = {
+            'cache_hits': {},
+            'cache_misses': dict(fn_hashes),
+            'sig_data': old_sig_data,
+        }
+        return fn_cache_data, fn_hashes, sig_hashes, old_sig_data
+    except Exception:
+        return None, {}, {}, None
+
+
+def _invalidate_dependents(ctx: _Compile, changed_sigs) -> None:
+    """Invalidate the modules under this source's project root (the nearest
+    ancestor with `.git` or `ritzlib/`) that import a changed signature."""
+    project_root = str(Path(ctx.source_path).resolve().parent)
+    for parent in Path(ctx.source_path).resolve().parents:
+        if (parent / '.git').exists() or (parent / 'ritzlib').is_dir():
+            project_root = str(parent)
+            break
+    invalidate_dependents(ctx.source_abs_path, changed_sigs, project_root)
+
+
+def _emit(ctx: _Compile) -> bool:
+    """Monomorphise and emit IR (emitter_llvmlite.emit), write the .ll, then
+    the .ritz.sig cache.
+
+    Always separate compilation: each source file -> one .ll file.
+    Functions from the current file: define (full body).  Functions from
+    imports: declare (external reference).  --no-runtime only controls
+    whether to emit the _start entry point.
+    """
+    fn_cache_data, fn_hashes, sig_hashes, old_sig_data = _fn_cache(ctx)
+    source_path_obj = Path(ctx.source_path)
+    source_dir = str(source_path_obj.parent.resolve()) if source_path_obj.parent else "."
+    emit_result = emit_llvmlite(
+        ctx.module, no_runtime=ctx.no_runtime,
+        source_file=source_path_obj.name, source_dir=source_dir,
+        main_source_path=ctx.source_abs_path,
+        target=ctx.target, target_os=ctx.target_os, test_mode=ctx.test_mode,
+        # Per-fn IR reuse is keyed on the source alone, so it cannot tell a
+        # test-mode compile (no `main`) from a normal one: test mode always
+        # emits fresh.
+        fn_cache_data=None if ctx.test_mode else fn_cache_data,
+        module_names=ctx.module_names)
+
+    if fn_cache_data is not None and isinstance(emit_result, tuple):
+        ir, emitted_fn_ir = emit_result
+    else:
+        ir = emit_result
+        emitted_fn_ir = {}
+
+    Path(ctx.output_path).write_text(ir)
+
+    # --- Write .ritz.sig cache with emitted function IR ---
+    try:
+        # The import paths _parse captured: the resolved module no longer
+        # contains Import nodes (they're replaced by the merged imported items).
+        sig_data = build_sig_data(
+            source=ctx.source,
+            fn_hashes=fn_hashes,
+            sig_hashes=sig_hashes,
+            fn_ir=emitted_fn_ir,
+            imports=ctx.original_import_paths,
+            old_sig_data=old_sig_data,
+            import_hashes=ctx.import_hashes,
+            import_misses=ctx.import_misses,
+            outputs=build_outputs(
+                old_sig_data, ctx.source, ctx.import_hashes, ctx.output_path,
+                ctx.mode_key, ir, import_misses=ctx.import_misses),
+        )
+        write_sig_file(ctx.source_abs_path, sig_data)
+    except Exception as e:
+        # Cache write failure is non-fatal
+        print(f"Warning: cache write failed: {e}", file=sys.stderr)
+    return True
+
+
+# The compile, in order: parse -> resolve -> check[] -> monomorph -> emit
+# (LARB review/5 N2, AGAST #3449).  The order is load-bearing: the lowering
+# passes (_rewrite_enum_from, _eval_array_sizes) run between the first checks,
+# and _infer_struct_lit_args, monomorph's first step, runs before the type
+# and ownership checks; the rest of monomorphisation, and the checks that
+# judge each generic instance, still run inside emitter_llvmlite.emit.
+PASSES = (
+    _parse,
+    _resolve,
+    _check_impl_targets,
+    _rewrite_enum_from,
+    _eval_array_sizes,
+    _check_binders,
+    _check_reachable,
+    _check_names,
+    _infer_struct_lit_args,
+    _check_types,
+    _check_ownership,
+    _emit,
+)
+
+
 def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                   check_names: bool = False, check_ownership: bool = False,
                   check_types: bool = False, dependencies: dict = None,
                   source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
                   target_os: str = 'linux', test_mode: bool = False) -> bool:
-    """Compile a single Ritz source file to LLVM IR.
+    """Compile a single Ritz source file to LLVM IR, by running PASSES.
 
-    This is the only compilation mode. Each .ritz file compiles to one .ll file.
-    Imports are resolved and emitted as external declarations for linking.
-
-    Args:
-        source_path: Path to the source .ritz file
-        output_path: Output .ll file path
-        no_runtime: Don't emit _start entry point (for library modules)
-        check_names: Verify all referenced names are defined before IR emission
-        check_ownership: Check ownership/borrowing rules before IR emission
-        check_types: Check types are compatible before IR emission
-        dependencies: RFC #109 dependency mappings for namespace resolution
-        source_roots: List of source directories to search for imports
-        project_root: Explicit project root for import resolution (source roots relative to this)
-        target: Target triple (default: x86_64-unknown-linux-gnu)
-        target_os: Target OS for conditional compilation (default: linux)
-        test_mode: Compile as the root of a test binary (LANGUAGE_SPEC §17.1):
-                   emit the `[[test]]` table and a `_start` that calls the
-                   ritzunit runner's `main`; drop the file's own `main`.
+    Each .ritz file compiles to one .ll file; imports are resolved and
+    emitted as external declarations for linking.  The arguments are
+    _Compile's inputs; see ritz0.py's argument parser for each flag.
+    `test_mode` compiles the root of a test binary (LANGUAGE_SPEC §17.1).
     """
     try:
-        # Read source file
-        source = Path(source_path).read_text()
-
-        # Get absolute path for source file tracking
-        source_abs_path = str(Path(source_path).resolve())
-
-        # --- Incremental compilation: source-file-level hash check ---
-        # If the .ll output exists, is newer than the source, the source hash
-        # matches the cached hash in .ritz.sig, AND every transitive import
-        # still hashes as recorded, skip everything. The import check matters:
-        # the .ll bakes in imported struct layouts (field offsets), constants
-        # and signatures, so an unchanged module over a changed import is
-        # still stale (AGAST #1674). The sig must also vouch for THIS output
-        # in THIS mode: it is keyed by source alone, so another flag set or
-        # another output path must not count as "unchanged" (AGAST #2020).
-        # And every candidate import resolution probed and missed must still
-        # be missing: a new file there would change what an import resolves
-        # to, behind import hashes that all still match (AGAST #2030).
-        # And the sig must come from THIS ritz0: read_current_sig drops one
-        # another ritz0 wrote, so editing ritz0 recompiles (AGAST #3086).
-        mode_key = compile_mode_key(_compile_mode(
+        ctx = _Compile(source_path, output_path, no_runtime, check_names,
+                       check_ownership, check_types, dependencies, source_roots,
+                       project_root, target, target_os, test_mode)
+        ctx.source = Path(source_path).read_text()
+        ctx.source_abs_path = str(Path(source_path).resolve())
+        ctx.mode_key = compile_mode_key(_compile_mode(
             no_runtime, check_names, check_ownership, check_types,
             dependencies, source_roots, project_root, target, target_os,
             test_mode))
-        output_file = Path(output_path)
-        if output_file.exists():
-            source_mtime = Path(source_path).stat().st_mtime
-            output_mtime = output_file.stat().st_mtime
-            prior_sig = read_current_sig(source_abs_path)
-            if (output_mtime >= source_mtime
-                    and check_source_hash(source, source_abs_path)
-                    and check_import_hashes(prior_sig)
-                    and check_import_misses(prior_sig)
-                    and check_output_entry(prior_sig, output_path, mode_key)):
-                print(f"Skipped {source_path} (unchanged)")
-                return True
-
-        # Extract directory and filename for debug info
-        source_path_obj = Path(source_path)
-        source_file = source_path_obj.name
-        source_dir = str(source_path_obj.parent.resolve()) if source_path_obj.parent else "."
-
-        # Lex and parse (counted: RITZ0_PARSE_LOG, module_interface.PARSED)
-        tokens, module = module_interface.parse_source_tokens(source, source_path)
-
-        # The fn cache's token hashes, from this one lex and parse (AGAST
-        # #2807: it used to lex the source four more times). Now, while
-        # `module.items` are still this file's: resolve_imports replaces them.
-        try:
-            source_hashes = hash_maps(tokens, module.items)
-        except Exception:
-            source_hashes = None
-        del tokens
-
-        # Capture import paths BEFORE resolve_imports — that pass replaces
-        # `module.items` with merged items from all transitive imports and
-        # strips the original Import nodes.  Without this snapshot, the
-        # `import_paths` extraction below the emit step sees an empty list,
-        # which causes every `.ritz.sig` to be written with `imports: []`,
-        # which causes `invalidate_dependents` to never propagate signature
-        # changes to importers — the per-function caching layer silently
-        # never invalidates anyone, manifesting as "I edited a lib and the
-        # binary still has stale code" until you `rm -rf .ritz-cache`.
-        original_import_paths: List[str] = []
-        for _item in module.items:
-            if isinstance(_item, rast.Import):
-                original_import_paths.append('.'.join(_item.path))
-
-        # Resolve imports and merge them into one module. Imported modules
-        # come from their interfaces (G9, AGAST #1810: module_interface.py),
-        # so only this file is parsed; only its bodies are emitted anyway.
-        # use_cache=False: the older .ritz-meta stubs lose generic bodies.
-        resolver = ImportResolver(project_root, use_cache=False, dependencies=dependencies,
-                                  source_roots=source_roots,
-                                  use_interfaces=module_interface.enabled())
-        module = resolver.resolve(module, source_path)
-
-        # What `token.Kind` may be qualified by: every module this compile saw.
-        module_names = {Path(f).stem for f in resolver.processed_files}
-        for aliases in resolver.import_aliases.values():
-            module_names.update(aliases)
-
-        # Hash every transitive import now, before emission, so the sig vouches
-        # for the sources this .ll was actually built from (AGAST #1674).
-        # The ritz.toml files that registered an imported namespace count too:
-        # their `sources` decide what `<name>.*` resolves to (AGAST #2087).
-        import_hashes = build_import_hashes(
-            [f for f in resolver.processed_files if f != source_abs_path]
-            + sorted(resolver.config_files))
-        # ...and the candidates it probed and missed on the way (AGAST #2030).
-        import_misses = sorted(resolver.missed_candidates)
-
-        # Filter out items that don't match target_os
-        # This must happen after import resolution but before name resolution
-        # so that name resolution doesn't see excluded items
-        module = _filter_by_target_os(module, target_os)
-
-        # An `impl` on a built-in type (Span, StrView, Option, Result) no
-        # module declares (AGAST #3162).  After the merge, so an imported
-        # `struct Span<T>` makes Span an ordinary struct.
-        builtin_impl_errors = check_builtin_impls(module)
-        # ...and on a type nothing declares or imports (AGAST #3264).
-        builtin_impl_errors += check_unknown_impl_targets(module)
-        if builtin_impl_errors:
-            for err in builtin_impl_errors:
-                print(f"Error: {err}", file=sys.stderr)
-            return False
-
-        # `E.from(v)` -> the generated `E__from(v)` (LANGUAGE_SPEC §10.4)
-        from_errors = rewrite_enum_from(module)
-        if from_errors:
-            for err in from_errors:
-                print(f"Error: {err}", file=sys.stderr)
-            return False
-
-        # Evaluate constant expressions in array sizes
-        # This must happen before name resolution since it transforms the AST
-        const_errors = evaluate_array_sizes(module)
-        if const_errors:
-            for err in const_errors:
-                print(f"Const eval error: {err}", file=sys.stderr)
-            return False
-
-        # A local named like a const, global or variant (AGAST #2407). Before
-        # monomorphisation, so a generic fn is judged whether or not it's used.
-        binder_errors = check_binders(module, source_abs_path)
-        if binder_errors:
-            for err in binder_errors:
-                print(f"Name error: {err}", file=sys.stderr)
-            return False
-
-        # A statement that can never run (AGAST #2520, LARB): before
-        # monomorphisation, so a generic fn is judged whether or not it's used.
-        dead_errors = check_reachable(module, source_abs_path)
-        if dead_errors:
-            for err in dead_errors:
-                print(err, file=sys.stderr)
-            return False
-
-        # Name resolution check (verifies all referenced names are defined)
-        if check_names:
-            name_errors = resolve_names(module, module_names)
-            if name_errors:
-                for err in name_errors:
-                    print(f"Name error: {err}", file=sys.stderr)
+        if _up_to_date(ctx):
+            print(f"Skipped {source_path} (unchanged)")
+            return True
+        for compile_pass in PASSES:
+            if not compile_pass(ctx):
                 return False
-
-        # A generic struct literal's left-out type args (§9.2, AGAST #3407):
-        # before the checkers, so the move checker sees `Box2 { v: d }` as
-        # the Box2<D> it is.
-        infer_struct_lit_args(module)
-
-        # Type check (verifies type compatibility)
-        if check_types:
-            type_checker = TypeChecker(module_names)
-            type_errors = type_checker.check(module)
-            if type_errors:
-                for err in type_errors:
-                    print(f"Type error: {err}", file=sys.stderr)
-                return False
-
-        # Ownership check (verifies move/borrow rules)
-        if check_ownership:
-            checker = MoveChecker()
-            ownership_errors = checker.check(module)
-            if ownership_errors:
-                # `c` in a reference slot wants `@c`, not "cannot move out".
-                slot_errors = check_ref_slots(module, lambda fn: True, module_names)
-                explains = [err for err in slot_errors if not err.after_moves]
-                for err in explains:
-                    print(f"Type error: {err}", file=sys.stderr)
-                if explains:
-                    return False
-                for err in ownership_errors:
-                    print(f"Ownership error: {err}", file=sys.stderr)
-                # The rest after it, as ritz1 prints them (#3189).
-                for err in slot_errors:
-                    print(f"Type error: {err}", file=sys.stderr)
-                return False
-
-        # --- Incremental compilation: per-fn IR reuse ---
-        # Build hash map and check against cached data before emission
-        fn_cache_data = None
-        try:
-            if source_hashes is None:
-                raise ValueError("fn hashes unavailable")
-            fn_hashes, sig_hashes = source_hashes
-            # Another ritz0's sig carries no outputs or fn IR forward (#3086).
-            old_sig_data = read_current_sig(source_abs_path)
-
-            # Detect signature changes and invalidate dependent modules
-            changed_sigs = detect_sig_changes(source_abs_path, sig_hashes)
-            if changed_sigs:
-                project_root = str(Path(source_path).resolve().parent)
-                for parent in Path(source_path).resolve().parents:
-                    if (parent / '.git').exists() or (parent / 'ritzlib').is_dir():
-                        project_root = str(parent)
-                        break
-                invalidate_dependents(source_abs_path, changed_sigs, project_root)
-
-            # Per-fn IR reuse is OFF: every fn is emitted fresh (AGAST #2019).
-            #
-            # The only "hits" the emitter ever honoured were fns the async
-            # transform synthesizes: an `async fn f` yields a constructor
-            # also named `f`, with no `source_file`, so `_should_emit_body`
-            # consulted the cache for it (source fns carry `source_file` and
-            # are always emitted).  Its body was skipped, `_splice_cached_ir`
-            # failed to match the `... "no-builtins"` declare, and a warm
-            # recompile shipped `f_poll` with `f` only declared — a link
-            # failure that build.py's shared CAS then kept for every worktree.
-            # Splicing can't be byte-identical to a cold compile in any case:
-            # a cached block's `!dbg !N` ids belong to the compile that wrote
-            # it.  The sig is still written (source-hash fast path, sig-change
-            # invalidation); its stored IR is just never spliced back in.
-            fn_cache_data = {
-                'cache_hits': {},
-                'cache_misses': dict(fn_hashes),
-                'sig_data': old_sig_data,
-            }
-        except Exception:
-            fn_hashes = {}
-            sig_hashes = {}
-            old_sig_data = None
-
-        # Emit IR
-        # Always use separate compilation: each source file → one .ll file
-        # Functions from current file: define (full body)
-        # Functions from imports: declare (external reference)
-        # --no-runtime only controls whether to emit _start entry point
-        emit_result = emit_llvmlite(module, no_runtime=no_runtime,
-                           source_file=source_file, source_dir=source_dir,
-                           main_source_path=source_abs_path,
-                           target=target, target_os=target_os,
-                           test_mode=test_mode,
-                           # Per-fn IR reuse is keyed on the source alone, so
-                           # it cannot tell a test-mode compile (no `main`)
-                           # from a normal one: test mode always emits fresh.
-                           fn_cache_data=None if test_mode else fn_cache_data,
-                           module_names=module_names)
-
-        if fn_cache_data is not None and isinstance(emit_result, tuple):
-            ir, emitted_fn_ir = emit_result
-        else:
-            ir = emit_result
-            emitted_fn_ir = {}
-
-        # Write output
-        Path(output_path).write_text(ir)
-
-        # --- Write .ritz.sig cache with emitted function IR ---
-        try:
-            # Use the import paths captured BEFORE resolve_imports — the
-            # post-resolved module no longer contains Import nodes (they're
-            # replaced by the merged imported items).
-            sig_data = build_sig_data(
-                source=source,
-                fn_hashes=fn_hashes,
-                sig_hashes=sig_hashes,
-                fn_ir=emitted_fn_ir,
-                imports=original_import_paths,
-                old_sig_data=old_sig_data,
-                import_hashes=import_hashes,
-                import_misses=import_misses,
-                outputs=build_outputs(old_sig_data, source, import_hashes,
-                                      output_path, mode_key, ir,
-                                      import_misses=import_misses),
-            )
-            write_sig_file(source_abs_path, sig_data)
-        except Exception as e:
-            # Cache write failure is non-fatal
-            print(f"Warning: cache write failed: {e}", file=sys.stderr)
-
         print(f"Compiled {source_path} -> {output_path}")
         return True
 
