@@ -2617,12 +2617,10 @@ fn emit_global_vars(s: *EmitterState)
 #   @.const.PAIRS.1.b = private constant [2 x i8] c"n\00"
 #   @PAIRS = internal constant [2 x %Pair] [ ... ]
 #
-# Only handles the shape needed by the current regression test: arrays whose
-# element type is a named struct, whose StructLit elements have
-# int / bool / char / StringLit-typed fields. Non-StrView struct-typed
-# fields inside the struct literal are not supported yet (would require
-# nested recursion); integer consts still take the old fast path via
-# find_const and do not need an LLVM global.
+# Each field of a StructLit element is lowered by emit_const_field_value:
+# integer / bool, pointer (null or a string), float and nested struct fields
+# (AGAST #1569, #3651); any other field is a located error.  Integer consts
+# still take the old fast path via find_const and need no LLVM global.
 
 # Find a FieldInit in a struct literal's FieldInit list by field name.
 # Note: parse_struct_lit returns the *FieldInit linked list directly,
@@ -2677,13 +2675,24 @@ fn emit_const_array_elem_string(s: *EmitterState, c: *ConstEntry, elem_idx: i32,
     emit_str(s, c"\\00\"\n")
 
 # Emit one struct-literal element inside the top-level array constant.
-# Walks the struct definition in field order (canonical) and emits each
-# field's value using `emit_const_field_value`.
 fn emit_const_struct_literal(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *StructDef, elem: *Expr)
     emit_str(s, c"%")
     emit_name(s, c.array_elem_type_name, c.array_elem_type_name_len)
-    emit_str(s, c" { ")
-    let fields: *FieldInit = elem.args as *FieldInit
+    emit_str(s, c" ")
+    emit_const_struct_body(s, c, elem_idx, st, elem.args as *FieldInit, null)
+
+# A field's place inside a const struct element: its FieldInit and the
+# enclosing struct literal's field (null at the element's top level), so an
+# error can name `inn.a` (AGAST #3651).
+struct ConstFieldPath
+    fi: *FieldInit
+    up: *ConstFieldPath
+
+# `{ <field>, ... }` of a struct literal whose fields are `fields`.  Walks the
+# struct definition in field order (canonical) and emits each field's value
+# using `emit_const_field_value`; `up` is where this literal sits.
+fn emit_const_struct_body(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *StructDef, fields: *FieldInit, up: *ConstFieldPath)
+    emit_str(s, c"{ ")
     var field: *StructField = st.fields
     var first: i32 = 1
     while field != null
@@ -2691,63 +2700,183 @@ fn emit_const_struct_literal(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st
             emit_str(s, c", ")
         first = 0
         let fi: *FieldInit = find_field_init(fields, field.name, field.name_len)
-        emit_const_field_value(s, c, elem_idx, field, fi)
+        emit_const_field_value(s, c, elem_idx, field, fi, up)
         field = field.next
     emit_str(s, c" }")
 
-# Emit one field's value as an LLVM typed-constant operand.
-# StrView-shaped struct field + StringLit value → %StrView { ptr @str, i64 len }.
-# Integer / bool field → `<type> <int>`, the value folded by const_fold_int
-# (AGAST #1569); one that doesn't fold is a located error.
-# Other scalars still take the value's raw int_val (AGAST #3651).
+# Emit one field's value as an LLVM typed-constant operand (AGAST #3651):
+#   integer / bool  `<type> <folded>` (const_fold_int, AGAST #1569)
+#   pointer         `ptr null`, or `ptr @<string>` for a string in a `*u8`
+#   f64 / f32       a float or integer literal, `-` applied; rounded as at run time
+#   struct          a nested struct literal, recursively; `"..."` is a StrView
+# Any other value or field type is a located error, never a silent 0: the
+# operand is still written, typed, so the line stays well-formed.
 # A missing field init falls back to zeroinitializer.
-fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, fi: *FieldInit)
-    if fi == null
+fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, fi: *FieldInit, up: *ConstFieldPath)
+    if fi == null or fi.value == null
         # Missing field init — shouldn't happen for well-formed source.
         emit_field_llvm_type(s, field)
         emit_str(s, c" zeroinitializer")
         return
+    var here: ConstFieldPath
+    here.fi = fi
+    here.up = up
     let v: *Expr = fi.value
-    if field.field_type == TYPE_STRUCT and v != null and v.kind == EXPR_STRING_LIT
+    let ft: i32 = field.field_type
+    emit_field_llvm_type(s, field)
+    emit_str(s, c" ")
+    if ft == TYPE_STRUCT and v.kind == EXPR_STRING_LIT
         # Treat target struct as StrView-shaped: { ptr, i64 len }.
-        emit_str(s, c"%")
-        emit_name(s, field.field_type_name, field.field_type_name_len)
-        emit_str(s, c" { ptr @.const.")
-        emit_name(s, c.name, c.name_len)
-        emit_str(s, c".")
-        emit_int(s, elem_idx as i64)
-        emit_str(s, c".")
-        emit_name(s, fi.name, fi.name_len)
+        emit_str(s, c"{ ptr ")
+        emit_const_string_ref(s, c, elem_idx, v, @here)
         emit_str(s, c", i64 ")
         emit_int(s, v.string_len as i64)
         emit_str(s, c" }")
         return
-    # Scalar / integer path — emit typed integer literal.
-    emit_llvm_type(s, field.field_type)
-    emit_str(s, c" ")
-    if v == null
-        emit_int(s, 0)
-        return
     # AGAST #1569: an integer field is folded, as #1557 folds primitive
-    # elements.  A raw `int_val` is 0 for `-5`, `K`, `A * 4 - 1`...; a field
-    # that doesn't fold is a located error, never a silent 0.
-    if is_int_const_type(field.field_type) == 1
+    # elements.  A raw `int_val` is 0 for `-5`, `K`, `A * 4 - 1`...
+    if is_int_const_type(ft) == 1
         var folded: i64 = 0
         if const_fold_int(s.module.constants, v, 1, @folded) == 0
             emit_int(s, 0)
-            const_field_error(s, c, elem_idx, fi)
+            const_field_error(s, c, elem_idx, @here, c"is not a constant integer expression")
             return
         emit_int(s, folded)
         return
-    emit_int(s, v.int_val)
+    if ft == TYPE_PTR or ft == TYPE_PTR_PTR
+        emit_const_ptr_field(s, c, elem_idx, field, v, @here)
+        return
+    if ft == TYPE_F64 or ft == TYPE_F32
+        emit_const_float_field(s, c, elem_idx, ft, v, @here)
+        return
+    if ft == TYPE_STRUCT
+        let st: *StructDef = find_struct(s, field.field_type_name, field.field_type_name_len)
+        if st != null
+            if v.kind != EXPR_STRUCT_LIT
+                emit_str(s, c"zeroinitializer")
+                const_field_error(s, c, elem_idx, @here, c"is not a struct literal")
+                return
+            emit_const_struct_body(s, c, elem_idx, st, v.args as *FieldInit, @here)
+            return
+    # An enum, an array, or anything else ritz1 has no constant form for.
+    emit_str(s, c"zeroinitializer")
+    const_field_error(s, c, elem_idx, @here, c"has a type ritz1 can't lower in a const (integer, bool, float, pointer and struct fields are)")
 
-# AGAST #1569: field `fi` of struct element `elem_idx` of const array `c` is
-# an integer field whose value isn't a constant integer expression.  Reported
-# at the value (at the const when the value has no position).  The global is
+# A string literal's bytes as a constant `ptr` operand.  A `"..."` directly in
+# an element has its own `@.const.NAME.ELEM.FIELD` (emitted up front by
+# emit_const_array_entry); one in a nested literal, and any `c"..."`, comes
+# from the string pool.
+fn emit_const_string_ref(s: *EmitterState, c: *ConstEntry, elem_idx: i32, v: *Expr, path: *ConstFieldPath)
+    if path.up == null and v.kind == EXPR_STRING_LIT
+        emit_str(s, c"@.const.")
+        emit_name(s, c.name, c.name_len)
+        emit_str(s, c".")
+        emit_int(s, elem_idx as i64)
+        emit_str(s, c".")
+        emit_name(s, path.fi.name, path.fi.name_len)
+        return
+    emit_cstring_const(s, v.string_ptr, v.string_len)
+
+# AGAST #3651: a pointer field's value -- `null`, or a string in a `*u8`.
+fn emit_const_ptr_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, v: *Expr, path: *ConstFieldPath)
+    if v.kind == EXPR_NIL_LIT
+        emit_str(s, c"null")
+        return
+    let byte_ptr: i32 = (field.field_type == TYPE_PTR and (field.ptr_pointee == TYPE_U8 or field.ptr_pointee == TYPE_I8)) as i32
+    if byte_ptr == 1 and (v.kind == EXPR_STRING_LIT or v.kind == EXPR_CSTRING_LIT)
+        emit_const_string_ref(s, c, elem_idx, v, path)
+        return
+    emit_str(s, c"null")
+    const_field_error(s, c, elem_idx, path, c"is not a constant pointer (null or a string literal)")
+
+# AGAST #3651: a float field's value -- a float literal, or an integer literal
+# (LANGUAGE_SPEC 7.5: a literal converts into a float slot), under any number
+# of unary `-`.  f64 is the literal's own text: LLVM rounds a decimal `double`
+# exactly as it does the `fadd double 0.0, <lit>` of a run-time literal.  An
+# f32 constant must be exact, so it is written as the hex `double` of the
+# literal rounded to double and then to float, as an f32 local is.  An
+# integer converts as int_into_float_slot's sitofp does.
+fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: i32, v: *Expr, path: *ConstFieldPath)
+    var neg: i32 = 0
+    var e: *Expr = v
+    while e.kind == EXPR_UNARY and e.op == OP_NEG
+        neg = 1 - neg
+        e = e.operand
+    if e.kind == EXPR_INT_LIT
+        var n: i64 = e.int_val
+        if neg == 1
+            n = 0 - n
+        if ft == TYPE_F64
+            var d: f64 = n as f64
+            emit_double_bits(s, *(@d as *i64))
+        else
+            let narrow: f32 = n as f32
+            var wide: f64 = narrow as f64
+            emit_double_bits(s, *(@wide as *i64))
+        return
+    if e.kind != EXPR_FLOAT_LIT
+        emit_str(s, c"0.0")
+        const_field_error(s, c, elem_idx, path, c"is not a float literal or an integer literal")
+        return
+    if ft == TYPE_F64
+        if neg == 1
+            emit_str(s, c"-")
+        emit_name(s, e.string_ptr, e.string_len)
+        return
+    var bits: i64 = 0
+    if f32_literal_bits(e.string_ptr, e.string_len, neg, @bits) == 0
+        emit_str(s, c"0.0")
+        const_field_error(s, c, elem_idx, path, c"is an f32 literal with more digits than ritz1 rounds exactly (at most 15 significant, 22 after the point)")
+        return
+    emit_double_bits(s, bits)
+
+# A float constant as LLVM's hex form: `0x` and the 16 hex digits of the
+# `double` bits (also how an exact f32 value is written).
+fn emit_double_bits(s: *EmitterState, bits: i64)
+    emit_str(s, c"0x")
+    var sh: i32 = 60
+    while sh >= 0
+        emit_name(s, c"0123456789ABCDEF" + ((bits >> sh) & 15), 1)
+        sh -= 4
+
+# The bits of the `double` holding float literal `text` (digits '.' digits)
+# rounded to double, negated if `neg`, then rounded to float.  Returns 0 when
+# the literal is outside Clinger's fast path -- a mantissa above 2^53 or more
+# than 22 decimals -- where `m / 10^k` in doubles may not round correctly.
+fn f32_literal_bits(text: *u8, len: i32, neg: i32, out: *i64) -> i32
+    var m: i64 = 0
+    var k: i32 = 0
+    var after: i32 = 0
+    for i in 0..len
+        let ch: u8 = *(text + i)
+        if ch == '.'
+            after = 1
+        else if ch >= '0' and ch <= '9'
+            m = m * 10 + (ch - '0') as i64
+            if m > 9007199254740992
+                return 0
+            if after == 1
+                k += 1
+    if k > 22
+        return 0
+    var p: f64 = 1.0
+    for j in 0..k
+        p = p * 10.0
+    var x: f64 = (m as f64) / p
+    if neg == 1
+        x = -x
+    let narrow: f32 = x as f32
+    var back: f64 = narrow as f64
+    *out = *(@back as *i64)
+    1
+
+# AGAST #1569 / #3651: the field at `path` of struct element `elem_idx` of
+# const array `c` has a value ritz1 can't lower; `why` says how.  Reported at
+# the value (at the const when the value has no position).  The global is
 # mid-line here, so there is no `; ERROR` marker: error_count fails the build.
-fn const_field_error(s: *EmitterState, c: *ConstEntry, elem_idx: i32, fi: *FieldInit)
-    var line: i32 = fi.value.span.line
-    var col: i32 = fi.value.span.col
+fn const_field_error(s: *EmitterState, c: *ConstEntry, elem_idx: i32, path: *ConstFieldPath, why: *u8)
+    var line: i32 = path.fi.value.span.line
+    var col: i32 = path.fi.value.span.col
     if line == 0
         line = c.line
         col = c.col
@@ -2771,12 +2900,21 @@ fn const_field_error(s: *EmitterState, c: *ConstEntry, elem_idx: i32, fi: *Field
     eprints_cstr(c"' element ")
     eprint_i64(elem_idx as i64)
     eprints_cstr(c" field '")
-    i = 0
-    while i < fi.name_len
-        eprint_char(*(fi.name + i))
-        i += 1
-    eprints_cstr(c"' is not a constant integer expression\n")
+    eprint_field_path(path)
+    eprints_cstr(c"' ")
+    eprints_cstr(why)
+    eprints_cstr(c"\n")
     s.error_count = s.error_count + 1
+
+# `inn.leaf.v`: the field names from the element down to `path`.
+fn eprint_field_path(path: *ConstFieldPath)
+    if path.up != null
+        eprint_field_path(path.up)
+        eprint_char('.')
+    var i: i32 = 0
+    while i < path.fi.name_len
+        eprint_char(*(path.fi.name + i))
+        i += 1
 
 # AGAST #1557: element `idx` of the primitive const array `c` isn't a
 # constant integer expression.  Reported at the const's location (elements
