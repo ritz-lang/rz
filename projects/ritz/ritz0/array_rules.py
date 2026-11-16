@@ -29,6 +29,14 @@ def literal_length(count: int, slot: str) -> str:
 WHOLE_ARRAY_NOT_A_VALUE = ('a whole array is not a value here (index it, copy it '
                            'into an array of the same type, or take its address with @)')
 
+# A whole `[N]T` where a `*U` goes, `U` not an array (AGAST #3054): the general
+# words' "take its address with @" leads to a second refusal there (`@a` is a
+# `*[N]T`, REF_TO_OTHER_TYPE), so the pointer slot has its own, naming the form
+# that fits. ritz1 prints the same words, from ref_check.ritz. Into a `*[M]U`
+# it's still the general words: `@a[0]` doesn't fit that either.
+WHOLE_ARRAY_INTO_POINTER = ('a whole array is not a pointer: '
+                            '`@a[0]` points at its first element')
+
 # `[]` through a reference to anything else (AGAST #2440, LARB R9).  ritz1 prints
 # the same words, from index_through.ritz.
 NOT_A_BUFFER = ('a reference is one value, not a buffer: '

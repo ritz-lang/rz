@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """A whole array where a `*T` goes is refused, located, by all three compilers
-(AGAST #2392).
+(AGAST #2392), in words that name the form that fits: `@a[0]` (AGAST #3054).
+The general whole-array words said "take its address with @", and `@a` into a
+`*i32` is refused again, as a reference to another type.
 
 `fn f() -> *i32 / var a: [2]i32 = [1, 2] / return a`: ritz1 and
 ritz1_selfhosted refuse the array with its own words, at the array. ritz0's
@@ -19,9 +21,9 @@ the same `line:col: message`.
 
 import pytest
 
-from array_rules import WHOLE_ARRAY_NOT_A_VALUE
+from array_rules import WHOLE_ARRAY_INTO_POINTER, WHOLE_ARRAY_NOT_A_VALUE
 from ref_rules import VALUE_INTO_SHARED_REF
-from test_ref_into_value import COMPILERS, _assert_refused, _ids, _main, _run
+from test_ref_into_value import COMPILERS, _assert_refused, _compile, _ids, _main, _run
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
@@ -45,12 +47,19 @@ SITES = {
     "pointer_elements": "fn f(a: [2]*i32) -> *i32\n    return ^a\n",
 }
 
+# Into a pointer to an array of another length, `@a[0]` doesn't fit either:
+# the general words, on all three (AGAST #3054 leaves them).
+OTHER_ARRAY = "fn f() -> *[3]i32\n    var a: [2]i32 = [1, 2]\n    return ^a\n"
+
 # A `:&` array param is the value-into-reference rule's, on all three: its
 # words, not these (test_value_into_ref.py, #2337).
 LENT = "fn f(a:& [2]i32) -> *i32\n    return ^a\n"
 
 # What the error's alternatives say, written out: they compile and run.
 WRITTEN = {
+    # The form the error names, from a local (AGAST #3054).
+    "first_element": ("fn f() -> i32\n    var a: [2]i32 = [4, 3]\n    let p: *i32 = @a[0]\n    *p\n",
+                      "    f()\n", 4),
     "element_address": ("fn f(a: @[2]i32) -> *i32\n    return @a[1]\n",
                         "    var a: [2]i32 = [1, 3]\n    let p = f(@a)\n    *p\n", 3),
     "array_pointer": ("fn f(a: @&[2]i32) -> *[2]i32\n    return a\n",
@@ -69,6 +78,22 @@ def _params(table):
 @pytest.mark.parametrize("site,compiler", list(_params(SITES)))
 def test_a_whole_array_never_fits_a_pointer_slot(tmp_path, compiler, site):
     _assert_refused(compiler, tmp_path, site, _main(HEAD + SITES[site], "    0\n"),
+                    WHOLE_ARRAY_INTO_POINTER)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_only_the_pointer_words(tmp_path, compiler):
+    """One error at the array: not the general words' `@` hint beside it."""
+    src = _main(HEAD + SITES["let"], "    0\n").replace("^", "")
+    comp, _, _ = _compile(compiler, tmp_path, "only", src)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0 and WHOLE_ARRAY_INTO_POINTER in out, out
+    assert "take its address with @" not in out, out
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_array_into_a_pointer_to_another_array(tmp_path, compiler):
+    _assert_refused(compiler, tmp_path, "other_array", _main(OTHER_ARRAY, "    0\n"),
                     WHOLE_ARRAY_NOT_A_VALUE)
 
 

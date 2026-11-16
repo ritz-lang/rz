@@ -1570,9 +1570,12 @@ class TypeChecker:
             # A whole array into a `*U` of anything but itself (#2392): ritz1's
             # emitter refuses it at the array, in its words. Into an `@U`, or
             # from a `:&` param, it's the value-into-reference error above, as
-            # it is in ritz1.
+            # it is in ritz1. Into a `*U` of a non-array U, `@a` is refused
+            # too, so the words name `@a[0]` (#3054), as ritz1's ref_check.
             self._slot_reported.add(id(expr))
-            self._slot_error(array_rules.WHOLE_ARRAY_NOT_A_VALUE, expr.span)
+            message = (array_rules.WHOLE_ARRAY_NOT_A_VALUE if isinstance(inner, rast.ArrayType)
+                       else array_rules.WHOLE_ARRAY_INTO_POINTER)
+            self._slot_error(message, expr.span)
 
     @staticmethod
     def _is_void(ty: rast.Type) -> bool:
