@@ -232,6 +232,14 @@ def _abi_size_align(ty: ir.Type) -> tuple:
     if isinstance(ty, ir.ArrayType):
         size, align = _abi_size_align(ty.element)
         return ty.count * size, align
+    if isinstance(ty, ir.VectorType):
+        # x86-64: a vector is aligned to its size rounded up to a power of
+        # two, and its alloc size is that rounded size (<4 x i64>: 32, 32).
+        size = ty.count * _abi_size_align(ty.element)[0]
+        align = 1
+        while align < size:
+            align *= 2
+        return align, align
     if isinstance(ty, ir.BaseStructType) and ty.elements is not None:
         packed = getattr(ty, 'packed', False)
         off, max_align = 0, 1
@@ -4650,11 +4658,16 @@ class LLVMEmitter:
         aggregates (StrView, Span, Result/Option) keep their ABI.  AGAST
         #2306 / #3181: and a `[N]T` array of at least SRET_MIN_BYTES, which
         is then also a byval param and copied pointer-to-pointer (#1732).
+
+        AGAST #1744: measured by the padded LLVM alloc size, as ritz1's
+        get_struct_size_by_name measures it.  For a param this threshold IS
+        the ABI (byval vs first-class), so `{[63]i32, u8}` (256 B with tail
+        padding, 253 B unpadded) must be byval in both compilers.
         """
         if (isinstance(ret_type, ir.IdentifiedStructType)
                 and ret_type.name.startswith('struct.')
                 and ret_type.elements is not None
-                and self._type_size_bytes(ret_type) >= SRET_MIN_BYTES):
+                and _abi_size_align(ret_type)[0] >= SRET_MIN_BYTES):
             return ret_type
         if (isinstance(ret_type, ir.ArrayType)
                 and _abi_size_align(ret_type)[0] >= SRET_MIN_BYTES):
