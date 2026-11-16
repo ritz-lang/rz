@@ -135,7 +135,8 @@ impl S
 
 
 def _int_only(t: str) -> dict:
-    """What leans on `n` being an integer local: #1668 hasn't bound a float so."""
+    """What leans on `n` being a local of its type: an integer, or a float since
+    AGAST #1668."""
     v = _lit(t, 3)
     arg = "@&a[1]"
     by_value = f"let r: {t} = f({arg})\n    a[1] = r"
@@ -172,8 +173,7 @@ def _reads(t: str) -> dict:
     return out
 
 
-# These only lean on the local recording its referent: #1668 hasn't bound a float
-# as a local of its type.
+# These only lean on the local recording its referent.
 FLOAT_READS = {}
 for ft in FLOATS:
     FLOAT_READS[f"{ft}_read"] = f"""\
@@ -335,11 +335,12 @@ BY_VALUE = {
     "pointer_into_reference_of_the_pointee": TYPES + "fn go(h:& *C)\n    let p: @&C = h\n    p.x = 3\n"
                                              + POINTER_MAIN.replace("CALL", "go(@&q)"),
 }
-for it in INTS:
-    three = _lit(it, 3)
+# AGAST #1668: and a float, which binds as a local of its type as an integer does.
+for it in INTS + FLOATS:
+    three, one = _lit(it, 3), _lit(it, 1)
     keep = _neighbours(it, f"a[1] = {three}\n    let r: {it} = f(@&a[1])\n    a[1] = r")
-    BY_VALUE[f"{it}_let"] = f"fn f(n:& {it}) -> {it}\n    let d: {it} = n\n    n = 1\n    return d\n" + keep
-    BY_VALUE[f"{it}_untyped_let"] = f"fn f(n:& {it}) -> {it}\n    let d = n\n    n = 1\n    return d\n" + keep
+    BY_VALUE[f"{it}_let"] = f"fn f(n:& {it}) -> {it}\n    let d: {it} = n\n    n = {one}\n    return d\n" + keep
+    BY_VALUE[f"{it}_untyped_let"] = f"fn f(n:& {it}) -> {it}\n    let d = n\n    n = {one}\n    return d\n" + keep
     BY_VALUE[f"{it}_return"] = f"fn f(n:& {it}) -> {it}\n    return n\n" + keep
     BY_VALUE[f"{it}_argument"] = f"fn g(m: {it}) -> {it}\n    return m\n\nfn f(n:& {it}) -> {it}\n    return g(n)\n" + keep
 
@@ -347,7 +348,7 @@ PROGRAMS = {}
 for it in INTS:
     PROGRAMS.update({f"{it}_{k}": v for k, v in {**_writes(it), **_int_only(it), **_reads(it)}.items()})
 for ft in FLOATS:
-    PROGRAMS.update({f"{ft}_{k}": v for k, v in _writes(ft).items()})
+    PROGRAMS.update({f"{ft}_{k}": v for k, v in {**_writes(ft), **_int_only(ft)}.items()})
 PROGRAMS.update(FLOAT_READS)
 PROGRAMS.update({f"bool_{k}": body + BOOL_MAIN.replace("CALL", call) for k, (body, call) in BOOLS.items()})
 for at in ["i8", "i16", "i32", "i64", "f64"]:

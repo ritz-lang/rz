@@ -158,6 +158,52 @@ pub fn main() -> i32
     outer(@&x)
     x as i32
 """,
+    # AGAST #1668: an f64 pointee binds as an f64 local, so `x + 1.0` is a
+    # float sum (it was refused as pointer arithmetic), `x > 41.0` compares
+    # the value and `x += 0.5` stores a double.
+    "borrow_f64_compound_and_compare": """\
+fn bump(x:& f64) -> i32
+    x = x + 1.0
+    x += 0.5
+    if x > 41.0
+        return 0
+    1
+
+pub fn main() -> i32
+    var x: f64 = 40.5
+    let miss: i32 = bump(@&x)
+    (x as i32) + miss
+""",
+    # f32: the store is 4 bytes, so the neighbouring field keeps its value.
+    "borrow_f32_width": """\
+struct P
+    a: f32
+    b: f32
+
+fn dbl(x:& f32)
+    x = x * 2.0
+
+pub fn main() -> i32
+    var p: P = P { a: 21.0, b: 7.0 }
+    dbl(@&p.a)
+    if p.b != 7.0
+        return 1
+    p.a as i32
+""",
+    # `@&x` of a float borrow forwards the caller's pointer.
+    "borrow_f64_forwarded": """\
+fn inner(x:& f64)
+    x = x + 2.0
+
+fn outer(x:& f64)
+    inner(@&x)
+    x = x * 1.0
+
+pub fn main() -> i32
+    var x: f64 = 40.0
+    outer(@&x)
+    x as i32
+""",
 }
 
 # --- 3. `@&` value into a `*T` (i64) parameter -------------------------------
@@ -184,6 +230,25 @@ fn fwd(x: @&i64)
 pub fn main() -> i32
     var x: i64 = 0
     fwd(@&x)
+    x as i32
+""",
+    # AGAST #1668: the method call's `*T` arg, from a float borrow bound as
+    # an f64 local: `@&x` is the caller's pointer, ptrtoint'd for the `*f64`.
+    "ufcs_float_borrow_into_ptr_param": """\
+struct V
+    k: i32
+
+impl V
+    fn put(self: @V, p: *f64)
+        *p = 42.0
+
+fn f(v: @V, x:& f64)
+    v.put(@&x)
+
+pub fn main() -> i32
+    var v: V = V { k: 0 }
+    var x: f64 = 1.0
+    f(@v, @&x)
     x as i32
 """,
 }

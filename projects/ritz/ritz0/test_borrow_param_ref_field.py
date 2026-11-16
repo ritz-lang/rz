@@ -1433,7 +1433,8 @@ pub fn main() -> i32
 """,
 })
 
-# AGAST #2250: known gaps next to it, each pinned by its own ticket below.
+# AGAST #2250: by-value fields fed from a float or a bool borrow, once gaps;
+# #1668 (float) and #2994 (bool) bind the borrow as a local of its type.
 CONTROLS.update({
     "by_value_float_field": """\
 struct F
@@ -3034,10 +3035,7 @@ for _name in NO_IMPLICIT_DEREF:
 
 
 # Keyed by program, across STORES, CONTROLS and MOVE_OUT.
-RITZ1_GAPS = {
-    "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
-    "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
-}
+RITZ1_GAPS = {}
 
 # `@n` into a `*i32` that isn't a field: the caller's address, so the write
 # through it reaches them.

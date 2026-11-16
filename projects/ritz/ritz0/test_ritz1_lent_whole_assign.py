@@ -14,9 +14,9 @@ For `r = v` with `v:& C` as well, the value IS a pointer, so it compiled and
 silently reseated `r` onto `v`: the caller's struct was never written.
 
 ritz1 now loads the borrow's pointer and stores the value at T.  The f32 / f64
-store (#1668's) goes through the same arm and is pinned here too; READING a
-`:&` float at all is still #1668, pinned in KNOWN_GAPS.  A `:& bool` binds as
-the `bool` itself, as an integer does (AGAST #2994).
+store (#1668's) goes through the same arm and is pinned here too.  A `:& f32` /
+`:& f64` binds as the float itself (AGAST #1668) and a `:& bool` as the `bool`
+(AGAST #2994), as an integer does.
 
 Every program returns 3 only if the caller sees the whole new value, and the
 neighbouring rows check the store is exactly T wide.
@@ -31,7 +31,6 @@ from test_borrow_param_ref_field import _run
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
-RITZ1S = ["ritz1", "ritz1_selfhosted"]
 
 _C = "struct C\n    a: i64\n    b: i64\n\n"
 _E = "enum E\n    A\n    B\n    C\n\n"
@@ -209,12 +208,8 @@ pub fn main() -> i32
         return 3
     1
 """,
-}
-
-# ritz0 is right; ritz1 refuses or miscompiles.  All READ a `:&` float, which
-# #1668 hasn't lowered: the store above is not the problem.
-KNOWN_GAPS = {
-    "f32_from_borrow": (1668, """\
+    # AGAST #1668: each READS a `:&` float too, which binds as a float local.
+    "f32_from_borrow": """\
 fn w(r:& f32, v:& f32)
     r = v
 
@@ -223,8 +218,8 @@ pub fn main() -> i32
     var y: f32 = 3.0
     w(@&x, @&y)
     x as i32
-"""),
-    "f64_compound": (1668, """\
+""",
+    "f64_compound": """\
 fn w(r:& f64)
     r += 2.0
 
@@ -232,7 +227,7 @@ pub fn main() -> i32
     var x: f64 = 1.0
     w(@&x)
     x as i32
-"""),
+""",
 }
 
 
@@ -253,19 +248,3 @@ def run_with(ritz1_bin, tmp_path):
 @pytest.mark.parametrize("name", sorted(SHAPES))
 def test_whole_assign_writes_the_referent(run_with, name, compiler):
     assert run_with(compiler, name, SHAPES[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(KNOWN_GAPS))
-def test_ritz0_has_the_known_gaps_right(run_with, name):
-    assert run_with("ritz0", name, KNOWN_GAPS[name][1]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize(
-    "name",
-    [pytest.param(n, marks=pytest.mark.xfail(strict=True, reason=f"AGAST #{KNOWN_GAPS[n][0]}"))
-     for n in sorted(KNOWN_GAPS)])
-def test_ritz1_known_gaps(run_with, name, compiler):
-    assert run_with(compiler, name, KNOWN_GAPS[name][1]) == 3
