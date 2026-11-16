@@ -1,0 +1,138 @@
+# spire/test/test_int_format.ritz
+#
+# Integer formatting at the extremes (AGAST #1956). spire's integer output
+# goes through ritzlib.fmt (fmt_i64_into / string_push_i64); these pin the
+# values a hand-written `% 10` loop gets wrong: 0, i64's minimum and
+# maximum, u16's maximum, and timestamp years past 9999 or before 1970.
+
+import ritzlib.strview { StrView, strview_eq }
+import ritzlib.string { String, string_as_view }
+import ritzlib.span { Span, span_from_cstr, span_eq_cstr }
+
+import http.types { METHOD_GET }
+import spire.http.request { Request, request_with }
+import spire.http.response { Response, response_ok }
+import spire.http.response { response_header_count, response_header_name, response_header_value }
+import spire.json.mod { JsonBuilder, json_builder_new, json_builder_finish }
+import spire.json.mod { json_array_start, json_array_end, json_elem_i64 }
+import spire.middleware.mod { RequestLog, request_log_new, request_log_format, request_log_json }
+import spire.middleware.mod { rate_limit_headers }
+import spire.model.timestamp { Timestamp, timestamp_from_unix, timestamp_to_iso8601 }
+import spire.utils { string_as_strview }
+
+# i64's extremes, spelled so the literal itself does not overflow.
+fn i64_min() -> i64
+    return -9223372036854775807 - 1
+
+fn i64_max() -> i64
+    return 9223372036854775807
+
+fn header_is(resp: *Response, name: *u8, expected: *u8) -> bool
+    var i: i64 = 0
+    while i < response_header_count(resp)
+        var n: Span<u8> = response_header_name(resp, i)
+        if span_eq_cstr(@n, name)
+            var v: Span<u8> = response_header_value(resp, i)
+            return span_eq_cstr(@v, expected)
+        i += 1
+    return false
+
+# A GET /x log entry with the given status and duration.
+fn log_with(status: i32, duration_us: i64) -> RequestLog
+    let p: Span<u8> = span_from_cstr("/x")
+    let req: Request = request_with(METHOD_GET, @p)
+    var log: RequestLog = request_log_new(@req)
+    log.status = status
+    log.duration_us = duration_us
+    return log
+
+fn iso_is(seconds: i64, expected: StrView) -> bool
+    let t: Timestamp = timestamp_from_unix(seconds)
+    var s: String = timestamp_to_iso8601(@t)
+    return strview_eq(string_as_strview(@s), expected)
+
+# ============================================================================
+# JsonBuilder
+# ============================================================================
+
+[[test]]
+fn test_json_elem_i64_extremes() -> i32
+    var b: JsonBuilder = json_builder_new()
+    json_array_start(@&b)
+    json_elem_i64(@&b, 0)
+    json_elem_i64(@&b, i64_max())
+    json_elem_i64(@&b, i64_min())
+    json_elem_i64(@&b, -1)
+    json_array_end(@&b)
+    assert strview_eq(json_builder_finish(@&b), "[0,9223372036854775807,-9223372036854775808,-1]")
+    0
+
+# ============================================================================
+# Request log
+# ============================================================================
+
+[[test]]
+fn test_request_log_format_extremes() -> i32
+    let lo: RequestLog = log_with(0, i64_min())
+    let a: String = request_log_format(@lo)
+    assert strview_eq(string_as_view(@a), "GET /x 0 -9223372036854775808us")
+    let hi: RequestLog = log_with(65535, i64_max())
+    let b: String = request_log_format(@hi)
+    assert strview_eq(string_as_view(@b), "GET /x 65535 9223372036854775807us")
+    0
+
+[[test]]
+fn test_request_log_json_extremes() -> i32
+    let lo: RequestLog = log_with(0, i64_min())
+    let a: String = request_log_json(@lo)
+    assert strview_eq(string_as_view(@a), "{\"method\":\"GET\",\"path\":\"/x\",\"status\":0,\"duration_us\":-9223372036854775808}")
+    let hi: RequestLog = log_with(65535, i64_max())
+    let b: String = request_log_json(@hi)
+    assert strview_eq(string_as_view(@b), "{\"method\":\"GET\",\"path\":\"/x\",\"status\":65535,\"duration_us\":9223372036854775807}")
+    0
+
+# ============================================================================
+# Rate-limit headers
+# ============================================================================
+
+[[test]]
+fn test_rate_limit_headers_extremes() -> i32
+    var resp: Response = response_ok()
+    rate_limit_headers(@resp, i64_max(), 0, i64_min())
+    assert header_is(@resp, "X-RateLimit-Limit", "9223372036854775807")
+    assert header_is(@resp, "X-RateLimit-Remaining", "0")
+    assert header_is(@resp, "X-RateLimit-Reset", "-9223372036854775808")
+    0
+
+# ============================================================================
+# Timestamp
+# ============================================================================
+
+[[test]]
+fn test_iso8601_epoch() -> i32
+    assert iso_is(0, "1970-01-01T00:00:00Z")
+    0
+
+[[test]]
+fn test_iso8601_last_second_of_9999() -> i32
+    assert iso_is(253402300799, "9999-12-31T23:59:59Z")
+    0
+
+# The year was taken mod 10000, printing "0000-01-01T00:00:00Z".
+[[test]]
+fn test_iso8601_year_10000() -> i32
+    assert iso_is(253402300800, "10000-01-01T00:00:00Z")
+    0
+
+# Before the epoch: floor division, so the time of day stays in 0..86399
+# (truncation gave negative hours and non-digit characters).
+[[test]]
+fn test_iso8601_one_second_before_epoch() -> i32
+    assert iso_is(-1, "1969-12-31T23:59:59Z")
+    0
+
+[[test]]
+fn test_iso8601_before_epoch_leap_year() -> i32
+    # 1968-02-29T12:00:00Z
+    assert iso_is(-58017600, "1968-02-29T12:00:00Z")
+    0
