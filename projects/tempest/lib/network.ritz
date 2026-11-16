@@ -11,9 +11,8 @@
 
 import ritzlib.io { prints, print_int }
 import ritzlib.strview { StrView }
-import ritzlib.string { String, string_from_strview }
-import ritzlib.gvec { Vec, vec_new, vec_push }
-import ritzlib.hashmap
+import ritzlib.string { String, string_from, string_from_strview, string_eq_strview }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get, vec_get_ptr }
 import ritzlib.net { Socket, socket_tcp, socket_connect, socket_send, socket_recv, socket_close }
 
 # TODO: Import from http library when available
@@ -62,10 +61,12 @@ pub struct Response
 
 ## Network manager for handling HTTP requests.
 pub struct NetworkManager
-    # Connection pool: host -> Vec<Connection>
-    connections: HashMap<String, Vec<Connection>>
-    # Cookie jar: domain -> Vec<Cookie>
-    cookies: HashMap<String, Vec<Cookie>>
+    # Connection pool: one bucket per host, found by linear scan.
+    # ritzlib has no generic HashMap (AGAST #1858), and a browser holds a
+    # handful of hosts at once, so a Vec of buckets is enough.
+    connections: Vec<HostPool>
+    # Cookie jar: one bucket per domain, same shape as the pool.
+    cookies: Vec<CookieJar>
     # Pending requests
     pending: Vec<Request>
     # Next request ID
@@ -78,6 +79,16 @@ struct Connection
     port: i32
     is_tls: i32
     in_use: i32
+
+# All pooled connections to one host
+struct HostPool
+    host: String
+    conns: Vec<Connection>
+
+# All cookies for one domain
+struct CookieJar
+    domain: String
+    cookies: Vec<Cookie>
 
 # A cookie
 struct Cookie
@@ -92,8 +103,8 @@ struct Cookie
 ## Create network manager.
 pub fn network_manager_new(config: Config) -> NetworkManager
     var nm: NetworkManager
-    nm.connections = hashmap_new<String, Vec<Connection>>()
-    nm.cookies = hashmap_new<String, Vec<Cookie>>()
+    nm.connections = vec_new<HostPool>()
+    nm.cookies = vec_new<CookieJar>()
     nm.pending = vec_new<Request>()
     nm.next_id = 1
     return nm
@@ -196,3 +207,84 @@ fn connect_to_host(host: String, port: i32, use_tls: i32) -> Connection
 fn release_connection(nm:& NetworkManager, conn:& Connection)
     conn.in_use = 0
     # Return to pool for reuse
+
+# ============================================================================
+# Connection pool and cookie jar buckets
+# ============================================================================
+
+## Index of the pool bucket for `host`, or -1 if there is none.
+fn find_host_pool(nm: @NetworkManager, host: StrView) -> i64
+    var i: i64 = 0
+    while i < vec_len<HostPool>(@nm.connections)
+        let pool = vec_get<HostPool>(@nm.connections, i)
+        if string_eq_strview(@pool.host, host)
+            return i
+        i += 1
+    return -1
+
+## Index of the cookie bucket for `domain`, or -1 if there is none.
+fn find_cookie_jar(nm: @NetworkManager, domain: StrView) -> i64
+    var i: i64 = 0
+    while i < vec_len<CookieJar>(@nm.cookies)
+        let jar = vec_get<CookieJar>(@nm.cookies, i)
+        if string_eq_strview(@jar.domain, domain)
+            return i
+        i += 1
+    return -1
+
+## Number of hosts with a pool bucket.
+pub fn network_host_count(nm: @NetworkManager) -> i64
+    return vec_len<HostPool>(@nm.connections)
+
+## Number of domains with a cookie bucket.
+pub fn network_domain_count(nm: @NetworkManager) -> i64
+    return vec_len<CookieJar>(@nm.cookies)
+
+## Number of pooled connections to `host`.
+pub fn network_pool_size(nm: @NetworkManager, host: StrView) -> i64
+    let idx = find_host_pool(nm, host)
+    if idx < 0
+        return 0
+    let pool = vec_get<HostPool>(@nm.connections, idx)
+    return vec_len<Connection>(@pool.conns)
+
+## Number of cookies stored for `domain`.
+pub fn network_cookie_count(nm: @NetworkManager, domain: StrView) -> i64
+    let idx = find_cookie_jar(nm, domain)
+    if idx < 0
+        return 0
+    let jar = vec_get<CookieJar>(@nm.cookies, idx)
+    return vec_len<Cookie>(@jar.cookies)
+
+## Open a connection to `host` and add it to that host's pool bucket.
+pub fn network_pool_add(nm:& NetworkManager, host: StrView, port: i32, use_tls: i32)
+    var idx = find_host_pool(@nm, host)
+    if idx < 0
+        var pool: HostPool
+        pool.host = string_from_strview(host)
+        pool.conns = vec_new<Connection>()
+        vec_push<HostPool>(@&nm.connections, pool)
+        idx = vec_len<HostPool>(@nm.connections) - 1
+    let conn = connect_to_host(string_from_strview(host), port, use_tls)
+    let pool = vec_get_ptr<HostPool>(@&nm.connections, idx)
+    vec_push<Connection>(@&pool.conns, conn)
+
+## Store a cookie in `domain`'s bucket.
+pub fn network_set_cookie(nm:& NetworkManager, domain: StrView, name: StrView, value: StrView)
+    var idx = find_cookie_jar(@nm, domain)
+    if idx < 0
+        var jar: CookieJar
+        jar.domain = string_from_strview(domain)
+        jar.cookies = vec_new<Cookie>()
+        vec_push<CookieJar>(@&nm.cookies, jar)
+        idx = vec_len<CookieJar>(@nm.cookies) - 1
+    var c: Cookie
+    c.name = string_from_strview(name)
+    c.value = string_from_strview(value)
+    c.domain = string_from_strview(domain)
+    c.path = string_from("/")
+    c.expires = 0
+    c.secure = 0
+    c.http_only = 0
+    let jar = vec_get_ptr<CookieJar>(@&nm.cookies, idx)
+    vec_push<Cookie>(@&jar.cookies, c)

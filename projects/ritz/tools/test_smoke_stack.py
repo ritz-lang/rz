@@ -159,7 +159,7 @@ def test_linux_bins_selects_by_target_not_name():
                    "tome/tome-cli", "mausoleum/mausoleum", "mausoleum/wiki-seed"):
         assert f"help:{server}" in ids
     assert all(not str(b.path).endswith(".elf") for b in bins)
-    assert set(known) >= {"tempest"}
+    assert not {"tempest", "lexis"} & set(known)  # delisted by #3609, #3689
 
 
 @pytest.mark.unit

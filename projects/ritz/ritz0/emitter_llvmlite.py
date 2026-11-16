@@ -14851,7 +14851,13 @@ class LLVMEmitter:
     _INT_ARITH_OPS = ('+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>')
 
     def _is_unsigned_type(self, ty: rast.Type) -> bool:
-        """Check if a Ritz type is unsigned."""
+        """Check if a Ritz type is unsigned.
+
+        An alias is its target (#3695): `type NodeId = u32` is unsigned, so a
+        NodeId sign-extends nowhere and a u32 literal fits it.
+        """
+        if isinstance(ty, rast.NamedType) and not ty.args and ty.name in self.type_aliases:
+            ty = resolve_alias_in(ty, self.type_aliases)
         if isinstance(ty, rast.NamedType):
             return ty.name in ('u8', 'u16', 'u32', 'u64')
         return False
