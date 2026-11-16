@@ -214,8 +214,9 @@ def test_impl_on_known_type_compiles(request, tmp_path, compiler, row):
 
 
 # A primitive is a built-in type, closed to `impl` (LARB R36, #3288),
-# inherent or trait: located at the type.  ritz0 only: ritz1's half is #3371
-# (ritz1 can't parse `impl Speak for i32` yet).
+# inherent or trait: located at the type, on every compiler.  ritz1 failed
+# with an unlocated "Parse error at pos 64": its grammar took only an IDENT
+# as the target, and `i32` is a keyword (#3371).
 PRIMITIVE_ROWS = {
     "inherent": ("u8", """\
 impl ^u8
@@ -237,8 +238,11 @@ pub fn main() -> i32
 }
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("row", sorted(PRIMITIVE_ROWS))
-def test_impl_on_primitive_refused(tmp_path, row):
+def test_impl_on_primitive_refused(request, tmp_path, compiler, row):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
     type_name, program = PRIMITIVE_ROWS[row]
-    _assert_refused("ritz0", tmp_path, f"primitive_{row}", PRELUDE + program,
+    _assert_refused(compiler, tmp_path, f"primitive_{row}", PRELUDE + program,
                     f"`{type_name}` is a built-in type; it can't have an `impl`")
