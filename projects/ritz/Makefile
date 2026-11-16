@@ -250,7 +250,8 @@ matrix-full: regen-check | _matrix_ritz1_built
 # Covers every generated file that is committed verbatim: parser_gen,
 # tokens_gen and lexer_setup_gen (the last was unchecked until #1436, which had
 # to change the generator and the generated file in step). ast_helpers.ritz is
-# NOT checked: ritz1's copy is hand-maintained and has diverged by design.
+# NOT checked: it is hand-written.  The generator emits only a stub listing the
+# constructor names the grammar actions call, so there is no generated copy.
 #
 # A generator crash fails the check. It used to pass: the diff ran behind `&&`,
 # so a failed generator skipped it and the trailing `rm` returned 0.

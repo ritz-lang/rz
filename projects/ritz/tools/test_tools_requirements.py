@@ -50,6 +50,7 @@ LOCAL_MODULES = {
     "check_test_tempdirs",
     "check_test_budget",
     "likely_tests",
+    "ritz1_arch",
     "run_regression_matrix",
     "smoke",
     "smoke_stack",
