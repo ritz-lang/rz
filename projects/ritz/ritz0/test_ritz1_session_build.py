@@ -14,6 +14,7 @@ fixture in conftest.py.  These tests pin that:
 """
 
 import ast
+import itertools
 import os
 import re
 import subprocess
@@ -40,6 +41,13 @@ _MAKE_IN_TREE = re.compile(
     r"""["']-C["']\s*,\s*["'](ritz1|runtime)["']"""
     r"""|_make\(\s*["'](ritz1|runtime)["']"""
 )
+
+
+# How every nested session here starts pytest: as main.yml's ritz0 step does,
+# without the venv's autoloaded plugins (AGAST #2793), which cost ~2.3 CPU-s
+# per interpreter, nested xdist workers included (AGAST #3524).
+_PYTEST = [sys.executable, "-m", "pytest", "--disable-plugin-autoload", "-p", "xdist",
+           "-p", "no:cacheprovider"]
 
 
 def _test_modules() -> list[Path]:
@@ -93,7 +101,8 @@ def test_no_test_module_builds_ritz1_itself():
 def _nested_pytest(tmp_path: Path, *extra: str, env: dict | None = None) -> tuple[subprocess.CompletedProcess, list[str]]:
     log = tmp_path / "make.log"
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra, *NESTED_TESTS],
+        [*_PYTEST, "-q", *extra, *NESTED_TESTS],
+        check=False,
         cwd=HERE,
         env=dict(env or os.environ, RITZ_TEST_MAKE_LOG=str(log)),
         capture_output=True,
@@ -104,13 +113,40 @@ def _nested_pytest(tmp_path: Path, *extra: str, env: dict | None = None) -> tupl
     return proc, lines
 
 
+@pytest.mark.unit
+def test_nested_sessions_skip_plugin_autoload(tmp_path, monkeypatch):
+    """Every nested pytest here runs as main.yml's does (AGAST #3524).
+
+    A venv's autoloaded plugins (django, asyncio, cov, ...) cost ~2.3 CPU-s
+    per interpreter: most of this file's budget, paid by the nested sessions
+    and their xdist workers rather than by anything they test.
+    """
+    argvs = []
+
+    def fake_run(argv, **kwargs):
+        argvs.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _nested_pytest(tmp_path)
+    _collect_ids()
+    assert len(argvs) == 2, argvs
+    for argv in argvs:
+        assert argv[:3] == [sys.executable, "-m", "pytest"], argv
+        assert "--disable-plugin-autoload" in argv, argv
+        assert any(a == "-p" and b == "xdist" for a, b in itertools.pairwise(argv)), argv
+
+
 def _ritz1_makes(lines: list[str]) -> list[str]:
     return [line for line in lines if re.search(r"-C ritz1 ritz1$", line)]
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("mode", ["serial", "xdist"])
-def test_session_builds_ritz1_exactly_once(tmp_path, mode):
+def test_session_builds_ritz1_exactly_once(ritz1_bin, tmp_path, mode):
+    # ritz1_bin (AGAST #3524): the outer session's one build brings the tree
+    # current, so the nested sessions' makes are no-ops, not full ritz1 builds
+    # charged to this file.
     # -q is in the base args; two -v nets verbosity 1, which prints [gwN] per test.
     extra = ("-n", "2", "--dist", "loadgroup", "-v", "-v") if mode == "xdist" else ()
     proc, lines = _nested_pytest(tmp_path, *extra)
@@ -140,7 +176,7 @@ def pytest_plugin_registered(plugin, plugin_name, manager):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("mode", ["serial", "xdist"])
-def test_failed_session_build_fails_tests_never_skips(tmp_path, mode):
+def test_failed_session_build_fails_tests_never_skips(ritz1_bin, tmp_path, mode):
     """A broken ritz1 build must turn every ritz1 test red, not skip it (#1327)."""
     (tmp_path / "inject_ritz1_failure.py").write_text(_FAIL_PLUGIN)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(
@@ -171,16 +207,21 @@ _FRONT = re.compile(
 )
 
 
+def _collect_ids() -> tuple[subprocess.CompletedProcess, list[str]]:
+    """The whole suite's test ids, in the order conftest.py schedules them."""
+    proc = subprocess.run(
+        [*_PYTEST, "--collect-only", "-q"],
+        cwd=HERE, capture_output=True, text=True, timeout=600, check=False,
+    )
+    return proc, [line for line in proc.stdout.splitlines() if "::" in line]
+
+
 @pytest.mark.integration
 def test_long_and_grouped_tests_are_scheduled_first():
     """xdist hands out work in collection order, so the longest single test
     (the staleness meta-test) and the serial `tree` group must lead it, or
     they become the tail of a parallel run."""
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
-        cwd=HERE, capture_output=True, text=True, timeout=600,
-    )
-    ids = [line for line in proc.stdout.splitlines() if "::" in line]
+    proc, ids = _collect_ids()
     assert proc.returncode == 0 and len(ids) > 1000, proc.stdout[-2000:] + proc.stderr[-2000:]
     flags = [bool(_FRONT.match(i)) for i in ids]
     assert flags[0] and ids[0].startswith("test_ritz1_bin_staleness.py::"), ids[:5]

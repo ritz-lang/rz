@@ -45,13 +45,21 @@ to a named `%T`; a primitive name (usize/isize/...) takes the scalar `ret`
 typed by emit_llvm_type_struct, the mapping the `define` line already uses.
 
 Every program has v.len() == 3, n == 4, k == 5 and exits with the value.
+
+COST (AGAST #3524): the rows share one compile and link per compiler
+(batching.py, docs/TESTING.md "What a ritz0 pytest case costs"); a row the
+batch can't answer is built on its own through build.py, as every row was.
 """
 
 import itertools
 
+import batching
 import pytest
-
 from test_ritz1_builtin_struct_shadow import _run_pkg
+from test_ritz1_for_header import batch_build, batch_compile
+
+# AGAST #3524: each test's rows share one compile per compiler (batching.py).
+pytestmark = pytest.mark.batched
 
 # The returned expression, with `{r}` the receiver, and the exit code.
 TAILS = {
@@ -104,6 +112,10 @@ CELLS = list(itertools.product(RECEIVERS, TYPES, TAILS))
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 @pytest.mark.parametrize("recv,ty,tail", CELLS, ids=["-".join(c) for c in CELLS])
-def test_method_usize_tail(compiler, recv, ty, tail, tmp_path):
+def test_method_usize_tail(ritz1_bin, compiler, recv, ty, tail, tmp_path):
     prog = _program(recv, ty, tail)
-    assert _run_pkg(compiler, tmp_path, "mut", prog) == TAILS[tail][1], prog
+    got = batching.run(compiler, prog, batch_build(ritz1_bin), compile=batch_compile(ritz1_bin))
+    if got is None:
+        batching.per_row()
+        got = _run_pkg(compiler, tmp_path, "mut", prog)
+    assert got == TAILS[tail][1], prog
