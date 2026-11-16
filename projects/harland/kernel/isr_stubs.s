@@ -258,3 +258,22 @@ IRQ_STUB 12, 44     # IRQ12 - PS/2 Mouse
 IRQ_STUB 13, 45     # IRQ13 - FPU
 IRQ_STUB 14, 46     # IRQ14 - Primary ATA
 IRQ_STUB 15, 47     # IRQ15 - Secondary ATA
+
+# MSI-X vectors 64-79 (drivers/msix.ritz, AGAST #1852). Same path as the
+# I/O APIC IRQs: irq_handler counts them through msix_dispatch and sends EOI.
+IRQ_STUB 32, 64
+IRQ_STUB 33, 65
+IRQ_STUB 34, 66
+IRQ_STUB 35, 67
+IRQ_STUB 36, 68
+IRQ_STUB 37, 69
+IRQ_STUB 38, 70
+IRQ_STUB 39, 71
+IRQ_STUB 40, 72
+IRQ_STUB 41, 73
+IRQ_STUB 42, 74
+IRQ_STUB 43, 75
+IRQ_STUB 44, 76
+IRQ_STUB 45, 77
+IRQ_STUB 46, 78
+IRQ_STUB 47, 79

@@ -13,6 +13,7 @@ import serial { prints, serial_print_hex, serial_print_dec, serial_write_byte }
 import drivers.pci { PciDevice, pci_find_virtio, pci_enable_bus_master, pci_enable_io, VIRTIO_DEVICE_NET }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 import mm.vmm { vmm_virt_to_phys }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
 
 # ============================================================================
 # VirtIO PCI Legacy Register Offsets (BAR0 I/O space)
@@ -27,6 +28,16 @@ const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 16      # 2 bytes - notify device of queue 
 const VIRTIO_PCI_DEVICE_STATUS: u16 = 18     # 1 byte - device status register
 const VIRTIO_PCI_ISR_STATUS: u16 = 19        # 1 byte - interrupt status
 const VIRTIO_PCI_CONFIG_OFFSET: u16 = 20     # Device-specific config starts here
+
+# With MSI-X enabled the legacy header grows by two 16-bit vector registers
+# and the device-specific config moves to 24 (virtio 1.1 §4.1.4.8).
+const VIRTIO_MSI_CONFIG_VECTOR: u16 = 20     # 2 bytes - config change vector
+const VIRTIO_MSI_QUEUE_VECTOR: u16 = 22      # 2 bytes - selected queue's vector
+const VIRTIO_PCI_CONFIG_OFFSET_MSIX: u16 = 24
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF
+
+# MSI-X table entries this driver uses: config changes, RX queue, TX queue
+const VIRTIO_NET_MSIX_ENTRIES: u16 = 3
 
 # ============================================================================
 # VirtIO Device Status Bits
@@ -165,6 +176,14 @@ var virtio_net: VirtioNetDevice
 # Pre-allocated RX/TX buffers
 var virtio_rx_buffers: [65536]u8  # 32 * 2048 = 64KB
 var virtio_tx_buffers: [65536]u8  # 32 * 2048 = 64KB
+
+# MSI-X state (AGAST #1852). Entry 0 signals config changes, entry 1 the RX
+# queue and entry 2 the TX queue, each on its own IDT vector. Without MSI-X
+# the device stays on INTx (masked at the I/O APIC) and is only polled.
+var virtio_net_msix: MsixInfo
+var virtio_net_msix_on: u8 = 0
+var virtio_net_vectors: [3]u8
+var virtio_net_config_off: u16 = 20   # VIRTIO_PCI_CONFIG_OFFSET[_MSIX]
 
 # ============================================================================
 # Register Access Helpers
@@ -386,6 +405,57 @@ fn virtq_init(vq: *VirtQueue, queue_index: u16, mem: *u8, io_base: u16) -> i32
     virtio_write16(@virtio_net, VIRTIO_PCI_QUEUE_SEL, queue_index)
     virtio_write32(@virtio_net, VIRTIO_PCI_QUEUE_PFN, pfn)
 
+    # Under MSI-X, queue N signals table entry N + 1 (entry 0 is config).
+    # The device reads back NO_VECTOR if it couldn't take the entry.
+    if virtio_net_msix_on != 0
+        virtio_write16(@virtio_net, VIRTIO_MSI_QUEUE_VECTOR, queue_index + 1)
+        if virtio_read16(@virtio_net, VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR
+            prints("[virtio-net] ERROR: queue ")
+            serial_print_dec(queue_index as u64)
+            prints(" refused its MSI-X vector\n")
+            return -1
+
+    return 0
+
+# Put the device in MSI-X mode: one IDT vector each for config changes, RX
+# and TX. Must run before anything reads the device-specific config, which
+# moves from offset 20 to 24 once MSI-X is on. Returns 0 if MSI-X is on;
+# -1 leaves the device on (polled) INTx with the config at 20.
+fn virtio_net_setup_msix(pci_dev: *PciDevice) -> i32
+    if msix_probe(pci_dev, @virtio_net_msix) != 0
+        prints("[msix] virtio-net: no MSI-X capability, polling\n")
+        return -1
+    if virtio_net_msix.table_size < VIRTIO_NET_MSIX_ENTRIES
+        prints("[msix] virtio-net: MSI-X table too small, polling\n")
+        return -1
+    var i: i32 = 0
+    while i < VIRTIO_NET_MSIX_ENTRIES as i32
+        virtio_net_vectors[i] = msix_vector_alloc()
+        if virtio_net_vectors[i] == 0
+            prints("[msix] virtio-net: out of MSI-X vectors, polling\n")
+            return -1
+        i = i + 1
+    if msix_enable(@virtio_net_msix) != 0
+        prints("[msix] virtio-net: can't map the MSI-X table, polling\n")
+        return -1
+    i = 0
+    while i < VIRTIO_NET_MSIX_ENTRIES as i32
+        msix_set_entry(@virtio_net_msix, i as u16, virtio_net_vectors[i])
+        i = i + 1
+
+    virtio_net_msix_on = 1
+    virtio_net_config_off = VIRTIO_PCI_CONFIG_OFFSET_MSIX
+    virtio_write16(@virtio_net, VIRTIO_MSI_CONFIG_VECTOR, 0)
+    if virtio_read16(@virtio_net, VIRTIO_MSI_CONFIG_VECTOR) == VIRTIO_MSI_NO_VECTOR
+        prints("[virtio-net] WARNING: config change vector refused\n")
+
+    prints("[msix] virtio-net: MSI-X on, vectors config=")
+    serial_print_dec(virtio_net_vectors[0] as u64)
+    prints(" rx=")
+    serial_print_dec(virtio_net_vectors[1] as u64)
+    prints(" tx=")
+    serial_print_dec(virtio_net_vectors[2] as u64)
+    prints("\n")
     return 0
 
 # ============================================================================
@@ -431,6 +501,11 @@ pub fn virtio_net_init() -> i32
     # Driver knows how to drive it
     virtio_add_status(@virtio_net, VIRTIO_STATUS_DRIVER)
 
+    # MSI-X before any device-config read: it moves the config to offset 24
+    virtio_net_msix_on = 0
+    virtio_net_config_off = VIRTIO_PCI_CONFIG_OFFSET
+    virtio_net_setup_msix(pci_dev)
+
     # Read device features
     let device_features: u32 = virtio_read32(@virtio_net, VIRTIO_PCI_HOST_FEATURES)
     prints("[virtio-net] Device Features: 0x")
@@ -458,7 +533,7 @@ pub fn virtio_net_init() -> i32
     if (accepted_features & VIRTIO_NET_F_MAC) != 0
         var i: i32 = 0
         while i < 6
-            virtio_net.mac[i] = virtio_read8(@virtio_net, VIRTIO_PCI_CONFIG_OFFSET + (i as u16))
+            virtio_net.mac[i] = virtio_read8(@virtio_net, virtio_net_config_off + (i as u16))
             i = i + 1
         prints("[virtio-net] MAC: ")
         i = 0
@@ -527,7 +602,7 @@ pub fn virtio_net_init() -> i32
     virtio_add_status(@virtio_net, VIRTIO_STATUS_DRIVER_OK)
 
     # Check link status
-    let link_status: u16 = virtio_read16(@virtio_net, VIRTIO_PCI_CONFIG_OFFSET + 6)
+    let link_status: u16 = virtio_read16(@virtio_net, virtio_net_config_off + 6)
     prints("[virtio-net] Link status: ")
     if (link_status & 1) != 0
         prints("UP\n")
@@ -624,3 +699,18 @@ pub fn virtio_net_get_mac(mac_out: *u8)
 
 pub fn virtio_net_get_device() -> *VirtioNetDevice
     return @virtio_net
+
+# 1 if the NIC signals through MSI-X (virtio_net_setup_msix succeeded)
+pub fn virtio_net_msix_enabled() -> u8
+    return virtio_net_msix_on
+
+# MSI-X interrupts the NIC has delivered so far, over all its vectors
+pub fn virtio_net_irq_count() -> u64
+    if virtio_net_msix_on == 0
+        return 0
+    var total: u64 = 0
+    var i: i32 = 0
+    while i < VIRTIO_NET_MSIX_ENTRIES as i32
+        total = total + msix_vector_count(virtio_net_vectors[i])
+        i = i + 1
+    return total

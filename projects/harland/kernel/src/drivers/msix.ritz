@@ -1,0 +1,230 @@
+# Harland Kernel - PCI MSI-X (AGAST #1852)
+#
+# Message Signalled Interrupts, extended (PCI Local Bus 3.0 §6.8.2). A device
+# with an MSI-X capability (ID 0x11) has a table of up to 2048 entries in one
+# of its memory BARs. Each 16-byte entry holds a message address, message data
+# and a mask bit; when the device raises entry N it writes N's data to N's
+# address. Address 0xFEE0_0000 | (APIC ID << 12) with data = vector delivers
+# that vector, edge-triggered, to that CPU's Local APIC: no I/O APIC, no
+# shared INTx line.
+#
+# This module:
+#   - finds a device's MSI-X capability and its table (msix_probe);
+#   - maps the table through the kernel MMIO window, masks every entry and
+#     enables MSI-X (msix_enable);
+#   - hands out IDT vectors MSIX_VECTOR_BASE.. (msix_vector_alloc) and points
+#     a table entry at one, aimed at the BSP (msix_set_entry);
+#   - counts each vector's interrupts (msix_dispatch, from irq_handler), so a
+#     driver or a test can see interrupts were delivered (msix_vector_count).
+#
+# IDT gates for the vectors are set in arch/x86_64/idt.ritz; the stubs are
+# irq_stub_32..47 in isr_stubs.s (vector = 32 + stub number).
+
+import serial { prints, serial_print_dec, serial_print_hex, serial_print_hex8, serial_print_hex16 }
+import mm.vmm { vmm_map_mmio }
+import drivers.pci { PciDevice, pci_find_capability, pci_read_config16, pci_read_config32, pci_write_config16, pci_enable_memory, pci_get_device_count, pci_get_device }
+
+# Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
+extern fn lapic_id() -> u32
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+pub const PCI_CAP_MSIX: u8 = 0x11
+
+# Capability layout (offsets from the capability pointer)
+const MSIX_CAP_CONTROL: u8 = 2      # 16-bit Message Control
+const MSIX_CAP_TABLE: u8 = 4        # 32-bit Table Offset / BIR
+
+# Message Control bits
+const MSIX_CTRL_TABLE_SIZE: u16 = 0x07FF    # table size - 1
+const MSIX_CTRL_FUNCTION_MASK: u16 = 0x4000
+const MSIX_CTRL_ENABLE: u16 = 0x8000
+
+# Table entry layout (16 bytes each)
+const MSIX_ENTRY_SIZE: u64 = 16
+const MSIX_ENTRY_ADDR_LO: u64 = 0
+const MSIX_ENTRY_ADDR_HI: u64 = 4
+const MSIX_ENTRY_DATA: u64 = 8
+const MSIX_ENTRY_CTRL: u64 = 12
+const MSIX_ENTRY_CTRL_MASKED: u32 = 1
+
+# x86 MSI message address: the Local APIC window, destination in bits 19:12
+const MSI_ADDR_BASE: u32 = 0xFEE00000
+
+# IDT vectors handed out to MSI-X entries: 0x40-0x4F, above the I/O APIC's
+# 32-47 and below anything else the kernel uses (spurious is 0xFF).
+pub const MSIX_VECTOR_BASE: u8 = 64
+pub const MSIX_VECTOR_COUNT: u8 = 16
+
+# ============================================================================
+# State
+# ============================================================================
+
+# A device's MSI-X capability, as msix_probe found it and msix_enable mapped it
+pub struct MsixInfo
+    dev: *PciDevice
+    cap: u8             # capability offset in config space (0 = none)
+    table_bar: u8       # BAR holding the table
+    table_size: u16     # number of entries
+    table_offset: u32   # table offset within that BAR
+    table_virt: u64     # kernel virtual address of entry 0 (0 until enabled)
+
+var msix_next_vector: u8 = 0                # next free slot past MSIX_VECTOR_BASE
+var msix_irq_count: [16]u64                 # interrupts seen, per slot
+
+# ============================================================================
+# Capability discovery
+# ============================================================================
+
+# Find dev's MSI-X capability and describe its table in *out. Returns 0 if
+# the device has MSI-X and its table sits in a usable memory BAR, else -1
+# (out.cap is 0 when there is no capability at all).
+pub fn msix_probe(dev: *PciDevice, out: *MsixInfo) -> i32
+    (*out).dev = dev
+    (*out).cap = 0
+    (*out).table_bar = 0
+    (*out).table_size = 0
+    (*out).table_offset = 0
+    (*out).table_virt = 0
+
+    let cap: u8 = pci_find_capability(dev, PCI_CAP_MSIX)
+    if cap == 0
+        return -1
+    let b: u8 = (*dev).bus
+    let d: u8 = (*dev).device
+    let f: u8 = (*dev).function
+    let ctrl: u16 = pci_read_config16(b, d, f, cap + MSIX_CAP_CONTROL)
+    let table: u32 = pci_read_config32(b, d, f, cap + MSIX_CAP_TABLE)
+
+    (*out).cap = cap
+    (*out).table_size = (ctrl & MSIX_CTRL_TABLE_SIZE) + 1
+    (*out).table_bar = (table & 0x7) as u8
+    (*out).table_offset = table & 0xFFFFFFF8
+
+    let bar: i32 = (*out).table_bar as i32
+    if bar > 5 or (*dev).bar_is_io[bar] != 0 or (*dev).bar[bar] == 0
+        return -1
+    return 0
+
+# ============================================================================
+# Enabling
+# ============================================================================
+
+# Map info's table, mask every entry and turn MSI-X on for the device. Its
+# INTx line is off from here on (the PCI spec ties that to MSI-X Enable).
+# Entries stay masked until msix_set_entry programs them. Returns 0 on
+# success, -1 if the table can't be mapped.
+pub fn msix_enable(info: *MsixInfo) -> i32
+    let dev: *PciDevice = (*info).dev
+    let bar: i32 = (*info).table_bar as i32
+    let phys: u64 = (*dev).bar[bar] + ((*info).table_offset as u64)
+    let virt: u64 = vmm_map_mmio(phys, ((*info).table_size as u64) * MSIX_ENTRY_SIZE)
+    if virt == 0
+        return -1
+    (*info).table_virt = virt
+    pci_enable_memory(dev)
+
+    let b: u8 = (*dev).bus
+    let d: u8 = (*dev).device
+    let f: u8 = (*dev).function
+    let ctrl_off: u8 = (*info).cap + MSIX_CAP_CONTROL
+
+    # Enable with the whole function masked, mask each entry, then unmask the
+    # function: no entry can fire with a stale address/data in between.
+    var ctrl: u16 = pci_read_config16(b, d, f, ctrl_off)
+    pci_write_config16(b, d, f, ctrl_off, ctrl | MSIX_CTRL_ENABLE | MSIX_CTRL_FUNCTION_MASK)
+    var i: u16 = 0
+    while i < (*info).table_size
+        let entry: u64 = virt + (i as u64) * MSIX_ENTRY_SIZE
+        volatile_store((entry + MSIX_ENTRY_CTRL) as *u32, MSIX_ENTRY_CTRL_MASKED)
+        i = i + 1
+    ctrl = pci_read_config16(b, d, f, ctrl_off)
+    pci_write_config16(b, d, f, ctrl_off, (ctrl | MSIX_CTRL_ENABLE) & (0xFFFF ^ MSIX_CTRL_FUNCTION_MASK))
+    return 0
+
+# Allocate one IDT vector for an MSI-X entry. Returns the vector, or 0 when
+# all MSIX_VECTOR_COUNT are taken. Vectors are never freed: drivers come up
+# once per boot.
+pub fn msix_vector_alloc() -> u8
+    if msix_next_vector >= MSIX_VECTOR_COUNT
+        return 0
+    let vector: u8 = MSIX_VECTOR_BASE + msix_next_vector
+    msix_irq_count[msix_next_vector as i32] = 0
+    msix_next_vector = msix_next_vector + 1
+    return vector
+
+# Point table entry `entry` at `vector` on the current CPU (the BSP during
+# boot) and unmask it. Returns 0, or -1 if the entry is out of range or the
+# table isn't mapped.
+pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
+    if (*info).table_virt == 0 or entry >= (*info).table_size
+        return -1
+    let e: u64 = (*info).table_virt + (entry as u64) * MSIX_ENTRY_SIZE
+    let dest: u32 = lapic_id() & 0xFF
+    # Mask while rewriting, so the device never sees half an entry.
+    volatile_store((e + MSIX_ENTRY_CTRL) as *u32, MSIX_ENTRY_CTRL_MASKED)
+    volatile_store((e + MSIX_ENTRY_ADDR_LO) as *u32, MSI_ADDR_BASE | (dest << 12))
+    volatile_store((e + MSIX_ENTRY_ADDR_HI) as *u32, 0)
+    # Fixed delivery, edge-triggered: data is just the vector.
+    volatile_store((e + MSIX_ENTRY_DATA) as *u32, vector as u32)
+    volatile_store((e + MSIX_ENTRY_CTRL) as *u32, 0)
+    return 0
+
+# ============================================================================
+# Interrupt accounting
+# ============================================================================
+
+# Called by irq_handler for every hardware vector. Counts the interrupt and
+# returns true if `vector` is an MSI-X vector (the caller still sends EOI).
+pub fn msix_dispatch(vector: u64) -> bool
+    if vector < MSIX_VECTOR_BASE as u64
+        return false
+    let slot: u64 = vector - (MSIX_VECTOR_BASE as u64)
+    if slot >= MSIX_VECTOR_COUNT as u64
+        return false
+    msix_irq_count[slot as i32] = msix_irq_count[slot as i32] + 1
+    return true
+
+# Interrupts delivered on `vector` so far (0 for a vector that isn't MSI-X).
+pub fn msix_vector_count(vector: u8) -> u64
+    if vector < MSIX_VECTOR_BASE or vector >= MSIX_VECTOR_BASE + MSIX_VECTOR_COUNT
+        return 0
+    return volatile_load(@msix_irq_count[(vector - MSIX_VECTOR_BASE) as i32])
+
+# ============================================================================
+# Diagnostics
+# ============================================================================
+
+# Log every PCI device's MSI-X table:
+#   [msix] BB:DD.FF VVVV:DDDD: N vectors, table BARn+0xOFFSET (hex)
+pub fn msix_print_all()
+    var found: i32 = 0
+    var i: i32 = 0
+    while i < pci_get_device_count()
+        let dev: *PciDevice = pci_get_device(i)
+        var info: MsixInfo
+        if msix_probe(dev, @info) == 0
+            prints("[msix] ")
+            serial_print_hex8((*dev).bus)
+            prints(":")
+            serial_print_hex8((*dev).device)
+            prints(".")
+            serial_print_hex8((*dev).function)
+            prints(" ")
+            serial_print_hex16((*dev).vendor_id)
+            prints(":")
+            serial_print_hex16((*dev).device_id)
+            prints(": ")
+            serial_print_dec(info.table_size as u64)
+            prints(" vectors, table BAR")
+            serial_print_dec(info.table_bar as u64)
+            prints("+0x")
+            serial_print_hex(info.table_offset as u64)
+            prints("\n")
+            found = found + 1
+        i = i + 1
+    prints("[msix] ")
+    serial_print_dec(found as u64)
+    prints(" PCI devices with MSI-X\n")
