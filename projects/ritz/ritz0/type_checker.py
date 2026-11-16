@@ -91,10 +91,10 @@ class TypeChecker:
     """
 
     # Primitive integer types
-    INT_TYPES = {'i8', 'i16', 'i32', 'i64', 'isize',
-                 'u8', 'u16', 'u32', 'u64', 'usize'}
-    SIGNED_INT_TYPES = {'i8', 'i16', 'i32', 'i64', 'isize'}
-    UNSIGNED_INT_TYPES = {'u8', 'u16', 'u32', 'u64', 'usize'}
+    INT_TYPES = {'i8', 'i16', 'i32', 'i64',
+                 'u8', 'u16', 'u32', 'u64'}
+    SIGNED_INT_TYPES = {'i8', 'i16', 'i32', 'i64'}
+    UNSIGNED_INT_TYPES = {'u8', 'u16', 'u32', 'u64'}
 
     # Numeric types (integers + floats)
     NUMERIC_TYPES = INT_TYPES | {'f32', 'f64'}
@@ -2119,10 +2119,10 @@ class TypeChecker:
 
         # Pointer-to-integer and integer-to-pointer coercion (common for low-level code)
         if isinstance(actual, (rast.PtrType, rast.RefType)) and isinstance(expected, rast.NamedType):
-            if expected.name in {'i64', 'u64', 'isize', 'usize'}:
+            if expected.name in {'i64', 'u64'}:
                 return True
         if isinstance(actual, rast.NamedType) and isinstance(expected, (rast.PtrType, rast.RefType)):
-            if actual.name in {'i64', 'u64', 'isize', 'usize'}:
+            if actual.name in {'i64', 'u64'}:
                 return True
 
         # Pointer types

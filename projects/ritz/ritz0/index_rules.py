@@ -14,7 +14,7 @@ BUILT_IN = ("Vec", "Span", "String")
 
 # The scalars: an element that is one has nothing to index, so `v[i][j]` on a
 # `Vec<i32>` is needs_index's error, at the second `[` (AGAST #2452).
-SCALARS = ("i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",
+SCALARS = ("i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
            "f32", "f64", "bool")
 
 

@@ -580,6 +580,25 @@ Signedness affects:
 An unannotated integer literal binding infers `i64`. Annotate when you need a
 narrower type: `let x: i32 = 1`.
 
+`usize` is another name for `u64`, and `isize` for `i64`: the same types, not
+new ones. Every Ritz target is 64-bit. So a `usize` is unsigned for every
+operator, takes any `u64` literal, and `Vec<usize>` is `Vec<u64>` (LARB R53):
+
+```ritz
+import ritzlib.gvec
+
+fn first(v: @Vec<u64>) -> u64
+    return *v.data
+
+fn main() -> i32
+    let b: usize = 18446744073709551608    # u64's range
+    let top = b >> 60                       # 15: a logical shift
+    var d: [1]usize = [7]
+    var v = Vec<usize> { data: @d[0], len: 1, cap: 1 }
+    let x: u64 = first(@v)                  # a Vec<usize> is a Vec<u64>
+    0
+```
+
 #### Boolean Type
 
 ```ritz body

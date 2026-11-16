@@ -48,7 +48,6 @@ class MoveChecker(MoveWalk):
     # §13.1), not by a list (AGAST #2157; the list was #1489 and #1548).
     PRIMITIVES = {
         'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'bool', 'f32', 'f64',
-        'usize', 'isize',
     }
 
     def __init__(self):

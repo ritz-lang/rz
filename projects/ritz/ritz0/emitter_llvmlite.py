@@ -1008,9 +1008,9 @@ class LLVMEmitter:
             return (8, 8)
 
     # Primitive names `sizeof` accepts; their sizes come from
-    # _ritz_type_size_and_align (isize/usize hit its 8-byte fallback).
+    # _ritz_type_size_and_align.
     _SIZEOF_PRIMITIVES = frozenset((
-        'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'isize', 'usize',
+        'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64',
         'f32', 'f64', 'bool',
         'v2i64', 'v4i32', 'v8i16', 'v16i8', 'v4i64', 'v8i32', 'v16i16', 'v32i8',
     ))
@@ -1144,8 +1144,6 @@ class LLVMEmitter:
                 'u16': self.i16,
                 'u32': self.i32,
                 'u64': self.i64,
-                'isize': self.i64,
-                'usize': self.i64,
                 'bool': self.i1,
                 'f32': self.f32,
                 'f64': self.f64,
@@ -1399,7 +1397,7 @@ class LLVMEmitter:
     # AGAST #1396.
     _INT_TYPE_WIDTHS = {
         'i8': 8, 'u8': 8, 'i16': 16, 'u16': 16, 'i32': 32, 'u32': 32,
-        'i64': 64, 'u64': 64, 'isize': 64, 'usize': 64,
+        'i64': 64, 'u64': 64,
     }
 
     def _arith_context_nodes(self, root: rast.Expr) -> set:
@@ -4131,7 +4129,7 @@ class LLVMEmitter:
             self._check_place_sign(arg, param.type, fname, argno)
         return val
 
-    _UNSIGNED = frozenset(('u8', 'u16', 'u32', 'u64', 'usize'))
+    _UNSIGNED = frozenset(('u8', 'u16', 'u32', 'u64'))
 
     def _check_place_sign(self, arg: rast.Expr, want: rast.Type,
                           fname: str, argno: int) -> None:
@@ -6976,7 +6974,7 @@ class LLVMEmitter:
         format_into all format integers here.
         """
         rt = self._infer_ritz_type(expr, value)
-        unsigned = isinstance(rt, rast.NamedType) and rt.name in ('u8', 'u16', 'u32', 'u64', 'usize')
+        unsigned = isinstance(rt, rast.NamedType) and rt.name in ('u8', 'u16', 'u32', 'u64')
         if value.type.width < 64:
             value = self.builder.zext(value, self.i64) if unsigned else self.builder.sext(value, self.i64)
         elif value.type.width > 64:
@@ -16919,7 +16917,7 @@ class LLVMEmitter:
         return getattr(val.type, 'name', None) or str(val.type)
 
     def _names_an_integer(self, ty: Optional[rast.Type]) -> bool:
-        """`ty`, through aliases, is `i8`..`usize`.  Its LLVM type can't say:
+        """`ty`, through aliases, is `i8`..`u64`.  Its LLVM type can't say:
         an unresolved name such as `serial.StrView` lowers to an `i8`
         placeholder (_ritz_type_to_llvm), and harland casts to one."""
         ty = resolve_alias_in(ty, self.type_aliases) if ty is not None else None

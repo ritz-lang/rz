@@ -155,6 +155,17 @@ def _asm_reg(tok) -> str:
     return tok.value
 
 
+# LARB R53 (#3463): `usize` is another name for `u64`, and `isize` for `i64`.
+# Every Ritz target is 64-bit, so they are the same types, not new ones. The
+# parser resolves the names where it reads a type, so no later pass sees them.
+TYPE_NAME_SYNONYMS = {'usize': 'u64', 'isize': 'i64'}
+
+
+def resolve_type_name(name: str) -> str:
+    """`name`, or the type it is another name for (LARB R53)."""
+    return TYPE_NAME_SYNONYMS.get(name, name)
+
+
 class Parser:
     """
     Parser for Ritz source code.
@@ -756,7 +767,7 @@ class Parser:
                     else:
                         # Slice type [T] where T was an identifier.
                         # `[T]` is sugar for `Span<T>` (see make_slice_type).
-                        return rast.make_slice_type(span, rast.NamedType(ident.span, ident.value))
+                        return rast.make_slice_type(span, rast.NamedType(ident.span, resolve_type_name(ident.value)))
                 else:
                     # More complex expression after IDENT (e.g., SIZE * 2)
                     self.pos = saved_pos
@@ -849,7 +860,7 @@ class Parser:
         else:
             args = self._try_parse_cast_type_args()
 
-        return rast.NamedType(span, name, args)
+        return rast.NamedType(span, resolve_type_name(name), args)
 
     def _parse_fn_type_param(self) -> rast.Type:
         """Parse a parameter in a function type.
@@ -1090,6 +1101,14 @@ class Parser:
                     # `sizeof(Box<i64>)` (AGAST #3268): a generic instance
                     # is a type, not `Box < i64 >` comparisons.
                     args.append(sized)
+                elif (isinstance(expr, rast.Ident) and expr.name == 'sizeof'
+                        and self._at(TokenType.IDENT)
+                        and self._current().value in TYPE_NAME_SYNONYMS
+                        and self._peek(1).type == TokenType.RPAREN):
+                    # `sizeof(usize)` is `sizeof(u64)` (LARB R53): the operand
+                    # is read as an expression, so resolve the name here too.
+                    tok = self._advance()
+                    args.append(rast.Ident(tok.span, resolve_type_name(tok.value)))
                 elif not self._at(TokenType.RPAREN):
                     args.append(self.parse_expr())
                     # Skip any newlines after argument
@@ -1666,7 +1685,7 @@ class Parser:
         suffix = getattr(tok, 'suffix', None)
         if not suffix:
             return lit
-        return rast.Cast(lit.span, lit, rast.NamedType(lit.span, suffix, []))
+        return rast.Cast(lit.span, lit, rast.NamedType(lit.span, resolve_type_name(suffix), []))
 
     def parse_closure(self) -> rast.Closure:
         """Parse a closure expression: |params| body.
