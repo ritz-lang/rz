@@ -411,9 +411,19 @@ Rules:
    `ritz0/test_ritz1_builtin_struct_shadow.py`).
 5. **Compile ritz0 in process** (`ritz0_inproc.run_ritz0` / `ritz0_oracle`),
    never `python3 ritz0.py` per case.
-6. **Measure.**  `pytest --durations=0` or `--junitxml` and sum by file;
-   anything over ~200 ms a case, or a file over a minute of test time,
-   needs a reason.
+6. **Measure.**  `pytest --cost-report=cost.json` prints the costliest
+   files by CPU-seconds (`ritz0/cost_meter.py`); `--durations=0` lists
+   tests.  Anything over ~200 ms a case needs a reason.
+7. **The budget is enforced (AGAST #3453).**  The gate's ritz0 step runs
+   with `--durations=30 --cost-report=pytest-cost.json` and then
+   `tools/check_test_budget.py`, which fails the step when a file or the
+   suite is over `tools/test_budget.toml`: a default per file, plus
+   overrides that each name the ticket paying the file down.  It budgets
+   CPU-seconds (the test process and every child it waits for), not wall
+   time, so a busy host doesn't turn it red.  Check locally with
+   `cd ritz0 && python -m pytest ... --cost-report=c.json && python
+   ../tools/check_test_budget.py c.json`.  Over budget?  Batch and resize
+   the matrix; raising the number or adding an override needs a ticket.
 
 ---
 

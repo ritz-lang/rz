@@ -38,6 +38,7 @@ ENTRY_POINTS = {
     "test_runner.py": "build.py loads it with importlib; not a test despite the name",
     "conftest.py": "pytest loads it",
     "spawn_guard.py": "pytest plugin; conftest.py names it in pytest_plugins",
+    "cost_meter.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "symbol_table.py": "tests only for now; it is the interface model for #1810",
 }
 

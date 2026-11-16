@@ -48,6 +48,7 @@ LOCAL_MODULES = {
     "check_doc_examples",
     "check_no_s_strings",
     "check_test_tempdirs",
+    "check_test_budget",
     "run_regression_matrix",
     "smoke",
     "smoke_stack",
