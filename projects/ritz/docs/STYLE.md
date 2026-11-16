@@ -1040,7 +1040,7 @@ fn test_hashmap_insert_and_get() -> i32
     hashmap_i64_insert(@&m, 7, 42)
 
     # Verify
-    assert hashmap_i64_contains(@m, 7) == 1
+    assert hashmap_i64_contains(@m, 7)
     assert hashmap_i64_get(@m, 7) == 42
 
     # Cleanup

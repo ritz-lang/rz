@@ -13,7 +13,7 @@ import ritzlib.hash
 fn test_hashmap_new() -> i32
     var m: HashMapI64 = hashmap_i64_new()
     assert hashmap_i64_len(@m) == 0, "new map should be empty"
-    assert hashmap_i64_is_empty(@m) == 1, "new map should be empty"
+    assert hashmap_i64_is_empty(@m), "new map should be empty"
     hashmap_i64_drop(@&m)
     0
 
@@ -34,11 +34,11 @@ fn test_hashmap_insert_get() -> i32
 fn test_hashmap_contains() -> i32
     var m: HashMapI64 = hashmap_i64_new()
 
-    assert hashmap_i64_contains(@m, 42) == 0, "should not contain 42"
+    assert not hashmap_i64_contains(@m, 42), "should not contain 42"
 
     hashmap_i64_insert(@&m, 42, 100)
-    assert hashmap_i64_contains(@m, 42) == 1, "should contain 42"
-    assert hashmap_i64_contains(@m, 43) == 0, "should not contain 43"
+    assert hashmap_i64_contains(@m, 42), "should contain 42"
+    assert not hashmap_i64_contains(@m, 43), "should not contain 43"
 
     hashmap_i64_drop(@&m)
     0
@@ -78,11 +78,11 @@ fn test_hashmap_remove() -> i32
     var m: HashMapI64 = hashmap_i64_new()
 
     hashmap_i64_insert(@&m, 42, 100)
-    assert hashmap_i64_contains(@m, 42) == 1, "should contain 42"
+    assert hashmap_i64_contains(@m, 42), "should contain 42"
 
     let removed: i32 = hashmap_i64_remove(@&m, 42)
     assert removed == 1, "should return 1 on successful remove"
-    assert hashmap_i64_contains(@m, 42) == 0, "should not contain 42 after remove"
+    assert not hashmap_i64_contains(@m, 42), "should not contain 42 after remove"
     assert hashmap_i64_len(@m) == 0, "len should be 0"
 
     hashmap_i64_drop(@&m)
@@ -229,5 +229,90 @@ fn test_hashmap_index_mixed() -> i32
     # Read via syntax sugar
     assert m[3] == 30, "get via index"
 
+    hashmap_i64_drop(@&m)
+    0
+
+# ============================================================================
+# AGAST #3451: one probe, four wrappers. A tombstone must be stepped over by
+# every lookup (get, value_ptr, contains, remove) and reused by insert.
+# ============================================================================
+
+# Eleven keys that all hash to slot 3 of a 16-slot table fill one probe chain
+# (slots 3..13), so every removal tombstones a slot that the keys after it are
+# probed past.  A wrapper that stops at a tombstone, or treats one as a hit,
+# loses or finds the wrong key.  Eleven, not twelve: re-inserting must not
+# cross the 75% load factor, or grow() would rehash the tombstone away.
+fn hashmap_i64_chain_keys(keys: *i64)
+    var n: i64 = 0
+    var k: i64 = 0
+    while n < 11
+        if ((hash_i64(k) as i64) & 15) == 3
+            keys[n] = k
+            n = n + 1
+        k = k + 1
+
+fn hashmap_i64_tomb_check(keys: *i64, gone_at: i64) -> i32
+    var m: HashMapI64 = hashmap_i64_with_cap(16)
+    for i in 0..11
+        hashmap_i64_insert(@&m, keys[i], i * 10 + 1)
+    if hashmap_i64_cap(@m) != 16
+        return 1
+    let gone: i64 = keys[gone_at]
+    if hashmap_i64_remove(@&m, gone) != 1
+        return 2
+    # The removed key is gone from every lookup.
+    if hashmap_i64_contains(@m, gone)
+        return 3
+    if hashmap_i64_get(@m, gone) != 0
+        return 4
+    if hashmap_i64_value_ptr(@m, gone) != null
+        return 5
+    if hashmap_i64_remove(@&m, gone) != 0
+        return 6
+    # Every other key is still reached across the tombstone.
+    for i in 0..11
+        if i != gone_at
+            let k: i64 = keys[i]
+            if not hashmap_i64_contains(@m, k)
+                return 7
+            if hashmap_i64_get(@m, k) != i * 10 + 1
+                return 8
+            let p: *i64 = hashmap_i64_value_ptr(@m, k)
+            if p == null
+                return 9
+            if *p != i * 10 + 1
+                return 10
+    # Re-inserting the key reuses its tombstone instead of a fresh slot.
+    hashmap_i64_insert(@&m, gone, 777)
+    if hashmap_i64_cap(@m) != 16
+        return 11
+    if m.tombstones != 0
+        return 12
+    if hashmap_i64_len(@m) != 11
+        return 13
+    if hashmap_i64_get(@m, gone) != 777
+        return 14
+    hashmap_i64_drop(@&m)
+    0
+
+[[test]]
+fn test_hashmap_remove_then_lookup_every_key() -> i32
+    var keys: [11]i64
+    hashmap_i64_chain_keys(@keys[0])
+    for gone_at in 0..11
+        let r: i32 = hashmap_i64_tomb_check(@keys[0], gone_at)
+        if r != 0
+            return r
+    0
+
+[[test]]
+fn test_hashmap_bool_predicates() -> i32
+    var m: HashMapI64 = hashmap_i64_new()
+    assert m.is_empty()
+    assert not m.contains(5)
+    m.insert(5, 50)
+    assert not m.is_empty()
+    assert not hashmap_i64_is_empty(@m)
+    assert m.contains(5)
     hashmap_i64_drop(@&m)
     0

@@ -547,11 +547,12 @@ struct HashMapI64
 |----------|-----------|-------------|
 | `hashmap_i64_insert` | `fn(m: @&HashMapI64, key: i64, value: i64)` | Insert or update |
 | `hashmap_i64_get` | `fn(m: @HashMapI64, key: i64) -> i64` | Get value (0 if not found) |
-| `hashmap_i64_contains` | `fn(m: @HashMapI64, key: i64) -> i32` | Check if key exists |
+| `hashmap_i64_find` | `fn(m: @HashMapI64, key: i64) -> i64` | Index of key's slot (-1 if not found) |
+| `hashmap_i64_contains` | `fn(m: @HashMapI64, key: i64) -> bool` | Check if key exists |
 | `hashmap_i64_remove` | `fn(m: @&HashMapI64, key: i64) -> i32` | Remove key (1 if removed) |
 | `hashmap_i64_len` | `fn(m: @HashMapI64) -> i64` | Get entry count |
 | `hashmap_i64_cap` | `fn(m: @HashMapI64) -> i64` | Get capacity |
-| `hashmap_i64_is_empty` | `fn(m: @HashMapI64) -> i32` | Check if empty |
+| `hashmap_i64_is_empty` | `fn(m: @HashMapI64) -> bool` | Check if empty |
 | `hashmap_i64_drop` | `fn(m: @&HashMapI64)` | Free the map |
 | `hashmap_i64_value_ptr` | `fn(m: @HashMapI64, key: i64) -> *i64` | The value's slot (null if not found) |
 | `hashmap_i64_missing_key` | `fn(key: i64)` | Exit 101: `HashMapI64: key not found: <key>` |
@@ -570,7 +571,7 @@ fn main() -> i32
     var m: HashMapI64 = hashmap_i64_new()
     m[7] = 1
     m[7] += 2
-    if hashmap_i64_contains(@m, 8) == 0
+    if not hashmap_i64_contains(@m, 8)
         m[8] = 0
     (m[7] + m[8] - 3) as i32
 ```
