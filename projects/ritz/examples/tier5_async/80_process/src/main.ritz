@@ -1,0 +1,167 @@
+# Example 80: process — spawn children over pipes with ritzlib.process
+#
+# ritzlib.process had no example, so neither differential ritz0-vs-ritz1
+# stage exercised it (AGAST #1461).  Five parts, each printing only values
+# that are the same on every run (never a PID):
+#
+# 1. `== read all ==`  — spawn_args /bin/cat, write two lines, close stdin,
+#    slurp stdout with process_read_stdout_all, wait.  A second wait on the
+#    same process returns the "not waitable" result (exit -1).
+# 2. `== read by line ==` — the same through process_read_line, with the
+#    second line left unterminated so the EOF behaviour shows: a final
+#    line without '\n', then an empty Vec.
+# 3. `== exit code ==` — `sh -c 'exit 3'`, sh found with
+#    find_command_in_path, and its result_code.
+# 4. `== kill ==` — process_kill on a cat still waiting for input: wait
+#    reports SIGKILL (9) and exit code 128 + 9.
+# 5. `== missing ==` — find_command_in_path on a name that is nowhere.
+#
+# The suite runs examples under `env -i`, so there is no PATH:
+# find_command_in_path searches a fixed directory list, and /bin/cat is
+# given as an absolute path.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+import ritzlib.process
+
+# ============================================================================
+# Output helpers
+# ============================================================================
+
+fn show(label: *u8, v: i64)
+    prints_cstr(label)
+    print_int(v)
+    print_char('\n')
+
+# `label` [bytes] (n), with '\n' shown as \n so each value stays on one line.
+fn show_vec(label: *u8, v: @Vec<u8>)
+    prints_cstr(label)
+    print_char('[')
+    var i: i64 = 0
+    while i < v.len
+        let c: u8 = *(v.data + i)
+        if c == '\n'
+            prints_cstr(c"\\n")
+        else
+            print_char(c)
+        i += 1
+    prints_cstr(c"] (")
+    print_int(v.len)
+    prints_cstr(c")\n")
+
+fn show_result(r: *ProcessResult)
+    show(c"exit: ", result_code(r) as i64)
+    show(c"success: ", result_success(r) as i64)
+    show(c"signaled: ", r.signaled as i64)
+
+fn spawn_cat() -> Process
+    var argv: [2]*u8
+    argv[0] = c"cat"
+    argv[1] = null
+    return spawn_args(c"/bin/cat", @argv[0])
+
+# ============================================================================
+# 1. Read all
+# ============================================================================
+
+fn read_all()
+    println("== read all ==")
+    var p: Process = spawn_cat()
+    show(c"spawned: ", process_valid(@p) as i64)
+    show(c"wrote: ", process_write(@p, c"alpha\n", 6))
+    show(c"wrote: ", process_write_str(@p, c"bravo\n"))
+    process_close_stdin(@p)
+
+    var out: Vec<u8> = process_read_stdout_all(@p)
+    show_vec(c"stdout: ", @out)
+    vec_drop<u8>(@&out)
+
+    var r: ProcessResult = process_wait(@p)
+    show_result(@r)
+    var again: ProcessResult = process_wait(@p)
+    show(c"wait again: ", result_code(@again) as i64)
+    process_cleanup(@p)
+
+# ============================================================================
+# 2. Read by line
+# ============================================================================
+
+fn read_by_line()
+    println("== read by line ==")
+    var p: Process = spawn_cat()
+    process_write_str(@p, c"alpha\n")
+    process_write_str(@p, c"bravo")
+    process_close_stdin(@p)
+
+    var l1: Vec<u8> = process_read_line(@p)
+    show_vec(c"line 1: ", @l1)
+    vec_drop<u8>(@&l1)
+    var l2: Vec<u8> = process_read_line(@p)
+    show_vec(c"line 2: ", @l2)
+    vec_drop<u8>(@&l2)
+    var l3: Vec<u8> = process_read_line(@p)
+    show_vec(c"eof: ", @l3)
+    vec_drop<u8>(@&l3)
+
+    var r: ProcessResult = process_wait(@p)
+    show(c"exit: ", result_code(@r) as i64)
+    process_cleanup(@p)
+
+# ============================================================================
+# 3. Exit code
+# ============================================================================
+
+fn exit_code()
+    println("== exit code ==")
+    var path: [256]u8
+    let sh: *u8 = find_command_in_path(c"sh", @path[0], 256)
+    if sh == null
+        println("sh found: 0")
+        return
+    println("sh found: 1")
+
+    var argv: [4]*u8
+    argv[0] = c"sh"
+    argv[1] = c"-c"
+    argv[2] = c"exit 3"
+    argv[3] = null
+    var p: Process = spawn_args(sh, @argv[0])
+    var r: ProcessResult = process_wait(@p)
+    show_result(@r)
+    process_cleanup(@p)
+
+# ============================================================================
+# 4. Kill
+# ============================================================================
+
+fn kill_child()
+    println("== kill ==")
+    # cat blocks reading its open stdin, so it is still running when killed.
+    var p: Process = spawn_cat()
+    process_kill(@p)
+    var r: ProcessResult = process_wait(@p)
+    show_result(@r)
+    show(c"signal: ", r.signal as i64)
+    process_cleanup(@p)
+
+# ============================================================================
+# 5. Missing command
+# ============================================================================
+
+fn missing()
+    println("== missing ==")
+    var path: [256]u8
+    let found: *u8 = find_command_in_path(c"ritz-no-such-command", @path[0], 256)
+    if found == null
+        println("not found: 1")
+    else
+        println("not found: 0")
+
+fn main() -> i32
+    read_all()
+    read_by_line()
+    exit_code()
+    kill_child()
+    missing()
+    return 0
