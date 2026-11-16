@@ -240,6 +240,12 @@ def _deep_nesting(depth: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _deep_parens(depth: int) -> str:
+    """`(` nested `depth` deep on line 2.  The innermost `(` is at column
+    11 + depth, so depth 65 fails at 2:76 (AGAST #3447)."""
+    return f"pub fn main() -> i32\n    return {'(' * depth}42{')' * depth}\n"
+
+
 TAB_PROGRAM = "fn main() -> i32\n\treturn 3\n"
 
 
@@ -267,12 +273,17 @@ MUST_WORK = {
     "generic_struct_12_args": (_wide_generic_struct(12), 5 + 66),
     "generic_fn_9_args": (_wide_generic_fn(9), 45),
     "generic_fn_12_args": (_wide_generic_fn(12), 78),
+    # AGAST #3447: the last depth Lexer.bracket_kinds holds.
+    "parens_64": (_deep_parens(64), 42),
 }
 
 # --- fixed limits that remain: one located error -----------------------------
 
 MUST_FAIL_LOUD = {
     "nesting_70": (_deep_nesting(70), 42, "blocks nested more than 64 levels deep"),
+    # AGAST #3447: past 64 the lexer stopped recording bracket kinds, silently.
+    # ritz0 has no limit, so its oracle compiles this.
+    "parens_65": (_deep_parens(65), 42, "parens_65.ritz:2:76: brackets nested more than 64 levels deep"),
 }
 
 ORACLE = {k: v[:2] for k, v in {**MUST_WORK, **MUST_FAIL_LOUD}.items()}

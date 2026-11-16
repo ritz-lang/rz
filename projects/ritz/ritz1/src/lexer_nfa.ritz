@@ -33,6 +33,11 @@ struct TokenPattern
 # with no bounds check, writing past the array into the fields after it.
 const MAX_INDENT_DEPTH: i32 = 64
 
+# Maximum bracket nesting: the size of Lexer.bracket_kinds.  Deeper is a
+# located lexer error (AGAST #3447); past it the kinds used to go unrecorded,
+# silently.  ritz0 has no limit.
+const MAX_BRACKET_DEPTH: i32 = 64
+
 # Initial capacity of the cooked-string scratch buffer.  This is a starting
 # size, NOT a cap — `lexer_str_push` grows it geometrically.  See the
 # `string_buf` comment on `struct Lexer`.
@@ -57,9 +62,8 @@ struct Lexer
   at_line_start: i32       # 1 if at start of line, 0 otherwise
   pending_dedents: i32     # Number of DEDENT tokens to emit
   bracket_depth: i32       # Nesting depth of (), [], {} - no NEWLINE/INDENT/DEDENT when > 0
-  # The innermost brackets' kinds (`(`, `[` or `{`), for the error below.
-  # Deeper than 64 the message names `(`.
-  bracket_kinds: [64]u8
+  # The open brackets' kinds (`(`, `[` or `{`), for the error below.
+  bracket_kinds: [64]u8    # MAX_BRACKET_DEPTH
   # No block opens inside brackets (LARB R46a, AGAST #3388): their line
   # breaks and indentation are ignored, so a `match` there, or an `if` whose
   # line ends before its `then`, is refused at the keyword.  #2369's "layout
@@ -245,7 +249,7 @@ fn lexer_ends_in_operator(lex: *Lexer) -> i32
 # message (#3429).
 fn lexer_fail_block(lex: *Lexer, start: *u8, line: i32, col: i32) -> Token
   var bracket: u8 = 40
-  if lex.bracket_depth >= 1 and lex.bracket_depth <= 64
+  if lex.bracket_depth >= 1 and lex.bracket_depth <= MAX_BRACKET_DEPTH
     bracket = lex.bracket_kinds[lex.bracket_depth - 1]
   lex.error_msg = c"a block can't open inside `(`: bind the `if`/`match` to a `let` first"
   if bracket == 91
@@ -950,9 +954,15 @@ fn lexer_next_token(lex: *Lexer) -> Token
 
     # Track bracket depth for suppressing INDENT/DEDENT inside brackets
     if best_type == TOK_LPAREN or best_type == TOK_LBRACKET or best_type == TOK_LBRACE
+      if lex.bracket_depth >= MAX_BRACKET_DEPTH
+        var err: Token = token_new(TOK_ERROR, 0, 1, line, col)
+        err.start = lex.src + start
+        lex.error_msg = c"brackets nested more than 64 levels deep"
+        lex.pos = lex.len
+        lex.pending_dedents = 0
+        return err
+      lex.bracket_kinds[lex.bracket_depth] = *(lex.src + start)
       lex.bracket_depth = lex.bracket_depth + 1
-      if lex.bracket_depth <= 64
-        lex.bracket_kinds[lex.bracket_depth - 1] = *(lex.src + start)
     if best_type == TOK_RPAREN or best_type == TOK_RBRACKET or best_type == TOK_RBRACE
       if lex.bracket_depth > 0
         lex.bracket_depth = lex.bracket_depth - 1

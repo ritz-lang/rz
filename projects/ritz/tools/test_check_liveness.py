@@ -159,11 +159,15 @@ def test_backup_files_are_strays(tmp_path, rel):
     assert find_strays(tmp_path, [rel]) == [rel]
 
 
-def test_elf_in_ritz0_is_a_stray(tmp_path):
-    (tmp_path / "ritz0").mkdir()
-    (tmp_path / "ritz0/cat_ll").write_bytes(b"\x7fELF\x02\x01\x01")
-    (tmp_path / "ritz0/notes.md").write_text("text")
-    assert find_strays(tmp_path, ["ritz0/cat_ll", "ritz0/notes.md"]) == ["ritz0/cat_ll"]
+@pytest.mark.parametrize("rel", ["ritz0/cat_ll", "ritz1/ritz1_new", "tools/a.out"])
+def test_elf_anywhere_is_a_stray(tmp_path, rel):
+    """AGAST #3447: ritz1/ritz1_new sat tracked for months; ritz0/ was the only
+    directory checked."""
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\x7fELF\x02\x01\x01")
+    (tmp_path / "notes.md").write_text("text")
+    assert find_strays(tmp_path, [rel, "notes.md"]) == [rel]
 
 
 def test_real_tree_is_live():
@@ -190,3 +194,22 @@ def test_cli_goes_red_on_a_planted_untracked_orphan(tmp_path):
     planted = subprocess.run(tool, capture_output=True, text=True)
     assert planted.returncode == 1
     assert "ritz0/planted.py" in planted.stdout
+
+
+@pytest.mark.integration
+def test_cli_goes_red_on_a_planted_tracked_elf(tmp_path):
+    """End to end (AGAST #3447): a tracked ELF outside ritz0/ fails; the same
+    file untracked does not, since a local build output is not the tree's."""
+    root, _ = tree(tmp_path, {})
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    tool = [sys.executable, check_liveness.__file__, "--root", str(root)]
+
+    (root / "ritz1").mkdir()
+    (root / "ritz1/ritz1_new").write_bytes(b"\x7fELF\x02\x01\x01")
+    untracked = subprocess.run(tool, capture_output=True, text=True)
+    assert untracked.returncode == 0, untracked.stdout + untracked.stderr
+
+    subprocess.run(["git", "add", "ritz1/ritz1_new"], cwd=root, check=True)
+    tracked = subprocess.run(tool, capture_output=True, text=True)
+    assert tracked.returncode == 1
+    assert "ritz1/ritz1_new" in tracked.stdout

@@ -15,8 +15,9 @@ each have one.  Test modules are never roots, so a test cannot keep the code it
 tests alive.  Imports are read from the AST, so a commented-out import does not
 count and one inside a function does.
 
-Also rejects editor and merge backups (*.orig, *.old) and ELF binaries in
-ritz0/, which no import graph would see.
+Also rejects tracked editor and merge backups (*.orig, *.old) and tracked ELF
+binaries anywhere under projects/ritz, which no import graph would see.  The ELF
+check covered only ritz0/ until AGAST #3447 found ritz1/ritz1_new tracked.
 
 Runs in `make tools-unit` through test_check_liveness.py::test_real_tree_is_live.
 """
@@ -152,12 +153,12 @@ def find_orphans(root, files):
 
 
 def find_strays(root, files):
-    """Backup files anywhere in `files`, and ELF binaries under ritz0/."""
+    """Backup files and ELF binaries anywhere in `files`."""
     strays = []
     for rel in files:
         if rel.endswith(BACKUP_SUFFIXES):
             strays.append(rel)
-        elif rel.startswith(f"{RITZ0}/"):
+        else:
             with open(Path(root) / rel, "rb") as f:
                 if f.read(len(ELF_MAGIC)) == ELF_MAGIC:
                     strays.append(rel)
