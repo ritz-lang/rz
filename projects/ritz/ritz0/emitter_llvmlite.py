@@ -2127,7 +2127,8 @@ class LLVMEmitter:
                 elif isinstance(elem, rast.StringLit) and elem.as_ptr:
                     elements.append(self._const_str_ptr(elem.value))
                 elif isinstance(elem, rast.StructLit):
-                    elements.append(self._make_const_struct_value(elem, elem_type, f"{name}.arr"))
+                    elements.append(self._make_const_struct_value(
+                        elem, elem_type, f"{name}.arr", (name, len(elements))))
                 else:
                     elem_val = self._fold_const_array_elem(name, len(elements), elem, elem_type)
                     elements.append(ir.Constant(elem_type, elem_val))
@@ -2157,8 +2158,18 @@ class LLVMEmitter:
         self.const_arrays[name] = (gvar, llvm_type)
         self.ritz_types[name] = ritz_type
 
-    def _const_value_from_expr(self, expr: rast.Expr, target_type: ir.Type, name_hint: str) -> ir.Constant:
-        """Build a compile-time constant value for globals/const arrays."""
+    def _const_value_from_expr(self, expr: rast.Expr, target_type: ir.Type, name_hint: str,
+                               field_of: Optional[Tuple[str, int, str]] = None) -> ir.Constant:
+        """Build a compile-time constant value for globals/const arrays.
+
+        `field_of` is `(const, element, field)` when `expr` is a field of a
+        struct element of a const array. An integer (or bool) field then folds
+        through the const evaluator, as ritz1's const_fold_int does (#1569),
+        and one that doesn't fold is a located error in ritz1's words
+        (AGAST #3650).
+        """
+        if field_of is not None and isinstance(target_type, ir.IntType):
+            return ir.Constant(target_type, self._fold_const_struct_field(expr, target_type, field_of))
         if isinstance(expr, rast.IntLit):
             return ir.Constant(target_type, expr.value)
         if isinstance(expr, rast.UnaryOp) and expr.op == '-' and isinstance(expr.operand, rast.IntLit):
@@ -2178,8 +2189,31 @@ class LLVMEmitter:
         zero = ir.Constant(self.i64, 0)
         return self._get_string_constant(value).gep([zero, zero])
 
-    def _make_const_struct_value(self, expr: rast.StructLit, target_type: ir.Type, name_hint: str) -> ir.Constant:
-        """Create an LLVM constant for a struct literal used in const contexts."""
+    def _fold_const_struct_field(self, expr: rast.Expr, target_type: ir.IntType,
+                                 field_of: Tuple[str, int, str]) -> int:
+        """Fold integer field `field_of` = (const, element, field) of a const
+        array's struct element (AGAST #3650). The value is wrapped to the
+        field's width in the signed form, as `_fold_const_array_elem` does, so
+        the IR holds an in-range literal rather than leaning on LLVM's parser
+        to truncate one."""
+        const_name, index, field_name = field_of
+        try:
+            value = ConstEvaluator(self._known_int_consts(), self._u64_const_names()).evaluate(expr)
+        except ConstEvalError:
+            raise EmitError(
+                f"const '{const_name}' element {index} field '{field_name}' "
+                f"is not a constant integer expression",
+                getattr(expr, "span", None),
+            ) from None
+        return self._wrap_to_int_type(value, target_type)
+
+    def _make_const_struct_value(self, expr: rast.StructLit, target_type: ir.Type, name_hint: str,
+                                 element_of: Optional[Tuple[str, int]] = None) -> ir.Constant:
+        """Create an LLVM constant for a struct literal used in const contexts.
+
+        `element_of` is `(const, element)` when the literal is an element of a
+        const array; its integer fields then fold (`_const_value_from_expr`).
+        """
         if expr.name not in self.struct_fields:
             raise ValueError(f"Unknown struct in const literal: {expr.name}")
 
@@ -2191,7 +2225,14 @@ class LLVMEmitter:
                 raise ValueError(f"Missing field '{field_name}' in const struct literal {expr.name}")
             field_llvm_type = self._ritz_type_to_llvm(field_ritz_type)
             field_expr = field_exprs[field_name]
-            field_const = self._const_value_from_expr(field_expr, field_llvm_type, f"{name_hint}.{field_name}")
+            field_of = (*element_of, field_name) if element_of is not None else None
+            if isinstance(field_expr, rast.StructLit):
+                # A nested struct field: its own fields fold in the same element.
+                field_const = self._make_const_struct_value(
+                    field_expr, field_llvm_type, f"{name_hint}.{field_name}", element_of)
+            else:
+                field_const = self._const_value_from_expr(
+                    field_expr, field_llvm_type, f"{name_hint}.{field_name}", field_of)
             field_constants.append(field_const)
 
         return ir.Constant(target_type, field_constants)
@@ -2242,12 +2283,8 @@ class LLVMEmitter:
         const arrays are emitted after every scalar const is collected. An
         element that does not fold is a located error, never a silent value.
         """
-        known = {
-            cname: cval for cname, (cval, cty) in self.constants.items()
-            if isinstance(cval, int) and isinstance(cty, ir.IntType)
-        }
         try:
-            value = ConstEvaluator(known, self._u64_const_names()).evaluate(expr)
+            value = ConstEvaluator(self._known_int_consts(), self._u64_const_names()).evaluate(expr)
         except ConstEvalError as e:
             raise EmitError(
                 f"const '{name}': element {index} is not a constant integer "
@@ -2259,6 +2296,13 @@ class LLVMEmitter:
             # and keep the signed form llvmlite prints.
             value = self._wrap_to_int_type(value, elem_type)
         return value
+
+    def _known_int_consts(self) -> Dict[str, int]:
+        """Every folded integer const, by name, for the const evaluator."""
+        return {
+            cname: cval for cname, (cval, cty) in self.constants.items()
+            if isinstance(cval, int) and isinstance(cty, ir.IntType)
+        }
 
     def _u64_const_names(self) -> List[str]:
         """The consts declared `u64`, which a fold must not read as signed."""

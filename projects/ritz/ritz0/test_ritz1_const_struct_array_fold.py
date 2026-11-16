@@ -9,10 +9,9 @@ struct-element sibling of #1557 (test_ritz1_const_array_fold.py).  Each integer
 field now goes through const_fold_int; one that doesn't fold is an error at
 the field's value, not a silent 0.
 
-Every program exits 3 when the fields hold the right values.  ritz0 is the
-reference for the literal forms; its const-field evaluator takes only literals
-and a negated literal, so the const-name and const-expression forms run on
-ritz1 and ritz1_selfhosted only (ritz0's gap is AGAST #3650).
+Every program exits 3 when the fields hold the right values, on all three
+compilers.  ritz0 folds each integer field through its ConstEvaluator and
+reports an unfoldable one with ritz1's wording (AGAST #3650).
 """
 
 import pytest
@@ -81,7 +80,9 @@ pub fn main() -> i32
 """
 
 # Every integer width, a negative needing the high word, a bool, and a string
-# field beside them: each field keeps its own value and slot.
+# field beside them: each field keeps its own value and slot.  `0xFFFF + 18`
+# (wrapping to the u16 17) and
+# `!0` are folded, not literal (AGAST #3650).
 WIDTHS = """\
 struct Q
     a: i8
@@ -90,7 +91,7 @@ struct Q
     c: u16
     d: bool
 
-const T: [1]Q = [Q { a: -3, b: -8589934595, name: "hi", c: 0x11, d: true }]
+const T: [1]Q = [Q { a: -3, b: -8589934595, name: "hi", c: 0xFFFF + 18, d: !0 }]
 
 pub fn main() -> i32
     if T[0].b != -8589934595
@@ -107,9 +108,6 @@ pub fn main() -> i32
 FORMS = {
     "neg_repro": NEG_REPRO,
     "widths": WIDTHS,
-}
-
-RITZ1_FORMS = {
     "const_name": CONST_NAME,
     "const_expr": CONST_EXPR,
 }
@@ -122,17 +120,8 @@ def test_const_struct_array_integer_fields_fold(tmp_path, compiler, name):
     assert rc == 3, f"{compiler} build of {name} exited {rc}, expected 3"
 
 
-@pytest.mark.parametrize("name", _ids(RITZ1_FORMS))
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_const_struct_array_const_expr_fields_fold(tmp_path, compiler, name):
-    rc = _run(compiler, tmp_path, name, RITZ1_FORMS[name])
-    assert rc == 3, f"{compiler} build of {name} exited {rc}, expected 3"
-
-
 # --- an integer field that doesn't fold is a located error ------------------
-# `^` marks the field's value, where the error is reported.  ritz0 raises a
-# traceback for these instead (AGAST #3650), so they run on the two ritz1
-# compilers only.
+# `^` marks the field's value, where the error is reported.
 
 UNFOLDABLE = {
     "call": """\
@@ -157,7 +146,7 @@ UNFOLDABLE_FIELD = {"call": (0, "y"), "unknown_name": (1, "x")}
 
 
 @pytest.mark.parametrize("name", _ids(UNFOLDABLE))
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_unfoldable_integer_field_is_a_located_error(tmp_path, compiler, name):
     elem, field = UNFOLDABLE_FIELD[name]
     src = UNFOLDABLE[name] + "\npub fn main() -> i32\n    return 3\n"
