@@ -170,6 +170,9 @@ HOLDERS = {
     "global_ptr_ptr_read": (_main("    G = @&q\n    G.get()\n", "var G: **C = null\n\n"), 1),
     "global_ptr_ptr_store": (_main("    G = @&q\n    G.set(3)\n    c.x\n", "var G: **C = null\n\n"), 3),
     "global_shared_ptr_read": (_main("    G = @q\n    G.get()\n", "var G: @*C = null\n\n"), 1),
+    # An `@C` / `@&C` global holds the `ptr` to its struct (#3093).
+    "global_shared_read": (_main("    G = @c\n    G.get()\n", "var G: @C = null\n\n"), 1),
+    "global_mut_store": (_main("    G = @&c\n    G.set(3)\n    c.x\n", "var G: @&C = null\n\n"), 3),
     # `G = @&c` stored the `ptr` into the global's i64 (#2399).
     "global_ptr_of_an_address_store": (_main("    G = @&c\n    G.set(3)\n    c.x\n", "var G: *C = null\n\n"), 3),
     "element_ptr_ptr_store": (_main("    var a: [1]**C = [@&q]\n    a[0].set(3)\n    c.x\n"), 3),
