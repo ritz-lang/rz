@@ -70,7 +70,7 @@ lib/config.ritz         valet.json config loading
 lib/log.ritz            Request logging
 lib/pool.ritz           Connection/buffer pooling
 lib/json_builder.ritz   JSON response construction
-lib/tls.ritz, lib/tls/  TLS 1.3 termination (via cryptosec)
+lib/tls.ritz            TLS 1.3 termination (via cryptosec)
 ```
 
 `src/` holds only `main.ritz` — the earlier claim that `src/compress.ritz` and
@@ -232,7 +232,7 @@ Shipped — these were listed as "next steps" here long after they landed:
 4. ~~**Compression**~~ ✅ `lib/compress.ritz` via squeeze
 5. ~~**Config file**~~ ✅ `lib/config.ritz`, `-c/--config`
 6. ~~**Reverse proxy**~~ ✅ `-z/--zeus-socket`
-7. ~~**TLS**~~ ✅ `lib/tls.ritz` + `lib/tls/` via cryptosec; `test/test_tls_socket.sh`
+7. ~~**TLS**~~ ✅ `lib/tls.ritz` via cryptosec; `test/test_tls_socket.sh`
    runs HTTPS against OpenSSL over a real socket in CI's `build-all` job
 
 Still open:

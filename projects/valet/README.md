@@ -96,7 +96,7 @@ integration, multi-process workers, routing (`lib/router.ritz`), static file
 serving (`valet_static`), middleware (`valet_use`) and gzip/deflate compression
 (`lib/compress.ritz`) are all implemented and present in `lib/`. A local smoke
 test (`valet -p 8099`, then `curl`) returns HTTP 200. TLS lives in `lib/tls.ritz`
-and `lib/tls/`; end-to-end HTTPS has not been measured here.
+(via cryptosec); end-to-end HTTPS has not been measured here.
 
 Throughput: `test/test_basic.sh` drives `wrk` against a single worker and
 reported **28,108** and **34,850 req/s** across two runs on this machine on
