@@ -306,6 +306,27 @@ def test_struct_load_from_call_result_is_a_copy_only(tmp_path, compiler):
     assert where in out, f"{compiler}: wanted the error at {where}:\n{out[-2000:]}"
 
 
+# `b.arr()[i] = v`: the same, through a method's `*T` / `**T` result.  ritz1
+# missed the method base (AGAST #3528) and stored through the VALUE of
+# `b.arr()[i]`: a SIGSEGV.  CALL_BASE's rows, with `arr` a method of `B`.
+def _method_base(body):
+    body = re.sub(r"^fn arr\(\) -> (.*)$", r"struct B\n    n: i32\n\nimpl B\n    fn arr(self: @B) -> \1",
+                  body, flags=re.M)
+    body = re.sub(r"^    D = D \* 10 \+ 6\n    return ([PQ])$", r"        D = D * 10 + 6\n        return \1",
+                  body, flags=re.M)
+    body = body.replace("    arr()[", "    var b: B = B { n: 0 }\n    b.arr()[")
+    assert "b.arr()[" in body and "impl B" in body, body
+    return body
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(CALL_BASE))
+def test_store_into_method_result(tmp_path, compiler, name):
+    body, call, want = CALL_BASE[name]
+    rc = _run(compiler, tmp_path, f"method_base_{name}", _source(_method_base(body), call, want))
+    assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
+
+
 # §3.3: a Drop array local needs an initialiser; the error is at the name.
 UNINIT = {
     "rank1": "    var a: [2]S\n",
