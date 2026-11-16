@@ -1951,18 +1951,65 @@ class LLVMEmitter:
         return None
 
     @staticmethod
-    def _fold_int_global_init(expr: rast.Expr) -> int | None:
-        """Fold an integer global's initializer, or None if it is not an
-        integer literal under any number of unary `-` / `~` (AGAST #3027),
-        as ritz1's global_init_fold folds them."""
-        if isinstance(expr, rast.IntLit):
-            return expr.value
+    def _fold_scalar_global_init(expr: rast.Expr) -> tuple | None:
+        """Fold a global's initializer as ritz1's global_init_fold does
+        (AGAST #3027, #1539): an int, char or float literal, or `null`,
+        under any number of unary `-` (`~` only over an integer) and `as`
+        casts.  Returns `('int', n)`, `('float', x)` or `('null', None)`, or
+        None if it is not one of those.
+
+        Like ritz1, a cast's target is not consulted: the value is written
+        in the global's own type.  Binary operators and named consts are not
+        folded here, though ConstEvaluator could: ritz1 refuses them, and all
+        three compilers must agree on that (test_global_init_rejected.py)."""
+        if isinstance(expr, (rast.IntLit, rast.CharLit)):
+            return ('int', expr.value)
+        if isinstance(expr, rast.FloatLit):
+            return ('float', expr.value)
+        if isinstance(expr, rast.NullLit):
+            return ('null', None)
+        if isinstance(expr, rast.Cast):
+            return LLVMEmitter._fold_scalar_global_init(expr.expr)
         if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
-            inner = LLVMEmitter._fold_int_global_init(expr.operand)
-            if inner is None:
+            inner = LLVMEmitter._fold_scalar_global_init(expr.operand)
+            if inner is None or inner[0] == 'null':
                 return None
-            return -inner if expr.op == '-' else ~inner
+            kind, value = inner
+            if expr.op == '-':
+                return (kind, -value)
+            if kind == 'int':
+                return ('int', ~value)
         return None
+
+    def _global_init_constant(self, var_def: rast.VarDef, ty: ir.Type,
+                              kind: str, value) -> ir.Constant:
+        """The LLVM initializer for a folded `(kind, value)` in a global of
+        type `ty`, or a located error when the value does not fit it."""
+        span = var_def.value.span
+        if kind == 'null':
+            if isinstance(ty, ir.PointerType):
+                return ir.Constant(ty, None)
+            raise self._global_init_error(var_def, "is not a pointer but has a null initializer")
+        if ty == self.i1:
+            raise EmitError(bool_rules.value_into_bool(
+                bool_rules.FLOAT if kind == 'float' else bool_rules.INTEGER), span)
+        is_float_ty = isinstance(ty, (ir.FloatType, ir.DoubleType))
+        if kind == 'float' and not is_float_ty:
+            # ritz1's wording.
+            raise self._global_init_error(
+                var_def, "is not a float type but has a float initializer")
+        if is_float_ty:
+            return ir.Constant(ty, float(value))
+        if isinstance(ty, ir.PointerType):
+            # `N as *T`: the address N; 0 is null (AGAST #1539: ritz0 used to
+            # write null for every integer).
+            if value == 0:
+                return ir.Constant(ty, None)
+            return ir.Constant(ir.IntType(64), value).inttoptr(ty)
+        if isinstance(ty, ir.IntType):
+            return ir.Constant(ty, value)
+        raise self._global_init_error(
+            var_def, "has a scalar initializer but is not a scalar type")
 
     @staticmethod
     def _global_init_error(var_def: rast.VarDef, why: str) -> EmitError:
@@ -2025,44 +2072,12 @@ class LLVMEmitter:
 
             # Set initializer for definitions
             if var_def.value is not None:
-                if isinstance(var_def.value, rast.IntLit):
-                    if ty == self.i1:
-                        raise EmitError(bool_rules.value_into_bool(bool_rules.INTEGER),
-                                        var_def.value.span)
-                    if isinstance(ty, ir.PointerType):
-                        # Pointer initialized with integer literal (e.g., 0) -> null pointer
-                        gvar.initializer = ir.Constant(ty, None)
-                    else:
-                        gvar.initializer = ir.Constant(ty, var_def.value.value)
-                elif (n := self._fold_int_global_init(var_def.value)) is not None:
-                    # `-1`, `~0`, `-~2`: unary -/~ over an integer literal
-                    # (AGAST #3027).  Not into a bool or a pointer.
-                    if ty == self.i1:
-                        raise EmitError(bool_rules.value_into_bool(bool_rules.INTEGER),
-                                        var_def.value.span)
-                    if isinstance(ty, ir.PointerType):
-                        raise self._global_init_error(
-                            var_def, "is a pointer but has a non-zero integer initializer")
-                    gvar.initializer = ir.Constant(ty, n)
-                elif isinstance(var_def.value, rast.Cast):
-                    # Handle `0 as *i8` style initialization
-                    if isinstance(var_def.value.expr, rast.IntLit):
-                        if isinstance(ty, ir.PointerType):
-                            # Cast to pointer type with zero -> null pointer
-                            gvar.initializer = ir.Constant(ty, None)
-                        else:
-                            gvar.initializer = ir.Constant(ty, var_def.value.expr.value)
-                    else:
-                        raise self._global_init_error(var_def, _GLOBAL_NON_CONSTANT)
-                elif isinstance(var_def.value, rast.StringLit) and var_def.value.as_ptr:
+                if isinstance(var_def.value, rast.StringLit) and var_def.value.as_ptr:
                     gvar.initializer = self._const_str_ptr(var_def.value.value)
-                elif isinstance(var_def.value, rast.NullLit):
-                    # Handle `null` initialization for pointer types
-                    if isinstance(ty, ir.PointerType):
-                        gvar.initializer = ir.Constant(ty, None)
-                    else:
-                        raise self._global_init_error(
-                            var_def, "is not a pointer but has a null initializer")
+                elif (folded := self._fold_scalar_global_init(var_def.value)) is not None:
+                    # `5`, `-1`, `~0`, `'A'`, `-0.75`, `null`, `4096 as *u8`
+                    # (AGAST #3027, #1539), written in the global's own type.
+                    gvar.initializer = self._global_init_constant(var_def, ty, *folded)
                 elif ty == self.i1 and (bit := self._fold_bool_global_init(var_def.value)) is not None:
                     # AGAST #3009: `true`, `false`, and `not` of one, as ritz1's
                     # global_init_fold folds them: the i1 0/1 a bool global is.

@@ -18,7 +18,8 @@ unary minus or `~` of one, `null`, or a cast of any of those) to the LLVM
 initializer, and gives anything else a located error instead of a zero.
 
 Every runnable program returns 3 when the global held the right value at
-startup and something else otherwise; ritz0 is run as the oracle.  Storage
+startup and something else otherwise; ritz0 is run as the oracle (it lowers
+bool, char and float initializers, and `N as *T`, since AGAST #1539).  Storage
 width is left as ritz1 already had it (narrow ints and floats live in an i64
 slot; a bool is an i1 since AGAST #3001), so the IR-shape tests pin the
 initializer in that storage type.
@@ -133,7 +134,78 @@ pub fn main() -> i32
     g = g - 7
     return g
 """,
+    # --- AGAST #1539: ritz0 refused these, so they were ritz1-only ---
+    "bool_true": """\
+var g: bool = true
+
+pub fn main() -> i32
+    if g
+        return 3
+    return 1
+""",
+    "u8_char": """\
+var g: u8 = 'A'
+
+pub fn main() -> i32
+    return (g as i32) - 62
+""",
+    "f64": """\
+var g: f64 = 1.5
+
+pub fn main() -> i32
+    return (g * 2.0) as i32
+""",
+    "f64_negative": """\
+var g: f64 = -0.75
+
+pub fn main() -> i32
+    # -0.75 * 4.0 + 6 == 3.  (Not `g * -4.0`: unary minus on a float
+    # literal inside an expression is a separate ritz1 bug, AGAST #1541.)
+    return ((g * 4.0) as i32) + 6
+""",
+    "i64_char_cast": """\
+var g: i64 = 'A' as i64
+
+pub fn main() -> i32
+    return (g as i32) - 62
+""",
+    "f64_cast": """\
+var g: f64 = 1.5 as f64
+
+pub fn main() -> i32
+    return (g * 2.0) as i32
+""",
+    # ritz0 dropped the integer and wrote `null` for any pointer target.
+    "ptr_int_cast": """\
+var g: *u8 = 4096 as *u8
+
+pub fn main() -> i32
+    if (g as u64) == 4096
+        return 3
+    return 1
+""",
+    "ptr_int_bare": """\
+var g: *u8 = 4096
+
+pub fn main() -> i32
+    if (g as u64) == 4096
+        return 3
+    return 1
+""",
 }
+
+# The forms #1539 made oracle-checked, also run on ritz1_selfhosted.
+FORMS_1539 = (
+    "bool_true",
+    "u8_char",
+    "f64",
+    "f64_negative",
+    "i64_char_cast",
+    "f64_cast",
+    "ptr_int_cast",
+    "ptr_int_bare",
+    "bool_false",
+)
 
 # --- forms that already worked: zero / null initializers and no initializer --
 
@@ -183,46 +255,25 @@ var g: i32 = -~2
 pub fn main() -> i32
     return g
 """,
+    # Worked before #1501 only because false == 0; pinned so it keeps working.
+    "bool_false": """\
+var g: bool = false
+
+pub fn main() -> i32
+    if g
+        return 1
+    return 3
+""",
 }
 
 ALL_RUNNABLE = {**BROKEN_FORMS, **WORKING_FORMS}
 
 # --- ritz1-only forms --------------------------------------------------------
-# ritz0's `_emit_global_var` refuses char and float literals (AGAST #1539),
-# and folded bools only from #3009, so there is no oracle here: each
-# program checks its own value and returns 3 when it matches.
+# ritz0 lowers only a `"..."` here, not `c"..."` (#2357; ritz1 points both at
+# the literal's `@.str`), so there is no oracle: the program checks its own
+# value and returns 3 when it matches.
 
 RITZ1_ONLY_BROKEN_FORMS = {
-    "bool_true": """\
-var g: bool = true
-
-pub fn main() -> i32
-    if g
-        return 3
-    return 1
-""",
-    "u8_char": """\
-var g: u8 = 'A'
-
-pub fn main() -> i32
-    return (g as i32) - 62
-""",
-    "f64": """\
-var g: f64 = 1.5
-
-pub fn main() -> i32
-    return (g * 2.0) as i32
-""",
-    "f64_negative": """\
-var g: f64 = -0.75
-
-pub fn main() -> i32
-    # -0.75 * 4.0 + 6 == 3.  (Not `g * -4.0`: unary minus on a float
-    # literal inside an expression is a separate ritz1 bug, AGAST #1541.)
-    return ((g * 4.0) as i32) + 6
-""",
-    # ritz0 lowers only a `"..."` here, not `c"..."` (#2357; ritz1 points both
-    # at the literal's `@.str`).
     "cstring": """\
 var g: *u8 = c"A"
 
@@ -231,15 +282,15 @@ pub fn main() -> i32
 """,
 }
 
-# Worked before the fix only because false == 0; pinned so it keeps working.
-RITZ1_ONLY_WORKING_FORMS = {
-    "bool_false": """\
-var g: bool = false
+# --- ritz0-only forms --------------------------------------------------------
+# ritz1 refuses a non-zero f32 (see NON_CONSTANT_FORMS); ritz0 lowers it.
+
+RITZ0_ONLY_FORMS = {
+    "f32_nonzero": """\
+var g: f32 = 1.5
 
 pub fn main() -> i32
-    if g
-        return 1
-    return 3
+    return (g * 2.0) as i32
 """,
 }
 
@@ -344,7 +395,7 @@ def _compile(compiler: str, tmp_path: Path, name: str, program: str):
     if compiler == "ritz0":
         comp = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
-        cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
+        cmd = [str(RITZ1_BIN.parent / compiler), str(src), "-o", str(ll)]
         comp = subprocess.run(
             cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
         )
@@ -360,7 +411,7 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     )
     exe = tmp_path / f"{name}_{compiler}"
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
-    if compiler == "ritz1":
+    if compiler != "ritz0":
         link_cmd.insert(2, str(RITZ_START))
     link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, (
@@ -412,14 +463,21 @@ def test_ritz1_zero_and_absent_initializers(ritz1_bin, tmp_path, name):
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(RITZ1_ONLY_BROKEN_FORMS))
 def test_ritz1_only_global_starts_at_initializer(ritz1_bin, tmp_path, name):
-    """bool / char / float initializers; before the fix each read 0."""
+    """A c-string initializer; before the fix it read 0."""
     assert _run("ritz1", tmp_path, name, RITZ1_ONLY_BROKEN_FORMS[name]) == 3
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY_WORKING_FORMS))
-def test_ritz1_only_zero_initializers(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", tmp_path, name, RITZ1_ONLY_WORKING_FORMS[name]) == 3
+@pytest.mark.parametrize("name", FORMS_1539)
+def test_ritz1_selfhosted_global_starts_at_initializer(ritz1_bin, tmp_path, name):
+    """AGAST #1539's forms on the third compiler, against the same oracle."""
+    assert _run("ritz1_selfhosted", tmp_path, name, ALL_RUNNABLE[name]) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(RITZ0_ONLY_FORMS))
+def test_ritz0_only_global_starts_at_initializer(tmp_path, name):
+    assert _run("ritz0", tmp_path, name, RITZ0_ONLY_FORMS[name]) == 3
 
 
 @pytest.mark.integration

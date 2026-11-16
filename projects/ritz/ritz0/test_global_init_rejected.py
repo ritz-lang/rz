@@ -82,6 +82,35 @@ def test_ritz0_null_into_an_integer_global_is_a_located_error(request, tmp_path)
     assert not ll.exists()
 
 
+# AGAST #1539: a char / float initializer folds, but only into a slot of its
+# kind.  ritz0-only: ritz1 locates these at the declaration, not the value.
+# name -> (source, message)
+_MISFIT = {
+    "float_into_int": ("var g: i32 = 1.5\n", "global 'g' is not a float type but has a float initializer"),
+    "neg_float_into_int": ("var g: i64 = -0.5\n", "global 'g' is not a float type but has a float initializer"),
+    "float_cast_into_int": ("var g: i64 = 1.5 as i64\n",
+                            "global 'g' is not a float type but has a float initializer"),
+    "float_into_pointer": ("var g: *u8 = 1.5\n", "global 'g' is not a float type but has a float initializer"),
+    "float_into_bool": ("var g: bool = 1.5\n", "cannot use a float as bool"),
+    "char_into_bool": ("var g: bool = 'A'\n", "cannot use an integer as bool"),
+    "bit_not_float": ("var g: f64 = ~1.5\n", "global 'g' has a non-constant initializer"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(_MISFIT))
+def test_ritz0_a_misfit_constant_initializer_is_a_located_error(request, tmp_path, name):
+    source, message = _MISFIT[name]
+    proc, ll = _compile(request, "ritz0", tmp_path, source + _MAIN)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"ritz0 accepted {name}:\n{out[-1500:]}"
+    assert "Traceback" not in out and "ValueError" not in out, out[-1500:]
+    col = source.index("=") + 3
+    hits = re.findall(rf"unit\.ritz:1:{col}: (?:error: )?{re.escape(message)}", out)
+    assert len(hits) == 1, f"{name}: want one {message!r} at 1:{col}:\n{out[-1500:]}"
+    assert not ll.exists(), f"ritz0 wrote IR for {name}"
+
+
 # LARB R38 (#3374): a global's type is written, never read off its initializer.
 # name -> (source, line, column, message)
 _UNTYPED = {
