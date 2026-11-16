@@ -375,20 +375,16 @@ vouches for that exact commit.
    squash to one commit: `ritz-task-<id>: 🤖 <terse description>`.
    Then run `make -C projects/ritz smoke` (≤ 2 min) before requesting a
    gate; fix anything it reports first. A gate slot is one machine-wide.
-6. **Gate that commit**, detached so a new message can't kill it. The gate
-   script always comes from `origin/main`, never from your branch: fetch,
-   then extract it outside your worktree and run it with `bash`:
+6. **Gate that commit**, detached so a new message can't kill it, with
+   your own worktree's gate script (a branch may carry gate fixes for itself;
+   Aaron, 2026-11-16, Borque #3724):
    ```bash
-   git -C ~/dev/ritz-lang/rz-task-<id> fetch -q origin
-   G=$(mktemp -d "$HOME/.cache/rz-gate-script.XXXXXX")
-   git -C ~/dev/ritz-lang/rz-task-<id> archive origin/main .claude/skills/rz-iterate/run-gate.sh .claude/host-env.sh | tar -x -C "$G"
-   LOG=$(bash "$G/.claude/skills/rz-iterate/run-gate.sh" ~/dev/ritz-lang/rz-task-<id> <id>)
-   timeout 540 bash "$G/.claude/skills/rz-iterate/run-gate.sh" --wait "$LOG"
+   W=~/dev/ritz-lang/rz-task-<id>
+   LOG=$(bash "$W/.claude/skills/rz-iterate/run-gate.sh" "$W" <id>)
+   timeout 540 bash "$W/.claude/skills/rz-iterate/run-gate.sh" --wait "$LOG"
    ```
-   (Borque, 2026-11-16: this works on hosts before and after the switch to
-   hostd, where `~/dev/ritz-lang/rz` is no longer kept current. `bash <path>`
-   works on a `noexec` `/tmp` too. Re-run the `mktemp`/`archive` lines in
-   a new shell; `$G` can go once the gate has ended.)
+   A gate fix on `main` reaches you only when you rebase. No room reads
+   `~/dev/ritz-lang/rz` any more, so it works unchanged under Borque's hostd.
    Run the wait in the foreground and repeat it on exit 124, which only means
    the slice ran out. It runs a clean `make -C projects/ritz ci-local` over CI's `build-all`
    and `bootstrap` jobs (#2141), one gate machine-wide, and exits with the
