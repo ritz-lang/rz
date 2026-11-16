@@ -23,16 +23,23 @@ struct; this has what's different for the others:
   MISFITS has a reference to something else, written out and not.
 
 `@x` doesn't fit an `@&T` or a `:&` (#2339): neither gets one here.
-"""
 
-import re
+The rows are tables, not a parametrised matrix (AGAST #3520): one test per
+compiler runs every row it holds in batched compiles (test_row_table.py), and a
+failure names each row that missed, what it wanted and what it got.  Which
+compilers a table runs on is the same as when each row was its own test.
+"""
 
 import pytest
 
-from ref_rules import REF_TO_OTHER_POINTER, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
-from test_borrow_param_ref_field import _compile, _run
-from test_ref_into_value import COMPILERS, _assert_refused
-from test_ref_into_value import _compile as _compile_three, _run as _run_three
+from ref_rules import (
+    REF_TO_OTHER_POINTER,
+    REF_TO_OTHER_TYPE,
+    VALUE_INTO_MUT_REF,
+    VALUE_INTO_SHARED_REF,
+)
+from test_ref_into_value import COMPILERS
+from test_row_table import Prefix, assert_refusals, assert_runs
 
 INTS = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"]
 FLOATS = ["f32", "f64"]
@@ -536,9 +543,6 @@ fn f(n:& i32, s: @&S)
 # test_value_into_ref.py's lent_other_scalar is this, bare.
 MISFITS_BARE = sorted(set(MISFITS) - {"narrower", "sign", "sign_pointer", "local", "local_untyped", "bool_local",
                                       "pointer_into_its_pointee"})
-# (row, compiler) -> reason, for a strict xfail.  #2527's `local_untyped` pin
-# went when ritz1 typed an un-annotated scalar local as its initialiser.
-MISFIT_GAPS = {}
 
 # Into a `name:& T` param, `@x` / `@&x` of another type is reinterpreted the
 # same way (#2367). `^` is where the argument goes, and the row's last item what's
@@ -555,9 +559,6 @@ LENT_MISFITS = {
     # `[2]i32` from a type argument is spelled as written, not as an annotation.
     "generic_array_sign": ("fn id<T>(c:& T) -> i32\n    return 0\n", "var a: [2]u32 = [1, 2]", "a", "@&"),
 }
-# (row, compiler) -> reason, for a strict xfail.  #2531's `generic_array_sign`
-# pin went with #2832: a clone of `c:& T` at an array T keeps N and E now.
-LENT_MISFIT_GAPS = {}
 
 
 def _lent_misfit(name):
@@ -568,46 +569,21 @@ def _lent_misfit(name):
     return TYPES + body + f"\npub fn main() -> i32\n    {decl}\n    {call}\n"
 
 
-def _lent_misfit_params():
-    for name in sorted(LENT_MISFITS):
-        for compiler in COMPILERS:
-            gap = LENT_MISFIT_GAPS.get((name, compiler))
-            marks = [pytest.mark.xfail(strict=True, reason=gap)] if gap else []
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_lent_misfit_params()))
-def test_a_lent_param_of_another_type_is_refused(tmp_path, compiler, name):
-    _assert_refused(compiler, tmp_path, name, _lent_misfit(name), REF_TO_OTHER_TYPE)
-
-
 # A bare place of another sign is the fit check's, like one of another width
 # (test_bare_place_borrow.py MISFITS), in its words: exactly the same type (#2530).
+# `^` is where.
 BARE_SIGN = """\
 fn w(n:& i32)
     n = 3
 
 pub fn main() -> i32
     var n: u32 = 1
-    w(n)
+    w(^n)
     return 0
 """
 
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_bare_place_of_another_sign_is_refused(tmp_path, compiler):
-    comp, ll, _ = _compile_three(compiler, tmp_path, "bare_sign", BARE_SIGN)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0 and not ll.exists(), out
-    assert "main.ritz:6:7: argument 1 of `w` has the wrong type" in out, out
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_lent_param_of_its_own_type_still_takes_it(tmp_path, compiler):
-    program = """\
+# A lent param of its own type still takes it, written out or bare: exit 6.
+OWN_TYPE = """\
 fn f(a:& [2]u32, n:& u32) -> i32
     a[1] = 3
     n = 3
@@ -619,7 +595,6 @@ pub fn main() -> i32
     f(@&a, n)
     return (a[1] + n) as i32
 """
-    assert _run_three(compiler, tmp_path, "own_type", program) == 6
 
 
 # A generic struct is the type its instance is: `@b` of a `Box<T>` fits
@@ -638,12 +613,6 @@ fn mk<T>(x: T) -> T
 pub fn main() -> i32
     return mk<i32>(3)
 """
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_generic_struct_fits_a_reference_to_its_instance(tmp_path, compiler):
-    assert _run_three(compiler, tmp_path, "generic_own_type", GENERIC_OWN_TYPE) == 3
 
 
 # An un-annotated global (`var G = 3`), which ritz0's checker couldn't type,
@@ -702,12 +671,6 @@ pub fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_untyped_scalar_local_is_its_initialisers_type(tmp_path, compiler):
-    assert _run_three(compiler, tmp_path, "untyped_scalar", UNTYPED_SCALAR) == 113
-
-
 # An un-annotated copy of a struct is that struct: `@b` fits `@Rect` (prism's
 # damage_region_bounds).
 UNTYPED_COPY = """\
@@ -741,89 +704,6 @@ MESSAGE = {"@": VALUE_INTO_SHARED_REF, "@&": VALUE_INTO_MUT_REF}
 SIGN_BLIND_POINTER = ("fn go(h:& *u32) -> @&*i32\n    return @&h\n\npub fn main() -> i32\n    var n: u32 = 3\n"
                       "    var q: *u32 = @n\n    go(@&q)\n    return *q as i32\n")
 
-# The u8_read_* rows were AGAST #2326's: ritz0 typed `*p` of an `@u8` as the
-# `@u8`, so `*p == 200` compared signed and was false.  #2557 types it as the u8.
-RITZ0_GAPS: dict[str, str] = {}
-
-
-def _params(programs, gaps):
-    return [pytest.param(name, marks=[pytest.mark.xfail(strict=True, reason=gaps[name])]
-                         if name in gaps else [])
-            for name in sorted(programs)]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz1_holds_the_reference_at_its_width(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, PROGRAMS[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", _params(PROGRAMS, RITZ0_GAPS))
-def test_ritz0_is_the_oracle(tmp_path, name):
-    assert _run("ritz0", None, tmp_path, name, PROGRAMS[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(BY_VALUE))
-def test_a_slot_of_the_value_takes_it(ritz1_bin, tmp_path, compiler, name):
-    assert _run(compiler, ritz1_bin, tmp_path, name, BY_VALUE[name]) == 3
-
-
-def _refused(comp, ll, message):
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, out[-2000:]
-    assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: (error: )?" + re.escape(message), out), out[-2000:]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", MISFITS_BARE)
-def test_a_value_into_a_reference_to_something_else_is_refused(ritz1_bin, tmp_path, compiler, name):
-    program, addr = MISFITS[name]
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, program.replace("^", "") + ENTRY)
-    _refused(comp, ll, MESSAGE[addr])
-
-
-def _written_misfit_params():
-    for name in sorted(MISFITS):
-        for compiler in COMPILERS:
-            gap = MISFIT_GAPS.get((name, compiler))
-            marks = [pytest.mark.xfail(strict=True, reason=gap)] if gap else []
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_untyped_copy_of_a_struct_fits_a_reference_to_it(tmp_path, compiler):
-    comp, ll, _ = _compile_three(compiler, tmp_path, "untyped_copy", UNTYPED_COPY)
-    assert comp.returncode == 0 and ll.exists(), (comp.stdout + comp.stderr)[-2000:]
-
-
-@pytest.mark.integration
-# AGAST #2524: ritz1 stored the un-annotated copy as an i64, which clang
-# refused; #2592 types it as the element's struct.
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_untyped_copy_of_a_struct_runs(tmp_path, compiler):
-    assert _run_three(compiler, tmp_path, "untyped_copy", UNTYPED_COPY) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_written_misfit_params()))
-def test_a_written_reference_to_something_else_is_refused(tmp_path, compiler, name):
-    program, addr = MISFITS[name]
-    _assert_refused(compiler, tmp_path, name, program.replace("^", "^" + addr) + ENTRY, REF_TO_OTHER_TYPE)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_a_reference_to_a_pointer_of_the_other_sign_is_refused(ritz1_bin, tmp_path, compiler):
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, "sign_blind", SIGN_BLIND_POINTER)
-    _refused(comp, ll, REF_TO_OTHER_POINTER)
-
-
 METHOD_GO = METHOD_TYPES + """\
 impl S
     fn go(self: @&S, n:& i8) -> @&i8
@@ -852,12 +732,6 @@ METHOD_DEREF = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(METHOD_DEREF))
-def test_ritz1_deref_of_a_method_call_has_its_width(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, METHOD_DEREF[name]) == 3
-
-
 # AGAST #3176: so is `*x.m()` of a `-> *i8` method, as `*f()` of a `-> *i8`
 # fn is (#2540).  Same rows, a raw pointer in and out.
 METHOD_PTR_GO = METHOD_TYPES + """\
@@ -868,14 +742,6 @@ impl S
 pub fn main() -> i32
     var s: S = S { v: 0 }
 """
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(METHOD_DEREF))
-def test_deref_of_a_pointer_method_call_has_its_width(ritz1_bin, tmp_path, compiler, name):
-    program = METHOD_DEREF[name].replace(METHOD_GO, METHOD_PTR_GO).replace("@&a[1]", "@a[1]")
-    assert _run(compiler, ritz1_bin, tmp_path, name, program) == 3
 
 
 POINTER_VALUE_RETURN = {
@@ -893,7 +759,68 @@ pub fn main() -> i32
 }
 
 
+RITZ0_RITZ1 = ("ritz0", "ritz1")
+
+
+def _method_ptr_deref(program: str) -> str:
+    return program.replace(METHOD_GO, METHOD_PTR_GO).replace("@&a[1]", "@a[1]")
+
+
+# (group, {row: program}, exit code, compilers).  A row's name is `group[row]`.
+RUN_TABLES = [
+    # A written reference holds its referent at its width.
+    ("width", PROGRAMS, 3, RITZ0_RITZ1),
+    # A slot of the value takes it.
+    ("by_value", BY_VALUE, 3, RITZ0_RITZ1),
+    ("own_type", {"own_type": OWN_TYPE}, 6, COMPILERS),
+    ("generic_own_type", {"generic_own_type": GENERIC_OWN_TYPE}, 3, COMPILERS),
+    ("untyped_scalar", {"untyped_scalar": UNTYPED_SCALAR}, 113, COMPILERS),
+    # An un-annotated copy of a struct fits a reference to it, and runs (#2524):
+    # the row that only compiled it couldn't fail without this one.
+    ("untyped_copy", {"untyped_copy": UNTYPED_COPY}, 3, COMPILERS),
+    ("method_deref", METHOD_DEREF, 3, ("ritz1",)),
+    ("pointer_method_deref", {k: _method_ptr_deref(v) for k, v in METHOD_DEREF.items()}, 3, RITZ0_RITZ1),
+    ("pointer_value_return", POINTER_VALUE_RETURN, 3, ("ritz1",)),
+]
+
+# (group, {row: program with `^` where the error goes, or none for anywhere}, message, compilers).
+REFUSE_TABLES = [
+    ("lent_param_of_another_type", {k: _lent_misfit(k) for k in LENT_MISFITS}, REF_TO_OTHER_TYPE, COMPILERS),
+    ("bare_place_of_another_sign", {"bare_sign": BARE_SIGN}, Prefix("argument 1 of `w` has the wrong type"),
+     COMPILERS),
+    ("written_reference_to_something_else", {k: p.replace("^", "^" + a) + ENTRY for k, (p, a) in MISFITS.items()},
+     REF_TO_OTHER_TYPE, COMPILERS),
+    ("reference_to_a_pointer_of_the_other_sign", {"sign_blind": SIGN_BLIND_POINTER}, REF_TO_OTHER_POINTER,
+     RITZ0_RITZ1),
+]
+# A value into a reference to something else: the message is the slot's.
+VALUE_INTO_OTHER = [(k, MISFITS[k][0].replace("^", "") + ENTRY, MESSAGE[MISFITS[k][1]]) for k in MISFITS_BARE]
+
+
+def _rows(tables, compiler: str) -> dict:
+    rows = {}
+    for group, table, want, compilers in tables:
+        if compiler in compilers:
+            for name, program in table.items():
+                rows[f"{group}[{name}]"] = (program, want)
+    return rows
+
+
+def _refusal_rows(compiler: str) -> dict:
+    rows = _rows(REFUSE_TABLES, compiler)
+    if compiler in RITZ0_RITZ1:
+        for name, program, message in VALUE_INTO_OTHER:
+            rows[f"value_into_a_reference_to_something_else[{name}]"] = (program, message)
+    return rows
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(POINTER_VALUE_RETURN))
-def test_ritz1_pointer_value_returned_as_a_reference(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, POINTER_VALUE_RETURN[name]) == 3
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_rows_run(ritz1_bin, tmp_path, compiler):
+    assert_runs(compiler, tmp_path, _rows(RUN_TABLES, compiler))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_rows_are_refused(ritz1_bin, tmp_path, compiler):
+    assert_refusals(compiler, tmp_path, _refusal_rows(compiler))

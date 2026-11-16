@@ -401,29 +401,37 @@ Rules:
    went from 605 to 1078 test-seconds (unbatched: 1600), almost all of it
    ritz0's ~120 ms emit for rows that touch a generic.
 
-   **Or make the table one test (AGAST #3518).**  Batching still collects,
-   dispatches and reports every row as a case.  `ritz0/test_row_table.py`'s
+   **Or make the table one test (AGAST #3518, #3520).**  Batching still
+   collects, dispatches and reports every row as a case.  A table test
+   doesn't: `ritz0/test_row_table.py`'s
    `assert_runs(compiler, tmp_path, {name: (program, exit)}, gaps)` and
    `assert_refusals(compiler, tmp_path, {name: (marked, message)}, gaps)`
-   assert a whole table in one test per compiler: batched compiles, each
-   row run in its own process, and a row the batch gets wrong compiled
-   again on its own.  The failure names every failing row (`row: wanted
-   exit 5, got exit 4`), and a `gaps` row (a strict xfail) that passes
-   fails the table.  `test_member_through_levels.py` and
-   `test_receiver_through_levels.py` went from 1,749 cases to 18.
+   assert a whole table in one test per compiler.  Rows are compiled
+   `batching.CHUNK` at a time as one program (`run_rows` / `refuse_rows`),
+   each run row in its own process, and a row the batch doesn't answer, or
+   answers wrongly, is compiled again on its own, so a failure is still the
+   row's own.  A refusal's `^` is where its message must be reported, the
+   whole message unless it's a `Prefix`; a program without a `^` must report
+   it, as a prefix, somewhere in its own lines.  The failure names every
+   failing row (`row: wanted exit 5, got exit 4`), the first 20 with their
+   detail, and a `gaps` row (a strict xfail) that passes fails the table.
+   `test_member_through_levels.py` and `test_receiver_through_levels.py`
+   went from 1,749 cases to 18; `test_ritz1_lent_ref_slot.py` and
+   `test_ritz1_ref_to_pointer_let.py` from 1,776 to 9.
 
    For rows that need more than that (their own build, such as a String
-   slice linking ritzlib/string; refusals checked in a batch, or ones with
-   no `^`; a row for only some compilers), `ritz0/test_table_rows.py`
-   (AGAST #3519) has each old test function become a `@case` that returns
-   `Run(program, want)` or `Refused(program, message, at=, located=)`.
+   slice linking ritzlib/string; a row for only some compilers),
+   `ritz0/test_table_rows.py` (AGAST #3519) has each old test function
+   become a `@case` that returns `Run(program, want)` or
+   `Refused(program, message, at=, located=)`.
    `test_every_row[<compiler>-<chunk>]` checks 64 rows at a time through
    `batching.run_rows` / `refuse_rows`, and each failing row keeps its old
    id (`ritz1 a_read_runs_right[Span-at_next-pointer]: want exit 20, got
    30`).  `test_index_through_reference.py` and
    `test_slice_through_reference.py` went from 2,070 tests to 37, but only
    from 102 to 93 CPU-s: most of what's left is the per-row compile that
-   #2867's leaning check makes for a row that reaches a generic.
+   #2867's leaning check makes for a row that reaches a generic.  Folding
+   the two helpers into one is AGAST #3566.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

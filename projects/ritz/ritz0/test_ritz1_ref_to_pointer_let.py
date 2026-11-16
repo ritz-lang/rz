@@ -14,11 +14,16 @@ test_ritz1_array_ptr_element.py; this is the plain-local form.
 The exit code is the low byte, so `return **r as i32` can't see a wide load.
 Every check compares the whole value, and every store checks its neighbour.
 Expected values come from the program; ritz0 agrees on every row.
+
+Every row exits 0.  The rows are one table, not a parametrised matrix (AGAST
+#3520): one test per compiler runs them all in batched compiles
+(test_row_table.py), and a failure names each row that missed and what it got.
 """
 
 import pytest
 
-from test_ritz1_array_ptr_element import COMPILERS, SCALARS, run_with  # noqa: F401  (fixture)
+from test_ritz1_array_ptr_element import COMPILERS, SCALARS
+from test_row_table import assert_runs
 
 # 1-3 load, 4-5 store, 6-7 compound, 8 the value a `let` copies out.  `{amp}` is
 # `@` or `@&`, `x` the three scalars, and q points at x[0].
@@ -67,16 +72,6 @@ def _program(source: str, amp: str, ty: str) -> str:
     return SOURCES[source].format(amp=amp, t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-@pytest.mark.parametrize("amp", ["@", "@&"], ids=["shared", "mut"])
-@pytest.mark.parametrize("source", sorted(SOURCES))
-def test_reference_to_a_scalar_pointer(run_with, source, amp, ty, compiler):
-    name = f"{source}_{'mut' if amp == '@&' else 'shared'}_{ty}"
-    assert run_with(compiler, name, _program(source, amp, ty)) == 0
-
-
 _X = "pub fn main() -> i32\n    var x: [3]i16\n    x[0] = 1\n    x[1] = 2\n    x[2] = 3\n"
 
 
@@ -110,13 +105,6 @@ SHAPES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(SHAPES))
-def test_reference_to_pointer_shape(run_with, name, compiler):
-    assert run_with(compiler, name, SHAPES[name]) == 0
-
-
 # AGAST #2537: `(*r)[i]` with `r: **T` loaded one byte on ritz1 whatever T was
 # (`getelementptr i8` + `load i8`), annotated or inferred: wrong values on an
 # integer, invalid IR on a float.  `*(*r + k)` already had T's stride.  Every
@@ -130,24 +118,6 @@ def _indexed(source: str, amp: str, ty: str, annotate: bool) -> str:
     if annotate:
         text = text.replace(f"let r = {amp}q", f"let r: **{ty} = {amp}q")
     return text
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-@pytest.mark.parametrize("amp", ["@", "@&"], ids=["shared", "mut"])
-@pytest.mark.parametrize("source", sorted(SOURCES))
-def test_index_through_deref(run_with, source, amp, ty, compiler):
-    name = f"index_{source}_{'mut' if amp == '@&' else 'shared'}_{ty}"
-    assert run_with(compiler, name, _indexed(source, amp, ty, False)) == 0
-
-
-# The written-out `let r: **T` took the same byte path.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-def test_index_through_deref_annotated(run_with, ty, compiler):
-    assert run_with(compiler, f"index_ann_{ty}", _indexed("local", "@", ty, True)) == 0
 
 
 # A `r: **T` parameter, not a `let`: the base is `*r` all the same.
@@ -174,21 +144,6 @@ pub fn main() -> i32
     return g(@q)
 """
 )
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-def test_index_through_deref_param(run_with, ty, compiler):
-    v0, v1, v2, _ = SCALARS[ty]
-    assert (
-        run_with(
-            compiler,
-            f"index_pp_param_{ty}",
-            _PARAM_PP.format(t=ty, v0=v0, v1=v1, v2=v2),
-        )
-        == 0
-    )
 
 
 # AGAST #2545: the store side, `(*r)[i] = v` with `r: **T`.  ritz1 stored
@@ -233,23 +188,6 @@ def _stored(source: str, amp: str, ty: str, annotate: bool) -> str:
     return text
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-@pytest.mark.parametrize("amp", ["@", "@&"], ids=["shared", "mut"])
-@pytest.mark.parametrize("source", sorted(SOURCES))
-def test_store_through_deref_index(run_with, source, amp, ty, compiler):
-    name = f"store_{source}_{'mut' if amp == '@&' else 'shared'}_{ty}"
-    assert run_with(compiler, name, _stored(source, amp, ty, False)) == 0
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-def test_store_through_deref_index_annotated(run_with, ty, compiler):
-    assert run_with(compiler, f"store_ann_{ty}", _stored("local", "@", ty, True)) == 0
-
-
 # A `r: **T` parameter stores through `*r` all the same.
 _PARAM_PP_STORE = (
     """\
@@ -275,15 +213,6 @@ pub fn main() -> i32
     return 0
 """
 )
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-def test_store_through_deref_index_param(run_with, ty, compiler):
-    v0, v1, v2, v3 = SCALARS[ty]
-    program = _PARAM_PP_STORE.format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
-    assert run_with(compiler, f"store_pp_param_{ty}", program) == 0
 
 
 # AGAST #2539: `let r = @q` with `q: *[N]T` or `q: *Enum` stayed an i64 after
@@ -331,27 +260,6 @@ ARRAY_BODIES = {
 ARRAY_TYPES = ["i8", "u8", "i16", "i32", "i64", "f64"]
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", ARRAY_TYPES)
-@pytest.mark.parametrize("ann", ["inferred", "annotated"])
-@pytest.mark.parametrize("body", sorted(ARRAY_BODIES))
-def test_reference_to_an_array_pointer(run_with, body, ann, ty, compiler):
-    # `(*r)[i]` read and stored the wrong bytes on ritz1 until #2553.
-    v0, v1, v2, v3 = SCALARS[ty]
-    amp = "@&" if body == "replace_through" else "@"
-    program = _ARRAY.format(
-        t=ty,
-        v0=v0,
-        v1=v1,
-        v2=v2,
-        amp=amp,
-        ann="" if ann == "inferred" else f": **[3]{ty}",
-        body=ARRAY_BODIES[body].format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3),
-    )
-    assert run_with(compiler, f"arr_{body}_{ann}_{ty}", program) == 0
-
-
 # AGAST #2553: the same through a `**[3]T` param.
 _ARRAY_PARAM = """\
 fn f(r: **[3]{t}, x: *[3]{t}) -> i32
@@ -364,16 +272,6 @@ pub fn main() -> i32
     var q: *[3]{t} = @x
     return f(@q, @x)
 """
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", ARRAY_TYPES)
-def test_index_through_an_array_pointer_pointer_param(run_with, ty, compiler):
-    v0, v1, v2, v3 = SCALARS[ty]
-    body = ARRAY_BODIES["index_through"].format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
-    program = _ARRAY_PARAM.format(t=ty, v0=v0, v1=v1, v2=v2, body=body)
-    assert run_with(compiler, f"arr_param_index_through_{ty}", program) == 0
 
 
 _ENUM = """\
@@ -403,17 +301,6 @@ ENUM_BODIES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ann", ["inferred", "annotated"])
-@pytest.mark.parametrize("body", sorted(ENUM_BODIES))
-def test_reference_to_an_enum_pointer(run_with, body, ann, compiler):
-    program = _ENUM.format(
-        ann="" if ann == "inferred" else ": **Color", body=ENUM_BODIES[body]
-    )
-    assert run_with(compiler, f"enum_{body}_{ann}", program) == 0
-
-
 _COLOR = "enum Color\n    Red\n    Green\n    Blue\n\n"
 _S3 = "struct S\n    a: i32\n    b: i32\n\npub fn main() -> i32\n    var x: [3]S\n    x[1].b = 5\n"
 
@@ -432,13 +319,6 @@ AGGREGATE_SHAPES = {
     + "    var q: *[3]S = @x\n    let r = @&q\n    var y: [3]S\n    y[1].b = 7\n    *r = @y\n"
     + _is("q[1].b", "7"),
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(AGGREGATE_SHAPES))
-def test_reference_to_an_aggregate_pointer_shape(run_with, name, compiler):
-    assert run_with(compiler, name, AGGREGATE_SHAPES[name]) == 0
 
 
 # AGAST #2542: `let v = <deref>` with no annotation is the pointee's type, the
@@ -507,11 +387,55 @@ DEREF_LETS = {
 }
 
 
+AMPS = {"shared": "@", "mut": "@&"}
+
+
+def _rows() -> dict:
+    """{row: program}, every row on every compiler."""
+    rows = {}
+
+    def add(name, program):
+        assert name not in rows, name
+        rows[name] = program
+
+    for source in sorted(SOURCES):
+        for form, amp in AMPS.items():
+            for ty in sorted(SCALARS):
+                add(f"{source}_{form}_{ty}", _program(source, amp, ty))
+                add(f"index_{source}_{form}_{ty}", _indexed(source, amp, ty, False))
+                add(f"store_{source}_{form}_{ty}", _stored(source, amp, ty, False))
+    for name, program in SHAPES.items():
+        add(name, program)
+    for ty in sorted(SCALARS):
+        v0, v1, v2, v3 = SCALARS[ty]
+        # The written-out `let r: **T` took the same byte path.
+        add(f"index_ann_{ty}", _indexed("local", "@", ty, True))
+        add(f"index_pp_param_{ty}", _PARAM_PP.format(t=ty, v0=v0, v1=v1, v2=v2))
+        add(f"store_ann_{ty}", _stored("local", "@", ty, True))
+        add(f"store_pp_param_{ty}", _PARAM_PP_STORE.format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3))
+    for ty in ARRAY_TYPES:
+        v0, v1, v2, v3 = SCALARS[ty]
+        # `(*r)[i]` read and stored the wrong bytes on ritz1 until #2553.
+        for body in sorted(ARRAY_BODIES):
+            text = ARRAY_BODIES[body].format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
+            for ann in ("inferred", "annotated"):
+                add(f"arr_{body}_{ann}_{ty}", _ARRAY.format(
+                    t=ty, v0=v0, v1=v1, v2=v2, amp="@&" if body == "replace_through" else "@",
+                    ann="" if ann == "inferred" else f": **[3]{ty}", body=text))
+        body = ARRAY_BODIES["index_through"].format(t=ty, v0=v0, v1=v1, v2=v2, v3=v3)
+        add(f"arr_param_index_through_{ty}", _ARRAY_PARAM.format(t=ty, v0=v0, v1=v1, v2=v2, body=body))
+    for ann in ("inferred", "annotated"):
+        for body in sorted(ENUM_BODIES):
+            add(f"enum_{body}_{ann}", _ENUM.format(ann="" if ann == "inferred" else ": **Color",
+                                                   body=ENUM_BODIES[body]))
+        for name, (ty, program) in sorted(DEREF_LETS.items()):
+            add(f"deref_let_{name}_{ann}", program.format(ann="" if ann == "inferred" else f": {ty}"))
+    for name, program in AGGREGATE_SHAPES.items():
+        add(name, program)
+    return rows
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ann", ["inferred", "annotated"])
-@pytest.mark.parametrize("name", sorted(DEREF_LETS))
-def test_let_of_a_deref_is_the_pointee(run_with, name, ann, compiler):
-    ty, program = DEREF_LETS[name]
-    program = program.format(ann="" if ann == "inferred" else f": {ty}")
-    assert run_with(compiler, f"deref_let_{name}_{ann}", program) == 0
+def test_rows_exit_zero(ritz1_bin, tmp_path, compiler):
+    assert_runs(compiler, tmp_path, {name: (program, 0) for name, program in _rows().items()})
