@@ -6,8 +6,30 @@
 # Usage:
 #   ./test.sh         # Headless mode (for CI/automated testing)
 #   ./test.sh --gui   # With display window (to see framebuffer graphics)
+#
+# The ESP is a QEMU vvfat directory (as tools/test_tier1_boot.sh does), so no
+# mkfs.vfat (dosfstools: /usr/sbin, off a non-login shell's PATH) and no
+# mtools are needed (AGAST #2200).
+#
+# Knobs:
+#   UEFI_MIN_MILESTONE=N  lowest milestone that passes (default 12: init's
+#                         Tier-1 suite reports ALL TESTS PASSED; numbering in
+#                         uefi_verdict.sh)
+#   BOOT_TIMEOUT=N        seconds QEMU may run (default 60 headless, 120 GUI).
+#                         Only the boot counts: every build finishes before
+#                         the clock starts, and a headless run stops QEMU as
+#                         soon as a verdict line (ALL TESTS PASSED, TESTS
+#                         FAILED, a panic or exception) appears.
+#   SKIP_BUILD=1          use the existing build outputs; build nothing
+#   OVMF_CODE=F           OVMF firmware to use (default: search the usual paths)
+#
+# Exit: 0 = pass; 1 = the boot failed or stopped below UEFI_MIN_MILESTONE;
+#       3 = a required tool is missing: a SETUP ERROR, as test_tier1_boot.sh.
 
 set -e
+
+EXIT_SETUP=3
+setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
 
 # Parse arguments
 GUI_MODE=false
@@ -27,15 +49,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$SCRIPT_DIR"
 
+command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found (qemu-system-x86)"
+command -v qemu-img >/dev/null || setup_error "qemu-img not found (qemu-utils)"
+
 # Build if needed using workspace rz CLI
 # Use debug/ path directly - always copy fresh build to avoid stale cache
 BOOT_EFI="$HARLAND_DIR/build/BOOTX64.EFI"
 KERNEL_ELF="$HARLAND_DIR/build/harland.elf"
 DEBUG_EFI="$HARLAND_DIR/build/debug/BOOTX64.EFI"
 DEBUG_ELF="$HARLAND_DIR/build/debug/harland.elf"
-RZ_CLI="$HARLAND_DIR/../../rz"
 
-if [ ! -f "$DEBUG_ELF" ]; then
+if [ ! -f "$DEBUG_ELF" ] && [ "${SKIP_BUILD:-}" != 1 ]; then
     echo "Building harland..."
     cd "$HARLAND_DIR/../.."
     ./rz build harland
@@ -57,22 +81,21 @@ if [ ! -f "$KERNEL_ELF" ]; then
 fi
 
 # Find OVMF
-OVMF_CODE=""
-for path in \
-    /usr/share/OVMF/OVMF_CODE_4M.fd \
-    /usr/share/OVMF/OVMF_CODE.fd \
-    /usr/share/edk2/x64/OVMF_CODE.4m.fd \
-    /usr/share/edk2-ovmf/x64/OVMF_CODE.4m.fd
-do
-    if [ -f "$path" ]; then
-        OVMF_CODE="$path"
-        break
-    fi
-done
-
-if [ -z "$OVMF_CODE" ]; then
-    echo "ERROR: OVMF not found. Install ovmf package."
-    exit 1
+if [ -n "${OVMF_CODE:-}" ]; then
+    [ -f "$OVMF_CODE" ] || setup_error "OVMF firmware not found: $OVMF_CODE"
+else
+    for path in \
+        /usr/share/OVMF/OVMF_CODE_4M.fd \
+        /usr/share/OVMF/OVMF_CODE.fd \
+        /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        /usr/share/edk2-ovmf/x64/OVMF_CODE.4m.fd
+    do
+        if [ -f "$path" ]; then
+            OVMF_CODE="$path"
+            break
+        fi
+    done
+    [ -n "$OVMF_CODE" ] || setup_error "OVMF not found. Install the ovmf package."
 fi
 
 echo "=== Testing UEFI Boot (Full System) ==="
@@ -81,34 +104,22 @@ echo "  EFI:    $BOOT_EFI"
 echo "  Kernel: $KERNEL_ELF"
 echo ""
 
-# Create a temporary FAT filesystem with the EFI file and kernel
-TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
+# The ESP: a directory QEMU presents as a FAT disk (vvfat, `fat:rw:DIR`)
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+ESP="$WORK/esp"
+mkdir -p "$ESP/EFI/BOOT" "$ESP/harland"
+cp "$BOOT_EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
+cp "$KERNEL_ELF" "$ESP/harland/kernel.elf"
 
-# Create EFI directory structure
-mkdir -p "$TMPDIR/EFI/BOOT"
-mkdir -p "$TMPDIR/harland"
-cp "$BOOT_EFI" "$TMPDIR/EFI/BOOT/BOOTX64.EFI"
-cp "$KERNEL_ELF" "$TMPDIR/harland/kernel.elf"
-
-# Create startup.nsh to auto-run our EFI app
-cat > "$TMPDIR/startup.nsh" << 'EOF'
+# startup.nsh auto-runs our EFI app
+cat > "$ESP/startup.nsh" << 'NSH'
 @echo -off
 FS0:\EFI\BOOT\BOOTX64.EFI
-EOF
-
-# Create a FAT disk image (larger to fit kernel)
-truncate -s 64M "$TMPDIR/disk.img"
-mkfs.vfat "$TMPDIR/disk.img" >/dev/null
-mmd -i "$TMPDIR/disk.img" ::/EFI
-mmd -i "$TMPDIR/disk.img" ::/EFI/BOOT
-mmd -i "$TMPDIR/disk.img" ::/harland
-mcopy -i "$TMPDIR/disk.img" "$BOOT_EFI" ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i "$TMPDIR/disk.img" "$KERNEL_ELF" ::/harland/kernel.elf
-mcopy -i "$TMPDIR/disk.img" "$TMPDIR/startup.nsh" ::/startup.nsh
+NSH
 
 # Serial output file
-SERIAL_LOG="$TMPDIR/serial.log"
+SERIAL_LOG="$WORK/serial.log"
 
 # Create VirtIO test disks
 # Tests use separate disk images that get reformatted each run
@@ -125,28 +136,30 @@ echo "Creating test storage disk (512MB)..."
 rm -f "$STORAGE"
 qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
 
-# Build the Ritz runtime (required for harland userspace binaries)
-echo "Building ritz runtime..."
-make -C "$HARLAND_DIR/../ritz/runtime" >/dev/null 2>&1 || {
-    echo "  Building runtime..."
-    make -C "$HARLAND_DIR/../ritz/runtime"
-}
+if [ "${SKIP_BUILD:-}" != 1 ]; then
+    # Build the Ritz runtime (required for harland userspace binaries)
+    echo "Building ritz runtime..."
+    make -C "$HARLAND_DIR/../ritz/runtime" >/dev/null 2>&1 || {
+        echo "  Building runtime..."
+        make -C "$HARLAND_DIR/../ritz/runtime"
+    }
 
-# Build indium userspace (init, hello, true, false, etc.)
-echo "Building indium userspace..."
-cd "$HARLAND_DIR/../.."
-./rz build indium 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
-cd "$SCRIPT_DIR"
+    # Build indium userspace (init, hello, true, false, etc.)
+    echo "Building indium userspace..."
+    cd "$HARLAND_DIR/../.."
+    ./rz build indium 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
+    cd "$SCRIPT_DIR"
 
-# Build prism (includes prism_demo)
-echo "Building prism..."
-cd "$HARLAND_DIR/../.."
-./rz build prism 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
+    # Build prism (includes prism_demo)
+    echo "Building prism..."
+    cd "$HARLAND_DIR/../.."
+    ./rz build prism 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
 
-# Build rzsh (Ritz shell)
-echo "Building rzsh..."
-./rz build rzsh 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
-cd "$SCRIPT_DIR"
+    # Build rzsh (Ritz shell)
+    echo "Building rzsh..."
+    ./rz build rzsh 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
+    cd "$SCRIPT_DIR"
+fi
 
 # Always rebuild initramfs with all binaries
 echo "Creating initramfs TAR archive..."
@@ -245,22 +258,27 @@ rm -f "$TAR_FILE" "$RAW_INITRAMFS"
 echo "Starting QEMU..."
 echo ""
 
-# Set display mode based on --gui flag
+# Set display mode based on --gui flag. BOOT_TIMEOUT covers QEMU only: every
+# build above has finished before the clock starts (#2200).
 if [ "$GUI_MODE" = true ]; then
     DISPLAY_OPT="-display gtk"
-    TIMEOUT_SECS=120  # Longer timeout for interactive use
+    TIMEOUT_SECS=${BOOT_TIMEOUT:-120}  # Longer timeout for interactive use
     echo "  Display: GUI mode (gtk)"
 else
     DISPLAY_OPT="-display none"
-    TIMEOUT_SECS=30
+    TIMEOUT_SECS=${BOOT_TIMEOUT:-60}
     echo "  Display: headless"
 fi
 
-# Interactive mode disables timeout
+# Interactive mode disables timeout. init_interactive runs no Tier-1 suite,
+# so any milestone from the kernel up counts unless one is asked for.
 if [ "$INTERACTIVE" = true ]; then
     TIMEOUT_SECS=0
+    UEFI_MIN_MILESTONE=${UEFI_MIN_MILESTONE:-1}
     echo "  Mode: interactive (no timeout, Ctrl+C to quit)"
 fi
+UEFI_MIN_MILESTONE=${UEFI_MIN_MILESTONE:-12}
+echo "  Boot timeout: ${TIMEOUT_SECS}s; required milestone: $UEFI_MIN_MILESTONE"
 
 # Run QEMU with UEFI (longer timeout for full boot)
 # NOTE: Using 256M because UEFI bootloader only identity maps first 256MB.
@@ -272,7 +290,7 @@ fi
 QEMU_CMD="qemu-system-x86_64 \
     -cpu Haswell \
     -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
-    -drive format=raw,file=$TMPDIR/disk.img \
+    -drive format=raw,file=fat:rw:$ESP \
     -device virtio-blk-pci,drive=initramfs \
     -drive file=$INITRAMFS,format=qcow2,if=none,id=initramfs \
     -device virtio-blk-pci,drive=storage \
@@ -287,7 +305,21 @@ QEMU_CMD="qemu-system-x86_64 \
     -m 256M \
     -no-reboot"
 
-if [ "$TIMEOUT_SECS" -gt 0 ]; then
+if [ "$TIMEOUT_SECS" -gt 0 ] && [ "$GUI_MODE" != true ]; then
+    # init halts after its suite: stop QEMU once a verdict line appears
+    # instead of idling out the rest of the timeout.
+    timeout "$TIMEOUT_SECS" $QEMU_CMD 2>&1 &
+    QEMU_PID=$!
+    while kill -0 "$QEMU_PID" 2>/dev/null; do
+        if grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC|!!! EXCEPTION !!!" "$SERIAL_LOG" 2>/dev/null; then
+            sleep 1
+            kill "$QEMU_PID" 2>/dev/null || true
+            break
+        fi
+        sleep 1
+    done
+    wait "$QEMU_PID" 2>/dev/null || true
+elif [ "$TIMEOUT_SECS" -gt 0 ]; then
     timeout $TIMEOUT_SECS $QEMU_CMD 2>&1 || true
 else
     $QEMU_CMD 2>&1 || true
@@ -298,5 +330,5 @@ cat "$SERIAL_LOG"
 echo ""
 
 # Classify the boot: boot/uefi_verdict.sh fails on a panic or exception
-# before looking for milestones.
-"$SCRIPT_DIR/uefi_verdict.sh" "$SERIAL_LOG"
+# before looking for milestones, and on any milestone below the required one.
+"$SCRIPT_DIR/uefi_verdict.sh" "$SERIAL_LOG" "$UEFI_MIN_MILESTONE"

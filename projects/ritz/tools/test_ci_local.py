@@ -521,8 +521,9 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     gate (#2456), which exit 0 or 1 and never 3 -- test_ci_e2e.py holds them
     to that. The harland boot (#1845) exits 3 too, and only for the same
     reason: a missing tool (QEMU, OVMF, GRUB-EFI, or rz build's own exit 3)
-    -- test_ci_harland_boot.py holds it to that. A new step here must make
-    the same promise."""
+    -- test_ci_harland_boot.py holds it to that. So does test-uefi-boot's
+    boot/test.sh (#2200; test_harland_uefi_boot_script.py). A new step here
+    must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
     assert [s.run.strip().splitlines()[-1] for s in steps] == [
         "./rz build --all",
@@ -531,6 +532,7 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "python3 projects/ritz/tools/smoke_stack",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_tier1_boot.sh",
+        "bash projects/harland/boot/test.sh",
     ]
 
 
