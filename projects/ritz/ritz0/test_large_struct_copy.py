@@ -34,7 +34,9 @@ ABI change for both compilers, tracked as AGAST #1739.
 Every clang -O2 run is bounded (see test_ritz1_large_struct_ret._clang_bounded).
 """
 
+import os
 import re
+import subprocess
 
 import pytest
 
@@ -45,6 +47,9 @@ from test_ritz1_large_struct_ret import (
     _ritz0_ll,
     _ritz1_ll,
 )
+from test_ritz1_builtin_struct_shadow import RITZ_ROOT
+
+SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
 
 COMPILERS = ("ritz0", "ritz1")
 
@@ -55,7 +60,24 @@ COPY_CALL = re.compile(r'call void @"?__ritz_sret_copy"?\(')
 def _ll(compiler: str, tmp_path, name: str, program: str):
     if compiler == "ritz0":
         return _ritz0_ll(tmp_path, name, program)
-    return _ritz1_ll(tmp_path, name, program)
+    if compiler == "ritz1":
+        return _ritz1_ll(tmp_path, name, program)
+    # ritz1_selfhosted: the gate builds it before pytest.
+    src = tmp_path / f"{name}.ritz"
+    src.write_text(program)
+    ll = tmp_path / f"{name}_{compiler}.ll"
+    comp = subprocess.run(
+        [str(SELFHOSTED_BIN), str(src), "-o", str(ll)],
+        cwd=tmp_path,
+        env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert comp.returncode == 0 and ll.exists(), (
+        f"{compiler} failed to compile {name}:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
+    )
+    return ll
 
 
 # --- the 22 KB shape, with no large-struct constructor in the module --------
@@ -116,11 +138,9 @@ pub fn use1(p: *Big) -> i32
     var y: Big = *p
     return sink(@y)
 """,
-    # Annotated: ritz1 cannot yet infer `let y = *p` for a struct pointer
-    # (a separate inference gap, AGAST #1740).
     "let_deref": """
 pub fn use1(p: *Big) -> i32
-    let y: Big = *p
+    let y = *p
     return y.count
 """,
     "store_deref": """
@@ -315,10 +335,12 @@ def test_small_struct_copy_is_unchanged(ritz1_bin, tmp_path, compiler):
 # --- the rewrite never reads the source after a write -----------------------
 #
 # Each program writes the copy's source from a call evaluated as part of the
-# store's DESTINATION.  Whether that call runs before or after the source is
-# read is the compiler's evaluation order; the rewrite must not change it.
-# Oracle: the same program with 1 row (184 bytes, below the threshold, so no
-# rewrite) must exit with the same code as with 4 rows (692 bytes).
+# store's DESTINATION.  §13.6 (LARB R61) runs that call before the source is
+# read, so every program exits 77 (AGAST #1740: ritz0 read the source first
+# for `*f() = *p` and `f().big = *p`, and ritz1 for `*f() = *p`).  The rewrite
+# must not change it: the same program with 1 row (184 bytes, below the
+# threshold, so no rewrite) must exit with the same code as with 4 rows
+# (692 bytes).
 
 ORDER_DECLS = """\
 struct Row
@@ -340,13 +362,20 @@ fn bump_ptr(p: *Big, d: *Big) -> *Big
     p.count = 77
     return d
 
+struct Outer
+    tag: i32
+    big: Big
+
+fn bump_o(p: *Big, o: *Outer) -> *Outer
+    p.count = 77
+    return o
+
 fn fresh(c: i32) -> Big
     return Big {{ rows: [Row {{ id: 0, name: [0; 32], pat: [0; 128], a: 0, b: 0 }}; {n}], count: c }}
 """
 
 ORDER_CASES = {
-    # load *p, then bump_idx in the index, then store (ritz0 order), or the
-    # call first (ritz1 order).
+    # bump_idx in the index, then load *p, then store.
     "index_call": """
 pub fn main() -> i32
     var src: Big = fresh(5)
@@ -355,9 +384,7 @@ pub fn main() -> i32
     arr[bump_idx(p)] = *p
     return arr[1].count
 """,
-    # ritz0 emits load *p; call bump_ptr; store — the guard case.  ritz1
-    # cannot compile a deref-of-call lvalue of struct type yet (#1740: it stores
-    # `i64`), so this one is ritz0 only.
+    # call bump_ptr; load *p; store.
     "deref_call_lvalue": """
 pub fn main() -> i32
     var src: Big = fresh(5)
@@ -366,12 +393,21 @@ pub fn main() -> i32
     *bump_ptr(p, @d) = *p
     return d.count
 """,
+    # call bump_o; load *p; store into its `.big` (ritz0 read *p first: 5).
+    "member_call_lvalue": """
+pub fn main() -> i32
+    var src: Big = fresh(5)
+    let p: *Big = @src
+    var o: Outer = Outer { tag: 0, big: fresh(1) }
+    bump_o(p, @o).big = *p
+    return o.big.count
+""",
 }
 
 ORDER_PARAMS = [
-    ("ritz0", "index_call"),
-    ("ritz1", "index_call"),
-    ("ritz0", "deref_call_lvalue"),
+    (compiler, name)
+    for name in ORDER_CASES
+    for compiler in ("ritz0", "ritz1", "ritz1_selfhosted")
 ]
 
 
@@ -387,8 +423,8 @@ def test_large_copy_keeps_evaluation_order(ritz1_bin, tmp_path, compiler, name):
             ORDER_DECLS.format(n=n) + ORDER_CASES[name],
         )
         exe = tmp_path / f"{name}_{n}_{compiler}"
-        codes[n] = _link_run([_o2_object(ll)], exe, with_start=(compiler == "ritz1"))
-    assert codes[1] in (5, 77), codes
+        codes[n] = _link_run([_o2_object(ll)], exe, with_start=(compiler != "ritz0"))
+    assert codes[1] == 77, f"{name} read the source before the place's call: {codes}"
     assert codes[4] == codes[1], (
         f"the large copy changed the result: {codes[4]} with the rewrite, "
         f"{codes[1]} without"
@@ -397,8 +433,8 @@ def test_large_copy_keeps_evaluation_order(ritz1_bin, tmp_path, compiler, name):
 
 # --- ritz1's scanner, driven with hand-written IR ----------------------------
 #
-# ritz1 evaluates an assignment's destination before its source today, so no
-# Ritz program puts a write between the load and the store, and the
+# Both compilers evaluate an assignment's destination before its source
+# (§13.6), so no Ritz program puts a write between the load and the store, and the
 # evaluation-order test above cannot reach ritz1's "nothing writes memory in
 # between" check.  These cases call ritz1/src/ll_copy_scan.ritz directly.
 # (expected, IR body whose LAST line is the store under test)

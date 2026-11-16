@@ -6658,9 +6658,11 @@ class LLVMEmitter:
                 self._reject_enum_assign(stmt.target, v, getattr(stmt, 'span', None))
                 return v
 
-            # LARB R61 (§13.6): `a[i] = v` evaluates `a`, then `i`, then `v`.
-            # The index arm below emits v once its place is addressed.
-            val = None if isinstance(stmt.target, rast.Index) else emit_val()
+            # LARB R61 (§13.6): the place, then `v`.  `a[i] = v` evaluates
+            # `a`, then `i`, then `v`; `f().x = v` and `*f() = v` call `f`
+            # first (AGAST #1740).  A name has nothing to evaluate; every
+            # other arm below emits v once its place is addressed.
+            val = emit_val() if isinstance(stmt.target, rast.Ident) else None
             if isinstance(stmt.target, rast.Ident):
                 name = stmt.target.name
                 # A `let` (#2025 slot or SSA value) was rejected by
@@ -6797,11 +6799,10 @@ class LLVMEmitter:
                 if slot is not None and isinstance(slot.type.pointee, ir.ArrayType):
                     raise EmitError(array_rules.BORROW_DEREF_STORE, stmt.target.span)
                 ptr = slot if slot is not None else self._emit_expr(stmt.target.operand)
-                if isinstance(ptr.type, ir.PointerType):
-                    val = self._convert_type(val, ptr.type.pointee, stmt.value)
-                    self.builder.store(val, ptr)
-                else:
+                if not isinstance(ptr.type, ir.PointerType):
                     raise EmitError(array_rules.NOT_A_POINTER, stmt.target.span)  # AGAST #2885
+                val = self._convert_type(emit_val(), ptr.type.pointee, stmt.value)
+                self.builder.store(val, ptr)
             elif isinstance(stmt.target, rast.Field):
                 # Assignment to struct field: obj.field = val
                 # First, try to get the value of the expression
@@ -6825,48 +6826,40 @@ class LLVMEmitter:
                     # through the call's pointer.  Reading `sp(@s).inner` as a
                     # value, then addressing it, ran the call twice.
                     struct_val = self._emit_lvalue_addr(stmt.target.expr)
+                if struct_val is None and self._names_struct_value(stmt.target.expr):
+                    # `ps[idx(0)].inn.v = v`: address the struct.  Reading it
+                    # as a value, then addressing it, ran idx() twice.
+                    struct_val = self._emit_lvalue_addr(stmt.target.expr)
                 if struct_val is None:
                     struct_val = self._emit_expr(stmt.target.expr)
 
                 if isinstance(struct_val.type, ir.PointerType):
                     # Expression evaluates to a pointer: through every level
                     # of it to the struct (§5.4, #2398).
-                    struct_val = self._through_pointers(struct_val)
-                    pointee_type = struct_val.type.pointee
-                    if self._assign_tuple_element(stmt, struct_val, val):
-                        pass
-                    elif isinstance(pointee_type, ir.BaseStructType):
-                        struct_name = self._get_struct_name_from_type(pointee_type)
-                        if struct_name:
-                            idx = self._get_struct_field_index(struct_name, stmt.target.field)
-                            _, field_type = self.struct_fields[struct_name][idx]
-                            field_llvm_type = self._ritz_type_to_llvm(field_type)
-                            field_ptr = self.builder.gep(struct_val, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                            val = self._convert_type(val, field_llvm_type, stmt.value)
-                            self._drop_old_field(stmt.target, field_ptr, field_type)
-                            self.builder.store(val, field_ptr)
-                        else:
-                            raise ValueError(f"Cannot determine struct type for field assignment")
-                    else:
-                        raise ValueError(f"Cannot assign field on non-struct pointer: {pointee_type}")
+                    struct_ptr = self._through_pointers(struct_val)
                 elif isinstance(struct_val.type, ir.BaseStructType):
                     # Value-type struct - need to get address from lvalue
                     struct_ptr = self._emit_lvalue_addr(stmt.target.expr)
-                    struct_name = self._get_struct_name_from_type(struct_val.type)
-                    if self._assign_tuple_element(stmt, struct_ptr, val):
-                        pass
-                    elif struct_name:
-                        idx = self._get_struct_field_index(struct_name, stmt.target.field)
-                        _, field_type = self.struct_fields[struct_name][idx]
-                        field_llvm_type = self._ritz_type_to_llvm(field_type)
-                        field_ptr = self.builder.gep(struct_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                        val = self._convert_type(val, field_llvm_type)
-                        self._drop_old_field(stmt.target, field_ptr, field_type)
-                        self.builder.store(val, field_ptr)
-                    else:
-                        raise ValueError(f"Cannot determine struct type for field assignment")
                 else:
                     raise ValueError(f"Invalid type for field assignment: {struct_val.type}")
+                # The place is addressed: now `v` (LARB R61, AGAST #1740).
+                val = emit_val()
+                pointee_type = struct_ptr.type.pointee
+                if self._assign_tuple_element(stmt, struct_ptr, val):
+                    pass
+                elif isinstance(pointee_type, ir.BaseStructType):
+                    struct_name = self._get_struct_name_from_type(pointee_type)
+                    if not struct_name:
+                        raise ValueError("Cannot determine struct type for field assignment")
+                    idx = self._get_struct_field_index(struct_name, stmt.target.field)
+                    _, field_type = self.struct_fields[struct_name][idx]
+                    field_llvm_type = self._ritz_type_to_llvm(field_type)
+                    field_ptr = self.builder.gep(struct_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+                    val = self._convert_type(val, field_llvm_type, stmt.value)
+                    self._drop_old_field(stmt.target, field_ptr, field_type)
+                    self.builder.store(val, field_ptr)
+                else:
+                    raise ValueError(f"Cannot assign field on non-struct pointer: {pointee_type}")
             else:
                 raise NotImplementedError(f"Assignment to: {type(stmt.target)}")
             return None
@@ -8966,8 +8959,10 @@ class LLVMEmitter:
             return True
         place = self._struct_index(target, "m[k] = v")
         self._literal_into_slot(self._infer_ritz_type(place), value)
-        val = self._emit_expr(value)
+        # `*index_mut(@&m, k) = v`: `m`, `k` and `index_mut`, then `v`, as any
+        # `*f() = v` (LARB R61, AGAST #1740).
         ptr = self._emit_expr(place.operand)
+        val = self._emit_expr(value)
         self.builder.store(self._convert_type(val, ptr.type.pointee, value), ptr)
         return True
 
@@ -9156,9 +9151,10 @@ class LLVMEmitter:
             finally:
                 self._evaluated_once = outer
         else:
+            # The place (and its `deref_mut`), then `v`: LARB R61, AGAST #1740.
             self._literal_into_slot(self._infer_ritz_type(target), value)
-            val = self._emit_into_array_slot(value, self._assign_slot(stmt))
             ptr = place()
+            val = self._emit_into_array_slot(value, self._assign_slot(stmt))
         self.builder.store(self._convert_type(val, ptr.type.pointee, value), ptr)
         return True
 
@@ -10858,9 +10854,10 @@ class LLVMEmitter:
                 target_enum = self._ensure_builtin_generic_specialization(
                     target_ritz_type)
         self._literal_into_slot(self._infer_ritz_type(expr.target), expr.value)
-        # LARB R61 (§13.6): `a[i] = v` addresses `a[i]` before it emits `v`.
-        ptr = (self._emit_lvalue_addr(expr.target)
-               if isinstance(expr.target, rast.Index) else None)
+        # LARB R61 (§13.6): the place is addressed before `v` is emitted:
+        # `a[i] = v`, `f().x = v`, `*f() = v` (AGAST #1740).
+        ptr = (None if isinstance(expr.target, rast.Ident)
+               else self._emit_lvalue_addr(expr.target))
         if target_enum is not None:
             val = self._emit_enum_variant_with_type(expr.value, target_enum)
         else:
@@ -10882,9 +10879,7 @@ class LLVMEmitter:
                 raise ValueError(f"Unknown variable: {name}")
 
         else:
-            # For field access, index, dereference - use _emit_lvalue_addr
-            if ptr is None:
-                ptr = self._emit_lvalue_addr(expr.target)
+            # For field access, index, dereference: addressed above.
             target_ty = ptr.type.pointee
             val = self._convert_type(val, target_ty)
             self.builder.store(val, ptr)
@@ -11411,6 +11406,17 @@ class LLVMEmitter:
         while isinstance(expr, rast.Field):
             expr = expr.expr
         return isinstance(expr, (rast.Call, rast.MethodCall))
+
+    def _names_struct_value(self, expr: rast.Expr) -> bool:
+        """Whether `expr` is an element or field whose type is a struct, not
+        a pointer to one: `ps[i].inn`, `a[i]`.  Its address is the place."""
+        if not isinstance(expr, (rast.Index, rast.Field)):
+            return False
+        ty = self._infer_ritz_type(expr)
+        if ty is not None:
+            ty = resolve_alias_in(ty, self.type_aliases)
+        return (isinstance(ty, rast.NamedType)
+                and isinstance(self._ritz_type_to_llvm(ty), ir.BaseStructType))
 
     def _struct_place_addr(self, expr: rast.Expr) -> Optional[ir.Value]:
         """The address of `expr` if it names struct storage, else None.
