@@ -8,6 +8,10 @@ import argparse, os, re, shutil, signal, subprocess, sys, tempfile, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import exec_tmpdir  # noqa: E402  (AGAST #3704)
+
 THIS_FILE = Path(__file__).resolve()
 RITZ_ROOT = THIS_FILE.parent.parent          # projects/ritz
 ROOT = RITZ_ROOT.parent.parent               # worktree root
@@ -726,6 +730,13 @@ def main():
                          "binary reflects the changes too.")
     args = ap.parse_args()
 
+    # Before env is copied: the executables built under the temp dir are run from there: a noexec /tmp
+    # (bangerang's CIS policy) would fail every one with EACCES (#3704).
+    try:
+        exec_tmpdir.ensure_exec_tmpdir(out=sys.stdout)
+    except exec_tmpdir.SetupError as e:
+        print(f"SETUP ERROR: {e}")
+        return exec_tmpdir.EXIT_SETUP
     # In os.environ too: closures are resolved in-process (build.cas_closure).
     os.environ["RITZ_PATH"] = RITZ_PATH_ENV
     env = os.environ.copy()

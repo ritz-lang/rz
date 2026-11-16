@@ -373,6 +373,49 @@ for p in projects/ritz/tools/smoke_stack/core.py projects/x/core.ritz projects/x
     check '! ign "$p"' ".gitignore doesn't ignore the source $p"
 done
 
+# 17. The gate's own exec-able TMPDIR (AGAST #3704): bangerang's /tmp is
+# noexec, so every gate failed running what smoke built there.
+git -C "$W" reset -q --hard "$SHA"
+GT="$RZ_GATE_DIR/.trees/ritz-gate-t17.tmp"
+cmd17='echo "$TMPDIR" > "$RZ_TEST_ORDER.tmpdir"
+python3 -c "import tempfile; print(tempfile.gettempdir())" > "$RZ_TEST_ORDER.pytmp"
+x="$(mktemp)" && printf "#!/bin/sh\necho ran-from-tmp\n" > "$x" && chmod +x "$x" && "$x"'
+l17="$(RZ_GATE_CMD="$cmd17" gate "$W" t17)"
+check 'grep -qx EXIT=0 "$l17" && grep -qx ran-from-tmp "$l17"' "the command runs a binary from its TMPDIR ($(grep '^EXIT=' "$l17"))"
+check '[[ "$(cat "$RZ_TEST_ORDER.tmpdir")" == "$GT" ]]' "the command's TMPDIR is <gate dir>/.trees/<unit>.tmp (got $(cat "$RZ_TEST_ORDER.tmpdir"))"
+check '[[ "$(cat "$RZ_TEST_ORDER.pytmp")" == "$GT" ]]' "python's tempfile (and so pytest's tmp_path) follows it"
+check '[[ "$(grep -c "^TMPDIR=" "$l17")" -eq 1 ]] && sed "/^WAITING/q" "$l17" | grep -qx "TMPDIR=$GT"' "the log names the TMPDIR once, in its header (before WAITING)"
+check '[[ ! -e "$GT" ]]' "the gate's TMPDIR is removed afterwards"
+# The probe is the one smoke uses, called on the gate's dir before any step.
+cat > "$T/bin/probe-ok" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" > "$RZ_TEST_ORDER.probe-args"; [[ -d "$2" && -w "$2" ]]
+STUB
+cat > "$T/bin/probe-noexec" <<'STUB'
+#!/usr/bin/env bash
+echo "SETUP ERROR: TMPDIR $2 can't run binaries: stub noexec"; exit 3
+STUB
+chmod +x "$T/bin/probe-ok" "$T/bin/probe-noexec"
+l17="$(RZ_GATE_PROBE="$T/bin/probe-ok" RZ_GATE_CMD='exit 0' gate "$W" t17)"
+check '[[ "$(cat "$RZ_TEST_ORDER.probe-args")" == "probe $GT" ]]' "the probe is asked about the gate's TMPDIR, which exists by then"
+check 'grep -qx EXIT=0 "$l17"' "a passing probe lets the command run"
+real="$(cd "$HERE/../../.." && pwd -P)/projects/ritz/tools/exec_tmpdir.py"
+check '[[ -x "$real" ]] && "$real" probe "$T"' "the default probe is the repo's tools/exec_tmpdir.py, and it passes here"
+# A TMPDIR that can't run a file: SETUP ERROR naming it, and nothing runs.
+rm -f "$RZ_TEST_ORDER.ran17"
+l17="$(RZ_GATE_PROBE="$T/bin/probe-noexec" RZ_GATE_CMD='touch "$RZ_TEST_ORDER.ran17"' gate "$W" t17)"
+gate --wait "$l17" > "$T/wait17" 2>&1; rc=$?
+check '[[ $rc -eq 2 ]]' "--wait exits 2 when the TMPDIR fails the probe, got $rc"
+check 'grep -q "^SETUP ERROR: the gate.s TMPDIR $GT can.t run binaries" "$l17"' "the log says SETUP ERROR and names the dir"
+check 'grep -q "^SETUP ERROR" "$T/wait17"' "--wait prints the SETUP ERROR line"
+check '[[ ! -e "$RZ_TEST_ORDER.ran17" ]]' "the command never ran"
+check '[[ ! -e "$GT" && ! -e "$RZ_GATE_DIR/.trees/ritz-gate-t17" ]]' "the TMPDIR and checkout are removed after a SETUP ERROR"
+# One left by a unit killed outright (no trap) is cleared, read-only or not.
+mkdir -p "$GT/stale/ro"; chmod a-w "$GT/stale/ro" "$GT/stale"
+l17="$(RZ_GATE_CMD='test ! -e "$TMPDIR/stale"' gate "$W" t17)"
+check 'grep -qx EXIT=0 "$l17"' "a stale TMPDIR from a killed gate is replaced ($(grep '^EXIT=' "$l17"))"
+check '[[ ! -e "$GT" ]]' "and removed afterwards"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

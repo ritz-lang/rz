@@ -9,7 +9,10 @@ the first step of main.yml's bootstrap job — and stops at the first failure.
 
 Steps, cheapest and most-likely-broken first:
 
-  0. timeout --signal=KILL                the run budgets regression.sh relies
+  0. exec-able TMPDIR                     every later step runs binaries from
+                                          the temp dir; a noexec /tmp moves
+                                          TMPDIR to a fallback (#3704)
+     timeout --signal=KILL                the run budgets regression.sh relies
                                           on are enforced (#2745; SETUP ERROR)
   1. check-no-s-strings, regen-check      banned syntax, generator drift
   2. pytest -m smoke  (ritz0/, serial)    broken ritz0 front end / tooling
@@ -46,6 +49,7 @@ HERE = Path(__file__).resolve().parent
 RITZ_ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
+import exec_tmpdir  # noqa: E402
 import run_regression_matrix as matrix  # noqa: E402
 
 CANARY_FILE = HERE / "smoke_canaries.txt"
@@ -177,6 +181,24 @@ def _make(*targets: str, cwd: Path = RITZ_ROOT) -> list[str]:
 # Steps
 # --------------------------------------------------------------------------
 
+def exec_tmpdir_step(out: TextIO = sys.stdout, fallback: Path | None = None,
+                     exec_fn: exec_tmpdir.ExecFn = exec_tmpdir._exec) -> int:
+    """The temp dir can run binaries, or TMPDIR moves to one that can (#3704).
+
+    Sets os.environ["TMPDIR"], so pytest's tmp_path, the matrix harness and
+    every other child of a later step inherit it.  A host where neither the
+    ambient dir nor the fallback can run a file is a SETUP ERROR.
+    """
+    try:
+        exec_tmpdir.ensure_exec_tmpdir(fallback=fallback, exec_fn=exec_fn, out=out)
+    except exec_tmpdir.SetupError as e:
+        print(f"  ⚠ SETUP ERROR: {e}.", file=out)
+        print("    Point TMPDIR at a directory on a filesystem mounted without noexec."
+              " Not a regression.", file=out)
+        return EXIT_SETUP
+    return 0
+
+
 def timeout_kill_probe(limit: float = 1.0, sleep: float = 3.0,
                        out: TextIO = sys.stdout,
                        env: dict | None = None) -> int:
@@ -279,7 +301,9 @@ def self_compile(ritz1: Path = RITZ1_BIN, src: Path = SELF_COMPILE_SRC,
 
 def build_steps(out: TextIO = sys.stdout) -> list[Step]:
     return [
-        # First: a broken timeout makes every later run budget meaningless.
+        # First: every later step runs binaries from the temp dir (#3704).
+        Step("exec-able TMPDIR", 1, lambda: exec_tmpdir_step(out=out)),
+        # A broken timeout makes every later run budget meaningless.
         Step("timeout --signal=KILL", 2, lambda: timeout_kill_probe(out=out)),
         Step("check-no-s-strings", 2, lambda: _run(_make("check-no-s-strings"), out=out)),
         Step("regen-check", 3, lambda: _run(_make("regen-check"), out=out)),

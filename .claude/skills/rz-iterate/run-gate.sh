@@ -116,6 +116,16 @@
 #     out) as "NOT IN COMMIT <file> (ignored: <rule>)", so a failure on a
 #     missing file names it; --wait prints them.  Those lines fail nothing.
 #     A HEAD move in the worktree or the checkout still voids the result.
+#   * a TMPDIR of its own that can run binaries (AGAST #3704): bangerang's
+#     JumpCloud CIS policy re-mounts /tmp noexec every 50 min, and every gate
+#     there failed at smoke's canary matrix (EACCES running what it built in
+#     /tmp).  The command runs with TMPDIR=<gate dir>/.trees/<unit>.tmp, so
+#     pytest's tmp_path, tempfile and mktemp all land there.  Before the first
+#     step, projects/ritz/tools/exec_tmpdir.py (the probe smoke uses too)
+#     writes, chmod +x-es and runs a file in it; if that fails the gate is a
+#     SETUP ERROR (exit 2) naming the dir, and the command never runs.  The
+#     log's header names the dir (TMPDIR=); the trap removes it with the
+#     checkout.  RZ_GATE_PROBE overrides the probe (tests).
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
@@ -175,6 +185,10 @@ CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build &
 # A merge train's package tests (AGAST #3363), only once CMD has passed.
 if [[ -n "${RZ_GATE_AFTER:-}" ]]; then CMD="($CMD) && $RZ_GATE_AFTER"; fi
 UNIT="ritz-gate-$NAME"
+TREE="$GATES/.trees/$UNIT"
+# The gate's own exec-able TMPDIR, beside its checkout (AGAST #3704).
+GATE_TMP="$TREE.tmp"
+PROBE="${RZ_GATE_PROBE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)/projects/ritz/tools/exec_tmpdir.py}"
 
 # Uncommitted tracked changes would be tested but not merged.
 if ! git -C "$WT" diff --quiet HEAD; then
@@ -202,7 +216,7 @@ while :; do
     fi
     n=$((n + 1))
 done
-printf 'UNIT=%s\nSHA=%s\nCMD=%s\n' "$UNIT" "$SHA" "$CMD" >> "$LOG"
+printf 'UNIT=%s\nSHA=%s\nCMD=%s\nTMPDIR=%s\n' "$UNIT" "$SHA" "$CMD" "$GATE_TMP" >> "$LOG"
 
 # Source files the room's worktree has and the commit doesn't (AGAST #3559).
 # The gate can't see them (it runs on a checkout of the SHA), so a gate that
@@ -326,6 +340,9 @@ untree() {
     git worktree remove --force "$RZ_TREE" >/dev/null 2>&1
     rm -rf "$RZ_TREE"
     git worktree prune
+    # The gate's TMPDIR (AGAST #3704).  A test may leave a read-only dir.
+    chmod -R u+w "$RZ_TMPDIR" 2>/dev/null
+    rm -rf "$RZ_TMPDIR"
 }
 trap 'dequeue; unmark; untree' EXIT
 # Fail fast if the unit can't write: otherwise the slot loop below spins
@@ -382,16 +399,23 @@ unmark
 echo "SLOT=$s START $(date -Is)" >> "$RZ_LOG"
 untree
 t0=$(date +%s)
-if mkdir -p "$(dirname "$RZ_TREE")" \
-        && git worktree add -q --detach "$RZ_TREE" "$RZ_SHA" >> "$RZ_LOG" 2>&1; then
-    echo "TREE=$RZ_TREE checked out in $(( $(date +%s) - t0 )) s" >> "$RZ_LOG"
-    (cd "$RZ_TREE" && bash -c "$RZ_CMD") >> "$RZ_LOG" 2>&1
-    rc=$?
-    tree_now="$(git -C "$RZ_TREE" rev-parse HEAD)"
-else
+if ! { mkdir -p "$(dirname "$RZ_TREE")" \
+        && git worktree add -q --detach "$RZ_TREE" "$RZ_SHA" >> "$RZ_LOG" 2>&1; }; then
     echo "SETUP ERROR: could not check out $RZ_SHA into $RZ_TREE" >> "$RZ_LOG"
     rc=2
     tree_now="$RZ_SHA"
+else
+    echo "TREE=$RZ_TREE checked out in $(( $(date +%s) - t0 )) s" >> "$RZ_LOG"
+    tree_now="$(git -C "$RZ_TREE" rev-parse HEAD)"
+    # Prove the gate's TMPDIR can run a binary before any step (AGAST #3704).
+    if ! why="$(mkdir -p -m 700 "$RZ_TMPDIR" 2>&1 && "$RZ_PROBE" probe "$RZ_TMPDIR" 2>&1)"; then
+        echo "SETUP ERROR: the gate's TMPDIR $RZ_TMPDIR can't run binaries (noexec?); not a test failure: $why" >> "$RZ_LOG"
+        rc=2
+    else
+        (cd "$RZ_TREE" && TMPDIR="$RZ_TMPDIR" bash -c "$RZ_CMD") >> "$RZ_LOG" 2>&1
+        rc=$?
+        tree_now="$(git -C "$RZ_TREE" rev-parse HEAD)"
+    fi
 fi
 now="$(git rev-parse HEAD)"
 if [ "$now" != "$RZ_SHA" ]; then
@@ -422,7 +446,8 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_POLL="${RZ_GATE_POLL:-20}" --setenv=RZ_UNIT="$UNIT" \
     --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
     --setenv=RZ_HOLD="${RZ_GATE_TRAIN_HOLD:-600}" \
-    --setenv=RZ_TREE="$GATES/.trees/$UNIT" \
+    --setenv=RZ_TREE="$TREE" \
+    --setenv=RZ_TMPDIR="$GATE_TMP" --setenv=RZ_PROBE="$PROBE" \
     --setenv=RZ_STARVE="${RZ_GATE_STARVE:-2700}" \
     /bin/bash "$SCRIPT"
 

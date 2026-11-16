@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import re
 import subprocess
 import sys
@@ -161,7 +162,7 @@ def test_run_steps_counts_an_exception_as_failure():
 def test_step_order_is_the_design():
     # fast-iteration.md §4: cheapest, most-likely-broken first.
     assert [s.name for s in smoke.build_steps()] == [
-        "timeout --signal=KILL", "check-no-s-strings", "regen-check", "pytest -m smoke",
+        "exec-able TMPDIR", "timeout --signal=KILL", "check-no-s-strings", "regen-check", "pytest -m smoke",
         "build ritz1", "canary matrix", "ritz1 self-compile",
     ]
 
@@ -169,6 +170,51 @@ def test_step_order_is_the_design():
 @pytest.mark.unit
 def test_budgets_sum_within_two_minutes():
     assert sum(s.budget for s in smoke.build_steps()) <= 120
+
+
+# --------------------------------------------------------------------------
+# AGAST #3704: a noexec /tmp is a host problem, handled before any step runs
+# --------------------------------------------------------------------------
+# Every later step runs binaries from the temp dir.  The probe itself is
+# tested in test_exec_tmpdir.py; here, smoke's use of it.
+
+@pytest.mark.unit
+def test_exec_tmpdir_step_switches_to_the_fallback(tmp_path, monkeypatch):
+    bad = tmp_path / "noexec"
+    bad.mkdir()
+    fb = tmp_path / "fb"
+    monkeypatch.setenv("TMPDIR", str(bad))
+    monkeypatch.setattr(smoke.tempfile, "tempdir", None)
+
+    def run(path):
+        if Path(path).parent == bad:
+            raise PermissionError(13, "Permission denied", path)
+        return 0
+
+    out = io.StringIO()
+    try:
+        assert smoke.exec_tmpdir_step(out=out, fallback=fb, exec_fn=run) == 0
+        assert os.environ["TMPDIR"] == str(fb)
+        assert "using" in out.getvalue() and str(fb) in out.getvalue()
+    finally:
+        smoke.tempfile.tempdir = None
+
+
+@pytest.mark.unit
+def test_exec_tmpdir_step_is_a_setup_error_when_nothing_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(smoke.tempfile, "tempdir", None)
+
+    def run(path):
+        raise PermissionError(13, "Permission denied", path)
+
+    out = io.StringIO()
+    try:
+        rc = smoke.exec_tmpdir_step(out=out, fallback=tmp_path / "fb", exec_fn=run)
+    finally:
+        smoke.tempfile.tempdir = None
+    assert rc == smoke.EXIT_SETUP
+    assert "SETUP ERROR" in out.getvalue() and str(tmp_path) in out.getvalue()
 
 
 # --------------------------------------------------------------------------
