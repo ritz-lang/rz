@@ -28,6 +28,7 @@ import let_rules
 import bool_rules
 import float_rules
 import binder_names
+import type_order
 import match_coverage
 from metadata import type_to_string
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
@@ -2776,6 +2777,10 @@ class LLVMEmitter:
 
         # AGAST #2306: no dead large-aggregate load reaches clang.
         self._drop_dead_large_loads()
+
+        # AGAST #3653: a struct a fn-type parameter takes by value is defined
+        # before the struct holding that fn type, or clang refuses it.
+        type_order.order_identified_types(self.module.context)
 
         # Generate IR string
         ir_str = str(self.module)
