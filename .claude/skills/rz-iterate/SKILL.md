@@ -536,7 +536,12 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    `train.sh pkgs test <base>`: `./rz test` on each touched package (the
    deepest `ritz.toml` above each changed file under `projects/`). It skips
    `projects/ritz/**` and `[workspace.exclude]` dirs, so a compiler-only
-   train costs what it did before. Each package gets one line, and
+   train costs what it did before. **Except a ritzunit train**: a change
+   to `projects/ritzunit` (its own package, not `inventory`) or to
+   `ritz0/test_runner.py` selects every package `rz test --all` sweeps,
+   `projects/ritz/**` members included (#3735). ritzunit is the `main` of
+   every test binary, and #2072, ritzunit-only, broke ritzlib/tests and
+   zeus through a green train. Each package gets one line, and
    `--wait` shows them:
    `PKG PASS`, `PKG KNOWN` (in `[ci.known_failing.build]`: advisory, as in
    `rz test --all`), `PKG PRE-EXISTING` (fails on the base too, so it was

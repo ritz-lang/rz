@@ -278,4 +278,34 @@ out="$(pt)"; rc=$?
 [[ $rc -ne 0 ]] && ok "a new package that fails blocks (rc=$rc)" || bad "a new package that fails blocks (rc=$rc)"
 has "$out" "^PKG FAIL +newpkg.*not on the base" "a new package's failure needs no base run"
 
+
+# 8. A ritzunit or test-runner change selects every package (AGAST #3735).
+# ritzunit is linked into every test binary (ritz0/test_runner.py), so #2072,
+# a ritzunit-only change, broke ritzlib/tests and zeus while its gate tested
+# only ritzunit.  Such a train tests what `rz test --all` sweeps: [workspace]
+# members minus [workspace.exclude], projects/ritz included.
+fetch; git -C "$M" checkout -q --detach origin/main
+for d in projects/ritzunit projects/ritz/ritzlib/tests projects/ritz/examples/ex1 bench/b1; do
+    mkdir -p "$M/$d"; echo "[package]" > "$M/$d/ritz.toml"
+done
+printf '%s\n' '[workspace]' 'members = ["projects/**", "bench/*"]' '[workspace.exclude]' \
+    '"projects/harland/boot" = "built by harland"' '"projects/ritz/examples" = "regression.sh"' \
+    '[ci.known_failing.build]' 'lexis = "AGAST #1 - fake"' > "$M/rz.toml"
+git -C "$M" add -A; git -C "$M" commit -qm "workspace members"; git -C "$M" push -q origin HEAD:main
+all="bench/b1 projects/harland projects/lexis projects/oldbad projects/prism projects/ritz projects/ritz-lsp projects/ritz/ritzlib/tests projects/ritzunit projects/ritzunit/inventory "
+for f in projects/ritzunit/src/runner.ritz projects/ritz/ritz0/test_runner.py; do
+    train "$f"
+    out="$(cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1)"
+    [[ "$(tr '\n' ' ' <<<"$out")" == "$all" ]] \
+        && ok "list: a $f change selects every package rz test --all sweeps" \
+        || { bad "list: a $f change selects every package"; echo "$out" | sed 's/^/     | /'; }
+done
+out="$(pt)"
+has "$out" "^PKG PASS +ritz/ritzlib/tests" "an all-packages train tests a package inside projects/ritz"
+has "$out" "^PKG PRE-EXISTING +oldbad" "an all-packages train still compares failures against the base"
+train projects/ritzunit/inventory/src.ritz
+out="$(cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1)"
+[[ "$(tr '\n' ' ' <<<"$out")" == "projects/ritzunit/inventory " ]] \
+    && ok "list: a nested package under ritzunit is only itself" \
+    || { bad "list: a nested package under ritzunit is only itself"; echo "$out" | sed 's/^/     | /'; }
 echo; [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

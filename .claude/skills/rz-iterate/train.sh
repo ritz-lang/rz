@@ -153,6 +153,8 @@ cmd_gate() {
 # Skipped: projects/ritz and everything in it (build-all + bootstrap is its
 # gate, so a compiler-only train costs exactly what it did), and rz.toml
 # [workspace.exclude] dirs, which resolve to the package above them.
+# Except: a change to ritzunit or ritz0/test_runner.py tests every package
+# `rz test --all` sweeps, projects/ritz's included (AGAST #3735, below).
 #
 # One verdict line per package:
 #   PKG PASS <id>
@@ -178,19 +180,49 @@ in_list() {
     return 1
 }
 
+# A change to ritzunit (its own package, not the nested inventory demo) or to
+# ritz0/test_runner.py touches every package: ritzunit is linked into every
+# test binary as its `main` (test_runner.py build_runner_objects).  #2072 was
+# ritzunit-only, so its gate never tested ritzlib/tests or zeus, which it
+# broke, and main's CI went red (AGAST #3725, #3735).  Such a train tests what
+# `rz test --all` sweeps: rz.toml [workspace] members minus
+# [workspace.exclude], projects/ritz and its nested packages included.
+ALL_PKGS_PKG=projects/ritzunit
+ALL_PKGS_FILE=projects/ritz/ritz0/test_runner.py
+
+# all_pkgs: every package dir `rz test --all` sweeps (rz discover_projects).
+all_pkgs() {
+    python3 -c 'import tomllib
+from pathlib import Path
+c = tomllib.load(open("rz.toml", "rb"))
+w = c.get("workspace", {})
+excl = [Path(e.rstrip("/")) for e in w.get("exclude", {})]
+for pat in w.get("members") or ["projects/**"]:
+    for m in Path(".").glob(pat + "/ritz.toml"):
+        d = m.parent
+        if not any(d == e or e in d.parents for e in excl):
+            print(d)' | sort -u
+}
+
 pkgs_list() {
-    local base="$1" f d excl
+    local base="$1" f d excl touched
     mapfile -t excl < <(toml_keys 'c.get("workspace", {}).get("exclude", {})')
-    git diff --name-only "$base" HEAD -- projects/ | while IFS= read -r f; do
+    touched="$(git diff --name-only "$base" HEAD -- projects/ | while IFS= read -r f; do
+        [[ "$f" == "$ALL_PKGS_FILE" ]] && echo "$ALL_PKGS_PKG"
         d="$(dirname "$f")"
         while [[ "$d" == projects/* ]]; do
             if [[ -f "$d/ritz.toml" ]] && ! in_list "$d" ${excl[@]+"${excl[@]}"}; then
-                in_list "$d" projects/ritz || echo "$d"
+                echo "$d"
                 break
             fi
             d="$(dirname "$d")"
         done
-    done | sort -u
+    done | sort -u)"
+    if grep -qxF -- "$ALL_PKGS_PKG" <<<"$touched"; then
+        all_pkgs
+        return
+    fi
+    [[ -z "$touched" ]] || grep -vxE 'projects/ritz(/.*)?' <<<"$touched" || true
 }
 
 pkgs_test() {
@@ -201,7 +233,7 @@ pkgs_test() {
     trap '[[ -z "$BASE_WT" ]] || { git worktree remove --force "$BASE_WT/tree" >/dev/null 2>&1; rm -rf "$BASE_WT"; git worktree prune; }' EXIT
     echo "=== Train package tests (AGAST #3363): ${#pkgs[@]} package(s) vs base ${base:0:12}"
     for p in ${pkgs[@]+"${pkgs[@]}"}; do
-        id="${p#projects/}"
+        id="${p#projects/}"; [[ "$p" == projects/* ]] || id="../$p"  # rz ids: ../bench/...
         echo "--- $id (train tip)"
         # The exit code comes straight from the command, never through a pipe.
         rc=0; $test "$p" || rc=$?
