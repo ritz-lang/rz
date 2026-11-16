@@ -1,4 +1,4 @@
-# async_echo_server.ritz - Simple echo server using async_tasks.ritz
+# async_echo_server.ritz - Simple echo server using ritzlib.async.tasks
 #
 # This example demonstrates:
 #   - Creating a listening socket
@@ -6,19 +6,24 @@
 #   - Handling multiple concurrent connections asynchronously
 #   - Echo protocol: recv data from client, send it back
 #
-# The server listens on port 9000 and echoes back all received data.
-# Each connection is handled by a separate task in the task pool.
+# The server listens on RITZ_EXAMPLE_PORT (default 9000) and echoes back all
+# received data.  Each connection is handled by a separate task in the pool.
 #
-# To test:
-#   cargo run --example async_echo_server
-#   nc localhost 9000
-#   (type something and see it echoed back)
+# To test (from projects/ritz):
+#   mkdir -p /tmp/aes/src && cp examples/tier5_async/async_echo_server.ritz /tmp/aes/src/main.ritz
+#   printf '[package]\nname = "aes"\nversion = "0.1.0"\n' > /tmp/aes/ritz.toml
+#   RITZ_PATH=$PWD python3 build.py build /tmp/aes
+#   RITZ_EXAMPLE_PORT=9000 /tmp/aes/build/debug/aes &
+#   echo hello | nc -q1 localhost 9000
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
 import ritzlib.async.tasks
 import ritzlib.async_net
+import ritzlib.strview
+import ritzlib.option
+import ritzlib.os.env
 
 
 # ============================================================================
@@ -63,7 +68,8 @@ fn echo_handler(task: *Task) -> i32
         # Copy read buffer to write buffer
         for i in 0..bytes_read
             task.write_buf[i] = task.read_buf[i]
-        # Fall through to send
+        # Fall through to send; no send has completed yet
+        task.io_result = TASK_IO_FRESH
 
     if task.handler_state == ECHO_STATE_SEND
         if task.io_result == TASK_IO_FRESH
@@ -87,50 +93,72 @@ fn echo_handler(task: *Task) -> i32
         # Successfully echoed the data, prepare for next request
         task.request_count += 1
         task.handler_state = ECHO_STATE_RECV
-        task.io_result = 0  # Clear for next iteration
+        task.io_result = TASK_IO_FRESH  # No recv has completed yet
+        # Submit the next recv now: returning pending with nothing in flight
+        # would leave the task waiting on a completion that never comes.
+        if task_recv(task) < 0
+            return 1  # Error, close connection
         return -1  # Pending, waiting for next recv
+
+    # ECHO_STATE_CLOSE (or anything unknown): done with this connection
+    return 0
 
 
 # ============================================================================
 # Server setup and main loop
 # ============================================================================
 
+# Port to listen on.  regression.sh-style runs pass a free per-run port in
+# RITZ_EXAMPLE_PORT so concurrent runs on one host cannot collide (AGAST
+# #1535, #1542); run by hand, the example keeps its historical default.
+fn port_in_range(p: i64, default_port: i32) -> i32
+    if p <= 0 or p > 65535
+        return default_port
+    return p as i32
+
+fn port_or(o: Option<i64>, default_port: i32) -> i32
+    match o
+        Some(p) => port_in_range(p, default_port)
+        None => default_port
+
+# Unset, empty or non-numeric all fall back to the default.
+fn listen_port(default_port: i32) -> i32
+    let s: StrView = env_get_or("RITZ_EXAMPLE_PORT", "")
+    return port_or(strview_parse_i64(s), default_port)
+
+
 fn main() -> i32
+    let port: i32 = listen_port(9000)
+
     # Create listening socket
-    let listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    let listen_fd: i32 = tcp_socket()
     if listen_fd < 0
         prints("Error: Failed to create socket\n")
         return 1
 
     # Allow address reuse
-    let reuse: i32 = 1
-    let ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, 4)
+    set_reuseaddr(listen_fd)
 
-    # Bind to port 9000
-    var addr: sockaddr_in
-    addr.sin_family = AF_INET
-    addr.sin_port = htons(9000)
-    addr.sin_addr.s_addr = htonl(INADDR_ANY)
-
-    ret = bind(listen_fd, &addr as *sockaddr, 16)
-    if ret < 0
-        prints("Error: Bind failed\n")
+    if tcp_bind(listen_fd, inaddr_any(), port) < 0
+        prints("Failed to bind to port ")
+        print_int(port as i64)
+        prints("\n")
         sys_close(listen_fd)
         return 1
 
     # Start listening
-    ret = listen(listen_fd, 128)
-    if ret < 0
+    if tcp_listen(listen_fd, 128) < 0
         prints("Error: Listen failed\n")
         sys_close(listen_fd)
         return 1
 
-    prints("Echo server listening on port 9000\n")
+    prints("Echo server listening on port ")
+    print_int(port as i64)
+    prints("\n")
 
-    # Initialize server with task pool
-    var srv: TaskServer
-    ret = task_server_init(&srv, listen_fd)
-    if ret < 0
+    # Initialize server with task pool (heap: TaskServer is ~4.5MB)
+    let srv: *TaskServer = task_server_create(listen_fd)
+    if srv == null
         prints("Error: Failed to initialize server\n")
         sys_close(listen_fd)
         return 1
@@ -138,14 +166,16 @@ fn main() -> i32
     prints("Server initialized, starting event loop\n")
 
     # Run the server event loop with our echo handler
-    ret = task_server_run(&srv, echo_handler)
+    let ret: i32 = task_server_run(srv, echo_handler)
 
-    task_server_destroy(&srv)
+    task_server_destroy(srv)
     sys_close(listen_fd)
 
     if ret == 0
         prints("Server shutdown cleanly\n")
     else
-        prints("Server error: %d\n", ret)
+        prints("Server error: ")
+        print_int(ret as i64)
+        prints("\n")
 
     return ret

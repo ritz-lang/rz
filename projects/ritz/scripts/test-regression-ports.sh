@@ -173,18 +173,98 @@ check "a real termination change is still reported as one" yes \
     "$(contains "$out" "termination behaviour changed")"
 
 # ---------------------------------------------------------------------------
-# 4. The three server examples take the port from the environment.
+# 4. Every server example takes its port from the environment (or from the
+#    kernel), including the ones outside the corpus.
 #
 #    Source-level: running them needs a compiler, which is the suite this test
 #    stays out of.  What it pins is exactly the regression -- a fixed port
 #    creeping back in.  The concurrent end-to-end proof lives in the #1535
 #    commit and in every gate, which now runs them with a per-run port.
 # ---------------------------------------------------------------------------
+# The literal-port detector, shared with section 5.  A literal port
+# (1024-65535) assigned to a `port`, passed straight to a bind, or handed to
+# htons() (the raw sockaddr_in form) is a port the program cannot be moved off.
+LITERAL_PORT_RE='\bport\b[^=(]*= *[1-9][0-9]{3,4}\b|bind\(.*, *[1-9][0-9]{3,4} *\)|htons\( *[1-9][0-9]{3,4} *\)'
+# Prints the literal-port lines under the paths given, or nothing.
+fixed_ports_in() {
+    grep -rsnE --include='*.ritz' --exclude-dir=build "$LITERAL_PORT_RE" "$@"
+}
+# Args: $1=example dir
+fixed_listen_ports() { fixed_ports_in "$1"/src; }
+unmovable_port() {
+    [[ -n "$(fixed_listen_ports "$1")" ]] &&
+        ! grep -rqs --include='*.ritz' --exclude-dir=build 'RITZ_EXAMPLE_PORT' "$1"/src
+}
+# A single loose .ritz file (not a package) with a literal port it cannot be
+# moved off.  Args: $1=file
+unmovable_port_file() {
+    [[ -n "$(fixed_ports_in "$1")" ]] && ! grep -q 'RITZ_EXAMPLE_PORT' "$1"
+}
+# A shell script that pins PORT=<literal> without deferring to
+# RITZ_EXAMPLE_PORT.  Args: $1=script
+unmovable_port_script() {
+    grep -qE '^[[:space:]]*(export[[:space:]]+)?PORT=[1-9][0-9]{3,4}\b' "$1" &&
+        ! grep -q 'RITZ_EXAMPLE_PORT' "$1"
+}
+
+# The servers that take a port: each reads RITZ_EXAMPLE_PORT.
 for ex in 74_async_tiers 75_tier2_uring 76_tier3_http tier5_async/50_http; do
     src="$RITZ_ROOT/examples/$ex/src/main.ritz"
     check "$ex reads RITZ_EXAMPLE_PORT" yes \
         "$(grep -q 'RITZ_EXAMPLE_PORT' "$src" && echo yes || echo no)"
 done
+
+# The client/server self-tests (AGAST #1542, fixed by #3136): they need no
+# outside port at all, so they bind port 0 and ask the kernel which one they
+# got.  No literal port, and their test.sh (run with the ambient env, not
+# env -i) passes none either.
+for ex in tier5_async/59_async_net tier5_async/60_echo_server; do
+    check "$ex binds no literal port" "" \
+        "$(fixed_listen_ports "$RITZ_ROOT/examples/$ex")"
+    check "$ex asks the kernel for its port" yes \
+        "$(grep -q 'tcp_getsockname' "$RITZ_ROOT/examples/$ex/src/main.ritz" && echo yes || echo no)"
+    check "$ex/test.sh pins no port" no \
+        "$(grep -qE 'PORT|[^0-9][1-9][0-9]{3,4}([^0-9]|$)' "$RITZ_ROOT/examples/$ex/test.sh" && echo yes || echo no)"
+done
+
+# The detectors, on fixtures, so a broken regex cannot pass vacuously.
+mkdir -p "$SCRATCH/fx_loose"
+printf 'fn main() -> i32\n    addr.sin_port = htons(9000)\n' > "$SCRATCH/fx_loose/raw.ritz"
+printf '# RITZ_EXAMPLE_PORT\nfn main() -> i32\n    addr.sin_port = htons(9000)\n' > "$SCRATCH/fx_loose/raw_env.ritz"
+printf 'fn main() -> i32\n    addr.sin_port = htons(port)\n' > "$SCRATCH/fx_loose/raw_var.ritz"
+printf 'fn main() -> i32\n    tcp_bind(fd, inaddr_any(), 9000)\n' > "$SCRATCH/fx_loose/nested.ritz"
+printf '#!/bin/bash\nPORT=9001\nnc localhost $PORT\n' > "$SCRATCH/fx_loose/fixed.sh"
+printf '#!/bin/bash\nPORT=${RITZ_EXAMPLE_PORT:-9001}\n' > "$SCRATCH/fx_loose/env.sh"
+check "a literal htons() port in a loose file is unmovable" yes \
+    "$(unmovable_port_file "$SCRATCH/fx_loose/raw.ritz" && echo yes || echo no)"
+check "a literal htons() default behind RITZ_EXAMPLE_PORT is fine" no \
+    "$(unmovable_port_file "$SCRATCH/fx_loose/raw_env.ritz" && echo yes || echo no)"
+check "a literal bind port after a nested call is unmovable" yes \
+    "$(unmovable_port_file "$SCRATCH/fx_loose/nested.ritz" && echo yes || echo no)"
+check "htons() of a variable is fine" no \
+    "$(unmovable_port_file "$SCRATCH/fx_loose/raw_var.ritz" && echo yes || echo no)"
+check "a script pinning PORT=N is unmovable" yes \
+    "$(unmovable_port_script "$SCRATCH/fx_loose/fixed.sh" && echo yes || echo no)"
+check "a script defaulting PORT from RITZ_EXAMPLE_PORT is fine" no \
+    "$(unmovable_port_script "$SCRATCH/fx_loose/env.sh" && echo yes || echo no)"
+
+# Outside the corpus regression.sh runs: loose .ritz servers (not packages, so
+# section 5 never sees them, e.g. tier5_async/async_echo_server.ritz) and the
+# hand-run integration scripts (74_async_tiers/test_tier1_integration.sh).
+# Run by hand next to a gate, a fixed port collides just the same.
+loose_unmovable=()
+while read -r f; do
+    unmovable_port_file "$f" && loose_unmovable+=("${f#"$RITZ_ROOT"/}")
+done < <(find "$RITZ_ROOT/examples" -type f -name '*.ritz' \
+            -not -path '*/build/*' -not -path '*/src/*' -not -path '*/test/*' | sort)
+check "no loose example .ritz binds a fixed port without RITZ_EXAMPLE_PORT" "" \
+    "${loose_unmovable[*]}"
+script_unmovable=()
+while read -r f; do
+    unmovable_port_script "$f" && script_unmovable+=("${f#"$RITZ_ROOT"/}")
+done < <(find "$RITZ_ROOT/examples" -type f -name '*.sh' -not -path '*/build/*' | sort)
+check "no example script pins a fixed PORT without RITZ_EXAMPLE_PORT" "" \
+    "${script_unmovable[*]}"
 
 # ---------------------------------------------------------------------------
 # 5. No example in the corpus binds a hard-coded port it cannot be moved off.
@@ -200,16 +280,7 @@ done
 #    self-test that needs a port of its own binds port 0 and asks the kernel
 #    which one it got (tcp_getsockname).
 # ---------------------------------------------------------------------------
-# Prints the example's literal-port lines, or nothing.  Args: $1=example dir
-fixed_listen_ports() {
-    grep -rsnE --include='*.ritz' --exclude-dir=build \
-        '\bport\b[^=(]*= *[1-9][0-9]{3,4}\b|bind\([^)]*, *[1-9][0-9]{3,4} *\)' \
-        "$1"/src
-}
-unmovable_port() {
-    [[ -n "$(fixed_listen_ports "$1")" ]] &&
-        ! grep -rqs --include='*.ritz' --exclude-dir=build 'RITZ_EXAMPLE_PORT' "$1"/src
-}
+# (fixed_listen_ports / unmovable_port are defined above section 4.)
 
 # The detector itself, on fixtures, so a broken regex cannot pass vacuously.
 mkdir -p "$SCRATCH/fx_fixed/src" "$SCRATCH/fx_env/src" "$SCRATCH/fx_zero/src"
