@@ -18,7 +18,7 @@ sudo apt install clang lld python3 make
 `lld-link`, and without it `./rz build --all` fails at exit 1 with
 `Cannot link UEFI target 'bootx64': lld-link not found`. No other project needs
 `lld` — but installing it does not make `build --all` green on its own, because
-`lexis` and `tempest` fail for unrelated compiler reasons. See the
+`tempest` fails for unrelated compiler reasons. See the
 [build status table](#build-status) below.
 
 `clang` 20 or newer is required. This machine has 21.1.8 (with `clang-20` also
@@ -155,17 +155,18 @@ Two directories under `projects/` are deliberately not among them:
 
 The descriptions above state each project's *intent*. For what actually builds
 and runs today, read the project's own README — several are further from their
-description than the table suggests, and three have known failures:
+description than the table suggests, and two have known build failures:
 
 | Project | `./rz build` | Note |
 |---|---|---|
 | **harland** | ✗ exit 1 locally | `bootx64` needs `lld`; see Prerequisites |
-| **lexis** | ✗ exit 1 | 424 ownership errors, AGAST #1289 |
 | **tempest** | ✗ exit 1 | emitter indirection-depth bug, AGAST #1302 |
 
-`lexis` and `tempest` are excused in `rz.toml`'s `[ci.known_failing.build]`, so
-`./rz build --all` reports them as advisory rather than gating. Measured
-2026-09-12; every other project in `./rz list` built at exit 0.
+`tempest` is excused in `rz.toml`'s `[ci.known_failing.build]`, so
+`./rz build --all` reports it as advisory rather than gating. Measured
+2026-09-12; every other project in `./rz list` built at exit 0. `lexis` has
+built since AGAST #3689 (2026-11-16), but its binary segfaults at startup
+(AGAST #3700).
 
 ## Architecture
 
