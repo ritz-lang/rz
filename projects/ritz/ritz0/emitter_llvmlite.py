@@ -10482,13 +10482,19 @@ class LLVMEmitter:
         self.builder.position_at_end(loop_end)
 
     def _try_vec_lvalue_base(self, expr: rast.Expr) -> Optional[ir.Value]:
-        """Address of `expr` when it denotes a Vec<T>, else None."""
+        """Address of `expr` when it denotes a Vec<T> or Span<T>, else None.
+
+        Both keep their element pointer in field 0 (`data`, `ptr`), which the
+        callers load.  A Span is a view, so a store through `h.s[i]` lands in
+        what it views (AGAST #3707: a Span field fell to the general case and
+        raised "Cannot index type").
+        """
         ritz_type = self._infer_ritz_type(expr)
         while isinstance(ritz_type, (rast.PtrType, rast.RefType)):
             ritz_type = ritz_type.inner
         if not isinstance(ritz_type, rast.NamedType):
             return None
-        if not (ritz_type.name == 'Vec' or ritz_type.name.startswith('Vec$')):
+        if self._buffer_field_path(ritz_type) not in (('data',), ('ptr',)):
             return None
         try:
             addr = self._emit_lvalue_addr(expr)
