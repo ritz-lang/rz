@@ -93,7 +93,8 @@ def test_every_compiler_refuses_qualified_access(ritz1_bin, tmp_path, compiler, 
     # Every compiler points at the `a::b` itself, not the item holding it, and
     # says why (AGAST #2600: ritz1 used to report only `cannot parse item
     # starting at 'fn main'`).
-    assert f"main.ritz:{where}: `{text}`: `::` was removed in RERITZ" in out, out
+    sep = "" if compiler == "ritz0" else "error: "
+    assert f"main.ritz:{where}: {sep}`{text}`: `::` was removed in RERITZ" in out, out
 
 
 def test_ritz1_spaced_colons_are_not_called_qualified_access(ritz1_bin, tmp_path):
@@ -102,7 +103,7 @@ def test_ritz1_spaced_colons_are_not_called_qualified_access(ritz1_bin, tmp_path
     proc, out, _ = _compile("ritz1", ritz1_bin, tmp_path, "spaced", main)
     assert proc.returncode != 0, out
     assert "removed in RERITZ" not in out, out
-    assert "main.ritz:5:18: unexpected ':'" in out, out
+    assert "main.ritz:5:18: error: unexpected ':'" in out, out
 
 
 def test_ritz0_aliased_qualified_call_is_unchanged(tmp_path):

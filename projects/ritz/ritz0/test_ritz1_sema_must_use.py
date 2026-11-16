@@ -138,7 +138,7 @@ REACH_WANTED = sorted(["15:9", "19:5", "19:5", "23:5", "28:9", "31:9", "34:9",
 
 def _reports(comp):
     out = comp.stdout + comp.stderr
-    return out, re.findall(r"main\.ritz:(\d+:\d+): (.*)", out)
+    return out, re.findall(r"main\.ritz:(\d+:\d+): error: (.*)", out)
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

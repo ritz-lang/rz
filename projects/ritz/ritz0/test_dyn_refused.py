@@ -118,8 +118,11 @@ fn f(w: *W<W<dyn Speak>>) -> i32
 }
 
 # "Parse error: <file>:<line>:<col>: <message>" (ritz0) or
-# "error: <file>:<line>:<col>: <message>" (ritz1).
-DIAG = re.compile(r"^(?:error|Parse error): (.+?):(\d+):(\d+): (.*)$")
+# "<file>:<line>:<col>: error: <message>" (ritz1, diag.ritz, AGAST #3445).
+DIAG = {
+    "ritz0": re.compile(r"^Parse error: (.+?):(\d+):(\d+): (.*)$"),
+    "ritz1": re.compile(r"^(.+?):(\d+):(\d+): error: (.*)$"),
+}
 
 
 def _dyn_sites(src: str):
@@ -154,7 +157,8 @@ def test_dyn_refused_at_the_dyn_token(request, tmp_path, compiler, name):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted `dyn`:\n{out[-2000:]}"
     assert not ll.exists(), f"{compiler} wrote IR for a refused program"
-    errors = [m.groups() for m in map(DIAG.match, out.splitlines()) if m]
+    diag = DIAG["ritz0" if compiler == "ritz0" else "ritz1"]
+    errors = [m.groups() for m in map(diag.match, out.splitlines()) if m]
     expected = [(str(src), str(line), str(col), MESSAGE) for line, col in _dyn_sites(program)]
     if compiler == "ritz0":
         expected = expected[:1]  # its parser stops at the first error

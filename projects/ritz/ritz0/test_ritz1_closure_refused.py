@@ -2,7 +2,7 @@
 lambda written as an expression, located at the `|` (or `||`) or `fn` that
 opens it, in ritz0's words (#3470, test_closures_refused.py):
 
-    error: main.ritz:2:29: closures aren't supported: write a named fn and pass it by name (§5.5)
+    main.ritz:2:29: error: closures aren't supported: write a named fn and pass it by name (§5.5)
 
 ritz1 already failed these at the parse, but with "unexpected '|'" /
 "unexpected 'fn'" at whatever token the backtracking parser gave up on.  The
@@ -58,8 +58,8 @@ def test_closure_expression_is_a_located_error(tmp_path, compiler, name):
     proc, ll = _compile(compiler, tmp_path, src)
     assert proc.returncode != 0, proc.stderr
     assert not ll.exists()
-    errors = [l for l in proc.stderr.splitlines() if l.startswith("error:")]
-    assert errors == [f"error: main.ritz:{line}:{column}: {MSG}"], proc.stderr
+    errors = [l for l in proc.stderr.splitlines() if ": error: " in l]
+    assert errors == [f"main.ritz:{line}:{column}: error: {MSG}"], proc.stderr
 
 
 # Each closure in a file is reported once, where it is written, however often
@@ -78,10 +78,10 @@ def test_each_closure_is_reported_once(tmp_path, compiler):
     proc, ll = _compile(compiler, tmp_path, src)
     assert proc.returncode != 0, proc.stderr
     assert not ll.exists()
-    errors = [l for l in proc.stderr.splitlines() if l.startswith("error:")]
+    errors = [l for l in proc.stderr.splitlines() if ": error: " in l]
     assert errors == [
-        f"error: main.ritz:5:19: {MSG}",
-        f"error: main.ritz:6:19: {MSG}",
+        f"main.ritz:5:19: error: {MSG}",
+        f"main.ritz:6:19: error: {MSG}",
     ], proc.stderr
 
 

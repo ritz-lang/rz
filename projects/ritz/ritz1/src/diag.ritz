@@ -1,0 +1,84 @@
+# diag.ritz - ritz1's located diagnostics (AGAST #3445, LARB review/5 N5)
+#
+# Every ritz1 error is one line on stderr:
+#
+#     <file>:<line>:<col>: error: <message>
+#
+# the shape ritz0 and the rest of the toolchain print.  Before #3445 ritz1
+# had ~60 printers of its own (42 hand-rolled `error: ` prefixes, each with
+# its own `if file != null ... "<input>"` fallback, and per-module helpers
+# such as si_error_at, enum_error_at and own_eprint_loc), half of them
+# printing `error: <file>:...` the other way round, and 56 emit_ir_error
+# calls with no location at all.  The parser side (ast_helpers,
+# struct_index, generic_infer, sema, call_check) goes through here; the
+# emitter files and emit_ir_error follow in AGAST #3621.  The tools-unit lint
+# tools/test_ritz1_diag_lint.py keeps a bare `error: ` prefix out of every
+# file but diag and its shrinking allowlist.
+#
+# The message text is the caller's and is frozen: the *_rules.py strings are
+# shared with ritz0.  Only the location prefix is diag's.
+#
+# A message is one of:
+#   diag_error       a c-string
+#   diag_error_name  head, a (ptr, len) name, tail -- the common "`x` ..." shape
+#   diag_error_buf   a String built with format_into (AGAST #1824):
+#                        var m: String = string_new()
+#                        format_into(@&m, "unhandled statement kind {k}")
+#                        diag_error_buf(file, span, @m)
+#                        string_drop(@&m)
+#   diag_error_at    the prefix alone, for a message printed piecewise after it
+#
+# None of these count the error: each pass keeps its own count (s.error_count,
+# g_si_errors, ...) and bumps it at the call.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.string
+
+import ast
+
+# A span from a (line, col) pair, for callers that carry the two separately.
+pub fn diag_span(line: i32, col: i32) -> SrcSpan
+    SrcSpan { line: line, col: col }
+
+# `<file>:<line>:<col>`, with `<input>` for a source that has no path.
+pub fn diag_loc(file: *u8, span: SrcSpan)
+    var f: *u8 = file
+    if f == null
+        f = c"<input>"
+    let line: i32 = span.line
+    let col: i32 = span.col
+    var m: String = string_new()
+    format_into(@&m, "{f}:{line}:{col}")
+    eprint_string(@m)
+    string_drop(@&m)
+
+# `<file>:<line>:<col>: error: ` -- the prefix of every ritz1 error.
+pub fn diag_error_at(file: *u8, span: SrcSpan)
+    diag_loc(file, span)
+    eprints_cstr(c": error: ")
+
+# `<file>:<line>:<col>: error: <msg>`, one line.
+pub fn diag_error(file: *u8, span: SrcSpan, msg: *u8)
+    diag_error_at(file, span)
+    eprints_cstr(msg)
+    eprint_char('\n')
+
+# `<file>:<line>:<col>: error: <head><name><tail>`, one line.  `name` is
+# `len` bytes, not NUL-terminated (a token or identifier in the source).
+pub fn diag_error_name(file: *u8, span: SrcSpan, head: *u8, name: *u8, len: i32, tail: *u8)
+    diag_error_at(file, span)
+    eprints_cstr(head)
+    var i: i32 = 0
+    while i < len
+        eprint_char(*(name + i))
+        i += 1
+    eprints_cstr(tail)
+    eprint_char('\n')
+
+# `<file>:<line>:<col>: error: <msg's bytes>`, one line; `msg` is typically
+# built with format_into.
+pub fn diag_error_buf(file: *u8, span: SrcSpan, msg: @String)
+    diag_error_at(file, span)
+    eprint_string(msg)
+    eprint_char('\n')

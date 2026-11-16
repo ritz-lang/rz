@@ -186,7 +186,7 @@ def test_ritz1_attr_on_pub_var_is_a_located_error(ritz1_bin, tmp_path):
     ll = tmp_path / "attr.ll"
     comp = _compile("ritz1", tmp_path, src, ll)
     assert comp.returncode != 0 and not ll.exists(), comp.stderr
-    assert "attr.ritz:1:3: attribute 'inline' applies to fn items only" in comp.stderr, comp.stderr
+    assert "attr.ritz:1:3: error: attribute 'inline' applies to fn items only" in comp.stderr, comp.stderr
 
 
 @pytest.mark.integration

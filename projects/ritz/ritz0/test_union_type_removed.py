@@ -137,7 +137,7 @@ def test_ritz1_refuses_at_the_spot(request, tmp_path, compiler, name):
     source, message, line, col = REFUSED[name]
     out, ll = _ritz1(request, compiler, tmp_path, source)
     assert not ll.exists(), f"{compiler} wrote IR for {name}:\n{out[-800:]}"
-    want = rf"^error: \S*/unit\.ritz:{line}:{col}: {re.escape(message)}$"
+    want = rf"^\S*/unit\.ritz:{line}:{col}: error: {re.escape(message)}$"
     assert len(re.findall(want, out, re.M)) == 1, f"{compiler}, {name}:\n{out[-800:]}"
     assert "unexpected" not in out, f"{compiler}, {name}:\n{out[-800:]}"
 

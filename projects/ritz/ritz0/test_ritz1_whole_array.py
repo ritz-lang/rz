@@ -2519,5 +2519,5 @@ def test_ritz1_array_conflict_cant_infer(ritz1_bin, tmp_path):
     """AGAST #3277: `[4]i32` and `[3]i32` for one T is ritz0's located refusal."""
     name = "generic_infer_array_conflict"
     comp, _ = _compile("ritz1", ritz1_bin, tmp_path, name, REJECTED[name])
-    assert re.search(r"\.ritz:7:12: can't infer `T` for `g`: write `g<T>\(\.\.\.\)`",
+    assert re.search(r"\.ritz:7:12: error: can't infer `T` for `g`: write `g<T>\(\.\.\.\)`",
                      comp.stdout + comp.stderr), comp.stdout + comp.stderr

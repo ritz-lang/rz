@@ -2,7 +2,7 @@
 call to a fn or method declared without `pub` in another file, located at the
 call, in ritz0's words (#3418, test_private_fn_cross_file.py):
 
-    error: main.ritz:5:5: `helper` is private to a.ritz; mark it `pub` (#3413)
+    main.ritz:5:5: error: `helper` is private to a.ritz; mark it `pub` (#3413)
     <dir>/a.ritz:8:1: note: `helper` is declared here
 
 Same rows and scope as ritz0's: free fns, method calls `p.get()` (and the
@@ -75,7 +75,7 @@ def _refused(compiler, tmp_path, a_src, main_src, env_extra=None):
 
 
 def _error(line, col, display):
-    return (f"error: main.ritz:{line}:{col}: `{display}` is private to a.ritz; "
+    return (f"main.ritz:{line}:{col}: error: `{display}` is private to a.ritz; "
             f"mark it `pub` (#3413)")
 
 

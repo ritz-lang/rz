@@ -136,7 +136,7 @@ def test_parse_error_points_at_the_type(ritz1_bin, tmp_path):
     proc, src, out = _compile_ritz1(ritz1_bin, tmp_path, "bad_type", BAD_TYPE)
     err = proc.stderr
     assert proc.returncode != 0 and not out.exists(), err
-    assert f"error: {src}:8:20: unexpected '*'" in err, err
+    assert f"{src}:8:20: error: unexpected '*'" in err, err
     # The item is still named, at its own line.
     assert f"{src}:7:1: cannot parse item starting at 'pub fn main'" in err, err
 
@@ -149,7 +149,7 @@ def test_parse_error_names_a_layout_token(ritz1_bin, tmp_path):
     proc, src, _out = _compile_ritz1(ritz1_bin, tmp_path, "bad_eol", program)
     err = proc.stderr
     assert proc.returncode != 0, err
-    assert f"error: {src}:5:" in err and ": unexpected end of line\n" in err, err
+    assert f"{src}:5:" in err and ": error: unexpected end of line\n" in err, err
 
 
 @pytest.mark.integration
@@ -169,4 +169,4 @@ def test_parse_error_with_nothing_consumed_keeps_the_item_location(ritz1_bin, tm
     proc, src, _out = _compile_ritz1(ritz1_bin, tmp_path, "bad_start", "fn ok() -> i32\n    0\n\n@@@\n")
     err = proc.stderr
     assert proc.returncode != 0, err
-    assert f"error: {src}:4:1:" in err, err
+    assert f"{src}:4:1: error:" in err, err

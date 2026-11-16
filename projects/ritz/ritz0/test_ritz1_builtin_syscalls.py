@@ -179,7 +179,8 @@ def test_undeclared_fn_is_refused_at_the_call(request, tmp_path, compiler, name)
     proc, ll = _compile(request, compiler, tmp_path, UNDECLARED.replace("write(", f"{name}("))
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out[-2000:]
-    assert re.search(rf"unit\.ritz:4:5: Unknown function: {name}$", out, re.M), out[-2000:]
+    sep = "" if compiler == "ritz0" else "error: "
+    assert re.search(rf"unit\.ritz:4:5: {sep}Unknown function: {name}$", out, re.M), out[-2000:]
     assert "Traceback" not in out, out[-2000:]
     assert not ll.exists()
 

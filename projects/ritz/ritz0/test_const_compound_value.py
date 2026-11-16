@@ -548,6 +548,6 @@ def test_ritz1_rejects_unfoldable_array_size(request, tmp_path, compiler, name):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted {name!r}:\n{out[-1000:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name!r}"
-    hits = re.findall(rf"main\.ritz:{line}:{col}: array length ", out)
+    hits = re.findall(rf"main\.ritz:{line}:{col}: error: array length ", out)
     # Once, though the backtracking parser runs the action on every retry.
     assert len(hits) == 1, out[-2000:]

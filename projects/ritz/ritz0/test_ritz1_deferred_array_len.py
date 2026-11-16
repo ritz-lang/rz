@@ -231,5 +231,5 @@ def test_ritz1_rejects_length_unfoldable_after_merge(request, tmp_path, compiler
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted {name!r}:\n{out[-1000:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name!r}"
-    hits = re.findall(rf"main\.ritz:{line}:{col}: array length ", out)
+    hits = re.findall(rf"main\.ritz:{line}:{col}: error: array length ", out)
     assert len(hits) == 1, out[-2000:]

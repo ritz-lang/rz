@@ -25,6 +25,7 @@ SOURCES = \
 	lexer_nfa \
 	lexer_setup_gen \
 	ast \
+	diag \
 	ast_helpers \
 	parser_gen \
 	interp \
