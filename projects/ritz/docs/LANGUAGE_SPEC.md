@@ -5049,7 +5049,7 @@ declares it. A call from another file is an error at the call. Make it `pub`
 to export it. The error names the declaring file, for example "`helper` is
 private to a.ritz; mark it `pub`", and a note gives the declaration's
 location. An `extern fn`, a `fn ... = extern` declaration and a generic's
-instances are not checked (AGAST #3418).
+instances are not checked (ritz0: AGAST #3418; ritz1: #3419).
 
 ### 15.3 Qualified Access
 

@@ -8,6 +8,8 @@
 #   known   "Unknown function: f", at the call (AGAST #3255)
 #   arity   "`f` called with N argument(s) but defined with M", at the call
 #   kind    "argument N of `f` has the wrong type: ...", at the argument
+#   private "`f` is private to a.ritz; mark it `pub` (#3413)", at the call, and
+#           a note at the declaration (AGAST #3419, LARB R45a; ritz0's #3418)
 #
 # A method call counts as `m(r, ..)`, its receiver argument 1, as ritz0 does
 # (#3319); a static call has no receiver.
@@ -43,7 +45,7 @@ import ritzlib.io
 import ast
 import ast_helpers
 import emitter_core
-import emitter_expr_call   # lent_local, arg_pointee_struct
+import emitter_expr_call   # lent_local, arg_pointee_struct, impl_of_method (#3419)
 import bool_check          # bool_kind, bk_of_type, BK_*
 import emitter             # is_cpuid_raw_function (AGAST #3255)
 
@@ -111,6 +113,63 @@ fn cc_is_syscall_name(name: *u8, len: i32) -> i32
     let d: u8 = *(name + at)
     return (d >= '0' and d <= '6') as i32
 
+# The part of `path` after its last '/'.
+fn cc_basename(path: *u8) -> *u8
+    var base: *u8 = path
+    var q: *u8 = path
+    while *q != 0
+        if *q == '/'
+            base = q + 1
+        q = q + 1
+    base
+
+# AGAST #3419 (LARB R45a, LANGUAGE_SPEC §15.2): a call to `fd`, declared
+# without `pub` in another file, refused at line:col as ritz0 refuses it
+# (#3418), with a note at the declaration: a basename alone is ambiguous
+# across packages.  `owner` is the impl's type for a method (`P.get`), null
+# for a free call (`helper`, the mangled `P_get`).  1 when refused.
+#
+# The caller's file is the fn being emitted's: an instance of another file's
+# generic carries that file (specialize copies def_file), so its calls are
+# that file's own.  Not checked, as in ritz0: an `extern fn` (no body) and a
+# written `fn .. = extern` (extern_decl: a symbol defined elsewhere; an
+# import's stripped bodies are checked), monomorph instances (is_pub,
+# set by specialize), a generated `E.from`, and a fn whose file isn't known.
+fn cc_private(s: *EmitterState, line: i32, col: i32, owner: *ImplBlock, name: *u8, len: i32, fd: *FnDef) -> i32
+    if fd == null or fd.is_pub == 1 or fd.body == null or fd.extern_decl == 1
+        return 0
+    if fd.from_generated == 1 or fd.def_file == null
+        return 0
+    let caller: *FnDef = emitter_current_fn()
+    var here: *u8 = null
+    if caller != null
+        here = caller.def_file
+    if here == null
+        here = emitter_source_file()
+    if here == null or streq(here, fd.def_file) == 1
+        return 0
+    if cc_report(s, line, col) == 1
+        for round in 0..2
+            if round == 1
+                eprints_cstr(fd.def_file)
+                eprint_char(':')
+                eprint_int(fd.line as i64)
+                eprint_char(':')
+                eprint_int(fd.col as i64)
+                eprints_cstr(c": note: ")
+            eprint_char('`')
+            if owner != null
+                eprint_bytes(owner.type_name, owner.type_name_len)
+                eprint_char('.')
+            eprint_bytes(name, len)
+            if round == 0
+                eprints_cstr(c"` is private to ")
+                eprints_cstr(cc_basename(fd.def_file))
+                eprints_cstr(c"; mark it `pub` (#3413)\n")
+            else
+                eprints_cstr(c"` is declared here\n")
+    1
+
 # A call to `name` that no declared, imported or `extern` fn answers (the
 # caller found no FnDef), refused at the call as ritz0 says it; 1 when refused.
 # ritz1 used to declare `@name(...)` and leave it to the no-libc link, whose
@@ -127,10 +186,13 @@ pub fn call_check_known(s: *EmitterState, line: i32, col: i32, name: *u8, len: i
         eprint_char('\n')
     1
 
-# `name(args)` against `params`, reported at line:col in ritz0's words.  1 when
-# the counts differ (refused), so the caller doesn't pair the arguments up.
-pub fn call_check_arity(s: *EmitterState, line: i32, col: i32, name: *u8, len: i32, params: *Param, args: *Expr) -> i32
-    let m: i32 = cc_count_params(params)
+# `name(args)`, a free call to `fd`, reported at line:col in ritz0's words: a
+# private fn of another file (#3419), else the argument count.  1 when
+# refused, so the caller doesn't pair the arguments up.
+pub fn call_check_arity(s: *EmitterState, line: i32, col: i32, name: *u8, len: i32, fd: *FnDef, args: *Expr) -> i32
+    if cc_private(s, line, col, null, name, len, fd) == 1
+        return 1
+    let m: i32 = cc_count_params(fd.params)
     let n: i32 = cc_count_args(args)
     if m == n
         return 0
@@ -327,9 +389,16 @@ pub fn call_check_boxed(s: *EmitterState, e: *Expr, argno: i32, a: *Expr, p: *Pa
 # against `fd`, the callee emit_expr_method dispatches it to (where it calls
 # note_method_callee).  As ritz0 counts it (#3319), the call is its desugaring
 # `m(r, ..)`: with `recv` 1 the receiver is argument 1 and fills the first
-# param; a static call (`recv` 0) has none.  Arity is reported at the call.
+# param; a static call (`recv` 0) has none.  Arity is reported at the call,
+# after a private method of another file (#3419), at the method's name.
 pub fn call_check_method(s: *EmitterState, e: *Expr, fd: *FnDef, recv: i32)
     if fd == null
+        return
+    # At the method's name, as ritz0's name_span: the parser's `bracket`.
+    var at: SrcSpan = e.span
+    if e.bracket.line > 0
+        at = e.bracket
+    if cc_private(s, at.line, at.col, impl_of_method(s.module, fd), e.ident_ptr, e.ident_len, fd) == 1
         return
     let want: i32 = cc_count_params(fd.params)
     let given: i32 = cc_count_args(e.args) + recv
