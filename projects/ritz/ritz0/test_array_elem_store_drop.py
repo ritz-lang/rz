@@ -211,6 +211,85 @@ def test_store_into_call_result(tmp_path, compiler, name):
     assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
 
 
+# Reading `f()[i]`, `f` returning a `*T`, loads the element at T's stride and
+# width, as `p[i]` does (f() appends 6).  ritz1 had no arm for a
+# call base and read one byte at `f() + i`, whatever T was: `arr()[1]` over a
+# `*i32` read 0, byte 1 of the i32 1 (AGAST #3527).
+CALL_BASE_LOAD = {
+    # A `*i32`: 4-byte stride and width, and sign-extended (-3).
+    "scalar": ("""\
+var P: *i32 = null
+
+fn arr() -> *i32
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var a: [3]i32 = [1, -3, 4]
+    P = @a[0]
+    let v: i64 = arr()[1] as i64
+    D = D * 10 + (v + 5)
+""", "f()", 62),
+    # A `*C`: the `%C` at a stride of sizeof(C), copied out whole.
+    "struct": ("""\
+struct C
+    x: i32
+    y: i64
+
+var P: *C = null
+
+fn arr() -> *C
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var a: [2]C = [C { x: 1, y: 2 }, C { x: 3, y: 4 }]
+    P = @a[0]
+    let c: C = arr()[1]
+    D = (D * 10 + c.x as i64) * 10 + c.y
+""", "f()", 634),
+    # A `**i32`: the element read is a pointer.
+    "pointer": ("""\
+var Q: **i32 = null
+
+fn arr() -> **i32
+    D = D * 10 + 6
+    return Q
+
+fn f()
+    var x: i32 = 1
+    var y: i32 = 3
+    var ps: [2]*i32 = [@x, @y]
+    Q = @ps[0]
+    let p: *i32 = arr()[1]
+    D = D * 10 + *p as i64
+""", "f()", 63),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(CALL_BASE_LOAD))
+def test_load_from_call_result(tmp_path, compiler, name):
+    body, call, want = CALL_BASE_LOAD[name]
+    rc = _run(compiler, tmp_path, f"call_load_{name}", _source(body, call, want))
+    assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_struct_load_from_call_result_is_a_copy_only(tmp_path, compiler):
+    """A `*C` call's `%C` element where a number goes is refused at the
+    element, as `p[i]` is (each compiler in its own words)."""
+    body = ("struct C\n    x: i64\n\nvar P: *C = null\n\nfn arr() -> *C\n    return P\n\n"
+            "fn f()\n    let n: i64 = arr()[0] + 1\n")
+    comp, ll, _ = _compile(compiler, tmp_path, "call_load_struct_int", _source(body, "f()", 0))
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted a struct where an i64 goes:\n{out[-1000:]}"
+    assert not ll.exists()
+    assert "Traceback" not in out, out[-2000:]
+    where = f"main.ritz:{PRELUDE.count(chr(10)) + 10}:18:"
+    assert where in out, f"{compiler}: wanted the error at {where}:\n{out[-2000:]}"
+
+
 # §3.3: a Drop array local needs an initialiser; the error is at the name.
 UNINIT = {
     "rank1": "    var a: [2]S\n",
