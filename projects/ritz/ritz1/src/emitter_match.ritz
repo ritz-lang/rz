@@ -100,6 +100,12 @@ struct MatchResult
     # AGAST #3276: the whole `[N]T` each arm stores its value into, or null
     # (the arms meet in a phi).  See emit_match_into.
     into: *ArrayInto
+    # AGAST #3696: the `alloca %T` register every arm of a large struct %T
+    # (at the sret threshold) stores its value into, or 0.  The merge loads
+    # it instead of a `phi %T`.  slot_misses counts value arms recorded
+    # before the slot existed; any forces the phi back (match_merge_slot).
+    slot: i32
+    slot_misses: i32
 
 # AGAST #3276: where a `match` of whole arrays stores each arm's array: the
 # `[N x T]` at `ptr`, held to N (`size`) and T (`et`; a struct's `name`).
@@ -548,6 +554,8 @@ fn match_result_init(r: *MatchResult, n_arms: i32)
     r.void_col = 0
     r.ptr_ty = 0
     r.into = null
+    r.slot = 0
+    r.slot_misses = 0
 
 # AGAST #2046: take the caller's "value discarded" flag (match_no_value) and
 # clear it so no nested match / if sees it.  Returns 1 if the value is wanted.
@@ -631,6 +639,62 @@ fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, resu
         return body_reg
     emit_ir_error(s, c"match arm yields a non-numeric value where the other arms yield a float")
     body_reg
+
+# AGAST #3696: an arm of a large struct %T writes its value into the
+# match's slot, in its own block, while its value is fresh: before its
+# bindings drop (a drop is a call, which would hide the value's load from
+# rewrite_large_struct_copies) and before its `br`.
+#
+# A `phi %T` over the arms, stored to the destination, is a first-class %T
+# the #1732 rewrite can't see (it is not a load), and it is what sends clang
+# -O2's InstCombine superlinear (#3692).  Through the slot, each arm's
+# `store %T (load %T, src), slot` and the merge's consumer `store %T (load
+# %T, slot), dst` are copies rewrite_large_struct_copies turns into
+# @__ritz_sret_copy.  The slot's alloca is emitted here, in the first such
+# arm, and hoisted to the entry block (hoist_entry_allocas), so it
+# dominates the merge.  An arm that leaves (`return`) stores nothing: it
+# never reaches the merge.  A `pass` arm, whose phi incoming was the zero of
+# %T, stores that zero once the slot exists; before it, it is a miss.
+fn match_arm_into_slot(s: *EmitterState, arm: *MatchArm, result: *MatchResult, body_reg: i32)
+    if result.into != null
+        return
+    if body_reg == MATCH_ZERO_VALUE and if_arm_diverges(arm) == 1
+        return
+    if result.agg_name == null or struct_ret_uses_sret(s, TYPE_STRUCT, result.agg_name, result.agg_name_len) == 0
+        result.slot_misses = result.slot_misses + 1
+        return
+    if body_reg == MATCH_ZERO_VALUE and result.slot == 0
+        result.slot_misses = result.slot_misses + 1
+        return
+    if result.slot == 0
+        result.slot = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, result.slot)
+        emit_str(s, c" = alloca ")
+        emit_match_phi_type(s, result)
+        emit_str(s, c"\n")
+    emit_str(s, c"  store ")
+    emit_match_phi_type(s, result)
+    emit_str(s, c" ")
+    emit_match_phi_value(s, result, body_reg)
+    emit_str(s, c", ptr ")
+    emit_reg(s, result.slot)
+    emit_str(s, c"\n")
+
+# AGAST #3696: at the merge, the arms' value read back from their slot (see
+# match_arm_into_slot), or 0 when they meet in a phi instead.
+fn match_merge_slot(s: *EmitterState, result: *MatchResult) -> i32
+    if result.slot == 0 or result.slot_misses > 0
+        return 0
+    let reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, reg)
+    emit_str(s, c" = load ")
+    emit_match_phi_type(s, result)
+    emit_str(s, c", ptr ")
+    emit_reg(s, result.slot)
+    emit_str(s, c"\n")
+    reg
 
 # AGAST #1946: the merge phi's type: the arms' struct, their float, or i64.
 fn emit_match_phi_type(s: *EmitterState, result: *MatchResult)
@@ -918,6 +982,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # AGAST #1946: a float-valued scalar arm types the phi as float.
         if result.agg_name == null and result.ptr_ty == 0
             body_reg = match_arm_float_settle(s, arm.body, body_reg, result)
+    match_arm_into_slot(s, arm, result, body_reg)   # AGAST #3696
 
     # AGAST #2158: drop the arm's bindings once its value is computed.
     own_pop_scope(s)
@@ -2378,6 +2443,10 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         own_match_end(s, own_old)
         return no_arm_reg
 
+    let slot_reg: i32 = match_merge_slot(s, @result)   # AGAST #3696
+    if slot_reg != 0
+        own_match_end(s, own_old)
+        return slot_reg
     let phi_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, phi_reg)
@@ -2497,6 +2566,10 @@ pub fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
     # Publish the phi type for an untyped `let v = if ...` (#1666's path);
     # set after both arms so a nested if/match inside an arm can't clobber it.
     publish_match_type(s, @result)
+
+    let slot_reg: i32 = match_merge_slot(s, @result)   # AGAST #3696
+    if slot_reg != 0
+        return slot_reg
 
     let phi_reg: i32 = next_reg(s)
     emit_str(s, c"  ")

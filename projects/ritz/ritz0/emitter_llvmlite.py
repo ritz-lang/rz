@@ -5153,14 +5153,68 @@ class LLVMEmitter:
         return ir.IRBuilder.call(builder, self._large_copy_helper(), [
             builder.bitcast(dst, i8p), builder.bitcast(src, i8p), size])
 
-    def _retarget_sret_result(self, value, dest) -> bool:
+    def _merge_large_struct_arms(self, incoming: list) -> Optional[ir.Value]:
+        """AGAST #3696: merge an if/match's large-struct arms through a slot.
+
+        `incoming` is (value, exit_block) per arm; every exit block already
+        branches to the merge block, where the builder sits (empty).  A
+        `phi %T` of a struct at the sret threshold is a first-class value
+        the #1732 copy rewrite cannot see (it is not a load), and it sends
+        clang -O2's InstCombine superlinear.  Instead each arm writes one
+        entry slot (an sret call directly, a load by @__ritz_sret_copy) and
+        the merge yields `load %T, slot`, which a consumer's store copies
+        pointer-to-pointer.  Returns None, emitting nothing, for any other
+        merge.
+        """
+        ty = incoming[0][0].type
+        if (self._sret_struct_type(ty) is None
+                or any(v.type != ty for v, _ in incoming)):
+            return None
+        b = self.builder
+        merge_block = b.block
+        slot = b._entry_alloca(ty, "merge.slot")
+        for val, block in incoming:
+            b.position_before(block.terminator)
+            self._copy_arm_into_slot(val, block, slot)
+        b.position_at_end(merge_block)
+        return b.load(slot, name="merge.val")
+
+    def _copy_arm_into_slot(self, val, block, slot) -> None:
+        """Write one arm's large-struct `val` into `slot`, before `block`'s
+        branch to the merge (the builder is there).  Never a first-class
+        `store %T` of a load or an sret call result."""
+        b = self.builder
+        if self._retarget_sret_result(val, slot, before_terminator=True):
+            return
+        if b._is_large_load(val):
+            insts = block.instructions
+            if val.parent is block:
+                idx = next(i for i in range(len(insts) - 1, -1, -1) if insts[i] is val)
+                if all(_cannot_write_memory(i) for i in insts[idx + 1:-1]):
+                    # Nothing since the load wrote memory: copy its source.
+                    self._emit_large_copy(b, slot, val.operands[0], val.type)
+                    return
+            # The source may have been written since the load (or the load
+            # sits before the if/match, where every arm's copy would run):
+            # snapshot it AT the load into its own slot, then copy here.
+            tmp = b._snapshot_large_load(val, "merge.tmp")
+            # Its entry alloca leaves the builder at the block's end, past
+            # the `br`: copy before the branch again.
+            b.position_before(block.terminator)
+            self._emit_large_copy(b, slot, tmp, val.type)
+            return
+        b.store(val, slot)   # e.g. a struct literal, still first-class (#1741)
+
+    def _retarget_sret_result(self, value, dest, before_terminator=False) -> bool:
         """Make the sret call that produced `value` write into `dest`.
 
         `value` must be the `load %T, slot` an sret call just produced, and
         still the last instruction of the current block, so that nothing can
         have used it yet. Then the call is pointed at `dest`, and the load and
         the now-unused slot are deleted. No first-class %T is left behind.
-        Returns False, changing nothing, otherwise.
+        Returns False, changing nothing, otherwise.  `before_terminator`
+        also accepts the load followed only by its block's terminator (an
+        if/match arm that has already branched to the merge, #3696).
 
         The caller vouches that `dest` is fresh storage the call's arguments
         cannot alias: a new `var`'s alloca, or this function's own sret slot.
@@ -5170,7 +5224,9 @@ class LLVMEmitter:
             return False
         load, call, slot = entry
         block = load.parent
-        if dest.type != slot.type or not block.instructions or block.instructions[-1] is not load:
+        insts = block.instructions
+        tail = insts[-2:] if before_terminator and block.is_terminated else insts[-1:]
+        if dest.type != slot.type or not tail or tail[0] is not load:
             return False
         block.instructions.remove(load)
         call.replace_usage(slot, dest)
@@ -7981,6 +8037,10 @@ class LLVMEmitter:
 
         # Create phi node if both branches have values
         if then_value is not None and else_value is not None:
+            merged = self._merge_large_struct_arms(
+                [(then_value, then_exit_block), (else_value, else_exit_block)])
+            if merged is not None:
+                return merged
             phi = self.builder.phi(then_value.type)  # Types should match now after conversion
             phi.add_incoming(then_value, then_exit_block)
             phi.add_incoming(else_value, else_exit_block)
@@ -15755,6 +15815,9 @@ class LLVMEmitter:
         first_type = incoming[0][0].type
         for val, _ in incoming[1:]:
             self._check_bool_slot(val, first_type, None)
+        merged = self._merge_large_struct_arms(incoming)
+        if merged is not None:
+            return merged
         if all(v.type == first_type for v, _ in incoming):
             phi = self.builder.phi(first_type)
             for val, block in incoming:

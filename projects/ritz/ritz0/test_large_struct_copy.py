@@ -571,3 +571,181 @@ def test_ritz1_copy_scanner_stops_at_writes(tmp_path):
     assert rc == 0, (
         f"scanner case failed: {names[rc - 1] if 0 < rc <= len(names) else rc}"
     )
+
+
+# --- AGAST #3696: an if / match that yields a large struct -------------------
+#
+# Both compilers merged the arms through `phi %Big` and stored the phi:
+#
+#     %.14 = phi %Big [ %.10, %L0 ], [ %.13, %L1 ]
+#     store %Big %.14, ptr %r.addr
+#
+# A phi is not a load, so the copy rewrite above never fired, and the
+# first-class %Big is what sends clang -O2 superlinear.  Now each arm copies
+# into a result slot (or an sret call writes it directly) and the merge reads
+# the slot, so no `phi %Big` and no `store %Big %` remain.
+
+MERGE_FNS = """
+enum Pick
+    A
+    B
+    C
+
+pub fn if_let(b: bool, p: *Big, q: *Big) -> i32
+    let r: Big = if b then *p else *q
+    return sink(@r)
+
+pub fn match_var(t: Pick, p: *Big, q: *Big) -> i32
+    var c: Big = match t
+        A => *p
+        B => *q
+        C => big_new()
+    return sink(@c)
+
+pub fn if_call(b: bool, p: *Big) -> i32
+    var r: Big = if b then big_new() else *p
+    return sink(@r)
+
+pub fn nested(a: bool, b: bool, p: *Big, q: *Big) -> i32
+    var r: Big = if a then *p else if b then *q else big_new()
+    return sink(@r)
+
+pub fn assign(b: bool, p: *Big, q: *Big) -> i32
+    var r: Big = *p
+    r = if b then *q else *p
+    return sink(@r)
+
+pub fn store_deref(b: bool, p: *Big, q: *Big, d: *Big) -> i32
+    *d = if b then *p else *q
+    return 0
+
+pub fn ret(b: bool, p: *Big, q: *Big) -> Big
+    return if b then *p else *q
+"""
+
+MERGE_HUGE = HUGE + MERGE_FNS
+
+# `phi %Big` (ritz1) / `phi  %"struct.m.Big"` (ritz0), and `store %Big %v`.
+FIRST_CLASS_MERGE = re.compile(r'(=\s*phi\s+%"?[\w.]*Big"?\s|^\s*store %"?[\w.]*Big"? %)')
+
+
+def _first_class_merges(ll) -> list:
+    return [ln.strip() for ln in ll.read_text().splitlines() if FIRST_CLASS_MERGE.search(ln)]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_large_struct_if_match_merges_through_a_slot(ritz1_bin, tmp_path, compiler):
+    """No `phi %Big` / `store %Big %`, and clang -O2 on the 22 KB Big is bounded."""
+    ll = _ll(compiler, tmp_path, "merge", MERGE_HUGE)
+    bad = _first_class_merges(ll)
+    assert not bad, f"first-class large-struct merges survive: {bad}"
+    assert COPY_CALL.search(ll.read_text()), "no copy helper call was emitted"
+    _assert_no_libc_mem(_o2_object(ll))
+
+
+MERGE_RUN_DECLS = """\
+enum Pick
+    A
+    B
+    C
+
+var CLOBBER: *Big = null
+
+struct Guard
+    id: i32
+
+impl Drop for Guard
+    fn drop(self: @&Guard)
+        CLOBBER.count = 9
+
+"""
+
+MERGE_RUN = (
+    MID.replace("struct Outer", MERGE_RUN_DECLS + "struct Outer")
+    + """
+fn pick_if(b: bool, p: *Big, q: *Big) -> i32
+    let r: Big = if b then *p else *q
+    return total(@r)
+
+fn pick_match(t: Pick, p: *Big, q: *Big) -> i32
+    var c: Big = match t
+        A => *p
+        B => *q
+        C => big_make(30)
+    return total(@c)
+
+fn pick_nested(a: bool, b: bool, p: *Big, q: *Big) -> i32
+    var r: Big = if a then *p else if b then big_make(40) else *q
+    return total(@r)
+
+fn pick_ret(b: bool, p: *Big, q: *Big) -> Big
+    return if b then *p else *q
+
+# The arm's value is `*p` as loaded, before `g`'s drop writes p.count: the
+# drop runs between the load and the arm's branch to the merge.
+fn pick_drop(b: bool, p: *Big, q: *Big) -> i32
+    CLOBBER = p
+    let r: Big = if b
+        var g: Guard = Guard { id: 1 }
+        *p
+    else
+        *q
+    return total(@r)
+
+pub fn main() -> i32
+    var x: Big = big_make(1)
+    var y: Big = big_make(2)
+    let tx: i32 = total(@x)
+    let ty: i32 = total(@y)
+    if pick_if(true, @x, @y) != tx
+        return 1
+    if pick_if(false, @x, @y) != ty
+        return 2
+    if pick_match(Pick.A, @x, @y) != tx
+        return 3
+    if pick_match(Pick.B, @x, @y) != ty
+        return 4
+    if pick_match(Pick.C, @x, @y) != 30 + 31 + 60
+        return 5
+    if pick_nested(true, false, @x, @y) != tx
+        return 6
+    if pick_nested(false, true, @x, @y) != 40 + 41 + 80
+        return 7
+    if pick_nested(false, false, @x, @y) != ty
+        return 8
+    var r: Big = pick_ret(false, @x, @y)
+    if total(@r) != ty
+        return 9
+    # The slot is reused on every pass: each merged value is its own copy.
+    var i: i32 = 0
+    var sum: i32 = 0
+    while i < 4
+        var z: Big = if i % 2 == 0 then x else y
+        z.count = z.count + i
+        sum = sum + total(@z)
+        i = i + 1
+    if sum != 2 * tx + 2 * ty + 0 + 1 + 2 + 3
+        return 10
+    if x.count != 1 or y.count != 2
+        return 11
+    var w: Big = big_make(1)
+    if pick_drop(true, @w, @y) != tx
+        return 12
+    if w.count != 9
+        return 13
+    return 42
+"""
+)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_large_struct_if_match_picks_the_right_arm_at_O2(ritz1_bin, tmp_path, compiler):
+    ll = _ll(compiler, tmp_path, "merge_run", MERGE_RUN)
+    bad = _first_class_merges(ll)
+    assert not bad, f"the merge did not go through a slot: {bad}"
+    obj = _o2_object(ll)
+    _assert_no_libc_mem(obj)
+    exe = tmp_path / f"merge_run_{compiler}"
+    assert _link_run([obj], exe, with_start=(compiler == "ritz1")) == 42
