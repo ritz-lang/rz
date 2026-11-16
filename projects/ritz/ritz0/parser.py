@@ -1440,11 +1440,13 @@ class Parser:
             if cond then a else b             # ternary style (single line)
         """
         span = self._current().span
+        if_pos = self.pos
         self._expect(TokenType.IF)
         cond = self.parse_expr()
 
         # Check for ternary style: if cond then a else b
         if self._at(TokenType.THEN):
+            self._refuse_condition_break_in_brackets(span, if_pos)
             self._advance()
             then_expr = self.parse_expr()
             self._expect(TokenType.ELSE)
@@ -1475,6 +1477,37 @@ class Parser:
         bracket = self._in_brackets.get((keyword.line, keyword.column))
         if bracket is not None:
             raise ParseError(block_in_brackets_message(bracket), keyword)
+
+    # The tokens a line may end in and still go on (R46a's "after an
+    # operator"): the binary operators but ranges, and `as`; ritz1's
+    # lexer_is_infix.
+    _CONDITION_GOES_ON = frozenset(PRECEDENCE) - {TokenType.DOTDOT, TokenType.DOTDOTEQ}
+
+    def _refuse_condition_break_in_brackets(self, keyword: Span, if_pos: int) -> None:
+        """LARB R46a: inside brackets, an `if` whose line ends before its
+        `then` would open a block, unless the line ended in an operator.
+
+        The lexer drops line breaks inside brackets (spec §2.2, AGAST
+        #3426), so they are found from the spans of the tokens from the `if`
+        (at `if_pos`) to its `then` (current): a line change between two
+        tokens at the `if`'s own bracket depth, after a token that is not an
+        operator.  A break inside a bracket of the condition is fine.  ritz1
+        refuses the same in its lexer (#3388).
+        """
+        bracket = self._in_brackets.get((keyword.line, keyword.column))
+        if bracket is None:
+            return
+        depth = 0
+        prev = self.tokens[if_pos]
+        for tok in self.tokens[if_pos + 1:self.pos + 1]:
+            if (depth == 0 and tok.span.line != prev.span.line
+                    and prev.type not in self._CONDITION_GOES_ON):
+                raise ParseError(block_in_brackets_message(bracket), keyword)
+            if tok.type in _OPENERS:
+                depth += 1
+            elif tok.type in _CLOSERS:
+                depth -= 1
+            prev = tok
 
     def parse_match(self) -> rast.Match:
         """Parse a match expression."""

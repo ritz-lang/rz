@@ -69,8 +69,13 @@ class Lexer:
         # the mode and is laid out as usual, DEDENTing the body.
         self.asm_state = None       # None, 'header' or 'raw'
         self.asm_base = 0           # the `asm` line's indentation
-        self.asm_parens = 0         # open parentheses in the header
         self.asm_body = False       # the body's INDENT has been pushed
+        # Open ( [ { (spec §2.2, AGAST #3426).  Inside them a line break and
+        # the next line's indentation are whitespace: no NEWLINE, INDENT or
+        # DEDENT (ritz1's lexer_nfa bracket_depth).  `[[` opens two, as the
+        # parser closes it with two `]`.  This also lets an asm header's
+        # clause list span lines (#3396).
+        self.bracket_depth = 0
 
     def _span(self, length: int = 1) -> Span:
         """Create a span at the current position."""
@@ -704,13 +709,15 @@ class Lexer:
         if tok.type == TokenType.ASM:
             self.asm_state = 'header'
             self.asm_base = self.line_indent
-            self.asm_parens = 0
             self.asm_body = False
-        elif self.asm_state == 'header':
-            if tok.type == TokenType.LPAREN:
-                self.asm_parens += 1
-            elif tok.type == TokenType.RPAREN:
-                self.asm_parens -= 1
+        tt = tok.type
+        if tt in (TokenType.LPAREN, TokenType.LBRACKET, TokenType.LBRACE):
+            self.bracket_depth += 1
+        elif tt == TokenType.LBRACKET2:
+            self.bracket_depth += 2
+        elif tt in (TokenType.RPAREN, TokenType.RBRACKET, TokenType.RBRACE):
+            # A close with nothing open is the parser's to report.
+            self.bracket_depth = max(0, self.bracket_depth - 1)
         return tok
 
     def _next_token(self) -> Token:
@@ -752,9 +759,10 @@ class Lexer:
         # Skip horizontal whitespace and comments
         self._skip_whitespace_and_comments()
 
-        # A newline inside an asm header's parentheses is a space: the
-        # clause list may span lines (AGAST #3396).
-        while self._peek() == '\n' and self.asm_state == 'header' and self.asm_parens > 0:
+        # Inside ( [ { a line break and the next line's indentation are
+        # whitespace (spec §2.2, AGAST #3426); so is a blank or comment-only
+        # line.
+        while self._peek() == '\n' and self.bracket_depth > 0:
             self._advance()
             self._skip_whitespace_and_comments()
 

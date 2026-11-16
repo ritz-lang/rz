@@ -70,7 +70,11 @@ fn main() -> i32
     let p: P = P { x: if c == 0 then 0 else 1 }
     let d: i32 = take(if take(
     c) == 1 then 0 else 9)
-    a + b + p.x + d
+    let e: i32 = take(if take(
+            c) == 1 then 0 else 9)
+    let f: i32 = (c
+        - 1)
+    a + b + p.x + d + e + f
 """
 
 
