@@ -640,6 +640,68 @@ fn test_recovery_torn_tail_keeps_committed_prefix() -> i32
     return rc
 
 # ============================================================================
+# Transaction Table Capacity (AGAST #3683)
+# ============================================================================
+
+# Usable bytes behind a ritzlib malloc pointer, read from the allocator's
+# 16-byte block header: a negative value is a large (mmap) block of -value
+# bytes; 0..7 is a size-class bin of 32 << class bytes plus 16.
+fn malloc_usable_bytes(p: *u8) -> i64
+    let hdr: *i64 = (p as i64 - 16) as *i64
+    let v: i64 = *hdr
+    if v < 0
+        return (0 - v) - 16
+    return (16 << v) as i64
+
+# The table was malloc(MAX_ACTIVE_TXNS * 24) for a 32-byte TxnEntry, so it
+# held 192 entries while upsert_txn admits 256. Entries 193..256 wrote past
+# the allocation: the page rounding hid 193..255, and entry 256 spilled 16
+# bytes off the mapping, which did not fault when the next page was mapped.
+# Recovery alone stays green on the bug, so check the capacity directly, then
+# recover a WAL of 256 committed transactions and read the last entry.
+[[test]]
+fn test_recovery_txn_table_holds_max_active_txns() -> i32
+    let base_path: *u8 = make_test_path(c"max_txns")
+    let pool_opt = buffer_pool_new(16)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 99
+    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+    let writer: *WalWriter = wal_writer_new(base_path)
+    wal_writer_open(writer)
+    var i: i64 = 0
+    while i < MAX_ACTIVE_TXNS
+        let txn_id: i64 = i + 1
+        var lsn: i64 = wal_write_begin(writer, txn_id)
+        lsn = wal_write_commit(writer, txn_id, lsn)
+        i += 1
+    wal_writer_destroy(writer)
+
+    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var rc: i32 = 0
+    if mgr == null
+        rc = 1
+    else if malloc_usable_bytes(mgr.txn_table as *u8) < MAX_ACTIVE_TXNS * sizeof(TxnEntry)
+        rc = 2
+    else if recovery_recover(mgr) != ERR_OK
+        rc = 3
+    else if recovery_stats(mgr).txns_committed != MAX_ACTIVE_TXNS
+        rc = 4
+    else if mgr.txn_count != MAX_ACTIVE_TXNS
+        rc = 5
+    else
+        let last: *TxnEntry = mgr.txn_table + (MAX_ACTIVE_TXNS - 1)
+        if last.txn_id != MAX_ACTIVE_TXNS or last.state != TXN_STATE_COMMITTED
+            rc = 6
+
+    if mgr != null
+        recovery_mgr_destroy(mgr)
+    buffer_pool_destroy(pool)
+    cleanup_test_files(base_path)
+    free(base_path)
+    return rc
+
+# ============================================================================
 # Error Handling Tests
 # ============================================================================
 
