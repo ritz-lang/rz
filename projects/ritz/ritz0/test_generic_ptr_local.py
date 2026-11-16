@@ -198,7 +198,48 @@ fn main() -> i32
     return *arr[0] * 10 + *arr[1]
 """
 
+
+# AGAST #3663: a `*[3]T` local's element is the argument type.  It stayed a
+# struct `T`, so `p[1]` was refused as "a whole struct element".
+def _ptr_array(kw, t, ret):
+    return (
+        f"fn second<T>(x: *[3]T) -> T\n    {kw} p: *[3]T = x\n    return p[1]\n\n"
+        f"fn main() -> i32\n    var arr: [3]{t}\n" + ret
+    )
+
+
+PA_SCALAR = "    arr[0] = 1\n    arr[1] = 10\n    arr[2] = 20\n"
+PA_U8 = PA_SCALAR + "    return second<u8>(@arr) as i32\n"
+PA_I64 = PA_SCALAR + "    return second<i64>(@arr) as i32\n"
+PA_LB = (
+    "    arr[0].start = 1\n    arr[1].start = 10\n    arr[2].start = 20\n"
+    "    let v: LB = second<LB>(@arr)\n    return v.start as i32\n"
+)
+
+# `*[3]*T`'s element points at T (#2378): `*p[1]` loads a T, not a `%T`.
+PA_PTR = """\
+fn second<T>(x: *[3]*T) -> T
+    let p: *[3]*T = x
+    return *p[1]
+
+fn main() -> i32
+    var a: u8 = 1
+    var b: u8 = 10
+    var arr: [3]*u8
+    arr[0] = @a
+    arr[1] = @b
+    arr[2] = @a
+    return second<u8>(@arr) as i32
+"""
+
 ROWS = {
+    "ptr_array_ptr_u8": (PA_PTR, 10),
+    "ptr_array_let_u8": (_ptr_array("let", "u8", PA_U8), 10),
+    "ptr_array_var_u8": (_ptr_array("var", "u8", PA_U8), 10),
+    "ptr_array_let_i64": (_ptr_array("let", "i64", PA_I64), 10),
+    "ptr_array_var_i64": (_ptr_array("var", "i64", PA_I64), 10),
+    "ptr_array_let_struct": (LB + _ptr_array("let", "LB", PA_LB), 10),
+    "ptr_array_var_struct": (LB + _ptr_array("var", "LB", PA_LB), 10),
     "ptr_arg_ptr_i32": (S + _ptr_arg("*T", "*i32", N_I32, "*q"), 9),
     "ptr_arg_ptr_struct": (S + _ptr_arg("*T", "*S", N_S, "q.b"), 9),
     "ptr_arg_ptr_ptr_u8": (_ptr_arg("*T", "**u8", N_PU8, "**q as i32"), 9),
