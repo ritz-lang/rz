@@ -15,7 +15,7 @@ sret pointer the caller never passed.  ritz1 was already correct.
 THE FIX (the return-side twin of #1739's byval params)
 
 ritz0 lowers `fn(..) -> Big` to `void (%Big*, ..)*`, the physical signature
-of every fn it can point at (named fns and closures alike), and an indirect
+of every fn it can point at, and an indirect
 call through it allocates the result slot and passes it `sret(%Big)`.
 """
 
@@ -118,24 +118,6 @@ pub fn main() -> i32
 """
 )
 
-CLOSURE_RET = (
-    MID
-    + """
-pub fn main() -> i32
-    let k: fn(i32) -> Big = |n| big_make(n + 1)
-    var x: Big = k(4)
-    if total(@x) != 5 + 6 + 10
-        return 1
-    # a capturing closure goes through a per-instance thunk
-    let base: i32 = 2
-    let k2: fn(i32) -> Big = |n| big_make(n + base)
-    var y: Big = k2(1)
-    if total(@y) != 3 + 4 + 6
-        return 2
-    return 42
-"""
-)
-
 # A fn-pointer type with a first-class %Big return: the miscompile's shape.
 FIRST_CLASS_RET = rf"{BIG_T} \([^)]*\)\*"
 
@@ -175,23 +157,6 @@ def test_sret_fn_pointer_runs_at_O2(ritz1_bin, tmp_path, compiler):
     _assert_no_libc_mem(obj)
     exe = tmp_path / f"fnptr_ret_{compiler}"
     assert _link_run([obj], exe, with_start=(compiler == "ritz1")) == 42
-
-
-@pytest.mark.integration
-def test_sret_closure_pointer_runs_at_O2(tmp_path):
-    """A closure behind `fn(i32) -> Big` must have the sret signature too."""
-    ll = _ll("ritz0", tmp_path, "closure_ret", CLOSURE_RET)
-    text = ll.read_text()
-    assert not re.search(FIRST_CLASS_RET, text), (
-        "closure fn-pointer returns %Big first-class"
-    )
-    hdr = [
-        ln for ln in text.splitlines() if ln.startswith("define") and "__closure_" in ln
-    ]
-    assert hdr and "sret" in hdr[0], f"closure is not sret:\n{hdr}"
-    obj = _o2_object(ll)
-    _assert_no_libc_mem(obj)
-    assert _link_run([obj], tmp_path / "closure_ret", with_start=False) == 42
 
 
 @pytest.mark.integration

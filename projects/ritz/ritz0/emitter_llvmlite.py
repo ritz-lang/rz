@@ -739,14 +739,7 @@ class LLVMEmitter:
         self.ritz_types: Dict[str, rast.Type] = {}  # name -> Ritz AST type (for signedness)
 
         self.string_counter = 0
-        self.closure_counter = 0  # Counter for anonymous closure names
-        self.closure_expected_type: Optional[rast.FnType] = None  # Expected type for closure inference
         self.simd_expected_type: Optional[rast.Type] = None  # Expected SIMD type for loadu inference
-        # Closure environment tracking for captures
-        self._closure_env_types: Dict[str, ir.Type] = {}  # env struct types
-        self._closure_env_arrays: Dict[str, ir.GlobalVariable] = {}  # env slot arrays
-        self._closure_env_counters: Dict[str, ir.GlobalVariable] = {}  # slot counters
-        self._closure_thunk_arrays: Dict[str, ir.GlobalVariable] = {}  # thunk fn ptr arrays
         self.has_returned = False
         self.main_fn_def: Optional[rast.FnDef] = None
         self.in_test_fn = False  # True when emitting a [[test]] function
@@ -5360,7 +5353,6 @@ class LLVMEmitter:
         self._loop_temp_depth.clear()
         self._temp_frames.clear()
         self.simd_expected_type = None  # Clear SIMD type context from previous function
-        self.closure_expected_type = None  # Clear closure type context from previous function
         self.expected_ritz_type = None  # Expected Ritz type of the value being emitted
         self._literal_ctx_nodes = set()  # AGAST #1396: BinOps consumed at that type
 
@@ -5472,9 +5464,6 @@ class LLVMEmitter:
 
                 # Set debug location for trailing expression
                 self._set_debug_loc(fn_def.body.expr)
-                # Set expected type for closure inference if return type is a function type
-                if isinstance(fn_def.ret_type, rast.FnType):
-                    self.closure_expected_type = fn_def.ret_type
                 # If the trailing expression is a bare enum variant constructor
                 # (e.g. `Ok(data)`), resolve which monomorphized enum the
                 # function's return type refers to, so we use the right
@@ -5497,7 +5486,6 @@ class LLVMEmitter:
                         lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
                 self._reject_missing_tail_value(
                     fn_def, lambda e: id(e) in self._procedure_calls)
-                self.closure_expected_type = None  # Clear context
                 # AGAST #3205: every arm of the tail left by `return` (`0 =>
                 # return A.V(7)`), so we sit in its dead merge block and the
                 # tail's value is the match's dummy `i32 0`.  Converting that
@@ -6032,8 +6020,7 @@ class LLVMEmitter:
         An operator needs its operands, a call its callee and arguments, an
         index its base and subscript, and so on — whatever statement `expr`
         sits in. Deliberately absent: `Block` (its statements run for effect
-        and are checked one by one when emitted), `Lambda`/`Closure` (their
-        body is a separate function), and the result paths of `If`/`Match`,
+        and are checked one by one when emitted) and the result paths of `If`/`Match`,
         which `_find_valueless_if` handles itself because whether THOSE are
         consumed depends on the context.
         """
@@ -6084,7 +6071,7 @@ class LLVMEmitter:
         Operands (`_operands`) are always walked with `consumed=True`: their
         value is used whatever the context (AGAST #1435).
 
-        Never walked: a block's statements and lambda/closure bodies. This
+        Never walked: a block's statements. This
         is a syntactic walk called from statement level; it is NOT a check
         inside `_emit_expr`, which is what v4 of #1406 did and why it broke
         angelo. Returning the innermost offender lets the diagnostic point at
@@ -6290,9 +6277,6 @@ class LLVMEmitter:
                         # This is a local variable being returned - treat as move
                         exclude_var = var_name
 
-                # Set expected type for closure inference if return type is a function type
-                if self.current_fn_def and isinstance(self.current_fn_def.ret_type, rast.FnType):
-                    self.closure_expected_type = self.current_fn_def.ret_type
                 # Expected Ritz type, used to resolve associated calls whose
                 # type argument is only implied (`return Span.empty()`).
                 if self.current_fn_def:
@@ -6302,7 +6286,6 @@ class LLVMEmitter:
                 if self._emit_large_lit_into(
                         stmt.value, self._sret_dest(self.current_fn, ret_type)):
                     # AGAST #1741: the literal was built in the sret slot.
-                    self.closure_expected_type = None
                     self.expected_ritz_type = None
                     self._emit_drop_for_all_scopes(exclude_var)
                     self.builder.ret_void()
@@ -6310,7 +6293,6 @@ class LLVMEmitter:
                     return True
                 else:
                     val = self._emit_return_operand(stmt.value)
-                self.closure_expected_type = None  # Clear context
                 self.expected_ritz_type = None
                 ret_ritz = self.current_fn_def.ret_type if self.current_fn_def else None
                 ret_span = getattr(stmt.value, 'span', None) or getattr(stmt, 'span', None)
@@ -6457,9 +6439,6 @@ class LLVMEmitter:
                 and isinstance(stmt.value, rast.StringLit)):
                 self._refuse_string_literal(stmt.value)
             else:
-                # Set expected type context for closure type inference
-                if stmt.type and isinstance(stmt.type, rast.FnType):
-                    self.closure_expected_type = stmt.type
                 # Set expected type context for SIMD type inference (e.g., v8i32 vs v4i32)
                 if stmt.type and isinstance(stmt.type, rast.NamedType):
                     if stmt.type.name in ('v8i32', 'v4i64', 'v16i16', 'v32i8',
@@ -6488,7 +6467,6 @@ class LLVMEmitter:
                     val = self._emit_expr_with_expected_enum(stmt.value, let_enum)
                 finally:
                     self._leave_float_tails(saved_float)
-                self.closure_expected_type = None  # Clear context
                 self.simd_expected_type = None  # Clear SIMD context
                 self.expected_ritz_type = saved_let_expected
             if stmt.type:
@@ -8781,12 +8759,6 @@ class LLVMEmitter:
         elif isinstance(expr, rast.Await):
             return self._emit_await(expr)
 
-        elif isinstance(expr, rast.Closure):
-            return self._emit_closure(expr)
-
-        elif isinstance(expr, rast.Lambda):
-            return self._emit_lambda(expr)
-
         elif isinstance(expr, rast.HeapExpr):
             return self._emit_heap_expr(expr)
 
@@ -10567,104 +10539,6 @@ class LLVMEmitter:
         idx = self._get_struct_field_index(struct_name, field)
         return self.builder.gep(ptr, [zero, ir.Constant(self.i32, idx)])
 
-    def _find_free_variables(self, expr: rast.Expr, bound_vars: set) -> set:
-        """Find free variables in an expression (referenced but not locally bound).
-
-        Args:
-            expr: Expression to analyze
-            bound_vars: Set of variable names that are locally bound
-
-        Returns:
-            Set of free variable names
-        """
-        free_vars = set()
-
-        if isinstance(expr, rast.Ident):
-            name = expr.name
-            # Only consider it free if not bound locally and not a global/function
-            if name not in bound_vars:
-                free_vars.add(name)
-
-        elif isinstance(expr, rast.BinOp):
-            free_vars |= self._find_free_variables(expr.left, bound_vars)
-            free_vars |= self._find_free_variables(expr.right, bound_vars)
-
-        elif isinstance(expr, rast.UnaryOp):
-            free_vars |= self._find_free_variables(expr.operand, bound_vars)
-
-        elif isinstance(expr, rast.Call):
-            if isinstance(expr.func, rast.Ident):
-                # Check if this is a variable (function pointer) vs a defined function
-                # If it's not a known function, it might be a captured variable
-                func_name = expr.func.name
-                if func_name not in self.functions and func_name not in bound_vars:
-                    # Could be a captured function pointer variable
-                    free_vars.add(func_name)
-            else:
-                free_vars |= self._find_free_variables(expr.func, bound_vars)
-            for arg in expr.args:
-                free_vars |= self._find_free_variables(arg, bound_vars)
-
-        elif isinstance(expr, rast.Index):
-            free_vars |= self._find_free_variables(expr.expr, bound_vars)
-            free_vars |= self._find_free_variables(expr.index, bound_vars)
-
-        elif isinstance(expr, rast.Field):
-            free_vars |= self._find_free_variables(expr.expr, bound_vars)
-
-        elif isinstance(expr, rast.If):
-            free_vars |= self._find_free_variables(expr.cond, bound_vars)
-            for stmt in expr.then_block.stmts:
-                free_vars |= self._find_free_variables_stmt(stmt, bound_vars)
-            if expr.then_block.expr:
-                free_vars |= self._find_free_variables(expr.then_block.expr, bound_vars)
-            if expr.else_block:
-                for stmt in expr.else_block.stmts:
-                    free_vars |= self._find_free_variables_stmt(stmt, bound_vars)
-                if expr.else_block.expr:
-                    free_vars |= self._find_free_variables(expr.else_block.expr, bound_vars)
-
-        elif isinstance(expr, rast.Cast):
-            free_vars |= self._find_free_variables(expr.expr, bound_vars)
-
-        elif isinstance(expr, rast.StructLit):
-            for _, val in expr.fields:
-                free_vars |= self._find_free_variables(val, bound_vars)
-
-        elif isinstance(expr, rast.ArrayLit):
-            for elem in expr.elements:
-                free_vars |= self._find_free_variables(elem, bound_vars)
-
-        elif isinstance(expr, rast.Closure):
-            # Nested closure - add its params to bound vars
-            inner_bound = bound_vars | {p.name for p in expr.params}
-            free_vars |= self._find_free_variables(expr.body, inner_bound)
-
-        # Literals don't have free variables
-        elif isinstance(expr, (rast.IntLit, rast.FloatLit, rast.StringLit,
-                               rast.CStringLit, rast.CharLit,
-                               rast.BoolLit, rast.NullLit)):
-            pass
-
-        return free_vars
-
-    def _find_free_variables_stmt(self, stmt: rast.Stmt, bound_vars: set) -> set:
-        """Find free variables in a statement."""
-        free_vars = set()
-
-        if isinstance(stmt, rast.ExprStmt):
-            free_vars |= self._find_free_variables(stmt.expr, bound_vars)
-        elif isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
-            free_vars |= self._find_free_variables(stmt.value, bound_vars)
-        elif isinstance(stmt, rast.ReturnStmt):
-            if stmt.value:
-                free_vars |= self._find_free_variables(stmt.value, bound_vars)
-        elif isinstance(stmt, rast.AssignStmt):
-            free_vars |= self._find_free_variables(stmt.value, bound_vars)
-            free_vars |= self._find_free_variables(stmt.target, bound_vars)
-
-        return free_vars
-
     def _emit_await(self, await_expr: rast.Await) -> ir.Value:
         """Emit an await expression.
 
@@ -10943,302 +10817,6 @@ class LLVMEmitter:
             self.builder.store(val, ptr)
 
         return val
-
-    def _emit_closure(self, closure: rast.Closure) -> ir.Value:
-        """Emit a closure expression: |params| body.
-
-        Closures compile to anonymous functions. If the closure captures
-        variables from the enclosing scope, they are passed as additional
-        parameters and the closure is wrapped in a partial application struct.
-
-        For closures without captures, returns a direct function pointer.
-        For closures with captures, returns a "fat pointer" struct containing
-        the function pointer and captured values.
-
-        The closure's types are inferred from:
-        1. Explicit parameter types in the closure
-        2. The expected type from context (e.g., let x: fn(i32) -> i32 = |x| ...)
-
-        Returns a function pointer to the anonymous function.
-        """
-        # Get expected type for type inference
-        expected_type = self.closure_expected_type
-
-        if expected_type is None:
-            # A user error, so located and no traceback (AGAST #3302).
-            raise EmitError(
-                "Cannot infer closure type - must be assigned to a typed variable. "
-                "Use: let f: fn(T) -> R = |x| ...",
-                closure.span,
-            )
-
-        # Find captured variables
-        param_names = {p.name for p in closure.params}
-        free_vars = self._find_free_variables(closure.body, param_names)
-
-        # Filter to only variables that exist in the enclosing scope
-        # (not globals, functions, or unknown names)
-        captures = []
-        capture_values = []
-        capture_llvm_types = []
-        capture_ritz_types = []
-
-        for name in sorted(free_vars):  # Sort for deterministic ordering
-            # Check if it's a local or parameter in the enclosing scope
-            if name in self.locals:
-                alloca, ty = self.locals[name]
-                val = self.builder.load(alloca)
-                captures.append(name)
-                capture_values.append(val)
-                capture_llvm_types.append(ty)
-                capture_ritz_types.append(self.ritz_types.get(name))
-            elif name in self.params:
-                val, ty = self.params[name]
-                captures.append(name)
-                capture_values.append(val)
-                capture_llvm_types.append(ty)
-                capture_ritz_types.append(self.ritz_types.get(name))
-            # Globals, functions, and constants are accessible without capture
-
-        # Generate unique name for the anonymous function
-        self.closure_counter += 1
-        closure_name = f"__closure_{self.closure_counter}"
-
-        # Build parameter types from expected type PLUS captured variables
-        param_types = [self._ritz_type_to_llvm(p) for p in expected_type.params]
-        # Add capture types at the end
-        param_types.extend(capture_llvm_types)
-
-        ret_type = self._ritz_type_to_llvm(expected_type.ret) if expected_type.ret else self.void
-
-        # Create the function from its logical signature.  AGAST #1745: via
-        # _new_function, so a large struct return is sret (and a large
-        # by-value param byval, #1739), matching the fn-pointer type
-        # (_ritz_type_to_llvm(FnType)) the closure is used through.
-        fn = self._new_function(closure_name, ret_type, param_types)
-        fn.linkage = 'private'  # Not visible outside this module
-        closure_byval = self._byval_params_of(fn)
-        closure_args = self._fn_value_args(fn)
-
-        # Save current state
-        saved_builder = self.builder
-        saved_fn = self.current_fn
-        saved_locals = self.locals.copy()
-        saved_params = self.params.copy()
-        saved_ritz_types = self.ritz_types.copy()
-        saved_has_returned = self.has_returned
-        # The closure's temporaries are its own (AGAST #2161).
-        saved_temp_frames = self._temp_frames
-        self._temp_frames = []
-
-        # Restored on every exit, a raise in the body included: a leaked
-        # empty `_temp_frames` made the enclosing `_emit_stmt`'s pop raise an
-        # IndexError over the body's own diagnostic (AGAST #2276).
-        try:
-            # Set up new function context
-            self.current_fn = fn
-            self.locals = {}
-            self.params = {}
-            self.has_returned = False
-
-            # Create entry block
-            block = fn.append_basic_block(name="entry")
-            self.builder = _SretAwareBuilder(block, self)
-
-            # Set up regular parameters
-            num_regular_params = len(closure.params)
-            for i, (arg, param) in enumerate(zip(closure_args[:num_regular_params], closure.params)):
-                param_name = param.name
-                arg.name = f"{param_name}.arg"
-
-                if i in closure_byval:
-                    # A byval arg points at the callee's own copy: it IS the slot.
-                    self.locals[param_name] = (arg, closure_byval[i])
-                else:
-                    # Allocate storage for the parameter (so it can be used like a local)
-                    alloca = self.builder.alloca(arg.type, name=param_name)
-                    self.builder.store(arg, alloca)
-                    self.locals[param_name] = (alloca, arg.type)
-
-                # Store Ritz type
-                if i < len(expected_type.params):
-                    self.ritz_types[param_name] = expected_type.params[i]
-
-            # Set up captured variables as parameters
-            for i, (cap_name, cap_ritz_type) in enumerate(zip(captures, capture_ritz_types)):
-                arg = closure_args[num_regular_params + i]
-                arg.name = f"{cap_name}.cap"
-
-                if num_regular_params + i in closure_byval:
-                    self.locals[cap_name] = (arg, closure_byval[num_regular_params + i])
-                else:
-                    # Allocate storage for the captured value
-                    alloca = self.builder.alloca(arg.type, name=cap_name)
-                    self.builder.store(arg, alloca)
-                    self.locals[cap_name] = (alloca, arg.type)
-
-                # Store Ritz type
-                if cap_ritz_type:
-                    self.ritz_types[cap_name] = cap_ritz_type
-
-            # Emit closure body expression
-            result = self._emit_expr(closure.body)
-
-            # Emit return
-            if ret_type == self.void:
-                self.builder.ret_void()
-            else:
-                # Convert result type if needed
-                result = self._convert_type(result, ret_type)
-                self.builder.ret(result)
-        finally:
-            # Restore previous state
-            self.builder = saved_builder
-            self.current_fn = saved_fn
-            self.locals = saved_locals
-            self.params = saved_params
-            self.ritz_types = saved_ritz_types
-            self.has_returned = saved_has_returned
-            self._temp_frames = saved_temp_frames
-
-        # If there are no captures, return the function pointer directly
-        if not captures:
-            return fn
-
-        # With captures, we use a "capture by value" approach:
-        # The closure function takes extra parameters for captured values.
-        # We generate a unique thunk per closure INSTANCE that passes the
-        # captured values.
-        #
-        # To handle multiple instances of the same closure (e.g., calling
-        # make_adder(5) and make_adder(10)), we use an array of environment
-        # slots. Each closure instance gets its own slot.
-        #
-        # This is a simplified implementation for the bootstrap compiler.
-        # A production implementation would use heap-allocated environments.
-
-        # Create the environment struct type (same for all instances of this closure)
-        env_struct_name = f"__closure_env_{self.closure_counter}"
-        if env_struct_name not in self._closure_env_types:
-            env_struct_type = self.module.context.get_identified_type(env_struct_name)
-            env_struct_type.set_body(*capture_llvm_types)
-            self._closure_env_types[env_struct_name] = env_struct_type
-        else:
-            env_struct_type = self._closure_env_types[env_struct_name]
-
-        # Create an array of environment slots for this closure (max 16 instances)
-        # This is a hack - proper impl would use heap allocation
-        MAX_CLOSURE_INSTANCES = 16
-        env_array_name = f"__closure_env_{self.closure_counter}_array"
-        if env_array_name not in self._closure_env_arrays:
-            env_array_type = ir.ArrayType(env_struct_type, MAX_CLOSURE_INSTANCES)
-            env_array = ir.GlobalVariable(self.module, env_array_type, name=env_array_name)
-            env_array.linkage = 'private'
-            # Initialize with zeros
-            zero_env = ir.Constant(env_struct_type, [ir.Constant(ty, None) for ty in capture_llvm_types])
-            env_array.initializer = ir.Constant(env_array_type, [zero_env] * MAX_CLOSURE_INSTANCES)
-            self._closure_env_arrays[env_array_name] = env_array
-
-            # Create a counter for instance allocation
-            counter_name = f"__closure_env_{self.closure_counter}_idx"
-            counter = ir.GlobalVariable(self.module, self.i32, name=counter_name)
-            counter.linkage = 'private'
-            counter.initializer = ir.Constant(self.i32, 0)
-            self._closure_env_counters[env_array_name] = counter
-
-        env_array = self._closure_env_arrays[env_array_name]
-        env_counter = self._closure_env_counters[env_array_name]
-
-        # Allocate a new environment slot
-        current_idx = self.builder.load(env_counter)
-        # Store captured values into the allocated slot
-        for i, (cap_name, cap_val, cap_ty) in enumerate(zip(captures, capture_values, capture_llvm_types)):
-            ptr = self.builder.gep(env_array, [ir.Constant(self.i32, 0), current_idx, ir.Constant(self.i32, i)])
-            self.builder.store(cap_val, ptr)
-
-        # Increment the counter for next allocation (with wraparound)
-        next_idx = self.builder.add(current_idx, ir.Constant(self.i32, 1))
-        wrapped_idx = self.builder.urem(next_idx, ir.Constant(self.i32, MAX_CLOSURE_INSTANCES))
-        self.builder.store(wrapped_idx, env_counter)
-
-        # Generate a thunk for each environment slot (we only need one per slot actually used)
-        # For simplicity, we generate MAX_CLOSURE_INSTANCES thunks statically
-        thunk_array_name = f"__closure_thunks_{self.closure_counter}"
-        if thunk_array_name not in self._closure_thunk_arrays:
-            thunk_param_types = [self._ritz_type_to_llvm(p) for p in expected_type.params]
-
-            thunks = []
-            for slot_idx in range(MAX_CLOSURE_INSTANCES):
-                thunk_name = f"__closure_thunk_{self.closure_counter}_{slot_idx}"
-                # AGAST #1745: same physical signature as the fn-pointer type.
-                thunk_fn = self._new_function(thunk_name, ret_type, thunk_param_types)
-                thunk_fn.linkage = 'private'
-
-                # Build thunk body
-                thunk_block = thunk_fn.append_basic_block(name="entry")
-                thunk_builder = _SretAwareBuilder(thunk_block, self)
-
-                # Gather arguments: regular params + captured values from this
-                # slot.  The thunk's physical args (its sret pointer and byval
-                # pointers) are forwarded as-is to the closure fn, which has
-                # the same leading physical signature.
-                call_args = list(thunk_fn.args)
-                for i in range(len(captures)):
-                    ptr = thunk_builder.gep(env_array, [
-                        ir.Constant(self.i32, 0),
-                        ir.Constant(self.i32, slot_idx),
-                        ir.Constant(self.i32, i)
-                    ])
-                    cap_val = thunk_builder.load(ptr)
-                    call_args.append(cap_val)
-
-                # Call the real closure function
-                result = thunk_builder.call(fn, call_args)
-
-                if ret_type == self.void or self._sret_type_of(thunk_fn) is not None:
-                    thunk_builder.ret_void()
-                else:
-                    thunk_builder.ret(result)
-
-                thunks.append(thunk_fn)
-
-            # Create array of thunk function pointers
-            thunk_ptr_type = thunks[0].type
-            thunk_array_type = ir.ArrayType(thunk_ptr_type, MAX_CLOSURE_INSTANCES)
-            thunk_array = ir.GlobalVariable(self.module, thunk_array_type, name=thunk_array_name)
-            thunk_array.linkage = 'private'
-            thunk_array.initializer = ir.Constant(thunk_array_type, thunks)
-            self._closure_thunk_arrays[thunk_array_name] = thunk_array
-
-        thunk_array = self._closure_thunk_arrays[thunk_array_name]
-
-        # Look up the thunk for this instance's slot
-        thunk_ptr_ptr = self.builder.gep(thunk_array, [ir.Constant(self.i32, 0), current_idx])
-        thunk_ptr = self.builder.load(thunk_ptr_ptr)
-
-        return thunk_ptr
-
-    def _emit_lambda(self, lambda_expr: rast.Lambda) -> ir.Value:
-        """Emit a lambda expression: fn(params) -> RetType expr.
-
-        Lambda is the older form of closure with explicit parameters.
-        We convert it to a Closure and delegate to _emit_closure.
-        """
-        # Convert Lambda parameters to ClosureParams
-        closure_params = [
-            rast.ClosureParam(p.name, p.type)
-            for p in lambda_expr.params
-        ]
-
-        # Create a Closure AST node and delegate
-        closure = rast.Closure(
-            lambda_expr.span,
-            closure_params,
-            lambda_expr.body,
-            captures=[]
-        )
-
-        return self._emit_closure(closure)
 
     def _lent_arg(self, expr: rast.Expr) -> Optional[ir.Value]:
         """The incoming `*T` if `expr` names a `h:& T` param, or None once a

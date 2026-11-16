@@ -19,13 +19,11 @@ import ritz_ast as rast
 def _has_own_break(node) -> bool:
     """A `break` under `node` that leaves the loop `node` is the body of.
 
-    An inner loop owns its own breaks, and a lambda or closure body is a
-    different function.
+    An inner loop owns its own breaks.
     """
     if isinstance(node, (rast.BreakStmt, rast.BreakExpr)):
         return True
-    if isinstance(node, (rast.WhileStmt, rast.ForStmt,
-                         rast.Lambda, rast.Closure)):
+    if isinstance(node, (rast.WhileStmt, rast.ForStmt)):
         return False
     if isinstance(node, (list, tuple)):
         return any(_has_own_break(item) for item in node)

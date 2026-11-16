@@ -632,30 +632,6 @@ class TypeChecker:
             # For now, just return unknown since we don't track future types
             return rast.NamedType(expr.span, 'unknown', [])
 
-        elif isinstance(expr, rast.Closure):
-            # Infer closure type from parameters and body
-            param_types = []
-            self._push_scope()
-            for p in expr.params:
-                if p.type:
-                    param_types.append(p.type)
-                else:
-                    param_types.append(rast.NamedType(expr.span, 'unknown', []))
-                self.locals[p.name] = param_types[-1]
-            body_type = self._infer_type(expr.body)
-            self._pop_scope()
-            return rast.FnType(expr.span, param_types, body_type)
-
-        elif isinstance(expr, rast.Lambda):
-            # Lambda is an older form of closure with explicit param types
-            param_types = [p.type for p in expr.params]
-            self._push_scope()
-            for p in expr.params:
-                self.locals[p.name] = p.type
-            body_type = self._infer_type(expr.body)
-            self._pop_scope()
-            return rast.FnType(expr.span, param_types, body_type if body_type else rast.NamedType(expr.span, 'unknown', []))
-
         else:
             self._error(f"cannot infer type of {type(expr).__name__}", getattr(expr, 'span', None))
             return rast.NamedType(expr.span if hasattr(expr, 'span') else None, 'unknown', [])

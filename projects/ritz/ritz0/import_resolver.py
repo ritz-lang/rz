@@ -687,12 +687,6 @@ class ImportResolver:
         elif isinstance(expr, rast.ArrayFill):
             new_value = self._transform_expr(expr.value, aliases)
             return replace(expr, value=new_value)
-        elif isinstance(expr, rast.Lambda):
-            new_body = self._transform_expr(expr.body, aliases)
-            return replace(expr, body=new_body)
-        elif isinstance(expr, rast.Closure):
-            new_body = self._transform_block(expr.body, aliases)
-            return replace(expr, body=new_body)
         elif isinstance(expr, rast.Block):
             return self._transform_block(expr, aliases)
         elif isinstance(expr, rast.TryOp):

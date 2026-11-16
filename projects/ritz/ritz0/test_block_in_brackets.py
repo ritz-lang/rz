@@ -28,10 +28,9 @@ so `then` / `else` one-liners are unaffected; `parse_match` always checks.
 THE TESTS
 
 Parse-level (no compile): `if` and `match` in each bracket kind, with the
-exact message and line:col; the innermost bracket is the one named; a
-closure's `match` body inside a call.  Controls: one-liners in each bracket
-kind, block forms outside brackets (including after a bracket that closed
-on the same line, and in a closure bound by `let`).  Two compiles go through
+exact message and line:col; the innermost bracket is the one named.
+Controls: one-liners in each bracket kind, block forms outside brackets
+(including after a bracket that closed on the same line).  Two compiles go through
 the CLI: the located error, and a one-line `if` inside parens that runs.
 """
 
@@ -124,18 +123,6 @@ fn f(a: *i32, c: i32) -> i32
         1
     ])
 """, "[", 5, 10),
-    # A closure body is an expression, so its `match` is inside the call's
-    # parens like any other operand.
-    "closure_match_in_call": ("""\
-fn apply(g: fn(i32) -> i32, v: i32) -> i32
-    g(v)
-
-fn f(n: i32) -> i32
-    apply(|x| match x
-        1 => 10
-        _ => 20
-    , n)
-""", "(", 5, 15),
 }
 
 
@@ -201,13 +188,6 @@ fn f(n: i32) -> i32
         1 => id(if n == 1 then 10 else 11)
         _ => id(20)
     t
-""",
-    "closure_match_bound_by_let": """\
-fn f(n: i32) -> i32
-    let g: fn(i32) -> i32 = |x| match x
-        1 => 10
-        _ => 20
-    g(n)
 """,
 }
 

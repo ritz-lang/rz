@@ -71,7 +71,7 @@ def map_child_nodes(node, on_expr, on_stmt, on_type):
     for.  Each dataclass field is mapped by kind: an Expr (Block included) goes
     through on_expr, a Stmt through on_stmt, a Type through on_type; lists and
     tuples are mapped element-wise; any other dataclass (MatchArm, Pattern,
-    Param, ClosureParam, AsmOperand) is walked recursively.  Spans and plain
+    Param, AsmOperand) is walked recursively.  Spans and plain
     values are kept.
 
     Returns `node` itself when nothing beneath it changed, otherwise a shallow
@@ -79,7 +79,7 @@ def map_child_nodes(node, on_expr, on_stmt, on_type):
     generic template shared by every instantiation.
 
     Before AGAST #1937 the fallback was `return node`, so sizeof(T), casts and
-    generic calls inside Match, Grouped, TupleLit, Lambda, InterpString, ...
+    generic calls inside Match, Grouped, TupleLit, InterpString, ...
     kept the template's T.
     """
     def map_value(value):
@@ -531,11 +531,6 @@ class Monomorphizer:
             return
         if isinstance(node, rast.Type):
             return
-        if isinstance(node, rast.Lambda):
-            # A closure's params are its own scope's; type them for its body.
-            for param in node.params:
-                if getattr(param, 'type', None) is not None:
-                    self.var_types[param.name] = param.type
         # Slots before the values that fill them (§9.2): a literal's slot
         # decides its args before its fields are walked, so a nested literal
         # in one of its fields has a slot too.
@@ -1146,12 +1141,6 @@ class Monomorphizer:
                 self._visit_expr(expr.start)
             if expr.end:
                 self._visit_expr(expr.end)
-        elif isinstance(expr, rast.Lambda):
-            for param in expr.params:
-                self._visit_type(param.type)
-            if expr.ret_type:
-                self._visit_type(expr.ret_type)
-            self._visit_expr(expr.body)
         elif isinstance(expr, rast.SliceExpr):
             # Visit the base expression and indices
             self._visit_expr(expr.expr)
@@ -2133,7 +2122,7 @@ class Monomorphizer:
                              self._specialize_expr(expr.end, subst) if expr.end else None,
                              expr.inclusive)
         else:
-            # Every other kind (Match, Grouped, TupleLit, Lambda, ...): walk
+            # Every other kind (Match, Grouped, TupleLit, ...): walk
             # its fields generically.  Returning it unchanged left sizeof(T),
             # casts and generic calls nested inside on the template's T
             # (AGAST #1937).  Leaves (literals, identifiers) come back as-is.
@@ -2456,7 +2445,7 @@ class Monomorphizer:
         elif isinstance(expr, rast.TryOp):
             return rast.TryOp(expr.span, self._rewrite_expr(expr.expr))
         else:
-            # Grouped, TupleLit, Lambda, ...: a generic call nested inside
+            # Grouped, TupleLit, ...: a generic call nested inside
             # must still reach its mangled name (AGAST #1937).
             return map_child_nodes(expr, self._rewrite_expr,
                                    self._rewrite_stmt, self._rewrite_type)

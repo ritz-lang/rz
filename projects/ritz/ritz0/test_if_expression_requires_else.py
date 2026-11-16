@@ -57,7 +57,7 @@ AGAST #1435 extends the walk into operand positions (operator operands, call
 and method arguments, index, field base, cast, struct-literal fields, ...).
 An operand's value is consumed no matter which statement holds it, so that
 part of the walk runs from every statement and from a function's tail too.
-It still never enters `Block.stmts` or a lambda/closure body.
+It still never enters `Block.stmts`.
 
 The function-tail shape (a fn declaring `-> T` whose last statement is an
 else-less `if`) is deliberately NOT covered here. AGAST #1429 rejects it, with
@@ -267,7 +267,7 @@ def test_the_value_was_really_zero_before_and_is_one_after_adding_else(tmp_path)
 # expression sits in. So the walk descends into operands from EVERY statement,
 # including an `ExprStmt` and a function's tail, not only from the four
 # consuming statements. It still never enters `Block.stmts` (each statement is
-# checked on its own when emitted) or a lambda/closure body.
+# checked on its own when emitted).
 #
 # Every entry compiled at exit 0 before the fix and used 0 for the `if`.
 # ---------------------------------------------------------------------------
@@ -431,9 +431,9 @@ def test_walker_reaches_every_operand_node(shape):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("shape", ["expr_stmt_if", "block_stmts", "lambda", "closure"])
+@pytest.mark.parametrize("shape", ["expr_stmt_if", "block_stmts"])
 def test_walker_does_not_flag_unconsumed_positions(shape):
-    """Statement `if`, `Block.stmts`, lambda and closure bodies stay unwalked."""
+    """Statement `if` and `Block.stmts` stay unwalked."""
     import ritz_ast as rast
     from emitter_llvmlite import LLVMEmitter
 
@@ -446,8 +446,6 @@ def test_walker_does_not_flag_unconsumed_positions(shape):
         "expr_stmt_if": bad,
         "block_stmts": call_of(rast.Block(S, 
             [rast.ExprStmt(S, call_of(bad))], rast.IntLit(S, 1))),
-        "lambda": call_of(rast.Lambda(S, [], None, call_of(bad))),
-        "closure": call_of(rast.Closure(S, [], call_of(bad))),
     }[shape]
     assert LLVMEmitter._find_valueless_if(tree, consumed=False) is None
 

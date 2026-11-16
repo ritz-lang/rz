@@ -469,9 +469,6 @@ class NameResolver:
             self._check_expr(expr.target, scope)
             self._check_expr(expr.value, scope)
 
-        elif isinstance(expr, (rast.Closure, rast.Lambda)):
-            self._check_expr(expr.body, Scope(scope, {p.name for p in expr.params}))
-
         # Literals (IntLit, FloatLit, StringLit, CharLit, BoolLit, NilLit)
         # don't need checking
 

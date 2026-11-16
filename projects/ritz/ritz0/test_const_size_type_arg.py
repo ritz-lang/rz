@@ -1,7 +1,7 @@
 """AGAST #2857: a const-named array size inside an expression is folded.
 
 const_eval walked a Call's args but not its type_args, and skipped whole
-expression kinds (struct literals, method calls, grouping, `?`, lambdas,
+expression kinds (struct literals, method calls, grouping, `?`,
 `sizeof`, assignments...).  So with `const N: i64 = 2`, the `[N]i8` in
 `first<*[N]i8>(@x)` kept `size = Ident('N')` and ritz0 died with an internal
 TypeError in llvmlite (since #2843, in mangle_type_name) instead of compiling.
@@ -41,7 +41,6 @@ FORMS = {
     "grouped": "let p: *[2]i8 = (first<*[N]i8>(@x))",
     "sizeof": "let n: i64 = sizeof([N]i8)",
     "assign_value": "var p: *[2]i8 = @x\n    p = first<*[N]i8>(@x)",
-    "lambda_param": "let f: fn(*[2]i8) -> i64 = fn(p: *[N]i8) -> i64 0",
     "tuple_type": "let t: (i64, [N]i8) = (1, x)",
     "nested_type_arg": "let b: Box<Box<[N]i8>> = Box<Box<[N]i8>> { v: Box<[N]i8> { v: x, tag: 0 }, tag: 0 }",
 }

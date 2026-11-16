@@ -23,11 +23,15 @@ from qualified_access import module_item_access_removed
 from monomorph import TypeSubstitution
 
 
+CLOSURE_REFUSED = ("closures aren't supported: write a named fn and pass it by "
+                   "name (§5.5)")
+
+
 def _defer_escape(node, in_loop: bool) -> Optional[str]:
     """The first `return`, `?`, `break` or `continue` that would leave a
     deferred statement, or None (LANGUAGE_SPEC §13.7). A `break`/`continue`
     inside a loop that is itself inside the deferred statement is fine. A
-    nested `defer` was checked when it was parsed; a lambda is its own fn."""
+    nested `defer` was checked when it was parsed."""
     if isinstance(node, (rast.ReturnStmt, rast.ReturnExpr)):
         return "return"
     if isinstance(node, rast.TryOp):
@@ -36,7 +40,7 @@ def _defer_escape(node, in_loop: bool) -> Optional[str]:
         return "break"
     if isinstance(node, (rast.ContinueStmt, rast.ContinueExpr)) and not in_loop:
         return "continue"
-    if isinstance(node, (rast.DeferStmt, rast.Lambda, rast.Closure)):
+    if isinstance(node, rast.DeferStmt):
         return None
     if isinstance(node, (rast.WhileStmt, rast.ForStmt)):
         in_loop = True
@@ -678,8 +682,8 @@ class Parser:
 
         `|` always ends a type.  Where nothing may follow it but a type's end
         (here), a `|` is the old union syntax: LARB R52 removed it
-        (LANGUAGE_SPEC §3.8, AGAST #3409).  A cast's target and a closure
-        param's type, which `|` may legitimately follow, read the primary.
+        (LANGUAGE_SPEC §3.8, AGAST #3409).  A cast's target, which `|` may
+        legitimately follow, reads the primary.
         """
         ty = self._parse_type_primary(allow_type_args)
         if self._at(TokenType.PIPE):
@@ -1236,9 +1240,10 @@ class Parser:
         tok = self._current()
         span = tok.span
 
-        # Closure: |params| body
-        if self._at(TokenType.PIPE):
-            return self.parse_closure()
+        # LARB R56: `|x| e`, `|| e` and an anonymous `fn(...) e` are refused
+        # where they open (LANGUAGE_SPEC §5.6).  `||` lexes as one token.
+        if self._at(TokenType.PIPE) or self._at(TokenType.PIPEPIPE) or self._at(TokenType.FN):
+            raise ParseError(CLOSURE_REFUSED, span)
 
         # Integer literal (with optional type suffix: `0u32`)
         if self._at(TokenType.INT):
@@ -1384,10 +1389,6 @@ class Parser:
         # Match expression
         if self._at(TokenType.MATCH):
             return self.parse_match()
-
-        # Lambda
-        if self._at(TokenType.FN):
-            return self.parse_lambda()
 
         # Array literal: [a, b, c] or array fill: [value; count]
         # Supports multiline for readability (like struct literals)
@@ -1685,30 +1686,6 @@ class Parser:
 
         raise ParseError(f"Expected pattern, got {self._current().type.name}", span)
 
-    def parse_lambda(self) -> rast.Lambda:
-        """Parse a lambda/closure."""
-        span = self._current().span
-        self._expect(TokenType.FN)
-        self._expect(TokenType.LPAREN)
-
-        params = []
-        if not self._at(TokenType.RPAREN):
-            params.append(self.parse_param())
-            while self._at(TokenType.COMMA):
-                self._advance()
-                if self._at(TokenType.RPAREN):
-                    break
-                params.append(self.parse_param())
-        self._expect(TokenType.RPAREN)
-
-        ret_type = None
-        if self._at(TokenType.ARROW):
-            self._advance()
-            ret_type = self.parse_type()
-
-        body = self.parse_expr()
-        return rast.Lambda(span, params, ret_type, body)
-
     def _apply_literal_suffix(self, lit, tok):
         """Apply a numeric literal's type suffix: `0u32` -> `0 as u32`.
 
@@ -1719,41 +1696,6 @@ class Parser:
         if not suffix:
             return lit
         return rast.Cast(lit.span, lit, rast.NamedType(lit.span, resolve_type_name(suffix), []))
-
-    def parse_closure(self) -> rast.Closure:
-        """Parse a closure expression: |params| body.
-
-        Examples:
-            |x| x * 2           - single param, inferred type
-            |x, y| x + y        - multiple params
-            |x: i32| x * 2      - explicit param type
-            || 42               - zero params
-        """
-        span = self._current().span
-        self._expect(TokenType.PIPE)
-
-        params = []
-        if not self._at(TokenType.PIPE):
-            params.append(self._parse_closure_param())
-            while self._at(TokenType.COMMA):
-                self._advance()
-                if self._at(TokenType.PIPE):
-                    break  # trailing comma
-                params.append(self._parse_closure_param())
-        self._expect(TokenType.PIPE)
-
-        body = self.parse_expr()
-        return rast.Closure(span, params, body)
-
-    def _parse_closure_param(self) -> rast.ClosureParam:
-        """Parse a closure parameter: name or name: type."""
-        name_tok = self._expect(TokenType.IDENT, "Expected parameter name")
-        param_type = None
-        if self._at(TokenType.COLON):
-            self._advance()
-            # `|` closes the param list here (#2230).
-            param_type = self._parse_type_primary()
-        return rast.ClosureParam(name_tok.value, param_type, name_tok.span)
 
     # ========================================================================
     # Statements

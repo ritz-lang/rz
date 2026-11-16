@@ -415,14 +415,6 @@ class Block(Expr):
 
 
 @dataclass
-class Lambda(Expr):
-    """Lambda/closure: fn(x, y) -> T expr."""
-    params: List['Param']
-    ret_type: Optional[Type]
-    body: Expr
-
-
-@dataclass
 class StructLit(Expr):
     """Struct literal: MyStruct { field: value } or MyStruct<T> { field: value }."""
     name: str
@@ -575,37 +567,6 @@ class AssignExpr(Expr):
     """
     target: Expr
     value: Expr
-
-
-@dataclass
-class ClosureParam:
-    """A closure parameter: name with optional type."""
-    name: str
-    type: Optional[Type] = None
-    # Where the name is (AGAST #2407: a binder's errors point at it).
-    span: Optional[Span] = field(default=None, compare=False, repr=False)
-
-
-@dataclass
-class Closure(Expr):
-    """Closure expression: |params| body.
-
-    Examples:
-        |x| x * 2           - single param, inferred type
-        |x, y| x + y        - multiple params
-        |x: i32| x * 2      - explicit param type
-
-    A closure may capture variables from its enclosing scope.
-    These are identified during closure analysis.
-    """
-    params: List[ClosureParam]
-    body: Expr
-    # Captured variables (filled in by closure analysis)
-    captures: List[str] = None
-
-    def __post_init__(self):
-        if self.captures is None:
-            self.captures = []
 
 
 # ============================================================================

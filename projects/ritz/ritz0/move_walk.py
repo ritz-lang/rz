@@ -106,8 +106,6 @@ class MoveWalk:
                 if info is not None and (info.state == VarState.MOVED or info.moved_fields):
                     found.append(node.name)
                 return
-            if isinstance(node, (rast.Lambda, rast.Closure)):
-                return
             if isinstance(node, list):
                 for child in node:
                     walk(child)

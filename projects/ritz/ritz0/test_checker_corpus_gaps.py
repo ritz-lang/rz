@@ -273,10 +273,6 @@ class TestRoundThree:
         src = "struct S\n    n: i32\n\nfn f(s: S) -> i32\n    let p: *u8 = s\n    0\n"
         assert any("cannot initialize" in e for e in types(src))
 
-    def test_closure_params_are_in_scope(self):
-        src = "fn f() -> i32\n    let g = |x| x + 1\n    0\n"
-        assert names(src) == [] and types(src) == []
-
     def test_variant_constructor_through_enum_name(self):
         assert types(ENUM + "fn f() -> Color\n    Color.Green(1)\n") == []
 

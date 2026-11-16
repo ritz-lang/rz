@@ -8,9 +8,8 @@ through the global variant map: whichever specialization registered last.
 
 `_emit_return_expr`, the path a `return` in an arm takes, emitted its operand
 with no expected enum. The `ReturnStmt` path had one only for a bare variant, so
-`return match ...` and `return if ...` had the same bug, and it read
-`current_fn_def`, which names the enclosing fn inside a closure body. Both paths
-now go through `_emit_return_operand`.
+`return match ...` and `return if ...` had the same bug. Both paths now go
+through `_emit_return_operand`.
 
 ritz1 already took a `return` from the fn's type, except inside a `let`
 initialiser, whose enum context won: `return Ok(p)` built an `Option$i64`.
@@ -362,32 +361,6 @@ fn main() -> i32
 """
 )
 
-# ritz1 has no closures here, so these two run on ritz0 only.
-#
-# A closure body changes the fn being emitted but not `current_fn_def`, so the
-# `return` must take the closure's type, not the enclosing `Result`.
-CLOSURE_RETURN = (
-    PRELUDE
-    + """\
-fn both(n: i64) -> Result<Page, Er>
-    let f: fn(i32) -> Option<i32> = |x| match x
-        4 => return Some(x)
-        _ => None
-    match f(4)
-        Some(v) => Ok(Page { id: v as i64 })
-        None => Err(Er { code: 1 })
-
-"""
-    + COMPETITOR
-    + "\n"
-    + MAIN_PAGE % 5
-)
-
-# The same in a block arm, which is a `ReturnStmt` rather than a `ReturnExpr`.
-CLOSURE_BLOCK_ARM_RETURN = CLOSURE_RETURN.replace(
-    "        4 => return Some(x)\n", "        4 =>\n            return Some(x)\n"
-)
-
 # An early `return` from the arm of a `match` whose value feeds a call. The
 # match was the call's argument until LARB R46a (AGAST #3429) made a block
 # inside `(` an error; it is bound to a `let` first, then passed.
@@ -411,8 +384,6 @@ fn both(n: i64) -> Result<Page, Er>
 )
 
 RITZ0_ONLY = {
-    "closure_return": (CLOSURE_RETURN, 4),
-    "closure_block_arm_return": (CLOSURE_BLOCK_ARM_RETURN, 4),
     "call_arg_arm": (CALL_ARG_ARM, 12),
 }
 
@@ -816,17 +787,3 @@ def test_ritz1_one_letter_struct_payload(tmp_path, ritz1_bin, ritz_start):
 # AGAST #2275, fixed by #2418: `o: Option<T>` was defined as `%Option$T`.
 def test_ritz1_generic_enum_signature(tmp_path, ritz1_bin, ritz_start):
     assert _run("ritz1", tmp_path, "generic_sig", GENERIC_ENUM_SIGNATURE) == 7
-
-
-# AGAST #2276: an IndexError replaced it; test_closure_error_state.py has the
-# state rows.
-def test_ritz0_closure_error_keeps_its_diagnostic(tmp_path):
-    src = tmp_path / "closure_error.ritz"
-    src.write_text(
-        "fn main() -> i32\n    let f: fn(i32) -> i32 = |x| nosuchname + x\n    f(4)\n"
-    )
-    comp = run_ritz0([str(src), "-o", str(tmp_path / "closure_error.ll")], cwd=tmp_path)
-    assert comp.returncode != 0
-    # The chained traceback names `nosuchname` too, so ask for the absence of
-    # the IndexError that replaced it.
-    assert "pop from empty list" not in comp.stdout + comp.stderr

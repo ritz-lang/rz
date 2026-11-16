@@ -1647,13 +1647,23 @@ fn call(h: H) -> i32
 
 ### 5.6 Closures
 
-**Not implemented.** There is no closure or lambda syntax; the `|...|` form the
-0.2.0 spec described never existed in the compiler:
+Ritz has no closures (LARB R56). `|x| e`, `|| e`, `|x: T| e` and an anonymous
+`fn(…) e` used as an expression are each an error at the `|` or `fn` that opens
+them: closures aren't supported: write a named fn and pass it by name
+([§5.5](#55-function-pointer-types)).
 
-```ritz body expect-error="Expected expression, got ARROW"
-let add_one = |x: i32| -> i32
-    x + 1
+```ritz body expect-error="closures aren't supported: write a named fn and pass it by name (§5.5)"
+let add_one: fn(i32) -> i32 = |x| x + 1
 ```
+
+```ritz body expect-error="closures aren't supported: write a named fn and pass it by name (§5.5)"
+let add_one: fn(i32) -> i32 = fn(x: i32) -> i32 x + 1
+```
+
+State a closure would have captured goes in a struct next to a fn field, and
+the fn takes it as a parameter: `s.f(s.k, x)` (LARB R41,
+[§5.5](#55-function-pointer-types)). `examples/tier5_async/58_closures` shows
+both forms.
 
 ---
 

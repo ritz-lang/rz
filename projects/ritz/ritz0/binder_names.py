@@ -108,7 +108,7 @@ class _Judge:
     def params(self, node, params) -> None:
         self.frames.append({})
         for param in params:
-            span = param.span if isinstance(node, (rast.FnDef, rast.Lambda)) else (param.span or node.span)
+            span = param.span
             self.binder(param.name, span)
         self.walk(node.body)
         self.frames.pop()
@@ -126,7 +126,7 @@ class _Judge:
     def walk(self, node) -> None:
         if node is None:
             return
-        if isinstance(node, (rast.FnDef, rast.Lambda, rast.Closure)):
+        if isinstance(node, rast.FnDef):
             self.params(node, node.params)
         elif isinstance(node, rast.Block):
             self.scoped(*node.stmts, node.expr)

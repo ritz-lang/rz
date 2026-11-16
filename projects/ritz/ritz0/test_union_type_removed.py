@@ -7,8 +7,7 @@ type (so `u64 as (i64 | u64)` got the i64 tag) and read back with an unchecked
 that took it apart are now located parse errors.  For a value of several
 kinds, write an enum with a payload per kind.
 
-`|` always ends a type, so a typed closure param (`|x: i32| x + 1`, #2230)
-needs no special rule.  ritz0's rows are parser-only and in-process.
+`|` always ends a type.  ritz0's rows are parser-only and in-process.
 
 ritz1 never had unions (#3411): its grammar already stopped at the same `|`
 and pattern, as "unexpected '|'".  Its dropped-item report (ast_helpers.ritz,
@@ -102,15 +101,6 @@ def test_ritz0_refuses_at_the_spot(name):
 @pytest.mark.parametrize("name", sorted(KEPT))
 def test_ritz0_keeps(name):
     parse(KEPT[name])
-
-
-@pytest.mark.unit
-def test_typed_closure_param_still_parses():
-    module = parse("fn main() -> i32\n    let g = |x: i32| x + 1\n    0\n")
-    closure = module.items[0].body.stmts[0].value
-    assert isinstance(closure, rast.Closure)
-    assert isinstance(closure.params[0].type, rast.NamedType)
-    assert isinstance(closure.body, rast.BinOp) and closure.body.op == "+"
 
 
 @pytest.mark.unit

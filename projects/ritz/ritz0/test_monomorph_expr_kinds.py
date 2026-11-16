@@ -4,7 +4,7 @@ ritz0 monomorph must reach type parameters and generic calls nested inside
 
 `_specialize_stmt` / `_specialize_expr` used to return any node kind without
 its own case unchanged, so `sizeof(T)`, casts and generic calls nested in a
-Match, Grouped, TupleLit, Lambda, InterpString, SliceExpr, AssignExpr,
+Match, Grouped, TupleLit, InterpString, SliceExpr, AssignExpr,
 UnsafeBlock, ... kept the template's `T` (and `sizeof(T)` then read 8, the
 size of an unresolved name).  `_rewrite_stmt` / `_rewrite_expr`, the same walk
 for non-generic fns, had the same hole for generic *calls*: `(g<i32>(0))` was
@@ -97,8 +97,6 @@ EXPR_KINDS = {
     "interp_string": lambda p: rast.InterpString(SP, ["a", "b"], [p]),
     "slice_start": lambda p: rast.SliceExpr(SP, ident("x"), p, None),
     "slice_end": lambda p: rast.SliceExpr(SP, ident("x"), None, p),
-    "lambda_body": lambda p: rast.Lambda(SP, [], None, p),
-    "closure_body": lambda p: rast.Closure(SP, [], p),
     "match_scrutinee": lambda p: rast.Match(SP, p, [wildcard_arm(rast.IntLit(SP, 0))]),
     "match_arm_body": lambda p: rast.Match(SP, ident("x"), [wildcard_arm(p)]),
     "match_arm_guard": lambda p: rast.Match(SP, ident("x"), [wildcard_arm(rast.IntLit(SP, 0), p)]),
@@ -176,18 +174,6 @@ def test_cast_target_specialized_inside_grouped():
     fn = specialize_with(as_stmt(rast.Grouped(SP, cast)))
     targets = [n.target.name for n in walk(fn.body) if isinstance(n, rast.Cast)]
     assert targets == ["i32"]
-
-
-@pytest.mark.unit
-def test_lambda_and_closure_types_specialized():
-    lam = rast.Lambda(SP, [rast.Param(SP, "p", T())], T(), ident("p"))
-    clo = rast.Closure(SP, [rast.ClosureParam("q", T())], ident("q"))
-    mod = parse(SKELETON)
-    g = fn_named(mod, "g")
-    g.body = rast.Block(SP, [as_stmt(lam), as_stmt(clo)], rast.IntLit(SP, 0))
-    fn = fn_named(monomorphize(mod), "g$i32")
-    names = [n.name for n in walk(fn.body) if isinstance(n, rast.NamedType)]
-    assert names == ["i32", "i32", "i32"]
 
 
 @pytest.mark.unit
