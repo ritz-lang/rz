@@ -1,0 +1,63 @@
+# ritz1/src/pass_arm_init.ritz - a `pass` arm in a typed struct / enum initialiser
+#
+# AGAST #3740.  LANGUAGE_SPEC §8: `pass` is the body of an arm that does
+# nothing, so it has no value.
+#
+#     var c: Big = match t
+#         T.A => *p
+#         T.B => pass     # c has no value when t is B
+#
+# ritz1 merged the arms with a `zeroinitializer` for the `pass` arm, a silent
+# all-zero `c`.  ritz0 refuses it at the `let` / `var`, and this is its
+# wording (emitter_llvmlite.py _check_initialiser_has_value).
+#
+# Only a named struct (a generic's instance among them) or a user enum
+# annotation is checked: an integer slot takes the `pass` arm as 0 on all
+# three compilers (#3759), and the other forms ritz0 refuses it misnames or
+# crashes on (#3758).  ritz0/test_match_pass_arm_value.py pins the rule.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import sema
+
+# Is `arm` a `pass`: written after the `=>` (is_pass), or alone on the arm's
+# block, which match_arm_set_block detaches into `body` as a LIT_PASS.
+fn pass_arm(arm: *MatchArm) -> i32
+    if arm.is_pass == 1
+        return 1
+    if arm.body == null
+        return 0
+    (arm.body.kind == EXPR_INT_LIT and arm.body.lit_kind == LIT_PASS) as i32
+
+# Report the `let` / `var` `st` if its annotation is a struct or user enum
+# and its initialiser a match with both a `pass` arm and a value arm.  A match
+# of `pass` arms only, ritz0 refuses in other words (#3758).
+pub fn pass_arm_init_check(sm: *Sema, st: *Stmt)
+    let init: *Expr = st.var_init
+    if init == null or init.kind != EXPR_MATCH or st.var_declared_type != TYPE_STRUCT
+        return
+    let name: *u8 = st.var_type_name
+    let len: i32 = st.var_type_name_len
+    if len <= 0 or (sema_find_struct(sm, name, len) == null and user_enum_index(name, len) < 0)
+        return
+    var passes: i32 = 0
+    var values: i32 = 0
+    var arm: *MatchArm = init.args as *MatchArm
+    while arm != null
+        if pass_arm(arm) == 1
+            passes += 1
+        else
+            values += 1
+        arm = arm.next
+    if passes == 0 or values == 0
+        return
+    sema_error_at(sm, st.span.line, st.span.col)
+    eprint_char('`')
+    eprint_bytes(st.var_name, st.var_name_len)
+    eprints_cstr(c"` is declared `")
+    eprint_bytes(name, len)
+    eprints_cstr(c"` but its initialiser has no single value type: its match / if arms yield values that cannot be merged at that type\n")

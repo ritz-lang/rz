@@ -54,6 +54,7 @@ SOURCES = \
 	sema_probe \
 	must_use \
 	sema_index_store \
+	pass_arm_init \
 	generic_method \
 	field_slot \
 	sema_walk \
