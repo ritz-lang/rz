@@ -4237,7 +4237,8 @@ fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
 # each runs once, in order, as ritz0 runs them.  A local can't reuse a name
 # in its fn, so `y`'s element can't read the `x` just bound.
 #
-# Split only when every arm is a bare literal of two elements, and no match
+# Split only when every arm is a bare literal of one element per name (AGAST
+# #109: any number of names, not only two), and no match
 # arm binds a name (its elements might read it, and the element `if`s are
 # outside the arm).  Any other destructure (an arm with statements before
 # its tuple, a `Some(v) =>` or bare `v =>` arm) stays a STMT_TUPLE_DECL: the
@@ -4246,14 +4247,17 @@ fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
 var g_tuple_p: *Parser = null      # tuple_resolve_module's, for the AST built here
 var g_tuple_split_n: i32 = 0       # numbers the arm-index locals, unique per compile
 
-# A nameless tuple literal of exactly two elements?
-fn tuple_split_pair(e: *Expr) -> i32
+# A nameless tuple literal of exactly `n` elements, one per name of the
+# destructure (AGAST #109: was two)?
+fn tuple_split_pair(e: *Expr, n: i32) -> i32
     if e == null or e.kind != EXPR_STRUCT_LIT or e.ident_len != 0
         return 0
-    let fi: *FieldInit = e.args as *FieldInit
-    if fi == null or fi.next == null or fi.next.next != null
-        return 0
-    1
+    var fi: *FieldInit = e.args as *FieldInit
+    var k: i32 = 0
+    while fi != null
+        k = k + 1
+        fi = fi.next
+    (k == n) as i32
 
 # Does match arm `arm` bind no name?  A bare `x =>` binds one unless it is a
 # unit variant, which the parser can't tell; a qualified `E.V` (no
@@ -4270,8 +4274,8 @@ fn tuple_split_arm_binds_none(arm: *MatchArm) -> i32
 
 # The number of tuple literals `e` yields (one per arm, through nested if /
 # match arms), or 0 when it is no splittable tree.
-fn tuple_split_leaves(e: *Expr) -> i32
-    if tuple_split_pair(e) == 1
+fn tuple_split_leaves(e: *Expr, names: i32) -> i32
+    if tuple_split_pair(e, names) == 1
         return 1
     if e == null or (e.kind != EXPR_IF and e.kind != EXPR_MATCH)
         return 0
@@ -4282,7 +4286,7 @@ fn tuple_split_leaves(e: *Expr) -> i32
             return 0
         if e.kind == EXPR_MATCH and tuple_split_arm_binds_none(arm) == 0
             return 0
-        let m: i32 = tuple_split_leaves(arm.body)
+        let m: i32 = tuple_split_leaves(arm.body, names)
         if m == 0
             return 0
         n = n + m
@@ -4291,8 +4295,8 @@ fn tuple_split_leaves(e: *Expr) -> i32
 
 # Replace each tuple literal of tree `e` by its index (0, 1, .. in arm
 # order), recording the literal at leaves[index].  Returns the new tree.
-fn tuple_split_index(e: *Expr, leaves: **Expr, next_idx: *i32) -> *Expr
-    if tuple_split_pair(e) == 1
+fn tuple_split_index(e: *Expr, leaves: **Expr, next_idx: *i32, names: i32) -> *Expr
+    if tuple_split_pair(e, names) == 1
         let i: i32 = *next_idx
         *(leaves + i) = e
         *next_idx = i + 1
@@ -4302,15 +4306,17 @@ fn tuple_split_index(e: *Expr, leaves: **Expr, next_idx: *i32) -> *Expr
         return expr_int(g_tuple_p, i as i64, e.span.line, e.span.col)
     var arm: *MatchArm = e.args as *MatchArm
     while arm != null
-        arm.body = tuple_split_index(arm.body, leaves, next_idx)
+        arm.body = tuple_split_index(arm.body, leaves, next_idx, names)
         arm = arm.next
     e
 
-# Element `j` (0 / 1) of tuple literal `lit`.
+# Element `j` of tuple literal `lit`.
 fn tuple_split_elem(lit: *Expr, j: i32) -> *Expr
     var fi: *FieldInit = lit.args as *FieldInit
-    if j == 1
+    var i: i32 = 0
+    while i < j
         fi = fi.next
+        i = i + 1
     fi.value
 
 # `if k == 0 L0.j else if k == 1 L1.j .. else Ln-1.j`
@@ -4324,37 +4330,52 @@ fn tuple_split_pick(leaves: **Expr, n: i32, j: i32, k: *u8, k_len: i32, line: i3
         i = i - 1
     acc
 
-# `let x = ..` for the destructure's first (which == 0) or second name.
+# `let x = ..` for the destructure's name `which` (0, 1, then its tail).
 fn tuple_split_let(s: *Stmt, which: i32, init: *Expr) -> *Stmt
     var d: *Stmt = null
     if which == 0
         d = stmt_let_decl(g_tuple_p, s.var_name, s.var_name_len, 0, init, s.span.line, s.span.col)
         d.name_span = s.name_span
-    else
+    else if which == 1
         d = stmt_let_decl(g_tuple_p, s.assign_target, s.assign_target_len, 0, init, s.span.line, s.span.col)
         d.name_span = s.name2_span
+    else
+        var t: *TupleName = s.tuple_more
+        var i: i32 = 2
+        while i < which
+            t = t.next
+            i = i + 1
+        d = stmt_let_decl(g_tuple_p, t.name, t.len, 0, init, s.span.line, s.span.col)
+        d.name_span = t.span
     d
 
 # Rewrite STMT_TUPLE_DECL `s` in place into the `let`s above, when its init
 # is a tuple literal or a splittable if / match of them.
 fn tuple_split_decl(s: *Stmt)
     let init: *Expr = s.var_init
-    let n: i32 = tuple_split_leaves(init)
+    let names: i32 = tuple_decl_arity(s)   # AGAST #109
+    let n: i32 = tuple_split_leaves(init, names)
     if n == 0
         return
     let rest: *Stmt = s.next
     var first: *Stmt = null
-    var second: *Stmt = null
-    if tuple_split_pair(init) == 1
+    var last: *Stmt = null
+    if tuple_split_pair(init, names) == 1
         init.ident_ptr = c"(split)"
         init.ident_len = 7
-        first = tuple_split_let(s, 0, tuple_split_elem(init, 0))
-        second = tuple_split_let(s, 1, tuple_split_elem(init, 1))
-        first.next = second
+        var j: i32 = 0
+        while j < names
+            let d: *Stmt = tuple_split_let(s, j, tuple_split_elem(init, j))
+            if first == null
+                first = d
+            else
+                last.next = d
+            last = d
+            j = j + 1
     else
         let leaves: **Expr = parser_alloc(g_tuple_p, (n as i64) * 8) as **Expr
         var idx: i32 = 0
-        let tree: *Expr = tuple_split_index(init, leaves, @idx)
+        let tree: *Expr = tuple_split_index(init, leaves, @idx, names)
         # "$tk<N>": no source name can collide with it.
         let k: *u8 = parser_alloc(g_tuple_p, 16)
         memcpy(k, c"$tk", 3)
@@ -4362,13 +4383,16 @@ fn tuple_split_decl(s: *Stmt)
         *(k + k_len) = 0
         g_tuple_split_n = g_tuple_split_n + 1
         first = stmt_let_decl(g_tuple_p, k, k_len, 0, tree, s.span.line, s.span.col)
+        last = first
         let line: i32 = s.span.line
         let col: i32 = s.span.col
-        let a: *Stmt = tuple_split_let(s, 0, tuple_split_pick(leaves, n, 0, k, k_len, line, col))
-        second = tuple_split_let(s, 1, tuple_split_pick(leaves, n, 1, k, k_len, line, col))
-        first.next = a
-        a.next = second
-    second.next = rest
+        var j: i32 = 0
+        while j < names
+            let d: *Stmt = tuple_split_let(s, j, tuple_split_pick(leaves, n, j, k, k_len, line, col))
+            last.next = d
+            last = d
+            j = j + 1
+    last.next = rest
     # `s` is referenced by its predecessor: it becomes `first`.
     memcpy(s as *u8, first as *u8, sizeof(Stmt))
 
@@ -5084,9 +5108,9 @@ pub fn stmt_assert(p: *Parser, cond: *Expr, msg: *u8, msg_len: i32, line: i32, c
     s.next = null
     return s
 
-# `let (x, y) = expr` — 2-field destructure.  First binding name lives in
-# var_name (reuse), second in assign_target (reuse).  Init expr in
-# var_init.  Emitter (see STMT_TUPLE_DECL handler) emits the init as a
+# `let (x, y, ...) = expr` — destructure.  First binding name lives in
+# var_name (reuse), second in assign_target (reuse), any after the second
+# in tuple_more (AGAST #109, stmt_tuple_more).  Init expr in var_init.  Emitter (see STMT_TUPLE_DECL handler) emits the init as a
 # struct value, alloca two i64 slots, extractvalue fields 0/1 with
 # appropriate widening to i64, and registers both names as locals.
 pub fn stmt_tuple_decl(p: *Parser, name1: *u8, len1: i32, name2: *u8, len2: i32, init: *Expr, line: i32, col: i32) -> *Stmt
@@ -5102,9 +5126,38 @@ pub fn stmt_tuple_decl(p: *Parser, name1: *u8, len1: i32, name2: *u8, len2: i32,
     s.var_name_len = len1
     s.assign_target = name2 as *u8
     s.assign_target_len = len2
+    s.tuple_more = null   # AGAST #109: stmt_tuple_more sets the tail
     s.var_init = init
     s.next = null
     return s
+
+# AGAST #109: one name of a destructure's tail (`c` of `let (a, b, c) = e`).
+pub fn tuple_name_new(p: *Parser, name: *u8, len: i32, line: i32, col: i32) -> *TupleName
+    let t: *TupleName = parser_alloc(p, sizeof(TupleName)) as *TupleName
+    t.name = name
+    t.len = len
+    t.span.line = line
+    t.span.col = col
+    t.next = null
+    return t
+
+pub fn tuple_name_link(first: *TupleName, rest: *TupleName) -> *TupleName
+    first.next = rest
+    return first
+
+# AGAST #109: give tuple decl `s` its names after the second.
+pub fn stmt_tuple_more(s: *Stmt, more: *TupleName) -> *Stmt
+    s.tuple_more = more
+    return s
+
+# AGAST #109: how many names tuple decl `s` binds, `_` included.
+pub fn tuple_decl_arity(s: *Stmt) -> i32
+    var n: i32 = 2
+    var t: *TupleName = s.tuple_more
+    while t != null
+        n = n + 1
+        t = t.next
+    n
 
 pub fn stmt_while(p: *Parser, cond: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt

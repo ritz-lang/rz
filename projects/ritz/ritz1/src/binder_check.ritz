@@ -205,6 +205,31 @@ fn binder_bind(span: SrcSpan, name: *u8, len: i32)
     g_scope_col[g_scope_top] = span.col
     g_scope_top = g_scope_top + 1
 
+# AGAST #109: the names of tuple decl `s` after its second.  Each is judged
+# as the first two are, and against the names before it in `s` (none is
+# bound yet), as ritz0's binder_names does: `let (a, b, a)` reuses `a`.
+fn binder_check_tail(file: *u8, s: *Stmt) -> i32
+    var errors: i32 = 0
+    var tn: *TupleName = s.tuple_more
+    while tn != null
+        let judged: i32 = binder_judge(file, tn.span, tn.name, tn.len)
+        errors = errors + judged
+        if judged == 0 and binder_is_wildcard(tn.name, tn.len) == 0 and binder_module_value_kind(tn.name, tn.len) == BINDER_NONE
+            var at: SrcSpan = s.name_span
+            var hit: i32 = name_eq(s.var_name, s.var_name_len, tn.name, tn.len)
+            if hit == 0
+                at = s.name2_span
+                hit = name_eq(s.assign_target, s.assign_target_len, tn.name, tn.len)
+            var e: *TupleName = s.tuple_more
+            while hit == 0 and e != tn
+                at = e.span
+                hit = name_eq(e.name, e.len, tn.name, tn.len)
+                e = e.next
+            if hit == 1
+                errors = errors + binder_reuse_report(file, tn.span, tn.name, tn.len, at.line, at.col)
+        tn = tn.next
+    errors
+
 fn binder_judge_bind(file: *u8, span: SrcSpan, name: *u8, len: i32) -> i32
     let errors: i32 = binder_judge(file, span, name, len)
     binder_bind(span, name, len)
@@ -256,9 +281,14 @@ fn binder_check_stmts(file: *u8, first: *Stmt) -> i32
                 errors = errors + binder_reuse_report(file, s.name2_span, s.assign_target, s.assign_target_len, s.name_span.line, s.name_span.col)
             else
                 errors = errors + binder_judge(file, s.name2_span, s.assign_target, s.assign_target_len)
+            errors = errors + binder_check_tail(file, s)   # AGAST #109
             errors = errors + binder_check_expr(file, s.var_init)
             binder_bind(s.name_span, s.var_name, s.var_name_len)
             binder_bind(s.name2_span, s.assign_target, s.assign_target_len)
+            var tn: *TupleName = s.tuple_more
+            while tn != null
+                binder_bind(tn.span, tn.name, tn.len)
+                tn = tn.next
         else if s.kind == STMT_FOR
             let for_mark: i32 = g_scope_top
             errors = errors + binder_judge_bind(file, s.name_span, s.for_var, s.for_var_len)
