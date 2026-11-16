@@ -117,7 +117,7 @@ smoke:
 # strict xfails cite the tickets that own today's failures. ~30s.
 .PHONY: smoke-stack
 smoke-stack:
-	@$(PYTHON) tools/smoke_stack.py $(ARGS)
+	@$(PYTHON) tools/smoke_stack $(ARGS)
 
 # Run exactly what .github/workflows/main.yml runs, by PARSING it — AGAST #1363.
 #

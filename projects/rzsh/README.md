@@ -97,7 +97,7 @@ the Indium distribution's init sequence (`make -C projects/indium rzsh` pulls it
 in).
 
 AGAST #2461 added `cd`/`pwd`, variables, `$?`, `;`, quoting, redirection and
-pipes; `projects/ritz/tools/smoke_stack.py rzsh` runs a scripted session per
+pipes; `projects/ritz/tools/smoke_stack rzsh` runs a scripted session per
 feature against rzsh.linux, and `test/test_parse.ritz` / `test/test_shell.ritz`
 cover the tokenizer and `run_line`. Redirection and pipes wait on harland
 syscalls (fork/pipe/dup2).

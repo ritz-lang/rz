@@ -55,6 +55,10 @@ LOCAL_MODULES = {
     "ritzgen_py",
 }
 
+# Packages under tools/ whose modules are scanned too. smoke_stack was one
+# file until AGAST #3455 split it into a package; it must not leave the check.
+PACKAGES = ["smoke_stack"]
+
 # Distribution name -> module name, where they differ.
 DIST_TO_MODULE = {
     "pyyaml": "yaml",
@@ -105,11 +109,11 @@ def test_every_third_party_import_under_tools_is_declared():
     declared = _declared_modules()
     undeclared: dict[str, set[str]] = {}
 
-    for path in sorted(TOOLS.glob("*.py")):
+    for path in sorted(TOOLS.glob("*.py")) + sorted(p for pkg in PACKAGES for p in (TOOLS / pkg).glob("*.py")):
         for mod in _top_level_imports(path):
             if mod in stdlib or mod in LOCAL_MODULES or mod in declared:
                 continue
-            undeclared.setdefault(path.name, set()).add(mod)
+            undeclared.setdefault(str(path.relative_to(TOOLS)), set()).add(mod)
 
     assert not undeclared, (
         "third-party imports not declared in requirements.txt or "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-tests for tools/smoke_stack.py, the stack smoke gate (AGAST #2456).
+"""Self-tests for tools/smoke_stack/, the stack smoke gate (AGAST #2456).
 
 The gate's value is in the properties that would make it say "fine" when the
 stack is broken, so those are what these pin, without starting any server:
@@ -185,16 +185,17 @@ def test_every_zeus_the_stack_starts_gets_the_store_env():
     # A zeus started without it runs nexus workers that dial 127.0.0.1:7777,
     # i.e. some other stack's mausoleum (zeus_alone did, #3065).
     import ast
-    tree = ast.parse(Path(ss.__file__).read_text())
     zeus_starts = [
-        n for n in ast.walk(tree)
+        (src.name, n) for src in sorted(Path(ss.__file__).parent.glob("*.py"))
+        for n in ast.walk(ast.parse(src.read_text()))
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "start"
         and len(n.args) >= 2 and isinstance(n.args[1], ast.List)
-        and any(isinstance(e, ast.Call) and ast.unparse(e) == "str(zeus)" for e in n.args[1].elts)
+        and any(isinstance(e, ast.Call) and ast.unparse(e) in ("str(zeus)", "str(ctx.zeus)")
+                for e in n.args[1].elts)
     ]
     assert len(zeus_starts) >= 2
-    missing = [n.lineno for n in zeus_starts if not any(k.arg == "env" for k in n.keywords)]
-    assert not missing, f"zeus started without env= at smoke_stack.py lines {missing}"
+    missing = [f"{f}:{n.lineno}" for f, n in zeus_starts if not any(k.arg == "env" for k in n.keywords)]
+    assert not missing, f"zeus started without env= at {missing}"
 
 
 # --- process hygiene -----------------------------------------------------------

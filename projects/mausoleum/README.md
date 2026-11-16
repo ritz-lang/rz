@@ -85,7 +85,7 @@ root page and counters go to the WAL as one transaction, then to `data.m7m` and
 `meta.m7m`. A restart on DIR (including after `kill -9`, or a crash mid-flush)
 redoes the WAL and reopens the same collection; a checkpoint (on open, on close,
 or past 4 MiB) cuts the WAL back. `test/test_restart.ritz` restarts a store
-those ways; `projects/ritz/tools/smoke_stack.py mausoleum` does it with the
+those ways; `projects/ritz/tools/smoke_stack mausoleum` does it with the
 real binaries.
 
 `mausoleum shell` and `wiki-seed` speak the encrypted protocol by default, like

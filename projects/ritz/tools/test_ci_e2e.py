@@ -37,8 +37,9 @@ E2ES = [
     "projects/nexus/test/e2e_large_page.sh",
     "projects/valet/test/test_tls_socket.sh",
     # AGAST #2456: the stack smoke gate, same constraints (needs the debug
-    # binaries, real servers, must exit 0 or 1 only).
-    "projects/ritz/tools/smoke_stack.py",
+    # binaries, real servers, must exit 0 or 1 only). A package run as a
+    # directory since #3455: its __main__.py calls cli.main().
+    "projects/ritz/tools/smoke_stack",
 ]
 REPO = ci_local.WORKFLOW.resolve().parents[2]
 
@@ -55,7 +56,20 @@ def _e2e_index(steps: list[ci_local.Step], e2e: str) -> int:
 
 @pytest.mark.parametrize("e2e", E2ES)
 def test_e2e_script_exists(e2e):
-    assert (REPO / e2e).is_file()
+    path = REPO / e2e
+    assert path.is_file() or (path / "__main__.py").is_file()
+
+
+def _python_entry(path: Path) -> tuple[str, str] | None:
+    """(every line of source, main()'s module source) of a Python e2e: a
+    script, or a package directory whose __main__ calls cli.main()."""
+    if path.suffix == ".py":
+        src = path.read_text()
+        return src, src
+    if (path / "__main__.py").is_file():
+        src = "\n".join(p.read_text() for p in sorted(path.glob("*.py")))
+        return src, (path / "cli.py").read_text() + (path / "__main__.py").read_text()
+    return None
 
 
 @pytest.mark.parametrize("e2e", E2ES)
@@ -95,16 +109,18 @@ def test_e2e_never_exits_with_the_setup_code(e2e):
     """ci_local reads exit 3 as SETUP ERROR (a missing tool, no verdict on
     the code) and does not stop --fail-fast for it. A red e2e must read as
     a regression, so the script may only exit 0 or 1."""
-    src = (REPO / e2e).read_text()
-    if e2e.endswith(".py"):
+    py = _python_entry(REPO / e2e)
+    if py:
         # Python: every sys.exit(N) / exit(N) literal and every `return N`
         # out of main(). The script exits via sys.exit(main()).
+        src, main_mod = py
         codes = set(re.findall(r"\bexit\((\d+)\)", src))
-        main_src = src[src.index("\ndef main("):]
+        main_src = main_mod[main_mod.index("\ndef main("):]
         codes |= set(re.findall(r"^\s+return (\d+)\b", main_src, re.M))
-        assert "sys.exit(main())" in src
+        assert "sys.exit(main())" in main_mod
         assert codes <= {"0", "1"}, f"{e2e} exits with {sorted(codes)}"
         return
+    src = (REPO / e2e).read_text()
     # Statements, not prose: "curl exit $rc" in a message is not one.
     codes = set(re.findall(r"(?<!curl )\bexit\s+([^\s;})\"']+)", src))
     assert codes <= {"0", "1"}, f"{e2e} exits with {sorted(codes)}"
