@@ -84,6 +84,9 @@ pub struct TlsConfig
     # Hostname for SNI and certificate verification
     hostname: [256]u8
     hostname_len: i32
+    # 1 after tls_config_set_hostname refused a name: a client built from
+    # this config fails closed even if the caller ignored that error.
+    hostname_refused: i32
 
     # Trust anchor: DER of the one leaf certificate this client accepts.
     pinned_cert: [4096]u8
@@ -106,14 +109,24 @@ pub fn tls_config_init(cfg: *TlsConfig)
     cfg.cipher_suites[0] = TLS_AES_128_GCM_SHA256
     cfg.num_cipher_suites = 1
 
-pub fn tls_config_set_hostname(cfg: *TlsConfig, hostname: *u8, len: i32)
-    if len > 255
-        len = 255
+# Set the hostname used for SNI and certificate verification. Returns 0, or
+# -1 if `len` is negative or over TLS_MAX_HOSTNAME_LEN (253). A refused name
+# clears any earlier one and poisons the config: tls_client_init fails, and
+# so does tls_client_start. It used to clamp to 255 and carry on, so SNI and
+# the certificate check ran on a prefix of the name asked for (AGAST #3460).
+pub fn tls_config_set_hostname(cfg: *TlsConfig, hostname: *u8, len: i32) -> i32
+    mem_zero(@cfg.hostname[0], sizeof(cfg.hostname))
+    cfg.hostname_len = 0
+    if len < 0 || len > TLS_MAX_HOSTNAME_LEN
+        cfg.hostname_refused = 1
+        return -1
     var i: i32 = 0
     while i < len
         cfg.hostname[i] = hostname[i]
         i += 1
     cfg.hostname_len = len
+    cfg.hostname_refused = 0
+    return 0
 
 # Pin the server's leaf certificate (DER). The handshake fails unless the
 # server presents exactly this certificate. Returns 0, or -1 if it is empty
@@ -200,10 +213,17 @@ pub struct TlsClient
 # ============================================================================
 
 # Initialize a new TLS client
-# Returns 0 on success, -1 if the RNG failed (the client must not be used).
+# Returns 0 on success, -1 if the RNG failed or the config's hostname was
+# refused (the client must not be used).
 pub fn tls_client_init(client: *TlsClient, config: *TlsConfig) -> i32
     # Zero everything
     mem_zero(client as *u8, sizeof(TlsClient))
+
+    # A refused hostname fails closed (AGAST #3460): never handshake without
+    # the name the caller asked for.
+    if config.hostname_refused != 0
+        client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+        return -1
 
     # Copy config
     mem_copy(@client.config as *u8, config as *u8, sizeof(TlsConfig))
@@ -220,7 +240,9 @@ pub fn tls_client_init(client: *TlsClient, config: *TlsConfig) -> i32
 
     # Set hostname from config
     if config.hostname_len > 0
-        client_hello_set_hostname(@client.client_hello, @config.hostname[0], config.hostname_len)
+        if client_hello_set_hostname(@client.client_hello, @config.hostname[0], config.hostname_len) != 0
+            client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+            return -1
 
     # Set cipher suites from config
     var i: i32 = 0
