@@ -2356,12 +2356,24 @@ struct GlobalInit
     text_len: i32
     neg: i32
 
-# Fold a global initializer: literals, unary - ~ ! of a literal, null, and
-# `as` casts of any of those.  The cast target is not consulted: the value is
-# written in the global's own storage type, as ritz0 does.
-fn global_init_fold(e: *Expr, out: *GlobalInit)
+# Fold a global initializer: literals, module integer/bool consts (AGAST
+# #1540), unary - ~ ! of one, null, and `as` casts of any of those.  The cast
+# target is not consulted: the value is written in the global's own storage
+# type, as ritz0 does.
+fn global_init_fold(s: *EmitterState, e: *Expr, out: *GlobalInit)
     out.kind = GINIT_BAD
     if e == null
+        return
+    # AGAST #1540: `var g: i32 = MAX`.  resolve_const_values has run, so an
+    # integer const is DONE with its folded, type-wrapped value (#1502: -7,
+    # not 0) or BAD with its own error.  A float/struct/pointer const's
+    # `value` is not its value, and any other name (a global, a fn) is not
+    # constant: both stay BAD.
+    if e.kind == EXPR_IDENT
+        let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+        if ce != null and ce.fold_state == CONST_FOLD_DONE and is_int_const_type(ce.const_type) == 1
+            out.kind = GINIT_INT
+            out.int_val = ce.value
         return
     if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
         out.kind = GINIT_INT
@@ -2383,10 +2395,10 @@ fn global_init_fold(e: *Expr, out: *GlobalInit)
         out.text_len = e.string_len
         return
     if e.kind == EXPR_CAST
-        global_init_fold(e.left, out)
+        global_init_fold(s, e.left, out)
         return
     if e.kind == EXPR_UNARY
-        global_init_fold(e.operand, out)
+        global_init_fold(s, e.operand, out)
         if e.op == OP_NEG
             if out.kind == GINIT_INT
                 out.int_val = 0 - out.int_val
@@ -2502,9 +2514,9 @@ fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
     if g.var_type == TYPE_STRUCT or g.var_type == TYPE_ARRAY
         global_init_error(s, g, g.line, g.col, c"has an aggregate initializer; ritz1 only lowers scalar constants")
         return
-    global_init_fold(g.init_expr, gi)
+    global_init_fold(s, g.init_expr, gi)
     if gi.kind == GINIT_BAD
-        global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"has a non-constant initializer; ritz1 lowers only literals, unary -/~/! of one, null and casts of those")
+        global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"has a non-constant initializer; ritz1 lowers only literals, integer consts, unary -/~/! of one, null and casts of those")
         return
     if gi.kind == GINIT_STR and g.var_type != TYPE_PTR
         global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a pointer but has a string initializer")
