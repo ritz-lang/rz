@@ -306,6 +306,68 @@ bin=$(make_binary exits 'echo out; echo err >&2; exit 3')
 check "[$NAME] stress: run_binary x20 under a cleanup trap: status and output captured" "" \
     "$(stress_run_binary "$bin" "$SCRATCH/e2e")"
 
+# 7. A job the budget catches before it has reached setsid() is still
+#    KILLed at the budget -- AGAST #3222.  The sid names a session only once
+#    the `&` job has exec'd setsid and setsid() has run; until then the job
+#    is still in the harness's session, so `pkill -s SID` matched nothing and
+#    `wait SID` waited for it to end on its own: unbounded for a hang.  A
+#    fake setsid first on PATH stalls 15s in a builtin `read -t` (no fork:
+#    the stalled process IS the would-be leader, pid SID) before it execs the
+#    real one.  Where a real stall needs a budget's worth of extreme load,
+#    this hits the window every time.
+#    Once for run_binary and once for run_test_script, which share the bug.
+REAL_SETSID=$(command -v setsid)
+STALL="$SCRATCH/stall-${TAG}"
+mkdir -p "$STALL"
+mkfifo "$STALL/fifo"
+printf '#!/bin/bash\nread -rt 15 <> %q\nexec %q "$@"\n' "$STALL/fifo" "$REAL_SETSID" > "$STALL/setsid"
+chmod 755 "$STALL/setsid"
+# stalled -- is a stalled fake setsid still running?
+stalled() {
+    local i
+    for i in 1 2 3 4 5; do
+        pgrep -f "stall-${TAG}/setsid" >/dev/null || { echo gone; return; }
+        sleep 0.1
+    done
+    echo alive
+}
+# In ( ) so PATH and the hash table revert after.
+bin=$(make_binary stalled 'exit 0')
+t0=$SECONDS
+( PATH="$STALL:$PATH"; hash -r; RUN_TIMEOUT=1s run_binary "$bin" "$out.stdout" "$out.exit" )
+check "[$NAME] stalled before setsid: run_binary returns within the 1s budget, not the stall's 15s" yes \
+    "$( (( SECONDS - t0 <= 4 )) && echo yes || echo "no ($((SECONDS - t0))s)")"
+check "[$NAME] stalled before setsid: run_binary records SIGKILL (137)" 137 "$(cat "$out.exit" 2>/dev/null)"
+check "[$NAME] stalled before setsid: run_binary's job is killed" gone "$(stalled)"
+pkill -KILL -f "stall-${TAG}/setsid" 2>/dev/null
+ex="$SCRATCH/ex-stalled"
+mkdir -p "$ex"
+printf '[package]\nname = "stalled"\n' > "$ex/ritz.toml"
+printf 'exit 0\n' > "$ex/test.sh"
+t0=$SECONDS
+( PATH="$STALL:$PATH"; hash -r; TEST_SCRIPT_TIMEOUT=1 run_test_script "$ex" "$bin" ); r=$?
+check "[$NAME] stalled before setsid: run_test_script returns within the 1s budget, not the stall's 15s" yes \
+    "$( (( SECONDS - t0 <= 4 )) && echo yes || echo "no ($((SECONDS - t0))s)")"
+check "[$NAME] stalled before setsid: run_test_script reports SIGKILL (137)" 137 "$r"
+check "[$NAME] stalled before setsid: run_test_script's job is killed" gone "$(stalled)"
+pkill -KILL -f "stall-${TAG}/setsid" 2>/dev/null
+
+# 8. kill_session sweeps until a pass finds nothing -- AGAST #3222.  One
+#    `pkill -s` is one /proc scan, which misses a child forked after the scan
+#    read the directory by a parent it then KILLs.  That race is not
+#    reproducible on demand, so a shadow pkill stands in for it: its first
+#    pass "matches" (returns 0) yet kills nothing, as a pass that killed the
+#    parent and missed the new child.  A single pass leaves the session
+#    alive; a sweep's next pass ends it.  In $( ) so the shadow stays there.
+{ setsid bash -c "sleep 15.${TAG}4 & exit 0" & s=$!; wait "$s"; } 2>/dev/null
+for _ in $(seq 50); do pgrep -fx "sleep 15\.${TAG}4" >/dev/null && break; sleep 0.02; done
+check "[$NAME] kill_session: a pass that misses a late fork is followed by another" gone "$(
+    missed=
+    pkill() { [[ -n "$missed" ]] && { command pkill "$@"; return; }; missed=1; return 0; }
+    kill_session "$s"
+    alive 4)"
+pkill -KILL -fx "sleep 15\.${TAG}4" 2>/dev/null
+
 if [[ "${ARGS[0]:-}" == "--as" ]]; then
     [[ $TESTS_FAILED -eq 0 ]]; exit
 fi

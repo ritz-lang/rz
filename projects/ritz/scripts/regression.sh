@@ -619,6 +619,26 @@ fi
 # that has exited but not been reaped still answers `kill -0`: the next
 # `wait -n` reaps and reports it as usual.
 WATCHDOG_TICK=0.1
+
+# kill_session SID -- KILL every process in session SID, pass after pass,
+# until a pass finds none -- AGAST #3222.  One `pkill -s` is a single /proc
+# scan: a process forked after the scan read the directory, by a parent it
+# then KILLs, is never seen.  Once its parent is dead it can fork no more,
+# so the next pass finds it; each pass shrinks the session by a generation.
+# A KILLed process still matches until it is reaped, and an orphan is
+# reaped by init (or a subreaper) whenever that gets to it; a pass that
+# finds only those is spent, so the loop is capped (~1s), not unbounded.
+# Call it after the leader is reaped: as our unreaped child it would match
+# every pass.
+KILL_SESSION_PASSES=20
+kill_session() {
+    local i
+    for ((i = 0; i < KILL_SESSION_PASSES; i++)); do
+        pkill -KILL -s "$1" 2>/dev/null || return 0
+        sleep 0.05
+    done
+}
+
 watchdog_wait() {
     local sid="$1" budget="$2" wd tick first result
     sleep "$budget" &
@@ -649,9 +669,17 @@ watchdog_wait() {
     # budget.  KILL can be neither caught nor lost.
     kill -KILL "$tick" 2>/dev/null
     if [[ "$first" == "$wd" ]]; then
-        # Watchdog fired with the job still running: timed out.
-        pkill -KILL -s "$sid" 2>/dev/null
+        # Watchdog fired with the job still running: timed out.  KILL the
+        # leader by pid first -- AGAST #3222.  SID names a session only once
+        # the job has exec'd setsid and setsid() has run; a job stalled
+        # before that is still in our session, `pkill -s` matches nothing,
+        # and `wait SID` waited for it to end on its own.  Its pid is SID
+        # either way (setsid execs in place), and it cannot have been
+        # reused: SID is our child, not yet reaped.  Then the rest of the
+        # session, if it got that far.
+        kill -KILL "$sid" 2>/dev/null
         wait "$sid" "$tick"
+        kill_session "$sid"
         result=137
     else
         kill -KILL "$wd" 2>/dev/null
@@ -908,7 +936,7 @@ run_test_script() {
       sid=$!
       watchdog_wait "$sid" "${TEST_SCRIPT_TIMEOUT:-30}"
       result=$?; } 2>/dev/null
-    pkill -KILL -s "$sid" 2>/dev/null || true
+    kill_session "$sid"
 
     for n in "${linked[@]}"; do rm -f "./$n"; done
     cd "$orig_dir"
