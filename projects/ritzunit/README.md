@@ -91,6 +91,7 @@ Options:
   -f, --filter=EXPR    Filter tests by EXPR (glob, @attr, bool)
   -t, --timeout=MS     Timeout per test in milliseconds (default: 5000)
       --no-fork        Disable fork isolation (run tests in main process)
+      --core           Let a crashing test dump core (default: it cannot)
   -j, --jobs=N         Run up to N tests at once, each in its own child (default: 1)
   -x, --fail-fast      Stop on first test failure
   -s, --shuffle        Randomize test execution order
@@ -99,6 +100,24 @@ Options:
       --junit          Output results in JUnit XML format
       --color          Force colored output (even when not a TTY)
       --no-color       Disable colored output
+```
+
+### Crashes and core dumps
+
+A test child cannot dump core: before running its test it sets
+`PR_SET_DUMPABLE 0` and `RLIMIT_CORE 0`. The kernel runs the core handler
+before the runner sees the crash. A piped `core_pattern` (apport,
+systemd-coredump) can take longer than the test's `-t` deadline. The runner's
+SIGKILL then interrupts the dump, and the crash is reported as a timeout. With
+both settings off, a crash is reported as a crash at once, and no core files
+or crash reports are left behind (AGAST #2072).
+
+To debug a crash from its core file, pass `--core`. Children then keep the
+runner's own dumpable flag and core limit, so raise the limit first:
+
+```bash
+ulimit -c unlimited
+$BIN --core -f 'crashing_test'
 ```
 
 ## Dependencies

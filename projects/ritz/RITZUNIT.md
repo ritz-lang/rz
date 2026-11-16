@@ -45,4 +45,5 @@ $BIN -v            # each test as it runs
 $BIN -f 'name*'    # only matching tests
 $BIN --no-fork     # in-process, for a debugger (no output capture)
 $BIN --json        # the report ./rz test reads
+$BIN --core        # let a crashing test dump core (children cannot by default)
 ```

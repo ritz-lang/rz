@@ -23,6 +23,7 @@
 #   -j, --jobs N     Run up to N tests at once (default: 1); reported in order
 #   --json           JSON report (no short form: -j is --jobs, as in make/rz)
 #   --no-fork        Disable fork isolation (run tests in main process)
+#   --core           Let a crashing test dump core (default: it cannot)
 #   -h, --help       Show help message
 
 import ritzlib.sys
@@ -57,6 +58,11 @@ const SYS_MEMFD_CREATE: i64 = 319
 const SYS_FTRUNCATE: i64 = 77
 const MFD_CLOEXEC: i64 = 1
 
+const SYS_PRCTL: i64 = 157
+const SYS_SETRLIMIT: i64 = 160
+const PR_SET_DUMPABLE: i64 = 4
+const RLIMIT_CORE: i64 = 4
+
 # Output kept per failing test: the last CAPTURE_KEEP bytes. A diagnostic is
 # at the end of a test's output, and a runaway test must not exhaust memory.
 const CAPTURE_KEEP: i64 = 65536
@@ -78,6 +84,7 @@ var g_json: i32 = 0          # --json: output in JSON format
 var g_junit: i32 = 0         # --junit: output in JUnit XML format
 var g_color: i32 = 0         # 0=auto, 1=always, -1=never
 var g_jobs: i64 = 1          # -j: tests run at once (forked children)
+var g_core: i32 = 0          # --core: let a crashing test dump core
 
 # ============================================================================
 # Timing
@@ -173,6 +180,21 @@ fn capture_take(fd: i32) -> StrView
     out.len = got
     return out
 
+# A forked test child may not dump core (AGAST #2072). The kernel runs the
+# core handler before the runner sees the crash; a piped core_pattern (apport,
+# systemd-coredump) can outlast the test's deadline, and the runner's SIGKILL
+# then turns the crash into a timeout. Not dumpable: no handler runs at all.
+# RLIMIT_CORE 0 also stops a plain-file pattern should something make the
+# process dumpable again (an exec, a setuid). --core keeps both as they were.
+fn child_disable_core()
+    if g_core != 0
+        return
+    syscall2(SYS_PRCTL, PR_SET_DUMPABLE, 0)
+    var zero: [2]i64
+    zero[0] = 0
+    zero[1] = 0
+    syscall2(SYS_SETRLIMIT, RLIMIT_CORE, @zero[0] as i64)
+
 # Run a test directly in the current process (no isolation).
 fn run_test_direct(test: *RitzTest) -> i32
     let run: fn() -> i32 = test.run
@@ -230,6 +252,7 @@ fn pool_launch(slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_ma
     if pid == 0
         # === Child: the test sees the signal mask the runner started with ===
         sys_rt_sigprocmask(SIG_SETMASK, old_mask, null, 8)
+        child_disable_core()
         if slot.capture_fd >= 0
             sys_dup2(slot.capture_fd, 1)
             sys_dup2(slot.capture_fd, 2)
@@ -568,6 +591,7 @@ fn parse_args(argc: i32, argv: **u8) -> i32
     args_option(@parser, 'f', c"filter", c"EXPR", c"Filter tests by EXPR (glob, @attr, bool)", null)
     args_option(@parser, 't', c"timeout", c"MS", c"Timeout per test in milliseconds", c"5000")
     args_flag(@parser, 0, c"no-fork", c"Disable fork isolation (run tests in main process)")
+    args_flag(@parser, 0, c"core", c"Let a crashing test dump core (default: it cannot)")
     args_flag(@parser, 'x', c"fail-fast", c"Stop on first test failure")
     args_flag(@parser, 's', c"shuffle", c"Randomize test execution order")
     args_option(@parser, 0, c"seed", c"N", c"Random seed for shuffling (0 = auto)", c"0")
@@ -590,6 +614,7 @@ fn parse_args(argc: i32, argv: **u8) -> i32
     g_filter = args_get_str(@parser, 'f')
     g_timeout_ms = args_get_int(@parser, 't')
     g_no_fork = args_get_flag_long(@parser, c"no-fork")
+    g_core = args_get_flag_long(@parser, c"core")
     g_fail_fast = args_get_flag(@parser, 'x')
     g_shuffle = args_get_flag(@parser, 's')
     g_seed = args_get_int_long(@parser, c"seed")
