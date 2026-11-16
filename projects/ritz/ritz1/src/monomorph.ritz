@@ -2398,9 +2398,51 @@ struct ArrayArg
     pointee: i32       # for a TYPE_PTR element, its pointee's TYPE_*
     name: *u8          # the struct named by the element or its pointee
     name_len: i32
+    # AGAST #3634: every dimension of an `arrN_arrM_..E` (elem is then
+    # TYPE_ARRAY and name null, as on an N-D local); null for a 1-D one.
+    shape: *ArrayShape
 
 # 1 and *out filled when name[0..len] spells an array, else 0.
 pub fn array_arg_decode(name: *u8, len: i32, out: *ArrayArg) -> i32
+    out.shape = null
+    if array_arg_decode_1d(name, len, out) == 0
+        return 0
+    # AGAST #3634: an element that itself spells an array nests it.
+    if out.elem != TYPE_STRUCT or out.name_len < 6
+        return 1
+    var inner: ArrayArg
+    if array_arg_decode(out.name, out.name_len, @inner) == 0
+        return 1
+    var inner_rank: i32 = 1
+    if inner.shape != null
+        inner_rank = inner.shape.rank
+    if inner_rank >= MAX_ARRAY_RANK
+        return 1
+    let sh: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
+    sh.rank = inner_rank + 1
+    sh.dims[0] = out.size
+    if inner.shape == null
+        sh.dims[1] = inner.size
+        sh.leaf_type = inner.elem
+        sh.leaf_pointee = inner.pointee
+        sh.leaf_name = inner.name
+        sh.leaf_name_len = inner.name_len
+    else
+        for d in 0..inner_rank
+            sh.dims[d + 1] = inner.shape.dims[d]
+        sh.leaf_type = inner.shape.leaf_type
+        sh.leaf_pointee = inner.shape.leaf_pointee
+        sh.leaf_name = inner.shape.leaf_name
+        sh.leaf_name_len = inner.shape.leaf_name_len
+    out.elem = TYPE_ARRAY
+    out.pointee = TYPE_VOID
+    out.name = null
+    out.name_len = 0
+    out.shape = sh
+    1
+
+# One `arrN_` level of array_arg_decode, its element read as written.
+fn array_arg_decode_1d(name: *u8, len: i32, out: *ArrayArg) -> i32
     if name == null or len < 6 or memcmp(name, c"arr", 3) != 0
         return 0
     var pos: i32 = 3
@@ -2895,6 +2937,7 @@ fn param_take_array_arg(param: *Param, name: *u8, len: i32) -> i32
     param.param_array_size = arr.size
     param.param_array_elem_type = arr.elem
     param.param_array_elem_pointee = arr.pointee
+    param.param_array_shape = arr.shape   # AGAST #3634
     param.param_type_name = arr.name
     param.param_type_name_len = arr.name_len
     1
@@ -3010,6 +3053,9 @@ fn clone_params_with_suffix(params: *Param, type_param: *u8, type_param_len: i32
     cloned.param_array_size = params.param_array_size
     cloned.param_array_elem_type = params.param_array_elem_type
     cloned.param_array_elem_pointee = params.param_array_elem_pointee   # AGAST #2332
+    # AGAST #3634: a by-value `[N][M]T`'s shape, its leaf substituted as above.
+    let byval_sh: *ArrayShape = array_shape_subst(params.param_array_shape, type_param, type_param_len, subst_type, subst_name, subst_len)
+    cloned.param_array_shape = array_shape_mangled_subst(byval_sh, type_param, type_param_len, suffix, suffix_len)
     cloned.is_borrow = params.is_borrow
     cloned.is_self_borrow = params.is_self_borrow
     cloned.param_ref_ptr_pointee = params.param_ref_ptr_pointee   # AGAST #2308
@@ -3430,6 +3476,7 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
                 cloned.var_array_size = vaa.size
                 cloned.var_array_elem_type = vaa.elem
                 cloned.var_array_elem_pointee = vaa.pointee
+                cloned.var_array_shape = vaa.shape   # AGAST #3634
                 cloned.var_type_name = vaa.name
                 cloned.var_type_name_len = vaa.name_len
         else if s.var_type == TYPE_STRUCT and s.var_type_name != null
@@ -3464,8 +3511,10 @@ fn clone_stmt(s: *Stmt, type_param: *u8, type_param_len: i32, subst_type: i32, s
         # AGAST #3120: `var a: [2][3]T` / `[2][3]P<T>` at T = the argument.  The
         # leaf lives only in the shape; kept as `T` / `P$T`, P$i64 was never
         # instantiated and `a[1][2].v` was "unhandled EXPR_MEMBER".
-        let bare_sh: *ArrayShape = array_shape_subst(s.var_array_shape, type_param, type_param_len, subst_type, subst_name, subst_len)
-        cloned.var_array_shape = array_shape_mangled_subst(bare_sh, type_param, type_param_len, suffix, suffix_len)
+        # AGAST #3634: a bare `var x: T` at T = `[N][M]E` took its shape above.
+        if s.var_array_shape != null
+            let bare_sh: *ArrayShape = array_shape_subst(s.var_array_shape, type_param, type_param_len, subst_type, subst_name, subst_len)
+            cloned.var_array_shape = array_shape_mangled_subst(bare_sh, type_param, type_param_len, suffix, suffix_len)
         # AGAST #2308: `let p: @&T` concretizes T as a `@&T` param does.
         cloned.var_ref = clone_params_with_suffix(s.var_ref, type_param, type_param_len, subst_type, subst_name, subst_len, suffix, suffix_len)
         if cloned.var_ref != null
@@ -3579,10 +3628,17 @@ fn sizeof_subst_operand(at: *Expr, subst_type: i32, subst_name: *u8, subst_len: 
     var leaf_len: i32 = subst_len
     var a: ArrayArg
     if subst_type == TYPE_ARRAY and array_arg_decode(subst_name, subst_len, @a) == 1
-        op.int_val = op.int_val * a.size as i64
         op.op = a.elem
         leaf_name = a.name
         leaf_len = a.name_len
+        var count: i32 = a.size
+        if a.shape != null
+            # AGAST #3634: `[N][M]E` is N*M values of its leaf E.
+            count = shape_leaf_count(a.shape)
+            op.op = a.shape.leaf_type
+            leaf_name = a.shape.leaf_name
+            leaf_len = a.shape.leaf_name_len
+        op.int_val = op.int_val * count as i64
     if op.op == TYPE_STRUCT
         op.ident_ptr = leaf_name
         op.ident_len = leaf_len
@@ -4130,7 +4186,7 @@ fn subst_value_field(cloned: *StructField, subst_type: i32, subst_name: *u8, sub
         cloned.array_elem_pointee = a.pointee
         cloned.array_elem_type_name = a.name
         cloned.array_elem_type_name_len = a.name_len
-        cloned.array_shape = null
+        cloned.array_shape = a.shape   # AGAST #3634: `[N][M]E`
 
 # A `*T` / `@T` / `@&T` field at T = the argument.  The parser records a
 # struct pointee in field_type_name and a primitive one in array_elem_type.

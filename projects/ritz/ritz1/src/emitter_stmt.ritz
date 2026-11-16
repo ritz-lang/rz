@@ -1255,6 +1255,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             stmt.var_array_size = lra.param_array_size
             stmt.var_array_elem_type = lra.param_array_elem_type
             stmt.var_array_elem_pointee = lra.param_array_elem_pointee
+            stmt.var_array_shape = lra.param_array_shape   # AGAST #3634: `[N][M]T`
             stmt.var_type_name = lra.param_type_name
             stmt.var_type_name_len = lra.param_type_name_len
         # AGAST #3191: so is `let c = *p` of a `*[N]T` (local, field, global,
@@ -3022,8 +3023,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         return
 
     # AGAST #1509: `g = v` onto a whole multi-dimensional array stored one
-    # i64 into its first 8 bytes.  Not lowered: fail closed.
-    if nd_array_name_shape(s, stmt.assign_target, stmt.assign_target_len) != null
+    # i64 into its first 8 bytes.  AGAST #3634: a whole N-D value of the same
+    # shape (a local, a global, a `:&` param on either side, a call) is copied
+    # over it; anything else still fails closed.
+    let whole_sh: *ArrayShape = nd_array_name_shape(s, stmt.assign_target, stmt.assign_target_len)
+    if whole_sh != null
+        if emit_nd_whole_assign(s, stmt, whole_sh) == 1
+            return
         emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a whole multi-dimensional array is not supported in ritz1 (assign each element)")
         return
     let loc: i32 = find_local(s, stmt.assign_target, stmt.assign_target_len)
@@ -4880,6 +4886,9 @@ pub fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
 # the sret slot it wrote (emit_sret_array_call_slot), copied pointer-to-pointer.
 fn emit_call_array_store(s: *EmitterState, value: *Expr, ra: *Param, dst_ptr: i32)
     let cv: i32 = emit_expr(s, value)
+    if array_param_uses_byval(s, ra) == 1 and ra.param_array_shape != null
+        emit_nd_plane_copy(s, ra.param_array_shape, 0, dst_ptr, cv)   # AGAST #3634
+        return
     if array_param_uses_byval(s, ra) == 1
         emit_local_array_copy(s, ra.param_array_size, ra.param_array_elem_type, ra.param_type_name, ra.param_type_name_len, cv, dst_ptr)
         return
@@ -5014,6 +5023,14 @@ fn array_shapes_match(a: *ArrayShape, b: *ArrayShape) -> i32
 # AGAST #3350: or a plane of a deeper one (`g[1]` of `[2][2][3]T`, any base
 # emit_nd_index_ptr takes), copied from the address that GEP gives.
 fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *Expr) -> i32
+    # AGAST #3634: a call's `-> [N][M]T`, stored straight into the slot.
+    let cra: *Param = call_ret_array(s, value)
+    if cra != null and cra.param_array_shape != null
+        if array_shapes_match(cra.param_array_shape, sh) == 0
+            emit_ir_error(s, c"multi-dimensional array initializer's shape does not match the local array's")
+            return 1
+        emit_call_array_store(s, value, cra, dst_ptr)
+        return 1
     var src_sh: *ArrayShape = nd_array_base_shape(s, value)
     if src_sh == null
         src_sh = nd_plane_shape(s, value)
@@ -5042,6 +5059,35 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
             src_ptr = emit_global_array_ptr(s, find_global(s, value.ident_ptr, value.ident_len))
     emit_nd_plane_copy(s, sh, 0, dst_ptr, src_ptr)
     1
+
+# AGAST #3634: `g = v` with `g` a whole N-D local, global or `:&` param of shape
+# `sh`: `v`'s array copied over it, as emit_nd_array_init_copy initialises a
+# slot (a `:&` param's local is the caller's array).  0, having emitted
+# nothing, when `v` is no N-D value; a move-only leaf isn't copied either
+# (the old elements would never drop, and `v`'s would drop twice).
+fn emit_nd_whole_assign(s: *EmitterState, stmt: *Stmt, sh: *ArrayShape) -> i32
+    if sh.leaf_type == TYPE_STRUCT and sh.leaf_name_len > 0 and own_type_is_move_only(s, sh.leaf_name, sh.leaf_name_len) == 1
+        return 0
+    let v: *Expr = stmt.assign_value
+    let cra: *Param = call_ret_array(s, v)
+    if (cra == null or cra.param_array_shape == null) and nd_array_base_shape(s, v) == null and nd_plane_shape(s, v) == null
+        return 0
+    var dst: i32 = 0
+    let loc: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
+    if loc != null
+        dst = loc.reg
+    else
+        dst = emit_global_array_ptr(s, find_global(s, stmt.assign_target, stmt.assign_target_len))
+    emit_nd_array_init_copy(s, dst, sh, v)
+
+# AGAST #3634: the whole `[N][M]..T` value `value` (an N-D place or a call
+# returning one, emit_nd_array_init_copy) copied into the fresh slot `dst_ptr`
+# of shape `sh`, for a by-value param or a return.  Anything else is no value
+# of that type: a located error.
+pub fn emit_nd_array_value_into(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *Expr)
+    if emit_nd_array_init_copy(s, dst_ptr, sh, value) == 1
+        return
+    emit_nd_error(s, value.span.line, value.span.col, c"this value is not a multi-dimensional array of that shape")
 
 # Copy the dimension-`from` plane of `sh` (the whole array at 0) from
 # `src_ptr` over `dst_ptr`: one aggregate load + store, or pointer-to-pointer

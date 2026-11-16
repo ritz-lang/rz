@@ -1455,11 +1455,12 @@ def test_ritz1_refuses_at_the_line(ritz1_bin, tmp_path, name):
     assert re.search(pattern, comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 
-# ritz0 gives 3 for these; ritz1 refuses them, located.  A nested array has no
-# whole value in ritz1: that's #2098 and #2099, and these are what's left of it.
-# (`var b = a` of `a:& [2][3]i32` is lowered since #3299: test_nd_array_field_copy.)
-NESTED_LOCATED = {
-    "nested_whole_assign": ("assigning a whole multi-dimensional array", """
+# ritz0 gives 3 for these.  ritz1 refused them, located, until AGAST #3634: a
+# whole `[2][3]i32` assigned through a `:&` (either side) or between locals is
+# the whole nested array, every row (`var b = a` of a `:&` is #3299's:
+# test_nd_array_field_copy).
+NESTED_WHOLE = {
+    "nested_whole_assign": """
 fn f(a:& [2][3]i32, b:& [2][3]i32)
     a = b
 
@@ -1469,23 +1470,48 @@ pub fn main() -> i32
     b[1][2] = 3
     f(@&a, @&b)
     return a[1][2]
-"""),
+""",
+    # ... every cell, and a local on either side of a borrow.
+    "nested_whole_assign_cells": """
+fn put(a:& [2][3]i32, g: [2][3]i32)
+    a = g
+
+fn get(b:& [2][3]i32) -> i32
+    var l: [2][3]i32
+    l = b
+    return l[0][1] + l[1][0]
+
+pub fn main() -> i32
+    var a: [2][3]i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            a[i][j] = 9
+            g[i][j] = i * 3 + j
+    put(@&a, g)
+    for i in 0..2
+        for j in 0..3
+            if a[i][j] != i * 3 + j
+                return 1
+    var h: [2][3]i32
+    h = a
+    if h[1][2] != 5
+        return 2
+    return get(@&h) - 1
+""",
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(NESTED_LOCATED))
-def test_ritz0_takes_what_ritz1_refuses(tmp_path, name):
-    assert _run("ritz0", None, tmp_path, name, TYPES + NESTED_LOCATED[name][1]) == 3
+@pytest.mark.parametrize("name", sorted(NESTED_WHOLE))
+def test_ritz0_assigns_a_whole_nested_array(tmp_path, name):
+    assert _run("ritz0", None, tmp_path, name, TYPES + NESTED_WHOLE[name]) == 3
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(NESTED_LOCATED))
-def test_ritz1_nested_gap_is_located(ritz1_bin, tmp_path, name):
-    message, program = NESTED_LOCATED[name]
-    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + program)
-    assert comp.returncode != 0 and not ll.exists()
-    assert message in comp.stdout + comp.stderr, comp.stdout + comp.stderr
+@pytest.mark.parametrize("name", sorted(NESTED_WHOLE))
+def test_ritz1_assigns_a_whole_nested_array(ritz1_bin, tmp_path, name):
+    assert _run("ritz1", ritz1_bin, tmp_path, name, TYPES + NESTED_WHOLE[name]) == 3
 
 
 # ritz0 gives 3.  ritz1 emitted IR clang refused (AGAST #1562): a whole struct

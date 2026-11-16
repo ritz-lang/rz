@@ -1045,6 +1045,187 @@ pub fn main() -> i32
     let q = p + 1
     return q[1][2] + (*q)[0][0]
 """,
+    # AGAST #3634: a by-value `[2][3]i32` param is `[2 x [3 x i32]] %a.arg`, as
+    # ritz0 spells it, and the callee's own copy: its store doesn't reach g.
+    # Cell (i, j) holds 3i + j (sum 15); `twice` hands its param on by value.
+    "param_by_value": """\
+fn sum(a: [2][3]i32) -> i32
+    var t: i32 = 0
+    for i in 0..2
+        for j in 0..3
+            t = t + a[i][j]
+    a[0][0] = 100
+    return t + a[0][0] - 100
+
+fn twice(a: [2][3]i32) -> i32
+    return sum(a) + a[1][2]
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = i * 3 + j
+    let t = sum(g)
+    if g[0][0] != 0 or t != 15
+        return 1
+    return twice(g) + 22
+""",
+    # ... rank 3 with a u8 leaf, and a struct leaf.
+    "param_by_value_3d_struct": """\
+struct P
+    a: i32
+    b: i64
+
+fn cell(g: [2][3][4]u8, i: i32, j: i32, k: i32) -> i32
+    return g[i][j][k] as i32
+
+fn pb(ps: [2][2]P) -> i32
+    return ps[1][0].a + (ps[0][1].b as i32)
+
+pub fn main() -> i32
+    var g: [2][3][4]u8
+    for i in 0..2
+        for j in 0..3
+            for k in 0..4
+                g[i][j][k] = (i * 12 + j * 4 + k) as u8
+    var ps: [2][2]P
+    ps[1][0].a = 3
+    ps[0][1].b = 9
+    if cell(g, 1, 2, 3) != 23 or cell(g, 0, 1, 2) != 6
+        return 1
+    return pb(ps) + 30
+""",
+    # AGAST #3634: `-> [2][3]i32` is `[2 x [3 x i32]]`; `return g` hands the
+    # local back, and an annotated `var`, an inferred `let` and a param take it.
+    "return_by_value": """\
+fn mk(k: i32) -> [2][3]i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = k * (i * 3 + j)
+    return g
+
+fn at(a: [2][3]i32, i: i32, j: i32) -> i32
+    return a[i][j]
+
+pub fn main() -> i32
+    var g: [2][3]i32 = mk(1)
+    let h = mk(2)
+    g[0][0] = 7
+    if g[1][2] != 5 or h[1][2] != 10 or h[0][1] != 2 or g[0][0] != 7
+        return 1
+    return g[1][2] + h[1][2] + at(mk(3), 1, 1) + at(h, 1, 0) + 9
+""",
+    # ... a large one (2 KiB, past SRET_MIN_BYTES) is `ptr byval` in and
+    # `ptr sret` out, as a 1-D one is (#2306, #3181); both still copies.
+    "by_value_large": """\
+fn mk(k: i32) -> [16][32]i32
+    var g: [16][32]i32
+    for i in 0..16
+        for j in 0..32
+            g[i][j] = k * (i * 32 + j)
+    return g
+
+fn bump(a: [16][32]i32) -> i32
+    a[15][31] = 0
+    return a[15][31] + a[1][2] + a[15][30]
+
+pub fn main() -> i32
+    let h = mk(1)
+    var g: [16][32]i32 = mk(0)
+    g = h
+    if bump(g) != 34 + 510 or g[15][31] != 511
+        return 1
+    return g[1][1] + 9
+""",
+    # ... and a Drop leaf is moved, as ritz0 moves it: the callee drops the
+    # param, the caller's `g` not again (D = 1 + 2), and a returned array
+    # drops once, in the caller (D = 20 + 1 + 2).
+    "by_value_drop": """\
+var D: i32 = 0
+
+struct S
+    x: i32
+
+impl Drop for S
+    fn drop(self:& S)
+        D = D + self.x
+
+fn f(a: [2][1]S) -> i32
+    return a[1][0].x
+
+fn mk() -> [2][1]S
+    var g: [2][1]S = [ [S { x: 1 }], [S { x: 2 }] ]
+    return g
+
+pub fn main() -> i32
+    var t: i32 = 0
+    if true
+        var g: [2][1]S = [ [S { x: 1 }], [S { x: 2 }] ]
+        t = f(g)
+    if D != 3 or t != 2
+        return 1
+    if true
+        let h = mk()
+        D = D + 10 * h[1][0].x
+    return D + 16
+""",
+    # AGAST #3634: `Box<[2][3]u8>` holds the whole array as its field.
+    "generic_arg": """\
+struct Box<T>
+    v: T
+    k: i32
+
+pub fn main() -> i32
+    var b: Box<[2][3]u8>
+    for i in 0..2
+        for j in 0..3
+            b.v[i][j] = (i * 3 + j) as u8
+    b.k = 30
+    if b.v[0][2] != 2
+        return 1
+    return (b.v[1][2] as i32) + (b.v[1][1] as i32) + b.k + 3
+""",
+    # ... and through a generic fn (`id$arr2_arr3_i32`, as ritz0 mangles it),
+    # `sizeof(T)`, and a struct leaf.
+    "generic_arg_fn": """\
+struct P
+    a: i32
+    b: i64
+
+struct Box<T>
+    v: T
+    k: i32
+
+fn id<T>(x: T) -> T
+    return x
+
+fn sz<T>() -> i64
+    return sizeof(T)
+
+fn keep<T>(x: T) -> T
+    var y: T = x
+    return y
+
+fn corner<T>(a: [2][3]T) -> T
+    return a[1][2]
+
+pub fn main() -> i32
+    var b: Box<[2][3]u8>
+    b.v[1][2] = 7
+    var c: Box<[2][2]P>
+    c.v[1][0].a = 5
+    var g: [2][3]i32
+    g[1][2] = 10
+    g[0][1] = 3
+    let h = id<[2][3]i32>(g)
+    let k = keep<[2][3]i32>(g)
+    if sz<[2][3]i32>() != 24 or sz<[2][2]P>() != 64 or k[1][2] != 10
+        return 1
+    if corner<i32>(g) != 10 or corner<u8>(b.v) != 7
+        return 2
+    return h[1][2] + (b.v[1][2] as i32) + c.v[1][0].a + k[0][1] + 17
+""",
 }
 
 
@@ -1108,14 +1289,6 @@ def test_ritz1_nested_array(ritz1_bin, tmp_path, name):
 # error naming the source line, never a silent `[N x i64]` (AGAST #1509).
 # `needle` is the `:line:` the error must name.
 FAIL_CLOSED = {
-    # AGAST #3634: by-value params, return types and generic args.
-    "param": ("""\
-fn f(a: [2][3]i32) -> i32
-    return 0
-
-pub fn main() -> i32
-    return 0
-""", ":1:", "multi-dimensional array type is not supported as a parameter"),
     # AGAST #2098: a `*[N][M]T` param or local is lowered (RUNNABLE
     # "pointee"); every other site that holds one is still refused.
     "pointee_field": ("""\
@@ -1266,14 +1439,6 @@ var gg: [2][2]i32 = [0; 2]
 pub fn main() -> i32
     return gg[1][1]
 """, ":1:", "an initializer on a multi-dimensional array is not supported"),
-    "return_type": ("""\
-fn f() -> [2][3]i32
-    var g: [2][3]i32
-    return g
-
-pub fn main() -> i32
-    return 0
-""", ":1:", "multi-dimensional array type is not supported as a return type"),
     "row_as_value": ("""\
 fn take(p: i64) -> i32
     return 0
@@ -1282,14 +1447,6 @@ pub fn main() -> i32
     var g: [2][3]i32
     return take(g[1] as i64)
 """, ":6:", "a row or a struct element of a multi-dimensional array is not a value"),
-    "generic_arg": ("""\
-struct Box<T>
-    v: T
-
-pub fn main() -> i32
-    var b: Box<[2][3]u8>
-    return 0
-""", ":5:", "multi-dimensional array type is not supported as a generic type argument"),
     "name_assign_local": ("""\
 pub fn main() -> i32
     var g: [2][3]u8
@@ -1334,6 +1491,61 @@ pub fn main() -> i32
     let t: S = g[1][1]
     return t.x
 """, ":11:", "cannot move out of an array element"),
+    # AGAST #3634: a by-value N-D param, return or whole assignment takes an
+    # array of its own shape only, as ritz0 says it at the value.
+    "param_shape_mismatch": ("""\
+fn f(a: [2][3]i32) -> i32
+    return a[1][2]
+
+pub fn main() -> i32
+    var g: [3][2]i32
+    return f(g)
+""", ":6:", "an array only fits a slot of the same element type"),
+    "param_leaf_mismatch": ("""\
+fn f(a: [2][3]u8) -> i32
+    return 0
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    return f(g)
+""", ":6:", "an array only fits a slot of the same element type"),
+    "param_not_an_array": ("""\
+fn f(a: [2][3]i32) -> i32
+    return a[1][2]
+
+pub fn main() -> i32
+    return f(0)
+""", ":5:", "this value is not a multi-dimensional array of that shape"),
+    "return_shape_mismatch": ("""\
+fn mk() -> [2][3]i32
+    var g: [3][2]i32
+    return g
+
+pub fn main() -> i32
+    return 0
+""", ":3:", "an array only fits a slot of the same element type"),
+    "whole_assign_shape_mismatch": ("""\
+pub fn main() -> i32
+    var g: [2][3]i32
+    var h: [3][2]i32
+    g = h
+    return 0
+""", ":4:", "an array only fits a slot of the same element type"),
+    # ... and a move-only leaf isn't copied over the old elements.
+    "whole_assign_move_only": ("""\
+struct S
+    x: i32
+
+impl Drop for S
+    fn drop(self:& S)
+        self.x = 0
+
+pub fn main() -> i32
+    var g: [1][1]S = [ [S { x: 1 }] ]
+    var h: [1][1]S = [ [S { x: 2 }] ]
+    g = h
+    return 0
+""", ":11:", "assigning a whole multi-dimensional array is not supported"),
     "whole_array_use": ("""\
 fn take(a: i64) -> i32
     return 0
@@ -1378,6 +1590,30 @@ def test_ritz1_nested_array_layout(ritz1_bin, tmp_path, decl, llvm):
     ir = ll.read_text()
     assert f"@g = weak_odr global {llvm} zeroinitializer" in ir, ir
     assert f"alloca {llvm}" in ir, ir
+
+
+@pytest.mark.integration
+def test_ritz1_nested_array_by_value_abi(ritz1_bin, tmp_path):
+    """AGAST #3634: a by-value `[N][M]T` param and return are ritz0's nested
+    `[N x [M x T]]`, and a large one (`by_value_large`) `ptr byval` / `ptr
+    sret` at the leaf's alignment, as a 1-D one is (#2306, #3181)."""
+    sigs = {
+        "return_by_value": [
+            "define internal [2 x [3 x i32]] @mk(i32 %k.arg)",
+            "define internal i32 @at([2 x [3 x i32]] %a.arg, i32 %i.arg, i32 %j.arg)",
+            "call [2 x [3 x i32]] @mk(",
+        ],
+        "by_value_large": [
+            "define internal void @mk(ptr sret([16 x [32 x i32]]) %ret.sret, i32 %k.arg)",
+            "define internal i32 @bump(ptr byval([16 x [32 x i32]]) align 4 %a.arg)",
+        ],
+    }
+    for name, want in sigs.items():
+        comp, ll = _compile("ritz1", tmp_path, name, RUNNABLE[name])
+        assert comp.returncode == 0, comp.stderr[-2000:]
+        ir = ll.read_text()
+        for w in want:
+            assert w in ir, (w, ir)
 
 
 @pytest.mark.integration

@@ -1609,7 +1609,7 @@ fn ptr_names_array_of_struct_ptrs(p: *Parser, ty: i32) -> i32
     (p.last_array_elem_type == TYPE_PTR and p.last_array_elem_pointee == TYPE_STRUCT) as i32
 
 pub fn param_new(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
-    nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
+    # AGAST #3634: a by-value `[N][M]T` keeps its shape (param_of_type).
     note_pass_binding(name, len)   # AGAST #3320
     let param: *Param = param_of_type(p, name, len, ty)
     param.name_span.line = line   # AGAST #2407
@@ -1668,10 +1668,12 @@ fn param_of_type(p: *Parser, name: *u8, len: i32, ty: i32) -> *Param
         param.param_ref_ptr_pointee = p.last_pointee_type
     param.param_array_size = 0
     param.param_array_elem_type = TYPE_VOID
+    param.param_array_shape = null
     if ty == TYPE_ARRAY
         param.param_array_size = p.last_array_size
         param.param_array_elem_type = p.last_array_elem_type
         param.param_array_elem_pointee = p.last_array_elem_pointee
+        param.param_array_shape = p.last_array_shape   # AGAST #3634: `[N][M]T`
     param.next = null
     param.is_borrow = 0
     param.is_self_borrow = 0
@@ -1694,7 +1696,6 @@ pub fn ptr_array_of_last(p: *Parser, ty: i32) -> *Param
 
 # `name:& T` (AGAST #1644): a TYPE_MUT_REF param that ritz0 auto-derefs.
 pub fn param_borrow(p: *Parser, name: *u8, len: i32, ty: i32, line: i32, col: i32) -> *Param
-    nd_array_reject(p, ty, line, col, c"a parameter")  # AGAST #1509
     let param: *Param = param_new(p, name, len, ty, line, col)
     param.is_borrow = 1
     # AGAST #2075: for `name:& *T` keep T (the borrowed pointer's own
@@ -2495,7 +2496,7 @@ fn fn_ret_array_param(ret: i32) -> *Param
     return null
 
 pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
-    nd_array_reject(p, ret, parse_pos_line(p), parse_pos_col(p), c"a return type")  # AGAST #1509
+    # AGAST #3634: a `-> [N][M]T` keeps its shape on g_ret_array_param.
     g_ret_fn_sig = fresh_fn_sig(p)   # the type_spec just ended here
     g_ret_ref = null
     g_ret_array = null
@@ -3573,7 +3574,6 @@ struct GenericArg
 # Called from grammar rules first_generic_type_arg / first_generic_type_arg_shr
 # right after the argument's type_spec parses, while last_type_name is fresh.
 pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
-    nd_array_reject(p, ty, parse_pos_line(p), parse_pos_col(p), c"a generic type argument")  # AGAST #1509
     let ga: *GenericArg = parser_alloc(p, 32) as *GenericArg
     ga.ty = ty
     if ty == TYPE_STRUCT
@@ -3725,35 +3725,55 @@ pub fn mangled_ref_prefix(name: *u8, len: i32) -> i32
 # "arr2_i8", `[3]Foo` "arr3_Foo", `[4]*u8` "arr4_ptr_u8".  Any other element
 # spells as "" (out_len 0), as an unspellable argument always has.  Reads
 # p.last_array_*, which type_array wrote for this array.
+#
+# AGAST #3634: a `[N][M]..E` is every dimension's prefix around its leaf, as
+# ritz0 nests it: `[2][3]u8` is "arr2_arr3_u8".  monomorph's array_arg_decode
+# reads the shape back.
 fn spell_last_array(p: *Parser, out_len: *i32) -> *u8
     var elem: *u8 = null
     var elem_len: i32 = 0
     var ptr: i32 = 0
-    let et: i32 = p.last_array_elem_type
+    let sh: *ArrayShape = p.last_array_shape
+    var et: i32 = p.last_array_elem_type
+    var ep: i32 = p.last_array_elem_pointee
+    var en: *u8 = p.last_array_elem_type_name
+    var en_len: i32 = p.last_array_elem_type_name_len
+    var dims: i32 = 1
+    if sh != null
+        et = sh.leaf_type
+        ep = sh.leaf_pointee
+        en = sh.leaf_name
+        en_len = sh.leaf_name_len
+        dims = sh.rank
     if et == TYPE_STRUCT
-        elem = p.last_array_elem_type_name
-        elem_len = p.last_array_elem_type_name_len
+        elem = en
+        elem_len = en_len
     else if et == TYPE_PTR
         ptr = 1
-        if p.last_array_elem_pointee == TYPE_STRUCT
-            elem = p.last_array_elem_type_name
-            elem_len = p.last_array_elem_type_name_len
+        if ep == TYPE_STRUCT
+            elem = en
+            elem_len = en_len
         else
-            elem_len = primitive_arg_spelling(p.last_array_elem_pointee, @elem)
+            elem_len = primitive_arg_spelling(ep, @elem)
     else
         elem_len = primitive_arg_spelling(et, @elem)
     if elem_len <= 0 or elem == null
         *out_len = 0
         return null
-    # "arr" + up to 10 digits + "_" + "ptr_" + elem
-    let name: *u8 = parser_alloc(p, (elem_len + 19) as i64)
-    *name = 97        # 'a'
-    *(name + 1) = 114 # 'r'
-    *(name + 2) = 114 # 'r'
-    var pos: i32 = 3
-    pos = pos + write_dec_i32(name + pos, p.last_array_size)
-    *(name + pos) = 95  # '_'
-    pos = pos + 1
+    # ("arr" + up to 10 digits + "_") per dimension + "ptr_" + elem
+    let name: *u8 = parser_alloc(p, (elem_len + 14 * dims + 5) as i64)
+    var pos: i32 = 0
+    for d in 0..dims
+        *(name + pos) = 97        # 'a'
+        *(name + pos + 1) = 114   # 'r'
+        *(name + pos + 2) = 114   # 'r'
+        pos = pos + 3
+        if sh != null
+            pos = pos + write_dec_i32(name + pos, sh.dims[d])
+        else
+            pos = pos + write_dec_i32(name + pos, p.last_array_size)
+        *(name + pos) = 95  # '_'
+        pos = pos + 1
     if ptr == 1
         *(name + pos) = 112      # 'p'
         *(name + pos + 1) = 116  # 't'

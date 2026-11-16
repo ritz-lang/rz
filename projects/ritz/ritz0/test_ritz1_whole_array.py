@@ -1672,7 +1672,9 @@ pub fn main() -> i32
 assert not set(STRUCT_LITERALS) & set(CASES)
 CASES.update(STRUCT_LITERALS)
 
-PARAM_ND_GAPS = {
+# AGAST #3634: a by-value N-D param and a whole N-D global assignment (were
+# strict-xfail gaps under #2098 and #2099).
+ND_WHOLE = {
     "arg_2d": """\
 fn g(a: [2][3]i32) -> i32
     return a[1][2]
@@ -1682,18 +1684,6 @@ pub fn main() -> i32
     a[1][2] = 3
     return g(a)
 """,
-}
-
-ROW_GAPS = {
-    "aoa_row_store": """\
-pub fn main() -> i32
-    var m: [2][4]i32
-    var r: [4]i32 = [0, 0, 0, 3]
-    m[1] = r
-    return m[1][3]
-""",
-    # `aoa_whole`, `var n: [2][4]i32 = m`, is lowered since #3299:
-    # test_nd_array_field_copy.py's annotated_local_copy.
     "nd_global_store": """\
 var G: [2][2]i32
 var H: [2][2]i32
@@ -1705,8 +1695,23 @@ pub fn main() -> i32
 """,
 }
 
+assert not set(ND_WHOLE) & set(CASES)
+CASES.update(ND_WHOLE)
+
+ROW_GAPS = {
+    "aoa_row_store": """\
+pub fn main() -> i32
+    var m: [2][4]i32
+    var r: [4]i32 = [0, 0, 0, 3]
+    m[1] = r
+    return m[1][3]
+""",
+    # `aoa_whole`, `var n: [2][4]i32 = m`, is lowered since #3299:
+    # test_nd_array_field_copy.py's annotated_local_copy, and `nd_global_store`
+    # since #3634 (ND_WHOLE).
+}
+
 GAPS = [
-    (PARAM_ND_GAPS, "AGAST #2098: a multi-dimensional array param"),
     (ROW_GAPS, "AGAST #2099: a whole row of a multi-dimensional array"),
 ]
 
