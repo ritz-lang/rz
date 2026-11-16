@@ -336,6 +336,18 @@ REJECTED.update({
 })
 ACCEPTED["span_from_literal"] = ('fn main() -> i32\n    let s: Span<u8> = "abc"\n    s.len as i32\n', 3)
 
+# AGAST #3441 (R49): only a `"..."` literal fits a `Span<u8>` slot; a StrView
+# value never converts. ritz1 let the StrView / Span$u8 layout pair through.
+_DECLARED = "`s` is declared `Span$u8` but its initialiser is a `StrView`"
+_RETURNED = "the fn is declared `-> Span$u8` but its return value is a `StrView`"
+REJECTED.update({
+    "strview_span_let": (_fn("v: StrView", "let s: Span<u8> = v\ns.len"), 2, 5, _DECLARED),
+    "strview_span_arg": ("fn take(s: Span<u8>) -> i64\n    s.len\n" + _fn("v: StrView", "take(v)"),
+                         4, 10, "parameter `s` is declared `Span$u8` but its argument is a `StrView`"),
+    "strview_span_return": (_fn("v: StrView", "return v", "Span<u8>"), 2, 5, _RETURNED),
+    "strview_span_tail": (_fn("v: StrView", "v", "Span<u8>"), 2, 5, _RETURNED),
+})
+
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
 # no tuple type and no `await`.
 RITZ0_ACCEPTED = {
