@@ -170,9 +170,34 @@ pub fn heap_realloc(ptr: *u8, old_size: i64, new_size: i64) -> *u8
 # ============================================================================
 # Note: memcpy, memset, memcmp are provided by ritzlib.str
 
-# Zero `n` bytes at `dst`
+# Zero `n` bytes at `dst`. Plain stores: if `dst` is never read again the
+# optimiser may delete them. Wiping a secret needs secure_zero.
 pub fn memzero(dst: *u8, n: i64)
     memset(dst, 0, n)
+
+# Zero `n` bytes at `dst` so that the optimiser cannot remove the writes,
+# even when nothing reads `dst` again (AGAST #1864). Use it to wipe keys and
+# other secrets before their memory goes out of scope or is freed. A plain
+# zeroing loop there is a dead store that -O2 or LTO deletes.
+#
+# Every write is a volatile_store (LANGUAGE_SPEC §18.4), which is never
+# removed, merged or invented. Bytes up to the first 8-byte boundary, aligned
+# u64 words, then the tail bytes: 2 KB is 256 stores, not 2048. Volatile
+# stores are not vectorised, so this is slower than memzero on large buffers.
+pub fn secure_zero(dst: *u8, n: i64)
+    var i: i64 = 0
+    while i < n and ((dst as u64 + i as u64) & 7) != 0
+        let b: *u8 = dst + i
+        volatile_store(b, 0)
+        i += 1
+    while i + 8 <= n
+        let w: *u64 = (dst + i) as *u64
+        volatile_store(w, 0)
+        i += 8
+    while i < n
+        let b: *u8 = dst + i
+        volatile_store(b, 0)
+        i += 1
 
 # ============================================================================
 # jemalloc-style Allocator

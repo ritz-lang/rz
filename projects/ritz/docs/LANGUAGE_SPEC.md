@@ -5688,6 +5688,35 @@ fn read(r: *Regs) -> u32
 Volatile is not atomic. It orders nothing with respect to other CPUs; use
 §18.5 for that.
 
+#### Wiping secrets
+
+Zeroing a key that is never read again is a dead store, and the optimiser
+deletes it: at -O2 in the same module, or across modules under LTO, a plain
+`*p = 0` loop, or a `memzero` inlined beside the dead buffer, disappears and
+leaves the key in memory. A volatile store is never removed, so a wipe built
+from `volatile_store` always reaches memory. ritzlib provides it as
+`secure_zero(p, n)` in `ritzlib.memory` (AGAST #1864). It writes each of the
+`n` bytes at `p` with a volatile store: byte stores up to the first 8-byte
+boundary, aligned `u64` stores, then byte stores for the tail. Use it for
+every secret wipe. Use plain `memzero` for zeroing that only initialises.
+
+```ritz
+import ritzlib.memory
+
+fn derive(seed: u8, out: *u8) -> i32
+    var key: [32]u8
+    for i in 0..32
+        key[i] = seed + i as u8
+    out[0] = key[0] ^ key[31]
+    secure_zero(@key[0], 32)     # stays at -O2: key is dead, the wipe is not
+    0
+```
+
+*Why a library function, not an intrinsic:* `volatile_store` already says
+"this write happens", in both compilers. `secure_zero` is that store in a
+loop, so it needs no compiler support of its own. An `llvm.memset` with
+`volatile` set would allow wider stores, but nothing needs that yet.
+
 ### 18.5 Atomics and Fences
 
 | Builtin | Effect | Returns |

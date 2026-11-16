@@ -4,7 +4,7 @@
 # All functions are designed to resist timing side-channel attacks.
 #
 # Key functions:
-# - mem_zero: Zero memory (compiler cannot optimize away)
+# - mem_zero: secure_zero (ritzlib.memory) for dependents; cannot be elided
 # - mem_burn_stack: Zero the dead frame of the callee that just returned
 # - mem_eq: Constant-time memory comparison
 # - mem_copy: Safe memory copy
@@ -12,31 +12,30 @@
 # - ct_is_zero_*: Constant-time zero check
 
 import ritzlib.sys
+import ritzlib.memory { secure_zero }
 
 # ============================================================================
 # Secure memory zeroing
 # ============================================================================
 # Clearing secrets (keys, shared secrets) the program never reads again is a
-# dead store: once mem_zero is inlined into its caller (same module, or LTO)
-# -O2 deletes the wipe, and the buffer with it (AGAST #1986).
+# dead store: once a plain zeroing loop is inlined into its caller (same
+# module, or LTO) -O2 deletes the wipe (AGAST #1986). Every secret wipe in
+# cryptosec is ritzlib.memory's secure_zero, whose writes are volatile_store
+# (LANGUAGE_SPEC §18.4) and cannot be removed (AGAST #1864). Zeroing that
+# only initialises a buffer (padding, a fresh struct, a constant zero input)
+# is ritzlib's plain memzero.
 #
-# The barrier after the loop is explicit_bzero's / memzero_explicit's
-# `asm volatile("" :: "r"(ptr) : "memory")`: ritz0 emits every asm as
-# `sideeffect` with a `~{memory}` clobber, and `ptr` is an input, so LLVM must
-# assume the asm reads the zeroed bytes through it. `nopl ({ptr})` is the
-# multi-byte NOP: it names the operand but touches no memory, flags or
-# registers. (A language-level secure_zero / volatile memset is #1864.)
+# mem_zero is secure_zero under cryptosec's older name, for dependents
+# (valet, mausoleum) that wipe their own secrets with it. cryptosec itself
+# calls secure_zero or memzero, which say which one is meant.
 
 pub fn mem_zero(ptr: *u8, len: i64)
-    for i in 0..len
-        *(ptr + i) = 0
-    asm x86_64:
-        nopl ({ptr})
+    secure_zero(ptr, len)
 
 # ============================================================================
 # Stack burning
 # ============================================================================
-# mem_zero reaches named buffers only. The compiler also keeps secrets in
+# secure_zero reaches named buffers only. The compiler also keeps secrets in
 # register-spill slots no source name reaches: chacha20_block spills
 # final-round words that, with the keystream, give key words (AGAST #2770).
 # Call mem_burn_stack right after a [[noinline]] secret-handling callee
@@ -48,7 +47,7 @@ const MEM_BURN_STACK_BYTES: i64 = 2048
 [[noinline]]
 pub fn mem_burn_stack()
     var buf: [2048]u8
-    mem_zero(@buf[0], MEM_BURN_STACK_BYTES)
+    secure_zero(@buf[0], MEM_BURN_STACK_BYTES)
 
 # ============================================================================
 # Constant-time memory comparison

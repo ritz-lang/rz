@@ -6,9 +6,12 @@ again. That is a dead store: once mem_zero is inlined into its caller (same
 module or LTO), -O2 deleted the wipe, and the buffer with it. Before the fix,
 the linked program below optimised to `ret i32 0`.
 
-The test links the caller with the real cryptosec/lib/mem.ritz the way LTO
-would, built by ritz0 and by ritz1 (which lowers the asm since #3395), runs -O2, and checks that the zeroing stores, and the barrier that
-keeps them, are still in `main` (IR) and in the machine code (object).
+The fix was an asm barrier after a plain loop; since #1864 mem_zero is
+ritzlib.memory's secure_zero, whose stores are volatile_store (LANGUAGE_SPEC
+§18.4). The test links the caller with the real cryptosec/lib/mem.ritz and
+ritzlib.memory (and what it imports) the way LTO would, built by ritz0 and by
+ritz1, runs -O2, and checks that the wipe is inlined into `main` as volatile
+stores (IR) and is still in the machine code.
 """
 
 import os
@@ -27,6 +30,8 @@ RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 PROJECTS = RITZ_ROOT.parent
 MEM_RITZ = PROJECTS / "cryptosec" / "lib" / "mem.ritz"
+# ritzlib.memory (secure_zero) and the modules it imports.
+RITZLIB = [RITZ_ROOT / "ritzlib" / f"{m}.ritz" for m in ("memory", "str", "sys", "fmt")]
 
 # A secret is filled, wiped and the frame returns: nothing reads it again.
 CALLER = """\
@@ -85,11 +90,15 @@ def linked(request, tmp_path):
     caller = tmp_path / "t.ritz"
     caller.write_text(CALLER)
     _compile(request.param, caller, tmp_path / "t.ll", tmp_path)
-    _compile(request.param, MEM_RITZ, tmp_path / "mem.ll", tmp_path)
+    lls = [tmp_path / "t.ll", tmp_path / "mem.ll"]
+    _compile(request.param, MEM_RITZ, lls[1], tmp_path)
+    for src in RITZLIB:
+        lls.append(tmp_path / f"ritzlib_{src.stem}.ll")
+        _compile(request.param, src, lls[-1], tmp_path)
     out = tmp_path / "linked.ll"
     proc = subprocess.run(
-        [LLVM_LINK, "-S", str(tmp_path / "t.ll"), str(tmp_path / "mem.ll"),
-         "-o", str(out)], capture_output=True, text=True)
+        [LLVM_LINK, "-S", *map(str, lls), "-o", str(out)],
+        capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr
     return out
 
@@ -106,14 +115,10 @@ def test_O2_keeps_the_wipe_of_a_dead_local_in_ir(linked):
     out = _clang_O2(["-S", "-emit-llvm", str(linked), "-o", "-"])
     main = re.search(r"^define [^\n]*@\"?main\"?\(.*?^}", out, re.M | re.S).group(0)
     # The whole call chain is inlined, so this is the case LTO creates.
-    assert "@mem_zero" not in main and "@wipe_local" not in main, main
-    # The 32 bytes are still zeroed (vector stores, scalar stores or memset)...
-    zeroing = re.findall(
-        r"store <\d+ x i8> zeroinitializer|store i\d+ 0,|"
-        r"call void @llvm\.memset[^\n]*i8 0, i64 32", main)
-    assert zeroing, main
-    # ...and kept alive by the asm barrier that reads the buffer through ptr.
-    assert re.search(r'call void asm sideeffect "nopl[^"]*", "r,~\{memory\},~\{dirflag\},~\{fpsr\},~\{flags\}"', main), main
+    for fn in ("@mem_zero", "@secure_zero", "@wipe_local"):
+        assert fn not in main, main
+    # The 32 bytes are still zeroed, by stores -O2 may not delete.
+    assert re.search(r"store volatile i(8|64) 0,", main), main
 
 
 @needs_tools
@@ -122,11 +127,10 @@ def test_O2_keeps_the_wipe_of_a_dead_local_in_machine_code(linked):
     main = re.search(r"^main:.*?^\s*(?:ret|\.Lfunc_end)", asm, re.M | re.S).group(0)
     stores = re.findall(r"^\s*(?:mov\w*|stos\w*)\s+[^\n]*\(%r[sb]p\)", main, re.M)
     assert stores, main
-    assert "nopl" in main, main
 
 
-def test_mem_zero_has_the_barrier():
+def test_mem_zero_is_secure_zero():
     # Guards the fix if the toolchain-dependent tests above are skipped.
     src = MEM_RITZ.read_text()
     body = re.search(r"^pub fn mem_zero\(.*?(?=^\S)", src, re.M | re.S).group(0)
-    assert re.search(r"asm x86_64:\s*\n\s*nopl \(\{ptr\}\)", body), body
+    assert re.search(r"^\s+secure_zero\(ptr, len\)\s*$", body, re.M), body

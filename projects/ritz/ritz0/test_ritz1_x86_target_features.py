@@ -257,9 +257,10 @@ def test_intrinsic_fns_honour_masked_native_features(program_ll, tmp_path):
         assert not avx, f"{fn} uses AVX under {' '.join(MASKED_NATIVE)}: {avx[:4]}"
 
 
-# aes and aes_gcm import cryptosec.mem, whose mem_zero holds an `asm x86_64:`
-# block.  ritz1 parses it (AGAST #3394) and lowers it (#3395); an imported fn
-# is declared, not emitted, so these compile without it either way.
+# aes and aes_gcm import cryptosec.mem, whose mem_zero held an `asm x86_64:`
+# block until #1864 made it ritzlib's secure_zero.  ritz1 parses asm (AGAST
+# #3394) and lowers it (#3395); an imported fn is declared, not emitted, so
+# these compile without it either way.
 
 
 @pytest.mark.skipif(not CRYPTOSEC.is_dir(), reason="cryptosec not checked out")

@@ -11,8 +11,8 @@ Step 2 of #1619 for ritz1; #3394 parsed and checked the blocks.
 * ERRORS: the typed errors §18.6 lists, each located at the operand.
 
 test_asm.ritz's no-clause blocks run in the regression matrix on every
-compiler, and cryptosec's `mem_zero` in test_cryptosec_ritz1_shapes.py and
-test_cryptosec_mem_zero_o2.py.
+compiler. cryptosec's `mem_zero` barrier ran them in test_cryptosec_ritz1_shapes.py and
+test_cryptosec_mem_zero_o2.py until #1864 replaced it with secure_zero.
 """
 
 import re

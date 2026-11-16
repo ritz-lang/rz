@@ -310,6 +310,7 @@ Proper malloc/free with size classes (no need to track sizes when freeing).
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `memzero` | `fn(dst: *u8, n: i64)` | Zero n bytes at dst |
+| `secure_zero` | `fn(dst: *u8, n: i64)` | Zero n bytes at dst with volatile stores the optimiser cannot remove; use it to wipe secrets (LANGUAGE_SPEC §18.4) |
 
 ---
 

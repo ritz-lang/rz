@@ -10,9 +10,10 @@ chain.  ritz1 refused a struct value's ("cannot take address") and, through a
 operand must be a pointer to a first class type").
 
 ritz0 is the oracle: every row's exit code is what ritz0's build returns.
-mem.ritz's inline `asm` was the third failure, and #1619's: ritz1 lowers it
-since #3395 (test_cryptosec_mem_compiles here; test_cryptosec_mem_zero_o2.py
-runs the wipe).
+mem.ritz's inline `asm` was the third failure, and #1619's: ritz1 lowered it
+since #3395. #1864 replaced that barrier with ritzlib's secure_zero
+(test_cryptosec_mem_compiles here; test_cryptosec_mem_zero_o2.py runs the
+wipe).
 """
 
 import os
@@ -179,7 +180,8 @@ def test_cryptosec_shape_runs_as_ritz0_runs_it(compiler, tmp_path, name):
 @pytest.mark.skipif(not MEM_RITZ.is_file(), reason="cryptosec not checked out")
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_cryptosec_mem_compiles(compiler, tmp_path):
-    # mem_zero's `nopl ({ptr})` barrier (#1986): ritz1 refused it until #3395.
+    # mem_zero and mem_burn_stack wipe through ritzlib's secure_zero (#1864),
+    # which replaced the `nopl ({ptr})` barrier (#1986, ritz1 since #3395).
     comp = _emit(compiler, MEM_RITZ, tmp_path / "mem.ll", tmp_path)
     assert comp.returncode == 0, comp.stdout + comp.stderr
-    assert "nopl" in (tmp_path / "mem.ll").read_text()
+    assert "secure_zero" in (tmp_path / "mem.ll").read_text()
