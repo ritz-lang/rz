@@ -54,6 +54,7 @@ SOURCES = \
 	must_use \
 	sema_index_store \
 	generic_method \
+	field_slot \
 	sema_walk \
 	bool_check \
 	call_check \

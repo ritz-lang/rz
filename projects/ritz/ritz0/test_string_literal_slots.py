@@ -363,6 +363,11 @@ REJECTED.update({
     # AGAST #3483 (R62): nor does a String.
     "string_span_let": (_IMPORT_STRING + _fn("", f"{_MAKE_STRING}\nlet t: Span<u8> = s\nt.len"),
                         4, 5, "`t` is declared `Span$u8` but its initialiser is a `String`"),
+    # AGAST #3563: nor into a struct-literal field, at a let or a tail. ritz1 stored it.
+    "strview_span_field": ("struct H\n    s: Span<u8>\n" + _fn("v: StrView", "let h = H { s: v }\nh.s.len"),
+                           4, 20, "field `s` of `H` is `Span<u8>`, not `StrView`"),
+    "strview_span_field_tail": ("struct H\n    s: Span<u8>\n" + _fn("v: StrView", "H { s: v }", "H"),
+                                4, 12, "field `s` of `H` is `Span<u8>`, not `StrView`"),
 })
 
 # AGAST #3580: StrView is built in, so the rule can't lean on ritzlib.strview.

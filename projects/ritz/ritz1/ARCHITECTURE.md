@@ -46,8 +46,8 @@ input.ritz
   │         struct_index) rewrites `m[k]` on a struct into its Index call
   ▼
 [sema]      sema_walk runs the checks registered on Sema (sema, sema_type,
-  │         must_use, generic_method, ...) over exactly the fns the emitter
-  │         will lower. Any error stops here.
+  │         must_use, generic_method, field_slot, ...) over exactly the
+  │         fns the emitter will lower. Any error stops here.
   ▼
 [emit]      emitter.emit_module lowers each fn to IR text through the
   │         emitter_* modules, still running the checks that have not yet
@@ -138,7 +138,7 @@ Sizes and imports are in [Measurements](#measurements).
 | `sema_type` | Types an expression from the AST and Sema's scope alone. |
 | `sema_walk` | Walks the module and calls each Sema check. |
 | `sema_probe` | Test-only: compares Sema's typing with the emitter's (`RITZ1_SEMA_PROBE`). |
-| `must_use`, `generic_method` | Checks already moved onto Sema. |
+| `must_use`, `generic_method`, `field_slot` | Checks already moved onto Sema. |
 | `binder_check`, `reachability` | Whole-module checks run by main before monomorphisation. |
 
 **Checks still called from the emitter**
@@ -257,9 +257,10 @@ Every module appears after all the modules it imports (modules in a cycle are ad
 | `emitter` | 1 | 3831 | 2735 | ast, ast_helpers, bool_check, deref_field, emitter_asm, emitter_core, emitter_expr, emitter_print, emitter_stmt, enum_as_int, let_check, literal_slot, ll_copy_scan, narrowing, ownership, ref_check, tail_value, tokens_gen |
 | `generic_infer` | 1 | 1166 | 965 | ast, ast_helpers, diag, monomorph |
 | `generic_method` | 1 | 72 | 45 | ast, ast_helpers, emitter_core, sema |
+| `field_slot` | 1 | 83 | 58 | ast, ast_helpers, emitter_core, sema, sema_type |
 | `must_use` | 1 | 44 | 17 | ast, ast_helpers, emitter_core, sema |
 | `reachability` | 1 | 202 | 139 | ast, ast_helpers, binder_check, emitter_core, tail_value |
-| `sema_walk` | 1 | 208 | 164 | ast, ast_helpers, emitter_core, generic_method, must_use, sema, sema_probe, sema_type |
+| `sema_walk` | 1 | 208 | 164 | ast, ast_helpers, emitter_core, field_slot, generic_method, must_use, sema, sema_probe, sema_type |
 | `main` | 0 | 1470 | 961 | ast, ast_helpers, binder_check, emitter, fn_cache, generic_infer, lexer_nfa, lexer_setup_gen, monomorph, nfa, parser_gen, reachability, sema_probe, sema_walk, sha256, struct_index, tokens_gen |
 
 ### Import cycles
