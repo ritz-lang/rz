@@ -152,7 +152,9 @@ def test_linux_bins_selects_by_target_not_name():
     assert "help:rzsh/rzsh.linux" in ids
     assert "help:rzsh/rzsh" not in ids              # harland rzsh.elf
     assert not any(c.startswith("help:ritzutils/") for c in ids)  # harland cat.elf
-    assert not any(c.startswith(("help:harland/", "help:indium/", "help:prism/")) for c in ids)
+    assert not any(c.startswith(("help:harland/", "help:indium/")) for c in ids)
+    assert "help:prism/prism" in ids                # Linux; its siblings are harland .elfs
+    assert "help:prism/prism_demo" not in ids and "help:prism/hello_gfx" not in ids
     for server in ("valet/valet", "zeus/zeus", "nexus/nexus", "tome/tome-server",
                    "tome/tome-cli", "mausoleum/mausoleum", "mausoleum/wiki-seed"):
         assert f"help:{server}" in ids

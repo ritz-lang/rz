@@ -12,14 +12,22 @@ Prism provides a rendering API that clients use to:
 
 ## Quick Start
 
+Import each type from the file that defines it (`api.client`, `api.draw`,
+`types.rect`, ...). `src/api/mod.ritz` re-exports them all, but ritz0 has no
+`mod.ritz` rule yet, so `import api { ... }` does not resolve.
+
 ```ritz
-import prism.api { PrismClient, ClientConfig, DrawContext, SurfaceConfig, LayerConfig }
-import prism.api { Rect, Color, Point }
+import ritzlib.gvec { Vec, vec_new }
+import types.rect { Rect, Point }
+import types.color { Color }
+import api.client { PrismClient, ClientConfig }
+import api.surface { SurfaceConfig }
+import protocol.event { WindowEvent }
 
 fn main() -> i32
     # Connect to Prism
     let config = ClientConfig.new(800, 600)
-    let client = PrismClient.connect(config).unwrap()
+    var client = PrismClient.connect(config).unwrap()
 
     # Create a surface for drawing
     let surface = client.create_surface(SurfaceConfig.new(800, 600))
@@ -42,7 +50,7 @@ fn main() -> i32
         ctx.fill_rect(Rect.new(100, 100, 200, 150), Color.rgb(100, 150, 200))
 
         # Submit frame
-        client.submit_draw(ctx, Vec<Rect>.new())
+        client.submit_draw(ctx, vec_new<Rect>())
         client.submit_frame()
 
     client.disconnect()
@@ -219,7 +227,7 @@ pub struct MouseMoveEvent
 For optimal performance, track which regions changed:
 
 ```ritz
-var damage = Vec<Rect>.new()
+var damage = vec_new<Rect>()
 damage.push(Rect.new(100, 100, 200, 150))  # Only this area changed
 client.submit_draw(ctx, damage)
 ```

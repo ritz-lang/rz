@@ -1,0 +1,181 @@
+# Prism - Public API Tests
+#
+# Exercises src/api: surfaces, layers, images, text, drawing and the client.
+
+import ritzlib.gvec { Vec, vec_new, vec_get }
+import types.rect { Point, Size, Rect }
+import types.color { Color }
+import api.surface { Surface, SurfaceConfig, SurfaceFormat, SurfaceId, SurfaceUsage }
+import api.layer { LayerConfig, LayerId, LayerTransform, BlendMode }
+import api.image { ImageHandle, ImageFormat, ImageUpload, NinePatch }
+import api.text { GlyphRun, ShapedGlyph, TextStyle, TextLayout, FontStyle }
+import api.draw { DrawCommand, PathBuilder, PathCommand, Transform2D }
+import api.client { PrismClient, ClientConfig, LayerUpdate }
+
+[[test]]
+fn test_surface_config_builders() -> i32
+    let config = SurfaceConfig.new(64, 32).with_format(SurfaceFormat.A8).with_usage(SurfaceUsage.Static)
+    assert config.width == 64
+    assert config.height == 32
+    match config.format
+        SurfaceFormat.A8 => ()
+        _ => return 1
+    match config.usage
+        SurfaceUsage.Static => ()
+        _ => return 2
+    0
+
+[[test]]
+fn test_surface_damage_is_clipped_and_taken() -> i32
+    var surface = Surface {
+        id: SurfaceId.new(7),
+        width: 100,
+        height: 50,
+        format: SurfaceFormat.RGBA8,
+        dirty_rects: vec_new<Rect>()
+    }
+    assert surface.id.is_valid()
+    assert not surface.is_dirty()
+
+    # Half of this rect hangs off the right edge and gets clipped away
+    surface.invalidate(Rect.new(80, 10, 40, 10))
+    # Entirely outside the surface: no damage at all
+    surface.invalidate(Rect.new(200, 200, 10, 10))
+    assert surface.is_dirty()
+
+    let damage = surface.take_damage()
+    assert damage.len() == 1
+    let r = damage[0]
+    assert r.x == 80
+    assert r.width == 20
+    assert not surface.is_dirty()
+
+    surface.resize(10, 20)
+    assert surface.size().area() == 200
+    let all = surface.take_damage()
+    assert all.len() == 1
+    assert all[0].height == 20
+    0
+
+[[test]]
+fn test_layer_config_and_transform() -> i32
+    let config = LayerConfig.new(320, 240).at(5, 6).with_opacity(0.5).scrollable()
+    assert config.x == 5
+    assert config.y == 6
+    assert config.opacity == 0.5
+    assert config.scrollable
+    match config.blend_mode
+        BlendMode.Normal => ()
+        _ => return 1
+
+    let ident = LayerTransform.identity()
+    assert ident.is_identity()
+    assert ident.is_2d()
+    let moved = LayerTransform.translate(3.0, 4.0, 0.0)
+    assert not moved.is_identity()
+    assert moved.is_2d()
+    assert not LayerTransform.translate(0.0, 0.0, 1.0).is_2d()
+    assert LayerId.new(3).is_valid()
+    0
+
+[[test]]
+fn test_image_upload_stride() -> i32
+    let rgb = ImageUpload.new(10, 4, ImageFormat.RGB8)
+    assert rgb.stride == 30
+    assert rgb.data_size == 120
+    let mask = ImageUpload.new(10, 4, ImageFormat.A8).with_data_offset(64)
+    assert mask.stride == 10
+    assert mask.data_offset == 64
+
+    let img = ImageHandle.new(9, 16, 8, ImageFormat.RGBA8)
+    assert img.is_valid()
+    assert img.size().area() == 128
+    let patch = NinePatch.new(img, 2, 3, 4, 5)
+    let min = patch.min_size()
+    assert min.width == 6
+    assert min.height == 8
+    0
+
+[[test]]
+fn test_text_types() -> i32
+    var run = GlyphRun.new(1, 12.0)
+    assert run.is_empty()
+    run.add_glyph(ShapedGlyph.new(42, 0.0, 0.0, 7.0, 0.0, 0))
+    assert run.glyph_count() == 1
+
+    let style = TextStyle.default().with_size(20.0).bold().italic()
+    assert style.font_size == 20.0
+    assert style.font_weight == 700
+    match style.font_style
+        FontStyle.Italic => ()
+        _ => return 1
+
+    var layout = TextLayout.new()
+    layout.add_run(run)
+    assert layout.runs.len() == 1
+    0
+
+[[test]]
+fn test_path_builder() -> i32
+    let path = PathBuilder.new().move_to(1.0, 2.0).line_to(3.0, 4.0).close().build()
+    assert path.commands.len() == 3
+    match path.commands[1]
+        PathCommand.LineTo(p) =>
+            assert p.x == 3
+            assert p.y == 4
+        _ => return 1
+    let t = Transform2D.translate(2.0, 3.0)
+    assert t.e == 2.0
+    assert t.f == 3.0
+    0
+
+[[test]]
+fn test_client_draw_and_clip() -> i32
+    let config = ClientConfig.new(640, 480).as_widget()
+    assert config.is_widget
+    var client = PrismClient.connect(config).unwrap()
+    assert client.is_connected()
+    assert client.window_size().width == 640
+    assert client.root_layer().raw() == 1
+
+    let sid = client.create_surface(SurfaceConfig.new(64, 64))
+    assert sid.is_valid()
+    let lid = client.create_layer(LayerConfig.new(64, 64))
+    assert lid.raw() == 2
+    client.attach_surface(lid, sid)
+    client.update_layer(lid, LayerUpdate.new().position(1, 2).opacity(0.25))
+
+    var ctx = client.begin_draw(sid)
+    # A literal, not Color.red(): with BlendMode in scope ritz0 resolves
+    # `Color.red()` against the BlendMode.Color variant (#3618)
+    let red = Color { r: 255, g: 0, b: 0, a: 255 }
+    ctx.fill_rect(Rect.new(0, 0, 10, 10), red)
+    ctx.push_clip(Rect.new(0, 0, 50, 50))
+    ctx.push_clip(Rect.new(25, 25, 50, 50))
+    assert ctx.clip_stack.len() == 2
+    # The nested clip intersects with the outer one
+    let inner = ctx.clip_stack[1]
+    assert inner.x == 25
+    assert inner.width == 25
+    ctx.pop_clip()
+    ctx.pop_clip()
+    ctx.pop_clip()  # Popping an empty stack is a no-op
+    assert ctx.clip_stack.len() == 0
+
+    let cmds = ctx.finish()
+    # fill, push, push, pop, pop
+    assert cmds.len() == 5
+    match cmds[0]
+        DrawCommand.FillRect(op) =>
+            assert op.rect.width == 10
+            assert op.color.r == 255
+        _ => return 1
+    assert ctx.commands.len() == 0
+
+    client.submit_draw(ctx, vec_new<Rect>())
+    client.submit_frame()
+    let events = client.poll_events()
+    assert events.len() == 0
+    client.disconnect()
+    assert not client.is_connected()
+    0
