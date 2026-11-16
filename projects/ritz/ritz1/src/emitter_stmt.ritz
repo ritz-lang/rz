@@ -938,32 +938,6 @@ fn emit_ctor_stmt(s: *EmitterState, e: *Expr) -> i32
         return emit_expr(s, e)   # the located error
     emit_ctor_scrutinee(s, e, name, len)
 
-# AGAST #2594: the struct payload `init` = `r.unwrap()` gives, `r` an
-# Option<S> or Result<S, E> (try_emit_enum_unwrap loads it as a `%S`), or
-# null/0.  AGAST #3250 / #2863: `r.unwrap_or(d)` gives the same `%S` (its
-# select is on `%S`), so `let t = r.unwrap_or(d)` is an `%S` slot too.
-fn unwrap_payload_struct_name(s: *EmitterState, init: *Expr, out_name: **u8, out_len: *i32)
-    if init.kind != EXPR_METHOD or init.left == null
-        return
-    let is_unwrap: bool = init.args == null and name_eq(init.ident_ptr, init.ident_len, c"unwrap", 6) == 1
-    let is_unwrap_or: bool = init.args != null and init.args.next == null and name_eq(init.ident_ptr, init.ident_len, c"unwrap_or", 9) == 1
-    if not is_unwrap and not is_unwrap_or
-        return
-    var enum_name: *u8 = null
-    var enum_len: i32 = 0
-    call_result_struct_name(s, init.left, @enum_name, @enum_len)
-    if enum_len == 0
-        resolve_expr_struct_name(s, init.left, @enum_name, @enum_len)
-    if enum_len == 0
-        return
-    if starts_with(enum_name, enum_len, c"Option$", 7) == 0 and starts_with(enum_name, enum_len, c"Result$", 7) == 0
-        return
-    var pay_len: i32 = 0
-    let pay: *u8 = tagged_enum_payload_named(s, enum_name, enum_len, @pay_len, 0)
-    if pay != null and pay_len > 0
-        *out_name = pay
-        *out_len = pay_len
-
 # AGAST #2784: the struct returned by the method call `init` on a call's
 # result (`mk<T>(u, v).flip()`), or null/0: the callee's return names the
 # receiver, the method's return the result.  A method receiver (`c.me().tp()`)
@@ -1586,6 +1560,16 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                         var_type = TYPE_PTR   # AGAST #2308, as for a call
                         stmt.var_type = TYPE_PTR
                         stmt.var_pointee_type = ret_ref_scalar_pointee(m)
+                    else if (m.return_type == TYPE_PTR or m.return_type == TYPE_REF or m.return_type == TYPE_MUT_REF) and m.return_type_name_len > 0 and find_struct(s, m.return_type_name, m.return_type_name_len) != null
+                        # AGAST #3620: `-> *S` / `-> @S` / `-> @&S` points
+                        # at S, as a call's does (#175, #1453).  The local
+                        # stayed i64, so prism's `let buf =
+                        # self.get_draw_buffer_ref(); buf.set(..)` had no
+                        # receiver type.
+                        var_type = TYPE_PTR
+                        stmt.var_type = TYPE_PTR
+                        stmt.var_type_name = m.return_type_name
+                        stmt.var_type_name_len = m.return_type_name_len
                 else
                     # AGAST #2576: `let t = r.unwrap()`, r an Option<S> or a
                     # Result<S, E> (`mk().unwrap()`, angelo's ttf tests), is
@@ -1593,10 +1577,11 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     # (try_emit_enum_unwrap) has no FnDef to name it.  The
                     # slot stayed i64, so `t.f` was "unhandled EXPR_MEMBER"
                     # and, S a `Vec$E`, `t.len()` / `t[0]` had no receiver.
+                    # AGAST #3620: or a user enum's `%E` (`match t` over it).
                     var up_name: *u8 = null
                     var up_len: i32 = 0
                     unwrap_payload_struct_name(s, stmt.var_init, @up_name, @up_len)
-                    if up_len > 0 and find_struct(s, up_name, up_len) != null
+                    if up_len > 0 and (find_struct(s, up_name, up_len) != null or user_enum_index(up_name, up_len) >= 0)
                         var_type = TYPE_STRUCT
                         stmt.var_type = TYPE_STRUCT
                         stmt.var_type_name = up_name
@@ -1791,7 +1776,11 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 # global, call / method result, index, deref).
                 let mf: *StructField = resolve_member_chain_field(s, stmt.var_init)
                 if mf != null and mf.field_type == TYPE_STRUCT and mf.field_type_name_len > 0
-                    if find_struct(s, mf.field_type_name, mf.field_type_name_len) != null
+                    # AGAST #3620: an `Option<T>` / `Result<T, E>` field is
+                    # its `%Option$T` slot too (find_struct knows no tagged
+                    # enum), as the `?` arm reads one (#2267).  prism's
+                    # `let action = self.hotkey_triggered` stored i64.
+                    if find_struct(s, mf.field_type_name, mf.field_type_name_len) != null or is_tagged_enum_type(mf.field_type_name, mf.field_type_name_len) == 1
                         var_type = TYPE_STRUCT
                         stmt.var_type = TYPE_STRUCT
                         stmt.var_type_name = mf.field_type_name

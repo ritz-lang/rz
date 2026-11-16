@@ -3886,11 +3886,46 @@ pub fn call_result_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_l
     if fd == null
         # AGAST #3161: no FnDef, but a built-in Span slice (`s.slice(1, 3).len()`).
         span_builtin_slice_struct(s, e, out_name, out_len)
+        # AGAST #3620: or `.unwrap()` / `.unwrap_or(d)` of an Option<S> or
+        # Result<S, E>, whose S names the next link of a chain
+        # (`r.focused_window().unwrap().raw()`, prism's test_input).
+        if *out_len == 0
+            unwrap_payload_struct_name(s, e, out_name, out_len)
+            if *out_len > 0 and find_struct(s, *out_name, *out_len) == null
+                *out_name = null
+                *out_len = 0
         return
     if fd.return_type != TYPE_STRUCT or fd.return_type_name_len <= 0
         return
     *out_name = fd.return_type_name
     *out_len = fd.return_type_name_len
+
+# AGAST #2594: the struct payload `init` = `r.unwrap()` gives, `r` an
+# Option<S> or Result<S, E> (try_emit_enum_unwrap loads it as a `%S`), or
+# null/0.  AGAST #3250 / #2863: `r.unwrap_or(d)` gives the same `%S` (its
+# select is on `%S`), so `let t = r.unwrap_or(d)` is an `%S` slot too.
+pub fn unwrap_payload_struct_name(s: *EmitterState, init: *Expr, out_name: **u8, out_len: *i32)
+    if init.kind != EXPR_METHOD or init.left == null
+        return
+    let is_unwrap: bool = init.args == null and name_eq(init.ident_ptr, init.ident_len, c"unwrap", 6) == 1
+    let is_unwrap_or: bool = init.args != null and init.args.next == null and name_eq(init.ident_ptr, init.ident_len, c"unwrap_or", 9) == 1
+    if not is_unwrap and not is_unwrap_or
+        return
+    var enum_name: *u8 = null
+    var enum_len: i32 = 0
+    call_result_struct_name(s, init.left, @enum_name, @enum_len)
+    if enum_len == 0
+        resolve_expr_struct_name(s, init.left, @enum_name, @enum_len)
+    if enum_len == 0
+        return
+    if starts_with(enum_name, enum_len, c"Option$", 7) == 0 and starts_with(enum_name, enum_len, c"Result$", 7) == 0
+        return
+    # A user-enum payload too (AGAST #3620), as try_emit_enum_unwrap loads it.
+    var pay_len: i32 = 0
+    let pay: *u8 = tagged_enum_payload_named(s, enum_name, enum_len, @pay_len, 1)
+    if pay != null and pay_len > 0
+        *out_name = pay
+        *out_len = pay_len
 
 # AGAST #3161: `.slice(lo, hi)` on a `Span<T>` that no FnDef resolves (the
 # callers ask only once method_callee_def found none) is try_emit_span_builtin's
@@ -5625,6 +5660,14 @@ pub fn method_recv_type_name(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
             *out_len = fd.return_type_name_len
             return fd.return_type_name
         return null
+    # AGAST #3620: a method call's struct return (`Color.red().is_opaque()`,
+    # `c.me().is_zero()`) names the impl, as call_callee_def resolves the
+    # chain for emit_expr_method.  Without it bool_check couldn't type the
+    # outer call: "assert condition must be bool, and ritz1 cannot tell".
+    if rcv.kind == EXPR_METHOD
+        var mname: *u8 = null
+        call_result_struct_name(s, rcv, @mname, out_len)
+        return mname
     if rcv.kind == EXPR_MEMBER
         let fld: *StructField = member_field_def(s, rcv)
         if fld != null and (fld.field_type == TYPE_STRUCT or fld.field_type == TYPE_PTR or fld.field_type == TYPE_REF or fld.field_type == TYPE_MUT_REF)
