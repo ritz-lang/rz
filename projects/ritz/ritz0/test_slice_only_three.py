@@ -57,6 +57,12 @@ ND_FIELD = (f"{HEADER}struct M\n    m: [2][3]i32\n\npub fn main() -> i32\n    va
             "    let t = h.m[1][0..2] + 1\n    return 0\n")
 ND_INCLUSIVE = (f"{HEADER}pub fn main() -> i32\n    var a: [2][2][3]i32\n"
                 "    let t = a[1][0][0..=2] + 1\n    return 0\n")
+# AGAST #1552: a 1-D global `[N]T`.  ritz1 took the pointer path here: g[0]'s
+# value as a base address, and the ticket's repro (the typed row, verbatim)
+# segfaulted.  The N-D global above goes through nd_index_shape; this doesn't.
+GLOBAL = (f"{HEADER}var g: [4]i64\n\npub fn main() -> i32\n    g[2] = 7\n"
+          "    let t = g[1..3]\n    return t[1] as i32\n")
+GLOBAL_TYPED = GLOBAL.replace("let t = g", "let t: *i64 = g")
 # A plane pointer, `@g[1]` of a `[2][2][3]i32`, is a `*[2][3]i32`.
 PLANE = (f"{HEADER}var g: [2][2][3]i32\n\npub fn main() -> i32\n    let a = @g[1]\n"
          "    let t = a[1][0..2] + 1\n    return 0\n")
@@ -71,6 +77,8 @@ CASES = {
     "raw_pointer_compare": (RAW_COMPARE, "a pointer can't be sliced"),
     "pointer_to_pointer": (POINTER_TO_POINTER, "a pointer to a pointer can't be sliced"),
     "pointer_to_array": (POINTER_TO_ARRAY, "a pointer to an array can't be sliced"),
+    "global": (GLOBAL, "an array can't be sliced"),
+    "global_typed": (GLOBAL_TYPED, "an array can't be sliced"),
     "nd_local": (ND_LOCAL, "an array can't be sliced"),
     "nd_global": (ND_GLOBAL, "an array can't be sliced"),
     "nd_field": (ND_FIELD, "an array can't be sliced"),
@@ -82,7 +90,7 @@ CASES = {
 def _where(program):
     """main.ritz line:col of the slice's base, as all three locate an index."""
     for n, line in enumerate(program.splitlines(), 1):
-        m = re.search(r"let t = [*(]*([\w.()]+)\[", line)
+        m = re.search(r"let t(?:: [^=]+)? = [*(]*([\w.()]+)\[", line)
         if m:
             return n, m.start(1) + 1
     raise AssertionError("no slice in the program")
