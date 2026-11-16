@@ -934,7 +934,7 @@ fn main() -> i32
 | `String` | Owned, heap-allocated, growable |
 | `StrView` | Borrowed `{ ptr, len }` view — the default type of a `"..."` literal |
 | `*u8` | C-style NUL-terminated string — the type of a `c"..."` literal, and of a `"..."` literal in a `*u8` slot |
-| `Span<u8>` | Borrowed byte slice with length |
+| `Span<u8>` | Borrowed byte slice with length — also the type of a `"..."` literal in a `Span<u8>` slot |
 
 ```ritz
 import ritzlib.string
@@ -990,6 +990,78 @@ fn main() -> i32
     let same: bool = *a == *b
     string_drop(@&s)
     if same
+        return 0
+    1
+```
+
+In a `Span<u8>` slot a `"..."` literal is a `Span<u8>` of its bytes; a `StrView`
+value, a `c"..."` literal and a `String` don't convert (LARB R62, AGAST #3483).
+The slot may be a `let`, an argument or a return value. Escapes are decoded, so
+`"a\tc"` is three bytes:
+
+```ritz
+fn count(s: Span<u8>) -> i64
+    s.len
+
+fn tab() -> Span<u8>
+    return "a\tc"
+
+fn main() -> i32
+    let s: Span<u8> = "abc"
+    let t = tab()
+    if s.len != 3 or s[0] != 97 or s[2] != 99
+        return 1
+    if t.len != 3 or t[1] != 9
+        return 2
+    if count("hello") != 5
+        return 3
+    0
+```
+
+Only the literal converts. A `StrView` value is refused (AGAST #3441), and so
+is a `c"..."` literal, which is a bare `*u8` with no length (AGAST #3440), and a `String`:
+
+```ritz expect-error="its initialiser is a `StrView`"
+import ritzlib.strview
+
+fn first(v: StrView) -> i64
+    let s: Span<u8> = v
+    s.len
+
+fn main() -> i32
+    0
+```
+
+```ritz body expect-error='a `c"..."` literal is a `*u8`, not a `Span<u8>`'
+let s: Span<u8> = c"abc"
+```
+
+```ritz expect-error="its initialiser is a `String`"
+import ritzlib.string
+
+fn main() -> i32
+    var t: String = string_from("abc")
+    let s: Span<u8> = t
+    0
+```
+
+Ask for the conversion by name: `span_from_strview` for a `StrView` (via
+`string_as_view` for a `String`) and `span_from_cstr` for a `*u8`:
+
+```ritz
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview
+
+fn main() -> i32
+    let v: StrView = "abc"
+    let a: Span<u8> = span_from_strview(v)
+    let b: Span<u8> = span_from_cstr(c"abc")
+    var t: String = string_from("abc")
+    let c: Span<u8> = span_from_strview(string_as_view(@t))
+    let n = a.len + b.len + c.len
+    string_drop(@&t)
+    if n == 9
         return 0
     1
 ```

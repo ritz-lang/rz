@@ -334,7 +334,18 @@ REJECTED.update({
                         4, 20, _not_a("Span<u8>")),
     "cstr_strview_let": (_fn("", 'let s: StrView = c"abc"\ns.len'), 2, 22, _not_a("StrView")),
 })
-ACCEPTED["span_from_literal"] = ('fn main() -> i32\n    let s: Span<u8> = "abc"\n    s.len as i32\n', 3)
+
+# AGAST #3483 (R62): in a `Span<u8>` slot a `"..."` literal is a `Span<u8>` of its
+# bytes. Each slot checks the length and every byte, past an escape, and exits 42.
+_SPAN_BYTES = ("    if s.len != 3\n        return 1\n"
+               "    if s[0] != 97 or s[1] != 9 or s[2] != 99\n        return 2\n    42\n")
+ACCEPTED.update({
+    "span_let": ('fn main() -> i32\n    let s: Span<u8> = "a\\tc"\n' + _SPAN_BYTES, 42),
+    "span_arg": ("fn take(s: Span<u8>) -> i32\n" + _SPAN_BYTES
+                 + 'fn main() -> i32\n    take("a\\tc")\n', 42),
+    "span_return": ('fn g() -> Span<u8>\n    return "a\\tc"\n'
+                    "fn main() -> i32\n    let s = g()\n" + _SPAN_BYTES, 42),
+})
 
 # AGAST #3441 (R49): only a `"..."` literal fits a `Span<u8>` slot; a StrView
 # value never converts. ritz1 let the StrView / Span$u8 layout pair through.
@@ -346,6 +357,9 @@ REJECTED.update({
                          4, 10, "parameter `s` is declared `Span$u8` but its argument is a `StrView`"),
     "strview_span_return": (_fn("v: StrView", "return v", "Span<u8>"), 2, 5, _RETURNED),
     "strview_span_tail": (_fn("v: StrView", "v", "Span<u8>"), 2, 5, _RETURNED),
+    # AGAST #3483 (R62): nor does a String.
+    "string_span_let": (_IMPORT_STRING + _fn("", f"{_MAKE_STRING}\nlet t: Span<u8> = s\nt.len"),
+                        4, 5, "`t` is declared `Span$u8` but its initialiser is a `String`"),
 })
 
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
