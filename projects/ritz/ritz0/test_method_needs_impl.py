@@ -114,9 +114,8 @@ pub fn main() -> i32
 
 # A StrView's methods are ritzlib's `impl StrView` and ritz0's emitter
 # builtins (`len`, `as_bytes`): its emitter raised an unlocated ValueError for
-# anything else (AGAST #3649). ritz1 refuses it too, but names the type
-# `Span$u8` (AGAST #3697), so this row is ritz0's until that's fixed.
-RITZ0_REFUSED = {
+# anything else (AGAST #3649). ritz1 named it `Span$u8` until AGAST #3697.
+STRVIEW_REFUSED = {
     "strview": (
         """\
 pub fn main() -> i32
@@ -125,6 +124,19 @@ pub fn main() -> i32
 """,
         # Spelled out: StrView's impl is ritzlib's, so there is no hint.
         "no method `nope` on `StrView`",
+    ),
+}
+
+# ...but a declared `Span<u8>` is one: ritz1 names it so.  ritz0 raises an
+# unlocated ValueError for it (AGAST #3764), so this row is ritz1's until then.
+RITZ1_REFUSED = {
+    "span_u8": (
+        """\
+pub fn main() -> i32
+    let s: Span<u8> = "abc"
+    s.^nope()
+""",
+        no_method("nope", "Span$u8"),
     ),
 }
 
@@ -261,9 +273,16 @@ def test_method_syntax_needs_an_impl_method(tmp_path, compiler, name):
     _assert_refused(compiler, tmp_path, name, program, message)
 
 
-def test_ritz0_refuses_a_strview_method_it_lacks(tmp_path):
-    program, message = RITZ0_REFUSED["strview"]
-    _assert_refused("ritz0", tmp_path, "strview", program, message)
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_strview_method_it_lacks_is_refused_as_strview(tmp_path, compiler):
+    program, message = STRVIEW_REFUSED["strview"]
+    _assert_refused(compiler, tmp_path, "strview", program, message)
+
+
+@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
+def test_ritz1_refuses_a_declared_span_u8_method_as_span(tmp_path, compiler):
+    program, message = RITZ1_REFUSED["span_u8"]
+    _assert_refused(compiler, tmp_path, "span_u8", program, message)
 
 
 # ritz0's emitter builtin `s.as_bytes()` isn't refused (AGAST #3649); ritz1
