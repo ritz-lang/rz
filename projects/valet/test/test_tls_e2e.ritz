@@ -1260,3 +1260,126 @@ fn test_e2e_retry_group_change_with_cookie() -> i32
     if r != 0
         return 100 + r
     return data_both_ways_2182(@client, @server)
+
+# ============================================================================
+# Alerts from the client (AGAST #2197 item 4)
+# ============================================================================
+#
+# A client's close_notify is a clean end of stream, not a failed decrypt;
+# the server mirrors cryptosec's client (#2191): TLS_SERVER_READ_CLOSED for
+# close_notify, TLS_SERVER_READ_ALERT for any other alert, -1 for anything
+# it cannot accept.
+
+# A connected pair. 0 on success.
+fn alert_setup_2197(der: *u8, scfg: *TlsServerConfig, ccfg: *TlsConfig, client: *TlsClient, server: *TlsServer) -> i32
+    if server_setup(scfg, der, cert_valet(), key_valet()) != 0
+        return 1
+    if client_setup(ccfg, c"valet.test", scfg) != 0
+        return 2
+    tls_server_init(server, scfg)
+    tls_client_init(client, ccfg)
+    if handshake(client, server) != 0
+        return 3
+    return 0
+
+# Client -> server: one record of inner type `ctype` holding `data`;
+# returns tls_server_read's result.
+fn server_read_typed_2197(client: *TlsClient, server: *TlsServer, ctype: u8, data: *u8, len: i32) -> i64
+    var rec: [256]u8
+    let rec_len: i32 = tls_record_state_client_encrypt(@client.write_state, data, len, ctype, @rec[0], 256)
+    if rec_len <= 0
+        return -100
+    var got: [256]u8
+    return tls_server_read(server, @rec[0], rec_len as i64, @got[0], 256)
+
+[[test]]
+fn test_e2e_client_close_notify_is_clean_close() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return 1
+    var rec: [256]u8
+    let rec_len: i64 = tls_client_close(@client, @rec[0], 256)
+    if rec_len <= 0
+        return 2
+    var got: [256]u8
+    if tls_server_read(@server, @rec[0], rec_len, @got[0], 256) != TLS_SERVER_READ_CLOSED
+        return 3
+    # Later records are ignored (RFC 8446 6.1): the stream has ended.
+    let n: i64 = tls_server_read(@server, @rec[0], rec_len, @got[0], 256)
+    if n != TLS_SERVER_READ_CLOSED
+        return 4
+    # The server can still write until it closes (a half-close).
+    if tls_server_write(@server, c"bye", 3, @rec[0], 256) <= 0
+        return 5
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+[[test]]
+fn test_e2e_client_fatal_alert_is_reported() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return 1
+    var alert: [2]u8
+    alert[0] = 2   # fatal
+    alert[1] = 40  # handshake_failure
+    if server_read_typed_2197(@client, @server, 21, @alert[0], 2) != TLS_SERVER_READ_ALERT
+        return 2
+    if tls_server_peer_alert(@server) != 40
+        return 3
+    # The connection is dead: nothing more is read.
+    var msg: [2]u8
+    msg[0] = 'h'
+    msg[1] = 'i'
+    if server_read_typed_2197(@client, @server, 23, @msg[0], 2) != -1
+        return 4
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+[[test]]
+fn test_e2e_client_malformed_alert_rejected() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return 1
+    var alert: [3]u8
+    alert[0] = 1
+    alert[1] = 0
+    alert[2] = 0
+    # Three bytes: not an alert (RFC 8446 6), so not a close_notify either.
+    if server_read_typed_2197(@client, @server, 21, @alert[0], 3) != -1
+        return 2
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+[[test]]
+fn test_e2e_client_unknown_inner_type_rejected() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return 1
+    var b: [2]u8
+    b[0] = 1
+    b[1] = 0
+    # Inner type 24 (heartbeat) carrying close_notify's bytes: not an alert.
+    if server_read_typed_2197(@client, @server, 24, @b[0], 2) != -1
+        return 2
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0

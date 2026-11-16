@@ -60,6 +60,14 @@ pub const TLS_ERR_NO_CERTIFICATE: i32 = -12
 pub const TLS_ERR_NO_PRIVATE_KEY: i32 = -13
 pub const TLS_ERR_RNG_FAILED: i32 = -14
 
+# tls_server_read results besides a byte count and -1 (AGAST #2197), as the
+# cryptosec client's TLS_READ_CLOSED (#2191):
+#   TLS_SERVER_READ_CLOSED  the client's close_notify: a clean end of stream
+#   TLS_SERVER_READ_ALERT   any other alert from the client (see
+#                           tls_server_peer_alert): the connection is dead
+pub const TLS_SERVER_READ_CLOSED: i64 = -2
+pub const TLS_SERVER_READ_ALERT: i64 = -3
+
 # Key types
 pub const TLS_KEY_TYPE_ED25519: i32 = 0
 pub const TLS_KEY_TYPE_RSA: i32 = 1
@@ -345,6 +353,11 @@ pub struct TlsServer
     # Handshake complete flag
     handshake_complete: i32
 
+    # The client's alerts (AGAST #2197): peer_closed once its close_notify
+    # is in; peer_alert is the last alert's description, or -1.
+    peer_closed: i32
+    peer_alert: i32
+
     # Work buffers for handshake (to avoid stack overflow)
     # These are large buffers that would otherwise be on the stack
     cert_buf: [8192]u8        # Certificate serialization buffer
@@ -372,6 +385,8 @@ pub fn tls_server_init(server: *TlsServer, config: *TlsServerConfig) -> i32
     server.recv_len = 0
     server.send_len = 0
     server.handshake_complete = 0
+    server.peer_closed = 0
+    server.peer_alert = -1
 
     # Generate server's ephemeral X25519 key pair
     if random_bytes(@server.x25519_private[0], 32) != 0
@@ -1341,9 +1356,20 @@ pub fn tls_server_write(server: *TlsServer, data: *u8, data_len: i64, out: *u8, 
         return -1
     return result as i64
 
-# Decrypt received application data
-# Returns bytes written to out, or negative on error
+# Decrypt one record from the client, after the handshake.
+# Returns:
+#   n >= 0                  n bytes of application data, written to out (0
+#                           also when data holds less than one whole record)
+#   TLS_SERVER_READ_CLOSED  the client's close_notify: a clean end of stream.
+#                           Later records are ignored (RFC 8446 6.1); writes
+#                           still work until tls_server_close.
+#   TLS_SERVER_READ_ALERT   any other alert: the connection is dead, and
+#                           tls_server_peer_alert says which
+#   -1                      error: a record that fails to decrypt, or carries
+#                           a content type the server does not accept
 pub fn tls_server_read(server: *TlsServer, data: *u8, data_len: i64, out: *u8, out_cap: i64) -> i64
+    if server.peer_closed != 0
+        return TLS_SERVER_READ_CLOSED
     if server.state != TLS_SERVER_STATE_CONNECTED
         return -1
 
@@ -1368,6 +1394,9 @@ pub fn tls_server_read(server: *TlsServer, data: *u8, data_len: i64, out: *u8, o
     if result < 0
         return -1
 
+    if inner_type == 21
+        return server_process_alert(server, @plaintext[0], result as i64)
+
     if inner_type != 23
         return -1
 
@@ -1378,6 +1407,20 @@ pub fn tls_server_read(server: *TlsServer, data: *u8, data_len: i64, out: *u8, o
 
     mem_copy(out, @plaintext[0], plaintext_len )
     return plaintext_len
+
+# An alert (RFC 8446 6), as the cryptosec client's process_alert (#2191):
+# close_notify ends the stream cleanly; every other alert, warning or fatal,
+# ends the connection.
+fn server_process_alert(server: *TlsServer, data: *u8, len: i64) -> i64
+    if len != 2
+        server.state = TLS_SERVER_STATE_ERROR
+        return -1
+    server.peer_alert = data[1] as i32
+    if data[1] != 0
+        server.state = TLS_SERVER_STATE_ERROR
+        return TLS_SERVER_READ_ALERT
+    server.peer_closed = 1
+    return TLS_SERVER_READ_CLOSED
 
 # ============================================================================
 # Close Connection
@@ -1429,6 +1472,10 @@ pub fn tls_server_state(server: *TlsServer) -> i32
 # Get last error
 pub fn tls_server_error(server: *TlsServer) -> i32
     return server.last_error
+
+# The client's last alert description (RFC 8446 6), or -1 if none came.
+pub fn tls_server_peer_alert(server: *TlsServer) -> i32
+    return server.peer_alert
 
 # Check if handshake is complete
 pub fn tls_server_is_connected(server: *TlsServer) -> i32

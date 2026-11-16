@@ -18,6 +18,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.uring
 import ritzlib.async_net
+import ritzlib.net { sys_setsockopt }
 import ritzlib.async.tasks
 import ritzlib.iovec
 
@@ -64,6 +65,7 @@ struct Valet
     port: i32                       # Listen port
     workers: i32                    # Worker processes (0 = single)
     backlog: i32                    # Listen backlog
+    sndbuf: i32                     # SO_SNDBUF per connection (0 = kernel default)
     multishot: i32                  # Use multishot accept
     static_root: *u8                # Static file root directory (or null)
     static_prefix: *u8              # Static URL prefix (e.g., "/static/")
@@ -124,6 +126,7 @@ pub fn valet_init(app: *Valet, port: i32)
     app.port = port
     app.workers = 0
     app.backlog = 1024
+    app.sndbuf = 0
     app.multishot = 0
     app.static_root = null
     app.static_prefix = null
@@ -231,6 +234,13 @@ pub fn valet_multishot(app: *Valet, enabled: i32)
 
 pub fn valet_backlog(app: *Valet, backlog: i32)
     app.backlog = backlog
+
+
+# Send buffer size for every connection, in bytes (0 = the kernel default).
+# Set on the listening socket, which accepted sockets inherit it from. A
+# small one makes large responses go out in short sends (#2197's test).
+pub fn valet_sndbuf(app: *Valet, bytes: i32)
+    app.sndbuf = bytes
 
 
 pub fn valet_keepalive_requests(app: *Valet, max_requests: i32)
@@ -1563,6 +1573,16 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
         if tls_data.rx_len - off < rec_len
             break  # partial record: the rest is still on the wire
         let plaintext_len: i64 = tls_server_read(@tls_data.tls, @tls_data.rx[off], rec_len, @plaintext[0], 8192)
+        if plaintext_len == TLS_SERVER_READ_CLOSED
+            # The client's close_notify: nothing after it counts (RFC 8446
+            # 6.1). A complete request before it is still answered below.
+            off = tls_data.rx_len
+            break
+        if plaintext_len == TLS_SERVER_READ_ALERT
+            log_warn(c"TLS alert from client, closing connection")
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
         if plaintext_len < 0
             log_warn(c"TLS decrypt failed")
             tls_task_data_free(tls_data)
@@ -1585,6 +1605,12 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     if total == -2 or total > TLS_REQ_CAP
         return valet_tls_send_413(task, tls_data)
     if total == -1 or total > req_len
+        # The client closed (AGAST #2197 item 4): a normal hangup, and the
+        # rest of a partial request is never coming.
+        if tls_data.tls.peer_closed != 0
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 0
         if total == -1 and req_len >= TLS_REQ_CAP
             return valet_tls_send_413(task, tls_data)
         let ret = tls_task_recv_app(task, tls_data)
@@ -1836,10 +1862,23 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
 
     # State: SEND - wait for send completion
     if task.handler_state == TLS_CONN_STATE_SEND
-        if task.io_result < 0
+        if task.io_result <= 0
             tls_task_data_free(tls_data)
             task.user_data = null
             return 1
+
+        # Short send: the rest of the record is still in write_buf, from
+        # write_pos on. Send it before anything else: a record cut short and
+        # followed by the next one is garbage to the client (AGAST #2197
+        # item 5). Nothing touches write_buf until the whole record is out.
+        task.write_pos = task.write_pos + task.io_result
+        if task.write_pos < task.write_len
+            let ret = task_submit_send_buf(tls_data.pool, task, @task.write_buf[task.write_pos], task.write_len - task.write_pos)
+            if ret < 0
+                tls_task_data_free(tls_data)
+                task.user_data = null
+                return 1
+            return -1
 
         # Keep-alive
         if task.request_count < app.keepalive_requests
@@ -1912,6 +1951,9 @@ pub fn valet_run(app: *Valet) -> i32
 
     set_reuseaddr(server_fd)
     set_reuseport(server_fd)
+    if app.sndbuf > 0
+        var sndbuf: i32 = app.sndbuf
+        sys_setsockopt(server_fd, 1, 7, @sndbuf as *u8, 4)  # SOL_SOCKET, SO_SNDBUF
 
     var ret_bind: i32 = tcp_bind(server_fd, inaddr_any(), app.port)
     if ret_bind < 0

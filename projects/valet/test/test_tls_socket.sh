@@ -19,6 +19,10 @@
 #   - A request's two records in one TCP write (AGAST #2197 item 2)
 #   - Headers over the 8 KiB request limit get a 413, not a silent close
 #   - A client hanging up mid-handshake does not spin the server
+#   - A client's close_notify is a clean close, not "decrypt failed"
+#     (AGAST #2197 item 4)
+#   - Responses sent in short sends, under a small SO_SNDBUF, arrive intact
+#     (AGAST #2197 item 5)
 #
 # Usage: bash projects/valet/test/test_tls_socket.sh  (after ./rz build valet)
 #
@@ -209,6 +213,38 @@ elif mode == "tworecords":
     tls.write(b"GET / HTTP/1.1\r\n")
     tls.write(b"Host: localhost\r\nConnection: close\r\n\r\n")
     sock.sendall(outg.read())  # both records, one write
+elif mode == "closenotify":
+    # A keep-alive GET, its response, then close_notify: how a
+    # well-behaved client ends a session.
+    sock.sendall(outg.read())
+    time.sleep(PAUSE)
+    send_record(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    reply = b""
+    while b"Hello, World!" not in reply:
+        try:
+            reply += tls.read(16384)
+        except ssl.SSLWantReadError:
+            data = sock.recv(16384)
+            if not data:
+                break
+            inc.write(data)
+    try:
+        tls.unwrap()  # queues close_notify, then wants the server's
+    except ssl.SSLWantReadError:
+        pass
+    sock.sendall(outg.read())
+    # The client is done; the server must not wait on it. Its close, not
+    # ours, ends the connection.
+    sock.settimeout(2)
+    try:
+        while sock.recv(16384):
+            pass
+        reply += b"\nSERVER CLOSED\n"
+    except socket.timeout:
+        pass
+    sock.close()
+    sys.stdout.write(reply.decode("latin-1"))
+    sys.exit(0)
 elif mode == "oversized":
     sock.sendall(outg.read())
     time.sleep(PAUSE)
@@ -225,7 +261,7 @@ while True:
         if not data:
             break
         inc.write(data)
-    except (ssl.SSLZeroReturn, ssl.SSLEOFError):
+    except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
         break
 sys.stdout.write(reply.decode("latin-1"))
 EOF
@@ -326,9 +362,107 @@ else
     fail "hangup: server spinning ($SPENT ticks in 1s)"
 fi
 
+# A client's close_notify came back from tls_server_read as -1, so every
+# normal hangup logged a warning (AGAST #2197 item 4).
+echo "=== Test 12: client sends close_notify, then hangs up ==="
+BEFORE="$(grep -c "TLS decrypt failed" "$WORK/server.log")"
+OUT="$(raw_client closenotify 2>&1)"
+sleep 0.3
+AFTER="$(grep -c "TLS decrypt failed" "$WORK/server.log")"
+if ! grep -q "Hello, World!" <<<"$OUT"; then
+    fail "close_notify: no HTTP response before the close"
+    echo "--- client"; tail -5 <<<"$OUT"
+elif ! grep -q "^SERVER CLOSED$" <<<"$OUT"; then
+    fail "close_notify: server kept the connection open"
+elif [ "$AFTER" -ne "$BEFORE" ]; then
+    fail "close_notify: logged \"TLS decrypt failed\""
+    echo "--- server"; grep "WARN\|ERROR" "$WORK/server.log" | tail -3
+else
+    pass "close_notify: clean close, no decrypt warning"
+fi
+
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     fail "server exited during the run"
 fi
+
+# A second server with the smallest send buffer: a 3500-byte response no
+# longer fits in one send while the client is not reading, so it goes out in
+# pieces. The TLS SEND state took the first piece for the whole record and
+# moved on, so the rest of the record never followed (AGAST #2197 item 5).
+echo "=== Test 13: short sends under a small SO_SNDBUF ==="
+SPORT=$((PORT + 1))
+cat > "$WORK/valet_sndbuf.json" <<EOF2
+{"server":{"port":$SPORT,"sndbuf":1024},"tls":{"enabled":true,"cert":"$WORK/cert.pem","key":"$WORK/key.pem"}}
+EOF2
+(cd "$WORK" && exec "$VALET" -c valet_sndbuf.json) > "$WORK/server_sndbuf.log" 2>&1 &
+SNDBUF_PID=$!
+for _ in $(seq 1 50); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$SPORT") 2>/dev/null && break
+    sleep 0.1
+done
+OUT="$(timeout "$CLIENT_TIMEOUT" python3 - "$SPORT" <<'EOF2' 2>&1
+import socket, ssl, sys, time
+
+port = int(sys.argv[1])
+N, SIZE = 12, 3500
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+inc, outg = ssl.MemoryBIO(), ssl.MemoryBIO()
+tls = ctx.wrap_bio(inc, outg, server_hostname="localhost")
+sock = socket.socket()
+# A small receive window too, so the server's sends back up behind it.
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+sock.connect(("127.0.0.1", port))
+while True:
+    try:
+        tls.do_handshake()
+        break
+    except ssl.SSLWantReadError:
+        sock.sendall(outg.read())
+        inc.write(sock.recv(16384))
+sock.sendall(outg.read())
+# N pipelined requests, the last closing; then not reading for a while.
+reqs = b"GET /bytes/%d HTTP/1.1\r\nHost: localhost\r\n\r\n" % SIZE * (N - 1)
+reqs += b"GET /bytes/%d HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" % SIZE
+tls.write(reqs)
+sock.sendall(outg.read())
+time.sleep(0.5)
+reply = b""
+try:
+    while True:
+        try:
+            reply += tls.read(16384)
+        except ssl.SSLWantReadError:
+            data = sock.recv(2048)
+            if not data:
+                break
+            inc.write(data)
+            time.sleep(0.002)
+        except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+            break
+except ssl.SSLError as e:
+    print("TLS error after %d bytes: %s" % (len(reply), e))
+body = bytes(b"0123456789"[i % 10] for i in range(SIZE))
+head, sep, rest = reply.partition(b"\r\n\r\n")
+got = 0
+while sep:
+    if not head.startswith(b"HTTP/1.1 200") or not rest.startswith(body):
+        break
+    got += 1
+    head, sep, rest = rest[SIZE:].partition(b"\r\n\r\n")
+print("intact responses: %d of %d" % (got, N))
+EOF2
+)"
+if grep -q "^intact responses: 12 of 12$" <<<"$OUT"; then
+    pass "short sends: 12 responses of 3500 bytes arrived intact"
+else
+    fail "short sends: responses corrupted or missing"
+    echo "--- client"; tail -3 <<<"$OUT"
+    echo "--- server"; grep "WARN\|ERROR" "$WORK/server_sndbuf.log" | tail -3
+fi
+{ kill -9 "$SNDBUF_PID"; wait "$SNDBUF_PID"; } 2>/dev/null
 
 if [ "$FAILED" -ne 0 ]; then
     echo -e "${RED}TLS socket tests failed${NC}"
