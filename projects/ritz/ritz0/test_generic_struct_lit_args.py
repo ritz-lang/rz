@@ -235,6 +235,14 @@ R51A_INFERS = {
                                  "fn main() -> i32\n"
                                  "    let w = W10<u8> { t: Box2<My_A> { v: My_A { n: 9 } }, a: 1 }\n"
                                  "    w.t.v.n + w.a as i32 * 10\n", 19),
+    # ...through an array (#3746): A binds from `arr2_A`, and W4<u8>'s field
+    # is a Box2$arr2_u8 (ritz1 kept `Box2$arr2_A`, an unsized W4$u8, until
+    # #3748's piece rule).
+    "outer_param_array_field": (ALL, "struct W4<A>\n    t: Box2<[2]A>\n"
+                                "fn f(w: W4<u8>) -> i32\n    let b: Box2<[2]u8> = w.t\n"
+                                "    b.v[1] as i32 + 20\n"
+                                "fn main() -> i32\n    var a: [2]u8 = [3, 4]\n"
+                                "    let w = W4 { t: Box2 { v: a } }\n    f(w)\n", 24),
     # The same principle: a generic fn's concrete param is its argument's
     # slot, its `6` a u8.
     "generic_fn_known_param": (ALL, TAGGED + "fn g<U>(x: U, t: Tagged<u8>, b: Box2<u8>) -> i32\n"
