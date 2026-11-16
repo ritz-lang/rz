@@ -484,6 +484,11 @@ projects/ritz/
 │   ├── test_runner.py        # ritz0 --test driver
 │   └── test/
 │       └── test_issue_*.ritz # 33 regression tests (compiler matrix)
+├── ritz1/
+│   └── test/
+│       └── test_*.ritz       # unit suites for ritz1/src modules (nfa, regex,
+│                             #   lexer_nfa): `make ritz1-unit`, a bootstrap
+│                             #   gate step; red on zero tests (AGAST #1556)
 └── examples/
     └── tier{1..5}_*/*/
         ├── test/

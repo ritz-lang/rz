@@ -1,0 +1,178 @@
+# ritz1/test/test_nfa.ritz - unit tests for ritz1/src/nfa.ritz
+#
+# Run by `make ritz1-unit` (tools/ritz1_unit.py), a bootstrap gate step.
+# Each test builds a small NFA by hand with the Thompson constructors, then
+# asks nfa_accepts whether it accepts whole strings.  nfa_finalize must run
+# first: nfa_accepts walks the per-state index it builds.
+
+import ritzlib.strview
+import nfa
+
+# Storage for one NFA.  The caller owns it; nfa_init only records pointers.
+struct Rig
+  nfa: NFA
+  states: [64]NFAState
+  trans: [128]Transition
+  sto: [64]i32
+  stc: [64]i32
+  ti: [128]i32
+
+fn rig_init(r: *Rig) -> *NFA
+  nfa_init(@r.nfa, @r.states[0], @r.trans[0], @r.sto[0], @r.stc[0], @r.ti[0], 64, 128)
+  @r.nfa
+
+# Mark `frag` accepting, make it the start, index it.
+fn rig_seal(n: *NFA, frag: NFAFragment) -> i32
+  thompson_accept(n, frag, 7)
+  nfa_finalize(n)
+
+fn accepts(n: *NFA, s: StrView) -> i32
+  nfa_accepts(n, s.ptr, s.len as i32)
+
+[[test]]
+fn test_char_accepts_only_itself() -> i32
+  var r: Rig
+  let n: *NFA = rig_init(@r)
+  rig_seal(n, thompson_char(n, 97))
+  assert accepts(n, "a") == 1
+  assert accepts(n, "b") == 0
+  assert accepts(n, "") == 0
+  assert accepts(n, "aa") == 0
+  0
+
+[[test]]
+fn test_range_is_inclusive_at_both_ends() -> i32
+  var r: Rig
+  let n: *NFA = rig_init(@r)
+  rig_seal(n, thompson_range(n, 98, 100))  # [b-d]
+  assert accepts(n, "a") == 0
+  assert accepts(n, "b") == 1
+  assert accepts(n, "c") == 1
+  assert accepts(n, "d") == 1
+  assert accepts(n, "e") == 0
+  0
+
+[[test]]
+fn test_any_accepts_one_byte_of_any_value() -> i32
+  var r: Rig
+  let n: *NFA = rig_init(@r)
+  rig_seal(n, thompson_any(n))
+  assert accepts(n, "x") == 1
+  var hi: [1]u8 = [255; 1]
+  assert nfa_accepts(n, @hi[0], 1) == 1  # a high byte is a char, not EOF (-1)
+  assert accepts(n, "") == 0
+  assert accepts(n, "xy") == 0
+  0
+
+[[test]]
+fn test_concat_and_string() -> i32
+  var r: Rig
+  let n: *NFA = rig_init(@r)
+  let s: StrView = "abc"
+  rig_seal(n, thompson_string(n, s.ptr, 3))
+  assert accepts(n, "abc") == 1
+  assert accepts(n, "ab") == 0
+  assert accepts(n, "abcd") == 0
+  assert accepts(n, "abd") == 0
+  0
+
+[[test]]
+fn test_empty_string_accepts_only_empty() -> i32
+  var r: Rig
+  let n: *NFA = rig_init(@r)
+  let s: StrView = ""
+  rig_seal(n, thompson_string(n, s.ptr, 0))
+  assert accepts(n, "") == 1
+  assert accepts(n, "a") == 0
+  0
+
+[[test]]
+fn test_alt_accepts_either_side() -> i32
+  var r: Rig
+  let n: *NFA = rig_init(@r)
+  let a: NFAFragment = thompson_char(n, 97)
+  let b: NFAFragment = thompson_char(n, 98)
+  rig_seal(n, thompson_alt(n, a, b))
+  assert accepts(n, "a") == 1
+  assert accepts(n, "b") == 1
+  assert accepts(n, "c") == 0
+  assert accepts(n, "ab") == 0
+  0
+
+[[test]]
+fn test_star_plus_opt_counts() -> i32
+  # a*: 0..n, a+: 1..n, a?: 0..1
+  var r1: Rig
+  let n1: *NFA = rig_init(@r1)
+  rig_seal(n1, thompson_star(n1, thompson_char(n1, 97)))
+  assert accepts(n1, "") == 1
+  assert accepts(n1, "a") == 1
+  assert accepts(n1, "aaaa") == 1
+  assert accepts(n1, "ab") == 0
+
+  var r2: Rig
+  let n2: *NFA = rig_init(@r2)
+  rig_seal(n2, thompson_plus(n2, thompson_char(n2, 97)))
+  assert accepts(n2, "") == 0
+  assert accepts(n2, "a") == 1
+  assert accepts(n2, "aaaa") == 1
+
+  var r3: Rig
+  let n3: *NFA = rig_init(@r3)
+  rig_seal(n3, thompson_opt(n3, thompson_char(n3, 97)))
+  assert accepts(n3, "") == 1
+  assert accepts(n3, "a") == 1
+  assert accepts(n3, "aa") == 0
+  0
+
+[[test]]
+fn test_trans_matches_by_kind() -> i32
+  var t: Transition = Transition { kind: 0, char_lo: 0, char_hi: 0, from_state: 0, to_state: 0 }
+  t.kind = 0  # TR_CHAR
+  t.char_lo = 65
+  t.char_hi = 65
+  assert trans_matches(@t, 65) == 1
+  assert trans_matches(@t, 66) == 0
+  t.kind = 1  # TR_RANGE
+  t.char_hi = 70
+  assert trans_matches(@t, 64) == 0
+  assert trans_matches(@t, 70) == 1
+  assert trans_matches(@t, 71) == 0
+  t.kind = 2  # TR_EPSILON consumes nothing, so it matches no char
+  assert trans_matches(@t, 65) == 0
+  t.kind = 3  # TR_ANY: any byte, but not end-of-input (-1)
+  assert trans_matches(@t, 0) == 1
+  assert trans_matches(@t, 255) == 1
+  assert trans_matches(@t, -1) == 0
+  0
+
+[[test]]
+fn test_finalize_groups_transitions_by_state() -> i32
+  # Transitions added out of state order: 1->2, 0->1, 1->0, 0->2.
+  var r: Rig
+  let n: *NFA = rig_init(@r)
+  nfa_add_state(n, 0, 0)
+  nfa_add_state(n, 0, 0)
+  nfa_add_state(n, 1, 0)
+  nfa_add_char_trans(n, 1, 2, 98)     # t0
+  nfa_add_char_trans(n, 0, 1, 97)     # t1
+  nfa_add_epsilon_trans(n, 1, 0)      # t2
+  nfa_add_range_trans(n, 0, 2, 48, 57)  # t3
+  nfa_finalize(n)
+  # state 0: t1, t3; state 1: t0, t2; state 2: none
+  assert r.stc[0] == 2
+  assert r.stc[1] == 2
+  assert r.stc[2] == 0
+  assert r.sto[0] == 0
+  assert r.sto[1] == 2
+  assert r.sto[2] == 4
+  assert r.ti[0] == 1
+  assert r.ti[1] == 3
+  assert r.ti[2] == 0
+  assert r.ti[3] == 2
+  # and the simulation follows it: (a b?)* then b, or a digit
+  assert accepts(n, "5") == 1
+  assert accepts(n, "ab") == 1
+  assert accepts(n, "aab") == 1   # a, eps back to 0, a, b
+  assert accepts(n, "b") == 0
+  0

@@ -177,6 +177,13 @@ ritz1-bootstrap:
 	@echo "=== Building ritz1 + ritz1_selfhosted (-j$(RITZ1_J)) ==="
 	@$(MAKE) -j$(RITZ1_J) -C ritz1 bootstrap
 
+# ritz1's unit suites: every ritz1/test/*.ritz is a [[test]] file importing
+# ritz1/src modules (AGAST #1556).  Fails on a file with no tests and on no
+# files at all.  CI's bootstrap job runs it; ~5 s.
+.PHONY: ritz1-unit
+ritz1-unit:
+	@$(PYTHON) tools/ritz1_unit.py
+
 # Build and test all examples (always runs)
 .PHONY: examples
 examples:

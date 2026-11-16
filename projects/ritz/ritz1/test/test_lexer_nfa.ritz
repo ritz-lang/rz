@@ -1,0 +1,176 @@
+# ritz1/test/test_lexer_nfa.ritz - unit tests for ritz1/src/lexer_nfa.ritz
+#
+# Run by `make ritz1-unit` (tools/ritz1_unit.py), a bootstrap gate step.
+# Two rigs: a four-pattern lexer built here with lexer_add_pattern (ported
+# from the ungated ritz1/test/test_lexer_reuse.ritz, AGAST #1556), and the
+# real grammar through the generated setup_lexer (ported from
+# ritz1/test/test_lexer.ritz, which called a setup_lexer signature that no
+# longer exists).
+
+import ritzlib.strview
+import tokens_gen
+import nfa
+import lexer_nfa
+import lexer_setup_gen
+
+# Sized as ritz1/src/main.ritz sizes the real lexer's storage.
+struct Rig
+  lex: Lexer
+  nfa: NFA
+  patterns: [128]TokenPattern
+  states: [4096]NFAState
+  trans: [8192]Transition
+  sto: [4096]i32
+  stc: [4096]i32
+  ti: [8192]i32
+
+fn rig_storage(r: *Rig)
+  nfa_init(@r.nfa, @r.states[0], @r.trans[0], @r.sto[0], @r.stc[0], @r.ti[0], 4096, 8192)
+  lexer_init(@r.lex, null, 0, @r.nfa, @r.patterns[0])
+
+# IDENT, ( and ), with spaces skipped, plus "ab" as TOK_FN.  The longest
+# match wins; on a tie the LOWER token type wins (keywords are numbered
+# below TOK_IDENT), not the pattern added first: "ab" is added second.
+fn rig_mini(r: *Rig) -> *Lexer
+  rig_storage(r)
+  lexer_add_pattern(@r.lex, "[a-zA-Z_][a-zA-Z0-9_]*", TOK_IDENT, 0)
+  lexer_add_pattern(@r.lex, "ab", TOK_FN, 1)
+  lexer_add_pattern(@r.lex, "(", TOK_LPAREN, 1)
+  lexer_add_pattern(@r.lex, ")", TOK_RPAREN, 1)
+  lexer_add_pattern(@r.lex, " ", TOK_SKIP, 1)
+  lexer_finalize(@r.lex)
+  @r.lex
+
+fn rig_grammar(r: *Rig) -> *Lexer
+  setup_lexer(@r.lex, @r.nfa, @r.patterns[0], @r.states[0], @r.trans[0], @r.sto[0], @r.stc[0], @r.ti[0], 4096, 8192)
+  @r.lex
+
+fn feed(lex: *Lexer, src: StrView)
+  lexer_reset(lex, src.ptr, src.len)
+
+# The next token's kind (`assert next_kind(lex) == TOK_X` prints both).
+fn next_kind(lex: *Lexer) -> i32
+  let tok: Token = lexer_next(lex)
+  tok.kind
+
+[[test]]
+fn test_mini_tokens_in_order() -> i32
+  var r: Rig
+  let lex: *Lexer = rig_mini(@r)
+  feed(lex, "main ( x)")
+  let t1: Token = lexer_next(lex)
+  assert t1.kind == TOK_IDENT
+  assert t1.len == 4
+  assert *t1.start == 109  # m
+  assert t1.line == 1
+  assert t1.col == 1
+  let t2: Token = lexer_next(lex)
+  assert t2.kind == TOK_LPAREN
+  assert t2.col == 6       # the skipped space still advances the column
+  assert next_kind(lex) == TOK_IDENT
+  assert next_kind(lex) == TOK_RPAREN
+  0
+
+[[test]]
+fn test_longest_match_then_lower_token_type_wins() -> i32
+  var r: Rig
+  let lex: *Lexer = rig_mini(@r)
+  feed(lex, "ab abc")
+  let t1: Token = lexer_next(lex)
+  assert t1.kind == TOK_FN      # "ab": tie with IDENT; 10 < 130
+  let t2: Token = lexer_next(lex)
+  assert t2.kind == TOK_IDENT   # "abc": IDENT matches longer
+  assert t2.len == 3
+  0
+
+[[test]]
+fn test_unmatched_char_is_one_error_token() -> i32
+  var r: Rig
+  let lex: *Lexer = rig_mini(@r)
+  feed(lex, "a!b")
+  assert next_kind(lex) == TOK_IDENT
+  let bad: Token = lexer_next(lex)
+  assert bad.kind == TOK_ERROR
+  assert bad.len == 1
+  assert *bad.start == 33  # !
+  assert next_kind(lex) == TOK_IDENT
+  0
+
+[[test]]
+fn test_dollar_is_a_fatal_error() -> i32
+  # `$` outside asm is refused with a message, and lexing stops there.
+  var r: Rig
+  let lex: *Lexer = rig_mini(@r)
+  feed(lex, "a$b")
+  assert next_kind(lex) == TOK_IDENT
+  let bad: Token = lexer_next(lex)
+  assert bad.kind == TOK_ERROR
+  assert *bad.start == 36  # $
+  assert lex.error_msg != null
+  assert next_kind(lex) == TOK_EOF
+  0
+
+[[test]]
+fn test_reset_reuses_nfa_for_a_new_source() -> i32
+  var r: Rig
+  let lex: *Lexer = rig_mini(@r)
+  feed(lex, "main()")
+  assert next_kind(lex) == TOK_IDENT
+  assert next_kind(lex) == TOK_LPAREN
+  # A second source, mid-way through the first: position, line and column
+  # all restart, and the same NFA lexes it.
+  feed(lex, "(zz")
+  let t: Token = lexer_next(lex)
+  assert t.kind == TOK_LPAREN
+  assert t.col == 1
+  assert t.line == 1
+  assert next_kind(lex) == TOK_IDENT
+  0
+
+[[test]]
+fn test_grammar_function_header_and_block() -> i32
+  var r: Rig
+  let lex: *Lexer = rig_grammar(@r)
+  feed(lex, "fn main() -> i32\n  return 42\n")
+  assert next_kind(lex) == TOK_FN
+  assert next_kind(lex) == TOK_IDENT
+  assert next_kind(lex) == TOK_LPAREN
+  assert next_kind(lex) == TOK_RPAREN
+  assert next_kind(lex) == TOK_ARROW
+  assert next_kind(lex) == TOK_I32
+  assert next_kind(lex) == TOK_NEWLINE
+  assert next_kind(lex) == TOK_INDENT
+  let ret: Token = lexer_next(lex)
+  assert ret.kind == TOK_RETURN
+  assert ret.line == 2
+  assert ret.col == 3
+  let num: Token = lexer_next(lex)
+  assert num.kind == TOK_NUMBER
+  assert num.len == 2
+  assert next_kind(lex) == TOK_NEWLINE
+  assert next_kind(lex) == TOK_DEDENT
+  assert next_kind(lex) == TOK_EOF
+  0
+
+[[test]]
+fn test_grammar_keyword_prefix_is_an_identifier() -> i32
+  var r: Rig
+  let lex: *Lexer = rig_grammar(@r)
+  feed(lex, "fnord returned")
+  assert next_kind(lex) == TOK_IDENT
+  assert next_kind(lex) == TOK_IDENT
+  0
+
+[[test]]
+fn test_grammar_string_is_cooked() -> i32
+  var r: Rig
+  let lex: *Lexer = rig_grammar(@r)
+  feed(lex, "\"a\\n\\\"b\"")   # source text: "a\n\"b"
+  let s: Token = lexer_next(lex)
+  assert s.kind == TOK_STRING
+  assert s.string_len == 4
+  assert *(s.string_val + 0) == 97
+  assert *(s.string_val + 1) == 10
+  assert *(s.string_val + 2) == 34
+  assert *(s.string_val + 3) == 98
+  0

@@ -53,6 +53,7 @@ LOCAL_MODULES = {
     "likely_tests",
     "ritz1_arch",
     "run_regression_matrix",
+    "ritz1_unit",
     "smoke",
     "smoke_stack",
     "ritzgen_py",

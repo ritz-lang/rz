@@ -1,0 +1,206 @@
+# ritz1/test/test_regex.ritz - unit tests for ritz1/src/regex.ritz
+#
+# Run by `make ritz1-unit` (tools/ritz1_unit.py), a bootstrap gate step.
+# Each test compiles a pattern with regex_parse into a fresh NFA and asks
+# nfa_accepts about whole strings.
+#
+# Ported from the ungated repros AGAST #1556 retired: ritz1/test/
+# test_negation_kleene.ritz and test_string_pattern.ritz (`[^a]*` and
+# `[^"]*` used to hang regex_parse), test_negated_range.ritz (`[^x]` with x at
+# the bottom of the byte range built the inverted range [0..-1]), and
+# ritz1/tests/test_regex_negation.ritz.
+
+import ritzlib.strview
+import nfa
+import regex
+
+struct Rig
+  nfa: NFA
+  states: [512]NFAState
+  trans: [1024]Transition
+  sto: [512]i32
+  stc: [512]i32
+  ti: [1024]i32
+
+# Compile `pattern` into r's NFA, ready for nfa_accepts.
+fn compile(r: *Rig, pattern: StrView) -> *NFA
+  nfa_init(@r.nfa, @r.states[0], @r.trans[0], @r.sto[0], @r.stc[0], @r.ti[0], 512, 1024)
+  let frag: NFAFragment = regex_parse(pattern.ptr, pattern.len as i32, @r.nfa)
+  thompson_accept(@r.nfa, frag, 1)
+  nfa_finalize(@r.nfa)
+  @r.nfa
+
+fn accepts(n: *NFA, s: StrView) -> i32
+  nfa_accepts(n, s.ptr, s.len as i32)
+
+fn accepts_byte(n: *NFA, b: i32) -> i32
+  var one: [1]u8 = [b as u8; 1]
+  nfa_accepts(n, @one[0], 1)
+
+# 1 if every TR_RANGE transition in n has lo <= hi.
+fn ranges_well_formed(n: *NFA) -> i32
+  var i: i32 = 0
+  while i < n.trans_count
+    let t: *Transition = n.transitions + i
+    if t.kind == 1 and t.char_lo > t.char_hi
+      return 0
+    i = i + 1
+  1
+
+[[test]]
+fn test_literal_concat() -> i32
+  var r: Rig
+  let n: *NFA = compile(@r, "fn")
+  assert accepts(n, "fn") == 1
+  assert accepts(n, "f") == 0
+  assert accepts(n, "fnx") == 0
+  0
+
+[[test]]
+fn test_class_with_ranges() -> i32
+  var r: Rig
+  let n: *NFA = compile(@r, "[a-zA-Z_][a-zA-Z0-9_]*")
+  assert accepts(n, "main") == 1
+  assert accepts(n, "_x9") == 1
+  assert accepts(n, "Z") == 1
+  assert accepts(n, "9a") == 0
+  assert accepts(n, "a-b") == 0
+  0
+
+[[test]]
+fn test_class_trailing_dash_is_literal() -> i32
+  var r: Rig
+  let n: *NFA = compile(@r, "[a-]")
+  assert accepts(n, "a") == 1
+  assert accepts(n, "-") == 1
+  assert accepts(n, "b") == 0
+  0
+
+[[test]]
+fn test_dot_alternation_group_and_quantifiers() -> i32
+  var r1: Rig
+  let n1: *NFA = compile(@r1, "a.c")
+  assert accepts(n1, "abc") == 1
+  assert accepts(n1, "a c") == 1
+  assert accepts(n1, "ac") == 0
+
+  var r2: Rig
+  let n2: *NFA = compile(@r2, "ab|cd")
+  assert accepts(n2, "ab") == 1
+  assert accepts(n2, "cd") == 1
+  assert accepts(n2, "ad") == 0
+
+  var r3: Rig
+  let n3: *NFA = compile(@r3, "(ab)+c?")
+  assert accepts(n3, "ab") == 1
+  assert accepts(n3, "ababc") == 1
+  assert accepts(n3, "c") == 0
+  assert accepts(n3, "abcc") == 0
+  0
+
+[[test]]
+fn test_escapes() -> i32
+  # \n \t are control chars; \* and \\ are the literal char
+  var r1: Rig
+  let n1: *NFA = compile(@r1, "\\n\\t")
+  assert accepts(n1, "\n\t") == 1
+  assert accepts(n1, "nt") == 0
+
+  var r2: Rig
+  let n2: *NFA = compile(@r2, "a\\*")
+  assert accepts(n2, "a*") == 1
+  assert accepts(n2, "aa") == 0
+  assert accepts(n2, "a") == 0
+
+  var r3: Rig
+  let n3: *NFA = compile(@r3, "\\\\")
+  assert accepts(n3, "\\") == 1
+  0
+
+[[test]]
+fn test_negated_class_excludes_its_char() -> i32
+  var r: Rig
+  let n: *NFA = compile(@r, "[^a]")
+  assert accepts(n, "b") == 1
+  assert accepts(n, "a") == 0
+  assert accepts_byte(n, 0) == 1
+  assert accepts_byte(n, 255) == 1
+  assert accepts(n, "") == 0
+  0
+
+[[test]]
+fn test_negated_class_excludes_every_char() -> i32
+  # [^"\\] is STRING's body: before the excluded set was collected, only
+  # the first char was honoured and `\` slipped through.
+  var r: Rig
+  let n: *NFA = compile(@r, "[^\"\\\\]")
+  assert accepts(n, "a") == 1
+  assert accepts(n, "\"") == 0
+  assert accepts(n, "\\") == 0
+  0
+
+[[test]]
+fn test_negated_class_with_range() -> i32
+  var r: Rig
+  let n: *NFA = compile(@r, "[^b-d]")
+  assert accepts(n, "a") == 1
+  assert accepts(n, "b") == 0
+  assert accepts(n, "c") == 0
+  assert accepts(n, "d") == 0
+  assert accepts(n, "e") == 1
+  0
+
+[[test]]
+fn test_negated_class_at_byte_range_ends() -> i32
+  # Excluding 0 or 255 leaves no gap below/above it: no range may be
+  # built for the empty gap ([0..-1] or [256..255]).
+  var r1: Rig
+  let n1: *NFA = compile(@r1, "[^\\0]")
+  assert ranges_well_formed(n1) == 1
+  assert accepts_byte(n1, 0) == 0
+  assert accepts_byte(n1, 1) == 1
+  assert accepts_byte(n1, 255) == 1
+
+  var r2: Rig
+  var pat: [4]u8 = [0; 4]
+  pat[0] = 91   # [
+  pat[1] = 94   # ^
+  pat[2] = 255
+  pat[3] = 93   # ]
+  nfa_init(@r2.nfa, @r2.states[0], @r2.trans[0], @r2.sto[0], @r2.stc[0], @r2.ti[0], 512, 1024)
+  thompson_accept(@r2.nfa, regex_parse(@pat[0], 4, @r2.nfa), 1)
+  nfa_finalize(@r2.nfa)
+  assert ranges_well_formed(@r2.nfa) == 1
+  assert accepts_byte(@r2.nfa, 255) == 0
+  assert accepts_byte(@r2.nfa, 254) == 1
+  assert accepts_byte(@r2.nfa, 0) == 1
+  0
+
+[[test]]
+fn test_negated_class_under_star() -> i32
+  # [^a]* and [^"]* used to hang regex_parse.
+  var r1: Rig
+  let n1: *NFA = compile(@r1, "[^a]*")
+  assert accepts(n1, "") == 1
+  assert accepts(n1, "bcd") == 1
+  assert accepts(n1, "bad") == 0
+
+  var r2: Rig
+  let n2: *NFA = compile(@r2, "\"[^\"]*\"")
+  assert accepts(n2, "\"\"") == 1
+  assert accepts(n2, "\"a b\"") == 1
+  assert accepts(n2, "\"a\"b\"") == 0
+  assert accepts(n2, "\"a") == 0
+  0
+
+[[test]]
+fn test_regex_parse_literal_takes_metachars_verbatim() -> i32
+  var r: Rig
+  nfa_init(@r.nfa, @r.states[0], @r.trans[0], @r.sto[0], @r.stc[0], @r.ti[0], 512, 1024)
+  let s: StrView = "a*"
+  thompson_accept(@r.nfa, regex_parse_literal(s.ptr, 2, @r.nfa), 1)
+  nfa_finalize(@r.nfa)
+  assert accepts(@r.nfa, "a*") == 1
+  assert accepts(@r.nfa, "aa") == 0
+  assert accepts(@r.nfa, "") == 0
+  0

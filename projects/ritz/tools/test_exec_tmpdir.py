@@ -299,8 +299,9 @@ def test_cli_probe_on_a_real_noexec_mount(noexec_mount):
 # ---- wiring ---------------------------------------------------------------
 
 def test_smoke_and_matrix_use_the_one_helper():
-    """Both entry points call ensure_exec_tmpdir; neither has its own probe."""
-    for name in ("smoke.py", "run_regression_matrix.py"):
+    """Every entry point that runs built binaries calls ensure_exec_tmpdir;
+    none has its own probe."""
+    for name in ("smoke.py", "run_regression_matrix.py", "ritz1_unit.py"):
         src = (HERE / name).read_text()
         assert "exec_tmpdir.ensure_exec_tmpdir(" in src, name
         assert "chmod" not in src, f"{name} grew its own exec probe"

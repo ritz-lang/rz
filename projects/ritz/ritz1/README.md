@@ -50,7 +50,7 @@ responsibilities, the generated import graph and known structural debt.
 ```
 ritz1/
 ├── src/                 # Compiler source, one module per file (see ARCHITECTURE.md)
-├── test/, tests/        # Test programs
+├── test/                # [[test]] unit suites: `make -C .. ritz1-unit`
 ├── runtime/             # Minimal runtime support
 ├── bootstrap_ritzlib/   # Bootstrap ritzlib stubs
 ├── Makefile             # Build system

@@ -38,7 +38,6 @@ REPO = RITZ.parent.parent
 # it in its own EXIT trap; the ritz1 Makefile writes under $(BUILD_DIR).
 SHARED_HOST_SCRATCH_SCRIPTS = [
     SCRIPTS / "prove-stage5-divergence.sh",
-    RITZ / "ritz1" / "test" / "test_imports.sh",
     REPO / "bench" / "run.sh",
     REPO / "projects" / "mausoleum" / "tools" / "concurrent_test.sh",
     REPO / "projects" / "harland" / "tools" / "test_boot.sh",
