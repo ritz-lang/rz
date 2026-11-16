@@ -136,9 +136,20 @@ serve a private wiki) until mausoleum answers. Startup is `src/wiki_app.ritz`.
 Slugs are 1-128 bytes of `/`-separated `[a-z0-9-]` segments (`src/slug.ritz`,
 the one rule for routes and the service); `new` and slugs ending in `/edit`
 are reserved for the routes. Pages written before #2209 (documents with only
-`slug` and `content`) are still served, titled by their slug, and rewritten
-in the current format on their next save; documents that aren't pages are
-skipped. A slug lookup scans the collection (#3644).
+`slug` and `content`) are still served, titled by their slug (or the `title`
+wiki-seed stored), and rewritten in the current format on their next save;
+documents that aren't pages are skipped. A slug lookup scans the collection
+(#3644).
+
+Upgrading a store written before mausoleum #3637, when every CONNECT name
+shared one collection: such a store opens with nexus's pages (and wiki-seed's)
+in the `default` collection, while nexus reads `nexus_pages`. No operator step
+is needed. The first time a worker reaches mausoleum it moves every page in
+`default` into `nexus_pages` (the newest copy of each slug, rewritten in the
+current format) and deletes them from `default`. Other apps' documents stay
+there. A slug `nexus_pages` already holds keeps its page. A move that fails
+leaves `default` intact and runs again on the next dial (#3681,
+`test/fixtures/store_v1_wiki`, written by the pre-#3637 binaries).
 
 Page size: a page is one Mausoleum document, and a document is at most
 `MAX_DOC_SIZE` (1992 bytes, one B-tree value; bigger ones would need overflow

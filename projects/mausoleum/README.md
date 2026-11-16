@@ -99,7 +99,8 @@ for every collection it changed. A store written before #3637 (v1 `meta.m7m`)
 opens with its documents in the default collection
 (`test/test_collections.ritz` checks this against fixtures in `test/fixtures/`).
 `wiki-seed` seeds nexus's `nexus_pages`, and `concurrent_bench` uses
-`wiki_pages`.
+`wiki_pages`. Nexus moves the wiki pages an upgraded store holds in `default`
+into `nexus_pages` by itself (#3681, see nexus's README).
 
 `mausoleum shell` and `wiki-seed` speak the encrypted protocol by default, like
 the server; pass `--no-encryption` to both for a `serve --no-encryption` server.

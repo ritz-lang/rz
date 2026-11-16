@@ -10,7 +10,7 @@ import ritzlib.string { String, string_from, string_new, string_drop, string_pus
 import ritzlib.gvec { Vec, vec_len, vec_get, vec_drop }
 
 import spire.repo.mausoleum { Db, DbField, db_field, db_serialize_doc, db_extract_field }
-import spire.repo.mausoleum { db_init, db_set_encryption, db_connect, db_close, db_insert, db_scan }
+import spire.repo.mausoleum { db_init, db_set_encryption, db_connect, db_close, db_insert, db_scan, db_delete, db_get }
 import mausoleum.document { DocumentId, doc_id_invalid, doc_id_is_valid, doc_id_eq }
 import mausoleum.collection { MAX_DOC_SIZE }
 import services.validation { MAX_CONTENT_SIZE, MAX_SLUG_LENGTH, MAX_TITLE_LENGTH }
@@ -36,7 +36,7 @@ import repos.wiki_page_repo {
     wiki_page_repo_max_content_len,
     MEMORY_MAX_CONTENT_LEN
 }
-import test.support.live_db { LiveDb, live_db_start, live_db_stop, live_db_restart }
+import test.support.live_db { LiveDb, live_db_start, live_db_stop, live_db_restart, live_db_start_store, live_db_remove_store }
 
 
 fn page_of(slug: StrView, title: StrView, content: StrView) -> WikiPage
@@ -1026,6 +1026,26 @@ fn test_codec_decodes_a_legacy_page() -> i32
         Err(_) => 7
 
 
+# wiki-seed, before #3637, wrote {slug, title, content, version}: the title
+# is kept, since adopting a store's pages rewrites them (AGAST #3681).
+[[test]]
+fn test_codec_legacy_decode_keeps_a_stored_title() -> i32
+    var fields: [3]DbField
+    fields[0] = db_field(c"slug", 4, c"ritz", 4)
+    fields[1] = db_field(c"title", 5, c"The Ritz Language", 17)
+    fields[2] = db_field(c"content", 7, c"hi", 2)
+    var buf: [256]u8
+    let n: i64 = db_serialize_doc(@buf[0], 256, @fields[0], 3)
+    if n < 0
+        return 1
+    match wiki_page_decode_legacy(@buf[0], n as i32)
+        Ok(page) =>
+            if not string_eq(@page.title, "The Ritz Language")
+                return 2
+            if not string_eq(@page.content, "hi") then 3 else 0
+        Err(_) => 4
+
+
 [[test]]
 fn test_codec_legacy_decode_refuses_a_document_without_a_slug() -> i32
     var fields: [2]DbField
@@ -1079,6 +1099,338 @@ fn test_repo_serves_lists_and_upgrades_legacy_pages() -> i32
         rc = 1
     if rc == 0
         rc = check_legacy(@repo, @raw)
+    live_db_stop(@db)
+    rc
+
+
+# ============================================================================
+# Stores written before #3637 (AGAST #3681)
+#
+# Before #3637 every CONNECT name shared one collection, so a deployed store
+# holds nexus's pages (and wiki-seed's) in what #3637 opens as the "default"
+# collection. On its first dial the repository moves the pages there into
+# "nexus_pages"; documents that aren't pages stay where they are.
+#
+# test/fixtures/store_v1_wiki was written by the pre-#3637 binaries: `mausoleum
+# serve --data-dir`, `wiki-seed --seed` (welcome, getting-started, ritz,
+# ritz/syntax, mausoleum), then `mausoleum shell` putting a store.ritz page
+# "old-home" twice ("first draft", then "second draft") and one
+# {kind: "session", token: "abc123"} document, and a clean shutdown.
+# ============================================================================
+
+const V1_WIKI: StrView = "test/fixtures/store_v1_wiki"
+const V1_WIKI_PAGES: i64 = 6
+# Its documents' ids, in insertion order: 0-4 wiki-seed's pages, 5 and 7
+# old-home's copies, 6 the session.
+const V1_FIRST_ID: i64 = 4294967297
+const V1_DOCS: i64 = 8
+const V1_SESSION: i64 = 6
+
+
+# Default holds the session document and none of the pages. Checked by id,
+# not by SCAN: a B-tree leaf the move's deletes empty ends a scan early
+# (AGAST #3687), which would make "nothing left" pass for the wrong reason.
+fn v1_default_has_only_the_session(legacy: *Db) -> bool
+    var i: i64 = 0
+    while i < V1_DOCS
+        var data: *u8 = null
+        var len: i32 = 0
+        let found: i32 = db_get(legacy, V1_FIRST_ID + i, @data, @len)
+        if found < 0 or (found == 1) != (i == V1_SESSION)
+            return false
+        i += 1
+    true
+
+
+# A raw connection to the default collection, where pre-#3637 documents are.
+fn raw_connect_default(raw: *Db, port: i32) -> i32
+    db_init(raw, c"127.0.0.1", 9, port, c"default", 7)
+    db_set_encryption(raw, 0)
+    db_connect(raw)
+
+
+fn count_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+    let n: *i64 = user as *i64
+    *n = *n + 1
+    0
+
+
+# How many documents `raw`'s collection holds, -1 if the scan failed.
+fn doc_total(raw: *Db) -> i64
+    var n: i64 = 0
+    if db_scan(raw, count_step as *u8, @n as *u8) < 0
+        return -1
+    n
+
+
+fn start_v1_wiki(db: *LiveDb) -> i32
+    live_db_start_store(db, strview_as_ptr(V1_WIKI))
+
+
+# The fixture's pages, read through `repo`, are all there.
+fn check_v1_pages(repo: *WikiPageRepository) -> i32
+    if listed_count(repo) != V1_WIKI_PAGES
+        return 20
+    if not serves(repo, "old-home", "second draft")    # the newest copy
+        return 21
+    match wiki_page_repo_get_by_slug(repo, "ritz/syntax")
+        Ok(got) =>
+            let ok: bool = string_eq(@got.title, "Ritz Syntax Guide")
+            var p: WikiPage = got
+            wiki_page_drop(@p)
+            if not ok
+                return 22
+        Err(_) => return 23
+    0
+
+
+# Every page now lives in nexus_pages, one document per slug, and default
+# keeps only the session document.
+fn check_v1_moved(port: i32) -> i32
+    var pages: Db
+    var legacy: Db
+    if raw_connect(@pages, port) < 0 or raw_connect_default(@legacy, port) < 0
+        return 30
+    if doc_total(@pages) != V1_WIKI_PAGES
+        return 31
+    if docs_for(@pages, "old-home") != 1
+        return 32
+    if not v1_default_has_only_the_session(@legacy)
+        return 33
+    db_close(@pages)
+    db_close(@legacy)
+    0
+
+
+fn edit_page(repo: *WikiPageRepository, slug: StrView, content: StrView) -> i32
+    match wiki_page_repo_get_by_slug(repo, slug)
+        Ok(got) =>
+            var page: WikiPage = got
+            wiki_page_update_content(@page, string_from(content))
+            var rc: i32 = 0
+            match wiki_page_repo_update(repo, @page)
+                Ok(_) => rc = 0
+                Err(_) => rc = 1
+            wiki_page_drop(@page)
+            rc
+        Err(_) => 2
+
+
+fn check_v1_upgrade(db: *LiveDb) -> i32
+    var repo = wiki_page_repo_new()
+    if connect(@repo, db) != 0
+        return 1
+    var rc: i32 = check_v1_pages(@repo)
+    if rc != 0
+        return rc
+    rc = check_v1_moved(db.port)
+    if rc != 0
+        return rc
+    # Old pages edit like any other; new ones land in nexus_pages.
+    if edit_page(@repo, "welcome", "edited after the upgrade") != 0
+        return 40
+    if insert_page(@repo, "fresh", "new after the upgrade") != 0
+        return 41
+    var pages: Db
+    var legacy: Db
+    if raw_connect(@pages, db.port) < 0 or raw_connect_default(@legacy, db.port) < 0
+        return 42
+    if docs_for(@pages, "fresh") != 1 or docs_for(@legacy, "fresh") != 0
+        return 43
+    if docs_for(@pages, "welcome") != 1
+        return 44
+    db_close(@pages)
+    db_close(@legacy)
+    wiki_page_repo_disconnect(@repo)
+
+    # The move is durable: a restarted server serves the same wiki.
+    if live_db_restart(db) != 0
+        return 91
+    var again = wiki_page_repo_new()
+    if connect(@again, db) != 0
+        return 50
+    if listed_count(@again) != V1_WIKI_PAGES + 1
+        return 51
+    if not serves(@again, "welcome", "edited after the upgrade")
+        return 52
+    if not serves(@again, "old-home", "second draft")
+        return 53
+    wiki_page_repo_disconnect(@again)
+    if raw_connect_default(@legacy, db.port) < 0
+        return 54
+    if v1_default_has_only_the_session(@legacy) then 0 else 55
+
+
+[[test]]
+fn test_repo_adopts_the_wiki_a_pre_3637_store_kept_in_default() -> i32
+    var db: LiveDb
+    if start_v1_wiki(@db) != 0
+        live_db_remove_store(@db)
+        return 90
+    let rc: i32 = check_v1_upgrade(@db)
+    live_db_remove_store(@db)
+    rc
+
+
+# Mausoleum down when nexus starts: the move happens on the first dial that
+# reaches it, not at open.
+[[test]]
+fn test_repo_adopts_default_pages_when_mausoleum_comes_up_late() -> i32
+    var db: LiveDb
+    if start_v1_wiki(@db) != 0
+        live_db_remove_store(@db)
+        return 90
+    live_db_stop(@db)
+    var repo = wiki_page_repo_new()
+    var rc: i32 = 0
+    if wiki_page_repo_open(@repo, "127.0.0.1", db.port, false) >= 0
+        rc = 1
+    if rc == 0 and live_db_restart(@db) != 0
+        rc = 91
+    if rc == 0
+        rc = check_v1_pages(@repo)
+    if rc == 0
+        rc = check_v1_moved(db.port)
+    wiki_page_repo_disconnect(@repo)
+    live_db_remove_store(@db)
+    rc
+
+
+fn check_keeps_current(a: *WikiPageRepository, b: *WikiPageRepository, db: *LiveDb) -> i32
+    let port: i32 = db.port
+    # b is up (and found default empty) before the stale copies appear, as
+    # when another worker moved the pages and the page was edited since.
+    if insert_page(b, "welcome", "current") != 0
+        return 2
+    var pages: Db
+    var legacy: Db
+    if raw_connect(@pages, port) < 0 or raw_connect_default(@legacy, port) < 0
+        return 3
+    if legacy_put(@legacy, "welcome", "stale") < 0 or legacy_put(@legacy, "other", "moved") < 0
+        return 4
+    if connect(a, db) != 0
+        return 5
+    if not serves(a, "welcome", "current")
+        return 6
+    if not serves(a, "other", "moved")
+        return 7
+    if docs_for(@pages, "welcome") != 1
+        return 8
+    if doc_total(@legacy) != 0 then 9 else 0
+
+
+# A store.ritz page as long as one document holds: rewritten in the current
+# format it no longer fits, so its move into nexus_pages is refused. Returns
+# its id, < 0 if the server took no such page.
+fn put_unmovable(raw: *Db) -> i64
+    let buf: *u8 = malloc(MAX_DOC_SIZE + 64)
+    let content: String = big_string(MAX_DOC_SIZE)
+    # The longest content whose document fits.
+    var len: i64 = MAX_DOC_SIZE
+    var n: i64 = -1
+    while (n <= 0 or n > MAX_DOC_SIZE) and len > 0
+        var fields: [2]DbField
+        fields[0] = db_field(c"slug", 4, c"huge", 4)
+        fields[1] = db_field(c"content", 7, string_as_view(@content).ptr, len as i32)
+        n = db_serialize_doc(buf, MAX_DOC_SIZE + 64, @fields[0], 2)
+        len -= 1
+    var id: i64 = -1
+    if n > 0 and n <= MAX_DOC_SIZE
+        id = db_insert(raw, buf, n as i32)
+    free(buf)
+    var c: String = content
+    string_drop(@&c)
+    id
+
+
+fn check_cut_short(db: *LiveDb) -> i32
+    var legacy: Db
+    if raw_connect_default(@legacy, db.port) < 0
+        return 1
+    let huge: i64 = put_unmovable(@legacy)
+    if huge < 0
+        return 2
+    var repo = wiki_page_repo_new()
+    if connect(@repo, db) != 0
+        return 3
+    # The move failed, so default still has all its documents: the fixture's
+    # eight and the huge page.
+    if doc_total(@legacy) != 9
+        return 4
+    db_close(@legacy)
+    # Mausoleum restarts without the page; the next dial finishes the move.
+    if live_db_restart(db) != 0
+        return 91
+    if raw_connect_default(@legacy, db.port) < 0 or db_delete(@legacy, huge) < 0
+        return 5
+    db_close(@legacy)
+    var rc: i32 = check_v1_pages(@repo)
+    if rc == 0
+        rc = check_v1_moved(db.port)
+    wiki_page_repo_disconnect(@repo)
+    rc
+
+
+# A move that fails leaves default's pages there, and the next dial tries
+# again.
+[[test]]
+fn test_repo_finishes_an_adoption_that_failed() -> i32
+    var db: LiveDb
+    if start_v1_wiki(@db) != 0
+        live_db_remove_store(@db)
+        return 90
+    let rc: i32 = check_cut_short(@db)
+    live_db_remove_store(@db)
+    rc
+
+
+# A slug nexus_pages already holds keeps its page there: default's copy is
+# older (a crash between a move's copy and its cleanup, or two workers moving
+# at once) and goes.
+[[test]]
+fn test_repo_adoption_keeps_the_page_nexus_pages_already_has() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var a = wiki_page_repo_new()
+    var b = wiki_page_repo_new()
+    var rc: i32 = connect(@b, @db)
+    if rc == 0
+        rc = check_keeps_current(@a, @b, @db)
+    live_db_stop(@db)
+    rc
+
+
+# A moved page that is then deleted stays deleted for a worker that starts
+# later: the move empties default of pages, so nothing brings it back.
+[[test]]
+fn test_repo_deleted_adopted_page_stays_deleted() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var legacy: Db
+    if raw_connect_default(@legacy, db.port) < 0
+        live_db_stop(@db)
+        return 1
+    var rc: i32 = 0
+    if legacy_put(@legacy, "gone", "soon") < 0
+        rc = 2
+    var a = wiki_page_repo_new()
+    if rc == 0 and connect(@a, @db) != 0
+        rc = 3
+    if rc == 0 and not serves(@a, "gone", "soon")
+        rc = 4
+    if rc == 0
+        match wiki_page_repo_delete_slug(@a, "gone")
+            Ok(_) => 0
+            Err(_) => rc = 5
+    var c = wiki_page_repo_new()
+    if rc == 0 and connect(@c, @db) != 0
+        rc = 6
+    if rc == 0
+        match wiki_page_repo_get_by_slug(@c, "gone")
+            Ok(_) => rc = 7
+            Err(e) => rc = expect_not_found(@e)
     live_db_stop(@db)
     rc
 

@@ -14,10 +14,13 @@
 #     second worker saving) in between leaves two documents for the slug;
 #     lookups serve the newest (ids only grow), list shows it once, and the
 #     next save or delete removes the rest;
-#   - documents that aren't pages are skipped: collection names are ignored
-#     server-side, so other apps' documents share the collection. Pages that
-#     src/store.ritz wrote before #2209 ({slug, content} only) are read as
-#     version-1 pages titled by their slug, and rewritten on their next save.
+#   - documents that aren't pages are skipped. Pages that src/store.ritz
+#     wrote before #2209 ({slug, content} only) are read as version-1 pages
+#     titled by their slug, and rewritten on their next save;
+#   - before #3637 the server put every CONNECT name in one collection, which
+#     an upgraded store opens as "default". The first dial that reaches
+#     Mausoleum moves the pages found there into "nexus_pages" (adopt_default,
+#     AGAST #3681); other apps' documents stay in "default".
 #
 # A connection that fails mid-request is dropped and dialled again once, so
 # nexus recovers when Mausoleum comes back. An unreachable Mausoleum is a
@@ -70,6 +73,7 @@ pub struct WikiPageRepository
     memory: bool             # pages live in `mem`, not Mausoleum
     mem: MemDocs
     connect_error: i32       # the last failed dial's error, 0 if none
+    adopted: bool            # "default"'s pages moved here (or being moved)
 
 
 # Create a new repository (not yet connected)
@@ -78,12 +82,15 @@ pub fn wiki_page_repo_new() -> WikiPageRepository
     repo.connected = false
     repo.memory = false
     repo.connect_error = 0
+    repo.adopted = false
     repo.db.client = null
     repo.db.connected = 0
     repo
 
 
 # Dial Mausoleum if the connection is down. 0 = connected, < 0 = the error.
+# The first dial that connects also moves "default"'s pages here; if that
+# fails they stay where they are, and the next dial tries again.
 fn ensure_db(repo: *WikiPageRepository) -> i32
     if db_is_connected(@repo.db) == 1
         return 0
@@ -92,6 +99,11 @@ fn ensure_db(repo: *WikiPageRepository) -> i32
         repo.connect_error = rc
         return rc
     repo.connect_error = 0
+    if not repo.adopted
+        # Set first: the move's own requests dial through here.
+        repo.adopted = true
+        if adopt_default(repo) < 0
+            repo.adopted = false
     0
 
 
@@ -480,22 +492,27 @@ fn list_index_of(pages: *Vec<WikiPage>, page: *WikiPage) -> i64
     -1
 
 
+# Add `page` to `pages`, one per slug: a second copy of a slug replaces the
+# first, in its place, only if it is newer (`newest`) or older (not `newest`).
+fn list_keep(pages: *Vec<WikiPage>, page: WikiPage, newest: bool)
+    var p: WikiPage = page
+    let at: i64 = list_index_of(pages, @p)
+    if at < 0
+        vec_push<WikiPage>(pages, p)
+        return
+    var other: WikiPage = vec_get<WikiPage>(pages, at)
+    if (p.id.value > other.id.value) == newest
+        wiki_page_drop(@other)
+        vec_set<WikiPage>(pages, at, p)
+    else
+        wiki_page_drop(@p)
+
+
 fn list_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
     let scan: *ListScan = user_data as *ListScan
     match decode_stored(doc_id, data, len)
-        Ok(decoded) =>
-            var page: WikiPage = decoded
-            let at: i64 = list_index_of(@scan.pages, @page)
-            if at < 0
-                vec_push<WikiPage>(@&scan.pages, page)
-            else
-                # A second copy of a slug: keep the newer, in the older's place.
-                var other: WikiPage = vec_get<WikiPage>(@scan.pages, at)
-                if page.id.value > other.id.value
-                    wiki_page_drop(@other)
-                    vec_set<WikiPage>(@&scan.pages, at, page)
-                else
-                    wiki_page_drop(@page)
+        Ok(page) =>
+            list_keep(@&scan.pages, page, true)
             0
         Err(_) =>
             0   # not a page: another app's document
@@ -514,3 +531,137 @@ pub fn wiki_page_repo_list_all(repo: *WikiPageRepository) -> Result<Vec<WikiPage
         vec_drop<WikiPage>(@&scan.pages)
         return Err(doc_error(scanned, "Scan failed"))
     Ok(scan.pages)
+
+
+# ============================================================================
+# Pages a pre-#3637 store kept in "default" (AGAST #3681)
+#
+# Before #3637 every CONNECT name shared one collection, so a deployed store
+# holds nexus's pages (and wiki-seed's) in what #3637 opens as the default
+# collection, while this repository CONNECTs to "nexus_pages". adopt_default
+# moves them on the first dial, so an upgrade needs no operator step:
+#
+#   1. scan "default" for pages: the newest copy of each slug, and the id of
+#      every page document. Anything that isn't a page (another app's) stays;
+#   2. insert each page into "nexus_pages", rewritten in the current format;
+#   3. delete each inserted copy whose slug "nexus_pages" already held in an
+#      older document: that one is the page (a previous move cut short by a
+#      crash, another worker moving at once, or a save since). The oldest
+#      copy is kept, so a save, always newer than every copy, still wins;
+#   4. delete the page documents from "default". A page moved and then
+#      deleted can't come back, and the next dial finds nothing to move.
+#
+# Every step is safe to repeat, so a move cut short is finished by the next
+# dial. A worker moving the same pages at the same moment that another deletes
+# one could keep a copy of it; that window is the upgrade's first seconds.
+# ============================================================================
+
+# The page documents in "default".
+struct AdoptScan
+    pages: Vec<WikiPage>     # newest copy per slug, id = its "default" id
+    ids: Vec<i64>            # every page document
+
+
+fn adopt_scan_reset(user_data: *u8) -> i32
+    let scan: *AdoptScan = user_data as *AdoptScan
+    list_scan_clear(@scan.pages)
+    vec_drop<i64>(@&scan.ids)
+    scan.ids = vec_new<i64>()
+    0
+
+
+fn adopt_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+    let scan: *AdoptScan = user_data as *AdoptScan
+    match decode_stored(doc_id, data, len)
+        Ok(page) =>
+            vec_push<i64>(@&scan.ids, doc_id)
+            list_keep(@&scan.pages, page, true)
+            0
+        Err(_) =>
+            0   # not a page: another app's, and it stays in "default"
+
+
+# Oldest document per slug in "nexus_pages".
+fn oldest_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+    let scan: *ListScan = user_data as *ListScan
+    match decode_stored(doc_id, data, len)
+        Ok(page) =>
+            list_keep(@&scan.pages, page, false)
+            0
+        Err(_) =>
+            0
+
+
+# The id `pages` holds for `page`'s slug, -1 if none.
+fn listed_id(pages: *Vec<WikiPage>, page: *WikiPage) -> i64
+    let at: i64 = list_index_of(pages, page)
+    if at < 0
+        return -1
+    let other: WikiPage = vec_get<WikiPage>(pages, at)
+    other.id.value
+
+
+# Scan the default collection on `legacy` (connected). < 0 = failed.
+fn legacy_scan(legacy: *Db, scan: *AdoptScan) -> i64
+    adopt_scan_reset(scan as *u8)
+    db_scan(legacy, adopt_scan_step as *u8, scan as *u8) as i64
+
+
+# Copy `pages` into this repository's collection (steps 2 and 3). 0 = ok.
+fn adopt_pages(repo: *WikiPageRepository, pages: *Vec<WikiPage>) -> i64
+    let n: i64 = vec_len<WikiPage>(pages)
+    if n == 0
+        return 0
+    var copies: Vec<i64> = vec_new<i64>()
+    var i: i64 = 0
+    var rc: i64 = 0
+    while i < n
+        var page: WikiPage = vec_get<WikiPage>(pages, i)
+        match insert_document(repo, @page)
+            Ok(id) => vec_push<i64>(@&copies, id)
+            Err(_) =>
+                rc = -1
+                break
+        i += 1
+    if rc == 0
+        var oldest: ListScan
+        oldest.pages = vec_new<WikiPage>()
+        rc = doc_scan(repo, oldest_scan_step as *u8, list_scan_reset as *u8, @oldest as *u8)
+        i = 0
+        while rc >= 0 and i < vec_len<i64>(@copies)
+            var page: WikiPage = vec_get<WikiPage>(pages, i)
+            let copy: i64 = vec_get<i64>(@copies, i)
+            if listed_id(@oldest.pages, @page) != copy
+                doc_delete(repo, copy)    # a failure leaves a copy: harmless
+            i += 1
+        list_scan_clear(@oldest.pages)
+        vec_drop<WikiPage>(@&oldest.pages)
+    vec_drop<i64>(@&copies)
+    if rc < 0 then -1 else 0
+
+
+# Move the default collection's pages into this repository's collection.
+# 0 = done (or nothing to move), < 0 = failed, leaving "default" as it was
+# or with fewer pages, every one of them still somewhere.
+fn adopt_default(repo: *WikiPageRepository) -> i64
+    var legacy: Db
+    db_init(@legacy, @repo.db.host[0], repo.db.host_len, repo.db.port, c"default", 7)
+    db_set_encryption(@legacy, repo.db.encrypted)
+    if db_connect(@legacy) < 0
+        return -1
+    var scan: AdoptScan
+    scan.pages = vec_new<WikiPage>()
+    scan.ids = vec_new<i64>()
+    var rc: i64 = legacy_scan(@legacy, @scan)
+    if rc >= 0
+        rc = adopt_pages(repo, @scan.pages)
+    var i: i64 = 0
+    while rc >= 0 and i < vec_len<i64>(@scan.ids)
+        if db_delete(@legacy, vec_get<i64>(@scan.ids, i)) < 0
+            rc = -1
+        i += 1
+    list_scan_clear(@scan.pages)
+    vec_drop<WikiPage>(@&scan.pages)
+    vec_drop<i64>(@&scan.ids)
+    db_close(@legacy)
+    rc

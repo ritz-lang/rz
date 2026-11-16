@@ -6,14 +6,18 @@
 # validation rather than a fake. It is hosted in-process because `rz test
 # nexus` does not build the mausoleum binary.
 #
-# Each test starts its own server, so every test sees an empty collection.
+# Each test starts its own server, so every test sees an empty collection,
+# unless it starts one on a copy of a data directory (live_db_start_store):
+# then the server opens it as `mausoleum serve --data-dir` would.
 
 import ritzlib.sys
 import ritzlib.net
 import ritzlib.option
 
 import mausoleum.buffer_pool
-import mausoleum.collection { Collection, collection_init }
+import mausoleum.collection { Collection, collection_init, collection_open_storage }
+import mausoleum.storage { Storage, storage_open, storage_pool }
+import mausoleum.m7m_types { DEFAULT_COLLECTION_ID }
 import mausoleum.client { Client, client_new, client_free, client_connect, client_disconnect }
 import mausoleum.server_async { serve_async }
 
@@ -33,6 +37,8 @@ var g_next_offset: i32 = 0
 pub struct LiveDb
     pid: i32
     port: i32
+    has_dir: bool       # serving the data directory `dir`, not memory
+    dir: [128]u8        # NUL-terminated
 
 
 fn sleep_ms(ms: i64)
@@ -73,6 +79,45 @@ fn serve_forever(port: i32)
     sys_exit(0)
 
 
+# The child: serve the data directory `dir` until killed.
+fn serve_store_forever(port: i32, dir: *u8)
+    syscall2(SYS_PRCTL_NR, PR_SET_PDEATHSIG, SIG_KILL as i64)
+    let devnull: i32 = sys_open(c"/dev/null", 2)   # O_RDWR
+    if devnull >= 0
+        sys_dup2(devnull, 0)
+        sys_dup2(devnull, 1)
+        sys_dup2(devnull, 2)
+
+    let storage_opt = storage_open(dir)
+    if option_is_none<*Storage>(@storage_opt) == 1
+        sys_exit(2)
+    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let pool: *BufferPool = storage_pool(storage)
+
+    var collection: Collection
+    if collection_open_storage(@collection, storage, DEFAULT_COLLECTION_ID) < 0
+        sys_exit(3)
+
+    var sock: Socket = socket_tcp_nonblock()
+    if sock.fd < 0
+        sys_exit(4)
+    socket_set_reuseaddr(@sock)
+    if socket_bind_any(@sock, port) < 0
+        sys_exit(5)
+    if socket_listen(@sock, 128) < 0
+        sys_exit(6)
+
+    serve_async(sock.fd, pool, storage, @collection)
+    sys_exit(0)
+
+
+fn serve_child(db: *LiveDb, port: i32)
+    if db.has_dir
+        serve_store_forever(port, @db.dir[0])
+    else
+        serve_forever(port)
+
+
 # 1 if the child already exited (and was reaped), else 0.
 fn exited(pid: i32) -> i32
     var status: i32 = 0
@@ -103,6 +148,13 @@ fn wait_ready(db: *LiveDb) -> i32
 
 # Start a server. Returns 0 once it accepts connections, < 0 if it never did.
 pub fn live_db_start(db: *LiveDb) -> i32
+    db.has_dir = false
+    db.dir[0] = 0
+    live_db_serve(db)
+
+
+# Fork servers on fresh ports until one accepts connections.
+fn live_db_serve(db: *LiveDb) -> i32
     db.pid = 0
     db.port = 0
     var attempt: i32 = 0
@@ -113,7 +165,7 @@ pub fn live_db_start(db: *LiveDb) -> i32
         if pid < 0
             return -1
         if pid == 0
-            serve_forever(port)
+            serve_child(db, port)
             sys_exit(1)
         db.pid = pid
         db.port = port
@@ -127,8 +179,8 @@ pub fn live_db_start(db: *LiveDb) -> i32
     return -3
 
 
-# Start a fresh, empty server on the port `db` last used (after
-# live_db_stop), as a restarted database would come back. Returns 0 once it
+# Start a fresh server on the port `db` last used (after live_db_stop), as a
+# restarted database would come back: empty, or on the same data directory. Returns 0 once it
 # accepts connections, < 0 if it never did.
 pub fn live_db_restart(db: *LiveDb) -> i32
     live_db_stop(db)
@@ -139,7 +191,7 @@ pub fn live_db_restart(db: *LiveDb) -> i32
         if pid < 0
             return -1
         if pid == 0
-            serve_forever(port)
+            serve_child(db, port)
             sys_exit(1)
         db.pid = pid
         db.port = port
@@ -162,3 +214,133 @@ pub fn live_db_stop(db: *LiveDb)
     var status: i32 = 0
     sys_wait4(db.pid, @status, 0, null)
     db.pid = 0
+
+
+# ============================================================================
+# A server on a data directory
+# ============================================================================
+
+fn append_cstr(buf: *u8, pos: i64, s: *u8) -> i64
+    var p: i64 = pos
+    var i: i64 = 0
+    while *(s + i) != 0
+        *(buf + p) = *(s + i)
+        p += 1
+        i += 1
+    p
+
+
+fn append_uint(buf: *u8, pos: i64, n: i32) -> i64
+    var digits: [16]u8
+    var len: i32 = 0
+    var v: i32 = n
+    if v == 0
+        digits[0] = 48
+        len = 1
+    while v > 0
+        digits[len] = ((v % 10) + 48) as u8
+        v = v / 10
+        len += 1
+    var p: i64 = pos
+    while len > 0
+        len -= 1
+        *(buf + p) = digits[len]
+        p += 1
+    p
+
+
+# Copy <src_dir>/<name> to <dst_dir>/<name>. 0 = ok.
+fn copy_file(src_dir: *u8, dst_dir: *u8, name: *u8) -> i32
+    var src: [512]u8
+    var dst: [512]u8
+    var p: i64 = append_cstr(@src[0], 0, src_dir)
+    p = append_cstr(@src[0], p, c"/")
+    p = append_cstr(@src[0], p, name)
+    src[p] = 0
+    p = append_cstr(@dst[0], 0, dst_dir)
+    p = append_cstr(@dst[0], p, c"/")
+    p = append_cstr(@dst[0], p, name)
+    dst[p] = 0
+    let in_fd: i32 = sys_open(@src[0], O_RDONLY)
+    if in_fd < 0
+        return 1
+    let out_fd: i32 = sys_open3(@dst[0], O_RDWR | O_CREAT | O_TRUNC, 420)
+    if out_fd < 0
+        sys_close(in_fd)
+        return 2
+    var buf: [4096]u8
+    var rc: i32 = 0
+    loop
+        let n: i64 = sys_read(in_fd, @buf[0], 4096)
+        if n < 0
+            rc = 3
+            break
+        if n == 0
+            break
+        if sys_write(out_fd, @buf[0], n) != n
+            rc = 4
+            break
+    sys_close(in_fd)
+    sys_close(out_fd)
+    rc
+
+
+# Remove every entry of a flat directory, then the directory.
+fn rm_dir_flat(dir: *u8)
+    let fd: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
+    if fd >= 0
+        var ents: [4096]u8
+        var child: [512]u8
+        loop
+            let n: i64 = sys_getdents64(fd, @ents[0], 4096)
+            if n <= 0
+                break
+            var off: i64 = 0
+            while off < n
+                let rec: *u8 = @ents[off]
+                let reclen: i64 = (*(rec + 16) as i64) + ((*(rec + 17) as i64) << 8)
+                let name: *u8 = rec + 19
+                let is_dot: bool = *name == 46 and *(name + 1) == 0
+                let is_dotdot: bool = *name == 46 and *(name + 1) == 46 and *(name + 2) == 0
+                if not is_dot and not is_dotdot
+                    var p: i64 = append_cstr(@child[0], 0, dir)
+                    p = append_cstr(@child[0], p, c"/")
+                    p = append_cstr(@child[0], p, name)
+                    child[p] = 0
+                    sys_unlink(@child[0])
+                off += reclen
+        sys_close(fd)
+    sys_rmdir(dir)
+
+
+# Start a server on a copy of the data directory `fixture` (meta.m7m,
+# data.m7m and wal.wal.000000, as a stopped `mausoleum serve --data-dir`
+# leaves them), made under /tmp. Returns 0 once it accepts connections, < 0
+# if it never did. live_db_remove_store deletes the copy.
+pub fn live_db_start_store(db: *LiveDb, fixture: *u8) -> i32
+    g_next_offset += 1
+    var p: i64 = append_cstr(@db.dir[0], 0, c"/tmp/nexus_live_db_")
+    p = append_uint(@db.dir[0], p, sys_getpid())
+    p = append_cstr(@db.dir[0], p, c"_")
+    p = append_uint(@db.dir[0], p, g_next_offset)
+    db.dir[p] = 0
+    db.has_dir = true
+    db.pid = 0
+    rm_dir_flat(@db.dir[0])
+    if sys_mkdir(@db.dir[0], 493) != 0
+        return -10
+    if copy_file(fixture, @db.dir[0], c"meta.m7m") != 0
+        return -11
+    if copy_file(fixture, @db.dir[0], c"data.m7m") != 0
+        return -12
+    if copy_file(fixture, @db.dir[0], c"wal.wal.000000") != 0
+        return -13
+    live_db_serve(db)
+
+
+# Stop the server and delete its data directory (live_db_start_store's copy).
+pub fn live_db_remove_store(db: *LiveDb)
+    live_db_stop(db)
+    if db.has_dir
+        rm_dir_flat(@db.dir[0])
+        db.has_dir = false
