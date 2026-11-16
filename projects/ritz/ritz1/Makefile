@@ -48,6 +48,8 @@ SOURCES = \
 	emitter_match \
 	enum_as_int \
 	sema \
+	sema_type \
+	sema_probe \
 	must_use \
 	sema_walk \
 	bool_check \

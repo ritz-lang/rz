@@ -9,6 +9,13 @@
 # and the match / if expressions in a statement's value.  parser_alloc does
 # not zero the fields one statement kind leaves unset, so only the fields
 # each kind sets are read.
+#
+# It binds each local with its declared type (AGAST #3501): a param's, a
+# `let` / `var`'s annotation or else its initialiser's sema_expr_ty.  A `for`
+# variable, a tuple binding, a match-arm binding and a `:&` param are bound
+# TYPE_UNKNOWN for now.  It visits every sub-expression of a statement, so
+# RITZ1_SEMA_PROBE (sema_probe.ritz) can pin sema_expr_ty against the
+# emitter's typing on each.
 
 import ritzlib.sys
 import ritzlib.hash
@@ -18,6 +25,8 @@ import ast
 import ast_helpers
 import emitter_core
 import sema
+import sema_type
+import sema_probe
 import must_use
 
 fn sema_walk_arms(sm: *Sema, arms: *MatchArm)
@@ -33,12 +42,63 @@ fn sema_walk_arms(sm: *Sema, arms: *MatchArm)
         sm.scope_top = mark
         arm = arm.next
 
-# Only a match or an if/else expression holds statements.
+# Every sub-expression, for the probe; a match or an if/else expression's
+# arms hold statements.
 fn sema_walk_expr(sm: *Sema, e: *Expr)
     if e == null
         return
-    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+    sema_probe_record(sm, e)
+    let k: i32 = e.kind
+    if k == EXPR_MATCH or k == EXPR_IF
+        sema_walk_expr(sm, e.left)
         sema_walk_arms(sm, e.args as *MatchArm)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        sema_walk_expr(sm, e.left)
+        sema_walk_expr(sm, e.right)
+    else if k == EXPR_UNARY
+        sema_walk_expr(sm, e.operand)
+    else if k == EXPR_CAST or k == EXPR_MEMBER or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        sema_walk_expr(sm, e.left)
+    else if k == EXPR_CALL or k == EXPR_ARRAY_LIT
+        sema_walk_list(sm, e.args)
+    else if k == EXPR_METHOD
+        sema_walk_expr(sm, e.left)
+        sema_walk_list(sm, e.args)
+
+fn sema_walk_list(sm: *Sema, first: *Expr)
+    var a: *Expr = first
+    while a != null
+        sema_walk_expr(sm, a)
+        a = a.next
+
+# The declared type of a `let` / `var`, else its initialiser's.
+fn sema_bind_decl(sm: *Sema, st: *Stmt)
+    var t: SemaTy
+    if st.var_declared_type != TYPE_VOID
+        t.kind = st.var_type
+        t.name = st.var_type_name
+        t.name_len = st.var_type_name_len
+        t.pointee = st.var_pointee_type
+        # On a `[N]fn(..)` array var_fn_sig is the element's signature.
+        t.fn_sig = null
+        if st.var_type == TYPE_PTR
+            t.fn_sig = st.var_fn_sig
+    else
+        sema_expr_ty(sm, st.var_init, @t)
+    sema_bind_ty(sm, st.var_name, st.var_name_len, @t, st.var_is_let)
+
+fn sema_bind_param(sm: *Sema, p: *Param)
+    var t: SemaTy
+    if p.is_borrow == 1
+        # `x:& T` reads its T, not the reference it holds: not typed yet.
+        sema_ty_unknown(@t)
+    else
+        t.kind = p.param_type
+        t.name = p.param_type_name
+        t.name_len = p.param_type_name_len
+        t.pointee = p.param_pointee_type
+        t.fn_sig = p.fn_sig
+    sema_bind_ty(sm, p.name, p.name_len, @t, 0)
 
 fn sema_is_assign(kind: i32) -> i32
     (kind == STMT_ASSIGN or kind == STMT_MEMBER_ASSIGN or kind == STMT_MEMBER_INDEX_ASSIGN or kind == STMT_INDEX_ASSIGN or kind == STMT_LOCAL_FIELD_ASSIGN or kind == STMT_LOCAL_FIELD_INDEX_ASSIGN) as i32
@@ -52,12 +112,14 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
     while st != null
         if st.kind == STMT_VAR_DECL
             sema_walk_expr(sm, st.var_init)
-            sema_bind(sm, st.var_name, st.var_name_len)
+            sema_bind_decl(sm, st)
         else if st.kind == STMT_TUPLE_DECL
             sema_walk_expr(sm, st.var_init)
             sema_bind(sm, st.var_name, st.var_name_len)
             sema_bind(sm, st.assign_target, st.assign_target_len)
         else if st.kind == STMT_FOR
+            sema_walk_expr(sm, st.for_start)
+            sema_walk_expr(sm, st.for_end)
             let for_mark: i32 = sm.scope_top
             sema_bind(sm, st.for_var, st.for_var_len)
             sema_walk_stmts(sm, st.for_body, 0)
@@ -80,7 +142,13 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
             if st.next != null or void_tail == 1
                 must_use_check(sm, st.expr)
             sema_walk_expr(sm, st.expr)
+        else if st.kind == STMT_ASSERT
+            sema_walk_expr(sm, st.if_cond)
         else if sema_is_assign(st.kind) == 1
+            if st.kind == STMT_ASSIGN and st.assign_target_len == 0
+                sema_walk_expr(sm, st.if_cond)
+            else if st.kind == STMT_INDEX_ASSIGN
+                sema_walk_expr(sm, st.while_cond)
             sema_walk_expr(sm, st.assign_value)
         st = st.next
     sm.scope_top = mark
@@ -91,7 +159,7 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
     sm.scope_top = 0
     var p: *Param = f.params
     while p != null
-        sema_bind(sm, p.name, p.name_len)
+        sema_bind_param(sm, p)
         p = p.next
     sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
     sm.scope_top = 0

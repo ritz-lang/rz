@@ -43,7 +43,7 @@ source.ritz
     |         Specialize generic functions/structs with
     |         concrete type arguments (Vec<i32>, etc.)
     v
-[sema]      sema + sema_walk (+ one module per check)
+[sema]      sema + sema_type + sema_walk (+ one module per check)
     |         Check the AST; any error stops the compile here
     v
 [emit]      emitter
@@ -61,6 +61,15 @@ the emitter (AGAST #3462, #1816; LARB review/5 ritz1 N1):
   (`must_use.ritz` is the pattern).  It reads the AST only.  Use
   `sema_find_fn` / `sema_call_fn` / `sema_is_local` to resolve names, and
   `sema_error_at` to report a located `error: file:line:col: ...`.
+- Read types from Sema, not the emitter (AGAST #3501).  `sema_find_local`
+  gives a local's declared type (`SemaVar`), and `sema_expr_ty` /
+  `sema_expr_type` (`sema_type.ritz`) type an expression, `TYPE_UNKNOWN` when
+  Sema can't say: treat that as bool_check treats `BK_UNSURE`.  A bool is
+  `TYPE_BOOL` there, not the emitter's i64 slot.  A shape your check needs
+  that Sema leaves unknown goes into `sema_expr_ty` first, and
+  `RITZ1_SEMA_PROBE=1` (`sema_probe.ritz`, pinned by
+  `ritz0/test_ritz1_sema_type.py`) must still report no mismatch with the
+  emitter's typing on the matrix corpus.
 - Call it from the walk in `sema_walk.ritz`.  main runs `sema_check_module`
   after monomorphisation and before `emit_module`, over exactly the fns the
   emitter lowers, and stops on any error.

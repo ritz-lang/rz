@@ -16,7 +16,9 @@
 # instance, as the emitter judged it.
 #
 # Its scope is lexical: a block, a `for` or a match arm puts back what it
-# bound on exit (binder_check's discipline).
+# bound on exit (binder_check's discipline).  Each binding carries its
+# declared type, and sema_expr_type (sema_type.ritz) types an expression from
+# them, answering TYPE_UNKNOWN rather than guessing (AGAST #3501).
 #
 # The checks on it:
 #   must_use_check (must_use.ritz, AGAST #2137): a discarded [[must_use]] call.
@@ -34,14 +36,38 @@ import ast
 import ast_helpers
 import emitter_core
 
+# What Sema knows of a value's type (AGAST #3501): the subset of LocalVar the
+# checks read.  kind is a TYPE_*, or TYPE_UNKNOWN when Sema can't say; a
+# check treats that as bool_check treats BK_UNSURE.  name is the struct (or
+# primitive-named struct, `usize`) a TYPE_STRUCT is, and the struct a pointer
+# or reference points at.  Unlike LocalVar, a bool is TYPE_BOOL here: the
+# emitter's i64 bool slot (#1646) is a codegen fact, not a type.
+struct SemaTy
+    kind: i32
+    name: *u8
+    name_len: i32
+    pointee: i32          # the pointee's TYPE_* for a pointer or reference
+    fn_sig: *FnDef        # a `fn(..) -> T` value's signature; null otherwise
+
+# A local in scope: its name, declared type and whether it is a `let`.
+struct SemaVar
+    name: *u8
+    name_len: i32
+    kind: i32
+    type_name: *u8
+    type_name_len: i32
+    pointee: i32
+    fn_sig: *FnDef
+    is_let: i32
+
 struct Sema
     module: *Module
     file: *u8              # the input path every diagnostic names
     error_count: i32
     fn_map: HashMapI64     # fnv1a(name) -> the first FnDef of that name
+    struct_map: HashMapI64 # fnv1a(name) -> the first StructDef of that name
     # The locals in scope in the fn being walked, innermost last.
-    scope_name: **u8
-    scope_len: *i32
+    scope: *SemaVar
     scope_top: i32
     scope_cap: i32
 
@@ -56,9 +82,15 @@ pub fn sema_init(sm: *Sema, m: *Module, file: *u8)
         if hashmap_i64_contains(@sm.fn_map, k) == 0
             hashmap_i64_insert(@&sm.fn_map, k, f as i64)
         f = f.next
+    sm.struct_map = hashmap_i64_with_cap(1024)
+    var st: *StructDef = m.structs
+    while st != null
+        let sk: i64 = fnv1a_str(st.name, st.name_len) as i64
+        if hashmap_i64_contains(@sm.struct_map, sk) == 0
+            hashmap_i64_insert(@&sm.struct_map, sk, st as i64)
+        st = st.next
     sm.scope_cap = 256
-    sm.scope_name = malloc(sm.scope_cap as i64 * 8) as **u8
-    sm.scope_len = malloc(sm.scope_cap as i64 * 4) as *i32
+    sm.scope = malloc(sm.scope_cap as i64 * sizeof(SemaVar)) as *SemaVar
     sm.scope_top = 0
 
 # --- Diagnostics ---------------------------------------------------------------
@@ -121,22 +153,69 @@ pub fn sema_call_fn(sm: *Sema, e: *Expr) -> *FnDef
 
 # --- Scope ---------------------------------------------------------------------
 
-pub fn sema_bind(sm: *Sema, name: *u8, len: i32)
+# The struct named `name`: the first of that name, as the emitter's
+# find_struct resolves it.
+pub fn sema_find_struct(sm: *Sema, name: *u8, len: i32) -> *StructDef
+    if name == null or len <= 0
+        return null
+    let st: *StructDef = hashmap_i64_get(@sm.struct_map, fnv1a_str(name, len) as i64) as *StructDef
+    if st == null
+        return null
+    if name_eq(st.name, st.name_len, name, len) == 1
+        return st
+    var cur: *StructDef = sm.module.structs
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return cur
+        cur = cur.next
+    null
+
+# --- Scope ---------------------------------------------------------------------
+#
+# A binding carries its declared type (AGAST #3501).  sema_walk binds params,
+# `let` / `var`, `for` variables and match-arm bindings; one whose type it
+# can't state is bound TYPE_UNKNOWN, which still shadows an outer name.
+
+pub fn sema_ty_unknown(t: *SemaTy)
+    t.kind = TYPE_UNKNOWN
+    t.name = null
+    t.name_len = 0
+    t.pointee = TYPE_VOID
+    t.fn_sig = null
+
+pub fn sema_bind_ty(sm: *Sema, name: *u8, len: i32, t: *SemaTy, is_let: i32)
     if name == null or len <= 0
         return
     if sm.scope_top >= sm.scope_cap
         sm.scope_cap = sm.scope_cap * 2
-        sm.scope_name = realloc(sm.scope_name as *u8, sm.scope_cap as i64 * 8) as **u8
-        sm.scope_len = realloc(sm.scope_len as *u8, sm.scope_cap as i64 * 4) as *i32
-    *(sm.scope_name + sm.scope_top) = name
-    *(sm.scope_len + sm.scope_top) = len
+        sm.scope = realloc(sm.scope as *u8, sm.scope_cap as i64 * sizeof(SemaVar)) as *SemaVar
+    let v: *SemaVar = @sm.scope[sm.scope_top]
+    v.name = name
+    v.name_len = len
+    v.kind = t.kind
+    v.type_name = t.name
+    v.type_name_len = t.name_len
+    v.pointee = t.pointee
+    v.fn_sig = t.fn_sig
+    v.is_let = is_let
     sm.scope_top = sm.scope_top + 1
+
+# A binding Sema can't type.
+pub fn sema_bind(sm: *Sema, name: *u8, len: i32)
+    var t: SemaTy
+    sema_ty_unknown(@t)
+    sema_bind_ty(sm, name, len, @t, 0)
+
+# The innermost local named `name`, or null.
+pub fn sema_find_local(sm: *Sema, name: *u8, len: i32) -> *SemaVar
+    var i: i32 = sm.scope_top - 1
+    while i >= 0
+        let v: *SemaVar = @sm.scope[i]
+        if name_eq(v.name, v.name_len, name, len) == 1
+            return v
+        i = i - 1
+    null
 
 # 1 when a local named `name` is in scope.
 pub fn sema_is_local(sm: *Sema, name: *u8, len: i32) -> i32
-    var i: i32 = sm.scope_top - 1
-    while i >= 0
-        if name_eq(*(sm.scope_name + i), *(sm.scope_len + i), name, len) == 1
-            return 1
-        i = i - 1
-    0
+    (sema_find_local(sm, name, len) != null) as i32
