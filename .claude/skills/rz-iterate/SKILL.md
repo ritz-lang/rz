@@ -161,6 +161,12 @@ stays here; remote hosts only run rooms.
     `ritz-task-<id>` branch there and fails with `fatal: '…/rz-task-<id>'
     already exists` (huburght, 6 stray branches, 2026-11-14). `repo=rz` on
     the verb line isn't enough.
+  - that `adele room rm` (TEARDOWN, dry run and real) also takes `--repo
+    ~/dev/ritz-lang/rz`. Its ownership guard accepts an `rz-task-<id>`
+    worktree only through the branch rule inside `--repo`. Without it,
+    `rm` refuses with "not named for ritz-task-<id>" (bangerang #1540,
+    2026-11-16, then cleaned up by hand). A refusal with `--repo` comes
+    back as `TEARDOWN-REFUSED`; never a manual teardown.
   Every `SPAWN` still tells the host to **save the briefing with a Bash
   here-doc, never the `Write` tool**: `Write` outside the host's workspace
   waits on an approval nobody gives, and the host room stalls for up to 30
