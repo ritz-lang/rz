@@ -13,12 +13,13 @@ if/else chain with "unknown escape -> emit the literal char".
 
 The fix routes all of them through one table (lexer_cook_escape) holding the
 escapes ritz0 accepts, and turns anything else into a located, fatal lexer
-error.  `\\xNN` is deliberately NOT added: LANGUAGE_SPEC lists the escapes and
-widening it is a LARB decision.
+error.  AGAST #1872 since added `\\xNN` and `\\e` to the language; their
+cases, the #1978 repro `c"a\\xC3b"` among them, live in test_escape_hex_esc.py.
 
 The accepted sets are ritz0's, per literal kind:
 
-  * ``"..."`` (StrView) and ``'.'`` (char): ``\\n \\t \\r \\\\ \\" \\' \\0 \\{ \\}``
+  * ``"..."`` (StrView) and ``'.'`` (char): ``\\n \\t \\r \\\\ \\" \\' \\0 \\{ \\}``,
+    plus ``\\e`` and ``\\xNN`` (AGAST #1872)
   * ``c"..."``: the same minus ``\\{`` and ``\\}`` (no interpolation there)
 
 Every one of them is a must-still-compile control below, checked by value:
@@ -42,8 +43,6 @@ EXPECTED = 42
 # The body must lex the literal; using it in a typed `let` keeps every case a
 # complete, otherwise-valid program, so the escape is the only error.
 REJECT = {
-    # the ticket repro
-    "cstr_x": ("*u8", 'c"a\\xC3b"'),
     "cstr_q": ("*u8", 'c"a\\qb"'),
     "cstr_a": ("*u8", 'c"\\a"'),
     "cstr_u": ("*u8", 'c"\\u0041"'),
@@ -52,11 +51,8 @@ REJECT = {
     # braces are only escapes where interpolation exists
     "cstr_lbrace": ("*u8", 'c"\\{"'),
     "cstr_rbrace": ("*u8", 'c"\\}"'),
-    "str_x": ("StrView", '"a\\xC3b"'),
     "str_q": ("StrView", '"a\\qb"'),
-    "str_e": ("StrView", '"\\e"'),
     "str_1": ("StrView", '"\\1"'),
-    "char_x": ("u8", "'\\x'"),
     "char_q": ("u8", "'\\q'"),
     "char_a": ("u8", "'\\a'"),
     "char_1": ("u8", "'\\1'"),

@@ -273,14 +273,13 @@ fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: *u8) -> i32
   lex.pending_dedents = 0
   1
 
-# The byte an escape `\<esc>` cooks to, or -1 if the language defines no such
-# escape (AGAST #1978).  The one table for every literal kind: the "..." and
-# c"..." scanners below, the TOK_CHAR check, and ast_helpers' expr_char.
-# `braces` is 1 for "..." and '.' literals, which (as in ritz0) also accept
-# `\{` and `\}`; c"..." has no interpolation, so there they are unknown.
-# Every arm used to end in "unknown escape -> the literal char", which
-# silently turned c"a\xC3b" into "axC3b".  `\xNN` is deliberately absent:
-# LANGUAGE_SPEC lists the escapes, and widening it is a LARB decision.
+# The byte a one-char escape `\<esc>` cooks to, or -1 if the language defines
+# no such escape (AGAST #1978).  `braces` is 1 for "..." and '.' literals,
+# which (as in ritz0) also accept `\{` and `\}`; c"..." has no interpolation,
+# so there they are unknown.  Every arm used to end in "unknown escape -> the
+# literal char", which silently turned c"a\qb" into "aqb".  `\x` takes two
+# more bytes, so it is cooked by lexer_cook_escape_at, the entry point every
+# literal kind uses; expr_char and print's re-cooker (emitter_print) too.
 pub fn lexer_cook_escape(esc: i32, braces: i32) -> i32
   if esc == 110       # \n
     return 10
@@ -296,26 +295,89 @@ pub fn lexer_cook_escape(esc: i32, braces: i32) -> i32
     return 39
   if esc == 48        # \0
     return 0
+  if esc == 101       # \e, ESC (AGAST #1872)
+    return 27
   if braces == 1 and (esc == 123 or esc == 125)  # \{ \}
     return esc
   -1
 
-# Fatal, located TOK_ERROR for an unknown escape `\<esc>` whose escape char
-# (the byte after the backslash) is at source offset `pos` -- the column
-# ritz0 reports -- naming the escape as ritz0 does:
-#   Unknown escape sequence '\x'
-fn lexer_fail_escape(lex: *Lexer, pos: i64, line: i32, col: i32, esc: i32) -> Token
-  let prefix: *u8 = c"Unknown escape sequence '\\"
+# lexer_cook_escape_at's failures, besides lexer_cook_escape's -1 (unknown).
+const ESCAPE_HEX_DIGITS: i32 = -2   # `\x` without two hex digits
+const ESCAPE_HEX_RANGE: i32 = -3    # `\xNN` above 0x7F
+
+# Value of hex digit `c`, or -1.
+fn lexer_hex_val(c: i32) -> i32
+  if c >= 48 and c <= 57      # 0-9
+    return c - 48
+  if c >= 97 and c <= 102     # a-f
+    return c - 87
+  if c >= 65 and c <= 70      # A-F
+    return c - 55
+  -1
+
+# The byte the escape whose escape char (the one after the backslash) is at
+# `p` cooks to, or a negative failure code.  `avail` is how many bytes of the
+# literal remain from `p` on; a `\x` short of two never reads past them.
+# ritz0's twin is lexer.py `decode_escape`; the two must agree.
+#
+# AGAST #1872: `\xNN` is exactly two hex digits, either case, at most 0x7F.
+# A literal is UTF-8 text, so a lone byte above 0x7F would be half a
+# character; a non-ASCII character is written as itself.
+pub fn lexer_cook_escape_at(p: *u8, avail: i64, braces: i32) -> i32
+  let esc: i32 = ((*p) as i32) & 255
+  if esc != 120               # not \x
+    return lexer_cook_escape(esc, braces)
+  if avail < 3
+    return ESCAPE_HEX_DIGITS
+  let hi: i32 = lexer_hex_val(((*(p + 1)) as i32) & 255)
+  let lo: i32 = lexer_hex_val(((*(p + 2)) as i32) & 255)
+  if hi < 0 or lo < 0
+    return ESCAPE_HEX_DIGITS
+  let v: i32 = hi * 16 + lo
+  if v > 127
+    return ESCAPE_HEX_RANGE
+  v
+
+# Source bytes an escape occupies after its backslash: 3 for `\xNN`, else 1.
+pub fn lexer_escape_width(esc: i32) -> i32
+  if esc == 120
+    return 3
+  1
+
+# Append the NUL-terminated `text` to `buf` at `n`; returns the new length.
+fn lexer_msg_append(buf: *u8, n: i64, text: *u8) -> i64
+  var k: i64 = n
+  var i: i64 = 0
+  while *(text + i) != 0
+    *(buf + k) = *(text + i)
+    k = k + 1
+    i = i + 1
+  k
+
+# Fatal, located TOK_ERROR for a bad escape: `p` points at its escape char
+# (the byte after the backslash), at source offset `pos` -- the column ritz0
+# reports -- and `code` is lexer_cook_escape_at's failure.  The messages are
+# ritz0's (lexer.py decode_escape):
+#   Unknown escape sequence '\q'
+#   Hex escape '\x' needs exactly two hex digits
+#   Hex escape '\xC3' is above '\x7F': ...
+fn lexer_fail_escape(lex: *Lexer, pos: i64, line: i32, col: i32, p: *u8, code: i32) -> Token
+  # Fatal path: never freed.  The longest message is under 120 bytes.
+  let msg: *u8 = malloc(160)
   var n: i64 = 0
-  while *(prefix + n) != 0
-    n = n + 1
-  # prefix + escape byte + closing quote + NUL.  Fatal path: never freed.
-  let msg: *u8 = malloc(n + 3)
-  for i in 0..n
-    *(msg + i) = *(prefix + i)
-  *(msg + n) = esc as u8
-  *(msg + n + 1) = 39
-  *(msg + n + 2) = 0
+  if code == ESCAPE_HEX_DIGITS
+    n = lexer_msg_append(msg, n, c"Hex escape '\\x' needs exactly two hex digits")
+  else if code == ESCAPE_HEX_RANGE
+    n = lexer_msg_append(msg, n, c"Hex escape '\\x")
+    *(msg + n) = *(p + 1)
+    *(msg + n + 1) = *(p + 2)
+    n = lexer_msg_append(msg, n + 2, c"' is above '\\x7F': a literal is UTF-8 text, so write a non-ASCII character as itself")
+  else
+    n = lexer_msg_append(msg, n, c"Unknown escape sequence '\\")
+    *(msg + n) = *p
+    *(msg + n + 1) = 39
+    n = n + 2
+  *(msg + n) = 0
   lex.error_msg = msg
   lex.pos = lex.len
   lex.pending_dedents = 0
@@ -759,14 +821,15 @@ fn lexer_next_token(lex: *Lexer) -> Token
           lex.pos = lex.pos + 1
           lex.col = lex.col + 1
           if lex.pos < lex.len
-            let esc_ch: i32 = lexer_peek_at(lex, 0)
-            let cooked: i32 = lexer_cook_escape(esc_ch, 1)
+            let esc_p: *u8 = lex.src + lex.pos
+            let cooked: i32 = lexer_cook_escape_at(esc_p, lex.len - lex.pos, 1)
             if cooked < 0
-              return lexer_fail_escape(lex, lex.pos, lex.line, lex.col, esc_ch)
+              return lexer_fail_escape(lex, lex.pos, lex.line, lex.col, esc_p, cooked)
             # Store cooked char in buffer
             lexer_str_push(lex, cooked as i8)
-            lex.pos = lex.pos + 1
-            lex.col = lex.col + 1
+            let esc_w: i32 = lexer_escape_width(lexer_peek_at(lex, 0))
+            lex.pos = lex.pos + esc_w
+            lex.col = lex.col + esc_w
         else
           # Regular character - copy as-is
           lexer_str_push(lex, str_ch as i8)
@@ -921,13 +984,14 @@ fn lexer_next_token(lex: *Lexer) -> Token
                     lex.pos = lex.pos + 1
                     lex.col = lex.col + 1
                     if lex.pos < lex.len
-                        let esc_ch: i32 = lexer_peek_at(lex, 0)
-                        let cooked: i32 = lexer_cook_escape(esc_ch, 0)
+                        let esc_p: *u8 = lex.src + lex.pos
+                        let cooked: i32 = lexer_cook_escape_at(esc_p, lex.len - lex.pos, 0)
                         if cooked < 0
-                            return lexer_fail_escape(lex, lex.pos, lex.line, lex.col, esc_ch)
+                            return lexer_fail_escape(lex, lex.pos, lex.line, lex.col, esc_p, cooked)
                         lexer_str_push(lex, cooked as i8)
-                        lex.pos = lex.pos + 1
-                        lex.col = lex.col + 1
+                        let esc_w: i32 = lexer_escape_width(lexer_peek_at(lex, 0))
+                        lex.pos = lex.pos + esc_w
+                        lex.col = lex.col + esc_w
                 else
                     lexer_str_push(lex, str_ch as i8)
                     lex.pos = lex.pos + 1
@@ -980,12 +1044,23 @@ fn lexer_next_token(lex: *Lexer) -> Token
     # IDENT-prefix path above is the legacy workaround for when the NFA
     # negation bug masked CSTRING matches; with the negation fixed,
     # CSTRING wins the longest match and we cook here.
-    # A char literal `'\X'` is cooked later, by expr_char; reject an unknown
-    # escape here so it is a located lexer error like the string kinds.
-    if best_type == TOK_CHAR and best_len == 4 and ((*(lex.src + start + 1)) & 255) == 92
-      let esc: i32 = (*(lex.src + start + 2)) & 255
-      if lexer_cook_escape(esc, 1) < 0
-        return lexer_fail_escape(lex, start + 2, line, col + 2, esc)
+    # A char literal `'\X'` / `'\xNN'` is cooked later, by expr_char; reject
+    # a bad escape here so it is a located lexer error like the string kinds.
+    # The CHAR pattern lets `\x` take any run of bytes up to the quote, so a
+    # short or non-hex `'\x1'` gets the hex message, not "unexpected '".
+    if best_type == TOK_CHAR and ((*(lex.src + start + 1)) & 255) == 92
+      let esc_p: *u8 = lex.src + start + 2
+      let avail: i64 = (best_len - 3) as i64   # bytes from esc char to the closing quote
+      let cooked: i32 = lexer_cook_escape_at(esc_p, avail, 1)
+      if cooked < 0
+        return lexer_fail_escape(lex, start + 2, line, col + 2, esc_p, cooked)
+      if (lexer_escape_width(((*esc_p) as i32) & 255) as i64) != avail
+        var err: Token = token_new(TOK_ERROR, start, 1, line, col)
+        err.start = lex.src + start
+        lex.error_msg = c"Character literal must contain exactly one character"
+        lex.pos = lex.len
+        lex.pending_dedents = 0
+        return err
     if best_type == TOK_CSTRING or best_type == TOK_STRING
       var prefix: i32 = 1  # default: `"`
       var braces: i32 = 1
@@ -997,12 +1072,12 @@ fn lexer_next_token(lex: *Lexer) -> Token
       while i < best_len - 1  # stop before closing quote
         let raw: i32 = (*(lex.src + start + i)) & 255
         if raw == 92 and i + 1 < best_len - 1  # backslash escape
-          let esc: i32 = (*(lex.src + start + i + 1)) & 255
-          let cooked: i32 = lexer_cook_escape(esc, braces)
+          let esc_p: *u8 = lex.src + start + i + 1
+          let cooked: i32 = lexer_cook_escape_at(esc_p, (best_len - 1 - (i + 1)) as i64, braces)
           if cooked < 0
-            return lexer_fail_escape(lex, start + i + 1, line, col + i + 1, esc)
+            return lexer_fail_escape(lex, start + i + 1, line, col + i + 1, esc_p, cooked)
           lexer_str_push(lex, cooked as i8)
-          i = i + 2
+          i = i + 1 + lexer_escape_width(((*esc_p) as i32) & 255)
         else
           lexer_str_push(lex, raw as i8)
           i = i + 1

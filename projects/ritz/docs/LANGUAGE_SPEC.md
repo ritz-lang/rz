@@ -331,8 +331,30 @@ let bad = s"hello"
 
 `make check-no-s-strings` fails the build if one reappears in the tree.
 
-**Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`, and `\{` /
-`\}` for a literal brace anywhere
+**Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`, `\e` (ESC,
+0x1B), `\xNN`, and `\{` / `\}` for a literal brace anywhere. They mean the same
+in `"..."`, `c"..."` and `'.'` literals (AGAST #1872).
+
+`\xNN` is exactly two hex digits, in either case, and gives that byte. The byte
+must be ASCII, at most `\x7F`: a literal is UTF-8 text, and a lone byte above
+that would be half a character, so a non-ASCII character is written as itself.
+
+```ritz body
+let clear: *u8 = c"\e[2J\e[H"   # ANSI clear screen, cursor home
+let esc: u8 = '\x1B'            # the same byte as '\e'
+let del: u8 = '\x7f'
+let csi: StrView = "\x1b["
+```
+
+Anything else after `\x` is an error at the `x`, as an unknown escape is:
+
+```ritz body expect-error="Hex escape '\x' needs exactly two hex digits"
+let bad: u8 = '\x1'
+```
+
+```ritz body expect-error="is above '\x7F'"
+let half: *u8 = c"\xC3"
+```
 
 **String interpolation:** `{expr}` inside a **plain** string literal passed to
 the `print` or `eprint` builtin substitutes the value of `expr`. `print` writes

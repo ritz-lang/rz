@@ -27,6 +27,47 @@ from ref_rules import DOLLAR_OUTSIDE_ASM
 UNMATCHED_INDENT = "Unindent does not match any outer indentation level"
 
 
+class EscapeError(Exception):
+    """A bad escape; the caller attaches the span (the escape char's)."""
+
+
+# The escapes every literal kind accepts (LANGUAGE_SPEC section 2.6). `\{` and
+# `\}` are added for "..." and '.' only: c"..." has no interpolation.
+_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"', "'": "'",
+            '0': '\0', 'e': '\x1b'}
+_HEX_DIGITS = '0123456789abcdefABCDEF'
+
+
+def decode_escape(text: str, i: int, braces: bool) -> tuple:
+    r"""Decode the escape whose escape char (the one after the backslash) is
+    `text[i]`. Returns (cooked char, chars consumed from `i`).
+
+    The one escape table for `_lex_string`, `_lex_cstring` and `_cook_plain`
+    (AGAST #3450 noted the ladder was copied per literal kind). ritz1's twin
+    is lexer_nfa.ritz `lexer_cook_escape_at`; the two must agree.
+
+    AGAST #1872 added `\e` (ESC) and `\xNN`: exactly two hex digits, either
+    case, and at most 0x7F. A literal is UTF-8 text, so a lone byte above
+    0x7F would be half a character; write a non-ASCII character as itself.
+    """
+    esc = text[i] if i < len(text) else '\0'
+    if esc in _ESCAPES:
+        return _ESCAPES[esc], 1
+    if braces and esc in '{}':
+        return esc, 1
+    if esc == 'x':
+        digits = text[i + 1:i + 3]
+        if len(digits) != 2 or any(c not in _HEX_DIGITS for c in digits):
+            raise EscapeError("Hex escape '\\x' needs exactly two hex digits")
+        value = int(digits, 16)
+        if value > 0x7F:
+            raise EscapeError(
+                f"Hex escape '\\x{digits}' is above '\\x7F': a literal is "
+                f"UTF-8 text, so write a non-ASCII character as itself")
+        return chr(value), 3
+    raise EscapeError(f"Unknown escape sequence '\\{esc}'")
+
+
 class LexerError(Exception):
     """Lexer error with source location."""
     def __init__(self, message: str, span: Span):
@@ -232,29 +273,8 @@ class Lexer:
                 break
             if ch == '\\':
                 self._advance()
-                escape = self._peek()
-                if escape == 'n':
-                    chars.append('\n')
-                elif escape == 't':
-                    chars.append('\t')
-                elif escape == 'r':
-                    chars.append('\r')
-                elif escape == '\\':
-                    chars.append('\\')
-                elif escape == '"':
-                    chars.append('"')
-                elif escape == "'":
-                    chars.append("'")
-                elif escape == '0':
-                    chars.append('\0')
-                elif escape == '{':
-                    chars.append('{')  # \{ for literal brace
-                elif escape == '}':
-                    chars.append('}')  # \} for literal brace
-                else:
-                    raise LexerError(f"Unknown escape sequence '\\{escape}'", self._span())
+                chars.append(self._read_escape(braces=True))
                 pchars.append(chars[-1])
-                self._advance()
             elif ch == '{' and quote == '"':
                 # Check for {{ (escaped brace)
                 if self._peek(1) == '{':
@@ -363,8 +383,17 @@ class Lexer:
         return Token(TokenType.STRING, ''.join(chars), start_span,
                      print_value=''.join(pchars))
 
-    _PLAIN_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"',
-                      "'": "'", '0': '\0', '{': '{', '}': '}'}
+    def _read_escape(self, braces: bool) -> str:
+        """Consume the escape at the current position (the char after the
+        backslash) and return its cooked char. A bad one is located at the
+        escape char, as every unknown escape always was."""
+        try:
+            cooked, width = decode_escape(self.source, self.pos, braces)
+        except EscapeError as e:
+            raise LexerError(str(e), self._span())
+        for _ in range(width):
+            self._advance()
+        return cooked
 
     def _cook_plain(self, body: str, span: Span) -> str:
         """Cook a "..." body's escapes, treating every brace as a plain byte.
@@ -377,11 +406,12 @@ class Lexer:
         while i < len(body):
             ch = body[i]
             if ch == '\\':
-                esc = body[i + 1] if i + 1 < len(body) else '\0'
-                if esc not in self._PLAIN_ESCAPES:
-                    raise LexerError(f"Unknown escape sequence '\\{esc}'", span)
-                out.append(self._PLAIN_ESCAPES[esc])
-                i += 2
+                try:
+                    cooked, width = decode_escape(body, i + 1, True)
+                except EscapeError as e:
+                    raise LexerError(str(e), span)
+                out.append(cooked)
+                i += 1 + width
             else:
                 out.append(ch)
                 i += 1
@@ -407,24 +437,7 @@ class Lexer:
                 break
             if ch == '\\':
                 self._advance()
-                escape = self._peek()
-                if escape == 'n':
-                    chars.append('\n')
-                elif escape == 't':
-                    chars.append('\t')
-                elif escape == 'r':
-                    chars.append('\r')
-                elif escape == '\\':
-                    chars.append('\\')
-                elif escape == '"':
-                    chars.append('"')
-                elif escape == "'":
-                    chars.append("'")
-                elif escape == '0':
-                    chars.append('\0')
-                else:
-                    raise LexerError(f"Unknown escape sequence '\\{escape}'", self._span())
-                self._advance()
+                chars.append(self._read_escape(braces=False))
             elif ch == '{':
                 # No interpolation in C-strings - just literal braces
                 chars.append(ch)
