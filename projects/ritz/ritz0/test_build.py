@@ -598,6 +598,23 @@ class TestCacheWholesaleInvalidation:
         h2 = compute_compiler_hash(tmp_path, "ritz1")
         assert h1 != h2, "ritz1 binary edit did not change fingerprint"
 
+    @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+    def test_build_drivers_resolver_is_fingerprinted(self, tmp_path, compiler):
+        """resolve.py decides the --deps every module is compiled with. It
+        was part of build.py, which is fingerprinted, until AGAST #1835 moved
+        it out; an edit to it must still rebuild."""
+        from cache import compute_compiler_hash
+
+        (tmp_path / "ritz0").mkdir()
+        (tmp_path / "ritz0" / "ritz0.py").write_text("# x")
+        (tmp_path / "ritz1" / "build").mkdir(parents=True)
+        (tmp_path / "ritz1" / "build" / "ritz1").write_bytes(b"binary")
+        resolver = tmp_path / "resolve.py"
+        resolver.write_text("# v1")
+        h1 = compute_compiler_hash(tmp_path, compiler)
+        resolver.write_text("# v2")
+        assert compute_compiler_hash(tmp_path, compiler) != h1
+
     def test_ritz1_missing_returns_sentinel(self, tmp_path):
         from cache import compute_compiler_hash
         # No ritz1 binary at all

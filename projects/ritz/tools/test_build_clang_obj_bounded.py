@@ -198,7 +198,8 @@ def test_failing_o2_compile_fails_the_build_loudly(buildpy, fake_clang, pkg,
     assert len(fake_clang.o2_calls()) == 1, "the -O2 object compile never ran"
     assert rc != 0, "a failed clang -c -O2 must not be linked around"
     assert buildpy.CLANG_OBJ_FAILURES == 1
-    assert "clang -c -O2 failed" in text
+    assert "clang -c failed" in text
+    assert "flags: -c -O2 " in text, "must name the object flags"
     assert ".ll" in text and "main.ritz" in text, "must name the file"
     assert "exit status 1" in text
     # The stderr *tail*: the real error is the last line, after 50 lines of noise.

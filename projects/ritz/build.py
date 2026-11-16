@@ -273,17 +273,23 @@ def _stderr_tail(stderr: str, lines: int = CLANG_OBJ_STDERR_TAIL) -> str:
 OBJ_CLANG_FLAGS = ["-c", "-O2", "-fPIC", *FREESTANDING_FLAGS]
 
 
-def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path) -> Optional[str]:
-    """Run the bounded `clang -c -O2` for one .ll. Return None on success.
+def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path,
+                      flags: Optional[List[str]] = None) -> Optional[str]:
+    """Run the bounded `clang <flags>` object compile for one .ll. Return None
+    on success.
 
-    On failure, increments CLANG_OBJ_FAILURES and returns a message naming the
-    file, the exit status (or timeout) and clang's stderr tail. The caller
-    must fail the build with it. See the AGAST #1731 note above.
+    `flags` are the target's object flags (`Target.obj_flags`), the hosted
+    OBJ_CLANG_FLAGS by default. On failure, increments CLANG_OBJ_FAILURES and
+    returns a message naming the file, the exit status (or timeout) and
+    clang's stderr tail. The caller must fail the build with it. See the
+    AGAST #1731 note above.
     """
     global CLANG_OBJ_FAILURES
     timeout = _env_int(CLANG_OBJ_TIMEOUT_ENV, CLANG_OBJ_TIMEOUT_DEFAULT)
     mem_mb = _env_int(CLANG_OBJ_MEM_ENV, CLANG_OBJ_MEM_MB_DEFAULT)
-    cmd = ["clang", *OBJ_CLANG_FLAGS, str(ll_path), "-o", str(obj_path)]
+    if flags is None:
+        flags = OBJ_CLANG_FLAGS
+    cmd = ["clang", *flags, str(ll_path), "-o", str(obj_path)]
 
     # Own session, so a timeout kills clang and anything it spawned (cc1 when
     # not integrated), not just the driver.
@@ -312,7 +318,8 @@ def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path) -> Optional[str]
     CLANG_OBJ_FAILURES += 1
     obj_path.unlink(missing_ok=True)  # never link a partial object
     return (
-        f"clang -c -O2 failed on {ll_path} (from {src}): {status}\n"
+        f"clang -c failed on {ll_path} (from {src}): {status}\n"
+        f"  flags: {' '.join(flags)}\n"
         f"  bounds: timeout {timeout}s, address space {mem_mb} MiB "
         f"({CLANG_OBJ_MEM_ENV})\n"
         f"  stderr tail:\n" + textwrap.indent(_stderr_tail(stderr), "    ")
@@ -320,11 +327,11 @@ def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path) -> Optional[str]
 
 
 def report_obj_failures(failures: List[str]) -> None:
-    """Report every failed `clang -c -O2`. AGAST #1731: never silent."""
+    """Report every failed object compile. AGAST #1731: never silent."""
     if not failures:
         return
     n = len(failures)
-    print(f"\n  ✗ clang -c -O2 failed for {n} IR file{'s' if n != 1 else ''} "
+    print(f"\n  ✗ clang -c failed for {n} IR file{'s' if n != 1 else ''} "
           f"(no fallback; see AGAST #1731):", file=sys.stderr)
     for msg in failures:
         print(f"\n  {msg}", file=sys.stderr)
@@ -944,43 +951,11 @@ def get_output_dir(pkg_dir: Path, profile: dict) -> Path:
 # RFC #109 Phase 2: Dependency Resolution and Namespacing
 # =============================================================================
 
-@dataclass
-class DependencySpec:
-    """Represents a single dependency specification.
-
-    Per RFC #109 §2.6, dependencies are namespaced:
-    - import squeeze.gzip → squeeze/src/gzip.ritz (if squeeze is a dependency)
-    """
-    name: str           # Dependency name (used as import namespace)
-    path: Path          # Path to dependency root (absolute)
-    sources: list[str]  # Source directories within dependency (default: ["src"])
-
-    def resolve_import(self, module_parts: list[str]) -> Path | None:
-        """Resolve an import path within this dependency.
-
-        Args:
-            module_parts: Path parts after the dependency name
-                         e.g., for "squeeze.gzip", this would be ["gzip"]
-
-        Returns:
-            Path to the .ritz file if found, None otherwise
-        """
-        if not module_parts:
-            return None
-
-        # Convert module path to file path: gzip → gzip.ritz, http.server → http/server.ritz
-        file_rel = "/".join(module_parts[:-1] + [module_parts[-1] + ".ritz"]) if module_parts else ""
-
-        # Search in dependency's source directories
-        for src_dir in self.sources:
-            src_path = self.path / src_dir
-            if not src_path.is_dir():
-                continue
-            candidate = src_path / file_rel
-            if candidate.exists():
-                return candidate
-
-        return None
+# DependencySpec and the [dependencies] resolver live in resolve.py, shared
+# with `rz` (AGAST #1835).
+from resolve import (  # noqa: E402,F401  (re-exported: tests import them from build)
+    DependencySpec, get_transitive_dependencies, package_import_namespaces,
+    parse_dependencies)
 
 
 @dataclass
@@ -1020,145 +995,6 @@ class LibraryConfig:
     """
     name: str
     modules: list[Path]
-
-
-def parse_dependencies(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]:
-    """Parse [dependencies] section from ritz.toml config.
-
-    Per RFC #109 §2.6:
-    - Dependencies are declared as: name = { path = "..." }
-    - Each dependency gets its own namespace for imports
-    - Paths are resolved relative to the package directory
-
-    Returns:
-        Dict mapping dependency name to DependencySpec
-    """
-    deps = {}
-    deps_config = config.get("dependencies", {})
-
-    for name, spec in deps_config.items():
-        if isinstance(spec, dict):
-            # Full spec: { path = "...", sources = [...] }
-            dep_path = spec.get("path")
-            if dep_path is None:
-                print(f"  ⚠ Dependency '{name}' missing 'path'", file=sys.stderr)
-                continue
-
-            # Resolve path relative to package directory
-            dep_path = (pkg_dir / dep_path).resolve()
-            if not dep_path.exists():
-                print(f"  ⚠ Dependency '{name}' path not found: {dep_path}", file=sys.stderr)
-                continue
-
-            # Get sources from dependency's ritz.toml if not specified
-            sources = spec.get("sources")
-            if sources is None:
-                # Try to read from dependency's ritz.toml
-                dep_toml = dep_path / "ritz.toml"
-                if dep_toml.exists():
-                    with open(dep_toml, "rb") as f:
-                        dep_config = tomllib.load(f)
-                    # Check both top-level and inside [package] (TOML quirk)
-                    sources = dep_config.get("sources")
-                    if sources is None:
-                        sources = dep_config.get("package", {}).get("sources", ["src"])
-                else:
-                    sources = ["src"]
-
-            if isinstance(sources, str):
-                sources = [sources]
-
-            deps[name] = DependencySpec(name=name, path=dep_path, sources=sources)
-        elif isinstance(spec, str):
-            # Shorthand: just a path
-            dep_path = (pkg_dir / spec).resolve()
-            if not dep_path.exists():
-                print(f"  ⚠ Dependency '{name}' path not found: {dep_path}", file=sys.stderr)
-                continue
-            deps[name] = DependencySpec(name=name, path=dep_path, sources=["src"])
-
-    return deps
-
-
-def package_import_namespaces(config: dict, pkg_dir: Path) -> dict[str, DependencySpec]:
-    """Import namespaces visible to a package's own sources.
-
-    The declared [dependencies], plus the package's OWN name mapped onto its
-    own source roots, so `import tome.resp` inside tome resolves to
-    tome/lib/resp.ritz exactly as it does for a consumer that declares
-    `tome = { path = "../tome" }` (AGAST #1538).
-
-    Before this, a package's self-qualified imports resolved only when
-    something happened to put the package itself on RITZ_PATH (`./rz`
-    does, as a side effect of collecting dependency paths); a plain
-    `build.py build projects/tome` failed "Cannot find module: tome.resp".
-
-    An explicit dependency of the same name always wins over the
-    self-mapping.
-    """
-    namespaces = parse_dependencies(config, pkg_dir)
-    pkg_name = config.get("package", {}).get("name")
-    if pkg_name and pkg_name not in namespaces:
-        sources = config.get("sources")
-        if sources is None:
-            sources = config.get("package", {}).get("sources")
-        if sources is None:
-            sources = config.get("build", {}).get("sources")
-        if sources is None:
-            sources = ["src"]
-        if isinstance(sources, str):
-            sources = [sources]
-        namespaces[pkg_name] = DependencySpec(
-            name=pkg_name, path=pkg_dir.resolve(), sources=list(sources))
-    return namespaces
-
-
-def get_transitive_dependencies(
-    pkg_dir: Path,
-    config: dict,
-    seen: set[str] = None
-) -> dict[str, DependencySpec]:
-    """Get all dependencies including transitive ones.
-
-    Walks the dependency tree and collects all dependencies.
-    Detects cycles and raises an error.
-
-    Args:
-        pkg_dir: Package directory
-        config: Package config
-        seen: Set of already-seen package paths (for cycle detection)
-
-    Returns:
-        Dict mapping dependency name to DependencySpec
-    """
-    if seen is None:
-        seen = set()
-
-    pkg_key = str(pkg_dir.resolve())
-    if pkg_key in seen:
-        raise ValueError(f"Circular dependency detected involving: {pkg_dir}")
-
-    seen.add(pkg_key)
-    all_deps = {}
-
-    # Get direct dependencies
-    direct_deps = parse_dependencies(config, pkg_dir)
-    all_deps.update(direct_deps)
-
-    # Get transitive dependencies
-    for dep_name, dep_spec in direct_deps.items():
-        dep_toml = dep_spec.path / "ritz.toml"
-        if dep_toml.exists():
-            with open(dep_toml, "rb") as f:
-                dep_config = tomllib.load(f)
-            transitive = get_transitive_dependencies(dep_spec.path, dep_config, seen.copy())
-
-            # Add transitive deps (but don't override direct deps)
-            for trans_name, trans_spec in transitive.items():
-                if trans_name not in all_deps:
-                    all_deps[trans_name] = trans_spec
-
-    return all_deps
 
 
 # =============================================================================
@@ -1591,14 +1427,111 @@ def binary_is_up_to_date(bin_path: Path, provenance: dict) -> bool:
     return recorded == provenance
 
 
+@dataclass(frozen=True)
+class Target:
+    """What a module's object is compiled for (AGAST #1835).
+
+    The per-module stages (discover, emit, verify, `clang -c`, store) are the
+    same for every binary; a Target holds what differs between a hosted
+    binary and a freestanding one (kernel, bootloader, UEFI app). It replaced
+    compile_freestanding_binary's own copy of those stages, which had drifted:
+    no compile_ll_to_obj (so no timeout or memory cap), and a return on the
+    first clang failure.
+
+    `clang_flags` are a freestanding target's object flags after `-c`;
+    `target_os` selects [[target_os = "..."]] code in the compiler.
+    """
+    freestanding: bool = False
+    clang_flags: Tuple[str, ...] = ()
+    target_os: str = ""
+
+    @property
+    def obj_flags(self) -> List[str]:
+        """The flags compile_ll_to_obj runs clang with."""
+        if not self.freestanding:
+            return OBJ_CLANG_FLAGS
+        return ["-c", *self.clang_flags]
+
+    @property
+    def key_flags(self) -> Optional[dict]:
+        """cas_module_key's `object_flags`: None for the hosted defaults.
+        Unchanged from AGAST #1896, so existing store entries stay valid."""
+        if not self.freestanding:
+            return None
+        return {"freestanding": True, "target_os": self.target_os,
+                "clang": list(self.clang_flags)}
+
+    def compiler_args(self) -> List[str]:
+        """Arguments the compiler (ritz0 or ritz1) takes for this target."""
+        return ["--target-os", self.target_os] if self.target_os else []
+
+
+HOSTED = Target()
+
+
+def _deps_json(dependencies: Optional[dict[str, DependencySpec]]) -> str:
+    return json.dumps({name: {"path": str(spec.path), "sources": spec.sources}
+                       for name, spec in dependencies.items()})
+
+
+def discover_modules(src_path: Path, *, project_root: Path,
+                     dependencies: dict[str, DependencySpec] = None,
+                     source_roots: list[str] = None) -> Optional[list[Path]]:
+    """Every module `src_path` imports, transitively, imports first and
+    `src_path` last (ritz0/list_deps.py, in a subprocess). None once an
+    import resolution failure has been reported."""
+    cmd = [sys.executable, str(RITZ0_DIR / "list_deps.py"), str(src_path),
+           "--project-root", str(project_root)]
+    if dependencies:
+        cmd.extend(["--deps", _deps_json(dependencies)])
+    if source_roots:
+        cmd.extend(["--sources", json.dumps(source_roots)])
+    # The environment carries RITZ_PATH for import resolution.
+    result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ)
+    if result.returncode != 0:
+        print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
+        return None
+    return [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
+
+
+def module_compile_cmd(compiler: str, src: Path, ll_path: Path, target: Target, *,
+                       dependencies: dict[str, DependencySpec] = None,
+                       source_roots: list[str] = None,
+                       pkg_dir: Path = None) -> Optional[list]:
+    """The command that emits `src`'s IR to `ll_path` with no runtime.
+    None when the ritz1-family compiler cannot be used (already reported)."""
+    if compiler.startswith("ritz1"):
+        # ritz1 emits no _start by default, which is what --no-runtime asks
+        # of ritz0.
+        cmd = ritz1_compile_cmd(compiler, src, ll_path)
+        if cmd is None:
+            return None
+    else:
+        cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
+        # Pass dependencies if any (RFC #109 Phase 2)
+        if dependencies:
+            cmd.extend(["--deps", _deps_json(dependencies)])
+        # Pass source roots if any (for import resolution)
+        if source_roots:
+            cmd.extend(["--sources", json.dumps(source_roots)])
+        # Pass project root (package directory) for source root resolution
+        if pkg_dir:
+            cmd.extend(["--project-root", str(pkg_dir)])
+    return cmd + target.compiler_args()
+
+
 def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, use_cache: bool,
                     compiler: str, dependencies: dict[str, DependencySpec] = None,
-                    source_roots: list[str] = None, pkg_dir: Path = None) -> Optional[list[Path]]:
-    """Compile each source to an object in `artifact_dir`, through the store.
+                    source_roots: list[str] = None, pkg_dir: Path = None,
+                    target: Target = HOSTED) -> Optional[list[Path]]:
+    """Compile each source to a `target` object in `artifact_dir`, through
+    the store.
 
     All sources are compiled with --no-runtime; a binary gets _start from the
     runtime .o at link time. Every source is attempted, so one run reports
-    every broken module (AGAST #1286).
+    every broken module (AGAST #1286), whether the compiler or clang rejects
+    it. `source_roots` and `pkg_dir` are passed to ritz0 as given (`pkg_dir`
+    as --project-root; a freestanding build passes absolute roots and none).
 
     Returns the objects in source order, or None once the failures have been
     reported.
@@ -1620,32 +1553,17 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
         # this compiler, with these flags: in this worktree or any other.
         # It replaces the per-worktree .ritz-cache objects (and the
         # .bc/.ll tiers, which a hit on the .o always made unreachable).
-        cas_key = cas_module_key(src, cache, compiler) if use_cache else None
+        cas_key = (cas_module_key(src, cache, compiler, target.key_flags)
+                   if use_cache else None)
 
         def compile_src(src=src, ll_path=ll_path, obj_path=obj_path) -> Optional[tuple]:
             """Emit, verify and `clang -c` one module into obj_path.
             None on success, else ("compile" | "obj" | "no-compiler", msg)."""
-            # All sources compiled without runtime - _start comes from external .o
-            if compiler.startswith("ritz1"):
-                compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
-                if compile_cmd is None:
-                    return ("no-compiler", "")
-            else:
-                compile_cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
-
-                # Pass dependencies if any (RFC #109 Phase 2)
-                if dependencies:
-                    deps_json = {
-                        name: {"path": str(spec.path), "sources": spec.sources}
-                        for name, spec in dependencies.items()
-                    }
-                    compile_cmd.extend(["--deps", json.dumps(deps_json)])
-                # Pass source roots if any (for import resolution)
-                if source_roots:
-                    compile_cmd.extend(["--sources", json.dumps(source_roots)])
-                # Pass project root (package directory) for source root resolution
-                if pkg_dir:
-                    compile_cmd.extend(["--project-root", str(pkg_dir)])
+            compile_cmd = module_compile_cmd(
+                compiler, src, ll_path, target, dependencies=dependencies,
+                source_roots=source_roots, pkg_dir=pkg_dir)
+            if compile_cmd is None:
+                return ("no-compiler", "")
 
             env = ritz1_env(dependencies) if compiler.startswith("ritz1") else os.environ.copy()
             result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
@@ -1669,7 +1587,7 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
             # AGAST #1731: there is deliberately no .bc / .ll fallback here.
             # One used to swallow a failed (or capped) -O2 compile and link the
             # .ll instead, which hid #1730 for a whole gate.
-            obj_error = compile_ll_to_obj(ll_path, obj_path, src)
+            obj_error = compile_ll_to_obj(ll_path, obj_path, src, target.obj_flags)
             if obj_error is not None:
                 return ("obj", obj_error)
             return None
@@ -1688,8 +1606,10 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
             ident = cas.module_identity(src)
             try:
                 # AGAST #2794: fetch, so a hit gc'd before the copy rebuilds.
-                store.fetch(cas_key, "o", build_fn, obj_path, identity=ident,
-                            meta={"module": ident, "compiler": compiler})
+                meta = {"module": ident, "compiler": compiler}
+                if target.freestanding:
+                    meta["freestanding"] = target.key_flags
+                store.fetch(cas_key, "o", build_fn, obj_path, identity=ident, meta=meta)
                 failure = None
             except cas.BuildFailed as e:
                 failure = e.args[0]
@@ -1719,6 +1639,47 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
     return link_files
 
 
+def link_hosted(bin_path: Path, runtime_obj: Path, link_files: list[Path],
+                profile: dict) -> bool:
+    """Link a hosted binary: the runtime `_start` object, then the module
+    objects, with clang (gcc if absent) and the profile's options. False
+    once a failure has been reported."""
+    # Use -g to preserve DWARF debug info, -nostdlib for bare-metal
+    print(f"  ⚡ Linking {len(link_files)} object files...")
+    if os.environ.get("RITZ_DEBUG"):
+        for lf in link_files:
+            print(f"    - {lf}")
+    # Try clang first, fall back to gcc
+    if shutil.which("clang"):
+        linker_name = "clang"
+    elif shutil.which("gcc"):
+        linker_name = "gcc"
+    else:
+        print(f"  ✗ Neither clang nor gcc found in PATH", file=sys.stderr)
+        return False
+
+    # Link: runtime.o + all objects -> binary, with profile-specific options.
+    # -march=native enables CPU-specific features (SHA-NI, AES-NI, etc.) for code generation
+    # -msha matches the per-object compile flag
+    link_cmd = [linker_name, str(runtime_obj), *[str(f) for f in link_files],
+                "-o", str(bin_path), "-nostdlib", "-march=native", "-msha",
+                f"-O{profile.get('opt_level', 0)}"]
+    if profile.get("debug", True):
+        link_cmd.append("-g")
+    if profile.get("lto", False):
+        link_cmd.append("-flto")
+
+    if os.environ.get("RITZ_DEBUG"):
+        print(f"  [DEBUG] Link cmd: {' '.join(link_cmd[:5])}... ({len(link_files)} files)")
+        print(f"  [DEBUG] Full command: {' '.join(link_cmd)}")
+
+    result = subprocess.run(link_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ✗ {linker_name} linking failed: {result.stderr}", file=sys.stderr)
+        return False
+    return True
+
+
 def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources: list[Path] = None, keep_artifacts: bool = False, use_cache: bool = True, profile: dict = None, dependencies: dict[str, DependencySpec] = None, pkg_dir: Path = None, source_roots: list[str] = None, compiler: str = "ritz0", on_rebuild=None) -> Path:
     """Compile Ritz source file(s) to a binary.
 
@@ -1746,7 +1707,6 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
 
     Uses gcc for linking when clang is not available.
     """
-    import json
 
     # Default profile if not specified
     if profile is None:
@@ -1771,16 +1731,10 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     # AGAST #1808: compiled modules come from, and go to, the shared store.
     store = cas.ArtifactStore()
 
-    # Discover all source files through import resolution using subprocess
-    # This avoids Python import path issues
-    list_deps_script = RITZ0_DIR / "list_deps.py"
-
-    # Build command with project root and optional dependencies
-    cmd = [sys.executable, str(list_deps_script), str(src_path)]
-    # Pass the package directory as project root (fallback to ritz ROOT for standalone builds)
-    # This ensures ritzlib is resolved consistently across all dependencies
+    # Pass the package directory as project root (fallback to ritz ROOT for
+    # standalone builds), so ritzlib resolves the same way for every
+    # dependency.
     project_root = pkg_dir if pkg_dir else ROOT
-    cmd.extend(["--project-root", str(project_root)])
     # AGAST #1832: the per-module cache must resolve imports exactly as
     # list_deps does, or modules found via source roots / dependency
     # namespaces drop out of its import graph.
@@ -1789,22 +1743,10 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         dependencies={n: (s.path, s.sources) for n, s in (dependencies or {}).items()},
         source_roots=source_roots,
     )
-    if dependencies:
-        # Convert DependencySpec to JSON for passing to subprocess
-        deps_json = {
-            name: {"path": str(spec.path), "sources": spec.sources}
-            for name, spec in dependencies.items()
-        }
-        cmd.extend(["--deps", json.dumps(deps_json)])
-    if source_roots:
-        cmd.extend(["--sources", json.dumps(source_roots)])
-
-    # Pass environment including RITZ_PATH for import resolution
-    result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ)
-    if result.returncode != 0:
-        print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
+    all_sources = discover_modules(src_path, project_root=project_root,
+                                   dependencies=dependencies, source_roots=source_roots)
+    if all_sources is None:
         return None
-    all_sources = [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
 
     # Add any explicit additional sources (for backwards compatibility)
     if additional_sources:
@@ -1864,55 +1806,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         if link_files is None:
             return None
 
-        # Link all .bc/.ll files with the runtime .o
-        # Use -g to preserve DWARF debug info, -nostdlib for bare-metal
-        # Debug: print number of files to link
-        print(f"  ⚡ Linking {len(link_files)} object files...")
-        if os.environ.get("RITZ_DEBUG"):
-            for lf in link_files:
-                print(f"    - {lf}")
-        # Try clang first, fall back to gcc
-        linker_cmd = None
-        linker_name = None
-
-        # Check which linker is available
-        import shutil
-        if shutil.which("clang"):
-            linker_cmd = ["clang"]
-            linker_name = "clang"
-        elif shutil.which("gcc"):
-            linker_cmd = ["gcc"]
-            linker_name = "gcc"
-        else:
-            print(f"  ✗ Neither clang nor gcc found in PATH", file=sys.stderr)
-            return None
-
-        # Link: runtime.o + all .bc/.ll files -> binary
-        # Build link command with profile-specific options
-        # -march=native enables CPU-specific features (SHA-NI, AES-NI, etc.) for code generation
-        # -msha matches the per-object compile flag (see clang_cmd above)
-        link_cmd = linker_cmd + [str(runtime_obj)] + [str(f) for f in link_files] + ["-o", str(bin_path), "-nostdlib", "-march=native", "-msha"]
-
-        # Add optimization level
-        opt_level = profile.get("opt_level", 0)
-        link_cmd.append(f"-O{opt_level}")
-
-        # Add debug info if requested
-        if profile.get("debug", True):
-            link_cmd.append("-g")
-
-        # Add LTO if requested
-        if profile.get("lto", False):
-            link_cmd.append("-flto")
-
-        # Debug: print link command
-        if os.environ.get("RITZ_DEBUG"):
-            print(f"  [DEBUG] Link cmd: {' '.join(link_cmd[:5])}... ({len(link_files)} files)")
-            print(f"  [DEBUG] Full command: {' '.join(link_cmd)}")
-
-        result = subprocess.run(link_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  ✗ {linker_name} linking failed: {result.stderr}", file=sys.stderr)
+        if not link_hosted(bin_path, runtime_obj, link_files, profile):
             return None
 
         if provenance is not None:
@@ -1924,7 +1818,6 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         if os.environ.get("RITZ_KEEP_TEMP"):
             print(f"  [DEBUG] Keeping temp dir: {artifact_dir}")
         elif not keep_artifacts and artifact_dir.exists():
-            import shutil
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
@@ -2050,6 +1943,171 @@ def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool =
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
+def freestanding_target(bin_config: BinaryConfig) -> Target:
+    """The Target a freestanding [[bin]] compiles its modules for.
+
+    Its object flags are its own (no -O2, a --target triple), so its objects
+    never share a store entry with a hosted build of the same source.
+    """
+    target = bin_config.target or "x86_64-none-elf"
+    if "uefi" in target.lower():
+        # UEFI: compile for Windows x64 ABI (produces COFF objects for lld-link)
+        clang_flags = [
+            "--target=x86_64-unknown-windows-gnu",  # Windows x64 target for COFF
+            "-fshort-wchar",      # UEFI uses 16-bit wchar
+            "-mno-red-zone",      # Required for UEFI
+            "-fno-stack-protector",
+            "-ffreestanding",
+        ]
+    else:
+        clang_flags = [
+            f"--target={target}",
+            *FREESTANDING_FLAGS,
+            "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
+            "-msha",  # Force SHA extensions: code using the SHA-NI
+                      # intrinsics (e.g. cryptosec's test_sha_ni.ritz) must
+                      # compile even where it never runs. Without this,
+                      # clang refuses to lower llvm.x86.sha256rnds2 on hosts
+                      # where -march=native doesn't include +sha (e.g.
+                      # pre-Skylake).
+        ]
+        # Add PIC flag if explicitly requested or for Linux targets
+        if bin_config.pic or target.endswith("-linux"):
+            clang_flags.append("-fPIC")
+        # Note: -mcmodel=large is incompatible with -fPIC on x86_64. For PIC
+        # code the default small model (GOT/PLT relocations) is used instead.
+        if bin_config.code_model and not (bin_config.pic and bin_config.code_model == "large"):
+            clang_flags.append(f"-mcmodel={bin_config.code_model}")
+        if bin_config.no_red_zone:
+            clang_flags.append("-mno-red-zone")
+    return Target(freestanding=True, clang_flags=tuple(clang_flags),
+                  target_os=bin_config.target_os or "")
+
+
+_INCBIN = re.compile(r'\.incbin\s+"([^"]+)"')
+
+
+def assemble_objects(asm_files: list[Path], pkg_dir: Path,
+                     artifact_dir: Path) -> Optional[list[Path]]:
+    """Assemble a freestanding [[bin]]'s .s files. None once a failure has
+    been reported. A missing file, or one that .incbin's a file not built
+    yet (user_elf.s), is skipped with a warning."""
+    objects = []
+    print(f"  Assembling {len(asm_files)} assembly file(s)...")
+    for asm_file in asm_files:
+        if not asm_file.exists():
+            print(f"  ⚠ Assembly file not found: {asm_file}")
+            continue
+
+        missing = next((m.group(1) for line in asm_file.read_text().split('\n')
+                        if '.incbin' in line and (m := _INCBIN.search(line))
+                        and not (pkg_dir / m.group(1)).exists()), None)
+        if missing is not None:
+            print(f"  ⚠ Skipping {asm_file.name}: missing {missing}")
+            continue
+
+        obj_path = artifact_dir / f"{asm_file.stem}.o"
+        # Use GNU as for assembly (supports .code32/.code64 directives)
+        # Run from pkg_dir so .incbin relative paths work
+        as_cmd = ["as", "--64", "-o", str(obj_path), str(asm_file)]
+        result = subprocess.run(as_cmd, capture_output=True, text=True, cwd=str(pkg_dir))
+        if result.returncode != 0:
+            print(f"  ✗ as failed for {asm_file.name}: {result.stderr}", file=sys.stderr)
+            return None
+        objects.append(obj_path)
+    return objects
+
+
+def freestanding_runtime_object(bin_config: BinaryConfig) -> Optional[Path]:
+    """The _start shim a link_runtime [[bin]] links first: it calls main()
+    and then sys_exit(). None once a failure has been reported."""
+    # Determine the runtime variant based on main_args and target_os
+    runtime_variant = {3: "ritz_start_envp", 2: "ritz_start"}.get(
+        bin_config.main_args, "ritz_start_noargs")
+    # Choose OS-specific runtime
+    if bin_config.target_os == "harland":
+        runtime_suffix = ".harland.x86_64.o"
+    else:
+        runtime_suffix = ".x86_64.o"
+    runtime_name = f"{runtime_variant}{runtime_suffix}"
+    runtime_path = RITZ0_DIR.parent / "runtime" / runtime_name
+
+    if not ensure_runtime_object(runtime_path):
+        # A freestanding/UEFI target can legitimately have no shim,
+        # but link_runtime was explicitly requested — so this is fatal.
+        print(f"  ✗ Could not provide runtime object: {runtime_path}", file=sys.stderr)
+        return None
+    print(f"  📦 Linking with runtime: {runtime_name}")
+    return runtime_path
+
+
+def link_uefi(name: str, bin_path: Path, object_files: list[Path]) -> bool:
+    """Link a PE/COFF EFI application with lld-link. False once reported."""
+    # Use find_llvm_tool so versioned installs (lld-link-19, ...) are
+    # found — a bare which("lld-link") misses every distro package that
+    # only ships the versioned name.
+    lld_link = find_llvm_tool("lld-link")
+    if not shutil.which(lld_link):
+        # No lld-link: fail loudly rather than attempt the impossible.
+        #
+        # The objects we just produced are PE/COFF (compiled with
+        # --target=x86_64-unknown-windows-gnu). The old fallback tried
+        # to link them as an ELF shared object with `lld`, which
+        # find_llvm_tool() silently degrades to GNU `ld` when LLVM's
+        # linker is absent. GNU ld cannot link COFF input, so it died
+        # on the Win64 ABI's mandatory SEH unwind data with:
+        #
+        #   dangerous relocation: R_AMD64_IMAGEBASE with __ImageBase
+        #   undefined
+        #
+        # That is not a fixable link — it is a category error, and the
+        # error text points at relocations rather than the real cause
+        # (a missing tool). `__ImageBase` is supplied by lld-link
+        # itself, so there is nothing to define our way out of.
+        print(
+            f"  ✗ Cannot link UEFI target '{name}': lld-link not found.\n"
+            f"    UEFI binaries are PE/COFF and require LLVM's COFF "
+            f"linker; GNU ld cannot link COFF objects.\n"
+            f"    Install it with:  sudo apt install lld",
+            file=sys.stderr,
+        )
+        record_setup_miss(name, "lld-link")
+        return False
+
+    # Direct PE/COFF linking with lld-link: a proper PE32+ with the
+    # optional header UEFI expects.
+    print(f"  📦 Linking PE/COFF with lld-link...")
+    link_cmd = [lld_link, "/subsystem:efi_application", "/entry:efi_main",
+                f"/out:{bin_path}", *[str(obj) for obj in object_files]]
+    result = subprocess.run(link_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ✗ lld-link failed: {result.stderr}", file=sys.stderr)
+        return False
+    return True
+
+
+def link_freestanding_elf(bin_config: BinaryConfig, bin_path: Path,
+                          object_files: list[Path]) -> bool:
+    """Link a freestanding ELF with ld.lld (GNU ld if absent). False once
+    reported."""
+    link_cmd = [find_llvm_tool("lld")]
+    # For PIE executables, add -pie flag and --no-dynamic-linker
+    # (freestanding PIE doesn't need a dynamic linker)
+    if bin_config.pic:
+        link_cmd.extend(["--pie", "--no-dynamic-linker"])
+    linker_script = bin_config.linker_script
+    if linker_script and linker_script.exists():
+        link_cmd.extend(["-T", str(linker_script)])
+    link_cmd.extend(["-o", str(bin_path)])
+    link_cmd.extend([str(obj) for obj in object_files])
+
+    result = subprocess.run(link_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ✗ ld.lld linking failed: {result.stderr}", file=sys.stderr)
+        return False
+    return True
+
+
 def compile_freestanding_binary(
     bin_config: BinaryConfig,
     out_dir: Path,
@@ -2063,11 +2121,13 @@ def compile_freestanding_binary(
 ) -> Path:
     """Compile a freestanding binary (kernel, bootloader, etc.).
 
-    Unlike compile_binary(), this:
-    - Does NOT link with Ritz runtime
-    - Uses llc to compile to object files with custom target triple
+    Its modules go through the same stages as compile_binary's
+    (discover_modules, compile_modules), for `freestanding_target(bin_config)`
+    (AGAST #1835). Unlike compile_binary(), this:
+    - Links the Ritz runtime only if the bin asks for it (link_runtime)
+    - Compiles objects for the bin's own target triple and flags
     - Assembles .s files
-    - Links with ld.lld using custom linker script
+    - Links with ld.lld using a custom linker script, or lld-link for UEFI
 
     Args:
         bin_config: BinaryConfig with freestanding options
@@ -2075,384 +2135,82 @@ def compile_freestanding_binary(
         pkg_dir: Package directory
         keep_artifacts: Keep .ll, .o files
         use_cache: Use build cache
-        profile: Build profile
+        profile: Build profile (unused: the bin's own flags decide)
         dependencies: RFC #109 dependencies
         source_roots: List of source directories to search for imports
         compiler: "ritz0", "ritz1" or "ritz1_selfhosted". Never silently
             substituted (AGAST #1473): a ritz1-family build that ritz1 cannot
             honour fails with the reason instead of falling back to ritz0.
     """
-    import json
-    import shutil as shutil_mod
-
-    if profile is None:
-        profile = {"name": "debug", "opt_level": 0, "debug": True, "lto": False}
-
     name = bin_config.name
-    src_path = bin_config.src_path
-    target = bin_config.target or "x86_64-none-elf"
-    target_os = bin_config.target_os or ""  # For conditional compilation (e.g., "harland")
-    linker_script = bin_config.linker_script
-    asm_files = bin_config.asm_files or []
-    code_model = bin_config.code_model
-    no_red_zone = bin_config.no_red_zone
-    pic = bin_config.pic
-
-    ritz1_family = compiler.startswith("ritz1")
-
-    # UEFI targets need special handling
-    is_uefi = "uefi" in target.lower()
-
+    is_uefi = "uefi" in (bin_config.target or "x86_64-none-elf").lower()
     # Output binary path (ELF for kernels, EFI for UEFI)
-    if is_uefi:
-        bin_path = out_dir / f"{name.upper()}.EFI"
-    else:
-        bin_path = out_dir / f"{name}.elf"
+    bin_path = out_dir / (f"{name.upper()}.EFI" if is_uefi else f"{name}.elf")
 
-    # Artifact directory
     if keep_artifacts:
         artifact_dir = out_dir / "obj"
         artifact_dir.mkdir(exist_ok=True)
     else:
         artifact_dir = Path(tempfile.mkdtemp())
 
-    # Find LLVM tools
-    lld = find_llvm_tool("lld")
-
-    # Collect object files to link
-    object_files = []
-
     try:
-        # Step 1: Discover all Ritz source files via imports
-        list_deps_script = RITZ0_DIR / "list_deps.py"
-        cmd = [sys.executable, str(list_deps_script), str(src_path)]
-        cmd.extend(["--project-root", str(pkg_dir)])
-        if dependencies:
-            deps_json = {
-                dep_name: {"path": str(spec.path), "sources": spec.sources}
-                for dep_name, spec in dependencies.items()
-            }
-            cmd.extend(["--deps", json.dumps(deps_json)])
-        if source_roots:
-            # Resolve source roots to absolute paths relative to pkg_dir
-            abs_source_roots = [str(pkg_dir / sr) for sr in source_roots]
-            cmd.extend(["--sources", json.dumps(abs_source_roots)])
+        # Freestanding builds name their source roots absolutely and do not
+        # pass --project-root to the compiler; kept as it was before the
+        # stages were shared (AGAST #1835), so the IR is unchanged.
+        abs_source_roots = [str(pkg_dir / sr) for sr in source_roots] if source_roots else None
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
+        # Step 1: Discover all Ritz source files via imports
+        all_sources = discover_modules(bin_config.src_path, project_root=pkg_dir,
+                                       dependencies=dependencies,
+                                       source_roots=abs_source_roots)
+        if all_sources is None:
             return None
 
-        all_sources = [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
-
-        # Compile LLVM IR to object file with target-specific options.
-        # Use clang -c which can compile .ll files directly (more portable
-        # than llc). The same for every module, so built once.
-        if is_uefi:
-            # UEFI: compile for Windows x64 ABI (produces COFF objects for lld-link)
-            clang_flags = [
-                "--target=x86_64-unknown-windows-gnu",  # Windows x64 target for COFF
-                "-fshort-wchar",      # UEFI uses 16-bit wchar
-                "-mno-red-zone",      # Required for UEFI
-                "-fno-stack-protector",
-                "-ffreestanding",
-            ]
-        else:
-            clang_flags = [
-                f"--target={target}",
-                *FREESTANDING_FLAGS,
-                "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
-                "-msha",  # Force SHA extensions: code using the SHA-NI
-                          # intrinsics (e.g. cryptosec's test_sha_ni.ritz) must
-                          # compile even where it never runs. Without this,
-                          # clang refuses to lower llvm.x86.sha256rnds2 on hosts
-                          # where -march=native doesn't include +sha (e.g.
-                          # pre-Skylake).
-            ]
-            # Add PIC flag if explicitly requested or for Linux targets
-            if pic or target.endswith("-linux"):
-                clang_flags.append("-fPIC")
-
-            if code_model:
-                # Note: -mcmodel=large is incompatible with -fPIC on x86_64
-                # For PIC code, use "small" model (default) which supports
-                # GOT/PLT relocations for position-independent code
-                if pic and code_model == "large":
-                    # Skip code model for PIC - use default small model
-                    pass
-                else:
-                    clang_flags.append(f"-mcmodel={code_model}")
-            if no_red_zone:
-                clang_flags.append("-mno-red-zone")
-
         # AGAST #1896: objects come from, and go to, the shared store, as
-        # compile_binary's do. Without it every freestanding module (harland's
-        # 51) was recompiled on every build: the two longest units of a warm
-        # `rz test --all`. Keyed like a hosted module, except that the object
-        # flags are this target's (target_os too: [[target_os]] conditional
-        # compilation makes the same source a different module).
-        store = cas.ArtifactStore() if use_cache else None
+        # compile_binary's do, keyed by this target's object flags.
         cache = get_build_cache(compiler)
         cache.set_import_context(
             project_root=pkg_dir,
             dependencies={n: (s.path, s.sources) for n, s in (dependencies or {}).items()},
             source_roots=source_roots,
         )
-        object_flags = {"freestanding": True, "target_os": target_os, "clang": clang_flags}
 
-        # Step 2: Compile each Ritz source to LLVM IR, then to object file
+        # Step 2: Compile each Ritz source to LLVM IR, then to an object,
+        # through the same stages as a hosted binary (AGAST #1835).
         print(f"  Compiling {len(all_sources)} Ritz source file(s)...")
-        compile_failures: List[Tuple[Path, str]] = []
-        for src in all_sources:
-            import hashlib
-            path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
-            src_name = f"{src.stem}_{path_hash}"
-            ll_path = artifact_dir / f"{src_name}.ll"
-            obj_path = artifact_dir / f"{src_name}.o"
-
-            # Compile Ritz to LLVM IR
-            if ritz1_family:
-                # Same command as compile_binary's ritz1 path. ritz1 emits no
-                # _start by default, which is what --no-runtime asks of ritz0.
-                compile_cmd = ritz1_compile_cmd(compiler, src, ll_path)
-                if compile_cmd is None:
-                    return None
-                # [[target_os = "..."]] conditional compilation (AGAST #1550)
-                if target_os:
-                    compile_cmd.extend(["--target-os", target_os])
-                env = ritz1_env(dependencies)
-            else:
-                compile_cmd = [
-                    sys.executable, str(RITZ0), str(src),
-                    "-o", str(ll_path),
-                    "--no-runtime"
-                ]
-                # Pass target OS for [[target_os = "..."]] conditional compilation
-                if target_os:
-                    compile_cmd.extend(["--target-os", target_os])
-                if dependencies:
-                    deps_json = {
-                        dep_name: {"path": str(spec.path), "sources": spec.sources}
-                        for dep_name, spec in dependencies.items()
-                    }
-                    compile_cmd.extend(["--deps", json.dumps(deps_json)])
-                if source_roots:
-                    # Resolve source roots to absolute paths relative to pkg_dir
-                    abs_source_roots = [str(pkg_dir / sr) for sr in source_roots]
-                    compile_cmd.extend(["--sources", json.dumps(abs_source_roots)])
-                env = None
-
-            def compile_src(compile_cmd=compile_cmd, env=env, src=src,
-                            ll_path=ll_path, obj_path=obj_path) -> Optional[tuple]:
-                """ritz0/ritz1, verify, `clang -c` of one module into obj_path.
-                None on success, else ("compile" | "clang", message)."""
-                result = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
-                if result.returncode != 0:
-                    return ("compile", result.stderr)
-                relay_compiler_warnings(result.stderr)
-                # AGAST #1308: see verify_ir. No-op unless RITZ_VERIFY_IR is set.
-                ir_error = verify_ir(ll_path, src)
-                if ir_error is not None:
-                    return ("compile", ir_error)
-                result = subprocess.run(
-                    ["clang", "-c", *clang_flags, "-o", str(obj_path), str(ll_path)],
-                    capture_output=True, text=True)
-                if result.returncode != 0:
-                    return ("clang", result.stderr)
-                return None
-
-            cas_key = (cas_module_key(src, cache, compiler, object_flags)
-                       if store is not None else None)
-            if cas_key is None:
-                failure = compile_src()
-            else:
-                def build_fn(compile_src=compile_src, ll_path=ll_path, obj_path=obj_path):
-                    failure = compile_src()
-                    if failure is not None:
-                        raise cas.BuildFailed(failure)
-                    return {"ll": ll_path, "o": obj_path}
-                ident = cas.module_identity(src)
-                try:
-                    # fetch, not get_or_build + copy: gc may remove a hit
-                    # before it is copied out (AGAST #2809).
-                    store.fetch(cas_key, "o", build_fn, obj_path, identity=ident,
-                                meta={"module": ident, "compiler": compiler,
-                                      "freestanding": object_flags})
-                    failure = None
-                except cas.BuildFailed as e:
-                    failure = e.args[0]
-
-            if failure is not None:
-                kind, msg = failure
-                if kind == "clang":
-                    print(f"  ✗ clang failed for {src.name}: {msg}", file=sys.stderr)
-                    return None
-                # AGAST #1286: collect rather than bail, so all broken files
-                # surface in one build. See `report_compile_failures`.
-                compile_failures.append((src, msg))
-                continue
-
-            object_files.append(obj_path)
-
-        # AGAST #1286: report every source that failed to compile, then stop
-        # before assembling/linking a partial object set.
-        if compile_failures:
-            report_compile_failures(compile_failures, compiler)
+        object_files = compile_modules(
+            all_sources, artifact_dir, cache=cache, store=cas.ArtifactStore(),
+            use_cache=use_cache, compiler=compiler, dependencies=dependencies,
+            source_roots=abs_source_roots, pkg_dir=None,
+            target=freestanding_target(bin_config))
+        if object_files is None:
             return None
 
         # Step 3: Assemble .s files
-        if asm_files:
-            print(f"  Assembling {len(asm_files)} assembly file(s)...")
-            for asm_file in asm_files:
-                if not asm_file.exists():
-                    print(f"  ⚠ Assembly file not found: {asm_file}")
-                    continue
-
-                # Special case: user_elf.s includes an ELF binary that might not exist yet
-                # Read the file to check for .incbin directives
-                asm_content = asm_file.read_text()
-                skip_file = False
-                for line in asm_content.split('\n'):
-                    if '.incbin' in line:
-                        # Extract the path from .incbin "path"
-                        import re
-                        match = re.search(r'\.incbin\s+"([^"]+)"', line)
-                        if match:
-                            inc_path = pkg_dir / match.group(1)
-                            if not inc_path.exists():
-                                print(f"  ⚠ Skipping {asm_file.name}: missing {match.group(1)}")
-                                skip_file = True
-                                break
-                if skip_file:
-                    continue
-
-                obj_name = f"{asm_file.stem}.o"
-                obj_path = artifact_dir / obj_name
-
-                # Use GNU as for assembly (supports .code32/.code64 directives)
-                # Run from pkg_dir so .incbin relative paths work
-                as_cmd = ["as", "--64", "-o", str(obj_path), str(asm_file)]
-                result = subprocess.run(as_cmd, capture_output=True, text=True, cwd=str(pkg_dir))
-                if result.returncode != 0:
-                    print(f"  ✗ as failed for {asm_file.name}: {result.stderr}", file=sys.stderr)
-                    return None
-
-                object_files.append(obj_path)
-
-        # Step 3.5: Add runtime object file if requested
-        # The runtime provides _start which calls main() and then sys_exit()
-        if bin_config.link_runtime and not is_uefi:
-            # Determine the runtime variant based on main_args and target_os
-            main_args = bin_config.main_args
-            if main_args == 3:
-                runtime_variant = "ritz_start_envp"
-            elif main_args == 2:
-                runtime_variant = "ritz_start"
-            else:
-                runtime_variant = "ritz_start_noargs"
-
-            # Choose OS-specific runtime
-            if target_os == "harland":
-                runtime_suffix = ".harland.x86_64.o"
-            else:
-                runtime_suffix = ".x86_64.o"
-
-            runtime_name = f"{runtime_variant}{runtime_suffix}"
-            runtime_path = RITZ0_DIR.parent / "runtime" / runtime_name
-
-            if ensure_runtime_object(runtime_path):
-                object_files.insert(0, runtime_path)  # Runtime should be first
-                print(f"  📦 Linking with runtime: {runtime_name}")
-            else:
-                # A freestanding/UEFI target can legitimately have no shim,
-                # but link_runtime was explicitly requested — so this is fatal.
-                print(f"  ✗ Could not provide runtime object: {runtime_path}", file=sys.stderr)
+        if bin_config.asm_files:
+            asm_objects = assemble_objects(bin_config.asm_files, pkg_dir, artifact_dir)
+            if asm_objects is None:
                 return None
+            object_files.extend(asm_objects)
+
+        # Step 3.5: Add runtime object file if requested (first in the link)
+        if bin_config.link_runtime and not is_uefi:
+            runtime_path = freestanding_runtime_object(bin_config)
+            if runtime_path is None:
+                return None
+            object_files.insert(0, runtime_path)
 
         # Step 4: Link
         print(f"  ⚡ Linking {len(object_files)} object files...")
-
         if is_uefi:
-            # UEFI: Use lld-link to directly produce PE/COFF EFI application
-            # This produces a proper PE32+ with optional header that UEFI expects
-            import shutil as shutil_mod
-
-            # Check for lld-link.
-            #
-            # Use find_llvm_tool so versioned installs (lld-link-19, ...) are
-            # found — a bare which("lld-link") misses every distro package that
-            # only ships the versioned name.
-            lld_link = find_llvm_tool("lld-link")
-            if not shutil_mod.which(lld_link):
-                lld_link = None
-            if lld_link:
-                # Direct PE/COFF linking with lld-link
-                print(f"  📦 Linking PE/COFF with lld-link...")
-                link_cmd = [
-                    lld_link,
-                    "/subsystem:efi_application",
-                    "/entry:efi_main",
-                    f"/out:{bin_path}",
-                ]
-                link_cmd.extend([str(obj) for obj in object_files])
-
-                result = subprocess.run(link_cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"  ✗ lld-link failed: {result.stderr}", file=sys.stderr)
-                    return None
-            else:
-                # No lld-link: fail loudly rather than attempt the impossible.
-                #
-                # The objects we just produced are PE/COFF (compiled with
-                # --target=x86_64-unknown-windows-gnu). The old fallback tried
-                # to link them as an ELF shared object with `lld`, which
-                # find_llvm_tool() silently degrades to GNU `ld` when LLVM's
-                # linker is absent. GNU ld cannot link COFF input, so it died
-                # on the Win64 ABI's mandatory SEH unwind data with:
-                #
-                #   dangerous relocation: R_AMD64_IMAGEBASE with __ImageBase
-                #   undefined
-                #
-                # That is not a fixable link — it is a category error, and the
-                # error text points at relocations rather than the real cause
-                # (a missing tool). `__ImageBase` is supplied by lld-link
-                # itself, so there is nothing to define our way out of.
-                print(
-                    f"  ✗ Cannot link UEFI target '{name}': lld-link not found.\n"
-                    f"    UEFI binaries are PE/COFF and require LLVM's COFF "
-                    f"linker; GNU ld cannot link COFF objects.\n"
-                    f"    Install it with:  sudo apt install lld",
-                    file=sys.stderr,
-                )
-                record_setup_miss(name, "lld-link")
-                return None
-
+            linked = link_uefi(name, bin_path, object_files)
         else:
-            # Normal freestanding ELF linking
-            link_cmd = [lld]
-
-            # For PIE executables, add -pie flag and --no-dynamic-linker
-            # (freestanding PIE doesn't need a dynamic linker)
-            if pic:
-                link_cmd.extend(["--pie", "--no-dynamic-linker"])
-
-            if linker_script and linker_script.exists():
-                link_cmd.extend(["-T", str(linker_script)])
-
-            link_cmd.extend(["-o", str(bin_path)])
-            link_cmd.extend([str(obj) for obj in object_files])
-
-            result = subprocess.run(link_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"  ✗ ld.lld linking failed: {result.stderr}", file=sys.stderr)
-                return None
-
-        return bin_path
+            linked = link_freestanding_elf(bin_config, bin_path, object_files)
+        return bin_path if linked else None
 
     finally:
         # Clean up temp directory if not keeping artifacts
         if not keep_artifacts and artifact_dir.exists():
-            import shutil
             shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
