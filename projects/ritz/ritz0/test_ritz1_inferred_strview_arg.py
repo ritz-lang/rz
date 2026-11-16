@@ -18,8 +18,9 @@ check that failed otherwise.  ritz0 is the oracle; every case runs.
 import pytest
 
 from test_ritz1_call_result_member import EXPECTED, _run
+from test_sys_syscall_asm import LOCAL_SYSCALL3
 
-PRINTS = """\
+PRINTS = LOCAL_SYSCALL3 + """\
 fn prints(s: StrView) -> i64
     syscall3(1, 1, s.ptr as i64, s.len)
     s.len

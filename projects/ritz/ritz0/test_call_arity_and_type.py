@@ -279,24 +279,12 @@ def test_a_pointer_to_the_same_struct_is_not_a_wrong_type(compile_with, compiler
 
 
 # `syscallN(num, a1..aN)` takes N+1, counted like any call (#3334): ritz0's
-# builtin used to pass whatever it got, and ritz1 skipped the count to match.
+# builtin used to pass whatever it got.  It is a ritzlib.sys fn now (#3397).
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_syscall_builtin_is_counted(compile_with, compiler):
+def test_a_syscall_is_counted(compile_with, compiler):
     _refused(compile_with, compiler, "syscall", "    @syscall2(39, 0, 0, 0)",
              "`syscall2` called with 4 argument(s) but defined with 3")
-
-
-# ritz0's builtin counts on its own, with no extern to count against: too few,
-# and the `__syscallN` spelling ritzlib doesn't declare (ritz1 can't count that
-# one yet: #3352).
-@pytest.mark.integration
-@pytest.mark.parametrize("marked, message", [
-    ("    @syscall3(39, 0)", "`syscall3` called with 2 argument(s) but defined with 4"),
-    ("    @__syscall1(39, 0, 0)", "`__syscall1` called with 3 argument(s) but defined with 2"),
-], ids=["too_few", "underscored"])
-def test_ritz0s_syscall_builtin_counts_without_an_extern(compile_with, marked, message):
-    _refused(compile_with, "ritz0", "syscall_builtin", marked, message)
 
 
 @pytest.mark.integration

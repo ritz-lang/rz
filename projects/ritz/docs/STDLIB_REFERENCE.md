@@ -959,15 +959,19 @@ Low-level syscall wrappers for Linux x86-64.
 
 #### Raw Syscall Interface
 
+`syscallN(n, a1..aN)` executes the x86-64 `syscall` instruction: the number in
+rax, the arguments in rdi, rsi, rdx, r10, r8, r9, the result from rax. Each is
+an `[[inline]]` `asm` fn (LANGUAGE_SPEC §18.6); no compiler knows the names.
+
 | Function | Signature |
 |----------|-----------|
-| `syscall0` | `extern fn(n: i64) -> i64` |
-| `syscall1` | `extern fn(n: i64, a1: i64) -> i64` |
-| `syscall2` | `extern fn(n: i64, a1: i64, a2: i64) -> i64` |
-| `syscall3` | `extern fn(n: i64, a1: i64, a2: i64, a3: i64) -> i64` |
-| `syscall4` | `extern fn(n: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64` |
-| `syscall5` | `extern fn(n: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64) -> i64` |
-| `syscall6` | `extern fn(n: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64` |
+| `syscall0` | `fn(n: i64) -> i64` |
+| `syscall1` | `fn(n: i64, a1: i64) -> i64` |
+| `syscall2` | `fn(n: i64, a1: i64, a2: i64) -> i64` |
+| `syscall3` | `fn(n: i64, a1: i64, a2: i64, a3: i64) -> i64` |
+| `syscall4` | `fn(n: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64` |
+| `syscall5` | `fn(n: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64) -> i64` |
+| `syscall6` | `fn(n: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64` |
 
 #### Stat Structure
 

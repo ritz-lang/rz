@@ -28,12 +28,13 @@ bug both compilers share cannot pass.
 import pytest
 
 from test_ritz1_print_interpolation import _assert_parity
+from test_sys_syscall_asm import LOCAL_SYSCALL3
 
 pytestmark = [pytest.mark.usefixtures("ritz1_bin"), pytest.mark.integration]
 
 
 # The ticket's two repros: a literal's length and prints' bytes.
-OUTSIDE_PRINT = """\
+OUTSIDE_PRINT = LOCAL_SYSCALL3 + """\
 # A local prints: the parity harness links one module, without ritzlib.
 fn prints(s: StrView)
     syscall3(1, 1, s.ptr as i64, s.len)
@@ -80,7 +81,7 @@ def test_braces_collapse_inside_print(tmp_path):
 # `\\{` is one literal brace on its own, so `\\{{` is that brace and then a
 # lone `{` -- two braces -- in print as well as out of it. A rule that
 # collapsed the cooked text after the fact would print one.
-ESCAPED_THEN_BRACE = """\
+ESCAPED_THEN_BRACE = LOCAL_SYSCALL3 + """\
 # A local prints: the parity harness links one module, without ritzlib.
 fn prints(s: StrView)
     syscall3(1, 1, s.ptr as i64, s.len)

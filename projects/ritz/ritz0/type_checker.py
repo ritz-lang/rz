@@ -15,7 +15,6 @@ Type inference rules:
 Built-in functions:
 - sizeof(T) -> i64: compile-time size of type
 - print(str_lit) -> void: print string literal
-- syscallN(...) -> i64: system call wrappers
 """
 
 import copy
@@ -29,8 +28,7 @@ import ritz_ast as rast
 from tail_value import slot_tails
 from monomorph import mangle_generic_name, TypeSubstitution
 from ufcs import find_ufcs_function
-from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
-                           SYSCALL_BUILTINS)
+from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS
 from typed import Typed
 
 
@@ -774,12 +772,6 @@ class TypeChecker:
                         self._error(f"__builtin_alloca expects integer size, got {self._type_str(arg_type)}", expr.span)
                 return rast.PtrType(expr.span, rast.NamedType(expr.span, 'i8', []), mutable=True)
 
-            # syscall0..syscall6 -> i64
-            if fn_name.startswith('syscall') or fn_name.startswith('__syscall'):
-                for arg in expr.args:
-                    self._infer_type(arg)
-                return rast.NamedType(expr.span, 'i64', [])
-
             # Volatile / atomic memory builtins (LANGUAGE_SPEC §18.4-§18.5,
             # AGAST #1879): the value-returning ones return the pointee type.
             if fn_name in ('volatile_load', 'volatile_store', 'atomic_load',
@@ -835,8 +827,7 @@ class TypeChecker:
 
             # Look up function
             fn_sig = self.functions.get(fn_name)
-            if fn_sig is None and (fn_name in SYSCALL_BUILTINS
-                                   or fn_name in BUILTIN_VARIANTS):
+            if fn_sig is None and fn_name in BUILTIN_VARIANTS:
                 for arg in expr.args:
                     self._infer_type(arg)
                 return rast.NamedType(expr.span, 'unknown', [])

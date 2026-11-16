@@ -32,6 +32,7 @@ import fast_link
 
 from test_ritz1_builtin_struct_shadow import RITZ_START
 from test_ritz1_print_interpolation import _compile
+from test_sys_syscall_asm import LOCAL_SYSCALL3
 
 pytestmark = [pytest.mark.usefixtures("ritz1_bin"), pytest.mark.integration]
 
@@ -63,7 +64,7 @@ def _assert_parity(tmp_path, name, program, out, err=b""):
 
 # Shared helpers. A local `prints` / `len`: the harness links one module,
 # without ritzlib.
-PRELUDE = """\
+PRELUDE = LOCAL_SYSCALL3 + """\
 fn prints(s: StrView)
     syscall3(1, 1, s.ptr as i64, s.len)
     let bar: StrView = "|"

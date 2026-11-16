@@ -45,13 +45,13 @@ INTRINSICS = frozenset({
     'simd_add', 'simd_xor', 'simd_rotl',
     'aesenc', 'aesenclast', 'aesdec', 'aesdeclast', 'aesimc', 'aeskeygenassist',
     'sha256rnds2', 'sha256msg1', 'sha256msg2',
-    'cpuid_raw', 'xgetbv',
+    'xgetbv',
 })
 
-# Syscalls the emitter lowers by name, and the variants of the generics it
-# instantiates itself. `write`, `read`, `open`, `close` and `nanosleep` are
-# ordinary identifiers (AGAST #3243): ritzlib.sys has `sys_write` and friends.
-SYSCALL_BUILTINS = frozenset(f'syscall{n}' for n in range(7))
+# The variants of the generics the emitter instantiates itself. `syscallN`
+# (AGAST #3397) and `write`, `read`, `open`, `close` and `nanosleep` (AGAST
+# #3243) are ordinary identifiers: ritzlib.sys defines `syscallN`, `sys_write`
+# and friends.
 BUILTIN_VARIANTS = frozenset({'Some', 'None', 'Ok', 'Err'})
 BUILTIN_GENERICS = frozenset({'Option', 'Result', 'Span'})
 
@@ -61,8 +61,6 @@ class NameResolver:
 
     # Built-in functions that don't need explicit definition
     BUILTINS = {
-        '__syscall0', '__syscall1', '__syscall2', '__syscall3',
-        '__syscall4', '__syscall5', '__syscall6',
         '__builtin_alloca', 'print', 'eprint', 'format_into', 'sizeof', 'typeof',
         'assert',
         # SIMD vector operations
@@ -74,7 +72,7 @@ class NameResolver:
         'volatile_load', 'volatile_store', 'atomic_load', 'atomic_store',
         'atomic_xchg', 'atomic_cmpxchg', 'atomic_fetch_add', 'atomic_fetch_sub',
         'atomic_fetch_and', 'atomic_fetch_or', 'atomic_fetch_xor', 'fence',
-    } | INTRINSICS | SYSCALL_BUILTINS
+    } | INTRINSICS
 
     # Built-in types
     BUILTIN_TYPES = {

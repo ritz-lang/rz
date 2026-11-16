@@ -5053,25 +5053,12 @@ class LLVMEmitter:
             self._emit_drop_for_scope(scope, exclude_var)
 
     def _declare_extern(self, extern: rast.ExternFn) -> ir.Function:
-        """Declare an external function.
-
-        For syscall-like functions (e.g., syscall1-6), these are handled
-        specially and inlined. For other extern functions, we declare them
-        in the LLVM module so they can be linked with external object files.
-        """
+        """Declare an external function in the LLVM module, so it can be
+        linked with external object files."""
         param_types = [self._ritz_type_to_llvm(p.type) for p in extern.params]
         ret_type = self._ritz_type_to_llvm(extern.ret_type) if extern.ret_type else self.void
 
         fn_type = ir.FunctionType(ret_type, param_types)
-
-        # Check if this is a syscall function (handled specially)
-        syscall_names = {'syscall0', 'syscall1', 'syscall2', 'syscall3',
-                        'syscall4', 'syscall5', 'syscall6'}
-
-        if extern.name in syscall_names:
-            # Syscalls are inlined, don't declare in module
-            self.extern_fns[extern.name] = (fn_type, extern)
-            return None
 
         # Actually declare the extern function in the LLVM module
         # This allows linking with external assembly/object files.
@@ -11864,23 +11851,6 @@ class LLVMEmitter:
         if fname == 'format_into':
             return self._emit_format_into(call)
 
-        # Handle generic syscallN(num, args...) builtins
-        # ONLY match exact builtin names: syscall0-syscall6, __syscall0-__syscall6
-        # Don't match other functions that happen to start with "syscall" (e.g., syscall_init)
-        syscall_builtins = {'syscall0', 'syscall1', 'syscall2', 'syscall3', 'syscall4', 'syscall5', 'syscall6',
-                           '__syscall0', '__syscall1', '__syscall2', '__syscall3', '__syscall4', '__syscall5', '__syscall6'}
-        if fname in syscall_builtins:
-            # syscallN(num, a1..aN): N+1, counted like any call (AGAST #3334).
-            # It used to pass whatever it was given, so prism's 3-arg write
-            # through syscall2 compiled.
-            want = int(fname[-1]) + 1
-            if len(call.args) != want:
-                raise EmitError(
-                    f"`{fname}` called with {len(call.args)} argument(s) but "
-                    f"defined with {want}",
-                    self._call_span(call))
-            return self._emit_generic_syscall(fname, call.args)
-
         # Look up user-defined function
         if fname in self.functions:
             fn, fn_def = self.functions[fname]
@@ -12394,56 +12364,6 @@ class LLVMEmitter:
             left = self.builder.shl(vec, left_shift_val)
             right = self.builder.lshr(vec, right_shift_val)
             return self.builder.or_(left, right)
-
-        elif fname == 'cpuid_raw':
-            # cpuid_raw(leaf: u32, subleaf: u32, out_eax: *u32, out_ebx: *u32, out_ecx: *u32, out_edx: *u32) -> void
-            # Uses inline assembly to execute CPUID instruction
-            # Writes results to the provided output pointers
-            if len(args) != 6:
-                raise ValueError("cpuid_raw() requires 6 arguments (leaf, subleaf, out_eax, out_ebx, out_ecx, out_edx)")
-            leaf = self._emit_expr(args[0])
-            subleaf = self._emit_expr(args[1])
-            out_eax = self._emit_expr(args[2])
-            out_ebx = self._emit_expr(args[3])
-            out_ecx = self._emit_expr(args[4])
-            out_edx = self._emit_expr(args[5])
-
-            # Convert to i32 if needed
-            if leaf.type != self.i32:
-                leaf = self.builder.trunc(leaf, self.i32) if leaf.type.width > 32 else self.builder.zext(leaf, self.i32)
-            if subleaf.type != self.i32:
-                subleaf = self.builder.trunc(subleaf, self.i32) if subleaf.type.width > 32 else self.builder.zext(subleaf, self.i32)
-
-            # Define the result struct type: {i32, i32, i32, i32} for eax, ebx, ecx, edx
-            result_type = ir.LiteralStructType([self.i32, self.i32, self.i32, self.i32])
-
-            # CPUID inline asm:
-            # Input: eax = leaf, ecx = subleaf
-            # Output: eax, ebx, ecx, edx
-            # The asm string uses AT&T syntax (cpuid clobbers eax, ebx, ecx, edx)
-            asm_str = "cpuid"
-            # Constraints: ={eax},={ebx},={ecx},={edx},{eax},{ecx}
-            # Output: eax, ebx, ecx, edx (in order)
-            # Input: eax (leaf), ecx (subleaf)
-            constraints = "={ax},={bx},={cx},={dx},{ax},{cx},~{dirflag},~{fpsr},~{flags}"
-
-            asm_func_ty = ir.FunctionType(result_type, [self.i32, self.i32])
-            asm_ir = ir.InlineAsm(asm_func_ty, asm_str, constraints, side_effect=True)
-            result = self.builder.call(asm_ir, [leaf, subleaf])
-
-            # Extract and store each register value
-            eax = self.builder.extract_value(result, 0)
-            ebx = self.builder.extract_value(result, 1)
-            ecx = self.builder.extract_value(result, 2)
-            edx = self.builder.extract_value(result, 3)
-
-            self.builder.store(eax, out_eax)
-            self.builder.store(ebx, out_ebx)
-            self.builder.store(ecx, out_ecx)
-            self.builder.store(edx, out_edx)
-
-            # Return void (no value)
-            return ir.Constant(self.i32, 0)
 
         elif fname == 'xgetbv':
             # xgetbv(xcr: u32) -> u64
@@ -13877,70 +13797,6 @@ class LLVMEmitter:
             for _ in range(levels - self_levels):
                 receiver = self.builder.load(receiver)
         return receiver
-
-    def _emit_generic_syscall(self, fname: str, args: List[rast.Expr]) -> ir.Value:
-        """Emit a generic syscallN(num, arg1, ...) call.
-
-        syscall1(num, arg1) - 1 arg syscall
-        syscall2(num, arg1, arg2) - 2 arg syscall
-        syscall3(num, arg1, arg2, arg3) - 3 arg syscall
-        syscall4(num, arg1, arg2, arg3, arg4) - 4 arg syscall
-        """
-        # Emit all arguments
-        arg_vals = [self._emit_expr(arg) for arg in args]
-
-        # First arg is the syscall number
-        if not arg_vals:
-            raise ValueError(f"{fname} requires at least a syscall number")
-
-        syscall_num = self._to_i64(arg_vals[0])
-
-        # Remaining args are the syscall arguments
-        syscall_args = [self._to_i64(v) for v in arg_vals[1:]]
-
-        if len(syscall_args) == 0:
-            # syscall with no args (just the number)
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64])
-            asm_args = [syscall_num]
-        elif len(syscall_args) == 1:
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64])
-            asm_args = [syscall_num, syscall_args[0]]
-        elif len(syscall_args) == 2:
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},{rsi},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64, self.i64])
-            asm_args = [syscall_num, syscall_args[0], syscall_args[1]]
-        elif len(syscall_args) == 3:
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64, self.i64, self.i64])
-            asm_args = [syscall_num] + syscall_args
-        elif len(syscall_args) == 4:
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},{rsi},{rdx},{r10},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64, self.i64, self.i64, self.i64])
-            asm_args = [syscall_num] + syscall_args
-        elif len(syscall_args) == 5:
-            # 5 args: rdi, rsi, rdx, r10, r8
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64, self.i64, self.i64, self.i64, self.i64])
-            asm_args = [syscall_num] + syscall_args
-        elif len(syscall_args) == 6:
-            # 6 args: rdi, rsi, rdx, r10, r8, r9 (e.g., mmap)
-            asm_str = "syscall"
-            constraints = "=&{rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},~{memory}"
-            asm_func_ty = ir.FunctionType(self.i64, [self.i64, self.i64, self.i64, self.i64, self.i64, self.i64, self.i64])
-            asm_args = [syscall_num] + syscall_args
-        else:
-            raise ValueError(f"Syscall with {len(syscall_args)} args not supported (max 6)")
-
-        asm_ir = ir.InlineAsm(asm_func_ty, asm_str, constraints, side_effect=True)
-        return self.builder.call(asm_ir, asm_args)
 
     def _emit_write_syscall(self, fd: ir.Value, buf: ir.Value, count: ir.Value) -> ir.Value:
         """Emit a write syscall (fd, buf, count) -> bytes written."""

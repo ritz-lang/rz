@@ -84,7 +84,7 @@ class TestNameResolverFalsePositives:
 
     @pytest.mark.parametrize("fn", [
         "aesenc", "aesdec", "aesimc", "aesenclast", "aesdeclast",
-        "aeskeygenassist", "simd_add", "simd_xor", "simd_rotl", "cpuid_raw",
+        "aeskeygenassist", "simd_add", "simd_xor", "simd_rotl",
         "xgetbv", "sha256rnds2", "sha256msg1", "sha256msg2"])
     def test_emitter_intrinsics(self, fn):
         assert names(f"fn f() -> i32\n    {fn}(1, 2)\n    0\n") == []

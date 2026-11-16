@@ -16,6 +16,10 @@ words (AGAST #3255; ritz1 used to leave it to the no-libc link).
 Syscalls are reached through ritzlib.sys (`sys_write`, `sys_read`, `sys_open`,
 `sys_open3`, `sys_close`, `sys_nanosleep`) or `syscallN`.
 
+`syscallN`, `__syscallN` and `cpuid_raw` went the same way (AGAST #3397):
+`syscall0..6` are `asm` fns in ritzlib.sys and `cpuid_raw` one in
+cryptosec.cpuid, so with no declaration in scope each is an unknown function.
+
 Each program returns 42 when correct and a distinct small code naming the
 failed check otherwise.
 """
@@ -121,6 +125,8 @@ pub fn main() -> i32
     var ts: [2]i64 = [0, 1000]
     if sys_nanosleep(@ts[0], null) != 0
         return 6
+    if syscall0(39) <= 0
+        return 8
     if sys_write(1, c"ok\\n", 3) != 3
         return 7
     42
@@ -165,40 +171,17 @@ def test_user_fn_of_a_former_builtin_name_is_called(request, tmp_path, compiler,
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", ["write", "frob"])
+@pytest.mark.parametrize("name", ["write", "frob", "syscall3", "__syscall3", "cpuid_raw"])
 def test_undeclared_fn_is_refused_at_the_call(request, tmp_path, compiler, name):
     """AGAST #3255: ritz1 accepted the call, declared `@write(...)` and left
-    it to the link, whose "undefined reference" names no line."""
+    it to the link, whose "undefined reference" names no line.  #3397: the
+    names the compilers used to lower themselves are no exception."""
     proc, ll = _compile(request, compiler, tmp_path, UNDECLARED.replace("write(", f"{name}("))
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out[-2000:]
     assert re.search(rf"unit\.ritz:4:5: Unknown function: {name}$", out, re.M), out[-2000:]
     assert "Traceback" not in out, out[-2000:]
     assert not ll.exists()
-
-
-# The undeclared names every compiler answers itself, which #3255's refusal
-# must not reach: the syscallN builtins and cpuid_raw.  pid 39 is getpid.
-INTRINSICS = """\
-pub fn main() -> i32
-    var a: i32 = 0
-    var b: i32 = 0
-    var c: i32 = 0
-    var d: i32 = 0
-    cpuid_raw(0, 0, @a, @b, @c, @d)
-    if syscall0(39) <= 0 or __syscall0(39) <= 0
-        return 1
-    42
-"""
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_builtin_names_need_no_declaration(request, tmp_path, compiler):
-    proc, ll = _compile(request, compiler, tmp_path, INTRINSICS)
-    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
-    link, exe = _link(compiler, tmp_path, ll)
-    assert link.returncode == 0, link.stderr[-2000:]
-    assert subprocess.run([str(exe)], capture_output=True, timeout=60).returncode == EXPECTED
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

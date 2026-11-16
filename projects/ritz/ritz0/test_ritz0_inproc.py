@@ -21,6 +21,7 @@ import pytest
 
 import ritz0_inproc
 from ritz0_inproc import RITZ0_PY, RITZ_ROOT, ritz0_oracle, run_ritz0
+from test_sys_syscall_asm import LOCAL_SYSCALL3
 
 pytestmark = pytest.mark.integration
 
@@ -32,8 +33,8 @@ pub fn main() -> i32
 """
 
 # The oracle links one module, like the test_ritz1_* files it serves: no
-# ritzlib import, output through the `syscall3` builtin (write(2) is 1).
-PRINTING_PROGRAM = """\
+# ritzlib import, output through a local `syscall3` (write(2) is 1).
+PRINTING_PROGRAM = LOCAL_SYSCALL3 + """\
 pub fn main() -> i32
     syscall3(1, 1, c"hello oracle\\n" as i64, 13)
     5

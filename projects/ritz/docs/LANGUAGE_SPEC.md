@@ -1377,7 +1377,7 @@ fn mul(a: i32, b: i32) -> i32
 ### 5.3 External Functions
 
 ```ritz
-extern fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64
+extern fn memcpy(dst: *u8, src: *u8, n: i64) -> *u8
 ```
 
 `extern fn` is a C-style symbol: top level only, no `pub`, no attributes.
