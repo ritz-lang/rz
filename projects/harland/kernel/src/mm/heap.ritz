@@ -112,6 +112,53 @@ fn heap_expand(pages: u64) -> i32
 # ============================================================================
 
 
+# Point the free list (or free block `prev`, when non-zero) at `next`.
+fn heap_link_after(prev: u64, next: u64) -> i32
+    if prev == 0
+        heap_free_list = next
+    else
+        let prev_block: *HeapBlock = prev as *HeapBlock
+        (*prev_block).next = next
+    return 0
+
+# Allocate `total_size` bytes from free block `curr` (preceded in the free list
+# by `prev`, 0 if it is the head): split off the remainder as a new free block
+# when it is big enough, unlink, mark allocated, and return its data pointer.
+fn heap_take_block(prev: u64, curr: u64, total_size: u64) -> *u8
+    let block: *HeapBlock = curr as *HeapBlock
+    let remaining: u64 = (*block).size - total_size
+
+    if remaining >= HEAP_MIN_BLOCK
+        # Split the block
+        let new_block_addr: u64 = curr + total_size
+
+        # Write directly using pointer arithmetic
+        let new_next_ptr: *u64 = new_block_addr as *u64
+        let new_size_ptr: *u64 = (new_block_addr + 8) as *u64
+        let new_magic_ptr: *u64 = (new_block_addr + 16) as *u64
+        let new_flags_ptr: *u64 = (new_block_addr + 24) as *u64
+
+        *new_next_ptr = (*block).next
+        *new_size_ptr = remaining
+        *new_magic_ptr = HEAP_BLOCK_MAGIC
+        *new_flags_ptr = 1
+
+        (*block).size = total_size
+        (*block).next = new_block_addr
+
+        # Update free list
+        heap_link_after(prev, new_block_addr)
+    else
+        # Use entire block
+        heap_link_after(prev, (*block).next)
+
+    # Mark as allocated
+    (*block).flags = 0
+    (*block).next = 0
+
+    # Return pointer to data (after header)
+    return (curr + 32) as *u8
+
 # Allocate memory from the heap
 pub fn kalloc(size: u64) -> *u8
     if heap_initialized == 0
@@ -140,49 +187,9 @@ pub fn kalloc(size: u64) -> *u8
             prints("\n" as StrView)
             return 0 as *u8
 
-        if ((*block).flags & 1) != 0
-            if (*block).size >= total_size
-                # Found a suitable block
-                let remaining: u64 = (*block).size - total_size
-
-                if remaining >= HEAP_MIN_BLOCK
-                    # Split the block
-                    let new_block_addr: u64 = curr + total_size
-
-                    # Write directly using pointer arithmetic
-                    let new_next_ptr: *u64 = new_block_addr as *u64
-                    let new_size_ptr: *u64 = (new_block_addr + 8) as *u64
-                    let new_magic_ptr: *u64 = (new_block_addr + 16) as *u64
-                    let new_flags_ptr: *u64 = (new_block_addr + 24) as *u64
-
-                    *new_next_ptr = (*block).next
-                    *new_size_ptr = remaining
-                    *new_magic_ptr = HEAP_BLOCK_MAGIC
-                    *new_flags_ptr = 1
-
-                    (*block).size = total_size
-                    (*block).next = new_block_addr
-
-                    # Update free list
-                    if prev == 0
-                        heap_free_list = new_block_addr
-                    else
-                        let prev_block: *HeapBlock = prev as *HeapBlock
-                        (*prev_block).next = new_block_addr
-                else
-                    # Use entire block
-                    if prev == 0
-                        heap_free_list = (*block).next
-                    else
-                        let prev_block: *HeapBlock = prev as *HeapBlock
-                        (*prev_block).next = (*block).next
-
-                # Mark as allocated
-                (*block).flags = 0
-                (*block).next = 0
-
-                # Return pointer to data (after header)
-                return (curr + 32) as *u8
+        if ((*block).flags & 1) != 0 and (*block).size >= total_size
+            # Found a suitable block
+            return heap_take_block(prev, curr, total_size)
 
         prev = curr
         curr = (*block).next

@@ -230,35 +230,38 @@ fn dhcp_send_request() -> i32
 # Handle DHCP Response
 # ============================================================================
 
-pub fn dhcp_handle_packet(dhcp_data: *u8, dhcp_len: u32)
-    if dhcp_len < DHCP_HEADER_SIZE
+# Big-endian u32 at p
+fn dhcp_be32(p: *u8) -> u32
+    let b0: u32 = (*(p + 0) as u32) << 24
+    let b1: u32 = (*(p + 1) as u32) << 16
+    let b2: u32 = (*(p + 2) as u32) << 8
+    let b3: u32 = *(p + 3) as u32
+    return b0 | b1 | b2 | b3
+
+# Copy a 4-byte address (IPv4 / netmask) from src to dst
+fn dhcp_copy4(dst: *u8, src: *u8)
+    var j: i64 = 0
+    while j < 4
+        *(dst + j) = *(src + j)
+        j = j + 1
+
+# Record one 4-byte option we care about (subnet mask, router, DNS, server id).
+# Other options, and ones shorter than 4 bytes, are ignored.
+fn dhcp_store_addr_option(opt: u8, opt_len: u8, opt_data: *u8)
+    if opt_len < 4
         return
+    if opt == 1
+        dhcp_copy4(@dhcp_offered_netmask[0], opt_data)    # Subnet Mask
+    else if opt == 3
+        dhcp_copy4(@dhcp_offered_gateway[0], opt_data)    # Router
+    else if opt == 6
+        dhcp_copy4(@dhcp_offered_dns[0], opt_data)        # DNS Server
+    else if opt == 54
+        dhcp_copy4(@dhcp_offered_server[0], opt_data)     # Server Identifier
 
-    # Check magic cookie at offset 236
-    if dhcp_len < 240
-        return
-
-    let b0: u32 = (*(dhcp_data + 236) as u32) << 24
-    let b1: u32 = (*(dhcp_data + 237) as u32) << 16
-    let b2: u32 = (*(dhcp_data + 238) as u32) << 8
-    let b3: u32 = *(dhcp_data + 239) as u32
-    let magic: u32 = b0 | b1 | b2 | b3
-    if magic != DHCP_MAGIC
-        return
-
-    # Check transaction ID
-    let x0: u32 = (*(dhcp_data + 4) as u32) << 24
-    let x1: u32 = (*(dhcp_data + 5) as u32) << 16
-    let x2: u32 = (*(dhcp_data + 6) as u32) << 8
-    let x3: u32 = *(dhcp_data + 7) as u32
-    let xid: u32 = x0 | x1 | x2 | x3
-    if xid != dhcp_xid
-        return
-
-    # Get offered IP (yiaddr at offset 16)
-    let offered_ip: *u8 = dhcp_data + 16
-
-    # Parse options to find message type and other info
+# Walk the options (from offset 240), storing the address options.
+# Returns the DHCP message type (option 53), or 0 if there is none.
+fn dhcp_parse_options(dhcp_data: *u8, dhcp_len: u32) -> u8
     var msg_type: u8 = 0
     var i: u32 = 240
     while i < dhcp_len
@@ -275,79 +278,74 @@ pub fn dhcp_handle_packet(dhcp_data: *u8, dhcp_len: u32)
         if opt == 53 and opt_len >= 1
             # DHCP Message Type
             msg_type = *opt_data
-
-        else if opt == 1 and opt_len >= 4
-            # Subnet Mask
-            var j: i32 = 0
-            while j < 4
-                dhcp_offered_netmask[j] = *(opt_data + j as i64)
-                j = j + 1
-
-        else if opt == 3 and opt_len >= 4
-            # Router
-            var j: i32 = 0
-            while j < 4
-                dhcp_offered_gateway[j] = *(opt_data + j as i64)
-                j = j + 1
-
-        else if opt == 6 and opt_len >= 4
-            # DNS Server
-            var j: i32 = 0
-            while j < 4
-                dhcp_offered_dns[j] = *(opt_data + j as i64)
-                j = j + 1
-
-        else if opt == 54 and opt_len >= 4
-            # Server Identifier
-            var j: i32 = 0
-            while j < 4
-                dhcp_offered_server[j] = *(opt_data + j as i64)
-                j = j + 1
+        else
+            dhcp_store_addr_option(opt, opt_len, opt_data)
 
         i = i + 2 + opt_len as u32
+    return msg_type
+
+# OFFER (after DISCOVER): save the offered IP (yiaddr) and send REQUEST
+fn dhcp_on_offer(offered_ip: *u8)
+    dhcp_copy4(@dhcp_offered_ip[0], offered_ip)
+
+    prints("[dhcp] OFFER: ")
+    dhcp_print_ip(@dhcp_offered_ip[0])
+    prints("\n")
+
+    # Send REQUEST
+    dhcp_send_request()
+
+# ACK (after REQUEST): configure the IP stack
+fn dhcp_on_ack()
+    prints("[dhcp] ACK: ")
+    dhcp_print_ip(@dhcp_offered_ip[0])
+    prints("\n")
+
+    # Set default netmask if not provided
+    if dhcp_offered_netmask[0] == 0 and dhcp_offered_netmask[1] == 0
+        dhcp_offered_netmask[0] = 255
+        dhcp_offered_netmask[1] = 255
+        dhcp_offered_netmask[2] = 255
+        dhcp_offered_netmask[3] = 0
+
+    # Set default gateway if not provided (QEMU SLIRP default)
+    if dhcp_offered_gateway[0] == 0 and dhcp_offered_gateway[1] == 0
+        dhcp_offered_gateway[0] = 10
+        dhcp_offered_gateway[1] = 0
+        dhcp_offered_gateway[2] = 2
+        dhcp_offered_gateway[3] = 2
+
+    # Configure IP layer
+    ip_set_config(@dhcp_offered_ip[0], @dhcp_offered_gateway[0], @dhcp_offered_netmask[0])
+
+    if dhcp_offered_dns[0] != 0 or dhcp_offered_dns[1] != 0
+        ip_set_dns(@dhcp_offered_dns[0])
+
+    dhcp_state = 3
+    prints("[dhcp] Configured!\n")
+
+pub fn dhcp_handle_packet(dhcp_data: *u8, dhcp_len: u32)
+    if dhcp_len < DHCP_HEADER_SIZE
+        return
+
+    # Need the magic cookie at offset 236
+    if dhcp_len < 240
+        return
+    if dhcp_be32(dhcp_data + 236) != DHCP_MAGIC
+        return
+
+    # Check transaction ID
+    if dhcp_be32(dhcp_data + 4) != dhcp_xid
+        return
+
+    # Parse options to find message type and other info
+    let msg_type: u8 = dhcp_parse_options(dhcp_data, dhcp_len)
 
     if msg_type == DHCP_OFFER and dhcp_state == 1
-        # Save offered IP
-        var j: i32 = 0
-        while j < 4
-            dhcp_offered_ip[j] = *(offered_ip + j as i64)
-            j = j + 1
-
-        prints("[dhcp] OFFER: ")
-        dhcp_print_ip(@dhcp_offered_ip[0])
-        prints("\n")
-
-        # Send REQUEST
-        dhcp_send_request()
-
+        # Offered IP is yiaddr, at offset 16
+        dhcp_on_offer(dhcp_data + 16)
     else if msg_type == DHCP_ACK and dhcp_state == 2
-        # Configure the IP stack
-        prints("[dhcp] ACK: ")
-        dhcp_print_ip(@dhcp_offered_ip[0])
-        prints("\n")
-
-        # Set default netmask if not provided
-        if dhcp_offered_netmask[0] == 0 and dhcp_offered_netmask[1] == 0
-            dhcp_offered_netmask[0] = 255
-            dhcp_offered_netmask[1] = 255
-            dhcp_offered_netmask[2] = 255
-            dhcp_offered_netmask[3] = 0
-
-        # Set default gateway if not provided (QEMU SLIRP default)
-        if dhcp_offered_gateway[0] == 0 and dhcp_offered_gateway[1] == 0
-            dhcp_offered_gateway[0] = 10
-            dhcp_offered_gateway[1] = 0
-            dhcp_offered_gateway[2] = 2
-            dhcp_offered_gateway[3] = 2
-
-        # Configure IP layer
-        ip_set_config(@dhcp_offered_ip[0], @dhcp_offered_gateway[0], @dhcp_offered_netmask[0])
-
-        if dhcp_offered_dns[0] != 0 or dhcp_offered_dns[1] != 0
-            ip_set_dns(@dhcp_offered_dns[0])
-
-        dhcp_state = 3
-        prints("[dhcp] Configured!\n")
+        dhcp_on_ack()
 
 # ============================================================================
 # State Query

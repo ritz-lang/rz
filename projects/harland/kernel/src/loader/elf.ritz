@@ -192,6 +192,115 @@ fn elf_flags_to_pte(p_flags: u32) -> u64
 
     return pte_flags
 
+# Allocate a fresh physical page and zero it (through the physmap).
+# Returns 0 if the PMM is out of pages.
+fn elf_alloc_zeroed_page() -> u64
+    let page_phys: u64 = pmm_alloc_page()
+    if page_phys == 0
+        return 0
+    var zero_ptr: *u8 = phys_to_virt(page_phys) as *u8
+    var zero_i: u64 = 0
+    while zero_i < PAGE_SIZE
+        *(zero_ptr + zero_i as i64) = 0
+        zero_i = zero_i + 1
+    return page_phys
+
+# Copy the part of a segment's file data that lands in the page at page_vaddr.
+#   copy_ptr: the page, through the physmap
+#   seg_vaddr: the segment's (load_base-adjusted) virtual address
+#   src / filesz: the segment's file bytes in the ELF image
+fn elf_copy_to_page(copy_ptr: *u8, page_vaddr: u64, seg_vaddr: u64, src: *u8, filesz: u64)
+    if seg_vaddr > page_vaddr
+        # Segment starts partway into this page: copy starting at offset
+        let offset: u64 = seg_vaddr - page_vaddr
+        var copy_i: u64 = 0
+        while copy_i < filesz and (offset + copy_i) < PAGE_SIZE
+            *(copy_ptr + (offset + copy_i) as i64) = *(src + copy_i as i64)
+            copy_i = copy_i + 1
+        return
+
+    # Segment started before or at this page: skip what earlier pages took
+    let already_copied: u64 = page_vaddr - seg_vaddr
+    if already_copied >= filesz
+        return
+    let remaining: u64 = filesz - already_copied
+    var copy_i: u64 = 0
+    while copy_i < remaining and copy_i < PAGE_SIZE
+        *(copy_ptr + copy_i as i64) = *(src + (already_copied + copy_i) as i64)
+        copy_i = copy_i + 1
+
+# Load one page of a PT_LOAD segment at page_vaddr: allocate it (or reuse the
+# page an earlier segment already allocated there), copy its share of the
+# file data, and map it (or upgrade the existing mapping to writable).
+fn elf_load_page(page_vaddr: u64, seg_vaddr: u64, src: *u8, filesz: u64, pte_flags: u64) -> ElfStatus
+    # For user ELF segments, we always need to allocate NEW physical
+    # pages and map them with USER permissions. The identity mapping
+    # of low memory is kernel-only and would cause page faults.
+    #
+    # Check if WE already mapped this page (with USER bit).
+    # For the ELF loader, we track pages we've allocated by checking
+    # if the physical address differs from the virtual address.
+    # Identity mapping has phys == virt, our allocations have phys > 32MB
+    # (where PMM allocates from available RAM)
+    let existing_phys: u64 = vmm_virt_to_phys(page_vaddr)
+    # If physical != virtual, we already mapped it (not identity mapped).
+    # Also check it's a reasonable physical address (our allocations
+    # come from PMM which allocates from free RAM, typically above kernel)
+    let already_mapped: bool = existing_phys != page_vaddr and existing_phys >= 0x200000
+
+    var page_phys: u64 = existing_phys
+    if not already_mapped
+        page_phys = elf_alloc_zeroed_page()
+        if page_phys == 0
+            prints("[elf] Failed to allocate page!\n")
+            return ElfStatus.AllocFailed
+
+    # Copy data to this page (through the physmap)
+    elf_copy_to_page(phys_to_virt(page_phys) as *u8, page_vaddr, seg_vaddr, src, filesz)
+
+    if not already_mapped
+        if vmm_map_page(page_vaddr, page_phys, pte_flags) != 0
+            prints("[elf] Failed to map page at 0x")
+            serial_print_hex(page_vaddr)
+            prints("!\n")
+            pmm_free_page(page_phys)
+            return ElfStatus.MapFailed
+    else if (pte_flags & PTE_WRITABLE) != 0
+        # Page was already mapped by an earlier segment but we need to upgrade
+        # permissions (e.g., a read-only segment followed by a writable
+        # segment sharing the same page): use the most permissive combination
+        if vmm_map_page(page_vaddr, page_phys, pte_flags) != 0
+            prints("[elf] Failed to upgrade page permissions at 0x")
+            serial_print_hex(page_vaddr)
+            prints("!\n")
+            return ElfStatus.MapFailed
+
+    return ElfStatus.Ok
+
+# Allocate, map, and copy one PT_LOAD segment, page by page.
+# We copy data through the physical addresses (the physmap) since the
+# virtual addresses may be outside the identity-mapped region.
+# The rest of each page (from p_filesz to p_memsz) is already zeroed.
+fn elf_load_segment(elf_data: *u8, phdr: *Elf64Phdr, seg_vaddr: u64) -> ElfStatus
+    # Calculate number of pages needed
+    let seg_start_page: u64 = seg_vaddr & 0xFFFFFFFFFFFFF000  # Page-align down
+    let seg_end: u64 = seg_vaddr + (*phdr).p_memsz
+    let seg_end_page: u64 = (seg_end + 0xFFF) & 0xFFFFFFFFFFFFF000  # Page-align up
+    let num_pages: u64 = (seg_end_page - seg_start_page) / PAGE_SIZE
+
+    # Get page table flags for this segment
+    let pte_flags: u64 = elf_flags_to_pte((*phdr).p_flags)
+    let src: *u8 = elf_data + (*phdr).p_offset as i64
+
+    var page_offset: u64 = 0
+    while page_offset < num_pages * PAGE_SIZE
+        let status: ElfStatus = elf_load_page(seg_start_page + page_offset, seg_vaddr, src, (*phdr).p_filesz, pte_flags)
+        if status != ElfStatus.Ok
+            return status
+        page_offset = page_offset + PAGE_SIZE
+
+    return ElfStatus.Ok
+
 # Load an ELF executable from memory
 #
 # Parameters:
@@ -216,13 +325,12 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
         result.error = validate_result
         return result
 
-    # Calculate adjusted entry point
-    # For PIE executables (ET_DYN), add load_base offset
-    # For static executables (ET_EXEC), use as-is
+    # For PIE executables (ET_DYN), add the load_base offset to the entry
+    # point and every segment; static executables (ET_EXEC) load as-is
+    var bias: u64 = 0
     if (*ehdr).e_type == ET_DYN and load_base != 0
-        result.entry_point = (*ehdr).e_entry + load_base
-    else
-        result.entry_point = (*ehdr).e_entry
+        bias = load_base
+    result.entry_point = (*ehdr).e_entry + bias
 
     # Process program headers
     let phdr_base: *u8 = elf_data + (*ehdr).e_phoff as i64
@@ -233,124 +341,10 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
 
         # Only process PT_LOAD segments
         if (*phdr).p_type == PT_LOAD
-            # Calculate virtual address (apply load_base for PIE)
-            var seg_vaddr: u64 = (*phdr).p_vaddr
-            if (*ehdr).e_type == ET_DYN and load_base != 0
-                seg_vaddr = seg_vaddr + load_base
-
-            # Calculate number of pages needed
-            let seg_start_page: u64 = seg_vaddr & 0xFFFFFFFFFFFFF000  # Page-align down
-            let seg_end: u64 = seg_vaddr + (*phdr).p_memsz
-            let seg_end_page: u64 = (seg_end + 0xFFF) & 0xFFFFFFFFFFFFF000  # Page-align up
-            let num_pages: u64 = (seg_end_page - seg_start_page) / PAGE_SIZE
-
-            # Get page table flags for this segment
-            let pte_flags: u64 = elf_flags_to_pte((*phdr).p_flags)
-
-            # Allocate, map, and copy data for this segment
-            # We need to copy data through the physical addresses (identity-mapped)
-            # since the virtual addresses may be outside the identity-mapped region
-            let src: *u8 = elf_data + (*phdr).p_offset as i64
-            var bytes_copied: u64 = 0
-            var page_offset: u64 = 0
-
-            while page_offset < num_pages * PAGE_SIZE
-                let page_vaddr: u64 = seg_start_page + page_offset
-
-                # For user ELF segments, we always need to allocate NEW physical
-                # pages and map them with USER permissions. The identity mapping
-                # of low memory is kernel-only and would cause page faults.
-                #
-                # Check if we already allocated this page for a previous segment
-                var page_phys: u64 = 0
-                var need_map: bool = true
-                var need_upgrade: bool = false
-
-                # Check if WE already mapped this page (with USER bit)
-                # For the ELF loader, we track pages we've allocated by checking
-                # if the physical address differs from the virtual address.
-                # Identity mapping has phys == virt, our allocations have phys > 32MB
-                # (where PMM allocates from available RAM)
-                let existing_phys: u64 = vmm_virt_to_phys(page_vaddr)
-                # If physical != virtual, we already mapped it (not identity mapped)
-                # Also check it's a reasonable physical address (our allocations
-                # come from PMM which allocates from free RAM, typically above kernel)
-                if existing_phys != page_vaddr and existing_phys >= 0x200000
-                    # We already allocated and mapped this page for a previous segment
-                    page_phys = existing_phys
-                    need_map = false
-                    # Check if we need to upgrade permissions (e.g., R -> RW)
-                    # Multiple segments can share a page with different permissions;
-                    # we need to use the most permissive combination
-                    if (pte_flags & PTE_WRITABLE) != 0
-                        need_upgrade = true
-                else
-                    # Need to allocate a new physical page
-                    page_phys = pmm_alloc_page()
-                    if page_phys == 0
-                        prints("[elf] Failed to allocate page!\n")
-                        result.error = ElfStatus.AllocFailed
-                        return result
-
-                    # Zero the new page (through the physmap)
-                    var zero_ptr: *u8 = phys_to_virt(page_phys) as *u8
-                    var zero_i: u64 = 0
-                    while zero_i < PAGE_SIZE
-                        *(zero_ptr + zero_i as i64) = 0
-                        zero_i = zero_i + 1
-
-                # Copy data to this page (through the physmap)
-                var copy_ptr: *u8 = phys_to_virt(page_phys) as *u8
-
-                # Calculate where in the page this segment's data should go
-                let page_base: u64 = page_vaddr
-                let seg_start_in_page: u64 = 0
-                if seg_vaddr > page_base
-                    # Segment starts partway into this page
-                    let offset: u64 = seg_vaddr - page_base
-                    if offset < PAGE_SIZE
-                        # Copy starting at offset
-                        var copy_i: u64 = 0
-                        while copy_i < (*phdr).p_filesz and (offset + copy_i) < PAGE_SIZE
-                            *(copy_ptr + (offset + copy_i) as i64) = *(src + copy_i as i64)
-                            copy_i = copy_i + 1
-                        bytes_copied = copy_i
-                else
-                    # Segment started before or at this page
-                    # Calculate how many bytes we've already copied
-                    let already_copied: u64 = page_vaddr - seg_vaddr
-                    if already_copied < (*phdr).p_filesz
-                        var copy_i: u64 = 0
-                        let remaining: u64 = (*phdr).p_filesz - already_copied
-                        while copy_i < remaining and copy_i < PAGE_SIZE
-                            *(copy_ptr + copy_i as i64) = *(src + (already_copied + copy_i) as i64)
-                            copy_i = copy_i + 1
-                        bytes_copied = already_copied + copy_i
-
-                # Map the page if needed
-                if need_map
-                    let map_result: i32 = vmm_map_page(page_vaddr, page_phys, pte_flags)
-                    if map_result != 0
-                        prints("[elf] Failed to map page at 0x")
-                        serial_print_hex(page_vaddr)
-                        prints("!\n")
-                        pmm_free_page(page_phys)
-                        result.error = ElfStatus.MapFailed
-                        return result
-                else if need_upgrade
-                    # Page was already mapped but we need to upgrade permissions
-                    # (e.g., a read-only segment followed by a writable segment sharing the same page)
-                    let map_result: i32 = vmm_map_page(page_vaddr, page_phys, pte_flags)
-                    if map_result != 0
-                        prints("[elf] Failed to upgrade page permissions at 0x")
-                        serial_print_hex(page_vaddr)
-                        prints("!\n")
-                        result.error = ElfStatus.MapFailed
-                        return result
-
-                page_offset = page_offset + PAGE_SIZE
-
-            # The rest (from p_filesz to p_memsz) is already zeroed
+            let status: ElfStatus = elf_load_segment(elf_data, phdr, (*phdr).p_vaddr + bias)
+            if status != ElfStatus.Ok
+                result.error = status
+                return result
 
         phdr_idx = phdr_idx + 1
 
