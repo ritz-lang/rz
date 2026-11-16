@@ -18,21 +18,21 @@ Around that rule, the two forms it isn't:
 Arrays behind a pointer are #2330 and other bases (`h.r[i]`, `g[i]`, `f()[i]`) are
 #2329.  A pointer as the pointee isn't indexable: one level, so `q: @*[3]i32` wants
 `(*q)[1]`, which #2331 lowers.
+
+AGAST #3519: the cases are one table (test_table_rows.py), not a parametrised
+matrix.  Each `@case` below is what was a test function, and each of its rows
+has the id that test's case had, less the compiler: `a_read_runs_right[Span-add-pointer]`
+was `test_a_read_runs_right[Span-add-pointer-ritz0]`.  `test_every_row` checks
+a chunk of rows per compiler and names each row that fails.
 """
 
 import pytest
 
 import batching
+import test_table_rows as table_rows
 import test_ritz1_for_header as for_header
+from test_table_rows import Refused, Run, case
 from test_ritz1_for_header import _new
-
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = pytest.mark.batched
-
-compile_with = for_header.compile_with
-run_with = for_header.run_with
-
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 # The pointer's spelling and the operator that makes one.
 KINDS = {"pointer": ("*", "@"), "reference": ("@", "@"), "mut_reference": ("@&", "@&")}
@@ -91,6 +91,20 @@ def _writes(spelled, ty, setup, addr, body, back):
     return _program(spelled, ty, setup, addr, body + "    return 0\n", f"    return {back}\n")
 
 
+def _refused(compile_with, compiler, name, program, message):
+    """For the files that share this one's HEADER: `program` is refused, saying `message`."""
+    batch = getattr(compile_with, "batch_compile", None)
+    got = batching.refused(compiler, program, batch) if batch else None  # AGAST #2806
+    if got is not None:
+        out = got[0]  # the batch's diagnostics inside this row's own lines
+    else:
+        comp, _, _ = compile_with(compiler, name, program)
+        assert comp.returncode != 0, f"{compiler} took {name}"
+        out = comp.stdout + comp.stderr
+    assert message in out, out[-1000:]
+    assert "main.ritz:" in out, f"unlocated: {out[-1000:]}"
+
+
 # Each returns element 1, or the sum `add` wants.  `{e}` is the element type.
 SCALAR_READS = {
     "read": "    return p[1] as i32\n",
@@ -109,38 +123,25 @@ SCALAR_WRITES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("op", sorted(SCALAR_READS))
-@pytest.mark.parametrize("box", sorted(SCALARS))
-def test_a_read_runs_right(run_with, box, op, kind, compiler):
+@case(box=sorted(SCALARS), op=sorted(SCALAR_READS), kind=sorted(KINDS))
+def a_read_runs_right(box, op, kind):
     ty, elem, setup, _ = SCALARS[box]
     spelled, addr = KINDS[kind]
-    want = 30 if op == "add" else 20
     body = SCALAR_READS[op].replace("{e}", elem)
-    assert run_with(compiler, op, _reads(spelled, ty, setup, addr, body)) == want
+    return Run(_reads(spelled, ty, setup, addr, body), 30 if op == "add" else 20)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("op", sorted(SCALAR_WRITES))
-@pytest.mark.parametrize("box", sorted(SCALARS))
-def test_a_write_lands_in_the_element(run_with, box, op, kind, compiler):
+@case(box=sorted(SCALARS), op=sorted(SCALAR_WRITES), kind=WRITABLE)
+def a_write_lands_in_the_element(box, op, kind):
     ty, elem, setup, back = SCALARS[box]
     spelled, addr = KINDS[kind]
     body, want = SCALAR_WRITES[op]
-    program = _writes(spelled, ty, setup, addr, body.replace("{e}", elem), back)
-    assert run_with(compiler, op, program) == want
+    return Run(_writes(spelled, ty, setup, addr, body.replace("{e}", elem), back), want)
 
 
 # Neighbours keep their values: a wrong stride or width writes past element 1.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("box", sorted(SCALARS))
-def test_a_store_leaves_the_neighbours_and_the_header(run_with, box, kind, compiler):
+@case(box=sorted(SCALARS), kind=WRITABLE)
+def a_store_leaves_the_neighbours_and_the_header(box, kind):
     ty, _, setup, _ = SCALARS[box]
     spelled, addr = KINDS[kind]
     first, last = {"Vec": ("*(v.data)", "*(v.data + 2)"),
@@ -148,8 +149,7 @@ def test_a_store_leaves_the_neighbours_and_the_header(run_with, box, kind, compi
                    "String": ("*(v.data.data) as i32", "*(v.data.data + 2) as i32")}[box]
     length = "v.data.len" if box == "String" else "v.len"
     after = f"    return {first} + {last} + {length} as i32\n"
-    assert run_with(compiler, "neighbours", _program(
-        spelled, ty, setup, addr, "    p[1] = 7\n    return 0\n", after)) == 43
+    return Run(_program(spelled, ty, setup, addr, "    p[1] = 7\n    return 0\n", after), 43)
 
 
 # Every position, for an element with a field.
@@ -170,27 +170,19 @@ STRUCT_WRITES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("op", sorted(STRUCT_READS))
-@pytest.mark.parametrize("box", sorted(STRUCTS))
-def test_a_field_of_an_element_reads(run_with, box, op, kind, compiler):
+@case(box=sorted(STRUCTS), op=sorted(STRUCT_READS), kind=sorted(KINDS))
+def a_field_of_an_element_reads(box, op, kind):
     ty, setup, _ = STRUCTS[box]
     spelled, addr = KINDS[kind]
-    assert run_with(compiler, op, _reads(spelled, ty, setup, addr, STRUCT_READS[op])) == 20
+    return Run(_reads(spelled, ty, setup, addr, STRUCT_READS[op]), 20)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("op", sorted(STRUCT_WRITES))
-@pytest.mark.parametrize("box", sorted(STRUCTS))
-def test_a_field_of_an_element_writes(run_with, box, op, kind, compiler):
+@case(box=sorted(STRUCTS), op=sorted(STRUCT_WRITES), kind=WRITABLE)
+def a_field_of_an_element_writes(box, op, kind):
     ty, setup, back = STRUCTS[box]
     spelled, addr = KINDS[kind]
     body, want = STRUCT_WRITES[op]
-    assert run_with(compiler, op, _writes(spelled, ty, setup, addr, body, back)) == want
+    return Run(_writes(spelled, ty, setup, addr, body, back), want)
 
 
 # §3.2: an `@T` on the way to the place refuses a write, at the statement or the `@&`.
@@ -207,38 +199,18 @@ SHARED_FIELD_REFUSALS = {
 }
 
 
-def _refused(compile_with, compiler, name, program, message):
-    batch = getattr(compile_with, "batch_compile", None)
-    got = batching.refused(compiler, program, batch) if batch else None  # AGAST #2806
-    if got is not None:
-        out = got[0]  # the batch's diagnostics inside this row's own lines
-    else:
-        comp, _, _ = compile_with(compiler, name, program)
-        assert comp.returncode != 0, f"{compiler} took {name}"
-        out = comp.stdout + comp.stderr
-    assert message in out, out[-1000:]
-    assert "main.ritz:" in out, f"unlocated: {out[-1000:]}"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("op", sorted(SHARED_REFUSALS))
-@pytest.mark.parametrize("box", sorted(SCALARS))
-def test_a_shared_reference_refuses_a_write(compile_with, box, op, compiler):
+@case(box=sorted(SCALARS), op=sorted(SHARED_REFUSALS))
+def a_shared_reference_refuses_a_write(box, op):
     ty, elem, setup, _ = SCALARS[box]
     body, message = SHARED_REFUSALS[op]
-    program = _reads("@", ty, setup, "@", body.replace("{e}", elem) + "    return 0\n")
-    _refused(compile_with, compiler, op, program, message)
+    return Refused(_reads("@", ty, setup, "@", body.replace("{e}", elem) + "    return 0\n"), message)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("op", sorted(SHARED_FIELD_REFUSALS))
-@pytest.mark.parametrize("box", sorted(STRUCTS))
-def test_a_shared_reference_refuses_a_field_write(compile_with, box, op, compiler):
+@case(box=sorted(STRUCTS), op=sorted(SHARED_FIELD_REFUSALS))
+def a_shared_reference_refuses_a_field_write(box, op):
     ty, setup, _ = STRUCTS[box]
     body, message = SHARED_FIELD_REFUSALS[op]
-    _refused(compile_with, compiler, op, _reads("@", ty, setup, "@", body + "    return 0\n"), message)
+    return Refused(_reads("@", ty, setup, "@", body + "    return 0\n"), message)
 
 
 # The element's own width, sign and float-ness, through every kind.  A Span over a
@@ -253,14 +225,11 @@ ELEMENTS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("ty", sorted(ELEMENTS))
-def test_every_element_type_at_its_own_width(run_with, ty, kind, compiler):
+@case(ty=sorted(ELEMENTS), kind=WRITABLE)
+def every_element_type_at_its_own_width(ty, kind):
     fill, other = ELEMENTS[ty]
     spelled, addr = KINDS[kind]
-    program = f"""\
+    return Run(f"""\
 {HEADER}fn get(p: {spelled}Span<{ty}>, i: i64) -> {ty}
     return p[i]
 
@@ -283,18 +252,14 @@ pub fn main() -> i32
     if get({addr}v, 1) != {other}
         return 4
     return 0
-"""
-    assert run_with(compiler, ty, program) == 0
+""", 0)
 
 
 # A float element straight into arithmetic and a comparison: its type picks the op.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("ty", ["f32", "f64"])
-def test_a_float_element_in_an_expression(run_with, ty, kind, compiler):
+@case(ty=["f32", "f64"], kind=sorted(KINDS))
+def a_float_element_in_an_expression(ty, kind):
     spelled, addr = KINDS[kind]
-    program = f"""\
+    return Run(f"""\
 {HEADER}fn f(p: {spelled}Span<{ty}>) -> i32
     if p[1] * 2.0 != 5.0
         return 1
@@ -311,8 +276,7 @@ pub fn main() -> i32
     a[1] = 2.5
     var v: Span<{ty}> = span_from_ptr<{ty}>(@a[0], 2)
     return f({addr}v)
-"""
-    assert run_with(compiler, "float", program) == 4
+""", 4)
 
 
 # A field's own type, through an element: width, sign, float-ness and pointer stride.
@@ -343,13 +307,10 @@ FIELD_READS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("name", sorted(FIELD_READS))
-def test_a_field_keeps_its_own_type(run_with, name, kind, compiler):
+@case(name=sorted(FIELD_READS), kind=sorted(KINDS))
+def a_field_keeps_its_own_type(name, kind):
     spelled, addr = KINDS[kind]
-    program = f"""\
+    return Run(f"""\
 {HEADER}{FIELDS}fn f(p: {spelled}Span<W>) -> i32
 {FIELD_READS[name]}
 pub fn main() -> i32
@@ -362,21 +323,17 @@ pub fn main() -> i32
     a[1].k = K.Blue
     var v: Span<W> = span_from_ptr<W>(@a[0], 2)
     return f({addr}v)
-"""
-    assert run_with(compiler, name, program) == 0
+""", 0)
 
 
 # A byte above 127 keeps its value when it widens: `*(p + i)`'s sign, not i8's.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("ty", ["Vec<u8>", "String"])
-def test_an_unsigned_byte_widens_without_its_sign(run_with, ty, kind, compiler):
+@case(ty=["Vec<u8>", "String"], kind=sorted(KINDS))
+def an_unsigned_byte_widens_without_its_sign(ty, kind):
     spelled, addr = KINDS[kind]
     setup = (_new("u8", (1, 200)) if ty == "Vec<u8>" else
              "    var v: String\n    v.data = vec_new<u8>()\n    v.data.push(1)\n    v.data.push(200)\n")
     body = "    if p[1] as i64 != 200\n        return 1\n    if p[1] < 100\n        return 2\n    return 0\n"
-    assert run_with(compiler, "byte", _reads(spelled, ty, setup, addr, body)) == 0
+    return Run(_reads(spelled, ty, setup, addr, body), 0)
 
 
 # However a local comes to hold the pointer, and whatever the index is.
@@ -398,62 +355,47 @@ HOLDERS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(HOLDERS))
-def test_every_way_of_holding_it(run_with, name, compiler):
-    program = (f"{HEADER}fn id(x: i32) -> i32\n    return x\n\n"
-               f"pub fn main() -> i32\n{_new('i32', (10, 20, 30))}{HOLDERS[name]}")
-    assert run_with(compiler, name, program) == 20
+@case(name=sorted(HOLDERS))
+def every_way_of_holding_it(name):
+    return Run(f"{HEADER}fn id(x: i32) -> i32\n    return x\n\n"
+               f"pub fn main() -> i32\n{_new('i32', (10, 20, 30))}{HOLDERS[name]}", 20)
 
 
 # An alias is the type it names, behind a pointer or as the pointer.
 ALIASES = "type IntVec = Vec<i32>\ntype Row = [3]i32\ntype VecRef = @Vec<i32>\ntype IntRef = @i32\ntype Num = i32\n\n"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_an_alias_of_a_vec_sees_through(run_with, kind, compiler):
+@case(kind=sorted(KINDS))
+def an_alias_of_a_vec_sees_through(kind):
     spelled, addr = KINDS[kind]
-    program = (f"{HEADER}{ALIASES}fn f(p: {spelled}IntVec) -> i32\n    return p[1]\n\n"
-               f"pub fn main() -> i32\n{_new('i32', (10, 20, 30))}    return f({addr}v)\n")
-    assert run_with(compiler, "alias", program) == 20
+    return Run(f"{HEADER}{ALIASES}fn f(p: {spelled}IntVec) -> i32\n    return p[1]\n\n"
+               f"pub fn main() -> i32\n{_new('i32', (10, 20, 30))}    return f({addr}v)\n", 20)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_an_alias_of_an_array_indexes(run_with, kind, compiler):
+@case(kind=sorted(KINDS))
+def an_alias_of_an_array_indexes(kind):
     spelled, addr = KINDS[kind]
-    program = (f"{HEADER}{ALIASES}fn f(p: {spelled}Row) -> i32\n    return p[1]\n\n"
-               f"pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n    return f({addr}a)\n")
-    assert run_with(compiler, "alias", program) == 20
+    return Run(f"{HEADER}{ALIASES}fn f(p: {spelled}Row) -> i32\n    return p[1]\n\n"
+               f"pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n    return f({addr}a)\n", 20)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_alias_of_a_reference_to_a_vec_sees_through(run_with, compiler):
-    program = (f"{HEADER}{ALIASES}fn f(p: VecRef) -> i32\n    return p[1]\n\n"
-               f"pub fn main() -> i32\n{_new('i32', (10, 20, 30))}    return f(@v)\n")
-    assert run_with(compiler, "alias", program) == 20
+@case()
+def an_alias_of_a_reference_to_a_vec_sees_through():
+    return Run(f"{HEADER}{ALIASES}fn f(p: VecRef) -> i32\n    return p[1]\n\n"
+               f"pub fn main() -> i32\n{_new('i32', (10, 20, 30))}    return f(@v)\n", 20)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("param", ["p: IntRef", "p: @Num", "p: @&Num"])
-def test_an_alias_of_a_scalar_is_not_a_buffer(compile_with, param, compiler):
-    program = f"{HEADER}{ALIASES}fn f({param}) -> i32\n    return p[1]\n\npub fn main() -> i32\n    return 0\n"
-    _refused(compile_with, compiler, "alias", program, NOT_A_BUFFER)
+@case(param=["p: IntRef", "p: @Num", "p: @&Num"])
+def an_alias_of_a_scalar_is_not_a_buffer(param):
+    return Refused(f"{HEADER}{ALIASES}fn f({param}) -> i32\n    return p[1]\n\n"
+                   "pub fn main() -> i32\n    return 0\n", NOT_A_BUFFER)
 
 
 # A generic body sees the instantiated pointee.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-def test_a_generic_fn(run_with, kind, compiler):
+@case(kind=WRITABLE)
+def a_generic_fn(kind):
     spelled, addr = KINDS[kind]
-    program = f"""\
+    return Run(f"""\
 {HEADER}fn swap_ends<T>(p: {spelled}Vec<T>)
     let t: T = p[0]
     p[0] = p[2]
@@ -462,15 +404,13 @@ def test_a_generic_fn(run_with, kind, compiler):
 pub fn main() -> i32
 {_new('i32', (10, 20, 30))}    swap_ends<i32>({addr}v)
     return *(v.data) + *(v.data + 2) / 10
-"""
-    assert run_with(compiler, "generic", program) == 31
+""", 31)
 
 
 # A store runs its index once.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_store_runs_its_index_once(run_with, compiler):
-    program = f"""\
+@case()
+def a_store_runs_its_index_once():
+    return Run(f"""\
 {HEADER}var G: i64 = 0
 
 fn next() -> i64
@@ -483,8 +423,7 @@ fn f(p: *Vec<i32>)
 pub fn main() -> i32
 {_new('i32', (10, 20, 30))}    f(@v)
     return *(v.data + 1) + G as i32
-"""
-    assert run_with(compiler, "once", program) == 8
+""", 8)
 
 
 # What isn't a pointer or reference to a Vec isn't this rule's, though it names one.
@@ -496,26 +435,10 @@ NOT_THROUGH = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(NOT_THROUGH))
-def test_a_value_is_not_seen_through(run_with, name, compiler):
+@case(name=sorted(NOT_THROUGH))
+def a_value_is_not_seen_through(name):
     body, want = NOT_THROUGH[name]
-    assert run_with(compiler, name, f"{HEADER}pub fn main() -> i32\n{body}") == want
-
-
-# ritz0's checker, which is off by default, has the element too.
-@pytest.mark.integration
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("box", sorted(SCALARS))
-def test_the_type_checker_sees_the_element(tmp_path, box, kind):
-    ty, elem, setup, _ = SCALARS[box]
-    spelled, addr = KINDS[kind]
-    src = tmp_path / "main.ritz"
-    src.write_text(_reads(spelled, ty, setup, addr, f"    let e: {elem} = p[1]\n    return e as i32\n"))
-    comp = for_header.ritz0_inproc.run_ritz0([str(src), "--check-types", "-o", str(tmp_path / "main.ll")],
-                                             cwd=tmp_path, env=for_header.ENV, timeout=300)
-    assert comp.returncode == 0, comp.stdout + comp.stderr
+    return Run(f"{HEADER}pub fn main() -> i32\n{body}", want)
 
 
 # A raw buffer stays one: `*T` with T not indexable, at stride T.
@@ -536,13 +459,10 @@ RAW = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(RAW))
-def test_a_raw_buffer_stays_one(run_with, name, compiler):
+@case(name=sorted(RAW))
+def a_raw_buffer_stays_one(name):
     decl, body, want = RAW[name]
-    program = f"{HEADER}{decl}\npub fn main() -> i32\n{body}"
-    assert run_with(compiler, name, program) == want
+    return Run(f"{HEADER}{decl}\npub fn main() -> i32\n{body}", want)
 
 
 # A reference is one T: every way of reaching past it, and the same words from all three.
@@ -568,65 +488,46 @@ NOT_BUFFERS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(NOT_BUFFERS))
-def test_a_reference_is_not_a_buffer(compile_with, name, compiler):
+@case(name=sorted(NOT_BUFFERS))
+def a_reference_is_not_a_buffer(name):
     params, body = NOT_BUFFERS[name]
-    program = f"{HEADER}fn f({params}) -> i32\n{body}\npub fn main() -> i32\n    return 0\n"
-    comp, _, _ = compile_with(compiler, name, program)
-    assert comp.returncode != 0, f"{compiler} took {name}"
-    out = comp.stdout + comp.stderr
-    assert NOT_A_BUFFER in out, out[-1000:]
-    # At the index's own base, the same place on all three.
+    # At the index's own base, the same place on all three: line 10 is f's first.
     first_line = body.splitlines()[0]
     column = 1 + min(first_line.index(n) for n in ("p[", "q[") if n in first_line)
-    assert f"main.ritz:10:{column}:" in out, out[-1000:]
+    return Refused(f"{HEADER}fn f({params}) -> i32\n{body}\npub fn main() -> i32\n    return 0\n",
+                   NOT_A_BUFFER, at=(10, column))
 
 
 # A write through `@T` is §3.2's first, on all three, whatever is behind it.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_write_through_a_shared_scalar_is_section_3_2s(compile_with, compiler):
-    program = f"{HEADER}fn f(p: @i32) -> i32\n    p[1] = 7\n    return 0\n\npub fn main() -> i32\n    return 0\n"
-    _refused(compile_with, compiler, "shared", program, SHARED_WRITE)
+@case()
+def a_write_through_a_shared_scalar_is_section_3_2s():
+    return Refused(f"{HEADER}fn f(p: @i32) -> i32\n    p[1] = 7\n    return 0\n\n"
+                   "pub fn main() -> i32\n    return 0\n", SHARED_WRITE)
 
 
 # `let p = @x` is an `@T` too, and `let p = @&x` an `@&T` (#2445: ritz0 read past
 # it, 20; ritz1 failed at clang, later compiled it silently).  Both are refused
 # at the `p[1]`, and so is a copy of either.  An annotated `*T` takes the same
 # address and stays raw.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("addr", ["@", "@&"])
-@pytest.mark.parametrize("copied", [False, True])
-def test_an_inferred_reference_is_not_a_buffer(compile_with, copied, addr, compiler):
+@case(copied=[False, True], addr=["@", "@&"])
+def an_inferred_reference_is_not_a_buffer(copied, addr):
     program = (f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
                f"    let p = {addr}a[0]\n" + ("    let q = p\n    return q[1]\n" if copied
                                                  else "    return p[1]\n"))
-    comp, _, _ = compile_with(compiler, "inferred", program)
-    assert comp.returncode != 0
-    assert NOT_A_BUFFER in comp.stdout + comp.stderr
     # At the `p[1]` (or `q[1]`), on the line it's on.
-    assert f"main.ritz:{len(HEADER.splitlines()) + 4 + copied}:12:" in comp.stdout + comp.stderr
+    return Refused(program, NOT_A_BUFFER, at=(len(HEADER.splitlines()) + 4 + copied, 12))
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("addr", ["@", "@&"])
-def test_an_annotated_pointer_takes_the_same_address_and_is_raw(run_with, addr, compiler):
-    program = (f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
-               f"    let p: *i32 = {addr}a[0]\n    return p[1]\n")
-    assert run_with(compiler, "annotated", program) == 20
+@case(addr=["@", "@&"])
+def an_annotated_pointer_takes_the_same_address_and_is_raw(addr):
+    return Run(f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
+               f"    let p: *i32 = {addr}a[0]\n    return p[1]\n", 20)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("init", ["@a", "@&a"])
-def test_an_inferred_reference_to_an_array_indexes(run_with, init, compiler):
-    program = (f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
-               f"    let p = {init}\n    return p[1]\n")
-    assert run_with(compiler, "array", program) == 20
+@case(init=["@a", "@&a"])
+def an_inferred_reference_to_an_array_indexes(init):
+    return Run(f"{HEADER}pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n"
+               f"    let p = {init}\n    return p[1]\n", 20)
 
 
 # A store checks its value against the element, not the Vec.
@@ -644,22 +545,17 @@ SLOTS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(SLOTS))
-def test_a_store_fits_the_element(compile_with, name, compiler):
+@case(name=sorted(SLOTS))
+def a_store_fits_the_element(name):
     ty, stmt, message = SLOTS[name]
-    program = f"{HEADER}fn f(p: {ty})\n    {stmt}\n\npub fn main() -> i32\n    return 0\n"
-    _refused(compile_with, compiler, name, program, message)
+    return Refused(f"{HEADER}fn f(p: {ty})\n    {stmt}\n\npub fn main() -> i32\n    return 0\n", message)
 
 
 # A condition sees the element too: the element of a `*Vec<bool>` is a bool.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_bool_element_is_a_condition(run_with, kind, compiler):
+@case(kind=sorted(KINDS))
+def a_bool_element_is_a_condition(kind):
     spelled, addr = KINDS[kind]
-    program = f"""\
+    return Run(f"""\
 {HEADER}fn f(p: {spelled}Span<bool>) -> i32
     if p[1]
         return 5
@@ -671,16 +567,13 @@ pub fn main() -> i32
     a[1] = true
     var v: Span<bool> = span_from_ptr<bool>(@a[0], 2)
     return f({addr}v)
-"""
-    assert run_with(compiler, "cond", program) == 5
+""", 5)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("place", ["p[1]", "(*p)[1]"])
-def test_an_int_element_is_not_a_condition(compile_with, place, compiler):
-    program = f"{HEADER}fn f(p: *Vec<i32>) -> i32\n    if {place}\n        return 1\n    return 0\n\npub fn main() -> i32\n    return 0\n"
-    _refused(compile_with, compiler, "cond", program, "if condition must be bool")
+@case(place=["p[1]", "(*p)[1]"])
+def an_int_element_is_not_a_condition(place):
+    return Refused(f"{HEADER}fn f(p: *Vec<i32>) -> i32\n    if {place}\n        return 1\n    return 0\n\n"
+                   "pub fn main() -> i32\n    return 0\n", "if condition must be bool")
 
 
 # A pointer element, and an array inside an element.
@@ -719,22 +612,16 @@ def _inside(spelled, addr, row):
             f"pub fn main() -> i32\n{setup.format(tail=tail.format(a=addr))}")
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("name", sorted(INSIDE))
-def test_inside_an_element_reads(run_with, name, kind, compiler):
+@case(name=sorted(INSIDE), kind=sorted(KINDS))
+def inside_an_element_reads(name, kind):
     spelled, addr = KINDS[kind]
-    assert run_with(compiler, name, _inside(spelled, addr, INSIDE[name])) == INSIDE[name][4]
+    return Run(_inside(spelled, addr, INSIDE[name]), INSIDE[name][4])
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("name", sorted(INSIDE_WRITES))
-def test_inside_an_element_writes(run_with, name, kind, compiler):
+@case(name=sorted(INSIDE_WRITES), kind=WRITABLE)
+def inside_an_element_writes(name, kind):
     spelled, addr = KINDS[kind]
-    assert run_with(compiler, name, _inside(spelled, addr, INSIDE_WRITES[name])) == INSIDE_WRITES[name][4]
+    return Run(_inside(spelled, addr, INSIDE_WRITES[name]), INSIDE_WRITES[name][4])
 
 
 # A range isn't an element: `p[lo..hi]` slices what `p` points at, on all three
@@ -752,19 +639,16 @@ pub fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_slice_through_a_pointer(run_with, kind, compiler):
+@case(kind=sorted(KINDS))
+def a_slice_through_a_pointer(kind):
     spelled, addr = KINDS[kind]
-    assert run_with(compiler, "slice", HEADER + SLICE.format(spelled=spelled, addr=addr)) == 20
+    return Run(HEADER + SLICE.format(spelled=spelled, addr=addr), 20)
 
 
 # One level out, `(*q)[1]` is the form R9 points at: not this error (#2331).
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_one_level_out_is_the_deref_form(run_with, compiler):
-    program = """\
+@case()
+def one_level_out_is_the_deref_form():
+    return Run("""\
 fn f(q: @*[3]i32) -> i32
     return (*q)[1]
 
@@ -772,17 +656,15 @@ pub fn main() -> i32
     var a: [3]i32 = [10, 20, 30]
     let p: *[3]i32 = @a
     return f(@p)
-"""
-    assert run_with(compiler, "out", program) == 20
+""", 20)
 
 
 # AGAST #2557: `let p = *q` copies that `*[3]i32` out, so p is a pointer and
 # indexes, a store included.  ritz0 kept q's reference type for `*q`, and refused
 # `p[1]` as one value.  ritz1's side of a `@*[N]T` param is #2331's.
-@pytest.mark.integration
-@pytest.mark.parametrize("ref", ["@", "@&"])
-def test_one_level_out_copied_is_the_pointer(run_with, ref):
-    program = f"""\
+@case(compilers=("ritz0",), ref=["@", "@&"])
+def one_level_out_copied_is_the_pointer(ref):
+    return Run(f"""\
 fn f(q: {ref}*[3]i32) -> i32
     let p = *q
     p[2] = 4
@@ -792,8 +674,7 @@ pub fn main() -> i32
     var a: [3]i32 = [10, 20, 30]
     var p: *[3]i32 = @a
     return f({ref}p) + a[2]
-"""
-    assert run_with("ritz0", f"out_copy_{ref == '@&'}", program) == 28
+""", 28)
 
 
 # `p[1][1]`: the base is itself an element (#2442).  Its stores are in
@@ -814,22 +695,18 @@ pub fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_an_element_that_is_a_vec_indexes(run_with, kind, compiler):
+@case(kind=sorted(KINDS))
+def an_element_that_is_a_vec_indexes(kind):
     spelled, addr = KINDS[kind]
-    assert run_with(compiler, "nested", HEADER + NESTED.format(spelled=spelled, addr=addr)) == 20
+    return Run(HEADER + NESTED.format(spelled=spelled, addr=addr), 20)
 
 
 # A method on an element (#2443): the element is the receiver.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_method_on_an_element(run_with, kind, compiler):
+@case(kind=sorted(KINDS))
+def a_method_on_an_element(kind):
     spelled, addr = KINDS[kind]
     row = ("Vec<A>", ARRAYS, "    return p[1].get1()\n", "    return f({a}v)\n", 20)
-    assert run_with(compiler, "method", _inside(spelled, addr, row)) == 20
+    return Run(_inside(spelled, addr, row), 20)
 
 
 # The element is the receiver, in place: `self: @M` reads it, `self: @&M` writes it,
@@ -884,27 +761,17 @@ def _m_program(spelled, holder, addr, body, after):
             + after.format(back=back))
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("holder", sorted(M_HOLDERS))
-@pytest.mark.parametrize("name", sorted(M_READS))
-def test_a_method_reads_its_element(run_with, name, holder, kind, compiler):
+@case(name=sorted(M_READS), holder=sorted(M_HOLDERS), kind=sorted(KINDS))
+def a_method_reads_its_element(name, holder, kind):
     spelled, addr = KINDS[kind]
     body, want = M_READS[name]
-    program = _m_program(spelled, holder, addr, body, "    return r\n")
-    assert run_with(compiler, f"m_{name}", program) == want
+    return Run(_m_program(spelled, holder, addr, body, "    return r\n"), want)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("holder", sorted(M_HOLDERS))
-@pytest.mark.parametrize("name", sorted(M_WRITES))
-def test_a_mutating_method_writes_its_element(run_with, name, holder, kind, compiler):
+@case(name=sorted(M_WRITES), holder=sorted(M_HOLDERS), kind=WRITABLE)
+def a_mutating_method_writes_its_element(name, holder, kind):
     spelled, addr = KINDS[kind]
-    program = _m_program(spelled, holder, addr, M_WRITES[name], "    return {back}\n")
-    assert run_with(compiler, f"m_{name}", program) == 7
+    return Run(_m_program(spelled, holder, addr, M_WRITES[name], "    return {back}\n"), 7)
 
 
 # Through an `@T`, a `self: @&M` method is a mutable borrow of the element, as
@@ -914,17 +781,12 @@ SHARED_INTO_MUT = "an `@T` doesn't fit an `@&T` slot: make it `@&T`"
 SHARED_RECEIVERS = {"element": ("p[1].sety(7)", 5), "element_deref": ("(*p)[1].sety(7)", 6)}
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("holder", ["Span", "Vec"])
-@pytest.mark.parametrize("name", sorted(SHARED_RECEIVERS))
-def test_a_shared_reference_refuses_a_mutating_method(compile_with, name, holder, compiler):
+@case(name=sorted(SHARED_RECEIVERS), holder=["Span", "Vec"])
+def a_shared_reference_refuses_a_mutating_method(name, holder):
     call, col = SHARED_RECEIVERS[name]
     program = _m_program("@", holder, "@", f"    {call}\n    return 0\n", "    return r\n")
     line = program.splitlines().index(f"    {call}") + 1
-    _refused(compile_with, compiler, name, program, SHARED_INTO_MUT)
-    comp, _, _ = compile_with(compiler, name + "_at", program)
-    assert f"main.ritz:{line}:{col}:" in comp.stdout + comp.stderr, (comp.stdout + comp.stderr)[-1000:]
+    return Refused(program, SHARED_INTO_MUT, at=(line, col))
 
 
 SHARED_LEGAL = {
@@ -935,23 +797,18 @@ SHARED_LEGAL = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(SHARED_LEGAL))
-def test_a_shared_reference_takes_what_does_not_write_its_element(run_with, name, compiler):
+@case(name=sorted(SHARED_LEGAL))
+def a_shared_reference_takes_what_does_not_write_its_element(name):
     holder, body, after, want = SHARED_LEGAL[name]
-    assert run_with(compiler, name, _m_program("@", holder, "@", body, after)) == want
+    return Run(_m_program("@", holder, "@", body, after), want)
 
 
 # On the value itself: `v[1].m()` on a Vec or Span local.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("holder", sorted(M_HOLDERS))
-def test_a_method_on_an_element_of_a_local(run_with, holder, compiler):
-    ty, setup, back = M_HOLDERS[holder]
-    program = (f"{HEADER}{M_ELEMENT}pub fn main() -> i32\n{setup}"
-               f"    v[1].sety(v[1].gety() + 5)\n    return {back}\n")
-    assert run_with(compiler, "m_local", program) == 25
+@case(holder=sorted(M_HOLDERS))
+def a_method_on_an_element_of_a_local(holder):
+    _, setup, back = M_HOLDERS[holder]
+    return Run(f"{HEADER}{M_ELEMENT}pub fn main() -> i32\n{setup}"
+               f"    v[1].sety(v[1].gety() + 5)\n    return {back}\n", 25)
 
 
 # An element that's a Vec: Vec's own methods (`len`, `get`) on it.  `get` needs
@@ -960,23 +817,17 @@ def test_a_method_on_an_element_of_a_local(run_with, holder, compiler):
 VEC_METHODS = {"len": ("p[1].len() as i32", 2), "get": ("p[1].get(1)", 20)}
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("method", sorted(VEC_METHODS))
-def test_a_vec_method_on_an_element_that_is_a_vec(run_with, method, kind, compiler):
+@case(method=sorted(VEC_METHODS), kind=sorted(KINDS))
+def a_vec_method_on_an_element_that_is_a_vec(method, kind):
     spelled, addr = KINDS[kind]
     call, want = VEC_METHODS[method]
-    program = HEADER + NESTED.replace("p[1][1]", call).format(spelled=spelled, addr=addr)
-    assert run_with(compiler, f"vm_{method}", program) == want
+    return Run(HEADER + NESTED.replace("p[1][1]", call).format(spelled=spelled, addr=addr), want)
 
 
 # The same on the local Vec itself: no reference in the way (#2519).
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_vec_method_on_an_element_of_a_local_vec(run_with, compiler):
-    program = HEADER + NESTED.replace("return f({addr}v)", "return v[1].get(1)").format(spelled="*")
-    assert run_with(compiler, "vm_local", program) == 20
+@case()
+def a_vec_method_on_an_element_of_a_local_vec():
+    return Run(HEADER + NESTED.replace("return f({addr}v)", "return v[1].get(1)").format(spelled="*"), 20)
 
 
 # The other bases an element receiver is reached from (#2519): `(*p)[i]`, a
@@ -991,44 +842,71 @@ ELEMENT_RECEIVERS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("form", sorted(ELEMENT_RECEIVERS))
-def test_a_vec_method_on_an_element_reached_another_way(run_with, form, compiler):
-    head, _, rest = NESTED.partition("pub fn main")
-    program = (HEADER + "struct H\n    vv: Vec<Vec<i32>>\n\n" + ELEMENT_RECEIVERS[form]
-               + "\npub fn main" + rest.format(addr="@"))
-    assert run_with(compiler, f"vm_{form}", program) == 20
-
+@case(form=sorted(ELEMENT_RECEIVERS))
+def a_vec_method_on_an_element_reached_another_way(form):
+    _, _, rest = NESTED.partition("pub fn main")
+    return Run(HEADER + "struct H\n    vv: Vec<Vec<i32>>\n\n" + ELEMENT_RECEIVERS[form]
+               + "\npub fn main" + rest.format(addr="@"), 20)
 
 
 # Generic code meets its T when it's instantiated.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_generic_reference_is_refused_once_it_has_a_type(compile_with, compiler):
-    program = f"""\
+@case()
+def a_generic_reference_is_refused_once_it_has_a_type():
+    return Refused(f"""\
 {HEADER}fn g<T>(p: @T) -> T
     return p[1]
 
 pub fn main() -> i32
     var x: i32 = 1
     return g<i32>(@x)
-"""
-    comp, _, _ = compile_with(compiler, "generic", program)
-    assert comp.returncode != 0
-    assert NOT_A_BUFFER in comp.stdout + comp.stderr
+""", NOT_A_BUFFER, located=False)
 
 
 # The legal form beside the error: a whole array behind a reference.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_array_behind_a_reference_still_reads(run_with, compiler):
-    program = """\
+@case()
+def an_array_behind_a_reference_still_reads():
+    return Run("""\
 fn f(p: @[3]i32) -> i32
     return p[1]
 
 pub fn main() -> i32
     var a: [3]i32 = [10, 20, 30]
     return f(@a)
-"""
-    assert run_with(compiler, "array", program) == 20
+""", 20)
+
+
+TABLE = table_rows.cases(globals())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=for_header.batch_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
+
+
+# ritz0's checker, which is off by default, has the element too.  Its own flag, so
+# its own loop: one row per box and kind, ids as the table's.
+TYPE_CHECKED = [
+    (f"the_type_checker_sees_the_element[{box}-{kind}]",
+     _reads(KINDS[kind][0], SCALARS[box][0], SCALARS[box][2], KINDS[kind][1],
+            f"    let e: {SCALARS[box][1]} = p[1]\n    return e as i32\n"))
+    for box in sorted(SCALARS) for kind in sorted(KINDS)]
+OUTSIDE_TABLE = [rid for rid, _ in TYPE_CHECKED]
+
+
+@pytest.mark.integration
+def test_the_type_checker_sees_the_element(tmp_path):
+    failures = []
+    for n, (rid, program) in enumerate(TYPE_CHECKED):
+        here = tmp_path / str(n)
+        here.mkdir()
+        src = here / "main.ritz"
+        src.write_text(program)
+        comp = for_header.ritz0_inproc.run_ritz0([str(src), "--check-types", "-o", str(here / "main.ll")],
+                                                 cwd=here, env=for_header.ENV, timeout=300)
+        if comp.returncode != 0:
+            failures.append(f"ritz0 --check-types {rid}:\n" + (comp.stdout + comp.stderr)[-800:])
+    assert not failures, "\n".join(failures)

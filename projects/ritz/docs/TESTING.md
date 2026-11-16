@@ -411,6 +411,19 @@ Rules:
    exit 5, got exit 4`), and a `gaps` row (a strict xfail) that passes
    fails the table.  `test_member_through_levels.py` and
    `test_receiver_through_levels.py` went from 1,749 cases to 18.
+
+   For rows that need more than that (their own build, such as a String
+   slice linking ritzlib/string; refusals checked in a batch, or ones with
+   no `^`; a row for only some compilers), `ritz0/test_table_rows.py`
+   (AGAST #3519) has each old test function become a `@case` that returns
+   `Run(program, want)` or `Refused(program, message, at=, located=)`.
+   `test_every_row[<compiler>-<chunk>]` checks 64 rows at a time through
+   `batching.run_rows` / `refuse_rows`, and each failing row keeps its old
+   id (`ritz1 a_read_runs_right[Span-at_next-pointer]: want exit 20, got
+   30`).  `test_index_through_reference.py` and
+   `test_slice_through_reference.py` went from 2,070 tests to 37, but only
+   from 102 to 93 CPU-s: most of what's left is the per-row compile that
+   #2867's leaning check makes for a row that reaches a generic.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a
