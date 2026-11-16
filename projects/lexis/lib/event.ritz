@@ -5,7 +5,6 @@
 
 import lib.dom.tag { Tag }
 import lib.dom.attribute { Attribute }
-import lib.dom.node { NodeId }
 
 # =============================================================================
 # DOM Event Types
@@ -85,99 +84,99 @@ pub struct ParseWarningEvent
     col: u32
 
 # =============================================================================
-# Event Handler Trait
+# Event Handler (a struct of fn pointers)
 # =============================================================================
 
-# The parser calls these methods to emit events.
-# Tempest implements this trait to receive parsing results.
+# The parser calls these fns to emit events. Ritz has no dynamic dispatch, no
+# trait bound on a generic parameter and no `dyn Trait` (LANGUAGE_SPEC §5.5,
+# §5.6, LARB R41), so a sink is a struct of fn-pointer fields plus `ctx`, the
+# state a closure would have captured. Every callback gets `ctx` back as its
+# first argument; the event data is lent read-only (`@T`), because an
+# ElementStartEvent carries 64 attributes and isn't worth copying per call.
 #
-# Usage:
-#   struct TempestDomBuilder
-#       # ... DOM state ...
+# Tempest implements it (lib/lexis_bridge.ritz polls ParseEvents, so its
+# callbacks push onto the queue that ctx points at):
 #
-#   impl EventHandler for TempestDomBuilder
-#       fn on_document_start(self:&)
-#           # Handle document start
+#   fn bridge_on_text(ctx: *u8, event: @TextEvent)
+#       let p = ctx as *LexisParser
+#       # ... queue ParseEvent.Text { content: event.content } on p ...
 #
-#       fn on_element_start(self:&, event: ElementStartEvent)
-#           # Build DOM node
-#
-#   let handler = TempestDomBuilder.new()
-#   let parser = html_parser_new(source, handler)
-#   html_parser_run(parser)
+#   var h = no_op_handler_new()       # start from no-ops,
+#   h.ctx = @&parser as *u8          # point ctx at the receiver,
+#   h.on_text = bridge_on_text       # and override what you care about
+#   var hp = html_parser_new(source, h)
+#   html_parser_run(hp)
 
-pub trait EventHandler
-    fn on_document_start(self:&)
-    fn on_document_end(self:&)
-    fn on_element_start(self:&, event: ElementStartEvent)
-    fn on_element_end(self:&, event: ElementEndEvent)
-    fn on_text(self:&, event: TextEvent)
-    fn on_comment(self:&, event: CommentEvent)
-    fn on_doctype(self:&, event: DoctypeEvent)
-    fn on_error(self:&, event: ParseErrorEvent)
-    fn on_warning(self:&, event: ParseWarningEvent)
+pub struct EventHandler
+    ctx: *u8
+    on_document_start: fn(*u8)
+    on_document_end: fn(*u8)
+    on_element_start: fn(*u8, @ElementStartEvent)
+    on_element_end: fn(*u8, @ElementEndEvent)
+    on_text: fn(*u8, @TextEvent)
+    on_comment: fn(*u8, @CommentEvent)
+    on_doctype: fn(*u8, @DoctypeEvent)
+    on_error: fn(*u8, @ParseErrorEvent)
+    on_warning: fn(*u8, @ParseWarningEvent)
 
 # =============================================================================
 # Default No-Op Handler
 # =============================================================================
 
-# A handler that does nothing - useful for testing or when you only
-# care about certain events.
+# A handler whose every callback does nothing - useful for testing, or as the
+# starting point when you only care about certain events (override the fields
+# you want). Its ctx is null.
 
-pub struct NoOpHandler
+fn no_op_document(ctx: *u8)
+    pass
 
-pub fn no_op_handler_new() -> NoOpHandler
-    NoOpHandler {}
+fn no_op_element_start(ctx: *u8, event: @ElementStartEvent)
+    pass
 
-impl EventHandler for NoOpHandler
-    fn on_document_start(self:&)
-        # No-op
-        0
+fn no_op_element_end(ctx: *u8, event: @ElementEndEvent)
+    pass
 
-    fn on_document_end(self:&)
-        # No-op
-        0
+fn no_op_text(ctx: *u8, event: @TextEvent)
+    pass
 
-    fn on_element_start(self:&, event: ElementStartEvent)
-        # No-op
-        0
+fn no_op_comment(ctx: *u8, event: @CommentEvent)
+    pass
 
-    fn on_element_end(self:&, event: ElementEndEvent)
-        # No-op
-        0
+fn no_op_doctype(ctx: *u8, event: @DoctypeEvent)
+    pass
 
-    fn on_text(self:&, event: TextEvent)
-        # No-op
-        0
+fn no_op_error(ctx: *u8, event: @ParseErrorEvent)
+    pass
 
-    fn on_comment(self:&, event: CommentEvent)
-        # No-op
-        0
+fn no_op_warning(ctx: *u8, event: @ParseWarningEvent)
+    pass
 
-    fn on_doctype(self:&, event: DoctypeEvent)
-        # No-op
-        0
-
-    fn on_error(self:&, event: ParseErrorEvent)
-        # No-op
-        0
-
-    fn on_warning(self:&, event: ParseWarningEvent)
-        # No-op
-        0
+pub fn no_op_handler_new() -> EventHandler
+    EventHandler {
+        ctx: null,
+        on_document_start: no_op_document,
+        on_document_end: no_op_document,
+        on_element_start: no_op_element_start,
+        on_element_end: no_op_element_end,
+        on_text: no_op_text,
+        on_comment: no_op_comment,
+        on_doctype: no_op_doctype,
+        on_error: no_op_error,
+        on_warning: no_op_warning
+    }
 
 # =============================================================================
 # Event Emitter Helpers
 # =============================================================================
 
-# Helper functions that call the appropriate trait method
-# These are used internally by the parser
+# Build the event and call the matching callback with the handler's ctx.
+# These are used internally by the parser.
 
 pub fn emit_document_start(handler:& EventHandler)
-    handler.on_document_start()
+    handler.on_document_start(handler.ctx)
 
 pub fn emit_document_end(handler:& EventHandler)
-    handler.on_document_end()
+    handler.on_document_end(handler.ctx)
 
 # `attrs` points at `attr_count` attributes (the tokenizer's StartTagToken.attrs),
 # or is null with attr_count 0 for an implied element. They are copied into the
@@ -191,19 +190,19 @@ pub fn emit_element_start(handler:& EventHandler, tag: Tag, attrs: *Attribute, a
         while event.attr_count < attr_count and event.attr_count < 64
             event.attrs[event.attr_count] = attrs[event.attr_count]
             event.attr_count = event.attr_count + 1
-    handler.on_element_start(event)
+    handler.on_element_start(handler.ctx, @event)
 
 pub fn emit_element_end(handler:& EventHandler, tag: Tag)
     let event = ElementEndEvent { tag: tag }
-    handler.on_element_end(event)
+    handler.on_element_end(handler.ctx, @event)
 
 pub fn emit_text(handler:& EventHandler, content: StrView)
     let event = TextEvent { content: content }
-    handler.on_text(event)
+    handler.on_text(handler.ctx, @event)
 
 pub fn emit_comment(handler:& EventHandler, content: StrView)
     let event = CommentEvent { content: content }
-    handler.on_comment(event)
+    handler.on_comment(handler.ctx, @event)
 
 pub fn emit_doctype(handler:& EventHandler, name: StrView, public_id: StrView, system_id: StrView)
     let event = DoctypeEvent {
@@ -211,7 +210,7 @@ pub fn emit_doctype(handler:& EventHandler, name: StrView, public_id: StrView, s
         public_id: public_id,
         system_id: system_id
     }
-    handler.on_doctype(event)
+    handler.on_doctype(handler.ctx, @event)
 
 pub fn emit_error(handler:& EventHandler, kind: i32, message: StrView, line: u32, col: u32)
     let event = ParseErrorEvent {
@@ -220,7 +219,7 @@ pub fn emit_error(handler:& EventHandler, kind: i32, message: StrView, line: u32
         line: line,
         col: col
     }
-    handler.on_error(event)
+    handler.on_error(handler.ctx, @event)
 
 pub fn emit_warning(handler:& EventHandler, kind: i32, message: StrView, line: u32, col: u32)
     let event = ParseWarningEvent {
@@ -229,4 +228,4 @@ pub fn emit_warning(handler:& EventHandler, kind: i32, message: StrView, line: u
         line: line,
         col: col
     }
-    handler.on_warning(event)
+    handler.on_warning(handler.ctx, @event)
