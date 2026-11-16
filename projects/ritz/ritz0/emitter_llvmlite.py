@@ -964,7 +964,8 @@ class LLVMEmitter:
                 synthesized = self._ensure_builtin_generic_struct_specialization(ty)
                 if synthesized and synthesized in self.struct_types:
                     llvm_ty = self.struct_types[synthesized]
-                    return (self._type_size_bytes(llvm_ty), 8)
+                    # Padded, at its own alignment (AGAST #3655).
+                    return _abi_size_align(llvm_ty)
 
             # Fallback for unknown types (treat as 8-byte pointer-sized)
             return (8, 8)
@@ -10050,12 +10051,14 @@ class LLVMEmitter:
             elem_size = self._sizeof_type(elem_type)
 
             # For single-byte fills, use memset
-            if elem_size == 1 and isinstance(emitted, ir.Constant):
+            if elem_size == 1 and isinstance(emitted, ir.Constant) and isinstance(val.type, ir.IntType):
                 # memset(ptr, val, count)
                 ptr = self.builder.bitcast(arr_alloca, self.i8.as_pointer())
                 byte_val = val
                 if byte_val.type != self.i8:
-                    byte_val = self.builder.trunc(val, self.i8)
+                    # A bool (i1) fill is 1 byte too (#3654): widen it.
+                    byte_val = (self.builder.zext(val, self.i8) if val.type.width < 8
+                                else self.builder.trunc(val, self.i8))
                 count = ir.Constant(self.i64, expr.count)
                 self._emit_memset(ptr, byte_val, count)
             else:
@@ -10138,11 +10141,13 @@ class LLVMEmitter:
         else:
             elem_size = self._sizeof_type(target_elem_type)
             # For single-byte fills, use memset
-            if elem_size == 1 and isinstance(val, ir.Constant):
+            if elem_size == 1 and isinstance(val, ir.Constant) and isinstance(val.type, ir.IntType):
                 ptr = self.builder.bitcast(alloca, self.i8.as_pointer())
                 byte_val = val
                 if byte_val.type != self.i8:
-                    byte_val = self.builder.trunc(val, self.i8)
+                    # A bool (i1) fill is 1 byte too (#3654): widen it.
+                    byte_val = (self.builder.zext(val, self.i8) if val.type.width < 8
+                                else self.builder.trunc(val, self.i8))
                 count = ir.Constant(self.i64, expr.count)
                 self._emit_memset(ptr, byte_val, count)
             else:
@@ -10204,22 +10209,12 @@ class LLVMEmitter:
         return self.builder.sdiv(diff, stride)
 
     def _sizeof_type(self, ty: ir.Type) -> int:
-        """Get the size in bytes of an LLVM type."""
-        if isinstance(ty, ir.IntType):
-            return ty.width // 8
-        elif isinstance(ty, ir.FloatType):
-            return 4
-        elif isinstance(ty, ir.DoubleType):
-            return 8
-        elif isinstance(ty, ir.PointerType):
-            return 8  # 64-bit pointers
-        elif isinstance(ty, ir.ArrayType):
-            return self._sizeof_type(ty.element) * ty.count
-        elif isinstance(ty, ir.LiteralStructType):
-            return sum(self._sizeof_type(e) for e in ty.elements)
-        else:
-            # Default to pointer size for unknown types
-            return 8
+        """The alloc size in bytes of an LLVM type, padding included.
+
+        AGAST #3654: this measured an i1 as `1 // 8 == 0` bytes, so a large
+        `[false; N]` memset nothing and left the bools uninitialised.
+        """
+        return _abi_size_align(ty)[0]
 
     def _emit_memset(self, ptr: ir.Value, byte_val: ir.Value, count: ir.Value) -> None:
         """Emit a call to llvm.memset intrinsic."""
@@ -10713,9 +10708,11 @@ class LLVMEmitter:
         inner_val = self._emit_expr(heap_expr.expr)
         llvm_type = inner_val.type
 
-        # Calculate size of the value type
-        size = self._type_size_bytes(llvm_type)
-        size_val = ir.Constant(self.i64, size)
+        # The exact alloc size, padding included: `gep (T* null, 1)`.  The
+        # unpadded _type_size_bytes malloc'd 10 bytes for a 24-byte
+        # `{u8, i64, u8}` and the store overran the block (AGAST #3654).
+        size_val = ir.Constant(llvm_type.as_pointer(), None).gep(
+            [ir.Constant(self.i32, 1)]).ptrtoint(self.i64)
 
         # Call malloc - look in functions first, then extern_fns
         malloc_fn = None
