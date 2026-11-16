@@ -4650,6 +4650,7 @@ class LLVMEmitter:
             self.builder.position_before(first_non_alloca)
         else:
             self.builder.position_at_end(entry_block)
+        # Positioned in the entry block above, so never in a loop (AGAST #3661).
         flag_alloca = self.builder.alloca(self.i1, name=f"{name}.drop_flag")
         self.builder.store(ir.Constant(self.i1, 0), flag_alloca)
         self.builder.position_at_end(current_block)
@@ -7267,7 +7268,7 @@ class LLVMEmitter:
         len_done = self.current_fn.append_basic_block("strlen.done")
 
         # Initialize length counter
-        len_ptr = self.builder.alloca(self.i64)
+        len_ptr = self.builder._entry_alloca(self.i64, "strlen.len")  # AGAST #3661
         self.builder.store(ir.Constant(self.i64, 0), len_ptr)
         self.builder.branch(len_loop)
 
@@ -10096,7 +10097,7 @@ class LLVMEmitter:
         # 1. `store [65536 x i32] zeroinitializer, ptr` causes LLVM SelectionDAG to crash
         # 2. Even if it didn't crash, it would generate a huge store operation
         # Instead, we allocate and use memset which generates efficient code.
-        arr_alloca = self.builder.alloca(arr_type)
+        arr_alloca = self.builder._entry_alloca(arr_type, "fill.arr")  # AGAST #3661
 
         if is_zero_fill:
             # Use memset to zero the array (efficient O(1) IR)
@@ -10307,7 +10308,7 @@ class LLVMEmitter:
         loop_end = self.builder.append_basic_block("fill_end")
 
         # Initialize counter
-        counter_alloca = self.builder.alloca(self.i64)
+        counter_alloca = self.builder._entry_alloca(self.i64, "fill.i")  # AGAST #3661
         self.builder.store(ir.Constant(self.i64, 0), counter_alloca)
         self.builder.branch(loop_header)
 
@@ -10724,7 +10725,7 @@ class LLVMEmitter:
             emit_args.append(val)
 
         # Create the future: var future = fn_name(args)
-        future_alloca = self.builder.alloca(future_llvm_type, name="future")
+        future_alloca = self.builder._entry_alloca(future_llvm_type, "future")  # AGAST #3661
         future_val = self.builder.call(constructor_fn, emit_args, name="future_init")
         self.builder.store(future_val, future_alloca)
 
@@ -13734,7 +13735,7 @@ class LLVMEmitter:
                         receiver_val = val
                     else:
                         # let binding with struct value - create temporary storage
-                        tmp = self.builder.alloca(ty, name=f"{name}.tmp")
+                        tmp = self.builder._entry_alloca(ty, f"{name}.tmp")  # AGAST #3661
                         self.builder.store(val, tmp)
                         receiver_val = tmp
                 else:

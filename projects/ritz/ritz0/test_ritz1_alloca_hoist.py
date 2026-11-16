@@ -435,6 +435,103 @@ pub fn main() -> i32
         None => return 1
 """
 
+# AGAST #3661: the remaining point-of-use slots, each reached in a loop body.
+# A `[v; N]` rvalue with N > 64 spills to an array slot (`arr_alloca`); a
+# zero fill memsets it, so that case has no fill loop.  The 800-byte slot
+# overflows 8 MB in ~10K iterations, so 100K is plenty.
+ARRAY_FILL_ZERO = """\
+fn take(a: [100]i64) -> i64
+    return a[99] + 1
+
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < 100000
+        t = t + take([0; 100])
+        i = i + 1
+    return (t / 10000) as i32
+"""
+
+# A non-zero fill also opens _emit_fill_loop, whose counter is a slot too.
+ARRAY_FILL_VALUE = """\
+fn take(a: [100]i64) -> i64
+    return a[99]
+
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < 100000
+        t = t + take([5; 100])
+        i = i + 1
+    return (t / 10000) as i32
+"""
+
+# `var a = [5; 65]` fills the var's own (entry) slot in place, so the fill
+# loop's counter is the only slot in the body.
+FILL_COUNTER = """\
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < 1000000
+        var a: [65]i64 = [5; 65]
+        t = t + a[64]
+        i = i + 1
+    return (t / 100000) as i32
+"""
+
+# Interpolating a `*u8` measures it with an inline strlen loop (`len_ptr`).
+# The string is empty, so each write is 0 bytes.
+STRLEN_PRINT = """\
+pub fn main() -> i32
+    var i: i64 = 0
+    while i < 2000000
+        let s: *u8 = c""
+        print("{s}")
+        i = i + 1
+    return (i / 100000) as i32
+"""
+
+# `await` of an async fn outside an async fn polls a `future` slot.
+AWAIT_FUTURE = f"""\
+async fn fetch(x: i32) -> i32
+    x
+
+pub fn main() -> i32
+    var t: i32 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        t = t + await fetch(2)
+        i = i + 1
+    return t / 1000000
+"""
+
+# A struct payload binding is an SSA value; lending it as `self` spills it
+# to a `{name}.tmp` slot at each call.
+PAYLOAD_RECEIVER = f"""\
+struct P
+    x: i64
+    y: i64
+
+impl P
+    fn total(self: @P) -> i64
+        return self.x + self.y
+
+enum E
+    A(P)
+    B
+
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    match A(P {{ x: 1, y: 2 }})
+        A(p) =>
+            while i < {ITERS}
+                t = t + p.total()
+                i = i + 1
+        B => t = 0
+    return (t / 1000000) as i32
+"""
+
 RITZ0_CASES = dict(
     CASES,
     variant_untyped=(VARIANT_UNTYPED, 40),
@@ -445,6 +542,12 @@ RITZ0_CASES = dict(
     enum_unwrap=(ENUM_UNWRAP, 20),
     try_result=(TRY_RESULT, 20),
     try_option=(TRY_OPTION, 20),
+    array_fill_zero=(ARRAY_FILL_ZERO, 10),
+    array_fill_value=(ARRAY_FILL_VALUE, 50),
+    fill_counter=(FILL_COUNTER, 50),
+    strlen_print=(STRLEN_PRINT, 20),
+    await_future=(AWAIT_FUTURE, 20),
+    payload_receiver=(PAYLOAD_RECEIVER, 30),
 )
 
 
