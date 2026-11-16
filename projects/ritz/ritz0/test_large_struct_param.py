@@ -349,6 +349,98 @@ def test_large_struct_params_run_at_O2(ritz1_bin, tmp_path, compiler):
     assert _link_run([obj], exe, with_start=(compiler == "ritz1")) == 42
 
 
+# --- AGAST #3692: a write between the arg's load and the call --------------
+#
+# `has(tb, Tag.Body)` loads `*tb`, then builds the enum arg with a `store`
+# into a fresh alloca.  That store hid the load's pointer source from
+# _large_copy_source, so ritz0 spilled the arg with a first-class
+# `store %Big` (lexis tree_builder.ritz: clang -O1 > 120 s, -O2 > 300 s).
+# The fix copies the source into the byval slot at the load, before any
+# later write can clobber it.
+
+CLOBBER = """
+enum Tag
+    Head
+    Body
+
+fn has(b: Big, t: Tag) -> i32
+    return b.count
+
+pub fn caller(tb:& Big) -> i32
+    return has(tb, Tag.Body)
+
+pub fn caller_deref(p: *Big) -> i32
+    return has(*p, Tag.Head)
+
+pub fn copy_after_write(p: *Big, q: *Big) -> i32
+    var c: Big = *p
+    return sink(@c)
+"""
+
+@pytest.mark.integration
+def test_byval_arg_after_intervening_store_is_not_first_class(ritz1_bin, tmp_path):
+    """No first-class `store %Big` when a store sits between load and call."""
+    text = _ll("ritz0", tmp_path, "clobber", HUGE + CLOBBER).read_text()
+    stores = [line for line in text.splitlines() if re.search(rf"store {BIG_T} %", line)]
+    assert not stores, "a large byval arg is still spilled first-class:\n" + "\n".join(stores)
+    calls = _calls(text, "has")
+    assert len(calls) == 2 and all(re.search(BYVAL_BIG, c) for c in calls), calls
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_byval_arg_after_intervening_store_compiles_at_O2_within_bound(
+    ritz1_bin, tmp_path, compiler
+):
+    ll = _ll(compiler, tmp_path, "clobber", HUGE + CLOBBER)
+    _assert_no_libc_mem(_o2_object(ll))
+
+
+# The copy taken at the load must be the value AT the load: a later arg that
+# writes the source must not reach the callee (evaluation order).
+CLOBBER_RUN = (
+    MID
+    + """
+enum Tag
+    Head
+    Body
+
+fn has(b: Big, t: Tag, n: i32) -> i32
+    match t
+        Tag.Head => return total(@b) * 100 + n
+        Tag.Body => return total(@b) * 1000 + n
+
+fn bump(p: *Big) -> i32
+    p.count = p.count + 50
+    return 7
+
+fn via_ref(tb:& Big) -> i32
+    return has(tb, Tag.Body, 3)
+
+pub fn main() -> i32
+    var x: Big = big_make(5)
+    let p: *Big = @x
+    if has(*p, Tag.Head, bump(p)) != 2107
+        return 1
+    if x.count != 55
+        return 2
+    if via_ref(x) != 71003
+        return 3
+    return 42
+"""
+)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_byval_arg_snapshot_at_load_runs_at_O2(ritz1_bin, tmp_path, compiler):
+    ll = _ll(compiler, tmp_path, "clobber_run", CLOBBER_RUN)
+    obj = _o2_object(ll)
+    _assert_no_libc_mem(obj)
+    exe = tmp_path / f"clobber_run_{compiler}"
+    assert _link_run([obj], exe, with_start=(compiler == "ritz1")) == 42
+
+
 # --- function pointers ------------------------------------------------------
 #
 # A `fn(Big) -> i32` value points at a function whose physical signature is

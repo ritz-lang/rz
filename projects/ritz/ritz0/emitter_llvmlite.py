@@ -460,6 +460,11 @@ class _SretAwareBuilder(ir.IRBuilder):
                 # LLVM copies a byval arg at the call; nothing since the load
                 # wrote memory, so the bytes at `src` are still the value.
                 args[j] = src
+            elif self._is_large_load(v):
+                # AGAST #3692: something since the load may have written its
+                # source (an enum arg built in an alloca, a later arg's side
+                # effect).  Copy into the slot AT the load, not here.
+                args[j] = self._snapshot_large_load(v, "byval.tmp")
             else:
                 spills.append((j, v, ty))
         for j, v, ty in spills:
@@ -468,6 +473,30 @@ class _SretAwareBuilder(ir.IRBuilder):
                 self.store(v, tmp)
             args[j] = tmp
         return args, arg_attrs
+
+    def _is_large_load(self, value) -> bool:
+        """`value` is a `load %T` of a struct %T at the sret threshold."""
+        return (isinstance(value, ir.LoadInstr)
+                and value.parent is not None
+                and self._emitter._sret_struct_type(value.type) is not None)
+
+    def _snapshot_large_load(self, load, name):
+        """AGAST #3692: a fresh entry slot holding `load`'s value, copied with
+        @__ritz_sret_copy right after `load`, so it is the value AT the load
+        whatever was written since.  Never a first-class `store %T`."""
+        tmp = self._entry_alloca(load.type, name)
+        # Insert after the load (possibly in another block), then put this
+        # builder back where it was: inserting into its own block before its
+        # anchor shifts the anchor's index.
+        block, anchor = self.block, self._anchor
+        at = block.instructions[anchor] if anchor < len(block.instructions) else None
+        self.position_after(load)
+        self._emitter._emit_large_copy(self, tmp, load.operands[0], load.type)
+        if at is None:
+            self.position_at_end(block)
+        else:
+            self.position_before(at)
+        return tmp
 
     @staticmethod
     def _set_byval_align(call, byval, offset):
