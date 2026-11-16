@@ -22,8 +22,8 @@ field (a dotted path inside a nested literal), worded like #1569's.
 Every program exits 3 when the fields hold the right values.  Pointer and f32
 fields are read through a typed local: a direct `*(T[0].s + 1)` or f32
 `T[0].a != x` read is mistyped by ritz1 (AGAST #3671).  ritz0 refuses
-pointer and float fields with a traceback (AGAST #3670), so those rows are
-expected failures on ritz0.
+lowers the same set and raises the same located errors (AGAST #3670), but
+rounds every f32 literal exactly, so it has no f32_too_precise rows.
 """
 
 import pytest
@@ -32,7 +32,6 @@ from test_ref_into_value import _assert_refused, _ids, _run
 pytestmark = pytest.mark.integration
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
-RITZ0_GAP = 3670
 
 # The ticket's repro: with the bug p is `i64 0` (clang rejects the IR) and f is 0.
 REPRO = """\
@@ -156,6 +155,47 @@ pub fn main() -> i32
     return 3
 """
 
+# An integer converts straight to f32, rounded once, as `sitofp` does.
+# 2^54 + 2^30 + 1 is 2^54 + 2^31 in f32, but 2^54 by way of a double: the
+# double is 2^54 + 2^30, a tie that rounds to even.
+INT_INTO_F32_ONCE = """\
+struct P
+    c: f32
+    d: f32
+
+const T: [1]P = [P { c: 18014399583223809, d: -18014399583223809 }]
+
+pub fn main() -> i32
+    let tc: f32 = T[0].c
+    let td: f32 = T[0].d
+    if tc != 18014400657965056.0
+        return 10
+    if td != -18014400657965056.0
+        return 11
+    return 3
+"""
+
+# ritz0 rounds an f32 literal exactly, past ritz1's fast-path limit (the
+# REFUSED f32_too_many_* rows), to what a run-time f32 of it holds.
+F32_PRECISE = """\
+struct P
+    a: f32
+    b: f32
+
+const T: [1]P = [P { a: 1234567890.1234567, b: -0.00000000000000000000001 }]
+
+pub fn main() -> i32
+    let a: f32 = 1234567890.1234567
+    let b: f32 = -0.00000000000000000000001
+    let ta: f32 = T[0].a
+    let tb: f32 = T[0].b
+    if ta != a
+        return 10
+    if tb != b or tb == 0.0
+        return 11
+    return 3
+"""
+
 # A nested struct literal, two levels deep, holding integers, a folded const
 # expression, a StrView, a pointer and a float.
 NESTED = """\
@@ -202,22 +242,24 @@ FORMS = {
     "f32": F32,
     "int_into_float": INT_INTO_FLOAT,
     "nested": NESTED,
+    "int_into_f32_once": INT_INTO_F32_ONCE,
+    "f32_precise": F32_PRECISE,
 }
 
-# ritz0's _const_value_from_expr takes no null, float or `*u8` string (#3670).
-RITZ0_FAILS = {"repro", "pointers", "f64", "f32", "nested"}
+# ritz1 refuses these literals (see REFUSED's f32_too_many_* rows).
+RITZ0_ONLY = {"f32_precise"}
 
 
-def _params(table, failing):
+def _params(table, ritz1_only=(), ritz0_only=()):
     for name in _ids(table):
         for compiler in COMPILERS:
-            marks = []
-            if compiler == "ritz0" and name in failing:
-                marks = [pytest.mark.xfail(strict=True, reason=f"AGAST #{RITZ0_GAP}")]
-            yield pytest.param(name, compiler, marks=marks)
+            skip = ritz1_only if compiler == "ritz0" else ritz0_only
+            if name in skip:
+                continue
+            yield pytest.param(name, compiler)
 
 
-@pytest.mark.parametrize("name,compiler", list(_params(FORMS, RITZ0_FAILS)))
+@pytest.mark.parametrize("name,compiler", list(_params(FORMS, ritz0_only=RITZ0_ONLY)))
 def test_const_struct_array_field_kinds_lower(tmp_path, compiler, name):
     rc = _run(compiler, tmp_path, name, FORMS[name])
     assert rc == 3, f"{compiler} build of {name} exited {rc}, expected 3"
@@ -287,11 +329,11 @@ REFUSED = {
 # The element each row's bad field is in, when it isn't element 0.
 REFUSED_ELEM = {"float_const": 1}
 
-# ritz0 refuses every row with a traceback, not a located error (#3670).
-RITZ0_REFUSE_FAILS = set(REFUSED)
+# ritz1's limit: ritz0 rounds every f32 literal exactly and lowers these (#3670).
+RITZ1_ONLY = {"f32_too_many_digits", "f32_too_many_decimals"}
 
 
-@pytest.mark.parametrize("name,compiler", list(_params(REFUSED, RITZ0_REFUSE_FAILS)))
+@pytest.mark.parametrize("name,compiler", list(_params(REFUSED, RITZ1_ONLY)))
 def test_unsupported_const_field_is_a_located_error(tmp_path, compiler, name):
     body, why = REFUSED[name]
     src = DECLS + body + "\npub fn main() -> i32\n    return 3\n"

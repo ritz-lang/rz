@@ -45,6 +45,22 @@ STRING_LIT_NO_IMPORT = ("`String` is not built in: `import ritzlib.string` "
                         "to make one from a string literal")
 
 
+def _round_int_to_bits(n: int, bits: int) -> int:
+    """`n` rounded to `bits` significant bits, half to even: the value an
+    integer converts to in a float of that precision, as `sitofp` gives
+    (AGAST #3670). `float(n)` alone rounds to 53 bits, so narrowing that to
+    f32 rounds twice."""
+    mag = abs(n)
+    drop = mag.bit_length() - bits
+    if drop <= 0:
+        return n
+    q, r = divmod(mag, 1 << drop)
+    half = 1 << (drop - 1)
+    if r > half or (r == half and q & 1):
+        q += 1
+    return (q << drop) if n >= 0 else -(q << drop)
+
+
 def _source_quote(value: str) -> str:
     """`value` as the "..." literal that writes it: the inverse of the lexer's
     escapes for `"`, `\\`, newline, tab, CR and NUL; every other character,
@@ -2143,7 +2159,7 @@ class LLVMEmitter:
                     elements.append(self._const_str_ptr(elem.value))
                 elif isinstance(elem, rast.StructLit):
                     elements.append(self._make_const_struct_value(
-                        elem, elem_type, f"{name}.arr", (name, len(elements))))
+                        elem, elem_type, f"{name}.arr", (name, len(elements), "")))
                 else:
                     elem_val = self._fold_const_array_elem(name, len(elements), elem, elem_type)
                     elements.append(ir.Constant(elem_type, elem_val))
@@ -2173,18 +2189,12 @@ class LLVMEmitter:
         self.const_arrays[name] = (gvar, llvm_type)
         self.ritz_types[name] = ritz_type
 
-    def _const_value_from_expr(self, expr: rast.Expr, target_type: ir.Type, name_hint: str,
-                               field_of: Optional[Tuple[str, int, str]] = None) -> ir.Constant:
+    def _const_value_from_expr(self, expr: rast.Expr, target_type: ir.Type, name_hint: str) -> ir.Constant:
         """Build a compile-time constant value for globals/const arrays.
 
-        `field_of` is `(const, element, field)` when `expr` is a field of a
-        struct element of a const array. An integer (or bool) field then folds
-        through the const evaluator, as ritz1's const_fold_int does (#1569),
-        and one that doesn't fold is a located error in ritz1's words
-        (AGAST #3650).
+        A field of a const array's struct element goes through
+        `_const_struct_field` instead (AGAST #3650, #3670).
         """
-        if field_of is not None and isinstance(target_type, ir.IntType):
-            return ir.Constant(target_type, self._fold_const_struct_field(expr, target_type, field_of))
         if isinstance(expr, rast.IntLit):
             return ir.Constant(target_type, expr.value)
         if isinstance(expr, rast.UnaryOp) and expr.op == '-' and isinstance(expr.operand, rast.IntLit):
@@ -2206,7 +2216,7 @@ class LLVMEmitter:
 
     def _fold_const_struct_field(self, expr: rast.Expr, target_type: ir.IntType,
                                  field_of: Tuple[str, int, str]) -> int:
-        """Fold integer field `field_of` = (const, element, field) of a const
+        """Fold integer field `field_of` = (const, element, dotted path) of a const
         array's struct element (AGAST #3650). The value is wrapped to the
         field's width in the signed form, as `_fold_const_array_elem` does, so
         the IR holds an in-range literal rather than leaning on LLVM's parser
@@ -2223,11 +2233,13 @@ class LLVMEmitter:
         return self._wrap_to_int_type(value, target_type)
 
     def _make_const_struct_value(self, expr: rast.StructLit, target_type: ir.Type, name_hint: str,
-                                 element_of: Optional[Tuple[str, int]] = None) -> ir.Constant:
+                                 element_of: Optional[Tuple[str, int, str]] = None) -> ir.Constant:
         """Create an LLVM constant for a struct literal used in const contexts.
 
-        `element_of` is `(const, element)` when the literal is an element of a
-        const array; its integer fields then fold (`_const_value_from_expr`).
+        `element_of` is `(const, element, path)` when the literal is in an
+        element of a const array, `path` being the dotted field path to it
+        ("" for the element itself); its fields then lower or are refused as
+        ritz1's are (`_const_struct_field`).
         """
         if expr.name not in self.struct_fields:
             raise ValueError(f"Unknown struct in const literal: {expr.name}")
@@ -2240,17 +2252,95 @@ class LLVMEmitter:
                 raise ValueError(f"Missing field '{field_name}' in const struct literal {expr.name}")
             field_llvm_type = self._ritz_type_to_llvm(field_ritz_type)
             field_expr = field_exprs[field_name]
-            field_of = (*element_of, field_name) if element_of is not None else None
-            if isinstance(field_expr, rast.StructLit):
-                # A nested struct field: its own fields fold in the same element.
-                field_const = self._make_const_struct_value(
-                    field_expr, field_llvm_type, f"{name_hint}.{field_name}", element_of)
+            hint = f"{name_hint}.{field_name}"
+            if element_of is not None:
+                const_name, index, path = element_of
+                field_of = (const_name, index, f"{path}.{field_name}" if path else field_name)
+                field_const = self._const_struct_field(
+                    field_expr, field_ritz_type, field_llvm_type, hint, field_of)
+            elif isinstance(field_expr, rast.StructLit):
+                field_const = self._make_const_struct_value(field_expr, field_llvm_type, hint)
             else:
-                field_const = self._const_value_from_expr(
-                    field_expr, field_llvm_type, f"{name_hint}.{field_name}", field_of)
+                field_const = self._const_value_from_expr(field_expr, field_llvm_type, hint)
             field_constants.append(field_const)
 
         return ir.Constant(target_type, field_constants)
+
+    # The field types a const struct-array element lowers, as ritz1's
+    # emit_const_field_value does (AGAST #3651, #3670).
+    _CONST_INT_FIELD_TYPES = frozenset(
+        ('i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'bool'))
+
+    def _const_struct_field(self, expr: rast.Expr, ritz_type: rast.Type, llvm_type: ir.Type,
+                            name_hint: str, field_of: Tuple[str, int, str]) -> ir.Constant:
+        """Lower field `field_of` = (const, element, dotted path) of a const
+        array's struct element, or raise ritz1's located error (AGAST #3670):
+
+          integer / bool  folded through the const evaluator (#3650)
+          pointer         `null`, or `"..."` / `c"..."` into a `*u8` / `*i8`
+          f64 / f32       a float or integer literal under any number of `-`
+          struct          a nested struct literal, or `"..."` into a StrView
+        """
+        def refuse(why: str):
+            const_name, index, path = field_of
+            raise EmitError(f"const '{const_name}' element {index} field '{path}' {why}",
+                            getattr(expr, "span", None))
+
+        ritz_type = self._resolve_const_field_alias(ritz_type)
+        named = ritz_type.name if isinstance(ritz_type, rast.NamedType) and not ritz_type.args else None
+        if named in self._CONST_INT_FIELD_TYPES:
+            return ir.Constant(llvm_type, self._fold_const_struct_field(expr, llvm_type, field_of))
+        if isinstance(ritz_type, (rast.PtrType, rast.RefType)):
+            if isinstance(expr, rast.NullLit):
+                return ir.Constant(llvm_type, None)
+            inner = ritz_type.inner
+            byte_ptr = isinstance(inner, rast.NamedType) and inner.name in ('u8', 'i8') and not inner.args
+            if byte_ptr and isinstance(expr, (rast.StringLit, rast.CStringLit)):
+                return self._const_str_ptr(expr.value)
+            refuse("is not a constant pointer (null or a string literal)")
+        if named in ('f64', 'f32'):
+            value = self._const_float_literal(expr, named)
+            if value is None:
+                refuse("is not a float literal or an integer literal")
+            return ir.Constant(llvm_type, value)
+        if isinstance(expr, rast.StringLit) and self._is_strview_llvm_type(llvm_type):
+            return self._make_const_strview_value(expr.value, name_hint, llvm_type)
+        if named is not None and named in self.struct_fields:
+            if not isinstance(expr, rast.StructLit):
+                refuse("is not a struct literal")
+            return self._make_const_struct_value(expr, llvm_type, name_hint, field_of)
+        # An enum, an array, or anything else ritz1 has no constant form for.
+        refuse("has a type ritz1 can't lower in a const "
+               "(integer, bool, float, pointer and struct fields are)")
+
+    def _resolve_const_field_alias(self, ty: rast.Type) -> rast.Type:
+        """A field typed by a `type` alias lowers as its target."""
+        if isinstance(ty, rast.NamedType) and not ty.args and ty.name in self.type_aliases:
+            return resolve_alias_in(ty, self.type_aliases)
+        return ty
+
+    @staticmethod
+    def _const_float_literal(expr: rast.Expr, kind: str) -> Optional[float]:
+        """The value of a float field's literal (AGAST #3670): a float or an
+        integer literal (LANGUAGE_SPEC 7.5) under any number of unary `-`, or
+        None for anything else. An f32 value is returned as the double holding
+        it, rounded as at run time: a float literal is decimal -> double ->
+        float (llvmlite narrows the double), an integer goes straight to float
+        as `sitofp` does, so it is rounded here to 24 bits, half to even."""
+        neg = False
+        while isinstance(expr, rast.UnaryOp) and expr.op == '-':
+            neg = not neg
+            expr = expr.operand
+        if isinstance(expr, rast.FloatLit):
+            value = float(expr.value)
+        elif isinstance(expr, rast.IntLit) and not isinstance(expr.value, bool):
+            n = -expr.value if neg else expr.value
+            if kind == 'f32':
+                n = _round_int_to_bits(n, 24)
+            return float(n)
+        else:
+            return None
+        return -value if neg else value
 
     def _is_strview_llvm_type(self, ty: ir.Type) -> bool:
         """Heuristic check for StrView-like LLVM struct: { *i8, i64 }."""
