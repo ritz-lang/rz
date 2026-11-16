@@ -78,13 +78,12 @@ pub fn main() -> i32
     ),
 }
 
-# AGAST #1572: refused by ritz1 and ritz1_selfhosted, which called an
-# undeclared `@<Type>_nope` and failed at link time. A generic instance's
-# methods are monomorphized in each module that calls them (`linkonce_odr`),
-# so one find_spec_impl_method misses is defined nowhere. ritz0 refuses these
-# with an unlocated ValueError: AGAST #3649.
-RITZ1_COMPILERS = ["ritz1", "ritz1_selfhosted"]
-RITZ1_REFUSED = {
+# AGAST #1572, #3649: a generic instance has no `impl W$i32` to name in a
+# hint. ritz1 and ritz1_selfhosted called an undeclared `@<Type>_nope` (a
+# generic instance's methods are monomorphized per calling module, so one
+# find_spec_impl_method misses is defined nowhere), and ritz0's emitter raised
+# an unlocated ValueError. All three refuse it at the method name.
+REFUSED |= {
     "generic_instance": (
         """\
 struct W<T>
@@ -113,8 +112,47 @@ pub fn main() -> i32
     ),
 }
 
+# A StrView's methods are ritzlib's `impl StrView` and ritz0's emitter
+# builtins (`len`, `as_bytes`): its emitter raised an unlocated ValueError for
+# anything else (AGAST #3649). ritz1 refuses it too, but names the type
+# `Span$u8` (AGAST #3697), so this row is ritz0's until that's fixed.
+RITZ0_REFUSED = {
+    "strview": (
+        """\
+pub fn main() -> i32
+    let s = "abc"
+    s.^nope()
+""",
+        # Spelled out: StrView's impl is ritzlib's, so there is no hint.
+        "no method `nope` on `StrView`",
+    ),
+}
+
 # name -> (program, exit status): what still dispatches.
 DISPATCHED = {
+    # The emitters' built-in `len` on a StrView, and on a generic `Vec`
+    # instance with no `vec_len` in scope (AGAST #3649).
+    "strview_len_builtin": (
+        """\
+pub fn main() -> i32
+    let s = "abcd"
+    s.len() as i32
+""",
+        4,
+    ),
+    "vec_len_builtin": (
+        """\
+struct Vec<T>
+    data: *T
+    len: i64
+    cap: i64
+
+pub fn main() -> i32
+    let v = Vec<i32> { data: null, len: 3, cap: 0 }
+    v.len() as i32
+""",
+        3,
+    ),
     "impl_method": (
         FOO
         + """
@@ -223,11 +261,21 @@ def test_method_syntax_needs_an_impl_method(tmp_path, compiler, name):
     _assert_refused(compiler, tmp_path, name, program, message)
 
 
-@pytest.mark.parametrize("compiler", RITZ1_COMPILERS)
-@pytest.mark.parametrize("name", sorted(RITZ1_REFUSED))
-def test_ritz1_refuses_a_method_no_module_defines(tmp_path, compiler, name):
-    program, message = RITZ1_REFUSED[name]
-    _assert_refused(compiler, tmp_path, name, program, message)
+def test_ritz0_refuses_a_strview_method_it_lacks(tmp_path):
+    program, message = RITZ0_REFUSED["strview"]
+    _assert_refused("ritz0", tmp_path, "strview", program, message)
+
+
+# ritz0's emitter builtin `s.as_bytes()` isn't refused (AGAST #3649); ritz1
+# has no such builtin (AGAST #3699).
+def test_ritz0_strview_as_bytes_still_dispatches(tmp_path):
+    program = """\
+pub fn main() -> i32
+    let s = "abcd"
+    let b = s.as_bytes()
+    5
+"""
+    assert _run("ritz0", tmp_path, "as_bytes", program) == 5
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

@@ -932,6 +932,10 @@ class TypeChecker:
                 or receiver.name in ('bool', 'StrView'))):
             for arg in expr.args:
                 self._infer_type(arg)
+            if self._is_strview_without(receiver, expr.method):
+                self._slot_error(ref_rules.no_method(expr.method, 'StrView'),
+                                 expr.name_span or expr.span)
+                return rast.NamedType(expr.span, 'unknown', [])
             # ritzlib's own `impl StrView` declares some (AGAST #3154).
             self._check_value_args(expr, receiver)
             return rast.NamedType(expr.span, 'unknown', [])
@@ -998,6 +1002,17 @@ class TypeChecker:
                              expr.name_span or expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
 
+        if fn_sig is None and self._is_generic_instance_without(receiver, expr.method):
+            # `w.nope()` on a `W<i32>`: ritz1's words, at the method name
+            # (AGAST #3649). The instance has no `impl W$i32` to hint at.
+            for arg in expr.args:
+                self._infer_type(arg)
+            instance = (mangle_generic_name(receiver.name, receiver.args)
+                        if receiver.args else receiver.name)
+            self._slot_error(ref_rules.no_method(expr.method, instance),
+                expr.name_span or expr.span)
+            return rast.NamedType(expr.span, 'unknown', [])
+
         if fn_sig is None:
             # Try just the method name
             tried_names.append(expr.method)
@@ -1048,6 +1063,43 @@ class TypeChecker:
         if type_name == 'StrView':
             return False
         return f"{type_name}_deref" not in self.functions
+
+    # The emitter's own methods on a receiver no source declares them for
+    # (_try_emit_strview_builtin, _try_emit_len_builtin).
+    STRVIEW_BUILTINS = frozenset({'len', 'as_bytes'})
+
+    def _is_strview_without(self, receiver: rast.Type, method: str) -> bool:
+        """Is `receiver` a StrView the emitter would find no `method` on?
+        Its methods are ritzlib's `impl StrView` (`StrView_cmp`) and the
+        emitter's builtins: anything else raised an unlocated ValueError in
+        the emitter (AGAST #3649)."""
+        if not (isinstance(receiver, rast.NamedType) and receiver.name == 'StrView'):
+            return False
+        return (method not in self.STRVIEW_BUILTINS
+                and f"StrView_{method}" not in self.functions
+                and find_ufcs_function(self.functions, 'StrView', method) is None)
+
+    def _is_generic_instance_without(self, receiver: rast.Type, method: str) -> bool:
+        """Is `receiver` an instance of a user generic struct or enum
+        (`W<i32>`, ritzlib's `Vec<i32>`) the emitter would find no `method`
+        on? Its impl methods (`W_get`) and table fns (`vec_push`) were looked
+        up already. The built-in generics' methods are the emitter's, and a
+        `Deref` type's target's are §7.7's: neither is refused here."""
+        if not isinstance(receiver, rast.NamedType):
+            return False
+        # Monomorphised, `W<i32>` is the struct `W$i32`.
+        name = receiver.name.split('$')[0]
+        if not receiver.args and name == receiver.name:
+            return False
+        if name in BUILTIN_GENERICS:
+            return False
+        # The template before monomorphisation, the instance after it.
+        if not any(n in self.structs or n in self.enums for n in (name, receiver.name)):
+            return False
+        if name == 'Vec' and method == 'len':  # _try_emit_len_builtin
+            return False
+        return (f"{name}_deref" not in self.functions
+                and f"{receiver.name}_deref" not in self.functions)
 
     def _has_fn_field(self, type_name: str, name: str) -> bool:
         """Does struct `type_name` have a field `name` of a `fn(...)` type?"""
