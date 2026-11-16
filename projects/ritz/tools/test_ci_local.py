@@ -529,6 +529,7 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "./rz build --all",
         "bash projects/nexus/test/e2e_large_page.sh",
         "bash projects/valet/test/test_tls_socket.sh",
+        "bash projects/valet/test/test_split_request.sh",
         "python3 projects/ritz/tools/smoke_stack",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_tier1_boot.sh",

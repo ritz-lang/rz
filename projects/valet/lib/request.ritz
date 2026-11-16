@@ -78,6 +78,10 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
             req.method_len = pos
             pos += 1
             break
+        # A line break before the space: a junk line, not the start of a
+        # request, so don't let a caller wait for more of it (AGAST #2201).
+        if *(buf + pos) == '\r' || *(buf + pos) == '\n'
+            return REQ_ERR_MALFORMED
         pos += 1
 
     if pos >= len
@@ -91,6 +95,8 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
             req.path_len = pos - path_start
             pos += 1
             break
+        if *(buf + pos) == '\r' || *(buf + pos) == '\n'
+            return REQ_ERR_MALFORMED
         pos += 1
 
     if pos >= len
@@ -260,14 +266,18 @@ fn connection_tokens(buf: *u8, pos: i32, len: i32) -> i32
 
 # Bytes a complete request occupies: headers_end + Content-Length.
 #
-# Returns -1 if the header block is not complete yet (or unparseable), and
-# -2 if Content-Length is invalid (overflowed / negative).  Used to keep
-# receiving a request whose body did not fit the first recv (AGAST #2104).
+# Returns -1 if the header block is not complete yet, -2 if Content-Length
+# is invalid (overflowed / negative), and -3 if the request is malformed, so
+# more input can never complete it.  Used to keep receiving a request that
+# did not fit the first recv: its body (AGAST #2104) or its headers (#2201).
 pub fn request_total_len(buf: *u8, len: i32) -> i64
     var req: Request
     request_init(@req)
-    if request_parse(@req, buf, len) < 0
+    let parsed: i32 = request_parse(@req, buf, len)
+    if parsed == REQ_ERR_INCOMPLETE
         return -1
+    if parsed < 0
+        return -3
     if req.content_length < 0
         return -2
     return req.headers_end as i64 + req.content_length as i64

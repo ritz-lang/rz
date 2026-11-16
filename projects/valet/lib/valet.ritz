@@ -797,6 +797,10 @@ const CONN_STATE_SEND: i32 = 2
 const CONN_STATE_STATIC: i32 = 3  # Serving static file
 const CONN_STATE_PROXY_WAIT: i32 = 4  # Cooperative-yield proxy: wakeup pending
 
+# Size of Task.read_buf (ritzlib's TASK_BUFFER_SIZE): the most header bytes a
+# plain request may arrive with, across however many reads (AGAST #2201).
+const VALET_READ_BUF: i32 = 8192
+
 
 # ============================================================================
 # Cooperative-yield proxy support
@@ -1127,17 +1131,25 @@ pub fn valet_task_send(task: *Task, len: i32) -> i32
     return task_send(task, len)
 
 
+# Build a 413 Request Entity Too Large response (Connection: close) in `res`.
+fn valet_build_413(res: *Response)
+    response_status(res, 413)
+    response_header(res, c"Content-Type", c"text/plain")
+    response_header(res, c"Connection", c"close")
+    let body = c"413 Request Entity Too Large\n"
+    response_content_length(res, 29)
+    response_end_headers(res)
+    response_body(res, body, 29)
+
+
 # Helper to send 413 Request Entity Too Large
 pub fn valet_send_413(task: *Task) -> i32
     var res: Response
     response_init(@res, @task.write_buf[0], 8192)
-    response_status(@res, 413)
-    response_header(@res, c"Content-Type", c"text/plain")
-    response_header(@res, c"Connection", c"close")
-    let body = c"413 Request Entity Too Large\n"
-    response_content_length(@res, 29)
-    response_end_headers(@res)
-    response_body(@res, body, 29)
+    valet_build_413(@res)
+    # It says "Connection: close": make the SEND state close (AGAST #2106's
+    # saturated count), or a client waiting for EOF would wait forever.
+    task.request_count = get_g_app().keepalive_requests
     task.write_len = res.len
     task.write_pos = 0
     task.handler_state = CONN_STATE_SEND
@@ -1192,7 +1204,10 @@ pub fn valet_handle_connection(task: *Task) -> i32
             req_buf = big.ptr
             req_len = big.len as i32
         else
-            task.read_len = task.io_result
+            # Append: read_len is 0 for a new request (spawn_task,
+            # task_reset_for_recv), or the bytes of one whose headers have
+            # not all arrived yet (AGAST #2201).
+            task.read_len = task.read_len + task.io_result
             req_len = task.read_len
 
             # Check request size limit
@@ -1205,6 +1220,14 @@ pub fn valet_handle_connection(task: *Task) -> i32
             let total: i64 = request_total_len(@task.read_buf[0], task.read_len)
             if total == -2
                 return valet_send_413(task)
+            if total == -1
+                # Headers split across reads: read the rest in behind them.
+                if task.read_len >= VALET_READ_BUF
+                    log_warn(c"Request headers exceed the read buffer")
+                    return valet_send_413(task)
+                if task_recv_buf(task, @task.read_buf[task.read_len], VALET_READ_BUF - task.read_len) < 0
+                    return 1
+                return -1
             if total > task.read_len as i64
                 if app.max_request_size > 0 && total > app.max_request_size as i64
                     log_warn(c"Request too large, closing connection")
@@ -1449,13 +1472,34 @@ const TLS_CONN_STATE_HANDSHAKE_SEND: i32 = 5
 # Global TLS server instance per connection
 # We allocate these on the heap since TlsServer is large (~35KB with work buffers)
 # task.user_data points to the TlsTaskData structure
+#
+# Application data is buffered at both layers (AGAST #2201):
+#   rx   ciphertext as received.  One recv can hold several records, or end
+#        partway through one; whole records are decrypted out of the front
+#        and a partial one waits here for the rest (#2197 items 1-3).
+#   req  decrypted plaintext.  A request can span records (a client writes
+#        its request line and headers separately, or a body follows its
+#        headers), so it collects here until it is complete.  8 KiB, the
+#        limit a single record's plaintext had before.  Bytes behind the
+#        request (a pipelined next one) stay for the next round.
+const TLS_REQ_CAP: i64 = 8192
+const TLS_RX_CAP: i64 = 16645  # 5-byte header + 2^14 + 256: a maximal TLSCiphertext
+
 struct TlsTaskData
     pool: *TaskPool             # Pointer to task pool (for I/O)
+    req_len: i64                # Plaintext bytes in `req`
+    rx_len: i64                 # Ciphertext bytes in `rx`
+    req: [8192]u8               # TLS_REQ_CAP
+    rx: [16645]u8               # TLS_RX_CAP
     tls: TlsServer              # TLS connection state (~35KB)
 
-# Allocate TLS task data
+# Bytes mapped for one TlsTaskData, whole pages.
+fn tls_task_data_size() -> i64
+    return ((sizeof(TlsTaskData) as i64 + 4095) / 4096) * 4096
+
+# Allocate TLS task data (zeroed: anonymous mmap)
 pub fn tls_task_data_alloc() -> *TlsTaskData
-    let size: i64 = 40960  # ~40KB for TlsTaskData (TlsServer is ~35KB + work buffers)
+    let size: i64 = tls_task_data_size()
     let flags: i32 = 0x02 | 0x20  # MAP_PRIVATE | MAP_ANONYMOUS
     let prot: i32 = 0x01 | 0x02   # PROT_READ | PROT_WRITE
     let ptr: *u8 = sys_mmap(0, size, prot, flags, -1, 0)
@@ -1466,7 +1510,7 @@ pub fn tls_task_data_alloc() -> *TlsTaskData
 pub fn tls_task_data_free(data: *TlsTaskData)
     if data != null
         tls_server_free(@data.tls)
-        sys_munmap(data as *u8, 40960)
+        sys_munmap(data as *u8, tls_task_data_size())
 
 # TLS-specific I/O helpers that use the pool from TlsTaskData
 pub fn tls_task_recv(task: *Task, tls_data: *TlsTaskData) -> i32
@@ -1474,6 +1518,163 @@ pub fn tls_task_recv(task: *Task, tls_data: *TlsTaskData) -> i32
 
 pub fn tls_task_send(task: *Task, tls_data: *TlsTaskData, len: i32) -> i32
     return task_submit_send(tls_data.pool, task, len)
+
+# Receive application data in behind the ciphertext already buffered.
+fn tls_task_recv_app(task: *Task, tls_data: *TlsTaskData) -> i32
+    let room: i64 = TLS_RX_CAP - tls_data.rx_len
+    return task_submit_recv_buf(tls_data.pool, task, @tls_data.rx[tls_data.rx_len], room as i32)
+
+# Encrypt and send a 413, then close (the SEND state sees the saturated
+# request count).  Returns the handler convention.
+fn valet_tls_send_413(task: *Task, tls_data: *TlsTaskData) -> i32
+    log_warn(c"TLS request too large, closing connection")
+    tls_data.req_len = 0
+    var http_res: [256]u8
+    var res: Response
+    response_init(@res, @http_res[0], 256)
+    valet_build_413(@res)
+    let encrypted_len: i64 = tls_server_write(@tls_data.tls, @http_res[0], res.len as i64, @task.write_buf[0], 8192)
+    if encrypted_len <= 0
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return 1
+    task.request_count = get_g_app().keepalive_requests
+    task.write_len = encrypted_len as i32
+    task.handler_state = TLS_CONN_STATE_SEND
+    if tls_task_send(task, tls_data, encrypted_len as i32) < 0
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return 1
+    return -1
+
+# Serve from the connection's buffers: decrypt every whole record in `rx`
+# into `req`, then answer the request if it is complete or receive more.
+# Returns the handler convention.
+fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
+    var plaintext: [8192]u8
+    var off: i64 = 0
+    while tls_data.rx_len - off >= 5
+        let rec_len: i64 = 5 + (((tls_data.rx[off + 3] as i64) << 8) | (tls_data.rx[off + 4] as i64))
+        if rec_len > TLS_RX_CAP
+            log_warn(c"TLS record too large")
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+        if tls_data.rx_len - off < rec_len
+            break  # partial record: the rest is still on the wire
+        let plaintext_len: i64 = tls_server_read(@tls_data.tls, @tls_data.rx[off], rec_len, @plaintext[0], 8192)
+        if plaintext_len < 0
+            log_warn(c"TLS decrypt failed")
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+        off = off + rec_len
+        if tls_data.req_len + plaintext_len > TLS_REQ_CAP
+            return valet_tls_send_413(task, tls_data)
+        memcpy(@tls_data.req[tls_data.req_len], @plaintext[0], plaintext_len)
+        tls_data.req_len = tls_data.req_len + plaintext_len
+    if off > 0
+        memmove(@tls_data.rx[0], @tls_data.rx[off], tls_data.rx_len - off)
+        tls_data.rx_len = tls_data.rx_len - off
+
+    let req_len: i64 = tls_data.req_len
+
+    # Headers incomplete (-1), or Content-Length bytes still to come: wait
+    # for more records.
+    let total: i64 = request_total_len(@tls_data.req[0], req_len as i32)
+    if total == -2 or total > TLS_REQ_CAP
+        return valet_tls_send_413(task, tls_data)
+    if total == -1 or total > req_len
+        if total == -1 and req_len >= TLS_REQ_CAP
+            return valet_tls_send_413(task, tls_data)
+        let ret = tls_task_recv_app(task, tls_data)
+        if ret < 0
+            tls_task_data_free(tls_data)
+            task.user_data = null
+            return 1
+        return -1
+
+    # Parse HTTP request from the accumulated plaintext
+    var req: Request
+    request_init(@req)
+
+    let parsed = request_parse(@req, @tls_data.req[0], req_len as i32)
+    if parsed < 0
+        log_warn(c"TLS: malformed HTTP request, closing connection")
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return 0
+
+    task.request_count += 1
+    # See valet_handle_connection: close after this response unless
+    # the client asked to persist (AGAST #2106).
+    if valet_keep_alive(@req, task.request_count, app.keepalive_requests) == 0
+        task.request_count = app.keepalive_requests
+
+    # Build response
+    var http_res: [4096]u8
+    var res: Response
+    response_init(@res, @http_res[0], 4096)
+
+    # Set up handler context
+    var handler_ctx: HandlerContext
+    handler_ctx.req = @req
+    handler_ctx.res = @res
+    handler_ctx.route_result = null
+    handler_ctx.path = req.path_ptr
+    handler_ctx.path_len = req.path_len
+    handler_ctx.raw_buf = @tls_data.req[0]
+    handler_ctx.raw_len = req_len as i32
+    handler_ctx.task = task
+    set_g_ctx(@handler_ctx)
+
+    # Run middleware
+    let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
+    if mw_result != MW_CONTINUE
+        set_g_ctx(null)
+    else
+        # Try to match route
+        var route_result: RouteMatch
+        let matched: i32 = router_match(@app.router, req.method_ptr, req.path_ptr, req.path_len, @route_result)
+
+        if matched == 1
+            handler_ctx.route_result = @route_result
+            let h: fn(*u8, i32) -> i32 = route_result.handler
+            let status: i32 = h(req.path_ptr, req.path_len)
+            set_g_ctx(null)
+            if status != 0 && res.len == 0
+                response_status(@res, 500)
+                response_header(@res, c"Content-Type", c"text/plain")
+                let body = c"Internal Server Error\n"
+                response_content_length(@res, 22)
+                response_end_headers(@res)
+                response_body(@res, body, 22)
+        else
+            set_g_ctx(null)
+            response_not_found(@res)
+
+    # The request is answered: drop it, keeping any pipelined bytes behind it.
+    let rest: i64 = req_len - total
+    memmove(@tls_data.req[0], @tls_data.req[total], rest)
+    tls_data.req_len = rest
+
+    # Encrypt and send response
+    let encrypted_len: i64 = tls_server_write(@tls_data.tls, @http_res[0], res.len as i64, @task.write_buf[0], 8192)
+    if encrypted_len <= 0
+        log_error(c"TLS encrypt failed")
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return 1
+
+    task.write_len = encrypted_len as i32
+    task.handler_state = TLS_CONN_STATE_SEND
+    let ret = tls_task_send(task, tls_data, encrypted_len as i32)
+    if ret < 0
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return 1
+    return -1
+
 
 pub fn valet_handle_tls_connection(task: *Task) -> i32
     prints("[TLS] handle_tls_connection called\n")
@@ -1602,9 +1803,9 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                 task.handler_state = TLS_CONN_STATE_RECV
                 # The first request can share a read with the client's
                 # Finished: serve it now, as no later recv will return it.
-                let buffered: i64 = tls_server_take_buffered(@tls_data.tls, @task.read_buf[0], 8192)
+                let buffered: i64 = tls_server_take_buffered(@tls_data.tls, @tls_data.rx[0], TLS_RX_CAP)
                 if buffered == 0
-                    let ret = tls_task_recv(task, tls_data)
+                    let ret = tls_task_recv_app(task, tls_data)
                     if ret < 0
                         tls_task_data_free(tls_data)
                         task.user_data = null
@@ -1616,7 +1817,7 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
     if task.handler_state == TLS_CONN_STATE_RECV
         if task.io_result == TASK_IO_FRESH
             # Fresh task — never submitted recv. Submit the initial recv now.
-            let ret = tls_task_recv(task, tls_data)
+            let ret = tls_task_recv_app(task, tls_data)
             if ret < 0
                 tls_task_data_free(tls_data)
                 task.user_data = null
@@ -1629,90 +1830,9 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
             task.user_data = null
             return 0
 
-        # Decrypt application data
-        var plaintext: [8192]u8
-        let plaintext_len: i64 = tls_server_read(@tls_data.tls, @task.read_buf[0], task.io_result as i64, @plaintext[0], 8192)
-
-        if plaintext_len <= 0
-            log_warn(c"TLS decrypt failed")
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 1
-
-        # Parse HTTP request from decrypted data
-        var req: Request
-        request_init(@req)
-
-        let parsed = request_parse(@req, @plaintext[0], plaintext_len as i32)
-        if parsed < 0
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 0
-
-        task.request_count += 1
-        # See valet_handle_connection: close after this response unless
-        # the client asked to persist (AGAST #2106).
-        if valet_keep_alive(@req, task.request_count, app.keepalive_requests) == 0
-            task.request_count = app.keepalive_requests
-
-        # Build response
-        var http_res: [4096]u8
-        var res: Response
-        response_init(@res, @http_res[0], 4096)
-
-        # Set up handler context
-        var handler_ctx: HandlerContext
-        handler_ctx.req = @req
-        handler_ctx.res = @res
-        handler_ctx.route_result = null
-        handler_ctx.path = req.path_ptr
-        handler_ctx.path_len = req.path_len
-        handler_ctx.raw_buf = @plaintext[0]
-        handler_ctx.raw_len = plaintext_len as i32
-        handler_ctx.task = task
-        set_g_ctx(@handler_ctx)
-
-        # Run middleware
-        let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
-        if mw_result != MW_CONTINUE
-            set_g_ctx(null)
-        else
-            # Try to match route
-            var route_result: RouteMatch
-            let matched: i32 = router_match(@app.router, req.method_ptr, req.path_ptr, req.path_len, @route_result)
-
-            if matched == 1
-                handler_ctx.route_result = @route_result
-                let h: fn(*u8, i32) -> i32 = route_result.handler
-                let status: i32 = h(req.path_ptr, req.path_len)
-                set_g_ctx(null)
-                if status != 0 && res.len == 0
-                    response_status(@res, 500)
-                    response_header(@res, c"Content-Type", c"text/plain")
-                    let body = c"Internal Server Error\n"
-                    response_content_length(@res, 22)
-                    response_end_headers(@res)
-                    response_body(@res, body, 22)
-            else
-                set_g_ctx(null)
-                response_not_found(@res)
-
-        # Encrypt and send response
-        let encrypted_len: i64 = tls_server_write(@tls_data.tls, @http_res[0], res.len as i64, @task.write_buf[0], 8192)
-        if encrypted_len <= 0
-            log_error(c"TLS encrypt failed")
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 1
-
-        task.write_len = encrypted_len as i32
-        task.handler_state = TLS_CONN_STATE_SEND
-        let ret = tls_task_send(task, tls_data, encrypted_len as i32)
-        if ret < 0
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 1
-        return -1
+        # The recv landed behind the buffered ciphertext.
+        tls_data.rx_len = tls_data.rx_len + task.io_result as i64
+        return tls_serve_buffered(task, tls_data, app)
 
     # State: SEND - wait for send completion
     if task.handler_state == TLS_CONN_STATE_SEND
@@ -1725,7 +1845,11 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
         if task.request_count < app.keepalive_requests
             task.handler_state = TLS_CONN_STATE_RECV
             task.io_result = 0
-            let ret = tls_task_recv(task, tls_data)
+            # A pipelined request may already be buffered: no recv would
+            # bring it, as the client is waiting on us.
+            if tls_data.req_len > 0 or tls_data.rx_len > 0
+                return tls_serve_buffered(task, tls_data, app)
+            let ret = tls_task_recv_app(task, tls_data)
             if ret < 0
                 tls_task_data_free(tls_data)
                 task.user_data = null
