@@ -68,15 +68,32 @@
 # blast radius to rooms that have no human in them by construction.
 #
 set -euo pipefail
+# Borque's hostd runs this as a hook with a clean environment (AGAST #3722,
+# .borque/profile.toml): maybe no HOME or PATH.  Supply the standard ones.
+# With no PATH, the gate's venv goes first, as it does on a host's own PATH:
+# ~/dev/.venv (most hosts), then ~/dev/nevelis/.venv (omegalisk), if present.
+# "No PATH" includes bash's own fallback, which it sets but doesn't export.
+: "${HOME:=$(getent passwd "$(id -u)" | cut -d: -f6)}"
+if [[ -z "${PATH:-}" || "$(declare -p PATH)" != "declare -x"* ]]; then
+    PATH=/usr/local/bin:/usr/bin:/bin
+    for _v in "$HOME/dev/nevelis/.venv/bin" "$HOME/dev/.venv/bin"; do
+        [[ -d "$_v" ]] && PATH="$_v:$PATH"
+    done
+    unset _v
+fi
+export HOME PATH
 
 MODE=apply
 case "${1:-}" in
     --verify) MODE=verify; shift ;;
     --remove) MODE=remove; shift ;;
+    # The host checks below and nothing else: "could this host gate a room?"
+    # Any dir on the build filesystem will do, e.g. ~/dev/ritz-lang.
+    --check-host) MODE=check; shift ;;
 esac
 
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 [--verify|--remove] <worktree-path>" >&2
+    echo "usage: $0 [--verify|--remove|--check-host] <worktree-path>" >&2
     exit 2
 fi
 
@@ -217,6 +234,100 @@ PY
     fi
     [[ $rc -eq 0 ]] && echo "  room permissions OK — a headless Write will not block"
     exit $rc
+fi
+
+# --- host checks (apply only) -------------------------------------------------
+# What a room's gate needs that Borque's host probe can't see (AGAST #3722):
+# the probe reports python/pytest/llvm/lld from PATH, not the venv's modules,
+# qemu, OVMF, lld-link, disk for a build, or a scratch dir that can run a binary.
+# A host missing one would pass the probe, take the room, and fail its gate
+# hours later, so refuse here instead: exit 1 with ONE line naming every
+# problem, before anything is written.  Presence and version checks only:
+# this runs at every spawn.  --verify and --remove skip it, so a host that
+# has since lost a tool can still verify and tear down.
+#
+#   RZ_PROVISION_HOST_CHECKS=0   skip (test_provision_room.py; CI has no qemu)
+#   RZ_LLVM_BIN   LLVM's bin dir, added to PATH           (default /usr/lib/llvm-21/bin)
+#   OVMF_CODE     the firmware; else harland/boot/test.sh's search list
+#   RZ_MIN_DISK_GB  free space on the worktree's filesystem (default 20)
+#   RZ_EXEC_DIRS  colon list; one must run a binary
+#                 (default $TMPDIR:/tmp:~/tmp:$RZ_GATE_DIR or ~/dev/ritz-lang/gate-logs:~)
+#
+# The python checked is the one the gate runs: the first python3 on PATH
+# (run-gate.sh passes PATH on; with none, the default above), looked up
+# before LLVM's bin dir and ~/.local/bin (where starbux and chungus keep
+# lld-link) go on PATH here.  No venv path is assumed: omegalisk's is
+# ~/dev/nevelis/.venv, the others' ~/dev/.venv.
+# Tests: projects/ritz/tools/test_borque_hooks.py.
+host_problems() {
+    local py p=() tool f ovmf="" tmp out
+    py="$(command -v python3)" || py=""
+    local PATH="${RZ_LLVM_BIN:-/usr/lib/llvm-21/bin}:$HOME/.local/bin:$PATH"
+    if [[ -z "$py" ]]; then
+        p+=("no python3 on PATH ($PATH)")
+    elif ! out="$("$py" - "$py" 2>&1 <<'PY'
+import importlib.metadata as md, importlib.util as iu, sys
+py = sys.argv[1]
+bad = [f"{m} not importable by {py}" for m in ("llvmlite", "yaml") if iu.find_spec(m) is None]
+try:
+    v = md.version("pytest")
+    if tuple(int(x) for x in v.split(".")[:2] if x.isdigit()) >= (9, 2):
+        bad.append(f"pytest {v} at {py} (need < 9.2, requirements.txt)")
+except md.PackageNotFoundError:
+    bad.append(f"no pytest at {py}")
+print("; ".join(bad))
+sys.exit(1 if bad else 0)
+PY
+)"; then
+        p+=("${out:-$py failed}")
+    fi
+    for tool in qemu-system-x86_64 lld-link; do
+        command -v "$tool" >/dev/null || p+=("no $tool on PATH")
+    done
+    if [[ -n "${OVMF_CODE:-}" ]]; then
+        [[ -f "$OVMF_CODE" ]] && ovmf="$OVMF_CODE"
+    else
+        for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+            /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2-ovmf/x64/OVMF_CODE.4m.fd; do
+            [[ -f "$f" ]] && { ovmf="$f"; break; }
+        done
+    fi
+    [[ -n "$ovmf" ]] || p+=("no OVMF firmware (${OVMF_CODE:-install the ovmf package})")
+    local min="${RZ_MIN_DISK_GB:-20}" free
+    free="$(df -Pk "$WT" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }')"
+    if [[ -z "$free" || "$free" -lt "$min" ]]; then
+        p+=("free disk ${free:-unknown} GB on $WT (need $min)")
+    fi
+    # A gate needs SOME dir that can run a binary, not $TMPDIR in particular:
+    # bangerang's /tmp is noexec for good (CIS policy), and #3704 gives each
+    # gate its own TMPDIR under the gate dir.  Pass on the first usable one.
+    local dirs d ok=""
+    dirs="${RZ_EXEC_DIRS:-${TMPDIR:+$TMPDIR:}/tmp:$HOME/tmp:${RZ_GATE_DIR:-$HOME/dev/ritz-lang/gate-logs}:$HOME}"
+    local IFS=:
+    for d in $dirs; do
+        [[ -d "$d" ]] || continue
+        tmp="$(mktemp "$d/rz-exec.XXXXXX" 2>/dev/null)" || continue
+        printf '#!/bin/sh\nexit 0\n' > "$tmp" && chmod +x "$tmp" && "$tmp" 2>/dev/null && ok="$d"
+        rm -f "$tmp"
+        [[ -n "$ok" ]] && break
+    done
+    unset IFS
+    [[ -n "$ok" ]] || p+=("no exec-able scratch dir (tried $dirs; noexec or unwritable)")
+    local line="" x
+    for x in ${p[@]+"${p[@]}"}; do line+="${line:+; }$x"; done
+    echo "$line"
+}
+
+if [[ $MODE == check || "${RZ_PROVISION_HOST_CHECKS:-1}" != 0 ]]; then
+    problems="$(host_problems)"
+    if [[ -n "$problems" ]]; then
+        echo "provision-room: host can't gate a room: $problems" >&2
+        exit 1
+    fi
+fi
+if [[ $MODE == check ]]; then
+    echo "provision-room: host ok"
+    exit 0
 fi
 
 # --- apply ------------------------------------------------------------------

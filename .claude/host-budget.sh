@@ -90,6 +90,14 @@ GATE_SLOTS=1              # run-gate.sh's default; reported by --verify
 ROOM_CPU_WEIGHT=20
 GATE_CPU_WEIGHT=100
 set -euo pipefail
+# Borque's hostd runs this as a hook with a clean environment (AGAST #3722,
+# .borque/profile.toml): maybe no HOME, PATH or XDG_RUNTIME_DIR.  Supply the
+# standard ones; `systemctl --user` can't reach the user manager without the
+# runtime dir.  Tests: projects/ritz/tools/test_borque_hooks.py.
+: "${HOME:=$(getent passwd "$(id -u)" | cut -d: -f6)}"
+: "${PATH:=/usr/local/bin:/usr/bin:/bin}"
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export HOME PATH XDG_RUNTIME_DIR
 # shellcheck source=host-env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/host-env.sh"
 

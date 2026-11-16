@@ -64,6 +64,9 @@ def env(tmp_path: Path):
     # Pointing both at the scratch dir keeps either version off the real file.
     e["HOME"] = str(cfg)
     e["CLAUDE_CONFIG_DIR"] = str(cfg)
+    # The host checks (AGAST #3722) have their own tests in
+    # test_borque_hooks.py; a CI runner has no qemu or OVMF.
+    e["RZ_PROVISION_HOST_CHECKS"] = "0"
     cj = cfg / ".claude.json"
     cj.write_text(json.dumps({"oauthAccount": {"keep": "me"}, "projects": {}}))
     return {

@@ -1,0 +1,69 @@
+# Borque project profile for ritz-lang/rz (AGAST #3722; Borque #3711/#3716).
+#
+# Borque's hostd reads this file at a run's base_sha and runs each command
+# below as argv: split with shlex, no shell, cwd = the room's worktree
+# (~/borque/worktrees/ritz-task-<id>), with a timeout and a clean environment.
+# So each hook supplies its own HOME/PATH defaults and puts the venv and LLVM
+# on PATH itself.  Schema: borque hostd/schemas/profile.schema.json;
+# validator: hostd.profile.parse(text, "ritz").
+#
+# This file says HOW to provision, gate and tear down a ritz room.  Policy
+# (the room cap, which hosts, review, the train gate host, who answers
+# questions) is Borque's Project row, not this file.
+#
+#   hooks.provision  .claude/provision-room.sh: checks the host has what a
+#                    gate needs (venv modules, pytest < 9.2, qemu, OVMF,
+#                    lld-link, disk, exec-able TMPDIR; one-line reason and
+#                    exit 1 if not), then trusts the worktree so a headless
+#                    agent never blocks on a permission prompt (#1378)
+#   hooks.budget     .claude/host-budget.sh: installs the room's slice and
+#                    memory cap drop-in (MemoryHigh 3500M / MemoryMax 5G,
+#                    CPUWeight 20) and the gate's slice (#1811); --verify
+#                    would only check, so this is the install form
+#   hooks.teardown   the two above, undone: drop the room's drop-in, then
+#                    its trust entry
+#   verify           .borque/verify.sh: gate the room's HEAD (run-gate.sh,
+#                    named by task id) and block; exit = the gate's code
+#   train.gate       .borque/train-gate.sh: gate the train's tip as
+#                    `train.sh gate` does (train priority, the touched
+#                    packages' tests) and block; exit = the gate's code
+#
+# Tests: .borque/test-borque.sh (profile + wrappers) and
+# projects/ritz/tools/test_borque_hooks.py (the hooks, run as hostd runs them).
+
+project = "ritz"
+room_prefix = "ritz-task-"
+
+# Probe capability names only (borque design §7.4).  Left empty for the
+# pilot: the probe reads llvm21 from `llvm-config` and lld from `ld.lld` on
+# hostd's PATH, which starbux doesn't have there (/usr/lib/llvm-21/bin,
+# ~/.local/bin), so listing them would match no host.  The checks the gate
+# really needs are in hooks.provision, which fails with the reason.
+needs = []
+
+# A room plus its own gate.  Both figures are measured and recorded in
+# .claude/host-budget.sh (AGAST #1811): a room is throttled above
+# ROOM_MEMORY_HIGH = 3500M (hard cap 5G), and a clean ci-local gate's
+# memory.peak was 3496 MB (GATE_PEAK_MB = 3500; huburght sees 2.5-3 GiB per
+# gate).  The gate runs uncapped in ritz-gate.slice while the room waits on
+# it: 3500 MiB + 3500 MiB = 6.8 GiB, rounded up.
+reserve_mem_gib = 7.0
+
+verify = ".borque/verify.sh {worktree} {room}"
+deploy.paths = []                 # ritz has no stage deploy
+
+[hooks]
+provision = ".claude/provision-room.sh {worktree}"
+budget = ".claude/host-budget.sh {room}"
+teardown = [
+    ".claude/host-budget.sh --remove {room}",
+    ".claude/provision-room.sh --remove {worktree}",
+]
+
+[train]
+gate = ".borque/train-gate.sh {train_worktree}"
+# False: the train gate also runs the touched packages' tests (#3363), which
+# a room's gate doesn't, so a room's green gate never stands in for it.
+room_gate_equals_train_gate = false
+# rz has landed trains of 12.
+max_cars = 12
