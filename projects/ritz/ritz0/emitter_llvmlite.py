@@ -1986,39 +1986,61 @@ class LLVMEmitter:
 
         return sv
 
-    @staticmethod
-    def _fold_bool_global_init(expr: rast.Expr) -> int | None:
+    def _global_init_const(self, expr: rast.Expr, want_bool: bool) -> int | None:
+        """The folded value of the module const `expr` names (AGAST #3702,
+        ritz0's half of #1540), or None.
+
+        Only an integer const (`want_bool=False`) or a bool const
+        (`want_bool=True`) counts: a float const's value is refused, as
+        ritz1 refuses it, and so is any other name (a global, a fn).  Every
+        scalar const is folded before a global is emitted, so a later or
+        derived const (`const N: i32 = BASE - 4`) is known here."""
+        if not isinstance(expr, rast.Ident) or expr.name not in self.constants:
+            return None
+        value, ty = self.constants[expr.name]
+        if not isinstance(ty, ir.IntType) or not isinstance(value, int):
+            return None
+        if (ty == self.i1) != want_bool:
+            return None
+        return value
+
+    def _fold_bool_global_init(self, expr: rast.Expr) -> int | None:
         """Fold a `bool` global's initializer to 0/1, or None if it is not
-        a `true` / `false` literal under any number of `not` / `!`."""
+        a `true` / `false` literal or a bool const, under any number of
+        `not` / `!`."""
         if isinstance(expr, rast.BoolLit):
             return int(expr.value)
+        if (bit := self._global_init_const(expr, want_bool=True)) is not None:
+            return 1 if bit else 0
         if isinstance(expr, rast.UnaryOp) and expr.op in ('!', 'not'):
-            inner = LLVMEmitter._fold_bool_global_init(expr.operand)
+            inner = self._fold_bool_global_init(expr.operand)
             return None if inner is None else 1 - inner
         return None
 
-    @staticmethod
-    def _fold_scalar_global_init(expr: rast.Expr) -> tuple | None:
+    def _fold_scalar_global_init(self, expr: rast.Expr) -> tuple | None:
         """Fold a global's initializer as ritz1's global_init_fold does
-        (AGAST #3027, #1539): an int, char or float literal, or `null`,
-        under any number of unary `-` (`~` only over an integer) and `as`
-        casts.  Returns `('int', n)`, `('float', x)` or `('null', None)`, or
-        None if it is not one of those.
+        (AGAST #3027, #1539, #1540/#3702): an int, char or float literal, an
+        integer const, or `null`, under any number of unary `-` (`~` only
+        over an integer) and `as` casts.  Returns `('int', n)`,
+        `('float', x)` or `('null', None)`, or None if it is not one of
+        those.
 
         Like ritz1, a cast's target is not consulted: the value is written
-        in the global's own type.  Binary operators and named consts are not
-        folded here, though ConstEvaluator could: ritz1 refuses them, and all
-        three compilers must agree on that (test_global_init_rejected.py)."""
+        in the global's own type.  Binary operators are not folded here,
+        though ConstEvaluator could: ritz1 refuses them, and all three
+        compilers must agree on that (test_global_init_rejected.py)."""
         if isinstance(expr, (rast.IntLit, rast.CharLit)):
             return ('int', expr.value)
+        if (value := self._global_init_const(expr, want_bool=False)) is not None:
+            return ('int', value)
         if isinstance(expr, rast.FloatLit):
             return ('float', expr.value)
         if isinstance(expr, rast.NullLit):
             return ('null', None)
         if isinstance(expr, rast.Cast):
-            return LLVMEmitter._fold_scalar_global_init(expr.expr)
+            return self._fold_scalar_global_init(expr.expr)
         if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
-            inner = LLVMEmitter._fold_scalar_global_init(expr.operand)
+            inner = self._fold_scalar_global_init(expr.operand)
             if inner is None or inner[0] == 'null':
                 return None
             kind, value = inner
@@ -2868,6 +2890,7 @@ class LLVMEmitter:
         # Third pass: collect constants, module-level vars, and extern declarations
         const_arrays = []
         const_exprs = []
+        global_vars = []
         for item in module.items:
             if isinstance(item, rast.ConstDef):
                 ty = self._ritz_type_to_llvm(item.type)
@@ -2903,10 +2926,14 @@ class LLVMEmitter:
                     # every literal const is known (AGAST #2150).
                     const_exprs.append((item, ty))
             elif isinstance(item, rast.VarDef):
-                self._emit_global_var(item)
+                global_vars.append(item)
             elif isinstance(item, rast.ExternFn):
                 self._declare_extern(item)
         self._fold_scalar_consts(const_exprs)
+        # After every scalar const is folded, so `var g: i32 = MAX` reads
+        # MAX's value even when MAX is declared later or derived (#3702).
+        for item in global_vars:
+            self._emit_global_var(item)
         for item in const_arrays:
             self._emit_const_array(item.name, item.type, item.value)
 

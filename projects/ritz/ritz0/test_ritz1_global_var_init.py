@@ -194,6 +194,45 @@ pub fn main() -> i32
         return 3
     return 1
 """,
+    # --- AGAST #1540: a module integer const folds to its value ---
+    # ritz0 folds them too since AGAST #3702, so it is their oracle.
+    "const_ident": """\
+const K: i32 = 3
+var g: i32 = K
+
+pub fn main() -> i32
+    return g
+""",
+    # Needs #1502's folded value: the const's raw int_val would be 0.
+    "const_negative": """\
+const NEG: i64 = -7
+var g: i64 = NEG
+
+pub fn main() -> i32
+    if g == -7
+        return 3
+    return 1
+""",
+    # A const declared after the global and derived from another: resolved
+    # at emit time (PENDING at parse time), and unary minus composes over it.
+    "const_later_derived": """\
+var g: i32 = -NEG3
+
+const NEG3: i32 = BASE - 4
+const BASE: i32 = 1
+
+pub fn main() -> i32
+    return g
+""",
+    "const_bool": """\
+const ON: bool = true
+var g: bool = ON
+
+pub fn main() -> i32
+    if g
+        return 3
+    return 1
+""",
 }
 
 # The forms #1539 made oracle-checked, also run on ritz1_selfhosted.
@@ -281,46 +320,6 @@ var g: *u8 = c"A"
 
 pub fn main() -> i32
     return (*g as i32) - 62
-""",
-    # --- AGAST #1540: a module integer const folds to its value ---
-    # ritz0 refuses these too (its fold has no const lookup), so ritz1 checks
-    # its own value.
-    "const_ident": """\
-const K: i32 = 3
-var g: i32 = K
-
-pub fn main() -> i32
-    return g
-""",
-    # Needs #1502's folded value: the const's raw int_val would be 0.
-    "const_negative": """\
-const NEG: i64 = -7
-var g: i64 = NEG
-
-pub fn main() -> i32
-    if g == -7
-        return 3
-    return 1
-""",
-    # A const declared after the global and derived from another: resolved
-    # at emit time (PENDING at parse time), and unary minus composes over it.
-    "const_later_derived": """\
-var g: i32 = -NEG3
-
-const NEG3: i32 = BASE - 4
-const BASE: i32 = 1
-
-pub fn main() -> i32
-    return g
-""",
-    "const_bool": """\
-const ON: bool = true
-var g: bool = ON
-
-pub fn main() -> i32
-    if g
-        return 3
-    return 1
 """,
 }
 
@@ -554,7 +553,7 @@ def test_ritz1_selfhosted_global_starts_at_initializer(ritz1_bin, tmp_path, name
 @pytest.mark.parametrize("name", FORMS_1540)
 def test_ritz1_selfhosted_global_from_const(ritz1_bin, tmp_path, name):
     """AGAST #1540's const-identifier forms on the third compiler."""
-    assert _run("ritz1_selfhosted", tmp_path, name, RITZ1_ONLY_BROKEN_FORMS[name]) == 3
+    assert _run("ritz1_selfhosted", tmp_path, name, ALL_RUNNABLE[name]) == 3
 
 
 @pytest.mark.integration

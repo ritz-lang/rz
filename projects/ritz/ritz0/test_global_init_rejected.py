@@ -47,6 +47,9 @@ REJECTED = {
     "float_into_bool": ("var g: bool = 1.5\n" + _MAIN, 1, 15, "cannot use a float as bool"),
     "char_into_bool": ("var g: bool = 'A'\n" + _MAIN, 1, 15, "cannot use an integer as bool"),
     "bit_not_float": ("var g: f64 = ~1.5\n" + _MAIN, 1, 14, _NON_CONST),
+    # AGAST #1540 / #3702: an integer or bool const folds (run in
+    # test_ritz1_global_var_init.py), a float const does not.
+    "float_const": ("const F: f64 = 1.5\nvar g: f64 = F\n" + _MAIN, 2, 14, _NON_CONST),
 }
 
 
