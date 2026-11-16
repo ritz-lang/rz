@@ -136,7 +136,7 @@ def test_test_mode_starts_in_the_runners_main(ritz1_bin, tmp_path):
     assert "define void @_start() naked" in ir
     assert "call main" in ir
     assert "leaq 8(%rsp), %rsi" in ir  # argv is passed
-    assert re.search(r'^declare i32 @main\(i32, ptr\)$', ir, re.M), ir
+    assert re.search(r'^declare i32 @main\(i32, ptr\) "no-builtins"$', ir, re.M), ir  # AGAST #1985
 
 
 def test_test_mode_drops_the_files_own_main(ritz1_bin, tmp_path):

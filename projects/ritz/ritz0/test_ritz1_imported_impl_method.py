@@ -271,7 +271,7 @@ def test_imported_method_declare_matches_signature(ritz1_bin, tmp_path):
     )
     assert declares["Pt_huge"].startswith("declare void @Pt_huge(")
     assert declares["Pt_weigh"] == (
-        "declare i64 @Pt_weigh(ptr, ptr byval(%Huge) align 8)"
+        "declare i64 @Pt_weigh(ptr, ptr byval(%Huge) align 8) \"no-builtins\""
     )
     assert declares["Pt_narrow"].startswith("declare i32 @Pt_narrow(")
     assert declares["Pt_swapped"].startswith("declare %Pt @Pt_swapped(")
