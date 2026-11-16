@@ -3371,7 +3371,9 @@ class LLVMEmitter:
         variant = self._get_enum_variant(enum_name, variant_name)
 
         # Allocate stack space for the enum
-        enum_alloca = self.builder.alloca(enum_type, name=f"{variant_name}.alloca")
+        # AGAST #1734: in the entry block, so a ctor in a loop body
+        # reuses one slot instead of growing the stack every iteration.
+        enum_alloca = self.builder._entry_alloca(enum_type, f"{variant_name}.alloca")
 
         # Store the tag (index 0)
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
@@ -3617,7 +3619,9 @@ class LLVMEmitter:
         variant = self._get_enum_variant(enum_name, variant_name)
 
         # Allocate stack space for the enum
-        enum_alloca = self.builder.alloca(enum_type, name=f"{variant_name}.alloca")
+        # AGAST #1734: in the entry block, so a ctor in a loop body
+        # reuses one slot instead of growing the stack every iteration.
+        enum_alloca = self.builder._entry_alloca(enum_type, f"{variant_name}.alloca")
 
         # Store the tag (index 0)
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
@@ -10312,7 +10316,7 @@ class LLVMEmitter:
                 # For params/let bindings that are SSA values, create a temp alloca
                 # This allows borrowing of immutable bindings (for RERITZ @ and call-site borrows)
                 val, ty = self.params[name]
-                temp_alloca = self.builder.alloca(ty, name=f"{name}.addr")
+                temp_alloca = self.builder._entry_alloca(ty, f"{name}.addr")  # AGAST #1734
                 self.builder.store(val, temp_alloca)
                 return temp_alloca
             elif self._is_const_array_name(name):
@@ -11156,7 +11160,7 @@ class LLVMEmitter:
                     # For params/let bindings that are SSA values, create a temp alloca
                     # This allows taking address of immutable bindings (for @ operator in RERITZ)
                     val, ty = self.params[name]
-                    temp_alloca = self.builder.alloca(ty, name=f"{name}.addr")
+                    temp_alloca = self.builder._entry_alloca(ty, f"{name}.addr")  # AGAST #1734
                     self.builder.store(val, temp_alloca)
                     return temp_alloca
                 elif self._is_const_array_name(name):

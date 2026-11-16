@@ -248,9 +248,11 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     ).returncode
 
 
-_DEFINE = re.compile(r"^define\b.*\{\s*$")
+# ritz1 ends the `define` line with `{`; ritz0 puts `{` on the next line.
+_DEFINE = re.compile(r"^define\b")
 _LABEL = re.compile(r"^[A-Za-z_.$][\w.$]*:")
-_ALLOCA = re.compile(r"^\s*%[\w.$]+ = alloca (.*)$")
+# ritz0 quotes register names (`%"q.addr"`); ritz1 does not.
+_ALLOCA = re.compile(r'^\s*%"?[\w.$]+"? = alloca (.*)$')
 
 
 def _misplaced_allocas(ll_text: str) -> list:
@@ -298,28 +300,94 @@ def test_ritz1_allocas_in_entry_block(ritz1_bin, tmp_path, name):
     )
 
 
-# ritz0 hoists locals but not these two temps (`Some.alloca`, and the local
-# of a struct with an array-fill field): it segfaults on them too.  The
-# expected codes above are computed by hand (ITERS * per-iteration / divisor).
-RITZ0_GROWS_STACK = {"variant_ctor", "array_fill"}
+# The twins of the two #1734 sites, ritz0 only.  A call argument or an
+# annotated `let` builds its variant through the expected-enum constructor; an
+# unannotated `let` has no expected enum and takes the bare constructor.  `@v`
+# of a match payload takes its address through the `@` path rather than the
+# place path.
+VARIANT_UNTYPED = f"""\
+enum E
+    A(i64)
+    B
 
+fn get(e: E) -> i64
+    return match e
+        A(v) => v
+        B => 0
 
-def _oracle_param(name: str):
-    if name in RITZ0_GROWS_STACK:
-        return pytest.param(
-            name,
-            marks=pytest.mark.xfail(
-                strict=True, reason="AGAST #1734: ritz0 allocas in loop body"
-            ),
-        )
-    return name
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        let e = A(4)
+        t = t + get(e)
+        i = i + 1
+    return (t / 1000000) as i32
+"""
+
+VARIANT_TYPED = f"""\
+fn take(o: Option<i64>) -> i64
+    return match o
+        Some(v) => v
+        None => 0
+
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    while i < {ITERS}
+        let o: Option<i64> = Some(4)
+        t = t + take(o)
+        i = i + 1
+    return (t / 1000000) as i32
+"""
+
+# The loop is inside the arm, so only `v.addr` is in it (the scrutinee's
+# own `match.enum` slot is a separate site, kept out of this case).
+ADDR_OF_PAYLOAD = f"""\
+fn rd(p: @i64) -> i64
+    return *p
+
+pub fn main() -> i32
+    var t: i64 = 0
+    var i: i64 = 0
+    match Some(2)
+        Some(v) =>
+            while i < {ITERS}
+                t = t + rd(@v)
+                i = i + 1
+        None => t = 0
+    return (t / 1000000) as i32
+"""
+
+RITZ0_CASES = dict(
+    CASES,
+    variant_untyped=(VARIANT_UNTYPED, 40),
+    variant_typed=(VARIANT_TYPED, 40),
+    addr_of_payload=(ADDR_OF_PAYLOAD, 20),
+)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", [_oracle_param(n) for n in sorted(CASES)])
+@pytest.mark.parametrize("name", sorted(RITZ0_CASES))
+def test_ritz0_allocas_in_entry_block(tmp_path, name):
+    """AGAST #1734: every fixed-size alloca ritz0 emits is in `entry:`."""
+    ll = _compile("ritz0", tmp_path, name, RITZ0_CASES[name][0])
+    text = ll.read_text()
+    assert re.search(r"^while\.body:", text, re.MULTILINE), (
+        f"{name}: no loop block emitted"
+    )
+    bad = _misplaced_allocas(text)
+    assert not bad, f"{name}: allocas outside the entry block:\n" + "\n".join(
+        f"  {h}\n    {line}" for h, line in bad
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(RITZ0_CASES))
 def test_ritz0_oracle(tmp_path, name):
-    """The reference answer. If this changes, the oracle moved, not ritz1."""
-    program, want = CASES[name]
+    """The reference answer, under the same 8 MB stack. If this changes, the
+    oracle moved, not ritz1."""
+    program, want = RITZ0_CASES[name]
     assert _run("ritz0", tmp_path, name, program) == want
 
 
