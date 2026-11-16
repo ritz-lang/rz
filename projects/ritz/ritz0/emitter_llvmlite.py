@@ -198,6 +198,8 @@ _GLOBAL_NON_CONSTANT = ("has a non-constant initializer; ritz0 lowers only liter
                         "unary -/~/not of one, null and casts of those")
 
 SRET_MIN_BYTES = 256
+# LLVM refuses a byval param whose type is this big or bigger (AGAST #3668).
+BYVAL_MAX_BYTES = 1 << 32
 
 # ============================================================================
 # Large by-value struct params via byval (AGAST #1739)
@@ -4896,6 +4898,27 @@ class LLVMEmitter:
             fn.calling_convention = cc
         return fn
 
+    def _refuse_huge_byval(self, params, param_types: List[ir.Type]) -> None:
+        """Refuse a by-value param LLVM can't pass byval (AGAST #3668).
+
+        LLVM's verifier rejects a byval type whose alloc size is 2^32 bytes or
+        more ("huge 'byval' arguments are unsupported"), which surfaced as a
+        clang backend crash with no source location.  A multi-GiB copy per
+        call is never what the source meant, so the refusal names the
+        reference to take instead.  ritz1's refuse_huge_byval_params says the
+        same words."""
+        for p, ty in zip(params, param_types):
+            if self._sret_struct_type(ty) is None:
+                continue
+            size = _abi_size_align(ty)[0]
+            if size < BYVAL_MAX_BYTES:
+                continue
+            t = type_to_string(p.type)
+            raise EmitError(
+                f"parameter `{p.name}` is {size} bytes, too large to pass by value "
+                f"(LLVM's byval limit is 4 GiB); take it by reference: "
+                f"`{p.name}: @{t}` or `{p.name}: @&{t}`", p.span)
+
     def _fn_type_byval(self, fn_type: rast.FnType) -> Dict[int, ir.Type]:
         """Logical param index -> %T for the byval params of a Ritz fn-pointer
         type: what _byval_params_of answers for a named fn (AGAST #1739)."""
@@ -5298,6 +5321,7 @@ class LLVMEmitter:
         # This allows linking with external assembly/object files.
         # extern_fns keeps the logical fn_type; the declaration is sret for a
         # large struct return (AGAST #1736), matching its definition.
+        self._refuse_huge_byval(extern.params, param_types)   # AGAST #3668
         fn = self._new_function(extern.name, ret_type, param_types, extern.callconv)
         fn.linkage = 'external'
 
@@ -5421,6 +5445,7 @@ class LLVMEmitter:
         param_types = [self._param_to_llvm_type(p) for p in fn_def.params]
         ret_type = self._ritz_type_to_llvm(fn_def.ret_type) if fn_def.ret_type else self.i32
 
+        self._refuse_huge_byval(fn_def.params, param_types)   # AGAST #3668
         # AGAST #1736: large struct returns become an sret parameter.
         fn = self._new_function(fn_def.name, ret_type, param_types,
                                 fn_def.get_attr_value('callconv'))
