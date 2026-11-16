@@ -4,163 +4,90 @@
 #
 # Presenters transform domain objects into response formats.
 # They handle:
-# - JSON serialization for API responses
-# - HTML rendering (templates)
+# - JSON envelopes for API responses
 # - Content negotiation
 # - Error formatting
 #
 # Example:
 #
-#   struct TaskPresenter
-#
 #   fn present_task(task: *Task) -> Response
 #       var builder: JsonBuilder = json_builder_new()
-#       json_object_start(@builder)
-#       json_field_uuid(@builder, "id", task.id)
-#       json_field_str(@builder, "title", task.title)
-#       json_field_bool(@builder, "completed", task.completed)
-#       json_field_timestamp(@builder, "created_at", task.created_at)
-#       json_object_end(@builder)
-#
-#       var resp: Response = response_ok()
-#       response_json_str(@resp, json_builder_finish(@builder))
-#       return resp
+#       json_object_start(@&builder)
+#       json_field_uuid(@&builder, "id", task.id)
+#       json_field_str(@&builder, "title", string_as_strview(@task.title))
+#       json_object_end(@&builder)
+#       return present_success(json_builder_finish(@&builder))
 
 import ritzlib.option
-import ritzlib.strview { StrView, strview_from_ptr, strview_eq }
-import ritzlib.string { String, string_new, string_push, string_from_strview, string_len }
-import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get_ptr }
+import ritzlib.strview { StrView }
+import ritzlib.string { String }
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.gvec { Vec, vec_len, vec_get_ptr }
 
-import spire.http.request { Request, request_wants_json, request_wants_html }
-import spire.http.response { Response, response_ok, response_created, response_no_content }
-import spire.http.response { response_new, response_json_str, response_html, response_body }
-import spire.http.status { Status, status_ok, status_created, status_no_content }
-import spire.http.status { status_bad_request, status_not_found, status_forbidden }
-import spire.http.status { status_conflict, status_unprocessable_entity, status_internal_server_error }
-import spire.json { JsonBuilder, json_builder_new, json_builder_finish }
-import spire.json { json_object_start, json_object_end, json_array_start, json_array_end }
-import spire.json { json_field_str, json_field_i64, json_field_bool, json_field_null }
-import spire.json { json_field_uuid, json_field_timestamp, json_field_array, json_field_object }
-import spire.json { json_elem_str, json_elem_object }
-import spire.service { ServiceError, ValidationErrors, PageInfo }
-import spire.service { service_error_status_code }
-import spire.model.uuid { Uuid }
-import spire.model.timestamp { Timestamp }
+import http.types { STATUS_OK, STATUS_CREATED, STATUS_BAD_REQUEST, STATUS_FORBIDDEN }
+import http.types { STATUS_NOT_FOUND, STATUS_INTERNAL_SERVER_ERROR }
+import spire.http.request { Request, request_wants_json }
+import spire.http.response { Response, response_no_content, response_json_str, response_html }
+import spire.http.response { response_set_status, response_set_header }
+import spire.json.mod { JsonBuilder, json_builder_new, json_builder_finish }
+import spire.json.mod { json_object_start, json_object_end, json_array_end }
+import spire.json.mod { json_field_str, json_field_i64, json_field_bool, json_field_raw }
+import spire.json.mod { json_field_array, json_field_object }
+import spire.service.mod { ServiceError, ValidationErrors, FieldValidationError, PageInfo }
+import spire.service.mod { service_error_status_code }
 import spire.utils { string_as_strview }
-
-# ============================================================================
-# API Response Envelope
-# ============================================================================
-
-# Standard API response structure
-pub struct ApiResponse<T>
-    success: i32
-    data: Option<T>
-    error: Option<ApiError>
-    meta: Option<ApiMeta>
-
-pub struct ApiError
-    code: String
-    message: String
-    details: Option<Vec<FieldError>>
-
-pub struct FieldError
-    field: String
-    message: String
-
-pub struct ApiMeta
-    pagination: Option<PaginationMeta>
-    timestamp: i64
-
-pub struct PaginationMeta
-    page: i64
-    per_page: i64
-    total_items: i64
-    total_pages: i64
 
 # ============================================================================
 # Response builders
 # ============================================================================
 
+# A JSON response with `status` and `body`
+fn json_response(status: i32, body: StrView) -> Response
+    let sp: Span<u8> = span_from_strview(body)
+    var resp: Response = response_json_str(@sp)
+    response_set_status(@resp, status)
+    return resp
+
+# {"success":true,"data":<json>} with `status`
+fn present_data(status: i32, json: StrView) -> Response
+    var builder: JsonBuilder = json_builder_new()
+    json_object_start(@&builder)
+    json_field_bool(@&builder, "success", 1)
+    json_field_raw(@&builder, "data", json)
+    json_object_end(@&builder)
+    return json_response(status, json_builder_finish(@&builder))
+
 # Present success with data (JSON body built separately)
 pub fn present_success(json: StrView) -> Response
-    var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
-
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 1)
-
-    let data_field: StrView = "data"
-    json_field_raw(@builder, data_field, json)
-
-    json_object_end(@builder)
-
-    var resp: Response = response_ok()
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
+    return present_data(STATUS_OK, json)
 
 # Present success with pagination
-pub fn present_paginated(json: StrView, page_info: PageInfo) -> Response
+pub fn present_paginated(json: StrView, page_info: *PageInfo) -> Response
     var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
+    json_object_start(@&builder)
+    json_field_bool(@&builder, "success", 1)
+    json_field_raw(@&builder, "data", json)
 
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 1)
+    json_field_object(@&builder, "meta")
+    json_field_object(@&builder, "pagination")
+    json_field_i64(@&builder, "page", page_info.page)
+    json_field_i64(@&builder, "per_page", page_info.per_page)
+    json_field_i64(@&builder, "total_items", page_info.total_items)
+    json_field_i64(@&builder, "total_pages", page_info.total_pages)
+    json_object_end(@&builder)  # pagination
+    json_object_end(@&builder)  # meta
+    json_object_end(@&builder)  # root
 
-    let data_field: StrView = "data"
-    json_field_raw(@builder, data_field, json)
-
-    let meta_field: StrView = "meta"
-    json_field_object(@builder, meta_field)
-
-    let pagination_field: StrView = "pagination"
-    json_field_object(@builder, pagination_field)
-
-    let page_field: StrView = "page"
-    json_field_i64(@builder, page_field, page_info.page)
-
-    let per_page_field: StrView = "per_page"
-    json_field_i64(@builder, per_page_field, page_info.per_page)
-
-    let total_items_field: StrView = "total_items"
-    json_field_i64(@builder, total_items_field, page_info.total_items)
-
-    let total_pages_field: StrView = "total_pages"
-    json_field_i64(@builder, total_pages_field, page_info.total_pages)
-
-    json_object_end(@builder)  # pagination
-    json_object_end(@builder)  # meta
-    json_object_end(@builder)  # root
-
-    var resp: Response = response_ok()
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
+    return json_response(STATUS_OK, json_builder_finish(@&builder))
 
 # Present created resource
 pub fn present_created(json: StrView) -> Response
-    var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
-
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 1)
-
-    let data_field: StrView = "data"
-    json_field_raw(@builder, data_field, json)
-
-    json_object_end(@builder)
-
-    var resp: Response = response_created()
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
+    return present_data(STATUS_CREATED, json)
 
 # Present created with location header
 pub fn present_created_at(json: StrView, location: StrView) -> Response
     var resp: Response = present_created(json)
-    let loc_header: StrView = "Location"
-    response_header(@resp, @loc_header, @location)
+    response_set_header(@resp, span_from_strview("Location"), span_from_strview(location))
     return resp
 
 # Present no content (204)
@@ -171,245 +98,77 @@ pub fn present_no_content() -> Response
 # Error presentation
 # ============================================================================
 
+# {"success":false,"error":{"code":<code>,"message":<message>}} with `status`
+fn present_error_body(status: i32, code: StrView, message: StrView) -> Response
+    var builder: JsonBuilder = json_builder_new()
+    json_object_start(@&builder)
+    json_field_bool(@&builder, "success", 0)
+    json_field_object(@&builder, "error")
+    json_field_str(@&builder, "code", code)
+    json_field_str(@&builder, "message", message)
+    json_object_end(@&builder)  # error
+    json_object_end(@&builder)  # root
+    return json_response(status, json_builder_finish(@&builder))
+
 # Present service error
 pub fn present_error(err: ServiceError) -> Response
-    let status_code: u16 = service_error_status_code(err)
-    let status: Status = status_from_code(status_code)
-
-    var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
-
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 0)
-
-    let error_field: StrView = "error"
-    json_field_object(@builder, error_field)
-
+    let status: i32 = service_error_status_code(err) as i32
     match err
         ValidationError(errors) =>
-            let code_field: StrView = "code"
-            let code_val: StrView = "VALIDATION_ERROR"
-            json_field_str(@builder, code_field, code_val)
-
-            let msg_field: StrView = "message"
-            let msg_val: StrView = "Validation failed"
-            json_field_str(@builder, msg_field, msg_val)
-
-            present_validation_details(@builder, @errors)
-
+            return present_validation_error(status, @errors)
         NotFoundError(msg) =>
-            let code_field: StrView = "code"
-            let code_val: StrView = "NOT_FOUND"
-            json_field_str(@builder, code_field, code_val)
-
-            let msg_field: StrView = "message"
-            json_field_str(@builder, msg_field, string_as_strview(@msg))
-
+            return present_error_body(status, "NOT_FOUND", string_as_strview(@msg))
         ForbiddenError(msg) =>
-            let code_field: StrView = "code"
-            let code_val: StrView = "FORBIDDEN"
-            json_field_str(@builder, code_field, code_val)
-
-            let msg_field: StrView = "message"
-            json_field_str(@builder, msg_field, string_as_strview(@msg))
-
+            return present_error_body(status, "FORBIDDEN", string_as_strview(@msg))
         ConflictError(msg) =>
-            let code_field: StrView = "code"
-            let code_val: StrView = "CONFLICT"
-            json_field_str(@builder, code_field, code_val)
-
-            let msg_field: StrView = "message"
-            json_field_str(@builder, msg_field, string_as_strview(@msg))
-
+            return present_error_body(status, "CONFLICT", string_as_strview(@msg))
         ExternalError(msg) =>
-            let code_field: StrView = "code"
-            let code_val: StrView = "EXTERNAL_ERROR"
-            json_field_str(@builder, code_field, code_val)
+            return present_error_body(status, "EXTERNAL_ERROR", string_as_strview(@msg))
+        InternalError(_) =>
+            # Don't expose internal error details
+            return present_error_body(status, "INTERNAL_ERROR", "An internal error occurred")
 
-            let msg_field: StrView = "message"
-            json_field_str(@builder, msg_field, string_as_strview(@msg))
-
-        InternalError(msg) =>
-            let code_field: StrView = "code"
-            let code_val: StrView = "INTERNAL_ERROR"
-            json_field_str(@builder, code_field, code_val)
-
-            # Don't expose internal error details in production
-            let msg_field: StrView = "message"
-            let safe_msg: StrView = "An internal error occurred"
-            json_field_str(@builder, msg_field, safe_msg)
-
-    json_object_end(@builder)  # error
-    json_object_end(@builder)  # root
-
-    var resp: Response = response_new(status)
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
-
-fn present_validation_details(builder:& JsonBuilder, errors: *ValidationErrors)
-    let details_field: StrView = "details"
-    json_field_array(builder, details_field)
+fn present_validation_error(status: i32, errors: *ValidationErrors) -> Response
+    var builder: JsonBuilder = json_builder_new()
+    json_object_start(@&builder)
+    json_field_bool(@&builder, "success", 0)
+    json_field_object(@&builder, "error")
+    json_field_str(@&builder, "code", "VALIDATION_ERROR")
+    json_field_str(@&builder, "message", "Validation failed")
+    json_field_array(@&builder, "details")
 
     var i: i64 = 0
     while i < vec_len<FieldValidationError>(@errors.errors)
-        let fve: *FieldValidationError = vec_get_ptr<FieldValidationError>(@errors.errors, i)
-
+        let fve: *FieldValidationError = vec_get_ptr<FieldValidationError>(@&errors.errors, i)
         var j: i64 = 0
         while j < vec_len<String>(@fve.messages)
-            json_object_start(builder)
-
-            let field_field: StrView = "field"
-            json_field_str(builder, field_field, string_as_strview(@fve.field))
-
-            let msg_field: StrView = "message"
-            let msg: *String = vec_get_ptr<String>(@fve.messages, j)
-            json_field_str(builder, msg_field, string_as_strview(msg))
-
-            json_object_end(builder)
+            json_object_start(@&builder)
+            json_field_str(@&builder, "field", string_as_strview(@fve.field))
+            json_field_str(@&builder, "message", string_as_strview(vec_get_ptr<String>(@&fve.messages, j)))
+            json_object_end(@&builder)
             j += 1
-
         i += 1
 
-    json_array_end(builder)
-
-# Internal import for service types
-import spire.service { FieldValidationError }
-
-fn status_from_code(code: u16) -> Status
-    var s: Status
-    s.code = code
-    s.reason = status_reason(code)
-    return s
-
-fn status_reason(code: u16) -> StrView
-    if code == 200
-        return "OK"
-    if code == 201
-        return "Created"
-    if code == 204
-        return "No Content"
-    if code == 400
-        return "Bad Request"
-    if code == 403
-        return "Forbidden"
-    if code == 404
-        return "Not Found"
-    if code == 409
-        return "Conflict"
-    if code == 422
-        return "Unprocessable Entity"
-    if code == 500
-        return "Internal Server Error"
-    if code == 502
-        return "Bad Gateway"
-    return "Unknown"
+    json_array_end(@&builder)   # details
+    json_object_end(@&builder)  # error
+    json_object_end(@&builder)  # root
+    return json_response(status, json_builder_finish(@&builder))
 
 # ============================================================================
 # Simple error responses
 # ============================================================================
 
 pub fn present_bad_request(message: StrView) -> Response
-    var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
-
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 0)
-
-    let error_field: StrView = "error"
-    json_field_object(@builder, error_field)
-
-    let code_field: StrView = "code"
-    let code_val: StrView = "BAD_REQUEST"
-    json_field_str(@builder, code_field, code_val)
-
-    let msg_field: StrView = "message"
-    json_field_str(@builder, msg_field, message)
-
-    json_object_end(@builder)
-    json_object_end(@builder)
-
-    var resp: Response = response_new(status_bad_request())
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
+    return present_error_body(STATUS_BAD_REQUEST, "BAD_REQUEST", message)
 
 pub fn present_not_found(resource: StrView) -> Response
-    var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
-
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 0)
-
-    let error_field: StrView = "error"
-    json_field_object(@builder, error_field)
-
-    let code_field: StrView = "code"
-    let code_val: StrView = "NOT_FOUND"
-    json_field_str(@builder, code_field, code_val)
-
-    let msg_field: StrView = "message"
-    json_field_str(@builder, msg_field, resource)
-
-    json_object_end(@builder)
-    json_object_end(@builder)
-
-    var resp: Response = response_new(status_not_found())
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
+    return present_error_body(STATUS_NOT_FOUND, "NOT_FOUND", resource)
 
 pub fn present_forbidden() -> Response
-    var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
-
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 0)
-
-    let error_field: StrView = "error"
-    json_field_object(@builder, error_field)
-
-    let code_field: StrView = "code"
-    let code_val: StrView = "FORBIDDEN"
-    json_field_str(@builder, code_field, code_val)
-
-    let msg_field: StrView = "message"
-    let msg_val: StrView = "Access denied"
-    json_field_str(@builder, msg_field, msg_val)
-
-    json_object_end(@builder)
-    json_object_end(@builder)
-
-    var resp: Response = response_new(status_forbidden())
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
+    return present_error_body(STATUS_FORBIDDEN, "FORBIDDEN", "Access denied")
 
 pub fn present_internal_error() -> Response
-    var builder: JsonBuilder = json_builder_new()
-    json_object_start(@builder)
-
-    let success_field: StrView = "success"
-    json_field_bool(@builder, success_field, 0)
-
-    let error_field: StrView = "error"
-    json_field_object(@builder, error_field)
-
-    let code_field: StrView = "code"
-    let code_val: StrView = "INTERNAL_ERROR"
-    json_field_str(@builder, code_field, code_val)
-
-    let msg_field: StrView = "message"
-    let msg_val: StrView = "An internal error occurred"
-    json_field_str(@builder, msg_field, msg_val)
-
-    json_object_end(@builder)
-    json_object_end(@builder)
-
-    var resp: Response = response_new(status_internal_server_error())
-    let body: StrView = json_builder_finish(@builder)
-    response_json_str(@resp, @body)
-    return resp
+    return present_error_body(STATUS_INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An internal error occurred")
 
 # ============================================================================
 # Content negotiation
@@ -418,44 +177,7 @@ pub fn present_internal_error() -> Response
 # Present based on Accept header
 pub fn present_negotiated(request: *Request, json: StrView, html: StrView) -> Response
     if request_wants_json(request) != 0
-        var resp: Response = response_ok()
-        response_json_str(@resp, @json)
-        return resp
-    else
-        var resp: Response = response_ok()
-        response_html(@resp, @html)
-        return resp
-
-# ============================================================================
-# Raw JSON field insertion helper
-# ============================================================================
-
-fn json_field_raw(builder:& JsonBuilder, name: StrView, value: StrView)
-    # Write field name
-    maybe_comma(builder)
-    vec_push<u8>(@builder.buffer, 34)  # '"'
-    var i: i64 = 0
-    while i < name.len
-        vec_push<u8>(@builder.buffer, *(name.ptr + i))
-        i += 1
-    vec_push<u8>(@builder.buffer, 34)  # '"'
-    vec_push<u8>(@builder.buffer, 58)  # ':'
-
-    # Write raw value
-    i = 0
-    while i < value.len
-        vec_push<u8>(@builder.buffer, *(value.ptr + i))
-        i += 1
-
-    set_needs_comma(builder)
-
-fn maybe_comma(builder:& JsonBuilder)
-    let len: i64 = vec_len<i32>(@builder.needs_comma)
-    if len > 0
-        if *(builder.needs_comma.data + len - 1) != 0
-            vec_push<u8>(@builder.buffer, 44)  # ','
-
-fn set_needs_comma(builder:& JsonBuilder)
-    let len: i64 = vec_len<i32>(@builder.needs_comma)
-    if len > 0
-        *(builder.needs_comma.data + len - 1) = 1
+        let sp: Span<u8> = span_from_strview(json)
+        return response_json_str(@sp)
+    let sp: Span<u8> = span_from_strview(html)
+    return response_html(@sp)

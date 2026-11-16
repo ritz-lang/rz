@@ -1,0 +1,137 @@
+# spire/test/test_presenter.ritz
+#
+# Tests for the presenter layer (lib/presenter): JSON envelopes, error
+# formatting and content negotiation. Until #2424 nothing imported
+# lib/presenter, so it never compiled.
+
+import ritzlib.span { Span, span_from_cstr, span_eq_cstr }
+
+import http.types { STATUS_OK, STATUS_CREATED, STATUS_NO_CONTENT, STATUS_BAD_REQUEST }
+import http.types { STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_INTERNAL_SERVER_ERROR }
+import spire.http.request { Request, request_new, request_set_header }
+import spire.http.response { Response, response_status, response_body }
+import spire.http.response { response_header_count, response_header_name, response_header_value }
+import spire.service.mod { ServiceError, ValidationErrors, PageInfo, PageRequest }
+import spire.service.mod { validation_errors_new, validation_add, service_validation_error }
+import spire.service.mod { service_not_found, service_internal_error, page_request, page_info }
+import spire.presenter.mod { present_success, present_paginated, present_created, present_created_at }
+import spire.presenter.mod { present_no_content, present_error, present_bad_request }
+import spire.presenter.mod { present_not_found, present_forbidden, present_internal_error }
+import spire.presenter.mod { present_negotiated }
+
+fn body_is(resp: *Response, expected: *u8) -> bool
+    var b: Span<u8> = response_body(resp)
+    return span_eq_cstr(@b, expected)
+
+# The value of the response's `name` header equals `expected`
+fn header_is(resp: *Response, name: *u8, expected: *u8) -> bool
+    var i: i64 = 0
+    while i < response_header_count(resp)
+        var n: Span<u8> = response_header_name(resp, i)
+        if span_eq_cstr(@n, name)
+            var v: Span<u8> = response_header_value(resp, i)
+            return span_eq_cstr(@v, expected)
+        i += 1
+    return false
+
+# ============================================================================
+# Success envelopes
+# ============================================================================
+
+[[test]]
+fn test_present_success() -> i32
+    let resp: Response = present_success("[1,2]")
+    assert response_status(@resp) == STATUS_OK
+    assert body_is(@resp, "{\"success\":true,\"data\":[1,2]}")
+    assert header_is(@resp, "Content-Type", "application/json")
+    0
+
+[[test]]
+fn test_present_created_at() -> i32
+    let resp: Response = present_created_at("{\"id\":7}", "/tasks/7")
+    assert response_status(@resp) == STATUS_CREATED
+    assert body_is(@resp, "{\"success\":true,\"data\":{\"id\":7}}")
+    assert header_is(@resp, "Location", "/tasks/7")
+    0
+
+[[test]]
+fn test_present_paginated() -> i32
+    let info: PageInfo = page_info(page_request(2, 10), 35)
+    let resp: Response = present_paginated("[]", @info)
+    assert response_status(@resp) == STATUS_OK
+    assert body_is(@resp, "{\"success\":true,\"data\":[],\"meta\":{\"pagination\":{\"page\":2,\"per_page\":10,\"total_items\":35,\"total_pages\":4}}}")
+    0
+
+[[test]]
+fn test_present_no_content() -> i32
+    let resp: Response = present_no_content()
+    assert response_status(@resp) == STATUS_NO_CONTENT
+    0
+
+# ============================================================================
+# Errors
+# ============================================================================
+
+[[test]]
+fn test_present_bad_request() -> i32
+    let resp: Response = present_bad_request("bad input")
+    assert response_status(@resp) == STATUS_BAD_REQUEST
+    assert body_is(@resp, "{\"success\":false,\"error\":{\"code\":\"BAD_REQUEST\",\"message\":\"bad input\"}}")
+    0
+
+[[test]]
+fn test_present_simple_errors() -> i32
+    let nf: Response = present_not_found("task")
+    assert response_status(@nf) == STATUS_NOT_FOUND
+    assert body_is(@nf, "{\"success\":false,\"error\":{\"code\":\"NOT_FOUND\",\"message\":\"task\"}}")
+    let fb: Response = present_forbidden()
+    assert response_status(@fb) == STATUS_FORBIDDEN
+    let ie: Response = present_internal_error()
+    assert response_status(@ie) == STATUS_INTERNAL_SERVER_ERROR
+    0
+
+[[test]]
+fn test_present_error_not_found() -> i32
+    let resp: Response = present_error(service_not_found("task 7"))
+    assert response_status(@resp) == 404
+    assert body_is(@resp, "{\"success\":false,\"error\":{\"code\":\"NOT_FOUND\",\"message\":\"task 7\"}}")
+    0
+
+[[test]]
+fn test_present_error_hides_internal() -> i32
+    let resp: Response = present_error(service_internal_error("db password wrong"))
+    assert response_status(@resp) == 500
+    assert body_is(@resp, "{\"success\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"An internal error occurred\"}}")
+    0
+
+[[test]]
+fn test_present_error_validation() -> i32
+    var errors: ValidationErrors = validation_errors_new()
+    validation_add(@&errors, "title", "is required")
+    validation_add(@&errors, "title", "is too short")
+    let resp: Response = present_error(service_validation_error(errors))
+    assert response_status(@resp) == 422
+    assert body_is(@resp, "{\"success\":false,\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"Validation failed\",\"details\":[{\"field\":\"title\",\"message\":\"is required\"},{\"field\":\"title\",\"message\":\"is too short\"}]}}")
+    0
+
+# ============================================================================
+# Content negotiation
+# ============================================================================
+
+[[test]]
+fn test_present_negotiated_json() -> i32
+    var req: Request = request_new()
+    let name: Span<u8> = span_from_cstr(c"Accept")
+    let value: Span<u8> = span_from_cstr(c"application/json")
+    request_set_header(@req, @name, @value)
+    let resp: Response = present_negotiated(@req, "{}", "<p/>")
+    assert body_is(@resp, "{}")
+    assert header_is(@resp, "Content-Type", "application/json")
+    0
+
+[[test]]
+fn test_present_negotiated_html() -> i32
+    let req: Request = request_new()
+    let resp: Response = present_negotiated(@req, "{}", "<p/>")
+    assert body_is(@resp, "<p/>")
+    0

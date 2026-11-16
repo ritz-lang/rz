@@ -1,0 +1,142 @@
+# spire/test/test_form.ritz
+#
+# Tests for form parsing, URL encoding and validation (lib/form).
+# Until #2424 nothing imported lib/form, so it never compiled and no
+# checker saw its `@x` calls into mutating callees.
+
+import ritzlib.option
+import ritzlib.strview { StrView, strview_eq }
+import ritzlib.string { String, string_as_view }
+import ritzlib.gvec { Vec, vec_len }
+
+import spire.form.mod { FormData, form_parse, form_get, form_get_all, form_has }
+import spire.form.mod { form_get_i64, form_get_bool, url_encode }
+import spire.service.mod { ValidationErrors, validation_errors_new, validation_add, validation_has_errors }
+import spire.form.mod { validation_error_count, validation_get_error }
+import spire.form.mod { validation_error_json }
+import spire.form.mod { validate_required, validate_min_length, validate_max_length }
+import spire.form.mod { validate_email, validate_numeric, validate_range, validate_matches }
+
+fn get_is(form: *FormData, name: StrView, expected: StrView) -> bool
+    match form_get(form, name)
+        Some(v) => strview_eq(v, expected)
+        None => false
+
+# ============================================================================
+# Parsing
+# ============================================================================
+
+[[test]]
+fn test_form_parse_empty() -> i32
+    let form: FormData = form_parse("")
+    assert form_has(@form, "a") == 0
+    0
+
+[[test]]
+fn test_form_parse_fields() -> i32
+    let form: FormData = form_parse("name=alice&age=30")
+    assert get_is(@form, "name", "alice")
+    assert get_is(@form, "age", "30")
+    assert form_has(@form, "missing") == 0
+    0
+
+[[test]]
+fn test_form_parse_decodes() -> i32
+    let form: FormData = form_parse("q=hello+world%21&k%3D=v")
+    assert get_is(@form, "q", "hello world!")
+    assert get_is(@form, "k=", "v")
+    0
+
+[[test]]
+fn test_form_get_all() -> i32
+    let form: FormData = form_parse("tag=a&tag=b&other=c")
+    let all: Vec<StrView> = form_get_all(@form, "tag")
+    assert vec_len<StrView>(@all) == 2
+    0
+
+[[test]]
+fn test_form_get_i64() -> i32
+    let form: FormData = form_parse("n=-42&bad=x1")
+    let n: i64 = match form_get_i64(@form, "n")
+        Some(v) => v
+        None => 0
+    assert n == -42
+    let bad: i32 = match form_get_i64(@form, "bad")
+        Some(_) => 1
+        None => 0
+    assert bad == 0
+    0
+
+[[test]]
+fn test_form_get_bool() -> i32
+    let form: FormData = form_parse("a=on&b=true&c=no&d=")
+    assert form_get_bool(@form, "a") == 1
+    assert form_get_bool(@form, "b") == 1
+    assert form_get_bool(@form, "c") == 0
+    assert form_get_bool(@form, "d") == 1
+    assert form_get_bool(@form, "e") == 0
+    0
+
+# ============================================================================
+# Encoding
+# ============================================================================
+
+[[test]]
+fn test_url_encode() -> i32
+    let s: String = url_encode("a b&c~")
+    assert strview_eq(string_as_view(@s), "a+b%26c~")
+    0
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+[[test]]
+fn test_validation_empty() -> i32
+    let errors: ValidationErrors = validation_errors_new()
+    assert validation_has_errors(errors) == 0
+    assert validation_error_count(@errors) == 0
+    0
+
+[[test]]
+fn test_validation_add_and_get() -> i32
+    var errors: ValidationErrors = validation_errors_new()
+    validation_add(@&errors, "name", "is required")
+    assert validation_has_errors(errors) == 1
+    let ok: bool = match validation_get_error(@errors, "name")
+        Some(m) => strview_eq(m, "is required")
+        None => false
+    assert ok
+    0
+
+[[test]]
+fn test_validators() -> i32
+    let form: FormData = form_parse("email=bad&pw=abc&pw2=abd&age=200&n=x")
+    var errors: ValidationErrors = validation_errors_new()
+    validate_required(@&errors, "name", form_get(@form, "name"))
+    validate_email(@&errors, "email", form_get(@form, "email"))
+    validate_min_length(@&errors, "pw", form_get(@form, "pw"), 8)
+    validate_max_length(@&errors, "pw", form_get(@form, "pw"), 2)
+    validate_matches(@&errors, "pw2", form_get(@form, "pw2"), form_get(@form, "pw"), "pw")
+    validate_range(@&errors, "age", form_get(@form, "age"), 0, 150)
+    validate_numeric(@&errors, "n", form_get(@form, "n"))
+    assert validation_error_count(@errors) == 7
+    0
+
+[[test]]
+fn test_validators_pass() -> i32
+    let form: FormData = form_parse("email=a%40b.com&age=20&n=-3&x=1")
+    var errors: ValidationErrors = validation_errors_new()
+    validate_email(@&errors, "email", form_get(@form, "email"))
+    validate_range(@&errors, "age", form_get(@form, "age"), 0, 150)
+    validate_numeric(@&errors, "n", form_get(@form, "n"))
+    assert validation_error_count(@errors) == 0
+    0
+
+[[test]]
+fn test_validation_error_json() -> i32
+    var errors: ValidationErrors = validation_errors_new()
+    validation_add(@&errors, "name", "is required")
+    let json: StrView = validation_error_json(@errors)
+    assert strview_eq(json, "{\"errors\":[{\"field\":\"name\",\"message\":\"is required\"}]}")
+    0
