@@ -519,13 +519,18 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     from `rz build --all`. The other steps are the valet/zeus/nexus e2e
     (AGAST #2107), the valet HTTPS socket test (#2190) and the stack smoke
     gate (#2456), which exit 0 or 1 and never 3 -- test_ci_e2e.py holds them
-    to that. A new step here must make the same promise."""
+    to that. The harland boot (#1845) exits 3 too, and only for the same
+    reason: a missing tool (QEMU, OVMF, GRUB-EFI, or rz build's own exit 3)
+    -- test_ci_harland_boot.py holds it to that. A new step here must make
+    the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
-    assert [s.run.strip() for s in steps] == [
+    assert [s.run.strip().splitlines()[-1] for s in steps] == [
         "./rz build --all",
         "bash projects/nexus/test/e2e_large_page.sh",
         "bash projects/valet/test/test_tls_socket.sh",
         "python3 projects/ritz/tools/smoke_stack.py",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
+        "bash projects/harland/tools/test_tier1_boot.sh",
     ]
 
 

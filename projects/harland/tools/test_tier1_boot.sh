@@ -19,9 +19,14 @@
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds per boot (default 60)
 #        KEEP_WORK=DIR  copy each boot's serial log (NAME.log) into DIR
+#        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #
-# Exit: 0 = pass; 1 = a boot failed; 2 = a required tool is missing (setup
-#       error, not a regression).
+# Exit: 0 = pass; 1 = a boot failed (panic, exception, failed suite, no
+#       verdict before the timeout, or a failed build); 2 = bad usage;
+#       3 = a required tool is missing: a SETUP ERROR, not a regression.
+#       3 is rz's and ci_local.py's EXIT_SETUP (AGAST #1845): CI runs this
+#       in main.yml's build-all job, and ci_local must read a host without
+#       QEMU as "not verified here", never as a pass or a regression.
 
 set -u
 
@@ -35,16 +40,23 @@ MODE="${1:-all}"
 # spawns rzsh and prism's hello_gfx as well as indium's binaries.
 USER_PKGS="indium rzsh ritzutils prism"
 
-setup_error() { echo "SETUP ERROR: $*" >&2; exit 2; }
+EXIT_SETUP=3
+setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
 
 case "$MODE" in native|grub|all) ;; *) echo "usage: $0 [native|grub|all]" >&2; exit 2 ;; esac
 
 command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found"
-OVMF_CODE=""
-for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd; do
-    if [ -f "$p" ]; then OVMF_CODE="$p"; break; fi
-done
-[ -n "$OVMF_CODE" ] || setup_error "OVMF firmware not found"
+# Each boot writes a qcow2 overlay; without qemu-img that read as a boot
+# that never reported a verdict (a FAIL) rather than a missing tool.
+command -v qemu-img >/dev/null || setup_error "qemu-img not found (qemu-utils)"
+if [ -n "${OVMF_CODE:-}" ]; then
+    [ -f "$OVMF_CODE" ] || setup_error "OVMF firmware not found: $OVMF_CODE"
+else
+    for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd; do
+        if [ -f "$p" ]; then OVMF_CODE="$p"; break; fi
+    done
+    [ -n "$OVMF_CODE" ] || setup_error "OVMF firmware not found"
+fi
 OVMF_VARS=""
 for p in "${OVMF_CODE/CODE/VARS}" /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do
     if [ -f "$p" ]; then OVMF_VARS="$p"; break; fi
@@ -56,7 +68,12 @@ fi
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     for pkg in harland $USER_PKGS; do
-        (cd "$ROOT_DIR" && ./rz build "$pkg") || { echo "FAIL: build of $pkg failed"; exit 1; }
+        (cd "$ROOT_DIR" && ./rz build "$pkg")
+        brc=$?
+        # rz exits EXIT_SETUP when a toolchain binary is missing (lld-link
+        # for BOOTX64.EFI): the host's fault, not the code's.
+        [ "$brc" -eq "$EXIT_SETUP" ] && setup_error "build of $pkg: a toolchain binary is missing"
+        [ "$brc" -eq 0 ] || { echo "FAIL: build of $pkg failed"; exit 1; }
     done
 fi
 

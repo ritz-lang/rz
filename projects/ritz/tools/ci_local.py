@@ -72,7 +72,8 @@ broke angelo, gated green, and turned main's build-all red for nine runs.
 
 Exit code: 0 only if every step it ran exited 0. A step that exits 3
 (EXIT_SETUP: `rz build --all` saying a toolchain binary is missing, e.g.
-lld-link) is a SETUP ERROR: it does not trip --fail-fast, and if every failure
+lld-link, or the harland boot missing QEMU/OVMF/GRUB-EFI, AGAST #1845)
+is a SETUP ERROR: it does not trip --fail-fast, and if every failure
 was one the run exits 3 -- not 0 (nothing was verified) and not 1 (nothing
 regressed). Any other failure exits 1.
 """

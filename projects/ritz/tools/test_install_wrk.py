@@ -163,10 +163,13 @@ def test_workflow_step_runs_the_script_with_a_timeout():
     steps = [
         s
         for s in wf["jobs"]["build-all"]["steps"]
-        if "install test tools" in s.get("name", "").lower()
+        if "install_wrk.sh" in s.get("run", "")
     ]
     assert len(steps) == 1
     step = steps[0]
+    # ci_local skips it as setup by this name prefix (the harland boot's
+    # install step, AGAST #1845, shares it).
+    assert "install test tools" in step["name"].lower()
     assert step["run"].strip() == "bash .github/scripts/install_wrk.sh"
     # Retries are bounded by the script; the timeout bounds a hung apt.
     assert 0 < step["timeout-minutes"] <= 15
