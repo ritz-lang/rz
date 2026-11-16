@@ -165,3 +165,155 @@ def test_verify_requires_bare_bash_as_well_as_write(env):
     d["permissions"]["allow"].remove("Bash")
     s.write_text(json.dumps(d))
     assert _run(env, "--verify", env["wt"]).returncode == 1
+
+
+# ---------------------------------------------------------------------------
+# AGAST #3568: systemd-run and /tmp scratch
+# ---------------------------------------------------------------------------
+#
+# A bare `Bash` allow lets a room run `systemd-run --user make ...`, which
+# moves the build out of its own unit's 5G cap.  The room settings deny every
+# direct systemd-run spelling; tests that need a real unit go through
+# .claude/room-unit.sh, which pins the unit inside ritz-rooms.slice under its
+# own cap and in the room's /tmp namespace.
+
+ROOM_UNIT = REPO / ".claude" / "room-unit.sh"
+ROOM_UNIT_DENY = {
+    "Bash(systemd-run:*)",
+    "Bash(/usr/bin/systemd-run:*)",
+    "Bash(/bin/systemd-run:*)",
+}
+ROOM_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/ritz.slice/ritz-rooms.slice/adele-agent@ritz-task-9.service\n"
+
+
+def _settings(env) -> dict:
+    return json.loads((Path(env["wt"]) / ".claude" / "settings.json").read_text())
+
+
+def test_apply_denies_direct_systemd_run(env):
+    """Deny beats the bare Bash allow: no direct systemd-run, any spelling."""
+    assert _run(env, env["wt"]).returncode == 0
+    perms = _settings(env)["permissions"]
+    assert ROOM_UNIT_DENY <= set(perms["deny"])
+    # The deny is narrow: Bash itself (and so /tmp scratch) stays allowed.
+    assert "Bash" in perms["allow"]
+    assert not any(d.startswith("Bash(bash") or d == "Bash" for d in perms["deny"])
+
+
+def test_verify_requires_the_systemd_run_deny(env):
+    assert _run(env, env["wt"]).returncode == 0
+    s = Path(env["wt"]) / ".claude" / "settings.json"
+    d = json.loads(s.read_text())
+    d["permissions"]["deny"].remove("Bash(systemd-run:*)")
+    s.write_text(json.dumps(d))
+    r = _run(env, "--verify", env["wt"])
+    assert r.returncode == 1
+    assert "systemd-run" in r.stderr
+
+
+def _unit(tmp_path: Path, *args: str, cgroup: str = ROOM_CGROUP):
+    cg = tmp_path / "cgroup"
+    cg.write_text(cgroup)
+    e = dict(os.environ, ROOM_UNIT_DRY_RUN="1", ROOM_UNIT_CGROUP_FILE=str(cg))
+    return subprocess.run(
+        ["bash", str(ROOM_UNIT), *args], env=e, capture_output=True, text=True
+    )
+
+
+def _argv(r: subprocess.CompletedProcess) -> list[str]:
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout.splitlines()
+
+
+def test_room_unit_pins_the_unit_inside_the_room(tmp_path: Path):
+    """3567's probe, through the wrapper: same options, plus the pins."""
+    argv = _argv(
+        _unit(
+            tmp_path,
+            "--quiet",
+            "--unit=t3567-probe",
+            "--pipe",
+            "-p",
+            "StandardError=file:/home/x/t3567.err",
+            "--setenv=X=a $$ ${HOME} $HOME %h",
+            "--",
+            "/bin/bash",
+            "-c",
+            "echo hi",
+        )
+    )
+    sep = argv.index("--")
+    head, cmd = argv[:sep], argv[sep + 1 :]
+    assert head[0] == "systemd-run"
+    for pin in (
+        "--user",
+        "--wait",
+        "--collect",
+        "--slice=ritz-rooms.slice",
+        "--property=MemoryMax=1G",
+        "--property=CPUWeight=20",
+        "--property=RuntimeMaxSec=900",
+        # The room's PrivateTmp: without these the unit sees the host's /tmp
+        # and 3567's /tmp/t3567probe never appeared to the room.
+        "--property=PrivateTmp=yes",
+        "--property=JoinsNamespaceOf=adele-agent@ritz-task-9.service",
+    ):
+        assert pin in head, (pin, head)
+    assert "--unit=t3567-probe" in head
+    assert "--pipe" in head
+    assert "--property=StandardError=file:/home/x/t3567.err" in head
+    assert "--setenv=X=a $$ ${HOME} $HOME %h" in head
+    assert cmd == ["/bin/bash", "-c", "echo hi"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--slice=user.slice", "--", "make"],
+        ["--slice", "app.slice", "--", "make"],
+        ["-p", "Slice=app.slice", "--", "make"],
+        ["--property=Slice=app.slice", "--", "make"],
+        ["-p", "MemoryMax=infinity", "--", "make"],
+        ["-p", "CPUWeight=100", "--", "make"],
+        ["-p", "JoinsNamespaceOf=foo.service", "--", "make"],
+        ["--scope", "--", "make"],
+        ["--system", "--", "make"],
+        ["--machine=x", "--", "make"],
+        ["--on-active=5", "--", "make"],
+        ["--unit=../x", "--", "make"],
+        ["--unit=ritz-gate.slice", "--", "make"],
+        # The manager opens file: outputs in the HOST's /tmp, not the room's:
+        # 3567's probe file never appeared.  Refused, pointing at --pipe.
+        ["-p", "StandardOutput=file:/tmp/t3567probe", "--", "true"],
+        ["-p", "StandardError=append:/var/tmp/x", "--", "true"],
+        ["--property=StandardOutput=truncate:/tmp/x", "--", "true"],
+        ["make"],  # no `--`: options and command must be unambiguous
+        ["--"],  # no command
+    ],
+)
+def test_room_unit_refuses_anything_that_could_leave_the_room(tmp_path, args):
+    r = _unit(tmp_path, *args)
+    assert r.returncode == 2, (args, r.stdout, r.stderr)
+    assert r.stdout == ""
+
+
+def test_room_unit_refuses_outside_a_room_unit(tmp_path: Path):
+    """No room unit in our cgroup: nothing to pin to, so nothing runs."""
+    r = _unit(tmp_path, "--", "/bin/true", cgroup="0::/user.slice/session-3.scope\n")
+    assert r.returncode == 2
+    assert r.stdout == ""
+
+
+def test_room_unit_restart_self(tmp_path: Path):
+    """The briefing's self-restart, now that direct systemd-run is denied.
+    It can only restart the unit the caller is running in."""
+    assert _argv(_unit(tmp_path, "restart-self")) == [
+        "systemd-run",
+        "--user",
+        "--on-active=15",
+        "systemctl",
+        "--user",
+        "restart",
+        "adele-agent@ritz-task-9.service",
+    ]
+    assert _unit(tmp_path, "restart-self", "adele-agent@rz.service").returncode == 2

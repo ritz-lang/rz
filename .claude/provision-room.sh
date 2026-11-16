@@ -125,11 +125,33 @@ fi
 # room's permission surface is readable in one file instead of inferred from
 # two.  Read/Glob/Grep are read-only tiers adele auto-approves anyway; they are
 # listed for the same reason.
+#
+# DENY: direct systemd-run, every spelling (AGAST #3568).  The room's 5G cap
+# is on its own unit (adele-agent@<room>.service MemoryMax), not on
+# ritz-rooms.slice (32G), so `systemd-run --user make ...` takes a build out
+# of the cap.  With bare Bash allowed it ran without a prompt.  A deny beats
+# the bare allow and is refused outright, so it never waits for a human.
+# Tests that need a real unit, and the self-restart, go through
+# .claude/room-unit.sh, which pins the unit inside the room.  Scripts that
+# call systemd-run themselves (run-gate.sh) are not affected: the CLI only
+# sees `bash <script>`.
+#
+# /tmp scratch (mktemp, cp, sed -i, rm under /tmp) needs no entry: bare Bash
+# and Write cover it, measured 2026-11-16 with CLI 2.1.322.
+#
+# What no entry here can fix (measured, same day): the CLI ASKS for every
+# write under a `.claude/` directory (Write, Edit, `cp`/`sed -i`/`rm`/`>`
+# into it), whatever the allow list, a path rule like Edit(/.claude/**), or a
+# PreToolUse hook answering "allow" say.  In a room that ask goes to adele's
+# callback, which auto-approves Edit, cp, sed -i and > but holds Write and
+# any `rm` for a human: that is what stalled ritz-task-3567.  The briefing
+# (rz-iterate SKILL.md) tells rooms how to work around it.
 read -r -d '' ALLOW_JSON <<'EOF' || true
 {
-  "_comment": "Written by .claude/provision-room.sh — see that file for why these are bare tool names. Machine-local; gitignored. AGAST #1378.",
+  "_comment": "Written by .claude/provision-room.sh — see that file for why these are bare tool names and why systemd-run is denied. Machine-local; gitignored. AGAST #1378, #3568.",
   "permissions": {
-    "allow": ["Write", "Edit", "NotebookEdit", "Read", "Glob", "Grep", "Bash"]
+    "allow": ["Write", "Edit", "NotebookEdit", "Read", "Glob", "Grep", "Bash"],
+    "deny": ["Bash(systemd-run:*)", "Bash(/usr/bin/systemd-run:*)", "Bash(/bin/systemd-run:*)"]
   }
 }
 EOF
@@ -179,6 +201,18 @@ PY
         echo "  ✓ bare 'Write' and 'Bash' allow entries present: $SETTINGS"
     else
         echo "  ✗ $SETTINGS missing a bare 'Write' or 'Bash' allow entry" >&2
+        rc=1
+    fi
+    if [[ -f "$SETTINGS" ]] && python3 - "$SETTINGS" <<'PY'
+import json, sys
+deny = json.load(open(sys.argv[1])).get('permissions', {}).get('deny', [])
+want = {'Bash(systemd-run:*)', 'Bash(/usr/bin/systemd-run:*)', 'Bash(/bin/systemd-run:*)'}
+sys.exit(0 if want <= set(deny) else 1)
+PY
+    then
+        echo "  ✓ direct systemd-run denied (tests use .claude/room-unit.sh)"
+    else
+        echo "  ✗ $SETTINGS missing a systemd-run deny entry: builds could leave the room's cap" >&2
         rc=1
     fi
     [[ $rc -eq 0 ]] && echo "  room permissions OK — a headless Write will not block"

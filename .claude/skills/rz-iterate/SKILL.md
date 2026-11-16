@@ -379,8 +379,12 @@ vouches for that exact commit.
    gate's code (98 = no verdict, 99 = HEAD moved; neither passes). A
    `SETUP ERROR` line means a missing tool on this machine (e.g. lld-link
    for harland), not a regression: fix the machine and re-gate. The gate runs at full CPU weight; your room runs at CPUWeight=20
-   under a 5G memory cap, so room builds can't starve it (#1811). Don't
-   escape the cap with your own `systemd-run`. If you touched packages
+   under a 5G memory cap, so room builds can't starve it (#1811). Your
+   permissions deny `systemd-run` (it would take a build out of the cap).
+   A test that needs a real unit runs it through
+   `bash .claude/room-unit.sh [--pipe] [--unit=NAME] -- <cmd>`, which keeps
+   it in `ritz-rooms.slice` under a 1G, 15-minute cap and shares your /tmp
+   (#3568). Builds never go through it. If you touched packages
    outside `projects/ritz`, also `./rz build <pkg>` and run their tests;
    compare failures against `origin/main` before calling them pre-existing.
    **Only exit 0 passes.**
@@ -417,6 +421,13 @@ under 10 minutes, for anything long. The harness ends a turn after 600s of
 silence on a background wait, and a `Monitor` or wakeup can be lost with it
 (#2333). The gate is detached, so `timeout` only ends the wait.
 
+**Writing under `.claude/` asks a human** for the `Write` tool and any `rm`,
+whatever your permissions say (#3568). Nobody answers a room, so you stall.
+To create a file there, `Write` it to /tmp and `cp` it in. Change files
+with `Edit` or `sed -i`. To delete one, `mv` it to /tmp. A command that
+writes under `.claude/` and contains the word `rm` anywhere (heredoc bodies
+included) still asks. /tmp scratch (mktemp, cp, rm) needs no approval.
+
 **An MCP call rejected (401, expired or invalid token)? Restart yourself.**
 Don't retry, and don't work around it. Your token is read once, at startup
 (#2546). Save the message you were sending, schedule your own restart, and
@@ -424,7 +435,7 @@ end your turn:
 ```bash
 P=$(git rev-parse --git-dir)/pending-mcp   # outside the tree, never committed
 printf '%s\n' "REAP ritz-task-<id> <full-sha> — <one line>" > "$P"
-systemd-run --user --on-active=15 systemctl --user restart adele-agent@ritz-task-<id>.service
+bash .claude/room-unit.sh restart-self   # restarts your own unit in 15s
 ```
 On every rejoin, check for that file first. If it's there, send its line
 exactly as in step 8, then delete it.
@@ -449,8 +460,8 @@ so:
   (step 1). The ticket text is also pasted below. If an AGAST call fails, say so in your REAP, list
   follow-ups there (one line each: title, file:line, why) for `rz` to file,
   and for step 1 REAP `none` with the evidence.
-- **Self-restart** (the `systemd-run` under "An MCP call rejected", below)
-  works the same on this host.
+- **Self-restart** (`room-unit.sh restart-self` under "An MCP call
+  rejected", below) works the same on this host.
 
 <full AGAST ticket text>
 ````
