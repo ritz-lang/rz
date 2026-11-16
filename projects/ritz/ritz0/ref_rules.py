@@ -113,6 +113,9 @@ CONST_SCALAR_ADDR = "cannot take the address of const `{}`; a const scalar has n
 # free fn `<lowercased type>_<m>` to call. ritz1 prints the same words
 # (emitter_expr_call.ritz, refuse_no_method).
 def no_method(method: str, type_name: str, free_call: str | None = None) -> str:
+    # A generic instance (`W$i32`) has no `impl W$i32` to name (AGAST #1572).
+    if "$" in type_name:
+        return f"no method `{method}` on `{type_name}`"
     hint = f"declare it in `impl {type_name}`"
     if free_call:
         hint += f", or call `{free_call}`"

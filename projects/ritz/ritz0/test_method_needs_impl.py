@@ -29,6 +29,12 @@ struct Foo
     x: i32
 """
 
+ENUM = """\
+enum Color
+    Red
+    Blue
+"""
+
 MAIN = """
 pub fn main() -> i32
     let a = Foo { x: 1 }
@@ -59,6 +65,52 @@ fn cmp(a: Foo, b: Foo) -> i32
         + MAIN,
         no_method("cmp", "Foo"),
     ),
+    # An enum is a user type too: ritz1 called an undeclared `@Color_nope`
+    # and failed at link time with no location (AGAST #1572).
+    "enum_no_impl": (
+        ENUM
+        + """
+pub fn main() -> i32
+    let c = Color.Red
+    c.^nope()
+""",
+        no_method("nope", "Color"),
+    ),
+}
+
+# AGAST #1572: refused by ritz1 and ritz1_selfhosted, which called an
+# undeclared `@<Type>_nope` and failed at link time. A generic instance's
+# methods are monomorphized in each module that calls them (`linkonce_odr`),
+# so one find_spec_impl_method misses is defined nowhere. ritz0 refuses these
+# with an unlocated ValueError: AGAST #3649.
+RITZ1_COMPILERS = ["ritz1", "ritz1_selfhosted"]
+RITZ1_REFUSED = {
+    "generic_instance": (
+        """\
+struct W<T>
+    x: T
+
+impl<T> W<T>
+    fn get(self: @W<T>) -> T
+        self.x
+
+pub fn main() -> i32
+    let w = W<i32> { x: 1 }
+    w.^nope()
+""",
+        no_method("nope", "W$i32"),
+    ),
+    # A UFCS-table generic (`vec_<m>$T`) with no `vec_nope`.
+    "ufcs_table_generic": (
+        """\
+import ritzlib.gvec
+
+pub fn main() -> i32
+    var v: Vec<i32> = vec_new<i32>()
+    v.^nope()
+""",
+        no_method("nope", "Vec$i32"),
+    ),
 }
 
 # name -> (program, exit status): what still dispatches.
@@ -87,6 +139,37 @@ impl Cmp for Foo
 """
         + MAIN.replace("^", "").replace("a.cmp(b)", "a.cmp(b) + 10"),
         9,
+    ),
+    # AGAST #1572: an enum's impl method, and a generic impl's at an instance.
+    "enum_impl_method": (
+        ENUM
+        + """
+impl Color
+    fn code(self: @Color) -> i32
+        match *self
+            Red => 3
+            Blue => 4
+
+pub fn main() -> i32
+    let c = Color.Blue
+    c.code()
+""",
+        4,
+    ),
+    "generic_impl_method": (
+        """\
+struct W<T>
+    x: T
+
+impl<T> W<T>
+    fn get(self: @W<T>) -> T
+        self.x
+
+pub fn main() -> i32
+    let w = W<i32> { x: 6 }
+    w.get()
+""",
+        6,
     ),
     # §7.7 rule 2: `w.get()` is the `Deref` target's method, not a missing one.
     "deref_target_method": (
@@ -137,6 +220,13 @@ pub fn main() -> i32
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_method_syntax_needs_an_impl_method(tmp_path, compiler, name):
     program, message = REFUSED[name]
+    _assert_refused(compiler, tmp_path, name, program, message)
+
+
+@pytest.mark.parametrize("compiler", RITZ1_COMPILERS)
+@pytest.mark.parametrize("name", sorted(RITZ1_REFUSED))
+def test_ritz1_refuses_a_method_no_module_defines(tmp_path, compiler, name):
+    program, message = RITZ1_REFUSED[name]
     _assert_refused(compiler, tmp_path, name, program, message)
 
 
