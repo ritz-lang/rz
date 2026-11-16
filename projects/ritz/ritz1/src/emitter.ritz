@@ -2685,10 +2685,10 @@ fn emit_const_struct_literal(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st
 
 # Emit one field's value as an LLVM typed-constant operand.
 # StrView-shaped struct field + StringLit value → %StrView { ptr @str, i64 len }.
-# Scalar (i8/i16/i32/i64) → `<type> <int>` using FieldInit value's int_val.
-# For anything we don't recognise, fall back to zeroinitializer so the
-# overall global still assembles — matches ritz0's "best-effort lowering"
-# behaviour on mixed-shape const arrays.
+# Integer / bool field → `<type> <int>`, the value folded by const_fold_int
+# (AGAST #1569); one that doesn't fold is a located error.
+# Other scalars still take the value's raw int_val (AGAST #3651).
+# A missing field init falls back to zeroinitializer.
 fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, fi: *FieldInit)
     if fi == null
         # Missing field init — shouldn't happen for well-formed source.
@@ -2713,10 +2713,58 @@ fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
     # Scalar / integer path — emit typed integer literal.
     emit_llvm_type(s, field.field_type)
     emit_str(s, c" ")
-    if v != null
-        emit_int(s, v.int_val)
-    else
+    if v == null
         emit_int(s, 0)
+        return
+    # AGAST #1569: an integer field is folded, as #1557 folds primitive
+    # elements.  A raw `int_val` is 0 for `-5`, `K`, `A * 4 - 1`...; a field
+    # that doesn't fold is a located error, never a silent 0.
+    if is_int_const_type(field.field_type) == 1
+        var folded: i64 = 0
+        if const_fold_int(s.module.constants, v, 1, @folded) == 0
+            emit_int(s, 0)
+            const_field_error(s, c, elem_idx, fi)
+            return
+        emit_int(s, folded)
+        return
+    emit_int(s, v.int_val)
+
+# AGAST #1569: field `fi` of struct element `elem_idx` of const array `c` is
+# an integer field whose value isn't a constant integer expression.  Reported
+# at the value (at the const when the value has no position).  The global is
+# mid-line here, so there is no `; ERROR` marker: error_count fails the build.
+fn const_field_error(s: *EmitterState, c: *ConstEntry, elem_idx: i32, fi: *FieldInit)
+    var line: i32 = fi.value.span.line
+    var col: i32 = fi.value.span.col
+    if line == 0
+        line = c.line
+        col = c.col
+    var file: *u8 = c.def_file
+    if file == null
+        file = c.src_file
+    if file == null
+        file = emitter_source_file()
+    if file == null
+        file = c"<input>"
+    eprints_cstr(file)
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": error: const '")
+    var i: i32 = 0
+    while i < c.name_len
+        eprint_char(*(c.name + i))
+        i += 1
+    eprints_cstr(c"' element ")
+    eprint_i64(elem_idx as i64)
+    eprints_cstr(c" field '")
+    i = 0
+    while i < fi.name_len
+        eprint_char(*(fi.name + i))
+        i += 1
+    eprints_cstr(c"' is not a constant integer expression\n")
+    s.error_count = s.error_count + 1
 
 # AGAST #1557: element `idx` of the primitive const array `c` isn't a
 # constant integer expression.  Reported at the const's location (elements
