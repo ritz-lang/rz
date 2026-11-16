@@ -158,3 +158,63 @@ def test_ticket_program(run_with, decl, compiler):
     name = decl.split()[1].rstrip(":")
     prog = TICKET.format(decl=decl, name=name)
     assert run_with(compiler, name, prog) == 256 - 3
+
+
+# AGAST #3645: whole-element writes on a LOCAL `[N]Q` that read their value
+# from the same array.  test_ritz1_global_struct_array.py pins SWAP and
+# COPY_ELEMENT for globals only.  Q's mixed widths (and padding) mean an i64
+# load or store, or a wrong stride, corrupts a field; runtime indices take the
+# dynamic GEP.  Each program returns the number of the first failed check.
+_LOCAL_SETUP = """\
+struct Q
+    a: i8
+    b: f32
+    c: i16
+
+pub fn main() -> i32
+    var g: [4]Q
+    g[0] = Q { a: -7, b: 2.5, c: -300 }
+    g[1] = Q { a: 9, b: -1.5, c: 1234 }
+    g[2] = Q { a: 100, b: 0.25, c: -2 }
+    g[3] = Q { a: 1, b: 1.0, c: 1 }
+    var i: i64 = 0
+    var j: i64 = 2
+"""
+
+LOCAL_FORMS = {
+    # ritzunit shuffle_tests' shape, on a local: g[0] and g[2] trade places.
+    "swap": _LOCAL_SETUP + """\
+    let tmp: Q = g[i]
+    g[i] = g[j]
+    g[j] = tmp
+    if g[0].a != 100 or g[0].b != 0.25 or g[0].c != -2
+        return 1
+    if g[2].a != -7 or g[2].b != 2.5 or g[2].c != -300
+        return 2
+    if g[1].a != 9 or g[1].b != -1.5 or g[1].c != 1234
+        return 3
+    if g[3].a != 1 or g[3].b != 1.0 or g[3].c != 1
+        return 4
+    0
+""",
+    # Element-to-element copy; then the source changes and the copy must not.
+    "copy_element": _LOCAL_SETUP + """\
+    g[3] = g[0]
+    g[0].a = 50
+    if g[3].a != -7 or g[3].b != 2.5 or g[3].c != -300
+        return 1
+    g[j] = g[i + 1]
+    if g[2].a != 9 or g[2].b != -1.5 or g[2].c != 1234
+        return 2
+    if g[1].a != 9 or g[0].a != 50
+        return 3
+    0
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("form", sorted(LOCAL_FORMS))
+def test_local_element_swap_and_copy(run_with, form, compiler):
+    assert run_with(compiler, f"local_{form}", LOCAL_FORMS[form]) == 0
