@@ -266,15 +266,21 @@ ROUTES = {
                        "    return n + (b as i32)\n",
     "aliased_type": "type N = i32\n\nfn w(r:& N)\n    r = 3\n\n"
                     "pub fn main() -> i32\n    var n: i32 = 1\n    w(n)\n    return n\n",
+    # AGAST #2086: a borrowed `*bool`, `*f32` and `*f64` read as the pointer,
+    # so `*p = v` writes the referent.  ritz1 refused the `bool` one as a
+    # pointer and emitted a float store into the borrow slot for the others.
+    "pointer_to_bool_or_float": "fn wb(p:& *bool)\n    *p = true\n\n"
+                                "fn ws(p:& *f32)\n    *p = 1.0\n\n"
+                                "fn wd(p:& *f64)\n    *p = 1.0\n\n"
+                                "pub fn main() -> i32\n    var b: bool = false\n    var s: f32 = 0.0\n"
+                                "    var d: f64 = 0.0\n    var pb: *bool = @b\n    var ps: *f32 = @s\n"
+                                "    var pd: *f64 = @d\n    wb(pb)\n    ws(ps)\n    wd(pd)\n"
+                                "    return (b as i32) + (s as i32) + (d as i32)\n",
 }
 
 
-# ritz1's callee, not the call, and not generic: `:& **C` and `:& *f64` don't
-# bind as their referent either.
-ROUTE_GAPS = {
-    "generic_pointer_to_float": "AGAST #2086: `r = v` in a `:& *f64` writes nothing",
-    "generic_pointer_to_pointer": "AGAST #2086: `r = v` in a `:& **C` writes nothing",
-}
+# name -> AGAST ticket, for a route ritz1 can't run yet (strict xfail).
+ROUTE_GAPS: dict[str, str] = {}
 
 
 def _neighbours(t: str, writer: str) -> str:
