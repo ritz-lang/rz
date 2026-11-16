@@ -2280,6 +2280,15 @@ compilers (`ritz0/test_implicit_int_to_float.py`, AGAST #2945). ritz1 works
 out the integer's type from its Ritz types. Where it can't, for example for an
 unannotated local, it converts without checking rather than guess.
 
+A pointer never converts into a float slot, as the whole initialiser or as an
+`if` / `match` arm (AGAST #2093, `ritz0/test_let_float_pointer.py`). Neither
+does a `bool` (above):
+
+```ritz body expect-error="cannot use a pointer as a float"
+let p: *u8 = c"x"
+let a: f64 = p
+```
+
 #### Implicit narrowing is an error
 
 A typed `let` or `var` whose initialiser is a wider integer is rejected, unless

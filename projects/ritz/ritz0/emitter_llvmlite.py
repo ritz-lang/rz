@@ -6396,6 +6396,7 @@ class LLVMEmitter:
                         self._reject_enum_as_int(val, ty, stmt.type,
                                                  getattr(stmt, 'span', None))
                         self._reject_another_struct(stmt, val, ty)
+                        self._reject_pointer_into_float(val, ty, stmt.value)
                     if stmt.type:
                         self._check_implicit_narrowing(stmt, val.type, ty)
                     # AGAST #1736: an sret call writes the new var in place
@@ -6463,6 +6464,7 @@ class LLVMEmitter:
                 self._reject_enum_as_int(val, declared_ty, stmt.type,
                                          getattr(stmt, 'span', None))
                 self._reject_another_struct(stmt, val, declared_ty)
+                self._reject_pointer_into_float(val, declared_ty, stmt.value)
                 val = self._convert_type(val, declared_ty, stmt.value)
                 self._check_implicit_narrowing(stmt, src_ty, declared_ty)
                 self._check_let_annotation(stmt, val, declared_ty)
@@ -7489,6 +7491,12 @@ class LLVMEmitter:
                 # 1.5 to 1 (#2094).
                 if float_ty is None:
                     self._reject_mixed_int_float_arms(if_expr, arm_types)
+                else:
+                    # #2093: by size, `then p else 1.5` merged at i8*.
+                    self._reject_pointer_into_float(
+                        then_value, float_ty, if_expr.then_block.expr)
+                    self._reject_pointer_into_float(
+                        else_value, float_ty, if_expr.else_block.expr)
                 # All-int arms convert too, each on its own (#3313): merged
                 # at i64 first, `if c then k else 1` (k: i32) was refused
                 # as a lossy i64 -> f64.
@@ -15172,6 +15180,27 @@ class LLVMEmitter:
         "match arms yield both an integer and a float value; write the "
         "integer arm as a float (`0.0`) or annotate the binding")
 
+    # --- AGAST #2093: a pointer into a float slot -----------------------------
+    #
+    # LARB R1 / R4: nothing converts implicitly into a float but a number.
+    # `let a: f64 = p` bound the pointer as an f64, and an if arm `p` next to
+    # `1.5` built `phi i8*` over a double constant. One message for the plain
+    # let / var and for an if or match arm, located at the pointer value.
+
+    POINTER_AS_FLOAT = "cannot use a pointer as a float"
+
+    def _reject_pointer_into_float(self, val: ir.Value, float_ty: ir.Type,
+                                   at: Optional[rast.Expr] = None) -> None:
+        """Refuse `val` landing in `float_ty` when it is a pointer."""
+        if not (isinstance(val.type, ir.PointerType)
+                and isinstance(float_ty, (ir.FloatType, ir.DoubleType))):
+            return
+        if at is None:
+            origin = self._value_origin.get(id(val))
+            at = origin[1] if origin is not None and origin[0] is val else None
+        raise EmitError(self.POINTER_AS_FLOAT,
+                        self._value_span(at) if at is not None else None)
+
     def _merge_value_used(self, node) -> bool:
         """Whether the value of match / if `node` is used (#2046, #2094)."""
         if id(node) in self._tail_merge_ids:
@@ -15202,6 +15231,8 @@ class LLVMEmitter:
         if float_ty is None:
             self._reject_mixed_int_float_arms(expr, [v.type for v, _ in incoming])
             return None
+        for val, _ in incoming:
+            self._reject_pointer_into_float(val, float_ty)
         return self._merge_arms_at_float(incoming, float_ty)
 
     def _merge_match_arms(self, incoming: list) -> ir.Value:

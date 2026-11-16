@@ -18,8 +18,8 @@ This is what ritz1 does since #1946.
 Arm shapes outside that rule are a located diagnostic, not a traceback:
 
 * a pointer arm. ritz1 rejects it too ("match arm yields a non-numeric
-  value"). The plain form `let a: f64 = <ptr>` is wrong in both compilers
-  and is ticketed separately.
+  value"). ritz0 gives the plain form's words, "cannot use a pointer as a
+  float", at the arm (#2093, test_let_float_pointer.py).
 * a bool arm. The plain form converts in both compilers but disagrees on
   the value: ritz0 sitofp's i1 true to -1.0, ritz1 gives 1.0. Merging it
   would copy that bug into the match form, so it stays rejected until the
@@ -633,18 +633,21 @@ def _ritz0_compile(run_ritz0, tmp_path: Path, program: str):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("program", [
-    pytest.param(POINTER_ARM, id="pointer-arm"),
-    pytest.param(BOOL_ARM, id="bool-arm"),
+@pytest.mark.parametrize("program,where,words", [
+    # #2093: at the pointer arm, in the plain form's words.
+    pytest.param(POINTER_ARM, "bad.ritz:7:17:", "cannot use a pointer as a float",
+                 id="pointer-arm"),
+    # At the `let` (line 5), naming the variable and its annotation.
+    pytest.param(BOOL_ARM, "bad.ritz:5:", "`a` is declared `f64`", id="bool-arm"),
 ])
-def test_ritz0_rejects_non_numeric_arm_with_location(run_ritz0, tmp_path, program):
+def test_ritz0_rejects_non_numeric_arm_with_location(run_ritz0, tmp_path, program,
+                                                     where, words):
     comp = _ritz0_compile(run_ritz0, tmp_path, program)
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, out
     assert "Traceback" not in out and "AttributeError" not in out, out
-    # Located at the `let` (line 5), naming the variable and its annotation.
-    assert "bad.ritz:5:" in out, out
-    assert "`a` is declared `f64`" in out, out
+    assert where in out, out
+    assert words in out, out
 
 
 @pytest.mark.integration
