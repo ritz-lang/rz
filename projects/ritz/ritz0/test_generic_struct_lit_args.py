@@ -175,21 +175,21 @@ RUNS = {
 }
 
 
-RITZ0, ALL = ("ritz0",), tuple(COMPILERS)
+ALL = tuple(COMPILERS)
 
-# LARB R51a (#3430): ritz0 only until ritz1 follows (#3431); a row ritz1
-# already gets right (#3408) runs on ALL.  name -> (compilers, source, exit code)
+# LARB R51a: ritz0 (#3430), ritz1 and ritz1_selfhosted (#3431, generic_infer).
+# name -> (compilers, source, exit code)
 R51A_INFERS = {
     # LARB R51a (#3430): a field whose type names none of the outer's
     # params is a slot though the outer literal is args-less.  `Tagged`'s
     # X only the slot binds (it was "can't infer `X`"), and `b`'s `5` is a
     # u8, not a Box2<i64>.
-    "known_field": (RITZ0, TAGGED + "struct W<A>\n    a: A\n    t: Tagged<u8>\n    b: Box2<u8>\n"
+    "known_field": (ALL, TAGGED + "struct W<A>\n    a: A\n    t: Tagged<u8>\n    b: Box2<u8>\n"
                     "fn main() -> i32\n    let w = W { a: 3, t: Tagged { n: 4 }, b: Box2 { v: 5 } }\n"
                     "    w.t.n + w.b.v as i32 * 10 + sizeof(w.b.v) as i32 * 100\n", 154),
     # Two deep: `t`'s slot makes the middle literal a V<u16> (its `2` a u16,
     # not an i64), and its own field the inner one a Tagged<u8>.
-    "known_field_nested": (RITZ0, TAGGED + "struct V<B>\n    b: B\n    u: Tagged<u8>\n"
+    "known_field_nested": (ALL, TAGGED + "struct V<B>\n    b: B\n    u: Tagged<u8>\n"
                            "struct W<A>\n    a: A\n    t: V<u16>\n"
                            "fn main() -> i32\n"
                            "    let w = W { a: 1, t: V { b: 2, u: Tagged { n: 3 } } }\n"
@@ -201,7 +201,7 @@ R51A_INFERS = {
                           "    sizeof(w.t.v) as i32 * 10 + w.t.v as i32\n", 15),
     # The same principle: a generic fn's concrete param is its argument's
     # slot, its `6` a u8.
-    "generic_fn_known_param": (RITZ0, TAGGED + "fn g<U>(x: U, t: Tagged<u8>, b: Box2<u8>) -> i32\n"
+    "generic_fn_known_param": (ALL, TAGGED + "fn g<U>(x: U, t: Tagged<u8>, b: Box2<u8>) -> i32\n"
                                "    t.n + b.v as i32 * 10 + sizeof(b.v) as i32 * 100\n"
                                "fn main() -> i32\n    g(1, Tagged { n: 4 }, Box2 { v: 6 })\n", 164),
 }

@@ -802,6 +802,8 @@ fn gi_walk_stmt(m: *Module, s: *Stmt)
 #      return type (`return`, the tail, each branch of a tail if/match).  The
 #      slot wins; a literal field value then takes the slot's type, as in the
 #      spelled-out literal, and a value of another type is that field's error.
+#      In an args-less literal or inferred generic call, a field or param
+#      whose type names none of its params is a slot too (LARB R51a, #3431).
 #   2. No slot (an untyped let): the field values bind the params by the
 #      section 4.4 call rule above (an integer literal alone binds i64).  An
 #      untyped let doesn't borrow the fn's return type.
@@ -868,7 +870,9 @@ fn gi_slot_block(m: *Module, stmts: *Stmt, sn: *u8, sl: i32)
         gi_slot_arms(m, last.if_then as *MatchArm, sn, sl)
 
 # Each by-value struct param of `params` is its argument's slot.  With
-# `tps`, the callee is generic and (suffix, starts, lens) its written args.
+# `tps`, the callee is generic and (suffix, starts, lens) its written args;
+# a null suffix, its args still inferred: only a param naming none of `tps`
+# is a slot (LARB R51a, #3431).
 fn gi_slot_args(m: *Module, params: *Param, args: *Expr, tps: *TypeParam, suffix: *u8, starts: *i32, lens: *i32)
     var p: *Param = params
     var a: *Expr = args
@@ -876,14 +880,19 @@ fn gi_slot_args(m: *Module, params: *Param, args: *Expr, tps: *TypeParam, suffix
         if p.param_type == TYPE_STRUCT and p.is_borrow == 0 and p.param_type_name != null
             var pn: *u8 = p.param_type_name
             var pl: i32 = p.param_type_name_len
-            if tps != null
+            if tps == null
+                gi_slot(m, a, pn, pl)
+            else if suffix != null
                 pn = substitute_params_in_mangled(tps, suffix, starts, lens, pn, pl, @pl)
-            gi_slot(m, a, pn, pl)
+                gi_slot(m, a, pn, pl)
+            else if gi_names_type_param(tps, pn, pl) == 0
+                gi_slot(m, a, pn, pl)
         p = p.next
         a = a.next
 
 # `f(args)`: a plain fn's params, or a generic's with its written args.  A
-# generic call whose args are inferred gives none: they come from the args.
+# generic call whose args are inferred gives only its fully-known params
+# (LARB R51a): the rest come from the args.
 fn gi_slot_call(m: *Module, e: *Expr)
     if e.func_name == null or gi_find_local(e.func_name, e.func_name_len) >= 0
         return
@@ -894,6 +903,7 @@ fn gi_slot_call(m: *Module, e: *Expr)
         gi_slot_args(m, f.params, e.args, null, null, null, null)
         return
     if e.call_type_suffix_len <= 0
+        gi_slot_args(m, f.params, e.args, f.type_params, null, null, null)
         return
     let cap: i32 = mangled_arg_capacity(e.call_type_suffix, e.call_type_suffix_len)
     let starts: *i32 = malloc((cap as i64) * 4) as *i32
@@ -925,6 +935,25 @@ fn gi_slot_method(m: *Module, e: *Expr)
                 method = method.next
         ib = ib.next
 
+# LARB R51a (#3431): 1 when the mangled type name (`Tag2$u8$A`, `Box2$ptr_A`,
+# `Vec$tuple_A_B`) names any of `tps` in a component or a `_`-piece of one;
+# 0 when it is fully known, so a slot while `tps` are still being inferred.
+# Partly known counts as naming one.  A struct whose own name has a param as
+# a `_`-piece (`My_A`) counts too: the safe way, no slot, as before R51a.
+# Mirrors ritz0's _names_type_param (#3430).
+fn gi_names_type_param(tps: *TypeParam, name: *u8, len: i32) -> i32
+    if tps == null or name == null
+        return 0
+    var pos: i32 = 0
+    while pos < len
+        var end: i32 = pos
+        while end < len and *(name + end) != 36 and *(name + end) != 95   # '$' '_'
+            end = end + 1
+        if type_param_index(tps, name + pos, end - pos) >= 0
+            return 1
+        pos = end + 1
+    0
+
 fn gi_field_named(st: *StructDef, name: *u8, len: i32) -> *StructField
     var f: *StructField = st.fields
     while f != null
@@ -935,8 +964,10 @@ fn gi_field_named(st: *StructDef, name: *u8, len: i32) -> *StructField
 
 # A literal whose struct is known gives each field value that field's type
 # as its slot: `Outer { b: Box2 { v: 8 } }`, `Box2<Box2<u16>> { v: Box2 { v: 1 } }`.
-# An args-less literal's fields give none, as in ritz0: its args aren't known
-# while its field values are walked.
+# An args-less literal's args aren't known while its field values are walked,
+# so only a field whose type names none of its params is a slot (LARB R51a,
+# #3431): `W { a: 3, t: Tagged { n: 4 } }`, `t: Tagged<u8>`.  One naming a
+# param (`t: Box2<A>`) is none: its value infers, then binds A.
 fn gi_field_slots(m: *Module, e: *Expr)
     if e.ident_ptr == null or e.ident_len <= 0
         return
@@ -973,6 +1004,8 @@ fn gi_field_slots(m: *Module, e: *Expr)
                 gi_slot(m, fi.value, fname, flen)
             else if suffix != null
                 fname = substitute_params_in_mangled(tps, suffix, starts, lens, fname, flen, @flen)
+                gi_slot(m, fi.value, fname, flen)
+            else if gi_names_type_param(tps, fname, flen) == 0
                 gi_slot(m, fi.value, fname, flen)
         fi = fi.next
     if starts != null
