@@ -543,3 +543,174 @@ def test_the_ritz0_suite_loads_no_stray_plugins():
     words = step.run.split()
     assert "--disable-plugin-autoload" in words
     assert words[words.index("--disable-plugin-autoload") + 1:][:2] == ["-p", "xdist"]
+
+
+# --------------------------------------------------------------------------
+# AGAST #3456 (LARB review/5 tooling F4): likely failures first.  10 of 18
+# red gates failed in "ritz0 unit tests", 550-674 s in, because that step
+# starts ~6 minutes into the gate.  ci_local now runs the files
+# tools/likely_tests.py picks (with the ritz1 build they need) before the
+# first step, --maxfail=1, and the full step --ignore's them: a likely failure
+# shows in minutes, and a green gate runs every test once, as before.
+# --------------------------------------------------------------------------
+
+LIKELY_WF = """\
+jobs:
+  build-all:
+    steps:
+      - name: Early
+        run: echo early >> {log}
+  bootstrap:
+    steps:
+      - name: Build ritz1 + ritz1_selfhosted
+        run: echo build >> {log}
+      - name: ritz0 unit tests
+        run: |
+          set -o pipefail
+          echo "pytest ADDOPTS=[$PYTEST_ADDOPTS] PARTIAL=[${{RITZ_TEST_BUDGET_PARTIAL:-}}] INCLUDE=[${{RITZ_COST_REPORT_INCLUDE:-}}]" >> {log}
+          echo "{{\\"run\\": \\"$RITZ_TEST_BUDGET_PARTIAL\\"}}" > pytest-cost.json
+          : stands in for pytest --cost-report=pytest-cost.json
+          if [ -n "${{RITZ_TEST_BUDGET_PARTIAL:-}}" ] && [ -e {fail} ]; then exit 1; fi
+        working-directory: r0
+      - name: Late
+        run: echo late >> {log}
+"""
+
+
+@pytest.fixture
+def likely(tmp_path, monkeypatch):
+    """A gate-shaped workflow; every step appends a line to `log`."""
+    log, fail = tmp_path / "log", tmp_path / "fail-prepass"
+    (tmp_path / "r0").mkdir()
+    wf = tmp_path / "main.yml"
+    wf.write_text(LIKELY_WF.format(log=log, fail=fail))
+    monkeypatch.setattr(ci_local, "WORKFLOW", wf)
+    monkeypatch.setattr(ci_local, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ci_local.likely_tests, "select",
+                        lambda root: ["test_a.py", "emitter/test_b.py"])
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+
+    class Run:
+        def __init__(self):
+            self.fail = fail
+
+        def lines(self):
+            return log.read_text().splitlines() if log.exists() else []
+
+    return Run()
+
+
+GATE = ["--fail-fast", "--job", "build-all", "--job", "bootstrap"]
+
+
+def test_likely_files_run_first_with_their_build_then_the_rest(likely, capsys):
+    assert ci_local.main(GATE) == 0
+    first_pytest, rest = [ln for ln in likely.lines() if ln.startswith("pytest")]
+    assert [ln.split()[0] for ln in likely.lines()] == [
+        "build", "pytest", "early", "pytest", "late"], likely.lines()
+    # The pre-pass: only the likely files, stopping at the first failure; its
+    # budget check judges files, not the suite.
+    assert "ADDOPTS=[--maxfail=1 test_a.py emitter/test_b.py]" in first_pytest
+    assert "PARTIAL=[1]" in first_pytest and "INCLUDE=[]" in first_pytest
+    # The full step: everything else, with the pre-pass's cost folded in.
+    assert "ADDOPTS=[--ignore=test_a.py --ignore=emitter/test_b.py]" in rest
+    assert "PARTIAL=[]" in rest and "INCLUDE=[/" in rest
+    out = capsys.readouterr().out
+    assert "[ritz0 unit tests (likely failures first)] START" in out
+    assert "likely failures first: 2 file(s)" in out
+
+
+def test_the_full_step_folds_in_the_pre_pass_cost_report(likely, monkeypatch):
+    seen = {}
+    real = ci_local.run_step
+
+    def spy(step, dry_run=False):
+        inc = step.env.get("RITZ_COST_REPORT_INCLUDE")
+        if inc:
+            seen["include"] = Path(inc).read_text()
+        return real(step, dry_run=dry_run)
+
+    monkeypatch.setattr(ci_local, "run_step", spy)
+    assert ci_local.main(GATE) == 0
+    # The pre-pass wrote {"run": "1"}; the full step reads that, not its own.
+    assert '"run": "1"' in seen["include"]
+
+
+def test_a_pre_pass_failure_stops_a_fail_fast_gate(likely, capsys):
+    likely.fail.touch()
+    assert ci_local.main(GATE) == 1
+    assert [ln.split()[0] for ln in likely.lines()] == ["build", "pytest"]
+    out = capsys.readouterr().out
+    assert "ritz0 unit tests (likely failures first) (exit 1)" in out
+    not_run = out[out.index("not run"):]
+    for name in ("Early", "] ritz0 unit tests\n", "Late"):
+        assert name in not_run, not_run
+
+
+def test_without_fail_fast_the_rest_still_runs_without_the_likely_files(likely):
+    likely.fail.touch()
+    assert ci_local.main(GATE[1:]) == 1
+    assert [ln.split()[0] for ln in likely.lines()] == [
+        "build", "pytest", "early", "pytest", "late"]
+    assert "--ignore=test_a.py" in likely.lines()[3]
+
+
+def test_callers_pytest_addopts_are_kept(likely, monkeypatch):
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-x")
+    assert ci_local.main(GATE) == 0
+    first, rest = [ln for ln in likely.lines() if ln.startswith("pytest")]
+    assert "ADDOPTS=[-x --maxfail=1 test_a.py" in first
+    assert "ADDOPTS=[-x --ignore=test_a.py" in rest
+
+
+@pytest.mark.parametrize("why, argv, select", [
+    ("nothing selected", GATE, []),
+    ("opted out", GATE + ["--no-likely-first"], ["test_a.py"]),
+    ("pytest step skipped", GATE + ["--skip", "ritz0 unit tests"], ["test_a.py"]),
+    ("pytest job not selected", ["--fail-fast", "--job", "build-all"], ["test_a.py"]),
+])
+def test_no_pre_pass(likely, monkeypatch, capsys, why, argv, select):
+    monkeypatch.setattr(ci_local.likely_tests, "select", lambda root: select)
+    assert ci_local.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "likely failures first)] START" not in out, why
+    for ln in likely.lines():
+        assert "--ignore" not in ln and "--maxfail" not in ln, why
+    assert len([ln for ln in likely.lines() if ln == "build"]) <= 1, why
+
+
+def test_a_failed_build_stops_a_fail_fast_gate_before_the_pre_pass(likely, tmp_path):
+    wf = tmp_path / "main.yml"
+    wf.write_text(wf.read_text().replace("run: echo build >> ", "run: exit 5; echo "))
+    assert ci_local.main(GATE) == 1
+    assert likely.lines() == []
+
+
+def test_real_workflow_has_the_steps_the_pre_pass_runs():
+    names = {s.name for s in ci_local.load_steps() if s.job == "bootstrap"}
+    assert ci_local.PYTEST_STEP in names
+    assert ci_local.PYTEST_PREREQ in names
+    step = next(s for s in ci_local.load_steps() if s.name == ci_local.PYTEST_STEP)
+    # The cost report the full step folds the pre-pass's into.
+    assert ci_local.cost_report_path(step) == "pytest-cost.json"
+    # And the pre-pass's report must reach check_test_budget as partial: the
+    # step runs the check itself, so it inherits the env ci_local sets.
+    assert "check_test_budget.py" in step.run
+
+
+def test_a_stale_cost_report_is_not_folded_in(likely, tmp_path, monkeypatch):
+    """A pre-pass that dies before writing its report must not hand the full
+    step an earlier run's report left in the tree."""
+    (tmp_path / "r0" / "pytest-cost.json").write_text('{"stale": 1}')
+    seen = []
+    real = ci_local.run_step
+
+    def spy(step, dry_run=False):
+        if step.name.endswith(ci_local.PREPASS_SUFFIX):
+            return 0  # ran nothing, wrote nothing
+        seen.append(step.env.get("RITZ_COST_REPORT_INCLUDE"))
+        return real(step, dry_run=dry_run)
+
+    monkeypatch.setattr(ci_local, "run_step", spy)
+    assert ci_local.main(GATE) == 0
+    assert set(seen) == {None}

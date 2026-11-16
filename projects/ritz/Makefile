@@ -132,6 +132,11 @@ smoke-stack:
 #   make ci-local                       bootstrap
 #   make ci-local ARGS="--list"         what CI declares
 #   make ci-local ARGS="--jobs"         everything
+#
+# One deliberate reordering (AGAST #3456): before the first step, ci-local runs
+# the ritz0 test files the last commits changed (tools/likely_tests.py), so a
+# likely failure shows minutes into a gate, not ten; the pytest step then
+# --ignore's them.  ARGS="--no-likely-first" runs the steps exactly as declared.
 .PHONY: ci-local
 ci-local:
 	@$(PYTHON) tools/ci_local.py $(ARGS)

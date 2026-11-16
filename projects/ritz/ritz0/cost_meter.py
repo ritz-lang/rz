@@ -16,6 +16,11 @@ alongside, for the log.
                          "cpu_s", "wall_s"}}} to PATH at the end of the run,
                          and print the costliest files in the terminal summary
 
+RITZ_COST_REPORT_INCLUDE=PATH folds an earlier session's report into this one's
+(AGAST #3456): the gate runs its likely-failing files first, then the rest with
+those --ignore'd, and the budget is checked against the two together.  A
+missing PATH is skipped (that session never ran).
+
 Each test's CPU is measured where it runs (an xdist worker) and travels to the
 controller as a `user_properties` entry, which xdist already serialises.
 
@@ -93,10 +98,21 @@ class _Collector:
             f["tests"] += 1
             f["cpu_s"] += sum(v for k, v in report.user_properties if k == _PROP)
 
+    def _merged(self) -> dict:
+        """This session's files, plus RITZ_COST_REPORT_INCLUDE's."""
+        files = {k: dict(v) for k, v in self.files.items()}
+        inc = os.environ.get("RITZ_COST_REPORT_INCLUDE", "")
+        if inc and Path(inc).is_file():
+            for name, v in json.loads(Path(inc).read_text())["files"].items():
+                f = files.setdefault(name, {"tests": 0, "cpu_s": 0.0, "wall_s": 0.0})
+                for k in ("tests", "cpu_s", "wall_s"):
+                    f[k] += v[k]
+        return files
+
     def data(self) -> dict:
         files = {
             name: {**v, "cpu_s": round(v["cpu_s"], 3), "wall_s": round(v["wall_s"], 3)}
-            for name, v in sorted(self.files.items())
+            for name, v in sorted(self._merged().items())
         }
         return {
             "wall_s": round(self.wall, 3),

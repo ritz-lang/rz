@@ -281,3 +281,74 @@ def test_gate_pytest_step_runs_the_budget_check_after_pytest():
 def test_ritz0_conftest_loads_the_cost_meter():
     text = (RITZ0 / "conftest.py").read_text()
     assert '"cost_meter"' in text.split("pytest_plugins", 1)[1].splitlines()[0]
+
+
+# --- AGAST #3456: the gate splits the step in two ------------------------------
+#
+# ci_local.py runs the likely-failing files first (tools/likely_tests.py), then
+# the full step with those files --ignore'd.  The first run is a subset: only
+# its per-file caps mean anything (RITZ_TEST_BUDGET_PARTIAL).  The second run's
+# report folds the first one's in (RITZ_COST_REPORT_INCLUDE), so the budget
+# still sees the whole suite: the suite caps, and every override's file.
+
+
+@pytest.mark.unit
+def test_partial_report_skips_the_suite_wide_checks():
+    b = budget(default=60.0, suite=90.0,
+               overrides={"test_elsewhere.py": {"cpu_s": 200.0, "ticket": 3460}})
+    b["suite"]["tests"] = 1
+    r = report({"test_a.py": 50.0, "test_b.py": 50.0})
+    assert len(ctb.check(r, b)) == 3  # suite cpu, suite tests, missing override
+    assert ctb.check(r, b, partial=True) == []
+
+
+@pytest.mark.unit
+def test_partial_report_still_holds_each_file_to_its_cap():
+    b = budget(default=60.0,
+               overrides={"test_big.py": {"cpu_s": 200.0}})  # no ticket
+    r = report({"test_a.py": 61.0, "test_big.py": 1.0})
+    errs = ctb.check(r, b, partial=True)
+    assert len(errs) == 2
+    assert any("test_a.py" in e for e in errs)
+    assert any("ticket" in e for e in errs)
+
+
+@pytest.mark.unit
+def test_partial_is_read_from_the_environment(tmp_path, monkeypatch, capsys):
+    rep = tmp_path / "cost.json"
+    rep.write_text(json.dumps(report({"test_a.py": 50.0, "test_b.py": 50.0})))
+    b = tmp_path / "budget.toml"
+    b.write_text("[suite]\ncpu_s = 90.0\n\n[file]\ndefault_cpu_s = 60.0\n")
+    monkeypatch.delenv("RITZ_TEST_BUDGET_PARTIAL", raising=False)
+    assert ctb.main([str(rep), "--budget", str(b)]) == 1
+    monkeypatch.setenv("RITZ_TEST_BUDGET_PARTIAL", "1")
+    assert ctb.main([str(rep), "--budget", str(b)]) == 0
+    assert "partial" in capsys.readouterr().out
+
+
+def _session(tmp_path: Path, files: list[str], out: Path, env: dict) -> None:
+    cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+           "--disable-plugin-autoload", "-p", "cost_meter",
+           f"--cost-report={out}", "--rootdir", str(tmp_path),
+           *[str(tmp_path / f) for f in files]]
+    r = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "PYTHONPATH": str(RITZ0), **env}, check=False)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.integration
+def test_included_report_is_folded_into_this_sessions_report(tmp_path):
+    (tmp_path / "test_planted_slow.py").write_text(PLANTED)
+    (tmp_path / "test_fast.py").write_text(FAST)
+    first, second = tmp_path / "first.json", tmp_path / "second.json"
+    _session(tmp_path, ["test_planted_slow.py"], first, {})
+    _session(tmp_path, ["test_fast.py"], second,
+             {"RITZ_COST_REPORT_INCLUDE": str(first)})
+    a, b = json.loads(first.read_text()), json.loads(second.read_text())
+    assert sorted(b["files"]) == ["test_fast.py", "test_planted_slow.py"]
+    assert b["files"]["test_planted_slow.py"] == a["files"]["test_planted_slow.py"]
+    assert b["cpu_s"] == pytest.approx(sum(v["cpu_s"] for v in b["files"].values()))
+    # A missing include is ignored: that file's run did not happen.
+    _session(tmp_path, ["test_fast.py"], second,
+             {"RITZ_COST_REPORT_INCLUDE": str(tmp_path / "absent.json")})
+    assert sorted(json.loads(second.read_text())["files"]) == ["test_fast.py"]

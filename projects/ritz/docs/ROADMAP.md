@@ -29,7 +29,7 @@ commands are in the next section and they are the same ones CI runs.
 | Question | Authority |
 |---|---|
 | What is being worked on, what is blocked, why | **AGAST** — the task tracker. Not any file in this repo. |
-| Does the compiler work, right now | `make -C projects/ritz ci-local` — runs CI's job list, in CI's order |
+| Does the compiler work, right now | `make -C projects/ritz ci-local` — runs CI's job list, in CI's order, except that the recently changed ritz0 test files run first (`tools/likely_tests.py`, AGAST #3456) |
 | Which examples does each compiler accept | `projects/ritz/scripts/regression.sh` — the 5-stage differential suite |
 | Which failures are known and excused | `projects/ritz/scripts/regression-known-failures.txt` (ritz0) and `projects/ritz/scripts/regression-known-failures-ritz1.txt` (ritz1 / ritz1_selfhosted) |
 | What the language *is* | `docs/LANGUAGE_SPEC.md` — the normative standard, and its examples are compiled by CI |

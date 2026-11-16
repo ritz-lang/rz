@@ -49,6 +49,7 @@ LOCAL_MODULES = {
     "check_no_s_strings",
     "check_test_tempdirs",
     "check_test_budget",
+    "likely_tests",
     "run_regression_matrix",
     "smoke",
     "smoke_stack",

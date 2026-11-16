@@ -70,6 +70,19 @@ runs `--job build-all --job bootstrap` (AGAST #2141): bootstrap alone is the
 compiler gate, but a compiler change can break an ecosystem package -- #2124
 broke angelo, gated green, and turned main's build-all red for nine runs.
 
+Likely failures first (AGAST #3456, LARB review/5 tooling F4). The ritz0
+pytest step starts ~6 minutes into a gate, so the 10 of 18 red gates that
+failed there reported 550-674 s in. When the selected jobs include that step,
+ci_local first runs the step it needs ("Build ritz1 + ritz1_selfhosted"), then
+the pytest step's own command on the files tools/likely_tests.py picks (the
+test files the last commits changed), with --maxfail=1, as the step "ritz0
+unit tests (likely failures first)". The full step then --ignore's those
+files, so a green gate runs every test once. Both go through PYTEST_ADDOPTS,
+so the command and its flags stay main.yml's. The pre-pass's cost report is
+checked per file only (RITZ_TEST_BUDGET_PARTIAL) and folded into the full
+step's (RITZ_COST_REPORT_INCLUDE), which is checked whole. `--no-likely-first`
+runs the steps exactly as declared.
+
 Exit code: 0 only if every step it ran exited 0. A step that exits 3
 (EXIT_SETUP: `rz build --all` saying a toolchain binary is missing, e.g.
 lld-link, or the harland boot missing QEMU/OVMF/GRUB-EFI, AGAST #1845)
@@ -84,6 +97,8 @@ import argparse
 import importlib.util
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import sys
@@ -92,6 +107,9 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import likely_tests
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "main.yml"
@@ -112,6 +130,13 @@ EXIT_SETUP = 3
 # Steps after it in the same job get that PATH here too (AGAST #1907).
 TOOLCHAIN_ACTION = "install-toolchain"
 LLVM_BINDIR = "/usr/lib/llvm-{version}/bin"
+
+# AGAST #3456: the step whose likely-failing files run first, the step that
+# builds what they need, and the name the pre-pass reports under.
+PYTEST_STEP = "ritz0 unit tests"
+PYTEST_PREREQ = "Build ritz1 + ritz1_selfhosted"
+PREPASS_SUFFIX = " (likely failures first)"
+_COST_REPORT = re.compile(r"--cost-report=(\S+)")
 
 _EXPR = re.compile(r"\$\{\{\s*env\.(\w+)\s*\}\}")
 
@@ -256,6 +281,47 @@ def trim_cas() -> None:
     print(f"[ritz-cas] gc: removed {removed} files, freed {freed} bytes from {store.root}")
 
 
+def cost_report_path(step: Step) -> str | None:
+    """The `--cost-report=PATH` the step's pytest writes, relative to its cwd."""
+    m = _COST_REPORT.search(step.run)
+    return m.group(1) if m else None
+
+
+def _with_addopts(step: Step, name: str, extra: list[str], env: dict[str, str]) -> Step:
+    """`step` under another name, with `extra` appended to PYTEST_ADDOPTS."""
+    opts = " ".join(x for x in (os.environ.get("PYTEST_ADDOPTS", ""),
+                                step.env.get("PYTEST_ADDOPTS", ""), shlex.join(extra)) if x)
+    return Step(job=step.job, name=name, run=step.run, workdir=step.workdir,
+                env={**step.env, **env, "PYTEST_ADDOPTS": opts},
+                llvm_bindir=step.llvm_bindir)
+
+
+def plan_likely_first(steps: list[Step], skip: list[str]) -> tuple[list[Step], Step | None]:
+    """(steps to run before the first step, the full pytest step to rewrite).
+
+    Empty when the pytest step is not selected or skipped, or nothing is
+    likely: then every step runs as declared.
+    """
+    pytest_step = next((s for s in steps if s.name == PYTEST_STEP), None)
+    if pytest_step is None or PYTEST_STEP in skip:
+        return [], None
+    files = likely_tests.select(REPO_ROOT)
+    if not files:
+        print("likely failures first: no recently changed ritz0 test files")
+        return [], None
+    print(f"likely failures first: {len(files)} file(s) from tools/likely_tests.py, "
+          f"then the rest of {PYTEST_STEP!r} without them:")
+    for f in files:
+        print(f"  {f}")
+    early = [s for s in steps if s.name == PYTEST_PREREQ and s.name not in skip]
+    early.append(_with_addopts(pytest_step, PYTEST_STEP + PREPASS_SUFFIX,
+                               ["--maxfail=1", *files],
+                               {"RITZ_TEST_BUDGET_PARTIAL": "1"}))
+    rest = _with_addopts(pytest_step, PYTEST_STEP,
+                         [f"--ignore={f}" for f in files], {})
+    return early, rest
+
+
 def run_step(step: Step, dry_run: bool = False) -> int:
     cwd = (REPO_ROOT / step.workdir).resolve()
     print(f"\n{'=' * 70}", flush=True)
@@ -300,6 +366,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="also run toolchain/dependency install steps")
     p.add_argument("--fail-fast", action="store_true",
                    help="stop at the first failing step (the gate's default)")
+    p.add_argument("--no-likely-first", action="store_true",
+                   help="do not run the likely-failing ritz0 test files first "
+                        "(AGAST #3456); run every step as declared")
     p.add_argument("--skip", action="append", default=[], metavar="STEP",
                    help="do not run the step with this exact name (repeatable); "
                         "an unknown name is an error")
@@ -355,18 +424,11 @@ def main(argv: list[str] | None = None) -> int:
     not_run: list[str] = []
     skipped_by_request: list[str] = []
     timings: list[tuple[str, float, int]] = []
-    for s in steps:
-        if s.job not in selected:
-            continue
-        if s.name in args.skip:
-            skipped_by_request.append(f"[{s.job}] {s.name}")
-            continue
-        if s.is_setup and not args.with_setup:
-            skipped.append(f"[{s.job}] {s.name}")
-            continue
+
+    def run(s: Step) -> None:
         if failures and args.fail_fast:
             not_run.append(f"[{s.job}] {s.name}")
-            continue
+            return
         rc, secs = timed_step(s, dry_run=args.dry_run)
         timings.append((s.name, secs, rc))
         if rc == EXIT_SETUP:
@@ -374,6 +436,39 @@ def main(argv: list[str] | None = None) -> int:
             setup_errors.append(f"[{s.job}] {s.name} (exit {rc})")
         elif rc != 0:
             failures.append(f"[{s.job}] {s.name} (exit {rc})")
+
+    chosen = [s for s in steps if s.job in selected]
+    early, rest = ([], None) if args.no_likely_first else \
+        plan_likely_first(chosen, args.skip)
+    ran_early = {s.name for s in early}
+    include_dir = tempfile.mkdtemp(prefix="ritz-likely-first-") if early else None
+    for s in early:
+        report = cost_report_path(s)
+        prepass = s.name.endswith(PREPASS_SUFFIX) and report and not args.dry_run
+        src = (REPO_ROOT / s.workdir / report).resolve() if prepass else None
+        if src is not None:
+            # An earlier run's report must not pass for this one's.
+            src.unlink(missing_ok=True)
+        run(s)
+        if src is not None and src.is_file():
+            # Moved aside, so the full step's report folds it in rather than
+            # overwriting it.
+            dst = Path(include_dir) / "prepass-cost.json"
+            shutil.move(src, dst)
+            rest.env["RITZ_COST_REPORT_INCLUDE"] = str(dst)
+
+    for s in chosen:
+        if s.name in args.skip:
+            skipped_by_request.append(f"[{s.job}] {s.name}")
+            continue
+        if s.is_setup and not args.with_setup:
+            skipped.append(f"[{s.job}] {s.name}")
+            continue
+        if s.name in ran_early:
+            continue
+        run(rest if rest is not None and s.name == PYTEST_STEP else s)
+    if include_dir:
+        shutil.rmtree(include_dir, ignore_errors=True)
 
     print(f"\n{'=' * 70}")
     print_timings(timings)

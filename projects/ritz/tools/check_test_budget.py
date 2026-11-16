@@ -18,6 +18,10 @@ CPU-seconds per test file.  The budget file sets
 Exit 1 with one line per breach, 0 when everything fits.  Every limit is
 multiplied by $RITZ_TEST_BUDGET_SCALE (default 1) for a slower machine.
 
+RITZ_TEST_BUDGET_PARTIAL=1 says the report covers a subset of the suite (the
+gate's likely-failures-first pass, AGAST #3456): only the per-file checks
+apply.  The full step's report folds that subset back in, and is checked whole.
+
 Why CPU-seconds: see ritz0/cost_meter.py.  Why a budget at all: the suite
 went from 2,898 tests / 134 s to 39,054 / 372 s in three weeks, and nothing
 said no.  A file over budget is fixed by sizing its matrix to the rule and
@@ -43,8 +47,13 @@ def load_budget(path: Path) -> dict:
     return b
 
 
-def check(report: dict, budget: dict, scale: float = 1.0) -> list[str]:
-    """Every breach of `budget` in `report`, as one line each."""
+def check(report: dict, budget: dict, scale: float = 1.0,
+          partial: bool = False) -> list[str]:
+    """Every breach of `budget` in `report`, as one line each.
+
+    `partial`: the report is a subset of the suite, so the suite caps and
+    "this override's file is gone" cannot be judged from it.
+    """
     errs = []
     files = report["files"]
     default = float(budget["file"]["default_cpu_s"]) * scale
@@ -54,7 +63,7 @@ def check(report: dict, budget: dict, scale: float = 1.0) -> list[str]:
         if not o.get("ticket"):
             errs.append(f"{name}: override has no ticket; name the ticket that "
                         f"brings it under {default:.1f} s")
-        if name not in files:
+        if name not in files and not partial:
             errs.append(f"{name}: override for a file the suite no longer runs; "
                         f"remove it from the budget")
 
@@ -66,6 +75,9 @@ def check(report: dict, budget: dict, scale: float = 1.0) -> list[str]:
             why = f" (override, #{o['ticket']})" if o else ""
             errs.append(f"{name}: {cpu:.1f} CPU-s over its budget of {limit:.1f}{why}, "
                         f"{v['tests']} tests")
+
+    if partial:
+        return errs
 
     total = sum(float(v["cpu_s"]) for v in files.values())
     cap = float(budget["suite"]["cpu_s"]) * scale
@@ -87,18 +99,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
     a = ap.parse_args(argv)
     scale = float(os.environ.get("RITZ_TEST_BUDGET_SCALE", "1") or 1)
+    partial = os.environ.get("RITZ_TEST_BUDGET_PARTIAL", "") not in ("", "0")
     report = json.loads(a.report.read_text())
-    errs = check(report, load_budget(a.budget), scale)
+    errs = check(report, load_budget(a.budget), scale, partial=partial)
+    scope = ", partial: per-file checks only" if partial else ""
     total = sum(float(v["cpu_s"]) for v in report["files"].values())
     if errs:
-        print(f"test budget: {len(errs)} breach(es) ({a.budget.name}, scale {scale:g}):")
+        print(f"test budget: {len(errs)} breach(es) ({a.budget.name}, scale {scale:g}{scope}):")
         for e in errs:
             print(f"  {e}")
         print("Size the matrix to the rule and batch it: docs/TESTING.md, "
               "\"What a ritz0 pytest case costs\".")
         return 1
     print(f"test budget: ok, {total:.1f} CPU-s across {len(report['files'])} files "
-          f"({a.budget.name}, scale {scale:g})")
+          f"({a.budget.name}, scale {scale:g}{scope})")
     return 0
 
 
