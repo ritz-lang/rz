@@ -16,6 +16,9 @@ The rule (LANGUAGE_SPEC §17):
 * `[[naked]]` fns get LLVM `naked` and no prologue; their body may contain
   only `asm` blocks. ritz1 has no inline asm yet (AGAST #1619), so it rejects
   `[[naked]]` with a located error rather than emit something wrong.
+* `[[inline]]` / `[[always_inline]]` / `[[noinline]]` reach each monomorph
+  instance of a generic fn too (AGAST #1961); that test also runs on
+  ritz1_selfhosted.
 """
 
 import os
@@ -31,6 +34,7 @@ from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
+RITZ1_SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
 pytestmark = pytest.mark.integration
@@ -46,7 +50,8 @@ def _compile(compiler: str, tmp_path: Path, src: str, name: str = "t"):
     if compiler == "ritz0":
         proc = run_ritz0([str(path), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
-        proc = subprocess.run([str(RITZ1_BIN), str(path), "-o", str(ll)], cwd=tmp_path,
+        binary = RITZ1_SELFHOSTED_BIN if compiler == "ritz1_selfhosted" else RITZ1_BIN
+        proc = subprocess.run([str(binary), str(path), "-o", str(ll)], cwd=tmp_path,
                               env=env, capture_output=True, text=True, timeout=300)
     return proc, ll
 
@@ -88,6 +93,10 @@ COMPILERS = ["ritz0", "ritz1"]
 def _need(compiler, request):
     if compiler == "ritz1":
         request.getfixturevalue("ritz1_bin")
+    elif compiler == "ritz1_selfhosted":
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        assert RITZ1_SELFHOSTED_BIN.exists(), (
+            f"{RITZ1_SELFHOSTED_BIN} missing; run `make -C ritz1 bootstrap`")
 
 
 # --- unknown / misplaced attributes -----------------------------------------
@@ -248,6 +257,54 @@ def test_inline_family_reaches_the_ir(request, tmp_path, compiler):
     assert re.search(r"\balwaysinline\b", attrs_of("b")), defs["b"]
     assert re.search(r"\bnoinline\b", attrs_of("c")), defs["c"]
     assert not re.search(r"inline", attrs_of("main")), defs["main"]
+
+
+# AGAST #1961: a generic fn's inline-family attribute reaches each of its
+# monomorph instances (`hint$i32` ...), not only non-generic fns.  ritz1 once
+# copied [[callconv]] / [[test_helper]] / [[must_use]] to an instance but not
+# these, so every instance came out with no inline attribute at all.
+GENERIC_INLINE = """\
+[[inline]]
+fn hint<T>(x: T) -> T
+    x
+
+[[always_inline]]
+fn always<T>(x: T) -> T
+    x
+
+[[noinline]]
+fn never<T>(x: T) -> T
+    x
+
+fn plain<T>(x: T) -> T
+    x
+
+fn main() -> i32
+    hint(1) + always(2) + never(3) + plain(4)
+"""
+
+
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+def test_inline_family_reaches_generic_instances(request, tmp_path, compiler):
+    _need(compiler, request)
+    ir = _ir(compiler, tmp_path, GENERIC_INLINE)
+
+    def attrs_of(base):
+        # The instance's mangled name varies by compiler; it starts with `base`
+        # and is the only define that does.
+        lines = [m.group(0) for m in re.finditer(
+            rf'^define [^@]*@"?{base}\b[^(]*\(.*$', ir, re.M)]
+        assert len(lines) == 1, f"{compiler}: instances of {base}: {lines}"
+        text = lines[0]
+        for g in re.findall(r"#(\d+)", lines[0]):
+            m = re.search(rf"^attributes #{g} = \{{(.*)\}}", ir, re.M)
+            text += " " + (m.group(1) if m else "")
+        return text
+
+    assert re.search(r"\binlinehint\b", attrs_of("hint")), attrs_of("hint")
+    assert re.search(r"\balwaysinline\b", attrs_of("always")), attrs_of("always")
+    assert re.search(r"\bnoinline\b", attrs_of("never")), attrs_of("never")
+    assert not re.search(r"inline", attrs_of("plain")), attrs_of("plain")
 
 
 # --- [[packed]] --------------------------------------------------------------
