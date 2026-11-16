@@ -28,6 +28,7 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 _MAIN = "fn main() -> i32\n    0\n"
 _NON_CONST = "global 'g' has a non-constant initializer"
 _B2I = "cannot use bool as an integer: write `b as i32`"
+_NOT_FLOAT = "global 'g' is not a float type but has a float initializer"
 
 # name -> (source, line, column, message prefix)
 REJECTED = {
@@ -37,6 +38,15 @@ REJECTED = {
     "neg_of_a_global": ("var x: i32\nvar g: i32 = -x\n" + _MAIN, 2, 14, _NON_CONST),
     "bit_not_of_a_global": ("var x: i32\nvar g: i32 = ~x\n" + _MAIN, 2, 14, _NON_CONST),
     "cast_of_binary": ("var g: i64 = (1 + 2) as i64\n" + _MAIN, 1, 15, _NON_CONST),
+    # AGAST #1539: a char / float initializer folds, but only into a slot of
+    # its kind.  ritz1 located the float misfits at column 1 until #3680.
+    "float_into_int": ("var g: i32 = 1.5\n" + _MAIN, 1, 14, _NOT_FLOAT),
+    "neg_float_into_int": ("var g: i64 = -0.5\n" + _MAIN, 1, 14, _NOT_FLOAT),
+    "float_cast_into_int": ("var g: i64 = 1.5 as i64\n" + _MAIN, 1, 14, _NOT_FLOAT),
+    "float_into_pointer": ("var g: *u8 = 1.5\n" + _MAIN, 1, 14, _NOT_FLOAT),
+    "float_into_bool": ("var g: bool = 1.5\n" + _MAIN, 1, 15, "cannot use a float as bool"),
+    "char_into_bool": ("var g: bool = 'A'\n" + _MAIN, 1, 15, "cannot use an integer as bool"),
+    "bit_not_float": ("var g: f64 = ~1.5\n" + _MAIN, 1, 14, _NON_CONST),
 }
 
 
@@ -82,33 +92,28 @@ def test_ritz0_null_into_an_integer_global_is_a_located_error(request, tmp_path)
     assert not ll.exists()
 
 
-# AGAST #1539: a char / float initializer folds, but only into a slot of its
-# kind.  ritz0-only: ritz1 locates these at the declaration, not the value.
-# name -> (source, message)
-_MISFIT = {
-    "float_into_int": ("var g: i32 = 1.5\n", "global 'g' is not a float type but has a float initializer"),
-    "neg_float_into_int": ("var g: i64 = -0.5\n", "global 'g' is not a float type but has a float initializer"),
-    "float_cast_into_int": ("var g: i64 = 1.5 as i64\n",
-                            "global 'g' is not a float type but has a float initializer"),
-    "float_into_pointer": ("var g: *u8 = 1.5\n", "global 'g' is not a float type but has a float initializer"),
-    "float_into_bool": ("var g: bool = 1.5\n", "cannot use a float as bool"),
-    "char_into_bool": ("var g: bool = 'A'\n", "cannot use an integer as bool"),
-    "bit_not_float": ("var g: f64 = ~1.5\n", "global 'g' has a non-constant initializer"),
+# ritz1-only: ritz0 lowers a non-zero f32 global, and calls `null` in a
+# float global "not a pointer".  Located at the initializer too (AGAST #3680).
+# name -> (source, line, column, message)
+_RITZ1_ONLY = {
+    "null_into_float": ("var g: f64 = null\n" + _MAIN, 1, 14,
+                        "global 'g' is a float type but has a null initializer"),
+    "nonzero_f32": ("var g: f32 = 1.5\n" + _MAIN, 1, 14,
+                    "global 'g' is f32 with a non-zero initializer, which ritz1 cannot lower yet"),
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(_MISFIT))
-def test_ritz0_a_misfit_constant_initializer_is_a_located_error(request, tmp_path, name):
-    source, message = _MISFIT[name]
-    proc, ll = _compile(request, "ritz0", tmp_path, source + _MAIN)
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("name", sorted(_RITZ1_ONLY))
+def test_ritz1_a_misfit_float_global_is_located_at_the_initializer(request, tmp_path, compiler, name):
+    source, line, col, message = _RITZ1_ONLY[name]
+    proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"ritz0 accepted {name}:\n{out[-1500:]}"
-    assert "Traceback" not in out and "ValueError" not in out, out[-1500:]
-    col = source.index("=") + 3
-    hits = re.findall(rf"unit\.ritz:1:{col}: (?:error: )?{re.escape(message)}", out)
-    assert len(hits) == 1, f"{name}: want one {message!r} at 1:{col}:\n{out[-1500:]}"
-    assert not ll.exists(), f"ritz0 wrote IR for {name}"
+    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
+    hits = re.findall(rf"unit\.ritz:{line}:{col}: (?:error: )?{re.escape(message)}", out)
+    assert len(hits) == 1, f"{compiler}, {name}: want one {message!r} at {line}:{col}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
 # LARB R38 (#3374): a global's type is written, never read off its initializer.
