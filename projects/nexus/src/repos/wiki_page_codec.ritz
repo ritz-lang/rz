@@ -7,7 +7,8 @@
 
 import ritzlib.memory
 import ritzlib.strview { StrView, strview_len, strview_as_ptr, strview_from_ptr, strview_parse_i64 }
-import ritzlib.string { String, string_new, string_drop, string_len, string_as_view, string_from_bytes, string_push_i64 }
+import ritzlib.string { String, string_new, string_drop, string_len, string_from, string_as_view, string_from_bytes, string_push_i64 }
+import mausoleum.m7m_types { timestamp_zero }
 
 import spire.repo.mausoleum { DbField, db_field, db_serialize_doc, db_extract_field }
 import mausoleum.document { DocumentId, doc_id_invalid }
@@ -135,3 +136,41 @@ pub fn wiki_page_decode(data: *u8, len: i32) -> Result<WikiPage, RepoError>
     let result = page_doc_decode(data, len, tmp)
     free(tmp)
     result
+
+
+fn page_doc_decode_legacy(data: *u8, len: i32, tmp: *u8) -> Result<WikiPage, RepoError>
+    let slug: String = page_doc_text(data, len, "slug", tmp)?
+    if string_len(@slug) == 0
+        var empty: String = slug
+        string_drop(@&empty)
+        return Err(RepoError.SerializationError)
+    match page_doc_text(data, len, "content", tmp)
+        Ok(content) =>
+            let title: String = string_from(string_as_view(@slug))
+            Ok(wiki_page_new(slug, title, content))
+        Err(e) =>
+            var unused: String = slug
+            string_drop(@&unused)
+            Err(e)
+
+
+# A page as src/store.ritz stored it before AGAST #2209: a Document with only
+# `slug` and `content`. It becomes a version-1 page titled by its slug, with
+# no id (the repository sets it) and zero timestamps; its next save writes it
+# back in wiki_page_encode's format. Anything without both fields is a
+# SerializationError.
+pub fn wiki_page_decode_legacy(data: *u8, len: i32) -> Result<WikiPage, RepoError>
+    if data == null or len <= 0
+        return Err(RepoError.SerializationError)
+    let tmp: *u8 = malloc(len as i64)
+    if tmp == null
+        return Err(RepoError.SerializationError)
+    let result = page_doc_decode_legacy(data, len, tmp)
+    free(tmp)
+    match result
+        Ok(page) =>
+            var p: WikiPage = page
+            p.created_at = timestamp_zero()
+            p.updated_at = timestamp_zero()
+            Ok(p)
+        Err(e) => Err(e)

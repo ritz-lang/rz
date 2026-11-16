@@ -2,15 +2,17 @@
 #
 # extract_slug used to accept any byte except '/', and GET /wiki/:slug and
 # /wiki/:slug/edit never validated it, so a slug of `"><script>` reached an
-# href unescaped.  Every route now rejects slugs outside [a-z0-9-]{1,128}.
+# href unescaped.  Every route now rejects slugs outside the one slug rule
+# (AGAST #2209): 1-128 bytes of '/'-separated [a-z0-9-] segments.
 
 import ritzlib.str { strlen }
 
-import slug { extract_slug, validate_slug, slug_from_path }
+import slug { extract_slug, slug_valid, slug_from_path }
+import slug { slug_check, SLUG_OK, SLUG_BAD_CHAR, SLUG_EMPTY_SEGMENT, SLUG_RESERVED }
 
 
 fn valid(s: *u8) -> i32
-    return validate_slug(s, strlen(s) as i32)
+    return slug_valid(s, strlen(s) as i32)
 
 
 [[test]]
@@ -47,7 +49,7 @@ fn test_validate_slug_rejects_other_bytes() -> i32
         return 3
     if valid(c"a%22b") != 0
         return 4
-    if validate_slug(c"x", 0) != 0
+    if slug_valid(c"x", 0) != 0
         return 5
     0
 
@@ -57,21 +59,21 @@ fn test_validate_slug_length_cap() -> i32
     var buf: [129]u8
     for i in 0..129
         buf[i] = 'a'
-    if validate_slug(@buf[0], 128) != 1
+    if slug_valid(@buf[0], 128) != 1
         return 1
-    if validate_slug(@buf[0], 129) != 0
+    if slug_valid(@buf[0], 129) != 0
         return 2
     0
 
 
 [[test]]
-fn test_extract_slug_stops_at_slash() -> i32
+fn test_extract_slug_takes_the_whole_rest_of_the_path() -> i32
     var out: [128]u8
-    let p = c"/wiki/foo/edit"
+    let p = c"/wiki/foo/bar"
     let n = extract_slug(p, strlen(p) as i32, @out[0], 128)
-    if n != 3
+    if n != 7
         return 1
-    if out[0] != 'f' or out[2] != 'o'
+    if out[0] != 'f' or out[3] != '/' or out[6] != 'r'
         return 2
     0
 
@@ -90,6 +92,14 @@ fn test_slug_from_path_rejects_hostile_slug() -> i32
     let empty = c"/wiki/"
     if slug_from_path(empty, strlen(empty) as i32, @out[0]) != -1
         return 3
+    let nested = c"/wiki/language/syntax/edit"
+    if slug_from_path(nested, strlen(nested) as i32, @out[0]) != 15
+        return 4
+    if out[8] != '/'
+        return 5
+    let up = c"/wiki/../etc"
+    if slug_from_path(up, strlen(up) as i32, @out[0]) != -1
+        return 6
     0
 
 
@@ -110,4 +120,66 @@ fn test_slug_from_path_rejects_overlong() -> i32
         return 1
     if slug_from_path(@path[0], 134, @out[0]) != 128
         return 2
+    0
+
+
+# ============================================================================
+# The one slug rule (AGAST #2209): the routes (slug_valid) and the wiki
+# service (services/validation) both call slug_check.
+# ============================================================================
+
+fn check(s: *u8) -> i32
+    return slug_check(s, strlen(s) as i32)
+
+
+[[test]]
+fn test_slug_allows_hierarchy() -> i32
+    if valid(c"language/syntax") != 1
+        return 1
+    if valid(c"stdlib/io/file") != 1
+        return 2
+    if valid(c"2026-roadmap") != 1
+        return 3
+    0
+
+
+[[test]]
+fn test_slug_refuses_empty_segments() -> i32
+    if check(c"/lead") != SLUG_EMPTY_SEGMENT
+        return 1
+    if check(c"trail/") != SLUG_EMPTY_SEGMENT
+        return 2
+    if check(c"a//b") != SLUG_EMPTY_SEGMENT
+        return 3
+    if check(c"/") != SLUG_EMPTY_SEGMENT
+        return 4
+    0
+
+
+[[test]]
+fn test_slug_refuses_upper_case() -> i32
+    # One page per name: /wiki/Home and /wiki/home are not two pages.
+    if check(c"Home") != SLUG_BAD_CHAR
+        return 1
+    if check(c"language/Syntax") != SLUG_BAD_CHAR
+        return 2
+    0
+
+
+[[test]]
+fn test_slug_reserves_route_words() -> i32
+    # /wiki/new is the create form, and /wiki/<slug>/edit the edit form, so
+    # neither can be a page's own name.
+    if check(c"new") != SLUG_RESERVED
+        return 1
+    if check(c"a/edit") != SLUG_RESERVED
+        return 2
+    if check(c"edit") != SLUG_OK
+        return 3
+    if check(c"news") != SLUG_OK
+        return 4
+    if check(c"a/editor") != SLUG_OK
+        return 5
+    if check(c"a/new") != SLUG_OK
+        return 6
     0

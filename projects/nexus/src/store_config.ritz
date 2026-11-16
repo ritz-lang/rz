@@ -1,0 +1,122 @@
+# src/store_config.ritz - Where nexus's page store (Mausoleum) is, and how to
+# dial it
+#
+# From the environment zeus passes each worker:
+#   MAUSOLEUM_HOST / MAUSOLEUM_PORT  default 127.0.0.1:7777 (AGAST #3065)
+#   MAUSOLEUM_PLAINTEXT              "1" for a mausoleum --no-encryption, "0"
+#                                    or unset for encrypted, its default and
+#                                    production's (AGAST #2466)
+#
+# A value that is set but unusable marks the config `error`, and nexus refuses
+# to serve pages (src/wiki_app.ritz) rather than guess: the default address
+# would reach the wrong store, and the wrong transport fails every handshake
+# or sends pages in the clear. Moved here from src/store.ritz (AGAST #2209).
+
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_push_cstr }
+import ritzlib.os.env { env_get_or }
+
+import log { log_begin, log_end }
+
+
+# client_connect / client_connect_encrypted results worth explaining.
+const CONNECT_REFUSED: i32 = -4          # nothing accepted the TCP connection
+const CONNECT_NO_REPLY: i32 = -6         # handshake / CONNECT reply never came
+
+
+pub struct StoreConfig
+    host: [64]u8             # NUL-terminated
+    host_len: i32
+    port: i32
+    encrypted: bool
+    error: bool              # a setting was unusable: refuse to serve
+
+
+# 127.0.0.1:7777, encrypted.
+pub fn store_config_default() -> StoreConfig
+    var cfg: StoreConfig
+    store_config_set_host(@cfg, c"127.0.0.1", 9)
+    cfg.port = 7777
+    cfg.encrypted = true
+    cfg.error = false
+    cfg
+
+
+fn store_config_set_host(cfg: *StoreConfig, host: *u8, host_len: i32)
+    var n: i32 = host_len
+    if n > 63
+        n = 63
+    for i in 0..n
+        cfg.host[i] = *(host + i)
+    cfg.host[n] = 0
+    cfg.host_len = n
+
+
+# The host, NUL-terminated.
+pub fn store_config_host(cfg: *StoreConfig) -> *u8
+    @cfg.host[0]
+
+
+fn store_config_reject(cfg: *StoreConfig, why: *u8) -> i32
+    cfg.error = true
+    var line: String = log_begin()
+    string_push_cstr(@&line, c"[STORE] ")
+    string_push_cstr(@&line, why)
+    string_push_cstr(@&line, c"; REFUSING to serve pages until it is fixed")
+    log_end(@&line)
+    -1
+
+
+# MAUSOLEUM_HOST / MAUSOLEUM_PORT's values; "" = unset (keep what is set).
+# -1 (and cfg.error) if the port isn't 1..65535 or the host is over 63 bytes.
+pub fn store_config_set_address(cfg: *StoreConfig, host: StrView, port: StrView) -> i32
+    if host.len > 63
+        return store_config_reject(cfg, c"MAUSOLEUM_HOST is longer than 63 bytes")
+    var p: i64 = cfg.port as i64
+    if port.len > 0
+        p = 0
+        for i in 0..port.len
+            let c: u8 = *(port.ptr + i)
+            if c < '0' or c > '9' or p > 65535
+                p = 0
+                break
+            p = p * 10 + (c - 48) as i64
+        if p < 1 or p > 65535
+            return store_config_reject(cfg, c"MAUSOLEUM_PORT is not a port number (1..65535)")
+    if host.len > 0
+        store_config_set_host(cfg, host.ptr, host.len as i32)
+    cfg.port = p as i32
+    0
+
+
+# MAUSOLEUM_PLAINTEXT's value: "1" plaintext, "0" encrypted, "" unset (keep).
+# -1 (and cfg.error, the mode unchanged) for anything else.
+pub fn store_config_set_plaintext(cfg: *StoreConfig, v: StrView) -> i32
+    if v.len == 0
+        return 0
+    if v.len == 1 and *v.ptr == '1'
+        cfg.encrypted = false
+        return 0
+    if v.len == 1 and *v.ptr == '0'
+        cfg.encrypted = true
+        return 0
+    store_config_reject(cfg, c"MAUSOLEUM_PLAINTEXT is not 1 (plaintext) or 0 (encrypted)")
+
+
+# The defaults, overridden by this process's MAUSOLEUM_* variables.
+pub fn store_config_from_env() -> StoreConfig
+    var cfg: StoreConfig = store_config_default()
+    store_config_set_address(@cfg, env_get_or("MAUSOLEUM_HOST", ""), env_get_or("MAUSOLEUM_PORT", ""))
+    store_config_set_plaintext(@cfg, env_get_or("MAUSOLEUM_PLAINTEXT", ""))
+    cfg
+
+
+# Why a connect failed, for the log; null if there is nothing to add.
+pub fn store_connect_hint(err: i32, encrypted: bool) -> *u8
+    if err == CONNECT_NO_REPLY
+        if encrypted
+            return c"it accepted the connection but never completed the encrypted handshake: is it running with --no-encryption? nexus speaks the encrypted protocol"
+        return c"it accepted the connection but never answered the plaintext CONNECT: is it running encrypted (mausoleum's default)?"
+    if err == CONNECT_REFUSED
+        return c"nothing accepted the connection: is mausoleum running there?"
+    return null

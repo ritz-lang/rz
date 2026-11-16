@@ -1,9 +1,22 @@
-# src/slug.ritz - Wiki page slugs: extraction from /wiki/... paths and validation
+# src/slug.ritz - Wiki page slugs: the one slug rule, and extraction from
+# /wiki/... paths
 #
-# A slug is 1-128 bytes of [a-z0-9-].  Every route that takes a slug from the
-# request (path or form) validates it before use (AGAST #1870): GET
-# /wiki/:slug and /wiki/:slug/edit used to accept any byte except '/', so a
-# slug of `"><script>` reached an href unescaped.
+# A slug is 1-128 bytes of '/'-separated segments, each one or more of
+# [a-z0-9-]. This is the only slug rule (AGAST #2209): the routes call
+# slug_valid / slug_from_path, the wiki service calls slug_check through
+# services/validation. Why this rule:
+#
+#   - [a-z0-9-] needs no URL, HTML or header escaping, so a slug can go into
+#     an href or a Location header as is, and can't smuggle markup, traversal
+#     ("..") or percent-escapes (AGAST #1870: `"><script>` reached an href);
+#   - lower case only, so /wiki/Home and /wiki/home can't be two pages;
+#   - '/' between non-empty segments, for the service's page hierarchy
+#     (wiki_service_get_children: "language/syntax" is a child of "language");
+#   - "new" and any slug ending in "/edit" are refused: /wiki/new is the
+#     create form and /wiki/<slug>/edit the edit form, so such a page could
+#     never be viewed.
+#
+# Every route that takes a slug from the request validates it before use.
 
 import ritzlib.str { strlen }
 
@@ -21,53 +34,83 @@ pub fn path_starts_with(path: *u8, path_len: i32, prefix: *u8) -> i32
     return 1
 
 
-# Copy the slug of /wiki/:slug[/...] into slug_out.  Returns its length, or
-# -1 if the path has no slug or the slug is longer than max_len (an over-long
-# slug is refused rather than truncated to a different page's name).
+# slug_check's verdicts.
+pub const SLUG_OK: i32 = 0
+pub const SLUG_EMPTY: i32 = 1
+pub const SLUG_TOO_LONG: i32 = 2
+pub const SLUG_BAD_CHAR: i32 = 3          # a byte outside [a-z0-9-/]
+pub const SLUG_EMPTY_SEGMENT: i32 = 4     # leading, trailing or doubled '/'
+pub const SLUG_RESERVED: i32 = 5          # "new", or ending in "/edit"
+
+
+fn is_slug_byte(c: u8) -> bool
+    (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-'
+
+
+fn bytes_are(p: *u8, len: i32, lit: *u8) -> bool
+    if strlen(lit) as i32 != len
+        return false
+    for i in 0..len
+        if *(p + i) != *(lit + i)
+            return false
+    true
+
+
+# Check slug[0..slug_len] against the slug rule: SLUG_OK, or why not.
+pub fn slug_check(slug: *u8, slug_len: i32) -> i32
+    if slug_len <= 0
+        return SLUG_EMPTY
+    if slug_len > MAX_SLUG
+        return SLUG_TOO_LONG
+    var seg_start: i32 = 0
+    for i in 0..slug_len
+        let c: u8 = *(slug + i)
+        if c == '/'
+            if i == seg_start
+                return SLUG_EMPTY_SEGMENT
+            seg_start = i + 1
+        else if not is_slug_byte(c)
+            return SLUG_BAD_CHAR
+    if seg_start == slug_len
+        return SLUG_EMPTY_SEGMENT
+    if bytes_are(slug, slug_len, c"new")
+        return SLUG_RESERVED
+    if seg_start > 0 and bytes_are(slug + seg_start, slug_len - seg_start, c"edit")
+        return SLUG_RESERVED
+    SLUG_OK
+
+
+# 1 if slug[0..slug_len] follows the slug rule, else 0.
+pub fn slug_valid(slug: *u8, slug_len: i32) -> i32
+    if slug_check(slug, slug_len) == SLUG_OK then 1 else 0
+
+
+# Copy the rest of a /wiki/... path into slug_out.  Returns its length, or
+# -1 if the path has no slug or it is longer than max_len (an over-long slug
+# is refused rather than truncated to a different page's name).
 pub fn extract_slug(path: *u8, path_len: i32, slug_out: *u8, max_len: i32) -> i32
     if path_starts_with(path, path_len, c"/wiki/") == 0
         return -1
-
-    let start: i32 = 6
-    var end: i32 = start
-    while end < path_len and *(path + end) != '/'
-        end += 1
-
-    let len: i32 = end - start
-    if len == 0 or len > max_len
+    let len: i32 = path_len - 6
+    if len <= 0 or len > max_len
         return -1
-
     for i in 0..len
-        *(slug_out + i) = *(path + start + i)
+        *(slug_out + i) = *(path + 6 + i)
     return len
 
 
-# 1 if slug[0..slug_len] is 1-128 bytes of [a-z0-9-], else 0.  Guards against
-# markup injection, directory traversal, URL-escaping ambiguity and DB key
-# abuse on user-supplied input.
-pub fn validate_slug(slug: *u8, slug_len: i32) -> i32
-    if slug_len <= 0 or slug_len > MAX_SLUG
-        return 0
-    for i in 0..slug_len
-        let c: u8 = *(slug + i)
-        var ok: i32 = 0
-        if c >= 'a' and c <= 'z'
-            ok = 1
-        else if c >= '0' and c <= '9'
-            ok = 1
-        else if c == '-'
-            ok = 1
-        if ok == 0
-            return 0
-    return 1
-
-
-# Extract and validate the slug of a /wiki/:slug path into slug_out, which
-# must hold MAX_SLUG bytes.  Returns its length, or -1 if absent or invalid.
+# The slug of /wiki/<slug> or /wiki/<slug>/edit into slug_out, which must hold
+# MAX_SLUG bytes.  Returns its length, or -1 if absent or invalid.  No valid
+# slug ends in "/edit", so a trailing "/edit" is always the edit route's.
 pub fn slug_from_path(path: *u8, path_len: i32, slug_out: *u8) -> i32
-    let len: i32 = extract_slug(path, path_len, slug_out, MAX_SLUG)
+    if path_starts_with(path, path_len, c"/wiki/") == 0
+        return -1
+    var end: i32 = path_len
+    if end - 6 > 5 and bytes_are(path + end - 5, 5, c"/edit")
+        end -= 5
+    let len: i32 = extract_slug(path, end, slug_out, MAX_SLUG)
     if len <= 0
         return -1
-    if validate_slug(slug_out, len) == 0
+    if slug_valid(slug_out, len) == 0
         return -1
     return len

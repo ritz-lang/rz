@@ -118,28 +118,34 @@ fn main() -> i32
 
 The binary is a Zeus worker (`nexus <shm_size> <worker_id> <worker_count>`),
 there is no `serve` subcommand, and invoking it by hand segfaults — see
-Installation above. It serves pages through `src/store.ritz`, which reaches
-mausoleum over Spire at `MAUSOLEUM_HOST`:`MAUSOLEUM_PORT`
+Installation above. Each route parses its request and hands it to a presenter
+(`src/presenters/`), which runs it through the wiki service (`src/services/`)
+and the page repository (`src/repos/`) and renders the page (#2209). The
+repository reaches mausoleum over Spire at `MAUSOLEUM_HOST`:`MAUSOLEUM_PORT`
 (default 127.0.0.1:7777; Zeus passes its environment on to its workers, #3065),
 encrypted unless `MAUSOLEUM_PLAINTEXT=1` (for `mausoleum --no-encryption`,
 #2466). A set but unusable value of any of the three makes every page request
-fail rather than fall back to a default. Mausoleum is the only
+a 503 rather than fall back to a default. Mausoleum is the only
 copy of a page: every request reads it there, so all of Zeus's workers serve
-the same wiki (#2459). Without mausoleum, a single worker (`zeus -w 1`) falls
-back to an in-memory wiki with 3 seeded pages; with several workers every page
-request is a 503, since each would otherwise serve a private wiki.
+the same wiki (#2459); the Tome page cache stays off for the same reason. A
+connection that drops is dialled again on the next request. Without mausoleum,
+a single worker (`zeus -w 1`) falls back to an in-memory wiki with 3 seeded
+pages; with several workers every page request is a 503 (each would otherwise
+serve a private wiki) until mausoleum answers. Startup is `src/wiki_app.ritz`.
 
-`src/` also holds a layered application stack that the binary does **not** use
-yet: `repos/` (pages as Mausoleum documents, a Tome cache), `services/` and
-`presenters/`. `src/main.ritz` imports none of it, so `./rz build nexus` does not
-compile it; `./rz test nexus` does, and runs it against a real Mausoleum server.
+Slugs are 1-128 bytes of `/`-separated `[a-z0-9-]` segments (`src/slug.ritz`,
+the one rule for routes and the service); `new` and slugs ending in `/edit`
+are reserved for the routes. Pages written before #2209 (documents with only
+`slug` and `content`) are still served, titled by their slug, and rewritten
+in the current format on their next save; documents that aren't pages are
+skipped. A slug lookup scans the collection (#3644).
 
 Page size: a page is one Mausoleum document, and a document is at most
 `MAX_DOC_SIZE` (1992 bytes, one B-tree value; bigger ones would need overflow
-pages). So the store takes at most `STORE_MAX_CONTENT_LEN` (1769) bytes of
-content, and this stack's validation `MAX_CONTENT_SIZE` (1229: its pages carry
-a title and six numbers too). Longer content is a 413, not a database error
-(#2208). The in-memory fallback keeps its own 8192-byte limit.
+pages). A page also carries its slug, title and six numbers, so its content is
+at most `MAX_CONTENT_SIZE` (1229, `src/services/validation.ritz`). Longer
+content is a 413, not a database error (#2208). The in-memory fallback keeps
+its own 8192-byte limit (`wiki_page_repo_max_content_len`).
 
 It also does not build with the self-hosted compiler:
 `./rz clean nexus && ./rz build nexus --compiler ritz1` fails at exit 1 with

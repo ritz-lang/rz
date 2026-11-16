@@ -1,0 +1,212 @@
+# test/test_wiki_app.ritz - how nexus opens its page store (AGAST #2209)
+#
+# Ported from test_store.ritz when src/store.ritz retired: wiki_app_open picks
+# the repository's backend for a worker from its StoreConfig and how many
+# workers zeus runs.
+
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.string { String, string_new, string_drop, string_contains }
+import ritzlib.gvec { Vec, vec_len, vec_drop }
+
+import models.wiki_page { WikiPage }
+import errors.repo_error { RepoError }
+import repos.wiki_page_repo {
+    WikiPageRepository,
+    wiki_page_repo_new,
+    wiki_page_repo_disconnect,
+    wiki_page_repo_get_by_slug,
+    wiki_page_repo_list_all
+}
+import repos.page_cache { PageCache, page_cache_new }
+import services.wiki_service { WikiService, wiki_service_new }
+import presenters.page_presenter { STATUS_SAVED, present_page_save, present_page_view }
+import store_config { StoreConfig, store_config_default, store_config_set_address, store_config_set_plaintext }
+import wiki_app { APP_MAUSOLEUM, APP_MEMORY, APP_UNAVAILABLE, wiki_app_open, wiki_app_seed }
+import test.support.live_db { LiveDb, live_db_start, live_db_stop }
+
+
+struct App
+    repo: WikiPageRepository
+    cache: PageCache
+    svc: WikiService
+
+
+fn app_new(app: *App)
+    app.repo = wiki_page_repo_new()
+    app.cache = page_cache_new()       # never connected, as in main
+    app.svc = wiki_service_new(@app.repo, @app.cache)
+
+
+fn plaintext_on(port: i32) -> StoreConfig
+    var cfg: StoreConfig = store_config_default()
+    cfg.port = port
+    cfg.encrypted = false
+    cfg
+
+
+# A port nothing listens on.
+fn dead_port() -> i32
+    return 1     # tcp/1 (tcpmux): never served on a dev or CI host
+
+
+fn save(app: *App, slug: StrView, content: StrView) -> i32
+    var out: String = string_new()
+    let status: i32 = present_page_save(@app.svc, slug, slug, content, @&out)
+    string_drop(@&out)
+    status
+
+
+fn view(app: *App, slug: StrView) -> i32
+    var out: String = string_new()
+    let status: i32 = present_page_view(@app.svc, slug, @&out)
+    string_drop(@&out)
+    status
+
+
+fn page_count(app: *App) -> i64
+    match wiki_page_repo_list_all(@app.repo)
+        Ok(pages) =>
+            let n: i64 = vec_len<WikiPage>(@pages)
+            var v: Vec<WikiPage> = pages
+            vec_drop<WikiPage>(@&v)
+            n
+        Err(_) => -1
+
+
+[[test]]
+fn test_app_uses_a_reachable_database() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    var app: App
+    app_new(@app)
+    var cfg: StoreConfig = plaintext_on(live.port)
+    var rc: i32 = 0
+    if wiki_app_open(@app.repo, @cfg, 2) != APP_MAUSOLEUM
+        rc = 1
+    if rc == 0 and save(@app, "page", "content") != STATUS_SAVED
+        rc = 2
+    if rc == 0 and view(@app, "page") != 200
+        rc = 3
+    wiki_page_repo_disconnect(@app.repo)
+    live_db_stop(@live)
+    rc
+
+
+[[test]]
+fn test_app_without_database_falls_back_with_one_worker() -> i32
+    # One worker: its in-memory pages are the only copy, so they are coherent.
+    var app: App
+    app_new(@app)
+    var cfg: StoreConfig = plaintext_on(dead_port())
+    if wiki_app_open(@app.repo, @cfg, 1) != APP_MEMORY
+        return 1
+    if save(@app, "page", "content") != STATUS_SAVED
+        return 2
+    if view(@app, "page") != 200
+        return 3
+    if page_count(@app) == 1 then 0 else 4
+
+
+[[test]]
+fn test_app_without_database_refuses_with_several_workers() -> i32
+    # Each worker would serve its own in-memory pages: a page created on one
+    # is a 404 on the next request. Every request is a 503 instead.
+    var app: App
+    app_new(@app)
+    var cfg: StoreConfig = plaintext_on(dead_port())
+    if wiki_app_open(@app.repo, @cfg, 2) != APP_UNAVAILABLE
+        return 1
+    if save(@app, "page", "content") != 503
+        return 2
+    if view(@app, "welcome") != 503
+        return 3
+    if page_count(@app) < 0 then 0 else 4
+
+
+# An unusable configuration never dials: not the default address, not memory.
+fn refuses_config(cfg: *StoreConfig) -> bool
+    var app: App
+    app_new(@app)
+    let mode: i32 = wiki_app_open(@app.repo, cfg, 1)
+    mode == APP_UNAVAILABLE and view(@app, "welcome") == 503
+
+
+[[test]]
+fn test_app_refuses_a_bad_configuration() -> i32
+    var bad_port: StoreConfig = store_config_default()
+    store_config_set_address(@bad_port, "", "77x")
+    if not refuses_config(@bad_port)
+        return 1
+    var bad_mode: StoreConfig = store_config_default()
+    store_config_set_plaintext(@bad_mode, "yes")
+    if refuses_config(@bad_mode) then 0 else 2
+
+
+[[test]]
+fn test_app_reaches_the_configured_database() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    var cfg: StoreConfig = store_config_default()
+    var port: [12]u8
+    let n: i32 = fmt_port(live.port, @port[0])
+    if store_config_set_address(@cfg, "127.0.0.1", strview_from_ptr(@port[0], n as i64)) != 0
+        live_db_stop(@live)
+        return 1
+    if store_config_set_plaintext(@cfg, "1") != 0
+        live_db_stop(@live)
+        return 2
+    var app: App
+    app_new(@app)
+    let mode: i32 = wiki_app_open(@app.repo, @cfg, 2)
+    wiki_page_repo_disconnect(@app.repo)
+    live_db_stop(@live)
+    if mode == APP_MAUSOLEUM then 0 else 3
+
+
+# Decimal digits of `v` (> 0) into `out`; returns how many.
+fn fmt_port(v: i32, out: *u8) -> i32
+    var tmp: [12]u8
+    var n: i32 = 0
+    var x: i32 = v
+    while x > 0
+        tmp[n] = (48 + x % 10) as u8
+        x = x / 10
+        n += 1
+    for i in 0..n
+        *(out + i) = tmp[n - 1 - i]
+    n
+
+
+# ============================================================================
+# Seeding an empty wiki
+# ============================================================================
+
+[[test]]
+fn test_app_seeds_an_empty_wiki_once() -> i32
+    var app: App
+    app_new(@app)
+    var cfg: StoreConfig = plaintext_on(dead_port())
+    if wiki_app_open(@app.repo, @cfg, 1) != APP_MEMORY
+        return 1
+    if wiki_app_seed(@app.svc) != 3
+        return 2
+    if view(@app, "welcome") != 200
+        return 3
+    # Not empty any more (another worker seeded, or a restart): no reseed.
+    if wiki_app_seed(@app.svc) != 3
+        return 4
+    if page_count(@app) == 3 then 0 else 5
+
+
+[[test]]
+fn test_app_does_not_seed_a_wiki_with_pages() -> i32
+    var app: App
+    app_new(@app)
+    var cfg: StoreConfig = plaintext_on(dead_port())
+    wiki_app_open(@app.repo, @cfg, 1)
+    save(@app, "mine", "x")
+    if wiki_app_seed(@app.svc) != 1
+        return 1
+    if view(@app, "welcome") == 404 then 0 else 2

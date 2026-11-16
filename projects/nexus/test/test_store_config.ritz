@@ -1,0 +1,177 @@
+# test/test_store_config.ritz - where nexus's page store is, and how to dial it
+#
+# Ported from test_store.ritz when src/store.ritz retired (AGAST #2209): the
+# configuration it parsed is now a StoreConfig (src/store_config.ritz) that
+# src/wiki_app.ritz opens the repository with.
+
+import ritzlib.str
+import ritzlib.strview { StrView }
+
+import store_config {
+    StoreConfig,
+    store_config_default,
+    store_config_set_address,
+    store_config_set_plaintext,
+    store_config_host,
+    store_connect_hint
+}
+
+
+# ============================================================================
+# Where mausoleum is: MAUSOLEUM_HOST / MAUSOLEUM_PORT (AGAST #3065)
+#
+# nexus used to dial a hard-coded 127.0.0.1:7777, so a test stack reached
+# whatever mausoleum another process had up there. store_config_set_address
+# takes the two variables' values ("" = unset, keep the default).
+# ============================================================================
+
+[[test]]
+fn test_config_defaults_to_local_encrypted() -> i32
+    var cfg: StoreConfig = store_config_default()
+    if cfg.port != 7777
+        return 1
+    if not cfg.encrypted
+        return 2
+    if cfg.error
+        return 3
+    if strcmp(store_config_host(@cfg), c"127.0.0.1") == 0 then 0 else 4
+
+
+[[test]]
+fn test_config_unset_keeps_the_default() -> i32
+    var cfg: StoreConfig = store_config_default()
+    if store_config_set_address(@cfg, "", "") != 0
+        return 1
+    if cfg.port != 7777
+        return 2
+    if strcmp(store_config_host(@cfg), c"127.0.0.1") == 0 then 0 else 3
+
+
+[[test]]
+fn test_config_sets_host_and_port() -> i32
+    var cfg: StoreConfig = store_config_default()
+    if store_config_set_address(@cfg, "10.1.2.3", "4242") != 0
+        return 1
+    if cfg.port != 4242
+        return 2
+    if strcmp(store_config_host(@cfg), c"10.1.2.3") != 0
+        return 3
+    # Port alone keeps the host.
+    var cfg2: StoreConfig = store_config_default()
+    if store_config_set_address(@cfg2, "", "65535") != 0
+        return 4
+    if cfg2.port != 65535
+        return 5
+    if strcmp(store_config_host(@cfg2), c"127.0.0.1") == 0 then 0 else 6
+
+
+# An unusable value must not quietly become the default store: that is the
+# wrong-mausoleum bug again. The config is marked bad, and nexus refuses.
+fn address_rejected(host: StrView, port: StrView) -> bool
+    var cfg: StoreConfig = store_config_default()
+    if store_config_set_address(@cfg, host, port) == 0
+        return false
+    cfg.error
+
+
+[[test]]
+fn test_config_rejects_a_bad_port() -> i32
+    if not address_rejected("", "77x")
+        return 1
+    if not address_rejected("", "0")
+        return 2
+    if not address_rejected("", "65536")
+        return 3
+    if not address_rejected("", "-1")
+        return 4
+    if not address_rejected("", "99999999999999999999")
+        return 5
+    0
+
+
+[[test]]
+fn test_config_rejects_a_too_long_host() -> i32
+    let long: StrView = "a234567890123456789012345678901234567890123456789012345678901234"
+    if address_rejected(long, "") then 0 else 1
+
+
+# ============================================================================
+# Plaintext transport: MAUSOLEUM_PLAINTEXT (AGAST #2466)
+#
+# "1" = plaintext (mausoleum --no-encryption), "0" = encrypted (mausoleum's
+# default, and production's), "" = unset (keep). Any other value refuses to
+# serve, like a bad MAUSOLEUM_PORT: guessing would fail every handshake, or
+# send pages in the clear to an encrypted store.
+# ============================================================================
+
+[[test]]
+fn test_config_plaintext_unset_keeps_the_mode() -> i32
+    var cfg: StoreConfig = store_config_default()
+    if store_config_set_plaintext(@cfg, "") != 0
+        return 1
+    if not cfg.encrypted
+        return 2
+    cfg.encrypted = false
+    if store_config_set_plaintext(@cfg, "") != 0
+        return 3
+    if cfg.encrypted then 4 else 0
+
+
+[[test]]
+fn test_config_plaintext_1_and_0() -> i32
+    var cfg: StoreConfig = store_config_default()
+    if store_config_set_plaintext(@cfg, "1") != 0
+        return 1
+    if cfg.encrypted
+        return 2
+    if store_config_set_plaintext(@cfg, "0") != 0
+        return 3
+    if cfg.encrypted then 0 else 4
+
+
+fn plaintext_rejected(v: StrView) -> bool
+    var cfg: StoreConfig = store_config_default()
+    if store_config_set_plaintext(@cfg, v) == 0
+        return false
+    # Unchanged, and marked bad: nexus dials in neither mode.
+    cfg.encrypted and cfg.error
+
+
+[[test]]
+fn test_config_plaintext_rejects_other_values() -> i32
+    if not plaintext_rejected("yes")
+        return 1
+    if not plaintext_rejected("true")
+        return 2
+    if not plaintext_rejected("2")
+        return 3
+    if not plaintext_rejected("10")
+        return 4
+    if not plaintext_rejected(" 1")
+        return 5
+    0
+
+
+# ============================================================================
+# Connection failure explains itself
+# ============================================================================
+
+[[test]]
+fn test_hint_names_the_encryption_mismatch() -> i32
+    # -6: the handshake (or CONNECT reply) never arrived, which is what an
+    # encrypted client sees from a --no-encryption server.
+    let hint: *u8 = store_connect_hint(-6, true)
+    if hint == null
+        return 1
+    if strstr(hint, c"--no-encryption") == null
+        return 2
+    0
+
+
+[[test]]
+fn test_hint_is_silent_for_a_refused_connection() -> i32
+    # Nothing listening is not an encryption problem.
+    let hint: *u8 = store_connect_hint(-4, true)
+    if hint == null
+        return 0
+    if strstr(hint, c"encryption") == null then 0 else 1

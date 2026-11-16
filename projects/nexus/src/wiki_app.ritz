@@ -1,0 +1,120 @@
+# src/wiki_app.ritz - Opening nexus's page store, and seeding an empty wiki
+#
+# Replaces src/store.ritz's startup (AGAST #2209). The pages live in Mausoleum
+# when it answers; the database is then the only copy of a page, so every
+# worker sees every other's writes (AGAST #2459). If it doesn't answer:
+#
+#   - one worker serves pages from its own memory (coherent, as the only copy,
+#     but lost on restart). The e2e (test/e2e_large_page.sh) runs this way;
+#   - several workers would be several divergent wikis, so every page request
+#     is a 503 instead, and each one dials again: nexus recovers when
+#     Mausoleum comes up;
+#   - an unusable configuration (src/store_config.ritz) never dials at all.
+
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_push_cstr, string_push_i64 }
+import ritzlib.gvec { Vec, vec_len, vec_get, vec_drop }
+
+import log { log_begin, log_end, log_cstr }
+import store_config { StoreConfig, store_config_host, store_connect_hint }
+import models.wiki_page { WikiPage, wiki_page_drop }
+import repos.wiki_page_repo { WikiPageRepository, wiki_page_repo_open, wiki_page_repo_open_memory, wiki_page_repo_disconnect }
+import services.wiki_service { WikiService, wiki_service_list_pages, wiki_service_create_page }
+
+
+# wiki_app_open's outcome.
+pub const APP_MAUSOLEUM: i32 = 0       # pages live in mausoleum
+pub const APP_MEMORY: i32 = 1          # one worker, in-memory pages
+pub const APP_UNAVAILABLE: i32 = -1    # page requests are 503s
+
+
+fn wiki_app_log_connect_failure(cfg: *StoreConfig, err: i32)
+    var line: String = log_begin()
+    string_push_cstr(@&line, c"[STORE] Failed to connect to mausoleum at ")
+    string_push_cstr(@&line, store_config_host(cfg))
+    string_push_cstr(@&line, c":")
+    string_push_i64(@&line, cfg.port as i64)
+    string_push_cstr(@&line, c" (error ")
+    string_push_i64(@&line, err as i64)
+    string_push_cstr(@&line, c")")
+    let hint: *u8 = store_connect_hint(err, cfg.encrypted)
+    if hint != null
+        string_push_cstr(@&line, c": ")
+        string_push_cstr(@&line, hint)
+    log_end(@&line)
+
+
+# Open `repo` for one of `workers` workers as `cfg` says. Returns the mode.
+pub fn wiki_app_open(repo: *WikiPageRepository, cfg: *StoreConfig, workers: i32) -> i32
+    if cfg.error
+        # The repository stays closed: every operation is a NetworkError.
+        log_cstr(c"[STORE] Not connecting: the mausoleum configuration is unusable (see above)")
+        return APP_UNAVAILABLE
+
+    var line: String = log_begin()
+    string_push_cstr(@&line, c"[STORE] Connecting to mausoleum via Spire at ")
+    string_push_cstr(@&line, store_config_host(cfg))
+    string_push_cstr(@&line, c":")
+    string_push_i64(@&line, cfg.port as i64)
+    if not cfg.encrypted
+        string_push_cstr(@&line, c" (plaintext)")
+    log_end(@&line)
+
+    let host: StrView = StrView { ptr: store_config_host(cfg), len: cfg.host_len as i64 }
+    let rc: i32 = wiki_page_repo_open(repo, host, cfg.port, cfg.encrypted)
+    if rc == 0
+        log_cstr(c"[STORE] Connected to mausoleum via Spire!")
+        return APP_MAUSOLEUM
+    wiki_app_log_connect_failure(cfg, rc)
+
+    if workers > 1
+        # Stay open on mausoleum: each request dials it again.
+        var refuse: String = log_begin()
+        string_push_cstr(@&refuse, c"[STORE] REFUSING to serve pages: ")
+        string_push_i64(@&refuse, workers as i64)
+        string_push_cstr(@&refuse, c" workers would each keep a private in-memory wiki. Start mausoleum (or run zeus -w 1); page requests are 503s until it answers")
+        log_end(@&refuse)
+        return APP_UNAVAILABLE
+
+    wiki_page_repo_disconnect(repo)
+    wiki_page_repo_open_memory(repo)
+    log_cstr(c"[STORE] Falling back to in-memory mode (single worker; pages are lost on restart)")
+    APP_MEMORY
+
+
+fn wiki_app_seed_page(svc: *WikiService, slug: StrView, content: StrView)
+    match wiki_service_create_page(svc, slug, slug, content)
+        Ok(page) =>
+            var p: WikiPage = page
+            wiki_page_drop(@p)
+        Err(_) =>
+            0     # another worker seeded it first, or the store is down
+
+
+fn wiki_app_page_count(svc: *WikiService) -> i64
+    match wiki_service_list_pages(svc)
+        Ok(pages) =>
+            let n: i64 = vec_len<WikiPage>(@pages)
+            var i: i64 = 0
+            while i < n
+                var page: WikiPage = vec_get<WikiPage>(@pages, i)
+                wiki_page_drop(@page)
+                i += 1
+            var v: Vec<WikiPage> = pages
+            vec_drop<WikiPage>(@&v)
+            n
+        Err(_) => -1
+
+
+# Seed the starter pages if the wiki is empty. Several workers may race to do
+# this; creates never overwrite, so they converge. Returns how many pages the
+# wiki has afterwards, or -1 if the store is unavailable.
+pub fn wiki_app_seed(svc: *WikiService) -> i64
+    let before: i64 = wiki_app_page_count(svc)
+    if before != 0
+        return before
+    log_cstr(c"[STORE] Seeding initial pages...")
+    wiki_app_seed_page(svc, "welcome", "# Welcome to Nexus Wiki\n\nThis is your knowledge base powered by Ritz.\n\nThe entire stack - HTTP server, database, and this wiki - is written in Ritz!")
+    wiki_app_seed_page(svc, "getting-started", "# Getting Started\n\nLearn how to use the Nexus Wiki.\n\n1. Browse pages from the home page\n2. Click 'Edit' to modify a page\n3. Click '+ New Page' to create a page")
+    wiki_app_seed_page(svc, "ritz-language", "# Ritz Language\n\nRitz is a systems programming language that compiles to LLVM IR.\n\n- No libc dependency\n- Direct Linux syscalls\n- Memory safe (coming soon)")
+    wiki_app_page_count(svc)

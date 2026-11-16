@@ -9,14 +9,15 @@ import ritzlib.strview { StrView, strview_len, strview_as_ptr }
 import ritzlib.string { String, string_from, string_new, string_drop, string_push, string_len, string_eq, string_as_view }
 import ritzlib.gvec { Vec, vec_len, vec_get, vec_drop }
 
-import spire.repo.mausoleum { DbField, db_field, db_serialize_doc }
+import spire.repo.mausoleum { Db, DbField, db_field, db_serialize_doc, db_extract_field }
+import spire.repo.mausoleum { db_init, db_set_encryption, db_connect, db_close, db_insert, db_scan }
 import mausoleum.document { DocumentId, doc_id_invalid, doc_id_is_valid, doc_id_eq }
 import mausoleum.collection { MAX_DOC_SIZE }
 import services.validation { MAX_CONTENT_SIZE, MAX_SLUG_LENGTH, MAX_TITLE_LENGTH }
 
 import models.wiki_page { WikiPage, wiki_page_new, wiki_page_new_child, wiki_page_drop, wiki_page_update_content }
 import errors.repo_error { RepoError }
-import repos.wiki_page_codec { wiki_page_encode, wiki_page_encode_bound, wiki_page_decode }
+import repos.wiki_page_codec { wiki_page_encode, wiki_page_encode_bound, wiki_page_decode, wiki_page_decode_legacy }
 import repos.wiki_page_repo {
     WikiPageRepository,
     wiki_page_repo_new,
@@ -28,9 +29,14 @@ import repos.wiki_page_repo {
     wiki_page_repo_insert,
     wiki_page_repo_update,
     wiki_page_repo_delete,
-    wiki_page_repo_list_all
+    wiki_page_repo_list_all,
+    wiki_page_repo_delete_slug,
+    wiki_page_repo_open,
+    wiki_page_repo_open_memory,
+    wiki_page_repo_max_content_len,
+    MEMORY_MAX_CONTENT_LEN
 }
-import test.support.live_db { LiveDb, live_db_start, live_db_stop }
+import test.support.live_db { LiveDb, live_db_start, live_db_stop, live_db_restart }
 
 
 fn page_of(slug: StrView, title: StrView, content: StrView) -> WikiPage
@@ -692,6 +698,465 @@ fn test_page_at_the_limit_round_trips() -> i32
     var rc: i32 = connect(@repo, @db)
     if rc == 0
         rc = check_max_page(@repo)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+# ============================================================================
+# Many workers, one database (AGAST #2459, #2209)
+#
+# zeus runs several nexus workers, each with its own repository. These tests
+# play one worker (`repo`) and use a second repository or a raw connection as
+# "another worker" writing behind its back: every worker must see every other
+# worker's writes on its next request.
+# ============================================================================
+
+fn repos_on(db: *LiveDb, a: *WikiPageRepository, b: *WikiPageRepository) -> i32
+    if connect(a, db) != 0
+        return 1
+    connect(b, db)
+
+
+# A raw connection, as store.ritz (before #2209) or a foreign app wrote.
+fn raw_connect(raw: *Db, port: i32) -> i32
+    db_init(raw, c"127.0.0.1", 9, port, c"wiki", 4)
+    db_set_encryption(raw, 0)
+    db_connect(raw)
+
+
+# A store.ritz page: a Document with only `slug` and `content`.
+fn raw_put(raw: *Db, k1: StrView, v1: StrView, k2: StrView, v2: StrView) -> i64
+    var fields: [2]DbField
+    fields[0] = db_field(strview_as_ptr(k1), strview_len(k1) as i32, strview_as_ptr(v1), strview_len(v1) as i32)
+    fields[1] = db_field(strview_as_ptr(k2), strview_len(k2) as i32, strview_as_ptr(v2), strview_len(v2) as i32)
+    var buf: [1024]u8
+    let n: i64 = db_serialize_doc(@buf[0], 1024, @fields[0], 2)
+    if n < 0
+        return -1
+    db_insert(raw, @buf[0], n as i32)
+
+
+fn legacy_put(raw: *Db, slug: StrView, content: StrView) -> i64
+    raw_put(raw, "slug", slug, "content", content)
+
+
+struct SlugCount
+    slug: StrView
+    n: i32
+
+
+fn slug_count_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+    let sc: *SlugCount = user as *SlugCount
+    var got: [129]u8
+    let n: i32 = db_extract_field(data, len, c"slug", 4, @got[0], 129)
+    if n as i64 != strview_len(sc.slug)
+        return 0
+    for i in 0..n
+        if got[i] != *(strview_as_ptr(sc.slug) + i)
+            return 0
+    sc.n += 1
+    0
+
+
+# How many documents in the database hold `slug`.
+fn docs_for(raw: *Db, slug: StrView) -> i32
+    var sc: SlugCount
+    sc.slug = slug
+    sc.n = 0
+    if db_scan(raw, slug_count_step as *u8, @sc as *u8) < 0
+        return -1
+    sc.n
+
+
+# `repo` serves `slug` with exactly `want`.
+fn serves(repo: *WikiPageRepository, slug: StrView, want: StrView) -> bool
+    match wiki_page_repo_get_by_slug(repo, slug)
+        Ok(got) =>
+            let ok: bool = string_eq(@got.content, want)
+            var p: WikiPage = got
+            wiki_page_drop(@p)
+            ok
+        Err(_) => false
+
+
+fn listed_count(repo: *WikiPageRepository) -> i64
+    match wiki_page_repo_list_all(repo)
+        Ok(pages) =>
+            let n: i64 = vec_len<WikiPage>(@pages)
+            var v: Vec<WikiPage> = pages
+            vec_drop<WikiPage>(@&v)
+            n
+        Err(_) => -1
+
+
+[[test]]
+fn test_repo_serves_a_page_another_worker_created() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var a = wiki_page_repo_new()
+    var b = wiki_page_repo_new()
+    var rc: i32 = repos_on(@db, @a, @b)
+    if rc == 0
+        rc = insert_page(@b, "made-elsewhere", "hello from worker b")
+    if rc == 0 and not serves(@a, "made-elsewhere", "hello from worker b")
+        rc = 3
+    live_db_stop(@db)
+    rc
+
+
+[[test]]
+fn test_repo_serves_the_newest_copy_of_a_slug() -> i32
+    # Two documents for one slug: a save interrupted between its insert and
+    # its delete, or two workers saving at once. The newest is the page.
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var a = wiki_page_repo_new()
+    var b = wiki_page_repo_new()
+    var rc: i32 = repos_on(@db, @a, @b)
+    if rc == 0
+        rc = insert_page(@b, "twice", "older")
+    if rc == 0
+        rc = insert_page(@b, "twice", "newer")
+    if rc == 0 and not serves(@a, "twice", "newer")
+        rc = 3
+    live_db_stop(@db)
+    rc
+
+
+fn check_update_cleans_up(a: *WikiPageRepository, b: *WikiPageRepository, raw: *Db) -> i32
+    if insert_page(b, "twice", "older") != 0
+        return 2
+    if insert_page(b, "twice", "newer") != 0
+        return 3
+    match wiki_page_repo_get_by_slug(a, "twice")
+        Ok(got) =>
+            var page: WikiPage = got
+            wiki_page_update_content(@page, string_from("newest"))
+            match wiki_page_repo_update(a, @page)
+                Ok(_) => 0
+                Err(_) => return 4
+        Err(_) => return 5
+    if docs_for(raw, "twice") != 1
+        return 6
+    if not serves(a, "twice", "newest")
+        return 7
+    if listed_count(a) == 1 then 0 else 8
+
+
+[[test]]
+fn test_repo_update_leaves_one_document_per_slug() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var a = wiki_page_repo_new()
+    var b = wiki_page_repo_new()
+    var raw: Db
+    var rc: i32 = repos_on(@db, @a, @b)
+    if rc == 0 and raw_connect(@raw, db.port) < 0
+        rc = 10
+    if rc == 0
+        rc = check_update_cleans_up(@a, @b, @raw)
+    live_db_stop(@db)
+    rc
+
+
+[[test]]
+fn test_repo_lists_a_slug_with_two_copies_once() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var a = wiki_page_repo_new()
+    var b = wiki_page_repo_new()
+    var rc: i32 = repos_on(@db, @a, @b)
+    if rc == 0
+        rc = insert_page(@b, "twice", "older")
+    if rc == 0
+        rc = insert_page(@b, "twice", "newer")
+    if rc == 0
+        rc = insert_page(@b, "once", "only")
+    if rc == 0
+        match wiki_page_repo_list_all(@a)
+            Ok(pages) =>
+                if vec_len<WikiPage>(@pages) != 2
+                    rc = 4
+                else
+                    # The surviving copy is the newest.
+                    let first: WikiPage = vec_get<WikiPage>(@pages, 0)
+                    if not string_eq(@first.content, "newer")
+                        rc = 5
+            Err(_) => rc = 6
+    live_db_stop(@db)
+    rc
+
+
+[[test]]
+fn test_repo_delete_slug_removes_every_copy() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var a = wiki_page_repo_new()
+    var b = wiki_page_repo_new()
+    var rc: i32 = repos_on(@db, @a, @b)
+    if rc == 0
+        rc = insert_page(@b, "twice", "older")
+    if rc == 0
+        rc = insert_page(@b, "twice", "newer")
+    if rc == 0
+        match wiki_page_repo_delete_slug(@a, "twice")
+            Ok(_) => 0
+            Err(_) => rc = 3
+    if rc == 0
+        # Deleting the newest copy alone would bring the older one back.
+        match wiki_page_repo_get_by_slug(@a, "twice")
+            Ok(_) => rc = 4
+            Err(e) => rc = expect_not_found(@e)
+    if rc == 0
+        match wiki_page_repo_delete_slug(@a, "twice")
+            Ok(_) => rc = 5
+            Err(e) => rc = expect_not_found(@e)
+    live_db_stop(@db)
+    rc
+
+
+# ============================================================================
+# Database trouble is a NetworkError (a 503), never a missing page
+# ============================================================================
+
+[[test]]
+fn test_repo_reports_a_lost_database_as_a_network_error() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = insert_page(@repo, "kept", "safe")
+    live_db_stop(@db)
+    if rc != 0
+        return rc
+    # Before #2209 a lost scan was a DatabaseError; a 404 before #2459.
+    match wiki_page_repo_get_by_slug(@repo, "kept")
+        Ok(_) => return 3
+        Err(e) =>
+            if expect_network(@e) != 0
+                return 4
+    var page = page_of("orphan", "Orphan", "lost")
+    match wiki_page_repo_insert(@repo, @page)
+        Ok(_) => 5
+        Err(e) => if expect_network(@e) == 0 then 0 else 6
+
+
+[[test]]
+fn test_repo_reconnects_when_the_database_comes_back() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0 and live_db_restart(@db) != 0
+        rc = 91
+    # The old connection is dead; the next request dials again.
+    if rc == 0
+        rc = insert_page(@repo, "after", "restart")
+    if rc == 0 and not serves(@repo, "after", "restart")
+        rc = 3
+    live_db_stop(@db)
+    rc
+
+
+[[test]]
+fn test_repo_opened_while_the_database_is_down_dials_on_each_request() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    live_db_stop(@db)
+    var repo = wiki_page_repo_new()
+    if wiki_page_repo_open(@repo, "127.0.0.1", db.port, false) >= 0
+        return 1
+    match wiki_page_repo_get_by_slug(@repo, "x")
+        Ok(_) => return 2
+        Err(e) =>
+            if expect_network(@e) != 0
+                return 3
+    if live_db_restart(@db) != 0
+        return 91
+    var rc: i32 = insert_page(@repo, "late", "arrival")
+    if rc == 0 and not serves(@repo, "late", "arrival")
+        rc = 4
+    live_db_stop(@db)
+    rc
+
+
+# ============================================================================
+# Data written before #2209, and documents that aren't pages
+#
+# store.ritz stored a page as {slug, content}; collection names are ignored
+# server-side, so those documents (and any other app's) share the pages'
+# collection. Old pages stay readable, and become full pages on their next
+# save; documents that aren't pages are skipped.
+# ============================================================================
+
+[[test]]
+fn test_codec_decodes_a_legacy_page() -> i32
+    var fields: [2]DbField
+    fields[0] = db_field(c"slug", 4, c"welcome", 7)
+    fields[1] = db_field(c"content", 7, c"hi", 2)
+    var buf: [256]u8
+    let n: i64 = db_serialize_doc(@buf[0], 256, @fields[0], 2)
+    if n < 0
+        return 1
+    # The strict decoder still refuses it.
+    match wiki_page_decode(@buf[0], n as i32)
+        Ok(_) => return 2
+        Err(_) => 0
+    match wiki_page_decode_legacy(@buf[0], n as i32)
+        Ok(page) =>
+            if not string_eq(@page.slug, "welcome")
+                return 3
+            if not string_eq(@page.title, "welcome")
+                return 4
+            if not string_eq(@page.content, "hi")
+                return 5
+            if page.version != 1 then 6 else 0
+        Err(_) => 7
+
+
+[[test]]
+fn test_codec_legacy_decode_refuses_a_document_without_a_slug() -> i32
+    var fields: [2]DbField
+    fields[0] = db_field(c"kind", 4, c"user", 4)
+    fields[1] = db_field(c"content", 7, c"hi", 2)
+    var buf: [256]u8
+    let n: i64 = db_serialize_doc(@buf[0], 256, @fields[0], 2)
+    match wiki_page_decode_legacy(@buf[0], n as i32)
+        Ok(_) => 1
+        Err(e) => expect_serialization(@e)
+
+
+fn check_legacy(repo: *WikiPageRepository, raw: *Db) -> i32
+    if legacy_put(raw, "welcome", "old content") < 0
+        return 2
+    raw_put(raw, "kind", "session", "token", "abc")       # not a page
+    if insert_page(repo, "fresh", "new content") != 0
+        return 3
+    if not serves(repo, "welcome", "old content")
+        return 4
+    if listed_count(repo) != 2
+        return 5
+    # Its next save rewrites it as a full page, leaving one document.
+    match wiki_page_repo_get_by_slug(repo, "welcome")
+        Ok(got) =>
+            var page: WikiPage = got
+            wiki_page_update_content(@page, string_from("edited"))
+            match wiki_page_repo_update(repo, @page)
+                Ok(_) => 0
+                Err(_) => return 6
+        Err(_) => return 7
+    if docs_for(raw, "welcome") != 1
+        return 8
+    match wiki_page_repo_get_by_slug(repo, "welcome")
+        Ok(got) =>
+            if not string_eq(@got.content, "edited")
+                return 9
+            if got.version != 2 then 10 else 0
+        Err(_) => 11
+
+
+[[test]]
+fn test_repo_serves_lists_and_upgrades_legacy_pages() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var raw: Db
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0 and raw_connect(@raw, db.port) < 0
+        rc = 1
+    if rc == 0
+        rc = check_legacy(@repo, @raw)
+    live_db_stop(@db)
+    rc
+
+
+# ============================================================================
+# In memory: one worker with no database (the e2e's mode)
+# ============================================================================
+
+[[test]]
+fn test_memory_repo_round_trips_pages() -> i32
+    var repo = wiki_page_repo_new()
+    wiki_page_repo_open_memory(@repo)
+    if not wiki_page_repo_is_connected(@repo)
+        return 1
+    if insert_page(@repo, "one", "1") != 0
+        return 2
+    if insert_page(@repo, "two", "2") != 0
+        return 3
+    if not serves(@repo, "one", "1")
+        return 4
+    match wiki_page_repo_get_by_slug(@repo, "missing")
+        Ok(_) => return 5
+        Err(e) =>
+            if expect_not_found(@e) != 0
+                return 6
+    if listed_count(@repo) != 2
+        return 7
+    match wiki_page_repo_get_by_slug(@repo, "two")
+        Ok(got) =>
+            var page: WikiPage = got
+            wiki_page_update_content(@page, string_from("2b"))
+            match wiki_page_repo_update(@repo, @page)
+                Ok(_) => 0
+                Err(_) => return 8
+        Err(_) => return 9
+    if not serves(@repo, "two", "2b")
+        return 10
+    if listed_count(@repo) != 2
+        return 11
+    match wiki_page_repo_delete_slug(@repo, "one")
+        Ok(_) => 0
+        Err(_) => return 12
+    if listed_count(@repo) == 1 then 0 else 13
+
+
+[[test]]
+fn test_memory_repo_keeps_a_page_bigger_than_mausoleum_takes() -> i32
+    # The repository stores what it's given; the 8192 limit is the service's
+    # (wiki_page_repo_max_content_len), so this page is bigger than both.
+    var repo = wiki_page_repo_new()
+    wiki_page_repo_open_memory(@repo)
+    var page = wiki_page_new(string_from("big"), string_from("Big"), big_string(100000))
+    match wiki_page_repo_insert(@repo, @page)
+        Ok(_) => 0
+        Err(_) => return 1
+    match wiki_page_repo_get_by_slug(@repo, "big")
+        Ok(got) => if string_len(@got.content) == 100000 then 0 else 2
+        Err(_) => 3
+
+
+# The longest content each backend takes (#2208's limits, AGAST #2209): one
+# mausoleum document's worth on Mausoleum, the in-memory store's own 8192
+# (the e2e's max-size page) in memory.
+[[test]]
+fn test_repo_max_content_len_follows_the_backend() -> i32
+    if MEMORY_MAX_CONTENT_LEN != 8192
+        return 1
+    var repo = wiki_page_repo_new()
+    if wiki_page_repo_max_content_len(@repo) != MAX_CONTENT_SIZE
+        return 2
+    wiki_page_repo_open_memory(@repo)
+    if wiki_page_repo_max_content_len(@repo) != MEMORY_MAX_CONTENT_LEN
+        return 3
+    wiki_page_repo_disconnect(@repo)
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0 and wiki_page_repo_max_content_len(@repo) != MAX_CONTENT_SIZE
+        rc = 4
     wiki_page_repo_disconnect(@repo)
     live_db_stop(@db)
     rc

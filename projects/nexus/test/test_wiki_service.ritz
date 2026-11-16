@@ -10,9 +10,11 @@ import repos.wiki_page_repo {
     WikiPageRepository,
     wiki_page_repo_new,
     wiki_page_repo_connect,
+    wiki_page_repo_open_memory,
     wiki_page_repo_disconnect,
     wiki_page_repo_get_by_slug,
-    wiki_page_repo_delete
+    wiki_page_repo_delete,
+    wiki_page_repo_insert
 }
 import repos.page_cache {
     PageCache,
@@ -417,4 +419,69 @@ fn test_page_at_the_limit_is_stored() -> i32
         return rc
     rc = check_max_size(@w)
     world_close(@w)
+    rc
+
+
+# Two documents for one slug (an interrupted save, or two workers saving at
+# once): a delete takes both, or the older would come back (AGAST #2209).
+fn check_delete_every_copy(w: *World) -> i32
+    if create(w, "home", "first") != 0
+        return 1
+    var copy: WikiPage = wiki_page_new(string_from("home"), string_from("Title"), string_from("second"))
+    match wiki_page_repo_insert(@w.repo, @copy)
+        Ok(_) => 0
+        Err(_) => return 2
+    match wiki_service_delete_page(@w.svc, "home")
+        Ok(_) => 0
+        Err(_) => return 3
+    match wiki_page_repo_get_by_slug(@w.repo, "home")
+        Ok(_) => 4
+        Err(_) => 0
+
+
+[[test]]
+fn test_delete_removes_every_copy_of_a_slug() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_delete_every_copy(@w)
+    world_close(@w)
+    rc
+
+
+# In memory (one worker, no mausoleum: the e2e's mode) the limit is the
+# in-memory store's 8192, as #2208 kept it, not one mausoleum document's.
+fn check_memory_limit(svc: *WikiService) -> i32
+    let at = content_of(8192)
+    let over = content_of(8193)
+    match wiki_service_create_page(svc, "big", "Big", string_as_view(@at))
+        Ok(_) => 0
+        Err(_) => return 1
+    match wiki_service_update_content(svc, "big", string_as_view(@over))
+        Ok(_) => return 2
+        Err(e) =>
+            match e
+                ServiceError.ContentTooLarge => 0
+                _ => return 3
+    match wiki_service_create_page(svc, "bigger", "Bigger", string_as_view(@over))
+        Ok(_) => 4
+        Err(e) =>
+            match e
+                ServiceError.ContentTooLarge => 0
+                _ => 5
+
+
+[[test]]
+fn test_memory_service_takes_the_in_memory_limit() -> i32
+    var repo = wiki_page_repo_new()
+    wiki_page_repo_open_memory(@repo)
+    var cache = page_cache_new()
+    match page_cache_connect(@cache, 4194304)
+        Ok(_) => 0
+        Err(_) => return 92
+    var svc = wiki_service_new(@repo, @cache)
+    let rc: i32 = check_memory_limit(@svc)
+    page_cache_disconnect(@cache)
+    wiki_page_repo_disconnect(@repo)
     rc

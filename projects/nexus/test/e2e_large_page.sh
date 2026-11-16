@@ -19,9 +19,9 @@
 # on, so the dial is refused and the one worker serves in-memory pages. Before
 # that nexus always dialed 127.0.0.1:7777, so this test used whatever
 # mausoleum another process (another room's smoke stack) had up there, and
-# failed on its inserts. A mausoleum page holds at most STORE_MAX_CONTENT_LEN
-# (1769) bytes of content (#2208: one document); the in-memory store's limit
-# is its 8192-byte buffer, which is what this transport test needs.
+# failed on its inserts. A mausoleum page holds at most MAX_CONTENT_SIZE
+# (1229) bytes of content (#2208: one document); the in-memory store's limit
+# is 8192 (MEMORY_MAX_CONTENT_LEN), which is what this transport test needs.
 #
 # Needs debug builds of zeus, valet and nexus:
 #   ./rz build zeus && ./rz build valet && ./rz build nexus
@@ -128,6 +128,14 @@ if [[ "$(echo "$out" | awk 'NR==2{print $1}')" == "200" && "$(echo "$out" | awk 
 else
     fail "keep-alive after large response: '$(echo $out)' (want second '200 0')"
 fi
+
+# --- 3b. One byte over the in-memory limit: 413, nothing stored -------------
+python3 -c 'import sys; sys.stdout.write("slug=over&content=" + "a" * 8193)' >"$TMP/over.body"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    --data-binary @"$TMP/over.body" "$BASE/wiki")"
+if [[ "$code" == "413" ]]; then pass "POST 8193-byte page -> 413"; else fail "POST 8193-byte page -> '$code' (want 413, #2208)"; fi
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BASE/wiki/over")"
+if [[ "$code" == "404" ]]; then pass "refused page not stored -> 404"; else fail "GET /wiki/over -> '$code' (want 404)"; fi
 
 # --- 4. Request body larger than a zeus slot: clean error, no hang ------------
 python3 -c 'import sys; sys.stdout.write("slug=huge&content=" + "a" * 300000)' >"$TMP/huge.body"

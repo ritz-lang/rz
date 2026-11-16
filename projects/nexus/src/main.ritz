@@ -2,10 +2,15 @@
 #
 # A wiki built on the Ritz stack as a Zeus worker process:
 # - zeus: Zero-copy IPC with Valet HTTP server
-# - mausoleum: Document database
-# - tome: Caching (TODO)
+# - mausoleum: Document database (src/repos), or memory for a lone worker
+#   with no database (src/wiki_app.ritz)
 #
 # This binary is spawned by Zeus daemon and communicates via shared memory.
+#
+# Each route is a thin adapter (AGAST #2209): parse the request, call a
+# transport-neutral presenter (src/presenters/page_presenter.ritz) that runs
+# it through the wiki service and renders the page, then send its status and
+# body. STATUS_SAVED means the save worked: send the 303 to the page.
 #
 # Usage (spawned by zeus):
 #   nexus <shm_size> <worker_id>
@@ -16,15 +21,17 @@
 # Routes:
 #   GET /           - Home page (list of pages)
 #   GET /health     - Health check
-#   GET /wiki/:slug - View a wiki page
+#   GET /wiki/:slug - View a wiki page (slugs may be nested: a/b/c)
 #   GET /wiki/:slug/edit - Edit form
-#   POST /wiki/:slug - Save changes
+#   POST /wiki/:slug - Save changes (creates the page if it is new)
 #   GET /wiki/new   - Create new page form
-#   POST /wiki      - Create new page
+#   POST /wiki      - Create new page (409 if the slug is taken)
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.memory
+import ritzlib.strview { StrView }
 import ritzlib.string { String, string_new, string_drop, string_len, string_as_ptr, string_push_cstr, string_push_i64 }
 
 import zeus.worker { WorkerContext }
@@ -40,12 +47,18 @@ import zeus.ring { response_slot_set_status, response_slot_set_flags }
 import zeus.ring { response_slot_set_body, response_slot_set_headers }
 import zeus.ring { RESP_FLAG_COMPLETE }
 
-import src.store
 import src.log { log_set_worker, log_begin, log_end, log_cstr }
-import src.slug { MAX_SLUG, path_starts_with, validate_slug, slug_from_path }
-import src.pages { render_index_page, render_not_found_page, render_view_page }
-import src.pages { render_new_page, render_edit_page, render_error_page }
+import src.slug { MAX_SLUG, path_starts_with, slug_valid, slug_from_path }
+import src.pages { render_new_page, render_error_page }
 import src.pages { push_headers, push_redirect_to_page }
+
+import store_config { StoreConfig, store_config_from_env }
+import wiki_app { APP_UNAVAILABLE, wiki_app_open, wiki_app_seed }
+import repos.wiki_page_repo { WikiPageRepository, wiki_page_repo_new, wiki_page_repo_disconnect }
+import repos.page_cache { PageCache, page_cache_new }
+import services.wiki_service { WikiService, wiki_service_new }
+import presenters.page_presenter { STATUS_SAVED, present_index, present_page_view, present_page_edit }
+import presenters.page_presenter { present_page_save, present_page_create }
 
 
 # ============================================================================
@@ -53,6 +66,19 @@ import src.pages { push_headers, push_redirect_to_page }
 # ============================================================================
 
 const SHM_FD: i32 = 3  # Zeus always passes shm fd as fd 3
+
+
+# ============================================================================
+# The wiki: one repository, cache and service per worker process
+#
+# The cache is never connected, so every read goes to the repository. It is
+# per-process (embedded Tome), and zeus runs several workers: a page cached
+# by one would go stale when another saved it (AGAST #2459).
+# ============================================================================
+
+var g_repo: WikiPageRepository
+var g_cache: PageCache
+var g_svc: WikiService
 
 
 # ============================================================================
@@ -232,19 +258,37 @@ fn send_error_page(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, title:
     return send_body(ctx, resp, status, c"text/html; charset=utf-8", @&body)
 
 
-# 503: mausoleum is unreachable, or several workers run without it (AGAST
-# #2459). Never a 404 for a page that may well exist, and never a private
-# per-worker page another request can't see.
-# 413 for content over what the store can hold (AGAST #2208). The form
-# field is read into an 8192-byte buffer, truncated if longer; truncated
-# content is still over the limit (at least 8192 / 3 bytes once decoded), so
-# truncation can't sneak a page under it.
-fn send_content_too_large(ctx: *WorkerContext, resp: *ResponseSlot) -> i32
-    return send_error_page(ctx, resp, 413, c"Page Too Large", c"The page is longer than the wiki's page store can hold. Shorten it and save again.")
+fn send_html(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, body: @&String) -> i32
+    return send_body(ctx, resp, status, c"text/html; charset=utf-8", body)
 
 
-fn send_store_unavailable(ctx: *WorkerContext, resp: *ResponseSlot) -> i32
-    return send_error_page(ctx, resp, 503, c"Store Unavailable", c"The wiki's page store (mausoleum) is unavailable. Try again shortly.")
+# A presenter's outcome: STATUS_SAVED is the 303 to the saved page (its body
+# is empty), anything else is `body` with that status.
+fn send_presented(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, body: @&String, slug: StrView) -> i32
+    if status == STATUS_SAVED
+        string_drop(body)
+        return send_redirect(ctx, resp, slug.ptr, slug.len as i32)
+    return send_html(ctx, resp, status, body)
+
+
+# Form field `name` of the request body, URL-decoded, as a view of a fresh
+# allocation the caller frees (no field can be longer than the body).
+# Returns the field's length, or -1 if absent (*buf_out is then null).
+fn form_field(body: *u8, body_len: i32, name: *u8, buf_out: **u8) -> i32
+    *buf_out = null
+    let buf: *u8 = malloc(body_len as i64)
+    if buf == null
+        return -1
+    let n: i32 = parse_form_field(body, body_len, name, buf, body_len)
+    if n < 0
+        free(buf)
+        return -1
+    *buf_out = buf
+    return n
+
+
+fn view_of(ptr: *u8, len: i32) -> StrView
+    return StrView { ptr: ptr, len: len as i64 }
 
 
 # ============================================================================
@@ -252,15 +296,9 @@ fn send_store_unavailable(ctx: *WorkerContext, resp: *ResponseSlot) -> i32
 # ============================================================================
 
 fn handle_index(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    # wiki_store_list writes '\n'-terminated slugs but no end marker, so
-    # zero the buffer: the renderer stops at the first NUL.
-    var slugs: [2048]u8
-    memset(@slugs[0], 0, 2048)
-    if wiki_store_list(@slugs[0], 2048) < 0
-        return send_store_unavailable(ctx, resp)
     var body: String = string_new()
-    render_index_page(@&body, @slugs[0], 2048)
-    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @&body)
+    let status: i32 = present_index(@g_svc, @&body)
+    return send_html(ctx, resp, status, @&body)
 
 
 fn handle_health(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
@@ -273,148 +311,106 @@ fn handle_not_found(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot)
 
 # GET /wiki/:slug - View a wiki page
 #
-# Looks up the page in the store (mausoleum or fallback) and renders its
-# content inside the standard Nexus chrome.  A slug outside [a-z0-9-]{1,128}
-# is a plain 404; a valid slug with no page gets a styled 404 offering to
-# create it.
+# A slug outside the slug rule (src/slug.ritz) is a plain 404; a valid slug
+# with no page gets a styled 404 offering to create it; mausoleum down is a
+# 503 (src/presenters/page_presenter.ritz).
 fn handle_wiki_view(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let path: *u8 = worker_get_request_path(ctx, req)
-    let path_len: i32 = req.path_len as i32
-
     var slug: [128]u8
-    let slug_len: i32 = slug_from_path(path, path_len, @slug[0])
+    let slug_len: i32 = slug_from_path(path, req.path_len as i32, @slug[0])
     if slug_len <= 0
         return handle_not_found(ctx, req, resp)
 
-    var content: [8192]u8
-    var content_len: i32 = 0
-    let found: i32 = wiki_store_get(@slug[0], slug_len, @content[0], @content_len)
-    if found < 0
-        return send_store_unavailable(ctx, resp)
     var body: String = string_new()
-    if found == 0
-        render_not_found_page(@&body, @slug[0], slug_len)
-        return send_body(ctx, resp, 404, c"text/html; charset=utf-8", @&body)
-
-    render_view_page(@&body, @slug[0], slug_len, @content[0], content_len)
-    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @&body)
+    let status: i32 = present_page_view(@g_svc, view_of(@slug[0], slug_len), @&body)
+    return send_html(ctx, resp, status, @&body)
 
 
 fn handle_wiki_new(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     var body: String = string_new()
     render_new_page(@&body)
-    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @&body)
+    return send_html(ctx, resp, 200, @&body)
 
 
 # POST /wiki - Create a new wiki page from form data.
 #
 # Body shape: application/x-www-form-urlencoded with fields `slug` and
-# `content`.  Both are URL-decoded by parse_form_field.  Slug is then
-# validated against [a-z0-9-]{1,128}; content has no character restrictions
-# beyond a length cap.  If a page with the slug already exists we refuse
-# with 409 rather than silently overwriting — use POST /wiki/:slug for
-# explicit updates.  On success we 303-redirect to the new page so the
-# browser ends up on a GET.
+# `content`, both URL-decoded by parse_form_field.  The slug must follow the
+# slug rule; content is capped by the service (services/validation).  A slug
+# that already has a page is a 409 rather than a silent overwrite — use POST
+# /wiki/:slug for explicit updates.  On success we 303-redirect to the new
+# page so the browser ends up on a GET.  The page's title is its slug.
 fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let body_ptr: *u8 = worker_get_request_body(ctx, req)
     let body_len: i32 = req.body_len as i32
-
     if body_len <= 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Empty request body.")
 
-    # One byte past MAX_SLUG, so an over-long slug fails validation instead
-    # of being truncated to a valid, different one.
-    var slug: [129]u8
-    let slug_len: i32 = parse_form_field(body_ptr, body_len, c"slug", @slug[0], MAX_SLUG + 1)
+    var slug: *u8 = null
+    let slug_len: i32 = form_field(body_ptr, body_len, c"slug", @slug)
     if slug_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'slug' field.")
-    if validate_slug(@slug[0], slug_len) == 0
-        return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9], or '-'.")
+    if slug_len > MAX_SLUG or slug_valid(slug, slug_len) == 0
+        free(slug)
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9] or '-', in segments separated by '/'.")
 
-    var content: [8192]u8
-    let content_len: i32 = parse_form_field(body_ptr, body_len, c"content", @content[0], 8192)
+    var content: *u8 = null
+    let content_len: i32 = form_field(body_ptr, body_len, c"content", @content)
     if content_len < 0
+        free(slug)
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
-    if content_len > wiki_store_max_content_len()
-        return send_content_too_large(ctx, resp)
 
-    # Reject duplicate slug — caller should POST to /wiki/:slug to update
-    var probe: [8192]u8
-    var probe_len: i32 = 0
-    let exists: i32 = wiki_store_get(@slug[0], slug_len, @probe[0], @probe_len)
-    if exists < 0
-        return send_store_unavailable(ctx, resp)
-    if exists == 1
-        return send_error_page(ctx, resp, 409, c"Slug Already Exists", c"A page with that slug already exists. Edit it from its page, or pick a different slug.")
-
-    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
-    if saved == STORE_SAVE_TOO_LARGE
-        return send_content_too_large(ctx, resp)
-    if saved != 1
-        return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the new page.")
-
-    return send_redirect(ctx, resp, @slug[0], slug_len)
+    let slug_view: StrView = view_of(slug, slug_len)
+    var body: String = string_new()
+    let status: i32 = present_page_create(@g_svc, slug_view, slug_view, view_of(content, content_len), @&body)
+    let rc: i32 = send_presented(ctx, resp, status, @&body, slug_view)
+    free(content)
+    free(slug)
+    return rc
 
 
-# POST /wiki/:slug - Update an existing page (also creates if missing).
+# POST /wiki/:slug - Update a page, creating it if it is new.
 #
-# Body shape: same as create but only `content` is read; the slug
-# comes from the URL.  This is the only POST that's idempotent in
-# practice — replaying it overwrites with the same bytes.
+# Body shape: same as create but only `content` is read; the slug comes from
+# the URL.  Replaying it overwrites with the same bytes.
 fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let path: *u8 = worker_get_request_path(ctx, req)
-    let path_len: i32 = req.path_len as i32
-
     var slug: [128]u8
-    let slug_len: i32 = slug_from_path(path, path_len, @slug[0])
+    let slug_len: i32 = slug_from_path(path, req.path_len as i32, @slug[0])
     if slug_len <= 0
-        return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9], or '-'.")
+        return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9] or '-', in segments separated by '/'.")
 
     let body_ptr: *u8 = worker_get_request_body(ctx, req)
     let body_len: i32 = req.body_len as i32
     if body_len <= 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Empty request body.")
 
-    var content: [8192]u8
-    let content_len: i32 = parse_form_field(body_ptr, body_len, c"content", @content[0], 8192)
+    var content: *u8 = null
+    let content_len: i32 = form_field(body_ptr, body_len, c"content", @content)
     if content_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
-    if content_len > wiki_store_max_content_len()
-        return send_content_too_large(ctx, resp)
 
-    if wiki_store_mode() == STORE_UNAVAILABLE
-        return send_store_unavailable(ctx, resp)
-    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
-    if saved == STORE_SAVE_TOO_LARGE
-        return send_content_too_large(ctx, resp)
-    if saved != 1
-        return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the page.")
-
-    return send_redirect(ctx, resp, @slug[0], slug_len)
+    let slug_view: StrView = view_of(@slug[0], slug_len)
+    var body: String = string_new()
+    let status: i32 = present_page_save(@g_svc, slug_view, slug_view, view_of(content, content_len), @&body)
+    let rc: i32 = send_presented(ctx, resp, status, @&body, slug_view)
+    free(content)
+    return rc
 
 
-# GET /wiki/:slug/edit - Render the edit form pre-populated with the
-# current page content.  404s if the slug is invalid or has no page.
+# GET /wiki/:slug/edit - the edit form pre-populated with the current page
+# content; for a slug with no page yet, the new-page form.  An invalid slug is
+# a plain 404.
 fn handle_wiki_edit_form(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let path: *u8 = worker_get_request_path(ctx, req)
-    let path_len: i32 = req.path_len as i32
-
     var slug: [128]u8
-    let slug_len: i32 = slug_from_path(path, path_len, @slug[0])
+    let slug_len: i32 = slug_from_path(path, req.path_len as i32, @slug[0])
     if slug_len <= 0
         return handle_not_found(ctx, req, resp)
 
-    var content: [8192]u8
-    var content_len: i32 = 0
-    let found: i32 = wiki_store_get(@slug[0], slug_len, @content[0], @content_len)
-    if found < 0
-        return send_store_unavailable(ctx, resp)
-    if found == 0
-        return handle_not_found(ctx, req, resp)
-
     var body: String = string_new()
-    render_edit_page(@&body, @slug[0], slug_len, @content[0], content_len)
-    return send_body(ctx, resp, 200, c"text/html; charset=utf-8", @&body)
+    let status: i32 = present_page_edit(@g_svc, view_of(@slug[0], slug_len), @&body)
+    return send_html(ctx, resp, status, @&body)
 
 
 # Detect the trailing "/edit" suffix for a /wiki/:slug/edit GET.  We
@@ -447,8 +443,10 @@ fn route_request(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) ->
     if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/health") != 0
         return handle_health(ctx, req, resp)
 
-    # GET /wiki/new — must come before /wiki/:slug so "new" isn't treated as a slug
-    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/new") != 0
+    # GET /wiki/new — must come before /wiki/:slug so "new" isn't treated as
+    # a slug (the slug rule reserves it).  Exactly /wiki/new: /wiki/news is a
+    # page.
+    if method == HTTP_METHOD_GET and path_len == 9 and path_starts_with(path, path_len, c"/wiki/new") != 0
         return handle_wiki_new(ctx, req, resp)
 
     # POST /wiki — create a new page from the form on /wiki/new.  Must
@@ -464,7 +462,7 @@ fn route_request(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) ->
     if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/") != 0 and path_ends_with_edit(path, path_len) != 0
         return handle_wiki_edit_form(ctx, req, resp)
 
-    # GET /wiki/:slug — view a wiki page (mausoleum-backed via wiki_store_get)
+    # GET /wiki/:slug — view a wiki page
     if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/") != 0
         return handle_wiki_view(ctx, req, resp)
 
@@ -533,16 +531,18 @@ pub fn main(argc: i32, argv: **u8) -> i32
     string_push_cstr(@&line, c" bytes")
     log_end(@&line)
 
-    # Initialize store (connects to mausoleum at MAUSOLEUM_HOST:MAUSOLEUM_PORT,
-    # default 127.0.0.1:7777, AGAST #3065; plaintext if MAUSOLEUM_PLAINTEXT=1,
-    # #2466)
-    wiki_store_configure_from_env()
-    wiki_store_set_worker_count(worker_count)
-    if wiki_store_init() != STORE_UNAVAILABLE
-        store_seed()
+    # Open the page store: mausoleum at MAUSOLEUM_HOST:MAUSOLEUM_PORT (default
+    # 127.0.0.1:7777, AGAST #3065), encrypted unless MAUSOLEUM_PLAINTEXT=1
+    # (#2466); memory for a lone worker without it (src/wiki_app.ritz).
+    var cfg: StoreConfig = store_config_from_env()
+    g_repo = wiki_page_repo_new()
+    g_cache = page_cache_new()
+    g_svc = wiki_service_new(@g_repo, @g_cache)
+    if wiki_app_open(@g_repo, @cfg, worker_count) != APP_UNAVAILABLE
+        let pages: i64 = wiki_app_seed(@g_svc)
         var count_line: String = log_begin()
         string_push_cstr(@&count_line, c"Store initialized with ")
-        string_push_i64(@&count_line, wiki_store_count() as i64)
+        string_push_i64(@&count_line, pages)
         string_push_cstr(@&count_line, c" pages")
         log_end(@&count_line)
 
@@ -584,7 +584,7 @@ pub fn main(argc: i32, argv: **u8) -> i32
                 worker_set_running(@ctx)
 
     worker_destroy(@ctx)
-    wiki_store_close()
+    wiki_page_repo_disconnect(@g_repo)
     log_cstr(c"Worker shutting down")
 
     return 0

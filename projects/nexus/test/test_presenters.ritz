@@ -4,11 +4,13 @@ import ritzlib.strview { StrView }
 import ritzlib.string { String, string_from, string_new, string_drop, string_len, string_contains, string_push, string_as_view }
 
 import errors.service_error { ServiceError }
+import errors.repo_error { RepoError }
 import repos.wiki_page_repo {
     WikiPageRepository,
     wiki_page_repo_new,
     wiki_page_repo_connect,
-    wiki_page_repo_disconnect
+    wiki_page_repo_disconnect,
+    wiki_page_repo_open
 }
 import repos.page_cache { PageCache, page_cache_new, page_cache_connect, page_cache_disconnect }
 import services.wiki_service { WikiService, wiki_service_new, wiki_service_create_page }
@@ -19,7 +21,9 @@ import presenters.page_presenter {
     present_page_view,
     present_page_edit,
     present_page_save,
-    present_page_delete
+    present_page_create,
+    present_page_delete,
+    present_error
 }
 import test.support.live_db { LiveDb, live_db_start, live_db_stop }
 
@@ -205,6 +209,10 @@ fn check_too_large(w: *World) -> i32
         return 1
     if not string_contains(@out, "too large to save")
         return 2
+    # POST /wiki (create) refuses it the same way (AGAST #2209).
+    var created: String = string_new()
+    if present_page_create(@w.svc, "big", "big", string_as_view(@content), @&created) != 413
+        return 3
     0
 
 
@@ -221,11 +229,14 @@ fn test_oversize_page_is_a_413() -> i32
     rc
 
 
-# The database goes away under the service: a generic 500.
+# The database refuses a request: a generic 500. No request the service lets
+# through can make a live database refuse it any more (#2208's limits), and a
+# database that went away is a 503 (test_unreachable_store_is_a_503), so this
+# renders the error the repository would return (AGAST #2209).
 fn check_database_failure(w: *World) -> i32
-    live_db_stop(@w.db)
     var out: String = string_new()
-    if present_page_save(@w.svc, "page", "Page", "content", @&out) != 500
+    let err = ServiceError.RepoError(RepoError.DatabaseError(string_from("Insert failed: 127.0.0.1:7777")))
+    if present_error(err, @&out) != 500
         return 1
     # The response must not leak the repository's error text.
     if string_contains(@out, "127.0.0.1")
@@ -299,4 +310,68 @@ fn test_index_lists_the_pages() -> i32
         return rc
     rc = check_index(@w)
     world_close(@w)
+    rc
+
+
+# POST /wiki creates only: an existing slug is a 409, never an overwrite.
+fn check_create(w: *World) -> i32
+    var out: String = string_new()
+    if present_page_create(@w.svc, "home", "home", "first", @&out) != STATUS_SAVED
+        return 1
+    if string_len(@out) != 0
+        return 2
+    var again: String = string_new()
+    if present_page_create(@w.svc, "home", "home", "second", @&again) != 409
+        return 3
+    var view: String = string_new()
+    if present_page_view(@w.svc, "home", @&view) != 200
+        return 4
+    if not string_contains(@view, "first")
+        return 5
+    var bad: String = string_new()
+    if present_page_create(@w.svc, "Home", "Home", "x", @&bad) != 400 then 6 else 0
+
+
+[[test]]
+fn test_create_refuses_an_existing_slug() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_create(@w)
+    world_close(@w)
+    rc
+
+
+# Mausoleum down: every page request is a 503 that says so, not a 404 for a
+# page that may exist, nor a generic 500.
+fn check_unreachable(w: *World) -> i32
+    live_db_stop(@w.db)
+    var view: String = string_new()
+    if present_page_view(@w.svc, "home", @&view) != 503
+        return 1
+    if not string_contains(@view, "unavailable")
+        return 2
+    var index: String = string_new()
+    if present_index(@w.svc, @&index) != 503
+        return 3
+    var saved: String = string_new()
+    if present_page_save(@w.svc, "home", "home", "x", @&saved) != 503
+        return 4
+    var created: String = string_new()
+    if present_page_create(@w.svc, "home", "home", "x", @&created) != 503
+        return 5
+    var edit: String = string_new()
+    if present_page_edit(@w.svc, "home", @&edit) != 503 then 6 else 0
+
+
+[[test]]
+fn test_unreachable_store_is_a_503() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_unreachable(@w)
+    page_cache_disconnect(@w.cache)
+    wiki_page_repo_disconnect(@w.repo)
     rc
