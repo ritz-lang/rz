@@ -1155,6 +1155,28 @@ class Monomorphizer:
                 self._visit_expr(expr.end)
             # If base is an identifier with known Vec<T> type, register vec_slice<T>
             self._register_slice_instantiation(expr)
+        else:
+            # Every other kind (TupleLit, TryOp, Grouped, ReturnExpr,
+            # AssignExpr, InterpString, Await, ...) is walked generically, as
+            # _rewrite_expr and _specialize_expr walk theirs (#1937).  Without
+            # this, `(W<i64> { .. }, 3)` or `pass<W<i64>>(..)?` named an
+            # instance that was never found: the rewrite left the bare `W`
+            # and the emitter raised "Unknown struct: W" (AGAST #3676).
+            # The visitors return their input, so nothing is rebuilt.
+            map_child_nodes(expr, self._visit_expr_child,
+                            self._visit_stmt_child, self._visit_type_child)
+
+    def _visit_expr_child(self, expr: rast.Expr) -> rast.Expr:
+        self._visit_expr(expr)
+        return expr
+
+    def _visit_stmt_child(self, stmt: rast.Stmt) -> rast.Stmt:
+        self._visit_stmt(stmt)
+        return stmt
+
+    def _visit_type_child(self, ty: rast.Type) -> rast.Type:
+        self._visit_type(ty)
+        return ty
 
     def _variant_payload_types(self, scrut_type: Optional[rast.Type],
                                variant: str) -> Optional[List[rast.Type]]:
