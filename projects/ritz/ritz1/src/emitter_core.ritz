@@ -9,10 +9,12 @@ import ritzlib.str
 import ritzlib.fmt
 import ritzlib.gvec
 import ritzlib.memory
+import ritzlib.string
 import ritzlib.hash
 import ritzlib.hashmap
 
 import ast
+import diag          # diag_error_at (AGAST #3445)
 import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
 import index_through # index_through (AGAST #2440)
 import tokens_gen
@@ -593,8 +595,10 @@ pub fn emit_name(s: *EmitterState, name: *u8, len: i32)
         else
             vec_push<u8>(s.out, c)
 
-# AGAST #3257: how many counted errors were printed WITHOUT a file:line:col
-# ("ritz1 cannot emit: ..."), out of s.error_count.  main prints its
+# AGAST #3257: how many counted errors were printed WITHOUT a file:line:col,
+# out of s.error_count.  Since #3445 the emit_ir_error family is located, so
+# only the errors that have no source construct to point at count here (the
+# multi-dimensional global leak tally in emitter.ritz).  main prints its
 # "emitted N unlowerable expression(s)" summary only when this is non-zero:
 # after a located error it is noise.  emit_module runs once per process.
 var g_emit_unlocated: i32 = 0
@@ -622,21 +626,27 @@ pub fn count_unlocated_error(s: *EmitterState, n: i32)
 # emit_module can return non-zero and main can refuse to write the output.
 # The IR comment is deliberately still written FIRST, so a developer dumping
 # a failed compile's buffer sees the marker in place.
-pub fn emit_ir_error(s: *EmitterState, msg: *u8)
+#
+# AGAST #3445: the stderr line is located, `<file>:<line>:<col>: error:
+# ritz1 cannot emit: <msg>` (diag.ritz), at `span`: the construct that could
+# not be lowered.  It used to be the only unlocated error ritz1 printed.
+pub fn emit_ir_error(s: *EmitterState, span: SrcSpan, msg: *u8)
     emit_str(s, c"  ; ERROR: ")
     emit_str(s, msg)
     emit_str(s, c"\n")
-    eprints_cstr(c"error: ritz1 cannot emit: ")
+    diag_error_at(emitter_source_file(), span)
+    eprints_cstr(c"ritz1 cannot emit: ")
     eprints_cstr(msg)
-    eprints_cstr(c"\n")
-    count_unlocated_error(s, 1)
+    eprint_char('\n')
+    s.error_count = s.error_count + 1
 
 # Same, for the two sites that append a name to the message before the
-# newline.  The caller follows this with emit_name + emit_ir_error_end.
-pub fn emit_ir_error_begin(s: *EmitterState, msg: *u8)
+# newline.  The caller follows this with emit_ir_error_end.
+pub fn emit_ir_error_begin(s: *EmitterState, span: SrcSpan, msg: *u8)
     emit_str(s, c"  ; ERROR: ")
     emit_str(s, msg)
-    eprints_cstr(c"error: ritz1 cannot emit: ")
+    diag_error_at(emitter_source_file(), span)
+    eprints_cstr(c"ritz1 cannot emit: ")
     eprints_cstr(msg)
 
 pub fn emit_ir_error_end(s: *EmitterState, name: *u8, len: i32)
@@ -647,19 +657,19 @@ pub fn emit_ir_error_end(s: *EmitterState, name: *u8, len: i32)
         eprint_char(*(name + i))
         i += 1
     eprints_cstr(c"'\n")
-    count_unlocated_error(s, 1)
+    s.error_count = s.error_count + 1
 
 # Same, for a message followed by an integer (a kind number, say).
-pub fn emit_ir_error_kind(s: *EmitterState, msg: *u8, kind: i32)
+pub fn emit_ir_error_kind(s: *EmitterState, span: SrcSpan, msg: *u8, kind: i32)
     emit_str(s, c"  ; ERROR: ")
     emit_str(s, msg)
     emit_int(s, kind as i64)
     emit_str(s, c"\n")
-    eprints_cstr(c"error: ritz1 cannot emit: ")
-    eprints_cstr(msg)
-    eprint_int(kind as i64)
-    eprints_cstr(c"\n")
-    count_unlocated_error(s, 1)
+    var m: String = string_new()
+    format_into(@&m, "ritz1 cannot emit: {msg}{kind}")
+    diag_error_buf(emitter_source_file(), span, @m)
+    string_drop(@&m)
+    s.error_count = s.error_count + 1
 
 # AGAST #2296: EmitterState.ctx_slot_*, saved around a slot.
 struct SlotCtx
