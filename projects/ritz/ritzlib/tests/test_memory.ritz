@@ -5,6 +5,7 @@
 
 import ritzlib.memory
 import ritzlib.sys
+import ritzlib.string
 
 # ============================================================================
 # Arena Tests
@@ -566,6 +567,78 @@ fn test_arena_mmap_failure_has_null_base() -> i32
 fn test_heap_alloc_mmap_failure_returns_null() -> i32
     let p: *u8 = heap_alloc(unmappable_size())
     assert p == null
+    0
+
+# AGAST #3551: no user mapping is at 0 or at a negative address (that half of
+# the address space is the kernel's), so either is a failed mmap, whatever the
+# errno: harland returns -12/-22/-3, Linux anything in [-4095, -1].
+[[test]]
+fn test_mmap_failed_on_zero_and_negative() -> i32
+    assert mmap_failed(null)
+    assert mmap_failed(-1 as *u8)
+    assert mmap_failed(-12 as *u8)
+    assert mmap_failed(-4095 as *u8)
+    assert mmap_failed(-4096 as *u8)
+    assert mmap_failed(-9223372036854775807 as *u8)
+    0
+
+[[test]]
+fn test_mmap_failed_false_for_a_mapping() -> i32
+    let p: *u8 = sys_mmap_anon(4096)
+    assert not mmap_failed(p)
+    assert not mmap_failed(1 as *u8)
+    sys_munmap(p, 4096)
+    0
+
+# AGAST #3551: string_as_ptr NUL-terminates in place, which needs one byte
+# past len. When that reserve fails it must not write anyway: rzsh's first
+# string_as_ptr on an empty word, after a failed slab mmap on harland, wrote
+# the NUL through a null data pointer (CR2 0). Here a String whose next
+# growth asks for 2^60 bytes stands in for an exhausted heap.
+[[test]]
+fn test_string_as_ptr_failed_reserve_returns_null_without_writing() -> i32
+    var s: String = string_new()
+    s.data.data = null
+    s.data.len = 576460752303423488   # 2^59: growth doubles cap to 2^60
+    s.data.cap = 576460752303423488
+    let p: *u8 = string_as_ptr(@&s)
+    assert p == null
+    assert s.data.data == null
+    assert s.data.len == 576460752303423488
+    0
+
+# The case rzsh hit: an empty String (an empty quoted word) whose first
+# reserve is a small malloc, i.e. a 64 KiB slab mmap, that fails. With the
+# address-space limit at 1 byte every new mapping fails with -ENOMEM in this
+# test's own (forked) process; the limit is restored before returning.
+const SYS_PRLIMIT64: i64 = 302
+const RLIMIT_AS: i64 = 9
+
+struct RLimit
+    cur: i64
+    max: i64
+
+[[test]]
+fn test_string_as_ptr_of_empty_string_when_malloc_fails() -> i32
+    var old: RLimit = RLimit { cur: 0, max: 0 }
+    assert syscall4(SYS_PRLIMIT64, 0, RLIMIT_AS, 0, @old as i64) == 0
+    var tight: RLimit = RLimit { cur: 1, max: old.max }
+    assert syscall4(SYS_PRLIMIT64, 0, RLIMIT_AS, @tight as i64, 0) == 0
+
+    # Precondition: small mallocs really fail (no bin has a slab yet).
+    let m: *u8 = malloc(16)
+    var s: String = string_new()
+    let p: *u8 = string_as_ptr(@&s)
+    let pushed: i32 = string_push(@&s, 65)
+
+    syscall4(SYS_PRLIMIT64, 0, RLIMIT_AS, @old as i64, 0)
+    assert m == null
+    # A readable "", and nothing written through the null data pointer.
+    assert p != null
+    assert *p == 0
+    assert s.data.data == null
+    assert pushed == -1
+    assert string_len(@s) == 0
     0
 
 [[test]]

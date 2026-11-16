@@ -1,0 +1,101 @@
+# malloc_fail_child: ritzlib's allocators on harland when sys_mmap fails
+# (AGAST #3551).
+#
+# harland's sys_mmap fails with -errno (-12 ENOMEM, -22 EINVAL) cast to *u8,
+# not null, so a `== null` check misses it and the caller writes through a
+# garbage pointer: rzsh once faulted that way (RIP in rzsh, CR2 0). Every
+# failure here is a request the kernel refuses up front (outside, or larger
+# than, the user mmap region), so no RAM is consumed and nothing leaks:
+#   1. a MAP_FIXED mmap below the region is negative, and mmap_failed says so
+#   2. malloc of more than the whole region is null
+#   3. realloc to that size is null and leaves the block intact
+#   4. a Vec can't be created or grown to that size, and stays usable
+#   5. string_as_ptr of a String whose NUL byte can't be reserved is null,
+#      and writes nothing (it once wrote at data + len)
+#   6. pushing that many bytes onto a String fails and leaves it as it was
+#   7. small mallocs still work afterwards
+# Exit 0 = PASS, else the failing step.
+
+import libharland { print_str, print_int, sys_mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, MAP_FIXED }
+import ritzlib.memory { malloc, realloc, free, mmap_failed }
+import ritzlib.gvec
+import ritzlib.string
+
+# 128 TiB: more than the user mmap region (512 GiB .. ~128 TiB), so the
+# kernel answers -ENOMEM before mapping a page.
+const TOO_BIG: i64 = 140737488355328
+# 4 MiB: page-aligned and below the user mmap region.
+const BELOW_REGION: i64 = 0x400000
+
+fn fail(step: i32, msg: *u8) -> i32
+    print_str(c"[malloc_fail_child] FAIL: ")
+    print_str(msg)
+    print_str(c"\n")
+    return step
+
+pub fn main() -> i32
+    # 1. The kernel's failure value: negative, not 0.
+    let fixed: *u8 = sys_mmap(BELOW_REGION, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED)
+    if (fixed as i64) >= 0
+        return fail(1, c"MAP_FIXED below the mmap region did not fail")
+    if not mmap_failed(fixed)
+        return fail(1, c"mmap_failed missed a -errno")
+
+    # 2. malloc's large (direct mmap) path.
+    if malloc(TOO_BIG) != null
+        return fail(2, c"malloc of more than the mmap region is not null")
+
+    # 3. realloc keeps the old block when the new one can't be had.
+    let p: *u8 = malloc(64)
+    if p == null
+        return fail(3, c"malloc(64) failed")
+    *p = 0x42
+    if realloc(p, TOO_BIG) != null
+        return fail(3, c"realloc to more than the mmap region is not null")
+    if *p != 0x42
+        return fail(3, c"failed realloc changed the block")
+    free(p)
+
+    # 4. Vec: creation and growth fail; the Vec stays usable.
+    var big: Vec<u8> = vec_with_cap<u8>(TOO_BIG)
+    if big.cap != 0 or big.data != null
+        return fail(4, c"vec_with_cap of more than the mmap region has storage")
+    var v: Vec<u8> = vec_new<u8>()
+    if vec_push<u8>(@&v, 1) != 0
+        return fail(4, c"vec_push onto an empty Vec failed")
+    if vec_grow<u8>(@&v, TOO_BIG) == 0
+        return fail(4, c"vec_grow to more than the mmap region succeeded")
+    if vec_push<u8>(@&v, 2) != 0 or v.len != 2 or vec_get<u8>(@v, 0) != 1 or vec_get<u8>(@v, 1) != 2
+        return fail(4, c"Vec unusable after a failed grow")
+    vec_drop<u8>(@&v)
+
+    # 5. A full String (len == cap) whose NUL byte needs growth past the
+    # region: no storage behind it, so any write would fault.
+    var full: String = string_new()
+    full.data.data = null
+    full.data.len = TOO_BIG / 2
+    full.data.cap = TOO_BIG / 2
+    if string_as_ptr(@&full) != null
+        return fail(5, c"string_as_ptr without room for the NUL is not null")
+
+    # 6. A push too big to reserve leaves the String as it was.
+    var s: String = string_from("ok")
+    let src: *u8 = c"x"
+    if string_push_bytes(@&s, src, TOO_BIG) == 0
+        return fail(6, c"string_push_bytes past the mmap region succeeded")
+    if not string_eq(@s, "ok")
+        return fail(6, c"String changed by a failed push")
+    string_drop(@&s)
+
+    # 7. Small allocations still work.
+    let q: *u8 = malloc(16)
+    if q == null
+        return fail(7, c"malloc(16) null after the failures")
+    *q = 0x5A
+    *(q + 15) = 0xA5
+    if *q != 0x5A or *(q + 15) != 0xA5
+        return fail(7, c"malloc(16) block lost a write")
+    free(q)
+
+    print_str(c"[malloc_fail_child] PASS: failed mmaps reach malloc/Vec/String as null/-1\n")
+    return 0
