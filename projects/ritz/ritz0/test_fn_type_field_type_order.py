@@ -65,6 +65,34 @@ fn main() -> i32
     return 42
 """
 
+# AGAST #3666: `fs[1]` and `f` are `swap`, so a result of {5, 4} shows the
+# call went through the element and passed S by value.
+FN_ARRAY = """\
+struct S
+    a: i64
+    b: i64
+
+struct Info
+    fs: [2]fn(s: S) -> S
+    f: fn(s: S) -> S
+
+fn ident(s: S) -> S
+    s
+
+fn swap(s: S) -> S
+    S { a: s.b, b: s.a }
+
+fn main() -> i32
+    let i = Info { fs: [ident, swap], f: swap }
+    let s = S { a: 4, b: 5 }
+"""
+
+SWAPPED = """\
+    if r.a != 5 or r.b != 4
+        return 1
+    return 42
+"""
+
 # name -> (main.ritz, {other module: source})
 CASES = {
     # The ticket: lexis's `get_attribute: fn(name: StrView) -> StrView`.
@@ -125,14 +153,19 @@ fn swap(s: S) -> S
 
 fn main() -> i32
     let o = Outer { inner: Info { fs: [ident, swap], n: 3 }, k: 1 }
-    # Through typed locals: ritz1 loses the fn type of `(o.inner.fs[1])(..)`
-    # and of an untyped `let` holding its result (#3666).
-    let h: fn(s: S) -> S = o.inner.fs[1]
-    let r: S = h(S { a: 4, b: 5 })
+    let r = (o.inner.fs[1])(S { a: 4, b: 5 })
     if r.a != 5 or r.b != 4
         return 1
     return 42
 """, {}),
+    # AGAST #3666: ritz1 typed a call through an element of a `[N]fn` field as
+    # `call i64 %f(i64 %S)`, and an untyped `let` of its result, or of the
+    # element, or of a call through a fn-pointer local, had no type.
+    "fn_array_untyped": (FN_ARRAY + "    let r = (i.fs[1])(s)\n" + SWAPPED, {}),
+    "fn_array_annotated": (FN_ARRAY + "    let r: S = (i.fs[1])(s)\n" + SWAPPED, {}),
+    "fn_array_via_local": (FN_ARRAY + "    let h = i.fs[1]\n    let r = h(s)\n" + SWAPPED, {}),
+    "fn_array_typed_local": (FN_ARRAY + "    let h: fn(s: S) -> S = i.fs[1]\n    let r = h(s)\n" + SWAPPED, {}),
+    "fn_field_via_local": (FN_ARRAY + "    let h = i.f\n    let r = h(s)\n" + SWAPPED, {}),
     # A's fn returns B, and B's fn takes A by value. Only the parameter is an
     # ordering edge, so A stays first. If the result counted too, the cycle
     # would put B first and leave its parameter A forward-referenced.

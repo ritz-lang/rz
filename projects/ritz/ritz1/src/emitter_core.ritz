@@ -1691,6 +1691,12 @@ pub fn find_call_fn(s: *EmitterState, e: *Expr) -> *FnDef
     if step != null
         return step
     if e.call_type_suffix_len <= 0
+        # AGAST #3666: a typed fn-pointer local of this name is the callee, as
+        # emit_call has it (#2246), so `let r = h(s)` takes h's result type.
+        if find_local(s, e.func_name, e.func_name_len) >= 0
+            let lv: *LocalVar = find_local_struct_name(s, e.func_name, e.func_name_len)
+            if lv != null and lv.fn_sig != null and lv.var_type != TYPE_ARRAY
+                return lv.fn_sig
         let f: *FnDef = find_fn(s, e.func_name, e.func_name_len)
         if f != null
             return f
@@ -1719,13 +1725,23 @@ pub fn find_call_fn(s: *EmitterState, e: *Expr) -> *FnDef
 pub fn call_callee_sig(s: *EmitterState, e: *Expr) -> *FnDef
     if e.func_name_len != 0
         return null
-    let c: *Expr = e.left
+    value_fn_sig(s, e.left)
+
+# The signature of the fn value `c` (null when not statically known): the
+# callee of a nameless call, or an untyped `let h = c` (AGAST #3666).
+pub fn value_fn_sig(s: *EmitterState, c: *Expr) -> *FnDef
     if c == null
         return null
     if c.kind == EXPR_INDEX and c.left != null and c.left.kind == EXPR_IDENT
         let lv: *LocalVar = find_local_struct_name(s, c.left.ident_ptr, c.left.ident_len)
         if lv != null and lv.var_type == TYPE_ARRAY
             return lv.fn_sig
+    # AGAST #3666: an element of a `fs: [N]fn(..) -> T` field, `(t.fs[i])(..)`.
+    # It was the untyped `call i64 %f(i64 ..)`, wrong for a by-value struct.
+    else if c.kind == EXPR_INDEX and c.left != null and c.left.kind == EXPR_MEMBER and c.right != null and c.right.kind != EXPR_RANGE
+        let af: *StructField = member_field_def(s, c.left)
+        if af != null and af.field_type == TYPE_ARRAY
+            return af.elem_fn_sig
     else if c.kind == EXPR_CAST
         return c.fn_sig
     else if c.kind == EXPR_MEMBER
