@@ -34,8 +34,11 @@ the 31-path cap it had per binding.
 AGAST #2266 closed ritz1's array literals: an element moves in, a literal
 nobody takes drops its elements, and an unannotated literal of a struct is
 `[N]T`.
-A new gap goes in as a strict xfail, so the room that closes it has to flip
-it.
+A new gap goes in as a gap ticket on its row, a strict xfail: the table's
+test fails if the row passes, so the room that closes it has to flip it.
+
+Each table is one test per compiler that asserts every row and names each
+failing one (`row <name>: ...`); see "the harness" below (AGAST #3521).
 """
 
 import os
@@ -44,6 +47,7 @@ from pathlib import Path
 
 import pytest
 
+import batching
 import fast_link
 
 from ref_rules import (ADDR_INTO_VALUE, MOVE_OUT_OF_REF, REF_INTO_VALUE, lent_temp_escapes,
@@ -3360,20 +3364,87 @@ pub fn main() -> i32
 }
 
 
-def _params(table):
-    out = []
-    for name in sorted(table):
-        gaps = table[name][-1]
-        for compiler in COMPILERS:
-            marks = []
-            if compiler in gaps:
-                marks.append(pytest.mark.xfail(
-                    strict=True,
-                    reason=f"AGAST #{gaps[compiler]}: {compiler} does not "
-                           f"implement this part of LANGUAGE_SPEC §13 yet"))
-            out.append(pytest.param(compiler, name, marks=marks,
-                                    id=f"{compiler}-{name}"))
-    return out
+# ---- the harness: one test per table per compiler (AGAST #3521) -------------
+#
+# Each table is one test per compiler, not one per row: 846 collected tests
+# cost more in xdist collection, dispatch and reporting than their compiles
+# (#3453 F1).  Rows compile together through batching.run_rows /
+# refuse_rows, a few dozen to a program.  A batch only passes a row: a row
+# it has no answer for, or whose answer fails the row's check, is compiled
+# on its own and checked again, so a failure is always the row's own, and
+# the test's message names each failing row (`row <name>: ...`).
+#
+# A row with a gap ticket for this compiler is a strict xfail: it is run on
+# its own, and the test fails if it passes, so the room that closes the gap
+# has to flip it.  It is never batched: a row expected to fail would only
+# split its batch.
+
+
+def _gap_rows(table, compiler):
+    """{name: gap ticket} of `table`'s rows this compiler is known to miss."""
+    return {name: row[-1][compiler] for name, row in table.items()
+            if isinstance(row[-1], dict) and compiler in row[-1]}
+
+
+def _verdict(failures, gaps, passed, compiler):
+    """Fail naming every row that failed, or that passed with a gap open."""
+    msgs = [f"row {name}: {why}" for name, why in sorted(failures.items()) if name not in gaps]
+    msgs += [f"row {name}: XPASS(strict) AGAST #{gaps[name]}: {compiler} passes it now; "
+             f"drop the gap" for name in sorted(passed & set(gaps))]
+    assert not msgs, f"{compiler}: {len(msgs)} row(s) failed:\n" + "\n".join(msgs)
+
+
+def _check_table(compiler, tmp_path, table, program, check_batched, check_alone, kind,
+                 at=lambda name: None):
+    """Check every row of `table` on `compiler`; fail naming each row that fails.
+
+    `program(name)` is the row's whole source.  `kind` is "run" or "refused".
+    "run": `check_batched(name, exit code)` and `check_alone(name, workdir)`.
+    "refused": `check_batched(name, diagnostics, "line:col" of its mark)` and
+    `check_alone(name, workdir)`; `at(name)` is the (line, col) its mark goes
+    at, or None.  Each returns None for a pass, else why it failed.
+    """
+    gaps = _gap_rows(table, compiler)
+    names = sorted(table)
+    batched = [n for n in names if n not in gaps]
+    answers = {}
+    if batching.enabled():
+        for k in range(0, len(batched), batching.CHUNK):
+            chunk = batched[k:k + batching.CHUNK]
+            work = tmp_path / f"batch{k}"
+            if kind == "run":
+                got = batching.run_rows(compiler, [program(n) for n in chunk], _build, work,
+                                        compile=_compile_only)
+            else:
+                got = batching.refuse_rows(compiler, [_marked(program(n), at(n)) for n in chunk],
+                                           _compile_only, work)
+            answers.update(zip(chunk, got))
+    failures, passed = {}, set()
+    for i, name in enumerate(names):
+        got = answers.get(name)
+        if got is not None:
+            ok = check_batched(name, got) if kind == "run" else check_batched(name, *got)
+            if ok is None:
+                passed.add(name)
+                continue
+        work = tmp_path / f"row{i}"
+        work.mkdir()
+        why = check_alone(name, work)
+        if why is None:
+            passed.add(name)
+        else:
+            failures[name] = why
+    _verdict(failures, gaps, passed, compiler)
+
+
+def _marked(program, at):
+    """`program` with batching's mark at (line, col), so the batch says where it went."""
+    if at is None:
+        return program
+    line, col = at
+    lines = program.split("\n")
+    lines[line - 1] = lines[line - 1][:col - 1] + batching.MARK + lines[line - 1][col - 1:]
+    return "\n".join(lines)
 
 
 def _compile(compiler, src, ll, cwd):
@@ -3384,7 +3455,29 @@ def _compile(compiler, src, ll, cwd):
     # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
     assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
     return subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=cwd, env=env,
-                          capture_output=True, text=True, timeout=300)
+                          capture_output=True, text=True, timeout=300, check=False)
+
+
+def _compile_only(compiler, src, work):
+    """batching's `compile`: (returncode, output), the module in work/main.ll."""
+    comp = _compile(compiler, src, work / "main.ll", work)
+    return comp.returncode, comp.stdout + comp.stderr
+
+
+def _build(compiler, src, work):
+    """batching's `build`: (ok, output, exe) for the program at `src`."""
+    ll, exe = work / "main.ll", work / "main"
+    comp = _compile(compiler, src, ll, work)
+    out = comp.stdout + comp.stderr
+    if comp.returncode != 0 or not ll.exists():
+        return False, out, None
+    link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
+    if compiler != "ritz0":
+        link_cmd.insert(2, str(RITZ_START))
+    link = fast_link.clang(link_cmd, cwd=work, capture_output=True, text=True)
+    if link.returncode != 0:
+        return False, out + link.stderr, None
+    return True, out, exe
 
 
 def _write(tmp_path, body):
@@ -3393,124 +3486,139 @@ def _write(tmp_path, body):
     return src
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler,name", _params(CASES))
-def test_free_count(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    body, expected, _ = CASES[name]
-    src = _write(tmp_path, body)
-    ll = tmp_path / "main.ll"
-    comp = _compile(compiler, src, ll, tmp_path)
-    assert comp.returncode == 0 and ll.exists(), (
-        f"{compiler} failed to compile:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
-    )
-    exe = tmp_path / "main"
-    link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
-    if compiler != "ritz0":
-        link_cmd.insert(2, str(RITZ_START))
-    link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
-    assert link.returncode == 0, f"{compiler}: link failed:\n{link.stderr[-2000:]}"
-    rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
-    assert rc == expected, f"{compiler} {name}: exit {rc}, spec says {expected}"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler,name", _params(THROUGH_REFERENCE))
-def test_second_owner_through_a_reference_rejected(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    body, message, _ = THROUGH_REFERENCE[name]
-    src = _write(tmp_path, body)
-    ll = tmp_path / "main.ll"
-    comp = _compile(compiler, src, ll, tmp_path)
+def _refusal(compiler, work, body):
+    """(output, None) for `body` compiled alone if it was refused cleanly, else (None, why)."""
+    comp = _compile(compiler, _write(work, body), work / "main.ll", work)
     out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
-    assert "Traceback" not in out, out[-2000:]
-    assert message in out, out[-2000:]
+    if comp.returncode == 0:
+        return None, f"accepted it:\n{out[-1000:]}"
+    if "Traceback" in out:
+        return None, out[-2000:]
+    return out, None
+
+
+def _refused_table(compiler, tmp_path, table, body, wants, at=lambda name: None):
+    """A refusal table: `wants(name, output, "line:col" or None)` is None or why not."""
+    def alone(name, work):
+        out, why = _refusal(compiler, work, body(name))
+        if why is not None:
+            return why
+        loc = at(name)
+        return wants(name, out, loc and f"{loc[0]}:{loc[1]}")
+
+    _check_table(compiler, tmp_path, table, lambda n: PRELUDE + body(n),
+                 lambda name, diag, mark: wants(name, diag, mark), alone, "refused", at)
+
+
+def _ritz1(request, compiler):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler,name", [
-    pytest.param(c, n, id=f"{c}-{n}") for n in sorted(LENT_PAYLOAD_ROWS) for c in COMPILERS])
-def test_move_out_of_a_non_owning_match_payload_rejected(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    body, line, col = LENT_PAYLOAD_ROWS[name]
-    src = _write(tmp_path, body)
-    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
-    assert "Traceback" not in out, out[-2000:]
-    assert MOVE_OUT_OF_REF in out, out[-2000:]
-    # Located at the use: its line in the body, after the prelude.
-    at = PRELUDE.count("\n") + line
-    assert f":{at}:{col}:" in out, out[-2000:]
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_free_count(request, tmp_path, compiler):
+    """Every CASES row runs and exits with the free count the spec gives it."""
+    _ritz1(request, compiler)
+
+    def check_code(name, rc):
+        expected = CASES[name][1]
+        return None if rc == expected else f"exit {rc}, spec says {expected}"
+
+    def alone(name, work):
+        good, out, exe = _build(compiler, _write(work, CASES[name][0]), work)
+        if not good:
+            return f"failed to compile or link:\n{out[-2000:]}"
+        rc = subprocess.run([str(exe)], capture_output=True, timeout=60, check=False).returncode
+        return check_code(name, rc)
+
+    _check_table(compiler, tmp_path, CASES, lambda n: PRELUDE + CASES[n][0], check_code, alone,
+                 "run")
+
+
+def _has(message):
+    return lambda out: None if message in out else f"no {message!r} in:\n{out[-2000:]}"
+
+
+def _located_at(out, loc):
+    """None if a diagnostic in `out` is at `loc` ("line:col"), else why not."""
+    return None if f":{loc}:" in out else f"nothing at :{loc}: in:\n{out[-2000:]}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_second_owner_through_a_reference_rejected(request, tmp_path, compiler):
+    _ritz1(request, compiler)
+    _refused_table(compiler, tmp_path, THROUGH_REFERENCE, lambda n: THROUGH_REFERENCE[n][0],
+                   lambda name, out, loc: _has(THROUGH_REFERENCE[name][1])(out))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_move_out_of_a_non_owning_match_payload_rejected(request, tmp_path, compiler):
+    _ritz1(request, compiler)
+
+    def wants(name, out, loc):
+        # Located at the use: its line in the body, after the prelude.
+        return _has(MOVE_OUT_OF_REF)(out) or _located_at(out, loc)
+
+    def at(name):
+        _, line, col = LENT_PAYLOAD_ROWS[name]
+        return PRELUDE.count("\n") + line, col
+
+    _refused_table(compiler, tmp_path, LENT_PAYLOAD_ROWS, lambda n: LENT_PAYLOAD_ROWS[n][0],
+                   wants, at)
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_nested_payload_of_a_non_owning_match_still_refused(request, tmp_path, compiler):
     """Goes red when nested patterns compile: see NESTED_LENT_PAYLOAD."""
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    src = _write(tmp_path, NESTED_LENT_PAYLOAD)
-    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
-    assert "Traceback" not in out, out[-2000:]
+    _ritz1(request, compiler)
+    out, why = _refusal(compiler, tmp_path, NESTED_LENT_PAYLOAD)
+    assert why is None, f"{compiler} {why}"
     # Refused at the nested pattern (line 15 of the body), not elsewhere.
     at = PRELUDE.count("\n") + 15
     assert f":{at}:" in out, out[-2000:]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler,name", _params(USE_AFTER_MOVE))
-def test_use_after_move_rejected(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    body, var, _ = USE_AFTER_MOVE[name]
-    src = _write(tmp_path, body)
-    ll = tmp_path / "main.ll"
-    comp = _compile(compiler, src, ll, tmp_path)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted a use after move:\n{out[-1000:]}"
-    assert "Traceback" not in out, out[-2000:]
-    assert f"use of moved value: `{var}`" in out, out[-2000:]
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_use_after_move_rejected(request, tmp_path, compiler):
+    _ritz1(request, compiler)
+    _refused_table(compiler, tmp_path, USE_AFTER_MOVE, lambda n: USE_AFTER_MOVE[n][0],
+                   lambda name, out, loc: _has(f"use of moved value: `{USE_AFTER_MOVE[name][1]}`")(out))
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler,name", [
-    pytest.param(c, n, id=f"{c}-{n}") for n in sorted(LENT_ESCAPE_ROWS) for c in COMPILERS])
-def test_lent_temp_into_returned_reference_refused(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    body, arg, line, col = LENT_ESCAPE_ROWS[name]
-    src = _write(tmp_path, LENT_ESCAPE + body)
-    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
-    assert "Traceback" not in out, out[-2000:]
-    assert lent_temp_escapes(arg) in out, out[-2000:]
-    # Located at the lent argument: its line in the body, after the prelude.
-    at = PRELUDE.count("\n") + LENT_ESCAPE.count("\n") + line
-    assert f":{at}:{col}:" in out, out[-2000:]
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_lent_temp_into_returned_reference_refused(request, tmp_path, compiler):
+    _ritz1(request, compiler)
+
+    def wants(name, out, loc):
+        # Located at the lent argument: its line in the body, after the prelude.
+        return _has(lent_temp_escapes(LENT_ESCAPE_ROWS[name][1]))(out) or _located_at(out, loc)
+
+    def at(name):
+        _, _, line, col = LENT_ESCAPE_ROWS[name]
+        return PRELUDE.count("\n") + LENT_ESCAPE.count("\n") + line, col
+
+    _refused_table(compiler, tmp_path, LENT_ESCAPE_ROWS,
+                   lambda n: LENT_ESCAPE + LENT_ESCAPE_ROWS[n][0], wants, at)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler,name", _params(GLOBAL_MOVE_OUT))
-def test_move_out_of_a_global_refused(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    body, path, use, _ = GLOBAL_MOVE_OUT[name]
-    src = _write(tmp_path, body)
-    comp = _compile(compiler, src, tmp_path / "main.ll", tmp_path)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
-    assert "Traceback" not in out, out[-2000:]
-    assert move_out_of_global(path.split(".")[0], path) in out, out[-2000:]
-    # Located at the path: its line and column in the body, after the prelude.
-    lines = body.splitlines()
-    at = PRELUDE.count("\n") + lines.index(use) + 1
-    col = use.index(path) + 1
-    assert f":{at}:{col}:" in out, out[-2000:]
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_move_out_of_a_global_refused(request, tmp_path, compiler):
+    _ritz1(request, compiler)
+
+    def wants(name, out, loc):
+        path = GLOBAL_MOVE_OUT[name][1]
+        # Located at the path: its line and column in the body, after the prelude.
+        return _has(move_out_of_global(path.split(".")[0], path))(out) or _located_at(out, loc)
+
+    def at(name):
+        body, path, use, _ = GLOBAL_MOVE_OUT[name]
+        return PRELUDE.count("\n") + body.splitlines().index(use) + 1, use.index(path) + 1
+
+    _refused_table(compiler, tmp_path, GLOBAL_MOVE_OUT, lambda n: GLOBAL_MOVE_OUT[n][0], wants, at)
