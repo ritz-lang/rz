@@ -232,6 +232,31 @@ fn main() -> i32
     return second<u8>(@arr) as i32
 """
 
+# AGAST #3686: at T = `***u8` the argument spelled "" past two levels, so
+# `first<***u8>` became `first$`, a procedure: "`first` returns nothing".
+# `deep`'s `****p` reaches the leaf through the `****u8` local, so it reads
+# #3662's depth packing (`inner + extra * PTR_DEPTH_UNIT`) in
+# ptr_local_take_ptr_arg; recorded as a `**u8` it loads a pointer as the u8.
+PTR_ARG_PTR3 = """\
+fn first<T>(x: *T) -> T
+    let p: *T = x
+    return *p
+
+fn deep<T>(x: *T) -> i32
+    let p: *T = x
+    return ****p as i32
+
+fn main() -> i32
+    var c: u8 = 9
+    var m: *u8 = @c
+    var n: **u8 = @m
+    var arr: [2]***u8
+    arr[0] = @n
+    arr[1] = @n
+    let q: ***u8 = first<***u8>(@arr[0])
+    return ***q as i32 * 10 + deep<***u8>(@arr[1])
+"""
+
 ROWS = {
     "ptr_array_ptr_u8": (PA_PTR, 10),
     "ptr_array_let_u8": (_ptr_array("let", "u8", PA_U8), 10),
@@ -243,6 +268,7 @@ ROWS = {
     "ptr_arg_ptr_i32": (S + _ptr_arg("*T", "*i32", N_I32, "*q"), 9),
     "ptr_arg_ptr_struct": (S + _ptr_arg("*T", "*S", N_S, "q.b"), 9),
     "ptr_arg_ptr_ptr_u8": (_ptr_arg("*T", "**u8", N_PU8, "**q as i32"), 9),
+    "ptr_arg_ptr3_u8": (PTR_ARG_PTR3, 99),
     "ref_ptr_i32": (_ptr_arg("@T", "*i32", N_I32, "*q"), 9),
     "mut_ref_ptr_i32": (_ptr_arg("@&T", "*i32", N_I32, "*q"), 9),
     "ref_ptr_struct": (S + _ptr_arg("@T", "*S", N_S, "q.b"), 9),

@@ -3694,9 +3694,8 @@ pub fn primitive_arg_spelling(ty: i32, out: **u8) -> i32
 # Mangle the pointer type that just parsed as ritz0 does (monomorph.py
 # mangle_type_name): "ptr_" per level, then the pointee's spelling — a
 # primitive's name or the struct/generic name in last_type_name.  `*u8` is
-# "ptr_u8", `**Foo` "ptr_ptr_Foo".  type_ptr records only the immediate and
-# the innermost pointee, so depth is exact up to two levels; a deeper
-# pointer spells as "" (clang then rejects the IR loudly).
+# "ptr_u8", `**Foo` "ptr_ptr_Foo", `***u8` "ptr_ptr_ptr_u8" (the depth past
+# two levels is packed into the inner-pointee slot, AGAST #3686).
 fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
     if p.last_inner_pointee_type == TYPE_ARRAY
         # AGAST #2832: `*[2]i8` is "ptr_arr2_i8".  The array's spelling stands
@@ -3704,6 +3703,10 @@ fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
         var n: i32 = 0
         let arr: *u8 = spell_last_array(p, @n)
         return spell_ptr_parts(p, ty, p.last_pointee_type, TYPE_STRUCT, arr, n, out_len)
+    # AGAST #3686: past two levels the pointee is itself a `**`; pass the
+    # depth-packed slot, as a `***u8` local records it.
+    if ty == TYPE_PTR_PTR and p.last_pointee_type == TYPE_PTR_PTR
+        return spell_ptr_parts(p, ty, TYPE_PTR, ptr_ptr_inner_pointee(p, ty), p.last_type_name, p.last_type_name_len, out_len)
     return spell_ptr_parts(p, ty, p.last_pointee_type, p.last_inner_pointee_type, p.last_type_name, p.last_type_name_len, out_len)
 
 # AGAST #2384: the reference type that just parsed, spelled as ritz0's
@@ -3841,18 +3844,24 @@ pub fn write_dec_i32(buf: *u8, n: i32) -> i32
 # saved the same fields) spells without replaying itself into p.
 fn spell_ptr_parts(p: *Parser, ty: i32, pointee: i32, inner: i32, type_name: *u8, type_name_len: i32, out_len: *i32) -> *u8
     var depth: i32 = 1
+    var leaf: i32 = inner
     if ty == TYPE_PTR_PTR
         if pointee != TYPE_PTR
             *out_len = 0
             return null
-        depth = 2
+        # AGAST #3686: `inner` is depth-packed past two levels (`***u8` is
+        # u8 + PTR_DEPTH_UNIT).  Read raw, it named no primitive, so the
+        # argument spelled "" and `first<***u8>` became `first$`, a
+        # procedure.
+        depth = ptr_ptr_slot_levels(inner)
+        leaf = ptr_ptr_slot_inner(inner)
     var base: *u8 = null
     var base_len: i32 = 0
-    if inner == TYPE_STRUCT
+    if leaf == TYPE_STRUCT
         base = type_name
         base_len = type_name_len
     else
-        base_len = primitive_arg_spelling(inner, @base)
+        base_len = primitive_arg_spelling(leaf, @base)
     if base_len <= 0
         *out_len = 0
         return null
