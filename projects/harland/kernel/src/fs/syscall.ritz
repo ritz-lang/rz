@@ -1,51 +1,139 @@
 # Filesystem Syscalls
 #
 # Implements sys_open, sys_close, sys_read, sys_write for files.
-# Integrates with knamespace and VFS file descriptors.
+# Integrates with knamespace and the per-process fd tables (fs/fd.ritz).
 
-import serial { StrView, prints, println, serial_print_dec }
-import fs.vfs { FileDesc, fd_table_init, fd_alloc, fd_free, fd_get, MAX_FDS, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND }
+import serial { StrView, prints }
+import fs.vfs { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND }
+import fs.fd { FdTable, FileDescriptor, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_get }
 import syscall.errno { Errno }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_resolve, knamespace_read, knamespace_write, knamespace_exists, knamespace_mkdir }
 import fs.kblob { KBlobStore, KBlobId, kblob_id_is_zero, kblob_id_copy, kblob_store_get, kblob_store_get_size, kblob_get_store }
 import fs.kpath { strview_from_ptr }
+import mm.heap { kalloc, kfree }
 
 # Syscall numbers are `enum Syscall` in syscall/numbers.ritz; main.ritz
 # registers this module's handlers in the dispatch table (syscall/dispatch.ritz).
 
 # ============================================================================
-# File Descriptor State
+# Per-process file state (AGAST #2753)
 # ============================================================================
+#
+# Each process has an FsProc: its own FdTable (fds 3..255) and, per fd, the
+# open file's blob, position and pending writes. The process layer
+# (syscall/runtime/process.ritz) brackets every process's life:
+# fs_process_start(pid) when it starts running (run_init for init, spawn for
+# a child) makes a fresh FsProc current; fs_process_end() when it exits
+# closes every fd it left open (flushing writes as sys_close does), frees the
+# FsProc and makes the parent's current again. So the fs layer never asks
+# who is running, and imports nothing from the process layer.
+#
+# An FsProc is ~36 KB and comes from the kernel heap only while its process
+# lives, so the BSS holds just the FS_MAX_PROCS pointers. Read its fields as
+# `p.field`: ritz0 lowers `(*p).field` by loading the whole FsProc first.
 
-# Extended file descriptor with blob info
-# This lives alongside the VFS FileDesc
-struct FsFileState
+# One open file.
+struct FsFile
     blob_id: KBlobId        # The blob this fd refers to
     data_ptr: *u8           # Cached pointer to blob data
     size: u64               # File size
     position: u64           # Current read/write position
     flags: i32              # Open flags
-    used: u8                # Is this entry in use?
+    wbuf: *u8               # Pending writes, flushed on close (null if none)
+    wbuf_size: u64
+    wbuf_cap: u64
+    path: *u8               # Heap copy of the path, for writable fds (null if none)
+    path_len: u64
 
-# File state table (indexed by fd)
-var fs_file_state: [64]FsFileState
+struct FsProc
+    pid: u64
+    parent: i32             # fs_procs index of the spawning process; -1 for none
+    table: FdTable
+    files: [256]FsFile      # indexed by fd; meaningful while the fd is open
+
+# Live processes at once. Blocking spawn keeps at most init and one child.
+pub const FS_MAX_PROCS: i32 = 8
+
+var fs_procs: [8]*FsProc
+var fs_current: i32 = -1
 var fs_syscall_initialized: u8 = 0
+
+const WRITE_BUFFER_INITIAL: u64 = 4096
 
 # Initialize filesystem syscalls
 pub fn fs_syscall_init() -> i32
     if fs_syscall_initialized != 0
         return 0
-
-    # Clear all file states
-    var i: i32 = 0
-    while i < 64
-        fs_file_state[i].used = 0
-        fs_file_state[i].position = 0
-        i = i + 1
-
     fs_syscall_initialized = 1
     prints("fs_syscall: initialized\n" as StrView)
     0
+
+fn fs_current_proc() -> *FsProc
+    if fs_current < 0
+        return 0 as *FsProc
+    fs_procs[fs_current]
+
+# p's open file at fd, or null if fd is not an open file of p.
+fn fs_file(p: *FsProc, fd: i32) -> *FsFile
+    if p == 0 as *FsProc or fd < 3 or fd >= MAX_FDS
+        return 0 as *FsFile
+    if fd_get(@(*p).table, fd) == 0 as *FileDescriptor
+        return 0 as *FsFile
+    @(*p).files[fd]
+
+# A process starts running: give it an empty fd table and make it current.
+# 0, Errno.Again (FS_MAX_PROCS live already) or Errno.NoMem.
+pub fn fs_process_start(pid: u64) -> i32
+    var slot: i32 = 0
+    while slot < FS_MAX_PROCS and fs_procs[slot] != 0 as *FsProc
+        slot = slot + 1
+    if slot == FS_MAX_PROCS
+        return Errno.Again as i32
+    let p: *FsProc = kalloc(sizeof(FsProc) as u64) as *FsProc
+    if p == 0 as *FsProc
+        return Errno.NoMem as i32
+    (*p).pid = pid
+    (*p).parent = fs_current
+    fd_table_init(@(*p).table)
+    fs_procs[slot] = p
+    fs_current = slot
+    0
+
+# The current process exits: close every fd it left open, flushing pending
+# writes exactly as sys_close does, free its FsProc and make its parent's
+# current. Returns how many fds it closed, or Errno.Srch if none is current.
+pub fn fs_process_end() -> i32
+    let p: *FsProc = fs_current_proc()
+    if p == 0 as *FsProc
+        return Errno.Srch as i32
+    var closed: i32 = 0
+    var fd: i32 = 3
+    while fd < MAX_FDS
+        if fs_file(p, fd) != 0 as *FsFile
+            fs_close_file(p, fd)
+            closed = closed + 1
+        fd = fd + 1
+    fs_procs[fs_current] = 0 as *FsProc
+    fs_current = p.parent
+    kfree(p as *u8)
+    closed
+
+# The pid fs_process_start gave the current process, or 0 if none.
+pub fn fs_process_pid() -> u64
+    let p: *FsProc = fs_current_proc()
+    if p == 0 as *FsProc
+        return 0
+    p.pid
+
+# Processes with an fd table.
+pub fn fs_process_count() -> i32
+    var n: i32 = 0
+    var i: i32 = 0
+    while i < FS_MAX_PROCS
+        if fs_procs[i] != 0 as *FsProc
+            n = n + 1
+        i = i + 1
+    n
 
 # ============================================================================
 # sys_open - Open a file
@@ -61,6 +149,11 @@ pub fn fs_syscall_init() -> i32
 #   < 0: error code
 
 pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
+    # Read before knamespace_resolve (see sys_open_handler's workaround).
+    let p: *FsProc = fs_current_proc()
+    if p == 0 as *FsProc
+        return Errno.Srch as i64
+
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
         return Errno.Inval as i64
@@ -87,7 +180,7 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
             return Errno.NoEnt as i64
 
     # Allocate a file descriptor
-    let fd: i32 = fd_alloc()
+    let fd: i32 = fd_alloc(@(*p).table)
     if fd < 0
         return fd as i64
 
@@ -97,25 +190,40 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     let size: u64 = kblob_store_get_size(store, @blob_id)
 
     # Set up file state
-    fs_file_state[fd].blob_id = kblob_id_copy(@blob_id)
-    fs_file_state[fd].data_ptr = data_ptr
-    fs_file_state[fd].size = size
-    fs_file_state[fd].position = 0
-    fs_file_state[fd].flags = flags
-    fs_file_state[fd].used = 1
+    let f: *FsFile = @(*p).files[fd]
+    (*f).blob_id = kblob_id_copy(@blob_id)
+    (*f).data_ptr = data_ptr
+    (*f).size = size
+    (*f).position = 0
+    (*f).flags = flags
+    (*f).wbuf = 0 as *u8
+    (*f).wbuf_size = 0
+    (*f).wbuf_cap = 0
+    (*f).path = 0 as *u8
+    (*f).path_len = 0
 
     # Handle O_TRUNC - truncate file to zero
     if (flags & O_TRUNC) != 0 and (flags & O_WRONLY) != 0
-        fs_file_state[fd].size = 0
-        fs_file_state[fd].position = 0
+        (*f).size = 0
+        (*f).position = 0
 
     # Handle O_APPEND - position at end
     if (flags & O_APPEND) != 0
-        fs_file_state[fd].position = size
+        (*f).position = size
 
     # Store path for write-back on close
     if (flags & O_WRONLY) != 0 or (flags & O_RDWR) != 0
-        fs_store_path(fd, path_ptr, path_len)
+        let copy: *u8 = kalloc(path_len + 1)
+        if copy == 0 as *u8
+            fd_free(@(*p).table, fd)
+            return Errno.NoMem as i64
+        var i: u64 = 0
+        while i < path_len
+            *(copy + i) = *(path_ptr + i)
+            i = i + 1
+        *(copy + path_len) = 0
+        (*f).path = copy
+        (*f).path_len = path_len
 
     fd as i64
 
@@ -124,25 +232,23 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
 # ============================================================================
 
 pub fn sys_close(fd: i32) -> i64
-    if fd < 0 or fd >= MAX_FDS
+    let p: *FsProc = fs_current_proc()
+    if fs_file(p, fd) == 0 as *FsFile
         return Errno.BadF as i64
+    fs_close_file(p, fd) as i64
 
-    if fs_file_state[fd].used == 0
-        return Errno.BadF as i64
-
-    # Flush write buffer if any data was written
-    let flush_result: i32 = fs_flush_write_buffer(fd)
-
-    # Mark as unused
-    fs_file_state[fd].used = 0
-    fs_file_state[fd].position = 0
-
-    # Free the VFS file descriptor
-    fd_free(fd)
-
-    if flush_result != 0
-        return flush_result as i64
-    0
+# Flush fd's pending writes, release its state and free the fd: 0, or the
+# flush's Errno. Shared by sys_close and fs_process_end.
+fn fs_close_file(p: *FsProc, fd: i32) -> i32
+    let f: *FsFile = @(*p).files[fd]
+    let flush_result: i32 = fs_flush_write_buffer(f)
+    if (*f).path != 0 as *u8
+        kfree((*f).path)
+        (*f).path = 0 as *u8
+        (*f).path_len = 0
+    (*f).position = 0
+    fd_free(@(*p).table, fd)
+    flush_result
 
 # ============================================================================
 # sys_read - Read from a file
@@ -158,20 +264,18 @@ pub fn sys_close(fd: i32) -> i64
 #   < 0: error code
 
 pub fn sys_fs_read(fd: i32, buf: *u8, count: u64) -> i64
-    if fd < 0 or fd >= MAX_FDS
-        return Errno.BadF as i64
-
-    if fs_file_state[fd].used == 0
+    let f: *FsFile = fs_file(fs_current_proc(), fd)
+    if f == 0 as *FsFile
         return Errno.BadF as i64
 
     # Check read permission
-    let flags: i32 = fs_file_state[fd].flags
+    let flags: i32 = (*f).flags
     if (flags & O_WRONLY) != 0 and (flags & O_RDWR) == 0
         return Errno.BadF as i64  # Write-only, can't read
 
-    let pos: u64 = fs_file_state[fd].position
-    let size: u64 = fs_file_state[fd].size
-    let data: *u8 = fs_file_state[fd].data_ptr
+    let pos: u64 = (*f).position
+    let size: u64 = (*f).size
+    let data: *u8 = (*f).data_ptr
 
     # Calculate how much we can actually read
     var bytes_to_read: u64 = count
@@ -187,7 +291,7 @@ pub fn sys_fs_read(fd: i32, buf: *u8, count: u64) -> i64
         i = i + 1
 
     # Update position
-    fs_file_state[fd].position = pos + bytes_to_read
+    (*f).position = pos + bytes_to_read
 
     bytes_to_read as i64
 
@@ -195,16 +299,8 @@ pub fn sys_fs_read(fd: i32, buf: *u8, count: u64) -> i64
 # sys_write - Write to a file
 # ============================================================================
 #
-# For content-addressable storage, writes create new blobs.
-# This implementation buffers data and writes immediately for simplicity.
-
-# Write buffer per fd (simple approach - one buffer per fd)
-var fs_write_buffers: [64]*u8
-var fs_write_buffer_sizes: [64]u64
-var fs_write_buffer_caps: [64]u64
-const WRITE_BUFFER_INITIAL: u64 = 4096
-
-import mm.heap { kalloc, kfree }
+# For content-addressable storage, writes create new blobs: the data is
+# buffered per fd and written back to the namespace on close.
 
 # Simple realloc implementation
 fn krealloc(old_ptr: *u8, new_size: u64, old_size: u64) -> *u8
@@ -224,101 +320,76 @@ fn krealloc(old_ptr: *u8, new_size: u64, old_size: u64) -> *u8
     kfree(old_ptr)
     new_ptr
 
-# Buffer for storing file paths (needed for write-back)
-var fs_file_paths: [64][256]u8
-var fs_file_path_lens: [64]u64
-
-# Store the path when opening for later write-back
-pub fn fs_store_path(fd: i32, path: *u8, len: u64)
-    if fd < 0 or fd >= 64
-        return
-    var i: u64 = 0
-    while i < len and i < 255
-        fs_file_paths[fd][i as i32] = *(path + i)
-        i = i + 1
-    fs_file_paths[fd][i as i32] = 0
-    fs_file_path_lens[fd] = i
-
 pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
-    if fd < 0 or fd >= MAX_FDS
-        return Errno.BadF as i64
-
-    if fs_file_state[fd].used == 0
+    let f: *FsFile = fs_file(fs_current_proc(), fd)
+    if f == 0 as *FsFile
         return Errno.BadF as i64
 
     # Check write permission
-    let flags: i32 = fs_file_state[fd].flags
+    let flags: i32 = (*f).flags
     if (flags & O_WRONLY) == 0 and (flags & O_RDWR) == 0
         return Errno.BadF as i64  # Read-only
 
     # Allocate write buffer if needed
-    if fs_write_buffers[fd] == 0 as *u8
-        fs_write_buffers[fd] = kalloc(WRITE_BUFFER_INITIAL) as *u8
-        if fs_write_buffers[fd] == 0 as *u8
+    if (*f).wbuf == 0 as *u8
+        (*f).wbuf = kalloc(WRITE_BUFFER_INITIAL)
+        if (*f).wbuf == 0 as *u8
             return Errno.NoMem as i64
-        fs_write_buffer_caps[fd] = WRITE_BUFFER_INITIAL
-        fs_write_buffer_sizes[fd] = 0
+        (*f).wbuf_cap = WRITE_BUFFER_INITIAL
+        (*f).wbuf_size = 0
 
     # Grow buffer if needed
-    let new_size: u64 = fs_write_buffer_sizes[fd] + count
-    if new_size > fs_write_buffer_caps[fd]
-        var new_cap: u64 = fs_write_buffer_caps[fd] * 2
+    let new_size: u64 = (*f).wbuf_size + count
+    if new_size > (*f).wbuf_cap
+        var new_cap: u64 = (*f).wbuf_cap * 2
         if new_cap < new_size
             new_cap = new_size + 1024
-        let old_cap: u64 = fs_write_buffer_caps[fd]
-        let new_buf: *u8 = krealloc(fs_write_buffers[fd], new_cap, old_cap)
+        let new_buf: *u8 = krealloc((*f).wbuf, new_cap, (*f).wbuf_cap)
         if new_buf == 0 as *u8
             return Errno.NoMem as i64
-        fs_write_buffers[fd] = new_buf
-        fs_write_buffer_caps[fd] = new_cap
+        (*f).wbuf = new_buf
+        (*f).wbuf_cap = new_cap
 
     # Copy data to buffer
     var i: u64 = 0
-    let offset: u64 = fs_write_buffer_sizes[fd]
+    let offset: u64 = (*f).wbuf_size
     while i < count
-        *(fs_write_buffers[fd] + offset + i) = *(buf + i)
+        *((*f).wbuf + offset + i) = *(buf + i)
         i = i + 1
-    fs_write_buffer_sizes[fd] = new_size
+    (*f).wbuf_size = new_size
 
     # Update position
-    fs_file_state[fd].position = fs_file_state[fd].position + count
+    (*f).position = (*f).position + count
 
     count as i64
 
-# Flush write buffer to namespace (called on close): 0, or an Errno that
-# sys_close returns
-fn fs_flush_write_buffer(fd: i32) -> i32
-    if fs_write_buffers[fd] == 0 as *u8
+# Flush f's write buffer to the namespace and free it: 0, or an Errno that
+# sys_close returns.
+fn fs_flush_write_buffer(f: *FsFile) -> i32
+    let wbuf: *u8 = (*f).wbuf
+    if wbuf == 0 as *u8
         return 0  # Nothing to flush
+    let wsize: u64 = (*f).wbuf_size
+    (*f).wbuf = 0 as *u8
+    (*f).wbuf_size = 0
+    (*f).wbuf_cap = 0
 
-    if fs_write_buffer_sizes[fd] == 0
-        # Free empty buffer
-        kfree(fs_write_buffers[fd])
-        fs_write_buffers[fd] = 0 as *u8
+    if wsize == 0
+        kfree(wbuf)
         return 0
 
-    # Get the path for this fd
-    let path_len: u64 = fs_file_path_lens[fd]
-    if path_len == 0
-        kfree(fs_write_buffers[fd])
-        fs_write_buffers[fd] = 0 as *u8
+    if (*f).path_len == 0
+        kfree(wbuf)
         return Errno.Io as i32  # no path to write back to
 
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
-        kfree(fs_write_buffers[fd])
-        fs_write_buffers[fd] = 0 as *u8
+        kfree(wbuf)
         return Errno.Io as i32
 
-    let path: StrView = strview_from_ptr(@fs_file_paths[fd][0], path_len as i64)
-    let result: i32 = knamespace_write(ns, path, fs_write_buffers[fd], fs_write_buffer_sizes[fd])
-
-    # Free the buffer
-    kfree(fs_write_buffers[fd])
-    fs_write_buffers[fd] = 0 as *u8
-    fs_write_buffer_sizes[fd] = 0
-    fs_write_buffer_caps[fd] = 0
-
+    let path: StrView = strview_from_ptr((*f).path, (*f).path_len as i64)
+    let result: i32 = knamespace_write(ns, path, wbuf, wsize)
+    kfree(wbuf)
     result
 
 # ============================================================================
@@ -330,19 +401,17 @@ pub const SEEK_CUR: i32 = 1
 pub const SEEK_END: i32 = 2
 
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
-    if fd < 0 or fd >= MAX_FDS
+    let f: *FsFile = fs_file(fs_current_proc(), fd)
+    if f == 0 as *FsFile
         return Errno.BadF as i64
 
-    if fs_file_state[fd].used == 0
-        return Errno.BadF as i64
-
-    let size: u64 = fs_file_state[fd].size
+    let size: u64 = (*f).size
     var new_pos: i64
 
     if whence == SEEK_SET
         new_pos = offset
     else if whence == SEEK_CUR
-        new_pos = fs_file_state[fd].position as i64 + offset
+        new_pos = (*f).position as i64 + offset
     else if whence == SEEK_END
         new_pos = size as i64 + offset
     else
@@ -351,7 +420,7 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
     if new_pos < 0
         return Errno.Inval as i64
 
-    fs_file_state[fd].position = new_pos as u64
+    (*f).position = new_pos as u64
     new_pos
 
 # ============================================================================
@@ -371,10 +440,6 @@ pub fn sys_mkdir(path_ptr: *u8, path_len: u64) -> i64
 # Check if fd is a filesystem fd
 # ============================================================================
 
+# FDs 0, 1, 2 are stdin/stdout/stderr (serial), never filesystem fds.
 pub fn is_fs_fd(fd: i32) -> bool
-    if fd < 0 or fd >= MAX_FDS
-        return false
-    # FDs 0, 1, 2 are reserved for stdin/stdout/stderr (serial)
-    if fd < 3
-        return false
-    fs_file_state[fd].used != 0
+    fs_file(fs_current_proc(), fd) != 0 as *FsFile

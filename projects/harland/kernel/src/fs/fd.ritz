@@ -1,0 +1,188 @@
+# File descriptor table (AGAST #2753, from origin/harland-main 3759515e and
+# 7d8658ec).
+#
+# One FdTable per process: fd_alloc hands out the lowest free fd from 3 up
+# (0, 1, 2 are stdin/stdout/stderr and always in use), fd_free releases it,
+# fd_get looks one up and fd_dup makes a second fd for the same open file
+# (ref-counted on the owning slot). The table only tracks which fds exist;
+# what an fd refers to lives with its owner (fs/syscall.ritz keeps a
+# per-process FsFile array indexed by fd).
+
+import syscall.errno { Errno }
+
+# Reads go through `table.field`, not `(*table).field`: ritz0 lowers the
+# latter by loading the whole 9 KB FdTable first, onto a 4 KB syscall stack.
+
+# Fds per process, 0-2 included.
+pub const MAX_FDS: i32 = 256
+
+pub const FD_KIND_NONE: u8 = 0
+pub const FD_KIND_FILE: u8 = 1
+pub const FD_KIND_DIRECTORY: u8 = 2
+pub const FD_KIND_SOCKET: u8 = 3
+pub const FD_KIND_PIPE: u8 = 4
+pub const FD_KIND_STDIO: u8 = 5
+
+pub struct FileDescriptor
+    kind: u8
+    flags: u32
+    position: u64
+    path_hash: u64
+    target_fd: i32      # the slot that owns the open file (itself unless a dup)
+    used: u8
+
+pub struct FdTable
+    fds: [256]FileDescriptor
+    ref_counts: [256]i32
+    initialized: u8
+
+fn fd_slot(table: *FdTable, fd: i32) -> *FileDescriptor
+    return @(*table).fds[fd]
+
+fn fd_slot_clear(slot: *FileDescriptor)
+    (*slot).used = 0
+    (*slot).kind = FD_KIND_NONE
+    (*slot).flags = 0
+    (*slot).position = 0
+    (*slot).path_hash = 0
+    (*slot).target_fd = -1
+
+# Empty the table, then reserve stdin/stdout/stderr.
+pub fn fd_table_init(table: *FdTable) -> i32
+    if table == 0 as *FdTable
+        return Errno.BadF as i32
+    var i: i32 = 0
+    while i < MAX_FDS
+        fd_slot_clear(fd_slot(table, i))
+        (*table).ref_counts[i] = 0
+        i = i + 1
+    i = 0
+    while i < 3
+        let s: *FileDescriptor = fd_slot(table, i)
+        (*s).kind = FD_KIND_STDIO
+        (*s).used = 1
+        (*s).target_fd = i
+        (*table).ref_counts[i] = 1
+        i = i + 1
+    (*table).initialized = 1
+    return 0
+
+# The lowest free fd >= 3, or Errno.NFile when all MAX_FDS are in use.
+pub fn fd_alloc(table: *FdTable) -> i32
+    if table == 0 as *FdTable
+        return Errno.BadF as i32
+    if table.initialized == 0
+        fd_table_init(table)
+    var i: i32 = 3
+    while i < MAX_FDS
+        let s: *FileDescriptor = fd_slot(table, i)
+        if (*s).used == 0
+            fd_slot_clear(s)
+            (*s).used = 1
+            (*s).kind = FD_KIND_FILE
+            (*s).target_fd = i
+            (*table).ref_counts[i] = 1
+            return i
+        i = i + 1
+    return Errno.NFile as i32
+
+# Release fd (>= 3). Closing the owner of a dup'd file hands ownership to
+# one of its dups, so the remaining fds keep working.
+pub fn fd_free(table: *FdTable, fd: i32) -> i32
+    if table == 0 as *FdTable
+        return Errno.BadF as i32
+    if fd < 3 or fd >= MAX_FDS
+        return Errno.BadF as i32
+    let slot: *FileDescriptor = fd_slot(table, fd)
+    if (*slot).used == 0
+        return Errno.BadF as i32
+    let owner_fd: i32 = (*slot).target_fd
+    if owner_fd < 0 or owner_fd >= MAX_FDS
+        return Errno.BadF as i32
+    let owner: *FileDescriptor = fd_slot(table, owner_fd)
+    if (*owner).used == 0
+        return Errno.BadF as i32
+    let refs: i32 = table.ref_counts[owner_fd] - 1
+    (*table).ref_counts[owner_fd] = refs
+
+    # A dup: drop it; the owner goes with its last reference.
+    if owner_fd != fd
+        fd_slot_clear(slot)
+        if refs <= 0
+            fd_slot_clear(owner)
+            (*table).ref_counts[owner_fd] = 0
+        return 0
+
+    # The owner, with dups left: the first dup becomes the owner.
+    if refs > 0
+        var heir: i32 = -1
+        var i: i32 = 3
+        while i < MAX_FDS
+            let c: *FileDescriptor = fd_slot(table, i)
+            if i != fd and (*c).used != 0 and (*c).target_fd == owner_fd
+                heir = i
+                break
+            i = i + 1
+        if heir < 0
+            return Errno.BadF as i32
+        let h: *FileDescriptor = fd_slot(table, heir)
+        (*h).kind = (*owner).kind
+        (*h).flags = (*owner).flags
+        (*h).position = (*owner).position
+        (*h).path_hash = (*owner).path_hash
+        (*table).ref_counts[heir] = refs
+        var j: i32 = 3
+        while j < MAX_FDS
+            let a: *FileDescriptor = fd_slot(table, j)
+            if (*a).used != 0 and (*a).target_fd == owner_fd
+                (*a).target_fd = heir
+            j = j + 1
+    fd_slot_clear(slot)
+    (*table).ref_counts[owner_fd] = 0
+    return 0
+
+# The descriptor that owns fd's open file, or null if fd is not open.
+pub fn fd_get(table: *FdTable, fd: i32) -> *FileDescriptor
+    if table == 0 as *FdTable
+        return 0 as *FileDescriptor
+    if fd < 0 or fd >= MAX_FDS
+        return 0 as *FileDescriptor
+    let slot: *FileDescriptor = fd_slot(table, fd)
+    if (*slot).used == 0
+        return 0 as *FileDescriptor
+    let owner_fd: i32 = (*slot).target_fd
+    if owner_fd < 0 or owner_fd >= MAX_FDS
+        return 0 as *FileDescriptor
+    let owner: *FileDescriptor = fd_slot(table, owner_fd)
+    if (*owner).used == 0
+        return 0 as *FileDescriptor
+    return owner
+
+# A new fd for old_fd's open file, or an Errno.
+pub fn fd_dup(table: *FdTable, old_fd: i32) -> i32
+    let desc: *FileDescriptor = fd_get(table, old_fd)
+    if desc == 0 as *FileDescriptor
+        return Errno.BadF as i32
+    let new_fd: i32 = fd_alloc(table)
+    if new_fd < 0
+        return new_fd
+    let owner_fd: i32 = (*fd_slot(table, old_fd)).target_fd
+    let s: *FileDescriptor = fd_slot(table, new_fd)
+    (*s).kind = (*desc).kind
+    (*s).flags = (*desc).flags
+    (*s).position = (*desc).position
+    (*s).path_hash = (*desc).path_hash
+    (*s).target_fd = owner_fd
+    (*table).ref_counts[owner_fd] = table.ref_counts[owner_fd] + 1
+    (*table).ref_counts[new_fd] = 0
+    return new_fd
+
+# Number of fds >= 3 in use.
+pub fn fd_count_open(table: *FdTable) -> i32
+    var n: i32 = 0
+    var i: i32 = 3
+    while i < MAX_FDS
+        if (*fd_slot(table, i)).used != 0
+            n = n + 1
+        i = i + 1
+    return n

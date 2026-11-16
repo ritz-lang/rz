@@ -1,0 +1,89 @@
+# fd_table_test: a process's fd table hands out the lowest free fd, reuses a
+# closed one, and holds far more than the old 61 usable fds (AGAST #2753,
+# from origin/harland-main 7d8658ec).
+#
+# Exit 0 = PASS. Every failure closes what it opened first, so a red run
+# does not leak fds into the rest of init's suite.
+
+import libharland { print_str, print_int, sys_open, sys_close, O_RDONLY }
+
+# Held open at once. The old kernel-wide table had 61 usable fds (3..63).
+const HOLD: i32 = 100
+
+fn fail_eq(label: *u8, expected: i32, actual: i32) -> i32
+    print_str(c"[fd_table_test] FAIL: ")
+    print_str(label)
+    print_str(c" expected=")
+    print_int(expected as i64)
+    print_str(c" got=")
+    print_int(actual as i64)
+    print_str(c"\n")
+    return 1
+
+# Open, open, close the first, reopen: the freed fd comes back.
+fn test_reuse() -> i32
+    let fd1: i32 = sys_open(c"/etc/motd", O_RDONLY)
+    if fd1 != 3
+        if fd1 >= 0
+            sys_close(fd1)
+        return fail_eq(c"fd1", 3, fd1)
+    let fd2: i32 = sys_open(c"/etc/motd", O_RDONLY)
+    if fd2 != 4
+        sys_close(fd1)
+        if fd2 >= 0
+            sys_close(fd2)
+        return fail_eq(c"fd2", 4, fd2)
+    if sys_close(fd1) != 0
+        sys_close(fd2)
+        return fail_eq(c"close(fd1)", 0, -1)
+    let fd3: i32 = sys_open(c"/etc/motd", O_RDONLY)
+    sys_close(fd2)
+    if fd3 >= 0
+        sys_close(fd3)
+    if fd3 != 3
+        return fail_eq(c"fd3 reuse", 3, fd3)
+    return 0
+
+# Hold HOLD fds open at once (3..HOLD+2), then close them all.
+fn test_capacity() -> i32
+    var opened: i32 = 0
+    var bad: i32 = 0
+    while opened < HOLD
+        let fd: i32 = sys_open(c"/etc/motd", O_RDONLY)
+        if fd != opened + 3
+            bad = fd
+            if fd >= 0
+                sys_close(fd)
+            break
+        opened = opened + 1
+    var closed: i32 = 0
+    var i: i32 = 0
+    while i < opened
+        if sys_close(i + 3) == 0
+            closed = closed + 1
+        i = i + 1
+    if opened != HOLD
+        print_str(c"[fd_table_test] FAIL: capacity: open #")
+        print_int((opened + 1) as i64)
+        print_str(c" returned ")
+        print_int(bad as i64)
+        print_str(c"\n")
+        return 1
+    if closed != HOLD
+        return fail_eq(c"capacity: closes", HOLD, closed)
+    # Everything was closed: the lowest fd is free again.
+    let fd: i32 = sys_open(c"/etc/motd", O_RDONLY)
+    if fd >= 0
+        sys_close(fd)
+    if fd != 3
+        return fail_eq(c"after capacity", 3, fd)
+    return 0
+
+pub fn main() -> i32
+    print_str(c"[fd_table_test] starting\n")
+    if test_reuse() != 0
+        return 1
+    if test_capacity() != 0
+        return 2
+    print_str(c"[fd_table_test] PASS\n")
+    return 0

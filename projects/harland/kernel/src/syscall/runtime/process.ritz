@@ -16,7 +16,7 @@ import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm
 import mm.uptr { uptr_validate_string, uptr_check_read }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_read }
 import fs.kpath { strview_from_ptr }
-import fs.syscall { sys_open }
+import fs.syscall { sys_open, fs_process_end, fs_process_start }
 import drivers.acpi.tables { acpi_poweroff }
 import loader.elf { ElfLoadResult, ElfStatus, elf_load }
 import syscall.errno { Errno }
@@ -83,11 +83,13 @@ fn prints_str(s: *u8)
         serial_write_byte(*p)
         p = p + 1
 
-# Make the running process init (PID 1, no parent): run_init, before it
-# jumps to /bin/init.
+# Make the running process init (PID 1, no parent) with its own fd table
+# (#2753): run_init, before it jumps to /bin/init.
 pub fn process_enter_init()
     g_has_parent = 0
     g_child_pid = 1
+    if fs_process_start(1) != 0
+        prints("[init] No fd table: init cannot open files\n")
 
 # The errno a failed spawn returns for a failed ELF load: out of memory, or
 # a file that isn't a loadable x86-64 executable.
@@ -146,6 +148,17 @@ fn sys_spawn_impl(path: *u8) -> i64
     serial_print_hex(vmm_read_pml4_entry(child_pml4, 511))
     prints("\n")
 
+    # The child's own fd table (#2753); sys_exit_impl releases it. Made here,
+    # in the parent's address space: kalloc may grow the heap, and
+    # vmm_map_page walks the page tables through the identity map, which a
+    # child's page table lacks.
+    let fs_result: i32 = fs_process_start(g_child_pid)
+    if fs_result != 0
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return fs_result as i64
+
     # Switch to child's address space for ELF loading
     # This way, elf_load will map pages directly into the child's page table
     vmm_switch_pml4(child_pml4)
@@ -159,6 +172,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     if load_result.error != ElfStatus.Ok
         # Switch back to parent before cleanup
         vmm_switch_pml4(g_parent_ctx.user_pml4)
+        fs_process_end()
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
@@ -168,6 +182,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     let child_stack_top: u64 = alloc_user_stack()
     if child_stack_top == 0
         vmm_switch_pml4(g_parent_ctx.user_pml4)
+        fs_process_end()
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
@@ -280,6 +295,18 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         copy_pos = copy_pos + j + 1
         i = i + 1
 
+    # The child's own fd table (#2753); sys_exit_impl releases it. Made here,
+    # in the parent's address space: kalloc may grow the heap, and
+    # vmm_map_page walks the page tables through the identity map, which a
+    # child's page table lacks.
+    let fs_result: i32 = fs_process_start(g_child_pid)
+    if fs_result != 0
+        prints("[spawn_args] No fd table for the child\n")
+        vmm_free_pml4(child_pml4)
+        g_has_parent = 0
+        g_child_pml4 = 0
+        return fs_result as i64
+
     # Switch to child's address space
     vmm_switch_pml4(child_pml4)
 
@@ -290,6 +317,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     if load_result.error != ElfStatus.Ok
         prints("[spawn_args] Failed to load ELF\n")
         vmm_switch_pml4(g_parent_ctx.user_pml4)
+        fs_process_end()
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
@@ -300,6 +328,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     if alloc_stack_top == 0
         prints("[spawn_args] Failed to allocate child stack\n")
         vmm_switch_pml4(g_parent_ctx.user_pml4)
+        fs_process_end()
         vmm_free_pml4(child_pml4)
         g_has_parent = 0
         g_child_pml4 = 0
@@ -390,6 +419,11 @@ fn sys_exit_impl(code: i32) -> i64
         # page table. If we jump while still in the child's CR3, we'll page fault.
         vmm_switch_pml4(g_parent_ctx.user_pml4)
 
+        # Close the fds the child left open (flushing their writes) and free
+        # its fd table, so none outlive it; the parent's table is current
+        # again (#2753). After the switch: a flush may grow the kernel heap.
+        fs_process_end()
+
         # Free the child's page table and all its user-space pages
         if g_child_pml4 != 0
             vmm_free_pml4(g_child_pml4)
@@ -409,7 +443,9 @@ fn sys_exit_impl(code: i32) -> i64
 
         # Never reached
 
-    # No parent - this is init exiting or a system halt
+    # No parent - this is init exiting or a system halt. Its fds are closed
+    # (and their writes flushed) like any process's (#2753).
+    fs_process_end()
     prints(" - halting system\n")
     halt_loop()
     return 0

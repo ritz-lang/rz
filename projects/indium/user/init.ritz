@@ -7,7 +7,7 @@
 # this will move to the test suite rather than being the actual init process.
 # Runtime _start calls main() and then sys_exit(return_value).
 
-import libharland { print_str, print_int, strlen, sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_acpi_poweroff }
+import libharland { print_str, print_int, strlen, sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_acpi_poweroff, sys_open, sys_close, sys_read, O_RDONLY }
 
 # ============================================================================
 # Test Infrastructure
@@ -76,6 +76,73 @@ fn run_test_args(path: *u8, name: *u8, argv: **u8, argc: i32, expected: i32) -> 
         g_failed = g_failed + 1
         return 1
 
+# fd isolation (AGAST #2753). init is the parent: a spawned process can't
+# spawn yet (the blocking spawn keeps one saved parent frame), so this runs
+# in init rather than as its own /bin test. init holds /etc/motd as fd 3;
+# the child (/bin/fd_isolation_child) must get its own fd 3 and leaves it
+# open. Back here, fd 3 must still read /etc/motd and the next open must be
+# 4, and a second run of the child must get fd 3 again: the child's fd did
+# not outlive it. Returns 0 on PASS, else a step number.
+fn fd_isolation_steps() -> i32
+    let fd: i32 = sys_open(c"/etc/motd", O_RDONLY)
+    if fd != 3
+        if fd >= 0
+            sys_close(fd)
+        print_str(c"(parent open: fd ")
+        print_int(fd as i64)
+        print_str(c") ")
+        return 1
+    let child: i64 = spawn_and_wait(c"/bin/fd_isolation_child")
+    var buf: [8]u8
+    let n: i64 = sys_read(fd, @buf[0], 7)
+    let next: i32 = sys_open(c"/etc/motd", O_RDONLY)
+    # The same child again: its fd 3 must be free, not still held by the
+    # first one (children all run as pid 2).
+    let again: i64 = spawn_and_wait(c"/bin/fd_isolation_child")
+    sys_close(fd)
+    if next >= 0
+        sys_close(next)
+    if child != 0
+        print_str(c"(child exit ")
+        print_int(child)
+        print_str(c") ")
+        return 2
+    # /etc/motd starts "Welcome"
+    if n != 7 or buf[0] != 87 or buf[6] != 101
+        print_str(c"(parent fd 3 lost /etc/motd) ")
+        return 3
+    if next != 4
+        print_str(c"(parent next open: fd ")
+        print_int(next as i64)
+        print_str(c") ")
+        return 4
+    if again != 0
+        print_str(c"(second child exit ")
+        print_int(again)
+        print_str(c") ")
+        return 5
+    return 0
+
+# Spawn path and return its exit code, or -1000 if it didn't spawn.
+fn spawn_and_wait(path: *u8) -> i64
+    let pid: i64 = sys_spawn(path)
+    if pid <= 0
+        return -1000
+    return sys_wait(pid as i32)
+
+fn run_fd_isolation_test() -> i32
+    print_str(c"[test] fd_isolation ... ")
+    let step: i32 = fd_isolation_steps()
+    if step == 0
+        print_str(c"PASS\n")
+        g_passed = g_passed + 1
+        return 0
+    print_str(c"FAIL (step ")
+    print_int(step as i64)
+    print_str(c")\n")
+    g_failed = g_failed + 1
+    return 1
+
 # ============================================================================
 # Syscall Tests
 # ============================================================================
@@ -133,6 +200,9 @@ fn run_tier1_tests() -> i32
     run_test(c"/bin/cat_motd",    c"cat_motd",    0)
     run_test(c"/bin/hello_gfx",   c"hello_gfx",   0)
     run_test(c"/bin/cwd_test",    c"cwd_test",    0)
+    run_test(c"/bin/fd_table_test",  c"fd_table_test",  0)
+    run_test(c"/bin/pid_child_test", c"pid_child_test", 0)
+    run_fd_isolation_test()
 
     # Test rzsh --help (non-interactive)
     var rzsh_argv: [2]*u8
