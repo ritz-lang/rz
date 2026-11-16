@@ -2162,13 +2162,12 @@ def compile_freestanding_binary(
                 f"--target={target}",
                 *FREESTANDING_FLAGS,
                 "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
-                "-msha",  # Force SHA extensions: cryptosec emits SHA intrinsics
-                          # in dead SHA-NI dispatch path; runtime detection
-                          # ensures they only execute on capable CPUs. Without
-                          # this, clang refuses to lower llvm.x86.sha256rnds2
-                          # on hosts where -march=native doesn't include +sha
-                          # (e.g. pre-Skylake). The disabled paths still need
-                          # to compile.
+                "-msha",  # Force SHA extensions: code using the SHA-NI
+                          # intrinsics (e.g. cryptosec's test_sha_ni.ritz) must
+                          # compile even where it never runs. Without this,
+                          # clang refuses to lower llvm.x86.sha256rnds2 on hosts
+                          # where -march=native doesn't include +sha (e.g.
+                          # pre-Skylake).
             ]
             # Add PIC flag if explicitly requested or for Linux targets
             if pic or target.endswith("-linux"):

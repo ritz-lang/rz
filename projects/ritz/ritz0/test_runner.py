@@ -667,13 +667,12 @@ def _harness_obj(source_path: str, harness_path: str, harness_ll: str,
 def _link(objects: List[str], exe_path: str) -> Tuple[Optional[str], Optional[str]]:
     """Link objects / .ll files into an executable. Returns (exe_path, error)."""
     # -march=native enables host CPU features (AES-NI, AVX2, etc.).  -msha is
-    # added unconditionally because cryptosec's sha256.ritz defines a
-    # sha256_transform_ni function whose body emits SHA-NI intrinsics
-    # (sha256rnds2/msg1/msg2).  Even when the public API never calls it (it
-    # currently doesn't), LLVM's instruction selector still has to lower the
-    # function body and aborts with "Cannot select intrinsic" without +sha.
+    # added unconditionally because code such as cryptosec's test_sha_ni.ritz
+    # emits SHA-NI intrinsics (sha256rnds2/msg1/msg2).  Even when nothing
+    # calls such a function, LLVM's instruction selector still has to lower
+    # its body and aborts with "Cannot select intrinsic" without +sha.
     # On a host without SHA-NI silicon the binary will SIGILL only if the
-    # function is actually called — pure-soft callers are safe.  This mirrors
+    # function is actually called.  This mirrors
     # the flag set used by build.py's link path.
     clang_cmd = ["clang"] + objects + ["-o", exe_path, "-nostdlib", "-no-pie", "-g", "-march=native", "-msha"]
     result = subprocess.run(clang_cmd, capture_output=True, text=True)
