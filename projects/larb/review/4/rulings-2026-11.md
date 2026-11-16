@@ -1770,17 +1770,26 @@ matched ritz0 at the time.
   wording. Which stage reports it isn't a language question.
 - §8.1's "for a union, an arm for every member" coverage bullet is removed.
 
-## Ticket-scrub batch, 2026-11-16: R53–R67 (RECOMMENDED, awaiting Aaron)
+## Ticket-scrub batch, 2026-11-16: R53–R67, CONFIRMED
 
 From the rz room's scrub of all 190 open Ritz tickets against `main` @ 6f245b93
 (Nexus "Ritz retrospective 2026-11"). Every row was measured on ritz0 and ritz1
 at 6f245b93; repros were kept in `/tmp/larb-{a..f}/` on the LARB host.
-ritz1_selfhosted wasn't probed (its build was stale). These are
-recommendations: each ticket is `blocked` until Aaron confirms, and the
-implementation tickets are filed then. Bugs found along the way are filed now
-regardless (listed at the end).
+ritz1_selfhosted wasn't probed (its build was stale). Bugs found along the way
+were filed at once (listed at the end).
 
-### R53: `usize` / `isize` (#2363): KEEP, AS `u64` / `i64`
+**All fifteen CONFIRMED by Aaron, 2026-11-16 (~01:3x UTC, via `rz`), as
+recommended below.** With them he accepted review/5's first recommendation: **the
+checking phase comes before the rulings are implemented.** So every
+implementation ticket that adds a check or a typing rule depends on its
+compiler's checking phase: ritz1 on **#1816** (its first step is #3462), ritz0 on
+**#3448** (which waits on #3449). Tickets that add no check are `ready`: spec
+text, pure migrations, and library cleanups that don't need the new rule. Each
+ticket gives its reason in a `GATE:` line. The question tickets are closed, and
+each one names its implementation tickets. The table is
+[at the end of this batch](#implementation-tickets-r53r67).
+
+### R53: `usize` / `isize` (#2363): KEEP, AS `u64` / `i64`, CONFIRMED
 **Measured.** The spec never names either type. Both compilers treat `usize` as
 *signed*: with `b = 0xFFFF_FFFF_FFFF_FFF8 as usize`, `b >> 60` is an
 arithmetic shift, `b > 1` is false, `/` `%` are signed, `b as f64` is negative.
@@ -1797,7 +1806,7 @@ signed lowering with 0 source changes. Removing the names would rewrite 162
 uses for nothing. Tickets on confirm: ritz0 (unsigned everywhere, literal range,
 `Vec<usize>` and `Vec<u64>` are one instance; spec text), then ritz1.
 
-### R54: a selective import of a name the module doesn't define (#3439): LOCATED ERROR
+### R54: a selective import of a name the module doesn't define (#3439): LOCATED ERROR, CONFIRMED
 **Measured.** §15.1 says the `{ }` list "is recognised but does not currently
 filter". Both compilers accept `import ritzlib.hashmap { HashMap }`; the error
 comes later, at a call. 50 names in 16 import lines exist nowhere (tempest,
@@ -1814,7 +1823,7 @@ sites import them). A private fn in the list gets §15.2's error at the import (
 sites). The list is checked but still doesn't filter. Order on confirm: corpus
 migration (~35 files), ritz0, ritz1. #1388 is an older duplicate and folds in.
 
-### R55: trait bounds (#1621): KEEP, AS A CHECK ONLY
+### R55: trait bounds (#1621): KEEP, AS A CHECK ONLY, CONFIRMED
 **Measured.** ritz0 parses `<T: A>` and `<T: A + B>` on fn, struct, enum and
 impl (no `where`) and checks at instantiation (monomorph.py:421). The check
 doesn't steer method lookup: `x.area()` on an unbounded `T` compiles on both.
@@ -1839,7 +1848,7 @@ touch the 226 generics; it can come later. Tickets on confirm: ritz0 (the three
 defects, located tests), then ritz1 (parse, impl table, check; clears the
 EXPECTED_FAILURES entry; with #1612). Unblocks R36's revisit, #3251, #3256.
 
-### R56: closures (#1623): REMOVE
+### R56: closures (#1623): REMOVE, CONFIRMED
 **Measured.** ritz0 parses `|x| e`, `|| e`, `|x: T| e` and anonymous
 `fn(a: i32) -> i32 e`. Captures are copied into a private global ring of 16
 environment slots ("This is a hack"): 17 closures from `make_adder`, then call
@@ -1859,7 +1868,7 @@ Tickets on confirm: ritz0 refusal and test conversions (clears test_level39's
 EXPECTED_FAILURES entry), 58_closures rewrite, ritz1 test. #1531 and #3301 close
 as superseded. (#1624, #1626: implementation, no ruling.)
 
-### R57: a view is a borrow; a move conflicts with a borrow (#1292)
+### R57: a view is a borrow; a move conflicts with a borrow (#1292), CONFIRMED
 **Measured.** Both compilers refuse `let p = @v[0]` then `v.push`, but accept
 `let s: Span<u8> = v[0..2]` held across `v.push`, returning `v[0..3]` of a local
 Vec, and returning a Span of `@arr` of a local array. Both also accept moving a
@@ -1876,7 +1885,7 @@ a field or global. Cost: 2 Span-annotated view lets found by regex, 0 outside
 tests; the room counts returns with the checker and stops at ~10. Tickets on
 confirm: ritz0, then ritz1; #2159 then depends on both, not #1292.
 
-### R58: a store through a reference drops the old value; through `*T` it doesn't (#2179)
+### R58: a store through a reference drops the old value; through `*T` it doesn't (#2179), CONFIRMED
 **Measured.** Every store through a pointer or reference leaks the old value on
 both compilers: `p.t = v` through `*Holder`, `@&Holder`, `:&`, a local `@&`
 binding; `*p = v` through `@&T` and `*T`. A whole store to an owned binding
@@ -1893,7 +1902,7 @@ point at uninitialised memory: `box_new` writes `*b.ptr = value` into fresh
 room measures with an instrumented build and stops at ~10. Tickets on confirm:
 ritz0, ritz1; before #2159.
 
-### R59: an uninitialised move-only `var` starts moved (#2180)
+### R59: an uninitialised move-only `var` starts moved (#2180), CONFIRMED
 **Measured.** `var h: Holder; h.t = make(1)` is never dropped on either
 compiler. Reading `h.t` before any store compiles and reads garbage (exit 48 on
 ritz0, 32 on ritz1); returning a partly built Holder hands garbage to the
@@ -1913,7 +1922,7 @@ guard becomes unreachable. Not covered: an uninitialised *copy* struct read,
 which is a general definite-initialisation question. Tickets on confirm: ritz0
 with the migration, then ritz1; before #2159.
 
-### R60: module-level values (#3338, #3412, #3436, ROADMAP GH #95): `const` AND `var`, ONE CONSTANT-INITIALISER RULE
+### R60: module-level values (#3338, #3412, #3436, ROADMAP GH #95): `const` AND `var`, ONE CONSTANT-INITIALISER RULE, CONFIRMED
 **Measured.**
 
 | initialiser | ritz0 | ritz1 |
@@ -1944,7 +1953,7 @@ evaluator shared by const and var, spec), ritz1 (reuse `emit_const_array_entry`,
 covers #3398, f64 globals typed `double`), optional cleanup (angelo TAG_*,
 harland eth/dhcp, the ROADMAP row).
 
-### R61: `a[i] = v` order (#3432): LEFT TO RIGHT
+### R61: `a[i] = v` order (#3432): LEFT TO RIGHT, CONFIRMED
 **Measured.** ritz0's plain store evaluates `v` before the place (`a[idx()] =
 val()` gives 87; `g[i][j] = v` gives 877). ritz1 goes place first (78, 778).
 ritz0's own `a[i] += v` is place first, and so are both compilers everywhere
@@ -1957,7 +1966,7 @@ split rows in test_array_elem_store_drop.py go back to one. Visible only when
 the index and value both have side effects: none found in the corpus (not a full
 sweep).
 
-### R62: a `"…"` literal in a `Span<u8>` slot (#3402): ACCEPT
+### R62: a `"…"` literal in a `Span<u8>` slot (#3402): ACCEPT, CONFIRMED
 **Measured.** Both compilers already accept it in let, argument and return
 slots, with a NUL after the bytes. The library doesn't use it: 415
 `span_from_cstr(c"…")` (a strlen at run time) and 106 `span_literal(c"…", N)`
@@ -1970,7 +1979,7 @@ R49's line holds: `String` owns heap memory and a literal can't be one, but a
 optional library cleanup. Tickets on confirm: spec plus tests on both compilers;
 the two bugs below.
 
-### R63: integer overflow (#3197): TRAP, IN EVERY PROFILE; `+%` WRAPS
+### R63: integer overflow (#3197): TRAP, IN EVERY PROFILE; `+%` WRAPS, CONFIRMED
 **Measured.** A build profile reaches only clang's link flags (build.py:1904);
 neither compiler gets one, so "trap in debug" would add a compiler mode, a cache
 key and matrix rows. ritzlib has no `wrapping_*`. Code that relies on wrapping
@@ -1995,7 +2004,7 @@ exceeds ~5%, it comes back. Order on confirm: `+%` on ritz0, then ritz1; migrate
 crypto function by function (not test-driven: untested carry paths would trap
 in production); then the checks with timing on ritz0, then ritz1.
 
-### R64: a statement with no effect (#3253): LOCATED ERROR
+### R64: a statement with no effect (#3253): LOCATED ERROR, CONFIRMED
 **Measured.** Both compilers accept `x`, `5`, `x == 1`, `x + 1`, `p.x`, `@x` as
 statements silently. An AST walk of 1221 files found 277: **259 bare
 `"FAIL: …\n"` strings in 15 zeus test files** (every failure message is lost),
@@ -2012,7 +2021,7 @@ not warning: Ritz has no warning tier, and 270 of 277 hits are real bugs. Order
 on confirm: fix the 277 (the `555` lines become a call so the regressions still
 test what they did), ritz0, ritz1.
 
-### R65: where an `impl` may live (#3256): THE TYPE'S FILE (OR THE TRAIT'S); EVERY INSTANTIATION
+### R65: where an `impl` may live (#3256): THE TYPE'S FILE (OR THE TRAIT'S); EVERY INSTANTIATION, CONFIRMED
 **Measured.** An inherent impl of another file's type, and trait impls of it,
 run on both. Two files adding `Foo.tag`: ritz0 fails at link with no location;
 ritz1 silently keeps one body per module. A method added in `b` is callable from
@@ -2035,7 +2044,7 @@ file is where R36's `impl Hash for i64` becomes legal: R36's revisit is then a
 narrow question for Aaron (trait impls on primitives, in the trait's file only).
 Cost 0 plus 2 test rows. Tickets on confirm: ritz0, then ritz1.
 
-### R66: the ritzlib UFCS name table (#3252): REPLACE WITH IMPL BLOCKS
+### R66: the ritzlib UFCS name table (#3252): REPLACE WITH IMPL BLOCKS, CONFIRMED
 **Measured.** ritz0 `ufcs.py:14` (String, GrowBuf, Buffer, ArgParser prefixes,
 plus `Vec$ Span$ Option$ Result$ Box$`), ritz1 `ast_helpers.ritz:124`; a parity
 test keeps them equal. Lookups over `rz build --all` plus examples: Vec 1125 (15
@@ -2051,7 +2060,7 @@ cross-module through the table: the wrappers must be `pub` (#3418). Tickets on
 confirm: ritzlib impls (with `rz test --all` before and after), then one per
 compiler.
 
-### R67: positional `let (a, b) = s` of a named struct (#3254): REFUSE
+### R67: positional `let (a, b) = s` of a named struct (#3254): REFUSE, CONFIRMED
 **Measured.** 21 `let (…)` sites; 16 are tuples, 5 named structs (angelo
 font.ritz:112, raster/fill.ritz:85 and :136, two ritz0 tests). Both bind in
 declaration order. 3 fields, 2 names: ritz0 unlocated ValueError, ritz1
@@ -2067,6 +2076,45 @@ expect-error block. Migration: 5 sites. Tickets on confirm: ritz0 with the
 migration, then ritz1 (test_ritz1_struct_destructure.py becomes refusal rows).
 #2864 closes as superseded. Not measured: §10.3 says named-field enum variants
 also bind positionally, which is the same hazard; a separate question.
+
+### Implementation tickets (R53–R67)
+
+Filed 2026-11-16 after Aaron's confirmation. **Ready** means it waits on no
+checking phase. **ritz0 phase** means it depends on #3448, and **ritz1 phase**
+on #1816. Other edges are listed under "Then".
+
+| R | Ready now | ritz0 phase (#3448) | ritz1 phase (#1816) | Then |
+|---|---|---|---|---|
+| R53 | #3463 ritz0 + §3.1, #3464 ritz1: name resolution only | | | |
+| R54 | #3465 corpus migration | #3466 | #3467 | both after #3465 |
+| R55 | | #3468 | #3469 | |
+| R56 | #3470 ritz0 refusal at the parse, tests, 58_closures, §5.6; #3471 ritz1 message | | | |
+| R57 | | #3472 | #3473 | #2159 depends on both |
+| R58 | | #3474 | #3475 | #2159 depends on both; dropping needs the phase's reference kinds |
+| R59 | #3476 library migration | #3477 | #3478 | both after #3476; #2159 depends on both |
+| R60 | | #3479 | #3480 (covers #3398) | #3481 cleanup after both |
+| R61 | #3482 ritz0 evaluation order + §13.6 | | | ritz1 already conforms |
+| R62 | #3483 spec + tests, #3484 ritzlib cleanup | | | bugs #3440, #3441 |
+| R63 | | #3485 `+%` ops, #3488 traps | #3486 `+%` ops, #3489 traps | #3485 and #3486, then #3487 migration, then #3488, then #3489 |
+| R64 | **#3490** zeus `"FAIL"` repair (p70) | #3491 | #3492 | both after #3490 |
+| R65 | | #3493 | #3494 | |
+| R66 | #3495 ritzlib impls | | | #3496 ritz0, #3497 ritz1: table deletions, after #3495 |
+| R67 | #3498 migration (5 sites) | #3499 | #3500 | both after #3498 |
+
+- **R63's measurement gate stands:** #3488 and #3489 each time ritz1's
+  self-compile and a cryptosec bench. Over ~5%, they stop and it goes back to
+  Aaron.
+- **R64's zeus repair is `ready` at Aaron's direction.** The 259 `"FAIL: …"`
+  lines in 15 zeus test files are a test-integrity bug: the return code still
+  fails the test, but every message is lost. They become `prints(…)`.
+- **Closed:** question tickets #2363, #3439, #1621, #1623, #1292, #2179, #2180,
+  #3338, #3412, #3436, #3432, #3402, #3197, #3253, #3256, #3252 and #3254.
+  Duplicates and superseded tickets: #1388 (into #3439), #1531 and #3301 (R56),
+  #2864 (R67).
+- **#2159** now depends on R57–R59's six tickets. Its old edge to #1292 remains
+  and is satisfied, because #1292 is closed.
+- **Now open for a ruling:** #3251 (with R55 confirmed) and R36's revisit (trait
+  impls on primitives, in the trait's file, under R65).
 
 ### #3251 (runtime polymorphism): NO RULING YET
 Waits on R55. With R56, closures (code plus environment) fold into it: the one
