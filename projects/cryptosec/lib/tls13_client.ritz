@@ -489,22 +489,17 @@ fn process_server_hello(client: *TlsClient, out: *u8, out_cap: i64, out_len: *i6
 
     # Parse ServerHello
     let sh_result: i32 = server_hello_parse(@client.recv_buf[9], hdr.length, @client.server_hello)
+    if sh_result == SERVER_HELLO_ERR_VERSION
+        # No supported_versions: the server chose TLS 1.2 or older, which we
+        # do not speak (protocol_version). One naming a version we did not
+        # offer is illegal_parameter (RFC 8446 4.2.1).
+        if client.server_hello.negotiated_version == 0
+            return client_fail(client, TLS_ERR_VERSION_MISMATCH)
+        return client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+    if sh_result == SERVER_HELLO_ERR_NO_KEY_SHARE
+        return client_fail(client, TLS_ERR_NO_KEY_SHARE)
     if sh_result != 0
-        client.last_error = TLS_ERR_PARSE_ERROR
-        client.state = TLS_STATE_ERROR
-        return TLS_RESULT_ERROR
-
-    # Verify TLS 1.3
-    if client.server_hello.negotiated_version != TLS_VERSION_13
-        client.last_error = TLS_ERR_VERSION_MISMATCH
-        client.state = TLS_STATE_ERROR
-        return TLS_RESULT_ERROR
-
-    # Verify we got key share
-    if client.server_hello.has_key_share != 1
-        client.last_error = TLS_ERR_NO_KEY_SHARE
-        client.state = TLS_STATE_ERROR
-        return TLS_RESULT_ERROR
+        return client_fail(client, TLS_ERR_PARSE_ERROR)
 
     # Only a share for the group we offered can be answered. This also holds
     # the second ServerHello to the group its HelloRetryRequest selected.
@@ -1155,10 +1150,23 @@ pub const TLS_ALERT_BAD_CERTIFICATE: i32 = 42
 pub const TLS_ALERT_ILLEGAL_PARAMETER: i32 = 47
 pub const TLS_ALERT_DECODE_ERROR: i32 = 50
 pub const TLS_ALERT_DECRYPT_ERROR: i32 = 51
+pub const TLS_ALERT_PROTOCOL_VERSION: i32 = 70
+pub const TLS_ALERT_INTERNAL_ERROR: i32 = 80
+pub const TLS_ALERT_MISSING_EXTENSION: i32 = 109
 
 # The alert that reports `err` to the server, or -1 for none: TLS_ERR_PEER_ALERT
-# (the server already closed with its own), and errors not mapped yet.
+# (the server already closed with its own). INVALID_STATE and BUFFER_TOO_SMALL
+# only reach here once they have killed the connection: a refused call on a
+# live one leaves the state alone and tls_client_pending_alert sends nothing.
 fn client_alert_for_error(err: i32) -> i32
+    if err == TLS_ERR_VERSION_MISMATCH
+        return TLS_ALERT_PROTOCOL_VERSION
+    if err == TLS_ERR_NO_KEY_SHARE
+        return TLS_ALERT_MISSING_EXTENSION
+    if err == TLS_ERR_HELLO_RETRY_REQUEST
+        return TLS_ALERT_ILLEGAL_PARAMETER
+    if err == TLS_ERR_INVALID_STATE || err == TLS_ERR_BUFFER_TOO_SMALL
+        return TLS_ALERT_INTERNAL_ERROR
     if err == TLS_ERR_DECRYPT_FAILED
         return TLS_ALERT_BAD_RECORD_MAC
     if err == TLS_ERR_UNEXPECTED_MESSAGE
