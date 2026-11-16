@@ -27,6 +27,7 @@ import ast_helpers
 import emitter_core
 import narrowing
 import bool_check
+import diag
 
 # Is `e` built from integer literals alone (`4000000000`, `-3`, `2 * 3`)?
 # ritz0's _int_literal_only.
@@ -88,6 +89,27 @@ pub fn int_into_float_slot(s: *EmitterState, val_reg: i32, value: *Expr, dst_ty:
     emit_str(s, float_llvm_name(dst_ty))
     emit_str(s, c"\n")
     r
+
+# AGAST #3626, LARB R1 / R4, LANGUAGE_SPEC §7.5: nothing but a number lands
+# in an f32 / f64 slot.  `let a: f64 = p` and an if / match arm `p` next to
+# `1.5` are refused at the pointer value, in ritz0's words
+# (_reject_pointer_into_float; ritz0/test_let_float_pointer.py feeds the same
+# programs to both).  Silent unless bool_kind is sure the value is a pointer.
+# Returns 1 when `value` is a pointer, reported and counted; 0 otherwise.
+pub fn pointer_into_float(s: *EmitterState, value: *Expr) -> i32
+    if value == null or bool_kind(s, value) != BK_PTR
+        return 0
+    let at: *Expr = fs_report_at(value)
+    let f: *FnDef = emitter_current_fn()
+    s.error_count = s.error_count + 1
+    emit_str(s, c"  ; ERROR: pointer into a float slot (AGAST #3626)\n")
+    var file: *u8 = null
+    if f != null
+        file = fn_source_file(f)
+    if file == null
+        file = emitter_source_file()
+    diag_error(file, at.span, c"cannot use a pointer as a float")
+    1
 
 fn c_float_name(t: i32) -> *u8
     if t == TYPE_F32

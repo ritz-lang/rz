@@ -9,14 +9,16 @@ ritz0 now refuses every form with one located error, at the pointer value:
 "cannot use a pointer as a float" (LANGUAGE_SPEC §7.5). The bool half of this
 ticket was already done: "cannot use bool as a float" (test_bool_type.py).
 
-Every form runs through all three compilers, held to ritz0's located words.
-ritz1 and ritz1_selfhosted give none yet: the plain let / var compile (rc 0,
-then clang rejects the IR), and the if / match arms are refused unlocated
-("ritz1 cannot emit: match arm yields a non-numeric value ..."). Those rows
-are strict xfails naming AGAST #3626; empty RITZ1_GAPS when it lands.
+Every form runs through all three compilers, held to ritz0's located words:
+one `<file>:<line>:<col>: cannot use a pointer as a float` line (ritz1 puts
+`error: ` before the message, as diag.ritz does), and no IR written.  Before
+AGAST #3626 ritz1 had none: the plain let / var compiled (rc 0, then clang
+rejected the IR), and the if / match arms were refused unlocated ("ritz1
+cannot emit: match arm yields a non-numeric value ...").
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -53,16 +55,18 @@ FORMS = {
                   "    return a as i32\n\n"
                   "fn main() -> i32\n"
                   "    return f(1)\n", 4, 14),
+    # The pointer after the float arm: the slot's type is fixed before either.
+    "if_else_arm": ("fn f(n: i64) -> i32\n"
+                    "    let p: *u8 = c\"x\"\n"
+                    "    let a: f64 = if n > 2 then 1.5 else p\n"
+                    "    return a as i32\n\n"
+                    "fn main() -> i32\n"
+                    "    return f(1)\n", 3, 41),
 }
 
-# ritz1 and ritz1_selfhosted: forms with no located refusal yet.
-_NOT_LOCATED = "AGAST #3626: ritz1 has no located pointer-into-float refusal"
-RITZ1_GAPS = {
-    "let_plain": _NOT_LOCATED + " (compiles; clang rejects the IR)",
-    "var_f32_plain": _NOT_LOCATED + " (compiles; clang rejects the IR)",
-    "if_arm": _NOT_LOCATED + " (refused unlocated, in match words)",
-    "match_arm": _NOT_LOCATED + " (refused unlocated)",
-}
+# ritz1 and ritz1_selfhosted: forms with no located refusal yet (none since
+# AGAST #3626).
+RITZ1_GAPS = {}
 
 
 def _compile(compiler, tmp_path, source):
@@ -84,7 +88,11 @@ def _assert_refused(compiler, tmp_path, name):
     proc = _compile(compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
-    assert f"bad.ritz:{line}:{col}: {MESSAGE}" in out, out
+    hits = re.findall(rf"bad\.ritz:{line}:{col}: (?:error: )?{re.escape(MESSAGE)}$", out, re.M)
+    assert len(hits) == 1, out
+    # Said once, at the pointer: not again at the `if` / `match` holding it.
+    assert out.count(MESSAGE) == 1, out
+    assert not (tmp_path / "bad.ll").exists(), f"{compiler} wrote IR for {name}"
 
 
 @pytest.mark.integration

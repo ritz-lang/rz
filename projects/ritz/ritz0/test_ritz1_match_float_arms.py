@@ -95,7 +95,8 @@ def test_int_arm_before_float_arm_is_a_diagnostic(ritz1_bin, tmp_path):
 def test_pointer_arm_in_float_match_is_a_diagnostic(ritz1_bin, tmp_path):
     comp, _ = _compile(ritz1_bin, tmp_path, "pointer_arm", POINTER_ARM)
     assert comp.returncode != 0, comp.stdout + comp.stderr
-    assert "match arm yields a non-numeric value" in comp.stderr
+    # AGAST #3626: located at the pointer arm, in ritz0's words.
+    assert "pointer_arm.ritz:7:17: error: cannot use a pointer as a float" in comp.stderr, comp.stderr
 
 
 @pytest.mark.integration

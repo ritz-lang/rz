@@ -17,9 +17,9 @@ This is what ritz1 does since #1946.
 
 Arm shapes outside that rule are a located diagnostic, not a traceback:
 
-* a pointer arm. ritz1 rejects it too ("match arm yields a non-numeric
-  value"). ritz0 gives the plain form's words, "cannot use a pointer as a
-  float", at the arm (#2093, test_let_float_pointer.py).
+* a pointer arm. Both compilers give the plain form's words, "cannot use a
+  pointer as a float", at the arm (ritz0 #2093, ritz1 #3626;
+  test_let_float_pointer.py).
 * a bool arm. The plain form converts in both compilers but disagrees on
   the value: ritz0 sitofp's i1 true to -1.0, ritz1 gives 1.0. Merging it
   would copy that bug into the match form, so it stays rejected until the
@@ -654,7 +654,8 @@ def test_ritz0_rejects_non_numeric_arm_with_location(run_ritz0, tmp_path, progra
 def test_ritz1_rejects_pointer_arm(ritz1_bin, tmp_path):
     rc, diag = _ritz1_run(ritz1_bin, tmp_path, POINTER_ARM)
     assert rc is None
-    assert "match arm yields a non-numeric value" in diag
+    # AGAST #3626: at the pointer arm, in ritz0's words.
+    assert "prog.ritz:7:17: error: cannot use a pointer as a float" in diag, diag
 
 
 # --- AGAST #3313: an arm that really is lossy --------------------------------
