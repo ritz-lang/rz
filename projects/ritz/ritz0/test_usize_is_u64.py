@@ -82,3 +82,28 @@ def test_names_resolved_by_parser():
     walk(module)
     assert "usize" not in seen and "isize" not in seen, seen
     assert seen.count("u64") == 6 and "i64" in seen, seen
+
+
+# A bare `usize`/`isize` in an expression names no value (#3573). ritz0 used to
+# read it as the constant 0, a leftover from before the lexer read `0usize`
+# as one token. One row per name, plus a local named `usize`, which still wins.
+BARE = {
+    "usize": ("let x = usize\nx as i32", "Unknown identifier: usize"),
+    "isize": ("let x = 1 + isize\nx as i32", "Unknown identifier: isize"),
+    "local_named_usize": ("let usize = 0\nusize", None),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("row", BARE)
+def test_bare_usize_is_undefined(row, tmp_path):
+    from ritz0_inproc import run_ritz0
+
+    body, error = BARE[row]
+    src = tmp_path / "t.ritz"
+    src.write_text("fn main() -> i32\n" + _indent(body))
+    r = run_ritz0([src.name, "-o", "t.ll"], cwd=tmp_path)
+    if error is None:
+        assert r.returncode == 0, r.stderr
+    else:
+        assert r.returncode != 0 and error in r.stdout + r.stderr, (r.stdout, r.stderr)

@@ -8459,14 +8459,6 @@ class LLVMEmitter:
                 # Return a null pointer of i8* type
                 return ir.Constant(ir.IntType(8).as_pointer(), None)
 
-            # Tolerate numeric-suffix parser fallback tokens (e.g., 0usize -> `usize`).
-            # When the lexer/parser splits `0usize` into `0` (consumed) followed by an
-            # identifier `usize`, the integer suffix surfaces as a bare identifier in
-            # expression position. Treat it as a 0 of the matching width so the
-            # surrounding code (typically a cast or initialiser) still type-checks.
-            if name in ("usize", "isize"):
-                return ir.Constant(self.i64, 0)
-
             # Treat `pass` as a unit/no-op expression when used in expression position
             # (e.g., as an `if` arm or match arm body). Returns 0 — typed as i32 since
             # phi nodes / assignments will coerce as needed for the surrounding context.
