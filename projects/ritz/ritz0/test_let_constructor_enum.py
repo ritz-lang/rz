@@ -345,9 +345,9 @@ def test_ritz1_binds_the_enum_the_constructor_built(request, tmp_path, compiler,
 @pytest.mark.parametrize("ctor,enum", [
     ("Some(5)", "Option$i64"),
     ("None", "Option$i64"),
-    ("Ok(5)", "Result$i64$i64"),
-    ("Err(5)", "Result$i64$i64"),
-    ('Ok("x")', "Result$StrView$i64"),
+    ("Ok(5)", "Result$i64_i64"),
+    ("Err(5)", "Result$i64_i64"),
+    ('Ok("x")', "Result$StrView_i64"),
     ("Some(2.5)", "Option$f64"),
 ])
 def test_ritz1_types_the_local_by_the_payload(request, tmp_path, compiler, ctor, enum):

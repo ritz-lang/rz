@@ -393,10 +393,10 @@ def test_ritz1_moves_a_local_into_the_scrutinee(request, tmp_path, compiler):
 @pytest.mark.parametrize("scrutinee,arm,enum", [
     ("Some(5)", "Some(v)", "Option$i64"),
     ("None", "Some(v)", "Option$i64"),
-    ("Ok(5)", "Ok(v)", "Result$i64$i64"),
-    ("Err(5)", "Ok(v)", "Result$i64$i64"),
-    ('Ok("x")', "Ok(v)", "Result$StrView$i64"),
-    ('Err("x")', "Ok(v)", "Result$i64$StrView"),
+    ("Ok(5)", "Ok(v)", "Result$i64_i64"),
+    ("Err(5)", "Ok(v)", "Result$i64_i64"),
+    ('Ok("x")', "Ok(v)", "Result$StrView_i64"),
+    ('Err("x")', "Ok(v)", "Result$i64_StrView"),
     ("Some(2.5)", "Some(v)", "Option$f64"),
     ("Some(true)", "Some(v)", "Option$bool"),
 ])

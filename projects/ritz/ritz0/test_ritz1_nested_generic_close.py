@@ -18,8 +18,8 @@ cannot reach every shape:
   Vec<Connection>>` fields, `Pair<i64, Vec<i64>> { ... }` literals, `>>` in
   impl headers, and plain `Pair<i64, i32>`. ritz1 used to mangle and
   substitute on the FIRST type argument only (`%Pair$i64 = type {i64,
-  %B$i64}`); it now mangles on every argument (`Pair$i64$i32`) and
-  substitutes every parameter.
+  %B$i64}`); it now mangles on every argument (`Pair$i64_i32` in the IR,
+  AGAST #3446) and substitutes every parameter.
 """
 
 import os
@@ -263,18 +263,22 @@ def test_ritz1_runs_nested_generic_close(ritz1_bin, tmp_path, name):
 
 @pytest.mark.integration
 def test_ritz1_depth4_mangles_every_level(ritz1_bin, tmp_path):
-    """Each `>>` closes the RIGHT two lists: the type is Box$Box$Box$Box$i64."""
+    """Each `>>` closes the RIGHT two lists: the type is Box$Box_Box_Box_i64.
+
+    (ritz1 spells it Box$Box$Box$Box$i64 internally; the IR uses the §11.4
+    spelling, AGAST #3446.)
+    """
     ir = _compiled_ir("ritz1", tmp_path, "depth4_ir", RUNNABLE["depth4"])
-    assert "%Box$Box$Box$Box$i64 = type" in ir, ir[:3000]
+    assert "%Box$Box_Box_Box_i64 = type" in ir, ir[:3000]
 
 
 @pytest.mark.integration
 def test_ritz1_generic_call_suffix_is_nested_type(ritz1_bin, tmp_path):
-    """`make<Box<i64>>` instantiates `make$Box$i64`, not `make$Box`."""
+    """`make<Box<i64>>` instantiates `make$Box_i64`, not `make$Box`."""
     ir = _compiled_ir(
         "ritz1", tmp_path, "gencall_ir", RUNNABLE["generic_call_type_arg"]
     )
-    assert "@make$Box$i64(" in ir, ir[:3000]
+    assert "@make$Box_i64(" in ir, ir[:3000]
 
 
 # --- multi-parameter generic structs (AGAST #1574) -------------------------
@@ -430,20 +434,82 @@ def test_ritz1_runs_multi_arg_generic_struct(ritz1_bin, tmp_path, name):
 
 @pytest.mark.integration
 def test_ritz1_pair_substitutes_every_param(ritz1_bin, tmp_path):
-    """`Pair<i64, i32>` is `%Pair$i64$i32 = type {i64, i32}`: no `$B`."""
+    """`Pair<i64, i32>` is `%Pair$i64_i32 = type {i64, i32}`: no `$B`."""
     ir = _compiled_ir("ritz1", tmp_path, "pair_ir", MULTI_ARG["pair_prims"])
-    assert re.search(r"%Pair\$i64\$i32 = type \{\s*i64,\s*i32\s*\}", ir), ir[:3000]
+    assert re.search(r"%Pair\$i64_i32 = type \{\s*i64,\s*i32\s*\}", ir), ir[:3000]
     assert "$B" not in ir, ir[:3000]
 
 
 @pytest.mark.integration
 def test_ritz1_multi_arg_mangles_on_every_arg(ritz1_bin, tmp_path):
-    """`HashMap<Key, Vec<Connection>>` mangles as HashMap$Key$Vec$Connection.
+    """`HashMap<Key, Vec<Connection>>` mangles as HashMap$Key_Vec_Connection.
 
     Not HashMap$Key (first argument only, #1574), and not HashMap$Connection
     (the tail's own generic clobbering a single global save slot, #1300).
     """
     ir = _compiled_ir("ritz1", tmp_path, "mangle", MULTI_ARG["multi_arg_field"])
-    assert "%HashMap$Key$Vec$Connection = type" in ir, ir[:3000]
+    assert "%HashMap$Key_Vec_Connection = type" in ir, ir[:3000]
     assert "HashMap$Connection" not in ir, ir[:3000]
-    assert not re.search(r"HashMap\$Key\b(?!\$)", ir), ir[:3000]
+    assert not re.search(r"HashMap\$Key\b", ir), ir[:3000]
+
+
+# --- spec §11.4 spelling of multi-argument names (AGAST #3446) --------------
+# Every type argument after the first `$` is joined by `_`, nested generics
+# included: ritz0 and LANGUAGE_SPEC.md §11.4 say `first$i32_u8`, and ritz1
+# used to say `first$i32$u8`, so the two compilers' symbols and struct types
+# disagreed for every multi-argument generic.  One program covers the three
+# shapes the ticket names: the repro, a 3-argument generic over a user type
+# whose name contains `_` (a `_`-split would see four arguments), and a nested
+# generic argument.
+
+SPEC_MANGLE = PAIR + BOX + """\
+struct my_t
+    x: i64
+
+struct Tri<A, B, C>
+    a: A
+    b: B
+    c: C
+
+fn first<A, B>(p: Pair<A, B>) -> A
+    p.first
+
+fn tfirst<A, B, C>(t: Tri<A, B, C>) -> A
+    t.a
+
+pub fn main() -> i32
+    let p = Pair<i32, u8> { first: 3, second: 4 }
+    let t = Tri<i32, my_t, u8> { a: 1, b: my_t { x: 9 }, c: 2 }
+    var bx: Box<i64>
+    bx.v = 2
+    let n = Pair<i64, Box<i64>> { first: 1, second: bx }
+    return first(p) + tfirst(t) + first(n) as i32 + n.second.v as i32
+"""
+
+SPEC_MANGLE_NAMES = [
+    "@first$i32_u8(",
+    "%Pair$i32_u8 = type",
+    "@tfirst$i32_my_t_u8(",
+    "%Tri$i32_my_t_u8 = type",
+    "@first$i64_Box_i64(",
+    "%Pair$i64_Box_i64 = type",
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_multi_arg_names_join_args_with_underscore(ritz1_bin, tmp_path, compiler):
+    """Both compilers define the §11.4 names; no `$` joins two arguments."""
+    ir = _compiled_ir(compiler, tmp_path, "spec_mangle", SPEC_MANGLE)
+    # ritz0 quotes names containing `$` and prefixes its struct types with
+    # `struct.<module>.`; ritz1 does neither.
+    bare = re.sub(r"%struct\.[A-Za-z0-9_]+\.", "%", ir.replace('"', ""))
+    for name in SPEC_MANGLE_NAMES:
+        assert name in bare, f"{compiler}: no {name}\n{ir[:3000]}"
+    assert not re.search(r"[@%][A-Za-z_][A-Za-z0-9_]*\$[A-Za-z0-9_]*\$", bare), ir[:3000]
+
+
+@pytest.mark.integration
+def test_ritz1_runs_spec_mangled_multi_arg(ritz1_bin, tmp_path):
+    """3 + 1 + 1 + 2: the `_`-spelled instances still link and run."""
+    assert _run("ritz1", tmp_path, "spec_mangle_run", SPEC_MANGLE) == EXPECTED

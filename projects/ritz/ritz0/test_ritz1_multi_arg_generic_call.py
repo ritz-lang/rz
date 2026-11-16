@@ -225,21 +225,22 @@ def test_ritz1_runs_multi_arg_generic_call(ritz1_bin, tmp_path, name):
 
 @pytest.mark.integration
 def test_ritz1_mangles_on_every_type_arg(ritz1_bin, tmp_path):
-    """`second<i64, i32>` instantiates `second$i64$i32` — ritz0's spelling."""
+    """`second<i64, i32>` instantiates `second$i64_i32` — ritz0's and §11.4's
+    spelling (ritz1 said `second$i64$i32` until AGAST #3446)."""
     ir = _compiled_ir("ritz1", tmp_path, "second_ir", GENERIC_CALLS["ticket_second"])
-    assert re.search(r"define[^\n]*@second\$i64\$i32\(", ir), ir[:3000]
-    assert re.search(r"call[^\n]*@second\$i64\$i32\(", ir), ir[:3000]
+    assert re.search(r"define[^\n]*@second\$i64_i32\(", ir), ir[:3000]
+    assert re.search(r"call[^\n]*@second\$i64_i32\(", ir), ir[:3000]
 
 
 @pytest.mark.integration
 def test_ritz1_forwarding_instantiates_only_concrete(ritz1_bin, tmp_path):
-    """`fwd<i64, i32>` calling `second<A, B>` yields second$i64$i32 and no
-    half-bound `second$i64$B` (registered between the A and B passes)."""
+    """`fwd<i64, i32>` calling `second<A, B>` yields second$i64_i32 and no
+    half-bound `second$i64_B` (registered between the A and B passes)."""
     ir = _compiled_ir(
         "ritz1", tmp_path, "fwd_ir", GENERIC_CALLS["forwarded_params"]
     )
-    assert re.search(r"define[^\n]*@second\$i64\$i32\(", ir), ir[:3000]
-    assert "second$i64$B" not in ir, ir[:3000]
+    assert re.search(r"define[^\n]*@second\$i64_i32\(", ir), ir[:3000]
+    assert "second$i64_B" not in ir, ir[:3000]
 
 
 # --- comparisons that must NOT become generic calls --------------------------

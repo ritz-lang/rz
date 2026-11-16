@@ -3769,8 +3769,10 @@ fn main() -> i32
 Generics are monomorphized at compile time; each instantiation generates
 specialized code. *Every* type argument participates in name mangling, joined
 by `_`: `Result<i32, StrView>` mangles to `Result$i32_StrView`, and
-`Result<i32, i32>` to `Result$i32_i32`. You can read the mangled names straight
-out of the emitted IR:
+`Result<i32, i32>` to `Result$i32_i32`. Only the first `$` survives: a
+nested generic argument is joined the same way, so `Box<Pair<i32, u8>>` is
+`Box$Pair_i32_u8` and `first<i64, Vec<i64>>` is `first$i64_Vec_i64`. You can
+read the mangled names straight out of the emitted IR:
 
 ```bash
 RITZ_PATH=$PWD python3 ritz0/ritz0.py prog.ritz -o prog.ll --no-runtime

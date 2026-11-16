@@ -573,7 +573,7 @@ fn main() -> i32
 
 # AGAST #2272: `()` as an argument to Result, a generic fn and Option, `Ok(())`
 # built and matched (bound and wildcard).  Exercises the zero-byte payload
-# layout: `Result$unit$i32` is { i8, [3 x i8], [4 x i8] }, as in ritz0.
+# layout: `Result$unit_i32` is { i8, [3 x i8], [4 x i8] }, as in ritz0.
 UNIT_ARG_USES = """\
 import ritzlib.result
 
@@ -723,7 +723,7 @@ def test_ritz1_unit_type_argument_uses(tmp_path, ritz1_bin, ritz_start):
         (
             "unit_uses",
             UNIT_ARG_USES,
-            "%Result$unit$i32 = type { i8, [3 x i8], [4 x i8] }",
+            "%Result$unit_i32 = type { i8, [3 x i8], [4 x i8] }",
         ),
         ("option_unit", OPTION_UNIT, "%Option$unit = type { i8, [0 x i8], [0 x i8] }"),
     ],
