@@ -37,6 +37,14 @@ fn is_message_too_long(r: Result<i64, CryptoError>) -> bool
                 CryptoError.MessageTooLong => true
                 _ => false
 
+fn is_invalid_length(r: Result<i64, CryptoError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) =>
+            match e
+                CryptoError.InvalidLength => true
+                _ => false
+
 # =============================================================================
 # RFC 8439 AEAD Test Vectors
 # =============================================================================
@@ -529,6 +537,86 @@ fn test_chacha20_poly1305_decrypt_too_long() -> i32
         return 1
     if untouched(@pt[0], 64) == 0
         return 2
+    return 0
+
+# -----------------------------------------------------------------------------
+# Negative lengths (AGAST #2744)
+#
+# A negative aad_len or text length skipped the data in the Poly1305 input but
+# still wrote the value, cast to u64, into the length block; decrypt clamped
+# a negative ct_len to 0 instead (#2577). Same policy as AES-GCM now: refuse
+# with InvalidLength before any buffer is read or written (fail closed).
+# -----------------------------------------------------------------------------
+
+const AEAD_MOST_NEGATIVE: i64 = -0x7FFFFFFFFFFFFFFF - 1
+
+# Run encrypt (decrypt = false) or decrypt with (aad_len, text_len) and require
+# InvalidLength with the output buffers untouched. Returns 0 on success,
+# 1 if not refused as InvalidLength, 2 if output was written.
+fn aead_refuses_2744(decrypt: bool, aad_len: i64, text_len: i64) -> i32
+    var key: [32]u8
+    var nonce: [12]u8
+    mem_zero(@key[0], 32)
+    mem_zero(@nonce[0], 12)
+    var aad: [16]u8
+    var input: [16]u8
+    var output: [16]u8
+    var tag: [16]u8
+    mem_zero(@aad[0], 16)
+    mem_zero(@input[0], 16)
+    fill_sentinel(@output[0], 16)
+    fill_sentinel(@tag[0], 16)
+
+    var refused: bool = false
+    if decrypt
+        refused = is_invalid_length(chacha20_poly1305_decrypt(@key[0], @nonce[0], @aad[0], aad_len, @input[0], text_len, @tag[0], @output[0]))
+    else
+        refused = is_invalid_length(chacha20_poly1305_encrypt(@key[0], @nonce[0], @aad[0], aad_len, @input[0], text_len, @output[0], @tag[0]))
+    if not refused
+        return 1
+    if untouched(@output[0], 16) == 0 or untouched(@tag[0], 16) == 0
+        return 2
+    return 0
+
+[[test]]
+fn test_chacha20_poly1305_encrypt_negative_pt_len() -> i32
+    let r1: i32 = aead_refuses_2744(false, 0, -1)
+    if r1 != 0
+        return r1
+    let r2: i32 = aead_refuses_2744(false, 16, AEAD_MOST_NEGATIVE)
+    if r2 != 0
+        return 10 + r2
+    return 0
+
+[[test]]
+fn test_chacha20_poly1305_encrypt_negative_aad_len() -> i32
+    let r1: i32 = aead_refuses_2744(false, -1, 16)
+    if r1 != 0
+        return r1
+    let r2: i32 = aead_refuses_2744(false, AEAD_MOST_NEGATIVE, 0)
+    if r2 != 0
+        return 10 + r2
+    return 0
+
+# Was clamped to 0 (#2577); now refused like everything else.
+[[test]]
+fn test_chacha20_poly1305_decrypt_negative_ct_len() -> i32
+    let r1: i32 = aead_refuses_2744(true, 0, -1)
+    if r1 != 0
+        return r1
+    let r2: i32 = aead_refuses_2744(true, 16, AEAD_MOST_NEGATIVE)
+    if r2 != 0
+        return 10 + r2
+    return 0
+
+[[test]]
+fn test_chacha20_poly1305_decrypt_negative_aad_len() -> i32
+    let r1: i32 = aead_refuses_2744(true, -1, 16)
+    if r1 != 0
+        return r1
+    let r2: i32 = aead_refuses_2744(true, AEAD_MOST_NEGATIVE, 0)
+    if r2 != 0
+        return 10 + r2
     return 0
 
 # A forged tag is refused and the plaintext buffer is left untouched.

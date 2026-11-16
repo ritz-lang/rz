@@ -47,6 +47,21 @@ fn store64_le(dst: *u8, val: u64) -> void
 # 2^32 - 1 blocks of 64 bytes.
 pub const CHACHA20_POLY1305_MAX_LEN: i64 = 0xFFFFFFFF * 64
 
+# Refuse lengths the construction does not define, before any buffer is read
+# or written. Ok = text_len.
+# A negative length is InvalidLength (AGAST #2744): the tag would skip the data
+# but write the value, cast to u64, into the length block. Decrypt used to
+# clamp a negative ct_len to 0 (#2577); refusing instead matches AES-GCM and
+# fails closed on a caller's length bug.
+fn aead_check_lengths(aad_len: i64, text_len: i64) -> Result<i64, CryptoError>
+    if text_len < 0
+        return Err(CryptoError.InvalidLength)
+    if aad_len < 0
+        return Err(CryptoError.InvalidLength)
+    if text_len > CHACHA20_POLY1305_MAX_LEN
+        return Err(CryptoError.MessageTooLong)
+    Ok(text_len)
+
 # Poly1305 tag over AAD and ciphertext (step 3-4 above).
 fn aead_compute_tag(poly_key: *u8, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8) -> void
     var poly_ctx: Poly1305
@@ -78,11 +93,10 @@ fn aead_compute_tag(poly_key: *u8, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64,
     poly1305_final(@poly_ctx, tag)
 
 # Encrypt pt into ct and write the 16-byte tag. Ok = ciphertext length.
-# Err(MessageTooLong) if pt_len > CHACHA20_POLY1305_MAX_LEN; then nothing is
-# read or written.
+# Err(InvalidLength) if pt_len or aad_len is negative; Err(MessageTooLong) if
+# pt_len > CHACHA20_POLY1305_MAX_LEN. Either way nothing is read or written.
 pub fn chacha20_poly1305_encrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
-    if pt_len > CHACHA20_POLY1305_MAX_LEN
-        return Err(CryptoError.MessageTooLong)
+    aead_check_lengths(aad_len, pt_len)?
 
     # Encrypt plaintext starting at counter=1. This is the one fallible step;
     # it runs before the Poly1305 key exists, so no early return can leave
@@ -98,22 +112,18 @@ pub fn chacha20_poly1305_encrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, p
     Ok(n)
 
 # Verify the tag, then decrypt ct into pt. Ok = plaintext length.
-# Err(MessageTooLong) if ct_len > CHACHA20_POLY1305_MAX_LEN (nothing is read
-# or written); Err(AuthenticationFailed) if the tag does not verify (pt is
-# left untouched).
+# Err(InvalidLength) if ct_len or aad_len is negative, Err(MessageTooLong) if
+# ct_len > CHACHA20_POLY1305_MAX_LEN (either way nothing is read or written);
+# Err(AuthenticationFailed) if the tag does not verify (pt is left untouched).
 pub fn chacha20_poly1305_decrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
-    if ct_len > CHACHA20_POLY1305_MAX_LEN
-        return Err(CryptoError.MessageTooLong)
+    aead_check_lengths(aad_len, ct_len)?
 
     var poly_key: [64]u8
     chacha20_block(key, 0, nonce, @poly_key[0])
 
     # Verify tag first
     var computed_tag: [16]u8
-    var len: i64 = ct_len
-    if len < 0
-        len = 0
-    aead_compute_tag(@poly_key[0], aad, aad_len, ct, len, @computed_tag[0])
+    aead_compute_tag(@poly_key[0], aad, aad_len, ct, ct_len, @computed_tag[0])
     mem_zero(@poly_key[0], 64)
 
     # Constant-time tag comparison. computed_tag is the valid tag for the
@@ -125,5 +135,5 @@ pub fn chacha20_poly1305_decrypt(key: *u8, nonce: *u8, aad: *u8, aad_len: i64, c
         return Err(CryptoError.AuthenticationFailed)
 
     # Decrypt ciphertext
-    let n: i64 = chacha20_xor(key, nonce, 1, ct, len, pt)?
+    let n: i64 = chacha20_xor(key, nonce, 1, ct, ct_len, pt)?
     Ok(n)
