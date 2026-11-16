@@ -14,7 +14,8 @@ alloca hoisting; it was a race that any compiler column could lose.
 
 Two checks:
   * unit: no file in ritz0/test names a literal /tmp path, so the whole
-    class of collision is caught before it gets a chance to flake.
+    class of collision is caught before it gets a chance to flake. The same
+    lint covers examples/**/test (#1738): rooms gate those concurrently too.
   * integration: the level11 file tests run 4-way concurrently, many rounds,
     with zero failures. Against the fixed-path version this fails reliably
     (~1% of runs per test, over 800 runs per test).
@@ -85,6 +86,25 @@ def test_no_matrix_test_file_uses_a_fixed_tmp_path():
     assert offenders == {}, (
         "matrix runs each file under 3 compilers concurrently; a fixed /tmp "
         f"path makes them race. Build a per-pid path instead: {offenders}"
+    )
+
+
+EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
+
+
+@pytest.mark.unit
+def test_no_example_test_file_uses_a_fixed_tmp_path():
+    """Example tests gate concurrently across rooms on one host (#1738)."""
+    files = sorted(EXAMPLES_DIR.glob("**/test/**/*.ritz"))
+    assert files, f"no example tests found under {EXAMPLES_DIR}"
+    offenders = {
+        str(path.relative_to(EXAMPLES_DIR)): hits
+        for path in files
+        if (hits := fixed_tmp_paths(path.read_text()))
+    }
+    assert offenders == {}, (
+        "example tests run concurrently when rooms gate on one host; a fixed "
+        f"/tmp path makes them race. Build a per-pid path instead: {offenders}"
     )
 
 

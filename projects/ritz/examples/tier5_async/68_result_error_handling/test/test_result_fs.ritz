@@ -14,9 +14,31 @@ fn read_matches(r: *Result<String, i32>, want: StrView) -> i32
         Ok(s) => string_eq(@s, want) as i32
         Err(_) => 0
 
+# "/tmp/ritz_test_rfs_<tag>_<pid>". The pid keeps concurrent runs (rooms
+# gating on one host) off each other's files: a shared fixed path let one
+# run's O_TRUNC race another's read-back (AGAST #1735, #1738). Caller drops.
+fn rfs_tmp_path(tag: StrView) -> String
+    var s: String = string_from_strview("/tmp/ritz_test_rfs_")
+    string_push_str(@&s, tag)
+    string_push(@&s, '_')
+    string_push_i64(@&s, sys_getpid() as i64)
+    s
+
+[[test]]
+fn test_tmp_path_is_per_process() -> i32
+    var p: String = rfs_tmp_path("x")
+    var want: String = string_from_strview("/tmp/ritz_test_rfs_x_")
+    string_push_i64(@&want, sys_getpid() as i64)
+    let ok: bool = string_eq_string(@p, @want)
+    string_drop(@&p)
+    string_drop(@&want)
+    assert ok
+    0
+
 [[test]]
 fn test_write_and_read_file() -> i32
-    let path: StrView = "/tmp/ritz_test_rw.txt"
+    var path_s: String = rfs_tmp_path("rw")
+    let path: StrView = string_as_view(@path_s)
 
     var w_res: Result<i64, i32> = write_file(path, "Hello, Result!")
     if result_is_err<i64, i32>(@w_res) == 1
@@ -24,20 +46,24 @@ fn test_write_and_read_file() -> i32
 
     var r_res: Result<String, i32> = read_file(path)
     unlink(path)
+    string_drop(@&path_s)
     if read_matches(@r_res, "Hello, Result!") == 0
         return 2
     return 0
 
 [[test]]
 fn test_read_nonexistent_file() -> i32
-    var r_res: Result<String, i32> = read_file("/tmp/does_not_exist_xyz123.txt")
+    var path_s: String = rfs_tmp_path("missing")
+    var r_res: Result<String, i32> = read_file(string_as_view(@path_s))
+    string_drop(@&path_s)
     if result_is_err<String, i32>(@r_res) == 1
         return 0
     return 1
 
 [[test]]
 fn test_mkdir_and_rmdir() -> i32
-    let path: StrView = "/tmp/ritz_test_dir"
+    var path_s: String = rfs_tmp_path("dir")
+    let path: StrView = string_as_view(@path_s)
 
     var mk: Result<i32, i32> = mkdir(path, 493)  # 0755 octal = 493 decimal
     if unit_failed(@mk) == 1
@@ -50,25 +76,33 @@ fn test_mkdir_and_rmdir() -> i32
     if unit_failed(@rm) == 1
         return 3
 
-    if path_exists(path)
+    let still_there: bool = path_exists(path)
+    string_drop(@&path_s)
+    if still_there
         return 4
     return 0
 
 [[test]]
 fn test_copy_file() -> i32
-    let src: StrView = "/tmp/ritz_test_src.txt"
-    let dst: StrView = "/tmp/ritz_test_dst.txt"
+    var src_s: String = rfs_tmp_path("src")
+    var dst_s: String = rfs_tmp_path("dst")
+    let src: StrView = string_as_view(@src_s)
+    let dst: StrView = string_as_view(@dst_s)
 
     write_file(src, "Content to copy")
 
     var cp_res: Result<i64, i32> = copy_file(src, dst, 420)  # 0644 octal = 420 decimal
     if result_is_err<i64, i32>(@cp_res) == 1
         unlink(src)
+        string_drop(@&src_s)
+        string_drop(@&dst_s)
         return 1
 
     var r_res: Result<String, i32> = read_file(dst)
     unlink(src)
     unlink(dst)
+    string_drop(@&src_s)
+    string_drop(@&dst_s)
     if read_matches(@r_res, "Content to copy") == 0
         return 2
     return 0
