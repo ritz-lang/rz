@@ -3701,8 +3701,8 @@ class LLVMEmitter:
             # Preserve source_file for separate compilation
             if hasattr(method, 'source_file'):
                 mangled_method.source_file = method.source_file
-            # The method as declared, for its visibility (AGAST #3416). The
-            # copy itself stays non-`pub`: its linkage is what it always was.
+            # The method as declared, for its visibility (AGAST #3416) and,
+            # when `pub`, its external linkage (#3495, _declare_function).
             mangled_method.declared_method = method
             # Declare the mangled function
             self._declare_function(mangled_method)
@@ -5195,8 +5195,14 @@ class LLVMEmitter:
         # Exception: 'main' always needs external linkage so runtime _start can call it
         # Exception: When no_runtime is set (separate compilation), all functions are external
         #            since other modules may need to call them
+        # A `pub` impl method is exported as a `pub fn` is: its copy's
+        # `declared_method` holds the visibility (AGAST #3416).  ritzlib's
+        # `impl String` (AGAST #3495) is called from other objects, and ritz1
+        # already exports impl methods.
         if not getattr(self, 'no_runtime', False):
-            if not fn_def.is_pub and fn_def.name != 'main' and self._should_emit_body(fn_def):
+            is_pub = fn_def.is_pub or getattr(
+                getattr(fn_def, 'declared_method', None), 'is_pub', False)
+            if not is_pub and fn_def.name != 'main' and self._should_emit_body(fn_def):
                 fn.linkage = 'internal'
 
         # Create DISubprogram for debug info (only for functions we'll define, not declarations)

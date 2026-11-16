@@ -237,13 +237,14 @@ def _called_symbols(compiler: str, tmp_path: Path) -> set:
 @pytest.mark.integration
 def test_repro_calls_same_symbols_as_ritz0(ritz1_bin, tmp_path):
     r0, _ = _called_symbols("ritz0", tmp_path)
-    r1, r1_text = _called_symbols("ritz1", tmp_path)
-    want = {"string_new", "string_push_str", "string_len"}
+    r1, _ = _called_symbols("ritz1", tmp_path)
+    # LARB R66 (AGAST #3495): `impl String` wraps the free fns, and an impl
+    # method wins over the table, so both now call the wrappers. ritzlib's
+    # string.ritz defines `String_*` now; the #1368 defect was ritz1 naming
+    # one nothing defined, which the runtime cases above still link.
+    want = {"string_new", "String_push_str", "String_len"}
     assert want <= r0, r0
     assert want <= r1, r1
-    assert "@String_" not in r1_text, [
-        ln for ln in r1_text.splitlines() if "@String_" in ln
-    ]
 
 
 # Delimits ritz1's table so this test can read it without a Ritz parser.

@@ -1273,7 +1273,11 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
             track_method_init_local(m, s.var_name, s.var_name_len, s.var_init)
         else if s.var_init != null and s.var_init.kind == EXPR_CALL and s.var_init.call_type_suffix_len == 0
             # `var w = ms()`: a plain fn's return type, as an annotation of it.
-            let call_fn: *FnDef = find_fn_in_module(m, s.var_init.func_name, s.var_init.func_name_len)
+            var call_fn: *FnDef = find_fn_in_module(m, s.var_init.func_name, s.var_init.func_name_len)
+            # AGAST #3495: or an impl method by its symbol, `String_from` as
+            # rewrite_static_ufcs_call names `String.from(..)`.
+            if call_fn == null
+                call_fn = find_impl_method_by_symbol(m, s.var_init.func_name, s.var_init.func_name_len)
             if call_fn != null and call_fn.type_params == null
                 track_typed_local(s.var_name, s.var_name_len, call_fn.return_type, call_fn.return_type_name, call_fn.return_type_name_len)
         if s.var_init != null
@@ -1486,6 +1490,10 @@ fn rewrite_enum_from_call(m: *Module, e: *Expr)
 # name doesn't shadow it, in ritz0 either.  As a plain call, `let s =
 # String.new()` is typed by its callee's return like `let s = string_new()`.
 # Anything else is left to emit_expr_method, which refuses it.
+# AGAST #3495 (LARB R66): a static method of the type's impl (ritzlib's
+# `impl String` wraps `string_from` as `from`) is the call `String_from(x)`
+# instead, the impl method's own symbol, typed by it (#2447).  Left to
+# emit_expr_method, a global of the type's name made the receiver a value.
 fn rewrite_static_ufcs_call(m: *Module, e: *Expr)
     if e.kind != EXPR_METHOD or e.left == null or e.left.kind != EXPR_IDENT
         return
@@ -1497,7 +1505,23 @@ fn rewrite_static_ufcs_call(m: *Module, e: *Expr)
         return
     if g_ufcs_shadowed == 1
         return
-    if impl_has_method(m, tn, tn_len, e.ident_ptr, e.ident_len) == 1
+    let im: *FnDef = impl_method_named(m, tn, tn_len, e.ident_ptr, e.ident_len)
+    if im != null
+        # A `self` method called on the type is emit_expr_method's refusal.
+        if param_is_self(im.params) == 1
+            return
+        let ilen: i32 = tn_len + 1 + e.ident_len
+        let iname: *u8 = malloc(ilen as i64 + 1)
+        memcpy(iname, tn, tn_len as i64)
+        *(iname + tn_len) = '_'
+        memcpy(iname + tn_len + 1, e.ident_ptr, e.ident_len as i64)
+        *(iname + ilen) = 0
+        e.kind = EXPR_CALL
+        e.func_name = iname
+        e.func_name_len = ilen
+        e.call_type_suffix = null
+        e.call_type_suffix_len = 0
+        e.left = null
         return
     let len: i32 = pfx_len + e.ident_len
     let name: *u8 = malloc(len as i64 + 1)
@@ -1514,18 +1538,18 @@ fn rewrite_static_ufcs_call(m: *Module, e: *Expr)
     e.call_type_suffix_len = 0
     e.left = null
 
-# 1 when an impl of `tn` (any, generic or not) has a method `meth`.
-fn impl_has_method(m: *Module, tn: *u8, tn_len: i32, meth: *u8, meth_len: i32) -> i32
+# The method `meth` of an impl of `tn` (any, generic or not), or null.
+fn impl_method_named(m: *Module, tn: *u8, tn_len: i32, meth: *u8, meth_len: i32) -> *FnDef
     var ib: *ImplBlock = m.impls
     while ib != null
         if buf_eq(ib.type_name, ib.type_name_len, tn, tn_len) == 1
             var f: *FnDef = ib.methods
             while f != null
                 if buf_eq(f.name, f.name_len, meth, meth_len) == 1
-                    return 1
+                    return f
                 f = f.next
         ib = ib.next
-    return 0
+    return null
 
 # ----------------------------------------------------------------------------
 # Indexing a struct (LANGUAGE_SPEC §7.8, LARB R15, AGAST #1635): `m[k]` on a

@@ -70,7 +70,8 @@ fn main() -> i32
 IR_CASES = {
     "span": (REPRO, "span_is_empty$u8"),
     "strview": (STRVIEW, "strview_is_empty"),
-    "string": (STRING, "string_is_empty"),
+    # `impl String`'s wrapper of string_is_empty (LARB R66, AGAST #3495).
+    "string": (STRING, "String_is_empty"),
 }
 
 

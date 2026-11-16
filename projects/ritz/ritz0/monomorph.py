@@ -1386,10 +1386,14 @@ class Monomorphizer:
         # (the emitter's #1321 fallback), so `var t = String.from(..)` is a
         # String and `t.data.push(..)` registers vec_push<u8>.  A binding of
         # that name is a value, not the type.
+        # AGAST #3495: with the method in the type's impl (ritzlib's `impl
+        # String`, LARB R66), the impl method's return types it instead.
         if (isinstance(expr.expr, rast.Ident)
                 and expr.expr.name in UFCS_NON_GENERIC_PREFIXES
-                and expr.expr.name not in self.var_types
-                and expr.method not in self.impl_methods.get(expr.expr.name, {})):
+                and expr.expr.name not in self.var_types):
+            method = self.impl_methods.get(expr.expr.name, {}).get(expr.method)
+            if method is not None:
+                return method.ret_type
             free = self.fn_signatures.get(
                 UFCS_NON_GENERIC_PREFIXES[expr.expr.name] + expr.method)
             if free is not None:
