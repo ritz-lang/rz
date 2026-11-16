@@ -423,9 +423,44 @@ fn gi_bind(b: *GiBind, idx: i32, s: *u8, n: i32)
     if pl != n or memcmp(prev, s, n as i64) != 0
         *(b.conflict + idx) = 1
 
+# Match one `$`-component of a param type name, `_`-piece by `_`-piece
+# (`ptr_A`, `arr2_A`, `ptr_ptr_A`), against the argument from `ai` (#3516).
+# A param piece takes one argument piece, or the whole mangled argument when
+# it is the component's last (`ptr_Vec$u8` binds A = `Vec$u8`).  Other pieces
+# match exactly, so a component naming no param is a plain comparison.  Like
+# gi_match_mangled, it binds as it goes.  The argument end, or -1 for no match.
+fn gi_match_pieces(m: *Module, tps: *TypeParam, p: *u8, plen: i32, a: *u8, alen: i32, ai: i32, b: *GiBind) -> i32
+    var pi: i32 = 0
+    var x: i32 = ai
+    while pi < plen
+        var pe: i32 = pi
+        while pe < plen and *(p + pe) != 95   # '_'
+            pe = pe + 1
+        let idx: i32 = type_param_index(tps, p + pi, pe - pi)
+        var xe: i32 = x
+        if idx >= 0 and pe == plen
+            xe = mangled_arg_end(m, a, alen, x)
+        else
+            while xe < alen and *(a + xe) != 95 and *(a + xe) != 36   # '_' '$'
+                xe = xe + 1
+        if idx >= 0
+            gi_bind(b, idx, a + x, xe - x)   # an empty piece binds nothing
+        else if xe - x != pe - pi or memcmp(p + pi, a + x, (pe - pi) as i64) != 0
+            return -1
+        x = xe
+        if pe < plen
+            if x >= alen or *(a + x) != 95
+                return -1
+            x = x + 1
+        pi = pe + 1
+    if x < alen and *(a + x) != 36
+        return -1
+    x
+
 # Match a mangled param type name (`Vec$T`, `Pair$T$U`) against an
 # argument's (`Vec$u64`), component by component: a type param's component
-# takes one whole mangled argument (`Vec$u8` in `Vec$Vec$u8`).
+# takes one whole mangled argument (`Vec$u8` in `Vec$Vec$u8`), and any other
+# binds what its `_`-pieces name (`Box2$ptr_A` against `Box2$ptr_u8`).
 fn gi_match_mangled(m: *Module, tps: *TypeParam, p: *u8, plen: i32, a: *u8, alen: i32, b: *GiBind)
     var pi: i32 = 0
     var ai: i32 = 0
@@ -441,9 +476,8 @@ fn gi_match_mangled(m: *Module, tps: *TypeParam, p: *u8, plen: i32, a: *u8, alen
             ae = mangled_arg_end(m, a, alen, ai)
             gi_bind(b, idx, a + ai, ae - ai)
         else
-            while ae < alen and *(a + ae) != 36
-                ae = ae + 1
-            if ae - ai != pe - pi or memcmp(p + pi, a + ai, (pe - pi) as i64) != 0
+            ae = gi_match_pieces(m, tps, p + pi, pe - pi, a, alen, ai, b)
+            if ae < 0
                 return
         pi = pe + 1
         ai = ae + 1

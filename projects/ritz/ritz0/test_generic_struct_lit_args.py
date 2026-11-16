@@ -199,6 +199,21 @@ R51A_INFERS = {
     "outer_param_field": (ALL, "struct W2<A>\n    t: Box2<A>\n"
                           "fn main() -> i32\n    let x: u8 = 5\n    let w = W2 { t: Box2 { v: x } }\n"
                           "    sizeof(w.t.v) as i32 * 10 + w.t.v as i32\n", 15),
+    # ...through a pointer (#3516): the inner literal is a Box2<*u8>, and A
+    # binds from the `ptr_A` piece of `Box2$ptr_A`, not a whole component.
+    # `f` takes only a W3<u8> (any other A is a parameter mismatch): ritz1
+    # can't size `*w.t.v` through the instance yet (#3747).
+    "outer_param_ptr_field": (ALL, "struct W3<A>\n    t: Box2<*A>\n"
+                              "fn f(w: W3<u8>) -> i32\n    *w.t.v as i32 + 10\n"
+                              "fn main() -> i32\n    var x: u8 = 7\n    let w = W3 { t: Box2 { v: @x } }\n"
+                              "    f(w)\n", 17),
+    # ...where the piece is a whole mangled generic: `ptr_A` against
+    # `ptr_Box2$u8` binds A = Box2$u8, not `Box2` (`w.t.v.v` is #3748).
+    "outer_param_ptr_generic_field": (ALL, "struct W3<A>\n    t: Box2<*A>\n"
+                                      "fn f(w: W3<Box2<u8>>) -> i32\n    10\n"
+                                      "fn main() -> i32\n    let x: u8 = 7\n    var b = Box2 { v: x }\n"
+                                      "    let w = W3 { t: Box2 { v: @b } }\n"
+                                      "    f(w) + b.v as i32\n", 17),
     # The same principle: a generic fn's concrete param is its argument's
     # slot, its `6` a u8.
     "generic_fn_known_param": (ALL, TAGGED + "fn g<U>(x: U, t: Tagged<u8>, b: Box2<u8>) -> i32\n"
@@ -217,6 +232,39 @@ R51A_ERRORS = {
                               "    w.t.n\n", "14:26",
                               "can't infer `X` for `Tag2`: write its type arguments, "
                               "`Tag2<X, Y> { .. }`"),
+    # #3516: a `_`-piece match is exact.  `Two$ptr$u8` (a struct named `ptr`)
+    # is no `Two$ptr_A$u8`: A doesn't bind the `u8` past the `$`.
+    "ptr_piece_needs_its_param": (ALL, "struct ptr\n    n: i32\n"
+                                  "struct W5<A>\n    t: Two<*A, u8>\n"
+                                  "fn main() -> i32\n    let y: u8 = 2\n"
+                                  "    let w = W5 { t: Two { a: ptr { n: 1 }, b: y } }\n    0\n",
+                                  "14:13", "can't infer `A` for `W5`: write its type arguments, "
+                                  "`W5<A> { .. }`"),
+    # ...and a whole component: `My` is no prefix of `My_B`, so A doesn't bind
+    # the `B`.  ritz0, whose mangling differs, refuses the field instead.
+    "piece_is_a_whole_component": (("ritz1", "ritz1_selfhosted"),
+                                   "struct My\n    n: i32\nstruct My_B\n    n: i32\n"
+                                   "struct W6<A>\n    t: Two<My, A>\n"
+                                   "fn main() -> i32\n    let x: u8 = 1\n"
+                                   "    let w = W6 { t: Two { a: My_B { n: 1 }, b: x } }\n    0\n",
+                                   "16:13", "can't infer `A` for `W6`: write its type arguments, "
+                                   "`W6<A> { .. }`"),
+    # ...nor `Mz`, the same length, for `My`.
+    "piece_is_its_name": (("ritz1", "ritz1_selfhosted"),
+                          "struct My\n    n: i32\nstruct Mz\n    n: i32\n"
+                          "struct W8<A>\n    t: Two<My, A>\n"
+                          "fn main() -> i32\n    let x: u8 = 1\n"
+                          "    let w = W8 { t: Two { a: Mz { n: 1 }, b: x } }\n    0\n",
+                          "16:13", "can't infer `A` for `W8`: write its type arguments, "
+                          "`W8<A> { .. }`"),
+    # ...nor of `MyX`: a piece matches the whole name.
+    "piece_is_a_whole_name": (("ritz1", "ritz1_selfhosted"),
+                              "struct My\n    n: i32\nstruct MyX\n    n: i32\n"
+                              "struct W7<A>\n    t: Two<My, A>\n"
+                              "fn main() -> i32\n    let x: u8 = 1\n"
+                              "    let w = W7 { t: Two { a: MyX { n: 1 }, b: x } }\n    0\n",
+                              "16:13", "can't infer `A` for `W7`: write its type arguments, "
+                              "`W7<A> { .. }`"),
 }
 
 
