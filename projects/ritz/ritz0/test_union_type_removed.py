@@ -153,8 +153,8 @@ def test_ritz1_keeps(request, tmp_path, compiler, name):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 def test_ritz1_closure_pipe_is_not_a_union(request, tmp_path, compiler):
-    """ritz1 has no closures: `|x: i32|` is still just an unexpected `|`."""
+    """ritz1 has no closures: `|x: i32|` is refused as one (#3471), not a union."""
     out, ll = _ritz1(request, compiler, tmp_path,
                      "fn main() -> i32\n    let g = |x: i32| x + 1\n    0\n")
     assert not ll.exists(), out[-800:]
-    assert UNION_MSG not in out and "unexpected '|'" in out, f"{compiler}:\n{out[-800:]}"
+    assert UNION_MSG not in out and "closures aren't supported" in out, f"{compiler}:\n{out[-800:]}"
