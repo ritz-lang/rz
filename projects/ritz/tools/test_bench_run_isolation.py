@@ -75,6 +75,21 @@ def _would_kill(out: str) -> list:
     return [int(p) for p in m[1].split()]
 
 
+def _listed_pids(out: str) -> set:
+    """Every pid run.sh names: the ABORT `(pids: ...)` list and the dry-run
+    `cleanup would kill:` list, parsed as whole numbers.
+
+    Never test `str(pid) in stderr`: stderr also carries 5-digit ports, so a
+    4-digit pid substring-matches a port it has nothing to do with (#3736).
+    """
+    pids = set()
+    for m in re.finditer(
+        r"\(pids:([ \d]*)\)|cleanup would kill:([ \d]*)$", out, re.MULTILINE
+    ):
+        pids.update(int(p) for p in (m[1] or m[2] or "").split())
+    return pids
+
+
 @pytest.fixture
 def worktrees(tmp_path):
     """Two fake worktrees, each with its own copy of bench/run.sh."""
@@ -178,13 +193,35 @@ def test_port_overrides_are_honoured():
 # ── orphan guard ────────────────────────────────────────────────────────
 
 
+def test_listed_pids_reads_only_pid_lists_not_substrings():
+    """A pid is "listed" only as a whole number in a pid list (AGAST #3736).
+
+    CI pids are often 4 digits, and the dry-run stderr also prints 5-digit
+    ephemeral ports: pid 3887 is a substring of port 38871 but is not
+    listed.  A bare `str(pid) in stderr` mistook one for the other.
+    """
+    quiet = (
+        "[bench] dry-run: port PORT_DIRECT=38871\n"
+        "[bench] dry-run: no orphaned bench binaries under x/build\n"
+        "[bench] dry-run: cleanup would kill: 13887\n"
+    )
+    assert 3887 not in _listed_pids(quiet)
+    assert _listed_pids(quiet) == {13887}
+    abort = (
+        "[bench] ABORT: this worktree's bench binaries still running "
+        "(pids: 38870 3887)\n"
+        "[bench]        check they are yours, then:  kill -9 38870 3887\n"
+    )
+    assert _listed_pids(abort) == {38870, 3887}
+
+
 @pytest.mark.parametrize("server", SERVERS)
 def test_guard_ignores_another_worktrees_server(worktrees, decoy, server):
     room_a, room_b = worktrees
     other = decoy(room_b, server)
     r = _run(room_a / "bench" / "run.sh", "--dry-run")
     assert r.returncode == 0, r.stderr
-    assert str(other.pid) not in r.stderr
+    assert other.pid not in _listed_pids(r.stderr), r.stderr
     assert other.poll() is None
 
 
@@ -193,7 +230,7 @@ def test_guard_still_aborts_on_this_worktrees_own_orphan(worktrees, decoy):
     mine = decoy(room_a, "zeus")
     r = _run(room_a / "bench" / "run.sh", "--dry-run")
     assert r.returncode == 1, r.stderr
-    assert "ABORT" in r.stderr and str(mine.pid) in r.stderr
+    assert "ABORT" in r.stderr and mine.pid in _listed_pids(r.stderr), r.stderr
     assert mine.poll() is None  # reported, never killed
 
 
