@@ -29,12 +29,11 @@ _spec.loader.exec_module(RULE)
 
 COMPILERS = ["ritz1", "ritz1_selfhosted"]
 
-# ritz1-only cases on top of ritz0's tables: the whole-binding forms (ritz0
-# tests those elsewhere) and the statement shapes ritz1's grammar gives
-# their own AST kinds (`a[i] =`, `p.f[i] =`, compound forms).
+# ritz1-only cases on top of ritz0's tables: the statement shapes ritz1's
+# grammar gives their own AST kinds (`a[i] =`, `p.f[i] =`, compound forms).
+# Whole-binding `x = v` / `x op= v` cases live only in ritz0's
+# WHOLE_REJECTED / WHOLE_ACCEPTED, run below (AGAST #2033).
 EXTRA_REJECTED = [
-    ("whole-binding", "let k: i64 = 4\nk = 5", "k", "whole"),
-    ("whole-binding-compound", "let k: i64 = 4\nk += 5", "k", "whole"),
     ("small-array-elem-compound", "let a: [4]i64 = [1, 2, 3, 4]\na[0] += 9", "a", "assign"),
     ("large-array-field-elem-compound", "let b: Big = big_new()\nb.data[7] += 3", "b", "assign"),
     ("large-nested-field-compound", "let b: Big = big_new()\nb.pt.x += 3", "b", "assign"),
@@ -46,7 +45,6 @@ EXTRA_REJECTED = [
 ]
 
 EXTRA_ACCEPTED = [
-    ("var-whole-binding", "var k: i64 = 4\nk = 5\nk += 1"),
     ("let-ptr-deref", "var k: i64 = 4\nlet p: *i64 = @&k\n*p = 5"),
     ("let-ptr-compound-field", "var v = Pt { x: 1, y: 2 }\nlet p: *Pt = @&v\np.x += 3"),
 ]
@@ -99,6 +97,29 @@ def test_ritz1_rejects_mutating_a_let(compilers, tmp_path, compiler, body, name,
 @pytest.mark.parametrize("body", [a[1] for a in ACCEPTED], ids=[a[0] for a in ACCEPTED])
 def test_ritz1_accepts_non_let_mutation(compilers, tmp_path, compiler, body):
     """The load-bearing controls: without them, rejecting everything passes."""
+    r, out = _compile(compilers[compiler], tmp_path, body)
+    assert r.returncode == 0, f"{compiler} rejected:\n{body}\n{out[-2000:]}"
+    assert "`let` binding" not in out
+
+
+# AGAST #2033: whole-binding assignment, from ritz0's own table, so both
+# compilers run the same cases (ritz0's run is test_let_immutability.py).
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("body,name", [r[1:] for r in RULE.WHOLE_REJECTED],
+                         ids=[r[0] for r in RULE.WHOLE_REJECTED])
+def test_ritz1_rejects_assigning_a_let(compilers, tmp_path, compiler, body, name):
+    r, out = _compile(compilers[compiler], tmp_path, body)
+    assert r.returncode != 0, f"{compiler} compiled an assignment to `let {name}`:\n{body}"
+    assert _want(name, "whole") in out, out[-2000:]
+    assert "prog.ritz:" in out, out[-2000:]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("body", [a[1] for a in RULE.WHOLE_ACCEPTED],
+                         ids=[a[0] for a in RULE.WHOLE_ACCEPTED])
+def test_ritz1_accepts_assigning_a_var(compilers, tmp_path, compiler, body):
     r, out = _compile(compilers[compiler], tmp_path, body)
     assert r.returncode == 0, f"{compiler} rejected:\n{body}\n{out[-2000:]}"
     assert "`let` binding" not in out
