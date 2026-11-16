@@ -327,6 +327,139 @@ def test_store_into_method_result(tmp_path, compiler, name):
     assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
 
 
+# `(e as *T)[i] = v` and `(q + k)[i] = v`: a cast or pointer-arithmetic base
+# stores through the `*T` it names, base, index, then value (LARB R61).
+# ritz1 stored through the VALUE of `x[i]` (AGAST #3565): a SIGSEGV.  One row
+# per pointee shape and base kind; `arr()` (6) roots the arithmetic rows so
+# the base's place in the order shows.
+EXPR_BASE = {
+    "cast_scalar": ("""\
+var P: i64 = 0
+
+fn base() -> i64
+    D = D * 10 + 6
+    return P
+
+fn val(x: i32) -> i32
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var a: [3]i32 = [1, 2, 4]
+    P = @a[0] as i64
+    (base() as *i32)[idx(1)] = val(3)
+    D = ((D * 10 + a[0] as i64) * 10 + a[1] as i64) * 10 + a[2] as i64
+""", "f()", 678134),
+    "cast_struct": ("""\
+var P: i64 = 0
+
+fn base() -> i64
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    P = @a[0] as i64
+    (base() as *S)[idx(1)] = mk(3)
+""", "f()", 67813),
+    "arith_scalar": ("""\
+var P: *i32 = null
+
+fn arr() -> *i32
+    D = D * 10 + 6
+    return P
+
+fn val(x: i32) -> i32
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var a: [3]i32 = [1, 2, 4]
+    P = @a[0]
+    (arr() + 1)[idx(1)] = val(3)
+    D = ((D * 10 + a[0] as i64) * 10 + a[1] as i64) * 10 + a[2] as i64
+""", "f()", 678123),
+    # A `*S` local root: `q + 1` names a[1].
+    "arith_struct": ("""\
+fn f()
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    let q: *S = @a[0]
+    (q + 1)[idx(0)] = mk(3)
+""", "f()", 7813),
+    # `**i32`: the element stored is a pointer, through a cast and through
+    # arithmetic on a `**i32` local.
+    "pointer": ("""\
+var P: i64 = 0
+
+fn base() -> i64
+    D = D * 10 + 6
+    return P
+
+fn val(p: *i32) -> *i32
+    D = D * 10 + 8
+    return p
+
+fn f()
+    var x: i32 = 1
+    var y: i32 = 3
+    var ps: [3]*i32 = [@x, @x, @x]
+    P = @ps[0] as i64
+    (base() as **i32)[idx(1)] = val(@y)
+    let q: **i32 = @ps[0]
+    (q + 1)[1] = @y
+    D = ((D * 10 + *ps[0] as i64) * 10 + *ps[1] as i64) * 10 + *ps[2] as i64
+""", "f()", 678133),
+    # A global root under arithmetic, and a parenthesised `*i32` local.
+    "global_and_name_roots": ("""\
+var G: *i32 = null
+
+fn f()
+    var a: [3]i32 = [1, 2, 4]
+    G = @a[0]
+    let p: *i32 = @a[0]
+    (G + 1)[idx(1)] = 5
+    (p)[0] = 3
+    D = ((D * 10 + a[0] as i64) * 10 + a[1] as i64) * 10 + a[2] as i64
+""", "f()", 7325),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(EXPR_BASE))
+def test_store_into_cast_or_arith_base(tmp_path, compiler, name):
+    body, call, want = EXPR_BASE[name]
+    rc = _run(compiler, tmp_path, f"expr_base_{name}", _source(body, call, want))
+    assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
+
+
+# A scalar base, or pointer arithmetic the store above doesn't type, reached
+# that generic path too; ritz1's Sema refuses it (index_store_check).  An
+# integer base in ritz0's words for `n[i] = v`.  ritz1 only: ritz0 raises a
+# traceback on the integer bases (AGAST #3754) and stores through
+# `(@a[0] + 1)[i]`, which ritz1 is to route (AGAST #3757).
+EXPR_BASE_REFUSED = {
+    "int_arith": ("    (n + 1)[0] = 5\n", "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
+    "int_cast": ("    (n as i64)[0] = 5\n", "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
+    "untyped_arith": ("    (@a[0] + 1)[0] = 5\n",
+                      "can't store through this element: ritz1 stores into `x[i]` here only when `x` "
+                      "is a `*T` or `**T` it can type"),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS[1:])
+@pytest.mark.parametrize("name", sorted(EXPR_BASE_REFUSED))
+def test_store_into_untyped_base_refused(tmp_path, compiler, name):
+    line, msg = EXPR_BASE_REFUSED[name]
+    body = "fn f()\n    var a: [2]i32 = [1, 2]\n    var n: i64 = 0\n" + line
+    comp, ll, _ = _compile(compiler, tmp_path, f"expr_base_refused_{name}", _source(body, "f()", 0))
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {line.strip()!r}:\n{out[-1000:]}"
+    assert not ll.exists()
+    found = re.findall(r"main\.ritz:(\d+:\d+): error: (.*)", out)
+    where = f"{PRELUDE.count(chr(10)) + 4}:6"
+    assert (where, msg) in found, f"{compiler}: wanted {msg!r} at {where}:\n{out[-2000:]}"
+
+
 # §3.3: a Drop array local needs an initialiser; the error is at the name.
 UNINIT = {
     "rank1": "    var a: [2]S\n",

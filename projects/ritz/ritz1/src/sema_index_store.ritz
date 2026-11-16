@@ -1,0 +1,133 @@
+# ritz1/src/sema_index_store.ritz - an index store ritz1 can't lower
+#
+# AGAST #3565.  An expression-target index store `x[i] = v` (a STMT_ASSIGN
+# whose target is an EXPR_INDEX) is lowered by one of emit_assign's arms for
+# its base: an array element or `**T` element (base EXPR_INDEX), `(*p)[i]`
+# (EXPR_UNARY), `x.f[i]` (EXPR_MEMBER, which refuses what it can't type
+# itself, #1439), `b.m()[i]` (EXPR_METHOD, #3528), `f()[i]` (EXPR_CALL,
+# #3442), and `(e as *T)[i]`, `(q + k)[i]`, `(p)[i]` (EXPR_CAST, EXPR_BINARY
+# and EXPR_IDENT: emit_ptr_base_index_store).  A target none of them takes
+# reached the generic deref path, which read `x[i]` as a VALUE and stored
+# through it: always a miscompile, most often a SIGSEGV.
+#
+# index_store_check refuses, before emission, the targets it can show none
+# of them takes.  Not every base: index_through also lowers names, calls and
+# casts that are (or point at) a `[N]T`, Vec, Span or String (#2329, #2726),
+# and Sema doesn't type those views, so they are left to the emitter.  It
+# refuses, unless emit_ptr_base_index_store / emit_call_base_index_store
+# store through it (isc_base_ok: a local, param, global, field, cast or named
+# call that is a `**T`, or a `*T` with a scalar or known-struct pointee,
+# under any `+ k` / `- k` chain), a base that is
+#   - of an integer, float or bool type, in ritz0's words for `n[i]` (§7.8);
+#   - pointer arithmetic, which no view takes (`(@a[0] + 1)[i]`); or
+#   - a name or call Sema types as a `*T` to such a scalar.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import sema
+import sema_type
+
+# The global `name`, or null.
+fn isc_global(sm: *Sema, name: *u8, len: i32) -> *GlobalVarDef
+    var g: *GlobalVarDef = sm.module.globals
+    while g != null
+        if name_eq(g.name, g.name_len, name, len) == 1
+            return g
+        g = g.next
+    null
+
+# 1 when `x`, an index store base's root, is a `**T` or a `*T` whose pointee
+# the emitter can stride by (index_store_root_pointee's roots).
+fn isc_root_ok(sm: *Sema, x: *Expr) -> i32
+    let k: i32 = x.kind
+    if k != EXPR_CAST and k != EXPR_CALL and k != EXPR_MEMBER and k != EXPR_IDENT
+        return 0
+    # A call through a local fn pointer: the emitter resolves no FnDef for it.
+    if k == EXPR_CALL and isc_local_call(sm, x) == 1
+        return 0
+    if k == EXPR_IDENT and sema_find_local(sm, x.ident_ptr, x.ident_len) == null
+        # A global `*S` keeps S on pointee_type_name, not where Sema reads it.
+        let g: *GlobalVarDef = isc_global(sm, x.ident_ptr, x.ident_len)
+        if g == null
+            return 0
+        if g.var_type == TYPE_PTR_PTR
+            return 1
+        if g.var_type != TYPE_PTR
+            return 0
+        if primitive_name_len(g.pointee_type) > 0
+            return 1
+        return (g.pointee_type_name_len > 0 and sema_find_struct(sm, g.pointee_type_name, g.pointee_type_name_len) != null) as i32
+    var t: SemaTy
+    let kind: i32 = sema_expr_ty(sm, x, @t)
+    if kind == TYPE_PTR_PTR
+        return 1
+    if kind != TYPE_PTR
+        return 0
+    if primitive_name_len(t.pointee) > 0
+        return 1
+    if t.name == null or t.name_len == 0
+        return 0
+    # A call's `*i32` return names its pointee "i32" (#1984).
+    if primitive_type_from_name(t.name, t.name_len) != 0
+        return 1
+    (sema_find_struct(sm, t.name, t.name_len) != null) as i32
+
+# 1 for a call with no name, or through a local of that name.
+fn isc_local_call(sm: *Sema, e: *Expr) -> i32
+    if e.func_name_len == 0
+        return 1
+    sema_is_local(sm, e.func_name, e.func_name_len)
+
+# 1 when `x` is a `*T` / `**T` base the emitter stores through: a root
+# isc_root_ok takes, under `+ k` / `- k` steps whose right side isn't itself
+# a pointer (`q - p` is a count).
+fn isc_base_ok(sm: *Sema, x: *Expr) -> i32
+    var root: *Expr = x
+    while root.kind == EXPR_BINARY
+        if root.op != OP_ADD and root.op != OP_SUB
+            return 0
+        if root.op == OP_SUB and isc_base_ok(sm, root.right) == 1
+            return 0
+        root = root.left
+    isc_root_ok(sm, root)
+
+# 1 when `x` is a name or call Sema types as a `*T` with an integer, float
+# or bool T, which index_store_root_pointee would have typed if it could: no
+# `[N]T` or Vec index_through could see through.  A call through a local
+# fn pointer is one.
+fn isc_scalar_ptr(sm: *Sema, x: *Expr) -> i32
+    var t: SemaTy
+    if sema_expr_ty(sm, x, @t) != TYPE_PTR
+        return 0
+    if primitive_name_len(t.pointee) > 0
+        return 1
+    (t.name_len > 0 and primitive_type_from_name(t.name, t.name_len) != 0) as i32
+
+# Refuse the index store whose target is `target` when no emit_assign arm
+# lowers it.  sema_walk calls this for each expression-target assignment.
+pub fn index_store_check(sm: *Sema, target: *Expr)
+    if target == null or target.kind != EXPR_INDEX or target.left == null
+        return
+    let base: *Expr = target.left
+    let k: i32 = base.kind
+    if k != EXPR_CAST and k != EXPR_BINARY and k != EXPR_IDENT and k != EXPR_CALL
+        return
+    if isc_base_ok(sm, base) == 1
+        return
+    let bk: i32 = sema_expr_type(sm, base)
+    if primitive_name_len(bk) > 0
+        sema_error_at(sm, target.span.line, target.span.col)
+        eprints_cstr(c"`")
+        eprints_cstr(primitive_name_from_type(bk))
+        eprints_cstr(c"` can't be indexed: it doesn't implement `Index` (§7.8)\n")
+        return
+    # Pointer arithmetic is no view index_through takes: only
+    # emit_ptr_base_index_store stores through it.
+    if k != EXPR_BINARY and isc_scalar_ptr(sm, base) == 0
+        return
+    sema_error_at(sm, target.span.line, target.span.col)
+    eprints_cstr(c"can't store through this element: ritz1 stores into `x[i]` here only when `x` is a `*T` or `**T` it can type\n")

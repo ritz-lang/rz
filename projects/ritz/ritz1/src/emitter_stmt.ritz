@@ -2596,6 +2596,9 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # it: a SIGSEGV.  Base, index, then value (LARB R61).
         if emit_call_base_index_store(s, target_expr, stmt.assign_value) == 1
             return
+        # AGAST #3565: and `(e as *T)[i] = v`, `(q + k)[i] = v`, `(p)[i] = v`.
+        if emit_ptr_base_index_store(s, target_expr, stmt.assign_value) == 1
+            return
 
         # AGAST #1509: `g[i][j] = v` over a multi-dimensional array.  It fell
         # to the generic path below, which evaluated `g[i][j]` as a VALUE
@@ -4543,6 +4546,107 @@ fn emit_call_base_index_store(s: *EmitterState, target: *Expr, value: *Expr) -> 
         emit_ptr_struct_elem_store(s, target.right, value, bptr, st_name, st_len)
     else
         emit_ptr_elem_store(s, target.right, value, bptr, base_type, pointee)
+    return 1
+
+# AGAST #3565: the pointee of `x`, the root of an index store's base (a
+# local, param, global, field, cast or call).  A `**T` root sets *out_pp and
+# returns TYPE_PTR: its element is a pointer.  A `*T` root returns what
+# ptr_root_pointee says, or for a global (which ptr_root_pointee leaves to
+# its callers' own global arms) its recorded pointee.  0 for anything else.
+# sema_index_store.ritz's index_store_check accepts exactly these roots.
+fn index_store_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32, out_pp: *i32) -> i32
+    *out_name = null
+    *out_len = 0
+    *out_pp = 0
+    var pp: i32 = 0
+    if x.kind == EXPR_CAST
+        pp = (x.op == TYPE_PTR_PTR) as i32
+    else if x.kind == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, x)
+        pp = (fd != null and fd.return_type == TYPE_PTR_PTR) as i32
+    else if x.kind == EXPR_MEMBER
+        let fld: *StructField = member_field_def(s, x)
+        pp = (fld != null and fld.field_type == TYPE_PTR_PTR) as i32
+    else if x.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+        if loc != null
+            pp = (loc.var_type == TYPE_PTR_PTR) as i32
+        else
+            let glob: *GlobalVarDef = find_global(s, x.ident_ptr, x.ident_len)
+            if glob == null
+                return 0
+            if glob.var_type == TYPE_PTR_PTR
+                pp = 1
+            else if glob.var_type != TYPE_PTR
+                return 0
+            else if primitive_name_len(glob.pointee_type) > 0
+                return glob.pointee_type
+            else
+                let gn: *u8 = glob.pointee_type_name
+                let gl: i32 = glob.pointee_type_name_len
+                if gn == null or gl == 0 or find_struct(s, gn, gl) == null
+                    return 0
+                *out_name = gn
+                *out_len = gl
+                return TYPE_STRUCT
+    else
+        return 0
+    if pp == 1
+        *out_pp = 1
+        return TYPE_PTR
+    ptr_root_pointee(s, x, out_name, out_len)
+
+# AGAST #3565: the pointee of an index store's base `x` when it names a `*T`
+# or `**T` (out_pp): a root index_store_root_pointee types, or pointer
+# arithmetic `y + k` / `y - k` down the left spine of one.  0 otherwise.
+fn index_store_base_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32, out_pp: *i32) -> i32
+    var root: *Expr = x
+    while root.kind == EXPR_BINARY
+        if root.op != OP_ADD and root.op != OP_SUB
+            return 0
+        # `q - p` of two pointers is a count, not a pointer.
+        if root.op == OP_SUB and index_store_base_pointee(s, root.right, out_name, out_len, out_pp) != 0
+            *out_name = null
+            *out_len = 0
+            *out_pp = 0
+            return 0
+        root = root.left
+    index_store_root_pointee(s, root, out_name, out_len, out_pp)
+
+# AGAST #3565: `(e as *T)[i] = v`, `(q + k)[i] = v` and `(p)[i] = v` store
+# through the `*T` / `**T` the base names, as `p[i] = v` does.  They fell to
+# emit_assign's generic path, which read `x[i]` as a VALUE and stored through
+# it: a SIGSEGV.  Base, index, then value (LARB R61).  Returns 1 when it
+# emitted the store, 0 (nothing emitted) for any other target.  Sema
+# (index_store_check) has refused a scalar base, or a pointer or reference
+# to a scalar, that this doesn't type.
+fn emit_ptr_base_index_store(s: *EmitterState, target: *Expr, value: *Expr) -> i32
+    if target.kind != EXPR_INDEX or target.left == null
+        return 0
+    if target.right == null or target.right.kind == EXPR_RANGE
+        return 0
+    let k: i32 = target.left.kind
+    if k != EXPR_CAST and k != EXPR_BINARY and k != EXPR_IDENT
+        return 0
+    var st_name: *u8 = null
+    var st_len: i32 = 0
+    var pp: i32 = 0
+    let pointee: i32 = index_store_base_pointee(s, target.left, @st_name, @st_len, @pp)
+    if pointee == 0
+        return 0
+    let base: i32 = emit_expr(s, target.left)
+    let bptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, bptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, base)
+    emit_str(s, c" to ptr\n")
+    if pp == 1
+        emit_ptr_elem_store(s, target.right, value, bptr, TYPE_PTR_PTR, TYPE_PTR)
+    else if pointee == TYPE_STRUCT
+        emit_ptr_struct_elem_store(s, target.right, value, bptr, st_name, st_len)
+    else
+        emit_ptr_elem_store(s, target.right, value, bptr, TYPE_PTR, pointee)
     return 1
 
 # The body of emit_index_assign_ptr_store, for any index / value pair.  AGAST

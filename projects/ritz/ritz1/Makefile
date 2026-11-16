@@ -52,6 +52,7 @@ SOURCES = \
 	sema_type \
 	sema_probe \
 	must_use \
+	sema_index_store \
 	generic_method \
 	sema_walk \
 	bool_check \
