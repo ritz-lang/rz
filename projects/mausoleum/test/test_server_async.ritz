@@ -7,6 +7,13 @@
 import ritzlib.sys
 
 import lib.server_async
+import ritzlib.memory
+import ritzlib.option
+import lib.m7m_types
+import lib.protocol
+import lib.buffer_pool
+import lib.document
+import lib.collection
 import cryptosec.x25519
 import cryptosec.random
 import cryptosec.mem
@@ -54,4 +61,107 @@ fn test_async_handshake_accepts_valid_client_key() -> i32
     assert sa_all_zero(@s.cipher_send_key[0], 32) == 0
     assert sa_all_zero(@s.cipher_recv_key[0], 32) == 0
     m7sp_session_destroy(idx)
+    0
+
+# ============================================================================
+# Document size limit (AGAST #2208)
+# ============================================================================
+#
+# The client refuses an oversize document before sending it; the server must
+# refuse one from any other client the same way, as DOCUMENT_TOO_LARGE rather
+# than an internal error, on INSERT and UPDATE alike.
+
+
+fn sa_collection(col: *Collection) -> i32
+    let pool_opt = buffer_pool_new(64)
+    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    if pool == null
+        return -1
+    return collection_init(col, pool, 1)
+
+# Serialize a one-string-field document of exactly `size` bytes into buf;
+# `id` (an existing document's, for UPDATE) or the invalid id.
+fn sa_sized_doc(size: i64, id: i64, payload: *u8, buf: *u8, cap: i64) -> i64
+    memset(payload, 122, size - 69)
+    var doc: Document
+    var doc_id: DocumentId = doc_id_invalid()
+    doc_id.value = id
+    doc_init(@doc, @doc_id)
+    var f: Field = field_string(payload, size - 69)
+    doc_set_field(@doc, "c", @f)
+    return doc_serialize(@doc, buf, cap)
+
+# Run one INSERT (update == 0) or UPDATE carrying `doc` through the handler;
+# returns the response type, with the error code in *code for MSG_ERROR.
+fn sa_write(col: *Collection, update: i32, doc: *u8, doc_len: i32, code: *i32) -> i32
+    let req: *MessageBuffer = msgbuf_new(16384)
+    let resp: *MessageBuffer = msgbuf_new(16384)
+    var msg_type: i32 = MSG_INSERT
+    if update != 0
+        msg_type = MSG_UPDATE
+    msgbuf_start(req, msg_type, 1)
+    msgbuf_write_bytes(req, doc, doc_len)
+    msgbuf_finish(req)
+    var reader: MessageReader
+    msgreader_init(@reader, msgbuf_data(req), msgbuf_len(req))
+    if update != 0
+        async_handle_update(@reader, resp, 1, col)
+    else
+        async_handle_insert(@reader, resp, 1, col)
+    var out: MessageReader
+    msgreader_init(@out, msgbuf_data(resp), msgbuf_len(resp))
+    let t: i32 = msgreader_msg_type(@out)
+    *code = 0
+    if t == MSG_ERROR
+        *code = msgreader_read_i32(@out)
+    msgbuf_free(req)
+    msgbuf_free(resp)
+    return t
+
+[[test]]
+fn test_async_insert_takes_a_max_size_doc() -> i32
+    var col: Collection
+    assert sa_collection(@col) == ERR_OK
+    let payload: *u8 = malloc(4096)
+    let buf: *u8 = malloc(4096)
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf, 4096)
+    assert n == MAX_DOC_SIZE
+    var code: i32 = 0
+    assert sa_write(@col, 0, buf, n as i32, @code) == MSG_INSERT_OK
+    assert collection_count(@col) == 1
+    0
+
+[[test]]
+fn test_async_insert_refuses_an_oversize_doc_as_too_large() -> i32
+    var col: Collection
+    assert sa_collection(@col) == ERR_OK
+    let payload: *u8 = malloc(4096)
+    let buf: *u8 = malloc(4096)
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, -1, payload, buf, 4096)
+    var code: i32 = 0
+    assert sa_write(@col, 0, buf, n as i32, @code) == MSG_ERROR
+    assert code == PROTO_ERR_DOCUMENT_TOO_LARGE
+    assert collection_count(@col) == 0
+    0
+
+[[test]]
+fn test_async_update_refuses_an_oversize_doc_as_too_large() -> i32
+    var col: Collection
+    assert sa_collection(@col) == ERR_OK
+    let payload: *u8 = malloc(4096)
+    let buf: *u8 = malloc(4096)
+    var small: i64 = sa_sized_doc(100, -1, payload, buf, 4096)
+    var id: DocumentId
+    var doc: Document
+    assert doc_deserialize(buf, small, @doc) == ERR_OK
+    assert collection_insert(@col, @doc, @id) == ERR_OK
+
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, id.value, payload, buf, 4096)
+    var code: i32 = 0
+    assert sa_write(@col, 1, buf, n as i32, @code) == MSG_ERROR
+    assert code == PROTO_ERR_DOCUMENT_TOO_LARGE
+
+    # Control: an update at the limit is fine.
+    let ok: i64 = sa_sized_doc(MAX_DOC_SIZE, id.value, payload, buf, 4096)
+    assert sa_write(@col, 1, buf, ok as i32, @code) == MSG_UPDATE_OK
     0

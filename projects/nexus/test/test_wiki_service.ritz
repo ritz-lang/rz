@@ -33,6 +33,7 @@ import services.wiki_service {
     wiki_service_list_pages,
     wiki_service_get_children
 }
+import services.validation { MAX_CONTENT_SIZE }
 import test.support.live_db { LiveDb, live_db_start, live_db_stop }
 
 
@@ -354,30 +355,66 @@ fn test_children_are_slugs_below_the_parent() -> i32
     rc
 
 
-fn check_oversize(w: *World) -> i32
+fn content_of(n: i64) -> String
     var content: String = string_new()
     var i: i64 = 0
-    while i < 4000
+    while i < n
         string_push(@&content, 'x' as u8)
         i += 1
+    content
+
+
+# A page over the limit is ContentTooLarge (HTTP 413), refused before the
+# database sees it (AGAST #2208; it used to reach mausoleum and come back a
+# RepoError, a 500), and nothing of it is readable afterwards.
+fn check_oversize(w: *World) -> i32
+    let content = content_of(MAX_CONTENT_SIZE + 1)
     match wiki_service_create_page(@w.svc, "big", "Big", string_as_view(@content))
         Ok(_) => return 1
         Err(e) =>
             match e
-                ServiceError.RepoError(_) => 0
+                ServiceError.ContentTooLarge => 0
                 _ => return 2
-    # A refused page must not be readable from the cache.
     if wiki_service_page_exists(@w.svc, "big")
         return 3
+    # Growing an existing page past the limit is refused the same way.
+    if create(w, "small", "x") != 0
+        return 4
+    match wiki_service_update_content(@w.svc, "small", string_as_view(@content))
+        Ok(_) => return 5
+        Err(e) =>
+            match e
+                ServiceError.ContentTooLarge => 0
+                _ => return 6
     0
 
 
 [[test]]
-fn test_page_the_database_refuses_is_not_cached() -> i32
+fn test_oversize_page_is_content_too_large_and_not_stored() -> i32
     var w: World
     var rc: i32 = world_open(@w)
     if rc != 0
         return rc
     rc = check_oversize(@w)
+    world_close(@w)
+    rc
+
+
+fn check_max_size(w: *World) -> i32
+    let content = content_of(MAX_CONTENT_SIZE)
+    if create(w, "big", string_as_view(@content)) != 0
+        return 1
+    match wiki_service_get_page(@w.svc, "big")
+        Ok(page) => if string_eq(@page.content, string_as_view(@content)) then 0 else 2
+        Err(_) => 3
+
+
+[[test]]
+fn test_page_at_the_limit_is_stored() -> i32
+    var w: World
+    var rc: i32 = world_open(@w)
+    if rc != 0
+        return rc
+    rc = check_max_size(@w)
     world_close(@w)
     rc

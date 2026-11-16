@@ -9,6 +9,7 @@ import ritzlib.memory
 import ritzlib.net
 
 import mausoleum.protocol
+import mausoleum.collection { MAX_DOC_SIZE }
 import mausoleum.encrypted_channel { EncryptedChannel }
 import mausoleum.encrypted_channel { channel_init_client, channel_handshake_client }
 import mausoleum.encrypted_channel { channel_send, channel_recv, channel_free }
@@ -522,14 +523,24 @@ pub fn client_ping(client: *Client) -> i32
     client.last_error = PROTO_OK
     return 0
 
-# Insert a document (returns document ID, or < 0 on error)
+# Insert a document (returns document ID, or < 0 on error). -4 is a refusal
+# with the session intact: client_last_error says why (DOCUMENT_TOO_LARGE for
+# a document over MAX_DOC_SIZE, which is never sent).
 pub fn client_insert(client: *Client, doc_data: *u8, doc_len: i32) -> i64
     if client == null or client.connected == 0
         return -1
 
+    # The server would refuse it; don't send it (AGAST #2208). This also
+    # keeps the document within the client's own buffers.
+    if doc_len as i64 > MAX_DOC_SIZE
+        client.last_error = PROTO_ERR_DOCUMENT_TOO_LARGE
+        return -4
+
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_insert(client.send_buf, req_id, doc_data, doc_len)
+    if build_insert(client.send_buf, req_id, doc_data, doc_len) < 0
+        client.last_error = PROTO_ERR_MESSAGE_TOO_LARGE
+        return -4
 
     if send_message(client) < 0
         client.connected = 0

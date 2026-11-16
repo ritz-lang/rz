@@ -134,9 +134,12 @@ yet: `repos/` (pages as Mausoleum documents, a Tome cache), `services/` and
 `presenters/`. `src/main.ritz` imports none of it, so `./rz build nexus` does not
 compile it; `./rz test nexus` does, and runs it against a real Mausoleum server.
 
-Known limit of that stack: Mausoleum stores documents of at most 2 KB
-(`MAX_DOC_SIZE`), so a larger page is refused with a 500, well under the 1 MB
-`MAX_CONTENT_SIZE` that validation allows.
+Page size: a page is one Mausoleum document, and a document is at most
+`MAX_DOC_SIZE` (1992 bytes, one B-tree value; bigger ones would need overflow
+pages). So the store takes at most `STORE_MAX_CONTENT_LEN` (1769) bytes of
+content, and this stack's validation `MAX_CONTENT_SIZE` (1229: its pages carry
+a title and six numbers too). Longer content is a 413, not a database error
+(#2208). The in-memory fallback keeps its own 8192-byte limit.
 
 It also does not build with the self-hosted compiler:
 `./rz clean nexus && ./rz build nexus --compiler ritz1` fails at exit 1 with

@@ -12,6 +12,8 @@ import ritzlib.str
 import ritzlib.memory
 import ritzlib.strview { StrView, strview_from_ptr }
 
+import mausoleum.collection { MAX_DOC_SIZE }
+
 import spire.repo.mausoleum { Db, DbField, db_init, db_set_encryption, db_connect, db_close }
 import spire.repo.mausoleum { db_insert, db_delete, db_scan, db_field, db_serialize_doc, db_extract_field }
 
@@ -563,3 +565,105 @@ fn test_store_plaintext_reaches_a_plaintext_database() -> i32
     let mode: i32 = wiki_store_init()
     live_db_stop(@live)
     if mode == STORE_MAUSOLEUM then 0 else 2
+
+
+# ============================================================================
+# Page size limit (AGAST #2208)
+# ============================================================================
+#
+# A page is one mausoleum document, so the store takes the longest content
+# that fits one under the longest slug: nexus refuses the rest up front
+# (HTTP 413) instead of letting mausoleum refuse the insert (HTTP 500).
+
+# A 128-byte slug (the longest the store takes), in `buf`.
+fn long_slug(buf: *u8) -> *u8
+    memset(buf, 108, 128)       # 'l'
+    *(buf + 128) = 0
+    buf
+
+
+# The store's page document at the limit is at most MAX_DOC_SIZE; one more
+# content byte would not be.
+[[test]]
+fn test_store_max_content_fits_one_document() -> i32
+    var slug: [129]u8
+    let content: *u8 = malloc(4096)
+    memset(content, 99, 4096)
+    var fields: [2]DbField
+    fields[0] = db_field(c"slug", 4, long_slug(@slug[0]), 128)
+    fields[1] = db_field(c"content", 7, content, STORE_MAX_CONTENT_LEN)
+    let buf: *u8 = malloc(8192)
+    let n: i64 = db_serialize_doc(buf, 8192, @fields[0], 2)
+    if n != MAX_DOC_SIZE
+        return 1
+    0
+
+
+[[test]]
+fn test_store_saves_a_page_at_the_limit() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    var rc: i32 = 0
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        rc = 1
+    var slug: [129]u8
+    long_slug(@slug[0])
+    let content: *u8 = malloc(STORE_MAX_CONTENT_LEN as i64)
+    memset(content, 113, STORE_MAX_CONTENT_LEN as i64)
+    if rc == 0 and wiki_store_save(@slug[0], 128, content, STORE_MAX_CONTENT_LEN) != 1
+        rc = 2
+    # Twice: the second save replaces the first (insert, then delete).
+    if rc == 0 and wiki_store_save(@slug[0], 128, content, STORE_MAX_CONTENT_LEN) != 1
+        rc = 3
+    var out: [8192]u8
+    var out_len: i32 = 0
+    if rc == 0 and wiki_store_get(@slug[0], 128, @out[0], @out_len) != 1
+        rc = 4
+    if rc == 0 and (out_len != STORE_MAX_CONTENT_LEN or memcmp(@out[0], content, out_len as i64) != 0)
+        rc = 5
+    live_db_stop(@live)
+    rc
+
+
+[[test]]
+fn test_store_refuses_a_page_over_the_limit_and_keeps_the_old_one() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    var rc: i32 = 0
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        rc = 1
+    if rc == 0 and save(c"page", c"old") != 1
+        rc = 2
+    let big: *u8 = malloc(8192)
+    memset(big, 122, 8192)
+    if rc == 0 and wiki_store_save(c"page", 4, big, STORE_MAX_CONTENT_LEN + 1) != STORE_SAVE_TOO_LARGE
+        rc = 3
+    if rc == 0 and wiki_store_save(c"page", 4, big, 8192) != STORE_SAVE_TOO_LARGE
+        rc = 4
+    if rc == 0 and not serves(c"page", c"old")
+        rc = 5
+    live_db_stop(@live)
+    rc
+
+
+# The in-memory fallback keeps its own, larger buffers.
+[[test]]
+fn test_store_max_content_len_follows_the_mode() -> i32
+    var live: LiveDb
+    if live_db_start(@live) != 0
+        return 100
+    var rc: i32 = 0
+    if store_on(live.port, 2) != STORE_MAUSOLEUM
+        rc = 1
+    if rc == 0 and wiki_store_max_content_len() != STORE_MAX_CONTENT_LEN
+        rc = 2
+    live_db_stop(@live)
+    if rc != 0
+        return rc
+    if store_on(dead_port(), 1) != STORE_FALLBACK
+        return 3
+    if wiki_store_max_content_len() != 8192
+        return 4
+    0

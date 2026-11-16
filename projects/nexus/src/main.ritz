@@ -235,6 +235,14 @@ fn send_error_page(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, title:
 # 503: mausoleum is unreachable, or several workers run without it (AGAST
 # #2459). Never a 404 for a page that may well exist, and never a private
 # per-worker page another request can't see.
+# 413 for content over what the store can hold (AGAST #2208). The form
+# field is read into an 8192-byte buffer, truncated if longer; truncated
+# content is still over the limit (at least 8192 / 3 bytes once decoded), so
+# truncation can't sneak a page under it.
+fn send_content_too_large(ctx: *WorkerContext, resp: *ResponseSlot) -> i32
+    return send_error_page(ctx, resp, 413, c"Page Too Large", c"The page is longer than the wiki's page store can hold. Shorten it and save again.")
+
+
 fn send_store_unavailable(ctx: *WorkerContext, resp: *ResponseSlot) -> i32
     return send_error_page(ctx, resp, 503, c"Store Unavailable", c"The wiki's page store (mausoleum) is unavailable. Try again shortly.")
 
@@ -327,6 +335,8 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     let content_len: i32 = parse_form_field(body_ptr, body_len, c"content", @content[0], 8192)
     if content_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
+    if content_len > wiki_store_max_content_len()
+        return send_content_too_large(ctx, resp)
 
     # Reject duplicate slug — caller should POST to /wiki/:slug to update
     var probe: [8192]u8
@@ -337,7 +347,10 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if exists == 1
         return send_error_page(ctx, resp, 409, c"Slug Already Exists", c"A page with that slug already exists. Edit it from its page, or pick a different slug.")
 
-    if wiki_store_save(@slug[0], slug_len, @content[0], content_len) == 0
+    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
+    if saved == STORE_SAVE_TOO_LARGE
+        return send_content_too_large(ctx, resp)
+    if saved != 1
         return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the new page.")
 
     return send_redirect(ctx, resp, @slug[0], slug_len)
@@ -366,10 +379,15 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     let content_len: i32 = parse_form_field(body_ptr, body_len, c"content", @content[0], 8192)
     if content_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
+    if content_len > wiki_store_max_content_len()
+        return send_content_too_large(ctx, resp)
 
     if wiki_store_mode() == STORE_UNAVAILABLE
         return send_store_unavailable(ctx, resp)
-    if wiki_store_save(@slug[0], slug_len, @content[0], content_len) == 0
+    let saved: i32 = wiki_store_save(@slug[0], slug_len, @content[0], content_len)
+    if saved == STORE_SAVE_TOO_LARGE
+        return send_content_too_large(ctx, resp)
+    if saved != 1
         return send_error_page(ctx, resp, 500, c"Save Failed", c"Could not persist the page.")
 
     return send_redirect(ctx, resp, @slug[0], slug_len)

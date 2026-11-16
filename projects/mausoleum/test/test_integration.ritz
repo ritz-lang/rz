@@ -354,3 +354,126 @@ fn test_delete() -> i32
     let rc: i32 = check_delete(@srv)
     server_stop(@srv)
     return rc
+
+# ============================================================================
+# Document size limit, end to end (AGAST #2208)
+# ============================================================================
+
+# Serialize a document with one string field "c" whose serialization is
+# exactly `size` bytes (69 bytes of header and field framing + payload).
+fn make_sized_doc(size: i64, payload: *u8, buf: *u8, cap: i64) -> i64
+    let len: i64 = size - 69
+    memset(payload, 113, len)          # 'q'
+    var doc: Document
+    var tmp_id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp_id)
+    var f: Field = field_string(payload, len)
+    doc_set_field(@doc, "c", @f)
+    return doc_serialize(@doc, buf, cap)
+
+struct ScanSeen
+    docs: i32
+    max_len: i32
+
+fn scan_seen_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+    let seen: *ScanSeen = user_data as *ScanSeen
+    seen.docs += 1
+    if len > seen.max_len
+        seen.max_len = len
+    return 0
+
+# Several documents of exactly MAX_DOC_SIZE go in, come back whole by GET
+# (only the id the server assigns differs) and all come back by SCAN.
+fn check_max_size_docs(srv: *TestServer) -> i32
+    let client: *Client = connect_client(srv)
+    if client == null
+        return 1
+    let payload: *u8 = malloc(4096)
+    let buf: *u8 = malloc(4096)
+    let size: i64 = make_sized_doc(MAX_DOC_SIZE, payload, buf, 4096)
+    if size != MAX_DOC_SIZE
+        return 2
+    var ids: [6]i64
+    for i in 0..6
+        ids[i] = client_insert(client, buf, size as i32)
+        if ids[i] < 0
+            return 3
+    for i in 0..6
+        var out: *u8 = null
+        var out_len: i32 = 0
+        if client_get(client, ids[i], @out, @out_len) != 1
+            return 4
+        if out_len as i64 != size
+            return 5
+        # Skip the serial version (4) and the id (8).
+        if memcmp(out + 12, buf + 12, size - 12) != 0
+            return 6
+    var seen: ScanSeen
+    seen.docs = 0
+    seen.max_len = 0
+    if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
+        return 7
+    if seen.docs != 6 or seen.max_len as i64 != size
+        return 8
+    client_disconnect(client)
+    client_free(client)
+    return 0
+
+# One byte over is refused as DOCUMENT_TOO_LARGE before it is sent, and the
+# session carries on; so is a document bigger than the client's buffers.
+fn check_oversize_doc(srv: *TestServer, size: i64) -> i32
+    let client: *Client = connect_client(srv)
+    if client == null
+        return 1
+    let payload: *u8 = malloc(size + 64)
+    let buf: *u8 = malloc(size + 64)
+    if make_sized_doc(size, payload, buf, size + 64) != size
+        return 2
+    if client_insert(client, buf, size as i32) != -4
+        return 3
+    if client_last_error(client) != PROTO_ERR_DOCUMENT_TOO_LARGE
+        return 4
+    if client_is_connected(client) == 0
+        return 5
+    if client_ping(client) < 0
+        return 6
+    var seen: ScanSeen
+    seen.docs = 0
+    seen.max_len = 0
+    if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
+        return 7
+    if seen.docs != 0
+        return 8
+    client_disconnect(client)
+    client_free(client)
+    return 0
+
+[[test]]
+fn test_max_size_docs_round_trip() -> i32
+    var srv: TestServer
+    let started: i32 = server_start(@srv)
+    if started != 0
+        return started
+    let rc: i32 = check_max_size_docs(@srv)
+    server_stop(@srv)
+    return rc
+
+[[test]]
+fn test_doc_one_byte_over_the_limit_is_refused() -> i32
+    var srv: TestServer
+    let started: i32 = server_start(@srv)
+    if started != 0
+        return started
+    let rc: i32 = check_oversize_doc(@srv, MAX_DOC_SIZE + 1)
+    server_stop(@srv)
+    return rc
+
+[[test]]
+fn test_doc_over_the_client_buffer_is_refused() -> i32
+    var srv: TestServer
+    let started: i32 = server_start(@srv)
+    if started != 0
+        return started
+    let rc: i32 = check_oversize_doc(@srv, 100000)
+    server_stop(@srv)
+    return rc

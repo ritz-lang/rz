@@ -17,8 +17,12 @@ import mausoleum.document
 # Constants
 # ============================================================================
 
-# Max serialized document size (fits in B-tree value)
-const MAX_DOC_SIZE: i64 = 2048
+# Max serialized document size: the longest B-tree value under an 8-byte
+# document-id key, btree_max_value_len(8) (AGAST #2208). A document is one
+# inline B-tree value, and a leaf must hold two. Bigger documents would need
+# overflow pages. Every layer above takes its limit from this one: the
+# server's buffers, the client's pre-send check, and nexus's page-size cap.
+pub const MAX_DOC_SIZE: i64 = 1992
 
 # Serialization format version
 const DOC_SERIAL_VERSION: i32 = 1
@@ -471,6 +475,25 @@ pub fn collection_get(col: *Collection, id: *DocumentId, out_doc: *Document) -> 
 
     # Deserialize
     return doc_deserialize(@buf[0], val_len as i64, out_doc)
+
+# The stored (serialized) bytes of document `id`, copied into `buf`.
+# The server answers GET with these as they are: collection_get's string
+# fields point into its own stack frame, gone once it returns, so
+# re-serializing its Document sent garbage for any string field.
+pub fn collection_get_raw(col: *Collection, id: *DocumentId, buf: *u8, cap: i64, out_len: *i64) -> i32
+    if col == null or id == null or buf == null or out_len == null
+        return ERR_INVALID
+    if cap < MAX_DOC_SIZE
+        return ERR_INVALID
+    var key: [8]u8
+    var key_ptr: *i64 = @key[0] as *i64
+    *key_ptr = id.value
+    var val_len: i32 = 0
+    let result: i32 = btree_get(col.tree, @key[0], 8, buf, @val_len)
+    if result != ERR_OK
+        return result
+    *out_len = val_len as i64
+    return ERR_OK
 
 pub fn collection_update(col: *Collection, doc: *Document) -> i32
     if col == null or doc == null

@@ -1214,3 +1214,178 @@ fn test_btree_node_count() -> i32
     btree_destroy(tree)
     buffer_pool_destroy(pool)
     0
+
+# ============================================================================
+# Large entries (AGAST #2208)
+# ============================================================================
+#
+# A leaf used to split by count without compacting, and leaf_insert_entry
+# wrote wherever the data area ended: two ~2 KB entries could not share a
+# 4 KB leaf, so the entry inserted after a split overran the slot directory.
+
+# Pseudo-random (but distinct) 12-byte key for i: insertion order is not
+# key order, as with mausoleum's little-endian document ids.
+fn scrambled_key(i: i32, buf: *u8) -> i32
+    make_key((i * 7919) % 100003, buf)
+
+# Room for every leaf these tests make: the pool has no file to evict to.
+fn big_test_pool() -> *BufferPool
+    let pool_opt = buffer_pool_new(512)
+    return option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+fn fill_value(buf: *u8, len: i32, fill: i32)
+    memset(buf, fill, len as i64)
+
+# 0 if `key` holds `len` bytes of `fill`.
+fn value_is(tree: *BTree, key: *u8, key_len: i32, len: i32, fill: i32) -> i32
+    var got: [4096]u8
+    var got_len: i32 = 0
+    if btree_get(tree, key, key_len, @got[0], @got_len) != ERR_OK
+        return 1
+    if got_len != len
+        return 2
+    for i in 0..len
+        if got[i] as i32 != fill
+            return 3
+    0
+
+[[test]]
+fn test_btree_max_value_len_is_half_a_leaf() -> i32
+    # Two max-size entries (data + slot) must fit one node's data area.
+    let max: i32 = btree_max_value_len(12)
+    if max <= 0
+        return 1
+    if 2 * (4 + 12 + max + 4) > PAGE_DATA_SIZE as i32 - 16
+        return 2
+    # ...and one more byte would not.
+    if 2 * (4 + 12 + max + 1 + 4) <= PAGE_DATA_SIZE as i32 - 16
+        return 3
+    # A longer key leaves less room for the value.
+    if btree_max_value_len(1024) != max - (1024 - 12)
+        return 4
+    0
+
+[[test]]
+fn test_btree_put_refuses_an_entry_over_half_a_leaf() -> i32
+    var pool: *BufferPool = big_test_pool()
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return 10
+    var key: [1024]u8
+    var val: [4096]u8
+    let key_len: i32 = make_key(1, @key[0])
+    let max: i32 = btree_max_value_len(key_len)
+    if btree_put(tree, @key[0], key_len, @val[0], max + 1) != ERR_INVALID
+        return 1
+    if btree_put(tree, @key[0], key_len, @val[0], max) != ERR_OK
+        return 2
+    # The same value under the longest key is over the limit.
+    memset(@key[0], 120, 1024)
+    if btree_put(tree, @key[0], 1024, @val[0], max) != ERR_INVALID
+        return 3
+    if btree_count(tree) != 1
+        return 4
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_btree_max_size_values_survive_splits() -> i32
+    var pool: *BufferPool = big_test_pool()
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return 10
+    var key: [16]u8
+    var val: [4096]u8
+    let max: i32 = btree_max_value_len(12)
+    for i in 0..60
+        let kl: i32 = scrambled_key(i, @key[0])
+        fill_value(@val[0], max, 65 + i % 26)
+        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+            return 1
+    if btree_count(tree) != 60
+        return 2
+    for i in 0..60
+        let kl: i32 = scrambled_key(i, @key[0])
+        if value_is(tree, @key[0], kl, max, 65 + i % 26) != 0
+            return 100 + i
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    0
+
+# Overwriting a key must reuse its space, not leak a page's worth per update.
+[[test]]
+fn test_btree_repeated_updates_of_large_values() -> i32
+    var pool: *BufferPool = big_test_pool()
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return 10
+    var key: [16]u8
+    var val: [4096]u8
+    let max: i32 = btree_max_value_len(12)
+    # A few small neighbours share the leaf.
+    for i in 0..5
+        let kl: i32 = make_key(i, @key[0])
+        fill_value(@val[0], 20, 48 + i)
+        btree_put(tree, @key[0], kl, @val[0], 20)
+    # Alternate two keys, so the entry replaced is not always the newest
+    # (lowest) one, whose space would come back without a compaction.
+    for round in 0..200
+        let r: i32 = round as i32
+        let which: i32 = 1 + 2 * (r % 2)
+        let kw: i32 = make_key(which, @key[0])
+        let len: i32 = max - (r % 3) * 300
+        fill_value(@val[0], len, 97 + r % 26)
+        if btree_put(tree, @key[0], kw, @val[0], len) != ERR_OK
+            return 1
+        if value_is(tree, @key[0], kw, len, 97 + r % 26) != 0
+            return 2
+    if btree_count(tree) != 5
+        return 3
+    for i in 0..5
+        if i != 1 and i != 3
+            let nk: i32 = make_key(i, @key[0])
+            if value_is(tree, @key[0], nk, 20, 48 + i) != 0
+                return 20 + i
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    0
+
+# A leaf packed with small entries, then large ones landing among them:
+# a split by count would leave the large entry's half over-full.
+[[test]]
+fn test_btree_large_values_among_many_small_ones() -> i32
+    var pool: *BufferPool = big_test_pool()
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return 10
+    var key: [16]u8
+    var val: [4096]u8
+    let max: i32 = btree_max_value_len(12)
+    for i in 0..300
+        let kl: i32 = make_key(i * 10, @key[0])
+        fill_value(@val[0], 8, 48 + i % 10)
+        if btree_put(tree, @key[0], kl, @val[0], 8) != ERR_OK
+            return 1
+    for i in 0..30
+        let kl: i32 = make_key(i * 100 + 5, @key[0])
+        fill_value(@val[0], max, 65 + i % 26)
+        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+            return 2
+    if btree_count(tree) != 330
+        return 3
+    for i in 0..300
+        let kl: i32 = make_key(i * 10, @key[0])
+        if value_is(tree, @key[0], kl, 8, 48 + i % 10) != 0
+            return 4
+    for i in 0..30
+        let kl: i32 = make_key(i * 100 + 5, @key[0])
+        if value_is(tree, @key[0], kl, max, 65 + i % 26) != 0
+            return 5
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    0

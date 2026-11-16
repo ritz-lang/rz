@@ -447,3 +447,121 @@ fn test_collection_count_after_delete() -> i32
     if collection_count(@col) != 1
         return 2
     0
+
+# ============================================================================
+# Document size limit (AGAST #2208)
+# ============================================================================
+#
+# A document with one string field "c" of `len` bytes serializes to
+# DOC_ONE_FIELD_OVERHEAD + len bytes: the 48-byte header, the field
+# (4 key_len + 1 key + 4 type + 8 len) and the 4-byte link count.
+
+const DOC_ONE_FIELD_OVERHEAD: i64 = 69
+
+fn size_test_pool() -> *BufferPool
+    var pool_opt = buffer_pool_new(256)
+    option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+# A document whose serialization is exactly `size` bytes of which the
+# string payload is `payload`, filled with `fill`.
+fn sized_doc(doc: *Document, payload: *u8, size: i64, fill: u8)
+    let len: i64 = size - DOC_ONE_FIELD_OVERHEAD
+    memset(payload, fill as i32, len)
+    var id: DocumentId = doc_id_invalid()
+    doc_init(doc, @id)
+    var f: Field = field_string(payload, len)
+    doc_set_field(doc, "c", @f)
+
+# 0 if the stored value for `id` is `size` bytes whose payload is all `fill`.
+fn stored_doc_is(col: *Collection, id: *DocumentId, size: i64, fill: u8) -> i32
+    var key: [8]u8
+    var key_ptr: *i64 = @key[0] as *i64
+    *key_ptr = id.value
+    var val: [2048]u8
+    var val_len: i32 = 0
+    if btree_get(col.tree, @key[0], 8, @val[0], @val_len) != ERR_OK
+        return 1
+    if val_len as i64 != size
+        return 2
+    # Payload sits between the header + field prelude (65) and the link count.
+    var i: i64 = 65
+    while i < size - 4
+        if val[i] != fill
+            return 3
+        i += 1
+    0
+
+# Many documents of exactly MAX_DOC_SIZE fill several leaves (one per page
+# at most two fit) and must all come back intact, before and after an update.
+[[test]]
+fn test_collection_max_size_docs_round_trip() -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var payload: [2048]u8
+    var ids: [40]DocumentId
+    for i in 0..40
+        var doc: Document
+        sized_doc(@doc, @payload[0], MAX_DOC_SIZE, (65 + i % 26) as u8)
+        if collection_insert(@col, @doc, @ids[i]) != ERR_OK
+            return 1
+    if collection_count(@col) != 40
+        return 2
+    for i in 0..40
+        if stored_doc_is(@col, @ids[i], MAX_DOC_SIZE, (65 + i % 26) as u8) != 0
+            return 10 + i
+
+    # Rewrite every document with a new payload.
+    for i in 0..40
+        var doc: Document
+        sized_doc(@doc, @payload[0], MAX_DOC_SIZE, (97 + i % 26) as u8)
+        doc.id = ids[i]
+        if collection_update(@col, @doc) != ERR_OK
+            return 3
+    for i in 0..40
+        if stored_doc_is(@col, @ids[i], MAX_DOC_SIZE, (97 + i % 26) as u8) != 0
+            return 50 + i
+    0
+
+# One byte over the limit is refused (and leaves nothing behind).
+[[test]]
+fn test_collection_refuses_a_doc_one_byte_over_the_limit() -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var payload: [2100]u8
+    var doc: Document
+    sized_doc(@doc, @payload[0], MAX_DOC_SIZE + 1, 120 as u8)
+    var id: DocumentId
+    if collection_insert(@col, @doc, @id) != ERR_FULL
+        return 1
+    if collection_count(@col) != 0
+        return 2
+
+    # And an update to one byte over keeps the old version.
+    var small: Document
+    sized_doc(@small, @payload[0], 100, 121 as u8)
+    if collection_insert(@col, @small, @id) != ERR_OK
+        return 3
+    sized_doc(@doc, @payload[0], MAX_DOC_SIZE + 1, 122 as u8)
+    doc.id = id
+    if collection_update(@col, @doc) != ERR_FULL
+        return 4
+    # sized_doc reuses `payload`, so check the stored copy, not the buffer.
+    if stored_doc_is(@col, @id, 100, 121 as u8) != 0
+        return 5
+    0
+
+# MAX_DOC_SIZE is a constant for the layers above; it must be exactly what
+# the B-tree stores under a document-id key.
+[[test]]
+fn test_collection_max_doc_size_is_the_btree_value_limit() -> i32
+    if MAX_DOC_SIZE != btree_max_value_len(8) as i64
+        return 1
+    0

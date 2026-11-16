@@ -19,7 +19,9 @@
 # on, so the dial is refused and the one worker serves in-memory pages. Before
 # that nexus always dialed 127.0.0.1:7777, so this test used whatever
 # mausoleum another process (another room's smoke stack) had up there, and
-# failed on its inserts: mausoleum can't store a max-size page yet (#2208).
+# failed on its inserts. A mausoleum page holds at most STORE_MAX_CONTENT_LEN
+# (1769) bytes of content (#2208: one document); the in-memory store's limit
+# is its 8192-byte buffer, which is what this transport test needs.
 #
 # Needs debug builds of zeus, valet and nexus:
 #   ./rz build zeus && ./rz build valet && ./rz build nexus

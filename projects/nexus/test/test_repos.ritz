@@ -11,6 +11,8 @@ import ritzlib.gvec { Vec, vec_len, vec_get, vec_drop }
 
 import spire.repo.mausoleum { DbField, db_field, db_serialize_doc }
 import mausoleum.document { DocumentId, doc_id_invalid, doc_id_is_valid, doc_id_eq }
+import mausoleum.collection { MAX_DOC_SIZE }
+import services.validation { MAX_CONTENT_SIZE, MAX_SLUG_LENGTH, MAX_TITLE_LENGTH }
 
 import models.wiki_page { WikiPage, wiki_page_new, wiki_page_new_child, wiki_page_drop, wiki_page_update_content }
 import errors.repo_error { RepoError }
@@ -609,6 +611,87 @@ fn test_page_over_the_client_buffer_is_a_database_error() -> i32
     var rc: i32 = connect(@repo, @db)
     if rc == 0
         rc = check_oversize(@repo, 100000)
+    wiki_page_repo_disconnect(@repo)
+    live_db_stop(@db)
+    rc
+
+
+# ============================================================================
+# Page size limit (AGAST #2208)
+# ============================================================================
+
+fn letters(c: u8, n: i64) -> String
+    var s: String = string_new()
+    var i: i64 = 0
+    while i < n
+        string_push(@&s, c)
+        i += 1
+    s
+
+
+# The longest page validation accepts: longest slug, title and content, and
+# every number at its longest decimal (i64 min, 20 characters).
+fn worst_case_page(content_len: i64) -> WikiPage
+    let longest: i64 = -9223372036854775807 - 1
+    var parent: DocumentId = doc_id_invalid()
+    parent.value = longest
+    var page = wiki_page_new(letters('s' as u8, MAX_SLUG_LENGTH), letters('t' as u8, MAX_TITLE_LENGTH), letters('c' as u8, content_len))
+    page.id.value = longest
+    page.author_id.value = longest
+    page.version = longest as u64
+    page.created_at.nanos = longest
+    page.updated_at.nanos = longest
+    page.parent_id = Some(parent)
+    page
+
+
+fn encoded_len(page: *WikiPage) -> i64
+    let bound: i64 = wiki_page_encode_bound(page)
+    let buf: *u8 = malloc(bound)
+    let n: i64 = wiki_page_encode(page, buf, bound)
+    free(buf)
+    n
+
+
+# MAX_CONTENT_SIZE is exactly what one mausoleum document leaves for content
+# once everything else on the page is as long as validation allows.
+[[test]]
+fn test_codec_longest_valid_page_is_one_max_document() -> i32
+    var page = worst_case_page(MAX_CONTENT_SIZE)
+    if encoded_len(@page) != MAX_DOC_SIZE
+        return 1
+    var over = worst_case_page(MAX_CONTENT_SIZE + 1)
+    if encoded_len(@over) != MAX_DOC_SIZE + 1
+        return 2
+    0
+
+
+fn check_max_page(repo: *WikiPageRepository) -> i32
+    var page = wiki_page_new(letters('s' as u8, MAX_SLUG_LENGTH), letters('t' as u8, MAX_TITLE_LENGTH), letters('c' as u8, MAX_CONTENT_SIZE))
+    match wiki_page_repo_insert(repo, @page)
+        Ok(_) => 0
+        Err(_) => return 1
+    let slug = letters('s' as u8, MAX_SLUG_LENGTH)
+    match wiki_page_repo_get_by_slug(repo, string_as_view(@slug))
+        Ok(got) =>
+            if string_len(@got.content) != MAX_CONTENT_SIZE
+                return 2
+            if not string_eq(@got.content, string_as_view(@page.content))
+                return 3
+            0
+        Err(_) => 4
+
+
+# A page at the limit is stored and read back whole by a real server.
+[[test]]
+fn test_page_at_the_limit_round_trips() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = check_max_page(@repo)
     wiki_page_repo_disconnect(@repo)
     live_db_stop(@db)
     rc
