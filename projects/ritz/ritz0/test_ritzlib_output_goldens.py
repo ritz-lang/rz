@@ -17,10 +17,11 @@ pin most of it under ritz0; this file covers the two things they can't:
   match arm, #1454).
 
 AGAST #1684 did the same to timer, iovec, lang/tokens and elf.  ritz1
-compiles all four, so the timer/iovec/tokens cases from
-ritzlib/tests/test_{timer,iovec,tokens}_output.ritz are built with both
-compilers below.  elf is ritz0 only: its golden finds `pub fn test_*` symbols
-in the [[test]] harness binary, which a package build doesn't reproduce.
+compiles all four, so the timer/iovec cases from
+ritzlib/tests/test_{timer,iovec}_output.ritz are built with both
+compilers below.  elf is ritz0 only: its golden finds `pub fn test_*`
+symbols in the [[test]] harness binary, which a package build doesn't
+reproduce.  lang/tokens' case went with that dead module (#3721).
 """
 
 import os
@@ -161,7 +162,7 @@ def test_args_output_is_byte_exact(agold, case):
 
 
 # ---------------------------------------------------------------------------
-# ritzlib/timer.ritz, iovec.ritz, lang/tokens.ritz (ritz0 and ritz1, #1684)
+# ritzlib/timer.ritz, iovec.ritz (ritz0 and ritz1, #1684)
 # ---------------------------------------------------------------------------
 
 
@@ -177,10 +178,9 @@ def _printers_program() -> str:
     """The goldens' case functions, driven by argv[1] instead of fork."""
     return (
         "import ritzlib.sys\nimport ritzlib.io\nimport ritzlib.strview\n"
-        "import ritzlib.timer\nimport ritzlib.iovec\nimport ritzlib.lang.tokens\n\n"
+        "import ritzlib.timer\nimport ritzlib.iovec\n\n"
         + _golden_body("timer", "fn show(", "timer")
         + _golden_body("iovec", "fn case_empty(", "iovec")
-        + _golden_body("tokens", "fn run_body(", "tokens")
         + """fn main(argc: i32, argv: **u8) -> i32
     let which: u8 = *(*(argv + 1))
     if which == '1'
@@ -189,9 +189,7 @@ def _printers_program() -> str:
         return timer_body(2)
     if which == '3'
         return iovec_body(1)
-    if which == '4'
-        return iovec_body(2)
-    tokens_body(1)
+    iovec_body(2)
 """
     )
 
@@ -212,7 +210,6 @@ def _printers_cases(compiler: str) -> dict:
         "3": b"IoVecBuilder: 0 iovecs, 0 pool bytes, 0 total bytes\n",
         "4": b"IoVecBuilder: 4 iovecs, 16 pool bytes, 22 total bytes\n"
         b"  [0] len=4\n  [1] len=11\n  [2] len=5\n  [3] len=2\n",
-        "5": b"3:7 kind=5 'ident'\n10:200 kind=2 'foo'\n1:1 kind=0\n",
     }
 
 
@@ -224,7 +221,7 @@ def pgold(request, tmp_path_factory):
     return request.param, _build(pkg, "pgold", _printers_program(), request.param)
 
 
-@pytest.mark.parametrize("case", ["1", "2", "3", "4", "5"])
+@pytest.mark.parametrize("case", ["1", "2", "3", "4"])
 def test_printers_output_is_byte_exact(pgold, case):
     compiler, exe = pgold
     want_out = _printers_cases(compiler)[case]

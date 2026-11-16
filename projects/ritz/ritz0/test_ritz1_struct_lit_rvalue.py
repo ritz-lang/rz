@@ -11,7 +11,7 @@ it emitted `add i64 0, 0` instead, which clang rejected. The contexts that hit i
 
   * a function / method argument     `f(P { x: 3, y: 4 })`
   * a variant-constructor argument   `Some(P { .. })`, `Ok(Font { .. })`
-  * an array-repeat element          `[P { .. }; 4]` (ritzlib/lang/tokens.ritz)
+  * an array-repeat element          `[P { .. }; 4]` (the old ritzlib/lang/tokens.ritz)
   * the same, nested as a field init `Q { ps: [P { .. }; 2], n: 1 }`
 
 THE FIX
@@ -28,14 +28,9 @@ impl-method and UFCS call paths, which re-boxed it through an i64.
 Oracle: ritz0 builds and runs every program with the same exit code.
 """
 
-import os
-import subprocess
-
 import pytest
 
-import fast_link
-
-from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run, _run_pkg
+from test_ritz1_builtin_struct_shadow import _run, _run_pkg
 
 # --- function / method arguments -------------------------------------------
 
@@ -393,27 +388,46 @@ def test_ritz1_struct_lit_rvalue_pkg(ritz1_bin, tmp_path, name):
     assert _run_pkg("ritz1", tmp_path, name, program) == want
 
 
+# tokendefs_new from the since-deleted ritzlib/lang/tokens.ritz (AGAST #3721
+# removed the dead module): a multi-line `[S { .. }; N]` array-repeat whose
+# element has array fields, nested as a field initialiser of a returned
+# literal.  This was the #1362 acceptance fixture; it stays, inline.
+TOKENDEFS_REPEAT = """\
+struct TokenDef
+    token_id: i32
+    name: [32]u8
+    pattern: [128]u8
+    is_literal: i32
+    is_skip: i32
+
+struct TokenDefs
+    defs: [8]TokenDef
+    count: i32
+
+fn tokendefs_new() -> TokenDefs
+    return TokenDefs {
+        defs: [TokenDef {
+            token_id: 7,
+            name: [0; 32],
+            pattern: [0; 128],
+            is_literal: 1,
+            is_skip: 0
+        }; 8],
+        count: 0
+    }
+
+pub fn main() -> i32
+    var d: TokenDefs = tokendefs_new()
+    return d.defs[0].token_id + d.defs[7].token_id + d.defs[7].is_literal
+"""
+
+
 @pytest.mark.integration
-def test_ritz1_compiles_ritzlib_lang_tokens(ritz1_bin, tmp_path):
+def test_ritz0_oracle_tokendefs_repeat(tmp_path):
+    assert _run("ritz0", tmp_path, "tokendefs", TOKENDEFS_REPEAT) == 15
+
+
+@pytest.mark.integration
+def test_ritz1_compiles_tokendefs_repeat(ritz1_bin, tmp_path):
     """Acceptance: tokendefs_new's `[TokenDef { .. }; N]` lowers under ritz1."""
-    src = RITZ_ROOT / "ritzlib" / "lang" / "tokens.ritz"
-    out = tmp_path / "tokens.ll"
-    comp = subprocess.run(
-        [str(RITZ1_BIN), str(src), "-o", str(out)],
-        cwd=tmp_path,
-        env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert comp.returncode == 0 and out.exists(), (
-        f"ritz1 failed on ritzlib/lang/tokens.ritz:\n"
-        f"{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
-    )
-    # The IR must also be valid, not merely emitted.
-    obj = fast_link.clang(
-        ["clang", "-c", str(out), "-o", str(tmp_path / "tokens.o")],
-        capture_output=True,
-        text=True,
-    )
-    assert obj.returncode == 0, f"invalid IR for tokens.ritz:\n{obj.stderr[-2000:]}"
+    assert _run("ritz1", tmp_path, "tokendefs", TOKENDEFS_REPEAT) == 15

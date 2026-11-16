@@ -75,8 +75,8 @@ same-named non-pub helper.
 | `io` | 25 | 15 | 4 | 4 | ok | ok |
 | `iovec` | 14 | 8 | 4 | 3 | ok | ok |
 | `json` | 27 | 0 | 16 | 8 | ok | ok |
-| `lang.lexer` | 20 | 4 | 7 | 2 | ok | ok |
-| `lang.tokens` | 6 | 1 | 4 | 4 | ok | FAIL |
+| ~~`lang.lexer`~~ | — | — | — | — | deleted | deleted (#3721: dead, no importers) |
+| ~~`lang.tokens`~~ | — | — | — | — | deleted | deleted (#3721: dead, no importers) |
 | `memory` | 25 | 12 | 13 | 13 | ok | ok |
 | `meta` | 21 | 0 | 20 | 12 | ok | ok |
 | `net` | 46 | 7 | 17 | 15 | ok | ok |

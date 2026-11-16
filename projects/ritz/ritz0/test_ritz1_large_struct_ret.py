@@ -7,11 +7,12 @@ ritz1 returned every struct as a first-class LLVM aggregate:
     %v = load %TokenDefs, ptr %slot
     ret %TokenDefs %v
 
-For ritzlib/lang/tokens.ritz's `tokendefs_new` that value is the 22 KB
-`%TokenDefs = {[128 x %TokenDef], i32}`.  At -O2, InstCombine unpacks such a
-load into one scalar per leaf (~21k), and clang then grows past 13 GB.  That
-broke every ci-local gate from b6dad04 on, because
-test_printers_output_is_byte_exact[ritz1-*] compiles lang.tokens with ritz1.
+For the since-deleted ritzlib/lang/tokens.ritz's `tokendefs_new` that value
+was the 22 KB `%TokenDefs = {[128 x %TokenDef], i32}`.  At -O2, InstCombine
+unpacks such a load into one scalar per leaf (~21k), and clang then grows past
+13 GB.  That broke every ci-local gate from b6dad04 on, because
+test_printers_output_is_byte_exact[ritz1-*] compiled lang.tokens with ritz1.
+AGAST #3721 deleted that dead module; TOKENDEFS below is its shape, inline.
 ritz0 emits the same `ret`, but its function is `internal` and unused, so it
 is deleted before InstCombine ever sees it.
 
@@ -44,7 +45,7 @@ import fast_link
 
 from test_ritz1_builtin_struct_shadow import RITZ0, RITZ1_BIN, RITZ_ROOT, RITZ_START
 
-# clang on ritz0's IR for tokens.ritz takes ~0.1 s at -O2.  20 s and 2 GB are
+# clang on ritz0's IR for TOKENDEFS takes ~0.1 s at -O2.  20 s and 2 GB are
 # two orders of magnitude of headroom, and still turn the old hang into a
 # fast, host-safe failure.
 O2_TIMEOUT_S = 20
@@ -157,7 +158,7 @@ def _define_line(ll: Path, fn: str) -> str:
     raise AssertionError(f"no define for @{fn} in {ll.name}")
 
 
-# --- the 22 KB shape of tokens.ritz -----------------------------------------
+# --- the 22 KB shape of the old ritzlib/lang/tokens.ritz ---------------------
 
 BIG_DECLS = """\
 struct Row
@@ -229,13 +230,75 @@ impl Big
 }
 
 
+# The ticket repro, inline since AGAST #3721 deleted ritzlib/lang/tokens.ritz:
+# its %TokenDefs (128 TokenDefs of [32]u8 + [128]u8, 22020 bytes) built by a
+# `[TokenDef { .. }; 128]` array-repeat and returned by value, plus the
+# by-pointer fns that index it.
+TOKENDEFS = """\
+const MAX_TOKEN_DEFS: i32 = 128
+
+struct TokenDef
+    token_id: i32
+    name: [32]u8
+    pattern: [128]u8
+    is_literal: i32
+    is_skip: i32
+
+struct TokenDefs
+    defs: [128]TokenDef
+    count: i32
+
+fn tokendefs_new() -> TokenDefs
+    return TokenDefs {
+        defs: [TokenDef {
+            token_id: 0,
+            name: [0; 32],
+            pattern: [0; 128],
+            is_literal: 0,
+            is_skip: 0
+        }; 128],
+        count: 0
+    }
+
+fn tokendefs_add(defs: *TokenDefs, id: i32, name: *u8) -> i32
+    if defs.count >= MAX_TOKEN_DEFS
+        return 0 - 1
+    let def: *TokenDef = @defs.defs[defs.count]
+    def.token_id = id
+    var i: i32 = 0
+    for j in 0..31
+        let c: u8 = *(name + j)
+        if c == 0
+            break
+        def.name[j] = c
+        i = j + 1
+    def.name[i] = 0
+    defs.count = defs.count + 1
+    return 0
+
+fn tokendefs_find(defs: *TokenDefs, id: i32) -> i32
+    for i in 0..defs.count
+        if defs.defs[i].token_id == id
+            return i
+    return 0 - 1
+
+pub fn main() -> i32
+    var defs: TokenDefs = tokendefs_new()
+    tokendefs_add(@defs, 100, c"FN")
+    tokendefs_add(@defs, 101, c"IDENT")
+    if tokendefs_find(@defs, 101) != 1
+        return 1
+    return 42
+"""
+
+
 @pytest.mark.integration
-def test_ritz1_lang_tokens_compiles_at_O2_within_bound(ritz1_bin, tmp_path):
-    """The ticket repro: ritzlib/lang/tokens.ritz through clang -O2."""
-    ll = _ritz1_ll_file(
-        tmp_path, "tokens", RITZ_ROOT / "ritzlib" / "lang" / "tokens.ritz"
-    )
-    _assert_no_libc_mem(_o2_object(ll))
+def test_ritz1_tokendefs_compiles_at_O2_within_bound(ritz1_bin, tmp_path):
+    """The ticket repro: lang/tokens.ritz's 22 KB TokenDefs through clang -O2."""
+    ll = _ritz1_ll(tmp_path, "tokendefs", TOKENDEFS)
+    obj = _o2_object(ll)
+    _assert_no_libc_mem(obj)
+    assert _link_run([obj], tmp_path / "tokendefs", with_start=True) == 42
 
 
 @pytest.mark.integration
